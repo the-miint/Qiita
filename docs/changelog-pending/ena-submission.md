@@ -13,21 +13,21 @@
   text biosample fields — `env_broad_scale`, `env_local_scale`, `env_medium` — hold the
   environmental contexts as supplied, alongside the existing ENVO-resolved three.
 
-- **The control plane can deposit studies and biosamples to ENA (#642).**
-  `ena_submission.EnaSubmissionCatalog` opens a miint Webin V2 session — registering the secret,
-  attaching the `ena` catalog over the service-side LOAD-only connect, and tearing both down on
-  exit — then inserts projects and samples and hands back the accessions ENA assigns. Each
-  study and biosample is deposited under its `export_entity_id` as the ENA alias. One
-  `EnaObjectSpec` per object declares what a submission carries, so a column absent from it is
-  never sent rather than sent as NULL; `scientific_name` is left out deliberately. Samples go as
-  one envelope, accepted or rejected whole, each row's accessions matched back to it by alias. A
-  rejection is classified into the three shapes that need different handling — already deposited,
-  alias collision, failed checklist validation — each carrying what that path reports, so a
-  caller can record an existing accession against the right row, resubmit, or fix the metadata
-  without re-parsing a message. Blank aliases and checklists, and a repeated alias within one
-  batch, are refused before anything is sent. The endpoint is an environment selector, `test` or
-  `production` and never a URL, checked before a connection opens; the session bounds its own
-  `threads` and `memory_limit`.
+- **The control plane gains a catalog for depositing studies and biosamples to ENA (#642).**
+  No route or job calls it yet. `ena_submission.EnaSubmissionCatalog` opens a miint Webin V2 session
+  — registering the secret, attaching the `ena` catalog over the service-side LOAD-only connect, and
+  tearing both down on exit — then inserts projects and samples and hands back the accessions ENA
+  assigns. Each study and biosample is deposited under its `export_entity_id` as the ENA alias. One
+  `EnaObjectSpec` per object declares what a submission carries, so a column absent from it is never
+  sent rather than sent as NULL; `scientific_name` is left out deliberately. Samples go as one
+  envelope, accepted or rejected whole, each row's accessions matched back to it by alias. A
+  rejection is classified by its message text (duckdb-miint#291) into the three shapes that need
+  different handling — already deposited, alias collision, failed checklist validation — each
+  carrying what that path reports, so a caller can record an existing accession against the right
+  row, resubmit, or fix the metadata without re-parsing a message. Blank aliases and checklists, and
+  a repeated alias within one batch, are refused before anything is sent. The endpoint is an
+  environment selector, `test` or `production` and never a URL, checked before a connection opens;
+  the session bounds its own `threads` and `memory_limit`.
 
 - **`qiita_common.sql.sql_string_literal` replaces the three private copies of the same SQL
   string-literal escaper in the control-plane CLI modules (#642).**

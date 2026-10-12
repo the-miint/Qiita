@@ -120,6 +120,8 @@ class EnaChecklistValidationError(EnaSubmissionError):
         super().__init__(f"ENA {object_kind} checklist validation failed: {detail}")
 
 
+# Told apart by message text because miint reports failures only as text
+# (duckdb-miint#291); its alias pre-check never fires (duckdb-miint#290, duckdb-miint#305).
 _ALREADY_SUBMITTED_RE = re.compile(
     r'(?:alias:\s*"([^"]*)",\s*accession:\s*"[^"]*"\.\s*The object being added\s+)?'
     r'already exists in the submission account with accession:\s*"([^"]+)"'
@@ -353,6 +355,10 @@ class EnaSubmissionCatalog:
         # Close even if the detach fails, or a failed teardown leaks the connection.
         try:
             con.execute(f"DETACH {_CATALOG_ALIAS}")
+        except duckdb.Error:
+            # A failed detach must not replace an error already leaving the block
+            if exc is None:
+                raise
         finally:
             con.close()
 

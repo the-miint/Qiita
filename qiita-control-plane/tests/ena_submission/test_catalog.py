@@ -37,6 +37,11 @@ from .conftest import (
     _valid_kwargs,
 )
 
+# Statement prefixes a recording connection can be told to fail on.
+_INSERT = "INSERT INTO "
+_ATTACH = "ATTACH "
+_DETACH = "DETACH "
+
 _INVALID_ENDPOINTS = ["", "https://wwwdev.ebi.ac.uk/ena/submit/webin-v2/", "Production"]
 
 # Every spec the module defines, paired with the model whose fields its columns
@@ -72,23 +77,24 @@ _MIINT_CHECKLIST_VALIDATION = (
 
 class _RecordingConn:
     """Stands in for a DuckDB connection, recording every statement executed
-    and handing back a canned result set, or failing every INSERT with
-    `insert_error` when one is given."""
+    and handing back a canned result set; a statement starting with a key of
+    `failures` raises that key's error text instead."""
 
     def __init__(
-        self, returned_rows: list[tuple] | None = None, *, insert_error: str | None = None
+        self, returned_rows: list[tuple] | None = None, *, failures: dict[str, str] | None = None
     ) -> None:
         self.statements: list[str] = []
         self.parameters: list[list | None] = []
         self.closed = False
         self._returned_rows = [] if returned_rows is None else returned_rows
-        self._insert_error = insert_error
+        self._failures = failures or {}
 
     def execute(self, sql: str, params: list | None = None) -> _RecordingConn:
         self.statements.append(sql)
         self.parameters.append(params)
-        if self._insert_error is not None and sql.startswith("INSERT INTO "):
-            raise duckdb.Error(self._insert_error)
+        for prefix, error in self._failures.items():
+            if sql.startswith(prefix):
+                raise duckdb.Error(error)
         return self
 
     def fetchall(self) -> list[tuple]:
@@ -181,6 +187,18 @@ def test__open_ena_submission_session_validate_only(
     assert emitted is dry_run
 
 
+def test__open_ena_submission_session_setup_failure_closes(monkeypatch, password_file: Path):
+    """Tests the case where a setup statement fails: the error propagates and
+    the connection is closed rather than leaked."""
+    conn = _RecordingConn(failures={_ATTACH: "attach refused"})
+    monkeypatch.setattr(catalog_module, "connect_with_miint_staged", lambda: conn)
+
+    with pytest.raises(duckdb.Error, match="attach refused"):
+        catalog_module._open_ena_submission_session(**_valid_kwargs(password_file, dry_run=False))
+
+    assert conn.closed is True
+
+
 def test__open_ena_submission_session_emits_no_install(monkeypatch, password_file: Path):
     """Tests the case where a session is opened: no extension statement is
     issued, since the staged connect helper already loads miint and httpfs."""
@@ -246,6 +264,28 @@ def test_EnaSubmissionCatalog_detaches_and_closes(
             pass
 
     assert any(s.startswith("DETACH ") for s in conn.statements)
+    assert conn.closed is True
+
+
+@pytest.mark.parametrize(
+    ("body_raises", "expected_error"),
+    [(False, duckdb.Error), (True, ValueError)],
+    ids=["clean body", "raising body"],
+)
+def test_EnaSubmissionCatalog_detach_failure(
+    monkeypatch, password_file: Path, body_raises: bool, expected_error: type[Exception]
+):
+    """Tests the case where the detach fails after a clean block and the case
+    where it fails after the block raised: the connection is closed either way,
+    and a detach error surfaces only when no error was already leaving the block."""
+    conn = _RecordingConn(failures={_DETACH: "detach refused"})
+    monkeypatch.setattr(_OPEN_SESSION, lambda **kwargs: conn)
+    catalog = EnaSubmissionCatalog(**_valid_kwargs(password_file))
+
+    with pytest.raises(expected_error), catalog:
+        if body_raises:
+            raise ValueError("from the body")
+
     assert conn.closed is True
 
 
@@ -396,7 +436,7 @@ def test__insert_returning_rows_already_submitted(monkeypatch, password_file: Pa
     """Tests the case where ENA's receipt reports the alias already deposited:
     the alias and the accession it names ride together on a distinguishable
     error, so a caller can record it rather than treat the submission as lost."""
-    conn = _RecordingConn(insert_error=_RECEIPT_ALREADY_SUBMITTED)
+    conn = _RecordingConn(failures={_INSERT: _RECEIPT_ALREADY_SUBMITTED})
     with _catalog_over(monkeypatch, password_file, conn) as catalog:
         with pytest.raises(EnaAlreadySubmittedError) as raised:
             catalog.submit_project(_project_row())
@@ -410,7 +450,7 @@ def test__insert_returning_rows_alias_check_blocked(monkeypatch, password_file: 
     """Tests the case where miint's own pre-POST alias check refuses the insert:
     every colliding alias is carried, and the error says no accession is
     available from this path."""
-    conn = _RecordingConn(insert_error=_MIINT_ALIAS_CHECK_BLOCKED)
+    conn = _RecordingConn(failures={_INSERT: _MIINT_ALIAS_CHECK_BLOCKED})
     with _catalog_over(monkeypatch, password_file, conn) as catalog:
         with pytest.raises(EnaAliasCheckBlockedError) as raised:
             catalog.submit_samples([_sample_row("QB11"), _sample_row("QB12")])
@@ -425,7 +465,7 @@ def test__insert_returning_rows_checklist_validation(monkeypatch, password_file:
     """Tests the case where miint's checklist validator refuses the insert: the
     per-attribute detail is carried on its own error, since it means incomplete
     data rather than an object already deposited."""
-    conn = _RecordingConn(insert_error=_MIINT_CHECKLIST_VALIDATION)
+    conn = _RecordingConn(failures={_INSERT: _MIINT_CHECKLIST_VALIDATION})
     with _catalog_over(monkeypatch, password_file, conn) as catalog:
         with pytest.raises(EnaChecklistValidationError) as raised:
             catalog.submit_samples([_sample_row("QB11")])
@@ -439,7 +479,8 @@ def test__insert_returning_rows_unclassified_failure(monkeypatch, password_file:
     """Tests the case where a failure matches none of the three known shapes:
     the base error carries the exception's text, so an unrecognized rejection
     is reported as itself rather than reshaped into one of them."""
-    conn = _RecordingConn(insert_error="INSERT INTO ena.samples failed: Webin account is suspended")
+    suspended = "INSERT INTO ena.samples failed: Webin account is suspended"
+    conn = _RecordingConn(failures={_INSERT: suspended})
     with _catalog_over(monkeypatch, password_file, conn) as catalog:
         with pytest.raises(EnaSubmissionError, match="Webin account is suspended") as raised:
             catalog.submit_samples([_sample_row("QB11")])
@@ -458,7 +499,7 @@ def test__insert_returning_rows_already_submitted_names_every_collision(
         _already_exists_error("sample", "QB12", "ERS12"),
     ]
     receipt = f"INSERT INTO ena.samples failed: {'; '.join(rejections)}"
-    conn = _RecordingConn(insert_error=receipt)
+    conn = _RecordingConn(failures={_INSERT: receipt})
     with _catalog_over(monkeypatch, password_file, conn) as catalog:
         with pytest.raises(EnaAlreadySubmittedError) as raised:
             catalog.submit_samples([_sample_row("QB11"), _sample_row("QB12")])

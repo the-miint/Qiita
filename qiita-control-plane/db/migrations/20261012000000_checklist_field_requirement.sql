@@ -11,7 +11,8 @@
 -- metadata_checklist_field is renamed to metadata_checklist_requirement: a row
 -- is one requirement a checklist places, which is what it was already, and
 -- *_field no longer distinguishes it from the vocabulary table now that the
--- two concepts are separate.
+-- two concepts are separate. Nothing reads the old name, so the rename is done
+-- in one step rather than expanded and contracted.
 
 ALTER TABLE qiita.metadata_checklist_field RENAME TO metadata_checklist_requirement;
 
@@ -42,6 +43,21 @@ ALTER INDEX qiita.metadata_checklist_field_biosample_idx
     RENAME TO metadata_checklist_requirement_biosample_idx;
 ALTER INDEX qiita.metadata_checklist_field_prep_sample_idx
     RENAME TO metadata_checklist_requirement_prep_sample_idx;
+ALTER TABLE qiita.metadata_checklist_requirement
+    RENAME CONSTRAINT metadata_checklist_field_pkey
+                   TO metadata_checklist_requirement_pkey;
+ALTER TABLE qiita.metadata_checklist_requirement
+    RENAME CONSTRAINT metadata_checklist_field_metadata_checklist_idx_fkey
+                   TO metadata_checklist_requirement_metadata_checklist_idx_fkey;
+ALTER TABLE qiita.metadata_checklist_requirement
+    RENAME CONSTRAINT metadata_checklist_field_biosample_global_field_idx_fkey
+                   TO metadata_checklist_requirement_biosample_global_field_idx_fkey;
+-- Without "_idx": the full pattern exceeds Postgres's 63-character identifier limit.
+ALTER TABLE qiita.metadata_checklist_requirement
+    RENAME CONSTRAINT metadata_checklist_field_prep_sample_global_field_idx_fkey
+                   TO metadata_checklist_requirement_prep_sample_global_field_fkey;
+ALTER SEQUENCE qiita.metadata_checklist_field_idx_seq
+    RENAME TO metadata_checklist_requirement_idx_seq;
 
 
 CREATE TABLE qiita.checklist_field (
@@ -59,6 +75,14 @@ COMMENT ON TABLE qiita.checklist_field IS
     'the same field; which Qiita field supplies the value, and in what unit, '
     'belongs to the requirement that links them.';
 
+
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM qiita.metadata_checklist_requirement) THEN
+        RAISE EXCEPTION 'metadata_checklist_requirement already holds rows, which '
+                        'have no checklist_field_idx for the NOT NULL column added next';
+    END IF;
+END $$;
 
 ALTER TABLE qiita.metadata_checklist_requirement
     ADD COLUMN checklist_field_idx BIGINT NOT NULL
@@ -158,6 +182,19 @@ SELECT mc.idx, bgf.idx, cf.idx, fs.unit
   JOIN qiita.biosample_global_field bgf ON bgf.internal_name = fs.source_internal_name
 ON CONFLICT DO NOTHING;
 
+DO $$
+DECLARE
+    expected BIGINT;
+    seeded   BIGINT;
+BEGIN
+    SELECT sum(cardinality(checklist_names)) INTO expected FROM checklist_field_spec;
+    SELECT count(*) INTO seeded FROM qiita.metadata_checklist_requirement;
+    IF seeded <> expected THEN
+        RAISE EXCEPTION 'seeded % checklist requirements, expected %: a checklist or '
+                        'source field named in the spec did not resolve', seeded, expected;
+    END IF;
+END $$;
+
 DROP TABLE checklist_field_spec;
 
 -- migrate:down
@@ -217,5 +254,19 @@ ALTER INDEX qiita.metadata_checklist_requirement_unique_biosample
 ALTER TABLE qiita.metadata_checklist_requirement
     RENAME CONSTRAINT metadata_checklist_requirement_exactly_one_target
                    TO metadata_checklist_field_exactly_one_target;
+ALTER SEQUENCE qiita.metadata_checklist_requirement_idx_seq
+    RENAME TO metadata_checklist_field_idx_seq;
+ALTER TABLE qiita.metadata_checklist_requirement
+    RENAME CONSTRAINT metadata_checklist_requirement_prep_sample_global_field_fkey
+                   TO metadata_checklist_field_prep_sample_global_field_idx_fkey;
+ALTER TABLE qiita.metadata_checklist_requirement
+    RENAME CONSTRAINT metadata_checklist_requirement_biosample_global_field_idx_fkey
+                   TO metadata_checklist_field_biosample_global_field_idx_fkey;
+ALTER TABLE qiita.metadata_checklist_requirement
+    RENAME CONSTRAINT metadata_checklist_requirement_metadata_checklist_idx_fkey
+                   TO metadata_checklist_field_metadata_checklist_idx_fkey;
+ALTER TABLE qiita.metadata_checklist_requirement
+    RENAME CONSTRAINT metadata_checklist_requirement_pkey
+                   TO metadata_checklist_field_pkey;
 
 ALTER TABLE qiita.metadata_checklist_requirement RENAME TO metadata_checklist_field;

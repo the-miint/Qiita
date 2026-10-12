@@ -38,6 +38,7 @@ _None yet._
 ### 3. Migrations
 
 - `[operator]` `make migrate` applies `20261006000000_exported_entity.sql` (new table `qiita.exported_entity`, mint-on-insert triggers on `qiita.study` and `qiita.biosample`, and a backfill of one row per existing study and biosample, all in one transaction; it aborts and rolls back if any study or biosample is left without a row). (#682)
+- `[operator]` `make migrate` applies `20261012000000_checklist_field_requirement.sql` (renames `qiita.metadata_checklist_field` to `qiita.metadata_checklist_requirement`, adds `qiita.checklist_field`, seeds the five ENA checklists' requirements, and adds three free-text environmental-context biosample fields; one transaction). It aborts and rolls back if the old table holds any rows — none are written by code, so any there were inserted by hand; stop and find out why before removing them — or if the seed does not produce every requirement it names. (#642)
 
 ### 4. Deploy
 
