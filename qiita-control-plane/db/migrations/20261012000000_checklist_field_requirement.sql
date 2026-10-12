@@ -75,16 +75,10 @@ COMMENT ON COLUMN qiita.metadata_checklist_requirement.unit IS
     'codepoint, so a value must match what the checklist declares rather than '
     'any normalization of it.';
 
--- At most one requirement per checklist field per checklist.
 CREATE UNIQUE INDEX metadata_checklist_requirement_unique_field
     ON qiita.metadata_checklist_requirement (metadata_checklist_idx, checklist_field_idx);
 
 
--- The parent link records a declared lineage between published specifications.
--- It does NOT mean a child requires or accepts its parent's fields: publishers
--- issue each checklist complete, and a child's accepted-field set is not a
--- superset of its parent's. Resolve a checklist's requirements from its own
--- rows rather than by walking this link.
 COMMENT ON COLUMN qiita.metadata_checklist.parent_metadata_checklist_idx IS
     'Declared lineage between published checklist specifications. Does not '
     'imply a child requires or accepts its parent''s fields; resolve a '
@@ -92,10 +86,7 @@ COMMENT ON COLUMN qiita.metadata_checklist.parent_metadata_checklist_idx IS
     'rows, not by walking this link.';
 
 
--- The three environmental-context fields already in the registry are bound to
--- ENVO, and the values people actually supply for them are free text that no
--- ontology resolves. These hold what was supplied, verbatim. created_by_idx = 1
--- names the seeded system principal, as in the original global-field seed.
+-- created_by_idx = 1 is the seeded system principal.
 INSERT INTO qiita.biosample_global_field
     (internal_name, display_name, description, data_type, required, created_by_idx)
 VALUES
@@ -111,9 +102,6 @@ VALUES
 ON CONFLICT (internal_name) DO NOTHING;
 
 
--- The ENVO-bound originals carry no description, which leaves the newer
--- verbatim field of each pair the only documented one. State what each holds
--- so the pair reads as the contrast it is.
 UPDATE qiita.biosample_global_field
    SET description = 'Broad-scale environmental context, resolved against ENVO'
  WHERE internal_name = 'broad_scale_environmental_context';

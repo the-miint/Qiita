@@ -1,8 +1,7 @@
 """Row bodies for the ENA objects this package submits, and the mapping into them.
 
 One model per `ena` catalog table, each field named for the ENA column it
-populates, so a dumped model is addressable by column name and no second
-statement of the ordering exists to drift from it.
+populates.
 """
 
 from __future__ import annotations
@@ -26,13 +25,9 @@ from qiita_control_plane.repositories._sample_helpers import (
     GlobalMetadataRow,
 )
 
-# ENA's `project name` attribute, sourced from the study rather than the sample.
 _PROJECT_NAME_ATTRIBUTE = "project name"
 
-# The one ENA checklist with no `project name` field, so the attribute is
-# withheld for it and sent to every other. Deliberately a single value, not a
-# set: a second checklist needing this carve-out means the per-checklist
-# requirement belongs in the database, not in a wider constant here.
+# The only seeded checklist without a `project name` field.
 _CHECKLIST_WITHOUT_PROJECT_NAME = "ERC000011"
 
 
@@ -88,8 +83,6 @@ def _taxon_id_of(metadata: dict[str, GlobalMetadataRow]) -> int:
     as a resolved term and its term_id is an id that vocabulary issued. That
     binding is what establishes the id names a real taxon.
     """
-    # Fills ena.samples' own taxon_id column rather than becoming an
-    # attribute: the SAMPLE record requires it independently of any checklist.
     entry = metadata.get(BIOSAMPLE_FIELD_TAXON_ID)
     if entry is None:
         raise EnaMappingError("biosample has no taxon id, which ena.samples requires")
@@ -160,8 +153,6 @@ def map_biosample_to_ena_sample_row(
         if requirement.unit is not None:
             attribute_units[requirement.checklist_field_name] = requirement.unit
 
-    # Sourced from the study, so it is not a requirement row and is sent to
-    # every checklist that defines the field.
     if checklist.name != _CHECKLIST_WITHOUT_PROJECT_NAME:
         attributes[_PROJECT_NAME_ATTRIBUTE] = study_title
 

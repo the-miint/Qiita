@@ -25,11 +25,17 @@ from qiita_control_plane.ena_submission.catalog import (
 )
 from qiita_control_plane.ena_submission.mapping import EnaProjectRow, EnaSampleRow
 
-_OPEN_SESSION = "qiita_control_plane.ena_submission.catalog._open_ena_submission_session"
+from .conftest import (
+    _CHECKLIST,
+    _ENDPOINT,
+    _OPEN_SESSION,
+    _WEBIN_USER,
+    _project_row,
+    _sample_row,
+    _valid_kwargs,
+)
 
-_WEBIN_USER = "Webin-00000"
-# miint's ENA endpoint is an environment selector, not a URL.
-_ENDPOINT = "test"
+_INVALID_ENDPOINTS = ["", "https://wwwdev.ebi.ac.uk/ena/submit/webin-v2/", "Production"]
 
 # Every spec the module defines, paired with the model whose fields its columns
 # bind from. A spec missing from here fails its own registration test.
@@ -51,18 +57,15 @@ _TWO_SAMPLE_INSERT_SQL = (
     " RETURNING alias, ers_accession, samea_accession"
 )
 
-_CHECKLIST = "ERC000011"
-
-# The three failure wordings, quoted from their sources: ENA's own receipt, and
-# miint's two client-side refusals (`ena_object_insert_op.hpp` for the alias
-# check, `ena_samples_insert_op.cpp` for the checklist validator).
 _RECEIPT_ALREADY_SUBMITTED = (
-    'ENA receipt: alias "7" already exists in the submission account with accession: "PRJEB77"'
+    'ENA receipt: alias "QS7" already exists in the submission account with accession: "PRJEB77"'
 )
 _MIINT_ALIAS_CHECK_BLOCKED = (
-    "INSERT INTO ena.samples: aliases already exist in submission account: '11', '12'"
+    "INSERT INTO ena.samples: aliases already exist in submission account: 'QB11', 'QB12'"
 )
-_CHECKLIST_VALIDATION_DETAIL = "sample alias '11': mandatory attribute 'collection date' is missing"
+_CHECKLIST_VALIDATION_DETAIL = (
+    "sample alias 'QB11': mandatory attribute 'collection date' is missing"
+)
 _MIINT_CHECKLIST_VALIDATION = (
     f"INSERT INTO ena.samples: checklist validation failed:\n  {_CHECKLIST_VALIDATION_DETAIL}"
 )
@@ -155,60 +158,27 @@ class _SubmissionLogConn:
         self.closed = True
 
 
-@pytest.fixture
-def password_file(tmp_path: Path) -> Path:
-    """A readable Webin password file; its contents are miint's to consume."""
-    path = tmp_path / "webin_password.txt"
-    path.write_text("not-a-real-password\n")
-    return path
-
-
-def _valid_kwargs(password_file: Path, **overrides) -> dict:
-    """A configuration that passes validation, with any field replaced."""
-    return {
-        "webin_user": _WEBIN_USER,
-        "webin_password_file": password_file,
-        "endpoint": _ENDPOINT,
-        **overrides,
-    }
-
-
 def _catalog_over(monkeypatch, password_file: Path, conn: _RecordingConn) -> EnaSubmissionCatalog:
     """A catalog whose session is `conn`; enter it to submit."""
     monkeypatch.setattr(_OPEN_SESSION, lambda **kwargs: conn)
     return EnaSubmissionCatalog(**_valid_kwargs(password_file))
 
 
-def _project_row() -> EnaProjectRow:
-    """One project body, with the unpopulated columns left at their default."""
-    return EnaProjectRow(alias="7", title="A study", project_type="other")
-
-
-def _sample_row(alias: str) -> EnaSampleRow:
-    """One sample body carrying a single checklist attribute and no units."""
-    return EnaSampleRow(
-        alias=alias,
-        taxon_id=408170,
-        checklist=_CHECKLIST,
-        attributes={"collection date": "2026-01-15"},
-    )
-
-
-def _open(monkeypatch, password_file: Path, *, dry_run: bool = False) -> _RecordingConn:
+def _open(
+    monkeypatch, password_file: Path, *, dry_run: bool = False, endpoint_url: str | None = None
+) -> _RecordingConn:
     """Open a session against a recording connection and return the recorder."""
     conn = _RecordingConn()
     monkeypatch.setattr(catalog_module, "connect_with_miint_staged", lambda: conn)
-    catalog_module._open_ena_submission_session(**_valid_kwargs(password_file, dry_run=dry_run))
+    catalog_module._open_ena_submission_session(
+        **_valid_kwargs(password_file, dry_run=dry_run, endpoint_url=endpoint_url)
+    )
     return conn
 
 
 def test__open_ena_submission_session_creates_secret(monkeypatch, password_file: Path):
     """Tests the case where a session is opened: the Webin secret is registered
-    with the user, the password file, and the endpoint, as a TYPE ENA secret.
-
-    The endpoint rides on the secret as well as the attach because the secret is
-    the only side miint validates it on.
-    """
+    with the user, the password file, and the endpoint, as a TYPE ENA secret."""
     conn = _open(monkeypatch, password_file)
     secret = next(s for s in conn.statements if "CREATE SECRET" in s)
     assert catalog_module._SECRET_NAME in secret
@@ -218,15 +188,27 @@ def test__open_ena_submission_session_creates_secret(monkeypatch, password_file:
     assert f"ENDPOINT '{_ENDPOINT}'" in secret
 
 
-def test__open_ena_submission_session_attaches_catalog(monkeypatch, password_file: Path):
-    """Tests the case where a session is opened: the catalog is attached at the
-    endpoint, under the module's alias, bound to the registered secret."""
-    conn = _open(monkeypatch, password_file)
+@pytest.mark.parametrize(
+    ("endpoint_url", "url_option"),
+    [
+        (None, ""),
+        ("http://127.0.0.1:8080", ", ENDPOINT_URL 'http://127.0.0.1:8080'"),
+    ],
+)
+def test__open_ena_submission_session_attaches_catalog(
+    monkeypatch, password_file: Path, endpoint_url: str | None, url_option: str
+):
+    """Tests the case where a session is opened without a URL and the case where
+    it is opened with one: the catalog is attached at the endpoint, under the
+    module's alias, bound to the registered secret, and points at the URL only
+    when one is given."""
+    conn = _open(monkeypatch, password_file, endpoint_url=endpoint_url)
     attach = next(s for s in conn.statements if s.startswith("ATTACH "))
-    assert f"'{_ENDPOINT}'" in attach
-    assert f"AS {catalog_module._CATALOG_ALIAS}" in attach
-    assert "TYPE ENA" in attach
-    assert catalog_module._SECRET_NAME in attach
+    expected = (
+        f"ATTACH '{_ENDPOINT}' AS {catalog_module._CATALOG_ALIAS}"
+        f" (TYPE ENA, SECRET {catalog_module._SECRET_NAME}{url_option})"
+    )
+    assert attach == expected
 
 
 @pytest.mark.parametrize(
@@ -268,15 +250,30 @@ def test__open_ena_submission_session_emits_no_install(monkeypatch, password_fil
         assert "LOAD " not in statement.upper(), statement
 
 
+@pytest.mark.parametrize("endpoint", _INVALID_ENDPOINTS)
+def test__open_ena_submission_session_invalid_endpoint_raises(
+    monkeypatch, password_file: Path, endpoint: str
+):
+    """Tests the case where the session is opened directly with an endpoint
+    outside ENA's two environments: it fails naming the endpoint, and no
+    connection is opened."""
+    monkeypatch.setattr(
+        catalog_module,
+        "connect_with_miint_staged",
+        lambda: pytest.fail("no connection may be opened"),
+    )
+    with pytest.raises(EnaSubmissionError, match="endpoint"):
+        catalog_module._open_ena_submission_session(
+            **_valid_kwargs(password_file, endpoint=endpoint, dry_run=False)
+        )
+
+
 @pytest.mark.parametrize(
     ("field", "overrides"),
     [
         ("webin_user", {"webin_user": ""}),
         ("webin_user", {"webin_user": "   "}),
-        ("endpoint", {"endpoint": ""}),
-        # ATTACH accepts any string, so a wrong endpoint has to fail here.
-        ("endpoint", {"endpoint": "https://wwwdev.ebi.ac.uk/ena/submit/webin-v2/"}),
-        ("endpoint", {"endpoint": "Production"}),
+        *[("endpoint", {"endpoint": endpoint}) for endpoint in _INVALID_ENDPOINTS],
         ("password", {"webin_password_file": Path("/nonexistent/webin_password.txt")}),
     ],
 )
@@ -377,7 +374,7 @@ def test_submit_project(monkeypatch, password_file: Path):
         assigned = catalog.submit_project(_project_row())
         # Read before the block exits, whose teardown statement would be last.
         assert conn.statements[-1] == _PROJECT_INSERT_SQL
-        assert conn.parameters[-1] == ["7", "A study", None, "other"]
+        assert conn.parameters[-1] == ["QS7", "A study", None, "other"]
     assert assigned == ("PRJEB77", "ERP77")
 
 
@@ -394,19 +391,19 @@ def test_submit_samples(monkeypatch, password_file: Path):
     """Tests the case where several samples are submitted: a single INSERT
     carries one placeholder group per row, every row's values bind in column
     order, and the batch RETURNING asks for the alias alongside."""
-    conn = _RecordingConn([("11", "ERS11", "SAMEA11"), ("12", "ERS12", "SAMEA12")])
-    rows = [_sample_row("11"), _sample_row("12")]
+    conn = _RecordingConn([("QB11", "ERS11", "SAMEA11"), ("QB12", "ERS12", "SAMEA12")])
+    rows = [_sample_row("QB11"), _sample_row("QB12")]
     with _catalog_over(monkeypatch, password_file, conn) as catalog:
         catalog.submit_samples(rows)
         # Read before the block exits, whose teardown statement would be last.
         assert conn.statements[-1] == _TWO_SAMPLE_INSERT_SQL
         assert conn.parameters[-1] == [
-            "11",
+            "QB11",
             408170,
             _CHECKLIST,
             {"collection date": "2026-01-15"},
             {},
-            "12",
+            "QB12",
             408170,
             _CHECKLIST,
             {"collection date": "2026-01-15"},
@@ -418,8 +415,8 @@ def test_submit_samples_maps_results_by_alias(monkeypatch, password_file: Path):
     """Tests the case where the returned rows arrive in an order other than the
     one submitted: each row's accessions are matched to it by alias, and a row
     no result names reports none."""
-    conn = _RecordingConn([("12", "ERS12", "SAMEA12"), ("11", "ERS11", "SAMEA11")])
-    rows = [_sample_row("11"), _sample_row("12"), _sample_row("13")]
+    conn = _RecordingConn([("QB12", "ERS12", "SAMEA12"), ("QB11", "ERS11", "SAMEA11")])
+    rows = [_sample_row("QB11"), _sample_row("QB12"), _sample_row("QB13")]
     with _catalog_over(monkeypatch, password_file, conn) as catalog:
         assigned = catalog.submit_samples(rows)
     assert assigned == [("ERS11", "SAMEA11"), ("ERS12", "SAMEA12"), None]
@@ -429,7 +426,7 @@ def test_submit_samples_dry_run_returns_none_per_row(monkeypatch, password_file:
     """Tests the case where a validate-only session returns no rows: every
     submitted sample reports no accession, one entry per input row."""
     conn = _RecordingConn([])
-    rows = [_sample_row("11"), _sample_row("12")]
+    rows = [_sample_row("QB11"), _sample_row("QB12")]
     with _catalog_over(monkeypatch, password_file, conn) as catalog:
         assigned = catalog.submit_samples(rows)
     assert assigned == [None, None]
@@ -467,7 +464,7 @@ def test__insert_returning_rows_already_submitted(monkeypatch, password_file: Pa
             catalog.submit_project(_project_row())
     assert (raised.value.object_kind, raised.value.existing) == (
         EnaObjectKind.PROJECT,
-        (EnaExistingAccession("7", "PRJEB77"),),
+        (EnaExistingAccession("QS7", "PRJEB77"),),
     )
 
 
@@ -478,10 +475,10 @@ def test__insert_returning_rows_alias_check_blocked(monkeypatch, password_file: 
     conn = _SubmissionLogConn(_MIINT_ALIAS_CHECK_BLOCKED)
     with _catalog_over(monkeypatch, password_file, conn) as catalog:
         with pytest.raises(EnaAliasCheckBlockedError) as raised:
-            catalog.submit_samples([_sample_row("11"), _sample_row("12")])
+            catalog.submit_samples([_sample_row("QB11"), _sample_row("QB12")])
     assert (raised.value.object_kind, raised.value.aliases) == (
         EnaObjectKind.SAMPLE,
-        ("11", "12"),
+        ("QB11", "QB12"),
     )
     assert "no accession" in str(raised.value)
 
@@ -493,7 +490,7 @@ def test__insert_returning_rows_checklist_validation(monkeypatch, password_file:
     conn = _SubmissionLogConn(_MIINT_CHECKLIST_VALIDATION)
     with _catalog_over(monkeypatch, password_file, conn) as catalog:
         with pytest.raises(EnaChecklistValidationError) as raised:
-            catalog.submit_samples([_sample_row("11")])
+            catalog.submit_samples([_sample_row("QB11")])
     assert (raised.value.object_kind, raised.value.detail) == (
         EnaObjectKind.SAMPLE,
         _CHECKLIST_VALIDATION_DETAIL,
@@ -510,7 +507,7 @@ def test__insert_returning_rows_unclassified_failure(monkeypatch, password_file:
     )
     with _catalog_over(monkeypatch, password_file, conn) as catalog:
         with pytest.raises(EnaSubmissionError, match="Webin account is suspended") as raised:
-            catalog.submit_samples([_sample_row("11")])
+            catalog.submit_samples([_sample_row("QB11")])
     assert type(raised.value) is EnaSubmissionError
 
 
@@ -535,7 +532,7 @@ def test__last_submission_error_bounded_by_high_water(
     )
     with _catalog_over(monkeypatch, password_file, conn) as catalog:
         with pytest.raises(EnaSubmissionError) as raised:
-            catalog.submit_samples([_sample_row("11")])
+            catalog.submit_samples([_sample_row("QB11")])
     assert expected_detail in str(raised.value)
     assert "an earlier request" not in str(raised.value)
 
@@ -547,7 +544,7 @@ def test__last_submission_error_unreadable_log_does_not_mask(monkeypatch, passwo
     conn = _SubmissionLogConn(_OPAQUE_INSERT_FAILURE, log_readable=False)
     with _catalog_over(monkeypatch, password_file, conn) as catalog:
         with pytest.raises(EnaSubmissionError, match=_OPAQUE_INSERT_FAILURE) as raised:
-            catalog.submit_samples([_sample_row("11")])
+            catalog.submit_samples([_sample_row("QB11")])
     assert type(raised.value) is EnaSubmissionError
 
 
@@ -558,17 +555,17 @@ def test__insert_returning_rows_already_submitted_names_every_collision(
     alias ENA's receipt names is carried, since a caller recording only the
     first would lose the rest with nothing saying so."""
     receipt = (
-        'ENA receipt: alias "11" already exists in the submission account with'
-        ' accession: "ERS11"; alias "12" already exists in the submission account'
+        'ENA receipt: alias "QB11" already exists in the submission account with'
+        ' accession: "ERS11"; alias "QB12" already exists in the submission account'
         ' with accession: "ERS12"'
     )
     conn = _SubmissionLogConn(_OPAQUE_INSERT_FAILURE, logged_on_failure=(2, [receipt]))
     with _catalog_over(monkeypatch, password_file, conn) as catalog:
         with pytest.raises(EnaAlreadySubmittedError) as raised:
-            catalog.submit_samples([_sample_row("11"), _sample_row("12")])
+            catalog.submit_samples([_sample_row("QB11"), _sample_row("QB12")])
     assert raised.value.existing == (
-        EnaExistingAccession("11", "ERS11"),
-        EnaExistingAccession("12", "ERS12"),
+        EnaExistingAccession("QB11", "ERS11"),
+        EnaExistingAccession("QB12", "ERS12"),
     )
 
 
@@ -586,7 +583,7 @@ def test__classify_submission_failure_alias_check_without_quoted_aliases():
     """Tests the case where the alias-check sentence matches but names nothing
     extractable: the base error reports the disagreement instead of an
     alias-check error carrying the empty payload it exists to deliver."""
-    message = "INSERT INTO ena.samples: aliases already exist in submission account: 11, 12"
+    message = "INSERT INTO ena.samples: aliases already exist in submission account: QB11, QB12"
     classified = catalog_module._classify_submission_failure(catalog_module._SAMPLE_SPEC, message)
     assert type(classified) is EnaSubmissionError
     assert "no alias could be read" in str(classified)
@@ -599,7 +596,7 @@ def test__last_submission_error_empty_message_list_does_not_mask(monkeypatch, pa
     conn = _SubmissionLogConn(_OPAQUE_INSERT_FAILURE, logged_on_failure=(2, []))
     with _catalog_over(monkeypatch, password_file, conn) as catalog:
         with pytest.raises(EnaSubmissionError, match=_OPAQUE_INSERT_FAILURE) as raised:
-            catalog.submit_samples([_sample_row("11")])
+            catalog.submit_samples([_sample_row("QB11")])
     assert "[]" not in str(raised.value)
 
 
@@ -612,7 +609,7 @@ def test__last_submission_error_joins_every_logged_message(monkeypatch, password
     )
     with _catalog_over(monkeypatch, password_file, conn) as catalog:
         with pytest.raises(EnaSubmissionError) as raised:
-            catalog.submit_samples([_sample_row("11")])
+            catalog.submit_samples([_sample_row("QB11")])
     assert "first complaint; second complaint" in str(raised.value)
     assert "['" not in str(raised.value)
 
@@ -640,7 +637,7 @@ def test__last_submission_error_bounded_read_is_filtered_and_ordered(
     )
     with _catalog_over(monkeypatch, password_file, conn) as catalog:
         with pytest.raises(EnaSubmissionError):
-            catalog.submit_samples([_sample_row("11")])
+            catalog.submit_samples([_sample_row("QB11")])
     bounded_read = next(sql for sql in conn.statements if sql.startswith("SELECT error_messages"))
     assert bounded_read == (
         "SELECT error_messages FROM ena.submission_log WHERE NOT success"
@@ -660,7 +657,7 @@ def test__insert_returning_rows_checklist_detail_excludes_the_exception(
     )
     with _catalog_over(monkeypatch, password_file, conn) as catalog:
         with pytest.raises(EnaChecklistValidationError) as raised:
-            catalog.submit_samples([_sample_row("11")])
+            catalog.submit_samples([_sample_row("QB11")])
     assert raised.value.detail == _CHECKLIST_VALIDATION_DETAIL
 
 
@@ -675,7 +672,7 @@ def test__bind_values_orders_to_spec_columns():
         returning=("prjeb_accession",),
     )
     values = catalog_module._bind_values(spec, _project_row())
-    assert values == ("other", "7")
+    assert values == ("other", "QS7")
 
 
 def test_submit_samples_outside_the_block_raises(monkeypatch, password_file: Path):
@@ -696,7 +693,7 @@ def test_submit_samples_duplicate_alias_raises(monkeypatch, password_file: Path)
     with _catalog_over(monkeypatch, password_file, conn) as catalog:
         before = list(conn.statements)
         with pytest.raises(EnaSubmissionError, match="distinct alias"):
-            catalog.submit_samples([_sample_row("11"), _sample_row("11")])
+            catalog.submit_samples([_sample_row("QB11"), _sample_row("QB11")])
         assert conn.statements == before
 
 
@@ -706,7 +703,7 @@ def test_EnaSampleRow_blank_text_is_refused(field: str, blank: str):
     """Tests the case where a sample's alias or checklist carries no content: it
     is refused at construction, since an empty checklist turns off miint's own
     validation and an empty alias is the key results are matched on."""
-    overrides = {"alias": "11", "checklist": _CHECKLIST, field: blank}
+    overrides = {"alias": "QB11", "checklist": _CHECKLIST, field: blank}
     with pytest.raises(ValidationError):
         EnaSampleRow(taxon_id=408170, **overrides)
 
@@ -731,5 +728,5 @@ def test_EnaProjectRow_blank_alias_is_refused(blank: str):
 def test_ena_row_alias_is_stripped(model: type, overrides: dict):
     """Tests the case where an alias arrives with stray padding: it is stored
     stripped, so one alias written two ways keys to the same result."""
-    row = model(alias="  11  ", **overrides)
-    assert row.alias == "11"
+    row = model(alias="  QB11  ", **overrides)
+    assert row.alias == "QB11"

@@ -26,29 +26,19 @@ from .mapping import EnaProjectRow, EnaSampleRow
 _SECRET_NAME = "qiita_ena_submission"
 _CATALOG_ALIAS = "ena"
 
-# miint's ENA endpoint is an environment selector, not a URL. Both CREATE SECRET
-# and ATTACH reject anything outside this set; checking it here fails before a
-# connection is opened and raises this module's own error type rather than a
-# DuckDB binder error.
+# miint's ATTACH also takes a URL or either label in any case; this set is the only exact check.
 ENA_ENDPOINTS = frozenset({"test", "production"})
 
-# Per-session DuckDB bounds. A connection left at DuckDB's defaults takes every
-# core and roughly 80% of system RAM, which inside the process that also serves
-# the REST API is a ceiling worth naming rather than inheriting. These are
-# conservative bounds, not measurements: a session carries one project row and
-# some per-sample attribute maps, so it is sized for metadata rather than for
-# anything that streams sequence data, and several sessions may run at once.
+# DuckDB's defaults take every core and ~80% of RAM; these size a session for
+# metadata, inside the process that also serves the REST API.
 _SESSION_THREADS = 2
 _SESSION_MEMORY_LIMIT = "1GB"
 
-# A qualified name elides the catalog's one schema, so the leading segment of
-# every table below is the ATTACH alias itself.
 
 # miint's record of what it sent and what came back; the one enrichment source
 # for a rejected insert.
 _SUBMISSION_LOG_TABLE = f"{_CATALOG_ALIAS}.submission_log"
 
-# The submitter-chosen name ENA keys an object on; every spec names it.
 _ALIAS_COLUMN = "alias"
 
 
@@ -86,9 +76,7 @@ class EnaAlreadySubmittedError(EnaSubmissionError):
     under this submission account.
 
     Carries every accession the receipt names, since one envelope can collide on
-    several of its rows. Which of the object's two accessions each is differs by
-    object, so recovering the other means looking the object up rather than
-    assuming a namespace.
+    several of its rows.
     """
 
     def __init__(
@@ -136,8 +124,6 @@ class EnaChecklistValidationError(EnaSubmissionError):
         super().__init__(f"ENA {object_kind} checklist validation failed: {detail}")
 
 
-# ENA's own receipt names an accession and leaves a submission_log row behind;
-# miint's client-side refusals fire before the POST and leave neither.
 _ALREADY_SUBMITTED_RE = re.compile(
     r'(?:alias\s+"([^"]+)"\s+)?already exists in the submission account with accession:\s*"([^"]+)"'
 )
@@ -173,8 +159,7 @@ _PROJECT_SPEC = EnaObjectSpec(
     returning=("prjeb_accession", "erp_accession"),
 )
 
-# `scientific_name` is absent rather than bound as NULL: ENA derives it from the
-# taxon id, and Qiita's seeded label risks a rejection wherever the two drifted.
+# `scientific_name` is never sent: ENA fills it in from the taxon id.
 _SAMPLE_SPEC = EnaObjectSpec(
     object_kind=EnaObjectKind.SAMPLE,
     table=f"{_CATALOG_ALIAS}.samples",
@@ -183,18 +168,33 @@ _SAMPLE_SPEC = EnaObjectSpec(
 )
 
 
+def _require_ena_endpoint(endpoint: str) -> None:
+    """Raise unless `endpoint` names one of ENA's two environments."""
+    if endpoint not in ENA_ENDPOINTS:
+        raise EnaSubmissionError(
+            f"endpoint must be one of {sorted(ENA_ENDPOINTS)}; got {endpoint!r}"
+        )
+
+
 def _open_ena_submission_session(
     *,
     webin_user: str,
     webin_password_file: Path,
     endpoint: str,
     dry_run: bool,
+    endpoint_url: str | None = None,
 ) -> duckdb.DuckDBPyConnection:
     """Open a session with the Webin secret registered and the catalog attached.
 
     Under `dry_run` every insert on the returned session is validated against
-    ENA instead of submitted. The caller owns the connection and must close it.
+    ENA instead of submitted. `endpoint_url` sends the session's submissions to
+    a stand-in server instead of ENA's, and exists for tests only. The caller
+    owns the connection and must close it.
     """
+    _require_ena_endpoint(endpoint)
+    url_option = (
+        "" if endpoint_url is None else f", ENDPOINT_URL {sql_string_literal(endpoint_url)}"
+    )
     con = connect_with_miint_staged()
     try:
         con.execute(f"SET threads = {_SESSION_THREADS}")
@@ -208,7 +208,7 @@ def _open_ena_submission_session(
         )
         con.execute(
             f"ATTACH {sql_string_literal(endpoint)} AS {_CATALOG_ALIAS}"
-            f" (TYPE ENA, SECRET {_SECRET_NAME})"
+            f" (TYPE ENA, SECRET {_SECRET_NAME}{url_option})"
         )
         if dry_run:
             con.execute("SET miint_ena_validate_only = true")
@@ -387,10 +387,7 @@ class EnaSubmissionCatalog:
     ) -> None:
         if not webin_user.strip():
             raise EnaSubmissionError("webin_user is blank; cannot register a Webin secret")
-        if endpoint not in ENA_ENDPOINTS:
-            raise EnaSubmissionError(
-                f"endpoint must be one of {sorted(ENA_ENDPOINTS)}; got {endpoint!r}"
-            )
+        _require_ena_endpoint(endpoint)
         if not webin_password_file.is_file():
             raise EnaSubmissionError(f"webin password file not found: {webin_password_file}")
         self._webin_user = webin_user

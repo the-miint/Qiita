@@ -1068,8 +1068,6 @@ async def fetch_biosample_checklist_requirements(
         "  LEFT JOIN qiita.biosample_global_field bgf"
         "         ON bgf.idx = r.biosample_global_field_idx"
         " WHERE mc.idx = $1"
-        # Ordered for legible output when reading these rows by hand; no
-        # caller depends on it.
         " ORDER BY cf.name",
         metadata_checklist_idx,
     )
