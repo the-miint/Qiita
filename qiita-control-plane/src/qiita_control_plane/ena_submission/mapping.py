@@ -26,8 +26,6 @@ from qiita_control_plane.repositories._sample_helpers import (
 )
 
 _PROJECT_NAME_ATTRIBUTE = "project name"
-
-# The only seeded checklist without a `project name` field.
 _CHECKLIST_WITHOUT_PROJECT_NAME = "ERC000011"
 
 
@@ -77,7 +75,7 @@ def _render_value(value: SampleMetadataValue, *, field_name: str) -> str:
 
 
 def _taxon_id_of(metadata: dict[str, GlobalMetadataRow]) -> int:
-    """Extract the NCBI taxon id ena.samples requires of every sample.
+    """Extract the NCBI taxon id ena.samples requires of every biosample.
 
     The field is bound to the NCBI Taxonomy terminology, so the value arrives
     as a resolved term and its term_id is an id that vocabulary issued. That
@@ -85,7 +83,7 @@ def _taxon_id_of(metadata: dict[str, GlobalMetadataRow]) -> int:
     """
     entry = metadata.get(BIOSAMPLE_FIELD_TAXON_ID)
     if entry is None:
-        raise EnaMappingError("biosample has no taxon id, which ena.samples requires")
+        raise EnaMappingError("biosample has no taxon id, which an ENA sample requires")
     if not isinstance(entry.value, TerminologyTermRef):
         raise EnaMappingError(
             f"taxon id is {type(entry.value).__name__}, not a resolved terminology term"
@@ -126,15 +124,15 @@ def map_biosample_to_ena_sample_row(
     nothing else, so a value Qiita holds for an unrequired field is not
     submitted and a required field Qiita lacks raises here rather than being
     rejected by the whole envelope at submit. `project name` is the one
-    attribute drawn from the study instead of the sample.
+    attribute drawn from the study instead of the biosample.
     """
     if checklist is None:
         raise EnaMappingError(
-            f"biosample {export_entity_id} claims no metadata checklist, which ena.samples requires"
+            f"biosample {export_entity_id} claims no metadata checklist, which an ENA sample requires"  # noqa: E501
         )
     if not requirements:
         raise EnaMappingError(
-            f"checklist {checklist.name} has no seeded requirements, so a sample "
+            f"checklist {checklist.name} has no seeded requirements, so a biosample "
             "under it would be submitted carrying nothing"
         )
 

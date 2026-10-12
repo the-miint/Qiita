@@ -13,12 +13,6 @@ and a prep_sample-spec sanity test that proves
 PREP_SAMPLE_METADATA_SPEC's identifiers and callables are correctly
 bound.
 
-Biosample tests use the ctx fixture (Pattern 2: committed rows + swept
-teardown) so the diagnostic SELECT sees the prior writer's committed row.
-The prep_sample sanity test uses Pattern 1 (per-test transaction rollback)
-because the prep_sample side has no committed-fixture pattern yet.
-parse_text_for_data_type tests are pure-unit and need no fixture.
-
 Known coverage gap: the collision sub-cases are driven from a single
 thread against an already-committed occupant row; the savepoint /
 concurrent-delete race (the slot occupant vanishing between the savepoint
@@ -6770,8 +6764,6 @@ async def test_fetch_global_fields_orders_by_internal_name(ctx, spec):
 # ---------------------------------------------------------------------------
 # fetch_biosample_checklist_requirements
 # ---------------------------------------------------------------------------
-# Compared as sets: the exact order depends on the database's collation, which
-# is not a contract worth pinning.
 
 
 async def test_fetch_biosample_checklist_requirements(postgres_pool):

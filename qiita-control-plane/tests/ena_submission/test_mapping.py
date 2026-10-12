@@ -5,6 +5,7 @@ from decimal import Decimal
 
 import pytest
 from qiita_common.models import (
+    BIOSAMPLE_FIELD_TAXON_ID,
     FieldDataType,
     MetadataChecklistRef,
     MissingReasonRef,
@@ -28,8 +29,7 @@ from qiita_control_plane.repositories._sample_helpers import (
 _HUMAN_GUT = MetadataChecklistRef(idx=4, name="ERC000015")
 _ENA_DEFAULT = MetadataChecklistRef(idx=1, name="ERC000011")
 _STUDY_TITLE = "Gut microbiome of resident penguins"
-# Deliberately unrelated to any idx, so an alias composed from an idx
-# cannot match by accident.
+# Unrelated to any idx, so an alias composed from an idx cannot match by accident.
 _STUDY_EXPORT_ENTITY_ID = "QS903"
 _BIOSAMPLE_EXPORT_ENTITY_ID = "QB812"
 _TAXON_ID = 408170
@@ -69,8 +69,12 @@ _TAXON_TERM = TerminologyTermRef(idx=7, term_id="408170", label="human gut metag
 
 
 def _taxon_metadata() -> dict[str, GlobalMetadataRow]:
-    """The taxon entry every sample needs, independent of any checklist."""
-    return {"taxon_id": _metadata_row("taxon_id", _TAXON_TERM, FieldDataType.TERMINOLOGY)}
+    """The taxon entry every biosample needs, independent of any checklist."""
+    return {
+        BIOSAMPLE_FIELD_TAXON_ID: _metadata_row(
+            BIOSAMPLE_FIELD_TAXON_ID, _TAXON_TERM, FieldDataType.TERMINOLOGY
+        )
+    }
 
 
 def _expected_sample(
@@ -272,8 +276,7 @@ def test_map_biosample_to_ena_sample_row_date_value():
 
 def test_map_biosample_to_ena_sample_row_no_checklist():
     """Tests the case where the biosample claims no checklist: mapping raises
-    rather than passing an empty checklist, which would silently disable the
-    client-side validation instead of failing."""
+    rather than passing an empty checklist."""
     with pytest.raises(EnaMappingError, match="claims no metadata checklist"):
         map_biosample_to_ena_sample_row(
             export_entity_id=_BIOSAMPLE_EXPORT_ENTITY_ID,
@@ -286,8 +289,8 @@ def test_map_biosample_to_ena_sample_row_no_checklist():
 
 def test_map_biosample_to_ena_sample_row_no_requirements():
     """Tests the case where the checklist exists but nothing is seeded for it:
-    mapping raises, since a sample submitted under a real checklist carrying no
-    attributes is a gap in the seed rather than a sample with nothing to say."""
+    mapping raises, since a biosample submitted under a real checklist carrying no
+    attributes is a gap in the seed rather than a biosample with nothing to say."""
     with pytest.raises(EnaMappingError, match="no seeded requirements"):
         map_biosample_to_ena_sample_row(
             export_entity_id=_BIOSAMPLE_EXPORT_ENTITY_ID,
@@ -301,7 +304,7 @@ def test_map_biosample_to_ena_sample_row_no_requirements():
 def test_map_biosample_to_ena_sample_row_missing_required_field():
     """Tests the case where the biosample lacks a field its checklist requires:
     mapping raises naming the field, rather than submitting an envelope that
-    fails validation for every sample in it."""
+    fails validation for every biosample in it."""
     requirements = [_COLLECTION_DATE]
 
     with pytest.raises(EnaMappingError, match="collection_date"):
@@ -337,8 +340,8 @@ def test_map_biosample_to_ena_sample_row_taxon_not_resolved():
     ena.samples needs the id itself. A populated missing reason supersedes the
     field's terminology typing, so ordinary data reaches this path."""
     metadata = {
-        "taxon_id": _metadata_row(
-            "taxon_id",
+        BIOSAMPLE_FIELD_TAXON_ID: _metadata_row(
+            BIOSAMPLE_FIELD_TAXON_ID,
             MissingReasonRef(idx=2, name="not collected"),
             FieldDataType.TERMINOLOGY,
         ),
@@ -357,9 +360,7 @@ def test_map_biosample_to_ena_sample_row_taxon_not_resolved():
 
 def test_map_biosample_to_ena_sample_row_unrenderable_value():
     """Tests the case where a required field holds a kind with no ENA
-    rendering: mapping raises rather than guessing. No field any seeded
-    checklist requires is of such a kind, so this fires only when a newly
-    required field needs a rendering decision."""
+    rendering: mapping raises rather than guessing."""
     requirements = [_COLLECTION_DATE]
     metadata = _taxon_metadata() | {
         "collection_date": _metadata_row("collection_date", True, FieldDataType.BOOLEAN),

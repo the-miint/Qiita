@@ -23,8 +23,7 @@ COMMENT ON TABLE qiita.metadata_checklist IS
     'that describes which fields a sample should carry to be considered '
     'compliant. A metadata checklist''s required-field list is declared by '
     'the metadata_checklist_requirement table. Checklists are not enforced at '
-    'write time; they are checked at query time when a sample claims '
-    'conformance. Metadata checklists are not retired: conformance against '
+    'write time. Metadata checklists are not retired: conformance against '
     'a currently-defined checklist is always meaningful, even for samples '
     'created long ago. A metadata_checklist row does not carry creation-audit '
     'columns (created_by_idx, created_at) because the checklist is a mutable '
@@ -122,8 +121,7 @@ VALUES
      'text', false, 1),
     ('environmental_medium_verbatim', 'env_medium',
      'Environmental medium as supplied, unresolved against any ontology',
-     'text', false, 1)
-ON CONFLICT (internal_name) DO NOTHING;
+     'text', false, 1);
 
 
 UPDATE qiita.biosample_global_field
@@ -169,8 +167,7 @@ VALUES
      ARRAY['ERC000024']);
 
 INSERT INTO qiita.checklist_field (name)
-SELECT name FROM checklist_field_spec
-ON CONFLICT (name) DO NOTHING;
+SELECT name FROM checklist_field_spec;
 
 INSERT INTO qiita.metadata_checklist_requirement
     (metadata_checklist_idx, biosample_global_field_idx, checklist_field_idx, unit)
@@ -179,8 +176,7 @@ SELECT mc.idx, bgf.idx, cf.idx, fs.unit
   CROSS JOIN LATERAL unnest(fs.checklist_names) AS cn(checklist_name)
   JOIN qiita.checklist_field cf ON cf.name = fs.name
   JOIN qiita.metadata_checklist mc ON mc.name = cn.checklist_name
-  JOIN qiita.biosample_global_field bgf ON bgf.internal_name = fs.source_internal_name
-ON CONFLICT DO NOTHING;
+  JOIN qiita.biosample_global_field bgf ON bgf.internal_name = fs.source_internal_name;
 
 DO $$
 DECLARE
@@ -199,8 +195,7 @@ DROP TABLE checklist_field_spec;
 
 -- migrate:down
 
-DELETE FROM qiita.metadata_checklist_requirement
- WHERE checklist_field_idx IN (SELECT idx FROM qiita.checklist_field);
+DELETE FROM qiita.metadata_checklist_requirement;
 
 UPDATE qiita.biosample_global_field
    SET description = NULL

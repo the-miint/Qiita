@@ -104,10 +104,12 @@ class _RecordingConn:
         self.closed = True
 
 
-def _catalog_over(monkeypatch, password_file: Path, conn: _RecordingConn) -> EnaSubmissionCatalog:
+def _catalog_over(
+    monkeypatch, password_file: Path, conn: _RecordingConn, *, dry_run: bool = False
+) -> EnaSubmissionCatalog:
     """A catalog whose session is `conn`; enter it to submit."""
     monkeypatch.setattr(_OPEN_SESSION, lambda **kwargs: conn)
-    return EnaSubmissionCatalog(**_valid_kwargs(password_file))
+    return EnaSubmissionCatalog(**_valid_kwargs(password_file, dry_run=dry_run))
 
 
 def _open(
@@ -362,9 +364,18 @@ def test_submit_project_dry_run_returns_none(monkeypatch, password_file: Path):
     """Tests the case where a validate-only session returns no row: the project
     submit reports no accession rather than failing on an empty result."""
     conn = _RecordingConn([])
-    with _catalog_over(monkeypatch, password_file, conn) as catalog:
+    with _catalog_over(monkeypatch, password_file, conn, dry_run=True) as catalog:
         assigned = catalog.submit_project(_project_row())
     assert assigned is None
+
+
+def test_submit_project_no_result_raises(monkeypatch, password_file: Path):
+    """Tests the case where a session that is not validate-only returns no row:
+    the submit fails rather than reporting an accepted project as unassigned."""
+    conn = _RecordingConn([])
+    with _catalog_over(monkeypatch, password_file, conn) as catalog:
+        with pytest.raises(EnaSubmissionError, match="QS7"):
+            catalog.submit_project(_project_row())
 
 
 def test_submit_samples(monkeypatch, password_file: Path):
@@ -393,13 +404,23 @@ def test_submit_samples(monkeypatch, password_file: Path):
 
 def test_submit_samples_maps_results_by_alias(monkeypatch, password_file: Path):
     """Tests the case where the returned rows arrive in an order other than the
-    one submitted: each row's accessions are matched to it by alias, and a row
-    no result names reports none."""
+    one submitted: each row's accessions are matched to it by alias."""
     conn = _RecordingConn([("QB12", "ERS12", "SAMEA12"), ("QB11", "ERS11", "SAMEA11")])
-    rows = [_sample_row("QB11"), _sample_row("QB12"), _sample_row("QB13")]
+    rows = [_sample_row("QB11"), _sample_row("QB12")]
     with _catalog_over(monkeypatch, password_file, conn) as catalog:
         assigned = catalog.submit_samples(rows)
-    assert assigned == [("ERS11", "SAMEA11"), ("ERS12", "SAMEA12"), None]
+    assert assigned == [("ERS11", "SAMEA11"), ("ERS12", "SAMEA12")]
+
+
+def test_submit_samples_missing_alias_raises(monkeypatch, password_file: Path):
+    """Tests the case where a session that is not validate-only returns no row
+    for one submitted alias: the submit fails naming it, rather than reporting
+    an accepted sample as unassigned."""
+    conn = _RecordingConn([("QB11", "ERS11", "SAMEA11")])
+    rows = [_sample_row("QB11"), _sample_row("QB13")]
+    with _catalog_over(monkeypatch, password_file, conn) as catalog:
+        with pytest.raises(EnaSubmissionError, match="QB13"):
+            catalog.submit_samples(rows)
 
 
 def test_submit_samples_dry_run_returns_none_per_row(monkeypatch, password_file: Path):
@@ -407,7 +428,7 @@ def test_submit_samples_dry_run_returns_none_per_row(monkeypatch, password_file:
     submitted sample reports no accession, one entry per input row."""
     conn = _RecordingConn([])
     rows = [_sample_row("QB11"), _sample_row("QB12")]
-    with _catalog_over(monkeypatch, password_file, conn) as catalog:
+    with _catalog_over(monkeypatch, password_file, conn, dry_run=True) as catalog:
         assigned = catalog.submit_samples(rows)
     assert assigned == [None, None]
 
@@ -569,8 +590,7 @@ def test_submit_samples_duplicate_alias_raises(monkeypatch, password_file: Path)
 @pytest.mark.parametrize("field", ["alias", "checklist"])
 def test_EnaSampleRow_blank_text_is_refused(field: str, blank: str):
     """Tests the case where a sample's alias or checklist carries no content: it
-    is refused at construction, since an empty checklist turns off miint's own
-    validation and an empty alias is the key results are matched on."""
+    is refused at construction."""
     overrides = {"alias": "QB11", "checklist": _CHECKLIST, field: blank}
     with pytest.raises(ValidationError):
         EnaSampleRow(taxon_id=408170, **overrides)

@@ -1,9 +1,4 @@
-"""Sample-family (biosample + prep_sample) cross-entity helpers.
-
-Holds the shapes, exceptions, and write-and-diagnose machinery that the
-biosample and prep_sample repository modules share, so the parallel
-implementations stay coordinated without duplicating logic.
-"""
+"""Sample-family (biosample + prep_sample) cross-entity helpers."""
 
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -1067,20 +1062,13 @@ async def fetch_biosample_checklist_requirements(
         "  LEFT JOIN qiita.checklist_field cf ON cf.idx = r.checklist_field_idx"
         "  LEFT JOIN qiita.biosample_global_field bgf"
         "         ON bgf.idx = r.biosample_global_field_idx"
-        " WHERE mc.idx = $1"
-        " ORDER BY cf.name",
+        " WHERE mc.idx = $1",
         metadata_checklist_idx,
     )
     if not rows:
         raise MetadataChecklistUnknownError(metadata_checklist_idx)
     requirements = [
-        ChecklistRequirementRow(
-            checklist_field_name=r["checklist_field_name"],
-            internal_name=r["internal_name"],
-            unit=r["unit"],
-        )
-        for r in rows
-        if r["checklist_field_name"] is not None
+        ChecklistRequirementRow(**dict(r)) for r in rows if r["checklist_field_name"] is not None
     ]
     return requirements
 

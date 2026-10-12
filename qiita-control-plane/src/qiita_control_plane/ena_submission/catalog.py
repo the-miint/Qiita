@@ -26,7 +26,6 @@ from .mapping import EnaProjectRow, EnaSampleRow
 _SECRET_NAME = "qiita_ena_submission"
 _CATALOG_ALIAS = "ena"
 
-# miint's ATTACH also takes a URL or either label in any case; this set is the only exact check.
 ENA_ENDPOINTS = frozenset({"test", "production"})
 
 # DuckDB's defaults take every core and ~80% of RAM; these size a session for
@@ -187,8 +186,8 @@ def _open_ena_submission_session(
 
     Under `dry_run` every insert on the returned session is validated against
     ENA instead of submitted. `endpoint_url` sends the session's submissions to
-    a stand-in server instead of ENA's, and exists for tests only. The caller
-    owns the connection and must close it.
+    a stand-in server instead of ENA's. The caller owns the connection and must
+    close it.
     """
     _require_ena_endpoint(endpoint)
     url_option = (
@@ -377,6 +376,8 @@ class EnaSubmissionCatalog:
         con = self._require_connection()
         values = _bind_values(_PROJECT_SPEC, row)
         assigned = _insert_one_returning(con, _PROJECT_SPEC, values, _PROJECT_SPEC.returning)
+        if assigned is None and not self._dry_run:
+            raise EnaSubmissionError(f"ENA returned no accessions for project {row.alias!r}")
         return assigned
 
     def submit_samples(self, rows: list[EnaSampleRow]) -> list[tuple[str, str] | None]:
@@ -403,8 +404,10 @@ class EnaSubmissionCatalog:
         returned_rows = _insert_returning_rows(
             con, _SAMPLE_SPEC, rows_values, _SAMPLE_SPEC.returning_batch
         )
-        # Key by the alias each row came back with: the return order is not
-        # promised, and an empty result leaves every row's accessions None.
+        # Key by the alias each row came back with: the return order is not promised
         by_alias = {returned[0]: tuple(returned[1:]) for returned in returned_rows}
+        missing = [alias for alias in aliases if alias not in by_alias]
+        if missing and not self._dry_run:
+            raise EnaSubmissionError(f"ENA returned no accessions for samples {missing!r}")
         assigned = [by_alias.get(row.alias) for row in rows]
         return assigned
