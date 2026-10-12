@@ -27,9 +27,11 @@ from qiita_control_plane.ena_submission.mapping import EnaProjectRow, EnaSampleR
 
 from .conftest import (
     _CHECKLIST,
+    _CHECKLIST_VALIDATION_DETAIL,
     _ENDPOINT,
     _OPEN_SESSION,
     _WEBIN_USER,
+    _already_exists_error,
     _project_row,
     _sample_row,
     _valid_kwargs,
@@ -58,101 +60,39 @@ _TWO_SAMPLE_INSERT_SQL = (
 )
 
 _RECEIPT_ALREADY_SUBMITTED = (
-    'ENA receipt: alias "QS7" already exists in the submission account with accession: "PRJEB77"'
+    f"INSERT INTO ena.projects failed: {_already_exists_error('project', 'QS7', 'PRJEB77')}"
 )
 _MIINT_ALIAS_CHECK_BLOCKED = (
     "INSERT INTO ena.samples: aliases already exist in submission account: 'QB11', 'QB12'"
-)
-_CHECKLIST_VALIDATION_DETAIL = (
-    "sample alias 'QB11': mandatory attribute 'collection date' is missing"
 )
 _MIINT_CHECKLIST_VALIDATION = (
     f"INSERT INTO ena.samples: checklist validation failed:\n  {_CHECKLIST_VALIDATION_DETAIL}"
 )
 
-# A failure the insert reports directly, with nothing in it to classify.
-_OPAQUE_INSERT_FAILURE = "INSERT INTO ena.samples: submission failed"
-
 
 class _RecordingConn:
     """Stands in for a DuckDB connection, recording every statement executed
-    and handing back a canned result set."""
+    and handing back a canned result set, or failing every INSERT with
+    `insert_error` when one is given."""
 
-    def __init__(self, returned_rows: list[tuple] | None = None) -> None:
+    def __init__(
+        self, returned_rows: list[tuple] | None = None, *, insert_error: str | None = None
+    ) -> None:
         self.statements: list[str] = []
         self.parameters: list[list | None] = []
         self.closed = False
         self._returned_rows = [] if returned_rows is None else returned_rows
+        self._insert_error = insert_error
 
     def execute(self, sql: str, params: list | None = None) -> _RecordingConn:
         self.statements.append(sql)
         self.parameters.append(params)
+        if self._insert_error is not None and sql.startswith("INSERT INTO "):
+            raise duckdb.Error(self._insert_error)
         return self
 
     def fetchall(self) -> list[tuple]:
         return self._returned_rows
-
-    def fetchone(self) -> tuple | None:
-        """An empty submission log — this connection's statements all succeed,
-        so the high-water read ahead of each insert finds nothing."""
-        return (None,)
-
-    def close(self) -> None:
-        self.closed = True
-
-
-class _SubmissionLogConn:
-    """Stands in for a DuckDB connection whose INSERT fails, answering the
-    submission-log reads that follow out of a canned list of failed rows.
-
-    `failed_rows` are (submitted_at, error_messages) pairs already in the log
-    when the block opens; `logged_on_failure` is the row the failing INSERT
-    writes, which the two client-side refusals do not write at all.
-    `error_messages` is a list of messages, matching the column's own type, so a
-    failed row with nothing to say carries an empty list rather than NULL.
-    """
-
-    def __init__(
-        self,
-        insert_error: str,
-        *,
-        failed_rows: list[tuple[int, list[str]]] | None = None,
-        logged_on_failure: tuple[int, list[str]] | None = None,
-        log_readable: bool = True,
-    ) -> None:
-        self._insert_error = insert_error
-        self._failed_rows = list(failed_rows or [])
-        self._logged_on_failure = logged_on_failure
-        self._log_readable = log_readable
-        self._pending_row: tuple | None = None
-        self.statements: list[str] = []
-        self.closed = False
-
-    def execute(self, sql: str, params: list | None = None) -> _SubmissionLogConn:
-        self.statements.append(sql)
-        if sql.startswith("INSERT INTO "):
-            if self._logged_on_failure is not None:
-                self._failed_rows.append(self._logged_on_failure)
-            raise duckdb.Error(self._insert_error)
-        if not sql.startswith("SELECT "):
-            return self
-        if not self._log_readable:
-            raise duckdb.Error("ena.submission_log is unavailable")
-        self._pending_row = self._read_log(sql, params)
-        return self
-
-    def _read_log(self, sql: str, params: list | None) -> tuple | None:
-        """The row the high-water read or the bounded error read comes back
-        with, honouring the `submitted_at > ?` bound when one is bound."""
-        if "max(submitted_at)" in sql:
-            return (max((at for at, _ in self._failed_rows), default=None),)
-        after = params[0] if params else None
-        newer = [row for row in self._failed_rows if after is None or row[0] > after]
-        newest = max(newer, default=None)
-        return None if newest is None else (newest[1],)
-
-    def fetchone(self) -> tuple | None:
-        return self._pending_row
 
     def close(self) -> None:
         self.closed = True
@@ -456,9 +396,7 @@ def test__insert_returning_rows_already_submitted(monkeypatch, password_file: Pa
     """Tests the case where ENA's receipt reports the alias already deposited:
     the alias and the accession it names ride together on a distinguishable
     error, so a caller can record it rather than treat the submission as lost."""
-    conn = _SubmissionLogConn(
-        _OPAQUE_INSERT_FAILURE, logged_on_failure=(2, [_RECEIPT_ALREADY_SUBMITTED])
-    )
+    conn = _RecordingConn(insert_error=_RECEIPT_ALREADY_SUBMITTED)
     with _catalog_over(monkeypatch, password_file, conn) as catalog:
         with pytest.raises(EnaAlreadySubmittedError) as raised:
             catalog.submit_project(_project_row())
@@ -472,7 +410,7 @@ def test__insert_returning_rows_alias_check_blocked(monkeypatch, password_file: 
     """Tests the case where miint's own pre-POST alias check refuses the insert:
     every colliding alias is carried, and the error says no accession is
     available from this path."""
-    conn = _SubmissionLogConn(_MIINT_ALIAS_CHECK_BLOCKED)
+    conn = _RecordingConn(insert_error=_MIINT_ALIAS_CHECK_BLOCKED)
     with _catalog_over(monkeypatch, password_file, conn) as catalog:
         with pytest.raises(EnaAliasCheckBlockedError) as raised:
             catalog.submit_samples([_sample_row("QB11"), _sample_row("QB12")])
@@ -487,7 +425,7 @@ def test__insert_returning_rows_checklist_validation(monkeypatch, password_file:
     """Tests the case where miint's checklist validator refuses the insert: the
     per-attribute detail is carried on its own error, since it means incomplete
     data rather than an object already deposited."""
-    conn = _SubmissionLogConn(_MIINT_CHECKLIST_VALIDATION)
+    conn = _RecordingConn(insert_error=_MIINT_CHECKLIST_VALIDATION)
     with _catalog_over(monkeypatch, password_file, conn) as catalog:
         with pytest.raises(EnaChecklistValidationError) as raised:
             catalog.submit_samples([_sample_row("QB11")])
@@ -499,51 +437,11 @@ def test__insert_returning_rows_checklist_validation(monkeypatch, password_file:
 
 def test__insert_returning_rows_unclassified_failure(monkeypatch, password_file: Path):
     """Tests the case where a failure matches none of the three known shapes:
-    the base error carries the log's detail, so an unrecognized rejection is
-    reported as itself rather than reshaped into one of them."""
-    conn = _SubmissionLogConn(
-        _OPAQUE_INSERT_FAILURE,
-        logged_on_failure=(2, ["ENA receipt: Webin account is suspended"]),
-    )
+    the base error carries the exception's text, so an unrecognized rejection
+    is reported as itself rather than reshaped into one of them."""
+    conn = _RecordingConn(insert_error="INSERT INTO ena.samples failed: Webin account is suspended")
     with _catalog_over(monkeypatch, password_file, conn) as catalog:
         with pytest.raises(EnaSubmissionError, match="Webin account is suspended") as raised:
-            catalog.submit_samples([_sample_row("QB11")])
-    assert type(raised.value) is EnaSubmissionError
-
-
-@pytest.mark.parametrize(
-    ("logged_on_failure", "expected_detail"),
-    [
-        (None, _OPAQUE_INSERT_FAILURE),
-        ((2, ["ENA receipt: Webin account is suspended"]), "Webin account is suspended"),
-    ],
-    ids=["older row rejected", "newer row accepted"],
-)
-def test__last_submission_error_bounded_by_high_water(
-    monkeypatch, password_file: Path, logged_on_failure, expected_detail: str
-):
-    """Tests the case where the log already holds an older failed row: only a
-    row written after this insert began enriches the error, since a pooled,
-    long-lived session's newest failed row may belong to an earlier request."""
-    conn = _SubmissionLogConn(
-        _OPAQUE_INSERT_FAILURE,
-        failed_rows=[(1, ["an earlier request's rejection"])],
-        logged_on_failure=logged_on_failure,
-    )
-    with _catalog_over(monkeypatch, password_file, conn) as catalog:
-        with pytest.raises(EnaSubmissionError) as raised:
-            catalog.submit_samples([_sample_row("QB11")])
-    assert expected_detail in str(raised.value)
-    assert "an earlier request" not in str(raised.value)
-
-
-def test__last_submission_error_unreadable_log_does_not_mask(monkeypatch, password_file: Path):
-    """Tests the case where the submission log cannot be read at all: the
-    insert's own error still reaches the caller, unenriched rather than
-    replaced by the log's."""
-    conn = _SubmissionLogConn(_OPAQUE_INSERT_FAILURE, log_readable=False)
-    with _catalog_over(monkeypatch, password_file, conn) as catalog:
-        with pytest.raises(EnaSubmissionError, match=_OPAQUE_INSERT_FAILURE) as raised:
             catalog.submit_samples([_sample_row("QB11")])
     assert type(raised.value) is EnaSubmissionError
 
@@ -554,12 +452,13 @@ def test__insert_returning_rows_already_submitted_names_every_collision(
     """Tests the case where one envelope collides on several of its rows: every
     alias ENA's receipt names is carried, since a caller recording only the
     first would lose the rest with nothing saying so."""
-    receipt = (
-        'ENA receipt: alias "QB11" already exists in the submission account with'
-        ' accession: "ERS11"; alias "QB12" already exists in the submission account'
-        ' with accession: "ERS12"'
-    )
-    conn = _SubmissionLogConn(_OPAQUE_INSERT_FAILURE, logged_on_failure=(2, [receipt]))
+    # miint joins ENA's messages with "; "
+    rejections = [
+        _already_exists_error("sample", "QB11", "ERS11"),
+        _already_exists_error("sample", "QB12", "ERS12"),
+    ]
+    receipt = f"INSERT INTO ena.samples failed: {'; '.join(rejections)}"
+    conn = _RecordingConn(insert_error=receipt)
     with _catalog_over(monkeypatch, password_file, conn) as catalog:
         with pytest.raises(EnaAlreadySubmittedError) as raised:
             catalog.submit_samples([_sample_row("QB11"), _sample_row("QB12")])
@@ -573,7 +472,7 @@ def test__classify_submission_failure_accession_without_its_alias():
     """Tests the case where a receipt names an accession but not the alias it
     belongs to: the accession is still carried, marked as unattributable rather
     than dropped or paired with a guess."""
-    message = 'ENA receipt: already exists in the submission account with accession: "PRJEB77"'
+    message = 'INSERT INTO ena.projects failed: The object being added already exists in the submission account with accession: "PRJEB77".'  # noqa: E501
     classified = catalog_module._classify_submission_failure(catalog_module._PROJECT_SPEC, message)
     assert isinstance(classified, EnaAlreadySubmittedError)
     assert classified.existing == (EnaExistingAccession(None, "PRJEB77"),)
@@ -587,78 +486,6 @@ def test__classify_submission_failure_alias_check_without_quoted_aliases():
     classified = catalog_module._classify_submission_failure(catalog_module._SAMPLE_SPEC, message)
     assert type(classified) is EnaSubmissionError
     assert "no alias could be read" in str(classified)
-
-
-def test__last_submission_error_empty_message_list_does_not_mask(monkeypatch, password_file: Path):
-    """Tests the case where the failed row carries no messages: the insert's own
-    error reaches the caller, since an empty list is no detail rather than
-    detail that happens to render as one."""
-    conn = _SubmissionLogConn(_OPAQUE_INSERT_FAILURE, logged_on_failure=(2, []))
-    with _catalog_over(monkeypatch, password_file, conn) as catalog:
-        with pytest.raises(EnaSubmissionError, match=_OPAQUE_INSERT_FAILURE) as raised:
-            catalog.submit_samples([_sample_row("QB11")])
-    assert "[]" not in str(raised.value)
-
-
-def test__last_submission_error_joins_every_logged_message(monkeypatch, password_file: Path):
-    """Tests the case where the failed row carries several messages: all of them
-    reach the caller, joined, rather than arriving as a rendered list."""
-    conn = _SubmissionLogConn(
-        _OPAQUE_INSERT_FAILURE,
-        logged_on_failure=(2, ["first complaint", "second complaint"]),
-    )
-    with _catalog_over(monkeypatch, password_file, conn) as catalog:
-        with pytest.raises(EnaSubmissionError) as raised:
-            catalog.submit_samples([_sample_row("QB11")])
-    assert "first complaint; second complaint" in str(raised.value)
-    assert "['" not in str(raised.value)
-
-
-@pytest.mark.parametrize(
-    ("failed_rows", "expected_bound"),
-    [
-        ([], ""),
-        ([(1, ["an earlier request's rejection"])], " AND submitted_at > ?"),
-    ],
-    ids=["log empty when the insert began", "log already held a failed row"],
-)
-def test__last_submission_error_bounded_read_is_filtered_and_ordered(
-    monkeypatch, password_file: Path, failed_rows, expected_bound: str
-):
-    """Tests the case where the enrichment read is issued: it selects only
-    failed rows and only the newest one, bounded to rows newer than the
-    pre-insert mark whenever the log held anything to mark.
-
-    These clauses are answered by the fake rather than executed by it, so the
-    statement is asserted directly; nothing else would notice them changing.
-    """
-    conn = _SubmissionLogConn(
-        _OPAQUE_INSERT_FAILURE, failed_rows=failed_rows, logged_on_failure=(2, ["anything"])
-    )
-    with _catalog_over(monkeypatch, password_file, conn) as catalog:
-        with pytest.raises(EnaSubmissionError):
-            catalog.submit_samples([_sample_row("QB11")])
-    bounded_read = next(sql for sql in conn.statements if sql.startswith("SELECT error_messages"))
-    assert bounded_read == (
-        "SELECT error_messages FROM ena.submission_log WHERE NOT success"
-        f"{expected_bound} ORDER BY submitted_at DESC LIMIT 1"
-    )
-
-
-def test__insert_returning_rows_checklist_detail_excludes_the_exception(
-    monkeypatch, password_file: Path
-):
-    """Tests the case where the log carries the checklist wording and the raised
-    error does not: the detail stops at the log's own text, since a caller fixes
-    metadata from it rather than re-parsing a message."""
-    conn = _SubmissionLogConn(
-        _OPAQUE_INSERT_FAILURE,
-        logged_on_failure=(2, [f"checklist validation failed:\n  {_CHECKLIST_VALIDATION_DETAIL}"]),
-    )
-    with _catalog_over(monkeypatch, password_file, conn) as catalog:
-        with pytest.raises(EnaChecklistValidationError) as raised:
-            catalog.submit_samples([_sample_row("QB11")])
-    assert raised.value.detail == _CHECKLIST_VALIDATION_DETAIL
 
 
 def test__bind_values_orders_to_spec_columns():

@@ -12,6 +12,8 @@ _WEBIN_USER = "Webin-00000"
 _ENDPOINT = "test"
 _CHECKLIST = "ERC000011"
 
+_CHECKLIST_VALIDATION_DETAIL = f"sample alias 'QB11': checklist '{_CHECKLIST}' marks field 'collection date' as mandatory but it is missing or empty"  # noqa: E501
+
 
 @pytest.fixture
 def password_file(tmp_path: Path) -> Path:
@@ -29,6 +31,12 @@ def _valid_kwargs(password_file: Path, **overrides) -> dict:
         "endpoint": _ENDPOINT,
         **overrides,
     }
+
+
+def _already_exists_error(object_noun: str, alias: str, accession: str) -> str:
+    """ENA's rejection of an object already in the account, worded as its one
+    documented example of it (for an analysis) shows."""
+    return f'In {object_noun}, alias:"{alias}", accession:"". The object being added already exists in the submission account with accession: "{accession}".'  # noqa: E501
 
 
 def _project_row() -> EnaProjectRow:

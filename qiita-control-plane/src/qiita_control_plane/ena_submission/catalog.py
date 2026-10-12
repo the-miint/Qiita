@@ -35,10 +35,6 @@ _SESSION_THREADS = 2
 _SESSION_MEMORY_LIMIT = "1GB"
 
 
-# miint's record of what it sent and what came back; the one enrichment source
-# for a rejected insert.
-_SUBMISSION_LOG_TABLE = f"{_CATALOG_ALIAS}.submission_log"
-
 _ALIAS_COLUMN = "alias"
 
 
@@ -125,7 +121,8 @@ class EnaChecklistValidationError(EnaSubmissionError):
 
 
 _ALREADY_SUBMITTED_RE = re.compile(
-    r'(?:alias\s+"([^"]+)"\s+)?already exists in the submission account with accession:\s*"([^"]+)"'
+    r'(?:alias:\s*"([^"]*)",\s*accession:\s*"[^"]*"\.\s*The object being added\s+)?'
+    r'already exists in the submission account with accession:\s*"([^"]+)"'
 )
 _ALIAS_CHECK_BLOCKED_RE = re.compile(r"alias(?:es)? already exists? in submission account:\s*(.+)")
 _QUOTED_ALIAS_RE = re.compile(r"'([^']*)'")
@@ -229,54 +226,6 @@ def _bind_values(spec: EnaObjectSpec, row: BaseModel) -> tuple[object, ...]:
     return values
 
 
-def _read_log_scalar(
-    con: duckdb.DuckDBPyConnection, sql: str, params: list[object] | None = None
-) -> object | None:
-    """The first column of the one row `sql` selects from the submission log,
-    or None when nothing comes back.
-
-    Best-effort by contract: reading the log only ever enriches an error that
-    has already been raised, so a failure here must never mask it and every
-    DuckDB error becomes None.
-    """
-    try:
-        cursor = con.execute(sql, params or [])
-        row = cursor.fetchone()
-    except duckdb.Error:
-        return None
-    return None if row is None else row[0]
-
-
-def _submission_log_high_water(con: duckdb.DuckDBPyConnection) -> object | None:
-    """The newest `ena.submission_log` timestamp, or None when the log holds
-    nothing or cannot be read."""
-    high_water = _read_log_scalar(con, f"SELECT max(submitted_at) FROM {_SUBMISSION_LOG_TABLE}")
-    return high_water
-
-
-def _last_submission_error(con: duckdb.DuckDBPyConnection, after: object | None) -> str | None:
-    """The newest failed submission's error detail, considering only rows newer
-    than `after`; None when the log names no such row or cannot be read.
-
-    An `after` of None accepts any row, which is what an unreadable or empty log
-    leaves.
-    """
-    sql = f"SELECT error_messages FROM {_SUBMISSION_LOG_TABLE} WHERE NOT success"
-    params: list[object] = []
-    if after is not None:
-        # One session submits more than once, so an earlier insert's failed row
-        # is already here.
-        sql += " AND submitted_at > ?"
-        params.append(after)
-    sql += " ORDER BY submitted_at DESC LIMIT 1"
-    detail = _read_log_scalar(con, sql, params)
-    if detail is None:
-        return None
-    if isinstance(detail, list):
-        return "; ".join(str(message) for message in detail) or None
-    return str(detail) or None
-
-
 def _classify_submission_failure(spec: EnaObjectSpec, message: str) -> EnaSubmissionError | None:
     """The error the failure text names, or None when it matches none of the
     three distinguishable shapes.
@@ -331,29 +280,15 @@ def _insert_returning_rows(
         f" RETURNING {', '.join(returning)}"
     )
     params = [value for row_values in rows_values for value in row_values]
-    # Bound the log read to rows this statement could have written, before it
-    # writes one.
-    high_water = _submission_log_high_water(con)
     try:
         cursor = con.execute(sql, params)
         returned_rows = cursor.fetchall()
         return returned_rows
     except duckdb.Error as exc:
-        # Classified apart so a pattern matched in one captures only that text:
-        # ENA's rejection reaches us through the log, miint's through the error.
-        detail = _last_submission_error(con, high_water)
-        classified = None
-        for message in (detail, str(exc)):
-            if not message:
-                continue
-            classified = _classify_submission_failure(spec, message)
-            if classified is not None:
-                break
+        classified = _classify_submission_failure(spec, str(exc))
         if classified is not None:
             raise classified from exc
-        raise EnaSubmissionError(
-            f"ENA {spec.object_kind} submission failed: {detail or exc}"
-        ) from exc
+        raise EnaSubmissionError(f"ENA {spec.object_kind} submission failed: {exc}") from exc
 
 
 def _insert_one_returning(

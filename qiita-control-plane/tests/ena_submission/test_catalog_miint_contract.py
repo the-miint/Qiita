@@ -16,10 +16,25 @@ import pytest
 from qiita_common.api_paths import LOOPBACK_HOST
 
 from qiita_control_plane.ena_submission import catalog as catalog_module
-from qiita_control_plane.ena_submission.catalog import EnaSubmissionCatalog
+from qiita_control_plane.ena_submission.catalog import (
+    EnaAliasCheckBlockedError,
+    EnaAlreadySubmittedError,
+    EnaChecklistValidationError,
+    EnaExistingAccession,
+    EnaObjectKind,
+    EnaSubmissionCatalog,
+)
 from qiita_control_plane.testing.loopback import serve_on_loopback
 
-from .conftest import _CHECKLIST, _OPEN_SESSION, _project_row, _sample_row, _valid_kwargs
+from .conftest import (
+    _CHECKLIST,
+    _CHECKLIST_VALIDATION_DETAIL,
+    _OPEN_SESSION,
+    _already_exists_error,
+    _project_row,
+    _sample_row,
+    _valid_kwargs,
+)
 
 # Where miint sends each request; the portal and checklist bases reach miint
 # through these environment variables, the submit URL through the session.
@@ -36,6 +51,11 @@ _RECEIPT_KINDS = {
     "samples": ("SAMPLE", "ERS", "SAMEA", "biosample"),
 }
 _FIRST_ACCESSION_NUMBER = 1000
+
+# Aliases the stand-in treats as already in the account: ENA's receipt rejects a
+# deposited one, naming its accession, and the portal search reports a taken one.
+_DEPOSITED_ALIAS_ACCESSIONS = {"QS99": "PRJEB99", "QB21": "ERS21"}
+_TAKEN_ALIASES = frozenset({"QB31"})
 
 _LATITUDE_LABEL = "geographic location (latitude)"
 _LATITUDE_UNIT = "DD"
@@ -71,6 +91,7 @@ _CHECKLIST_XML = f"""<?xml version="1.0" encoding="UTF-8"?>
 
 _XML_ACTION_RE = re.compile(r"<ACTION>\s*<(\w+)")
 _XML_SAMPLE_ALIAS_RE = re.compile(r'<SAMPLE\b[^>]*\balias="([^"]*)"')
+_QUOTED_RE = re.compile(r'"([^"]*)"')
 
 
 def _parse_envelope(content_type: str, body: str) -> tuple[str, str, list[str]]:
@@ -88,11 +109,19 @@ def _parse_envelope(content_type: str, body: str) -> tuple[str, str, list[str]]:
 
 
 def _build_receipt(kind: str, action: str, aliases: list[str]) -> str:
-    """A successful receipt numbering each alias's accessions by its position;
-    a VALIDATE receipt names no objects, since validation assigns none."""
+    """A receipt numbering each alias's accessions by its position, or rejecting
+    the submission if any alias is deposited; a VALIDATE receipt names no
+    objects, since validation assigns none."""
     element, primary_prefix, secondary_prefix, ext_type = _RECEIPT_KINDS[kind]
+    noun = element.lower()
+    errors = [
+        f"<ERROR>{_already_exists_error(noun, alias, accession)}</ERROR>"
+        for alias in aliases
+        if (accession := _DEPOSITED_ALIAS_ACCESSIONS.get(alias)) is not None
+    ]
+    succeeded = not errors
     objects = []
-    if action != "VALIDATE":
+    if succeeded and action != "VALIDATE":
         for position, alias in enumerate(aliases):
             number = _FIRST_ACCESSION_NUMBER + position
             objects.append(
@@ -102,9 +131,11 @@ def _build_receipt(kind: str, action: str, aliases: list[str]) -> str:
             )
     receipt = (
         '<?xml version="1.0" encoding="UTF-8"?>'
-        '<RECEIPT receiptDate="2026-10-12T12:00:00.000Z" submissionFile="stand-in" success="true">'
+        '<RECEIPT receiptDate="2026-10-12T12:00:00.000Z" submissionFile="stand-in"'
+        f' success="{str(succeeded).lower()}">'
         f"{''.join(objects)}"
         '<SUBMISSION accession="ERA1000" alias="stand-in"/>'
+        f"<MESSAGES>{''.join(errors)}</MESSAGES>"
         f"<ACTIONS>{action}</ACTIONS>"
         "</RECEIPT>"
     )
@@ -112,10 +143,13 @@ def _build_receipt(kind: str, action: str, aliases: list[str]) -> str:
 
 
 def _portal_search_tsv(path: str) -> str:
-    """A portal search answer reporting none of the queried aliases as taken."""
+    """A portal search answer naming which of the queried aliases are taken."""
     query = parse_qs(urlparse(path).query)
     header = query["fields"][0]
-    return f"{header}\n"
+    queried = _QUOTED_RE.findall(query["query"][0])
+    taken = [alias for alias in queried if alias in _TAKEN_ALIASES]
+    tsv = "".join(f"{line}\n" for line in [header, *taken])
+    return tsv
 
 
 class _EnaStandInHandler(BaseHTTPRequestHandler):
@@ -215,3 +249,52 @@ def test_EnaSubmissionCatalog_submit_samples_dry_run(contract_catalog):
         assigned = catalog.submit_samples(rows)
 
     assert assigned == [None, None]
+
+
+def test_EnaSubmissionCatalog_submit_samples_already_deposited(contract_catalog):
+    """Tests the case where ENA's receipt rejects a sample as already deposited:
+    the error names the alias and the accession ENA reports for it."""
+    with contract_catalog() as catalog, pytest.raises(EnaAlreadySubmittedError) as raised:
+        catalog.submit_samples([_sample_row("QB21")])
+
+    expected = (EnaObjectKind.SAMPLE, (EnaExistingAccession("QB21", "ERS21"),))
+    assert (raised.value.object_kind, raised.value.existing) == expected
+
+
+def test_EnaSubmissionCatalog_submit_samples_alias_check_blocked(contract_catalog):
+    """Tests the case where miint's alias check finds the alias taken: the
+    error names the alias."""
+    with contract_catalog() as catalog, pytest.raises(EnaAliasCheckBlockedError) as raised:
+        catalog.submit_samples([_sample_row("QB31")])
+
+    expected = (EnaObjectKind.SAMPLE, ("QB31",))
+    assert (raised.value.object_kind, raised.value.aliases) == expected
+
+
+def test_EnaSubmissionCatalog_submit_samples_checklist_validation(contract_catalog):
+    """Tests the case where a sample lacks a field its checklist marks
+    mandatory: miint's validator refuses it, and the error carries miint's
+    detail for that sample."""
+    row = _sample_row("QB11").model_copy(update={"attributes": {}})
+
+    with contract_catalog() as catalog, pytest.raises(EnaChecklistValidationError) as raised:
+        catalog.submit_samples([row])
+
+    expected = (EnaObjectKind.SAMPLE, _CHECKLIST_VALIDATION_DETAIL)
+    assert (raised.value.object_kind, raised.value.detail) == expected
+
+
+def test_EnaSubmissionCatalog_submit_after_earlier_failure(contract_catalog):
+    """Tests the case where an insert fails after an earlier insert in the same
+    session already failed: the later failure is classified by its own cause,
+    not by the earlier one."""
+    deposited_project = _project_row().model_copy(update={"alias": "QS99"})
+
+    with contract_catalog() as catalog:
+        with pytest.raises(EnaAlreadySubmittedError):
+            catalog.submit_project(deposited_project)
+        with pytest.raises(EnaAliasCheckBlockedError) as raised:
+            catalog.submit_samples([_sample_row("QB31")])
+
+    expected = (EnaObjectKind.SAMPLE, ("QB31",))
+    assert (raised.value.object_kind, raised.value.aliases) == expected
