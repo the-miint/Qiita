@@ -63,22 +63,6 @@ class EnaSampleRow(BaseModel):
     attribute_units: dict[str, str] = Field(default_factory=dict)
 
 
-def ena_alias(idx: int) -> str:
-    """Render a Qiita idx as the ENA alias for the object it identifies.
-
-    The same idx must always yield the same alias, for the life of the object:
-    an alias is unique per (submission account, object type) on ENA's side, so
-    a value derived from anything editable would address a different object
-    after an edit.
-
-    Sending an idx past the Qiita boundary is approved here specifically. The
-    alternative handles are worse: sample_name often carries PII, and an
-    accession does not exist yet at submission time. These aliases are
-    permanent once deposited.
-    """
-    return str(idx)
-
-
 def _render_value(value: SampleMetadataValue, *, field_name: str) -> str:
     """Render one metadata value as the text ENA's attribute map carries."""
     # The reason name is already the INSDC vocabulary ENA reads.
@@ -123,9 +107,10 @@ def _taxon_id_of(metadata: dict[str, GlobalMetadataRow]) -> int:
 def map_study_to_ena_project_row(
     study: StudyResponse, *, project_type: str | None = None
 ) -> EnaProjectRow:
-    """Build the `ena.projects` row body for `study`."""
+    """Build the `ena.projects` row body for `study`, aliased by its
+    export_entity_id."""
     row = EnaProjectRow(
-        alias=ena_alias(study.study_idx),
+        alias=study.export_entity_id,
         title=study.title,
         description=study.description,
         project_type=project_type,
@@ -135,13 +120,14 @@ def map_study_to_ena_project_row(
 
 def map_biosample_to_ena_sample_row(
     *,
-    biosample_idx: int,
+    export_entity_id: str,
     checklist: MetadataChecklistRef | None,
     requirements: list[ChecklistRequirementRow],
     metadata: dict[str, GlobalMetadataRow],
     study_title: str,
 ) -> EnaSampleRow:
-    """Build the `ena.samples` row body for one biosample.
+    """Build the `ena.samples` row body for the biosample whose
+    export_entity_id is `export_entity_id`, which becomes its alias.
 
     `requirements` fixes what is sent: every field the checklist requires and
     nothing else, so a value Qiita holds for an unrequired field is not
@@ -151,7 +137,7 @@ def map_biosample_to_ena_sample_row(
     """
     if checklist is None:
         raise EnaMappingError(
-            f"biosample {biosample_idx} claims no metadata checklist, which ena.samples requires"
+            f"biosample {export_entity_id} claims no metadata checklist, which ena.samples requires"
         )
     if not requirements:
         raise EnaMappingError(
@@ -165,7 +151,7 @@ def map_biosample_to_ena_sample_row(
         entry = metadata.get(requirement.internal_name)
         if entry is None:
             raise EnaMappingError(
-                f"biosample {biosample_idx} has no {requirement.internal_name!r}, "
+                f"biosample {export_entity_id} has no {requirement.internal_name!r}, "
                 f"which checklist {checklist.name} requires"
             )
         attributes[requirement.checklist_field_name] = _render_value(
@@ -180,7 +166,7 @@ def map_biosample_to_ena_sample_row(
         attributes[_PROJECT_NAME_ATTRIBUTE] = study_title
 
     row = EnaSampleRow(
-        alias=ena_alias(biosample_idx),
+        alias=export_entity_id,
         taxon_id=_taxon_id_of(metadata),
         checklist=checklist.name,
         attributes=attributes,

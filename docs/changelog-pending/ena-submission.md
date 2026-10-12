@@ -19,7 +19,8 @@
 - **The control plane can deposit studies and biosamples to ENA (#642).**
   `ena_submission.EnaSubmissionCatalog` opens a miint Webin V2 session — registering the secret,
   attaching the `ena` catalog over the service-side LOAD-only connect, and tearing both down on
-  exit — then inserts projects and samples and hands back the accessions ENA assigns. One
+  exit — then inserts projects and samples and hands back the accessions ENA assigns. Each
+  study and biosample is deposited under its `export_entity_id` as the ENA alias. One
   `EnaObjectSpec` per object declares what a submission carries, so a column absent from it is
   never sent rather than sent as NULL; `scientific_name` is left out deliberately, since ENA
   derives it from the taxon id. Samples go as one envelope, accepted or rejected whole, each

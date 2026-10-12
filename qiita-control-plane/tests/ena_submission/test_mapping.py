@@ -17,7 +17,6 @@ from qiita_control_plane.ena_submission.mapping import (
     EnaMappingError,
     EnaProjectRow,
     EnaSampleRow,
-    ena_alias,
     map_biosample_to_ena_sample_row,
     map_study_to_ena_project_row,
 )
@@ -29,7 +28,10 @@ from qiita_control_plane.repositories._sample_helpers import (
 _HUMAN_GUT = MetadataChecklistRef(idx=4, name="ERC000015")
 _ENA_DEFAULT = MetadataChecklistRef(idx=1, name="ERC000011")
 _STUDY_TITLE = "Gut microbiome of resident penguins"
-_BIOSAMPLE_IDX = 30002
+# Deliberately unrelated to any idx, so an alias composed from an idx
+# cannot match by accident.
+_STUDY_EXPORT_ENTITY_ID = "QS903"
+_BIOSAMPLE_EXPORT_ENTITY_ID = "QB812"
 _TAXON_ID = 408170
 
 # The requirement most tests use, since its value kind is the uninteresting one
@@ -80,7 +82,7 @@ def _expected_sample(
     """The row every mapping test expects, varying only in what that test is
     about: the alias and taxon id are fixed by the inputs each one shares."""
     return EnaSampleRow(
-        alias=str(_BIOSAMPLE_IDX),
+        alias=_BIOSAMPLE_EXPORT_ENTITY_ID,
         taxon_id=_TAXON_ID,
         checklist=checklist.name,
         attributes=attributes,
@@ -94,7 +96,7 @@ def _study(*, description: str | None) -> StudyResponse:
     stamp = datetime(2026, 3, 11, tzinfo=UTC)
     return StudyResponse(
         study_idx=25001,
-        export_entity_id="QS25001",
+        export_entity_id=_STUDY_EXPORT_ENTITY_ID,
         owner_idx=1,
         principal_investigator_idx=None,
         title=_STUDY_TITLE,
@@ -115,22 +117,16 @@ def _study(*, description: str | None) -> StudyResponse:
     )
 
 
-def test_ena_alias():
-    """Tests the case where an idx is rendered as an alias: it is the idx
-    verbatim, since retry safety depends on it being derivable again."""
-    assert ena_alias(25001) == "25001"
-
-
 def test_map_study_to_ena_project_row():
     """Tests the case where a study is mapped with no project type supplied:
-    the alias is the study idx and project_type stays unset rather than being
-    given a placeholder."""
+    the alias is the study's export_entity_id and project_type stays unset
+    rather than being given a placeholder."""
     study = _study(description="Resident colony, sampled monthly")
 
     result = map_study_to_ena_project_row(study)
 
     expected = EnaProjectRow(
-        alias="25001",
+        alias=_STUDY_EXPORT_ENTITY_ID,
         title=_STUDY_TITLE,
         description="Resident colony, sampled monthly",
         project_type=None,
@@ -155,7 +151,7 @@ def test_map_biosample_to_ena_sample_row():
     }
 
     result = map_biosample_to_ena_sample_row(
-        biosample_idx=_BIOSAMPLE_IDX,
+        export_entity_id=_BIOSAMPLE_EXPORT_ENTITY_ID,
         checklist=_HUMAN_GUT,
         requirements=requirements,
         metadata=metadata,
@@ -183,7 +179,7 @@ def test_map_biosample_to_ena_sample_row_root_checklist():
     }
 
     result = map_biosample_to_ena_sample_row(
-        biosample_idx=_BIOSAMPLE_IDX,
+        export_entity_id=_BIOSAMPLE_EXPORT_ENTITY_ID,
         checklist=_ENA_DEFAULT,
         requirements=requirements,
         metadata=metadata,
@@ -211,7 +207,7 @@ def test_map_biosample_to_ena_sample_row_missing_value():
     }
 
     result = map_biosample_to_ena_sample_row(
-        biosample_idx=_BIOSAMPLE_IDX,
+        export_entity_id=_BIOSAMPLE_EXPORT_ENTITY_ID,
         checklist=_ENA_DEFAULT,
         requirements=requirements,
         metadata=metadata,
@@ -236,7 +232,7 @@ def test_map_biosample_to_ena_sample_row_small_numeric():
     }
 
     result = map_biosample_to_ena_sample_row(
-        biosample_idx=_BIOSAMPLE_IDX,
+        export_entity_id=_BIOSAMPLE_EXPORT_ENTITY_ID,
         checklist=_ENA_DEFAULT,
         requirements=requirements,
         metadata=metadata,
@@ -260,7 +256,7 @@ def test_map_biosample_to_ena_sample_row_date_value():
     }
 
     result = map_biosample_to_ena_sample_row(
-        biosample_idx=_BIOSAMPLE_IDX,
+        export_entity_id=_BIOSAMPLE_EXPORT_ENTITY_ID,
         checklist=_ENA_DEFAULT,
         requirements=requirements,
         metadata=metadata,
@@ -280,7 +276,7 @@ def test_map_biosample_to_ena_sample_row_no_checklist():
     client-side validation instead of failing."""
     with pytest.raises(EnaMappingError, match="claims no metadata checklist"):
         map_biosample_to_ena_sample_row(
-            biosample_idx=_BIOSAMPLE_IDX,
+            export_entity_id=_BIOSAMPLE_EXPORT_ENTITY_ID,
             checklist=None,
             requirements=[],
             metadata=_taxon_metadata(),
@@ -294,7 +290,7 @@ def test_map_biosample_to_ena_sample_row_no_requirements():
     attributes is a gap in the seed rather than a sample with nothing to say."""
     with pytest.raises(EnaMappingError, match="no seeded requirements"):
         map_biosample_to_ena_sample_row(
-            biosample_idx=_BIOSAMPLE_IDX,
+            export_entity_id=_BIOSAMPLE_EXPORT_ENTITY_ID,
             checklist=_HUMAN_GUT,
             requirements=[],
             metadata=_taxon_metadata(),
@@ -310,7 +306,7 @@ def test_map_biosample_to_ena_sample_row_missing_required_field():
 
     with pytest.raises(EnaMappingError, match="collection_date"):
         map_biosample_to_ena_sample_row(
-            biosample_idx=_BIOSAMPLE_IDX,
+            export_entity_id=_BIOSAMPLE_EXPORT_ENTITY_ID,
             checklist=_ENA_DEFAULT,
             requirements=requirements,
             metadata=_taxon_metadata(),
@@ -323,7 +319,7 @@ def test_map_biosample_to_ena_sample_row_no_taxon():
     because ena.samples requires one of every sample whatever its checklist."""
     with pytest.raises(EnaMappingError, match="no taxon id"):
         map_biosample_to_ena_sample_row(
-            biosample_idx=_BIOSAMPLE_IDX,
+            export_entity_id=_BIOSAMPLE_EXPORT_ENTITY_ID,
             checklist=_ENA_DEFAULT,
             requirements=[_COLLECTION_DATE],
             metadata={
@@ -351,7 +347,7 @@ def test_map_biosample_to_ena_sample_row_taxon_not_resolved():
 
     with pytest.raises(EnaMappingError, match="not a resolved terminology term"):
         map_biosample_to_ena_sample_row(
-            biosample_idx=_BIOSAMPLE_IDX,
+            export_entity_id=_BIOSAMPLE_EXPORT_ENTITY_ID,
             checklist=_ENA_DEFAULT,
             requirements=[_COLLECTION_DATE],
             metadata=metadata,
@@ -371,7 +367,7 @@ def test_map_biosample_to_ena_sample_row_unrenderable_value():
 
     with pytest.raises(EnaMappingError, match="no ENA rendering"):
         map_biosample_to_ena_sample_row(
-            biosample_idx=_BIOSAMPLE_IDX,
+            export_entity_id=_BIOSAMPLE_EXPORT_ENTITY_ID,
             checklist=_ENA_DEFAULT,
             requirements=requirements,
             metadata=metadata,
