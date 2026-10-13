@@ -88,7 +88,7 @@ _None yet._
     change, so no `FORCE_STAGE_MIINT`. `make verify-deploy`'s `compute-readiness` and
     `cp-miint` checks LOAD the new build.
   - The `assemble` and `checkm` (`-1.0.1`) SIFs auto-rebuild on deploy to pick up 1.5.5.
-    `checkm`'s tools are now pinned exactly — checkm-genome 1.2.5, pplacer 1.1.alpha22,
+    `checkm`'s tools are now pinned exactly — checkm-genome 1.2.5, pplacer 1.1.alpha20,
     hmmer 3.4, prodigal 2.6.3 — and its build fails if a solve drifts off them.
   - **Work that loads miint between the bucket-4 deploy and the redeploy's miint stage
     (step 5/8) fails at LOAD.** `v1.5.5/` is staged last, after everything that moves to
