@@ -37,6 +37,7 @@ INT4_MASK = 0x7FFF_FFFF
 #   actions.library                1-arg key 4_310_290_149 (exclusion sync)
 #   notify.sweeper                 1-arg key 4_310_290_147
 #   auth.cli_login_code_sweeper    1-arg key 4_310_290_148
+#   scratch_reclaim                1-arg key 4_310_290_150
 
 
 def require_transaction(conn: asyncpg.Connection) -> None:

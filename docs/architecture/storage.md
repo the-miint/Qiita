@@ -33,7 +33,7 @@ PATH_PERSISTENT/                            durable, backed up
   ducklake/<table>/<filename>               DuckLake data path (flat per logical table; CRC sharding only if file count pressures the FS)
 
 /scratch/                                   recommended PATH_SCRATCH (and PATH_DERIVED = /scratch/persistent)
-  ticket/<work_ticket_idx>/<step>/attempt-<N>/  per-attempt workspace: control-plane runner files; under SLURM also input/params.json, output/ (step outputs), logs/{stdout,stderr}, tmp/; not reclaimed automatically
+  ticket/<work_ticket_idx>/<step>/attempt-<N>/  per-attempt workspace: control-plane runner files; under SLURM also input/params.json, output/ (step outputs), logs/{stdout,stderr}, tmp/; reclaimed on request by `qiita-admin scratch reclaim`, which keeps logs/
   staging/uploads/<upload_idx>/upload.parquet   DoPut upload staging; not reclaimed automatically
   references/staging/<name>/<version>/     operator-staged reference source files (docs/reference-data-staging.md)
   persistent/                               shared FS, never auto-deleted; cluster purge exemption requested
@@ -53,7 +53,7 @@ Retention:
 
 - `PATH_PERSISTENT/` — never auto-deleted. Backed up by cluster policy.
 - `/scratch/persistent/` and `/scratch/persistent-local/` — never auto-deleted by us; cluster purge exemption requested for both. For aligner indices specifically, if the local-SSD copy is missing for any reason, the orchestrator rebuilds it on demand at job dispatch.
-- `PATH_SCRATCH/ticket/` and `PATH_SCRATCH/staging/` — nothing reclaims them: no sweep deletes a ticket's workspace or an upload's staging directory after the ticket ends, so both grow with every ticket. Registration moves a registered file out of its output dir; everything else (inputs, logs, `tmp/`, outputs no step registered) stays.
+- `PATH_SCRATCH/ticket/` and `PATH_SCRATCH/staging/` — nothing reclaims them automatically, so both grow with every ticket. Registration moves a registered file out of its output dir; everything else (inputs, logs, `tmp/`, outputs no step registered) stays. `qiita-admin scratch reclaim --older-than DAYS [--execute]` deletes everything under `ticket/<idx>/<step>/attempt-<N>/` except `logs/` for finished tickets (see `--help` for eligibility; `--older-than` counts from the ticket's last update). It must run as the user that owns the job output dirs (the SLURM job user), since it restores owner write on 0550 container output dirs before deleting. It never touches `staging/`. A reclaimed read-mask ticket can no longer feed the SynDNA read-count backfill, so the command skips tickets that backfill would still write; once a ticket is reclaimed, its backfill gap is permanent.
 
 Same-FS preference: registration moves each file from the producing step's output dir under `PATH_SCRATCH/ticket/` into `PATH_PERSISTENT/ducklake/<table>/` by `rename`, falling back to copy + delete when the two are on different filesystems (`EXDEV`; `move_file` in `qiita-data-plane/src/flight_service.rs`). The fallback is not atomic and copies the whole file, so placing `PATH_SCRATCH` on the same filesystem as `PATH_PERSISTENT` keeps registration on the rename path ([`first-deploy.md`](../runbooks/first-deploy.md) §0.3).
 

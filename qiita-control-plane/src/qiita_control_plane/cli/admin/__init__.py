@@ -33,8 +33,9 @@ import json
 import os
 import sys
 import time
-from collections import Counter
+from collections import Counter, defaultdict
 from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import asyncpg
@@ -56,10 +57,21 @@ from ...backfill.syndna_read_count import BackfillPlan as SyndnaBackfillPlan
 from ...backfill.syndna_read_count import apply_backfill as apply_syndna_backfill
 from ...backfill.syndna_read_count import plan_backfill as plan_syndna_backfill
 from ...config import _parse_optional_positive_int_env
+from ...scratch_reclaim import (
+    ReclaimLockHeld,
+    apply_reclaim,
+    plan_reclaim,
+    reclaim_lock,
+)
 from ...workspace import WORK_TICKET_SUBDIR
 from .. import _common
 from .._reference_exclusion import add_admin_exclusion_subparsers
-from ._helpers import _DB_CONNECT_TIMEOUT_SECONDS, open_admin_pool
+from ._helpers import (
+    _DB_CONNECT_TIMEOUT_SECONDS,
+    EXIT_PRECONDITION_FAILED,
+    open_admin_pool,
+    requires_database_url,
+)
 from .actions_sync import _handle_actions_sync, _sync_actions
 from .auth import _handle_login, _handle_token_revoke_all, _handle_whoami, _token_revoke_all
 from .compute_readiness import _DEFAULT_ORCHESTRATOR_VENV, _handle_compute_readiness
@@ -569,6 +581,46 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Write the counts (default: dry-run, report only, no writes).",
     )
     p_backfill_syndna.set_defaults(handler=_handle_backfill_syndna_read_count)
+
+    p_scratch = sub.add_parser("scratch", help="Scratch workspace housekeeping")
+    p_scratch_sub = p_scratch.add_subparsers(dest="scratch_cmd", required=True)
+    p_scratch_reclaim = p_scratch_sub.add_parser(
+        "reclaim",
+        help="Delete finished tickets' scratch workspaces, keeping their logs",
+        description=(
+            "Delete everything under PATH_SCRATCH/ticket/<idx>/<step>/attempt-<n>/ except logs/,"
+            " for tickets that are completed or no_data, or failed/cancelled download-ena-study"
+            " tickets a newer download ticket has superseded, with no step still submitting or"
+            " running. Tickets the SynDNA read-count backfill would still write are skipped."
+            " Workspaces with no work_ticket row are reported, and deleted only with"
+            " --include-orphans. Dry-run by default. Exit codes: 0 ok, 1 a workspace failed, 2 bad"
+            " configuration, 3 another run holds the lock. Needs DATABASE_URL and PATH_SCRATCH."
+        ),
+    )
+    p_scratch_reclaim.add_argument(
+        "--older-than",
+        type=_days_ago,
+        required=True,
+        metavar="DAYS",
+        help=(
+            "Only tickets last updated more than DAYS days ago (counted from the ticket's"
+            " last update, not its completion)."
+        ),
+    )
+    p_scratch_reclaim.add_argument(
+        "--action-id", default=None, help="Only tickets of this action (orphans are unaffected)."
+    )
+    p_scratch_reclaim.add_argument(
+        "--include-orphans",
+        action="store_true",
+        help="Also delete workspaces whose work_ticket row does not exist.",
+    )
+    p_scratch_reclaim.add_argument(
+        "--execute",
+        action="store_true",
+        help="Delete (default: dry-run, report only, no writes).",
+    )
+    p_scratch_reclaim.set_defaults(handler=_handle_scratch_reclaim)
 
     p_actions = sub.add_parser("actions", help="Action registry operations")
     p_actions_sub = p_actions.add_subparsers(dest="actions_cmd", required=True)
@@ -1413,6 +1465,111 @@ def _handle_backfill_syndna_read_count(
             f" {len(writable)} prep_sample(s)."
         )
     return 0
+
+
+_EXIT_LOCK_HELD = 3
+
+
+def _days_ago(value: str) -> datetime:
+    try:
+        days = int(value)
+        if days >= 1:
+            return datetime.now(UTC) - timedelta(days=days)
+    except ValueError, OverflowError:
+        pass
+    raise argparse.ArgumentTypeError(f"{value!r} must be a positive whole number of days")
+
+
+def _gib(n: int) -> str:
+    return f"{n / 2**30:.2f} GiB"
+
+
+async def _scratch_reclaim(
+    database_url: str,
+    *,
+    ticket_root: Path,
+    cutoff: datetime,
+    action_id: str | None,
+    execute: bool,
+    include_orphans: bool,
+):
+    pool = await open_admin_pool(database_url)
+    try:
+        if not execute:
+            return await plan_reclaim(
+                pool, ticket_root=ticket_root, cutoff=cutoff, action_id=action_id
+            ), None
+        async with reclaim_lock(pool):
+            plan = await plan_reclaim(
+                pool, ticket_root=ticket_root, cutoff=cutoff, action_id=action_id
+            )
+            return plan, await apply_reclaim(pool, plan, include_orphans=include_orphans)
+    finally:
+        await pool.close()
+
+
+@requires_database_url
+def _handle_scratch_reclaim(
+    args: argparse.Namespace, parser: argparse.ArgumentParser, database_url: str
+) -> int:
+    scratch = os.environ.get("PATH_SCRATCH")
+    if not scratch or not Path(scratch).is_absolute():
+        print("error: PATH_SCRATCH must be set to an absolute path", file=sys.stderr)
+        return EXIT_PRECONDITION_FAILED
+
+    try:
+        plan, result = asyncio.run(
+            _scratch_reclaim(
+                database_url,
+                ticket_root=Path(scratch) / WORK_TICKET_SUBDIR,
+                cutoff=args.older_than,
+                action_id=args.action_id,
+                execute=args.execute,
+                include_orphans=args.include_orphans,
+            )
+        )
+    except ReclaimLockHeld as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return _EXIT_LOCK_HELD
+    except (RuntimeError, ValueError, OSError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    groups: dict[tuple[str, str], list[int]] = defaultdict(lambda: [0, 0, 0, 0, 0])
+    for t in plan.tickets:
+        g = groups[(t.action_id, t.state)]
+        g[0] += 1
+        g[1] += t.usage.total_bytes
+        g[2] += t.usage.reclaimable_bytes
+        g[3] += t.usage.log_bytes
+        g[4] += t.usage.kept_inodes
+    print("action_id / state: tickets, total, reclaimable, logs kept, inodes left behind")
+    for (action_id, state), (n, total, freeable, logs, left) in sorted(groups.items()):
+        print(f"  {action_id} {state}: {n}, {_gib(total)}, {_gib(freeable)}, {_gib(logs)}, {left}")
+    print(f"eligible tickets : {len(plan.tickets)}")
+    for t in plan.tickets:
+        if t.error:
+            print(f"  ticket {t.work_ticket_idx}: {t.error}")
+    print(f"skipped (SynDNA backfill still needs them): {len(plan.syndna_skipped)}")
+    for idx in plan.syndna_skipped:
+        print(f"  ticket {idx}")
+    print(f"orphan workspaces: {len(plan.orphans)}")
+    for o in plan.orphans:
+        print(
+            f"  ticket/{o.work_ticket_idx}: {_gib(o.usage.total_bytes)},"
+            f" {o.usage.inodes} inodes{f' ({o.error})' if o.error else ''}"
+        )
+
+    if result is None:
+        print("\nDRY RUN — nothing deleted. Pass --execute to reclaim.")
+        return 0
+    freed = sum(t.usage.reclaimable_bytes for t in result.reclaimed)
+    print(f"\nreclaimed {len(result.reclaimed)} workspace(s), {_gib(freed)}")
+    for idx, reason in result.skipped:
+        print(f"  skipped ticket {idx}: {reason}")
+    for idx, reason in result.failures:
+        print(f"  FAILED ticket {idx}: {reason}", file=sys.stderr)
+    return 1 if result.failures else 0
 
 
 __all__ = [
