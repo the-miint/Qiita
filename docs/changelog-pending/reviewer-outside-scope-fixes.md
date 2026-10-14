@@ -10,3 +10,11 @@
   code such a commit wrote, a defect it introduced is a finding against it and a further
   pre-existing problem is deferred. An offer the author does not take, and everything
   else, is deferred to an issue as before. `review-loop-check` is unchanged.
+
+### Fixed
+
+- **A fanned-out reviewer subagent now gets the caller's scope and ledger.** The
+  qiita-reviewer's subagent prompt template carried neither, so in a later round a family
+  subagent read past the round's scope and could re-raise a finding the caller had
+  already declined or deferred. The template now passes them on verbatim, with the
+  `[outside-subject]` commits.
