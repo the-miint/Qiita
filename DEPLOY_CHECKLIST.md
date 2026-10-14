@@ -24,6 +24,7 @@ _None yet._
 ### 3. Migrations
 
 - `[operator]` (#685) `make migrate` applies `20261009000000_work_ticket_follow_on.sql` (three nullable columns on `qiita.work_ticket`, two CHECKs, one partial index; no backfill).
+- `[operator]` `make migrate` applies `20261013000000_seed_control_type_fields.sql` (new terminology `MIxS NegContTypeEnum` and global fields `neg_cont_type` and `pos_cont_type`; additive, no backfill). (#690)
 
 ### 4. Deploy
 

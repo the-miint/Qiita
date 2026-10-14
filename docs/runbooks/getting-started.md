@@ -155,8 +155,14 @@ much that covers is a per-site choice: a deploy starts with a small seeded set
 (`9606` human, `10090` mouse, a few metagenome taxa), and an operator can load a
 full NCBI release, after which the whole taxonomy is accepted. An id your site does
 not have is refused, and there is no self-service way to list or add one — ask your
-operator. For a biosample with no host of its own — a blank, a control, an
-environmental biosample — use `not applicable`.
+operator. For an environmental biosample with no host of its own, use
+`not applicable`. A blank or other control still needs a `host taxon id` (any accepted
+value, `not applicable` included) and also sets `--metadata "negative control type=…"`
+or `--metadata "positive control type=…"`; either makes it a control whatever its
+`host taxon id`. `negative control type` takes only `DNA-free PCR mix`,
+`distilled water`, `empty collection device`, `empty collection tube`,
+`phosphate buffer`, `sterile swab`, `sterile syringe`, `extraction blank` or
+`no-template control`; `positive control type` is free text, such as `katharoseq`.
 
 `--owner-biosample-id-value` is your own name for the biosample, stored under the
 field named by `--owner-biosample-id-field-name` (the field is created the first

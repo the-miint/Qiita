@@ -18,7 +18,16 @@ import secrets
 import asyncpg
 import pytest
 import pytest_asyncio
-from qiita_common.models import MISSING_REASON_CONTROL_SAMPLE, Platform
+from qiita_common.models import (
+    BIOSAMPLE_DISPLAY_NEG_CONT_TYPE,
+    BIOSAMPLE_DISPLAY_POS_CONT_TYPE,
+    BIOSAMPLE_DISPLAY_QIITA_SAMPLE_TYPE,
+    BIOSAMPLE_FIELD_NEG_CONT_TYPE,
+    BIOSAMPLE_FIELD_POS_CONT_TYPE,
+    BIOSAMPLE_FIELD_QIITA_SAMPLE_TYPE,
+    MISSING_REASON_CONTROL_SAMPLE,
+    Platform,
+)
 
 from qiita_control_plane.host_filter_resolver import (
     HostFilterOutcome,
@@ -44,6 +53,12 @@ from qiita_control_plane.testing.db_teardown import delete_principal, teardown_e
 pytestmark = pytest.mark.db
 
 _HOST_TAXON_FIELD = "host_taxon_id"
+_CONTROL_FIELDS = {
+    BIOSAMPLE_FIELD_NEG_CONT_TYPE: BIOSAMPLE_DISPLAY_NEG_CONT_TYPE,
+    BIOSAMPLE_FIELD_POS_CONT_TYPE: BIOSAMPLE_DISPLAY_POS_CONT_TYPE,
+    BIOSAMPLE_FIELD_QIITA_SAMPLE_TYPE: BIOSAMPLE_DISPLAY_QIITA_SAMPLE_TYPE,
+}
+_NEGATIVE_SAMPLE_TYPES = ["control_blank", "control_sterile_water", "control_sea_water"]
 
 
 @pytest_asyncio.fixture
@@ -81,6 +96,20 @@ async def ctx(postgres_pool):
             display_name="host taxon id",
             created_by_idx=principal_idx,
         )
+        control_field_idxs = {}
+        for internal_name, display_name in _CONTROL_FIELDS.items():
+            control_gf_idx = await conn.fetchval(
+                "SELECT idx FROM qiita.biosample_global_field WHERE internal_name = $1",
+                internal_name,
+            )
+            control_field_idxs[internal_name], _ = await _get_or_create_globally_linked_study_field(
+                conn,
+                spec=BIOSAMPLE_METADATA_SPEC,
+                study_idx=study_idx,
+                global_field_idx=control_gf_idx,
+                display_name=display_name,
+                created_by_idx=principal_idx,
+            )
 
     rype_idx = await seed_host_reference(
         pool, name=f"hfr-rype-{suffix}", created_by_idx=principal_idx
@@ -129,6 +158,7 @@ async def ctx(postgres_pool):
         "study_idx": study_idx,
         "host_gf_idx": host_gf_idx,
         "field_idx": field_idx,
+        "control_field_idxs": control_field_idxs,
         "rype_idx": rype_idx,
         "minimap2_idx": minimap2_idx,
         "human_term_idx": human_term_idx,
@@ -198,6 +228,61 @@ async def _set_host_missing_reason(ctx, biosample_idx, reason_name):
         ctx["field_idx"],
         reason_idx,
         ctx["principal_idx"],
+    )
+
+
+async def _set_control_term(ctx, biosample_idx, internal_name, term_id):
+    """Write a terminology-typed control field (neg_cont_type / qiita_sample_type)."""
+    term_idx = await ctx["pool"].fetchval(
+        "SELECT tt.idx FROM qiita.terminology_term tt"
+        " JOIN qiita.biosample_global_field bgf ON bgf.terminology_idx = tt.terminology_idx"
+        " WHERE bgf.internal_name = $1 AND tt.term_id = $2",
+        internal_name,
+        term_id,
+    )
+    assert term_idx is not None, f"{term_id!r} should be seeded for {internal_name}"
+    await ctx["pool"].execute(
+        "INSERT INTO qiita.biosample_metadata"
+        " (biosample_idx, biosample_study_field_idx, value_terminology_term_idx,"
+        "  created_by_idx)"
+        " VALUES ($1, $2, $3, $4)",
+        biosample_idx,
+        ctx["control_field_idxs"][internal_name],
+        term_idx,
+        ctx["principal_idx"],
+    )
+
+
+async def _set_control_missing_reason(ctx, biosample_idx, internal_name, reason_name):
+    reason_idx = await fetch_missing_value_reason_idx(ctx["pool"], reason_name)
+    assert reason_idx is not None, f"missing_value_reason {reason_name!r} should be seeded"
+    await ctx["pool"].execute(
+        "INSERT INTO qiita.biosample_metadata"
+        " (biosample_idx, biosample_study_field_idx, value_missing_reason_idx,"
+        "  created_by_idx)"
+        " VALUES ($1, $2, $3, $4)",
+        biosample_idx,
+        ctx["control_field_idxs"][internal_name],
+        reason_idx,
+        ctx["principal_idx"],
+    )
+
+
+async def _set_pos_cont_text(ctx, biosample_idx, text):
+    await ctx["pool"].execute(
+        "INSERT INTO qiita.biosample_metadata"
+        " (biosample_idx, biosample_study_field_idx, value_text, created_by_idx)"
+        " VALUES ($1, $2, $3, $4)",
+        biosample_idx,
+        ctx["control_field_idxs"][BIOSAMPLE_FIELD_POS_CONT_TYPE],
+        text,
+        ctx["principal_idx"],
+    )
+
+
+async def _resolve(ctx, biosample_idx):
+    return await resolve_host_filter(
+        ctx["pool"], biosample_idx=biosample_idx, platform=Platform.ILLUMINA
     )
 
 
@@ -332,6 +417,134 @@ async def test_control_sample_is_a_marker_not_a_decision(ctx):
     assert res.outcome is HostFilterOutcome.CONTROL
     assert res.rype_reference_idx is None
     assert res.minimap2_reference_idx is None
+
+
+# ---------------------------------------------------------------------------
+# Controls identified from sample metadata, ahead of host_taxon_id
+# ---------------------------------------------------------------------------
+
+
+async def test_negative_control_with_a_host_taxon_resolves_control(ctx):
+    """A blank carrying the taxon of the samples it rode with (human) must not be
+    filtered against that host: the control signal beats host_taxon_id."""
+    bs_idx = await _make_biosample(ctx)
+    await _set_host_term(ctx, bs_idx, ctx["human_term_idx"])
+    await _set_control_term(ctx, bs_idx, BIOSAMPLE_FIELD_NEG_CONT_TYPE, "distilled water")
+
+    res = await _resolve(ctx, bs_idx)
+
+    assert res.outcome is HostFilterOutcome.CONTROL
+    assert res.host_term_idx is None
+    assert res.rype_reference_idx is None
+    assert res.minimap2_reference_idx is None
+
+
+async def test_negative_control_with_no_host_taxon_row_resolves_control(ctx):
+    """Seeded by SQL, since import requires host_taxon_id: the control check must
+    not depend on the host row existing."""
+    bs_idx = await _make_biosample(ctx)
+    await _set_control_term(ctx, bs_idx, BIOSAMPLE_FIELD_NEG_CONT_TYPE, "extraction blank")
+
+    assert (await _resolve(ctx, bs_idx)).outcome is HostFilterOutcome.CONTROL
+
+
+@pytest.mark.parametrize("host_reason", ["not applicable", "not provided"])
+async def test_negative_control_beats_a_missing_host_reason(ctx, host_reason):
+    """'not applicable' would be PASS_THROUGH and 'not provided' (what the ENA
+    import writes for an unmapped taxon) UNRESOLVED; the control wins either way."""
+    bs_idx = await _make_biosample(ctx)
+    await _set_host_missing_reason(ctx, bs_idx, host_reason)
+    await _set_control_term(ctx, bs_idx, BIOSAMPLE_FIELD_NEG_CONT_TYPE, "no-template control")
+
+    assert (await _resolve(ctx, bs_idx)).outcome is HostFilterOutcome.CONTROL
+
+
+async def test_positive_control_resolves_control_for_host_filtering(ctx):
+    bs_idx = await _make_biosample(ctx)
+    await _set_host_term(ctx, bs_idx, ctx["human_term_idx"])
+    await _set_pos_cont_text(ctx, bs_idx, "katharoseq")
+
+    assert (await _resolve(ctx, bs_idx)).outcome is HostFilterOutcome.CONTROL
+
+
+@pytest.mark.parametrize("blank", ["", "   "])
+async def test_blank_pos_cont_type_is_not_a_control(ctx, blank):
+    bs_idx = await _make_biosample(ctx)
+    await _set_host_term(ctx, bs_idx, ctx["human_term_idx"])
+    await _set_pos_cont_text(ctx, bs_idx, blank)
+
+    assert (await _resolve(ctx, bs_idx)).outcome is HostFilterOutcome.FILTER
+    assert await is_control_sample(ctx["pool"], biosample_idx=bs_idx) is False
+
+
+@pytest.mark.parametrize("reason", ["not applicable", "not provided", "missing: control sample"])
+async def test_a_missing_reason_on_neg_cont_type_is_not_a_control(ctx, reason):
+    """A sheet that writes 'not applicable' on every real sample must not turn the
+    pool into controls: only a real value counts."""
+    bs_idx = await _make_biosample(ctx)
+    await _set_host_term(ctx, bs_idx, ctx["human_term_idx"])
+    await _set_control_missing_reason(ctx, bs_idx, BIOSAMPLE_FIELD_NEG_CONT_TYPE, reason)
+
+    assert (await _resolve(ctx, bs_idx)).outcome is HostFilterOutcome.FILTER
+    assert await is_control_sample(ctx["pool"], biosample_idx=bs_idx) is False
+
+
+@pytest.mark.parametrize("term_id", ["control_blank", "control_spike_in"])
+async def test_control_qiita_sample_type_with_a_host_taxon_resolves_control(ctx, term_id):
+    bs_idx = await _make_biosample(ctx)
+    await _set_host_term(ctx, bs_idx, ctx["human_term_idx"])
+    await _set_control_term(ctx, bs_idx, BIOSAMPLE_FIELD_QIITA_SAMPLE_TYPE, term_id)
+
+    assert (await _resolve(ctx, bs_idx)).outcome is HostFilterOutcome.CONTROL
+
+
+async def test_control_reason_names_neg_cont_type_over_qiita_sample_type(ctx):
+    bs_idx = await _make_biosample(ctx)
+    await _set_control_term(ctx, bs_idx, BIOSAMPLE_FIELD_QIITA_SAMPLE_TYPE, "control_blank")
+    await _set_control_term(ctx, bs_idx, BIOSAMPLE_FIELD_NEG_CONT_TYPE, "sterile swab")
+
+    single = await _resolve(ctx, bs_idx)
+    batch = await resolve_host_filter_many(
+        ctx["pool"], biosample_idxs=[bs_idx], platform=Platform.ILLUMINA
+    )
+
+    assert single.reason.startswith(BIOSAMPLE_FIELD_NEG_CONT_TYPE)
+    assert batch[bs_idx] == single
+
+
+async def test_non_control_qiita_sample_type_is_not_a_control(ctx):
+    bs_idx = await _make_biosample(ctx)
+    await _set_host_term(ctx, bs_idx, ctx["human_term_idx"])
+    await _set_control_term(ctx, bs_idx, BIOSAMPLE_FIELD_QIITA_SAMPLE_TYPE, "feces")
+
+    assert (await _resolve(ctx, bs_idx)).outcome is HostFilterOutcome.FILTER
+    assert await is_control_sample(ctx["pool"], biosample_idx=bs_idx) is False
+
+
+async def test_is_control_sample_true_for_negative_metadata_controls(ctx):
+    neg = await _make_biosample(ctx)
+    await _set_control_term(ctx, neg, BIOSAMPLE_FIELD_NEG_CONT_TYPE, "sterile swab")
+    assert await is_control_sample(ctx["pool"], biosample_idx=neg) is True
+
+    for term_id in _NEGATIVE_SAMPLE_TYPES:
+        bs_idx = await _make_biosample(ctx)
+        await _set_control_term(ctx, bs_idx, BIOSAMPLE_FIELD_QIITA_SAMPLE_TYPE, term_id)
+        assert await is_control_sample(ctx["pool"], biosample_idx=bs_idx) is True, term_id
+
+
+async def test_positive_controls_are_not_expected_empty_wells(ctx):
+    """A positive control should yield reads, so zero reads from one stays a
+    failure: CONTROL for host filtering, but not an expected-empty well."""
+    by_pos_cont_type = await _make_biosample(ctx)
+    await _set_pos_cont_text(ctx, by_pos_cont_type, "katharoseq")
+    by_sample_type = await _make_biosample(ctx)
+    await _set_control_term(
+        ctx, by_sample_type, BIOSAMPLE_FIELD_QIITA_SAMPLE_TYPE, "control_spike_in"
+    )
+
+    for bs_idx in (by_pos_cont_type, by_sample_type):
+        assert (await _resolve(ctx, bs_idx)).outcome is HostFilterOutcome.CONTROL
+        assert await is_control_sample(ctx["pool"], biosample_idx=bs_idx) is False
 
 
 # ---------------------------------------------------------------------------
@@ -538,6 +751,27 @@ async def test_batch_agrees_with_single_sample_for_every_outcome(ctx):
     # No host_taxon_id at all.
     biosamples["absent"] = await _make_biosample(ctx)
 
+    biosamples["metadata_control_with_host"] = await _make_biosample(ctx)
+    await _set_host_term(ctx, biosamples["metadata_control_with_host"], ctx["human_term_idx"])
+    await _set_control_term(
+        ctx,
+        biosamples["metadata_control_with_host"],
+        BIOSAMPLE_FIELD_NEG_CONT_TYPE,
+        "distilled water",
+    )
+
+    biosamples["metadata_control_no_host"] = await _make_biosample(ctx)
+    await _set_pos_cont_text(ctx, biosamples["metadata_control_no_host"], "katharoseq")
+
+    biosamples["sample_type_control"] = await _make_biosample(ctx)
+    await _set_host_term(ctx, biosamples["sample_type_control"], ctx["human_term_idx"])
+    await _set_control_term(
+        ctx,
+        biosamples["sample_type_control"],
+        BIOSAMPLE_FIELD_QIITA_SAMPLE_TYPE,
+        "control_blank",
+    )
+
     idxs = list(biosamples.values())
     batch = await resolve_host_filter_many(
         ctx["pool"], biosample_idxs=idxs, platform=Platform.ILLUMINA
@@ -547,6 +781,9 @@ async def test_batch_agrees_with_single_sample_for_every_outcome(ctx):
             ctx["pool"], biosample_idx=idx, platform=Platform.ILLUMINA
         )
         assert batch[idx] == single, f"batch/single disagree for biosample {idx}"
+
+    for name in ("metadata_control_with_host", "metadata_control_no_host", "sample_type_control"):
+        assert batch[biosamples[name]].outcome is HostFilterOutcome.CONTROL, name
 
     # And the fan actually covered every branch — otherwise the equality above
     # could pass by comparing five identical UNRESOLVEDs.

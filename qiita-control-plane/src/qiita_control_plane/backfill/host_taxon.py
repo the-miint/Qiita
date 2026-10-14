@@ -18,7 +18,8 @@ Two facts drive each biosample, in this order:
   1. IS IT A CONTROL? A blank has no host of its own regardless of what taxon it
      carries, so this is checked FIRST. The signal is the pre-flight's own
      `is_control` (`input_sample.project_idx IS NULL`), read via
-     `preflight.control_samples` — not the sample's name.
+     `preflight.control_samples`, or a negative control in the sample's own
+     metadata (`negative_control_biosamples`) — not the sample's name.
   2. WHAT IS THE SAMPLE'S OWN TAXON? `taxon_id` (populated on every biosample we
      hold) names the sample's organism — for a metagenome, the environment it
      came from. `human gut metagenome` implies a human host; `seawater
@@ -54,6 +55,7 @@ from qiita_common.models import (
 )
 
 from ..host_by_sample_taxon import HOST_BY_SAMPLE_TAXON
+from ..host_filter_resolver import negative_control_biosamples
 from ..preflight import control_samples_from_blob
 from ..repositories._sample_helpers import _get_or_create_globally_linked_study_field
 from ..repositories.biosample_metadata import BIOSAMPLE_METADATA_SPEC
@@ -79,7 +81,7 @@ class HostTaxonSource(StrEnum):
     operator can see which rows rest on the pre-flight and which on the curated
     taxon mapping."""
 
-    CONTROL = "control"  # the pre-flight says it is a blank
+    CONTROL = "control"  # the pre-flight or the metadata says it is a blank
     TAXON = "taxon"  # its own taxon implies a host
     NO_HOST = "no_host"  # its own taxon implies NO host ('not applicable')
     UNRESOLVED = "unresolved"  # nothing settles it — left unwritten, reported
@@ -293,6 +295,10 @@ async def plan_backfill(pool: asyncpg.Pool) -> BackfillPlan:
         BIOSAMPLE_FIELD_HOST_TAXON_ID,
     )
 
+    metadata_controls = await negative_control_biosamples(
+        pool, [row["biosample_idx"] for row in rows]
+    )
+
     plan = BackfillPlan(
         already_populated=already_populated or 0,
         no_taxon=no_taxon or 0,
@@ -304,7 +310,8 @@ async def plan_backfill(pool: asyncpg.Pool) -> BackfillPlan:
             classify(
                 biosample_idx=row["biosample_idx"],
                 study_idx=row["study_idx"],
-                is_control=accession is not None and accession in scan.accessions,
+                is_control=(accession is not None and accession in scan.accessions)
+                or row["biosample_idx"] in metadata_controls,
                 sample_taxon_term_id=row["taxon_term_id"],
                 sample_taxon_label=row["taxon_label"],
             )

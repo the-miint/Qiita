@@ -21,6 +21,8 @@ import secrets
 import pytest
 import pytest_asyncio
 from qiita_common.models import (
+    BIOSAMPLE_FIELD_NEG_CONT_TYPE,
+    BIOSAMPLE_FIELD_QIITA_SAMPLE_TYPE,
     NCBI_TAXONOMY_HUMAN_TERM_ID,
     NCBI_TAXONOMY_METAGENOME_TERM_ID,
     NCBI_TAXONOMY_MOUSE_TERM_ID,
@@ -411,3 +413,77 @@ async def test_a_biosample_with_no_taxon_is_counted_not_silently_dropped(ctx):
 
     assert not any(a.biosample_idx == bare for a in plan.assignments)
     assert plan.no_taxon >= 1
+
+
+async def _set_control_term(ctx, biosample_idx, internal_name, term_id):
+    async with ctx["pool"].acquire() as conn, conn.transaction():
+        global_field_idx, term_idx = await _control_global_field_and_term(
+            conn, internal_name, term_id
+        )
+        field_idx, _ = await _get_or_create_globally_linked_study_field(
+            conn,
+            spec=BIOSAMPLE_METADATA_SPEC,
+            study_idx=ctx["study_idx"],
+            global_field_idx=global_field_idx,
+            display_name=internal_name,
+            created_by_idx=ctx["principal_idx"],
+        )
+        await conn.execute(
+            "INSERT INTO qiita.biosample_metadata"
+            " (biosample_idx, biosample_study_field_idx, value_terminology_term_idx,"
+            "  created_by_idx)"
+            " VALUES ($1, $2, $3, $4)",
+            biosample_idx,
+            field_idx,
+            term_idx,
+            ctx["principal_idx"],
+        )
+
+
+async def _control_global_field_and_term(conn, internal_name, term_id):
+    row = await conn.fetchrow(
+        "SELECT bgf.idx AS field_idx, tt.idx AS term_idx"
+        "  FROM qiita.biosample_global_field bgf"
+        "  JOIN qiita.terminology_term tt ON tt.terminology_idx = bgf.terminology_idx"
+        " WHERE bgf.internal_name = $1 AND tt.term_id = $2",
+        internal_name,
+        term_id,
+    )
+    return row["field_idx"], row["term_idx"]
+
+
+@pytest.mark.db
+@pytest.mark.parametrize(
+    ("internal_name", "term_id"),
+    [
+        (BIOSAMPLE_FIELD_NEG_CONT_TYPE, "distilled water"),
+        (BIOSAMPLE_FIELD_QIITA_SAMPLE_TYPE, "control_blank"),
+    ],
+)
+async def test_negative_metadata_control_is_written_as_a_control_marker(
+    ctx, internal_name, term_id
+):
+    """A biosample the metadata calls a negative control is a CONTROL even when no
+    pre-flight names it, and gets the marker rather than its taxon's host."""
+    bs_idx = await _seed_biosample_with_taxon(ctx, _HUMAN_GUT_METAGENOME)
+    await _set_control_term(ctx, bs_idx, internal_name, term_id)
+
+    plan = await plan_backfill(ctx["pool"])
+    mine = [a for a in plan.assignments if a.biosample_idx == bs_idx]
+    await apply_backfill(ctx["pool"], mine, principal_idx=ctx["principal_idx"])
+
+    assert [a.source for a in mine] == [HostTaxonSource.CONTROL]
+    assert (await _host_taxon_of(ctx, bs_idx))["reason"] == "missing: control sample"
+
+
+@pytest.mark.db
+async def test_positive_metadata_control_is_not_written_as_a_control_marker(ctx):
+    """The marker makes a sample an expected-empty well, which a spike-in control
+    must not be; it keeps the host its own taxon implies."""
+    bs_idx = await _seed_biosample_with_taxon(ctx, _HUMAN_GUT_METAGENOME)
+    await _set_control_term(ctx, bs_idx, BIOSAMPLE_FIELD_QIITA_SAMPLE_TYPE, "control_spike_in")
+
+    plan = await plan_backfill(ctx["pool"])
+    mine = [a for a in plan.assignments if a.biosample_idx == bs_idx]
+
+    assert [a.source for a in mine] == [HostTaxonSource.TAXON]

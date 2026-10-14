@@ -640,16 +640,9 @@ def _stream_masked_reads_to_fastq(data_plane_url: str, ticket_bytes: bytes, dest
 
 
 async def _prep_sample_is_expected_empty_control(pool: asyncpg.Pool, prep_sample_idx: int) -> bool:
-    """True when this prep_sample's biosample is flagged an expected-empty control
-    (host_taxon_id == "missing: control sample"). Resolves prep_sample → biosample,
-    then defers the control classification to `is_control_sample` so the definition
-    of "control" stays shared with the host-filter resolver. Fail-safe on a missing
-    prep_sample (returns False → the zero-read ticket FAILs as a data well).
-
-    Covers BOTH positive and negative controls, because the persisted control
-    marker cannot yet tell them apart — see the KNOWN LIMITATION in
-    `is_control_sample`: a positive control (katharoseq) that yields zero reads is
-    currently classified `no_data` too, though it is really a failure."""
+    """True when this prep_sample's biosample is an expected-empty control, per
+    `is_control_sample`. Fail-safe on a missing prep_sample (False → the zero-read
+    ticket FAILs as a data well)."""
     biosample_idx = await fetch_biosample_idx_for_prep_sample(pool, prep_sample_idx)
     if biosample_idx is None:
         return False
@@ -722,9 +715,8 @@ async def _resolve_staged_reads(
         # writes no file for an empty result). Split control from data: an
         # expected-empty control (blank / NTC) reading zero is the benign, correct
         # outcome → terminal no_data; a data well reading zero is a real failure →
-        # BAD_INPUT (must be ingested before a mask can be created over it). The
-        # control marker is the persisted biosample host_taxon_id == "missing:
-        # control sample" (see `is_control_sample`).
+        # BAD_INPUT (must be ingested before a mask can be created over it). See
+        # `is_control_sample` for what counts as a control.
         if await _prep_sample_is_expected_empty_control(pool, prep_sample_idx):
             raise StepNoData(
                 reason=(
