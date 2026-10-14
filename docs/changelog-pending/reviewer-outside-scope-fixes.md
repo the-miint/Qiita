@@ -13,8 +13,8 @@
 
 ### Fixed
 
-- **A fanned-out reviewer subagent now gets the caller's scope and ledger.** The
-  qiita-reviewer's subagent prompt template carried neither, so in a later round a family
-  subagent read past the round's scope and could re-raise a finding the caller had
-  already declined or deferred. The template now passes them on verbatim, with the
-  `[outside-subject]` commits.
+- **A fanned-out reviewer subagent now gets the caller's prompt.** The qiita-reviewer's
+  subagent prompt template carried none of it, so in a later round a family subagent could
+  read past the round's scope, re-raise a finding the caller had already declined or
+  deferred, and leave the round's fixes unconfirmed. The template now passes the prompt
+  on verbatim: its scope, standing ledger, `[outside-subject]` commits and ask.
