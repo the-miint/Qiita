@@ -5056,6 +5056,7 @@ async def redrive_ctx(ctx, monkeypatch):
     saved_client = getattr(app.state, "compute_backend_client", None)
     app.state.compute_backend_client = object()
     monkeypatch.setattr("qiita_control_plane.routes.work_ticket.schedule_dispatch", lambda *_: None)
+    monkeypatch.setattr("qiita_control_plane.work_ticket_submit.schedule_dispatch", lambda *_: None)
     try:
         yield ctx
     finally:

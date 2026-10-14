@@ -34,6 +34,7 @@ from .dispatch import (
 )
 from .ena_import.batch import build_ena_import_study_semaphore, reconcile_inflight_batches
 from .follow_on import reconcile_follow_ons
+from .follow_on_sweeper import run_follow_on_sweeper
 from .health import aggregate_health
 from .landing import router as landing_router
 from .notify import build_transport, run_sweeper
@@ -143,9 +144,22 @@ async def lifespan(app: FastAPI):
         name="cli_login_code_sweeper",
     )
 
+    # follow-on sweeper — retries a transiently-failed follow-on once per
+    # FOLLOW_ON_SWEEP_INTERVAL_SECONDS instead of waiting for the next CP start.
+    # Its submit path is create-at-most-once, so it needs no advisory lock or
+    # dedicated pool (see follow_on_sweeper). Registered on app.state so the GC
+    # can't drop it; cancelled in the shutdown finally.
+    app.state.follow_on_sweeper_task = asyncio.create_task(
+        run_follow_on_sweeper(app, settings),
+        name="follow_on_sweeper",
+    )
+
     try:
         yield
     finally:
+        app.state.follow_on_sweeper_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await app.state.follow_on_sweeper_task
         app.state.cli_login_code_sweeper_task.cancel()
         with suppress(asyncio.CancelledError):
             await app.state.cli_login_code_sweeper_task

@@ -965,7 +965,7 @@ async def test_tier_on_all_studies_admin_wrapper_is_unchanged(study_access_ctx):
     """The ADMIN-specific entry point keeps its exact behaviour and message.
 
     Its two production call sites (routes/sequenced_sample.py, and
-    routes/work_ticket.py via _check_prep_sample_study_access) must not notice
+    work_ticket_submit.py via _check_prep_sample_study_access) must not notice
     the generalization. VIEWER is enough for the new read gate but must still fail the old
     write gate.
     """

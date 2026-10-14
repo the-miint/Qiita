@@ -1981,8 +1981,8 @@ async def test_concurrency_bound_is_shared_across_batches(
     not one limit per batch. Gated at ticket submission -- the last thing
     `_process_one_study` does -- so the semaphore permit must still be held
     that far into the item's flow, not just across `register_ena_study`."""
+    from qiita_control_plane import work_ticket_submit as work_ticket_module
     from qiita_control_plane.ena_import import batch as batch_module
-    from qiita_control_plane.routes import work_ticket as work_ticket_module
 
     concurrency = batch_module._STUDY_CONCURRENCY
     # A misconfigured `_STUDY_CONCURRENCY` must fail here with a clear message,

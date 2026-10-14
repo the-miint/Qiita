@@ -150,14 +150,13 @@ async def _submit_follow_on(app: FastAPI, work_ticket_idx: int) -> None:
     """Submit the follow-on of a ticket that just COMPLETED (no-op otherwise).
 
     `follow_on` records refusals on the parent row itself; anything else reaches
-    here having recorded nothing, and the startup reconcile retries it — so log
+    here having recorded nothing, and a later reconcile retries it — so log
     it and keep the dispatch task clean."""
     try:
         await submit_follow_on(app, work_ticket_idx)
     except Exception:
         _log.exception(
-            "follow-on after work_ticket %d was not submitted; the next startup"
-            " reconcile re-drives it",
+            "follow-on after work_ticket %d was not submitted; a later reconcile re-drives it",
             work_ticket_idx,
         )
 

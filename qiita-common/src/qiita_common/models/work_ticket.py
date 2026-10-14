@@ -60,7 +60,7 @@ class ProcessingKind(StrEnum):
 
     When extending the enum: each workflow YAML's `target_processing_kinds:`
     is an explicit allowlist. New kinds do NOT auto-enroll into existing
-    workflows — the submission check (qiita_control_plane/routes/work_ticket.py)
+    workflows — the submission check (qiita_control_plane/work_ticket_submit.py)
     rejects any prep_sample whose kind is not in the action's list. Adding
     a new kind means landing the DB enum value, the subtype table (see
     qiita-control-plane/tests/test_prep_sample_subtype_invariants.py for

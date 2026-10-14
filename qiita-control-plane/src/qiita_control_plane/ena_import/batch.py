@@ -564,7 +564,7 @@ async def _process_one_study(
         # Local import (narrow, deliberately unusual direction): reuse the exact
         # same audience/scope/disallow-without-delete gate a real
         # `POST /work-ticket` goes through, not a parallel copy.
-        from ..routes.work_ticket import submit_work_ticket_core
+        from ..work_ticket_submit import submit_work_ticket_core
 
         # Each idx is persisted as it lands so a crash mid-loop orphans nothing.
         any_ticket = False

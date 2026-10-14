@@ -82,6 +82,7 @@ _None yet._
   write storm can occupy the whole pool and reads are refused for that window.
 
 - (#685) Work-ticket responses (`GET /work-ticket/{idx}` and the ticket lists) gain `on_success`, `follow_on_work_ticket_idx` and `follow_on_error` (all null for a ticket with no follow-on); clients validating that shape strictly must accept them.
+- (#707) New optional `FOLLOW_ON_SWEEP_INTERVAL_SECONDS` (default 60) tunes how often the control plane retries a transiently-failed follow-on; no action required.
 
 ## Deployed history
 
