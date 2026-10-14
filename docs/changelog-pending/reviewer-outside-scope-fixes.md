@@ -1,10 +1,12 @@
 ### Changed
 
 - **A small fix outside a PR's subject lands in that PR instead of becoming an issue.** The
-  reviewer's Scope discipline now offers a pre-existing problem as a fix for the branch when
-  the fix is correct on reading the diff alone, changes no behaviour a test does not pin,
-  touches no operator-impacting surface, and makes no design choice for a maintainer; a
-  finding in code that only such a fix touched is deferred. The `qiita-review` skill lands
-  each one as its own commit, names the paths it touched to the next round, and lists it
-  under `Fixed:` in the `## Reviewer loop` block. Everything else is deferred to an issue
-  as before. `review-loop-check` is unchanged.
+  reviewer's Scope discipline now offers a pre-existing problem as an `[outside-subject]`
+  fix for the branch when reading settles that the fix is correct, every behaviour it
+  changes is pinned by a test, it needs no `DEPLOY_CHECKLIST.md` fold, and it makes no
+  design choice for a maintainer. The `qiita-review` skill lands each one as its own
+  commit, adds a changelog bullet when it changes behaviour, names its commit to the next
+  round, and lists it with that commit under `Fixed:` in the `## Reviewer loop` block. In
+  code such a commit wrote, a defect it introduced is a finding against it and a further
+  pre-existing problem is deferred. An offer the author does not take, and everything
+  else, is deferred to an issue as before. `review-loop-check` is unchanged.
