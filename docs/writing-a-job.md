@@ -117,11 +117,16 @@ Raise the right thing; the dispatcher maps it:
 | Raised in `execute()` | Classified as | Retry? |
 |---|---|---|
 | `StepNoData` | `NO_DATA` (terminal, not a failure) | — |
-| `FileNotFoundError`, `ValueError` | `BAD_INPUT` (permanent) | no |
 | a pyarrow/Flight error that is a recoverable data-plane condition (`qiita_common.data_plane_errors`) | `DATA_PLANE_TRANSIENT` | yes |
 | any other `pyarrow.ArrowException` / `FlightError` | propagates (logged with traceback) | — |
+| `FileNotFoundError`, `ValueError` | `BAD_INPUT` (permanent) | no |
 | `NotImplementedError` | `UNKNOWN_PERMANENT` | no |
 | anything else | propagates (logged with traceback) | — |
+
+The rows are in the order the dispatcher's arms run, which is the order to read
+them in: `ArrowInvalid` is a `ValueError` and `ArrowNotImplementedError` is a
+`NotImplementedError`, so a pyarrow error matches a row above the builtin one
+that would otherwise claim it.
 
 `StepNoData` is for a legitimate empty input (e.g. an empty FASTQ well) — a
 terminal *no-data* outcome, distinct from a failure. Follow the repo ethos:

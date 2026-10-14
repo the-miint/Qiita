@@ -147,16 +147,22 @@ fi
 
 # --- 4a. Data-plane pool, per running instance ------------------------------
 # Each data plane logs one line at boot naming the pool it built, the memory
-# ceiling it divided and WHICH detector answered. Two things are worth a row.
+# ceiling it divided and which detector answered. Two things are worth a row,
+# and they read different spans of the journal: the pool line is the last one
+# this boot (the running process's, after any restart within the boot), while the
+# discard count covers every process that ran this boot.
 #
 # `fallback default` means no cgroup and no /proc/meminfo answered, so the pool
-# sized itself against 8 GiB — on this host that is a misdetection, and every
-# request runs under a limit two orders of magnitude below what is there.
+# sized itself against 8 GiB — on this host that is a misdetection, and at the
+# default pool size every connection gets the 512 MiB floor instead of a share of
+# what the host has.
 #
 # `discarding a pooled DuckLake connection` means a connection failed its reset
-# on the way back and was rebuilt. One is a transient; a stream of them means
-# every request pays a fresh attach (measured at 84-107 ms and ~16 catalog
-# transactions against 3.0-3.4 ms reused), which shows up only as slowness.
+# on the way back and was rebuilt, which fails the row at any count: the reset is
+# a ROLLBACK that already tolerates having nothing to roll back, so a failure is
+# not a shape the pool expects. What it costs is a fresh attach per request
+# (measured at 84-107 ms and ~16 catalog transactions against 3.0-3.4 ms reused),
+# which otherwise shows up only as slowness.
 if [ -n "${SKIP_DP_POOL:-}" ]; then
     skip "dp-pool" "SKIP_DP_POOL=1"
 elif ! command -v journalctl >/dev/null 2>&1; then
@@ -165,7 +171,7 @@ else
     dp_units=$(systemctl list-units --no-legend --plain 'qiita-data-plane@*.service' 2>/dev/null \
         | awk '{print $1}')
     if [ -z "$dp_units" ]; then
-        skip "dp-pool" "no qiita-data-plane@ instance is running"
+        skip "dp-pool" "systemctl lists no running qiita-data-plane@ instance"
     else
         for unit in $dp_units; do
             # -b: this boot only, so a previous boot's lines are not read as this

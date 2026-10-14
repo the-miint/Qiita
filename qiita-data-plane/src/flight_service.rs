@@ -109,15 +109,13 @@ pub struct QiitaFlightService {
     /// DuckDB that would size itself against the whole host.
     pool: Arc<LakePool>,
     /// Permits for concurrent DoPuts, which borrow no connection and so are not
-    /// bounded by the pool.
-    ///
-    /// An upload decodes Arrow batches and writes Parquet; its cost is the
-    /// batches in flight, and measured against a real data plane that cost is
-    /// linear in both concurrency and batch size — peak RSS 165 MiB at one
-    /// upload, 1,103 MiB at sixteen with 8 MiB batches, and 3,014 MiB at sixteen
-    /// with 64 MiB batches. Nothing in the process bounded how many ran, so the
-    /// ceiling was whatever the edge admitted per client address.
+    /// bounded by the pool. An upload decodes Arrow batches and writes Parquet,
+    /// so its cost is the batches in flight; the measurement the default rests
+    /// on is on `DEFAULT_MAX_CONCURRENT_DOPUT` in `config.rs`.
     doput_permits: Arc<tokio::sync::Semaphore>,
+    /// The permit count, kept because `available_permits()` is 0 once
+    /// `try_acquire` has failed and the refusal names the bound it hit.
+    max_concurrent_doput: usize,
     /// Root for DoPut staging — uploads land at
     /// `{root}/uploads/{upload_idx}/upload.parquet`. CP and DP must agree
     /// on the layout convention (CP derives the same path on the read
@@ -142,6 +140,7 @@ impl QiitaFlightService {
             flight_public_key,
             pool,
             doput_permits: Arc::new(tokio::sync::Semaphore::new(max_concurrent_doput)),
+            max_concurrent_doput,
             upload_staging_root,
             scratch_root,
         }
@@ -1245,16 +1244,15 @@ impl QiitaFlightService {
 
         // One permit per upload in flight, taken after the ticket verifies so an
         // unauthenticated caller cannot spend one, and held until the staged file
-        // is written. `try_acquire`, not `acquire`: an upload that waited here
-        // would hold its stream open at the edge exactly as a queued DoGet would,
-        // which is the reasoning in `pool.rs`. The refusal carries the same
-        // "data plane busy" prefix, so the classification both services share
-        // (`qiita_common.data_plane_errors`) files it as retriable without
-        // knowing which surface refused.
+        // is written. `try_acquire`, not `acquire`, for the reason `pool.rs` gives
+        // for refusing rather than queueing. The refusal carries the same
+        // "data plane busy" prefix as the pool's, so one signature covers both
+        // surfaces; today both DoPut clients are user-facing CLIs that classify
+        // nothing, so what the prefix reaches is a person reading the message.
         let _upload_permit = self.doput_permits.try_acquire().map_err(|_| {
             Status::resource_exhausted(format!(
                 "data plane busy: all {} concurrent uploads are in use; retry",
-                self.doput_permits.available_permits() + 1
+                self.max_concurrent_doput
             ))
         })?;
 

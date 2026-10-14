@@ -31,8 +31,6 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
-import pyarrow
-import pyarrow.flight
 from pydantic import BaseModel, ValidationError
 from qiita_common.actions import NATIVE_MODULE_PREFIX
 from qiita_common.backend_failure import BackendFailure, FailureKind, StepNoData
@@ -185,10 +183,14 @@ async def run_native_job(
       `Inputs` / `execute` exports → CONTRACT_VIOLATION (permanent;
       the job tree is broken).
     - `Inputs.model_validate` rejects `raw_inputs`, or `execute` raises
-      `FileNotFoundError` / `ValueError` → BAD_INPUT (permanent;
-      same inputs would fail the same way on retry).
-    - `execute` raises `NotImplementedError` → UNKNOWN_PERMANENT
-      (the job module is a skeleton; auto-retry would not help).
+      `FileNotFoundError` / a `ValueError` that is not a pyarrow one →
+      BAD_INPUT (permanent; same inputs would fail the same way on retry).
+    - `execute` raises one of the data plane's recoverable conditions
+      (`qiita_common.data_plane_errors.is_data_plane_transient`) →
+      DATA_PLANE_TRANSIENT (the runner re-dispatches the step).
+    - `execute` raises a `NotImplementedError` that is not a pyarrow one →
+      UNKNOWN_PERMANENT (the job module is a skeleton; auto-retry would not
+      help).
 
     `StepNoData` raised by `execute` propagates UNCHANGED — it is a
     terminal no-data outcome (an empty FASTQ well), NOT a failure, so it
@@ -199,8 +201,19 @@ async def run_native_job(
 
     Other exception types from `execute` propagate so they surface in
     the orchestrator's logs with full traceback rather than being
-    silently classified.
+    silently classified. Every pyarrow and Flight exception the four
+    conditions above do not cover propagates for the same reason, which is
+    what the pyarrow arm's placement above the builtin arms buys: an
+    `ArrowInvalid` is a `ValueError` and an `ArrowNotImplementedError` is a
+    `NotImplementedError`, and neither is the thing those arms describe.
     """
+    # Deferred like the package's other two pyarrow users
+    # (`data_plane_client`, `jobs.golay_demux`): the names are needed only by the
+    # `except` arm below, and importing both costs 51 ms and 28 MiB on every
+    # import of this package — the boot scan and the SLURM launcher included.
+    import pyarrow  # noqa: PLC0415
+    import pyarrow.flight  # noqa: PLC0415
+
     if not module_name.startswith(NATIVE_MODULE_PREFIX):
         raise _contract_violation(
             step_name=step_name,

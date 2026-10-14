@@ -1,5 +1,5 @@
 //! Pool behaviour that needs no catalog: the in-flight bound, what a returned
-//! instance carries, and that the settings reach DuckDB. The real ATTACH is
+//! connection carries, and that the settings reach DuckDB. The real ATTACH is
 //! exercised by the integration tier.
 
 use super::*;
@@ -58,7 +58,7 @@ fn duckdb_resource_settings_belong_to_the_database_not_the_connection() {
 }
 
 #[test]
-fn checkout_refuses_once_every_instance_is_in_use() {
+fn checkout_refuses_once_every_connection_is_in_use() {
     let tmp = tempfile::tempdir().unwrap();
     let pool = pool_without_catalog(2, tmp.path().to_path_buf());
 
@@ -77,7 +77,7 @@ fn checkout_refuses_once_every_instance_is_in_use() {
     drop(first);
     drop(second);
     assert_eq!(pool.idle_len(), 2, "both came back");
-    pool.checkout().expect("a returned instance is reusable");
+    pool.checkout().expect("a returned connection is reusable");
 }
 
 #[test]
@@ -95,7 +95,7 @@ fn an_unfinished_transaction_does_not_outlive_the_borrow() {
         // request that failed mid-transaction leaves behind.
     }
 
-    let conn = pool.checkout().expect("checkout the same instance again");
+    let conn = pool.checkout().expect("checkout the same connection again");
     let rows: i64 = conn
         .query_row("SELECT count(*) FROM t", [], |row| row.get(0))
         .expect("count");
@@ -118,7 +118,7 @@ fn an_unfinished_transaction_does_not_outlive_the_borrow() {
 /// The other half of the reset: a borrow that ends with nothing open comes back
 /// without being treated as broken. This is what pins the one error string
 /// `reset` tolerates — if DuckDB ever words it differently, this fails rather
-/// than the pool quietly discarding and rebuilding every instance it lends.
+/// than the pool quietly discarding and rebuilding every connection it lends.
 #[test]
 fn a_clean_borrow_comes_back_without_error() {
     let tmp = tempfile::tempdir().unwrap();
@@ -131,7 +131,7 @@ fn a_clean_borrow_comes_back_without_error() {
     assert_eq!(
         pool.idle_len(),
         1,
-        "the instance was returned, not discarded"
+        "the connection was returned, not discarded"
     );
     let conn = pool.checkout().expect("checkout again");
     let rows: i64 = conn
@@ -228,13 +228,13 @@ fn every_setting_that_could_end_a_sql_literal_is_rejected_at_construction() {
 }
 
 /// The lazy half of the bound, against a real catalog: `open` attaches one
-/// instance so a bad setting or an unwritable spill directory fails the unit at
+/// connection so a bad setting or an unwritable spill directory fails the unit at
 /// boot, and the remaining slots are attached only when a request needs them —
 /// each one costs a lake-Postgres backend for as long as it lives.
 #[test]
 #[cfg(feature = "integration")]
 #[serial_test::serial]
-fn open_attaches_one_instance_and_the_rest_on_demand() {
+fn open_attaches_one_connection_and_the_rest_on_demand() {
     let connstr = crate::test_catalog::connstr();
     let data_path = crate::test_catalog::data_path();
     let tmp = tempfile::tempdir().unwrap();
@@ -248,12 +248,12 @@ fn open_attaches_one_instance_and_the_rest_on_demand() {
     assert_eq!(
         pool.idle_len(),
         1,
-        "exactly one instance is attached at open"
+        "exactly one connection is attached at open"
     );
     assert_eq!(pool.unbuilt_len(), 2, "the other two are not attached yet");
 
-    let first = pool.checkout().expect("the attached instance");
-    let second = pool.checkout().expect("an instance attached on demand");
+    let first = pool.checkout().expect("the attached connection");
+    let second = pool.checkout().expect("an connection attached on demand");
     assert_eq!(pool.unbuilt_len(), 1);
     let _third = pool.checkout().expect("the last slot");
     assert_eq!(pool.unbuilt_len(), 0);
@@ -262,9 +262,9 @@ fn open_attaches_one_instance_and_the_rest_on_demand() {
         "a fourth request has nothing left to borrow"
     );
 
-    // What a reused attach is for: the instance comes back and answers again.
+    // What a reused attach is for: the connection comes back and answers again.
     // `idle_len` is the half a query cannot show — a reset that failed on an
-    // attached instance would discard it, credit the slot and rebuild, and the
+    // attached connection would discard it, credit the slot and rebuild, and the
     // query below would still succeed.
     drop(first);
     drop(second);
@@ -273,9 +273,9 @@ fn open_attaches_one_instance_and_the_rest_on_demand() {
         2,
         "both were returned and reset, not discarded and rebuilt"
     );
-    let reused = pool.checkout().expect("a returned instance");
+    let reused = pool.checkout().expect("a returned connection");
     let one: i64 = reused
         .query_row("SELECT 1", [], |row| row.get(0))
-        .expect("a returned instance still answers");
+        .expect("a returned connection still answers");
     assert_eq!(one, 1);
 }

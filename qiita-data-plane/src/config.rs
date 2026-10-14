@@ -78,10 +78,10 @@ pub(crate) const CEILING_DIVISOR: u64 = 2;
 /// DELETE) at a 209 MiB and a 2,086 MiB payload: the export fails at 256 MiB for
 /// the larger payload and at 128 MiB for the smaller, with a single
 /// `failed to allocate data of size 128.0 MiB` — its Parquet row-group buffer,
-/// which a spill directory does not rescue, so the floor matters more than the
-/// cap. Both shapes' minimum moved up one step for ten times the payload, so no
-/// fixed value serves every request; this is the floor, and what a request
-/// actually gets comes from dividing a real ceiling.
+/// which a spill directory does not rescue. Ten times the payload moved each
+/// shape that has a floor up one step, the streamed read 128 → 256 MiB and the
+/// export 256 → 512 MiB, so no fixed value serves every request; this is the
+/// floor, and what a request actually gets comes from dividing a real ceiling.
 ///
 /// A share below it means the pool is too big for the host rather than that the
 /// share should be rounded up — granting the floor anyway would hand out
@@ -104,11 +104,26 @@ const DEFAULT_MAX_TEMP_DIRECTORY_SIZE: &str = "4GiB";
 
 /// Uploads one data plane serves at once. Chosen, not measured: what is measured
 /// is the cost curve it bounds — against a real data plane, peak RSS was 165 MiB
-/// for one upload, 1,103 MiB for sixteen at 8 MiB batches and 3,014 MiB for
-/// sixteen at 64 MiB batches, so the cost is linear in concurrency and grows with
-/// batch size. Eight matches the connection pool's default, because it is the
-/// same question asked of a different resource, not because the two share
-/// anything — an upload takes no connection, and this permit is not one.
+/// for one upload and 1,103 MiB for sixteen at 8 MiB batches, 3,014 MiB for
+/// sixteen at 64 MiB, and 2,787 MiB for one and 8,834 MiB for four at 896 MiB.
+/// So the cost is linear in concurrency and tracks the batch size, which makes
+/// this a bound on uploads and not on memory.
+///
+/// What a payload may be is bounded elsewhere and far higher: one client
+/// RecordBatch, which `main`'s `FLIGHT_MAX_DECODING_BYTES` admits at up to 1 GiB
+/// and `flight_service::DOPUT_WRITER_CHANNEL_DEPTH` lets that many again queue
+/// for behind. Today's uploaders are the two user-facing CLIs, which send
+/// `qiita_common.chunking.CHUNK_ROW_GROUP_SIZE` rows per batch — stated there as
+/// ~1 GB on dense data — so eight of them is ~18 GiB of decode buffers by the
+/// measured linearity. That is a share of the deploy host and the whole of the
+/// 8 GiB fallback ceiling, and unlike the pool's memory share it is not derived
+/// from a ceiling and cannot fail boot: a host smaller than this one needs the
+/// value lowered by hand. Bounding bytes rather than count is the mechanism that
+/// would make that automatic, and nothing here measures what it should be.
+///
+/// Eight matches the connection pool's default because it is the same question
+/// asked of a different resource, not because the two share anything — an upload
+/// takes no connection, and this permit is not one.
 const DEFAULT_MAX_CONCURRENT_DOPUT: usize = 8;
 
 /// Leaf name of the derived spill directory, under the `HOME` the systemd unit
@@ -253,6 +268,11 @@ impl Settings {
             }
         };
 
+        // Only `> 0` is checked, where DUCKLAKE_POOL_SIZE also fails boot when the
+        // ceiling cannot give each connection MIN_MEMORY_LIMIT_MIB. There is no
+        // equivalent arithmetic here: DuckDB accounts the pool's memory against a
+        // limit this process sets, and nothing accounts an upload's, so there is
+        // no per-upload share to check a ceiling against.
         let max_concurrent_doput = parse_positive::<usize>("FLIGHT_MAX_CONCURRENT_DOPUT")?
             .unwrap_or(DEFAULT_MAX_CONCURRENT_DOPUT);
 

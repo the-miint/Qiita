@@ -10,7 +10,9 @@ mod flight_service;
 mod miint;
 mod pool;
 mod resources;
-#[cfg(test)]
+// Gated with its consumers, every one of which is an `integration` test: under
+// `#[cfg(test)]` alone its two functions are dead code on a plain `cargo test`.
+#[cfg(all(test, feature = "integration"))]
 mod test_catalog;
 
 #[tokio::main]

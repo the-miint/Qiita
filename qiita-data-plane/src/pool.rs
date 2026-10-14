@@ -17,7 +17,7 @@
 //! itself; what a refusal becomes instead differs per caller, and
 //! `docs/architecture/flight.md` ("Concurrency bound") is where that lives.
 //!
-//! Instances are built as they are first needed rather than all at boot, because
+//! Connections are built as they are first needed rather than all at boot, because
 //! each one costs a lake-Postgres backend for as long as it lives — the budget
 //! `config::DEFAULT_POOL_SIZE` is chosen against. One is built at `open` so a bad
 //! setting or an unwritable spill directory fails the unit at boot rather than on
@@ -37,7 +37,7 @@ use crate::ducklake;
 /// its own.
 #[derive(Debug, Clone)]
 pub struct PoolSettings {
-    /// Instances the pool may hold, and so requests that may be in flight.
+    /// Connections the pool may hold, and so requests that may be in flight.
     pub size: usize,
     pub threads: u32,
     /// In DuckDB's own spelling, e.g. `23552MiB` — note DuckDB reads `GB` as
@@ -58,12 +58,13 @@ pub struct PoolSettings {
 }
 
 impl PoolSettings {
-    /// Checked by every constructor, because all three of these reach DuckDB
-    /// inside quoted SQL literals in `apply_settings` — the same way the
-    /// connection string and data path do in `ducklake::connect_ducklake` — and
-    /// all three come from the environment. What a valid value looks like is
-    /// DuckDB's business, and `ducklake::validate_sql_literal` says what happens to
-    /// one it rejects.
+    /// Checked by every constructor, over everything in these settings that
+    /// comes from the environment: the size, which bounds what the pool can
+    /// serve, and the three values that reach DuckDB inside quoted SQL literals
+    /// in `apply_settings` — the same way the connection string and data path do
+    /// in `ducklake::connect_ducklake`. What a valid value looks like is DuckDB's
+    /// business, and `ducklake::validate_sql_literal` says what happens to one it
+    /// rejects.
     fn validate(&self) -> Result<(), String> {
         if self.size == 0 {
             return Err("pool size must be at least 1 — a size of 0 serves no request".into());
@@ -100,7 +101,7 @@ const NO_TRANSACTION_TO_ROLL_BACK: &str = "no transaction is active";
 
 struct PoolState {
     idle: Vec<Connection>,
-    /// Instances the pool is entitled to but has not built, or has discarded.
+    /// Connections the pool is entitled to but has not built, or has discarded.
     /// `idle.len() + checked_out + unbuilt == size` always.
     unbuilt: usize,
 }
@@ -137,7 +138,7 @@ impl LakePool {
                 unbuilt: 0,
             }),
         });
-        let first = pool.build_instance()?;
+        let first = pool.build_connection()?;
         {
             let mut state = pool.lock_state();
             state.idle.push(first);
@@ -173,7 +174,7 @@ impl LakePool {
             // same slot; handed back below if the build fails.
             state.unbuilt -= 1;
         }
-        match self.build_instance() {
+        match self.build_connection() {
             Ok(conn) => Ok(PooledConnection {
                 pool: Arc::clone(self),
                 conn: Some(conn),
@@ -192,7 +193,7 @@ impl LakePool {
         }
     }
 
-    fn build_instance(&self) -> Result<Connection, Box<dyn std::error::Error>> {
+    fn build_connection(&self) -> Result<Connection, Box<dyn std::error::Error>> {
         let conn = Connection::open_in_memory()?;
         ducklake::connect_ducklake(&conn, &self.catalog_connstr, &self.data_path)?;
         self.apply_settings(&conn)?;
@@ -269,7 +270,7 @@ impl LakePool {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// A pool over plain in-memory DuckDB instances, with no DuckLake attached:
+    /// A pool over plain in-memory DuckDB databases, with no DuckLake attached:
     /// for tests that need a pool but never reach a catalog. The bound, the
     /// refusal and the reset on return are the production path; the lazy build —
     /// reserving an unbuilt slot, crediting it back when a build fails — is only

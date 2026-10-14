@@ -16,12 +16,17 @@
 //! the other platform does not have, so the ordering alone decides which answers.
 //!
 //! The compute orchestrator sizes its own DuckDB sessions from a cgroup too
-//! (`qiita_compute_orchestrator.miint`), and walks ancestors the same way for the
-//! same reason. It still differs in its last resort — the host's physical total,
-//! where this takes what is currently available — because a job is sized before
-//! it runs and this pool is sized at boot. Neither language can import the other,
-//! so a change to one precedence is a reason to look at the other rather than a
-//! shared constant.
+//! (`qiita_compute_orchestrator.miint`), and takes the tightest limit across the
+//! ancestor chain for the same reason. The two converge on that and on nothing
+//! else: it collects v2 and v1 files together and minimises over both, where this
+//! reads v2 and falls to v1 only when the unified line names no path; it reads the
+//! mount root even when the process's own path is `/`, where `cgroup_v2_path`
+//! declines; it treats a v1 value at or above the host total as unlimited, where
+//! this has a fixed sentinel (`CGROUP_V1_UNLIMITED_ABOVE`); and its last resort is
+//! the host's physical total, where this takes what is currently available —
+//! because a job is sized before it runs and this pool is sized at boot. Neither
+//! language can import the other, so a change to one precedence is a reason to
+//! read the other rather than a shared constant.
 
 /// Where a detected memory ceiling came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,11 +135,12 @@ fn read_self_cgroup() -> Option<String> {
 /// The tightest limit across the process's own cgroup and every ancestor up to
 /// the mount root, which is not always its own: a slice above it can be the one
 /// that caps memory, and under a systemd `MemoryMax=` on a parent slice the
-/// process's own file reads unlimited. The compute orchestrator walks the same
-/// way for the same reason (`qiita_compute_orchestrator.miint.detected_ram_gb`).
-/// A file that is missing, unreadable or unlimited is skipped rather than ending
-/// the walk, so detection steps down to the next source only when no cgroup in
-/// the chain has a limit.
+/// process's own file reads unlimited. A file that is missing, unreadable or
+/// unlimited is skipped rather than ending the walk, so detection steps down to
+/// the next source only when no cgroup in the chain has a limit — which also
+/// means an unreadable own file and an absent one are not told apart, and an
+/// ancestor's looser limit answers where a step down to `MemAvailable` would
+/// have.
 fn tightest_limit(
     own_path: &str,
     mount: &str,
@@ -294,6 +300,10 @@ mod tests {
 
     /// A fake cgroup tree: `mount/<path>/<file>` for each entry.
     fn cgroup_tree(entries: &[(&str, &str)]) -> tempfile::TempDir {
+        cgroup_tree_of("memory.max", entries)
+    }
+
+    fn cgroup_tree_of(file: &str, entries: &[(&str, &str)]) -> tempfile::TempDir {
         let root = tempfile::tempdir().unwrap();
         for (path, value) in entries {
             let dir = root
@@ -301,7 +311,7 @@ mod tests {
                 .join("cgroup")
                 .join(path.trim_start_matches('/'));
             std::fs::create_dir_all(&dir).unwrap();
-            std::fs::write(dir.join("memory.max"), value).unwrap();
+            std::fs::write(dir.join(file), value).unwrap();
         }
         root
     }
@@ -351,6 +361,54 @@ mod tests {
             ),
             None,
             "an unlimited chain steps down to the next detector"
+        );
+    }
+
+    #[test]
+    fn the_walk_reads_the_v1_filename_and_its_unlimited_sentinel() {
+        // v1 spells unlimited as a number above any real host, and the walk starts
+        // at the mount root for a process whose own path is `/` — which is where
+        // the v1 reader differs from the v2 one.
+        let root = cgroup_tree_of(
+            "memory.limit_in_bytes",
+            &[
+                (
+                    "",
+                    "9223372036854771712
+",
+                ),
+                (
+                    "slice",
+                    "2147483648
+",
+                ),
+                (
+                    "slice/unit",
+                    "9223372036854771712
+",
+                ),
+            ],
+        );
+        let mount = root.path().join("cgroup");
+        assert_eq!(
+            tightest_limit(
+                "/slice/unit",
+                mount.to_str().unwrap(),
+                "memory.limit_in_bytes",
+                parse_cgroup_v1_limit
+            ),
+            Some(2 * 1024 * 1024 * 1024),
+            "the sentinel is skipped at both ends and the slice's real limit answers"
+        );
+        assert_eq!(
+            tightest_limit(
+                "",
+                mount.to_str().unwrap(),
+                "memory.limit_in_bytes",
+                parse_cgroup_v1_limit
+            ),
+            None,
+            "a process at the mount root sees only the sentinel there"
         );
     }
 

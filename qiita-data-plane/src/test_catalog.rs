@@ -1,9 +1,8 @@
 //! Where the integration tier finds the test DuckLake catalog.
+
 //!
-//! One home for the two values every catalog-backed test needs, because three
-//! modules had their own copy of both and a divergence between them reads as a
-//! test failure in whichever one is stale. `ducklake`, `flight_service` and
-//! `pool` all take them from here.
+//! One home for the two values every catalog-backed test needs: a divergence
+//! between copies reads as a test failure in whichever one is stale.
 
 /// The test catalog's libpq connection string.
 ///

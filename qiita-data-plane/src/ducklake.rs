@@ -867,6 +867,7 @@ mod tests {
         TEST_ID.fetch_add(1, Ordering::Relaxed) as i64
     }
 
+    #[cfg(feature = "integration")]
     fn setup_conn() -> Connection {
         let conn = Connection::open_in_memory().expect("open in-memory DuckDB");
         let connstr = crate::test_catalog::connstr();
@@ -886,6 +887,7 @@ mod tests {
     /// declared order, for the schema-drift assertions below. `is_nullable` is
     /// carried because NOT NULL is a property both alignment DDLs argue for
     /// explicitly; without it, dropping every NOT NULL leaves these tests green.
+    #[cfg(feature = "integration")]
     fn table_schema(conn: &Connection, table: &str) -> Vec<(String, String, String)> {
         let mut stmt = conn
             .prepare(
@@ -904,6 +906,7 @@ mod tests {
     /// Uses format! for SQL — safe because table/column are &'static str from
     /// compile-time constants in the test code, and id is an integer.
     /// This pattern is test-only and must not be copied to production code.
+    #[cfg(feature = "integration")]
     struct Cleanup<'a> {
         conn: &'a Connection,
         table: &'static str,
@@ -911,6 +914,7 @@ mod tests {
         id: i64,
     }
 
+    #[cfg(feature = "integration")]
     impl Drop for Cleanup<'_> {
         fn drop(&mut self) {
             let _ = self.conn.execute_batch(&format!(

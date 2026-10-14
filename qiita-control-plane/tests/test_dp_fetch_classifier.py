@@ -26,11 +26,11 @@ from pathlib import Path
 from qiita_common.backend_failure import FailureKind
 from qiita_common.data_plane_errors import (
     DATA_PLANE_BUSY_SIGNATURE,
-    DP_TICKET_EXPIRED_SIGNATURES,
+    DATA_PLANE_TICKET_EXPIRED_SIGNATURES,
     is_data_plane_busy,
-    is_dp_serialization_conflict,
-    is_dp_ticket_expired,
-    is_dp_unavailable,
+    is_data_plane_serialization_conflict,
+    is_data_plane_ticket_expired,
+    is_data_plane_unavailable,
 )
 from qiita_common.models import WorkTicketFailureStage
 
@@ -123,8 +123,8 @@ _SERVER_RETURNED_EXPIRED = (
 )
 
 # A server-returned UNAVAILABLE: no connect failure happened, so none of the
-# connect-shaped substrings appear. See the block comment above for why this is
-# pinned even though nothing on the CP->DP path is known to produce it.
+# connect-shaped substrings appear — which is the half of the match this fixture
+# discriminates.
 _SERVER_RETURNED_UNAVAILABLE = (
     "data plane is shutting down. Detail: Unavailable. gRPC client debug context: "
     "UNKNOWN:Error received from peer ipv4:127.0.0.1:50112 "
@@ -136,8 +136,8 @@ _SERVER_RETURNED_UNAVAILABLE = (
 def test_expiry_is_detected_in_both_pyarrow_renderings():
     """The classifier must fire on the form a live data plane produces, not only on
     the message-prefix form the other fixtures use."""
-    assert is_dp_ticket_expired(Exception(_REAL_EXPIRED)) is True
-    assert is_dp_ticket_expired(Exception(_SERVER_RETURNED_EXPIRED)) is True
+    assert is_data_plane_ticket_expired(Exception(_REAL_EXPIRED)) is True
+    assert is_data_plane_ticket_expired(Exception(_SERVER_RETURNED_EXPIRED)) is True
 
 
 def test_a_data_plane_that_is_up_but_unavailable_is_retriable():
@@ -146,7 +146,7 @@ def test_a_data_plane_that_is_up_but_unavailable_is_retriable():
     The data plane answers this status when it cannot open a DuckLake connection, and
     gRPC defines it as retriable, so a redrive self-heals it and it must not land as a
     bad-input an operator resolves."""
-    assert is_dp_unavailable(Exception(_SERVER_RETURNED_UNAVAILABLE)) is True
+    assert is_data_plane_unavailable(Exception(_SERVER_RETURNED_UNAVAILABLE)) is True
     f = _submission_dp_fetch_failure("could not fetch ...", Exception(_SERVER_RETURNED_UNAVAILABLE))
     assert f.kind is FailureKind.DATA_PLANE_TRANSIENT
     assert f.transient is True
@@ -162,43 +162,43 @@ def test_the_two_renderings_do_not_cross_contaminate():
     same_message_other_status = _SERVER_RETURNED_EXPIRED.replace(
         "Detail: Unauthenticated", "Detail: Internal"
     )
-    assert is_dp_ticket_expired(Exception(same_message_other_status)) is False
-    assert is_dp_ticket_expired(Exception(_SERVER_RETURNED_UNAVAILABLE)) is False
-    assert is_dp_unavailable(Exception(_SERVER_RETURNED_EXPIRED)) is False
+    assert is_data_plane_ticket_expired(Exception(same_message_other_status)) is False
+    assert is_data_plane_ticket_expired(Exception(_SERVER_RETURNED_UNAVAILABLE)) is False
+    assert is_data_plane_unavailable(Exception(_SERVER_RETURNED_EXPIRED)) is False
 
 
 def test_serialization_conflict_is_detected():
-    assert is_dp_serialization_conflict(Exception(_REAL_40001)) is True
+    assert is_data_plane_serialization_conflict(Exception(_REAL_40001)) is True
 
 
 def test_non_serialization_error_is_not_detected():
-    assert is_dp_serialization_conflict(Exception("some other flight error")) is False
-    assert is_dp_serialization_conflict(FileNotFoundError("missing file")) is False
+    assert is_data_plane_serialization_conflict(Exception("some other flight error")) is False
+    assert is_data_plane_serialization_conflict(FileNotFoundError("missing file")) is False
 
 
 def test_unavailable_is_detected():
-    assert is_dp_unavailable(Exception(_REAL_UNAVAILABLE)) is True
+    assert is_data_plane_unavailable(Exception(_REAL_UNAVAILABLE)) is True
 
 
 def test_non_unavailable_error_is_not_detected():
     # A serialization conflict is retriable, but NOT via the unavailable path.
-    assert is_dp_unavailable(Exception(_REAL_40001)) is False
-    assert is_dp_unavailable(Exception("some other flight error")) is False
+    assert is_data_plane_unavailable(Exception(_REAL_40001)) is False
+    assert is_data_plane_unavailable(Exception("some other flight error")) is False
 
 
 def test_ticket_expired_is_detected():
-    assert is_dp_ticket_expired(Exception(_REAL_EXPIRED)) is True
+    assert is_data_plane_ticket_expired(Exception(_REAL_EXPIRED)) is True
 
 
 def test_other_unauthenticated_errors_are_not_detected():
     # Same class, same gRPC status, permanent cause — must not be swept in.
-    assert is_dp_ticket_expired(Exception(_REAL_BAD_SIGNATURE)) is False
-    assert is_dp_ticket_expired(Exception(_REAL_40001)) is False
-    assert is_dp_ticket_expired(Exception("some other flight error")) is False
+    assert is_data_plane_ticket_expired(Exception(_REAL_BAD_SIGNATURE)) is False
+    assert is_data_plane_ticket_expired(Exception(_REAL_40001)) is False
+    assert is_data_plane_ticket_expired(Exception("some other flight error")) is False
     # `AuthError::ExpiryTooFar` — the nearest miss, and the variant a reword of the
     # Rust `Display` impl is most likely to collide with.
     assert (
-        is_dp_ticket_expired(
+        is_data_plane_ticket_expired(
             Exception(
                 "Flight returned unauthenticated error, with message: "
                 "ticket expiry too far in the future"
@@ -212,7 +212,7 @@ def test_an_expired_work_ticket_is_not_an_expired_flight_ticket():
     """ "ticket" names both a Flight ticket and a work_ticket in this repo, and
     "work ticket expired" contains the expiry text. The unauthenticated marker is
     what separates them, so a non-Flight message must not classify retriable."""
-    assert is_dp_ticket_expired(Exception("work ticket expired while queued")) is False
+    assert is_data_plane_ticket_expired(Exception("work ticket expired while queued")) is False
 
 
 def test_expiry_signatures_match_the_data_planes_wording():
@@ -228,7 +228,7 @@ def test_expiry_signatures_match_the_data_planes_wording():
     assert m, "AuthError::Expired arm not found in auth.rs"
     assert m.group(1) == "ticket expired", (
         f"the data plane now renders an expired ticket as {m.group(1)!r}; "
-        f"update DP_TICKET_EXPIRED_SIGNATURES ({DP_TICKET_EXPIRED_SIGNATURES!r}) "
+        f"update DATA_PLANE_TICKET_EXPIRED_SIGNATURES ({DATA_PLANE_TICKET_EXPIRED_SIGNATURES!r}) "
         "or expired tokens silently classify permanent again"
     )
     # The other half of the match: every ticket verification maps its AuthError to
@@ -242,7 +242,7 @@ def test_expiry_signatures_match_the_data_planes_wording():
     assert verify_calls, "no auth::verify_* -> Status mapping found in flight_service.rs"
     assert set(verify_calls) == {"unauthenticated"}, (
         f"a ticket verification now maps to {sorted(set(verify_calls))}; the classifier's "
-        f"{DP_TICKET_EXPIRED_SIGNATURES!r} match assumes every one is unauthenticated"
+        f"{DATA_PLANE_TICKET_EXPIRED_SIGNATURES!r} match assumes every one is unauthenticated"
     )
 
 
@@ -313,7 +313,9 @@ def test_busy_signature_matches_the_data_planes_wording():
     for src_file in sorted(DATA_PLANE_SRC.glob("*.rs")):
         src = src_file.read_text()
         for call in re.finditer(r"Status::resource_exhausted\(", src):
-            # The literals inside the call, up to the balancing paren.
+            # The literals inside this call only: up to its `");`, which is where
+            # a `format!` refusal ends. Reading past it collects whatever literal
+            # comes next in the function.
             tail = src[call.end() : call.end() + 600]
             refusals.extend(re.findall(r'"([^"]*)"', tail.split(");", 1)[0]))
     assert refusals, "no Status::resource_exhausted refusal found in the data plane"
@@ -322,7 +324,7 @@ def test_busy_signature_matches_the_data_planes_wording():
         "Update the signature or a busy data plane classifies permanent again"
     )
     for refusal in refusals:
-        assert DATA_PLANE_BUSY_SIGNATURE in refusal.lower() or "{" in refusal, (
+        assert DATA_PLANE_BUSY_SIGNATURE in refusal.lower(), (
             f"the data plane has a refusal that does not carry "
             f"{DATA_PLANE_BUSY_SIGNATURE!r}: {refusal!r}"
         )

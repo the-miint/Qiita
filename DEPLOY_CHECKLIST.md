@@ -18,10 +18,10 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
 - `[operator]` (#713) `data-plane.env` gains six optional vars, all documented in
   `.env.data-plane.example`: `DUCKLAKE_POOL_SIZE`, `DUCKDB_THREADS`, `DUCKDB_MEMORY_LIMIT`,
   `DUCKDB_TEMP_DIRECTORY`, `DUCKDB_MAX_TEMP_DIRECTORY_SIZE`, `FLIGHT_MAX_CONCURRENT_DOPUT`.
-  Left unset the data plane derives
-  each of them at boot and starts — `memory_limit` from the memory it finds free, `threads`
-  from the CPU allowance, the spill directory from the unit's `HOME`, and the spill cap from a
-  fixed default. One exception: boot fails if the pool size leaves under 512 MiB per
+  Left unset the data plane starts on its own
+  values: `memory_limit` derived from the memory it finds free, `threads` from the CPU
+  allowance, the spill directory from the unit's `HOME`, and fixed defaults for the spill cap
+  and for the two counts (pool size and concurrent uploads, 8 each). One exception: boot fails if the pool size leaves under 512 MiB per
   connection — measured as the point below which the export DoAction cannot run — naming
   both ways out. Setting `DUCKDB_MEMORY_LIMIT` explicitly is what stops
   boot depending on how much was free at the moment of a restart. Set the pool size
@@ -30,7 +30,9 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
   default — and a catalog-connection budget: each attached connection holds one
   lake-Postgres backend while it lives, against `max_connections = 100` (3 superuser-reserved)
   shared with the control plane and every other data-plane process. The default is 8 per
-  process.
+  process. `FLIGHT_MAX_CONCURRENT_DOPUT` is the one value nothing derives and nothing fails
+  boot over: measured, eight concurrent uploads at the batch size the CLIs send hold ~18 GiB
+  of decode buffers, which this host has and a smaller one does not — lower it there.
 
 ### 2. One-time host setup
 
@@ -46,11 +48,12 @@ _None yet._
 
 ### 5. Verify
 
-- `[operator]` (#713) `make verify-deploy` gains a `dp-pool/<unit>` row per running data
-  plane, which reads that instance's journal for this boot: it prints the pool the instance
-  built (size, per-connection `threads` and `memory_limit`, the ceiling they were divided
-  from and which detector answered), fails if the ceiling came from the fallback rather than
-  this host, and fails if any connection failed its reset and was rebuilt. Read the printed
+- `[operator]` (#713) `make verify-deploy` gains two rows per running data plane, read from
+  that instance's journal: `dp-pool/<unit>` prints the pool the instance built (size,
+  per-connection `threads` and `memory_limit`, how many concurrent uploads it admits, the
+  ceiling they were divided from and which detector answered) and fails if the ceiling came
+  from the fallback rather than this host, and `dp-pool/<unit>/reset` fails if any connection
+  failed its reset and was rebuilt. Read the printed
   line — on this host the ceiling should come from `/proc/meminfo MemAvailable`, since the
   unit sets no cgroup limit. No separate journal read by hand; `SKIP_DP_POOL=1` drops the
   row.

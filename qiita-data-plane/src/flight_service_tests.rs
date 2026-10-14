@@ -5294,7 +5294,8 @@ fn make_service(staging_root: PathBuf) -> QiitaFlightService {
             std::env::temp_dir().join("qiita-dp-test-spill"),
         )),
         // Two upload permits: enough that a DoPut test is never refused, small
-        // enough that `a_doput_past_the_bound_is_refused` can exhaust them.
+        // enough that `do_put_past_its_bound_is_refused_with_a_retriable_status`
+        // can exhaust them.
         2,
         staging_root,
         scratch_root,
@@ -5693,8 +5694,20 @@ async fn do_put_past_its_bound_is_refused_with_a_retriable_status() {
         }));
         senders.push(tx);
     }
-    // Both permits taken before the third attempt.
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    // Both permits taken before the third attempt. Waiting on the count rather
+    // than on a duration: a sleep that ends early admits the third upload and
+    // fails the assertion below for a reason that is not the bound.
+    for _ in 0..1_000 {
+        if service.doput_permits.available_permits() == 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        service.doput_permits.available_permits(),
+        0,
+        "both held uploads must hold their permits before the third arrives"
+    );
 
     let ticket = sign_doput_for_test(999, &TEST_SEED, future_expiry_secs(300));
     let messages = flight_stream_with_ticket(vec![sample_batch()], ticket).await;
@@ -5707,6 +5720,11 @@ async fn do_put_past_its_bound_is_refused_with_a_retriable_status() {
     assert!(
         err.message().contains("data plane busy"),
         "the refusal must carry the prefix both services classify on: {}",
+        err.message()
+    );
+    assert!(
+        err.message().contains('2'),
+        "the refusal names the bound it hit, not what is left: {}",
         err.message()
     );
 

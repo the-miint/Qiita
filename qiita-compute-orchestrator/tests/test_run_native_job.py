@@ -263,10 +263,8 @@ async def test_a_value_error_that_merely_mentions_the_data_plane_stays_permanent
 
 async def test_unreachable_data_plane_maps_to_a_retriable_failure(monkeypatch, tmp_path):
     """gRPC UNAVAILABLE — the data plane restarting mid-deploy, or unable to open a
-    DuckLake connection — arrives as a `FlightUnavailableError`, which is NOT a
-    ValueError, so it needs the typed arm rather than the data-quality one. Before it
-    existed the exception escaped the dispatcher and the step failed with an
-    unstructured non-zero exit."""
+    DuckLake connection — arrives as a `FlightUnavailableError`, which is not a
+    `ValueError`, so only the typed arm reaches it; the data-quality arm does not."""
     import pyarrow.flight
 
     async def execute(inputs, workspace):
@@ -285,11 +283,10 @@ async def test_unreachable_data_plane_maps_to_a_retriable_failure(monkeypatch, t
 async def test_an_unsupported_arrow_cast_is_not_reported_as_an_unimplemented_job(
     monkeypatch, tmp_path
 ):
-    """`ArrowNotImplementedError` IS a `NotImplementedError`, so before the pyarrow arm
-    sat above the skeleton arm, a job hitting an unsupported cast was reported as a job
-    module that ships without an `execute()` — a permanent failure naming the wrong
-    cause. It is not a data-plane condition either, so it propagates with its
-    traceback."""
+    """`ArrowNotImplementedError` is a `NotImplementedError`, which the skeleton arm
+    claims unless the pyarrow arm sits above it — reporting an unsupported cast as a
+    job module that ships without an `execute()`. It is not a data-plane condition
+    either, so it propagates with its traceback."""
     import pyarrow
 
     async def execute(inputs, workspace):
@@ -299,6 +296,30 @@ async def test_an_unsupported_arrow_cast_is_not_reported_as_an_unimplemented_job
         monkeypatch, short_name="arrow_cast", inputs_cls=_Inputs, execute_fn=execute
     )
     with pytest.raises(pyarrow.ArrowNotImplementedError):
+        await run_native_job(name, {"x": 1}, tmp_path, step_name="step")
+
+
+async def test_a_non_data_plane_arrow_invalid_propagates_rather_than_reading_as_bad_input(
+    monkeypatch, tmp_path
+):
+    """`ArrowInvalid` is a `ValueError`, so the data-quality arm used to classify every
+    one of them as permanent BAD_INPUT with the job's own reason text. Now the typed arm
+    takes them first and re-raises the ones that are not a data-plane condition, so a
+    cast failure inside a job surfaces with its traceback instead.
+
+    `ArrowCapacityError`, which the test above uses, derives from `ArrowException` alone
+    — it never reached the data-quality arm, so it cannot pin this."""
+    import pyarrow
+
+    async def execute(inputs, workspace):
+        raise pyarrow.ArrowInvalid(
+            "Could not convert 'abc' with type str: tried to convert to int64"
+        )
+
+    name = _install_stub(
+        monkeypatch, short_name="arrow_invalid", inputs_cls=_Inputs, execute_fn=execute
+    )
+    with pytest.raises(pyarrow.ArrowInvalid):
         await run_native_job(name, {"x": 1}, tmp_path, step_name="step")
 
 
