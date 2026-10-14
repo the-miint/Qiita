@@ -18,6 +18,7 @@ from qiita_common.models import WorkTicketFailureStage
 
 from qiita_control_plane.runner._upload import (
     _DP_TICKET_EXPIRED_SIGNATURES,
+    _is_dp_busy,
     _is_dp_serialization_conflict,
     _is_dp_ticket_expired,
     _is_dp_unavailable,
@@ -58,6 +59,22 @@ _REAL_UNAVAILABLE = (
 # With the prefix, the `unauthenticated` half of the match would be satisfied by the
 # CP's own text and the fixture would stop testing pyarrow's rendering at all.
 _REAL_EXPIRED = "Flight returned unauthenticated error, with message: ticket expired"
+
+
+# How a busy data plane reaches this layer. The data plane refuses a request it has
+# no free DuckLake connection for with gRPC RESOURCE_EXHAUSTED; this string is what
+# a pyarrow client raised for that status in a probe (pyarrow 23.0.1, grpcio 1.80.0,
+# a generic gRPC server answering RESOURCE_EXHAUSTED, with gRPC UNAVAILABLE as the
+# control reproducing `_REAL_UNAVAILABLE`'s shape). Note the exception class: pyarrow
+# surfaces this status as `ArrowInvalid`, a ValueError and NOT a FlightError, which is
+# why the classifier matches text rather than a type.
+_REAL_BUSY = (
+    "gRPC returned resource exhausted error, with message: data plane busy: all 8 "
+    "DuckLake connections are in use; retry. gRPC client debug context: "
+    "UNKNOWN:Error received from peer ipv4:127.0.0.1:50051 {grpc_status:8, "
+    'grpc_message:"data plane busy: all 8 DuckLake connections are in use; retry"}. '
+    "Client context: IOError: Server never sent a data message."
+)
 
 # The same gRPC status and the same pyarrow class, from `AuthError::InvalidSignature`
 # — a key mismatch between the CP and the DP, which no redrive fixes. This is why
@@ -237,6 +254,29 @@ def test_unavailable_classified_retriable():
     assert f.transient is True  # DP was briefly unreachable; a redrive self-heals
     assert f.stage is WorkTicketFailureStage.SUBMISSION
     assert f.step_name is None
+
+
+def test_busy_data_plane_classified_retriable():
+    """A refusal for want of a free connection is overload, not bad input: the same
+    fetch succeeds once a connection frees, so it must not be filed permanent."""
+    f = _submission_dp_fetch_failure(
+        "could not materialize reads for prep_sample 31074 ...",
+        ValueError(_REAL_BUSY),
+    )
+    assert f.kind is FailureKind.DATA_PLANE_TRANSIENT
+    assert f.transient is True  # a redrive self-heals once the pool frees up
+    assert f.stage is WorkTicketFailureStage.SUBMISSION
+    assert f.step_name is None
+
+
+def test_busy_predicate_does_not_fire_on_the_other_dp_errors():
+    """The busy match is on pyarrow's rendering of the status name, so it must not
+    swallow the failures that are permanent."""
+    assert _is_dp_busy(ValueError(_REAL_BUSY)) is True
+    assert _is_dp_busy(Exception(_REAL_40001)) is False
+    assert _is_dp_busy(Exception(_REAL_UNAVAILABLE)) is False
+    assert _is_dp_busy(Exception(_REAL_EXPIRED)) is False
+    assert _is_dp_busy(Exception("Flight returned internal error: no such table")) is False
 
 
 def test_ticket_expired_classified_retriable():

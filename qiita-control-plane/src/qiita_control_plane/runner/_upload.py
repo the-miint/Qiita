@@ -98,6 +98,15 @@ _DP_UNAVAILABLE_SIGNATURES = (
 # reverting every expiry to permanent.
 _DP_TICKET_EXPIRED_SIGNATURES = ("unauthenticated", "ticket expired")
 
+# gRPC RESOURCE_EXHAUSTED signature. The data plane refuses a request it has no free
+# DuckLake connection for, rather than queueing it (`qiita-data-plane/src/pool.rs`) —
+# overload, not bad input: the same call succeeds once a connection frees. Matched by
+# message for the reasons above and one more, measured on pyarrow 23.0.1: this status
+# arrives as `ArrowInvalid` (a ValueError), NOT a FlightError subclass, so there is no
+# Flight exception type to match on. The text is pyarrow's own rendering of the status
+# name, not the data plane's wording, so a reworded refusal still classifies.
+_DP_BUSY_SIGNATURE = "resource exhausted"
+
 
 def _is_dp_serialization_conflict(exc: BaseException) -> bool:
     """True if a data-plane Flight failure is a transient, retriable serialization
@@ -112,6 +121,12 @@ def _is_dp_unavailable(exc: BaseException) -> bool:
     return any(sig in text for sig in _DP_UNAVAILABLE_SIGNATURES)
 
 
+def _is_dp_busy(exc: BaseException) -> bool:
+    """True if a data-plane Flight failure is the data plane refusing the request for
+    want of a free DuckLake connection, rather than a permanent bad-input error."""
+    return _DP_BUSY_SIGNATURE in str(exc).lower()
+
+
 def _is_dp_ticket_expired(exc: BaseException) -> bool:
     """True if a data-plane Flight failure is an expired signing token, rather than
     a permanent auth failure (bad signature, malformed payload) or a bad input."""
@@ -122,11 +137,15 @@ def _is_dp_ticket_expired(exc: BaseException) -> bool:
 def _is_retriable_dp_error(exc: BaseException) -> bool:
     """True if a data-plane Flight fetch failed for a transient, retriable reason —
     a serialization conflict (concurrent DuckLake attach), the DP being briefly
-    unreachable, or a signing token that expired before the call reached the DP —
+    unreachable, the DP refusing the request because every DuckLake connection in its
+    pool is in use, or a signing token that expired before the call reached the DP —
     any of which a redrive self-heals. Everything else is a permanent bad-input an
     operator must resolve."""
     return (
-        _is_dp_serialization_conflict(exc) or _is_dp_unavailable(exc) or _is_dp_ticket_expired(exc)
+        _is_dp_serialization_conflict(exc)
+        or _is_dp_unavailable(exc)
+        or _is_dp_busy(exc)
+        or _is_dp_ticket_expired(exc)
     )
 
 
@@ -141,8 +160,9 @@ def _submission_dp_fetch_failure(reason: str, exc: BaseException) -> BackendFail
     stays a drop-in for the existing `except` translation.
 
     Classifies by cause: a transient serialization conflict (concurrent DuckLake
-    attach), a transient DP-unreachable (gRPC UNAVAILABLE), or an expired signing
-    token is DATA_PLANE_TRANSIENT; anything else keeps the BAD_INPUT/permanent
+    attach), a transient DP-unreachable (gRPC UNAVAILABLE), a busy data plane (gRPC
+    RESOURCE_EXHAUSTED), or an expired signing token is DATA_PLANE_TRANSIENT;
+    anything else keeps the BAD_INPUT/permanent
     shape of `_submission_bad_input` (a genuine bad reference or missing data an
     operator must resolve).
 

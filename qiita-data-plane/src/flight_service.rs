@@ -37,7 +37,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::auth;
-use crate::ducklake;
+use crate::pool::{LakePool, PooledConnection};
 
 /// gRPC metadata key by which a DoGet client asks for a compressed IPC body.
 ///
@@ -102,10 +102,11 @@ pub struct QiitaFlightService {
     /// Ed25519 PUBLIC key for ticket verification. Verify-only — the private
     /// signing seed lives only in the control plane.
     flight_public_key: ed25519_dalek::VerifyingKey,
-    /// DuckLake catalog connection string (libpq format).
-    catalog_connstr: String,
-    /// Directory where DuckLake stores Parquet data files.
-    data_path: String,
+    /// The bounded pool of attached DuckLake instances every request borrows
+    /// from. Its size is the in-flight bound: a request that finds it fully
+    /// lent out is refused with a retriable status rather than opening another
+    /// DuckDB that would size itself against the whole host.
+    pool: Arc<LakePool>,
     /// Root for DoPut staging — uploads land at
     /// `{root}/uploads/{upload_idx}/upload.parquet`. CP and DP must agree
     /// on the layout convention (CP derives the same path on the read
@@ -121,31 +122,17 @@ pub struct QiitaFlightService {
 impl QiitaFlightService {
     pub fn new(
         flight_public_key: ed25519_dalek::VerifyingKey,
-        catalog_connstr: String,
-        data_path: String,
+        pool: Arc<LakePool>,
         upload_staging_root: PathBuf,
         scratch_root: PathBuf,
     ) -> Self {
         Self {
             flight_public_key,
-            catalog_connstr,
-            data_path,
+            pool,
             upload_staging_root,
             scratch_root,
         }
     }
-}
-
-/// Open a fresh in-memory DuckDB connection with DuckLake attached. Each
-/// request gets its own connection — no shared state. A free function (not a
-/// method) so the DoGet streaming task can open the connection on its own
-/// blocking thread from owned connstr/data_path, without borrowing `self`.
-fn open_ducklake(catalog_connstr: &str, data_path: &str) -> Result<Connection, Status> {
-    let conn = Connection::open_in_memory()
-        .map_err(|e| Status::internal(format!("failed to open DuckDB: {e}")))?;
-    ducklake::connect_ducklake(&conn, catalog_connstr, data_path)
-        .map_err(|e| Status::internal(format!("failed to attach DuckLake: {e}")))?;
-    Ok(conn)
 }
 
 /// Bounded depth of the DoGet batch channel. Backpressure: the blocking producer
@@ -168,9 +155,12 @@ const DOGET_BATCH_CHANNEL_DEPTH: usize = 4;
 ///     alone could never have caught that — the blow-up was upstream of it.
 ///   * The `Statement` borrows the `Connection`, and the `DoGetStream` we return
 ///     must be `'static`, so neither can be handed out directly. A blocking task
-///     owns the connection for the query's lifetime and pushes each `RecordBatch`
-///     into a bounded channel (`DOGET_BATCH_CHANNEL_DEPTH`); the returned stream
-///     drains the receiver, applying backpressure to the streaming producer.
+///     owns the borrowed instance for the query's lifetime and pushes each
+///     `RecordBatch` into a bounded channel (`DOGET_BATCH_CHANNEL_DEPTH`); the
+///     returned stream drains the receiver, applying backpressure to the
+///     streaming producer. The instance goes back to the pool when that task
+///     ends — including when it ends early because the client dropped the
+///     stream, which closes the channel the producer sends into.
 ///
 /// A zero-row result still emits one empty `RecordBatch` carrying the schema, so
 /// the client always receives a valid (possibly empty) Arrow table. A DuckDB
@@ -178,8 +168,7 @@ const DOGET_BATCH_CHANNEL_DEPTH: usize = 4;
 /// gone out — surfaces as a trailing `Err` item, so a client never reads a
 /// truncated result as a whole one; so does a panic (see `run_producer`).
 fn stream_ducklake_batches(
-    catalog_connstr: String,
-    data_path: String,
+    conn: PooledConnection,
     sql: String,
     table: String,
 ) -> ReceiverStream<Result<RecordBatch, FlightError>> {
@@ -189,10 +178,7 @@ fn stream_ducklake_batches(
     // independently, draining into `tx`. Don't `.await`/`.join()` it — the
     // result is delivered through the channel, not the handle.
     tokio::task::spawn_blocking(move || {
-        run_producer(&tx, || {
-            let conn = open_ducklake(&catalog_connstr, &data_path)?;
-            send_query_batches(&conn, &sql, &table, &tx)
-        })
+        run_producer(&tx, || send_query_batches(&conn, &sql, &table, &tx))
     });
     ReceiverStream::new(rx)
 }
@@ -633,19 +619,15 @@ impl FlightService for QiitaFlightService {
             &payload.columns,
         )?;
 
-        // Stream the result incrementally. Each request gets its own DuckDB
-        // connection + DuckLake snapshot, opened on a blocking task that feeds
-        // RecordBatches through a bounded channel — so the data plane never
-        // buffers the whole result set (the non-blocking, memory-bounded path).
-        // Ticket/table/query-shape errors above are returned synchronously;
-        // per-request DB errors surface as a stream item (see
-        // stream_ducklake_batches).
-        let batch_stream = stream_ducklake_batches(
-            self.catalog_connstr.clone(),
-            self.data_path.clone(),
-            sql,
-            table,
-        );
+        // Stream the result incrementally, from an instance borrowed for the
+        // life of the stream: a blocking task feeds RecordBatches through a
+        // bounded channel, so the data plane never buffers the whole result set
+        // (the non-blocking, memory-bounded path). Ticket/table/query-shape
+        // errors above are returned synchronously, and so is a pool with
+        // nothing left to lend; per-request DB errors surface as a stream item
+        // (see stream_ducklake_batches).
+        let conn = self.pool.checkout()?;
+        let batch_stream = stream_ducklake_batches(conn, sql, table);
         // With no codec these options are structurally the encoder default that
         // preceded this change (pinned by
         // `no_codec_write_options_match_the_encoder_default`), which is what keeps
@@ -764,11 +746,11 @@ impl FlightService for QiitaFlightService {
                 // tonic async worker (mirrors export_read / count_masked). The
                 // closure opens and drops its own connection, so it is Send and
                 // crosses no await.
-                let catalog = self.catalog_connstr.clone();
-                let data_path = self.data_path.clone();
+                let conn = self.pool.checkout()?;
+                let data_path = self.pool.data_path().to_string();
                 let scratch_root = self.scratch_root.clone();
                 let registration = tokio::task::spawn_blocking(move || {
-                    register_files(&catalog, &data_path, &scratch_root, &payload)
+                    register_files(&conn, &data_path, &scratch_root, &payload)
                 })
                 .await
                 .map_err(|e| Status::internal(format!("register_files task join failed: {e}")))??;
@@ -800,16 +782,14 @@ impl FlightService for QiitaFlightService {
                 // pool so it never starves a tonic async worker (mirrors
                 // export_read / count_masked). The closure opens and drops its
                 // own connection, so it is Send and crosses no await.
-                let catalog = self.catalog_connstr.clone();
-                let data_path = self.data_path.clone();
+                let conn = self.pool.checkout()?;
                 let reference_idx = payload.reference_idx;
-                let deleted = tokio::task::spawn_blocking(move || {
-                    delete_reference(&catalog, &data_path, reference_idx)
-                })
-                .await
-                .map_err(|e| {
-                    Status::internal(format!("delete_reference task join failed: {e}"))
-                })??;
+                let deleted =
+                    tokio::task::spawn_blocking(move || delete_reference(&conn, reference_idx))
+                        .await
+                        .map_err(|e| {
+                            Status::internal(format!("delete_reference task join failed: {e}"))
+                        })??;
 
                 let result_body = serde_json::to_vec(&deleted)
                     .map_err(|e| Status::internal(format!("json serialization failed: {e}")))?;
@@ -835,14 +815,13 @@ impl FlightService for QiitaFlightService {
                 // pool so it never starves a tonic async worker (mirrors
                 // export_read / count_masked). The closure opens and drops its
                 // own connection, so it is Send and crosses no await.
-                let catalog = self.catalog_connstr.clone();
-                let data_path = self.data_path.clone();
+                let conn = self.pool.checkout()?;
                 let mask_idx = payload.mask_idx;
-                let deleted = tokio::task::spawn_blocking(move || {
-                    delete_mask(&catalog, &data_path, mask_idx)
-                })
-                .await
-                .map_err(|e| Status::internal(format!("delete_mask task join failed: {e}")))??;
+                let deleted = tokio::task::spawn_blocking(move || delete_mask(&conn, mask_idx))
+                    .await
+                    .map_err(|e| {
+                        Status::internal(format!("delete_mask task join failed: {e}"))
+                    })??;
 
                 let result_body = serde_json::to_vec(&deleted)
                     .map_err(|e| Status::internal(format!("json serialization failed: {e}")))?;
@@ -868,11 +847,10 @@ impl FlightService for QiitaFlightService {
                 // pool so it never starves a tonic async worker (mirrors
                 // export_read / count_masked). The closure opens and drops its
                 // own connection, so it is Send and crosses no await.
-                let catalog = self.catalog_connstr.clone();
-                let data_path = self.data_path.clone();
+                let conn = self.pool.checkout()?;
                 let prep_sample_idxs = payload.prep_sample_idxs;
                 let deleted = tokio::task::spawn_blocking(move || {
-                    delete_pool_reads(&catalog, &data_path, &prep_sample_idxs)
+                    delete_pool_reads(&conn, &prep_sample_idxs)
                 })
                 .await
                 .map_err(|e| {
@@ -911,12 +889,11 @@ impl FlightService for QiitaFlightService {
                 // pool so it never starves a tonic async worker (mirrors
                 // delete_alignment_block). The closure opens and drops its own
                 // connection, so it is Send and crosses no await.
-                let catalog = self.catalog_connstr.clone();
-                let data_path = self.data_path.clone();
+                let conn = self.pool.checkout()?;
                 let mask_idx = payload.mask_idx;
                 let members = payload.members;
                 let deleted = tokio::task::spawn_blocking(move || {
-                    delete_read_mask_block(&catalog, &data_path, mask_idx, &members)
+                    delete_read_mask_block(&conn, mask_idx, &members)
                 })
                 .await
                 .map_err(|e| {
@@ -947,16 +924,14 @@ impl FlightService for QiitaFlightService {
                 // pool so it never starves a tonic async worker (mirrors
                 // delete_mask). The closure opens and drops its own connection, so
                 // it is Send and crosses no await.
-                let catalog = self.catalog_connstr.clone();
-                let data_path = self.data_path.clone();
+                let conn = self.pool.checkout()?;
                 let alignment_idx = payload.alignment_idx;
-                let deleted = tokio::task::spawn_blocking(move || {
-                    delete_alignment(&catalog, &data_path, alignment_idx)
-                })
-                .await
-                .map_err(|e| {
-                    Status::internal(format!("delete_alignment task join failed: {e}"))
-                })??;
+                let deleted =
+                    tokio::task::spawn_blocking(move || delete_alignment(&conn, alignment_idx))
+                        .await
+                        .map_err(|e| {
+                            Status::internal(format!("delete_alignment task join failed: {e}"))
+                        })??;
 
                 let result_body = serde_json::to_vec(&deleted)
                     .map_err(|e| Status::internal(format!("json serialization failed: {e}")))?;
@@ -991,12 +966,11 @@ impl FlightService for QiitaFlightService {
                 // pool so it never starves a tonic async worker (mirrors
                 // delete_alignment). The closure opens and drops its own
                 // connection, so it is Send and crosses no await.
-                let catalog = self.catalog_connstr.clone();
-                let data_path = self.data_path.clone();
+                let conn = self.pool.checkout()?;
                 let alignment_idx = payload.alignment_idx;
                 let members = payload.members;
                 let deleted = tokio::task::spawn_blocking(move || {
-                    delete_alignment_block(&catalog, &data_path, alignment_idx, &members)
+                    delete_alignment_block(&conn, alignment_idx, &members)
                 })
                 .await
                 .map_err(|e| {
@@ -1029,12 +1003,11 @@ impl FlightService for QiitaFlightService {
                 // pool so it never starves a tonic async worker (mirrors
                 // delete_alignment). The closure opens and drops its own
                 // connection, so it is Send and crosses no await.
-                let catalog = self.catalog_connstr.clone();
-                let data_path = self.data_path.clone();
+                let conn = self.pool.checkout()?;
                 let alignment_idx = payload.alignment_idx;
                 let prep_sample_idx = payload.prep_sample_idx;
                 let deleted = tokio::task::spawn_blocking(move || {
-                    delete_alignment_sample(&catalog, &data_path, alignment_idx, prep_sample_idx)
+                    delete_alignment_sample(&conn, alignment_idx, prep_sample_idx)
                 })
                 .await
                 .map_err(|e| {
@@ -1069,12 +1042,11 @@ impl FlightService for QiitaFlightService {
                 // run it on the blocking pool so it never starves a tonic async
                 // worker. The closure opens and drops its own connection, so it
                 // is Send and crosses no await (mirrors `register_files`).
-                let catalog = self.catalog_connstr.clone();
-                let data_path = self.data_path.clone();
+                let conn = self.pool.checkout()?;
                 let scratch_root = self.scratch_root.clone();
                 let prep = payload.prep_sample_idx;
                 let count = tokio::task::spawn_blocking(move || {
-                    export_read_to_parquet(&catalog, &data_path, prep, &dest, &scratch_root)
+                    export_read_to_parquet(&conn, prep, &dest, &scratch_root)
                 })
                 .await
                 .map_err(|e| Status::internal(format!("export_read task join failed: {e}")))??;
@@ -1124,10 +1096,9 @@ impl FlightService for QiitaFlightService {
                 // count(*) is synchronous DuckDB work; run it on the blocking
                 // pool so it never starves a tonic async worker (mirrors
                 // export_read). The closure opens and drops its own connection.
-                let catalog = self.catalog_connstr.clone();
-                let data_path = self.data_path.clone();
+                let conn = self.pool.checkout()?;
                 let count = tokio::task::spawn_blocking(move || {
-                    count_masked_reads(&catalog, &data_path, prep_sample_idx, mask_idx)
+                    count_masked_reads(&conn, prep_sample_idx, mask_idx)
                 })
                 .await
                 .map_err(|e| Status::internal(format!("count_masked task join failed: {e}")))??;
@@ -1160,10 +1131,9 @@ impl FlightService for QiitaFlightService {
                 // `read_mask` table; run it on the blocking pool so it never
                 // starves a tonic async worker (mirrors count_masked). The
                 // closure opens and drops its own connection.
-                let catalog = self.catalog_connstr.clone();
-                let data_path = self.data_path.clone();
+                let conn = self.pool.checkout()?;
                 let counts = tokio::task::spawn_blocking(move || {
-                    mask_metrics_counts(&catalog, &data_path, mask_idx, prep_sample_idx)
+                    mask_metrics_counts(&conn, mask_idx, prep_sample_idx)
                 })
                 .await
                 .map_err(|e| Status::internal(format!("mask_metrics task join failed: {e}")))??;
@@ -1198,11 +1168,10 @@ impl FlightService for QiitaFlightService {
                 // pool so it never starves a tonic async worker (mirrors
                 // register_files / export_read). The closure opens and drops its
                 // own connection, so it is Send and crosses no await.
-                let catalog = self.catalog_connstr.clone();
-                let data_path = self.data_path.clone();
+                let conn = self.pool.checkout()?;
                 let scratch_root = self.scratch_root.clone();
                 let result = tokio::task::spawn_blocking(move || {
-                    sync_reference_exclusion(&catalog, &data_path, &dest, &scratch_root)
+                    sync_reference_exclusion(&conn, &dest, &scratch_root)
                 })
                 .await
                 .map_err(|e| {
@@ -1233,11 +1202,10 @@ impl FlightService for QiitaFlightService {
                 // One blocking DuckLake transaction, like sync_reference_exclusion:
                 // run it on the blocking pool so it never starves a tonic async
                 // worker. The closure opens and drops its own connection.
-                let catalog = self.catalog_connstr.clone();
-                let data_path = self.data_path.clone();
+                let conn = self.pool.checkout()?;
                 let reference_idx = payload.reference_idx;
                 let result = tokio::task::spawn_blocking(move || {
-                    mint_phylogeny_edge_id(&catalog, &data_path, reference_idx)
+                    mint_phylogeny_edge_id(&conn, reference_idx)
                 })
                 .await
                 .map_err(|e| {
@@ -1707,16 +1675,11 @@ fn validate_export_dest(dest: &str, scratch_root: &Path) -> Result<PathBuf, Stat
 /// written file, so it always matches the bytes on disk (no separate catalog
 /// scan that could race the `COPY`).
 fn export_select_to_parquet(
-    catalog_connstr: &str,
-    data_path: &str,
+    conn: &Connection,
     select_sql: &str,
     dest: &Path,
     scratch_root: &Path,
 ) -> Result<i64, Status> {
-    let conn = duckdb::Connection::open_in_memory()
-        .map_err(|e| Status::internal(format!("failed to open DuckDB: {e}")))?;
-    ducklake::connect_ducklake(&conn, catalog_connstr, data_path)
-        .map_err(|e| Status::internal(format!("failed to attach DuckLake: {e}")))?;
     // ROW_GROUP_SIZE_BYTES (in EXPORT_READ_PARQUET_OPTS) requires insertion
     // order NOT be preserved — and we don't need it: the file is unordered
     // because every consumer (qc is per-row, host_filter collapses with
@@ -1811,15 +1774,13 @@ fn export_select_to_parquet(
 /// writes NO file and returns 0. `prep_sample_idx` is a signature-verified i64, safe
 /// to inline. See `export_select_to_parquet` for the shared write/publish.
 fn export_read_to_parquet(
-    catalog_connstr: &str,
-    data_path: &str,
+    conn: &Connection,
     prep_sample_idx: i64,
     dest: &Path,
     scratch_root: &Path,
 ) -> Result<i64, Status> {
     export_select_to_parquet(
-        catalog_connstr,
-        data_path,
+        conn,
         &format!(
             "SELECT {EXPORT_READ_COLUMNS} FROM qiita_lake.read \
              WHERE prep_sample_idx = {prep_sample_idx}"
@@ -1964,12 +1925,10 @@ fn read_masked_relation(mask_idx: i64, preps: &[i64]) -> String {
 /// idempotency probe cheap. Opens and drops its own connection so the caller can
 /// run it on the blocking pool (mirrors `export_read_to_parquet`).
 fn count_masked_reads(
-    catalog_connstr: &str,
-    data_path: &str,
+    conn: &Connection,
     prep_sample_idx: i64,
     mask_idx: i64,
 ) -> Result<i64, Status> {
-    let conn = open_ducklake(catalog_connstr, data_path)?;
     // `prep_sample_idx`/`mask_idx` are signature-verified i64s, safe to inline (same
     // rationale as build_query: parsed integers reach SQL, no string data); the
     // 'pass' filter mirrors the read_masked macro's privacy filter.
@@ -2026,12 +1985,10 @@ const SPIKEIN_REASONS: &str = "'spikein_syndna'";
 /// Opens and drops its own connection so the caller can run it on the blocking
 /// pool (mirrors `count_masked_reads`).
 fn mask_metrics_counts(
-    catalog_connstr: &str,
-    data_path: &str,
+    conn: &Connection,
     mask_idx: i64,
     prep_sample_idx: i64,
 ) -> Result<serde_json::Value, Status> {
-    let conn = open_ducklake(catalog_connstr, data_path)?;
     // `mask_idx`/`prep_sample_idx` are signature-verified i64s, safe to inline (same
     // rationale as count_masked_reads: parsed integers reach SQL, no string data).
     let sql = format!(
@@ -2401,7 +2358,7 @@ struct Registration {
 /// reference_idx. The control plane is responsible for issuing tokens only for
 /// valid references in the correct state.
 fn register_files(
-    catalog_connstr: &str,
+    conn: &Connection,
     data_path: &str,
     scratch_root: &std::path::Path,
     payload: &auth::ActionPayload,
@@ -2445,10 +2402,6 @@ fn register_files(
     }
 
     // Tables are ensured at startup in main.rs.
-    let conn = duckdb::Connection::open_in_memory()
-        .map_err(|e| Status::internal(format!("failed to open DuckDB: {e}")))?;
-    ducklake::connect_ducklake(&conn, catalog_connstr, data_path)
-        .map_err(|e| Status::internal(format!("failed to attach DuckLake: {e}")))?;
 
     // `read` is not replace-keyed, and DuckLake enforces no uniqueness. A ticket
     // re-runs a step in a new attempt dir under its own workspace, so its second
@@ -2458,9 +2411,9 @@ fn register_files(
     // deleted in the registration transaction below. Only files named for this
     // ticket are deleted from, so rows another ticket registered are left as they
     // are.
-    let staged_read = staged_read_prep_samples(&conn, staging, &payload.files)?;
+    let staged_read = staged_read_prep_samples(conn, staging, &payload.files)?;
     let replace_read_files =
-        ticket_read_files_in_lake(&conn, payload.work_ticket_idx, &staged_read)?;
+        ticket_read_files_in_lake(conn, payload.work_ticket_idx, &staged_read)?;
     let replace_read_prep_samples: Vec<i64> = staged_read.into_iter().collect();
 
     // One scope key for the whole registration; it does not vary per file.
@@ -2589,12 +2542,12 @@ fn register_files(
     });
 
     let registration = transact_with_retry(
-        &conn,
+        conn,
         "the registration transaction",
         payload.work_ticket_idx,
         || {
             if takes_lock {
-                take_registration_lock(&conn)?;
+                take_registration_lock(conn)?;
             }
 
             // Replace-by-key runs as its OWN pass, ahead of every add: one statement
@@ -2760,16 +2713,7 @@ fn lake_file_ticket(path: &str) -> Option<i64> {
 /// Order matters: the sequence deletes run *before* the membership delete so
 /// the orphan subquery can still see this reference's rows. Idempotent — a
 /// reference with no loaded data deletes zero rows and still succeeds.
-fn delete_reference(
-    catalog_connstr: &str,
-    data_path: &str,
-    reference_idx: i64,
-) -> Result<serde_json::Value, Status> {
-    let conn = duckdb::Connection::open_in_memory()
-        .map_err(|e| Status::internal(format!("failed to open DuckDB: {e}")))?;
-    ducklake::connect_ducklake(&conn, catalog_connstr, data_path)
-        .map_err(|e| Status::internal(format!("failed to attach DuckLake: {e}")))?;
-
+fn delete_reference(conn: &Connection, reference_idx: i64) -> Result<serde_json::Value, Status> {
     let exec = |sql: &str, params: &[i64]| -> Result<usize, Status> {
         // duckdb's params! wants &dyn ToSql; i64 implements it. Build the
         // slice explicitly so the same helper serves the 1- and 2-param calls.
@@ -2821,8 +2765,8 @@ fn delete_reference(
     // Sequence/chunk deletes run BEFORE the membership AND annotation deletes: the
     // orphan subquery reads both of this reference's claim tables, so both must
     // still be present.
-    let counts = transact_with_retry(&conn, "the reference delete", reference_idx, || {
-        take_registration_lock(&conn)?;
+    let counts = transact_with_retry(conn, "the reference delete", reference_idx, || {
+        take_registration_lock(conn)?;
         let sequences_deleted = exec(
             &format!("DELETE FROM qiita_lake.reference_sequences WHERE {orphan_filter}"),
             &[reference_idx, reference_idx, reference_idx, reference_idx],
@@ -2880,16 +2824,7 @@ fn delete_reference(
 /// maintenance pass (matches `delete_reference`, which also reclaims nothing
 /// from disk). Idempotent: deleting a `mask_idx` with zero rows is success and
 /// returns `rows_deleted: 0`, so the control plane can safely retry.
-fn delete_mask(
-    catalog_connstr: &str,
-    data_path: &str,
-    mask_idx: i64,
-) -> Result<serde_json::Value, Status> {
-    let conn = duckdb::Connection::open_in_memory()
-        .map_err(|e| Status::internal(format!("failed to open DuckDB: {e}")))?;
-    ducklake::connect_ducklake(&conn, catalog_connstr, data_path)
-        .map_err(|e| Status::internal(format!("failed to attach DuckLake: {e}")))?;
-
+fn delete_mask(conn: &Connection, mask_idx: i64) -> Result<serde_json::Value, Status> {
     // Single-statement delete wrapped in an explicit transaction so the action
     // is all-or-nothing and the control plane can safely retry: a failed call
     // leaves the mask's rows fully intact, so a retry sees the same row set.
@@ -2953,8 +2888,7 @@ fn delete_mask(
 /// before reading, then inline the CANONICALIZED path (re-checked for a single
 /// quote a resolved symlink target could introduce) into `read_parquet`.
 fn sync_reference_exclusion(
-    catalog_connstr: &str,
-    data_path: &str,
+    conn: &Connection,
     dest: &Path,
     scratch_root: &Path,
 ) -> Result<serde_json::Value, Status> {
@@ -2986,11 +2920,6 @@ fn sync_reference_exclusion(
             "resolved sync dest must not contain a single quote: {dest_str:?}"
         )));
     }
-
-    let conn = duckdb::Connection::open_in_memory()
-        .map_err(|e| Status::internal(format!("failed to open DuckDB: {e}")))?;
-    ducklake::connect_ducklake(&conn, catalog_connstr, data_path)
-        .map_err(|e| Status::internal(format!("failed to attach DuckLake: {e}")))?;
 
     // Clear-then-reload in one transaction so the swap is atomic and retryable:
     // a failure leaves the previous mirror intact.
@@ -3058,15 +2987,9 @@ fn sync_reference_exclusion(
 /// means: a partly numbered tree comes back with `minted_rows` 0 rather than a
 /// partial write.
 fn mint_phylogeny_edge_id(
-    catalog_connstr: &str,
-    data_path: &str,
+    conn: &Connection,
     reference_idx: i64,
 ) -> Result<serde_json::Value, Status> {
-    let conn = duckdb::Connection::open_in_memory()
-        .map_err(|e| Status::internal(format!("failed to open DuckDB: {e}")))?;
-    ducklake::connect_ducklake(&conn, catalog_connstr, data_path)
-        .map_err(|e| Status::internal(format!("failed to attach DuckLake: {e}")))?;
-
     conn.execute_batch("BEGIN TRANSACTION")
         .map_err(|e| Status::internal(format!("failed to begin transaction: {e}")))?;
 
@@ -3135,8 +3058,7 @@ fn mint_phylogeny_edge_id(
 /// returns zero counts. The `prep_sample_idxs` are `i64` parsed from the
 /// Ed25519-signed payload and inlined through `sql_i64_list`.
 fn delete_pool_reads(
-    catalog_connstr: &str,
-    data_path: &str,
+    conn: &Connection,
     prep_sample_idxs: &[i64],
 ) -> Result<serde_json::Value, Status> {
     // Empty set: nothing to do, and `IN ()` is not valid SQL. Return the
@@ -3148,11 +3070,6 @@ fn delete_pool_reads(
             "read_mask_rows_deleted": 0,
         }));
     }
-
-    let conn = duckdb::Connection::open_in_memory()
-        .map_err(|e| Status::internal(format!("failed to open DuckDB: {e}")))?;
-    ducklake::connect_ducklake(&conn, catalog_connstr, data_path)
-        .map_err(|e| Status::internal(format!("failed to attach DuckLake: {e}")))?;
 
     let in_list = sql_i64_list(prep_sample_idxs);
 
@@ -3220,8 +3137,7 @@ fn delete_pool_reads(
 /// this); guarded here too, returning a zero-count noop. All integers are
 /// signature-verified i64s, safe to inline.
 fn delete_read_mask_block(
-    catalog_connstr: &str,
-    data_path: &str,
+    conn: &Connection,
     mask_idx: i64,
     members: &[auth::BlockReadMember],
 ) -> Result<serde_json::Value, Status> {
@@ -3231,11 +3147,6 @@ fn delete_read_mask_block(
             "rows_deleted": 0,
         }));
     }
-
-    let conn = duckdb::Connection::open_in_memory()
-        .map_err(|e| Status::internal(format!("failed to open DuckDB: {e}")))?;
-    ducklake::connect_ducklake(&conn, catalog_connstr, data_path)
-        .map_err(|e| Status::internal(format!("failed to attach DuckLake: {e}")))?;
 
     // Scope the shared footprint selector to this filtering identity. The
     // `read` export needs no mask column; `read_mask` is keyed by mask_idx too.
@@ -3354,18 +3265,9 @@ fn delete_lake_rows(
 /// control plane consumes both (`PoolReadPurgeResponse`); here there is no
 /// consumer, and no producer writing the side table, so a second key would carry
 /// a structural zero. A producer PR that adds a consumer adds the key with it.
-fn delete_alignment(
-    catalog_connstr: &str,
-    data_path: &str,
-    alignment_idx: i64,
-) -> Result<serde_json::Value, Status> {
-    let conn = duckdb::Connection::open_in_memory()
-        .map_err(|e| Status::internal(format!("failed to open DuckDB: {e}")))?;
-    ducklake::connect_ducklake(&conn, catalog_connstr, data_path)
-        .map_err(|e| Status::internal(format!("failed to attach DuckLake: {e}")))?;
-
+fn delete_alignment(conn: &Connection, alignment_idx: i64) -> Result<serde_json::Value, Status> {
     let counts = delete_lake_rows(
-        &conn,
+        conn,
         ALIGNMENT_DELETE_TABLES,
         "alignment_idx = ?",
         &[&alignment_idx as &dyn duckdb::ToSql],
@@ -3399,8 +3301,7 @@ fn delete_alignment(
 /// (the DoAction arm rejects it before this); guarded here too, returning a
 /// zero-count noop. All integers are Ed25519-verified i64s, safe to inline.
 fn delete_alignment_block(
-    catalog_connstr: &str,
-    data_path: &str,
+    conn: &Connection,
     alignment_idx: i64,
     members: &[auth::BlockReadMember],
 ) -> Result<serde_json::Value, Status> {
@@ -3410,11 +3311,6 @@ fn delete_alignment_block(
             "rows_deleted": 0,
         }));
     }
-
-    let conn = duckdb::Connection::open_in_memory()
-        .map_err(|e| Status::internal(format!("failed to open DuckDB: {e}")))?;
-    ducklake::connect_ducklake(&conn, catalog_connstr, data_path)
-        .map_err(|e| Status::internal(format!("failed to attach DuckLake: {e}")))?;
 
     // Scope the shared footprint selector to this align-config identity. The
     // `read`/`read_mask` blocks key on sequence_idx; every
@@ -3427,7 +3323,7 @@ fn delete_alignment_block(
         block_read_where_clause(members)
     );
 
-    let counts = delete_lake_rows(&conn, ALIGNMENT_DELETE_TABLES, &where_clause, &[])?;
+    let counts = delete_lake_rows(conn, ALIGNMENT_DELETE_TABLES, &where_clause, &[])?;
 
     Ok(serde_json::json!({
         "alignment_idx": alignment_idx,
@@ -3466,18 +3362,12 @@ fn delete_alignment_block(
 /// reporting is `delete_alignment`'s. Idempotent: a prep_sample with no rows yet
 /// deletes 0 and still succeeds.
 fn delete_alignment_sample(
-    catalog_connstr: &str,
-    data_path: &str,
+    conn: &Connection,
     alignment_idx: i64,
     prep_sample_idx: i64,
 ) -> Result<serde_json::Value, Status> {
-    let conn = duckdb::Connection::open_in_memory()
-        .map_err(|e| Status::internal(format!("failed to open DuckDB: {e}")))?;
-    ducklake::connect_ducklake(&conn, catalog_connstr, data_path)
-        .map_err(|e| Status::internal(format!("failed to attach DuckLake: {e}")))?;
-
     let counts = delete_lake_rows(
-        &conn,
+        conn,
         ALIGNMENT_DELETE_TABLES,
         "alignment_idx = ? AND prep_sample_idx = ?",
         &[

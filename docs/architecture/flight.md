@@ -16,6 +16,24 @@ Client interfaces are the user-facing layer through which researchers and system
 - **DoPut**: upload data (stream RecordBatches to shared filesystem via FlightDescriptor, authorized by signed action token)
 - **DoAction**: register file (`ducklake_add_data_files`), delete by key, insert-from-processing-method (authorized by signed action token)
 
+### Concurrency bound
+
+Every operation that touches the lake borrows one instance from a bounded pool
+([`qiita-data-plane/src/pool.rs`](../../qiita-data-plane/src/pool.rs)), so the
+pool's size is the number of requests one data plane serves at once. A request
+that arrives with every instance lent out is refused immediately with gRPC
+`RESOURCE_EXHAUSTED` and a message naming the bound — it is not queued, because
+the edge keeps admitting requests (64 concurrent per client address) and
+`grpc_read_timeout` is an hour, so a client that waits in here waits there. A
+caller retries at stream open.
+
+Each pooled instance carries its own `threads`, `memory_limit`, `temp_directory`
+and `max_temp_directory_size`, divided at boot from the memory ceiling the
+process detects for itself and overridable per deploy (`DUCKLAKE_POOL_SIZE` and
+the `DUCKDB_*` vars in `.env.data-plane.example`). The size is a catalog budget
+too: each attached instance holds one lake-Postgres backend for as long as it
+lives, and every instance on every host draws on the same `max_connections`.
+
 ### DoGet stream compression
 
 A DoGet client may ask for a zstd-compressed Arrow IPC body by sending the

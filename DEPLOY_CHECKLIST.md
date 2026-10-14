@@ -15,7 +15,14 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
 
 ### 1. Env vars — set BEFORE the deploy (most are `from_env()` fail-fast; a missing one keeps the unit down)
 
-_None yet._
+- `[operator]` (#NNN) `data-plane.env` gains five optional vars, all documented in
+  `.env.data-plane.example`: `DUCKLAKE_POOL_SIZE`, `DUCKDB_THREADS`, `DUCKDB_MEMORY_LIMIT`,
+  `DUCKDB_TEMP_DIRECTORY`, `DUCKDB_MAX_TEMP_DIRECTORY_SIZE`. Left unset the data plane derives
+  all of them at boot and starts, so no edit is required — but **decide the pool size
+  deliberately before the restart**, because it is both the number of requests one instance
+  serves at once and a catalog-connection budget: each attached connection holds one
+  lake-Postgres backend while it lives, against `max_connections = 100` (3 superuser-reserved)
+  shared with the control plane and every other instance. The default is 8 per instance.
 
 ### 2. One-time host setup
 
@@ -31,13 +38,25 @@ _None yet._
 
 ### 5. Verify
 
-_None yet._
+- `[operator]` (#NNN) `journalctl -u qiita-data-plane@50051 -n 50` carries one
+  `qiita-data-plane pool:` line per instance at boot, naming the pool size, per-connection
+  `threads` and `memory_limit`, the ceiling they were divided from and **which detector
+  answered**. On this host it should read the ceiling from `/proc/meminfo MemAvailable` (no
+  cgroup limit is set on the unit); `fallback default` means detection found nothing and the
+  pool sized itself against 8 GiB.
 
 ### 6. After the deploy verifies green
 
 _None yet._
 
 ### Notes (no host action)
+
+- (#NNN) Past the pool size, the data plane answers gRPC `RESOURCE_EXHAUSTED` rather than
+  serving the request. The control plane classifies that as retriable, so a pre-loop resolver's
+  ticket is held for redrive rather than failed permanently. **Compute-side readers do not
+  retry a refusal yet** — the client half is tracked separately — so a fan-out wider than the
+  pool turns into held tickets rather than slow ones. The Flight edge admits 64 concurrent
+  requests per client address, which is the number to weigh the pool size against.
 
 - (#685) Work-ticket responses (`GET /work-ticket/{idx}` and the ticket lists) gain `on_success`, `follow_on_work_ticket_idx` and `follow_on_error` (all null for a ticket with no follow-on); clients validating that shape strictly must accept them.
 

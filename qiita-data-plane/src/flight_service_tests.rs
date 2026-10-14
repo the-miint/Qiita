@@ -4,6 +4,12 @@
 
 use super::*;
 
+// `flight_service` itself no longer attaches DuckLake — the pool does — so the
+// table-creation helpers these tests call are imported here rather than
+// inherited; only the catalog-backed tests use them.
+#[cfg(feature = "integration")]
+use crate::ducklake;
+
 // --- validate_export_dest (pure; no DuckDB) ---
 
 #[test]
@@ -248,7 +254,8 @@ fn delete_reference_drops_orphans_keeps_shared() {
     ))
     .unwrap();
 
-    let counts = delete_reference(&connstr, &data_path, ref_a).expect("delete_reference failed");
+    let counts = delete_reference(&attached_conn(&connstr, &data_path), ref_a)
+        .expect("delete_reference failed");
     assert_eq!(counts["sequences_deleted"], 1, "only the orphan sequence");
     assert_eq!(counts["membership_deleted"], 2, "both ref_a memberships");
     assert_eq!(counts["taxonomy_deleted"], 2);
@@ -328,7 +335,8 @@ fn delete_mask_drops_target_idempotently() {
     ))
     .unwrap();
 
-    let first = delete_mask(&connstr, &data_path, mask_a).expect("delete_mask failed");
+    let first =
+        delete_mask(&attached_conn(&connstr, &data_path), mask_a).expect("delete_mask failed");
     assert_eq!(first["rows_deleted"], 2, "both mask_a rows deleted");
     assert_eq!(first["mask_idx"], mask_a);
 
@@ -344,7 +352,8 @@ fn delete_mask_drops_target_idempotently() {
     assert_eq!(count(mask_b), 1, "mask_b untouched");
 
     // Idempotency: re-deleting the now-empty mask is success with 0 rows.
-    let second = delete_mask(&connstr, &data_path, mask_a).expect("idempotent re-delete failed");
+    let second = delete_mask(&attached_conn(&connstr, &data_path), mask_a)
+        .expect("idempotent re-delete failed");
     assert_eq!(second["rows_deleted"], 0, "second delete removes nothing");
 
     // Best-effort cleanup of the surviving mask_b row.
@@ -406,7 +415,7 @@ fn delete_read_mask_block_deletes_footprint_only() {
         },
     ];
 
-    let first = delete_read_mask_block(&connstr, &data_path, mask_a, &members)
+    let first = delete_read_mask_block(&attached_conn(&connstr, &data_path), mask_a, &members)
         .expect("delete_read_mask_block failed");
     assert_eq!(
         first["rows_deleted"], 4,
@@ -437,7 +446,7 @@ fn delete_read_mask_block_deletes_footprint_only() {
     assert_eq!(count(mask_b, prep_a), 1, "mask_b untouched");
 
     // Idempotency: re-deleting the same footprint removes nothing.
-    let second = delete_read_mask_block(&connstr, &data_path, mask_a, &members)
+    let second = delete_read_mask_block(&attached_conn(&connstr, &data_path), mask_a, &members)
         .expect("idempotent re-delete failed");
     assert_eq!(second["rows_deleted"], 0, "second delete removes nothing");
 
@@ -489,7 +498,8 @@ fn delete_alignment_drops_target_idempotently() {
     ))
     .unwrap();
 
-    let first = delete_alignment(&connstr, &data_path, align_a).expect("delete_alignment failed");
+    let first = delete_alignment(&attached_conn(&connstr, &data_path), align_a)
+        .expect("delete_alignment failed");
     assert_eq!(first["rows_deleted"], 2, "both align_a rows deleted");
     assert_eq!(first["alignment_idx"], align_a);
 
@@ -515,8 +525,8 @@ fn delete_alignment_drops_target_idempotently() {
     );
 
     // Idempotency: re-deleting the now-empty alignment is success with 0 rows.
-    let second =
-        delete_alignment(&connstr, &data_path, align_a).expect("idempotent re-delete failed");
+    let second = delete_alignment(&attached_conn(&connstr, &data_path), align_a)
+        .expect("idempotent re-delete failed");
     assert_eq!(second["rows_deleted"], 0, "second delete removes nothing");
 
     let _ = conn.execute_batch(&format!(
@@ -602,7 +612,7 @@ fn delete_alignment_block_deletes_footprint_only() {
         },
     ];
 
-    let first = delete_alignment_block(&connstr, &data_path, align_a, &members)
+    let first = delete_alignment_block(&attached_conn(&connstr, &data_path), align_a, &members)
         .expect("delete_alignment_block failed");
     // 3 rows for prep_a[100,101] (two at seq 100 + one at 101) + 2 for prep_b.
     assert_eq!(
@@ -657,7 +667,7 @@ fn delete_alignment_block_deletes_footprint_only() {
     );
 
     // Idempotency: re-deleting the same footprint removes nothing.
-    let second = delete_alignment_block(&connstr, &data_path, align_a, &members)
+    let second = delete_alignment_block(&attached_conn(&connstr, &data_path), align_a, &members)
         .expect("idempotent re-delete failed");
     assert_eq!(second["rows_deleted"], 0, "second delete removes nothing");
 
@@ -721,7 +731,7 @@ fn delete_alignment_sample_deletes_the_pair_only() {
     ))
     .unwrap();
 
-    let first = delete_alignment_sample(&connstr, &data_path, align_a, prep_a)
+    let first = delete_alignment_sample(&attached_conn(&connstr, &data_path), align_a, prep_a)
         .expect("delete_alignment_sample failed");
     // Three rows: two at seq 100 (multiplicity) + one at 101.
     assert_eq!(first["rows_deleted"], 3, "the pair's 3 rows deleted");
@@ -768,12 +778,12 @@ fn delete_alignment_sample_deletes_the_pair_only() {
     );
 
     // Idempotency: re-deleting the now-empty pair is success with 0 rows.
-    let second = delete_alignment_sample(&connstr, &data_path, align_a, prep_a)
+    let second = delete_alignment_sample(&attached_conn(&connstr, &data_path), align_a, prep_a)
         .expect("idempotent re-delete failed");
     assert_eq!(second["rows_deleted"], 0, "second delete removes nothing");
 
     // A prep_sample that never registered rows is the same 0-row success.
-    let never = delete_alignment_sample(&connstr, &data_path, align_a, prep_empty)
+    let never = delete_alignment_sample(&attached_conn(&connstr, &data_path), align_a, prep_empty)
         .expect("delete of a prep_sample with no rows failed");
     assert_eq!(
         never["rows_deleted"], 0,
@@ -821,11 +831,13 @@ fn count_masked_reads_counts_pass_rows_for_target_only() {
 
     // Two 'pass' rows for (prep_a, mask_a); the host-filtered row, prep_b's
     // row, and mask_b's row are all excluded.
-    let n = count_masked_reads(&connstr, &data_path, prep_a, mask_a).expect("count failed");
+    let n = count_masked_reads(&attached_conn(&connstr, &data_path), prep_a, mask_a)
+        .expect("count failed");
     assert_eq!(n, 2);
 
     // A (prep, mask) pair with no rows counts zero, not an error.
-    let none = count_masked_reads(&connstr, &data_path, prep_b, mask_b).expect("count failed");
+    let none = count_masked_reads(&attached_conn(&connstr, &data_path), prep_b, mask_b)
+        .expect("count failed");
     assert_eq!(none, 0);
 
     let _ = conn.execute_batch(&format!(
@@ -882,7 +894,8 @@ fn mask_metrics_counts_buckets_both_mates_for_target_only() {
     ))
     .unwrap();
 
-    let counts = mask_metrics_counts(&connstr, &data_path, mask_a, prep_a).expect("counts failed");
+    let counts = mask_metrics_counts(&attached_conn(&connstr, &data_path), mask_a, prep_a)
+        .expect("counts failed");
     assert_eq!(
         counts["row_count"], 5,
         "one row per read/pair for the target"
@@ -892,7 +905,8 @@ fn mask_metrics_counts_buckets_both_mates_for_target_only() {
     assert_eq!(counts["quality_filtered"], 3, "pass only, both-mates");
 
     // A (mask, prep) pair with no rows is all-zero, not an error.
-    let empty = mask_metrics_counts(&connstr, &data_path, mask_b, prep_b).expect("counts failed");
+    let empty = mask_metrics_counts(&attached_conn(&connstr, &data_path), mask_b, prep_b)
+        .expect("counts failed");
     assert_eq!(empty["row_count"], 0);
     assert_eq!(empty["raw"], 0);
     assert_eq!(empty["biological"], 0);
@@ -908,7 +922,7 @@ fn mask_metrics_counts_buckets_both_mates_for_target_only() {
 /// emitting an invalid `IN ()` clause.
 #[test]
 fn delete_pool_reads_empty_set_is_zero_count_noop() {
-    let counts = delete_pool_reads("unused-connstr", "unused-data-path", &[])
+    let counts = delete_pool_reads(&unattached_conn(), &[])
         .expect("empty-set delete should succeed without touching the catalog");
     assert_eq!(counts["prep_sample_count"], 0);
     assert_eq!(counts["read_rows_deleted"], 0);
@@ -951,7 +965,7 @@ fn delete_pool_reads_drops_target_idempotently() {
     ))
     .unwrap();
 
-    let first = delete_pool_reads(&connstr, &data_path, &[prep_a, prep_b])
+    let first = delete_pool_reads(&attached_conn(&connstr, &data_path), &[prep_a, prep_b])
         .expect("delete_pool_reads failed");
     assert_eq!(first["prep_sample_count"], 2);
     assert_eq!(first["read_rows_deleted"], 3, "prep_a (2) + prep_b (1)");
@@ -979,7 +993,7 @@ fn delete_pool_reads_drops_target_idempotently() {
     assert_eq!(mask_count(prep_other), 1, "other pool's mask untouched");
 
     // Idempotency: re-deleting the now-empty set is success with 0 rows.
-    let second = delete_pool_reads(&connstr, &data_path, &[prep_a, prep_b])
+    let second = delete_pool_reads(&attached_conn(&connstr, &data_path), &[prep_a, prep_b])
         .expect("idempotent re-delete failed");
     assert_eq!(second["read_rows_deleted"], 0);
     assert_eq!(second["read_mask_rows_deleted"], 0);
@@ -1036,7 +1050,7 @@ async fn stream_ducklake_batches_streams_rows_and_empty_schema_branch() {
     );
     let (sql, table) = build_query("read_masked", &filter, &[], &[]).unwrap();
     let batches: Vec<arrow_array::RecordBatch> =
-        stream_ducklake_batches(connstr.clone(), data_path.clone(), sql, table)
+        stream_ducklake_batches(pooled_conn(&connstr, &data_path), sql, table)
             .collect::<Vec<_>>()
             .await
             .into_iter()
@@ -1074,7 +1088,7 @@ async fn stream_ducklake_batches_streams_rows_and_empty_schema_branch() {
     );
     let (esql, etable) = build_query("read_masked", &empty_filter, &[], &[]).unwrap();
     let empty: Vec<arrow_array::RecordBatch> =
-        stream_ducklake_batches(connstr.clone(), data_path.clone(), esql, etable)
+        stream_ducklake_batches(pooled_conn(&connstr, &data_path), esql, etable)
             .collect::<Vec<_>>()
             .await
             .into_iter()
@@ -1104,8 +1118,7 @@ async fn stream_ducklake_batches_propagates_query_error() {
     let connstr = delete_test_catalog_connstr();
     let data_path = delete_test_data_path();
     let items: Vec<_> = stream_ducklake_batches(
-        connstr,
-        data_path,
+        pooled_conn(&connstr, &data_path),
         "SELECT * FROM qiita_lake.does_not_exist_table".to_string(),
         "qiita_lake.does_not_exist_table".to_string(),
     )
@@ -1433,7 +1446,7 @@ fn register_files_rejects_filename_traversal() {
             work_ticket_idx: 1,
         };
         let err = register_files(
-            "unused-connstr",
+            &unattached_conn(),
             "unused-data-path",
             std::path::Path::new("/"),
             &payload,
@@ -1808,8 +1821,13 @@ fn register_files_moves_and_registers_end_to_end() {
         work_ticket_idx: ticket,
     };
 
-    let outcome = register_files(&connstr, &data_path, std::path::Path::new("/"), &payload)
-        .expect("register_files failed");
+    let outcome = register_files(
+        &attached_conn(&connstr, &data_path),
+        &data_path,
+        std::path::Path::new("/"),
+        &payload,
+    )
+    .expect("register_files failed");
     assert_eq!(outcome.registered.len(), 1, "one file registered");
     assert!(
         outcome.replaced.is_empty(),
@@ -1984,7 +2002,7 @@ fn register_files_replaces_shared_contigs_across_assembly_runs() {
         ),
     ]);
     let outcome_a = register_files(
-        &connstr,
+        &attached_conn(&connstr, &data_path),
         &data_path,
         std::path::Path::new("/"),
         &assembly_register_payload(&staging_a, 2, ticket_a),
@@ -2006,7 +2024,7 @@ fn register_files_replaces_shared_contigs_across_assembly_runs() {
         (b_only, "00000000-0000-0000-0000-000000971012", &["ACGT"]),
     ]);
     let outcome_b = register_files(
-        &connstr,
+        &attached_conn(&connstr, &data_path),
         &data_path,
         std::path::Path::new("/"),
         &assembly_register_payload(&staging_b, 2, ticket_b),
@@ -2112,7 +2130,7 @@ fn register_files_re_registering_the_same_contigs_does_not_accumulate() {
     for attempt in 0..3 {
         let staging = seed_assembly_staging(contigs);
         register_files(
-            &connstr,
+            &attached_conn(&connstr, &data_path),
             &data_path,
             std::path::Path::new("/"),
             &assembly_register_payload(&staging, 1, base_ticket + attempt),
@@ -2192,7 +2210,13 @@ fn register_parquets(
         files,
         work_ticket_idx: ticket,
     };
-    register_files(connstr, data_path, std::path::Path::new("/"), &payload).unwrap_or_else(|e| {
+    register_files(
+        &attached_conn(connstr, data_path),
+        data_path,
+        std::path::Path::new("/"),
+        &payload,
+    )
+    .unwrap_or_else(|e| {
         let names: Vec<&str> = tables.iter().map(|(table, _)| *table).collect();
         panic!("register_files({names:?}) failed: {e}")
     })
@@ -2361,7 +2385,12 @@ fn register_read_files(
         files,
         work_ticket_idx: ticket,
     };
-    register_files(connstr, data_path, std::path::Path::new("/"), &payload)
+    register_files(
+        &attached_conn(connstr, data_path),
+        data_path,
+        std::path::Path::new("/"),
+        &payload,
+    )
 }
 
 /// A registration carrying one prep_sample this ticket registered before and one
@@ -3146,7 +3175,14 @@ fn concurrent_registrations_of_one_feature_leave_one_row() {
                 let start = &start;
                 scope.spawn(move || {
                     start.wait();
-                    register_files(connstr, data_path, std::path::Path::new("/"), payload)
+                    // Each writer attaches for itself, as each concurrent
+                    // request borrows its own instance in production.
+                    register_files(
+                        &attached_conn(connstr, data_path),
+                        data_path,
+                        std::path::Path::new("/"),
+                        payload,
+                    )
                 })
             })
             .collect();
@@ -3242,8 +3278,13 @@ fn register_files_replaces_sequences_shared_across_references() {
             files,
             work_ticket_idx: ticket,
         };
-        let outcome = register_files(&connstr, &data_path, std::path::Path::new("/"), &payload)
-            .unwrap_or_else(|e| panic!("register_files failed: {e}"));
+        let outcome = register_files(
+            &attached_conn(&connstr, &data_path),
+            &data_path,
+            std::path::Path::new("/"),
+            &payload,
+        )
+        .unwrap_or_else(|e| panic!("register_files failed: {e}"));
         // Keep `staging` alive until after the call.
         drop(staging);
         outcome
@@ -3426,7 +3467,8 @@ fn sync_reference_exclusion_full_replace_is_idempotent() {
     // The tempdir is the scratch root the handler contains reads to.
     let root = dir.path();
 
-    let first = sync_reference_exclusion(&connstr, &data_path, &src, root).expect("sync failed");
+    let first = sync_reference_exclusion(&attached_conn(&connstr, &data_path), &src, root)
+        .expect("sync failed");
     assert_eq!(
         first["feature_count"], 2,
         "two rows loaded from the parquet"
@@ -3438,8 +3480,8 @@ fn sync_reference_exclusion_full_replace_is_idempotent() {
     );
 
     // Idempotency: re-running with the same file converges to the same table.
-    let second =
-        sync_reference_exclusion(&connstr, &data_path, &src, root).expect("re-sync failed");
+    let second = sync_reference_exclusion(&attached_conn(&connstr, &data_path), &src, root)
+        .expect("re-sync failed");
     assert_eq!(second["feature_count"], 2, "same load on replay");
     assert_eq!(
         contents(),
@@ -3459,8 +3501,8 @@ fn sync_reference_exclusion_full_replace_is_idempotent() {
             ))
             .unwrap();
     }
-    let cleared =
-        sync_reference_exclusion(&connstr, &data_path, &empty, root).expect("clear sync failed");
+    let cleared = sync_reference_exclusion(&attached_conn(&connstr, &data_path), &empty, root)
+        .expect("clear sync failed");
     assert_eq!(cleared["feature_count"], 0, "empty parquet loads zero rows");
     assert!(contents().is_empty(), "mirror cleared by the empty replace");
 
@@ -3481,7 +3523,7 @@ fn sync_reference_exclusion_full_replace_is_idempotent() {
     }
     let planted = dir.path().join("planted.parquet");
     std::os::unix::fs::symlink(&outside_pq, &planted).unwrap();
-    let escaped = sync_reference_exclusion(&connstr, &data_path, &planted, root);
+    let escaped = sync_reference_exclusion(&attached_conn(&connstr, &data_path), &planted, root);
     assert_eq!(
         escaped.unwrap_err().code(),
         tonic::Code::PermissionDenied,
@@ -3526,8 +3568,13 @@ fn export_read_writes_prep_sample_parquet() {
     let dir = tempfile::tempdir().unwrap();
     let dest = dir.path().join("reads.parquet");
 
-    let count = export_read_to_parquet(&connstr, &data_path, prep, &dest, dir.path())
-        .expect("export_read_to_parquet failed");
+    let count = export_read_to_parquet(
+        &attached_conn(&connstr, &data_path),
+        prep,
+        &dest,
+        dir.path(),
+    )
+    .expect("export_read_to_parquet failed");
     assert_eq!(count, 2, "both seeded rows exported");
     assert!(dest.exists(), "destination parquet written");
 
@@ -3572,8 +3619,13 @@ fn export_read_writes_prep_sample_parquet() {
 
     // An unknown prep_sample writes no file and reports 0.
     let dest_absent = dir.path().join("absent.parquet");
-    let zero = export_read_to_parquet(&connstr, &data_path, absent, &dest_absent, dir.path())
-        .expect("export of an unknown prep_sample should succeed with 0");
+    let zero = export_read_to_parquet(
+        &attached_conn(&connstr, &data_path),
+        absent,
+        &dest_absent,
+        dir.path(),
+    )
+    .expect("export of an unknown prep_sample should succeed with 0");
     assert_eq!(zero, 0);
     assert!(!dest_absent.exists(), "no file written for an empty result");
     assert!(
@@ -5022,7 +5074,7 @@ async fn build_query_alignment_visible_streams_projected_columns() {
     )
     .unwrap();
     let batches: Vec<arrow_array::RecordBatch> =
-        stream_ducklake_batches(connstr.clone(), data_path.clone(), sql, table)
+        stream_ducklake_batches(pooled_conn(&connstr, &data_path), sql, table)
             .collect::<Vec<_>>()
             .await
             .into_iter()
@@ -5114,7 +5166,7 @@ async fn alignment_visible_doget_omits_blocked_feature() {
     )
     .unwrap();
     let batches: Vec<arrow_array::RecordBatch> =
-        stream_ducklake_batches(connstr.clone(), data_path.clone(), sql, table)
+        stream_ducklake_batches(pooled_conn(&connstr, &data_path), sql, table)
             .collect::<Vec<_>>()
             .await
             .into_iter()
@@ -5251,12 +5303,51 @@ fn make_service(staging_root: PathBuf) -> QiitaFlightService {
         .unwrap_or_else(|| staging_root.clone());
     QiitaFlightService::new(
         test_vk(),
-        // catalog + data_path unused by DoPut path
-        "dbname=unused host=localhost".to_string(),
-        "/tmp/unused".to_string(),
+        // The DoPut path borrows no instance, so a pool with nothing attached
+        // is enough here; a test that reaches the catalog builds a real one.
+        crate::pool::LakePool::unattached_for_tests(crate::pool::PoolSettings::for_tests(
+            1,
+            std::env::temp_dir().join("qiita-dp-test-spill"),
+        )),
         staging_root,
         scratch_root,
     )
+}
+
+/// A DuckDB connection with no DuckLake attached, for the validation paths that
+/// must reject their input before any catalog is touched.
+fn unattached_conn() -> duckdb::Connection {
+    duckdb::Connection::open_in_memory().expect("open in-memory DuckDB")
+}
+
+/// A real pool over the test catalog. Four instances, so a test that opens a
+/// second stream before draining the first is not refused by the bound.
+#[cfg(feature = "integration")]
+fn test_pool(connstr: &str, data_path: &str) -> std::sync::Arc<crate::pool::LakePool> {
+    crate::pool::LakePool::open(
+        connstr.to_string(),
+        data_path.to_string(),
+        crate::pool::PoolSettings::for_tests(4, std::env::temp_dir().join("qiita-dp-test-spill")),
+    )
+    .expect("open a test pool")
+}
+
+/// An instance borrowed from such a pool, for the paths that take what
+/// `do_get` takes.
+#[cfg(feature = "integration")]
+fn pooled_conn(connstr: &str, data_path: &str) -> crate::pool::PooledConnection {
+    test_pool(connstr, data_path)
+        .checkout()
+        .expect("a fresh pool lends its first instance")
+}
+
+/// A connection with the test catalog attached — what the pool lends a request
+/// in production, built directly here so a test needs no pool.
+#[cfg(feature = "integration")]
+fn attached_conn(connstr: &str, data_path: &str) -> duckdb::Connection {
+    let conn = unattached_conn();
+    ducklake::connect_ducklake(&conn, connstr, data_path).expect("attach DuckLake");
+    conn
 }
 
 // ------------------------------------------------------------------
@@ -5317,8 +5408,7 @@ fn doget_fixture(
     std::fs::create_dir_all(&staging).unwrap();
     let service = QiitaFlightService::new(
         test_vk(),
-        connstr,
-        data_path,
+        test_pool(&connstr, &data_path),
         staging,
         tmp.path().to_path_buf(),
     );
@@ -6337,7 +6427,8 @@ fn mint_phylogeny_edge_id_is_all_or_nothing_and_replay_safe() {
 
     // An entirely NULL tree is numbered, and `execute` reports the true count —
     // which is what the operator reads back as `minted_rows`.
-    let first = mint_phylogeny_edge_id(&connstr, &data_path, all_null).expect("mint failed");
+    let first = mint_phylogeny_edge_id(&attached_conn(&connstr, &data_path), all_null)
+        .expect("mint failed");
     assert_eq!(first["phylogeny_rows"], 3);
     assert_eq!(first["already_numbered_rows"], 0);
     assert_eq!(
@@ -6354,14 +6445,16 @@ fn mint_phylogeny_edge_id_is_all_or_nothing_and_replay_safe() {
     assert_eq!(edge_ids(all_null), vec![Some(4), Some(7), Some(11)]);
 
     // Replay: the counts are re-read, the tree is already numbered, nothing moves.
-    let replay = mint_phylogeny_edge_id(&connstr, &data_path, all_null).expect("replay failed");
+    let replay = mint_phylogeny_edge_id(&attached_conn(&connstr, &data_path), all_null)
+        .expect("replay failed");
     assert_eq!(replay["already_numbered_rows"], 3);
     assert_eq!(replay["minted_rows"], 0, "a replay writes nothing");
     assert_eq!(edge_ids(all_null), vec![Some(4), Some(7), Some(11)]);
 
     // The all-or-nothing gate: one numbered node is enough to stop the whole tree,
     // so the two NULLs stay NULL rather than being filled with a second numbering.
-    let mixed = mint_phylogeny_edge_id(&connstr, &data_path, partial).expect("gate call failed");
+    let mixed = mint_phylogeny_edge_id(&attached_conn(&connstr, &data_path), partial)
+        .expect("gate call failed");
     assert_eq!(mixed["phylogeny_rows"], 3);
     assert_eq!(mixed["already_numbered_rows"], 1);
     assert_eq!(
@@ -6378,7 +6471,8 @@ fn mint_phylogeny_edge_id_is_all_or_nothing_and_replay_safe() {
     assert_eq!(edge_ids(neighbour), vec![None]);
 
     // A reference with no rows at all is reported, not mistaken for a done tree.
-    let empty = mint_phylogeny_edge_id(&connstr, &data_path, no_rows).expect("empty call failed");
+    let empty = mint_phylogeny_edge_id(&attached_conn(&connstr, &data_path), no_rows)
+        .expect("empty call failed");
     assert_eq!(empty["phylogeny_rows"], 0);
     assert_eq!(empty["minted_rows"], 0);
 
