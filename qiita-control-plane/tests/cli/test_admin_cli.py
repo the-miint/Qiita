@@ -881,8 +881,8 @@ def _fake_masked_export_http(manifest):
 
 
 def test_masked_read_export_writes_parquet_per_sample(monkeypatch, tmp_path):
-    """Happy path: one <accession>.<run>.<pool>.<prep>.parquet per sample, with
-    the streamed rows, written 0600."""
+    """Happy path: one <accession>.<run>.<pool>.<prep_sample>.parquet per
+    prep_sample, with the streamed rows, written 0600."""
     import duckdb
     import pyarrow as pa
 

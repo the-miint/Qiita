@@ -6,7 +6,7 @@
   In the CLI, `qiita study create` takes `--study-idx`, and `--owner-email` to create the study
   for another user (resolved through the admin principal lookup, so it needs a system_admin token
   carrying `admin:user`). `GET /api/v1/study` lists studies by `study_idx`, highest first, so a
-  study created at a legacy `study_idx` comes after every minted one.
+  study created at a legacy `study_idx` comes after every study minted at 25000 and up.
 
 ### Changed
 

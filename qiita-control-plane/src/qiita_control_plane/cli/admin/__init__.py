@@ -633,7 +633,7 @@ def _build_parser() -> argparse.ArgumentParser:
         required=True,
         type=int,
         dest="sequenced_pool_idx",
-        help="sequenced_pool to export every (non-retired) sample of (required).",
+        help="sequenced_pool to export every (non-retired) prep_sample of (required).",
     )
     p_export.add_argument(
         "--mask-idx",
@@ -647,9 +647,9 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=("parquet", "fastq"),
         default="parquet",
         help=(
-            "Output format. parquet → one <stem>.parquet per sample; fastq →"
-            " one <stem>.fastq for a single-end sample, or split"
-            " <stem>.R1.fastq + <stem>.R2.fastq for a paired sample."
+            "Output format. parquet → one <stem>.parquet per prep_sample; fastq"
+            " → one <stem>.fastq.gz for a single-end prep_sample, or split"
+            " <stem>.R1.fastq.gz + <stem>.R2.fastq.gz for a paired one."
         ),
     )
     p_export.add_argument(
@@ -658,10 +658,11 @@ def _build_parser() -> argparse.ArgumentParser:
         type=Path,
         dest="output_dir",
         help=(
-            "Directory to write per-sample files into (created, with parents, if"
-            " missing; files are mode 0600). On re-export, an existing parquet"
-            " sample is skipped when its count matches the data plane and"
-            " overwritten when it differs; an existing fastq target is refused."
+            "Directory to write each prep_sample's files into (created, with"
+            " parents, if missing; files are mode 0600). On re-export, an"
+            " existing parquet file is skipped when its count matches the data"
+            " plane and overwritten when it differs; an existing fastq target"
+            " is refused."
         ),
     )
     p_export.add_argument(

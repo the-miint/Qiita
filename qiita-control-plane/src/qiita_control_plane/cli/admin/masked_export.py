@@ -138,16 +138,16 @@ def _write_masked_sample(reader, stem: str, output_dir: Path, fmt: str, con) -> 
     elif fmt == "fastq":
         paired, stream = _peek_paired(reader)
         con.register("masked", stream)
+        pairs = [
+            (output_dir / f"{name}.partial", output_dir / name)
+            for name in _fastq_names(stem, paired=paired)
+        ]
         if paired:
             # `{ORIENTATION}` expands to R1/R2, so the one COPY emits both
             # `<stem>.R1.fastq.gz.partial` and `<stem>.R2.fastq.gz.partial`.
             target = output_dir / f"{stem}.{{ORIENTATION}}.fastq.gz.partial"
         else:
-            target = output_dir / f"{stem}.fastq.gz.partial"
-        pairs = [
-            (output_dir / f"{name}.partial", output_dir / name)
-            for name in _fastq_names(stem, paired=paired)
-        ]
+            target = pairs[0][0]
         _commit_partials(
             lambda: con.execute(
                 f"COPY (SELECT {_READ_MASKED_COLUMNS} FROM masked) "
@@ -411,9 +411,9 @@ def _handle_masked_read_export(args: argparse.Namespace, parser: argparse.Argume
         # RuntimeError from a bug still ends in a traceback. A data plane failure
         # after the first batch lands here rather than above: the parquet path's
         # reader raises OSError, the fastq path's COPY over it a duckdb.Error.
-        # ArrowInvalid and ArrowKeyError are pyarrow refusing --data-plane-url
-        # (unparseable, or a scheme with no Flight transport, such as http), and
-        # ArrowInvalid also an existing parquet target it cannot read.
+        # ArrowInvalid and ArrowKeyError are pyarrow refusing an input, among
+        # them --data-plane-url (unparseable, or a scheme with no Flight
+        # transport, such as http) and an existing parquet target it cannot read.
         print(f"error: {exc}", file=sys.stderr)
         return 1
     finally:
