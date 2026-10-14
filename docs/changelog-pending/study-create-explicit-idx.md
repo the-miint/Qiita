@@ -16,6 +16,13 @@
 
 ### Fixed
 
-- **`qiita study create --owner-email` and `qiita-admin principal set-role`, among others, report a
-  response they do not recognise (such as one from a control plane at a different version) on one
-  stderr line and exit 1, instead of printing a Python traceback.**
+- **`qiita study create --owner-email`, `qiita-admin principal set-role` and `qiita mask
+  syndna-read-count`, among others, report a response they do not recognise (such as one from a
+  control plane at a different version) on one stderr line and exit 1.** They printed a Python
+  traceback, or for `syndna-read-count` pydantic's multi-line error.
+- **Nine CLI commands reported HTTP and connection errors in their own words; they now use the
+  same messages as every other command.** A 403 from a token that predates a newly granted scope
+  prompts `qiita login`, and an unreachable control plane names the URL it tried. The commands:
+  `qiita mask syndna-read-count`, `qiita submit-reads`, `qiita reference load`, `qiita reference
+  export`, `qiita feature-table build`, `qiita assembly export`, and `qiita-admin`'s
+  `masked-read-export`, `owner-biosample-id` and `mask purge-failed`.

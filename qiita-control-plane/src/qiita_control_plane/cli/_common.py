@@ -628,6 +628,12 @@ def validation_messages(exc: ValidationError) -> str:
     return "; ".join(f"{'.'.join(str(p) for p in e['loc'])}: {e['msg']}" for e in exc.errors())
 
 
+def print_validation_error(exc: ValidationError) -> None:
+    """Print a model's refusal of a body to stderr as one line naming the
+    model, in the `invalid <Model>: ...` form `parser.error` callers use."""
+    print(f"error: invalid {exc.title}: {validation_messages(exc)}", file=sys.stderr)
+
+
 def print_request_error(exc: httpx.RequestError) -> None:
     """Print a transport-level failure (no HTTP response at all) to stderr,
     naming the target URL so a wrong --base-url / $QIITA_CONTROL_PLANE_URL
@@ -677,7 +683,7 @@ def run_http_subcommand(
         print_request_error(exc)
         return 1
     except ValidationError as exc:
-        print(f"error: invalid {exc.title}: {validation_messages(exc)}", file=sys.stderr)
+        print_validation_error(exc)
         return 1
     if render is not None:
         render(body)

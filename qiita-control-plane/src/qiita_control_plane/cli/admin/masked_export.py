@@ -250,7 +250,7 @@ def _handle_masked_read_export(args: argparse.Namespace, parser: argparse.Argume
             "GET", args.base_url, token, manifest_path, params={"mask_idx": args.mask_idx}
         )
     except httpx.HTTPStatusError as exc:
-        print(f"http error {exc.response.status_code}: {exc.response.text}", file=sys.stderr)
+        _common.print_http_status_error(exc.response)
         return 1
 
     samples = manifest["samples"]
@@ -383,7 +383,7 @@ def _handle_masked_read_export(args: argparse.Namespace, parser: argparse.Argume
             _write_masked_sample(reader, stem, output_dir, args.format, con)
             exported += 1
     except httpx.HTTPStatusError as exc:
-        print(f"http error {exc.response.status_code}: {exc.response.text}", file=sys.stderr)
+        _common.print_http_status_error(exc.response)
         return 1
     finally:
         flight_client.close()

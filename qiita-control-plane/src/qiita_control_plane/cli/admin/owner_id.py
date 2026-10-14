@@ -100,7 +100,7 @@ def _handle_owner_biosample_id(args: argparse.Namespace, parser: argparse.Argume
     try:
         body = _common.call("GET", args.base_url, token, path, params=params)
     except httpx.HTTPStatusError as exc:
-        print(f"http error {exc.response.status_code}: {exc.response.text}", file=sys.stderr)
+        _common.print_http_status_error(exc.response)
         return 1
 
     try:

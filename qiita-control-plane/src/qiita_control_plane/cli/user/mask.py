@@ -21,6 +21,7 @@ import sys
 from collections.abc import Sequence
 from pathlib import Path
 
+from pydantic import ValidationError
 from qiita_common.analytic import LABELLED_RELATION, biom_copy_sql, parquet_copy_sql
 from qiita_common.api_paths import (
     PATH_MASK_DEFINITION_PREFIX,
@@ -320,20 +321,20 @@ def _handle_mask_syndna_read_count(
                 fmt=args.format,
             )
     except _common.httpx.HTTPStatusError as exc:
-        print(f"http error {exc.response.status_code}: {exc.response.text}", file=sys.stderr)
+        _common.print_http_status_error(exc.response)
         return 1
     except _common.httpx.RequestError as exc:
-        print(
-            f"error: could not reach the control plane: {exc!r}. Check --base-url /"
-            " $QIITA_CONTROL_PLANE_URL.",
-            file=sys.stderr,
-        )
+        _common.print_request_error(exc)
         return 1
     except flight.FlightError as exc:
         print(f"flight error: {exc}", file=sys.stderr)
         return 1
     except duckdb.Error as exc:
         print(f"error: writing the table failed on this machine: {exc}", file=sys.stderr)
+        return 1
+    except ValidationError as exc:
+        # Ahead of ValueError, which it subclasses: its own str() spans lines.
+        _common.print_validation_error(exc)
         return 1
     except (ValueError, OSError, RuntimeError) as exc:
         print(f"error: {exc}", file=sys.stderr)

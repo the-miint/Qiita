@@ -16,6 +16,7 @@ from qiita_common.models import LEGACY_IDX_RESERVED_CEILING, StudyAccessionField
 
 from . import require_transaction, update_row
 from .exported_entity import export_entity_id_select
+from .study_access import insert_study_access
 
 _STUDY_RETURNING_COLS = (
     "idx, owner_idx, principal_investigator_idx, title, alias,"
@@ -202,38 +203,6 @@ async def insert_study(
     return study_idx
 
 
-async def insert_owner_study_access_admin(
-    conn: asyncpg.Connection,
-    *,
-    study_idx: int,
-    owner_idx: int,
-    granted_by_idx: int,
-) -> None:
-    """Grant the study's owner ADMIN access in qiita.study_access.
-
-    The auto-grant ensures the owner appears explicitly in study_access
-    queries even though the owner-bypass path in
-    `auth.guards.require_study_access` would let the owner through
-    without one. `granted_by_idx` is the caller (which equals owner_idx
-    on self-create and the on-behalf actor on admin-creates-for-other).
-
-    Raises asyncpg.UniqueViolationError if a row already exists for this
-    (study_idx, owner_idx) pair.
-    """
-    # Single INSERT against the (study_idx, principal_idx) unique constraint;
-    # access_tier is always ADMIN because that is the only tier that makes
-    # sense for the owner-auto-grant path.
-    await conn.execute(
-        "INSERT INTO qiita.study_access ("
-        "    study_idx, principal_idx, access_tier, granted_by_idx"
-        ") VALUES ($1, $2, $3::qiita.tier, $4)",
-        study_idx,
-        owner_idx,
-        Tier.ADMIN,
-        granted_by_idx,
-    )
-
-
 # Columns this repo's PATCH composer is allowed to write. Held as a
 # frozenset so unknown column names are rejected at the repo boundary
 # rather than reaching the SQL builder. owner_idx is intentionally
@@ -334,11 +303,16 @@ async def create_study(
         idx=idx,
     )
 
-    # Step b: auto-grant the owner ADMIN access on the freshly created study.
-    await insert_owner_study_access_admin(
+    # Step b: auto-grant the owner ADMIN access on the freshly created study, so
+    # the owner appears in study_access queries even though the owner bypass in
+    # `auth.guards.require_study_access` would admit them without a row.
+    # granted_by_idx is the caller: the owner on self-create, the on-behalf actor
+    # otherwise.
+    await insert_study_access(
         conn,
         study_idx=study_idx,
-        owner_idx=owner_idx,
+        principal_idx=owner_idx,
+        access_tier=Tier.ADMIN,
         granted_by_idx=created_by_idx,
     )
 

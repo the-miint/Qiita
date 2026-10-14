@@ -158,6 +158,35 @@ def test_accession_names_need_no_data_plane(monkeypatch, tmp_path):
     assert {r[1] for r in _cells(out, "parquet")} == {_H1, _H2}
 
 
+def test_a_response_the_cli_does_not_recognise_is_one_error_line(monkeypatch, tmp_path, capsys):
+    """A syndna-read-count body that fails SyndnaReadCountResponse (e.g. from a
+    control plane at a different version) is one stderr line, exit 1, no file."""
+    monkeypatch.setenv("QIITA_TOKEN", "t")
+    monkeypatch.setattr(mx._common, "call", lambda *a, **k: {"mask_idx": 3})
+    out = tmp_path / "syndna.biom"
+    rc = cli.main(
+        [
+            "--base-url",
+            "https://cp",
+            "mask",
+            "syndna-read-count",
+            "--mask-idx",
+            "3",
+            "--study-idx",
+            "1",
+            "--output",
+            str(out),
+            "--feature-names",
+            "accession",
+        ]
+    )
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert len(err.strip().splitlines()) == 1, err
+    assert "invalid SyndnaReadCountResponse" in err
+    assert not out.exists()
+
+
 def test_main_refuses_a_collision_and_writes_nothing(monkeypatch, tmp_path, capsys):
     _fake_species(monkeypatch)
     out = tmp_path / "syndna.biom"
