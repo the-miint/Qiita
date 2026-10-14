@@ -171,6 +171,33 @@ def test_native_checkout_fails_outside_git_clone(tmp_path: Path) -> None:
 _REDEPLOY = _DEPLOY / "redeploy.sh"
 
 
+def test_verify_dp_pool_row_greps_what_the_data_plane_actually_logs() -> None:
+    """`verify.sh`'s dp-pool row reads the data plane's journal by exact string, and
+    nothing in Rust knows that. A reword on either side would turn the row green (or
+    permanently red) without failing anything, so the three strings are pinned against
+    the source that writes them.
+
+    This pins the strings, not the row's logic — `bash -n` and shellcheck cover the
+    shell, and the behaviour needs a host with systemd."""
+    verify = (_DEPLOY / "verify.sh").read_text()
+    dp_src = _REPO_ROOT / "qiita-data-plane" / "src"
+    for string, writer in (
+        ("qiita-data-plane pool:", "main.rs"),
+        ("discarding a pooled DuckLake connection", "pool.rs"),
+        ("fallback default", "resources.rs"),
+    ):
+        assert string in verify, f"verify.sh no longer greps for {string!r}"
+        assert string in (dp_src / writer).read_text(), (
+            f"the data plane's {writer} no longer writes {string!r}, so verify.sh's "
+            "dp-pool row can never match it again"
+        )
+
+    # One hatch per row, documented in the header like its siblings.
+    assert verify.count("SKIP_DP_POOL") == 3, (
+        "the dp-pool hatch is missing from the row, its skip message, or the header"
+    )
+
+
 def _fake_deploy_dir(tmp_path: Path, *, script: str, common_suffix: str = "") -> Path:
     """A `deploy/`-shaped dir: a script beside a copy of the real `_common.sh`.
     The copy is what `QIITA_COMMON_SH` resolves to, so a test can edit or delete

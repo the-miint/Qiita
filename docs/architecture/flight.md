@@ -30,7 +30,11 @@ reasoning, and the edge limits it rests on, are in `pool.rs`. **No client retrie
 the call itself yet.** What a refusal becomes instead depends on the caller: a
 native job step is classified `data_plane_transient` and re-dispatched by the
 runner, a control-plane pre-loop fetch is held for an operator redrive, and a
-DoAction from the action library still fails permanently.
+DoAction from the control plane's action library still fails permanently. The
+same classification covers the data plane's other recoverable failures — it
+could not open a connection, a catalog write lost a serialization race, a signing
+token aged out — from one shared module
+([`qiita_common.data_plane_errors`](../../qiita-common/src/qiita_common/data_plane_errors.py)).
 
 Each pooled connection carries its own `threads`, `memory_limit`, `temp_directory`
 and `max_temp_directory_size`, divided at boot from the memory ceiling the

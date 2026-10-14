@@ -1,4 +1,6 @@
-"""Unit tests for the data-plane fetch failure classifier (`runner/_upload.py`).
+"""Unit tests for the data-plane failure classification both services share
+(`qiita_common.data_plane_errors`) and the control-plane wrapper that files it
+(`runner/_upload.py`).
 
 Pins which DP-fetch failures are RETRIABLE (`DATA_PLANE_TRANSIENT`) — a DuckLake
 serialization conflict (Postgres SQLSTATE 40001) surfaced over Flight, a gRPC
@@ -22,17 +24,17 @@ from __future__ import annotations
 from pathlib import Path
 
 from qiita_common.backend_failure import FailureKind
-from qiita_common.data_plane_errors import DATA_PLANE_BUSY_SIGNATURE
+from qiita_common.data_plane_errors import (
+    DATA_PLANE_BUSY_SIGNATURE,
+    DP_TICKET_EXPIRED_SIGNATURES,
+    is_data_plane_busy,
+    is_dp_serialization_conflict,
+    is_dp_ticket_expired,
+    is_dp_unavailable,
+)
 from qiita_common.models import WorkTicketFailureStage
 
-from qiita_control_plane.runner._upload import (
-    _DP_TICKET_EXPIRED_SIGNATURES,
-    _is_dp_busy,
-    _is_dp_serialization_conflict,
-    _is_dp_ticket_expired,
-    _is_dp_unavailable,
-    _submission_dp_fetch_failure,
-)
+from qiita_control_plane.runner._upload import _submission_dp_fetch_failure
 
 # A representative stringified pyarrow FlightError carrying the Postgres 40001
 # serialization message, as seen verbatim in a real read-mask fan-out
@@ -134,8 +136,8 @@ _SERVER_RETURNED_UNAVAILABLE = (
 def test_expiry_is_detected_in_both_pyarrow_renderings():
     """The classifier must fire on the form a live data plane produces, not only on
     the message-prefix form the other fixtures use."""
-    assert _is_dp_ticket_expired(Exception(_REAL_EXPIRED)) is True
-    assert _is_dp_ticket_expired(Exception(_SERVER_RETURNED_EXPIRED)) is True
+    assert is_dp_ticket_expired(Exception(_REAL_EXPIRED)) is True
+    assert is_dp_ticket_expired(Exception(_SERVER_RETURNED_EXPIRED)) is True
 
 
 def test_a_data_plane_that_is_up_but_unavailable_is_retriable():
@@ -144,7 +146,7 @@ def test_a_data_plane_that_is_up_but_unavailable_is_retriable():
     The data plane answers this status when it cannot open a DuckLake connection, and
     gRPC defines it as retriable, so a redrive self-heals it and it must not land as a
     bad-input an operator resolves."""
-    assert _is_dp_unavailable(Exception(_SERVER_RETURNED_UNAVAILABLE)) is True
+    assert is_dp_unavailable(Exception(_SERVER_RETURNED_UNAVAILABLE)) is True
     f = _submission_dp_fetch_failure("could not fetch ...", Exception(_SERVER_RETURNED_UNAVAILABLE))
     assert f.kind is FailureKind.DATA_PLANE_TRANSIENT
     assert f.transient is True
@@ -160,43 +162,43 @@ def test_the_two_renderings_do_not_cross_contaminate():
     same_message_other_status = _SERVER_RETURNED_EXPIRED.replace(
         "Detail: Unauthenticated", "Detail: Internal"
     )
-    assert _is_dp_ticket_expired(Exception(same_message_other_status)) is False
-    assert _is_dp_ticket_expired(Exception(_SERVER_RETURNED_UNAVAILABLE)) is False
-    assert _is_dp_unavailable(Exception(_SERVER_RETURNED_EXPIRED)) is False
+    assert is_dp_ticket_expired(Exception(same_message_other_status)) is False
+    assert is_dp_ticket_expired(Exception(_SERVER_RETURNED_UNAVAILABLE)) is False
+    assert is_dp_unavailable(Exception(_SERVER_RETURNED_EXPIRED)) is False
 
 
 def test_serialization_conflict_is_detected():
-    assert _is_dp_serialization_conflict(Exception(_REAL_40001)) is True
+    assert is_dp_serialization_conflict(Exception(_REAL_40001)) is True
 
 
 def test_non_serialization_error_is_not_detected():
-    assert _is_dp_serialization_conflict(Exception("some other flight error")) is False
-    assert _is_dp_serialization_conflict(FileNotFoundError("missing file")) is False
+    assert is_dp_serialization_conflict(Exception("some other flight error")) is False
+    assert is_dp_serialization_conflict(FileNotFoundError("missing file")) is False
 
 
 def test_unavailable_is_detected():
-    assert _is_dp_unavailable(Exception(_REAL_UNAVAILABLE)) is True
+    assert is_dp_unavailable(Exception(_REAL_UNAVAILABLE)) is True
 
 
 def test_non_unavailable_error_is_not_detected():
     # A serialization conflict is retriable, but NOT via the unavailable path.
-    assert _is_dp_unavailable(Exception(_REAL_40001)) is False
-    assert _is_dp_unavailable(Exception("some other flight error")) is False
+    assert is_dp_unavailable(Exception(_REAL_40001)) is False
+    assert is_dp_unavailable(Exception("some other flight error")) is False
 
 
 def test_ticket_expired_is_detected():
-    assert _is_dp_ticket_expired(Exception(_REAL_EXPIRED)) is True
+    assert is_dp_ticket_expired(Exception(_REAL_EXPIRED)) is True
 
 
 def test_other_unauthenticated_errors_are_not_detected():
     # Same class, same gRPC status, permanent cause — must not be swept in.
-    assert _is_dp_ticket_expired(Exception(_REAL_BAD_SIGNATURE)) is False
-    assert _is_dp_ticket_expired(Exception(_REAL_40001)) is False
-    assert _is_dp_ticket_expired(Exception("some other flight error")) is False
+    assert is_dp_ticket_expired(Exception(_REAL_BAD_SIGNATURE)) is False
+    assert is_dp_ticket_expired(Exception(_REAL_40001)) is False
+    assert is_dp_ticket_expired(Exception("some other flight error")) is False
     # `AuthError::ExpiryTooFar` — the nearest miss, and the variant a reword of the
     # Rust `Display` impl is most likely to collide with.
     assert (
-        _is_dp_ticket_expired(
+        is_dp_ticket_expired(
             Exception(
                 "Flight returned unauthenticated error, with message: "
                 "ticket expiry too far in the future"
@@ -210,7 +212,7 @@ def test_an_expired_work_ticket_is_not_an_expired_flight_ticket():
     """ "ticket" names both a Flight ticket and a work_ticket in this repo, and
     "work ticket expired" contains the expiry text. The unauthenticated marker is
     what separates them, so a non-Flight message must not classify retriable."""
-    assert _is_dp_ticket_expired(Exception("work ticket expired while queued")) is False
+    assert is_dp_ticket_expired(Exception("work ticket expired while queued")) is False
 
 
 def test_expiry_signatures_match_the_data_planes_wording():
@@ -226,7 +228,7 @@ def test_expiry_signatures_match_the_data_planes_wording():
     assert m, "AuthError::Expired arm not found in auth.rs"
     assert m.group(1) == "ticket expired", (
         f"the data plane now renders an expired ticket as {m.group(1)!r}; "
-        f"update _DP_TICKET_EXPIRED_SIGNATURES ({_DP_TICKET_EXPIRED_SIGNATURES!r}) "
+        f"update DP_TICKET_EXPIRED_SIGNATURES ({DP_TICKET_EXPIRED_SIGNATURES!r}) "
         "or expired tokens silently classify permanent again"
     )
     # The other half of the match: every ticket verification maps its AuthError to
@@ -240,7 +242,7 @@ def test_expiry_signatures_match_the_data_planes_wording():
     assert verify_calls, "no auth::verify_* -> Status mapping found in flight_service.rs"
     assert set(verify_calls) == {"unauthenticated"}, (
         f"a ticket verification now maps to {sorted(set(verify_calls))}; the classifier's "
-        f"{_DP_TICKET_EXPIRED_SIGNATURES!r} match assumes every one is unauthenticated"
+        f"{DP_TICKET_EXPIRED_SIGNATURES!r} match assumes every one is unauthenticated"
     )
 
 
@@ -281,15 +283,15 @@ def test_busy_data_plane_classified_retriable():
 def test_busy_predicate_does_not_fire_on_the_other_dp_errors():
     """The match is the data plane's own prefix, so it covers the refusal and nothing
     else that carries the same gRPC status."""
-    assert _is_dp_busy(ValueError(_REAL_BUSY)) is True
-    assert _is_dp_busy(Exception(_REAL_40001)) is False
-    assert _is_dp_busy(Exception(_REAL_UNAVAILABLE)) is False
-    assert _is_dp_busy(Exception(_REAL_EXPIRED)) is False
-    assert _is_dp_busy(Exception("Flight returned internal error: no such table")) is False
+    assert is_data_plane_busy(ValueError(_REAL_BUSY)) is True
+    assert is_data_plane_busy(Exception(_REAL_40001)) is False
+    assert is_data_plane_busy(Exception(_REAL_UNAVAILABLE)) is False
+    assert is_data_plane_busy(Exception(_REAL_EXPIRED)) is False
+    assert is_data_plane_busy(Exception("Flight returned internal error: no such table")) is False
     # The case the status name alone would have swallowed: gRPC answers
     # RESOURCE_EXHAUSTED for an oversized message too, and no redrive shrinks it.
     assert (
-        _is_dp_busy(
+        is_data_plane_busy(
             ValueError(
                 "gRPC returned resource exhausted error, with message: Received message "
                 "larger than max (21368092 vs. 4194304)"

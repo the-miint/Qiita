@@ -60,25 +60,43 @@ const DEFAULT_POOL_SIZE: usize = 8;
 /// what is measured is that it has to be less than all of it, because
 /// `memory_limit` bounds what DuckDB accounts for rather than what the process
 /// holds — on the deploy host one request under a 3.7 GiB limit peaked at
-/// 5,021 MiB RSS and finished in the same 100.5 s as the same request under a
-/// 29.8 GiB limit. The unspent half covers what that accounting does not see
-/// (the Arrow batches each stream holds in flight) and the host's other work.
+/// 5,021 MiB RSS, an overshoot of 1.33×, and finished in the same 100.5 s as the
+/// same request under a 29.8 GiB limit. Half leaves room for that overshoot on
+/// every connection at once, plus what the accounting never sees (the Arrow
+/// batches each stream holds in flight) and the host's other work.
 pub(crate) const CEILING_DIVISOR: u64 = 2;
 
-/// Smallest per-connection `memory_limit` worth deriving: enough for DuckDB to run
-/// a streaming scan with a few threads, chosen rather than measured. A share
-/// below it means the pool is too big for the host rather than that the share
-/// should be rounded up — granting the floor anyway would hand out
-/// `size × 256 MiB` from a ceiling that may be smaller than that. Boot fails
-/// instead, naming both ways out.
-pub(crate) const MIN_MEMORY_LIMIT_MIB: u64 = 256;
+/// Smallest per-connection `memory_limit` worth deriving — the point below which
+/// a request shape the data plane serves cannot run at all, rather than a size
+/// any particular request needs.
+///
+/// Measured on the four shapes this process runs (the `read_masked` stream, the
+/// export's `COPY … TO` Parquet, the mask-metrics aggregate, the pool-reads
+/// DELETE) at a 209 MiB and a 2,086 MiB payload: the export fails at 256 MiB for
+/// the larger payload and at 128 MiB for the smaller, with a single
+/// `failed to allocate data of size 128.0 MiB` — its Parquet row-group buffer,
+/// which a spill directory does not rescue, so the floor matters more than the
+/// cap. Both shapes' minimum moved up one step for ten times the payload, so no
+/// fixed value serves every request; this is the floor, and what a request
+/// actually gets comes from dividing a real ceiling.
+///
+/// A share below it means the pool is too big for the host rather than that the
+/// share should be rounded up — granting the floor anyway would hand out
+/// `size × this` from a ceiling smaller than that. Boot fails instead, naming
+/// both ways out.
+pub(crate) const MIN_MEMORY_LIMIT_MIB: u64 = 512;
 
 /// Per-connection ceiling on spill. DuckDB's own default is 90% of the
 /// filesystem holding `temp_directory` — which every connection would claim in
-/// full — so an explicit value is required rather than optional. This one is a
-/// bound, not a sizing: no spill size for a real request has been measured, and
-/// the measured behaviour when the cap is reached is a clean error naming the
-/// setting, with nothing left behind.
+/// full — so an explicit value is required rather than optional.
+///
+/// It is a backstop, and measurement is why: none of the four shapes this process
+/// runs spills anything at all when it completes, at either payload tested, and
+/// the largest spill seen anywhere was 58 MiB written by an export that then
+/// failed its allocation. So this does not size expected spill; it bounds a shape
+/// nobody has measured. At the default pool size that is 8 × 4 GiB against the
+/// deploy host's 378 G of free root, and the measured behaviour when a connection
+/// reaches it is a clean error naming the setting, with nothing left behind.
 const DEFAULT_MAX_TEMP_DIRECTORY_SIZE: &str = "4GiB";
 
 /// Leaf name of the derived spill directory, under the `HOME` the systemd unit

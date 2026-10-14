@@ -32,10 +32,11 @@ from pathlib import Path
 from typing import Any
 
 import pyarrow
+import pyarrow.flight
 from pydantic import BaseModel, ValidationError
 from qiita_common.actions import NATIVE_MODULE_PREFIX
 from qiita_common.backend_failure import BackendFailure, FailureKind, StepNoData
-from qiita_common.data_plane_errors import is_data_plane_busy
+from qiita_common.data_plane_errors import is_data_plane_transient
 from qiita_common.models import ScopeTargetKind, WorkTicketFailureStage
 
 
@@ -270,8 +271,31 @@ async def run_native_job(
             step_name=step_name,
             reason=str(exc),
         ) from exc
+    except (pyarrow.ArrowException, pyarrow.flight.FlightError) as exc:
+        # A Flight call the step made failed. Only the conditions the data plane is
+        # known to recover from are classified — the same set the control plane's
+        # pre-loop resolvers use, from one shared module so a reword in the data
+        # plane cannot leave the two disagreeing. Anything else re-raises and keeps
+        # the unclassified behaviour it has today, including a pyarrow error raised
+        # by a job's own Parquet or Arrow work rather than by a Flight call.
+        #
+        # This arm catches by type where the one below catches `ValueError`, because
+        # pyarrow raises these as `FlightError` subclasses, which are not
+        # ValueErrors — the refusal is the exception, arriving as `ArrowInvalid`.
+        # Both bases are listed because the two hierarchies only overlap in the
+        # concrete classes: `FlightUnavailableError` is a `(FlightError,
+        # ArrowException)`, while `FlightError` itself derives from `Exception`
+        # alone (measured on pyarrow 23.0.1 and 25.0.0).
+        if not is_data_plane_transient(exc):
+            raise
+        raise BackendFailure(
+            kind=FailureKind.DATA_PLANE_TRANSIENT,
+            stage=WorkTicketFailureStage.STEP_RUN,
+            step_name=step_name,
+            reason=f"native job {module_name!r}: {exc}",
+        ) from exc
     except ValueError as exc:
-        if isinstance(exc, pyarrow.ArrowInvalid) and is_data_plane_busy(exc):
+        if isinstance(exc, pyarrow.ArrowInvalid) and is_data_plane_transient(exc):
             # The data plane refused the step's Flight call because every DuckLake
             # connection in its pool was in use. Retriable, and it has to be
             # separated from the arm below rather than left to it: pyarrow raises

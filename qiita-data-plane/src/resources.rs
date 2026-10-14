@@ -16,11 +16,12 @@
 //! the other platform does not have, so the ordering alone decides which answers.
 //!
 //! The compute orchestrator sizes its own DuckDB sessions from a cgroup too
-//! (`qiita_compute_orchestrator.miint`), and deliberately differs: it takes the
-//! tightest limit of every ancestor cgroup and falls back to the host's physical
-//! total, where this takes the process's own leaf and falls back to what is
-//! currently available. Neither language can import the other, so a change to one
-//! precedence is a reason to look at the other rather than a shared constant.
+//! (`qiita_compute_orchestrator.miint`), and walks ancestors the same way for the
+//! same reason. It still differs in its last resort — the host's physical total,
+//! where this takes what is currently available — because a job is sized before
+//! it runs and this pool is sized at boot. Neither language can import the other,
+//! so a change to one precedence is a reason to look at the other rather than a
+//! shared constant.
 
 /// Where a detected memory ceiling came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,17 +86,22 @@ pub fn detect_thread_budget() -> usize {
 
 fn read_cgroup_v2() -> Option<u64> {
     let own_path = cgroup_v2_path(&read_self_cgroup()?)?;
-    let content = std::fs::read_to_string(format!("/sys/fs/cgroup{own_path}/memory.max")).ok()?;
-    parse_cgroup_v2_max(&content)
+    tightest_limit(
+        &own_path,
+        "/sys/fs/cgroup",
+        "memory.max",
+        parse_cgroup_v2_max,
+    )
 }
 
 fn read_cgroup_v1() -> Option<u64> {
     let own_path = cgroup_v1_memory_path(&read_self_cgroup()?)?;
-    let content = std::fs::read_to_string(format!(
-        "/sys/fs/cgroup/memory{own_path}/memory.limit_in_bytes"
-    ))
-    .ok()?;
-    parse_cgroup_v1_limit(&content)
+    tightest_limit(
+        &own_path,
+        "/sys/fs/cgroup/memory",
+        "memory.limit_in_bytes",
+        parse_cgroup_v1_limit,
+    )
 }
 
 fn read_proc_meminfo() -> Option<u64> {
@@ -119,6 +125,42 @@ fn read_macos_memsize() -> Option<u64> {
 
 fn read_self_cgroup() -> Option<String> {
     std::fs::read_to_string("/proc/self/cgroup").ok()
+}
+
+/// The tightest limit across the process's own cgroup and every ancestor up to
+/// the mount root, which is not always its own: a slice above it can be the one
+/// that caps memory, and under a systemd `MemoryMax=` on a parent slice the
+/// process's own file reads unlimited. The compute orchestrator walks the same
+/// way for the same reason (`qiita_compute_orchestrator.miint.detected_ram_gb`).
+/// A file that is missing, unreadable or unlimited is skipped rather than ending
+/// the walk, so detection steps down to the next source only when no cgroup in
+/// the chain has a limit.
+fn tightest_limit(
+    own_path: &str,
+    mount: &str,
+    file: &str,
+    parse: impl Fn(&str) -> Option<u64>,
+) -> Option<u64> {
+    let mut tightest: Option<u64> = None;
+    let mut path = own_path.to_string();
+    loop {
+        let candidate = std::fs::read_to_string(format!("{mount}{path}/{file}"))
+            .ok()
+            .and_then(|content| parse(&content));
+        if let Some(value) = candidate {
+            tightest = Some(tightest.map_or(value, |seen: u64| seen.min(value)));
+        }
+        if path.is_empty() {
+            break;
+        }
+        // "/a/b" -> "/a" -> "" , and "" is the mount root, read once before the
+        // loop ends.
+        match path.rfind('/') {
+            Some(cut) => path.truncate(cut),
+            None => break,
+        }
+    }
+    tightest
 }
 
 /// The path field of the `/proc/self/cgroup` line that `wanted` selects, where
@@ -248,6 +290,68 @@ mod tests {
     #[test]
     fn meminfo_declines_when_the_field_is_absent() {
         assert_eq!(parse_meminfo_available("MemTotal: 1 kB\n"), None);
+    }
+
+    /// A fake cgroup tree: `mount/<path>/<file>` for each entry.
+    fn cgroup_tree(entries: &[(&str, &str)]) -> tempfile::TempDir {
+        let root = tempfile::tempdir().unwrap();
+        for (path, value) in entries {
+            let dir = root
+                .path()
+                .join("cgroup")
+                .join(path.trim_start_matches('/'));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("memory.max"), value).unwrap();
+        }
+        root
+    }
+
+    #[test]
+    fn the_walk_takes_a_tighter_ancestor_over_the_process_s_own() {
+        // The unit's own file says `max`; the slice above it is the real ceiling.
+        let root = cgroup_tree(&[("slice", "4294967296\n"), ("slice/unit", "max\n")]);
+        let mount = root.path().join("cgroup");
+        assert_eq!(
+            tightest_limit(
+                "/slice/unit",
+                mount.to_str().unwrap(),
+                "memory.max",
+                parse_cgroup_v2_max
+            ),
+            Some(4 * 1024 * 1024 * 1024),
+            "a MemoryMax= on a parent slice is the limit this process runs under"
+        );
+    }
+
+    #[test]
+    fn the_walk_keeps_the_leaf_when_it_is_the_tighter_one() {
+        let root = cgroup_tree(&[("slice", "8589934592\n"), ("slice/unit", "2147483648\n")]);
+        let mount = root.path().join("cgroup");
+        assert_eq!(
+            tightest_limit(
+                "/slice/unit",
+                mount.to_str().unwrap(),
+                "memory.max",
+                parse_cgroup_v2_max
+            ),
+            Some(2 * 1024 * 1024 * 1024)
+        );
+    }
+
+    #[test]
+    fn the_walk_declines_when_no_cgroup_in_the_chain_has_a_limit() {
+        let root = cgroup_tree(&[("slice/unit", "max\n")]);
+        let mount = root.path().join("cgroup");
+        assert_eq!(
+            tightest_limit(
+                "/slice/unit",
+                mount.to_str().unwrap(),
+                "memory.max",
+                parse_cgroup_v2_max
+            ),
+            None,
+            "an unlimited chain steps down to the next detector"
+        );
     }
 
     #[test]

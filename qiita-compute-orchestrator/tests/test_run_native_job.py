@@ -261,6 +261,42 @@ async def test_a_value_error_that_merely_mentions_the_data_plane_stays_permanent
     assert ei.value.kind is FailureKind.BAD_INPUT
 
 
+async def test_unreachable_data_plane_maps_to_a_retriable_failure(monkeypatch, tmp_path):
+    """gRPC UNAVAILABLE — the data plane restarting mid-deploy, or unable to open a
+    DuckLake connection — arrives as a `FlightUnavailableError`, which is NOT a
+    ValueError, so it needs the typed arm rather than the data-quality one. Before it
+    existed the exception escaped the dispatcher and the step failed with an
+    unstructured non-zero exit."""
+    import pyarrow.flight
+
+    async def execute(inputs, workspace):
+        raise pyarrow.flight.FlightUnavailableError(
+            "Flight returned unavailable error, with message: failed to connect to all "
+            "addresses; last error: UNKNOWN: ipv4:127.0.0.1:50051"
+        )
+
+    name = _install_stub(monkeypatch, short_name="dp_down", inputs_cls=_Inputs, execute_fn=execute)
+    with pytest.raises(BackendFailure) as ei:
+        await run_native_job(name, {"x": 1}, tmp_path, step_name="step")
+    assert ei.value.kind is FailureKind.DATA_PLANE_TRANSIENT
+    assert ei.value.transient is True
+
+
+async def test_a_pyarrow_error_that_is_not_a_data_plane_condition_propagates(monkeypatch, tmp_path):
+    """A job's own Arrow or Parquet failure is not a data-plane condition, so it keeps
+    propagating uncaught rather than being relabelled retriable."""
+    import pyarrow
+
+    async def execute(inputs, workspace):
+        raise pyarrow.ArrowCapacityError("array cannot contain more than 2147483646 bytes")
+
+    name = _install_stub(
+        monkeypatch, short_name="arrow_capacity", inputs_cls=_Inputs, execute_fn=execute
+    )
+    with pytest.raises(pyarrow.ArrowCapacityError):
+        await run_native_job(name, {"x": 1}, tmp_path, step_name="step")
+
+
 async def test_step_no_data_propagates_unchanged(monkeypatch, tmp_path):
     """StepNoData is a TERMINAL no-data outcome, not a failure — the
     dispatcher must re-raise it unchanged (NOT reclassify it into a

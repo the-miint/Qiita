@@ -10,6 +10,8 @@ mod flight_service;
 mod miint;
 mod pool;
 mod resources;
+#[cfg(test)]
+mod test_catalog;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {

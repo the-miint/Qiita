@@ -198,10 +198,13 @@ fn the_pool_settings_reach_duckdb() {
 
 #[test]
 fn every_setting_that_could_end_a_sql_literal_is_rejected_at_construction() {
+    /// The env var a case poisons, and how.
+    type PoisonCase = (&'static str, fn(&mut PoolSettings));
+
     let tmp = tempfile::tempdir().unwrap();
     // One case per value that reaches `SET` as a literal; deleting any of the
     // three checks fails here rather than shipping an interpolation.
-    let cases: [(&str, fn(&mut PoolSettings)); 3] = [
+    let cases: [PoisonCase; 3] = [
         ("DUCKDB_MEMORY_LIMIT", |s| {
             s.memory_limit = "512MiB'; ATTACH 'evil".to_string()
         }),
@@ -232,8 +235,8 @@ fn every_setting_that_could_end_a_sql_literal_is_rejected_at_construction() {
 #[cfg(feature = "integration")]
 #[serial_test::serial]
 fn open_attaches_one_instance_and_the_rest_on_demand() {
-    let connstr = crate::flight_service::tests::delete_test_catalog_connstr();
-    let data_path = crate::flight_service::tests::delete_test_data_path();
+    let connstr = crate::test_catalog::connstr();
+    let data_path = crate::test_catalog::data_path();
     let tmp = tempfile::tempdir().unwrap();
 
     let pool = LakePool::open(

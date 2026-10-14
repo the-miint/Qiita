@@ -188,23 +188,7 @@ fn single_i64_filter_rejects_missing_empty_multi_and_non_integer() {
     assert!(single_i64_filter(&f, "text").is_err(), "non-integer value");
 }
 
-// --- delete_reference integration harness (mirrors ducklake.rs::tests) ---
-
-#[cfg(feature = "integration")]
-pub(crate) fn delete_test_catalog_connstr() -> String {
-    std::env::var("DUCKLAKE_CATALOG_CONNSTR").unwrap_or_else(|_| {
-        "dbname=qiita_ducklake host=localhost port=5433 user=qiita password=qiita".to_string()
-    })
-}
-
-#[cfg(feature = "integration")]
-pub(crate) fn delete_test_data_path() -> String {
-    let data_path = std::env::var("PATH_PERSISTENT")
-        .map(|base| format!("{base}/ducklake"))
-        .unwrap_or_else(|_| "/tmp/qiita-integration-ducklake-data".to_string());
-    std::fs::create_dir_all(&data_path).unwrap();
-    data_path
-}
+// --- delete_reference integration harness ---
 
 /// Lay down every lake table the data plane creates at boot, in `main.rs`'s
 /// order (exclusion last — its `_visible` views join reference + alignment).
@@ -231,8 +215,8 @@ fn setup_full_lake(conn: &duckdb::Connection) {
 #[serial_test::serial]
 #[cfg(feature = "integration")]
 fn delete_reference_drops_orphans_keeps_shared() {
-    let connstr = delete_test_catalog_connstr();
-    let data_path = delete_test_data_path();
+    let connstr = crate::test_catalog::connstr();
+    let data_path = crate::test_catalog::data_path();
     let conn = Connection::open_in_memory().unwrap();
     ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
     ducklake::ensure_reference_tables(&conn).unwrap();
@@ -312,8 +296,8 @@ fn delete_reference_drops_orphans_keeps_shared() {
 #[serial_test::serial]
 #[cfg(feature = "integration")]
 fn delete_mask_drops_target_idempotently() {
-    let connstr = delete_test_catalog_connstr();
-    let data_path = delete_test_data_path();
+    let connstr = crate::test_catalog::connstr();
+    let data_path = crate::test_catalog::data_path();
     let conn = Connection::open_in_memory().unwrap();
     ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
     ducklake::ensure_read_tables(&conn).unwrap();
@@ -370,8 +354,8 @@ fn delete_mask_drops_target_idempotently() {
 #[serial_test::serial]
 #[cfg(feature = "integration")]
 fn delete_read_mask_block_deletes_footprint_only() {
-    let connstr = delete_test_catalog_connstr();
-    let data_path = delete_test_data_path();
+    let connstr = crate::test_catalog::connstr();
+    let data_path = crate::test_catalog::data_path();
     let conn = Connection::open_in_memory().unwrap();
     ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
     ducklake::ensure_read_tables(&conn).unwrap();
@@ -468,8 +452,8 @@ fn delete_read_mask_block_deletes_footprint_only() {
 #[serial_test::serial]
 #[cfg(feature = "integration")]
 fn delete_alignment_drops_target_idempotently() {
-    let connstr = delete_test_catalog_connstr();
-    let data_path = delete_test_data_path();
+    let connstr = crate::test_catalog::connstr();
+    let data_path = crate::test_catalog::data_path();
     let conn = Connection::open_in_memory().unwrap();
     ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
     ducklake::ensure_alignment_tables(&conn).unwrap();
@@ -552,8 +536,8 @@ fn delete_alignment_drops_target_idempotently() {
 #[serial_test::serial]
 #[cfg(feature = "integration")]
 fn delete_alignment_block_deletes_footprint_only() {
-    let connstr = delete_test_catalog_connstr();
-    let data_path = delete_test_data_path();
+    let connstr = crate::test_catalog::connstr();
+    let data_path = crate::test_catalog::data_path();
     let conn = Connection::open_in_memory().unwrap();
     ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
     ducklake::ensure_alignment_tables(&conn).unwrap();
@@ -692,8 +676,8 @@ fn delete_alignment_block_deletes_footprint_only() {
 #[serial_test::serial]
 #[cfg(feature = "integration")]
 fn delete_alignment_sample_deletes_the_pair_only() {
-    let connstr = delete_test_catalog_connstr();
-    let data_path = delete_test_data_path();
+    let connstr = crate::test_catalog::connstr();
+    let data_path = crate::test_catalog::data_path();
     let conn = Connection::open_in_memory().unwrap();
     ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
     ducklake::ensure_alignment_tables(&conn).unwrap();
@@ -805,8 +789,8 @@ fn delete_alignment_sample_deletes_the_pair_only() {
 #[serial_test::serial]
 #[cfg(feature = "integration")]
 fn count_masked_reads_counts_pass_rows_for_target_only() {
-    let connstr = delete_test_catalog_connstr();
-    let data_path = delete_test_data_path();
+    let connstr = crate::test_catalog::connstr();
+    let data_path = crate::test_catalog::data_path();
     let conn = Connection::open_in_memory().unwrap();
     ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
     ducklake::ensure_read_tables(&conn).unwrap();
@@ -854,8 +838,8 @@ fn count_masked_reads_counts_pass_rows_for_target_only() {
 #[serial_test::serial]
 #[cfg(feature = "integration")]
 fn mask_metrics_counts_buckets_both_mates_for_target_only() {
-    let connstr = delete_test_catalog_connstr();
-    let data_path = delete_test_data_path();
+    let connstr = crate::test_catalog::connstr();
+    let data_path = crate::test_catalog::data_path();
     let conn = Connection::open_in_memory().unwrap();
     ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
     ducklake::ensure_read_tables(&conn).unwrap();
@@ -936,8 +920,8 @@ fn delete_pool_reads_empty_set_is_zero_count_noop() {
 #[serial_test::serial]
 #[cfg(feature = "integration")]
 fn delete_pool_reads_drops_target_idempotently() {
-    let connstr = delete_test_catalog_connstr();
-    let data_path = delete_test_data_path();
+    let connstr = crate::test_catalog::connstr();
+    let data_path = crate::test_catalog::data_path();
     let conn = Connection::open_in_memory().unwrap();
     ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
     ducklake::ensure_read_tables(&conn).unwrap();
@@ -1015,8 +999,8 @@ fn delete_pool_reads_drops_target_idempotently() {
 async fn stream_ducklake_batches_streams_rows_and_empty_schema_branch() {
     use arrow_schema::DataType;
 
-    let connstr = delete_test_catalog_connstr();
-    let data_path = delete_test_data_path();
+    let connstr = crate::test_catalog::connstr();
+    let data_path = crate::test_catalog::data_path();
 
     let prep: i64 = 921_000;
     let mask: i64 = 921_001;
@@ -1115,8 +1099,8 @@ async fn stream_ducklake_batches_streams_rows_and_empty_schema_branch() {
 #[serial_test::serial]
 #[cfg(feature = "integration")]
 async fn stream_ducklake_batches_propagates_query_error() {
-    let connstr = delete_test_catalog_connstr();
-    let data_path = delete_test_data_path();
+    let connstr = crate::test_catalog::connstr();
+    let data_path = crate::test_catalog::data_path();
     let items: Vec<_> = stream_ducklake_batches(
         pooled_conn(&connstr, &data_path),
         "SELECT * FROM qiita_lake.does_not_exist_table".to_string(),
@@ -1763,8 +1747,8 @@ async fn replay_safe_actions_matches_dispatcher() {
 #[serial_test::serial]
 #[cfg(feature = "integration")]
 fn register_files_moves_and_registers_end_to_end() {
-    let connstr = delete_test_catalog_connstr();
-    let data_path = delete_test_data_path();
+    let connstr = crate::test_catalog::connstr();
+    let data_path = crate::test_catalog::data_path();
 
     // Unique ids so leftover rows never collide with other serial tests.
     let ref_idx: i64 = 970_000;
@@ -1965,8 +1949,8 @@ fn assembly_register_payload(
 #[serial_test::serial]
 #[cfg(feature = "integration")]
 fn register_files_replaces_shared_contigs_across_assembly_runs() {
-    let connstr = delete_test_catalog_connstr();
-    let data_path = delete_test_data_path();
+    let connstr = crate::test_catalog::connstr();
+    let data_path = crate::test_catalog::data_path();
 
     let a_only: i64 = 971_010;
     let shared: i64 = 971_011;
@@ -2104,8 +2088,8 @@ fn register_files_replaces_shared_contigs_across_assembly_runs() {
 #[serial_test::serial]
 #[cfg(feature = "integration")]
 fn register_files_re_registering_the_same_contigs_does_not_accumulate() {
-    let connstr = delete_test_catalog_connstr();
-    let data_path = delete_test_data_path();
+    let connstr = crate::test_catalog::connstr();
+    let data_path = crate::test_catalog::data_path();
 
     let feature: i64 = 971_020;
     let base_ticket: i64 = 971_100_000 + std::process::id() as i64;
@@ -2248,8 +2232,8 @@ fn lake_count(conn: &Connection, sql: &str) -> i64 {
 #[serial_test::serial]
 #[cfg(feature = "integration")]
 fn register_files_re_registering_a_tickets_reads_leaves_one_copy() {
-    let connstr = delete_test_catalog_connstr();
-    let data_path = delete_test_data_path();
+    let connstr = crate::test_catalog::connstr();
+    let data_path = crate::test_catalog::data_path();
 
     let prep_sample: i64 = 972_556;
     let ticket: i64 = 972_100_000 + std::process::id() as i64;
@@ -2399,8 +2383,8 @@ fn register_read_files(
 #[serial_test::serial]
 #[cfg(feature = "integration")]
 fn register_files_decides_per_read_prep_sample() {
-    let connstr = delete_test_catalog_connstr();
-    let data_path = delete_test_data_path();
+    let connstr = crate::test_catalog::connstr();
+    let data_path = crate::test_catalog::data_path();
 
     let held: i64 = 972_557;
     let new: i64 = 972_558;
@@ -2467,8 +2451,8 @@ fn register_files_decides_per_read_prep_sample() {
 #[serial_test::serial]
 #[cfg(feature = "integration")]
 fn register_files_leaves_reads_another_ticket_registered() {
-    let connstr = delete_test_catalog_connstr();
-    let data_path = delete_test_data_path();
+    let connstr = crate::test_catalog::connstr();
+    let data_path = crate::test_catalog::data_path();
 
     let held: i64 = 972_561;
     let owner: i64 = 972_400_000 + std::process::id() as i64;
@@ -2531,8 +2515,8 @@ fn register_files_leaves_reads_another_ticket_registered() {
 #[serial_test::serial]
 #[cfg(feature = "integration")]
 fn register_files_replaces_a_tickets_rows_from_a_file_spanning_prep_samples() {
-    let connstr = delete_test_catalog_connstr();
-    let data_path = delete_test_data_path();
+    let connstr = crate::test_catalog::connstr();
+    let data_path = crate::test_catalog::data_path();
 
     let first: i64 = 972_565;
     let second: i64 = 972_566;
@@ -2619,8 +2603,8 @@ fn register_files_replaces_a_tickets_rows_from_a_file_spanning_prep_samples() {
 #[serial_test::serial]
 #[cfg(feature = "integration")]
 fn register_files_replaces_run_scoped_tables_on_the_whole_key() {
-    let connstr = delete_test_catalog_connstr();
-    let data_path = delete_test_data_path();
+    let connstr = crate::test_catalog::connstr();
+    let data_path = crate::test_catalog::data_path();
 
     // prep_sample A run P is the re-run under test; prep_sample B run P shares
     // its processing_idx and prep_sample A run Q shares its prep_sample_idx, so
@@ -2827,8 +2811,8 @@ fn register_files_replaces_run_scoped_tables_on_the_whole_key() {
 #[serial_test::serial]
 #[cfg(feature = "integration")]
 fn an_empty_bin_quality_still_supersedes_the_runs_rows() {
-    let connstr = delete_test_catalog_connstr();
-    let data_path = delete_test_data_path();
+    let connstr = crate::test_catalog::connstr();
+    let data_path = crate::test_catalog::data_path();
 
     let prep_sample: i64 = 974_010;
     let run: i64 = 974_020;
@@ -2939,8 +2923,8 @@ fn an_empty_bin_quality_still_supersedes_the_runs_rows() {
 #[serial_test::serial]
 #[cfg(feature = "integration")]
 fn replace_key_tables_match_the_lake_schema() {
-    let connstr = delete_test_catalog_connstr();
-    let data_path = delete_test_data_path();
+    let connstr = crate::test_catalog::connstr();
+    let data_path = crate::test_catalog::data_path();
     let conn = Connection::open_in_memory().unwrap();
     ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
     setup_full_lake(&conn);
@@ -2974,8 +2958,8 @@ fn replace_key_tables_match_the_lake_schema() {
 #[serial_test::serial]
 #[cfg(feature = "integration")]
 fn every_content_addressed_lake_table_is_registered() {
-    let connstr = delete_test_catalog_connstr();
-    let data_path = delete_test_data_path();
+    let connstr = crate::test_catalog::connstr();
+    let data_path = crate::test_catalog::data_path();
     let conn = Connection::open_in_memory().unwrap();
     ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
     setup_full_lake(&conn);
@@ -3044,8 +3028,8 @@ fn every_content_addressed_lake_table_is_registered() {
 #[serial_test::serial]
 #[cfg(feature = "integration")]
 fn alignment_delete_covers_every_alignment_scoped_lake_table() {
-    let connstr = delete_test_catalog_connstr();
-    let data_path = delete_test_data_path();
+    let connstr = crate::test_catalog::connstr();
+    let data_path = crate::test_catalog::data_path();
     let conn = Connection::open_in_memory().unwrap();
     ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
     setup_full_lake(&conn);
@@ -3129,8 +3113,8 @@ fn alignment_delete_covers_every_alignment_scoped_lake_table() {
 #[serial_test::serial]
 #[cfg(feature = "integration")]
 fn concurrent_registrations_of_one_feature_leave_one_row() {
-    let connstr = delete_test_catalog_connstr();
-    let data_path = delete_test_data_path();
+    let connstr = crate::test_catalog::connstr();
+    let data_path = crate::test_catalog::data_path();
 
     let shared: i64 = 973_010;
     let base_ticket: i64 = 973_000_000 + std::process::id() as i64;
@@ -3227,8 +3211,8 @@ fn concurrent_registrations_of_one_feature_leave_one_row() {
 #[serial_test::serial]
 #[cfg(feature = "integration")]
 fn register_files_replaces_sequences_shared_across_references() {
-    let connstr = delete_test_catalog_connstr();
-    let data_path = delete_test_data_path();
+    let connstr = crate::test_catalog::connstr();
+    let data_path = crate::test_catalog::data_path();
 
     let shared: i64 = 972_010;
     let b_only: i64 = 972_011;
@@ -3349,8 +3333,8 @@ fn register_files_replaces_sequences_shared_across_references() {
 #[serial_test::serial]
 #[cfg(feature = "integration")]
 fn register_ducklake_add_data_files_rolls_back_within_transaction() {
-    let connstr = delete_test_catalog_connstr();
-    let data_path = delete_test_data_path();
+    let connstr = crate::test_catalog::connstr();
+    let data_path = crate::test_catalog::data_path();
 
     let ref_idx: i64 = 972_000;
     let feat: i64 = 972_010;
@@ -3411,8 +3395,8 @@ fn register_ducklake_add_data_files_rolls_back_within_transaction() {
 #[serial_test::serial]
 #[cfg(feature = "integration")]
 fn sync_reference_exclusion_full_replace_is_idempotent() {
-    let connstr = delete_test_catalog_connstr();
-    let data_path = delete_test_data_path();
+    let connstr = crate::test_catalog::connstr();
+    let data_path = crate::test_catalog::data_path();
     let conn = Connection::open_in_memory().unwrap();
     ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
     // ensure_exclusion_tables also (re)creates the _visible views, which
@@ -3544,8 +3528,8 @@ fn sync_reference_exclusion_full_replace_is_idempotent() {
 #[serial_test::serial]
 #[cfg(feature = "integration")]
 fn export_read_writes_prep_sample_parquet() {
-    let connstr = delete_test_catalog_connstr();
-    let data_path = delete_test_data_path();
+    let connstr = crate::test_catalog::connstr();
+    let data_path = crate::test_catalog::data_path();
     let conn = Connection::open_in_memory().unwrap();
     ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
     ducklake::ensure_read_tables(&conn).unwrap();
@@ -3680,8 +3664,8 @@ fn bind_block_read_doget(
 #[serial_test::serial]
 #[cfg(feature = "integration")]
 fn read_block_selector_streams_union_and_excludes_gap_and_split() {
-    let connstr = delete_test_catalog_connstr();
-    let data_path = delete_test_data_path();
+    let connstr = crate::test_catalog::connstr();
+    let data_path = crate::test_catalog::data_path();
     let conn = Connection::open_in_memory().unwrap();
     ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
     ducklake::ensure_read_tables(&conn).unwrap();
@@ -3792,8 +3776,8 @@ fn read_block_selector_streams_union_and_excludes_gap_and_split() {
 #[serial_test::serial]
 #[cfg(feature = "integration")]
 fn read_masked_block_selector_streams_only_pass_rows_for_mask() {
-    let connstr = delete_test_catalog_connstr();
-    let data_path = delete_test_data_path();
+    let connstr = crate::test_catalog::connstr();
+    let data_path = crate::test_catalog::data_path();
     let conn = Connection::open_in_memory().unwrap();
     ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
     ducklake::ensure_read_tables(&conn).unwrap();
@@ -3914,8 +3898,8 @@ fn read_masked_block_selector_streams_only_pass_rows_for_mask() {
 #[serial_test::serial]
 #[cfg(feature = "integration")]
 fn read_block_selector_split_member_not_at_max_is_exact() {
-    let connstr = delete_test_catalog_connstr();
-    let data_path = delete_test_data_path();
+    let connstr = crate::test_catalog::connstr();
+    let data_path = crate::test_catalog::data_path();
     let conn = Connection::open_in_memory().unwrap();
     ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
     ducklake::ensure_read_tables(&conn).unwrap();
@@ -5027,8 +5011,8 @@ async fn build_query_alignment_visible_streams_projected_columns() {
     // prep_sample_idx scope must exclude out-of-cohort rows. No exclusions are
     // seeded here (a sibling test covers the anti-join); this pins projection +
     // scope over the view.
-    let connstr = delete_test_catalog_connstr();
-    let data_path = delete_test_data_path();
+    let connstr = crate::test_catalog::connstr();
+    let data_path = crate::test_catalog::data_path();
 
     let align: i64 = 962_000;
     let prep_a: i64 = 962_010;
@@ -5122,8 +5106,8 @@ async fn build_query_alignment_visible_streams_projected_columns() {
 #[serial_test::serial]
 #[cfg(feature = "integration")]
 async fn alignment_visible_doget_omits_blocked_feature() {
-    let connstr = delete_test_catalog_connstr();
-    let data_path = delete_test_data_path();
+    let connstr = crate::test_catalog::connstr();
+    let data_path = crate::test_catalog::data_path();
 
     let align: i64 = 976_000;
     let prep: i64 = 976_010;
@@ -5376,8 +5360,8 @@ fn doget_fixture(
     prep: i64,
     cols: &[&str],
 ) -> (QiitaFlightService, Vec<u8>, tempfile::TempDir) {
-    let connstr = delete_test_catalog_connstr();
-    let data_path = delete_test_data_path();
+    let connstr = crate::test_catalog::connstr();
+    let data_path = crate::test_catalog::data_path();
     {
         let conn = Connection::open_in_memory().unwrap();
         ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
@@ -5640,8 +5624,8 @@ fn projection_allowlist_matches_the_alignment_schema_exactly() {
     let conn = Connection::open_in_memory().unwrap();
     ducklake::connect_ducklake(
         &conn,
-        &delete_test_catalog_connstr(),
-        &delete_test_data_path(),
+        &crate::test_catalog::connstr(),
+        &crate::test_catalog::data_path(),
     )
     .unwrap();
     ducklake::ensure_reference_tables(&conn).unwrap();
@@ -6060,8 +6044,8 @@ fn files_read_for(conn: &Connection, query: &str) -> i64 {
 #[serial_test::serial]
 #[cfg(feature = "integration")]
 fn block_read_selector_prunes_and_scales() {
-    let connstr = delete_test_catalog_connstr();
-    let data_path = delete_test_data_path();
+    let connstr = crate::test_catalog::connstr();
+    let data_path = crate::test_catalog::data_path();
     let conn = Connection::open_in_memory().unwrap();
     ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
     // Hermetic + re-runnable: drop any prior `read` registrations (leftover
@@ -6223,8 +6207,8 @@ fn block_read_selector_prunes_and_scales() {
 #[serial_test::serial]
 #[cfg(feature = "integration")]
 fn bench_merged_file_rowgroup_pruning() {
-    let connstr = delete_test_catalog_connstr();
-    let data_path = delete_test_data_path();
+    let connstr = crate::test_catalog::connstr();
+    let data_path = crate::test_catalog::data_path();
     let conn = Connection::open_in_memory().unwrap();
     ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
     conn.execute_batch(
@@ -6359,8 +6343,8 @@ fn bench_merged_file_rowgroup_pruning() {
 #[serial_test::serial]
 #[cfg(feature = "integration")]
 fn mint_phylogeny_edge_id_is_all_or_nothing_and_replay_safe() {
-    let connstr = delete_test_catalog_connstr();
-    let data_path = delete_test_data_path();
+    let connstr = crate::test_catalog::connstr();
+    let data_path = crate::test_catalog::data_path();
     let conn = Connection::open_in_memory().unwrap();
     ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
     ducklake::ensure_reference_tables(&conn).unwrap();

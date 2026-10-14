@@ -10,7 +10,7 @@ from qiita_common.api_paths import (
     compute_upload_staging_path,
 )
 from qiita_common.backend_failure import BackendFailure, FailureKind
-from qiita_common.data_plane_errors import is_data_plane_busy
+from qiita_common.data_plane_errors import is_data_plane_transient
 from qiita_common.models import (
     UploadStatus,
     WorkTicketFailureStage,
@@ -44,99 +44,13 @@ def _submission_bad_input(reason: str) -> BackendFailure:
     )
 
 
-# Postgres SQLSTATE 40001 signature. The data plane's DuckLake catalog writes run
-# under serializable isolation, so a concurrent-attach race surfaces this exact
-# text — but stringified through the pyarrow FlightError the DP returns, so there
-# is no typed asyncpg exception to isinstance against at this layer (unlike
-# `_is_transient_db_error`, which matches the CP's OWN asyncpg errors). Match the
-# message. See FailureKind.DATA_PLANE_TRANSIENT.
-_DP_SERIALIZATION_SIGNATURE = "could not serialize access due to concurrent update"
-
-# gRPC UNAVAILABLE signatures. A data-plane fetch that can't reach the DP surfaces
-# as a pyarrow FlightUnavailableError — the DP momentarily saturated by a fan-out,
-# restarting during a deploy, or briefly unreachable. This is transient by
-# definition (gRPC's own retriable status): a redrive self-heals once the DP is
-# back, so it must NOT be filed as a permanent bad-input. Matched by message for
-# the same reason as the serialization signature (no typed exception at this
-# layer); any one substring is sufficient.
-#
-# pyarrow renders a Flight error TWO ways, and the difference decides which
-# substrings can fire. A client-side failure gives "Flight returned unavailable
-# error, with message: failed to connect to all addresses…" — the first three match
-# that, and it is the form every CP->DP failure reproduced so far takes (nothing
-# listening, and a server that has gone away). A status the server puts on the wire
-# gives "<message>. Detail: Unavailable. gRPC client debug context: …" with the class
-# name absent, which none of the first three match.
-#
-# The fourth signature covers that second form, which the data plane does produce: it
-# answers `unavailable` when it cannot open a DuckLake connection — the catalog
-# unreachable or at its connection limit (`qiita-data-plane/src/pool.rs`). A status
-# gRPC defines as retriable must not classify permanent on a stringification detail.
-_DP_UNAVAILABLE_SIGNATURES = (
-    "flightunavailableerror",
-    "flight returned unavailable",
-    "failed to connect to all addresses",
-    "detail: unavailable",
-)
-
-# Expired-token signatures, BOTH required. A Flight token carries a TTL
-# (`auth/tickets.py` DEFAULT_TTL_SECONDS) that the data plane checks when the call
-# arrives, so a token that ages out in transit comes back as the data plane's
-# `AuthError::Expired` text under a gRPC unauthenticated status. The next attempt
-# mints a fresh token, so a redrive self-heals it exactly as the two signatures
-# above do.
-#
-# The expiry text alone is too loose — "ticket" names both a Flight ticket and a
-# work_ticket here, and "work ticket expired" contains it. The unauthenticated
-# marker is what makes it a Flight auth failure, and it survives both of pyarrow's
-# renderings: the message-prefix form spells "unauthenticated error", the
-# server-returned form appends "Detail: Unauthenticated". The class name alone is too loose
-# in the other direction: every AuthError variant maps to unauthenticated, and
-# `invalid signature` / `malformed payload` never self-heal. A test parses the data
-# plane's `AuthError` Display impl so a reword there fails rather than silently
-# reverting every expiry to permanent.
-_DP_TICKET_EXPIRED_SIGNATURES = ("unauthenticated", "ticket expired")
-
-
-def _is_dp_serialization_conflict(exc: BaseException) -> bool:
-    """True if a data-plane Flight failure is a transient, retriable serialization
-    conflict (SQLSTATE 40001) rather than a permanent bad-input / DP-down error."""
-    return _DP_SERIALIZATION_SIGNATURE in str(exc)
-
-
-def _is_dp_unavailable(exc: BaseException) -> bool:
-    """True if a data-plane Flight failure is a transient gRPC UNAVAILABLE (the DP
-    could not be reached), rather than a permanent bad-input error."""
-    text = str(exc).lower()
-    return any(sig in text for sig in _DP_UNAVAILABLE_SIGNATURES)
-
-
-def _is_dp_busy(exc: BaseException) -> bool:
-    """True if a data-plane Flight failure is the data plane refusing the request for
-    want of a free DuckLake connection, rather than a permanent bad-input error."""
-    return is_data_plane_busy(exc)
-
-
-def _is_dp_ticket_expired(exc: BaseException) -> bool:
-    """True if a data-plane Flight failure is an expired signing token, rather than
-    a permanent auth failure (bad signature, malformed payload) or a bad input."""
-    text = str(exc).lower()
-    return all(sig in text for sig in _DP_TICKET_EXPIRED_SIGNATURES)
-
-
 def _is_retriable_dp_error(exc: BaseException) -> bool:
-    """True if a data-plane Flight fetch failed for a transient, retriable reason —
-    a serialization conflict (concurrent DuckLake attach), the DP being briefly
-    unreachable, the DP refusing the request because every DuckLake connection in its
-    pool is in use, or a signing token that expired before the call reached the DP —
-    any of which a redrive self-heals. Everything else is a permanent bad-input an
-    operator must resolve."""
-    return (
-        _is_dp_serialization_conflict(exc)
-        or _is_dp_unavailable(exc)
-        or _is_dp_busy(exc)
-        or _is_dp_ticket_expired(exc)
-    )
+    """True if a data-plane Flight fetch failed for a transient, retriable reason, any
+    of which a redrive self-heals. Everything else is a permanent bad-input an operator
+    must resolve. Which conditions those are, and the signatures they match on, live in
+    `qiita_common.data_plane_errors` — shared with the orchestrator's native-job
+    dispatcher so one reword in the data plane cannot leave the two disagreeing."""
+    return is_data_plane_transient(exc)
 
 
 def _submission_dp_fetch_failure(reason: str, exc: BaseException) -> BackendFailure:
