@@ -988,9 +988,6 @@ def _handle_mask_purge_failed(args: argparse.Namespace, parser: argparse.Argumen
     except (RuntimeError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
-    except httpx.HTTPStatusError as exc:
-        _common.print_http_status_error(exc.response)
-        return 1
 
     mode = "EXECUTED" if report["executed"] else "DRY-RUN (no writes; pass --execute to commit)"
     print(f"mask purge-failed [{mode}]")

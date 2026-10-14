@@ -252,6 +252,9 @@ def _handle_masked_read_export(args: argparse.Namespace, parser: argparse.Argume
     except httpx.HTTPStatusError as exc:
         _common.print_http_status_error(exc.response)
         return 1
+    except httpx.RequestError as exc:
+        _common.print_request_error(exc)
+        return 1
 
     samples = manifest["samples"]
     run_idx = manifest["sequencing_run_idx"]
@@ -384,6 +387,9 @@ def _handle_masked_read_export(args: argparse.Namespace, parser: argparse.Argume
             exported += 1
     except httpx.HTTPStatusError as exc:
         _common.print_http_status_error(exc.response)
+        return 1
+    except httpx.RequestError as exc:
+        _common.print_request_error(exc)
         return 1
     finally:
         flight_client.close()

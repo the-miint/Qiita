@@ -170,6 +170,9 @@ def _handle_reference_load(args: argparse.Namespace, parser: argparse.ArgumentPa
     except _httpx.HTTPStatusError as exc:
         _common.print_http_status_error(exc.response)
         return 1
+    except _httpx.RequestError as exc:
+        _common.print_request_error(exc)
+        return 1
     except _flight.FlightError as exc:
         # Catch the gRPC-level error explicitly so the operator sees a
         # formatted error line instead of a raw traceback. FlightError is
@@ -488,6 +491,9 @@ def _handle_reference_genome_export(
             )
     except _common.httpx.HTTPStatusError as exc:
         _common.print_http_status_error(exc.response)
+        return 1
+    except _common.httpx.RequestError as exc:
+        _common.print_request_error(exc)
         return 1
     except flight.FlightError as exc:
         print(f"flight error: {exc}", file=sys.stderr)

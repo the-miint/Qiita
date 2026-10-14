@@ -734,6 +734,38 @@ def test_owner_biosample_id_write_failure_preserves_existing_file(monkeypatch, t
     assert leftovers == [], f"stray temp files left behind: {leftovers}"
 
 
+def test_owner_biosample_id_unreachable_control_plane_is_one_line(monkeypatch, tmp_path, capsys):
+    """A connection failure (no HTTP response at all) is one stderr line naming
+    the URL it tried, and exit 1, not a traceback; no file is written."""
+    from qiita_control_plane.cli import _common
+    from qiita_control_plane.cli import admin as cli
+
+    monkeypatch.setenv("QIITA_TOKEN", "qk_admin")
+
+    def unreachable(method, url, **kwargs):
+        raise httpx.ConnectError("Connection refused", request=httpx.Request(method, url))
+
+    monkeypatch.setattr(_common.httpx, "request", unreachable)
+
+    out = tmp_path / "owner.tsv"
+    rc = cli.main(
+        [
+            "--base-url",
+            "http://localhost:9999",
+            "owner-biosample-id",
+            "--study-idx",
+            "7",
+            "--output",
+            str(out),
+        ]
+    )
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert err.count("\n") == 1
+    assert "could not reach http://localhost:9999" in err
+    assert not out.exists()
+
+
 # ---------------------------------------------------------------------------
 # masked-read-export (parquet path)
 # ---------------------------------------------------------------------------
@@ -1498,6 +1530,63 @@ def test_masked_read_export_overwrites_changed_parquet(monkeypatch, tmp_path):
     assert fake_cls.instances[-1].do_action_calls == [42]
     assert fake_cls.instances[-1].do_get_calls == [42]
     assert pq.ParquetFile(out_dir / "SAMN_A.5.7.42.parquet").metadata.num_rows == 2
+
+
+# The manifest GET runs before the per-sample loop and the ticket POST inside
+# it; each sits under its own except arms.
+@pytest.mark.parametrize("unreachable_method", ["GET", "POST"])
+def test_masked_read_export_unreachable_control_plane_is_one_line(
+    monkeypatch, tmp_path, capsys, unreachable_method
+):
+    """A connection failure (no HTTP response at all) is one stderr line naming
+    the URL it tried, and exit 1, not a traceback, whichever request hits it."""
+    import pyarrow as pa
+
+    from qiita_control_plane.cli import _common
+    from qiita_control_plane.cli import admin as cli
+
+    monkeypatch.setenv("QIITA_TOKEN", "qk_admin")
+    manifest = {
+        "sequenced_pool_idx": 7,
+        "sequencing_run_idx": 5,
+        "mask_idx": 3,
+        "samples": [{"prep_sample_idx": 42, "biosample_accession": "SAMN_A"}],
+    }
+    serve = _fake_masked_export_http(manifest)
+
+    def fake_request(method, url, **kwargs):
+        if method == unreachable_method:
+            raise httpx.ConnectError("Connection refused", request=httpx.Request(method, url))
+        return serve(method, url, **kwargs)
+
+    monkeypatch.setattr(_common.httpx, "request", fake_request)
+    fake_cls = _fake_flight_client_class({42: pa.table({"read_id": ["r"], "sequence1": ["A"]})})
+    monkeypatch.setattr("pyarrow.flight.FlightClient", fake_cls)
+
+    out_dir = tmp_path / "exp"
+    out_dir.mkdir()
+    rc = cli.main(
+        [
+            "--base-url",
+            "http://localhost:9999",
+            "masked-read-export",
+            "--sequenced-pool-idx",
+            "7",
+            "--mask-idx",
+            "3",
+            "--format",
+            "parquet",
+            "--output-dir",
+            str(out_dir),
+            "--data-plane-url",
+            "grpc://dp:50051",
+        ]
+    )
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert err.count("\n") == 1
+    assert "could not reach http://localhost:9999" in err
+    assert list(out_dir.iterdir()) == []
 
 
 # ---------------------------------------------------------------------------

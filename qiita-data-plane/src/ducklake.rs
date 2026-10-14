@@ -844,17 +844,16 @@ pub fn ensure_registration_lock(conn: &Connection) -> Result<(), Box<dyn std::er
     Ok(())
 }
 
-/// Create every lake table the data plane relies on. The data plane runs this
-/// at boot, and the Flight test harness runs the same function, so a test
-/// catalog holds exactly the tables a deploy does.
+/// Create every lake table the data plane relies on. This is the one list of
+/// them: a caller that needs a catalog shaped like a deploy's calls this rather
+/// than combining the `ensure_*` functions itself.
 pub fn ensure_lake_tables(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
     ensure_reference_tables(conn)?;
     ensure_read_tables(conn)?;
     ensure_alignment_tables(conn)?;
     ensure_assembly_tables(conn)?;
     ensure_amplicon_tables(conn)?;
-    // The row concurrent registrations into the replace-keyed tables contend
-    // for. Seeded here so no request path has to create it.
+    // Seeded here so no request path has to create it.
     ensure_registration_lock(conn)?;
     // Must run after reference + alignment tables — the `_visible` views join them.
     ensure_exclusion_tables(conn)?;

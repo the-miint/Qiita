@@ -253,6 +253,9 @@ def _handle_submit_reads(args: argparse.Namespace, parser: argparse.ArgumentPars
     except _httpx.HTTPStatusError as exc:
         _common.print_http_status_error(exc.response)
         return 1
+    except _httpx.RequestError as exc:
+        _common.print_request_error(exc)
+        return 1
     except _flight.FlightError as exc:
         # FlightError is not a RuntimeError subclass, so the catch-all below
         # would miss it and the operator would get a raw traceback.

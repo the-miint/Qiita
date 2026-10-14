@@ -102,6 +102,9 @@ def _handle_owner_biosample_id(args: argparse.Namespace, parser: argparse.Argume
     except httpx.HTTPStatusError as exc:
         _common.print_http_status_error(exc.response)
         return 1
+    except httpx.RequestError as exc:
+        _common.print_request_error(exc)
+        return 1
 
     try:
         n = _write_owner_biosample_id_tsv(body, output)
