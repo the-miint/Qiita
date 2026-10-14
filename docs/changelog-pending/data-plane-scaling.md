@@ -1,0 +1,21 @@
+### Added
+
+- **Data-plane scaling is host configuration rendered on every deploy, and can include data planes on other hosts (#363).**
+  Three keys in `/etc/qiita/data-plane.env` — `QIITA_DATA_PLANE_PORTS` (default `50051`),
+  `QIITA_DATA_PLANE_PEERS` (default none) and `QIITA_DATA_PLANE_BIND_HOST` (default
+  `127.0.0.1`) — decide what `activate.sh` renders into the nginx `qiita_data_plane`
+  upstream, which `qiita-data-plane@<port>` units it enables and restarts, and what
+  `verify-deploy` checks: `health/data-plane@<port>` per instance (replacing the single
+  `health/data-plane` row), `health/data-plane-peer@<host:port>` per peer, and
+  `health/data-plane-lb`. Before, the upstream was a checked-in literal the deploy
+  overwrote and only `@50051` was restarted, so an added instance lost its upstream entry
+  and kept running old code after the next deploy. The keys are validated, and peer names
+  resolved, before anything is installed, and the rendered nginx config is tested before
+  any service restarts; one `nginx -t` rejects is replaced by the config it overwrote,
+  so the next nginx start does not fail on it. nginx also serves the upstream on a loopback
+  listener, `127.0.0.1:50050`, which the control plane uses when
+  `DATA_PLANE_URL=grpc://127.0.0.1:50050`. `make preflight` gains `selinux/lb-port`, which
+  fails on an Enforcing host where that port is not labelled `http_port_t`. `make deploy`
+  prints the `local-deploy.sh` / `make redeploy` command instead of a hand copy of
+  `deploy/nginx/qiita.conf`, a template that fails `nginx -t` unrendered. Procedure:
+  `docs/runbooks/data-plane-scaling.md`.
