@@ -307,7 +307,7 @@ clean:
 
 ## CI (GitHub Actions)
 
-CI is defined in [`.github/workflows/ci.yml`](../../.github/workflows/ci.yml). The file's own comments explain each job and are the one place its rationale is written, so this section does not copy it. What the file cannot say about itself:
+CI is defined in [`.github/workflows/ci.yml`](../../.github/workflows/ci.yml). Where the file's comments give the reason for a job or step, that comment is the one place it is written, so this section does not copy it. What the file cannot say about itself:
 
 - **Jobs.** The `config` job runs first and picks the OS list. `lint-python` and `rust` follow, then `test-python`, `test-control-plane-with-db`, `test-integration` and `test-workflows`, each waiting on the jobs named in its `needs:`. `deploy-note-check` and `changelog-check` run on pull requests only.
 - **OS matrix.** A pull request runs the matrix jobs on Ubuntu only. A push to `main` runs them on Ubuntu and macOS. `test-workflows` is always Ubuntu-only.
