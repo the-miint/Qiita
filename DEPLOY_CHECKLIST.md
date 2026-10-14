@@ -18,14 +18,16 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
 - `[operator]` (#NNN) `data-plane.env` gains five optional vars, all documented in
   `.env.data-plane.example`: `DUCKLAKE_POOL_SIZE`, `DUCKDB_THREADS`, `DUCKDB_MEMORY_LIMIT`,
   `DUCKDB_TEMP_DIRECTORY`, `DUCKDB_MAX_TEMP_DIRECTORY_SIZE`. Left unset the data plane derives
-  all of them at boot from the memory it finds free, and starts — with one exception: boot
-  fails if the pool size leaves under 256 MiB per connection, naming both ways out. Setting
-  `DUCKDB_MEMORY_LIMIT` explicitly is what stops boot depending on how much was free at the
-  moment of a restart. The pool size is worth setting deliberately too, because it is both
-  the number of requests one data-plane process serves at once and a catalog-connection
-  budget: each attached connection holds one
+  each of them at boot and starts — `memory_limit` from the memory it finds free, `threads`
+  from the CPU allowance, the spill directory from the unit's `HOME`, and the spill cap from a
+  fixed default. One exception: boot fails if the pool size leaves under 256 MiB per
+  connection, naming both ways out. Setting `DUCKDB_MEMORY_LIMIT` explicitly is what stops
+  boot depending on how much was free at the moment of a restart. Set the pool size
+  deliberately as well: it is both the number of DoGets and DoActions one data-plane process
+  serves at once (DoPut is not bounded by it) and a catalog-connection budget: each attached connection holds one
   lake-Postgres backend while it lives, against `max_connections = 100` (3 superuser-reserved)
-  shared with the control plane and every other instance. The default is 8 per instance.
+  shared with the control plane and every other data-plane process. The default is 8 per
+  process.
 
 ### 2. One-time host setup
 
@@ -59,15 +61,15 @@ _None yet._
 ### Notes (no host action)
 
 - (#NNN) Past the pool size, the data plane answers gRPC `RESOURCE_EXHAUSTED` rather than
-  serving the request. The control plane classifies that as retriable, so a pre-loop resolver's
-  ticket is held for redrive rather than failed permanently. **Compute-side readers do not
-  retry a refusal yet** — the client half is tracked separately — so a fan-out wider than the
-  pool turns into held or retried work rather than slow work. Where a refusal lands today:
+  serving the request, so a fan-out wider than the pool turns into held or retried work
+  rather than slow work. No client retries the call itself. Where a refusal lands today:
   a native job step gets `data_plane_transient` and the runner re-dispatches it within the
   ticket's `max_retries`; a control-plane pre-loop fetch is held for an operator redrive;
   a DoAction from the control plane's action library (`register_files`, the `delete_*`
-  family) still surfaces it as a permanent failure, which the client-retry work (#539,
-  #582) covers. The Flight edge's own per-address admission (`deploy/nginx/qiita.conf`) is
+  family) still surfaces it as a permanent failure, and so does any data-plane failure
+  other than the refusal raised inside a native job — pyarrow raises those as
+  `FlightError` subclasses, which the dispatcher's arms do not catch. #539 and #582 carry
+  the client half. The Flight edge's own per-address admission (`deploy/nginx/qiita.conf`) is
   what to weigh the pool size against.
 - (#NNN) Per-request wall time rises with the division. A request used to take every core;
   it now takes `threads`, and measured on this host one masked read fitted

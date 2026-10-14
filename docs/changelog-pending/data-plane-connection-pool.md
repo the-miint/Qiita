@@ -1,9 +1,9 @@
 ### Added
 
 - **The data plane holds a bounded pool of DuckLake connections, and refuses work past it
-  (#NNN).** Every DoGet, DoPut and DoAction that touches the lake borrows one attached
-  connection from a pool whose size is the number of requests one data plane serves at once
-  (`DUCKLAKE_POOL_SIZE`, default 8). A request that arrives with every connection in use is
+  (#NNN).** Every DoGet and DoAction borrows one attached connection from a pool whose size
+  is the number of them one data plane serves at once (`DUCKLAKE_POOL_SIZE`, default 8); a
+  DoPut writes Parquet without touching the catalog and is not bounded by it. A request that arrives with every connection in use is
   refused with gRPC `RESOURCE_EXHAUSTED` and a message naming the bound, instead of being
   queued. Each pooled connection carries its own `threads`, `memory_limit`, `temp_directory`
   and `max_temp_directory_size` (`DUCKDB_*`), derived at boot by detecting the process's own

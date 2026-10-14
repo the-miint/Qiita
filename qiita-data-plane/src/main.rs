@@ -230,7 +230,7 @@ mod tests {
     /// What `set_required_env` sets, plus the `HOME` the spill directory derives
     /// from — snapshotted separately from the pool's own vars so neither list is
     /// a copy of the other.
-    const REQUIRED_VARS: &[&'static str] = &[
+    const REQUIRED_VARS: &[&str] = &[
         "FLIGHT_TICKET_PUBLIC_KEY",
         "DUCKLAKE_CATALOG_CONNSTR",
         "PATH_SCRATCH",
@@ -239,7 +239,7 @@ mod tests {
     ];
 
     /// The five optional vars the pool reads.
-    const POOL_VARS: &[&'static str] = &[
+    const POOL_VARS: &[&str] = &[
         "DUCKLAKE_POOL_SIZE",
         "DUCKDB_THREADS",
         "DUCKDB_MEMORY_LIMIT",
@@ -247,10 +247,20 @@ mod tests {
         "DUCKDB_MAX_TEMP_DIRECTORY_SIZE",
     ];
 
-    fn clear_pool_vars() {
+    /// The snapshot guards plus a known starting point: every required var set,
+    /// every optional pool var cleared. The caller holds the guards, so the
+    /// snapshot is restored when its test ends.
+    #[must_use]
+    fn pool_test_env() -> (EnvSnapshot, EnvSnapshot) {
+        let guards = (
+            EnvSnapshot::capture(REQUIRED_VARS),
+            EnvSnapshot::capture(POOL_VARS),
+        );
+        set_required_env();
         for var in POOL_VARS {
             std::env::remove_var(var);
         }
+        guards
     }
 
     /// With nothing configured, the pool still has a bound and every connection
@@ -258,10 +268,7 @@ mod tests {
     #[test]
     #[serial]
     fn pool_settings_are_derived_when_unset() {
-        let _required = EnvSnapshot::capture(REQUIRED_VARS);
-        let _pool = EnvSnapshot::capture(POOL_VARS);
-        set_required_env();
-        clear_pool_vars();
+        let _env = pool_test_env();
         std::env::set_var("HOME", tmp_abs("qiita-test-home"));
 
         let cfg = Settings::from_env().expect("from_env with no pool vars set");
@@ -293,9 +300,7 @@ mod tests {
     #[test]
     #[serial]
     fn pool_settings_are_taken_from_the_environment() {
-        let _required = EnvSnapshot::capture(REQUIRED_VARS);
-        let _pool = EnvSnapshot::capture(POOL_VARS);
-        set_required_env();
+        let _env = pool_test_env();
         let spill = tmp_abs("qiita-test-spill");
         std::env::set_var("DUCKLAKE_POOL_SIZE", "3");
         std::env::set_var("DUCKDB_THREADS", "5");
@@ -315,10 +320,7 @@ mod tests {
     #[test]
     #[serial]
     fn config_rejects_a_pool_that_serves_nothing() {
-        let _required = EnvSnapshot::capture(REQUIRED_VARS);
-        let _pool = EnvSnapshot::capture(POOL_VARS);
-        set_required_env();
-        clear_pool_vars();
+        let _env = pool_test_env();
         std::env::set_var("DUCKLAKE_POOL_SIZE", "0");
         let err = Settings::from_env().unwrap_err();
         assert!(
@@ -338,10 +340,7 @@ mod tests {
     #[test]
     #[serial]
     fn config_rejects_a_relative_spill_directory() {
-        let _required = EnvSnapshot::capture(REQUIRED_VARS);
-        let _pool = EnvSnapshot::capture(POOL_VARS);
-        set_required_env();
-        clear_pool_vars();
+        let _env = pool_test_env();
         std::env::set_var("DUCKDB_TEMP_DIRECTORY", "relative/spill");
         let err = Settings::from_env().unwrap_err();
         assert!(
@@ -357,10 +356,7 @@ mod tests {
     #[test]
     #[serial]
     fn a_pool_too_large_for_the_detected_ceiling_fails_at_boot() {
-        let _required = EnvSnapshot::capture(REQUIRED_VARS);
-        let _pool = EnvSnapshot::capture(POOL_VARS);
-        set_required_env();
-        clear_pool_vars();
+        let _env = pool_test_env();
         // From the constants that do the dividing, so the test cannot drift from
         // them, and from this machine's own ceiling so it holds on any host.
         let ceiling_mib = super::resources::detect_memory_ceiling().bytes / (1024 * 1024);
@@ -382,10 +378,7 @@ mod tests {
     #[test]
     #[serial]
     fn config_rejects_having_nowhere_to_spill() {
-        let _required = EnvSnapshot::capture(REQUIRED_VARS);
-        let _pool = EnvSnapshot::capture(POOL_VARS);
-        set_required_env();
-        clear_pool_vars();
+        let _env = pool_test_env();
         std::env::remove_var("HOME");
         let err = Settings::from_env().unwrap_err();
         assert!(

@@ -167,9 +167,9 @@ const DOGET_BATCH_CHANNEL_DEPTH: usize = 4;
 /// the client always receives a valid (possibly empty) Arrow table. A DuckDB
 /// error — prepare, execute, or a chunk fetch after batches have already gone
 /// out — surfaces as a trailing `Err` item, so a client never reads a truncated
-/// result as a whole one; so does a panic (see `run_producer`). Borrowing an
-/// instance happens before this, in the handler, so a pool with nothing to lend
-/// is a synchronous refusal rather than a stream item.
+/// result as a whole one; so does a panic (see `run_producer`). The connection is
+/// already borrowed when this is called, so a pool with nothing left to lend
+/// never reaches here.
 fn stream_ducklake_batches(
     conn: PooledConnection,
     sql: String,
@@ -626,9 +626,8 @@ impl FlightService for QiitaFlightService {
         // life of the stream: a blocking task feeds RecordBatches through a
         // bounded channel, so the data plane never buffers the whole result set
         // (the non-blocking, memory-bounded path). Ticket/table/query-shape
-        // errors above are returned synchronously, and so is a pool with
-        // nothing left to lend; per-request DB errors surface as a stream item
-        // (see stream_ducklake_batches).
+        // errors above are returned synchronously, and so is a pool with nothing
+        // left to lend; per-request DB errors surface as a stream item.
         let conn = self.pool.checkout()?;
         let batch_stream = stream_ducklake_batches(conn, sql, table);
         // With no codec these options are structurally the encoder default that

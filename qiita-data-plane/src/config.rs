@@ -36,13 +36,13 @@ pub struct Settings {
     /// validates the requested destination resolves under this root.
     pub path_scratch: PathBuf,
     /// Size of the DuckLake connection pool and the resource settings each of
-    /// its instances carries. The size is also the in-flight request bound.
+    /// its connections carries. The size is also the in-flight request bound.
     pub pool: PoolSettings,
     /// The ceiling the pool's memory share was divided from, and which detector
     /// answered. Carried so boot can log both — a number alone does not say
     /// whether it came from a cgroup or from the fallback.
     pub memory_ceiling: MemoryCeiling,
-    /// CPU allowance the per-instance `threads` was divided from.
+    /// CPU allowance each connection's `threads` was divided from.
     pub thread_budget: usize,
 }
 
@@ -65,7 +65,7 @@ const DEFAULT_POOL_SIZE: usize = 8;
 /// (the Arrow batches each stream holds in flight) and the host's other work.
 pub(crate) const CEILING_DIVISOR: u64 = 2;
 
-/// Smallest per-instance `memory_limit` worth deriving: enough for DuckDB to run
+/// Smallest per-connection `memory_limit` worth deriving: enough for DuckDB to run
 /// a streaming scan with a few threads, chosen rather than measured. A share
 /// below it means the pool is too big for the host rather than that the share
 /// should be rounded up — granting the floor anyway would hand out
@@ -73,18 +73,18 @@ pub(crate) const CEILING_DIVISOR: u64 = 2;
 /// instead, naming both ways out.
 pub(crate) const MIN_MEMORY_LIMIT_MIB: u64 = 256;
 
-/// Per-instance ceiling on spill. DuckDB's own default is 90% of the
-/// filesystem holding `temp_directory` — which every instance would claim in
+/// Per-connection ceiling on spill. DuckDB's own default is 90% of the
+/// filesystem holding `temp_directory` — which every connection would claim in
 /// full — so an explicit value is required rather than optional. This one is a
 /// bound, not a sizing: no spill size for a real request has been measured, and
 /// the measured behaviour when the cap is reached is a clean error naming the
 /// setting, with nothing left behind.
 const DEFAULT_MAX_TEMP_DIRECTORY_SIZE: &str = "4GiB";
 
-/// Leaf name of the derived spill directory, under the per-instance `HOME` the
-/// systemd unit sets (its `StateDirectory`, on local disk). Spill must not land
-/// on the shared scratch filesystem that every compute node mounts, and two
-/// instances must not share one directory.
+/// Leaf name of the derived spill directory, under the `HOME` the systemd unit
+/// sets per data-plane process (its `StateDirectory`, on local disk). Spill must
+/// not land on the shared scratch filesystem that every compute node mounts, and
+/// two processes must not share one directory.
 const DERIVED_TEMP_DIRECTORY_LEAF: &str = "duckdb-spill";
 
 impl Settings {
@@ -157,7 +157,7 @@ impl Settings {
         let memory_ceiling = resources::detect_memory_ceiling();
         let thread_budget = resources::detect_thread_budget();
 
-        let size = parse_positive_usize("DUCKLAKE_POOL_SIZE")?.unwrap_or(DEFAULT_POOL_SIZE);
+        let size = parse_positive::<usize>("DUCKLAKE_POOL_SIZE")?.unwrap_or(DEFAULT_POOL_SIZE);
 
         // The CPU allowance divided by the in-flight bound, so a saturated
         // pool asks for the budget once rather than once per request. Measured
@@ -166,7 +166,7 @@ impl Settings {
         // about 509 MiB per thread — an upper bound, since the probe's own
         // expression inflated both axes — so this is the setting that prices
         // concurrency.
-        let threads = parse_positive_u32("DUCKDB_THREADS")?
+        let threads = parse_positive::<u32>("DUCKDB_THREADS")?
             .unwrap_or_else(|| std::cmp::max(1, (thread_budget / size) as u32));
 
         let memory_limit = match env_value("DUCKDB_MEMORY_LIMIT") {
@@ -255,14 +255,6 @@ fn env_value(var: &str) -> Option<String> {
 
 /// `None` when the variable is unset or empty, so each caller states its own
 /// default beside the reasoning for it.
-fn parse_positive_usize(var: &str) -> Result<Option<usize>, String> {
-    parse_positive(var)
-}
-
-fn parse_positive_u32(var: &str) -> Result<Option<u32>, String> {
-    parse_positive(var)
-}
-
 fn parse_positive<T>(var: &str) -> Result<Option<T>, String>
 where
     T: std::str::FromStr + PartialEq + From<u8>,

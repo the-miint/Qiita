@@ -4,9 +4,9 @@
 
 use super::*;
 
-// `flight_service` itself no longer attaches DuckLake — the pool does — so the
-// table-creation helpers these tests call are imported here rather than
-// inherited; only the catalog-backed tests use them.
+// The pool owns attaching DuckLake, so the table-creation helpers these tests
+// call are imported here rather than inherited through `flight_service`; only the
+// catalog-backed tests use them.
 #[cfg(feature = "integration")]
 use crate::ducklake;
 

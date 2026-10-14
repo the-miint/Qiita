@@ -18,6 +18,7 @@ from pathlib import Path
 import pytest
 from pydantic import BaseModel
 from qiita_common.backend_failure import BackendFailure, FailureKind, StepNoData
+from qiita_common.data_plane_errors import DATA_PLANE_BUSY_SIGNATURE
 from qiita_common.models import WorkTicketFailureStage
 
 from qiita_compute_orchestrator.jobs import (
@@ -225,7 +226,7 @@ async def test_value_error_in_execute_maps_to_bad_input(monkeypatch, tmp_path):
 async def test_busy_data_plane_maps_to_a_retriable_failure(monkeypatch, tmp_path):
     """A step whose Flight call is refused because the data plane has no free
     DuckLake connection is overload, not bad data. pyarrow raises `ArrowInvalid` for
-    that gRPC status and `ArrowInvalid` IS a ValueError, so this arm has to be
+    that gRPC status and `ArrowInvalid` is a ValueError, so this arm has to be
     separated from the data-quality one or the ticket records a malformed-input
     reason and never retries."""
     import pyarrow
@@ -241,7 +242,7 @@ async def test_busy_data_plane_maps_to_a_retriable_failure(monkeypatch, tmp_path
         await run_native_job(name, {"x": 1}, tmp_path, step_name="step")
     assert ei.value.kind is FailureKind.DATA_PLANE_TRANSIENT
     assert ei.value.transient is True
-    assert "data plane busy" in ei.value.reason
+    assert DATA_PLANE_BUSY_SIGNATURE in ei.value.reason
 
 
 async def test_a_value_error_that_merely_mentions_the_data_plane_stays_permanent(

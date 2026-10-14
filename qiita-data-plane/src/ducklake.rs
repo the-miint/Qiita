@@ -73,7 +73,7 @@ pub fn connect_ducklake(
 /// These options are PERSISTED in `ducklake_metadata` (catalog-global), so they
 /// only need to be set ONCE per catalog. Call this on the PROCESS-START
 /// connection only — NEVER where an attach happens per request or per pooled
-/// instance (`pool::LakePool::build_instance`). Setting it on every attach made
+/// connection. Setting it on every attach made
 /// each concurrent Flight request UPDATE the same `ducklake_metadata` row, which
 /// serialized and failed under load with Postgres SQLSTATE 40001
 /// (`could not serialize access due to concurrent update`). Keep the values in
@@ -891,10 +891,10 @@ mod tests {
         connect_ducklake(&conn, &connstr, &data_path)
             .expect("failed to connect DuckLake — check DUCKLAKE_CATALOG_CONNSTR");
         // This helper mirrors the production BOOT connection (main.rs): it creates
-        // the tables AND sets the catalog-global Parquet options once. connect_ducklake
-        // no longer does. The options persist in the shared Postgres catalog, so the
-        // pool's instances (flight_service, in tests as in production) inherit them
-        // and correctly do NOT re-set them.
+        // the tables AND sets the catalog-global Parquet options once, which
+        // connect_ducklake does not. The options persist in the shared Postgres
+        // catalog, so a pooled connection (flight_service, in tests as in
+        // production) inherits them and correctly does NOT re-set them.
         set_catalog_options(&conn).expect("failed to set catalog options");
         conn
     }

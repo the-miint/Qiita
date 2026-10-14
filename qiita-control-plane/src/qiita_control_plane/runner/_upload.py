@@ -10,10 +10,7 @@ from qiita_common.api_paths import (
     compute_upload_staging_path,
 )
 from qiita_common.backend_failure import BackendFailure, FailureKind
-from qiita_common.data_plane_errors import (
-    DATA_PLANE_BUSY_SIGNATURE,
-    is_data_plane_busy,
-)
+from qiita_common.data_plane_errors import is_data_plane_busy
 from qiita_common.models import (
     UploadStatus,
     WorkTicketFailureStage,
@@ -71,12 +68,10 @@ _DP_SERIALIZATION_SIGNATURE = "could not serialize access due to concurrent upda
 # gives "<message>. Detail: Unavailable. gRPC client debug context: …" with the class
 # name absent, which none of the first three match.
 #
-# The fourth signature covers that second form. It is not there for an observed
-# failure: the data plane emits no `Status::unavailable` of its own (grep it), so
-# nothing on this path has been shown to produce that rendering. It is there because
-# the rendering is real — pinned from a live pyarrow client in
-# test_dp_fetch_classifier.py — and a status gRPC defines as retriable must not
-# classify permanent on a stringification detail if anything ever does return it.
+# The fourth signature covers that second form, which the data plane does produce: it
+# answers `unavailable` when it cannot open a DuckLake connection — the catalog
+# unreachable or at its connection limit (`qiita-data-plane/src/pool.rs`). A status
+# gRPC defines as retriable must not classify permanent on a stringification detail.
 _DP_UNAVAILABLE_SIGNATURES = (
     "flightunavailableerror",
     "flight returned unavailable",
@@ -101,13 +96,6 @@ _DP_UNAVAILABLE_SIGNATURES = (
 # plane's `AuthError` Display impl so a reword there fails rather than silently
 # reverting every expiry to permanent.
 _DP_TICKET_EXPIRED_SIGNATURES = ("unauthenticated", "ticket expired")
-
-# The data plane refuses a request it has no free DuckLake connection for rather than
-# queueing it — overload, not bad input: the same call succeeds once a connection frees.
-# The signature and why it is the data plane's own wording rather than the gRPC status
-# name live in `qiita_common.data_plane_errors`, which the orchestrator's native-job
-# dispatcher keys on too.
-_DP_BUSY_SIGNATURE = DATA_PLANE_BUSY_SIGNATURE
 
 
 def _is_dp_serialization_conflict(exc: BaseException) -> bool:

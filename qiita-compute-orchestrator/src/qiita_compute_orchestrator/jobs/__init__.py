@@ -31,6 +31,7 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
+import pyarrow
 from pydantic import BaseModel, ValidationError
 from qiita_common.actions import NATIVE_MODULE_PREFIX
 from qiita_common.backend_failure import BackendFailure, FailureKind, StepNoData
@@ -270,13 +271,23 @@ async def run_native_job(
             reason=str(exc),
         ) from exc
     except ValueError as exc:
-        if is_data_plane_busy(exc):
+        if isinstance(exc, pyarrow.ArrowInvalid) and is_data_plane_busy(exc):
             # The data plane refused the step's Flight call because every DuckLake
             # connection in its pool was in use. Retriable, and it has to be
             # separated from the arm below rather than left to it: pyarrow raises
-            # `ArrowInvalid` for that gRPC status, which IS a ValueError, so
-            # otherwise an overload is recorded as a data-quality problem and the
-            # ticket never retries.
+            # `ArrowInvalid` for that gRPC status (measured on 23.0.1 and 25.0.0)
+            # and `ArrowInvalid` is a ValueError, so otherwise an overload is
+            # recorded as a data-quality problem and the ticket never retries.
+            # The type is checked as well as the text because job code
+            # interpolates user-supplied values into its own ValueError messages,
+            # and one carrying this text must not turn a permanent data-quality
+            # failure into something the runner retries to exhaustion.
+            #
+            # The data plane's other transient failures do NOT arrive here:
+            # pyarrow raises gRPC UNAVAILABLE and INTERNAL as `FlightError`
+            # subclasses, which are not ValueErrors, so they escape this
+            # dispatcher and the step fails permanently. Converging that with the
+            # control plane's classifier is tracked separately.
             raise BackendFailure(
                 kind=FailureKind.DATA_PLANE_TRANSIENT,
                 stage=WorkTicketFailureStage.STEP_RUN,

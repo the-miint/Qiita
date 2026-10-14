@@ -18,10 +18,13 @@ Client interfaces are the user-facing layer through which researchers and system
 
 ### Concurrency bound
 
-Every operation that touches the lake borrows one instance from a bounded pool
+Every DoGet and every DoAction borrows one connection from a bounded pool
 ([`qiita-data-plane/src/pool.rs`](../../qiita-data-plane/src/pool.rs)), so the
-pool's size is the number of requests one data plane serves at once. A request
-that arrives with every connection lent out is refused immediately with gRPC
+pool's size is the number of *those* one data plane serves at once. **DoPut is
+not bounded by it** — an upload streams straight to Parquet without touching the
+catalog, so concurrent DoPuts are limited only by the edge's per-address
+admission. A request that arrives with every connection lent out is refused
+immediately with gRPC
 `RESOURCE_EXHAUSTED` and a message naming the bound, rather than queued — the
 reasoning, and the edge limits it rests on, are in `pool.rs`. **No client retries
 the call itself yet.** What a refusal becomes instead depends on the caller: a
@@ -29,12 +32,13 @@ native job step is classified `data_plane_transient` and re-dispatched by the
 runner, a control-plane pre-loop fetch is held for an operator redrive, and a
 DoAction from the action library still fails permanently.
 
-Each pooled instance carries its own `threads`, `memory_limit`, `temp_directory`
+Each pooled connection carries its own `threads`, `memory_limit`, `temp_directory`
 and `max_temp_directory_size`, divided at boot from the memory ceiling the
 process detects for itself and overridable per deploy (`DUCKLAKE_POOL_SIZE` and
 the `DUCKDB_*` vars in `.env.data-plane.example`). The size is a catalog budget
-too: each attached instance holds one lake-Postgres backend for as long as it
-lives, and every instance on every host draws on the same `max_connections`.
+too: each attached connection holds one lake-Postgres backend for as long as it
+lives, and every data-plane process on every host draws on the same
+`max_connections`.
 
 ### DoGet stream compression
 

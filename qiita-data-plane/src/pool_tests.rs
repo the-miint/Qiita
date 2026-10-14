@@ -22,11 +22,8 @@ fn a_pool_of_zero_is_rejected() {
     );
 }
 
-/// The premise the pool's shape rests on: DuckDB's resource settings belong to a
-/// *database*, not to a connection. If they were per connection, one database with
-/// N connections would give the same bound at a fraction of the catalog-backend
-/// cost, and the pool would be the wrong structure. Pinned here so a version bump
-/// that changes it fails a test rather than quietly invalidating the design.
+/// The premise `pool`'s module docs rest on, pinned so a version bump that changes
+/// it fails a test rather than quietly invalidating the design.
 #[test]
 fn duckdb_resource_settings_belong_to_the_database_not_the_connection() {
     let first = Connection::open_in_memory().expect("open");
@@ -44,12 +41,10 @@ fn duckdb_resource_settings_belong_to_the_database_not_the_connection() {
         .expect("read on the sibling");
     assert_eq!(
         seen, "512.0 MiB",
-        "a sibling connection to the same database sees the setting, so settings are \
-         database-scoped"
+        "a sibling connection to the same database sees the setting"
     );
 
-    // Control: a separately opened database does not see it, which is what makes a
-    // pool of databases the thing that bounds per-request cost.
+    // Control: a separately opened database does not.
     let other = Connection::open_in_memory().expect("open a second database");
     let elsewhere: String = other
         .query_row("SELECT current_setting('memory_limit')", [], |row| {
@@ -58,7 +53,7 @@ fn duckdb_resource_settings_belong_to_the_database_not_the_connection() {
         .expect("read on the other database");
     assert_ne!(
         elsewhere, "512.0 MiB",
-        "a separate database must keep its own limit, or pooling instances buys nothing"
+        "a separate database must keep its own limit"
     );
 }
 

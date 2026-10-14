@@ -1,8 +1,9 @@
-//! A bounded pool of attached DuckLake instances. Its size is the in-flight bound.
+//! A bounded pool of attached DuckLake connections. Its size is the in-flight bound.
 //!
 //! Two measurements shape it. DuckDB's resource settings belong to a *database*,
-//! not to a connection, so bounding what one request may spend means pooling
-//! instances rather than connections against one instance. And holding the
+//! not to a connection, so each pool member is its own in-memory DuckDB with its
+//! own attach — N connections against one database would all share one set of
+//! limits, which bounds nothing per request. And holding the
 //! ATTACH is most of what a small request pays: a fresh connect + attach + query
 //! measured 84–107 ms and about 16 catalog transactions, against 3.0–3.4 ms and
 //! about 3.7 once the attach is reused.
@@ -12,8 +13,9 @@
 //! than waiting at the edge: the `limit_conn` and `grpc_read_timeout` in
 //! `deploy/nginx/qiita.conf` already admit and hold far more concurrent requests
 //! per client address than this pool serves, so a queue inside the process would
-//! fill with requests the edge is holding open anyway. Nothing in this repo
-//! retries a refusal yet, and a caller that does not retry gets a failed step.
+//! fill with requests the edge is holding open anyway. No client retries the call
+//! itself; what a refusal becomes instead differs per caller, and
+//! `docs/architecture/flight.md` ("Concurrency bound") is where that lives.
 //!
 //! Instances are built as they are first needed rather than all at boot, because
 //! each one costs a lake-Postgres backend for as long as it lives — the budget
@@ -30,8 +32,9 @@ use tonic::Status;
 
 use crate::ducklake;
 
-/// What every pooled instance is set to. Per instance, not per pool: DuckDB
-/// applies each of these to the database it is set on.
+/// What every pooled connection is set to. Per connection, not per pool: DuckDB
+/// applies each of these to the database it is set on, and each connection has
+/// its own.
 #[derive(Debug, Clone)]
 pub struct PoolSettings {
     /// Instances the pool may hold, and so requests that may be in flight.
@@ -46,7 +49,7 @@ pub struct PoolSettings {
     /// and completed in 22.62 s with one. Which filesystem, and why, is
     /// `config::DERIVED_TEMP_DIRECTORY_LEAF`.
     pub temp_directory: PathBuf,
-    /// Ceiling on that spill, per instance. Measured: it is enforced mid-query,
+    /// Ceiling on that spill, per connection. Measured: it is enforced mid-query,
     /// names itself in the error (`This limit was set by the
     /// 'max_temp_directory_size' setting`) and leaves no files behind. Why it is
     /// set at all rather than left to DuckDB is
@@ -58,10 +61,13 @@ impl PoolSettings {
     /// Checked by every constructor, because all three of these reach DuckDB
     /// inside quoted SQL literals in `apply_settings` — the same way the
     /// connection string and data path do in `ducklake::connect_ducklake` — and
-    /// all three come from the environment. What a *valid* size string looks like
-    /// is DuckDB's business: one it cannot parse fails the first instance build,
-    /// which fails boot.
+    /// all three come from the environment. What a valid value looks like is
+    /// DuckDB's business, and `ducklake::validate_sql_literal` says what happens to
+    /// one it rejects.
     fn validate(&self) -> Result<(), String> {
+        if self.size == 0 {
+            return Err("pool size must be at least 1 — a size of 0 serves no request".into());
+        }
         ducklake::validate_sql_literal(&self.memory_limit, "DUCKDB_MEMORY_LIMIT")?;
         ducklake::validate_sql_literal(
             &self.max_temp_directory_size,
@@ -107,15 +113,12 @@ pub struct LakePool {
 }
 
 impl LakePool {
-    /// Build the pool and its first instance.
+    /// Build the pool and its first connection.
     pub fn open(
         catalog_connstr: String,
         data_path: String,
         settings: PoolSettings,
     ) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
-        if settings.size == 0 {
-            return Err("pool size must be at least 1 — a size of 0 serves no request".into());
-        }
         settings.validate()?;
         // DuckDB does not create this itself; an unwritable path must stop the
         // unit here rather than surface as a failed request under load.
@@ -143,13 +146,13 @@ impl LakePool {
         Ok(pool)
     }
 
-    /// Where DuckLake keeps its Parquet files, for the one handler that moves
-    /// files into it (`flight_service::register_files`).
+    /// Where DuckLake keeps its Parquet files, for a handler that moves files into
+    /// it as well as reading through the connection.
     pub fn data_path(&self) -> &str {
         &self.data_path
     }
 
-    /// Take an instance, or refuse. Never waits — the refusal *is* the in-flight
+    /// Take a connection, or refuse. Never waits — the refusal is the in-flight
     /// bound; see the module docs for why it is not a queue.
     pub fn checkout(self: &Arc<Self>) -> Result<PooledConnection, Status> {
         {
@@ -180,8 +183,8 @@ impl LakePool {
                 // `unavailable`, not `internal`: by the time the pool is serving,
                 // a failed build is the catalog being unreachable or at its
                 // connection limit, which the next attempt can clear. A setting
-                // DuckDB rejects cannot arrive here — `open` builds an instance at
-                // boot, so the unit never starts with one.
+                // DuckDB rejects cannot arrive here — `open` builds one at boot,
+                // so the unit never starts with a setting it will not take.
                 Err(Status::unavailable(format!(
                     "failed to open a DuckLake connection: {e}"
                 )))
@@ -196,7 +199,7 @@ impl LakePool {
         Ok(conn)
     }
 
-    /// The settings an instance carries, applied at build and re-applied when it
+    /// The settings a connection carries, applied at build and re-applied when it
     /// comes back. `preserve_insertion_order` is in the list because a borrower
     /// may change it (the Parquet export does) and the change outlives the
     /// borrow: measured, a connection kept `preserve_insertion_order=false`
@@ -221,11 +224,11 @@ impl LakePool {
         ))
     }
 
-    /// Put an instance back, or discard it. A borrow that failed inside an
+    /// Put a connection back, or discard it. A borrow that failed inside an
     /// explicit transaction leaves the connection *in* that transaction —
     /// measured: a later statement on it saw the uncommitted row and a later
     /// `COMMIT` succeeded, committing writes the failed request had made. So a
-    /// returning instance is rolled back and re-set, and one that will not reset
+    /// returning connection is rolled back and re-set, and one that will not reset
     /// is dropped; its slot goes back to `unbuilt` so the next checkout rebuilds
     /// it and the bound does not quietly shrink.
     fn give_back(&self, conn: Connection) {
@@ -267,8 +270,10 @@ impl LakePool {
     }
 
     /// A pool over plain in-memory DuckDB instances, with no DuckLake attached:
-    /// for tests that need a pool but never reach a catalog. Everything else —
-    /// the bound, the refusal, the reset on return — is the production path.
+    /// for tests that need a pool but never reach a catalog. The bound, the
+    /// refusal and the reset on return are the production path; the lazy build —
+    /// reserving an unbuilt slot, crediting it back when a build fails — is only
+    /// exercised against a real catalog, in the integration test.
     #[cfg(test)]
     pub(crate) fn unattached_for_tests(settings: PoolSettings) -> Arc<Self> {
         settings
@@ -318,7 +323,7 @@ impl std::fmt::Debug for LakePool {
     }
 }
 
-/// An instance on loan. Returns itself to the pool when dropped, so a request
+/// A connection on loan. Returns itself to the pool when dropped, so a request
 /// that fails, panics or has its stream dropped by the client does not leak the
 /// slot.
 pub struct PooledConnection {

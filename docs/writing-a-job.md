@@ -118,6 +118,7 @@ Raise the right thing; the dispatcher maps it:
 |---|---|---|
 | `StepNoData` | `NO_DATA` (terminal, not a failure) | — |
 | `FileNotFoundError`, `ValueError` | `BAD_INPUT` (permanent) | no |
+| a `pyarrow.ArrowInvalid` carrying the data plane's busy refusal | `DATA_PLANE_TRANSIENT` | yes |
 | `NotImplementedError` | `UNKNOWN_PERMANENT` | no |
 | anything else | propagates (logged with traceback) | — |
 

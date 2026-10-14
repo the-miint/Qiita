@@ -1,14 +1,20 @@
 """Unit tests for the data-plane fetch failure classifier (`runner/_upload.py`).
 
-Pins that a DuckLake serialization conflict (Postgres SQLSTATE 40001) surfaced
-over Flight is classified RETRIABLE (`DATA_PLANE_TRANSIENT`), as is an expired
-signing token, while every other DP-fetch failure stays permanent (`BAD_INPUT`) —
-including the other unauthenticated causes, which share the expiry's pyarrow error
-class and gRPC status but not its self-healing. The classifier matches the
-*stringified* pyarrow `FlightError` by message — there is no typed asyncpg
-exception to `isinstance` against at this layer — so a representative real string
-is captured here. If the data plane ever reformats that error, THIS test is what
-fails (rather than every DP fetch silently reverting to permanent in production).
+Pins which DP-fetch failures are RETRIABLE (`DATA_PLANE_TRANSIENT`) — a DuckLake
+serialization conflict (Postgres SQLSTATE 40001) surfaced over Flight, a gRPC
+UNAVAILABLE, the data plane refusing a request for want of a free connection, and an
+expired signing token — while every other DP-fetch failure stays permanent
+(`BAD_INPUT`), including the other unauthenticated causes, which share the expiry's
+pyarrow error class and gRPC status but not its self-healing.
+
+The classifier matches the *stringified* exception by message, because there is no type
+to match on at this layer: the pyarrow class differs per gRPC status (a `FlightError`
+subclass for most, `ArrowInvalid` — a plain `ValueError` — for RESOURCE_EXHAUSTED), and
+the DuckLake conflict arrives as text inside a Flight error rather than as the
+`asyncpg` exception the control plane's own DB errors raise. A representative real
+string is captured here for each. If the data plane ever reformats one of these, THIS
+test is what fails, rather than every DP fetch silently reverting to permanent in
+production.
 """
 
 from __future__ import annotations
@@ -16,10 +22,10 @@ from __future__ import annotations
 from pathlib import Path
 
 from qiita_common.backend_failure import FailureKind
+from qiita_common.data_plane_errors import DATA_PLANE_BUSY_SIGNATURE
 from qiita_common.models import WorkTicketFailureStage
 
 from qiita_control_plane.runner._upload import (
-    _DP_BUSY_SIGNATURE,
     _DP_TICKET_EXPIRED_SIGNATURES,
     _is_dp_busy,
     _is_dp_serialization_conflict,
@@ -31,6 +37,9 @@ from qiita_control_plane.runner._upload import (
 # A representative stringified pyarrow FlightError carrying the Postgres 40001
 # serialization message, as seen verbatim in a real read-mask fan-out
 # failure_reason (the concurrent DuckLake-attach race this classifier exists for).
+# The data plane's sources, which the contract tests below parse rather than restate.
+DATA_PLANE_SRC = Path(__file__).resolve().parents[2] / "qiita-data-plane" / "src"
+
 _REAL_40001 = (
     "FlightInternalError: Flight returned internal error, with message: data plane "
     "stream error: External error: failed to attach DuckLake: Invalid Error: Failed "
@@ -69,8 +78,8 @@ _REAL_EXPIRED = "Flight returned unauthenticated error, with message: ticket exp
 # a pyarrow client raised for that status in a probe (pyarrow 23.0.1, grpcio 1.80.0,
 # a generic gRPC server answering RESOURCE_EXHAUSTED, with gRPC UNAVAILABLE as the
 # control reproducing `_REAL_UNAVAILABLE`'s shape). Note the exception class: pyarrow
-# surfaces this status as `ArrowInvalid`, a ValueError and NOT a FlightError, which is
-# why the classifier matches text rather than a type.
+# surfaces this status as `ArrowInvalid`, a ValueError rather than a FlightError, which
+# is why the classifier matches text rather than a type.
 _REAL_BUSY = (
     "gRPC returned resource exhausted error, with message: data plane busy: all 8 "
     "DuckLake connections are in use; retry. gRPC client debug context: "
@@ -100,9 +109,9 @@ _REAL_BAD_SIGNATURE = "Flight returned unauthenticated error, with message: inva
 # different Detail, and the same status with a different message keeps the Detail —
 # so each half of the expiry match is shown to discriminate.
 #
-# The expiry fixture is what a live data plane produces. The UNAVAILABLE one is NOT
-# known to occur on the CP->DP path — the data plane emits no `Status::unavailable`
-# itself — it pins the rendering so the classifier is right if anything ever does.
+# Both fixtures are shapes a live data plane produces: it answers `unauthenticated` for
+# an expired ticket and `unavailable` when it cannot open a DuckLake connection (the
+# catalog unreachable or at its connection limit).
 _SERVER_RETURNED_EXPIRED = (
     "ticket expired. Detail: Unauthenticated. gRPC client debug context: "
     "UNKNOWN:Error received from peer ipv4:127.0.0.1:50112 "
@@ -131,10 +140,10 @@ def test_expiry_is_detected_in_both_pyarrow_renderings():
 
 def test_a_data_plane_that_is_up_but_unavailable_is_retriable():
     """A server-returned UNAVAILABLE carries no connect failure, so the three
-    connect-shaped substrings never appear and it classified PERMANENT until
-    "detail: unavailable" was added. gRPC defines the status as retriable, so a
-    redrive self-heals it and it must not land as a bad-input an operator resolves —
-    whether or not this path has yet produced one."""
+    connect-shaped substrings never appear and only "detail: unavailable" matches it.
+    The data plane answers this status when it cannot open a DuckLake connection, and
+    gRPC defines it as retriable, so a redrive self-heals it and it must not land as a
+    bad-input an operator resolves."""
     assert _is_dp_unavailable(Exception(_SERVER_RETURNED_UNAVAILABLE)) is True
     f = _submission_dp_fetch_failure("could not fetch ...", Exception(_SERVER_RETURNED_UNAVAILABLE))
     assert f.kind is FailureKind.DATA_PLANE_TRANSIENT
@@ -269,10 +278,6 @@ def test_busy_data_plane_classified_retriable():
     assert f.step_name is None
 
 
-# The data plane's sources, which three tests below parse rather than restate.
-DATA_PLANE_SRC = Path(__file__).resolve().parents[2] / "qiita-data-plane" / "src"
-
-
 def test_busy_predicate_does_not_fire_on_the_other_dp_errors():
     """The match is the data plane's own prefix, so it covers the refusal and nothing
     else that carries the same gRPC status."""
@@ -296,19 +301,28 @@ def test_busy_predicate_does_not_fire_on_the_other_dp_errors():
 
 def test_busy_signature_matches_the_data_planes_wording():
     """The signature is the data plane's own prefix, which no client library renders
-    for us, so a reword in `pool.rs` fails HERE rather than silently reverting every
-    refusal to a permanent BAD_INPUT. Every refusal in that file is checked, not just
-    the first, so a second one added later cannot slip through unclassified."""
+    for us, so a reword in the Rust fails HERE rather than silently reverting every
+    refusal to a permanent BAD_INPUT. Every `resource_exhausted` refusal in the
+    component is checked — whatever shape it is written in — so one added later cannot
+    ship unclassified."""
     import re
 
-    src = (DATA_PLANE_SRC / "pool.rs").read_text()
-    refusals = re.findall(r"Status::resource_exhausted\(\s*format!\(\s*\"([^\"]+)\"", src)
-    assert refusals, "no Status::resource_exhausted refusal found in pool.rs"
+    refusals: list[str] = []
+    for src_file in sorted(DATA_PLANE_SRC.glob("*.rs")):
+        src = src_file.read_text()
+        for call in re.finditer(r"Status::resource_exhausted\(", src):
+            # The literals inside the call, up to the balancing paren.
+            tail = src[call.end() : call.end() + 600]
+            refusals.extend(re.findall(r'"([^"]*)"', tail.split(");", 1)[0]))
+    assert refusals, "no Status::resource_exhausted refusal found in the data plane"
+    assert any(DATA_PLANE_BUSY_SIGNATURE in r.lower() for r in refusals), (
+        f"no data-plane refusal carries {DATA_PLANE_BUSY_SIGNATURE!r}; found {refusals!r}. "
+        "Update the signature or a busy data plane classifies permanent again"
+    )
     for refusal in refusals:
-        assert _DP_BUSY_SIGNATURE in refusal.lower(), (
-            f"the data plane refuses with {refusal!r}, which does not carry "
-            f"{_DP_BUSY_SIGNATURE!r}; update the signature or a busy data plane "
-            "classifies permanent again"
+        assert DATA_PLANE_BUSY_SIGNATURE in refusal.lower() or "{" in refusal, (
+            f"the data plane has a refusal that does not carry "
+            f"{DATA_PLANE_BUSY_SIGNATURE!r}: {refusal!r}"
         )
 
 

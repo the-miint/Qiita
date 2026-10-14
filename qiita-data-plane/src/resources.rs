@@ -13,14 +13,14 @@
 //! say whether it came from a cgroup or from a fallback.
 //!
 //! None of the detectors is compiled conditionally: each one asks for something
-//! the other platform does not have — `/proc` on macOS, the `hw.memsize` key on
-//! Linux (where `sysctl` exists but does not know it) — so the ordering alone
-//! decides which answers.
+//! the other platform does not have, so the ordering alone decides which answers.
 //!
-//! The compute orchestrator derives the same ceiling for its own DuckDB sessions
-//! in Python (`qiita_compute_orchestrator.miint`), and takes the tightest of
-//! every ancestor cgroup where this takes the process's own. Neither language can
-//! import the other; if the precedence here changes, that one is its sibling.
+//! The compute orchestrator sizes its own DuckDB sessions from a cgroup too
+//! (`qiita_compute_orchestrator.miint`), and deliberately differs: it takes the
+//! tightest limit of every ancestor cgroup and falls back to the host's physical
+//! total, where this takes the process's own leaf and falls back to what is
+//! currently available. Neither language can import the other, so a change to one
+//! precedence is a reason to look at the other rather than a shared constant.
 
 /// Where a detected memory ceiling came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,13 +84,13 @@ pub fn detect_thread_budget() -> usize {
 }
 
 fn read_cgroup_v2() -> Option<u64> {
-    let own_path = cgroup_v2_path(&std::fs::read_to_string("/proc/self/cgroup").ok()?)?;
+    let own_path = cgroup_v2_path(&read_self_cgroup()?)?;
     let content = std::fs::read_to_string(format!("/sys/fs/cgroup{own_path}/memory.max")).ok()?;
     parse_cgroup_v2_max(&content)
 }
 
 fn read_cgroup_v1() -> Option<u64> {
-    let own_path = cgroup_v1_memory_path(&std::fs::read_to_string("/proc/self/cgroup").ok()?)?;
+    let own_path = cgroup_v1_memory_path(&read_self_cgroup()?)?;
     let content = std::fs::read_to_string(format!(
         "/sys/fs/cgroup/memory{own_path}/memory.limit_in_bytes"
     ))
@@ -103,8 +103,9 @@ fn read_proc_meminfo() -> Option<u64> {
 }
 
 /// The machine's total, not an available share: macOS has no `MemAvailable`
-/// equivalent, and this is a development path — on Linux the key does not exist,
-/// so `/proc/meminfo` above has already answered.
+/// equivalent, and this is a development path. On Linux the `hw.memsize` key does
+/// not exist — `sysctl` itself may — and `/proc/meminfo` above has already
+/// answered anyway.
 fn read_macos_memsize() -> Option<u64> {
     let out = std::process::Command::new("sysctl")
         .args(["-n", "hw.memsize"])
@@ -116,29 +117,37 @@ fn read_macos_memsize() -> Option<u64> {
     String::from_utf8_lossy(&out.stdout).trim().parse().ok()
 }
 
-/// The process's own v2 cgroup, from the single `0::<path>` line. A process in
-/// the root cgroup has no limit of its own, so `/` declines.
-fn cgroup_v2_path(proc_self_cgroup: &str) -> Option<String> {
+fn read_self_cgroup() -> Option<String> {
+    std::fs::read_to_string("/proc/self/cgroup").ok()
+}
+
+/// The path field of the `/proc/self/cgroup` line that `wanted` selects, where
+/// `wanted` is given the line's hierarchy id and its comma-separated controller
+/// list.
+fn cgroup_path(proc_self_cgroup: &str, wanted: impl Fn(&str, &str) -> bool) -> Option<String> {
     for line in proc_self_cgroup.lines() {
         let parts: Vec<&str> = line.splitn(3, ':').collect();
-        if parts.len() == 3 && parts[0] == "0" && parts[1].is_empty() {
-            let path = parts[2];
-            return (!path.is_empty() && path != "/").then(|| path.to_string());
+        if parts.len() == 3 && wanted(parts[0], parts[1]) {
+            return Some(parts[2].to_string());
         }
     }
     None
 }
 
-/// The process's path under the v1 `memory` controller, from the line whose
-/// middle field is that controller.
+/// The process's own v2 cgroup, from the single `0::<path>` line. A process in
+/// the root cgroup has no limit of its own, so `/` declines.
+fn cgroup_v2_path(proc_self_cgroup: &str) -> Option<String> {
+    let path = cgroup_path(proc_self_cgroup, |id, controllers| {
+        id == "0" && controllers.is_empty()
+    })?;
+    (!path.is_empty() && path != "/").then_some(path)
+}
+
+/// The process's path under the v1 `memory` controller.
 fn cgroup_v1_memory_path(proc_self_cgroup: &str) -> Option<String> {
-    for line in proc_self_cgroup.lines() {
-        let parts: Vec<&str> = line.splitn(3, ':').collect();
-        if parts.len() == 3 && parts[1].split(',').any(|c| c == "memory") {
-            return Some(parts[2].to_string());
-        }
-    }
-    None
+    cgroup_path(proc_self_cgroup, |_, controllers| {
+        controllers.split(',').any(|c| c == "memory")
+    })
 }
 
 fn parse_cgroup_v2_max(content: &str) -> Option<u64> {
