@@ -182,8 +182,8 @@ with a disposition ledger and a stop rule. The rules it applies live in
 diff, and the next pass reads what the fixes wrote.
 
 The loop ends by printing a `## Reviewer loop` block for the PR description: the commit
-it reviewed, and each finding it declined (with the reason), deferred (with its issue
-number), or left unprobed. `.github/pull_request_template.md` carries the heading. The
+it reviewed, each fix it made outside the PR's subject, and each finding it declined
+(with the reason), deferred (with its issue number), or left unprobed. `.github/pull_request_template.md` carries the heading. The
 `review-loop-check` CI job fails a PR whose description lacks the block or whose
 "Reviewed at" is not one of the PR's own commits; the `no-agent-review` label opts out,
 for a PR whose author cannot run the loop or that has nothing for it to read; the
