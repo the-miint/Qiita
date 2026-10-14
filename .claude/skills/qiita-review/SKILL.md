@@ -53,9 +53,9 @@ Give every finding exactly one disposition, and write it into the ledger:
 
 | Disposition | Means | Next |
 |---|---|---|
-| `fixed` | You changed the code | Name the commit or `path:line` |
+| `fixed` | You changed the code | Name the commit or `path:line`. An `[outside-subject]` fix (the reviewer's Scope discipline) is a commit of its own, whose message says why it is outside the subject; one that would warrant a changelog entry on its own (`CHANGELOG.md`, "Adding an entry") also gets a bullet in the PR's changelog file. The PR-body block lists each |
 | `declined` | Correct rule, wrong here | Record the **reason** — it goes into the next prompt |
-| `deferred` | Real, but wider than this PR (the reviewer's Scope discipline) | Record the issue's number, or its draft title and body until it is opened (see the PR-body block), then drop it from the loop |
+| `deferred` | Real, but wider than this PR (the reviewer's Scope discipline), or an `[outside-subject]` fix you did not take | Record the issue's number, or its draft title and body until it is opened (see the PR-body block), then drop it from the loop |
 | `probed` | Was `[needs-probe]`; you ran it | Record the result — confirmed or refuted |
 
 Then apply the fixes and run the tests the change actually touches: always the
@@ -68,6 +68,8 @@ nothing else:
 
 1. **Scope** — the paths that changed since the last round, and any rule family
    already settled. This is what keeps a fresh spawn from costing a full-branch read.
+   Name the commits of `[outside-subject]` fixes, and any later commit that corrects
+   one, so the reviewer can tell which lines they wrote.
 2. **The standing ledger** — every `declined` and `deferred` finding with its reason.
    This is what stops round 3 from re-raising what round 2 settled, and it is a token
    cut as much as a convergence one.
@@ -166,6 +168,7 @@ included:
 
 - Reviewed at: <short sha of the last commit a round read> · rounds: <N> · stopped: <which stop rule>
 - Fixed: <count>
+  - <what, `path`> — outside the PR's subject, <its commit shas>
 - Declined:
   - <what, `path`> — <why>
 - Deferred:
@@ -176,7 +179,9 @@ included:
 
 - `Reviewed at` is a commit on the branch. If commits land after the last round, say so
   on that line ("plus 1 later commit: changelog tag") instead of moving the sha.
-- Write `none` under a heading with no entries; do not drop the heading.
+- Under `Fixed:`, list only the `[outside-subject]` fixes; the count includes them.
+  With none, the line is the count alone.
+- Write `none` under any other heading with no entries; do not drop the heading.
 - A deferred item names its issue by number. Every deferred issue is opened before
   the PR is, so the description carries `#N` from its first version; `issue to file`
   is not an entry. Open them yourself only when the author has asked you to. Otherwise,

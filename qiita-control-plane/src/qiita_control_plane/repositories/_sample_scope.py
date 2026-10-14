@@ -20,7 +20,7 @@ from qiita_common.models import Tier
 #
 # SQL restatement of the policy the submission gate applies in Python
 # (`auth.guards.require_caller_has_admin_on_all_studies`, as reached from
-# routes/work_ticket.py). Arm for arm: the caller must hold Tier.ADMIN — or own the
+# work_ticket_submit.py). Arm for arm: the caller must hold Tier.ADMIN — or own the
 # study — on EVERY non-retired link; a study row that does not exist is skipped
 # (inner JOIN); a sample whose links are all retired is admitted (vacuous NOT
 # EXISTS). Nothing pins the two together, so a change to either belongs in a PR

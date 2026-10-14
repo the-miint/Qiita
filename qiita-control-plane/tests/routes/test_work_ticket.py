@@ -688,7 +688,7 @@ async def test_submit_leaves_non_failed_reference_untouched(
         reference_idx,
     )
 
-    with caplog.at_level(logging.WARNING, logger="qiita_control_plane.routes.work_ticket"):
+    with caplog.at_level(logging.WARNING, logger="qiita_control_plane.work_ticket_submit"):
         resp = await wt_client.post(
             URL_WORK_TICKET_PREFIX,
             json=_body(action_id, version, reference_idx),
@@ -722,8 +722,8 @@ async def test_submit_rolls_back_ticket_if_scope_reset_fails(
     async def _boom(*_args, **_kwargs):
         raise RuntimeError("injected reset failure")
 
-    # Patch the symbol as imported into the route module.
-    monkeypatch.setattr("qiita_control_plane.routes.work_ticket.transition_reference_status", _boom)
+    # Patch the symbol as imported into the submit module (where the gate runs).
+    monkeypatch.setattr("qiita_control_plane.work_ticket_submit.transition_reference_status", _boom)
 
     with pytest.raises(RuntimeError, match="injected reset failure"):
         await wt_client.post(
@@ -1217,7 +1217,7 @@ async def test_submit_unique_index_catches_select_race(
         return None
 
     monkeypatch.setattr(
-        "qiita_control_plane.routes.work_ticket._check_disallow_without_delete",
+        "qiita_control_plane.work_ticket_submit._check_disallow_without_delete",
         _noop,
     )
 
@@ -1442,7 +1442,7 @@ async def test_submit_sequenced_pool_unique_index_catches_select_race(
         return None
 
     monkeypatch.setattr(
-        "qiita_control_plane.routes.work_ticket._check_disallow_without_delete",
+        "qiita_control_plane.work_ticket_submit._check_disallow_without_delete",
         _noop,
     )
 
@@ -1586,7 +1586,7 @@ async def test_submit_block_unique_index_catches_select_race(
         return None
 
     monkeypatch.setattr(
-        "qiita_control_plane.routes.work_ticket._check_disallow_without_delete",
+        "qiita_control_plane.work_ticket_submit._check_disallow_without_delete",
         _noop,
     )
 
@@ -4616,9 +4616,9 @@ async def test_follow_on_is_never_created_twice(
     from qiita_control_plane.auth.principal import load_human_user
     from qiita_control_plane.follow_on import reconcile_follow_ons, submit_follow_on
     from qiita_control_plane.main import app
-    from qiita_control_plane.routes.work_ticket import (
+    from qiita_control_plane.routes.work_ticket import fetch_work_ticket
+    from qiita_control_plane.work_ticket_submit import (
         FollowOnAlreadyRecordedError,
-        fetch_work_ticket,
         submit_work_ticket_core,
     )
 
@@ -4711,9 +4711,9 @@ async def test_follow_on_transient_failure_is_left_for_retry(
     submits the follow-on once the cause is gone."""
     from fastapi import HTTPException
 
+    from qiita_control_plane import work_ticket_submit as work_ticket_submit_mod
     from qiita_control_plane.follow_on import reconcile_follow_ons, submit_follow_on
     from qiita_control_plane.main import app
-    from qiita_control_plane.routes import work_ticket as work_ticket_routes
 
     token, _ = admin_token
     resp = await _submit_with_follow_on(
@@ -4732,7 +4732,7 @@ async def test_follow_on_transient_failure_is_left_for_retry(
         raise HTTPException(status_code=503, detail="compute backend unavailable")
 
     with monkeypatch.context() as m:
-        m.setattr(work_ticket_routes, "submit_work_ticket_core", _unavailable)
+        m.setattr(work_ticket_submit_mod, "submit_work_ticket_core", _unavailable)
         with pytest.raises(HTTPException):
             await submit_follow_on(app, parent_idx)
     assert await _follow_on_outcome(postgres_pool, parent_idx) == (None, None)
@@ -4794,7 +4794,7 @@ async def test_on_success_refused_from_a_service_account(postgres_pool):
     from qiita_common.models import WorkTicketCreateRequest
 
     from qiita_control_plane.auth.principal import ServiceAccount
-    from qiita_control_plane.routes.work_ticket import _gate_follow_on
+    from qiita_control_plane.work_ticket_submit import _gate_follow_on
 
     body = WorkTicketCreateRequest.model_validate(
         {

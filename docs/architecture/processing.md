@@ -170,8 +170,13 @@ job that succeeded during the outage, and decides a purged job from its
 on-disk output manifest. The startup hook then calls `reconcile_follow_ons`,
 which submits the follow-on of every completed ticket that records no outcome
 (one that completed while no process ran its completion hook, or whose
-submission failed with anything but a refusal). That is the only retry: such a
-follow-on waits for the next CP start. This is the deliberate consequence of deploys
+submission failed with anything but a refusal). The same reconcile then runs on
+an interval from the `follow_on_sweeper` (once per `FOLLOW_ON_SWEEP_INTERVAL_SECONDS`),
+so a transiently-failed follow-on is retried within an interval rather than
+waiting for the next CP start. The sweeper takes no advisory lock (the submit
+path is create-at-most-once, so an overlapping reconcile is harmless; see
+`follow_on_sweeper`). The startup reconcile still runs first because it must be
+ordered after `reconcile_inflight_tickets`. This is the deliberate consequence of deploys
 stopping/starting CP+CO without draining — a restart with live in-flight
 work is routine, so it must never nuke running jobs (the pre-decoupling
 `recover_orphaned_tickets` blanket-failed them). The reconcile assumes no

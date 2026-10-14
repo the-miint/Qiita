@@ -609,7 +609,7 @@ async def filter_prep_samples_caller_can_read(
     **A sample with no active study link is NOT readable.** It has no study to
     authorize against, and failing open on a data-integrity anomaly is the wrong
     default for a read. This diverges from the prep_sample-scoped *submission*
-    gate (`_check_prep_sample_study_access` in routes/work_ticket.py), which
+    gate (`_check_prep_sample_study_access` in work_ticket_submit.py), which
     lets an orphan pass; that gate guards a write whose downstream lookups fail
     anyway, this one answers "may this person see this".
 
