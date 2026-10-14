@@ -1940,6 +1940,84 @@ def test_masked_read_export_miint_load_failure_is_an_error_not_a_traceback(
     assert list(out_dir.iterdir()) == []
 
 
+def _run_parquet_export(monkeypatch, tmp_path, *, data_plane_url="grpc://dp:50051"):
+    """Drive a single-prep_sample parquet export against the fake manifest and,
+    unless `data_plane_url` is one pyarrow refuses, a fake Flight stream;
+    returns (rc, out_dir)."""
+    import pyarrow as pa
+
+    from qiita_control_plane.cli import _common
+    from qiita_control_plane.cli import admin as cli
+
+    monkeypatch.setenv("QIITA_TOKEN", "qk_admin")
+    manifest = {
+        "sequenced_pool_idx": 7,
+        "sequencing_run_idx": 5,
+        "mask_idx": 3,
+        "samples": [{"prep_sample_idx": 42, "biosample_accession": "SAMN_A"}],
+    }
+    monkeypatch.setattr(_common.httpx, "request", _fake_masked_export_http(manifest))
+    if data_plane_url.startswith("grpc://"):
+        fake_cls = _fake_flight_client_class({42: pa.table({"read_id": ["r"], "sequence1": ["A"]})})
+        monkeypatch.setattr("pyarrow.flight.FlightClient", fake_cls)
+    out_dir = tmp_path / "exp"
+    out_dir.mkdir(exist_ok=True)
+    rc = cli.main(
+        [
+            "masked-read-export",
+            "--sequenced-pool-idx",
+            "7",
+            "--mask-idx",
+            "3",
+            "--format",
+            "parquet",
+            "--output-dir",
+            str(out_dir),
+            "--data-plane-url",
+            data_plane_url,
+        ]
+    )
+    return rc, out_dir
+
+
+def test_masked_read_export_unparseable_data_plane_url_is_an_error(monkeypatch, tmp_path, capsys):
+    """pyarrow refuses the URL when the client is built; that is one stderr
+    message and exit 1, not a traceback."""
+    rc, out_dir = _run_parquet_export(monkeypatch, tmp_path, data_plane_url="not a uri")
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert err.startswith("error: "), err
+    assert "not a uri" in err
+    assert list(out_dir.iterdir()) == []
+
+
+def test_masked_read_export_unreadable_parquet_target_is_an_error(monkeypatch, tmp_path, capsys):
+    """An existing parquet target that is not parquet cannot be counted for the
+    re-export check; that is a stderr message and exit 1, and the file is left
+    as it was."""
+    out_dir = tmp_path / "exp"
+    out_dir.mkdir()
+    target = out_dir / "SAMN_A.5.7.42.parquet"
+    target.write_bytes(b"not parquet")
+    rc, _ = _run_parquet_export(monkeypatch, tmp_path)
+    assert rc == 1
+    assert capsys.readouterr().err.startswith("error: ")
+    assert target.read_bytes() == b"not parquet"
+
+
+def test_masked_read_export_bug_is_a_traceback(monkeypatch, tmp_path):
+    """A plain ValueError from this code is a bug, not a failure of the data
+    plane or the client host, so the handler lets it propagate."""
+    from qiita_control_plane.cli.admin import masked_export
+
+    def bug(*args, **kwargs):
+        raise ValueError("a bug in the writer")
+
+    monkeypatch.setattr(masked_export, "_write_masked_sample", bug)
+    with pytest.raises(ValueError, match="a bug in the writer"):
+        _run_parquet_export(monkeypatch, tmp_path)
+
+
 # ---------------------------------------------------------------------------
 # ticket cancel (calls the CP cancel route)
 # ---------------------------------------------------------------------------

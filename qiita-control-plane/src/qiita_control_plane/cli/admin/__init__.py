@@ -620,11 +620,12 @@ def _build_parser() -> argparse.ArgumentParser:
     p_export = sub.add_parser(
         "masked-read-export",
         help=(
-            "Export masked sequence data for every sample on a sequenced_pool"
-            " (system_admin only). Streams each sample's masked reads from the"
-            " data plane and writes per-sample files named"
-            " <biosample_accession>.<run>.<pool>.<prep>[.R1/.R2].<parquet|fastq>"
-            " (paired fastq splits into R1/R2)."
+            "Export masked sequence data for every prep_sample on a"
+            " sequenced_pool (system_admin only). Streams each prep_sample's"
+            " masked reads from the data plane and writes one file per"
+            " prep_sample named <biosample_accession>.<run>.<pool>.<prep> plus"
+            " .parquet, or .fastq.gz (single-end) / .R1.fastq.gz and"
+            " .R2.fastq.gz (paired)."
         ),
     )
     p_export.add_argument(
