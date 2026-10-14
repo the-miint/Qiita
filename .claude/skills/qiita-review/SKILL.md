@@ -68,8 +68,8 @@ nothing else:
 
 1. **Scope** — the paths that changed since the last round, and any rule family
    already settled. This is what keeps a fresh spawn from costing a full-branch read.
-   Name the commits of `[outside-subject]` fixes, so the reviewer can tell which lines
-   they wrote.
+   Name the commits of `[outside-subject]` fixes, and any later commit that corrects
+   one, so the reviewer can tell which lines they wrote.
 2. **The standing ledger** — every `declined` and `deferred` finding with its reason.
    This is what stops round 3 from re-raising what round 2 settled, and it is a token
    cut as much as a convergence one.
@@ -168,7 +168,7 @@ included:
 
 - Reviewed at: <short sha of the last commit a round read> · rounds: <N> · stopped: <which stop rule>
 - Fixed: <count>
-  - <what, `path`> — <commit sha>
+  - <what, `path`> — outside the PR's subject, <commit sha>
 - Declined:
   - <what, `path`> — <why>
 - Deferred:
@@ -179,7 +179,8 @@ included:
 
 - `Reviewed at` is a commit on the branch. If commits land after the last round, say so
   on that line ("plus 1 later commit: changelog tag") instead of moving the sha.
-- Under `Fixed:`, list only the `[outside-subject]` fixes; the count includes them. With none, the line is the count alone.
+- Under `Fixed:`, list only the `[outside-subject]` fixes; the count includes them.
+  With none, the line is the count alone.
 - Write `none` under any other heading with no entries; do not drop the heading.
 - A deferred item names its issue by number. Every deferred issue is opened before
   the PR is, so the description carries `#N` from its first version; `issue to file`
