@@ -75,7 +75,7 @@ fn an_unfinished_transaction_does_not_outlive_the_borrow() {
         .execute_batch("COMMIT;")
         .expect_err("no transaction may be left open for the next borrower");
     assert!(
-        err.to_string().contains("no transaction is active"),
+        err.to_string().contains(NO_TRANSACTION_TO_ROLL_BACK),
         "unexpected error: {err}"
     );
 }
@@ -162,8 +162,16 @@ fn the_pool_settings_reach_duckdb() {
 }
 
 #[test]
-fn a_path_holding_a_quote_cannot_end_the_sql_literal() {
-    assert_eq!(sql_quoted(Path::new("/tmp/it's")), "/tmp/it''s");
+fn a_setting_that_could_end_a_sql_literal_is_rejected_at_construction() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut settings = PoolSettings::for_tests(1, tmp.path().to_path_buf());
+    settings.memory_limit = "512MiB'; ATTACH 'evil".to_string();
+    let err = LakePool::open("unused".to_string(), "unused".to_string(), settings)
+        .expect_err("a quote in a setting must not reach DuckDB's SQL");
+    assert!(
+        err.to_string().contains("DUCKDB_MEMORY_LIMIT"),
+        "the error names the variable that carried it: {err}"
+    );
 }
 
 /// The lazy half of the bound, against a real catalog: `open` attaches one
@@ -174,13 +182,8 @@ fn a_path_holding_a_quote_cannot_end_the_sql_literal() {
 #[cfg(feature = "integration")]
 #[serial_test::serial]
 fn open_attaches_one_instance_and_the_rest_on_demand() {
-    let connstr = std::env::var("DUCKLAKE_CATALOG_CONNSTR").unwrap_or_else(|_| {
-        "dbname=qiita_ducklake host=localhost port=5433 user=qiita password=qiita".to_string()
-    });
-    let data_path = std::env::var("PATH_PERSISTENT")
-        .map(|base| format!("{base}/ducklake"))
-        .unwrap_or_else(|_| "/tmp/qiita-integration-ducklake-data".to_string());
-    std::fs::create_dir_all(&data_path).unwrap();
+    let connstr = crate::flight_service::tests::delete_test_catalog_connstr();
+    let data_path = crate::flight_service::tests::delete_test_data_path();
     let tmp = tempfile::tempdir().unwrap();
 
     let pool = LakePool::open(
@@ -206,9 +209,17 @@ fn open_attaches_one_instance_and_the_rest_on_demand() {
         "a fourth request has nothing left to borrow"
     );
 
-    // What a reused attach is for: the instance answers after being returned.
+    // What a reused attach is for: the instance comes back and answers again.
+    // `idle_len` is the half a query cannot show — a reset that failed on an
+    // attached instance would discard it, credit the slot and rebuild, and the
+    // query below would still succeed.
     drop(first);
     drop(second);
+    assert_eq!(
+        pool.idle_len(),
+        2,
+        "both were returned and reset, not discarded and rebuilt"
+    );
     let reused = pool.checkout().expect("a returned instance");
     let one: i64 = reused
         .query_row("SELECT 1", [], |row| row.get(0))

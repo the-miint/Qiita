@@ -345,6 +345,28 @@ mod tests {
         );
     }
 
+    /// A share below the floor means the pool is too big for the host, and
+    /// granting the floor anyway would over-commit the ceiling it was divided
+    /// from. The size is computed from whatever this machine detects, so the
+    /// test fails for the stated reason on a laptop and on the deploy host alike.
+    #[test]
+    #[serial]
+    fn a_pool_too_large_for_the_detected_ceiling_fails_at_boot() {
+        let _snapshot = EnvSnapshot::capture(POOL_VARS);
+        set_required_env();
+        clear_pool_vars();
+        let ceiling_mib = super::resources::detect_memory_ceiling().bytes / (1024 * 1024);
+        let size = (ceiling_mib / 2 / 256) + 1;
+        std::env::set_var("DUCKLAKE_POOL_SIZE", size.to_string());
+
+        let err = Settings::from_env().unwrap_err();
+
+        assert!(
+            err.contains("DUCKLAKE_POOL_SIZE") && err.contains("DUCKDB_MEMORY_LIMIT"),
+            "the error names both ways out: {err}"
+        );
+    }
+
     /// Nowhere to derive a spill directory from is a boot failure, not a silent
     /// fallback onto whatever filesystem the process happens to start in.
     #[test]

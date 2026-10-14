@@ -3,12 +3,13 @@
 //! Handles DoGet requests by verifying Ed25519-signed tickets, querying DuckLake,
 //! and streaming results as Arrow RecordBatches.
 //!
-//! Each request opens its own DuckDB connection and attaches DuckLake. This
-//! avoids shared mutable state and allows concurrent requests; DuckLake's
-//! snapshot isolation in the shared Postgres catalog keeps readers off each
-//! other. It is not sufficient for every writer, though — it detects a conflict
-//! only where two transactions touch the same existing row, so writers that must
-//! not both commit take an explicit lock (`take_registration_lock`).
+//! Each request borrows one attached instance from `pool::LakePool` for its
+//! duration, so two requests never share one at the same time and the number in
+//! flight is bounded. DuckLake's snapshot isolation in the shared Postgres
+//! catalog keeps readers off each other. It is not sufficient for every writer,
+//! though — it detects a conflict only where two transactions touch the same
+//! existing row, so writers that must not both commit take an explicit lock
+//! (`take_registration_lock`).
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -744,8 +745,8 @@ impl FlightService for QiitaFlightService {
                 // register_files moves files and runs a blocking DuckLake
                 // transaction; run it on the blocking pool so it never starves a
                 // tonic async worker (mirrors export_read / count_masked). The
-                // closure opens and drops its own connection, so it is Send and
-                // crosses no await.
+                // borrowed instance moves into the closure, so it is Send and
+                // crosses no await, and returns to the pool when the task ends.
                 let conn = self.pool.checkout()?;
                 let data_path = self.pool.data_path().to_string();
                 let scratch_root = self.scratch_root.clone();
@@ -922,7 +923,7 @@ impl FlightService for QiitaFlightService {
 
                 // Blocking DuckLake delete transaction — run it on the blocking
                 // pool so it never starves a tonic async worker (mirrors
-                // delete_mask). The closure opens and drops its own connection, so
+                // delete_mask). The borrowed instance moves into the closure, so
                 // it is Send and crosses no await.
                 let conn = self.pool.checkout()?;
                 let alignment_idx = payload.alignment_idx;
@@ -1040,8 +1041,8 @@ impl FlightService for QiitaFlightService {
 
                 // `COPY` is synchronous and, for a whole prep_sample, long-lived —
                 // run it on the blocking pool so it never starves a tonic async
-                // worker. The closure opens and drops its own connection, so it
-                // is Send and crosses no await (mirrors `register_files`).
+                // worker. The borrowed instance moves into the closure, so it is
+                // Send and crosses no await (mirrors `register_files`).
                 let conn = self.pool.checkout()?;
                 let scratch_root = self.scratch_root.clone();
                 let prep = payload.prep_sample_idx;
@@ -1095,7 +1096,7 @@ impl FlightService for QiitaFlightService {
 
                 // count(*) is synchronous DuckDB work; run it on the blocking
                 // pool so it never starves a tonic async worker (mirrors
-                // export_read). The closure opens and drops its own connection.
+                // export_read). The borrowed instance moves into the closure.
                 let conn = self.pool.checkout()?;
                 let count = tokio::task::spawn_blocking(move || {
                     count_masked_reads(&conn, prep_sample_idx, mask_idx)
@@ -1130,7 +1131,7 @@ impl FlightService for QiitaFlightService {
                 // The aggregate is a synchronous DuckDB count over the light
                 // `read_mask` table; run it on the blocking pool so it never
                 // starves a tonic async worker (mirrors count_masked). The
-                // closure opens and drops its own connection.
+                // borrowed instance moves into the closure.
                 let conn = self.pool.checkout()?;
                 let counts = tokio::task::spawn_blocking(move || {
                     mask_metrics_counts(&conn, mask_idx, prep_sample_idx)
@@ -1201,7 +1202,7 @@ impl FlightService for QiitaFlightService {
 
                 // One blocking DuckLake transaction, like sync_reference_exclusion:
                 // run it on the blocking pool so it never starves a tonic async
-                // worker. The closure opens and drops its own connection.
+                // worker. The borrowed instance moves into the closure.
                 let conn = self.pool.checkout()?;
                 let reference_idx = payload.reference_idx;
                 let result = tokio::task::spawn_blocking(move || {
@@ -1661,8 +1662,8 @@ fn validate_export_dest(dest: &str, scratch_root: &Path) -> Result<PathBuf, Stat
 /// identical); this function owns the publish. An empty selection writes NO file
 /// and returns 0 — the control plane turns that into a clean submission failure.
 /// The `COPY` streams row groups to disk, so memory stays bounded regardless of
-/// selection size. Opens and drops its own connection so the caller can run it on
-/// the blocking pool (mirrors `register_files`).
+/// selection size. Takes a borrowed instance so the caller can run it on the
+/// blocking pool (mirrors `register_files`).
 ///
 /// `dest` arrives already lexically validated (`validate_export_dest`), but this
 /// is human-read data, so we ALSO resolve symlinks: another job on the shared
@@ -1922,8 +1923,8 @@ fn read_masked_relation(mask_idx: i64, preps: &[i64]) -> String {
 /// construction, so the filtered `read_mask` count equals the view's row count —
 /// while touching only the small key/`reason` columns, never joining to `read`
 /// or materializing the sequence/quality bytes. This is what makes the export's
-/// idempotency probe cheap. Opens and drops its own connection so the caller can
-/// run it on the blocking pool (mirrors `export_read_to_parquet`).
+/// idempotency probe cheap. Takes a borrowed instance so the caller can run it on
+/// the blocking pool (mirrors `export_read_to_parquet`).
 fn count_masked_reads(
     conn: &Connection,
     prep_sample_idx: i64,
@@ -1982,8 +1983,8 @@ const SPIKEIN_REASONS: &str = "'spikein_syndna'";
 /// `host_minimap2` rows, so a typo here would miscount silently there.) Adding a
 /// ReadMaskReason means touching BOTH sides.
 ///
-/// Opens and drops its own connection so the caller can run it on the blocking
-/// pool (mirrors `count_masked_reads`).
+/// Takes a borrowed instance so the caller can run it on the blocking pool
+/// (mirrors `count_masked_reads`).
 fn mask_metrics_counts(
     conn: &Connection,
     mask_idx: i64,
@@ -2342,9 +2343,9 @@ struct Registration {
 
 /// Move Parquet files from staging to permanent storage and register in DuckLake.
 ///
-/// Validates all requested files exist in staging, attaches DuckLake, moves the
-/// files to permanent locations under `data_path/{table_name}/`, and registers
-/// them.
+/// Validates all requested files exist in staging, moves them to permanent
+/// locations under `data_path/{table_name}/`, and registers them — which is why
+/// it takes the data path as well as a connection.
 ///
 /// Uses `std::fs::rename` with a copy+delete fallback for cross-filesystem moves
 /// (e.g., SLURM local scratch → shared NFS).
@@ -2870,9 +2871,9 @@ fn delete_mask(conn: &Connection, mask_idx: i64) -> Result<serde_json::Value, St
 /// Parquet converges to the same table, and a replay of a stale-but-valid token
 /// reloads whatever the (authoritative) file holds. An empty blocklist ships a
 /// valid zero-row Parquet, so the DELETE + zero-row INSERT simply clears the
-/// mirror (re-enabling everything). Opens and drops its own connection so the
-/// caller can run it on the blocking pool (mirrors `delete_mask` /
-/// `register_files`). Returns the loaded row count.
+/// mirror (re-enabling everything). Takes a borrowed instance so the caller can
+/// run it on the blocking pool (mirrors `delete_mask` / `register_files`).
+/// Returns the loaded row count.
 ///
 /// `dest` arrives lexically validated (`validate_export_dest`: absolute, under
 /// the scratch root, no `..`, no single quote), but that check is a string test
@@ -3907,4 +3908,4 @@ fn build_block_read_query(
 
 #[cfg(test)]
 #[path = "flight_service_tests.rs"]
-mod tests;
+pub(crate) mod tests;

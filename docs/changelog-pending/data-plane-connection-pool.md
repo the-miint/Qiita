@@ -13,9 +13,9 @@
 
 ### Changed
 
-- **A request no longer opens its own DuckDB (#NNN).** Each of the twelve lake entry points
-  in the data plane opened a fresh in-memory DuckDB and attached DuckLake per request, at
-  DuckDB's defaults — which size themselves from the process's cgroup, so each concurrent
+- **A request no longer opens its own DuckDB (#NNN).** All fourteen lake entry points in the
+  data plane opened a fresh in-memory DuckDB and attached DuckLake per request, at DuckDB's
+  defaults — which size themselves from the process's cgroup, so each concurrent
   request authorised itself against the whole host. They now take a borrowed connection.
   Reusing the attach is also most of a small request's cost: a fresh connect + attach + query
   measured 84–107 ms and about 16 catalog transactions, against 3.0–3.4 ms and about 3.7 on a

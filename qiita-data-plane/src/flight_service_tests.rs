@@ -191,14 +191,14 @@ fn single_i64_filter_rejects_missing_empty_multi_and_non_integer() {
 // --- delete_reference integration harness (mirrors ducklake.rs::tests) ---
 
 #[cfg(feature = "integration")]
-fn delete_test_catalog_connstr() -> String {
+pub(crate) fn delete_test_catalog_connstr() -> String {
     std::env::var("DUCKLAKE_CATALOG_CONNSTR").unwrap_or_else(|_| {
         "dbname=qiita_ducklake host=localhost port=5433 user=qiita password=qiita".to_string()
     })
 }
 
 #[cfg(feature = "integration")]
-fn delete_test_data_path() -> String {
+pub(crate) fn delete_test_data_path() -> String {
     let data_path = std::env::var("PATH_PERSISTENT")
         .map(|base| format!("{base}/ducklake"))
         .unwrap_or_else(|_| "/tmp/qiita-integration-ducklake-data".to_string());
@@ -5320,8 +5320,8 @@ fn unattached_conn() -> duckdb::Connection {
     duckdb::Connection::open_in_memory().expect("open in-memory DuckDB")
 }
 
-/// A real pool over the test catalog. Four instances, so a test that opens a
-/// second stream before draining the first is not refused by the bound.
+/// A real pool over the test catalog. Four instances rather than one so a caller
+/// that borrows more than once from the same pool is not refused by the bound.
 #[cfg(feature = "integration")]
 fn test_pool(connstr: &str, data_path: &str) -> std::sync::Arc<crate::pool::LakePool> {
     crate::pool::LakePool::open(
@@ -5341,8 +5341,9 @@ fn pooled_conn(connstr: &str, data_path: &str) -> crate::pool::PooledConnection 
         .expect("a fresh pool lends its first instance")
 }
 
-/// A connection with the test catalog attached — what the pool lends a request
-/// in production, built directly here so a test needs no pool.
+/// A connection with the test catalog attached, built directly so a test needs
+/// no pool. It carries none of the pool's resource settings — only `LakePool`
+/// applies those — so it stands in for the attach, not for a pooled instance.
 #[cfg(feature = "integration")]
 fn attached_conn(connstr: &str, data_path: &str) -> duckdb::Connection {
     let conn = unattached_conn();

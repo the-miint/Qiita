@@ -22,10 +22,11 @@ Every operation that touches the lake borrows one instance from a bounded pool
 ([`qiita-data-plane/src/pool.rs`](../../qiita-data-plane/src/pool.rs)), so the
 pool's size is the number of requests one data plane serves at once. A request
 that arrives with every instance lent out is refused immediately with gRPC
-`RESOURCE_EXHAUSTED` and a message naming the bound — it is not queued, because
-the edge keeps admitting requests (64 concurrent per client address) and
-`grpc_read_timeout` is an hour, so a client that waits in here waits there. A
-caller retries at stream open.
+`RESOURCE_EXHAUSTED` and a message naming the bound, rather than queued — the
+reasoning, and the edge limits it rests on, are in `pool.rs`. **Nothing in this
+repo retries that refusal yet**: the control plane classifies it as retriable so
+the ticket is held for an operator redrive, and a compute-side reader fails its
+step.
 
 Each pooled instance carries its own `threads`, `memory_limit`, `temp_directory`
 and `max_temp_directory_size`, divided at boot from the memory ceiling the

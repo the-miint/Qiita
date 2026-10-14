@@ -1,30 +1,28 @@
 //! A bounded pool of attached DuckLake instances. Its size is the in-flight bound.
 //!
-//! Two measurements shape this. First, DuckDB's resource settings belong to a
-//! *database*, not to a connection, so bounding what one request may spend means
-//! pooling instances rather than handing out connections to one instance.
-//! Second, holding the ATTACH is most of what a request pays: a fresh
-//! connect + attach + query measured 84–107 ms and about 16 catalog
-//! transactions, against 3.0–3.4 ms and about 3.7 transactions once the attach
-//! is reused.
+//! Two measurements shape it. DuckDB's resource settings belong to a *database*,
+//! not to a connection, so bounding what one request may spend means pooling
+//! instances rather than connections against one instance. And holding the
+//! ATTACH is most of what a small request pays: a fresh connect + attach + query
+//! measured 84–107 ms and about 16 catalog transactions, against 3.0–3.4 ms and
+//! about 3.7 once the attach is reused.
 //!
 //! A checkout that finds nothing idle and nothing left to build refuses with
-//! `RESOURCE_EXHAUSTED` instead of waiting. Waiting would hold the caller's
-//! stream open against the edge's `grpc_read_timeout 3600s` while the edge keeps
-//! admitting more (64 concurrent requests per client address), which is how the
-//! unbounded version failed: with every request sizing its own DuckDB against
-//! the whole host, two instances under 16 concurrent streams were both
-//! OOM-killed and the edge answered 888 of 896 requests with 502.
+//! `RESOURCE_EXHAUSTED` instead of waiting, because waiting here is not shorter
+//! than waiting at the edge: the edge admits 64 concurrent requests per client
+//! address (`deploy/nginx/qiita.conf`) and holds each for up to its
+//! `grpc_read_timeout` of 3600s, so a queue inside the process would fill with
+//! requests the edge is already holding open. Nothing in this repo retries a
+//! refusal yet; `DEPLOY_CHECKLIST.md` records what that leaves for the operator.
 //!
 //! Instances are built as they are first needed rather than all at boot, because
-//! each attached instance holds one lake-Postgres backend for as long as it
-//! lives — against a `max_connections` of 100 with 3 superuser-reserved, shared
-//! with the control plane. One is built at `open` so a bad setting or an
-//! unwritable spill directory fails the unit at boot rather than on first
-//! request.
+//! each one costs a lake-Postgres backend for as long as it lives — the budget
+//! `config::DEFAULT_POOL_SIZE` is chosen against. One is built at `open` so a bad
+//! setting or an unwritable spill directory fails the unit at boot rather than on
+//! first request.
 
 use std::ops::Deref;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use duckdb::Connection;
@@ -42,18 +40,17 @@ pub struct PoolSettings {
     /// In DuckDB's own spelling, e.g. `23552MiB` — note DuckDB reads `GB` as
     /// decimal and `GiB` as binary.
     pub memory_limit: String,
-    /// Where an over-limit request spills. Local disk, never the shared scratch
-    /// filesystem: spilling is the difference between a request that fails and
-    /// one that completes (measured: the same over-limit sort raised
-    /// `OutOfMemoryException` after 2.41 s with no spill directory and completed
-    /// in 22.62 s with one), and that traffic does not belong on a cluster
-    /// filesystem every compute node shares.
+    /// Where an over-limit request spills, which is the difference between a
+    /// request that fails and one that completes: measured, the same over-limit
+    /// sort raised `OutOfMemoryException` after 2.41 s with no spill directory
+    /// and completed in 22.62 s with one. Which filesystem, and why, is
+    /// `config::DERIVED_TEMP_DIRECTORY_LEAF`.
     pub temp_directory: PathBuf,
-    /// Ceiling on that spill, per instance. Needed explicitly because DuckDB's
-    /// own default is 90% of the *filesystem*, which N instances would each
-    /// claim in full. Measured: the cap is enforced mid-query, names itself in
-    /// the error (`This limit was set by the 'max_temp_directory_size' setting`)
-    /// and leaves no files behind.
+    /// Ceiling on that spill, per instance. Measured: it is enforced mid-query,
+    /// names itself in the error (`This limit was set by the
+    /// 'max_temp_directory_size' setting`) and leaves no files behind. Why it is
+    /// set at all rather than left to DuckDB is
+    /// `config::DEFAULT_MAX_TEMP_DIRECTORY_SIZE`.
     pub max_temp_directory_size: String,
 }
 
@@ -99,6 +96,18 @@ impl LakePool {
         if settings.size == 0 {
             return Err("pool size must be at least 1 — a size of 0 serves no request".into());
         }
+        // All three reach DuckDB inside quoted SQL literals in `apply_settings`,
+        // the same way the connection string and data path do in
+        // `ducklake::connect_ducklake`, and all three come from the environment.
+        ducklake::validate_sql_literal(&settings.memory_limit, "DUCKDB_MEMORY_LIMIT")?;
+        ducklake::validate_sql_literal(
+            &settings.max_temp_directory_size,
+            "DUCKDB_MAX_TEMP_DIRECTORY_SIZE",
+        )?;
+        ducklake::validate_sql_literal(
+            &settings.temp_directory.display().to_string(),
+            "DUCKDB_TEMP_DIRECTORY",
+        )?;
         // DuckDB does not create this itself; an unwritable path must stop the
         // unit here rather than surface as a failed request under load.
         std::fs::create_dir_all(&settings.temp_directory).map_err(|e| {
@@ -134,7 +143,7 @@ impl LakePool {
     /// Take an instance, or refuse. Never waits: the refusal is the in-flight
     /// bound, and the caller retries at stream open.
     pub fn checkout(self: &Arc<Self>) -> Result<PooledConnection, Status> {
-        let reserved = {
+        {
             let mut state = self.lock_state();
             if let Some(conn) = state.idle.pop() {
                 return Ok(PooledConnection {
@@ -151,9 +160,7 @@ impl LakePool {
             // Reserved before the build so two callers cannot both spend the
             // same slot; handed back below if the build fails.
             state.unbuilt -= 1;
-            true
-        };
-        debug_assert!(reserved);
+        }
         match self.build_instance() {
             Ok(conn) => Ok(PooledConnection {
                 pool: Arc::clone(self),
@@ -180,8 +187,13 @@ impl LakePool {
     /// may change it (the Parquet export does) and the change outlives the
     /// borrow: measured, a connection kept `preserve_insertion_order=false`
     /// after the request that set it was done.
+    ///
+    /// Two obligations follow. A handler that `SET`s anything not listed here
+    /// leaks it to the next borrower, so a new `SET` in a request path belongs in
+    /// this list. And this is the only place limits are applied, so a
+    /// `Connection` built outside the pool — the boot connection in `main`, a
+    /// test's own — runs at DuckDB's defaults.
     fn apply_settings(&self, conn: &Connection) -> Result<(), duckdb::Error> {
-        let temp_dir = sql_quoted(&self.settings.temp_directory);
         conn.execute_batch(&format!(
             "SET threads={};
              SET memory_limit='{}';
@@ -190,7 +202,7 @@ impl LakePool {
              SET preserve_insertion_order=true;",
             self.settings.threads,
             self.settings.memory_limit,
-            temp_dir,
+            self.settings.temp_directory.display(),
             self.settings.max_temp_directory_size,
         ))
     }
@@ -216,11 +228,11 @@ impl LakePool {
     fn reset(&self, conn: &Connection) -> Result<(), duckdb::Error> {
         // Rolled back unconditionally because there is nothing to ask: this
         // binding's `is_autocommit()` reports true even inside an explicit
-        // `BEGIN TRANSACTION` (measured on duckdb 1.10505.0), so branching on
-        // it would skip every rollback that matters. A connection with no
-        // transaction open answers with exactly one error, which is the
-        // answer that there was nothing to roll back;
-        // `a_clean_borrow_comes_back_without_error` pins that.
+        // `BEGIN TRANSACTION` (measured on duckdb 1.10505.0), so branching on it
+        // would skip every rollback that matters. A connection with no
+        // transaction open answers with exactly one error, which is the answer
+        // that there was nothing to roll back — a test drives both halves, so a
+        // reworded error fails there rather than making every return a discard.
         if let Err(e) = conn.execute_batch("ROLLBACK;") {
             if !e.to_string().contains(NO_TRANSACTION_TO_ROLL_BACK) {
                 return Err(e);
@@ -230,9 +242,11 @@ impl LakePool {
     }
 
     fn lock_state(&self) -> std::sync::MutexGuard<'_, PoolState> {
-        // Nothing between lock and unlock can panic, so a poisoned lock means
-        // the process is already unwinding; recover the state rather than make
-        // every later checkout fail.
+        // The only panic reachable while this lock is held is an allocation
+        // failure in the idle `Vec`, which leaves the state structurally intact.
+        // Recovering it keeps the pool serving; honouring the poison flag would
+        // turn one failed allocation into a data plane that refuses every
+        // request for the life of the process.
         self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -319,14 +333,6 @@ impl Drop for PooledConnection {
             self.pool.give_back(conn);
         }
     }
-}
-
-/// `temp_directory` reaches DuckDB inside a quoted SQL literal, the same way the
-/// catalog connection string and data path do in `ducklake::connect_ducklake`.
-/// A path is not operator-free text — it comes from the environment — so a
-/// single quote in it is doubled rather than left to end the literal early.
-fn sql_quoted(path: &Path) -> String {
-    path.display().to_string().replace('\'', "''")
 }
 
 #[cfg(test)]

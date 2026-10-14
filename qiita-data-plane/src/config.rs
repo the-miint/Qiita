@@ -62,8 +62,11 @@ const DEFAULT_POOL_SIZE: usize = 8;
 /// the Arrow batches each stream holds in flight — and the host's other work.
 const CEILING_DIVISOR: u64 = 2;
 
-/// Floor for a derived per-instance `memory_limit`, so a small ceiling divided
-/// by a large pool cannot round down to nothing.
+/// Smallest per-instance `memory_limit` worth deriving. A share below this means
+/// the pool is too big for the host rather than that the share should be rounded
+/// up: granting the floor anyway would hand `size × 256 MiB` out of a ceiling
+/// that may be smaller than that, which is the over-commit this whole change
+/// exists to remove. Boot fails instead, naming both ways out.
 const MIN_MEMORY_LIMIT_MIB: u64 = 256;
 
 /// Per-instance ceiling on spill. DuckDB's own default is 90% of the
@@ -150,7 +153,7 @@ impl Settings {
         let memory_ceiling = resources::detect_memory_ceiling();
         let thread_budget = resources::detect_thread_budget();
 
-        let size = parse_positive_usize("DUCKLAKE_POOL_SIZE", DEFAULT_POOL_SIZE)?;
+        let size = parse_positive_usize("DUCKLAKE_POOL_SIZE")?.unwrap_or(DEFAULT_POOL_SIZE);
 
         // The CPU allowance divided by the in-flight bound, so a saturated
         // pool asks for the budget once rather than once per request. Measured
@@ -159,17 +162,24 @@ impl Settings {
         // about 509 MiB per thread — an upper bound, since the probe's own
         // expression inflated both axes — so this is the setting that prices
         // concurrency.
-        let threads = match std::env::var("DUCKDB_THREADS") {
-            Ok(raw) => parse_positive_u32("DUCKDB_THREADS", &raw)?,
-            Err(_) => std::cmp::max(1, (thread_budget / size) as u32),
-        };
+        let threads = parse_positive_u32("DUCKDB_THREADS")?
+            .unwrap_or_else(|| std::cmp::max(1, (thread_budget / size) as u32));
 
         let memory_limit = match std::env::var("DUCKDB_MEMORY_LIMIT") {
             Ok(raw) if !raw.trim().is_empty() => raw,
             _ => {
                 let share_mib =
                     memory_ceiling.bytes / CEILING_DIVISOR / size as u64 / (1024 * 1024);
-                format!("{}MiB", std::cmp::max(MIN_MEMORY_LIMIT_MIB, share_mib))
+                if share_mib < MIN_MEMORY_LIMIT_MIB {
+                    return Err(format!(
+                        "a pool of {size} would get {share_mib} MiB each from the \
+                         {:.1} GiB ceiling detected via {} — below the {MIN_MEMORY_LIMIT_MIB} MiB \
+                         floor. Lower DUCKLAKE_POOL_SIZE or set DUCKDB_MEMORY_LIMIT explicitly.",
+                        memory_ceiling.bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+                        memory_ceiling.source.as_str(),
+                    ));
+                }
+                format!("{share_mib}MiB")
             }
         };
 
@@ -224,29 +234,30 @@ impl Settings {
     }
 }
 
-fn parse_positive_usize(var: &str, default: usize) -> Result<usize, String> {
-    match std::env::var(var) {
-        Ok(raw) => {
-            let value: usize = raw
-                .trim()
-                .parse()
-                .map_err(|e| format!("{var} must be a positive integer, got {raw:?}: {e}"))?;
-            if value == 0 {
-                return Err(format!("{var} must be at least 1, got 0"));
-            }
-            Ok(value)
-        }
-        Err(_) => Ok(default),
-    }
+/// `None` when the variable is unset, so each caller states its own default
+/// beside the reasoning for it.
+fn parse_positive_usize(var: &str) -> Result<Option<usize>, String> {
+    parse_positive(var)
 }
 
-fn parse_positive_u32(var: &str, raw: &str) -> Result<u32, String> {
-    let value: u32 = raw
+fn parse_positive_u32(var: &str) -> Result<Option<u32>, String> {
+    parse_positive(var)
+}
+
+fn parse_positive<T>(var: &str) -> Result<Option<T>, String>
+where
+    T: std::str::FromStr + PartialEq + From<u8>,
+    T::Err: std::fmt::Display,
+{
+    let Ok(raw) = std::env::var(var) else {
+        return Ok(None);
+    };
+    let value: T = raw
         .trim()
         .parse()
         .map_err(|e| format!("{var} must be a positive integer, got {raw:?}: {e}"))?;
-    if value == 0 {
+    if value == T::from(0u8) {
         return Err(format!("{var} must be at least 1, got 0"));
     }
-    Ok(value)
+    Ok(Some(value))
 }

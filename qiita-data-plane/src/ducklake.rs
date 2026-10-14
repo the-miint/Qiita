@@ -21,7 +21,7 @@ use duckdb::Connection;
 /// Characters disallowed in connection strings and paths interpolated into SQL.
 /// DuckDB ATTACH does not support parameterized queries, so we validate inputs
 /// before interpolation. This is input validation, not sanitization.
-fn validate_sql_literal(value: &str, field: &str) -> Result<(), String> {
+pub(crate) fn validate_sql_literal(value: &str, field: &str) -> Result<(), String> {
     if value.contains('\'') || value.contains(';') || value.contains('\0') {
         return Err(format!(
             "{field} contains disallowed characters (single quote, semicolon, or null byte)"

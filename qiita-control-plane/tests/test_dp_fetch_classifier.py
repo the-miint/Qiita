@@ -17,6 +17,7 @@ from qiita_common.backend_failure import FailureKind
 from qiita_common.models import WorkTicketFailureStage
 
 from qiita_control_plane.runner._upload import (
+    _DP_BUSY_SIGNATURES,
     _DP_TICKET_EXPIRED_SIGNATURES,
     _is_dp_busy,
     _is_dp_serialization_conflict,
@@ -270,13 +271,44 @@ def test_busy_data_plane_classified_retriable():
 
 
 def test_busy_predicate_does_not_fire_on_the_other_dp_errors():
-    """The busy match is on pyarrow's rendering of the status name, so it must not
-    swallow the failures that are permanent."""
+    """Both substrings are required, so the match covers the refusal and nothing
+    else that carries the same gRPC status."""
     assert _is_dp_busy(ValueError(_REAL_BUSY)) is True
     assert _is_dp_busy(Exception(_REAL_40001)) is False
     assert _is_dp_busy(Exception(_REAL_UNAVAILABLE)) is False
     assert _is_dp_busy(Exception(_REAL_EXPIRED)) is False
     assert _is_dp_busy(Exception("Flight returned internal error: no such table")) is False
+    # The case the status name alone would have swallowed: gRPC answers
+    # RESOURCE_EXHAUSTED for an oversized message too, and no redrive shrinks it.
+    assert (
+        _is_dp_busy(
+            ValueError(
+                "gRPC returned resource exhausted error, with message: Received message "
+                "larger than max (21368092 vs. 4194304)"
+            )
+        )
+        is False
+    )
+
+
+def test_busy_signature_matches_the_data_planes_wording():
+    """The second substring is the data plane's own prefix, which no client library
+    renders for us. A reword in `pool.rs` fails HERE rather than silently reverting
+    every refusal to a permanent BAD_INPUT."""
+    import re
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parents[2] / "qiita-data-plane" / "src" / "pool.rs").read_text()
+    m = re.search(r'Status::resource_exhausted\(format!\(\s*"([^"{]+)', src)
+    assert m, "no Status::resource_exhausted refusal found in pool.rs"
+    refusal = m.group(1).lower()
+    for sig in _DP_BUSY_SIGNATURES:
+        if sig == "resource exhausted":
+            continue  # pyarrow's rendering of the status, not the data plane's text
+        assert sig in refusal, (
+            f"the data plane now refuses with {refusal!r}; update _DP_BUSY_SIGNATURES "
+            f"({_DP_BUSY_SIGNATURES!r}) or a busy data plane classifies permanent again"
+        )
 
 
 def test_ticket_expired_classified_retriable():

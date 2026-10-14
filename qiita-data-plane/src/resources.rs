@@ -45,9 +45,8 @@ pub struct MemoryCeiling {
 }
 
 /// Consulted only when every detector declines, which on Linux means no cgroup
-/// limit and an unreadable `/proc/meminfo`. Small on purpose: a pool sized from
-/// a number nobody could measure should be too small to hurt the host, not big
-/// enough to look like a measurement.
+/// limit and an unreadable `/proc/meminfo`. Small so that a pool sized from it
+/// cannot exhaust a host whose size was never established.
 const FALLBACK_CEILING_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
 /// cgroup v1 writes a sentinel near `u64::MAX` for "no limit"; anything past a
@@ -148,7 +147,9 @@ fn parse_cgroup_v1_limit(content: &str) -> Option<u64> {
 
 /// `MemAvailable`, in kB, is what the kernel expects to be usable without
 /// swapping — the share a new pool may plan against, rather than `MemTotal`
-/// which counts what the host's other services already hold.
+/// which counts what the host's other services already hold. (The macOS
+/// detector below has no equivalent and returns the machine's total; it is a
+/// development path, never the deploy host.)
 fn parse_meminfo_available(content: &str) -> Option<u64> {
     for line in content.lines() {
         if let Some(rest) = line.strip_prefix("MemAvailable:") {

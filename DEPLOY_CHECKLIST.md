@@ -18,9 +18,9 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
 - `[operator]` (#NNN) `data-plane.env` gains five optional vars, all documented in
   `.env.data-plane.example`: `DUCKLAKE_POOL_SIZE`, `DUCKDB_THREADS`, `DUCKDB_MEMORY_LIMIT`,
   `DUCKDB_TEMP_DIRECTORY`, `DUCKDB_MAX_TEMP_DIRECTORY_SIZE`. Left unset the data plane derives
-  all of them at boot and starts, so no edit is required — but **decide the pool size
-  deliberately before the restart**, because it is both the number of requests one instance
-  serves at once and a catalog-connection budget: each attached connection holds one
+  all of them at boot and starts, so no edit is required. The pool size is worth setting
+  before the restart, because it is both the number of requests one instance serves at once
+  and a catalog-connection budget: each attached connection holds one
   lake-Postgres backend while it lives, against `max_connections = 100` (3 superuser-reserved)
   shared with the control plane and every other instance. The default is 8 per instance.
 
@@ -44,6 +44,10 @@ _None yet._
   answered**. On this host it should read the ceiling from `/proc/meminfo MemAvailable` (no
   cgroup limit is set on the unit); `fallback default` means detection found nothing and the
   pool sized itself against 8 GiB.
+- `[operator]` (#NNN) the same journal should carry no `discarding a pooled DuckLake
+  connection` lines. One per request means every return is failing its reset, which costs an
+  attach per request (measured: 84–107 ms and ~16 catalog transactions, against 3.0–3.4 ms and
+  ~3.7 on a reused one) and shows up only as slowness.
 
 ### 6. After the deploy verifies green
 
@@ -57,6 +61,10 @@ _None yet._
   retry a refusal yet** — the client half is tracked separately — so a fan-out wider than the
   pool turns into held tickets rather than slow ones. The Flight edge admits 64 concurrent
   requests per client address, which is the number to weigh the pool size against.
+- (#NNN) Per-request wall time rises with the division. A request used to take every core;
+  it now takes `threads`, and measured on this host one masked read fitted
+  `25.3 s + 611.8 s / threads` — so at 48 cores and the default pool of 8 it is ~127 s where
+  it was ~38 s. Concurrency is what the change buys back.
 
 - (#685) Work-ticket responses (`GET /work-ticket/{idx}` and the ticket lists) gain `on_success`, `follow_on_work_ticket_idx` and `follow_on_error` (all null for a ticket with no follow-on); clients validating that shape strictly must accept them.
 
