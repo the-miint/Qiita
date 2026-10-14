@@ -53,7 +53,7 @@ Give every finding exactly one disposition, and write it into the ledger:
 
 | Disposition | Means | Next |
 |---|---|---|
-| `fixed` | You changed the code | Name the commit or `path:line`. An `[outside-subject]` fix (the reviewer's Scope discipline) is a commit of its own, whose message says why it is outside the subject; one that changes behaviour also gets a bullet in the PR's changelog file. The PR-body block lists each |
+| `fixed` | You changed the code | Name the commit or `path:line`. An `[outside-subject]` fix (the reviewer's Scope discipline) is a commit of its own, whose message says why it is outside the subject; one that would warrant a changelog entry on its own (`CHANGELOG.md`, "Adding an entry") also gets a bullet in the PR's changelog file. The PR-body block lists each |
 | `declined` | Correct rule, wrong here | Record the **reason** — it goes into the next prompt |
 | `deferred` | Real, but wider than this PR (the reviewer's Scope discipline), or an `[outside-subject]` fix you did not take | Record the issue's number, or its draft title and body until it is opened (see the PR-body block), then drop it from the loop |
 | `probed` | Was `[needs-probe]`; you ran it | Record the result — confirmed or refuted |
@@ -168,7 +168,7 @@ included:
 
 - Reviewed at: <short sha of the last commit a round read> · rounds: <N> · stopped: <which stop rule>
 - Fixed: <count>
-  - <what, `path`> — outside the PR's subject, <commit sha>
+  - <what, `path`> — outside the PR's subject, <its commit shas>
 - Declined:
   - <what, `path`> — <why>
 - Deferred:

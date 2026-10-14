@@ -6,8 +6,8 @@
   changes is pinned by a test, it touches no surface `deploy-note-check` gates and needs
   no `DEPLOY_CHECKLIST.md` fold, and it makes no design choice for a maintainer. The
   `qiita-review` skill lands each one as its own commit, adds a changelog bullet when it
-  changes behaviour, names its commit to the next round, and lists it with that commit
-  under `Fixed:` in the `## Reviewer loop` block. In code such a commit wrote, a defect it
+  would warrant an entry on its own, names its commits to the next round, and lists it
+  with them under `Fixed:` in the `## Reviewer loop` block. In code such a commit wrote, a defect it
   introduced is a finding against it and a further pre-existing problem is deferred. An
   offer the author does not take, and everything else, is deferred to an issue as before.
   `review-loop-check` is unchanged.
