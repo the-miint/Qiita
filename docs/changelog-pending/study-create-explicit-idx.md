@@ -13,3 +13,9 @@
   request (exit 2).**
 - **`POST /api/v1/study` refuses a body key it does not define (422).** It used to drop the key
   and create the study without it.
+
+### Fixed
+
+- **`qiita study create --owner-email` and `qiita-admin principal set-role`, among others, report a
+  response they do not recognise (such as one from a control plane at a different version) on one
+  stderr line and exit 1, instead of printing a Python traceback.**

@@ -2391,6 +2391,33 @@ def test_connection_error_prints_friendly_message_and_exits_1(monkeypatch, capsy
     assert "QIITA_CONTROL_PLANE_URL" in err
 
 
+def test_response_failing_its_model_prints_one_line_and_exits_1(monkeypatch, capsys):
+    """A response a command parses into a model that refuses it (here a
+    principal lookup carrying only principal_idx) is one stderr line naming the
+    model, and exit code 1, not a traceback; the create is never sent."""
+    import httpx as _httpx
+
+    from qiita_control_plane.cli import _common
+    from qiita_control_plane.cli.user import main
+
+    urls: list[str] = []
+
+    def fake_request(method, url, headers=None, json=None, params=None, timeout=None):
+        urls.append(url)
+        return _httpx.Response(200, json={"principal_idx": 77}, request=_httpx.Request(method, url))
+
+    monkeypatch.setattr(_common.httpx, "request", fake_request)
+    monkeypatch.setenv("QIITA_TOKEN", "qk_test")
+
+    rc = main(["study", "create", "--title", "T", "--owner-email", "owner@example.org"])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert len(err.strip().splitlines()) == 1, err
+    assert "invalid PrincipalLookupResponse" in err
+    assert "system_role" in err
+    assert [u for u in urls if u.endswith(URL_STUDY_PREFIX)] == []
+
+
 # ---------------------------------------------------------------------------
 # --base-url http-to-non-localhost guard
 # ---------------------------------------------------------------------------

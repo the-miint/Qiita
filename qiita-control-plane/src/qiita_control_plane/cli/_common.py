@@ -623,6 +623,11 @@ def print_http_status_error(resp: httpx.Response) -> None:
     print(f"http error {resp.status_code}: {resp.text}", file=sys.stderr)
 
 
+def validation_messages(exc: ValidationError) -> str:
+    """A ValidationError's errors flattened to one stderr line."""
+    return "; ".join(f"{'.'.join(str(p) for p in e['loc'])}: {e['msg']}" for e in exc.errors())
+
+
 def print_request_error(exc: httpx.RequestError) -> None:
     """Print a transport-level failure (no HTTP response at all) to stderr,
     naming the target URL so a wrong --base-url / $QIITA_CONTROL_PLANE_URL
@@ -647,9 +652,11 @@ def run_http_subcommand(
 
     `fn` accepts a PAT string and returns the parsed JSON body (a dict for
     most routes, a list for the list endpoints). Any RuntimeError from
-    token-read, HTTPStatusError (a non-2xx response), or RequestError (no
+    token-read, HTTPStatusError (a non-2xx response), RequestError (no
     response came back at all — connection refused, DNS failure, TLS error,
-    timeout) is converted to a stderr message + exit code 1.
+    timeout), or ValidationError (a model `fn` builds or parses refused its
+    input — a request body, or a response from a control plane at a different
+    version) is converted to a stderr message + exit code 1.
 
     By default the body is pretty-printed as JSON. A verb whose payload is meant
     to be *read* rather than parsed (e.g. a log tail, whose embedded newlines are
@@ -668,6 +675,9 @@ def run_http_subcommand(
         return 1
     except httpx.RequestError as exc:
         print_request_error(exc)
+        return 1
+    except ValidationError as exc:
+        print(f"error: invalid {exc.title}: {validation_messages(exc)}", file=sys.stderr)
         return 1
     if render is not None:
         render(body)

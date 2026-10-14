@@ -294,7 +294,7 @@ async def test_create_study_minimum_body_inserts_row_and_owner_admin_grant(postg
                 owner,
             )
             assert grant is not None
-            assert grant["access_tier"] == "admin"
+            assert grant["access_tier"] == Tier.ADMIN
             assert grant["granted_by_idx"] == owner
         finally:
             await tr.rollback()
@@ -340,7 +340,7 @@ async def test_create_study_full_body_round_trips_every_field(postgres_pool):
             assert row["notes"] == "notes-1"
             # asyncpg returns JSONB as a string; decode for comparison.
             assert json.loads(row["extra_metadata"]) == extra
-            assert row["default_tier"] == "viewer"
+            assert row["default_tier"] == Tier.VIEWER
         finally:
             await tr.rollback()
 
@@ -374,7 +374,7 @@ async def test_create_study_admin_on_behalf_grants_owner_not_caller(postgres_poo
                 row["idx"],
                 owner,
             )
-            assert owner_grant["access_tier"] == "admin"
+            assert owner_grant["access_tier"] == Tier.ADMIN
             assert owner_grant["granted_by_idx"] == caller
 
             # Caller has no auto-granted row.
@@ -579,7 +579,7 @@ async def test_fetch_study_returns_full_row_for_existing_idx(postgres_pool):
             assert fetched["bioproject_accession"] == "PRJNA000001"
             assert fetched["notes"] == "notes-1"
             assert json.loads(fetched["extra_metadata"]) == extra
-            assert fetched["default_tier"] == "viewer"
+            assert fetched["default_tier"] == Tier.VIEWER
             assert fetched["created_by_idx"] == owner
             assert fetched["created_at"] == created_row["created_at"]
             assert fetched["updated_at"] == created_row["updated_at"]

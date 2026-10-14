@@ -218,18 +218,18 @@ async def insert_owner_study_access_admin(
     on self-create and the on-behalf actor on admin-creates-for-other).
 
     Raises asyncpg.UniqueViolationError if a row already exists for this
-    (study_idx, owner_idx) pair (impossible during create_study but
-    surfaced for callers reusing the helper later).
+    (study_idx, owner_idx) pair.
     """
     # Single INSERT against the (study_idx, principal_idx) unique constraint;
-    # access_tier is hardcoded to ADMIN because that is the only tier that
-    # makes sense for the owner-auto-grant path.
+    # access_tier is always ADMIN because that is the only tier that makes
+    # sense for the owner-auto-grant path.
     await conn.execute(
         "INSERT INTO qiita.study_access ("
         "    study_idx, principal_idx, access_tier, granted_by_idx"
-        ") VALUES ($1, $2, 'admin'::qiita.tier, $3)",
+        ") VALUES ($1, $2, $3::qiita.tier, $4)",
         study_idx,
         owner_idx,
+        Tier.ADMIN,
         granted_by_idx,
     )
 
@@ -569,7 +569,7 @@ async def fetch_study_list_candidates(
         " LEFT JOIN qiita.study_access sa"
         "   ON sa.study_idx = s.idx AND sa.principal_idx = $1"
         " WHERE ($2 OR s.owner_idx = $1 OR sa.access_tier IS NOT NULL"
-        "        OR ($6 AND s.default_tier = 'public'))"
+        "        OR ($6 AND s.default_tier = $7::qiita.tier))"
         "   AND ($3::text IS NULL"
         "        OR s.search_vector @@ websearch_to_tsquery('english', $3)"
         f"       OR {_STUDY_SUMMARY_TSVECTOR} @@ websearch_to_tsquery('english', $3))"
@@ -582,4 +582,5 @@ async def fetch_study_list_candidates(
         after_study_idx,
         limit,
         include_ungranted_public,
+        Tier.PUBLIC,
     )

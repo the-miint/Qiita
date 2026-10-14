@@ -214,6 +214,7 @@ fn setup_full_lake(conn: &duckdb::Connection) {
     ducklake::ensure_read_tables(conn).unwrap();
     ducklake::ensure_alignment_tables(conn).unwrap();
     ducklake::ensure_assembly_tables(conn).unwrap();
+    ducklake::ensure_amplicon_tables(conn).unwrap();
     ducklake::ensure_registration_lock(conn).unwrap();
     ducklake::ensure_exclusion_tables(conn).unwrap();
 }
@@ -229,7 +230,9 @@ fn delete_reference_drops_orphans_keeps_shared() {
     let data_path = delete_test_data_path();
     let conn = Connection::open_in_memory().unwrap();
     ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
-    ducklake::ensure_reference_tables(&conn).unwrap();
+    // delete_reference takes the registration lock, so the lake needs more
+    // than the reference tables.
+    setup_full_lake(&conn);
 
     // Unique ids so leftover rows never collide with other tests.
     let ref_a: i64 = 910_000;
