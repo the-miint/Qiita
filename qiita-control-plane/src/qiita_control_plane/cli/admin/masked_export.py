@@ -352,14 +352,17 @@ def _handle_masked_read_export(args: argparse.Namespace, parser: argparse.Argume
             else None
         ),
     )
-    # The fastq writer needs a miint DuckDB connection; open it once and reuse it
-    # across all samples (each sample re-registers the `masked` view) rather than
-    # paying a fresh connect + extension LOAD per sample. Parquet needs no DuckDB.
-    con = connect_with_miint() if args.format == "fastq" else None
-    flight_client = flight.FlightClient(args.data_plane_url)
+    con = None
+    flight_client = None
     exported = 0
     skipped = 0
     try:
+        # The fastq writer needs a miint DuckDB connection; open it once and reuse
+        # it across all samples (each sample re-registers the `masked` view) rather
+        # than paying a fresh connect + extension LOAD per sample. Parquet needs no
+        # DuckDB.
+        con = connect_with_miint() if args.format == "fastq" else None
+        flight_client = flight.FlightClient(args.data_plane_url)
         for s in samples:
             prep = s["prep_sample_idx"]
             stem = _export_stem(s, run_idx, pool_idx)
@@ -402,7 +405,8 @@ def _handle_masked_read_export(args: argparse.Namespace, parser: argparse.Argume
         print(f"error: {exc}", file=sys.stderr)
         return 1
     finally:
-        flight_client.close()
+        if flight_client is not None:
+            flight_client.close()
         if con is not None:
             con.close()
 

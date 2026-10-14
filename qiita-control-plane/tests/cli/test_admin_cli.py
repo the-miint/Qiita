@@ -1836,20 +1836,18 @@ def test_masked_read_export_fastq_refuses_existing_file(monkeypatch, tmp_path, c
     assert sorted(p.name for p in out_dir.iterdir()) == ["SAMN_B.5.7.43.R1.fastq.gz"]
 
 
-# How a data plane failure reaches the export loop depends on when it happens: a
-# refused DoGet raises FlightError, but a stream cut after its first batch raises
-# OSError from the parquet path's reader and a duckdb.Error from the fastq path's
-# COPY over that reader (probed against pyarrow 23.0.1 and duckdb 1.5.5).
+# A refused DoGet and a stream cut after its first batch reach different except
+# arms in `_handle_masked_read_export`; the comment on the later arm says why.
 @pytest.mark.parametrize(
-    ("fmt", "failure", "expected"),
+    ("fmt", "failure", "prefix", "message"),
     [
-        ("parquet", "refused", "flight error: data plane unavailable"),
-        ("parquet", "midstream", "error: data plane stream cut"),
-        ("fastq", "midstream", "data plane stream cut"),
+        ("parquet", "refused", "flight error: ", "data plane unavailable"),
+        ("parquet", "midstream", "error: ", "data plane stream cut"),
+        ("fastq", "midstream", "error: Invalid Input Error: arrow_scan", "data plane stream cut"),
     ],
 )
 def test_masked_read_export_data_plane_failure_is_an_error_not_a_traceback(
-    monkeypatch, tmp_path, capsys, fmt, failure, expected
+    monkeypatch, tmp_path, capsys, fmt, failure, prefix, message
 ):
     """A data plane failure, whether it refuses the DoGet or cuts the stream after
     its first batch, is a stderr message and exit 1, and the prep_sample being
@@ -1913,7 +1911,32 @@ def test_masked_read_export_data_plane_failure_is_an_error_not_a_traceback(
         ]
     )
     assert rc == 1
-    assert expected in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert err.startswith(prefix), err
+    assert message in err
+    assert list(out_dir.iterdir()) == []
+
+
+def test_masked_read_export_miint_load_failure_is_an_error_not_a_traceback(
+    monkeypatch, tmp_path, capsys
+):
+    """A fastq export on a client where miint cannot be installed or loaded is a
+    stderr message and exit 1, before any prep_sample is streamed."""
+    import duckdb
+    import pyarrow as pa
+
+    from qiita_control_plane.cli.admin import masked_export
+
+    def no_miint():
+        raise duckdb.IOException("Failed to download extension miint")
+
+    monkeypatch.setattr(masked_export, "connect_with_miint", no_miint)
+    table = pa.table({"read_id": ["rS0"], "sequence1": ["GGGG"]})
+    rc, out_dir = _run_fastq_export(monkeypatch, tmp_path, table)
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert err.startswith("error: "), err
+    assert "Failed to download extension miint" in err
     assert list(out_dir.iterdir()) == []
 
 
