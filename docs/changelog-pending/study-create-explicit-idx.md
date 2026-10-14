@@ -31,6 +31,6 @@
 - **`qiita-admin masked-read-export` reports a failure during an export as an error message and
   exits 1 (#711).** It printed a Python traceback when the data plane refused a prep_sample's
   stream or cut it partway, when writing a file failed, when an existing parquet file could not be
-  read, when `--data-plane-url` could not be parsed, and, for fastq, when miint could not be
-  installed or loaded. Every file already written is complete. Its messages now count
-  prep_samples, where they said samples.
+  read, when pyarrow refused `--data-plane-url`, and, for fastq, when miint could not be installed
+  or loaded. Every file already written is complete. Its messages now count prep_samples, where
+  they said samples.

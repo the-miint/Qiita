@@ -23,16 +23,16 @@ COMMENT ON COLUMN qiita.prep_sample.idx IS
     'already present in the reserved band.';
 
 COMMENT ON COLUMN qiita.sequenced_pool.idx IS
-    'Reserved-range identity: [1, 25000) is reserved for rows carried over from '
-    'legacy Qiita, which keep their original id (inserted with OVERRIDING SYSTEM '
-    'VALUE); new rows mint at 25000 and above. Any code path that writes '
+    'Reserved-range identity: [1, 25000) is reserved for pools carried over from '
+    'legacy-Qiita preps, which keep the prep''s id (inserted with OVERRIDING '
+    'SYSTEM VALUE); new rows mint at 25000 and above. Any code path that writes '
     'explicit idx values must stay below 25000 and must not collide with rows '
     'already present in the reserved band.';
 
 
 -- migrate:down
 
--- Restore the text 20260527000000 and 20260616000001 wrote.
+-- Restore the comments the reserved-range bump migrations wrote.
 
 COMMENT ON COLUMN qiita.study.idx IS
     'Reserved-range identity: [1, 25000) is reserved for the one-time '

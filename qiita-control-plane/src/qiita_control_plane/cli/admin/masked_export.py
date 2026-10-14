@@ -399,14 +399,14 @@ def _handle_masked_read_export(args: argparse.Namespace, parser: argparse.Argume
     except flight.FlightError as exc:
         print(f"flight error: {exc}", file=sys.stderr)
         return 1
-    except (duckdb.Error, OSError, pa.ArrowInvalid) as exc:
-        # Failures of the environment, not of this code: a plain ValueError or
+    except (duckdb.Error, OSError, pa.ArrowInvalid, pa.ArrowKeyError) as exc:
+        # The types the environment raises at these sites; a plain ValueError or
         # RuntimeError from a bug still ends in a traceback. A data plane failure
-        # after the first batch lands here rather than above, as OSError from the
-        # parquet path's reader or a duckdb.Error from the fastq path's COPY over
-        # it. A failed write is an OSError, a miint that will not install or load
-        # a duckdb.Error, and an unparseable --data-plane-url or an unreadable
-        # existing parquet target an ArrowInvalid.
+        # after the first batch lands here rather than above: the parquet path's
+        # reader raises OSError, the fastq path's COPY over it a duckdb.Error.
+        # ArrowInvalid and ArrowKeyError are pyarrow refusing --data-plane-url
+        # (unparseable, or a scheme with no Flight transport, such as http), and
+        # ArrowInvalid also an existing parquet target it cannot read.
         print(f"error: {exc}", file=sys.stderr)
         return 1
     finally:
