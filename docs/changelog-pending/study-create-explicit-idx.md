@@ -27,6 +27,6 @@
   `masked-read-export` and `owner-biosample-id` printed a Python traceback when the control plane
   was unreachable. `qiita mask syndna-read-count`, `qiita feature-table build` and `qiita assembly
   export` printed one line, without the URL.
-- **`qiita-admin masked-read-export` reports a data plane failure partway through an export on
-  one stderr line and exits 1.** It printed a Python traceback. Every file already written is
-  complete.
+- **`qiita-admin masked-read-export` reports a data plane failure during an export as an error
+  message and exits 1.** It printed a Python traceback, whether the data plane refused a
+  prep_sample's stream or cut it partway. Every file already written is complete.

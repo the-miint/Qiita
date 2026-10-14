@@ -224,6 +224,7 @@ def _handle_masked_read_export(args: argparse.Namespace, parser: argparse.Argume
 
     The output directory is created if missing (parents included).
     """
+    import duckdb  # noqa: PLC0415
     import pyarrow.flight as flight  # noqa: PLC0415
     import pyarrow.ipc as ipc  # noqa: PLC0415
 
@@ -393,6 +394,12 @@ def _handle_masked_read_export(args: argparse.Namespace, parser: argparse.Argume
         return 1
     except flight.FlightError as exc:
         print(f"flight error: {exc}", file=sys.stderr)
+        return 1
+    except (duckdb.Error, OSError, RuntimeError, ValueError) as exc:
+        # A data plane failure after the first batch lands here, not above: the
+        # parquet path's reader raises it as OSError, and the fastq path's COPY
+        # over that reader as a duckdb.Error.
+        print(f"error: {exc}", file=sys.stderr)
         return 1
     finally:
         flight_client.close()

@@ -1589,55 +1589,6 @@ def test_masked_read_export_unreachable_control_plane_is_one_line(
     assert list(out_dir.iterdir()) == []
 
 
-def test_masked_read_export_flight_error_is_one_line(monkeypatch, tmp_path, capsys):
-    """A data-plane failure while streaming a prep_sample's reads is one stderr
-    line and exit 1, not a traceback, and leaves no partial file behind."""
-    import pyarrow as pa
-    import pyarrow.flight as flight
-
-    from qiita_control_plane.cli import _common
-    from qiita_control_plane.cli import admin as cli
-
-    monkeypatch.setenv("QIITA_TOKEN", "qk_admin")
-    manifest = {
-        "sequenced_pool_idx": 7,
-        "sequencing_run_idx": 5,
-        "mask_idx": 3,
-        "samples": [{"prep_sample_idx": 42, "biosample_accession": "SAMN_A"}],
-    }
-    monkeypatch.setattr(_common.httpx, "request", _fake_masked_export_http(manifest))
-    fake_cls = _fake_flight_client_class({42: pa.table({"read_id": ["r"], "sequence1": ["A"]})})
-
-    def unavailable(self, ticket, options=None):
-        raise flight.FlightUnavailableError("data plane unavailable")
-
-    monkeypatch.setattr(fake_cls, "do_get", unavailable)
-    monkeypatch.setattr("pyarrow.flight.FlightClient", fake_cls)
-
-    out_dir = tmp_path / "exp"
-    out_dir.mkdir()
-    rc = cli.main(
-        [
-            "masked-read-export",
-            "--sequenced-pool-idx",
-            "7",
-            "--mask-idx",
-            "3",
-            "--format",
-            "parquet",
-            "--output-dir",
-            str(out_dir),
-            "--data-plane-url",
-            "grpc://dp:50051",
-        ]
-    )
-    assert rc == 1
-    err = capsys.readouterr().err
-    assert err.count("\n") == 1
-    assert "flight error: data plane unavailable" in err
-    assert list(out_dir.iterdir()) == []
-
-
 # ---------------------------------------------------------------------------
 # masked-read-export (fastq path — R1/R2)
 #
@@ -1883,6 +1834,87 @@ def test_masked_read_export_fastq_refuses_existing_file(monkeypatch, tmp_path, c
     assert fake_cls.instances == []
     assert preexisting.read_bytes() == b"stale"
     assert sorted(p.name for p in out_dir.iterdir()) == ["SAMN_B.5.7.43.R1.fastq.gz"]
+
+
+# How a data plane failure reaches the export loop depends on when it happens: a
+# refused DoGet raises FlightError, but a stream cut after its first batch raises
+# OSError from the parquet path's reader and a duckdb.Error from the fastq path's
+# COPY over that reader (probed against pyarrow 23.0.1 and duckdb 1.5.5).
+@pytest.mark.parametrize(
+    ("fmt", "failure", "expected"),
+    [
+        ("parquet", "refused", "flight error: data plane unavailable"),
+        ("parquet", "midstream", "error: data plane stream cut"),
+        ("fastq", "midstream", "data plane stream cut"),
+    ],
+)
+def test_masked_read_export_data_plane_failure_is_an_error_not_a_traceback(
+    monkeypatch, tmp_path, capsys, fmt, failure, expected
+):
+    """A data plane failure, whether it refuses the DoGet or cuts the stream after
+    its first batch, is a stderr message and exit 1, and the prep_sample being
+    written leaves no partial file behind."""
+    import pyarrow as pa
+    import pyarrow.flight as flight
+
+    from qiita_control_plane.cli import _common
+    from qiita_control_plane.cli import admin as cli
+
+    monkeypatch.setenv("QIITA_TOKEN", "qk_admin")
+    manifest = {
+        "sequenced_pool_idx": 7,
+        "sequencing_run_idx": 5,
+        "mask_idx": 3,
+        "samples": [{"prep_sample_idx": 42, "biosample_accession": "SAMN_A"}],
+    }
+    monkeypatch.setattr(_common.httpx, "request", _fake_masked_export_http(manifest))
+    table = pa.table(
+        {
+            "read_id": pa.array(["rS0"]),
+            "sequence1": pa.array(["GGGGCCCC"]),
+            "qual1": _qual([[40] * 8]),
+            "sequence2": pa.array([None], type=pa.string()),
+            "qual2": _qual([None]),
+        }
+    )
+
+    class _CutStream:
+        def to_reader(self):
+            def batches():
+                yield from table.to_batches()
+                raise OSError("data plane stream cut")
+
+            return pa.RecordBatchReader.from_batches(table.schema, batches())
+
+    def do_get(self, ticket, options=None):
+        if failure == "refused":
+            raise flight.FlightUnavailableError("data plane unavailable")
+        return _CutStream()
+
+    fake_cls = _fake_flight_client_class({42: table})
+    monkeypatch.setattr(fake_cls, "do_get", do_get)
+    monkeypatch.setattr("pyarrow.flight.FlightClient", fake_cls)
+
+    out_dir = tmp_path / "exp"
+    out_dir.mkdir()
+    rc = cli.main(
+        [
+            "masked-read-export",
+            "--sequenced-pool-idx",
+            "7",
+            "--mask-idx",
+            "3",
+            "--format",
+            fmt,
+            "--output-dir",
+            str(out_dir),
+            "--data-plane-url",
+            "grpc://dp:50051",
+        ]
+    )
+    assert rc == 1
+    assert expected in capsys.readouterr().err
+    assert list(out_dir.iterdir()) == []
 
 
 # ---------------------------------------------------------------------------
