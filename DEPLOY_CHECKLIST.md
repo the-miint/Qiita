@@ -40,6 +40,12 @@ _None yet._
 ### Notes (no host action)
 
 - (#685) Work-ticket responses (`GET /work-ticket/{idx}` and the ticket lists) gain `on_success`, `follow_on_work_ticket_idx` and `follow_on_error` (all null for a ticket with no follow-on); clients validating that shape strictly must accept them.
+- (#686) **golay-demux tickets that failed at `bcl_convert` must be resubmitted, not
+  resumed.** bcl-convert 4.5.4 refused the amplicon dummy sample sheet on every run.
+  `qiita ticket run <idx>` would skip the completed `bcl_convert_prep` and reuse its
+  old sheet, so submit the pool again with `qiita submit-golay-demux`, passing the
+  same `--instrument-run-id`, `--preflight-blob` and `--prep-protocol-idx` (the run,
+  pool and roster are then reused).
 
 ## Deployed history
 
