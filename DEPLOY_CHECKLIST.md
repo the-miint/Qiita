@@ -15,7 +15,7 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
 
 ### 1. Env vars — set BEFORE the deploy (most are `from_env()` fail-fast; a missing one keeps the unit down)
 
-- `[operator]` (#NNN) `data-plane.env` gains five optional vars, all documented in
+- `[operator]` (#713) `data-plane.env` gains five optional vars, all documented in
   `.env.data-plane.example`: `DUCKLAKE_POOL_SIZE`, `DUCKDB_THREADS`, `DUCKDB_MEMORY_LIMIT`,
   `DUCKDB_TEMP_DIRECTORY`, `DUCKDB_MAX_TEMP_DIRECTORY_SIZE`. Left unset the data plane derives
   each of them at boot and starts — `memory_limit` from the memory it finds free, `threads`
@@ -43,13 +43,13 @@ _None yet._
 
 ### 5. Verify
 
-- `[operator]` (#NNN) `journalctl -u qiita-data-plane@50051 -n 50` carries one
+- `[operator]` (#713) `journalctl -u qiita-data-plane@50051 -n 50` carries one
   `qiita-data-plane pool:` line per instance at boot, naming the pool size, per-connection
   `threads` and `memory_limit`, the ceiling they were divided from and **which detector
   answered**. On this host it should read the ceiling from `/proc/meminfo MemAvailable` (no
   cgroup limit is set on the unit); `fallback default` means detection found nothing and the
   pool sized itself against 8 GiB.
-- `[operator]` (#NNN) the same journal should carry no `discarding a pooled DuckLake
+- `[operator]` (#713) the same journal should carry no `discarding a pooled DuckLake
   connection` lines. One per request means every return is failing its reset, which costs an
   attach per request (measured: 84–107 ms and ~16 catalog transactions, against 3.0–3.4 ms and
   ~3.7 on a reused one) and shows up only as slowness.
@@ -60,7 +60,7 @@ _None yet._
 
 ### Notes (no host action)
 
-- (#NNN) Past the pool size, the data plane answers gRPC `RESOURCE_EXHAUSTED` rather than
+- (#713) Past the pool size, the data plane answers gRPC `RESOURCE_EXHAUSTED` rather than
   serving the request, so a fan-out wider than the pool turns into held or retried work
   rather than slow work. No client retries the call itself. Where a refusal lands today:
   a native job step gets `data_plane_transient` and the runner re-dispatches it within the
@@ -71,11 +71,11 @@ _None yet._
   `FlightError` subclasses, which the dispatcher's arms do not catch. #539 and #582 carry
   the client half. The Flight edge's own per-address admission (`deploy/nginx/qiita.conf`) is
   what to weigh the pool size against.
-- (#NNN) Per-request wall time rises with the division. A request used to take every core;
+- (#713) Per-request wall time rises with the division. A request used to take every core;
   it now takes `threads`, and measured on this host one masked read fitted
   `25.3 s + 611.8 s / threads` — so at 48 cores and the default pool of 8 it is ~127 s where
   it was ~38 s. Concurrency is what the change buys back.
-- (#NNN) A write under contention holds its connection while it retries: the registration
+- (#713) A write under contention holds its connection while it retries: the registration
   path sleeps inside its 120 s commit budget, and every writer takes the same lock, so a
   write storm can occupy the whole pool and reads are refused for that window.
 
