@@ -58,11 +58,11 @@ def _prose(text: str) -> str:
 
 
 def _markdown_files() -> list[Path]:
-    """Every Markdown file git tracks or would track: a gitignored one (`localdocs/`,
-    a `.venv`, build output) is not the repo's documentation and is absent in CI.
-    A tracked file deleted from the working tree is skipped."""
+    """Every Markdown file git tracks. An untracked one (`localdocs/`, a scratch note,
+    a `.venv`) is not the repo's documentation and is absent in CI; a new doc is
+    checked once it is staged. A tracked file deleted from the working tree is skipped."""
     out = subprocess.run(
-        ["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard", "--", "*.md"],
+        ["git", "ls-files", "-z", "--", "*.md"],
         cwd=REPO_ROOT,
         check=True,
         capture_output=True,
@@ -70,6 +70,12 @@ def _markdown_files() -> list[Path]:
     ).stdout
     paths = (REPO_ROOT / path for path in out.split("\0") if path)
     return sorted(p for p in paths if p.is_file())
+
+
+def test_discovery_finds_known_docs() -> None:
+    """A discovery that silently found nothing would make the link check vacuous."""
+    found = {p.relative_to(REPO_ROOT).as_posix() for p in _markdown_files()}
+    assert {"CLAUDE.md", "docs/architecture.md", "docs/testing.md"} <= found
 
 
 def test_relative_markdown_links_resolve() -> None:
