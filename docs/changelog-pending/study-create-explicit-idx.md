@@ -1,11 +1,12 @@
 ### Added
 
-- **A system_admin can create a study at an explicit `study_idx` in the band reserved for
-  studies from legacy Qiita (#711).** `POST /api/v1/study` takes `study_idx` below 25000, so a study
+- **A system_admin can create a study at an explicit `study_idx` in the band reserved for studies
+  from legacy Qiita (#711).** `POST /api/v1/study` takes `study_idx` below 25000, so a study
   carried over keeps its original id. Anyone else gets a 403, and an idx already in use is a 409.
   In the CLI, `qiita study create` takes `--study-idx`, and `--owner-email` to create the study
   for another user (resolved through the admin principal lookup, so it needs a system_admin token
-  carrying `admin:user`).
+  carrying `admin:user`). `GET /api/v1/study` lists studies by `study_idx`, highest first, so a
+  study created at a legacy `study_idx` comes after every minted one.
 
 ### Changed
 
@@ -16,10 +17,10 @@
 
 ### Fixed
 
-- **`qiita study create --owner-email`, `qiita-admin principal set-role` and `qiita mask
-  syndna-read-count`, among others, report a response they do not recognise (such as one from a
-  control plane at a different version) on one stderr line and exit 1 (#711).** They printed a
-  Python traceback, or for `syndna-read-count` pydantic's multi-line error.
+- **`qiita-admin principal set-role` and `qiita mask syndna-read-count`, among others, report a
+  response they do not recognise (such as one from a control plane at a different version) on one
+  stderr line and exit 1 (#711).** They printed a Python traceback, or for `syndna-read-count`
+  pydantic's multi-line error.
 - **Eight CLI commands report HTTP and connection errors with the messages the CLI's other
   control-plane commands use (#711).** A 403 from a token that predates a newly granted scope now
   prompts `qiita login`, and an unreachable control plane is one stderr line naming the URL it

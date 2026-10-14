@@ -24,6 +24,7 @@ _None yet._
 ### 3. Migrations
 
 - `[operator]` (#685) `make migrate` applies `20261009000000_work_ticket_follow_on.sql` (three nullable columns on `qiita.work_ticket`, two CHECKs, one partial index; no backfill).
+- `[operator]` (#711) `make migrate` applies `20261014000000_legacy_band_column_comments.sql` (rewords the comments on `study.idx`, `prep_sample.idx` and `sequenced_pool.idx`; no row, sequence or constraint change).
 
 ### 4. Deploy
 

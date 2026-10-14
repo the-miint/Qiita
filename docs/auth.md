@@ -355,8 +355,9 @@ What a caller may read of a study's own record — the **full** record, its
 of a study's own record"). `GET /api/v1/study/{idx}` returns the view the caller
 has (`view` in the body says which; only the full view carries an `ETag`).
 
-`GET /api/v1/study` lists the studies the caller can read at either view, newest
-first, `study:read`. Query parameters: `q` (full-text, web-search syntax:
+`GET /api/v1/study` lists the studies the caller can read at either view, highest
+`study_idx` first (a study created at a legacy `study_idx` lists after every minted one),
+`study:read`. Query parameters: `q` (full-text, web-search syntax:
 stemmed English words matched whole, over title, alias and the accessions, plus
 abstract, description, notes and funding on studies whose full record the caller
 reads; NUL is refused), `min_tier` (only studies where the caller's *own* tier

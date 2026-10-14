@@ -251,7 +251,7 @@ async def list_studies(
     ] = None,
     limit: Annotated[int, Query(ge=1, le=_MAX_LIST_LIMIT)] = _DEFAULT_LIST_LIMIT,
 ) -> StudySummaryListResponse:
-    """The studies the caller may read, newest first: the same set
+    """The studies the caller may read, highest study_idx first: the same set
     GET /study/{idx} answers (owned, shared with them at any tier, or
     public-default; every study for wet_lab_admin+). Each row says which view
     of the record that answer is."""

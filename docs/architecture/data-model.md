@@ -27,10 +27,10 @@ Raw-read identifiers extend the prep_sample hierarchy:
 
 The live deployment partitions `study.idx`, `prep_sample.idx` and `sequenced_pool.idx` into two non-overlapping bands:
 
-- **`[1, 25000)`** — reserved for the one-time legacy import from the previous Qiita installation. Historic rows preserve their original integer identifiers and are inserted with `OVERRIDING SYSTEM VALUE` (all three columns are `GENERATED ALWAYS AS IDENTITY`).
+- **`[1, 25000)`** — reserved for rows carried over from the previous Qiita installation, which keep their original integer identifiers and are inserted with `OVERRIDING SYSTEM VALUE` (all three columns are `GENERATED ALWAYS AS IDENTITY`). They are brought over a few at a time, not in one import.
 - **`[25000, ...)`** — every new row minted on this deployment.
 
-Schema migrations fast-forward the implicit identity sequences for `qiita.study.idx`, `qiita.prep_sample.idx` and `qiita.sequenced_pool.idx` past the reserved block; existing rows in `[1, 25000)` are untouched. The threshold itself is pinned on each column in the Postgres catalog via `COMMENT ON COLUMN`, so `\d+ qiita.study`, `\d+ qiita.prep_sample` and `\d+ qiita.sequenced_pool` surface the invariant without consulting the migration history. The bump is one-way — the underlying sequence operation only advances and cannot rewind without risking PK collisions — so each migration's down step drops its column comment and leaves the sequence where it is.
+Schema migrations fast-forward the implicit identity sequences for `qiita.study.idx`, `qiita.prep_sample.idx` and `qiita.sequenced_pool.idx` past the reserved block; existing rows in `[1, 25000)` are untouched. The threshold itself is pinned on each column in the Postgres catalog via `COMMENT ON COLUMN`, so `\d+ qiita.study`, `\d+ qiita.prep_sample` and `\d+ qiita.sequenced_pool` surface the invariant without consulting the migration history. The bump is one-way: the down steps of the migrations that made it drop their column comments and leave the sequences where they are, because rewinding a sequence would reissue ids already minted.
 
 A study enters the reserved band through `POST /api/v1/study` with an explicit `study_idx` (`qiita study create --study-idx`), which only a system_admin may send. The ceiling the API checks against is `LEGACY_IDX_RESERVED_CEILING` in `qiita_common.models.study`. No path writes an explicit `prep_sample.idx` or `sequenced_pool.idx`.
 

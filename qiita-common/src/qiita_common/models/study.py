@@ -175,7 +175,9 @@ class StudySummary(BaseModel):
 
 
 class StudySummaryListResponse(BaseModel):
-    """GET /api/v1/study — the studies the caller may read, newest first.
+    """GET /api/v1/study — the studies the caller may read, highest study_idx
+    first. That is newest first among minted studies; a study created at a
+    legacy study_idx (below LEGACY_IDX_RESERVED_CEILING) lists after all of them.
 
     `next_after_study_idx` is the cursor for the next page (pass it back as
     `after_study_idx`), or None on the last page. A page can hold fewer than

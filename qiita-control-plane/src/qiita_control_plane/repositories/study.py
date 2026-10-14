@@ -506,7 +506,7 @@ async def fetch_study_list_candidates(
     after_study_idx: int | None,
     limit: int,
 ) -> list[asyncpg.Record]:
-    """Up to `limit` studies, newest (highest idx) first, that the caller MIGHT
+    """Up to `limit` studies, highest idx first, that the caller MIGHT
     read, each with the caller's access fields beside its summary columns.
 
     A prefilter, not the access decision: rows come back when the caller owns
@@ -528,10 +528,10 @@ async def fetch_study_list_candidates(
     stemmed and matched whole.
 
     Keyset paging on idx (`after_study_idx`) never re-reads a skipped row, but
-    a page scans newest-first until it has `limit` candidates or the table
-    ends: a caller whose readable studies are sparse among many, or a narrow
-    `query`, scans that much, and the search is filtered on that scan rather
-    than through `study_search_vector_idx`.
+    a page scans down from the highest idx until it has `limit` candidates or
+    the table ends: a caller whose readable studies are sparse among many, or a
+    narrow `query`, scans that much, and the search is filtered on that scan
+    rather than through `study_search_vector_idx`.
     """
     return await pool_or_conn.fetch(
         "SELECT s.idx, s.title, s.alias, s.bioproject_accession, s.ena_study_accession,"

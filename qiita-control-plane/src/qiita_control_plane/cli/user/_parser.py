@@ -364,7 +364,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p_study_list = p_study_sub.add_parser(
         "list",
-        help="List your own and shared studies, newest first (GET /study)",
+        help="List your own and shared studies, highest study_idx first (GET /study)",
     )
     p_study_list.add_argument(
         "--query",
