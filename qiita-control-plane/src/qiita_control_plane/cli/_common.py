@@ -55,12 +55,18 @@ from collections.abc import Callable
 from pathlib import Path
 
 import httpx
-from qiita_common.api_paths import LOOPBACK_HOST
+from pydantic import ValidationError
+from qiita_common.api_paths import (
+    LOOPBACK_HOST,
+    PATH_ADMIN_PREFIX,
+    PATH_ADMIN_PRINCIPAL_LOOKUP_BY_EMAIL,
+)
 from qiita_common.auth_constants import (
     API_PREFIX,
     BEARER_PREFIX,
     STALE_TOKEN_SCOPE_HEADER,
 )
+from qiita_common.models import PrincipalLookupRequest, PrincipalLookupResponse
 
 # Environment-variable names and CLI defaults are CLI conventions (not part of
 # the wire protocol — those live in qiita_common.auth_constants). Keep them
@@ -500,6 +506,31 @@ def patch_with_if_match(base_url: str, token: str, path: str, body: dict) -> dic
 
 def whoami(base_url: str, token: str) -> dict:
     return call("GET", base_url, token, "/auth/whoami")
+
+
+def lookup_email_arg(value: str) -> str:
+    """argparse `type=` for an email the CLI resolves with
+    `lookup_principal_by_email`: a malformed address exits 2 before any
+    request is sent."""
+    try:
+        PrincipalLookupRequest(email=value)
+    except ValidationError as exc:
+        raise argparse.ArgumentTypeError(f"not an email address: {value!r}") from exc
+    return value
+
+
+def lookup_principal_by_email(base_url: str, token: str, email: str) -> PrincipalLookupResponse:
+    """Resolve a user's email to their principal through
+    POST /admin/principal/lookup-by-email (see routes/admin.py for who may)."""
+    body = PrincipalLookupRequest(email=email).model_dump(mode="json")
+    found = call(
+        "POST",
+        base_url,
+        token,
+        f"{PATH_ADMIN_PREFIX}{PATH_ADMIN_PRINCIPAL_LOOKUP_BY_EMAIL}",
+        json=body,
+    )
+    return PrincipalLookupResponse.model_validate(found)
 
 
 def resolve_owner_idx(

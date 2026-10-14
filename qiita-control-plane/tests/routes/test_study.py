@@ -37,6 +37,7 @@ from qiita_common.api_paths import (
     URL_STUDY_PREFIX,
 )
 from qiita_common.auth_constants import Scope
+from qiita_common.models import LEGACY_IDX_RESERVED_CEILING, Tier
 
 from qiita_control_plane.testing.db_seeds import (
     fetch_export_entity_id,
@@ -144,8 +145,8 @@ async def test_post_study_regular_user_self_owner_idx_omitted(ctx):
     assert rj["owner_idx"] == ctx["user_session"]["principal_idx"]
     assert rj["created_by_idx"] == ctx["user_session"]["principal_idx"]
     assert rj["title"] == title
-    # Schema default applies for default_tier when the body omits it.
-    assert rj["default_tier"] == "member"
+    # An omitted default_tier falls back to member.
+    assert rj["default_tier"] == Tier.MEMBER
 
     grant = await ctx["pool"].fetchrow(
         "SELECT access_tier, granted_by_idx"
@@ -154,7 +155,7 @@ async def test_post_study_regular_user_self_owner_idx_omitted(ctx):
         rj["study_idx"],
         rj["owner_idx"],
     )
-    assert grant["access_tier"] == "admin"
+    assert grant["access_tier"] == Tier.ADMIN
     assert grant["granted_by_idx"] == ctx["user_session"]["principal_idx"]
 
 
@@ -247,7 +248,7 @@ async def test_post_study_wet_lab_admin_on_behalf_of_other_user(ctx):
         rj["study_idx"],
         target_idx,
     )
-    assert grant["access_tier"] == "admin"
+    assert grant["access_tier"] == Tier.ADMIN
     assert grant["granted_by_idx"] == ctx["wet_session"]["principal_idx"]
 
     # The admin caller does NOT get a study_access row from the auto-grant.
@@ -389,6 +390,12 @@ async def test_post_study_empty_title_422(ctx):
     assert resp.status_code == 422
 
 
+async def test_post_study_unknown_key_422(ctx):
+    """A key StudyCreate does not define is a 422 (see its model_config)."""
+    resp = await _post_study(ctx["user"], ctx, title=_unique_title("unknown-key"), study_id=1)
+    assert resp.status_code == 422
+
+
 # ===========================================================================
 # Repository exception mapping
 # ===========================================================================
@@ -498,6 +505,104 @@ async def test_post_study_two_null_ena_accessions_both_succeed(ctx):
     )
     assert second.status_code == 201, second.text
     assert second.json()["ena_study_accession"] is None
+
+
+# ===========================================================================
+# Explicit study_idx — the band reserved for studies from legacy Qiita
+# ===========================================================================
+
+
+async def _free_reserved_study_idx(pool) -> int:
+    """An idx in the reserved band that no study holds. Picked at random rather
+    than lowest-free so tests running at once do not reach for the same one."""
+    idx = await pool.fetchval(
+        "SELECT i FROM generate_series(1, $1::int - 1) AS i"
+        " WHERE NOT EXISTS (SELECT 1 FROM qiita.study WHERE idx = i)"
+        " ORDER BY random() LIMIT 1",
+        LEGACY_IDX_RESERVED_CEILING,
+    )
+    assert idx is not None, "every study_idx in the reserved band is taken"
+    return idx
+
+
+async def test_post_study_system_admin_explicit_study_idx_lands_there(ctx):
+    """A system_admin's explicit study_idx is the row's idx, on behalf of another
+    owner, and the row gets what a minted one does: its export_entity_id and
+    the owner's ADMIN study_access row."""
+    target_idx = await seed_user_principal(ctx["pool"], prefix=_SEED_PREFIX, suffix="idx-owner")
+    ctx["created"]["user_principals"].append(target_idx)
+    study_idx = await _free_reserved_study_idx(ctx["pool"])
+
+    resp = await _post_study(
+        ctx["admin"],
+        ctx,
+        title=_unique_title("explicit-idx"),
+        study_idx=study_idx,
+        owner_idx=target_idx,
+    )
+    assert resp.status_code == 201, resp.text
+    rj = resp.json()
+    assert rj["study_idx"] == study_idx
+    assert rj["owner_idx"] == target_idx
+    assert rj["export_entity_id"] == await fetch_export_entity_id(
+        ctx["pool"], kind="study", entity_idx=study_idx
+    )
+    grant = await ctx["pool"].fetchval(
+        "SELECT access_tier FROM qiita.study_access WHERE study_idx = $1 AND principal_idx = $2",
+        study_idx,
+        target_idx,
+    )
+    assert grant == Tier.ADMIN
+
+
+async def test_post_study_without_study_idx_mints_above_reserved_band(ctx):
+    """A minted idx is at or above LEGACY_IDX_RESERVED_CEILING. Pins the constant
+    against the identity the database actually runs: a ceiling set above it
+    would admit explicit idxs the identity also mints."""
+    resp = await _post_study(ctx["user"], ctx, title=_unique_title("minted-idx"))
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["study_idx"] >= LEGACY_IDX_RESERVED_CEILING
+
+
+@pytest.mark.parametrize("role", ["wet", "user"])
+async def test_post_study_explicit_study_idx_below_system_admin_403(ctx, role):
+    """An explicit study_idx is system_admin only; wet_lab_admin, which may
+    create on behalf of others, still may not choose the idx."""
+    study_idx = await _free_reserved_study_idx(ctx["pool"])
+
+    resp = await _post_study(
+        ctx[role], ctx, title=_unique_title(f"idx-{role}"), study_idx=study_idx
+    )
+    assert resp.status_code == 403, resp.text
+    assert "requires system_admin" in resp.json()["detail"]
+    assert await ctx["pool"].fetchval("SELECT 1 FROM qiita.study WHERE idx = $1", study_idx) is None
+
+
+async def test_post_study_explicit_study_idx_in_use_409(ctx):
+    """A second create at the same explicit study_idx trips study_pkey and maps
+    to 409 with the per-column detail."""
+    study_idx = await _free_reserved_study_idx(ctx["pool"])
+    first = await _post_study(
+        ctx["admin"], ctx, title=_unique_title("idx-first"), study_idx=study_idx
+    )
+    assert first.status_code == 201, first.text
+
+    resp = await _post_study(
+        ctx["admin"], ctx, title=_unique_title("idx-second"), study_idx=study_idx
+    )
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["detail"] == "study_idx already in use"
+
+
+async def test_post_study_explicit_study_idx_at_ceiling_422(ctx):
+    """The ceiling itself is outside the band: it is the identity's first value."""
+    resp = await _post_study(
+        ctx["admin"],
+        ctx,
+        title=_unique_title("idx-ceiling"),
+        study_idx=LEGACY_IDX_RESERVED_CEILING,
+    )
+    assert resp.status_code == 422, resp.text
 
 
 # ===========================================================================

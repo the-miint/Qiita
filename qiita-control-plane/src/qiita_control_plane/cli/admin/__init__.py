@@ -155,7 +155,7 @@ def _build_parser() -> argparse.ArgumentParser:
         " existing tokens at once; a promotion reaches them only on a token minted"
         " after it, so the user must `qiita login` again.",
     )
-    p_set_role.add_argument("--email", required=True)
+    p_set_role.add_argument("--email", required=True, type=_common.lookup_email_arg)
     p_set_role.add_argument("--role", required=True, choices=list(_VALID_ROLE_VALUES))
     p_set_role.add_argument(
         "--reason", required=True, type=_nonblank_reason, help="Recorded in the audit event"
