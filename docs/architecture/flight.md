@@ -20,11 +20,13 @@ Client interfaces are the user-facing layer through which researchers and system
 
 Every DoGet and every DoAction borrows one connection from a bounded pool
 ([`qiita-data-plane/src/pool.rs`](../../qiita-data-plane/src/pool.rs)), so the
-pool's size is the number of *those* one data plane serves at once. **DoPut is
-not bounded by it** — an upload streams straight to Parquet without touching the
-catalog, so concurrent DoPuts are limited only by the edge's per-address
-admission. A request that arrives with every connection lent out is refused
-immediately with gRPC
+pool's size is the number of *those* one data plane serves at once. **DoPut is bounded separately**, by
+`FLIGHT_MAX_CONCURRENT_DOPUT` permits rather than by the pool: an upload streams
+straight to Parquet without touching the catalog, so it borrows no connection,
+and its cost is the batches in flight — measured against a real data plane, peak
+RSS rose from 165 MiB at one upload to 1,103 MiB at sixteen with 8 MiB batches
+and 3,014 MiB at sixteen with 64 MiB batches. A request that arrives with every
+connection (or permit) taken is refused immediately with gRPC
 `RESOURCE_EXHAUSTED` and a message naming the bound, rather than queued — the
 reasoning, and the edge limits it rests on, are in `pool.rs`. **No client retries
 the call itself yet.** What a refusal becomes instead depends on the caller: a

@@ -255,6 +255,32 @@ async def run_native_job(
         # NO_DATA transition. Must sit ABOVE the generic `except ValueError`
         # below so empty input is never reclassified as BAD_INPUT.
         raise
+    except (pyarrow.ArrowException, pyarrow.flight.FlightError) as exc:
+        # A pyarrow or Flight failure. Only the conditions the data plane is known
+        # to recover from are classified — the same set the control plane's pre-loop
+        # resolvers use, from one shared module so a reword in the data plane cannot
+        # leave the two disagreeing. Everything else re-raises and propagates with
+        # its traceback, which is what a job's own Arrow or Parquet failure should
+        # do.
+        #
+        # This arm catches by type and sits ABOVE the `NotImplementedError` and
+        # `ValueError` arms, because pyarrow's classes inherit from builtins that
+        # those arms would otherwise claim first: the refusal arrives as
+        # `ArrowInvalid`, which IS a ValueError, and an unsupported cast arrives as
+        # `ArrowNotImplementedError`, which IS a NotImplementedError and would
+        # otherwise be reported as a job module that ships without an `execute()`.
+        # Both bases are listed because the two hierarchies overlap only in the
+        # concrete classes: `FlightUnavailableError` is a `(FlightError,
+        # ArrowException)`, while `FlightError` itself derives from `Exception`
+        # alone (measured on pyarrow 23.0.1 and 25.0.0).
+        if not is_data_plane_transient(exc):
+            raise
+        raise BackendFailure(
+            kind=FailureKind.DATA_PLANE_TRANSIENT,
+            stage=WorkTicketFailureStage.STEP_RUN,
+            step_name=step_name,
+            reason=f"native job {module_name!r}: {exc}",
+        ) from exc
     except NotImplementedError as exc:
         # Skeleton path: a job module that ships before its execute() is
         # written. Permanent — retry produces the same NotImplementedError.
@@ -271,56 +297,12 @@ async def run_native_job(
             step_name=step_name,
             reason=str(exc),
         ) from exc
-    except (pyarrow.ArrowException, pyarrow.flight.FlightError) as exc:
-        # A Flight call the step made failed. Only the conditions the data plane is
-        # known to recover from are classified — the same set the control plane's
-        # pre-loop resolvers use, from one shared module so a reword in the data
-        # plane cannot leave the two disagreeing. Anything else re-raises and keeps
-        # the unclassified behaviour it has today, including a pyarrow error raised
-        # by a job's own Parquet or Arrow work rather than by a Flight call.
-        #
-        # This arm catches by type where the one below catches `ValueError`, because
-        # pyarrow raises these as `FlightError` subclasses, which are not
-        # ValueErrors — the refusal is the exception, arriving as `ArrowInvalid`.
-        # Both bases are listed because the two hierarchies only overlap in the
-        # concrete classes: `FlightUnavailableError` is a `(FlightError,
-        # ArrowException)`, while `FlightError` itself derives from `Exception`
-        # alone (measured on pyarrow 23.0.1 and 25.0.0).
-        if not is_data_plane_transient(exc):
-            raise
-        raise BackendFailure(
-            kind=FailureKind.DATA_PLANE_TRANSIENT,
-            stage=WorkTicketFailureStage.STEP_RUN,
-            step_name=step_name,
-            reason=f"native job {module_name!r}: {exc}",
-        ) from exc
     except ValueError as exc:
-        if isinstance(exc, pyarrow.ArrowInvalid) and is_data_plane_transient(exc):
-            # The data plane refused the step's Flight call because every DuckLake
-            # connection in its pool was in use. Retriable, and it has to be
-            # separated from the arm below rather than left to it: pyarrow raises
-            # `ArrowInvalid` for that gRPC status (measured on 23.0.1 and 25.0.0)
-            # and `ArrowInvalid` is a ValueError, so otherwise an overload is
-            # recorded as a data-quality problem and the ticket never retries.
-            # The type is checked as well as the text because job code
-            # interpolates user-supplied values into its own ValueError messages,
-            # and one carrying this text must not turn a permanent data-quality
-            # failure into something the runner retries to exhaustion.
-            #
-            # The data plane's other transient failures do NOT arrive here:
-            # pyarrow raises gRPC UNAVAILABLE and INTERNAL as `FlightError`
-            # subclasses, which are not ValueErrors, so they escape this
-            # dispatcher and the step fails permanently. Converging that with the
-            # control plane's classifier is tracked separately.
-            raise BackendFailure(
-                kind=FailureKind.DATA_PLANE_TRANSIENT,
-                stage=WorkTicketFailureStage.STEP_RUN,
-                step_name=step_name,
-                reason=f"native job {module_name!r}: {exc}",
-            ) from exc
         # Data-quality issues raised from inside execute() (malformed
         # FASTA, unmapped hashes, etc.). Permanent because the same
-        # input always fails the same way.
+        # input always fails the same way. A data-plane failure cannot
+        # land here: pyarrow's are caught by type above, so job text that
+        # happens to quote a data-plane message is not reclassified.
         raise BackendFailure(
             kind=FailureKind.BAD_INPUT,
             stage=WorkTicketFailureStage.STEP_RUN,

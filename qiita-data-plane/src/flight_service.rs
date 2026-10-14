@@ -108,6 +108,16 @@ pub struct QiitaFlightService {
     /// lent out is refused with a retriable status rather than opening another
     /// DuckDB that would size itself against the whole host.
     pool: Arc<LakePool>,
+    /// Permits for concurrent DoPuts, which borrow no connection and so are not
+    /// bounded by the pool.
+    ///
+    /// An upload decodes Arrow batches and writes Parquet; its cost is the
+    /// batches in flight, and measured against a real data plane that cost is
+    /// linear in both concurrency and batch size — peak RSS 165 MiB at one
+    /// upload, 1,103 MiB at sixteen with 8 MiB batches, and 3,014 MiB at sixteen
+    /// with 64 MiB batches. Nothing in the process bounded how many ran, so the
+    /// ceiling was whatever the edge admitted per client address.
+    doput_permits: Arc<tokio::sync::Semaphore>,
     /// Root for DoPut staging — uploads land at
     /// `{root}/uploads/{upload_idx}/upload.parquet`. CP and DP must agree
     /// on the layout convention (CP derives the same path on the read
@@ -124,15 +134,38 @@ impl QiitaFlightService {
     pub fn new(
         flight_public_key: ed25519_dalek::VerifyingKey,
         pool: Arc<LakePool>,
+        max_concurrent_doput: usize,
         upload_staging_root: PathBuf,
         scratch_root: PathBuf,
     ) -> Self {
         Self {
             flight_public_key,
             pool,
+            doput_permits: Arc::new(tokio::sync::Semaphore::new(max_concurrent_doput)),
             upload_staging_root,
             scratch_root,
         }
+    }
+
+    /// Run one blocking lake operation on a borrowed connection.
+    ///
+    /// Every DoAction that touches the lake is this shape, and the shape is the
+    /// reason: DuckDB work is synchronous and some of it is long-lived, so it runs
+    /// on the blocking pool rather than starving a tonic async worker. The
+    /// borrowed connection moves into the closure, which makes the closure `Send`
+    /// and keeps it clear of any await; it returns to the pool when the task ends,
+    /// including when the task ends because the request failed or the client went
+    /// away. `what` names the operation in the one error this adds — a join
+    /// failure, which means the blocking task panicked or was cancelled.
+    async fn blocking_lake<T, F>(&self, what: &str, work: F) -> Result<T, Status>
+    where
+        F: FnOnce(&Connection) -> Result<T, Status> + Send + 'static,
+        T: Send + 'static,
+    {
+        let conn = self.pool.checkout()?;
+        tokio::task::spawn_blocking(move || work(&conn))
+            .await
+            .map_err(|e| Status::internal(format!("{what} task join failed: {e}")))?
     }
 }
 
@@ -743,19 +776,14 @@ impl FlightService for QiitaFlightService {
                     )));
                 }
 
-                // register_files moves files and runs a blocking DuckLake
-                // transaction; run it on the blocking pool so it never starves a
-                // tonic async worker (mirrors export_read / count_masked). The
-                // borrowed instance moves into the closure, so it is Send and
-                // crosses no await, and returns to the pool when the task ends.
-                let conn = self.pool.checkout()?;
+                // Moves files, then runs one DuckLake transaction.
                 let data_path = self.pool.data_path().to_string();
                 let scratch_root = self.scratch_root.clone();
-                let registration = tokio::task::spawn_blocking(move || {
-                    register_files(&conn, &data_path, &scratch_root, &payload)
-                })
-                .await
-                .map_err(|e| Status::internal(format!("register_files task join failed: {e}")))??;
+                let registration = self
+                    .blocking_lake("register_files", move |conn| {
+                        register_files(conn, &data_path, &scratch_root, &payload)
+                    })
+                    .await?;
 
                 let result_body = serde_json::to_vec(&serde_json::json!({
                     "registered": registration.registered,
@@ -780,18 +808,12 @@ impl FlightService for QiitaFlightService {
                     )));
                 }
 
-                // Blocking DuckLake delete transaction — run it on the blocking
-                // pool so it never starves a tonic async worker (mirrors
-                // export_read / count_masked). The borrowed instance moves into
-                // the closure, so it is Send and crosses no await.
-                let conn = self.pool.checkout()?;
                 let reference_idx = payload.reference_idx;
-                let deleted =
-                    tokio::task::spawn_blocking(move || delete_reference(&conn, reference_idx))
-                        .await
-                        .map_err(|e| {
-                            Status::internal(format!("delete_reference task join failed: {e}"))
-                        })??;
+                let deleted = self
+                    .blocking_lake("delete_reference", move |conn| {
+                        delete_reference(conn, reference_idx)
+                    })
+                    .await?;
 
                 let result_body = serde_json::to_vec(&deleted)
                     .map_err(|e| Status::internal(format!("json serialization failed: {e}")))?;
@@ -813,17 +835,10 @@ impl FlightService for QiitaFlightService {
                     )));
                 }
 
-                // Blocking DuckLake delete transaction — run it on the blocking
-                // pool so it never starves a tonic async worker (mirrors
-                // export_read / count_masked). The borrowed instance moves into
-                // the closure, so it is Send and crosses no await.
-                let conn = self.pool.checkout()?;
                 let mask_idx = payload.mask_idx;
-                let deleted = tokio::task::spawn_blocking(move || delete_mask(&conn, mask_idx))
-                    .await
-                    .map_err(|e| {
-                        Status::internal(format!("delete_mask task join failed: {e}"))
-                    })??;
+                let deleted = self
+                    .blocking_lake("delete_mask", move |conn| delete_mask(conn, mask_idx))
+                    .await?;
 
                 let result_body = serde_json::to_vec(&deleted)
                     .map_err(|e| Status::internal(format!("json serialization failed: {e}")))?;
@@ -845,19 +860,12 @@ impl FlightService for QiitaFlightService {
                     )));
                 }
 
-                // Blocking DuckLake delete transaction — run it on the blocking
-                // pool so it never starves a tonic async worker (mirrors
-                // export_read / count_masked). The borrowed instance moves into
-                // the closure, so it is Send and crosses no await.
-                let conn = self.pool.checkout()?;
                 let prep_sample_idxs = payload.prep_sample_idxs;
-                let deleted = tokio::task::spawn_blocking(move || {
-                    delete_pool_reads(&conn, &prep_sample_idxs)
-                })
-                .await
-                .map_err(|e| {
-                    Status::internal(format!("delete_pool_reads task join failed: {e}"))
-                })??;
+                let deleted = self
+                    .blocking_lake("delete_pool_reads", move |conn| {
+                        delete_pool_reads(conn, &prep_sample_idxs)
+                    })
+                    .await?;
 
                 let result_body = serde_json::to_vec(&deleted)
                     .map_err(|e| Status::internal(format!("json serialization failed: {e}")))?;
@@ -887,20 +895,13 @@ impl FlightService for QiitaFlightService {
                     ));
                 }
 
-                // Blocking DuckLake delete transaction — run it on the blocking
-                // pool so it never starves a tonic async worker (mirrors
-                // delete_alignment_block). The borrowed instance moves into the
-                // closure, so it is Send and crosses no await.
-                let conn = self.pool.checkout()?;
                 let mask_idx = payload.mask_idx;
                 let members = payload.members;
-                let deleted = tokio::task::spawn_blocking(move || {
-                    delete_read_mask_block(&conn, mask_idx, &members)
-                })
-                .await
-                .map_err(|e| {
-                    Status::internal(format!("delete_read_mask_block task join failed: {e}"))
-                })??;
+                let deleted = self
+                    .blocking_lake("delete_read_mask_block", move |conn| {
+                        delete_read_mask_block(conn, mask_idx, &members)
+                    })
+                    .await?;
 
                 let result_body = serde_json::to_vec(&deleted)
                     .map_err(|e| Status::internal(format!("json serialization failed: {e}")))?;
@@ -922,18 +923,12 @@ impl FlightService for QiitaFlightService {
                     )));
                 }
 
-                // Blocking DuckLake delete transaction — run it on the blocking
-                // pool so it never starves a tonic async worker (mirrors
-                // delete_mask). The borrowed instance moves into the closure, so
-                // it is Send and crosses no await.
-                let conn = self.pool.checkout()?;
                 let alignment_idx = payload.alignment_idx;
-                let deleted =
-                    tokio::task::spawn_blocking(move || delete_alignment(&conn, alignment_idx))
-                        .await
-                        .map_err(|e| {
-                            Status::internal(format!("delete_alignment task join failed: {e}"))
-                        })??;
+                let deleted = self
+                    .blocking_lake("delete_alignment", move |conn| {
+                        delete_alignment(conn, alignment_idx)
+                    })
+                    .await?;
 
                 let result_body = serde_json::to_vec(&deleted)
                     .map_err(|e| Status::internal(format!("json serialization failed: {e}")))?;
@@ -964,20 +959,13 @@ impl FlightService for QiitaFlightService {
                     ));
                 }
 
-                // Blocking DuckLake delete transaction — run it on the blocking
-                // pool so it never starves a tonic async worker (mirrors
-                // delete_alignment). The borrowed instance moves into the
-                // closure, so it is Send and crosses no await.
-                let conn = self.pool.checkout()?;
                 let alignment_idx = payload.alignment_idx;
                 let members = payload.members;
-                let deleted = tokio::task::spawn_blocking(move || {
-                    delete_alignment_block(&conn, alignment_idx, &members)
-                })
-                .await
-                .map_err(|e| {
-                    Status::internal(format!("delete_alignment_block task join failed: {e}"))
-                })??;
+                let deleted = self
+                    .blocking_lake("delete_alignment_block", move |conn| {
+                        delete_alignment_block(conn, alignment_idx, &members)
+                    })
+                    .await?;
 
                 let result_body = serde_json::to_vec(&deleted)
                     .map_err(|e| Status::internal(format!("json serialization failed: {e}")))?;
@@ -1001,20 +989,13 @@ impl FlightService for QiitaFlightService {
                     )));
                 }
 
-                // Blocking DuckLake delete transaction — run it on the blocking
-                // pool so it never starves a tonic async worker (mirrors
-                // delete_alignment). The borrowed instance moves into the
-                // closure, so it is Send and crosses no await.
-                let conn = self.pool.checkout()?;
                 let alignment_idx = payload.alignment_idx;
                 let prep_sample_idx = payload.prep_sample_idx;
-                let deleted = tokio::task::spawn_blocking(move || {
-                    delete_alignment_sample(&conn, alignment_idx, prep_sample_idx)
-                })
-                .await
-                .map_err(|e| {
-                    Status::internal(format!("delete_alignment_sample task join failed: {e}"))
-                })??;
+                let deleted = self
+                    .blocking_lake("delete_alignment_sample", move |conn| {
+                        delete_alignment_sample(conn, alignment_idx, prep_sample_idx)
+                    })
+                    .await?;
 
                 let result_body = serde_json::to_vec(&deleted)
                     .map_err(|e| Status::internal(format!("json serialization failed: {e}")))?;
@@ -1040,18 +1021,14 @@ impl FlightService for QiitaFlightService {
                 // inlined into a DuckDB `COPY ... TO` literal and written to.
                 let dest = validate_export_dest(&payload.dest, &self.scratch_root)?;
 
-                // `COPY` is synchronous and, for a whole prep_sample, long-lived —
-                // run it on the blocking pool so it never starves a tonic async
-                // worker. The borrowed instance moves into the closure, so it is
-                // Send and crosses no await (mirrors `register_files`).
-                let conn = self.pool.checkout()?;
+                // `COPY` is long-lived for a whole prep_sample.
                 let scratch_root = self.scratch_root.clone();
                 let prep = payload.prep_sample_idx;
-                let count = tokio::task::spawn_blocking(move || {
-                    export_read_to_parquet(&conn, prep, &dest, &scratch_root)
-                })
-                .await
-                .map_err(|e| Status::internal(format!("export_read task join failed: {e}")))??;
+                let count = self
+                    .blocking_lake("export_read", move |conn| {
+                        export_read_to_parquet(conn, prep, &dest, &scratch_root)
+                    })
+                    .await?;
 
                 let result_body = serde_json::to_vec(&serde_json::json!({
                     "count": count,
@@ -1095,15 +1072,11 @@ impl FlightService for QiitaFlightService {
                 let prep_sample_idx = single_i64_filter(&payload.filter, "prep_sample_idx")?;
                 let mask_idx = single_i64_filter(&payload.filter, "mask_idx")?;
 
-                // count(*) is synchronous DuckDB work; run it on the blocking
-                // pool so it never starves a tonic async worker (mirrors
-                // export_read). The borrowed instance moves into the closure.
-                let conn = self.pool.checkout()?;
-                let count = tokio::task::spawn_blocking(move || {
-                    count_masked_reads(&conn, prep_sample_idx, mask_idx)
-                })
-                .await
-                .map_err(|e| Status::internal(format!("count_masked task join failed: {e}")))??;
+                let count = self
+                    .blocking_lake("count_masked", move |conn| {
+                        count_masked_reads(conn, prep_sample_idx, mask_idx)
+                    })
+                    .await?;
 
                 let result_body = serde_json::to_vec(&serde_json::json!({ "count": count }))
                     .map_err(|e| Status::internal(format!("json serialization failed: {e}")))?;
@@ -1129,16 +1102,12 @@ impl FlightService for QiitaFlightService {
                 let mask_idx = payload.mask_idx;
                 let prep_sample_idx = payload.prep_sample_idx;
 
-                // The aggregate is a synchronous DuckDB count over the light
-                // `read_mask` table; run it on the blocking pool so it never
-                // starves a tonic async worker (mirrors count_masked). The
-                // borrowed instance moves into the closure.
-                let conn = self.pool.checkout()?;
-                let counts = tokio::task::spawn_blocking(move || {
-                    mask_metrics_counts(&conn, mask_idx, prep_sample_idx)
-                })
-                .await
-                .map_err(|e| Status::internal(format!("mask_metrics task join failed: {e}")))??;
+                // A count over the light `read_mask` table, not over `read`.
+                let counts = self
+                    .blocking_lake("mask_metrics", move |conn| {
+                        mask_metrics_counts(conn, mask_idx, prep_sample_idx)
+                    })
+                    .await?;
 
                 let result_body = serde_json::to_vec(&counts)
                     .map_err(|e| Status::internal(format!("json serialization failed: {e}")))?;
@@ -1165,20 +1134,13 @@ impl FlightService for QiitaFlightService {
                 // is inlined into a DuckDB `read_parquet(...)` literal and read.
                 let dest = validate_export_dest(&payload.dest, &self.scratch_root)?;
 
-                // The full-replace runs a blocking DuckLake transaction (and a
-                // blocking `canonicalize` in the handler) — run it on the blocking
-                // pool so it never starves a tonic async worker (mirrors
-                // register_files / export_read). The borrowed instance moves into
-                // the closure, so it is Send and crosses no await.
-                let conn = self.pool.checkout()?;
+                // A full replace, plus a blocking `canonicalize` in the handler.
                 let scratch_root = self.scratch_root.clone();
-                let result = tokio::task::spawn_blocking(move || {
-                    sync_reference_exclusion(&conn, &dest, &scratch_root)
-                })
-                .await
-                .map_err(|e| {
-                    Status::internal(format!("sync_reference_exclusion task join failed: {e}"))
-                })??;
+                let result = self
+                    .blocking_lake("sync_reference_exclusion", move |conn| {
+                        sync_reference_exclusion(conn, &dest, &scratch_root)
+                    })
+                    .await?;
 
                 let result_body = serde_json::to_vec(&result)
                     .map_err(|e| Status::internal(format!("json serialization failed: {e}")))?;
@@ -1201,18 +1163,12 @@ impl FlightService for QiitaFlightService {
                     )));
                 }
 
-                // One blocking DuckLake transaction, like sync_reference_exclusion:
-                // run it on the blocking pool so it never starves a tonic async
-                // worker. The borrowed instance moves into the closure.
-                let conn = self.pool.checkout()?;
                 let reference_idx = payload.reference_idx;
-                let result = tokio::task::spawn_blocking(move || {
-                    mint_phylogeny_edge_id(&conn, reference_idx)
-                })
-                .await
-                .map_err(|e| {
-                    Status::internal(format!("mint_phylogeny_edge_id task join failed: {e}"))
-                })??;
+                let result = self
+                    .blocking_lake("mint_phylogeny_edge_id", move |conn| {
+                        mint_phylogeny_edge_id(conn, reference_idx)
+                    })
+                    .await?;
 
                 let result_body = serde_json::to_vec(&result)
                     .map_err(|e| Status::internal(format!("json serialization failed: {e}")))?;
@@ -1286,6 +1242,21 @@ impl QiitaFlightService {
                 payload.action
             )));
         }
+
+        // One permit per upload in flight, taken after the ticket verifies so an
+        // unauthenticated caller cannot spend one, and held until the staged file
+        // is written. `try_acquire`, not `acquire`: an upload that waited here
+        // would hold its stream open at the edge exactly as a queued DoGet would,
+        // which is the reasoning in `pool.rs`. The refusal carries the same
+        // "data plane busy" prefix, so the classification both services share
+        // (`qiita_common.data_plane_errors`) files it as retriable without
+        // knowing which surface refused.
+        let _upload_permit = self.doput_permits.try_acquire().map_err(|_| {
+            Status::resource_exhausted(format!(
+                "data plane busy: all {} concurrent uploads are in use; retry",
+                self.doput_permits.available_permits() + 1
+            ))
+        })?;
 
         // Resolve staging path, create parent dir.
         let staging_path = staging_path_for(&self.upload_staging_root, payload.upload_idx);

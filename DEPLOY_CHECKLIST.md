@@ -15,9 +15,10 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
 
 ### 1. Env vars — set BEFORE the deploy (most are `from_env()` fail-fast; a missing one keeps the unit down)
 
-- `[operator]` (#713) `data-plane.env` gains five optional vars, all documented in
+- `[operator]` (#713) `data-plane.env` gains six optional vars, all documented in
   `.env.data-plane.example`: `DUCKLAKE_POOL_SIZE`, `DUCKDB_THREADS`, `DUCKDB_MEMORY_LIMIT`,
-  `DUCKDB_TEMP_DIRECTORY`, `DUCKDB_MAX_TEMP_DIRECTORY_SIZE`. Left unset the data plane derives
+  `DUCKDB_TEMP_DIRECTORY`, `DUCKDB_MAX_TEMP_DIRECTORY_SIZE`, `FLIGHT_MAX_CONCURRENT_DOPUT`.
+  Left unset the data plane derives
   each of them at boot and starts — `memory_limit` from the memory it finds free, `threads`
   from the CPU allowance, the spill directory from the unit's `HOME`, and the spill cap from a
   fixed default. One exception: boot fails if the pool size leaves under 512 MiB per
@@ -25,7 +26,8 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
   both ways out. Setting `DUCKDB_MEMORY_LIMIT` explicitly is what stops
   boot depending on how much was free at the moment of a restart. Set the pool size
   deliberately as well: it is both the number of DoGets and DoActions one data-plane process
-  serves at once (DoPut is not bounded by it) and a catalog-connection budget: each attached connection holds one
+  serves at once — uploads have their own bound, `FLIGHT_MAX_CONCURRENT_DOPUT`, also 8 by
+  default — and a catalog-connection budget: each attached connection holds one
   lake-Postgres backend while it lives, against `max_connections = 100` (3 superuser-reserved)
   shared with the control plane and every other data-plane process. The default is 8 per
   process.

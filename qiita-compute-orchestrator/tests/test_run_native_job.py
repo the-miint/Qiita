@@ -282,6 +282,42 @@ async def test_unreachable_data_plane_maps_to_a_retriable_failure(monkeypatch, t
     assert ei.value.transient is True
 
 
+async def test_an_unsupported_arrow_cast_is_not_reported_as_an_unimplemented_job(
+    monkeypatch, tmp_path
+):
+    """`ArrowNotImplementedError` IS a `NotImplementedError`, so before the pyarrow arm
+    sat above the skeleton arm, a job hitting an unsupported cast was reported as a job
+    module that ships without an `execute()` — a permanent failure naming the wrong
+    cause. It is not a data-plane condition either, so it propagates with its
+    traceback."""
+    import pyarrow
+
+    async def execute(inputs, workspace):
+        raise pyarrow.ArrowNotImplementedError("Unsupported cast from string to null")
+
+    name = _install_stub(
+        monkeypatch, short_name="arrow_cast", inputs_cls=_Inputs, execute_fn=execute
+    )
+    with pytest.raises(pyarrow.ArrowNotImplementedError):
+        await run_native_job(name, {"x": 1}, tmp_path, step_name="step")
+
+
+async def test_a_skeleton_job_is_still_reported_as_unimplemented(monkeypatch, tmp_path):
+    """The control for the test above: a bare `NotImplementedError` is the skeleton
+    path and must keep its own classification."""
+
+    async def execute(inputs, workspace):
+        raise NotImplementedError("execute() not written yet")
+
+    name = _install_stub(
+        monkeypatch, short_name="skeleton3", inputs_cls=_Inputs, execute_fn=execute
+    )
+    with pytest.raises(BackendFailure) as ei:
+        await run_native_job(name, {"x": 1}, tmp_path, step_name="step")
+    assert ei.value.kind is FailureKind.UNKNOWN_PERMANENT
+    assert "not implemented" in ei.value.reason
+
+
 async def test_a_pyarrow_error_that_is_not_a_data_plane_condition_propagates(monkeypatch, tmp_path):
     """A job's own Arrow or Parquet failure is not a data-plane condition, so it keeps
     propagating uncaught rather than being relabelled retriable."""

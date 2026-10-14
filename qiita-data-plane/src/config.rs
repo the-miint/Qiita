@@ -44,6 +44,9 @@ pub struct Settings {
     pub memory_ceiling: MemoryCeiling,
     /// CPU allowance each connection's `threads` was divided from.
     pub thread_budget: usize,
+    /// DoPuts the data plane will serve at once. Not part of the pool: an upload
+    /// borrows no connection, so the pool does not bound it.
+    pub max_concurrent_doput: usize,
 }
 
 /// Connections one data plane may hold, and so requests it may serve at once.
@@ -98,6 +101,15 @@ pub(crate) const MIN_MEMORY_LIMIT_MIB: u64 = 512;
 /// deploy host's 378 G of free root, and the measured behaviour when a connection
 /// reaches it is a clean error naming the setting, with nothing left behind.
 const DEFAULT_MAX_TEMP_DIRECTORY_SIZE: &str = "4GiB";
+
+/// Uploads one data plane serves at once. Chosen, not measured: what is measured
+/// is the cost curve it bounds — against a real data plane, peak RSS was 165 MiB
+/// for one upload, 1,103 MiB for sixteen at 8 MiB batches and 3,014 MiB for
+/// sixteen at 64 MiB batches, so the cost is linear in concurrency and grows with
+/// batch size. Eight matches the connection pool's default, because it is the
+/// same question asked of a different resource, not because the two share
+/// anything — an upload takes no connection, and this permit is not one.
+const DEFAULT_MAX_CONCURRENT_DOPUT: usize = 8;
 
 /// Leaf name of the derived spill directory, under the `HOME` the systemd unit
 /// sets per data-plane process (its `StateDirectory`, on local disk). Spill must
@@ -241,6 +253,9 @@ impl Settings {
             }
         };
 
+        let max_concurrent_doput = parse_positive::<usize>("FLIGHT_MAX_CONCURRENT_DOPUT")?
+            .unwrap_or(DEFAULT_MAX_CONCURRENT_DOPUT);
+
         let max_temp_directory_size = env_value("DUCKDB_MAX_TEMP_DIRECTORY_SIZE")
             .unwrap_or_else(|| DEFAULT_MAX_TEMP_DIRECTORY_SIZE.to_string());
 
@@ -260,6 +275,7 @@ impl Settings {
             },
             memory_ceiling,
             thread_budget,
+            max_concurrent_doput,
         })
     }
 }

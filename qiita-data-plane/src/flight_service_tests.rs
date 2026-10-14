@@ -5293,6 +5293,9 @@ fn make_service(staging_root: PathBuf) -> QiitaFlightService {
             1,
             std::env::temp_dir().join("qiita-dp-test-spill"),
         )),
+        // Two upload permits: enough that a DoPut test is never refused, small
+        // enough that `a_doput_past_the_bound_is_refused` can exhaust them.
+        2,
         staging_root,
         scratch_root,
     )
@@ -5394,6 +5397,7 @@ fn doget_fixture(
     let service = QiitaFlightService::new(
         test_vk(),
         test_pool(&connstr, &data_path),
+        2,
         staging,
         tmp.path().to_path_buf(),
     );
@@ -5655,6 +5659,68 @@ fn projection_allowlist_matches_the_alignment_schema_exactly() {
         actual.difference(&allowed).collect::<Vec<_>>(),
         allowed.difference(&actual).collect::<Vec<_>>()
     );
+}
+
+/// A DoPut borrows no pooled connection, so the pool does not bound it; its own
+/// permit does. Measured against a real data plane, an upload's cost is linear in
+/// concurrency and grows with batch size, so without this the ceiling was whatever
+/// the edge admitted per client address.
+///
+/// The refusal carries the same "data plane busy" prefix as the pool's, which is
+/// what the shared classification in `qiita_common.data_plane_errors` keys on —
+/// asserted here so the two surfaces cannot drift into wordings only one of them
+/// classifies.
+#[tokio::test]
+async fn do_put_past_its_bound_is_refused_with_a_retriable_status() {
+    let tmp = tempfile::tempdir().unwrap();
+    // `make_service` grants two permits.
+    let service = Arc::new(make_service(tmp.path().to_path_buf()));
+
+    // Two uploads that never finish: each sends its descriptor-bearing first
+    // message and then holds its stream open, so it holds its permit while the
+    // third upload arrives.
+    let mut senders = Vec::new();
+    let mut running = Vec::new();
+    for i in 0..2 {
+        let ticket = sign_doput_for_test(900 + i, &TEST_SEED, future_expiry_secs(300));
+        let first = flight_stream_with_ticket(vec![sample_batch()], ticket).await;
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<FlightData, Status>>(1);
+        tx.send(first[0].clone()).await.unwrap();
+        let svc = Arc::clone(&service);
+        running.push(tokio::spawn(async move {
+            svc.do_put_inner(tokio_stream::wrappers::ReceiverStream::new(rx))
+                .await
+        }));
+        senders.push(tx);
+    }
+    // Both permits taken before the third attempt.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let ticket = sign_doput_for_test(999, &TEST_SEED, future_expiry_secs(300));
+    let messages = flight_stream_with_ticket(vec![sample_batch()], ticket).await;
+    let err = service
+        .do_put_inner(stream::iter(messages))
+        .await
+        .expect_err("a third upload must be refused while two hold the permits");
+
+    assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+    assert!(
+        err.message().contains("data plane busy"),
+        "the refusal must carry the prefix both services classify on: {}",
+        err.message()
+    );
+
+    // Closing the senders ends the held uploads, which returns their permits.
+    drop(senders);
+    for task in running {
+        let _ = task.await;
+    }
+    let ticket = sign_doput_for_test(1000, &TEST_SEED, future_expiry_secs(300));
+    let messages = flight_stream_with_ticket(vec![sample_batch()], ticket).await;
+    service
+        .do_put_inner(stream::iter(messages))
+        .await
+        .expect("a permit returns when its upload ends");
 }
 
 #[tokio::test]

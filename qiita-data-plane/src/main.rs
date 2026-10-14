@@ -50,7 +50,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pool_log = format!(
         "qiita-data-plane pool: {} connections x {} threads, memory_limit {} \
          (from a {:.1} GiB ceiling read via {}, CPU budget {}), \
-         spill under {} capped at {}",
+         spill under {} capped at {}; {} concurrent uploads",
         cfg.pool.size,
         cfg.pool.threads,
         cfg.pool.memory_limit,
@@ -59,6 +59,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cfg.thread_budget,
         cfg.pool.temp_directory.display(),
         cfg.pool.max_temp_directory_size,
+        cfg.max_concurrent_doput,
     );
     let lake_pool = pool::LakePool::open(
         cfg.ducklake_catalog_connstr,
@@ -70,6 +71,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let flight_svc = flight_service::QiitaFlightService::new(
         cfg.flight_public_key,
         lake_pool,
+        cfg.max_concurrent_doput,
         cfg.path_scratch_staging,
         cfg.path_scratch,
     );
@@ -240,13 +242,14 @@ mod tests {
         "HOME",
     ];
 
-    /// The five optional vars the pool reads.
+    /// The optional vars the pool and the upload bound read.
     const POOL_VARS: &[&str] = &[
         "DUCKLAKE_POOL_SIZE",
         "DUCKDB_THREADS",
         "DUCKDB_MEMORY_LIMIT",
         "DUCKDB_TEMP_DIRECTORY",
         "DUCKDB_MAX_TEMP_DIRECTORY_SIZE",
+        "FLIGHT_MAX_CONCURRENT_DOPUT",
     ];
 
     /// The snapshot guards plus a known starting point: every required var set,
@@ -297,6 +300,10 @@ mod tests {
             "spill lands under the per-instance HOME the unit sets"
         );
         assert_eq!(cfg.pool.max_temp_directory_size, "4GiB");
+        assert_eq!(
+            cfg.max_concurrent_doput, 8,
+            "uploads are bounded too, though they borrow no connection"
+        );
     }
 
     #[test]
@@ -309,6 +316,7 @@ mod tests {
         std::env::set_var("DUCKDB_MEMORY_LIMIT", "7GiB");
         std::env::set_var("DUCKDB_TEMP_DIRECTORY", &spill);
         std::env::set_var("DUCKDB_MAX_TEMP_DIRECTORY_SIZE", "11GiB");
+        std::env::set_var("FLIGHT_MAX_CONCURRENT_DOPUT", "2");
 
         let cfg = Settings::from_env().expect("from_env with explicit pool vars");
 
@@ -317,6 +325,7 @@ mod tests {
         assert_eq!(cfg.pool.memory_limit, "7GiB");
         assert_eq!(cfg.pool.temp_directory, std::path::PathBuf::from(spill));
         assert_eq!(cfg.pool.max_temp_directory_size, "11GiB");
+        assert_eq!(cfg.max_concurrent_doput, 2);
     }
 
     #[test]
@@ -335,6 +344,14 @@ mod tests {
         let err = Settings::from_env().unwrap_err();
         assert!(
             err.contains("DUCKDB_THREADS") && err.contains("at least 1"),
+            "unexpected error: {err}"
+        );
+
+        std::env::set_var("DUCKDB_THREADS", "4");
+        std::env::set_var("FLIGHT_MAX_CONCURRENT_DOPUT", "0");
+        let err = Settings::from_env().unwrap_err();
+        assert!(
+            err.contains("FLIGHT_MAX_CONCURRENT_DOPUT") && err.contains("at least 1"),
             "unexpected error: {err}"
         );
     }
