@@ -1776,11 +1776,13 @@ def test_masked_read_export_empty_sample_fastq(monkeypatch, tmp_path):
     assert sorted(p.name for p in out_dir.iterdir()) == ["SAMN_A.5.7.42.fastq.gz"]
 
 
-def test_masked_read_export_fastq_refuses_existing_file(monkeypatch, tmp_path, capsys):
+# Any one of the names a prep_sample's export could commit blocks the run: the
+# single-end file, or either half of a prior paired export.
+@pytest.mark.parametrize("suffix", ["fastq.gz", "R1.fastq.gz", "R2.fastq.gz"])
+def test_masked_read_export_fastq_refuses_existing_file(monkeypatch, tmp_path, capsys, suffix):
     """fastq export never overwrites: if any target filename already exists, the
     command fails up front (exit 1) before constructing a Flight client or
-    streaming — no count probe, no DoGet, and the existing file is left intact.
-    A lone R1 (from a prior paired export) is enough to block the whole run."""
+    streaming — no count probe, no DoGet, and the existing file is left intact."""
     import pyarrow as pa
 
     from qiita_control_plane.cli import _common
@@ -1812,7 +1814,7 @@ def test_masked_read_export_fastq_refuses_existing_file(monkeypatch, tmp_path, c
 
     out_dir = tmp_path / "exp"
     out_dir.mkdir()
-    preexisting = out_dir / "SAMN_B.5.7.43.R1.fastq.gz"
+    preexisting = out_dir / f"SAMN_B.5.7.43.{suffix}"
     preexisting.write_bytes(b"stale")
 
     rc = cli.main(
@@ -1833,11 +1835,11 @@ def test_masked_read_export_fastq_refuses_existing_file(monkeypatch, tmp_path, c
     assert rc == 1
     err = capsys.readouterr().err
     assert "refusing to overwrite" in err
-    assert "SAMN_B.5.7.43.R1.fastq.gz" in err
+    assert preexisting.name in err
     # Failed before any Flight work; the stale file is the only thing on disk.
     assert fake_cls.instances == []
     assert preexisting.read_bytes() == b"stale"
-    assert sorted(p.name for p in out_dir.iterdir()) == ["SAMN_B.5.7.43.R1.fastq.gz"]
+    assert sorted(p.name for p in out_dir.iterdir()) == [preexisting.name]
 
 
 # A refused DoGet and a stream cut after its first batch reach different except

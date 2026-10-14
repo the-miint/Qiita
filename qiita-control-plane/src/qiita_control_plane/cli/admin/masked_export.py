@@ -142,16 +142,12 @@ def _write_masked_sample(reader, stem: str, output_dir: Path, fmt: str, con) -> 
             # `{ORIENTATION}` expands to R1/R2, so the one COPY emits both
             # `<stem>.R1.fastq.gz.partial` and `<stem>.R2.fastq.gz.partial`.
             target = output_dir / f"{stem}.{{ORIENTATION}}.fastq.gz.partial"
-            pairs = [
-                (
-                    output_dir / f"{stem}.{o}.fastq.gz.partial",
-                    output_dir / f"{stem}.{o}.fastq.gz",
-                )
-                for o in ("R1", "R2")
-            ]
         else:
             target = output_dir / f"{stem}.fastq.gz.partial"
-            pairs = [(target, output_dir / f"{stem}.fastq.gz")]
+        pairs = [
+            (output_dir / f"{name}.partial", output_dir / name)
+            for name in _fastq_names(stem, paired=paired)
+        ]
         _commit_partials(
             lambda: con.execute(
                 f"COPY (SELECT {_READ_MASKED_COLUMNS} FROM masked) "
@@ -161,6 +157,16 @@ def _write_masked_sample(reader, stem: str, output_dir: Path, fmt: str, con) -> 
         )
     else:
         raise ValueError(f"unsupported export format: {fmt!r}")
+
+
+def _fastq_names(stem: str, *, paired: bool) -> list[str]:
+    """The fastq files one prep_sample's export commits: `<stem>.fastq.gz`, or
+    `<stem>.R1.fastq.gz` and `<stem>.R2.fastq.gz` when paired. The writer
+    commits these and the never-overwrite pre-scan looks for them, so a rename
+    cannot leave the pre-scan checking names the writer no longer uses."""
+    if paired:
+        return [f"{stem}.R1.fastq.gz", f"{stem}.R2.fastq.gz"]
+    return [f"{stem}.fastq.gz"]
 
 
 def _export_stem(sample: dict, run_idx, pool_idx) -> str:
@@ -316,7 +322,8 @@ def _handle_masked_read_export(args: argparse.Namespace, parser: argparse.Argume
             stem = _export_stem(s, run_idx, pool_idx)
             existing += [
                 p
-                for name in (f"{stem}.fastq.gz", f"{stem}.R1.fastq.gz", f"{stem}.R2.fastq.gz")
+                for paired in (False, True)
+                for name in _fastq_names(stem, paired=paired)
                 if (p := output_dir / name).exists()
             ]
         if existing:
