@@ -46,28 +46,32 @@ pub struct Settings {
     pub thread_budget: usize,
 }
 
-/// Instances one data plane may hold, and so requests it may serve at once.
-/// Each attached instance holds one lake-Postgres backend for as long as it
-/// lives (measured: 8 attached connections held 8 idle backends), against a
+/// Connections one data plane may hold, and so requests it may serve at once.
+/// Chosen, not measured: what is measured is the budget it is chosen against —
+/// each attached connection holds one lake-Postgres backend for as long as it
+/// lives (8 attached connections held 8 idle backends), against a
 /// `max_connections` of 100 with 3 superuser-reserved that the control plane
-/// draws on as well. Raise it with `DUCKLAKE_POOL_SIZE` where that budget
-/// allows; every instance on every host is spent against the same 97.
+/// draws on as well. Eight leaves that budget room for other data-plane
+/// processes and for the control plane; raise it with `DUCKLAKE_POOL_SIZE` where
+/// the budget allows, counting every process on every host against the same 97.
 const DEFAULT_POOL_SIZE: usize = 8;
 
-/// The pool divides half the detected ceiling, not all of it. `memory_limit`
-/// bounds what DuckDB accounts for rather than what the process holds:
-/// measured on the deploy host, one request under a 3.7 GiB limit peaked at
+/// The pool divides half the detected ceiling, not all of it. Half is a choice;
+/// what is measured is that it has to be less than all of it, because
+/// `memory_limit` bounds what DuckDB accounts for rather than what the process
+/// holds — on the deploy host one request under a 3.7 GiB limit peaked at
 /// 5,021 MiB RSS and finished in the same 100.5 s as the same request under a
-/// 29.8 GiB limit. The unspent half covers what that accounting does not see —
-/// the Arrow batches each stream holds in flight — and the host's other work.
-const CEILING_DIVISOR: u64 = 2;
+/// 29.8 GiB limit. The unspent half covers what that accounting does not see
+/// (the Arrow batches each stream holds in flight) and the host's other work.
+pub(crate) const CEILING_DIVISOR: u64 = 2;
 
-/// Smallest per-instance `memory_limit` worth deriving. A share below this means
-/// the pool is too big for the host rather than that the share should be rounded
-/// up: granting the floor anyway would hand `size × 256 MiB` out of a ceiling
-/// that may be smaller than that, which is the over-commit this whole change
-/// exists to remove. Boot fails instead, naming both ways out.
-const MIN_MEMORY_LIMIT_MIB: u64 = 256;
+/// Smallest per-instance `memory_limit` worth deriving: enough for DuckDB to run
+/// a streaming scan with a few threads, chosen rather than measured. A share
+/// below it means the pool is too big for the host rather than that the share
+/// should be rounded up — granting the floor anyway would hand out
+/// `size × 256 MiB` from a ceiling that may be smaller than that. Boot fails
+/// instead, naming both ways out.
+pub(crate) const MIN_MEMORY_LIMIT_MIB: u64 = 256;
 
 /// Per-instance ceiling on spill. DuckDB's own default is 90% of the
 /// filesystem holding `temp_directory` — which every instance would claim in
@@ -165,26 +169,32 @@ impl Settings {
         let threads = parse_positive_u32("DUCKDB_THREADS")?
             .unwrap_or_else(|| std::cmp::max(1, (thread_budget / size) as u32));
 
-        let memory_limit = match std::env::var("DUCKDB_MEMORY_LIMIT") {
-            Ok(raw) if !raw.trim().is_empty() => raw,
-            _ => {
+        let memory_limit = match env_value("DUCKDB_MEMORY_LIMIT") {
+            Some(raw) => raw,
+            None => {
                 let share_mib =
                     memory_ceiling.bytes / CEILING_DIVISOR / size as u64 / (1024 * 1024);
                 if share_mib < MIN_MEMORY_LIMIT_MIB {
                     return Err(format!(
-                        "a pool of {size} would get {share_mib} MiB each from the \
-                         {:.1} GiB ceiling detected via {} — below the {MIN_MEMORY_LIMIT_MIB} MiB \
-                         floor. Lower DUCKLAKE_POOL_SIZE or set DUCKDB_MEMORY_LIMIT explicitly.",
+                        concat!(
+                            "a pool of {} would get {} MiB each from the {:.1} GiB ceiling ",
+                            "detected via {} — below the {} MiB floor. Lower ",
+                            "DUCKLAKE_POOL_SIZE, or set DUCKDB_MEMORY_LIMIT explicitly so ",
+                            "the pool does not depend on what was free at boot.",
+                        ),
+                        size,
+                        share_mib,
                         memory_ceiling.bytes as f64 / (1024.0 * 1024.0 * 1024.0),
                         memory_ceiling.source.as_str(),
+                        MIN_MEMORY_LIMIT_MIB,
                     ));
                 }
                 format!("{share_mib}MiB")
             }
         };
 
-        let temp_directory = match std::env::var("DUCKDB_TEMP_DIRECTORY") {
-            Ok(raw) => {
+        let temp_directory = match env_value("DUCKDB_TEMP_DIRECTORY") {
+            Some(raw) => {
                 let path = PathBuf::from(&raw);
                 if !path.is_absolute() {
                     return Err(format!(
@@ -193,10 +203,14 @@ impl Settings {
                 }
                 path
             }
-            Err(_) => {
+            None => {
                 let home = std::env::var("HOME").map_err(|_| {
-                    "DUCKDB_TEMP_DIRECTORY is not set and neither is HOME, so there is                      nowhere to derive a spill directory from — set DUCKDB_TEMP_DIRECTORY                      to an absolute path on local disk"
-                        .to_string()
+                    concat!(
+                        "DUCKDB_TEMP_DIRECTORY is not set and neither is HOME, so there ",
+                        "is nowhere to derive a spill directory from — set ",
+                        "DUCKDB_TEMP_DIRECTORY to an absolute path on local disk",
+                    )
+                    .to_string()
                 })?;
                 let home = PathBuf::from(home);
                 if !home.is_absolute() {
@@ -209,10 +223,8 @@ impl Settings {
             }
         };
 
-        let max_temp_directory_size = match std::env::var("DUCKDB_MAX_TEMP_DIRECTORY_SIZE") {
-            Ok(raw) if !raw.trim().is_empty() => raw,
-            _ => DEFAULT_MAX_TEMP_DIRECTORY_SIZE.to_string(),
-        };
+        let max_temp_directory_size = env_value("DUCKDB_MAX_TEMP_DIRECTORY_SIZE")
+            .unwrap_or_else(|| DEFAULT_MAX_TEMP_DIRECTORY_SIZE.to_string());
 
         Ok(Self {
             listen_addr,
@@ -234,8 +246,15 @@ impl Settings {
     }
 }
 
-/// `None` when the variable is unset, so each caller states its own default
-/// beside the reasoning for it.
+/// A set, non-empty environment value. `None` covers unset, empty, and
+/// non-unicode alike, so each caller states its own default beside the reasoning
+/// for it.
+fn env_value(var: &str) -> Option<String> {
+    std::env::var(var).ok().filter(|v| !v.trim().is_empty())
+}
+
+/// `None` when the variable is unset or empty, so each caller states its own
+/// default beside the reasoning for it.
 fn parse_positive_usize(var: &str) -> Result<Option<usize>, String> {
     parse_positive(var)
 }
@@ -249,7 +268,10 @@ where
     T: std::str::FromStr + PartialEq + From<u8>,
     T::Err: std::fmt::Display,
 {
-    let Ok(raw) = std::env::var(var) else {
+    // An empty value reads as unset, for every var in this group: an operator who
+    // comments a value out but leaves the `KEY=` gets the derived default rather
+    // than a unit that will not boot.
+    let Some(raw) = env_value(var) else {
         return Ok(None);
     };
     let value: T = raw

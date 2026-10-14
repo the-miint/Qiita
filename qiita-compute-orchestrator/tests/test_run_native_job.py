@@ -222,6 +222,44 @@ async def test_value_error_in_execute_maps_to_bad_input(monkeypatch, tmp_path):
     assert "duplicate read_id" in ei.value.reason
 
 
+async def test_busy_data_plane_maps_to_a_retriable_failure(monkeypatch, tmp_path):
+    """A step whose Flight call is refused because the data plane has no free
+    DuckLake connection is overload, not bad data. pyarrow raises `ArrowInvalid` for
+    that gRPC status and `ArrowInvalid` IS a ValueError, so this arm has to be
+    separated from the data-quality one or the ticket records a malformed-input
+    reason and never retries."""
+    import pyarrow
+
+    async def execute(inputs, workspace):
+        raise pyarrow.ArrowInvalid(
+            "gRPC returned resource exhausted error, with message: data plane busy: "
+            "all 8 DuckLake connections are in use; retry"
+        )
+
+    name = _install_stub(monkeypatch, short_name="dp_busy", inputs_cls=_Inputs, execute_fn=execute)
+    with pytest.raises(BackendFailure) as ei:
+        await run_native_job(name, {"x": 1}, tmp_path, step_name="step")
+    assert ei.value.kind is FailureKind.DATA_PLANE_TRANSIENT
+    assert ei.value.transient is True
+    assert "data plane busy" in ei.value.reason
+
+
+async def test_a_value_error_that_merely_mentions_the_data_plane_stays_permanent(
+    monkeypatch, tmp_path
+):
+    """The match is the data plane's refusal wording, not the words "data plane"."""
+
+    async def execute(inputs, workspace):
+        raise ValueError("data plane returned 3 rows for a 4-row prep_sample")
+
+    name = _install_stub(
+        monkeypatch, short_name="dp_mismatch", inputs_cls=_Inputs, execute_fn=execute
+    )
+    with pytest.raises(BackendFailure) as ei:
+        await run_native_job(name, {"x": 1}, tmp_path, step_name="step")
+    assert ei.value.kind is FailureKind.BAD_INPUT
+
+
 async def test_step_no_data_propagates_unchanged(monkeypatch, tmp_path):
     """StepNoData is a TERMINAL no-data outcome, not a failure — the
     dispatcher must re-raise it unchanged (NOT reclassify it into a

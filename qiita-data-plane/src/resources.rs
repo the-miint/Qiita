@@ -12,9 +12,15 @@
 //! names itself so boot can log which one answered — the value alone does not
 //! say whether it came from a cgroup or from a fallback.
 //!
-//! None of the detectors is compiled conditionally. Each one reads a path or
-//! runs a tool that is simply absent on the other platform — `/proc` on macOS,
-//! `hw.memsize` on Linux — so the ordering alone decides which can answer.
+//! None of the detectors is compiled conditionally: each one asks for something
+//! the other platform does not have — `/proc` on macOS, the `hw.memsize` key on
+//! Linux (where `sysctl` exists but does not know it) — so the ordering alone
+//! decides which answers.
+//!
+//! The compute orchestrator derives the same ceiling for its own DuckDB sessions
+//! in Python (`qiita_compute_orchestrator.miint`), and takes the tightest of
+//! every ancestor cgroup where this takes the process's own. Neither language can
+//! import the other; if the precedence here changes, that one is its sibling.
 
 /// Where a detected memory ceiling came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,6 +102,9 @@ fn read_proc_meminfo() -> Option<u64> {
     parse_meminfo_available(&std::fs::read_to_string("/proc/meminfo").ok()?)
 }
 
+/// The machine's total, not an available share: macOS has no `MemAvailable`
+/// equivalent, and this is a development path — on Linux the key does not exist,
+/// so `/proc/meminfo` above has already answered.
 fn read_macos_memsize() -> Option<u64> {
     let out = std::process::Command::new("sysctl")
         .args(["-n", "hw.memsize"])
@@ -147,9 +156,7 @@ fn parse_cgroup_v1_limit(content: &str) -> Option<u64> {
 
 /// `MemAvailable`, in kB, is what the kernel expects to be usable without
 /// swapping — the share a new pool may plan against, rather than `MemTotal`
-/// which counts what the host's other services already hold. (The macOS
-/// detector below has no equivalent and returns the machine's total; it is a
-/// development path, never the deploy host.)
+/// which counts what the host's other services already hold.
 fn parse_meminfo_available(content: &str) -> Option<u64> {
     for line in content.lines() {
         if let Some(rest) = line.strip_prefix("MemAvailable:") {

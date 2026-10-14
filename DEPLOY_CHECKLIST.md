@@ -18,9 +18,12 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
 - `[operator]` (#NNN) `data-plane.env` gains five optional vars, all documented in
   `.env.data-plane.example`: `DUCKLAKE_POOL_SIZE`, `DUCKDB_THREADS`, `DUCKDB_MEMORY_LIMIT`,
   `DUCKDB_TEMP_DIRECTORY`, `DUCKDB_MAX_TEMP_DIRECTORY_SIZE`. Left unset the data plane derives
-  all of them at boot and starts, so no edit is required. The pool size is worth setting
-  before the restart, because it is both the number of requests one instance serves at once
-  and a catalog-connection budget: each attached connection holds one
+  all of them at boot from the memory it finds free, and starts — with one exception: boot
+  fails if the pool size leaves under 256 MiB per connection, naming both ways out. Setting
+  `DUCKDB_MEMORY_LIMIT` explicitly is what stops boot depending on how much was free at the
+  moment of a restart. The pool size is worth setting deliberately too, because it is both
+  the number of requests one data-plane process serves at once and a catalog-connection
+  budget: each attached connection holds one
   lake-Postgres backend while it lives, against `max_connections = 100` (3 superuser-reserved)
   shared with the control plane and every other instance. The default is 8 per instance.
 
@@ -59,12 +62,20 @@ _None yet._
   serving the request. The control plane classifies that as retriable, so a pre-loop resolver's
   ticket is held for redrive rather than failed permanently. **Compute-side readers do not
   retry a refusal yet** — the client half is tracked separately — so a fan-out wider than the
-  pool turns into held tickets rather than slow ones. The Flight edge admits 64 concurrent
-  requests per client address, which is the number to weigh the pool size against.
+  pool turns into held or retried work rather than slow work. Where a refusal lands today:
+  a native job step gets `data_plane_transient` and the runner re-dispatches it within the
+  ticket's `max_retries`; a control-plane pre-loop fetch is held for an operator redrive;
+  a DoAction from the control plane's action library (`register_files`, the `delete_*`
+  family) still surfaces it as a permanent failure, which the client-retry work (#539,
+  #582) covers. The Flight edge's own per-address admission (`deploy/nginx/qiita.conf`) is
+  what to weigh the pool size against.
 - (#NNN) Per-request wall time rises with the division. A request used to take every core;
   it now takes `threads`, and measured on this host one masked read fitted
   `25.3 s + 611.8 s / threads` — so at 48 cores and the default pool of 8 it is ~127 s where
   it was ~38 s. Concurrency is what the change buys back.
+- (#NNN) A write under contention holds its connection while it retries: the registration
+  path sleeps inside its 120 s commit budget, and every writer takes the same lock, so a
+  write storm can occupy the whole pool and reads are refused for that window.
 
 - (#685) Work-ticket responses (`GET /work-ticket/{idx}` and the ticket lists) gain `on_success`, `follow_on_work_ticket_idx` and `follow_on_error` (all null for a ticket with no follow-on); clients validating that shape strictly must accept them.
 

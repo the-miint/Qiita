@@ -9,11 +9,11 @@
 //!
 //! A checkout that finds nothing idle and nothing left to build refuses with
 //! `RESOURCE_EXHAUSTED` instead of waiting, because waiting here is not shorter
-//! than waiting at the edge: the edge admits 64 concurrent requests per client
-//! address (`deploy/nginx/qiita.conf`) and holds each for up to its
-//! `grpc_read_timeout` of 3600s, so a queue inside the process would fill with
-//! requests the edge is already holding open. Nothing in this repo retries a
-//! refusal yet; `DEPLOY_CHECKLIST.md` records what that leaves for the operator.
+//! than waiting at the edge: the `limit_conn` and `grpc_read_timeout` in
+//! `deploy/nginx/qiita.conf` already admit and hold far more concurrent requests
+//! per client address than this pool serves, so a queue inside the process would
+//! fill with requests the edge is holding open anyway. Nothing in this repo
+//! retries a refusal yet, and a caller that does not retry gets a failed step.
 //!
 //! Instances are built as they are first needed rather than all at boot, because
 //! each one costs a lake-Postgres backend for as long as it lives — the budget
@@ -52,6 +52,26 @@ pub struct PoolSettings {
     /// set at all rather than left to DuckDB is
     /// `config::DEFAULT_MAX_TEMP_DIRECTORY_SIZE`.
     pub max_temp_directory_size: String,
+}
+
+impl PoolSettings {
+    /// Checked by every constructor, because all three of these reach DuckDB
+    /// inside quoted SQL literals in `apply_settings` — the same way the
+    /// connection string and data path do in `ducklake::connect_ducklake` — and
+    /// all three come from the environment. What a *valid* size string looks like
+    /// is DuckDB's business: one it cannot parse fails the first instance build,
+    /// which fails boot.
+    fn validate(&self) -> Result<(), String> {
+        ducklake::validate_sql_literal(&self.memory_limit, "DUCKDB_MEMORY_LIMIT")?;
+        ducklake::validate_sql_literal(
+            &self.max_temp_directory_size,
+            "DUCKDB_MAX_TEMP_DIRECTORY_SIZE",
+        )?;
+        ducklake::validate_sql_literal(
+            &self.temp_directory.display().to_string(),
+            "DUCKDB_TEMP_DIRECTORY",
+        )
+    }
 }
 
 #[cfg(test)]
@@ -96,18 +116,7 @@ impl LakePool {
         if settings.size == 0 {
             return Err("pool size must be at least 1 — a size of 0 serves no request".into());
         }
-        // All three reach DuckDB inside quoted SQL literals in `apply_settings`,
-        // the same way the connection string and data path do in
-        // `ducklake::connect_ducklake`, and all three come from the environment.
-        ducklake::validate_sql_literal(&settings.memory_limit, "DUCKDB_MEMORY_LIMIT")?;
-        ducklake::validate_sql_literal(
-            &settings.max_temp_directory_size,
-            "DUCKDB_MAX_TEMP_DIRECTORY_SIZE",
-        )?;
-        ducklake::validate_sql_literal(
-            &settings.temp_directory.display().to_string(),
-            "DUCKDB_TEMP_DIRECTORY",
-        )?;
+        settings.validate()?;
         // DuckDB does not create this itself; an unwritable path must stop the
         // unit here rather than surface as a failed request under load.
         std::fs::create_dir_all(&settings.temp_directory).map_err(|e| {
@@ -134,14 +143,14 @@ impl LakePool {
         Ok(pool)
     }
 
-    /// Where DuckLake keeps its Parquet files. `register_files` moves staged
-    /// files under it, so it needs the path as well as a connection.
+    /// Where DuckLake keeps its Parquet files, for the one handler that moves
+    /// files into it (`flight_service::register_files`).
     pub fn data_path(&self) -> &str {
         &self.data_path
     }
 
-    /// Take an instance, or refuse. Never waits: the refusal is the in-flight
-    /// bound, and the caller retries at stream open.
+    /// Take an instance, or refuse. Never waits — the refusal *is* the in-flight
+    /// bound; see the module docs for why it is not a queue.
     pub fn checkout(self: &Arc<Self>) -> Result<PooledConnection, Status> {
         {
             let mut state = self.lock_state();
@@ -168,7 +177,12 @@ impl LakePool {
             }),
             Err(e) => {
                 self.lock_state().unbuilt += 1;
-                Err(Status::internal(format!(
+                // `unavailable`, not `internal`: by the time the pool is serving,
+                // a failed build is the catalog being unreachable or at its
+                // connection limit, which the next attempt can clear. A setting
+                // DuckDB rejects cannot arrive here — `open` builds an instance at
+                // boot, so the unit never starts with one.
+                Err(Status::unavailable(format!(
                     "failed to open a DuckLake connection: {e}"
                 )))
             }
@@ -242,10 +256,10 @@ impl LakePool {
     }
 
     fn lock_state(&self) -> std::sync::MutexGuard<'_, PoolState> {
-        // The only panic reachable while this lock is held is an allocation
-        // failure in the idle `Vec`, which leaves the state structurally intact.
-        // Recovering it keeps the pool serving; honouring the poison flag would
-        // turn one failed allocation into a data plane that refuses every
+        // Nothing under this guard can panic: the work is a `Vec` pop or push and
+        // a counter, with every build and reset done outside the lock. The
+        // recovery is here because honouring a poison flag we cannot explain
+        // would turn one unexplained panic into a data plane that refuses every
         // request for the life of the process.
         self.state
             .lock()
@@ -257,6 +271,9 @@ impl LakePool {
     /// the bound, the refusal, the reset on return — is the production path.
     #[cfg(test)]
     pub(crate) fn unattached_for_tests(settings: PoolSettings) -> Arc<Self> {
+        settings
+            .validate()
+            .expect("test pool settings must pass the same check production settings do");
         let pool = Arc::new(Self {
             catalog_connstr: String::new(),
             data_path: String::new(),

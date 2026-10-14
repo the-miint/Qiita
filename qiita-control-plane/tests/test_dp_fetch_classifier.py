@@ -13,11 +13,13 @@ fails (rather than every DP fetch silently reverting to permanent in production)
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from qiita_common.backend_failure import FailureKind
 from qiita_common.models import WorkTicketFailureStage
 
 from qiita_control_plane.runner._upload import (
-    _DP_BUSY_SIGNATURES,
+    _DP_BUSY_SIGNATURE,
     _DP_TICKET_EXPIRED_SIGNATURES,
     _is_dp_busy,
     _is_dp_serialization_conflict,
@@ -209,9 +211,8 @@ def test_expiry_signatures_match_the_data_planes_wording():
     A reword in `auth.rs` fails HERE rather than silently reverting every expired
     token to a permanent BAD_INPUT."""
     import re
-    from pathlib import Path
 
-    src = (Path(__file__).resolve().parents[2] / "qiita-data-plane" / "src" / "auth.rs").read_text()
+    src = (DATA_PLANE_SRC / "auth.rs").read_text()
     m = re.search(r'AuthError::Expired => write!\(f, "([^"]+)"\)', src)
     assert m, "AuthError::Expired arm not found in auth.rs"
     assert m.group(1) == "ticket expired", (
@@ -223,9 +224,7 @@ def test_expiry_signatures_match_the_data_planes_wording():
     # gRPC unauthenticated, which is what puts that word in the client's error. A
     # verify site mapped to any other Status would break the match, so read them
     # out of the source rather than asserting the constant against itself.
-    service = (
-        Path(__file__).resolve().parents[2] / "qiita-data-plane" / "src" / "flight_service.rs"
-    ).read_text()
+    service = (DATA_PLANE_SRC / "flight_service.rs").read_text()
     verify_calls = re.findall(
         r"auth::verify_\w+\([^;]*?\.map_err\(\|e\| Status::(\w+)\(", service, flags=re.DOTALL
     )
@@ -270,8 +269,12 @@ def test_busy_data_plane_classified_retriable():
     assert f.step_name is None
 
 
+# The data plane's sources, which three tests below parse rather than restate.
+DATA_PLANE_SRC = Path(__file__).resolve().parents[2] / "qiita-data-plane" / "src"
+
+
 def test_busy_predicate_does_not_fire_on_the_other_dp_errors():
-    """Both substrings are required, so the match covers the refusal and nothing
+    """The match is the data plane's own prefix, so it covers the refusal and nothing
     else that carries the same gRPC status."""
     assert _is_dp_busy(ValueError(_REAL_BUSY)) is True
     assert _is_dp_busy(Exception(_REAL_40001)) is False
@@ -292,22 +295,20 @@ def test_busy_predicate_does_not_fire_on_the_other_dp_errors():
 
 
 def test_busy_signature_matches_the_data_planes_wording():
-    """The second substring is the data plane's own prefix, which no client library
-    renders for us. A reword in `pool.rs` fails HERE rather than silently reverting
-    every refusal to a permanent BAD_INPUT."""
+    """The signature is the data plane's own prefix, which no client library renders
+    for us, so a reword in `pool.rs` fails HERE rather than silently reverting every
+    refusal to a permanent BAD_INPUT. Every refusal in that file is checked, not just
+    the first, so a second one added later cannot slip through unclassified."""
     import re
-    from pathlib import Path
 
-    src = (Path(__file__).resolve().parents[2] / "qiita-data-plane" / "src" / "pool.rs").read_text()
-    m = re.search(r'Status::resource_exhausted\(format!\(\s*"([^"{]+)', src)
-    assert m, "no Status::resource_exhausted refusal found in pool.rs"
-    refusal = m.group(1).lower()
-    for sig in _DP_BUSY_SIGNATURES:
-        if sig == "resource exhausted":
-            continue  # pyarrow's rendering of the status, not the data plane's text
-        assert sig in refusal, (
-            f"the data plane now refuses with {refusal!r}; update _DP_BUSY_SIGNATURES "
-            f"({_DP_BUSY_SIGNATURES!r}) or a busy data plane classifies permanent again"
+    src = (DATA_PLANE_SRC / "pool.rs").read_text()
+    refusals = re.findall(r"Status::resource_exhausted\(\s*format!\(\s*\"([^\"]+)\"", src)
+    assert refusals, "no Status::resource_exhausted refusal found in pool.rs"
+    for refusal in refusals:
+        assert _DP_BUSY_SIGNATURE in refusal.lower(), (
+            f"the data plane refuses with {refusal!r}, which does not carry "
+            f"{_DP_BUSY_SIGNATURE!r}; update the signature or a busy data plane "
+            "classifies permanent again"
         )
 
 

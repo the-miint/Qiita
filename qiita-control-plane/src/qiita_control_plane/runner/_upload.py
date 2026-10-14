@@ -10,6 +10,10 @@ from qiita_common.api_paths import (
     compute_upload_staging_path,
 )
 from qiita_common.backend_failure import BackendFailure, FailureKind
+from qiita_common.data_plane_errors import (
+    DATA_PLANE_BUSY_SIGNATURE,
+    is_data_plane_busy,
+)
 from qiita_common.models import (
     UploadStatus,
     WorkTicketFailureStage,
@@ -98,21 +102,12 @@ _DP_UNAVAILABLE_SIGNATURES = (
 # reverting every expiry to permanent.
 _DP_TICKET_EXPIRED_SIGNATURES = ("unauthenticated", "ticket expired")
 
-# Busy-data-plane signatures, BOTH required. The data plane refuses a request it has
-# no free DuckLake connection for rather than queueing it
-# (`qiita-data-plane/src/pool.rs`) — overload, not bad input: the same call succeeds
-# once a connection frees. Matched by message for the reasons above and one more,
-# measured on pyarrow 23.0.1: this status arrives as `ArrowInvalid` (a ValueError),
-# NOT a FlightError subclass, so there is no exception type to match on.
-#
-# The status name alone is not enough to match on. gRPC also answers
-# RESOURCE_EXHAUSTED for a message that exceeds a receive limit, which no redrive
-# fixes — holding that for redrive forever is worse than filing it permanent. So the
-# data plane's own prefix is required too, and
-# `test_busy_signature_matches_the_data_planes_wording` parses it out of `pool.rs` so
-# a reword there fails the test instead of silently reverting every refusal to
-# permanent.
-_DP_BUSY_SIGNATURES = ("resource exhausted", "data plane busy")
+# The data plane refuses a request it has no free DuckLake connection for rather than
+# queueing it — overload, not bad input: the same call succeeds once a connection frees.
+# The signature and why it is the data plane's own wording rather than the gRPC status
+# name live in `qiita_common.data_plane_errors`, which the orchestrator's native-job
+# dispatcher keys on too.
+_DP_BUSY_SIGNATURE = DATA_PLANE_BUSY_SIGNATURE
 
 
 def _is_dp_serialization_conflict(exc: BaseException) -> bool:
@@ -131,8 +126,7 @@ def _is_dp_unavailable(exc: BaseException) -> bool:
 def _is_dp_busy(exc: BaseException) -> bool:
     """True if a data-plane Flight failure is the data plane refusing the request for
     want of a free DuckLake connection, rather than a permanent bad-input error."""
-    text = str(exc).lower()
-    return all(sig in text for sig in _DP_BUSY_SIGNATURES)
+    return is_data_plane_busy(exc)
 
 
 def _is_dp_ticket_expired(exc: BaseException) -> bool:

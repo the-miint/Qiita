@@ -21,12 +21,13 @@ Client interfaces are the user-facing layer through which researchers and system
 Every operation that touches the lake borrows one instance from a bounded pool
 ([`qiita-data-plane/src/pool.rs`](../../qiita-data-plane/src/pool.rs)), so the
 pool's size is the number of requests one data plane serves at once. A request
-that arrives with every instance lent out is refused immediately with gRPC
+that arrives with every connection lent out is refused immediately with gRPC
 `RESOURCE_EXHAUSTED` and a message naming the bound, rather than queued — the
-reasoning, and the edge limits it rests on, are in `pool.rs`. **Nothing in this
-repo retries that refusal yet**: the control plane classifies it as retriable so
-the ticket is held for an operator redrive, and a compute-side reader fails its
-step.
+reasoning, and the edge limits it rests on, are in `pool.rs`. **No client retries
+the call itself yet.** What a refusal becomes instead depends on the caller: a
+native job step is classified `data_plane_transient` and re-dispatched by the
+runner, a control-plane pre-loop fetch is held for an operator redrive, and a
+DoAction from the action library still fails permanently.
 
 Each pooled instance carries its own `threads`, `memory_limit`, `temp_directory`
 and `max_temp_directory_size`, divided at boot from the memory ceiling the

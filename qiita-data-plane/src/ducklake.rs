@@ -18,9 +18,17 @@
 
 use duckdb::Connection;
 
-/// Characters disallowed in connection strings and paths interpolated into SQL.
-/// DuckDB ATTACH does not support parameterized queries, so we validate inputs
+/// Characters disallowed in any value interpolated into a DuckDB SQL literal —
+/// connection strings and data paths for ATTACH, and the pool's resource
+/// settings for SET. Neither statement takes parameters, so inputs are validated
 /// before interpolation. This is input validation, not sanitization.
+///
+/// These three are sufficient for that one job: without a quote or a semicolon a
+/// value cannot close the literal and start a statement. Probed on DuckDB 1.5.5 —
+/// a value ending in a backslash is taken literally, so it does not escape the
+/// closing quote the way it would in a backslash-escaping dialect. What the
+/// values must otherwise look like is DuckDB's business: a `memory_limit` it
+/// cannot parse fails the pool's first instance build, which fails boot.
 pub(crate) fn validate_sql_literal(value: &str, field: &str) -> Result<(), String> {
     if value.contains('\'') || value.contains(';') || value.contains('\0') {
         return Err(format!(
@@ -64,9 +72,10 @@ pub fn connect_ducklake(
 ///
 /// These options are PERSISTED in `ducklake_metadata` (catalog-global), so they
 /// only need to be set ONCE per catalog. Call this on the PROCESS-START
-/// connection only — NEVER on a per-request attach. Setting it on every attach
-/// made each concurrent Flight request UPDATE the same `ducklake_metadata` row,
-/// which serialized and failed under load with Postgres SQLSTATE 40001
+/// connection only — NEVER where an attach happens per request or per pooled
+/// instance (`pool::LakePool::build_instance`). Setting it on every attach made
+/// each concurrent Flight request UPDATE the same `ducklake_metadata` row, which
+/// serialized and failed under load with Postgres SQLSTATE 40001
 /// (`could not serialize access due to concurrent update`). Keep the values in
 /// sync with PARQUET_OPTS.
 pub fn set_catalog_options(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
@@ -883,9 +892,9 @@ mod tests {
             .expect("failed to connect DuckLake — check DUCKLAKE_CATALOG_CONNSTR");
         // This helper mirrors the production BOOT connection (main.rs): it creates
         // the tables AND sets the catalog-global Parquet options once. connect_ducklake
-        // no longer does. The options persist in the shared Postgres catalog, so
-        // per-request connections (flight_service, in tests as in production) inherit
-        // them and correctly do NOT re-set them.
+        // no longer does. The options persist in the shared Postgres catalog, so the
+        // pool's instances (flight_service, in tests as in production) inherit them
+        // and correctly do NOT re-set them.
         set_catalog_options(&conn).expect("failed to set catalog options");
         conn
     }

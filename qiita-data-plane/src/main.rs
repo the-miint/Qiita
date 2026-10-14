@@ -26,7 +26,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &cfg.path_persistent_ducklake,
     )?;
     // Catalog-global Parquet defaults (zstd + v2). Set ONCE here at boot, NOT on
-    // every per-request attach: a per-attach write races on ducklake_metadata
+    // every attach the pool makes: a per-attach write races on ducklake_metadata
     // under concurrent Flight load and fails with SQLSTATE 40001. See
     // set_catalog_options.
     ducklake::set_catalog_options(&setup_conn)?;
@@ -42,11 +42,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ducklake::ensure_exclusion_tables(&setup_conn)?;
     drop(setup_conn);
 
-    // One bounded pool of attached instances serves every request. Its size is
-    // the in-flight bound: past it, a request is refused with a retriable
-    // status instead of opening another DuckDB that sizes itself against the
-    // whole host.
-    println!(
+    // One bounded pool of attached instances serves every request; its size is
+    // the number in flight. Logged after it opens, so the line is a statement
+    // that these settings applied rather than that they were intended.
+    let pool_log = format!(
         "qiita-data-plane pool: {} connections x {} threads, memory_limit {} \
          (from a {:.1} GiB ceiling read via {}, CPU budget {}), \
          spill under {} capped at {}",
@@ -64,6 +63,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cfg.path_persistent_ducklake,
         cfg.pool,
     )?;
+    println!("{pool_log}");
 
     let flight_svc = flight_service::QiitaFlightService::new(
         cfg.flight_public_key,
@@ -227,37 +227,39 @@ mod tests {
         (scratch, persistent)
     }
 
-    const POOL_VARS: &[&str] = &[
+    /// What `set_required_env` sets, plus the `HOME` the spill directory derives
+    /// from — snapshotted separately from the pool's own vars so neither list is
+    /// a copy of the other.
+    const REQUIRED_VARS: &[&'static str] = &[
         "FLIGHT_TICKET_PUBLIC_KEY",
         "DUCKLAKE_CATALOG_CONNSTR",
         "PATH_SCRATCH",
         "PATH_PERSISTENT",
+        "HOME",
+    ];
+
+    /// The five optional vars the pool reads.
+    const POOL_VARS: &[&'static str] = &[
         "DUCKLAKE_POOL_SIZE",
         "DUCKDB_THREADS",
         "DUCKDB_MEMORY_LIMIT",
         "DUCKDB_TEMP_DIRECTORY",
         "DUCKDB_MAX_TEMP_DIRECTORY_SIZE",
-        "HOME",
     ];
 
     fn clear_pool_vars() {
-        for var in [
-            "DUCKLAKE_POOL_SIZE",
-            "DUCKDB_THREADS",
-            "DUCKDB_MEMORY_LIMIT",
-            "DUCKDB_TEMP_DIRECTORY",
-            "DUCKDB_MAX_TEMP_DIRECTORY_SIZE",
-        ] {
+        for var in POOL_VARS {
             std::env::remove_var(var);
         }
     }
 
-    /// With nothing configured, the pool still has a bound and every instance
-    /// still has limits — the state before this existed was no bound at all.
+    /// With nothing configured, the pool still has a bound and every connection
+    /// still has limits.
     #[test]
     #[serial]
     fn pool_settings_are_derived_when_unset() {
-        let _snapshot = EnvSnapshot::capture(POOL_VARS);
+        let _required = EnvSnapshot::capture(REQUIRED_VARS);
+        let _pool = EnvSnapshot::capture(POOL_VARS);
         set_required_env();
         clear_pool_vars();
         std::env::set_var("HOME", tmp_abs("qiita-test-home"));
@@ -291,7 +293,8 @@ mod tests {
     #[test]
     #[serial]
     fn pool_settings_are_taken_from_the_environment() {
-        let _snapshot = EnvSnapshot::capture(POOL_VARS);
+        let _required = EnvSnapshot::capture(REQUIRED_VARS);
+        let _pool = EnvSnapshot::capture(POOL_VARS);
         set_required_env();
         let spill = tmp_abs("qiita-test-spill");
         std::env::set_var("DUCKLAKE_POOL_SIZE", "3");
@@ -312,7 +315,8 @@ mod tests {
     #[test]
     #[serial]
     fn config_rejects_a_pool_that_serves_nothing() {
-        let _snapshot = EnvSnapshot::capture(POOL_VARS);
+        let _required = EnvSnapshot::capture(REQUIRED_VARS);
+        let _pool = EnvSnapshot::capture(POOL_VARS);
         set_required_env();
         clear_pool_vars();
         std::env::set_var("DUCKLAKE_POOL_SIZE", "0");
@@ -334,7 +338,8 @@ mod tests {
     #[test]
     #[serial]
     fn config_rejects_a_relative_spill_directory() {
-        let _snapshot = EnvSnapshot::capture(POOL_VARS);
+        let _required = EnvSnapshot::capture(REQUIRED_VARS);
+        let _pool = EnvSnapshot::capture(POOL_VARS);
         set_required_env();
         clear_pool_vars();
         std::env::set_var("DUCKDB_TEMP_DIRECTORY", "relative/spill");
@@ -352,11 +357,16 @@ mod tests {
     #[test]
     #[serial]
     fn a_pool_too_large_for_the_detected_ceiling_fails_at_boot() {
-        let _snapshot = EnvSnapshot::capture(POOL_VARS);
+        let _required = EnvSnapshot::capture(REQUIRED_VARS);
+        let _pool = EnvSnapshot::capture(POOL_VARS);
         set_required_env();
         clear_pool_vars();
+        // From the constants that do the dividing, so the test cannot drift from
+        // them, and from this machine's own ceiling so it holds on any host.
         let ceiling_mib = super::resources::detect_memory_ceiling().bytes / (1024 * 1024);
-        let size = (ceiling_mib / 2 / 256) + 1;
+        let size =
+            (ceiling_mib / super::config::CEILING_DIVISOR / super::config::MIN_MEMORY_LIMIT_MIB)
+                + 1;
         std::env::set_var("DUCKLAKE_POOL_SIZE", size.to_string());
 
         let err = Settings::from_env().unwrap_err();
@@ -372,7 +382,8 @@ mod tests {
     #[test]
     #[serial]
     fn config_rejects_having_nowhere_to_spill() {
-        let _snapshot = EnvSnapshot::capture(POOL_VARS);
+        let _required = EnvSnapshot::capture(REQUIRED_VARS);
+        let _pool = EnvSnapshot::capture(POOL_VARS);
         set_required_env();
         clear_pool_vars();
         std::env::remove_var("HOME");

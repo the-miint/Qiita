@@ -165,9 +165,11 @@ const DOGET_BATCH_CHANNEL_DEPTH: usize = 4;
 ///
 /// A zero-row result still emits one empty `RecordBatch` carrying the schema, so
 /// the client always receives a valid (possibly empty) Arrow table. A DuckDB
-/// error — connect, prepare, execute, or a chunk fetch after batches have already
-/// gone out — surfaces as a trailing `Err` item, so a client never reads a
-/// truncated result as a whole one; so does a panic (see `run_producer`).
+/// error — prepare, execute, or a chunk fetch after batches have already gone
+/// out — surfaces as a trailing `Err` item, so a client never reads a truncated
+/// result as a whole one; so does a panic (see `run_producer`). Borrowing an
+/// instance happens before this, in the handler, so a pool with nothing to lend
+/// is a synchronous refusal rather than a stream item.
 fn stream_ducklake_batches(
     conn: PooledConnection,
     sql: String,
@@ -781,8 +783,8 @@ impl FlightService for QiitaFlightService {
 
                 // Blocking DuckLake delete transaction — run it on the blocking
                 // pool so it never starves a tonic async worker (mirrors
-                // export_read / count_masked). The closure opens and drops its
-                // own connection, so it is Send and crosses no await.
+                // export_read / count_masked). The borrowed instance moves into
+                // the closure, so it is Send and crosses no await.
                 let conn = self.pool.checkout()?;
                 let reference_idx = payload.reference_idx;
                 let deleted =
@@ -814,8 +816,8 @@ impl FlightService for QiitaFlightService {
 
                 // Blocking DuckLake delete transaction — run it on the blocking
                 // pool so it never starves a tonic async worker (mirrors
-                // export_read / count_masked). The closure opens and drops its
-                // own connection, so it is Send and crosses no await.
+                // export_read / count_masked). The borrowed instance moves into
+                // the closure, so it is Send and crosses no await.
                 let conn = self.pool.checkout()?;
                 let mask_idx = payload.mask_idx;
                 let deleted = tokio::task::spawn_blocking(move || delete_mask(&conn, mask_idx))
@@ -846,8 +848,8 @@ impl FlightService for QiitaFlightService {
 
                 // Blocking DuckLake delete transaction — run it on the blocking
                 // pool so it never starves a tonic async worker (mirrors
-                // export_read / count_masked). The closure opens and drops its
-                // own connection, so it is Send and crosses no await.
+                // export_read / count_masked). The borrowed instance moves into
+                // the closure, so it is Send and crosses no await.
                 let conn = self.pool.checkout()?;
                 let prep_sample_idxs = payload.prep_sample_idxs;
                 let deleted = tokio::task::spawn_blocking(move || {
@@ -888,8 +890,8 @@ impl FlightService for QiitaFlightService {
 
                 // Blocking DuckLake delete transaction — run it on the blocking
                 // pool so it never starves a tonic async worker (mirrors
-                // delete_alignment_block). The closure opens and drops its own
-                // connection, so it is Send and crosses no await.
+                // delete_alignment_block). The borrowed instance moves into the
+                // closure, so it is Send and crosses no await.
                 let conn = self.pool.checkout()?;
                 let mask_idx = payload.mask_idx;
                 let members = payload.members;
@@ -965,8 +967,8 @@ impl FlightService for QiitaFlightService {
 
                 // Blocking DuckLake delete transaction — run it on the blocking
                 // pool so it never starves a tonic async worker (mirrors
-                // delete_alignment). The closure opens and drops its own
-                // connection, so it is Send and crosses no await.
+                // delete_alignment). The borrowed instance moves into the
+                // closure, so it is Send and crosses no await.
                 let conn = self.pool.checkout()?;
                 let alignment_idx = payload.alignment_idx;
                 let members = payload.members;
@@ -1002,8 +1004,8 @@ impl FlightService for QiitaFlightService {
 
                 // Blocking DuckLake delete transaction — run it on the blocking
                 // pool so it never starves a tonic async worker (mirrors
-                // delete_alignment). The closure opens and drops its own
-                // connection, so it is Send and crosses no await.
+                // delete_alignment). The borrowed instance moves into the
+                // closure, so it is Send and crosses no await.
                 let conn = self.pool.checkout()?;
                 let alignment_idx = payload.alignment_idx;
                 let prep_sample_idx = payload.prep_sample_idx;
@@ -1167,8 +1169,8 @@ impl FlightService for QiitaFlightService {
                 // The full-replace runs a blocking DuckLake transaction (and a
                 // blocking `canonicalize` in the handler) — run it on the blocking
                 // pool so it never starves a tonic async worker (mirrors
-                // register_files / export_read). The closure opens and drops its
-                // own connection, so it is Send and crosses no await.
+                // register_files / export_read). The borrowed instance moves into
+                // the closure, so it is Send and crosses no await.
                 let conn = self.pool.checkout()?;
                 let scratch_root = self.scratch_root.clone();
                 let result = tokio::task::spawn_blocking(move || {
@@ -2344,8 +2346,7 @@ struct Registration {
 /// Move Parquet files from staging to permanent storage and register in DuckLake.
 ///
 /// Validates all requested files exist in staging, moves them to permanent
-/// locations under `data_path/{table_name}/`, and registers them — which is why
-/// it takes the data path as well as a connection.
+/// locations under `data_path/{table_name}/`, and registers them.
 ///
 /// Uses `std::fs::rename` with a copy+delete fallback for cross-filesystem moves
 /// (e.g., SLURM local scratch → shared NFS).

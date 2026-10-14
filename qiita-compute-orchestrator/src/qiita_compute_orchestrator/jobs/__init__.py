@@ -34,6 +34,7 @@ from typing import Any
 from pydantic import BaseModel, ValidationError
 from qiita_common.actions import NATIVE_MODULE_PREFIX
 from qiita_common.backend_failure import BackendFailure, FailureKind, StepNoData
+from qiita_common.data_plane_errors import is_data_plane_busy
 from qiita_common.models import ScopeTargetKind, WorkTicketFailureStage
 
 
@@ -269,6 +270,19 @@ async def run_native_job(
             reason=str(exc),
         ) from exc
     except ValueError as exc:
+        if is_data_plane_busy(exc):
+            # The data plane refused the step's Flight call because every DuckLake
+            # connection in its pool was in use. Retriable, and it has to be
+            # separated from the arm below rather than left to it: pyarrow raises
+            # `ArrowInvalid` for that gRPC status, which IS a ValueError, so
+            # otherwise an overload is recorded as a data-quality problem and the
+            # ticket never retries.
+            raise BackendFailure(
+                kind=FailureKind.DATA_PLANE_TRANSIENT,
+                stage=WorkTicketFailureStage.STEP_RUN,
+                step_name=step_name,
+                reason=f"native job {module_name!r}: {exc}",
+            ) from exc
         # Data-quality issues raised from inside execute() (malformed
         # FASTA, unmapped hashes, etc.). Permanent because the same
         # input always fails the same way.
