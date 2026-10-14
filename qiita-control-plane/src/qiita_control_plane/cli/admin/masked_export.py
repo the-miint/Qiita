@@ -391,6 +391,9 @@ def _handle_masked_read_export(args: argparse.Namespace, parser: argparse.Argume
     except httpx.RequestError as exc:
         _common.print_request_error(exc)
         return 1
+    except flight.FlightError as exc:
+        print(f"flight error: {exc}", file=sys.stderr)
+        return 1
     finally:
         flight_client.close()
         if con is not None:

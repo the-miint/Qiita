@@ -1532,8 +1532,8 @@ def test_masked_read_export_overwrites_changed_parquet(monkeypatch, tmp_path):
     assert pq.ParquetFile(out_dir / "SAMN_A.5.7.42.parquet").metadata.num_rows == 2
 
 
-# The manifest GET runs before the per-sample loop and the ticket POST inside
-# it; each sits under its own except arms.
+# The manifest GET runs before the loop over prep_samples and the ticket POST
+# inside it; each sits under its own except arms.
 @pytest.mark.parametrize("unreachable_method", ["GET", "POST"])
 def test_masked_read_export_unreachable_control_plane_is_one_line(
     monkeypatch, tmp_path, capsys, unreachable_method
@@ -1586,6 +1586,55 @@ def test_masked_read_export_unreachable_control_plane_is_one_line(
     err = capsys.readouterr().err
     assert err.count("\n") == 1
     assert "could not reach http://localhost:9999" in err
+    assert list(out_dir.iterdir()) == []
+
+
+def test_masked_read_export_flight_error_is_one_line(monkeypatch, tmp_path, capsys):
+    """A data-plane failure while streaming a prep_sample's reads is one stderr
+    line and exit 1, not a traceback, and leaves no partial file behind."""
+    import pyarrow as pa
+    import pyarrow.flight as flight
+
+    from qiita_control_plane.cli import _common
+    from qiita_control_plane.cli import admin as cli
+
+    monkeypatch.setenv("QIITA_TOKEN", "qk_admin")
+    manifest = {
+        "sequenced_pool_idx": 7,
+        "sequencing_run_idx": 5,
+        "mask_idx": 3,
+        "samples": [{"prep_sample_idx": 42, "biosample_accession": "SAMN_A"}],
+    }
+    monkeypatch.setattr(_common.httpx, "request", _fake_masked_export_http(manifest))
+    fake_cls = _fake_flight_client_class({42: pa.table({"read_id": ["r"], "sequence1": ["A"]})})
+
+    def unavailable(self, ticket, options=None):
+        raise flight.FlightUnavailableError("data plane unavailable")
+
+    monkeypatch.setattr(fake_cls, "do_get", unavailable)
+    monkeypatch.setattr("pyarrow.flight.FlightClient", fake_cls)
+
+    out_dir = tmp_path / "exp"
+    out_dir.mkdir()
+    rc = cli.main(
+        [
+            "masked-read-export",
+            "--sequenced-pool-idx",
+            "7",
+            "--mask-idx",
+            "3",
+            "--format",
+            "parquet",
+            "--output-dir",
+            str(out_dir),
+            "--data-plane-url",
+            "grpc://dp:50051",
+        ]
+    )
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert err.count("\n") == 1
+    assert "flight error: data plane unavailable" in err
     assert list(out_dir.iterdir()) == []
 
 

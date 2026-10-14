@@ -146,7 +146,7 @@ async def _run_reference_load(
 def _handle_reference_load(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
     """Entry point for `qiita reference load`. Reads the PAT, builds
     a real httpx + flight client, and calls `do_reference_load`. Maps
-    every known failure shape to exit 1 with a one-line stderr message —
+    every known failure shape to exit 1 with a stderr message —
     no silent retry, no buried traceback. Terminal work_ticket=failed
     also exits 1 so callers wrapping this in a Makefile / CI step get
     the build break."""

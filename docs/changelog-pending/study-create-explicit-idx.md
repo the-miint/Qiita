@@ -20,10 +20,13 @@
   syndna-read-count`, among others, report a response they do not recognise (such as one from a
   control plane at a different version) on one stderr line and exit 1.** They printed a Python
   traceback, or for `syndna-read-count` pydantic's multi-line error.
-- **Eight CLI commands report HTTP and connection errors with the same messages as every other
-  command.** A 403 from a token that predates a newly granted scope now prompts `qiita login`,
-  and an unreachable control plane is one stderr line naming the URL it tried. `qiita
-  submit-reads`, `qiita reference load`, `qiita reference export`, and `qiita-admin`'s
+- **Eight CLI commands report HTTP and connection errors with the messages the CLI's other
+  control-plane commands use.** A 403 from a token that predates a newly granted scope now prompts
+  `qiita login`, and an unreachable control plane is one stderr line naming the URL it tried.
+  `qiita submit-reads`, `qiita reference load`, `qiita reference export`, and `qiita-admin`'s
   `masked-read-export` and `owner-biosample-id` printed a Python traceback when the control plane
   was unreachable. `qiita mask syndna-read-count`, `qiita feature-table build` and `qiita assembly
   export` printed one line, without the URL.
+- **`qiita-admin masked-read-export` reports a data plane failure partway through an export on
+  one stderr line and exits 1.** It printed a Python traceback. Every file already written is
+  complete.

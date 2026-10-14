@@ -853,7 +853,7 @@ pub fn ensure_lake_tables(conn: &Connection) -> Result<(), Box<dyn std::error::E
     ensure_alignment_tables(conn)?;
     ensure_assembly_tables(conn)?;
     ensure_amplicon_tables(conn)?;
-    // Seeded here so no request path has to create it.
+    // The lock row is seeded here so no request path has to create it.
     ensure_registration_lock(conn)?;
     // Must run after reference + alignment tables — the `_visible` views join them.
     ensure_exclusion_tables(conn)?;
