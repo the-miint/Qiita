@@ -1473,7 +1473,7 @@ def test_masked_read_export_skips_unchanged_parquet(monkeypatch, tmp_path, capsy
     capsys.readouterr()  # discard first-run output
 
     assert cli.main(argv) == 0  # second export: nothing changed
-    assert "exported 0 sample(s) (skipped 2 already up to date)" in capsys.readouterr().out
+    assert "exported 0 prep_sample(s) (skipped 2 already up to date)" in capsys.readouterr().out
     # The re-run client streamed nothing (every sample skipped) but counted both.
     rerun = fake_cls.instances[-1]
     assert rerun.do_get_calls == []

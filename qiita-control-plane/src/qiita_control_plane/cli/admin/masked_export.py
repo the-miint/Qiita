@@ -276,9 +276,9 @@ def _handle_masked_read_export(args: argparse.Namespace, parser: argparse.Argume
     )
     if bad:
         print(
-            f"error: {len(bad)} sample(s) on sequenced_pool {pool_idx} have no usable "
+            f"error: {len(bad)} prep_sample(s) on sequenced_pool {pool_idx} have no usable "
             f"biosample_accession (missing or outside [A-Za-z0-9._-]): prep_sample_idx {bad}. "
-            "The export filename requires the accession — submit/repair these samples first.",
+            "The export filename requires the accession — submit/repair these prep_samples first.",
             file=sys.stderr,
         )
         return 1
@@ -296,7 +296,7 @@ def _handle_masked_read_export(args: argparse.Namespace, parser: argparse.Argume
     )
     if not_complete:
         print(
-            f"error: {len(not_complete)} sample(s) on sequenced_pool {pool_idx} are not "
+            f"error: {len(not_complete)} prep_sample(s) on sequenced_pool {pool_idx} are not "
             f"masked-complete under mask_idx {args.mask_idx} (mask_sample.state != 'completed'): "
             f"prep_sample_idx {not_complete}. The read_masked pass-set would be absent or "
             "partial — refusing to export. Retry once masking has completed.",
@@ -410,7 +410,7 @@ def _handle_masked_read_export(args: argparse.Namespace, parser: argparse.Argume
         if con is not None:
             con.close()
 
-    summary = f"exported {exported} sample(s)"
+    summary = f"exported {exported} prep_sample(s)"
     if skipped:
         summary += f" (skipped {skipped} already up to date)"
     print(f"{summary} from sequenced_pool {pool_idx} to {output_dir}")
