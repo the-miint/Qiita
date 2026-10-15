@@ -451,6 +451,75 @@ def test_md5_error_with_transient_marker_still_classifies_transient(
     assert "fastq_md5" not in exc.value.reason.lower()
 
 
+@pytest.mark.parametrize(
+    "error",
+    [
+        # ENA's metadata API, after miint's own retries
+        duckdb.HTTPException(
+            "HTTP Error: ENA request failed with HTTP 500 (URL: "
+            "https://www.ebi.ac.uk/ena/portal/api/search?result=read_run)"
+        ),
+        duckdb.HTTPException(
+            "HTTP Error: ENA request failed with HTTP 429 (URL: "
+            "https://www.ebi.ac.uk/ena/portal/api/search?result=read_run)"
+        ),
+        # the file server, through httpfs, when a run's file is opened
+        duckdb.HTTPException(
+            "HTTP Error: Request returned HTTP 503 for HTTP HEAD to "
+            "'https://ftp.sra.ebi.ac.uk/vol1/fastq/ERR001/ERR001.fastq.gz'"
+        ),
+        # a scan of one run that failed mid-stream, which older miint builds
+        # reported as a skip warning
+        duckdb.IOException(
+            "IO Error: read_ena_sequences: every run failed (1): ERR001; "
+            "first error: unexpected end of stream"
+        ),
+        # ENA's "Not all results may have been written" answer
+        duckdb.IOException(
+            "IO Error: ENA request failed after 4 attempts: the last response was "
+            'incomplete, ENA wrote "ERROR occurred. Not all results may have been '
+            'written." in place of the search results (URL: '
+            "https://www.ebi.ac.uk/ena/portal/api/search)"
+        ),
+    ],
+)
+def test_outage_shaped_fetch_error_is_retriable(fake_mint, monkeypatch, tmp_path, error):
+    """An ENA or file-server outage, and a run that broke mid-stream, clear up on
+    a later attempt, so they are retried rather than failing the ticket on its
+    first attempt. None of these messages carries a network word."""
+
+    def _fake(run_accession, download_method, intermediate_path, duckdb_tmp, memory_gb, threads):
+        raise error
+
+    monkeypatch.setattr(ingest_module, "_stage_run_reads", _fake)
+    inputs = _inputs(tmp_path, [(10, "ERR001")])
+
+    with pytest.raises(BackendFailure) as exc:
+        _run(inputs, tmp_path / "ws")
+    assert exc.value.kind == FailureKind.EXTERNAL_FETCH_TRANSIENT
+    assert exc.value.transient is True
+
+
+def test_not_found_fetch_error_is_permanent(fake_mint, monkeypatch, tmp_path):
+    """A run whose file is missing is missing on every attempt, so a 404 fails the
+    ticket at once instead of using up its retries."""
+
+    def _fake(run_accession, download_method, intermediate_path, duckdb_tmp, memory_gb, threads):
+        raise duckdb.HTTPException(
+            "HTTP Error: HTTP GET error on "
+            "'https://ftp.sra.ebi.ac.uk/vol1/fastq/ERR001/ERR001.fastq.gz' "
+            "(HTTP 404 Not Found)"
+        )
+
+    monkeypatch.setattr(ingest_module, "_stage_run_reads", _fake)
+    inputs = _inputs(tmp_path, [(10, "ERR001")])
+
+    with pytest.raises(BackendFailure) as exc:
+        _run(inputs, tmp_path / "ws")
+    assert exc.value.kind == FailureKind.BAD_INPUT
+    assert exc.value.transient is False
+
+
 # ---------------------------------------------------------------------------
 # Several failed runs in one pool
 # ---------------------------------------------------------------------------

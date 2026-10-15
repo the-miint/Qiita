@@ -350,10 +350,12 @@ see miint's [`insdc_ena` docs](https://the-miint.github.io/duckdb-miint/insdc_en
 and a mismatch fails the step. miint cannot tell a transfer truncated on a gzip member
 boundary from bytes that really disagree with the digest, so the step is retried up to
 the ticket's retry limit; when the retries run out the ticket ends FAILED with
-failure_type `permanent` and both digests in the reason. A run miint skipped (a failed
-open or a mid-download failure, including a corrupt body that surfaces mid-stream) is
-retried the same way, so a permanent open failure such as a 404 costs the full retry
-limit before it fails.
+failure_type `permanent` and both digests in the reason. A run that broke mid-download
+(including a corrupt body that surfaces mid-stream), an HTTP 5xx or 429 from ENA or its
+file server, and ENA's "Not all results may have been written" answer are retried the
+same way. A failed open depends on the miint build: before duckdb-miint#312 miint skips
+the run with a warning, which is retried like the rest, so a 404 costs the full retry
+limit; from duckdb-miint#312 on it raises the server's error, and a 404 fails at once.
 
 Where verification does not apply (an SFF run, a file that is not gzip-compressed, no
 `fastq_md5` from ENA) the run still registers. A run that comes back empty with no

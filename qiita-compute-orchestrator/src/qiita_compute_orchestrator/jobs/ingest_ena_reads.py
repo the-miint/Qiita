@@ -18,18 +18,21 @@ Gotchas specific to the ENA source:
 - One FRESH DuckDB connection PER RUN. `miint_warnings()` accumulates across
   queries in a session (duckdb-miint/docs/utilities.md), so a reused connection
   would leak one run's warnings into the next run's fail-loud check.
-- Fail loud on a silent skip. `read_ena_sequences` does not raise on a run that
-  fails to open or fails mid-stream — it retries once, then skips/truncates and
-  records a `miint_warnings()` entry, returning fewer/zero rows. So a "skip"
-  warning (`_skip_warnings`) fails the run retriably and a clean 0-row result
-  fails it BAD_INPUT (an ENA run never legitimately has zero reads, unlike a
-  demux well). A raised
-  `duckdb.Error` is classified separately (`_classify_ena_fetch_error`).
+- Fail loud on a silent skip. Before duckdb-miint#312, `read_ena_sequences` does
+  not raise on a run that fails to open or fails mid-stream — it retries once,
+  then skips/truncates and records a `miint_warnings()` entry, returning
+  fewer/zero rows. So a "skip" warning (`_skip_warnings`) fails the run
+  retriably and a clean 0-row result fails it BAD_INPUT (an ENA run never
+  legitimately has zero reads, unlike a demux well). From duckdb-miint#312 on, a
+  scan of one run raises instead: a failed open with the server's own error, a
+  mid-stream failure as "every run failed". A raised `duckdb.Error` is
+  classified separately (`_classify_ena_fetch_error`).
 """
 
 from __future__ import annotations
 
 import asyncio
+import re
 from pathlib import Path
 
 import duckdb
@@ -91,7 +94,18 @@ _TRANSIENT_ERROR_MARKERS = (
     "unreachable",
     "temporarily",
     "curl",
+    # miint's error for a scan of one run that failed mid-stream
+    # (duckdb-miint#312), which older builds reported as a "skip" warning.
+    "every run failed",
+    # ENA's "Not all results may have been written" answer, after miint's own
+    # retries (duckdb-miint#310).
+    "response was incomplete",
 )
+# A server-side or rate-limit status, from ENA's metadata APIs ("ENA request
+# failed with HTTP 500") or from the file server via httpfs ("Request returned
+# HTTP 503 for HTTP HEAD to ..."). A 404 is not here: a missing file is missing
+# on every retry.
+_TRANSIENT_HTTP_STATUS = re.compile(r"\bhttp (?:429|5\d\d)\b")
 
 
 class Inputs(BaseModel):
@@ -141,9 +155,9 @@ def _stage_run_reads(
     not interpret them — the caller applies `_skip_warnings`.
 
     Raises `duckdb.Error` on a raised transport/format failure (caller
-    classifies via `_classify_ena_fetch_error`). Does NOT raise on an internal
-    skip/partial-download — that returns normally with a warning, which is why
-    the caller must inspect `warning_messages`."""
+    classifies via `_classify_ena_fetch_error`). Before duckdb-miint#312, does
+    NOT raise on an internal skip/partial-download — that returns normally with a
+    warning, which is why the caller must inspect `warning_messages`."""
     intermediate = validate_parquet_path(intermediate_path)
     with open_miint_conn() as conn:
         apply_duckdb_settings(conn, duckdb_tmp, memory_gb=memory_gb, threads=threads)
@@ -163,11 +177,12 @@ def _classify_ena_fetch_error(
     run_accession: str, exc: duckdb.Error, *, step_name: str
 ) -> BackendFailure:
     """Classify a raised `duckdb.Error` from `_stage_run_reads` as retriable
-    (transport/network-shaped or md5 mismatch) or permanent (format/parse, or
-    anything not confidently network-shaped). The exception text is all the
-    caller has: a raise means miint's open-retry-then-skip did not run."""
+    (transport/network-shaped, a server-side or rate-limit HTTP status, or md5
+    mismatch) or permanent (format/parse, a 404, or anything not confidently
+    network-shaped). The exception text is all the caller has."""
     text = str(exc).lower()
-    if any(marker in text for marker in _TRANSIENT_ERROR_MARKERS):
+    network_shaped = any(marker in text for marker in _TRANSIENT_ERROR_MARKERS)
+    if network_shaped or _TRANSIENT_HTTP_STATUS.search(text):
         return BackendFailure(
             kind=FailureKind.EXTERNAL_FETCH_TRANSIENT,
             stage=WorkTicketFailureStage.STEP_RUN,
