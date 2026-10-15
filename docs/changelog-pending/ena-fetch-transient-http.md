@@ -1,9 +1,15 @@
 ### Fixed
 
 - **An ENA outage no longer fails an ENA read download on its first attempt.**
-  `ingest_ena_reads` now retries a fetch that fails with an HTTP 5xx or 429 from ENA or its
-  file server, with ENA's "Not all results may have been written" answer, or with miint's
-  "every run failed" error for a run that broke mid-download. None of these carries a
-  network word, so each was classified as bad input and failed the ticket at once. A 404
-  still fails at once. From duckdb-miint#312 on, miint raises these errors for a scan of
-  one run instead of skipping the run with a warning; the step handles either build.
+  `ingest_ena_reads` now retries a download that fails because ENA answers with an HTTP
+  5xx, 408 or 429. On every miint build, such a failure used to end the ticket with
+  failure_type `permanent` at once.
+
+### Changed
+
+- **`ingest_ena_reads` is ready for a miint build that raises for a run it could not
+  read.** From duckdb-miint#312 on, miint raises instead of skipping the run with a
+  warning. With such a build, a 5xx, 408 or 429 from ENA's file server and a run that
+  broke mid-download are retried, as the skip warning was, and a run whose file is
+  missing (404) fails at once instead of using up its retries. With duckdb-miint#310,
+  ENA's "Not all results may have been written" answer is retried too.

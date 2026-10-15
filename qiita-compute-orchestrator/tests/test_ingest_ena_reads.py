@@ -451,30 +451,41 @@ def test_md5_error_with_transient_marker_still_classifies_transient(
     assert "fastq_md5" not in exc.value.reason.lower()
 
 
+def _http_error(status: int, message: str) -> duckdb.HTTPException:
+    """A duckdb.HTTPException as httpfs and miint's ENA client raise it: with the
+    response's status in `status_code`, which a constructed one lacks."""
+    error = duckdb.HTTPException(message)
+    error.status_code = status
+    return error
+
+
 @pytest.mark.parametrize(
     "error",
     [
         # ENA's metadata API, after miint's own retries
-        duckdb.HTTPException(
+        _http_error(
+            500,
             "HTTP Error: ENA request failed with HTTP 500 (URL: "
-            "https://www.ebi.ac.uk/ena/portal/api/search?result=read_run)"
+            "https://www.ebi.ac.uk/ena/portal/api/search?result=read_run)",
         ),
-        duckdb.HTTPException(
+        _http_error(
+            429,
             "HTTP Error: ENA request failed with HTTP 429 (URL: "
-            "https://www.ebi.ac.uk/ena/portal/api/search?result=read_run)"
+            "https://www.ebi.ac.uk/ena/portal/api/search?result=read_run)",
         ),
         # the file server, through httpfs, when a run's file is opened
-        duckdb.HTTPException(
+        _http_error(
+            503,
             "HTTP Error: Request returned HTTP 503 for HTTP HEAD to "
-            "'https://ftp.sra.ebi.ac.uk/vol1/fastq/ERR001/ERR001.fastq.gz'"
+            "'https://ftp.sra.ebi.ac.uk/vol1/fastq/ERR001/ERR001.fastq.gz'",
         ),
-        # a scan of one run that failed mid-stream, which older miint builds
-        # reported as a skip warning
-        duckdb.IOException(
-            "IO Error: read_ena_sequences: every run failed (1): ERR001; "
-            "first error: unexpected end of stream"
+        _http_error(
+            408,
+            "HTTP Error: Request returned HTTP 408 for HTTP HEAD to "
+            "'https://ftp.sra.ebi.ac.uk/vol1/fastq/ERR001/ERR001.fastq.gz'",
         ),
-        # ENA's "Not all results may have been written" answer
+        # ENA's "Not all results may have been written" answer, after miint's
+        # own retries
         duckdb.IOException(
             "IO Error: ENA request failed after 4 attempts: the last response was "
             'incomplete, ENA wrote "ERROR occurred. Not all results may have been '
@@ -483,10 +494,9 @@ def test_md5_error_with_transient_marker_still_classifies_transient(
         ),
     ],
 )
-def test_outage_shaped_fetch_error_is_retriable(fake_mint, monkeypatch, tmp_path, error):
-    """An ENA or file-server outage, and a run that broke mid-stream, clear up on
-    a later attempt, so they are retried rather than failing the ticket on its
-    first attempt. None of these messages carries a network word."""
+def test_unavailable_server_fetch_error_is_retriable(fake_mint, monkeypatch, tmp_path, error):
+    """ENA or its file server answering with a failure a later attempt can clear
+    is retried, and reported as a transient fetch error."""
 
     def _fake(run_accession, download_method, intermediate_path, duckdb_tmp, memory_gb, threads):
         raise error
@@ -498,17 +508,41 @@ def test_outage_shaped_fetch_error_is_retriable(fake_mint, monkeypatch, tmp_path
         _run(inputs, tmp_path / "ws")
     assert exc.value.kind == FailureKind.EXTERNAL_FETCH_TRANSIENT
     assert exc.value.transient is True
+    assert ingest_module.TRANSIENT_FETCH_ERROR_TEXT in exc.value.reason
+
+
+def test_mid_stream_fetch_error_is_retried_as_partial_data(fake_mint, monkeypatch, tmp_path):
+    """A run that failed mid-stream is retried, like the skip warning a build that
+    skips gives for it, and its reason says the data is partial rather than that
+    ENA is unreachable, so the live e2e test fails on it instead of skipping."""
+
+    def _fake(run_accession, download_method, intermediate_path, duckdb_tmp, memory_gb, threads):
+        raise duckdb.IOException(
+            "IO Error: read_ena_sequences: every run failed (1): ERR001; "
+            "first error: unexpected end of stream"
+        )
+
+    monkeypatch.setattr(ingest_module, "_stage_run_reads", _fake)
+    inputs = _inputs(tmp_path, [(10, "ERR001")])
+
+    with pytest.raises(BackendFailure) as exc:
+        _run(inputs, tmp_path / "ws")
+    assert exc.value.kind == FailureKind.EXTERNAL_FETCH_TRANSIENT
+    assert exc.value.transient is True
+    assert ingest_module.TRANSIENT_FETCH_ERROR_TEXT not in exc.value.reason
+    assert "missing or partial" in exc.value.reason
 
 
 def test_not_found_fetch_error_is_permanent(fake_mint, monkeypatch, tmp_path):
-    """A run whose file is missing is missing on every attempt, so a 404 fails the
-    ticket at once instead of using up its retries."""
+    """A run whose file is missing is missing on every attempt, so a raised 404
+    fails the ticket at once instead of using up its retries."""
 
     def _fake(run_accession, download_method, intermediate_path, duckdb_tmp, memory_gb, threads):
-        raise duckdb.HTTPException(
+        raise _http_error(
+            404,
             "HTTP Error: HTTP GET error on "
             "'https://ftp.sra.ebi.ac.uk/vol1/fastq/ERR001/ERR001.fastq.gz' "
-            "(HTTP 404 Not Found)"
+            "(HTTP 404 Not Found)",
         )
 
     monkeypatch.setattr(ingest_module, "_stage_run_reads", _fake)
