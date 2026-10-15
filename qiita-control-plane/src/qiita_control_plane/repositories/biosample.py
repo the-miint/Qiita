@@ -337,23 +337,6 @@ async def fetch_biosample_idxs_by_natural_key(
     return resolved
 
 
-async def fetch_biosample_identity_by_tube(
-    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
-    tubes: list[str],
-) -> dict[str, tuple[int, str | None]]:
-    """Return `{matrix_tube_id: (biosample_idx, biosample_accession)}` for every
-    tube in `tubes` carried by a non-retired biosample. Absent tubes are omitted."""
-    if not tubes:
-        return {}
-    rows = await pool_or_conn.fetch(
-        "SELECT idx, matrix_tube_id, biosample_accession FROM qiita.biosample"
-        " WHERE matrix_tube_id = ANY($1::text[])"
-        "   AND retired = false",
-        tubes,
-    )
-    return {r["matrix_tube_id"]: (r["idx"], r["biosample_accession"]) for r in rows}
-
-
 async def fetch_active_study_links(
     pool_or_conn: asyncpg.Pool | asyncpg.Connection,
     biosample_idxs: list[int],

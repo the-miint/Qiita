@@ -2745,21 +2745,24 @@ def test_submit_bcl_convert_happy_path_chains_full_flow(
         "rows": [
             {
                 "item_id": "1",
-                "biosample_accession": "SAMN001",
-                "primary_project_accession": "PRJ001",
-                "secondary_project_accessions": [],
+                "biosample": {"biosample_accession": "SAMN001"},
+                "primary_project": {"bioproject_accession": "PRJ001"},
+                "secondary_projects": [],
             },
             {
                 "item_id": "2",
-                "biosample_accession": "SAMN002",
-                "primary_project_accession": "PRJ001",
-                "secondary_project_accessions": ["PRJ002"],
+                "biosample": {"biosample_accession": "SAMN002"},
+                "primary_project": {"bioproject_accession": "PRJ001"},
+                "secondary_projects": [{"bioproject_accession": "PRJ002"}],
             },
             {
                 "item_id": "3",
-                "biosample_accession": "SAMN003",
-                "primary_project_accession": "PRJ002",
-                "secondary_project_accessions": ["PRJ001", "PRJ003"],
+                "biosample": {"biosample_accession": "SAMN003"},
+                "primary_project": {"bioproject_accession": "PRJ002"},
+                "secondary_projects": [
+                    {"bioproject_accession": "PRJ001"},
+                    {"bioproject_accession": "PRJ003"},
+                ],
             },
         ]
     }

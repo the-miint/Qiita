@@ -40,6 +40,7 @@ from qiita_common.models import (
     HOST_FILTER_INDEX_TYPE_MINIMAP2,
     HOST_FILTER_INDEX_TYPE_RYPE,
     AlignPlanRequest,
+    BiosampleRef,
     BlockMaskPlanRequest,
     HostFilterResolution,
     Platform,
@@ -53,6 +54,7 @@ from qiita_common.models import (
     SequencedPoolCreateRequest,
     SequencedSampleCreateRequest,
     SequencingRunCreateRequest,
+    StudyRef,
     WorkTicketCreateRequest,
 )
 
@@ -157,9 +159,11 @@ def _resolve_roster(
         rows=[
             RosterResolveRow(
                 item_id=pool_item_id(row),
-                biosample_accession=row.biosample_accession,
-                primary_project_accession=row.primary_project_accession,
-                secondary_project_accessions=list(row.secondary_project_accessions),
+                biosample=BiosampleRef(biosample_accession=row.biosample_accession),
+                primary_project=StudyRef(bioproject_accession=row.primary_project_accession),
+                secondary_projects=[
+                    StudyRef(bioproject_accession=a) for a in row.secondary_project_accessions
+                ],
             )
             for row in preflight_rows
         ]

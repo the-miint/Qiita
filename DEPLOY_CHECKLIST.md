@@ -43,6 +43,7 @@ _None yet._
 - (#685) Work-ticket responses (`GET /work-ticket/{idx}` and the ticket lists) gain `on_success`, `follow_on_work_ticket_idx` and `follow_on_error` (all null for a ticket with no follow-on); clients validating that shape strictly must accept them.
 - (#707) New optional `FOLLOW_ON_SWEEP_INTERVAL_SECONDS` (default 60) tunes how often the control plane retries a transiently-failed follow-on; no action required.
 - (#711) `POST /study` now answers 422 to a body key it does not define, where it used to drop the key and return 201; a client sending extra keys must stop. It also takes an optional `study_idx` (system_admin only).
+- (#feat/export-entity-roster-lookup) `POST /biosample/resolve-roster` takes a new, incompatible row shape (nested `biosample` / `primary_project` / `secondary_projects` refs); a `qiita` CLI installed before this deploy gets a 422 from `submit-bcl-convert`, `submit-pacbio-ingest` and `submit-golay-demux` until it is upgraded.
 
 ## Deployed history
 

@@ -361,10 +361,10 @@ def _stub_submit_flow(
             rows = [
                 {
                     "item_id": r["item_id"],
-                    "biosample_idx": biosample_idx[r["biosample_accession"]],
-                    "primary_study_idx": study_idx[r["primary_project_accession"]],
+                    "biosample_idx": biosample_idx[r["biosample"]["biosample_accession"]],
+                    "primary_study_idx": study_idx[r["primary_project"]["bioproject_accession"]],
                     "secondary_study_idxs": [
-                        study_idx[a] for a in r["secondary_project_accessions"]
+                        study_idx[p["bioproject_accession"]] for p in r["secondary_projects"]
                     ],
                 }
                 for r in json["rows"]

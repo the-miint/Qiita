@@ -1,189 +1,255 @@
-"""Classification rules for resolving a pool roster by tube or accession.
+"""Classification rules for resolving a pool roster by external identifiers.
 
 Pure: the facts the database would supply are handed in, so every rule is
 exercised without Postgres.
 """
 
-from qiita_common.models import RosterResolvedRow, RosterResolveRow
+from typing import get_args
 
+import pytest
+from qiita_common.models import (
+    BiosampleRef,
+    RosterProblem,
+    RosterResolvedRow,
+    RosterResolveRow,
+    StudyRef,
+)
+
+from qiita_control_plane.repositories.biosample import BiosampleLookupKey
+from qiita_control_plane.repositories.study import StudyLookupKey
 from qiita_control_plane.roster_resolution import RosterFacts, classify_roster
 
 TUBE = "0363157924"
 TUBE_RAW = "363157924"
-_NO_REPLICATES = "technical replicates are not supported in a tube-keyed roster"
+BIOSAMPLE = {"biosample_accession": "SAMN1"}
+PRIMARY = {"bioproject_accession": "PRJNA1"}
 
 
-def _facts(**overrides) -> RosterFacts:
-    base = {
-        "by_tube": {TUBE: (11, None)},
-        "by_biosample_accession": {"SAMN1": 21},
-        "by_study_accession": {"PRJNA1": 101, "PRJNA2": 102},
-        "study_links": {11: [101], 21: [101]},
-    }
-    base.update(overrides)
-    return RosterFacts(**base)
-
-
-def _messages(problems) -> list[tuple[str, str]]:
-    return [(p.item_id, p.message) for p in problems]
-
-
-def test_tube_row_resolves_study_from_its_link():
-    resolved, problems = classify_roster(
-        [RosterResolveRow(item_id="1", matrix_tube_id=TUBE_RAW)], _facts()
+def _facts() -> RosterFacts:
+    """Biosample 21 carries every identifier and links to studies 101 and 102;
+    biosample 22 links to 101 only. Study 103 exists but links to nothing."""
+    return RosterFacts(
+        biosample_by_key={
+            "biosample_accession": {"SAMN1": 21, "SAMN2": 22},
+            "ena_sample_accession": {"ERS1": 21},
+            "export_entity_id": {"QB21": 21},
+            "matrix_tube_id": {TUBE: 21},
+        },
+        study_by_key={
+            "bioproject_accession": {"PRJNA1": 101, "PRJNA2": 102, "PRJNA3": 103},
+            "ena_study_accession": {"PRJEB1": 101},
+            "export_entity_id": {"QS101": 101},
+        },
+        study_links={21: [101, 102], 22: [101]},
     )
-    assert problems == []
-    assert resolved == [
-        RosterResolvedRow(
-            item_id="1", biosample_idx=11, primary_study_idx=101, secondary_study_idxs=[]
-        )
-    ]
 
 
-def test_tube_row_project_accession_must_name_a_linked_study():
-    ok, ok_problems = classify_roster(
-        [RosterResolveRow(item_id="1", matrix_tube_id=TUBE, primary_project_accession="PRJNA1")],
-        _facts(),
+def _row(
+    item_id: str = "1",
+    *,
+    biosample: dict = BIOSAMPLE,
+    primary: dict = PRIMARY,
+    secondaries: tuple[dict, ...] = (),
+) -> RosterResolveRow:
+    return RosterResolveRow(
+        item_id=item_id,
+        biosample=BiosampleRef(**biosample),
+        primary_project=StudyRef(**primary),
+        secondary_projects=[StudyRef(**s) for s in secondaries],
     )
-    assert ok_problems == []
-    assert ok[0].primary_study_idx == 101
-
-    _, problems = classify_roster(
-        [RosterResolveRow(item_id="1", matrix_tube_id=TUBE, primary_project_accession="PRJNA2")],
-        _facts(),
-    )
-    assert _messages(problems) == [
-        ("1", f"the biosample with matrix tube {TUBE} is not in study PRJNA2")
-    ]
 
 
-def test_tube_row_with_no_or_several_study_links():
-    _, none = classify_roster(
-        [RosterResolveRow(item_id="1", matrix_tube_id=TUBE)], _facts(study_links={})
+def _resolved(item_id: str, biosample_idx: int, secondaries: list[int] | None = None):
+    return RosterResolvedRow(
+        item_id=item_id,
+        biosample_idx=biosample_idx,
+        primary_study_idx=101,
+        secondary_study_idxs=secondaries or [],
     )
-    assert _messages(none) == [
-        ("1", f"the biosample with matrix tube {TUBE} belongs to no active study")
-    ]
-    _, several = classify_roster(
-        [RosterResolveRow(item_id="1", matrix_tube_id=TUBE)],
-        _facts(study_links={11: [101, 102]}),
-    )
-    assert _messages(several) == [
+
+
+@pytest.mark.parametrize(
+    ("ref_model", "lookup_key"),
+    [(BiosampleRef, BiosampleLookupKey), (StudyRef, StudyLookupKey)],
+)
+def test_ref_fields_match_lookup_keys(ref_model, lookup_key):
+    """Tests the case where a ref model and its lookup keys are compared: each
+    field is resolved by the key of the same name, so the two sets must match."""
+    assert set(ref_model.model_fields) == set(get_args(lookup_key))
+
+
+@pytest.mark.parametrize(
+    "biosample",
+    [
+        {"biosample_accession": "SAMN1"},
+        {"ena_sample_accession": "ERS1"},
+        {"export_entity_id": "QB21"},
+        {"matrix_tube_id": TUBE_RAW},
+    ],
+)
+@pytest.mark.parametrize(
+    "primary",
+    [
+        {"bioproject_accession": "PRJNA1"},
+        {"ena_study_accession": "PRJEB1"},
+        {"export_entity_id": "QS101"},
+    ],
+)
+def test_classify_roster_each_identifier_alone(biosample, primary):
+    """Tests the case where each entity is named by a single identifier of any key;
+    a tube that lost its leading zero resolves to the stored form."""
+    result = classify_roster([_row(biosample=biosample, primary=primary)], _facts())
+    assert result == ([_resolved("1", 21)], [])
+
+
+@pytest.mark.parametrize(
+    ("biosample", "primary", "message"),
+    [
         (
-            "1",
-            f"the biosample with matrix tube {TUBE} belongs to 2 studies; name the"
-            " project's bioproject accession to choose one",
-        )
-    ]
-
-
-def test_tube_problems_malformed_unknown_duplicate():
-    rows = [
-        RosterResolveRow(item_id="bad", matrix_tube_id="800805.001.V1.Plasma"),
-        RosterResolveRow(item_id="gone", matrix_tube_id="999"),
-        RosterResolveRow(item_id="a", matrix_tube_id=TUBE_RAW),
-        RosterResolveRow(item_id="b", matrix_tube_id=TUBE),
-    ]
-    resolved, problems = classify_roster(rows, _facts())
-    assert resolved == []
-    # A tube is reported in its normalized form, the one a registry holds.
-    assert _messages(problems) == [
-        ("bad", "'800805.001.V1.Plasma' is not a matrix tube id (1 to 10 digits)"),
-        ("gone", "no biosample has matrix tube 0000000999; register it before submitting"),
-        ("a", f"matrix tube {TUBE} appears on 2 rows of this roster; {_NO_REPLICATES}"),
-        ("b", f"matrix tube {TUBE} appears on 2 rows of this roster; {_NO_REPLICATES}"),
-    ]
-
-
-def test_tube_and_accession_must_agree():
-    _, problems = classify_roster(
-        [RosterResolveRow(item_id="1", matrix_tube_id=TUBE, biosample_accession="SAMN9")],
-        _facts(by_tube={TUBE: (11, "SAMN1")}),
-    )
-    assert _messages(problems) == [
-        ("1", f"matrix tube {TUBE} belongs to a biosample with accession 'SAMN1', not 'SAMN9'")
-    ]
-
-
-def test_accession_row_resolves_by_accessions():
-    resolved, problems = classify_roster(
-        [
-            RosterResolveRow(
-                item_id="1",
-                biosample_accession="SAMN1",
-                primary_project_accession="PRJNA1",
-                secondary_project_accessions=["PRJNA2"],
-            )
-        ],
-        _facts(),
-    )
-    assert problems == []
-    assert resolved == [
-        RosterResolvedRow(
-            item_id="1", biosample_idx=21, primary_study_idx=101, secondary_study_idxs=[102]
-        )
-    ]
-
-
-def test_accession_and_identity_problems():
-    rows = [
-        RosterResolveRow(item_id="none"),
-        RosterResolveRow(
-            item_id="nobs", biosample_accession="SAMN404", primary_project_accession="PRJNA1"
+            {"biosample_accession": "SAMN404"},
+            PRIMARY,
+            "no biosample has biosample_accession 'SAMN404'",
         ),
-        RosterResolveRow(
-            item_id="nostudy",
-            biosample_accession="SAMN1",
-            primary_project_accession="PRJNA404",
-            secondary_project_accessions=["PRJNA405"],
-        ),
-    ]
-    _, problems = classify_roster(rows, _facts())
-    assert _messages(problems) == [
-        ("none", "row carries neither a matrix tube nor a biosample accession"),
-        ("nobs", "no biosample has accession 'SAMN404'"),
-        ("nostudy", "no study has accession 'PRJNA404'"),
-        ("nostudy", "no study has accession 'PRJNA405'"),
-    ]
-
-
-def test_mixed_roster_resolves_in_request_order():
-    rows = [
-        RosterResolveRow(item_id="t", matrix_tube_id=TUBE),
-        RosterResolveRow(
-            item_id="a", biosample_accession="SAMN1", primary_project_accession="PRJNA1"
-        ),
-    ]
-    resolved, problems = classify_roster(rows, _facts())
-    assert problems == []
-    assert [r.item_id for r in resolved] == ["t", "a"]
-
-
-def test_accession_row_without_a_project_takes_its_one_study():
-    resolved, problems = classify_roster(
-        [RosterResolveRow(item_id="1", biosample_accession="SAMN1")], _facts()
-    )
-    assert problems == []
-    assert resolved[0].primary_study_idx == 101
-
-    _, several = classify_roster(
-        [RosterResolveRow(item_id="1", biosample_accession="SAMN1")],
-        _facts(study_links={21: [101, 102]}),
-    )
-    assert _messages(several) == [
         (
-            "1",
-            "biosample SAMN1 belongs to 2 studies; name the project's bioproject"
-            " accession to choose one",
-        )
-    ]
+            {"ena_sample_accession": "ERS404"},
+            PRIMARY,
+            "no biosample has ena_sample_accession 'ERS404'",
+        ),
+        ({"export_entity_id": "QB404"}, PRIMARY, "no biosample has export_entity_id 'QB404'"),
+        (
+            {"matrix_tube_id": "999"},
+            PRIMARY,
+            "no biosample has matrix tube 0000000999; register it before submitting",
+        ),
+        (
+            BIOSAMPLE,
+            {"bioproject_accession": "PRJNA404"},
+            "no study has bioproject_accession 'PRJNA404'",
+        ),
+        (
+            BIOSAMPLE,
+            {"ena_study_accession": "PRJEB404"},
+            "no study has ena_study_accession 'PRJEB404'",
+        ),
+        (BIOSAMPLE, {"export_entity_id": "QS404"}, "no study has export_entity_id 'QS404'"),
+    ],
+)
+def test_classify_roster_each_identifier_miss(biosample, primary, message):
+    """Tests the case where the only identifier given for an entity names nothing."""
+    result = classify_roster([_row(biosample=biosample, primary=primary)], _facts())
+    assert result == ([], [RosterProblem(item_id="1", message=message)])
 
 
-def test_tube_whose_biosample_has_no_accession_conflicts_with_a_named_one():
-    _, problems = classify_roster(
-        [RosterResolveRow(item_id="1", matrix_tube_id=TUBE, biosample_accession="SAMN9")],
-        _facts(),
+def test_classify_roster_all_identifiers_agree():
+    """Tests the case where every key is given for each entity and all of them
+    name the same one, with a linked secondary project."""
+    row = _row(
+        biosample={
+            "biosample_accession": "SAMN1",
+            "ena_sample_accession": "ERS1",
+            "export_entity_id": "QB21",
+            "matrix_tube_id": TUBE,
+        },
+        primary={
+            "bioproject_accession": "PRJNA1",
+            "ena_study_accession": "PRJEB1",
+            "export_entity_id": "QS101",
+        },
+        secondaries=({"bioproject_accession": "PRJNA2"},),
     )
-    assert _messages(problems) == [
-        ("1", f"matrix tube {TUBE} belongs to a biosample with no accession, not 'SAMN9'")
+    result = classify_roster([row], _facts())
+    assert result == ([_resolved("1", 21, [102])], [])
+
+
+def test_classify_roster_miss_alongside_hit():
+    """Tests the case where one identifier resolves and another, also given,
+    names nothing: the miss refuses the row."""
+    row = _row(biosample={"export_entity_id": "QB21", "biosample_accession": "SAMN404"})
+    result = classify_roster([row], _facts())
+    expected = RosterProblem(item_id="1", message="no biosample has biosample_accession 'SAMN404'")
+    assert result == ([], [expected])
+
+
+@pytest.mark.parametrize(
+    ("biosample", "primary", "message"),
+    [
+        (
+            {"biosample_accession": "SAMN2", "matrix_tube_id": TUBE},
+            PRIMARY,
+            "the identifiers do not name one biosample:"
+            f" biosample_accession 'SAMN2', matrix_tube_id '{TUBE}'",
+        ),
+        (
+            BIOSAMPLE,
+            {"bioproject_accession": "PRJNA2", "export_entity_id": "QS101"},
+            "the identifiers do not name one study:"
+            " bioproject_accession 'PRJNA2', export_entity_id 'QS101'",
+        ),
+    ],
+)
+def test_classify_roster_identifiers_disagree(biosample, primary, message):
+    """Tests the case where two identifiers given for one entity name different ones."""
+    result = classify_roster([_row(biosample=biosample, primary=primary)], _facts())
+    assert result == ([], [RosterProblem(item_id="1", message=message)])
+
+
+def test_classify_roster_malformed_tube():
+    """Tests the case where the tube is not a matrix tube id at all."""
+    result = classify_roster([_row(biosample={"matrix_tube_id": "800805.001.V1.Plasma"})], _facts())
+    expected = RosterProblem(
+        item_id="1", message="'800805.001.V1.Plasma' is not a matrix tube id (1 to 10 digits)"
+    )
+    assert result == ([], [expected])
+
+
+def test_classify_roster_repeated_tube():
+    """Tests the case where technical replicates repeat one tube: each row resolves."""
+    rows = [
+        _row("a", biosample={"matrix_tube_id": TUBE}),
+        _row("b", biosample={"matrix_tube_id": TUBE_RAW}),
     ]
+    result = classify_roster(rows, _facts())
+    assert result == ([_resolved("a", 21), _resolved("b", 21)], [])
+
+
+def test_classify_roster_primary_not_linked():
+    """Tests the case where the primary study is not among the biosample's links."""
+    row = _row(
+        biosample={"biosample_accession": "SAMN2"}, primary={"bioproject_accession": "PRJNA2"}
+    )
+    result = classify_roster([row], _facts())
+    expected = RosterProblem(
+        item_id="1",
+        message="the biosample with biosample_accession 'SAMN2' is not in the study"
+        " with bioproject_accession 'PRJNA2'",
+    )
+    assert result == ([], [expected])
+
+
+def test_classify_roster_secondary_not_linked():
+    """Tests the case where one secondary study is linked and another is not."""
+    row = _row(secondaries=({"bioproject_accession": "PRJNA2"}, {"bioproject_accession": "PRJNA3"}))
+    result = classify_roster([row], _facts())
+    expected = RosterProblem(
+        item_id="1",
+        message="the biosample with biosample_accession 'SAMN1' is not in the study"
+        " with bioproject_accession 'PRJNA3'",
+    )
+    assert result == ([], [expected])
+
+
+def test_classify_roster_request_order():
+    """Tests the case where resolved and unresolved rows interleave: each list
+    keeps request order."""
+    rows = [
+        _row("ok1"),
+        _row("bad1", biosample={"export_entity_id": "QB404"}),
+        _row("ok2", biosample={"biosample_accession": "SAMN2"}),
+        _row("bad2", primary={"export_entity_id": "QS404"}),
+    ]
+    result = classify_roster(rows, _facts())
+    expected_problems = [
+        RosterProblem(item_id="bad1", message="no biosample has export_entity_id 'QB404'"),
+        RosterProblem(item_id="bad2", message="no study has export_entity_id 'QS404'"),
+    ]
+    assert result == ([_resolved("ok1", 21), _resolved("ok2", 22)], expected_problems)
