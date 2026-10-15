@@ -9,13 +9,13 @@ to wrap the call in a transaction.
 """
 
 import json
-from typing import get_args
+from typing import Literal, get_args
 
 import asyncpg
 from qiita_common.models import LEGACY_IDX_RESERVED_CEILING, StudyAccessionField, Tier
 
 from . import require_transaction, update_row
-from .exported_entity import export_entity_id_select
+from .exported_entity import export_entity_id_join, export_entity_id_select
 from .study_access import insert_study_access
 
 _STUDY_RETURNING_COLS = (
@@ -23,8 +23,22 @@ _STUDY_RETURNING_COLS = (
     " description, abstract, funding, ena_study_accession,"
     " bioproject_accession, notes, last_submission_at, submission_error,"
     " extra_metadata, default_tier, created_by_idx,"
-    " created_at, updated_at, " + export_entity_id_select("study", alias="study")
+    " created_at, updated_at, " + export_entity_id_select("study")
 )
+
+# The natural keys a study lookup may key on: the wire-facing accession columns
+# plus export_entity_id. Deriving from StudyAccessionField keeps the accession
+# set defined once, in qiita_common.models.
+StudyLookupKey = Literal[*get_args(StudyAccessionField), "export_entity_id"]
+
+# Each lookup key's (column expression, join) over `qiita.study`. Only text from
+# this closed mapping reaches the SQL, since identifiers cannot be bound.
+# same-pattern-ok: per-table lookup kept separate by design
+_STUDY_LOOKUP_SQL: dict[StudyLookupKey, tuple[str, str]] = {
+    "bioproject_accession": ("study.bioproject_accession", ""),
+    "ena_study_accession": ("study.ena_study_accession", ""),
+    "export_entity_id": ("ee.export_entity_id", export_entity_id_join("study")),
+}
 
 
 async def fetch_study(
@@ -75,31 +89,32 @@ async def fetch_study_exists(
     )
 
 
-async def fetch_study_idxs_by_accession(
+async def fetch_study_idxs_by_natural_key(
     pool_or_conn: asyncpg.Pool | asyncpg.Connection,
     *,
     values: list[str],
-    accession_field: StudyAccessionField = "bioproject_accession",
+    key: StudyLookupKey = "bioproject_accession",
 ) -> dict[str, int]:
-    """Return `{accession: study_idx}` for every value in `values` that
-    resolves to a qiita.study row on the column named by `accession_field`
-    (default bioproject_accession). Values absent from the table are omitted
-    from the returned map.
+    """Return `{value: study_idx}` for every value in `values` that resolves to
+    a qiita.study row via the natural key named by `key` (default
+    bioproject_accession). Values absent from the table are omitted from the
+    returned map.
 
     The study table has no soft-delete column, so every key in the result
     is a live row.
     """
-    # Pin the interpolated column to the closed StudyAccessionField set; an
-    # out-of-set value cannot reach the SQL identifier.
-    if accession_field not in get_args(StudyAccessionField):
-        raise ValueError(f"invalid study accession field: {accession_field!r}")
+    if key not in _STUDY_LOOKUP_SQL:
+        raise ValueError(f"invalid study lookup key: {key!r}")
     if not values:
         return {}
+    column_sql, join_sql = _STUDY_LOOKUP_SQL[key]
     rows = await pool_or_conn.fetch(
-        f"SELECT idx, {accession_field} FROM qiita.study WHERE {accession_field} = ANY($1::text[])",
+        f"SELECT study.idx, {column_sql} AS lookup_value FROM qiita.study{join_sql}"
+        f" WHERE {column_sql} = ANY($1::text[])",
         values,
     )
-    return {r[accession_field]: r["idx"] for r in rows}
+    resolved = {r["lookup_value"]: r["idx"] for r in rows}
+    return resolved
 
 
 async def fetch_study_idx_by_either_ena_accession(
@@ -443,15 +458,15 @@ async def _resolve_study_by_ena_accessions(
     accessions resolve to different studies, or when the one study either
     accession resolves to has a recorded accession that disagrees with it.
     """
-    by_bioproject_idxs = await fetch_study_idxs_by_accession(
-        conn, values=[bioproject_accession], accession_field="bioproject_accession"
+    by_bioproject_idxs = await fetch_study_idxs_by_natural_key(
+        conn, values=[bioproject_accession], key="bioproject_accession"
     )
     by_bioproject = by_bioproject_idxs.get(bioproject_accession)
 
     by_ena = None
     if ena_study_accession is not None:
-        by_ena_idxs = await fetch_study_idxs_by_accession(
-            conn, values=[ena_study_accession], accession_field="ena_study_accession"
+        by_ena_idxs = await fetch_study_idxs_by_natural_key(
+            conn, values=[ena_study_accession], key="ena_study_accession"
         )
         by_ena = by_ena_idxs.get(ena_study_accession)
 
@@ -491,8 +506,8 @@ async def _resolve_study_by_ena_accessions(
 # study's summary may search (`auth.guards.study_record_view`). Same 'english'
 # configuration as the generated search_vector, which holds the full-record text.
 _STUDY_SUMMARY_TSVECTOR = (
-    "to_tsvector('english', concat_ws(' ', s.title, s.alias,"
-    " s.bioproject_accession, s.ena_study_accession))"
+    "to_tsvector('english', concat_ws(' ', study.title, study.alias,"
+    " study.bioproject_accession, study.ena_study_accession))"
 )
 
 
@@ -534,21 +549,22 @@ async def fetch_study_list_candidates(
     rather than through `study_search_vector_idx`.
     """
     return await pool_or_conn.fetch(
-        "SELECT s.idx, s.title, s.alias, s.bioproject_accession, s.ena_study_accession,"
-        "       s.default_tier, s.owner_idx, s.updated_at, sa.access_tier,"
-        f"      {export_entity_id_select('study', alias='s')},"
+        "SELECT study.idx, study.title, study.alias, study.bioproject_accession,"
+        "       study.ena_study_accession, study.default_tier, study.owner_idx,"
+        "       study.updated_at, sa.access_tier,"
+        f"      {export_entity_id_select('study')},"
         f"      ($3::text IS NOT NULL AND {_STUDY_SUMMARY_TSVECTOR}"
         "        @@ websearch_to_tsquery('english', $3)) AS summary_match"
-        " FROM qiita.study s"
+        " FROM qiita.study"
         " LEFT JOIN qiita.study_access sa"
-        "   ON sa.study_idx = s.idx AND sa.principal_idx = $1"
-        " WHERE ($2 OR s.owner_idx = $1 OR sa.access_tier IS NOT NULL"
-        "        OR ($6 AND s.default_tier = $7::qiita.tier))"
+        "   ON sa.study_idx = study.idx AND sa.principal_idx = $1"
+        " WHERE ($2 OR study.owner_idx = $1 OR sa.access_tier IS NOT NULL"
+        "        OR ($6 AND study.default_tier = $7::qiita.tier))"
         "   AND ($3::text IS NULL"
-        "        OR s.search_vector @@ websearch_to_tsquery('english', $3)"
+        "        OR study.search_vector @@ websearch_to_tsquery('english', $3)"
         f"       OR {_STUDY_SUMMARY_TSVECTOR} @@ websearch_to_tsquery('english', $3))"
-        "   AND ($4::bigint IS NULL OR s.idx < $4)"
-        " ORDER BY s.idx DESC"
+        "   AND ($4::bigint IS NULL OR study.idx < $4)"
+        " ORDER BY study.idx DESC"
         " LIMIT $5",
         principal_idx,
         all_studies,

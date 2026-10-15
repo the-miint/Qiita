@@ -28,7 +28,7 @@ from qiita_control_plane.repositories.biosample import (
     fetch_biosample_identity_by_tube,
     fetch_biosample_idxs_by_natural_key,
 )
-from qiita_control_plane.repositories.study import fetch_study_idxs_by_accession
+from qiita_control_plane.repositories.study import fetch_study_idxs_by_natural_key
 
 
 @dataclass(frozen=True)
@@ -193,7 +193,7 @@ async def fetch_roster_facts(
     by_biosample_accession = await fetch_biosample_idxs_by_natural_key(
         conn, key="biosample_accession", values=biosample_accessions
     )
-    by_study_accession = await fetch_study_idxs_by_accession(conn, values=study_accessions)
+    by_study_accession = await fetch_study_idxs_by_natural_key(conn, values=study_accessions)
     biosample_idxs = sorted(
         {idx for idx, _ in by_tube.values()} | set(by_biosample_accession.values())
     )

@@ -1821,6 +1821,47 @@ async def test_fetch_biosample_idxs_by_natural_key_returns_resolved(ctx, key, ma
     assert result == {hit_value: bs_idx}
 
 
+async def test_fetch_biosample_idxs_by_natural_key_export_entity_id(ctx):
+    """Tests the case where the key is export_entity_id: a biosample's own
+    export_entity_id resolves to it, and a study's export_entity_id does not
+    resolve as a biosample.
+    """
+    bs_idx = await _seed_full_biosample(
+        ctx,
+        owner_idx=ctx["biosample_owner_idx"],
+        bs_acc=unique_accession("LK-EE"),
+        ena_acc=unique_accession("LK-EE-ENA"),
+    )
+    bs_handle = await fetch_export_entity_id(ctx["pool"], kind="biosample", entity_idx=bs_idx)
+    study_handle = await fetch_export_entity_id(
+        ctx["pool"], kind="study", entity_idx=ctx["study_idx"]
+    )
+
+    result = await fetch_biosample_idxs_by_natural_key(
+        ctx["pool"], key="export_entity_id", values=[bs_handle, study_handle]
+    )
+    assert result == {bs_handle: bs_idx}
+
+
+async def test_fetch_biosample_idxs_by_natural_key_export_entity_id_excludes_retired(ctx):
+    """Tests the case where the key is export_entity_id and the biosample is
+    retired: its export_entity_id does not resolve.
+    """
+    bs_idx = await _seed_full_biosample(
+        ctx,
+        owner_idx=ctx["biosample_owner_idx"],
+        bs_acc=unique_accession("LK-EE-RET"),
+        ena_acc=unique_accession("LK-EE-RET-ENA"),
+    )
+    bs_handle = await fetch_export_entity_id(ctx["pool"], kind="biosample", entity_idx=bs_idx)
+    await retire_biosample(ctx["pool"], biosample_idx=bs_idx, retired_by_idx=ctx["principal_idx"])
+
+    result = await fetch_biosample_idxs_by_natural_key(
+        ctx["pool"], key="export_entity_id", values=[bs_handle]
+    )
+    assert result == {}
+
+
 async def test_fetch_biosample_idxs_by_natural_key_empty_values_short_circuits(ctx):
     """Tests the case where `values` is empty: the function returns an
     empty dict without executing any SQL (the no-op early-return path).

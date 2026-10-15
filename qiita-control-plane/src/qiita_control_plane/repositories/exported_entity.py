@@ -1,15 +1,11 @@
 """Reads of `qiita.exported_entity`."""
 
 from collections.abc import Mapping
-from typing import Any, Literal
+from typing import Any, Literal, get_args
 
 import asyncpg
 
 EntityKind = Literal["study", "biosample"]
-
-# The entity column per kind. A column name cannot be bound as a parameter, so the
-# kind selects one from this closed mapping rather than from caller input.
-ENTITY_COLUMN: dict[EntityKind, str] = {"study": "study_idx", "biosample": "biosample_idx"}
 
 # Every caller-visible column, both kinds in one pass. Study entries come first
 # ascending, then biosample entries ascending: `study_idx IS NULL` is false on a
@@ -40,22 +36,41 @@ class MissingExportedEntityError(RuntimeError):
         )
 
 
-def export_entity_id_select(kind: EntityKind, *, alias: str) -> str:
-    """Return the select-list expression for an entity's `export_entity_id`, where
-    `alias` names the entity table in the enclosing query.
+def entity_idx_column(kind: EntityKind) -> str:
+    """Return the exported_entity column that references a `kind` entity's idx.
+
+    `kind` is also the entity's table name; both reach SQL text, so a value outside
+    EntityKind is refused.
+    """
+    if kind not in get_args(EntityKind):
+        raise ValueError(f"invalid entity kind: {kind!r}")
+    column = f"{kind}_idx"
+    return column
+
+
+def export_entity_id_select(kind: EntityKind) -> str:
+    """Return the select-list expression for an entity's `export_entity_id`.
 
     A scalar subquery, so an entity without a row reads NULL rather than dropping
-    out of the result. `alias` is interpolated into SQL text, so anything but a
-    plain identifier is refused.
+    out of the result. The enclosing query must refer to the entity table by its
+    own name, unaliased.
     """
-    if not alias.isidentifier():
-        raise ValueError(f"alias must be a plain SQL identifier, got {alias!r}")
-    column = ENTITY_COLUMN[kind]
+    column = entity_idx_column(kind)
     expression = (
         "(SELECT export_entity_id FROM qiita.exported_entity ee"
-        f" WHERE ee.{column} = {alias}.idx) AS export_entity_id"
+        f" WHERE ee.{column} = {kind}.idx) AS export_entity_id"
     )
     return expression
+
+
+def export_entity_id_join(kind: EntityKind) -> str:
+    """Return a JOIN clause that brings an entity's exported_entity row in as `ee`.
+
+    The enclosing query must refer to the entity table by its own name, unaliased.
+    """
+    column = entity_idx_column(kind)
+    clause = f" JOIN qiita.exported_entity ee ON ee.{column} = {kind}.idx"
+    return clause
 
 
 def require_export_entity_id(row: Mapping[str, Any], *, kind: EntityKind) -> str:
@@ -85,7 +100,8 @@ async def fetch_exported_entities(
 
     # Per kind, so a gap names the entities it is actually about. A row of the
     # other kind carries NULL in this kind's column, so it matches nothing here.
-    for kind, column in ENTITY_COLUMN.items():
+    for kind in get_args(EntityKind):
+        column = entity_idx_column(kind)
         returned = {row[column] for row in rows}
         missing = sorted(idx for idx in set(requested[kind]) if idx not in returned)
         if missing:
