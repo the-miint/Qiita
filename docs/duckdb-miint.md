@@ -76,12 +76,14 @@ SELECT * FROM miint_versions();  -- every embedded tool version (see below)
 
 **`miint_warnings()` is not a load-time probe** — an earlier revision of this file described it as one ("non-fatal load-time issues, e.g. GPL boundary not installed"), which is wrong twice over: a missing gpl-boundary is reported by *throwing* at call time, not by a warning row, and the table is empty on a clean load.
 
-It is a **runtime, per-query log of non-fatal warnings**, and it matters because some functions **degrade silently rather than failing**. The one that should worry qiita is `read_ena_sequences`, which skips or retries individual runs and still returns a successful-looking result — the skipped runs appear only here. Which scans skip and which raise depends on the miint build ([insdc_ena](https://the-miint.github.io/duckdb-miint/insdc_ena/)); from duckdb-miint#312 on, a scan of one run, which is what `ingest_ena_reads` sends, raises:
+It is a **runtime, per-query log of non-fatal warnings**, and it matters because some functions **degrade silently rather than failing**. The one that should worry qiita is `read_ena_sequences`, which skips or retries individual runs and still returns a successful-looking result — the skipped runs appear only here:
 
 ```sql
 SELECT * FROM read_ena_sequences(...);
 SELECT * FROM miint_warnings();  -- e.g. "run 'ERR1234567' failed on retry (...), skipping"
 ```
+
+Which scans skip and which raise depends on the miint build ([insdc_ena](https://the-miint.github.io/duckdb-miint/insdc_ena/)): from duckdb-miint#312 on, a scan of one run, which is what `ingest_ena_reads` sends, raises instead of skipping.
 
 **Check it after any ENA ingest.** A partial result that reports success is otherwise indistinguishable from a complete one.
 

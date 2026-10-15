@@ -73,9 +73,8 @@ _REUSABLE_MINTER_STATES: frozenset[str] = frozenset(NON_TERMINAL_WORK_TICKET_STA
 def is_transient_http_status(status: int) -> bool:
     """True for an HTTP status a retry can self-heal: any 5xx (a proxy or
     connection blip, a server restart, or a statement timeout surfacing as a
-    500, as the CP's does), plus 408 (request timeout) and 429 (rate limit).
-    401/403 and any other 4xx are permanent client-side conditions → False.
-    ingest_ena_reads applies it to ENA's and its file server's statuses too."""
+    500), plus 408 (request timeout) and 429 (rate limit). 401/403 and any other
+    4xx are permanent client-side conditions → False."""
     return status >= 500 or status in (408, 429)
 
 

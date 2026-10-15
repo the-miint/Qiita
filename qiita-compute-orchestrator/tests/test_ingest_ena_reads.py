@@ -484,8 +484,8 @@ def _http_error(status: int, message: str) -> duckdb.HTTPException:
             "HTTP Error: Request returned HTTP 408 for HTTP HEAD to "
             "'https://ftp.sra.ebi.ac.uk/vol1/fastq/ERR001/ERR001.fastq.gz'",
         ),
-        # ENA's "Not all results may have been written" answer, after miint's
-        # own retries
+        # ENA's "Not all results may have been written" answer, which miint
+        # quotes from duckdb-miint#310 on, after its own retries
         duckdb.IOException(
             "IO Error: ENA request failed after 4 attempts: the last response was "
             'incomplete, ENA wrote "ERROR occurred. Not all results may have been '
@@ -511,15 +511,25 @@ def test_unavailable_server_fetch_error_is_retriable(fake_mint, monkeypatch, tmp
     assert ingest_module.TRANSIENT_FETCH_ERROR_TEXT in exc.value.reason
 
 
-def test_mid_stream_fetch_error_is_retried_as_partial_data(fake_mint, monkeypatch, tmp_path):
-    """A run that failed mid-stream is retried, like the skip warning a build that
-    skips gives for it, and its reason says the data is partial rather than that
-    ENA is unreachable, so the live e2e test fails on it instead of skipping."""
+@pytest.mark.parametrize(
+    "first_error",
+    [
+        "unexpected end of stream",
+        # a network word in the transfer's own error must not make the run read
+        # as ENA being unreachable
+        "connection reset by peer",
+    ],
+)
+def test_mid_stream_fetch_error_is_retried_as_partial_data(
+    fake_mint, monkeypatch, tmp_path, first_error
+):
+    """A run that broke mid-download is retried, as it is when miint skips it,
+    and its reason says the data is partial, not that ENA could not be reached."""
 
     def _fake(run_accession, download_method, intermediate_path, duckdb_tmp, memory_gb, threads):
         raise duckdb.IOException(
             "IO Error: read_ena_sequences: every run failed (1): ERR001; "
-            "first error: unexpected end of stream"
+            f"first error: {first_error}"
         )
 
     monkeypatch.setattr(ingest_module, "_stage_run_reads", _fake)
@@ -530,7 +540,7 @@ def test_mid_stream_fetch_error_is_retried_as_partial_data(fake_mint, monkeypatc
     assert exc.value.kind == FailureKind.EXTERNAL_FETCH_TRANSIENT
     assert exc.value.transient is True
     assert ingest_module.TRANSIENT_FETCH_ERROR_TEXT not in exc.value.reason
-    assert "missing or partial" in exc.value.reason
+    assert ingest_module._PARTIAL_RUN_TEXT in exc.value.reason
 
 
 def test_not_found_fetch_error_is_permanent(fake_mint, monkeypatch, tmp_path):
