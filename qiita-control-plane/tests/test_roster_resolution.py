@@ -10,7 +10,6 @@ from qiita_control_plane.roster_resolution import RosterFacts, classify_roster
 
 TUBE = "0363157924"
 TUBE_RAW = "363157924"
-_NO_REPLICATES = "technical replicates are not supported in a tube-keyed roster"
 
 
 def _facts(**overrides) -> RosterFacts:
@@ -77,12 +76,10 @@ def test_tube_row_with_no_or_several_study_links():
     ]
 
 
-def test_tube_problems_malformed_unknown_duplicate():
+def test_tube_problems_malformed_and_unknown():
     rows = [
         RosterResolveRow(item_id="bad", matrix_tube_id="800805.001.V1.Plasma"),
         RosterResolveRow(item_id="gone", matrix_tube_id="999"),
-        RosterResolveRow(item_id="a", matrix_tube_id=TUBE_RAW),
-        RosterResolveRow(item_id="b", matrix_tube_id=TUBE),
     ]
     resolved, problems = classify_roster(rows, _facts())
     assert resolved == []
@@ -90,8 +87,25 @@ def test_tube_problems_malformed_unknown_duplicate():
     assert _messages(problems) == [
         ("bad", "'800805.001.V1.Plasma' is not a matrix tube id (1 to 10 digits)"),
         ("gone", "no biosample has matrix tube 0000000999; register it before submitting"),
-        ("a", f"matrix tube {TUBE} appears on 2 rows of this roster; {_NO_REPLICATES}"),
-        ("b", f"matrix tube {TUBE} appears on 2 rows of this roster; {_NO_REPLICATES}"),
+    ]
+
+
+def test_tube_replicates_resolve_to_the_same_biosample():
+    # The same tube on two rows is two technical replicates of one biosample;
+    # each resolves to that biosample_idx, as a repeated biosample accession does.
+    rows = [
+        RosterResolveRow(item_id="a", matrix_tube_id=TUBE_RAW),
+        RosterResolveRow(item_id="b", matrix_tube_id=TUBE),
+    ]
+    resolved, problems = classify_roster(rows, _facts())
+    assert problems == []
+    assert resolved == [
+        RosterResolvedRow(
+            item_id="a", biosample_idx=11, primary_study_idx=101, secondary_study_idxs=[]
+        ),
+        RosterResolvedRow(
+            item_id="b", biosample_idx=11, primary_study_idx=101, secondary_study_idxs=[]
+        ),
     ]
 
 
