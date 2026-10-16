@@ -12,5 +12,6 @@
   so a control whose biosample is not linked to a secondary project is refused before anything is
   created, rather than partway through the submission. A primary project is required; the study
   no longer falls back to the biosample's single link. A tube repeated across rows is no longer
-  refused, since technical replicates share one. Problems name each identifier by its key.
-  `submit-bcl-convert`, `submit-pacbio-ingest` and `submit-golay-demux` send the new shape.
+  refused, since technical replicates share one. A miss or a disagreement names each identifier
+  by its field name. `submit-bcl-convert`, `submit-pacbio-ingest` and `submit-golay-demux` send
+  the new shape.

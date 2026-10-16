@@ -40,10 +40,25 @@ def test_normalize_matrix_tube_id_rejects(raw: str) -> None:
         normalize_matrix_tube_id(raw)
 
 
-@pytest.mark.parametrize("ref_model", [BiosampleRef, StudyRef])
-def test__requires_an_identifier(ref_model) -> None:
-    """Tests the case where a ref carries no identifier: it is refused."""
-    with pytest.raises(ValidationError, match="no identifier"):
+@pytest.mark.parametrize(
+    ("ref_model", "message"),
+    [
+        (
+            BiosampleRef,
+            "at least one of biosample_accession, ena_sample_accession,"
+            " export_entity_id, matrix_tube_id is required",
+        ),
+        (
+            StudyRef,
+            "at least one of bioproject_accession, ena_study_accession,"
+            " export_entity_id is required",
+        ),
+    ],
+)
+def test__requires_an_identifier(ref_model, message: str) -> None:
+    """Tests the case where a ref carries no identifier: it is refused, naming
+    the identifiers it accepts."""
+    with pytest.raises(ValidationError, match=message):
         ref_model()
 
 
@@ -88,7 +103,9 @@ def test_request_refuses_empty_and_extra() -> None:
 def test_failure_round_trips() -> None:
     failure = RosterResolveFailure(
         message="1 of 2 rows did not resolve",
-        problems=[RosterProblem(item_id="1", message="no biosample has matrix tube 0363157924")],
+        problems=[
+            RosterProblem(item_id="1", message="no biosample has matrix_tube_id '0363157924'")
+        ],
     )
     again = RosterResolveFailure.model_validate(failure.model_dump(mode="json"))
     assert again == failure

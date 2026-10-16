@@ -758,8 +758,9 @@ class _ExternalRef(BaseModel):
 
     @model_validator(mode="after")
     def _requires_an_identifier(self) -> _ExternalRef:
-        if all(getattr(self, name) is None for name in type(self).model_fields):
-            raise ValueError(f"{type(self).__name__} carries no identifier")
+        fields = type(self).model_fields
+        if all(getattr(self, name) is None for name in fields):
+            raise ValueError(f"at least one of {', '.join(fields)} is required")
         return self
 
 

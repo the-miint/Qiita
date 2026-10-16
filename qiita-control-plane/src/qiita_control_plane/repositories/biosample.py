@@ -34,7 +34,7 @@ from .biosample_metadata import (
     BiosampleOwnerIdMissingValueError,
     insert_owner_biosample_id_metadata,
 )
-from .exported_entity import export_entity_id_join, export_entity_id_select
+from .exported_entity import export_entity_id_lookup, export_entity_id_select
 
 # Owners' ids for their own samples sometimes inadvertently contain PII, so the
 # owner-biosample-id field is pinned above the study's default tier: the intent
@@ -304,7 +304,7 @@ _BIOSAMPLE_LOOKUP_SQL: dict[BiosampleLookupKey, tuple[str, str]] = {
     "biosample_accession": ("biosample.biosample_accession", ""),
     "ena_sample_accession": ("biosample.ena_sample_accession", ""),
     "matrix_tube_id": ("biosample.matrix_tube_id", ""),
-    "export_entity_id": ("ee.export_entity_id", export_entity_id_join("biosample")),
+    "export_entity_id": export_entity_id_lookup("biosample"),
 }
 
 
@@ -315,8 +315,8 @@ async def fetch_biosample_idxs_by_natural_key(
     values: list[str],
 ) -> dict[str, int]:
     """Return `{value: biosample_idx}` for every value in `values` that
-    resolves to a non-retired qiita.biosample row via the named natural-key
-    column.
+    resolves to a non-retired qiita.biosample row via the natural key named by
+    `key`.
 
     Values absent from the table or carried only by retired rows are
     omitted from the returned map, so a caller can detect misses by

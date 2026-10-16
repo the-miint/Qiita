@@ -3125,7 +3125,7 @@ async def test_resolve_roster_422_names_every_problem(ctx):
             },
             {
                 "item_id": "gone",
-                "message": f"no biosample has matrix tube {unknown}; register it before submitting",
+                "message": f"no biosample has matrix_tube_id '{unknown}'; register it before submitting",  # noqa: E501
             },
             {
                 "item_id": "plasma",
@@ -3167,7 +3167,7 @@ async def test_resolve_roster_skips_retired_biosample_and_link(ctx):
     assert resp.json()["detail"]["problems"] == [
         {
             "item_id": "r",
-            "message": f"no biosample has matrix tube {retired_tube}; register it before submitting",  # noqa: E501
+            "message": f"no biosample has matrix_tube_id '{retired_tube}'; register it before submitting",  # noqa: E501
         },
         {
             "item_id": "u",

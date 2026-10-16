@@ -15,7 +15,7 @@ import asyncpg
 from qiita_common.models import LEGACY_IDX_RESERVED_CEILING, StudyAccessionField, Tier
 
 from . import require_transaction, update_row
-from .exported_entity import export_entity_id_join, export_entity_id_select
+from .exported_entity import export_entity_id_lookup, export_entity_id_select
 from .study_access import insert_study_access
 
 _STUDY_RETURNING_COLS = (
@@ -37,7 +37,7 @@ StudyLookupKey = Literal[*get_args(StudyAccessionField), "export_entity_id"]
 _STUDY_LOOKUP_SQL: dict[StudyLookupKey, tuple[str, str]] = {
     "bioproject_accession": ("study.bioproject_accession", ""),
     "ena_study_accession": ("study.ena_study_accession", ""),
-    "export_entity_id": ("ee.export_entity_id", export_entity_id_join("study")),
+    "export_entity_id": export_entity_id_lookup("study"),
 }
 
 

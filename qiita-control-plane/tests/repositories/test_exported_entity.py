@@ -5,7 +5,7 @@ import pytest
 from qiita_control_plane.repositories.exported_entity import (
     MissingExportedEntityError,
     entity_idx_column,
-    export_entity_id_join,
+    export_entity_id_lookup,
     export_entity_id_select,
     fetch_exported_entities,
     require_export_entity_id,
@@ -168,8 +168,11 @@ def test_export_entity_id_select():
     assert actual == expected
 
 
-def test_export_entity_id_join():
-    """Tests the case where a biosample query joins in its exported_entity row."""
-    actual = export_entity_id_join("biosample")
-    expected = " JOIN qiita.exported_entity ee ON ee.biosample_idx = biosample.idx"
+def test_export_entity_id_lookup():
+    """Tests the case where a biosample query keys a lookup on export_entity_id."""
+    actual = export_entity_id_lookup("biosample")
+    expected = (
+        "ee.export_entity_id",
+        " JOIN qiita.exported_entity ee ON ee.biosample_idx = biosample.idx",
+    )
     assert actual == expected

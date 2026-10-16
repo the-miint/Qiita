@@ -43,9 +43,7 @@ _BIOSAMPLE_SPEC = _RefSpec(
     ref_model=BiosampleRef,
     fetch=fetch_biosample_idxs_by_natural_key,
     normalizers={"matrix_tube_id": normalize_matrix_tube_id},
-    miss_messages={
-        "matrix_tube_id": "no {noun} has matrix tube {value}; register it before submitting"
-    },
+    miss_messages={"matrix_tube_id": "no {noun} has {label}; register it before submitting"},
 )
 _STUDY_SPEC = _RefSpec(noun="study", ref_model=StudyRef, fetch=fetch_study_idxs_by_natural_key)
 
@@ -99,11 +97,11 @@ def _resolve_ref(
         if idx is not None:
             hits[label] = idx
         elif key in spec.miss_messages:
-            problems.append(spec.miss_messages[key].format(noun=spec.noun, value=value))
+            problems.append(spec.miss_messages[key].format(noun=spec.noun, label=label))
         else:
             problems.append(f"no {spec.noun} has {label}")
     if len(set(hits.values())) > 1:
-        problems.append(f"the identifiers do not name one {spec.noun}: {', '.join(hits)}")
+        problems.append(f"the identifiers name more than one {spec.noun}: {', '.join(hits)}")
     if len(problems) > problem_count:
         return None
     (idx,) = set(hits.values())

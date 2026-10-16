@@ -63,14 +63,16 @@ def export_entity_id_select(kind: EntityKind) -> str:
     return expression
 
 
-def export_entity_id_join(kind: EntityKind) -> str:
-    """Return a JOIN clause that brings an entity's exported_entity row in as `ee`.
+def export_entity_id_lookup(kind: EntityKind) -> tuple[str, str]:
+    """Return the (column expression, JOIN clause) that key a lookup of `kind`
+    entities on their `export_entity_id`.
 
     The enclosing query must refer to the entity table by its own name, unaliased.
     """
     column = entity_idx_column(kind)
     clause = f" JOIN qiita.exported_entity ee ON ee.{column} = {kind}.idx"
-    return clause
+    lookup = ("ee.export_entity_id", clause)
+    return lookup
 
 
 def require_export_entity_id(row: Mapping[str, Any], *, kind: EntityKind) -> str:

@@ -17,7 +17,12 @@ from qiita_common.models import (
 
 from qiita_control_plane.repositories.biosample import BiosampleLookupKey
 from qiita_control_plane.repositories.study import StudyLookupKey
-from qiita_control_plane.roster_resolution import RosterFacts, classify_roster
+from qiita_control_plane.roster_resolution import (
+    _BIOSAMPLE_SPEC,
+    _STUDY_SPEC,
+    RosterFacts,
+    classify_roster,
+)
 
 TUBE = "0363157924"
 TUBE_RAW = "363157924"
@@ -78,6 +83,14 @@ def test_ref_fields_match_lookup_keys(ref_model, lookup_key):
     assert set(ref_model.model_fields) == set(get_args(lookup_key))
 
 
+@pytest.mark.parametrize("spec", [_BIOSAMPLE_SPEC, _STUDY_SPEC])
+def test__RefSpec_keys_are_ref_fields(spec):
+    """Tests the case where a spec's per-key normalizers and miss messages are
+    compared to its ref model: a key that is not a field would never apply."""
+    spec_keys = set(spec.normalizers) | set(spec.miss_messages)
+    assert spec_keys <= set(spec.ref_model.model_fields)
+
+
 @pytest.mark.parametrize(
     "biosample",
     [
@@ -119,7 +132,7 @@ def test_classify_roster_each_identifier_alone(biosample, primary):
         (
             {"matrix_tube_id": "999"},
             PRIMARY,
-            "no biosample has matrix tube 0000000999; register it before submitting",
+            "no biosample has matrix_tube_id '0000000999'; register it before submitting",
         ),
         (
             BIOSAMPLE,
@@ -176,13 +189,13 @@ def test_classify_roster_miss_alongside_hit():
         (
             {"biosample_accession": "SAMN2", "matrix_tube_id": TUBE},
             PRIMARY,
-            "the identifiers do not name one biosample:"
+            "the identifiers name more than one biosample:"
             f" biosample_accession 'SAMN2', matrix_tube_id '{TUBE}'",
         ),
         (
             BIOSAMPLE,
             {"bioproject_accession": "PRJNA2", "export_entity_id": "QS101"},
-            "the identifiers do not name one study:"
+            "the identifiers name more than one study:"
             " bioproject_accession 'PRJNA2', export_entity_id 'QS101'",
         ),
     ],
