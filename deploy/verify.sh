@@ -17,7 +17,8 @@
 # question the env file is optional to and runs either way (see below).
 #
 # Hatches, one per row: SKIP_HEALTH, SKIP_ACTIONS, SKIP_COMPUTE_READINESS,
-# SKIP_SLURM_PROBE, SKIP_CP_MIINT, SKIP_ENA_REACHABILITY, SKIP_PREFLIGHT (the
+# SKIP_SLURM_PROBE, SKIP_CP_MIINT, SKIP_DP_POOL, SKIP_ENA_REACHABILITY,
+# SKIP_PREFLIGHT (the
 # last passes through to preflight.sh). SKIP_ENA_REACHABILITY skips the
 # CONTROL-PLANE row only; its compute-node counterpart (probe/ena-from-compute)
 # rides the SLURM probe job and goes with SKIP_SLURM_PROBE, which also drops
@@ -142,6 +143,58 @@ elif [ -r "$CP_ENV" ]; then
     fi
 else
     skip "cp-miint" "$CP_ENV absent (first deploy)"
+fi
+
+# --- 4a. Data-plane pool, per running instance ------------------------------
+# Each data plane logs one line at boot naming the pool it built, the memory
+# ceiling it divided and which detector answered. Two things are worth a row,
+# and they read different spans of the journal: the pool line is the last one
+# this boot (the running process's, after any restart within the boot), while the
+# discard count covers every process that ran this boot.
+#
+# `fallback default` means no cgroup and no /proc/meminfo answered, so the pool
+# sized itself against 8 GiB — on this host that is a misdetection, and at the
+# default pool size every connection gets the 512 MiB floor instead of a share of
+# what the host has.
+#
+# `discarding a pooled DuckLake connection` means a connection failed its reset
+# on the way back and was rebuilt, which fails the row at any count: the reset is
+# a ROLLBACK that already tolerates having nothing to roll back, so a failure is
+# not a shape the pool expects. What it costs is a fresh attach per request
+# (measured at 84-107 ms and ~16 catalog transactions against 3.0-3.4 ms reused),
+# which otherwise shows up only as slowness.
+if [ -n "${SKIP_DP_POOL:-}" ]; then
+    skip "dp-pool" "SKIP_DP_POOL=1"
+elif ! command -v journalctl >/dev/null 2>&1; then
+    skip "dp-pool" "journalctl not on PATH"
+else
+    dp_units=$(systemctl list-units --no-legend --plain 'qiita-data-plane@*.service' 2>/dev/null \
+        | awk '{print $1}')
+    if [ -z "$dp_units" ]; then
+        skip "dp-pool" "systemctl lists no running qiita-data-plane@ instance"
+    else
+        for unit in $dp_units; do
+            # -b: this boot only, so a previous boot's lines are not read as this
+            # deploy's. The unit may have restarted within the boot; the LAST
+            # pool line is the running process's.
+            pool_line=$(journalctl -u "$unit" -b --no-pager 2>/dev/null \
+                | grep 'qiita-data-plane pool:' | tail -1)
+            if [ -z "$pool_line" ]; then
+                fail "dp-pool/$unit" "no 'qiita-data-plane pool:' line this boot — binary predates the pool, or the unit has not started"
+            elif grep -q 'fallback default' <<<"$pool_line"; then
+                fail "dp-pool/$unit" "pool sized from the fallback ceiling, not this host: ${pool_line#*pool: }"
+            else
+                pass "dp-pool/$unit" "${pool_line#*pool: }"
+            fi
+            discards=$(journalctl -u "$unit" -b --no-pager 2>/dev/null \
+                | grep -c 'discarding a pooled DuckLake connection' || true)
+            if [ "${discards:-0}" -gt 0 ]; then
+                fail "dp-pool/$unit/reset" "$discards connection(s) failed their reset and were rebuilt this boot — every request may be paying a fresh attach"
+            else
+                pass "dp-pool/$unit/reset" "no connection failed its reset this boot"
+            fi
+        done
+    fi
 fi
 
 # --- 4b. ENA reachability from the control plane (as qiita-api) -----------

@@ -8,6 +8,12 @@ mod config;
 mod ducklake;
 mod flight_service;
 mod miint;
+mod pool;
+mod resources;
+// Gated with its consumers, every one of which is an `integration` test: under
+// `#[cfg(test)]` alone its two functions are dead code on a plain `cargo test`.
+#[cfg(all(test, feature = "integration"))]
+mod test_catalog;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -24,18 +30,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &cfg.path_persistent_ducklake,
     )?;
     // Catalog-global Parquet defaults (zstd + v2). Set ONCE here at boot, NOT on
-    // every per-request attach: a per-attach write races on ducklake_metadata
+    // every attach the pool makes: a per-attach write races on ducklake_metadata
     // under concurrent Flight load and fails with SQLSTATE 40001. See
     // set_catalog_options.
     ducklake::set_catalog_options(&setup_conn)?;
     ducklake::ensure_lake_tables(&setup_conn)?;
     drop(setup_conn);
 
-    // Build Flight service — each request opens its own DuckDB connection
-    let flight_svc = flight_service::QiitaFlightService::new(
-        cfg.flight_public_key,
+    // One bounded pool of attached instances serves every request; its size is
+    // the number in flight. Logged after it opens, so the line is a statement
+    // that these settings applied rather than that they were intended.
+    let pool_log = format!(
+        "qiita-data-plane pool: {} connections x {} threads, memory_limit {} \
+         (from a {:.1} GiB ceiling read via {}, CPU budget {}), \
+         spill under {} capped at {}; {} concurrent uploads",
+        cfg.pool.size,
+        cfg.pool.threads,
+        cfg.pool.memory_limit,
+        cfg.memory_ceiling.bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+        cfg.memory_ceiling.source.as_str(),
+        cfg.thread_budget,
+        cfg.pool.temp_directory.display(),
+        cfg.pool.max_temp_directory_size,
+        cfg.max_concurrent_doput,
+    );
+    let lake_pool = pool::LakePool::open(
         cfg.ducklake_catalog_connstr,
         cfg.path_persistent_ducklake,
+        cfg.pool,
+    )?;
+    println!("{pool_log}");
+
+    let flight_svc = flight_service::QiitaFlightService::new(
+        cfg.flight_public_key,
+        lake_pool,
+        cfg.max_concurrent_doput,
         cfg.path_scratch_staging,
         cfg.path_scratch,
     );
@@ -177,6 +206,196 @@ mod tests {
         assert_eq!(
             cfg.path_persistent_ducklake,
             format!("{persistent}/ducklake")
+        );
+    }
+
+    /// Every required var, so a test can get to the pool settings. Returns the
+    /// scratch and persistent roots it chose.
+    fn set_required_env() -> (String, String) {
+        std::env::set_var(
+            "FLIGHT_TICKET_PUBLIC_KEY",
+            "6kpsY+KcUgq+9VB7Ey7F+ZVHdq6+vnuSQh7qaRRG0iw=",
+        );
+        std::env::set_var("DUCKLAKE_CATALOG_CONNSTR", "dbname=test host=localhost");
+        let scratch = tmp_abs("qiita-test-scratch");
+        let persistent = tmp_abs("qiita-test-persistent");
+        std::env::set_var("PATH_SCRATCH", &scratch);
+        std::env::set_var("PATH_PERSISTENT", &persistent);
+        (scratch, persistent)
+    }
+
+    /// What `set_required_env` sets, plus the `HOME` the spill directory derives
+    /// from — snapshotted separately from the pool's own vars so neither list is
+    /// a copy of the other.
+    const REQUIRED_VARS: &[&str] = &[
+        "FLIGHT_TICKET_PUBLIC_KEY",
+        "DUCKLAKE_CATALOG_CONNSTR",
+        "PATH_SCRATCH",
+        "PATH_PERSISTENT",
+        "HOME",
+    ];
+
+    /// The optional vars the pool and the upload bound read.
+    const POOL_VARS: &[&str] = &[
+        "DUCKLAKE_POOL_SIZE",
+        "DUCKDB_THREADS",
+        "DUCKDB_MEMORY_LIMIT",
+        "DUCKDB_TEMP_DIRECTORY",
+        "DUCKDB_MAX_TEMP_DIRECTORY_SIZE",
+        "FLIGHT_MAX_CONCURRENT_DOPUT",
+    ];
+
+    /// The snapshot guards plus a known starting point: every required var set,
+    /// every optional pool var cleared. The caller holds the guards, so the
+    /// snapshot is restored when its test ends.
+    #[must_use]
+    fn pool_test_env() -> (EnvSnapshot, EnvSnapshot) {
+        let guards = (
+            EnvSnapshot::capture(REQUIRED_VARS),
+            EnvSnapshot::capture(POOL_VARS),
+        );
+        set_required_env();
+        for var in POOL_VARS {
+            std::env::remove_var(var);
+        }
+        guards
+    }
+
+    /// With nothing configured, the pool still has a bound and every connection
+    /// still has limits.
+    #[test]
+    #[serial]
+    fn pool_settings_are_derived_when_unset() {
+        let _env = pool_test_env();
+        std::env::set_var("HOME", tmp_abs("qiita-test-home"));
+
+        let cfg = Settings::from_env().expect("from_env with no pool vars set");
+
+        assert_eq!(cfg.pool.size, 8, "the default in-flight bound");
+        assert!(cfg.pool.threads >= 1, "a request always gets a thread");
+        assert_eq!(
+            cfg.pool.threads,
+            std::cmp::max(1, (cfg.thread_budget / cfg.pool.size) as u32),
+            "threads is the CPU budget divided by the bound"
+        );
+        assert!(
+            cfg.pool.memory_limit.ends_with("MiB"),
+            "a derived memory_limit is a binary size, got {}",
+            cfg.pool.memory_limit
+        );
+        assert!(
+            cfg.memory_ceiling.bytes > 0 && !cfg.memory_ceiling.source.as_str().is_empty(),
+            "the ceiling it was divided from is reported with its source"
+        );
+        assert_eq!(
+            cfg.pool.temp_directory,
+            std::path::PathBuf::from(tmp_abs("qiita-test-home")).join("duckdb-spill"),
+            "spill lands under the per-instance HOME the unit sets"
+        );
+        assert_eq!(cfg.pool.max_temp_directory_size, "4GiB");
+        assert_eq!(
+            cfg.max_concurrent_doput, 8,
+            "uploads are bounded too, though they borrow no connection"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn pool_settings_are_taken_from_the_environment() {
+        let _env = pool_test_env();
+        let spill = tmp_abs("qiita-test-spill");
+        std::env::set_var("DUCKLAKE_POOL_SIZE", "3");
+        std::env::set_var("DUCKDB_THREADS", "5");
+        std::env::set_var("DUCKDB_MEMORY_LIMIT", "7GiB");
+        std::env::set_var("DUCKDB_TEMP_DIRECTORY", &spill);
+        std::env::set_var("DUCKDB_MAX_TEMP_DIRECTORY_SIZE", "11GiB");
+        std::env::set_var("FLIGHT_MAX_CONCURRENT_DOPUT", "2");
+
+        let cfg = Settings::from_env().expect("from_env with explicit pool vars");
+
+        assert_eq!(cfg.pool.size, 3);
+        assert_eq!(cfg.pool.threads, 5);
+        assert_eq!(cfg.pool.memory_limit, "7GiB");
+        assert_eq!(cfg.pool.temp_directory, std::path::PathBuf::from(spill));
+        assert_eq!(cfg.pool.max_temp_directory_size, "11GiB");
+        assert_eq!(cfg.max_concurrent_doput, 2);
+    }
+
+    #[test]
+    #[serial]
+    fn config_rejects_a_pool_that_serves_nothing() {
+        let _env = pool_test_env();
+        std::env::set_var("DUCKLAKE_POOL_SIZE", "0");
+        let err = Settings::from_env().unwrap_err();
+        assert!(
+            err.contains("DUCKLAKE_POOL_SIZE") && err.contains("at least 1"),
+            "unexpected error: {err}"
+        );
+
+        std::env::set_var("DUCKLAKE_POOL_SIZE", "8");
+        std::env::set_var("DUCKDB_THREADS", "0");
+        let err = Settings::from_env().unwrap_err();
+        assert!(
+            err.contains("DUCKDB_THREADS") && err.contains("at least 1"),
+            "unexpected error: {err}"
+        );
+
+        std::env::set_var("DUCKDB_THREADS", "4");
+        std::env::set_var("FLIGHT_MAX_CONCURRENT_DOPUT", "0");
+        let err = Settings::from_env().unwrap_err();
+        assert!(
+            err.contains("FLIGHT_MAX_CONCURRENT_DOPUT") && err.contains("at least 1"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn config_rejects_a_relative_spill_directory() {
+        let _env = pool_test_env();
+        std::env::set_var("DUCKDB_TEMP_DIRECTORY", "relative/spill");
+        let err = Settings::from_env().unwrap_err();
+        assert!(
+            err.contains("DUCKDB_TEMP_DIRECTORY") && err.contains("absolute"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// A share below the floor means the pool is too big for the host, and
+    /// granting the floor anyway would over-commit the ceiling it was divided
+    /// from. The size is computed from whatever this machine detects, so the
+    /// test fails for the stated reason on a laptop and on the deploy host alike.
+    #[test]
+    #[serial]
+    fn a_pool_too_large_for_the_detected_ceiling_fails_at_boot() {
+        let _env = pool_test_env();
+        // From the constants that do the dividing, so the test cannot drift from
+        // them, and from this machine's own ceiling so it holds on any host.
+        let ceiling_mib = super::resources::detect_memory_ceiling().bytes / (1024 * 1024);
+        let size =
+            (ceiling_mib / super::config::CEILING_DIVISOR / super::config::MIN_MEMORY_LIMIT_MIB)
+                + 1;
+        std::env::set_var("DUCKLAKE_POOL_SIZE", size.to_string());
+
+        let err = Settings::from_env().unwrap_err();
+
+        assert!(
+            err.contains("DUCKLAKE_POOL_SIZE") && err.contains("DUCKDB_MEMORY_LIMIT"),
+            "the error names both ways out: {err}"
+        );
+    }
+
+    /// Nowhere to derive a spill directory from is a boot failure, not a silent
+    /// fallback onto whatever filesystem the process happens to start in.
+    #[test]
+    #[serial]
+    fn config_rejects_having_nowhere_to_spill() {
+        let _env = pool_test_env();
+        std::env::remove_var("HOME");
+        let err = Settings::from_env().unwrap_err();
+        assert!(
+            err.contains("DUCKDB_TEMP_DIRECTORY") && err.contains("HOME"),
+            "unexpected error: {err}"
         );
     }
 

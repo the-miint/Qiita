@@ -1,32 +1,47 @@
-"""Unit tests for the data-plane fetch failure classifier (`runner/_upload.py`).
+"""Unit tests for the data-plane failure classification both services share
+(`qiita_common.data_plane_errors`) and the control-plane wrapper that files it
+(`runner/_upload.py`).
 
-Pins that a DuckLake serialization conflict (Postgres SQLSTATE 40001) surfaced
-over Flight is classified RETRIABLE (`DATA_PLANE_TRANSIENT`), as is an expired
-signing token, while every other DP-fetch failure stays permanent (`BAD_INPUT`) —
-including the other unauthenticated causes, which share the expiry's pyarrow error
-class and gRPC status but not its self-healing. The classifier matches the
-*stringified* pyarrow `FlightError` by message — there is no typed asyncpg
-exception to `isinstance` against at this layer — so a representative real string
-is captured here. If the data plane ever reformats that error, THIS test is what
-fails (rather than every DP fetch silently reverting to permanent in production).
+Pins which DP-fetch failures are RETRIABLE (`DATA_PLANE_TRANSIENT`) — a DuckLake
+serialization conflict (Postgres SQLSTATE 40001) surfaced over Flight, a gRPC
+UNAVAILABLE, the data plane refusing a request for want of a free connection, and an
+expired signing token — while every other DP-fetch failure stays permanent
+(`BAD_INPUT`), including the other unauthenticated causes, which share the expiry's
+pyarrow error class and gRPC status but not its self-healing.
+
+The classifier matches the *stringified* exception by message, because there is no type
+to match on at this layer: the pyarrow class differs per gRPC status (a `FlightError`
+subclass for most, `ArrowInvalid` — a plain `ValueError` — for RESOURCE_EXHAUSTED), and
+the DuckLake conflict arrives as text inside a Flight error rather than as the
+`asyncpg` exception the control plane's own DB errors raise. A representative real
+string is captured here for each. If the data plane ever reformats one of these, THIS
+test is what fails, rather than every DP fetch silently reverting to permanent in
+production.
 """
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from qiita_common.backend_failure import FailureKind
+from qiita_common.data_plane_errors import (
+    DATA_PLANE_BUSY_SIGNATURE,
+    DATA_PLANE_TICKET_EXPIRED_SIGNATURES,
+    is_data_plane_busy,
+    is_data_plane_serialization_conflict,
+    is_data_plane_ticket_expired,
+    is_data_plane_unavailable,
+)
 from qiita_common.models import WorkTicketFailureStage
 
-from qiita_control_plane.runner._upload import (
-    _DP_TICKET_EXPIRED_SIGNATURES,
-    _is_dp_serialization_conflict,
-    _is_dp_ticket_expired,
-    _is_dp_unavailable,
-    _submission_dp_fetch_failure,
-)
+from qiita_control_plane.runner._upload import _submission_dp_fetch_failure
 
 # A representative stringified pyarrow FlightError carrying the Postgres 40001
 # serialization message, as seen verbatim in a real read-mask fan-out
 # failure_reason (the concurrent DuckLake-attach race this classifier exists for).
+# The data plane's sources, which the contract tests below parse rather than restate.
+DATA_PLANE_SRC = Path(__file__).resolve().parents[2] / "qiita-data-plane" / "src"
+
 _REAL_40001 = (
     "FlightInternalError: Flight returned internal error, with message: data plane "
     "stream error: External error: failed to attach DuckLake: Invalid Error: Failed "
@@ -59,6 +74,22 @@ _REAL_UNAVAILABLE = (
 # CP's own text and the fixture would stop testing pyarrow's rendering at all.
 _REAL_EXPIRED = "Flight returned unauthenticated error, with message: ticket expired"
 
+
+# How a busy data plane reaches this layer. The data plane refuses a request it has
+# no free DuckLake connection for with gRPC RESOURCE_EXHAUSTED; this string is what
+# a pyarrow client raised for that status in a probe (pyarrow 23.0.1, grpcio 1.80.0,
+# a generic gRPC server answering RESOURCE_EXHAUSTED, with gRPC UNAVAILABLE as the
+# control reproducing `_REAL_UNAVAILABLE`'s shape). Note the exception class: pyarrow
+# surfaces this status as `ArrowInvalid`, a ValueError rather than a FlightError, which
+# is why the classifier matches text rather than a type.
+_REAL_BUSY = (
+    "gRPC returned resource exhausted error, with message: data plane busy: all 8 "
+    "DuckLake connections are in use; retry. gRPC client debug context: "
+    "UNKNOWN:Error received from peer ipv4:127.0.0.1:50051 {grpc_status:8, "
+    'grpc_message:"data plane busy: all 8 DuckLake connections are in use; retry"}. '
+    "Client context: IOError: Server never sent a data message."
+)
+
 # The same gRPC status and the same pyarrow class, from `AuthError::InvalidSignature`
 # — a key mismatch between the CP and the DP, which no redrive fixes. This is why
 # the classifier keys off the expiry text and not the error class.
@@ -80,9 +111,9 @@ _REAL_BAD_SIGNATURE = "Flight returned unauthenticated error, with message: inva
 # different Detail, and the same status with a different message keeps the Detail —
 # so each half of the expiry match is shown to discriminate.
 #
-# The expiry fixture is what a live data plane produces. The UNAVAILABLE one is NOT
-# known to occur on the CP->DP path — the data plane emits no `Status::unavailable`
-# itself — it pins the rendering so the classifier is right if anything ever does.
+# Both fixtures are shapes a live data plane produces: it answers `unauthenticated` for
+# an expired ticket and `unavailable` when it cannot open a DuckLake connection (the
+# catalog unreachable or at its connection limit).
 _SERVER_RETURNED_EXPIRED = (
     "ticket expired. Detail: Unauthenticated. gRPC client debug context: "
     "UNKNOWN:Error received from peer ipv4:127.0.0.1:50112 "
@@ -92,8 +123,8 @@ _SERVER_RETURNED_EXPIRED = (
 )
 
 # A server-returned UNAVAILABLE: no connect failure happened, so none of the
-# connect-shaped substrings appear. See the block comment above for why this is
-# pinned even though nothing on the CP->DP path is known to produce it.
+# connect-shaped substrings appear — which is the half of the match this fixture
+# discriminates.
 _SERVER_RETURNED_UNAVAILABLE = (
     "data plane is shutting down. Detail: Unavailable. gRPC client debug context: "
     "UNKNOWN:Error received from peer ipv4:127.0.0.1:50112 "
@@ -105,17 +136,17 @@ _SERVER_RETURNED_UNAVAILABLE = (
 def test_expiry_is_detected_in_both_pyarrow_renderings():
     """The classifier must fire on the form a live data plane produces, not only on
     the message-prefix form the other fixtures use."""
-    assert _is_dp_ticket_expired(Exception(_REAL_EXPIRED)) is True
-    assert _is_dp_ticket_expired(Exception(_SERVER_RETURNED_EXPIRED)) is True
+    assert is_data_plane_ticket_expired(Exception(_REAL_EXPIRED)) is True
+    assert is_data_plane_ticket_expired(Exception(_SERVER_RETURNED_EXPIRED)) is True
 
 
 def test_a_data_plane_that_is_up_but_unavailable_is_retriable():
     """A server-returned UNAVAILABLE carries no connect failure, so the three
-    connect-shaped substrings never appear and it classified PERMANENT until
-    "detail: unavailable" was added. gRPC defines the status as retriable, so a
-    redrive self-heals it and it must not land as a bad-input an operator resolves —
-    whether or not this path has yet produced one."""
-    assert _is_dp_unavailable(Exception(_SERVER_RETURNED_UNAVAILABLE)) is True
+    connect-shaped substrings never appear and only "detail: unavailable" matches it.
+    The data plane answers this status when it cannot open a DuckLake connection, and
+    gRPC defines it as retriable, so a redrive self-heals it and it must not land as a
+    bad-input an operator resolves."""
+    assert is_data_plane_unavailable(Exception(_SERVER_RETURNED_UNAVAILABLE)) is True
     f = _submission_dp_fetch_failure("could not fetch ...", Exception(_SERVER_RETURNED_UNAVAILABLE))
     assert f.kind is FailureKind.DATA_PLANE_TRANSIENT
     assert f.transient is True
@@ -131,43 +162,43 @@ def test_the_two_renderings_do_not_cross_contaminate():
     same_message_other_status = _SERVER_RETURNED_EXPIRED.replace(
         "Detail: Unauthenticated", "Detail: Internal"
     )
-    assert _is_dp_ticket_expired(Exception(same_message_other_status)) is False
-    assert _is_dp_ticket_expired(Exception(_SERVER_RETURNED_UNAVAILABLE)) is False
-    assert _is_dp_unavailable(Exception(_SERVER_RETURNED_EXPIRED)) is False
+    assert is_data_plane_ticket_expired(Exception(same_message_other_status)) is False
+    assert is_data_plane_ticket_expired(Exception(_SERVER_RETURNED_UNAVAILABLE)) is False
+    assert is_data_plane_unavailable(Exception(_SERVER_RETURNED_EXPIRED)) is False
 
 
 def test_serialization_conflict_is_detected():
-    assert _is_dp_serialization_conflict(Exception(_REAL_40001)) is True
+    assert is_data_plane_serialization_conflict(Exception(_REAL_40001)) is True
 
 
 def test_non_serialization_error_is_not_detected():
-    assert _is_dp_serialization_conflict(Exception("some other flight error")) is False
-    assert _is_dp_serialization_conflict(FileNotFoundError("missing file")) is False
+    assert is_data_plane_serialization_conflict(Exception("some other flight error")) is False
+    assert is_data_plane_serialization_conflict(FileNotFoundError("missing file")) is False
 
 
 def test_unavailable_is_detected():
-    assert _is_dp_unavailable(Exception(_REAL_UNAVAILABLE)) is True
+    assert is_data_plane_unavailable(Exception(_REAL_UNAVAILABLE)) is True
 
 
 def test_non_unavailable_error_is_not_detected():
     # A serialization conflict is retriable, but NOT via the unavailable path.
-    assert _is_dp_unavailable(Exception(_REAL_40001)) is False
-    assert _is_dp_unavailable(Exception("some other flight error")) is False
+    assert is_data_plane_unavailable(Exception(_REAL_40001)) is False
+    assert is_data_plane_unavailable(Exception("some other flight error")) is False
 
 
 def test_ticket_expired_is_detected():
-    assert _is_dp_ticket_expired(Exception(_REAL_EXPIRED)) is True
+    assert is_data_plane_ticket_expired(Exception(_REAL_EXPIRED)) is True
 
 
 def test_other_unauthenticated_errors_are_not_detected():
     # Same class, same gRPC status, permanent cause — must not be swept in.
-    assert _is_dp_ticket_expired(Exception(_REAL_BAD_SIGNATURE)) is False
-    assert _is_dp_ticket_expired(Exception(_REAL_40001)) is False
-    assert _is_dp_ticket_expired(Exception("some other flight error")) is False
+    assert is_data_plane_ticket_expired(Exception(_REAL_BAD_SIGNATURE)) is False
+    assert is_data_plane_ticket_expired(Exception(_REAL_40001)) is False
+    assert is_data_plane_ticket_expired(Exception("some other flight error")) is False
     # `AuthError::ExpiryTooFar` — the nearest miss, and the variant a reword of the
     # Rust `Display` impl is most likely to collide with.
     assert (
-        _is_dp_ticket_expired(
+        is_data_plane_ticket_expired(
             Exception(
                 "Flight returned unauthenticated error, with message: "
                 "ticket expiry too far in the future"
@@ -181,7 +212,7 @@ def test_an_expired_work_ticket_is_not_an_expired_flight_ticket():
     """ "ticket" names both a Flight ticket and a work_ticket in this repo, and
     "work ticket expired" contains the expiry text. The unauthenticated marker is
     what separates them, so a non-Flight message must not classify retriable."""
-    assert _is_dp_ticket_expired(Exception("work ticket expired while queued")) is False
+    assert is_data_plane_ticket_expired(Exception("work ticket expired while queued")) is False
 
 
 def test_expiry_signatures_match_the_data_planes_wording():
@@ -191,30 +222,27 @@ def test_expiry_signatures_match_the_data_planes_wording():
     A reword in `auth.rs` fails HERE rather than silently reverting every expired
     token to a permanent BAD_INPUT."""
     import re
-    from pathlib import Path
 
-    src = (Path(__file__).resolve().parents[2] / "qiita-data-plane" / "src" / "auth.rs").read_text()
+    src = (DATA_PLANE_SRC / "auth.rs").read_text()
     m = re.search(r'AuthError::Expired => write!\(f, "([^"]+)"\)', src)
     assert m, "AuthError::Expired arm not found in auth.rs"
     assert m.group(1) == "ticket expired", (
         f"the data plane now renders an expired ticket as {m.group(1)!r}; "
-        f"update _DP_TICKET_EXPIRED_SIGNATURES ({_DP_TICKET_EXPIRED_SIGNATURES!r}) "
+        f"update DATA_PLANE_TICKET_EXPIRED_SIGNATURES ({DATA_PLANE_TICKET_EXPIRED_SIGNATURES!r}) "
         "or expired tokens silently classify permanent again"
     )
     # The other half of the match: every ticket verification maps its AuthError to
     # gRPC unauthenticated, which is what puts that word in the client's error. A
     # verify site mapped to any other Status would break the match, so read them
     # out of the source rather than asserting the constant against itself.
-    service = (
-        Path(__file__).resolve().parents[2] / "qiita-data-plane" / "src" / "flight_service.rs"
-    ).read_text()
+    service = (DATA_PLANE_SRC / "flight_service.rs").read_text()
     verify_calls = re.findall(
         r"auth::verify_\w+\([^;]*?\.map_err\(\|e\| Status::(\w+)\(", service, flags=re.DOTALL
     )
     assert verify_calls, "no auth::verify_* -> Status mapping found in flight_service.rs"
     assert set(verify_calls) == {"unauthenticated"}, (
         f"a ticket verification now maps to {sorted(set(verify_calls))}; the classifier's "
-        f"{_DP_TICKET_EXPIRED_SIGNATURES!r} match assumes every one is unauthenticated"
+        f"{DATA_PLANE_TICKET_EXPIRED_SIGNATURES!r} match assumes every one is unauthenticated"
     )
 
 
@@ -237,6 +265,69 @@ def test_unavailable_classified_retriable():
     assert f.transient is True  # DP was briefly unreachable; a redrive self-heals
     assert f.stage is WorkTicketFailureStage.SUBMISSION
     assert f.step_name is None
+
+
+def test_busy_data_plane_classified_retriable():
+    """A refusal for want of a free connection is overload, not bad input: the same
+    fetch succeeds once a connection frees, so it must not be filed permanent."""
+    f = _submission_dp_fetch_failure(
+        "could not materialize reads for prep_sample 31074 ...",
+        ValueError(_REAL_BUSY),
+    )
+    assert f.kind is FailureKind.DATA_PLANE_TRANSIENT
+    assert f.transient is True  # a redrive self-heals once the pool frees up
+    assert f.stage is WorkTicketFailureStage.SUBMISSION
+    assert f.step_name is None
+
+
+def test_busy_predicate_does_not_fire_on_the_other_dp_errors():
+    """The match is the data plane's own prefix, so it covers the refusal and nothing
+    else that carries the same gRPC status."""
+    assert is_data_plane_busy(ValueError(_REAL_BUSY)) is True
+    assert is_data_plane_busy(Exception(_REAL_40001)) is False
+    assert is_data_plane_busy(Exception(_REAL_UNAVAILABLE)) is False
+    assert is_data_plane_busy(Exception(_REAL_EXPIRED)) is False
+    assert is_data_plane_busy(Exception("Flight returned internal error: no such table")) is False
+    # The case the status name alone would have swallowed: gRPC answers
+    # RESOURCE_EXHAUSTED for an oversized message too, and no redrive shrinks it.
+    assert (
+        is_data_plane_busy(
+            ValueError(
+                "gRPC returned resource exhausted error, with message: Received message "
+                "larger than max (21368092 vs. 4194304)"
+            )
+        )
+        is False
+    )
+
+
+def test_busy_signature_matches_the_data_planes_wording():
+    """The signature is the data plane's own prefix, which no client library renders
+    for us, so a reword in the Rust fails HERE rather than silently reverting every
+    refusal to a permanent BAD_INPUT. Every `resource_exhausted` refusal in the
+    component is checked — whatever shape it is written in — so one added later cannot
+    ship unclassified."""
+    import re
+
+    refusals: list[str] = []
+    for src_file in sorted(DATA_PLANE_SRC.glob("*.rs")):
+        src = src_file.read_text()
+        for call in re.finditer(r"Status::resource_exhausted\(", src):
+            # The literals inside this call only: up to its `");`, which is where
+            # a `format!` refusal ends. Reading past it collects whatever literal
+            # comes next in the function.
+            tail = src[call.end() : call.end() + 600]
+            refusals.extend(re.findall(r'"([^"]*)"', tail.split(");", 1)[0]))
+    assert refusals, "no Status::resource_exhausted refusal found in the data plane"
+    assert any(DATA_PLANE_BUSY_SIGNATURE in r.lower() for r in refusals), (
+        f"no data-plane refusal carries {DATA_PLANE_BUSY_SIGNATURE!r}; found {refusals!r}. "
+        "Update the signature or a busy data plane classifies permanent again"
+    )
+    for refusal in refusals:
+        assert DATA_PLANE_BUSY_SIGNATURE in refusal.lower(), (
+            f"the data plane has a refusal that does not carry "
+            f"{DATA_PLANE_BUSY_SIGNATURE!r}: {refusal!r}"
+        )
 
 
 def test_ticket_expired_classified_retriable():

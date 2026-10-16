@@ -18,10 +18,18 @@
 
 use duckdb::Connection;
 
-/// Characters disallowed in connection strings and paths interpolated into SQL.
-/// DuckDB ATTACH does not support parameterized queries, so we validate inputs
+/// Characters disallowed in any value interpolated into a DuckDB SQL literal —
+/// connection strings and data paths for ATTACH, and the pool's resource
+/// settings for SET. Neither statement takes parameters, so inputs are validated
 /// before interpolation. This is input validation, not sanitization.
-fn validate_sql_literal(value: &str, field: &str) -> Result<(), String> {
+///
+/// These three are sufficient for that one job: without a quote or a semicolon a
+/// value cannot close the literal and start a statement. Probed on DuckDB 1.5.5 —
+/// a value ending in a backslash is taken literally, so it does not escape the
+/// closing quote the way it would in a backslash-escaping dialect. What the
+/// values must otherwise look like is DuckDB's business: a `memory_limit` it
+/// cannot parse fails the pool's first instance build, which fails boot.
+pub(crate) fn validate_sql_literal(value: &str, field: &str) -> Result<(), String> {
     if value.contains('\'') || value.contains(';') || value.contains('\0') {
         return Err(format!(
             "{field} contains disallowed characters (single quote, semicolon, or null byte)"
@@ -64,9 +72,10 @@ pub fn connect_ducklake(
 ///
 /// These options are PERSISTED in `ducklake_metadata` (catalog-global), so they
 /// only need to be set ONCE per catalog. Call this on the PROCESS-START
-/// connection only — NEVER on a per-request attach. Setting it on every attach
-/// made each concurrent Flight request UPDATE the same `ducklake_metadata` row,
-/// which serialized and failed under load with Postgres SQLSTATE 40001
+/// connection only — NEVER where an attach happens per request or per pooled
+/// connection. Setting it on every attach made
+/// each concurrent Flight request UPDATE the same `ducklake_metadata` row, which
+/// serialized and failed under load with Postgres SQLSTATE 40001
 /// (`could not serialize access due to concurrent update`). Keep the values in
 /// sync with PARQUET_OPTS.
 pub fn set_catalog_options(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
@@ -874,34 +883,18 @@ mod tests {
         TEST_ID.fetch_add(1, Ordering::Relaxed) as i64
     }
 
-    fn test_catalog_connstr() -> String {
-        // Fallback matches the Docker-compose Postgres at `:5433` so
-        // local Docker-mode runs work without setting the env var. The
-        // Makefile's test-integration recipe in host-Postgres mode (CI
-        // macOS, dev macOS without Docker) sets the env var explicitly
-        // to `:5432`. Tests that mutate this env var must use
-        // `EnvSnapshot` (see main.rs::tests) so they don't leak the
-        // default-only state into other `#[serial]` tests.
-        std::env::var("DUCKLAKE_CATALOG_CONNSTR").unwrap_or_else(|_| {
-            "dbname=qiita_ducklake host=localhost port=5433 user=qiita password=qiita".to_string()
-        })
-    }
-
+    #[cfg(feature = "integration")]
     fn setup_conn() -> Connection {
         let conn = Connection::open_in_memory().expect("open in-memory DuckDB");
-        let connstr = test_catalog_connstr();
-        // `/ducklake` must match config.rs's PATH_PERSISTENT/ducklake derivation.
-        let data_path = std::env::var("PATH_PERSISTENT")
-            .map(|base| format!("{base}/ducklake"))
-            .unwrap_or_else(|_| "/tmp/qiita-integration-ducklake-data".to_string());
-        std::fs::create_dir_all(&data_path).unwrap();
+        let connstr = crate::test_catalog::connstr();
+        let data_path = crate::test_catalog::data_path();
         connect_ducklake(&conn, &connstr, &data_path)
             .expect("failed to connect DuckLake — check DUCKLAKE_CATALOG_CONNSTR");
         // This helper mirrors the production BOOT connection (main.rs): it creates
-        // the tables AND sets the catalog-global Parquet options once. connect_ducklake
-        // no longer does. The options persist in the shared Postgres catalog, so
-        // per-request connections (flight_service, in tests as in production) inherit
-        // them and correctly do NOT re-set them.
+        // the tables AND sets the catalog-global Parquet options once, which
+        // connect_ducklake does not. The options persist in the shared Postgres
+        // catalog, so a pooled connection (flight_service, in tests as in
+        // production) inherits them and correctly does NOT re-set them.
         set_catalog_options(&conn).expect("failed to set catalog options");
         conn
     }
@@ -910,6 +903,7 @@ mod tests {
     /// declared order, for the schema-drift assertions below. `is_nullable` is
     /// carried because NOT NULL is a property both alignment DDLs argue for
     /// explicitly; without it, dropping every NOT NULL leaves these tests green.
+    #[cfg(feature = "integration")]
     fn table_schema(conn: &Connection, table: &str) -> Vec<(String, String, String)> {
         let mut stmt = conn
             .prepare(
@@ -928,6 +922,7 @@ mod tests {
     /// Uses format! for SQL — safe because table/column are &'static str from
     /// compile-time constants in the test code, and id is an integer.
     /// This pattern is test-only and must not be copied to production code.
+    #[cfg(feature = "integration")]
     struct Cleanup<'a> {
         conn: &'a Connection,
         table: &'static str,
@@ -935,6 +930,7 @@ mod tests {
         id: i64,
     }
 
+    #[cfg(feature = "integration")]
     impl Drop for Cleanup<'_> {
         fn drop(&mut self) {
             let _ = self.conn.execute_batch(&format!(
