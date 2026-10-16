@@ -307,45 +307,8 @@ clean:
 
 ## CI (GitHub Actions)
 
-```yaml
-# .github/workflows/ci.yml
-name: CI
-on: [push, pull_request]
+CI is defined in [`.github/workflows/ci.yml`](../../.github/workflows/ci.yml). Where the file's comments give the reason for a job or step, that comment is the one place it is written, so this section does not copy it. What the file cannot say about itself:
 
-jobs:
-  lint:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - run: make lint
-
-  test-unit:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - run: make test
-
-  test-integration:
-    runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: postgres:17
-        env:
-          POSTGRES_PASSWORD: test
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-    steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - run: make test-integration
-```
+- **Jobs.** The `config` job runs first and picks the OS list. `lint-python` and `rust` follow, then `test-python`, `test-control-plane-with-db`, `test-integration` and `test-workflows`, each waiting on the jobs named in its `needs:`. `deploy-note-check` and `changelog-check` run on pull requests only.
+- **OS matrix.** A pull request runs the matrix jobs on Ubuntu only. A push to `main` runs them on Ubuntu and macOS. `test-workflows` is always Ubuntu-only.
+- **Labels.** `ci-macos` adds macOS to a pull request's matrix. `no-deploy-note` skips `deploy-note-check`, and `no-changelog` skips `changelog-check`.
