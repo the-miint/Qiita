@@ -10,7 +10,10 @@
   dividing half of it, and the CPU allowance, by the pool size. Boot fails, naming both ways
   out, if that leaves under 512 MiB per connection — measured as the point below which the
   export DoAction's Parquet writer cannot run. The boot log names the detected ceiling,
-  the source that answered, and every value in use.
+  the source that answered, and every value in use. Each connection spills into a directory of its own,
+  created under `PATH_SCRATCH/duckdb-spill` and removed with the connection: DuckDB names its
+  spill files the same in every database, and two databases spilling into one shared
+  directory crashed the process in three of four probe runs.
 
 - **Concurrent uploads are bounded too (#713).** A DoPut writes Parquet without touching the
   catalog, so it borrows no pooled connection and nothing in the process capped how many ran

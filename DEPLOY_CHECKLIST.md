@@ -20,7 +20,7 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
   `DUCKDB_TEMP_DIRECTORY`, `DUCKDB_MAX_TEMP_DIRECTORY_SIZE`, `FLIGHT_MAX_CONCURRENT_DOPUT`.
   Left unset the data plane starts on its own
   values: `memory_limit` derived from the memory it finds free, `threads` from the CPU
-  allowance, the spill directory from the unit's `HOME`, and fixed defaults for the spill cap
+  allowance, the spill root `PATH_SCRATCH/duckdb-spill` (which bucket 2 creates), and fixed defaults for the spill cap
   and for the two counts (pool size and concurrent uploads, 8 each). One exception: boot fails if the pool size leaves under 512 MiB per
   connection — measured as the point below which the export DoAction cannot run — naming
   both ways out. Setting `DUCKDB_MEMORY_LIMIT` explicitly is what stops
@@ -36,7 +36,12 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
 
 ### 2. One-time host setup
 
-_None yet._
+- `[admin]` (#713) Create the data plane's spill root before the restart — each pooled
+  connection spills into a directory of its own under it, and boot fails if it cannot:
+  `sudo install -d -o qiita-data -g qiita-data -m 0700 <scratch>/duckdb-spill`. Skip it only
+  if `DUCKDB_TEMP_DIRECTORY` names another root the data plane can write. A data plane that
+  is killed rather than stopped leaves its directories there, named `<pid>-…`; nothing
+  reclaims them.
 
 ### 3. Migrations
 

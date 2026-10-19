@@ -43,11 +43,12 @@ pub struct PoolSettings {
     /// In DuckDB's own spelling, e.g. `23552MiB` — note DuckDB reads `GB` as
     /// decimal and `GiB` as binary.
     pub memory_limit: String,
-    /// Where an over-limit request spills, which is the difference between a
-    /// request that fails and one that completes: measured, the same over-limit
-    /// sort raised `OutOfMemoryException` after 2.41 s with no spill directory
-    /// and completed in 22.62 s with one. Which filesystem, and why, is
-    /// `config::DERIVED_TEMP_DIRECTORY_LEAF`.
+    /// The root each connection's spill directory is created under. Spill is the
+    /// difference between a request that fails and one that completes: measured,
+    /// the same over-limit sort raised `OutOfMemoryException` after 2.41 s with no
+    /// spill directory and completed in 22.62 s with one. Which filesystem, and
+    /// why, is `config::DERIVED_TEMP_DIRECTORY_LEAF`; why it is a root rather than
+    /// the directory itself is `Member`.
     pub temp_directory: PathBuf,
     /// Ceiling on that spill, per connection. Measured: it is enforced mid-query,
     /// names itself in the error (`This limit was set by the
@@ -99,8 +100,27 @@ impl PoolSettings {
 /// expected answer for a borrow that ended cleanly, not a failure.
 const NO_TRANSACTION_TO_ROLL_BACK: &str = "no transaction is active";
 
+/// One pooled database and the directory it spills into.
+///
+/// Every database gets a directory of its own because DuckDB names its spill
+/// files the same in every database (`duckdb_temp_storage_DEFAULT-0.tmp` and
+/// siblings, measured on DuckDB 1.5.5), and does not make the directory unique
+/// itself. Measured with two databases in one process spilling into one shared
+/// directory: three of four runs died — two segfaults and one `INTERNAL Error:
+/// Cannot perform IO in in-memory database - CreateBlock!` — where the same
+/// workload with a directory each returned correct results in four of four.
+///
+/// `conn` is declared before `spill` so it drops first: DuckDB closes and
+/// releases its spill files, then the directory is removed. A process that is
+/// killed rather than shut down leaves its directories behind, named for its
+/// pid so an operator can tell whose they were.
+struct Member {
+    conn: Connection,
+    spill: tempfile::TempDir,
+}
+
 struct PoolState {
-    idle: Vec<Connection>,
+    idle: Vec<Member>,
     /// Connections the pool is entitled to but has not built, or has discarded.
     /// `idle.len() + checked_out + unbuilt == size` always.
     unbuilt: usize,
@@ -121,11 +141,12 @@ impl LakePool {
         settings: PoolSettings,
     ) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
         settings.validate()?;
-        // DuckDB does not create this itself; an unwritable path must stop the
-        // unit here rather than surface as a failed request under load.
+        // An unwritable root must stop the unit here rather than surface as a
+        // failed request under load; building the first member below creates a
+        // directory in it, so it is checked for writing as well as existence.
         std::fs::create_dir_all(&settings.temp_directory).map_err(|e| {
             format!(
-                "cannot create DuckDB temp directory {}: {e}",
+                "cannot create the DuckDB spill root {}: {e}",
                 settings.temp_directory.display()
             )
         })?;
@@ -158,10 +179,10 @@ impl LakePool {
     pub fn checkout(self: &Arc<Self>) -> Result<PooledConnection, Status> {
         {
             let mut state = self.lock_state();
-            if let Some(conn) = state.idle.pop() {
+            if let Some(member) = state.idle.pop() {
                 return Ok(PooledConnection {
                     pool: Arc::clone(self),
-                    conn: Some(conn),
+                    member: Some(member),
                 });
             }
             if state.unbuilt == 0 {
@@ -175,9 +196,9 @@ impl LakePool {
             state.unbuilt -= 1;
         }
         match self.build_connection() {
-            Ok(conn) => Ok(PooledConnection {
+            Ok(member) => Ok(PooledConnection {
                 pool: Arc::clone(self),
-                conn: Some(conn),
+                member: Some(member),
             }),
             Err(e) => {
                 self.lock_state().unbuilt += 1;
@@ -193,11 +214,31 @@ impl LakePool {
         }
     }
 
-    fn build_connection(&self) -> Result<Connection, Box<dyn std::error::Error>> {
+    fn build_connection(&self) -> Result<Member, Box<dyn std::error::Error>> {
+        let spill = self.new_spill_directory()?;
         let conn = Connection::open_in_memory()?;
         ducklake::connect_ducklake(&conn, &self.catalog_connstr, &self.data_path)?;
-        self.apply_settings(&conn)?;
-        Ok(conn)
+        let member = Member { conn, spill };
+        self.apply_settings(&member)?;
+        Ok(member)
+    }
+
+    /// A directory of this member's own under the spill root; see `Member`.
+    fn new_spill_directory(&self) -> Result<tempfile::TempDir, String> {
+        let root = &self.settings.temp_directory;
+        let dir = tempfile::Builder::new()
+            .prefix(&format!("{}-", std::process::id()))
+            .tempdir_in(root)
+            .map_err(|e| {
+                format!(
+                    "cannot create a spill directory under {}: {e}",
+                    root.display()
+                )
+            })?;
+        // The root passed `validate`; the name `tempfile` appended is checked too,
+        // since the whole path reaches DuckDB inside a quoted SQL literal.
+        ducklake::validate_sql_literal(&dir.path().display().to_string(), "DUCKDB_TEMP_DIRECTORY")?;
+        Ok(dir)
     }
 
     /// The settings a connection carries, applied at build and re-applied when it
@@ -211,8 +252,8 @@ impl LakePool {
     /// this list. And this is the only place limits are applied, so a
     /// `Connection` built outside the pool — the boot connection in `main`, a
     /// test's own — runs at DuckDB's defaults.
-    fn apply_settings(&self, conn: &Connection) -> Result<(), duckdb::Error> {
-        conn.execute_batch(&format!(
+    fn apply_settings(&self, member: &Member) -> Result<(), duckdb::Error> {
+        member.conn.execute_batch(&format!(
             "SET threads={};
              SET memory_limit='{}';
              SET temp_directory='{}';
@@ -220,7 +261,7 @@ impl LakePool {
              SET preserve_insertion_order=true;",
             self.settings.threads,
             self.settings.memory_limit,
-            self.settings.temp_directory.display(),
+            member.spill.path().display(),
             self.settings.max_temp_directory_size,
         ))
     }
@@ -232,18 +273,18 @@ impl LakePool {
     /// returning connection is rolled back and re-set, and one that will not reset
     /// is dropped; its slot goes back to `unbuilt` so the next checkout rebuilds
     /// it and the bound does not quietly shrink.
-    fn give_back(&self, conn: Connection) {
-        match self.reset(&conn) {
-            Ok(()) => self.lock_state().idle.push(conn),
+    fn give_back(&self, member: Member) {
+        match self.reset(&member) {
+            Ok(()) => self.lock_state().idle.push(member),
             Err(e) => {
                 eprintln!("discarding a pooled DuckLake connection that failed to reset: {e}");
-                drop(conn);
+                drop(member);
                 self.lock_state().unbuilt += 1;
             }
         }
     }
 
-    fn reset(&self, conn: &Connection) -> Result<(), duckdb::Error> {
+    fn reset(&self, member: &Member) -> Result<(), duckdb::Error> {
         // Rolled back unconditionally because there is nothing to ask: this
         // binding's `is_autocommit()` reports true even inside an explicit
         // `BEGIN TRANSACTION` (measured on duckdb 1.10505.0), so branching on it
@@ -251,12 +292,12 @@ impl LakePool {
         // transaction open answers with exactly one error, which is the answer
         // that there was nothing to roll back — a test drives both halves, so a
         // reworded error fails there rather than making every return a discard.
-        if let Err(e) = conn.execute_batch("ROLLBACK;") {
+        if let Err(e) = member.conn.execute_batch("ROLLBACK;") {
             if !e.to_string().contains(NO_TRANSACTION_TO_ROLL_BACK) {
                 return Err(e);
             }
         }
-        self.apply_settings(conn)
+        self.apply_settings(member)
     }
 
     fn lock_state(&self) -> std::sync::MutexGuard<'_, PoolState> {
@@ -289,11 +330,17 @@ impl LakePool {
                 unbuilt: 0,
             }),
         });
+        std::fs::create_dir_all(&pool.settings.temp_directory).expect("create the spill root");
         let mut idle = Vec::new();
         for _ in 0..pool.settings.size {
-            let conn = Connection::open_in_memory().expect("open in-memory DuckDB");
-            pool.apply_settings(&conn).expect("apply pool settings");
-            idle.push(conn);
+            let member = Member {
+                conn: Connection::open_in_memory().expect("open in-memory DuckDB"),
+                spill: pool
+                    .new_spill_directory()
+                    .expect("create a spill directory"),
+            };
+            pool.apply_settings(&member).expect("apply pool settings");
+            idle.push(member);
         }
         pool.lock_state().idle = idle;
         pool
@@ -329,13 +376,13 @@ impl std::fmt::Debug for LakePool {
 /// slot.
 pub struct PooledConnection {
     pool: Arc<LakePool>,
-    conn: Option<Connection>,
+    member: Option<Member>,
 }
 
 impl std::fmt::Debug for PooledConnection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PooledConnection")
-            .field("held", &self.conn.is_some())
+            .field("held", &self.member.is_some())
             .finish()
     }
 }
@@ -344,16 +391,18 @@ impl Deref for PooledConnection {
     type Target = Connection;
 
     fn deref(&self) -> &Connection {
-        self.conn
+        &self
+            .member
             .as_ref()
             .expect("a PooledConnection holds its connection until it is dropped")
+            .conn
     }
 }
 
 impl Drop for PooledConnection {
     fn drop(&mut self) {
-        if let Some(conn) = self.conn.take() {
-            self.pool.give_back(conn);
+        if let Some(member) = self.member.take() {
+            self.pool.give_back(member);
         }
     }
 }

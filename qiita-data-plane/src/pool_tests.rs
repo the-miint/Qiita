@@ -184,15 +184,122 @@ fn the_pool_settings_reach_duckdb() {
         .expect("read threads");
 
     assert_eq!(threads, 2);
+    let spill = PathBuf::from(read_text("temp_directory"));
     assert_eq!(
-        read_text("temp_directory"),
-        tmp.path().display().to_string()
+        spill.parent(),
+        Some(tmp.path()),
+        "a connection spills into a directory of its own under the root, got {}",
+        spill.display()
+    );
+    assert!(
+        spill
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with(&format!("{}-", std::process::id()))),
+        "the directory is named for the process that owns it: {}",
+        spill.display()
     );
     assert_eq!(read_text("memory_limit"), "512.0 MiB");
     assert_eq!(
         read_text("max_temp_directory_size"),
         "256.0 MiB",
         "the spill cap must be ours, not DuckDB's filesystem-derived default"
+    );
+}
+
+#[test]
+fn every_connection_spills_into_a_directory_of_its_own_and_takes_it_when_dropped() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pool = pool_without_catalog(3, tmp.path().to_path_buf());
+    let spill_of = |conn: &Connection| -> PathBuf {
+        PathBuf::from(
+            conn.query_row("SELECT current_setting('temp_directory')", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .expect("read temp_directory"),
+        )
+    };
+
+    let held: Vec<_> = (0..3).map(|_| pool.checkout().expect("checkout")).collect();
+    let dirs: std::collections::BTreeSet<PathBuf> = held.iter().map(|c| spill_of(c)).collect();
+    assert_eq!(
+        dirs.len(),
+        3,
+        "three connections, three directories: {dirs:?}"
+    );
+    for dir in &dirs {
+        assert!(
+            dir.is_dir(),
+            "{} exists while its connection lives",
+            dir.display()
+        );
+    }
+
+    // A connection keeps its directory across a borrow: the reset re-applies the
+    // same one rather than minting another.
+    let first = spill_of(&held[0]);
+    drop(held);
+    // All three held at once, so each is a different connection.
+    let held_again: Vec<_> = (0..3)
+        .map(|_| pool.checkout().expect("checkout again"))
+        .collect();
+    let again: std::collections::BTreeSet<PathBuf> =
+        held_again.iter().map(|c| spill_of(c)).collect();
+    assert_eq!(again, dirs, "returned connections kept their directories");
+    assert!(again.contains(&first));
+    drop(held_again);
+
+    drop(pool);
+    for dir in &dirs {
+        assert!(
+            !dir.exists(),
+            "{} is removed with its connection",
+            dir.display()
+        );
+    }
+}
+
+/// The premise `Member` rests on, pinned so a DuckDB bump that changes it fails
+/// here: two databases spilling into directories of their own write files of the
+/// same names, so sharing one directory would have them write the same files.
+/// What sharing does instead — the crash — is measured, not tested, since a
+/// segfault takes the test binary with it.
+#[test]
+fn duckdb_names_its_spill_files_the_same_in_every_database() {
+    let tmp = tempfile::tempdir().unwrap();
+    let spilled_names = |dir: &std::path::Path| -> std::collections::BTreeSet<String> {
+        std::fs::create_dir_all(dir).unwrap();
+        let conn = Connection::open_in_memory().expect("open");
+        conn.execute_batch(&format!(
+            "SET temp_directory='{}'; SET memory_limit='32MiB'; SET threads=1;
+             SET preserve_insertion_order=false;
+             CREATE TABLE t AS SELECT hash(range) AS x, repeat('y', 64) AS pad
+                 FROM range(1500000);",
+            dir.display()
+        ))
+        .expect("set up a table larger than the limit");
+        // Hold the result open so the spill files are still on disk to list.
+        let mut stmt = conn
+            .prepare("SELECT x, pad FROM t ORDER BY x, pad")
+            .expect("prepare");
+        let mut rows = stmt.query([]).expect("a sort that spills");
+        rows.next().expect("first row");
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect()
+    };
+
+    let a = spilled_names(&tmp.path().join("a"));
+    let b = spilled_names(&tmp.path().join("b"));
+    assert!(
+        !a.is_empty(),
+        "the sort must spill for this to say anything"
+    );
+    assert!(
+        !a.is_disjoint(&b),
+        "DuckDB now names spill files uniquely per database ({a:?} vs {b:?}) — the \
+         per-connection directories in `Member` may no longer be needed"
     );
 }
 

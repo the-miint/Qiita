@@ -276,6 +276,7 @@ mod tests {
     #[serial]
     fn pool_settings_are_derived_when_unset() {
         let _env = pool_test_env();
+        // Set, so the assertion below shows the spill root does not follow it.
         std::env::set_var("HOME", tmp_abs("qiita-test-home"));
 
         let cfg = Settings::from_env().expect("from_env with no pool vars set");
@@ -298,8 +299,8 @@ mod tests {
         );
         assert_eq!(
             cfg.pool.temp_directory,
-            std::path::PathBuf::from(tmp_abs("qiita-test-home")).join("duckdb-spill"),
-            "spill lands under the per-instance HOME the unit sets"
+            std::path::PathBuf::from(tmp_abs("qiita-test-scratch")).join("duckdb-spill"),
+            "the spill root is on PATH_SCRATCH, not under HOME"
         );
         assert_eq!(cfg.pool.max_temp_directory_size, "4GiB");
         assert_eq!(
@@ -394,17 +395,19 @@ mod tests {
         );
     }
 
-    /// Nowhere to derive a spill directory from is a boot failure, not a silent
-    /// fallback onto whatever filesystem the process happens to start in.
+    /// The spill root needs nothing beyond PATH_SCRATCH, which boot already
+    /// requires (`config_rejects_missing_path_scratch`).
     #[test]
     #[serial]
-    fn config_rejects_having_nowhere_to_spill() {
+    fn the_spill_root_does_not_need_home() {
         let _env = pool_test_env();
+        let home = EnvSnapshot::capture(&["HOME"]);
         std::env::remove_var("HOME");
-        let err = Settings::from_env().unwrap_err();
-        assert!(
-            err.contains("DUCKDB_TEMP_DIRECTORY") && err.contains("HOME"),
-            "unexpected error: {err}"
+        let cfg = Settings::from_env().expect("from_env with HOME unset");
+        drop(home);
+        assert_eq!(
+            cfg.pool.temp_directory,
+            std::path::PathBuf::from(tmp_abs("qiita-test-scratch")).join("duckdb-spill")
         );
     }
 

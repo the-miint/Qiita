@@ -233,6 +233,7 @@ visible from every compute node (SLURM uses it as the job's
 |---|---|---|---|---|---|
 | `PATH_PERSISTENT` | `…/ducklake` | `qiita-data` | `qiita-data` | `0750` | DuckLake data path. DP-only. |
 | `PATH_SCRATCH` | `…/staging` | `qiita-data` | `qiita-pipeline` | `2770` | DoPut upload staging. Setgid forces `qiita-pipeline` group on inherited files. |
+| `PATH_SCRATCH` | `…/duckdb-spill` | `qiita-data` | `qiita-data` | `0700` | DuckDB spill root. Each pooled connection creates and removes a directory of its own under it. DP-only. |
 | `PATH_SCRATCH` | `…/ticket` | `qiita-orch` | `qiita-pipeline` | `2770` | Per-ticket workspace trees (`<work_ticket_idx>/<step>/attempt-N/`). `qiita-orch` writes per-step subdirs as owner; `qiita-api` (CP runner) and `qiita-job` (SLURM job outputs) write via the `qiita-pipeline` group. Setgid carries the group to inherited files. |
 | `PATH_DERIVED` | `…/images` | `qiita-orch` | `qiita-orch` | `0755` | Apptainer SIF tier (SLURM container steps). Created at the bcl-convert deploy, not here — see `DEPLOY_CHECKLIST.md`. |
 | `PATH_DERIVED` | `…/references` | `qiita-orch` | `qiita-pipeline` | `2770` | Host-reference index tier (rype `.ryxdi` + minimap2 `.mmi`, built by `host-reference-add`). The index build *and* its consumer (`host_filter`) both run as `qiita-job`, which `mkdir`s `{idx}/{rype,minimap2}/` at runtime — so the leaf must be group-writable by `qiita-job`, **not** owned `qiita-orch:qiita-orch` like `…/images` (whose SIFs `qiita-orch` builds). Setgid + `qiita-pipeline` group-write let `qiita-job` create the subdirs and read them back. The base root is `root:root 0755`, so a missing leaf fails the first `host-reference-add` build with Permission Denied at `mkdir`. Created at the first host-reference deploy. |
@@ -264,7 +265,7 @@ doesn't strand the reference:
 Verification:
 ```bash
 # [either]
-stat -c '%n  owner=%U  group=%G  mode=%a  device=%d' <persistent>/ducklake <scratch>/staging <scratch>/ticket
+stat -c '%n  owner=%U  group=%G  mode=%a  device=%d' <persistent>/ducklake <scratch>/staging <scratch>/duckdb-spill <scratch>/ticket
 ```
 
 Watch the **device numbers**: if `<persistent>/ducklake` and
@@ -783,19 +784,21 @@ Parquet files, and an env file.
 
 ### 8a. Create the Parquet data and staging directories
 
-The data plane derives `PATH_PERSISTENT/ducklake` (lake data) and
-`PATH_SCRATCH/staging` (DoPut upload staging), so create exactly those
-leaf dirs under the mount roots picked in §0.3. The mounts themselves stay
+The data plane derives `PATH_PERSISTENT/ducklake` (lake data),
+`PATH_SCRATCH/staging` (DoPut upload staging) and `PATH_SCRATCH/duckdb-spill`
+(DuckDB spill), so create exactly those leaf dirs under the mount roots picked
+in §0.3. The mounts themselves stay
 infra-owned.
 
 ```bash
 # [admin]
 sudo install -d -o qiita-data -g qiita-data -m 0750     <persistent>/ducklake
 sudo install -d -o qiita-data -g qiita-pipeline -m 2770 <scratch>/staging
+sudo install -d -o qiita-data -g qiita-data -m 0700     <scratch>/duckdb-spill
 ```
 
 Then `PATH_PERSISTENT=<persistent>` and `PATH_SCRATCH=<scratch>` in step 8b
-(the data plane appends `/ducklake` and `/staging` itself).
+(the data plane appends `/ducklake`, `/staging` and `/duckdb-spill` itself).
 
 The setgid bit on the staging dir (`2770`) is load-bearing: files
 written by `qiita-job` inherit the `qiita-pipeline` group regardless

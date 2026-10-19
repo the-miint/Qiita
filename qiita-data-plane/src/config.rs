@@ -126,10 +126,11 @@ const DEFAULT_MAX_TEMP_DIRECTORY_SIZE: &str = "4GiB";
 /// takes no connection, and this permit is not one.
 const DEFAULT_MAX_CONCURRENT_DOPUT: usize = 8;
 
-/// Leaf name of the derived spill directory, under the `HOME` the systemd unit
-/// sets per data-plane process (its `StateDirectory`, on local disk). Spill must
-/// not land on the shared scratch filesystem that every compute node mounts, and
-/// two processes must not share one directory.
+/// Leaf name of the derived spill root, under `PATH_SCRATCH`. Spill is high IO, so
+/// it belongs on the scratch filesystem rather than the unit's `HOME`. This is a
+/// root, not a spill directory: each pooled connection spills into its own
+/// directory under it (`pool::LakePool`), since DuckDB names its spill files the
+/// same in every database and two databases spilling into one directory crash.
 const DERIVED_TEMP_DIRECTORY_LEAF: &str = "duckdb-spill";
 
 impl Settings {
@@ -248,24 +249,7 @@ impl Settings {
                 }
                 path
             }
-            None => {
-                let home = std::env::var("HOME").map_err(|_| {
-                    concat!(
-                        "DUCKDB_TEMP_DIRECTORY is not set and neither is HOME, so there ",
-                        "is nowhere to derive a spill directory from — set ",
-                        "DUCKDB_TEMP_DIRECTORY to an absolute path on local disk",
-                    )
-                    .to_string()
-                })?;
-                let home = PathBuf::from(home);
-                if !home.is_absolute() {
-                    return Err(format!(
-                        "HOME must be absolute to derive DUCKDB_TEMP_DIRECTORY from it, got {}",
-                        home.display()
-                    ));
-                }
-                home.join(DERIVED_TEMP_DIRECTORY_LEAF)
-            }
+            None => path_scratch.join(DERIVED_TEMP_DIRECTORY_LEAF),
         };
 
         // Only `> 0` is checked, where DUCKLAKE_POOL_SIZE also fails boot when the
