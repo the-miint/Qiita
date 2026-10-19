@@ -62,8 +62,10 @@ impl PoolSettings {
     /// Checked by every constructor, over everything in these settings that
     /// comes from the environment: the size, which bounds what the pool can
     /// serve, and the three values that reach DuckDB inside quoted SQL literals
-    /// in `apply_settings` — the same way the connection string and data path do
-    /// in `ducklake::connect_ducklake`. What a valid value looks like is DuckDB's
+    /// — two in `apply_settings`, and the spill root as the start of each
+    /// member's path in `settle`, which `new_spill_directory` checks whole — the
+    /// same way the connection string and data path do in
+    /// `ducklake::connect_ducklake`. What a valid value looks like is DuckDB's
     /// business, and `ducklake::validate_sql_literal` says what happens to one it
     /// rejects.
     fn validate(&self) -> Result<(), String> {
@@ -281,7 +283,8 @@ impl LakePool {
     ///
     /// Two obligations follow. A handler that `SET`s anything not listed here
     /// leaks it to the next borrower, so a new `SET` in a request path belongs in
-    /// this list. And this is the only place limits are applied, so a
+    /// this list — except `temp_directory`, which cannot be re-applied (see
+    /// `settle`), so no handler may set it. And this is the only place limits are applied, so a
     /// `Connection` built outside the pool — the boot connection in `main`, a
     /// test's own — runs at DuckDB's defaults.
     fn apply_settings(&self, member: &Member) -> Result<(), duckdb::Error> {
@@ -468,13 +471,19 @@ fn sweep_abandoned_spill_directories(root: &Path, host: &str) -> Result<Vec<Path
         if !entry.file_type().is_ok_and(|t| t.is_dir()) {
             continue;
         }
-        std::fs::remove_dir_all(&path).map_err(|e| {
-            format!(
-                "cannot remove the spill directory {} left by pid {pid}: {e}",
-                path.display()
-            )
-        })?;
-        removed.push(path);
+        // NotFound is another instance on this host booting at the same moment
+        // and removing it first (measured: `remove_dir_all` on a listed path
+        // removed since returns NotFound). Any other failure stops boot.
+        match std::fs::remove_dir_all(&path) {
+            Ok(()) => removed.push(path),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(format!(
+                    "cannot remove the spill directory {} left by pid {pid}: {e}",
+                    path.display()
+                ));
+            }
+        }
     }
     Ok(removed)
 }

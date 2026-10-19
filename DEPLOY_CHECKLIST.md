@@ -21,8 +21,8 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
   Left unset the data plane starts on its own
   values: `memory_limit` derived from the memory it finds free, `threads` from the CPU
   allowance, the spill root `PATH_SCRATCH/duckdb-spill` (which bucket 2 creates), and fixed defaults for the spill cap
-  and for the two counts (pool size and concurrent uploads, 8 each). Boot fails in two cases:
-  if the pool size leaves under 512 MiB per connection — measured as the point below which
+  and for the two counts (pool size and concurrent uploads, 8 each). Boot fails, among other
+  cases, if the pool size leaves under 512 MiB per connection — measured as the point below which
   the export DoAction cannot run — naming both ways out, and if the spill root cannot be
   created or written. Setting `DUCKDB_MEMORY_LIMIT` explicitly is what stops
   boot depending on how much was free at the moment of a restart. Set the pool size
