@@ -46,6 +46,7 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
 ### 3. Migrations
 
 - `[operator]` (#685) `make migrate` applies `20261009000000_work_ticket_follow_on.sql` (three nullable columns on `qiita.work_ticket`, two CHECKs, one partial index; no backfill).
+- `[operator]` (#711) `make migrate` applies `20261014000000_legacy_band_column_comments.sql` (rewords the comments on `study.idx`, `prep_sample.idx` and `sequenced_pool.idx`; no row, sequence or constraint change).
 
 ### 4. Deploy
 
@@ -88,6 +89,7 @@ _None yet._
 
 - (#685) Work-ticket responses (`GET /work-ticket/{idx}` and the ticket lists) gain `on_success`, `follow_on_work_ticket_idx` and `follow_on_error` (all null for a ticket with no follow-on); clients validating that shape strictly must accept them.
 - (#707) New optional `FOLLOW_ON_SWEEP_INTERVAL_SECONDS` (default 60) tunes how often the control plane retries a transiently-failed follow-on; no action required.
+- (#711) `POST /study` now answers 422 to a body key it does not define, where it used to drop the key and return 201; a client sending extra keys must stop. It also takes an optional `study_idx` (system_admin only).
 
 ## Deployed history
 

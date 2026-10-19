@@ -63,6 +63,7 @@ Everything qiita currently carries **because of** a miint behaviour: each row is
 | [duckdb-miint#188](https://github.com/the-miint/duckdb-miint/issues/188) | The QC scalars are documented as `filter_read(seq, qual [, min_length, …])`, which reads as independently-optional args. Only all-or-nothing overloads exist (2-arg or 8-arg; `trim_adapters_pe` 4 or 11) and all args are positional. | The `qc` job restates every default to change one threshold — see the [QC section](#qc--fastp-algorithm-port-docsqcmd-upstream). This is what made an earlier revision of this file claim upstream "shows named optionals"; it does not. | No Qiita issue — a docs-only fix upstream removes the confusion; intermediate overloads would remove the restating. |
 | [duckdb-miint#194](https://github.com/the-miint/duckdb-miint/issues/194) | `align_mafft` shells to MAFFT, whose `create_tmpdir()` honors `$TMPDIR` but is not called on the FFTNS2 / PARTTREE strategies (`MAFFT_STRATEGY_AUTO` picks by input size); those litter `order` / `pre` / `trace` into the current working directory. Data-dependent, so it is invisible on small inputs. | `miint.mafft_scratch_cwd` chdirs into a per-job `<workspace>/.mafft` for the duration of the call and removes it on exit; `amplicon_deblur` wraps its miint body in it. | **Unfiled removal.** #194 is open (the CWD half was routed to `the-miint/mafft`, whose issues are disabled, so #194 is the citable number). Needs a Qiita issue for the helper's removal. |
 | [duckdb-miint#289](https://github.com/the-miint/duckdb-miint/issues/289) | `read_ena` / the Portal `/search` endpoint it queries only ever returns public records, and exposes no status for a record that has stopped being public. | `ena_import.availability.EnaAvailabilityClient` calls the ENA Browser API's `summary/{accession}` directly over `httpx`, batching runs and re-asking a batch that returns 500 one run at a time, so a re-import can tell a held run's current status apart from "still public". | [the-miint/Qiita#638](https://github.com/the-miint/Qiita/issues/638) |
+| [duckdb-miint#279](https://github.com/the-miint/duckdb-miint/issues/279) | A `read_ena_sequences` scan of one run that fails to open or breaks mid-stream returns zero or partial rows and records a skip warning in `miint_warnings()` instead of raising. duckdb-miint#312 makes it raise. | `ingest_ena_reads` reads `miint_warnings()` after each run, on a fresh connection, and fails the run on a skip warning (`_skip_warnings`). | **Unfiled.** Exit criterion is the staged miint including duckdb-miint#312; the skip-warning check can then go, and the 0-row check stays. Needs a Qiita issue for the removal. |
 
 ## Install / version probe
 
@@ -81,6 +82,8 @@ It is a **runtime, per-query log of non-fatal warnings**, and it matters because
 SELECT * FROM read_ena_sequences(...);
 SELECT * FROM miint_warnings();  -- e.g. "run 'ERR1234567' failed on retry (...), skipping"
 ```
+
+Which scans skip and which raise depends on the miint build ([insdc_ena](https://the-miint.github.io/duckdb-miint/insdc_ena/)): from duckdb-miint#312 on, a scan of one run, which is what `ingest_ena_reads` sends, raises instead of skipping.
 
 **Check it after any ENA ingest.** A partial result that reports success is otherwise indistinguishable from a complete one.
 

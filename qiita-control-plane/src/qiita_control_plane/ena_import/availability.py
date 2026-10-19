@@ -9,10 +9,9 @@ the source that answers which, reporting a numeric `status` regardless of
 availability.
 
 Runs batch in one comma-separated request (`summary/SRR096342,ERR000130` returns
-both summaries), but one accession ENA can't serve makes the whole batch HTTP 500,
-and mixing record types (`summary/PRJEB1,SRR096342`) returns 400 (probed live,
-2026-10-05). So `check_runs` batches runs and re-asks a batch that 500s one run
-at a time.
+both summaries) and leaves out a nonexistent run (probed live, 2026-10-19).
+Mixing record types (`summary/PRJEB1,SRR096342`) returns 400 (2026-10-05). A
+batch that 500s (per ENA's docs, a withdrawn run) is re-asked one run at a time.
 
 Tracked workaround: miint exposes no equivalent read (duckdb-miint#289); see
 `docs/duckdb-miint.md`'s Open upstream gaps for the removal condition.
@@ -67,9 +66,9 @@ class EnaAvailabilityClient:
         `statusDescription`.
 
         Raises `httpx.HTTPStatusError` when a run still returns non-2xx on its
-        own. A 500 covers nonexistent, withdrawn and a transient fault alike, so
-        it is not evidence the run is unavailable and writes no flag. Also
-        raises `UnknownEnaBrowserStatusError` for an unrecognized status, and
+        own. A 500 covers withdrawn and a transient fault alike, so it is not
+        evidence the run is unavailable and writes no flag. Also raises
+        `UnknownEnaBrowserStatusError` for an unrecognized status, and
         `ValueError` when a response omits a requested run.
         """
         statuses: dict[str, str | None] = {}
@@ -92,8 +91,7 @@ class EnaAvailabilityClient:
 
     async def _get(self, run_accessions: list[str], *, retry_on_500: bool) -> httpx.Response:
         """GET the summaries, retrying once on a transport error or a 5xx. A
-        batch's 500 is returned unretried: it usually means one run ENA can't
-        serve, which the caller resolves run by run."""
+        batch's 500 is returned unretried: the caller resolves it run by run."""
         path = f"/summary/{','.join(run_accessions)}"
         try:
             response = await self._http.get(path)

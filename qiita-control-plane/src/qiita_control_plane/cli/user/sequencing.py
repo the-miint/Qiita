@@ -183,8 +183,10 @@ def _handle_run_preflight_update_lane(
             reason=args.reason,
         )
     except ValidationError as exc:
-        msgs = "; ".join(f"{'.'.join(str(p) for p in e['loc'])}: {e['msg']}" for e in exc.errors())
-        parser.error(f"invalid {SequencedPoolPreflightUpdateLaneRequest.__name__}: {msgs}")
+        parser.error(
+            f"invalid {SequencedPoolPreflightUpdateLaneRequest.__name__}:"
+            f" {_common.validation_messages(exc)}"
+        )
     body = req.model_dump(mode="json")
     return _common.run_http_subcommand(
         lambda t: _post_preflight_update_lane(

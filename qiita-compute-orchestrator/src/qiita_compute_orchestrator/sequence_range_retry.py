@@ -1,16 +1,14 @@
 """Bounded retry + failure classification for the CP sequence-range callback.
 
-Every native job that mints a per-prep_sample sequence range — `ingest_reads` (the
-bcl-convert read-storage step, which fans over every pool sample), `fastq_to_parquet`
-and `bam_to_parquet` — calls back to the control plane's `/sequence-range` routes
-over HTTP. A *transient* blip on ONE of a pool's many per-sample callbacks (an
-HTTP 5xx from a proxy / a CP restart, or a pure transport error like a
-connection reset / read timeout) must not discard the whole multi-hour ingest:
-the mint is idempotent on retry (a minted-but-unwritten range is read back and
-reused), so re-driving the call is safe.
+Every native job that mints a per-prep_sample sequence range calls back to the
+control plane's `/sequence-range` routes over HTTP. A *transient* blip on ONE of a
+pool's many per-sample callbacks (an HTTP 5xx from a proxy / a CP restart, or a pure
+transport error like a connection reset / read timeout) must not discard the whole
+multi-hour ingest: the mint is idempotent on retry (a minted-but-unwritten range is
+read back and reused), so re-driving the call is safe.
 
-This module is the single home for that retry + classification, shared by all three
-so they can't diverge:
+This module is the single home for that retry + classification, shared by every
+such job so they can't diverge:
 
   - `cp_call_with_retry` retries a transient call a few times in-job, so a blip
     self-heals without ever failing the step.
@@ -56,8 +54,9 @@ from .sequence_range import (
 )
 
 # Attempts and exponential backoff for a transient CP sequence-range callback.
-# 401/403 and any non-5xx 4xx are NOT retried (a token/scope misconfig or a
-# missing prep_sample can't self-heal). Tests zero the backoff to avoid sleeps.
+# 401/403 and any other 4xx that `is_transient_http_status` rejects are not
+# retried (a token/scope misconfig or a missing prep_sample can't self-heal).
+# Tests zero the backoff to avoid sleeps.
 CP_RETRY_MAX_ATTEMPTS = 3
 CP_RETRY_BACKOFF_BASE_S = 0.5
 
@@ -70,21 +69,21 @@ CP_RETRY_BACKOFF_BASE_S = 0.5
 _REUSABLE_MINTER_STATES: frozenset[str] = frozenset(NON_TERMINAL_WORK_TICKET_STATES)
 
 
-def _is_transient_status(status: int) -> bool:
-    """True for an HTTP status from the CP callback that a retry can self-heal:
-    any 5xx (proxy/connection blip, CP restart, or a CP statement-timeout
-    surfacing as a 500), plus 408 (request timeout) and 429 (rate limit). 401/403
-    and any other 4xx are permanent client-side conditions → False."""
+def is_transient_http_status(status: int) -> bool:
+    """True for an HTTP status a retry can self-heal: any 5xx (a proxy or
+    connection blip, a server restart, or a statement timeout surfacing as a
+    500), plus 408 (request timeout) and 429 (rate limit). 401/403 and any other
+    4xx are permanent client-side conditions → False."""
     return status >= 500 or status in (408, 429)
 
 
 def is_transient_cp_error(exc: httpx.HTTPStatusError | httpx.TransportError) -> bool:
     """True for a CP sequence-range error a retry can self-heal: a transient HTTP
-    status (5xx / 408 / 429, per `_is_transient_status`) or a pure transport
+    status (5xx / 408 / 429, per `is_transient_http_status`) or a pure transport
     error (connect reset / read timeout — these raise before `raise_for_status`).
     A 401/403 or any other 4xx is a permanent client-side condition → False."""
     if isinstance(exc, httpx.HTTPStatusError):
-        return _is_transient_status(exc.response.status_code)
+        return is_transient_http_status(exc.response.status_code)
     return isinstance(exc, httpx.TransportError)
 
 
@@ -139,7 +138,7 @@ def cp_call_failure(
                 f"HTTP {status} — compute SA PAT misconfigured "
                 "(see docs/runbooks/compute-service-account-provisioning.md)"
             )
-        elif _is_transient_status(status):
+        elif is_transient_http_status(status):
             kind = FailureKind.CONTROL_PLANE_UNREACHABLE
             detail = f"HTTP {status}"
         else:

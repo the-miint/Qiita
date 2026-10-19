@@ -15,6 +15,12 @@ _STUDY_ALIAS_MAX = 255
 _STUDY_FUNDING_MAX = 500
 _STUDY_ACCESSION_MAX = 50
 
+# study.idx, prep_sample.idx and sequenced_pool.idx below this value are
+# reserved for rows carried over from the legacy Qiita installation, which keep
+# their original id; each identity mints from here up. It must equal the
+# start the column comments on those idx columns record.
+LEGACY_IDX_RESERVED_CEILING = 25_000
+
 
 class StudyCreate(BaseModel):
     """Body for POST /api/v1/study — create a study.
@@ -23,9 +29,19 @@ class StudyCreate(BaseModel):
     creates-own-study). When supplied as a different principal, the route
     enforces wet_lab_admin or higher (the lab-tech-on-behalf rule). The
     study row's `created_by_idx` is always the caller; only `owner_idx` is
-    transferred. `default_tier=None` lets the DB default ('member') apply.
+    transferred. `default_tier=None` gives the study the 'member' tier.
+
+    `study_idx` places the study at an explicit idx in the reserved band
+    below LEGACY_IDX_RESERVED_CEILING, for a study carried over from legacy
+    Qiita under its original id; who may send it is the route's decision.
+    `study_idx=None` mints one from the identity.
     """
 
+    # An unknown key is refused rather than dropped, so a 201 never answers a
+    # body the server did not read in full.
+    model_config = ConfigDict(extra="forbid")
+
+    study_idx: Annotated[int, Field(gt=0, lt=LEGACY_IDX_RESERVED_CEILING)] | None = None
     title: str = Field(min_length=1, max_length=_STUDY_TITLE_MAX)
     owner_idx: Annotated[int, Field(gt=0)] | None = None
     principal_investigator_idx: Annotated[int, Field(gt=0)] | None = None
@@ -159,7 +175,8 @@ class StudySummary(BaseModel):
 
 
 class StudySummaryListResponse(BaseModel):
-    """GET /api/v1/study — the studies the caller may read, newest first.
+    """GET /api/v1/study — the studies the caller may read, highest study_idx
+    first.
 
     `next_after_study_idx` is the cursor for the next page (pass it back as
     `after_study_idx`), or None on the last page. A page can hold fewer than

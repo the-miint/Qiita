@@ -1,9 +1,10 @@
 """Study create / read / patch routes.
 
 POST creates a study and gates on caller scope plus the lab-tech-on-behalf
-rule; GET /study lists the studies the caller may read, and GET /study/{idx}
-reads one, both deciding through `auth.guards.study_record_view` (the full
-record, its summary, or nothing); PATCH edits the editable post-create columns and gates on caller
+rule, and on system_admin for an explicit study_idx; GET /study lists the
+studies the caller may read, and GET /study/{idx} reads one, both deciding
+through `auth.guards.study_record_view` (the full record, its summary, or
+nothing); PATCH edits the editable post-create columns and gates on caller
 scope plus per-study Tier.ADMIN (wet_lab_admin bypass). POST, GET-by-idx and
 PATCH share the row → StudyResponse mapping via a helper in this module.
 DELETE is deferred.
@@ -75,6 +76,9 @@ router = APIRouter(prefix=PATH_STUDY_PREFIX, tags=["study"])
 _MSG_ON_BEHALF_REQUIRES_WET_LAB_ADMIN = (
     "creating studies on behalf of another user requires wet_lab_admin or higher"
 )
+_MSG_EXPLICIT_IDX_REQUIRES_SYSTEM_ADMIN = (
+    "creating a study at an explicit study_idx requires system_admin"
+)
 _MSG_OWNER_NOT_ELIGIBLE = "owner is not eligible to own studies"
 _MSG_BAD_PI_NOT_USER = "principal_investigator_idx must reference a user-kind principal"
 _MSG_BAD_OWNER_NOT_USER = "owner_idx must reference a user-kind principal"
@@ -84,6 +88,7 @@ _MSG_BAD_OWNER_NOT_USER = "owner_idx must reference a user-kind principal"
 _UNIQUE_VIOLATION_MESSAGES: dict[str, str] = {
     "study_ena_study_accession_unique": "ena_study_accession already in use",
     "study_bioproject_accession_unique": "bioproject_accession already in use",
+    "study_pkey": "study_idx already in use",
 }
 _GENERIC_UNIQUE_VIOLATION = "conflicts with an existing study"
 
@@ -150,7 +155,9 @@ async def create_study_route(
     caller (caller-creates-own-study); supplying a different owner requires
     wet_lab_admin or higher (lab-tech-on-behalf rule). The caller is always
     recorded as `created_by_idx`; only the owner is transferred when
-    on-behalf creation is in play.
+    on-behalf creation is in play. An explicit `body.study_idx` (the band
+    reserved for studies carried over from legacy Qiita) requires
+    system_admin; one already in use is a 409.
     """
     # Resolve the effective owner: caller's principal_idx when the body
     # leaves it null, otherwise the body value.
@@ -162,6 +169,9 @@ async def create_study_route(
         SystemRole.WET_LAB_ADMIN
     ):
         raise HTTPException(status_code=403, detail=_MSG_ON_BEHALF_REQUIRES_WET_LAB_ADMIN)
+
+    if body.study_idx is not None and not user.has_role_at_least(SystemRole.SYSTEM_ADMIN):
+        raise HTTPException(status_code=403, detail=_MSG_EXPLICIT_IDX_REQUIRES_SYSTEM_ADMIN)
 
     async with tx() as conn:
         # Owner eligibility pre-flight; collapses every ineligibility case to
@@ -189,6 +199,7 @@ async def create_study_route(
                 notes=body.notes,
                 extra_metadata=body.extra_metadata,
                 default_tier=body.default_tier,
+                idx=body.study_idx,
             )
         except asyncpg.UniqueViolationError as exc:
             raise_for_unique_violation(
@@ -240,7 +251,7 @@ async def list_studies(
     ] = None,
     limit: Annotated[int, Query(ge=1, le=_MAX_LIST_LIMIT)] = _DEFAULT_LIST_LIMIT,
 ) -> StudySummaryListResponse:
-    """The studies the caller may read, newest first: the same set
+    """The studies the caller may read, highest study_idx first: the same set
     GET /study/{idx} answers (owned, shared with them at any tier, or
     public-default; every study for wet_lab_admin+). Each row says which view
     of the record that answer is."""

@@ -55,11 +55,10 @@ async def test_check_run_suppressed_returns_description():
 
 
 async def test_check_run_http_500_raises():
-    """A held run's summary returns HTTP 500 (observed live for a nonexistent
-    accession; ENA's docs say released data can't be un-published, so for a run
-    imported while public this means withdrawn or a transient fault -- either
-    way, this fails the item the same as any other non-200 rather than writing
-    a flag)."""
+    """A held run's summary returns HTTP 500 (ENA's docs say released data can't
+    be un-published, so for a run imported while public this means withdrawn or a
+    transient fault -- either way, this fails the item the same as any other
+    non-200 rather than writing a flag)."""
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(500, content=b"{}")
@@ -170,8 +169,7 @@ async def test_check_runs_splits_a_long_list_into_batches(monkeypatch):
 
 
 async def test_check_runs_falls_back_to_single_runs_when_a_batch_returns_500():
-    """One accession ENA can't serve makes the whole batch 500 (probed
-    2026-10-05), so the batch is re-asked one run at a time."""
+    """A batch that 500s is re-asked one run at a time."""
 
     def handler(request: httpx.Request) -> httpx.Response:
         accessions = request.url.path.rsplit("/", 1)[1].split(",")

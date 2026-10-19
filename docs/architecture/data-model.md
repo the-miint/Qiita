@@ -23,16 +23,18 @@ Raw-read identifiers extend the prep_sample hierarchy:
 
 - **`sequence_idx`** — globally-unique bigint identifying a single raw read stored in the data plane. Minted by the control plane in contiguous ranges of caller-specified size via `POST /api/v1/sequence-range`, recorded in `qiita.sequence_range` (1:1 with `prep_sample_idx`, kind-pinned to `processing_kind='sequenced'` via composite FK), and never recycled — a deleted range's `sequence_idx` values stay consumed in `qiita.sequence_idx_seq`. The endpoint is service-account-only (`sequence_range:mint` scope); the compute orchestrator obtains a range before writing raw-read Parquet to the data plane.
 
-## Legacy import reserved range — study and prep_sample
+## Legacy import reserved range — study, prep_sample and sequenced_pool
 
-The live deployment partitions `study.idx` and `prep_sample.idx` into two non-overlapping bands:
+The live deployment partitions `study.idx`, `prep_sample.idx` and `sequenced_pool.idx` into two non-overlapping bands:
 
-- **`[1, 25000)`** — reserved for the one-time legacy import from the previous Qiita installation. Historic rows preserve their original integer identifiers and are inserted with `OVERRIDING SYSTEM VALUE` (both columns are `GENERATED ALWAYS AS IDENTITY`).
+- **`[1, 25000)`** — reserved for rows carried over from the previous Qiita installation, which keep their original integer identifiers and are inserted with `OVERRIDING SYSTEM VALUE` (all three columns are `GENERATED ALWAYS AS IDENTITY`).
 - **`[25000, ...)`** — every new row minted on this deployment.
 
-A schema migration fast-forwards the implicit identity sequences for `qiita.study.idx` and `qiita.prep_sample.idx` past the reserved block; existing rows in `[1, 25000)` are untouched. The threshold itself is pinned on each column in the Postgres catalog via `COMMENT ON COLUMN`, so `\d+ qiita.study` and `\d+ qiita.prep_sample` surface the invariant without consulting the migration history. The bump is one-way — the underlying sequence operation only advances and cannot rewind without risking PK collisions — so the migration's down step is a deliberate no-op.
+Schema migrations fast-forward the implicit identity sequences for `qiita.study.idx`, `qiita.prep_sample.idx` and `qiita.sequenced_pool.idx` past the reserved block; existing rows in `[1, 25000)` are untouched. The threshold itself is pinned on each column in the Postgres catalog via `COMMENT ON COLUMN`, so `\d+ qiita.study`, `\d+ qiita.prep_sample` and `\d+ qiita.sequenced_pool` surface the invariant without consulting the migration history. The bump is one-way: the down steps of the migrations that made it drop their column comments and leave the sequences where they are, because rewinding a sequence would reissue ids already minted.
 
-The reservation is intentionally scoped to `study` and `prep_sample` only — those are the identifiers legacy callers will continue to quote. Adjacent rows (`biosample`, `sequenced_sample`, `sequencing_run`, `prep_protocol`, the per-row `*_metadata` / `*_field_exception` tables, references) receive freshly-minted identifiers during the legacy import rather than preserving their originals, so their identity sequences are left on the default start.
+A study enters the reserved band through `POST /api/v1/study` with an explicit `study_idx` (`qiita study create --study-idx`), which only a system_admin may send. The ceiling the API checks against is `LEGACY_IDX_RESERVED_CEILING` in `qiita_common.models.study`. No path writes an explicit `prep_sample.idx` or `sequenced_pool.idx`.
+
+The reservation is intentionally scoped to `study` and `prep_sample` — those are the identifiers legacy callers will continue to quote — and `sequenced_pool`, the closest analog of a legacy prep, so legacy preps can migrate into pools under their ids. Adjacent rows (`biosample`, `sequenced_sample`, `sequencing_run`, `prep_protocol`, the per-row `*_metadata` / `*_field_exception` tables, references) receive freshly-minted identifiers during the legacy import rather than preserving their originals, so their identity sequences are left on the default start.
 
 ## Processing Methods
 

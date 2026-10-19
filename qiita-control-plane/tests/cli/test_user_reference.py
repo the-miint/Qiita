@@ -1468,3 +1468,45 @@ def test_reference_load_exit_code_is_zero_only_for_completed(
         ]
     )
     assert rc == expected_rc
+
+
+def test_reference_load_reports_an_unreachable_control_plane_on_one_line(
+    monkeypatch, tmp_path, capsys
+):
+    """A connection failure (no HTTP response at all) is one stderr line naming
+    the URL it tried, and exit 1, not a traceback."""
+    from qiita_control_plane.cli import _common
+    from qiita_control_plane.cli import reference_load as _ref
+    from qiita_control_plane.cli import user as _user
+
+    monkeypatch.setattr(_common, "read_token", lambda: "test-pat")
+
+    async def unreachable(**kwargs):
+        request = httpx.Request("POST", f"http://localhost:9999{URL_REFERENCE_PREFIX}")
+        raise httpx.ConnectError("Connection refused", request=request)
+
+    monkeypatch.setattr(_ref, "do_reference_load", unreachable)
+    fasta = tmp_path / "x.fasta"
+    fasta.write_text(">a\nACGT\n")
+
+    rc = _user.main(
+        [
+            "--base-url",
+            "http://localhost:9999",
+            "reference",
+            "load",
+            "--name",
+            "r",
+            "--version",
+            "1.0",
+            "--fasta",
+            str(fasta),
+            "--data-plane-url",
+            "grpc://localhost:0",
+            "--no-watch",
+        ]
+    )
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert err.count("\n") == 1
+    assert "could not reach http://localhost:9999" in err

@@ -136,8 +136,8 @@ same study**
 checks it. Every held run the fresh Portal response no longer names as public is
 looked up against ENA's Browser API (`summary/{accession}`), which reports every
 run's status regardless of availability. Runs are asked for in batches; a batch
-that returns HTTP 500 is re-asked one run at a time, because one run ENA can't
-serve fails the whole batch. Each request is retried once on a transport error or
+that returns HTTP 500 is re-asked one run at a time, so one run ENA can't serve
+doesn't fail the rest. Each request is retried once on a transport error or
 a 5xx.
 
 - **Public** (or the run reappears as public in the Portal's fresh response)
@@ -146,11 +146,10 @@ a 5xx.
   `sequenced_sample.ena_status`, and a `flagged_unavailable` outcome on the batch
   item naming it. The outcome is recorded as soon as the flag commits, so it stays
   on the item even if a later step fails it.
-- **A run that still errors on its own — including HTTP 500** (observed live for
-  both a nonexistent accession and, per ENA's docs, a withdrawn run; the two are
-  indistinguishable from this endpoint alone) **— fails the whole item and writes
-  no flags**: a 500 is not evidence a run is unavailable, and an availability
-  check never leaves a run half-updated.
+- **A run that still errors on its own — HTTP 500 (per ENA's docs, a withdrawn
+  run), or a response that leaves it out (observed live for a nonexistent
+  accession) — fails the whole item and writes no flags**: neither is evidence a
+  run is unavailable, and an availability check never leaves a run half-updated.
 - **A status this codebase does not recognize** fails the item the same way.
 
 **A study blocked by one run.** A held run that keeps returning 500 fails every
@@ -350,16 +349,20 @@ see miint's [`insdc_ena` docs](https://the-miint.github.io/duckdb-miint/insdc_en
 and a mismatch fails the step. miint cannot tell a transfer truncated on a gzip member
 boundary from bytes that really disagree with the digest, so the step is retried up to
 the ticket's retry limit; when the retries run out the ticket ends FAILED with
-failure_type `permanent` and both digests in the reason. A run miint skipped (a failed
-open or a mid-download failure, including a corrupt body that surfaces mid-stream) is
-retried the same way, so a permanent open failure such as a 404 costs the full retry
-limit before it fails.
+failure_type `permanent` and both digests in the reason. A run that broke mid-download
+(including a corrupt body that surfaces mid-stream) and an HTTP 5xx, 408 or 429 from ENA
+or its file server are retried the same way, as is ENA's "Not all results may have been
+written" answer with a miint build that includes duckdb-miint#310. A run whose file
+cannot be opened depends on the miint build: before duckdb-miint#312 miint skips it with
+a warning, which is retried like the rest, so a 404 costs the full retry limit; from
+duckdb-miint#312 on, a 404 fails at once.
 
 Where verification does not apply (an SFF run, a file that is not gzip-compressed, no
 `fastq_md5` from ENA) the run still registers. A run that comes back empty with no
 warning fails permanently.
 
-When the retries run out the ticket is FAILED `permanent` and emailed with its reason.
+When the retries run out, or at once for a failure a retry cannot clear (a 404 from
+duckdb-miint#312 on), the ticket is FAILED `permanent` and emailed with its reason.
 Read the reason first. A dropped transfer or an ENA outage: redrive the ticket
 (`POST /work-ticket/{idx}/run`) once ENA is healthy; runs already stored are skipped, and
 a redrive resets `retry_count`, so it buys the full budget again. A bad digest or a 404:

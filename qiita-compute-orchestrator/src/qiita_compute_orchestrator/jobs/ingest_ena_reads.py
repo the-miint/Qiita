@@ -18,13 +18,19 @@ Gotchas specific to the ENA source:
 - One FRESH DuckDB connection PER RUN. `miint_warnings()` accumulates across
   queries in a session (duckdb-miint/docs/utilities.md), so a reused connection
   would leak one run's warnings into the next run's fail-loud check.
-- Fail loud on a silent skip. `read_ena_sequences` does not raise on a run that
-  fails to open or fails mid-stream — it retries once, then skips/truncates and
-  records a `miint_warnings()` entry, returning fewer/zero rows. So a "skip"
-  warning (`_skip_warnings`) fails the run retriably and a clean 0-row result
-  fails it BAD_INPUT (an ENA run never legitimately has zero reads, unlike a
-  demux well). A raised
-  `duckdb.Error` is classified separately (`_classify_ena_fetch_error`).
+- Fail loud on a silent skip. How `read_ena_sequences` reports a run it could
+  not read depends on the miint build
+  (https://the-miint.github.io/duckdb-miint/insdc_ena/):
+  - before duckdb-miint#312 it does not raise on a run that fails to open or
+    fails mid-stream: it skips the run, or the rest of it, records a
+    `miint_warnings()` entry, and returns fewer/zero rows. A "skip" warning
+    (`_skip_warnings`) fails the run retriably, so a 404 on open is retried too;
+  - from duckdb-miint#312 on, a scan of one run (all this job sends) raises
+    instead: a failed open with the server's own error, a mid-stream failure as
+    "every run failed". `_classify_ena_fetch_error` classifies a raised
+    `duckdb.Error`, and a 404 is permanent there.
+  On either build a clean 0-row result fails the run BAD_INPUT: an ENA run never
+  legitimately has zero reads, unlike a demux well.
 """
 
 from __future__ import annotations
@@ -47,7 +53,7 @@ from ..miint import (
     open_miint_conn,
 )
 from ..read_staging import hardlink, per_slot_caps, read_roster_parquet, write_sorted_reads
-from ..sequence_range_retry import mint_or_reuse_sequence_range
+from ..sequence_range_retry import is_transient_http_status, mint_or_reuse_sequence_range
 
 # Hard-coded (not derived from the YAML) so a rename diverging from the
 # `- step: ingest_ena_reads` entry fails loudly at BackendFailure attribution.
@@ -79,8 +85,7 @@ _MID_STREAM_WARNING_MARKER = "mid-stream"
 TRANSIENT_FETCH_ERROR_TEXT = "transient fetch error"
 
 # Substrings marking a raised duckdb.Error as transport/network-shaped (vs.
-# format/parse) — see `_classify_ena_fetch_error`. A non-match is permanent
-# unless it is an md5 mismatch, which miint cannot tell from a truncation.
+# format/parse) — see `_classify_ena_fetch_error`.
 _TRANSIENT_ERROR_MARKERS = (
     "connection",
     "timed out",
@@ -92,6 +97,17 @@ _TRANSIENT_ERROR_MARKERS = (
     "temporarily",
     "curl",
 )
+# ENA's own words when it answers a search with HTTP 200 but stops writing the
+# results; with duckdb-miint#310, miint quotes them when the answer survives its
+# retries.
+_ENA_INCOMPLETE_ANSWER_MARKER = "not all results may have been written"
+# miint's error for a scan of one run that failed mid-stream (the module
+# docstring says which builds raise it).
+_EVERY_RUN_FAILED_MARKER = "every run failed"
+# The reason for a run whose data is partial, given both when miint skips the run
+# (`execute`) and when it raises "every run failed" (`_classify_ena_fetch_error`).
+_PARTIAL_RUN_TEXT = "its data is missing or partial; refusing to register an incomplete read set"
+_MID_STREAM_RERUN_HINT = "miint's docs say a re-run recovers a mid-stream failure"
 
 
 class Inputs(BaseModel):
@@ -141,9 +157,9 @@ def _stage_run_reads(
     not interpret them — the caller applies `_skip_warnings`.
 
     Raises `duckdb.Error` on a raised transport/format failure (caller
-    classifies via `_classify_ena_fetch_error`). Does NOT raise on an internal
-    skip/partial-download — that returns normally with a warning, which is why
-    the caller must inspect `warning_messages`."""
+    classifies via `_classify_ena_fetch_error`). On a build that skips instead
+    of raising (module docstring), a skip/partial-download returns normally with
+    a warning, which is why the caller must inspect `warning_messages`."""
     intermediate = validate_parquet_path(intermediate_path)
     with open_miint_conn() as conn:
         apply_duckdb_settings(conn, duckdb_tmp, memory_gb=memory_gb, threads=threads)
@@ -162,12 +178,34 @@ def _stage_run_reads(
 def _classify_ena_fetch_error(
     run_accession: str, exc: duckdb.Error, *, step_name: str
 ) -> BackendFailure:
-    """Classify a raised `duckdb.Error` from `_stage_run_reads` as retriable
-    (transport/network-shaped or md5 mismatch) or permanent (format/parse, or
-    anything not confidently network-shaped). The exception text is all the
-    caller has: a raise means miint's open-retry-then-skip did not run."""
+    """Classify a raised `duckdb.Error` from `_stage_run_reads` as retriable or
+    permanent. Retriable: a transport/network-shaped error; ENA or its file server
+    answering with a status `is_transient_http_status` accepts, or ENA saying it
+    did not write all the results; a run that failed mid-stream; an md5 mismatch.
+    Permanent: anything else, such as a format/parse error or a 404."""
     text = str(exc).lower()
-    if any(marker in text for marker in _TRANSIENT_ERROR_MARKERS):
+    # A run that broke mid-download: its data is partial, which is not the same
+    # as ENA being unreachable, so the reason does not carry
+    # TRANSIENT_FETCH_ERROR_TEXT. Checked first, because miint's message ends
+    # with the transfer's own error, which may carry a network word.
+    if _EVERY_RUN_FAILED_MARKER in text:
+        return BackendFailure(
+            kind=FailureKind.EXTERNAL_FETCH_TRANSIENT,
+            stage=WorkTicketFailureStage.STEP_RUN,
+            step_name=step_name,
+            reason=(
+                f"ENA run {run_accession} broke mid-download -- {_PARTIAL_RUN_TEXT}; "
+                f"{_MID_STREAM_RERUN_HINT} ({type(exc).__name__}): {exc}"
+            ),
+        )
+    # httpfs and miint's ENA client raise duckdb.HTTPException with the status.
+    status = getattr(exc, "status_code", None)
+    unavailable = (
+        any(marker in text for marker in _TRANSIENT_ERROR_MARKERS)
+        or (status is not None and is_transient_http_status(status))
+        or _ENA_INCOMPLETE_ANSWER_MARKER in text
+    )
+    if unavailable:
         return BackendFailure(
             kind=FailureKind.EXTERNAL_FETCH_TRANSIENT,
             stage=WorkTicketFailureStage.STEP_RUN,
@@ -272,6 +310,10 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                         run_accession, exc, step_name=YAML_STEP_NAME
                     ) from exc
 
+                # Only a build that skips instead of raising reports a failed run
+                # here (module docstring). This branch retries a 404 on open;
+                # `_classify_ena_fetch_error` makes it permanent on a build that
+                # raises.
                 skip_msgs = _skip_warnings(warnings)
                 if skip_msgs:
                     mid_stream = any(_MID_STREAM_WARNING_MARKER in m.lower() for m in skip_msgs)
@@ -281,13 +323,8 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                         step_name=YAML_STEP_NAME,
                         reason=(
                             f"ENA run {run_accession} (prep_sample {prep_sample_idx}) "
-                            "was skipped by miint -- its data is missing or partial; "
-                            "refusing to register an incomplete read set"
-                            + (
-                                "; miint's docs say a re-run recovers a mid-stream failure"
-                                if mid_stream
-                                else ""
-                            )
+                            f"was skipped by miint -- {_PARTIAL_RUN_TEXT}"
+                            + (f"; {_MID_STREAM_RERUN_HINT}" if mid_stream else "")
                             + f": {'; '.join(skip_msgs)}"
                         ),
                     )

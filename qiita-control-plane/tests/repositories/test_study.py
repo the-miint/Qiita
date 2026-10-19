@@ -20,7 +20,7 @@ import secrets
 import asyncpg
 import pytest
 from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX, SystemRole
-from qiita_common.models import Tier
+from qiita_common.models import LEGACY_IDX_RESERVED_CEILING, Tier
 
 from qiita_control_plane.repositories import study as study_module
 from qiita_control_plane.repositories.study import (
@@ -30,6 +30,7 @@ from qiita_control_plane.repositories.study import (
     fetch_study_exists,
     fetch_study_idxs_by_accession,
     get_or_create_study_by_ena_accessions,
+    insert_study,
     update_study,
 )
 from qiita_control_plane.testing.db_teardown import delete_principal, teardown_entity_graph
@@ -282,7 +283,7 @@ async def test_create_study_minimum_body_inserts_row_and_owner_admin_grant(postg
             assert row["ena_study_accession"] is None
             assert row["notes"] is None
             assert row["extra_metadata"] is None
-            assert row["default_tier"] == "member"
+            assert row["default_tier"] == Tier.MEMBER
 
             # Auto-grant: owner has an ADMIN access row, granted_by_idx=caller.
             grant = await conn.fetchrow(
@@ -293,7 +294,7 @@ async def test_create_study_minimum_body_inserts_row_and_owner_admin_grant(postg
                 owner,
             )
             assert grant is not None
-            assert grant["access_tier"] == "admin"
+            assert grant["access_tier"] == Tier.ADMIN
             assert grant["granted_by_idx"] == owner
         finally:
             await tr.rollback()
@@ -339,7 +340,7 @@ async def test_create_study_full_body_round_trips_every_field(postgres_pool):
             assert row["notes"] == "notes-1"
             # asyncpg returns JSONB as a string; decode for comparison.
             assert json.loads(row["extra_metadata"]) == extra
-            assert row["default_tier"] == "viewer"
+            assert row["default_tier"] == Tier.VIEWER
         finally:
             await tr.rollback()
 
@@ -373,7 +374,7 @@ async def test_create_study_admin_on_behalf_grants_owner_not_caller(postgres_poo
                 row["idx"],
                 owner,
             )
-            assert owner_grant["access_tier"] == "admin"
+            assert owner_grant["access_tier"] == Tier.ADMIN
             assert owner_grant["granted_by_idx"] == caller
 
             # Caller has no auto-granted row.
@@ -481,6 +482,27 @@ async def test_create_study_duplicate_ena_accession_raises_unique_error(postgres
             await tr.rollback()
 
 
+@pytest.mark.parametrize("idx", [0, LEGACY_IDX_RESERVED_CEILING])
+async def test_insert_study_explicit_idx_outside_reserved_band_raises(postgres_pool, idx):
+    """insert_study refuses an idx outside the reserved band before any SQL."""
+    async with postgres_pool.acquire() as conn:
+        with pytest.raises(ValueError, match="explicit study idx"):
+            await insert_study(conn, owner_idx=1, created_by_idx=1, title="t", idx=idx)
+
+
+@pytest.mark.parametrize("table", ["study", "prep_sample", "sequenced_pool"])
+async def test_legacy_idx_ceiling_matches_column_comment(postgres_pool, table):
+    """LEGACY_IDX_RESERVED_CEILING is the band the migrations record on each
+    reserved idx column, in either direction a drift could go."""
+    comment = await postgres_pool.fetchval(
+        "SELECT col_description(format('qiita.%I', $1::text)::regclass, a.attnum)"
+        " FROM pg_attribute a"
+        " WHERE a.attrelid = format('qiita.%I', $1::text)::regclass AND a.attname = 'idx'",
+        table,
+    )
+    assert f"[1, {LEGACY_IDX_RESERVED_CEILING})" in comment, comment
+
+
 # ---------------------------------------------------------------------------
 # fetch_study_exists
 # ---------------------------------------------------------------------------
@@ -557,7 +579,7 @@ async def test_fetch_study_returns_full_row_for_existing_idx(postgres_pool):
             assert fetched["bioproject_accession"] == "PRJNA000001"
             assert fetched["notes"] == "notes-1"
             assert json.loads(fetched["extra_metadata"]) == extra
-            assert fetched["default_tier"] == "viewer"
+            assert fetched["default_tier"] == Tier.VIEWER
             assert fetched["created_by_idx"] == owner
             assert fetched["created_at"] == created_row["created_at"]
             assert fetched["updated_at"] == created_row["updated_at"]

@@ -1,7 +1,4 @@
-"""qiita user CLI — shared body/arg helpers and generic read/patch handlers.
-
-Split out of the former single-file ``cli.user`` module; behavior unchanged.
-"""
+"""qiita user CLI — shared body/arg helpers and generic read/patch handlers."""
 
 import argparse
 import math
@@ -123,11 +120,6 @@ def _refuse_malformed_accessions(
         )
 
 
-def _validation_messages(exc: ValidationError) -> str:
-    """A ValidationError's errors flattened to one stderr line."""
-    return "; ".join(f"{'.'.join(str(p) for p in e['loc'])}: {e['msg']}" for e in exc.errors())
-
-
 def _build_body(
     model_cls: type[BaseModel],
     args: argparse.Namespace,
@@ -156,7 +148,7 @@ def _build_body(
     try:
         return model_cls(**fields).model_dump(exclude_unset=True, mode="json", by_alias=True)
     except ValidationError as exc:
-        parser.error(f"invalid {model_cls.__name__}: {_validation_messages(exc)}")
+        parser.error(f"invalid {model_cls.__name__}: {_common.validation_messages(exc)}")
 
 
 def _follow_on_from_args(
@@ -178,7 +170,7 @@ def _follow_on_from_args(
             action_id=action_id, action_version=action_version, action_context=context or {}
         )
     except ValidationError as exc:
-        parser.error(f"invalid follow-on: {_validation_messages(exc)}")
+        parser.error(f"invalid follow-on: {_common.validation_messages(exc)}")
 
 
 def _fold_flag_values(
