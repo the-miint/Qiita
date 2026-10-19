@@ -2039,6 +2039,12 @@ mod tests {
     /// Uses `stream_arrow`, the streaming form `stream_ducklake_batches` uses in
     /// production — the materialising `query_arrow` is a different execution mode
     /// and could order differently.
+    ///
+    /// This runs at DuckDB's default, `preserve_insertion_order=true`, which is
+    /// not what a production DoGet runs under: the pool turns it off
+    /// (`pool::LakePool::apply_settings`). An encoding that consumes scan order
+    /// has to set it on its own path, and this is the measurement of what it
+    /// would then get.
     #[test]
     #[serial]
     #[cfg(feature = "integration")]

@@ -1654,7 +1654,8 @@ fn export_select_to_parquet(
     // ROW_GROUP_SIZE_BYTES (in EXPORT_READ_PARQUET_OPTS) requires insertion
     // order NOT be preserved — and we don't need it: the file is unordered
     // because every consumer (qc is per-row, host_filter collapses with
-    // DISTINCT) is order-independent.
+    // DISTINCT) is order-independent. The pool's baseline is already off; the
+    // SET stays so this requirement does not rest on that baseline.
     conn.execute_batch("SET preserve_insertion_order = false;")
         .map_err(|e| Status::internal(format!("failed to set preserve_insertion_order: {e}")))?;
 

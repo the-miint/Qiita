@@ -242,10 +242,16 @@ impl LakePool {
     }
 
     /// The settings a connection carries, applied at build and re-applied when it
-    /// comes back. `preserve_insertion_order` is in the list because a borrower
-    /// may change it (the Parquet export does) and the change outlives the
-    /// borrow: measured, a connection kept `preserve_insertion_order=false`
-    /// after the request that set it was done.
+    /// comes back, because a borrower's `SET` outlives its borrow: measured, a
+    /// connection kept a changed `preserve_insertion_order` after the request that
+    /// set it was done.
+    ///
+    /// `preserve_insertion_order` is off, and on only where a handler sets it for
+    /// itself. Nothing the pool serves depends on the order rows arrive in: the
+    /// DoGet SQL has no `ORDER BY` to keep, chunks are reassembled by
+    /// `chunk_index`, a pair's mates share one row, no query takes a `LIMIT` or a
+    /// first row without ordering, and the masked-read DoGet is a join that carries
+    /// no order either way. No handler sets it today.
     ///
     /// Two obligations follow. A handler that `SET`s anything not listed here
     /// leaks it to the next borrower, so a new `SET` in a request path belongs in
@@ -258,7 +264,7 @@ impl LakePool {
              SET memory_limit='{}';
              SET temp_directory='{}';
              SET max_temp_directory_size='{}';
-             SET preserve_insertion_order=true;",
+             SET preserve_insertion_order=false;",
             self.settings.threads,
             self.settings.memory_limit,
             member.spill.path().display(),

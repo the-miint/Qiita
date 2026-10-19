@@ -147,7 +147,7 @@ fn a_setting_the_borrower_changed_is_restored() {
 
     {
         let conn = pool.checkout().expect("checkout");
-        conn.execute_batch("SET preserve_insertion_order=false;")
+        conn.execute_batch("SET preserve_insertion_order=true;")
             .expect("set");
     }
 
@@ -160,7 +160,7 @@ fn a_setting_the_borrower_changed_is_restored() {
             |row| row.get(0),
         )
         .expect("read back");
-    assert!(value, "the pool re-applied its baseline");
+    assert!(!value, "the pool re-applied its baseline");
 }
 
 #[test]
@@ -205,6 +205,14 @@ fn the_pool_settings_reach_duckdb() {
         "256.0 MiB",
         "the spill cap must be ours, not DuckDB's filesystem-derived default"
     );
+    let ordered: bool = conn
+        .query_row(
+            "SELECT current_setting('preserve_insertion_order')",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read preserve_insertion_order");
+    assert!(!ordered, "order is off unless a handler asks for it");
 }
 
 #[test]

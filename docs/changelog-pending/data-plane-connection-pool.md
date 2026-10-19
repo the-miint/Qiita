@@ -34,6 +34,13 @@
   Reusing the attach is also most of a small request's cost: a fresh connect + attach + query
   measured 84–107 ms and about 16 catalog transactions, against 3.0–3.4 ms and about 3.7 on a
   reused attach.
+- **A DoGet no longer preserves insertion order (#713).** Every pooled connection runs with
+  `preserve_insertion_order` off, where each request previously opened a DuckDB at its
+  default of on — so a plain scan, which used to arrive near the order its files were
+  written in, now arrives in no defined order. Nothing in the repo depends on it: chunks are
+  reassembled by `chunk_index`, a pair's mates share one row, and the masked-read DoGet is a
+  join that was never ordered. A client outside the repo that relied on scan order needs an
+  `ORDER BY` of its own.
 - **A recoverable data-plane failure is classified retriable in both services (#713).** The
   conditions — the request refused for want of a free connection, the data plane unreachable
   or unable to open one, a catalog write that lost a serialization race, a signing token that
