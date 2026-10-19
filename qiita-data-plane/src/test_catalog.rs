@@ -1,5 +1,4 @@
 //! Where the integration tier finds the test DuckLake catalog.
-
 //!
 //! One home for the two values every catalog-backed test needs: a divergence
 //! between copies reads as a test failure in whichever one is stale.

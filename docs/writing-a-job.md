@@ -119,8 +119,8 @@ Raise the right thing; the dispatcher maps it:
 | `StepNoData` | `NO_DATA` (terminal, not a failure) | — |
 | a pyarrow/Flight error that is a recoverable data-plane condition (`qiita_common.data_plane_errors`) | `DATA_PLANE_TRANSIENT` | yes |
 | any other `pyarrow.ArrowException` / `FlightError` | propagates (logged with traceback) | — |
-| `FileNotFoundError`, `ValueError` | `BAD_INPUT` (permanent) | no |
 | `NotImplementedError` | `UNKNOWN_PERMANENT` | no |
+| `FileNotFoundError`, `ValueError` | `BAD_INPUT` (permanent) | no |
 | anything else | propagates (logged with traceback) | — |
 
 The rows are in the order the dispatcher's arms run, which is the order to read

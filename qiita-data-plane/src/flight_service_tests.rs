@@ -5719,7 +5719,7 @@ async fn do_put_past_its_bound_is_refused_with_a_retriable_status() {
         err.message()
     );
     assert!(
-        err.message().contains('2'),
+        err.message().contains("all 2 concurrent uploads"),
         "the refusal names the bound it hit, not what is left: {}",
         err.message()
     );

@@ -302,10 +302,9 @@ async def test_an_unsupported_arrow_cast_is_not_reported_as_an_unimplemented_job
 async def test_a_non_data_plane_arrow_invalid_propagates_rather_than_reading_as_bad_input(
     monkeypatch, tmp_path
 ):
-    """`ArrowInvalid` is a `ValueError`, so the data-quality arm used to classify every
-    one of them as permanent BAD_INPUT with the job's own reason text. Now the typed arm
-    takes them first and re-raises the ones that are not a data-plane condition, so a
-    cast failure inside a job surfaces with its traceback instead.
+    """`ArrowInvalid` is a `ValueError`, which the data-quality arm would classify as
+    permanent BAD_INPUT. The typed arm takes it first and re-raises one that is not a
+    data-plane condition, so a cast failure inside a job surfaces with its traceback.
 
     `ArrowCapacityError`, which the test above uses, derives from `ArrowException` alone
     — it never reached the data-quality arm, so it cannot pin this."""

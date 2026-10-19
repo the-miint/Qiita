@@ -201,16 +201,16 @@ async def run_native_job(
 
     Other exception types from `execute` propagate so they surface in
     the orchestrator's logs with full traceback rather than being
-    silently classified. Every pyarrow and Flight exception the four
-    conditions above do not cover propagates for the same reason, which is
+    silently classified. Every pyarrow and Flight exception that
+    `is_data_plane_transient` does not recognise propagates for the same reason, which is
     what the pyarrow arm's placement above the builtin arms buys: an
     `ArrowInvalid` is a `ValueError` and an `ArrowNotImplementedError` is a
     `NotImplementedError`, and neither is the thing those arms describe.
     """
-    # Deferred like the package's other two pyarrow users
-    # (`data_plane_client`, `jobs.golay_demux`): the names are needed only by the
-    # `except` arm below, and importing both costs 51 ms and 28 MiB on every
-    # import of this package — the boot scan and the SLURM launcher included.
+    # Deferred: only the `except` arm below needs these, and importing both measured
+    # ~50 ms with a warm file cache and +28 MiB maxrss (pyarrow 25.0.0, orchestrator
+    # venv, an M1 Max) on every import of this package — the boot scan and the SLURM
+    # launcher included.
     import pyarrow  # noqa: PLC0415
     import pyarrow.flight  # noqa: PLC0415
 

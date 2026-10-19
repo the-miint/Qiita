@@ -37,7 +37,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ducklake::ensure_lake_tables(&setup_conn)?;
     drop(setup_conn);
 
-    // One bounded pool of attached instances serves every request; its size is
+    // One bounded pool of attached connections serves every request; its size is
     // the number in flight. Logged after it opens, so the line is a statement
     // that these settings applied rather than that they were intended.
     let pool_log = format!(

@@ -24,14 +24,11 @@ pool's size is the number of DoGets and DoActions one data plane serves at once.
 **DoPut is bounded separately**, by
 `FLIGHT_MAX_CONCURRENT_DOPUT` permits rather than by the pool: an upload streams
 straight to Parquet without touching the catalog, so it borrows no connection,
-and its cost is the batches in flight — measured against a real data plane, peak
-RSS rose from 165 MiB at one upload to 1,103 MiB at sixteen with 8 MiB batches,
-3,014 MiB at sixteen with 64 MiB batches, and 2,787 MiB at one upload against
-8,834 MiB at four with 896 MiB batches. **It bounds uploads, not bytes**: a
-payload is one client RecordBatch, which the chunked-upload path sizes up to
-~1 GiB, so eight of those is ~18 GiB of decode buffers — a share of the deploy
-host, and more than the 8 GiB a misdetected ceiling would assume. A small host
-needs the value lowered by hand, since nothing derives it. A request that arrives with every
+and its cost is the batches in flight, which grows with both the number of
+uploads and their batch size. **It bounds uploads, not bytes**, and nothing
+derives it from the host, so a small host needs the value lowered by hand; the
+measurements, and what the default costs at the batch size the CLIs send, are on
+`DEFAULT_MAX_CONCURRENT_DOPUT` in `qiita-data-plane/src/config.rs`. A request that arrives with every
 connection (or permit) taken is refused immediately with gRPC
 `RESOURCE_EXHAUSTED` and a message naming the bound, rather than queued — the
 reasoning, and the edge limits it rests on, are in `pool.rs`. **No client retries
