@@ -20,11 +20,11 @@
 //! Connections are built as they are first needed rather than all at boot, because
 //! each one costs a lake-Postgres backend for as long as it lives — the budget
 //! `config::DEFAULT_POOL_SIZE` is chosen against. One is built at `open` so a bad
-//! setting or an unwritable spill directory fails the unit at boot rather than on
-//! first request.
+//! setting or an unwritable spill root fails the unit at boot rather than on first
+//! request.
 
 use std::ops::Deref;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use duckdb::Connection;
@@ -106,14 +106,15 @@ const NO_TRANSACTION_TO_ROLL_BACK: &str = "no transaction is active";
 /// files the same in every database (`duckdb_temp_storage_DEFAULT-0.tmp` and
 /// siblings, measured on DuckDB 1.5.5), and does not make the directory unique
 /// itself. Measured with two databases in one process spilling into one shared
-/// directory: three of four runs died — two segfaults and one `INTERNAL Error:
+/// directory: all four runs failed — three segfaults and one `INTERNAL Error:
 /// Cannot perform IO in in-memory database - CreateBlock!` — where the same
 /// workload with a directory each returned correct results in four of four.
 ///
 /// `conn` is declared before `spill` so it drops first: DuckDB closes and
-/// releases its spill files, then the directory is removed. A process that is
-/// killed rather than shut down leaves its directories behind, named for its
-/// pid so an operator can tell whose they were.
+/// releases its spill files, then the directory is removed. The data plane has
+/// no shutdown path that drops the pool, so every stop — `systemctl stop` and
+/// `restart` included, measured with SIGTERM — leaves the directories behind;
+/// `sweep_abandoned_spill_directories` is what removes them.
 struct Member {
     conn: Connection,
     spill: tempfile::TempDir,
@@ -130,6 +131,9 @@ pub struct LakePool {
     catalog_connstr: String,
     data_path: String,
     settings: PoolSettings,
+    /// `<host>-<pid>-`, which every spill directory this process creates starts
+    /// with; see `sweep_abandoned_spill_directories`.
+    spill_prefix: String,
     state: Mutex<PoolState>,
 }
 
@@ -150,10 +154,18 @@ impl LakePool {
                 settings.temp_directory.display()
             )
         })?;
+        let host = host_name()?;
+        for removed in sweep_abandoned_spill_directories(&settings.temp_directory, &host)? {
+            println!(
+                "removed spill directory {} left by a process that is gone",
+                removed.display()
+            );
+        }
         let pool = Arc::new(Self {
             catalog_connstr,
             data_path,
             settings,
+            spill_prefix: spill_prefix(&host),
             state: Mutex::new(PoolState {
                 idle: Vec::new(),
                 unbuilt: 0,
@@ -204,7 +216,8 @@ impl LakePool {
                 self.lock_state().unbuilt += 1;
                 // `unavailable`, not `internal`: by the time the pool is serving,
                 // a failed build is the catalog being unreachable or at its
-                // connection limit, which the next attempt can clear. A setting
+                // connection limit, or the spill root refusing a new directory
+                // (scratch full or remounted), each of which can clear. A setting
                 // DuckDB rejects cannot arrive here — `open` builds one at boot,
                 // so the unit never starts with a setting it will not take.
                 Err(Status::unavailable(format!(
@@ -219,7 +232,7 @@ impl LakePool {
         let conn = Connection::open_in_memory()?;
         ducklake::connect_ducklake(&conn, &self.catalog_connstr, &self.data_path)?;
         let member = Member { conn, spill };
-        self.apply_settings(&member)?;
+        self.settle(&member)?;
         Ok(member)
     }
 
@@ -227,7 +240,7 @@ impl LakePool {
     fn new_spill_directory(&self) -> Result<tempfile::TempDir, String> {
         let root = &self.settings.temp_directory;
         let dir = tempfile::Builder::new()
-            .prefix(&format!("{}-", std::process::id()))
+            .prefix(&self.spill_prefix)
             .tempdir_in(root)
             .map_err(|e| {
                 format!(
@@ -241,17 +254,30 @@ impl LakePool {
         Ok(dir)
     }
 
+    /// A new member's settings: its spill directory, then `apply_settings`. The
+    /// directory is set here and never again, because DuckDB refuses to change
+    /// `temp_directory` once the database has used it — measured on DuckDB 1.5.5,
+    /// `Cannot switch temporary directory after the current one has been used`
+    /// for the same path, after the spill files were gone, and for `RESET` too.
+    fn settle(&self, member: &Member) -> Result<(), duckdb::Error> {
+        member.conn.execute_batch(&format!(
+            "SET temp_directory='{}';",
+            member.spill.path().display()
+        ))?;
+        self.apply_settings(member)
+    }
+
     /// The settings a connection carries, applied at build and re-applied when it
     /// comes back, because a borrower's `SET` outlives its borrow: measured, a
     /// connection kept a changed `preserve_insertion_order` after the request that
     /// set it was done.
     ///
     /// `preserve_insertion_order` is off, and on only where a handler sets it for
-    /// itself. Nothing the pool serves depends on the order rows arrive in: the
-    /// DoGet SQL has no `ORDER BY` to keep, chunks are reassembled by
-    /// `chunk_index`, a pair's mates share one row, no query takes a `LIMIT` or a
-    /// first row without ordering, and the masked-read DoGet is a join that carries
-    /// no order either way. No handler sets it today.
+    /// itself. Nothing the pool serves depends on the order rows arrive in: no
+    /// DoGet query has an `ORDER BY`, chunks are reassembled by `chunk_index`, a
+    /// pair's mates share one row, no query takes a `LIMIT` or a first row without
+    /// ordering, and the masked-read DoGet is a join that carries no order either
+    /// way. No handler turns it on today.
     ///
     /// Two obligations follow. A handler that `SET`s anything not listed here
     /// leaks it to the next borrower, so a new `SET` in a request path belongs in
@@ -262,12 +288,10 @@ impl LakePool {
         member.conn.execute_batch(&format!(
             "SET threads={};
              SET memory_limit='{}';
-             SET temp_directory='{}';
              SET max_temp_directory_size='{}';
              SET preserve_insertion_order=false;",
             self.settings.threads,
             self.settings.memory_limit,
-            member.spill.path().display(),
             self.settings.max_temp_directory_size,
         ))
     }
@@ -331,6 +355,7 @@ impl LakePool {
             catalog_connstr: String::new(),
             data_path: String::new(),
             settings,
+            spill_prefix: spill_prefix(&host_name().expect("read the host name")),
             state: Mutex::new(PoolState {
                 idle: Vec::new(),
                 unbuilt: 0,
@@ -345,7 +370,7 @@ impl LakePool {
                     .new_spill_directory()
                     .expect("create a spill directory"),
             };
-            pool.apply_settings(&member).expect("apply pool settings");
+            pool.settle(&member).expect("apply pool settings");
             idle.push(member);
         }
         pool.lock_state().idle = idle;
@@ -361,6 +386,97 @@ impl LakePool {
     fn unbuilt_len(&self) -> usize {
         self.lock_state().unbuilt
     }
+}
+
+/// The name every spill directory this process creates starts with. The host is
+/// in it because the spill root is on `PATH_SCRATCH`, which every host mounts, so
+/// a pid alone does not say whose a directory is.
+fn spill_prefix(host: &str) -> String {
+    format!("{host}-{}-", std::process::id())
+}
+
+fn host_name() -> Result<String, String> {
+    let mut buf = [0u8; 256];
+    // SAFETY: `buf` is writable for its whole length, which is what is passed.
+    if unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) } != 0 {
+        return Err(format!(
+            "cannot read the host name for the spill directories: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    let host = String::from_utf8(buf[..len].to_vec())
+        .map_err(|_| "the host name is not UTF-8".to_string())?;
+    if host.is_empty() || host.contains('/') {
+        return Err(format!(
+            "the host name {host:?} cannot start a spill directory's name"
+        ));
+    }
+    Ok(host)
+}
+
+/// Whether `pid` names a running process. A pid that cannot be asked about —
+/// 0, or one past `i32`, which `kill` would read as a process group — counts as
+/// running, so the sweep leaves its directory alone.
+fn process_is_running(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return true;
+    };
+    if pid == 0 {
+        return true;
+    }
+    // SAFETY: signal 0 delivers nothing; it only checks that the pid exists.
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return true;
+    }
+    // EPERM: it exists, under another user.
+    std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+/// Remove the spill directories under `root` that a process on this host left
+/// when it stopped, and return them. A directory is this host's when its name is
+/// `<host>-<pid>-<suffix>` with an alphanumeric suffix — `tempfile`'s — so
+/// another host whose name extends this one (`qiita` and `qiita-2`) does not
+/// match. It is left when its pid is this process or a running one, which keeps
+/// the directories of the other instances on this host; a pid reused by an
+/// unrelated process only postpones the removal to a later boot.
+fn sweep_abandoned_spill_directories(root: &Path, host: &str) -> Result<Vec<PathBuf>, String> {
+    let entries = std::fs::read_dir(root)
+        .map_err(|e| format!("cannot list the spill root {}: {e}", root.display()))?;
+    let own = format!("{host}-");
+    let mut removed = Vec::new();
+    for entry in entries {
+        let entry =
+            entry.map_err(|e| format!("cannot list the spill root {}: {e}", root.display()))?;
+        let name = entry.file_name();
+        let Some(rest) = name.to_str().and_then(|n| n.strip_prefix(&own)) else {
+            continue;
+        };
+        let Some((pid, suffix)) = rest.split_once('-') else {
+            continue;
+        };
+        let Ok(pid) = pid.parse::<u32>() else {
+            continue;
+        };
+        if suffix.is_empty() || !suffix.chars().all(|c| c.is_ascii_alphanumeric()) {
+            continue;
+        }
+        if pid == std::process::id() || process_is_running(pid) {
+            continue;
+        }
+        let path = entry.path();
+        if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        std::fs::remove_dir_all(&path).map_err(|e| {
+            format!(
+                "cannot remove the spill directory {} left by pid {pid}: {e}",
+                path.display()
+            )
+        })?;
+        removed.push(path);
+    }
+    Ok(removed)
 }
 
 impl std::fmt::Debug for LakePool {

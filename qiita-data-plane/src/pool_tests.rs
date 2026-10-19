@@ -163,6 +163,54 @@ fn a_setting_the_borrower_changed_is_restored() {
     assert!(!value, "the pool re-applied its baseline");
 }
 
+/// A connection whose database has spilled comes back to the pool rather than
+/// being discarded: DuckDB refuses any `SET temp_directory` once the directory
+/// has been used, the same path included, so a reset that re-set it would fail
+/// for every borrow that spilled.
+#[test]
+fn a_connection_that_spilled_comes_back() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut settings = PoolSettings::for_tests(1, tmp.path().to_path_buf());
+    settings.memory_limit = "32MiB".to_string();
+    settings.threads = 1;
+    let pool = LakePool::unattached_for_tests(settings);
+
+    let spill = {
+        let conn = pool.checkout().expect("checkout");
+        let spill: String = conn
+            .query_row("SELECT current_setting('temp_directory')", [], |row| {
+                row.get(0)
+            })
+            .expect("read temp_directory");
+        conn.execute_batch(
+            "CREATE TABLE t AS SELECT hash(range) AS x, repeat('y', 64) AS pad
+                 FROM range(1500000);",
+        )
+        .expect("set up a table larger than the limit");
+        let mut stmt = conn
+            .prepare("SELECT x, pad FROM t ORDER BY x, pad")
+            .expect("prepare");
+        let mut rows = stmt.query([]).expect("a sort that spills");
+        rows.next().expect("first row");
+        let spilled = std::fs::read_dir(&spill).unwrap().count();
+        assert!(spilled > 0, "the sort must spill for this to say anything");
+        spill
+    };
+
+    assert_eq!(
+        pool.idle_len(),
+        1,
+        "the connection was returned, not discarded"
+    );
+    let conn = pool.checkout().expect("checkout again");
+    let again: String = conn
+        .query_row("SELECT current_setting('temp_directory')", [], |row| {
+            row.get(0)
+        })
+        .expect("read temp_directory");
+    assert_eq!(again, spill, "the same connection, with its own directory");
+}
+
 #[test]
 fn the_pool_settings_reach_duckdb() {
     let tmp = tempfile::tempdir().unwrap();
@@ -195,8 +243,8 @@ fn the_pool_settings_reach_duckdb() {
         spill
             .file_name()
             .and_then(|n| n.to_str())
-            .is_some_and(|n| n.starts_with(&format!("{}-", std::process::id()))),
-        "the directory is named for the process that owns it: {}",
+            .is_some_and(|n| n.starts_with(&pool.spill_prefix)),
+        "the directory is named for the host and process that own it: {}",
         spill.display()
     );
     assert_eq!(read_text("memory_limit"), "512.0 MiB");
@@ -312,6 +360,42 @@ fn duckdb_names_its_spill_files_the_same_in_every_database() {
 }
 
 #[test]
+fn the_sweep_removes_only_this_hosts_directories_whose_process_is_gone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    // A pid that was running a moment ago and is not now.
+    let mut child = std::process::Command::new("true").spawn().expect("spawn");
+    let gone = child.id();
+    child.wait().expect("reap");
+    let me = std::process::id();
+    let mkdir = |name: &str| {
+        std::fs::create_dir(root.join(name)).unwrap();
+        name.to_string()
+    };
+
+    let abandoned = mkdir(&format!("qiita-{gone}-Ab3dE9"));
+    let kept = [
+        mkdir(&format!("qiita-{me}-Ab3dE9")),         // this process
+        mkdir(&format!("qiita-{}-Ab3dE9", 1)),        // a running process
+        mkdir(&format!("other-{gone}-Ab3dE9")),       // another host
+        mkdir(&format!("qiita-2-{gone}-Ab3dE9")),     // a host named qiita-2
+        mkdir(&format!("qiita-{gone}")),              // no suffix
+        mkdir("qiita-0-Ab3dE9"),                      // pid 0
+        mkdir(&format!("qiita-{}-Ab3dE9", u32::MAX)), // past pid_t
+    ];
+    let file = format!("qiita-{gone}-AbFile");
+    std::fs::write(root.join(&file), b"").unwrap();
+
+    let removed = sweep_abandoned_spill_directories(root, "qiita").expect("sweep");
+
+    assert_eq!(removed, vec![root.join(&abandoned)]);
+    assert!(!root.join(&abandoned).exists());
+    for name in kept.iter().chain([&file]) {
+        assert!(root.join(name).exists(), "{name} must be left alone");
+    }
+}
+
+#[test]
 fn every_setting_that_could_end_a_sql_literal_is_rejected_at_construction() {
     /// The env var a case poisons, and how.
     type PoisonCase = (&'static str, fn(&mut PoolSettings));
@@ -343,8 +427,8 @@ fn every_setting_that_could_end_a_sql_literal_is_rejected_at_construction() {
 }
 
 /// The lazy half of the bound, against a real catalog: `open` attaches one
-/// connection so a bad setting or an unwritable spill directory fails the unit at
-/// boot, and the remaining slots are attached only when a request needs them —
+/// connection so a bad setting or an unwritable spill root fails the unit at boot,
+/// and the remaining slots are attached only when a request needs them —
 /// each one costs a lake-Postgres backend for as long as it lives.
 #[test]
 #[cfg(feature = "integration")]
@@ -368,7 +452,7 @@ fn open_attaches_one_connection_and_the_rest_on_demand() {
     assert_eq!(pool.unbuilt_len(), 2, "the other two are not attached yet");
 
     let first = pool.checkout().expect("the attached connection");
-    let second = pool.checkout().expect("an connection attached on demand");
+    let second = pool.checkout().expect("a connection attached on demand");
     assert_eq!(pool.unbuilt_len(), 1);
     let _third = pool.checkout().expect("the last slot");
     assert_eq!(pool.unbuilt_len(), 0);

@@ -21,9 +21,10 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
   Left unset the data plane starts on its own
   values: `memory_limit` derived from the memory it finds free, `threads` from the CPU
   allowance, the spill root `PATH_SCRATCH/duckdb-spill` (which bucket 2 creates), and fixed defaults for the spill cap
-  and for the two counts (pool size and concurrent uploads, 8 each). One exception: boot fails if the pool size leaves under 512 MiB per
-  connection — measured as the point below which the export DoAction cannot run — naming
-  both ways out. Setting `DUCKDB_MEMORY_LIMIT` explicitly is what stops
+  and for the two counts (pool size and concurrent uploads, 8 each). Boot fails in two cases:
+  if the pool size leaves under 512 MiB per connection — measured as the point below which
+  the export DoAction cannot run — naming both ways out, and if the spill root cannot be
+  created or written. Setting `DUCKDB_MEMORY_LIMIT` explicitly is what stops
   boot depending on how much was free at the moment of a restart. Set the pool size
   deliberately as well: it is both the number of DoGets and DoActions one data-plane process
   serves at once — uploads have their own bound, `FLIGHT_MAX_CONCURRENT_DOPUT`, also 8 by
@@ -31,17 +32,18 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
   lake-Postgres backend while it lives, against `max_connections = 100` (3 superuser-reserved)
   shared with the control plane and every other data-plane process. The default is 8 per
   process. `FLIGHT_MAX_CONCURRENT_DOPUT` is the one value nothing derives and nothing fails
-  boot over: measured, eight concurrent uploads at the batch size the CLIs send hold ~18 GiB
-  of decode buffers, which this host has and a smaller one does not — lower it there.
+  boot over: extrapolated from the measured cost of four, eight concurrent uploads at the
+  batch size the CLIs send hold ~18 GiB of decode buffers, which this host has and a smaller
+  one does not — lower it there.
 
 ### 2. One-time host setup
 
 - `[admin]` (#713) Create the data plane's spill root before the restart — each pooled
   connection spills into a directory of its own under it, and boot fails if it cannot:
   `sudo install -d -o qiita-data -g qiita-data -m 0700 <scratch>/duckdb-spill`. Skip it only
-  if `DUCKDB_TEMP_DIRECTORY` names another root the data plane can write. A data plane that
-  is killed rather than stopped leaves its directories there, named `<pid>-…`; nothing
-  reclaims them.
+  if `DUCKDB_TEMP_DIRECTORY` names another root the data plane can write. Every stop or
+  restart leaves the stopped process's directories there, named `<host>-<pid>-…`; the next
+  boot on the same host removes those whose process is gone.
 
 ### 3. Migrations
 

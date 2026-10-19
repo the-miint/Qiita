@@ -127,10 +127,8 @@ const DEFAULT_MAX_TEMP_DIRECTORY_SIZE: &str = "4GiB";
 const DEFAULT_MAX_CONCURRENT_DOPUT: usize = 8;
 
 /// Leaf name of the derived spill root, under `PATH_SCRATCH`. Spill is high IO, so
-/// it belongs on the scratch filesystem rather than the unit's `HOME`. This is a
-/// root, not a spill directory: each pooled connection spills into its own
-/// directory under it (`pool::LakePool`), since DuckDB names its spill files the
-/// same in every database and two databases spilling into one directory crash.
+/// it belongs on the scratch filesystem. This is a root, not a spill directory;
+/// why is `pool::Member`.
 const DERIVED_TEMP_DIRECTORY_LEAF: &str = "duckdb-spill";
 
 impl Settings {

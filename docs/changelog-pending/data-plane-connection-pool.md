@@ -11,9 +11,11 @@
   out, if that leaves under 512 MiB per connection — measured as the point below which the
   export DoAction's Parquet writer cannot run. The boot log names the detected ceiling,
   the source that answered, and every value in use. Each connection spills into a directory of its own,
-  created under `PATH_SCRATCH/duckdb-spill` and removed with the connection: DuckDB names its
+  created under `PATH_SCRATCH/duckdb-spill` and named `<host>-<pid>-…`: DuckDB names its
   spill files the same in every database, and two databases spilling into one shared
-  directory crashed the process in three of four probe runs.
+  directory failed in all four probe runs, three of them by crashing the process. A stopped
+  data plane leaves its directories; the next boot on the same host removes those whose
+  process is gone.
 
 - **Concurrent uploads are bounded too (#713).** A DoPut writes Parquet without touching the
   catalog, so it borrows no pooled connection and nothing in the process capped how many ran
@@ -23,7 +25,8 @@
   Measured against a real data plane, peak RSS rose from 165 MiB at one upload to 1,103 MiB at
   sixteen with 8 MiB batches, and from 2,787 MiB at one upload to 8,834 MiB at four with
   896 MiB batches. It bounds uploads, not bytes — at the batch size the CLIs send, eight is
-  ~18 GiB of decode buffers, so a host smaller than the deploy host wants it lowered.
+  ~18 GiB of decode buffers by extrapolation from that, so a host smaller than the deploy
+  host wants it lowered.
 
 ### Changed
 
@@ -59,5 +62,9 @@
   (#713).** `pyarrow.ArrowNotImplementedError` is a `NotImplementedError`, so the dispatcher's
   skeleton arm claimed it and recorded "native job not implemented" — a permanent failure
   naming a job module that ships without an `execute()`, for what is a data problem. The
-  pyarrow arm now sits above it, and such a cast propagates with its traceback. Unrelated to
-  the pool; found while testing the arm that classification change added.
+  pyarrow arm now sits above it, and such a cast propagates with its traceback.
+- **A job's own `ArrowInvalid` is no longer recorded as bad input (#713).** It is a
+  `ValueError`, so the dispatcher's data-quality arm claimed every one, including a job's own
+  Arrow or Parquet failure. The pyarrow arm now takes it first; one that is not a data-plane
+  condition propagates with its traceback, and under SLURM fails the step `exit_nonzero`
+  rather than `bad_input`.

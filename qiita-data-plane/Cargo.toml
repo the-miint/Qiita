@@ -48,6 +48,9 @@ futures = "0.3.31"
 # Each pooled DuckDB database spills into a directory of its own, created and
 # removed with the connection (`pool::Member`).
 tempfile = "3"
+# The host name in each spill directory's name, and whether the process a left
+# directory names is still alive (`pool::sweep_abandoned_spill_directories`).
+libc = "0.2"
 
 [features]
 # Enable tests that require external services (Postgres on :5433).
