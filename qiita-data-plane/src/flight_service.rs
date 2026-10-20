@@ -168,14 +168,15 @@ impl QiitaFlightService {
     }
 
     /// `blocking_lake` for an action that writes to the lake: the same bound, on a
-    /// `LakeWriter`.
+    /// `LakeWriter`. The checkout runs inside the blocking task, since it sets the
+    /// connection up with SQL.
     async fn blocking_lake_write<T, F>(&self, what: &str, work: F) -> Result<T, Status>
     where
         F: FnOnce(&LakeWriter) -> Result<T, Status> + Send + 'static,
         T: Send + 'static,
     {
-        let writer = self.pool.checkout_for_write()?;
-        tokio::task::spawn_blocking(move || work(&writer))
+        let pool = Arc::clone(&self.pool);
+        tokio::task::spawn_blocking(move || work(&pool.checkout_for_write()?))
             .await
             .map_err(|e| Status::internal(format!("{what} task join failed: {e}")))?
     }
@@ -2203,6 +2204,9 @@ fn replace_key_delete_sql(table: &str, keys: &[&str], n_files: usize) -> String 
 /// against a lake that already holds the incoming keys, ~7 ms when it does not.
 /// Since every writer queues behind one row, that per-transaction cost IS the
 /// queue rate, and this budget covers a queue far longer than a deploy produces.
+/// Those times predate lake writes running on one thread (`pool::LakeWriter`) and
+/// were not re-taken; a 50M-row delete transaction measured 2.00 s at one thread
+/// against 1.32 s at six, locally.
 /// The DELETE's share of it is set by the spread of the incoming key set rather
 /// than by the table's size — `replace_key_delete_sql` carries what each key set
 /// scans, including the sets where it reads the whole table. Exceeding the

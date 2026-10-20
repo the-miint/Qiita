@@ -296,8 +296,9 @@ impl LakePool {
     /// leaks it to the next borrower, so a new `SET` in a request path belongs in
     /// this list — except `temp_directory`, which cannot be re-applied (see
     /// `settle`), so no handler may set it. And this is the only place limits
-    /// are applied, so a `Connection` built outside the pool — the boot
-    /// connection in `main`, a test's own — runs at DuckDB's defaults.
+    /// are applied, apart from `LAKE_WRITE_SETTINGS` for a write's borrow, so a
+    /// `Connection` built outside the pool — the boot connection in `main`, a
+    /// test's own — runs at DuckDB's defaults.
     fn apply_settings(&self, member: &Member) -> Result<(), duckdb::Error> {
         member.conn.execute_batch(&format!(
             "SET threads={};
@@ -568,11 +569,17 @@ impl Drop for PooledConnection {
 const LAKE_WRITE_SETTINGS: &str = "SET threads=1; SET preserve_insertion_order=true;";
 
 /// A connection lent for writing to the lake. Data at rest is kept in its sort
-/// order, so every function that writes lake rows takes this rather than a
+/// order, so every function that changes the lake takes this rather than a
 /// `Connection`, and the only way to get one is `LakePool::checkout_for_write`,
 /// which applies `LAKE_WRITE_SETTINGS`. The type is what stops a write being
 /// handed a read's connection; it does not stop SQL that writes being run on a
 /// `PooledConnection` directly.
+///
+/// Deletes and registration are on it too, though neither writes rows — a
+/// DuckLake `DELETE` adds delete files and leaves data files as they are
+/// (measured), and `ducklake_add_data_files` keeps a file as written — so that a
+/// row write added to either later is ordered without anyone choosing it. The
+/// cost is that they run on one thread as well.
 pub struct LakeWriter {
     conn: WriterConnection,
 }
