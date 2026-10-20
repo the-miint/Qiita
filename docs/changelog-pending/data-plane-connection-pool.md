@@ -71,9 +71,9 @@
   no longer marks a loaded reference `failed`. A workflow `action:` entry (`register-files`,
   the `delete-*` entries, `mask-metrics`) whose DoAction fails for any of the transient
   reasons above is now filed `data_plane_transient` and re-run by the runner, where it was
-  filed `unknown_permanent`. A re-run of `register-files` recovers only a failure from before
-  the data plane moved the staged files (busy, unreachable, an expired token); after the move
-  it fails with a reason saying the registration may have committed.
+  filed `unknown_permanent`. `register-files` is re-run only for a busy refusal or an expired
+  token, which come before the data plane moves the staged files; a re-run after a failure
+  partway through would register only the files left in staging.
 
 ### Fixed
 

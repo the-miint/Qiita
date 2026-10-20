@@ -351,7 +351,9 @@ def test_bad_signature_stays_permanent():
 # An `action:` entry's data-plane failure (`runner/_reconstruct._dispatch_action`).
 
 
-async def _dispatch_action_raising(monkeypatch, exc: BaseException) -> tuple[BaseException, list]:
+async def _dispatch_action_raising(
+    monkeypatch, exc: BaseException, name: str = "register-files"
+) -> tuple[BaseException, list]:
     """Run `_dispatch_action` with its primitive raising `exc` and the progress-row
     writes stubbed; returns what it raised and the failure kinds it recorded."""
     from qiita_common.actions import WorkflowAction
@@ -372,7 +374,7 @@ async def _dispatch_action_raising(monkeypatch, exc: BaseException) -> tuple[Bas
     monkeypatch.setattr(_reconstruct.step_progress, "record_submitting", _noop)
     monkeypatch.setattr(_reconstruct, "_best_effort_record_failed", _record_failed)
     monkeypatch.setattr(_reconstruct, "_run_action_primitive", _raise)
-    entry = WorkflowAction(kind="action", name="register-files", inputs=[], outputs=[])
+    entry = WorkflowAction(kind="action", name=name, inputs=[], outputs=[])
     try:
         await _reconstruct._dispatch_action(
             object(),
@@ -450,3 +452,30 @@ async def test_register_files_rerun_after_the_files_moved_says_so(tmp_path):
             signing_key=b"\x00" * 32,
             data_plane_url="grpc://dp:50051",
         )
+
+
+async def test_register_files_is_not_rerun_after_an_unavailable_data_plane(monkeypatch):
+    """An unavailable data plane may have dropped partway through moving the staged
+    files, so `register-files` is not re-run on it: the re-run would register only the
+    files left in staging."""
+    import pyarrow.flight as flight
+
+    exc = flight.FlightUnavailableError(_REAL_UNAVAILABLE)
+    raised, recorded = await _dispatch_action_raising(monkeypatch, exc)
+    assert raised is exc
+    assert recorded == [FailureKind.UNKNOWN_PERMANENT.value]
+
+
+async def test_other_action_entry_is_rerun_after_an_unavailable_data_plane(monkeypatch):
+    """Any other action entry is re-run on every transient data-plane failure."""
+    import pyarrow.flight as flight
+    from qiita_common.backend_failure import BackendFailure
+
+    raised, recorded = await _dispatch_action_raising(
+        monkeypatch,
+        flight.FlightUnavailableError(_REAL_UNAVAILABLE),
+        name="delete-alignment-sample",
+    )
+    assert isinstance(raised, BackendFailure)
+    assert raised.kind is FailureKind.DATA_PLANE_TRANSIENT
+    assert recorded == [FailureKind.DATA_PLANE_TRANSIENT.value]

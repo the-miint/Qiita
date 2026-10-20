@@ -21,7 +21,11 @@ from qiita_common.api_paths import (
 )
 from qiita_common.backend_failure import BackendFailure, FailureKind
 from qiita_common.compute_backend_client import ComputeBackendClient
-from qiita_common.data_plane_errors import is_data_plane_transient
+from qiita_common.data_plane_errors import (
+    is_data_plane_busy,
+    is_data_plane_ticket_expired,
+    is_data_plane_transient,
+)
 from qiita_common.models import (
     TERMINAL_STEP_PROGRESS_STATES,
     ComputeTarget,
@@ -254,6 +258,23 @@ async def _reconstruct_plan_shards_outputs(
     return {ROUTER_PENDING_BINDING: True, SHARD_MAPPING_BINDING: mapping_path}
 
 
+def _action_failure_is_retriable(entry_name: str, exc: BaseException) -> bool:
+    """True if an `action:` entry's failure is a data-plane one the next attempt can
+    clear, so the retry loop re-runs the entry.
+
+    Gated on the pyarrow types, as the orchestrator's dispatcher is, so a primitive's
+    own Postgres error cannot match by text. `register-files` is narrower: the data
+    plane moves the staged files before its catalog transaction, so a re-run after a
+    failure partway through would register only what is left in staging. Only the two
+    refusals that come before any move re-run it — busy (refused at connection
+    checkout) and an expired token (refused at verification)."""
+    if not isinstance(exc, (pyarrow.ArrowException, pyarrow.flight.FlightError)):
+        return False
+    if entry_name == LibraryPrimitive.REGISTER_FILES:
+        return is_data_plane_busy(exc) or is_data_plane_ticket_expired(exc)
+    return is_data_plane_transient(exc)
+
+
 async def _dispatch_action(
     pool: asyncpg.Pool,
     entry: WorkflowAction,
@@ -316,12 +337,7 @@ async def _dispatch_action(
         )
         raise
     except Exception as exc:
-        if isinstance(
-            exc, (pyarrow.ArrowException, pyarrow.flight.FlightError)
-        ) and is_data_plane_transient(exc):
-            # Gated on the pyarrow types, as the orchestrator's dispatcher is, so a
-            # primitive's own Postgres error cannot match by text. File it transient
-            # so the retry loop re-runs this entry.
+        if _action_failure_is_retriable(entry.name, exc):
             failure = BackendFailure(
                 kind=FailureKind.DATA_PLANE_TRANSIENT,
                 stage=WorkTicketFailureStage.STEP_RUN,
@@ -523,7 +539,7 @@ async def _run_action_primitive(
                 f"register-files: staging_dir {staging_dir} contains no Parquet files; "
                 "if an earlier attempt of this entry reached the data plane, it moved "
                 "them into the lake and its registration may have committed — check "
-                "the lake before re-running"
+                "whether the files are registered (`make lake-shell`) before re-running"
             )
         await LIBRARY[LibraryPrimitive.REGISTER_FILES](
             staging_dir=str(staging_dir),
