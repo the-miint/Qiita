@@ -575,9 +575,10 @@ const LAKE_WRITE_SETTINGS: &str = "SET threads=1; SET preserve_insertion_order=t
 /// handed a read's connection; it does not stop SQL that writes being run on a
 /// `PooledConnection` directly.
 ///
-/// Deletes and registration are on it too, though neither writes rows — a
-/// DuckLake `DELETE` adds delete files and leaves data files as they are
-/// (measured), and `ducklake_add_data_files` keeps a file as written — so that a
+/// Deletes and registration are on it too, though neither writes rows — measured,
+/// a DuckLake `DELETE` adds delete files and leaves data files as they are, and
+/// `ducklake_add_data_files` leaves a registered file byte-identical and reads it
+/// back in order at eight threads — so that a
 /// row write added to either later is ordered without anyone choosing it. The
 /// cost is that they run on one thread as well.
 pub struct LakeWriter {

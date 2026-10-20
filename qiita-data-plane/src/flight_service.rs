@@ -151,8 +151,9 @@ impl QiitaFlightService {
     /// Every DoAction that touches the lake is this shape, and the shape is the
     /// reason: DuckDB work is synchronous and some of it is long-lived, so it runs
     /// on the blocking pool rather than starving a tonic async worker. The
-    /// borrowed connection moves into the closure, which makes the closure `Send`
-    /// and keeps it clear of any await; it returns to the pool when the task ends,
+    /// checkout is part of it, since it can build and attach a connection. The
+    /// connection is borrowed inside the task, which keeps it clear of any await;
+    /// it returns to the pool when the task ends,
     /// including when the task ends because the request failed or the client went
     /// away. `what` names the operation in the one error this adds — a join
     /// failure, which means the blocking task panicked or was cancelled.
@@ -161,15 +162,14 @@ impl QiitaFlightService {
         F: FnOnce(&Connection) -> Result<T, Status> + Send + 'static,
         T: Send + 'static,
     {
-        let conn = self.pool.checkout()?;
-        tokio::task::spawn_blocking(move || work(&conn))
+        let pool = Arc::clone(&self.pool);
+        tokio::task::spawn_blocking(move || work(&*pool.checkout()?))
             .await
             .map_err(|e| Status::internal(format!("{what} task join failed: {e}")))?
     }
 
     /// `blocking_lake` for an action that writes to the lake: the same bound, on a
-    /// `LakeWriter`. The checkout runs inside the blocking task, since it sets the
-    /// connection up with SQL.
+    /// `LakeWriter`.
     async fn blocking_lake_write<T, F>(&self, what: &str, work: F) -> Result<T, Status>
     where
         F: FnOnce(&LakeWriter) -> Result<T, Status> + Send + 'static,
@@ -2204,9 +2204,9 @@ fn replace_key_delete_sql(table: &str, keys: &[&str], n_files: usize) -> String 
 /// against a lake that already holds the incoming keys, ~7 ms when it does not.
 /// Since every writer queues behind one row, that per-transaction cost IS the
 /// queue rate, and this budget covers a queue far longer than a deploy produces.
-/// Those times predate lake writes running on one thread (`pool::LakeWriter`) and
-/// were not re-taken; a 50M-row delete transaction measured 2.00 s at one thread
-/// against 1.32 s at six, locally.
+/// Those times were taken at the pool's threads, not at the one thread a lake
+/// write runs on (`pool::LakeWriter`); a 50M-row delete transaction measured
+/// 2.00 s at one thread against 1.32 s at six, locally.
 /// The DELETE's share of it is set by the spread of the incoming key set rather
 /// than by the table's size — `replace_key_delete_sql` carries what each key set
 /// scans, including the sets where it reads the whole table. Exceeding the
