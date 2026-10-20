@@ -59,7 +59,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cfg.path_persistent_ducklake,
         cfg.pool,
     )?;
-    println!("{pool_log}");
+    eprintln!("{pool_log}");
 
     let flight_svc = flight_service::QiitaFlightService::new(
         cfg.flight_public_key,

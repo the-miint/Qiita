@@ -158,7 +158,7 @@ impl LakePool {
         })?;
         let host = host_name()?;
         for removed in sweep_abandoned_spill_directories(&settings.temp_directory, &host)? {
-            println!(
+            eprintln!(
                 "removed spill directory {} left by a process that is gone",
                 removed.display()
             );
