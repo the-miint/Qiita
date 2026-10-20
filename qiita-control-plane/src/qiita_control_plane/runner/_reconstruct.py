@@ -265,9 +265,10 @@ def _action_failure_is_retriable(entry_name: str, exc: BaseException) -> bool:
     Gated on the pyarrow types, as the orchestrator's dispatcher is, so a primitive's
     own Postgres error cannot match by text. `register-files` is narrower: the data
     plane moves the staged files before its catalog transaction, so a re-run after a
-    failure partway through would register only what is left in staging. Only the two
-    refusals that come before any move re-run it — busy (refused at connection
-    checkout) and an expired token (refused at verification)."""
+    failure partway through would register only what is left in staging. It is re-run
+    only on busy (refused at connection checkout) and an expired token (refused at
+    verification). Unavailable is not among them even when it comes before the move,
+    because by its text a refusal cannot be told from a connection that dropped mid-move."""
     if not isinstance(exc, (pyarrow.ArrowException, pyarrow.flight.FlightError)):
         return False
     if entry_name == LibraryPrimitive.REGISTER_FILES:
@@ -353,9 +354,10 @@ async def _dispatch_action(
                 failure_reason=failure.reason,
             )
             raise failure from exc
-        # Plain Python from a LIBRARY primitive (untyped failure / bug). The
-        # outer run_workflow handler classifies it UNKNOWN_PERMANENT; record
-        # the same on the progress row, then re-raise unchanged.
+        # Plain Python from a LIBRARY primitive (untyped failure / bug), or a
+        # data-plane failure this entry is not re-run on. The outer run_workflow
+        # handler classifies it UNKNOWN_PERMANENT; record the same on the progress
+        # row, then re-raise unchanged.
         await _best_effort_record_failed(
             pool,
             work_ticket_idx=work_ticket_idx,

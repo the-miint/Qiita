@@ -479,3 +479,17 @@ async def test_other_action_entry_is_rerun_after_an_unavailable_data_plane(monke
     assert isinstance(raised, BackendFailure)
     assert raised.kind is FailureKind.DATA_PLANE_TRANSIENT
     assert recorded == [FailureKind.DATA_PLANE_TRANSIENT.value]
+
+
+async def test_register_files_is_rerun_after_an_expired_token(monkeypatch):
+    """An expired token is refused at verification, before the data plane moves any
+    staged file, so `register-files` is re-run on it."""
+    import pyarrow.flight as flight
+    from qiita_common.backend_failure import BackendFailure
+
+    raised, recorded = await _dispatch_action_raising(
+        monkeypatch, flight.FlightUnauthenticatedError(_REAL_EXPIRED)
+    )
+    assert isinstance(raised, BackendFailure)
+    assert raised.kind is FailureKind.DATA_PLANE_TRANSIENT
+    assert recorded == [FailureKind.DATA_PLANE_TRANSIENT.value]
