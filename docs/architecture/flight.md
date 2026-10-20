@@ -47,9 +47,11 @@ token aged out — from one shared module
 Each pooled connection carries its own `threads`, `memory_limit`, `temp_directory`
 and `max_temp_directory_size`, divided at boot from the memory ceiling the
 process detects for itself and overridable per deploy (`DUCKLAKE_POOL_SIZE` and
-the `DUCKDB_*` vars in `.env.data-plane.example`). None preserves insertion
-order, so a DoGet's rows arrive in no defined order; a client that needs one
-orders them itself. The size is a catalog budget
+the `DUCKDB_*` vars in `.env.data-plane.example`). A read runs with insertion
+order off, so a DoGet's rows arrive in no defined order; a client that needs one
+orders them itself. A DoAction that writes to the lake runs instead on one
+thread with order on, so what it writes keeps its source's order (`LakeWriter`
+in `qiita-data-plane/src/pool.rs` says why one thread). The size is a catalog budget
 too: each attached connection holds one lake-Postgres backend for as long as it
 lives, and every data-plane process on every host draws on the same
 `max_connections`.

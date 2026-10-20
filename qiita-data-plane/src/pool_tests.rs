@@ -495,3 +495,90 @@ fn open_attaches_one_connection_and_the_rest_on_demand() {
         .expect("a returned connection still answers");
     assert_eq!(one, 1);
 }
+
+#[test]
+fn a_lake_write_runs_ordered_on_one_thread_and_the_baseline_comes_back() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pool = pool_without_catalog(1, tmp.path().to_path_buf());
+    let threads = |conn: &Connection| -> i64 {
+        conn.query_row("SELECT current_setting('threads')", [], |row| row.get(0))
+            .expect("read threads")
+    };
+    let ordered = |conn: &Connection| -> bool {
+        conn.query_row(
+            "SELECT current_setting('preserve_insertion_order')",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read preserve_insertion_order")
+    };
+
+    {
+        let writer = pool.checkout_for_write().expect("checkout for write");
+        assert_eq!(threads(&writer), 1);
+        assert!(ordered(&writer));
+    }
+    assert_eq!(pool.idle_len(), 1, "the writer's connection came back");
+    let conn = pool.checkout().expect("checkout for read");
+    assert_eq!(threads(&conn), 2, "a read gets the pool's threads back");
+    assert!(!ordered(&conn), "and the pool's unordered baseline");
+}
+
+/// What `LAKE_WRITE_SETTINGS` rests on, against the test catalog: a sorted
+/// source inserted into a lake table at several threads comes back out of order,
+/// and at the writer's settings it does not. When DuckLake keeps the order of a
+/// parallel insert (duckdb/ducklake#1356), the first assertion fails and the
+/// one-thread setting can be reconsidered.
+#[test]
+#[cfg(feature = "integration")]
+#[serial_test::serial]
+fn a_parallel_insert_into_the_lake_loses_order_and_the_writer_keeps_it() {
+    let connstr = crate::test_catalog::connstr();
+    let data_path = crate::test_catalog::data_path();
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("sorted.parquet");
+    let conn = Connection::open_in_memory().expect("open");
+    crate::ducklake::connect_ducklake(&conn, &connstr, &data_path).expect("attach DuckLake");
+    conn.execute_batch(&format!(
+        "COPY (SELECT range AS k, md5(range::VARCHAR) AS pad FROM range(4000000) ORDER BY k)
+             TO '{}' (FORMAT PARQUET);",
+        source.display()
+    ))
+    .expect("write a sorted source");
+    let rows_out_of_order = |conn: &Connection, table: &str| -> i64 {
+        conn.execute_batch(&format!(
+            "DROP TABLE IF EXISTS qiita_lake.{table};
+             CREATE TABLE qiita_lake.{table} (k BIGINT, pad VARCHAR);
+             INSERT INTO qiita_lake.{table} SELECT * FROM read_parquet('{}');",
+            source.display()
+        ))
+        .expect("insert the sorted source");
+        let n = conn
+            .query_row(
+                &format!(
+                    "SELECT count(*) FROM (SELECT k < lag(k) OVER (ORDER BY rowid) AS back
+                     FROM qiita_lake.{table}) WHERE back"
+                ),
+                [],
+                |row| row.get(0),
+            )
+            .expect("count rows out of order");
+        conn.execute_batch(&format!("DROP TABLE qiita_lake.{table};"))
+            .expect("drop the probe table");
+        n
+    };
+
+    conn.execute_batch("SET threads=8; SET preserve_insertion_order=true;")
+        .expect("set a parallel insert");
+    assert!(
+        rows_out_of_order(&conn, "order_probe_parallel") > 0,
+        "a parallel insert kept its order: DuckLake may have fixed duckdb/ducklake#1356"
+    );
+
+    let writer = LakeWriter::for_tests(conn);
+    assert_eq!(
+        rows_out_of_order(&writer, "order_probe_writer"),
+        0,
+        "a lake write must keep its source's order"
+    );
+}

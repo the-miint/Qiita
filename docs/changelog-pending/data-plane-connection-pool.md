@@ -44,6 +44,15 @@
   reassembled by `chunk_index`, a pair's mates share one row, and the masked-read DoGet is a
   join that was never ordered. A client outside the repo that relied on scan order needs an
   `ORDER BY` of its own.
+- **A data-plane write to the lake keeps its source's order (#713).** Every DoAction that
+  writes lake rows (registration, the reference-exclusion mirror, the phylogeny edge-id
+  mint, the deletes) runs on a connection set to one thread with insertion order on, and
+  the functions that write take that connection's type, so a write cannot be handed a read's.
+  One thread because on the DuckLake build we ship a multi-threaded `INSERT` loses its rows'
+  order even with `preserve_insertion_order` on or an explicit `ORDER BY`
+  (duckdb/ducklake#1356); measured, a single-threaded insert of 1–4M rows took 4–6× as long.
+  Large data is still sorted by the job that writes it and registered as files, which this
+  does not change.
 - **A recoverable data-plane failure is classified retriable in both services (#713).** The
   conditions — the request refused for want of a free connection, the data plane unreachable
   or unable to open one, a catalog write that lost a serialization race, a signing token that

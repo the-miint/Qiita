@@ -234,7 +234,7 @@ fn delete_reference_drops_orphans_keeps_shared() {
     ))
     .unwrap();
 
-    let counts = delete_reference(&attached_conn(&connstr, &data_path), ref_a)
+    let counts = delete_reference(&attached_writer(&connstr, &data_path), ref_a)
         .expect("delete_reference failed");
     assert_eq!(counts["sequences_deleted"], 1, "only the orphan sequence");
     assert_eq!(counts["membership_deleted"], 2, "both ref_a memberships");
@@ -316,7 +316,7 @@ fn delete_mask_drops_target_idempotently() {
     .unwrap();
 
     let first =
-        delete_mask(&attached_conn(&connstr, &data_path), mask_a).expect("delete_mask failed");
+        delete_mask(&attached_writer(&connstr, &data_path), mask_a).expect("delete_mask failed");
     assert_eq!(first["rows_deleted"], 2, "both mask_a rows deleted");
     assert_eq!(first["mask_idx"], mask_a);
 
@@ -332,7 +332,7 @@ fn delete_mask_drops_target_idempotently() {
     assert_eq!(count(mask_b), 1, "mask_b untouched");
 
     // Idempotency: re-deleting the now-empty mask is success with 0 rows.
-    let second = delete_mask(&attached_conn(&connstr, &data_path), mask_a)
+    let second = delete_mask(&attached_writer(&connstr, &data_path), mask_a)
         .expect("idempotent re-delete failed");
     assert_eq!(second["rows_deleted"], 0, "second delete removes nothing");
 
@@ -395,7 +395,7 @@ fn delete_read_mask_block_deletes_footprint_only() {
         },
     ];
 
-    let first = delete_read_mask_block(&attached_conn(&connstr, &data_path), mask_a, &members)
+    let first = delete_read_mask_block(&attached_writer(&connstr, &data_path), mask_a, &members)
         .expect("delete_read_mask_block failed");
     assert_eq!(
         first["rows_deleted"], 4,
@@ -426,7 +426,7 @@ fn delete_read_mask_block_deletes_footprint_only() {
     assert_eq!(count(mask_b, prep_a), 1, "mask_b untouched");
 
     // Idempotency: re-deleting the same footprint removes nothing.
-    let second = delete_read_mask_block(&attached_conn(&connstr, &data_path), mask_a, &members)
+    let second = delete_read_mask_block(&attached_writer(&connstr, &data_path), mask_a, &members)
         .expect("idempotent re-delete failed");
     assert_eq!(second["rows_deleted"], 0, "second delete removes nothing");
 
@@ -478,7 +478,7 @@ fn delete_alignment_drops_target_idempotently() {
     ))
     .unwrap();
 
-    let first = delete_alignment(&attached_conn(&connstr, &data_path), align_a)
+    let first = delete_alignment(&attached_writer(&connstr, &data_path), align_a)
         .expect("delete_alignment failed");
     assert_eq!(first["rows_deleted"], 2, "both align_a rows deleted");
     assert_eq!(first["alignment_idx"], align_a);
@@ -505,7 +505,7 @@ fn delete_alignment_drops_target_idempotently() {
     );
 
     // Idempotency: re-deleting the now-empty alignment is success with 0 rows.
-    let second = delete_alignment(&attached_conn(&connstr, &data_path), align_a)
+    let second = delete_alignment(&attached_writer(&connstr, &data_path), align_a)
         .expect("idempotent re-delete failed");
     assert_eq!(second["rows_deleted"], 0, "second delete removes nothing");
 
@@ -592,7 +592,7 @@ fn delete_alignment_block_deletes_footprint_only() {
         },
     ];
 
-    let first = delete_alignment_block(&attached_conn(&connstr, &data_path), align_a, &members)
+    let first = delete_alignment_block(&attached_writer(&connstr, &data_path), align_a, &members)
         .expect("delete_alignment_block failed");
     // 3 rows for prep_a[100,101] (two at seq 100 + one at 101) + 2 for prep_b.
     assert_eq!(
@@ -647,7 +647,7 @@ fn delete_alignment_block_deletes_footprint_only() {
     );
 
     // Idempotency: re-deleting the same footprint removes nothing.
-    let second = delete_alignment_block(&attached_conn(&connstr, &data_path), align_a, &members)
+    let second = delete_alignment_block(&attached_writer(&connstr, &data_path), align_a, &members)
         .expect("idempotent re-delete failed");
     assert_eq!(second["rows_deleted"], 0, "second delete removes nothing");
 
@@ -711,7 +711,7 @@ fn delete_alignment_sample_deletes_the_pair_only() {
     ))
     .unwrap();
 
-    let first = delete_alignment_sample(&attached_conn(&connstr, &data_path), align_a, prep_a)
+    let first = delete_alignment_sample(&attached_writer(&connstr, &data_path), align_a, prep_a)
         .expect("delete_alignment_sample failed");
     // Three rows: two at seq 100 (multiplicity) + one at 101.
     assert_eq!(first["rows_deleted"], 3, "the pair's 3 rows deleted");
@@ -758,13 +758,14 @@ fn delete_alignment_sample_deletes_the_pair_only() {
     );
 
     // Idempotency: re-deleting the now-empty pair is success with 0 rows.
-    let second = delete_alignment_sample(&attached_conn(&connstr, &data_path), align_a, prep_a)
+    let second = delete_alignment_sample(&attached_writer(&connstr, &data_path), align_a, prep_a)
         .expect("idempotent re-delete failed");
     assert_eq!(second["rows_deleted"], 0, "second delete removes nothing");
 
     // A prep_sample that never registered rows is the same 0-row success.
-    let never = delete_alignment_sample(&attached_conn(&connstr, &data_path), align_a, prep_empty)
-        .expect("delete of a prep_sample with no rows failed");
+    let never =
+        delete_alignment_sample(&attached_writer(&connstr, &data_path), align_a, prep_empty)
+            .expect("delete of a prep_sample with no rows failed");
     assert_eq!(
         never["rows_deleted"], 0,
         "a prep_sample with no rows deletes 0"
@@ -902,7 +903,7 @@ fn mask_metrics_counts_buckets_both_mates_for_target_only() {
 /// emitting an invalid `IN ()` clause.
 #[test]
 fn delete_pool_reads_empty_set_is_zero_count_noop() {
-    let counts = delete_pool_reads(&unattached_conn(), &[])
+    let counts = delete_pool_reads(&unattached_writer(), &[])
         .expect("empty-set delete should succeed without touching the catalog");
     assert_eq!(counts["prep_sample_count"], 0);
     assert_eq!(counts["read_rows_deleted"], 0);
@@ -945,7 +946,7 @@ fn delete_pool_reads_drops_target_idempotently() {
     ))
     .unwrap();
 
-    let first = delete_pool_reads(&attached_conn(&connstr, &data_path), &[prep_a, prep_b])
+    let first = delete_pool_reads(&attached_writer(&connstr, &data_path), &[prep_a, prep_b])
         .expect("delete_pool_reads failed");
     assert_eq!(first["prep_sample_count"], 2);
     assert_eq!(first["read_rows_deleted"], 3, "prep_a (2) + prep_b (1)");
@@ -973,7 +974,7 @@ fn delete_pool_reads_drops_target_idempotently() {
     assert_eq!(mask_count(prep_other), 1, "other pool's mask untouched");
 
     // Idempotency: re-deleting the now-empty set is success with 0 rows.
-    let second = delete_pool_reads(&attached_conn(&connstr, &data_path), &[prep_a, prep_b])
+    let second = delete_pool_reads(&attached_writer(&connstr, &data_path), &[prep_a, prep_b])
         .expect("idempotent re-delete failed");
     assert_eq!(second["read_rows_deleted"], 0);
     assert_eq!(second["read_mask_rows_deleted"], 0);
@@ -1426,7 +1427,7 @@ fn register_files_rejects_filename_traversal() {
             work_ticket_idx: 1,
         };
         let err = register_files(
-            &unattached_conn(),
+            &unattached_writer(),
             "unused-data-path",
             std::path::Path::new("/"),
             &payload,
@@ -1802,7 +1803,7 @@ fn register_files_moves_and_registers_end_to_end() {
     };
 
     let outcome = register_files(
-        &attached_conn(&connstr, &data_path),
+        &attached_writer(&connstr, &data_path),
         &data_path,
         std::path::Path::new("/"),
         &payload,
@@ -1982,7 +1983,7 @@ fn register_files_replaces_shared_contigs_across_assembly_runs() {
         ),
     ]);
     let outcome_a = register_files(
-        &attached_conn(&connstr, &data_path),
+        &attached_writer(&connstr, &data_path),
         &data_path,
         std::path::Path::new("/"),
         &assembly_register_payload(&staging_a, 2, ticket_a),
@@ -2004,7 +2005,7 @@ fn register_files_replaces_shared_contigs_across_assembly_runs() {
         (b_only, "00000000-0000-0000-0000-000000971012", &["ACGT"]),
     ]);
     let outcome_b = register_files(
-        &attached_conn(&connstr, &data_path),
+        &attached_writer(&connstr, &data_path),
         &data_path,
         std::path::Path::new("/"),
         &assembly_register_payload(&staging_b, 2, ticket_b),
@@ -2110,7 +2111,7 @@ fn register_files_re_registering_the_same_contigs_does_not_accumulate() {
     for attempt in 0..3 {
         let staging = seed_assembly_staging(contigs);
         register_files(
-            &attached_conn(&connstr, &data_path),
+            &attached_writer(&connstr, &data_path),
             &data_path,
             std::path::Path::new("/"),
             &assembly_register_payload(&staging, 1, base_ticket + attempt),
@@ -2191,7 +2192,7 @@ fn register_parquets(
         work_ticket_idx: ticket,
     };
     register_files(
-        &attached_conn(connstr, data_path),
+        &attached_writer(connstr, data_path),
         data_path,
         std::path::Path::new("/"),
         &payload,
@@ -2366,7 +2367,7 @@ fn register_read_files(
         work_ticket_idx: ticket,
     };
     register_files(
-        &attached_conn(connstr, data_path),
+        &attached_writer(connstr, data_path),
         data_path,
         std::path::Path::new("/"),
         &payload,
@@ -3158,7 +3159,7 @@ fn concurrent_registrations_of_one_feature_leave_one_row() {
                     // Each writer attaches for itself, as each concurrent
                     // request borrows its own instance in production.
                     register_files(
-                        &attached_conn(connstr, data_path),
+                        &attached_writer(connstr, data_path),
                         data_path,
                         std::path::Path::new("/"),
                         payload,
@@ -3259,7 +3260,7 @@ fn register_files_replaces_sequences_shared_across_references() {
             work_ticket_idx: ticket,
         };
         let outcome = register_files(
-            &attached_conn(&connstr, &data_path),
+            &attached_writer(&connstr, &data_path),
             &data_path,
             std::path::Path::new("/"),
             &payload,
@@ -3447,7 +3448,7 @@ fn sync_reference_exclusion_full_replace_is_idempotent() {
     // The tempdir is the scratch root the handler contains reads to.
     let root = dir.path();
 
-    let first = sync_reference_exclusion(&attached_conn(&connstr, &data_path), &src, root)
+    let first = sync_reference_exclusion(&attached_writer(&connstr, &data_path), &src, root)
         .expect("sync failed");
     assert_eq!(
         first["feature_count"], 2,
@@ -3460,7 +3461,7 @@ fn sync_reference_exclusion_full_replace_is_idempotent() {
     );
 
     // Idempotency: re-running with the same file converges to the same table.
-    let second = sync_reference_exclusion(&attached_conn(&connstr, &data_path), &src, root)
+    let second = sync_reference_exclusion(&attached_writer(&connstr, &data_path), &src, root)
         .expect("re-sync failed");
     assert_eq!(second["feature_count"], 2, "same load on replay");
     assert_eq!(
@@ -3481,7 +3482,7 @@ fn sync_reference_exclusion_full_replace_is_idempotent() {
             ))
             .unwrap();
     }
-    let cleared = sync_reference_exclusion(&attached_conn(&connstr, &data_path), &empty, root)
+    let cleared = sync_reference_exclusion(&attached_writer(&connstr, &data_path), &empty, root)
         .expect("clear sync failed");
     assert_eq!(cleared["feature_count"], 0, "empty parquet loads zero rows");
     assert!(contents().is_empty(), "mirror cleared by the empty replace");
@@ -3503,7 +3504,7 @@ fn sync_reference_exclusion_full_replace_is_idempotent() {
     }
     let planted = dir.path().join("planted.parquet");
     std::os::unix::fs::symlink(&outside_pq, &planted).unwrap();
-    let escaped = sync_reference_exclusion(&attached_conn(&connstr, &data_path), &planted, root);
+    let escaped = sync_reference_exclusion(&attached_writer(&connstr, &data_path), &planted, root);
     assert_eq!(
         escaped.unwrap_err().code(),
         tonic::Code::PermissionDenied,
@@ -5335,6 +5336,17 @@ fn attached_conn(connstr: &str, data_path: &str) -> duckdb::Connection {
     conn
 }
 
+/// `attached_conn`, set up the way the pool lends a writing DoAction its
+/// connection.
+#[cfg(feature = "integration")]
+fn attached_writer(connstr: &str, data_path: &str) -> crate::pool::LakeWriter {
+    crate::pool::LakeWriter::for_tests(attached_conn(connstr, data_path))
+}
+
+fn unattached_writer() -> crate::pool::LakeWriter {
+    crate::pool::LakeWriter::for_tests(unattached_conn())
+}
+
 // ------------------------------------------------------------------
 // DoGet IPC compression — the parser being right does not prove the encoder
 // honoured it, so these drive the real `do_get` end to end and assert on
@@ -6492,7 +6504,7 @@ fn mint_phylogeny_edge_id_is_all_or_nothing_and_replay_safe() {
 
     // An entirely NULL tree is numbered, and `execute` reports the true count —
     // which is what the operator reads back as `minted_rows`.
-    let first = mint_phylogeny_edge_id(&attached_conn(&connstr, &data_path), all_null)
+    let first = mint_phylogeny_edge_id(&attached_writer(&connstr, &data_path), all_null)
         .expect("mint failed");
     assert_eq!(first["phylogeny_rows"], 3);
     assert_eq!(first["already_numbered_rows"], 0);
@@ -6510,7 +6522,7 @@ fn mint_phylogeny_edge_id_is_all_or_nothing_and_replay_safe() {
     assert_eq!(edge_ids(all_null), vec![Some(4), Some(7), Some(11)]);
 
     // Replay: the counts are re-read, the tree is already numbered, nothing moves.
-    let replay = mint_phylogeny_edge_id(&attached_conn(&connstr, &data_path), all_null)
+    let replay = mint_phylogeny_edge_id(&attached_writer(&connstr, &data_path), all_null)
         .expect("replay failed");
     assert_eq!(replay["already_numbered_rows"], 3);
     assert_eq!(replay["minted_rows"], 0, "a replay writes nothing");
@@ -6518,7 +6530,7 @@ fn mint_phylogeny_edge_id_is_all_or_nothing_and_replay_safe() {
 
     // The all-or-nothing gate: one numbered node is enough to stop the whole tree,
     // so the two NULLs stay NULL rather than being filled with a second numbering.
-    let mixed = mint_phylogeny_edge_id(&attached_conn(&connstr, &data_path), partial)
+    let mixed = mint_phylogeny_edge_id(&attached_writer(&connstr, &data_path), partial)
         .expect("gate call failed");
     assert_eq!(mixed["phylogeny_rows"], 3);
     assert_eq!(mixed["already_numbered_rows"], 1);
@@ -6536,7 +6548,7 @@ fn mint_phylogeny_edge_id_is_all_or_nothing_and_replay_safe() {
     assert_eq!(edge_ids(neighbour), vec![None]);
 
     // A reference with no rows at all is reported, not mistaken for a done tree.
-    let empty = mint_phylogeny_edge_id(&attached_conn(&connstr, &data_path), no_rows)
+    let empty = mint_phylogeny_edge_id(&attached_writer(&connstr, &data_path), no_rows)
         .expect("empty call failed");
     assert_eq!(empty["phylogeny_rows"], 0);
     assert_eq!(empty["minted_rows"], 0);

@@ -188,6 +188,18 @@ impl LakePool {
         &self.data_path
     }
 
+    /// Take a connection for writing to the lake, or refuse — the same bound as
+    /// `checkout`. See `LakeWriter`.
+    pub fn checkout_for_write(self: &Arc<Self>) -> Result<LakeWriter, Status> {
+        let pooled = self.checkout()?;
+        pooled
+            .execute_batch(LAKE_WRITE_SETTINGS)
+            .map_err(|e| Status::internal(format!("failed to set up a lake write: {e}")))?;
+        Ok(LakeWriter {
+            conn: WriterConnection::Pooled(pooled),
+        })
+    }
+
     /// Take a connection, or refuse. Never waits — the refusal is the in-flight
     /// bound; see the module docs for why it is not a queue.
     pub fn checkout(self: &Arc<Self>) -> Result<PooledConnection, Status> {
@@ -274,12 +286,11 @@ impl LakePool {
     /// connection kept a changed `preserve_insertion_order` after the request that
     /// set it was done.
     ///
-    /// `preserve_insertion_order` is off, and on only where a handler sets it for
-    /// itself. Nothing the pool serves depends on the order rows arrive in: no
-    /// DoGet query has an `ORDER BY`, chunks are reassembled by `chunk_index`, a
-    /// pair's mates share one row, no query takes a `LIMIT` or a first row without
-    /// ordering, and the masked-read DoGet is a join that carries no order either
-    /// way. No handler turns it on today.
+    /// `preserve_insertion_order` is off for reads: no DoGet query has an `ORDER
+    /// BY`, chunks are reassembled by `chunk_index`, a pair's mates share one row,
+    /// no query takes a `LIMIT` or a first row without ordering, and the
+    /// masked-read DoGet is a join that carries no order either way. A write to
+    /// the lake runs on a `LakeWriter`, which turns order on for its borrow.
     ///
     /// Two obligations follow. A handler that `SET`s anything not listed here
     /// leaks it to the next borrower, so a new `SET` in a request path belongs in
@@ -539,6 +550,66 @@ impl Drop for PooledConnection {
     fn drop(&mut self) {
         if let Some(member) = self.member.take() {
             self.pool.give_back(member);
+        }
+    }
+}
+
+/// What a lake write runs at, for the length of its borrow; the reset on return
+/// puts back the pool's baseline.
+///
+/// One thread, because on DuckLake `d8a1881e` a multi-threaded `INSERT` into a
+/// lake table loses its rows' order whatever `preserve_insertion_order` or an
+/// explicit `ORDER BY` say — measured, a 20M-row sorted source inserted at
+/// `threads=8` came back with 21–44 rows out of order per insert across all four
+/// combinations, and 0 at `threads=1`, while a plain Parquet `COPY` of the same
+/// source at `threads=8` kept it. Upstream, duckdb/ducklake#1356: the insert's
+/// copy is always planned parallel. `preserve_insertion_order` is on as well, for
+/// a write whose source order is the order wanted and that has no `ORDER BY`.
+const LAKE_WRITE_SETTINGS: &str = "SET threads=1; SET preserve_insertion_order=true;";
+
+/// A connection lent for writing to the lake. Data at rest is kept in its sort
+/// order, so every function that writes lake rows takes this rather than a
+/// `Connection`, and the only way to get one is `LakePool::checkout_for_write`,
+/// which applies `LAKE_WRITE_SETTINGS`. The type is what stops a write being
+/// handed a read's connection; it does not stop SQL that writes being run on a
+/// `PooledConnection` directly.
+pub struct LakeWriter {
+    conn: WriterConnection,
+}
+
+enum WriterConnection {
+    Pooled(PooledConnection),
+    #[cfg(test)]
+    Owned(Connection),
+}
+
+impl LakeWriter {
+    /// A test's own connection, set up the way `checkout_for_write` sets up a
+    /// pooled one.
+    #[cfg(test)]
+    pub(crate) fn for_tests(conn: Connection) -> Self {
+        conn.execute_batch(LAKE_WRITE_SETTINGS)
+            .expect("apply the lake write settings");
+        Self {
+            conn: WriterConnection::Owned(conn),
+        }
+    }
+}
+
+impl std::fmt::Debug for LakeWriter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LakeWriter").finish_non_exhaustive()
+    }
+}
+
+impl Deref for LakeWriter {
+    type Target = Connection;
+
+    fn deref(&self) -> &Connection {
+        match &self.conn {
+            WriterConnection::Pooled(pooled) => pooled,
+            #[cfg(test)]
+            WriterConnection::Owned(conn) => conn,
         }
     }
 }

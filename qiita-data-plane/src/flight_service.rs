@@ -38,7 +38,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::auth;
-use crate::pool::{LakePool, PooledConnection};
+use crate::pool::{LakePool, LakeWriter, PooledConnection};
 
 /// gRPC metadata key by which a DoGet client asks for a compressed IPC body.
 ///
@@ -163,6 +163,19 @@ impl QiitaFlightService {
     {
         let conn = self.pool.checkout()?;
         tokio::task::spawn_blocking(move || work(&conn))
+            .await
+            .map_err(|e| Status::internal(format!("{what} task join failed: {e}")))?
+    }
+
+    /// `blocking_lake` for an action that writes to the lake: the same bound, on a
+    /// `LakeWriter`.
+    async fn blocking_lake_write<T, F>(&self, what: &str, work: F) -> Result<T, Status>
+    where
+        F: FnOnce(&LakeWriter) -> Result<T, Status> + Send + 'static,
+        T: Send + 'static,
+    {
+        let writer = self.pool.checkout_for_write()?;
+        tokio::task::spawn_blocking(move || work(&writer))
             .await
             .map_err(|e| Status::internal(format!("{what} task join failed: {e}")))?
     }
@@ -779,7 +792,7 @@ impl FlightService for QiitaFlightService {
                 let data_path = self.pool.data_path().to_string();
                 let scratch_root = self.scratch_root.clone();
                 let registration = self
-                    .blocking_lake("register_files", move |conn| {
+                    .blocking_lake_write("register_files", move |conn| {
                         register_files(conn, &data_path, &scratch_root, &payload)
                     })
                     .await?;
@@ -809,7 +822,7 @@ impl FlightService for QiitaFlightService {
 
                 let reference_idx = payload.reference_idx;
                 let deleted = self
-                    .blocking_lake("delete_reference", move |conn| {
+                    .blocking_lake_write("delete_reference", move |conn| {
                         delete_reference(conn, reference_idx)
                     })
                     .await?;
@@ -836,7 +849,7 @@ impl FlightService for QiitaFlightService {
 
                 let mask_idx = payload.mask_idx;
                 let deleted = self
-                    .blocking_lake("delete_mask", move |conn| delete_mask(conn, mask_idx))
+                    .blocking_lake_write("delete_mask", move |conn| delete_mask(conn, mask_idx))
                     .await?;
 
                 let result_body = serde_json::to_vec(&deleted)
@@ -861,7 +874,7 @@ impl FlightService for QiitaFlightService {
 
                 let prep_sample_idxs = payload.prep_sample_idxs;
                 let deleted = self
-                    .blocking_lake("delete_pool_reads", move |conn| {
+                    .blocking_lake_write("delete_pool_reads", move |conn| {
                         delete_pool_reads(conn, &prep_sample_idxs)
                     })
                     .await?;
@@ -897,7 +910,7 @@ impl FlightService for QiitaFlightService {
                 let mask_idx = payload.mask_idx;
                 let members = payload.members;
                 let deleted = self
-                    .blocking_lake("delete_read_mask_block", move |conn| {
+                    .blocking_lake_write("delete_read_mask_block", move |conn| {
                         delete_read_mask_block(conn, mask_idx, &members)
                     })
                     .await?;
@@ -924,7 +937,7 @@ impl FlightService for QiitaFlightService {
 
                 let alignment_idx = payload.alignment_idx;
                 let deleted = self
-                    .blocking_lake("delete_alignment", move |conn| {
+                    .blocking_lake_write("delete_alignment", move |conn| {
                         delete_alignment(conn, alignment_idx)
                     })
                     .await?;
@@ -961,7 +974,7 @@ impl FlightService for QiitaFlightService {
                 let alignment_idx = payload.alignment_idx;
                 let members = payload.members;
                 let deleted = self
-                    .blocking_lake("delete_alignment_block", move |conn| {
+                    .blocking_lake_write("delete_alignment_block", move |conn| {
                         delete_alignment_block(conn, alignment_idx, &members)
                     })
                     .await?;
@@ -991,7 +1004,7 @@ impl FlightService for QiitaFlightService {
                 let alignment_idx = payload.alignment_idx;
                 let prep_sample_idx = payload.prep_sample_idx;
                 let deleted = self
-                    .blocking_lake("delete_alignment_sample", move |conn| {
+                    .blocking_lake_write("delete_alignment_sample", move |conn| {
                         delete_alignment_sample(conn, alignment_idx, prep_sample_idx)
                     })
                     .await?;
@@ -1136,7 +1149,7 @@ impl FlightService for QiitaFlightService {
                 // A full replace, plus a blocking `canonicalize` in the handler.
                 let scratch_root = self.scratch_root.clone();
                 let result = self
-                    .blocking_lake("sync_reference_exclusion", move |conn| {
+                    .blocking_lake_write("sync_reference_exclusion", move |conn| {
                         sync_reference_exclusion(conn, &dest, &scratch_root)
                     })
                     .await?;
@@ -1164,7 +1177,7 @@ impl FlightService for QiitaFlightService {
 
                 let reference_idx = payload.reference_idx;
                 let result = self
-                    .blocking_lake("mint_phylogeny_edge_id", move |conn| {
+                    .blocking_lake_write("mint_phylogeny_edge_id", move |conn| {
                         mint_phylogeny_edge_id(conn, reference_idx)
                     })
                     .await?;
@@ -2229,7 +2242,7 @@ fn lake_commit_backoff(attempt: u32, salt: i64) -> std::time::Duration {
 
 /// Take the lock that serializes writers of the replace-keyed tables. Call
 /// inside an open transaction; see `register_files` for why.
-fn take_registration_lock(conn: &duckdb::Connection) -> Result<(), Status> {
+fn take_registration_lock(conn: &LakeWriter) -> Result<(), Status> {
     let locked = conn
         .execute(
             "UPDATE qiita_lake.registration_lock SET epoch = epoch + 1",
@@ -2261,7 +2274,7 @@ fn take_registration_lock(conn: &duckdb::Connection) -> Result<(), Status> {
 /// fresh snapshot after DuckLake rolled the last one back. `salt` only spreads
 /// the backoff (see `lake_commit_backoff`).
 fn transact_with_retry<T>(
-    conn: &duckdb::Connection,
+    conn: &LakeWriter,
     what: &str,
     salt: i64,
     mut body: impl FnMut() -> Result<T, Status>,
@@ -2329,7 +2342,7 @@ struct Registration {
 /// reference_idx. The control plane is responsible for issuing tokens only for
 /// valid references in the correct state.
 fn register_files(
-    conn: &Connection,
+    conn: &LakeWriter,
     data_path: &str,
     scratch_root: &std::path::Path,
     payload: &auth::ActionPayload,
@@ -2684,7 +2697,7 @@ fn lake_file_ticket(path: &str) -> Option<i64> {
 /// Order matters: the sequence deletes run *before* the membership delete so
 /// the orphan subquery can still see this reference's rows. Idempotent — a
 /// reference with no loaded data deletes zero rows and still succeeds.
-fn delete_reference(conn: &Connection, reference_idx: i64) -> Result<serde_json::Value, Status> {
+fn delete_reference(conn: &LakeWriter, reference_idx: i64) -> Result<serde_json::Value, Status> {
     let exec = |sql: &str, params: &[i64]| -> Result<usize, Status> {
         // duckdb's params! wants &dyn ToSql; i64 implements it. Build the
         // slice explicitly so the same helper serves the 1- and 2-param calls.
@@ -2795,7 +2808,7 @@ fn delete_reference(conn: &Connection, reference_idx: i64) -> Result<serde_json:
 /// maintenance pass (matches `delete_reference`, which also reclaims nothing
 /// from disk). Idempotent: deleting a `mask_idx` with zero rows is success and
 /// returns `rows_deleted: 0`, so the control plane can safely retry.
-fn delete_mask(conn: &Connection, mask_idx: i64) -> Result<serde_json::Value, Status> {
+fn delete_mask(conn: &LakeWriter, mask_idx: i64) -> Result<serde_json::Value, Status> {
     // Single-statement delete wrapped in an explicit transaction so the action
     // is all-or-nothing and the control plane can safely retry: a failed call
     // leaves the mask's rows fully intact, so a retry sees the same row set.
@@ -2859,7 +2872,7 @@ fn delete_mask(conn: &Connection, mask_idx: i64) -> Result<serde_json::Value, St
 /// before reading, then inline the CANONICALIZED path (re-checked for a single
 /// quote a resolved symlink target could introduce) into `read_parquet`.
 fn sync_reference_exclusion(
-    conn: &Connection,
+    conn: &LakeWriter,
     dest: &Path,
     scratch_root: &Path,
 ) -> Result<serde_json::Value, Status> {
@@ -2958,7 +2971,7 @@ fn sync_reference_exclusion(
 /// means: a partly numbered tree comes back with `minted_rows` 0 rather than a
 /// partial write.
 fn mint_phylogeny_edge_id(
-    conn: &Connection,
+    conn: &LakeWriter,
     reference_idx: i64,
 ) -> Result<serde_json::Value, Status> {
     conn.execute_batch("BEGIN TRANSACTION")
@@ -3029,7 +3042,7 @@ fn mint_phylogeny_edge_id(
 /// returns zero counts. The `prep_sample_idxs` are `i64` parsed from the
 /// Ed25519-signed payload and inlined through `sql_i64_list`.
 fn delete_pool_reads(
-    conn: &Connection,
+    conn: &LakeWriter,
     prep_sample_idxs: &[i64],
 ) -> Result<serde_json::Value, Status> {
     // Empty set: nothing to do, and `IN ()` is not valid SQL. Return the
@@ -3108,7 +3121,7 @@ fn delete_pool_reads(
 /// this); guarded here too, returning a zero-count noop. All integers are
 /// signature-verified i64s, safe to inline.
 fn delete_read_mask_block(
-    conn: &Connection,
+    conn: &LakeWriter,
     mask_idx: i64,
     members: &[auth::BlockReadMember],
 ) -> Result<serde_json::Value, Status> {
@@ -3191,7 +3204,7 @@ const _: () = assert!(!ALIGNMENT_DELETE_TABLES.is_empty());
 /// `ALIGNMENT_DELETE_TABLES` literal and a clause whose values are either bound
 /// `?`s or inlined Ed25519-verified i64s.
 fn delete_lake_rows(
-    conn: &duckdb::Connection,
+    conn: &LakeWriter,
     tables: &[&str],
     where_clause: &str,
     params: &[&dyn duckdb::ToSql],
@@ -3236,7 +3249,7 @@ fn delete_lake_rows(
 /// control plane consumes both (`PoolReadPurgeResponse`); here there is no
 /// consumer, and no producer writing the side table, so a second key would carry
 /// a structural zero. A producer PR that adds a consumer adds the key with it.
-fn delete_alignment(conn: &Connection, alignment_idx: i64) -> Result<serde_json::Value, Status> {
+fn delete_alignment(conn: &LakeWriter, alignment_idx: i64) -> Result<serde_json::Value, Status> {
     let counts = delete_lake_rows(
         conn,
         ALIGNMENT_DELETE_TABLES,
@@ -3272,7 +3285,7 @@ fn delete_alignment(conn: &Connection, alignment_idx: i64) -> Result<serde_json:
 /// (the DoAction arm rejects it before this); guarded here too, returning a
 /// zero-count noop. All integers are Ed25519-verified i64s, safe to inline.
 fn delete_alignment_block(
-    conn: &Connection,
+    conn: &LakeWriter,
     alignment_idx: i64,
     members: &[auth::BlockReadMember],
 ) -> Result<serde_json::Value, Status> {
@@ -3333,7 +3346,7 @@ fn delete_alignment_block(
 /// reporting is `delete_alignment`'s. Idempotent: a prep_sample with no rows yet
 /// deletes 0 and still succeeds.
 fn delete_alignment_sample(
-    conn: &Connection,
+    conn: &LakeWriter,
     alignment_idx: i64,
     prep_sample_idx: i64,
 ) -> Result<serde_json::Value, Status> {
