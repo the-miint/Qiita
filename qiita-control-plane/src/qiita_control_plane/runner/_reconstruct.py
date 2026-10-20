@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import Any
 
 import asyncpg
+import pyarrow
+import pyarrow.flight
 from qiita_common.actions import (
     ALIGNMENT_IDX_BINDING,
     PROCESSING_IDX_BINDING,
@@ -314,10 +316,12 @@ async def _dispatch_action(
         )
         raise
     except Exception as exc:
-        if is_data_plane_transient(exc):
-            # A data-plane call the next attempt can clear (the data plane busy or
-            # unreachable, a catalog serialization conflict, a token that aged out):
-            # file it transient so the retry loop re-runs this entry.
+        if isinstance(
+            exc, (pyarrow.ArrowException, pyarrow.flight.FlightError)
+        ) and is_data_plane_transient(exc):
+            # Gated on the pyarrow types, as the orchestrator's dispatcher is, so a
+            # primitive's own Postgres error cannot match by text. File it transient
+            # so the retry loop re-runs this entry.
             failure = BackendFailure(
                 kind=FailureKind.DATA_PLANE_TRANSIENT,
                 stage=WorkTicketFailureStage.STEP_RUN,
@@ -512,8 +516,14 @@ async def _run_action_primitive(
                     rel = part.relative_to(staging_dir).as_posix()
                     files[rel] = entry_path.name
         if not files:
+            # The data plane moves the staged files out before its catalog
+            # transaction, so an empty directory on a re-run means an earlier
+            # attempt got that far.
             raise RuntimeError(
-                f"register-files: staging_dir {staging_dir} contains no Parquet files"
+                f"register-files: staging_dir {staging_dir} contains no Parquet files; "
+                "if an earlier attempt of this entry reached the data plane, it moved "
+                "them into the lake and its registration may have committed — check "
+                "the lake before re-running"
             )
         await LIBRARY[LibraryPrimitive.REGISTER_FILES](
             staging_dir=str(staging_dir),

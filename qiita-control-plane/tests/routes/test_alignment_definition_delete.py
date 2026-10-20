@@ -272,29 +272,16 @@ async def test_delete_alignment_busy_data_plane_returns_502(client, postgres_poo
     import pyarrow as pa
 
     from qiita_control_plane.actions import library as lib
+    from qiita_control_plane.testing.flight import REAL_BUSY_REFUSAL, flight_client_raising
 
     alignment_idx = await _seed_alignment(postgres_pool, client._created)
-
-    class _BusyClient:
-        def __init__(self, url):
-            pass
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *a):
-            return False
-
-        def do_action(self, action, options=None):
-            raise pa.ArrowInvalid(
-                "gRPC returned resource exhausted error, with message: data plane busy: "
-                "all 8 DuckLake connections are in use; retry"
-            )
 
     monkeypatch.setattr(
         "qiita_control_plane.routes.alignment.delete_alignment_data", lib.delete_alignment_data
     )
-    monkeypatch.setattr(lib._flight, "FlightClient", _BusyClient)
+    monkeypatch.setattr(
+        lib._flight, "FlightClient", flight_client_raising(pa.ArrowInvalid(REAL_BUSY_REFUSAL))
+    )
 
     resp = await client.delete(URL_ALIGNMENT_DEFINITION_BY_IDX.format(alignment_idx=alignment_idx))
     assert resp.status_code == 502

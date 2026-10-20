@@ -35,6 +35,7 @@ from qiita_common.data_plane_errors import (
 from qiita_common.models import WorkTicketFailureStage
 
 from qiita_control_plane.runner._upload import _submission_dp_fetch_failure
+from qiita_control_plane.testing.flight import REAL_BUSY_REFUSAL as _REAL_BUSY
 
 # A representative stringified pyarrow FlightError carrying the Postgres 40001
 # serialization message, as seen verbatim in a real read-mask fan-out
@@ -74,21 +75,6 @@ _REAL_UNAVAILABLE = (
 # CP's own text and the fixture would stop testing pyarrow's rendering at all.
 _REAL_EXPIRED = "Flight returned unauthenticated error, with message: ticket expired"
 
-
-# How a busy data plane reaches this layer. The data plane refuses a request it has
-# no free DuckLake connection for with gRPC RESOURCE_EXHAUSTED; this string is what
-# a pyarrow client raised for that status in a probe (pyarrow 23.0.1, grpcio 1.80.0,
-# a generic gRPC server answering RESOURCE_EXHAUSTED, with gRPC UNAVAILABLE as the
-# control reproducing `_REAL_UNAVAILABLE`'s shape). Note the exception class: pyarrow
-# surfaces this status as `ArrowInvalid`, a ValueError rather than a FlightError, which
-# is why the classifier matches text rather than a type.
-_REAL_BUSY = (
-    "gRPC returned resource exhausted error, with message: data plane busy: all 8 "
-    "DuckLake connections are in use; retry. gRPC client debug context: "
-    "UNKNOWN:Error received from peer ipv4:127.0.0.1:50051 {grpc_status:8, "
-    'grpc_message:"data plane busy: all 8 DuckLake connections are in use; retry"}. '
-    "Client context: IOError: Server never sent a data message."
-)
 
 # The same gRPC status and the same pyarrow class, from `AuthError::InvalidSignature`
 # — a key mismatch between the CP and the DP, which no redrive fixes. This is why
@@ -429,3 +415,38 @@ async def test_action_entry_other_failure_stays_unchanged(monkeypatch):
     raised, recorded = await _dispatch_action_raising(monkeypatch, exc)
     assert raised is exc
     assert recorded == [FailureKind.UNKNOWN_PERMANENT.value]
+
+
+async def test_action_entry_postgres_error_is_not_filed_as_a_data_plane_failure(monkeypatch):
+    """A primitive's own Postgres serialization failure carries the same SQLSTATE text
+    the data-plane classifier matches, but is not a pyarrow error, so it is not filed
+    `DATA_PLANE_TRANSIENT`."""
+    exc = RuntimeError("could not serialize access due to concurrent update")
+    raised, recorded = await _dispatch_action_raising(monkeypatch, exc)
+    assert raised is exc
+    assert recorded == [FailureKind.UNKNOWN_PERMANENT.value]
+
+
+async def test_register_files_rerun_after_the_files_moved_says_so(tmp_path):
+    """The data plane moves the staged files before its catalog transaction, so a
+    re-run of `register-files` can find the staging directory empty. Its reason says
+    that an earlier attempt may have committed rather than only that nothing is there."""
+    import pytest
+    from qiita_common.actions import WorkflowAction
+
+    from qiita_control_plane.runner import _run_action_primitive
+
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    entry = WorkflowAction(kind="action", name="register-files", inputs=["staging"], outputs=[])
+    with pytest.raises(RuntimeError, match="registration may have committed"):
+        await _run_action_primitive(
+            object(),
+            entry,
+            {"staging": str(staging)},
+            tmp_path,
+            {"kind": "prep_sample", "prep_sample_idx": 1},
+            work_ticket_idx=1,
+            signing_key=b"\x00" * 32,
+            data_plane_url="grpc://dp:50051",
+        )
