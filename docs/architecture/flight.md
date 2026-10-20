@@ -35,7 +35,9 @@ reasoning, and the edge limits it rests on, are in `pool.rs`. **No client retrie
 the call itself.** What a refusal becomes instead depends on the caller: a
 native job step is classified `data_plane_transient` and re-dispatched by the
 runner, a control-plane pre-loop fetch is held for an operator redrive, a
-DoAction from the control plane's action library fails permanently, and a refused
+DoAction from the control plane's action library is classified the same way and
+re-run by the runner when a workflow `action:` entry made it, or answered with a
+502 when a REST route did, and a refused
 upload reaches a person — both DoPut clients are the user-facing CLIs
 (`qiita reference load`, `qiita submit-reads`), which classify nothing and print
 the message. The

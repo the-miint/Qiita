@@ -64,8 +64,14 @@
   re-dispatches the step). The dispatcher previously classified none of them: pyarrow raises
   the refusal as `ArrowInvalid`, a plain `ValueError`, so an overload was recorded as
   malformed input, and raises the rest as `FlightError` subclasses, which escaped the
-  dispatcher entirely and failed the step with an unstructured non-zero exit. A DoAction
-  raised from the control plane's action library is still permanent.
+  dispatcher entirely and failed the step with an unstructured non-zero exit.
+- **A DoAction from the control plane's action library now handles a busy refusal (#713).** The
+  library raises it as a `FlightError`, as its primitives document, so a REST route that
+  deletes lake rows answers 502 instead of 500 and the post-load reference-exclusion sync
+  no longer marks a loaded reference `failed`. A workflow `action:` entry (`register-files`,
+  the `delete-*` entries, `mask-metrics`) whose DoAction fails for any of the transient
+  reasons above is now filed `data_plane_transient` and re-run by the runner, where it was
+  filed `unknown_permanent`.
 
 ### Fixed
 

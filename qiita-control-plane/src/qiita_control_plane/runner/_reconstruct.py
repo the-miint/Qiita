@@ -19,6 +19,7 @@ from qiita_common.api_paths import (
 )
 from qiita_common.backend_failure import BackendFailure, FailureKind
 from qiita_common.compute_backend_client import ComputeBackendClient
+from qiita_common.data_plane_errors import is_data_plane_transient
 from qiita_common.models import (
     TERMINAL_STEP_PROGRESS_STATES,
     ComputeTarget,
@@ -277,9 +278,10 @@ async def _dispatch_action(
 
     A primitive raising (plain Python or BackendFailure) marks this attempt's
     progress row failed before the exception propagates to the retry / outer
-    handler — which owns the work_ticket-level FAILED transition. The
-    exception is re-raised unchanged so the outer handler classifies it
-    exactly as before."""
+    handler — which owns the work_ticket-level FAILED transition. A data-plane
+    failure `is_data_plane_transient` recognises is raised as a transient
+    `DATA_PLANE_TRANSIENT` BackendFailure, so the retry loop re-runs the entry;
+    any other exception is re-raised unchanged."""
     await step_progress.record_submitting(
         pool,
         work_ticket_idx=work_ticket_idx,
@@ -312,6 +314,25 @@ async def _dispatch_action(
         )
         raise
     except Exception as exc:
+        if is_data_plane_transient(exc):
+            # A data-plane call the next attempt can clear (the data plane busy or
+            # unreachable, a catalog serialization conflict, a token that aged out):
+            # file it transient so the retry loop re-runs this entry.
+            failure = BackendFailure(
+                kind=FailureKind.DATA_PLANE_TRANSIENT,
+                stage=WorkTicketFailureStage.STEP_RUN,
+                step_name=entry.name,
+                reason=f"{type(exc).__name__}: {exc!s}"[:2000],
+            )
+            await _best_effort_record_failed(
+                pool,
+                work_ticket_idx=work_ticket_idx,
+                step_index=step_index,
+                attempt=attempt,
+                failure_kind=failure.kind.value,
+                failure_reason=failure.reason,
+            )
+            raise failure from exc
         # Plain Python from a LIBRARY primitive (untyped failure / bug). The
         # outer run_workflow handler classifies it UNKNOWN_PERMANENT; record
         # the same on the progress row, then re-raise unchanged.

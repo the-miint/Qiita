@@ -359,3 +359,73 @@ def test_bad_signature_stays_permanent():
     )
     assert f.kind is FailureKind.BAD_INPUT
     assert f.transient is False
+
+
+# ---------------------------------------------------------------------------
+# An `action:` entry's data-plane failure (`runner/_reconstruct._dispatch_action`).
+
+
+async def _dispatch_action_raising(monkeypatch, exc: BaseException) -> tuple[BaseException, list]:
+    """Run `_dispatch_action` with its primitive raising `exc` and the progress-row
+    writes stubbed; returns what it raised and the failure kinds it recorded."""
+    from qiita_common.actions import WorkflowAction
+
+    from qiita_control_plane.runner import _reconstruct
+
+    recorded: list = []
+
+    async def _noop(*a, **k):
+        return None
+
+    async def _record_failed(pool, **kw):
+        recorded.append(kw["failure_kind"])
+
+    async def _raise(*a, **k):
+        raise exc
+
+    monkeypatch.setattr(_reconstruct.step_progress, "record_submitting", _noop)
+    monkeypatch.setattr(_reconstruct, "_best_effort_record_failed", _record_failed)
+    monkeypatch.setattr(_reconstruct, "_run_action_primitive", _raise)
+    entry = WorkflowAction(kind="action", name="register-files", inputs=[], outputs=[])
+    try:
+        await _reconstruct._dispatch_action(
+            object(),
+            entry,
+            {},
+            Path("/unused"),
+            {"kind": "prep_sample", "prep_sample_idx": 1},
+            work_ticket_idx=1,
+            step_index=0,
+            attempt=0,
+            signing_key=b"\x00" * 32,
+            data_plane_url="grpc://dp:50051",
+        )
+    except BaseException as raised:
+        return raised, recorded
+    raise AssertionError("_dispatch_action did not raise")
+
+
+async def test_action_entry_busy_data_plane_is_retried(monkeypatch):
+    """A busy refusal from an `action:` entry's DoAction leaves `_dispatch_action` as a
+    transient `DATA_PLANE_TRANSIENT` failure, which the retry loop re-runs."""
+    import pyarrow.flight as flight
+    from qiita_common.backend_failure import BackendFailure
+
+    raised, recorded = await _dispatch_action_raising(
+        monkeypatch, flight.FlightUnavailableError(_REAL_BUSY)
+    )
+    assert isinstance(raised, BackendFailure)
+    assert raised.kind is FailureKind.DATA_PLANE_TRANSIENT
+    assert raised.transient is True
+    assert raised.stage is WorkTicketFailureStage.STEP_RUN
+    assert raised.step_name == "register-files"
+    assert recorded == [FailureKind.DATA_PLANE_TRANSIENT.value]
+
+
+async def test_action_entry_other_failure_stays_unchanged(monkeypatch):
+    """Any other failure from an `action:` entry propagates as it was raised and is
+    recorded `UNKNOWN_PERMANENT`, as before."""
+    exc = RuntimeError("boom")
+    raised, recorded = await _dispatch_action_raising(monkeypatch, exc)
+    assert raised is exc
+    assert recorded == [FailureKind.UNKNOWN_PERMANENT.value]

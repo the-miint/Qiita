@@ -40,6 +40,7 @@ from qiita_common.assembly_constants import (
     contig_attribute_projection,
     register_contig_attribute_table,
 )
+from qiita_common.data_plane_errors import is_data_plane_busy
 from qiita_common.models import (
     INDEX_TYPE_RYPE_ROUTER,
     FeatureHashEntry,
@@ -472,12 +473,21 @@ def _do_action(
     `timeout_seconds` bounds the Flight call: a hung-but-reachable data plane
     raises FlightTimedOutError (a FlightError subclass) instead of blocking
     forever. The exclusion sync passes it because it makes the call load-bearing
-    under a global advisory lock — see sync_reference_exclusion_data."""
+    under a global advisory lock — see sync_reference_exclusion_data.
+
+    A busy refusal is re-raised as FlightUnavailableError with its text intact, so
+    the primitives' documented "raises FlightError on data-plane failure" holds for
+    it too; pyarrow raises it as ArrowInvalid (see `qiita_common.data_plane_errors`)."""
     options = (
         _flight.FlightCallOptions(timeout=timeout_seconds) if timeout_seconds is not None else None
     )
-    with _flight.FlightClient(data_plane_url) as client:
-        return list(client.do_action(_flight.Action(action_type, token), options=options))
+    try:
+        with _flight.FlightClient(data_plane_url) as client:
+            return list(client.do_action(_flight.Action(action_type, token), options=options))
+    except pa.ArrowInvalid as exc:
+        if not is_data_plane_busy(exc):
+            raise
+        raise _flight.FlightUnavailableError(str(exc)) from exc
 
 
 # =============================================================================

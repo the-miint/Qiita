@@ -393,6 +393,91 @@ async def test_sync_reference_exclusion_primitive_still_raises_non_transient(tmp
         )
 
 
+# A busy refusal as pyarrow raises it: `ArrowInvalid`, not a `FlightError`
+# (`tests/test_dp_fetch_classifier.py` records the probe this text comes from).
+_BUSY_REFUSAL = (
+    "gRPC returned resource exhausted error, with message: data plane busy: all 8 "
+    "DuckLake connections are in use; retry"
+)
+
+
+def _flight_client_raising(exc: BaseException):
+    """A `FlightClient` stand-in whose `do_action` raises `exc`, so `_do_action`
+    itself runs rather than being stubbed out."""
+
+    class _Client:
+        def __init__(self, url):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def do_action(self, action, options=None):
+            raise exc
+
+    return _Client
+
+
+def test_do_action_raises_a_busy_refusal_as_a_flight_error(monkeypatch):
+    """A busy refusal leaves `_do_action` as a `FlightUnavailableError` carrying the
+    refusal's text, so every caller that catches `FlightError` handles it and the
+    transient classifier still recognises it."""
+    import pyarrow as pa
+    import pyarrow.flight as flight
+    import pytest
+    from qiita_common.data_plane_errors import is_data_plane_transient
+
+    from qiita_control_plane.actions import library as lib
+
+    monkeypatch.setattr(
+        lib._flight, "FlightClient", _flight_client_raising(pa.ArrowInvalid(_BUSY_REFUSAL))
+    )
+    with pytest.raises(flight.FlightUnavailableError, match="data plane busy") as info:
+        lib._do_action("delete_alignment", "grpc://dp:50051", b"token")
+    assert is_data_plane_transient(info.value)
+
+
+def test_do_action_leaves_other_arrow_invalid_as_it_is(monkeypatch):
+    """An `ArrowInvalid` that is not a busy refusal propagates unchanged: only the
+    refusal is the data plane's state rather than the request's."""
+    import pyarrow as pa
+    import pytest
+
+    from qiita_control_plane.actions import library as lib
+
+    monkeypatch.setattr(
+        lib._flight, "FlightClient", _flight_client_raising(pa.ArrowInvalid("bad payload"))
+    )
+    with pytest.raises(pa.ArrowInvalid, match="bad payload"):
+        lib._do_action("delete_alignment", "grpc://dp:50051", b"token")
+
+
+async def test_sync_reference_exclusion_primitive_swallows_a_busy_refusal(tmp_path, monkeypatch):
+    """A busy data plane during the post-load mirror sync reports `synced=False`
+    rather than raising, so it cannot mark the loaded reference `failed`."""
+    import pyarrow as pa
+
+    from qiita_control_plane.actions import library as lib
+
+    async def _fake_resolve(pool):
+        return [10, 20, 30]
+
+    monkeypatch.setattr(lib, "resolve_excluded_features", _fake_resolve)
+    monkeypatch.setattr(
+        lib._flight, "FlightClient", _flight_client_raising(pa.ArrowInvalid(_BUSY_REFUSAL))
+    )
+    out = await lib.sync_reference_exclusion(
+        _FakeExclusionPool(),
+        dest=tmp_path / "reference_exclusion.parquet",
+        signing_key=b"\x00" * 32,
+        data_plane_url="grpc://dp:50051",
+    )
+    assert out == {"synced_feature_count": None, "synced": False}
+
+
 def test_assembly_membership_join_resolves_contigs_to_bins_and_features(tmp_path):
     """The DuckDB join behind write-assembly-membership resolves each contig's
     synthetic read_id through bin_map (kind, bin_id) and manifest -> feature_map
