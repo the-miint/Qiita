@@ -395,6 +395,23 @@ fn the_sweep_removes_only_this_hosts_directories_whose_process_is_gone() {
     }
 }
 
+/// Two instances booting together can both list one abandoned directory; the
+/// second to remove it finds it gone, which is not a reason to stop boot.
+#[test]
+fn a_spill_directory_already_removed_is_not_a_boot_failure() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("qiita-1-Ab3dE9");
+    std::fs::create_dir(&dir).unwrap();
+
+    assert_eq!(remove_abandoned_spill_directory(&dir, 1), Ok(true));
+    assert!(!dir.exists());
+    assert_eq!(
+        remove_abandoned_spill_directory(&dir, 1),
+        Ok(false),
+        "the second removal finds it gone"
+    );
+}
+
 #[test]
 fn every_setting_that_could_end_a_sql_literal_is_rejected_at_construction() {
     /// The env var a case poisons, and how.

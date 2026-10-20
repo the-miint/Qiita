@@ -284,9 +284,9 @@ impl LakePool {
     /// Two obligations follow. A handler that `SET`s anything not listed here
     /// leaks it to the next borrower, so a new `SET` in a request path belongs in
     /// this list — except `temp_directory`, which cannot be re-applied (see
-    /// `settle`), so no handler may set it. And this is the only place limits are applied, so a
-    /// `Connection` built outside the pool — the boot connection in `main`, a
-    /// test's own — runs at DuckDB's defaults.
+    /// `settle`), so no handler may set it. And this is the only place limits
+    /// are applied, so a `Connection` built outside the pool — the boot
+    /// connection in `main`, a test's own — runs at DuckDB's defaults.
     fn apply_settings(&self, member: &Member) -> Result<(), duckdb::Error> {
         member.conn.execute_batch(&format!(
             "SET threads={};
@@ -471,21 +471,26 @@ fn sweep_abandoned_spill_directories(root: &Path, host: &str) -> Result<Vec<Path
         if !entry.file_type().is_ok_and(|t| t.is_dir()) {
             continue;
         }
-        // NotFound is another instance on this host booting at the same moment
-        // and removing it first (measured: `remove_dir_all` on a listed path
-        // removed since returns NotFound). Any other failure stops boot.
-        match std::fs::remove_dir_all(&path) {
-            Ok(()) => removed.push(path),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => {
-                return Err(format!(
-                    "cannot remove the spill directory {} left by pid {pid}: {e}",
-                    path.display()
-                ));
-            }
+        if remove_abandoned_spill_directory(&path, pid)? {
+            removed.push(path);
         }
     }
     Ok(removed)
+}
+
+/// Remove one abandoned spill directory; `Ok(false)` when it was already gone.
+/// That is another instance on this host booting at the same moment and removing
+/// it first (measured: `remove_dir_all` on a listed path removed since returns
+/// NotFound). Any other failure stops boot.
+fn remove_abandoned_spill_directory(path: &Path, pid: u32) -> Result<bool, String> {
+    match std::fs::remove_dir_all(path) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(format!(
+            "cannot remove the spill directory {} left by pid {pid}: {e}",
+            path.display()
+        )),
+    }
 }
 
 impl std::fmt::Debug for LakePool {
