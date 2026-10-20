@@ -12,7 +12,12 @@ DuckDB+miint session (mirrors `runner._stream_masked_reads_to_fastq`)."""
 
 from __future__ import annotations
 
-from qiita_common.ena_accession import validate_study_accession
+from qiita_common.ena_accession import (
+    EnaAccessionKind,
+    InvalidEnaAccessionError,
+    detect_accession_kind,
+    validate_study_accession,
+)
 from qiita_common.models.ena import EnaRunRecord, EnaSampleAttributes, EnaStudyHeader
 
 from qiita_control_plane.miint import connect_with_miint_staged
@@ -35,9 +40,9 @@ def _query_ena_study_header(accession: str) -> tuple[list[str], list[tuple]]:
         return [d[0] for d in rel.description], rel.fetchall()
 
 
-def _query_ena_runs(accession: str) -> tuple[list[str], list[tuple]]:
+def _query_ena_runs(accession: str | list[str]) -> tuple[list[str], list[tuple]]:
     """`read_ena(accession)` (default `result='read_run'`) — one row per run
-    under the study, restricted to `_RUN_FIELDS`."""
+    under a study, or per listed run, restricted to `_RUN_FIELDS`."""
     with connect_with_miint_staged() as con:
         rel = con.execute(
             "SELECT * FROM read_ena($accession, fields=$fields)",
@@ -46,10 +51,12 @@ def _query_ena_runs(accession: str) -> tuple[list[str], list[tuple]]:
         return [d[0] for d in rel.description], rel.fetchall()
 
 
-def _query_ena_sample_attributes(accession: str) -> list[tuple[str, dict[str, list[str]]]]:
+def _query_ena_sample_attributes(
+    accession: str | list[str],
+) -> list[tuple[str, dict[str, list[str]]]]:
     """One `(sample_accession, attributes)` row per sample, mapping each tag to its distinct
-    non-NULL values sorted. Entries are tag-ordered so a collision of normalised tags resolves
-    the same way every run."""
+    non-NULL values sorted, for a study or a list of samples. Entries are tag-ordered so a
+    collision of normalised tags resolves the same way every run."""
     with connect_with_miint_staged() as con:
         return con.execute(
             "SELECT sample_accession,"
@@ -103,3 +110,30 @@ class MiintEnaResolver:
             EnaSampleAttributes(sample_accession=sample_accession, attributes=attributes)
             for sample_accession, attributes in rows
         ]
+
+    def resolve_runs(self, run_accessions: list[str]) -> list[EnaRunRecord]:
+        """The listed runs, in one query. Returns only the runs ENA returned; raises
+        `EnaAccessionNotFoundError` only when it returned none."""
+        _require_kind(run_accessions, EnaAccessionKind.RUN)
+        columns, rows = _query_ena_runs(run_accessions)
+        if not rows:
+            raise EnaAccessionNotFoundError(
+                f"no public ENA runs found for {run_accessions!r}"
+                " (nonexistent, or not yet/no longer public)"
+            )
+        return [EnaRunRecord.model_validate(dict(zip(columns, row, strict=True))) for row in rows]
+
+    def resolve_sample_attributes_for_samples(
+        self, sample_accessions: list[str]
+    ) -> list[EnaSampleAttributes]:
+        _require_kind(sample_accessions, EnaAccessionKind.SAMPLE)
+        return [
+            EnaSampleAttributes(sample_accession=sample_accession, attributes=attributes)
+            for sample_accession, attributes in _query_ena_sample_attributes(sample_accessions)
+        ]
+
+
+def _require_kind(accessions: list[str], kind: EnaAccessionKind) -> None:
+    for accession in accessions:
+        if detect_accession_kind(accession) is not kind:
+            raise InvalidEnaAccessionError(f"'{accession}' is not a {kind.value} accession")

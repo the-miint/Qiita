@@ -1,21 +1,23 @@
 """Batch multi-study ENA import driver.
 
 `create_ena_import_batch` INSERTs one `qiita.ena_import_batch` row plus one
-`pending` `ena_import_batch_item` per accession and returns immediately (the
-route responds 202). `schedule_ena_import_batch` fires ONE background task on
-this module's own tracked set `app.state.running_ena_import_batches` (mirroring
+`pending` `ena_import_batch_item` per study accession and one for all run
+accessions, and returns immediately (the route responds 202).
+`schedule_ena_import_batch` fires ONE background task on this module's own
+tracked set `app.state.running_ena_import_batches` (mirroring
 `dispatch.py`'s `running_dispatches`; separate because this task drives
 `register_ena_study` + `submit_work_ticket_core` directly, not a
 `ComputeBackendClient` workflow run).
 
 The task (`_run_batch`) processes every item under the process-wide bound
-`_STUDY_CONCURRENCY`. Each item (`_process_one_study`): resolve
+`_STUDY_CONCURRENCY`. The run-list item is first split into one item per study
+(`_expand_run_list_item`). Each study item (`_process_one_study`): resolve
 (blocking calls under `asyncio.to_thread`) -> `_reconcile_held_run_availability`
 -> `register_ena_study` -> one `download-ena-study` ticket per pool holding
-the study's runs, reused when one already covers the pool and otherwise
+the item's runs, reused when one already covers the pool and otherwise
 submitted in-process through `submit_work_ticket_core` with the BATCH's
 submitting principal (so the ticket's audience gate is enforced against a
-real principal). One accession's failure marks only that item `failed`.
+real principal). One item's failure marks only that item `failed`.
 
 `reconcile_inflight_batches` (from `main.py` lifespan startup) re-drives every
 item still `pending`/`resolving`/`registered` after a CP restart --
@@ -34,7 +36,7 @@ from typing import Any
 
 import asyncpg
 from fastapi import FastAPI, HTTPException, status
-from qiita_common.ena_accession import validate_study_accession
+from qiita_common.ena_accession import EnaAccessionKind, validate_import_accession
 from qiita_common.models import WorkTicketState
 from qiita_common.models.ena import EnaStatus
 from qiita_common.models.ena_import import (
@@ -55,6 +57,7 @@ from ..repositories.ena_import_batch import (
     fetch_work_ticket_states_for_idxs,
     insert_ena_import_batch,
     insert_ena_import_batch_item,
+    split_run_list_item,
     update_ena_import_batch_item_registered,
     update_ena_import_batch_item_run_outcomes,
     update_ena_import_batch_item_state,
@@ -63,6 +66,7 @@ from ..repositories.ena_import_batch import (
 from ..repositories.sequenced_sample import (
     fetch_held_ena_run_accessions_for_study,
     fetch_non_terminal_work_tickets_for_sequenced_sample,
+    fetch_sequenced_pool_idxs_for_sequenced_samples,
     update_sequenced_sample_ena_status,
 )
 from ..repositories.study import (
@@ -129,12 +133,12 @@ _SUCCESSFUL_RUN_REGISTRATION_STATUSES = frozenset(
 
 @dataclass(frozen=True)
 class BatchImportItemHandle:
-    """One item's identity, threaded from `create_ena_import_batch` into
-    `_process_one_study`. Deliberately thinner than the `BatchImportItem` wire
-    shape."""
+    """One item's identity within its batch; thinner than the `BatchImportItem` wire shape."""
 
     idx: int
-    ena_study_accession: str
+    batch_idx: int
+    ena_study_accession: str | None
+    requested_run_accessions: list[str] | None = None
 
 
 async def create_ena_import_batch(
@@ -143,27 +147,45 @@ async def create_ena_import_batch(
     accessions: list[str],
     principal: HumanUser,
 ) -> tuple[int, list[BatchImportItemHandle]]:
-    """INSERT the batch row + one `pending` item per accession, synchronously.
+    """INSERT the batch row + one `pending` item per study, plus one ungrouped item
+    carrying every run accession, synchronously.
 
     Validates every accession's shape up front (fail-loud, before any write) so
     a batch with one garbage accession never partially lands. Returns the batch
-    idx and item handles in submitted order; the route fires the background task
-    next.
+    idx and item handles, studies in submitted order then the run-list item; the
+    route fires the background task next.
     """
-    # De-duplicate accessions, order-preserving: a repeated accession in one
-    # request would otherwise fan out concurrent items registering the same study.
-    validated = list(dict.fromkeys(validate_study_accession(a) for a in accessions))
+    # De-duplicate, order-preserving: a repeated accession in one request would
+    # otherwise fan out concurrent items registering the same study.
+    validated = [validate_import_accession(a) for a in accessions]
+    studies = list(dict.fromkeys(a for kind, a in validated if kind is EnaAccessionKind.STUDY))
+    runs = list(dict.fromkeys(a for kind, a in validated if kind is EnaAccessionKind.RUN))
 
     async with pool.acquire() as conn, conn.transaction():
         batch_idx = await insert_ena_import_batch(
             conn, submitted_by_principal_idx=principal.principal_idx
         )
-        items: list[BatchImportItemHandle] = []
-        for accession in validated:
-            item_idx = await insert_ena_import_batch_item(
-                conn, batch_idx=batch_idx, ena_study_accession=accession
+        items = [
+            BatchImportItemHandle(
+                idx=await insert_ena_import_batch_item(
+                    conn, batch_idx=batch_idx, ena_study_accession=accession
+                ),
+                batch_idx=batch_idx,
+                ena_study_accession=accession,
             )
-            items.append(BatchImportItemHandle(idx=item_idx, ena_study_accession=accession))
+            for accession in studies
+        ]
+        if runs:
+            items.append(
+                BatchImportItemHandle(
+                    idx=await insert_ena_import_batch_item(
+                        conn, batch_idx=batch_idx, requested_run_accessions=runs
+                    ),
+                    batch_idx=batch_idx,
+                    ena_study_accession=None,
+                    requested_run_accessions=runs,
+                )
+            )
     return batch_idx, items
 
 
@@ -265,7 +287,11 @@ async def _log_non_terminal_tickets_for_flagged_run(
 
 
 async def _reconcile_held_run_availability(
-    pool: asyncpg.Pool, *, study_idx: int, portal_run_accessions: frozenset[str]
+    pool: asyncpg.Pool,
+    *,
+    study_idx: int,
+    portal_run_accessions: frozenset[str],
+    only_runs: frozenset[str] | None = None,
 ) -> list[EnaRunRegistrationOutcome]:
     """Re-check every run this study already holds that the Portal's fresh
     response no longer names as public (`portal_run_accessions`), and clear the
@@ -284,8 +310,12 @@ async def _reconcile_held_run_availability(
     Returns one `EnaRunRegistrationOutcome` (`FLAGGED_UNAVAILABLE`) per run
     newly flagged or re-confirmed unavailable -- not per run merely checked or
     cleared, so a report distinguishes "still fine" from "flagged".
+
+    `only_runs` limits the check to those held runs.
     """
     held = await fetch_held_ena_run_accessions_for_study(pool, study_idx=study_idx)
+    if only_runs is not None:
+        held = [r for r in held if r["ena_run_accession"] in only_runs]
     candidates = [r for r in held if r["ena_run_accession"] not in portal_run_accessions]
     reappeared = [
         r
@@ -341,12 +371,13 @@ async def _reconcile_and_record(
     *,
     study_idx: int,
     portal_run_accessions: frozenset[str],
+    only_runs: frozenset[str] | None = None,
 ) -> list[EnaRunRegistrationOutcome]:
     """`_reconcile_held_run_availability`, then record its outcomes on the item
     at once: the flags are already committed, so the item must show them even
     if a later step fails it."""
     flagged = await _reconcile_held_run_availability(
-        pool, study_idx=study_idx, portal_run_accessions=portal_run_accessions
+        pool, study_idx=study_idx, portal_run_accessions=portal_run_accessions, only_runs=only_runs
     )
     async with pool.acquire() as conn:
         await update_ena_import_batch_item_run_outcomes(
@@ -369,6 +400,10 @@ async def _fail_after_held_run_check(
     public, or has no public runs. The Portal drops non-public runs, so "every
     run suppressed" arrives as one of these; an import-created study's held
     runs are re-checked first, and the failure names any flagged."""
+    # A run-list item read only its own runs, so there is nothing to re-check.
+    if item.requested_run_accessions is not None:
+        await _set_item_state(pool, item.idx, BatchItemState.FAILED, failure_reason=failure_reason)
+        return
     study_idx = await fetch_study_idx_by_either_ena_accession(pool, item.ena_study_accession)
     if study_idx is not None and await _study_created_by_an_import(pool, study_idx):
         flagged = await _reconcile_and_record(
@@ -436,8 +471,16 @@ async def _process_one_study(
                 pool, item, str(exc), portal_run_accessions=frozenset()
             )
             return
+        requested = item.requested_run_accessions
         try:
-            ena_runs = await asyncio.to_thread(resolver.resolve_ena_runs, item.ena_study_accession)
+            if requested is None:
+                ena_runs = await asyncio.to_thread(
+                    resolver.resolve_ena_runs, item.ena_study_accession
+                )
+            else:
+                # Re-resolved rather than handed down from expansion: a restart re-drives
+                # a split item from its row alone.
+                ena_runs = await asyncio.to_thread(resolver.resolve_runs, requested)
             no_runs_reason = None
         except EnaAccessionNotFoundError as exc:
             ena_runs, no_runs_reason = [], str(exc)
@@ -453,6 +496,16 @@ async def _process_one_study(
                 portal_run_accessions=public_run_accessions,
             )
             return
+        if requested is not None and (
+            unresolved := [r for r in requested if r not in public_run_accessions]
+        ):
+            await _set_item_state(
+                pool,
+                item.idx,
+                BatchItemState.FAILED,
+                failure_reason=_unresolved_runs_reason(unresolved),
+            )
+            return
         if not public_run_accessions:
             reasons = "; ".join(f"{run.run_accession} is {run.status.value}" for run in ena_runs)
             await _fail_after_held_run_check(
@@ -462,9 +515,15 @@ async def _process_one_study(
                 portal_run_accessions=public_run_accessions,
             )
             return
-        sample_attributes = await asyncio.to_thread(
-            resolver.resolve_sample_attributes, item.ena_study_accession
-        )
+        if requested is None:
+            sample_attributes = await asyncio.to_thread(
+                resolver.resolve_sample_attributes, item.ena_study_accession
+            )
+        else:
+            sample_attributes = await asyncio.to_thread(
+                resolver.resolve_sample_attributes_for_samples,
+                sorted({run.sample_accession for run in ena_runs}),
+            )
 
         # Resolve the study BEFORE registering anything, so an import into a
         # study we did not create fails with nothing written.
@@ -505,9 +564,14 @@ async def _process_one_study(
         # held runs are rows Qiita already has, so this does not depend on
         # register_ena_study having run. Disjoint from register_ena_study's
         # outcomes below (which only cover runs the Portal returned), so the
-        # two lists concatenate with no overlap.
+        # two lists concatenate with no overlap. A run-list item's runs all resolved
+        # public, so it only clears flags.
         flagged = await _reconcile_and_record(
-            pool, item, study_idx=study_idx, portal_run_accessions=public_run_accessions
+            pool,
+            item,
+            study_idx=study_idx,
+            portal_run_accessions=public_run_accessions,
+            only_runs=None if requested is None else public_run_accessions,
         )
         result = await register_ena_study(
             pool,
@@ -567,10 +631,25 @@ async def _process_one_study(
         from ..work_ticket_submit import submit_work_ticket_core
 
         # Each idx is persisted as it lands so a crash mid-loop orphans nothing.
+        own_pool_idxs = None
+        if requested is not None:
+            own_pool_idxs = await fetch_sequenced_pool_idxs_for_sequenced_samples(
+                pool,
+                [
+                    o.sequenced_sample_idx
+                    for o in result.ena_runs
+                    if o.sequenced_sample_idx is not None
+                ],
+            )
         any_ticket = False
         for sequencing_run_idx in dict.fromkeys(p.sequencing_run_idx for p in result.created_pools):
             for pool_state in await fetch_download_pool_states(pool, sequencing_run_idx):
                 if not pool_state["has_sequenced_sample"]:
+                    continue
+                if (
+                    own_pool_idxs is not None
+                    and pool_state["sequenced_pool_idx"] not in own_pool_idxs
+                ):
                     continue
                 if download_ticket_covers_pool(pool_state["work_ticket_state"]):
                     # Safe to reuse either way: a pool already covered when we
@@ -622,6 +701,102 @@ async def _process_one_study(
         await _set_item_state(pool, item.idx, BatchItemState.FAILED, failure_reason=str(exc))
 
 
+def _unresolved_runs_reason(unresolved: list[str]) -> str:
+    return f"run(s) unavailable at ENA: {', '.join(unresolved)}"
+
+
+async def _expand_run_list_item(
+    pool: asyncpg.Pool, item: BatchImportItemHandle
+) -> tuple[list[BatchImportItemHandle], list[str]]:
+    """Resolve an ungrouped run-list item and split it into one item per study.
+
+    Returns the per-study items to process, and the whole-study accessions that absorbed
+    every listed run (then there are no items). Never raises.
+    """
+    requested = item.requested_run_accessions
+    try:
+        await _set_item_state(pool, item.idx, BatchItemState.RESOLVING)
+        try:
+            ena_runs = await asyncio.to_thread(MiintEnaResolver().resolve_runs, requested)
+        except EnaAccessionNotFoundError:
+            ena_runs = []
+        study_by_run = {
+            r.run_accession: r.study_accession for r in ena_runs if r.status is EnaStatus.PUBLIC
+        }
+        if unresolved := [r for r in requested if r not in study_by_run]:
+            await _set_item_state(
+                pool,
+                item.idx,
+                BatchItemState.FAILED,
+                failure_reason=_unresolved_runs_reason(unresolved),
+            )
+            return [], []
+
+        runs_by_study: dict[str, list[str]] = {}
+        for run in requested:
+            runs_by_study.setdefault(study_by_run[run], []).append(run)
+        # A whole-study item of the same accession already imports these runs, and the
+        # batch allows one item per accession.
+        whole_studies = {
+            row["ena_study_accession"]
+            for row in await fetch_ena_import_batch_items(pool, item.batch_idx)
+            if row["requested_run_accessions"] is None
+        }
+        groups = [(s, r) for s, r in runs_by_study.items() if s not in whole_studies]
+        if not groups:
+            return [], list(runs_by_study)
+        async with pool.acquire() as conn, conn.transaction():
+            idxs = await split_run_list_item(conn, item_idx=item.idx, groups=groups)
+        if idxs is None:
+            return [], []
+        return [
+            BatchImportItemHandle(
+                idx=idx,
+                batch_idx=item.batch_idx,
+                ena_study_accession=study,
+                requested_run_accessions=runs,
+            )
+            for idx, (study, runs) in zip(idxs, groups, strict=True)
+        ], []
+    except Exception as exc:  # noqa: BLE001 -- item isolation.
+        _log.warning("ena_import_batch run-list item %d failed: %s", item.idx, exc)
+        await _set_item_state(pool, item.idx, BatchItemState.FAILED, failure_reason=str(exc))
+        return [], []
+
+
+async def _follow_absorbing_items(
+    pool: asyncpg.Pool, item: BatchImportItemHandle, accessions: list[str]
+) -> None:
+    """Give a wholly absorbed run-list item its absorbing items' download tickets, so it
+    rolls up with them. Never raises."""
+    try:
+        rows = [
+            r
+            for r in await fetch_ena_import_batch_items(pool, item.batch_idx)
+            if r["requested_run_accessions"] is None and r["ena_study_accession"] in accessions
+        ]
+        if failed := [
+            r["ena_study_accession"] for r in rows if r["state"] != BatchItemState.DOWNLOADING.value
+        ]:
+            await _set_item_state(
+                pool,
+                item.idx,
+                BatchItemState.FAILED,
+                failure_reason=(
+                    "every requested run belongs to a study this batch imports whole,"
+                    f" which failed: {', '.join(failed)}"
+                ),
+            )
+            return
+        for row in rows:
+            for ticket_idx in row["download_work_ticket_idxs"]:
+                await _append_item_download_ticket(pool, item.idx, ticket_idx)
+        await _mark_item_downloading(pool, item.idx)
+    except Exception as exc:  # noqa: BLE001 -- item isolation.
+        _log.warning("ena_import_batch absorbed run-list item %d failed: %s", item.idx, exc)
+        await _set_item_state(pool, item.idx, BatchItemState.FAILED, failure_reason=str(exc))
+
+
 async def _covering_download_ticket_idx(pool: asyncpg.Pool, sequenced_pool_idx: int) -> int | None:
     ticket = await fetch_pool_download_ticket(pool, sequenced_pool_idx=sequenced_pool_idx)
     if ticket is not None and download_ticket_covers_pool(ticket["work_ticket_state"]):
@@ -638,9 +813,18 @@ async def _run_batch(
     semaphore: asyncio.Semaphore,
 ) -> None:
     """Process every item against the process-wide `semaphore`. Never raises --
-    each item's own try/except in `_process_one_study` absorbs its failure."""
+    each item's own try/except absorbs its failure."""
 
     async def _bounded(item: BatchImportItemHandle) -> None:
+        if item.ena_study_accession is None:
+            # The permit is released before the children are awaited: they need their own.
+            async with semaphore:
+                children, absorbing = await _expand_run_list_item(pool, item)
+            if absorbing:
+                await asyncio.gather(*[whole[a] for a in absorbing if a in whole])
+                await _follow_absorbing_items(pool, item, absorbing)
+            await asyncio.gather(*[_bounded(child) for child in children])
+            return
         async with semaphore:
             await _process_one_study(
                 app,
@@ -649,7 +833,15 @@ async def _run_batch(
                 principal=principal,
             )
 
-    await asyncio.gather(*[_bounded(item) for item in items])
+    whole = {
+        item.ena_study_accession: asyncio.ensure_future(_bounded(item))
+        for item in items
+        if item.requested_run_accessions is None
+    }
+    await asyncio.gather(
+        *whole.values(),
+        *[_bounded(item) for item in items if item.requested_run_accessions is not None],
+    )
 
 
 def schedule_ena_import_batch(
@@ -723,7 +915,12 @@ async def reconcile_inflight_batches(app: FastAPI) -> int:
                 )
             continue
         items = [
-            BatchImportItemHandle(idx=r["idx"], ena_study_accession=r["ena_study_accession"])
+            BatchImportItemHandle(
+                idx=r["idx"],
+                batch_idx=batch_idx,
+                ena_study_accession=r["ena_study_accession"],
+                requested_run_accessions=r["requested_run_accessions"],
+            )
             for r in batch_rows
         ]
         _log.warning(
@@ -788,7 +985,9 @@ async def fetch_batch_status(pool: asyncpg.Pool, *, batch_idx: int) -> BatchImpo
         ena_runs = [EnaRunImportOutcome(**o) for o in json.loads(row["ena_run_outcomes"])]
         items.append(
             BatchImportItem(
+                idx=row["idx"],
                 ena_study_accession=row["ena_study_accession"],
+                requested_run_accessions=row["requested_run_accessions"],
                 state=state,
                 study_idx=row["study_idx"],
                 failure_reason=failure_reason,

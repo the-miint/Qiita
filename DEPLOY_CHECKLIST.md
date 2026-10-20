@@ -47,8 +47,7 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
 
 ### 3. Migrations
 
-- `[operator]` (#685) `make migrate` applies `20261009000000_work_ticket_follow_on.sql` (three nullable columns on `qiita.work_ticket`, two CHECKs, one partial index; no backfill).
-- `[operator]` (#711) `make migrate` applies `20261014000000_legacy_band_column_comments.sql` (rewords the comments on `study.idx`, `prep_sample.idx` and `sequenced_pool.idx`; no row, sequence or constraint change).
+_None yet._
 
 ### 4. Deploy
 
@@ -77,10 +76,11 @@ _None yet._
   rather than slow work. No client retries the call itself. Where a refusal lands today:
   a native job step gets `data_plane_transient` and the runner re-dispatches it within the
   ticket's `max_retries`; a control-plane pre-loop fetch is held for an operator redrive;
-  a DoAction from the control plane's action library (`register_files`, the `delete_*`
-  family) still surfaces it as a permanent failure. #539 and #582 carry the client half —
-  a reader that retries the call itself instead of failing the step. The Flight edge's own per-address admission (`deploy/nginx/qiita.conf`) is
-  what to weigh the pool size against.
+  a DoAction from the control plane's action library is re-run by the runner when a
+  workflow `action:` entry made it, and answered with a 502 when a REST route did. #539
+  and #582 carry the client half — a reader that retries the call itself instead of
+  failing the step. The Flight edge's own per-address admission (`deploy/nginx/qiita.conf`)
+  is what to weigh the pool size against.
 - (#713) Per-request wall time rises with the division. A request used to take every core;
   it now takes `threads`, and measured on this host one masked read fitted
   `25.3 s + 611.8 s / threads` — so at 48 cores and the default pool of 8 it is ~127 s where
@@ -88,10 +88,6 @@ _None yet._
 - (#713) A write under contention holds its connection while it retries: the registration
   path sleeps inside its 120 s commit budget, and every writer takes the same lock, so a
   write storm can occupy the whole pool and reads are refused for that window.
-
-- (#685) Work-ticket responses (`GET /work-ticket/{idx}` and the ticket lists) gain `on_success`, `follow_on_work_ticket_idx` and `follow_on_error` (all null for a ticket with no follow-on); clients validating that shape strictly must accept them.
-- (#707) New optional `FOLLOW_ON_SWEEP_INTERVAL_SECONDS` (default 60) tunes how often the control plane retries a transiently-failed follow-on; no action required.
-- (#711) `POST /study` now answers 422 to a body key it does not define, where it used to drop the key and return 201; a client sending extra keys must stop. It also takes an optional `study_idx` (system_admin only).
 
 ## Deployed history
 

@@ -18,7 +18,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 
 class BatchItemState(StrEnum):
-    """Per-accession lifecycle within one ena_import_batch.
+    """Per-item lifecycle within one ena_import_batch.
 
     pending -> resolving -> registered -> downloading -> done, with `failed`
     reachable from any non-terminal step. `done` is a rolled-up display state
@@ -45,8 +45,9 @@ TERMINAL_BATCH_ITEM_STATES: tuple[str, ...] = (
 class BatchImportRequest(BaseModel):
     """Body for `POST /api/v1/ena-import-batch`.
 
-    `accessions`: ENA STUDY accessions, one `qiita.study` per entry. The
-    transport each spawned ticket uses is the download job's to choose.
+    `accessions`: ENA study or run accessions, mixed. A study imports whole; runs
+    are grouped by their study and import only those runs. The transport each spawned
+    ticket uses is the download job's to choose.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -71,9 +72,15 @@ class EnaRunImportOutcome(BaseModel):
 
 
 class BatchImportItem(BaseModel):
-    """One accession's current state within a batch."""
+    """One item's current state within a batch: a whole study, or a list of runs.
 
-    ena_study_accession: str
+    `ena_study_accession` is null only on a run-list item not grouped by study;
+    `requested_run_accessions` is null for a whole-study item.
+    """
+
+    idx: int
+    ena_study_accession: str | None
+    requested_run_accessions: list[str] | None = None
     state: BatchItemState
     study_idx: int | None = None
     failure_reason: str | None = None

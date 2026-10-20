@@ -708,6 +708,17 @@ async def fetch_sequenced_pools_for_study(
     )
 
 
+async def fetch_sequenced_pool_idxs_for_sequenced_samples(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection, sequenced_sample_idxs: list[int]
+) -> set[int]:
+    """The sequenced_pool idxs holding any of `sequenced_sample_idxs`."""
+    rows = await pool_or_conn.fetch(
+        "SELECT sequenced_pool_idx FROM qiita.sequenced_sample WHERE idx = ANY($1::bigint[])",
+        sequenced_sample_idxs,
+    )
+    return {r["sequenced_pool_idx"] for r in rows}
+
+
 async def fetch_held_ena_run_accessions_for_study(
     pool_or_conn: asyncpg.Pool | asyncpg.Connection,
     *,

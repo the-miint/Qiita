@@ -423,3 +423,82 @@ def test_resolver_binds_the_staged_helper_not_the_client_installer():
 
     assert miint_resolver.connect_with_miint_staged is miint_module.connect_with_miint_staged
     assert not hasattr(miint_resolver, "connect_with_miint")
+
+
+def test_resolve_listed_runs_makes_one_seam_call_with_the_list(monkeypatch):
+    from qiita_control_plane.ena_import.miint_resolver import MiintEnaResolver
+
+    columns, rows = _load_fixture("ena_runs.json")
+    calls = []
+    monkeypatch.setattr(_QUERY_RUNS, lambda accession: calls.append(accession) or (columns, rows))
+
+    runs = MiintEnaResolver().resolve_runs(["SRR096342", "SRR096343"])
+
+    assert calls == [["SRR096342", "SRR096343"]]
+    assert_prjna48739_runs(runs)
+
+
+def test_resolve_listed_runs_returns_a_partial_result_without_raising(monkeypatch):
+    from qiita_control_plane.ena_import.miint_resolver import MiintEnaResolver
+
+    columns, rows = _load_fixture("ena_runs.json")
+    monkeypatch.setattr(_QUERY_RUNS, lambda accession: (columns, rows[:1]))
+
+    runs = MiintEnaResolver().resolve_runs(["SRR096342", "SRR000000"])
+
+    assert [r.run_accession for r in runs] == ["SRR096342"]
+
+
+def test_resolve_listed_runs_zero_rows_is_not_found(monkeypatch):
+    from qiita_control_plane.ena_import.miint_resolver import MiintEnaResolver
+
+    monkeypatch.setattr(_QUERY_RUNS, lambda accession: (["run_accession"], []))
+
+    with pytest.raises(EnaAccessionNotFoundError, match="SRR000000"):
+        MiintEnaResolver().resolve_runs(["SRR000000"])
+
+
+@pytest.mark.parametrize("bad", ["PRJNA48739", "SAMN00199006", "nonsense"])
+def test_resolve_listed_runs_rejects_a_non_run_accession(monkeypatch, bad):
+    from qiita_common.ena_accession import InvalidEnaAccessionError
+
+    from qiita_control_plane.ena_import.miint_resolver import MiintEnaResolver
+
+    monkeypatch.setattr(_QUERY_RUNS, lambda accession: pytest.fail("must not query"))
+
+    with pytest.raises(InvalidEnaAccessionError):
+        MiintEnaResolver().resolve_runs(["SRR096342", bad])
+
+
+def test_query_ena_runs_binds_a_list_as_given(monkeypatch):
+    fake = _FakeCapturingConnection()
+    monkeypatch.setattr(miint_resolver, "connect_with_miint_staged", lambda: fake)
+
+    miint_resolver._query_ena_runs(["SRR1", "SRR2"])
+
+    assert fake.captured_params["accession"] == ["SRR1", "SRR2"]
+
+
+def test_resolve_sample_attributes_for_samples_makes_one_seam_call_with_the_list(monkeypatch):
+    from qiita_control_plane.ena_import.miint_resolver import MiintEnaResolver
+
+    calls = []
+    monkeypatch.setattr(
+        _QUERY_ATTRS, lambda accession: calls.append(accession) or [("SAMN1", {"tag": ["x"]})]
+    )
+
+    attrs = MiintEnaResolver().resolve_sample_attributes_for_samples(["SAMN1", "SAMEA2"])
+
+    assert calls == [["SAMN1", "SAMEA2"]]
+    assert [(a.sample_accession, a.attributes) for a in attrs] == [("SAMN1", {"tag": ["x"]})]
+
+
+def test_resolve_sample_attributes_for_samples_rejects_a_non_sample_accession(monkeypatch):
+    from qiita_common.ena_accession import InvalidEnaAccessionError
+
+    from qiita_control_plane.ena_import.miint_resolver import MiintEnaResolver
+
+    monkeypatch.setattr(_QUERY_ATTRS, lambda accession: pytest.fail("must not query"))
+
+    with pytest.raises(InvalidEnaAccessionError):
+        MiintEnaResolver().resolve_sample_attributes_for_samples(["SAMN1", "SRR1"])

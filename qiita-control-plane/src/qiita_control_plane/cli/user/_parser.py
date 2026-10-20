@@ -1934,11 +1934,13 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p_ena_import = sub.add_parser(
         "submit-ena-import",
-        help="Submit a batch ENA study import (POST /ena-import-batch)",
+        help="Submit a batch ENA import of studies or runs (POST /ena-import-batch)",
         description=(
             "Submit one or more INSDC STUDY accessions (PRJNA/PRJEB/PRJDB/ERP/SRP/DRP)"
-            " for import: each becomes one qiita.study, with its runs registered and"
-            " downloaded via the download-ena-study workflow. Accessions may be given"
+            " and/or RUN accessions (SRR/ERR/DRR) for import: each study becomes one"
+            " qiita.study with its runs registered and downloaded via the"
+            " download-ena-study workflow, and a run accession imports only that"
+            " run, into its study. Accessions may be given"
             " positionally or via --from-file (one per line; blank lines and"
             " whole-line '#' comments are skipped — a line may not carry an inline"
             " comment or more than one accession). Requires wet_lab_admin or"
@@ -1948,7 +1950,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p_ena_import.add_argument(
         "accessions",
         nargs="*",
-        help="INSDC STUDY accession(s), e.g. PRJEB11419. Not valid with --from-file.",
+        help="INSDC study or run accession(s), e.g. PRJEB11419 or ERR1074767."
+        " Not valid with --from-file.",
     )
     p_ena_import.add_argument(
         "--from-file",

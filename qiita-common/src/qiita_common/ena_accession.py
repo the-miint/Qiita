@@ -83,3 +83,14 @@ def validate_study_accession(accession: str) -> str:
             f"(expected one of: {', '.join(_ACCESSION_PREFIXES[EnaAccessionKind.STUDY])})"
         )
     return accession.strip()
+
+
+def validate_import_accession(accession: str) -> tuple[EnaAccessionKind, str]:
+    """Validate `accession` is an importable INSDC study or run accession; return its kind
+    and stripped value. Raises `InvalidEnaAccessionError` for any other kind."""
+    kind = detect_accession_kind(accession)
+    if kind not in (EnaAccessionKind.STUDY, EnaAccessionKind.RUN):
+        raise InvalidEnaAccessionError(
+            f"'{accession}' is a {kind.value} accession; an import takes a study or run accession"
+        )
+    return kind, accession.strip()

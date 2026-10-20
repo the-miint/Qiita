@@ -58,3 +58,24 @@ def test_miint_resolver_unresolvable_accession_fails_loud():
     # A well-formed but non-existent BioProject accession.
     with pytest.raises(EnaAccessionNotFoundError):
         resolver.resolve_study_header("PRJNA00000000")
+
+
+@pytest.mark.system
+def test_miint_resolver_resolves_a_run_list_in_one_query():
+    resolver = MiintEnaResolver()
+    requested = ["SRR096342", "SRR096343"]
+
+    runs = resolver.resolve_runs(requested)
+    assert sorted(run.run_accession for run in runs) == requested
+    assert {run.study_accession for run in runs} == {_STUDY_ACCESSION}
+
+    samples = sorted({run.sample_accession for run in runs})
+    attrs = resolver.resolve_sample_attributes_for_samples(samples)
+    assert [a.sample_accession for a in attrs] == samples
+    assert all(a.attributes for a in attrs)
+
+
+@pytest.mark.system
+def test_miint_resolver_run_list_omits_an_unknown_run_without_raising():
+    runs = MiintEnaResolver().resolve_runs(["SRR096342", "SRR999999999"])
+    assert [run.run_accession for run in runs] == ["SRR096342"]

@@ -1,6 +1,6 @@
 """Batch multi-study ENA import routes.
 
-`POST /api/v1/ena-import-batch` accepts a *list* of INSDC study accessions,
+`POST /api/v1/ena-import-batch` accepts a *list* of INSDC study or run accessions,
 validates their shape up front (422 on anything malformed), and returns a batch
 handle immediately (202) — the resolve/register/download-submit work runs in a
 background task (`ena_import.batch`). `GET /api/v1/ena-import-batch/{idx}` reads
@@ -82,7 +82,10 @@ async def submit_ena_import_batch(
         ena_import_batch_idx=batch_idx,
         items=[
             BatchImportItem(
-                ena_study_accession=item.ena_study_accession, state=BatchItemState.PENDING
+                idx=item.idx,
+                ena_study_accession=item.ena_study_accession,
+                requested_run_accessions=item.requested_run_accessions,
+                state=BatchItemState.PENDING,
             )
             for item in items
         ],

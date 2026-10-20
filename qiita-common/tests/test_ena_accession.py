@@ -165,3 +165,31 @@ def test_validate_study_accession_rejects_invalid_shape():
 
     with pytest.raises(InvalidEnaAccessionError):
         validate_study_accession("")
+
+
+@pytest.mark.parametrize(
+    ("accession", "kind"),
+    [("PRJEB11419", "study"), ("  ERP012803 ", "study"), ("ERR1074767", "run"), ("SRR1", "run")],
+)
+def test_validate_import_accession_accepts_study_and_run(accession, kind):
+    from qiita_common.ena_accession import EnaAccessionKind, validate_import_accession
+
+    assert validate_import_accession(accession) == (
+        EnaAccessionKind(kind),
+        accession.strip(),
+    )
+
+
+@pytest.mark.parametrize("accession", ["SAMEA3610311", "SAMN01821487", "ERX1111111"])
+def test_validate_import_accession_rejects_sample_and_experiment(accession):
+    from qiita_common.ena_accession import InvalidEnaAccessionError, validate_import_accession
+
+    with pytest.raises(InvalidEnaAccessionError, match="study or run accession"):
+        validate_import_accession(accession)
+
+
+def test_validate_import_accession_rejects_garbage():
+    from qiita_common.ena_accession import InvalidEnaAccessionError, validate_import_accession
+
+    with pytest.raises(InvalidEnaAccessionError):
+        validate_import_accession("FOO123")

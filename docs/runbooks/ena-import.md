@@ -12,12 +12,14 @@ specific to importing from ENA.
 ## What an import does
 
 A single admin-facing call kicks off a **batch**: a list of INSDC study accessions
-(`PRJNA…`, `PRJEB…`, `PRJDB…`, `ERP…`, `SRP…`, `DRP…`). Each accession in the batch is
+(`PRJNA…`, `PRJEB…`, `PRJDB…`, `ERP…`, `SRP…`, `DRP…`), or run accessions (see
+[Importing chosen runs](#importing-chosen-runs)). Each study in the batch is
 processed independently, with bounded concurrency, in three phases. That bound is shared
 by every batch running in the control plane at once, first come first served: a later
-batch's accessions are not admitted until every accession of every batch submitted before
+batch's studies are not admitted until every study of every batch submitted before
 it has itself been admitted, so a busy batch can make a newly submitted one wait for it
-to clear the gate first.
+to clear the gate first. Listed runs take one slot to be resolved and grouped by study,
+then each study's runs queue again behind anything already waiting.
 
 1. **Resolve** — the study's header, run list, and per-sample attributes are pulled
    from ENA (via the `duckdb-miint` `read_ena` / `read_ena_attributes` table
@@ -63,6 +65,33 @@ download ticket that still fails there is FAILED/RETRIABLE: let the import
 finish, then redrive it with `POST /work-ticket/{idx}/run` — the redrive re-runs
 the download against the current roster; runs already stored are not fetched again.
 
+### Importing chosen runs
+
+Run accessions (`SRR…`, `ERR…`, `DRR…`) may be mixed with study accessions in one
+submit. The runs become a single ungrouped item that the control plane resolves in the
+background and splits into one item per study they belong to; each item then registers
+only its own listed runs. The study is created or reused exactly as for a
+whole-study import, so the same import-created-study guard applies.
+
+- **One unavailable run fails the whole item.** A run ENA does not return, or returns
+  non-public, fails the ungrouped item with `run(s) unavailable at ENA: …` naming every
+  such run, and nothing is registered or flagged. Fix the list and resubmit.
+- **Alongside a whole-study import.** A whole-study import of the same study, earlier or
+  later, skips the runs already present and registers the rest. A whole-study accession in the
+  same batch that exactly matches a run's study absorbs those runs, so no item is
+  duplicated. If every run is absorbed, the run-list item takes the absorbing items'
+  download tickets, every pool's, and ends `done` or `failed` as they do; its study
+  accession stays null. The match is on the exact string, so an `ERP…` whole-study item
+  alongside runs whose study reads `PRJEB…` becomes two items for one study. Each run
+  is still registered once, the same as with two concurrent batches.
+- **Only its own pools are ticketed.** A per-study run-list item submits or reuses a
+  download ticket only for pools holding its runs; re-import the whole study to retry
+  other failed pools.
+- **A failed pool's other runs download too.** New runs go into the newest pool without a
+  covering ticket. If that pool's earlier ticket failed, the item's new ticket reads the
+  pool's whole roster, so its unread runs are downloaded along with the listed ones.
+  Registration still covers exactly the listed runs.
+
 ### Re-importing, and studies we created ourselves
 
 Re-importing an accession is the supported way to pick up runs a bioproject gained
@@ -103,10 +132,12 @@ ena_study_accession='ERP1': study 42 has bioproject_accession 'PRJNA2'` — it d
 say the import was refused. Fix the accession passed to the import, or the study's
 recorded value, then re-import.
 
-A failure in any one accession — an unmappable platform, a resolver error, a database
-conflict — is recorded on that accession alone; it never aborts the batch or its
-sibling accessions. Poll with `qiita ena-import-status IDX` to see each accession's
-state and, on failure, the reason.
+A failure in any one item — an unmappable platform, a resolver error, a database
+conflict — is recorded on that item alone; it never aborts the batch or its
+sibling items. Listed runs share one item until they are grouped by study, so one
+unresolved run fails them all (see [Importing chosen runs](#importing-chosen-runs)).
+Poll with `qiita ena-import-status IDX` to see each item's state and, on failure, the
+reason.
 
 ### Non-public studies and runs
 
@@ -152,6 +183,11 @@ a 5xx.
   run is unavailable, and an availability check never leaves a run half-updated.
 - **A status this codebase does not recognize** fails the item the same way.
 
+A run-list import re-checks only its listed runs, and none when ENA does not return
+their study or returns it non-public. A listed run ENA no longer returns is not flagged;
+it fails the item as unavailable (see [Importing chosen runs](#importing-chosen-runs)).
+Re-import the whole study to flag it.
+
 **A study blocked by one run.** A held run that keeps returning 500 fails every
 re-import of its study before anything new registers. Check the run on the ENA
 Browser by hand; if ENA has withdrawn it, retire its prep_sample
@@ -195,19 +231,21 @@ did.
 ### REST surface
 
 - `POST /api/v1/ena-import-batch` — body: `{accessions: [...]}`. Returns `202` immediately with a batch
-  handle and every accession at its initial `pending` state; the resolve/register/
+  handle and one `pending` item per study accession, plus, when run accessions are
+  given, one with a null `ena_study_accession` holding them all; the resolve/register/
   submit work for the whole batch runs in the background. **Admin-only**
   (wet_lab_admin or system_admin) — this is an operator gesture, not something an
   end user submits, mirroring bcl-convert's own admin-only submission.
-- `GET /api/v1/ena-import-batch/{idx}` — the batch's current, rolled-up per-accession
-  status: `pending` / `resolving` / `registered` / `downloading` / `done` / `failed`,
-  with `study_idx` and the download ticket idx(s) once resolved, and a
+- `GET /api/v1/ena-import-batch/{idx}` — the batch's current, rolled-up per-item
+  status (the run item is split into one item per study once its runs resolve):
+  `pending` / `resolving` / `registered` / `downloading` / `done` / `failed`, with
+  `study_idx` and the download ticket idx(s) once resolved, and a
   `failure_reason` on any `failed` item. An item whose download ticket failed or was
   cancelled reports `failed`. Also admin-only.
 
-A control-plane restart re-drives every accession still `pending`, `resolving` or
+A control-plane restart re-drives every item still `pending`, `resolving` or
 `registered`, unless the batch's submitter has since been disabled or retired: those
-accessions fail with that reason instead, and a re-import by an active admin picks
+items fail with that reason instead, and a re-import by an active admin picks
 them up.
 
 `qiita submit-ena-import ACCESSION [ACCESSION ...]` (or `--from-file FILE`, one accession
@@ -219,7 +257,7 @@ whole call — then by default polls to terminal with `--poll-interval-seconds` 
 right after submit. A transient failure while polling — a dropped connection or a 5xx —
 is retried until the timeout instead of failing the watch; any other HTTP error is
 fatal. Exit codes: `0` every item reached `done`; `1` an item ended `failed`, the watch
-timed out (naming each still-pending accession and its last known state), an HTTP
+timed out (naming each still-pending item and its last known state), an HTTP
 error, or no token was found; `2` bad input (a malformed accession, a bad `--from-file`
 line, an out-of-range flag); `130` Ctrl-C, naming the batch to poll if the POST had
 already succeeded. `qiita ena-import-status IDX` reads a batch's current state and
@@ -390,7 +428,7 @@ An accession must be one of these prefixes followed by digits, e.g. `PRJEB11419`
 | run | `SRR`, `ERR`, `DRR` |
 | experiment | `SRX`, `ERX`, `DRX` |
 
-Submit takes study accessions only; anything else, including a well-formed sample or
-run, is refused at submit (CLI exit 2, HTTP 422) and no batch is created. An accession
+Submit takes study and run accessions; anything else, including a well-formed sample or
+experiment, is refused at submit (CLI exit 2, HTTP 422) and no batch is created. An accession
 of the right shape that ENA does not recognize fails loud with an actionable message
 rather than resolving to a silent empty result.
