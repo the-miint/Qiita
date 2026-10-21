@@ -20,8 +20,8 @@ Two facts drive each biosample, in this order:
      `is_control` (`input_sample.project_idx IS NULL`), read via
      `preflight.control_samples`, or a negative control in the biosample's own
      metadata (`negative_control_biosamples`) — not its name.
-  2. WHAT IS THE SAMPLE'S OWN TAXON? `taxon_id` (populated on every biosample we
-     hold) names the sample's organism — for a metagenome, the environment it
+  2. WHAT IS THE BIOSAMPLE'S OWN TAXON? `taxon_id` (populated on every biosample we
+     hold) names its organism — for a metagenome, the environment it
      came from. `human gut metagenome` implies a human host; `seawater
      metagenome` implies none.
 

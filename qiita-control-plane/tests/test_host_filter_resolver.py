@@ -348,7 +348,7 @@ async def test_control_sample_is_a_marker_not_a_decision(ctx):
     its POOL's hosts, which is a pool-level fact this single-sample function
     cannot see."""
     bs_idx = await _make_biosample(ctx)
-    await _set_host_missing_reason(ctx, bs_idx, "missing: control sample")
+    await _set_host_missing_reason(ctx, bs_idx, MISSING_REASON_CONTROL_SAMPLE)
 
     res = await resolve_host_filter(ctx["pool"], biosample_idx=bs_idx, platform=Platform.ILLUMINA)
 
@@ -487,20 +487,8 @@ async def test_is_control_sample_true_for_control_marker(ctx):
 
 
 async def test_is_control_sample_does_not_distinguish_positive_from_negative_control(ctx):
-    """KNOWN LIMITATION (see is_control_sample's docstring): the persisted control
-    marker is set from `is_control` alone, so a POSITIVE control (katharoseq — a
-    known spiked organism that SHOULD yield reads, whose zero-read outcome is really
-    a FAILURE) is represented IDENTICALLY to a NEGATIVE control (a blank). Both carry
-    `MISSING_REASON_CONTROL_SAMPLE` and there is no positive/negative field to key
-    on, so both classify as expected-empty here.
-
-    This test pins that collapse: a positive control cannot be told apart at this
-    layer and currently reads as expected-empty (→ `no_data` on zero reads, not a
-    failure). When the positive-vs-negative control policy lands a persisted signal,
-    this is the seam that must start returning False for a positive control — update
-    this test then. It is deliberately assay-policy-deferred, not an oversight."""
-    # There is only one way to represent ANY control at this layer today — the
-    # control missing-reason — so a "positive control" is byte-identical to a blank.
+    """The legacy marker alone can't tell a positive control from a blank, so it reads as
+    expected-empty."""
     positive_control_marked_like_any_control = await _make_biosample(ctx)
     await _set_host_missing_reason(
         ctx, positive_control_marked_like_any_control, MISSING_REASON_CONTROL_SAMPLE
@@ -666,7 +654,7 @@ async def test_batch_agrees_with_single_sample_for_every_outcome(ctx):
     await _set_host_missing_reason(ctx, biosamples["pass_through"], "not applicable")
 
     biosamples["control"] = await _make_biosample(ctx)
-    await _set_host_missing_reason(ctx, biosamples["control"], "missing: control sample")
+    await _set_host_missing_reason(ctx, biosamples["control"], MISSING_REASON_CONTROL_SAMPLE)
 
     biosamples["unrecognised_reason"] = await _make_biosample(ctx)
     await _set_host_missing_reason(ctx, biosamples["unrecognised_reason"], "not collected")

@@ -458,7 +458,7 @@ def _build_parser() -> argparse.ArgumentParser:
             " control metadata) gets 'missing: control sample'; otherwise the biosample's"
             " own taxon_id is mapped to a host through a small curated table. A biosample"
             " neither rule settles is REPORTED and left unwritten — it stays UNRESOLVED at"
-            " submit, which aborts rather than passing an un-depleted sample through."
+            " submit, which aborts rather than passing an un-depleted biosample through."
             " Idempotent: a biosample that already carries the field is skipped, so this"
             " can be re-run as curation lands. Dry-run by default; pass --execute to write."
             " Needs DATABASE_URL."

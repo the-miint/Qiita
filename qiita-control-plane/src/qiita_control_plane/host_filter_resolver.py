@@ -269,7 +269,7 @@ def _classify(
         return _without_references(
             HostFilterOutcome.UNRESOLVED,
             f"{BIOSAMPLE_FIELD_QIITA_SAMPLE_TYPE} term {term_id!r} on biosample {biosample_idx}"
-            " has no control classification; an operator must add one",
+            " has no control classification in this release",
         )
 
     # The field was never set. Not the same as "no host" — we simply were not
