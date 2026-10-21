@@ -1,7 +1,5 @@
-"""qiita user CLI — work-ticket subcommands.
-
-Split out of the former single-file ``cli.user`` module; behavior unchanged.
-"""
+"""qiita user CLI — work-ticket subcommands: submit, status, run, list, redrive
+and logs, each a thin client over the /work-ticket routes."""
 
 import argparse
 import json
