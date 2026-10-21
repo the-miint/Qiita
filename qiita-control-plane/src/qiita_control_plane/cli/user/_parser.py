@@ -37,6 +37,7 @@ from qiita_common.models import (
     HOST_FILTER_INDEX_TYPE_MINIMAP2,
     HOST_FILTER_INDEX_TYPE_RYPE,
     LEGACY_IDX_RESERVED_CEILING,
+    REDRIVABLE_WORK_TICKET_STATES,
     STORABLE_ACCESS_TIERS,
     BiosamplePatchRequest,
     BiosampleStudyFieldCreateRequest,
@@ -126,7 +127,6 @@ from .study import (
     _handle_study_list,
 )
 from .ticket import (
-    REDRIVABLE_STATES,
     _handle_ticket_list,
     _handle_ticket_logs,
     _handle_ticket_redrive,
@@ -1531,7 +1531,10 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_ticket_redrive.add_argument(
         "--state",
-        choices=[s.value for s in REDRIVABLE_STATES],
+        # PENDING is not offered: `/run` re-dispatches only a PENDING ticket whose
+        # create-time dispatch was lost, which a selector cannot tell from one
+        # that is dispatching now.
+        choices=sorted(REDRIVABLE_WORK_TICKET_STATES),
         default=WorkTicketState.FAILED.value,
         help="Which state to select (default: failed).",
     )

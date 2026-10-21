@@ -409,7 +409,7 @@ async def align_step_progress(
                 f"work_ticket {work_ticket_idx} has progress rows for entries the"
                 f" action's current steps list does not have: {described}. The"
                 " workflow was edited after these rows were written, so the ticket"
-                " cannot be resumed; delete it and submit a new one."
+                " cannot be resumed; submit a new ticket instead."
             )
         if moved:
             # The primary key includes step_index and is checked row by row, so

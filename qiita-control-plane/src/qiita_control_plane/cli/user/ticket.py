@@ -17,7 +17,6 @@ from qiita_common.models import (
     ScopeTargetKind,
     WorkTicketCreateRequest,
     WorkTicketListResponse,
-    WorkTicketState,
 )
 
 from .. import _common
@@ -231,11 +230,6 @@ def _handle_ticket_logs(args: argparse.Namespace, parser: argparse.ArgumentParse
         render=_render_ticket_logs,
     )
 
-
-# The states `/run` resets and re-dispatches. A PENDING ticket is re-dispatched
-# too, but only one whose create-time dispatch was lost, which a bulk selector
-# cannot tell from one that is dispatching now.
-REDRIVABLE_STATES = (WorkTicketState.FAILED, WorkTicketState.CANCELLED)
 
 # `/run` answers these when it refuses this one ticket (gone or not visible to
 # the caller; not in a redrivable state, or a refusal of its own such as a

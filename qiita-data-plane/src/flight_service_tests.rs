@@ -1941,13 +1941,14 @@ fn register_files_replayed_after_it_completed_registers_nothing_again() {
     assert_eq!(membership_rows(&connstr, &data_path, ref_idx), 2);
 }
 
-/// A registration whose files were moved into the lake but whose catalog
-/// transaction never committed is finished by the replay: the moved files are
-/// registered once.
+/// A replay that finds the files moved but not registered fails closed: the
+/// earlier call may still be registering them, and a second
+/// `ducklake_add_data_files` of a path adds its rows again
+/// (`ducklake_add_data_files_accepts_a_path_it_already_holds`).
 #[test]
 #[serial_test::serial]
 #[cfg(feature = "integration")]
-fn register_files_replayed_after_the_move_registers_the_moved_files() {
+fn register_files_replayed_before_the_earlier_call_committed_fails_closed() {
     let connstr = delete_test_catalog_connstr();
     let data_path = delete_test_data_path();
     let ref_idx: i64 = 972_000;
@@ -1965,13 +1966,75 @@ fn register_files_replayed_after_the_move_registers_the_moved_files() {
         "reference_membership.parquet",
     ));
     move_file(&staging.path().join("reference_membership.parquet"), &dest).unwrap();
+
+    let err = register_files(&connstr, &data_path, std::path::Path::new("/"), &payload)
+        .expect_err("a replay of an uncommitted registration is refused");
+
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition, "{err}");
     assert_eq!(membership_rows(&connstr, &data_path, ref_idx), 0);
+}
 
-    let replay = register_files(&connstr, &data_path, std::path::Path::new("/"), &payload)
-        .expect("replayed register_files failed");
+/// A replay that lands after the earlier registration's rows were deleted
+/// (all of them, or some) still registers nothing: DuckLake keeps listing a
+/// data file whose rows are deleted.
+#[test]
+#[serial_test::serial]
+#[cfg(feature = "integration")]
+fn register_files_replayed_after_its_rows_were_deleted_registers_nothing() {
+    let connstr = delete_test_catalog_connstr();
+    let data_path = delete_test_data_path();
+    for (ref_idx, filter, rows_left) in [
+        (973_000_i64, "", 0_i64),
+        (974_000_i64, " AND feature_idx = 1", 1_i64),
+    ] {
+        let ticket: i64 = ref_idx * 1000 + std::process::id() as i64;
+        prepare_membership_table(&connstr, &data_path, ref_idx);
+        let (_staging, payload) = seed_membership_registration(ref_idx, ticket);
+        let first = register_files(&connstr, &data_path, std::path::Path::new("/"), &payload)
+            .expect("first register_files failed");
+        let conn = Connection::open_in_memory().unwrap();
+        ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
+        conn.execute_batch(&format!(
+            "DELETE FROM qiita_lake.reference_membership WHERE reference_idx = {ref_idx}{filter};"
+        ))
+        .unwrap();
 
-    assert_eq!(replay.registered, vec![dest.to_str().unwrap().to_string()]);
+        let replay = register_files(&connstr, &data_path, std::path::Path::new("/"), &payload)
+            .expect("replayed register_files failed");
+
+        assert_eq!(replay.registered, first.registered);
+        assert_eq!(membership_rows(&connstr, &data_path, ref_idx), rows_left);
+    }
+}
+
+/// The reason a replay checks the catalog before registering: in the DuckLake
+/// we ship, adding a path the table already holds succeeds and counts its rows
+/// twice.
+#[test]
+#[serial_test::serial]
+#[cfg(feature = "integration")]
+fn ducklake_add_data_files_accepts_a_path_it_already_holds() {
+    let connstr = delete_test_catalog_connstr();
+    let data_path = delete_test_data_path();
+    // Unique per run: rows a prior local run added twice outlive the DELETE in
+    // `prepare_membership_table`, so a fixed reference_idx would not start at 0.
+    let ref_idx: i64 = 975_000_000 + std::process::id() as i64;
+    let ticket: i64 = ref_idx;
+    prepare_membership_table(&connstr, &data_path, ref_idx);
+    let (_staging, payload) = seed_membership_registration(ref_idx, ticket);
+    let first = register_files(&connstr, &data_path, std::path::Path::new("/"), &payload)
+        .expect("register_files failed");
     assert_eq!(membership_rows(&connstr, &data_path, ref_idx), 2);
+    let conn = Connection::open_in_memory().unwrap();
+    ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
+
+    conn.execute(
+        "CALL ducklake_add_data_files('qiita_lake', ?, ?)",
+        duckdb::params!["reference_membership", first.registered[0]],
+    )
+    .expect("a second add of the same path is accepted");
+
+    assert_eq!(membership_rows(&connstr, &data_path, ref_idx), 4);
 }
 
 // --- replace-by-key against a real DuckLake catalog ---
@@ -2428,25 +2491,6 @@ fn stage_read_files(
     (staging, files)
 }
 
-/// `files` as a registration places them, each still in `staging`.
-fn placed_in_staging(
-    staging: &std::path::Path,
-    files: &std::collections::HashMap<String, String>,
-) -> Vec<PlacedFile> {
-    files
-        .iter()
-        .map(|(filename, table)| {
-            let dest = staging.join("not-yet-moved").join(filename);
-            PlacedFile {
-                table: table.clone(),
-                src: staging.join(filename),
-                dest_str: dest.to_str().unwrap().to_string(),
-                dest,
-            }
-        })
-        .collect()
-}
-
 #[test]
 fn staged_read_prep_samples_collects_every_staged_read_prep_sample() {
     let spanning = format!(
@@ -2463,8 +2507,7 @@ fn staged_read_prep_samples_collects_every_staged_read_prep_sample() {
     // Other tables in the same registration are not read.
     files.insert("read_mask.parquet".to_string(), "read_mask".to_string());
     let conn = Connection::open_in_memory().unwrap();
-    let prep_samples =
-        staged_read_prep_samples(&conn, &placed_in_staging(staging.path(), &files)).unwrap();
+    let prep_samples = staged_read_prep_samples(&conn, staging.path(), &files).unwrap();
     assert_eq!(
         prep_samples,
         std::collections::BTreeSet::from([11, 22, 33, 44])
@@ -2484,7 +2527,7 @@ fn staged_read_prep_samples_refuses_a_null_prep_sample_idx() {
     );
     let (staging, files) = stage_read_files(&[("null", null_row)]);
     let conn = Connection::open_in_memory().unwrap();
-    let err = staged_read_prep_samples(&conn, &placed_in_staging(staging.path(), &files))
+    let err = staged_read_prep_samples(&conn, staging.path(), &files)
         .expect_err("a NULL prep_sample_idx is refused");
     assert_eq!(err.code(), tonic::Code::InvalidArgument, "{err}");
     assert!(err.message().contains("read/null.parquet"), "{err}");

@@ -6,14 +6,15 @@
   name), so inserting, removing or reordering steps in a workflow YAML no longer makes
   `qiita ticket run` or a control-plane restart fast-forward the wrong step. A ticket
   whose progress names a step the workflow no longer has (removed, renamed, or changed
-  between a `step:` and an `action:`) now fails at `submission`, naming that step, and
-  is resubmitted rather than redriven. `qiita.work_ticket_step` gains a
+  between a `step:` and an `action:`) now fails at `submission`, naming that step; submit
+  a new ticket for it instead of redriving. `qiita.work_ticket_step` gains a
   `step_occurrence` column, backfilled by the migration.
 - **`register-files` can be run again after it registered (#NNN).** A replay of the
   data plane's `register_files` — the control plane restarted after the registration
   committed but before it recorded the step complete — returns the files the first call
-  registered instead of failing with `staging file not found`, and a replay after the
-  files were moved but before the catalog commit registers the moved files once.
+  registered instead of failing with `staging file not found`. A replay that finds the
+  files moved but not registered still fails, since the first call may still be
+  registering them.
 
 ### Added
 

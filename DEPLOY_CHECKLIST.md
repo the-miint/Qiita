@@ -48,7 +48,7 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
 ### 3. Migrations
 
 - `[operator]` (#731) `make migrate` applies `20261021000000_sequenced_sample_download_failure.sql` (two nullable columns and a both-or-neither CHECK on `qiita.sequenced_sample`; no backfill).
-- `[operator]` (#resume-step-identity) `make migrate` also applies `20261021010000_work_ticket_step_occurrence.sql` (adds `qiita.work_ticket_step.step_occurrence`, backfilled in the migration from each ticket's synced `steps:`, then NOT NULL plus a unique index; no out-of-band step).
+- `[operator]` (#resume-step-identity) `make migrate` also applies `20261021010000_work_ticket_step_occurrence.sql` (adds `qiita.work_ticket_step.step_occurrence`, backfilled in the migration from each ticket's synced `steps:`, then NOT NULL plus a unique index; a trigger fills it for the still-running control plane, whose INSERT omits it, so migrating before the restart is safe; no out-of-band step).
 
 ### 4. Deploy
 

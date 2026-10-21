@@ -369,7 +369,7 @@ qiita ticket list --active
 qiita ticket status <idx>
 qiita ticket logs <idx> --step-index 0
 qiita ticket run <idx>        # re-drive a failed job, resuming at the first unfinished step
-qiita ticket redrive --sequenced-pool-idx <pool>   # list the pool's failed jobs; --execute re-drives each
+qiita ticket redrive --sequenced-pool-idx <pool>   # list your failed jobs in the pool; --execute re-drives each
 qiita pool-completion --sequencing-run-idx <run> --sequenced-pool-idx <pool>
 ```
 

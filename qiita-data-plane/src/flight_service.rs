@@ -571,8 +571,8 @@ fn block_read_source(table: &str) -> Option<&'static str> {
 /// - `register_files` — the dest name is deterministic for the registration
 ///   (see `lake_dest_filename`), so a replay after success finds every file
 ///   already a data file of its table and returns the earlier registration
-///   without writing; a replay after the move but before the catalog commit
-///   registers the moved files once.
+///   without writing; a replay that finds the files moved but not all
+///   registered fails closed.
 /// - `delete_reference` / `delete_mask` / `delete_pool_reads` /
 ///   `delete_read_mask_block` / `delete_alignment` / `delete_alignment_block` /
 ///   `delete_alignment_sample` — logical DELETEs, idempotent against themselves:
@@ -2380,10 +2380,8 @@ fn register_files(
     // One scope key for the whole registration; it does not vary per file.
     let scope = staging_scope(&payload.staging_dir, scratch_root);
 
-    // Where each file is placed in the lake. The name is deterministic for the
-    // (ticket, staging dir, basename), so a replayed call — the caller lost the
-    // reply, or died before recording it — finds the files an earlier call
-    // moved. Every file must be in staging or already at its destination.
+    // Where each file is placed in the lake. Every file must be in staging, or
+    // at the destination an earlier call with this payload moved it to.
     let mut placed: Vec<PlacedFile> = Vec::new();
     for (filename, table) in &payload.files {
         let src = staging.join(filename);
@@ -2424,28 +2422,32 @@ fn register_files(
 
     // Tables are ensured at startup in main.rs.
 
-    // A replay of a registration that committed: every destination is already
-    // a data file of its table. Registering them again would add their rows a
-    // second time to tables outside `REPLACE_KEY_TABLES`, so return what the
-    // earlier call registered. The registration below commits all of a call's
-    // files or none, so a call that finds only some of them registered did not
-    // come from this one.
-    let in_catalog = registered_data_files(&conn, &placed)?;
-    if !placed.is_empty() && in_catalog.len() == placed.len() {
-        return Ok(Registration {
-            registered: placed.into_iter().map(|p| p.dest_str).collect(),
-            replaced: BTreeMap::new(),
-        });
-    }
-    if !in_catalog.is_empty() {
-        return Err(Status::internal(format!(
-            "registration for work_ticket {} from {} is partly in the catalog \
-             already ({} of {} files: {:?}); refusing to register the rest",
+    // A file gone from staging is a replay of this payload: the caller lost the
+    // reply, or died before recording it, and called again. The destination name
+    // is deterministic for the (ticket, staging dir, basename), so the replay
+    // finds where the earlier call moved each file. When every file was moved and
+    // is a data file of its table, the earlier call committed, and its
+    // registration is returned without writing: `ducklake_add_data_files`
+    // accepts a path it already holds and adds its rows again. Any other state
+    // fails closed, because the earlier call may still be registering the files.
+    let moved_before = placed.iter().filter(|f| !f.src.exists()).count();
+    if moved_before > 0 {
+        let in_catalog = registered_data_files(&conn, &placed)?;
+        if moved_before == placed.len() && in_catalog.len() == placed.len() {
+            return Ok(Registration {
+                registered: placed.into_iter().map(|p| p.dest_str).collect(),
+                replaced: BTreeMap::new(),
+            });
+        }
+        return Err(Status::failed_precondition(format!(
+            "an earlier register_files call for work_ticket {} from {} moved {} of {} \
+             files into the lake and registered {} of them; it did not commit, or \
+             has not yet",
             payload.work_ticket_idx,
             payload.staging_dir,
-            in_catalog.len(),
+            moved_before,
             placed.len(),
-            in_catalog
+            in_catalog.len()
         )));
     }
 
@@ -2457,14 +2459,13 @@ fn register_files(
     // deleted in the registration transaction below. Only files named for this
     // ticket are deleted from, so rows another ticket registered are left as they
     // are.
-    let staged_read = staged_read_prep_samples(conn, &placed)?;
+    let staged_read = staged_read_prep_samples(conn, staging, &payload.files)?;
     let replace_read_files =
         ticket_read_files_in_lake(conn, payload.work_ticket_idx, &staged_read)?;
     let replace_read_prep_samples: Vec<i64> = staged_read.into_iter().collect();
 
-    // Move all files to permanent storage. A file already at its destination
-    // was moved by an earlier call whose registration did not commit (no file
-    // of this call is in the catalog, checked above).
+    // Move all files to permanent storage. `move_file` refuses a destination
+    // that exists, so a call racing this one for the same payload fails closed.
     // (DuckLake table, permanent path). The path is carried as a String because
     // every consumer below binds it into SQL or reports it.
     let mut moved: Vec<(String, String)> = Vec::new();
@@ -2478,21 +2479,7 @@ fn register_files(
                 dest_dir.display()
             ))
         })?;
-        if file.src.exists() {
-            if file.dest.exists() {
-                // Both present and the destination not registered: an earlier
-                // call's move did not finish (a cross-filesystem copy that was
-                // interrupted, or whose source unlink failed). The staging file
-                // is the complete one, so the destination is replaced.
-                std::fs::remove_file(&file.dest).map_err(|e| {
-                    Status::internal(format!(
-                        "failed to remove unregistered lake file {}: {e}",
-                        file.dest.display()
-                    ))
-                })?;
-            }
-            move_file(&file.src, &file.dest)?;
-        }
+        move_file(&file.src, &file.dest)?;
         moved.push((file.table.clone(), file.dest_str.clone()));
     }
 
@@ -2506,11 +2493,11 @@ fn register_files(
     // Atomicity here is CATALOG-LEVEL ONLY: the filesystem moves above have
     // already happened and are NOT rolled back. That is intentional and safe.
     // Each dest name is registration-unique (lake_dest_filename keys on the work
-    // ticket and the staging dir), so a rolled-back registration leaves its files
-    // at those names, unreferenced, and a replay of the same call registers them
-    // (the placement above). A registration that is never replayed leaves them as
-    // orphan Parquets, which DuckLake already tolerates (the delete_* actions
-    // reclaim nothing from disk either); a future maintenance pass sweeps them.
+    // ticket and the staging dir) and move_file refuses to overwrite, so a rolled-back registration
+    // leaves at most an unreferenced orphan Parquet on disk — never a collision
+    // and never a double-registration. This matches how DuckLake already
+    // tolerates orphan Parquets (the delete_* actions reclaim nothing from disk
+    // either); a future maintenance pass sweeps them.
     //
     // Registrations that touch a replace-keyed table SERIALIZE against each
     // other, and retry when they lose. Both halves are needed:
@@ -2644,18 +2631,6 @@ struct PlacedFile {
     dest_str: String,
 }
 
-impl PlacedFile {
-    /// The file's current copy: the staging source until it is moved, the
-    /// lake destination after.
-    fn current(&self) -> &std::path::Path {
-        if self.src.exists() {
-            &self.src
-        } else {
-            &self.dest
-        }
-    }
-}
-
 /// The destinations of `placed` that are already data files of their table in
 /// the catalog.
 fn registered_data_files(
@@ -2685,21 +2660,21 @@ fn registered_data_files(
         .collect())
 }
 
-/// The prep_samples the registration's `read` files hold. Files headed for other
-/// tables are not opened. A row with a NULL `prep_sample_idx` is refused: the
-/// replace could never match it.
+/// The prep_samples the staged `read` files hold. Files headed for other tables
+/// are not opened. A row with a NULL `prep_sample_idx` is refused: the replace
+/// could never match it.
 fn staged_read_prep_samples(
     conn: &duckdb::Connection,
-    placed: &[PlacedFile],
+    staging: &std::path::Path,
+    files: &std::collections::HashMap<String, String>,
 ) -> Result<std::collections::BTreeSet<i64>, Status> {
     let mut prep_samples = std::collections::BTreeSet::new();
-    for file in placed {
-        if file.table != "read" {
+    for (filename, table) in files {
+        if table != "read" {
             continue;
         }
-        let current = file.current();
-        let filename = current.display();
-        let path = current
+        let path = staging.join(filename);
+        let path = path
             .to_str()
             .ok_or_else(|| Status::invalid_argument(format!("non-UTF-8 path: {filename}")))?;
         let read_failed =
@@ -3496,10 +3471,10 @@ const LAKE_FILE_TICKET_PREFIX: &str = "wt";
 /// Deterministic for a given (ticket, staging dir), so a replayed DoAction
 /// recomputes the same name, and `register_files` recognises a replay from it:
 /// it returns the earlier registration when every file is already a data file of
-/// its table, and registers the files an earlier call moved when none is. A
-/// random name would hide both from it, and the tables outside
-/// `REPLACE_KEY_TABLES` (e.g. `reference_membership`), which have no
-/// replace-by-key to absorb a second registration, would be registered twice.
+/// its table, and fails closed otherwise. A random name would hide the replay
+/// from it, and the tables outside `REPLACE_KEY_TABLES` (e.g.
+/// `reference_membership`), which have no replace-by-key to absorb a second
+/// registration, would be registered twice.
 ///
 /// DuckLake names its own INSERT-written data files uniquely for the same
 /// reason; this is the equivalent for our "register an existing file" path.

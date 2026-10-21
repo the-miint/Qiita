@@ -55,6 +55,34 @@ UPDATE qiita.work_ticket_step s
 ALTER TABLE qiita.work_ticket_step
   ALTER COLUMN step_occurrence SET NOT NULL;
 
+-- `make migrate` runs while the previous control plane still serves, and its
+-- write-ahead INSERT names no step_occurrence. For an INSERT that leaves it
+-- NULL, this trigger counts it off the ticket's synced action, the same count
+-- the exact backfill above takes; without a match it is 0 and the NOT NULL
+-- holds. The current control plane always sets the column, so for it the
+-- trigger does nothing.
+CREATE FUNCTION qiita.work_ticket_step_fill_occurrence() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+  IF NEW.step_occurrence IS NULL THEN
+    SELECT count(*)
+      INTO NEW.step_occurrence
+      FROM qiita.work_ticket t
+      JOIN qiita.action a
+        ON a.action_id = t.action_id AND a.version = t.action_version
+      CROSS JOIN LATERAL jsonb_array_elements(a.steps) WITH ORDINALITY AS e(entry, ord)
+     WHERE t.work_ticket_idx = NEW.work_ticket_idx
+       AND e.ord - 1 < NEW.step_index
+       AND e.entry ->> 'name' = NEW.step_name;
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER work_ticket_step_fill_occurrence
+  BEFORE INSERT ON qiita.work_ticket_step
+  FOR EACH ROW EXECUTE FUNCTION qiita.work_ticket_step_fill_occurrence();
+
 CREATE UNIQUE INDEX work_ticket_step_identity_attempt
   ON qiita.work_ticket_step (work_ticket_idx, step_name, step_occurrence, attempt);
 
@@ -64,6 +92,8 @@ COMMENT ON COLUMN qiita.work_ticket_step.step_occurrence IS
   'edits of the list; step_index is its position in the list as last synced.';
 
 -- migrate:down
+DROP TRIGGER work_ticket_step_fill_occurrence ON qiita.work_ticket_step;
+DROP FUNCTION qiita.work_ticket_step_fill_occurrence();
 DROP INDEX qiita.work_ticket_step_identity_attempt;
 ALTER TABLE qiita.work_ticket_step
   DROP COLUMN step_occurrence;

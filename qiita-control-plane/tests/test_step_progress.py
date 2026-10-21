@@ -8,6 +8,7 @@ isolation against a real Postgres, without driving the full runner.
 
 import json
 import uuid
+from pathlib import Path
 
 import asyncpg
 import pytest
@@ -748,3 +749,134 @@ async def test_align_step_progress_refuses_a_row_no_entry_matches(postgres_pool,
         assert await step_progress.load_step_progress(postgres_pool, wt_idx) == before
     finally:
         await _cleanup(postgres_pool, wt_idx, *rest)
+
+
+# ---------------------------------------------------------------------------
+# The step_occurrence migration: its backfill, and the fill for writers that
+# omit the column
+# ---------------------------------------------------------------------------
+
+_OCCURRENCE_MIGRATION = (
+    Path(__file__).resolve().parents[1]
+    / "db"
+    / "migrations"
+    / "20261021010000_work_ticket_step_occurrence.sql"
+)
+
+# register-index repeats; the first one can be skipped by its `when:` gate.
+_REPEATED_STEPS = [
+    {"name": "build"},
+    {"name": "register-index"},
+    {"name": "build2"},
+    {"name": "register-index"},
+]
+
+
+def _occurrence_backfill_sql() -> str:
+    """The migration's two backfill UPDATEs, read from the file so the test runs
+    the migration's statements rather than a copy of them."""
+    up = _OCCURRENCE_MIGRATION.read_text().split("-- migrate:up", 1)[1]
+    start = up.index("UPDATE qiita.work_ticket_step s")
+    end = up.index(
+        "ALTER TABLE qiita.work_ticket_step\n  ALTER COLUMN step_occurrence SET NOT NULL"
+    )
+    return up[start:end]
+
+
+async def _seed_ticket_with_steps(pool, steps) -> tuple[int, str, str, int]:
+    """`_seed_work_ticket`, with the action's synced `steps:` set to `steps`."""
+    wt_idx, action_id, version, ref_idx = await _seed_work_ticket(pool)
+    await pool.execute(
+        "UPDATE qiita.action SET steps = $3::jsonb WHERE action_id = $1 AND version = $2",
+        action_id,
+        version,
+        json.dumps(steps),
+    )
+    return wt_idx, action_id, version, ref_idx
+
+
+async def _insert_without_occurrence(executor, wt_idx, step_index, attempt, name, target):
+    """The write-ahead INSERT as the control plane before step_occurrence wrote it."""
+    await executor.execute(
+        "INSERT INTO qiita.work_ticket_step"
+        " (work_ticket_idx, step_index, attempt, step_name, compute_target, state)"
+        " VALUES ($1, $2, $3, $4, $5, 'completed')",
+        wt_idx,
+        step_index,
+        attempt,
+        name,
+        target,
+    )
+
+
+async def test_insert_without_occurrence_is_filled_from_the_synced_steps(postgres_pool):
+    """A writer that omits step_occurrence (the previous control plane, between
+    `make migrate` and the restart) gets it counted off the ticket's action."""
+    wt_idx, *rest = await _seed_ticket_with_steps(postgres_pool, _REPEATED_STEPS)
+    try:
+        await _insert_without_occurrence(postgres_pool, wt_idx, 0, 0, "build", "local")
+        await _insert_without_occurrence(
+            postgres_pool, wt_idx, 3, 0, "register-index", "control_plane"
+        )
+        rows = await step_progress.load_step_progress(postgres_pool, wt_idx)
+        assert {(r.step_index, r.step_occurrence) for r in rows} == {(0, 0), (3, 1)}
+    finally:
+        await _cleanup(postgres_pool, wt_idx, *rest)
+
+
+class _RollBack(Exception):
+    pass
+
+
+async def test_occurrence_backfill_reads_the_definition_or_ranks_the_rows(postgres_pool):
+    """Ticket A's rows match its action's steps, so the backfill reads each
+    occurrence off the definition — the second register-index is occurrence 1
+    although the first never wrote a row. Ticket B's rows were written under an
+    earlier list (register-index at 1 and 2), so its occurrences are ranked
+    from its own rows."""
+    a_idx, *a_rest = await _seed_ticket_with_steps(postgres_pool, _REPEATED_STEPS)
+    b_idx, *b_rest = await _seed_ticket_with_steps(postgres_pool, _REPEATED_STEPS)
+    try:
+        with pytest.raises(_RollBack):
+            async with postgres_pool.acquire() as conn, conn.transaction():
+                # Rows as they stood before the migration: no step_occurrence.
+                await conn.execute(
+                    "ALTER TABLE qiita.work_ticket_step"
+                    " DISABLE TRIGGER work_ticket_step_fill_occurrence,"
+                    " ALTER COLUMN step_occurrence DROP NOT NULL"
+                )
+                for wt_idx, step_index, attempt, name, target in (
+                    (a_idx, 0, 0, "build", "local"),
+                    (a_idx, 2, 0, "build2", "local"),
+                    (a_idx, 3, 0, "register-index", "control_plane"),
+                    (a_idx, 3, 1, "register-index", "control_plane"),
+                    (b_idx, 0, 0, "build", "local"),
+                    (b_idx, 1, 0, "register-index", "control_plane"),
+                    (b_idx, 2, 0, "register-index", "control_plane"),
+                ):
+                    await _insert_without_occurrence(
+                        conn, wt_idx, step_index, attempt, name, target
+                    )
+                await conn.execute(_occurrence_backfill_sql())
+                rows = await conn.fetch(
+                    "SELECT work_ticket_idx, step_index, attempt, step_occurrence"
+                    " FROM qiita.work_ticket_step WHERE work_ticket_idx = ANY($1::bigint[])",
+                    [a_idx, b_idx],
+                )
+                got = {
+                    (r["work_ticket_idx"], r["step_index"], r["attempt"]): r["step_occurrence"]
+                    for r in rows
+                }
+                assert got == {
+                    (a_idx, 0, 0): 0,
+                    (a_idx, 2, 0): 0,
+                    (a_idx, 3, 0): 1,
+                    (a_idx, 3, 1): 1,
+                    (b_idx, 0, 0): 0,
+                    (b_idx, 1, 0): 0,
+                    (b_idx, 2, 0): 1,
+                }
+                raise _RollBack
+    finally:
+        await _cleanup(postgres_pool, a_idx, *a_rest)
+        await _cleanup(postgres_pool, b_idx, *b_rest)
