@@ -200,22 +200,16 @@ fn delete_test_data_path() -> String {
     data_path
 }
 
-/// Lay down every lake table the data plane creates at boot, in `main.rs`'s
-/// order (exclusion last — its `_visible` views join reference + alignment).
+/// Lay down every lake table the data plane creates at boot, through the same
+/// `ducklake::ensure_lake_tables` boot runs.
 ///
 /// The catalog-shape tests below decide what belongs in a registry by QUERYING
 /// the catalog, so each one is only as complete as the tables its connection
-/// happens to hold: a table this function does not create is invisible to the
-/// shape query and joins no registry, silently. Adding an `ensure_*` here is
-/// what keeps that a one-place edit instead of one per test.
+/// happens to hold: a table that function does not create is invisible to the
+/// shape query and joins no registry, silently.
 #[cfg(feature = "integration")]
 fn setup_full_lake(conn: &duckdb::Connection) {
-    ducklake::ensure_reference_tables(conn).unwrap();
-    ducklake::ensure_read_tables(conn).unwrap();
-    ducklake::ensure_alignment_tables(conn).unwrap();
-    ducklake::ensure_assembly_tables(conn).unwrap();
-    ducklake::ensure_registration_lock(conn).unwrap();
-    ducklake::ensure_exclusion_tables(conn).unwrap();
+    ducklake::ensure_lake_tables(conn).unwrap();
 }
 
 /// Orphan-only sequence deletion: a feature owned by another reference
@@ -229,7 +223,9 @@ fn delete_reference_drops_orphans_keeps_shared() {
     let data_path = delete_test_data_path();
     let conn = Connection::open_in_memory().unwrap();
     ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
-    ducklake::ensure_reference_tables(&conn).unwrap();
+    // delete_reference takes the registration lock, so the lake needs more
+    // than the reference tables.
+    setup_full_lake(&conn);
 
     // Unique ids so leftover rows never collide with other tests.
     let ref_a: i64 = 910_000;

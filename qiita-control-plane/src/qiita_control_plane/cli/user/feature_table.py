@@ -1481,7 +1481,7 @@ def _handle_feature_table_build(args: argparse.Namespace, parser: argparse.Argum
         with contextlib.closing(connect_with_miint()) as con:
             written, rows = _run_build(args, token, con, gate=gate)
     except _common.httpx.HTTPStatusError as exc:
-        print(f"http error {exc.response.status_code}: {exc.response.text}", file=sys.stderr)
+        _common.print_http_status_error(exc.response)
         return 1
     except _common.httpx.RemoteProtocolError as exc:
         # Ahead of RequestError, which it subclasses. httpx raises this both for a
@@ -1496,11 +1496,7 @@ def _handle_feature_table_build(args: argparse.Namespace, parser: argparse.Argum
         )
         return 1
     except _common.httpx.RequestError as exc:
-        print(
-            f"error: could not reach the control plane: {exc!r}. Check --base-url /"
-            f" $QIITA_CONTROL_PLANE_URL.",
-            file=sys.stderr,
-        )
+        _common.print_request_error(exc)
         return 1
     except flight.FlightError as exc:
         print(f"flight error: {exc}", file=sys.stderr)

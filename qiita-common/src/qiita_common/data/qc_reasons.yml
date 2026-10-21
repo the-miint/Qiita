@@ -1,0 +1,19 @@
+# Allowed QC reason codes, by check. Keys must be QcCheck members.
+data_type:
+  - data_type_mismatch
+composition:
+  - high_unknown
+  - low_panel_coverage
+host_fraction:
+  - high_host_fraction
+read_retention:
+  - low_read_retention
+  - below_rarefaction_depth
+amplicon_region:
+  - amplicon_region_mismatch
+orientation:
+  - orientation_mismatch
+source_tracker:
+  - low_expected_source
+classifier:
+  - classifier_disagrees

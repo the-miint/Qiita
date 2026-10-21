@@ -274,6 +274,43 @@ def test_handle_export_returns_1_on_short_export(monkeypatch, tmp_path):
     assert ref._handle_reference_genome_export(args, parser=None) == 1
 
 
+def test_handle_export_reports_an_unreachable_control_plane_on_one_line(
+    monkeypatch, tmp_path, capsys
+):
+    """A connection failure (no HTTP response at all) is one stderr line naming
+    the URL it tried, and exit 1, not a traceback."""
+    import argparse
+
+    monkeypatch.setattr(ref._common, "read_token", lambda: "tok")
+
+    def unreachable(method, url, **kwargs):
+        raise httpx.ConnectError("Connection refused", request=httpx.Request(method, url))
+
+    monkeypatch.setattr(ref._common.httpx, "request", unreachable)
+
+    class _FakeClient:
+        def __init__(self, url):
+            self.url = url
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("pyarrow.flight.FlightClient", _FakeClient)
+
+    args = argparse.Namespace(
+        reference_idx=5,
+        genome_idx=[10],
+        format="parquet",  # con stays None -> no miint needed
+        output_dir=tmp_path,
+        base_url="http://cp",
+        data_plane_url="grpc://host:50051",
+    )
+    assert ref._handle_reference_genome_export(args, parser=None) == 1
+    err = capsys.readouterr().err
+    assert err.count("\n") == 1
+    assert "could not reach http://cp" in err
+
+
 def test_parser_wires_export():
     from qiita_control_plane.cli.user._parser import _build_parser
 

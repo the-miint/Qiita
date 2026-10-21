@@ -15,6 +15,7 @@ from typing import NamedTuple
 
 import pytest
 from qiita_common.api_paths import (
+    URL_ADMIN_PRINCIPAL_LOOKUP_BY_EMAIL,
     URL_AUTH_WHOAMI,
     URL_BIOSAMPLE_BY_IDX,
     URL_BIOSAMPLE_BY_STUDY,
@@ -43,7 +44,8 @@ from qiita_common.api_paths import (
     URL_WORK_TICKET_PREFIX,
     URL_WORK_TICKET_STEP_LOGS,
 )
-from qiita_common.auth_constants import BEARER_PREFIX
+from qiita_common.auth_constants import BEARER_PREFIX, SystemRole
+from qiita_common.models import LEGACY_IDX_RESERVED_CEILING
 from run_preflight.db import ERR_CATEGORY_MISSING_ACCESSION, PlatformSampleInfo
 
 from qiita_control_plane.cli.user import main
@@ -519,6 +521,101 @@ def test_study_create_pydantic_validation_error_exits_2(capsys):
     err = capsys.readouterr().err
     assert "invalid StudyCreate" in err
     assert "title" in err
+
+
+def test_study_create_passes_study_idx(monkeypatch):
+    """--study-idx lands in the body as study_idx; who may use it is the
+    server's call."""
+    import httpx as _httpx
+
+    from qiita_control_plane.cli import _common
+
+    captured: dict = {}
+
+    def fake_request(method, url, headers=None, json=None, params=None, timeout=None):
+        captured["json"] = json
+        return _httpx.Response(201, json={"study_idx": 10317}, request=_httpx.Request(method, url))
+
+    monkeypatch.setattr(_common.httpx, "request", fake_request)
+    monkeypatch.setenv("QIITA_TOKEN", "qk_test")
+
+    from qiita_control_plane.cli.user import main
+
+    rc = main(["study", "create", "--title", "T", "--study-idx", "10317"])
+    assert rc == 0
+    assert captured["json"] == {"title": "T", "study_idx": 10317}
+
+
+def test_study_create_rejects_study_idx_outside_reserved_band(capsys):
+    """A --study-idx at or above the reserved ceiling fails StudyCreate
+    client-side, before any request."""
+    from qiita_control_plane.cli.user import main
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(["study", "create", "--title", "T", "--study-idx", str(LEGACY_IDX_RESERVED_CEILING)])
+    assert exc_info.value.code == 2
+    err = capsys.readouterr().err
+    assert "invalid StudyCreate" in err
+    assert "study_idx" in err
+
+
+def test_study_create_owner_email_resolves_owner_idx_before_post(monkeypatch):
+    """--owner-email is looked up through the admin principal lookup, and the
+    principal_idx it returns goes out as owner_idx on the create."""
+    import httpx as _httpx
+
+    from qiita_control_plane.cli import _common
+
+    calls: list = []
+
+    def fake_request(method, url, headers=None, json=None, params=None, timeout=None):
+        calls.append((method, url, json))
+        if url.endswith(URL_ADMIN_PRINCIPAL_LOOKUP_BY_EMAIL):
+            found = {
+                "principal_idx": 77,
+                "system_role": SystemRole.USER,
+                "disabled": False,
+                "retired": False,
+            }
+            return _httpx.Response(200, json=found, request=_httpx.Request(method, url))
+        return _httpx.Response(201, json={}, request=_httpx.Request(method, url))
+
+    monkeypatch.setattr(_common.httpx, "request", fake_request)
+    monkeypatch.setenv("QIITA_TOKEN", "qk_test")
+
+    from qiita_control_plane.cli.user import main
+
+    rc = main(
+        [
+            "--base-url",
+            "https://q.example.test",
+            "study",
+            "create",
+            "--title",
+            "T",
+            "--owner-email",
+            "owner@example.org",
+        ]
+    )
+    assert rc == 0
+    assert calls == [
+        (
+            "POST",
+            f"https://q.example.test{URL_ADMIN_PRINCIPAL_LOOKUP_BY_EMAIL}",
+            {"email": "owner@example.org"},
+        ),
+        ("POST", f"https://q.example.test{URL_STUDY_PREFIX}", {"title": "T", "owner_idx": 77}),
+    ]
+
+
+def test_study_create_rejects_malformed_owner_email(capsys):
+    """A --owner-email that is not an address exits 2 before any request."""
+    from qiita_control_plane.cli.user import main
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(["study", "create", "--title", "T", "--owner-email", "not-an-address"])
+    assert exc_info.value.code == 2
+    assert "not an email address" in capsys.readouterr().err
 
 
 def test_study_create_passes_extra_metadata(monkeypatch):
@@ -2292,6 +2389,33 @@ def test_connection_error_prints_friendly_message_and_exits_1(monkeypatch, capsy
     # The target URL is named so the user can spot a wrong base-url.
     assert "localhost:9999" in err
     assert "QIITA_CONTROL_PLANE_URL" in err
+
+
+def test_response_failing_its_model_prints_one_line_and_exits_1(monkeypatch, capsys):
+    """A response a command parses into a model that refuses it (here a
+    principal lookup carrying only principal_idx) is one stderr line naming the
+    model, and exit code 1, not a traceback; the create is never sent."""
+    import httpx as _httpx
+
+    from qiita_control_plane.cli import _common
+    from qiita_control_plane.cli.user import main
+
+    urls: list[str] = []
+
+    def fake_request(method, url, headers=None, json=None, params=None, timeout=None):
+        urls.append(url)
+        return _httpx.Response(200, json={"principal_idx": 77}, request=_httpx.Request(method, url))
+
+    monkeypatch.setattr(_common.httpx, "request", fake_request)
+    monkeypatch.setenv("QIITA_TOKEN", "qk_test")
+
+    rc = main(["study", "create", "--title", "T", "--owner-email", "owner@example.org"])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert len(err.strip().splitlines()) == 1, err
+    assert "invalid PrincipalLookupResponse" in err
+    assert "system_role" in err
+    assert [u for u in urls if u.endswith(URL_STUDY_PREFIX)] == []
 
 
 # ---------------------------------------------------------------------------

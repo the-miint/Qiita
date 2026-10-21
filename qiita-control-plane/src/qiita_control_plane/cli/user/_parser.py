@@ -36,6 +36,7 @@ from qiita_common.api_paths import (
 from qiita_common.models import (
     HOST_FILTER_INDEX_TYPE_MINIMAP2,
     HOST_FILTER_INDEX_TYPE_RYPE,
+    LEGACY_IDX_RESERVED_CEILING,
     STORABLE_ACCESS_TIERS,
     BiosamplePatchRequest,
     BiosampleStudyFieldCreateRequest,
@@ -313,9 +314,29 @@ def _build_parser() -> argparse.ArgumentParser:
     p_study_sub = p_study.add_subparsers(dest="study_cmd", required=True)
     p_study_create = p_study_sub.add_parser(
         "create",
-        help="Create a study owned by the calling principal (POST /study)",
+        help="Create a study, owned by the calling principal unless --owner-email (POST /study)",
     )
     p_study_create.add_argument("--title", required=True)
+    p_study_create.add_argument(
+        "--study-idx",
+        type=int,
+        help=(
+            "Create the study at this study_idx, in the band below"
+            f" {LEGACY_IDX_RESERVED_CEILING} reserved for studies carried over from"
+            " legacy Qiita under their original id (system_admin only). Omit to"
+            " mint one."
+        ),
+    )
+    p_study_create.add_argument(
+        "--owner-email",
+        type=_common.lookup_email_arg,
+        help=(
+            "Create the study for this user instead of yourself. Requires a"
+            " system_admin token carrying admin:user, for the admin principal"
+            " lookup that resolves the email. The user must have logged in and"
+            " completed their profile, and be neither disabled nor retired."
+        ),
+    )
     p_study_create.add_argument("--alias")
     p_study_create.add_argument("--description")
     p_study_create.add_argument("--abstract")
@@ -343,7 +364,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p_study_list = p_study_sub.add_parser(
         "list",
-        help="List your own and shared studies, newest first (GET /study)",
+        help="List your own and shared studies, highest study_idx first (GET /study)",
     )
     p_study_list.add_argument(
         "--query",
@@ -1913,11 +1934,13 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p_ena_import = sub.add_parser(
         "submit-ena-import",
-        help="Submit a batch ENA study import (POST /ena-import-batch)",
+        help="Submit a batch ENA import of studies or runs (POST /ena-import-batch)",
         description=(
             "Submit one or more INSDC STUDY accessions (PRJNA/PRJEB/PRJDB/ERP/SRP/DRP)"
-            " for import: each becomes one qiita.study, with its runs registered and"
-            " downloaded via the download-ena-study workflow. Accessions may be given"
+            " and/or RUN accessions (SRR/ERR/DRR) for import: each study becomes one"
+            " qiita.study with its runs registered and downloaded via the"
+            " download-ena-study workflow, and a run accession imports only that"
+            " run, into its study. Accessions may be given"
             " positionally or via --from-file (one per line; blank lines and"
             " whole-line '#' comments are skipped — a line may not carry an inline"
             " comment or more than one accession). Requires wet_lab_admin or"
@@ -1927,7 +1950,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p_ena_import.add_argument(
         "accessions",
         nargs="*",
-        help="INSDC STUDY accession(s), e.g. PRJEB11419. Not valid with --from-file.",
+        help="INSDC study or run accession(s), e.g. PRJEB11419 or ERR1074767."
+        " Not valid with --from-file.",
     )
     p_ena_import.add_argument(
         "--from-file",

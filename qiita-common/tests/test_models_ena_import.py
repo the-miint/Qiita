@@ -57,7 +57,7 @@ def test_batch_item_state_values():
 def test_batch_import_item_defaults():
     from qiita_common.models.ena_import import BatchImportItem, BatchItemState
 
-    item = BatchImportItem(ena_study_accession="PRJEB1234", state=BatchItemState.PENDING)
+    item = BatchImportItem(idx=1, ena_study_accession="PRJEB1234", state=BatchItemState.PENDING)
     assert item.study_idx is None
     assert item.failure_reason is None
     assert item.download_work_ticket_idxs == []
@@ -72,7 +72,9 @@ def test_batch_import_response_shape():
 
     resp = BatchImportResponse(
         ena_import_batch_idx=1,
-        items=[BatchImportItem(ena_study_accession="PRJEB1234", state=BatchItemState.PENDING)],
+        items=[
+            BatchImportItem(idx=1, ena_study_accession="PRJEB1234", state=BatchItemState.PENDING)
+        ],
     )
     assert resp.ena_import_batch_idx == 1
     assert resp.items[0].ena_study_accession == "PRJEB1234"
@@ -95,6 +97,7 @@ def test_batch_import_status_shape():
         ena_import_batch_idx=1,
         items=[
             BatchImportItem(
+                idx=1,
                 ena_study_accession="PRJEB1234",
                 state=BatchItemState.DONE,
                 study_idx=25000,
@@ -104,3 +107,22 @@ def test_batch_import_status_shape():
     )
     assert status.items[0].state == BatchItemState.DONE
     assert status.items[0].download_work_ticket_idxs == [7, 8]
+
+
+def test_batch_import_item_ungrouped_run_list_round_trips():
+    from qiita_common.models.ena_import import BatchImportItem, BatchItemState
+
+    item = BatchImportItem(
+        idx=3,
+        ena_study_accession=None,
+        requested_run_accessions=["ERR1", "ERR2"],
+        state=BatchItemState.PENDING,
+    )
+    assert BatchImportItem.model_validate_json(item.model_dump_json()) == item
+
+
+def test_batch_import_item_whole_study_has_no_run_list():
+    from qiita_common.models.ena_import import BatchImportItem, BatchItemState
+
+    item = BatchImportItem(idx=1, ena_study_accession="PRJEB1", state=BatchItemState.PENDING)
+    assert item.requested_run_accessions is None

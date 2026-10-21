@@ -11,8 +11,9 @@ originator, on the parent's scope target, and the outcome lands on the parent:
     and a created one is never unrecorded;
   * refused: `follow_on_error`, for a definitive refusal only (a 4xx from the
     gates, or an originator who can no longer submit);
-  * anything else (a 5xx, a database error): nothing is recorded, and the next
-    startup's `reconcile_follow_ons` submits it again.
+  * anything else (a 5xx, a database error): nothing is recorded, and
+    `reconcile_follow_ons` submits it again — at the next startup, or sooner from
+    the periodic `follow_on_sweeper`.
 """
 
 from __future__ import annotations
@@ -54,10 +55,11 @@ def _describe_refusal(exc: HTTPException) -> str:
 async def submit_follow_on(app: FastAPI, work_ticket_idx: int) -> None:
     """Submit `work_ticket_idx`'s follow-on if it COMPLETED with one that has no
     outcome yet. A failure that is not a refusal propagates, recording nothing."""
-    # Imported here: routes.work_ticket imports dispatch, which imports this module.
-    from .routes.work_ticket import (
+    # Both imports are lazy: routes.work_ticket and work_ticket_submit each import
+    # dispatch, which imports this module, so a top-level import would cycle at load.
+    from .routes.work_ticket import fetch_work_ticket
+    from .work_ticket_submit import (
         FollowOnAlreadyRecordedError,
-        fetch_work_ticket,
         submit_work_ticket_core,
     )
 
@@ -102,8 +104,9 @@ async def reconcile_follow_ons(app: FastAPI) -> None:
     """Submit every completed ticket's follow-on that has no outcome yet: one that
     completed with no hook to see it, or whose submission failed transiently.
 
-    Runs at startup after `reconcile_inflight_tickets`, so a follow-on created
-    here is dispatched only by its own submission."""
+    Runs at startup after `reconcile_inflight_tickets`, and then on an interval
+    from `follow_on_sweeper`, so a follow-on created here is dispatched only by
+    its own submission."""
     pool: asyncpg.Pool = app.state.pool
     # The literal 'completed' (not a bound parameter) matches the partial index
     # predicate verbatim, so the planner uses work_ticket_follow_on_pending_idx
@@ -120,6 +123,6 @@ async def reconcile_follow_ons(app: FastAPI) -> None:
             await submit_follow_on(app, row["work_ticket_idx"])
         except Exception:
             _log.exception(
-                "follow-on of work_ticket %d was not submitted; the next startup retries it",
+                "follow-on of work_ticket %d was not submitted; a later reconcile retries it",
                 row["work_ticket_idx"],
             )

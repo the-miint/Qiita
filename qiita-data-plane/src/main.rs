@@ -28,16 +28,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // under concurrent Flight load and fails with SQLSTATE 40001. See
     // set_catalog_options.
     ducklake::set_catalog_options(&setup_conn)?;
-    ducklake::ensure_reference_tables(&setup_conn)?;
-    ducklake::ensure_read_tables(&setup_conn)?;
-    ducklake::ensure_alignment_tables(&setup_conn)?;
-    ducklake::ensure_assembly_tables(&setup_conn)?;
-    ducklake::ensure_amplicon_tables(&setup_conn)?;
-    // The row concurrent registrations into the replace-keyed tables contend
-    // for. Seeded here so no request path has to create it.
-    ducklake::ensure_registration_lock(&setup_conn)?;
-    // Must run after reference + alignment tables — the `_visible` views join them.
-    ducklake::ensure_exclusion_tables(&setup_conn)?;
+    ducklake::ensure_lake_tables(&setup_conn)?;
     drop(setup_conn);
 
     // Build Flight service — each request opens its own DuckDB connection

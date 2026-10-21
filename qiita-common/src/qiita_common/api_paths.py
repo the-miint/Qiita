@@ -433,6 +433,16 @@ URL_SEQUENCE_RANGE_BY_PREP_SAMPLE = (
 )
 
 # =============================================================================
+# /qc-check/* — per-prep_sample QC check rows and verdict
+# =============================================================================
+
+PATH_QC_CHECK_PREFIX = "/qc-check"
+PATH_QC_CHECK_BY_PREP_SAMPLE = "/{prep_sample_idx}"
+
+URL_QC_CHECK_PREFIX = f"{API_PREFIX}{PATH_QC_CHECK_PREFIX}"
+URL_QC_CHECK_BY_PREP_SAMPLE = f"{URL_QC_CHECK_PREFIX}{PATH_QC_CHECK_BY_PREP_SAMPLE}"
+
+# =============================================================================
 # /mask-definition/* — control-plane read-filtering config identity
 # =============================================================================
 # Mints (idempotently, deduped on a canonical-config hash) the mask_idx that

@@ -32,7 +32,9 @@ from qiita_control_plane.ena_import import (
 )
 from qiita_control_plane.ena_import.batch import (
     _process_one_study,
+    build_ena_import_study_semaphore,
     create_ena_import_batch,
+    schedule_ena_import_batch,
 )
 from qiita_control_plane.repositories.sequenced_sample import (
     fetch_sequenced_pool_ena_run_roster,
@@ -556,3 +558,118 @@ async def test_batch_driver_to_register_files_to_ducklake_full_span(
     )
     assert biosample_count_after == 1
     assert _count_read_rows(data_plane, prep_sample_idxs) == total_reads
+
+
+async def test_run_list_import_ingests_only_the_listed_runs(
+    postgres_pool,
+    data_plane,
+    batch_app,
+    admin_principal,
+    download_ena_study_action,
+    batch_cleanup,
+    ena_study_cleanup,
+    tmp_path,
+    monkeypatch,
+):
+    """Two of a study's three runs: the pool roster and DuckLake reads hold only those two."""
+    accession = unique_ena_accession("PRJNA")
+    ena_study_cleanup.append(accession)
+    all_runs = [unique_ena_accession("SRR") for _ in range(3)]
+    listed = all_runs[:2]
+    _, template_rows = _make_two_runs_sharing_one_sample("unused")[0](accession)
+
+    def _row(run: str) -> tuple:
+        row = list(template_rows[0])
+        row[0], row[1], row[2] = run, f"SRX{run[3:]}", f"SAMN{run[3:]}"
+        return tuple(row)
+
+    def fake_runs(query):
+        wanted = all_runs if isinstance(query, str) else query
+        return list(_RUN_COLUMNS), [_row(r) for r in all_runs if r in wanted]
+
+    def fake_attrs(query):
+        samples = [f"SAMN{r[3:]}" for r in all_runs] if isinstance(query, str) else query
+        return [(s, {"collection date": ["2020-01-01"]}) for s in samples]
+
+    monkeypatch.setattr(_QUERY_STUDY, _fake_study_header)
+    monkeypatch.setattr(_QUERY_RUNS, fake_runs)
+    monkeypatch.setattr(_QUERY_ATTRS, fake_attrs)
+    batch_app.state.ena_import_study_semaphore = build_ena_import_study_semaphore()
+
+    batch_idx, items = await create_ena_import_batch(
+        postgres_pool, accessions=listed, principal=admin_principal
+    )
+    batch_cleanup.append(batch_idx)
+    await schedule_ena_import_batch(batch_app, items=items, principal=admin_principal)
+
+    item_row = await postgres_pool.fetchrow(
+        "SELECT state, ena_study_accession, download_work_ticket_idxs, failure_reason"
+        " FROM qiita.ena_import_batch_item WHERE batch_idx = $1",
+        batch_idx,
+    )
+    assert item_row["state"] == BatchItemState.DOWNLOADING.value, item_row["failure_reason"]
+    assert item_row["ena_study_accession"] == accession
+    (work_ticket_idx,) = item_row["download_work_ticket_idxs"]
+
+    sequenced_pool_idx = await postgres_pool.fetchval(
+        "SELECT sequenced_pool_idx FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+        work_ticket_idx,
+    )
+    sequencing_run_idx = await postgres_pool.fetchval(
+        "SELECT sequencing_run_idx FROM qiita.sequenced_pool WHERE idx = $1", sequenced_pool_idx
+    )
+    roster_rows = await fetch_sequenced_pool_ena_run_roster(
+        postgres_pool, sequenced_pool_idx=sequenced_pool_idx
+    )
+    roster = sorted((r["ena_run_accession"], r["prep_sample_idx"]) for r in roster_rows)
+    assert [run for run, _ in roster] == sorted(listed)
+    prep_sample_idxs = [psi for _, psi in roster]
+
+    by_run = {roster[0][0]: (_RUN1_ROWS, []), roster[1][0]: (_RUN2_ROWS, [])}
+    from qiita_compute_orchestrator import sequence_range_retry
+    from qiita_compute_orchestrator.jobs import ingest_ena_reads
+    from qiita_compute_orchestrator.sequence_range import MintedSequenceRange
+
+    monkeypatch.setattr(ingest_ena_reads, "_stage_run_reads", _fake_stage_run_reads_factory(by_run))
+
+    async def _local_mint(*, http, prep_sample_idx, count, work_ticket_idx):
+        row = await postgres_pool.fetchrow(
+            "SELECT * FROM qiita.mint_sequence_range($1, $2, $3, $4)",
+            prep_sample_idx,
+            count,
+            admin_principal.principal_idx,
+            work_ticket_idx,
+        )
+        return MintedSequenceRange(
+            prep_sample_idx=row["prep_sample_idx"],
+            sequence_idx_start=row["sequence_idx_start"],
+            sequence_idx_stop=row["sequence_idx_stop"],
+        )
+
+    monkeypatch.setattr(sequence_range_retry, "mint_sequence_range", _local_mint)
+
+    ena_run_map_path = tmp_path / "ena_run_map.parquet"
+    _write_ena_run_map(ena_run_map_path, [(psi, run) for run, psi in roster])
+    outputs = await ingest_ena_reads.execute(
+        ingest_ena_reads.Inputs(
+            ena_run_map=ena_run_map_path,
+            reads_staging_root=tmp_path / "reads-staging",
+            sequenced_pool_idx=sequenced_pool_idx,
+            sequencing_run_idx=sequencing_run_idx,
+            work_ticket_idx=work_ticket_idx,
+        ),
+        tmp_path / "ws1",
+    )
+    await _run_register_files(
+        postgres_pool,
+        data_plane,
+        staging_dir=outputs["read_staging_dir"],
+        work_ticket_idx=work_ticket_idx,
+    )
+
+    assert _count_read_rows(data_plane, prep_sample_idxs) == len(_RUN1_ROWS) + len(_RUN2_ROWS)
+    unlisted_prep_samples = await postgres_pool.fetch(
+        "SELECT prep_sample_idx FROM qiita.sequenced_sample WHERE ena_run_accession = $1",
+        all_runs[2],
+    )
+    assert unlisted_prep_samples == []

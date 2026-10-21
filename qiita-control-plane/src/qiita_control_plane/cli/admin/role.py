@@ -10,7 +10,6 @@ import sys
 import asyncpg
 from qiita_common.api_paths import (
     PATH_ADMIN_PREFIX,
-    PATH_ADMIN_PRINCIPAL_LOOKUP_BY_EMAIL,
     PATH_ADMIN_PRINCIPAL_SYSTEM_ROLE,
 )
 from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX, SystemRole
@@ -88,19 +87,13 @@ def _principal_set_role(base_url: str, token: str, email: str, role: str, reason
     Refuses (RuntimeError) a disabled or retired principal, and sends nothing
     when the principal already holds `role`, so no `from == to` event is written.
     """
-    found = _common.call(
-        "POST",
-        base_url,
-        token,
-        f"{PATH_ADMIN_PREFIX}{PATH_ADMIN_PRINCIPAL_LOOKUP_BY_EMAIL}",
-        json={"email": email},
-    )
-    principal_idx = found["principal_idx"]
+    found = _common.lookup_principal_by_email(base_url, token, email)
+    principal_idx = found.principal_idx
     for flag in ("disabled", "retired"):
-        if found[flag]:
+        if getattr(found, flag):
             raise RuntimeError(f"{email} is {flag}; refusing to change its role")
-    result = {"principal_idx": principal_idx, "email": email, "from": found["system_role"]}
-    if found["system_role"] == role:
+    result = {"principal_idx": principal_idx, "email": email, "from": found.system_role.value}
+    if found.system_role == role:
         return {**result, "to": role, "changed": False}
     _common._request(
         "PATCH",

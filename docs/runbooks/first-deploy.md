@@ -863,8 +863,8 @@ add `qiita-data-plane@50052` (etc.) and the matching nginx upstream
 entry when traffic warrants horizontal scaling.
 
 On first start, the DP attaches DuckLake to `qiita_miint_lake` (creates
-metadata tables) and runs `ensure_reference_tables`. All idempotent —
-restarts are safe.
+metadata tables) and creates the lake tables (`ensure_lake_tables`). All
+idempotent — restarts are safe.
 
 ### 8d. Verify the data plane is up
 

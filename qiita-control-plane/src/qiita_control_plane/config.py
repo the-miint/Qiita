@@ -31,6 +31,9 @@ _DEFAULT_CLI_LOGIN_CODE_TTL_SECONDS = 30
 # How often the in-process sweeper deletes consumed/expired cli_login_code rows,
 # reclaiming any plaintext PAT an abandoned login left at rest.
 _DEFAULT_CLI_LOGIN_CODE_SWEEP_INTERVAL_SECONDS = 60
+# How often the sweeper retries a transiently-failed follow-on, rather than
+# waiting for the next CP start.
+_DEFAULT_FOLLOW_ON_SWEEP_INTERVAL_SECONDS = 60
 
 # Hard cap on a single POST /sequence-range allocation. The bigint domain
 # is 2^63 so a runaway loop in a compute step could otherwise burn an
@@ -201,6 +204,7 @@ class Settings:
     auth_handoff_freshness_seconds: int = _DEFAULT_AUTH_HANDOFF_FRESHNESS_SECONDS
     cli_login_code_ttl_seconds: int = _DEFAULT_CLI_LOGIN_CODE_TTL_SECONDS
     cli_login_code_sweep_interval_seconds: int = _DEFAULT_CLI_LOGIN_CODE_SWEEP_INTERVAL_SECONDS
+    follow_on_sweep_interval_seconds: int = _DEFAULT_FOLLOW_ON_SWEEP_INTERVAL_SECONDS
     max_sequence_mint_count: int = _DEFAULT_MAX_SEQUENCE_MINT_COUNT
     # Per-cohort cap on concurrently-dispatched fan-out child work_tickets.
     fanout_max_inflight: int = _DEFAULT_FANOUT_MAX_INFLIGHT
@@ -399,6 +403,10 @@ class Settings:
             cli_login_code_sweep_interval_seconds=_parse_positive_int_env(
                 "CLI_LOGIN_CODE_SWEEP_INTERVAL_SECONDS",
                 _DEFAULT_CLI_LOGIN_CODE_SWEEP_INTERVAL_SECONDS,
+            ),
+            follow_on_sweep_interval_seconds=_parse_positive_int_env(
+                "FOLLOW_ON_SWEEP_INTERVAL_SECONDS",
+                _DEFAULT_FOLLOW_ON_SWEEP_INTERVAL_SECONDS,
             ),
             cli_login_code_ttl_seconds=_parse_positive_int_env(
                 "CLI_LOGIN_CODE_TTL_SECONDS", _DEFAULT_CLI_LOGIN_CODE_TTL_SECONDS

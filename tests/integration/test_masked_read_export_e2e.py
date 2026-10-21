@@ -400,12 +400,12 @@ async def test_masked_read_export_e2e_parquet_idempotent_recount(
 
     # Run 1: first export streams the two pass reads.
     assert cli.main(argv) == 0
-    assert "exported 1 sample(s)" in capsys.readouterr().out
+    assert "exported 1 prep_sample(s)" in capsys.readouterr().out
     assert _rows() == 2
 
     # Run 2: nothing changed → live count matches on disk → skipped, file untouched.
     assert cli.main(argv) == 0
-    assert "exported 0 sample(s) (skipped 1 already up to date)" in capsys.readouterr().out
+    assert "exported 0 prep_sample(s) (skipped 1 already up to date)" in capsys.readouterr().out
     assert _rows() == 2
 
     # Add a third pass read so the live count_masked now returns 3, not 2.
@@ -427,5 +427,5 @@ async def test_masked_read_export_e2e_parquet_idempotent_recount(
 
     # Run 3: count (3) differs from on disk (2) → re-stream and overwrite.
     assert cli.main(argv) == 0
-    assert "exported 1 sample(s)" in capsys.readouterr().out
+    assert "exported 1 prep_sample(s)" in capsys.readouterr().out
     assert _rows() == 3

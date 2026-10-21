@@ -223,8 +223,9 @@ async def _run_submit_reads(*, base_url: str, token: str, args: argparse.Namespa
 
 def _handle_submit_reads(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
     """Entry point for `qiita submit-reads`. Local validation runs before the
-    PAT is read so a bad filename costs no network call; every known failure
-    shape becomes exit 1 with a one-line stderr message."""
+    PAT is read so a bad filename costs no network call, and exits 2 through
+    argparse; every other known failure exits 1 with a stderr message, not a
+    traceback."""
     import httpx as _httpx
     import pyarrow.flight as _flight
 
@@ -251,7 +252,10 @@ def _handle_submit_reads(args: argparse.Namespace, parser: argparse.ArgumentPars
     try:
         result = asyncio.run(_run_submit_reads(base_url=args.base_url, token=token, args=args))
     except _httpx.HTTPStatusError as exc:
-        print(f"http error {exc.response.status_code}: {exc.response.text}", file=sys.stderr)
+        _common.print_http_status_error(exc.response)
+        return 1
+    except _httpx.RequestError as exc:
+        _common.print_request_error(exc)
         return 1
     except _flight.FlightError as exc:
         # FlightError is not a RuntimeError subclass, so the catch-all below

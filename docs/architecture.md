@@ -21,7 +21,7 @@ The service diagram, and what each of the four components is.
 Identifier hierarchy, Parquet identifier columns, metadata, processing dedup.
 
 - [Identifier Hierarchy](architecture/data-model.md#identifier-hierarchy)
-- [Legacy import reserved range — study and prep_sample](architecture/data-model.md#legacy-import-reserved-range--study-and-prep_sample)
+- [Legacy import reserved range — study, prep_sample and sequenced_pool](architecture/data-model.md#legacy-import-reserved-range--study-prep_sample-and-sequenced_pool)
 - [Processing Methods](architecture/data-model.md#processing-methods)
 - [Identifier Columns in Parquet](architecture/data-model.md#identifier-columns-in-parquet)
 - [Biosample and Prep Sample Metadata](architecture/data-model.md#biosample-and-prep-sample-metadata)

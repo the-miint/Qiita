@@ -1,10 +1,9 @@
 """System test: `EnaAvailabilityClient` against the live ENA Browser API, pinning
 the facts the client depends on: status 4 is public, 5 is suppressed, runs batch
-in one request, and an accession ENA can't serve returns HTTP 500. Runs manually
+in one request, and a nonexistent run is left out of a 200 response. Runs manually
 via `make test-system`, like `test_ena_resolver_live.py`.
 """
 
-import httpx
 import pytest
 
 from qiita_control_plane.ena_import.availability import EnaAvailabilityClient
@@ -24,6 +23,5 @@ async def test_availability_client_reads_live_run_statuses():
 @pytest.mark.system
 async def test_availability_client_raises_for_a_run_ena_cannot_serve():
     async with EnaAvailabilityClient() as client:
-        with pytest.raises(httpx.HTTPStatusError) as exc_info:
+        with pytest.raises(ValueError, match=f"missing: {_NONEXISTENT_RUN}"):
             await client.check_runs([_PUBLIC_RUN, _NONEXISTENT_RUN])
-    assert exc_info.value.response.status_code == 500

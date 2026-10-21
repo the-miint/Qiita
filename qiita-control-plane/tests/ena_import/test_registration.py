@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 import pytest_asyncio
-from qiita_common.models import FieldDataType
+from qiita_common.models import LEGACY_IDX_RESERVED_CEILING, FieldDataType
 from qiita_common.models.ena import (
     EnaRunRecord,
     EnaSampleAttributes,
@@ -1267,9 +1267,9 @@ async def test_paired_and_single_layout_runs_each_get_one_sequenced_sample(reg):
         assert row["ena_experiment_accession"] == run.experiment_accession
         assert row["ena_run_accession"] == run.run_accession
 
-    # Reserved-range invariant (>= 25000) holds ONLY for study and prep_sample --
+    # study and prep_sample mint above the reserved range --
     # biosample / sequenced_sample / sequencing_run legitimately mint low.
-    assert result.study_idx >= 25000
+    assert result.study_idx >= LEGACY_IDX_RESERVED_CEILING
     prep_sample_idxs = [
         r["prep_sample_idx"]
         for r in await reg["pool"].fetch(
@@ -1278,7 +1278,7 @@ async def test_paired_and_single_layout_runs_each_get_one_sequenced_sample(reg):
         )
     ]
     assert len(prep_sample_idxs) == 2
-    assert all(idx >= 25000 for idx in prep_sample_idxs)
+    assert all(idx >= LEGACY_IDX_RESERVED_CEILING for idx in prep_sample_idxs)
 
 
 async def test_library_fields_land_as_study_local_prep_sample_metadata(reg):

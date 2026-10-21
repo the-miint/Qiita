@@ -23,8 +23,7 @@ _None yet._
 
 ### 3. Migrations
 
-- `[operator]` (#685) `make migrate` applies `20261009000000_work_ticket_follow_on.sql` (three nullable columns on `qiita.work_ticket`, two CHECKs, one partial index; no backfill).
-- `[operator]` `make migrate` applies `20261013000000_seed_control_type_fields.sql` (new terminology `MIxS NegContTypeEnum` and global fields `neg_cont_type` and `pos_cont_type`; additive, no backfill). (#690)
+_None yet._
 
 ### 4. Deploy
 
@@ -40,7 +39,7 @@ _None yet._
 
 ### Notes (no host action)
 
-- (#685) Work-ticket responses (`GET /work-ticket/{idx}` and the ticket lists) gain `on_success`, `follow_on_work_ticket_idx` and `follow_on_error` (all null for a ticket with no follow-on); clients validating that shape strictly must accept them.
+_None yet._
 
 ## Deployed history
 

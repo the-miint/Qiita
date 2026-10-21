@@ -138,20 +138,16 @@ def _write_masked_sample(reader, stem: str, output_dir: Path, fmt: str, con) -> 
     elif fmt == "fastq":
         paired, stream = _peek_paired(reader)
         con.register("masked", stream)
+        pairs = [
+            (output_dir / f"{name}.partial", output_dir / name)
+            for name in _fastq_names(stem, paired=paired)
+        ]
         if paired:
             # `{ORIENTATION}` expands to R1/R2, so the one COPY emits both
             # `<stem>.R1.fastq.gz.partial` and `<stem>.R2.fastq.gz.partial`.
             target = output_dir / f"{stem}.{{ORIENTATION}}.fastq.gz.partial"
-            pairs = [
-                (
-                    output_dir / f"{stem}.{o}.fastq.gz.partial",
-                    output_dir / f"{stem}.{o}.fastq.gz",
-                )
-                for o in ("R1", "R2")
-            ]
         else:
-            target = output_dir / f"{stem}.fastq.gz.partial"
-            pairs = [(target, output_dir / f"{stem}.fastq.gz")]
+            target = pairs[0][0]
         _commit_partials(
             lambda: con.execute(
                 f"COPY (SELECT {_READ_MASKED_COLUMNS} FROM masked) "
@@ -161,6 +157,16 @@ def _write_masked_sample(reader, stem: str, output_dir: Path, fmt: str, con) -> 
         )
     else:
         raise ValueError(f"unsupported export format: {fmt!r}")
+
+
+def _fastq_names(stem: str, *, paired: bool) -> list[str]:
+    """The fastq files one prep_sample's export commits: `<stem>.fastq.gz`, or
+    `<stem>.R1.fastq.gz` and `<stem>.R2.fastq.gz` when paired. The writer
+    commits these and the never-overwrite pre-scan looks for them, so a rename
+    cannot leave the pre-scan checking names the writer no longer uses."""
+    if paired:
+        return [f"{stem}.R1.fastq.gz", f"{stem}.R2.fastq.gz"]
+    return [f"{stem}.fastq.gz"]
 
 
 def _export_stem(sample: dict, run_idx, pool_idx) -> str:
@@ -224,6 +230,8 @@ def _handle_masked_read_export(args: argparse.Namespace, parser: argparse.Argume
 
     The output directory is created if missing (parents included).
     """
+    import duckdb  # noqa: PLC0415
+    import pyarrow as pa  # noqa: PLC0415
     import pyarrow.flight as flight  # noqa: PLC0415
     import pyarrow.ipc as ipc  # noqa: PLC0415
 
@@ -250,7 +258,10 @@ def _handle_masked_read_export(args: argparse.Namespace, parser: argparse.Argume
             "GET", args.base_url, token, manifest_path, params={"mask_idx": args.mask_idx}
         )
     except httpx.HTTPStatusError as exc:
-        print(f"http error {exc.response.status_code}: {exc.response.text}", file=sys.stderr)
+        _common.print_http_status_error(exc.response)
+        return 1
+    except httpx.RequestError as exc:
+        _common.print_request_error(exc)
         return 1
 
     samples = manifest["samples"]
@@ -258,7 +269,7 @@ def _handle_masked_read_export(args: argparse.Namespace, parser: argparse.Argume
     pool_idx = manifest["sequenced_pool_idx"]
     if not samples:
         print(
-            f"no samples on sequenced_pool {pool_idx} for mask_idx {args.mask_idx}; "
+            f"no prep_samples on sequenced_pool {pool_idx} for mask_idx {args.mask_idx}; "
             "nothing to export"
         )
         return 0
@@ -272,9 +283,9 @@ def _handle_masked_read_export(args: argparse.Namespace, parser: argparse.Argume
     )
     if bad:
         print(
-            f"error: {len(bad)} sample(s) on sequenced_pool {pool_idx} have no usable "
+            f"error: {len(bad)} prep_sample(s) on sequenced_pool {pool_idx} have no usable "
             f"biosample_accession (missing or outside [A-Za-z0-9._-]): prep_sample_idx {bad}. "
-            "The export filename requires the accession — submit/repair these samples first.",
+            "The export filename requires the accession — submit/repair these prep_samples first.",
             file=sys.stderr,
         )
         return 1
@@ -292,7 +303,7 @@ def _handle_masked_read_export(args: argparse.Namespace, parser: argparse.Argume
     )
     if not_complete:
         print(
-            f"error: {len(not_complete)} sample(s) on sequenced_pool {pool_idx} are not "
+            f"error: {len(not_complete)} prep_sample(s) on sequenced_pool {pool_idx} are not "
             f"masked-complete under mask_idx {args.mask_idx} (mask_sample.state != 'completed'): "
             f"prep_sample_idx {not_complete}. The read_masked pass-set would be absent or "
             "partial — refusing to export. Retry once masking has completed.",
@@ -311,7 +322,8 @@ def _handle_masked_read_export(args: argparse.Namespace, parser: argparse.Argume
             stem = _export_stem(s, run_idx, pool_idx)
             existing += [
                 p
-                for name in (f"{stem}.fastq.gz", f"{stem}.R1.fastq.gz", f"{stem}.R2.fastq.gz")
+                for paired in (False, True)
+                for name in _fastq_names(stem, paired=paired)
                 if (p := output_dir / name).exists()
             ]
         if existing:
@@ -348,14 +360,17 @@ def _handle_masked_read_export(args: argparse.Namespace, parser: argparse.Argume
             else None
         ),
     )
-    # The fastq writer needs a miint DuckDB connection; open it once and reuse it
-    # across all samples (each sample re-registers the `masked` view) rather than
-    # paying a fresh connect + extension LOAD per sample. Parquet needs no DuckDB.
-    con = connect_with_miint() if args.format == "fastq" else None
-    flight_client = flight.FlightClient(args.data_plane_url)
+    con = None
+    flight_client = None
     exported = 0
     skipped = 0
     try:
+        # The fastq writer needs a miint DuckDB connection; open it once and reuse
+        # it across all samples (each sample re-registers the `masked` view) rather
+        # than paying a fresh connect + extension LOAD per sample. Parquet needs no
+        # DuckDB.
+        con = connect_with_miint() if args.format == "fastq" else None
+        flight_client = flight.FlightClient(args.data_plane_url)
         for s in samples:
             prep = s["prep_sample_idx"]
             stem = _export_stem(s, run_idx, pool_idx)
@@ -383,14 +398,31 @@ def _handle_masked_read_export(args: argparse.Namespace, parser: argparse.Argume
             _write_masked_sample(reader, stem, output_dir, args.format, con)
             exported += 1
     except httpx.HTTPStatusError as exc:
-        print(f"http error {exc.response.status_code}: {exc.response.text}", file=sys.stderr)
+        _common.print_http_status_error(exc.response)
+        return 1
+    except httpx.RequestError as exc:
+        _common.print_request_error(exc)
+        return 1
+    except flight.FlightError as exc:
+        print(f"flight error: {exc}", file=sys.stderr)
+        return 1
+    except (duckdb.Error, OSError, pa.ArrowInvalid, pa.ArrowKeyError) as exc:
+        # The types the environment raises at these sites; a plain ValueError or
+        # RuntimeError from a bug still ends in a traceback. A data plane failure
+        # after the first batch lands here rather than above: the parquet path's
+        # reader raises OSError, the fastq path's COPY over it a duckdb.Error.
+        # ArrowInvalid and ArrowKeyError are pyarrow refusing an input, among
+        # them --data-plane-url (unparseable, or a scheme with no Flight
+        # transport, such as http) and an existing parquet target it cannot read.
+        print(f"error: {exc}", file=sys.stderr)
         return 1
     finally:
-        flight_client.close()
+        if flight_client is not None:
+            flight_client.close()
         if con is not None:
             con.close()
 
-    summary = f"exported {exported} sample(s)"
+    summary = f"exported {exported} prep_sample(s)"
     if skipped:
         summary += f" (skipped {skipped} already up to date)"
     print(f"{summary} from sequenced_pool {pool_idx} to {output_dir}")

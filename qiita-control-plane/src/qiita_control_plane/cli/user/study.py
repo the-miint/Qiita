@@ -17,23 +17,28 @@ from .. import _common
 from ._helpers import _build_body
 
 
-def _post_study(base_url: str, token: str, body: dict) -> dict:
+def _post_study(base_url: str, token: str, body: dict, *, owner_email: str | None) -> dict:
     """POST /api/v1/study with the (already-pruned) body. Owner defaults to
-    the caller server-side; the CLI does not surface --owner-idx because
-    naming a different owner requires wet_lab_admin+ (lab-tech-on-behalf),
-    out of scope for the regular-user CLI."""
-    return _common.call("POST", base_url, token, "/study", json=body)
+    the caller server-side. `owner_email` names a different owner, resolved
+    to its principal_idx through the admin lookup route first, so that
+    route's guard decides before the create route's on-behalf rule does."""
+    if owner_email is not None:
+        found = _common.lookup_principal_by_email(base_url, token, owner_email)
+        body = {**body, "owner_idx": found.principal_idx}
+    return _common.call("POST", base_url, token, PATH_STUDY_PREFIX, json=body)
 
 
 def _handle_study_create(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
-    """Mint a study owned by the caller. --extra-metadata is parsed from
-    JSON before Pydantic validation so a malformed paste surfaces as a
-    clean argparse exit 2."""
+    """Mint a study, owned by the caller unless --owner-email names someone
+    else. --extra-metadata is parsed from JSON before Pydantic validation
+    so a malformed paste surfaces as a clean argparse exit 2."""
     args.extra_metadata = _common.parse_json_arg(
         args.extra_metadata, parser, flag="--extra-metadata"
     )
     body = _build_body(StudyCreate, args, parser)
-    return _common.run_http_subcommand(lambda t: _post_study(args.base_url, t, body))
+    return _common.run_http_subcommand(
+        lambda t: _post_study(args.base_url, t, body, owner_email=args.owner_email)
+    )
 
 
 _ACCESS_PATH = f"{PATH_STUDY_PREFIX}{PATH_STUDY_ACCESS}"
