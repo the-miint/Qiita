@@ -384,6 +384,7 @@ async def _dispatch_action_raising(
             {"kind": "prep_sample", "prep_sample_idx": 1},
             work_ticket_idx=1,
             step_index=0,
+            step_occurrence=0,
             attempt=0,
             signing_key=b"\x00" * 32,
             data_plane_url="grpc://dp:50051",

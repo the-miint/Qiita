@@ -2432,7 +2432,7 @@ fn register_files(
     // fails closed, because the earlier call may still be registering the files.
     let moved_before = placed.iter().filter(|f| !f.src.exists()).count();
     if moved_before > 0 {
-        let in_catalog = registered_data_files(&conn, &placed)?;
+        let in_catalog = registered_data_files(conn, &placed)?;
         if moved_before == placed.len() && in_catalog.len() == placed.len() {
             return Ok(Registration {
                 registered: placed.into_iter().map(|p| p.dest_str).collect(),

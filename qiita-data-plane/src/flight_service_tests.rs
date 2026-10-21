@@ -1924,17 +1924,27 @@ fn prepare_membership_table(connstr: &str, data_path: &str, ref_idx: i64) {
 #[serial_test::serial]
 #[cfg(feature = "integration")]
 fn register_files_replayed_after_it_completed_registers_nothing_again() {
-    let connstr = delete_test_catalog_connstr();
-    let data_path = delete_test_data_path();
+    let connstr = crate::test_catalog::connstr();
+    let data_path = crate::test_catalog::data_path();
     let ref_idx: i64 = 971_000;
     let ticket: i64 = 971_000_000 + std::process::id() as i64;
     prepare_membership_table(&connstr, &data_path, ref_idx);
     let (_staging, payload) = seed_membership_registration(ref_idx, ticket);
 
-    let first = register_files(&connstr, &data_path, std::path::Path::new("/"), &payload)
-        .expect("first register_files failed");
-    let replay = register_files(&connstr, &data_path, std::path::Path::new("/"), &payload)
-        .expect("replayed register_files failed");
+    let first = register_files(
+        &attached_writer(&connstr, &data_path),
+        &data_path,
+        std::path::Path::new("/"),
+        &payload,
+    )
+    .expect("first register_files failed");
+    let replay = register_files(
+        &attached_writer(&connstr, &data_path),
+        &data_path,
+        std::path::Path::new("/"),
+        &payload,
+    )
+    .expect("replayed register_files failed");
 
     assert_eq!(replay.registered, first.registered);
     assert!(replay.replaced.is_empty());
@@ -1949,8 +1959,8 @@ fn register_files_replayed_after_it_completed_registers_nothing_again() {
 #[serial_test::serial]
 #[cfg(feature = "integration")]
 fn register_files_replayed_before_the_earlier_call_committed_fails_closed() {
-    let connstr = delete_test_catalog_connstr();
-    let data_path = delete_test_data_path();
+    let connstr = crate::test_catalog::connstr();
+    let data_path = crate::test_catalog::data_path();
     let ref_idx: i64 = 972_000;
     let ticket: i64 = 972_000_000 + std::process::id() as i64;
     prepare_membership_table(&connstr, &data_path, ref_idx);
@@ -1967,8 +1977,13 @@ fn register_files_replayed_before_the_earlier_call_committed_fails_closed() {
     ));
     move_file(&staging.path().join("reference_membership.parquet"), &dest).unwrap();
 
-    let err = register_files(&connstr, &data_path, std::path::Path::new("/"), &payload)
-        .expect_err("a replay of an uncommitted registration is refused");
+    let err = register_files(
+        &attached_writer(&connstr, &data_path),
+        &data_path,
+        std::path::Path::new("/"),
+        &payload,
+    )
+    .expect_err("a replay of an uncommitted registration is refused");
 
     assert_eq!(err.code(), tonic::Code::FailedPrecondition, "{err}");
     assert_eq!(membership_rows(&connstr, &data_path, ref_idx), 0);
@@ -1981,8 +1996,8 @@ fn register_files_replayed_before_the_earlier_call_committed_fails_closed() {
 #[serial_test::serial]
 #[cfg(feature = "integration")]
 fn register_files_replayed_after_its_rows_were_deleted_registers_nothing() {
-    let connstr = delete_test_catalog_connstr();
-    let data_path = delete_test_data_path();
+    let connstr = crate::test_catalog::connstr();
+    let data_path = crate::test_catalog::data_path();
     for (ref_idx, filter, rows_left) in [
         (973_000_i64, "", 0_i64),
         (974_000_i64, " AND feature_idx = 1", 1_i64),
@@ -1990,8 +2005,13 @@ fn register_files_replayed_after_its_rows_were_deleted_registers_nothing() {
         let ticket: i64 = ref_idx * 1000 + std::process::id() as i64;
         prepare_membership_table(&connstr, &data_path, ref_idx);
         let (_staging, payload) = seed_membership_registration(ref_idx, ticket);
-        let first = register_files(&connstr, &data_path, std::path::Path::new("/"), &payload)
-            .expect("first register_files failed");
+        let first = register_files(
+            &attached_writer(&connstr, &data_path),
+            &data_path,
+            std::path::Path::new("/"),
+            &payload,
+        )
+        .expect("first register_files failed");
         let conn = Connection::open_in_memory().unwrap();
         ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
         conn.execute_batch(&format!(
@@ -1999,8 +2019,13 @@ fn register_files_replayed_after_its_rows_were_deleted_registers_nothing() {
         ))
         .unwrap();
 
-        let replay = register_files(&connstr, &data_path, std::path::Path::new("/"), &payload)
-            .expect("replayed register_files failed");
+        let replay = register_files(
+            &attached_writer(&connstr, &data_path),
+            &data_path,
+            std::path::Path::new("/"),
+            &payload,
+        )
+        .expect("replayed register_files failed");
 
         assert_eq!(replay.registered, first.registered);
         assert_eq!(membership_rows(&connstr, &data_path, ref_idx), rows_left);
@@ -2014,16 +2039,21 @@ fn register_files_replayed_after_its_rows_were_deleted_registers_nothing() {
 #[serial_test::serial]
 #[cfg(feature = "integration")]
 fn ducklake_add_data_files_accepts_a_path_it_already_holds() {
-    let connstr = delete_test_catalog_connstr();
-    let data_path = delete_test_data_path();
+    let connstr = crate::test_catalog::connstr();
+    let data_path = crate::test_catalog::data_path();
     // Unique per run: rows a prior local run added twice outlive the DELETE in
     // `prepare_membership_table`, so a fixed reference_idx would not start at 0.
     let ref_idx: i64 = 975_000_000 + std::process::id() as i64;
     let ticket: i64 = ref_idx;
     prepare_membership_table(&connstr, &data_path, ref_idx);
     let (_staging, payload) = seed_membership_registration(ref_idx, ticket);
-    let first = register_files(&connstr, &data_path, std::path::Path::new("/"), &payload)
-        .expect("register_files failed");
+    let first = register_files(
+        &attached_writer(&connstr, &data_path),
+        &data_path,
+        std::path::Path::new("/"),
+        &payload,
+    )
+    .expect("register_files failed");
     assert_eq!(membership_rows(&connstr, &data_path, ref_idx), 2);
     let conn = Connection::open_in_memory().unwrap();
     ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
