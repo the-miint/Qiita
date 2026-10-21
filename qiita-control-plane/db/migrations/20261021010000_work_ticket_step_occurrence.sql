@@ -55,12 +55,14 @@ UPDATE qiita.work_ticket_step s
 ALTER TABLE qiita.work_ticket_step
   ALTER COLUMN step_occurrence SET NOT NULL;
 
--- `make migrate` runs while the previous control plane still serves, and its
--- write-ahead INSERT names no step_occurrence. For an INSERT that leaves it
--- NULL, this trigger counts it off the ticket's synced action, the same count
--- the exact backfill above takes; without a match it is 0 and the NOT NULL
--- holds. The current control plane always sets the column, so for it the
--- trigger does nothing.
+-- `make migrate` runs before the control plane restarts, and a control plane
+-- built before this migration writes its write-ahead row with an INSERT that
+-- names no step_occurrence. For an INSERT that leaves it NULL, this trigger
+-- counts it off the ticket's synced action, the same count the exact backfill
+-- above takes; without a match it is 0 and the NOT NULL holds. An INSERT that
+-- sets the column is left as it is. On a ticket the backfill ranked, the count
+-- can differ from the ranked rows' and the INSERT then fails on the unique
+-- index below; such a ticket's rows already disagree with its definition.
 CREATE FUNCTION qiita.work_ticket_step_fill_occurrence() RETURNS trigger
 LANGUAGE plpgsql AS $$
 BEGIN

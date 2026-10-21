@@ -800,12 +800,13 @@ async def _insert_without_occurrence(executor, wt_idx, step_index, attempt, name
     await executor.execute(
         "INSERT INTO qiita.work_ticket_step"
         " (work_ticket_idx, step_index, attempt, step_name, compute_target, state)"
-        " VALUES ($1, $2, $3, $4, $5, 'completed')",
+        " VALUES ($1, $2, $3, $4, $5, $6)",
         wt_idx,
         step_index,
         attempt,
         name,
-        target,
+        target.value,
+        StepProgressState.COMPLETED.value,
     )
 
 
@@ -814,9 +815,9 @@ async def test_insert_without_occurrence_is_filled_from_the_synced_steps(postgre
     `make migrate` and the restart) gets it counted off the ticket's action."""
     wt_idx, *rest = await _seed_ticket_with_steps(postgres_pool, _REPEATED_STEPS)
     try:
-        await _insert_without_occurrence(postgres_pool, wt_idx, 0, 0, "build", "local")
+        await _insert_without_occurrence(postgres_pool, wt_idx, 0, 0, "build", ComputeTarget.LOCAL)
         await _insert_without_occurrence(
-            postgres_pool, wt_idx, 3, 0, "register-index", "control_plane"
+            postgres_pool, wt_idx, 3, 0, "register-index", ComputeTarget.CONTROL_PLANE
         )
         rows = await step_progress.load_step_progress(postgres_pool, wt_idx)
         assert {(r.step_index, r.step_occurrence) for r in rows} == {(0, 0), (3, 1)}
@@ -846,13 +847,13 @@ async def test_occurrence_backfill_reads_the_definition_or_ranks_the_rows(postgr
                     " ALTER COLUMN step_occurrence DROP NOT NULL"
                 )
                 for wt_idx, step_index, attempt, name, target in (
-                    (a_idx, 0, 0, "build", "local"),
-                    (a_idx, 2, 0, "build2", "local"),
-                    (a_idx, 3, 0, "register-index", "control_plane"),
-                    (a_idx, 3, 1, "register-index", "control_plane"),
-                    (b_idx, 0, 0, "build", "local"),
-                    (b_idx, 1, 0, "register-index", "control_plane"),
-                    (b_idx, 2, 0, "register-index", "control_plane"),
+                    (a_idx, 0, 0, "build", ComputeTarget.LOCAL),
+                    (a_idx, 2, 0, "build2", ComputeTarget.LOCAL),
+                    (a_idx, 3, 0, "register-index", ComputeTarget.CONTROL_PLANE),
+                    (a_idx, 3, 1, "register-index", ComputeTarget.CONTROL_PLANE),
+                    (b_idx, 0, 0, "build", ComputeTarget.LOCAL),
+                    (b_idx, 1, 0, "register-index", ComputeTarget.CONTROL_PLANE),
+                    (b_idx, 2, 0, "register-index", ComputeTarget.CONTROL_PLANE),
                 ):
                     await _insert_without_occurrence(
                         conn, wt_idx, step_index, attempt, name, target

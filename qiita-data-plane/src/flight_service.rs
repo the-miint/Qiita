@@ -2442,7 +2442,8 @@ fn register_files(
         return Err(Status::failed_precondition(format!(
             "an earlier register_files call for work_ticket {} from {} moved {} of {} \
              files into the lake and registered {} of them; it did not commit, or \
-             has not yet",
+             has not yet. If it did not, this ticket cannot finish the \
+             registration: submit a new ticket, whose files get new lake names",
             payload.work_ticket_idx,
             payload.staging_dir,
             moved_before,
