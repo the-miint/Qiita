@@ -89,6 +89,12 @@ pub(crate) const CEILING_DIVISOR: u64 = 2;
 /// both ways out.
 pub(crate) const MIN_MEMORY_LIMIT_MIB: u64 = 512;
 
+/// The `memory_limit`, in MiB, that each of `size` connections gets from a
+/// detected ceiling of `ceiling_bytes` when none is configured.
+pub(crate) fn derived_share_mib(ceiling_bytes: u64, size: usize) -> u64 {
+    ceiling_bytes / CEILING_DIVISOR / size as u64 / (1024 * 1024)
+}
+
 /// Per-connection ceiling on spill. DuckDB's own default is 90% of the
 /// filesystem holding `temp_directory` — which every connection would claim in
 /// full — so an explicit value is required rather than optional.
@@ -216,8 +222,7 @@ impl Settings {
         let memory_limit = match env_value("DUCKDB_MEMORY_LIMIT") {
             Some(raw) => raw,
             None => {
-                let share_mib =
-                    memory_ceiling.bytes / CEILING_DIVISOR / size as u64 / (1024 * 1024);
+                let share_mib = derived_share_mib(memory_ceiling.bytes, size);
                 if share_mib < MIN_MEMORY_LIMIT_MIB {
                     return Err(format!(
                         concat!(

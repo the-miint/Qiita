@@ -275,14 +275,12 @@ mod tests {
     #[serial]
     fn pool_settings_are_derived_when_unset() {
         let _env = pool_test_env();
-        // Below this much memory the default pool is refused at boot
-        // (`a_pool_too_large_for_the_detected_ceiling_fails_at_boot`), so there
-        // are no derived settings to check.
+        // Where this machine's memory gives the default pool a share below
+        // `MIN_MEMORY_LIMIT_MIB`, boot refuses the pool, so there are no derived
+        // settings to check.
         let ceiling = super::resources::detect_memory_ceiling();
-        let share_mib = ceiling.bytes
-            / super::config::CEILING_DIVISOR
-            / super::config::DEFAULT_POOL_SIZE as u64
-            / (1024 * 1024);
+        let share_mib =
+            super::config::derived_share_mib(ceiling.bytes, super::config::DEFAULT_POOL_SIZE);
         if share_mib < super::config::MIN_MEMORY_LIMIT_MIB {
             eprintln!(
                 "skipped: the {} MiB ceiling detected via {} gives the default pool \
