@@ -455,8 +455,8 @@ def _build_parser() -> argparse.ArgumentParser:
         description=(
             "Backfill the host_taxon_id biosample field, which postdates every sample"
             " we hold. A control (per the pre-flight's own is_control, or negative"
-            " control metadata) gets 'missing: control sample'; otherwise the sample's"
-            " own taxon_id is mapped to a host through a small curated table. A sample"
+            " control metadata) gets 'missing: control sample'; otherwise the biosample's"
+            " own taxon_id is mapped to a host through a small curated table. A biosample"
             " neither rule settles is REPORTED and left unwritten — it stays UNRESOLVED at"
             " submit, which aborts rather than passing an un-depleted sample through."
             " Idempotent: a biosample that already carries the field is skipped, so this"

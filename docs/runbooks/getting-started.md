@@ -157,10 +157,8 @@ full NCBI release, after which the whole taxonomy is accepted. An id your site d
 not have is refused, and there is no self-service way to list or add one — ask your
 operator. For an environmental biosample with no host of its own, use
 `not applicable`. A blank or other control still needs a `host taxon id` (any accepted
-value, `not applicable` included) and also sets `--metadata "qiita sample type=…"` to a
-control term (`control_blank`, `control_sterile_water`, `control_sea_water` or
-`control_spike_in`); that makes it a control whatever its `host taxon id`. The terms
-are classified in `qiita_common/data/control_types.yml`.
+value, `not applicable` included) and is marked by a `control_*` `qiita sample type` term
+(`--metadata "qiita sample type=…"`), which makes it a control whatever its `host taxon id`.
 
 `--owner-biosample-id-value` is your own name for the biosample, stored under the
 field named by `--owner-biosample-id-field-name` (the field is created the first

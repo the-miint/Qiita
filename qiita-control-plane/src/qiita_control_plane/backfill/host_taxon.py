@@ -18,8 +18,8 @@ Two facts drive each biosample, in this order:
   1. IS IT A CONTROL? A blank has no host of its own regardless of what taxon it
      carries, so this is checked FIRST. The signal is the pre-flight's own
      `is_control` (`input_sample.project_idx IS NULL`), read via
-     `preflight.control_samples`, or a negative control in the sample's own
-     metadata (`negative_control_biosamples`) — not the sample's name.
+     `preflight.control_samples`, or a negative control in the biosample's own
+     metadata (`negative_control_biosamples`) — not its name.
   2. WHAT IS THE SAMPLE'S OWN TAXON? `taxon_id` (populated on every biosample we
      hold) names the sample's organism — for a metagenome, the environment it
      came from. `human gut metagenome` implies a human host; `seawater

@@ -21,6 +21,14 @@ import asyncpg
 from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX, SystemRole
 from qiita_common.chunking import canonical_sequence_hash_expr
 from qiita_common.hashing import canonical_params_hash
+from qiita_common.models import (
+    BIOSAMPLE_DISPLAY_QIITA_SAMPLE_TYPE,
+    BIOSAMPLE_FIELD_QIITA_SAMPLE_TYPE,
+    FieldDataType,
+    GenomeSource,
+    ReferenceStatus,
+    TerminologyStatus,
+)
 
 # Re-exported (redundant-alias form, so the linter keeps what looks unused here).
 # The taxonomy constants live in qiita_common.models now — production code must
@@ -29,7 +37,6 @@ from qiita_common.hashing import canonical_params_hash
 from qiita_common.models import NCBI_TAXONOMY_HUMAN_TERM_ID as NCBI_TAXONOMY_HUMAN_TERM_ID
 from qiita_common.models import NCBI_TAXONOMY_METAGENOME_TERM_ID as NCBI_TAXONOMY_METAGENOME_TERM_ID
 from qiita_common.models import NCBI_TAXONOMY_NAME as NCBI_TAXONOMY_NAME
-from qiita_common.models import FieldDataType, GenomeSource, ReferenceStatus, TerminologyStatus
 
 from qiita_control_plane.miint import connect_with_miint
 from qiita_control_plane.repositories.exported_entity import ENTITY_COLUMN, EntityKind
@@ -41,6 +48,7 @@ from ..repositories._sample_helpers import (
     _get_or_create_local_study_field,
     write_local_metadata_or_diagnose,
 )
+from ..repositories.biosample_metadata import BIOSAMPLE_METADATA_SPEC
 
 # Pinned loaded_at for seeded terminology rows, so a seeded row is fully
 # determined rather than stamped at insert time. UTC-aware and
@@ -630,6 +638,45 @@ async def seed_biosample_global_field(
         required,
         created_by_idx,
     )
+
+
+async def seed_biosample_sample_type(
+    pool: asyncpg.Pool,
+    *,
+    biosample_idx: int,
+    study_idx: int,
+    created_by_idx: int,
+    term_id: str,
+) -> None:
+    """Write `qiita_sample_type = term_id` on a biosample, linking the study field if absent."""
+    async with pool.acquire() as conn, conn.transaction():
+        row = await conn.fetchrow(
+            "SELECT bgf.idx AS field_idx, tt.idx AS term_idx"
+            "  FROM qiita.biosample_global_field bgf"
+            "  JOIN qiita.terminology_term tt ON tt.terminology_idx = bgf.terminology_idx"
+            " WHERE bgf.internal_name = $1 AND tt.term_id = $2",
+            BIOSAMPLE_FIELD_QIITA_SAMPLE_TYPE,
+            term_id,
+        )
+        assert row is not None, f"{term_id!r} should be seeded for qiita_sample_type"
+        field_idx, _ = await _get_or_create_globally_linked_study_field(
+            conn,
+            spec=BIOSAMPLE_METADATA_SPEC,
+            study_idx=study_idx,
+            global_field_idx=row["field_idx"],
+            display_name=BIOSAMPLE_DISPLAY_QIITA_SAMPLE_TYPE,
+            created_by_idx=created_by_idx,
+        )
+        await conn.execute(
+            "INSERT INTO qiita.biosample_metadata"
+            " (biosample_idx, biosample_study_field_idx, value_terminology_term_idx,"
+            "  created_by_idx)"
+            " VALUES ($1, $2, $3, $4)",
+            biosample_idx,
+            field_idx,
+            row["term_idx"],
+            created_by_idx,
+        )
 
 
 async def seed_prep_sample_global_field(

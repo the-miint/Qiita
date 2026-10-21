@@ -21,7 +21,7 @@ import secrets
 import pytest
 import pytest_asyncio
 from qiita_common.models import (
-    BIOSAMPLE_FIELD_QIITA_SAMPLE_TYPE,
+    MISSING_REASON_CONTROL_SAMPLE,
     NCBI_TAXONOMY_HUMAN_TERM_ID,
     NCBI_TAXONOMY_METAGENOME_TERM_ID,
     NCBI_TAXONOMY_MOUSE_TERM_ID,
@@ -43,6 +43,7 @@ from qiita_control_plane.repositories.biosample import insert_biosample
 from qiita_control_plane.repositories.biosample_metadata import BIOSAMPLE_METADATA_SPEC
 from qiita_control_plane.testing.db_seeds import (
     fetch_ncbi_taxonomy_term,
+    seed_biosample_sample_type,
     seed_user_principal,
 )
 from qiita_control_plane.testing.db_teardown import delete_principal, teardown_entity_graph
@@ -145,7 +146,7 @@ def test_control_wins_over_its_taxon():
     because every pool contains blanks. This ordering is the whole ballgame."""
     a = _classify(is_control=True, sample_taxon_term_id=_GENERIC_METAGENOME)
     assert a.source is HostTaxonSource.CONTROL
-    assert a.missing_reason == "missing: control sample"
+    assert a.missing_reason == MISSING_REASON_CONTROL_SAMPLE
 
 
 def test_a_control_carrying_a_host_taxon_is_still_a_control():
@@ -414,41 +415,14 @@ async def test_a_biosample_with_no_taxon_is_counted_not_silently_dropped(ctx):
     assert plan.no_taxon >= 1
 
 
-async def _set_control_term(ctx, biosample_idx, internal_name, term_id):
-    async with ctx["pool"].acquire() as conn, conn.transaction():
-        global_field_idx, term_idx = await _control_global_field_and_term(
-            conn, internal_name, term_id
-        )
-        field_idx, _ = await _get_or_create_globally_linked_study_field(
-            conn,
-            spec=BIOSAMPLE_METADATA_SPEC,
-            study_idx=ctx["study_idx"],
-            global_field_idx=global_field_idx,
-            display_name=internal_name,
-            created_by_idx=ctx["principal_idx"],
-        )
-        await conn.execute(
-            "INSERT INTO qiita.biosample_metadata"
-            " (biosample_idx, biosample_study_field_idx, value_terminology_term_idx,"
-            "  created_by_idx)"
-            " VALUES ($1, $2, $3, $4)",
-            biosample_idx,
-            field_idx,
-            term_idx,
-            ctx["principal_idx"],
-        )
-
-
-async def _control_global_field_and_term(conn, internal_name, term_id):
-    row = await conn.fetchrow(
-        "SELECT bgf.idx AS field_idx, tt.idx AS term_idx"
-        "  FROM qiita.biosample_global_field bgf"
-        "  JOIN qiita.terminology_term tt ON tt.terminology_idx = bgf.terminology_idx"
-        " WHERE bgf.internal_name = $1 AND tt.term_id = $2",
-        internal_name,
-        term_id,
+async def _set_sample_type(ctx, biosample_idx, term_id):
+    await seed_biosample_sample_type(
+        ctx["pool"],
+        biosample_idx=biosample_idx,
+        study_idx=ctx["study_idx"],
+        created_by_idx=ctx["principal_idx"],
+        term_id=term_id,
     )
-    return row["field_idx"], row["term_idx"]
 
 
 @pytest.mark.db
@@ -456,22 +430,22 @@ async def test_negative_metadata_control_is_written_as_a_control_marker(ctx):
     """A biosample the metadata calls a negative control is a CONTROL even when no
     pre-flight names it, and gets the marker rather than its taxon's host."""
     bs_idx = await _seed_biosample_with_taxon(ctx, _HUMAN_GUT_METAGENOME)
-    await _set_control_term(ctx, bs_idx, BIOSAMPLE_FIELD_QIITA_SAMPLE_TYPE, "control_blank")
+    await _set_sample_type(ctx, bs_idx, "control_blank")
 
     plan = await plan_backfill(ctx["pool"])
     mine = [a for a in plan.assignments if a.biosample_idx == bs_idx]
     await apply_backfill(ctx["pool"], mine, principal_idx=ctx["principal_idx"])
 
     assert [a.source for a in mine] == [HostTaxonSource.CONTROL]
-    assert (await _host_taxon_of(ctx, bs_idx))["reason"] == "missing: control sample"
+    assert (await _host_taxon_of(ctx, bs_idx))["reason"] == MISSING_REASON_CONTROL_SAMPLE
 
 
 @pytest.mark.db
 async def test_positive_metadata_control_is_not_written_as_a_control_marker(ctx):
-    """The marker makes a sample an expected-empty well, which a spike-in control
+    """The marker makes a biosample an expected-empty well, which a spike-in control
     must not be; it keeps the host its own taxon implies."""
     bs_idx = await _seed_biosample_with_taxon(ctx, _HUMAN_GUT_METAGENOME)
-    await _set_control_term(ctx, bs_idx, BIOSAMPLE_FIELD_QIITA_SAMPLE_TYPE, "control_spike_in")
+    await _set_sample_type(ctx, bs_idx, "control_spike_in")
 
     plan = await plan_backfill(ctx["pool"])
     mine = [a for a in plan.assignments if a.biosample_idx == bs_idx]

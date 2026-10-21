@@ -2,20 +2,25 @@
 
 import pytest
 
-from qiita_common.control_types import load_control_types, parse_control_types
+from qiita_common.control_types import ControlKind, load_control_types, parse_control_types
+
+
+def _terms(kind):
+    return {term_id for term_id, k in load_control_types().items() if k is kind}
 
 
 def test_the_file_classifies_negative_positive_and_not_control():
-    types = load_control_types()
-    assert set(types) == {"negative", "positive", "not_control"}
-    assert types["negative"] == {"control_blank", "control_sterile_water", "control_sea_water"}
-    assert types["positive"] == {"control_spike_in"}
+    assert set(load_control_types().values()) == set(ControlKind)
+    assert _terms(ControlKind.NEGATIVE) == {
+        "control_blank",
+        "control_sterile_water",
+        "control_sea_water",
+    }
+    assert _terms(ControlKind.POSITIVE) == {"control_spike_in"}
 
 
-def test_loader_is_cached_and_frozen():
-    types = load_control_types()
-    assert load_control_types() is types
-    assert all(isinstance(terms, frozenset) for terms in types.values())
+def test_loader_is_cached():
+    assert load_control_types() is load_control_types()
 
 
 def test_term_listed_twice_in_one_kind_raises():

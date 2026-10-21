@@ -32,7 +32,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 
 import asyncpg
-from qiita_common.control_types import load_control_types
+from qiita_common.control_types import ControlKind, load_control_types
 from qiita_common.models import (
     BIOSAMPLE_FIELD_HOST_TAXON_ID,
     BIOSAMPLE_FIELD_QIITA_SAMPLE_TYPE,
@@ -49,13 +49,11 @@ from .repositories.host_filter_profile import (
     list_host_filter_profiles,
 )
 
-# host_taxon_id is terminology-typed, so a value is only ever a term or a
-# missing-reason, which is why there is no free-text branch for it below.
+# Both fields are terminology-typed, so a value is only ever a term or a missing-reason.
 _METADATA_COLUMNS = (
     "bm.biosample_idx,"
     " bgf.internal_name,"
     " bm.value_terminology_term_idx,"
-    " bm.value_text,"
     " bm.value_missing_reason_idx,"
     " mvr.name AS missing_reason,"
     " tt.term_id AS term_id"
@@ -77,10 +75,11 @@ class _Signals:
     """What one metadata read says about a set of biosamples."""
 
     host_rows: dict[int, asyncpg.Record] = field(default_factory=dict)
-    control: set[int] = field(default_factory=set)
-    negative: set[int] = field(default_factory=set)
-    # biosample_idx -> a qiita_sample_type term that control_types.yml does not list.
-    unlisted: dict[int, str] = field(default_factory=dict)
+    sample_types: dict[int, str] = field(default_factory=dict)
+
+    def kind(self, biosample_idx: int) -> ControlKind | None:
+        """None when the biosample has no sample type or control_types.yml does not list it."""
+        return load_control_types().get(self.sample_types.get(biosample_idx))
 
 
 async def _read_signals(
@@ -93,23 +92,13 @@ async def _read_signals(
         _METADATA_FIELDS,
         list(biosample_idxs),
     )
-    control_types = load_control_types()
     signals = _Signals()
     for row in rows:
         idx = row["biosample_idx"]
         if row["internal_name"] == BIOSAMPLE_FIELD_HOST_TAXON_ID:
             signals.host_rows[idx] = row
-            continue
-        term_id = row["term_id"]
-        if term_id is None:
-            continue
-        if term_id in control_types["negative"]:
-            signals.negative.add(idx)
-            signals.control.add(idx)
-        elif term_id in control_types["positive"]:
-            signals.control.add(idx)
-        elif term_id not in control_types["not_control"]:
-            signals.unlisted[idx] = term_id
+        elif row["internal_name"] == BIOSAMPLE_FIELD_QIITA_SAMPLE_TYPE and row["term_id"]:
+            signals.sample_types[idx] = row["term_id"]
     return signals
 
 
@@ -188,7 +177,8 @@ async def negative_control_biosamples(
     """
     negative: set[int] = set()
     if biosample_idxs:
-        negative = (await _read_signals(conn, biosample_idxs)).negative
+        signals = await _read_signals(conn, biosample_idxs)
+        negative = {i for i in biosample_idxs if signals.kind(i) is ControlKind.NEGATIVE}
     return negative
 
 
@@ -197,16 +187,11 @@ async def is_control_sample(
     *,
     biosample_idx: int,
 ) -> bool:
-    """True when `biosample_idx` is an expected-empty control: a negative control by
-    metadata (see `negative_control_biosamples`) or one carrying the legacy
-    `MISSING_REASON_CONTROL_SAMPLE` host marker.
-
-    Positive controls resolve CONTROL for host filtering but are not expected-empty:
-    they should yield reads, so zero reads from one stays a failure. The caller is
-    the read-mask reads binder, which must tell a blank from a failed data well.
+    """True for an expected-empty control: a negative `qiita_sample_type` or the legacy
+    control host marker. Positive controls are excluded: they should yield reads.
     """
     signals = await _read_signals(conn, [biosample_idx])
-    return biosample_idx in signals.negative or _has_control_marker(
+    return signals.kind(biosample_idx) is ControlKind.NEGATIVE or _has_control_marker(
         signals.host_rows.get(biosample_idx)
     )
 
@@ -271,19 +256,20 @@ def _classify(
     host_taxon_id row (or its absence), the profile for whatever host that row
     names (or its absence), and what its qiita_sample_type says.
     """
-    if biosample_idx in signals.control:
+    kind = signals.kind(biosample_idx)
+    if kind in (ControlKind.NEGATIVE, ControlKind.POSITIVE):
         return _without_references(
             HostFilterOutcome.CONTROL,
             f"{BIOSAMPLE_FIELD_QIITA_SAMPLE_TYPE} marks biosample {biosample_idx} as a control;"
             " what it filters against is decided pool-side",
         )
 
-    unlisted = signals.unlisted.get(biosample_idx)
-    if unlisted is not None:
+    term_id = signals.sample_types.get(biosample_idx)
+    if term_id is not None and kind is None:
         return _without_references(
             HostFilterOutcome.UNRESOLVED,
-            f"{BIOSAMPLE_FIELD_QIITA_SAMPLE_TYPE} {unlisted!r} on biosample {biosample_idx}"
-            " is not classified in control_types.yml",
+            f"{BIOSAMPLE_FIELD_QIITA_SAMPLE_TYPE} term {term_id!r} on biosample {biosample_idx}"
+            " has no control classification; an operator must add one",
         )
 
     # The field was never set. Not the same as "no host" — we simply were not
