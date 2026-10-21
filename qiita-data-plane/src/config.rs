@@ -57,7 +57,7 @@ pub struct Settings {
 /// draws on as well. Eight leaves that budget room for other data-plane
 /// processes and for the control plane; raise it with `DUCKLAKE_POOL_SIZE` where
 /// the budget allows, counting every process on every host against the same 97.
-const DEFAULT_POOL_SIZE: usize = 8;
+pub(crate) const DEFAULT_POOL_SIZE: usize = 8;
 
 /// The pool divides half the detected ceiling, not all of it. Half is a choice;
 /// what is measured is that it has to be less than all of it, because

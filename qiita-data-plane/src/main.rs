@@ -176,8 +176,10 @@ mod tests {
             "DUCKLAKE_CATALOG_CONNSTR",
             "PATH_SCRATCH",
             "PATH_PERSISTENT",
+            "DUCKDB_MEMORY_LIMIT",
         ]);
         std::env::remove_var("LISTEN_ADDR");
+        std::env::set_var("DUCKDB_MEMORY_LIMIT", TEST_MEMORY_LIMIT);
         // Ed25519 PUBLIC key (base64) — the verification half of the fixed test
         // seed [7u8; 32] used across the suite. A public key is not secret
         // (it only verifies; it cannot sign), so hardcoding it here is safe.
@@ -245,6 +247,12 @@ mod tests {
         "FLIGHT_MAX_CONCURRENT_DOPUT",
     ];
 
+    /// A memory limit for the tests that are not about deriving one. Unset, the
+    /// limit is derived from the memory of the machine running the test, and on a
+    /// small one `Settings::from_env` refuses the default pool before the test
+    /// reaches what it checks.
+    const TEST_MEMORY_LIMIT: &str = "1GiB";
+
     /// The snapshot guards plus a known starting point: every required var set,
     /// every optional pool var cleared. The caller holds the guards, so the
     /// snapshot is restored when its test ends.
@@ -267,12 +275,34 @@ mod tests {
     #[serial]
     fn pool_settings_are_derived_when_unset() {
         let _env = pool_test_env();
+        // Below this much memory the default pool is refused at boot
+        // (`a_pool_too_large_for_the_detected_ceiling_fails_at_boot`), so there
+        // are no derived settings to check.
+        let ceiling = super::resources::detect_memory_ceiling();
+        let share_mib = ceiling.bytes
+            / super::config::CEILING_DIVISOR
+            / super::config::DEFAULT_POOL_SIZE as u64
+            / (1024 * 1024);
+        if share_mib < super::config::MIN_MEMORY_LIMIT_MIB {
+            eprintln!(
+                "skipped: the {} MiB ceiling detected via {} gives the default pool \
+                 {share_mib} MiB per connection, below the {} MiB floor",
+                ceiling.bytes / (1024 * 1024),
+                ceiling.source.as_str(),
+                super::config::MIN_MEMORY_LIMIT_MIB,
+            );
+            return;
+        }
         // Set, so the assertion below shows the spill root does not follow it.
         std::env::set_var("HOME", tmp_abs("qiita-test-home"));
 
         let cfg = Settings::from_env().expect("from_env with no pool vars set");
 
-        assert_eq!(cfg.pool.size, 8, "the default in-flight bound");
+        assert_eq!(
+            cfg.pool.size,
+            super::config::DEFAULT_POOL_SIZE,
+            "the default in-flight bound"
+        );
         assert!(cfg.pool.threads >= 1, "a request always gets a thread");
         assert_eq!(
             cfg.pool.threads,
@@ -326,6 +356,7 @@ mod tests {
     #[serial]
     fn config_rejects_a_pool_that_serves_nothing() {
         let _env = pool_test_env();
+        std::env::set_var("DUCKDB_MEMORY_LIMIT", TEST_MEMORY_LIMIT);
         std::env::set_var("DUCKLAKE_POOL_SIZE", "0");
         let err = Settings::from_env().unwrap_err();
         assert!(
@@ -354,6 +385,7 @@ mod tests {
     #[serial]
     fn config_rejects_a_relative_spill_directory() {
         let _env = pool_test_env();
+        std::env::set_var("DUCKDB_MEMORY_LIMIT", TEST_MEMORY_LIMIT);
         std::env::set_var("DUCKDB_TEMP_DIRECTORY", "relative/spill");
         let err = Settings::from_env().unwrap_err();
         assert!(
@@ -392,6 +424,7 @@ mod tests {
     #[serial]
     fn the_spill_root_does_not_need_home() {
         let _env = pool_test_env();
+        std::env::set_var("DUCKDB_MEMORY_LIMIT", TEST_MEMORY_LIMIT);
         let home = EnvSnapshot::capture(&["HOME"]);
         std::env::remove_var("HOME");
         let cfg = Settings::from_env().expect("from_env with HOME unset");
