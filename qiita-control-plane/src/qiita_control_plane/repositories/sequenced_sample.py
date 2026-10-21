@@ -25,7 +25,7 @@ from dataclasses import dataclass
 
 import asyncpg
 from qiita_common.actions import READ_MASK_ACTION_ID
-from qiita_common.models import NON_TERMINAL_WORK_TICKET_STATES
+from qiita_common.models import NON_TERMINAL_WORK_TICKET_STATES, FailureType
 
 from . import require_transaction, validate_patch_fields
 from ._sample_helpers import (
@@ -769,6 +769,33 @@ async def update_sequenced_sample_ena_status(
         " WHERE ena_run_accession = $1",
         ena_run_accession,
         ena_status,
+    )
+
+
+async def set_sequenced_sample_download_failure(
+    conn: asyncpg.Connection,
+    *,
+    sequenced_pool_idx: int,
+    prep_sample_idx: int,
+    ena_run_accession: str,
+    failure_reason: str,
+    failure_type: FailureType,
+) -> bool:
+    """Record a download failure on the run's sequenced_sample; False when no row
+    in the pool carries both `prep_sample_idx` and `ena_run_accession`."""
+    return (
+        await conn.fetchval(
+            "UPDATE qiita.sequenced_sample"
+            " SET download_failure_reason = $4, download_failure_type = $5::qiita.failure_type"
+            " WHERE sequenced_pool_idx = $1 AND prep_sample_idx = $2 AND ena_run_accession = $3"
+            " RETURNING true",
+            sequenced_pool_idx,
+            prep_sample_idx,
+            ena_run_accession,
+            failure_reason,
+            failure_type.value,
+        )
+        is True
     )
 
 

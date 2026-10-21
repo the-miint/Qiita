@@ -454,13 +454,14 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Populate biosample host_taxon_id from the sample's own taxon + control status",
         description=(
             "Backfill the host_taxon_id biosample field, which postdates every sample"
-            " we hold. A control (per the pre-flight's own is_control) gets 'missing:"
-            " control sample'; otherwise the sample's own taxon_id is mapped to a host"
-            " through a small curated table. A sample neither rule settles is REPORTED"
-            " and left unwritten — it stays UNRESOLVED at submit, which aborts rather"
-            " than passing an un-depleted sample through. Idempotent: a biosample that"
-            " already carries the field is skipped, so this can be re-run as curation"
-            " lands. Dry-run by default; pass --execute to write. Needs DATABASE_URL."
+            " we hold. A control (per the pre-flight's own is_control, or negative"
+            " control metadata) gets 'missing: control sample'; otherwise the biosample's"
+            " own taxon_id is mapped to a host through a small curated table. A biosample"
+            " neither rule settles is REPORTED and left unwritten — it stays UNRESOLVED at"
+            " submit, which aborts rather than passing an un-depleted biosample through."
+            " Idempotent: a biosample that already carries the field is skipped, so this"
+            " can be re-run as curation lands. Dry-run by default; pass --execute to write."
+            " Needs DATABASE_URL."
         ),
     )
     p_backfill_host.add_argument(

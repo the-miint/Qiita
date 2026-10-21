@@ -1179,6 +1179,26 @@ async def test_result_step_step_level_oom_upgrades_to_oom_killed(jwt_path, tmp_p
 
 
 @pytest.mark.asyncio
+async def test_result_step_duckdb_oom_traceback_upgrades_to_oom_killed(jwt_path, tmp_path):
+    """A raw DuckDB OutOfMemoryException traceback with no launcher line is
+    upgraded to the retriable OOM_KILLED."""
+    backend = _make_backend(httpx.MockTransport(lambda r: httpx.Response(500)), jwt_path)
+    (tmp_path / "logs").mkdir(parents=True)
+    (tmp_path / "logs" / "stderr").write_text(
+        "Traceback (most recent call last):\n"
+        "duckdb.OutOfMemoryException: Out of Memory Error: failed to allocate data "
+        "of size 16.0 MiB\n"
+    )
+    with pytest.raises(BackendFailure) as ei:
+        await backend.result_step(
+            _slurm_handle(tmp_path),
+            StepStatusInfo(status=StepStatus.FAILED, raw_state="FAILED", exit_code=1),
+        )
+    assert ei.value.kind is FailureKind.OOM_KILLED
+    assert ei.value.transient is True
+
+
+@pytest.mark.asyncio
 async def test_result_step_non_oom_failure_stays_exit_nonzero_with_tail(jwt_path, tmp_path):
     """A generic FAILED whose stderr carries no OOM signature stays
     EXIT_NONZERO, but the stderr tail is still folded into failure_reason."""

@@ -446,6 +446,12 @@ at all, is in the Scopes and roles section above.
 |---|---|---|
 | `/api/v1/mask-definition/{mask_idx}/syndna-read-count` | GET | Per-insert SynDNA read counts under one mask for the prep_samples selected by `study_idx`, `sequenced_pool_idx` and/or repeatable `prep_sample_idx` (intersected; at least one required, else `422`): the reference's inserts with their recorded accession, and per prep_sample its biosample accession, `sequenced_pool_idx` and one count per insert. All-or-nothing: `403` unless the caller holds `Tier.VIEWER` on every study each selected prep_sample is linked to (wet_lab_admin+ bypass; a named `study_idx` or `prep_sample_idx` is checked before any lookup; an unknown study selects nothing); `409` when the mask ran without SynDNA, a named prep_sample is not masked under it, a selected prep_sample is not `completed`, or a completed one has no counts (naming `qiita-admin backfill syndna-read-count`); `404` for an unknown mask or an empty selection; `413` above the roster cap. Requires `prep_sample:read`. |
 
+### QC check
+
+| Route | Method | Notes |
+|---|---|---|
+| `/api/v1/qc-check/{prep_sample_idx}` | GET | A prep_sample's QC check rows (invalidated ones included, without who invalidated them) and its verdict, `null` when no row counts. Gated like `GET /sequence-range`: `Tier.VIEWER` on every linked study (wet_lab_admin+ bypass), checked before existence, so a caller without access gets `403` for an existing and a non-existent prep_sample alike; an admin gets `404` for a missing one. Service accounts are refused. Requires `prep_sample:read`. |
+
 ### Run folder
 
 | Route | Method | Notes |

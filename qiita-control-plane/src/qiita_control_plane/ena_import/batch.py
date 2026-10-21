@@ -29,13 +29,13 @@ partially ran.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 from dataclasses import dataclass, replace
 from typing import Any
 
 import asyncpg
 from fastapi import FastAPI, HTTPException, status
+from pydantic import TypeAdapter
 from qiita_common.ena_accession import EnaAccessionKind, validate_import_accession
 from qiita_common.models import WorkTicketState
 from qiita_common.models.ena import EnaStatus
@@ -48,10 +48,12 @@ from qiita_common.models.ena_import import (
 
 from ..auth.principal import HumanUser, PrincipalUnusableError, load_human_user
 from ..repositories.ena_import_batch import (
+    FailedDownload,
     append_ena_import_batch_item_download_ticket,
     ena_import_batch_exists,
     ena_import_created_study,
     fetch_ena_import_batch_items,
+    fetch_failed_downloads,
     fetch_inflight_ena_import_batch_items,
     fetch_sequenced_samples_missed_by_completed_download,
     fetch_work_ticket_states_for_idxs,
@@ -103,6 +105,11 @@ _log = logging.getLogger(__name__)
 # The dispatch each item's submit fires runs outside this permit, under
 # dispatch's own process-wide cap — see dispatch._DISPATCH_CONCURRENCY.
 _STUDY_CONCURRENCY = 4
+
+# Failed runs a `completed_partial` item's failure_reason lists before "and N more".
+_LISTED_FAILED_RUNS = 20
+
+_OUTCOMES = TypeAdapter(list[EnaRunImportOutcome])
 
 
 def build_ena_import_study_semaphore() -> asyncio.Semaphore:
@@ -944,8 +951,9 @@ async def fetch_batch_status(pool: asyncpg.Pool, *, batch_idx: int) -> BatchImpo
     A `downloading` item's `download_work_ticket_idxs`' `work_ticket.state` are
     rolled up ON DEMAND (never persisted back -- a pure read): any ticket failed or
     cancelled -> `failed` (naming the ticket(s); the batch itself is never failed);
-    any non-terminal -> stays `downloading`; all terminal-success -> `done`. Every
-    other persisted state passes through unchanged.
+    any non-terminal -> stays `downloading`; all terminal-success -> `done`, or
+    `completed_partial` when one of the item's runs has a recorded download failure
+    and no stored reads. Every other persisted state passes through unchanged.
     """
     if not await ena_import_batch_exists(pool, batch_idx):
         return None
@@ -958,8 +966,21 @@ async def fetch_batch_status(pool: asyncpg.Pool, *, batch_idx: int) -> BatchImpo
         ticket_rows = await fetch_work_ticket_states_for_idxs(pool, all_ticket_idxs)
         ticket_states = {r["work_ticket_idx"]: r["state"] for r in ticket_rows}
 
+    # ena_run_outcomes is a JSONB column; asyncpg has no default jsonb codec, so
+    # it comes back as a JSON string. Empty ('[]') until register_ena_study ran.
+    outcomes = [_OUTCOMES.validate_json(row["ena_run_outcomes"]) for row in item_rows]
+    runs_of_interest = [
+        row["requested_run_accessions"]
+        if row["requested_run_accessions"] is not None
+        else [o.run_accession for o in item_outcomes]
+        for row, item_outcomes in zip(item_rows, outcomes, strict=True)
+    ]
+    failed_downloads = await fetch_failed_downloads(
+        pool, run_accessions=sorted({run for runs in runs_of_interest for run in runs})
+    )
+
     items: list[BatchImportItem] = []
-    for row in item_rows:
+    for row, ena_runs, interest in zip(item_rows, outcomes, runs_of_interest, strict=True):
         state = BatchItemState(row["state"])
         failure_reason = row["failure_reason"]
         ticket_idxs = list(row["download_work_ticket_idxs"])
@@ -975,14 +996,16 @@ async def fetch_batch_status(pool: asyncpg.Pool, *, batch_idx: int) -> BatchImpo
                 failure_reason = f"download work_ticket(s) did not complete: {unsuccessful}"
             elif all(s in _TERMINAL_SUCCESS_STATES for s in states):
                 state = BatchItemState.DONE
+                failed = [run for run in interest if run in failed_downloads]
+                if failed:
+                    state = BatchItemState.COMPLETED_PARTIAL
+                    failure_reason = _failed_runs_reason(failed, failed_downloads)
+                    ena_runs = [_with_download_failure(o, failed_downloads) for o in ena_runs]
             else:
                 # Any ticket not explicitly terminal-success -- still running, an
                 # unrecognized state, or a missing work_ticket row (state None) --
                 # must not read as success.
                 state = BatchItemState.DOWNLOADING
-        # ena_run_outcomes is a JSONB column; asyncpg has no default jsonb codec, so
-        # it comes back as a JSON string. Empty ('[]') until register_ena_study ran.
-        ena_runs = [EnaRunImportOutcome(**o) for o in json.loads(row["ena_run_outcomes"])]
         items.append(
             BatchImportItem(
                 idx=row["idx"],
@@ -996,3 +1019,28 @@ async def fetch_batch_status(pool: asyncpg.Pool, *, batch_idx: int) -> BatchImpo
             )
         )
     return BatchImportStatus(ena_import_batch_idx=batch_idx, items=items)
+
+
+def _failed_runs_reason(failed: list[str], failed_downloads: dict[str, FailedDownload]) -> str:
+    listed = [
+        f"{run} ({failed_downloads[run].failure_type.value})"
+        for run in failed[:_LISTED_FAILED_RUNS]
+    ]
+    if len(failed) > _LISTED_FAILED_RUNS:
+        listed.append(f"and {len(failed) - _LISTED_FAILED_RUNS} more")
+    return ", ".join(listed)
+
+
+def _with_download_failure(
+    outcome: EnaRunImportOutcome, failed_downloads: dict[str, FailedDownload]
+) -> EnaRunImportOutcome:
+    if outcome.run_accession not in failed_downloads:
+        return outcome
+    failed = failed_downloads[outcome.run_accession]
+    return outcome.model_copy(
+        update={
+            "status": EnaRunRegistrationStatus.DOWNLOAD_FAILED.value,
+            "failure_reason": failed.reason,
+            "failure_type": failed.failure_type,
+        }
+    )

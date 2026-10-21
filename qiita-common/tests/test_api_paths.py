@@ -137,6 +137,12 @@ _TRIPLES: list[tuple[str, str, str]] = [
         "PATH_SEQUENCE_RANGE_PREFIX",
         "PATH_SEQUENCE_RANGE_BY_PREP_SAMPLE",
     ),
+    # /qc-check
+    (
+        "URL_QC_CHECK_BY_PREP_SAMPLE",
+        "PATH_QC_CHECK_PREFIX",
+        "PATH_QC_CHECK_BY_PREP_SAMPLE",
+    ),
     # /auth
     ("URL_AUTH_WHOAMI", "PATH_AUTH_PREFIX", "PATH_AUTH_WHOAMI"),
     ("URL_AUTH_PAT", "PATH_AUTH_PREFIX", "PATH_AUTH_PAT"),

@@ -686,6 +686,23 @@ async def _run_action_primitive(
         )
         return {}
 
+    if entry.name == LibraryPrimitive.PERSIST_ENA_RUN_OUTCOMES:
+        if entry.inputs != ["run_outcomes"]:
+            raise RuntimeError(
+                f"persist-ena-run-outcomes expects inputs [run_outcomes]; got {entry.inputs!r}"
+            )
+        if scope_target["kind"] != ScopeTargetKind.SEQUENCED_POOL.value:
+            raise RuntimeError(
+                "persist-ena-run-outcomes requires a sequenced_pool-scoped ticket; "
+                f"got {scope_target['kind']!r}"
+            )
+        await LIBRARY[LibraryPrimitive.PERSIST_ENA_RUN_OUTCOMES](
+            pool,
+            scope_target["sequenced_pool_idx"],
+            Path(bound["run_outcomes"]),
+        )
+        return {}
+
     if entry.name == LibraryPrimitive.PERSIST_SYNDNA_READ_COUNT:
         # Per-insert SynDNA read counts from the `syndna` step's alignment output.
         # mask_idx from the ticket (runner-bound for the prep_sample branch), the

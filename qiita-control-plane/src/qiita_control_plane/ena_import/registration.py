@@ -136,6 +136,10 @@ class EnaRunRegistrationStatus(StrEnum):
     # without it (it was flagged when that download read its roster). Nothing
     # schedules its download; set by ena_import.batch.
     HELD_NOT_DOWNLOADED = "held_not_downloaded"
+    # A run its pool's download fetched and could not store, while the pool's
+    # other runs landed. Read from the run's sequenced_sample by the status read;
+    # never stored on the item.
+    DOWNLOAD_FAILED = "download_failed"
 
 
 @dataclass(frozen=True)

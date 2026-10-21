@@ -15,6 +15,9 @@ import zlib
 import httpx
 import pytest
 from qiita_common.api_paths import URL_ENA_IMPORT_BATCH_BY_IDX
+from qiita_common.models import BatchItemState, FailureType
+
+from qiita_control_plane.ena_import.registration import EnaRunRegistrationStatus
 
 
 def _item(accession: str, state: str, **extra) -> dict:
@@ -433,6 +436,57 @@ def test_watch_exits_1_when_any_item_failed(monkeypatch, patch_async_client, cap
     out, err = capsys.readouterr()
     assert "ENA returned no runs" in err
     assert "ENA returned no runs" in out
+
+
+def test_watch_exits_1_and_names_the_failed_runs_when_an_item_is_completed_partial(
+    monkeypatch, patch_async_client, capsys
+):
+    from qiita_control_plane.cli.user._parser import _build_parser
+
+    post_body = {"ena_import_batch_idx": 5, "items": [_item("PRJEB11419", "pending")]}
+    get_bodies = [
+        {
+            "ena_import_batch_idx": 5,
+            "items": [
+                _item(
+                    "PRJEB11419",
+                    BatchItemState.COMPLETED_PARTIAL,
+                    failure_reason=f"ERR1 ({FailureType.PERMANENT.value})",
+                    ena_runs=[
+                        {
+                            "run_accession": "ERR1",
+                            "status": EnaRunRegistrationStatus.DOWNLOAD_FAILED.value,
+                            "failure_reason": "no sequence data found",
+                            "failure_type": FailureType.PERMANENT.value,
+                        }
+                    ],
+                )
+            ],
+        },
+    ]
+    handler, calls = _make_handler(post_body=post_body, get_bodies=get_bodies)
+    patch_async_client(httpx.MockTransport(handler))
+    monkeypatch.setenv("QIITA_TOKEN", "qk_test")
+
+    parser = _build_parser()
+    ns = parser.parse_args(
+        [
+            "--base-url",
+            "https://q.example.test",
+            "submit-ena-import",
+            "PRJEB11419",
+            "--poll-interval-seconds",
+            "0.001",
+        ]
+    )
+    rc = ns.handler(ns, parser)
+
+    assert rc == 1
+    out, err = capsys.readouterr()
+    partial, permanent = BatchItemState.COMPLETED_PARTIAL.value, FailureType.PERMANENT.value
+    assert f"PRJEB11419 -> {partial} (ERR1 ({permanent}))" in err
+    assert "no sequence data found" in out
+    assert [m for m, _p, _b in calls] == ["POST", "GET"]
 
 
 def test_watch_exits_0_when_a_done_item_has_failed_ena_runs(
@@ -941,6 +995,33 @@ def test_ena_import_status_issues_get_against_the_idx(monkeypatch):
         f"https://q.example.test{URL_ENA_IMPORT_BATCH_BY_IDX.format(ena_import_batch_idx=5)}"
     )
     assert captured["json"] is None
+
+
+def test_ena_import_status_exits_0_for_a_completed_partial_item(monkeypatch, capsys):
+    from qiita_control_plane.cli import _common
+    from qiita_control_plane.cli.user import main
+
+    response_json = {
+        "ena_import_batch_idx": 5,
+        "items": [
+            _item(
+                "PRJEB11419",
+                BatchItemState.COMPLETED_PARTIAL,
+                failure_reason=f"ERR1 ({FailureType.PERMANENT.value})",
+            )
+        ],
+    }
+
+    def fake_request(method, url, headers=None, json=None, params=None, timeout=None):
+        return httpx.Response(200, json=response_json, request=httpx.Request(method, url))
+
+    monkeypatch.setattr(_common.httpx, "request", fake_request)
+    monkeypatch.setenv("QIITA_TOKEN", "qk_test")
+
+    rc = main(["--base-url", "https://q.example.test", "ena-import-status", "5"])
+
+    assert rc == 0
+    assert BatchItemState.COMPLETED_PARTIAL.value in capsys.readouterr().out
 
 
 def test_ena_import_status_non_200_surfaces_status_and_body(monkeypatch, capsys):

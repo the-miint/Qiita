@@ -22,7 +22,9 @@ description: >
   fetches every run with `read_ena_sequences`, mints a sequence_idx range
   per run, and writes the FULL reads into the DuckLake `read` table (once,
   independent of any mask) plus a durable per-sample copy the repeatable
-  read-mask workflow consumes. Transport is pinned to `download_method:
+  read-mask workflow consumes. A run whose fetch fails permanently does not
+  fail the pool when another run was stored: `persist-ena-run-outcomes`
+  records it on its sequenced_sample. Transport is pinned to `download_method:
   http` (no Aspera key-staging exists in the compute env; see
   `docs/architecture.md`'s ENA Study Import download-ticket-granularity decision).
 
@@ -74,7 +76,7 @@ steps:
     # a submitter omits it.
     inputs: [ena_run_map, reads_staging_root]
     params: { download_method: download_method }
-    outputs: [read_staging_dir]
+    outputs: [read_staging_dir, run_outcomes]
     baseline_resources:
       # Bounded-concurrent per-run loop (up to _CONCURRENCY=4 runs fetched at
       # once, 2 DuckDB threads each -> cpu = 4*2 = 8, mem_gb split across the
@@ -95,6 +97,11 @@ steps:
   # maps the subdir -> the `read` table (subdir-of-parts convention).
   - action: register-files
     inputs: [read_staging_dir]
+    outputs: []
+
+  # Last: step progress is keyed by index, so a resumed ticket never re-runs register-files.
+  - action: persist-ena-run-outcomes
+    inputs: [run_outcomes]
     outputs: []
 
 # Headroom above the single baseline for the runner's OOM/TIMEOUT

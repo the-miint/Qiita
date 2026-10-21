@@ -45,14 +45,14 @@ async def clean_action_table(postgres_pool):
     be named in the same statement."""
     async with postgres_pool.acquire() as conn:
         await conn.execute(
-            "TRUNCATE qiita.work_ticket_step, qiita.block_member, qiita.work_ticket,"
-            " qiita.block, qiita.action"
+            "TRUNCATE qiita.prep_sample_qc_check, qiita.work_ticket_step, qiita.block_member,"
+            " qiita.work_ticket, qiita.block, qiita.action"
         )
     yield
     async with postgres_pool.acquire() as conn:
         await conn.execute(
-            "TRUNCATE qiita.work_ticket_step, qiita.block_member, qiita.work_ticket,"
-            " qiita.block, qiita.action"
+            "TRUNCATE qiita.prep_sample_qc_check, qiita.work_ticket_step, qiita.block_member,"
+            " qiita.work_ticket, qiita.block, qiita.action"
         )
 
 

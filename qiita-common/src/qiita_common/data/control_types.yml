@@ -1,0 +1,16 @@
+# Control classification of every `Qiita Sample Type` term_id; each appears exactly once.
+negative:
+  - control_blank
+  - control_sterile_water
+  - control_sea_water
+positive:
+  - control_spike_in
+not_control:
+  - artificial_sea_water
+  - estuarine_water_filter
+  - sea_water
+  - sea_water_filter
+  - aquarium_water
+  - cerebrospinal_fluid
+  - plasma
+  - feces

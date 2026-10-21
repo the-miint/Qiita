@@ -12,9 +12,16 @@ import json
 from typing import Any
 
 import asyncpg
+from pydantic import BaseModel
+from qiita_common.models import FailureType
 from qiita_common.models.ena_import import BatchItemState
 
 from . import require_transaction
+
+_NO_STORED_READS = (
+    "NOT EXISTS (SELECT 1 FROM qiita.sequence_range sr"
+    " WHERE sr.prep_sample_idx = ss.prep_sample_idx)"
+)
 
 
 async def insert_ena_import_batch(
@@ -229,15 +236,15 @@ async def fetch_sequenced_samples_missed_by_completed_download(
     action_id: str,
     action_version: str,
 ) -> set[int]:
-    """The `sequenced_sample_idxs` with no stored reads whose pool's latest
-    ticket for the action completed. A completed download stored every run on
-    the roster it read, so such a run was off that roster and nothing will
-    fetch it."""
+    """The `sequenced_sample_idxs` with no stored reads and no recorded download
+    failure whose pool's latest ticket for the action completed. A completed
+    download stored or failed every run on the roster it read, so such a run was
+    off that roster and nothing will fetch it."""
     rows = await pool_or_conn.fetch(
         "SELECT ss.idx FROM qiita.sequenced_sample ss"
         " WHERE ss.idx = ANY($1::bigint[])"
-        "   AND NOT EXISTS (SELECT 1 FROM qiita.sequence_range sr"
-        "                   WHERE sr.prep_sample_idx = ss.prep_sample_idx)"
+        "   AND ss.download_failure_type IS NULL"
+        f"   AND {_NO_STORED_READS}"
         "   AND (SELECT wt.state FROM qiita.work_ticket wt"
         "        WHERE wt.action_id = $2 AND wt.action_version = $3"
         "          AND wt.sequenced_pool_idx = ss.sequenced_pool_idx"
@@ -247,6 +254,30 @@ async def fetch_sequenced_samples_missed_by_completed_download(
         action_version,
     )
     return {r["idx"] for r in rows}
+
+
+class FailedDownload(BaseModel):
+    ena_run_accession: str
+    reason: str
+    failure_type: FailureType
+
+
+async def fetch_failed_downloads(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection, *, run_accessions: list[str]
+) -> dict[str, FailedDownload]:
+    """`run_accession -> FailedDownload` for the runs with a recorded download
+    failure and no stored reads."""
+    rows = await pool_or_conn.fetch(
+        "SELECT ss.ena_run_accession, ss.download_failure_reason AS reason,"
+        "       ss.download_failure_type AS failure_type"
+        " FROM qiita.sequenced_sample ss"
+        " WHERE ss.ena_run_accession = ANY($1::text[])"
+        "   AND ss.download_failure_type IS NOT NULL"
+        f"   AND {_NO_STORED_READS}",
+        run_accessions,
+    )
+    failed = (FailedDownload.model_validate(dict(r)) for r in rows)
+    return {f.ena_run_accession: f for f in failed}
 
 
 async def fetch_pool_latest_download_ticket(

@@ -1240,14 +1240,14 @@ def test_load_actions_loads_on_disk_download_ena_study_yaml():
     assert DOWNLOAD_ENA_STUDY_ACTION_VERSION == dl.version == "1.0.0"
 
     step_names = [s.name for s in dl.steps]
-    assert step_names == ["ingest_ena_reads", "register-files"]
+    assert step_names == ["ingest_ena_reads", "register-files", "persist-ena-run-outcomes"]
 
     ingest = next(s for s in dl.steps if s.name == "ingest_ena_reads")
     assert ingest.module == "qiita_compute_orchestrator.jobs.ingest_ena_reads"
     assert ingest.container is None
     assert ingest.inputs == ["ena_run_map", "reads_staging_root"]
     assert ingest.params == {"download_method": "download_method"}
-    assert ingest.outputs == ["read_staging_dir"]
+    assert ingest.outputs == ["read_staging_dir", "run_outcomes"]
 
     # download_method is OPTIONAL (not in `required`) and pinned to 'http'.
     assert dl.context_schema["required"] == ["ena_study_accession"]

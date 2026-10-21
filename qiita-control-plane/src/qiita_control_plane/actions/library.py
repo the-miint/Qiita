@@ -32,6 +32,7 @@ import duckdb
 import pyarrow as pa
 import pyarrow.flight as _flight
 import pyarrow.parquet as pq
+from pydantic import TypeAdapter
 from qiita_common.api_paths import LibraryPrimitive
 from qiita_common.assembly_constants import (
     CONTIG_ATTRIBUTE_REPRESENTATIVE_SQL,
@@ -50,6 +51,7 @@ from qiita_common.models import (
     ReferenceStatus,
     read_mask_reason_sql_list,
 )
+from qiita_common.models.ena_import import FailedRunOutcome
 from qiita_common.parquet import (
     PARQUET_COMPRESSION,
     PARQUET_COMPRESSION_INTERMEDIATE,
@@ -90,6 +92,7 @@ from ..repositories.reference_membership import (
     GENOME_MAP_ROWS_SQL,
     count_reference_shards,
 )
+from ..repositories.sequenced_sample import set_sequenced_sample_download_failure
 from ..repositories.syndna_read_count import (
     fetch_mask_syndna_reference,
     fetch_syndna_inserts,
@@ -2150,6 +2153,35 @@ async def persist_read_metrics(
     return ss_idx
 
 
+async def persist_ena_run_outcomes(
+    pool: asyncpg.Pool, sequenced_pool_idx: int, run_outcomes_path: Path
+) -> int:
+    """Record each run in `run_outcomes_path` as a failed download on its sequenced_sample;
+    raises if one is not in the pool."""
+    if not run_outcomes_path.exists():
+        raise FileNotFoundError(f"run_outcomes file not found: {run_outcomes_path}")
+    failed = TypeAdapter(list[FailedRunOutcome]).validate_json(run_outcomes_path.read_bytes())
+    async with pool.acquire() as conn, conn.transaction():
+        strangers = [
+            f"{f.ena_run_accession} (prep_sample {f.prep_sample_idx})"
+            for f in failed
+            if not await set_sequenced_sample_download_failure(
+                conn,
+                sequenced_pool_idx=sequenced_pool_idx,
+                prep_sample_idx=f.prep_sample_idx,
+                ena_run_accession=f.ena_run_accession,
+                failure_reason=f.failure_reason,
+                failure_type=f.failure_type,
+            )
+        ]
+        if strangers:
+            raise RuntimeError(
+                f"persist-ena-run-outcomes: not runs of sequenced_pool {sequenced_pool_idx}: "
+                + ", ".join(strangers)
+            )
+    return len(failed)
+
+
 def syndna_read_counts(alignment_path: Path, *, prep_sample_idx: int) -> dict[int, int]:
     """Count the reads aligned to each SynDNA insert in the read-mask `syndna` step's
     alignment output: `parent_feature_idx` → number of distinct `sequence_idx`.
@@ -3250,6 +3282,7 @@ LIBRARY: dict[str, Callable[..., Awaitable[Any]]] = {
     LibraryPrimitive.PLAN_SHARDS: plan_shards,
     LibraryPrimitive.FINALIZE_SHARD: finalize_shard,
     LibraryPrimitive.PERSIST_READ_METRICS: persist_read_metrics,
+    LibraryPrimitive.PERSIST_ENA_RUN_OUTCOMES: persist_ena_run_outcomes,
     LibraryPrimitive.PERSIST_SYNDNA_READ_COUNT: persist_syndna_read_count,
     LibraryPrimitive.PERSIST_QC_REPORT: persist_qc_report,
     LibraryPrimitive.DELETE_READ_MASK_BLOCK: delete_read_mask_block,

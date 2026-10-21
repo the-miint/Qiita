@@ -23,6 +23,7 @@ from conftest import cleanup_ena_study, ducklake_connect
 from qiita_common.actions import ActionDefinition, WorkflowAction
 from qiita_common.api_paths import LOOPBACK_HOST
 from qiita_common.auth_constants import SystemRole
+from qiita_common.models import FailureType, WorkTicketState
 from qiita_common.models.ena_import import BatchItemState
 from qiita_control_plane.auth.principal import HumanUser
 from qiita_control_plane.dispatch import build_dispatch_semaphore
@@ -34,8 +35,10 @@ from qiita_control_plane.ena_import.batch import (
     _process_one_study,
     build_ena_import_study_semaphore,
     create_ena_import_batch,
+    fetch_batch_status,
     schedule_ena_import_batch,
 )
+from qiita_control_plane.ena_import.registration import EnaRunRegistrationStatus
 from qiita_control_plane.repositories.sequenced_sample import (
     fetch_sequenced_pool_ena_run_roster,
 )
@@ -673,3 +676,133 @@ async def test_run_list_import_ingests_only_the_listed_runs(
         all_runs[2],
     )
     assert unlisted_prep_samples == []
+
+
+async def test_pool_with_a_permanently_failed_run_lands_the_rest_and_reads_completed_partial(
+    postgres_pool,
+    data_plane,
+    batch_app,
+    admin_principal,
+    download_ena_study_action,
+    batch_cleanup,
+    ena_study_cleanup,
+    tmp_path,
+    monkeypatch,
+):
+    """One run has no sequence data: its pool's other run is stored and loaded, the
+    failed run is recorded, and the item reads `completed_partial`."""
+    accession = unique_ena_accession("PRJNA")
+    ena_study_cleanup.append(accession)
+    fake_runs, fake_attrs = _make_two_runs_sharing_one_sample(unique_accession("SAMN"))
+    monkeypatch.setattr(_QUERY_STUDY, _fake_study_header)
+    monkeypatch.setattr(_QUERY_RUNS, fake_runs)
+    monkeypatch.setattr(_QUERY_ATTRS, fake_attrs)
+
+    batch_idx, items = await create_ena_import_batch(
+        postgres_pool, accessions=[accession], principal=admin_principal
+    )
+    batch_cleanup.append(batch_idx)
+    await _process_one_study(batch_app, postgres_pool, item=items[0], principal=admin_principal)
+    (work_ticket_idx,) = await postgres_pool.fetchval(
+        "SELECT download_work_ticket_idxs FROM qiita.ena_import_batch_item WHERE batch_idx = $1",
+        batch_idx,
+    )
+    sequenced_pool_idx = await postgres_pool.fetchval(
+        "SELECT sequenced_pool_idx FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+        work_ticket_idx,
+    )
+    sequencing_run_idx = await postgres_pool.fetchval(
+        "SELECT sequencing_run_idx FROM qiita.sequenced_pool WHERE idx = $1", sequenced_pool_idx
+    )
+    roster_rows = await fetch_sequenced_pool_ena_run_roster(
+        postgres_pool, sequenced_pool_idx=sequenced_pool_idx
+    )
+    roster = sorted((r["ena_run_accession"], r["prep_sample_idx"]) for r in roster_rows)
+    (bad_run, bad_psi), (good_run, good_psi) = roster
+
+    from qiita_compute_orchestrator import sequence_range_retry
+    from qiita_compute_orchestrator.jobs import ingest_ena_reads
+    from qiita_compute_orchestrator.sequence_range import MintedSequenceRange
+
+    good_fake = _fake_stage_run_reads_factory({good_run: (_RUN1_ROWS, [])})
+
+    def _stage(run_accession, *args):
+        if run_accession == bad_run:
+            raise duckdb.IOException(
+                "read_ena_sequences: no sequence data found for the provided accession(s)"
+            )
+        return good_fake(run_accession, *args)
+
+    monkeypatch.setattr(ingest_ena_reads, "_stage_run_reads", _stage)
+
+    async def _local_mint(*, http, prep_sample_idx, count, work_ticket_idx):
+        row = await postgres_pool.fetchrow(
+            "SELECT * FROM qiita.mint_sequence_range($1, $2, $3, $4)",
+            prep_sample_idx,
+            count,
+            admin_principal.principal_idx,
+            work_ticket_idx,
+        )
+        return MintedSequenceRange(
+            prep_sample_idx=row["prep_sample_idx"],
+            sequence_idx_start=row["sequence_idx_start"],
+            sequence_idx_stop=row["sequence_idx_stop"],
+        )
+
+    monkeypatch.setattr(sequence_range_retry, "mint_sequence_range", _local_mint)
+
+    ena_run_map_path = tmp_path / "ena_run_map.parquet"
+    _write_ena_run_map(ena_run_map_path, [(psi, run) for run, psi in roster])
+    outputs = await ingest_ena_reads.execute(
+        ingest_ena_reads.Inputs(
+            ena_run_map=ena_run_map_path,
+            reads_staging_root=tmp_path / "reads-staging",
+            sequenced_pool_idx=sequenced_pool_idx,
+            sequencing_run_idx=sequencing_run_idx,
+            work_ticket_idx=work_ticket_idx,
+        ),
+        tmp_path / "ws1",
+    )
+    await _run_register_files(
+        postgres_pool,
+        data_plane,
+        staging_dir=outputs["read_staging_dir"],
+        work_ticket_idx=work_ticket_idx,
+    )
+    from qiita_control_plane.runner import _run_action_primitive
+
+    await _run_action_primitive(
+        postgres_pool,
+        _entry_by_name("persist-ena-run-outcomes"),
+        {"run_outcomes": str(outputs["run_outcomes"])},
+        tmp_path / "ws1",
+        {"kind": "sequenced_pool", "sequenced_pool_idx": sequenced_pool_idx},
+        work_ticket_idx=work_ticket_idx,
+        signing_key=data_plane["secret"],
+        data_plane_url=_data_plane_url(data_plane),
+    )
+
+    assert _count_read_rows(data_plane, [good_psi]) == len(_RUN1_ROWS)
+    assert _count_read_rows(data_plane, [bad_psi]) == 0
+    recorded = await postgres_pool.fetch(
+        "SELECT ena_run_accession, download_failure_type AS failure_type,"
+        "       download_failure_reason FROM qiita.sequenced_sample"
+        " WHERE sequenced_pool_idx = $1 AND download_failure_type IS NOT NULL",
+        sequenced_pool_idx,
+    )
+    assert [(r["ena_run_accession"], r["failure_type"]) for r in recorded] == [
+        (bad_run, FailureType.PERMANENT)
+    ]
+    assert "no sequence data found" in recorded[0]["download_failure_reason"]
+
+    await postgres_pool.execute(
+        "UPDATE qiita.work_ticket SET state = $2 WHERE work_ticket_idx = $1",
+        work_ticket_idx,
+        WorkTicketState.COMPLETED.value,
+    )
+    (item,) = (await fetch_batch_status(postgres_pool, batch_idx=batch_idx)).items
+    assert item.state == BatchItemState.COMPLETED_PARTIAL
+    by_run = {r.run_accession: r for r in item.ena_runs}
+    assert by_run[bad_run].status == EnaRunRegistrationStatus.DOWNLOAD_FAILED.value
+    assert by_run[bad_run].failure_type == FailureType.PERMANENT
+    assert by_run[good_run].status == EnaRunRegistrationStatus.REGISTERED.value

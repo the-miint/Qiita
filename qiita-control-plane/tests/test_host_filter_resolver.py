@@ -18,8 +18,14 @@ import secrets
 import asyncpg
 import pytest
 import pytest_asyncio
-from qiita_common.models import MISSING_REASON_CONTROL_SAMPLE, Platform
+from qiita_common.control_types import ControlKind, load_control_types
+from qiita_common.models import (
+    BIOSAMPLE_FIELD_QIITA_SAMPLE_TYPE,
+    MISSING_REASON_CONTROL_SAMPLE,
+    Platform,
+)
 
+from qiita_control_plane import host_filter_resolver as resolver_module
 from qiita_control_plane.host_filter_resolver import (
     HostFilterOutcome,
     is_control_sample,
@@ -36,6 +42,7 @@ from qiita_control_plane.testing.db_seeds import (
     NCBI_TAXONOMY_HUMAN_TERM_ID,
     fetch_missing_value_reason_idx,
     fetch_ncbi_taxonomy_term,
+    seed_biosample_sample_type,
     seed_host_reference,
     seed_user_principal,
 )
@@ -201,6 +208,22 @@ async def _set_host_missing_reason(ctx, biosample_idx, reason_name):
     )
 
 
+async def _set_sample_type(ctx, biosample_idx, term_id):
+    await seed_biosample_sample_type(
+        ctx["pool"],
+        biosample_idx=biosample_idx,
+        study_idx=ctx["study_idx"],
+        created_by_idx=ctx["principal_idx"],
+        term_id=term_id,
+    )
+
+
+async def _resolve(ctx, biosample_idx):
+    return await resolve_host_filter(
+        ctx["pool"], biosample_idx=biosample_idx, platform=Platform.ILLUMINA
+    )
+
+
 # ---------------------------------------------------------------------------
 # FILTER — the host has a profile on this platform
 # ---------------------------------------------------------------------------
@@ -325,13 +348,126 @@ async def test_control_sample_is_a_marker_not_a_decision(ctx):
     its POOL's hosts, which is a pool-level fact this single-sample function
     cannot see."""
     bs_idx = await _make_biosample(ctx)
-    await _set_host_missing_reason(ctx, bs_idx, "missing: control sample")
+    await _set_host_missing_reason(ctx, bs_idx, MISSING_REASON_CONTROL_SAMPLE)
 
     res = await resolve_host_filter(ctx["pool"], biosample_idx=bs_idx, platform=Platform.ILLUMINA)
 
     assert res.outcome is HostFilterOutcome.CONTROL
     assert res.rype_reference_idx is None
     assert res.minimap2_reference_idx is None
+
+
+# ---------------------------------------------------------------------------
+# Controls identified from biosample metadata, ahead of host_taxon_id
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("term_id", ["control_blank", "control_spike_in"])
+async def test_control_qiita_sample_type_with_a_host_taxon_resolves_control(ctx, term_id):
+    """A blank carrying the taxon of the biosamples it rode with (human) must not be
+    filtered against that host: the control signal beats host_taxon_id."""
+    bs_idx = await _make_biosample(ctx)
+    await _set_host_term(ctx, bs_idx, ctx["human_term_idx"])
+    await _set_sample_type(ctx, bs_idx, term_id)
+
+    res = await _resolve(ctx, bs_idx)
+
+    assert res.outcome is HostFilterOutcome.CONTROL
+    assert res.host_term_idx is None
+    assert res.rype_reference_idx is None
+    assert res.minimap2_reference_idx is None
+
+
+async def test_control_qiita_sample_type_with_no_host_taxon_row_resolves_control(ctx):
+    """Seeded by SQL, since import requires host_taxon_id: the control check must
+    not depend on the host row existing."""
+    bs_idx = await _make_biosample(ctx)
+    await _set_sample_type(ctx, bs_idx, "control_blank")
+
+    assert (await _resolve(ctx, bs_idx)).outcome is HostFilterOutcome.CONTROL
+
+
+@pytest.mark.parametrize("host_reason", ["not applicable", "not provided"])
+async def test_control_beats_a_missing_host_reason(ctx, host_reason):
+    """The control wins over a non-control missing-reason."""
+    bs_idx = await _make_biosample(ctx)
+    await _set_host_missing_reason(ctx, bs_idx, host_reason)
+    await _set_sample_type(ctx, bs_idx, "control_sterile_water")
+
+    assert (await _resolve(ctx, bs_idx)).outcome is HostFilterOutcome.CONTROL
+
+
+async def test_non_control_qiita_sample_type_is_not_a_control(ctx):
+    bs_idx = await _make_biosample(ctx)
+    await _set_host_term(ctx, bs_idx, ctx["human_term_idx"])
+    await _set_sample_type(ctx, bs_idx, "feces")
+
+    assert (await _resolve(ctx, bs_idx)).outcome is HostFilterOutcome.FILTER
+    assert await is_control_sample(ctx["pool"], biosample_idx=bs_idx) is False
+
+
+@pytest.fixture
+def unlisted_term(monkeypatch):
+    """Drop `feces` from the file, as if a term were seeded without being classified."""
+    trimmed = {
+        term_id: kind for term_id, kind in load_control_types().items() if term_id != "feces"
+    }
+    monkeypatch.setattr(resolver_module, "load_control_types", lambda: trimmed)
+
+
+async def test_unlisted_qiita_sample_type_resolves_unresolved_naming_the_term(ctx, unlisted_term):
+    """Not read as "not a control": even a biosample with a resolvable host aborts."""
+    bs_idx = await _make_biosample(ctx)
+    await _set_host_term(ctx, bs_idx, ctx["human_term_idx"])
+    await _set_sample_type(ctx, bs_idx, "feces")
+
+    single = await _resolve(ctx, bs_idx)
+    batch = await resolve_host_filter_many(
+        ctx["pool"], biosample_idxs=[bs_idx], platform=Platform.ILLUMINA
+    )
+
+    assert single.outcome is HostFilterOutcome.UNRESOLVED
+    assert "'feces'" in single.reason
+    assert "no control classification" in single.reason
+    assert batch[bs_idx] == single
+    assert await is_control_sample(ctx["pool"], biosample_idx=bs_idx) is False
+
+
+async def test_control_types_file_matches_the_qiita_sample_type_terms(postgres_pool):
+    """A term added to the terminology must be classified before CI passes."""
+    async with postgres_pool.acquire() as conn:
+        in_db = {
+            r["term_id"]
+            for r in await conn.fetch(
+                "SELECT tt.term_id FROM qiita.terminology_term tt"
+                " JOIN qiita.biosample_global_field bgf"
+                "   ON bgf.terminology_idx = tt.terminology_idx"
+                " WHERE bgf.internal_name = $1",
+                BIOSAMPLE_FIELD_QIITA_SAMPLE_TYPE,
+            )
+        }
+    in_file = set(load_control_types())
+
+    assert in_db - in_file == set(), "terms missing from control_types.yml"
+    assert in_file - in_db == set(), "control_types.yml lists terms not in the database"
+
+
+async def test_is_control_sample_true_for_negative_sample_types(ctx):
+    negatives = [t for t, kind in load_control_types().items() if kind is ControlKind.NEGATIVE]
+    for term_id in negatives:
+        bs_idx = await _make_biosample(ctx)
+        await _set_sample_type(ctx, bs_idx, term_id)
+        assert await is_control_sample(ctx["pool"], biosample_idx=bs_idx) is True, term_id
+
+
+async def test_positive_controls_are_not_expected_empty_wells(ctx):
+    """A positive control should yield reads, so zero reads from one stays a
+    failure: CONTROL for host filtering, but not an expected-empty well."""
+    bs_idx = await _make_biosample(ctx)
+    await _set_sample_type(ctx, bs_idx, "control_spike_in")
+
+    assert (await _resolve(ctx, bs_idx)).outcome is HostFilterOutcome.CONTROL
+    assert await is_control_sample(ctx["pool"], biosample_idx=bs_idx) is False
 
 
 # ---------------------------------------------------------------------------
@@ -351,20 +487,8 @@ async def test_is_control_sample_true_for_control_marker(ctx):
 
 
 async def test_is_control_sample_does_not_distinguish_positive_from_negative_control(ctx):
-    """KNOWN LIMITATION (see is_control_sample's docstring): the persisted control
-    marker is set from `is_control` alone, so a POSITIVE control (katharoseq — a
-    known spiked organism that SHOULD yield reads, whose zero-read outcome is really
-    a FAILURE) is represented IDENTICALLY to a NEGATIVE control (a blank). Both carry
-    `MISSING_REASON_CONTROL_SAMPLE` and there is no positive/negative field to key
-    on, so both classify as expected-empty here.
-
-    This test pins that collapse: a positive control cannot be told apart at this
-    layer and currently reads as expected-empty (→ `no_data` on zero reads, not a
-    failure). When the positive-vs-negative control policy lands a persisted signal,
-    this is the seam that must start returning False for a positive control — update
-    this test then. It is deliberately assay-policy-deferred, not an oversight."""
-    # There is only one way to represent ANY control at this layer today — the
-    # control missing-reason — so a "positive control" is byte-identical to a blank.
+    """The legacy marker alone can't tell a positive control from a blank, so it reads as
+    expected-empty."""
     positive_control_marked_like_any_control = await _make_biosample(ctx)
     await _set_host_missing_reason(
         ctx, positive_control_marked_like_any_control, MISSING_REASON_CONTROL_SAMPLE
@@ -530,13 +654,17 @@ async def test_batch_agrees_with_single_sample_for_every_outcome(ctx):
     await _set_host_missing_reason(ctx, biosamples["pass_through"], "not applicable")
 
     biosamples["control"] = await _make_biosample(ctx)
-    await _set_host_missing_reason(ctx, biosamples["control"], "missing: control sample")
+    await _set_host_missing_reason(ctx, biosamples["control"], MISSING_REASON_CONTROL_SAMPLE)
 
     biosamples["unrecognised_reason"] = await _make_biosample(ctx)
     await _set_host_missing_reason(ctx, biosamples["unrecognised_reason"], "not collected")
 
     # No host_taxon_id at all.
     biosamples["absent"] = await _make_biosample(ctx)
+
+    biosamples["sample_type_control"] = await _make_biosample(ctx)
+    await _set_host_term(ctx, biosamples["sample_type_control"], ctx["human_term_idx"])
+    await _set_sample_type(ctx, biosamples["sample_type_control"], "control_blank")
 
     idxs = list(biosamples.values())
     batch = await resolve_host_filter_many(
@@ -547,6 +675,8 @@ async def test_batch_agrees_with_single_sample_for_every_outcome(ctx):
             ctx["pool"], biosample_idx=idx, platform=Platform.ILLUMINA
         )
         assert batch[idx] == single, f"batch/single disagree for biosample {idx}"
+
+    assert batch[biosamples["sample_type_control"]].outcome is HostFilterOutcome.CONTROL
 
     # And the fan actually covered every branch — otherwise the equality above
     # could pass by comparing five identical UNRESOLVEDs.

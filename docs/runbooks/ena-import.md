@@ -105,15 +105,16 @@ added since. `/run` is refused with a 409 on an older ticket (the error names th
 one and its state), and on a failed ticket that still has a live download job from before
 the failure, which holds the old roster: cancel it by idx (`work_ticket_idxs`) to reap the
 job, then re-import the study. The ticket stays FAILED and keeps refusing `/run`.
-Nothing schedules this — it is an operator gesture. A native `POST .../sequenced-sample`
-add to a pool whose download has already read (or is reading) its roster is refused the
-same way, 409: create a new `sequenced_pool` on the run and submit its own
-`download-ena-study` ticket instead.
-A `PATCH /sequenced-sample/{idx}` that changes `ena_run_accession` is refused (409) in
-those states, when a failed ticket still has a live download job, and once the
-sequenced_sample's reads have a `sequence_range` (the download reuses them rather than
-fetching the new run); retire its prep_sample and add the corrected run to a new
-`sequenced_pool` the same way.
+A re-import does not retry the failed runs of a `completed_partial` pool: its ticket is
+COMPLETED and is reused, and the runs keep reporting `download_failed`.
+Nothing schedules a re-import or a redrive; each is an operator gesture. A native
+`POST .../sequenced-sample` add to a pool whose download has already read (or is reading) its
+roster is refused the same way, 409: create a new `sequenced_pool` on the run and submit
+its own `download-ena-study` ticket instead. A `PATCH /sequenced-sample/{idx}` that
+changes `ena_run_accession` is refused (409) in those states, when a failed ticket still
+has a live download job, and once the sequenced_sample's reads have a `sequence_range`
+(the download reuses them rather than fetching the new run); retire its prep_sample and
+add the corrected run to a new `sequenced_pool` the same way.
 
 An import will only add to a study **an import created**. A study Qiita created
 natively and later deposited to ENA carries a `bioproject_accession` too, so
@@ -238,10 +239,13 @@ did.
   end user submits, mirroring bcl-convert's own admin-only submission.
 - `GET /api/v1/ena-import-batch/{idx}` — the batch's current, rolled-up per-item
   status (the run item is split into one item per study once its runs resolve):
-  `pending` / `resolving` / `registered` / `downloading` / `done` / `failed`, with
-  `study_idx` and the download ticket idx(s) once resolved, and a
-  `failure_reason` on any `failed` item. An item whose download ticket failed or was
-  cancelled reports `failed`. Also admin-only.
+  `pending` / `resolving` / `registered` / `downloading` / `done` / `completed_partial` /
+  `failed`, with `study_idx` and the download ticket idx(s) once resolved, and a
+  `failure_reason` on any `failed` or `completed_partial` item. An item whose download
+  ticket failed or was cancelled reports `failed`. An item whose ticket completed but
+  has a run that failed permanently and stored no reads reports `completed_partial`;
+  its `failure_reason` lists the failed runs, and each shows in `ena_runs` as
+  `download_failed` with its `failure_reason` and `failure_type`. Also admin-only.
 
 A control-plane restart re-drives every item still `pending`, `resolving` or
 `registered`, unless the batch's submitter has since been disabled or retired: those
@@ -256,11 +260,12 @@ whole call — then by default polls to terminal with `--poll-interval-seconds` 
 2s) between polls up to `--timeout-seconds` (default 86400s); `--no-watch` returns
 right after submit. A transient failure while polling — a dropped connection or a 5xx —
 is retried until the timeout instead of failing the watch; any other HTTP error is
-fatal. Exit codes: `0` every item reached `done`; `1` an item ended `failed`, the watch
-timed out (naming each still-pending item and its last known state), an HTTP
-error, or no token was found; `2` bad input (a malformed accession, a bad `--from-file`
-line, an out-of-range flag); `130` Ctrl-C, naming the batch to poll if the POST had
-already succeeded. `qiita ena-import-status IDX` reads a batch's current state and
+fatal. Exit codes: `0` every item reached `done`; `1` an item ended `failed` or
+`completed_partial`, the watch timed out (naming each still-pending item and its last
+known state), an HTTP error, or no token was found; `2` bad input (a malformed
+accession, a bad `--from-file` line, an out-of-range flag); `130` Ctrl-C, naming the
+batch to poll if the POST had already succeeded. `qiita ena-import-status IDX` reads a
+batch's current state and
 always exits `0` once the read itself succeeds. See the REST bullets above for the
 state set and what each field means.
 
@@ -275,9 +280,11 @@ Every ENA-imported biosample is bound to the **ERC000011** checklist (the ENA de
 sample checklist) — the same shared checklist model every other metadata path in
 Qiita uses. `GET /api/v1/ena-import-batch/{idx}` returns an `ena_runs` array per item,
 one entry per ENA run carrying its `status` (`registered` / `skipped_already_present` /
-`excluded` / `failed` / `flagged_unavailable` / `held_not_downloaded` — the last two
-from a re-import's ENA availability re-check, see above) and a `failure_reason` on
-every status but `registered` and `skipped_already_present`. A
+`excluded` / `failed` / `flagged_unavailable` / `held_not_downloaded` /
+`download_failed` — `flagged_unavailable` and `held_not_downloaded` come from a
+re-import's ENA availability re-check, see above) and a `failure_reason` on every
+status but `registered` and `skipped_already_present`. `download_failed` also carries
+a `failure_type`. A
 harmonization error (an unparseable value, or a cross-study metadata slot collision)
 fails the run, surfacing as that run's `status: failed` + `failure_reason`, isolated
 per-run exactly like an unmappable platform or a suppressed run (see *Non-public
@@ -328,7 +335,8 @@ filled from the run's taxon ids (falling back to the table, `not applicable`, or
 A warning appears only on the run that created the biosample, so after a re-import or for
 a later run on the same sample, check the creating batch.
 
-A stored `not provided` stops host filtering at submit, and nothing rewrites it:
+A stored `not provided` stops host filtering at submit (unless the biosample's
+`qiita sample type` makes it a control), and nothing rewrites it:
 `qiita-admin backfill host-taxon-id` skips a biosample that already has a `host taxon id`
 row, and a re-import does not revisit it (#669). To correct one, write the field on that
 biosample with `PATCH /study/{S}/biosample/{B}/metadata` and body
@@ -389,7 +397,8 @@ boundary from bytes that really disagree with the digest, so the step is retried
 the ticket's retry limit; when the retries run out the ticket ends FAILED with
 failure_type `permanent` and both digests in the reason. A run that broke mid-download
 (including a corrupt body that surfaces mid-stream) and an HTTP 5xx, 408 or 429 from ENA
-or its file server are retried the same way, as is ENA's "Not all results may have been
+or its file server, a failed connection to the server and an HTTP status 0 (no usable
+status) are retried the same way, as is ENA's "Not all results may have been
 written" answer with a miint build that includes duckdb-miint#310. A run whose file
 cannot be opened depends on the miint build: before duckdb-miint#312 miint skips it with
 a warning, which is retried like the rest, so a 404 costs the full retry limit; from
@@ -399,8 +408,21 @@ Where verification does not apply (an SFF run, a file that is not gzip-compresse
 `fastq_md5` from ENA) the run still registers. A run that comes back empty with no
 warning fails permanently.
 
-When the retries run out, or at once for a failure a retry cannot clear (a 404 from
-duckdb-miint#312 on), the ticket is FAILED `permanent` and emailed with its reason.
+A run that fails in a way a retry cannot clear (a format error, a run with no sequence
+data, a 404 from duckdb-miint#312 on, zero reads) does not fail its pool when another run
+was stored: the other runs load, the ticket completes, and the failed run is recorded with
+its reason and `permanent` failure type (the item reads `completed_partial`). The ticket
+is COMPLETED, so the submitter gets the work-ticket digest unless they opted out of
+processing emails, and it carries no `failure_reason`; read the batch status for the
+failed runs. If a run failed in a way a retry could clear, the step still fails and
+retries first, and a run that failed permanently is fetched again on each retry, so a
+large one is downloaded again. Any other error fails the step as a whole: out of memory
+retries with more memory, and anything else (a local disk fault) leaves the ticket FAILED
+and redrivable.
+
+When the retries run out, or at once when no run was stored and none of the failures is one
+a retry could clear (a 404 from duckdb-miint#312 on), the ticket is FAILED `permanent` and
+emailed with its reason.
 Read the reason first. A dropped transfer or an ENA outage: redrive the ticket
 (`POST /work-ticket/{idx}/run`) once ENA is healthy; runs already stored are skipped, and
 a redrive resets `retry_count`, so it buys the full budget again. A bad digest or a 404:
