@@ -40,6 +40,7 @@ from qiita_common.models import (
     STORABLE_ACCESS_TIERS,
     BiosamplePatchRequest,
     BiosampleStudyFieldCreateRequest,
+    FailureType,
     FieldDataType,
     Platform,
     PrepSampleStudyFieldCreateRequest,
@@ -125,8 +126,10 @@ from .study import (
     _handle_study_list,
 )
 from .ticket import (
+    REDRIVABLE_STATES,
     _handle_ticket_list,
     _handle_ticket_logs,
+    _handle_ticket_redrive,
     _handle_ticket_run,
     _handle_ticket_status,
     _handle_ticket_submit,
@@ -1516,6 +1519,68 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Max tickets to return (server default 50, max 500).",
     )
     p_ticket_list.set_defaults(handler=_handle_ticket_list)
+
+    p_ticket_redrive = p_ticket_sub.add_parser(
+        "redrive",
+        help=(
+            "Redrive many tickets at once, as `ticket run` does one: select FAILED"
+            " (or CANCELLED) tickets with the `ticket list` filters and POST"
+            " /work-ticket/{idx}/run for each, one at a time. Dry-run by default;"
+            " pass --execute to redrive."
+        ),
+    )
+    p_ticket_redrive.add_argument(
+        "--state",
+        choices=[s.value for s in REDRIVABLE_STATES],
+        default=WorkTicketState.FAILED.value,
+        help="Which state to select (default: failed).",
+    )
+    p_ticket_redrive.add_argument(
+        "--failure-type",
+        choices=[t.value for t in FailureType],
+        help="Only FAILED tickets whose failure was of this type.",
+    )
+    p_ticket_redrive.add_argument(
+        "--all",
+        dest="all_tickets",
+        action="store_true",
+        help="All originators' tickets (requires wet_lab_admin+); default is your own.",
+    )
+    p_ticket_redrive.add_argument(
+        "--sequenced-pool-idx",
+        type=int,
+        help="Only tickets that touch this sequenced_pool (as `ticket list`).",
+    )
+    p_ticket_redrive.add_argument(
+        "--prep-sample-idx",
+        type=int,
+        help="Only tickets scoped to this prep_sample.",
+    )
+    p_ticket_redrive.add_argument(
+        "--action-id",
+        help="Only tickets for this action_id, across every version.",
+    )
+    p_ticket_redrive.add_argument(
+        "--limit",
+        type=int,
+        help=(
+            "Max tickets to select (server default 50, max 500). A selection larger"
+            " than this is refused rather than redriven in part."
+        ),
+    )
+    p_ticket_redrive.add_argument(
+        "--execute",
+        action="store_true",
+        help="Redrive the selected tickets (default: dry-run, print the selection only).",
+    )
+    p_ticket_redrive.add_argument(
+        "--rate",
+        type=float,
+        default=0.0,
+        dest="rate_seconds",
+        help="Seconds to sleep between redrives (default: 0).",
+    )
+    p_ticket_redrive.set_defaults(handler=_handle_ticket_redrive)
 
     p_ticket_logs = p_ticket_sub.add_parser(
         "logs",

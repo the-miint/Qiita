@@ -11,6 +11,7 @@ import uuid
 
 import asyncpg
 import pytest
+from qiita_common.actions import WorkflowAction, WorkflowStep
 from qiita_common.models import ComputeTarget, StepProgressState
 
 from qiita_control_plane import step_progress
@@ -91,6 +92,7 @@ async def test_record_submitting_creates_write_ahead_row(postgres_pool):
             step_index=0,
             attempt=0,
             step_name="hash",
+            step_occurrence=0,
             compute_target=ComputeTarget.SLURM,
             job_name=f"qiita-wt{wt_idx}-hash-a0",
         )
@@ -117,6 +119,7 @@ async def test_record_submitting_is_idempotent(postgres_pool):
             step_index=0,
             attempt=0,
             step_name="hash",
+            step_occurrence=0,
             compute_target=ComputeTarget.SLURM,
             job_name=f"qiita-wt{wt_idx}-hash-a0",
         )
@@ -130,6 +133,7 @@ async def test_record_submitting_is_idempotent(postgres_pool):
             step_index=0,
             attempt=0,
             step_name="hash",
+            step_occurrence=0,
             compute_target=ComputeTarget.SLURM,
             job_name=f"qiita-wt{wt_idx}-hash-a0",
         )
@@ -156,6 +160,7 @@ async def test_slurm_lifecycle_to_completed(postgres_pool):
             step_index=0,
             attempt=0,
             step_name="align",
+            step_occurrence=0,
             compute_target=ComputeTarget.SLURM,
             job_name=f"qiita-wt{wt_idx}-align-a0",
         )
@@ -194,6 +199,7 @@ async def test_control_plane_entry_has_no_job_fields(postgres_pool):
             step_index=0,
             attempt=0,
             step_name="register-index",
+            step_occurrence=0,
             compute_target=ComputeTarget.CONTROL_PLANE,
         )
         await step_progress.record_completed(
@@ -220,6 +226,7 @@ async def test_record_synchronous_completion_corrects_target(postgres_pool):
             step_index=0,
             attempt=0,
             step_name="hash",
+            step_occurrence=0,
             compute_target=ComputeTarget.SLURM,
             job_name=f"qiita-wt{wt_idx}-hash-a0",
         )
@@ -248,6 +255,7 @@ async def test_record_failed_sets_failure_columns(postgres_pool):
             step_index=0,
             attempt=0,
             step_name="align",
+            step_occurrence=0,
             compute_target=ComputeTarget.SLURM,
             job_name=f"qiita-wt{wt_idx}-align-a0",
         )
@@ -282,6 +290,7 @@ async def test_record_failed_is_not_idempotent(postgres_pool):
             step_index=0,
             attempt=0,
             step_name="align",
+            step_occurrence=0,
             compute_target=ComputeTarget.SLURM,
             job_name=f"qiita-wt{wt_idx}-align-a0",
         )
@@ -321,6 +330,7 @@ async def test_record_completed_is_idempotent(postgres_pool):
             step_index=0,
             attempt=0,
             step_name="x",
+            step_occurrence=0,
             compute_target=ComputeTarget.CONTROL_PLANE,
         )
         await step_progress.record_completed(
@@ -346,6 +356,7 @@ async def test_in_process_entry_rejects_job_id_at_db(postgres_pool):
             step_index=0,
             attempt=0,
             step_name="x",
+            step_occurrence=0,
             compute_target=ComputeTarget.CONTROL_PLANE,
         )
         with pytest.raises(asyncpg.exceptions.CheckViolationError):
@@ -368,6 +379,7 @@ async def test_out_of_order_transition_raises(postgres_pool):
             step_index=0,
             attempt=0,
             step_name="align",
+            step_occurrence=0,
             compute_target=ComputeTarget.SLURM,
             job_name=f"qiita-wt{wt_idx}-align-a0",
         )
@@ -391,6 +403,7 @@ async def test_completed_cannot_be_failed(postgres_pool):
             step_index=0,
             attempt=0,
             step_name="x",
+            step_occurrence=0,
             compute_target=ComputeTarget.CONTROL_PLANE,
         )
         await step_progress.record_completed(
@@ -427,6 +440,7 @@ async def test_load_step_progress_returns_per_step_view(postgres_pool):
             step_index=0,
             attempt=0,
             step_name="prep",
+            step_occurrence=0,
             compute_target=ComputeTarget.CONTROL_PLANE,
         )
         await step_progress.record_completed(
@@ -439,6 +453,7 @@ async def test_load_step_progress_returns_per_step_view(postgres_pool):
             step_index=1,
             attempt=0,
             step_name="align",
+            step_occurrence=0,
             compute_target=ComputeTarget.SLURM,
             job_name=f"qiita-wt{wt_idx}-align-a0",
         )
@@ -482,6 +497,7 @@ async def test_first_incomplete_step_index(postgres_pool):
                 step_index=step_index,
                 attempt=0,
                 step_name=name,
+                step_occurrence=0,
                 compute_target=target,
             )
         await step_progress.record_completed(
@@ -500,6 +516,7 @@ async def test_first_incomplete_step_index(postgres_pool):
             step_index=2,
             attempt=0,
             step_name="tail",
+            step_occurrence=0,
             compute_target=ComputeTarget.CONTROL_PLANE,
         )
         await step_progress.record_completed(
@@ -523,6 +540,7 @@ async def test_retry_attempt_completion_counts_for_current_entry(postgres_pool):
             step_index=0,
             attempt=0,
             step_name="align",
+            step_occurrence=0,
             compute_target=ComputeTarget.SLURM,
             job_name=f"qiita-wt{wt_idx}-align-a0",
         )
@@ -541,6 +559,7 @@ async def test_retry_attempt_completion_counts_for_current_entry(postgres_pool):
             step_index=0,
             attempt=1,
             step_name="align",
+            step_occurrence=0,
             compute_target=ComputeTarget.SLURM,
             job_name=f"qiita-wt{wt_idx}-align-a1",
         )
@@ -554,5 +573,178 @@ async def test_retry_attempt_completion_counts_for_current_entry(postgres_pool):
         # Both attempts present, ordered.
         assert [(r.step_index, r.attempt) for r in rows] == [(0, 0), (0, 1)]
         assert step_progress.first_incomplete_step_index(rows, 1) == 1
+    finally:
+        await _cleanup(postgres_pool, wt_idx, *rest)
+
+
+# ---------------------------------------------------------------------------
+# Identity: (step_name, step_occurrence), aligned to the current steps list
+# ---------------------------------------------------------------------------
+
+
+def _action_entry(name: str) -> WorkflowAction:
+    return WorkflowAction(kind="action", name=name)
+
+
+def _step_entry(name: str) -> WorkflowStep:
+    return WorkflowStep(
+        kind="step",
+        name=name,
+        step_type="singleton",
+        module=f"qiita_compute_orchestrator.jobs.{name.replace('-', '_')}",
+        baseline_resources={"cpu": 1, "mem_gb": 1, "walltime": "PT1M"},
+    )
+
+
+async def _record_completed_entry(pool, wt_idx, *, step_index, name, occurrence, target):
+    await step_progress.record_submitting(
+        pool,
+        work_ticket_idx=wt_idx,
+        step_index=step_index,
+        attempt=0,
+        step_name=name,
+        step_occurrence=occurrence,
+        compute_target=target,
+    )
+    await step_progress.record_completed(
+        pool, work_ticket_idx=wt_idx, step_index=step_index, attempt=0
+    )
+
+
+def test_step_occurrences_counts_earlier_entries_with_the_same_name():
+    assert step_progress.step_occurrences(
+        ["register-index", "build", "register-index", "build", "register-index"]
+    ) == [0, 0, 1, 1, 2]
+
+
+async def test_align_step_progress_follows_entries_the_edit_moved(postgres_pool):
+    """Rows written under [qc, register-files, syndna] are re-pointed when the
+    list becomes [syndna, qc, persist-read-metrics, register-files]: syndna and
+    qc swap positions, and register-files moves past the inserted entry."""
+    wt_idx, *rest = await _seed_work_ticket(postgres_pool)
+    try:
+        for step_index, name, target in (
+            (0, "qc", ComputeTarget.LOCAL),
+            (1, "register-files", ComputeTarget.CONTROL_PLANE),
+            (2, "syndna", ComputeTarget.LOCAL),
+        ):
+            await _record_completed_entry(
+                postgres_pool,
+                wt_idx,
+                step_index=step_index,
+                name=name,
+                occurrence=0,
+                target=target,
+            )
+        rows = await step_progress.align_step_progress(
+            postgres_pool,
+            wt_idx,
+            [
+                _step_entry("syndna"),
+                _step_entry("qc"),
+                _action_entry("persist-read-metrics"),
+                _action_entry("register-files"),
+            ],
+        )
+        assert {r.step_name: r.step_index for r in rows} == {
+            "syndna": 0,
+            "qc": 1,
+            "register-files": 3,
+        }
+        # Persisted, not just returned.
+        reloaded = await step_progress.load_step_progress(postgres_pool, wt_idx)
+        assert {r.step_name: r.step_index for r in reloaded} == {
+            "syndna": 0,
+            "qc": 1,
+            "register-files": 3,
+        }
+    finally:
+        await _cleanup(postgres_pool, wt_idx, *rest)
+
+
+async def test_align_step_progress_tells_repeated_names_apart(postgres_pool):
+    """Two `register-index` actions are told apart by occurrence: inserting an
+    entry between them moves only the second one."""
+    wt_idx, *rest = await _seed_work_ticket(postgres_pool)
+    try:
+        for step_index, occurrence in ((0, 0), (1, 1)):
+            await _record_completed_entry(
+                postgres_pool,
+                wt_idx,
+                step_index=step_index,
+                name="register-index",
+                occurrence=occurrence,
+                target=ComputeTarget.CONTROL_PLANE,
+            )
+        rows = await step_progress.align_step_progress(
+            postgres_pool,
+            wt_idx,
+            [
+                _action_entry("register-index"),
+                _step_entry("build"),
+                _action_entry("register-index"),
+            ],
+        )
+        assert {r.step_occurrence: r.step_index for r in rows} == {0: 0, 1: 2}
+    finally:
+        await _cleanup(postgres_pool, wt_idx, *rest)
+
+
+async def test_align_step_progress_leaves_aligned_rows_untouched(postgres_pool):
+    wt_idx, *rest = await _seed_work_ticket(postgres_pool)
+    try:
+        await _record_completed_entry(
+            postgres_pool,
+            wt_idx,
+            step_index=0,
+            name="hash",
+            occurrence=0,
+            target=ComputeTarget.LOCAL,
+        )
+        before = await step_progress.load_step_progress(postgres_pool, wt_idx)
+        rows = await step_progress.align_step_progress(
+            postgres_pool, wt_idx, [_step_entry("hash"), _action_entry("load")]
+        )
+        assert rows == before
+    finally:
+        await _cleanup(postgres_pool, wt_idx, *rest)
+
+
+@pytest.mark.parametrize(
+    ("entries", "why"),
+    [
+        # The entry was removed from the list.
+        ([_step_entry("hash")], "removed"),
+        # The list has one `register-index`; the row is the second's.
+        ([_step_entry("hash"), _action_entry("load")], "fewer occurrences"),
+        # The name now belongs to a `step:`, the row was written by an `action:`.
+        ([_step_entry("hash"), _step_entry("load")], "other kind"),
+    ],
+)
+async def test_align_step_progress_refuses_a_row_no_entry_matches(postgres_pool, entries, why):
+    """A row whose identity names no entry fails loudly and changes nothing."""
+    wt_idx, *rest = await _seed_work_ticket(postgres_pool)
+    try:
+        await _record_completed_entry(
+            postgres_pool,
+            wt_idx,
+            step_index=0,
+            name="hash",
+            occurrence=0,
+            target=ComputeTarget.LOCAL,
+        )
+        name, occurrence = ("load", 1) if why == "fewer occurrences" else ("load", 0)
+        await _record_completed_entry(
+            postgres_pool,
+            wt_idx,
+            step_index=1,
+            name=name,
+            occurrence=occurrence,
+            target=ComputeTarget.CONTROL_PLANE,
+        )
+        before = await step_progress.load_step_progress(postgres_pool, wt_idx)
+        with pytest.raises(step_progress.StepProgressMismatch, match=f"'{name}' occurrence"):
+            await step_progress.align_step_progress(postgres_pool, wt_idx, entries)
+        assert await step_progress.load_step_progress(postgres_pool, wt_idx) == before
     finally:
         await _cleanup(postgres_pool, wt_idx, *rest)

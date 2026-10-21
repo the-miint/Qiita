@@ -2548,17 +2548,17 @@ async def test_run_on_failed_drops_dead_step_rows_keeps_completed(
     # surviving) and a later step's dead 'failed' attempt (must clear).
     await postgres_pool.execute(
         "INSERT INTO qiita.work_ticket_step"
-        " (work_ticket_idx, step_index, attempt, step_name, compute_target, state)"
-        " VALUES ($1, 0, 0, 'hash', $2, $3)",
+        " (work_ticket_idx, step_index, attempt, step_name, step_occurrence, compute_target, state)"
+        " VALUES ($1, 0, 0, 'hash', 0, $2, $3)",
         idx,
         ComputeTarget.LOCAL.value,
         StepProgressState.COMPLETED.value,
     )
     await postgres_pool.execute(
         "INSERT INTO qiita.work_ticket_step"
-        " (work_ticket_idx, step_index, attempt, step_name, compute_target,"
+        " (work_ticket_idx, step_index, attempt, step_name, step_occurrence, compute_target,"
         "  state, slurm_job_id, job_name, failure_kind, failure_reason)"
-        " VALUES ($1, 1, 0, 'load', $2, $3, 987654, 'qiita-wt-load-a0',"
+        " VALUES ($1, 1, 0, 'load', 0, $2, $3, 987654, 'qiita-wt-load-a0',"
         "  'contract_violation', 'boom')",
         idx,
         ComputeTarget.SLURM.value,
@@ -2615,9 +2615,9 @@ async def test_run_on_failed_keeps_inflight_step_rows_so_their_jobs_are_adoptabl
     # attempt 0 died (OOM); attempt 1 is the escalated retry, still live.
     await postgres_pool.execute(
         "INSERT INTO qiita.work_ticket_step"
-        " (work_ticket_idx, step_index, attempt, step_name, compute_target,"
+        " (work_ticket_idx, step_index, attempt, step_name, step_occurrence, compute_target,"
         "  state, slurm_job_id, job_name, failure_kind, failure_reason)"
-        " VALUES ($1, 0, 0, 'load', $2, $3, 605016, 'qiita-wt-load-a0',"
+        " VALUES ($1, 0, 0, 'load', 0, $2, $3, 605016, 'qiita-wt-load-a0',"
         "  'oom_killed', 'OUT_OF_MEMORY')",
         idx,
         ComputeTarget.SLURM.value,
@@ -2625,9 +2625,9 @@ async def test_run_on_failed_keeps_inflight_step_rows_so_their_jobs_are_adoptabl
     )
     await postgres_pool.execute(
         "INSERT INTO qiita.work_ticket_step"
-        " (work_ticket_idx, step_index, attempt, step_name, compute_target,"
+        " (work_ticket_idx, step_index, attempt, step_name, step_occurrence, compute_target,"
         "  state, slurm_job_id, job_name)"
-        " VALUES ($1, 0, 1, 'load', $2, $3, 605029, 'qiita-wt-load-a1')",
+        " VALUES ($1, 0, 1, 'load', 0, $2, $3, 605029, 'qiita-wt-load-a1')",
         idx,
         ComputeTarget.SLURM.value,
         StepProgressState.SUBMITTED.value,
@@ -2689,9 +2689,9 @@ async def test_run_preserves_the_escalated_resource_floor(
     # this row — the floor must outlive it.
     await postgres_pool.execute(
         "INSERT INTO qiita.work_ticket_step"
-        " (work_ticket_idx, step_index, attempt, step_name, compute_target,"
+        " (work_ticket_idx, step_index, attempt, step_name, step_occurrence, compute_target,"
         "  state, slurm_job_id, job_name, failure_kind, failure_reason)"
-        " VALUES ($1, 0, 0, 'load', $2, $3, 605016, 'qiita-wt-load-a0',"
+        " VALUES ($1, 0, 0, 'load', 0, $2, $3, 605016, 'qiita-wt-load-a0',"
         "  'oom_killed', 'OUT_OF_MEMORY')",
         idx,
         ComputeTarget.SLURM.value,
@@ -2803,17 +2803,17 @@ async def test_run_after_cancel_drops_inflight_rows_whose_jobs_were_reaped(
     # already scancelled (must NOT survive).
     await postgres_pool.execute(
         "INSERT INTO qiita.work_ticket_step"
-        " (work_ticket_idx, step_index, attempt, step_name, compute_target, state)"
-        " VALUES ($1, 0, 0, 'hash', $2, $3)",
+        " (work_ticket_idx, step_index, attempt, step_name, step_occurrence, compute_target, state)"
+        " VALUES ($1, 0, 0, 'hash', 0, $2, $3)",
         idx,
         ComputeTarget.LOCAL.value,
         StepProgressState.COMPLETED.value,
     )
     await postgres_pool.execute(
         "INSERT INTO qiita.work_ticket_step"
-        " (work_ticket_idx, step_index, attempt, step_name, compute_target,"
+        " (work_ticket_idx, step_index, attempt, step_name, step_occurrence, compute_target,"
         "  state, slurm_job_id, job_name)"
-        " VALUES ($1, 1, 0, 'load', $2, $3, 605016, 'qiita-wt-load-a0')",
+        " VALUES ($1, 1, 0, 'load', 0, $2, $3, 605016, 'qiita-wt-load-a0')",
         idx,
         ComputeTarget.SLURM.value,
         StepProgressState.RUNNING.value,
@@ -2865,9 +2865,9 @@ async def test_run_on_failed_drops_submitting_row_with_no_job_id(
     wt_client._created_tickets.append(idx)
     await postgres_pool.execute(
         "INSERT INTO qiita.work_ticket_step"
-        " (work_ticket_idx, step_index, attempt, step_name, compute_target,"
+        " (work_ticket_idx, step_index, attempt, step_name, step_occurrence, compute_target,"
         "  state, job_name)"
-        " VALUES ($1, 0, 0, 'load', $2, $3, 'qiita-wt-load-a0')",
+        " VALUES ($1, 0, 0, 'load', 0, $2, $3, 'qiita-wt-load-a0')",
         idx,
         ComputeTarget.SLURM.value,
         StepProgressState.SUBMITTING.value,
@@ -3150,9 +3150,9 @@ async def ticket_seeder(postgres_pool):
     ) -> None:
         await postgres_pool.execute(
             "INSERT INTO qiita.work_ticket_step"
-            " (work_ticket_idx, step_index, attempt, step_name, compute_target,"
+            " (work_ticket_idx, step_index, attempt, step_name, step_occurrence, compute_target,"
             "  state, slurm_job_id, job_name, failure_kind, failure_reason)"
-            " VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+            " VALUES ($1, $2, $3, $4, 0, $5, $6, $7, $8, $9, $10)",
             work_ticket_idx,
             step_index,
             attempt,
@@ -3939,9 +3939,9 @@ async def _seed_ticket_with_step_logs(
         # the work_ticket_step_failure_consistent CHECK.
         await postgres_pool.execute(
             "INSERT INTO qiita.work_ticket_step"
-            " (work_ticket_idx, step_index, attempt, step_name, compute_target, state,"
-            "  failure_kind, failure_reason)"
-            " VALUES ($1, 0, $2, $3, 'slurm', 'failed', 'oom_killed', 'seeded for logs test')",
+            " (work_ticket_idx, step_index, attempt, step_name, step_occurrence,"
+            "  compute_target, state, failure_kind, failure_reason)"
+            " VALUES ($1, 0, $2, $3, 0, 'slurm', 'failed', 'oom_killed', 'seeded for logs test')",
             idx,
             attempt,
             _LOGS_STEP_NAME,
@@ -4090,9 +4090,9 @@ async def test_get_step_logs_step_name_with_separator_500(
     wt_client._created_tickets.append(idx)
     await postgres_pool.execute(
         "INSERT INTO qiita.work_ticket_step"
-        " (work_ticket_idx, step_index, attempt, step_name, compute_target, state,"
+        " (work_ticket_idx, step_index, attempt, step_name, step_occurrence, compute_target, state,"
         "  failure_kind, failure_reason)"
-        " VALUES ($1, 0, 0, $2, 'slurm', 'failed', 'oom_killed', 'seeded')",
+        " VALUES ($1, 0, 0, $2, 0, 'slurm', 'failed', 'oom_killed', 'seeded')",
         idx,
         "evil/../etc",
     )

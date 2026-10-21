@@ -89,8 +89,9 @@ async def world(postgres_pool, tmp_path):
             return ps, None
         await pool.execute(
             "INSERT INTO qiita.work_ticket_step"
-            " (work_ticket_idx, step_index, attempt, step_name, compute_target, state)"
-            " VALUES ($1, 0, $2, 'syndna', 'local', 'completed')",
+            " (work_ticket_idx, step_index, attempt, step_name, step_occurrence,"
+            "  compute_target, state)"
+            " VALUES ($1, 0, $2, 'syndna', 0, 'local', 'completed')",
             ticket_idx,
             attempt,
         )

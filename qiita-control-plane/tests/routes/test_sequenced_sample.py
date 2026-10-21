@@ -5076,6 +5076,7 @@ async def _seed_slurm_step(pool, ticket_idx, *, step_index, name, state) -> None
         pool,
         **kw,
         step_name=name,
+        step_occurrence=0,
         compute_target=ComputeTarget.SLURM,
         job_name=f"qiita-wt{ticket_idx}-{name}-a0",
     )
@@ -5179,6 +5180,7 @@ async def test_redrive_of_failed_download_ticket_downloads_a_natively_added_run(
         step_index=1,
         attempt=0,
         step_name="register-files",
+        step_occurrence=0,
         compute_target=ComputeTarget.CONTROL_PLANE,
     )
     await step_progress.record_failed(
@@ -5431,6 +5433,7 @@ async def test_patch_run_accession_failed_ticket_live_job(ctx, step, expected):
             step_index=0,
             attempt=0,
             step_name="ingest_ena_reads",
+            step_occurrence=0,
             compute_target=ComputeTarget.SLURM,
             job_name=f"qiita-wt{ticket_idx}-ingest_ena_reads-a0",
         )

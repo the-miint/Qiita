@@ -268,7 +268,17 @@ async def run_workflow(
         # Per-entry progress from any prior run. Empty on a first dispatch; on a
         # resume (or a /run redrive) it carries the COMPLETED rows the loop
         # fast-forwards. Loaded once — this run's own writes don't feed back in.
-        progress = await step_progress.load_step_progress(pool, work_ticket_idx)
+        # Aligned to the current steps list first, so a row written before an
+        # in-place edit of the workflow is read for the entry that wrote it.
+        try:
+            progress = await step_progress.align_step_progress(pool, work_ticket_idx, action.steps)
+        except step_progress.StepProgressMismatch as exc:
+            raise BackendFailure(
+                kind=FailureKind.CONTRACT_VIOLATION,
+                stage=WorkTicketFailureStage.SUBMISSION,
+                reason=str(exc),
+            ) from exc
+        occurrences = step_progress.step_occurrences([e.name for e in action.steps])
 
         # Per-step resource floors a PRIOR run's retry ladder escalated to and
         # persisted. Empty on a first dispatch. This is what makes the ladder
@@ -809,6 +819,7 @@ async def run_workflow(
                 pool=pool,
                 work_ticket_idx=work_ticket_idx,
                 index=index,
+                occurrence=occurrences[index],
                 entry=entry,
                 action_ceiling=action.action_ceiling,
                 mem_gb_override=mem_gb_override,
@@ -1010,6 +1021,7 @@ async def _run_entry_with_retry(
     pool: asyncpg.Pool,
     work_ticket_idx: int,
     index: int,
+    occurrence: int,
     entry: WorkflowStep | WorkflowAction,
     action_ceiling: ActionCeiling,
     mem_gb_override: int | None = None,
@@ -1190,6 +1202,7 @@ async def _run_entry_with_retry(
                     pool=pool,
                     work_ticket_idx=work_ticket_idx,
                     step_index=index,
+                    step_occurrence=occurrence,
                     attempt=attempt,
                     action_ceiling=action_ceiling,
                     mem_gb_override=effective_mem_override,
@@ -1207,6 +1220,7 @@ async def _run_entry_with_retry(
                     scope_target,
                     work_ticket_idx=work_ticket_idx,
                     step_index=index,
+                    step_occurrence=occurrence,
                     attempt=attempt,
                     signing_key=signing_key,
                     data_plane_url=data_plane_url,

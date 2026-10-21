@@ -400,9 +400,9 @@ async def _seed_work_ticket_step(
     failure_reason (the work_ticket_step_failure_consistent CHECK)."""
     await ctx["pool"].execute(
         "INSERT INTO qiita.work_ticket_step"
-        " (work_ticket_idx, step_index, attempt, step_name, compute_target,"
+        " (work_ticket_idx, step_index, attempt, step_name, step_occurrence, compute_target,"
         "  state, failure_kind, failure_reason)"
-        " VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+        " VALUES ($1, $2, $3, $4, 0, $5, $6, $7, $8)",
         work_ticket_idx,
         step_index,
         attempt,

@@ -4720,6 +4720,7 @@ async def test_idempotent_adopt_does_not_resubmit(postgres_pool, slurm_ticket, t
         step_index=0,
         attempt=0,
         step_name="compute",
+        step_occurrence=0,
         compute_target=ComputeTarget.SLURM,
         job_name=f"qiita-wt{slurm_ticket}-compute-a0",
     )
@@ -4835,6 +4836,7 @@ async def _seed_submitted_step(pool, work_ticket_idx, *, step_name, slurm_job_id
         step_index=step_index,
         attempt=0,
         step_name=step_name,
+        step_occurrence=0,
         compute_target=ComputeTarget.SLURM,
         job_name=f"qiita-wt{work_ticket_idx}-{step_name}-a0",
     )
@@ -4963,6 +4965,7 @@ async def _seed_failed_then_escalated_step(
             step_index=step_index,
             attempt=attempt,
             step_name=step_name,
+            step_occurrence=0,
             compute_target=ComputeTarget.SLURM,
             job_name=f"qiita-wt{work_ticket_idx}-{step_name}-a{attempt}",
         )
@@ -5086,6 +5089,7 @@ async def _seed_submitting_no_id(pool, work_ticket_idx, *, step_name, step_index
         step_index=step_index,
         attempt=0,
         step_name=step_name,
+        step_occurrence=0,
         compute_target=ComputeTarget.SLURM,
         job_name=f"qiita-wt{work_ticket_idx}-{step_name}-a0",
     )
@@ -5428,6 +5432,7 @@ async def test_resume_multi_step_rebuilds_bound_and_skips_completed_action(
         step_index=1,
         attempt=0,
         step_name="mint-features",
+        step_occurrence=0,
         compute_target=ComputeTarget.CONTROL_PLANE,
     )
     await step_progress.record_completed(
@@ -5457,6 +5462,94 @@ async def test_resume_multi_step_rebuilds_bound_and_skips_completed_action(
     assert by_index[0].state is StepProgressState.COMPLETED
     assert by_index[1].state is StepProgressState.COMPLETED
     assert by_index[2].state is StepProgressState.COMPLETED
+
+
+async def test_resume_after_a_workflow_edit_fast_forwards_by_step_identity(
+    postgres_pool, multi_step_ticket, library_spy, tmp_path
+):
+    """Rows written under an earlier steps list, where mint-features sat at
+    index 2 (a since-removed entry at index 1 never wrote a row), resume against
+    the current list where it sits at index 1. mint-features is fast-forwarded
+    by its name and occurrence, not re-run, and `finish` — now at the index the
+    mint-features row recorded — runs fresh instead of being skipped."""
+    await _mark_processing(postgres_pool, multi_step_ticket)
+    await _seed_submitted_step(
+        postgres_pool, multi_step_ticket, step_name="compute", slurm_job_id=951, step_index=0
+    )
+    await step_progress.record_running(
+        postgres_pool, work_ticket_idx=multi_step_ticket, step_index=0, attempt=0
+    )
+    await step_progress.record_completed(
+        postgres_pool, work_ticket_idx=multi_step_ticket, step_index=0, attempt=0
+    )
+    await step_progress.record_submitting(
+        postgres_pool,
+        work_ticket_idx=multi_step_ticket,
+        step_index=2,
+        attempt=0,
+        step_name="mint-features",
+        step_occurrence=0,
+        compute_target=ComputeTarget.CONTROL_PLANE,
+    )
+    await step_progress.record_completed(
+        postgres_pool, work_ticket_idx=multi_step_ticket, step_index=2, attempt=0
+    )
+
+    backend = FakeSlurmBackendClient(
+        status_script=[StepStatus.COMPLETED],
+        result_script=[{"manifest": "manifest.parquet"}, {"result": "result.parquet"}],
+    )
+    await _run(multi_step_ticket, postgres_pool, backend, tmp_path / "ws", resume=True)
+
+    state = await postgres_pool.fetchval(
+        "SELECT state FROM qiita.work_ticket WHERE work_ticket_idx = $1", multi_step_ticket
+    )
+    assert state == "completed"
+    assert [c[0] for c in library_spy.calls] == []
+    assert backend.submit_calls == 1
+    rows = await step_progress.load_step_progress(postgres_pool, multi_step_ticket)
+    assert {(r.step_index, r.step_name, r.state) for r in rows} == {
+        (0, "compute", StepProgressState.COMPLETED),
+        (1, "mint-features", StepProgressState.COMPLETED),
+        (2, "finish", StepProgressState.COMPLETED),
+    }
+
+
+async def test_resume_fails_a_ticket_whose_rows_name_a_removed_entry(
+    postgres_pool, multi_step_ticket, library_spy, tmp_path
+):
+    """A completed row for an entry the current steps list no longer has fails
+    the ticket permanently, at submission, before any entry runs."""
+    await _mark_processing(postgres_pool, multi_step_ticket)
+    await step_progress.record_submitting(
+        postgres_pool,
+        work_ticket_idx=multi_step_ticket,
+        step_index=0,
+        attempt=0,
+        step_name="dropped-entry",
+        step_occurrence=0,
+        compute_target=ComputeTarget.CONTROL_PLANE,
+    )
+    await step_progress.record_completed(
+        postgres_pool, work_ticket_idx=multi_step_ticket, step_index=0, attempt=0
+    )
+
+    backend = FakeSlurmBackendClient(status_script=[], result_script=[])
+    with pytest.raises(BackendFailure):
+        await _run(multi_step_ticket, postgres_pool, backend, tmp_path / "ws", resume=True)
+
+    row = await postgres_pool.fetchrow(
+        "SELECT state, failure_type, failure_stage, failure_step_name, failure_reason"
+        " FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+        multi_step_ticket,
+    )
+    assert row["state"] == "failed"
+    assert row["failure_type"] == "permanent"
+    assert row["failure_stage"] == "submission"
+    assert row["failure_step_name"] is None
+    assert "'dropped-entry' occurrence 0" in row["failure_reason"]
+    assert backend.submit_calls == 0
+    assert library_spy.calls == []
 
 
 _TARGET_STATUS_WORKFLOW = [

@@ -48,6 +48,7 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
 ### 3. Migrations
 
 - `[operator]` (#731) `make migrate` applies `20261021000000_sequenced_sample_download_failure.sql` (two nullable columns and a both-or-neither CHECK on `qiita.sequenced_sample`; no backfill).
+- `[operator]` (#resume-step-identity) `make migrate` also applies `20261021010000_work_ticket_step_occurrence.sql` (adds `qiita.work_ticket_step.step_occurrence`, backfilled in the migration from each ticket's synced `steps:`, then NOT NULL plus a unique index; no out-of-band step).
 
 ### 4. Deploy
 
@@ -67,6 +68,7 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
   unit sets no cgroup limit. No separate journal read by hand; `SKIP_DP_POOL=1` drops the
   row.
 - `[admin]` (#731) `qiita.action` lists `download-ena-study` 1.0.0 with three steps, ending in `persist-ena-run-outcomes`, and `\d qiita.sequenced_sample` shows `download_failure_reason` and `download_failure_type`.
+- `[admin]` (#resume-step-identity) `\d qiita.work_ticket_step` shows `step_occurrence` (not null) and the index `work_ticket_step_identity_attempt`.
 
 ### 6. After the deploy verifies green
 
@@ -93,6 +95,7 @@ _None yet._
   write storm can occupy the whole pool and reads are refused for that window.
 - (#731) `GET /ena-import-batch/{idx}` items can read `completed_partial` (a pool landed with some runs failed permanently), and `ena_runs[].status` can be `download_failed`, with a new `failure_type`; clients matching on the closed set of states or statuses must accept them. `submit-ena-import --watch` exits 1 on a `completed_partial` item. A partially landed ticket is `completed`, so the submitter gets the work-ticket digest unless they opted out of processing emails.
 - (#751) `download-ena-study` 1.0.0 gains an optional `run_concurrency`. The optional control-plane `ENA_DOWNLOAD_RUN_CONCURRENCY` (1-8, default 4) stays at 4 in production (see `docs/runbooks/ena-import.md`).
+- (#resume-step-identity) Resume and `/run` now match a ticket's step rows to the workflow's steps by name and occurrence, not position. A ticket whose rows name a step the synced workflow no longer has fails at `submission` with those rows in `failure_reason`, on the restart after this deploy as on any later redrive; it is resubmitted, not redriven. New user command `qiita ticket redrive` (dry-run by default) redrives a selection of FAILED tickets one at a time.
 
 ## Deployed history
 
