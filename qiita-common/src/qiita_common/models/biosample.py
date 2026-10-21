@@ -287,8 +287,6 @@ TERMINOLOGY_TERM_VALUE_COLUMN = "value_terminology_term_idx"
 # Shared so that every reader of either field spells it the same way.
 BIOSAMPLE_FIELD_TAXON_ID = "taxon_id"
 BIOSAMPLE_FIELD_HOST_TAXON_ID = "host_taxon_id"
-BIOSAMPLE_FIELD_NEG_CONT_TYPE = "neg_cont_type"
-BIOSAMPLE_FIELD_POS_CONT_TYPE = "pos_cont_type"
 BIOSAMPLE_FIELD_QIITA_SAMPLE_TYPE = "qiita_sample_type"
 
 # Seeded `biosample_global_field.display_name` values -- NOT the `internal_name`s above.
@@ -299,8 +297,6 @@ BIOSAMPLE_DISPLAY_GEOGRAPHIC_LOCATION_LONGITUDE = "geographic location (longitud
 BIOSAMPLE_DISPLAY_DEPTH = "depth"
 BIOSAMPLE_DISPLAY_HOST_TAXON_ID = "host taxon id"
 BIOSAMPLE_DISPLAY_TAXON_ID = "taxon id"
-BIOSAMPLE_DISPLAY_NEG_CONT_TYPE = "negative control type"
-BIOSAMPLE_DISPLAY_POS_CONT_TYPE = "positive control type"
 BIOSAMPLE_DISPLAY_QIITA_SAMPLE_TYPE = "qiita sample type"
 
 # The two `qiita.missing_value_reason` names the host-filter resolver RECOGNISES

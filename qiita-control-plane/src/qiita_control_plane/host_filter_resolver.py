@@ -14,9 +14,8 @@ to the callers. Two seams it deliberately does not cross:
     its own; what it should be filtered against is a property of the POOL it
     rode in (the union of its neighbours' hosts). This module reports "this is a
     control" and stops; the pool-level union lives with the pool-level caller.
-    A control is a real value on `neg_cont_type` / `pos_cont_type`, a control
-    `qiita_sample_type` term (the `_*_SAMPLE_TYPE_TERM_IDS` below), or the legacy
-    `host_taxon_id` marker, and it wins over every `host_taxon_id` state.
+    A control is a control `qiita_sample_type` term (per `control_types.yml`) or the
+    legacy `host_taxon_id` marker, and it wins over every `host_taxon_id` state.
 
   * It resolves reference IDENTITY, not on-disk READINESS. The returned idxs name
     `qiita.reference` rows. Whether those references are ACTIVE and their indexes
@@ -29,15 +28,13 @@ UNRESOLVED rather than to "no filtering". Silently passing an un-depleted human
 sample through is the one outcome we cannot take back.
 """
 
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass, field
-from enum import Enum
 
 import asyncpg
+from qiita_common.control_types import load_control_types
 from qiita_common.models import (
     BIOSAMPLE_FIELD_HOST_TAXON_ID,
-    BIOSAMPLE_FIELD_NEG_CONT_TYPE,
-    BIOSAMPLE_FIELD_POS_CONT_TYPE,
     BIOSAMPLE_FIELD_QIITA_SAMPLE_TYPE,
     MISSING_REASON_CONTROL_SAMPLE,
     MISSING_REASON_NOT_APPLICABLE,
@@ -72,46 +69,7 @@ _METADATA_FROM = (
     " LEFT JOIN qiita.terminology_term tt"
     "   ON tt.idx = bm.value_terminology_term_idx"
 )
-_METADATA_FIELDS = [
-    BIOSAMPLE_FIELD_HOST_TAXON_ID,
-    BIOSAMPLE_FIELD_NEG_CONT_TYPE,
-    BIOSAMPLE_FIELD_POS_CONT_TYPE,
-    BIOSAMPLE_FIELD_QIITA_SAMPLE_TYPE,
-]
-
-_NEGATIVE_SAMPLE_TYPE_TERM_IDS = frozenset(
-    {"control_blank", "control_sterile_water", "control_sea_water"}
-)
-_POSITIVE_SAMPLE_TYPE_TERM_IDS = frozenset({"control_spike_in"})
-
-
-class _ControlKind(Enum):
-    NEGATIVE = "negative"
-    POSITIVE = "positive"
-
-
-def _neg_cont_type_kind(row: asyncpg.Record) -> _ControlKind | None:
-    return _ControlKind.NEGATIVE
-
-
-def _pos_cont_type_kind(row: asyncpg.Record) -> _ControlKind | None:
-    return _ControlKind.POSITIVE if (row["value_text"] or "").strip() else None
-
-
-def _qiita_sample_type_kind(row: asyncpg.Record) -> _ControlKind | None:
-    if row["term_id"] in _NEGATIVE_SAMPLE_TYPE_TERM_IDS:
-        return _ControlKind.NEGATIVE
-    if row["term_id"] in _POSITIVE_SAMPLE_TYPE_TERM_IDS:
-        return _ControlKind.POSITIVE
-    return None
-
-
-# Each control field's reading of a value that carries no missing reason.
-_CONTROL_KIND_BY_FIELD: dict[str, Callable[[asyncpg.Record], _ControlKind | None]] = {
-    BIOSAMPLE_FIELD_NEG_CONT_TYPE: _neg_cont_type_kind,
-    BIOSAMPLE_FIELD_POS_CONT_TYPE: _pos_cont_type_kind,
-    BIOSAMPLE_FIELD_QIITA_SAMPLE_TYPE: _qiita_sample_type_kind,
-}
+_METADATA_FIELDS = [BIOSAMPLE_FIELD_HOST_TAXON_ID, BIOSAMPLE_FIELD_QIITA_SAMPLE_TYPE]
 
 
 @dataclass
@@ -119,38 +77,39 @@ class _Signals:
     """What one metadata read says about a set of biosamples."""
 
     host_rows: dict[int, asyncpg.Record] = field(default_factory=dict)
-    # biosample_idx -> the control field that marked it.
-    control_field: dict[int, str] = field(default_factory=dict)
+    control: set[int] = field(default_factory=set)
     negative: set[int] = field(default_factory=set)
+    # biosample_idx -> a qiita_sample_type term that control_types.yml does not list.
+    unlisted: dict[int, str] = field(default_factory=dict)
 
 
 async def _read_signals(
     conn: asyncpg.Pool | asyncpg.Connection, biosample_idxs: Sequence[int]
 ) -> _Signals:
     """One cross-study query (via the trigger-maintained global_field_idx) over the host
-    and control fields; `_METADATA_FIELDS` order sets which control field is named."""
+    and sample-type fields."""
     rows = await conn.fetch(
-        f"SELECT {_METADATA_COLUMNS}{_METADATA_FROM}"
-        " WHERE bm.biosample_idx = ANY($2::bigint[])"
-        " ORDER BY array_position($1::text[], bgf.internal_name)",
+        f"SELECT {_METADATA_COLUMNS}{_METADATA_FROM} WHERE bm.biosample_idx = ANY($2::bigint[])",
         _METADATA_FIELDS,
         list(biosample_idxs),
     )
+    control_types = load_control_types()
     signals = _Signals()
     for row in rows:
-        name = row["internal_name"]
         idx = row["biosample_idx"]
-        if name == BIOSAMPLE_FIELD_HOST_TAXON_ID:
+        if row["internal_name"] == BIOSAMPLE_FIELD_HOST_TAXON_ID:
             signals.host_rows[idx] = row
             continue
-        if row["value_missing_reason_idx"] is not None:
+        term_id = row["term_id"]
+        if term_id is None:
             continue
-        kind = _CONTROL_KIND_BY_FIELD[name](row)
-        if kind is None:
-            continue
-        signals.control_field.setdefault(idx, name)
-        if kind is _ControlKind.NEGATIVE:
+        if term_id in control_types["negative"]:
             signals.negative.add(idx)
+            signals.control.add(idx)
+        elif term_id in control_types["positive"]:
+            signals.control.add(idx)
+        elif term_id not in control_types["not_control"]:
+            signals.unlisted[idx] = term_id
     return signals
 
 
@@ -218,16 +177,14 @@ async def resolve_host_filter(
         profile = await get_host_filter_profile(
             conn, host_term_idx=row["value_terminology_term_idx"], platform=platform
         )
-    return _classify(
-        biosample_idx, row, profile, platform, signals.control_field.get(biosample_idx)
-    )
+    return _classify(biosample_idx, row, profile, platform, signals)
 
 
 async def negative_control_biosamples(
     conn: asyncpg.Pool | asyncpg.Connection, biosample_idxs: Sequence[int]
 ) -> set[int]:
     """The subset of `biosample_idxs` that is an expected-empty (negative) control by
-    metadata: a real `neg_cont_type`, or a negative `qiita_sample_type` term.
+    metadata: a negative `qiita_sample_type` term.
     """
     negative: set[int] = set()
     if biosample_idxs:
@@ -299,9 +256,7 @@ async def resolve_host_filter_many(
         row = signals.host_rows.get(biosample_idx)
         term = row["value_terminology_term_idx"] if row is not None else None
         profile = profile_by_term.get(term) if term is not None else None
-        resolutions[biosample_idx] = _classify(
-            biosample_idx, row, profile, platform, signals.control_field.get(biosample_idx)
-        )
+        resolutions[biosample_idx] = _classify(biosample_idx, row, profile, platform, signals)
     return resolutions
 
 
@@ -310,17 +265,25 @@ def _classify(
     row: asyncpg.Record | None,
     profile: HostFilterProfile | None,
     platform: Platform,
-    control_field: str | None,
+    signals: _Signals,
 ) -> HostFilterResolution:
     """The whole decision, as a pure function of the facts it needs: the sample's
     host_taxon_id row (or its absence), the profile for whatever host that row
-    names (or its absence), and the control field that marked it, if any.
+    names (or its absence), and what its qiita_sample_type says.
     """
-    if control_field is not None:
+    if biosample_idx in signals.control:
         return _without_references(
             HostFilterOutcome.CONTROL,
-            f"{control_field} marks biosample {biosample_idx} as a control;"
+            f"{BIOSAMPLE_FIELD_QIITA_SAMPLE_TYPE} marks biosample {biosample_idx} as a control;"
             " what it filters against is decided pool-side",
+        )
+
+    unlisted = signals.unlisted.get(biosample_idx)
+    if unlisted is not None:
+        return _without_references(
+            HostFilterOutcome.UNRESOLVED,
+            f"{BIOSAMPLE_FIELD_QIITA_SAMPLE_TYPE} {unlisted!r} on biosample {biosample_idx}"
+            " is not classified in control_types.yml",
         )
 
     # The field was never set. Not the same as "no host" — we simply were not

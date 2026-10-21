@@ -328,8 +328,8 @@ filled from the run's taxon ids (falling back to the table, `not applicable`, or
 A warning appears only on the run that created the biosample, so after a re-import or for
 a later run on the same sample, check the creating batch.
 
-A stored `not provided` stops host filtering at submit (unless the biosample's metadata
-makes it a control, for example a `negative control type`), and nothing rewrites it:
+A stored `not provided` stops host filtering at submit (unless the biosample's
+`qiita sample type` makes it a control), and nothing rewrites it:
 `qiita-admin backfill host-taxon-id` skips a biosample that already has a `host taxon id`
 row, and a re-import does not revisit it (#669). To correct one, write the field on that
 biosample with `PATCH /study/{S}/biosample/{B}/metadata` and body

@@ -21,7 +21,6 @@ import secrets
 import pytest
 import pytest_asyncio
 from qiita_common.models import (
-    BIOSAMPLE_FIELD_NEG_CONT_TYPE,
     BIOSAMPLE_FIELD_QIITA_SAMPLE_TYPE,
     NCBI_TAXONOMY_HUMAN_TERM_ID,
     NCBI_TAXONOMY_METAGENOME_TERM_ID,
@@ -453,20 +452,11 @@ async def _control_global_field_and_term(conn, internal_name, term_id):
 
 
 @pytest.mark.db
-@pytest.mark.parametrize(
-    ("internal_name", "term_id"),
-    [
-        (BIOSAMPLE_FIELD_NEG_CONT_TYPE, "distilled water"),
-        (BIOSAMPLE_FIELD_QIITA_SAMPLE_TYPE, "control_blank"),
-    ],
-)
-async def test_negative_metadata_control_is_written_as_a_control_marker(
-    ctx, internal_name, term_id
-):
+async def test_negative_metadata_control_is_written_as_a_control_marker(ctx):
     """A biosample the metadata calls a negative control is a CONTROL even when no
     pre-flight names it, and gets the marker rather than its taxon's host."""
     bs_idx = await _seed_biosample_with_taxon(ctx, _HUMAN_GUT_METAGENOME)
-    await _set_control_term(ctx, bs_idx, internal_name, term_id)
+    await _set_control_term(ctx, bs_idx, BIOSAMPLE_FIELD_QIITA_SAMPLE_TYPE, "control_blank")
 
     plan = await plan_backfill(ctx["pool"])
     mine = [a for a in plan.assignments if a.biosample_idx == bs_idx]
