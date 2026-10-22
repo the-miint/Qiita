@@ -2280,9 +2280,10 @@ fn register_files_fails_closed_on_a_destination_there_before_it_moves() {
     std::fs::remove_file(&taken).unwrap();
 }
 
-/// A TCP proxy in front of the test catalog's Postgres. Once DuckLake sends its
-/// commit's catalog write (the `ducklake_snapshot` insert), the proxy drops
-/// Postgres's answer to the COMMIT that follows and closes that connection, so
+/// A TCP proxy in front of the test catalog's Postgres. Once a client message on
+/// a connection names `ducklake_snapshot` (DuckLake's commit writes a snapshot
+/// row), the proxy drops Postgres's answer to the next COMMIT on it and closes
+/// that connection, so
 /// the commit is in the catalog and the client is told it failed. Returns the
 /// connection string through the proxy, and whether it has cut a connection.
 /// Only the first such COMMIT is cut.
@@ -2309,9 +2310,11 @@ fn catalog_that_loses_a_commit_answer(
     let proxied = connstr
         .split_whitespace()
         .filter(|kv| {
-            !kv.starts_with("host=") && !kv.starts_with("port=") && !kv.starts_with("sslmode=")
+            !["host=", "port=", "sslmode=", "gssencmode="]
+                .iter()
+                .any(|key| kv.starts_with(key))
         })
-        .chain(["host=127.0.0.1", "sslmode=disable"])
+        .chain(["host=127.0.0.1", "sslmode=disable", "gssencmode=disable"])
         .collect::<Vec<_>>()
         .join(" ")
         + &format!(" port={port}");

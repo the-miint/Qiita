@@ -269,9 +269,11 @@ stat -c '%n  owner=%U  group=%G  mode=%a  device=%d' <persistent>/ducklake <scra
 ```
 
 Watch the **device numbers**: if `<persistent>/ducklake` and
-`<scratch>/staging` are on different volumes, the DP's rename from staging
-to final falls back to copy+delete. Works correctly, just slower. Flag to
-infra if you want the fast path; not blocking otherwise.
+`<scratch>/staging` are on different volumes, the DP copies each registered
+file instead of moving it. Works correctly, just slower; one volume avoids the
+copy only under the conditions in [storage](../architecture/storage.md)
+("Same-FS preference"). Flag to infra if you want the fast path; not blocking
+otherwise.
 
 ### 0.4 nginx + TLS + DNS
 

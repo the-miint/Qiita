@@ -2361,8 +2361,8 @@ struct Registration {
 /// Validates all requested files exist in staging, moves them to permanent
 /// locations under `data_path/{table_name}/`, and registers them.
 ///
-/// Uses `std::fs::rename` with a copy+delete fallback for cross-filesystem moves
-/// (e.g., SLURM local scratch → shared NFS).
+/// Each file is placed by `move_file`, which copies where it cannot rename or
+/// link (e.g., SLURM local scratch → shared NFS).
 ///
 /// Some tables are REPLACED on their key rather than appended to — see
 /// `REPLACE_KEY_TABLES` for which, and why. The `read` rows a ticket registered
@@ -2458,8 +2458,8 @@ fn register_files(
     // registration is returned without writing: `ducklake_add_data_files`
     // accepts a path it already holds and adds its rows again. Any other state
     // fails closed, because the earlier call may still be registering the files.
-    // Judged by the destination, not the source: the cross-filesystem path in
-    // `move_file` can leave the staging copy behind.
+    // Judged by the destination, not the source: `move_file` keeps a placed
+    // file when removing its staging source fails.
     let moved_before = placed.iter().filter(|f| f.dest.exists()).count();
     if moved_before > 0 {
         let in_catalog = registered_data_files(conn, &placed)?;
@@ -2516,8 +2516,9 @@ fn register_files(
             })
             .and_then(|()| move_file(&file.src, &file.dest));
         if let Err(e) = placed_one {
-            // `move_file` leaves no destination of its own behind when it fails,
-            // so only the files before this one are this call's to move back.
+            // `move_file` removes a destination of its own when it fails (unless
+            // that removal fails too, which it logs), so only the files before
+            // this one are this call's to move back.
             return Err(return_to_staging(conn, &placed[..i], e));
         }
         moved.push((file.table.clone(), file.dest_str.clone()));
@@ -2711,8 +2712,8 @@ fn return_to_staging(conn: &duckdb::Connection, files: &[PlacedFile], failure: S
     }
     let mut stuck = Vec::new();
     for file in moved {
-        // The cross-filesystem path in `move_file` can leave the staging copy;
-        // the lake copy is then the one to remove.
+        // `move_file` keeps a placed file when removing its staging source
+        // fails; the lake copy is then the one to remove.
         let back = if file.src.exists() {
             std::fs::remove_file(&file.dest)
                 .map_err(|e| Status::internal(format!("remove {}: {e}", file.dest.display())))
@@ -2986,7 +2987,9 @@ fn delete_reference(conn: &LakeWriter, reference_idx: i64) -> Result<serde_json:
         },
         |_| {
             // The deletes commit together, so none of the reference's rows left in
-            // the tables keyed by it means this attempt's commit is there.
+            // the tables keyed by it means the reference is deleted: by this
+            // attempt, or by a delete of the same reference that committed first,
+            // whose counts this one then reports.
             let mut remaining = 0i64;
             for table in [
                 "reference_membership",
@@ -3649,7 +3652,8 @@ fn staging_scope(staging_dir: &str, scratch_root: &std::path::Path) -> String {
         .unwrap_or_else(|_| staging_dir.to_string())
 }
 
-/// Move a file, falling back to copy+delete for cross-filesystem moves.
+/// Move a file: rename it, or hard-link it and remove the source, or copy it and
+/// remove the source, whichever the filesystem allows first.
 ///
 /// Refuses to overwrite an existing destination. Lake data files are
 /// registered in the DuckLake catalog by absolute path and written read-only
@@ -3661,8 +3665,9 @@ fn staging_scope(staging_dir: &str, scratch_root: &std::path::Path) -> String {
 ///
 /// The refusal is made by the call that creates the destination (a no-replace
 /// rename, a hard link, or a `create_new` copy), never by a check before it, so
-/// two calls placing one destination cannot both succeed. On failure no
-/// destination this call created is left behind. If the move succeeds but
+/// two calls placing one destination cannot both succeed. On failure the
+/// destination this call created is removed; if that removal fails too, a
+/// warning names the partial file. If the move succeeds but
 /// removing the staging source fails, the dest file is kept (it's the correct
 /// data) and a warning names the orphaned source.
 fn move_file(src: &std::path::Path, dest: &std::path::Path) -> Result<(), Status> {
@@ -3684,7 +3689,7 @@ fn move_file(src: &std::path::Path, dest: &std::path::Path) -> Result<(), Status
             )))
         }
     }
-    match std::fs::hard_link(src, dest) {
+    let link_error = match std::fs::hard_link(src, dest) {
         Ok(()) => {
             remove_moved_source(src, dest);
             return Ok(());
@@ -3700,14 +3705,14 @@ fn move_file(src: &std::path::Path, dest: &std::path::Path) -> Result<(), Status
         // Another filesystem, or a link the kernel refuses (Linux's
         // `fs.protected_hardlinks` refuses one to a file the caller does not own
         // and cannot write, and staged files are 0o440): copy instead.
-        Err(_) => {}
-    }
+        Err(e) => e,
+    };
     copy_no_replace(src, dest).map_err(|e| {
         if e.kind() == std::io::ErrorKind::AlreadyExists {
             refused()
         } else {
             Status::internal(format!(
-                "cross-fs copy failed {} → {}: {e}",
+                "copy failed {} → {} (the hard link was refused: {link_error}): {e}",
                 src.display(),
                 dest.display()
             ))
@@ -3750,8 +3755,17 @@ fn rename_no_replace(src: &std::path::Path, dest: &std::path::Path) -> std::io::
             return Ok(true);
         }
         let e = std::io::Error::last_os_error();
+        // Another filesystem, or one without the flag. ENOTSUP and EOPNOTSUPP
+        // are one value on Linux and two on macOS.
+        let unsupported = [
+            libc::EXDEV,
+            libc::EINVAL,
+            libc::ENOSYS,
+            libc::ENOTSUP,
+            libc::EOPNOTSUPP,
+        ];
         match e.raw_os_error() {
-            Some(libc::EXDEV | libc::EINVAL | libc::ENOSYS | libc::ENOTSUP) => Ok(false),
+            Some(n) if unsupported.contains(&n) => Ok(false),
             _ => Err(e),
         }
     }
@@ -3768,10 +3782,14 @@ fn rename_no_replace(src: &std::path::Path, dest: &std::path::Path) -> std::io::
 fn copy_no_replace(src: &std::path::Path, dest: &std::path::Path) -> std::io::Result<()> {
     let mut from = std::fs::File::open(src)?;
     let permissions = from.metadata()?.permissions();
-    let mut to = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(dest)?;
+    let mut to = {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(permissions.mode())
+            .open(dest)?
+    };
     let copied =
         std::io::copy(&mut from, &mut to).and_then(|_| std::fs::set_permissions(dest, permissions));
     if let Err(e) = copied {

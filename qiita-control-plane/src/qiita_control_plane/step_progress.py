@@ -16,8 +16,8 @@ connection so a caller can fold a progress write into a larger transaction.
 Recovery reads these rows via `load_step_progress` to decide,
 for a non-terminal ticket, which entries already completed (skip + rebuild
 `bound` from disk) and which to resume. A row is read for the entry at its
-`step_index` only while that entry still carries its `step_name`
-(`check_step_progress`): the action's `steps:` list is edited in place and
+`step_index` only while that entry still carries its `step_name` and is of the
+kind that wrote it (`check_step_progress`): the action's `steps:` list is edited in place and
 re-synced without a version bump, so a position recorded before an edit can
 name a different entry after it.
 """
@@ -345,7 +345,7 @@ def _resubmit_advice(action_id: str) -> str:
         # The block planner refuses a fresh plan for a sample whose mask gate is
         # still pending (`block_planner.BlockMaskResubmitError`), so a new block
         # ticket for the same mask cannot be submitted.
-        return "re-mask its samples under a new mask version instead"
+        return "re-mask its prep_samples under a new mask version instead"
     return "submit a new ticket instead"
 
 

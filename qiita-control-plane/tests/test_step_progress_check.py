@@ -72,9 +72,16 @@ def test_a_row_the_entry_at_its_position_does_not_match_is_refused(entries):
     assert message.endswith("submit a new ticket instead.")
 
 
+def test_a_step_row_at_an_action_entry_is_refused():
+    with pytest.raises(step_progress.StepProgressMismatch, match="'hash' at step 0"):
+        step_progress.check_step_progress(
+            7, "some-action", _ROWS, [_action_entry("hash"), _action_entry("load")]
+        )
+
+
 def test_a_refused_block_mask_ticket_is_told_to_re_mask():
     """A fresh block plan is refused for a sample whose mask gate is pending, so a
     block-mask ticket is not told to submit a new ticket."""
     with pytest.raises(step_progress.StepProgressMismatch) as raised:
         step_progress.check_step_progress(7, BLOCK_MASK_ACTION_ID, _ROWS, [_step_entry("hash")])
-    assert str(raised.value).endswith("re-mask its samples under a new mask version instead.")
+    assert str(raised.value).endswith("re-mask its prep_samples under a new mask version instead.")

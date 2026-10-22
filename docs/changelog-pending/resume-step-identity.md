@@ -8,8 +8,8 @@
   at its position, by name and by kind (`step:` or `action:`). A ticket with a row
   that does not is refused by `POST /work-ticket/{idx}/run` with a 409 naming that
   row, and fails at `submission` if a restart resumes it; submit a new ticket for it
-  instead, or for a `read-mask-block` ticket, re-mask its samples under a new mask
-  version. An edit that puts another step of the same name at a recorded position is
+  instead, or for a `read-mask-block` ticket, re-mask its prep_samples under a new
+  mask version. An edit that puts another step of the same name at a recorded position is
   not caught.
 - **A resumed ticket no longer fails at a completed step whose files
   `register-files` moved (#NNN).** On a resume or redrive, a completed SLURM step's
