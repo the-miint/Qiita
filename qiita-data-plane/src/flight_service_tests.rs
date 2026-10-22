@@ -285,6 +285,41 @@ fn delete_reference_drops_orphans_keeps_shared() {
     ));
 }
 
+/// A reference delete whose COMMIT answer is lost succeeds and reports the rows
+/// it deleted, rather than the zeros a re-run of the deletes would count.
+#[test]
+#[serial_test::serial]
+#[cfg(feature = "integration")]
+fn delete_reference_whose_commit_answer_is_lost_reports_what_it_deleted() {
+    let connstr = crate::test_catalog::connstr();
+    let data_path = crate::test_catalog::data_path();
+    let conn = Connection::open_in_memory().unwrap();
+    ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
+    setup_full_lake(&conn);
+    let ref_idx: i64 = 911_000;
+    conn.execute_batch(&format!(
+        "INSERT INTO qiita_lake.reference_membership VALUES ({ref_idx}, 911010), ({ref_idx}, 911011);"
+    ))
+    .unwrap();
+    let (proxied, cut) = catalog_that_loses_a_commit_answer(&connstr);
+
+    let counts = delete_reference(&attached_writer(&proxied, &data_path), ref_idx)
+        .expect("a reference delete whose COMMIT answer was lost failed");
+
+    assert!(cut.load(std::sync::atomic::Ordering::SeqCst));
+    assert_eq!(counts["membership_deleted"], 2);
+    let left: i64 = conn
+        .query_row(
+            &format!(
+                "SELECT count(*) FROM qiita_lake.reference_membership WHERE reference_idx = {ref_idx}"
+            ),
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(left, 0);
+}
+
 /// `delete_mask` drops exactly the target mask's `read_mask` rows, leaves a
 /// different mask untouched, and is idempotent: a second delete of the same
 /// mask_idx succeeds and reports `rows_deleted: 0`.
@@ -2243,6 +2278,180 @@ fn register_files_fails_closed_on_a_destination_there_before_it_moves() {
     assert!(staging.path().join("reference_membership.parquet").exists());
     assert!(staging.path().join("second.parquet").exists());
     std::fs::remove_file(&taken).unwrap();
+}
+
+/// A TCP proxy in front of the test catalog's Postgres. Once DuckLake sends its
+/// commit's catalog write (the `ducklake_snapshot` insert), the proxy drops
+/// Postgres's answer to the COMMIT that follows and closes that connection, so
+/// the commit is in the catalog and the client is told it failed. Returns the
+/// connection string through the proxy, and whether it has cut a connection.
+/// Only the first such COMMIT is cut.
+#[cfg(feature = "integration")]
+fn catalog_that_loses_a_commit_answer(
+    connstr: &str,
+) -> (String, std::sync::Arc<std::sync::atomic::AtomicBool>) {
+    use std::io::{Read, Write as _};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let field = |key: &str| {
+        connstr
+            .split_whitespace()
+            .find_map(|kv| kv.strip_prefix(&format!("{key}=")))
+            .map(str::to_string)
+    };
+    let upstream = format!(
+        "{}:{}",
+        field("host").unwrap_or_else(|| "localhost".into()),
+        field("port").unwrap_or_else(|| "5432".into())
+    );
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let proxied = connstr
+        .split_whitespace()
+        .filter(|kv| {
+            !kv.starts_with("host=") && !kv.starts_with("port=") && !kv.starts_with("sslmode=")
+        })
+        .chain(["host=127.0.0.1", "sslmode=disable"])
+        .collect::<Vec<_>>()
+        .join(" ")
+        + &format!(" port={port}");
+    let cut = Arc::new(AtomicBool::new(false));
+
+    // Complete protocol messages off the front of `buf`. Every message is typed
+    // except the client's first (startup), which `untyped` names.
+    fn split(buf: &mut Vec<u8>, untyped: &mut bool) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        loop {
+            let (start, len) = if *untyped { (0, 4) } else { (1, 5) };
+            if buf.len() < len {
+                break;
+            }
+            let n = u32::from_be_bytes(buf[start..start + 4].try_into().unwrap()) as usize + start;
+            if buf.len() < n {
+                break;
+            }
+            out.push(buf.drain(..n).collect());
+            *untyped = false;
+        }
+        out
+    }
+
+    let cut_flag = cut.clone();
+    std::thread::spawn(move || {
+        for client in listener.incoming() {
+            let Ok(client) = client else { return };
+            let Ok(server) = std::net::TcpStream::connect(&upstream) else {
+                return;
+            };
+            let armed = Arc::new(AtomicBool::new(false));
+            let (mut c_read, mut c_write) = (client.try_clone().unwrap(), client);
+            let (mut s_read, mut s_write) = (server.try_clone().unwrap(), server);
+            let client_armed = armed.clone();
+            std::thread::spawn(move || {
+                let (mut buf, mut untyped, mut chunk) = (Vec::new(), true, [0u8; 65536]);
+                while let Ok(n @ 1..) = c_read.read(&mut chunk) {
+                    buf.extend_from_slice(&chunk[..n]);
+                    for m in split(&mut buf, &mut untyped) {
+                        if m.windows(17).any(|w| w == b"ducklake_snapshot") {
+                            client_armed.store(true, Ordering::SeqCst);
+                        }
+                        if s_write.write_all(&m).is_err() {
+                            return;
+                        }
+                    }
+                }
+                let _ = s_write.shutdown(std::net::Shutdown::Both);
+            });
+            let cut_flag = cut_flag.clone();
+            std::thread::spawn(move || {
+                let (mut buf, mut untyped, mut chunk) = (Vec::new(), false, [0u8; 65536]);
+                while let Ok(n @ 1..) = s_read.read(&mut chunk) {
+                    buf.extend_from_slice(&chunk[..n]);
+                    for m in split(&mut buf, &mut untyped) {
+                        if armed.load(Ordering::SeqCst)
+                            && m[0] == b'C'
+                            && &m[5..] == b"COMMIT\0"
+                            && !cut_flag.swap(true, Ordering::SeqCst)
+                        {
+                            let _ = c_write.shutdown(std::net::Shutdown::Both);
+                            let _ = s_read.shutdown(std::net::Shutdown::Both);
+                            return;
+                        }
+                        if c_write.write_all(&m).is_err() {
+                            return;
+                        }
+                    }
+                }
+                let _ = c_write.shutdown(std::net::Shutdown::Both);
+            });
+        }
+    });
+    (proxied, cut)
+}
+
+/// Why `transact_with_retry` reads the catalog before re-running: a DuckLake
+/// COMMIT whose answer from the catalog is lost reports an error, and the rows
+/// it added are there.
+#[test]
+#[serial_test::serial]
+#[cfg(feature = "integration")]
+fn ducklake_commit_error_after_the_catalog_committed() {
+    let connstr = crate::test_catalog::connstr();
+    let data_path = crate::test_catalog::data_path();
+    let ref_idx: i64 = 983_000;
+    prepare_membership_table(&connstr, &data_path, ref_idx);
+    let (staging, _payload) = seed_membership_registration(ref_idx, ref_idx);
+    // In the lake's data path, where it outlives the test as a registered file must.
+    let lake_file = std::path::Path::new(&data_path)
+        .join("reference_membership")
+        .join(format!("commit-answer-lost-{}.parquet", std::process::id()));
+    std::fs::create_dir_all(lake_file.parent().unwrap()).unwrap();
+    move_file(
+        &staging.path().join("reference_membership.parquet"),
+        &lake_file,
+    )
+    .unwrap();
+    let (proxied, cut) = catalog_that_loses_a_commit_answer(&connstr);
+    let conn = attached_conn(&proxied, &data_path);
+
+    conn.execute_batch("BEGIN TRANSACTION").unwrap();
+    conn.execute(
+        "CALL ducklake_add_data_files('qiita_lake', 'reference_membership', ?)",
+        [lake_file.to_str().unwrap()],
+    )
+    .unwrap();
+    conn.execute_batch("COMMIT")
+        .expect_err("a COMMIT whose answer was lost succeeded");
+
+    assert!(cut.load(std::sync::atomic::Ordering::SeqCst));
+    assert_eq!(membership_rows(&connstr, &data_path, ref_idx), 2);
+}
+
+/// A registration whose COMMIT answer is lost succeeds and registers its file
+/// once, rather than adding it again on a re-run.
+#[test]
+#[serial_test::serial]
+#[cfg(feature = "integration")]
+fn register_files_whose_commit_answer_is_lost_registers_once() {
+    let connstr = crate::test_catalog::connstr();
+    let data_path = crate::test_catalog::data_path();
+    let ref_idx: i64 = 984_000;
+    let ticket: i64 = 984_000_000 + std::process::id() as i64;
+    prepare_membership_table(&connstr, &data_path, ref_idx);
+    let (_staging, payload) = seed_membership_registration(ref_idx, ticket);
+    let (proxied, cut) = catalog_that_loses_a_commit_answer(&connstr);
+
+    let registration = register_files(
+        &attached_writer(&proxied, &data_path),
+        &data_path,
+        std::path::Path::new("/"),
+        &payload,
+    )
+    .expect("a registration whose COMMIT answer was lost failed");
+
+    assert!(cut.load(std::sync::atomic::Ordering::SeqCst));
+    assert_eq!(registration.registered.len(), 1);
+    assert_eq!(membership_rows(&connstr, &data_path, ref_idx), 2);
 }
 
 /// The reason a replay checks the catalog before registering: in the DuckLake

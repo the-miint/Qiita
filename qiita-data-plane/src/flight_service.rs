@@ -2284,11 +2284,20 @@ fn take_registration_lock(conn: &LakeWriter) -> Result<(), Status> {
 /// `body` must therefore be idempotent across attempts — each one re-reads a
 /// fresh snapshot after DuckLake rolled the last one back. `salt` only spreads
 /// the backoff (see `lake_commit_backoff`).
+///
+/// A COMMIT that reports an error may still have landed: when the catalog's
+/// connection drops after Postgres committed, before its answer arrives, the
+/// COMMIT errors and the rows are there, and a re-run of an add registers them
+/// again (`ducklake_commit_error_after_the_catalog_committed`). So before any
+/// re-run, `landed` reads the catalog: given the attempt's value it says whether
+/// that attempt's commit is there, and if it is the value is returned. When
+/// `landed` cannot tell, the call fails with both errors rather than re-running.
 fn transact_with_retry<T>(
     conn: &LakeWriter,
     what: &str,
     salt: i64,
     mut body: impl FnMut() -> Result<T, Status>,
+    mut landed: impl FnMut(&T) -> Result<bool, Status>,
 ) -> Result<T, Status> {
     let deadline = std::time::Instant::now() + LAKE_COMMIT_BUDGET;
     let mut attempt: u32 = 0;
@@ -2308,6 +2317,17 @@ fn transact_with_retry<T>(
             Ok(()) => return Ok(value),
             Err(e) => e,
         };
+        match landed(&value) {
+            Ok(true) => return Ok(value),
+            Ok(false) => {}
+            Err(e) => {
+                return Err(Status::internal(format!(
+                    "failed to commit {what}: {commit_error}; whether the commit \
+                     landed could not be read: {}",
+                    e.message()
+                )))
+            }
+        }
 
         if std::time::Instant::now() >= deadline {
             return Err(Status::internal(format!(
@@ -2632,6 +2652,19 @@ fn register_files(
                 replaced,
             })
         },
+        // One transaction adds every file, so the catalog lists all of them or
+        // none; a count in between is a registration this one did not make.
+        |_| {
+            let listed = registered_data_files(conn, &placed)?.len();
+            match listed {
+                0 => Ok(false),
+                n if n == placed.len() => Ok(true),
+                n => Err(Status::internal(format!(
+                    "the catalog lists {n} of the {} files",
+                    placed.len()
+                ))),
+            }
+        },
     );
 
     registration.map_err(|e| return_to_staging(conn, &placed, e))
@@ -2902,51 +2935,77 @@ fn delete_reference(conn: &LakeWriter, reference_idx: i64) -> Result<serde_json:
     // Sequence/chunk deletes run BEFORE the membership AND annotation deletes: the
     // orphan subquery reads both of this reference's claim tables, so both must
     // still be present.
-    let counts = transact_with_retry(conn, "the reference delete", reference_idx, || {
-        take_registration_lock(conn)?;
-        let sequences_deleted = exec(
-            &format!("DELETE FROM qiita_lake.reference_sequences WHERE {orphan_filter}"),
-            &[reference_idx, reference_idx, reference_idx, reference_idx],
-        )?;
-        let chunks_deleted = exec(
-            &format!("DELETE FROM qiita_lake.reference_sequence_chunks WHERE {orphan_filter}"),
-            &[reference_idx, reference_idx, reference_idx, reference_idx],
-        )?;
-        let membership_deleted = exec(
-            "DELETE FROM qiita_lake.reference_membership WHERE reference_idx = ?",
-            &[reference_idx],
-        )?;
-        let taxonomy_deleted = exec(
-            "DELETE FROM qiita_lake.reference_taxonomy WHERE reference_idx = ?",
-            &[reference_idx],
-        )?;
-        let phylogeny_deleted = exec(
-            "DELETE FROM qiita_lake.reference_phylogeny WHERE reference_idx = ?",
-            &[reference_idx],
-        )?;
-        let placements_deleted = exec(
-            "DELETE FROM qiita_lake.reference_placements WHERE reference_idx = ?",
-            &[reference_idx],
-        )?;
-        // Annotation ROWS delete by reference_idx (they carry it directly), not by
-        // the orphan filter — but they must go AFTER the sequence/chunk deletes
-        // above, which read this table as one of the two claim sets in
-        // `orphan_filter`. The annotated FEATURES themselves are GC'd through that
-        // filter, like any other orphan.
-        let annotations_deleted = exec(
-            "DELETE FROM qiita_lake.reference_annotation WHERE reference_idx = ?",
-            &[reference_idx],
-        )?;
-        Ok(serde_json::json!({
-            "sequences_deleted": sequences_deleted,
-            "chunks_deleted": chunks_deleted,
-            "membership_deleted": membership_deleted,
-            "taxonomy_deleted": taxonomy_deleted,
-            "phylogeny_deleted": phylogeny_deleted,
-            "placements_deleted": placements_deleted,
-            "annotations_deleted": annotations_deleted,
-        }))
-    })?;
+    let counts = transact_with_retry(
+        conn,
+        "the reference delete",
+        reference_idx,
+        || {
+            take_registration_lock(conn)?;
+            let sequences_deleted = exec(
+                &format!("DELETE FROM qiita_lake.reference_sequences WHERE {orphan_filter}"),
+                &[reference_idx, reference_idx, reference_idx, reference_idx],
+            )?;
+            let chunks_deleted = exec(
+                &format!("DELETE FROM qiita_lake.reference_sequence_chunks WHERE {orphan_filter}"),
+                &[reference_idx, reference_idx, reference_idx, reference_idx],
+            )?;
+            let membership_deleted = exec(
+                "DELETE FROM qiita_lake.reference_membership WHERE reference_idx = ?",
+                &[reference_idx],
+            )?;
+            let taxonomy_deleted = exec(
+                "DELETE FROM qiita_lake.reference_taxonomy WHERE reference_idx = ?",
+                &[reference_idx],
+            )?;
+            let phylogeny_deleted = exec(
+                "DELETE FROM qiita_lake.reference_phylogeny WHERE reference_idx = ?",
+                &[reference_idx],
+            )?;
+            let placements_deleted = exec(
+                "DELETE FROM qiita_lake.reference_placements WHERE reference_idx = ?",
+                &[reference_idx],
+            )?;
+            // Annotation ROWS delete by reference_idx (they carry it directly), not by
+            // the orphan filter — but they must go AFTER the sequence/chunk deletes
+            // above, which read this table as one of the two claim sets in
+            // `orphan_filter`. The annotated FEATURES themselves are GC'd through that
+            // filter, like any other orphan.
+            let annotations_deleted = exec(
+                "DELETE FROM qiita_lake.reference_annotation WHERE reference_idx = ?",
+                &[reference_idx],
+            )?;
+            Ok(serde_json::json!({
+                "sequences_deleted": sequences_deleted,
+                "chunks_deleted": chunks_deleted,
+                "membership_deleted": membership_deleted,
+                "taxonomy_deleted": taxonomy_deleted,
+                "phylogeny_deleted": phylogeny_deleted,
+                "placements_deleted": placements_deleted,
+                "annotations_deleted": annotations_deleted,
+            }))
+        },
+        |_| {
+            // The deletes commit together, so none of the reference's rows left in
+            // the tables keyed by it means this attempt's commit is there.
+            let mut remaining = 0i64;
+            for table in [
+                "reference_membership",
+                "reference_taxonomy",
+                "reference_phylogeny",
+                "reference_placements",
+                "reference_annotation",
+            ] {
+                remaining += conn
+                    .query_row(
+                        &format!("SELECT count(*) FROM qiita_lake.{table} WHERE reference_idx = ?"),
+                        [reference_idx],
+                        |r| r.get::<_, i64>(0),
+                    )
+                    .map_err(|e| Status::internal(format!("failed to count {table} rows: {e}")))?;
+            }
+            Ok(remaining == 0)
+        },
+    )?;
 
     let mut out = counts;
     out["reference_idx"] = serde_json::json!(reference_idx);

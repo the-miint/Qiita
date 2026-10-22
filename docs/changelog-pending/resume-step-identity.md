@@ -27,6 +27,18 @@
   over. A replay that finds the files moved but not registered still fails, since the
   first call may still be running.
 
+- **A lake registration whose commit answer is lost no longer registers its files
+  twice (#NNN).** When the data plane's connection to the DuckLake catalog drops
+  after the catalog committed, the COMMIT reports an error although the rows are
+  there, and the data plane's commit retry re-ran the registration, adding every
+  file's rows a second time. Before re-running it now reads the catalog, and returns
+  the first attempt's result when its commit is there. A reference delete does the
+  same, so it reports the rows it deleted rather than zeros.
+- **Two `register-files` calls placing the same lake file can no longer both move
+  it (#NNN).** The data plane refused an existing destination by checking before the
+  move, so two calls could both pass the check and the second replace the first's
+  file; the move itself now refuses it.
+
 ### Changed
 
 - **`register-files` is re-run on an unavailable data plane (#NNN).** It is re-run on
