@@ -73,10 +73,12 @@ def test_a_row_the_entry_at_its_position_does_not_match_is_refused(entries):
 
 
 def test_a_step_row_at_an_action_entry_is_refused():
-    with pytest.raises(step_progress.StepProgressMismatch, match="'hash' at step 0"):
+    with pytest.raises(step_progress.StepProgressMismatch) as raised:
         step_progress.check_step_progress(
             7, "some-action", _ROWS, [_action_entry("hash"), _action_entry("load")]
         )
+    assert "'hash' at step 0" in str(raised.value)
+    assert "'load'" not in str(raised.value)
 
 
 def test_a_refused_block_mask_ticket_is_told_to_re_mask():

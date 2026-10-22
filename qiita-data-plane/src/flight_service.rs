@@ -3777,19 +3777,16 @@ fn rename_no_replace(src: &std::path::Path, dest: &std::path::Path) -> std::io::
 }
 
 /// Copy `src` to a `dest` this call creates, refused when `dest` exists. A copy
-/// that fails partway removes the `dest` it created, so a failed move leaves no
-/// partial lake file behind.
+/// that fails partway removes the `dest` it created; if that removal fails too, a
+/// warning names the partial file.
 fn copy_no_replace(src: &std::path::Path, dest: &std::path::Path) -> std::io::Result<()> {
     let mut from = std::fs::File::open(src)?;
     let permissions = from.metadata()?.permissions();
-    let mut to = {
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(permissions.mode())
-            .open(dest)?
-    };
+    // Created writable; the source's mode is applied once the bytes are written.
+    let mut to = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(dest)?;
     let copied =
         std::io::copy(&mut from, &mut to).and_then(|_| std::fs::set_permissions(dest, permissions));
     if let Err(e) = copied {

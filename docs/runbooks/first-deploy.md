@@ -268,12 +268,12 @@ Verification:
 stat -c '%n  owner=%U  group=%G  mode=%a  device=%d' <persistent>/ducklake <scratch>/staging <scratch>/duckdb-spill <scratch>/ticket
 ```
 
-Watch the **device numbers**: if `<persistent>/ducklake` and
-`<scratch>/staging` are on different volumes, the DP copies each registered
-file instead of moving it. Works correctly, just slower; one volume avoids the
-copy only under the conditions in [storage](../architecture/storage.md)
-("Same-FS preference"). Flag to infra if you want the fast path; not blocking
-otherwise.
+Watch the **device numbers**: if `<persistent>/ducklake` is on a different
+volume from `<scratch>/ticket` or `<scratch>/staging` (registration moves files
+out of both), the DP copies each registered file instead of moving it. Works
+correctly, just slower; one volume avoids the copy only under the conditions in
+[storage](../architecture/storage.md) ("Same-FS preference"). Flag to infra if
+you want the fast path; not blocking otherwise.
 
 ### 0.4 nginx + TLS + DNS
 
