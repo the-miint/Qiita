@@ -12,9 +12,11 @@ different questions, and the tests below are organized by which:
     check: every consumer already proceeds only on `'completed'`.
 """
 
+import itertools
 import json
 import secrets
 
+import asyncpg
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
@@ -554,3 +556,48 @@ async def test_lifecycle_patches_require_the_lifecycle_scope(
     assert status_resp.status_code == 403
     assert sample_resp.status_code == 403
     assert json.loads(status_resp.text)["detail"]
+
+
+_PARTIAL_PROVENANCE = [
+    pytest.param(subset, id="+".join(subset))
+    for n in (1, 2)
+    for subset in itertools.combinations(("at", "by", "reason"), n)
+]
+
+
+def _set_clause(columns, subset, principal_idx):
+    values = {"at": "now()", "by": str(principal_idx), "reason": "'why'"}
+    return ", ".join(f"{columns[f]} = {values[f]}" for f in subset)
+
+
+_DEPRECATION = {"at": "deprecated_at", "by": "deprecated_by_idx", "reason": "deprecation_reason"}
+_INVALIDATION = {
+    "at": "invalidated_at",
+    "by": "invalidated_by_idx",
+    "reason": "invalidation_reason",
+}
+
+
+@pytest.mark.parametrize("subset", _PARTIAL_PROVENANCE)
+async def test_a_live_config_cannot_hold_some_deprecation_fields(postgres_pool, lifecycle, subset):
+    """A live row may carry none of the provenance fields, not merely not all of them."""
+    assignments = _set_clause(_DEPRECATION, subset, lifecycle["principal_idx"])
+    with pytest.raises(asyncpg.CheckViolationError):
+        await postgres_pool.execute(
+            f"UPDATE qiita.mask_definition SET {assignments} WHERE mask_idx = $1",
+            lifecycle["mask_idx"],
+        )
+
+
+@pytest.mark.parametrize("state", ["completed", "pending"])
+@pytest.mark.parametrize("subset", _PARTIAL_PROVENANCE)
+async def test_a_live_run_cannot_hold_some_invalidation_fields(
+    postgres_pool, lifecycle, state, subset
+):
+    assignments = _set_clause(_INVALIDATION, subset, lifecycle["principal_idx"])
+    with pytest.raises(asyncpg.CheckViolationError):
+        await postgres_pool.execute(
+            f"UPDATE qiita.mask_sample SET {assignments} WHERE mask_idx = $1 AND state = $2",
+            lifecycle["mask_idx"],
+            state,
+        )

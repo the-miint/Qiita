@@ -48,6 +48,8 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
 ### 3. Migrations
 
 - `[operator]` (#731) `make migrate` applies `20261021000000_sequenced_sample_download_failure.sql` (two nullable columns and a both-or-neither CHECK on `qiita.sequenced_sample`; no backfill).
+- `[operator]` (#728) `make migrate` applies `20261022000000_lifecycle_provenance_fields.sql` (four lifecycle CHECKs tightened: a live row may hold none of its provenance fields; `mask_definition`, `mask_sample`, `processing`, `assembly_sample`). It fails atomically if a live row holds one or two of them, so run first; any row listed needs its stray fields cleared or all three set:
+  `SELECT 'mask_definition', mask_idx::text FROM qiita.mask_definition WHERE num_nonnulls(deprecated_at, deprecated_by_idx, deprecation_reason) IN (1,2) UNION ALL SELECT 'mask_sample', mask_idx||'/'||prep_sample_idx FROM qiita.mask_sample WHERE num_nonnulls(invalidated_at, invalidated_by_idx, invalidation_reason) IN (1,2) UNION ALL SELECT 'processing', processing_idx::text FROM qiita.processing WHERE num_nonnulls(deprecated_at, deprecated_by_idx, deprecation_reason) IN (1,2) UNION ALL SELECT 'assembly_sample', processing_idx||'/'||prep_sample_idx FROM qiita.assembly_sample WHERE num_nonnulls(invalidated_at, invalidated_by_idx, invalidation_reason) IN (1,2);`
 
 ### 4. Deploy
 
