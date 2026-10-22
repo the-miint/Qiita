@@ -304,8 +304,9 @@ async def test_enumerate_pool_samples_excludes_flagged(postgres_pool):
                     work_ticket_idx=None,
                 )
 
-            samples = await _enumerate_pool_samples(conn, pool_idx)
-            assert [s.prep_sample_idx for s in samples] == [healthy_ps]
+            ranged, rangeless = await _enumerate_pool_samples(conn, pool_idx)
+            assert [s.prep_sample_idx for s in ranged] == [healthy_ps]
+            assert rangeless == []
         finally:
             await tr.rollback()
 
