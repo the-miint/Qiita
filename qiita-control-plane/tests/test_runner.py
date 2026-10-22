@@ -28,7 +28,6 @@ from qiita_common.actions import LONG_READ_ASSEMBLY_ACTION_ID
 from qiita_common.api_paths import LibraryPrimitive
 from qiita_common.backend_failure import BackendFailure, FailureKind, StepNoData
 from qiita_common.models import (
-    RECOVERED_RAW_STATE,
     ComputeTarget,
     FoundJobWire,
     ScopeTargetKind,
@@ -5462,7 +5461,7 @@ async def test_resume_multi_step_rebuilds_bound_and_skips_completed_action(
     # The reconstruct is marked as a re-read, so the orchestrator checks the
     # declared outputs rather than files a later step may have moved; the fresh
     # step's result is not.
-    assert [s.raw_state for s in backend.result_statuses] == [RECOVERED_RAW_STATE, "COMPLETED"]
+    assert [s.recovered for s in backend.result_statuses] == [True, False]
     # All three entries end completed in the progress table.
     rows = await step_progress.load_step_progress(postgres_pool, multi_step_ticket)
     by_index = {r.step_index: r for r in rows}

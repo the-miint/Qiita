@@ -1590,7 +1590,7 @@ def _build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_FANOUT_MAX_INFLIGHT,
         help=(
             "Redriven tickets allowed to be pending, queued or processing at once;"
-            " the next waits for one to finish (default: the control plane's"
+            " the next waits for one to finish (default: the control plane's default"
             f" fan-out cap, {DEFAULT_FANOUT_MAX_INFLIGHT})."
         ),
     )

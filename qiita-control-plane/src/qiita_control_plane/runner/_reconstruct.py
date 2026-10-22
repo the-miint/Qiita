@@ -25,7 +25,6 @@ from qiita_common.data_plane_errors import (
     is_data_plane_transient,
 )
 from qiita_common.models import (
-    RECOVERED_RAW_STATE,
     TERMINAL_STEP_PROGRESS_STATES,
     ComputeTarget,
     ScopeTargetKind,
@@ -170,9 +169,8 @@ async def _reconstruct_completed_outputs(
 
     A `step:` entry re-reads its output manifest through `result_step`
     (reconstructing a handle from the progress row's job id + the deterministic
-    per-attempt `output`/`logs` dirs), marked `RECOVERED_RAW_STATE` so the
-    orchestrator checks the manifest and the declared outputs rather than every
-    listed file. This doubles as the filesystem tiebreaker for a now-purged job:
+    per-attempt `output`/`logs` dirs), marked `recovered` (see
+    `verify_container_output`). This doubles as the filesystem tiebreaker for a now-purged job:
     a valid manifest yields the outputs; a missing / broken one, or a declared
     output that is gone, raises CONTRACT_VIOLATION → the resumed workflow fails,
     as it should when a completed step's output has vanished from scratch.
@@ -203,7 +201,7 @@ async def _reconstruct_completed_outputs(
         output_path=str(step_output_dir(attempt_workspace)),
         logs_path=str(step_logs_dir(attempt_workspace)),
     )
-    status = StepStatusWire(status=StepStatus.COMPLETED, raw_state=RECOVERED_RAW_STATE)
+    status = StepStatusWire(status=StepStatus.COMPLETED, raw_state="RECOVERED", recovered=True)
     raw_outputs = await _result_with_infra_retry(
         backend_client,
         handle,
@@ -266,7 +264,7 @@ async def _reconstruct_plan_shards_outputs(
     return {ROUTER_PENDING_BINDING: True, SHARD_MAPPING_BINDING: mapping_path}
 
 
-def _action_failure_is_retriable(entry_name: str, exc: BaseException) -> bool:
+def _action_failure_is_retriable(exc: BaseException) -> bool:
     """True if an `action:` entry's failure is a data-plane one the next attempt can
     clear, so the retry loop re-runs the entry.
 
@@ -411,7 +409,7 @@ async def _dispatch_action(
         )
         raise
     except Exception as exc:
-        if _action_failure_is_retriable(entry.name, exc):
+        if _action_failure_is_retriable(exc):
             failure = BackendFailure(
                 kind=FailureKind.DATA_PLANE_TRANSIENT,
                 stage=WorkTicketFailureStage.STEP_RUN,

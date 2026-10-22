@@ -322,7 +322,6 @@ from qiita_common.models.sequencing import (
     merge_qc_reports,
 )
 from qiita_common.models.step import (
-    RECOVERED_RAW_STATE,
     AlignmentCohortDoGetTicketRequest,
     AlignmentDoGetTicketRequest,
     AssemblyDoGetTicketRequest,
@@ -580,7 +579,6 @@ __all__ = [
     "StepResultResponse",
     "StepStatusRequest",
     "StepStatusWire",
-    "RECOVERED_RAW_STATE",
     "StepSubmitRequest",
     # Upload.
     "EmailReceiptStatus",

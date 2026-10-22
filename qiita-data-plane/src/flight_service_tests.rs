@@ -2083,6 +2083,55 @@ fn register_files_that_fails_after_its_moves_returns_the_files_to_staging() {
     assert_eq!(membership_rows(&connstr, &data_path, ref_idx), 2);
 }
 
+/// A destination already there when the call starts is read as an earlier call's
+/// move, so the call fails closed before moving anything, and leaves that file
+/// as it was. (A destination that appears between that check and the move is
+/// refused by `move_file`, and `register_files` leaves it out of the move back.)
+#[test]
+#[serial_test::serial]
+#[cfg(feature = "integration")]
+fn register_files_leaves_a_destination_it_did_not_place() {
+    let connstr = crate::test_catalog::connstr();
+    let data_path = crate::test_catalog::data_path();
+    let ref_idx: i64 = 982_000_000 + std::process::id() as i64;
+    prepare_membership_table(&connstr, &data_path, ref_idx);
+    let (staging, mut payload) = seed_membership_registration(ref_idx, ref_idx);
+    std::fs::copy(
+        staging.path().join("reference_membership.parquet"),
+        staging.path().join("second.parquet"),
+    )
+    .unwrap();
+    payload.files.insert(
+        "second.parquet".to_string(),
+        "reference_membership".to_string(),
+    );
+    let scope = staging_scope(&payload.staging_dir, std::path::Path::new("/"));
+    let taken = std::path::Path::new(&data_path)
+        .join("reference_membership")
+        .join(lake_dest_filename(ref_idx, &scope, "second.parquet"));
+    std::fs::create_dir_all(taken.parent().unwrap()).unwrap();
+    std::fs::write(&taken, b"not ours").unwrap();
+
+    let err = register_files(
+        &attached_writer(&connstr, &data_path),
+        &data_path,
+        std::path::Path::new("/"),
+        &payload,
+    )
+    .expect_err("a registration whose destination was taken succeeded");
+
+    assert_eq!(
+        err.code(),
+        tonic::Code::FailedPrecondition,
+        "{}",
+        err.message()
+    );
+    assert_eq!(std::fs::read(&taken).unwrap(), b"not ours");
+    assert!(staging.path().join("reference_membership.parquet").exists());
+    assert!(staging.path().join("second.parquet").exists());
+    std::fs::remove_file(&taken).unwrap();
+}
+
 /// The reason a replay checks the catalog before registering: in the DuckLake
 /// we ship, adding a path the table already holds succeeds and counts its rows
 /// twice.
@@ -2211,6 +2260,59 @@ fn ducklake_transaction_reads_the_snapshot_of_its_first_statement() {
 
     assert_eq!(n, 2);
     assert_eq!(membership_rows(&connstr, &data_path, ref_idx), 0);
+}
+
+/// What `return_to_staging`'s catalog check rests on: after a COMMIT that fails,
+/// the connection is out of its transaction, and a read on it sees the catalog as
+/// it now is — here, a registration another connection committed meanwhile.
+#[test]
+#[serial_test::serial]
+#[cfg(feature = "integration")]
+fn ducklake_read_after_a_failed_commit_sees_the_current_catalog() {
+    let connstr = crate::test_catalog::connstr();
+    let data_path = crate::test_catalog::data_path();
+    let ref_idx: i64 = 981_000_000 + std::process::id() as i64;
+    let delete = "DELETE FROM qiita_lake.reference_membership WHERE reference_idx = ?";
+    prepare_membership_table(&connstr, &data_path, ref_idx);
+    let (_first_dir, first) = seed_membership_registration(ref_idx, ref_idx * 10);
+    register_files(
+        &attached_writer(&connstr, &data_path),
+        &data_path,
+        std::path::Path::new("/"),
+        &first,
+    )
+    .unwrap();
+
+    let failed = attached_conn(&connstr, &data_path);
+    failed.execute_batch("BEGIN TRANSACTION").unwrap();
+    failed.execute(delete, [ref_idx]).unwrap();
+    attached_conn(&connstr, &data_path)
+        .execute(delete, [ref_idx])
+        .unwrap();
+    let (_second_dir, second) = seed_membership_registration(ref_idx, ref_idx * 10 + 1);
+    let committed = register_files(
+        &attached_writer(&connstr, &data_path),
+        &data_path,
+        std::path::Path::new("/"),
+        &second,
+    )
+    .unwrap();
+    failed
+        .execute_batch("COMMIT")
+        .expect_err("the conflicting delete committed");
+
+    assert!(failed.is_autocommit());
+    let listed: Vec<String> = failed
+        .prepare("SELECT data_file FROM ducklake_list_files('qiita_lake', 'reference_membership')")
+        .unwrap()
+        .query_map([], |r| r.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert!(
+        listed.contains(&committed.registered[0]),
+        "the read after the failed commit missed the committed registration"
+    );
 }
 
 // --- replace-by-key against a real DuckLake catalog ---

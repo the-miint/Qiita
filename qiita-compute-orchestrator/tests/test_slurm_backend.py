@@ -23,7 +23,6 @@ import httpx
 import pytest
 from qiita_common.backend_failure import BackendFailure, FailureKind, StepNoData
 from qiita_common.models import (
-    RECOVERED_RAW_STATE,
     ComputeTarget,
     StepBaselineResources,
     StepStatus,
@@ -1081,7 +1080,7 @@ async def test_result_step_completed_returns_outputs(jwt_path, tmp_path):
 
 @pytest.mark.asyncio
 async def test_result_step_recovered_reads_a_step_whose_listed_files_were_moved(jwt_path, tmp_path):
-    """A step re-read on resume (`RECOVERED_RAW_STATE`) after a later step moved
+    """A step re-read on resume (`recovered`) after a later step moved
     the files its manifest lists — `register-files` moves its staging files into
     the lake — still yields its declared outputs. The same tree read as a fresh
     completion fails the file check, so the recovered read is what lets the
@@ -1106,7 +1105,7 @@ async def test_result_step_recovered_reads_a_step_whose_listed_files_were_moved(
         )
     outputs = await backend.result_step(
         _slurm_handle(tmp_path),
-        StepStatusInfo(status=StepStatus.COMPLETED, raw_state=RECOVERED_RAW_STATE),
+        StepStatusInfo(status=StepStatus.COMPLETED, recovered=True),
     )
 
     assert outputs == {"staging_dir": out.resolve()}
@@ -1123,7 +1122,7 @@ async def test_result_step_recovered_still_fails_on_a_missing_declared_output(jw
     with pytest.raises(BackendFailure) as ei:
         await backend.result_step(
             _slurm_handle(tmp_path),
-            StepStatusInfo(status=StepStatus.COMPLETED, raw_state=RECOVERED_RAW_STATE),
+            StepStatusInfo(status=StepStatus.COMPLETED, recovered=True),
         )
     assert ei.value.kind == FailureKind.CONTRACT_VIOLATION
     assert "points at missing path" in ei.value.reason

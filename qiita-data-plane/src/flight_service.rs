@@ -573,8 +573,9 @@ fn block_read_source(table: &str) -> Option<&'static str> {
 ///   already a data file of its table and returns the earlier registration
 ///   without writing; a replay that finds the files moved but not all
 ///   registered fails closed. A call that fails after its moves returns the
-///   files to staging (`return_to_staging`), so that state means a call still
-///   running, or one the data plane stopped mid-call.
+///   files to staging unless `return_to_staging` could not confirm that safe,
+///   so that state means a call still running, one the data plane stopped
+///   mid-call, or one whose error says it kept the files.
 /// - `delete_reference` / `delete_mask` / `delete_pool_reads` /
 ///   `delete_read_mask_block` / `delete_alignment` / `delete_alignment_block` /
 ///   `delete_alignment_sample` — logical DELETEs, idempotent against themselves:
@@ -2429,8 +2430,8 @@ fn register_files(
 
     // Tables are ensured at startup in main.rs.
 
-    // A file gone from staging is a replay of this payload: the caller lost the
-    // reply, or died before recording it, and called again. The destination name
+    // A file already at its lake destination is a replay of this payload: the
+    // caller lost the reply, or died before recording it, and called again. The destination name
     // is deterministic for the (ticket, staging dir, basename), so the replay
     // finds where the earlier call moved each file. When every file was moved and
     // is a data file of its table, the earlier call committed, and its
@@ -2450,12 +2451,12 @@ fn register_files(
         }
         return Err(Status::failed_precondition(format!(
             "an earlier register_files call for work_ticket {} from {} moved {} of {} \
-             files into the lake and registered {} of them; it may still be \
-             registering them. A call that fails after its moves returns the files \
-             to staging, so this one did not return: it is still running, or the \
-             data plane stopped mid-call. Redrive again once it has had time to \
-             finish; if this persists, the files stay at their lake paths \
-             unregistered and need an operator",
+             files into the lake and registered {} of them. Either it is still \
+             running (or the data plane stopped mid-call), or it failed and kept \
+             the files at their lake paths, which its error names (the catalog \
+             listed some of them, could not be read, or a move back failed). \
+             Redrive again once a running call has had time to finish; if this \
+             persists, the files need an operator",
             payload.work_ticket_idx,
             payload.staging_dir,
             moved_before,
@@ -2495,7 +2496,15 @@ fn register_files(
             })
             .and_then(|()| move_file(&file.src, &file.dest));
         if let Err(e) = placed_one {
-            return Err(return_to_staging(conn, &placed[..i], e));
+            // A copy that failed partway can leave this file's destination
+            // behind; it goes back with the others. Not when the destination
+            // was already there: `move_file` refused it, and it is not ours.
+            let ours = if e.code() == tonic::Code::AlreadyExists {
+                i
+            } else {
+                i + 1
+            };
+            return Err(return_to_staging(conn, &placed[..ours], e));
         }
         moved.push((file.table.clone(), file.dest_str.clone()));
     }

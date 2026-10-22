@@ -282,7 +282,7 @@ Orchestrator verification gates (all must pass before a step is accepted):
 4. The `outputs` map's relative paths resolve under `$QIITA_OUTPUT_PATH` (no traversal) and exist
 5. Every file under `$QIITA_OUTPUT_PATH` is mode `0o440` and is listed in `files` (no extras)
 
-A step re-read on a resume or redrive (`RECOVERED_RAW_STATE`) passes gates 2 and 4 only: it passed every gate when it finished, and a later `register-files` may since have moved the files gate 3 and 5 check (`slurm/verify.py`).
+A step re-read on a resume or redrive (`StepStatusWire.recovered`) skips the per-file gates, 3 and 5 above; `verify_container_output` (`slurm/verify.py`) says why.
 
 A gate failure after exit code 0 is a permanent failure — the container returned 0 but didn't honor the contract, so retry won't help. SlurmBackend wraps the resulting failures as `BackendFailure(kind=CONTRACT_VIOLATION, transient=False)`.
 

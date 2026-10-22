@@ -52,8 +52,9 @@ def action_payload_record(attempt_dir: Path, key: str) -> Path:
     attempt directories, so every attempt of the entry finds the same record.
 
     A redrive needs this record, as it needs the completed steps' outputs, so a
-    ticket's workspace may be reclaimed only once `/run` refuses the ticket. A
-    ticket redriven without it resends what is left in staging, not what the
-    first call sent."""
+    ticket's workspace may be reclaimed only once no `/run` can redrive it
+    again: completed, `no_data`, or superseded by a newer download. A ticket
+    redriven without it resends what is left in staging, not what the first
+    call sent."""
     digest = hashlib.sha256(key.encode()).hexdigest()
     return attempt_dir.parent / f"payload-{digest}.json"

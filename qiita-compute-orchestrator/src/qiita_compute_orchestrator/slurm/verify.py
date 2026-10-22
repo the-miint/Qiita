@@ -74,11 +74,12 @@ def verify_container_output(
     Returns an empty list when all gates pass; otherwise a non-empty
     list with one VerificationFailure per problem found.
 
-    `recovered` re-reads a step that passed every gate when it finished, for a
-    resume (`RECOVERED_RAW_STATE`): only the manifest and its `outputs` map are
-    checked, with each declared output still present. Gates 2 and 3 are
-    skipped, because a later step may have moved the files the manifest lists —
-    `register-files` moves its staging files into the lake.
+    `recovered` re-reads a step that passed every check when it finished, for a
+    resume: only the manifest and its `outputs` map are checked, with each
+    declared output still present. The per-file checks (each listed file at its
+    size; every file listed and read-only) are skipped, because a later step may
+    have moved the files the manifest lists — `register-files` moves its staging
+    files into the lake.
 
     Caller is responsible for ensuring the SLURM job exited 0 before
     calling this (gate 1 lives outside the file-system surface).

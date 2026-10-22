@@ -160,14 +160,6 @@ class StepHandleWire(BaseModel):
     terminal_outputs: dict[str, str] | None = None
 
 
-# The `raw_state` the control-plane runner sends with a COMPLETED status when it
-# re-reads a step that finished in an earlier run (a resume or a redrive), rather
-# than a state slurmrestd reported. The orchestrator's `result_step` then checks
-# the step's manifest and declared outputs, not every file the manifest lists:
-# a later step (`register-files`) may have moved those files since.
-RECOVERED_RAW_STATE = "RECOVERED"
-
-
 class StepStatusWire(BaseModel):
     """Serialized `StepStatusInfo` — returned by POST /step/status and fed
     back into POST /step/result so the orchestrator (stateless) can finalize
@@ -177,6 +169,10 @@ class StepStatusWire(BaseModel):
     raw_state: str | None = None
     exit_code: int | None = None
     reason: str | None = None
+    # Set by the control-plane runner when it re-reads a step that finished in an
+    # earlier run (a resume or a redrive) rather than one slurmrestd just reported;
+    # `result_step` then verifies it as `verify_container_output(recovered=True)`.
+    recovered: bool = False
 
 
 class StepStatusRequest(BaseModel):

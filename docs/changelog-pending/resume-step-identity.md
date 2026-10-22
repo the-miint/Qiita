@@ -46,7 +46,7 @@
   with the `qiita ticket list` filters plus `--failure-type`, prints the selection, and
   with `--execute` redrives each through `POST /work-ticket/{idx}/run`, one at a time,
   `--rate` seconds apart and with at most `--max-inflight` of them (default 8, the
-  control plane's fan-out cap) still pending, queued or processing. A ticket `/run`
+  control plane's default fan-out cap) still pending, queued or processing. A ticket `/run`
   refuses (404 or 409) is reported and the run goes on; any other answer stops it and
   reports the tickets not attempted. A selection larger than `--limit` is refused
   rather than redriven in part.

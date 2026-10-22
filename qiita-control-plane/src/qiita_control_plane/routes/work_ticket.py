@@ -107,6 +107,7 @@ from ..fanout_dispatch import (
     set_override,
     top_up_dispatch,
 )
+from ..runner import _fetch_action
 from ..step_progress import StepProgressMismatch, check_step_progress, load_step_progress
 from ..work_ticket_cancel import WorkTicketNotFound, cancel_work_ticket
 from ..work_ticket_submit import (
@@ -934,6 +935,17 @@ async def run_work_ticket(
         # under us between the SELECT and now (the WHERE binds the exact
         # from-state we read, so a concurrent flip loses the race cleanly).
         is_download = row["action_id"] == DOWNLOAD_ENA_STUDY_ACTION_ID
+        # Read before the transaction so the request holds one connection. None
+        # here means the action was disabled since the check above.
+        definition = await _fetch_action(pool, row["action_id"], row["action_version"])
+        if definition is None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    f"action {row['action_id']!r}/{row['action_version']!r} "
+                    "no longer enabled — cannot redrive"
+                ),
+            )
         async with pool.acquire() as conn, conn.transaction():
             # A redrive fast-forwards the completed mint, so the mint's own refusal
             # of a deprecated config never runs: the ticket would mask, or build
@@ -949,7 +961,8 @@ async def run_work_ticket(
                     status_code=status.HTTP_409_CONFLICT,
                     detail=(
                         f"work_ticket {work_ticket_idx} runs under mask_definition"
-                        f" {mask['mask_idx']}, which is deprecated; it is not redriven"
+                        f" {mask['mask_idx']}, which is deprecated; it is not redriven."
+                        " Submit the work under a current mask instead"
                     ),
                 )
             if is_download:
@@ -1041,20 +1054,14 @@ async def run_work_ticket(
 
             # Rows that no longer match the action's steps would only fail the
             # ticket again at submission; refused here, it stays as it was.
-            from ..runner import _fetch_action
-
-            definition = await _fetch_action(pool, row["action_id"], row["action_version"])
-            if definition is not None:
-                try:
-                    check_step_progress(
-                        work_ticket_idx,
-                        await load_step_progress(conn, work_ticket_idx),
-                        definition.steps,
-                    )
-                except StepProgressMismatch as exc:
-                    raise HTTPException(
-                        status_code=status.HTTP_409_CONFLICT, detail=str(exc)
-                    ) from exc
+            try:
+                check_step_progress(
+                    work_ticket_idx,
+                    await load_step_progress(conn, work_ticket_idx),
+                    definition.steps,
+                )
+            except StepProgressMismatch as exc:
+                raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
 
             await _reset_failed_reference_scope_for_dispatch(
                 conn,
