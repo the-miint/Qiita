@@ -163,6 +163,10 @@ PER_SAMPLE_MASK_ACTION_IDS = (READ_MASK_ACTION_ID, FASTQ_TO_PARQUET_ACTION_ID)
 # which bcl-convert version produced it.
 BCL_CONVERT_ACTION_ID = "bcl-convert"
 
+# The bcl-convert action_context key that holds the pool roster: one
+# `{prep_sample_idx, pool_item_id}` entry per prep_sample the ingest reads.
+BCL_CONVERT_SAMPLE_MAP_KEY = "sample_map"
+
 # The two BLOCK-scoped actions' bare ids (their YAML lives at
 # workflows/read-mask-block/<version>.yaml and workflows/align/<version>.yaml).
 # Bare ids for the same reason as the two above — and here the version-agnosticism

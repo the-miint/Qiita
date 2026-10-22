@@ -37,9 +37,11 @@ from qiita_control_plane.repositories.sequence_range import mint_sequence_range
 from qiita_control_plane.runner import AdapterSetHashes
 from qiita_control_plane.testing.db_seeds import (
     NCBI_TAXONOMY_HUMAN_TERM_ID,
+    delete_action_if_created,
     fetch_missing_value_reason_idx,
     fetch_ncbi_taxonomy_term,
     fetch_seeded_metagenome_term,
+    seed_action_if_absent,
     seed_biosample_with_sequenced_prep_sample,
     seed_host_filter_profile,
     seed_host_reference,
@@ -563,15 +565,8 @@ async def pool_ingest(pooled):
     `sample_map` lists `roster` — the record that ingest read those samples."""
     pool = pooled["pool"]
     version = f"plan-test-{uuid.uuid4()}"
-    await pool.execute(
-        "INSERT INTO qiita.action"
-        " (action_id, version, target_kind, scopes, audience, context_schema, steps,"
-        "  cpu_ceiling, mem_ceiling_gb, walltime_ceiling, success_status, failure_status)"
-        " VALUES ($1, $2, 'sequenced_pool', '{}'::text[], $3::jsonb, '{}'::jsonb, '[]'::jsonb,"
-        "         1, 1, '1 minute', 'active', 'failed')",
-        BCL_CONVERT_ACTION_ID,
-        version,
-        '{"service": false, "human_roles": ["wet_lab_admin"]}',
+    created = await seed_action_if_absent(
+        pool, action_id=BCL_CONVERT_ACTION_ID, version=version, target_kind="sequenced_pool"
     )
 
     async def add(roster):
@@ -595,10 +590,8 @@ async def pool_ingest(pooled):
         BCL_CONVERT_ACTION_ID,
         version,
     )
-    await pool.execute(
-        "DELETE FROM qiita.action WHERE action_id = $1 AND version = $2",
-        BCL_CONVERT_ACTION_ID,
-        version,
+    await delete_action_if_created(
+        pool, action_id=BCL_CONVERT_ACTION_ID, version=version, created=created
     )
 
 
@@ -638,11 +631,10 @@ async def test_plan_records_an_ingested_empty_sample_as_masked(pooled, planapp, 
         == 0
     )
     members = await pool.fetch(
-        "SELECT DISTINCT prep_sample_idx FROM qiita.block_member"
-        " WHERE prep_sample_idx = ANY($1::bigint[])",
+        "SELECT prep_sample_idx FROM qiita.block_member WHERE prep_sample_idx = ANY($1::bigint[])",
         [with_reads, empty, never_ingested],
     )
-    assert [m["prep_sample_idx"] for m in members] == [with_reads]
+    assert {m["prep_sample_idx"] for m in members} == {with_reads}
 
 
 async def test_plan_reaffirms_an_empty_sample_on_a_re_plan(pooled, planapp, pool_ingest):

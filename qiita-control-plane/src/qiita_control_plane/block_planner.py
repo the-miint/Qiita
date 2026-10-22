@@ -15,8 +15,9 @@ planner:
   4. persists the `block` / `block_member` cover-map + a `mask_sample` PENDING
      gate per sample, creates one block `work_ticket` per block, back-fills
      `block.work_ticket_idx`, and dispatches each;
-  5. records each sample that ingest found empty as masked under the mask its
-     partition resolves to — there is nothing to tile, and nothing left to mask.
+  5. records each prep_sample that ingest found empty as masked under the mask its
+     own host-filter decision resolves to — there is nothing to tile, and nothing
+     left to mask.
 
 This module holds the PURE tiler (`tile_partition`, unit-testable with no DB) and
 the server-side orchestration (`plan_and_submit_blocks`, DB + data-plane). The
@@ -57,7 +58,7 @@ from .repositories.block import (
     set_block_work_ticket,
 )
 from .repositories.mask_definition import mint_mask_definition
-from .repositories.sequenced_sample import fetch_empty_ingest_ticket
+from .repositories.sequenced_sample import fetch_empty_ingest_tickets
 from .repositories.sequencing_run import fetch_sequencing_run_platform
 from .runner import (
     AdapterSetHashes,
@@ -288,14 +289,23 @@ class _PlanSample(NamedTuple):
     sample_range: SampleRange
 
 
+class _RangelessSample(NamedTuple):
+    """A pool prep_sample with no stored reads: nothing to tile, but it resolves a
+    mask the same way a `_PlanSample` does."""
+
+    prep_sample_idx: int
+    biosample_idx: int
+    prep_protocol_idx: int | None
+
+
 async def _enumerate_pool_samples(
     conn: asyncpg.Connection | asyncpg.Pool, sequenced_pool_idx: int
-) -> list[_PlanSample]:
-    """The pool's ACTIVE sequenced samples that have stored reads (a
-    sequence_range), with the prep_protocol_idx that feeds the mask identity.
-    Samples without a sequence_range (reads never ingested) are excluded — there
-    is nothing to tile — and reported separately by the caller. Retired
-    prep_samples are excluded too (`ps.retired = false`), matching the per-sample
+) -> tuple[list[_PlanSample], list[_RangelessSample]]:
+    """The pool's ACTIVE sequenced samples, with the prep_protocol_idx that feeds the
+    mask identity, split by whether they have stored reads (a sequence_range) — one
+    read, so a range minted mid-plan cannot leave a sample in neither list. Only a
+    sample with reads can be tiled; the caller decides what a range-less one is.
+    Retired prep_samples are excluded (`ps.retired = false`), matching the per-sample
     roster query fetch_sequenced_pool_samples that submit-host-filter-pool + the
     pool status endpoints use — the block plan must not re-mask a retired sample.
     A flagged sequenced_sample (`ena_status IS NOT NULL`) is excluded the same
@@ -307,61 +317,35 @@ async def _enumerate_pool_samples(
         "       sr.sequence_idx_start, sr.sequence_idx_stop"
         "  FROM qiita.sequenced_sample ss"
         "  JOIN qiita.prep_sample ps ON ps.idx = ss.prep_sample_idx"
-        "  JOIN qiita.sequence_range sr ON sr.prep_sample_idx = ss.prep_sample_idx"
+        "  LEFT JOIN qiita.sequence_range sr ON sr.prep_sample_idx = ss.prep_sample_idx"
         " WHERE ss.sequenced_pool_idx = $1"
         "   AND ps.retired = false"
         "   AND ss.ena_status IS NULL",
         sequenced_pool_idx,
     )
-    return [
-        _PlanSample(
-            prep_sample_idx=r["prep_sample_idx"],
-            biosample_idx=r["biosample_idx"],
-            prep_protocol_idx=r["prep_protocol_idx"],
-            sample_range=SampleRange(
-                r["prep_sample_idx"], r["sequence_idx_start"], r["sequence_idx_stop"]
-            ),
-        )
-        for r in rows
-    ]
-
-
-class _EmptySample(NamedTuple):
-    """A pool sample that ingest found empty: no reads to tile, but it resolves a
-    mask the same way a `_PlanSample` does."""
-
-    prep_sample_idx: int
-    biosample_idx: int
-    prep_protocol_idx: int | None
-
-
-async def _enumerate_rangeless_pool_samples(
-    pool: asyncpg.Pool, sequenced_pool_idx: int
-) -> tuple[list[_EmptySample], int]:
-    """The pool's active samples with no sequence_range, split into those ingest
-    found empty (`fetch_empty_ingest_ticket`) and a count of the rest, whose reads
-    were never ingested. The filters are `_enumerate_pool_samples`' own, so the two
-    together cover the active pool."""
-    rows = await pool.fetch(
-        "SELECT ss.prep_sample_idx, ps.biosample_idx, ps.prep_protocol_idx"
-        "  FROM qiita.sequenced_sample ss"
-        "  JOIN qiita.prep_sample ps ON ps.idx = ss.prep_sample_idx"
-        "  LEFT JOIN qiita.sequence_range sr ON sr.prep_sample_idx = ss.prep_sample_idx"
-        " WHERE ss.sequenced_pool_idx = $1 AND ps.retired = false"
-        "   AND ss.ena_status IS NULL"
-        "   AND sr.prep_sample_idx IS NULL",
-        sequenced_pool_idx,
-    )
-    empty: list[_EmptySample] = []
+    ranged: list[_PlanSample] = []
+    rangeless: list[_RangelessSample] = []
     for r in rows:
-        proof = await fetch_empty_ingest_ticket(
-            pool, prep_sample_idx=r["prep_sample_idx"], current_work_ticket_idx=None
-        )
-        if proof is not None:
-            empty.append(
-                _EmptySample(r["prep_sample_idx"], r["biosample_idx"], r["prep_protocol_idx"])
+        if r["sequence_idx_start"] is None:
+            rangeless.append(
+                _RangelessSample(
+                    prep_sample_idx=r["prep_sample_idx"],
+                    biosample_idx=r["biosample_idx"],
+                    prep_protocol_idx=r["prep_protocol_idx"],
+                )
             )
-    return empty, len(rows) - len(empty)
+        else:
+            ranged.append(
+                _PlanSample(
+                    prep_sample_idx=r["prep_sample_idx"],
+                    biosample_idx=r["biosample_idx"],
+                    prep_protocol_idx=r["prep_protocol_idx"],
+                    sample_range=SampleRange(
+                        r["prep_sample_idx"], r["sequence_idx_start"], r["sequence_idx_stop"]
+                    ),
+                )
+            )
+    return ranged, rangeless
 
 
 class PoolHostFilterRefusal(RuntimeError):
@@ -400,7 +384,7 @@ class HostReferenceNotReady(RuntimeError):
 async def resolve_pool_sample_decisions(
     pool: asyncpg.Pool,
     *,
-    samples: Sequence[_PlanSample | _EmptySample],
+    samples: Sequence[_PlanSample | _RangelessSample],
     platform: Platform,
     force_decision: SampleHostFilter | None,
 ) -> dict[int, SampleHostFilter]:
@@ -602,13 +586,15 @@ async def plan_and_submit_blocks(
         sequencing_run_idx,
     )
 
-    all_samples = await _enumerate_pool_samples(pool, sequenced_pool_idx)
+    all_samples, rangeless = await _enumerate_pool_samples(pool, sequenced_pool_idx)
     # Range-less samples: the ones ingest found empty are masked below; the count of
     # the rest (reads never ingested) is reported so the operator sees the gap rather
     # than a silent drop.
-    empty_samples, skipped_no_reads = await _enumerate_rangeless_pool_samples(
-        pool, sequenced_pool_idx
+    found_empty = await fetch_empty_ingest_tickets(
+        pool, prep_sample_idxs=[r.prep_sample_idx for r in rangeless], current_work_ticket_idx=None
     )
+    empty_samples = [r for r in rangeless if r.prep_sample_idx in found_empty]
+    skipped_no_reads = len(rangeless) - len(empty_samples)
 
     # Per-sample host-filter decision (keyed by prep_sample_idx). Refuses an
     # UNRESOLVED / multi-host pool up front; `force_decision` bypasses resolution.
@@ -809,15 +795,23 @@ async def plan_and_submit_blocks(
         for e in empty_samples:
             try:
                 async with conn.transaction():
-                    await complete_empty_mask_sample_in_tx(
+                    proof = await complete_empty_mask_sample_in_tx(
                         conn,
                         mask_idx=mask_by_prep_sample[e.prep_sample_idx],
                         prep_sample_idx=e.prep_sample_idx,
+                        current_work_ticket_idx=None,
                     )
             except MaskSampleInvalidated:
                 invalidated_empty.append(e.prep_sample_idx)
-            else:
-                completed_empty += 1
+                continue
+            if proof is None:
+                # Its ingest record held when the plan read it and no longer does: a
+                # range was minted since. Re-planning tiles its new reads.
+                raise RuntimeError(
+                    f"prep_sample {e.prep_sample_idx} gained stored reads while sequenced_pool"
+                    f" {sequenced_pool_idx} was being planned; plan the pool again"
+                )
+            completed_empty += 1
 
     if invalidated_empty:
         _log.warning(

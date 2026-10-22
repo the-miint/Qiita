@@ -27,6 +27,7 @@ from qiita_common.api_paths import (
 from qiita_common.auth_constants import Scope
 from qiita_common.models import SequenceRange, SequenceRangeMintRequest
 
+from ..actions.library import clear_empty_mask_completions
 from ..auth.guards import COHORT_MIN_TIER, require_any_scope, require_service_with_scope
 from ..auth.principal import Principal, ServiceAccount
 from ..deps import TxConnFactory, get_db_pool, get_settings, get_tx_conn_factory
@@ -122,6 +123,9 @@ async def mint_sequence_range_route(
             raise HTTPException(status_code=400, detail="invalid sequence-range parameters")
         except asyncpg.PostgresError:
             raise HTTPException(status_code=500, detail="database error")
+        # The prep_sample is gaining reads, so a record that it was masked with none
+        # no longer holds; same transaction as the mint.
+        await clear_empty_mask_completions(conn, prep_sample_idx=body.prep_sample_idx)
 
     return _record_to_response(row)
 

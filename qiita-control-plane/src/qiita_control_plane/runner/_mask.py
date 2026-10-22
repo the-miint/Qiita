@@ -1,4 +1,5 @@
-"""Runner read-mask identity (mask_idx) minting."""
+"""Runner read-mask identity (mask_idx) minting, and the qiita.mask_sample gate row
+the runner writes for a prep_sample that ingest found empty."""
 
 from __future__ import annotations
 
@@ -24,7 +25,6 @@ from ..repositories.mask_definition import (
     mint_mask_definition,
 )
 from ..repositories.reference_membership import reference_sequence_set_hash
-from ..repositories.sequenced_sample import fetch_empty_ingest_ticket
 from ._base import _log
 from ._db import persist_ticket_idx
 from ._reference import QC_ADAPTER_BINDING, _resolve_qc_adapters
@@ -566,29 +566,36 @@ async def _record_mask_gate_empty(
     prep_sample_idx: int,
     work_ticket_idx: int,
 ) -> None:
-    """Record the sample as masked under `mask_idx` with an empty pass-set when an
-    ingest read it and found no reads; otherwise write nothing.
+    """Record the prep_sample as masked under `mask_idx` with an empty pass-set when
+    an ingest read it and found no reads; otherwise write nothing.
 
-    Run from the StepNoData handler, which ends a masking ticket for a sample with no
-    stored reads before `finalize-mask-sample` can run. Without this the sample has no
-    gate row and every consumer refuses it, though there was nothing to mask. A
-    NO_DATA that no ingest record explains (an expected-empty control with no finished
-    ingest) gets no row: its reads may simply not be ingested yet.
+    Run from the StepNoData handler, which ends a masking ticket for a prep_sample
+    with no stored reads before `finalize-mask-sample` can run. Without this it has
+    no gate row and every consumer refuses it, though there was nothing to mask. A
+    NO_DATA that no ingest record explains (an expected-empty control with no
+    finished ingest) gets no row: its reads may simply not be ingested yet.
 
     A withdrawn row stays withdrawn: `MaskSampleInvalidated` rolls the whole write
     back and is logged, as the assembly gate's twin does."""
-    proof = await fetch_empty_ingest_ticket(
-        pool, prep_sample_idx=prep_sample_idx, current_work_ticket_idx=work_ticket_idx
-    )
-    if proof is None:
-        return
     try:
-        await complete_empty_mask_sample(pool, mask_idx=mask_idx, prep_sample_idx=prep_sample_idx)
+        proof = await complete_empty_mask_sample(
+            pool,
+            mask_idx=mask_idx,
+            prep_sample_idx=prep_sample_idx,
+            current_work_ticket_idx=work_ticket_idx,
+        )
     except MaskSampleInvalidated:
         _log.warning(
-            "mask_sample gate (mask %d, prep_sample %d) stays 'invalidated', so the"
-            " empty pass-set ingest ticket %d shows is not recorded",
-            mask_idx,
+            "prep_sample %d was found empty at ingest, but its mask_sample row under"
+            " mask %d is 'invalidated'; it is left so",
             prep_sample_idx,
-            proof,
+            mask_idx,
+        )
+        return
+    if proof is None:
+        _log.info(
+            "prep_sample %d ended with no stored reads and no ingest record shows it was"
+            " found empty; no mask_sample row is written under mask %d",
+            prep_sample_idx,
+            mask_idx,
         )

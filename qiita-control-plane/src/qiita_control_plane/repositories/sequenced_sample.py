@@ -27,6 +27,7 @@ import asyncpg
 from qiita_common.actions import (
     BAM_TO_PARQUET_ACTION_ID,
     BCL_CONVERT_ACTION_ID,
+    BCL_CONVERT_SAMPLE_MAP_KEY,
     FASTQ_TO_PARQUET_ACTION_ID,
     READ_MASK_ACTION_ID,
 )
@@ -833,63 +834,63 @@ async def fetch_non_terminal_work_tickets_for_sequenced_sample(
     return list(rows)
 
 
-# The per-sample ingests: one ticket stores one prep_sample's reads, and ends
-# NO_DATA when its input held none.
 _PER_SAMPLE_INGEST_ACTION_IDS = (FASTQ_TO_PARQUET_ACTION_ID, BAM_TO_PARQUET_ACTION_ID)
-# A pool ingest that reached either state ran `ingest_reads` over every roster sample.
 _POOL_INGEST_DONE_STATES = (WorkTicketState.COMPLETED.value, WorkTicketState.NO_DATA.value)
 
 
-async def fetch_empty_ingest_ticket(
+async def fetch_empty_ingest_tickets(
     pool_or_conn: asyncpg.Pool | asyncpg.Connection,
     *,
-    prep_sample_idx: int,
+    prep_sample_idxs: Sequence[int],
     current_work_ticket_idx: int | None,
-) -> int | None:
-    """Return the work_ticket_idx of an ingest that read this prep_sample and stored
-    no reads, or None when nothing shows that.
+) -> dict[int, int]:
+    """For each of `prep_sample_idxs` that an ingest read and found empty, the newest
+    work_ticket_idx that shows it; a prep_sample nothing shows is absent.
 
-    A sample with no `sequence_range` either was ingested empty or was never
+    A prep_sample with no `sequence_range` either was ingested empty or was never
     ingested, and only an ingest record tells the two apart. The records that count:
 
-    - a per-sample ingest (fastq-to-parquet, bam-to-parquet) for the sample that
-      ended NO_DATA, which it does only when its input held no reads. The caller's
-      own ticket counts while it is still running, since it is the one that found
-      the input empty (`current_work_ticket_idx`; None from a caller that is not a
-      ticket).
-    - a bcl-convert ticket for the sample's pool that ended COMPLETED or NO_DATA
-      with the sample in its `sample_map` roster. `ingest_reads` skips an empty well
-      and fails the whole pool on a missing one, so a finished pool ingest with no
-      range for a listed sample means that well was empty.
+    - a per-sample ingest (fastq-to-parquet, bam-to-parquet) of the prep_sample that
+      ended NO_DATA, which it does only when its input held no reads. The ticket
+      named by `current_work_ticket_idx` counts while it is still running: a running
+      per-sample ingest asks about its own input after finding it empty. Any other
+      caller passes None.
+    - a bcl-convert ticket for the prep_sample's pool that ended COMPLETED or NO_DATA
+      with the prep_sample in its `sample_map` roster. `ingest_reads` skips an empty
+      well and fails the whole pool on a missing one, so a finished pool ingest with
+      no range for a listed prep_sample means that well was empty.
 
-    A sample that has a range returns None whatever its tickets say: its reads
-    exist. A pool ingest counts only for the samples its roster names; pool
-    membership alone does not show that the ingest read the sample.
+    A prep_sample that has a range is absent whatever its tickets say: its reads
+    exist. A pool ingest counts only for the prep_samples its roster names; pool
+    membership alone does not show that the ingest read the prep_sample.
     """
-    return await pool_or_conn.fetchval(
-        "SELECT proof.work_ticket_idx FROM ("
-        "  SELECT wt.work_ticket_idx FROM qiita.work_ticket wt"
-        "   WHERE wt.prep_sample_idx = $1"
-        "     AND wt.action_id = ANY($2::text[])"
-        "     AND (wt.state = $3::qiita.work_ticket_state OR wt.work_ticket_idx = $4::bigint)"
-        "  UNION ALL"
-        "  SELECT wt.work_ticket_idx FROM qiita.work_ticket wt"
-        "    JOIN qiita.sequenced_sample ss ON ss.sequenced_pool_idx = wt.sequenced_pool_idx"
-        "   WHERE ss.prep_sample_idx = $1"
-        "     AND wt.action_id = $5"
-        "     AND wt.state = ANY($6::qiita.work_ticket_state[])"
-        "     AND wt.action_context -> 'sample_map'"
-        "         @> jsonb_build_array(jsonb_build_object('prep_sample_idx', $1::bigint))"
-        " ) proof"
+    rows = await pool_or_conn.fetch(
+        "SELECT DISTINCT ON (proof.prep_sample_idx)"
+        "       proof.prep_sample_idx, proof.work_ticket_idx"
+        "  FROM ("
+        "    SELECT wt.prep_sample_idx, wt.work_ticket_idx FROM qiita.work_ticket wt"
+        "     WHERE wt.prep_sample_idx = ANY($1::bigint[])"
+        "       AND wt.action_id = ANY($2::text[])"
+        "       AND (wt.state = $3::qiita.work_ticket_state OR wt.work_ticket_idx = $4::bigint)"
+        "    UNION ALL"
+        "    SELECT ss.prep_sample_idx, wt.work_ticket_idx FROM qiita.sequenced_sample ss"
+        "      JOIN qiita.work_ticket wt ON wt.sequenced_pool_idx = ss.sequenced_pool_idx"
+        "     WHERE ss.prep_sample_idx = ANY($1::bigint[])"
+        "       AND wt.action_id = $5"
+        "       AND wt.state = ANY($6::qiita.work_ticket_state[])"
+        "       AND wt.action_context -> $7::text"
+        "           @> jsonb_build_array(jsonb_build_object('prep_sample_idx', ss.prep_sample_idx))"
+        "  ) proof"
         " WHERE NOT EXISTS ("
-        "   SELECT 1 FROM qiita.sequence_range sr WHERE sr.prep_sample_idx = $1"
+        "   SELECT 1 FROM qiita.sequence_range sr WHERE sr.prep_sample_idx = proof.prep_sample_idx"
         " )"
-        " ORDER BY proof.work_ticket_idx DESC"
-        " LIMIT 1",
-        prep_sample_idx,
+        " ORDER BY proof.prep_sample_idx, proof.work_ticket_idx DESC",
+        list(prep_sample_idxs),
         list(_PER_SAMPLE_INGEST_ACTION_IDS),
         WorkTicketState.NO_DATA.value,
         current_work_ticket_idx,
         BCL_CONVERT_ACTION_ID,
         list(_POOL_INGEST_DONE_STATES),
+        BCL_CONVERT_SAMPLE_MAP_KEY,
     )
+    return {r["prep_sample_idx"]: r["work_ticket_idx"] for r in rows}

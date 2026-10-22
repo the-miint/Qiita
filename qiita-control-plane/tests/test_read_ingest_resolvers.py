@@ -297,13 +297,15 @@ def _control_lookup(is_control: bool):
 
 
 # The zero-read empty-ingest lookup, monkeypatched for the same reason; its query is
-# pinned by the DB-bound tests in tests/repositories/test_empty_ingest_ticket.py.
-_EMPTY_INGEST_LOOKUP = "qiita_control_plane.runner._read_ingest.fetch_empty_ingest_ticket"
+# pinned by `fetch_empty_ingest_tickets`' own DB-bound tests.
+_EMPTY_INGEST_LOOKUP = "qiita_control_plane.runner._read_ingest.fetch_empty_ingest_tickets"
 
 
 def _empty_ingest_lookup(work_ticket_idx: int | None):
-    async def _fn(_pool, *, prep_sample_idx, current_work_ticket_idx):
-        return work_ticket_idx
+    async def _fn(_pool, *, prep_sample_idxs, current_work_ticket_idx):
+        if work_ticket_idx is None:
+            return {}
+        return dict.fromkeys(prep_sample_idxs, work_ticket_idx)
 
     return _fn
 
@@ -366,9 +368,9 @@ def test_resolve_staged_reads_export_fallback_binds_workspace_parquet(tmp_path, 
 
 
 def test_resolve_staged_reads_empty_data_well_fails_must_be_ingested(tmp_path, monkeypatch):
-    """Durable absent, the data plane returns 0 rows, and the well is NOT a control
-    → BAD_INPUT 'must be ingested' — an unexpected-empty data well is a real
-    failure, the no-stored-reads semantics preserved."""
+    """Durable absent, the data plane returns 0 rows, no ingest record shows the
+    prep_sample empty, and the well is NOT a control → BAD_INPUT 'must be ingested':
+    nothing shows it was ingested at all."""
     monkeypatch.setattr(_EXPORT_READ, lambda _u, _t: {"count": 0, "dest": "x"})
     monkeypatch.setattr(_EMPTY_INGEST_LOOKUP, _empty_ingest_lookup(None))
     monkeypatch.setattr(_CONTROL_LOOKUP, _control_lookup(False))

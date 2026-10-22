@@ -1,4 +1,4 @@
-"""DB tests for fetch_empty_ingest_ticket — the record that a prep_sample with no
+"""DB tests for fetch_empty_ingest_tickets — the record that a prep_sample with no
 sequence_range was ingested and found empty, rather than never ingested.
 
 Each test seeds samples on the shared `pool_ctx` pool and attaches ingest tickets
@@ -19,7 +19,8 @@ from qiita_common.actions import (
     READ_MASK_ACTION_ID,
 )
 
-from qiita_control_plane.repositories.sequenced_sample import fetch_empty_ingest_ticket
+from qiita_control_plane.repositories.sequenced_sample import fetch_empty_ingest_tickets
+from qiita_control_plane.testing.db_seeds import delete_action_if_created, seed_action_if_absent
 
 pytestmark = pytest.mark.db
 
@@ -38,18 +39,10 @@ async def ingest_ctx(pool_ctx):
         (BCL_CONVERT_ACTION_ID, "sequenced_pool"),
     ):
         version = f"v-{uuid.uuid4()}"
-        await pg.execute(
-            "INSERT INTO qiita.action ("
-            "  action_id, version, target_kind, scopes, audience, context_schema, steps,"
-            "  cpu_ceiling, mem_ceiling_gb, walltime_ceiling, success_status, failure_status"
-            ") VALUES ($1, $2, $3::qiita.scope_target_kind, '{}'::text[], $4::jsonb,"
-            "          '{}'::jsonb, '[]'::jsonb, 1, 1, '1 minute', 'active', 'failed')",
-            action_id,
-            version,
-            target_kind,
-            json.dumps({"service": False, "human_roles": ["system_admin"]}),
+        created = await seed_action_if_absent(
+            pg, action_id=action_id, version=version, target_kind=target_kind
         )
-        versions[action_id] = version
+        versions[action_id] = (version, created)
 
     def _failure(state):
         # work_ticket_failure_consistent: the failure columns are set together on a
@@ -72,7 +65,7 @@ async def ingest_ctx(pool_ctx):
             "         $7::qiita.work_ticket_failure_stage, $8)"
             " RETURNING work_ticket_idx",
             action_id,
-            versions[action_id],
+            versions[action_id][0],
             owner_idx,
             prep_sample_idx,
             state,
@@ -93,7 +86,7 @@ async def ingest_ctx(pool_ctx):
             "         $8::qiita.work_ticket_failure_stage, $9)"
             " RETURNING work_ticket_idx",
             BCL_CONVERT_ACTION_ID,
-            versions[BCL_CONVERT_ACTION_ID],
+            versions[BCL_CONVERT_ACTION_ID][0],
             owner_idx,
             sequenced_pool_idx or pool_ctx["pool_idx"],
             state,
@@ -134,23 +127,22 @@ async def ingest_ctx(pool_ctx):
         "other_pool": other_pool,
     }
 
-    for action_id, version in versions.items():
+    for action_id, (version, created) in versions.items():
         await pg.execute(
             "DELETE FROM qiita.work_ticket WHERE action_id = $1 AND action_version = $2",
             action_id,
             version,
         )
-        await pg.execute(
-            "DELETE FROM qiita.action WHERE action_id = $1 AND version = $2", action_id, version
-        )
+        await delete_action_if_created(pg, action_id=action_id, version=version, created=created)
     for pool_idx in extra_pools:
         await pg.execute("DELETE FROM qiita.sequenced_pool WHERE idx = $1", pool_idx)
 
 
 async def _proof(ctx, prep_sample_idx, current=None):
-    return await fetch_empty_ingest_ticket(
-        ctx["pool"], prep_sample_idx=prep_sample_idx, current_work_ticket_idx=current
+    found = await fetch_empty_ingest_tickets(
+        ctx["pool"], prep_sample_idxs=[prep_sample_idx], current_work_ticket_idx=current
     )
+    return found.get(prep_sample_idx)
 
 
 async def test_no_ingest_record_is_none(ingest_ctx):
@@ -228,3 +220,21 @@ async def test_a_sample_with_reads_is_never_empty(ingest_ctx):
     await ingest_ctx["add_pool_ingest"]("completed", [s.prep_sample_idx])
     await ingest_ctx["add_range"](s.prep_sample_idx)
     assert await _proof(ingest_ctx, s.prep_sample_idx) is None
+
+
+async def test_answers_for_many_prep_samples_at_once(ingest_ctx):
+    """One read answers a whole pool: each prep_sample maps to the newest ticket that
+    shows it was found empty, and one nothing shows is absent."""
+    by_bam, by_pool, unproven = [await ingest_ctx["add_sample"]() for _ in range(3)]
+    add_ticket = ingest_ctx["add_sample_ticket"]
+    await add_ticket(BAM_TO_PARQUET_ACTION_ID, by_bam.prep_sample_idx, "no_data")
+    newer = await add_ticket(BAM_TO_PARQUET_ACTION_ID, by_bam.prep_sample_idx, "no_data")
+    pool_ingest = await ingest_ctx["add_pool_ingest"]("completed", [by_pool.prep_sample_idx])
+
+    found = await fetch_empty_ingest_tickets(
+        ingest_ctx["pool"],
+        prep_sample_idxs=[s.prep_sample_idx for s in (by_bam, by_pool, unproven)],
+        current_work_ticket_idx=None,
+    )
+
+    assert found == {by_bam.prep_sample_idx: newer, by_pool.prep_sample_idx: pool_ingest}

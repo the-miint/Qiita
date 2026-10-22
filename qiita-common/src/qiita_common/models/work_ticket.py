@@ -510,9 +510,10 @@ class BlockMaskPlanResponse(BaseModel):
     answer any more — it is per sample); the `samples_*` counts reconcile the
     pool's samples (planned + skipped-existing + skipped-no-reads +
     completed-empty + skipped-invalidated). `samples_completed_empty` counts the
-    samples ingest found empty, recorded as masked with an empty pass-set;
-    `samples_skipped_invalidated` the empty ones whose gate row was withdrawn and is
-    left so. A pool with nothing to do returns 202 with zero counts."""
+    prep_samples whose ingest stored no reads, recorded as masked with no reads to
+    serve; `samples_skipped_invalidated` counts those of them whose masking was
+    withdrawn earlier, which the plan leaves withdrawn. A pool with nothing to do
+    returns 202 with zero counts."""
 
     sequencing_run_idx: Annotated[int, Field(gt=0)]
     sequenced_pool_idx: Annotated[int, Field(gt=0)]

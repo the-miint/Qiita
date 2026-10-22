@@ -1,16 +1,23 @@
-"""Tests for `complete_empty_mask_sample`: a prep_sample that ingest found empty is
-recorded as masked under a mask, with the rows a finished mask leaves behind."""
+"""Tests for `complete_empty_mask_sample`, which records a prep_sample that ingest
+found empty as masked under a mask with the rows a finished mask leaves behind, and
+`clear_empty_mask_completions`, which removes that record when reads arrive."""
 
 import json
 import uuid
 
 import pytest
 import pytest_asyncio
+from qiita_common.actions import BAM_TO_PARQUET_ACTION_ID
 
-from qiita_control_plane.actions.library import complete_empty_mask_sample
+from qiita_control_plane.actions.library import (
+    clear_empty_mask_completions,
+    complete_empty_mask_sample,
+)
 from qiita_control_plane.repositories.block import MaskSampleInvalidated
 from qiita_control_plane.testing.db_seeds import (
     cleanup_reference_graph,
+    delete_action_if_created,
+    seed_action_if_absent,
     seed_bare_feature,
     seed_bare_reference,
     seed_biosample_with_sequenced_prep_sample,
@@ -30,7 +37,8 @@ pytestmark = pytest.mark.db
 @pytest_asyncio.fixture
 async def seeded(postgres_pool):
     """A pooled prep_sample with no reads, a SynDNA reference of three inserts, and
-    two masks: one carrying that reference and one without."""
+    two masks: one carrying that reference and one without. `ingested_empty()` adds
+    the bam-to-parquet ticket that shows ingest found the prep_sample empty."""
     principal_idx = await seed_user_principal(postgres_pool, prefix="empty-mask", suffix="owner")
     biosample_idx, prep_sample_idx = await seed_biosample_with_sequenced_prep_sample(
         postgres_pool, owner_idx=principal_idx
@@ -57,12 +65,41 @@ async def seeded(postgres_pool):
             json.dumps({"resolved_syndna": syndna}),
             principal_idx,
         )
+    version = f"v-{uuid.uuid4()}"
+    created = await seed_action_if_absent(
+        postgres_pool,
+        action_id=BAM_TO_PARQUET_ACTION_ID,
+        version=version,
+        target_kind="prep_sample",
+    )
+
+    async def ingested_empty():
+        return await postgres_pool.fetchval(
+            "INSERT INTO qiita.work_ticket"
+            "  (action_id, action_version, originator_principal_idx,"
+            "   scope_target_kind, prep_sample_idx, state)"
+            " VALUES ($1, $2, $3, 'prep_sample', $4, 'no_data') RETURNING work_ticket_idx",
+            BAM_TO_PARQUET_ACTION_ID,
+            version,
+            principal_idx,
+            prep_sample_idx,
+        )
+
     yield {
         "principal_idx": principal_idx,
         "prep_sample_idx": prep_sample_idx,
         "inserts": inserts,
         "masks": masks,
+        "ingested_empty": ingested_empty,
     }
+    await postgres_pool.execute(
+        "DELETE FROM qiita.work_ticket WHERE action_id = $1 AND action_version = $2",
+        BAM_TO_PARQUET_ACTION_ID,
+        version,
+    )
+    await delete_action_if_created(
+        postgres_pool, action_id=BAM_TO_PARQUET_ACTION_ID, version=version, created=created
+    )
     await teardown_entity_graph(
         postgres_pool,
         study_idxs=[],
@@ -107,10 +144,20 @@ async def _syndna(pool, mask_idx, prep_sample_idx):
     return {r["feature_idx"]: r["read_count"] for r in rows}
 
 
+async def _complete(pool, seeded, mask_name):
+    return await complete_empty_mask_sample(
+        pool,
+        mask_idx=seeded["masks"][mask_name],
+        prep_sample_idx=seeded["prep_sample_idx"],
+        current_work_ticket_idx=None,
+    )
+
+
 async def test_completes_the_gate_with_zero_counts(postgres_pool, seeded):
     ps, mask_idx = seeded["prep_sample_idx"], seeded["masks"]["plain"]
+    proof = await seeded["ingested_empty"]()
 
-    await complete_empty_mask_sample(postgres_pool, mask_idx=mask_idx, prep_sample_idx=ps)
+    assert await _complete(postgres_pool, seeded, "plain") == proof
 
     assert await _gate(postgres_pool, mask_idx, ps) == "completed"
     assert await _counts(postgres_pool, ps) == (0, 0, 0, 0)
@@ -118,10 +165,11 @@ async def test_completes_the_gate_with_zero_counts(postgres_pool, seeded):
 
 
 async def test_writes_a_zero_per_syndna_insert(postgres_pool, seeded):
-    """The SynDNA export refuses a completed sample with no count rows."""
+    """The SynDNA export refuses a completed prep_sample with no count rows."""
     ps, mask_idx = seeded["prep_sample_idx"], seeded["masks"]["syndna"]
+    await seeded["ingested_empty"]()
 
-    await complete_empty_mask_sample(postgres_pool, mask_idx=mask_idx, prep_sample_idx=ps)
+    await _complete(postgres_pool, seeded, "syndna")
 
     assert await _gate(postgres_pool, mask_idx, ps) == "completed"
     assert await _syndna(postgres_pool, mask_idx, ps) == dict.fromkeys(seeded["inserts"], 0)
@@ -129,16 +177,30 @@ async def test_writes_a_zero_per_syndna_insert(postgres_pool, seeded):
 
 async def test_is_idempotent(postgres_pool, seeded):
     ps, mask_idx = seeded["prep_sample_idx"], seeded["masks"]["syndna"]
+    await seeded["ingested_empty"]()
 
     for _ in range(2):
-        await complete_empty_mask_sample(postgres_pool, mask_idx=mask_idx, prep_sample_idx=ps)
+        await _complete(postgres_pool, seeded, "syndna")
 
     assert await _gate(postgres_pool, mask_idx, ps) == "completed"
     assert await _syndna(postgres_pool, mask_idx, ps) == dict.fromkeys(seeded["inserts"], 0)
 
 
+async def test_writes_nothing_when_no_ingest_shows_the_prep_sample_empty(postgres_pool, seeded):
+    """The writer reads the ingest record itself, so no caller can open the gate
+    without it."""
+    ps, mask_idx = seeded["prep_sample_idx"], seeded["masks"]["syndna"]
+
+    assert await _complete(postgres_pool, seeded, "syndna") is None
+
+    assert await _gate(postgres_pool, mask_idx, ps) is None
+    assert await _counts(postgres_pool, ps) == (None, None, None, None)
+    assert await _syndna(postgres_pool, mask_idx, ps) == {}
+
+
 async def test_a_withdrawn_gate_stays_withdrawn_and_nothing_is_written(postgres_pool, seeded):
     ps, mask_idx = seeded["prep_sample_idx"], seeded["masks"]["syndna"]
+    await seeded["ingested_empty"]()
     await postgres_pool.execute(
         "INSERT INTO qiita.mask_sample"
         "  (mask_idx, prep_sample_idx, state,"
@@ -150,8 +212,53 @@ async def test_a_withdrawn_gate_stays_withdrawn_and_nothing_is_written(postgres_
     )
 
     with pytest.raises(MaskSampleInvalidated):
-        await complete_empty_mask_sample(postgres_pool, mask_idx=mask_idx, prep_sample_idx=ps)
+        await _complete(postgres_pool, seeded, "syndna")
 
     assert await _gate(postgres_pool, mask_idx, ps) == "invalidated"
     assert await _counts(postgres_pool, ps) == (None, None, None, None)
     assert await _syndna(postgres_pool, mask_idx, ps) == {}
+
+
+async def _clear(pool, prep_sample_idx):
+    async with pool.acquire() as conn, conn.transaction():
+        return await clear_empty_mask_completions(conn, prep_sample_idx=prep_sample_idx)
+
+
+async def test_clearing_removes_the_record_when_reads_arrive(postgres_pool, seeded):
+    """Left in place, the record would keep serving an empty pass-set over the
+    prep_sample's new reads."""
+    ps = seeded["prep_sample_idx"]
+    await seeded["ingested_empty"]()
+    for name in ("syndna", "plain"):
+        await _complete(postgres_pool, seeded, name)
+
+    assert await _clear(postgres_pool, ps) == 2
+
+    for mask_idx in seeded["masks"].values():
+        assert await _gate(postgres_pool, mask_idx, ps) is None
+        assert await _syndna(postgres_pool, mask_idx, ps) == {}
+    assert await _counts(postgres_pool, ps) == (None, None, None, None)
+
+
+async def test_clearing_leaves_a_withdrawn_row_and_touches_nothing_else(postgres_pool, seeded):
+    ps, mask_idx = seeded["prep_sample_idx"], seeded["masks"]["plain"]
+    await postgres_pool.execute(
+        "INSERT INTO qiita.mask_sample"
+        "  (mask_idx, prep_sample_idx, state,"
+        "   invalidated_at, invalidated_by_idx, invalidation_reason)"
+        " VALUES ($1, $2, 'invalidated', now(), $3, 'test withdrawal')",
+        mask_idx,
+        ps,
+        seeded["principal_idx"],
+    )
+    await postgres_pool.execute(
+        "UPDATE qiita.sequenced_sample SET raw_read_count_r1r2 = 5,"
+        " biological_read_count_r1r2 = 5, quality_filtered_read_count_r1r2 = 5,"
+        " spikein_read_count_r1r2 = 0 WHERE prep_sample_idx = $1",
+        ps,
+    )
+
+    assert await _clear(postgres_pool, ps) == 0
+
+    assert await _gate(postgres_pool, mask_idx, ps) == "invalidated"
+    assert await _counts(postgres_pool, ps) == (5, 5, 5, 0)

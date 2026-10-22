@@ -638,3 +638,36 @@ async def test_cascade_then_remint_yields_advanced_start(ctx):
     assert second_resp.status_code == 201, second_resp.text
     second = second_resp.json()
     assert second["sequence_idx_start"] > first["sequence_idx_stop"]
+
+
+async def test_post_removes_a_record_that_the_prep_sample_was_masked_with_no_reads(ctx):
+    """A prep_sample recorded as masked with no reads (ingest found it empty) that
+    now gets a range is gaining reads: the record goes in the mint's transaction, so
+    no consumer is served an empty pass-set over reads that exist."""
+    pool, ps = ctx["pool"], ctx["prep_sample_idx"]
+    mask_idx = await pool.fetchval(
+        "INSERT INTO qiita.mask_definition"
+        " (params_hash, filter_workflow, filter_version, params, created_by_idx)"
+        " VALUES ($1, 'read-mask', '1.0.0', '{}'::jsonb, $2) RETURNING mask_idx",
+        secrets.token_bytes(32),
+        ctx["principal_idx"],
+    )
+    try:
+        await pool.execute(
+            "INSERT INTO qiita.mask_sample (mask_idx, prep_sample_idx, state)"
+            " VALUES ($1, $2, 'completed')",
+            mask_idx,
+            ps,
+        )
+
+        await _mint(ctx, ps)
+
+        assert (
+            await pool.fetchval(
+                "SELECT count(*) FROM qiita.mask_sample WHERE prep_sample_idx = $1", ps
+            )
+            == 0
+        )
+    finally:
+        await pool.execute("DELETE FROM qiita.mask_sample WHERE mask_idx = $1", mask_idx)
+        await pool.execute("DELETE FROM qiita.mask_definition WHERE mask_idx = $1", mask_idx)

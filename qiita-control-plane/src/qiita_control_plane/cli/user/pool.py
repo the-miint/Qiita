@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any, NamedTuple
 
 import httpx
-from qiita_common.actions import READ_MASK_ACTION_ID
+from qiita_common.actions import BCL_CONVERT_SAMPLE_MAP_KEY, READ_MASK_ACTION_ID
 from qiita_common.api_paths import (
     PATH_BIOSAMPLE_PREFIX,
     PATH_BIOSAMPLE_RESOLVE_ROSTER,
@@ -507,7 +507,7 @@ def _handle_submit_bcl_convert(args: argparse.Namespace, parser: argparse.Argume
                 # argument — the submit gate normalizes too, so storing the
                 # resolved value keeps the two spellings from diverging.
                 "bcl_input_dir": inspected.path,
-                "sample_map": sample_map,
+                BCL_CONVERT_SAMPLE_MAP_KEY: sample_map,
             },
             force=args.force,
         ).model_dump(exclude_unset=True, mode="json")

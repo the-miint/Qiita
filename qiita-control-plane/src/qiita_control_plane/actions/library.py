@@ -97,7 +97,10 @@ from ..repositories.reference_membership import (
     GENOME_MAP_ROWS_SQL,
     count_reference_shards,
 )
-from ..repositories.sequenced_sample import set_sequenced_sample_download_failure
+from ..repositories.sequenced_sample import (
+    fetch_empty_ingest_tickets,
+    set_sequenced_sample_download_failure,
+)
 from ..repositories.syndna_read_count import (
     fetch_mask_syndna_reference,
     fetch_syndna_inserts,
@@ -3111,7 +3114,9 @@ async def _complete_mask_sample_gate(
     prep_sample_idx: int,
 ) -> None:
     """Write the `(mask_idx, prep_sample_idx)` gate row to 'completed' on the caller's
-    transaction.
+    transaction: for a per-sample masking run (`finalize_mask_sample_gate`), and for a
+    prep_sample ingest found empty (`complete_empty_mask_sample_in_tx`), which no block
+    can cover since a block tiles reads.
 
     `mask_idx` is a config hash shared with the block path, so a sample can (in the
     pathological cross-path case) be masked by BOTH a per-sample ticket and an
@@ -3154,27 +3159,44 @@ async def complete_empty_mask_sample_in_tx(
     *,
     mask_idx: int,
     prep_sample_idx: int,
-) -> None:
-    """Record a prep_sample that ingest found empty as masked under `mask_idx`, on
-    the caller's transaction.
+    current_work_ticket_idx: int | None,
+) -> int | None:
+    """Record a prep_sample that ingest found empty as masked under `mask_idx`, on the
+    caller's transaction, and return the ingest ticket that shows it was found empty.
+    Write nothing and return None when no ingest record shows that
+    (`fetch_empty_ingest_tickets`, which defines `current_work_ticket_idx`).
 
     There are no reads to mask, so the pass-set is empty and complete: the gate goes
     to 'completed' like any other finished mask, and consumers serve an empty
     pass-set. The rows a finished mask would leave are written too, so a reader sees
-    the sample like any other: all-zero read counts on its sequenced_sample, and a
-    zero per insert when the mask carries a SynDNA reference (the SynDNA export
-    refuses a completed sample that has no count rows).
+    the prep_sample like any other: all-zero read counts on its sequenced_sample,
+    and a zero per insert when the mask carries a SynDNA reference (the SynDNA
+    export refuses a completed prep_sample that has no count rows).
 
-    The caller establishes that ingest found the sample empty
-    (`fetch_empty_ingest_ticket`). Raises `MaskSampleInvalidated` when the gate row
-    was withdrawn; the count writes go with the caller's rollback."""
+    The record is read here, after the gate lock and on the write's own transaction,
+    so no caller writes the gate without it. Raises `MaskSampleInvalidated` when the
+    gate row was withdrawn; the count writes go with the caller's rollback. A
+    prep_sample that later gains reads loses this record
+    (`clear_empty_mask_completions`)."""
     require_transaction(conn)
+    # The gate lock before any row write, the order the block planner takes them in,
+    # so the two writers of this pair queue rather than deadlock.
+    await lock_mask_sample_gate_advisory(conn, mask_idx=mask_idx, prep_sample_idx=prep_sample_idx)
+    proof = (
+        await fetch_empty_ingest_tickets(
+            conn,
+            prep_sample_idxs=[prep_sample_idx],
+            current_work_ticket_idx=current_work_ticket_idx,
+        )
+    ).get(prep_sample_idx)
+    if proof is None:
+        return None
     ss_idx = await _update_sequenced_sample_read_counts(
         conn, prep_sample_idx, raw=0, biological=0, quality_filtered=0, spikein=0
     )
     if ss_idx is None:
         raise RuntimeError(
-            f"no sequenced_sample row for prep_sample_idx={prep_sample_idx}; a sample "
+            f"no sequenced_sample row for prep_sample_idx={prep_sample_idx}; a prep_sample "
             "recorded as masked must be pooled (its 1:1 sequenced_sample created)"
         )
     syndna = await _mask_syndna_inserts(conn, mask_idx)
@@ -3187,6 +3209,7 @@ async def complete_empty_mask_sample_in_tx(
             counts=dict.fromkeys(inserts, 0),
         )
     await _complete_mask_sample_gate(conn, mask_idx=mask_idx, prep_sample_idx=prep_sample_idx)
+    return proof
 
 
 async def complete_empty_mask_sample(
@@ -3194,12 +3217,53 @@ async def complete_empty_mask_sample(
     *,
     mask_idx: int,
     prep_sample_idx: int,
-) -> None:
+    current_work_ticket_idx: int | None,
+) -> int | None:
     """`complete_empty_mask_sample_in_tx` in a transaction of its own."""
     async with pool.acquire() as conn, conn.transaction():
-        await complete_empty_mask_sample_in_tx(
-            conn, mask_idx=mask_idx, prep_sample_idx=prep_sample_idx
+        return await complete_empty_mask_sample_in_tx(
+            conn,
+            mask_idx=mask_idx,
+            prep_sample_idx=prep_sample_idx,
+            current_work_ticket_idx=current_work_ticket_idx,
         )
+
+
+async def clear_empty_mask_completions(conn: asyncpg.Connection, *, prep_sample_idx: int) -> int:
+    """Undo `complete_empty_mask_sample_in_tx` for a prep_sample that is gaining reads,
+    on the caller's transaction; return the number of gate rows removed.
+
+    Run where a sequence_range is minted. Until then the prep_sample had no reads, so
+    each 'completed' gate row it holds is an empty completion, and left in place it
+    would keep serving an empty pass-set over reads that now exist. Its SynDNA zeros
+    under those masks go with it, and its read counts return to unset; masking the
+    new reads writes all three again. An 'invalidated' row stays: a withdrawal stands
+    until someone restores it."""
+    require_transaction(conn)
+    cleared = [
+        r["mask_idx"]
+        for r in await conn.fetch(
+            "DELETE FROM qiita.mask_sample WHERE prep_sample_idx = $1 AND state = $2"
+            " RETURNING mask_idx",
+            prep_sample_idx,
+            MASK_SAMPLE_COMPLETED,
+        )
+    ]
+    if cleared:
+        await conn.execute(
+            "DELETE FROM qiita.syndna_read_count"
+            " WHERE prep_sample_idx = $1 AND mask_idx = ANY($2::bigint[])",
+            prep_sample_idx,
+            cleared,
+        )
+        await conn.execute(
+            "UPDATE qiita.sequenced_sample"
+            " SET raw_read_count_r1r2 = NULL, biological_read_count_r1r2 = NULL,"
+            "     quality_filtered_read_count_r1r2 = NULL, spikein_read_count_r1r2 = NULL"
+            " WHERE prep_sample_idx = $1",
+            prep_sample_idx,
+        )
+    return len(cleared)
 
 
 async def finalize_assembly_sample_gate(

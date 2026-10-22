@@ -70,13 +70,13 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
   unit sets no cgroup limit. No separate journal read by hand; `SKIP_DP_POOL=1` drops the
   row.
 - `[admin]` (#731) `qiita.action` lists `download-ena-study` 1.0.0 with three steps, ending in `persist-ena-run-outcomes`, and `\d qiita.sequenced_sample` shows `download_failure_reason` and `download_failure_type`.
-- `[admin]` (#fix/empty-sample-mask-gate) The new mask_sample comment landed: `SELECT obj_description('qiita.mask_sample'::regclass) LIKE '%found empty%';` returns `t`.
 
 ### 6. After the deploy verifies green
 
-- `[operator]` (#fix/empty-sample-mask-gate) Re-run masking for samples whose ingest stored no reads, so each gets its masked-complete record. List them:
-  `SELECT work_ticket_idx, action_id, state, prep_sample_idx FROM qiita.work_ticket wt WHERE (action_id = 'read-mask' AND ((state = 'failed' AND failure_reason LIKE 'no stored reads%') OR (state = 'no_data' AND mask_idx IS NULL))) OR (action_id = 'fastq-to-parquet' AND state = 'no_data' AND mask_idx IS NOT NULL AND NOT EXISTS (SELECT 1 FROM qiita.mask_sample ms WHERE ms.mask_idx = wt.mask_idx AND ms.prep_sample_idx = wt.prep_sample_idx)) ORDER BY work_ticket_idx;`
-  Redrive a `failed` row with `qiita ticket run <work_ticket_idx>`. A `no_data` row is terminal, so re-submit it with the same action_context (`qiita ticket submit`). Each should end `no_data`, and `qiita mask samples --mask-idx <mask> --sequenced-pool-idx <pool>` should then list the sample `completed`. A `read-mask` sample with no finished ingest fails again, now naming the three ingests. Known case: read-mask ticket 12402 (prep_sample 31483, pool 25056, mask 11). Then re-run the masked-read export for the pools those samples belong to.
+- `[operator]` (#fix/empty-sample-mask-gate) Re-run masking for prep_samples whose ingest stored no reads, so each is recorded as masked. List the per-sample tickets:
+  `SELECT wt.work_ticket_idx, wt.action_id, wt.state, wt.prep_sample_idx, ss.sequenced_pool_idx FROM qiita.work_ticket wt JOIN qiita.sequenced_sample ss ON ss.prep_sample_idx = wt.prep_sample_idx WHERE (wt.action_id = 'read-mask' AND ((wt.state = 'failed' AND wt.failure_reason LIKE 'no stored reads%') OR (wt.state = 'no_data' AND wt.mask_idx IS NULL))) OR (wt.action_id = 'fastq-to-parquet' AND wt.state = 'no_data' AND wt.mask_idx IS NOT NULL AND NOT EXISTS (SELECT 1 FROM qiita.mask_sample ms WHERE ms.mask_idx = wt.mask_idx AND ms.prep_sample_idx = wt.prep_sample_idx)) ORDER BY wt.work_ticket_idx;`
+  Redrive a `failed` row with `qiita ticket run <work_ticket_idx>`. A `no_data` row is terminal, so re-submit it with the same action_context (`qiita ticket submit`). Each should end `no_data` with its `mask_idx` set (`qiita ticket status`), after which `qiita mask samples --mask-idx <mask_idx> --sequenced-pool-idx <pool>` lists the prep_sample `completed`. The exception is a prep_sample no ingest record shows empty (a control never ingested), which stays unrecorded. Known case: ticket 12402 (prep_sample 31483, pool 25056, mask 11).
+  For each pool masked with `submit-block-mask-pool`, re-run it with `--only-missing` and the same flags: the plan records the pool's empty wells (`samples_completed_empty`) and tiles nothing already gated. Then re-run the masked-read export for the affected pools.
 
 ### Notes (no host action)
 
@@ -99,7 +99,7 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
   write storm can occupy the whole pool and reads are refused for that window.
 - (#731) `GET /ena-import-batch/{idx}` items can read `completed_partial` (a pool landed with some runs failed permanently), and `ena_runs[].status` can be `download_failed`, with a new `failure_type`; clients matching on the closed set of states or statuses must accept them. `submit-ena-import --watch` exits 1 on a `completed_partial` item. A partially landed ticket is `completed`, so the submitter gets the work-ticket digest unless they opted out of processing emails.
 - (#751) `download-ena-study` 1.0.0 gains an optional `run_concurrency`. The optional control-plane `ENA_DOWNLOAD_RUN_CONCURRENCY` (1-8, default 4) stays at 4 in production (see `docs/runbooks/ena-import.md`).
-- (#fix/empty-sample-mask-gate) `POST …/block-mask-plan` returns two new counts, `samples_completed_empty` and `samples_skipped_invalidated`. `samples_skipped_no_reads` now counts only samples with no reads and no ingest record. A sample ingest found empty is now masked-complete, so the pool masking rollup counts it `completed` rather than `no_data`, and the read-metrics rollup counts it in `samples_zero_reads`.
+- (#fix/empty-sample-mask-gate) `POST …/block-mask-plan` returns two new counts, `samples_completed_empty` and `samples_skipped_invalidated`, and `samples_skipped_no_reads` now counts only prep_samples with no reads and no ingest record. A prep_sample that ingest found empty is now recorded as masked, so the pool masking rollup counts it `completed` rather than `no_data`, and the read-metrics rollup counts it in `samples_zero_reads`. Minting a sequence_range for it later removes that record. The block plan now resolves host filtering for such a prep_sample too, so one with unresolvable host metadata refuses the plan, as it already did for `submit-host-filter-pool`.
 
 ## Deployed history
 

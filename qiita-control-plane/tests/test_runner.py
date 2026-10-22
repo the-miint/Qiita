@@ -24,7 +24,11 @@ from pathlib import Path
 
 import asyncpg
 import pytest
-from qiita_common.actions import LONG_READ_ASSEMBLY_ACTION_ID
+from qiita_common.actions import (
+    FASTQ_TO_PARQUET_ACTION_ID,
+    LONG_READ_ASSEMBLY_ACTION_ID,
+    READ_MASK_ACTION_ID,
+)
 from qiita_common.api_paths import LibraryPrimitive
 from qiita_common.backend_failure import BackendFailure, FailureKind, StepNoData
 from qiita_common.models import (
@@ -6922,7 +6926,7 @@ _HOST_FILTER_STEP = {
 }
 _FINALIZE_MASK_SAMPLE = {
     "kind": "action",
-    "name": "finalize-mask-sample",
+    "name": LibraryPrimitive.FINALIZE_MASK_SAMPLE.value,
     "inputs": [],
     "outputs": [],
 }
@@ -7017,7 +7021,7 @@ async def _seed_mask_gate_ticket(pool, *, action_id, steps, ingest_state=None):
 
     async def _teardown():
         mask_idxs = await pool.fetch(
-            "SELECT DISTINCT mask_idx FROM qiita.work_ticket"
+            "SELECT mask_idx FROM qiita.work_ticket"
             " WHERE action_version = $1 AND mask_idx IS NOT NULL",
             version,
         )
@@ -7081,7 +7085,10 @@ async def test_read_mask_records_a_sample_ingest_found_empty_as_masked(
     NO_DATA too, and the sample is masked-complete under the mask the ticket minted,
     with zero read counts: there was nothing to mask."""
     work_ticket_idx, ps, teardown = await _seed_mask_gate_ticket(
-        postgres_pool, action_id="read-mask", steps=_READ_MASK_GATE_STEPS, ingest_state="no_data"
+        postgres_pool,
+        action_id=READ_MASK_ACTION_ID,
+        steps=_READ_MASK_GATE_STEPS,
+        ingest_state="no_data",
     )
     _stub_no_stored_reads(monkeypatch)
     try:
@@ -7101,7 +7108,7 @@ async def test_read_mask_writes_no_gate_for_an_empty_control_no_ingest_explains(
     """An expected-empty control with no finished ingest still ends NO_DATA, but its
     reads may simply not be ingested yet, so no gate row claims it masked."""
     work_ticket_idx, ps, teardown = await _seed_mask_gate_ticket(
-        postgres_pool, action_id="read-mask", steps=_READ_MASK_GATE_STEPS
+        postgres_pool, action_id=READ_MASK_ACTION_ID, steps=_READ_MASK_GATE_STEPS
     )
     _stub_no_stored_reads(monkeypatch, control=True)
     try:
@@ -7118,10 +7125,14 @@ async def test_read_mask_writes_no_gate_for_an_empty_control_no_ingest_explains(
 async def test_read_mask_for_a_never_ingested_sample_fails_and_carries_its_mask(
     postgres_pool, monkeypatch, tmp_path
 ):
-    """No reads and no ingest record: the sample must be ingested first. The mask is
-    minted before the reads are bound, so the failed ticket names it."""
+    """No reads, and the only ingest record is a failed one, which does not show the
+    prep_sample was read: it must be ingested first. The mask is minted before the
+    reads are bound, so the failed ticket names it."""
     work_ticket_idx, ps, teardown = await _seed_mask_gate_ticket(
-        postgres_pool, action_id="read-mask", steps=_READ_MASK_GATE_STEPS, ingest_state="failed"
+        postgres_pool,
+        action_id=READ_MASK_ACTION_ID,
+        steps=_READ_MASK_GATE_STEPS,
+        ingest_state="failed",
     )
     _stub_no_stored_reads(monkeypatch)
     try:
@@ -7142,7 +7153,7 @@ async def test_fastq_to_parquet_records_its_own_empty_input_as_masked(
     `fastq` step raises StepNoData after the mask is minted, and the ticket itself is
     the ingest that found the sample empty."""
     work_ticket_idx, ps, teardown = await _seed_mask_gate_ticket(
-        postgres_pool, action_id="fastq-to-parquet", steps=_FASTQ_TO_PARQUET_GATE_STEPS
+        postgres_pool, action_id=FASTQ_TO_PARQUET_ACTION_ID, steps=_FASTQ_TO_PARQUET_GATE_STEPS
     )
     backend = FakeBackendClient()
 
