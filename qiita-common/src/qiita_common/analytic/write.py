@@ -11,7 +11,7 @@ from pathlib import Path
 # `validate_parquet_path` is named for its first caller but checks a COPY *target* —
 # a path safe to interpolate into a SQL string literal, which cannot be bound — so it
 # is what every writer below uses, BIOM included.
-from ..parquet import PARQUET_OPTS, validate_parquet_path
+from ..parquet import PARQUET_OPTS_TRANSFER, validate_parquet_path
 from ..taxonomy import QUOTED_RANK_COLUMNS
 from .relations import LABELLED_RELATION, TAXONOMY_SIDECAR_RELATION, TREE_TABLE
 from .sidecar import TaxonomyClearance, TreeClearance
@@ -30,11 +30,11 @@ def parquet_copy_sql(path: Path) -> str:
     """COPY the relabelled table to Parquet, with the canonical options every qiita
     Parquet artifact shares.
 
-    `PARQUET_OPTS`' `ROW_GROUP_SIZE_BYTES` requires `SET preserve_insertion_order =
+    `PARQUET_OPTS_TRANSFER`' `ROW_GROUP_SIZE_BYTES` requires `SET preserve_insertion_order =
     false` on the writing connection — DuckDB errors at bind time otherwise — which is
     the caller's to set (see `parquet.py`).
     """
-    return f"COPY {LABELLED_RELATION} TO '{validate_parquet_path(path)}' ({PARQUET_OPTS})"
+    return f"COPY {LABELLED_RELATION} TO '{validate_parquet_path(path)}' ({PARQUET_OPTS_TRANSFER})"
 
 
 def biom_copy_sql(path: Path) -> str:
@@ -75,7 +75,7 @@ def taxonomy_copy_sql(path: Path, *, clearance: TaxonomyClearance) -> str:
     projection = ", ".join(("feature_id", *QUOTED_RANK_COLUMNS))
     return (
         f"COPY (SELECT {projection} FROM {TAXONOMY_SIDECAR_RELATION}) "
-        f"TO '{validate_parquet_path(path)}' ({PARQUET_OPTS})"
+        f"TO '{validate_parquet_path(path)}' ({PARQUET_OPTS_TRANSFER})"
     )
 
 
@@ -101,4 +101,4 @@ def tree_copy_sql(path: Path, *, clearance: TreeClearance) -> str:
     dataclass.
     """
     _ = clearance
-    return f"COPY {TREE_TABLE} TO '{validate_parquet_path(path)}' ({PARQUET_OPTS})"
+    return f"COPY {TREE_TABLE} TO '{validate_parquet_path(path)}' ({PARQUET_OPTS_TRANSFER})"

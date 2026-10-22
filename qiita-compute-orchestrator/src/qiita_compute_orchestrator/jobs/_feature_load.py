@@ -32,7 +32,7 @@ from pathlib import Path
 import duckdb
 from qiita_common.parquet import validate_parquet_path
 
-from ..miint import PARQUET_OPTS, PARQUET_OPTS_CHUNKED
+from ..miint import PARQUET_OPTS_CHUNKED_TRANSFER, PARQUET_OPTS_TRANSFER
 
 # Per-batch chunk budget, shared by every pass that reassembles or rewrites
 # chunked sequence data (`write_feature_sequence_chunks` here; the hashing pass and
@@ -128,7 +128,7 @@ def write_feature_sequences(
         "    feature_idx, sequence_hash, sequence_length_bp"
         "  FROM id_map"
         "  ORDER BY feature_idx"
-        f") TO '{out}' ({PARQUET_OPTS})"
+        f") TO '{out}' ({PARQUET_OPTS_TRANSFER})"
     )
 
 
@@ -260,7 +260,7 @@ def write_feature_sequence_chunks(
                 "  SELECT feature_idx, chunk_index, chunk_data"
                 "  FROM part_chunks"
                 "  ORDER BY feature_idx, chunk_index"
-                f") TO '{part_out}' ({PARQUET_OPTS_CHUNKED})"
+                f") TO '{part_out}' ({PARQUET_OPTS_CHUNKED_TRANSFER})"
             )
         conn.execute("DROP TABLE IF EXISTS part_chunks")
     else:
@@ -277,5 +277,5 @@ def write_feature_sequence_chunks(
             "    CAST(NULL AS INTEGER) AS chunk_index,"
             "    CAST(NULL AS VARCHAR) AS chunk_data"
             "  WHERE FALSE"
-            f") TO '{empty_out}' ({PARQUET_OPTS_CHUNKED})"
+            f") TO '{empty_out}' ({PARQUET_OPTS_CHUNKED_TRANSFER})"
         )

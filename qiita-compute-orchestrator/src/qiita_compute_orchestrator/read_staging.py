@@ -24,7 +24,7 @@ import duckdb
 from qiita_common.parquet import validate_parquet_path
 
 from .miint import (
-    PARQUET_OPTS,
+    PARQUET_OPTS_TRANSFER,
     apply_duckdb_settings,
     detected_ram_gb,
     duckdb_headroom_gb,
@@ -113,7 +113,7 @@ def write_sorted_reads(
                 "  read_id, sequence1, qual1, sequence2, qual2 "
                 f"FROM read_parquet(?){where_clause} "
                 "ORDER BY sequence_idx ) "
-                f"TO '{partial}' ({PARQUET_OPTS})",
+                f"TO '{partial}' ({PARQUET_OPTS_TRANSFER})",
                 [prep_sample_idx, sequence_idx_start, str(intermediate_path)],
             )
         # Publish atomically: the durable path only ever appears complete.

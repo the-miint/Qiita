@@ -28,8 +28,8 @@ from qiita_common.chunking import canonical_sequence_hash_expr, sequence_split_e
 from qiita_common.parquet import validate_parquet_path
 
 from ..miint import (
-    PARQUET_OPTS,
-    PARQUET_OPTS_CHUNKED,
+    PARQUET_OPTS_CHUNKED_TRANSFER,
+    PARQUET_OPTS_TRANSFER,
     apply_duckdb_settings,
     duckdb_tmp_dir,
     mafft_scratch_cwd,
@@ -281,16 +281,17 @@ def _write_outputs(conn, *, counts_out: Path, manifest_out: Path, chunks_dir: Pa
     try:
         conn.execute(
             f"COPY (SELECT prep_sample_idx, sequence_hash, count FROM asv "
-            f"ORDER BY prep_sample_idx, sequence_hash) TO '{safe_counts}' ({PARQUET_OPTS})"
+            f"ORDER BY prep_sample_idx, sequence_hash) TO '{safe_counts}' ({PARQUET_OPTS_TRANSFER})"
         )
         conn.execute(
             f"COPY (SELECT sequence_hash AS read_id, sequence_hash, sequence_length_bp "
-            f"FROM asv_seq ORDER BY sequence_hash) TO '{safe_manifest}' ({PARQUET_OPTS})"
+            f"FROM asv_seq ORDER BY sequence_hash) TO '{safe_manifest}' ({PARQUET_OPTS_TRANSFER})"
         )
         conn.execute(
             f"COPY (SELECT sequence_hash, c.chunk_index, c.chunk_data FROM ("
             f"  SELECT sequence_hash, UNNEST({sequence_split_expr('sequence1')}) AS c FROM asv_seq"
-            f") ORDER BY sequence_hash, c.chunk_index) TO '{chunk_part}' ({PARQUET_OPTS_CHUNKED})"
+            f") ORDER BY sequence_hash, c.chunk_index) "
+            f"TO '{chunk_part}' ({PARQUET_OPTS_CHUNKED_TRANSFER})"
         )
         os.replace(counts_partial, counts_out)
         os.replace(manifest_partial, manifest_out)

@@ -110,7 +110,7 @@ def _write_masked_sample(reader, stem: str, output_dir: Path, fmt: str, con) -> 
             # batches up to one row group's worth and write them as a single row
             # group — reproducing the layout (and bounded peak memory) of the
             # DuckDB `COPY` this path replaced. Size the group by encoded bytes
-            # (ROW_GROUP_SIZE_BYTES, the qiita-wide cap from PARQUET_OPTS) rather
+            # (ROW_GROUP_SIZE_BYTES, the qiita-wide cap every Parquet option set carries) rather
             # than a fixed row count, so wide rows don't produce oversized groups;
             # batch.nbytes is the in-memory size DuckDB's byte cap also measures.
             writer = pq.ParquetWriter(partial, reader.schema, compression=PARQUET_COMPRESSION)

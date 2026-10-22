@@ -53,8 +53,8 @@ from qiita_common.parquet import validate_parquet_path
 
 from ..cp_client import make_cp_client
 from ..miint import (
-    PARQUET_OPTS,
     PARQUET_OPTS_INTERMEDIATE,
+    PARQUET_OPTS_TRANSFER,
     apply_duckdb_settings,
     duckdb_tmp_dir,
     open_conn,
@@ -142,7 +142,7 @@ def _write_read_parts(
     where the first real PacBio run died. Paying for it with a bigger allocation
     would be paying for work we do not need to do.
 
-    What the ORDER BY actually buys is NOT a globally sorted file — `PARQUET_OPTS`
+    What the ORDER BY actually buys is NOT a globally sorted file — `PARQUET_OPTS_TRANSFER`
     says so explicitly: with `preserve_insertion_order=false` (which
     `ROW_GROUP_SIZE_BYTES` requires) "row groups land in thread-finish order". What
     it buys is that each row group stays CLUSTERED on the sort key, giving tight
@@ -203,7 +203,7 @@ def _write_read_parts(
             # explicit — preserve_insertion_order=false means DuckDB is free to emit
             # a batch's rows out of order, and the clustering is the point.
             "ORDER BY sequence_idx ) "
-            f"TO '{part}' ({PARQUET_OPTS})",
+            f"TO '{part}' ({PARQUET_OPTS_TRANSFER})",
             [prep_sample_idx, sequence_idx_start, str(intermediate), lo, hi],
         )
         parts += 1
