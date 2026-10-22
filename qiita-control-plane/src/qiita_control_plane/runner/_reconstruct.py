@@ -324,13 +324,7 @@ def _register_files_payload(attempt_dir: Path, staging_dir: Path) -> dict[str, s
     staged = _staged_register_files(staging_dir)
     record = action_payload_record(attempt_dir, str(staging_dir))
     if record.exists():
-        recorded = json.loads(record.read_text())
-        if recorded["staging_dir"] != str(staging_dir):
-            raise RuntimeError(
-                f"register-files: record {record} is for staging_dir "
-                f"{recorded['staging_dir']}, not {staging_dir}"
-            )
-        files: dict[str, str] = recorded["files"]
+        files: dict[str, str] = json.loads(record.read_text())["files"]
         unsent = {name: table for name, table in staged.items() if files.get(name) != table}
         if unsent:
             raise RuntimeError(

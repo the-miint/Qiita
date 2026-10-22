@@ -7,6 +7,7 @@ so a replay reads a staging dir the first call emptied, in part or in full.
 import json
 
 import pytest
+from qiita_common.actions import LibraryPrimitive
 
 from qiita_control_plane.runner._reconstruct import _register_files_payload
 from qiita_control_plane.workspace import action_payload_record, step_attempt_dir
@@ -28,7 +29,7 @@ _PAYLOAD = {
 
 
 def _attempt(tmp_path, attempt: int):
-    return step_attempt_dir(tmp_path / "ticket", "register-files", attempt)
+    return step_attempt_dir(tmp_path / "ticket", LibraryPrimitive.REGISTER_FILES, attempt)
 
 
 def test_first_call_records_what_it_sends(tmp_path, staged):
