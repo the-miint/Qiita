@@ -507,9 +507,9 @@ class BlockMaskPlanResponse(BaseModel):
     persisted + dispatched. `blocks` lists every created block with its
     dispatched work_ticket; `partitions` summarizes the per-mask tiling and the
     host filtering EACH partition resolved to (host filtering is resolved per
-    sample, so a pool can span several partitions); the `samples_*` counts reconcile the
-    pool's samples (planned + skipped-existing + skipped-no-reads +
-    completed-empty + skipped-invalidated). `samples_completed_empty` counts the
+    prep_sample, so a pool can span several partitions); the `samples_*` counts
+    reconcile the pool's prep_samples (planned + skipped-existing + skipped-no-reads
+    + completed-empty + skipped-invalidated). `samples_completed_empty` counts the
     prep_samples whose ingest stored no reads, recorded as masked with no reads to
     serve; `samples_skipped_invalidated` counts those of them whose masking was
     withdrawn earlier, which the plan leaves withdrawn. A pool with nothing to do

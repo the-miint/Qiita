@@ -669,5 +669,4 @@ async def test_post_removes_a_record_that_the_prep_sample_was_masked_with_no_rea
             == 0
         )
     finally:
-        await pool.execute("DELETE FROM qiita.mask_sample WHERE mask_idx = $1", mask_idx)
         await pool.execute("DELETE FROM qiita.mask_definition WHERE mask_idx = $1", mask_idx)

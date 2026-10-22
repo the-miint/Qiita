@@ -192,6 +192,20 @@ class AdapterMaterializationUnavailable(RuntimeError):
     The route maps this to a 503 — a misconfiguration, not a client error."""
 
 
+class BlockPlanSampleGainedReads(RuntimeError):
+    """A prep_sample the plan read as range-less, with an ingest record that it was
+    found empty, had a range minted before the plan could record it as masked. The
+    plan rolls back; planning the pool again tiles the new reads. The route maps this
+    to 409."""
+
+    def __init__(self, *, prep_sample_idx: int, sequenced_pool_idx: int):
+        self.prep_sample_idx = prep_sample_idx
+        super().__init__(
+            f"prep_sample {prep_sample_idx} gained stored reads while sequenced_pool"
+            f" {sequenced_pool_idx} was being planned; plan the pool again"
+        )
+
+
 class BlockMaskResubmitError(RuntimeError):
     """One or more requested samples already carry a `mask_sample` gate for their
     resolved mask, so a fresh (`only_missing=False`) plan is refused:
@@ -573,7 +587,8 @@ async def plan_and_submit_blocks(
     it as masked under that mask (`complete_empty_mask_sample_in_tx`), counted in
     `samples_completed_empty`; one whose gate was withdrawn is left so and counted in
     `samples_skipped_invalidated`. Any other range-less sample was never ingested and
-    is counted in `samples_skipped_no_reads`.
+    is counted in `samples_skipped_no_reads`. One that gains a range mid-plan raises
+    `BlockPlanSampleGainedReads`.
 
     Returns a JSON-able summary (partitions with their host refs, blocks + their
     tickets, counts). Raises asyncpg errors on a genuine DB fault (fail loud).
@@ -805,11 +820,8 @@ async def plan_and_submit_blocks(
                 invalidated_empty.append(e.prep_sample_idx)
                 continue
             if proof is None:
-                # Its ingest record held when the plan read it and no longer does: a
-                # range was minted since. Re-planning tiles its new reads.
-                raise RuntimeError(
-                    f"prep_sample {e.prep_sample_idx} gained stored reads while sequenced_pool"
-                    f" {sequenced_pool_idx} was being planned; plan the pool again"
+                raise BlockPlanSampleGainedReads(
+                    prep_sample_idx=e.prep_sample_idx, sequenced_pool_idx=sequenced_pool_idx
                 )
             completed_empty += 1
 

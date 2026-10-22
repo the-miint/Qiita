@@ -15,6 +15,7 @@ import pytest_asyncio
 from qiita_common.actions import (
     BAM_TO_PARQUET_ACTION_ID,
     BCL_CONVERT_ACTION_ID,
+    BCL_CONVERT_SAMPLE_MAP_KEY,
     FASTQ_TO_PARQUET_ACTION_ID,
     READ_MASK_ACTION_ID,
 )
@@ -90,7 +91,7 @@ async def ingest_ctx(pool_ctx):
             owner_idx,
             sequenced_pool_idx or pool_ctx["pool_idx"],
             state,
-            json.dumps({"sample_map": sample_map}),
+            json.dumps({BCL_CONVERT_SAMPLE_MAP_KEY: sample_map}),
             *_failure(state),
         )
 

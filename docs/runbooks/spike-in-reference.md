@@ -113,8 +113,7 @@ Each completed `read-mask` ticket under a SynDNA mask writes, per prep_sample, t
 of reads with a mapped primary alignment to each member of the reference — ungated,
 so not the `spikein_read_count_r1r2` total — into `qiita.syndna_read_count`. A
 prep_sample that ingest found empty gets a zero per member instead. A study
-reader exports them as the table classic Qiita published as `syndna.biom`
-(where an all-zero prep_sample has no cells, since BIOM keeps no zeros):
+reader exports them as the table classic Qiita published as `syndna.biom`:
 
 ```bash
 qiita mask syndna-read-count --mask-idx M --study-idx S --output syndna.biom \

@@ -2082,21 +2082,20 @@ async def _update_sequenced_sample_read_counts(
     conn: asyncpg.Connection | asyncpg.Pool,
     prep_sample_idx: int,
     *,
-    raw: int,
-    biological: int,
-    quality_filtered: int,
-    spikein: int,
+    raw: int | None,
+    biological: int | None,
+    quality_filtered: int | None,
+    spikein: int | None,
 ) -> int | None:
     """Write the four per-stage both-mates (`*_r1r2`) read counts onto the 1:1
     sequenced_sample row for `prep_sample_idx`; return its idx, or None if no such
-    row exists (the caller raises its own ordering-specific error).
+    row exists (the caller raises its own ordering-specific error). All four None
+    returns the row to "not yet masked".
 
-    Shared by `persist_read_metrics` (per-sample path, counts from a local
-    parquet) and `_finalize_sample_metrics` (block-compute path, counts from the
-    DuckLake `mask_metrics` aggregate). Idempotent — a retried workflow overwrites
-    with the same counts. Accepts a pool or a connection so it composes standalone
-    or inside a transaction. The DB CHECK (quality_filtered <= biological and
-    biological + spikein <= raw) enforces the bucket invariants at write time."""
+    Idempotent — a retried workflow overwrites with the same counts. Accepts a pool
+    or a connection so it composes standalone or inside a transaction. The DB CHECK
+    (quality_filtered <= biological and biological + spikein <= raw) enforces the
+    bucket invariants at write time."""
     return await conn.fetchval(
         "UPDATE qiita.sequenced_sample"
         " SET raw_read_count_r1r2 = $2,"
@@ -3114,9 +3113,7 @@ async def _complete_mask_sample_gate(
     prep_sample_idx: int,
 ) -> None:
     """Write the `(mask_idx, prep_sample_idx)` gate row to 'completed' on the caller's
-    transaction: for a per-sample masking run (`finalize_mask_sample_gate`), and for a
-    prep_sample ingest found empty (`complete_empty_mask_sample_in_tx`), which no block
-    can cover since a block tiles reads.
+    transaction.
 
     `mask_idx` is a config hash shared with the block path, so a sample can (in the
     pathological cross-path case) be masked by BOTH a per-sample ticket and an
@@ -3256,12 +3253,8 @@ async def clear_empty_mask_completions(conn: asyncpg.Connection, *, prep_sample_
             prep_sample_idx,
             cleared,
         )
-        await conn.execute(
-            "UPDATE qiita.sequenced_sample"
-            " SET raw_read_count_r1r2 = NULL, biological_read_count_r1r2 = NULL,"
-            "     quality_filtered_read_count_r1r2 = NULL, spikein_read_count_r1r2 = NULL"
-            " WHERE prep_sample_idx = $1",
-            prep_sample_idx,
+        await _update_sequenced_sample_read_counts(
+            conn, prep_sample_idx, raw=None, biological=None, quality_filtered=None, spikein=None
         )
     return len(cleared)
 

@@ -851,10 +851,10 @@ async def fetch_empty_ingest_tickets(
     ingested, and only an ingest record tells the two apart. The records that count:
 
     - a per-sample ingest (fastq-to-parquet, bam-to-parquet) of the prep_sample that
-      ended NO_DATA, which it does only when its input held no reads. The ticket
-      named by `current_work_ticket_idx` counts while it is still running: a running
-      per-sample ingest asks about its own input after finding it empty. Any other
-      caller passes None.
+      ended NO_DATA, which it does only when its input held no reads. A ticket
+      caller may pass its own idx as `current_work_ticket_idx`; it counts while still
+      running only when it is such an ingest, which asks about its own input after
+      finding it empty. A caller that is not a ticket passes None.
     - a bcl-convert ticket for the prep_sample's pool that ended COMPLETED or NO_DATA
       with the prep_sample in its `sample_map` roster. `ingest_reads` skips an empty
       well and fails the whole pool on a missing one, so a finished pool ingest with

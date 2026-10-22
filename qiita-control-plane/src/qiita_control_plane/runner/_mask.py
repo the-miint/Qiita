@@ -546,13 +546,13 @@ async def _materialize_adapter_set_hashes(
 
 
 # =============================================================================
-# The mask_sample gate for a sample ingest found empty
+# The mask_sample gate for a prep_sample ingest found empty
 # =============================================================================
 
 
 def _workflow_writes_mask_gate(steps: list[Any]) -> bool:
     """True iff some entry is the `finalize-mask-sample` action: the workflow records
-    each sample it masks in qiita.mask_sample, so the runner records a sample it ends
+    each prep_sample it masks in qiita.mask_sample, so the runner records one it ends
     at NO_DATA for want of reads there too."""
     return _workflow_declares_action(steps, LibraryPrimitive.FINALIZE_MASK_SAMPLE)
 

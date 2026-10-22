@@ -1,7 +1,8 @@
 """Sequence-range allocation routes.
 
-POST /sequence-range mints a contiguous bigint range for a prep_sample.
-Service-account callers with the `sequence_range:mint` scope only —
+POST /sequence-range mints a contiguous bigint range for a prep_sample, and in
+the same transaction removes any record that the prep_sample was masked with no
+reads (`clear_empty_mask_completions`). Service-account callers with the `sequence_range:mint` scope only —
 humans never mint sequence ranges. The cap on a single allocation is
 read from Settings.max_sequence_mint_count (so a runaway compute step
 can't burn an unbounded slice of the sequence_idx space).
@@ -67,7 +68,9 @@ async def mint_sequence_range_route(
     tx: TxConnFactory = Depends(get_tx_conn_factory),
     sa: ServiceAccount = Depends(require_service_with_scope(Scope.SEQUENCE_RANGE_MINT)),
 ) -> SequenceRange:
-    """Mint a contiguous sequence_idx range for `body.prep_sample_idx`.
+    """Mint a contiguous sequence_idx range for `body.prep_sample_idx`, and remove any
+    record that it was masked with no reads (`clear_empty_mask_completions`) in the
+    same transaction.
 
     Caller must be a ServiceAccount holding `sequence_range:mint`.
     Pydantic enforces count > 0 and prep_sample_idx > 0; the route adds
@@ -106,6 +109,9 @@ async def mint_sequence_range_route(
                 principal_idx=sa.principal_idx,
                 work_ticket_idx=body.work_ticket_idx,
             )
+            # The prep_sample is gaining reads, so a record that it was masked with
+            # none no longer holds; same transaction as the mint.
+            await clear_empty_mask_completions(conn, prep_sample_idx=body.prep_sample_idx)
         except asyncpg.UniqueViolationError:
             raise HTTPException(
                 status_code=409,
@@ -123,9 +129,6 @@ async def mint_sequence_range_route(
             raise HTTPException(status_code=400, detail="invalid sequence-range parameters")
         except asyncpg.PostgresError:
             raise HTTPException(status_code=500, detail="database error")
-        # The prep_sample is gaining reads, so a record that it was masked with none
-        # no longer holds; same transaction as the mint.
-        await clear_empty_mask_completions(conn, prep_sample_idx=body.prep_sample_idx)
 
     return _record_to_response(row)
 

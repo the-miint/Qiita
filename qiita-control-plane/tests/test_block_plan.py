@@ -19,7 +19,7 @@ import uuid
 
 import pytest
 import pytest_asyncio
-from qiita_common.actions import BCL_CONVERT_ACTION_ID
+from qiita_common.actions import BCL_CONVERT_ACTION_ID, BCL_CONVERT_SAMPLE_MAP_KEY
 from qiita_common.host_filter_plan import PoolPlanRefusal
 from qiita_common.models import (
     HOST_FILTER_INDEX_TYPE_RYPE,
@@ -580,7 +580,11 @@ async def pool_ingest(pooled):
             pooled["principal_idx"],
             pooled["pool_idx"],
             json.dumps(
-                {"sample_map": [{"prep_sample_idx": ps, "pool_item_id": str(ps)} for ps in roster]}
+                {
+                    BCL_CONVERT_SAMPLE_MAP_KEY: [
+                        {"prep_sample_idx": ps, "pool_item_id": str(ps)} for ps in roster
+                    ]
+                }
             ),
         )
 
@@ -655,6 +659,32 @@ async def test_plan_reaffirms_an_empty_sample_on_a_re_plan(pooled, planapp, pool
         "SELECT mask_idx FROM qiita.mask_sample WHERE prep_sample_idx = $1", empty
     )
     assert await _gate_state(pool, mask_idx, empty) == "completed"
+
+
+async def test_plan_refuses_a_prep_sample_that_gains_reads_mid_plan(pooled, planapp, monkeypatch):
+    """The plan read a prep_sample as found empty, but by the time it records it the
+    record no longer holds (here: there never was one, which is what a range minted
+    in between looks like to the writer). The plan raises and rolls back whole."""
+    pool = pooled["pool"]
+    with_reads = await pooled["add_sample"](reads=50)
+    rangeless = await pooled["add_sample"](reads=0)
+
+    async def _claims_empty(_pool, *, prep_sample_idxs, current_work_ticket_idx):
+        return dict.fromkeys(prep_sample_idxs, 1)
+
+    monkeypatch.setattr(block_planner, "fetch_empty_ingest_tickets", _claims_empty)
+
+    with pytest.raises(block_planner.BlockPlanSampleGainedReads) as ei:
+        await _plan(pooled, planapp)
+
+    assert ei.value.prep_sample_idx == rangeless
+    assert (
+        await pool.fetchval(
+            "SELECT count(*) FROM qiita.mask_sample WHERE prep_sample_idx = ANY($1::bigint[])",
+            [with_reads, rangeless],
+        )
+        == 0
+    )
 
 
 async def test_plan_leaves_a_withdrawn_empty_sample_withdrawn(pooled, planapp, pool_ingest):
