@@ -2496,15 +2496,9 @@ fn register_files(
             })
             .and_then(|()| move_file(&file.src, &file.dest));
         if let Err(e) = placed_one {
-            // A copy that failed partway can leave this file's destination
-            // behind; it goes back with the others. Not when the destination
-            // was already there: `move_file` refused it, and it is not ours.
-            let ours = if e.code() == tonic::Code::AlreadyExists {
-                i
-            } else {
-                i + 1
-            };
-            return Err(return_to_staging(conn, &placed[..ours], e));
+            // `move_file` leaves no destination of its own behind when it fails,
+            // so only the files before this one are this call's to move back.
+            return Err(return_to_staging(conn, &placed[..i], e));
         }
         moved.push((file.table.clone(), file.dest_str.clone()));
     }
@@ -3606,43 +3600,143 @@ fn staging_scope(staging_dir: &str, scratch_root: &std::path::Path) -> String {
 /// double-registration — surface it loudly as `AlreadyExists` rather than
 /// touching the file.
 ///
-/// If the copy succeeds but delete fails, the dest file is kept (it's the
-/// correct data) and the error message includes the orphaned source path
-/// for cleanup.
+/// The refusal is made by the call that creates the destination (a no-replace
+/// rename, a hard link, or a `create_new` copy), never by a check before it, so
+/// two calls placing one destination cannot both succeed. On failure no
+/// destination this call created is left behind. If the move succeeds but
+/// removing the staging source fails, the dest file is kept (it's the correct
+/// data) and a warning names the orphaned source.
 fn move_file(src: &std::path::Path, dest: &std::path::Path) -> Result<(), Status> {
-    if dest.exists() {
-        return Err(Status::already_exists(format!(
+    let refused = || {
+        Status::already_exists(format!(
             "refusing to overwrite existing lake file {}",
             dest.display()
-        )));
-    }
-    match std::fs::rename(src, dest) {
-        Ok(()) => Ok(()),
-        Err(e) if e.raw_os_error() == Some(18) => {
-            // EXDEV: cross-device link — fall back to copy + delete
-            std::fs::copy(src, dest).map_err(|e| {
-                Status::internal(format!(
-                    "cross-fs copy failed {} → {}: {e}",
-                    src.display(),
-                    dest.display()
-                ))
-            })?;
-            if let Err(e) = std::fs::remove_file(src) {
-                // Copy succeeded — dest has the data. Log the orphan but
-                // don't fail the operation. The staging file is stale.
-                eprintln!(
-                    "warning: cross-fs cleanup failed for {} (dest {} is valid): {e}",
-                    src.display(),
-                    dest.display()
-                );
-            }
-            Ok(())
+        ))
+    };
+    match rename_no_replace(src, dest) {
+        Ok(true) => return Ok(()),
+        Ok(false) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Err(refused()),
+        Err(e) => {
+            return Err(Status::internal(format!(
+                "rename failed {} → {}: {e}",
+                src.display(),
+                dest.display()
+            )))
         }
-        Err(e) => Err(Status::internal(format!(
-            "rename failed {} → {}: {e}",
+    }
+    match std::fs::hard_link(src, dest) {
+        Ok(()) => {
+            remove_moved_source(src, dest);
+            return Ok(());
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Err(refused()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(Status::internal(format!(
+                "move failed {} → {}: {e}",
+                src.display(),
+                dest.display()
+            )))
+        }
+        // Another filesystem, or a link the kernel refuses (Linux's
+        // `fs.protected_hardlinks` refuses one to a file the caller does not own
+        // and cannot write, and staged files are 0o440): copy instead.
+        Err(_) => {}
+    }
+    copy_no_replace(src, dest).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::AlreadyExists {
+            refused()
+        } else {
+            Status::internal(format!(
+                "cross-fs copy failed {} → {}: {e}",
+                src.display(),
+                dest.display()
+            ))
+        }
+    })?;
+    remove_moved_source(src, dest);
+    Ok(())
+}
+
+/// Rename `src` to `dest` unless `dest` exists, checked by the kernel in the same
+/// call, so two callers placing one destination cannot both succeed. `Ok(false)`
+/// when this platform or filesystem has no such rename, or the two paths are on
+/// different filesystems.
+fn rename_no_replace(src: &std::path::Path, dest: &std::path::Path) -> std::io::Result<bool> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let c = |p: &std::path::Path| {
+            std::ffi::CString::new(p.as_os_str().as_bytes())
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
+        };
+        let (from, to) = (c(src)?, c(dest)?);
+        // The raw syscall rather than glibc's wrapper, which only glibc 2.28 and
+        // later has. SAFETY: both paths are NUL-terminated and outlive the call.
+        #[cfg(target_os = "linux")]
+        let rc = unsafe {
+            libc::syscall(
+                libc::SYS_renameat2,
+                libc::AT_FDCWD,
+                from.as_ptr(),
+                libc::AT_FDCWD,
+                to.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        };
+        // SAFETY: as above.
+        #[cfg(target_os = "macos")]
+        let rc = unsafe { libc::renamex_np(from.as_ptr(), to.as_ptr(), libc::RENAME_EXCL) };
+        if rc == 0 {
+            return Ok(true);
+        }
+        let e = std::io::Error::last_os_error();
+        match e.raw_os_error() {
+            Some(libc::EXDEV | libc::EINVAL | libc::ENOSYS | libc::ENOTSUP) => Ok(false),
+            _ => Err(e),
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (src, dest);
+        Ok(false)
+    }
+}
+
+/// Copy `src` to a `dest` this call creates, refused when `dest` exists. A copy
+/// that fails partway removes the `dest` it created, so a failed move leaves no
+/// partial lake file behind.
+fn copy_no_replace(src: &std::path::Path, dest: &std::path::Path) -> std::io::Result<()> {
+    let mut from = std::fs::File::open(src)?;
+    let permissions = from.metadata()?.permissions();
+    let mut to = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(dest)?;
+    let copied =
+        std::io::copy(&mut from, &mut to).and_then(|_| std::fs::set_permissions(dest, permissions));
+    if let Err(e) = copied {
+        drop(to);
+        if let Err(cleanup) = std::fs::remove_file(dest) {
+            eprintln!(
+                "warning: failed to remove partial copy {}: {cleanup}",
+                dest.display()
+            );
+        }
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// Remove the staging source of a move that placed `dest`. A failure leaves a
+/// stale staging file and is not the move's failure: `dest` has the data.
+fn remove_moved_source(src: &std::path::Path, dest: &std::path::Path) {
+    if let Err(e) = std::fs::remove_file(src) {
+        eprintln!(
+            "warning: cleanup of moved file {} failed (dest {} is valid): {e}",
             src.display(),
             dest.display()
-        ))),
+        );
     }
 }
 

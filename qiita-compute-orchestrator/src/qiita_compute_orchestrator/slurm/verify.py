@@ -75,7 +75,7 @@ def verify_container_output(
     list with one VerificationFailure per problem found.
 
     `recovered` re-reads a step that passed every check when it finished, for a
-    resume: only the manifest and its `outputs` map are checked, with each
+    resume or a redrive: only the manifest and its `outputs` map are checked, with each
     declared output still present. The per-file checks (each listed file at its
     size; every file listed and read-only) are skipped, because a later step may
     have moved the files the manifest lists — `register-files` moves its staging

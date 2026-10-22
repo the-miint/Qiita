@@ -201,7 +201,7 @@ async def _reconstruct_completed_outputs(
         output_path=str(step_output_dir(attempt_workspace)),
         logs_path=str(step_logs_dir(attempt_workspace)),
     )
-    status = StepStatusWire(status=StepStatus.COMPLETED, raw_state="RECOVERED", recovered=True)
+    status = StepStatusWire(status=StepStatus.COMPLETED, recovered=True)
     raw_outputs = await _result_with_infra_retry(
         backend_client,
         handle,

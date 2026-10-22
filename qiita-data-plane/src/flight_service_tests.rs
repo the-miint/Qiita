@@ -1276,6 +1276,119 @@ fn move_file_refuses_to_overwrite_existing_dest() {
     );
 }
 
+/// Why `move_file` cannot refuse by checking first: a plain rename replaces an
+/// existing destination.
+#[test]
+fn rename_replaces_an_existing_destination() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, dest) = (tmp.path().join("src"), tmp.path().join("dest"));
+    std::fs::write(&src, b"new").unwrap();
+    std::fs::write(&dest, b"old").unwrap();
+    std::fs::rename(&src, &dest).unwrap();
+    assert_eq!(std::fs::read(&dest).unwrap(), b"new");
+}
+
+/// Each way `move_file` places a file is refused by the call itself when the
+/// destination exists, on the filesystem the tests run on.
+#[test]
+fn every_placement_refuses_an_existing_destination() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, dest) = (tmp.path().join("src"), tmp.path().join("dest"));
+    std::fs::write(&src, b"new").unwrap();
+    std::fs::write(&dest, b"old").unwrap();
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    assert_eq!(
+        rename_no_replace(&src, &dest).unwrap_err().kind(),
+        std::io::ErrorKind::AlreadyExists
+    );
+    assert_eq!(
+        std::fs::hard_link(&src, &dest).unwrap_err().kind(),
+        std::io::ErrorKind::AlreadyExists
+    );
+    assert_eq!(
+        copy_no_replace(&src, &dest).unwrap_err().kind(),
+        std::io::ErrorKind::AlreadyExists
+    );
+    assert_eq!(std::fs::read(&dest).unwrap(), b"old");
+    assert_eq!(std::fs::read(&src).unwrap(), b"new");
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn rename_no_replace_moves_to_a_free_destination() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, dest) = (tmp.path().join("src"), tmp.path().join("dest"));
+    std::fs::write(&src, b"new").unwrap();
+    assert!(rename_no_replace(&src, &dest).unwrap());
+    assert_eq!(std::fs::read(&dest).unwrap(), b"new");
+    assert!(!src.exists());
+}
+
+/// A copy that fails partway leaves no destination: here the source is a
+/// directory, which opens but cannot be read.
+#[test]
+fn copy_no_replace_removes_the_destination_of_a_failed_copy() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, dest) = (tmp.path().join("src"), tmp.path().join("dest"));
+    std::fs::create_dir(&src).unwrap();
+    copy_no_replace(&src, &dest).expect_err("copying a directory succeeded");
+    assert!(!dest.exists());
+}
+
+#[test]
+fn copy_no_replace_keeps_the_source_mode() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, dest) = (tmp.path().join("src"), tmp.path().join("dest"));
+    std::fs::write(&src, b"new").unwrap();
+    std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o440)).unwrap();
+    copy_no_replace(&src, &dest).unwrap();
+    assert_eq!(std::fs::read(&dest).unwrap(), b"new");
+    assert_eq!(
+        std::fs::metadata(&dest).unwrap().permissions().mode() & 0o777,
+        0o440
+    );
+}
+
+/// Calls racing to place one destination: exactly one succeeds, every other is
+/// refused with AlreadyExists, and the destination holds the winner's bytes.
+#[test]
+fn move_file_lets_one_of_racing_placements_through() {
+    const RACERS: usize = 16;
+    for _ in 0..20 {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("dest");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(RACERS));
+        let handles: Vec<_> = (0..RACERS)
+            .map(|n| {
+                let src = tmp.path().join(format!("src-{n}"));
+                std::fs::write(&src, format!("racer {n}")).unwrap();
+                let (dest, barrier) = (dest.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    (n, src.clone(), move_file(&src, &dest))
+                })
+            })
+            .collect();
+        let outcomes: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let winners: Vec<_> = outcomes.iter().filter(|(_, _, r)| r.is_ok()).collect();
+        assert_eq!(winners.len(), 1, "{} placements succeeded", winners.len());
+        for (n, src, result) in &outcomes {
+            match result {
+                Ok(()) => assert_eq!(
+                    std::fs::read(&dest).unwrap(),
+                    format!("racer {n}").as_bytes()
+                ),
+                Err(e) => {
+                    assert_eq!(e.code(), tonic::Code::AlreadyExists, "{}", e.message());
+                    assert!(src.exists(), "a refused move removed its source");
+                }
+            }
+        }
+    }
+}
+
 // The minted lake filename carries the work ticket (traceability) and is
 // unique across loads: the same producer basename registered under two
 // different tickets must land at distinct paths, so neither clobbers the
@@ -2090,7 +2203,7 @@ fn register_files_that_fails_after_its_moves_returns_the_files_to_staging() {
 #[test]
 #[serial_test::serial]
 #[cfg(feature = "integration")]
-fn register_files_leaves_a_destination_it_did_not_place() {
+fn register_files_fails_closed_on_a_destination_there_before_it_moves() {
     let connstr = crate::test_catalog::connstr();
     let data_path = crate::test_catalog::data_path();
     let ref_idx: i64 = 982_000_000 + std::process::id() as i64;
