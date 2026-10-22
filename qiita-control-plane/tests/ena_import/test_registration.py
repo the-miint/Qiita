@@ -1856,6 +1856,40 @@ async def test_partial_failure_run_leaves_no_orphan_rows_and_rerun_completes(reg
     assert final_count == 1
 
 
+async def test_pcr_selection_on_a_non_amplicon_run_fails_only_that_run(reg):
+    study_accession = unique_ena_accession("PRJNA")
+    header = _study_header(study_accession=study_accession)
+    ok_run = _run(
+        run_accession=unique_accession("SRR"),
+        experiment_accession=unique_accession("SRX"),
+        sample_accession=unique_accession("SAMN"),
+        study_accession=study_accession,
+    )
+    pcr_run = _run(
+        run_accession=unique_accession("SRR"),
+        experiment_accession=unique_accession("SRX"),
+        sample_accession=unique_accession("SAMN"),
+        study_accession=study_accession,
+        library_strategy="OTHER",
+        library_source="METAGENOMIC",
+        library_selection="PCR",
+    )
+
+    result = await _register(reg, study_header=header, ena_runs=[ok_run, pcr_run])
+
+    by_accession = {o.run_accession: o for o in result.ena_runs}
+    assert by_accession[ok_run.run_accession].status == EnaRunRegistrationStatus.REGISTERED
+    pcr_outcome = by_accession[pcr_run.run_accession]
+    assert pcr_outcome.status == EnaRunRegistrationStatus.FAILED
+    assert pcr_outcome.failure_reason is not None
+    assert "PCR" in pcr_outcome.failure_reason
+    orphan_count = await reg["pool"].fetchval(
+        "SELECT count(*) FROM qiita.sequenced_sample WHERE ena_run_accession = $1",
+        pcr_run.run_accession,
+    )
+    assert orphan_count == 0
+
+
 # ---------------------------------------------------------------------------
 # Unmappable-platform failure isolation -- a bad `instrument_platform` fails only
 # that run, never the whole study import.
