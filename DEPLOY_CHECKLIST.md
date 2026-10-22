@@ -48,7 +48,6 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
 ### 3. Migrations
 
 - `[operator]` (#731) `make migrate` applies `20261021000000_sequenced_sample_download_failure.sql` (two nullable columns and a both-or-neither CHECK on `qiita.sequenced_sample`; no backfill).
-- `[operator]` (#resume-step-identity) `make migrate` also applies `20261021010000_work_ticket_step_occurrence.sql` (adds `qiita.work_ticket_step.step_occurrence`, backfilled in the migration from each ticket's synced `steps:`, then NOT NULL plus a unique index; a trigger fills it for the still-running control plane, whose INSERT omits it, so migrating before the restart is safe; no out-of-band step).
 
 ### 4. Deploy
 
@@ -71,7 +70,6 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
   unit sets no cgroup limit. No separate journal read by hand; `SKIP_DP_POOL=1` drops the
   row.
 - `[admin]` (#731) `qiita.action` lists `download-ena-study` 1.0.0 with three steps, ending in `persist-ena-run-outcomes`, and `\d qiita.sequenced_sample` shows `download_failure_reason` and `download_failure_type`.
-- `[admin]` (#resume-step-identity) `\d qiita.work_ticket_step` shows `step_occurrence` (not null) and the index `work_ticket_step_identity_attempt`.
 
 ### 6. After the deploy verifies green
 
@@ -100,6 +98,7 @@ _None yet._
 - (#751) `download-ena-study` 1.0.0 gains an optional `run_concurrency`. The optional control-plane `ENA_DOWNLOAD_RUN_CONCURRENCY` (1-8, default 4) stays at 4 in production (see `docs/runbooks/ena-import.md`).
 - (#resume-step-identity) Resume and `/run` now match a ticket's step rows to the workflow's steps by name and occurrence, not position. A ticket whose rows name a step the synced workflow no longer has fails at `submission` with those rows in `failure_reason`, on the restart after this deploy as on any later redrive; it is resubmitted, not redriven. New user command `qiita ticket redrive` (dry-run by default) redrives a selection of FAILED tickets one at a time.
 - (#resume-step-identity) Resume and `/run` now match a ticket's step rows to the workflow's steps by name and occurrence, not position. A ticket whose rows name a step the synced workflow no longer has — including rows the migration could not match, left with a negative `step_occurrence` — is refused by `/run` with a 409, and fails at `submission` if the restart after this deploy resumes it; it is resubmitted, not redriven. `/run` also refuses a ticket under a deprecated mask. New user command `qiita ticket redrive` (dry-run by default) redrives a selection of FAILED tickets one at a time, at most 8 unfinished at once by default.
+- (#resume-step-identity) Resume and `/run` now check that each of a ticket's step rows still names the step at its recorded position in the synced workflow. A ticket whose rows do not — the workflow was edited in place since, inserting, removing or reordering steps ahead of a recorded one — is refused by `/run` with a 409, and fails at `submission` if the restart after this deploy resumes it; it is resubmitted (a `read-mask-block` ticket: re-masked under a new mask version), not redriven. `/run` also refuses a ticket under a deprecated mask. New user command `qiita ticket redrive` (dry-run by default) redrives a selection of FAILED tickets one at a time, at most 8 unfinished at once by default.
 
 ## Deployed history
 

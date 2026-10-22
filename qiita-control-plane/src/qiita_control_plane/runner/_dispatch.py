@@ -626,7 +626,6 @@ async def _dispatch_step(
     pool: asyncpg.Pool,
     work_ticket_idx: int,
     step_index: int,
-    step_occurrence: int,
     attempt: int,
     action_ceiling: ActionCeiling,
     mem_gb_override: int | None = None,
@@ -683,7 +682,6 @@ async def _dispatch_step(
         step_index=step_index,
         attempt=attempt,
         step_name=entry.name,
-        step_occurrence=step_occurrence,
         compute_target=ComputeTarget.SLURM,
         job_name=job_name,
     )

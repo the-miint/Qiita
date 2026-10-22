@@ -13,26 +13,24 @@ a guard miss raises rather than silently overwriting, surfacing a corrupted
 progress sequence loudly (fail-fast). They accept either a pool or a live
 connection so a caller can fold a progress write into a larger transaction.
 
-A row's identity is `(step_name, step_occurrence)`, not `step_index`: the
-runner reads the rows through `align_step_progress`, which first points each
-row's `step_index` at the entry its identity names in the action's current
-`steps:` list. Recovery reads these rows to decide,
+Recovery reads these rows via `load_step_progress` to decide,
 for a non-terminal ticket, which entries already completed (skip + rebuild
-`bound` from disk) and which to resume.
+`bound` from disk) and which to resume. A row is read for the entry at its
+`step_index` only while that entry still carries its `step_name`
+(`check_step_progress`): the action's `steps:` list is edited in place and
+re-synced without a version bump, so a position recorded before an edit can
+name a different entry after it.
 """
 
 from __future__ import annotations
 
-import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
 
 import asyncpg
-from qiita_common.actions import WorkflowAction, WorkflowStep
+from qiita_common.actions import BLOCK_MASK_ACTION_ID, WorkflowAction, WorkflowStep
 from qiita_common.models import ComputeTarget, StepProgressState
-
-_log = logging.getLogger(__name__)
 
 # asyncpg accepts either a pool (auto-acquires a transient connection per
 # call) or a live connection. Writers take both so the runner can fold a
@@ -43,7 +41,7 @@ _Executor = asyncpg.Pool | asyncpg.Connection
 # and StepProgressRow.from_record's body. A drift surfaces as a runtime KeyError
 # in from_record, not an import-time error.
 _COLUMNS = (
-    "work_ticket_idx, step_index, attempt, step_name, step_occurrence, compute_target, state, "
+    "work_ticket_idx, step_index, attempt, step_name, compute_target, state, "
     "slurm_job_id, job_name, failure_kind, failure_reason, created_at, updated_at"
 )
 
@@ -56,7 +54,6 @@ class StepProgressRow:
     step_index: int
     attempt: int
     step_name: str
-    step_occurrence: int
     compute_target: ComputeTarget
     state: StepProgressState
     slurm_job_id: int | None
@@ -73,7 +70,6 @@ class StepProgressRow:
             step_index=row["step_index"],
             attempt=row["attempt"],
             step_name=row["step_name"],
-            step_occurrence=row["step_occurrence"],
             compute_target=ComputeTarget(row["compute_target"]),
             state=StepProgressState(row["state"]),
             slurm_job_id=row["slurm_job_id"],
@@ -97,7 +93,6 @@ async def record_submitting(
     step_index: int,
     attempt: int,
     step_name: str,
-    step_occurrence: int,
     compute_target: ComputeTarget,
     job_name: str | None = None,
 ) -> None:
@@ -108,15 +103,14 @@ async def record_submitting(
     resets a row that already advanced."""
     await executor.execute(
         "INSERT INTO qiita.work_ticket_step"
-        " (work_ticket_idx, step_index, attempt, step_name, step_occurrence,"
-        "  compute_target, job_name, state)"
-        " VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"
+        " (work_ticket_idx, step_index, attempt, step_name, compute_target,"
+        "  job_name, state)"
+        " VALUES ($1, $2, $3, $4, $5, $6, $7)"
         " ON CONFLICT (work_ticket_idx, step_index, attempt) DO NOTHING",
         work_ticket_idx,
         step_index,
         attempt,
         step_name,
-        step_occurrence,
         compute_target.value,
         job_name,
         StepProgressState.SUBMITTING.value,
@@ -332,141 +326,64 @@ async def load_step_progress(executor: _Executor, work_ticket_idx: int) -> list[
 
 class StepProgressMismatch(Exception):
     """A ticket's progress rows name entries its action's current `steps:` list
-    does not have, so which entries already ran cannot be decided from them."""
-
-
-def step_occurrences(names: Sequence[str]) -> list[int]:
-    """Each entry's occurrence: how many earlier entries in `names` carry the
-    same name. `(name, occurrence)` is an entry's identity in
-    `qiita.work_ticket_step` (see the `step_occurrence` column comment)."""
-    seen: dict[str, int] = {}
-    occurrences = []
-    for name in names:
-        occurrence = seen.get(name, 0)
-        occurrences.append(occurrence)
-        seen[name] = occurrence + 1
-    return occurrences
+    does not have at their recorded positions, so which entries already ran
+    cannot be decided from them."""
 
 
 def _runs_where_recorded(entry: WorkflowStep | WorkflowAction, row: StepProgressRow) -> bool:
     """Whether `entry` is the kind of entry that writes `row`: an `action:` runs
     on the control plane, a `step:` on a compute backend. A row matching an
-    entry by identity but not by kind was written by a different entry."""
+    entry by position and name but not by kind was written by a different entry."""
     if isinstance(entry, WorkflowAction):
         return row.compute_target is ComputeTarget.CONTROL_PLANE
     return row.compute_target is not ComputeTarget.CONTROL_PLANE
 
 
-def _entry_positions(
-    entries: Sequence[WorkflowStep | WorkflowAction],
-) -> dict[tuple[str, int], tuple[int, WorkflowStep | WorkflowAction]]:
-    """Each entry's identity, mapped to its position in `entries` and the entry."""
-    return {
-        (entry.name, occurrence): (index, entry)
-        for index, (entry, occurrence) in enumerate(
-            zip(entries, step_occurrences([e.name for e in entries]), strict=True)
-        )
-    }
+def _resubmit_advice(action_id: str) -> str:
+    """What to do with a ticket whose progress rows no longer match its steps."""
+    if action_id == BLOCK_MASK_ACTION_ID:
+        # The block planner refuses a fresh plan for a sample whose mask gate is
+        # still pending (`block_planner.BlockMaskResubmitError`), so a new block
+        # ticket for the same mask cannot be submitted.
+        return "re-mask its samples under a new mask version instead"
+    return "submit a new ticket instead"
 
 
 def check_step_progress(
     work_ticket_idx: int,
+    action_id: str,
     rows: Sequence[StepProgressRow],
     entries: Sequence[WorkflowStep | WorkflowAction],
 ) -> None:
-    """Raise `StepProgressMismatch` when any of `rows` names no entry of
-    `entries`, or an entry of the other kind, naming those rows. The runner
-    checks before it resumes (`align_step_progress`), and `/run` before it
-    redrives, so a ticket that cannot resume is refused rather than failed again."""
-    positions = _entry_positions(entries)
-    unmatched = []
-    for row in rows:
-        hit = positions.get((row.step_name, row.step_occurrence))
-        if hit is None or not _runs_where_recorded(hit[1], row):
-            unmatched.append(row)
+    """Raise `StepProgressMismatch` when any of `rows` names an entry `entries`
+    does not have at the row's `step_index` (no entry there, one with another
+    name, or one of the other kind), naming those rows. The runner checks before
+    it resumes, and `/run` before it redrives, so a ticket that cannot resume is
+    refused rather than failed again.
+
+    Two entries may share a name (`action:` entries name their primitive), so an
+    edit that places another same-name entry at a recorded position is not
+    caught."""
+    unmatched = [
+        row
+        for row in rows
+        if row.step_index >= len(entries)
+        or entries[row.step_index].name != row.step_name
+        or not _runs_where_recorded(entries[row.step_index], row)
+    ]
     if not unmatched:
         return
     described = "; ".join(
-        f"{r.step_name!r} occurrence {r.step_occurrence} (recorded at step"
-        f" {r.step_index}, attempt {r.attempt}, {r.compute_target.value},"
-        f" {r.state.value})"
+        f"{r.step_name!r} at step {r.step_index} (attempt {r.attempt},"
+        f" {r.compute_target.value}, {r.state.value})"
         for r in unmatched
-    )
-    unmatchable = (
-        " A negative occurrence marks a row the step_occurrence migration could"
-        " not match to an entry of the list it was written under."
-        if any(r.step_occurrence < 0 for r in unmatched)
-        else ""
     )
     raise StepProgressMismatch(
         f"work_ticket {work_ticket_idx} has progress rows for entries the"
-        f" action's current steps list does not have: {described}. The"
-        " workflow was edited after these rows were written, so the ticket"
-        f" cannot be resumed; submit a new ticket instead.{unmatchable}"
+        f" action's current steps list does not have at those positions: {described}."
+        " The workflow was edited after these rows were written, so the ticket"
+        f" cannot be resumed; {_resubmit_advice(action_id)}."
     )
-
-
-async def align_step_progress(
-    pool: asyncpg.Pool,
-    work_ticket_idx: int,
-    entries: Sequence[WorkflowStep | WorkflowAction],
-) -> list[StepProgressRow]:
-    """Point every progress row of the ticket at the entry of `entries` that its
-    `(step_name, step_occurrence)` names, then return the rows as
-    `load_step_progress` does.
-
-    A row's `step_index` is the position its entry had when the row was
-    written, and the action's `steps:` list may have been edited and re-synced
-    since. After this call `step_index` is the entry's position in `entries`,
-    so every reader keyed on it reads the entry the row was written for.
-
-    Raises `StepProgressMismatch`, changing nothing, when any row's identity
-    names no entry of `entries` or an entry of the other kind."""
-    async with pool.acquire() as conn, conn.transaction():
-        rows = [
-            StepProgressRow.from_record(r)
-            for r in await conn.fetch(
-                f"SELECT {_COLUMNS} FROM qiita.work_ticket_step"
-                " WHERE work_ticket_idx = $1"
-                " ORDER BY step_index, attempt"
-                " FOR UPDATE",
-                work_ticket_idx,
-            )
-        ]
-        positions = _entry_positions(entries)
-        check_step_progress(work_ticket_idx, rows, entries)
-        moved = any(positions[(r.step_name, r.step_occurrence)][0] != r.step_index for r in rows)
-        if moved:
-            # The primary key includes step_index and is checked row by row, so
-            # an UPDATE that swaps two rows' positions collides part-way. Every
-            # row is first moved past both the old and the new positions, then
-            # set to its entry's position.
-            offset = 1 + max(len(entries), *(r.step_index for r in rows))
-            await conn.execute(
-                "UPDATE qiita.work_ticket_step SET step_index = step_index + $2"
-                " WHERE work_ticket_idx = $1",
-                work_ticket_idx,
-                offset,
-            )
-            identities = sorted({(r.step_name, r.step_occurrence) for r in rows})
-            await conn.execute(
-                "UPDATE qiita.work_ticket_step s SET step_index = m.step_index"
-                " FROM unnest($2::text[], $3::int[], $4::int[])"
-                "   AS m(step_name, step_occurrence, step_index)"
-                " WHERE s.work_ticket_idx = $1"
-                "   AND s.step_name = m.step_name"
-                "   AND s.step_occurrence = m.step_occurrence",
-                work_ticket_idx,
-                [name for name, _ in identities],
-                [occurrence for _, occurrence in identities],
-                [positions[identity][0] for identity in identities],
-            )
-            _log.warning(
-                "work_ticket %d: progress rows re-pointed at the current steps list"
-                " (the workflow was edited since they were written)",
-                work_ticket_idx,
-            )
-        return await load_step_progress(conn, work_ticket_idx)
 
 
 def first_incomplete_step_index(rows: Sequence[StepProgressRow], total_steps: int) -> int:

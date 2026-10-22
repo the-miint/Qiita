@@ -354,7 +354,6 @@ async def _dispatch_action(
     *,
     work_ticket_idx: int,
     step_index: int,
-    step_occurrence: int,
     attempt: int,
     signing_key: bytes,
     data_plane_url: str,
@@ -382,7 +381,6 @@ async def _dispatch_action(
         step_index=step_index,
         attempt=attempt,
         step_name=entry.name,
-        step_occurrence=step_occurrence,
         compute_target=ComputeTarget.CONTROL_PLANE,
     )
     try:

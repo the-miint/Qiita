@@ -115,7 +115,7 @@ The control plane's submit-time gate is **one ticket in flight per scope target*
 
 `qiita_control_plane.runner.run_workflow` walks an action's `steps:` list for a single `qiita.work_ticket`. Lives in the control plane (direct DB access for work_ticket / action / reference rows is legitimate here). For each entry:
 
-- `step:` — calls the orchestrator over HTTP via `qiita_common.compute_backend_client.ComputeBackendClient`, driving `submit_step` → poll `status_step` (CP-side loop, ~10s) → `result_step`. Per-entry, per-attempt progress is written to `qiita.work_ticket_step`, keyed by the entry's `(step_name, step_occurrence)` (see [processing](processing.md), manual restart), (write-ahead `submitting` before submit) so a CP restart re-attaches via `reconcile_inflight_tickets` instead of failing in-flight work. A CO-unreachable error is transient and retried in place, never failing the ticket.
+- `step:` — calls the orchestrator over HTTP via `qiita_common.compute_backend_client.ComputeBackendClient`, driving `submit_step` → poll `status_step` (CP-side loop, ~10s) → `result_step`. Per-`(step_index, attempt)` progress is written to `qiita.work_ticket_step` (write-ahead `submitting` before submit) so a CP restart re-attaches via `reconcile_inflight_tickets` instead of failing in-flight work. A CO-unreachable error is transient and retried in place, never failing the ticket.
 - `action:` — calls the matching primitive in `qiita_control_plane.actions.library.LIBRARY` directly, no HTTP hop.
 
 Status PATCHes declared in YAML (`target_status`) call `qiita_control_plane.actions.reference.transition_reference_status` in-process. Same atomic, transition-validated UPDATE the public `PATCH /reference/{idx}/status` route uses.

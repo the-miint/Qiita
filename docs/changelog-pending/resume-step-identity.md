@@ -1,19 +1,16 @@
 ### Fixed
 
-- **A redrive or restart after a workflow edit skips the steps that ran, not the
-  steps at their old positions (#NNN).** A ticket's step progress is matched to the
-  workflow's steps by step name and occurrence (how many earlier steps share that
-  name), so inserting, removing or reordering steps in a workflow YAML no longer makes
-  `qiita ticket run` or a control-plane restart fast-forward the wrong step. A ticket
-  whose progress names a step the workflow no longer has (removed, renamed, or changed
-  between a `step:` and an `action:`) is refused by `POST /work-ticket/{idx}/run` with a
-  409 naming that step, and fails at `submission` if a restart resumes it; submit a new
-  ticket for it instead. `qiita.work_ticket_step` gains a `step_occurrence` column,
-  backfilled by the migration; where the backfill cannot tell which entry a row was
-  written for (a repeated step name on a ticket whose workflow has changed since), the
-  row gets a negative occurrence and the ticket is refused the same way. The step
-  indexes a ticket's status and step logs show follow the current workflow after a
-  redrive, not the positions the steps had when they ran.
+- **A redrive or restart after a workflow edit no longer skips a step that did not
+  run (#NNN).** A ticket's step progress was matched to the workflow's steps by
+  position alone, so inserting, removing or reordering steps in a workflow YAML made
+  `qiita ticket run` or a control-plane restart fast-forward whichever step now sat
+  at a completed step's old position. Each progress row must now still name the step
+  at its position, by name and by kind (`step:` or `action:`). A ticket with a row
+  that does not is refused by `POST /work-ticket/{idx}/run` with a 409 naming that
+  row, and fails at `submission` if a restart resumes it; submit a new ticket for it
+  instead, or for a `read-mask-block` ticket, re-mask its samples under a new mask
+  version. An edit that puts another step of the same name at a recorded position is
+  not caught.
 - **A resumed ticket no longer fails at a completed step whose files
   `register-files` moved (#NNN).** On a resume or redrive, a completed SLURM step's
   outputs are re-read checking its manifest and declared outputs, not every file the

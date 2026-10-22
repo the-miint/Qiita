@@ -901,15 +901,12 @@ async def run_work_ticket(
     # "row missing" and "row exists but disabled" the same for redrive:
     # both mean the action is unreachable from this ticket. Submission
     # cares about the distinction (404 vs 410); redrive doesn't.
+    disabled = (
+        f"action {row['action_id']!r}/{row['action_version']!r} no longer enabled — cannot redrive"
+    )
     action = await _fetch_action_for_submission(pool, row["action_id"], row["action_version"])
     if action is None or not action["enabled"]:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=(
-                f"action {row['action_id']!r}/{row['action_version']!r} "
-                "no longer enabled — cannot redrive"
-            ),
-        )
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=disabled)
     _check_audience(principal, action["audience"])
     _check_scopes(principal, action["scopes"])
 
@@ -939,13 +936,7 @@ async def run_work_ticket(
         # here means the action was disabled since the check above.
         definition = await _fetch_action(pool, row["action_id"], row["action_version"])
         if definition is None:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=(
-                    f"action {row['action_id']!r}/{row['action_version']!r} "
-                    "no longer enabled — cannot redrive"
-                ),
-            )
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=disabled)
         async with pool.acquire() as conn, conn.transaction():
             # A redrive fast-forwards the completed mint, so the mint's own refusal
             # of a deprecated config never runs: the ticket would mask, or build
@@ -1057,6 +1048,7 @@ async def run_work_ticket(
             try:
                 check_step_progress(
                     work_ticket_idx,
+                    row["action_id"],
                     await load_step_progress(conn, work_ticket_idx),
                     definition.steps,
                 )
