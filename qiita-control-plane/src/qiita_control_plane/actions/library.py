@@ -66,6 +66,7 @@ from qiita_common.taxonomy import TAXONOMY_SOURCE_TABLE, genome_lineage_select_s
 
 from ..auth.tickets import run_signed_flight_call, sign_action, sign_ticket
 from ..miint import duckdb_connect
+from ..repositories import require_transaction
 from ..repositories.assembly import (
     ASSEMBLY_GENOME_MAP_PAIRS_SQL,
     ASSEMBLY_GENOME_MAP_ROWS_SQL,
@@ -2217,6 +2218,22 @@ def syndna_read_counts(alignment_path: Path, *, prep_sample_idx: int) -> dict[in
     return {int(feature_idx): int(n) for feature_idx, n in rows}
 
 
+async def _mask_syndna_inserts(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection, mask_idx: int
+) -> tuple[int, list[int]] | None:
+    """The mask's SynDNA reference_idx and the feature_idx of each of its inserts, or
+    None when the mask carries no SynDNA reference. Raises when the reference has no
+    members: no count could describe it."""
+    mask = await fetch_mask_syndna_reference(pool_or_conn, mask_idx)
+    if mask is None or mask["reference_idx"] is None:
+        return None
+    reference_idx = mask["reference_idx"]
+    inserts = [r["feature_idx"] for r in await fetch_syndna_inserts(pool_or_conn, reference_idx)]
+    if not inserts:
+        raise ValueError(f"SynDNA reference {reference_idx} has no members")
+    return reference_idx, inserts
+
+
 async def persist_syndna_read_count(
     pool: asyncpg.Pool,
     *,
@@ -2238,13 +2255,10 @@ async def persist_syndna_read_count(
     """
     if not alignment_path.exists():
         raise FileNotFoundError(f"syndna alignment parquet not found: {alignment_path}")
-    mask = await fetch_mask_syndna_reference(pool, mask_idx)
-    if mask is None or mask["reference_idx"] is None:
+    syndna = await _mask_syndna_inserts(pool, mask_idx)
+    if syndna is None:
         raise ValueError(f"mask {mask_idx} has no SynDNA reference; nothing to count against")
-    reference_idx = mask["reference_idx"]
-    inserts = [r["feature_idx"] for r in await fetch_syndna_inserts(pool, reference_idx)]
-    if not inserts:
-        raise ValueError(f"SynDNA reference {reference_idx} has no members")
+    reference_idx, inserts = syndna
     counted = syndna_read_counts(alignment_path, prep_sample_idx=prep_sample_idx)
     outside = sorted(set(counted) - set(inserts))
     if outside:
@@ -3083,7 +3097,21 @@ async def finalize_mask_sample_gate(
     preceding register-files step), so there is no partial state to model — the gate
     goes straight to 'completed' via an idempotent upsert. Runs AFTER register-files
     so the gate never reads 'completed' before the masked reads are in DuckLake. A
-    workflow retried from the start re-runs this and re-affirms 'completed'.
+    workflow retried from the start re-runs this and re-affirms 'completed'. What the
+    write refuses: `_complete_mask_sample_gate`."""
+    async with pool.acquire() as conn, conn.transaction():
+        await _complete_mask_sample_gate(conn, mask_idx=mask_idx, prep_sample_idx=prep_sample_idx)
+    return {"mask_idx": mask_idx, "prep_sample_idx": prep_sample_idx}
+
+
+async def _complete_mask_sample_gate(
+    conn: asyncpg.Connection,
+    *,
+    mask_idx: int,
+    prep_sample_idx: int,
+) -> None:
+    """Write the `(mask_idx, prep_sample_idx)` gate row to 'completed' on the caller's
+    transaction.
 
     `mask_idx` is a config hash shared with the block path, so a sample can (in the
     pathological cross-path case) be masked by BOTH a per-sample ticket and an
@@ -3101,25 +3129,77 @@ async def finalize_mask_sample_gate(
     it, this path and a block plan could each read "no conflict" before either
     writes, and both would proceed (the cross-path double-mask). With the lock,
     whichever runs second sees the other's committed state and refuses here (or the
-    planner raises `BlockMaskResubmitError`)."""
+    planner raises `BlockMaskResubmitError`).
+
+    Raises `MaskSampleInvalidated` when the row was withdrawn (see
+    `upsert_mask_sample_completed`)."""
+    # Serialize against the block planner's create_mask_sample_pending for this
+    # footprint (contract: see lock_mask_sample_gate_advisory). Held to commit.
+    await lock_mask_sample_gate_advisory(conn, mask_idx=mask_idx, prep_sample_idx=prep_sample_idx)
+    if await has_incomplete_covering_block(
+        conn, mask_idx=mask_idx, prep_sample_idx=prep_sample_idx
+    ):
+        raise RuntimeError(
+            f"refusing to finalize the mask_sample gate for (mask={mask_idx}, "
+            f"prep_sample={prep_sample_idx}): a covering block is still masking the "
+            "same footprint under this mask_idx (cross-path double-mask). The block "
+            "path owns this gate — delete the conflicting block-mask (or the "
+            "per-sample duplicate) before masking the same config twice."
+        )
+    await upsert_mask_sample_completed(conn, mask_idx=mask_idx, prep_sample_idx=prep_sample_idx)
+
+
+async def complete_empty_mask_sample_in_tx(
+    conn: asyncpg.Connection,
+    *,
+    mask_idx: int,
+    prep_sample_idx: int,
+) -> None:
+    """Record a prep_sample that ingest found empty as masked under `mask_idx`, on
+    the caller's transaction.
+
+    There are no reads to mask, so the pass-set is empty and complete: the gate goes
+    to 'completed' like any other finished mask, and consumers serve an empty
+    pass-set. The rows a finished mask would leave are written too, so a reader sees
+    the sample like any other: all-zero read counts on its sequenced_sample, and a
+    zero per insert when the mask carries a SynDNA reference (the SynDNA export
+    refuses a completed sample that has no count rows).
+
+    The caller establishes that ingest found the sample empty
+    (`fetch_empty_ingest_ticket`). Raises `MaskSampleInvalidated` when the gate row
+    was withdrawn; the count writes go with the caller's rollback."""
+    require_transaction(conn)
+    ss_idx = await _update_sequenced_sample_read_counts(
+        conn, prep_sample_idx, raw=0, biological=0, quality_filtered=0, spikein=0
+    )
+    if ss_idx is None:
+        raise RuntimeError(
+            f"no sequenced_sample row for prep_sample_idx={prep_sample_idx}; a sample "
+            "recorded as masked must be pooled (its 1:1 sequenced_sample created)"
+        )
+    syndna = await _mask_syndna_inserts(conn, mask_idx)
+    if syndna is not None:
+        _reference_idx, inserts = syndna
+        await replace_syndna_read_counts(
+            conn,
+            mask_idx=mask_idx,
+            prep_sample_idx=prep_sample_idx,
+            counts=dict.fromkeys(inserts, 0),
+        )
+    await _complete_mask_sample_gate(conn, mask_idx=mask_idx, prep_sample_idx=prep_sample_idx)
+
+
+async def complete_empty_mask_sample(
+    pool: asyncpg.Pool,
+    *,
+    mask_idx: int,
+    prep_sample_idx: int,
+) -> None:
+    """`complete_empty_mask_sample_in_tx` in a transaction of its own."""
     async with pool.acquire() as conn, conn.transaction():
-        # Serialize against the block planner's create_mask_sample_pending for this
-        # footprint (contract: see lock_mask_sample_gate_advisory). Held to commit.
-        await lock_mask_sample_gate_advisory(
+        await complete_empty_mask_sample_in_tx(
             conn, mask_idx=mask_idx, prep_sample_idx=prep_sample_idx
         )
-        if await has_incomplete_covering_block(
-            conn, mask_idx=mask_idx, prep_sample_idx=prep_sample_idx
-        ):
-            raise RuntimeError(
-                f"refusing to finalize the mask_sample gate for (mask={mask_idx}, "
-                f"prep_sample={prep_sample_idx}): a covering block is still masking the "
-                "same footprint under this mask_idx (cross-path double-mask). The block "
-                "path owns this gate — delete the conflicting block-mask (or the "
-                "per-sample duplicate) before masking the same config twice."
-            )
-        await upsert_mask_sample_completed(conn, mask_idx=mask_idx, prep_sample_idx=prep_sample_idx)
-    return {"mask_idx": mask_idx, "prep_sample_idx": prep_sample_idx}
 
 
 async def finalize_assembly_sample_gate(

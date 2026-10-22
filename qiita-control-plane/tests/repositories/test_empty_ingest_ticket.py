@@ -1,0 +1,230 @@
+"""DB tests for fetch_empty_ingest_ticket — the record that a prep_sample with no
+sequence_range was ingested and found empty, rather than never ingested.
+
+Each test seeds samples on the shared `pool_ctx` pool and attaches ingest tickets
+directly: per-sample (fastq-to-parquet, bam-to-parquet) by prep_sample, the pool
+ingest (bcl-convert) by sequenced_pool with a `sample_map` roster.
+"""
+
+import json
+import secrets
+import uuid
+
+import pytest
+import pytest_asyncio
+from qiita_common.actions import (
+    BAM_TO_PARQUET_ACTION_ID,
+    BCL_CONVERT_ACTION_ID,
+    FASTQ_TO_PARQUET_ACTION_ID,
+    READ_MASK_ACTION_ID,
+)
+
+from qiita_control_plane.repositories.sequenced_sample import fetch_empty_ingest_ticket
+
+pytestmark = pytest.mark.db
+
+
+@pytest_asyncio.fixture
+async def ingest_ctx(pool_ctx):
+    """`pool_ctx` plus throwaway-version action rows for the three ingests and
+    read-mask, and helpers to attach tickets and a read range to a sample."""
+    pg = pool_ctx["pool"]
+    owner_idx = pool_ctx["owner_idx"]
+    versions: dict[str, str] = {}
+    for action_id, target_kind in (
+        (BAM_TO_PARQUET_ACTION_ID, "prep_sample"),
+        (FASTQ_TO_PARQUET_ACTION_ID, "prep_sample"),
+        (READ_MASK_ACTION_ID, "prep_sample"),
+        (BCL_CONVERT_ACTION_ID, "sequenced_pool"),
+    ):
+        version = f"v-{uuid.uuid4()}"
+        await pg.execute(
+            "INSERT INTO qiita.action ("
+            "  action_id, version, target_kind, scopes, audience, context_schema, steps,"
+            "  cpu_ceiling, mem_ceiling_gb, walltime_ceiling, success_status, failure_status"
+            ") VALUES ($1, $2, $3::qiita.scope_target_kind, '{}'::text[], $4::jsonb,"
+            "          '{}'::jsonb, '[]'::jsonb, 1, 1, '1 minute', 'active', 'failed')",
+            action_id,
+            version,
+            target_kind,
+            json.dumps({"service": False, "human_roles": ["system_admin"]}),
+        )
+        versions[action_id] = version
+
+    def _failure(state):
+        # work_ticket_failure_consistent: the failure columns are set together on a
+        # FAILED ticket and all-NULL otherwise.
+        failed = state == "failed"
+        return (
+            "permanent" if failed else None,
+            "submission" if failed else None,
+            "test failure" if failed else None,
+        )
+
+    async def add_sample_ticket(action_id, prep_sample_idx, state):
+        return await pg.fetchval(
+            "INSERT INTO qiita.work_ticket"
+            "  (action_id, action_version, originator_principal_idx,"
+            "   scope_target_kind, prep_sample_idx, state,"
+            "   failure_type, failure_stage, failure_reason)"
+            " VALUES ($1, $2, $3, 'prep_sample'::qiita.scope_target_kind, $4,"
+            "         $5::qiita.work_ticket_state, $6::qiita.failure_type,"
+            "         $7::qiita.work_ticket_failure_stage, $8)"
+            " RETURNING work_ticket_idx",
+            action_id,
+            versions[action_id],
+            owner_idx,
+            prep_sample_idx,
+            state,
+            *_failure(state),
+        )
+
+    async def add_pool_ingest(state, roster, *, sequenced_pool_idx=None):
+        sample_map = [
+            {"prep_sample_idx": ps, "pool_item_id": f"item-{i}"} for i, ps in enumerate(roster)
+        ]
+        return await pg.fetchval(
+            "INSERT INTO qiita.work_ticket"
+            "  (action_id, action_version, originator_principal_idx,"
+            "   scope_target_kind, sequenced_pool_idx, state, action_context,"
+            "   failure_type, failure_stage, failure_reason)"
+            " VALUES ($1, $2, $3, 'sequenced_pool'::qiita.scope_target_kind, $4,"
+            "         $5::qiita.work_ticket_state, $6::jsonb, $7::qiita.failure_type,"
+            "         $8::qiita.work_ticket_failure_stage, $9)"
+            " RETURNING work_ticket_idx",
+            BCL_CONVERT_ACTION_ID,
+            versions[BCL_CONVERT_ACTION_ID],
+            owner_idx,
+            sequenced_pool_idx or pool_ctx["pool_idx"],
+            state,
+            json.dumps({"sample_map": sample_map}),
+            *_failure(state),
+        )
+
+    async def add_range(prep_sample_idx):
+        # A start far from anything else this worker seeds; ranges must not overlap.
+        start = 10**12 + secrets.randbelow(10**9) * 1000
+        await pg.execute(
+            "INSERT INTO qiita.sequence_range"
+            " (prep_sample_idx, sequence_idx_start, sequence_idx_stop, created_by_idx)"
+            " VALUES ($1, $2, $3, $4)",
+            prep_sample_idx,
+            start,
+            start + 9,
+            owner_idx,
+        )
+
+    extra_pools: list[int] = []
+
+    async def other_pool():
+        pool_idx = await pg.fetchval(
+            "INSERT INTO qiita.sequenced_pool (sequencing_run_idx, created_by_idx)"
+            " VALUES ($1, $2) RETURNING idx",
+            pool_ctx["run_idx"],
+            owner_idx,
+        )
+        extra_pools.append(pool_idx)
+        return pool_idx
+
+    yield {
+        **pool_ctx,
+        "add_sample_ticket": add_sample_ticket,
+        "add_pool_ingest": add_pool_ingest,
+        "add_range": add_range,
+        "other_pool": other_pool,
+    }
+
+    for action_id, version in versions.items():
+        await pg.execute(
+            "DELETE FROM qiita.work_ticket WHERE action_id = $1 AND action_version = $2",
+            action_id,
+            version,
+        )
+        await pg.execute(
+            "DELETE FROM qiita.action WHERE action_id = $1 AND version = $2", action_id, version
+        )
+    for pool_idx in extra_pools:
+        await pg.execute("DELETE FROM qiita.sequenced_pool WHERE idx = $1", pool_idx)
+
+
+async def _proof(ctx, prep_sample_idx, current=None):
+    return await fetch_empty_ingest_ticket(
+        ctx["pool"], prep_sample_idx=prep_sample_idx, current_work_ticket_idx=current
+    )
+
+
+async def test_no_ingest_record_is_none(ingest_ctx):
+    s = await ingest_ctx["add_sample"]()
+    assert await _proof(ingest_ctx, s.prep_sample_idx) is None
+
+
+@pytest.mark.parametrize("action_id", [BAM_TO_PARQUET_ACTION_ID, FASTQ_TO_PARQUET_ACTION_ID])
+async def test_per_sample_ingest_no_data_is_proof(ingest_ctx, action_id):
+    s = await ingest_ctx["add_sample"]()
+    wt = await ingest_ctx["add_sample_ticket"](action_id, s.prep_sample_idx, "no_data")
+    assert await _proof(ingest_ctx, s.prep_sample_idx) == wt
+
+
+@pytest.mark.parametrize("state", ["failed", "completed", "processing"])
+async def test_per_sample_ingest_in_another_state_is_not_proof(ingest_ctx, state):
+    """Only NO_DATA says the input was read and held nothing; a failed ingest may
+    never have read it."""
+    s = await ingest_ctx["add_sample"]()
+    await ingest_ctx["add_sample_ticket"](BAM_TO_PARQUET_ACTION_ID, s.prep_sample_idx, state)
+    assert await _proof(ingest_ctx, s.prep_sample_idx) is None
+
+
+async def test_the_callers_own_running_ingest_is_proof(ingest_ctx):
+    """fastq-to-parquet's run handler asks while its own ticket is still running: the
+    ticket that found the input empty is the caller."""
+    s = await ingest_ctx["add_sample"]()
+    wt = await ingest_ctx["add_sample_ticket"](
+        FASTQ_TO_PARQUET_ACTION_ID, s.prep_sample_idx, "processing"
+    )
+    assert await _proof(ingest_ctx, s.prep_sample_idx, current=wt) == wt
+    assert await _proof(ingest_ctx, s.prep_sample_idx) is None
+
+
+async def test_a_running_read_mask_is_not_its_own_proof(ingest_ctx):
+    """read-mask stores no reads, so its own ticket says nothing about ingest."""
+    s = await ingest_ctx["add_sample"]()
+    wt = await ingest_ctx["add_sample_ticket"](READ_MASK_ACTION_ID, s.prep_sample_idx, "processing")
+    assert await _proof(ingest_ctx, s.prep_sample_idx, current=wt) is None
+
+
+@pytest.mark.parametrize("state", ["completed", "no_data"])
+async def test_finished_pool_ingest_listing_the_sample_is_proof(ingest_ctx, state):
+    s = await ingest_ctx["add_sample"]()
+    wt = await ingest_ctx["add_pool_ingest"](state, [s.prep_sample_idx])
+    assert await _proof(ingest_ctx, s.prep_sample_idx) == wt
+
+
+async def test_failed_pool_ingest_is_not_proof(ingest_ctx):
+    s = await ingest_ctx["add_sample"]()
+    await ingest_ctx["add_pool_ingest"]("failed", [s.prep_sample_idx])
+    assert await _proof(ingest_ctx, s.prep_sample_idx) is None
+
+
+async def test_pool_ingest_whose_roster_omits_the_sample_is_not_proof(ingest_ctx):
+    s = await ingest_ctx["add_sample"]()
+    other = await ingest_ctx["add_sample"]()
+    await ingest_ctx["add_pool_ingest"]("completed", [other.prep_sample_idx])
+    assert await _proof(ingest_ctx, s.prep_sample_idx) is None
+
+
+async def test_pool_ingest_of_another_pool_is_not_proof(ingest_ctx):
+    s = await ingest_ctx["add_sample"]()
+    elsewhere = await ingest_ctx["other_pool"]()
+    await ingest_ctx["add_pool_ingest"](
+        "completed", [s.prep_sample_idx], sequenced_pool_idx=elsewhere
+    )
+    assert await _proof(ingest_ctx, s.prep_sample_idx) is None
+
+
+async def test_a_sample_with_reads_is_never_empty(ingest_ctx):
+    """A range means reads exist, whatever an ingest ticket says."""
+    s = await ingest_ctx["add_sample"]()
+    await ingest_ctx["add_sample_ticket"](BAM_TO_PARQUET_ACTION_ID, s.prep_sample_idx, "no_data")
+    await ingest_ctx["add_pool_ingest"]("completed", [s.prep_sample_idx])
+    await ingest_ctx["add_range"](s.prep_sample_idx)
+    assert await _proof(ingest_ctx, s.prep_sample_idx) is None

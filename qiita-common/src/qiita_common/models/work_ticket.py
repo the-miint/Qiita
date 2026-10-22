@@ -508,8 +508,11 @@ class BlockMaskPlanResponse(BaseModel):
     dispatched work_ticket; `partitions` summarizes the per-mask tiling and the
     host filtering EACH partition resolved to (there is no single pool-wide host
     answer any more — it is per sample); the `samples_*` counts reconcile the
-    pool's samples (planned + skipped-existing + skipped-no-reads). A pool with
-    nothing to do returns 202 with zero counts."""
+    pool's samples (planned + skipped-existing + skipped-no-reads +
+    completed-empty + skipped-invalidated). `samples_completed_empty` counts the
+    samples ingest found empty, recorded as masked with an empty pass-set;
+    `samples_skipped_invalidated` the empty ones whose gate row was withdrawn and is
+    left so. A pool with nothing to do returns 202 with zero counts."""
 
     sequencing_run_idx: Annotated[int, Field(gt=0)]
     sequenced_pool_idx: Annotated[int, Field(gt=0)]
@@ -517,6 +520,8 @@ class BlockMaskPlanResponse(BaseModel):
     samples_planned: Annotated[int, Field(ge=0)]
     samples_skipped_existing: Annotated[int, Field(ge=0)]
     samples_skipped_no_reads: Annotated[int, Field(ge=0)]
+    samples_completed_empty: Annotated[int, Field(ge=0)]
+    samples_skipped_invalidated: Annotated[int, Field(ge=0)]
     blocks_created: Annotated[int, Field(ge=0)]
     partitions: list[BlockPlanPartition]
     blocks: list[BlockPlanBlock]

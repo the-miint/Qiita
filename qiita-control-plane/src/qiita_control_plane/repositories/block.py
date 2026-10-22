@@ -241,7 +241,11 @@ async def fetch_mask_sample_state(
     masking workflows, first-class: the block path materializes 'pending' at plan
     time and flips it to 'completed' at reconcile;
     the per-sample mask-model workflows (read-mask, fastq-to-parquet) write
-    'completed' at their `finalize-mask-sample` terminal step. The third,
+    'completed' at their `finalize-mask-sample` terminal step. A sample that ingest
+    found empty has nothing to mask, so it is written 'completed' with an empty
+    pass-set (`complete_empty_mask_sample_in_tx`): a consumer of a 'completed' row
+    must accept zero rows, which is also what a sample whose every read failed QC
+    yields. The third,
     'invalidated', is written by an operator withdrawing a completed run whose
     output is not trustworthy — a judgement about one RUN, distinct from
     deprecating the CONFIG (`MaskDefinitionStatus`). So absence (`None`) means "no

@@ -15,9 +15,11 @@ one-time adapter DoGet.
 import json
 import secrets
 import types
+import uuid
 
 import pytest
 import pytest_asyncio
+from qiita_common.actions import BCL_CONVERT_ACTION_ID
 from qiita_common.host_filter_plan import PoolPlanRefusal
 from qiita_common.models import (
     HOST_FILTER_INDEX_TYPE_RYPE,
@@ -553,6 +555,156 @@ async def test_plan_reports_no_reads_samples(pooled, planapp):
     assert summary["samples_planned"] == 1
     assert summary["samples_skipped_no_reads"] == 1
     assert summary["blocks_created"] == 1
+
+
+@pytest_asyncio.fixture
+async def pool_ingest(pooled):
+    """`add(roster)`: a finished bcl-convert ticket for the pooled fixture's pool whose
+    `sample_map` lists `roster` — the record that ingest read those samples."""
+    pool = pooled["pool"]
+    version = f"plan-test-{uuid.uuid4()}"
+    await pool.execute(
+        "INSERT INTO qiita.action"
+        " (action_id, version, target_kind, scopes, audience, context_schema, steps,"
+        "  cpu_ceiling, mem_ceiling_gb, walltime_ceiling, success_status, failure_status)"
+        " VALUES ($1, $2, 'sequenced_pool', '{}'::text[], $3::jsonb, '{}'::jsonb, '[]'::jsonb,"
+        "         1, 1, '1 minute', 'active', 'failed')",
+        BCL_CONVERT_ACTION_ID,
+        version,
+        '{"service": false, "human_roles": ["wet_lab_admin"]}',
+    )
+
+    async def add(roster):
+        await pool.execute(
+            "INSERT INTO qiita.work_ticket"
+            "  (action_id, action_version, originator_principal_idx,"
+            "   scope_target_kind, sequenced_pool_idx, state, action_context)"
+            " VALUES ($1, $2, $3, 'sequenced_pool', $4, 'completed', $5::jsonb)",
+            BCL_CONVERT_ACTION_ID,
+            version,
+            pooled["principal_idx"],
+            pooled["pool_idx"],
+            json.dumps(
+                {"sample_map": [{"prep_sample_idx": ps, "pool_item_id": str(ps)} for ps in roster]}
+            ),
+        )
+
+    yield add
+    await pool.execute(
+        "DELETE FROM qiita.work_ticket WHERE action_id = $1 AND action_version = $2",
+        BCL_CONVERT_ACTION_ID,
+        version,
+    )
+    await pool.execute(
+        "DELETE FROM qiita.action WHERE action_id = $1 AND version = $2",
+        BCL_CONVERT_ACTION_ID,
+        version,
+    )
+
+
+async def _gate_state(pool, mask_idx, prep_sample_idx):
+    return await pool.fetchval(
+        "SELECT state FROM qiita.mask_sample WHERE mask_idx = $1 AND prep_sample_idx = $2",
+        mask_idx,
+        prep_sample_idx,
+    )
+
+
+async def test_plan_records_an_ingested_empty_sample_as_masked(pooled, planapp, pool_ingest):
+    """A range-less sample the pool ingest listed was an empty well: it is masked,
+    with an empty pass-set, under the mask its partition resolved to. One no ingest
+    listed was never ingested and is still reported as no-reads. Neither is tiled."""
+    pool = pooled["pool"]
+    with_reads = await pooled["add_sample"](reads=50)
+    empty = await pooled["add_sample"](reads=0)
+    never_ingested = await pooled["add_sample"](reads=0)
+    await pool_ingest([with_reads, empty])
+
+    summary, _ = await _plan(pooled, planapp)
+
+    assert summary["samples_planned"] == 1
+    assert summary["samples_completed_empty"] == 1
+    assert summary["samples_skipped_no_reads"] == 1
+    assert summary["samples_skipped_invalidated"] == 0
+    mask_idx = summary["partitions"][0]["mask_idx"]
+    assert await _gate_state(pool, mask_idx, with_reads) == "pending"
+    assert await _gate_state(pool, mask_idx, empty) == "completed"
+    assert await _gate_state(pool, mask_idx, never_ingested) is None
+    assert (
+        await pool.fetchval(
+            "SELECT raw_read_count_r1r2 FROM qiita.sequenced_sample WHERE prep_sample_idx = $1",
+            empty,
+        )
+        == 0
+    )
+    members = await pool.fetch(
+        "SELECT DISTINCT prep_sample_idx FROM qiita.block_member"
+        " WHERE prep_sample_idx = ANY($1::bigint[])",
+        [with_reads, empty, never_ingested],
+    )
+    assert [m["prep_sample_idx"] for m in members] == [with_reads]
+
+
+async def test_plan_reaffirms_an_empty_sample_on_a_re_plan(pooled, planapp, pool_ingest):
+    """An empty sample's completion is idempotent, so a fresh re-plan does not refuse
+    it the way it refuses a sample a prior plan tiled; only_missing leaves it too."""
+    pool = pooled["pool"]
+    empty = await pooled["add_sample"](reads=0)
+    await pool_ingest([empty])
+
+    first, _ = await _plan(pooled, planapp)
+    second, _ = await _plan(pooled, planapp)
+    third, _ = await _plan(pooled, planapp, only_missing=True)
+
+    for summary in (first, second, third):
+        assert summary["samples_completed_empty"] == 1
+        assert summary["blocks_created"] == 0
+    mask_idx = await pool.fetchval(
+        "SELECT mask_idx FROM qiita.mask_sample WHERE prep_sample_idx = $1", empty
+    )
+    assert await _gate_state(pool, mask_idx, empty) == "completed"
+
+
+async def test_plan_leaves_a_withdrawn_empty_sample_withdrawn(pooled, planapp, pool_ingest):
+    """A withdrawn gate row stays withdrawn: the empty sample is reported, its own
+    writes roll back, and the rest of the plan stands."""
+    pool = pooled["pool"]
+    withdrawn = await pooled["add_sample"](reads=0)
+    other = await pooled["add_sample"](reads=0)
+    await pool_ingest([withdrawn, other])
+    first, _ = await _plan(pooled, planapp)
+    mask_idx = await pool.fetchval(
+        "SELECT mask_idx FROM qiita.mask_sample WHERE prep_sample_idx = $1", withdrawn
+    )
+    await pool.execute(
+        "UPDATE qiita.mask_sample SET state = 'invalidated', invalidated_at = now(),"
+        "  invalidated_by_idx = $3, invalidation_reason = 'test withdrawal'"
+        " WHERE mask_idx = $1 AND prep_sample_idx = $2",
+        mask_idx,
+        withdrawn,
+        pooled["principal_idx"],
+    )
+    await pool.execute(
+        "UPDATE qiita.sequenced_sample SET raw_read_count_r1r2 = NULL,"
+        "  biological_read_count_r1r2 = NULL, quality_filtered_read_count_r1r2 = NULL,"
+        "  spikein_read_count_r1r2 = NULL WHERE prep_sample_idx = $1",
+        withdrawn,
+    )
+
+    second, _ = await _plan(pooled, planapp)
+
+    assert first["samples_completed_empty"] == 2
+    assert second["samples_completed_empty"] == 1
+    assert second["samples_skipped_invalidated"] == 1
+    assert await _gate_state(pool, mask_idx, withdrawn) == "invalidated"
+    assert await _gate_state(pool, mask_idx, other) == "completed"
+    assert (
+        await pool.fetchval(
+            "SELECT raw_read_count_r1r2 FROM qiita.sequenced_sample WHERE prep_sample_idx = $1",
+            withdrawn,
+        )
+        is None
+    )
 
 
 async def test_plan_excludes_retired_samples(pooled, planapp):

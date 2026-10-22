@@ -296,6 +296,18 @@ def _control_lookup(is_control: bool):
     return _fn
 
 
+# The zero-read empty-ingest lookup, monkeypatched for the same reason; its query is
+# pinned by the DB-bound tests in tests/repositories/test_empty_ingest_ticket.py.
+_EMPTY_INGEST_LOOKUP = "qiita_control_plane.runner._read_ingest.fetch_empty_ingest_ticket"
+
+
+def _empty_ingest_lookup(work_ticket_idx: int | None):
+    async def _fn(_pool, *, prep_sample_idx, current_work_ticket_idx):
+        return work_ticket_idx
+
+    return _fn
+
+
 def _staged_kwargs(tmp_path):
     return {
         "data_plane_url": "grpc://unused",
@@ -358,6 +370,7 @@ def test_resolve_staged_reads_empty_data_well_fails_must_be_ingested(tmp_path, m
     → BAD_INPUT 'must be ingested' — an unexpected-empty data well is a real
     failure, the no-stored-reads semantics preserved."""
     monkeypatch.setattr(_EXPORT_READ, lambda _u, _t: {"count": 0, "dest": "x"})
+    monkeypatch.setattr(_EMPTY_INGEST_LOOKUP, _empty_ingest_lookup(None))
     monkeypatch.setattr(_CONTROL_LOOKUP, _control_lookup(False))
     with pytest.raises(BackendFailure) as exc:
         asyncio.run(
@@ -374,6 +387,7 @@ def test_resolve_staged_reads_empty_control_well_is_no_data(tmp_path, monkeypatc
     expected-empty control (blank / NTC) → StepNoData (terminal no_data), NOT a
     failure — an empty control must not land in the pool's samples_failed."""
     monkeypatch.setattr(_EXPORT_READ, lambda _u, _t: {"count": 0, "dest": "x"})
+    monkeypatch.setattr(_EMPTY_INGEST_LOOKUP, _empty_ingest_lookup(None))
     monkeypatch.setattr(_CONTROL_LOOKUP, _control_lookup(True))
     with pytest.raises(StepNoData) as exc:
         asyncio.run(
@@ -383,6 +397,27 @@ def test_resolve_staged_reads_empty_control_well_is_no_data(tmp_path, monkeypatc
         )
     assert "expected-empty control" in exc.value.reason
     assert "7" in exc.value.reason
+
+
+def test_resolve_staged_reads_empty_ingest_is_no_data(tmp_path, monkeypatch):
+    """Durable absent, the data plane returns 0 rows, and an ingest read the sample
+    and found it empty → StepNoData naming that ingest, whether or not the well is a
+    control: the sample was ingested, there is just nothing in it."""
+    monkeypatch.setattr(_EXPORT_READ, lambda _u, _t: {"count": 0, "dest": "x"})
+    monkeypatch.setattr(_EMPTY_INGEST_LOOKUP, _empty_ingest_lookup(12218))
+
+    async def _not_consulted(_pool, _prep_sample_idx):
+        raise AssertionError("the control lookup must not decide an ingested-empty sample")
+
+    monkeypatch.setattr(_CONTROL_LOOKUP, _not_consulted)
+    with pytest.raises(StepNoData) as exc:
+        asyncio.run(
+            _resolve_staged_reads(
+                _FAKE_POOL, {"prep_sample_idx": 7}, tmp_path / "staging", **_staged_kwargs(tmp_path)
+            )
+        )
+    assert "ingest ticket 12218" in exc.value.reason
+    assert "prep_sample 7" in exc.value.reason
 
 
 def test_resolve_staged_reads_export_failure_is_bad_input(tmp_path, monkeypatch):
