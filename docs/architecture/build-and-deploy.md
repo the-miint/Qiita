@@ -307,8 +307,8 @@ clean:
 
 ## CI (GitHub Actions)
 
-CI is defined in [`.github/workflows/ci.yml`](../../.github/workflows/ci.yml). Where the file's comments give the reason for a job or step, that comment is the one place it is written, so this section does not copy it. What the file cannot say about itself:
+CI is two workflows. [`.github/workflows/ci.yml`](../../.github/workflows/ci.yml) lints, builds and tests. [`.github/workflows/review-loop-check.yml`](../../.github/workflows/review-loop-check.yml) checks the pull request description. Where a workflow's comments give the reason for a job or step, that comment is the one place it is written, so this section does not copy it. What the files cannot say about themselves:
 
-- **Jobs.** The `config` job runs first and picks the OS list. `lint-python` and `rust` follow, then `test-python`, `test-control-plane-with-db`, `test-integration` and `test-workflows`, each waiting on the jobs named in its `needs:`. `deploy-note-check` and `changelog-check` run on pull requests only.
+- **Jobs.** In `ci.yml`, the `config` job runs first and picks the OS list. `lint-python` and `rust` follow, then `test-python`, `test-control-plane-with-db`, `test-integration` and `test-workflows`, each waiting on the jobs named in its `needs:`. `deploy-note-check` and `changelog-check` run on pull requests only. `review-loop-check.yml` has the one job of that name, also on pull requests only. It requires the `## Reviewer loop` block in the description (see "Reviewing a branch" in `CLAUDE.md`).
 - **OS matrix.** A pull request runs the matrix jobs on Ubuntu only. A push to `main` runs them on Ubuntu and macOS. `test-workflows` is always Ubuntu-only.
-- **Labels.** `ci-macos` adds macOS to a pull request's matrix. `no-deploy-note` skips `deploy-note-check`, and `no-changelog` skips `changelog-check`.
+- **Labels.** `ci-macos` adds macOS to a pull request's matrix. `no-deploy-note` skips `deploy-note-check`, `no-changelog` skips `changelog-check`, and `no-agent-review` skips `review-loop-check`.
