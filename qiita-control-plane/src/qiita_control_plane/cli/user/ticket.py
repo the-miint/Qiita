@@ -12,6 +12,7 @@ from qiita_common.api_paths import (
     PATH_WORK_TICKET_PREFIX,
 )
 from qiita_common.models import (
+    NON_TERMINAL_WORK_TICKET_STATES,
     ScopeTargetKind,
     WorkTicketCreateRequest,
     WorkTicketListResponse,
@@ -86,6 +87,7 @@ def _list_work_tickets(
     prep_sample_idx: int | None,
     action_id: str | None,
     limit: int | None,
+    failure_type: str | None = None,
 ) -> dict:
     """GET /api/v1/work-ticket. Returns the WorkTicketListResponse envelope:
     `tickets` (each ticket plus its current step's compute_target /
@@ -110,6 +112,8 @@ def _list_work_tickets(
         params["action_id"] = action_id
     if limit is not None:
         params["limit"] = str(limit)
+    if failure_type is not None:
+        params["failure_type"] = failure_type
     return _common.call("GET", base_url, token, PATH_WORK_TICKET_PREFIX, params=params)
 
 
@@ -251,6 +255,7 @@ def _redrive(args: argparse.Namespace, token: str) -> tuple[dict, bool]:
             prep_sample_idx=args.prep_sample_idx,
             action_id=args.action_id,
             limit=args.limit,
+            failure_type=args.failure_type,
         )
     )
     if listing.truncated:
@@ -258,6 +263,8 @@ def _redrive(args: argparse.Namespace, token: str) -> tuple[dict, bool]:
             f"the selection matches more than the {listing.count} tickets returned;"
             " narrow it or raise --limit, so the run covers the whole selection"
         )
+    # The server filters on failure_type; filtering again here keeps a server
+    # that predates the parameter, and so ignores it, from widening the selection.
     selected = [
         t
         for t in listing.tickets
@@ -281,12 +288,23 @@ def _redrive(args: argparse.Namespace, token: str) -> tuple[dict, bool]:
         return report, True
     redriven: list[dict] = []
     refused: list[dict] = []
+    in_flight: list[int] = []
     report.update(redriven=redriven, refused=refused, not_attempted=[])
     for position, ticket in enumerate(selected):
         if position and args.rate_seconds:
             time.sleep(args.rate_seconds)
         try:
+            _wait_for_room(args, token, in_flight)
+        except (httpx.HTTPStatusError, httpx.RequestError) as exc:
+            report["stopped"] = {
+                "work_ticket_idx": ticket.work_ticket_idx,
+                "error": f"reading the redriven tickets' states failed: {exc!r}",
+            }
+            report["not_attempted"] = [t.work_ticket_idx for t in selected[position:]]
+            return report, False
+        try:
             redriven.append(_run_work_ticket(args.base_url, token, ticket.work_ticket_idx))
+            in_flight.append(ticket.work_ticket_idx)
         except httpx.HTTPStatusError as exc:
             if exc.response.status_code not in _PER_TICKET_REFUSALS:
                 report["stopped"] = {
@@ -310,14 +328,34 @@ def _redrive(args: argparse.Namespace, token: str) -> tuple[dict, bool]:
     return report, not refused
 
 
+def _wait_for_room(args: argparse.Namespace, token: str, in_flight: list[int]) -> None:
+    """Block until fewer than --max-inflight of the tickets this run redrove are
+    still pending, queued or processing, dropping the finished ones from
+    `in_flight`. A redrive dispatches at once, and what overloads the data
+    plane's edge is how many run together, not how fast they are sent."""
+    while len(in_flight) >= args.max_inflight:
+        time.sleep(args.poll_seconds)
+        in_flight[:] = [
+            idx
+            for idx in in_flight
+            if _get_work_ticket(args.base_url, token, idx)["state"]
+            in NON_TERMINAL_WORK_TICKET_STATES
+        ]
+
+
 def _handle_ticket_redrive(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
     """Redrive every ticket a selector picks, as `ticket run` does one: select
     FAILED (or CANCELLED) tickets with the `ticket list` filters, print them, and
     with --execute POST /work-ticket/{idx}/run for each in turn, --rate seconds
-    apart. Prints a JSON report; exits 1 when any selected ticket was not
-    redriven (refused, or not attempted after the run stopped)."""
+    apart and with at most --max-inflight of them unfinished at once. Prints a
+    JSON report; exits 1 when any selected ticket was not redriven (refused, or
+    not attempted after the run stopped)."""
     if args.rate_seconds < 0:
         parser.error(f"--rate must be >= 0, got {args.rate_seconds}")
+    if args.max_inflight < 1:
+        parser.error(f"--max-inflight must be >= 1, got {args.max_inflight}")
+    if args.poll_seconds <= 0:
+        parser.error(f"--poll-seconds must be > 0, got {args.poll_seconds}")
     try:
         token = _common.read_token()
     except RuntimeError as exc:

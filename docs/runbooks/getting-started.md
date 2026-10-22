@@ -383,10 +383,11 @@ to do next. A job that fails on a transient problem, such as a node failure or r
 of memory, is retried automatically; other
 read-loading failures are re-driven with `qiita ticket run`, or many at once with
 `qiita ticket redrive`, which takes the `ticket list` filters, prints what it
-selected, and re-drives them one at a time only with `--execute` (`--rate` sets the
-seconds between them). A job whose workflow lost or renamed a step it already ran
-cannot be re-driven: it fails at submission naming that step, and is resubmitted
-instead. The ones that
+selected, and re-drives them one at a time only with `--execute`, with at most
+`--max-inflight` of them running at once (default 8; `--rate` adds seconds between
+them). A job whose workflow lost or renamed a step it already ran cannot be
+re-driven: `/run` refuses it naming that step, and it is resubmitted instead. A job
+under a deprecated mask is refused too. The ones that
 cannot be re-driven end in removing the pool, which only an
 operator can do — so take the reason to yours;
 [`fastq-to-parquet-retry-recovery.md`](fastq-to-parquet-retry-recovery.md) is the

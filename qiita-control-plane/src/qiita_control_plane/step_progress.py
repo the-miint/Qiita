@@ -357,6 +357,55 @@ def _runs_where_recorded(entry: WorkflowStep | WorkflowAction, row: StepProgress
     return row.compute_target is not ComputeTarget.CONTROL_PLANE
 
 
+def _entry_positions(
+    entries: Sequence[WorkflowStep | WorkflowAction],
+) -> dict[tuple[str, int], tuple[int, WorkflowStep | WorkflowAction]]:
+    """Each entry's identity, mapped to its position in `entries` and the entry."""
+    return {
+        (entry.name, occurrence): (index, entry)
+        for index, (entry, occurrence) in enumerate(
+            zip(entries, step_occurrences([e.name for e in entries]), strict=True)
+        )
+    }
+
+
+def check_step_progress(
+    work_ticket_idx: int,
+    rows: Sequence[StepProgressRow],
+    entries: Sequence[WorkflowStep | WorkflowAction],
+) -> None:
+    """Raise `StepProgressMismatch` when any of `rows` names no entry of
+    `entries`, or an entry of the other kind, naming those rows. The runner
+    checks before it resumes (`align_step_progress`), and `/run` before it
+    redrives, so a ticket that cannot resume is refused rather than failed again."""
+    positions = _entry_positions(entries)
+    unmatched = []
+    for row in rows:
+        hit = positions.get((row.step_name, row.step_occurrence))
+        if hit is None or not _runs_where_recorded(hit[1], row):
+            unmatched.append(row)
+    if not unmatched:
+        return
+    described = "; ".join(
+        f"{r.step_name!r} occurrence {r.step_occurrence} (recorded at step"
+        f" {r.step_index}, attempt {r.attempt}, {r.compute_target.value},"
+        f" {r.state.value})"
+        for r in unmatched
+    )
+    unmatchable = (
+        " A negative occurrence marks a row the step_occurrence migration could"
+        " not match to an entry of the list it was written under."
+        if any(r.step_occurrence < 0 for r in unmatched)
+        else ""
+    )
+    raise StepProgressMismatch(
+        f"work_ticket {work_ticket_idx} has progress rows for entries the"
+        f" action's current steps list does not have: {described}. The"
+        " workflow was edited after these rows were written, so the ticket"
+        f" cannot be resumed; submit a new ticket instead.{unmatchable}"
+    )
+
+
 async def align_step_progress(
     pool: asyncpg.Pool,
     work_ticket_idx: int,
@@ -384,33 +433,9 @@ async def align_step_progress(
                 work_ticket_idx,
             )
         ]
-        positions = {
-            (entry.name, occurrence): (index, entry)
-            for index, (entry, occurrence) in enumerate(
-                zip(entries, step_occurrences([e.name for e in entries]), strict=True)
-            )
-        }
-        unmatched = []
-        moved = False
-        for row in rows:
-            hit = positions.get((row.step_name, row.step_occurrence))
-            if hit is None or not _runs_where_recorded(hit[1], row):
-                unmatched.append(row)
-            elif hit[0] != row.step_index:
-                moved = True
-        if unmatched:
-            described = "; ".join(
-                f"{r.step_name!r} occurrence {r.step_occurrence} (recorded at step"
-                f" {r.step_index}, attempt {r.attempt}, {r.compute_target.value},"
-                f" {r.state.value})"
-                for r in unmatched
-            )
-            raise StepProgressMismatch(
-                f"work_ticket {work_ticket_idx} has progress rows for entries the"
-                f" action's current steps list does not have: {described}. The"
-                " workflow was edited after these rows were written, so the ticket"
-                " cannot be resumed; submit a new ticket instead."
-            )
+        positions = _entry_positions(entries)
+        check_step_progress(work_ticket_idx, rows, entries)
+        moved = any(positions[(r.step_name, r.step_occurrence)][0] != r.step_index for r in rows)
         if moved:
             # The primary key includes step_index and is checked row by row, so
             # an UPDATE that swaps two rows' positions collides part-way. Every

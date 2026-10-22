@@ -13,7 +13,7 @@
 
 -- migrate:up
 ALTER TABLE qiita.work_ticket_step
-  ADD COLUMN step_occurrence INT CHECK (step_occurrence >= 0);
+  ADD COLUMN step_occurrence INT;
 
 -- Backfill, per ticket. Where the ticket's synced action still names step_name
 -- at every row's step_index, the occurrence is read off that definition: the
@@ -36,17 +36,32 @@ UPDATE qiita.work_ticket_step s
             AND (a.steps -> o.step_index ->> 'name') IS DISTINCT FROM o.step_name);
 
 -- A ticket whose rows the current definition no longer matches was written
--- under an earlier step list. Its occurrences are ranked from its own rows: the
--- n-th distinct step_index carrying a name is occurrence n - 1. Applied to the
--- whole ticket, never mixed with the exact form above, so the unique index
--- below holds.
+-- under an earlier step list, which is not kept. A name with at most one entry
+-- in the current list and rows at one step_index is occurrence 0. Any other
+-- name — repeated in the current list, or recorded at more than one step_index —
+-- cannot be matched to an entry from the rows alone (an earlier same-name entry
+-- may have been skipped by its `when:` gate, or removed since), so its rows get a
+-- negative occurrence, -n for the n-th distinct step_index carrying the name. No
+-- entry has a negative occurrence, so the runner fails such a ticket at resume
+-- naming the rows rather than fast-forwarding a guess
+-- (`step_progress.align_step_progress`). Applied to the whole ticket, never mixed
+-- with the exact form above, so the unique index below holds.
 UPDATE qiita.work_ticket_step s
-   SET step_occurrence = r.occurrence
-  FROM (SELECT work_ticket_idx, step_index, attempt,
-               dense_rank() OVER (
-                 PARTITION BY work_ticket_idx, step_name ORDER BY step_index
-               ) - 1 AS occurrence
-          FROM qiita.work_ticket_step) r
+   SET step_occurrence = CASE WHEN r.ambiguous THEN -r.rank ELSE 0 END
+  FROM (SELECT x.work_ticket_idx, x.step_index, x.attempt, x.rank,
+               max(x.rank) OVER (PARTITION BY x.work_ticket_idx, x.step_name) > 1
+                 OR (SELECT count(*)
+                       FROM qiita.work_ticket t
+                       JOIN qiita.action a
+                         ON a.action_id = t.action_id AND a.version = t.action_version
+                      CROSS JOIN LATERAL jsonb_array_elements(a.steps) AS e(entry)
+                      WHERE t.work_ticket_idx = x.work_ticket_idx
+                        AND e.entry ->> 'name' = x.step_name) > 1 AS ambiguous
+          FROM (SELECT work_ticket_idx, step_name, step_index, attempt,
+                       dense_rank() OVER (
+                         PARTITION BY work_ticket_idx, step_name ORDER BY step_index
+                       ) AS rank
+                  FROM qiita.work_ticket_step) x) r
  WHERE s.step_occurrence IS NULL
    AND r.work_ticket_idx = s.work_ticket_idx
    AND r.step_index = s.step_index
@@ -60,9 +75,9 @@ ALTER TABLE qiita.work_ticket_step
 -- names no step_occurrence. For an INSERT that leaves it NULL, this trigger
 -- counts it off the ticket's synced action, the same count the exact backfill
 -- above takes; without a match it is 0 and the NOT NULL holds. An INSERT that
--- sets the column is left as it is. On a ticket the backfill ranked, the count
--- can differ from the ranked rows' and the INSERT then fails on the unique
--- index below; such a ticket's rows already disagree with its definition.
+-- sets the column is left as it is. On a ticket the backfill could not match,
+-- the rows the previous control plane adds are counted off the current list too;
+-- its negative rows still fail the ticket at resume.
 CREATE FUNCTION qiita.work_ticket_step_fill_occurrence() RETURNS trigger
 LANGUAGE plpgsql AS $$
 BEGIN
@@ -91,7 +106,8 @@ CREATE UNIQUE INDEX work_ticket_step_identity_attempt
 COMMENT ON COLUMN qiita.work_ticket_step.step_occurrence IS
   'How many earlier entries of the action''s steps: list carry the same name '
   '(0-based). (step_name, step_occurrence) identifies the entry across in-place '
-  'edits of the list; step_index is its position in the list as last synced.';
+  'edits of the list; step_index is its position in the list as last synced. '
+  'Negative on a row the backfill could not match to an entry.';
 
 -- migrate:down
 DROP TRIGGER work_ticket_step_fill_occurrence ON qiita.work_ticket_step;

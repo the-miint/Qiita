@@ -49,6 +49,11 @@ def step_logs_dir(attempt_dir: Path) -> Path:
 
 def action_payload_record(attempt_dir: Path, key: str) -> Path:
     """Where an `action:` entry records the payload it sent for `key`, beside its
-    attempt directories, so every attempt of the entry finds the same record."""
+    attempt directories, so every attempt of the entry finds the same record.
+
+    A redrive needs this record, as it needs the completed steps' outputs, so a
+    ticket's workspace may be reclaimed only once `/run` refuses the ticket. A
+    ticket redriven without it resends what is left in staging, not what the
+    first call sent."""
     digest = hashlib.sha256(key.encode()).hexdigest()
     return attempt_dir.parent / f"payload-{digest}.json"

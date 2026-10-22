@@ -22,11 +22,10 @@ from qiita_common.api_paths import (
 from qiita_common.backend_failure import BackendFailure, FailureKind
 from qiita_common.compute_backend_client import ComputeBackendClient
 from qiita_common.data_plane_errors import (
-    is_data_plane_busy,
-    is_data_plane_ticket_expired,
     is_data_plane_transient,
 )
 from qiita_common.models import (
+    RECOVERED_RAW_STATE,
     TERMINAL_STEP_PROGRESS_STATES,
     ComputeTarget,
     ScopeTargetKind,
@@ -169,13 +168,14 @@ async def _reconstruct_completed_outputs(
     """Rebuild the bound outputs of an already-COMPLETED entry from disk,
     without re-running it.
 
-    A `step:` entry re-reads its verified output manifest through `result_step`
+    A `step:` entry re-reads its output manifest through `result_step`
     (reconstructing a handle from the progress row's job id + the deterministic
-    per-attempt `output`/`logs` dirs). This doubles as the filesystem
-    tiebreaker for a now-purged job: a valid manifest yields the outputs; a
-    missing / broken one raises CONTRACT_VIOLATION → the resumed workflow
-    fails, as it should when a completed step's output has vanished from
-    scratch.
+    per-attempt `output`/`logs` dirs), marked `RECOVERED_RAW_STATE` so the
+    orchestrator checks the manifest and the declared outputs rather than every
+    listed file. This doubles as the filesystem tiebreaker for a now-purged job:
+    a valid manifest yields the outputs; a missing / broken one, or a declared
+    output that is gone, raises CONTRACT_VIOLATION → the resumed workflow fails,
+    as it should when a completed step's output has vanished from scratch.
 
     An `action:` entry rebuilds its deterministic output paths in-process (see
     `_reconstruct_action_outputs`) — the in-process primitive must not re-run.
@@ -203,7 +203,7 @@ async def _reconstruct_completed_outputs(
         output_path=str(step_output_dir(attempt_workspace)),
         logs_path=str(step_logs_dir(attempt_workspace)),
     )
-    status = StepStatusWire(status=StepStatus.COMPLETED, raw_state="RECOVERED")
+    status = StepStatusWire(status=StepStatus.COMPLETED, raw_state=RECOVERED_RAW_STATE)
     raw_outputs = await _result_with_infra_retry(
         backend_client,
         handle,
@@ -271,16 +271,12 @@ def _action_failure_is_retriable(entry_name: str, exc: BaseException) -> bool:
     clear, so the retry loop re-runs the entry.
 
     Gated on the pyarrow types, as the orchestrator's dispatcher is, so a primitive's
-    own Postgres error cannot match by text. `register-files` is narrower: the data
-    plane moves the staged files before its catalog transaction, so a re-run after a
-    failure partway through would register only what is left in staging. It is re-run
-    only on busy (refused at connection checkout) and an expired token (refused at
-    verification). Unavailable is not among them even when it comes before the move,
-    because by its text a refusal cannot be told from a connection that dropped mid-move."""
+    own Postgres error cannot match by text. `register-files` is re-run on the same
+    failures as every other entry: the re-run resends the payload the first call
+    recorded (`_register_files_payload`), so a connection that dropped mid-move
+    neither shrinks the payload nor registers a file twice."""
     if not isinstance(exc, (pyarrow.ArrowException, pyarrow.flight.FlightError)):
         return False
-    if entry_name == LibraryPrimitive.REGISTER_FILES:
-        return is_data_plane_busy(exc) or is_data_plane_ticket_expired(exc)
     return is_data_plane_transient(exc)
 
 

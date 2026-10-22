@@ -572,7 +572,9 @@ fn block_read_source(table: &str) -> Option<&'static str> {
 ///   (see `lake_dest_filename`), so a replay after success finds every file
 ///   already a data file of its table and returns the earlier registration
 ///   without writing; a replay that finds the files moved but not all
-///   registered fails closed.
+///   registered fails closed. A call that fails after its moves returns the
+///   files to staging (`return_to_staging`), so that state means a call still
+///   running, or one the data plane stopped mid-call.
 /// - `delete_reference` / `delete_mask` / `delete_pool_reads` /
 ///   `delete_read_mask_block` / `delete_alignment` / `delete_alignment_block` /
 ///   `delete_alignment_sample` — logical DELETEs, idempotent against themselves:
@@ -587,6 +589,11 @@ fn block_read_source(table: &str) -> Option<&'static str> {
 ///   `auth::verify_ticket_raw`: 300s from
 ///   `qiita_control_plane.auth.tickets.sign_action`'s default, and
 ///   `MAX_TICKET_LIFETIME` refuses any token whose expiry is more than 3600s out.
+///   The expiry is checked when a request arrives, so it bounds a replayed
+///   request, not a call already accepted and still running: a DuckLake
+///   transaction reads the snapshot of its first statement, so such a call's
+///   DELETE can still run after the rerun's registration and drop it
+///   (`ducklake_transaction_reads_the_snapshot_of_its_first_statement`).
 /// - `export_read` — re-materializes the same prep_sample's bytes to the same ticket
 ///   path via atomic publish; a replay reproduces identical output. (The block
 ///   exports that used to sit beside it are gone: block-scoped compute now
@@ -2430,7 +2437,9 @@ fn register_files(
     // registration is returned without writing: `ducklake_add_data_files`
     // accepts a path it already holds and adds its rows again. Any other state
     // fails closed, because the earlier call may still be registering the files.
-    let moved_before = placed.iter().filter(|f| !f.src.exists()).count();
+    // Judged by the destination, not the source: the cross-filesystem path in
+    // `move_file` can leave the staging copy behind.
+    let moved_before = placed.iter().filter(|f| f.dest.exists()).count();
     if moved_before > 0 {
         let in_catalog = registered_data_files(conn, &placed)?;
         if moved_before == placed.len() && in_catalog.len() == placed.len() {
@@ -2441,9 +2450,12 @@ fn register_files(
         }
         return Err(Status::failed_precondition(format!(
             "an earlier register_files call for work_ticket {} from {} moved {} of {} \
-             files into the lake and registered {} of them; it did not commit, or \
-             has not yet. If it did not, this ticket cannot finish the \
-             registration: submit a new ticket, whose files get new lake names",
+             files into the lake and registered {} of them; it may still be \
+             registering them. A call that fails after its moves returns the files \
+             to staging, so this one did not return: it is still running, or the \
+             data plane stopped mid-call. Redrive again once it has had time to \
+             finish; if this persists, the files stay at their lake paths \
+             unregistered and need an operator",
             payload.work_ticket_idx,
             payload.staging_dir,
             moved_before,
@@ -2470,17 +2482,21 @@ fn register_files(
     // (DuckLake table, permanent path). The path is carried as a String because
     // every consumer below binds it into SQL or reports it.
     let mut moved: Vec<(String, String)> = Vec::new();
-    for file in &placed {
+    for (i, file) in placed.iter().enumerate() {
         let dest_dir = file.dest.parent().ok_or_else(|| {
             Status::internal(format!("lake path has no parent: {}", file.dest.display()))
         })?;
-        std::fs::create_dir_all(dest_dir).map_err(|e| {
-            Status::internal(format!(
-                "failed to create directory {}: {e}",
-                dest_dir.display()
-            ))
-        })?;
-        move_file(&file.src, &file.dest)?;
+        let placed_one = std::fs::create_dir_all(dest_dir)
+            .map_err(|e| {
+                Status::internal(format!(
+                    "failed to create directory {}: {e}",
+                    dest_dir.display()
+                ))
+            })
+            .and_then(|()| move_file(&file.src, &file.dest));
+        if let Err(e) = placed_one {
+            return Err(return_to_staging(conn, &placed[..i], e));
+        }
         moved.push((file.table.clone(), file.dest_str.clone()));
     }
 
@@ -2491,14 +2507,9 @@ fn register_files(
     // ducklake_add_data_files call rather than leaving the reference
     // half-registered in the catalog.
     //
-    // Atomicity here is CATALOG-LEVEL ONLY: the filesystem moves above have
-    // already happened and are NOT rolled back. That is intentional and safe.
-    // Each dest name is registration-unique (lake_dest_filename keys on the work
-    // ticket and the staging dir) and move_file refuses to overwrite, so a rolled-back registration
-    // leaves at most an unreferenced orphan Parquet on disk — never a collision
-    // and never a double-registration. This matches how DuckLake already
-    // tolerates orphan Parquets (the delete_* actions reclaim nothing from disk
-    // either); a future maintenance pass sweeps them.
+    // Atomicity here is CATALOG-LEVEL ONLY: the filesystem moves above are not
+    // part of the transaction. When it fails, `return_to_staging` moves the files
+    // back, so the call can be made again with the same payload.
     //
     // Registrations that touch a replace-keyed table SERIALIZE against each
     // other, and retry when they lose. Both halves are needed:
@@ -2618,9 +2629,75 @@ fn register_files(
                 replaced,
             })
         },
-    )?;
+    );
 
-    Ok(registration)
+    registration.map_err(|e| return_to_staging(conn, &placed, e))
+}
+
+/// Move `files` back from the lake to staging after a registration failed past
+/// its moves, so a later call with the same payload starts from staging again,
+/// and return `failure` with what became of the files appended.
+///
+/// A COMMIT that reported an error may still have landed — the catalog's
+/// connection can drop after the write — so the files go back only when the
+/// catalog confirms it holds none of them. Otherwise, or when a move back fails,
+/// they stay at their lake paths and the message says so: a replay then fails
+/// closed rather than registering a payload twice.
+fn return_to_staging(conn: &duckdb::Connection, files: &[PlacedFile], failure: Status) -> Status {
+    let moved: Vec<&PlacedFile> = files.iter().filter(|f| f.dest.exists()).collect();
+    if moved.is_empty() {
+        return failure;
+    }
+    let count = moved.len();
+    let kept = |why: String| {
+        Status::new(
+            failure.code(),
+            format!(
+                "{}; {count} file(s) stay at their lake paths unregistered: {why}",
+                failure.message()
+            ),
+        )
+    };
+    match registered_data_files(conn, files) {
+        Ok(listed) if listed.is_empty() => {}
+        Ok(listed) => {
+            return kept(format!(
+                "the catalog lists {} of them, so the registration may have committed",
+                listed.len()
+            ))
+        }
+        Err(e) => {
+            return kept(format!(
+                "the catalog could not be read to confirm it holds none of them ({})",
+                e.message()
+            ))
+        }
+    }
+    let mut stuck = Vec::new();
+    for file in moved {
+        // The cross-filesystem path in `move_file` can leave the staging copy;
+        // the lake copy is then the one to remove.
+        let back = if file.src.exists() {
+            std::fs::remove_file(&file.dest)
+                .map_err(|e| Status::internal(format!("remove {}: {e}", file.dest.display())))
+        } else {
+            move_file(&file.dest, &file.src)
+        };
+        if let Err(e) = back {
+            stuck.push(format!("{}: {}", file.dest.display(), e.message()));
+        }
+    }
+    if stuck.is_empty() {
+        Status::new(
+            failure.code(),
+            format!(
+                "{}; the files were moved back to staging",
+                failure.message()
+            ),
+        )
+    } else {
+        kept(format!("moving them back failed: {}", stuck.join("; ")))
+    }
 }
 
 /// One file of a registration: its table, its staging source, and its lake

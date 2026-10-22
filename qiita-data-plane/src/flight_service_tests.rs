@@ -2032,6 +2032,57 @@ fn register_files_replayed_after_its_rows_were_deleted_registers_nothing() {
     }
 }
 
+/// A registration that fails after its moves — here `ducklake_add_data_files`
+/// refuses a file whose columns do not match the table — returns the files to
+/// staging, so a call with the same payload starts over instead of failing
+/// closed on files left at their lake paths unregistered.
+#[test]
+#[serial_test::serial]
+#[cfg(feature = "integration")]
+fn register_files_that_fails_after_its_moves_returns_the_files_to_staging() {
+    let connstr = crate::test_catalog::connstr();
+    let data_path = crate::test_catalog::data_path();
+    let ref_idx: i64 = 980_000_000 + std::process::id() as i64;
+    prepare_membership_table(&connstr, &data_path, ref_idx);
+    let (staging, payload) = seed_membership_registration(ref_idx, ref_idx);
+    let good = staging.path().join("reference_membership.parquet");
+    let good_bytes = std::fs::read(&good).unwrap();
+    Connection::open_in_memory()
+        .unwrap()
+        .execute_batch(&format!(
+            "COPY (SELECT 'not a number' AS reference_idx) TO '{}' (FORMAT PARQUET)",
+            good.to_str().unwrap()
+        ))
+        .unwrap();
+
+    let err = register_files(
+        &attached_writer(&connstr, &data_path),
+        &data_path,
+        std::path::Path::new("/"),
+        &payload,
+    )
+    .expect_err("a file that does not match its table registered");
+
+    assert!(
+        err.message().contains("moved back to staging"),
+        "{}",
+        err.message()
+    );
+    assert!(good.exists(), "the staged file was not returned");
+    assert_eq!(membership_rows(&connstr, &data_path, ref_idx), 0);
+
+    // The same payload, with the file fixed in staging, registers.
+    std::fs::write(&good, good_bytes).unwrap();
+    register_files(
+        &attached_writer(&connstr, &data_path),
+        &data_path,
+        std::path::Path::new("/"),
+        &payload,
+    )
+    .expect("the retried registration failed");
+    assert_eq!(membership_rows(&connstr, &data_path, ref_idx), 2);
+}
+
 /// The reason a replay checks the catalog before registering: in the DuckLake
 /// we ship, adding a path the table already holds succeeds and counts its rows
 /// twice.

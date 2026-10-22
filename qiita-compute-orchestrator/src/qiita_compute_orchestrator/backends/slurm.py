@@ -31,6 +31,7 @@ from qiita_common.backend_failure import BackendFailure, FailureKind, StepNoData
 from qiita_common.duckdb_miint import miint_job_env
 from qiita_common.log_tail import contains_oom_signature, read_text_tail
 from qiita_common.models import (
+    RECOVERED_RAW_STATE,
     StepBaselineResources,
     StepStatus,
     WorkTicketFailureStage,
@@ -574,7 +575,9 @@ class SlurmBackend(ComputeBackend):
         once `status_step` reports the job terminal."""
         self._require_slurm_handle(handle)
         if status.status == StepStatus.COMPLETED:
-            failures = verify_container_output(handle.output_path)
+            failures = verify_container_output(
+                handle.output_path, recovered=status.raw_state == RECOVERED_RAW_STATE
+            )
             if failures:
                 # Container exited 0 but didn't honor the contract — gate
                 # 2/3/4 violation. Permanent: same container against same

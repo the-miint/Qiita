@@ -57,6 +57,7 @@ from qiita_common.work_ticket_constants import (
     FORCE_RESUBMIT_EXPLANATION,
 )
 
+from ...fanout_dispatch import DEFAULT_FANOUT_MAX_INFLIGHT
 from .. import _common
 from .._reference_exclusion import add_user_exclusion_subparsers
 from ._helpers import (
@@ -1582,6 +1583,22 @@ def _build_parser() -> argparse.ArgumentParser:
         default=0.0,
         dest="rate_seconds",
         help="Seconds to sleep between redrives (default: 0).",
+    )
+    p_ticket_redrive.add_argument(
+        "--max-inflight",
+        type=int,
+        default=DEFAULT_FANOUT_MAX_INFLIGHT,
+        help=(
+            "Redriven tickets allowed to be pending, queued or processing at once;"
+            " the next waits for one to finish (default: the control plane's"
+            f" fan-out cap, {DEFAULT_FANOUT_MAX_INFLIGHT})."
+        ),
+    )
+    p_ticket_redrive.add_argument(
+        "--poll-seconds",
+        type=float,
+        default=10.0,
+        help="Seconds between reads of the redriven tickets' states while waiting (default: 10).",
     )
     p_ticket_redrive.set_defaults(handler=_handle_ticket_redrive)
 

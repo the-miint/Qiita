@@ -28,6 +28,7 @@ from qiita_common.actions import LONG_READ_ASSEMBLY_ACTION_ID
 from qiita_common.api_paths import LibraryPrimitive
 from qiita_common.backend_failure import BackendFailure, FailureKind, StepNoData
 from qiita_common.models import (
+    RECOVERED_RAW_STATE,
     ComputeTarget,
     FoundJobWire,
     ScopeTargetKind,
@@ -4514,6 +4515,7 @@ class FakeSlurmBackendClient:
         # or on a dead one.
         self.status_handles: list = []
         self.result_handles: list = []
+        self.result_statuses: list[StepStatusWire] = []
 
     async def submit_step(
         self,
@@ -4558,6 +4560,7 @@ class FakeSlurmBackendClient:
     async def result_step(self, handle, status):
         self.result_calls += 1
         self.result_handles.append(handle)
+        self.result_statuses.append(status)
         item = self.result_script.pop(0) if self.result_script else {}
         if isinstance(item, BackendFailure):
             raise item
@@ -5456,6 +5459,10 @@ async def test_resume_multi_step_rebuilds_bound_and_skips_completed_action(
     assert [c[0] for c in library_spy.calls] == []
     # Only the final step submitted fresh; compute was reconstructed, not resubmitted.
     assert backend.submit_calls == 1
+    # The reconstruct is marked as a re-read, so the orchestrator checks the
+    # declared outputs rather than files a later step may have moved; the fresh
+    # step's result is not.
+    assert [s.raw_state for s in backend.result_statuses] == [RECOVERED_RAW_STATE, "COMPLETED"]
     # All three entries end completed in the progress table.
     rows = await step_progress.load_step_progress(postgres_pool, multi_step_ticket)
     by_index = {r.step_index: r for r in rows}

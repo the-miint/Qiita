@@ -109,6 +109,31 @@ async def test_record_submitting_creates_write_ahead_row(postgres_pool):
         await _cleanup(postgres_pool, wt_idx, *rest)
 
 
+async def test_record_submitting_refuses_a_second_row_for_one_identity(postgres_pool):
+    """The write-ahead INSERT ignores a repeat of its primary key, not of the
+    entry's identity: a second row for the same (step_name, step_occurrence,
+    attempt) at another step_index is an error, not a silent no-op."""
+    wt_idx, *rest = await _seed_work_ticket(postgres_pool)
+    try:
+        for step_index in (0, 1):
+            write = step_progress.record_submitting(
+                postgres_pool,
+                work_ticket_idx=wt_idx,
+                step_index=step_index,
+                attempt=0,
+                step_name="hash",
+                step_occurrence=0,
+                compute_target=ComputeTarget.LOCAL,
+            )
+            if step_index == 0:
+                await write
+            else:
+                with pytest.raises(asyncpg.UniqueViolationError):
+                    await write
+    finally:
+        await _cleanup(postgres_pool, wt_idx, *rest)
+
+
 async def test_record_submitting_is_idempotent(postgres_pool):
     """Re-entry (recovery, retry of the same attempt) must not reset a row
     that already advanced past 'submitting'."""
@@ -720,6 +745,8 @@ async def test_align_step_progress_leaves_aligned_rows_untouched(postgres_pool):
         ([_step_entry("hash"), _action_entry("load")], "fewer occurrences"),
         # The name now belongs to a `step:`, the row was written by an `action:`.
         ([_step_entry("hash"), _step_entry("load")], "other kind"),
+        # The migration could not match the row to an entry and left it negative.
+        ([_step_entry("hash"), _action_entry("load")], "unmatched by the backfill"),
     ],
 )
 async def test_align_step_progress_refuses_a_row_no_entry_matches(postgres_pool, entries, why):
@@ -734,7 +761,8 @@ async def test_align_step_progress_refuses_a_row_no_entry_matches(postgres_pool,
             occurrence=0,
             target=ComputeTarget.LOCAL,
         )
-        name, occurrence = ("load", 1) if why == "fewer occurrences" else ("load", 0)
+        occurrence = {"fewer occurrences": 1, "unmatched by the backfill": -1}.get(why, 0)
+        name = "load"
         await _record_completed_entry(
             postgres_pool,
             wt_idx,
@@ -744,8 +772,11 @@ async def test_align_step_progress_refuses_a_row_no_entry_matches(postgres_pool,
             target=ComputeTarget.CONTROL_PLANE,
         )
         before = await step_progress.load_step_progress(postgres_pool, wt_idx)
-        with pytest.raises(step_progress.StepProgressMismatch, match=f"'{name}' occurrence"):
+        with pytest.raises(
+            step_progress.StepProgressMismatch, match=f"'{name}' occurrence {occurrence}"
+        ) as raised:
             await step_progress.align_step_progress(postgres_pool, wt_idx, entries)
+        assert ("negative occurrence" in str(raised.value)) is (occurrence < 0)
         assert await step_progress.load_step_progress(postgres_pool, wt_idx) == before
     finally:
         await _cleanup(postgres_pool, wt_idx, *rest)
@@ -833,8 +864,9 @@ async def test_occurrence_backfill_reads_the_definition_or_ranks_the_rows(postgr
     """Ticket A's rows match its action's steps, so the backfill reads each
     occurrence off the definition — the second register-index is occurrence 1
     although the first never wrote a row. Ticket B's rows were written under an
-    earlier list (register-index at 1 and 2), so its occurrences are ranked
-    from its own rows."""
+    earlier list (register-index at 1 and 2), which is not kept: `build` has one
+    entry and one recorded position, so it is occurrence 0, and register-index,
+    repeated, gets negative occurrences that match no entry."""
     a_idx, *a_rest = await _seed_ticket_with_steps(postgres_pool, _REPEATED_STEPS)
     b_idx, *b_rest = await _seed_ticket_with_steps(postgres_pool, _REPEATED_STEPS)
     try:
@@ -874,8 +906,8 @@ async def test_occurrence_backfill_reads_the_definition_or_ranks_the_rows(postgr
                     (a_idx, 3, 0): 1,
                     (a_idx, 3, 1): 1,
                     (b_idx, 0, 0): 0,
-                    (b_idx, 1, 0): 0,
-                    (b_idx, 2, 0): 1,
+                    (b_idx, 1, 0): -1,
+                    (b_idx, 2, 0): -2,
                 }
                 raise _RollBack
     finally:

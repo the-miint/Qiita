@@ -5,7 +5,11 @@ import json
 
 import httpx
 import pytest
-from qiita_common.api_paths import URL_WORK_TICKET_LIST, URL_WORK_TICKET_RUN
+from qiita_common.api_paths import (
+    URL_WORK_TICKET_BY_IDX,
+    URL_WORK_TICKET_LIST,
+    URL_WORK_TICKET_RUN,
+)
 
 from qiita_control_plane.cli import _common
 from qiita_control_plane.cli.user import main
@@ -33,10 +37,12 @@ def _ticket(idx: int, *, failure_type: str = "permanent") -> dict:
     }
 
 
-def _stub(monkeypatch, *, tickets, run_status=None, truncated=False):
-    """Answer the list GET with `tickets`, and each /run POST with the status
-    `run_status` maps its idx to (default 200). Returns the request log."""
+def _stub(monkeypatch, *, tickets, run_status=None, truncated=False, states=None):
+    """Answer the list GET with `tickets`, each /run POST with the status
+    `run_status` maps its idx to (default 200), and each single-ticket GET with
+    the next of the states `states` lists for its idx. Returns the request log."""
     run_status = run_status or {}
+    states = states or {}
     log: list[tuple[str, str, dict | None]] = []
 
     def fake_request(method, url, headers=None, json=None, params=None, timeout=None):
@@ -47,6 +53,12 @@ def _stub(monkeypatch, *, tickets, run_status=None, truncated=False):
             return httpx.Response(200, json=body, request=request)
         for ticket in tickets:
             idx = ticket["work_ticket_idx"]
+            if (
+                method == "GET"
+                and url == f"{_BASE}{URL_WORK_TICKET_BY_IDX.format(work_ticket_idx=idx)}"
+            ):
+                body = {**ticket, "state": states[idx].pop(0)}
+                return httpx.Response(200, json=body, request=request)
             if (
                 method == "POST"
                 and url == f"{_BASE}{URL_WORK_TICKET_RUN.format(work_ticket_idx=idx)}"
@@ -148,3 +160,54 @@ def test_redrive_rejects_a_negative_rate(monkeypatch):
     _stub(monkeypatch, tickets=[])
     with pytest.raises(SystemExit):
         main(["--base-url", _BASE, "ticket", "redrive", "--rate", "-1"])
+
+
+def test_redrive_sends_the_failure_type_to_the_server(monkeypatch, capsys):
+    log = _stub(monkeypatch, tickets=[_ticket(11)])
+
+    main(["--base-url", _BASE, "ticket", "redrive", "--failure-type", "retriable"])
+
+    assert log[0][2]["failure_type"] == "retriable"
+
+
+def test_redrive_waits_while_max_inflight_tickets_are_unfinished(monkeypatch, capsys):
+    """With --max-inflight 1, the second redrive waits until the first ticket is
+    no longer pending, queued or processing."""
+    log = _stub(
+        monkeypatch,
+        tickets=[_ticket(11), _ticket(12)],
+        states={11: ["processing", "completed"]},
+    )
+    sleeps: list[float] = []
+    monkeypatch.setattr("qiita_control_plane.cli.user.ticket.time.sleep", sleeps.append)
+
+    rc = main(
+        [
+            "--base-url",
+            _BASE,
+            "ticket",
+            "redrive",
+            "--execute",
+            "--max-inflight",
+            "1",
+            "--poll-seconds",
+            "3",
+        ]
+    )
+
+    assert rc == 0
+    calls = [(method, url) for method, url, _ in log]
+    run_12 = calls.index(("POST", f"{_BASE}{URL_WORK_TICKET_RUN.format(work_ticket_idx=12)}"))
+    reads_11 = [
+        i
+        for i, call in enumerate(calls)
+        if call == ("GET", f"{_BASE}{URL_WORK_TICKET_BY_IDX.format(work_ticket_idx=11)}")
+    ]
+    assert len(reads_11) == 2 and max(reads_11) < run_12
+    assert sleeps == [3.0, 3.0]
+
+
+def test_redrive_rejects_a_max_inflight_below_one(monkeypatch):
+    _stub(monkeypatch, tickets=[])
+    with pytest.raises(SystemExit):
+        main(["--base-url", _BASE, "ticket", "redrive", "--max-inflight", "0"])
