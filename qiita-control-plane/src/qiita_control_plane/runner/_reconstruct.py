@@ -344,6 +344,8 @@ def _register_files_payload(attempt_dir: Path, staging_dir: Path) -> dict[str, s
         )
     record.parent.mkdir(parents=True, exist_ok=True)
     partial = record.with_suffix(".partial")
+    # `staging_dir` is not read back (the file's name is its hash); it names the
+    # directory for whoever opens the record by hand.
     partial.write_text(json.dumps({"staging_dir": str(staging_dir), "files": staged}))
     partial.replace(record)
     return staged

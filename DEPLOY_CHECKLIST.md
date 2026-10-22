@@ -55,8 +55,9 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
 - `[admin]` (#731) Before stopping the control plane, confirm no `download-ena-study` ticket is in flight; if the query lists any, wait for them to finish. `download-ena-study` 1.0.0 is edited in place (`qiita-admin actions sync` in `activate.sh` re-syncs it), and a ticket whose ingest step finished on the old code fails on the missing `run_outcomes` output:
   `SELECT work_ticket_idx, state FROM qiita.work_ticket WHERE action_id = 'download-ena-study' AND state IN ('pending','queued','processing');`
   If one was missed and ends FAILED, redrive it (`POST /work-ticket/{idx}/run`): a download redrive drops the completed step rows, so ingest re-runs on the new code and skips runs already stored.
-- `[admin]` (#resume-step-identity) Before stopping the control plane, confirm no ticket is in a `register-files` step; if the query lists any, wait for them to finish. The new control plane resends the payload a `register-files` call recorded, and a call the old one made recorded none, so a ticket stopped mid-registration with its staging dir partly emptied would send only the files left:
-  `SELECT work_ticket_idx, step_index, attempt FROM qiita.work_ticket_step WHERE step_name = 'register-files' AND state NOT IN ('completed','failed');`
+- `[admin]` (#resume-step-identity) Before stopping the control plane, list the `register-files` steps that never finished. The new control plane resends the payload a `register-files` call recorded, and a call the old one made recorded none, so a ticket stopped mid-registration with its staging dir partly emptied would send only the files left:
+  `SELECT s.work_ticket_idx, t.state FROM qiita.work_ticket_step s JOIN qiita.work_ticket t USING (work_ticket_idx) WHERE s.step_name = 'register-files' AND s.state NOT IN ('completed','failed');`
+  A ticket still `pending`, `queued` or `processing`: wait for it to finish. A ticket in any other state: resubmit it rather than redrive it after this deploy. Needed for this deploy only; calls from this deploy on record their payload.
 
 ### 5. Verify
 
