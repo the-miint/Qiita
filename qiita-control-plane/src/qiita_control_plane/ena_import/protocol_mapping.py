@@ -55,7 +55,8 @@ class UnmappableEnaLibraryStrategyError(ValueError):
             message = (
                 f"ENA library_selection={library_selection!r} marks an amplicon library but "
                 f"library_strategy={library_strategy!r} (library_source={library_source!r}) "
-                "is not AMPLICON; ask the depositor to correct the ENA record"
+                "is not AMPLICON; ask the depositor to correct the ENA record, "
+                "or register the run by hand"
             )
         super().__init__(message)
 
