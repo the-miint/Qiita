@@ -408,9 +408,10 @@ gaps expected to close soon (except where noted):
 - **A non-amplicon run deposited with `library_selection` PCR is refused.** PCR selection
   marks an amplicon library, so a run whose `library_strategy` is anything but `AMPLICON`
   (including `RNA-Seq`/transcriptomic) contradicts it. That run fails alone with a
-  `failure_reason` naming the selection; its siblings import. There is no override and
-  deposited metadata is not rewritten: correct the record at ENA, then re-import.
-  `RANDOM PCR` and `RT-PCR` are different selections and are not refused.
+  `failure_reason` naming the selection; its siblings import. The run cannot be imported
+  until its depositor corrects the ENA record; re-import then picks it up. There is no
+  override and deposited metadata is not rewritten (#383 is where an override would be
+  decided). `RANDOM PCR` and `RT-PCR` are different selections and are not refused.
 - **No ENVO harmonization or free-text host matching.** Free-text environment and host
   fields ENA supplies are kept as study-local text as given; only ENA's numeric
   `tax_id` and `host_tax_id` are cross-referenced to NCBI Taxonomy. Also deferred to the

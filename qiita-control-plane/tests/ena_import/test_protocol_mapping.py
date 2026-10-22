@@ -101,7 +101,8 @@ def test_pcr_selection_on_a_non_amplicon_strategy_raises(
     library_strategy, library_source, library_selection, platform
 ):
     with pytest.raises(
-        UnmappableEnaLibraryStrategyError, match="is not AMPLICON; correct the record at ENA"
+        UnmappableEnaLibraryStrategyError,
+        match="is not AMPLICON; ask the depositor to correct the ENA record",
     ) as excinfo:
         map_ena_run_to_prep_protocol_name(
             library_strategy=library_strategy,
