@@ -44,7 +44,7 @@ from qiita_common.models import ScopeTargetKind, WorkTicketCreateRequest, WorkTi
 
 from . import _common
 
-# Pinned here rather than taken from a flag: this gesture knows which workflow
+# Fixed here rather than taken from a flag: this gesture knows which workflow
 # loads reads, and an operator who needs a different one has `qiita ticket
 # submit`. Bumping a workflow's version means bumping it here.
 _FASTQ_ACTION_ID = FASTQ_TO_PARQUET_ACTION_ID

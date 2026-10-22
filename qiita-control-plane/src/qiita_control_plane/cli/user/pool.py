@@ -64,10 +64,10 @@ from ...preflight import SHEET_TYPE_PACBIO_ABSQUANT
 from .. import _common
 from ._helpers import _inspect_run_folder, _load_preflight_conn, _refuse_malformed_accessions
 
-# action_id + version for the bundled bcl-convert submission flow. Pinned
-# here so the CLI does not drift from the workflow YAML the operator's
-# deploy syncs into qiita.action; bumping the workflow major version is a
-# coordinated change.
+# The bundled bcl-convert submission flow's action_id. Its version, below, is pinned
+# here so it does not drift from the workflow YAML the operator's deploy
+# syncs into qiita.action; bumping the workflow major version is a coordinated
+# change.
 _BCL_CONVERT_ACTION_ID = BCL_CONVERT_ACTION_ID
 
 _BCL_CONVERT_ACTION_VERSION = "1.0.0"
