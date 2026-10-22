@@ -585,8 +585,8 @@ def test_reads_are_written_as_monotone_disjoint_parts(fake_mint, monkeypatch, tm
     The old form was one `COPY ... ORDER BY sequence_idx`, a blocking sort over the
     whole seq+qual payload — tens of GB for a HiFi sample, and where the first real
     PacBio run OOM'd. What that sort actually bought was not a globally sorted file
-    (PARQUET_OPTS_TRANSFER writes row groups in thread-finish order regardless) but tight
-    per-row-group min/max on sequence_idx, for DuckLake pruning.
+    (every qiita_common.parquet option set writes row groups in thread-finish order
+    regardless) but tight per-row-group min/max on sequence_idx, for DuckLake pruning.
 
     Batching gets the same thing for free, because the data is already monotone:
     sequence_idx = sequence_index + start - 1. So this pins the properties pruning

@@ -111,8 +111,8 @@ from qiita_common.parquet import validate_parquet_path
 
 from ..cp_client import make_cp_client
 from ..miint import (
+    PARQUET_OPTS_AT_REST,
     PARQUET_OPTS_INTERMEDIATE,
-    PARQUET_OPTS_TRANSFER,
     apply_duckdb_settings,
     duckdb_tmp_dir,
     open_conn,
@@ -373,7 +373,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 "  read_id, sequence1, qual1, sequence2, qual2 "
                 "FROM read_parquet(?) "
                 "ORDER BY sequence_idx ) "
-                f"TO '{out}' ({PARQUET_OPTS_TRANSFER})",
+                f"TO '{out}' ({PARQUET_OPTS_AT_REST})",
                 [inputs.prep_sample_idx, sequence_idx_start, str(intermediate)],
             )
             # Emit the raw read count: the reads out of bcl-convert,
