@@ -102,3 +102,31 @@ def test_at_rest_level_reaches_the_writer(tmp_path: Path):
     con.execute(f"COPY t TO '{at_rest}' ({PARQUET_OPTS_AT_REST})")
     con.execute(f"COPY t TO '{transfer}' ({PARQUET_OPTS_TRANSFER})")
     assert _disk_bytes(con, at_rest) < _disk_bytes(con, transfer)
+
+
+def test_ducklake_catalog_level_matches_the_rust_one_exactly():
+    # DuckLake's own writes (inserts, compaction) are data at rest too, so the data plane
+    # sets the same level on the catalog. Rust cannot import the Python, so the value is
+    # parsed out of the source; drift would leave compacted files at a different level
+    # with nothing failing.
+    import re
+
+    src = (
+        Path(__file__).resolve().parents[2] / "qiita-data-plane" / "src" / "ducklake.rs"
+    ).read_text()
+    m = re.search(r"const PARQUET_COMPRESSION_LEVEL_AT_REST: \w+ = (\d+);", src)
+    assert m, "PARQUET_COMPRESSION_LEVEL_AT_REST not found in ducklake.rs"
+    assert int(m.group(1)) == PARQUET_COMPRESSION_LEVEL_AT_REST
+
+
+def test_data_plane_read_export_options_match_transfer_exactly():
+    # The data plane writes a transient reads export with its own copy of the transfer
+    # set; drift would change that file's shape with nothing failing.
+    import re
+
+    src = (
+        Path(__file__).resolve().parents[2] / "qiita-data-plane" / "src" / "flight_service.rs"
+    ).read_text()
+    m = re.search(r'const EXPORT_READ_PARQUET_OPTS: &str =\s*"([^"]+)";', src)
+    assert m, "EXPORT_READ_PARQUET_OPTS not found in flight_service.rs"
+    assert m.group(1) == PARQUET_OPTS_TRANSFER

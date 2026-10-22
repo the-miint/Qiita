@@ -41,7 +41,7 @@ pub(crate) fn validate_sql_literal(value: &str, field: &str) -> Result<(), Strin
 /// Parquet row-group size (rows) DuckLake should use when it rewrites the chunked
 /// sequence tables. Must equal `qiita_common.chunking.CHUNK_ROW_GROUP_SIZE`: the
 /// orchestrator writes those chunk Parquets at this row count
-/// (`PARQUET_OPTS_CHUNKED` `ROW_GROUP_SIZE`), and the per-table `set_option` calls
+/// (`PARQUET_OPTS_CHUNKED_AT_REST` `ROW_GROUP_SIZE`), and the per-table `set_option` calls
 /// below pin DuckLake's own rewrites to the same layout.
 const CHUNK_ROW_GROUP_SIZE: u64 = 16384;
 
@@ -64,11 +64,18 @@ pub fn connect_ducklake(
     Ok(())
 }
 
+/// The zstd level for data at rest: a copy of
+/// `qiita_common.parquet.PARQUET_COMPRESSION_LEVEL_AT_REST`, which carries the
+/// measurements behind it. Rust cannot import the Python, so
+/// `qiita-common/tests/test_parquet.py` parses this line and pins the two equal.
+const PARQUET_COMPRESSION_LEVEL_AT_REST: u8 = 16;
+
 /// Set the catalog-global Parquet options DuckLake uses for its OWN writes
-/// (compaction, merge, any future direct insert), aligning them with how
-/// register_files writes our files: `qiita_common.parquet.PARQUET_OPTS` is
-/// zstd + Parquet v2, whereas DuckLake defaults to snappy + v1. Without this,
-/// DuckLake's maintenance rewrites would drift from the register-time format.
+/// (compaction, merge, direct inserts), aligning them with how register_files
+/// writes our files: `qiita_common.parquet.PARQUET_OPTS_AT_REST` is zstd at
+/// PARQUET_COMPRESSION_LEVEL_AT_REST + Parquet v2, whereas DuckLake defaults to
+/// snappy + v1. Without this, DuckLake's maintenance rewrites would drift from the
+/// register-time format.
 ///
 /// These options are PERSISTED in `ducklake_metadata` (catalog-global), so they
 /// only need to be set ONCE per catalog. Call this on the PROCESS-START
@@ -77,12 +84,13 @@ pub fn connect_ducklake(
 /// each concurrent Flight request UPDATE the same `ducklake_metadata` row, which
 /// serialized and failed under load with Postgres SQLSTATE 40001
 /// (`could not serialize access due to concurrent update`). Keep the values in
-/// sync with PARQUET_OPTS.
+/// sync with PARQUET_OPTS_AT_REST.
 pub fn set_catalog_options(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
-    conn.execute_batch(
+    conn.execute_batch(&format!(
         "CALL qiita_lake.set_option('parquet_compression', 'zstd');
-         CALL qiita_lake.set_option('parquet_version', 2);",
-    )?;
+         CALL qiita_lake.set_option('parquet_compression_level', {PARQUET_COMPRESSION_LEVEL_AT_REST});
+         CALL qiita_lake.set_option('parquet_version', 2);"
+    ))?;
     Ok(())
 }
 
@@ -897,6 +905,24 @@ mod tests {
         // production) inherits them and correctly does NOT re-set them.
         set_catalog_options(&conn).expect("failed to set catalog options");
         conn
+    }
+
+    /// DuckLake's own writes (inserts, compaction) land in the lake as data at rest, so
+    /// the boot connection's catalog options carry the level the job-side writers use.
+    #[test]
+    #[serial]
+    #[cfg(feature = "integration")]
+    fn catalog_options_set_the_at_rest_compression_level() {
+        let conn = setup_conn();
+        let value: String = conn
+            .query_row(
+                "SELECT value FROM qiita_lake.options() \
+                 WHERE option_name = 'parquet_compression_level' AND scope = 'GLOBAL'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("parquet_compression_level is not set on the catalog");
+        assert_eq!(value, PARQUET_COMPRESSION_LEVEL_AT_REST.to_string());
     }
 
     /// `(column_name, data_type, is_nullable)` for one `qiita_lake` table, in
