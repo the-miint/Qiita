@@ -293,8 +293,8 @@ def data_plane(signing_key, tmp_path_factory):
         "DUCKLAKE_CATALOG_CONNSTR": DUCKLAKE_CATALOG_CONNSTR,
         "PATH_PERSISTENT": str(persistent_base),
         "PATH_SCRATCH": str(scratch_base),
-        # Unset, the limit is derived from the memory of the machine running the
-        # suite, and on a small one the data plane refuses its default pool at boot.
+        # Pinned so the data plane's boot does not depend on the memory of the
+        # machine running the suite.
         "DUCKDB_MEMORY_LIMIT": "1GiB",
         LIB_PATH_ENV: lib_path,
     }

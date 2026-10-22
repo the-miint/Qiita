@@ -247,10 +247,8 @@ mod tests {
         "FLIGHT_MAX_CONCURRENT_DOPUT",
     ];
 
-    /// A memory limit for the tests that are not about deriving one. Unset, the
-    /// limit is derived from the memory of the machine running the test, and on a
-    /// small one `Settings::from_env` refuses the default pool before the test
-    /// reaches what it checks.
+    /// A memory limit for the tests that are not about deriving one, so they do
+    /// not depend on the memory of the machine running them.
     const TEST_MEMORY_LIMIT: &str = "1GiB";
 
     /// The snapshot guards plus a known starting point: every required var set,
