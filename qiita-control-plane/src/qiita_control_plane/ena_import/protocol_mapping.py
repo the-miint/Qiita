@@ -34,8 +34,8 @@ _LONG_READ = "long_read"
 class UnmappableEnaLibraryStrategyError(ValueError):
     """Raised when an ENA run's (library_strategy, library_source, mapped platform) has
     no curated prep_protocol name -- including when the category is recognized but no
-    protocol exists for its read-length bucket (there is no `long_read_transcriptomics`).
-    Carries the offending strategy/source (and selection, when it caused the refusal)."""
+    protocol exists for its read-length bucket (there is no `long_read_transcriptomics`)
+    -- or when its library_selection contradicts its strategy."""
 
     def __init__(
         self,
@@ -46,12 +46,17 @@ class UnmappableEnaLibraryStrategyError(ValueError):
         self.library_strategy = library_strategy
         self.library_source = library_source
         self.library_selection = library_selection
-        message = (
-            "no curated prep_protocol mapping for ENA library_strategy="
-            f"{library_strategy!r}, library_source={library_source!r}"
-        )
-        if library_selection is not None:
-            message += f", library_selection={library_selection!r}"
+        if library_selection is None:
+            message = (
+                "no curated prep_protocol mapping for ENA library_strategy="
+                f"{library_strategy!r}, library_source={library_source!r}"
+            )
+        else:
+            message = (
+                f"ENA library_selection={library_selection!r} marks an amplicon library but "
+                f"library_strategy={library_strategy!r} (library_source={library_source!r}) "
+                "is not AMPLICON; correct the record at ENA"
+            )
         super().__init__(message)
 
 
@@ -84,11 +89,9 @@ def map_ena_run_to_prep_protocol_name(
       - strategy == "RNA-SEQ" or source in {"TRANSCRIPTOMIC", "METATRANSCRIPTOMIC"}
         -> short_read_transcriptomics (long-read raises -- no such protocol curated)
 
-    A non-AMPLICON run deposited with library_selection == "PCR" is refused: PCR selection
-    marks an amplicon library, so the strategy contradicts it.
-
-    Raises `UnmappableEnaLibraryStrategyError` when the pair matches no category or the
-    matched category has no protocol for the read-length bucket. Never silently buckets.
+    Raises `UnmappableEnaLibraryStrategyError` when the pair matches no category, the
+    matched category has no protocol for the read-length bucket, or a non-AMPLICON run's
+    selection is "PCR", which marks an amplicon library. Never silently buckets.
     """
     read_length = _read_length_bucket(platform)
     strategy = (library_strategy or "").strip().upper()

@@ -174,7 +174,7 @@ study** fails the whole accession before anything is written, naming its status
 (`study PRJ... is suppressed`). A study with **no public runs at all** fails the same
 way (`no public runs`), before the study is even resolved or created. Within an
 otherwise-public study, an individual **suppressed run** is `excluded` — isolated from
-its siblings exactly like an unmappable platform or a refused library, carrying a `failure_reason` naming
+its siblings exactly like an unmappable platform, carrying a `failure_reason` naming
 the run and its status, and contributing no `biosample`/`prep_sample`/`sequenced_sample`
 rows. When a pool was created (at least one run's platform mapped) but every run in
 the item still ends up `excluded` and/or `failed` — none reaches
@@ -409,8 +409,8 @@ gaps expected to close soon (except where noted):
   marks an amplicon library, so a run whose `library_strategy` is anything but `AMPLICON`
   (including `RNA-Seq`/transcriptomic) contradicts it. That run fails alone with a
   `failure_reason` naming the selection; its siblings import. There is no override and
-  deposited metadata is not rewritten: correct the record at ENA, then re-import. `RANDOM PCR`
-  and `RT-PCR` are different selections and are not refused.
+  deposited metadata is not rewritten: correct the record at ENA, then re-import.
+  `RANDOM PCR` and `RT-PCR` are different selections and are not refused.
 - **No ENVO harmonization or free-text host matching.** Free-text environment and host
   fields ENA supplies are kept as study-local text as given; only ENA's numeric
   `tax_id` and `host_tax_id` are cross-referenced to NCBI Taxonomy. Also deferred to the

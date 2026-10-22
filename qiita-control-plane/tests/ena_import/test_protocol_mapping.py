@@ -100,8 +100,6 @@ def test_none_strategy_and_source_raises():
 def test_pcr_selection_on_a_non_amplicon_strategy_raises(
     library_strategy, library_source, library_selection, platform
 ):
-    """A PCR-selected library is an amplicon library, so a non-AMPLICON strategy
-    contradicts it; refuse rather than label it shotgun."""
     with pytest.raises(UnmappableEnaLibraryStrategyError, match="(?i)pcr") as excinfo:
         map_ena_run_to_prep_protocol_name(
             library_strategy=library_strategy,
