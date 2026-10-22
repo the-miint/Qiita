@@ -13,7 +13,11 @@ from pathlib import Path
 from typing import Any, NamedTuple
 
 import httpx
-from qiita_common.actions import BCL_CONVERT_SAMPLE_MAP_KEY, READ_MASK_ACTION_ID
+from qiita_common.actions import (
+    BCL_CONVERT_ACTION_ID,
+    BCL_CONVERT_SAMPLE_MAP_KEY,
+    READ_MASK_ACTION_ID,
+)
 from qiita_common.api_paths import (
     PATH_BIOSAMPLE_PREFIX,
     PATH_BIOSAMPLE_RESOLVE_ROSTER,
@@ -64,7 +68,7 @@ from ._helpers import _inspect_run_folder, _load_preflight_conn, _refuse_malform
 # here so the CLI does not drift from the workflow YAML the operator's
 # deploy syncs into qiita.action; bumping the workflow major version is a
 # coordinated change.
-_BCL_CONVERT_ACTION_ID = "bcl-convert"
+_BCL_CONVERT_ACTION_ID = BCL_CONVERT_ACTION_ID
 
 _BCL_CONVERT_ACTION_VERSION = "1.0.0"
 
