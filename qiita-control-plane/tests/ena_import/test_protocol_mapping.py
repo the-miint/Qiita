@@ -100,7 +100,9 @@ def test_none_strategy_and_source_raises():
 def test_pcr_selection_on_a_non_amplicon_strategy_raises(
     library_strategy, library_source, library_selection, platform
 ):
-    with pytest.raises(UnmappableEnaLibraryStrategyError, match="(?i)pcr") as excinfo:
+    with pytest.raises(
+        UnmappableEnaLibraryStrategyError, match="is not AMPLICON; correct the record at ENA"
+    ) as excinfo:
         map_ena_run_to_prep_protocol_name(
             library_strategy=library_strategy,
             library_source=library_source,
