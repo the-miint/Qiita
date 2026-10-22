@@ -2089,13 +2089,20 @@ async def _update_sequenced_sample_read_counts(
 ) -> int | None:
     """Write the four per-stage both-mates (`*_r1r2`) read counts onto the 1:1
     sequenced_sample row for `prep_sample_idx`; return its idx, or None if no such
-    row exists (the caller raises its own ordering-specific error). All four None
-    returns the row to "not yet masked".
+    row exists. All four None returns the row to "not yet masked"; a mix of set and
+    None is refused, since no masking run leaves a partial set.
 
     Idempotent — a retried workflow overwrites with the same counts. Accepts a pool
     or a connection so it composes standalone or inside a transaction. The DB CHECK
     (quality_filtered <= biological and biological + spikein <= raw) enforces the
     bucket invariants at write time."""
+    counts = (raw, biological, quality_filtered, spikein)
+    if any(c is None for c in counts) and not all(c is None for c in counts):
+        raise ValueError(
+            f"read counts for prep_sample_idx={prep_sample_idx} must be all set or all "
+            f"None; got raw={raw}, biological={biological}, "
+            f"quality_filtered={quality_filtered}, spikein={spikein}"
+        )
     return await conn.fetchval(
         "UPDATE qiita.sequenced_sample"
         " SET raw_read_count_r1r2 = $2,"

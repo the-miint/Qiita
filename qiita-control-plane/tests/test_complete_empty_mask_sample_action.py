@@ -262,3 +262,19 @@ async def test_clearing_leaves_a_withdrawn_row_and_touches_nothing_else(postgres
 
     assert await _gate(postgres_pool, mask_idx, ps) == "invalidated"
     assert await _counts(postgres_pool, ps) == (5, 5, 5, 0)
+
+
+async def test_read_counts_are_written_all_set_or_all_unset(postgres_pool, seeded):
+    """No masking run leaves a partial set of counts, so the writer refuses one."""
+    from qiita_control_plane.actions.library import _update_sequenced_sample_read_counts
+
+    with pytest.raises(ValueError, match="all set or all None"):
+        await _update_sequenced_sample_read_counts(
+            postgres_pool,
+            seeded["prep_sample_idx"],
+            raw=0,
+            biological=None,
+            quality_filtered=0,
+            spikein=0,
+        )
+    assert await _counts(postgres_pool, seeded["prep_sample_idx"]) == (None, None, None, None)

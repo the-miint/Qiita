@@ -26,7 +26,8 @@
     earlier and is left so.
 
   `samples_skipped_no_reads` now counts only prep_samples that have no reads and no
-  ingest record.
+  ingest record. The plan answers 409 when a prep_sample gains reads while it runs;
+  planning again picks them up.
 - **A `read-mask` ticket that fails for want of reads now carries its `mask_idx`
   (#fix/empty-sample-mask-gate)**, so `qiita mask samples` lists the prep_sample
   instead of leaving it out.

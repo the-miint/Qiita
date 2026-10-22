@@ -109,8 +109,6 @@ async def mint_sequence_range_route(
                 principal_idx=sa.principal_idx,
                 work_ticket_idx=body.work_ticket_idx,
             )
-            # The prep_sample is gaining reads, so a record that it was masked with
-            # none no longer holds; same transaction as the mint.
             await clear_empty_mask_completions(conn, prep_sample_idx=body.prep_sample_idx)
         except asyncpg.UniqueViolationError:
             raise HTTPException(
