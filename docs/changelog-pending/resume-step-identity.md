@@ -12,7 +12,9 @@
 - **`register-files` can be run again after it registered (#NNN).** A replay of the
   data plane's `register_files` — the control plane restarted after the registration
   committed but before it recorded the step complete — returns the files the first call
-  registered instead of failing with `staging file not found`. A replay that finds the
+  registered instead of failing with `contains no Parquet files`. The control plane
+  records the payload it sends beside the step's attempt directories and resends it on a
+  replay, since the first call's move empties the staging dir. A replay that finds the
   files moved but not registered still fails, since the first call may still be
   registering them.
 

@@ -54,7 +54,12 @@ from ..shard_orchestration import (
     expected_shard_index_types,
     plan_and_submit_shards,
 )
-from ..workspace import step_attempt_dir, step_logs_dir, step_output_dir
+from ..workspace import (
+    action_payload_record,
+    step_attempt_dir,
+    step_logs_dir,
+    step_output_dir,
+)
 from ._alignment import _workflow_writes_alignment_gate
 from ._dispatch import _best_effort_record_failed, _result_with_infra_retry
 from ._mask import MASK_IDX_BINDING
@@ -277,6 +282,78 @@ def _action_failure_is_retriable(entry_name: str, exc: BaseException) -> bool:
     if entry_name == LibraryPrimitive.REGISTER_FILES:
         return is_data_plane_busy(exc) or is_data_plane_ticket_expired(exc)
     return is_data_plane_transient(exc)
+
+
+def _staged_register_files(staging_dir: Path) -> dict[str, str]:
+    """Filename → DuckLake table mapping derived from the staging dir.
+
+    Convention:
+      - Top-level `<table>.parquet` files register as the table named after the
+        file's stem (single-file table).
+      - Top-level subdirs containing `*.parquet` files register each part as the
+        table named after the directory (multi-file table). The filename carries
+        the subdir prefix relative to staging_dir; the data plane normalises to
+        basename when placing each part in the permanent per-table directory.
+
+    The multi-file form exists for `reference_sequence_chunks` — at GG2 scale a
+    single-file sort+write of ~30 GB of chunk_data OOMs DuckDB; reference_load
+    batches it into part files instead
+    (jobs/reference_load.py:_write_reference_sequence_chunks)."""
+    files: dict[str, str] = {}
+    for entry_path in sorted(staging_dir.iterdir()):
+        if entry_path.is_file() and entry_path.suffix == ".parquet":
+            files[entry_path.name] = entry_path.stem
+        elif entry_path.is_dir():
+            for part in sorted(entry_path.glob("*.parquet")):
+                rel = part.relative_to(staging_dir).as_posix()
+                files[rel] = entry_path.name
+    return files
+
+
+def _register_files_payload(attempt_dir: Path, staging_dir: Path) -> dict[str, str]:
+    """The `files` payload for a register-files call on `staging_dir`.
+
+    The data plane moves each file out of staging before its catalog commit, so
+    a replay — the control plane lost the reply, or died before recording the
+    step complete — finds the directory partly or wholly empty. The payload is
+    therefore recorded before the first call, where every attempt of the entry
+    finds it, and resent on a replay whatever the directory still holds; the data plane answers a
+    resent payload from where it moved the files (`register_files` in the data
+    plane's flight_service.rs). A staged file the record does not name was not
+    part of the earlier call, so the replay refuses it rather than registering
+    a payload neither call sent."""
+    staged = _staged_register_files(staging_dir)
+    record = action_payload_record(attempt_dir, str(staging_dir))
+    if record.exists():
+        recorded = json.loads(record.read_text())
+        if recorded["staging_dir"] != str(staging_dir):
+            raise RuntimeError(
+                f"register-files: record {record} is for staging_dir "
+                f"{recorded['staging_dir']}, not {staging_dir}"
+            )
+        files: dict[str, str] = recorded["files"]
+        unsent = {name: table for name, table in staged.items() if files.get(name) != table}
+        if unsent:
+            raise RuntimeError(
+                f"register-files: staging_dir {staging_dir} holds {sorted(unsent)}, which the "
+                f"earlier call recorded in {record} did not send"
+            )
+        return files
+    if not staged:
+        # A call made before the control plane recorded its payload leaves no
+        # record, and may still have moved the files and committed.
+        raise RuntimeError(
+            f"register-files: staging_dir {staging_dir} contains no Parquet files, and no "
+            "earlier call of this entry recorded a payload for it; if an earlier call "
+            "reached the data plane, it moved them into the lake and its registration "
+            "may have committed — check whether the files are registered "
+            "(`make lake-shell`) before re-running"
+        )
+    record.parent.mkdir(parents=True, exist_ok=True)
+    partial = record.with_suffix(".partial")
+    partial.write_text(json.dumps({"staging_dir": str(staging_dir), "files": staged}))
+    partial.replace(record)
+    return staged
 
 
 async def _dispatch_action(
@@ -536,38 +613,7 @@ async def _run_action_primitive(
 
     if entry.name == LibraryPrimitive.REGISTER_FILES:
         staging_dir = Path(bound[entry.inputs[0]])
-        # Filename → DuckLake table mapping derived from the staging dir.
-        # Convention:
-        #   - Top-level `<table>.parquet` files register as the table
-        #     named after the file's stem (single-file table).
-        #   - Top-level subdirs containing `*.parquet` files register
-        #     each part as the table named after the directory
-        #     (multi-file table). The filename in `files` carries the
-        #     subdir prefix relative to staging_dir; the data plane
-        #     normalises to basename when placing each part in the
-        #     permanent per-table directory.
-        # The multi-file form exists for `reference_sequence_chunks` —
-        # at GG2 scale a single-file sort+write of ~30 GB of chunk_data
-        # OOMs DuckDB; reference_load batches it into part files
-        # instead (jobs/reference_load.py:_write_reference_sequence_chunks).
-        files: dict[str, str] = {}
-        for entry_path in sorted(staging_dir.iterdir()):
-            if entry_path.is_file() and entry_path.suffix == ".parquet":
-                files[entry_path.name] = entry_path.stem
-            elif entry_path.is_dir():
-                for part in sorted(entry_path.glob("*.parquet")):
-                    rel = part.relative_to(staging_dir).as_posix()
-                    files[rel] = entry_path.name
-        if not files:
-            # The data plane moves the staged files out before its catalog
-            # transaction, so an empty directory on a re-run means an earlier
-            # attempt got that far.
-            raise RuntimeError(
-                f"register-files: staging_dir {staging_dir} contains no Parquet files; "
-                "if an earlier attempt of this entry reached the data plane, it moved "
-                "them into the lake and its registration may have committed — check "
-                "whether the files are registered (`make lake-shell`) before re-running"
-            )
+        files = _register_files_payload(workspace, staging_dir)
         await LIBRARY[LibraryPrimitive.REGISTER_FILES](
             staging_dir=str(staging_dir),
             files=files,

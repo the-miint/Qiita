@@ -2067,6 +2067,101 @@ fn ducklake_add_data_files_accepts_a_path_it_already_holds() {
     assert_eq!(membership_rows(&connstr, &data_path, ref_idx), 4);
 }
 
+/// One `reference_idx`'s rows registered once, then a second registration of
+/// the same rows from a new staging dir, for the overlapping-delete tests: the
+/// shape of `delete-alignment-sample` followed by `register-files`.
+#[cfg(feature = "integration")]
+fn delete_then_reregister(
+    connstr: &str,
+    data_path: &str,
+    ref_idx: i64,
+    between: impl FnOnce(),
+) -> Vec<tempfile::TempDir> {
+    prepare_membership_table(connstr, data_path, ref_idx);
+    let (first_dir, first) = seed_membership_registration(ref_idx, ref_idx * 10);
+    register_files(
+        &attached_writer(connstr, data_path),
+        data_path,
+        std::path::Path::new("/"),
+        &first,
+    )
+    .unwrap();
+    between();
+    let rerun = attached_conn(connstr, data_path);
+    rerun
+        .execute(
+            "DELETE FROM qiita_lake.reference_membership WHERE reference_idx = ?",
+            [ref_idx],
+        )
+        .unwrap();
+    let (second_dir, second) = seed_membership_registration(ref_idx, ref_idx * 10 + 1);
+    register_files(
+        &attached_writer(connstr, data_path),
+        data_path,
+        std::path::Path::new("/"),
+        &second,
+    )
+    .unwrap();
+    assert_eq!(membership_rows(connstr, data_path, ref_idx), 2);
+    vec![first_dir, second_dir]
+}
+
+/// A delete the caller abandoned, whose DELETE ran before the rerun's delete and
+/// registration and whose COMMIT comes after them, fails to commit, and the
+/// rerun's rows stay.
+#[test]
+#[serial_test::serial]
+#[cfg(feature = "integration")]
+fn ducklake_abandoned_delete_that_read_first_fails_to_commit() {
+    let connstr = crate::test_catalog::connstr();
+    let data_path = crate::test_catalog::data_path();
+    let ref_idx: i64 = 976_000_000 + std::process::id() as i64;
+    let abandoned = attached_conn(&connstr, &data_path);
+    let _dirs = delete_then_reregister(&connstr, &data_path, ref_idx, || {
+        abandoned.execute_batch("BEGIN TRANSACTION").unwrap();
+        let n = abandoned
+            .execute(
+                "DELETE FROM qiita_lake.reference_membership WHERE reference_idx = ?",
+                [ref_idx],
+            )
+            .unwrap();
+        assert_eq!(n, 2);
+    });
+
+    let err = abandoned
+        .execute_batch("COMMIT")
+        .expect_err("the abandoned delete committed over the rerun");
+    assert!(err.to_string().contains("Transaction conflict"), "{err}");
+    assert_eq!(membership_rows(&connstr, &data_path, ref_idx), 2);
+}
+
+/// A DuckLake transaction reads the snapshot current at its first statement, not
+/// at its BEGIN: a delete whose DELETE runs after the rerun's registration
+/// commits, and deletes the rerun's rows.
+#[test]
+#[serial_test::serial]
+#[cfg(feature = "integration")]
+fn ducklake_transaction_reads_the_snapshot_of_its_first_statement() {
+    let connstr = crate::test_catalog::connstr();
+    let data_path = crate::test_catalog::data_path();
+    let ref_idx: i64 = 977_000_000 + std::process::id() as i64;
+    let late = attached_conn(&connstr, &data_path);
+    let _dirs = delete_then_reregister(&connstr, &data_path, ref_idx, || {
+        late.execute_batch("BEGIN TRANSACTION").unwrap();
+    });
+
+    let n = late
+        .execute(
+            "DELETE FROM qiita_lake.reference_membership WHERE reference_idx = ?",
+            [ref_idx],
+        )
+        .unwrap();
+    late.execute_batch("COMMIT").unwrap();
+
+    assert_eq!(n, 2);
+    assert_eq!(membership_rows(&connstr, &data_path, ref_idx), 0);
+}
+
 // --- replace-by-key against a real DuckLake catalog ---
 
 /// Seed one assembly run's staging dir in the shapes `ensure_assembly_tables`
