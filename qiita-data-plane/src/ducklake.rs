@@ -828,13 +828,14 @@ pub fn ensure_amplicon_tables(conn: &Connection) -> Result<(), Box<dyn std::erro
     Ok(())
 }
 
-/// Create the one row that registrations into the replace-keyed tables
-/// serialize on, and seed it.
+/// Create the one row the lake writers that take `registration_lock` serialize
+/// on, and seed it.
 ///
-/// Why a lock is needed at all, and what it buys, lives at the one site that
-/// takes it — `flight_service::register_files`. What matters here is the shape:
-/// EXACTLY ONE row, holding a value nothing reads. `register_files` fails loudly
-/// if its UPDATE matches no row, because a lock that silently stopped locking
+/// Why a lock is needed at all, and what it buys, lives where it is taken —
+/// `flight_service::register_files` and `flight_service::delete_reference`, both
+/// through `take_registration_lock`. What matters here is the shape: EXACTLY ONE
+/// row, holding a value nothing reads. `take_registration_lock` fails loudly if
+/// its UPDATE matches no row, because a lock that silently stopped locking
 /// reintroduces the duplication this table exists to prevent.
 ///
 /// The seeding INSERT is guarded so a restart does not add a second row. Two data

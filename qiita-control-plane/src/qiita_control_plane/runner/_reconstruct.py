@@ -296,9 +296,8 @@ def _staged_register_files(staging_dir: Path) -> dict[str, str]:
         basename when placing each part in the permanent per-table directory.
 
     The multi-file form exists for `reference_sequence_chunks` — at GG2 scale a
-    single-file sort+write of ~30 GB of chunk_data OOMs DuckDB; reference_load
-    batches it into part files instead
-    (jobs/reference_load.py:_write_reference_sequence_chunks)."""
+    single-file sort+write of ~30 GB of chunk_data OOMs DuckDB, so reference_load
+    writes it as batched part files instead."""
     files: dict[str, str] = {}
     for entry_path in sorted(staging_dir.iterdir()):
         if entry_path.is_file() and entry_path.suffix == ".parquet":
