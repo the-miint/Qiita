@@ -2,10 +2,10 @@
 
 POST /sequence-range mints a contiguous bigint range for a prep_sample, and in
 the same transaction removes any record that the prep_sample was masked with no
-reads (`clear_empty_mask_completions`). Service-account callers with the `sequence_range:mint` scope only —
-humans never mint sequence ranges. The cap on a single allocation is
-read from Settings.max_sequence_mint_count (so a runaway compute step
-can't burn an unbounded slice of the sequence_idx space).
+reads (`clear_empty_mask_completions`). Service-account callers with the
+`sequence_range:mint` scope only — humans never mint sequence ranges. The cap on
+a single allocation is read from Settings.max_sequence_mint_count (so a runaway
+compute step can't burn an unbounded slice of the sequence_idx space).
 
 GET /sequence-range/{prep_sample_idx} reads the row back. Who may read it is
 on `get_sequence_range_route`.

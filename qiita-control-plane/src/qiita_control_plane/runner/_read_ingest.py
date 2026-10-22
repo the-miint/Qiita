@@ -676,9 +676,10 @@ async def _resolve_staged_reads(
     — the run handler then records it as masked with an empty pass-set — or when it
     is an expected-empty control (a blank / no-template control legitimately
     produces no reads). Anything else is SUBMISSION/BAD_INPUT (FAILED): nothing shows
-    the prep_sample was ingested, so it must be before a mask can be created over it. (An unreachable data plane is likewise
-    SUBMISSION/BAD_INPUT.) Without this split every empty well lands in the pool's
-    `samples_failed`, burying real failures among wells that were simply empty."""
+    the prep_sample was ingested, so it must be before a mask can be created over it.
+    (An unreachable data plane is likewise SUBMISSION/BAD_INPUT.) Without this split
+    every empty well lands in the pool's `samples_failed`, burying real failures
+    among wells that were simply empty."""
     prep_sample_idx = scope_target["prep_sample_idx"]
 
     durable = compute_reads_staging_path(staging_root, prep_sample_idx)
