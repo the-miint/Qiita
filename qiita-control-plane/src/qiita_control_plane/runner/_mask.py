@@ -10,7 +10,6 @@ from pathlib import Path
 from typing import Any, NamedTuple
 
 import asyncpg
-from qiita_common.actions import WorkflowAction
 from qiita_common.api_paths import LibraryPrimitive
 
 from ..actions.library import complete_empty_mask_sample
@@ -25,7 +24,7 @@ from ..repositories.mask_definition import (
     mint_mask_definition,
 )
 from ..repositories.reference_membership import reference_sequence_set_hash
-from ._base import _log
+from ._base import _log, _workflow_declares_action
 from ._db import persist_ticket_idx
 from ._reference import QC_ADAPTER_BINDING, _resolve_qc_adapters
 from ._upload import _submission_bad_input
@@ -555,8 +554,7 @@ def _workflow_writes_mask_gate(steps: list[Any]) -> bool:
     """True iff some entry is the `finalize-mask-sample` action: the workflow records
     each sample it masks in qiita.mask_sample, so the runner records a sample it ends
     at NO_DATA for want of reads there too."""
-    gate = LibraryPrimitive.FINALIZE_MASK_SAMPLE
-    return any(isinstance(entry, WorkflowAction) and entry.name == gate for entry in steps)
+    return _workflow_declares_action(steps, LibraryPrimitive.FINALIZE_MASK_SAMPLE)
 
 
 async def _record_mask_gate_empty(
