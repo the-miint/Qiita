@@ -506,8 +506,8 @@ class BlockMaskPlanResponse(BaseModel):
     """Returned (HTTP 202) by `POST .../block-mask-plan`: the plan the server
     persisted + dispatched. `blocks` lists every created block with its
     dispatched work_ticket; `partitions` summarizes the per-mask tiling and the
-    host filtering EACH partition resolved to (there is no single pool-wide host
-    answer any more — it is per sample); the `samples_*` counts reconcile the
+    host filtering EACH partition resolved to (host filtering is resolved per
+    sample, so a pool can span several partitions); the `samples_*` counts reconcile the
     pool's samples (planned + skipped-existing + skipped-no-reads +
     completed-empty + skipped-invalidated). `samples_completed_empty` counts the
     prep_samples whose ingest stored no reads, recorded as masked with no reads to

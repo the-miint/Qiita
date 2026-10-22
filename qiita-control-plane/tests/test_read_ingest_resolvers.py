@@ -280,12 +280,11 @@ def test_workflow_declares_run_map_binding_gate():
 _EXPORT_READ = "qiita_control_plane.runner._do_action_export_read"
 # The zero-read control-split lookup, monkeypatched so these pure-unit tests
 # exercise the routing decision without a DB. The seam's real DB behavior
-# (prep_sample -> biosample -> control marker) is pinned by the DB-bound tests
-# in test_host_filter_resolver.py.
+# (prep_sample -> biosample -> control marker) is pinned by `is_control_sample`'s
+# own DB-bound tests.
 _CONTROL_LOOKUP = "qiita_control_plane.runner._read_ingest._prep_sample_is_expected_empty_control"
-# `_resolve_staged_reads` now takes a pool first; the branches these tests reach
-# either don't touch it or monkeypatch the one helper that would, so a sentinel
-# stands in for it.
+# `_resolve_staged_reads` takes a pool; the branches these tests reach either don't
+# touch it or monkeypatch the helpers that would, so a sentinel stands in for it.
 _FAKE_POOL = object()
 
 
