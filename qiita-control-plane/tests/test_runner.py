@@ -24,7 +24,11 @@ from pathlib import Path
 
 import asyncpg
 import pytest
-from qiita_common.actions import LONG_READ_ASSEMBLY_ACTION_ID
+from qiita_common.actions import (
+    FASTQ_TO_PARQUET_ACTION_ID,
+    LONG_READ_ASSEMBLY_ACTION_ID,
+    READ_MASK_ACTION_ID,
+)
 from qiita_common.api_paths import LibraryPrimitive
 from qiita_common.backend_failure import BackendFailure, FailureKind, StepNoData
 from qiita_common.models import (
@@ -6900,3 +6904,269 @@ def test_qc_producer_covers_every_per_sample_gate():
         LibraryPrimitive.FINALIZE_MASK_SAMPLE,
         LibraryPrimitive.FINALIZE_ASSEMBLY_SAMPLE,
     }
+
+
+# =============================================================================
+# The mask_sample gate for a sample ingest found empty
+# =============================================================================
+
+# A per-sample masking workflow pared to what the empty-sample path reads: a step
+# threading `mask_idx` (so the runner mints the mask) and the terminal
+# `finalize-mask-sample` action (so it writes the gate). read-mask binds `reads`
+# from the stored reads; fastq-to-parquet produces them in its first step.
+_HOST_FILTER_STEP = {
+    "kind": "step",
+    "name": "host_filter",
+    "step_type": "singleton",
+    "module": "qiita_compute_orchestrator.jobs.host_filter",
+    "params": {"mask_idx": "mask_idx"},
+    "inputs": ["reads"],
+    "outputs": ["read_mask"],
+    "baseline_resources": {"cpu": 1, "mem_gb": 1, "walltime": "PT1M"},
+}
+_FINALIZE_MASK_SAMPLE = {
+    "kind": "action",
+    "name": LibraryPrimitive.FINALIZE_MASK_SAMPLE.value,
+    "inputs": [],
+    "outputs": [],
+}
+_READ_MASK_GATE_STEPS = [_HOST_FILTER_STEP, _FINALIZE_MASK_SAMPLE]
+_FASTQ_TO_PARQUET_GATE_STEPS = [
+    {
+        "kind": "step",
+        "name": "fastq",
+        "step_type": "singleton",
+        "module": "qiita_compute_orchestrator.jobs.fastq_to_parquet",
+        "inputs": [],
+        "outputs": ["reads"],
+        "baseline_resources": {"cpu": 1, "mem_gb": 1, "walltime": "PT1M"},
+    },
+    _HOST_FILTER_STEP,
+    _FINALIZE_MASK_SAMPLE,
+]
+
+
+async def _seed_mask_gate_ticket(pool, *, action_id, steps, ingest_state=None):
+    """A pooled prep_sample with no reads and a ticket for a masking `action_id`
+    running `steps`. With `ingest_state`, the sample also has a bam-to-parquet ticket
+    that ended in that state. Returns the ids plus a teardown."""
+    from qiita_common.actions import BAM_TO_PARQUET_ACTION_ID
+
+    from qiita_control_plane.testing.db_seeds import (
+        seed_biosample_with_sequenced_prep_sample,
+        seed_sequenced_sample_subtype,
+        seed_user_principal,
+    )
+    from qiita_control_plane.testing.db_teardown import delete_idxs
+
+    principal_idx = await seed_user_principal(pool, prefix="mask-gate", suffix=uuid.uuid4().hex[:8])
+    biosample_idx, prep_sample_idx = await seed_biosample_with_sequenced_prep_sample(
+        pool, owner_idx=principal_idx
+    )
+    run_idx, pool_idx, _ss_idx = await seed_sequenced_sample_subtype(
+        pool,
+        prep_sample_idx=prep_sample_idx,
+        owner_idx=principal_idx,
+        sequenced_pool_item_id=f"item-{uuid.uuid4().hex[:8]}",
+    )
+    version = f"runner-test-{uuid.uuid4()}"
+    actions = [(action_id, version, steps)]
+    if ingest_state is not None:
+        actions.append((BAM_TO_PARQUET_ACTION_ID, version, []))
+    for a_id, a_version, a_steps in actions:
+        await pool.execute(
+            "INSERT INTO qiita.action ("
+            "  action_id, version, target_kind, scopes, audience,"
+            "  context_schema, steps,"
+            "  cpu_ceiling, mem_ceiling_gb, walltime_ceiling"
+            ") VALUES ($1, $2, 'prep_sample', $3::text[], $4::jsonb,"
+            "  $5::jsonb, $6::jsonb, 1, 1, '1 minute')",
+            a_id,
+            a_version,
+            [],
+            json.dumps({"service": False, "human_roles": ["user"]}),
+            json.dumps({}),
+            json.dumps(a_steps),
+        )
+    if ingest_state is not None:
+        # work_ticket_failure_consistent: a FAILED ticket carries its failure columns.
+        failed = ingest_state == "failed"
+        await pool.execute(
+            "INSERT INTO qiita.work_ticket ("
+            "  action_id, action_version, originator_principal_idx,"
+            "  scope_target_kind, prep_sample_idx, state,"
+            "  failure_type, failure_stage, failure_reason"
+            ") VALUES ($1, $2, $3, 'prep_sample', $4, $5::qiita.work_ticket_state,"
+            "  $6::qiita.failure_type, $7::qiita.work_ticket_failure_stage, $8)",
+            BAM_TO_PARQUET_ACTION_ID,
+            version,
+            principal_idx,
+            prep_sample_idx,
+            ingest_state,
+            "permanent" if failed else None,
+            "submission" if failed else None,
+            "test failure" if failed else None,
+        )
+    work_ticket_idx = await pool.fetchval(
+        "INSERT INTO qiita.work_ticket ("
+        "  action_id, action_version, originator_principal_idx,"
+        "  scope_target_kind, prep_sample_idx, action_context"
+        ") VALUES ($1, $2, $3, 'prep_sample', $4, $5::jsonb) RETURNING work_ticket_idx",
+        action_id,
+        version,
+        principal_idx,
+        prep_sample_idx,
+        json.dumps({"host_filter_enabled": False, "lima_enabled": False, "syndna_enabled": False}),
+    )
+
+    async def _teardown():
+        mask_idxs = await pool.fetch(
+            "SELECT mask_idx FROM qiita.work_ticket"
+            " WHERE action_version = $1 AND mask_idx IS NOT NULL",
+            version,
+        )
+        await pool.execute("DELETE FROM qiita.work_ticket WHERE action_version = $1", version)
+        await pool.execute("DELETE FROM qiita.action WHERE version = $1", version)
+        await teardown_entity_graph(
+            pool,
+            study_idxs=[],
+            biosample_idxs=[biosample_idx],
+            prep_sample_idxs=[prep_sample_idx],
+        )
+        await delete_idxs(pool, "sequenced_pool", pool_idx)
+        await delete_idxs(pool, "sequencing_run", run_idx)
+        await pool.execute(
+            "DELETE FROM qiita.mask_definition WHERE mask_idx = ANY($1::bigint[])",
+            [r["mask_idx"] for r in mask_idxs],
+        )
+        await delete_principal(pool, principal_idx)
+
+    return work_ticket_idx, prep_sample_idx, _teardown
+
+
+def _stub_no_stored_reads(monkeypatch, *, control: bool = False):
+    """The data plane holds no reads for the sample; `control` answers the
+    expected-empty-control lookup."""
+    from qiita_control_plane.runner import _read_ingest
+
+    monkeypatch.setattr(
+        "qiita_control_plane.runner._do_action_export_read",
+        lambda _url, _token: {"count": 0, "dest": "unused"},
+    )
+
+    async def _is_control(_pool, _prep_sample_idx):
+        return control
+
+    monkeypatch.setattr(_read_ingest, "_prep_sample_is_expected_empty_control", _is_control)
+
+
+async def _ticket_and_gate(pool, work_ticket_idx, prep_sample_idx):
+    ticket = await pool.fetchrow(
+        "SELECT state, mask_idx FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+        work_ticket_idx,
+    )
+    gate = await pool.fetchval(
+        "SELECT state FROM qiita.mask_sample WHERE mask_idx = $1 AND prep_sample_idx = $2",
+        ticket["mask_idx"],
+        prep_sample_idx,
+    )
+    counts = await pool.fetchrow(
+        "SELECT raw_read_count_r1r2, quality_filtered_read_count_r1r2"
+        "  FROM qiita.sequenced_sample WHERE prep_sample_idx = $1",
+        prep_sample_idx,
+    )
+    return ticket["state"], ticket["mask_idx"], gate, tuple(counts)
+
+
+async def test_read_mask_records_a_sample_ingest_found_empty_as_masked(
+    postgres_pool, monkeypatch, tmp_path
+):
+    """The sample's BAM held no reads (bam-to-parquet ended NO_DATA). read-mask ends
+    NO_DATA too, and the sample is masked-complete under the mask the ticket minted,
+    with zero read counts: there was nothing to mask."""
+    work_ticket_idx, ps, teardown = await _seed_mask_gate_ticket(
+        postgres_pool,
+        action_id=READ_MASK_ACTION_ID,
+        steps=_READ_MASK_GATE_STEPS,
+        ingest_state="no_data",
+    )
+    _stub_no_stored_reads(monkeypatch)
+    try:
+        await _run(work_ticket_idx, postgres_pool, FakeBackendClient(), tmp_path / "ws")
+        state, mask_idx, gate, counts = await _ticket_and_gate(postgres_pool, work_ticket_idx, ps)
+        assert state == "no_data"
+        assert mask_idx is not None
+        assert gate == "completed"
+        assert counts == (0, 0)
+    finally:
+        await teardown()
+
+
+async def test_read_mask_writes_no_gate_for_an_empty_control_no_ingest_explains(
+    postgres_pool, monkeypatch, tmp_path
+):
+    """An expected-empty control with no finished ingest still ends NO_DATA, but its
+    reads may simply not be ingested yet, so no gate row claims it masked."""
+    work_ticket_idx, ps, teardown = await _seed_mask_gate_ticket(
+        postgres_pool, action_id=READ_MASK_ACTION_ID, steps=_READ_MASK_GATE_STEPS
+    )
+    _stub_no_stored_reads(monkeypatch, control=True)
+    try:
+        await _run(work_ticket_idx, postgres_pool, FakeBackendClient(), tmp_path / "ws")
+        state, mask_idx, gate, counts = await _ticket_and_gate(postgres_pool, work_ticket_idx, ps)
+        assert state == "no_data"
+        assert mask_idx is not None
+        assert gate is None
+        assert counts == (None, None)
+    finally:
+        await teardown()
+
+
+async def test_read_mask_for_a_never_ingested_sample_fails_and_carries_its_mask(
+    postgres_pool, monkeypatch, tmp_path
+):
+    """No reads, and the only ingest record is a failed one, which does not show the
+    prep_sample was read: it must be ingested first. The mask is minted before the
+    reads are bound, so the failed ticket names it."""
+    work_ticket_idx, ps, teardown = await _seed_mask_gate_ticket(
+        postgres_pool,
+        action_id=READ_MASK_ACTION_ID,
+        steps=_READ_MASK_GATE_STEPS,
+        ingest_state="failed",
+    )
+    _stub_no_stored_reads(monkeypatch)
+    try:
+        with pytest.raises(BackendFailure, match="must be ingested"):
+            await _run(work_ticket_idx, postgres_pool, FakeBackendClient(), tmp_path / "ws")
+        state, mask_idx, gate, _counts = await _ticket_and_gate(postgres_pool, work_ticket_idx, ps)
+        assert state == "failed"
+        assert mask_idx is not None
+        assert gate is None
+    finally:
+        await teardown()
+
+
+async def test_fastq_to_parquet_records_its_own_empty_input_as_masked(
+    postgres_pool, monkeypatch, tmp_path
+):
+    """fastq-to-parquet ingests and masks in one ticket. When its FASTQ is empty the
+    `fastq` step raises StepNoData after the mask is minted, and the ticket itself is
+    the ingest that found the sample empty."""
+    work_ticket_idx, ps, teardown = await _seed_mask_gate_ticket(
+        postgres_pool, action_id=FASTQ_TO_PARQUET_ACTION_ID, steps=_FASTQ_TO_PARQUET_GATE_STEPS
+    )
+    backend = FakeBackendClient()
+
+    async def _empty_fastq(*_args, **_kwargs):
+        raise StepNoData(step_name="fastq", reason="FASTQ holds no records")
+
+    monkeypatch.setattr(backend, "run_step", _empty_fastq)
+    try:
+        await _run(work_ticket_idx, postgres_pool, backend, tmp_path / "ws")
+        state, mask_idx, gate, counts = await _ticket_and_gate(postgres_pool, work_ticket_idx, ps)
+        assert state == "no_data"
+        assert mask_idx is not None
+        assert gate == "completed"
+        assert counts == (0, 0)
+    finally:
+        await teardown()

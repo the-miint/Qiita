@@ -336,6 +336,23 @@ async def test_block_mask_plan_resubmit_over_completed_409(ctx, planned):
     assert ok.json()["blocks_created"] == 0
 
 
+async def test_block_mask_plan_prep_sample_gaining_reads_mid_plan_409(ctx, planned, monkeypatch):
+    """A prep_sample whose range landed while the plan ran rolls the plan back; the
+    operator is told to plan again rather than handed an unmapped 500."""
+    await _seed_block_action(planned["db"])
+    gained = planned["prep_samples"][0]
+
+    async def _raise(*_args, **_kwargs):
+        raise block_planner.BlockPlanSampleGainedReads(
+            prep_sample_idx=gained, sequenced_pool_idx=planned["pool_idx"]
+        )
+
+    monkeypatch.setattr(block_planner, "plan_and_submit_blocks", _raise)
+    resp = await ctx["wet"].post(_url(planned), json={})
+    assert resp.status_code == 409, resp.text
+    assert "plan the pool again" in resp.json()["detail"]
+
+
 async def test_block_mask_plan_missing_action_503(ctx, planned):
     # No block action seeded → the endpoint refuses with 503 (sync actions first)
     # rather than 500ing at the ticket FK.

@@ -21,7 +21,6 @@ from typing import Any
 import asyncpg
 from qiita_common.actions import (
     PROCESSING_IDX_BINDING,
-    WorkflowAction,
     action_threads_processing_idx,
 )
 from qiita_common.api_paths import LibraryPrimitive
@@ -31,7 +30,7 @@ from ..repositories.assembly import (
     upsert_assembly_sample_no_data,
 )
 from ..repositories.processing import ProcessingDeprecated, mint_processing
-from ._base import _log
+from ._base import _log, _workflow_declares_action
 from ._mask import MASK_IDX_BINDING
 from ._upload import _submission_bad_input
 
@@ -171,8 +170,7 @@ def _workflow_writes_assembly_gate(steps: list[Any]) -> bool:
     the action_id means a workflow gets the runner's two writes exactly when it
     declares the third.
     """
-    gate = LibraryPrimitive.FINALIZE_ASSEMBLY_SAMPLE
-    return any(isinstance(entry, WorkflowAction) and entry.name == gate for entry in steps)
+    return _workflow_declares_action(steps, LibraryPrimitive.FINALIZE_ASSEMBLY_SAMPLE)
 
 
 async def _create_assembly_gate_pending(

@@ -57,7 +57,7 @@ from ..shard_orchestration import (
 from ..workspace import step_attempt_dir, step_logs_dir, step_output_dir
 from ._alignment import _workflow_writes_alignment_gate
 from ._dispatch import _best_effort_record_failed, _result_with_infra_retry
-from ._mask import MASK_IDX_BINDING
+from ._mask import MASK_IDX_BINDING, _workflow_writes_mask_gate
 from ._processing import _workflow_writes_assembly_gate
 from ._read_ingest import (
     ROUTER_PENDING_BINDING,
@@ -388,10 +388,7 @@ def _workflow_qc_producer(steps: list[Any]) -> QcProducer | None:
         return QcProducer.ALIGNMENT
     if _workflow_writes_assembly_gate(steps):
         return None
-    if any(
-        isinstance(e, WorkflowAction) and e.name == LibraryPrimitive.FINALIZE_MASK_SAMPLE
-        for e in steps
-    ):
+    if _workflow_writes_mask_gate(steps):
         return QcProducer.MASK
     return QcProducer.NONE
 

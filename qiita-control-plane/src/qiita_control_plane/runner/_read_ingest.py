@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import asyncpg
+from qiita_common.actions import BCL_CONVERT_SAMPLE_MAP_KEY
 from qiita_common.api_paths import (
     compute_reads_staging_path,
 )
@@ -24,6 +25,7 @@ from ..preflight import AmpliconBarcode, AmpliconPreflightError, amplicon_barcod
 from ..repositories.block import MASK_SAMPLE_COMPLETED, fetch_mask_sample_state
 from ..repositories.prep_sample import fetch_biosample_idx_for_prep_sample
 from ..repositories.sequenced_sample import (
+    fetch_empty_ingest_tickets,
     fetch_sequenced_pool_ena_run_roster,
     fetch_sequenced_pool_item_prep_sample_idxs,
 )
@@ -48,7 +50,7 @@ _log = logging.getLogger(__name__)
 # `reads_staging_root` hands the ingest step the scratch root it writes the
 # durable copies under.
 
-SAMPLE_MAP_BINDING = "sample_map"
+SAMPLE_MAP_BINDING = BCL_CONVERT_SAMPLE_MAP_KEY
 # golay-demux's per-sample barcode roster, materialized to a parquet like
 # `sample_map`. each entry carries its own barcodes_are_rc flag.
 BARCODE_MAP_BINDING = "barcode_map"
@@ -669,14 +671,15 @@ async def _resolve_staged_reads(
     Either source binds the same `reads` path; they are byte-equivalent modulo row
     order, and qc / host_filter are order-independent.
 
-    Zero stored reads splits on whether the well is an expected-empty control: a
-    blank / no-template control legitimately produces no reads, so it ends the
-    ticket at a benign terminal `no_data` (StepNoData); a data well with no reads
-    is a genuine failure and stays SUBMISSION/BAD_INPUT (FAILED) — it must be
-    ingested before a mask can be created over it. (An unreachable data plane is
-    likewise SUBMISSION/BAD_INPUT.) Without this split every empty well — control
-    or data — lands in the pool's `samples_failed`, burying real failures among
-    blanks doing their job."""
+    Zero stored reads ends the ticket at a benign terminal `no_data` (StepNoData)
+    when ingest read the prep_sample and found it empty (`fetch_empty_ingest_tickets`)
+    — the run handler then records it as masked with an empty pass-set — or when it
+    is an expected-empty control (a blank / no-template control legitimately
+    produces no reads). Anything else is SUBMISSION/BAD_INPUT (FAILED): nothing shows
+    the prep_sample was ingested, so it must be before a mask can be created over it.
+    (An unreachable data plane is likewise SUBMISSION/BAD_INPUT.) Without this split
+    every empty well lands in the pool's `samples_failed`, burying real failures
+    among wells that were simply empty."""
     prep_sample_idx = scope_target["prep_sample_idx"]
 
     durable = compute_reads_staging_path(staging_root, prep_sample_idx)
@@ -712,11 +715,19 @@ async def _resolve_staged_reads(
     # `count` is already an int (coerced in `_do_action_export_read`).
     if result.get("count", 0) == 0:
         # The persistent store has no reads for this sample either (the data plane
-        # writes no file for an empty result). Split control from data: an
-        # expected-empty control (blank / NTC) reading zero is the benign, correct
-        # outcome → terminal no_data; a data well reading zero is a real failure →
-        # BAD_INPUT (must be ingested before a mask can be created over it). See
-        # `is_control_sample` for what counts as a control.
+        # writes no file for an empty result). See the docstring for the split.
+        empty_ingest_ticket_idx = (
+            await fetch_empty_ingest_tickets(
+                pool, prep_sample_idxs=[prep_sample_idx], current_work_ticket_idx=None
+            )
+        ).get(prep_sample_idx)
+        if empty_ingest_ticket_idx is not None:
+            raise StepNoData(
+                reason=(
+                    f"prep_sample {prep_sample_idx} has no stored reads: ingest ticket "
+                    f"{empty_ingest_ticket_idx} read it and found it empty"
+                )
+            )
         if await _prep_sample_is_expected_empty_control(pool, prep_sample_idx):
             raise StepNoData(
                 reason=(
@@ -726,9 +737,9 @@ async def _resolve_staged_reads(
                 )
             )
         raise _submission_bad_input(
-            f"no stored reads for prep_sample {prep_sample_idx}; the sample must be "
-            "ingested (submit-bcl-convert stores reads) before a read mask can be "
-            "created over it"
+            f"no stored reads for prep_sample {prep_sample_idx}, and no ingest shows it "
+            "was read and found empty (it has none, or its newest did not end that way); "
+            "the prep_sample must be ingested before a read mask can be created over it"
         )
     if not dest.exists():
         # The data plane reported reads but no file landed at dest (a data-plane
