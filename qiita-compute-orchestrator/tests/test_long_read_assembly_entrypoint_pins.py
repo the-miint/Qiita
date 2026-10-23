@@ -847,6 +847,15 @@ def test_binning_refuses_an_unreadable_fai(tmp_path: Path) -> None:
     assert result.stdout == ""
 
 
+def test_binning_checks_contig_lengths_before_staging_reads_and_bam() -> None:
+    """The no-bins exit at the length check leaves bins_dir empty only while the check
+    comes before the reads are decompressed and coverage_bam is copied under it."""
+    lines = _code_lines(_BINNING_SH)
+    check = _binning_line_index(lines, "MIN_CONTIG_LEN=")
+    assert check < _binning_line_index(lines, "READS_FQ=")
+    assert check < _binning_line_index(lines, 'cp "${COVERAGE_BAM}"')
+
+
 def test_metawrap_gets_the_cut_as_its_minimum_contig_length(tmp_path: Path) -> None:
     result = _run_metawrap_exit_handling(tmp_path, _METABAT2_BINS, 0)
     assert result.returncode == 0, (result.returncode, result.stdout, result.stderr)

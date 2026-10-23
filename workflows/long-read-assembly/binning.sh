@@ -52,15 +52,16 @@ if [[ ! -s "${NOLCG}" ]]; then
     exit 0
 fi
 
-# metaWRAP's -l. MaxBin2 receives it as its minimum contig length and keeps a contig
-# whose length equals it. With no contig at or above it, MetaBAT2 forms no bins,
-# MaxBin2 runs FragGeneScan on an empty file and reports "Error running FragGeneScan",
-# and metaWRAP exits 1 before CONCOCT runs; a retry reproduces it. Measured on this
-# image's solve (metawrap-mg 1.3.0, maxbin2 2.2.7, metabat2 2.15, fraggenescan 1.32):
-# one 15,846 bp contig at -l 16000 and -l 15847 took that path, and at -l 15846 and
-# -l 15000 MaxBin2 kept the contig and reached the marker-gene verdict matched at the
-# metaWRAP call below. So the step finishes with no bins without running metaWRAP,
-# and before staging the reads and the BAM, as the empty-noLCG exit above does.
+# MIN_CONTIG_LEN is metaWRAP's -l. MaxBin2 receives it as its minimum contig length
+# and keeps a contig whose length equals it. With no contig at or above it, MetaBAT2
+# forms no bins, MaxBin2 runs FragGeneScan on an empty file and reports "Error running
+# FragGeneScan", and metaWRAP exits 1 before CONCOCT runs; a retry reproduces it.
+# Measured on this image's solve (metawrap-mg 1.3.0, maxbin2 2.2.7, metabat2 2.15,
+# fraggenescan 1.32): one 15,846 bp contig at -l 16000 and -l 15847 took that path,
+# and at -l 15846 and -l 15000 MaxBin2 kept the contig and reached the marker-gene
+# verdict matched at the metaWRAP call below. So the step finishes with no bins
+# without running metaWRAP, and before staging the reads and the BAM, as the
+# empty-noLCG exit above does.
 #
 # The lengths come from samtools faidx's .fai. faidx writes it next to the FASTA and
 # genomes_dir is a read-only bind, so index a WORK copy rather than noLCG in place;
