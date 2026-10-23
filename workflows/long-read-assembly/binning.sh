@@ -177,13 +177,13 @@ mv "${STAGED_BAM}" "${WORK_FILES}/${READS_STEM}.bam"
 # preserves order across batches, so the output follows @SQ order exactly. (samtools
 # 1.10 has no `-r region-file`; xargs is the version-safe equivalent.)
 #
-# `xargs --no-run-if-empty` is load-bearing, not a nicety: without it, an empty
-# order file makes xargs run `faidx` ONCE with no regions, which emits the WHOLE
-# assembly in its original (numeric) order — same contig count as noLCG, so the
-# count guard below would pass and metaWRAP would get the un-reordered assembly,
-# the exact bug. Unreachable today (the @SQ set equals noLCG's, so an empty order
-# file implies an empty noLCG, which exited above), but the flag makes the guard's
-# fail-loud cover that seam instead of silently passing.
+# Without `xargs --no-run-if-empty`, an empty order file makes xargs run `faidx`
+# once with no regions, which emits the whole assembly in its original (numeric)
+# order — same contig count as noLCG, so the count guard below would pass and
+# metaWRAP would get the un-reordered assembly, which metabat2 aborts on.
+# Unreachable today (the @SQ set equals noLCG's, so an empty order file implies an
+# empty noLCG, which exited above), but the flag makes the guard's fail-loud cover
+# that seam instead of silently passing.
 #
 # Disk: two assembly-sized copies (assembly.fa + assembly.ordered.fa) land in WORK.
 # The assembly is ≪ the read set, so this is small next to READS_FQ and the staged
