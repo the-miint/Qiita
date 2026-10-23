@@ -848,10 +848,11 @@ def test_binning_refuses_an_unreadable_fai(tmp_path: Path) -> None:
 
 
 def test_binning_checks_contig_lengths_before_staging_reads_and_bam() -> None:
-    """The no-bins exit at the length check leaves bins_dir empty only while the check
-    comes before the reads are decompressed and coverage_bam is copied under it."""
+    """The length check's no-bins exit comes before the reads are decompressed, so a
+    sample with nothing to bin does not decompress its read set, and before coverage_bam
+    is copied under bins_dir, so that exit leaves bins_dir empty."""
     lines = _code_lines(_BINNING_SH)
-    check = _binning_line_index(lines, "MIN_CONTIG_LEN=")
+    check = _binning_line_index(lines, "n_binnable=")
     assert check < _binning_line_index(lines, "READS_FQ=")
     assert check < _binning_line_index(lines, 'cp "${COVERAGE_BAM}"')
 
