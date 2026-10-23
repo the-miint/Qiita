@@ -695,22 +695,30 @@ _METABAT2_NONE_MAXBIN2_DECLINED = "\n".join(
 
 
 def _run_metawrap_exit_handling(
-    tmp_path: Path, stdout: str, exit_code: int
+    tmp_path: Path,
+    stdout: str,
+    exit_code: int,
+    contig_lengths: tuple[int, ...] = (16000,),
 ) -> subprocess.CompletedProcess[str]:
-    """Run binning.sh from its metaWRAP stdout copy to the end under bash, with a stand-in
-    `micromamba` that prints `stdout` and exits `exit_code`, and a `qiita_finish` that
-    echoes its arguments."""
+    """Run binning.sh from its minimum-contig-length check to the end under bash, with a
+    `.fai` listing `contig_lengths`, a stand-in `micromamba` that prints `stdout`, echoes
+    its arguments to stderr and exits `exit_code`, and a `qiita_finish` that echoes its
+    arguments."""
     lines = _code_lines(_BINNING_SH)
-    starts = [i for i, ln in enumerate(lines) if ln.startswith("METAWRAP_STDOUT=")]
-    assert len(starts) == 1, f"expected one METAWRAP_STDOUT assignment, got {len(starts)}"
+    starts = [i for i, ln in enumerate(lines) if ln.startswith("MIN_CONTIG_LEN=")]
+    assert len(starts) == 1, f"expected one MIN_CONTIG_LEN assignment, got {len(starts)}"
     fixture = tmp_path / "fixture.stdout"
     fixture.write_text(stdout + "\n")
+    # samtools faidx's columns: name, length, offset, linebases, linewidth.
+    (tmp_path / "assembly.fa.fai").write_text(
+        "".join(f"c{i}\t{n}\t0\t60\t61\n" for i, n in enumerate(contig_lengths))
+    )
     script = "\n".join(
         [
             "set -euo pipefail",
             f'WORK="{tmp_path}"',
             "OUT=bins THREADS=1 METAWRAP_MEM_GB=1 ORDERED_NOLCG=nolcg.fa READS_FQ=reads.fastq",
-            f'micromamba() {{ cat "{fixture}"; return {exit_code}; }}',
+            f'micromamba() {{ echo "micromamba $*" >&2; cat "{fixture}"; return {exit_code}; }}',
             'qiita_finish() { echo "qiita_finish $*"; }',
             *lines[starts[0] :],
         ]
@@ -766,6 +774,61 @@ def test_binning_finishes_after_a_clean_metawrap_run(tmp_path: Path) -> None:
     result = _run_metawrap_exit_handling(tmp_path, _METABAT2_BINS, 0)
     assert result.returncode == 0, (result.returncode, result.stdout, result.stderr)
     assert result.stdout.splitlines()[-1] == "qiita_finish bins_dir=bins"
+
+
+@pytest.mark.parametrize(
+    "contig_lengths",
+    [
+        pytest.param((15846,), id="one contig under the cut"),
+        pytest.param((9000, 12000, 15999), id="every contig under the cut"),
+    ],
+)
+def test_binning_finishes_without_metawrap_when_no_contig_reaches_the_cut(
+    tmp_path: Path, contig_lengths: tuple[int, ...]
+) -> None:
+    """With no contig at or above metaWRAP's minimum contig length, the step finishes
+    with bins_dir and does not run metaWRAP."""
+    result = _run_metawrap_exit_handling(tmp_path, _METAWRAP_MAXBIN2_ERROR, 1, contig_lengths)
+    assert result.returncode == 0, (result.returncode, result.stdout, result.stderr)
+    assert result.stdout.splitlines() == ["qiita_finish bins_dir=bins"]
+    assert "micromamba" not in result.stderr
+    assert "no contig is at least 16000 bp" in result.stderr
+
+
+@pytest.mark.parametrize(
+    "contig_lengths",
+    [
+        pytest.param((16000,), id="one contig at the cut"),
+        pytest.param((9000, 16001), id="one of two contigs over the cut"),
+    ],
+)
+def test_binning_runs_metawrap_when_a_contig_reaches_the_cut(
+    tmp_path: Path, contig_lengths: tuple[int, ...]
+) -> None:
+    """A contig whose length equals the cut is binnable, so metaWRAP runs with that cut
+    as its -l, and its failure is handled as before."""
+    result = _run_metawrap_exit_handling(tmp_path, _METAWRAP_METABAT2_ERROR, 3, contig_lengths)
+    assert result.returncode == 3, (result.returncode, result.stdout, result.stderr)
+    assert re.search(r"micromamba run -n metawrap metawrap binning .* -l 16000 ", result.stderr)
+    assert f"{_METAWRAP_FAILED} (exit 3)" in result.stderr
+
+
+def test_binning_refuses_an_unreadable_fai(tmp_path: Path) -> None:
+    """A .fai the check cannot read fails the step rather than reading as no contig."""
+    lines = _code_lines(_BINNING_SH)
+    start = next(i for i, ln in enumerate(lines) if ln.startswith("MIN_CONTIG_LEN="))
+    script = "\n".join(
+        [
+            "set -euo pipefail",
+            f'WORK="{tmp_path}"',
+            'qiita_finish() { echo "qiita_finish $*"; }',
+            "micromamba() { return 0; }",
+            *lines[start:],
+        ]
+    )
+    result = subprocess.run(["bash", "-c", script], capture_output=True, text=True, check=False)
+    assert result.returncode != 0, (result.returncode, result.stdout, result.stderr)
+    assert "qiita_finish" not in result.stdout
 
 
 def test_binning_fails_loud_on_contig_set_drift() -> None:

@@ -209,6 +209,26 @@ if (( METAWRAP_MEM_GB < 1 )); then
     echo "         to run outside it, export QIITA_MEM_MB as the memory available in MB." >&2
     exit 78
 fi
+
+# metaWRAP's -l. It reaches MetaBAT2 as minContig and MaxBin2 as its minimum contig
+# length, and both keep a contig whose length equals it. With no contig at or above
+# it, MetaBAT2 forms no bins, MaxBin2 runs FragGeneScan on an empty file and reports
+# "Error running FragGeneScan", and metaWRAP exits 1 before CONCOCT runs; a retry
+# reproduces it. Measured on this image's solve (metawrap-mg 1.3.0, maxbin2 2.2.7,
+# metabat2 2.15, fraggenescan 1.32): one 15,846 bp contig at -l 16000 and -l 15847
+# took that path, and at -l 15846 and -l 15000 MaxBin2 kept the contig and reached
+# the marker-gene verdict matched below. So the step finishes with no bins without
+# running metaWRAP. The lengths come from the .fai the reorder above wrote; a count
+# rather than an awk exit status, so an unreadable .fai aborts under set -e instead of
+# reading as no contig.
+MIN_CONTIG_LEN=16000
+n_binnable=$(awk -v min="${MIN_CONTIG_LEN}" '$2 >= min {n++} END {print n+0}' "${WORK}/assembly.fa.fai")
+if (( n_binnable == 0 )); then
+    echo "binning: no contig is at least ${MIN_CONTIG_LEN} bp, metaWRAP's minimum contig length; finishing with no bins." >&2
+    qiita_finish bins_dir=bins
+    exit 0
+fi
+
 # metaWRAP exits non-zero when any binner fails, and stops there. MaxBin2 fails on an
 # assembly whose contigs carry too few marker genes; when MetaBAT2 also formed no
 # bins, the step finishes with no bins instead of failing. The three lines matched
@@ -223,7 +243,7 @@ fi
 METAWRAP_STDOUT="${WORK}/metawrap.stdout"
 set +e
 micromamba run -n metawrap metawrap binning \
-    -a "${ORDERED_NOLCG}" -o "${OUT}" -t "${THREADS}" -m "${METAWRAP_MEM_GB}" -l 16000 \
+    -a "${ORDERED_NOLCG}" -o "${OUT}" -t "${THREADS}" -m "${METAWRAP_MEM_GB}" -l "${MIN_CONTIG_LEN}" \
     --single-end --metabat2 --maxbin2 --concoct --universal "${READS_FQ}" \
     | tee "${METAWRAP_STDOUT}"
 metawrap_rc=${PIPESTATUS[0]}
