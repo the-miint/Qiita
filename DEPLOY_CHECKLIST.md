@@ -72,7 +72,7 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
 
 ### 6. After the deploy verifies green
 
-- `[operator]` (#fix/binning-no-contig-over-min-length) Re-drive long-read-assembly ticket 12513 (prep_sample 31407), failed at `binning` because no contig reached metaWRAP's 16,000 bp minimum: `qiita ticket run 12513`. It resumes at `binning`, which now finishes with no bins; confirm with `qiita ticket status 12513`.
+- `[operator]` (#764) Re-drive long-read-assembly ticket 12513 (prep_sample 31407), failed at `binning` because no contig reached metaWRAP's 16,000 bp minimum: `qiita ticket run 12513`. It resumes at `binning`, which now finishes with no bins; confirm with `qiita ticket status 12513`.
 
 ### Notes (no host action)
 
@@ -95,7 +95,7 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
   write storm can occupy the whole pool and reads are refused for that window.
 - (#731) `GET /ena-import-batch/{idx}` items can read `completed_partial` (a pool landed with some runs failed permanently), and `ena_runs[].status` can be `download_failed`, with a new `failure_type`; clients matching on the closed set of states or statuses must accept them. `submit-ena-import --watch` exits 1 on a `completed_partial` item. A partially landed ticket is `completed`, so the submitter gets the work-ticket digest unless they opted out of processing emails.
 - (#751) `download-ena-study` 1.0.0 gains an optional `run_concurrency`. The optional control-plane `ENA_DOWNLOAD_RUN_CONCURRENCY` (1-8, default 4) stays at 4 in production (see `docs/runbooks/ena-import.md`).
-- (#fix/binning-no-contig-over-min-length) The `long-read-assembly-binning-1.0.0.sif` auto-rebuilds on deploy to pick up `binning.sh`'s minimum-contig-length check; long-read-assembly 1.0.0 and 1.0.1 both run that image, so both get it. Its `%test` now also runs `binning-min-contig-check.sh`, which runs metaWRAP twice on a small fixture; a build failure naming that script means the re-solved binners changed the behaviour the check rests on, and its stderr says which. The deploy then stops before any restart (`build-sifs.sh`), so services stay on the old build; the fix is a change to `binning.def` or `binning.sh`, not a host step.
+- (#764) The `long-read-assembly-binning-1.0.0.sif` auto-rebuilds on deploy to pick up `binning.sh`'s minimum-contig-length check; long-read-assembly 1.0.0 and 1.0.1 both run that image, so both get it. Its `%test` now also runs `binning-min-contig-check.sh`, which runs metaWRAP twice on a small fixture; a build failure naming that script means the re-solved binners changed the behaviour the check rests on, and its stderr says which. The deploy then stops before any restart (`build-sifs.sh`), so services stay on the old build; the fix is a change to `binning.def` or `binning.sh`, not a host step.
 
 ## Deployed history
 
