@@ -9,12 +9,15 @@
   zero per SynDNA insert, so the export writes an empty file for it.
   - `read-mask` and `fastq-to-parquet` end its ticket `no_data`.
   - The block plan (`submit-block-mask-pool`) records it without tiling it.
-  - It counts as empty only when an ingest record shows it was read: its
-    `bam-to-parquet` or `fastq-to-parquet` ticket ended `no_data`, or a finished
-    `bcl-convert` ticket lists it. Without that record the `read-mask` ticket still
-    fails.
+  - It counts as empty only when its newest ingest shows it was read and held
+    nothing: a `bam-to-parquet` or `fastq-to-parquet` ticket that ended `no_data`, or
+    a finished `bcl-convert` ticket that lists it. When a newer ingest failed, was
+    cancelled or has not finished, the older one does not count, and the `read-mask`
+    ticket still fails.
   - If reads are later stored for the prep_sample, the record is removed, so it has to
-    be masked again before it can be exported.
+    be masked again before it can be exported. Reads stored while the record is being
+    written wait for it, so the removal does not miss it. A newer ingest that fails or
+    has not finished leaves the record in place.
 
 ### Changed
 
@@ -25,9 +28,11 @@
   - `samples_skipped_invalidated`: empty prep_samples whose masking was withdrawn
     earlier and is left so.
 
-  `samples_skipped_no_reads` now counts only prep_samples that have no reads and no
-  ingest record. The plan answers 409 when a prep_sample gains reads while it runs;
-  planning again picks them up.
+  `samples_skipped_no_reads` now counts only prep_samples that have no reads and whose
+  newest ingest does not show them empty. The plan answers 409 when a prep_sample
+  gains reads or has a newer ingest submitted while it runs. Planning again tiles new
+  reads; a prep_sample whose newer ingest has not finished counts in
+  `samples_skipped_no_reads` until it does.
 - **A `read-mask` ticket that fails for want of reads now carries its `mask_idx`
   (#761)**, so `qiita mask samples` lists the prep_sample
   instead of leaving it out.

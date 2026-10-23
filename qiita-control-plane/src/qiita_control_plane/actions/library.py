@@ -97,6 +97,7 @@ from ..repositories.reference_membership import (
     GENOME_MAP_ROWS_SQL,
     count_reference_shards,
 )
+from ..repositories.sequence_range import lock_prep_sample_range
 from ..repositories.sequenced_sample import (
     fetch_empty_ingest_tickets,
     set_sequenced_sample_download_failure,
@@ -3167,7 +3168,7 @@ async def complete_empty_mask_sample_in_tx(
 ) -> int | None:
     """Record a prep_sample that ingest found empty as masked under `mask_idx`, on the
     caller's transaction, and return the ingest ticket that shows it was found empty.
-    Write nothing and return None when no ingest record shows that
+    Write nothing and return None when its newest ingest does not show that
     (`fetch_empty_ingest_tickets`, which defines `current_work_ticket_idx`).
 
     There are no reads to mask, so the pass-set is empty and complete: the gate goes
@@ -3177,15 +3178,18 @@ async def complete_empty_mask_sample_in_tx(
     and a zero per insert when the mask carries a SynDNA reference (the SynDNA
     export refuses a completed prep_sample that has no count rows).
 
-    The record is read here, after the gate lock and on the write's own transaction,
-    so no caller writes the gate without it. Raises `MaskSampleInvalidated` when the
-    gate row was withdrawn; the count writes go with the caller's rollback. A
-    prep_sample that later gains reads loses this record
+    The record is read here, on the write's own transaction and under the
+    prep_sample's range lock (`lock_prep_sample_range`), so no caller writes the gate
+    without it and no range lands between the read and the commit. Raises
+    `MaskSampleInvalidated` when the gate row was withdrawn; the count writes go with
+    the caller's rollback. A prep_sample that later gains reads loses this record
     (`clear_empty_mask_completions`)."""
     require_transaction(conn)
-    # The gate lock before any row write, the order the block planner takes them in,
-    # so the two writers of this pair queue rather than deadlock.
+    # The gate lock, then the range lock, before any row write: the order the block
+    # planner takes them in, so the writers of this prep_sample queue rather than
+    # deadlock.
     await lock_mask_sample_gate_advisory(conn, mask_idx=mask_idx, prep_sample_idx=prep_sample_idx)
+    await lock_prep_sample_range(conn, prep_sample_idx=prep_sample_idx)
     proof = (
         await fetch_empty_ingest_tickets(
             conn,
@@ -3237,13 +3241,20 @@ async def clear_empty_mask_completions(conn: asyncpg.Connection, *, prep_sample_
     """Undo `complete_empty_mask_sample_in_tx` for a prep_sample that is gaining reads,
     on the caller's transaction; return the number of gate rows removed.
 
-    Run where a sequence_range is minted. Until then the prep_sample had no reads, so
-    each 'completed' gate row it holds is an empty completion, and left in place it
-    would keep serving an empty pass-set over reads that now exist. Its SynDNA zeros
-    under those masks go with it, and its read counts return to unset; masking the
-    new reads writes all three again. An 'invalidated' row stays: a withdrawal stands
-    until someone restores it."""
+    Run where a sequence_range is minted, on the mint's transaction. Until then the
+    prep_sample had no reads, so each 'completed' gate row it holds is an empty
+    completion, and left in place it would keep serving an empty pass-set over reads
+    that now exist. Its SynDNA zeros under those masks go with it, and its read
+    counts return to unset; masking the new reads writes all three again. An
+    'invalidated' row stays: a withdrawal stands until someone restores it.
+
+    Only reads arriving remove the record. A newer ingest that fails or has not yet
+    finished leaves it as written, when an older ingest was the newest; the newer
+    ingest removes it here once it stores reads.
+
+    Takes `lock_prep_sample_range`, which says why."""
     require_transaction(conn)
+    await lock_prep_sample_range(conn, prep_sample_idx=prep_sample_idx)
     cleared = [
         r["mask_idx"]
         for r in await conn.fetch(

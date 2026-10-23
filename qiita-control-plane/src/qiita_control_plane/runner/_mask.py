@@ -565,13 +565,14 @@ async def _record_mask_gate_empty(
     work_ticket_idx: int,
 ) -> None:
     """Record the prep_sample as masked under `mask_idx` with an empty pass-set when
-    an ingest read it and found no reads; otherwise write nothing.
+    its newest ingest read it and found no reads; otherwise write nothing.
 
     Run from the StepNoData handler, which ends a masking ticket for a prep_sample
     with no stored reads before `finalize-mask-sample` can run. Without this it has
     no gate row and every consumer refuses it, though there was nothing to mask. A
-    NO_DATA that no ingest record explains (an expected-empty control with no
-    finished ingest) gets no row: its reads may simply not be ingested yet.
+    NO_DATA that no ingest explains (an expected-empty control whose newest ingest did
+    not end empty, or that has none) gets no row: its reads may simply not be
+    ingested yet.
 
     A withdrawn row stays withdrawn: `MaskSampleInvalidated` rolls the whole write
     back and is logged, as the assembly gate's twin does."""
@@ -592,8 +593,9 @@ async def _record_mask_gate_empty(
         return
     if proof is None:
         _log.info(
-            "prep_sample %d ended with no stored reads and no ingest record shows it was"
-            " found empty; no mask_sample row is written under mask %d",
+            "prep_sample %d ended with no stored reads and no ingest shows it was found"
+            " empty (it has none, or its newest did not end that way); no mask_sample row"
+            " is written under mask %d",
             prep_sample_idx,
             mask_idx,
         )

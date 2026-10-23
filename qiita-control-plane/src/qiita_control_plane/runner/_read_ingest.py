@@ -737,9 +737,9 @@ async def _resolve_staged_reads(
                 )
             )
         raise _submission_bad_input(
-            f"no stored reads for prep_sample {prep_sample_idx}, and no finished ingest "
-            "shows it was read and found empty; the prep_sample must be ingested before "
-            "a read mask can be created over it"
+            f"no stored reads for prep_sample {prep_sample_idx}, and no ingest shows it "
+            "was read and found empty (it has none, or its newest did not end that way); "
+            "the prep_sample must be ingested before a read mask can be created over it"
         )
     if not dest.exists():
         # The data plane reported reads but no file landed at dest (a data-plane

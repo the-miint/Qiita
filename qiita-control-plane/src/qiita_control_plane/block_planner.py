@@ -193,16 +193,17 @@ class AdapterMaterializationUnavailable(RuntimeError):
 
 
 class BlockPlanSampleGainedReads(RuntimeError):
-    """A prep_sample the plan read as range-less, with an ingest record that it was
-    found empty, had a range minted before the plan could record it as masked. The
-    plan rolls back; planning the pool again tiles the new reads. The route maps this
-    to 409."""
+    """A prep_sample the plan read as range-less and found empty by its newest ingest
+    had, by the time the plan came to record it as masked, a range minted or a newer
+    ingest submitted. The plan rolls back; planning the pool again tiles the new reads
+    or leaves the prep_sample to the newer ingest. The route maps this to 409."""
 
     def __init__(self, *, prep_sample_idx: int, sequenced_pool_idx: int):
         self.prep_sample_idx = prep_sample_idx
         super().__init__(
-            f"prep_sample {prep_sample_idx} gained stored reads while sequenced_pool"
-            f" {sequenced_pool_idx} was being planned; plan the pool again"
+            f"prep_sample {prep_sample_idx} gained stored reads, or had a newer ingest"
+            f" submitted, while sequenced_pool {sequenced_pool_idx} was being planned;"
+            " plan the pool again"
         )
 
 
@@ -586,8 +587,9 @@ async def plan_and_submit_blocks(
     it still resolves a mask like any other sample, and the same transaction records
     it as masked under that mask (`complete_empty_mask_sample_in_tx`), counted in
     `samples_completed_empty`; one whose gate was withdrawn is left so and counted in
-    `samples_skipped_invalidated`. Any other range-less sample was never ingested and
-    is counted in `samples_skipped_no_reads`. One that gains a range mid-plan raises
+    `samples_skipped_invalidated`. Any other range-less sample, whose newest ingest
+    does not show it empty or which has none, is counted in `samples_skipped_no_reads`.
+    One that gains a range or a newer ingest mid-plan raises
     `BlockPlanSampleGainedReads`.
 
     Returns a JSON-able summary (partitions with their host refs, blocks + their
@@ -603,12 +605,16 @@ async def plan_and_submit_blocks(
 
     all_samples, rangeless = await _enumerate_pool_samples(pool, sequenced_pool_idx)
     # Range-less samples: the ones ingest found empty are masked below; the count of
-    # the rest (reads never ingested) is reported so the operator sees the gap rather
-    # than a silent drop.
+    # the rest (their newest ingest does not show them empty, or they have none) is
+    # reported so the operator sees the gap rather than a silent drop.
     found_empty = await fetch_empty_ingest_tickets(
         pool, prep_sample_idxs=[r.prep_sample_idx for r in rangeless], current_work_ticket_idx=None
     )
-    empty_samples = [r for r in rangeless if r.prep_sample_idx in found_empty]
+    # Ascending, the order lock_prep_sample_range asks of a many-key caller.
+    empty_samples = sorted(
+        (r for r in rangeless if r.prep_sample_idx in found_empty),
+        key=lambda r: r.prep_sample_idx,
+    )
     skipped_no_reads = len(rangeless) - len(empty_samples)
 
     # Per-sample host-filter decision (keyed by prep_sample_idx). Refuses an
@@ -697,7 +703,9 @@ async def plan_and_submit_blocks(
         # the same lock). Sorted acquisition avoids deadlock between two concurrent
         # plans over overlapping samples. (contract: lock_mask_sample_gate_advisory.)
         # The empty samples' locks are taken in the same sorted pass; their gate
-        # write below takes each again, which an advisory lock allows.
+        # write below takes each again, which an advisory lock allows, and then each
+        # prep_sample's range lock, in ascending order, after every gate lock here
+        # (`complete_empty_mask_sample_in_tx` says why).
         for lock_mask_idx, lock_prep_sample_idx in sorted(
             (mask_by_prep_sample[s.prep_sample_idx], s.prep_sample_idx)
             for s in [*to_plan, *empty_samples]

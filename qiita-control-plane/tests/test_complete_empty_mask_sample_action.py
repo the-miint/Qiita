@@ -1,19 +1,28 @@
 """Tests for `complete_empty_mask_sample`, which records a prep_sample that ingest
 found empty as masked under a mask with the rows a finished mask leaves behind, and
-`clear_empty_mask_completions`, which removes that record when reads arrive."""
+`clear_empty_mask_completions`, which removes that record when reads arrive, including
+when the two run at once."""
 
+import asyncio
+import contextlib
 import json
 import uuid
 
 import pytest
 import pytest_asyncio
+from httpx import ASGITransport, AsyncClient
 from qiita_common.actions import BAM_TO_PARQUET_ACTION_ID
+from qiita_common.api_paths import URL_SEQUENCE_RANGE_PREFIX
 
 from qiita_control_plane.actions.library import (
     clear_empty_mask_completions,
     complete_empty_mask_sample,
+    complete_empty_mask_sample_in_tx,
 )
+from qiita_control_plane.repositories import INT4_MASK
 from qiita_control_plane.repositories.block import MaskSampleInvalidated
+from qiita_control_plane.repositories.sequence_range import PREP_SAMPLE_RANGE_LOCK_CLASS
+from qiita_control_plane.routes import sequence_range as sequence_range_route
 from qiita_control_plane.testing.db_seeds import (
     cleanup_reference_graph,
     delete_action_if_created,
@@ -30,6 +39,7 @@ from qiita_control_plane.testing.db_teardown import (
     delete_principal,
     teardown_entity_graph,
 )
+from qiita_control_plane.testing.postgres import until_advisory_lock_awaited
 
 pytestmark = pytest.mark.db
 
@@ -278,3 +288,117 @@ async def test_read_counts_are_written_all_set_or_all_unset(postgres_pool, seede
             spikein=0,
         )
     assert await _counts(postgres_pool, seeded["prep_sample_idx"]) == (None, None, None, None)
+
+
+@pytest_asyncio.fixture
+async def mint_range(postgres_pool, compute_worker_service_account):
+    """`mint_range(prep_sample_idx)`: `POST /sequence-range` as the compute service
+    account, returning the response."""
+    from qiita_control_plane.config import Settings
+    from qiita_control_plane.main import app
+
+    app.state.pool = postgres_pool
+    app.state.settings = Settings(
+        database_url="unused", flight_signing_key=b"\x00" * 32, data_plane_url="unused"
+    )
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+        headers={"Authorization": f"Bearer {compute_worker_service_account['token']}"},
+    ) as client:
+
+        async def mint(prep_sample_idx):
+            # The range records its minter; no FK, so any positive idx does.
+            return await client.post(
+                URL_SEQUENCE_RANGE_PREFIX,
+                json={"prep_sample_idx": prep_sample_idx, "count": 3, "work_ticket_idx": 7},
+            )
+
+        yield mint
+
+
+async def _until_range_lock_awaited(pool, prep_sample_idx, task):
+    await asyncio.wait_for(
+        until_advisory_lock_awaited(
+            pool,
+            lock_class=PREP_SAMPLE_RANGE_LOCK_CLASS,
+            key=prep_sample_idx & INT4_MASK,
+            task=task,
+        ),
+        timeout=10,
+    )
+
+
+async def _cancel_unfinished(tasks):
+    """Cancel and reap what a failed test left running, so it cannot write during
+    teardown and hide the failure."""
+    for task in tasks:
+        if not task.done():
+            task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await task
+
+
+async def test_a_writer_that_starts_during_a_mint_waits_and_writes_nothing(
+    postgres_pool, seeded, mint_range, monkeypatch
+):
+    """The mint has inserted its range but not committed when the writer starts.
+    The mint holds the prep_sample's range lock from before its insert, so the writer
+    waits for the commit, then finds the range and records nothing."""
+    ps, mask_idx = seeded["prep_sample_idx"], seeded["masks"]["syndna"]
+    await seeded["ingested_empty"]()
+    inserted, release = asyncio.Event(), asyncio.Event()
+    real_clear = sequence_range_route.clear_empty_mask_completions
+
+    async def clear_after_release(conn, *, prep_sample_idx):
+        inserted.set()
+        await release.wait()
+        return await real_clear(conn, prep_sample_idx=prep_sample_idx)
+
+    monkeypatch.setattr(sequence_range_route, "clear_empty_mask_completions", clear_after_release)
+    tasks = [mint := asyncio.create_task(mint_range(ps))]
+    try:
+        try:
+            await asyncio.wait_for(inserted.wait(), timeout=10)
+            tasks.append(writer := asyncio.create_task(_complete(postgres_pool, seeded, "syndna")))
+            await _until_range_lock_awaited(postgres_pool, ps, writer)
+        finally:
+            release.set()
+
+        resp = await asyncio.wait_for(mint, timeout=10)
+        assert resp.status_code == 201, resp.text
+        assert await asyncio.wait_for(writer, timeout=10) is None
+    finally:
+        await _cancel_unfinished(tasks)
+    assert await _gate(postgres_pool, mask_idx, ps) is None
+    assert await _counts(postgres_pool, ps) == (None, None, None, None)
+    assert await _syndna(postgres_pool, mask_idx, ps) == {}
+
+
+async def test_a_mint_during_an_uncommitted_completion_waits_and_removes_it(
+    postgres_pool, seeded, mint_range
+):
+    """The writer has recorded the prep_sample empty but not committed when the mint
+    starts. The writer holds the range lock to its commit, so the mint waits, and its
+    clean-up then sees the record and removes it."""
+    ps, mask_idx = seeded["prep_sample_idx"], seeded["masks"]["syndna"]
+    await seeded["ingested_empty"]()
+    tasks = []
+    try:
+        async with postgres_pool.acquire() as conn, conn.transaction():
+            assert (
+                await complete_empty_mask_sample_in_tx(
+                    conn, mask_idx=mask_idx, prep_sample_idx=ps, current_work_ticket_idx=None
+                )
+                is not None
+            )
+            tasks.append(mint := asyncio.create_task(mint_range(ps)))
+            await _until_range_lock_awaited(postgres_pool, ps, mint)
+
+        resp = await asyncio.wait_for(mint, timeout=10)
+        assert resp.status_code == 201, resp.text
+    finally:
+        await _cancel_unfinished(tasks)
+    assert await _gate(postgres_pool, mask_idx, ps) is None
+    assert await _counts(postgres_pool, ps) == (None, None, None, None)
+    assert await _syndna(postgres_pool, mask_idx, ps) == {}

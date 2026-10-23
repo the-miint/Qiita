@@ -223,9 +223,65 @@ async def test_a_sample_with_reads_is_never_empty(ingest_ctx):
     assert await _proof(ingest_ctx, s.prep_sample_idx) is None
 
 
+@pytest.mark.parametrize("state", ["failed", "cancelled", "queued", "processing"])
+async def test_a_newer_unfinished_or_failed_ingest_overrides_an_older_no_data(ingest_ctx, state):
+    """An empty or wrong file ends NO_DATA; the corrected file's ingest fails, is
+    cancelled or has not finished. The newer ingest was given reads the older never
+    saw, so the prep_sample is not shown empty."""
+    s = await ingest_ctx["add_sample"]()
+    add_ticket = ingest_ctx["add_sample_ticket"]
+    await add_ticket(BAM_TO_PARQUET_ACTION_ID, s.prep_sample_idx, "no_data")
+    await add_ticket(FASTQ_TO_PARQUET_ACTION_ID, s.prep_sample_idx, state)
+    assert await _proof(ingest_ctx, s.prep_sample_idx) is None
+
+
+async def test_a_newer_no_data_ingest_after_a_failed_one_is_proof(ingest_ctx):
+    s = await ingest_ctx["add_sample"]()
+    add_ticket = ingest_ctx["add_sample_ticket"]
+    await add_ticket(BAM_TO_PARQUET_ACTION_ID, s.prep_sample_idx, "failed")
+    wt = await add_ticket(BAM_TO_PARQUET_ACTION_ID, s.prep_sample_idx, "no_data")
+    assert await _proof(ingest_ctx, s.prep_sample_idx) == wt
+
+
+async def test_the_newest_record_decides_across_pool_and_per_sample_ingests(ingest_ctx):
+    """A per-sample ingest that fails after the pool ingest found the well empty
+    leaves the prep_sample unproven; a pool ingest after a failed per-sample one
+    shows it empty."""
+    after_pool, after_sample = [await ingest_ctx["add_sample"]() for _ in range(2)]
+    add_ticket = ingest_ctx["add_sample_ticket"]
+    await ingest_ctx["add_pool_ingest"]("completed", [after_pool.prep_sample_idx])
+    await add_ticket(BAM_TO_PARQUET_ACTION_ID, after_pool.prep_sample_idx, "failed")
+    await add_ticket(BAM_TO_PARQUET_ACTION_ID, after_sample.prep_sample_idx, "failed")
+    pool_ingest = await ingest_ctx["add_pool_ingest"]("completed", [after_sample.prep_sample_idx])
+
+    assert await _proof(ingest_ctx, after_pool.prep_sample_idx) is None
+    assert await _proof(ingest_ctx, after_sample.prep_sample_idx) == pool_ingest
+
+
+@pytest.mark.parametrize("state", ["failed", "queued"])
+async def test_a_newer_unfinished_or_failed_pool_ingest_overrides_a_per_sample_no_data(
+    ingest_ctx, state
+):
+    s = await ingest_ctx["add_sample"]()
+    await ingest_ctx["add_sample_ticket"](BAM_TO_PARQUET_ACTION_ID, s.prep_sample_idx, "no_data")
+    await ingest_ctx["add_pool_ingest"](state, [s.prep_sample_idx])
+    assert await _proof(ingest_ctx, s.prep_sample_idx) is None
+
+
+async def test_the_callers_own_ingest_is_not_proof_behind_a_newer_one(ingest_ctx):
+    """An ingest that finds its input empty while a newer ingest of the prep_sample
+    is queued does not record it empty: the newer one may store reads."""
+    s = await ingest_ctx["add_sample"]()
+    add_ticket = ingest_ctx["add_sample_ticket"]
+    running = await add_ticket(FASTQ_TO_PARQUET_ACTION_ID, s.prep_sample_idx, "processing")
+    # Another action: one ticket of an action version is in flight per prep_sample.
+    await add_ticket(BAM_TO_PARQUET_ACTION_ID, s.prep_sample_idx, "queued")
+    assert await _proof(ingest_ctx, s.prep_sample_idx, current=running) is None
+
+
 async def test_answers_for_many_prep_samples_at_once(ingest_ctx):
-    """One read answers a whole pool: each prep_sample maps to the newest ticket that
-    shows it was found empty, and one nothing shows is absent."""
+    """One read answers a whole pool: each prep_sample whose newest ingest shows it
+    empty maps to that ingest, and one nothing shows is absent."""
     by_bam, by_pool, unproven = [await ingest_ctx["add_sample"]() for _ in range(3)]
     add_ticket = ingest_ctx["add_sample_ticket"]
     await add_ticket(BAM_TO_PARQUET_ACTION_ID, by_bam.prep_sample_idx, "no_data")

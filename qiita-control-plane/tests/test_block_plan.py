@@ -661,27 +661,44 @@ async def test_plan_reaffirms_an_empty_sample_on_a_re_plan(pooled, planapp, pool
     assert await _gate_state(pool, mask_idx, empty) == "completed"
 
 
-async def test_plan_refuses_a_prep_sample_that_gains_reads_mid_plan(pooled, planapp, monkeypatch):
-    """The plan read a prep_sample as found empty, but by the time it records it the
-    record no longer holds (here: there never was one, which is what a range minted
-    in between looks like to the writer). The plan raises and rolls back whole."""
+async def test_plan_refuses_a_prep_sample_that_gains_reads_mid_plan(
+    pooled, planapp, pool_ingest, monkeypatch
+):
+    """The plan read a prep_sample as found empty, then a range was minted for it
+    before the plan came to record it. The record no longer holds, so the plan raises
+    and rolls back whole."""
     pool = pooled["pool"]
     with_reads = await pooled["add_sample"](reads=50)
-    rangeless = await pooled["add_sample"](reads=0)
+    empty = await pooled["add_sample"](reads=0)
+    await pool_ingest([with_reads, empty])
+    real_lookup = block_planner.fetch_empty_ingest_tickets
 
-    async def _claims_empty(_pool, *, prep_sample_idxs, current_work_ticket_idx):
-        return dict.fromkeys(prep_sample_idxs, 1)
+    async def lookup_then_mint(pool_or_conn, *, prep_sample_idxs, current_work_ticket_idx):
+        found = await real_lookup(
+            pool_or_conn,
+            prep_sample_idxs=prep_sample_idxs,
+            current_work_ticket_idx=current_work_ticket_idx,
+        )
+        async with pool.acquire() as conn, conn.transaction():
+            await mint_sequence_range(
+                conn,
+                prep_sample_idx=empty,
+                count=5,
+                principal_idx=pooled["principal_idx"],
+                work_ticket_idx=None,
+            )
+        return found
 
-    monkeypatch.setattr(block_planner, "fetch_empty_ingest_tickets", _claims_empty)
+    monkeypatch.setattr(block_planner, "fetch_empty_ingest_tickets", lookup_then_mint)
 
     with pytest.raises(block_planner.BlockPlanSampleGainedReads) as ei:
         await _plan(pooled, planapp)
 
-    assert ei.value.prep_sample_idx == rangeless
+    assert ei.value.prep_sample_idx == empty
     assert (
         await pool.fetchval(
             "SELECT count(*) FROM qiita.mask_sample WHERE prep_sample_idx = ANY($1::bigint[])",
-            [with_reads, rangeless],
+            [with_reads, empty],
         )
         == 0
     )

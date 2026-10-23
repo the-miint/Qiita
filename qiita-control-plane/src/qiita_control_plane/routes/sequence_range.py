@@ -34,6 +34,7 @@ from ..auth.principal import Principal, ServiceAccount
 from ..deps import TxConnFactory, get_db_pool, get_settings, get_tx_conn_factory
 from ..repositories.sequence_range import (
     fetch_sequence_range_by_prep_sample_idx,
+    lock_prep_sample_range,
     mint_sequence_range,
 )
 from ._helpers import authorize_prep_sample_cohort
@@ -75,7 +76,9 @@ async def mint_sequence_range_route(
     Caller must be a ServiceAccount holding `sequence_range:mint`.
     Pydantic enforces count > 0 and prep_sample_idx > 0; the route adds
     the dynamic cap from Settings. The plpgsql function holds an
-    advisory lock for the nextval/setval/INSERT critical section.
+    advisory lock for the nextval/setval/INSERT critical section; the
+    route takes the prep_sample's own lock before it
+    (`lock_prep_sample_range`).
 
     Maps repository-layer exceptions to HTTP status:
       - asyncpg.UniqueViolationError → 409 (prep_sample already has a range)
@@ -102,6 +105,7 @@ async def mint_sequence_range_route(
 
     async with tx() as conn:
         try:
+            await lock_prep_sample_range(conn, prep_sample_idx=body.prep_sample_idx)
             row = await mint_sequence_range(
                 conn,
                 prep_sample_idx=body.prep_sample_idx,
