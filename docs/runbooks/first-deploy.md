@@ -224,7 +224,7 @@ sets once per component env file; the services compute fixed subdirs from
 them (no per-leaf env var). The data plane writes Parquet under a durable
 mount (`PATH_PERSISTENT/ducklake`); SLURM upload staging lives under a
 scratch mount (`PATH_SCRATCH/staging`), a separate filesystem from the
-lake's, since the two have different needs; the orchestrator stages
+lake's ([storage](../architecture/storage.md)); the orchestrator stages
 per-ticket workspaces under the same scratch mount (`PATH_SCRATCH/ticket`),
 visible from every compute node (SLURM uses it as the job's
 `current_working_directory`).
@@ -269,10 +269,10 @@ stat -c '%n  owner=%U  group=%G  mode=%a  device=%d' <persistent>/ducklake <scra
 ```
 
 The **device numbers** of `<persistent>/ducklake` and `<scratch>/ticket` /
-`<scratch>/staging` differ: they are separate filesystems, so registration copies
-each file into the lake rather than renaming it
+`<scratch>/staging` should differ: they are meant to be separate filesystems
 ([storage](../architecture/storage.md), "`PATH_SCRATCH` and `PATH_PERSISTENT` are
-separate filesystems").
+separate filesystems"). Matching numbers mean both are on one mount; raise it with
+infra before going on.
 
 ### 0.4 nginx + TLS + DNS
 

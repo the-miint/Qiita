@@ -1527,7 +1527,8 @@ def _build_parser() -> argparse.ArgumentParser:
             "Redrive many tickets at once, as `ticket run` does one: select FAILED"
             " (or CANCELLED) tickets with the `ticket list` filters and POST"
             " /work-ticket/{idx}/run for each, one at a time. Dry-run by default;"
-            " pass --execute to redrive."
+            " pass --execute to redrive. Prints a JSON report on stdout, or on"
+            " stderr with exit 1 when any selected ticket was not redriven."
         ),
     )
     p_ticket_redrive.add_argument(

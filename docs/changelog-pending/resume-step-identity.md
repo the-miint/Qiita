@@ -58,6 +58,7 @@
   control plane's default fan-out cap) still pending, queued or processing. A ticket `/run`
   refuses (404 or 409) is reported and the run goes on; any other answer stops it and
   reports the tickets not attempted. A selection larger than `--limit` is refused
-  rather than redriven in part.
+  rather than redriven in part. It prints a JSON report on stdout, or on stderr with
+  exit 1 when any selected ticket was not redriven.
 - **`GET /work-ticket?failure_type=` (#756).** Filters the ticket list to FAILED
   tickets whose failure was `retriable` or `permanent`.
