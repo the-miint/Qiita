@@ -1,9 +1,8 @@
 #!/bin/bash
 # Assert the metaWRAP behaviour binning.sh's minimum-contig-length check rests on,
 # against this image's own binners. Run from the def's %test only, so a solve that
-# changes it fails the BUILD. Not part of binning-verify.sh: that script is also the
-# spec's VERIFY_CMD, which build-sif.sh runs on every deploy to decide whether to
-# skip the rebuild, and this one runs metaWRAP twice.
+# changes it fails the build; why it is not the spec's VERIFY_CMD is in
+# test_min_contig_check_ships_runs_at_build_and_scopes_its_rebuild.
 #
 # One contig of exactly MIN_CONTIG_LEN bp, read from the shipped binning.sh, with
 # reads tiled across it:
@@ -25,11 +24,22 @@ if [[ ! "${min_len}" =~ ^[0-9]+$ ]]; then
 fi
 over=$(( min_len + 1 ))
 
-# The marker-gene line binning.sh matches, and the two MaxBin2 lines ticket 12513's
-# log carried.
-VERDICT='Marker gene search reveals that the dataset cannot be binned (the medium of marker gene number <= 1). Program stop.'
+# The marker-gene line and the MaxBin2-failure line, read from the grep -qxF / grep -qF
+# arguments binning.sh matches them with, so the two cannot drift apart. The
+# FragGeneScan line is MaxBin2's when its marker-gene search gets an empty input;
+# binning.sh does not match it.
+binning_sh_match() {
+    local flags="$1" prefix="$2" found
+    found=$(sed -n "s/.*grep ${flags} '\(${prefix}[^']*\)'.*/\1/p" "${BINNING_SH}")
+    if [[ -z "${found}" || "${found}" == *$'\n'* ]]; then
+        echo "binning-min-contig-check: expected one \`grep ${flags} '${prefix}...'\` in ${BINNING_SH}, got: '${found}'" >&2
+        exit 1
+    fi
+    printf '%s' "${found}"
+}
+VERDICT=$(binning_sh_match -qxF 'Marker gene search reveals')
+MAXBIN2_FAILED=$(binning_sh_match -qF 'Something went wrong with running MaxBin2')
 FGS_ERROR='Error running FragGeneScan.'
-MAXBIN2_FAILED='Something went wrong with running MaxBin2. Exiting.'
 
 work=$(mktemp -d)
 trap 'rm -rf "${work}"' EXIT
