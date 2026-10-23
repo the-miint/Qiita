@@ -367,9 +367,9 @@ def test_resolve_staged_reads_export_fallback_binds_workspace_parquet(tmp_path, 
 
 
 def test_resolve_staged_reads_empty_data_well_fails_must_be_ingested(tmp_path, monkeypatch):
-    """Durable absent, the data plane returns 0 rows, no ingest record shows the
-    prep_sample empty, and the well is NOT a control → BAD_INPUT 'must be ingested':
-    nothing shows it was ingested at all."""
+    """Durable absent, the data plane returns 0 rows, no ingest shows the prep_sample
+    empty (it has none, or its newest did not end that way), and the well is NOT a
+    control → BAD_INPUT 'must be ingested'."""
     monkeypatch.setattr(_EXPORT_READ, lambda _u, _t: {"count": 0, "dest": "x"})
     monkeypatch.setattr(_EMPTY_INGEST_LOOKUP, _empty_ingest_lookup(None))
     monkeypatch.setattr(_CONTROL_LOOKUP, _control_lookup(False))

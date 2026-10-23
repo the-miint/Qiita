@@ -1,5 +1,6 @@
 """DB tests for fetch_empty_ingest_tickets — the record that a prep_sample with no
-sequence_range was ingested and found empty, rather than never ingested.
+sequence_range was ingested and found empty, rather than never ingested or left to an
+ingest that failed or has not finished. Only the newest ingest record counts.
 
 Each test seeds samples on the shared `pool_ctx` pool and attaches ingest tickets
 directly: per-sample (fastq-to-parquet, bam-to-parquet) by prep_sample, the pool

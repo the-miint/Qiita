@@ -3168,8 +3168,9 @@ async def complete_empty_mask_sample_in_tx(
 ) -> int | None:
     """Record a prep_sample that ingest found empty as masked under `mask_idx`, on the
     caller's transaction, and return the ingest ticket that shows it was found empty.
-    Write nothing and return None when its newest ingest does not show that
-    (`fetch_empty_ingest_tickets`, which defines `current_work_ticket_idx`).
+    Write nothing and return None when no ingest shows that: it has none, or its
+    newest did not end that way (`fetch_empty_ingest_tickets`, which defines
+    `current_work_ticket_idx`).
 
     There are no reads to mask, so the pass-set is empty and complete: the gate goes
     to 'completed' like any other finished mask, and consumers serve an empty
@@ -3249,8 +3250,8 @@ async def clear_empty_mask_completions(conn: asyncpg.Connection, *, prep_sample_
     'invalidated' row stays: a withdrawal stands until someone restores it.
 
     Only reads arriving remove the record. A newer ingest that fails or has not yet
-    finished leaves it as written, when an older ingest was the newest; the newer
-    ingest removes it here once it stores reads.
+    finished leaves a record written while an older ingest was the newest; the newer
+    ingest removes it here once it mints a range.
 
     Takes `lock_prep_sample_range`, which says why."""
     require_transaction(conn)

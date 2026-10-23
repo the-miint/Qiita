@@ -12,8 +12,9 @@
   - It counts as empty only when its newest ingest shows it was read and held
     nothing: a `bam-to-parquet` or `fastq-to-parquet` ticket that ended `no_data`, or
     a finished `bcl-convert` ticket that lists it. When a newer ingest failed, was
-    cancelled or has not finished, the older one does not count, and the `read-mask`
-    ticket still fails.
+    cancelled or has not finished, the older one does not count. Without that record
+    the `read-mask` ticket still fails, or ends `no_data` unrecorded for an
+    expected-empty control.
   - If reads are later stored for the prep_sample, the record is removed, so it has to
     be masked again before it can be exported. Reads stored while the record is being
     written wait for it, so the removal does not miss it. A newer ingest that fails or
@@ -28,8 +29,8 @@
   - `samples_skipped_invalidated`: empty prep_samples whose masking was withdrawn
     earlier and is left so.
 
-  `samples_skipped_no_reads` now counts only prep_samples that have no reads and whose
-  newest ingest does not show them empty. The plan answers 409 when a prep_sample
+  `samples_skipped_no_reads` now counts only prep_samples that have no reads and that
+  no ingest shows empty: they have none, or their newest did not end that way. The plan answers 409 when a prep_sample
   gains reads or has a newer ingest submitted while it runs. Planning again tiles new
   reads; a prep_sample whose newer ingest has not finished counts in
   `samples_skipped_no_reads` until it does.
