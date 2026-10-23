@@ -16,8 +16,10 @@ from conftest import ducklake_connect
 
 N_ROWS = 50_000
 SEQ_LEN = 1000
-# Slow enough that the stream is still open when the signal lands.
-READ_SLEEP_S = 0.05
+# Slow enough that the stream is still open when the signal lands and when the
+# second request is made, SIGNAL_AFTER_S + 0.5 s in. At 0.05 s a stream ended
+# 6.5 ms before that request.
+READ_SLEEP_S = 0.2
 SIGNAL_AFTER_S = 1.0
 
 
