@@ -146,8 +146,7 @@ YAML_STEP_NAME = "fastq"
 # under 1 GB of it, and the rest of the 7 GB is for the final COPY's sort,
 # which spills past the limit. That split is derived, not measured.
 #
-# TWO KNOWN GAPS vs bam_to_parquet, both tracked (see the issue below), both
-# deliberately not fixed in the PR that introduced this note:
+# TWO KNOWN GAPS vs bam_to_parquet:
 #
 #   1. This limit is NOT sized from the real cgroup, so the runner's OOM escalation
 #      cannot reach DuckDB here — an escalated retry re-OOMs at this same value.

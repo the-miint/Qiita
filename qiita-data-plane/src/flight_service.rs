@@ -1963,9 +1963,8 @@ const SPIKEIN_REASONS: &str = "'spikein_syndna'";
 /// toward raw only.
 ///
 /// The reason lists below are the Rust twin of `READ_MASK_BUCKET` in qiita-common
-/// (`read_mask_reason_sql_list`). Rust cannot import it, so the two are pinned by
-/// `qiita-control-plane/tests/test_read_mask_counts.py::test_rust_reason_lists_match_the_python_bucket_map`,
-/// which parses these consts out of this file and compares them character for
+/// (`read_mask_reason_sql_list`). Rust cannot import it, so a control-plane test
+/// parses these consts out of this file and compares them to it character for
 /// character. (NOT the block e2e test: its fixture emits no `spikein_syndna` or
 /// `host_minimap2` rows, so a typo here would miscount silently there.) Adding a
 /// ReadMaskReason means touching BOTH sides.
