@@ -1,16 +1,14 @@
 #!/bin/bash
-# Build-time test of this image; no job runs it. binning.def's %test calls it during
-# `apptainer build`, and a failure fails the build. It is copied into the image only
-# because %test runs inside the finished image. It is not the spec's VERIFY_CMD, which
-# runs on every deploy's skip check; the wiring is pinned by
+# Build-time test of this image; binning.def's %files comment on it says where it
+# runs. Why it is not the spec's VERIFY_CMD is in
 # test_min_contig_check_ships_runs_at_build_and_scopes_its_rebuild.
 #
 # What it tests: binning.sh skips metaWRAP when no contig reaches MIN_CONTIG_LEN,
-# because of how this image's binners treat a contig under metaWRAP's -l (see the
-# comment above MIN_CONTIG_LEN there). That is binner behaviour, set by whichever
-# maxbin2, FragGeneScan and metawrap-mg the solve resolves, none of them pinned to
-# one version, so a rebuild can change it. This runs metaWRAP twice on a synthetic
-# one-contig assembly of exactly MIN_CONTIG_LEN bp, read from the shipped binning.sh:
+# because of how this image's metaWRAP and MaxBin2 handle a contig under -l (see the
+# comment above MIN_CONTIG_LEN there). The solve pins none of metawrap-mg, maxbin2 or
+# FragGeneScan to one version, so a rebuild can change that. This runs metaWRAP twice
+# on a synthetic one-contig assembly of exactly MIN_CONTIG_LEN bp, read from the
+# shipped binning.sh:
 #   -l MIN_CONTIG_LEN     MaxBin2 keeps the contig and reaches its marker-gene
 #                         search, so binning.sh's `>=` passes it to metaWRAP.
 #   -l MIN_CONTIG_LEN+1   MetaBAT2 runs with that as its minContig, MaxBin2 reports

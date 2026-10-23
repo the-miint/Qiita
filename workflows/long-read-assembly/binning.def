@@ -26,8 +26,9 @@ From: mambaorg/micromamba:1.5.8
     binning.sh /opt/qiita/binning.sh
     # Required-tool assertion, shared by %test and the spec's VERIFY_CMD.
     binning-verify.sh /opt/qiita/binning-verify.sh
-    # Build-time test, run from %test only; no job calls it. It asserts the binner
-    # behaviour binning.sh's minimum-contig-length skip rests on.
+    # Build-time test: run from %test below, so a failure fails the build; no job
+    # calls it. It is copied in because %test runs inside the finished image. It
+    # asserts the metaWRAP behaviour binning.sh's minimum-contig-length skip rests on.
     binning-min-contig-check.sh /opt/qiita/binning-min-contig-check.sh
 
 %environment
@@ -126,8 +127,7 @@ From: mambaorg/micromamba:1.5.8
     # invokes, and fails the BUILD when one is absent.
     /opt/qiita/binning-verify.sh
     # Runs metaWRAP on a synthetic one-contig fixture at binning.sh's minimum contig
-    # length and one above it, and fails the build if the binners no longer behave as
-    # binning.sh's skip assumes; the script says what each run asserts.
+    # length and one above it; the script says what each run asserts.
     /opt/qiita/binning-min-contig-check.sh
     # Base utilities the entrypoints actually invoke — assert each one, since the
     # whole point of this %test is to fail the BUILD on a missing runtime dep
