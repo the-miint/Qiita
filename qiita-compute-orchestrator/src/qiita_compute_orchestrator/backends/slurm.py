@@ -574,7 +574,7 @@ class SlurmBackend(ComputeBackend):
         once `status_step` reports the job terminal."""
         self._require_slurm_handle(handle)
         if status.status == StepStatus.COMPLETED:
-            failures = verify_container_output(handle.output_path)
+            failures = verify_container_output(handle.output_path, recovered=status.recovered)
             if failures:
                 # Container exited 0 but didn't honor the contract — gate
                 # 2/3/4 violation. Permanent: same container against same

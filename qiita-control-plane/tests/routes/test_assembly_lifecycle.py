@@ -16,6 +16,7 @@ answer two different questions, and the tests below are organized by which:
 import json
 import secrets
 
+import asyncpg
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
@@ -36,6 +37,8 @@ from qiita_control_plane.testing.db_seeds import (
     seed_prep_sample_to_study_link,
 )
 from qiita_control_plane.testing.db_teardown import teardown_entity_graph
+
+from .conftest import DEPRECATION_FIELDS, INVALIDATION_FIELDS, PARTIAL_PROVENANCE, set_provenance
 
 pytestmark = pytest.mark.db
 
@@ -931,3 +934,28 @@ async def test_lifecycle_patches_require_the_lifecycle_scope(
     assert sample_resp.status_code == 403
     assert read_resp.status_code == 200
     assert json.loads(status_resp.text)["detail"]
+
+
+@pytest.mark.parametrize("subset", PARTIAL_PROVENANCE)
+async def test_a_live_config_cannot_hold_some_deprecation_fields(postgres_pool, lifecycle, subset):
+    assignments = set_provenance(DEPRECATION_FIELDS, subset, lifecycle["principal_idx"])
+    with pytest.raises(asyncpg.CheckViolationError):
+        await postgres_pool.execute(
+            f"UPDATE qiita.processing SET {assignments} WHERE processing_idx = $1",
+            lifecycle["processing_idx"],
+        )
+
+
+@pytest.mark.parametrize("state", ["completed", "pending", "no_data"])
+@pytest.mark.parametrize("subset", PARTIAL_PROVENANCE)
+async def test_a_live_sample_cannot_hold_some_invalidation_fields(
+    postgres_pool, lifecycle, state, subset
+):
+    assignments = set_provenance(INVALIDATION_FIELDS, subset, lifecycle["principal_idx"])
+    with pytest.raises(asyncpg.CheckViolationError):
+        await postgres_pool.execute(
+            f"UPDATE qiita.assembly_sample SET {assignments}"
+            f" WHERE processing_idx = $1 AND state = $2",
+            lifecycle["processing_idx"],
+            state,
+        )

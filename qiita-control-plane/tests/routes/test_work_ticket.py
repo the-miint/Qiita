@@ -12,6 +12,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
+import secrets
 import uuid
 
 import asyncpg
@@ -28,6 +29,7 @@ from qiita_common.auth_constants import Scope, SystemRole
 from qiita_common.models import (
     NON_TERMINAL_WORK_TICKET_STATES,
     ComputeTarget,
+    MaskDefinitionStatus,
     ReferenceStatus,
     ScopeTargetKind,
     StepProgressState,
@@ -35,6 +37,7 @@ from qiita_common.models import (
 )
 
 from qiita_control_plane.dispatch import build_dispatch_semaphore
+from qiita_control_plane.repositories.mask_definition import transition_mask_definition_status
 from qiita_control_plane.testing.db_teardown import teardown_entity_graph
 
 pytestmark = pytest.mark.db
@@ -303,6 +306,7 @@ async def _seed_action(
     target_processing_kinds: list[str] | None = None,
     human_roles: list[str] | None = None,
     mem_ceiling_gb: int = 1,
+    steps: list[dict] | None = None,
 ) -> tuple[str, str]:
     """Insert an enabled action with the given context_schema and
     target_kind. Returns (action_id, version). Caller is responsible
@@ -343,11 +347,19 @@ async def _seed_action(
             }
         ),
         json.dumps(context_schema),
-        json.dumps(_TEST_STEPS),
+        json.dumps(steps if steps is not None else _TEST_STEPS),
         "active",
         "failed",
     )
     return action_id, version
+
+
+# The entries the redrive tests' seeded progress rows were written for: a
+# redrive refuses rows that name no entry of the action's steps.
+_HASH_LOAD_STEPS = [
+    {**_TEST_STEPS[0], "name": "hash"},
+    {**_TEST_STEPS[0], "name": "load"},
+]
 
 
 async def _drop_action(postgres_pool, action_id: str, version: str) -> None:
@@ -370,6 +382,17 @@ async def reference_action(postgres_pool):
     reference:write, with an empty context_schema (accepts any object)
     — matches the admin_token fixture's grant."""
     action_id, version = await _seed_action(postgres_pool, context_schema={})
+    yield action_id, version
+    await _drop_action(postgres_pool, action_id, version)
+
+
+@pytest.fixture
+async def hash_load_action(postgres_pool):
+    """`reference_action`, with `hash` and `load` steps for the redrive tests
+    that seed progress rows for them."""
+    action_id, version = await _seed_action(
+        postgres_pool, context_schema={}, steps=_HASH_LOAD_STEPS
+    )
     yield action_id, version
     await _drop_action(postgres_pool, action_id, version)
 
@@ -2513,7 +2536,7 @@ async def test_run_on_failed_resets_reference_scope_target_to_pending(
 
 
 async def test_run_on_failed_drops_dead_step_rows_keeps_completed(
-    wt_client, postgres_pool, admin_token, reference_action, reference_idx
+    wt_client, postgres_pool, admin_token, hash_load_action, reference_idx
 ):
     """A redrive re-enters every not-yet-completed entry at attempt 0, but a
     prior FAILED run leaves terminal 'failed' work_ticket_step rows behind.
@@ -2527,7 +2550,7 @@ async def test_run_on_failed_drops_dead_step_rows_keeps_completed(
     `test_run_on_failed_keeps_inflight_step_rows_so_their_jobs_are_adoptable`
     and `test_run_after_cancel_drops_inflight_rows_whose_jobs_were_reaped`.)"""
     token, admin_idx = admin_token
-    action_id, version = reference_action
+    action_id, version = hash_load_action
     idx = await postgres_pool.fetchval(
         "INSERT INTO qiita.work_ticket"
         " (action_id, action_version, originator_principal_idx,"
@@ -2580,8 +2603,113 @@ async def test_run_on_failed_drops_dead_step_rows_keeps_completed(
     assert surviving == [(0, 0, StepProgressState.COMPLETED.value)]
 
 
-async def test_run_on_failed_keeps_inflight_step_rows_so_their_jobs_are_adoptable(
+async def _seed_failed_reference_ticket(
+    postgres_pool, action_id, version, admin_idx, reference_idx
+):
+    """A FAILED reference ticket under the given action."""
+    return await postgres_pool.fetchval(
+        "INSERT INTO qiita.work_ticket"
+        " (action_id, action_version, originator_principal_idx,"
+        "  scope_target_kind, reference_idx, state,"
+        "  failure_type, failure_stage, failure_reason)"
+        " VALUES ($1, $2, $3, 'reference', $4,"
+        "  $5::qiita.work_ticket_state, 'permanent'::qiita.failure_type,"
+        "  'submission'::qiita.work_ticket_failure_stage, 'test seed')"
+        " RETURNING work_ticket_idx",
+        action_id,
+        version,
+        admin_idx,
+        reference_idx,
+        WorkTicketState.FAILED.value,
+    )
+
+
+async def test_run_refuses_rows_no_entry_of_the_steps_matches(
     wt_client, postgres_pool, admin_token, reference_action, reference_idx
+):
+    """A completed row for an entry the action's steps no longer have would fail
+    the ticket again at submission; /run refuses it instead and changes nothing."""
+    token, admin_idx = admin_token
+    action_id, version = reference_action
+    idx = await _seed_failed_reference_ticket(
+        postgres_pool, action_id, version, admin_idx, reference_idx
+    )
+    wt_client._created_tickets.append(idx)
+    await postgres_pool.execute(
+        "INSERT INTO qiita.work_ticket_step"
+        " (work_ticket_idx, step_index, attempt, step_name, compute_target, state)"
+        " VALUES ($1, 0, 0, 'renamed-away', $2, $3)",
+        idx,
+        ComputeTarget.LOCAL.value,
+        StepProgressState.COMPLETED.value,
+    )
+
+    resp = await wt_client.post(
+        URL_WORK_TICKET_RUN.format(work_ticket_idx=idx),
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert resp.status_code == 409, resp.text
+    assert "'renamed-away' at step 0" in resp.json()["detail"]
+    state = await postgres_pool.fetchval(
+        "SELECT state FROM qiita.work_ticket WHERE work_ticket_idx = $1", idx
+    )
+    assert state == WorkTicketState.FAILED.value
+
+
+async def test_run_refuses_a_ticket_under_a_deprecated_mask(
+    wt_client, postgres_pool, admin_token, reference_action, reference_idx
+):
+    """A redrive fast-forwards the completed mint, so the mint never refuses the
+    deprecated config; /run does, and the ticket stays FAILED."""
+    token, admin_idx = admin_token
+    action_id, version = reference_action
+    mask_idx = await postgres_pool.fetchval(
+        "INSERT INTO qiita.mask_definition"
+        " (params_hash, filter_workflow, filter_version, params, created_by_idx)"
+        " VALUES ($1, 'read-mask', '1.0.0', '{}'::jsonb, $2) RETURNING mask_idx",
+        secrets.token_bytes(32),
+        admin_idx,
+    )
+    try:
+        await transition_mask_definition_status(
+            postgres_pool,
+            mask_idx=mask_idx,
+            status=MaskDefinitionStatus.DEPRECATED,
+            reason="test",
+            superseded_by=None,
+            principal_idx=admin_idx,
+        )
+        idx = await _seed_failed_reference_ticket(
+            postgres_pool, action_id, version, admin_idx, reference_idx
+        )
+        wt_client._created_tickets.append(idx)
+        await postgres_pool.execute(
+            "UPDATE qiita.work_ticket SET mask_idx = $2 WHERE work_ticket_idx = $1", idx, mask_idx
+        )
+
+        resp = await wt_client.post(
+            URL_WORK_TICKET_RUN.format(work_ticket_idx=idx),
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+        assert resp.status_code == 409, resp.text
+        assert "deprecated" in resp.json()["detail"]
+        state = await postgres_pool.fetchval(
+            "SELECT state FROM qiita.work_ticket WHERE work_ticket_idx = $1", idx
+        )
+        assert state == WorkTicketState.FAILED.value
+    finally:
+        await postgres_pool.execute(
+            "UPDATE qiita.work_ticket SET mask_idx = NULL WHERE mask_idx = $1", mask_idx
+        )
+        await postgres_pool.execute(
+            "DELETE FROM qiita.mask_definition WHERE mask_idx = $1", mask_idx
+        )
+
+
+async def test_run_on_failed_keeps_inflight_step_rows_so_their_jobs_are_adoptable(
+    wt_client, postgres_pool, admin_token, hash_load_action, reference_idx
 ):
     """A FAILED ticket CAN still have a live SLURM job, and /run must not
     strand it.
@@ -2595,7 +2723,7 @@ async def test_run_on_failed_keeps_inflight_step_rows_so_their_jobs_are_adoptabl
     terminal 'failed' one, letting the runner adopt the job already paid for
     instead of resubmitting the work."""
     token, admin_idx = admin_token
-    action_id, version = reference_action
+    action_id, version = hash_load_action
     idx = await postgres_pool.fetchval(
         "INSERT INTO qiita.work_ticket"
         " (action_id, action_version, originator_principal_idx,"
@@ -2617,7 +2745,7 @@ async def test_run_on_failed_keeps_inflight_step_rows_so_their_jobs_are_adoptabl
         "INSERT INTO qiita.work_ticket_step"
         " (work_ticket_idx, step_index, attempt, step_name, compute_target,"
         "  state, slurm_job_id, job_name, failure_kind, failure_reason)"
-        " VALUES ($1, 0, 0, 'load', $2, $3, 605016, 'qiita-wt-load-a0',"
+        " VALUES ($1, 1, 0, 'load', $2, $3, 605016, 'qiita-wt-load-a0',"
         "  'oom_killed', 'OUT_OF_MEMORY')",
         idx,
         ComputeTarget.SLURM.value,
@@ -2627,7 +2755,7 @@ async def test_run_on_failed_keeps_inflight_step_rows_so_their_jobs_are_adoptabl
         "INSERT INTO qiita.work_ticket_step"
         " (work_ticket_idx, step_index, attempt, step_name, compute_target,"
         "  state, slurm_job_id, job_name)"
-        " VALUES ($1, 0, 1, 'load', $2, $3, 605029, 'qiita-wt-load-a1')",
+        " VALUES ($1, 1, 1, 'load', $2, $3, 605029, 'qiita-wt-load-a1')",
         idx,
         ComputeTarget.SLURM.value,
         StepProgressState.SUBMITTED.value,
@@ -2647,7 +2775,7 @@ async def test_run_on_failed_keeps_inflight_step_rows_so_their_jobs_are_adoptabl
     surviving = [(r["step_index"], r["attempt"], r["state"]) for r in rows]
     # The dead attempt is gone; the live one survives WITH its job id intact,
     # which is the whole point — that id is the only handle on the running job.
-    assert surviving == [(0, 1, StepProgressState.SUBMITTED.value)]
+    assert surviving == [(1, 1, StepProgressState.SUBMITTED.value)]
     assert rows[0]["slurm_job_id"] == 605029
 
 
@@ -2772,7 +2900,7 @@ async def test_escalated_resource_floor_rejects_a_jsonb_null(
 
 
 async def test_run_after_cancel_drops_inflight_rows_whose_jobs_were_reaped(
-    wt_client, postgres_pool, admin_token, reference_action, reference_idx
+    wt_client, postgres_pool, admin_token, hash_load_action, reference_idx
 ):
     """The CANCELLED carve-out: a post-cancel redrive drops in-flight rows.
 
@@ -2785,7 +2913,7 @@ async def test_run_after_cancel_drops_inflight_rows_whose_jobs_were_reaped(
     no manifest — the same failure this commit fixes, reached through a live row
     instead of a dead one. So after a cancel, every non-completed row goes."""
     token, admin_idx = admin_token
-    action_id, version = reference_action
+    action_id, version = hash_load_action
     idx = await postgres_pool.fetchval(
         "INSERT INTO qiita.work_ticket"
         " (action_id, action_version, originator_principal_idx,"
@@ -3419,6 +3547,38 @@ async def test_list_work_ticket_state_filter(
     assert processing_idx in returned
     assert pending_idx not in returned
     assert completed_idx not in returned
+
+
+async def test_list_work_ticket_failure_type_filter(
+    wt_client, postgres_pool, admin_token, reference_action, reference_idx
+):
+    """`?failure_type=retriable` returns only FAILED tickets whose failure was
+    retriable — the selection `qiita ticket redrive --failure-type` asks for."""
+    admin_tok, admin_idx = admin_token
+    action_id, version = reference_action
+    permanent_idx = await _seed_failed_reference_ticket(
+        postgres_pool, action_id, version, admin_idx, reference_idx
+    )
+    retriable_idx = await _seed_failed_reference_ticket(
+        postgres_pool, action_id, version, admin_idx, reference_idx
+    )
+    wt_client._created_tickets.extend([permanent_idx, retriable_idx])
+    await postgres_pool.execute(
+        "UPDATE qiita.work_ticket SET failure_type = 'retriable'::qiita.failure_type"
+        " WHERE work_ticket_idx = $1",
+        retriable_idx,
+    )
+
+    resp = await wt_client.get(
+        URL_WORK_TICKET_LIST,
+        params={"failure_type": "retriable"},
+        headers={"Authorization": f"Bearer {admin_tok}"},
+    )
+
+    assert resp.status_code == 200, resp.text
+    returned = {row["work_ticket_idx"] for row in resp.json()["tickets"]}
+    assert retriable_idx in returned
+    assert permanent_idx not in returned
 
 
 async def test_list_work_ticket_active_filter(

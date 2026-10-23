@@ -13,7 +13,7 @@ from typing import Any
 
 import asyncpg
 from pydantic import BaseModel
-from qiita_common.models import FailureType
+from qiita_common.models import FailureType, WorkTicketState
 from qiita_common.models.ena_import import BatchItemState
 
 from . import require_transaction
@@ -248,10 +248,11 @@ async def fetch_sequenced_samples_missed_by_completed_download(
         "   AND (SELECT wt.state FROM qiita.work_ticket wt"
         "        WHERE wt.action_id = $2 AND wt.action_version = $3"
         "          AND wt.sequenced_pool_idx = ss.sequenced_pool_idx"
-        "        ORDER BY wt.work_ticket_idx DESC LIMIT 1) = 'completed'",
+        "        ORDER BY wt.work_ticket_idx DESC LIMIT 1) = $4::qiita.work_ticket_state",
         sequenced_sample_idxs,
         action_id,
         action_version,
+        WorkTicketState.COMPLETED.value,
     )
     return {r["idx"] for r in rows}
 
@@ -278,6 +279,32 @@ async def fetch_failed_downloads(
     )
     failed = (FailedDownload.model_validate(dict(r)) for r in rows)
     return {f.ena_run_accession: f for f in failed}
+
+
+async def fetch_partial_download_counts(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection, *, ticket_idxs: list[int]
+) -> dict[int, tuple[int, int | None]]:
+    """`ticket_idx -> (failed runs, newest batch_idx or None)` for the tickets among
+    `ticket_idxs` that are their pool's newest completed one for the action, any version,
+    and whose pool has runs that failed with no stored reads."""
+    rows = await pool_or_conn.fetch(
+        "SELECT wt.work_ticket_idx, count(*) AS failed_runs,"
+        "       (SELECT max(bi.batch_idx) FROM qiita.ena_import_batch_item bi"
+        "         WHERE wt.work_ticket_idx = ANY(bi.download_work_ticket_idxs)) AS batch_idx"
+        " FROM qiita.work_ticket wt"
+        " JOIN qiita.sequenced_sample ss ON ss.sequenced_pool_idx = wt.sequenced_pool_idx"
+        " WHERE wt.work_ticket_idx = ANY($1::bigint[])"
+        "   AND wt.state = $2::qiita.work_ticket_state"
+        "   AND wt.work_ticket_idx = (SELECT max(w2.work_ticket_idx) FROM qiita.work_ticket w2"
+        "        WHERE w2.action_id = wt.action_id AND w2.state = wt.state"
+        "          AND w2.sequenced_pool_idx = wt.sequenced_pool_idx)"
+        "   AND ss.download_failure_type IS NOT NULL"
+        f"   AND {_NO_STORED_READS}"
+        " GROUP BY wt.work_ticket_idx",
+        ticket_idxs,
+        WorkTicketState.COMPLETED.value,
+    )
+    return {r["work_ticket_idx"]: (r["failed_runs"], r["batch_idx"]) for r in rows}
 
 
 async def fetch_pool_latest_download_ticket(

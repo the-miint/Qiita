@@ -1079,6 +1079,56 @@ async def test_result_step_completed_returns_outputs(jwt_path, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_result_step_recovered_reads_a_step_whose_listed_files_were_moved(jwt_path, tmp_path):
+    """A step re-read on resume (`recovered`) after a later step moved
+    the files its manifest lists — `register-files` moves its staging files into
+    the lake — still yields its declared outputs. The same tree read as a fresh
+    completion fails the file check, so the recovered read is what lets the
+    resume reach the later step."""
+    backend = _make_backend(httpx.MockTransport(lambda r: httpx.Response(500)), jwt_path)
+    out = tmp_path / "output"
+    (out / "read").mkdir(parents=True)
+    (out / "manifest.json").write_text(
+        json.dumps(
+            {
+                "files": [{"path": "read/part-0.parquet", "size_bytes": 3}],
+                "outputs": {"staging_dir": "."},
+            }
+        )
+    )
+    (out / "manifest.json").chmod(0o440)
+
+    with pytest.raises(BackendFailure, match="declared output file missing"):
+        await backend.result_step(
+            _slurm_handle(tmp_path),
+            StepStatusInfo(status=StepStatus.COMPLETED, raw_state="COMPLETED", exit_code=0),
+        )
+    outputs = await backend.result_step(
+        _slurm_handle(tmp_path),
+        StepStatusInfo(status=StepStatus.COMPLETED, recovered=True),
+    )
+
+    assert outputs == {"staging_dir": out.resolve()}
+
+
+@pytest.mark.asyncio
+async def test_result_step_recovered_still_fails_on_a_missing_declared_output(jwt_path, tmp_path):
+    """The recovered read skips the per-file gates, not the declared outputs: a
+    resumed step whose bound output is gone fails, as a purged workspace should."""
+    backend = _make_backend(httpx.MockTransport(lambda r: httpx.Response(500)), jwt_path)
+    _write_completed_output(tmp_path)
+    (tmp_path / "output" / "result.parquet").unlink()
+
+    with pytest.raises(BackendFailure) as ei:
+        await backend.result_step(
+            _slurm_handle(tmp_path),
+            StepStatusInfo(status=StepStatus.COMPLETED, recovered=True),
+        )
+    assert ei.value.kind == FailureKind.CONTRACT_VIOLATION
+    assert "points at missing path" in ei.value.reason
+
+
+@pytest.mark.asyncio
 async def test_result_step_completed_missing_manifest_is_contract_violation(jwt_path, tmp_path):
     backend = _make_backend(httpx.MockTransport(lambda r: httpx.Response(500)), jwt_path)
     (tmp_path / "output").mkdir(parents=True)

@@ -568,12 +568,14 @@ fn block_read_source(table: &str) -> Option<&'static str> {
 /// justified because every action the data plane dispatches is idempotent or
 /// otherwise replay-safe (see `docs/auth.md#ticket-replay`):
 ///
-/// - `register_files` — a replay after success hits the staging-existence check
-///   first and returns `not_found`, its files having been moved out. Where the
-///   source survives instead (the EXDEV copy branch of `move_file`), the minted
-///   dest name is deterministic for the registration — see `lake_dest_filename`
-///   — so `move_file` refuses to overwrite and it fails closed rather than
-///   double-registering.
+/// - `register_files` — the dest name is deterministic for the registration
+///   (see `lake_dest_filename`), so a replay after success finds every file
+///   already a data file of its table and returns the earlier registration
+///   without writing; a replay that finds the files moved but not all
+///   registered fails closed. A call that fails after its moves returns the
+///   files to staging unless `return_to_staging` could not confirm that safe,
+///   so that state means a call still running, one the data plane stopped
+///   mid-call, or one whose error says it kept the files.
 /// - `delete_reference` / `delete_mask` / `delete_pool_reads` /
 ///   `delete_read_mask_block` / `delete_alignment` / `delete_alignment_block` /
 ///   `delete_alignment_sample` — logical DELETEs, idempotent against themselves:
@@ -588,6 +590,11 @@ fn block_read_source(table: &str) -> Option<&'static str> {
 ///   `auth::verify_ticket_raw`: 300s from
 ///   `qiita_control_plane.auth.tickets.sign_action`'s default, and
 ///   `MAX_TICKET_LIFETIME` refuses any token whose expiry is more than 3600s out.
+///   The expiry is checked when a request arrives, so it bounds a replayed
+///   request, not a call already accepted and still running: a DuckLake
+///   transaction reads the snapshot of its first statement, so such a call's
+///   DELETE can still run after the rerun's registration and drop it
+///   (`ducklake_transaction_reads_the_snapshot_of_its_first_statement`).
 /// - `export_read` — re-materializes the same prep_sample's bytes to the same ticket
 ///   path via atomic publish; a replay reproduces identical output. (The block
 ///   exports that used to sit beside it are gone: block-scoped compute now
@@ -2278,11 +2285,20 @@ fn take_registration_lock(conn: &LakeWriter) -> Result<(), Status> {
 /// `body` must therefore be idempotent across attempts — each one re-reads a
 /// fresh snapshot after DuckLake rolled the last one back. `salt` only spreads
 /// the backoff (see `lake_commit_backoff`).
+///
+/// A COMMIT that reports an error may still have landed: when the catalog's
+/// connection drops after Postgres committed, before its answer arrives, the
+/// COMMIT errors and the rows are there, and a re-run of an add registers them
+/// again (`ducklake_commit_error_after_the_catalog_committed`). So before any
+/// re-run, `landed` reads the catalog: given the attempt's value it says whether
+/// that attempt's commit is there, and if it is the value is returned. When
+/// `landed` cannot tell, the call fails with both errors rather than re-running.
 fn transact_with_retry<T>(
     conn: &LakeWriter,
     what: &str,
     salt: i64,
     mut body: impl FnMut() -> Result<T, Status>,
+    mut landed: impl FnMut(&T) -> Result<bool, Status>,
 ) -> Result<T, Status> {
     let deadline = std::time::Instant::now() + LAKE_COMMIT_BUDGET;
     let mut attempt: u32 = 0;
@@ -2302,6 +2318,17 @@ fn transact_with_retry<T>(
             Ok(()) => return Ok(value),
             Err(e) => e,
         };
+        match landed(&value) {
+            Ok(true) => return Ok(value),
+            Ok(false) => {}
+            Err(e) => {
+                return Err(Status::internal(format!(
+                    "failed to commit {what}: {commit_error}; whether the commit \
+                     landed could not be read: {}",
+                    e.message()
+                )))
+            }
+        }
 
         if std::time::Instant::now() >= deadline {
             return Err(Status::internal(format!(
@@ -2335,8 +2362,8 @@ struct Registration {
 /// Validates all requested files exist in staging, moves them to permanent
 /// locations under `data_path/{table_name}/`, and registers them.
 ///
-/// Uses `std::fs::rename` with a copy+delete fallback for cross-filesystem moves
-/// (e.g., SLURM local scratch → shared NFS).
+/// Each file is placed by `move_file`, which copies where it cannot rename or
+/// link (e.g., SLURM local scratch → shared NFS).
 ///
 /// Some tables are REPLACED on their key rather than appended to — see
 /// `REPLACE_KEY_TABLES` for which, and why. The `read` rows a ticket registered
@@ -2379,18 +2406,85 @@ fn register_files(
         }
     }
 
-    // Validate all requested files exist.
-    for filename in payload.files.keys() {
+    // One scope key for the whole registration; it does not vary per file.
+    let scope = staging_scope(&payload.staging_dir, scratch_root);
+
+    // Where each file is placed in the lake. Every file must be in staging, or
+    // at the destination an earlier call with this payload moved it to.
+    let mut placed: Vec<PlacedFile> = Vec::new();
+    for (filename, table) in &payload.files {
         let src = staging.join(filename);
-        if !src.exists() {
+        // Multi-file tables carry a subdir prefix in `filename`
+        // (e.g. "reference_sequence_chunks/part_00000.parquet"). Use
+        // only the basename when placing into the per-table dir —
+        // otherwise we'd nest the staging subdir inside it.
+        let basename = std::path::Path::new(filename)
+            .file_name()
+            .and_then(|b| b.to_str())
+            .ok_or_else(|| {
+                Status::invalid_argument(format!("filename has no UTF-8 basename: {filename}"))
+            })?;
+        let dest = perm_root.join(table).join(lake_dest_filename(
+            payload.work_ticket_idx,
+            &scope,
+            basename,
+        ));
+        if !src.exists() && !dest.exists() {
             return Err(Status::not_found(format!(
                 "staging file not found: {}",
                 src.display()
             )));
         }
+        // Both SQL passes below name the destination as a string, so resolve it
+        // once here rather than re-deriving (and re-erroring on) it twice.
+        let dest_str = dest
+            .to_str()
+            .ok_or_else(|| Status::internal(format!("non-UTF-8 path: {}", dest.display())))?
+            .to_string();
+        placed.push(PlacedFile {
+            table: table.clone(),
+            src,
+            dest,
+            dest_str,
+        });
     }
 
     // Tables are ensured at startup in main.rs.
+
+    // A file already at its lake destination is a replay of this payload: the
+    // caller lost the reply, or died before recording it, and called again. The destination name
+    // is deterministic for the (ticket, staging dir, basename), so the replay
+    // finds where the earlier call moved each file. When every file was moved and
+    // is a data file of its table, the earlier call committed, and its
+    // registration is returned without writing: `ducklake_add_data_files`
+    // accepts a path it already holds and adds its rows again. Any other state
+    // fails closed, because the earlier call may still be registering the files.
+    // Judged by the destination, not the source: `move_file` keeps a placed
+    // file when removing its staging source fails.
+    let moved_before = placed.iter().filter(|f| f.dest.exists()).count();
+    if moved_before > 0 {
+        let in_catalog = registered_data_files(conn, &placed)?;
+        if moved_before == placed.len() && in_catalog.len() == placed.len() {
+            return Ok(Registration {
+                registered: placed.into_iter().map(|p| p.dest_str).collect(),
+                replaced: BTreeMap::new(),
+            });
+        }
+        return Err(Status::failed_precondition(format!(
+            "an earlier register_files call for work_ticket {} from {} moved {} of {} \
+             files into the lake and registered {} of them. Either it is still \
+             running (or the data plane stopped mid-call), or it failed and kept \
+             the files at their lake paths, which its error names (the catalog \
+             listed some of them, could not be read, or a move back failed). \
+             Redrive again once a running call has had time to finish; if this \
+             persists, the files need an operator",
+            payload.work_ticket_idx,
+            payload.staging_dir,
+            moved_before,
+            placed.len(),
+            in_catalog.len()
+        )));
+    }
 
     // `read` is not replace-keyed, and DuckLake enforces no uniqueness. A ticket
     // re-runs a step in a new attempt dir under its own workspace, so its second
@@ -2405,51 +2499,30 @@ fn register_files(
         ticket_read_files_in_lake(conn, payload.work_ticket_idx, &staged_read)?;
     let replace_read_prep_samples: Vec<i64> = staged_read.into_iter().collect();
 
-    // One scope key for the whole registration; it does not vary per file.
-    let scope = staging_scope(&payload.staging_dir, scratch_root);
-
-    // Move all files to permanent storage.
+    // Move all files to permanent storage. `move_file` refuses a destination
+    // that exists, so a call racing this one for the same payload fails closed.
     // (DuckLake table, permanent path). The path is carried as a String because
     // every consumer below binds it into SQL or reports it.
     let mut moved: Vec<(String, String)> = Vec::new();
-    for (filename, table) in &payload.files {
-        let src = staging.join(filename);
-        let dest_dir = perm_root.join(table);
-        std::fs::create_dir_all(&dest_dir).map_err(|e| {
-            Status::internal(format!(
-                "failed to create directory {}: {e}",
-                dest_dir.display()
-            ))
+    for (i, file) in placed.iter().enumerate() {
+        let dest_dir = file.dest.parent().ok_or_else(|| {
+            Status::internal(format!("lake path has no parent: {}", file.dest.display()))
         })?;
-        // Multi-file tables carry a subdir prefix in `filename`
-        // (e.g. "reference_sequence_chunks/part_00000.parquet"). Use
-        // only the basename when placing into `dest_dir` — otherwise
-        // we'd nest the staging subdir inside the per-table
-        // destination dir.
-        let basename = std::path::Path::new(filename)
-            .file_name()
-            .and_then(|b| b.to_str())
-            .ok_or_else(|| {
-                Status::invalid_argument(format!("filename has no UTF-8 basename: {filename}"))
-            })?;
-        // Mint a unique, ticket-traceable destination name — the data plane
-        // owns lake-storage layout, and the producer reuses fixed basenames
-        // across loads, so placing the bare basename would collide with an
-        // already-registered file in the same per-table dir. `move_file`
-        // refuses to overwrite besides, as a hard safety net.
-        let dest = dest_dir.join(lake_dest_filename(
-            payload.work_ticket_idx,
-            &scope,
-            basename,
-        ));
-        move_file(&src, &dest)?;
-        // Both SQL passes below name the destination as a string, so resolve it
-        // once here rather than re-deriving (and re-erroring on) it twice.
-        let dest_str = dest
-            .to_str()
-            .ok_or_else(|| Status::internal(format!("non-UTF-8 path: {}", dest.display())))?
-            .to_string();
-        moved.push((table.clone(), dest_str));
+        let placed_one = std::fs::create_dir_all(dest_dir)
+            .map_err(|e| {
+                Status::internal(format!(
+                    "failed to create directory {}: {e}",
+                    dest_dir.display()
+                ))
+            })
+            .and_then(|()| move_file(&file.src, &file.dest));
+        if let Err(e) = placed_one {
+            // `move_file` removes a destination of its own when it fails (unless
+            // that removal fails too, which it logs), so only the files before
+            // this one are this call's to move back.
+            return Err(return_to_staging(conn, &placed[..i], e));
+        }
+        moved.push((file.table.clone(), file.dest_str.clone()));
     }
 
     // Replace-by-key the `REPLACE_KEY_TABLES` targets, then register every moved
@@ -2459,14 +2532,9 @@ fn register_files(
     // ducklake_add_data_files call rather than leaving the reference
     // half-registered in the catalog.
     //
-    // Atomicity here is CATALOG-LEVEL ONLY: the filesystem moves above have
-    // already happened and are NOT rolled back. That is intentional and safe.
-    // Each dest name is registration-unique (lake_dest_filename keys on the work
-    // ticket and the staging dir) and move_file refuses to overwrite, so a rolled-back registration
-    // leaves at most an unreferenced orphan Parquet on disk — never a collision
-    // and never a double-registration. This matches how DuckLake already
-    // tolerates orphan Parquets (the delete_* actions reclaim nothing from disk
-    // either); a future maintenance pass sweeps them.
+    // Atomicity here is CATALOG-LEVEL ONLY: the filesystem moves above are not
+    // part of the transaction. When it fails, `return_to_staging` moves the files
+    // back, so the call can be made again with the same payload.
     //
     // Registrations that touch a replace-keyed table SERIALIZE against each
     // other, and retry when they lose. Both halves are needed:
@@ -2482,9 +2550,7 @@ fn register_files(
     //
     // The loser's work is fully re-runnable — its files are already at the paths
     // `lake_dest_filename` minted and the delete+add is idempotent against whatever
-    // snapshot it re-reads — so it retries here rather than failing the ticket. A
-    // retry from the top would not work: the staging files were moved above, so
-    // the caller's next attempt gets `not_found`.
+    // snapshot it re-reads — so it retries here rather than failing the ticket.
     //
     // Registrations touching none of those tables (read_mask, alignment) skip the
     // lock and so never contend.
@@ -2588,9 +2654,126 @@ fn register_files(
                 replaced,
             })
         },
-    )?;
+        // One transaction adds every file, so the catalog lists all of them or
+        // none; a count in between is a registration this one did not make.
+        |_| {
+            let listed = registered_data_files(conn, &placed)?.len();
+            match listed {
+                0 => Ok(false),
+                n if n == placed.len() => Ok(true),
+                n => Err(Status::internal(format!(
+                    "the catalog lists {n} of the {} files",
+                    placed.len()
+                ))),
+            }
+        },
+    );
 
-    Ok(registration)
+    registration.map_err(|e| return_to_staging(conn, &placed, e))
+}
+
+/// Move `files` back from the lake to staging after a registration failed past
+/// its moves, so a later call with the same payload starts from staging again,
+/// and return `failure` with what became of the files appended.
+///
+/// A COMMIT that reported an error may still have landed — the catalog's
+/// connection can drop after the write — so the files go back only when the
+/// catalog confirms it holds none of them. Otherwise, or when a move back fails,
+/// they stay at their lake paths and the message says so: a replay then fails
+/// closed rather than registering a payload twice.
+fn return_to_staging(conn: &duckdb::Connection, files: &[PlacedFile], failure: Status) -> Status {
+    let moved: Vec<&PlacedFile> = files.iter().filter(|f| f.dest.exists()).collect();
+    if moved.is_empty() {
+        return failure;
+    }
+    let count = moved.len();
+    let kept = |why: String| {
+        Status::new(
+            failure.code(),
+            format!(
+                "{}; {count} file(s) stay at their lake paths unregistered: {why}",
+                failure.message()
+            ),
+        )
+    };
+    match registered_data_files(conn, files) {
+        Ok(listed) if listed.is_empty() => {}
+        Ok(listed) => {
+            return kept(format!(
+                "the catalog lists {} of them, so the registration may have committed",
+                listed.len()
+            ))
+        }
+        Err(e) => {
+            return kept(format!(
+                "the catalog could not be read to confirm it holds none of them ({})",
+                e.message()
+            ))
+        }
+    }
+    let mut stuck = Vec::new();
+    for file in moved {
+        // `move_file` keeps a placed file when removing its staging source
+        // fails; the lake copy is then the one to remove.
+        let back = if file.src.exists() {
+            std::fs::remove_file(&file.dest)
+                .map_err(|e| Status::internal(format!("remove {}: {e}", file.dest.display())))
+        } else {
+            move_file(&file.dest, &file.src)
+        };
+        if let Err(e) = back {
+            stuck.push(format!("{}: {}", file.dest.display(), e.message()));
+        }
+    }
+    if stuck.is_empty() {
+        Status::new(
+            failure.code(),
+            format!(
+                "{}; the files were moved back to staging",
+                failure.message()
+            ),
+        )
+    } else {
+        kept(format!("moving them back failed: {}", stuck.join("; ")))
+    }
+}
+
+/// One file of a registration: its table, its staging source, and its lake
+/// destination (with that destination as the string the SQL binds).
+struct PlacedFile {
+    table: String,
+    src: std::path::PathBuf,
+    dest: std::path::PathBuf,
+    dest_str: String,
+}
+
+/// The destinations of `placed` that are already data files of their table in
+/// the catalog.
+fn registered_data_files(
+    conn: &duckdb::Connection,
+    placed: &[PlacedFile],
+) -> Result<Vec<String>, Status> {
+    let lookup_failed =
+        |e: duckdb::Error| Status::internal(format!("failed to list lake data files: {e}"));
+    let mut by_table: BTreeMap<&str, std::collections::BTreeSet<String>> = BTreeMap::new();
+    for file in placed {
+        if by_table.contains_key(file.table.as_str()) {
+            continue;
+        }
+        let mut stmt = conn
+            .prepare("SELECT data_file FROM ducklake_list_files('qiita_lake', ?)")
+            .map_err(lookup_failed)?;
+        let files = stmt
+            .query_map(duckdb::params![file.table], |r| r.get::<_, String>(0))
+            .and_then(|rows| rows.collect::<Result<_, _>>())
+            .map_err(lookup_failed)?;
+        by_table.insert(file.table.as_str(), files);
+    }
+    Ok(placed
+        .iter()
+        .filter(|file| by_table[file.table.as_str()].contains(&file.dest_str))
+        .map(|file| file.dest_str.clone())
+        .collect())
 }
 
 /// The prep_samples the staged `read` files hold. Files headed for other tables
@@ -2754,51 +2937,79 @@ fn delete_reference(conn: &LakeWriter, reference_idx: i64) -> Result<serde_json:
     // Sequence/chunk deletes run BEFORE the membership AND annotation deletes: the
     // orphan subquery reads both of this reference's claim tables, so both must
     // still be present.
-    let counts = transact_with_retry(conn, "the reference delete", reference_idx, || {
-        take_registration_lock(conn)?;
-        let sequences_deleted = exec(
-            &format!("DELETE FROM qiita_lake.reference_sequences WHERE {orphan_filter}"),
-            &[reference_idx, reference_idx, reference_idx, reference_idx],
-        )?;
-        let chunks_deleted = exec(
-            &format!("DELETE FROM qiita_lake.reference_sequence_chunks WHERE {orphan_filter}"),
-            &[reference_idx, reference_idx, reference_idx, reference_idx],
-        )?;
-        let membership_deleted = exec(
-            "DELETE FROM qiita_lake.reference_membership WHERE reference_idx = ?",
-            &[reference_idx],
-        )?;
-        let taxonomy_deleted = exec(
-            "DELETE FROM qiita_lake.reference_taxonomy WHERE reference_idx = ?",
-            &[reference_idx],
-        )?;
-        let phylogeny_deleted = exec(
-            "DELETE FROM qiita_lake.reference_phylogeny WHERE reference_idx = ?",
-            &[reference_idx],
-        )?;
-        let placements_deleted = exec(
-            "DELETE FROM qiita_lake.reference_placements WHERE reference_idx = ?",
-            &[reference_idx],
-        )?;
-        // Annotation ROWS delete by reference_idx (they carry it directly), not by
-        // the orphan filter — but they must go AFTER the sequence/chunk deletes
-        // above, which read this table as one of the two claim sets in
-        // `orphan_filter`. The annotated FEATURES themselves are GC'd through that
-        // filter, like any other orphan.
-        let annotations_deleted = exec(
-            "DELETE FROM qiita_lake.reference_annotation WHERE reference_idx = ?",
-            &[reference_idx],
-        )?;
-        Ok(serde_json::json!({
-            "sequences_deleted": sequences_deleted,
-            "chunks_deleted": chunks_deleted,
-            "membership_deleted": membership_deleted,
-            "taxonomy_deleted": taxonomy_deleted,
-            "phylogeny_deleted": phylogeny_deleted,
-            "placements_deleted": placements_deleted,
-            "annotations_deleted": annotations_deleted,
-        }))
-    })?;
+    let counts = transact_with_retry(
+        conn,
+        "the reference delete",
+        reference_idx,
+        || {
+            take_registration_lock(conn)?;
+            let sequences_deleted = exec(
+                &format!("DELETE FROM qiita_lake.reference_sequences WHERE {orphan_filter}"),
+                &[reference_idx, reference_idx, reference_idx, reference_idx],
+            )?;
+            let chunks_deleted = exec(
+                &format!("DELETE FROM qiita_lake.reference_sequence_chunks WHERE {orphan_filter}"),
+                &[reference_idx, reference_idx, reference_idx, reference_idx],
+            )?;
+            let membership_deleted = exec(
+                "DELETE FROM qiita_lake.reference_membership WHERE reference_idx = ?",
+                &[reference_idx],
+            )?;
+            let taxonomy_deleted = exec(
+                "DELETE FROM qiita_lake.reference_taxonomy WHERE reference_idx = ?",
+                &[reference_idx],
+            )?;
+            let phylogeny_deleted = exec(
+                "DELETE FROM qiita_lake.reference_phylogeny WHERE reference_idx = ?",
+                &[reference_idx],
+            )?;
+            let placements_deleted = exec(
+                "DELETE FROM qiita_lake.reference_placements WHERE reference_idx = ?",
+                &[reference_idx],
+            )?;
+            // Annotation ROWS delete by reference_idx (they carry it directly), not by
+            // the orphan filter — but they must go AFTER the sequence/chunk deletes
+            // above, which read this table as one of the two claim sets in
+            // `orphan_filter`. The annotated FEATURES themselves are GC'd through that
+            // filter, like any other orphan.
+            let annotations_deleted = exec(
+                "DELETE FROM qiita_lake.reference_annotation WHERE reference_idx = ?",
+                &[reference_idx],
+            )?;
+            Ok(serde_json::json!({
+                "sequences_deleted": sequences_deleted,
+                "chunks_deleted": chunks_deleted,
+                "membership_deleted": membership_deleted,
+                "taxonomy_deleted": taxonomy_deleted,
+                "phylogeny_deleted": phylogeny_deleted,
+                "placements_deleted": placements_deleted,
+                "annotations_deleted": annotations_deleted,
+            }))
+        },
+        |_| {
+            // The deletes commit together, so none of the reference's rows left in
+            // the tables keyed by it means the reference is deleted: by this
+            // attempt, or by a delete of the same reference that committed first,
+            // whose counts this one then reports.
+            let mut remaining = 0i64;
+            for table in [
+                "reference_membership",
+                "reference_taxonomy",
+                "reference_phylogeny",
+                "reference_placements",
+                "reference_annotation",
+            ] {
+                remaining += conn
+                    .query_row(
+                        &format!("SELECT count(*) FROM qiita_lake.{table} WHERE reference_idx = ?"),
+                        [reference_idx],
+                        |r| r.get::<_, i64>(0),
+                    )
+                    .map_err(|e| Status::internal(format!("failed to count {table} rows: {e}")))?;
+            }
+            Ok(remaining == 0)
+        },
+    )?;
 
     let mut out = counts;
     out["reference_idx"] = serde_json::json!(reference_idx);
@@ -3398,19 +3609,16 @@ const LAKE_FILE_TICKET_PREFIX: &str = "wt";
 ///   so it separates the two loads only where the producer itself re-ran — the
 ///   case a redrive that drops the producer's `qiita.work_ticket_step` row
 ///   produces. A redrive that leaves the producer fast-forwarded rebuilds its
-///   outputs under the original attempt, yielding the same `staging_dir` and the
-///   same collision. That still fails at
-///   [`move_file`] rather than corrupting anything, but it is not covered here.
+///   outputs under the original attempt, yielding the same `staging_dir`, and so
+///   the same names: `register_files` then finds the files it placed before.
 ///
 /// Deterministic for a given (ticket, staging dir), so a replayed DoAction
-/// recomputes the same name. Most replays never reach [`move_file`]: the first
-/// run moved the staging files out, so the source-existence check in
-/// `register_files` returns `not_found` first. The name carries the guard on the
-/// one path where the source survives — the EXDEV branch below copies and then
-/// tolerates a failed `remove_file(src)`, leaving source and destination both in
-/// place. There the refusal is what stops a second registration of the tables
-/// outside `REPLACE_KEY_TABLES` (e.g. `reference_membership`), which have no
-/// replace-by-key to absorb one; a random name would register them twice.
+/// recomputes the same name, and `register_files` recognises a replay from it:
+/// it returns the earlier registration when every file is already a data file of
+/// its table, and fails closed otherwise. A random name would hide the replay
+/// from it, and the tables outside `REPLACE_KEY_TABLES` (e.g.
+/// `reference_membership`), which have no replace-by-key to absorb a second
+/// registration, would be registered twice.
 ///
 /// DuckLake names its own INSERT-written data files uniquely for the same
 /// reason; this is the equivalent for our "register an existing file" path.
@@ -3445,7 +3653,8 @@ fn staging_scope(staging_dir: &str, scratch_root: &std::path::Path) -> String {
         .unwrap_or_else(|_| staging_dir.to_string())
 }
 
-/// Move a file, falling back to copy+delete for cross-filesystem moves.
+/// Move a file: rename it, or hard-link it and remove the source, or copy it and
+/// remove the source, whichever the filesystem allows first.
 ///
 /// Refuses to overwrite an existing destination. Lake data files are
 /// registered in the DuckLake catalog by absolute path and written read-only
@@ -3455,43 +3664,154 @@ fn staging_scope(staging_dir: &str, scratch_root: &std::path::Path) -> String {
 /// double-registration — surface it loudly as `AlreadyExists` rather than
 /// touching the file.
 ///
-/// If the copy succeeds but delete fails, the dest file is kept (it's the
-/// correct data) and the error message includes the orphaned source path
-/// for cleanup.
+/// The refusal is made by the call that creates the destination (a no-replace
+/// rename, a hard link, or a `create_new` copy), never by a check before it, so
+/// two calls placing one destination cannot both succeed. On failure the
+/// destination this call created is removed; if that removal fails too, a
+/// warning names the partial file. If the move succeeds but
+/// removing the staging source fails, the dest file is kept (it's the correct
+/// data) and a warning names the orphaned source.
 fn move_file(src: &std::path::Path, dest: &std::path::Path) -> Result<(), Status> {
-    if dest.exists() {
-        return Err(Status::already_exists(format!(
+    let refused = || {
+        Status::already_exists(format!(
             "refusing to overwrite existing lake file {}",
             dest.display()
-        )));
-    }
-    match std::fs::rename(src, dest) {
-        Ok(()) => Ok(()),
-        Err(e) if e.raw_os_error() == Some(18) => {
-            // EXDEV: cross-device link — fall back to copy + delete
-            std::fs::copy(src, dest).map_err(|e| {
-                Status::internal(format!(
-                    "cross-fs copy failed {} → {}: {e}",
-                    src.display(),
-                    dest.display()
-                ))
-            })?;
-            if let Err(e) = std::fs::remove_file(src) {
-                // Copy succeeded — dest has the data. Log the orphan but
-                // don't fail the operation. The staging file is stale.
-                eprintln!(
-                    "warning: cross-fs cleanup failed for {} (dest {} is valid): {e}",
-                    src.display(),
-                    dest.display()
-                );
-            }
-            Ok(())
+        ))
+    };
+    match rename_no_replace(src, dest) {
+        Ok(true) => return Ok(()),
+        Ok(false) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Err(refused()),
+        Err(e) => {
+            return Err(Status::internal(format!(
+                "rename failed {} → {}: {e}",
+                src.display(),
+                dest.display()
+            )))
         }
-        Err(e) => Err(Status::internal(format!(
-            "rename failed {} → {}: {e}",
+    }
+    let link_error = match std::fs::hard_link(src, dest) {
+        Ok(()) => {
+            remove_moved_source(src, dest);
+            return Ok(());
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Err(refused()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(Status::internal(format!(
+                "move failed {} → {}: {e}",
+                src.display(),
+                dest.display()
+            )))
+        }
+        // Another filesystem, or a link the kernel refuses (Linux's
+        // `fs.protected_hardlinks` refuses one to a file the caller does not own
+        // and cannot write, and staged files are 0o440): copy instead.
+        Err(e) => e,
+    };
+    copy_no_replace(src, dest).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::AlreadyExists {
+            refused()
+        } else {
+            Status::internal(format!(
+                "copy failed {} → {} (the hard link was refused: {link_error}): {e}",
+                src.display(),
+                dest.display()
+            ))
+        }
+    })?;
+    remove_moved_source(src, dest);
+    Ok(())
+}
+
+/// Rename `src` to `dest` unless `dest` exists, checked by the kernel in the same
+/// call, so two callers placing one destination cannot both succeed. `Ok(false)`
+/// when this platform or filesystem has no such rename, or the two paths are on
+/// different filesystems.
+fn rename_no_replace(src: &std::path::Path, dest: &std::path::Path) -> std::io::Result<bool> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let c = |p: &std::path::Path| {
+            std::ffi::CString::new(p.as_os_str().as_bytes())
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
+        };
+        let (from, to) = (c(src)?, c(dest)?);
+        // The raw syscall rather than glibc's wrapper, which only glibc 2.28 and
+        // later has. SAFETY: both paths are NUL-terminated and outlive the call.
+        #[cfg(target_os = "linux")]
+        let rc = unsafe {
+            libc::syscall(
+                libc::SYS_renameat2,
+                libc::AT_FDCWD,
+                from.as_ptr(),
+                libc::AT_FDCWD,
+                to.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        };
+        // SAFETY: as above.
+        #[cfg(target_os = "macos")]
+        let rc = unsafe { libc::renamex_np(from.as_ptr(), to.as_ptr(), libc::RENAME_EXCL) };
+        if rc == 0 {
+            return Ok(true);
+        }
+        let e = std::io::Error::last_os_error();
+        // Another filesystem, or one without the flag. ENOTSUP and EOPNOTSUPP
+        // are one value on Linux and two on macOS.
+        let unsupported = [
+            libc::EXDEV,
+            libc::EINVAL,
+            libc::ENOSYS,
+            libc::ENOTSUP,
+            libc::EOPNOTSUPP,
+        ];
+        match e.raw_os_error() {
+            Some(n) if unsupported.contains(&n) => Ok(false),
+            _ => Err(e),
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (src, dest);
+        Ok(false)
+    }
+}
+
+/// Copy `src` to a `dest` this call creates, refused when `dest` exists. A copy
+/// that fails partway removes the `dest` it created; if that removal fails too, a
+/// warning names the partial file.
+fn copy_no_replace(src: &std::path::Path, dest: &std::path::Path) -> std::io::Result<()> {
+    let mut from = std::fs::File::open(src)?;
+    let permissions = from.metadata()?.permissions();
+    // Created writable; the source's mode is applied once the bytes are written.
+    let mut to = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(dest)?;
+    let copied =
+        std::io::copy(&mut from, &mut to).and_then(|_| std::fs::set_permissions(dest, permissions));
+    if let Err(e) = copied {
+        drop(to);
+        if let Err(cleanup) = std::fs::remove_file(dest) {
+            eprintln!(
+                "warning: failed to remove partial copy {}: {cleanup}",
+                dest.display()
+            );
+        }
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// Remove the staging source of a move that placed `dest`. A failure leaves a
+/// stale staging file and is not the move's failure: `dest` has the data.
+fn remove_moved_source(src: &std::path::Path, dest: &std::path::Path) {
+    if let Err(e) = std::fs::remove_file(src) {
+        eprintln!(
+            "warning: cleanup of moved file {} failed (dest {} is valid): {e}",
             src.display(),
             dest.display()
-        ))),
+        );
     }
 }
 

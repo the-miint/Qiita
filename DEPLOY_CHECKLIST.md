@@ -15,58 +15,22 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
 
 ### 1. Env vars — set BEFORE the deploy (most are `from_env()` fail-fast; a missing one keeps the unit down)
 
-- `[operator]` (#713) `data-plane.env` gains six optional vars, all documented in
-  `.env.data-plane.example`: `DUCKLAKE_POOL_SIZE`, `DUCKDB_THREADS`, `DUCKDB_MEMORY_LIMIT`,
-  `DUCKDB_TEMP_DIRECTORY`, `DUCKDB_MAX_TEMP_DIRECTORY_SIZE`, `FLIGHT_MAX_CONCURRENT_DOPUT`.
-  Left unset the data plane starts on its own
-  values: `memory_limit` derived from the memory it finds free, `threads` from the CPU
-  allowance, the spill root `PATH_SCRATCH/duckdb-spill` (which bucket 2 creates), and fixed defaults for the spill cap
-  and for the two counts (pool size and concurrent uploads, 8 each). Boot fails, among other
-  cases, if the pool size leaves under 512 MiB per connection — measured as the point below which
-  the export DoAction cannot run — naming both ways out, and if the spill root cannot be
-  created or written. Setting `DUCKDB_MEMORY_LIMIT` explicitly is what stops
-  boot depending on how much was free at the moment of a restart. Set the pool size
-  deliberately as well: it is both the number of DoGets and DoActions one data-plane process
-  serves at once — uploads have their own bound, `FLIGHT_MAX_CONCURRENT_DOPUT`, also 8 by
-  default — and a catalog-connection budget: each attached connection holds one
-  lake-Postgres backend while it lives, against `max_connections = 100` (3 superuser-reserved)
-  shared with the control plane and every other data-plane process. The default is 8 per
-  process. `FLIGHT_MAX_CONCURRENT_DOPUT` is the one value nothing derives and nothing fails
-  boot over: extrapolated from the measured cost of four, eight concurrent uploads at the
-  batch size the CLIs send hold ~18 GiB of decode buffers, which this host has and a smaller
-  one does not — lower it there.
+_None yet._
 
 ### 2. One-time host setup
 
-- `[admin]` (#713) Create the data plane's spill root before the restart — each pooled
-  connection spills into a directory of its own under it, and boot fails if it cannot:
-  `sudo install -d -o qiita-data -g qiita-data -m 0700 <scratch>/duckdb-spill`. Skip it only
-  if `DUCKDB_TEMP_DIRECTORY` names another root the data plane can write. Every stop or
-  restart leaves the stopped process's directories there, named `<host>-<pid>-…`; the next
-  boot on the same host removes those whose process is gone.
+_None yet._
 
 ### 3. Migrations
 
-- `[operator]` (#731) `make migrate` applies `20261021000000_sequenced_sample_download_failure.sql` (two nullable columns and a both-or-neither CHECK on `qiita.sequenced_sample`; no backfill).
+_None yet._
 
 ### 4. Deploy
 
-- `[admin]` (#731) Before stopping the control plane, confirm no `download-ena-study` ticket is in flight; if the query lists any, wait for them to finish. `download-ena-study` 1.0.0 is edited in place (`qiita-admin actions sync` in `activate.sh` re-syncs it), and a ticket whose ingest step finished on the old code fails on the missing `run_outcomes` output:
-  `SELECT work_ticket_idx, state FROM qiita.work_ticket WHERE action_id = 'download-ena-study' AND state IN ('pending','queued','processing');`
-  If one was missed and ends FAILED, redrive it (`POST /work-ticket/{idx}/run`): a download redrive drops the completed step rows, so ingest re-runs on the new code and skips runs already stored.
+_None yet._
 
 ### 5. Verify
 
-- `[operator]` (#713) `make verify-deploy` gains two rows per running data plane, read from
-  that instance's journal: `dp-pool/<unit>` prints the pool the instance built (size,
-  per-connection `threads` and `memory_limit`, how many concurrent uploads it admits, the
-  ceiling they were divided from and which detector answered) and fails if the ceiling came
-  from the fallback rather than this host, and `dp-pool/<unit>/reset` fails if any connection
-  failed its reset and was rebuilt. Read the printed
-  line — on this host the ceiling should come from `/proc/meminfo MemAvailable`, since the
-  unit sets no cgroup limit. No separate journal read by hand; `SKIP_DP_POOL=1` drops the
-  row.
-- `[admin]` (#731) `qiita.action` lists `download-ena-study` 1.0.0 with three steps, ending in `persist-ena-run-outcomes`, and `\d qiita.sequenced_sample` shows `download_failure_reason` and `download_failure_type`.
 - `[admin]` (#773) The SLURM partition allows a 72 h job (`local-reference-add`'s `load` can now run 48 h and retry at 72 h): `scontrol show partition <partition> | grep -o 'MaxTime=[^ ]*'` reads `UNLIMITED` or at least `3-00:00:00`, where `<partition>` is `SLURM_PARTITION` in `compute-orchestrator.env`. Below that, SLURM holds or refuses a `load` submitted with the longer walltime, so a genome-scale reference load cannot finish; raise the partition's MaxTime before running one.
 - `[admin]` (#773) Every `fastq-to-parquet` version's `fastq` step reads `cpu` 8 / `mem_gb` 13: `SELECT version, s->'baseline_resources' FROM qiita.action, jsonb_array_elements(steps) s WHERE action_id = 'fastq-to-parquet' AND s->>'name' = 'fastq';`
 
@@ -76,25 +40,6 @@ _None yet._
 
 ### Notes (no host action)
 
-- (#713) Past the pool size, the data plane answers gRPC `RESOURCE_EXHAUSTED` rather than
-  serving the request, so a fan-out wider than the pool turns into held or retried work
-  rather than slow work. No client retries the call itself. Where a refusal lands today:
-  a native job step gets `data_plane_transient` and the runner re-dispatches it within the
-  ticket's `max_retries`; a control-plane pre-loop fetch is held for an operator redrive;
-  a DoAction from the control plane's action library is re-run by the runner when a
-  workflow `action:` entry made it, and answered with a 502 when a REST route did. #539
-  and #582 carry the client half — a reader that retries the call itself instead of
-  failing the step. The Flight edge's own per-address admission (`deploy/nginx/qiita.conf`)
-  is what to weigh the pool size against.
-- (#713) Per-request wall time rises with the division. A request used to take every core;
-  it now takes `threads`, and measured on this host one masked read fitted
-  `25.3 s + 611.8 s / threads` — so at 48 cores and the default pool of 8 it is ~127 s where
-  it was ~38 s. Concurrency is what the change buys back.
-- (#713) A write under contention holds its connection while it retries: the registration
-  path sleeps inside its 120 s commit budget, and every writer takes the same lock, so a
-  write storm can occupy the whole pool and reads are refused for that window.
-- (#731) `GET /ena-import-batch/{idx}` items can read `completed_partial` (a pool landed with some runs failed permanently), and `ena_runs[].status` can be `download_failed`, with a new `failure_type`; clients matching on the closed set of states or statuses must accept them. `submit-ena-import --watch` exits 1 on a `completed_partial` item. A partially landed ticket is `completed`, so the submitter gets the work-ticket digest unless they opted out of processing emails.
-- (#751) `download-ena-study` 1.0.0 gains an optional `run_concurrency`. The optional control-plane `ENA_DOWNLOAD_RUN_CONCURRENCY` (1-8, default 4) stays at 4 in production (see `docs/runbooks/ena-import.md`).
 - (#773) Parquet that jobs register into DuckLake is now written at zstd level 16 (was the default 3), and the data plane sets DuckLake's `parquet_compression_level` to 16 at boot, so new lake files are ~12–15% smaller (synthetic production-shaped tables; −14.6% on one real long-read prep_sample's `sequence1`) and the steps that write them take longer: read ingest (`fastq-to-parquet`, `bcl-convert`'s `ingest_reads`, `download-ena-study`, `golay-demux`, `bam-to-parquet`), host filtering, alignment, and the reference, amplicon and long-read-assembly loads. Existing lake files are untouched. Watch reference-load walltimes on the first loads after the deploy.
 - (#773) `fastq-to-parquet` 1.0.0–1.3.0 are edited in place, resources only: the `fastq` step goes from cpu 2 / mem_gb 8 to cpu 8 / mem_gb 13, re-synced by `qiita-admin actions sync` in `activate.sh`. `bam-to-parquet` 1.0.0 and `local-reference-add` 1.0.0 are edited in place the same way, for walltime: the `bam` step goes from PT4H to PT6H (its description now says prep_sample), and `local-reference-add`'s `load` step from PT36H to PT48H under an action ceiling raised from PT48H to PT72H. `golay-demux` now runs DuckDB on all 8 of the cpu its YAML already allocates (code only).
 

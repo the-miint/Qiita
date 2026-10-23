@@ -604,6 +604,7 @@ async def _register_one_ena_run(
             protocol_name = map_ena_run_to_prep_protocol_name(
                 library_strategy=ena_run.library_strategy,
                 library_source=ena_run.library_source,
+                library_selection=ena_run.library_selection,
                 platform=platform,
             )
             prep_protocol_idx = await fetch_prep_protocol_idx_by_name(conn, protocol_name)

@@ -369,6 +369,7 @@ qiita ticket list --active
 qiita ticket status <idx>
 qiita ticket logs <idx> --step-index 0
 qiita ticket run <idx>        # re-drive a failed job, resuming at the first unfinished step
+qiita ticket redrive --sequenced-pool-idx <pool>   # list your failed jobs in the pool; --execute re-drives each
 qiita pool-completion --sequencing-run-idx <run> --sequenced-pool-idx <pool>
 ```
 
@@ -380,7 +381,13 @@ surprise. `cancelled` means somebody stopped it; `qiita ticket run` restarts it.
 `failed` comes with the reason and the step it failed at, and the reason says what
 to do next. A job that fails on a transient problem, such as a node failure or running out
 of memory, is retried automatically; other
-read-loading failures are re-driven with `qiita ticket run`. The ones that
+read-loading failures are re-driven with `qiita ticket run`, or many at once with
+`qiita ticket redrive`, which takes the `ticket list` filters, prints what it
+selected, and re-drives them one at a time only with `--execute`, with at most
+`--max-inflight` of them running at once (default 8; `--rate` adds seconds between
+them). A job whose workflow lost or renamed a step it already ran cannot be
+re-driven: `/run` refuses it naming that step, and it is resubmitted instead. A job
+under a deprecated mask is refused too. The ones that
 cannot be re-driven end in removing the pool, which only an
 operator can do — so take the reason to yours;
 [`fastq-to-parquet-retry-recovery.md`](fastq-to-parquet-retry-recovery.md) is the

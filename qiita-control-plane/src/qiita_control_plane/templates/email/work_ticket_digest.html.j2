@@ -47,7 +47,13 @@
           <td>{{ t.action_id }}</td>
           <td>{{ t.action_version }}</td>
           <td>{{ t.state }}</td>
-          <td>{{ t.failure_reason or "" }}</td>
+          <td>
+            {{ t.failure_reason or "" }}
+            {% if t.failed_runs %}
+            partial: {{ t.failed_runs }} run{{ 's' if t.failed_runs != 1 else '' }} failed
+            {% if t.batch_idx %}(see <code>qiita ena-import-status {{ t.batch_idx }}</code>){% endif %}
+            {% endif %}
+          </td>
         </tr>
         {% endfor %}
       </tbody>

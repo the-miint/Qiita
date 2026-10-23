@@ -169,6 +169,10 @@ class StepStatusWire(BaseModel):
     raw_state: str | None = None
     exit_code: int | None = None
     reason: str | None = None
+    # Set by the control-plane runner when it re-reads a step that finished in an
+    # earlier run (a resume or a redrive) rather than one slurmrestd just reported;
+    # `result_step` then verifies it as `verify_container_output(recovered=True)`.
+    recovered: bool = False
 
 
 class StepStatusRequest(BaseModel):

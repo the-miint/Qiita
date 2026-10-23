@@ -29,14 +29,21 @@ UpdatableTable = Literal[
 INT4_MASK = 0x7FFF_FFFF
 
 # Registry of advisory-lock keys/classes, so a new one is allocated rather
-# than invented (each site also carries its own "distinct from" note):
+# than invented (each Python site also carries its own "distinct from" note):
 #   repositories.block             1-arg, hashtextextended(mask_idx:prep_sample_idx)
 #   repositories.sequencing_run    2-arg class POOL_RESOLVE_LOCK_CLASS (pool
 #                                  writes vs the download-roster read)
+#   repositories.sequence_range    2-arg class PREP_SAMPLE_RANGE_LOCK_CLASS (range
+#                                  mint vs the empty-completion writer)
 #   fanout_dispatch                2-arg classes 0x0FA0_0001-3 (cohort kinds)
 #   actions.library                1-arg key 4_310_290_149 (exclusion sync)
 #   notify.sweeper                 1-arg key 4_310_290_147
 #   auth.cli_login_code_sweeper    1-arg key 4_310_290_148
+# and, taken inside plpgsql (db/migrations/):
+#   qiita.mint_sequence_range      1-arg, hashtext('qiita.sequence_idx_seq') (the
+#                                  global range-allocation lock)
+#   principal role triggers        1-arg, principal_idx (the auth and role-typed FK
+#                                  triggers)
 
 
 def require_transaction(conn: asyncpg.Connection) -> None:

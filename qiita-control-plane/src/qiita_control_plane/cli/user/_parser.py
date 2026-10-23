@@ -37,9 +37,11 @@ from qiita_common.models import (
     HOST_FILTER_INDEX_TYPE_MINIMAP2,
     HOST_FILTER_INDEX_TYPE_RYPE,
     LEGACY_IDX_RESERVED_CEILING,
+    REDRIVABLE_WORK_TICKET_STATES,
     STORABLE_ACCESS_TIERS,
     BiosamplePatchRequest,
     BiosampleStudyFieldCreateRequest,
+    FailureType,
     FieldDataType,
     Platform,
     PrepSampleStudyFieldCreateRequest,
@@ -55,6 +57,7 @@ from qiita_common.work_ticket_constants import (
     FORCE_RESUBMIT_EXPLANATION,
 )
 
+from ...fanout_dispatch import DEFAULT_FANOUT_MAX_INFLIGHT
 from .. import _common
 from .._reference_exclusion import add_user_exclusion_subparsers
 from ._helpers import (
@@ -127,6 +130,7 @@ from .study import (
 from .ticket import (
     _handle_ticket_list,
     _handle_ticket_logs,
+    _handle_ticket_redrive,
     _handle_ticket_run,
     _handle_ticket_status,
     _handle_ticket_submit,
@@ -1517,6 +1521,88 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_ticket_list.set_defaults(handler=_handle_ticket_list)
 
+    p_ticket_redrive = p_ticket_sub.add_parser(
+        "redrive",
+        help=(
+            "Redrive many tickets at once, as `ticket run` does one: select FAILED"
+            " (or CANCELLED) tickets with the `ticket list` filters and POST"
+            " /work-ticket/{idx}/run for each, one at a time. Dry-run by default;"
+            " pass --execute to redrive. Prints a JSON report on stdout, or on"
+            " stderr with exit 1 when any selected ticket was not redriven."
+        ),
+    )
+    p_ticket_redrive.add_argument(
+        "--state",
+        # PENDING is not offered: `/run` re-dispatches only a PENDING ticket whose
+        # create-time dispatch was lost, which a selector cannot tell from one
+        # that is dispatching now.
+        choices=sorted(REDRIVABLE_WORK_TICKET_STATES),
+        default=WorkTicketState.FAILED.value,
+        help="Which state to select (default: failed).",
+    )
+    p_ticket_redrive.add_argument(
+        "--failure-type",
+        choices=[t.value for t in FailureType],
+        help="Only FAILED tickets whose failure was of this type.",
+    )
+    p_ticket_redrive.add_argument(
+        "--all",
+        dest="all_tickets",
+        action="store_true",
+        help="All originators' tickets (requires wet_lab_admin+); default is your own.",
+    )
+    p_ticket_redrive.add_argument(
+        "--sequenced-pool-idx",
+        type=int,
+        help="Only tickets that touch this sequenced_pool (as `ticket list`).",
+    )
+    p_ticket_redrive.add_argument(
+        "--prep-sample-idx",
+        type=int,
+        help="Only tickets scoped to this prep_sample.",
+    )
+    p_ticket_redrive.add_argument(
+        "--action-id",
+        help="Only tickets for this action_id, across every version.",
+    )
+    p_ticket_redrive.add_argument(
+        "--limit",
+        type=int,
+        help=(
+            "Max tickets to select (server default 50, max 500). A selection larger"
+            " than this is refused rather than redriven in part."
+        ),
+    )
+    p_ticket_redrive.add_argument(
+        "--execute",
+        action="store_true",
+        help="Redrive the selected tickets (default: dry-run, print the selection only).",
+    )
+    p_ticket_redrive.add_argument(
+        "--rate",
+        type=float,
+        default=0.0,
+        dest="rate_seconds",
+        help="Seconds to sleep between redrives (default: 0).",
+    )
+    p_ticket_redrive.add_argument(
+        "--max-inflight",
+        type=int,
+        default=DEFAULT_FANOUT_MAX_INFLIGHT,
+        help=(
+            "Redriven tickets allowed to be pending, queued or processing at once;"
+            " the next waits for one to finish (default: the control plane's default"
+            f" fan-out cap, {DEFAULT_FANOUT_MAX_INFLIGHT})."
+        ),
+    )
+    p_ticket_redrive.add_argument(
+        "--poll-seconds",
+        type=float,
+        default=10.0,
+        help="Seconds between reads of the redriven tickets' states while waiting (default: 10).",
+    )
+    p_ticket_redrive.set_defaults(handler=_handle_ticket_redrive)
+
     p_ticket_logs = p_ticket_sub.add_parser(
         "logs",
         help="Read a step attempt's stdout/stderr tail "
@@ -2079,7 +2165,7 @@ def _build_parser() -> argparse.ArgumentParser:
         description=(
             "Submit a golay-demux work-ticket end-to-end. The run folder is resolved"
             " from --instrument-run-id server-side; the ticket converts it with a"
-            " no-index dummy sheet (every read to Undetermined, the Golay I1 emitted)"
+            " dummy sheet (every decodable read to Undetermined, the Golay I1 emitted)"
             " and demuxes on the Golay barcode. The per-sample Golay barcode_map is"
             " read from the preflight's amplicon_sample rows and carried in"
             " action_context; at run time the runner re-checks it against the"

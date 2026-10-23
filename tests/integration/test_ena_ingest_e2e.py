@@ -285,6 +285,18 @@ async def test_ena_reads_land_in_ducklake_read_via_register_files(
 
     total_reads = len(_PAIRED_ROWS) + len(_SINGLE_ROWS)
 
+    # A replay of the same call — the control plane lost the reply, or died
+    # before recording the step complete — finds the staging dir emptied by the
+    # first call's move, resends the payload the first call recorded, and the
+    # data plane registers nothing again.
+    await _run_register_files(
+        postgres_pool,
+        data_plane,
+        staging_dir=outputs["read_staging_dir"],
+        work_ticket_idx=_WORK_TICKET_IDX,
+    )
+    assert _count_read_rows(data_plane, [prep_paired, prep_single]) == total_reads
+
     # --- Assert against the real DuckLake `read` table. ---
     conn = ducklake_connect(data_plane["data_path"])
     try:

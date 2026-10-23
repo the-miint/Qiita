@@ -9,7 +9,7 @@
 **For:** whoever processes an EMP-style 16S run — Golay-barcoded, with no
 per-sample Illumina indices (the per-sample identity is a Golay barcode in the
 index read). Two workflows run in sequence: `golay-demux` (bcl-convert with a
-no-index dummy sheet, then Golay demux → `read`) then `amplicon` (denoise → ASV
+dummy sheet, then Golay demux → `read`) then `amplicon` (denoise → ASV
 `feature_idx` + counts). Auth and the general CLI flow are not repeated here —
 see [`getting-started.md`](getting-started.md).
 
@@ -34,7 +34,7 @@ see [`getting-started.md`](getting-started.md).
 - _(TODO)_ `qiita submit-golay-demux --instrument-run-id <run id> --preflight-blob
   <sqlite> --prep-protocol-idx <n>`. The CP resolves the run folder from the run
   id and reads the instrument identity from its RunInfo.xml. bcl-convert runs with
-  a no-index dummy sheet (every read to Undetermined, the Golay I1 emitted), then
+  a dummy sheet (every decodable read to Undetermined, the Golay I1 emitted), then
   `golay_demux` demultiplexes on the Golay barcode. The per-sample `barcode_map`
   roster is built from the preflight's `amplicon_sample` rows and submitted in
   action_context. Before running, the runner rebuilds the roster from the

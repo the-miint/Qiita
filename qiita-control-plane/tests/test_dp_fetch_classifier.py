@@ -454,16 +454,19 @@ async def test_register_files_rerun_after_the_files_moved_says_so(tmp_path):
         )
 
 
-async def test_register_files_is_not_rerun_after_an_unavailable_data_plane(monkeypatch):
+async def test_register_files_is_rerun_after_an_unavailable_data_plane(monkeypatch):
     """An unavailable data plane may have dropped partway through moving the staged
-    files, so `register-files` is not re-run on it: the re-run would register only the
-    files left in staging."""
+    files; `register-files` is re-run on it anyway, because the re-run resends the
+    payload the first call recorded rather than what is left in staging."""
     import pyarrow.flight as flight
+    from qiita_common.backend_failure import BackendFailure
 
-    exc = flight.FlightUnavailableError(_REAL_UNAVAILABLE)
-    raised, recorded = await _dispatch_action_raising(monkeypatch, exc)
-    assert raised is exc
-    assert recorded == [FailureKind.UNKNOWN_PERMANENT.value]
+    raised, recorded = await _dispatch_action_raising(
+        monkeypatch, flight.FlightUnavailableError(_REAL_UNAVAILABLE)
+    )
+    assert isinstance(raised, BackendFailure)
+    assert raised.kind is FailureKind.DATA_PLANE_TRANSIENT
+    assert recorded == [FailureKind.DATA_PLANE_TRANSIENT.value]
 
 
 async def test_other_action_entry_is_rerun_after_an_unavailable_data_plane(monkeypatch):

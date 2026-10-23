@@ -152,6 +152,7 @@ Retry semantics (implemented in `qiita_control_plane.runner._run_entry_with_retr
 Manual restart (`POST /api/v1/work-ticket/{idx}/run` on a `FAILED` ticket):
 - Atomic UPDATE: state ← PENDING, `retry_count = 0`, all `failure_*` columns ← NULL (the DB CHECK requires `failure_*` all-NULL when state ≠ failed; the route clears them in one statement).
 - Triggers a fresh in-process dispatch via `schedule_dispatch`, which queues behind the process-wide dispatch cap below when all slots are held. The original FAILED-row state is not preserved on the row itself; ops dashboards that want post-mortem retention should snapshot the `failure_*` fields before triggering /run.
+- Entries with a `completed` step row are fast-forwarded, not re-run. A step row is read for the entry at its `step_index` only while that entry still has the row's `step_name` and kind (`step:` or `action:`), because workflow YAMLs are edited in place and re-synced (`step_progress.check_step_progress`). A ticket with a row that no longer matches — a step was inserted, removed, renamed or reordered ahead of it — is refused by `/run` with a 409 naming those rows, and fails permanently at `submission` when startup recovery resumes it; a new ticket is submitted in its place (a terminal ticket does not block one), or, for `read-mask-block`, its prep_samples are re-masked under a new mask version. `/run` also refuses a ticket whose `mask_idx` names a deprecated mask.
 - A `download-ena-study` redrive also drops completed step rows so the roster is re-read, and is refused (409) when a newer download ticket exists for the pool or a FAILED ticket still has a live job; see the [ENA import runbook](../runbooks/ena-import.md).
 
 **Dispatch concurrency.** Every dispatch path (route submit, ENA batch submit, startup reconcile, fan-out pump release) goes through `schedule_dispatch`, whose task holds one slot of the process-wide `_DISPATCH_CONCURRENCY` cap (8) for its whole workflow — an hours-long download poll included. Tasks past the cap queue FIFO and start as slots free, logging `queued behind the dispatch cap` when they start waiting and `dispatched after waiting` when they get one; nothing fails while it waits. Bounding in-flight workflows, not just connections, is the deliberate consequence: it is what keeps a burst of submits from pressuring the connection pool after `_STUDY_CONCURRENCY`'s permit has already been released at submit. Two behaviours follow that an operator should expect: a restart with more than 8 tickets in flight re-attaches the first 8 and queues the rest, and `/run` queues behind the same slots as ordinary submits. The cap is sized against the pool and `FANOUT_MAX_INFLIGHT` together — see the note on the constant.
@@ -231,7 +232,7 @@ Execution (the CP runner drives the per-step loop — `submit_step` → poll `st
 
 Step outputs, intermediate and final, land in the step's per-attempt workspace, `PATH_SCRATCH/ticket/<work_ticket_idx>/<step>/attempt-<N>/` (see [Data Storage](storage.md#data-storage)). Jobs never write into the lake: registration has the data plane move each registered file from there into `PATH_PERSISTENT/ducklake/<table>/` and then call `ducklake_add_data_files`.
 
-Failure records which step failed (`failed_stage=processing_step_{n}`). Manual restart resets to step 0.
+Failure records which step failed (`failed_stage=processing_step_{n}`). A manual restart fast-forwards the entries that already completed (see "Manual restart" above).
 
 **Container contract:** Every workflow container must honour this interface regardless of what it does internally. Violations are rejected by the orchestrator's output verification gates and treated as permanent failures.
 
@@ -280,6 +281,8 @@ Orchestrator verification gates (all must pass before a step is accepted):
 3. Every file listed in `files` exists at its declared `size_bytes`
 4. The `outputs` map's relative paths resolve under `$QIITA_OUTPUT_PATH` (no traversal) and exist
 5. Every file under `$QIITA_OUTPUT_PATH` is mode `0o440` and is listed in `files` (no extras)
+
+A step re-read on a resume or redrive (`StepStatusWire.recovered`) skips the per-file gates, 3 and 5 above; `verify_container_output` (`slurm/verify.py`) says why.
 
 A gate failure after exit code 0 is a permanent failure — the container returned 0 but didn't honor the contract, so retry won't help. SlurmBackend wraps the resulting failures as `BackendFailure(kind=CONTRACT_VIOLATION, transient=False)`.
 

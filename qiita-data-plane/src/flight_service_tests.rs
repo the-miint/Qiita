@@ -285,6 +285,41 @@ fn delete_reference_drops_orphans_keeps_shared() {
     ));
 }
 
+/// A reference delete whose COMMIT answer is lost succeeds and reports the rows
+/// it deleted, rather than the zeros a re-run of the deletes would count.
+#[test]
+#[serial_test::serial]
+#[cfg(feature = "integration")]
+fn delete_reference_whose_commit_answer_is_lost_reports_what_it_deleted() {
+    let connstr = crate::test_catalog::connstr();
+    let data_path = crate::test_catalog::data_path();
+    let conn = Connection::open_in_memory().unwrap();
+    ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
+    setup_full_lake(&conn);
+    let ref_idx: i64 = 911_000;
+    conn.execute_batch(&format!(
+        "INSERT INTO qiita_lake.reference_membership VALUES ({ref_idx}, 911010), ({ref_idx}, 911011);"
+    ))
+    .unwrap();
+    let (proxied, cut) = catalog_that_loses_a_commit_answer(&connstr);
+
+    let counts = delete_reference(&attached_writer(&proxied, &data_path), ref_idx)
+        .expect("a reference delete whose COMMIT answer was lost failed");
+
+    assert!(cut.load(std::sync::atomic::Ordering::SeqCst));
+    assert_eq!(counts["membership_deleted"], 2);
+    let left: i64 = conn
+        .query_row(
+            &format!(
+                "SELECT count(*) FROM qiita_lake.reference_membership WHERE reference_idx = {ref_idx}"
+            ),
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(left, 0);
+}
+
 /// `delete_mask` drops exactly the target mask's `read_mask` rows, leaves a
 /// different mask untouched, and is idempotent: a second delete of the same
 /// mask_idx succeeds and reports `rows_deleted: 0`.
@@ -1276,6 +1311,119 @@ fn move_file_refuses_to_overwrite_existing_dest() {
     );
 }
 
+/// Why `move_file` cannot refuse by checking first: a plain rename replaces an
+/// existing destination.
+#[test]
+fn rename_replaces_an_existing_destination() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, dest) = (tmp.path().join("src"), tmp.path().join("dest"));
+    std::fs::write(&src, b"new").unwrap();
+    std::fs::write(&dest, b"old").unwrap();
+    std::fs::rename(&src, &dest).unwrap();
+    assert_eq!(std::fs::read(&dest).unwrap(), b"new");
+}
+
+/// Each way `move_file` places a file is refused by the call itself when the
+/// destination exists, on the filesystem the tests run on.
+#[test]
+fn every_placement_refuses_an_existing_destination() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, dest) = (tmp.path().join("src"), tmp.path().join("dest"));
+    std::fs::write(&src, b"new").unwrap();
+    std::fs::write(&dest, b"old").unwrap();
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    assert_eq!(
+        rename_no_replace(&src, &dest).unwrap_err().kind(),
+        std::io::ErrorKind::AlreadyExists
+    );
+    assert_eq!(
+        std::fs::hard_link(&src, &dest).unwrap_err().kind(),
+        std::io::ErrorKind::AlreadyExists
+    );
+    assert_eq!(
+        copy_no_replace(&src, &dest).unwrap_err().kind(),
+        std::io::ErrorKind::AlreadyExists
+    );
+    assert_eq!(std::fs::read(&dest).unwrap(), b"old");
+    assert_eq!(std::fs::read(&src).unwrap(), b"new");
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn rename_no_replace_moves_to_a_free_destination() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, dest) = (tmp.path().join("src"), tmp.path().join("dest"));
+    std::fs::write(&src, b"new").unwrap();
+    assert!(rename_no_replace(&src, &dest).unwrap());
+    assert_eq!(std::fs::read(&dest).unwrap(), b"new");
+    assert!(!src.exists());
+}
+
+/// A copy that fails partway leaves no destination: here the source is a
+/// directory, which opens but cannot be read.
+#[test]
+fn copy_no_replace_removes_the_destination_of_a_failed_copy() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, dest) = (tmp.path().join("src"), tmp.path().join("dest"));
+    std::fs::create_dir(&src).unwrap();
+    copy_no_replace(&src, &dest).expect_err("copying a directory succeeded");
+    assert!(!dest.exists());
+}
+
+#[test]
+fn copy_no_replace_keeps_the_source_mode() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, dest) = (tmp.path().join("src"), tmp.path().join("dest"));
+    std::fs::write(&src, b"new").unwrap();
+    std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o440)).unwrap();
+    copy_no_replace(&src, &dest).unwrap();
+    assert_eq!(std::fs::read(&dest).unwrap(), b"new");
+    assert_eq!(
+        std::fs::metadata(&dest).unwrap().permissions().mode() & 0o777,
+        0o440
+    );
+}
+
+/// Calls racing to place one destination: exactly one succeeds, every other is
+/// refused with AlreadyExists, and the destination holds the winner's bytes.
+#[test]
+fn move_file_lets_one_of_racing_placements_through() {
+    const RACERS: usize = 16;
+    for _ in 0..20 {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("dest");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(RACERS));
+        let handles: Vec<_> = (0..RACERS)
+            .map(|n| {
+                let src = tmp.path().join(format!("src-{n}"));
+                std::fs::write(&src, format!("racer {n}")).unwrap();
+                let (dest, barrier) = (dest.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    (n, src.clone(), move_file(&src, &dest))
+                })
+            })
+            .collect();
+        let outcomes: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let winners: Vec<_> = outcomes.iter().filter(|(_, _, r)| r.is_ok()).collect();
+        assert_eq!(winners.len(), 1, "{} placements succeeded", winners.len());
+        for (n, src, result) in &outcomes {
+            match result {
+                Ok(()) => assert_eq!(
+                    std::fs::read(&dest).unwrap(),
+                    format!("racer {n}").as_bytes()
+                ),
+                Err(e) => {
+                    assert_eq!(e.code(), tonic::Code::AlreadyExists, "{}", e.message());
+                    assert!(src.exists(), "a refused move removed its source");
+                }
+            }
+        }
+    }
+}
+
 // The minted lake filename carries the work ticket (traceability) and is
 // unique across loads: the same producer basename registered under two
 // different tickets must land at distinct paths, so neither clobbers the
@@ -1853,6 +2001,643 @@ fn register_files_moves_and_registers_end_to_end() {
     let _ = reader.execute_batch(&format!(
         "DELETE FROM qiita_lake.reference_membership WHERE reference_idx = {ref_idx};"
     ));
+}
+
+/// Seed one `reference_membership` staging Parquet for `register_files` replay
+/// tests, returning (staging dir guard, payload).
+#[cfg(feature = "integration")]
+fn seed_membership_registration(
+    ref_idx: i64,
+    ticket: i64,
+) -> (tempfile::TempDir, auth::ActionPayload) {
+    let staging = tempfile::tempdir().unwrap();
+    let src = staging.path().join("reference_membership.parquet");
+    let src_str = src.to_str().unwrap();
+    Connection::open_in_memory()
+        .unwrap()
+        .execute_batch(&format!(
+            "COPY (SELECT * FROM (VALUES \
+                 ({ref_idx}::BIGINT, 1::BIGINT), ({ref_idx}::BIGINT, 2::BIGINT)) \
+                 t(reference_idx, feature_idx)) \
+             TO '{src_str}' (FORMAT PARQUET)"
+        ))
+        .unwrap();
+    let mut files = std::collections::HashMap::new();
+    files.insert(
+        "reference_membership.parquet".to_string(),
+        "reference_membership".to_string(),
+    );
+    let payload = auth::ActionPayload {
+        action: "register_files".to_string(),
+        staging_dir: staging.path().to_str().unwrap().to_string(),
+        files,
+        work_ticket_idx: ticket,
+    };
+    (staging, payload)
+}
+
+#[cfg(feature = "integration")]
+fn membership_rows(connstr: &str, data_path: &str, ref_idx: i64) -> i64 {
+    let reader = Connection::open_in_memory().unwrap();
+    ducklake::connect_ducklake(&reader, connstr, data_path).unwrap();
+    reader
+        .query_row(
+            &format!(
+                "SELECT count(*) FROM qiita_lake.reference_membership \
+                 WHERE reference_idx = {ref_idx}"
+            ),
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+}
+
+#[cfg(feature = "integration")]
+fn prepare_membership_table(connstr: &str, data_path: &str, ref_idx: i64) {
+    let conn = Connection::open_in_memory().unwrap();
+    ducklake::connect_ducklake(&conn, connstr, data_path).unwrap();
+    ducklake::ensure_reference_tables(&conn).unwrap();
+    ducklake::ensure_registration_lock(&conn).unwrap();
+    conn.execute_batch(&format!(
+        "DELETE FROM qiita_lake.reference_membership WHERE reference_idx = {ref_idx};"
+    ))
+    .unwrap();
+}
+
+/// A registration replayed after it completed — the caller lost the reply, or
+/// died before recording it — returns the files the first call registered and
+/// registers nothing again. `reference_membership` is not replace-keyed, so a
+/// second registration of its file would double its rows.
+#[test]
+#[serial_test::serial]
+#[cfg(feature = "integration")]
+fn register_files_replayed_after_it_completed_registers_nothing_again() {
+    let connstr = crate::test_catalog::connstr();
+    let data_path = crate::test_catalog::data_path();
+    let ref_idx: i64 = 971_000;
+    let ticket: i64 = 971_000_000 + std::process::id() as i64;
+    prepare_membership_table(&connstr, &data_path, ref_idx);
+    let (_staging, payload) = seed_membership_registration(ref_idx, ticket);
+
+    let first = register_files(
+        &attached_writer(&connstr, &data_path),
+        &data_path,
+        std::path::Path::new("/"),
+        &payload,
+    )
+    .expect("first register_files failed");
+    let replay = register_files(
+        &attached_writer(&connstr, &data_path),
+        &data_path,
+        std::path::Path::new("/"),
+        &payload,
+    )
+    .expect("replayed register_files failed");
+
+    assert_eq!(replay.registered, first.registered);
+    assert!(replay.replaced.is_empty());
+    assert_eq!(membership_rows(&connstr, &data_path, ref_idx), 2);
+}
+
+/// A replay that finds the files moved but not registered fails closed: the
+/// earlier call may still be registering them, and a second
+/// `ducklake_add_data_files` of a path adds its rows again
+/// (`ducklake_add_data_files_accepts_a_path_it_already_holds`).
+#[test]
+#[serial_test::serial]
+#[cfg(feature = "integration")]
+fn register_files_replayed_before_the_earlier_call_committed_fails_closed() {
+    let connstr = crate::test_catalog::connstr();
+    let data_path = crate::test_catalog::data_path();
+    let ref_idx: i64 = 972_000;
+    let ticket: i64 = 972_000_000 + std::process::id() as i64;
+    prepare_membership_table(&connstr, &data_path, ref_idx);
+    let (staging, payload) = seed_membership_registration(ref_idx, ticket);
+
+    // The move half of a registration, as `register_files` places the file.
+    let scope = staging_scope(&payload.staging_dir, std::path::Path::new("/"));
+    let dest_dir = std::path::Path::new(&data_path).join("reference_membership");
+    std::fs::create_dir_all(&dest_dir).unwrap();
+    let dest = dest_dir.join(lake_dest_filename(
+        ticket,
+        &scope,
+        "reference_membership.parquet",
+    ));
+    move_file(&staging.path().join("reference_membership.parquet"), &dest).unwrap();
+
+    let err = register_files(
+        &attached_writer(&connstr, &data_path),
+        &data_path,
+        std::path::Path::new("/"),
+        &payload,
+    )
+    .expect_err("a replay of an uncommitted registration is refused");
+
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition, "{err}");
+    assert_eq!(membership_rows(&connstr, &data_path, ref_idx), 0);
+}
+
+/// A replay that lands after the earlier registration's rows were deleted
+/// (all of them, or some) still registers nothing: DuckLake keeps listing a
+/// data file whose rows are deleted.
+#[test]
+#[serial_test::serial]
+#[cfg(feature = "integration")]
+fn register_files_replayed_after_its_rows_were_deleted_registers_nothing() {
+    let connstr = crate::test_catalog::connstr();
+    let data_path = crate::test_catalog::data_path();
+    for (ref_idx, filter, rows_left) in [
+        (973_000_i64, "", 0_i64),
+        (974_000_i64, " AND feature_idx = 1", 1_i64),
+    ] {
+        let ticket: i64 = ref_idx * 1000 + std::process::id() as i64;
+        prepare_membership_table(&connstr, &data_path, ref_idx);
+        let (_staging, payload) = seed_membership_registration(ref_idx, ticket);
+        let first = register_files(
+            &attached_writer(&connstr, &data_path),
+            &data_path,
+            std::path::Path::new("/"),
+            &payload,
+        )
+        .expect("first register_files failed");
+        let conn = Connection::open_in_memory().unwrap();
+        ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
+        conn.execute_batch(&format!(
+            "DELETE FROM qiita_lake.reference_membership WHERE reference_idx = {ref_idx}{filter};"
+        ))
+        .unwrap();
+
+        let replay = register_files(
+            &attached_writer(&connstr, &data_path),
+            &data_path,
+            std::path::Path::new("/"),
+            &payload,
+        )
+        .expect("replayed register_files failed");
+
+        assert_eq!(replay.registered, first.registered);
+        assert_eq!(membership_rows(&connstr, &data_path, ref_idx), rows_left);
+    }
+}
+
+/// A registration that fails after its moves — here `ducklake_add_data_files`
+/// refuses a file whose columns do not match the table — returns the files to
+/// staging, so a call with the same payload starts over instead of failing
+/// closed on files left at their lake paths unregistered.
+#[test]
+#[serial_test::serial]
+#[cfg(feature = "integration")]
+fn register_files_that_fails_after_its_moves_returns_the_files_to_staging() {
+    let connstr = crate::test_catalog::connstr();
+    let data_path = crate::test_catalog::data_path();
+    let ref_idx: i64 = 980_000_000 + std::process::id() as i64;
+    prepare_membership_table(&connstr, &data_path, ref_idx);
+    let (staging, payload) = seed_membership_registration(ref_idx, ref_idx);
+    let good = staging.path().join("reference_membership.parquet");
+    let good_bytes = std::fs::read(&good).unwrap();
+    Connection::open_in_memory()
+        .unwrap()
+        .execute_batch(&format!(
+            "COPY (SELECT 'not a number' AS reference_idx) TO '{}' (FORMAT PARQUET)",
+            good.to_str().unwrap()
+        ))
+        .unwrap();
+
+    let err = register_files(
+        &attached_writer(&connstr, &data_path),
+        &data_path,
+        std::path::Path::new("/"),
+        &payload,
+    )
+    .expect_err("a file that does not match its table registered");
+
+    assert!(
+        err.message().contains("moved back to staging"),
+        "{}",
+        err.message()
+    );
+    assert!(good.exists(), "the staged file was not returned");
+    assert_eq!(membership_rows(&connstr, &data_path, ref_idx), 0);
+
+    // The same payload, with the file fixed in staging, registers.
+    std::fs::write(&good, good_bytes).unwrap();
+    register_files(
+        &attached_writer(&connstr, &data_path),
+        &data_path,
+        std::path::Path::new("/"),
+        &payload,
+    )
+    .expect("the retried registration failed");
+    assert_eq!(membership_rows(&connstr, &data_path, ref_idx), 2);
+}
+
+/// A destination already there when the call starts is read as an earlier call's
+/// move, so the call fails closed before moving anything, and leaves that file
+/// as it was. (A destination that appears between that check and the move is
+/// refused by `move_file`, and `register_files` leaves it out of the move back.)
+#[test]
+#[serial_test::serial]
+#[cfg(feature = "integration")]
+fn register_files_fails_closed_on_a_destination_there_before_it_moves() {
+    let connstr = crate::test_catalog::connstr();
+    let data_path = crate::test_catalog::data_path();
+    let ref_idx: i64 = 982_000_000 + std::process::id() as i64;
+    prepare_membership_table(&connstr, &data_path, ref_idx);
+    let (staging, mut payload) = seed_membership_registration(ref_idx, ref_idx);
+    std::fs::copy(
+        staging.path().join("reference_membership.parquet"),
+        staging.path().join("second.parquet"),
+    )
+    .unwrap();
+    payload.files.insert(
+        "second.parquet".to_string(),
+        "reference_membership".to_string(),
+    );
+    let scope = staging_scope(&payload.staging_dir, std::path::Path::new("/"));
+    let taken = std::path::Path::new(&data_path)
+        .join("reference_membership")
+        .join(lake_dest_filename(ref_idx, &scope, "second.parquet"));
+    std::fs::create_dir_all(taken.parent().unwrap()).unwrap();
+    std::fs::write(&taken, b"not ours").unwrap();
+
+    let err = register_files(
+        &attached_writer(&connstr, &data_path),
+        &data_path,
+        std::path::Path::new("/"),
+        &payload,
+    )
+    .expect_err("a registration whose destination was taken succeeded");
+
+    assert_eq!(
+        err.code(),
+        tonic::Code::FailedPrecondition,
+        "{}",
+        err.message()
+    );
+    assert_eq!(std::fs::read(&taken).unwrap(), b"not ours");
+    assert!(staging.path().join("reference_membership.parquet").exists());
+    assert!(staging.path().join("second.parquet").exists());
+    std::fs::remove_file(&taken).unwrap();
+}
+
+/// A TCP proxy in front of the test catalog's Postgres. Once a client message on
+/// a connection names `ducklake_snapshot` (DuckLake's commit writes a snapshot
+/// row), the proxy drops Postgres's answer to the next COMMIT on it and closes
+/// that connection, so
+/// the commit is in the catalog and the client is told it failed. Returns the
+/// connection string through the proxy, and whether it has cut a connection.
+/// Only the first such COMMIT is cut.
+#[cfg(feature = "integration")]
+fn catalog_that_loses_a_commit_answer(
+    connstr: &str,
+) -> (String, std::sync::Arc<std::sync::atomic::AtomicBool>) {
+    use std::io::{Read, Write as _};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let field = |key: &str| {
+        connstr
+            .split_whitespace()
+            .find_map(|kv| kv.strip_prefix(&format!("{key}=")))
+            .map(str::to_string)
+    };
+    let upstream = format!(
+        "{}:{}",
+        field("host").unwrap_or_else(|| "localhost".into()),
+        field("port").unwrap_or_else(|| "5432".into())
+    );
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let proxied = connstr
+        .split_whitespace()
+        .filter(|kv| {
+            !["host=", "port=", "sslmode=", "gssencmode="]
+                .iter()
+                .any(|key| kv.starts_with(key))
+        })
+        .chain(["host=127.0.0.1", "sslmode=disable", "gssencmode=disable"])
+        .collect::<Vec<_>>()
+        .join(" ")
+        + &format!(" port={port}");
+    let cut = Arc::new(AtomicBool::new(false));
+
+    // Complete protocol messages off the front of `buf`. Every message is typed
+    // except the client's first (startup), which `untyped` names.
+    fn split(buf: &mut Vec<u8>, untyped: &mut bool) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        loop {
+            let (start, len) = if *untyped { (0, 4) } else { (1, 5) };
+            if buf.len() < len {
+                break;
+            }
+            let n = u32::from_be_bytes(buf[start..start + 4].try_into().unwrap()) as usize + start;
+            if buf.len() < n {
+                break;
+            }
+            out.push(buf.drain(..n).collect());
+            *untyped = false;
+        }
+        out
+    }
+
+    let cut_flag = cut.clone();
+    std::thread::spawn(move || {
+        for client in listener.incoming() {
+            let Ok(client) = client else { return };
+            let Ok(server) = std::net::TcpStream::connect(&upstream) else {
+                return;
+            };
+            let armed = Arc::new(AtomicBool::new(false));
+            let (mut c_read, mut c_write) = (client.try_clone().unwrap(), client);
+            let (mut s_read, mut s_write) = (server.try_clone().unwrap(), server);
+            let client_armed = armed.clone();
+            std::thread::spawn(move || {
+                let (mut buf, mut untyped, mut chunk) = (Vec::new(), true, [0u8; 65536]);
+                while let Ok(n @ 1..) = c_read.read(&mut chunk) {
+                    buf.extend_from_slice(&chunk[..n]);
+                    for m in split(&mut buf, &mut untyped) {
+                        if m.windows(17).any(|w| w == b"ducklake_snapshot") {
+                            client_armed.store(true, Ordering::SeqCst);
+                        }
+                        if s_write.write_all(&m).is_err() {
+                            return;
+                        }
+                    }
+                }
+                let _ = s_write.shutdown(std::net::Shutdown::Both);
+            });
+            let cut_flag = cut_flag.clone();
+            std::thread::spawn(move || {
+                let (mut buf, mut untyped, mut chunk) = (Vec::new(), false, [0u8; 65536]);
+                while let Ok(n @ 1..) = s_read.read(&mut chunk) {
+                    buf.extend_from_slice(&chunk[..n]);
+                    for m in split(&mut buf, &mut untyped) {
+                        if armed.load(Ordering::SeqCst)
+                            && m[0] == b'C'
+                            && &m[5..] == b"COMMIT\0"
+                            && !cut_flag.swap(true, Ordering::SeqCst)
+                        {
+                            let _ = c_write.shutdown(std::net::Shutdown::Both);
+                            let _ = s_read.shutdown(std::net::Shutdown::Both);
+                            return;
+                        }
+                        if c_write.write_all(&m).is_err() {
+                            return;
+                        }
+                    }
+                }
+                let _ = c_write.shutdown(std::net::Shutdown::Both);
+            });
+        }
+    });
+    (proxied, cut)
+}
+
+/// Why `transact_with_retry` reads the catalog before re-running: a DuckLake
+/// COMMIT whose answer from the catalog is lost reports an error, and the rows
+/// it added are there.
+#[test]
+#[serial_test::serial]
+#[cfg(feature = "integration")]
+fn ducklake_commit_error_after_the_catalog_committed() {
+    let connstr = crate::test_catalog::connstr();
+    let data_path = crate::test_catalog::data_path();
+    let ref_idx: i64 = 983_000;
+    prepare_membership_table(&connstr, &data_path, ref_idx);
+    let (staging, _payload) = seed_membership_registration(ref_idx, ref_idx);
+    // In the lake's data path, where it outlives the test as a registered file must.
+    let lake_file = std::path::Path::new(&data_path)
+        .join("reference_membership")
+        .join(format!("commit-answer-lost-{}.parquet", std::process::id()));
+    std::fs::create_dir_all(lake_file.parent().unwrap()).unwrap();
+    move_file(
+        &staging.path().join("reference_membership.parquet"),
+        &lake_file,
+    )
+    .unwrap();
+    let (proxied, cut) = catalog_that_loses_a_commit_answer(&connstr);
+    let conn = attached_conn(&proxied, &data_path);
+
+    conn.execute_batch("BEGIN TRANSACTION").unwrap();
+    conn.execute(
+        "CALL ducklake_add_data_files('qiita_lake', 'reference_membership', ?)",
+        [lake_file.to_str().unwrap()],
+    )
+    .unwrap();
+    conn.execute_batch("COMMIT")
+        .expect_err("a COMMIT whose answer was lost succeeded");
+
+    assert!(cut.load(std::sync::atomic::Ordering::SeqCst));
+    assert_eq!(membership_rows(&connstr, &data_path, ref_idx), 2);
+}
+
+/// A registration whose COMMIT answer is lost succeeds and registers its file
+/// once, rather than adding it again on a re-run.
+#[test]
+#[serial_test::serial]
+#[cfg(feature = "integration")]
+fn register_files_whose_commit_answer_is_lost_registers_once() {
+    let connstr = crate::test_catalog::connstr();
+    let data_path = crate::test_catalog::data_path();
+    let ref_idx: i64 = 984_000;
+    let ticket: i64 = 984_000_000 + std::process::id() as i64;
+    prepare_membership_table(&connstr, &data_path, ref_idx);
+    let (_staging, payload) = seed_membership_registration(ref_idx, ticket);
+    let (proxied, cut) = catalog_that_loses_a_commit_answer(&connstr);
+
+    let registration = register_files(
+        &attached_writer(&proxied, &data_path),
+        &data_path,
+        std::path::Path::new("/"),
+        &payload,
+    )
+    .expect("a registration whose COMMIT answer was lost failed");
+
+    assert!(cut.load(std::sync::atomic::Ordering::SeqCst));
+    assert_eq!(registration.registered.len(), 1);
+    assert_eq!(membership_rows(&connstr, &data_path, ref_idx), 2);
+}
+
+/// The reason a replay checks the catalog before registering: in the DuckLake
+/// we ship, adding a path the table already holds succeeds and counts its rows
+/// twice.
+#[test]
+#[serial_test::serial]
+#[cfg(feature = "integration")]
+fn ducklake_add_data_files_accepts_a_path_it_already_holds() {
+    let connstr = crate::test_catalog::connstr();
+    let data_path = crate::test_catalog::data_path();
+    // Unique per run: rows a prior local run added twice outlive the DELETE in
+    // `prepare_membership_table`, so a fixed reference_idx would not start at 0.
+    let ref_idx: i64 = 975_000_000 + std::process::id() as i64;
+    let ticket: i64 = ref_idx;
+    prepare_membership_table(&connstr, &data_path, ref_idx);
+    let (_staging, payload) = seed_membership_registration(ref_idx, ticket);
+    let first = register_files(
+        &attached_writer(&connstr, &data_path),
+        &data_path,
+        std::path::Path::new("/"),
+        &payload,
+    )
+    .expect("register_files failed");
+    assert_eq!(membership_rows(&connstr, &data_path, ref_idx), 2);
+    let conn = Connection::open_in_memory().unwrap();
+    ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
+
+    conn.execute(
+        "CALL ducklake_add_data_files('qiita_lake', ?, ?)",
+        duckdb::params!["reference_membership", first.registered[0]],
+    )
+    .expect("a second add of the same path is accepted");
+
+    assert_eq!(membership_rows(&connstr, &data_path, ref_idx), 4);
+}
+
+/// One `reference_idx`'s rows registered once, then a second registration of
+/// the same rows from a new staging dir, for the overlapping-delete tests: the
+/// shape of `delete-alignment-sample` followed by `register-files`.
+#[cfg(feature = "integration")]
+fn delete_then_reregister(
+    connstr: &str,
+    data_path: &str,
+    ref_idx: i64,
+    between: impl FnOnce(),
+) -> Vec<tempfile::TempDir> {
+    prepare_membership_table(connstr, data_path, ref_idx);
+    let (first_dir, first) = seed_membership_registration(ref_idx, ref_idx * 10);
+    register_files(
+        &attached_writer(connstr, data_path),
+        data_path,
+        std::path::Path::new("/"),
+        &first,
+    )
+    .unwrap();
+    between();
+    let rerun = attached_conn(connstr, data_path);
+    rerun
+        .execute(
+            "DELETE FROM qiita_lake.reference_membership WHERE reference_idx = ?",
+            [ref_idx],
+        )
+        .unwrap();
+    let (second_dir, second) = seed_membership_registration(ref_idx, ref_idx * 10 + 1);
+    register_files(
+        &attached_writer(connstr, data_path),
+        data_path,
+        std::path::Path::new("/"),
+        &second,
+    )
+    .unwrap();
+    assert_eq!(membership_rows(connstr, data_path, ref_idx), 2);
+    vec![first_dir, second_dir]
+}
+
+/// A delete the caller abandoned, whose DELETE ran before the rerun's delete and
+/// registration and whose COMMIT comes after them, fails to commit, and the
+/// rerun's rows stay.
+#[test]
+#[serial_test::serial]
+#[cfg(feature = "integration")]
+fn ducklake_abandoned_delete_that_read_first_fails_to_commit() {
+    let connstr = crate::test_catalog::connstr();
+    let data_path = crate::test_catalog::data_path();
+    let ref_idx: i64 = 976_000_000 + std::process::id() as i64;
+    let abandoned = attached_conn(&connstr, &data_path);
+    let _dirs = delete_then_reregister(&connstr, &data_path, ref_idx, || {
+        abandoned.execute_batch("BEGIN TRANSACTION").unwrap();
+        let n = abandoned
+            .execute(
+                "DELETE FROM qiita_lake.reference_membership WHERE reference_idx = ?",
+                [ref_idx],
+            )
+            .unwrap();
+        assert_eq!(n, 2);
+    });
+
+    let err = abandoned
+        .execute_batch("COMMIT")
+        .expect_err("the abandoned delete committed over the rerun");
+    assert!(err.to_string().contains("Transaction conflict"), "{err}");
+    assert_eq!(membership_rows(&connstr, &data_path, ref_idx), 2);
+}
+
+/// A DuckLake transaction reads the snapshot current at its first statement, not
+/// at its BEGIN: a delete whose DELETE runs after the rerun's registration
+/// commits, and deletes the rerun's rows.
+#[test]
+#[serial_test::serial]
+#[cfg(feature = "integration")]
+fn ducklake_transaction_reads_the_snapshot_of_its_first_statement() {
+    let connstr = crate::test_catalog::connstr();
+    let data_path = crate::test_catalog::data_path();
+    let ref_idx: i64 = 977_000_000 + std::process::id() as i64;
+    let late = attached_conn(&connstr, &data_path);
+    let _dirs = delete_then_reregister(&connstr, &data_path, ref_idx, || {
+        late.execute_batch("BEGIN TRANSACTION").unwrap();
+    });
+
+    let n = late
+        .execute(
+            "DELETE FROM qiita_lake.reference_membership WHERE reference_idx = ?",
+            [ref_idx],
+        )
+        .unwrap();
+    late.execute_batch("COMMIT").unwrap();
+
+    assert_eq!(n, 2);
+    assert_eq!(membership_rows(&connstr, &data_path, ref_idx), 0);
+}
+
+/// What `return_to_staging`'s catalog check rests on: after a COMMIT that fails,
+/// the connection is out of its transaction, and a read on it sees the catalog as
+/// it now is — here, a registration another connection committed meanwhile.
+#[test]
+#[serial_test::serial]
+#[cfg(feature = "integration")]
+fn ducklake_read_after_a_failed_commit_sees_the_current_catalog() {
+    let connstr = crate::test_catalog::connstr();
+    let data_path = crate::test_catalog::data_path();
+    let ref_idx: i64 = 981_000_000 + std::process::id() as i64;
+    let delete = "DELETE FROM qiita_lake.reference_membership WHERE reference_idx = ?";
+    prepare_membership_table(&connstr, &data_path, ref_idx);
+    let (_first_dir, first) = seed_membership_registration(ref_idx, ref_idx * 10);
+    register_files(
+        &attached_writer(&connstr, &data_path),
+        &data_path,
+        std::path::Path::new("/"),
+        &first,
+    )
+    .unwrap();
+
+    let failed = attached_conn(&connstr, &data_path);
+    failed.execute_batch("BEGIN TRANSACTION").unwrap();
+    failed.execute(delete, [ref_idx]).unwrap();
+    attached_conn(&connstr, &data_path)
+        .execute(delete, [ref_idx])
+        .unwrap();
+    let (_second_dir, second) = seed_membership_registration(ref_idx, ref_idx * 10 + 1);
+    let committed = register_files(
+        &attached_writer(&connstr, &data_path),
+        &data_path,
+        std::path::Path::new("/"),
+        &second,
+    )
+    .unwrap();
+    failed
+        .execute_batch("COMMIT")
+        .expect_err("the conflicting delete committed");
+
+    assert!(failed.is_autocommit());
+    let listed: Vec<String> = failed
+        .prepare("SELECT data_file FROM ducklake_list_files('qiita_lake', 'reference_membership')")
+        .unwrap()
+        .query_map([], |r| r.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert!(
+        listed.contains(&committed.registered[0]),
+        "the read after the failed commit missed the committed registration"
+    );
 }
 
 // --- replace-by-key against a real DuckLake catalog ---
