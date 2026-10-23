@@ -67,6 +67,7 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
   unit sets no cgroup limit. No separate journal read by hand; `SKIP_DP_POOL=1` drops the
   row.
 - `[admin]` (#731) `qiita.action` lists `download-ena-study` 1.0.0 with three steps, ending in `persist-ena-run-outcomes`, and `\d qiita.sequenced_sample` shows `download_failure_reason` and `download_failure_type`.
+- `[admin]` (#feat/parquet-at-rest-zstd16) The SLURM partition allows a 72 h job (`local-reference-add`'s `load` can now run 48 h and retry at 72 h): `scontrol show partition "$SLURM_PARTITION" | grep -o 'MaxTime=[^ ]*'` reads `UNLIMITED` or at least `3-00:00:00`. If it does not, tell the PR author before a large reference load runs.
 - `[admin]` (#feat/parquet-at-rest-zstd16) Every `fastq-to-parquet` version's `fastq` step reads `cpu` 8 / `mem_gb` 13: `SELECT version, s->'baseline_resources' FROM qiita.action, jsonb_array_elements(steps) s WHERE action_id = 'fastq-to-parquet' AND s->>'name' = 'fastq';`
 
 ### 6. After the deploy verifies green
@@ -95,7 +96,7 @@ _None yet._
 - (#731) `GET /ena-import-batch/{idx}` items can read `completed_partial` (a pool landed with some runs failed permanently), and `ena_runs[].status` can be `download_failed`, with a new `failure_type`; clients matching on the closed set of states or statuses must accept them. `submit-ena-import --watch` exits 1 on a `completed_partial` item. A partially landed ticket is `completed`, so the submitter gets the work-ticket digest unless they opted out of processing emails.
 - (#751) `download-ena-study` 1.0.0 gains an optional `run_concurrency`. The optional control-plane `ENA_DOWNLOAD_RUN_CONCURRENCY` (1-8, default 4) stays at 4 in production (see `docs/runbooks/ena-import.md`).
 - (#feat/parquet-at-rest-zstd16) Parquet that jobs register into DuckLake is now written at zstd level 16 (was the default 3), and the data plane sets DuckLake's `parquet_compression_level` to 16 at boot, so new lake files are ~12–15% smaller and the steps that write them take longer: read ingest (`fastq-to-parquet`, `ingest-reads`, ENA ingest, `golay-demux`, BAM ingest), host filtering, alignment, and the reference loads. Existing lake files are untouched. Watch reference-load walltimes on the first loads after the deploy.
-- (#feat/parquet-at-rest-zstd16) `fastq-to-parquet` 1.0.0–1.3.0 are edited in place, resources only: the `fastq` step goes from cpu 2 / mem_gb 8 to cpu 8 / mem_gb 13, re-synced by `qiita-admin actions sync` in `activate.sh`. `golay-demux` now runs DuckDB on all 8 of the cpu its YAML already allocates (code only).
+- (#feat/parquet-at-rest-zstd16) `fastq-to-parquet` 1.0.0–1.3.0 are edited in place, resources only: the `fastq` step goes from cpu 2 / mem_gb 8 to cpu 8 / mem_gb 13, re-synced by `qiita-admin actions sync` in `activate.sh`. `bam-to-parquet` 1.0.0 and `local-reference-add` 1.0.0 are edited in place the same way, for walltime: the `bam` step goes from PT4H to PT6H, and `local-reference-add`'s `load` step from PT36H to PT48H under an action ceiling raised from PT48H to PT72H. `golay-demux` now runs DuckDB on all 8 of the cpu its YAML already allocates (code only).
 
 ## Deployed history
 
