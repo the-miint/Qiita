@@ -254,7 +254,7 @@ def test_execute_reuses_range_left_by_a_crashed_attempt(monkeypatch, tmp_path):
     attempt into a permanent failure on the retry: it masked the OOM behind a mint
     conflict and defeated the runner's OOM memory escalation, which can only pay
     off if the escalated attempt gets past the mint. This is the exact sequence
-    that failed nearly every sample on the first real PacBio run.
+    that failed nearly every prep_sample on the first real PacBio run.
     """
 
     async def _conflict(*, http, prep_sample_idx, count, work_ticket_idx):
@@ -346,12 +346,12 @@ def test_duckdb_memory_limit_tracks_the_slurm_cgroup(fake_mint, monkeypatch, tmp
 
 
 def test_execute_refuses_a_range_minted_by_a_different_ticket(monkeypatch, tmp_path):
-    """A range minted by ANOTHER work_ticket must NOT be reused — the sample's reads
+    """A range minted by ANOTHER work_ticket must NOT be reused — the prep_sample's reads
     are already registered, and reusing the range would register them a second time.
 
     This is the guard that makes the 409-reuse safe. The submit-time
     disallow-without-delete gate only blocks NON-terminal tickets, so a COMPLETED
-    sample can be resubmitted; without this check the new ticket would mint, 409,
+    prep_sample can be resubmitted; without this check the new ticket would mint, 409,
     read back the old range, rewrite the identical sequence_idx values, and
     register-files would add a SECOND DuckLake data file. DuckLake has no
     uniqueness, so every read would silently exist twice.
@@ -590,7 +590,7 @@ def test_reads_are_written_as_monotone_disjoint_parts(fake_mint, monkeypatch, tm
     """The batched write must reproduce EXACTLY what the global sort used to give.
 
     The old form was one `COPY ... ORDER BY sequence_idx`, a blocking sort over the
-    whole seq+qual payload — tens of GB for a HiFi sample, and where the first real
+    whole seq+qual payload — tens of GB for a HiFi prep_sample, and where the first real
     PacBio run OOM'd. What that sort bought for pruning was not the row order itself
     but tight per-row-group min/max on sequence_idx, which is what DuckLake pruning reads.
 

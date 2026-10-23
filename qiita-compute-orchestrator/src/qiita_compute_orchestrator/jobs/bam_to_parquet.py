@@ -79,7 +79,7 @@ YAML_STEP_NAME = "bam"
 # backend / tests), where there is no cgroup to read; it is NOT the YAML baseline
 # minus headroom, and deliberately stays small so a dev box isn't asked for 29 GB.
 #
-# Peak memory is flat in the sample: the reads are written in bounded batches (see
+# Peak memory is flat in the read set's size: the reads are written in bounded batches (see
 # _write_read_parts), and the parse streams (read_sequences_sam projects the aux tags
 # away rather than materialising them). The one term that still scales with the input
 # is `count(DISTINCT read_id)` — a blocking hash aggregate, O(distinct read_ids). At a
@@ -96,7 +96,7 @@ _DUCKDB_THREADS = 2
 # There is deliberately NO plan(). Peak memory is flat in the batch, not the input, so
 # a down-only sizing hint has nothing useful to lower; and a walltime hint risks
 # burning one of the ticket's three shared retries on a TIMEOUT. What scales with a
-# long sample is walltime, which is where the ceiling headroom sits.
+# long read set is walltime, which is where the ceiling headroom sits.
 _ROWS_PER_PART_TARGET_BYTES = 1024**3
 
 
@@ -138,7 +138,7 @@ def _write_read_parts(
         COPY (SELECT ... FROM read_parquet(intermediate) ORDER BY sequence_idx)
         TO 'read.parquet'
 
-    — is a BLOCKING sort over the full seq+qual payload. For a PacBio HiFi sample
+    — is a BLOCKING sort over the full seq+qual payload. For a PacBio HiFi prep_sample
     (~15-25 kB per read, millions of reads) that is tens of GB, and it is exactly
     where the first real PacBio run died. Paying for it with a bigger allocation
     would be paying for work we do not need to do.
@@ -154,7 +154,7 @@ def _write_read_parts(
     below every row in part N+1, so each part's row groups carry a tight, disjoint
     min/max — the same pruning the global sort produced. The ORDER BY inside a part
     then sorts at most `_ROWS_PER_PART_TARGET_BYTES` worth of payload, so peak memory
-    is bounded by the batch, not by the sample.
+    is bounded by the batch, not by the prep_sample.
 
     The multi-file table shape is not new: `register-files` maps a top-level subdir
     of `part_*.parquet` to the table named after the directory, which is what
@@ -186,7 +186,7 @@ def _write_read_parts(
             "  read_id, sequence1, qual1, sequence2, qual2 "
             "FROM read_parquet(?) "
             "WHERE sequence_index BETWEEN ? AND ? "
-            # Bounded: at most one batch's payload, not the whole sample. Still
+            # Bounded: at most one batch's payload, not the whole read set. Still
             # explicit — preserve_insertion_order=false means DuckDB is free to emit
             # a batch's rows out of order, and the clustering is the point.
             "ORDER BY sequence_idx ) "
@@ -198,7 +198,7 @@ def _write_read_parts(
     # The slicing above assumes `sequence_index` is DENSE 1..count (miint's per-file
     # ordinal; pinned in tests/jobs/test_bam_to_parquet_miint_contract.py). If that
     # ever stopped holding, the WHERE clauses would silently DROP rows and we would
-    # register a short sample — reads missing from the lake, with no error anywhere.
+    # register a short read set — reads missing from the lake, with no error anywhere.
     # The old single COPY had no WHERE and so could not do that. Footer-only count,
     # no data scan.
     written = conn.execute(

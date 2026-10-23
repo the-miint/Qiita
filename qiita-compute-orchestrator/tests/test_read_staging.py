@@ -1,7 +1,7 @@
 """Unit tests for read_staging's per-slot DuckDB caps.
 
 `per_slot_caps` splits a memory budget across `concurrency` in-flight
-samples/runs. Under SLURM the budget is the cgroup; off SLURM the literal is a
+prep_samples/runs. Under SLURM the budget is the cgroup; off SLURM the literal is a
 ceiling bounded by detected host RAM, the same contract as
 `resolve_duckdb_memory_gb` — these tests pin that bound (and its fail-soft).
 """
@@ -68,11 +68,11 @@ def test_under_slurm_detected_ram_is_irrelevant(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# write_sorted_reads: the shared per-sample writer.
+# write_sorted_reads: the shared per-prep_sample writer.
 #   - default mode (sequence_index verbatim): ingest_reads / ingest_ena_reads,
-#     whose intermediate is already per-sample.
-#   - golay mode (ROW_NUMBER + per-sample filter): golay_demux, whose demux
-#     intermediate is pooled and numbered across all samples.
+#     whose intermediate is already per-prep_sample.
+#   - golay mode (ROW_NUMBER + per-prep_sample filter): golay_demux, whose demux
+#     intermediate is pooled and numbered across all prep_samples.
 # ---------------------------------------------------------------------------
 
 _OUT_COLS = [
@@ -132,8 +132,8 @@ def test_write_sorted_reads_default_mode(tmp_path):
 
 
 def test_write_sorted_reads_golay_mode_renumbers_per_sample(tmp_path):
-    """golay's pooled intermediate (numbered across ALL samples) is re-numbered
-    densely 1..count per sample via ROW_NUMBER + a per-sample filter, regardless
+    """golay's pooled intermediate (numbered across ALL prep_samples) is re-numbered
+    densely 1..count per prep_sample via ROW_NUMBER + a per-prep_sample filter, regardless
     of the gappy global sequence_index."""
     src = tmp_path / "demuxed.parquet"
     _write_source(
