@@ -215,7 +215,7 @@ request in flight (up to `QIITA_DP_IDLE_WAIT_S`, default 3900 s, printing
 `waiting for qiita-data-plane@50051 to go idle …` once a minute), and
 restarts the services whose env files are present. The data plane's own
 restart lets requests still running finish, for up to its unit's
-`TimeoutStopSec` (3900 s). See [`docs/deployments.md`](../deployments.md).
+`TimeoutStopSec`. See [`docs/deployments.md`](../deployments.md).
 
 If the migration guard aborts here, you skipped or under-ran the migrate
 step above — run `make migrate` and re-run this command.

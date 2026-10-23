@@ -1355,6 +1355,12 @@ def test_idle_wait_refuses_a_wait_that_is_not_whole_seconds(tmp_path: Path) -> N
     assert calls == []
 
 
+def test_idle_wait_reads_a_leading_zero_as_decimal(tmp_path: Path) -> None:
+    proc, _calls = _run_idle_wait(tmp_path, [1, 0], wait_s="09")
+    assert proc.returncode == 0, proc.stderr
+    assert "up to 9s more" in proc.stderr
+
+
 def test_idle_wait_stops_the_deploy_when_the_catalog_query_fails(tmp_path: Path) -> None:
     """A wait that cannot tell whether the data plane is idle stops the deploy before
     any restart, and names the override."""

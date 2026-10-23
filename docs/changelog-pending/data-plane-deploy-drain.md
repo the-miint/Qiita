@@ -9,8 +9,9 @@
 - **A deploy waits for the data plane to go idle before restarting services (#TBD).**
   `activate.sh` waits, before any service restart, until the data plane has no DoGet
   stream, DoPut or registration in flight, for up to `QIITA_DP_IDLE_WAIT_S` (default 3900
-  s; 0 skips the wait), and then restarts either way. The data plane keeps serving while it
-  waits. So a deploy can now spend up to that long before its restarts, and up to the
+  s; 0 skips the wait), and then restarts whether or not it went idle. The data plane keeps
+  serving while it waits. If the wait cannot query the catalog, the deploy stops before
+  any restart and says to set `QIITA_DP_IDLE_WAIT_S=0`. So a deploy can now spend up to that long before its restarts, and up to the
   unit's stop timeout on the data plane's own restart.
 - **A DoPut upload appears as `upload.parquet` only once it is complete (#TBD).** It is
   written to `upload.parquet.partial` and published when closed; a data plane killed

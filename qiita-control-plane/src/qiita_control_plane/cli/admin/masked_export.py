@@ -52,7 +52,10 @@ DEFAULT_EXPORT_RETRY_SECONDS = 3900.0
 
 def _retry_seconds_arg(value: str) -> float:
     """argparse `type=` for --retry-seconds: a finite number of seconds, 0 or more."""
-    seconds = float(value)
+    try:
+        seconds = float(value)
+    except ValueError:
+        seconds = math.nan
     if not math.isfinite(seconds) or seconds < 0:
         raise argparse.ArgumentTypeError(f"must be a finite number >= 0, got {value!r}")
     return seconds

@@ -530,6 +530,8 @@ wait_for_data_plane_idle() {
             return 1
             ;;
     esac
+    # Base 10, so a leading zero is not read as octal.
+    wait_s=$((10#$wait_s))
     [ -r "$env_file" ] && [ "$wait_s" -gt 0 ] || return 0
     local pid
     pid=$(systemctl show -p MainPID --value "$unit")

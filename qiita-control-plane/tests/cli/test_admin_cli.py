@@ -1111,7 +1111,7 @@ def test_masked_read_export_gives_up_after_retry_seconds(monkeypatch, tmp_path, 
     assert list(out_dir.iterdir()) == []
 
 
-@pytest.mark.parametrize("value", ["-1", "nan", "inf"])
+@pytest.mark.parametrize("value", ["-1", "nan", "inf", "abc"])
 def test_masked_read_export_refuses_a_retry_window_that_is_not_finite_or_is_negative(
     tmp_path, capsys, value
 ):
