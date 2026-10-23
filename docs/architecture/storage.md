@@ -35,6 +35,7 @@ PATH_PERSISTENT/                            durable, backed up
 /scratch/                                   recommended PATH_SCRATCH (and PATH_DERIVED = /scratch/persistent)
   ticket/<work_ticket_idx>/<step>/attempt-<N>/  per-attempt workspace: control-plane runner files; under SLURM also input/params.json, output/ (step outputs), logs/{stdout,stderr}, tmp/; not reclaimed automatically
   staging/uploads/<upload_idx>/upload.parquet   DoPut upload staging; not reclaimed automatically
+  staging/uploads/<upload_idx>/upload.parquet.partial  a DoPut being written; one a killed data plane left is not reclaimed automatically
   duckdb-spill/<host>-<pid>-<random>/       one data-plane connection's DuckDB spill
   references/staging/<name>/<version>/     operator-staged reference source files (docs/reference-data-staging.md)
   persistent/                               shared FS, never auto-deleted; cluster purge exemption requested

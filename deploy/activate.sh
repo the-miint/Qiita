@@ -206,6 +206,12 @@ for dropin_src in "$INCOMING/deploy/systemd/"*.service.d; do
 done
 systemctl daemon-reload
 
+# Wait for the data plane to have nothing in flight before any service restarts:
+# restarting the control plane or orchestrator ends the data-plane calls they have
+# open, and restarting the data plane refuses new requests for as long as its drain
+# runs. See wait_for_data_plane_idle (deploy/_common.sh).
+wait_for_data_plane_idle qiita-data-plane@50051 /etc/qiita/data-plane.env
+
 # Skip restart when env file is absent (first deploy; operator writes envs in runbook steps 1/8b/9a).
 restart_if_env_present() {
     if [ -r "$2" ]; then

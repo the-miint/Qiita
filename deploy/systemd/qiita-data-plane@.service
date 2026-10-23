@@ -18,6 +18,13 @@ Environment=LISTEN_ADDR=127.0.0.1:%i
 EnvironmentFile=/etc/qiita/data-plane.env
 ExecStart=/opt/qiita/data-plane/qiita-data-plane
 Restart=on-failure
+# On SIGTERM the data plane stops accepting connections and exits once the
+# requests already in flight finish (main.rs, drain_signal). A stop or restart
+# waits up to this long for that before SIGKILL, which ends any stream still
+# open. 3900 s is above the longest DoGet streams seen in production
+# (align-denovo, 3,606-3,691 s), so `systemctl restart` in activate.sh can block
+# for that long, and new requests are refused for the whole drain.
+TimeoutStopSec=3900
 
 [Install]
 WantedBy=multi-user.target
