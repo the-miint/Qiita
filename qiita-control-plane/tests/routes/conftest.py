@@ -9,6 +9,7 @@ what a route needs seeded differs per route; teardown does not, and goes
 through the ordered sweep.
 """
 
+import itertools
 import secrets
 import uuid
 from collections.abc import Awaitable, Callable
@@ -1266,3 +1267,28 @@ async def pool_alignment_seed(role_keyed_clients):
     )
     await db.execute("DELETE FROM qiita.sequenced_pool WHERE idx = $1", pool_idx)
     await db.execute("DELETE FROM qiita.sequencing_run WHERE idx = $1", run_idx)
+
+
+# Every one- and two-field subset of a lifecycle row's three provenance fields.
+PARTIAL_PROVENANCE = [
+    pytest.param(subset, id="+".join(subset))
+    for n in (1, 2)
+    for subset in itertools.combinations(("at", "by", "reason"), n)
+]
+
+
+def set_provenance(columns, subset, principal_idx):
+    values = {"at": "now()", "by": str(principal_idx), "reason": "'why'"}
+    return ", ".join(f"{columns[f]} = {values[f]}" for f in subset)
+
+
+DEPRECATION_FIELDS = {
+    "at": "deprecated_at",
+    "by": "deprecated_by_idx",
+    "reason": "deprecation_reason",
+}
+INVALIDATION_FIELDS = {
+    "at": "invalidated_at",
+    "by": "invalidated_by_idx",
+    "reason": "invalidation_reason",
+}

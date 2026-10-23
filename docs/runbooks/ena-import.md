@@ -405,6 +405,19 @@ gaps expected to close soon (except where noted):
   platform string can fail platform mapping for that run alone (isolated, per the
   per-run failure model above) rather than importing correctly. Filling out DDBJ
   coverage is deferred to the backlog.
+- **A non-amplicon run deposited with `library_selection` PCR is refused.** PCR selection
+  marks an amplicon library, so a run whose `library_strategy` is anything but `AMPLICON`
+  (including `RNA-Seq`/transcriptomic) contradicts it. That run fails alone with a
+  `failure_reason` naming the selection; its siblings import. Deposited metadata is not
+  rewritten and the import has no override. Once the depositor corrects the ENA record,
+  a re-import picks the run up. An operator who knows the run is amplicon can instead
+  register it by hand: a biosample carrying the run's `ena_sample_accession` (the import
+  rolled its own back; a later re-import reuses one with that accession), then
+  `POST .../sequenced-sample` with `short_read_amplicon` or `long_read_amplicon` as its
+  `prep_protocol_idx` and the run's `ena_run_accession`, in a new `sequenced_pool` with its
+  own `download-ena-study` ticket, as under "Re-importing" above. #383 tracks inferring the
+  protocol from the reads instead. `RANDOM PCR` and `RT-PCR` are different selections and
+  are not refused.
 - **No ENVO harmonization or free-text host matching.** Free-text environment and host
   fields ENA supplies are kept as study-local text as given; only ENA's numeric
   `tax_id` and `host_tax_id` are cross-referenced to NCBI Taxonomy. Also deferred to the
@@ -446,12 +459,12 @@ data, a 404 from duckdb-miint#312 on, zero reads) does not fail its pool when an
 was stored: the other runs load, the ticket completes, and the failed run is recorded with
 its reason and `permanent` failure type (the item reads `completed_partial`). The ticket
 is COMPLETED, so the submitter gets the work-ticket digest unless they opted out of
-processing emails, and it carries no `failure_reason`; read the batch status for the
-failed runs. If a run failed in a way a retry could clear, the step still fails and
-retries first, and a run that failed permanently is fetched again on each retry, so a
-large one is downloaded again. Any other error fails the step as a whole: out of memory
-retries with more memory, and anything else (a local disk fault) leaves the ticket FAILED
-and redrivable.
+processing emails; the digest row reads `partial: N runs failed` with a pointer to the
+batch status, which lists the failed runs, and the ticket carries no `failure_reason`. If
+a run failed in a way a retry could clear, the step still fails and retries first, and a
+run that failed permanently is fetched again on each retry, so a large one is downloaded
+again. Any other error fails the step as a whole: out of memory retries with more memory,
+and anything else (a local disk fault) leaves the ticket FAILED and redrivable.
 
 When the retries run out, or at once when no run was stored and none of the failures is one
 a retry could clear (a 404 from duckdb-miint#312 on), the ticket is FAILED `permanent` and

@@ -22,7 +22,6 @@ from typing import Any
 import asyncpg
 from qiita_common.actions import (
     ALIGNMENT_IDX_BINDING,
-    WorkflowAction,
     context_schema_default,
 )
 from qiita_common.analytic import MAX_SECONDARY
@@ -46,6 +45,7 @@ from ..repositories.block import (
     create_alignment_sample_pending,
     fetch_mask_sample_state,
 )
+from ._base import _workflow_declares_action
 from ._db import persist_ticket_idx
 from ._upload import _submission_bad_input
 
@@ -96,8 +96,7 @@ def _workflow_writes_alignment_gate(steps: list[Any]) -> bool:
     rather than on the action_id means a workflow gets them exactly when it declares
     it. Mirrors `_processing._workflow_writes_assembly_gate`.
     """
-    gate = LibraryPrimitive.FINALIZE_ALIGNMENT_SAMPLE
-    return any(isinstance(entry, WorkflowAction) and entry.name == gate for entry in steps)
+    return _workflow_declares_action(steps, LibraryPrimitive.FINALIZE_ALIGNMENT_SAMPLE)
 
 
 def _knob_defaults(context_schema: dict[str, Any]) -> dict[str, Any]:

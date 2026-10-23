@@ -12,7 +12,6 @@ one response names them all. `classify_roster` holds the rules and is pure;
 `fetch_roster_facts` gathers what it needs in a fixed number of queries.
 """
 
-from collections import Counter
 from dataclasses import dataclass
 
 import asyncpg
@@ -57,7 +56,7 @@ def _normalized_tube(row: RosterResolveRow) -> str | None:
 
 
 def _resolve_biosample(
-    row: RosterResolveRow, facts: RosterFacts, tube_counts: Counter[str], problems: list[str]
+    row: RosterResolveRow, facts: RosterFacts, problems: list[str]
 ) -> int | None:
     """The row's biosample_idx, or None after appending why to `problems`."""
     if row.matrix_tube_id is None:
@@ -74,14 +73,10 @@ def _resolve_biosample(
     except ValueError as exc:
         problems.append(str(exc))
         return None
-    if tube_counts[tube] > 1:
-        # A technical replicate is a second prep_sample of one biosample, and so
-        # repeats its tube. A tube-keyed roster does not support replicates yet.
-        problems.append(
-            f"matrix tube {tube} appears on {tube_counts[tube]} rows of this roster;"
-            " technical replicates are not supported in a tube-keyed roster"
-        )
-        return None
+    # A tube may repeat across rows: each is a technical replicate — a second
+    # prep_sample of the one biosample the tube names — and resolves to the same
+    # biosample_idx, exactly as a repeated biosample accession does. The rows
+    # stay distinct downstream by their sequenced_pool_item_id, not the tube.
     if tube not in facts.by_tube:
         problems.append(f"no biosample has matrix tube {tube}; register it before submitting")
         return None
@@ -143,12 +138,11 @@ def classify_roster(
     that resolved cleanly, `problems` in request order for the rest. A caller
     refuses the roster when `problems` is non-empty.
     """
-    tube_counts = Counter(t for t in map(_normalized_tube, rows) if t is not None)
     resolved: list[RosterResolvedRow] = []
     problems: list[RosterProblem] = []
     for row in rows:
         row_problems: list[str] = []
-        biosample_idx = _resolve_biosample(row, facts, tube_counts, row_problems)
+        biosample_idx = _resolve_biosample(row, facts, row_problems)
         primary_study_idx = _resolve_primary_study(row, biosample_idx, facts, row_problems)
         # Secondary studies are not checked against the biosample's links, on a
         # tube row as on an accession row: they name the other projects sharing a

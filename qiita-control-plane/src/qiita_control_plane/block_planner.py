@@ -14,7 +14,10 @@ planner:
      arithmetic over `qiita.sequence_range` bounds — no read data touched);
   4. persists the `block` / `block_member` cover-map + a `mask_sample` PENDING
      gate per sample, creates one block `work_ticket` per block, back-fills
-     `block.work_ticket_idx`, and dispatches each.
+     `block.work_ticket_idx`, and dispatches each;
+  5. records each prep_sample that ingest found empty as masked under the mask its
+     own host-filter decision resolves to — there is nothing to tile, and nothing
+     left to mask.
 
 This module holds the PURE tiler (`tile_partition`, unit-testable with no DB) and
 the server-side orchestration (`plan_and_submit_blocks`, DB + data-plane). The
@@ -24,6 +27,7 @@ REST route is the only caller; the CLI reaches it over HTTP.
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Sequence
 from functools import partial
 from typing import TYPE_CHECKING, Any, NamedTuple
@@ -41,10 +45,12 @@ from qiita_common.models import (
     Platform,
 )
 
+from .actions.library import complete_empty_mask_sample_in_tx
 from .dispatch import schedule_dispatch
 from .fanout_dispatch import read_mask_block_cohort, top_up_dispatch
 from .host_filter_resolver import resolve_host_filter_many
 from .repositories.block import (
+    MaskSampleInvalidated,
     add_block_members,
     create_block,
     create_mask_sample_pending,
@@ -52,6 +58,7 @@ from .repositories.block import (
     set_block_work_ticket,
 )
 from .repositories.mask_definition import mint_mask_definition
+from .repositories.sequenced_sample import fetch_empty_ingest_tickets
 from .repositories.sequencing_run import fetch_sequencing_run_platform
 from .runner import (
     AdapterSetHashes,
@@ -63,6 +70,8 @@ from .runner import (
 
 if TYPE_CHECKING:
     from fastapi import FastAPI
+
+_log = logging.getLogger(__name__)
 
 # Target reads per block. A block is one work ticket / SLURM job, so this sets
 # the per-job input size — chosen so QC + host-filter run on a predictable
@@ -183,6 +192,21 @@ class AdapterMaterializationUnavailable(RuntimeError):
     The route maps this to a 503 — a misconfiguration, not a client error."""
 
 
+class BlockPlanSampleGainedReads(RuntimeError):
+    """A prep_sample the plan read as range-less and found empty by its newest ingest
+    had, by the time the plan came to record it as masked, a range minted or a newer
+    ingest submitted. The plan rolls back; planning the pool again tiles the new reads
+    or leaves the prep_sample to the newer ingest. The route maps this to 409."""
+
+    def __init__(self, *, prep_sample_idx: int, sequenced_pool_idx: int):
+        self.prep_sample_idx = prep_sample_idx
+        super().__init__(
+            f"prep_sample {prep_sample_idx} gained stored reads, or had a newer ingest"
+            f" submitted, while sequenced_pool {sequenced_pool_idx} was being planned;"
+            " plan the pool again"
+        )
+
+
 class BlockMaskResubmitError(RuntimeError):
     """One or more requested samples already carry a `mask_sample` gate for their
     resolved mask, so a fresh (`only_missing=False`) plan is refused:
@@ -280,14 +304,23 @@ class _PlanSample(NamedTuple):
     sample_range: SampleRange
 
 
+class _RangelessSample(NamedTuple):
+    """A pool prep_sample with no stored reads: nothing to tile, but it resolves a
+    mask the same way a `_PlanSample` does."""
+
+    prep_sample_idx: int
+    biosample_idx: int
+    prep_protocol_idx: int | None
+
+
 async def _enumerate_pool_samples(
     conn: asyncpg.Connection | asyncpg.Pool, sequenced_pool_idx: int
-) -> list[_PlanSample]:
-    """The pool's ACTIVE sequenced samples that have stored reads (a
-    sequence_range), with the prep_protocol_idx that feeds the mask identity.
-    Samples without a sequence_range (reads never ingested) are excluded — there
-    is nothing to tile — and reported separately by the caller. Retired
-    prep_samples are excluded too (`ps.retired = false`), matching the per-sample
+) -> tuple[list[_PlanSample], list[_RangelessSample]]:
+    """The pool's ACTIVE sequenced samples, with the prep_protocol_idx that feeds the
+    mask identity, split by whether they have stored reads (a sequence_range) — one
+    read, so a range minted mid-plan cannot leave a sample in neither list. Only a
+    sample with reads can be tiled; the caller decides what a range-less one is.
+    Retired prep_samples are excluded (`ps.retired = false`), matching the per-sample
     roster query fetch_sequenced_pool_samples that submit-host-filter-pool + the
     pool status endpoints use — the block plan must not re-mask a retired sample.
     A flagged sequenced_sample (`ena_status IS NOT NULL`) is excluded the same
@@ -299,23 +332,35 @@ async def _enumerate_pool_samples(
         "       sr.sequence_idx_start, sr.sequence_idx_stop"
         "  FROM qiita.sequenced_sample ss"
         "  JOIN qiita.prep_sample ps ON ps.idx = ss.prep_sample_idx"
-        "  JOIN qiita.sequence_range sr ON sr.prep_sample_idx = ss.prep_sample_idx"
+        "  LEFT JOIN qiita.sequence_range sr ON sr.prep_sample_idx = ss.prep_sample_idx"
         " WHERE ss.sequenced_pool_idx = $1"
         "   AND ps.retired = false"
         "   AND ss.ena_status IS NULL",
         sequenced_pool_idx,
     )
-    return [
-        _PlanSample(
-            prep_sample_idx=r["prep_sample_idx"],
-            biosample_idx=r["biosample_idx"],
-            prep_protocol_idx=r["prep_protocol_idx"],
-            sample_range=SampleRange(
-                r["prep_sample_idx"], r["sequence_idx_start"], r["sequence_idx_stop"]
-            ),
-        )
-        for r in rows
-    ]
+    ranged: list[_PlanSample] = []
+    rangeless: list[_RangelessSample] = []
+    for r in rows:
+        if r["sequence_idx_start"] is None:
+            rangeless.append(
+                _RangelessSample(
+                    prep_sample_idx=r["prep_sample_idx"],
+                    biosample_idx=r["biosample_idx"],
+                    prep_protocol_idx=r["prep_protocol_idx"],
+                )
+            )
+        else:
+            ranged.append(
+                _PlanSample(
+                    prep_sample_idx=r["prep_sample_idx"],
+                    biosample_idx=r["biosample_idx"],
+                    prep_protocol_idx=r["prep_protocol_idx"],
+                    sample_range=SampleRange(
+                        r["prep_sample_idx"], r["sequence_idx_start"], r["sequence_idx_stop"]
+                    ),
+                )
+            )
+    return ranged, rangeless
 
 
 class PoolHostFilterRefusal(RuntimeError):
@@ -354,7 +399,7 @@ class HostReferenceNotReady(RuntimeError):
 async def resolve_pool_sample_decisions(
     pool: asyncpg.Pool,
     *,
-    samples: Sequence[_PlanSample],
+    samples: Sequence[_PlanSample | _RangelessSample],
     platform: Platform,
     force_decision: SampleHostFilter | None,
 ) -> dict[int, SampleHostFilter]:
@@ -538,9 +583,17 @@ async def plan_and_submit_blocks(
     reference that is not built raises `HostReferenceNotReady` — both before any
     mask is minted.
 
+    A sample without a sequence_range has nothing to tile. When ingest found it empty
+    it still resolves a mask like any other sample, and the same transaction records
+    it as masked under that mask (`complete_empty_mask_sample_in_tx`), counted in
+    `samples_completed_empty`; one whose gate was withdrawn is left so and counted in
+    `samples_skipped_invalidated`. Any other range-less sample, whose newest ingest
+    does not show it empty or which has none, is counted in `samples_skipped_no_reads`.
+    One that gains a range or a newer ingest mid-plan raises
+    `BlockPlanSampleGainedReads`.
+
     Returns a JSON-able summary (partitions with their host refs, blocks + their
-    tickets, counts). Raises asyncpg errors on a genuine DB fault (fail loud); a
-    sample without a sequence_range is reported in `samples_skipped_no_reads`.
+    tickets, counts). Raises asyncpg errors on a genuine DB fault (fail loud).
     """
     # platform is the resolver's second input; instrument_model gates QC's polyG
     # and is part of the mask identity. Both are pool-constant, read once.
@@ -550,31 +603,33 @@ async def plan_and_submit_blocks(
         sequencing_run_idx,
     )
 
-    all_samples = await _enumerate_pool_samples(pool, sequenced_pool_idx)
+    all_samples, rangeless = await _enumerate_pool_samples(pool, sequenced_pool_idx)
+    # Range-less samples: the ones ingest found empty are masked below; the count of
+    # the rest (their newest ingest does not show them empty, or they have none) is
+    # reported so the operator sees the gap rather than a silent drop.
+    found_empty = await fetch_empty_ingest_tickets(
+        pool, prep_sample_idxs=[r.prep_sample_idx for r in rangeless], current_work_ticket_idx=None
+    )
+    # Ascending, the order lock_prep_sample_range asks of a many-key caller.
+    empty_samples = sorted(
+        (r for r in rangeless if r.prep_sample_idx in found_empty),
+        key=lambda r: r.prep_sample_idx,
+    )
+    skipped_no_reads = len(rangeless) - len(empty_samples)
 
     # Per-sample host-filter decision (keyed by prep_sample_idx). Refuses an
     # UNRESOLVED / multi-host pool up front; `force_decision` bypasses resolution.
+    # An empty sample is resolved with the rest: its mask is the one a block over it
+    # would carry.
     decision_by_prep_sample = await resolve_pool_sample_decisions(
-        pool, samples=all_samples, platform=platform, force_decision=force_decision
+        pool,
+        samples=[*all_samples, *empty_samples],
+        platform=platform,
+        force_decision=force_decision,
     )
     # Preflight the references the plan resolved to — one actionable error instead
     # of a whole plan's worth of failed blocks.
     await _assert_pool_references_ready(pool, list(decision_by_prep_sample.values()))
-
-    # ACTIVE pool samples whose reads were never ingested (no sequence_range)
-    # can't be tiled — report them so the operator sees the gap rather than a
-    # silent drop. Retired and flagged samples are excluded (they are not
-    # planned at all), so this count matches the active set
-    # _enumerate_pool_samples draws from.
-    skipped_no_reads = await pool.fetchval(
-        "SELECT count(*) FROM qiita.sequenced_sample ss"
-        "  JOIN qiita.prep_sample ps ON ps.idx = ss.prep_sample_idx"
-        "  LEFT JOIN qiita.sequence_range sr ON sr.prep_sample_idx = ss.prep_sample_idx"
-        " WHERE ss.sequenced_pool_idx = $1 AND ps.retired = false"
-        "   AND ss.ena_status IS NULL"
-        "   AND sr.prep_sample_idx IS NULL",
-        sequenced_pool_idx,
-    )
 
     # Mint mask_idx per sample. The identity now depends on BOTH the prep_protocol
     # AND the sample's resolved host-filter decision, so memoize by that pair — one
@@ -585,7 +640,7 @@ async def plan_and_submit_blocks(
     decision_by_mask: dict[int, SampleHostFilter] = {}
     mask_by_key: dict[tuple[int | None, SampleHostFilter], int] = {}
     async with pool.acquire() as conn:
-        for s in all_samples:
+        for s in [*all_samples, *empty_samples]:
             decision = decision_by_prep_sample[s.prep_sample_idx]
             key = (s.prep_protocol_idx, decision)
             mask_idx = mask_by_key.get(key)
@@ -647,8 +702,13 @@ async def plan_and_submit_blocks(
         # atomic w.r.t. the per-sample finalize_mask_sample_gate writer (which takes
         # the same lock). Sorted acquisition avoids deadlock between two concurrent
         # plans over overlapping samples. (contract: lock_mask_sample_gate_advisory.)
+        # The empty samples' locks are taken in the same sorted pass; their gate
+        # write below takes each again, which an advisory lock allows, and then each
+        # prep_sample's range lock, in ascending order, after every gate lock here
+        # (`complete_empty_mask_sample_in_tx` says why).
         for lock_mask_idx, lock_prep_sample_idx in sorted(
-            (mask_by_prep_sample[s.prep_sample_idx], s.prep_sample_idx) for s in to_plan
+            (mask_by_prep_sample[s.prep_sample_idx], s.prep_sample_idx)
+            for s in [*to_plan, *empty_samples]
         ):
             await lock_mask_sample_gate_advisory(
                 conn, mask_idx=lock_mask_idx, prep_sample_idx=lock_prep_sample_idx
@@ -749,6 +809,38 @@ async def plan_and_submit_blocks(
                 }
             )
 
+        # The samples ingest found empty: masked under their resolved mask with an
+        # empty pass-set. Idempotent, so a re-plan re-affirms them rather than
+        # refusing. A savepoint each, so a withdrawn gate row rolls back only its own
+        # sample's writes.
+        completed_empty = 0
+        invalidated_empty: list[int] = []
+        for e in empty_samples:
+            try:
+                async with conn.transaction():
+                    proof = await complete_empty_mask_sample_in_tx(
+                        conn,
+                        mask_idx=mask_by_prep_sample[e.prep_sample_idx],
+                        prep_sample_idx=e.prep_sample_idx,
+                        current_work_ticket_idx=None,
+                    )
+            except MaskSampleInvalidated:
+                invalidated_empty.append(e.prep_sample_idx)
+                continue
+            if proof is None:
+                raise BlockPlanSampleGainedReads(
+                    prep_sample_idx=e.prep_sample_idx, sequenced_pool_idx=sequenced_pool_idx
+                )
+            completed_empty += 1
+
+    if invalidated_empty:
+        _log.warning(
+            "block plan for sequenced_pool %d: prep_sample(s) %s were found empty at ingest"
+            " but their mask_sample gate is 'invalidated'; left as is",
+            sequenced_pool_idx,
+            invalidated_empty,
+        )
+
     # Every block ticket was INSERTed `dispatch_held`; the pump releases up to
     # FANOUT_MAX_INFLIGHT per mask-partition cohort and refills as each block
     # finishes (dispatch._run_and_log completion hook). Post-commit, so a
@@ -769,6 +861,8 @@ async def plan_and_submit_blocks(
         "samples_planned": len(to_plan),
         "samples_skipped_existing": skipped_existing,
         "samples_skipped_no_reads": skipped_no_reads,
+        "samples_completed_empty": completed_empty,
+        "samples_skipped_invalidated": len(invalidated_empty),
         "partitions": partition_summaries,
         "blocks": block_summaries,
         "blocks_created": len(block_summaries),

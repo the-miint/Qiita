@@ -16,10 +16,33 @@ from uuid import uuid4
 
 import asyncpg
 import pytest
+from qiita_common.models import FailureType
 
+from qiita_control_plane.ena_import.submit import (
+    DOWNLOAD_ENA_STUDY_ACTION_ID,
+    DOWNLOAD_ENA_STUDY_ACTION_VERSION,
+)
 from qiita_control_plane.notify import sweep_once
 from qiita_control_plane.notify.transport import CaptureTransport, RenderedEmail
-from qiita_control_plane.testing.db_seeds import seed_service_principal, seed_user_principal
+from qiita_control_plane.repositories.ena_import_batch import (
+    append_ena_import_batch_item_download_ticket,
+    insert_ena_import_batch,
+    insert_ena_import_batch_item,
+)
+from qiita_control_plane.repositories.sequence_range import mint_sequence_range
+from qiita_control_plane.testing.db_seeds import (
+    delete_action_if_created,
+    seed_action_if_absent,
+    seed_biosample_with_sequenced_prep_sample,
+    seed_sequenced_sample_subtype,
+    seed_service_principal,
+    seed_user_principal,
+)
+from qiita_control_plane.testing.db_teardown import (
+    delete_idxs,
+    teardown_entity_graph,
+)
+from qiita_control_plane.testing.unique_names import unique_ena_accession
 
 pytestmark = pytest.mark.db
 
@@ -606,3 +629,96 @@ async def test_receipt_row_correctness(env):
     assert r["transport"] == "capture"
     assert r["provider_message_id"]
     assert len(r["template_sha"]) == 64
+
+
+async def test_digest_flags_a_partially_landed_download_ticket(env):
+    pool = env.pool
+    user = await env.user()
+    created = await seed_action_if_absent(
+        pool,
+        action_id=DOWNLOAD_ENA_STUDY_ACTION_ID,
+        version=DOWNLOAD_ENA_STUDY_ACTION_VERSION,
+        target_kind="sequenced_pool",
+    )
+    graphs = []
+    run_idx = pool_idx = batch_idx = None
+    try:
+        for stored in (True, False):
+            biosample_idx, prep_sample_idx = await seed_biosample_with_sequenced_prep_sample(
+                pool, owner_idx=user
+            )
+            graphs.append((biosample_idx, prep_sample_idx))
+            run_idx, pool_idx, _ = await seed_sequenced_sample_subtype(
+                pool,
+                prep_sample_idx=prep_sample_idx,
+                owner_idx=user,
+                sequenced_pool_item_id=f"item-{uuid4().hex[:8]}",
+                sequencing_run_idx=run_idx,
+                sequenced_pool_idx=pool_idx,
+            )
+            if stored:
+                await mint_sequence_range(
+                    pool,
+                    prep_sample_idx=prep_sample_idx,
+                    count=10,
+                    principal_idx=user,
+                    work_ticket_idx=None,
+                )
+            else:
+                await pool.execute(
+                    "UPDATE qiita.sequenced_sample SET download_failure_reason = 'no data',"
+                    " download_failure_type = $2 WHERE prep_sample_idx = $1",
+                    prep_sample_idx,
+                    FailureType.PERMANENT.value,
+                )
+        wt = await pool.fetchval(
+            "INSERT INTO qiita.work_ticket"
+            " (action_id, action_version, originator_principal_idx, scope_target_kind,"
+            "  sequenced_pool_idx, state)"
+            " VALUES ($1, $2, $3, 'sequenced_pool'::qiita.scope_target_kind, $4,"
+            "         'completed'::qiita.work_ticket_state)"
+            " RETURNING work_ticket_idx",
+            DOWNLOAD_ENA_STUDY_ACTION_ID,
+            DOWNLOAD_ENA_STUDY_ACTION_VERSION,
+            user,
+            pool_idx,
+        )
+        async with pool.acquire() as conn, conn.transaction():
+            batch_idx = await insert_ena_import_batch(conn, submitted_by_principal_idx=user)
+            item_idx = await insert_ena_import_batch_item(
+                conn, batch_idx=batch_idx, ena_study_accession=unique_ena_accession("PRJNA")
+            )
+            await append_ena_import_batch_item_download_ticket(
+                conn, item_idx=item_idx, ticket_idx=wt
+            )
+        lo, hi = await env.minmax([wt])
+        transport = CaptureTransport()
+
+        await sweep_once(pool, _settings(), transport, now=hi + timedelta(seconds=200))
+
+        (_to, rendered, _mid) = transport.sent[0]
+        assert (
+            f"  - ticket {wt}: download-ena-study 1.0.0 -> completed,"
+            f" partial: 1 run failed (see qiita ena-import-status {batch_idx})"
+        ) in rendered.text.splitlines()
+        (receipt,) = await env.receipts_for(user)
+        ctx = json.loads(receipt["template_context"])
+        assert ctx["partial_downloads"] == [{"idx": wt, "failed_runs": 1, "batch_idx": batch_idx}]
+    finally:
+        await pool.execute("DELETE FROM qiita.work_ticket WHERE sequenced_pool_idx = $1", pool_idx)
+        if batch_idx is not None:
+            await delete_idxs(pool, "ena_import_batch", [batch_idx])
+        await teardown_entity_graph(
+            pool,
+            study_idxs=[],
+            biosample_idxs=[b for b, _ in graphs],
+            prep_sample_idxs=[p for _, p in graphs],
+        )
+        await delete_idxs(pool, "sequenced_pool", pool_idx)
+        await delete_idxs(pool, "sequencing_run", run_idx)
+        await delete_action_if_created(
+            pool,
+            action_id=DOWNLOAD_ENA_STUDY_ACTION_ID,
+            version=DOWNLOAD_ENA_STUDY_ACTION_VERSION,
+            created=created,
+        )

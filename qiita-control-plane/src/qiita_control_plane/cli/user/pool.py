@@ -13,7 +13,11 @@ from pathlib import Path
 from typing import Any, NamedTuple
 
 import httpx
-from qiita_common.actions import READ_MASK_ACTION_ID
+from qiita_common.actions import (
+    BCL_CONVERT_ACTION_ID,
+    BCL_CONVERT_SAMPLE_MAP_KEY,
+    READ_MASK_ACTION_ID,
+)
 from qiita_common.api_paths import (
     PATH_BIOSAMPLE_PREFIX,
     PATH_BIOSAMPLE_RESOLVE_ROSTER,
@@ -60,11 +64,11 @@ from ...preflight import SHEET_TYPE_PACBIO_ABSQUANT
 from .. import _common
 from ._helpers import _inspect_run_folder, _load_preflight_conn, _refuse_malformed_accessions
 
-# action_id + version for the bundled bcl-convert submission flow. Pinned
-# here so the CLI does not drift from the workflow YAML the operator's
-# deploy syncs into qiita.action; bumping the workflow major version is a
-# coordinated change.
-_BCL_CONVERT_ACTION_ID = "bcl-convert"
+# The bundled bcl-convert submission flow's action_id. Its version, below, is pinned
+# here so it does not drift from the workflow YAML the operator's deploy
+# syncs into qiita.action; bumping the workflow major version is a coordinated
+# change.
+_BCL_CONVERT_ACTION_ID = BCL_CONVERT_ACTION_ID
 
 _BCL_CONVERT_ACTION_VERSION = "1.0.0"
 
@@ -507,7 +511,7 @@ def _handle_submit_bcl_convert(args: argparse.Namespace, parser: argparse.Argume
                 # argument — the submit gate normalizes too, so storing the
                 # resolved value keeps the two spellings from diverging.
                 "bcl_input_dir": inspected.path,
-                "sample_map": sample_map,
+                BCL_CONVERT_SAMPLE_MAP_KEY: sample_map,
             },
             force=args.force,
         ).model_dump(exclude_unset=True, mode="json")
@@ -917,8 +921,9 @@ def _handle_submit_host_filter_pool(
     way an un-caught raise would. The summary lists every submitted and every
     failed sample, and the command exits non-zero if any sample failed, so a
     partial fan-out is visible and re-runnable rather than silent. A sample
-    whose reads were never stored fails its own ticket at the runner's
-    staged-read resolution (and shows up in the per-sample summary, not here).
+    with no stored reads ends its own ticket at the runner's staged-read
+    resolution: `no_data` when ingest found it empty or it is an expected-empty
+    control, failed otherwise (it shows up in the per-sample summary, not here).
 
     `--only-missing` skips samples that already have a read-mask ticket (any
     state, via the roster's has_read_mask_ticket flag), submitting only those

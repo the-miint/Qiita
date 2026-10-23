@@ -351,20 +351,10 @@ async def plan_and_submit_alignments(
     # registered after the shard assignment stamped these rows.
     shard_ids = await reference_shard_ids(pool, reference_idx)
 
-    all_samples = await _enumerate_pool_samples(pool, sequenced_pool_idx)
-
-    # ACTIVE pool samples whose reads were never ingested (no sequence_range) can't
-    # be tiled — report them (mirrors block_planner). Retired and flagged samples
-    # are already excluded from all_samples, so this count matches the active set.
-    skipped_no_reads = await pool.fetchval(
-        "SELECT count(*) FROM qiita.sequenced_sample ss"
-        "  JOIN qiita.prep_sample ps ON ps.idx = ss.prep_sample_idx"
-        "  LEFT JOIN qiita.sequence_range sr ON sr.prep_sample_idx = ss.prep_sample_idx"
-        " WHERE ss.sequenced_pool_idx = $1 AND ps.retired = false"
-        "   AND ss.ena_status IS NULL"
-        "   AND sr.prep_sample_idx IS NULL",
-        sequenced_pool_idx,
-    )
+    # ACTIVE pool samples with no stored reads (no sequence_range) have nothing to
+    # align, whether ingest found them empty or never read them — report them.
+    all_samples, rangeless = await _enumerate_pool_samples(pool, sequenced_pool_idx)
+    skipped_no_reads = len(rangeless)
 
     # Which of the pool's samples are masked under the caller-named mask_idx, and in
     # what gate state? Alignment does NOT re-derive the mask config — the caller

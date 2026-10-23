@@ -13,6 +13,7 @@ import secrets
 import asyncpg
 import pytest
 import pytest_asyncio
+from qiita_common.models import FailureType
 from qiita_common.models.ena_import import BatchItemState
 
 from qiita_control_plane.repositories.ena_import_batch import (
@@ -21,6 +22,7 @@ from qiita_control_plane.repositories.ena_import_batch import (
     ena_import_created_study,
     fetch_ena_import_batch_items,
     fetch_inflight_ena_import_batch_items,
+    fetch_partial_download_counts,
     fetch_pool_latest_download_ticket,
     fetch_sequenced_pool_download_states,
     fetch_work_ticket_states_for_idxs,
@@ -31,6 +33,7 @@ from qiita_control_plane.repositories.ena_import_batch import (
     update_ena_import_batch_item_state,
     update_ena_import_batch_item_study_created,
 )
+from qiita_control_plane.repositories.sequence_range import mint_sequence_range
 from qiita_control_plane.repositories.study import create_study
 from qiita_control_plane.testing.db_seeds import (
     delete_action_if_created,
@@ -443,6 +446,156 @@ async def test_fetch_sequenced_pool_download_states_reports_latest_ticket(sequen
         await ctx["pool"].execute(
             "DELETE FROM qiita.work_ticket WHERE work_ticket_idx = ANY($1::bigint[])",
             [older_idx, latest_idx],
+        )
+
+
+async def _add_run(ctx, graphs, *, stored: bool = False, failed: bool = False) -> None:
+    pool = ctx["pool"]
+    biosample_idx, prep_sample_idx = await seed_biosample_with_sequenced_prep_sample(
+        pool, owner_idx=ctx["principal_idx"]
+    )
+    graphs.append((biosample_idx, prep_sample_idx))
+    await seed_sequenced_sample_subtype(
+        pool,
+        prep_sample_idx=prep_sample_idx,
+        owner_idx=ctx["principal_idx"],
+        sequenced_pool_item_id=f"item-{secrets.token_hex(4)}",
+        sequencing_run_idx=ctx["sequencing_run_idx"],
+        sequenced_pool_idx=ctx["sequenced_pool_idx"],
+    )
+    if stored:
+        await mint_sequence_range(
+            pool,
+            prep_sample_idx=prep_sample_idx,
+            count=10,
+            principal_idx=ctx["principal_idx"],
+            work_ticket_idx=None,
+        )
+    if failed:
+        await pool.execute(
+            "UPDATE qiita.sequenced_sample"
+            " SET download_failure_reason = 'no sequence data', download_failure_type = $2"
+            " WHERE prep_sample_idx = $1",
+            prep_sample_idx,
+            FailureType.PERMANENT.value,
+        )
+
+
+async def test_fetch_partial_download_counts_counts_failed_runs_without_reads(
+    sequenced_pool_ctx, eib
+):
+    ctx = sequenced_pool_ctx
+    graphs: list[tuple[int, int]] = []
+    ticket_idx = await _seed_work_ticket(ctx, state="completed")
+    try:
+        await _add_run(ctx, graphs, stored=True)
+        await _add_run(ctx, graphs, failed=True)
+        await _add_run(ctx, graphs, failed=True)
+        await _add_run(ctx, graphs, stored=True, failed=True)
+        older_batch, older_item = await _new_batch_item(eib)
+        newer_batch, newer_item = await _new_batch_item(eib)
+        async with ctx["pool"].acquire() as conn:
+            for item_idx in (older_item, newer_item):
+                await append_ena_import_batch_item_download_ticket(
+                    conn, item_idx=item_idx, ticket_idx=ticket_idx
+                )
+
+        counts = await fetch_partial_download_counts(ctx["pool"], ticket_idxs=[ticket_idx])
+
+        assert counts == {ticket_idx: (2, newer_batch)}
+        assert newer_batch > older_batch
+    finally:
+        await ctx["pool"].execute(
+            "DELETE FROM qiita.work_ticket WHERE work_ticket_idx = $1", ticket_idx
+        )
+        await teardown_entity_graph(
+            ctx["pool"],
+            study_idxs=[],
+            biosample_idxs=[b for b, _ in graphs],
+            prep_sample_idxs=[p for _, p in graphs],
+        )
+
+
+async def test_fetch_partial_download_counts_has_no_batch_when_no_item_names_the_ticket(
+    sequenced_pool_ctx,
+):
+    ctx = sequenced_pool_ctx
+    graphs: list[tuple[int, int]] = []
+    ticket_idx = await _seed_work_ticket(ctx, state="completed")
+    try:
+        await _add_run(ctx, graphs, failed=True)
+
+        counts = await fetch_partial_download_counts(ctx["pool"], ticket_idxs=[ticket_idx])
+
+        assert counts == {ticket_idx: (1, None)}
+    finally:
+        await ctx["pool"].execute(
+            "DELETE FROM qiita.work_ticket WHERE work_ticket_idx = $1", ticket_idx
+        )
+        await teardown_entity_graph(
+            ctx["pool"],
+            study_idxs=[],
+            biosample_idxs=[b for b, _ in graphs],
+            prep_sample_idxs=[p for _, p in graphs],
+        )
+
+
+async def test_fetch_partial_download_counts_reports_only_the_pools_newest_completed_ticket(
+    sequenced_pool_ctx,
+):
+    ctx = sequenced_pool_ctx
+    graphs: list[tuple[int, int]] = []
+    older_idx = await _seed_work_ticket(ctx, state="completed")
+    newer_idx = await _seed_work_ticket(ctx, state="completed")
+    try:
+        await _add_run(ctx, graphs, failed=True)
+
+        counts = await fetch_partial_download_counts(
+            ctx["pool"], ticket_idxs=[older_idx, newer_idx]
+        )
+
+        assert counts == {newer_idx: (1, None)}
+    finally:
+        await ctx["pool"].execute(
+            "DELETE FROM qiita.work_ticket WHERE work_ticket_idx = ANY($1::bigint[])",
+            [older_idx, newer_idx],
+        )
+        await teardown_entity_graph(
+            ctx["pool"],
+            study_idxs=[],
+            biosample_idxs=[b for b, _ in graphs],
+            prep_sample_idxs=[p for _, p in graphs],
+        )
+
+
+async def test_fetch_partial_download_counts_skips_fully_landed_and_unfinished_tickets(
+    sequenced_pool_ctx,
+):
+    ctx = sequenced_pool_ctx
+    graphs: list[tuple[int, int]] = []
+    landed_idx = await _seed_work_ticket(ctx, state="completed")
+    running_idx = await _seed_work_ticket(ctx, state="pending")
+    try:
+        await _add_run(ctx, graphs, stored=True)
+        assert (
+            await fetch_partial_download_counts(ctx["pool"], ticket_idxs=[landed_idx, running_idx])
+            == {}
+        )
+
+        await _add_run(ctx, graphs, failed=True)
+        assert await fetch_partial_download_counts(
+            ctx["pool"], ticket_idxs=[landed_idx, running_idx]
+        ) == {landed_idx: (1, None)}
+    finally:
+        await ctx["pool"].execute(
+            "DELETE FROM qiita.work_ticket WHERE work_ticket_idx = ANY($1::bigint[])",
+            [landed_idx, running_idx],
+        )
+        await teardown_entity_graph(
+            ctx["pool"],
+            study_idxs=[],
+            biosample_idxs=[b for b, _ in graphs],
+            prep_sample_idxs=[p for _, p in graphs],
         )
 
 
