@@ -46,6 +46,10 @@ FGS_ERROR='Error running FragGeneScan.'
 
 work=$(mktemp -d)
 trap 'rm -rf "${work}"' EXIT
+# MaxBin2 writes a tmp_<N> file into the working directory before calling
+# FragGeneScan, and %test starts in the read-only image, where that write fails
+# and FragGeneScan never runs at either cut.
+cd "${work}"
 
 # The fixture: a random contig of min_len bp, and single-end 150 bp reads starting
 # every 40 bp along it, so every binner has coverage to work with.
