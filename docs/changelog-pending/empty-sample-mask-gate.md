@@ -1,7 +1,7 @@
 ### Fixed
 
 - **A prep_sample whose reads came back empty at ingest no longer blocks its pool's
-  masked-read export (#fix/empty-sample-mask-gate).** A BAM or FASTQ with no reads, or an
+  masked-read export (#761).** A BAM or FASTQ with no reads, or an
   empty well on an Illumina plate, left the prep_sample with no record that it was
   masked under the pool's mask. Its `read-mask` ticket failed with "no stored reads …
   must be ingested", and `qiita-admin masked-read-export` refused the whole pool. Such a
@@ -19,7 +19,7 @@
 ### Changed
 
 - **The block-mask plan response reports empty prep_samples
-  (#fix/empty-sample-mask-gate).** `POST …/block-mask-plan` returns two new counts:
+  (#761).** `POST …/block-mask-plan` returns two new counts:
   - `samples_completed_empty`: prep_samples that ingest found empty, recorded as
     masked.
   - `samples_skipped_invalidated`: empty prep_samples whose masking was withdrawn
@@ -29,5 +29,5 @@
   ingest record. The plan answers 409 when a prep_sample gains reads while it runs;
   planning again picks them up.
 - **A `read-mask` ticket that fails for want of reads now carries its `mask_idx`
-  (#fix/empty-sample-mask-gate)**, so `qiita mask samples` lists the prep_sample
+  (#761)**, so `qiita mask samples` lists the prep_sample
   instead of leaving it out.
