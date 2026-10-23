@@ -52,6 +52,30 @@ if [[ ! -s "${NOLCG}" ]]; then
     exit 0
 fi
 
+# metaWRAP's -l. MaxBin2 receives it as its minimum contig length and keeps a contig
+# whose length equals it. With no contig at or above it, MetaBAT2 forms no bins,
+# MaxBin2 runs FragGeneScan on an empty file and reports "Error running FragGeneScan",
+# and metaWRAP exits 1 before CONCOCT runs; a retry reproduces it. Measured on this
+# image's solve (metawrap-mg 1.3.0, maxbin2 2.2.7, metabat2 2.15, fraggenescan 1.32):
+# one 15,846 bp contig at -l 16000 and -l 15847 took that path, and at -l 15846 and
+# -l 15000 MaxBin2 kept the contig and reached the marker-gene verdict matched at the
+# metaWRAP call below. So the step finishes with no bins without running metaWRAP,
+# and before staging the reads and the BAM, as the empty-noLCG exit above does.
+#
+# The lengths come from samtools faidx's .fai. faidx writes it next to the FASTA and
+# genomes_dir is a read-only bind, so index a WORK copy rather than noLCG in place;
+# the reorder below reads the same copy. Counted with awk for the reason given at
+# the n_ordered count below.
+cp "${NOLCG}" "${WORK}/assembly.fa"
+micromamba run -n metawrap samtools faidx "${WORK}/assembly.fa"
+MIN_CONTIG_LEN=16000
+n_binnable=$(awk -v min="${MIN_CONTIG_LEN}" '$2 >= min {n++} END {print n+0}' "${WORK}/assembly.fa.fai")
+if (( n_binnable == 0 )); then
+    echo "binning: no contig is at least ${MIN_CONTIG_LEN} bp, metaWRAP's minimum contig length; finishing with no bins." >&2
+    qiita_finish bins_dir=bins
+    exit 0
+fi
+
 # metaWRAP's --single-end wants a plain (uncompressed) .fastq path.
 # One stem for both the FASTQ and the staged BAM. metaWRAP derives its `sample`
 # from the reads filename, then looks for work_files/<sample>.bam — so these two
@@ -147,8 +171,7 @@ mv "${STAGED_BAM}" "${WORK_FILES}/${READS_STEM}.bam"
 # delivered a *defined* order, not a steerable one), or the assembler emitting
 # contigs in name order. docs/duckdb-miint.md's "Open upstream gaps" carries it.
 #
-# samtools faidx writes its .fai next to the FASTA and genomes_dir is a read-only
-# bind, so index a WORK copy rather than noLCG in place. xargs batches the ~21k
+# The WORK copy and its .fai are from the length check above. xargs batches the ~21k
 # region names under ARG_MAX; faidx emits regions in argument order and xargs
 # preserves order across batches, so the output follows @SQ order exactly. (samtools
 # 1.10 has no `-r region-file`; xargs is the version-safe equivalent.)
@@ -167,8 +190,6 @@ mv "${STAGED_BAM}" "${WORK_FILES}/${READS_STEM}.bam"
 STAGED_ORDER="${WORK}/sq_order.txt"
 micromamba run -n metawrap samtools view -H "${WORK_FILES}/${READS_STEM}.bam" \
     | awk '/^@SQ/{sub(/.*SN:/,"");sub(/\t.*/,"");print}' > "${STAGED_ORDER}"
-cp "${NOLCG}" "${WORK}/assembly.fa"
-micromamba run -n metawrap samtools faidx "${WORK}/assembly.fa"
 ORDERED_NOLCG="${WORK}/assembly.ordered.fa"
 xargs --no-run-if-empty -a "${STAGED_ORDER}" \
     micromamba run -n metawrap samtools faidx "${WORK}/assembly.fa" > "${ORDERED_NOLCG}"
@@ -208,25 +229,6 @@ if (( METAWRAP_MEM_GB < 1 )); then
     echo "         ${METAWRAP_HEADROOM_GB} GB of headroom. The SLURM payload sets QIITA_MEM_MB;" >&2
     echo "         to run outside it, export QIITA_MEM_MB as the memory available in MB." >&2
     exit 78
-fi
-
-# metaWRAP's -l. It reaches MetaBAT2 as minContig and MaxBin2 as its minimum contig
-# length, and both keep a contig whose length equals it. With no contig at or above
-# it, MetaBAT2 forms no bins, MaxBin2 runs FragGeneScan on an empty file and reports
-# "Error running FragGeneScan", and metaWRAP exits 1 before CONCOCT runs; a retry
-# reproduces it. Measured on this image's solve (metawrap-mg 1.3.0, maxbin2 2.2.7,
-# metabat2 2.15, fraggenescan 1.32): one 15,846 bp contig at -l 16000 and -l 15847
-# took that path, and at -l 15846 and -l 15000 MaxBin2 kept the contig and reached
-# the marker-gene verdict matched below. So the step finishes with no bins without
-# running metaWRAP. The lengths come from the .fai the reorder above wrote; a count
-# rather than an awk exit status, so an unreadable .fai aborts under set -e instead of
-# reading as no contig.
-MIN_CONTIG_LEN=16000
-n_binnable=$(awk -v min="${MIN_CONTIG_LEN}" '$2 >= min {n++} END {print n+0}' "${WORK}/assembly.fa.fai")
-if (( n_binnable == 0 )); then
-    echo "binning: no contig is at least ${MIN_CONTIG_LEN} bp, metaWRAP's minimum contig length; finishing with no bins." >&2
-    qiita_finish bins_dir=bins
-    exit 0
 fi
 
 # metaWRAP exits non-zero when any binner fails, and stops there. MaxBin2 fails on an
