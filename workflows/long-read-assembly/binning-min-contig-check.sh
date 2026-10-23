@@ -1,11 +1,16 @@
 #!/bin/bash
-# Assert the metaWRAP behaviour binning.sh's minimum-contig-length check rests on,
-# against this image's own binners. Run from the def's %test only, so a solve that
-# changes it fails the build; why it is not the spec's VERIFY_CMD is in
+# Build-time test of this image; no job runs it. binning.def's %test calls it during
+# `apptainer build`, and a failure fails the build. It is copied into the image only
+# because %test runs inside the finished image. It is not the spec's VERIFY_CMD, which
+# runs on every deploy's skip check; the wiring is pinned by
 # test_min_contig_check_ships_runs_at_build_and_scopes_its_rebuild.
 #
-# One contig of exactly MIN_CONTIG_LEN bp, read from the shipped binning.sh, with
-# reads tiled across it:
+# What it tests: binning.sh skips metaWRAP when no contig reaches MIN_CONTIG_LEN,
+# because of how this image's binners treat a contig under metaWRAP's -l (see the
+# comment above MIN_CONTIG_LEN there). That is binner behaviour, set by whichever
+# maxbin2, FragGeneScan and metawrap-mg the solve resolves, none of them pinned to
+# one version, so a rebuild can change it. This runs metaWRAP twice on a synthetic
+# one-contig assembly of exactly MIN_CONTIG_LEN bp, read from the shipped binning.sh:
 #   -l MIN_CONTIG_LEN     MaxBin2 keeps the contig and reaches its marker-gene
 #                         search, so binning.sh's `>=` passes it to metaWRAP.
 #   -l MIN_CONTIG_LEN+1   MetaBAT2 runs with that as its minContig, MaxBin2 reports
@@ -44,12 +49,14 @@ FGS_ERROR='Error running FragGeneScan.'
 work=$(mktemp -d)
 trap 'rm -rf "${work}"' EXIT
 
+# The fixture: a random contig of min_len bp, and single-end 150 bp reads starting
+# every 40 bp along it, so every binner has coverage to work with.
 python3 - "${work}" "${min_len}" <<'EOF'
 import random
 import sys
 
 work, length = sys.argv[1], int(sys.argv[2])
-rng = random.Random(755)
+rng = random.Random(0)
 seq = "".join(rng.choice("ACGT") for _ in range(length))
 with open(f"{work}/assembly.fa", "w") as f:
     f.write(f">c0\n{seq}\n")
