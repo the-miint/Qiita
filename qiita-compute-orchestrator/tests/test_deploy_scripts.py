@@ -1265,11 +1265,12 @@ def test_workflow_script_is_valid_bash(path: Path) -> None:
 
 
 def _run_idle_wait(
-    tmp_path: Path, counts: list[int], *, wait_s: str = "60", env_file=True, pid: int = 4242
+    tmp_path: Path, counts: list[int | str], *, wait_s: str = "60", env_file=True, pid: int = 4242
 ):
     """Run `wait_for_data_plane_idle` with `systemctl` and `psql` stubbed: systemctl
     names `pid` as the unit's main process, and psql answers the in-flight
-    catalog-session count from `counts`, one per call, then the last one again.
+    catalog-session count from `counts`, one per call, then the last one again, and
+    fails on a `"fail"` entry.
     Returns the completed process and the argv of every psql call."""
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
@@ -1283,6 +1284,7 @@ def _run_idle_wait(
         f'printf "%s|PGPASSFILE=%s\\n" "$argv" "$PGPASSFILE" >> "{calls}"\n'
         f'n=$(head -n1 "{queue}")\n'
         f'[ "$(wc -l < "{queue}")" -gt 1 ] && sed -i.bak 1d "{queue}"\n'
+        '[ "$n" = fail ] && exit 2\n'
         'echo "$n"\n'
     )
     for stub in ("systemctl", "psql"):
@@ -1346,6 +1348,21 @@ def test_idle_wait_skips_when_disabled_or_on_a_first_deploy(
     assert calls == []
 
 
+def test_idle_wait_refuses_a_wait_that_is_not_whole_seconds(tmp_path: Path) -> None:
+    proc, calls = _run_idle_wait(tmp_path, [1], wait_s="1h")
+    assert proc.returncode != 0
+    assert "QIITA_DP_IDLE_WAIT_S must be a whole number of seconds, got '1h'" in proc.stderr
+    assert calls == []
+
+
+def test_idle_wait_stops_the_deploy_when_the_catalog_query_fails(tmp_path: Path) -> None:
+    """A wait that cannot tell whether the data plane is idle stops the deploy before
+    any restart, and names the override."""
+    proc, _calls = _run_idle_wait(tmp_path, ["fail"])
+    assert proc.returncode != 0
+    assert "set QIITA_DP_IDLE_WAIT_S=0 to restart without waiting" in proc.stderr
+
+
 @pytest.mark.skipif(not Path("/proc/self/fd").is_dir(), reason="needs /proc (Linux)")
 @pytest.mark.parametrize(
     ("name", "busy"), [("upload.parquet.partial", True), ("upload.parquet", False)]
@@ -1369,12 +1386,14 @@ def test_idle_wait_counts_an_open_partial_upload(tmp_path: Path, name: str, busy
     finally:
         holder.communicate(b"")
     assert proc.returncode == 0, proc.stderr
-    assert ("still busy after 1s (catalog sessions: 0, uploads: 1)" in proc.stderr) is busy
+    assert (
+        "still busy after 1s (catalog sessions: 0, open partial files: 1)" in proc.stderr
+    ) is busy
 
 
 def test_data_plane_unit_stop_timeout_covers_the_idle_wait() -> None:
     """The data plane drains on SIGTERM for up to the unit's TimeoutStopSec, and the
-    deploy's idle wait and the masked-read-export retry default to the same bound."""
+    deploy's idle wait defaults to the same bound."""
     unit = (_DEPLOY / "systemd" / "qiita-data-plane@.service").read_text()
     assert re.search(r"(?m)^TimeoutStopSec=3900$", unit)
     assert "QIITA_DP_IDLE_WAIT_S:-3900}" in _COMMON.read_text()

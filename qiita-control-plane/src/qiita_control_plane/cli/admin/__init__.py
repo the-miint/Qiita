@@ -99,6 +99,7 @@ from .masked_export import (
     _handle_masked_read_export,
     _parquet_row_count,
     _peek_paired,
+    _retry_seconds_arg,
     _write_masked_sample,
 )
 from .owner_id import (
@@ -690,7 +691,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_export.add_argument(
         "--retry-seconds",
-        type=float,
+        type=_retry_seconds_arg,
         default=DEFAULT_EXPORT_RETRY_SECONDS,
         dest="retry_seconds",
         help=(

@@ -7,6 +7,7 @@ import argparse
 import base64
 import itertools
 import json
+import math
 import re
 import sys
 import time
@@ -47,6 +48,15 @@ _READ_MASKED_COLUMNS = "read_id, sequence1, qual1, sequence2, qual2"
 # for as long as its in-flight ones run, up to the unit's TimeoutStopSec
 # (deploy/systemd/qiita-data-plane@.service), so the default matches that bound.
 DEFAULT_EXPORT_RETRY_SECONDS = 3900.0
+
+
+def _retry_seconds_arg(value: str) -> float:
+    """argparse `type=` for --retry-seconds: a finite number of seconds, 0 or more."""
+    seconds = float(value)
+    if not math.isfinite(seconds) or seconds < 0:
+        raise argparse.ArgumentTypeError(f"must be a finite number >= 0, got {value!r}")
+    return seconds
+
 
 # The longest wait between two attempts of one prep_sample.
 _EXPORT_RETRY_MAX_DELAY_S = 30.0

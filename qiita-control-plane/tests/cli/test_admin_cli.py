@@ -1111,6 +1111,18 @@ def test_masked_read_export_gives_up_after_retry_seconds(monkeypatch, tmp_path, 
     assert list(out_dir.iterdir()) == []
 
 
+@pytest.mark.parametrize("value", ["-1", "nan", "inf"])
+def test_masked_read_export_refuses_a_retry_window_that_is_not_finite_or_is_negative(
+    tmp_path, capsys, value
+):
+    from qiita_control_plane.cli import admin as cli
+
+    with pytest.raises(SystemExit) as exc:
+        _run_parquet_export(cli, tmp_path / "exp", "--retry-seconds", value)
+    assert exc.value.code == 2
+    assert "must be a finite number >= 0" in capsys.readouterr().err
+
+
 @pytest.mark.parametrize(
     ("make_exc", "transient"),
     [
