@@ -17,7 +17,7 @@ command reaches the system and whether the auth model can gate it:
                  moments the auth system can't help — no admin exists yet,
                  the API is down, or you're recovering state.
 
-This package exposes `main`. `_parser.py` builds the user-facing argparse
+The entry point is `main`. `_parser.py` builds the user-facing argparse
 surface, and each subcommand's handler lives in the submodule for its
 area. PAT file I/O, the LoginRocket loopback flow, the
 authenticated HTTP call helper, and the generic token-read + invoke +
