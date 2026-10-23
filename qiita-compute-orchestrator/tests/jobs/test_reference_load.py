@@ -342,9 +342,10 @@ def test_chunk_parts_keep_wide_row_groups_under_the_byte_cap(tmp_path, monkeypat
 
 
 def test_chunk_parts_size_row_groups_from_their_own_chunks(tmp_path, monkeypatch):
-    """A part's row count follows its own chunks' width, not the whole input's. A reference
-    that mixes short records with genomes would otherwise size a part of full-width chunks
-    for the short records' mean, and its row groups would run far past the cap."""
+    """A part's row count follows its own widest chunk, not the whole input's mean. A
+    reference that mixes short records with genomes would otherwise size a part of
+    full-width chunks for the short records, and its row groups would run far past the
+    cap."""
     import qiita_compute_orchestrator.jobs._feature_load as fl
 
     monkeypatch.setattr(parquet, "ROW_GROUP_SIZE_BYTES", SHRUNK_ROW_GROUP_SIZE_BYTES)

@@ -1582,8 +1582,8 @@ where
 }
 
 /// Canonical Parquet write options for an exported reads file: a copy of
-/// `qiita_common.parquet.PARQUET_OPTS_TRANSFER`, which a qiita-common test pins it
-/// equal to. The materialized file has the shape of the
+/// `qiita_common.parquet.PARQUET_OPTS_TRANSFER`, pinned equal to it by a qiita-common
+/// test. The materialized file has the shape of the
 /// durable copy `ingest_reads` first wrote (Parquet v2, zstd, 64 MB row groups), but
 /// a job reads it and it is dropped, so it takes zstd's default level rather than
 /// the at-rest one.

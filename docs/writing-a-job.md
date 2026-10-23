@@ -114,8 +114,9 @@ Three kinds of field arrive in `Inputs`:
   `register-files` step registers takes `PARQUET_OPTS_AT_REST`; anything else takes
   `PARQUET_OPTS_TRANSFER` or `PARQUET_OPTS_INTERMEDIATE`. That module's header says why the
   sets differ. `tests/test_parquet_at_rest_writers.py` finds the registering modules from the
-  workflow YAMLs and fails when one of them names no at-rest set or names a transfer set,
-  or when any other module names an at-rest set. It reads which sets a module's source
+  workflow YAMLs and fails when one of them neither names an at-rest set nor calls a shared
+  writer of registered files (`read_staging.write_sorted_reads`, the `_feature_load`
+  writers), when one names a transfer set, or when any other module names an at-rest set. It reads which sets a module's source
   names, not which set each file is written with. A sorted COPY of wide rows also appends
   `ROW_GROUP_SIZE` from `sorted_row_group_size` (its docstring says why).
 

@@ -260,16 +260,17 @@ def write_feature_sequence_chunks(
             # secondary `chunk_index` orders a feature's chunks for cheap
             # reassembly.
             #
-            # The row count comes from this part's own width, not the input's: a
-            # reference that mixes short records with genomes has parts of very
-            # different widths, and an input-wide mean would size a part of full 64 KB
-            # chunks for the short records.
-            chunks, chunk_bytes = conn.execute(
-                "SELECT count(*), sum(strlen(chunk_data)) FROM part_chunks"
+            # The row count comes from this part's widest chunk, not a mean: a
+            # reference that mixes short records with genomes would otherwise size a
+            # part, or a run of genome chunks inside one, for the short records. Sized
+            # for the widest, a group never holds more than one vector of it, at the
+            # cost of smaller groups where short records share a part with genomes.
+            chunks, widest = conn.execute(
+                "SELECT count(*), max(strlen(chunk_data)) FROM part_chunks"
             ).fetchone()
             if not chunks:
                 raise ValueError(f"batch {i} matched no chunks in {parts_glob}")
-            row_group_size = sorted_row_group_size(_CHUNK_KEY_BYTES + chunk_bytes // chunks)
+            row_group_size = sorted_row_group_size(_CHUNK_KEY_BYTES + widest)
             conn.execute(
                 "COPY ("
                 "  SELECT feature_idx, chunk_index, chunk_data"

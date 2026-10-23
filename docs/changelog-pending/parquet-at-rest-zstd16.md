@@ -7,7 +7,7 @@
   12–15% smaller on synthetic production-shaped tables (−14.6% on one real long-read
   prep_sample's `sequence1`); files already in the lake are unchanged. Files that are not
   kept (inter-step inputs, downloads, exports) stay at the default level. The cost is write
-  time, measured on those tables with DuckDB 1.5.5: ~47–52 s more per GB of reads and ~74 s
+  time, measured on those tables with DuckDB 1.5.5: ~46–52 s more per GB of reads and ~74 s
   per GB of reference sequence at 8 threads, and ~102 s per GB of long reads at
   `bam-to-parquet`'s 2.
 - **Sorted lake writes of wide rows get row groups near 64 MB (#N).** A sorted DuckDB COPY

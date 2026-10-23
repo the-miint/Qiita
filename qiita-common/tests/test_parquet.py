@@ -2,7 +2,9 @@
 
 The sets exist because their files have different lives, so these pin what tells them
 apart — the codec, and whether a compression level is set — and that the pinned DuckDB
-accepts each one in a real COPY.
+accepts each one in a real COPY. They also pin the data plane's Rust copies of these
+values, and the DuckDB behaviour `sorted_row_group_size` rests on: how a sorted COPY cuts
+row groups, its default row count, and what `'64MB'` means.
 """
 
 from __future__ import annotations
@@ -106,10 +108,8 @@ def test_at_rest_level_reaches_the_writer(tmp_path: Path):
     assert _disk_bytes(con, at_rest) < _disk_bytes(con, transfer)
 
 
-def _ducklake_rs() -> str:
-    return (
-        Path(__file__).resolve().parents[2] / "qiita-data-plane" / "src" / "ducklake.rs"
-    ).read_text()
+def _data_plane_src(name: str) -> str:
+    return (Path(__file__).resolve().parents[2] / "qiita-data-plane" / "src" / name).read_text()
 
 
 def test_ducklake_catalog_options_match_the_at_rest_set_exactly():
@@ -119,7 +119,7 @@ def test_ducklake_catalog_options_match_the_at_rest_set_exactly():
     # format with nothing failing.
     import re
 
-    src = _ducklake_rs()
+    src = _data_plane_src("ducklake.rs")
     level = re.search(r"const PARQUET_COMPRESSION_LEVEL_AT_REST: \w+ = (\d+);", src)
     assert level, "PARQUET_COMPRESSION_LEVEL_AT_REST not found in ducklake.rs"
     assert int(level.group(1)) == PARQUET_COMPRESSION_LEVEL_AT_REST
@@ -136,7 +136,7 @@ def test_ducklake_chunk_row_group_size_matches_the_python_one_exactly():
 
     from qiita_common.chunking import CHUNK_ROW_GROUP_SIZE
 
-    m = re.search(r"const CHUNK_ROW_GROUP_SIZE: \w+ = (\d+);", _ducklake_rs())
+    m = re.search(r"const CHUNK_ROW_GROUP_SIZE: \w+ = (\d+);", _data_plane_src("ducklake.rs"))
     assert m, "CHUNK_ROW_GROUP_SIZE not found in ducklake.rs"
     assert int(m.group(1)) == CHUNK_ROW_GROUP_SIZE
 
@@ -146,9 +146,7 @@ def test_data_plane_read_export_options_match_transfer_exactly():
     # set; drift would change that file's shape with nothing failing.
     import re
 
-    src = (
-        Path(__file__).resolve().parents[2] / "qiita-data-plane" / "src" / "flight_service.rs"
-    ).read_text()
+    src = _data_plane_src("flight_service.rs")
     m = re.search(r'const EXPORT_READ_PARQUET_OPTS: &str =\s*"([^"]+)";', src)
     assert m, "EXPORT_READ_PARQUET_OPTS not found in flight_service.rs"
     assert m.group(1) == PARQUET_OPTS_TRANSFER
@@ -183,8 +181,8 @@ def _row_groups(con: duckdb.DuckDBPyConnection, path: Path) -> list[tuple[int, i
 
 def test_a_sorted_copy_ignores_the_byte_cap(tmp_path: Path):
     # The DuckDB behaviour sorted_row_group_size exists for. If a DuckDB bump makes this
-    # fail, that DuckDB applies the byte cap to a sorted COPY, and the helper may be
-    # unneeded.
+    # fail, check whether DuckDB now applies the byte cap to a sorted COPY; if it does,
+    # the helper may be unneeded.
     con = _connect()
     out = _sorted_copy(con, tmp_path, "FORMAT PARQUET, ROW_GROUP_SIZE_BYTES '1MB'")
     assert [rows for rows, _, _ in _row_groups(con, out)] == [20000]
@@ -215,13 +213,17 @@ def test_a_sorted_copy_defaults_to_the_largest_row_count_the_helper_gives(tmp_pa
     con.execute(
         f"COPY (SELECT * FROM read_parquet('{src}') ORDER BY k) TO '{out}' (FORMAT PARQUET)"
     )
-    rows = [rows for rows, _, _ in _row_groups(con, out)]
-    assert rows[:-1] == [sorted_row_group_size(1)] * (len(rows) - 1)
+    default = sorted_row_group_size(1)
+    assert [rows for rows, _, _ in _row_groups(con, out)] == [
+        default,
+        default,
+        300000 - 2 * default,
+    ]
 
 
 def test_the_byte_cap_int_is_what_duckdb_reads_the_literal_as(tmp_path: Path):
     # DuckDB's MB is decimal, so '8MB' cuts where 8,000,000 does and not where 2^23 does.
-    # The two caps are ~4.9% apart, which on 100-byte rows is several 2,048-row vectors.
+    # The two caps are ~4.9% apart, which on 100-byte rows is about two 2,048-row vectors.
     con = _connect()
     con.execute("SET threads = 1")
 
