@@ -348,8 +348,9 @@ def _handle_ticket_redrive(args: argparse.Namespace, parser: argparse.ArgumentPa
     FAILED (or CANCELLED) tickets with the `ticket list` filters, print them, and
     with --execute POST /work-ticket/{idx}/run for each in turn, --rate seconds
     apart and with at most --max-inflight of them unfinished at once. Prints a
-    JSON report; exits 1 when any selected ticket was not redriven (refused, or
-    not attempted after the run stopped)."""
+    JSON report, to stdout when every selected ticket was redriven and to stderr
+    with exit 1 when any was not (refused, or not attempted after the run
+    stopped)."""
     if args.rate_seconds < 0:
         parser.error(f"--rate must be >= 0, got {args.rate_seconds}")
     if args.max_inflight < 1:
@@ -375,5 +376,5 @@ def _handle_ticket_redrive(args: argparse.Namespace, parser: argparse.ArgumentPa
     except ValidationError as exc:
         _common.print_validation_error(exc)
         return 1
-    print(json.dumps(report, indent=2))
+    print(json.dumps(report, indent=2), file=sys.stdout if complete else sys.stderr)
     return 0 if complete else 1

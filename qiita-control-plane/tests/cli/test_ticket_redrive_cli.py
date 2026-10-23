@@ -117,7 +117,9 @@ def test_redrive_records_a_refused_ticket_and_goes_on(monkeypatch, capsys):
 
     assert rc == 1
     assert len(_posts(log)) == 2
-    report = json.loads(capsys.readouterr().out)
+    out, err = capsys.readouterr()
+    assert out == ""
+    report = json.loads(err)
     assert [r["work_ticket_idx"] for r in report["refused"]] == [11]
     assert [r["idx"] for r in report["redriven"]] == [12]
 
@@ -129,7 +131,9 @@ def test_redrive_stops_on_an_answer_that_is_not_about_the_ticket(monkeypatch, ca
 
     assert rc == 1
     assert len(_posts(log)) == 2
-    report = json.loads(capsys.readouterr().out)
+    out, err = capsys.readouterr()
+    assert out == ""
+    report = json.loads(err)
     assert report["stopped"]["work_ticket_idx"] == 12
     assert report["stopped"]["status"] == 503
     assert report["not_attempted"] == [13]
