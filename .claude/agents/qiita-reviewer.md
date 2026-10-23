@@ -104,6 +104,7 @@ Only rules whose trigger appears in the diff can fire.
 | A guard shaped as a denylist; a check that shells out and swallows errors; a `skipif` on the assertion a test exists for | R4 |
 | A guard, fallback or presence-probe for a state that may be unreachable, including a missing miint function in a request or job path | R4 |
 | A fix that cleans up bad state after it lands; a dedup, cleanup or GC pass | R4, R9 |
+| A write decided by a row being absent that another path inserts; a query that takes a past ticket's or record's outcome as proof | R4, R9 |
 | A Pydantic `Field(...)` constraint or a validation regex | R5 |
 | Several values stored in one column with a non-empty separator; a hash, UUID or id cast to text | R5 |
 | A filename, digest, or identity input built from an absolute path or another host-specific value | R5 |
@@ -196,6 +197,7 @@ Safety must not rest on convention or a comment; and a guard must be real, so do
 - **Enforce assumptions.** A migration that assumes "no rows reference this" raises if rows exist; a seed that must match N rows asserts it; an invariant enforced only in the CLI while the server accepts anything is not enforced.
 - **A check must fail loud.** A check that swallows the error, a `skipif` on the assertion the test exists for [soft], and an empty or no-op result read as success are fail-open. An empty result is a trap only if something keys on it: a status flips, an identity is minted, a gate opens. If nothing does, zero rows is a legitimate answer.
 - **Discriminate on the trusted source, and validate before the expensive or irreversible step.**
+- **Proof from history is the newest record's, not any record's.** A query that opens a gate or writes a state because some past ticket ended a certain way must say whether a newer one supersedes it. A later attempt that failed, was cancelled or is still running usually does.
 - **Cause, not aftermath** [soft]. For a fix that removes bad state after it lands, ask whether the state can be refused where it is created.
 - **Mirror — don't over-guard.** A guard for an unreachable state, re-validation of data the system already owns, handling for output a tool does not emit, and a test fixture modelling an input no producer can emit [soft: ask which producer emits it] all mask an upstream bug or pin nothing. For miint specifically: no presence-probe or fallback for a missing function in a request or job path. `CLAUDE.md` ("miint is a core dependency") makes its absence a hard failure and names the boot, deploy and staged-directory checks this does not cover.
 
@@ -262,6 +264,7 @@ When two similar code paths solve the same problem differently, factor out the s
 - **The system owns the lifecycle from what our instruments write.** A workflow for instrument data that starts from a hand-converted input diverges from its siblings. Uploads and public-archive imports legitimately start from FASTQ.
 - **Multi-fetch read consistency**: related reads from two or more sources use one connection or transaction.
 - **A multi-statement mutation: is it one transaction?** [soft] Ask rather than prescribe; snapshot semantics can make a single transaction the wrong answer.
+- **Two paths that check-then-write the same fact share a lock.** One path acts because a row is absent, and another inserts that row or undoes the first path's write. Both must take one lock, held to commit, before the check and before the insert. Under READ COMMITTED neither sees the other's uncommitted rows, so re-checking inside the same transaction does not close the gap, and neither does a lock only one side takes. Take it ahead of any wider lock the insert holds to commit. The test interleaves two connections; it does not stub the check.
 - **Resource requests are sized to the workload** [soft]: a cap targets a stated input size and derives from the enforced limit; a request that looks high gets "what drives it?"; an unmeasured number is labelled a starting point with an issue to measure it.
 - **CLI convention**: diagnostics to stderr, exit through `sys.exit(N)`.
 - **One container image bundling many tool steps couples them** [soft].
