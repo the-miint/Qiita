@@ -69,6 +69,8 @@ _ASSEMBLE_SH = _WORKFLOW_DIR / "assemble.sh"
 _BINNING_SH = _WORKFLOW_DIR / "binning.sh"
 _BINNING_DEF = _WORKFLOW_DIR / "binning.def"
 _BINNING_VERIFY = _WORKFLOW_DIR / "binning-verify.sh"
+_BINNING_MIN_CONTIG_CHECK = _WORKFLOW_DIR / "binning-min-contig-check.sh"
+_BINNING_ENV = _WORKFLOW_DIR / "sif-build.d" / "binning.env"
 _BIN_REFINE_SH = _WORKFLOW_DIR / "bin_refine.sh"
 _BIN_REFINE_DEF = _WORKFLOW_DIR / "bin_refine.def"
 _CHECKM_SH = _WORKFLOW_DIR / "checkm.sh"
@@ -93,6 +95,7 @@ _ASSERTED_VERSIONS = {
         _BINNING_SH,
         _BINNING_DEF,
         _BINNING_VERIFY,
+        _BINNING_MIN_CONTIG_CHECK,
         _BIN_REFINE_SH,
         _BIN_REFINE_DEF,
         _CHECKM_SH,
@@ -1035,6 +1038,40 @@ def test_image_pins_are_asserted_at_build_time() -> None:
             f"green. Add it to the PINNED map there (keyed by the binary the "
             f"package provides -- metabat2's is jgi_summarize_bam_contig_depths)."
         )
+
+
+def test_min_contig_check_ships_runs_at_build_and_scopes_its_rebuild() -> None:
+    """binning-min-contig-check.sh is %files-copied, run from %test, and named in
+    HASH_INPUTS, and is not the spec's VERIFY_CMD.
+
+    Out of HASH_INPUTS, an edit to it would leave the idempotency check green and
+    the deploy would keep the old SIF. As VERIFY_CMD, every deploy's skip check
+    would run metaWRAP.
+    """
+    def_lines = _code_lines(_BINNING_DEF)
+    assert "binning-min-contig-check.sh /opt/qiita/binning-min-contig-check.sh" in def_lines, (
+        "binning.def no longer %files-copies binning-min-contig-check.sh"
+    )
+    test_section = def_lines[def_lines.index("%test") :]
+    assert "/opt/qiita/binning-min-contig-check.sh" in test_section, (
+        "binning.def's %test no longer runs binning-min-contig-check.sh"
+    )
+
+    env = _BINNING_ENV.read_text()
+    hash_inputs = re.search(r'^HASH_INPUTS="([^"]*)"', env, re.MULTILINE)
+    assert hash_inputs is not None, "binning.env no longer declares HASH_INPUTS"
+    assert "binning-min-contig-check.sh" in hash_inputs.group(1).split(), hash_inputs.group(1)
+    verify_cmd = re.search(r'^VERIFY_CMD="([^"]*)"', env, re.MULTILINE)
+    assert verify_cmd is not None, "binning.env no longer declares VERIFY_CMD"
+    assert "binning-min-contig-check" not in verify_cmd.group(1)
+
+
+def test_min_contig_check_reads_the_cut_binning_sh_ships() -> None:
+    """The check's awk reads the raw `MIN_CONTIG_LEN=` line from binning.sh, so the
+    raw file, not its code lines, must hold exactly one, with a bare number."""
+    raw = re.findall(r"^MIN_CONTIG_LEN=(.*)$", _BINNING_SH.read_text(), re.MULTILINE)
+    assert len(raw) == 1 and raw[0].isdigit(), raw
+    assert "/^MIN_CONTIG_LEN=/" in "\n".join(_code_lines(_BINNING_MIN_CONTIG_CHECK))
 
 
 def test_bin_refine_initializes_its_binner_arrays_by_assignment() -> None:

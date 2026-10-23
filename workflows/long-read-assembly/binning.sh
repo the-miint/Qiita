@@ -59,9 +59,9 @@ fi
 # Measured on this image's solve (metawrap-mg 1.3.0, maxbin2 2.2.7, metabat2 2.15,
 # fraggenescan 1.32): one 15,846 bp contig at -l 16000 and -l 15847 took that path,
 # and at -l 15846 and -l 15000 MaxBin2 kept the contig and reached the marker-gene
-# verdict matched at the metaWRAP call below. So the step finishes with no bins
-# without running metaWRAP, and before staging the reads and the BAM, as the
-# empty-noLCG exit above does.
+# verdict matched at the metaWRAP call below. binning-min-contig-check.sh asserts this
+# at image build. So the step finishes with no bins without running metaWRAP, and
+# before staging the reads and the BAM, as the empty-noLCG exit above does.
 #
 # The lengths come from samtools faidx's .fai. faidx writes it next to the FASTA and
 # genomes_dir is a read-only bind, so index a WORK copy rather than noLCG in place;

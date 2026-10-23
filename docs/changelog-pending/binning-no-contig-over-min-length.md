@@ -5,3 +5,6 @@
   ended `failed`. The step now checks contig lengths before running metaWRAP and, when
   none reaches the minimum, finishes with an empty `bins_dir`, as it already did for an
   assembly with no non-circular contig.
+  The binning image's build now runs metaWRAP on a one-contig fixture at that minimum
+  and one above it, and fails if MaxBin2 stops keeping a contig of exactly the minimum
+  or any binner bins a contig under it.
