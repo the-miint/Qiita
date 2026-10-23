@@ -60,6 +60,7 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
 - `[admin]` (#756) Before stopping the control plane, list the unfinished tickets with a `register-files` step that did not complete. The new control plane resends the payload a `register-files` call recorded, and a call the old one made recorded none, so a ticket whose old call moved some files and then stopped or failed would send only the files left:
   `SELECT DISTINCT s.work_ticket_idx, t.state FROM qiita.work_ticket_step s JOIN qiita.work_ticket t USING (work_ticket_idx) WHERE s.step_name = 'register-files' AND s.state <> 'completed' AND t.state NOT IN ('completed','no_data');`
   A ticket still `pending`, `queued` or `processing`: wait for it to finish. A ticket `failed` or `cancelled`: resubmit it rather than redrive it after this deploy. Needed for this deploy only; calls from this deploy on record their payload.
+- `[admin]` (#TBD) `activate.sh` now waits, before any restart, for the data plane to go idle (no DoGet stream, DoPut or registration in flight), up to 3900 s, printing `waiting for qiita-data-plane@50051 to go idle …` once a minute; it then restarts either way. `QIITA_DP_IDLE_WAIT_S=<s>` in the deploy's environment changes the bound (0 skips it). This deploy still stops the old data-plane binary at once on SIGTERM: the drain ships with the new binary, so from the next deploy the data plane's own restart can take up to the unit's `TimeoutStopSec=3900` too.
 
 ### 5. Verify
 
@@ -72,6 +73,7 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
   line — on this host the ceiling should come from `/proc/meminfo MemAvailable`, since the
   unit sets no cgroup limit. No separate journal read by hand; `SKIP_DP_POOL=1` drops the
   row.
+- `[admin]` (#TBD) `systemctl show -p TimeoutStopUSec qiita-data-plane@50051` prints `TimeoutStopUSec=1h 5min`.
 - `[admin]` (#731) `qiita.action` lists `download-ena-study` 1.0.0 with three steps, ending in `persist-ena-run-outcomes`, and `\d qiita.sequenced_sample` shows `download_failure_reason` and `download_failure_type`.
 
 ### 6. After the deploy verifies green
@@ -112,6 +114,8 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
   old sheet, so submit the pool again with `qiita submit-golay-demux`, passing the
   same `--instrument-run-id`, `--preflight-blob` and `--prep-protocol-idx` (the run,
   pool and roster are then reused).
+
+- (#TBD) A killed DoPut leaves `staging/uploads/<idx>/upload.parquet.partial`, which nothing reclaims, as nothing reclaims finished uploads. `qiita-admin masked-read-export` gains `--retry-seconds` (default 3900, the data-plane unit's stop timeout).
 
 ## Deployed history
 

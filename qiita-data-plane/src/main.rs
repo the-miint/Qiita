@@ -109,10 +109,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             FlightServiceServer::new(flight_svc)
                 .max_decoding_message_size(FLIGHT_MAX_DECODING_BYTES),
         )
-        .serve(cfg.listen_addr)
+        .serve_with_shutdown(cfg.listen_addr, drain_signal())
         .await?;
+    eprintln!("qiita-data-plane: in-flight requests drained; exiting");
 
     Ok(())
+}
+
+/// Resolves on SIGTERM (what `systemctl stop` / `restart` sends) or SIGINT, which
+/// starts tonic's graceful shutdown: the listener closes, so a new connection is
+/// refused, and `serve_with_shutdown` returns once every request already in flight
+/// has finished. A DoGet stream, a DoPut and a `register_files` signalled mid-call
+/// each ran to completion and the process exited 0 (tonic 0.14.5). How long a stop
+/// waits on that drain before SIGKILL is the unit's `TimeoutStopSec`.
+async fn drain_signal() {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut term = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+    let mut int = signal(SignalKind::interrupt()).expect("install SIGINT handler");
+    let name = tokio::select! {
+        _ = term.recv() => "SIGTERM",
+        _ = int.recv() => "SIGINT",
+    };
+    eprintln!("qiita-data-plane: {name} received; draining in-flight requests");
 }
 
 #[cfg(test)]

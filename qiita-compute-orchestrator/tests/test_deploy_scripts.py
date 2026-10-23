@@ -23,6 +23,7 @@ import os
 import re
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -1258,3 +1259,122 @@ def test_workflow_script_is_valid_bash(path: Path) -> None:
     until a ticket is already running inside it."""
     result = subprocess.run(["bash", "-n", str(path)], capture_output=True, text=True)
     assert result.returncode == 0, f"bash -n failed for {path}:\n{result.stderr}"
+
+
+# --- wait_for_data_plane_idle ----------------------------------------------------
+
+
+def _run_idle_wait(
+    tmp_path: Path, counts: list[int], *, wait_s: str = "60", env_file=True, pid: int = 4242
+):
+    """Run `wait_for_data_plane_idle` with `systemctl` and `psql` stubbed: systemctl
+    names `pid` as the unit's main process, and psql answers the in-flight
+    catalog-session count from `counts`, one per call, then the last one again.
+    Returns the completed process and the argv of every psql call."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "systemctl").write_text(f"#!/bin/sh\necho {pid}\n")
+    queue = tmp_path / "counts"
+    queue.write_text("".join(f"{n}\n" for n in counts))
+    calls = tmp_path / "psql-calls"
+    (bin_dir / "psql").write_text(
+        "#!/bin/sh\n"
+        'argv=$(printf %s "$*" | tr "\\n" " ")\n'
+        f'printf "%s|PGPASSFILE=%s\\n" "$argv" "$PGPASSFILE" >> "{calls}"\n'
+        f'n=$(head -n1 "{queue}")\n'
+        f'[ "$(wc -l < "{queue}")" -gt 1 ] && sed -i.bak 1d "{queue}"\n'
+        'echo "$n"\n'
+    )
+    for stub in ("systemctl", "psql"):
+        (bin_dir / stub).chmod(0o755)
+    env_path = tmp_path / "data-plane.env"
+    if env_file:
+        env_path.write_text(
+            "DUCKLAKE_CATALOG_CONNSTR='dbname=lake host=db user=lake_rw password=s3cr3t'\n"
+        )
+    proc = subprocess.run(
+        [
+            "bash",
+            "-c",
+            f'set -euo pipefail; source "{_COMMON}"; '
+            f'wait_for_data_plane_idle qiita-data-plane@50051 "{env_path}"',
+        ],
+        env={
+            **os.environ,
+            "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            "QIITA_DP_IDLE_POLL_S": "0",
+            "QIITA_DP_IDLE_WAIT_S": wait_s,
+        },
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    lines = calls.read_text().splitlines() if calls.exists() else []
+    return proc, lines
+
+
+def test_idle_wait_returns_once_no_catalog_session_is_in_flight(tmp_path: Path) -> None:
+    proc, calls = _run_idle_wait(tmp_path, [2, 1, 0])
+    assert proc.returncode == 0, proc.stderr
+    assert len(calls) == 3
+    assert "waiting for qiita-data-plane@50051 to go idle (catalog sessions: 2" in proc.stderr
+
+
+def test_idle_wait_goes_ahead_when_the_wait_runs_out(tmp_path: Path) -> None:
+    proc, calls = _run_idle_wait(tmp_path, [1], wait_s="1")
+    assert proc.returncode == 0, proc.stderr
+    assert "still busy after 1s" in proc.stderr
+    assert calls
+
+
+def test_idle_wait_keeps_the_catalog_password_off_psql_argv(tmp_path: Path) -> None:
+    """The password reaches libpq through a PGPASSFILE (argv is readable by every user
+    on the host through /proc)."""
+    _proc, calls = _run_idle_wait(tmp_path, [0])
+    argv, pgpassfile = calls[0].split("|PGPASSFILE=")
+    assert "s3cr3t" not in argv
+    assert "user=lake_rw" in argv
+    assert pgpassfile, "psql ran without a PGPASSFILE"
+
+
+@pytest.mark.parametrize(("wait_s", "env_file"), [("0", True), ("60", False)])
+def test_idle_wait_skips_when_disabled_or_on_a_first_deploy(
+    tmp_path: Path, wait_s: str, env_file: bool
+) -> None:
+    proc, calls = _run_idle_wait(tmp_path, [1], wait_s=wait_s, env_file=env_file)
+    assert proc.returncode == 0, proc.stderr
+    assert calls == []
+
+
+@pytest.mark.skipif(not Path("/proc/self/fd").is_dir(), reason="needs /proc (Linux)")
+@pytest.mark.parametrize(
+    ("name", "busy"), [("upload.parquet.partial", True), ("upload.parquet", False)]
+)
+def test_idle_wait_counts_an_open_partial_upload(tmp_path: Path, name: str, busy: bool) -> None:
+    """A DoPut holds its `upload.parquet.partial` open, and the wait finds it through
+    /proc/<pid>/fd; a published `upload.parquet` held open is not an upload in flight."""
+    held = tmp_path / name
+    held.touch()
+    holder = subprocess.Popen(
+        ["python3", "-c", "import sys; f = open(sys.argv[1]); sys.stdin.read()", str(held)],
+        stdin=subprocess.PIPE,
+    )
+    try:
+        fd_dir = Path(f"/proc/{holder.pid}/fd")
+        for _ in range(100):
+            if any(os.readlink(fd) == str(held) for fd in fd_dir.iterdir()):
+                break
+            time.sleep(0.05)
+        proc, _calls = _run_idle_wait(tmp_path, [0], wait_s="1", pid=holder.pid)
+    finally:
+        holder.communicate(b"")
+    assert proc.returncode == 0, proc.stderr
+    assert ("still busy after 1s (catalog sessions: 0, uploads: 1)" in proc.stderr) is busy
+
+
+def test_data_plane_unit_stop_timeout_covers_the_idle_wait() -> None:
+    """The data plane drains on SIGTERM for up to the unit's TimeoutStopSec, and the
+    deploy's idle wait and the masked-read-export retry default to the same bound."""
+    unit = (_DEPLOY / "systemd" / "qiita-data-plane@.service").read_text()
+    assert re.search(r"(?m)^TimeoutStopSec=3900$", unit)
+    assert "QIITA_DP_IDLE_WAIT_S:-3900}" in _COMMON.read_text()

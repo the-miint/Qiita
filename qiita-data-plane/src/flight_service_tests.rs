@@ -6669,12 +6669,17 @@ async fn do_put_interrupted_stream_leaves_no_parquet() {
         .expect_err("interrupted stream must surface an error");
     assert_eq!(err.code(), tonic::Code::Internal);
 
-    let staged = tmp.path().join("uploads/99/upload.parquet");
-    assert!(
-        !staged.exists(),
-        "partial parquet must be deleted on interrupt; found {}",
-        staged.display()
-    );
+    for leftover in [
+        "uploads/99/upload.parquet",
+        "uploads/99/upload.parquet.partial",
+    ] {
+        let staged = tmp.path().join(leftover);
+        assert!(
+            !staged.exists(),
+            "an interrupted upload must leave nothing; found {}",
+            staged.display()
+        );
+    }
 }
 
 #[tokio::test]
@@ -6710,23 +6715,20 @@ async fn do_put_same_upload_idx_second_attempt_rejected() {
 #[tokio::test]
 async fn do_put_alreadyexists_wins_over_mid_stream_decode_error() {
     // Regression: with the async-decoder/blocking-writer bridge, a second
-    // DoPut to an occupied upload_idx whose stream ALSO errors mid-flight
-    // must still surface AlreadyExists — not the decode error. do_put_inner
-    // skips its partial-file cleanup only for AlreadyExists, and that staged
-    // file belongs to the first, legitimate upload; masking it as the decode
-    // error would unlink their file. Reproduces the writer-task error vs
-    // decode-error precedence.
+    // DoPut to an upload_idx another DoPut is still writing, whose stream ALSO
+    // errors mid-flight, must still surface AlreadyExists — not the decode
+    // error. do_put_inner skips its partial-file cleanup only for
+    // AlreadyExists, and that `.partial` belongs to the first upload; masking
+    // it as the decode error would unlink it. Reproduces the writer-task error
+    // vs decode-error precedence.
     let tmp = tempfile::tempdir().unwrap();
     let service = make_service(tmp.path().to_path_buf());
 
-    // First upload occupies upload_idx=88.
-    let t1 = sign_doput_for_test(88, &TEST_SEED, future_expiry_secs(300));
-    let m1 = flight_stream_with_ticket(vec![sample_batch()], t1).await;
-    service
-        .do_put_inner(stream::iter(m1))
-        .await
-        .expect("first DoPut should succeed");
-    let staged = tmp.path().join("uploads/88/upload.parquet");
+    // An upload in progress occupies upload_idx=88.
+    let staged = tmp.path().join("uploads/88/upload.parquet.partial");
+    std::fs::create_dir_all(staged.parent().unwrap()).unwrap();
+    std::fs::write(&staged, b"an upload in progress").unwrap();
+    std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o440)).unwrap();
     let bytes_before = std::fs::read(&staged).unwrap();
 
     // Second DoPut to the same idx: keep only the schema frame, then inject a
@@ -6749,6 +6751,10 @@ async fn do_put_alreadyexists_wins_over_mid_stream_decode_error() {
 
     // The first upload's file is untouched — not unlinked by cleanup.
     assert!(staged.exists(), "the first upload's file must survive");
+    assert!(
+        !tmp.path().join("uploads/88/upload.parquet").exists(),
+        "nothing is published"
+    );
     assert_eq!(
         std::fs::read(&staged).unwrap(),
         bytes_before,
@@ -6758,6 +6764,28 @@ async fn do_put_alreadyexists_wins_over_mid_stream_decode_error() {
         std::fs::metadata(&staged).unwrap().permissions().mode() & 0o777,
         0o440
     );
+}
+
+#[tokio::test]
+async fn do_put_publishes_upload_parquet_and_leaves_no_partial() {
+    let tmp = tempfile::tempdir().unwrap();
+    let service = make_service(tmp.path().to_path_buf());
+    let ticket = sign_doput_for_test(31, &TEST_SEED, future_expiry_secs(300));
+    let messages = flight_stream_with_ticket(vec![sample_batch()], ticket).await;
+    service
+        .do_put_inner(stream::iter(messages))
+        .await
+        .expect("DoPut should succeed");
+    let staged = tmp.path().join("uploads/31/upload.parquet");
+    assert!(staged.exists());
+    assert_eq!(
+        std::fs::metadata(&staged).unwrap().permissions().mode() & 0o777,
+        0o440
+    );
+    assert!(!tmp
+        .path()
+        .join("uploads/31/upload.parquet.partial")
+        .exists());
 }
 
 #[tokio::test]
