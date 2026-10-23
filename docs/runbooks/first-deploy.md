@@ -223,8 +223,8 @@ Qiita's filesystem paths derive from three **base roots** the operator
 sets once per component env file; the services compute fixed subdirs from
 them (no per-leaf env var). The data plane writes Parquet under a durable
 mount (`PATH_PERSISTENT/ducklake`); SLURM upload staging lives under a
-scratch mount (`PATH_SCRATCH/staging`), ideally on the same filesystem as
-the lake for the atomic-rename fast path; the orchestrator stages
+scratch mount (`PATH_SCRATCH/staging`), a separate filesystem from the
+lake's, since the two have different needs; the orchestrator stages
 per-ticket workspaces under the same scratch mount (`PATH_SCRATCH/ticket`),
 visible from every compute node (SLURM uses it as the job's
 `current_working_directory`).
@@ -268,12 +268,11 @@ Verification:
 stat -c '%n  owner=%U  group=%G  mode=%a  device=%d' <persistent>/ducklake <scratch>/staging <scratch>/duckdb-spill <scratch>/ticket
 ```
 
-Watch the **device numbers**: if `<persistent>/ducklake` is on a different
-volume from `<scratch>/ticket` or `<scratch>/staging` (registration moves files
-out of both), the DP copies each registered file instead of moving it. Works
-correctly, just slower; one volume avoids the copy only under the conditions in
-[storage](../architecture/storage.md) ("Same-FS preference"). Flag to infra if
-you want the fast path; not blocking otherwise.
+The **device numbers** of `<persistent>/ducklake` and `<scratch>/ticket` /
+`<scratch>/staging` differ: they are separate filesystems, so registration copies
+each file into the lake rather than renaming it
+([storage](../architecture/storage.md), "`PATH_SCRATCH` and `PATH_PERSISTENT` are
+separate filesystems").
 
 ### 0.4 nginx + TLS + DNS
 
