@@ -2377,6 +2377,47 @@ async def test_run_action_primitive_persist_syndna_read_count_rejects_a_bad_entr
         )
 
 
+@pytest.mark.parametrize(
+    ("name", "inputs", "required"),
+    [
+        ("plan-shards", [], "reference"),
+        ("finalize-shard", [], "reference"),
+        ("persist-ena-run-outcomes", ["run_outcomes"], "sequenced_pool"),
+        ("persist-syndna-read-count", ["alignment"], "prep_sample"),
+        ("delete-alignment-block", [], "block"),
+        ("reconcile-alignment-block", [], "block"),
+        ("finalize-alignment-sample", [], "prep_sample"),
+        ("delete-alignment-sample", [], "prep_sample"),
+        ("finalize-mask-sample", [], "prep_sample"),
+        ("finalize-assembly-sample", [], "prep_sample"),
+        ("persist-qc-checks", ["qc_checks"], "prep_sample"),
+        ("reconcile-block", [], "block"),
+        ("delete-block-mask", [], "block"),
+    ],
+)
+async def test_run_action_primitive_refuses_a_wrongly_scoped_ticket(
+    tmp_path, name, inputs, required
+):
+    from qiita_common.actions import WorkflowAction
+
+    from qiita_control_plane.runner import _run_action_primitive
+
+    wrong = "block" if required != "block" else "reference"
+    entry = WorkflowAction(kind="action", name=name, inputs=inputs, outputs=[])
+    with pytest.raises(RuntimeError) as exc:
+        await _run_action_primitive(
+            None,
+            entry,
+            {"shard_index": True, "run_outcomes": "x", "alignment": "x"},
+            tmp_path,
+            {"kind": wrong},
+            work_ticket_idx=1,
+            signing_key=b"x",
+            data_plane_url="grpc://x",
+        )
+    assert str(exc.value) == f"{name} requires a {required}-scoped ticket; got {wrong!r}"
+
+
 async def test_run_action_primitive_persist_qc_checks_dispatches(monkeypatch, tmp_path):
     """The persist-qc-checks arm passes the ticket idx, the scope target's prep_sample_idx
     and the `qc_checks` binding's path."""
