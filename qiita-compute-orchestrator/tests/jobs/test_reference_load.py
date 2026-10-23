@@ -24,6 +24,13 @@ from uuid import UUID
 
 import duckdb
 import pytest
+from helpers import (
+    SHRUNK_ROW_GROUP_SIZE_BYTES,
+    WIDE_READ_COUNT,
+    WIDE_READ_ROW_GROUPS,
+    row_group_rows,
+)
+from qiita_common import parquet
 from qiita_common.chunking import reassemble_chunks_expr
 
 _REFERENCE_LOAD_LOGGER = "qiita_compute_orchestrator.jobs.reference_load"
@@ -287,6 +294,36 @@ def test_chunks_batched_into_disjoint_feature_idx_ranges(staging_inputs, tmp_pat
         ).fetchall()
     fidx_to_canon = {_FEATURE_MAP[_HASHES[n]]: _CANON[n] for n in _TEST_SEQUENCES}
     assert {fidx: canon for fidx, canon in rows} == fidx_to_canon
+
+
+def test_chunk_parts_keep_wide_row_groups_under_the_byte_cap(tmp_path, monkeypatch):
+    """Each part's sorted COPY ignores ROW_GROUP_SIZE_BYTES (see
+    `qiita_common.parquet.sorted_row_group_size`), so the writer asks for a row count sized
+    to the chunks it reads. With the cap shrunk to 1 MiB, ~1 KB chunks land one vector per
+    row group instead of the whole part in one."""
+    import qiita_compute_orchestrator.jobs._feature_load as fl
+
+    monkeypatch.setattr(parquet, "ROW_GROUP_SIZE_BYTES", SHRUNK_ROW_GROUP_SIZE_BYTES)
+    src = tmp_path / "hashed_chunks"
+    src.mkdir()
+    out = tmp_path / "reference_sequence_chunks"
+    with duckdb.connect(":memory:") as conn:
+        conn.execute("SET preserve_insertion_order = false")
+        conn.execute("SET threads = 4")
+        conn.execute(
+            "CREATE TEMP TABLE feature_map AS SELECT range + 1 AS feature_idx, "
+            f"uuid() AS sequence_hash FROM range({WIDE_READ_COUNT})"
+        )
+        # One ~1 KB chunk per feature, distinct per feature so no encoder collapses it.
+        conn.execute(
+            "COPY (SELECT sequence_hash, 0 AS chunk_index, "
+            "repeat(md5(feature_idx::VARCHAR), 32) AS chunk_data FROM feature_map) "
+            f"TO '{src / 'part_00000.parquet'}' (FORMAT PARQUET, ROW_GROUP_SIZE 1024)"
+        )
+        fl.write_feature_sequence_chunks(conn, src, out)
+    parts = sorted(out.glob("part_*.parquet"))
+    assert len(parts) == 1, "one batch's worth of chunks is one part"
+    assert row_group_rows(parts[0]) == WIDE_READ_ROW_GROUPS
 
 
 def test_emits_reference_membership_with_reference_idx(staging_inputs, tmp_path):

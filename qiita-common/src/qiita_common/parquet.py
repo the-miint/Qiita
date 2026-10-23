@@ -24,10 +24,8 @@ from pathlib import Path
 # ~64 MB instead of buffering one giant group — sharper row-group predicate pushdown
 # (tighter per-group min/max) and lower peak write memory. It REQUIRES
 # `SET preserve_insertion_order=false` on the writing connection (DuckDB errors at bind
-# time otherwise). It does NOT produce a globally byte-sorted file — under parallel writes
-# row groups land in thread-finish order — but each row group stays clustered on the
-# COPY's ORDER BY key, which is what catalog pruning and row-group pushdown read (min/max
-# stats, not physical row order).
+# time otherwise). A COPY whose query ends in ORDER BY does not get the cap; a sorted
+# writer of wide rows adds the row count `sorted_row_group_size` gives it.
 
 
 def _copy_options(codec: str, level: int | None = None) -> str:
@@ -62,12 +60,37 @@ PARQUET_COMPRESSION_INTERMEDIATE: str = "snappy"
 PARQUET_OPTS_INTERMEDIATE: str = _copy_options(PARQUET_COMPRESSION_INTERMEDIATE)
 
 # The `ROW_GROUP_SIZE_BYTES '64MB'` cap above, as an int, for write paths that
-# size row groups in Python rather than via a DuckDB COPY (e.g. a pyarrow
-# `ParquetWriter` fed a Flight stream — the admin masked-read export). Sizing by
+# size row groups themselves: a pyarrow `ParquetWriter` fed a Flight stream (the
+# admin masked-read export), and a sorted COPY (`sorted_row_group_size`). Sizing by
 # encoded bytes (not a fixed row count) is what keeps row groups sane across
 # qiita's varying row widths — a fixed row count large enough for narrow reads is
 # far too big for wide rows. Keep in sync with the literal in `_copy_options`.
 ROW_GROUP_SIZE_BYTES: int = 64 * 1024 * 1024
+
+# DuckDB's Parquet writer, by rows: a row group of this many unless a COPY says otherwise,
+# built from vectors of this many.
+_DUCKDB_ROW_GROUP_SIZE: int = 122_880
+_DUCKDB_VECTOR_SIZE: int = 2_048
+
+
+def sorted_row_group_size(bytes_per_row: int) -> int:
+    """`ROW_GROUP_SIZE` for a COPY whose query ends in ORDER BY, given its rows' mean width.
+
+    A sorted COPY writes one file in sort order, each row group a contiguous run of the
+    key, but DuckDB 1.5.5 cuts those row groups by row count alone. ROW_GROUP_SIZE_BYTES
+    does not apply, and a group closes at the first whole vector at or past ROW_GROUP_SIZE
+    (122,880 rows unless set), so 122,880 HiFi reads become one ~3.7 GB row group. The
+    writer compresses each row group on one thread, so a level-16 write of such a group
+    runs on one core however many threads the connection has.
+
+    Returns the most whole vectors that fit ROW_GROUP_SIZE_BYTES, never more rows than
+    DuckDB's default (so narrow rows keep the groups an unsorted write would give them) and
+    never less than one vector, the least DuckDB writes. Rows wider than
+    ROW_GROUP_SIZE_BYTES / 2,048 therefore get one-vector groups past the cap."""
+    if bytes_per_row < 1:
+        raise ValueError(f"bytes_per_row must be positive, got {bytes_per_row}")
+    vectors = ROW_GROUP_SIZE_BYTES // bytes_per_row // _DUCKDB_VECTOR_SIZE
+    return min(_DUCKDB_ROW_GROUP_SIZE, max(1, vectors) * _DUCKDB_VECTOR_SIZE)
 
 
 def validate_parquet_path(path: Path) -> str:

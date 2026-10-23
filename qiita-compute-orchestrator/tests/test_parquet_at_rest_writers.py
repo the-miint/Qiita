@@ -28,7 +28,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 _WORKFLOWS_DIR = _REPO_ROOT / "workflows"
 _PACKAGE_DIR = Path(qiita_compute_orchestrator.__file__).resolve().parent
 
-_AT_REST_SETS = frozenset({"PARQUET_OPTS_AT_REST", "PARQUET_OPTS_CHUNKED_AT_REST"})
+_AT_REST_SETS = frozenset({"PARQUET_OPTS_AT_REST"})
 _TRANSFER_SETS = frozenset({"PARQUET_OPTS_TRANSFER", "PARQUET_OPTS_CHUNKED_TRANSFER"})
 
 # Shared writers of registered files, and the functions through which jobs reach them.

@@ -18,6 +18,8 @@ from qiita_common.parquet import (
     PARQUET_OPTS_AT_REST,
     PARQUET_OPTS_INTERMEDIATE,
     PARQUET_OPTS_TRANSFER,
+    ROW_GROUP_SIZE_BYTES,
+    sorted_row_group_size,
 )
 
 _SHARED = ("FORMAT PARQUET", "PARQUET_VERSION 'v2'", "ROW_GROUP_SIZE_BYTES '64MB'")
@@ -130,3 +132,76 @@ def test_data_plane_read_export_options_match_transfer_exactly():
     m = re.search(r'const EXPORT_READ_PARQUET_OPTS: &str =\s*"([^"]+)";', src)
     assert m, "EXPORT_READ_PARQUET_OPTS not found in flight_service.rs"
     assert m.group(1) == PARQUET_OPTS_TRANSFER
+
+
+# A sorted COPY: what DuckDB does with its row groups, and the row count that keeps them
+# under the cap.
+
+
+def _sorted_copy(con: duckdb.DuckDBPyConnection, tmp_path: Path, opts: str) -> Path:
+    # ~20 MB of ~1 KB rows, scanned from a source of many row groups so the sort runs on
+    # several threads; the byte-cap behaviour below only shows with more than one.
+    src = tmp_path / "src.parquet"
+    con.execute(
+        "COPY (SELECT range AS k, repeat('ACGT', 250) AS s FROM range(20000) ORDER BY random()) "
+        f"TO '{src}' (FORMAT PARQUET, ROW_GROUP_SIZE 2048)"
+    )
+    out = tmp_path / "sorted.parquet"
+    con.execute("SET threads = 4")
+    con.execute(f"COPY (SELECT * FROM read_parquet('{src}') ORDER BY k) TO '{out}' ({opts})")
+    return out
+
+
+def _row_groups(con: duckdb.DuckDBPyConnection, path: Path) -> list[tuple[int, int, int]]:
+    """(rows, min k, max k) of each row group, in file order."""
+    return con.execute(
+        "SELECT row_group_num_rows, stats_min_value::BIGINT, stats_max_value::BIGINT "
+        "FROM parquet_metadata(?) WHERE path_in_schema = 'k' ORDER BY row_group_id",
+        [str(path)],
+    ).fetchall()
+
+
+def test_a_sorted_copy_ignores_the_byte_cap(tmp_path: Path):
+    # The DuckDB behaviour sorted_row_group_size exists for. If a DuckDB bump makes this
+    # fail, the byte cap may cut sorted writes again and the helper may be unneeded.
+    con = _connect()
+    out = _sorted_copy(con, tmp_path, "FORMAT PARQUET, ROW_GROUP_SIZE_BYTES '1MB'")
+    assert [rows for rows, _, _ in _row_groups(con, out)] == [20000]
+
+
+def test_a_sorted_copy_cuts_row_groups_on_whole_vectors_in_sort_order(tmp_path: Path):
+    con = _connect()
+    out = _sorted_copy(con, tmp_path, "FORMAT PARQUET, ROW_GROUP_SIZE 4097")
+    groups = _row_groups(con, out)
+    # 4,097 rows round up to three 2,048-row vectors.
+    assert {rows for rows, _, _ in groups[:-1]} == {6144}
+    # One sorted file: each row group a contiguous run of the key, in key order.
+    assert all(hi - lo + 1 == rows for rows, lo, hi in groups)
+    assert all(a[2] < b[1] for a, b in zip(groups, groups[1:]))
+
+
+def test_sorted_row_group_size_takes_the_whole_vectors_under_the_cap():
+    # 6,710 rows of 10 KB fit 64 MiB: three whole vectors.
+    assert ROW_GROUP_SIZE_BYTES == 64 * 1024 * 1024
+    assert sorted_row_group_size(10_000) == 3 * 2048
+
+
+def test_sorted_row_group_size_is_at_least_one_vector():
+    # 1,024 64 KB chunks fit the cap, but DuckDB writes no row group under one vector.
+    assert sorted_row_group_size(64 * 1024) == 2048
+    assert sorted_row_group_size(2 * ROW_GROUP_SIZE_BYTES) == 2048
+
+
+def test_sorted_row_group_size_keeps_duckdbs_default_for_narrow_rows():
+    assert sorted_row_group_size(8) == 122_880
+
+
+def test_sorted_row_group_size_follows_the_cap(monkeypatch):
+    monkeypatch.setattr(parquet, "ROW_GROUP_SIZE_BYTES", 1024 * 1024)
+    assert sorted_row_group_size(100) == 5 * 2048
+
+
+@pytest.mark.parametrize("bytes_per_row", [0, -1])
+def test_sorted_row_group_size_rejects_a_width_that_is_not_positive(bytes_per_row: int):
+    with pytest.raises(ValueError, match="bytes_per_row"):
+        sorted_row_group_size(bytes_per_row)

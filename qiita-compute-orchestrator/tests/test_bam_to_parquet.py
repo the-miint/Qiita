@@ -26,7 +26,14 @@ import asyncio
 
 import duckdb
 import pytest
-from helpers import write_chunked_blob_upload
+from helpers import (
+    SHRUNK_ROW_GROUP_SIZE_BYTES,
+    WIDE_READ_ROW_GROUPS,
+    row_group_rows,
+    wide_reads,
+    write_chunked_blob_upload,
+)
+from qiita_common import parquet
 from qiita_common.backend_failure import BackendFailure, FailureKind, StepNoData
 from qiita_common.models import (
     REDRIVABLE_WORK_TICKET_STATES,
@@ -584,9 +591,8 @@ def test_reads_are_written_as_monotone_disjoint_parts(fake_mint, monkeypatch, tm
 
     The old form was one `COPY ... ORDER BY sequence_idx`, a blocking sort over the
     whole seq+qual payload — tens of GB for a HiFi sample, and where the first real
-    PacBio run OOM'd. What that sort actually bought was not a globally sorted file
-    (every qiita_common.parquet option set writes row groups in thread-finish order
-    regardless) but tight per-row-group min/max on sequence_idx, for DuckLake pruning.
+    PacBio run OOM'd. What that sort bought for pruning was not the row order itself
+    but tight per-row-group min/max on sequence_idx, which is what DuckLake pruning reads.
 
     Batching gets the same thing for free, because the data is already monotone:
     sequence_idx = sequence_index + start - 1. So this pins the properties pruning
@@ -626,6 +632,22 @@ def test_reads_are_written_as_monotone_disjoint_parts(fake_mint, monkeypatch, tm
             bounds.append((lo, hi))
     for (_, prev_hi), (next_lo, _) in zip(bounds, bounds[1:], strict=False):
         assert prev_hi < next_lo, f"parts overlap: {bounds}"
+
+
+def test_parts_keep_wide_row_groups_under_the_byte_cap(fake_mint, monkeypatch, tmp_path):
+    """Each part's sorted COPY ignores ROW_GROUP_SIZE_BYTES (see
+    `qiita_common.parquet.sorted_row_group_size`), so it asks for a row count sized to the
+    reads. With the cap shrunk to 1 MiB, ~1 KB reads land one vector per row group instead
+    of the whole part in one."""
+    monkeypatch.setattr(parquet, "ROW_GROUP_SIZE_BYTES", SHRUNK_ROW_GROUP_SIZE_BYTES)
+    sam = tmp_path / "in.sam"
+    _write_sam(sam, [_sam_record(rid, bases, "I" * len(bases)) for rid, bases in wide_reads()])
+
+    _run(Inputs(bam_path=sam, prep_sample_idx=42, work_ticket_idx=1), tmp_path / "ws")
+
+    parts = sorted((tmp_path / "ws" / "read").glob("*.parquet"))
+    assert len(parts) == 1, "a few MB of reads is well under one part's budget"
+    assert row_group_rows(parts[0]) == WIDE_READ_ROW_GROUPS
 
 
 def test_execute_refuses_when_the_minter_state_is_unknown(monkeypatch, tmp_path):

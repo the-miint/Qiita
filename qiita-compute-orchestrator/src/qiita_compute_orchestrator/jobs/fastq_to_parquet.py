@@ -107,7 +107,7 @@ import duckdb
 from pydantic import BaseModel
 from qiita_common.backend_failure import StepNoData
 from qiita_common.duckdb_miint import is_empty_sequence_file
-from qiita_common.parquet import validate_parquet_path
+from qiita_common.parquet import sorted_row_group_size, validate_parquet_path
 
 from ..cp_client import make_cp_client
 from ..miint import (
@@ -117,6 +117,7 @@ from ..miint import (
     duckdb_tmp_dir,
     open_conn,
     open_miint_conn,
+    parquet_bytes_per_row,
 )
 from ..read_count import write_read_count
 from ..sequence_range_retry import mint_or_reuse_sequence_range
@@ -366,6 +367,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             # 1), so adding it to the sort key orders nothing — the output
             # is identical to sorting by (prep_sample_idx, sequence_idx),
             # the `read` table's join key, for row-group pruning.
+            row_group_size = sorted_row_group_size(parquet_bytes_per_row(conn, intermediate))
             conn.execute(
                 "COPY ( SELECT "
                 "  ?::BIGINT AS prep_sample_idx,"
@@ -373,7 +375,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 "  read_id, sequence1, qual1, sequence2, qual2 "
                 "FROM read_parquet(?) "
                 "ORDER BY sequence_idx ) "
-                f"TO '{out}' ({PARQUET_OPTS_AT_REST})",
+                f"TO '{out}' ({PARQUET_OPTS_AT_REST}, ROW_GROUP_SIZE {row_group_size})",
                 [inputs.prep_sample_idx, sequence_idx_start, str(intermediate)],
             )
             # Emit the raw read count: the reads out of bcl-convert,

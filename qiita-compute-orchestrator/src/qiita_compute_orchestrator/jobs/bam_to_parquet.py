@@ -49,7 +49,7 @@ import duckdb
 from pydantic import BaseModel
 from qiita_common.backend_failure import BackendFailure, FailureKind, StepNoData
 from qiita_common.models import WorkTicketFailureStage
-from qiita_common.parquet import validate_parquet_path
+from qiita_common.parquet import sorted_row_group_size, validate_parquet_path
 
 from ..cp_client import make_cp_client
 from ..miint import (
@@ -59,6 +59,7 @@ from ..miint import (
     duckdb_tmp_dir,
     open_conn,
     open_miint_conn,
+    parquet_bytes_per_row,
     resolve_duckdb_memory_gb,
 )
 from ..sequence_range_retry import mint_or_reuse_sequence_range
@@ -142,14 +143,11 @@ def _write_read_parts(
     where the first real PacBio run died. Paying for it with a bigger allocation
     would be paying for work we do not need to do.
 
-    What the ORDER BY actually buys is NOT a globally sorted file — `qiita_common.parquet`
-    says so explicitly: with `preserve_insertion_order=false` (which
-    `ROW_GROUP_SIZE_BYTES` requires) "row groups land in thread-finish order". What
-    it buys is that each row group stays CLUSTERED on the sort key, giving tight
-    per-group min/max, which is what DuckLake pruning and Parquet predicate pushdown
-    actually read.
+    What pruning reads from the sorted file is not its row order but each row group's
+    min/max on the sort key: DuckLake pruning and Parquet predicate pushdown both work
+    from those stats, and the sort gives every row group a tight, disjoint window.
 
-    Clustering does not need a global sort, because the data is already monotone:
+    That does not need a global sort, because the data is already monotone:
     `sequence_idx = sequence_index + start - 1`, and `sequence_index` is
     read_sequences_sam's per-file 1-based ordinal. So we slice on `sequence_index`
     and write one part per slice. Every row in part N has a sequence_idx strictly
@@ -163,25 +161,14 @@ def _write_read_parts(
     reference_load and hash_sequences already do — and for this same reason (a
     single-file sort+write of a large payload OOMs DuckDB).
     """
-    # Size the batch from the intermediate's UNCOMPRESSED payload, read from the
-    # Parquet footer (parquet_metadata is metadata-only — no data scan). Row count
-    # alone would be a poor proxy: HiFi reads are ~100x an Illumina read.
-    uncompressed_bytes = conn.execute(
-        "SELECT sum(total_uncompressed_size) FROM parquet_metadata(?)",
-        [str(intermediate)],
-    ).fetchone()[0]
-    if not uncompressed_bytes:
-        # Coalescing this to 0 would make bytes_per_row 1 and rows_per_part ~1e9 —
-        # i.e. ONE part, an unbounded sort over the whole sample. That is exactly the
-        # OOM this batching exists to remove, and it would come back silently. The
-        # footer of a non-empty Parquet always reports a size, so a missing one means
-        # something is wrong with the intermediate; say so.
-        raise ValueError(
-            f"parquet_metadata reported no uncompressed size for {intermediate} "
-            f"({count} rows) — cannot size the output batches"
-        )
-    bytes_per_row = max(1, uncompressed_bytes // count)
+    # Size the parts and their row groups from the intermediate's UNCOMPRESSED
+    # payload, read from the Parquet footer. Row count alone would be a poor proxy:
+    # HiFi reads are ~100x an Illumina read. A footer with no size raises rather than
+    # sizing for 1-byte rows, which would make ONE part — an unbounded sort over the
+    # whole sample, exactly the OOM this batching exists to remove.
+    bytes_per_row = parquet_bytes_per_row(conn, intermediate)
     rows_per_part = max(1, _ROWS_PER_PART_TARGET_BYTES // bytes_per_row)
+    row_group_size = sorted_row_group_size(bytes_per_row)
 
     # Created here, not up front: a run that fails before this point (bad input, a
     # duplicate QNAME, a refused mint) must leave NO output directory behind for the
@@ -203,7 +190,7 @@ def _write_read_parts(
             # explicit — preserve_insertion_order=false means DuckDB is free to emit
             # a batch's rows out of order, and the clustering is the point.
             "ORDER BY sequence_idx ) "
-            f"TO '{part}' ({PARQUET_OPTS_AT_REST})",
+            f"TO '{part}' ({PARQUET_OPTS_AT_REST}, ROW_GROUP_SIZE {row_group_size})",
             [prep_sample_idx, sequence_idx_start, str(intermediate), lo, hi],
         )
         parts += 1
