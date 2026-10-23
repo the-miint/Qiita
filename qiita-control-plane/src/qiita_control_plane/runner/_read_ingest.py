@@ -22,6 +22,7 @@ from ..block_read import READ_MASKED_TABLE
 from ..host_filter_resolver import is_control_sample
 from ..miint import connect_with_miint_staged
 from ..preflight import AmpliconBarcode, AmpliconPreflightError, amplicon_barcode_from_blob
+from ..problem_list import capped
 from ..repositories.block import MASK_SAMPLE_COMPLETED, fetch_mask_sample_state
 from ..repositories.prep_sample import fetch_biosample_idx_for_prep_sample
 from ..repositories.sequenced_sample import (
@@ -482,10 +483,7 @@ def _barcode_roster_mismatches(
             )
     for idx in sorted(set(expected) - seen):
         problems.append(f"prep_sample_idx {idx} is missing from barcode_map")
-    if len(problems) > _MAX_ROSTER_MISMATCHES_SHOWN:
-        extra = len(problems) - _MAX_ROSTER_MISMATCHES_SHOWN
-        problems = [*problems[:_MAX_ROSTER_MISMATCHES_SHOWN], f"and {extra} more"]
-    return problems
+    return capped(problems, _MAX_ROSTER_MISMATCHES_SHOWN)
 
 
 async def _stage_ena_run_roster(
