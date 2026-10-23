@@ -921,8 +921,9 @@ def _handle_submit_host_filter_pool(
     way an un-caught raise would. The summary lists every submitted and every
     failed sample, and the command exits non-zero if any sample failed, so a
     partial fan-out is visible and re-runnable rather than silent. A sample
-    whose reads were never stored fails its own ticket at the runner's
-    staged-read resolution (and shows up in the per-sample summary, not here).
+    with no stored reads ends its own ticket at the runner's staged-read
+    resolution: `no_data` when ingest found it empty or it is an expected-empty
+    control, failed otherwise (it shows up in the per-sample summary, not here).
 
     `--only-missing` skips samples that already have a read-mask ticket (any
     state, via the roster's has_read_mask_ticket flag), submitting only those
