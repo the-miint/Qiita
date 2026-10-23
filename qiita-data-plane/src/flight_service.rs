@@ -1455,8 +1455,7 @@ where
                     // job). A DoPut upload is consumed once, like an intermediate,
                     // but its disk-residency is "from /done to (eventual)
                     // cleanup," not "until the next phase in the same job." That
-                    // can be minutes to indefinitely with the current no-sweep
-                    // follow-up open, so it is a transfer file: the disk-footprint
+                    // can be minutes or much longer, so it is a transfer file: the disk-footprint
                     // tradeoff outweighs the snappy fast-decode win at GG2 scale.
                     // Backbone FASTA blew up to ~3.5× the source on disk under
                     // uncompressed v1 (DNA-chunk VARCHAR columns don't
@@ -1583,8 +1582,8 @@ where
 }
 
 /// Canonical Parquet write options for an exported reads file: a copy of
-/// `qiita_common.parquet.PARQUET_OPTS_TRANSFER`, pinned equal by
-/// `qiita-common/tests/test_parquet.py`. The materialized file has the shape of the
+/// `qiita_common.parquet.PARQUET_OPTS_TRANSFER`, which a qiita-common test pins it
+/// equal to. The materialized file has the shape of the
 /// durable copy `ingest_reads` first wrote (Parquet v2, zstd, 64 MB row groups), but
 /// a job reads it and it is dropped, so it takes zstd's default level rather than
 /// the at-rest one.

@@ -42,7 +42,8 @@ pub(crate) fn validate_sql_literal(value: &str, field: &str) -> Result<(), Strin
 /// tables: `qiita_common.chunking.CHUNK_ROW_GROUP_SIZE`, ~1 GB of dense 64 KB chunks. The
 /// chunk files the orchestrator registers into those tables do not use it; their sorted
 /// writer sizes row groups from the chunks' width
-/// (`qiita_common.parquet.sorted_row_group_size`).
+/// (`qiita_common.parquet.sorted_row_group_size`). A qiita-common test parses this line
+/// and pins it to the Python constant.
 const CHUNK_ROW_GROUP_SIZE: u64 = 16384;
 
 /// Connect to DuckLake backed by a Postgres catalog.
@@ -66,8 +67,8 @@ pub fn connect_ducklake(
 
 /// The zstd level for data at rest: a copy of
 /// `qiita_common.parquet.PARQUET_COMPRESSION_LEVEL_AT_REST`, which carries the
-/// measurements behind it. Rust cannot import the Python, so
-/// `qiita-common/tests/test_parquet.py` parses this line and pins the two equal.
+/// measurements behind it. Rust cannot import the Python, so a qiita-common test parses
+/// this line and pins the two equal.
 const PARQUET_COMPRESSION_LEVEL_AT_REST: u8 = 16;
 
 /// Set the catalog-global Parquet options DuckLake uses for its OWN writes
@@ -83,8 +84,8 @@ const PARQUET_COMPRESSION_LEVEL_AT_REST: u8 = 16;
 /// connection. Setting it on every attach made
 /// each concurrent Flight request UPDATE the same `ducklake_metadata` row, which
 /// serialized and failed under load with Postgres SQLSTATE 40001
-/// (`could not serialize access due to concurrent update`). Keep the values in
-/// sync with PARQUET_OPTS_AT_REST.
+/// (`could not serialize access due to concurrent update`). A qiita-common test
+/// parses the three values below and pins them to PARQUET_OPTS_AT_REST.
 pub fn set_catalog_options(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
     conn.execute_batch(&format!(
         "CALL qiita_lake.set_option('parquet_compression', 'zstd');

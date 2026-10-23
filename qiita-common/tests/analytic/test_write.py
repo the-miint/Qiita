@@ -33,8 +33,8 @@ def test_both_writers_copy_the_RELABELLED_relation(build, tmp_path):
     assert ft.OGU_OUTPUT_TABLE not in sql
 
 
-def test_the_parquet_writer_uses_the_canonical_options(tmp_path):
-    """One definition of the Parquet shape for every artifact qiita writes, so a
+def test_the_parquet_writer_uses_the_transfer_options(tmp_path):
+    """The analytic's files are transfer files, so they take the one transfer set, and a
     version or compression bump moves in one place."""
     assert PARQUET_OPTS_TRANSFER in ft.parquet_copy_sql(tmp_path / "t.parquet")
 

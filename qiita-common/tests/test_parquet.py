@@ -106,19 +106,39 @@ def test_at_rest_level_reaches_the_writer(tmp_path: Path):
     assert _disk_bytes(con, at_rest) < _disk_bytes(con, transfer)
 
 
-def test_ducklake_catalog_level_matches_the_rust_one_exactly():
-    # DuckLake's own writes (inserts, compaction) are data at rest too, so the data plane
-    # sets the same level on the catalog. Rust cannot import the Python, so the value is
-    # parsed out of the source; drift would leave compacted files at a different level
-    # with nothing failing.
-    import re
-
-    src = (
+def _ducklake_rs() -> str:
+    return (
         Path(__file__).resolve().parents[2] / "qiita-data-plane" / "src" / "ducklake.rs"
     ).read_text()
-    m = re.search(r"const PARQUET_COMPRESSION_LEVEL_AT_REST: \w+ = (\d+);", src)
-    assert m, "PARQUET_COMPRESSION_LEVEL_AT_REST not found in ducklake.rs"
-    assert int(m.group(1)) == PARQUET_COMPRESSION_LEVEL_AT_REST
+
+
+def test_ducklake_catalog_options_match_the_at_rest_set_exactly():
+    # DuckLake's own writes (inserts, compaction) are data at rest too, so the data plane
+    # sets the at-rest codec, level and Parquet version on the catalog. The values are
+    # parsed out of the Rust source; drift would leave DuckLake-written files in another
+    # format with nothing failing.
+    import re
+
+    src = _ducklake_rs()
+    level = re.search(r"const PARQUET_COMPRESSION_LEVEL_AT_REST: \w+ = (\d+);", src)
+    assert level, "PARQUET_COMPRESSION_LEVEL_AT_REST not found in ducklake.rs"
+    assert int(level.group(1)) == PARQUET_COMPRESSION_LEVEL_AT_REST
+    codec = re.search(r"set_option\('parquet_compression', '(\w+)'\)", src)
+    assert codec, "parquet_compression set_option not found in ducklake.rs"
+    assert f"COMPRESSION '{codec.group(1)}'" in PARQUET_OPTS_AT_REST
+    version = re.search(r"set_option\('parquet_version', (\d+)\)", src)
+    assert version, "parquet_version set_option not found in ducklake.rs"
+    assert f"PARQUET_VERSION 'v{version.group(1)}'" in PARQUET_OPTS_AT_REST
+
+
+def test_ducklake_chunk_row_group_size_matches_the_python_one_exactly():
+    import re
+
+    from qiita_common.chunking import CHUNK_ROW_GROUP_SIZE
+
+    m = re.search(r"const CHUNK_ROW_GROUP_SIZE: \w+ = (\d+);", _ducklake_rs())
+    assert m, "CHUNK_ROW_GROUP_SIZE not found in ducklake.rs"
+    assert int(m.group(1)) == CHUNK_ROW_GROUP_SIZE
 
 
 def test_data_plane_read_export_options_match_transfer_exactly():
@@ -163,7 +183,8 @@ def _row_groups(con: duckdb.DuckDBPyConnection, path: Path) -> list[tuple[int, i
 
 def test_a_sorted_copy_ignores_the_byte_cap(tmp_path: Path):
     # The DuckDB behaviour sorted_row_group_size exists for. If a DuckDB bump makes this
-    # fail, the byte cap may cut sorted writes again and the helper may be unneeded.
+    # fail, that DuckDB applies the byte cap to a sorted COPY, and the helper may be
+    # unneeded.
     con = _connect()
     out = _sorted_copy(con, tmp_path, "FORMAT PARQUET, ROW_GROUP_SIZE_BYTES '1MB'")
     assert [rows for rows, _, _ in _row_groups(con, out)] == [20000]
@@ -180,14 +201,59 @@ def test_a_sorted_copy_cuts_row_groups_on_whole_vectors_in_sort_order(tmp_path: 
     assert all(a[2] < b[1] for a, b in zip(groups, groups[1:]))
 
 
+def test_a_sorted_copy_defaults_to_the_largest_row_count_the_helper_gives(tmp_path: Path):
+    # sorted_row_group_size never asks for more rows than DuckDB's default, so narrow rows
+    # keep the groups they would get without it. That default is DuckDB's, not ours.
+    con = _connect()
+    src = tmp_path / "narrow.parquet"
+    con.execute(
+        "COPY (SELECT range AS k FROM range(300000) ORDER BY random()) "
+        f"TO '{src}' (FORMAT PARQUET, ROW_GROUP_SIZE 2048)"
+    )
+    out = tmp_path / "sorted.parquet"
+    con.execute("SET threads = 4")
+    con.execute(
+        f"COPY (SELECT * FROM read_parquet('{src}') ORDER BY k) TO '{out}' (FORMAT PARQUET)"
+    )
+    rows = [rows for rows, _, _ in _row_groups(con, out)]
+    assert rows[:-1] == [sorted_row_group_size(1)] * (len(rows) - 1)
+
+
+def test_the_byte_cap_int_is_what_duckdb_reads_the_literal_as(tmp_path: Path):
+    # DuckDB's MB is decimal, so '8MB' cuts where 8,000,000 does and not where 2^23 does.
+    # The two caps are ~4.9% apart, which on 100-byte rows is several 2,048-row vectors.
+    con = _connect()
+    con.execute("SET threads = 1")
+
+    def rows_per_group(cap: str) -> list[int]:
+        out = tmp_path / "capped.parquet"
+        con.execute(
+            "COPY (SELECT repeat('A', 92) || lpad(range::VARCHAR, 8, '0') AS s "
+            f"FROM range(200000)) TO '{out}' (FORMAT PARQUET, COMPRESSION 'uncompressed', "
+            f"ROW_GROUP_SIZE_BYTES {cap})"
+        )
+        return [
+            r[0]
+            for r in con.execute(
+                "SELECT row_group_num_rows FROM parquet_metadata(?) ORDER BY row_group_id",
+                [str(out)],
+            ).fetchall()
+        ]
+
+    assert rows_per_group("'8MB'") == rows_per_group("8000000")
+    assert rows_per_group("'8MB'") != rows_per_group(str(8 * 1024 * 1024))
+    assert ROW_GROUP_SIZE_BYTES == 64 * 1000 * 1000
+    for opts in (PARQUET_OPTS_AT_REST, PARQUET_OPTS_TRANSFER, PARQUET_OPTS_INTERMEDIATE):
+        assert "ROW_GROUP_SIZE_BYTES '64MB'" in opts
+
+
 def test_sorted_row_group_size_takes_the_whole_vectors_under_the_cap():
-    # 6,710 rows of 10 KB fit 64 MiB: three whole vectors.
-    assert ROW_GROUP_SIZE_BYTES == 64 * 1024 * 1024
+    # 6,400 rows of 10 KB fit 64 MB: three whole vectors.
     assert sorted_row_group_size(10_000) == 3 * 2048
 
 
 def test_sorted_row_group_size_is_at_least_one_vector():
-    # 1,024 64 KB chunks fit the cap, but DuckDB writes no row group under one vector.
+    # 976 64 KiB chunks fit the cap, but DuckDB writes no row group under one vector.
     assert sorted_row_group_size(64 * 1024) == 2048
     assert sorted_row_group_size(2 * ROW_GROUP_SIZE_BYTES) == 2048
 

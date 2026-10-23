@@ -3,8 +3,7 @@
 from pathlib import Path
 
 # DuckDB COPY option sets for the Parquet qiita writes, one per kind of file. A writer
-# picks the set for where its file ends up; there is deliberately no unqualified set to
-# reach for.
+# picks the set for where its file ends up; there is no unqualified set to reach for.
 #
 #   PARQUET_OPTS_AT_REST       a file the data plane registers into DuckLake. Registration
 #                              moves the writer's bytes into the lake without rewriting
@@ -15,14 +14,14 @@ from pathlib import Path
 #                              user's disk.
 #   PARQUET_OPTS_INTERMEDIATE  a file a later phase of the same job reads once and deletes.
 #
-# Single-sourced HERE because qiita-common is the one module both the compute orchestrator
+# Single-sourced here because qiita-common is the one module both the compute orchestrator
 # and the control plane depend on. The orchestrator (`qiita_compute_orchestrator.miint`)
 # re-exports these and derives the chunked variants.
 #
 # ROW_GROUP_SIZE_BYTES '64MB' (all three sets) caps each row group by encoded size (on top
 # of DuckDB's default row-count threshold) so a wide-row result flushes row groups at
 # ~64 MB instead of buffering one giant group — sharper row-group predicate pushdown
-# (tighter per-group min/max) and lower peak write memory. It REQUIRES
+# (tighter per-group min/max) and lower peak write memory. It requires
 # `SET preserve_insertion_order=false` on the writing connection (DuckDB errors at bind
 # time otherwise). A COPY whose query ends in ORDER BY does not get the cap; a sorted
 # writer of wide rows adds the row count `sorted_row_group_size` gives it.
@@ -41,11 +40,10 @@ def _copy_options(codec: str, level: int | None = None) -> str:
 # spelling it again. `ROW_GROUP_SIZE_BYTES` below exists for the same reason.
 PARQUET_COMPRESSION: str = "zstd"
 
-# The zstd level for data at rest, measured on DuckDB 1.5.5's Parquet writer. On a
-# production long-read sample it took sequence1 from 1.314 to 1.123 bits/base on disk
+# The zstd level for data at rest, measured on DuckDB 1.5.5's Parquet writer. On one
+# production long-read prep_sample it took sequence1 from 1.314 to 1.123 bits/base on disk
 # (-14.6%); level 19 compressed the same at about half the write speed, and levels 4-12
-# found fewer repeats in DNA than level 3 (their hash-chain match finders search too few
-# candidates on a four-letter alphabet). The cost is write CPU: ~6 MB/s per thread on DNA
+# found fewer repeats in DNA than level 3. The cost is write CPU: ~6 MB/s per thread on DNA
 # against ~350 MB/s at level 3. Decompression speed does not depend on the level.
 PARQUET_COMPRESSION_LEVEL_AT_REST: int = 16
 PARQUET_OPTS_AT_REST: str = _copy_options(PARQUET_COMPRESSION, PARQUET_COMPRESSION_LEVEL_AT_REST)
@@ -54,18 +52,17 @@ PARQUET_OPTS_AT_REST: str = _copy_options(PARQUET_COMPRESSION, PARQUET_COMPRESSI
 # at-rest level's write cost buys nothing that lasts.
 PARQUET_OPTS_TRANSFER: str = _copy_options(PARQUET_COMPRESSION)
 
-# snappy decompresses faster than zstd at the cost of a larger file, the right trade for
-# a file whose lifetime is "until the next phase reads it".
+# snappy decompresses faster than zstd at the cost of a larger file, which suits a file
+# whose lifetime is "until the next phase reads it".
 PARQUET_COMPRESSION_INTERMEDIATE: str = "snappy"
 PARQUET_OPTS_INTERMEDIATE: str = _copy_options(PARQUET_COMPRESSION_INTERMEDIATE)
 
-# The `ROW_GROUP_SIZE_BYTES '64MB'` cap above, as an int, for write paths that
-# size row groups themselves: a pyarrow `ParquetWriter` fed a Flight stream (the
-# admin masked-read export), and a sorted COPY (`sorted_row_group_size`). Sizing by
-# encoded bytes (not a fixed row count) is what keeps row groups sane across
-# qiita's varying row widths — a fixed row count large enough for narrow reads is
-# far too big for wide rows. Keep in sync with the literal in `_copy_options`.
-ROW_GROUP_SIZE_BYTES: int = 64 * 1024 * 1024
+# The `ROW_GROUP_SIZE_BYTES '64MB'` cap above, as an int, for writers that size row
+# groups themselves. DuckDB's MB is decimal (its MiB is binary), so this is 64,000,000;
+# a test pins the two equal. Sizing by encoded bytes (not a fixed row count) is what
+# keeps row groups sane across qiita's varying row widths — a fixed row count large
+# enough for narrow reads is far too big for wide rows.
+ROW_GROUP_SIZE_BYTES: int = 64_000_000
 
 # DuckDB's Parquet writer, by rows: a row group of this many unless a COPY says otherwise,
 # built from vectors of this many.

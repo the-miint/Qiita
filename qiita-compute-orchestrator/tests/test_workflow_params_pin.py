@@ -289,9 +289,9 @@ def test_fastq_to_parquet_cpu_pins_duckdb_threads():
     `fastq_to_parquet._DUCKDB_THREADS`, in every version.
 
     The step's cores are spent by its DuckDB pool, and above all by the final write's
-    at-rest compression, which runs one row group per thread. A `cpu:` above the literal
-    allocates cores nothing uses; one below it oversubscribes the pool onto fewer. The
-    measurement behind the literal is stated once, on `_DUCKDB_THREADS`.
+    at-rest compression (see `qiita_common.parquet.sorted_row_group_size`). A `cpu:` above
+    the literal allocates cores nothing uses; one below it oversubscribes the pool onto
+    fewer. The measurement behind the literal is stated once, on `_DUCKDB_THREADS`.
     """
     mod = importlib.import_module("qiita_compute_orchestrator.jobs.fastq_to_parquet")
     for where, cpu in _baseline_cpu_every_version("fastq-to-parquet", "fastq"):
@@ -328,9 +328,9 @@ def test_golay_demux_cpu_pins_duckdb_threads():
     """`golay-demux`'s `golay_demux` step: baseline `cpu:` must equal
     `golay_demux._DUCKDB_THREADS`.
 
-    Its per-sample writes run one at a time, each a sorted COPY at the at-rest zstd
-    level that compresses one row group per thread, so the pool is what the step's
-    cores are for, as on `fastq_to_parquet`'s pin above.
+    Its per-prep_sample writes run one at a time, each a sorted COPY at the at-rest zstd
+    level, so the pool is what the step's cores are for, as on `fastq_to_parquet`'s pin
+    above.
     """
     mod = importlib.import_module("qiita_compute_orchestrator.jobs.golay_demux")
     for where, cpu in _baseline_cpu_every_version("golay-demux", "golay_demux"):

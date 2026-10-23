@@ -137,7 +137,7 @@ YAML_STEP_NAME = "fastq"
 # cgroup: in every workflows/fastq-to-parquet/ version, `cpu` is
 # _DUCKDB_THREADS and `mem_gb` covers _DUCKDB_MEMORY_GB plus
 # `duckdb_headroom_gb(_DUCKDB_THREADS)` for Python/miint/OS and DuckDB's
-# above-limit overshoot (both pinned in tests/test_workflow_params_pin.py).
+# above-limit overshoot (a workflow test pins both).
 # A thread's writer state is about one row group: ~2.4 GB of long reads at
 # DuckDB's default 122,880 rows (2048 STANDARD_VECTOR_SIZE × 60 × ~20 KB avg
 # long-read record incl. quality), but both COPYs here cap it near 64 MB —
@@ -153,13 +153,13 @@ YAML_STEP_NAME = "fastq"
 #      cannot reach DuckDB here — an escalated retry re-OOMs at this same value.
 #   2. The final write is still ONE blocking `COPY ... ORDER BY sequence_idx` over
 #      the full seq+qual payload. bam_to_parquet now batches that into bounded
-#      monotone parts precisely because it OOM'd on real long reads. The claim above
-#      that 7 GB "covers long-read inputs" is the same claim that proved false there,
-#      and an ONT run arrives through THIS path as FASTQ.
+#      monotone parts precisely because it OOM'd on real long reads. A memory sizing
+#      like the one above proved false there, and an ONT run arrives through THIS
+#      path as FASTQ.
 _DUCKDB_MEMORY_GB = 7
 # 8 threads because the final write compresses at the at-rest zstd level, one row
 # group per thread. On an unsorted COPY of synthetic paired reads, whose row groups
-# the byte cap keeps as small as `sorted_row_group_size` now keeps the sorted write's,
+# the byte cap keeps as small as `sorted_row_group_size` keeps the sorted write's,
 # that level's added cost measured ~99 s per GB of logical read data at 2 threads and
 # ~46 s at 8 (DuckDB 1.5.5, a shared 32-core dev box, fastest of repeats).
 _DUCKDB_THREADS = 8

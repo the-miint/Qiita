@@ -32,7 +32,7 @@ from pathlib import Path
 import duckdb
 from qiita_common.parquet import sorted_row_group_size, validate_parquet_path
 
-from ..miint import PARQUET_OPTS_AT_REST, parquet_bytes_per_row
+from ..miint import PARQUET_OPTS_AT_REST
 
 # Per-batch chunk budget, shared by every pass that reassembles or rewrites
 # chunked sequence data (`write_feature_sequence_chunks` here; the hashing pass and
@@ -43,6 +43,10 @@ from ..miint import PARQUET_OPTS_AT_REST, parquet_bytes_per_row
 # `string_agg` / sort over the whole corpus), so a tuning change that fixes one and
 # not the others is not a fix.
 CHUNK_BUDGET_PER_BATCH = 50_000
+
+# The bytes beside each `chunk_data` in a written chunk row: feature_idx BIGINT and
+# chunk_index INTEGER.
+_CHUNK_KEY_BYTES = 12
 
 
 def bin_pack_by_chunks[K](items: list[tuple[K, int]]) -> list[list[K]]:
@@ -211,8 +215,6 @@ def write_feature_sequence_chunks(
     )
 
     if batches:
-        # One width for every part: they all hold the same chunks the glob does.
-        row_group_size = sorted_row_group_size(parquet_bytes_per_row(conn, parts_glob))
         for i, batch_hashes in enumerate(batches):
             part_path = out_dir / f"part_{i:05d}.parquet"
             part_out = validate_parquet_path(part_path)
@@ -257,6 +259,17 @@ def write_feature_sequence_chunks(
             # without this sort a point query would scan a whole part. The
             # secondary `chunk_index` orders a feature's chunks for cheap
             # reassembly.
+            #
+            # The row count comes from this part's own width, not the input's: a
+            # reference that mixes short records with genomes has parts of very
+            # different widths, and an input-wide mean would size a part of full 64 KB
+            # chunks for the short records.
+            chunks, chunk_bytes = conn.execute(
+                "SELECT count(*), sum(strlen(chunk_data)) FROM part_chunks"
+            ).fetchone()
+            if not chunks:
+                raise ValueError(f"batch {i} matched no chunks in {parts_glob}")
+            row_group_size = sorted_row_group_size(_CHUNK_KEY_BYTES + chunk_bytes // chunks)
             conn.execute(
                 "COPY ("
                 "  SELECT feature_idx, chunk_index, chunk_data"

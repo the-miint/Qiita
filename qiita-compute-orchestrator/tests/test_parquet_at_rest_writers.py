@@ -1,16 +1,21 @@
-"""Files the data plane registers are written with the at-rest Parquet options; no other file is.
+"""Jobs whose files the data plane registers name the at-rest Parquet options; no other
+job does.
 
-`register-files` moves a step's staged Parquet into DuckLake without rewriting it, so the
-job that wrote the file is the only place its compression is decided — and the at-rest
-level's write cost is only worth paying for a file that stays in the lake. Neither side of
-that is visible from a single job, so this derives the jobs whose output is registered from
-the workflow YAMLs and checks every orchestrator module's source against it:
+Why a registered file's writer is the one place its compression is decided is stated in
+`qiita_common.parquet`. Which jobs those are is not visible from a single job, so this
+derives the jobs whose output is registered from the workflow YAMLs and checks every
+orchestrator module's source against it:
 
 - a module whose output is registered names an at-rest set, or calls one of the helpers that
   write registered files;
-- such a module, and those helpers, name no transfer set (their only other option is
-  PARQUET_OPTS_INTERMEDIATE, for files the same job deletes);
+- such a module, and those helpers, name no transfer set;
 - no other module names an at-rest set.
+
+It checks which option sets a module's source names, not which set each file is written
+with. A registering module may also name PARQUET_OPTS_INTERMEDIATE, for the scratch files
+it deletes, so a registered file written with that set would pass. Which names are at-rest
+or transfer sets is read from the sets' values, so a set added under a new name is checked
+too.
 """
 
 from __future__ import annotations
@@ -21,15 +26,41 @@ from pathlib import Path
 
 import pytest
 import yaml
+from qiita_common import parquet
+from qiita_common.api_paths import LibraryPrimitive
 
 import qiita_compute_orchestrator
+from qiita_compute_orchestrator import miint
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _WORKFLOWS_DIR = _REPO_ROOT / "workflows"
 _PACKAGE_DIR = Path(qiita_compute_orchestrator.__file__).resolve().parent
 
-_AT_REST_SETS = frozenset({"PARQUET_OPTS_AT_REST"})
-_TRANSFER_SETS = frozenset({"PARQUET_OPTS_TRANSFER", "PARQUET_OPTS_CHUNKED_TRANSFER"})
+
+def _option_sets() -> tuple[frozenset[str], frozenset[str]]:
+    """The at-rest and the transfer option-set names, from every set the two defining
+    modules carry, classified by what the set says: a compression level marks at rest, zstd
+    without one transfer, and snappy intermediate. A set that fits none fails here, so a new
+    one cannot go unchecked."""
+    at_rest: set[str] = set()
+    transfer: set[str] = set()
+    unclassified: list[str] = []
+    for module in (parquet, miint):
+        for name in dir(module):
+            if not name.startswith("PARQUET_OPTS"):
+                continue
+            value = getattr(module, name)
+            if "COMPRESSION_LEVEL" in value:
+                at_rest.add(name)
+            elif "COMPRESSION 'zstd'" in value:
+                transfer.add(name)
+            elif "COMPRESSION 'snappy'" not in value:
+                unclassified.append(f"{module.__name__}.{name}")
+    assert not unclassified, f"option sets of no known kind: {unclassified}"
+    return frozenset(at_rest), frozenset(transfer)
+
+
+_AT_REST_SETS, _TRANSFER_SETS = _option_sets()
 
 # Shared writers of registered files, and the functions through which jobs reach them.
 _AT_REST_HELPERS: dict[str, frozenset[str]] = {
@@ -50,7 +81,7 @@ def _registering_modules() -> dict[str, set[str]]:
     for yaml_path in sorted(_WORKFLOWS_DIR.glob("*/*.yaml")):
         steps = yaml.safe_load(yaml_path.read_text()).get("steps", [])
         for i, step in enumerate(steps):
-            if step.get("action") != "register-files":
+            if step.get("action") != LibraryPrimitive.REGISTER_FILES:
                 continue
             for name in step.get("inputs", []):
                 producers = [s for s in steps[:i] if name in (s.get("outputs") or [])]
@@ -72,26 +103,34 @@ def _module_path(module: str) -> Path:
 
 
 def _names(path: Path) -> set[str]:
-    """Every identifier a module reads or imports."""
+    """Every identifier a module reads or imports, bare or as an attribute."""
     names: set[str] = set()
     for node in ast.walk(ast.parse(path.read_text(), filename=str(path))):
         if isinstance(node, ast.Name):
             names.add(node.id)
+        elif isinstance(node, ast.Attribute):
+            names.add(node.attr)
         elif isinstance(node, ast.ImportFrom):
             names.update(alias.asname or alias.name for alias in node.names)
     return names
 
 
 def _all_modules() -> dict[str, Path]:
-    return {
-        "qiita_compute_orchestrator."
-        + ".".join(p.relative_to(_PACKAGE_DIR).with_suffix("").parts): p
-        for p in sorted(_PACKAGE_DIR.rglob("*.py"))
-        if p.name != "__init__.py"
-    }
+    modules: dict[str, Path] = {}
+    for p in sorted(_PACKAGE_DIR.rglob("*.py")):
+        parts = p.relative_to(_PACKAGE_DIR).with_suffix("").parts
+        if parts[-1] == "__init__":
+            parts = parts[:-1]
+        modules[".".join(("qiita_compute_orchestrator", *parts))] = p
+    return modules
 
 
 _REGISTERING = _registering_modules()
+
+
+def test_option_sets_are_classified():
+    assert "PARQUET_OPTS_AT_REST" in _AT_REST_SETS
+    assert {"PARQUET_OPTS_TRANSFER", "PARQUET_OPTS_CHUNKED_TRANSFER"} <= _TRANSFER_SETS
 
 
 def test_registering_modules_are_found():

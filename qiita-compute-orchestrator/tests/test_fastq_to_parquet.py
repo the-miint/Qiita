@@ -30,7 +30,7 @@ import duckdb
 import pytest
 from helpers import (
     SHRUNK_ROW_GROUP_SIZE_BYTES,
-    WIDE_READ_ROW_GROUPS,
+    WIDE_ROW_GROUPS,
     row_group_rows,
     wide_reads,
     write_chunked_blob_upload,
@@ -140,7 +140,7 @@ def test_execute_keeps_wide_row_groups_under_the_byte_cap(fake_mint, monkeypatch
     """The final sorted COPY ignores ROW_GROUP_SIZE_BYTES (see
     `qiita_common.parquet.sorted_row_group_size`), so it asks for a row count sized to the
     reads. With the cap shrunk to 1 MiB, ~1 KB reads land one vector per row group instead
-    of the whole sample in one."""
+    of the whole read set in one."""
     monkeypatch.setattr(parquet, "ROW_GROUP_SIZE_BYTES", SHRUNK_ROW_GROUP_SIZE_BYTES)
     fastq = tmp_path / "in.fastq"
     fastq.write_text(
@@ -150,7 +150,7 @@ def test_execute_keeps_wide_row_groups_under_the_byte_cap(fake_mint, monkeypatch
         Inputs(fastq_path=fastq, prep_sample_idx=42, work_ticket_idx=1),
         tmp_path / "ws",
     )
-    assert row_group_rows(outputs["reads"]) == WIDE_READ_ROW_GROUPS
+    assert row_group_rows(outputs["reads"]) == WIDE_ROW_GROUPS
 
 
 def test_execute_handles_fasta_with_null_quality(fake_mint, tmp_path):

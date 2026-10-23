@@ -28,7 +28,7 @@ import duckdb
 import pytest
 from helpers import (
     SHRUNK_ROW_GROUP_SIZE_BYTES,
-    WIDE_READ_ROW_GROUPS,
+    WIDE_ROW_GROUPS,
     row_group_rows,
     wide_reads,
     write_chunked_blob_upload,
@@ -647,7 +647,7 @@ def test_parts_keep_wide_row_groups_under_the_byte_cap(fake_mint, monkeypatch, t
 
     parts = sorted((tmp_path / "ws" / "read").glob("*.parquet"))
     assert len(parts) == 1, "a few MB of reads is well under one part's budget"
-    assert row_group_rows(parts[0]) == WIDE_READ_ROW_GROUPS
+    assert row_group_rows(parts[0]) == WIDE_ROW_GROUPS
 
 
 def test_execute_refuses_when_the_minter_state_is_unknown(monkeypatch, tmp_path):

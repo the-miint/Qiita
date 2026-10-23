@@ -27,8 +27,8 @@ BIOM_GENERATED_BY = "qiita-miint"
 
 
 def parquet_copy_sql(path: Path) -> str:
-    """COPY the relabelled table to Parquet, with the canonical options every qiita
-    Parquet artifact shares.
+    """COPY the relabelled table to Parquet with the transfer option set: the file leaves
+    the job but is never registered into the lake.
 
     `PARQUET_OPTS_TRANSFER`' `ROW_GROUP_SIZE_BYTES` requires `SET preserve_insertion_order =
     false` on the writing connection — DuckDB errors at bind time otherwise — which is
@@ -60,8 +60,8 @@ def biom_copy_sql(path: Path) -> str:
 
 
 def taxonomy_copy_sql(path: Path, *, clearance: TaxonomyClearance) -> str:
-    """COPY the sidecar to Parquet, with the options every qiita Parquet artifact
-    shares. Parquet and not TSV: the ranks are eight nullable strings, and a TSV cannot
+    """COPY the sidecar to Parquet with the transfer option set, like the table. Parquet
+    and not TSV: the ranks are eight nullable strings, and a TSV cannot
     tell an empty rank from an absent one without a convention every reader has to be
     told about.
 
@@ -80,8 +80,7 @@ def taxonomy_copy_sql(path: Path, *, clearance: TaxonomyClearance) -> str:
 
 
 def tree_copy_sql(path: Path, *, clearance: TreeClearance) -> str:
-    """COPY the sheared tree to Parquet, with the options every qiita Parquet artifact
-    shares.
+    """COPY the sheared tree to Parquet with the transfer option set, like the table.
 
     **Parquet, not Newick.** We ship the node table and let a consumer that wants Newick
     convert it — which also keeps `COPY … (FORMAT NEWICK)`'s edge-id default from being

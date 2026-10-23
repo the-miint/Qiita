@@ -161,11 +161,11 @@ def _write_read_parts(
     reference_load and hash_sequences already do — and for this same reason (a
     single-file sort+write of a large payload OOMs DuckDB).
     """
-    # Size the parts and their row groups from the intermediate's UNCOMPRESSED
+    # Size the parts and their row groups from the intermediate's uncompressed
     # payload, read from the Parquet footer. Row count alone would be a poor proxy:
     # HiFi reads are ~100x an Illumina read. A footer with no size raises rather than
-    # sizing for 1-byte rows, which would make ONE part — an unbounded sort over the
-    # whole sample, exactly the OOM this batching exists to remove.
+    # sizing for 1-byte rows, which would make one part — an unbounded sort over the
+    # whole read set, exactly the OOM this batching exists to remove.
     bytes_per_row = parquet_bytes_per_row(conn, intermediate)
     rows_per_part = max(1, _ROWS_PER_PART_TARGET_BYTES // bytes_per_row)
     row_group_size = sorted_row_group_size(bytes_per_row)

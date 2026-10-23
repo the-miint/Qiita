@@ -66,20 +66,20 @@ def shard_yaml_baseline_gb(step_name: str) -> int:
     raise AssertionError(f"build-shard-index declares no {step_name} step")
 
 
-# Reads wide enough that one 2,048-row vector of them overruns a 1 MiB row-group byte cap,
+# Rows wide enough that one 2,048-row vector of them overruns a 1 MiB row-group byte cap,
 # and enough of them for three row groups once a writer sizes its sorted row groups to that
 # cap (`qiita_common.parquet.sorted_row_group_size`). A test shrinks the cap to
-# SHRUNK_ROW_GROUP_SIZE_BYTES so a few MB of rows show what 64 MB groups of real reads do.
+# SHRUNK_ROW_GROUP_SIZE_BYTES so a few MB of rows show what 64 MB groups of real ones do.
 SHRUNK_ROW_GROUP_SIZE_BYTES = 1024 * 1024
 WIDE_READ_BASES = 1000
-WIDE_READ_COUNT = 6000
-WIDE_READ_ROW_GROUPS = [2048, 2048, WIDE_READ_COUNT - 2 * 2048]
+WIDE_ROW_COUNT = 6000
+WIDE_ROW_GROUPS = [2048, 2048, WIDE_ROW_COUNT - 2 * 2048]
 
 _HEX_TO_BASE = str.maketrans("0123456789abcdef", "ACGTACGTACGTACGT")
 
 
 def wide_reads() -> list[tuple[str, str]]:
-    """(read_id, bases) for WIDE_READ_COUNT reads of WIDE_READ_BASES bases each, distinct
+    """(read_id, bases) for WIDE_ROW_COUNT reads of WIDE_READ_BASES bases each, distinct
     per read so no Parquet encoder can collapse the column."""
     return [
         (
@@ -88,7 +88,7 @@ def wide_reads() -> list[tuple[str, str]]:
             .hexdigest(WIDE_READ_BASES // 2)
             .translate(_HEX_TO_BASE),
         )
-        for i in range(1, WIDE_READ_COUNT + 1)
+        for i in range(1, WIDE_ROW_COUNT + 1)
     ]
 
 

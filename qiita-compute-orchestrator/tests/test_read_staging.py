@@ -12,13 +12,12 @@ import os
 from pathlib import Path
 
 import duckdb
-import pyarrow as pa
 from helpers import (
     SHRUNK_ROW_GROUP_SIZE_BYTES,
     WIDE_READ_BASES,
-    WIDE_READ_ROW_GROUPS,
+    WIDE_ROW_COUNT,
+    WIDE_ROW_GROUPS,
     row_group_rows,
-    wide_reads,
 )
 from qiita_common import parquet
 
@@ -178,27 +177,23 @@ def test_write_sorted_reads_keeps_wide_row_groups_under_the_byte_cap(tmp_path, m
     """A sorted COPY ignores ROW_GROUP_SIZE_BYTES (see
     `qiita_common.parquet.sorted_row_group_size`), so the writer asks for a row count sized
     to its reads. With the cap shrunk to 1 MiB, ~1 KB reads land one vector per row group
-    instead of the whole sample in one."""
+    instead of the whole read set in one."""
     monkeypatch.setattr(parquet, "ROW_GROUP_SIZE_BYTES", SHRUNK_ROW_GROUP_SIZE_BYTES)
-    reads = wide_reads()
-    src_table = pa.table(
-        {
-            "sequence_index": pa.array(range(1, len(reads) + 1), pa.int64()),
-            "read_id": [rid for rid, _ in reads],
-            "sequence1": [bases for _, bases in reads],
-            "qual1": ["I" * WIDE_READ_BASES] * len(reads),
-            "sequence2": pa.nulls(len(reads), pa.string()),
-            "qual2": pa.nulls(len(reads), pa.string()),
-        }
-    )
     src = tmp_path / "intermediate.parquet"
     with duckdb.connect() as conn:
-        conn.register("src_table", src_table)
-        # Many row groups, so the writer's scan and sort run on several threads.
-        conn.execute(f"COPY src_table TO '{src}' (FORMAT PARQUET, ROW_GROUP_SIZE 1024)")
+        # Bases distinct per read, so no encoder collapses the column; many row groups,
+        # so the writer's scan and sort run on several threads.
+        conn.execute(
+            "COPY (SELECT range + 1 AS sequence_index, 'r' || range AS read_id, "
+            "translate(repeat(md5(range::VARCHAR), 32)[:?], '0123456789abcdef', "
+            "'ACGTACGTACGTACGT') AS sequence1, repeat('I', ?) AS qual1, "
+            "NULL::VARCHAR AS sequence2, NULL::VARCHAR AS qual2 FROM range(?)) "
+            f"TO '{src}' (FORMAT PARQUET, ROW_GROUP_SIZE 1024)",
+            [WIDE_READ_BASES, WIDE_READ_BASES, WIDE_ROW_COUNT],
+        )
     out = tmp_path / "read.parquet"
     read_staging.write_sorted_reads(src, 42, 100, out, tmp_path, 2, 4)
-    assert row_group_rows(out) == WIDE_READ_ROW_GROUPS
+    assert row_group_rows(out) == WIDE_ROW_GROUPS
 
 
 def test_hardlink_shares_inode(tmp_path):

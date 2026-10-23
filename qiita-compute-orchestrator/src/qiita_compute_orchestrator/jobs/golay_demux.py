@@ -41,8 +41,9 @@ from ..sequence_range_retry import mint_or_reuse_sequence_range
 YAML_STEP_NAME = "golay_demux"
 
 # per-sample writes run one at a time, so each gets the full budget. 8 threads, the
-# step's whole cpu allocation: each write compresses at the at-rest zstd level one row
-# group per thread (the measurement is on fastq_to_parquet's _DUCKDB_THREADS).
+# step's whole cpu allocation, for the writes' at-rest compression (see
+# `qiita_common.parquet.sorted_row_group_size`; the measurement is on
+# fastq_to_parquet's _DUCKDB_THREADS).
 _DUCKDB_THREADS = 8
 _DUCKDB_FALLBACK_MEMORY_GB = 8
 

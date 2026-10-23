@@ -92,9 +92,10 @@ steps:
     # cost rather than paying for it with an allocation.)
     #
     # The walltime carries the at-rest zstd level's write cost: ~102 s per GB of
-    # logical read data at this step's 2 threads, ~1.7 h on a 60 GB HiFi sample
+    # logical read data at this step's 2 threads, ~1.7 h on a 60 GB HiFi read set
     # (synthetic 10 kb reads written in this job's sorted shape, DuckDB 1.5.5, a shared
-    # 32-core dev box). No real sample's runtime at either level has been measured.
+    # 32-core dev box). No real prep_sample's runtime at either level has been measured.
+    # cpu stays 2: at 4, the action ceiling, the same measurement falls only to ~76 s.
     baseline_resources:
       cpu: 2
       mem_gb: 12
