@@ -29,7 +29,7 @@ UpdatableTable = Literal[
 INT4_MASK = 0x7FFF_FFFF
 
 # Registry of advisory-lock keys/classes, so a new one is allocated rather
-# than invented (each site also carries its own "distinct from" note):
+# than invented (each Python site also carries its own "distinct from" note):
 #   repositories.block             1-arg, hashtextextended(mask_idx:prep_sample_idx)
 #   repositories.sequencing_run    2-arg class POOL_RESOLVE_LOCK_CLASS (pool
 #                                  writes vs the download-roster read)
