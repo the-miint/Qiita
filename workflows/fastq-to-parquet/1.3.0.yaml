@@ -147,8 +147,8 @@ steps:
     # the mask via persist-read-metrics).
     outputs: [reads, read_staging_dir, raw_read_count]
     baseline_resources:
-      cpu: 2
-      mem_gb: 8
+      cpu: 8
+      mem_gb: 13
       walltime: PT30M
 
   # Load the FULL reads into the DuckLake `read` table. read_staging_dir holds
