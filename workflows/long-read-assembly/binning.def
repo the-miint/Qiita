@@ -126,8 +126,7 @@ From: mambaorg/micromamba:1.5.8
     # a binner-less image shipped. This asserts every tool metaWRAP actually
     # invokes, and fails the BUILD when one is absent.
     /opt/qiita/binning-verify.sh
-    # Runs metaWRAP on a synthetic one-contig fixture at binning.sh's minimum contig
-    # length and one above it; the script says what each run asserts.
+    # The min-contig check; its %files comment above says what it is.
     /opt/qiita/binning-min-contig-check.sh
     # Base utilities the entrypoints actually invoke — assert each one, since the
     # whole point of this %test is to fail the BUILD on a missing runtime dep
