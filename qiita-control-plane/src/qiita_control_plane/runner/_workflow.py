@@ -765,6 +765,9 @@ async def run_workflow(
             resume=resume,
             dispatch_cb=dispatch_cb,
             max_inflight=max_inflight,
+            mem_gb_override=mem_gb_override,
+            workspace=workspace,
+            prior_progress=progress,
         )
         for index, entry in enumerate(action.steps):
             # Conditional gate (WorkflowStep/WorkflowAction.when): skip this
@@ -816,7 +819,7 @@ async def run_workflow(
                 # a rejected backward edge, both benign.
                 if entry.target_status:
                     await _advance_completed_step_status(pool, scope_target, entry.target_status)
-                bound.update(await _reconstruct_completed_outputs(ctx, entry, completed, workspace))
+                bound.update(await _reconstruct_completed_outputs(ctx, entry, completed))
                 continue
 
             if entry.target_status:
@@ -832,7 +835,6 @@ async def run_workflow(
                 ctx,
                 index=index,
                 entry=entry,
-                mem_gb_override=mem_gb_override,
                 # Only `step:` entries carry baseline_resources and escalate, so
                 # only they ever WRITE a floor. `_step_entry_names_unique`
                 # constrains `step:` names only, so an `action:` entry may share
@@ -841,8 +843,6 @@ async def run_workflow(
                 # which an `action:` entry never reaches.
                 persisted_floor=escalated_floor.get(entry.name, _NO_STEP_FLOOR),
                 bound=bound,
-                workspace=workspace,
-                prior_progress=progress,
             )
             bound.update(outputs)
 
@@ -1036,11 +1036,8 @@ async def _run_entry_with_retry(
     *,
     index: int,
     entry: WorkflowStep | WorkflowAction,
-    mem_gb_override: int | None = None,
     persisted_floor: StepResourceFloor = _NO_STEP_FLOOR,
     bound: dict[str, Any],
-    workspace: Path,
-    prior_progress: list[step_progress.StepProgressRow],
 ) -> dict[str, Any]:
     """Dispatch one workflow entry, with auto-retry on transient
     `BackendFailure`. Returns the entry's output map on success; raises
@@ -1107,7 +1104,7 @@ async def _run_entry_with_retry(
     # the composition — and the persisted value already grew from a resolution
     # that included the static override, so it dominates in practice.
     effective_mem_override = max(
-        (v for v in (mem_gb_override, persisted_floor.mem_gb) if v is not None),
+        (v for v in (ctx.mem_gb_override, persisted_floor.mem_gb) if v is not None),
         default=None,
     )
     # Escalating walltime floor: starts at the persisted floor (there is no
@@ -1127,7 +1124,7 @@ async def _run_entry_with_retry(
             ctx.backend_client, entry, bound, ctx.scope_target, work_ticket_idx=ctx.work_ticket_idx
         )
     while True:
-        attempt_workspace = step_attempt_dir(workspace, entry.name, attempt)
+        attempt_workspace = step_attempt_dir(ctx.workspace, entry.name, attempt)
         # Only a LIVE attempt is adoptable. `attempt` restarts at 0 on every
         # invocation, so a restart-recovery resume of a step that failed at
         # attempt N and escalated to N+1 lands back on N first — and
@@ -1136,7 +1133,7 @@ async def _run_entry_with_retry(
         # re-attaching to a job that already ended. Checked before the
         # orphan-dir branch and independently of whether the dir exists: a row
         # is terminal whether or not its workspace survived.
-        if _attempt_is_terminal(prior_progress, step_index=index, attempt=attempt):
+        if _attempt_is_terminal(ctx.prior_progress, step_index=index, attempt=attempt):
             _log.info(
                 "work_ticket %d entry %r attempt %d: prior attempt already terminal; "
                 "advancing to the next attempt",
@@ -1161,7 +1158,7 @@ async def _run_entry_with_retry(
         # re-attach to its job and reuse the workspace, so we leave it and
         # proceed. (A present-but-terminal row was already skipped above.)
         if attempt_workspace.exists() and _attempt_is_unowned(
-            prior_progress, step_index=index, attempt=attempt
+            ctx.prior_progress, step_index=index, attempt=attempt
         ):
             _log.info(
                 "work_ticket %d entry %r attempt %d: orphaned attempt dir from a "

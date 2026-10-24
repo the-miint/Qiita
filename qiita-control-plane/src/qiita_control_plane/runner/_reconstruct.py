@@ -155,7 +155,6 @@ async def _reconstruct_completed_outputs(
     ctx: RunContext,
     entry: WorkflowStep | WorkflowAction,
     completed: step_progress.StepProgressRow,
-    workspace: Path,
 ) -> dict[str, Any]:
     """Rebuild the bound outputs of an already-COMPLETED entry from disk,
     without re-running it.
@@ -179,7 +178,7 @@ async def _reconstruct_completed_outputs(
     recovery is a SLURM-backend concern (local steps are synchronous and don't
     survive a restart mid-flight), so this returns its outputs empty — a
     downstream consumer that needs a missing binding fails loudly via KeyError."""
-    attempt_workspace = step_attempt_dir(workspace, entry.name, completed.attempt)
+    attempt_workspace = step_attempt_dir(ctx.workspace, entry.name, completed.attempt)
     if isinstance(entry, WorkflowAction):
         if entry.name == LibraryPrimitive.PLAN_SHARDS:
             return await _reconstruct_plan_shards_outputs(
