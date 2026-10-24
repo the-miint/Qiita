@@ -26,6 +26,7 @@ from qiita_common.models.biosample import (
 )
 
 from . import require_transaction, update_row
+from .study_access import CallerMetadataTiers
 
 # Whether a colliding metadata write overwrites the existing value or raises.
 type MetadataConflictMode = Literal["raise", "upsert"]
@@ -798,11 +799,38 @@ class EntityMetadataSpec:
     # tagged and kept in lockstep the same way. It rejects a row whose
     # populated value column does not match its field's declared type.
     metadata_field_contract_trigger: str
+    # The set-returning function judging every metadata row against a caller's
+    # tiers (qiita.biosample_metadata_visibility / ...), named only through
+    # `visible_metadata_source`.
+    visibility_function: str
+    # The per-(entity, field) exception table (biosample_field_exception /
+    # prep_sample_field_exception), keyed on the entity, on
+    # `study_field_idx_column`, or on global_field_idx.
+    field_exception_table: str
     # The boolean *_metadata column marking an owner-sample-id row, for
     # entities that carry one (is_owner_biosample_id on biosample); None when
     # the entity has no owner-sample-id concept. When set, generic metadata
     # writes refuse to target a field holding such a row.
     owner_sample_id_flag_column: str | None = None
+
+
+def visible_metadata_source(spec: EntityMetadataSpec, *, first_param: int) -> str:
+    """The FROM item a caller-facing metadata read names in place of
+    `spec.metadata_table`: the entity's visibility function, aliased `m`.
+
+    It yields every metadata row with `visible` and the masked `value_*`
+    columns (see the function's COMMENT in the migration that creates it), so a
+    read filters with `AND m.visible` or reads the value columns as a mask. It
+    binds the three `CallerMetadataTiers.sql_args()` values at `$first_param`
+    onward; the caller's own parameters start after them. The function is
+    written to be inlined, so a predicate on `m` still reaches the base
+    table's indexes.
+    """
+    n = first_param
+    return (
+        f"{spec.visibility_function}"
+        f"(${n}::bigint[], ${n + 1}::text[]::qiita.tier[], ${n + 2}::qiita.tier) m"
+    )
 
 
 # SQL identifiers are interpolated into the queries below only from frozen
@@ -939,9 +967,13 @@ async def fetch_entity_idx_by_unique_field_value(
     study_field_idx: int,
     data_type: FieldDataType,
     value: str | Decimal | date | bool,
+    tiers: CallerMetadataTiers,
 ) -> int | None:
     """Return the entity idx carrying `value` through the given study field, or
-    None when no row does.
+    None when no row does or the matching value is hidden from `tiers`.
+
+    A hidden match is a miss, indistinguishable from no match: answering
+    otherwise would confirm a value the caller may not read.
 
     The caller must have established that the field declares unique_in_study.
     Without it every row under the field carries the flag false, so the term
@@ -961,14 +993,20 @@ async def fetch_entity_idx_by_unique_field_value(
     # Closed-set lookup; a data_type with no typed column reaches the write and
     # read guards as NotImplementedError rather than matching NULL here.
     value_column = GLOBAL_METADATA_VALUE_COLUMN[data_type]
+    # The match reads the base table, not the visibility function: the
+    # function's value columns are masked expressions, which no index serves.
     # The unique_in_study term spells the partial index's own predicate, which
-    # the planner needs in order to use that index.
+    # the planner needs in order to use that index. The matched row is then
+    # judged by primary key.
     row = await pool_or_conn.fetchrow(
-        f"SELECT {spec.entity_key_column}"
-        f" FROM {spec.metadata_table}"
-        f" WHERE {spec.study_field_idx_column} = $1"
-        f"   AND {value_column} = $2"
-        f"   AND unique_in_study",
+        f"SELECT raw.{spec.entity_key_column}"
+        f" FROM {spec.metadata_table} raw"
+        f" JOIN {visible_metadata_source(spec, first_param=1)} ON m.idx = raw.idx"
+        f" WHERE raw.{spec.study_field_idx_column} = $4"
+        f"   AND raw.{value_column} = $5"
+        f"   AND raw.unique_in_study"
+        f"   AND m.visible",
+        *tiers.sql_args(),
         study_field_idx,
         value,
     )
@@ -1153,9 +1191,11 @@ async def fetch_global_metadata(
     *,
     spec: EntityMetadataSpec,
     entity_idx: int,
+    tiers: CallerMetadataTiers,
 ) -> dict[str, GlobalMetadataRow]:
     """Return internal_name -> GlobalMetadataRow for every globally-linked
-    metadata value the entity carries.
+    metadata value the entity carries that is visible at `tiers`; a hidden
+    value is absent.
 
     Filters on global_field_idx IS NOT NULL (purely-local rows are
     excluded). Intentionally-missing entries (value_missing_reason_idx
@@ -1174,11 +1214,13 @@ async def fetch_global_metadata(
     rows = await pool_or_conn.fetch(
         f"SELECT gf.internal_name, gf.display_name, gf.description, gf.data_type,"
         f" {METADATA_VALUE_COLUMNS_SELECT}, {METADATA_REF_PAYLOAD_SELECT}"
-        f" FROM {spec.metadata_table} m"
+        f" FROM {visible_metadata_source(spec, first_param=1)}"
         f" JOIN {spec.global_field_table} gf ON gf.idx = m.global_field_idx"
         f"{METADATA_REF_JOIN_CLAUSES}"
-        f" WHERE m.{spec.entity_key_column} = $1"
-        f"   AND m.global_field_idx IS NOT NULL",
+        f" WHERE m.{spec.entity_key_column} = $4"
+        f"   AND m.global_field_idx IS NOT NULL"
+        f"   AND m.visible",
+        *tiers.sql_args(),
         entity_idx,
     )
 
@@ -1204,9 +1246,11 @@ async def fetch_local_metadata(
     spec: EntityMetadataSpec,
     entity_idx: int,
     study_idx: int,
+    tiers: CallerMetadataTiers,
 ) -> dict[str, MetadataRow]:
     """Return display_name -> MetadataRow for every purely-local metadata value
-    the entity carries on study_idx.
+    the entity carries on study_idx that is visible at `tiers`; a hidden value
+    is absent.
 
     Filters on global_field_idx IS NULL (globally-linked rows are excluded) and
     on the value's study_field belonging to study_idx, so the read is scoped to
@@ -1215,8 +1259,7 @@ async def fetch_local_metadata(
     missing and terminology-term entries surface as MissingReasonRef /
     TerminologyTermRef; any other row is decoded from the value column its
     data_type maps to. An owner-sample-id row (where the spec has one) is a
-    study-local value like any other and is included; this read applies no
-    visibility gating of its own.
+    study-local value like any other, judged by the same rule.
     """
     # The study_field join scopes to one study and supplies the field's
     # display_name + data_type; the LEFT JOINs recover a missing-reason or
@@ -1225,12 +1268,14 @@ async def fetch_local_metadata(
     rows = await pool_or_conn.fetch(
         f"SELECT sf.display_name, sf.description, sf.data_type,"
         f" {METADATA_VALUE_COLUMNS_SELECT}, {METADATA_REF_PAYLOAD_SELECT}"
-        f" FROM {spec.metadata_table} m"
+        f" FROM {visible_metadata_source(spec, first_param=1)}"
         f" JOIN {spec.study_field_table} sf ON sf.idx = m.{spec.study_field_idx_column}"
         f"{METADATA_REF_JOIN_CLAUSES}"
-        f" WHERE m.{spec.entity_key_column} = $1"
+        f" WHERE m.{spec.entity_key_column} = $4"
         f"   AND m.global_field_idx IS NULL"
-        f"   AND sf.study_idx = $2",
+        f"   AND sf.study_idx = $5"
+        f"   AND m.visible",
+        *tiers.sql_args(),
         entity_idx,
         study_idx,
     )

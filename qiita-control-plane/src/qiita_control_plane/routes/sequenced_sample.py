@@ -62,6 +62,8 @@ from qiita_common.models import (
 )
 
 from ..auth.guards import (
+    METADATA_BYPASS_ROLE,
+    caller_metadata_tiers,
     require_caller_has_admin_on_all_studies,
     require_caller_owns_pool,
     require_complete_profile,
@@ -769,7 +771,7 @@ async def get_sequenced_sample_in_study(
     _scope: Principal = Depends(require_scope(Scope.PREP_SAMPLE_READ)),
     _exists: None = Depends(require_study_exists),
     _access: None = Depends(
-        require_study_access(min_tier=Tier.ADMIN, bypass_role=SystemRole.WET_LAB_ADMIN)
+        require_study_access(min_tier=Tier.VIEWER, bypass_role=METADATA_BYPASS_ROLE)
     ),
 ) -> StudyScopedSequencedSampleResponse:
     """Return one study's view of a sequenced_sample: the joined
@@ -807,6 +809,7 @@ async def get_sequenced_sample_in_study(
             metadata_idx_column="prep_sample_idx",
             study_idx=study_idx,
             noun="sequenced_sample",
+            tiers=await caller_metadata_tiers(conn, user),
         )
 
     # ETag from the GREATEST-of-both timestamp; opaque-by-contract to clients.
@@ -936,7 +939,10 @@ async def get_sequenced_sample(
         # repo function handles the global_field_idx IS NOT NULL filter and
         # the data_type-driven value-column dispatch.
         metadata_rows = await fetch_global_metadata(
-            conn, spec=PREP_SAMPLE_METADATA_SPEC, entity_idx=row["prep_sample_idx"]
+            conn,
+            spec=PREP_SAMPLE_METADATA_SPEC,
+            entity_idx=row["prep_sample_idx"],
+            tiers=await caller_metadata_tiers(conn, user),
         )
 
     global_metadata = metadata_entries_from_rows(metadata_rows)
@@ -1073,7 +1079,10 @@ async def patch_sequenced_sample(
             # Re-read global metadata in the same transaction so the
             # response and the UPDATE see one consistent snapshot.
             metadata_rows = await fetch_global_metadata(
-                conn, spec=PREP_SAMPLE_METADATA_SPEC, entity_idx=updated_row["prep_sample_idx"]
+                conn,
+                spec=PREP_SAMPLE_METADATA_SPEC,
+                entity_idx=updated_row["prep_sample_idx"],
+                tiers=await caller_metadata_tiers(conn, caller),
             )
         except asyncpg.UniqueViolationError as exc:
             detail = _SEQUENCED_SAMPLE_PATCH_UNIQUE_MESSAGES.get(

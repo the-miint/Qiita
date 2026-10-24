@@ -62,6 +62,8 @@ from qiita_common.models import (
 )
 
 from ..auth.guards import (
+    METADATA_BYPASS_ROLE,
+    caller_metadata_tiers,
     require_complete_profile,
     require_eligible_owner,
     require_human,
@@ -101,6 +103,7 @@ from ..repositories.biosample_metadata import (
     BiosampleOwnerIdMissingValueError,
 )
 from ..repositories.exported_entity import fetch_exported_entities, require_export_entity_id
+from ..repositories.study_access import CallerMetadataTiers
 from ..roster_resolution import classify_roster, fetch_roster_facts
 from ._helpers import (
     ETAG_HEADER,
@@ -747,6 +750,7 @@ async def _read_study_scoped_biosample(
     biosample_idx: int,
     response: Response,
     caller_system_role: SystemRole,
+    tiers: CallerMetadataTiers,
     not_found_detail: str | None = None,
 ) -> StudyScopedBiosampleResponse:
     """Read one study's view of a biosample and stamp the response's ETag.
@@ -766,6 +770,7 @@ async def _read_study_scoped_biosample(
         metadata_idx_column="idx",
         study_idx=study_idx,
         noun="biosample",
+        tiers=tiers,
         not_found_detail=not_found_detail,
     )
 
@@ -791,7 +796,7 @@ async def lookup_biosample_in_study_by_unique_field(
     _scope: Principal = Depends(require_scope(Scope.BIOSAMPLE_READ)),
     _exists: None = Depends(require_study_exists),
     _access: None = Depends(
-        require_study_access(min_tier=Tier.ADMIN, bypass_role=SystemRole.WET_LAB_ADMIN)
+        require_study_access(min_tier=Tier.VIEWER, bypass_role=METADATA_BYPASS_ROLE)
     ),
 ) -> StudyScopedBiosampleResponse:
     """Return one study's view of the biosample the study's own name identifies.
@@ -815,6 +820,7 @@ async def lookup_biosample_in_study_by_unique_field(
     # value that resolved the idx and the row read back cannot straddle a
     # concurrent writer's commit.
     async with snapshot() as conn:
+        tiers = await caller_metadata_tiers(conn, user)
         biosample_idx = await resolve_study_entity_by_unique_field(
             conn,
             spec=BIOSAMPLE_METADATA_SPEC,
@@ -822,6 +828,7 @@ async def lookup_biosample_in_study_by_unique_field(
             display_name=body.unique_field_display_name,
             value=body.unique_field_value,
             noun="biosample",
+            tiers=tiers,
         )
         return await _read_study_scoped_biosample(
             conn,
@@ -829,6 +836,7 @@ async def lookup_biosample_in_study_by_unique_field(
             biosample_idx=biosample_idx,
             response=response,
             caller_system_role=user.system_role,
+            tiers=tiers,
             not_found_detail=detail_for_unique_field_miss(
                 noun="biosample",
                 study_idx=study_idx,
@@ -848,7 +856,7 @@ async def get_biosample_in_study(
     _scope: Principal = Depends(require_scope(Scope.BIOSAMPLE_READ)),
     _exists: None = Depends(require_study_exists),
     _access: None = Depends(
-        require_study_access(min_tier=Tier.ADMIN, bypass_role=SystemRole.WET_LAB_ADMIN)
+        require_study_access(min_tier=Tier.VIEWER, bypass_role=METADATA_BYPASS_ROLE)
     ),
 ) -> StudyScopedBiosampleResponse:
     """Return one study's view of a biosample: the core row, its globally-linked
@@ -885,6 +893,7 @@ async def get_biosample_in_study(
             biosample_idx=biosample_idx,
             response=response,
             caller_system_role=user.system_role,
+            tiers=await caller_metadata_tiers(conn, user),
         )
 
 
@@ -943,6 +952,7 @@ async def patch_biosample_metadata_by_unique_field(
             display_name=body.unique_field_display_name,
             value=body.unique_field_value,
             noun="biosample",
+            tiers=await caller_metadata_tiers(conn, user),
         )
         written = await resolve_and_write_study_scoped_metadata(
             conn,
@@ -1172,11 +1182,13 @@ async def get_biosample(
                 detail=f"caller has no read path to biosample {biosample_idx}",
             )
 
-        # Pull the globally-linked metadata once access has been resolved; the
-        # repo function handles the global_field_idx IS NOT NULL filter and the
-        # data_type-driven value column dispatch.
+        # Pull the globally-linked metadata once access has been resolved,
+        # each value judged on the study that wrote it.
         metadata_rows = await fetch_global_metadata(
-            conn, spec=BIOSAMPLE_METADATA_SPEC, entity_idx=biosample_idx
+            conn,
+            spec=BIOSAMPLE_METADATA_SPEC,
+            entity_idx=biosample_idx,
+            tiers=await caller_metadata_tiers(conn, user),
         )
 
     global_metadata = metadata_entries_from_rows(metadata_rows)
@@ -1416,7 +1428,10 @@ async def patch_biosample(
             # Re-read global metadata in the same transaction so the response
             # and the UPDATE see one consistent snapshot.
             metadata_rows = await fetch_global_metadata(
-                conn, spec=BIOSAMPLE_METADATA_SPEC, entity_idx=biosample_idx
+                conn,
+                spec=BIOSAMPLE_METADATA_SPEC,
+                entity_idx=biosample_idx,
+                tiers=await caller_metadata_tiers(conn, caller),
             )
         except asyncpg.UniqueViolationError as exc:
             raise_for_unique_violation(

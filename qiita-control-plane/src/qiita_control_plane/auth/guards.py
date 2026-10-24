@@ -33,8 +33,10 @@ from ..repositories.sequencing_run import (
 )
 from ..repositories.study import fetch_study_exists
 from ..repositories.study_access import (
+    CallerMetadataTiers,
     CallerStudyAccessRow,
     fetch_caller_study_access,
+    fetch_caller_study_access_all,
     fetch_caller_study_access_batch,
 )
 from ..repositories.user_eligibility import fetch_user_eligibility
@@ -321,11 +323,10 @@ def require_complete_profile(
 # tier (or 'public' by absence of a row) is compared against min_tier.
 
 
-# Strict ordering by privilege; mirrors the qiita.tier enum order. The
-# integer ranks let the guard compare tiers with a plain >= rather than
-# relying on enum-string ordering. Read only through `_access_row_allows`,
-# which is the single definition of the comparison. Unlike Roles, Tiers are
-# not a property of principals.
+# Strict ordering by privilege; mirrors the qiita.tier enum order (a test pins
+# the two together, since the metadata visibility functions compare tiers in
+# SQL). Read only through `tier_at_least`, which is the single definition of the
+# comparison. Unlike Roles, Tiers are not a property of principals.
 _TIER_ORDER = {
     Tier.PUBLIC: 0,
     Tier.VIEWER: 1,
@@ -454,11 +455,6 @@ def _access_row_allows(
     unreachable. A future caller that passes user-supplied study_idxs would
     inherit fail-open silently, which is the wrong default for a read gate; give
     it an existence check of its own, or make the branch configurable.
-
-    Comparison goes through `_TIER_ORDER`, never the enum members: `Tier` is a
-    `StrEnum` and compares LEXICALLY, where 'admin' < 'member' < 'public' <
-    'viewer'. A bare `>=` would admit a PUBLIC caller at a VIEWER minimum and
-    reject an ADMIN one.
     """
     if row is None:
         return True
@@ -467,7 +463,18 @@ def _access_row_allows(
     # Public-by-absence when the caller holds no study_access row, matching
     # require_study_access.
     effective_tier = row.access_tier if row.access_tier is not None else Tier.PUBLIC
-    return _TIER_ORDER[effective_tier] >= _TIER_ORDER[min_tier]
+    return tier_at_least(effective_tier, min_tier)
+
+
+def tier_at_least(held: Tier, required: Tier) -> bool:
+    """Whether `held` reaches `required`: the one comparison of two tiers.
+
+    Goes through `_TIER_ORDER`, never the enum members: `Tier` is a `StrEnum`
+    and compares LEXICALLY, where 'admin' < 'member' < 'public' < 'viewer'. A
+    bare `>=` would admit a PUBLIC caller at a VIEWER minimum and reject an
+    ADMIN one.
+    """
+    return _TIER_ORDER[held] >= _TIER_ORDER[required]
 
 
 def study_record_view(
@@ -510,6 +517,38 @@ def caller_tier_reaches(row: CallerStudyAccessRow, *, caller: Principal, tier: T
     at least `tier`. A role bypass does not count: this is about the caller's
     relationship to the study, as the listing's `min_tier` filter asks."""
     return _access_row_allows(row, caller=caller, min_tier=tier)
+
+
+# The role at or above which a caller reads and writes every metadata value on
+# every study, whatever its tier. The sample routes' study gates admit the same
+# role without a grant (`require_study_access(bypass_role=METADATA_BYPASS_ROLE)`),
+# and the two must agree: a caller the gate admitted by role and the value rule
+# then judged by grant would be let in to read only public values.
+METADATA_BYPASS_ROLE = SystemRole.WET_LAB_ADMIN
+
+
+async def caller_metadata_tiers(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection, caller: Principal
+) -> CallerMetadataTiers:
+    """The tier `caller` reads metadata values at, on every study.
+
+    Anonymous reads at public everywhere. A caller at or above
+    `METADATA_BYPASS_ROLE` reads at admin everywhere, with no lookup. Anyone
+    else reads at `caller_effective_tier` on each study they own or hold a grant
+    on, and at public on the rest. The rule these tiers feed is defined in
+    docs/architecture/data-model.md, "Metadata visibility tiers".
+    """
+    if isinstance(caller, Anonymous):
+        return CallerMetadataTiers(study_tiers={}, default=Tier.PUBLIC)
+    if caller.has_role_at_least(METADATA_BYPASS_ROLE):
+        return CallerMetadataTiers(study_tiers={}, default=Tier.ADMIN)
+    rows = await fetch_caller_study_access_all(pool_or_conn, principal_idx=caller.principal_idx)
+    return CallerMetadataTiers(
+        study_tiers={
+            study_idx: caller_effective_tier(row, caller=caller) for study_idx, row in rows.items()
+        },
+        default=Tier.PUBLIC,
+    )
 
 
 def study_access_via(row: CallerStudyAccessRow, *, caller: Principal) -> StudyAccessVia:
@@ -692,11 +731,6 @@ async def require_caller_has_tier_on_all_studies(
     Short-circuiting on the first refusal saved nothing on the path that
     matters — a request where every study passes is the common one, and it
     used to cost one round trip per study.
-
-    Comparison goes through `_TIER_ORDER`, never the enum members: `Tier`
-    is a `StrEnum` and compares LEXICALLY, where 'admin' < 'member' <
-    'public' < 'viewer'. A bare `>=` would admit a PUBLIC caller at a
-    VIEWER minimum and reject an ADMIN one.
     """
     if isinstance(caller, Anonymous):
         raise HTTPException(status_code=401, detail=_MSG_AUTH_REQUIRED)

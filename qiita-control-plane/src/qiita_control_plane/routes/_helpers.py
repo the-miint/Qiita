@@ -75,6 +75,7 @@ from ..repositories._sample_helpers import (
 )
 from ..repositories.alignment_definition import alignment_definition_exists
 from ..repositories.block import list_incomplete_alignment_samples
+from ..repositories.study_access import CallerMetadataTiers
 
 REFERENCE_NOT_FOUND_DETAIL = "Reference not found"
 
@@ -331,17 +332,18 @@ async def read_global_and_local_entries(
     spec: EntityMetadataSpec,
     entity_idx: int,
     study_idx: int,
+    tiers: CallerMetadataTiers,
 ) -> tuple[dict[str, MetadataEntry], dict[str, MetadataEntry]]:
-    """Read an entity's globally-linked and study-local metadata and shape both
-    into MetadataEntry dicts.
+    """Read an entity's globally-linked and study-local metadata visible at
+    `tiers` and shape both into MetadataEntry dicts.
 
     Spec-driven. The caller owns the connection/snapshot and the
     link/existence/retired gating. Returns (global_metadata keyed by
     internal_name, local_metadata keyed by display_name).
     """
-    global_rows = await fetch_global_metadata(conn, spec=spec, entity_idx=entity_idx)
+    global_rows = await fetch_global_metadata(conn, spec=spec, entity_idx=entity_idx, tiers=tiers)
     local_rows = await fetch_local_metadata(
-        conn, spec=spec, entity_idx=entity_idx, study_idx=study_idx
+        conn, spec=spec, entity_idx=entity_idx, study_idx=study_idx, tiers=tiers
     )
     global_metadata = metadata_entries_from_rows(global_rows)
     local_metadata = metadata_entries_from_rows(local_rows)
@@ -450,15 +452,17 @@ async def read_study_scoped_entity(
     metadata_idx_column: str,
     study_idx: int,
     noun: str,
+    tiers: CallerMetadataTiers,
     not_found_detail: str | None = None,
 ) -> tuple[asyncpg.Record, dict[str, MetadataEntry], dict[str, MetadataEntry]]:
     """Fetch a study-scoped entity for reading and return its metadata.
 
     Gates via resolve_linked_study_entity with a read's 404-on-retired, then
-    reads the entity's global and study-local metadata. not_found_detail words
-    both of those 404s at once -- on a read, unlinked and retired are one
-    answer -- for a caller that named the entity by something other than its
-    idx. Returns the (non-None) row plus the two MetadataEntry dicts.
+    reads the entity's global and study-local metadata visible at `tiers`.
+    not_found_detail words both of those 404s at once -- on a read, unlinked
+    and retired are one answer -- for a caller that named the entity by
+    something other than its idx. Returns the (non-None) row plus the two
+    MetadataEntry dicts.
     """
     retired_detail = (
         f"{noun} {entity_idx} not found" if not_found_detail is None else not_found_detail
@@ -481,7 +485,7 @@ async def read_study_scoped_entity(
         unlinked_detail=unlinked_detail,
     )
     global_metadata, local_metadata = await read_global_and_local_entries(
-        conn, spec=spec, entity_idx=metadata_entity_idx, study_idx=study_idx
+        conn, spec=spec, entity_idx=metadata_entity_idx, study_idx=study_idx, tiers=tiers
     )
     return row, global_metadata, local_metadata
 
@@ -558,13 +562,15 @@ async def resolve_study_entity_by_unique_field(
     display_name: str,
     value: str,
     noun: str,
+    tiers: CallerMetadataTiers,
 ) -> int:
     """Resolve the study's own name for a sample to that sample's idx.
 
     display_name names one of the study's fields and value is what that field
     carries on the wanted sample. The field must declare unique_in_study; one
     that does not is refused (422), as is a name the study does not use. A
-    well-formed pair matching no sample is 404.
+    well-formed pair matching no sample is 404, and so is one whose matching
+    value is hidden from `tiers`, in the same words.
 
     Resolution ignores retirement, so a retired sample or a retired study link
     still resolves; the caller applies its own gate afterwards and decides what
@@ -602,6 +608,7 @@ async def resolve_study_entity_by_unique_field(
         study_field_idx=field_row.idx,
         data_type=field_row.data_type,
         value=parsed_value,
+        tiers=tiers,
     )
     if entity_idx is None:
         raise HTTPException(

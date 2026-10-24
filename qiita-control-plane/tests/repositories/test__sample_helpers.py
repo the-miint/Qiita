@@ -107,6 +107,7 @@ from qiita_control_plane.repositories.biosample_metadata import (
     insert_owner_biosample_id_metadata,
 )
 from qiita_control_plane.repositories.prep_sample_metadata import PREP_SAMPLE_METADATA_SPEC
+from qiita_control_plane.repositories.study_access import CallerMetadataTiers
 from qiita_control_plane.testing.db_seeds import (
     NCBI_TAXONOMY_METAGENOME_TERM_ID,
     fetch_seeded_metagenome_term,
@@ -133,6 +134,11 @@ from .conftest import (
 )
 
 pytestmark = pytest.mark.db
+
+# The reads below are tested for what they decode, not for what they hide (that
+# is tests/repositories/test_metadata_visibility.py), so they read at admin
+# everywhere.
+_READ_ALL = CallerMetadataTiers(study_tiers={}, default=Tier.ADMIN)
 
 
 # ---------------------------------------------------------------------------
@@ -3176,7 +3182,9 @@ async def test_fetch_global_metadata_typed_values(ctx, spec):
         value=False,
     )
 
-    result = await fetch_global_metadata(ctx["pool"], spec=spec, entity_idx=entity_idx)
+    result = await fetch_global_metadata(
+        ctx["pool"], spec=spec, entity_idx=entity_idx, tiers=_READ_ALL
+    )
 
     expected = {
         f"host_subject_id_{suffix}": GlobalMetadataRow(
@@ -3259,7 +3267,7 @@ async def test_fetch_global_metadata_excludes_purely_local_rows(ctx, spec):
             created_by_idx=ctx["principal_idx"],
         )
 
-    result = await fetch_global_metadata(ctx["pool"], spec=spec, entity_idx=bs_idx)
+    result = await fetch_global_metadata(ctx["pool"], spec=spec, entity_idx=bs_idx, tiers=_READ_ALL)
 
     # Only the globally-linked row appears; both purely-local rows are filtered.
     expected = {
@@ -3326,7 +3334,7 @@ async def test_fetch_local_metadata_returns_local_excludes_global(ctx, spec):
     )
 
     result = await fetch_local_metadata(
-        ctx["pool"], spec=spec, entity_idx=entity_idx, study_idx=ctx["study_idx"]
+        ctx["pool"], spec=spec, entity_idx=entity_idx, study_idx=ctx["study_idx"], tiers=_READ_ALL
     )
 
     expected = {
@@ -3379,10 +3387,18 @@ async def test_fetch_local_metadata_scopes_to_study(ctx):
         )
 
     first_result = await fetch_local_metadata(
-        ctx["pool"], spec=BIOSAMPLE_METADATA_SPEC, entity_idx=bs_idx, study_idx=ctx["study_idx"]
+        ctx["pool"],
+        spec=BIOSAMPLE_METADATA_SPEC,
+        entity_idx=bs_idx,
+        study_idx=ctx["study_idx"],
+        tiers=_READ_ALL,
     )
     second_result = await fetch_local_metadata(
-        ctx["pool"], spec=BIOSAMPLE_METADATA_SPEC, entity_idx=bs_idx, study_idx=second_study_idx
+        ctx["pool"],
+        spec=BIOSAMPLE_METADATA_SPEC,
+        entity_idx=bs_idx,
+        study_idx=second_study_idx,
+        tiers=_READ_ALL,
     )
 
     assert first_result == {
@@ -3418,7 +3434,11 @@ async def test_fetch_local_metadata_includes_owner_sample_id_row(ctx):
         )
 
     result = await fetch_local_metadata(
-        ctx["pool"], spec=BIOSAMPLE_METADATA_SPEC, entity_idx=bs_idx, study_idx=ctx["study_idx"]
+        ctx["pool"],
+        spec=BIOSAMPLE_METADATA_SPEC,
+        entity_idx=bs_idx,
+        study_idx=ctx["study_idx"],
+        tiers=_READ_ALL,
     )
     assert result == {
         owner_field_name: MetadataRow(
@@ -3461,7 +3481,9 @@ async def test_fetch_global_metadata_preserves_link_retired_rows(ctx, spec):
     )
     await _retire_entity_to_study_link(ctx, spec, entity_idx)
 
-    result = await fetch_global_metadata(ctx["pool"], spec=spec, entity_idx=entity_idx)
+    result = await fetch_global_metadata(
+        ctx["pool"], spec=spec, entity_idx=entity_idx, tiers=_READ_ALL
+    )
 
     # The row still satisfies global_field_idx IS NOT NULL and surfaces
     # unchanged through the cross-study read.
@@ -3490,7 +3512,9 @@ async def test_fetch_global_metadata_empty_when_none_exist(ctx, spec):
         else _create_prep_sample_with_link(ctx)
     )
 
-    result = await fetch_global_metadata(ctx["pool"], spec=spec, entity_idx=entity_idx)
+    result = await fetch_global_metadata(
+        ctx["pool"], spec=spec, entity_idx=entity_idx, tiers=_READ_ALL
+    )
     assert result == {}
 
 
@@ -3538,7 +3562,9 @@ async def test_fetch_global_metadata_surfaces_missing_reason_rows(ctx, spec):
         value=MissingReasonRef(idx=reason_idx, name=reason_name),
     )
 
-    result = await fetch_global_metadata(ctx["pool"], spec=spec, entity_idx=entity_idx)
+    result = await fetch_global_metadata(
+        ctx["pool"], spec=spec, entity_idx=entity_idx, tiers=_READ_ALL
+    )
 
     expected = {
         f"host_subject_id_{suffix}": GlobalMetadataRow(
@@ -5239,7 +5265,9 @@ async def test_fetch_global_metadata_surfaces_terminology_term_rows(ctx, spec, m
         terminology_idx=terminology_idx,
     )
 
-    result = await fetch_global_metadata(ctx["pool"], spec=spec, entity_idx=entity_idx)
+    result = await fetch_global_metadata(
+        ctx["pool"], spec=spec, entity_idx=entity_idx, tiers=_READ_ALL
+    )
 
     expected = {
         internal_name: GlobalMetadataRow(
@@ -7053,6 +7081,7 @@ async def test_fetch_entity_idx_by_unique_field_value(ctx, spec):
             study_field_idx=field_idx,
             data_type=FieldDataType.TEXT,
             value="Sample 1",
+            tiers=_READ_ALL,
         )
         missed = await fetch_entity_idx_by_unique_field_value(
             conn,
@@ -7060,6 +7089,7 @@ async def test_fetch_entity_idx_by_unique_field_value(ctx, spec):
             study_field_idx=field_idx,
             data_type=FieldDataType.TEXT,
             value="Sample 2",
+            tiers=_READ_ALL,
         )
 
     assert found == entity_idx
@@ -7099,6 +7129,7 @@ async def test_fetch_entity_idx_by_unique_field_value_not_unique_returns_none(ct
             study_field_idx=field_idx,
             data_type=FieldDataType.TEXT,
             value="Sample 1",
+            tiers=_READ_ALL,
         )
 
     assert found is None
@@ -7128,6 +7159,7 @@ async def test_fetch_entity_idx_by_unique_field_value_scoped_to_its_field(ctx, s
             study_field_idx=first_field,
             data_type=FieldDataType.TEXT,
             value="Shared",
+            tiers=_READ_ALL,
         )
         via_second = await fetch_entity_idx_by_unique_field_value(
             conn,
@@ -7135,6 +7167,7 @@ async def test_fetch_entity_idx_by_unique_field_value_scoped_to_its_field(ctx, s
             study_field_idx=second_field,
             data_type=FieldDataType.TEXT,
             value="Shared",
+            tiers=_READ_ALL,
         )
 
     assert via_first == first_entity
