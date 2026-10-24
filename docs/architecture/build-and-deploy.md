@@ -106,7 +106,7 @@ qiita/
 │   │       │   ├── __main__.py     # `python -m` SLURM launcher (params.json → run_native_job)
 │   │       │   └── fastq_to_parquet.py  # native job: FASTQ → Parquet via DuckDB + miint
 │   │       │                            # (per-sample, sequenced_sample-scoped)
-│   │       ├── miint.py            # shared miint install + DuckDB-conn helpers, PARQUET_OPTS
+│   │       ├── miint.py            # shared miint install + DuckDB-conn helpers; re-exports the Parquet option sets
 │   │       └── slurm/
 │   │           ├── client.py       # slurmrestd REST client
 │   │           ├── contract.py     # shared constants + JobParams: EXPECTED_FILE_MODE,

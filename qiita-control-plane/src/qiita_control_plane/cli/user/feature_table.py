@@ -1009,7 +1009,7 @@ def _write_bundle(
     )
 
     def write() -> None:
-        # ROW_GROUP_SIZE_BYTES in PARQUET_OPTS requires this; DuckDB errors at bind time
+        # ROW_GROUP_SIZE_BYTES in PARQUET_OPTS_TRANSFER requires this; DuckDB errors at bind time
         # without it (see qiita_common.parquet). Set once for every Parquet COPY below —
         # the BIOM writer neither needs nor minds it, and the table's format does not
         # decide whether a companion is written.

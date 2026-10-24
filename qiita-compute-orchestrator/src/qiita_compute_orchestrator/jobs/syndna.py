@@ -61,7 +61,7 @@ from qiita_common.models import ReadMaskReason
 from qiita_common.parquet import validate_parquet_path
 
 from ..miint import (
-    PARQUET_OPTS,
+    PARQUET_OPTS_TRANSFER,
     apply_duckdb_settings,
     duckdb_tmp_dir,
     open_miint_conn,
@@ -358,7 +358,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 "        NULL::UINTEGER AS left_trim2, NULL::UINTEGER AS right_trim2 "
                 f"      FROM {_READS} r LEFT JOIN {_HITS} h USING (sequence_idx) "
                 "      ORDER BY sequence_idx) "
-                f"TO '{out_sql}' ({PARQUET_OPTS})"
+                f"TO '{out_sql}' ({PARQUET_OPTS_TRANSFER})"
             )
 
             # The alignment itself, which the control plane's persist-syndna-read-count
@@ -373,7 +373,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 "         sequence_idx, parent_feature_idx, "
                 "         flags, position, stop_position, cigar "
                 f"      FROM {_ALIGNMENT}) "
-                f"TO '{alignment_sql}' ({PARQUET_OPTS})"
+                f"TO '{alignment_sql}' ({PARQUET_OPTS_TRANSFER})"
             )
         success = True
     finally:

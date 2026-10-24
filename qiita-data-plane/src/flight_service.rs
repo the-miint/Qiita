@@ -1496,20 +1496,19 @@ where
                         file.try_clone()
                             .map_err(|e| Status::internal(format!("dup file handle: {e}")))?,
                     );
-                    // Parquet v2 + zstd. The orchestrator's miint.py defines
-                    // two conventions: PARQUET_OPTS (zstd, for DuckLake-bound
-                    // durable artifacts) and PARQUET_OPTS_INTERMEDIATE (snappy,
-                    // for transient files read once then deleted in the same
-                    // job). DoPut uploads are intermediate in the consumed-once
-                    // sense — but their disk-residency is "from /done to
-                    // (eventual) cleanup," not "until the next phase in the
-                    // same job." That can be minutes to indefinitely with the
-                    // current no-sweep follow-up open. The disk-footprint
-                    // tradeoff outweighs the snappy fast-decode win at GG2
-                    // scale: backbone FASTA blew up to ~3.5× the source on
-                    // disk under uncompressed v1 (DNA-chunk VARCHAR columns
-                    // don't dictionary-encode), and zstd-default level 3
-                    // gives ~4× compression at parquet-rs's default cost.
+                    // Parquet v2 + zstd. `qiita_common.parquet` names its option
+                    // sets by where a file ends up: AT_REST (registered into
+                    // DuckLake), TRANSFER (leaves the job, but not into the lake)
+                    // and INTERMEDIATE (snappy, read once then deleted in the same
+                    // job). A DoPut upload is consumed once, like an intermediate,
+                    // but its disk-residency is "from /done to (eventual)
+                    // cleanup," not "until the next phase in the same job." That
+                    // can be minutes or much longer, so it is a transfer file: the disk-footprint
+                    // tradeoff outweighs the snappy fast-decode win at GG2 scale.
+                    // Backbone FASTA blew up to ~3.5× the source on disk under
+                    // uncompressed v1 (DNA-chunk VARCHAR columns don't
+                    // dictionary-encode), and zstd at parquet-rs's default level
+                    // (1) gives ~4× compression.
                     let props = WriterProperties::builder()
                         .set_writer_version(WriterVersion::PARQUET_2_0)
                         .set_compression(Compression::ZSTD(ZstdLevel::default()))
@@ -1630,9 +1629,12 @@ where
     task_result
 }
 
-/// Canonical Parquet write options for an exported reads file — Parquet v2 +
-/// zstd, matching `qiita_common.parquet.PARQUET_OPTS` so the materialized file
-/// is shape-identical to the durable copy `ingest_reads` first wrote.
+/// Canonical Parquet write options for an exported reads file: a copy of
+/// `qiita_common.parquet.PARQUET_OPTS_TRANSFER`, pinned equal to it by a qiita-common
+/// test. The materialized file has the shape of the
+/// durable copy `ingest_reads` first wrote (Parquet v2, zstd, 64 MB row groups), but
+/// a job reads it and it is dropped, so it takes zstd's default level rather than
+/// the at-rest one.
 const EXPORT_READ_PARQUET_OPTS: &str =
     "FORMAT PARQUET, PARQUET_VERSION 'v2', COMPRESSION 'zstd', ROW_GROUP_SIZE_BYTES '64MB'";
 
@@ -2009,9 +2011,8 @@ const SPIKEIN_REASONS: &str = "'spikein_syndna'";
 /// toward raw only.
 ///
 /// The reason lists below are the Rust twin of `READ_MASK_BUCKET` in qiita-common
-/// (`read_mask_reason_sql_list`). Rust cannot import it, so the two are pinned by
-/// `qiita-control-plane/tests/test_read_mask_counts.py::test_rust_reason_lists_match_the_python_bucket_map`,
-/// which parses these consts out of this file and compares them character for
+/// (`read_mask_reason_sql_list`). Rust cannot import it, so a control-plane test
+/// parses these consts out of this file and compares them to it character for
 /// character. (NOT the block e2e test: its fixture emits no `spikein_syndna` or
 /// `host_minimap2` rows, so a typo here would miscount silently there.) Adding a
 /// ReadMaskReason means touching BOTH sides.

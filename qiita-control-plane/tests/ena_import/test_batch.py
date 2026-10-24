@@ -716,6 +716,32 @@ async def test_run_batch_isolates_per_study_failure(
     await _cleanup_study(postgres_pool, ok_accession)
 
 
+async def test_run_batch_names_an_exception_raised_without_a_message(
+    batch_app, postgres_pool, admin_principal, download_ena_study_action, batch_cleanup, monkeypatch
+):
+    """A failure whose exception carries no message (a bare timeout) still records
+    what it was, never an empty failure reason."""
+
+    def _time_out(accession: str):
+        raise TimeoutError()
+
+    monkeypatch.setattr(_QUERY_RUNS, _time_out)
+
+    accession = unique_ena_accession("PRJEB")
+    batch_idx, items = await create_ena_import_batch(
+        postgres_pool, accessions=[accession], principal=admin_principal
+    )
+    batch_cleanup.append(batch_idx)
+    await schedule_ena_import_batch(batch_app, items=items, principal=admin_principal)
+
+    row = await postgres_pool.fetchrow(
+        "SELECT state, failure_reason FROM qiita.ena_import_batch_item WHERE batch_idx = $1",
+        batch_idx,
+    )
+    assert row["state"] == BatchItemState.FAILED.value
+    assert row["failure_reason"] == "TimeoutError (no message)"
+
+
 # ---------------------------------------------------------------------------
 # Transient ENA HTTP statuses at resolve
 # ---------------------------------------------------------------------------
@@ -1290,12 +1316,16 @@ async def test_process_one_study_all_runs_failed_reaches_terminal_failed(
     it reports success over an all-failed study, and submits doomed download
     tickets. The per-run reason is surfaced on the endpoint."""
 
-    def _bad_latitude_attrs(accession):
-        # ILLUMINA maps (pool created), but an unparseable latitude fails the run
-        # in harmonization -- the created_pools-non-empty / all-runs-failed case.
-        return [(f"SAMN-{accession}", {"geographic location (latitude)": ["not-a-number"]})]
+    def _unmappable_strategy_runs(accession):
+        # ILLUMINA maps (pool created), but a library strategy no prep protocol covers
+        # fails the run -- the created_pools-non-empty / all-runs-failed case.
+        cols, (row,) = _fake_runs(accession)
+        row = list(row)
+        row[_RUN_COLUMNS.index("library_strategy")] = "OTHER"
+        row[_RUN_COLUMNS.index("library_source")] = "OTHER"
+        return cols, [tuple(row)]
 
-    monkeypatch.setattr(_QUERY_ATTRS, _bad_latitude_attrs)
+    monkeypatch.setattr(_QUERY_RUNS, _unmappable_strategy_runs)
 
     accession = unique_ena_accession("PRJNA")
     batch_idx, _items = await _drive_one_study(batch_app, postgres_pool, admin_principal, accession)
@@ -1471,7 +1501,7 @@ async def test_process_one_study_mixed_excluded_and_failed_every_run_failed_mess
     batch_app, postgres_pool, admin_principal, download_ena_study_action, batch_cleanup, monkeypatch
 ):
     """A study with one suppressed (excluded) run and one run that maps a
-    platform (a pool IS created) but then fails harmonization has no
+    platform (a pool IS created) but then fails on its library strategy has no
     successful run either way -- terminal `failed`, and the reasons string
     names both."""
     accession = unique_ena_accession("PRJNA")
@@ -1493,14 +1523,12 @@ async def test_process_one_study_mixed_excluded_and_failed_every_run_failed_mess
         bad_harmonization_row[run_i] = f"SRR-{a}-badharm"
         bad_harmonization_row[exp_i] = f"SRX-{a}-badharm"
         bad_harmonization_row[sample_i] = f"SAMN-{a}-badharm"
+        bad_harmonization_row[_RUN_COLUMNS.index("library_strategy")] = "OTHER"
+        bad_harmonization_row[_RUN_COLUMNS.index("library_source")] = "OTHER"
 
         return list(_RUN_COLUMNS), [tuple(suppressed_row), tuple(bad_harmonization_row)]
 
-    def _bad_latitude_attrs(a):
-        return [(f"SAMN-{a}-badharm", {"geographic location (latitude)": ["not-a-number"]})]
-
     monkeypatch.setattr(_QUERY_RUNS, _mixed_runs)
-    monkeypatch.setattr(_QUERY_ATTRS, _bad_latitude_attrs)
 
     batch_idx, _items = await _drive_one_study(batch_app, postgres_pool, admin_principal, accession)
     batch_cleanup.append(batch_idx)
@@ -2048,15 +2076,21 @@ async def test_platform_whose_runs_all_failed_gets_no_ticket(
     """A failed platform must neither submit a ticket that can only fail on an empty
     pool nor drag the item to `failed` when the other platform downloads."""
     accession = unique_ena_accession("PRJNA")
+
+    def _runs(a):
+        # The nanopore run's platform maps, but its library strategy maps to no
+        # prep protocol, so that platform's only run fails.
+        cols, (ok_row, bad_row) = _fake_run_rows(
+            a, [("ok", "ILLUMINA"), ("bad", "OXFORD_NANOPORE")]
+        )
+        bad_row = list(bad_row)
+        bad_row[_RUN_COLUMNS.index("library_strategy")] = "OTHER"
+        bad_row[_RUN_COLUMNS.index("library_source")] = "OTHER"
+        return cols, [ok_row, tuple(bad_row)]
+
+    monkeypatch.setattr(_QUERY_RUNS, _runs)
     monkeypatch.setattr(
-        _QUERY_RUNS, lambda a: _fake_run_rows(a, [("ok", "ILLUMINA"), ("bad", "OXFORD_NANOPORE")])
-    )
-    monkeypatch.setattr(
-        _QUERY_ATTRS,
-        lambda a: [
-            (f"SAMN-{a}-ok", {"collection date": ["2020-01-01"]}),
-            (f"SAMN-{a}-bad", {"geographic location (latitude)": ["not-a-number"]}),
-        ],
+        _QUERY_ATTRS, lambda a: [(f"SAMN-{a}-ok", {"collection date": ["2020-01-01"]})]
     )
     batch_idx, items = await _drive_one_study(batch_app, postgres_pool, admin_principal, accession)
     batch_cleanup.append(batch_idx)

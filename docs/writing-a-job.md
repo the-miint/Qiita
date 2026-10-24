@@ -109,6 +109,16 @@ Three kinds of field arrive in `Inputs`:
   columns the destination table has helps DuckLake prune, but is not verified
   (see [`architecture/cross-cutting.md`](architecture/cross-cutting.md) — result
   file requirements).
+- Write a Parquet file with the option set for where it ends up, from
+  `qiita_common.parquet` (re-exported by `qiita_compute_orchestrator.miint`): a file a
+  `register-files` step registers takes `PARQUET_OPTS_AT_REST`; anything else takes
+  `PARQUET_OPTS_TRANSFER` or `PARQUET_OPTS_INTERMEDIATE`. That module's header says why the
+  sets differ. `tests/test_parquet_at_rest_writers.py` finds the registering modules from the
+  workflow YAMLs and fails when one of them neither names an at-rest set nor calls a shared
+  writer of registered files (`read_staging.write_sorted_reads`, the `_feature_load`
+  writers), when one names a transfer set, or when any other module names an at-rest set. It reads which sets a module's source
+  names, not which set each file is written with. A sorted COPY of wide rows also appends
+  `ROW_GROUP_SIZE` from `sorted_row_group_size` (its docstring says why).
 
 ### Error classification
 

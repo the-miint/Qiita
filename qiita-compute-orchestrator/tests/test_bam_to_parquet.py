@@ -26,7 +26,14 @@ import asyncio
 
 import duckdb
 import pytest
-from helpers import write_chunked_blob_upload
+from helpers import (
+    SHRUNK_ROW_GROUP_SIZE_BYTES,
+    WIDE_ROW_GROUPS,
+    row_group_rows,
+    wide_reads,
+    write_chunked_blob_upload,
+)
+from qiita_common import parquet
 from qiita_common.backend_failure import BackendFailure, FailureKind, StepNoData
 from qiita_common.models import (
     REDRIVABLE_WORK_TICKET_STATES,
@@ -247,7 +254,7 @@ def test_execute_reuses_range_left_by_a_crashed_attempt(monkeypatch, tmp_path):
     attempt into a permanent failure on the retry: it masked the OOM behind a mint
     conflict and defeated the runner's OOM memory escalation, which can only pay
     off if the escalated attempt gets past the mint. This is the exact sequence
-    that failed nearly every sample on the first real PacBio run.
+    that failed nearly every prep_sample on the first real PacBio run.
     """
 
     async def _conflict(*, http, prep_sample_idx, count, work_ticket_idx):
@@ -339,12 +346,12 @@ def test_duckdb_memory_limit_tracks_the_slurm_cgroup(fake_mint, monkeypatch, tmp
 
 
 def test_execute_refuses_a_range_minted_by_a_different_ticket(monkeypatch, tmp_path):
-    """A range minted by ANOTHER work_ticket must NOT be reused — the sample's reads
+    """A range minted by ANOTHER work_ticket must NOT be reused — the prep_sample's reads
     are already registered, and reusing the range would register them a second time.
 
     This is the guard that makes the 409-reuse safe. The submit-time
     disallow-without-delete gate only blocks NON-terminal tickets, so a COMPLETED
-    sample can be resubmitted; without this check the new ticket would mint, 409,
+    prep_sample can be resubmitted; without this check the new ticket would mint, 409,
     read back the old range, rewrite the identical sequence_idx values, and
     register-files would add a SECOND DuckLake data file. DuckLake has no
     uniqueness, so every read would silently exist twice.
@@ -583,10 +590,9 @@ def test_reads_are_written_as_monotone_disjoint_parts(fake_mint, monkeypatch, tm
     """The batched write must reproduce EXACTLY what the global sort used to give.
 
     The old form was one `COPY ... ORDER BY sequence_idx`, a blocking sort over the
-    whole seq+qual payload — tens of GB for a HiFi sample, and where the first real
-    PacBio run OOM'd. What that sort actually bought was not a globally sorted file
-    (PARQUET_OPTS writes row groups in thread-finish order regardless) but tight
-    per-row-group min/max on sequence_idx, for DuckLake pruning.
+    whole seq+qual payload — tens of GB for a HiFi prep_sample, and where the first real
+    PacBio run OOM'd. What that sort bought for pruning was not the row order itself
+    but tight per-row-group min/max on sequence_idx, which is what DuckLake pruning reads.
 
     Batching gets the same thing for free, because the data is already monotone:
     sequence_idx = sequence_index + start - 1. So this pins the properties pruning
@@ -626,6 +632,22 @@ def test_reads_are_written_as_monotone_disjoint_parts(fake_mint, monkeypatch, tm
             bounds.append((lo, hi))
     for (_, prev_hi), (next_lo, _) in zip(bounds, bounds[1:], strict=False):
         assert prev_hi < next_lo, f"parts overlap: {bounds}"
+
+
+def test_parts_keep_wide_row_groups_under_the_byte_cap(fake_mint, monkeypatch, tmp_path):
+    """Each part's sorted COPY ignores ROW_GROUP_SIZE_BYTES (see
+    `qiita_common.parquet.sorted_row_group_size`), so it asks for a row count sized to the
+    reads. With the cap shrunk to 1 MiB, ~1 KB reads land one vector per row group instead
+    of the whole part in one."""
+    monkeypatch.setattr(parquet, "ROW_GROUP_SIZE_BYTES", SHRUNK_ROW_GROUP_SIZE_BYTES)
+    sam = tmp_path / "in.sam"
+    _write_sam(sam, [_sam_record(rid, bases, "I" * len(bases)) for rid, bases in wide_reads()])
+
+    _run(Inputs(bam_path=sam, prep_sample_idx=42, work_ticket_idx=1), tmp_path / "ws")
+
+    parts = sorted((tmp_path / "ws" / "read").glob("*.parquet"))
+    assert len(parts) == 1, "a few MB of reads is well under one part's budget"
+    assert row_group_rows(parts[0]) == WIDE_ROW_GROUPS
 
 
 def test_execute_refuses_when_the_minter_state_is_unknown(monkeypatch, tmp_path):

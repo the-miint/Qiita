@@ -62,7 +62,7 @@ from ..data_plane_client import (
     open_reference_sequences_stream,
 )
 from ..miint import (
-    PARQUET_OPTS,
+    PARQUET_OPTS_TRANSFER,
     apply_duckdb_settings,
     duckdb_tmp_dir,
     open_miint_conn,
@@ -159,7 +159,7 @@ def _write_ogu_table(
 
     n_rows = conn.execute(analytic.ogu_input_count_sql()).fetchone()[0]
     select_sql = analytic.woltka_ogu_select_sql() if n_rows else analytic.empty_ogu_select_sql()
-    conn.execute(f"COPY ({select_sql}) TO '{out_sql}' ({PARQUET_OPTS})")
+    conn.execute(f"COPY ({select_sql}) TO '{out_sql}' ({PARQUET_OPTS_TRANSFER})")
 
 
 def _require_denovo_genome_quality_path(inputs: Inputs) -> Path:

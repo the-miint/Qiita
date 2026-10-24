@@ -1001,6 +1001,15 @@ async def fetch_missing_value_reason_idxs_by_names(
     return {r["name"]: r["idx"] for r in rows}
 
 
+async def fetch_missing_value_reason_names(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
+) -> frozenset[str]:
+    """Every qiita.missing_value_reason name -- a small, closed vocabulary. Same
+    no-is_obsolete-filter stance as `fetch_missing_value_reason_idxs_by_names`."""
+    rows = await pool_or_conn.fetch("SELECT name FROM qiita.missing_value_reason")
+    return frozenset(r["name"] for r in rows)
+
+
 async def fetch_terminology_term_idxs_by_term_ids(
     pool_or_conn: asyncpg.Pool | asyncpg.Connection,
     *,

@@ -151,22 +151,27 @@ steps:
     optional_inputs: [taxonomy_path, tree_path, jplace_path]
     outputs: [staging_dir]
     # walltime sized from the one completing attempt of the reference-18 build
-    # (196,062 genomes), which ran 22:25:50. No attempt was observed hitting a WALLTIME
-    # limit: that one ran under a 48h SLURM limit whose origin the ticket does not
-    # record, and the other two failed on memory at 00:06:50 and 01:39:03. So this
-    # sizes a 22h26 duration against a 24h baseline, on n=1.
+    # (196,062 genomes, 718 Gbp), which ran 22:25:50 writing zstd at the default level.
+    # No attempt was observed hitting a WALLTIME limit: that one ran under a 48h SLURM
+    # limit whose origin the ticket does not record, and the other two failed on memory
+    # at 00:06:50 and 01:39:03. So the base is a 22h26 duration, on n=1.
     #
-    # PT36H is 1.6x that duration. It buys no extra escalation step — a TIMEOUT
-    # doubles and clamps to the PT48H action ceiling, so PT24H and PT36H both give
-    # exactly one retry at PT48H. What it buys is a smaller chance of needing it,
-    # which matters because `max_retries` is spent ticket-wide.
+    # The at-rest zstd level adds ~74 s per GB of chunk data at this step's 8 threads
+    # (synthetic 64 KB chunks written in this job's sorted shape, DuckDB 1.5.5, a shared
+    # 32-core dev box). That run had one round of row groups per thread; a full batch's
+    # 25 row groups take 4 rounds on 8 threads, so up to ~97 s. On 718 GB that is
+    # +15-19 h, ~37-42 h for that build.
+    #
+    # PT48H is 1.15x the high end. A TIMEOUT doubles and clamps to the PT72H action
+    # ceiling, so one retry at PT72H remains; the baseline's margin is a smaller chance
+    # of needing it, which matters because `max_retries` is spent ticket-wide.
     #
     # mem_gb is untouched: RSS pegged at ReqMem in all three attempts, which bounds
     # demand from below without measuring it.
     baseline_resources:
       cpu: 8
       mem_gb: 32
-      walltime: PT36H
+      walltime: PT48H
 
   - action: register-files
     inputs: [staging_dir]
@@ -244,4 +249,4 @@ action_ceiling:
   # 128 (not 64): build_routing_index starts at 64 GB and an OOM retry doubles it,
   # matching local-host-reference-add's build_rype_index ceiling rationale.
   mem_gb: 128
-  walltime: PT48H
+  walltime: PT72H

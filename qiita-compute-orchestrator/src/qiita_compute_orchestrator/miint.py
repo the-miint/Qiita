@@ -38,46 +38,69 @@ from qiita_common.duckdb_miint import (
     miint_load_sql,
 )
 from qiita_common.parquet import (
-    PARQUET_OPTS,
+    PARQUET_OPTS_AT_REST,  # noqa: F401  re-exported for jobs that import it from here
     PARQUET_OPTS_INTERMEDIATE,  # noqa: F401  re-exported for jobs that import it from here
+    PARQUET_OPTS_TRANSFER,
 )
 
 from .miint_staging import write_staging_marker
 
-# PARQUET_OPTS / PARQUET_OPTS_INTERMEDIATE are single-sourced in
-# `qiita_common.parquet` (the one module this service and the control plane both
-# depend on) so a Parquet-version, compression, or row-group bump touches ONE
-# place. They are imported above and re-exported here for the jobs that pull
-# them via `from ..miint import PARQUET_OPTS`; see that module for the
-# ROW_GROUP_SIZE_BYTES / preserve_insertion_order semantics.
+# The Parquet option sets are single-sourced in `qiita_common.parquet` (the one
+# module this service and the control plane both depend on), which says which set a
+# file takes. They are imported above and re-exported here for the jobs that pull
+# them via `from ..miint import ...`; see that module for the ROW_GROUP_SIZE_BYTES /
+# preserve_insertion_order semantics.
 #
-# Cross-component contract: result files written with these options are
-# registered into DuckLake by the Rust data plane (qiita-data-plane, DoAction
-# "register"). Any bump (PARQUET_VERSION, COMPRESSION, etc.) must be verified
-# against the data plane's pinned DuckDB version before merging — orchestrator
-# unit tests don't exercise the read side, so a breaking bump would surface only
-# in `make test-integration` with a confusing data-plane-side trace.
+# Cross-component contract: files written with PARQUET_OPTS_AT_REST are registered
+# into DuckLake by the Rust data plane (qiita-data-plane, DoAction "register_files").
+# Any bump (PARQUET_VERSION, COMPRESSION, etc.) must be verified against the data
+# plane's pinned DuckDB version before merging — orchestrator unit tests don't
+# exercise the read side, so a breaking bump would surface only in
+# `make test-integration` with a confusing data-plane-side trace.
 #
-# ROW_GROUP_SIZE_BYTES (carried by both) requires preserve_insertion_order=false,
+# ROW_GROUP_SIZE_BYTES (carried by every set) requires preserve_insertion_order=false,
 # which `apply_duckdb_settings` below sets on every pipeline connection.
 
 # Chunked-sequence write constants. Sequence data (genome-scale up to
 # ~21 MB per record on GG2) is broken into 64 KB chunks so the DuckLake
-# row layout stays narrow on long entries. DuckDB flushes a row group on
-# whichever cap it hits first: the ROW_GROUP_SIZE row count (16384 rows ×
-# ~64 KB chunk_data ≈ 1 GB, empirically tuned against GG2 backbone —
+# row layout stays narrow on long entries. An unsorted write flushes a row
+# group on whichever cap it hits first: the ROW_GROUP_SIZE row count (16384
+# rows × ~64 KB chunk_data ≈ 1 GB, empirically tuned against GG2 backbone —
 # 4.2 GB peak RSS; 32768 OOMs on 30 GB hosts) OR the ROW_GROUP_SIZE_BYTES
-# '64MB' size cap inherited from PARQUET_OPTS. On dense chunk data the
+# '64MB' size cap inherited from the base set. On dense chunk data the
 # 64 MB cap binds first (~1024 chunks), so row groups land at ~64 MB
 # rather than ~1 GB — strictly lower write memory and finer pruning, with
-# the row-count cap still backstopping sparse/narrow records.
+# the row-count cap still backstopping sparse/narrow records. A sorted
+# write gets the row count alone (see `qiita_common.parquet.sorted_row_group_size`).
 #
 # CHUNK_ROW_GROUP_SIZE (and the matching CHUNK_SIZE) are single-sourced in
 # `qiita_common.chunking`, shared with the CLI's DoPut path. The actual
 # chunking is miint's native `sequence_split` over read_fastx, in
 # `stage_local_fasta` (which builds the expression via
 # `qiita_common.chunking.sequence_split_expr`).
-PARQUET_OPTS_CHUNKED: str = f"{PARQUET_OPTS}, ROW_GROUP_SIZE {CHUNK_ROW_GROUP_SIZE}"
+PARQUET_OPTS_CHUNKED_TRANSFER: str = (
+    f"{PARQUET_OPTS_TRANSFER}, ROW_GROUP_SIZE {CHUNK_ROW_GROUP_SIZE}"
+)
+
+
+def parquet_bytes_per_row(conn: duckdb.DuckDBPyConnection, path: Path | str) -> int:
+    """Mean decompressed bytes per row (still Parquet-encoded) of the Parquet file or glob
+    at `path`, from its footers alone: the width a sorted write of rows of the same shape
+    passes to `qiita_common.parquet.sorted_row_group_size`.
+
+    Raises when the footers report no rows or no size. A default would size the write
+    for rows of the wrong width, and nothing downstream would notice."""
+    rows, size = conn.execute(
+        "SELECT (SELECT sum(num_rows) FROM parquet_file_metadata(?)),"
+        " sum(total_uncompressed_size) FROM parquet_metadata(?)",
+        [str(path), str(path)],
+    ).fetchone()
+    if not rows or not size:
+        raise ValueError(
+            f"the Parquet footers at {path} report no rows or no size "
+            f"(rows={rows}, uncompressed bytes={size}); cannot size a write from them"
+        )
+    return max(1, size // rows)
 
 
 # DuckDB resource caps for native jobs.

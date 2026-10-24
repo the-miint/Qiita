@@ -1,7 +1,7 @@
 """Unit tests for read_staging's per-slot DuckDB caps.
 
 `per_slot_caps` splits a memory budget across `concurrency` in-flight
-samples/runs. Under SLURM the budget is the cgroup; off SLURM the literal is a
+prep_samples/runs. Under SLURM the budget is the cgroup; off SLURM the literal is a
 ceiling bounded by detected host RAM, the same contract as
 `resolve_duckdb_memory_gb` — these tests pin that bound (and its fail-soft).
 """
@@ -12,6 +12,14 @@ import os
 from pathlib import Path
 
 import duckdb
+from helpers import (
+    SHRUNK_ROW_GROUP_SIZE_BYTES,
+    WIDE_READ_BASES,
+    WIDE_ROW_COUNT,
+    WIDE_ROW_GROUPS,
+    row_group_rows,
+)
+from qiita_common import parquet
 
 from qiita_compute_orchestrator import read_staging
 
@@ -60,11 +68,11 @@ def test_under_slurm_detected_ram_is_irrelevant(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# write_sorted_reads: the shared per-sample writer.
+# write_sorted_reads: the shared per-prep_sample writer.
 #   - default mode (sequence_index verbatim): ingest_reads / ingest_ena_reads,
-#     whose intermediate is already per-sample.
-#   - golay mode (ROW_NUMBER + per-sample filter): golay_demux, whose demux
-#     intermediate is pooled and numbered across all samples.
+#     whose intermediate is already per-prep_sample.
+#   - golay mode (ROW_NUMBER + per-prep_sample filter): golay_demux, whose demux
+#     intermediate is pooled and numbered across all prep_samples.
 # ---------------------------------------------------------------------------
 
 _OUT_COLS = [
@@ -124,8 +132,8 @@ def test_write_sorted_reads_default_mode(tmp_path):
 
 
 def test_write_sorted_reads_golay_mode_renumbers_per_sample(tmp_path):
-    """golay's pooled intermediate (numbered across ALL samples) is re-numbered
-    densely 1..count per sample via ROW_NUMBER + a per-sample filter, regardless
+    """golay's pooled intermediate (numbered across ALL prep_samples) is re-numbered
+    densely 1..count per prep_sample via ROW_NUMBER + a per-prep_sample filter, regardless
     of the gappy global sequence_index."""
     src = tmp_path / "demuxed.parquet"
     _write_source(
@@ -163,6 +171,29 @@ def test_write_sorted_reads_golay_mode_renumbers_per_sample(tmp_path):
     assert [r["read_id"] for r in rows] == ["s7a", "s7b", "s7c"]
     assert [r["sequence_idx"] for r in rows] == [500, 501, 502]
     assert all(r["prep_sample_idx"] == 7 for r in rows)
+
+
+def test_write_sorted_reads_keeps_wide_row_groups_under_the_byte_cap(tmp_path, monkeypatch):
+    """A sorted COPY ignores ROW_GROUP_SIZE_BYTES (see
+    `qiita_common.parquet.sorted_row_group_size`), so the writer asks for a row count sized
+    to its reads. With the cap shrunk to 1 MiB, ~1 KB reads land one vector per row group
+    instead of the whole read set in one."""
+    monkeypatch.setattr(parquet, "ROW_GROUP_SIZE_BYTES", SHRUNK_ROW_GROUP_SIZE_BYTES)
+    src = tmp_path / "intermediate.parquet"
+    with duckdb.connect() as conn:
+        # Bases distinct per read, so no encoder collapses the column; many row groups,
+        # so the writer's scan and sort run on several threads.
+        conn.execute(
+            "COPY (SELECT range + 1 AS sequence_index, 'r' || range AS read_id, "
+            "translate(repeat(md5(range::VARCHAR), 32)[:?], '0123456789abcdef', "
+            "'ACGTACGTACGTACGT') AS sequence1, repeat('I', ?) AS qual1, "
+            "NULL::VARCHAR AS sequence2, NULL::VARCHAR AS qual2 FROM range(?)) "
+            f"TO '{src}' (FORMAT PARQUET, ROW_GROUP_SIZE 1024)",
+            [WIDE_READ_BASES, WIDE_READ_BASES, WIDE_ROW_COUNT],
+        )
+    out = tmp_path / "read.parquet"
+    read_staging.write_sorted_reads(src, 42, 100, out, tmp_path, 2, 4)
+    assert row_group_rows(out) == WIDE_ROW_GROUPS
 
 
 def test_hardlink_shares_inode(tmp_path):

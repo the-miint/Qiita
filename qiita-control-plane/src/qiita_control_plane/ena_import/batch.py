@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -81,6 +82,7 @@ from .registration import (
     EnaRunRegistrationOutcome,
     EnaRunRegistrationStatus,
     download_ticket_covers_pool,
+    exception_reason,
     fetch_download_pool_states,
     fetch_pool_download_ticket,
     register_ena_study,
@@ -396,6 +398,28 @@ async def _reconcile_and_record(
     return flagged
 
 
+# How many run accessions a grouped failure reason names before eliding the rest.
+_RUN_FAILURE_EXAMPLES = 3
+
+
+def _summarize_run_failures(outcomes: Iterable[EnaRunRegistrationOutcome]) -> str:
+    """One clause per distinct failure reason, in first-seen order, naming how many
+    runs hit it and the first few of them: a study whose runs share one bad value
+    reports it once, not once per run. Every run's own reason stays on `ena_run_outcomes`."""
+    by_reason: dict[str | None, list[str]] = {}
+    for outcome in outcomes:
+        # an empty reason and an absent one read the same, so they group together
+        by_reason.setdefault(outcome.failure_reason or None, []).append(outcome.run_accession)
+    clauses = []
+    for reason, accessions in by_reason.items():
+        named = ", ".join(accessions[:_RUN_FAILURE_EXAMPLES])
+        if len(accessions) > _RUN_FAILURE_EXAMPLES:
+            named += ", …"
+        count = f"{len(accessions)} run{'s' if len(accessions) != 1 else ''}"
+        clauses.append(f"{count} ({named}): {reason or 'no reason recorded'}")
+    return "; ".join(clauses)
+
+
 async def _fail_after_held_run_check(
     pool: asyncpg.Pool,
     item: BatchImportItemHandle,
@@ -417,7 +441,7 @@ async def _fail_after_held_run_check(
             pool, item, study_idx=study_idx, portal_run_accessions=portal_run_accessions
         )
         if flagged:
-            reasons = "; ".join(f"{o.run_accession}: {o.failure_reason}" for o in flagged)
+            reasons = _summarize_run_failures(flagged)
             failure_reason = f"{failure_reason} (held runs re-checked: {reasons})"
     await _set_item_state(pool, item.idx, BatchItemState.FAILED, failure_reason=failure_reason)
 
@@ -619,10 +643,8 @@ async def _process_one_study(
             # no sequenced_sample rows. Submitting downloads against them would
             # report success over an all-failed study. Terminal `failed`; the
             # per-run reasons are already persisted on `ena_run_outcomes`.
-            reasons = "; ".join(
-                f"{o.run_accession}: {o.failure_reason}"
-                for o in result.ena_runs
-                if o.status not in _SUCCESSFUL_RUN_REGISTRATION_STATUSES
+            reasons = _summarize_run_failures(
+                o for o in result.ena_runs if o.status not in _SUCCESSFUL_RUN_REGISTRATION_STATUSES
             )
             await _set_item_state(
                 pool,
@@ -706,7 +728,12 @@ async def _process_one_study(
             item.ena_study_accession,
             exc,
         )
-        await _set_item_state(pool, item.idx, BatchItemState.FAILED, failure_reason=str(exc))
+        await _set_item_state(
+            pool,
+            item.idx,
+            BatchItemState.FAILED,
+            failure_reason=exception_reason(exc),
+        )
 
 
 def _unresolved_runs_reason(unresolved: list[str]) -> str:
