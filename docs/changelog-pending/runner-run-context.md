@@ -1,6 +1,6 @@
 ### Changed
 
-- **The workflow runner passes the values fixed for a run as one `RunContext` (#TBD).**
+- **The workflow runner passes the values fixed for a run as one `RunContext` (#774).**
   `run_workflow` builds it once; `_run_entry_with_retry`, `_dispatch_step`,
   `_adopt_or_submit`, `_dispatch_action`, `_run_action_primitive` and
   `_reconstruct_completed_outputs` take it in place of the pool, ticket, backend client,
