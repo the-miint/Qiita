@@ -127,6 +127,7 @@ Only rules whose trigger appears in the diff can fire.
 | Any new or changed doc, runbook, docstring or comment | R2 |
 | A user-facing string: a runbook, a workflow `description:`, argparse `help=`, an HTTPException `detail`, a failure reason, or a test assertion on one; a `generated_by` value | R11, R2 |
 | A new file, moved code, a helper in a feature-specific module, feature- or platform-specific naming, a one-shot script | R10 |
+| A private (`_`-prefixed) name imported into, or listed in `__all__` of, a package `__init__.py` | R10 |
 | An external tool's behaviour that correctness depends on | Outside the rule set |
 
 ## PR-level checks
@@ -277,6 +278,7 @@ When two similar code paths solve the same problem differently, factor out the s
 - **A method lives in the module whose responsibility it matches.** A non-route helper does not live under `routes/`; a generic runner does not carry one feature's special case.
 - **A one-shot or backfill script is not a permanent module**; ask whether it should be committed at all.
 - **A file covering several concerns becomes a package.**
+- **A package `__init__` does not re-export a submodule's private name.** A caller, a test included, imports it from the module that defines it; the re-export widens the package's surface and hides where the code lives.
 - **Protocol-specific logic is conditional, and a workflow that is not general says so.**
 - **A parameter, column or enum threaded through for a single possible value**: is the other state reachable?
 
