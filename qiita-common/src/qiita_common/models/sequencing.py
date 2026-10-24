@@ -825,16 +825,15 @@ class SequencedSampleResponse(ReadCounts):
     of the globally-linked metadata values the prep_sample carries that
     the caller's tier reaches (each judged on the study that wrote it;
     the rest are absent), keyed on prep_sample_global_field.internal_name.
-    Purely-local
-    metadata and metadata whose prep_sample_to_study link has been
-    retired are excluded -- both surface as
-    prep_sample_metadata.global_field_idx IS NULL via the existing
-    schema triggers and are filtered out by the read.
+    Purely-local metadata is excluded: its
+    prep_sample_metadata.global_field_idx is NULL. A global value still
+    surfaces after the prep_sample_to_study link it was written through is
+    retired, since the canonical value outlives the link.
 
     `effective_updated_at` = GREATEST(prep_sample.updated_at,
     sequenced_sample.updated_at) — a single timestamp that bumps on a
     write to either table, used as the source for the ETag header on
-    the GET and the If-Match contract on a future PATCH.
+    the GET and the If-Match contract on the PATCH.
     `caller_system_role` carries the caller's principal.system_role
     verbatim from the database.
     """

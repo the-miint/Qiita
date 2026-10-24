@@ -3,8 +3,8 @@
 Functions take an asyncpg.Connection or asyncpg.Pool as their first
 positional argument; they never acquire their own connection or
 transaction. They return data, not policy — the access predicate lives
-in qiita_control_plane.auth.study_access and consumes the shapes
-returned here.
+in qiita_control_plane.auth.guards and consumes the shapes returned
+here.
 """
 
 from collections.abc import Mapping

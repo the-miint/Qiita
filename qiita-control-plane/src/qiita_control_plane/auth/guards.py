@@ -665,7 +665,7 @@ async def filter_prep_samples_caller_can_read(
     — shared by the narrowing discovery reads and the all-or-nothing alignment
     mint, where two copies would be exactly the drift that ends with discovery
     advertising a cohort the mint then 403s. It is not the only such predicate in
-    the repo: `repositories/mask_definition.py`'s `_CALLER_MAY_SEE_SAMPLE` answers
+    the repo: `repositories/_sample_scope.py`'s `_CALLER_MAY_SEE_SAMPLE` answers
     a similar-sounding question for the admin mask surface, at a different tier,
     and reaches the OPPOSITE verdict on an orphan. Do not assume a sample's
     readability has one answer everywhere; assume it has one answer here.
@@ -723,7 +723,7 @@ async def require_caller_has_tier_on_all_studies(
 
     This policy has a second implementation: the mask-definition reads
     restate it as a SQL predicate
-    (`repositories.mask_definition._CALLER_MAY_SEE_SAMPLE`), because
+    (`repositories._sample_scope._CALLER_MAY_SEE_SAMPLE`), because
     narrowing a list one sample at a time in Python would be a query per
     row. A change to any arm above — the bypass role, the required tier,
     the treatment of a missing study, the orphan case — has to land there
