@@ -52,6 +52,7 @@ from qiita_common.models import (
     StepProgressState,
     StepStatus,
     StepStatusWire,
+    Tier,
     WorkTicketFailureStage,
     WorkTicketState,
 )
@@ -3635,12 +3636,12 @@ async def test_get_sequenced_sample_in_study_admin_tier_returns_response(ctx):
     assert etag.startswith('"') and etag.endswith('"')
 
 
-@pytest.mark.parametrize("tier", ["viewer", "member"])
-async def test_get_sequenced_sample_in_study_below_admin_tier_reads(ctx, tier):
+@pytest.mark.parametrize("tier", [Tier.VIEWER, Tier.MEMBER])
+async def test_get_sequenced_sample_in_study_viewer_and_member_read(ctx, tier):
     """Tests the case where a regular user's study access is viewer or member:
     the study-scoped GET is 200, since the read's floor is viewer. Which of the
-    sample's values each tier then sees is test_metadata_visibility.py's
-    subject.
+    sequenced_sample's values each tier then sees is pinned by the metadata
+    visibility route tests.
     """
     seeded = await _seed_one_sequenced_sample(ctx, f"get-{tier}")
     await _grant_study_access(

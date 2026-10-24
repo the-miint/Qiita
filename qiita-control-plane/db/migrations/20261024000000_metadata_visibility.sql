@@ -1,15 +1,14 @@
 -- migrate:up
 
--- The metadata visibility rule as SQL: one scalar for a field's tier and, per
--- entity kind, one set-returning function over its EAV rows that a read uses
--- either as a filter (WHERE visible) or as a mask (the value_* columns are NULL
--- on a hidden row). The rule itself is defined in
+-- The metadata visibility rule as SQL: two scalars for a value's required tier
+-- and, per entity kind, one set-returning function over its EAV rows that a
+-- read uses either as a filter (WHERE visible) or as a mask (the value_*
+-- columns are NULL on a hidden row). The rule itself is defined in
 -- docs/architecture/data-model.md, "Metadata visibility tiers"; this file
 -- implements it and does not restate it.
 --
 -- The caller's tiers arrive as parallel arrays (study_idx, tier) plus the tier
--- held on every study not in them, computed once per request by
--- auth.guards.caller_metadata_tiers.
+-- held on every study not in them.
 --
 -- Both visibility functions are LANGUAGE sql, STABLE, not STRICT, not SECURITY
 -- DEFINER, carry no SET clause, and have a single SELECT for a body: those are
@@ -30,6 +29,21 @@ COMMENT ON FUNCTION qiita.metadata_field_tier(qiita.tier, qiita.tier, qiita.tier
     'The tier a metadata field requires, before any per-value exception. '
     'Definition: docs/architecture/data-model.md, "Metadata visibility tiers".';
 
+-- GREATEST ignores NULLs, so a value with no exception row requires its field
+-- tier, and an exception below the field tier changes nothing.
+CREATE FUNCTION qiita.metadata_required_tier(
+    field_tier qiita.tier,
+    global_exception_tier qiita.tier,
+    local_exception_tier qiita.tier
+) RETURNS qiita.tier
+LANGUAGE sql IMMUTABLE PARALLEL SAFE
+AS $$ SELECT GREATEST(field_tier, global_exception_tier, local_exception_tier) $$;
+
+COMMENT ON FUNCTION qiita.metadata_required_tier(qiita.tier, qiita.tier, qiita.tier) IS
+    'The tier one metadata value requires: its field tier, raised by any '
+    'exception row on the value. Definition: docs/architecture/data-model.md, '
+    '"Metadata visibility tiers".';
+
 CREATE FUNCTION qiita.biosample_metadata_visibility(
     caller_study_idxs bigint[],
     caller_study_tiers qiita.tier[],
@@ -40,7 +54,6 @@ CREATE FUNCTION qiita.biosample_metadata_visibility(
     biosample_study_field_idx bigint,
     global_field_idx bigint,
     study_idx bigint,
-    unique_in_study boolean,
     required_tier qiita.tier,
     caller_tier qiita.tier,
     visible boolean,
@@ -58,7 +71,6 @@ AS $$
            m.biosample_study_field_idx,
            m.global_field_idx,
            sf.study_idx,
-           m.unique_in_study,
            r.required_tier,
            r.caller_tier,
            r.caller_tier >= r.required_tier,
@@ -81,7 +93,7 @@ AS $$
       LEFT JOIN unnest(caller_study_idxs, caller_study_tiers) AS ct(study_idx, tier)
              ON ct.study_idx = sf.study_idx
      CROSS JOIN LATERAL (VALUES (
-               GREATEST(
+               qiita.metadata_required_tier(
                    qiita.metadata_field_tier(gf.default_tier, sf.tier_override, s.default_tier),
                    eg.tier_override,
                    el.tier_override
@@ -94,9 +106,8 @@ COMMENT ON FUNCTION qiita.biosample_metadata_visibility(bigint[], qiita.tier[], 
     'Every biosample_metadata row with the tier it requires, the tier the caller '
     'holds on its study, and whether the caller may read it; the value columns '
     'are NULL on a row the caller may not read. Filter with WHERE visible, or '
-    'read the value columns as a mask. Callers name it through '
-    '_sample_helpers.visible_metadata_source. Rule: '
-    'docs/architecture/data-model.md, "Metadata visibility tiers".';
+    'read the value columns as a mask. Rule: docs/architecture/data-model.md, '
+    '"Metadata visibility tiers".';
 
 CREATE FUNCTION qiita.prep_sample_metadata_visibility(
     caller_study_idxs bigint[],
@@ -108,7 +119,6 @@ CREATE FUNCTION qiita.prep_sample_metadata_visibility(
     prep_sample_study_field_idx bigint,
     global_field_idx bigint,
     study_idx bigint,
-    unique_in_study boolean,
     required_tier qiita.tier,
     caller_tier qiita.tier,
     visible boolean,
@@ -126,7 +136,6 @@ AS $$
            m.prep_sample_study_field_idx,
            m.global_field_idx,
            sf.study_idx,
-           m.unique_in_study,
            r.required_tier,
            r.caller_tier,
            r.caller_tier >= r.required_tier,
@@ -149,7 +158,7 @@ AS $$
       LEFT JOIN unnest(caller_study_idxs, caller_study_tiers) AS ct(study_idx, tier)
              ON ct.study_idx = sf.study_idx
      CROSS JOIN LATERAL (VALUES (
-               GREATEST(
+               qiita.metadata_required_tier(
                    qiita.metadata_field_tier(gf.default_tier, sf.tier_override, s.default_tier),
                    eg.tier_override,
                    el.tier_override
@@ -162,8 +171,50 @@ COMMENT ON FUNCTION qiita.prep_sample_metadata_visibility(bigint[], qiita.tier[]
     'The prep_sample_metadata twin of qiita.biosample_metadata_visibility; same '
     'columns, same rule.';
 
+-- The original table COMMENTs said an exception "downgrades visibility to a
+-- specified tier_override", which reads as setting the value's tier. It can
+-- only raise it.
+COMMENT ON TABLE qiita.biosample_field_exception IS
+    'Per-(biosample, field) visibility overrides. Used to restrict the audience for '
+    'specific metadata values that need narrower visibility than their field''s general '
+    'policy (e.g., a description field where one biosample accidentally received PII). '
+    'An exception raises the value''s required tier to tier_override; one at or below '
+    'the field''s tier changes nothing. Exceptions on globally-linked metadata are keyed '
+    'on global_field_idx so they follow the value across studies; exceptions on purely '
+    'study-local metadata are keyed on biosample_study_field_idx. Rule: '
+    'docs/architecture/data-model.md, "Metadata visibility tiers".';
+
+COMMENT ON TABLE qiita.prep_sample_field_exception IS
+    'Per-(prep_sample, field) visibility overrides. Used to restrict '
+    'the audience for specific metadata values that need narrower visibility '
+    'than their field''s general policy. An exception raises the value''s required '
+    'tier to tier_override; one at or below the field''s tier changes nothing. '
+    'Exceptions on globally-linked metadata are keyed on global_field_idx so they '
+    'follow the value across studies; exceptions on purely study-local metadata are '
+    'keyed on prep_sample_study_field_idx. Rule: docs/architecture/data-model.md, '
+    '"Metadata visibility tiers".';
+
 -- migrate:down
+
+COMMENT ON TABLE qiita.prep_sample_field_exception IS
+    'Per-(prep_sample, field) visibility overrides. Used to restrict '
+    'the audience for specific metadata values that need narrower visibility '
+    'than their field''s general policy. An exception downgrades visibility '
+    'to a specified tier_override. Exceptions on globally-linked metadata '
+    'are keyed on global_field_idx so they follow the value across studies; '
+    'exceptions on purely study-local metadata are keyed on '
+    'prep_sample_study_field_idx.';
+
+COMMENT ON TABLE qiita.biosample_field_exception IS
+    'Per-(biosample, field) visibility overrides. Used to restrict the audience for '
+    'specific metadata values that need narrower visibility than their field''s general '
+    'policy (e.g., a description field where one biosample accidentally received PII). '
+    'An exception downgrades visibility to a specified tier_override. Exceptions on '
+    'globally-linked metadata are keyed on global_field_idx so they follow the value '
+    'across studies; exceptions on purely study-local metadata are keyed on '
+    'biosample_study_field_idx.';
 
 DROP FUNCTION qiita.prep_sample_metadata_visibility(bigint[], qiita.tier[], qiita.tier);
 DROP FUNCTION qiita.biosample_metadata_visibility(bigint[], qiita.tier[], qiita.tier);
+DROP FUNCTION qiita.metadata_required_tier(qiita.tier, qiita.tier, qiita.tier);
 DROP FUNCTION qiita.metadata_field_tier(qiita.tier, qiita.tier, qiita.tier);

@@ -136,7 +136,7 @@ from .conftest import (
 pytestmark = pytest.mark.db
 
 # The reads below are tested for what they decode, not for what they hide (that
-# is tests/repositories/test_metadata_visibility.py), so they read at admin
+# is pinned against the visibility functions directly), so they read at admin
 # everywhere.
 _READ_ALL = CallerMetadataTiers(study_tiers={}, default=Tier.ADMIN)
 

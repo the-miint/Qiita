@@ -25,7 +25,7 @@ from qiita_common.api_paths import (
     URL_BIOSAMPLE_STUDY_FIELD_BY_STUDY,
 )
 from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX, Scope, SystemRole
-from qiita_common.models import BiosampleAccessionField, FieldDataType
+from qiita_common.models import BiosampleAccessionField, FieldDataType, Tier
 
 from qiita_control_plane.repositories import _sample_helpers as sample_helpers
 from qiita_control_plane.repositories.biosample_metadata import BIOSAMPLE_METADATA_SPEC
@@ -1406,14 +1406,14 @@ async def _seed_authz_sample_with_unique_value(ctx, study_idx):
     case under test makes the study's owner.
     """
     # Public, so the matrix measures the route's own gate: what each tier sees
-    # of a value is test_metadata_visibility.py's subject, not this one's.
+    # of a value is pinned by the metadata visibility route tests.
     created = await ctx["wet"].post(
         URL_BIOSAMPLE_STUDY_FIELD_BY_STUDY.format(study_idx=study_idx),
         json={
             "display_name": _AUTHZ_FIELD_NAME,
             "data_type": "text",
             "unique_in_study": True,
-            "tier_override": "public",
+            "tier_override": Tier.PUBLIC,
         },
     )
     assert created.status_code == 201, created.text

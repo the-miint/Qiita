@@ -438,8 +438,10 @@ class BiosampleResponse(BaseModel):
 
     Mirrors qiita.biosample's caller-visible columns, adds the biosample's
     export_entity_id from qiita.exported_entity, and embeds a dict
-    of every globally-linked metadata value the biosample carries,
-    keyed on biosample_global_field.internal_name. Purely-local
+    of the globally-linked metadata values the biosample carries that
+    the caller's tier reaches (each judged on the study that wrote it;
+    the rest are absent), keyed on biosample_global_field.internal_name.
+    Purely-local
     metadata (including the owner-biosample-id row) and metadata whose
     biosample_to_study link has been retired are excluded -- both
     surface as biosample_metadata.global_field_idx IS NULL via the
@@ -479,7 +481,8 @@ class StudyScopedBiosampleResponse(BiosampleResponse):
     (core columns, caller_system_role, and the globally-linked global_metadata
     keyed by internal_name) plus this study's purely-local metadata, keyed by
     display_name. local_metadata is returned only on a study-scoped response,
-    where the caller is already authorized on the study.
+    where the caller is already authorized on the study. Both maps carry only
+    the values the caller's tier reaches; the rest are absent.
     """
 
     local_metadata: dict[str, MetadataEntry]

@@ -323,10 +323,10 @@ def require_complete_profile(
 # tier (or 'public' by absence of a row) is compared against min_tier.
 
 
-# Strict ordering by privilege; mirrors the qiita.tier enum order (a test pins
-# the two together, since the metadata visibility functions compare tiers in
-# SQL). Read only through `tier_at_least`, which is the single definition of the
-# comparison. Unlike Roles, Tiers are not a property of principals.
+# Strict ordering by privilege; mirrors the qiita.tier enum order, which is how
+# the metadata visibility functions compare tiers in SQL (a test pins the two
+# together). Read only through `tier_at_least`, the single Python definition of
+# the comparison. Unlike Roles, Tiers are not a property of principals.
 _TIER_ORDER = {
     Tier.PUBLIC: 0,
     Tier.VIEWER: 1,
@@ -467,7 +467,7 @@ def _access_row_allows(
 
 
 def tier_at_least(held: Tier, required: Tier) -> bool:
-    """Whether `held` reaches `required`: the one comparison of two tiers.
+    """Whether `held` reaches `required`: the one Python comparison of two tiers.
 
     Goes through `_TIER_ORDER`, never the enum members: `Tier` is a `StrEnum`
     and compares LEXICALLY, where 'admin' < 'member' < 'public' < 'viewer'. A
@@ -520,10 +520,13 @@ def caller_tier_reaches(row: CallerStudyAccessRow, *, caller: Principal, tier: T
 
 
 # The role at or above which a caller reads and writes every metadata value on
-# every study, whatever its tier. The sample routes' study gates admit the same
-# role without a grant (`require_study_access(bypass_role=METADATA_BYPASS_ROLE)`),
-# and the two must agree: a caller the gate admitted by role and the value rule
-# then judged by grant would be let in to read only public values.
+# every study, whatever its tier. A route gate that admits a caller by role and
+# then reads metadata names this constant for its bypass
+# (`require_study_access(bypass_role=METADATA_BYPASS_ROLE)`), and the two must
+# agree: a caller the gate admitted by role and the value rule then judged by
+# grant would be let in to read only public values. The wet-lab routes gated on
+# `require_role_at_least(SystemRole.WET_LAB_ADMIN)` admit a role for the
+# route's own work, not as a stand-in for a grant, and keep their literal.
 METADATA_BYPASS_ROLE = SystemRole.WET_LAB_ADMIN
 
 

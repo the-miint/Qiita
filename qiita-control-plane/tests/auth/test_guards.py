@@ -35,6 +35,7 @@ from qiita_control_plane.testing.db_teardown import (
     delete_principal,
     teardown_entity_graph,
 )
+from qiita_control_plane.testing.tiers import TIER_RANK
 
 
 def _human(*, role=SystemRole.USER, scopes=frozenset(), profile_complete=True):
@@ -1188,10 +1189,9 @@ def test_study_access_via_names_the_strongest_reason(row, role, expected):
 @pytest.mark.parametrize("held", list(Tier))
 @pytest.mark.parametrize("required", list(Tier))
 def test_tier_at_least_follows_privilege_not_spelling(held, required):
-    """Tier is a StrEnum, so a bare >= would compare spellings; the ranking
-    here is the privilege order, written out independently of _TIER_ORDER."""
-    rank = {Tier.PUBLIC: 0, Tier.VIEWER: 1, Tier.MEMBER: 2, Tier.ADMIN: 3}
-    assert tier_at_least(held, required) is (rank[held] >= rank[required])
+    """Tier is a StrEnum, so a bare >= would compare spellings; tier_at_least
+    must follow the privilege order."""
+    assert tier_at_least(held, required) is (TIER_RANK[held] >= TIER_RANK[required])
 
 
 @pytest.mark.db
@@ -1295,5 +1295,6 @@ async def test_caller_metadata_tiers_service_account_reads_at_its_grants(study_a
             study_tiers={study_access_ctx["study_idx"]: Tier.MEMBER}, default=Tier.PUBLIC
         )
     finally:
+        # Ahead of the sweep: the grant references the principal deleted next.
         await pool.execute("DELETE FROM qiita.study_access WHERE principal_idx = $1", service_idx)
         await delete_idxs(pool, "principal", service_idx)

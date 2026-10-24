@@ -822,8 +822,10 @@ class SequencedSampleResponse(ReadCounts):
 
     Carries every caller-visible column from the sequenced_sample subtype
     row plus the controlling supertype prep_sample row, and embeds a dict
-    of every globally-linked metadata value the prep_sample carries,
-    keyed on prep_sample_global_field.internal_name. Purely-local
+    of the globally-linked metadata values the prep_sample carries that
+    the caller's tier reaches (each judged on the study that wrote it;
+    the rest are absent), keyed on prep_sample_global_field.internal_name.
+    Purely-local
     metadata and metadata whose prep_sample_to_study link has been
     retired are excluded -- both surface as
     prep_sample_metadata.global_field_idx IS NULL via the existing
@@ -869,7 +871,8 @@ class StudyScopedSequencedSampleResponse(SequencedSampleResponse):
     globally-linked global_metadata keyed by internal_name) plus this study's
     purely-local prep_sample metadata, keyed by display_name. local_metadata is
     returned only on a study-scoped response, where the caller is already
-    authorized on the study.
+    authorized on the study. Both maps carry only the values the caller's tier
+    reaches; the rest are absent.
     """
 
     local_metadata: dict[str, MetadataEntry]

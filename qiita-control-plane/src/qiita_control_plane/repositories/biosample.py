@@ -38,9 +38,10 @@ from .exported_entity import export_entity_id_select
 
 # Owners' ids for their own samples sometimes inadvertently contain PII, so the
 # owner-biosample-id field is created at member tier whatever the study's
-# default: even on a public study, only study members (and the roles that read
-# every value) see it. The metadata visibility rule enforces the field's tier
-# (docs/architecture/data-model.md, "Metadata visibility tiers").
+# default: even on a public study, only callers at the field's tier (and the
+# roles that read every value) see it. The metadata visibility rule enforces
+# the field's tier (docs/architecture/data-model.md, "Metadata visibility
+# tiers").
 OWNER_BIOSAMPLE_ID_TIER_OVERRIDE: Tier = Tier.MEMBER
 
 
@@ -540,11 +541,8 @@ async def import_biosample_from_owner_biosample_id(
         caller_idx=caller_idx,
     )
 
-    # tier_override pins the field to member tier: the owner's sample name
-    # is theirs to see, but restricted to study members because sample
-    # names sometimes carry incautiously-entered PII. wet_lab_admin and
-    # system_admin callers are admitted regardless of tier. (Tier
-    # enforcement is not yet built — see docs/architecture/data-model.md.)
+    # tier_override creates the field at OWNER_BIOSAMPLE_ID_TIER_OVERRIDE (the
+    # constant says why).
     # The shape this PII write needs -- purely-local, text, unique within the
     # study; the docstring above says why each matters -- is refused by the
     # resolver when the resolved row contradicts it.

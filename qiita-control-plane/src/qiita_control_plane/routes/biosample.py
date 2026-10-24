@@ -568,8 +568,8 @@ async def create_biosample_field(
     the response body is the created field.
 
     Access policy is interim: the ADMIN gate is a coarse stand-in matching the
-    study-scoped biosample metadata routes, held until per-field
-    visibility-tier enforcement lands. When that clamp comes off, this route
+    study-scoped biosample metadata routes, held until metadata writes enforce
+    the visibility rule. When that clamp comes off, this route
     goes back to `Tier.MEMBER` — minting a study-local field is work a study
     member is meant to do.
 
@@ -877,8 +877,9 @@ async def get_biosample_in_study(
     retirement is evaluated only after the link passes, and a retired biosample
     is likewise 404 (mirroring the biosample-level read's retired carve-out).
 
-    The owner-biosample-id row is a study-local value like any other, so a
-    member or above sees it and a viewer does not. This route does not write it.
+    The owner-biosample-id row is a study-local value like any other, read at
+    its field's tier (member when the field is created), so a viewer does not
+    see it. This route does not write it.
 
     The response carries an `ETag` header derived from the row's `updated_at`
     column; the value is a quoted ISO 8601 timestamp and is opaque by contract.
@@ -908,7 +909,7 @@ async def patch_biosample_metadata_by_unique_field(
     _scope: Principal = Depends(require_scope(Scope.BIOSAMPLE_WRITE)),
     _exists: None = Depends(require_study_exists),
     _access: None = Depends(
-        require_study_access(min_tier=Tier.ADMIN, bypass_role=SystemRole.WET_LAB_ADMIN)
+        require_study_access(min_tier=Tier.ADMIN, bypass_role=METADATA_BYPASS_ROLE)
     ),
 ) -> BiosampleMetadataWriteByUniqueFieldResponse:
     """Upsert this study's metadata on the biosample the study's own id names.
@@ -932,7 +933,7 @@ async def patch_biosample_metadata_by_unique_field(
 
     Access and the remaining refusals are the by-idx write's: Tier.ADMIN study
     access with a wet_lab_admin+ role bypass as an interim stand-in until
-    per-field visibility-tier enforcement lands, a retired biosample answering
+    metadata writes enforce the visibility rule, a retired biosample answering
     409, and a retired study link answering 404.
 
     There is NO If-Match on this route, exactly as on the by-idx write: a
@@ -998,8 +999,8 @@ async def patch_biosample_metadata(
     """Upsert this study's metadata values on a biosample.
 
     Access policy is interim: gated at Tier.ADMIN study access with a
-    wet_lab_admin+ role bypass -- a coarse stand-in until per-field
-    visibility-tier enforcement lands. 401 on Anonymous, 403 on missing scope,
+    wet_lab_admin+ role bypass -- a coarse stand-in until metadata writes
+    enforce the visibility rule. 401 on Anonymous, 403 on missing scope,
     an incomplete profile, or sub-ADMIN tier, 404 on a study that does not
     exist. require_study_exists composes alongside require_study_access so an
     admin-bypass caller still gets 404 on a non-existent study.
@@ -1043,13 +1044,6 @@ async def patch_biosample_metadata(
             global_internal_names=body.global_internal_names,
         )
     return written
-
-
-# Roles that may bypass the per-biosample owner / linked-study-access check.
-# A bypass-role caller still gets the standard 404 on a missing or retired
-# biosample (see the docstring on get_biosample for the retired-row
-# carve-out planned for a future change).
-_BIOSAMPLE_GET_BYPASS_ROLE: SystemRole = SystemRole.WET_LAB_ADMIN
 
 
 def _biosample_core_row_dict(row: asyncpg.Record) -> dict[str, object]:
@@ -1172,10 +1166,10 @@ async def get_biosample(
         if row["retired"]:
             raise HTTPException(status_code=404, detail=f"biosample {biosample_idx} not found")
 
-        # Role bypass for wet_lab_admin and higher; everyone else must satisfy
-        # the owner-or-linked-study-access predicate.
+        # The metadata bypass role passes; everyone else must satisfy the
+        # owner-or-linked-study-access predicate.
         authorized = user.has_role_at_least(
-            _BIOSAMPLE_GET_BYPASS_ROLE
+            METADATA_BYPASS_ROLE
         ) or await fetch_caller_has_biosample_access(
             conn,
             principal_idx=user.principal_idx,

@@ -2,8 +2,8 @@
 and the per-entity `qiita.*_metadata_visibility` functions.
 
 The functions are called directly with synthesized caller tier maps, so these
-tests pin the SQL rule on its own; how a route turns a principal into a map is
-test_guards' concern. The expected answer comes from an oracle written here,
+tests pin the SQL rule on its own; how a principal becomes a map is pinned with
+the guards. The expected answer comes from an oracle written here,
 independently of the SQL, so a drift in either one fails.
 """
 
@@ -28,11 +28,11 @@ from qiita_control_plane.testing.db_seeds import (
     fetch_missing_value_reason_idx,
     fetch_seeded_metagenome_term,
     seed_biosample,
-    seed_biosample_global_field,
     seed_field_exception,
+    seed_global_field_for_spec,
     seed_globally_linked_study_field,
     seed_local_study_field,
-    seed_prep_sample_global_field,
+    seed_metadata_text_value,
     seed_sequenced_prep_sample,
     seed_study,
     seed_user_principal,
@@ -42,6 +42,7 @@ from qiita_control_plane.testing.db_teardown import (
     delete_principal,
     teardown_entity_graph,
 )
+from qiita_control_plane.testing.tiers import TIER_RANK
 from qiita_control_plane.testing.unique_names import unique_field_name
 
 from .conftest import (
@@ -53,12 +54,9 @@ from .conftest import (
 
 pytestmark = pytest.mark.db
 
-# The oracle's own ranking. Deliberately not imported from the guards: a test
-# that borrowed the production order could not catch that order being wrong.
-_RANK = {Tier.PUBLIC: 0, Tier.VIEWER: 1, Tier.MEMBER: 2, Tier.ADMIN: 3}
 _ALL_TIERS = (Tier.PUBLIC, Tier.VIEWER, Tier.MEMBER, Tier.ADMIN)
-# An exception narrows below the field's tier, so a public one would never
-# restrict anything; the corpus seeds the three that can.
+# An exception can only raise a value's required tier, so a public one would
+# never restrict anything; the corpus seeds the three that can.
 _EXCEPTION_TIERS = (None, Tier.VIEWER, Tier.MEMBER, Tier.ADMIN)
 
 _VALUE_COLUMNS = (
@@ -72,7 +70,7 @@ _VALUE_COLUMNS = (
 
 
 def _most_restrictive(*tiers: Tier | None) -> Tier:
-    return max((t for t in tiers if t is not None), key=_RANK.__getitem__)
+    return max((t for t in tiers if t is not None), key=TIER_RANK.__getitem__)
 
 
 def _spec_id(spec: EntityMetadataSpec) -> str:
@@ -94,7 +92,7 @@ class _SeededValue:
 
     def visible_to(self, tiers: CallerMetadataTiers) -> bool:
         held = tiers.study_tiers.get(self.study_idx, tiers.default)
-        return _RANK[held] >= _RANK[self.required_tier]
+        return TIER_RANK[held] >= TIER_RANK[self.required_tier]
 
 
 @dataclass(frozen=True)
@@ -104,27 +102,11 @@ class _Corpus:
     values: tuple[_SeededValue, ...]
 
 
-async def _insert_text_value(pool, spec, *, entity_idx, study_field_idx, created_by_idx) -> int:
-    return await pool.fetchval(
-        f"INSERT INTO {spec.metadata_table}"
-        f" ({spec.entity_key_column}, {spec.study_field_idx_column}, value_text, created_by_idx)"
-        f" VALUES ($1, $2, $3, $4) RETURNING idx",
-        entity_idx,
-        study_field_idx,
-        f"v-{secrets.token_hex(3)}",
-        created_by_idx,
-    )
-
-
 async def _seed_global_field(pool, spec, *, default_tier, created_by_idx) -> int:
-    seed = (
-        seed_biosample_global_field
-        if spec.entity_kind is SampleEntityKind.BIOSAMPLE
-        else seed_prep_sample_global_field
-    )
     suffix = secrets.token_hex(4)
-    return await seed(
+    return await seed_global_field_for_spec(
         pool,
+        spec=spec,
         internal_name=f"vis_{suffix}",
         display_name=f"Vis {suffix}",
         data_type=FieldDataType.TEXT,
@@ -205,9 +187,9 @@ async def _build_corpus(pool, spec, *, owner_idx, created) -> _Corpus:
                     created_by_idx=owner_idx,
                     tier_override=tier_override,
                 )
-                metadata_idx = await _insert_text_value(
+                metadata_idx = await seed_metadata_text_value(
                     pool,
-                    spec,
+                    spec=spec,
                     entity_idx=entity_idx,
                     study_field_idx=field_idx,
                     created_by_idx=owner_idx,
@@ -247,9 +229,9 @@ async def _build_corpus(pool, spec, *, owner_idx, created) -> _Corpus:
                 display_name=unique_field_name("vis_alias"),
                 created_by_idx=owner_idx,
             )
-            metadata_idx = await _insert_text_value(
+            metadata_idx = await seed_metadata_text_value(
                 pool,
-                spec,
+                spec=spec,
                 entity_idx=entity_idx,
                 study_field_idx=alias_idx,
                 created_by_idx=owner_idx,
@@ -342,7 +324,7 @@ async def _visibility_rows(pool, spec, tiers: CallerMetadataTiers, entity_idx: i
     return await pool.fetch(
         f"SELECT m.idx, m.study_idx, m.required_tier, m.caller_tier, m.visible,"
         f" {', '.join(f'm.{c}' for c in _VALUE_COLUMNS)}"
-        f" FROM {visible_metadata_source(spec, first_param=1)}"
+        f" FROM {visible_metadata_source(spec)}"
         f" WHERE m.{spec.entity_key_column} = $4",
         *tiers.sql_args(),
         entity_idx,
@@ -410,11 +392,12 @@ async def test_hidden_rows_null_every_value_column(ctx, spec):
             f"INSERT INTO {spec.study_field_table}"
             f" (study_idx, display_name, data_type, required, terminology_idx,"
             f"  tier_override, created_by_idx)"
-            f" VALUES ($1, $2, $3, false, $4, 'admin', $5) RETURNING idx",
+            f" VALUES ($1, $2, $3, false, $4, $5::qiita.tier, $6) RETURNING idx",
             ctx["study_idx"],
             unique_field_name("hidden"),
             data_type,
             terminology_idx,
+            Tier.ADMIN,
             ctx["principal_idx"],
         )
 
@@ -471,9 +454,9 @@ async def test_misfiled_local_exception_on_linked_value_still_restricts(ctx, spe
         display_name=unique_field_name("misfiled"),
         created_by_idx=ctx["principal_idx"],
     )
-    metadata_idx = await _insert_text_value(
+    metadata_idx = await seed_metadata_text_value(
         pool,
-        spec,
+        spec=spec,
         entity_idx=entity_idx,
         study_field_idx=alias_idx,
         created_by_idx=ctx["principal_idx"],
@@ -526,9 +509,9 @@ async def test_global_value_judged_on_contributing_study(ctx, spec):
         display_name=unique_field_name("contrib"),
         created_by_idx=ctx["principal_idx"],
     )
-    metadata_idx = await _insert_text_value(
+    metadata_idx = await seed_metadata_text_value(
         pool,
-        spec,
+        spec=spec,
         entity_idx=entity_idx,
         study_field_idx=alias_idx,
         created_by_idx=ctx["principal_idx"],
@@ -563,7 +546,7 @@ async def test_visibility_function_is_inlined(postgres_pool, spec):
     tiers = CallerMetadataTiers(study_tiers={}, default=Tier.PUBLIC)
     raw = await postgres_pool.fetchval(
         f"EXPLAIN (FORMAT JSON) SELECT m.idx"
-        f" FROM {visible_metadata_source(spec, first_param=1)}"
+        f" FROM {visible_metadata_source(spec)}"
         f" WHERE m.{spec.entity_key_column} = $4",
         *tiers.sql_args(),
         1,

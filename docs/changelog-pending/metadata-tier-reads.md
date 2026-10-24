@@ -1,6 +1,7 @@
 ### Changed
 
-- **Sample metadata reads now honour each field's and each value's visibility tier.**
+- **Biosample and prep_sample metadata reads now honour each field's and each value's
+  visibility tier.**
   A value is returned only when the caller's tier on the study that wrote it reaches
   the tier the value requires. That tier comes from the global field's `default_tier`,
   a study-local field's `tier_override`, or the study's `default_tier`, and a
@@ -17,5 +18,6 @@
     same words as a value that matches nothing.
   - `GET /biosample/{biosample_idx}` judges each global value on the study that wrote
     it, so a caller with a grant on one of the biosample's studies no longer sees
-    another study's restricted values.
+    another study's restricted values. The biosample's owner reads at public on any
+    study they hold no grant on.
   - Metadata writes and field creation still require `admin` on the study.

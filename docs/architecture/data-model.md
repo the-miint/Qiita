@@ -104,8 +104,7 @@ A purely-local field's `data_type` may be **widened to `text`**, and to nothing 
 This is the definition. Where it differs from the comment on the `qiita.tier`
 type in the applied migration `20260501000006_study.sql` — which names only
 system admins as reading every value — this one supersedes it, as with the
-study-record rule below (an applied migration cannot be edited in place). Reads
-enforce it through `qiita.biosample_metadata_visibility` /
+study-record rule below. Reads of biosample and prep_sample metadata enforce it through `qiita.biosample_metadata_visibility` /
 `qiita.prep_sample_metadata_visibility`, fed the caller's tiers by
 `auth.guards.caller_metadata_tiers`.
 
@@ -138,7 +137,9 @@ global value that study A wrote only if their tier on A reaches it.
 **The caller's tier on a study** is `admin` for the study's owner, otherwise
 their `qiita.study_access` row, otherwise `public`. A wet_lab_admin or
 system_admin reads at `admin` on every study (`auth.guards.METADATA_BYPASS_ROLE`);
-an anonymous caller reads at `public` everywhere.
+an anonymous caller reads at `public` everywhere. Owning a biosample confers no
+tier: it is a way in to `GET /biosample/{idx}`, but an owner with no grant on
+the study that wrote a value reads that value at `public`.
 
 **A hidden value is absent**, not marked: a read omits its key, and anything
 that counts values counts only the visible ones. A lookup by a unique-in-study
@@ -148,18 +149,19 @@ at `member` tier whatever the study's default, is the standing example: a
 viewer of the study does not see it.
 
 Every caller-facing metadata read names its source through
-`_sample_helpers.visible_metadata_source`, which filters on the function's
-`visible` column or reads its value columns as a mask (NULL on a hidden row).
-The study-scoped sample reads admit any caller with viewer tier or above on the
-study; the rule decides which values they carry. Readers that serve operators
+`_sample_helpers.visible_metadata_source`. Today's reads filter on the
+function's `visible` column; its value columns, NULL on a hidden row, serve a
+read that must keep every row in place, such as an export writing one column
+per field. The study-scoped biosample and sequenced_sample reads admit any
+caller with `viewer` tier or above on the study; the rule decides which values
+they carry. Readers that serve operators
 rather than callers — the host-filter resolver, the host-taxon backfill, and
 the system_admin owner-biosample-id export — read the tables directly.
 
-**Writes do not apply this rule yet.** Every study-scoped route that writes
-sample metadata or mints a study-local field still requires `admin` on the
-study (wet_lab_admin+ bypassing), so only a caller who reads every value there
-can write. Field creation returns to `member` tier once writes enforce the
-rule, since minting a study-local field is work a study member is meant to do.
+**Writes are gated separately.** Every study-scoped route that writes
+biosample or prep_sample metadata, or mints a study-local field, requires
+`admin` on the study (wet_lab_admin+ bypassing), so only a caller who reads
+every value there can write.
 
 ### What a tier reads of a study's own record
 

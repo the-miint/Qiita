@@ -841,8 +841,8 @@ async def patch_sequenced_sample_metadata(
     prep_sample.
 
     Access policy is interim: gated at Tier.ADMIN study access with a
-    wet_lab_admin+ role bypass -- a coarse stand-in until per-field
-    visibility-tier enforcement lands. 401 on Anonymous, 403 on missing scope,
+    wet_lab_admin+ role bypass -- a coarse stand-in until metadata writes
+    enforce the visibility rule. 401 on Anonymous, 403 on missing scope,
     an incomplete profile, or sub-ADMIN tier, 404 on a study that does not
     exist. require_study_exists composes alongside require_study_access so an
     admin-bypass caller still gets 404 on a non-existent study.

@@ -42,12 +42,13 @@ _None yet._
 
 - (#773) Parquet that jobs register into DuckLake is now written at zstd level 16 (was the default 3), and the data plane sets DuckLake's `parquet_compression_level` to 16 at boot, so new lake files are ~12–15% smaller (synthetic production-shaped tables; −14.6% on one real long-read prep_sample's `sequence1`) and the steps that write them take longer: read ingest (`fastq-to-parquet`, `bcl-convert`'s `ingest_reads`, `download-ena-study`, `golay-demux`, `bam-to-parquet`), host filtering, alignment, and the reference, amplicon and long-read-assembly loads. Existing lake files are untouched. Watch reference-load walltimes on the first loads after the deploy.
 - (#773) `fastq-to-parquet` 1.0.0–1.3.0 are edited in place, resources only: the `fastq` step goes from cpu 2 / mem_gb 8 to cpu 8 / mem_gb 13, re-synced by `qiita-admin actions sync` in `activate.sh`. `bam-to-parquet` 1.0.0 and `local-reference-add` 1.0.0 are edited in place the same way, for walltime: the `bam` step goes from PT4H to PT6H (its description now says prep_sample), and `local-reference-add`'s `load` step from PT36H to PT48H under an action ceiling raised from PT48H to PT72H. `golay-demux` now runs DuckDB on all 8 of the cpu its YAML already allocates (code only).
-- (#feat/metadata-tier-reads) Soft API-contract change: sample metadata reads omit any value
-  above the caller's tier on the study that wrote it (no placeholder). The study-scoped
-  biosample and sequenced-sample reads (`GET /study/{s}/biosample/{b}`,
+- (#feat/metadata-tier-reads) Soft API-contract change: biosample and prep_sample metadata
+  reads omit any value above the caller's tier on the study that wrote it (no placeholder).
+  The study-scoped biosample and sequenced-sample reads (`GET /study/{s}/biosample/{b}`,
   `POST /study/{s}/biosample/by-unique-field`, `GET /study/{s}/sequenced-sample/{q}`) now
   admit `viewer` and above instead of only `admin`; `GET /biosample/{b}` drops global values
-  the caller's tier does not reach. wet_lab_admin+ responses are unchanged.
+  the caller's tier does not reach, including for the biosample's owner. wet_lab_admin+
+  responses are unchanged.
 
 ## Deployed history
 

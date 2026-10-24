@@ -863,8 +863,8 @@ async def assert_study_field_create_conflict(
 # expected status) for the study-scoped sample reads. The VIEWER floor every
 # study read shares, plus an unauthenticated row. "anon" names the
 # unauthenticated client the driver builds rather than one the caller supplies.
-# What each tier then sees of the sample's values is not this table's subject:
-# test_metadata_visibility.py pins that.
+# What each tier then sees of the biosample's or sequenced_sample's values is
+# not this table's subject; the metadata visibility route tests pin that.
 _STUDY_SCOPED_SAMPLE_READ_AUTHZ: dict[str, tuple[str | None, str | None, str, int | None]] = {
     "owner": ("user", None, "user", None),
     "viewer_grant": ("wet", "viewer", "user", None),

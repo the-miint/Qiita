@@ -814,28 +814,23 @@ class EntityMetadataSpec:
     owner_sample_id_flag_column: str | None = None
 
 
-def visible_metadata_source(spec: EntityMetadataSpec, *, first_param: int) -> str:
-    """The FROM item a caller-facing metadata read names in place of
-    `spec.metadata_table`: the entity's visibility function, aliased `m`.
-
-    It yields every metadata row with `visible` and the masked `value_*`
-    columns (see the function's COMMENT in the migration that creates it), so a
-    read filters with `AND m.visible` or reads the value columns as a mask. It
-    binds the three `CallerMetadataTiers.sql_args()` values at `$first_param`
-    onward; the caller's own parameters start after them. The function is
-    written to be inlined, so a predicate on `m` still reaches the base
-    table's indexes.
-    """
-    n = first_param
-    return (
-        f"{spec.visibility_function}"
-        f"(${n}::bigint[], ${n + 1}::text[]::qiita.tier[], ${n + 2}::qiita.tier) m"
-    )
-
-
 # SQL identifiers are interpolated into the queries below only from frozen
 # constants and closed in-code mappings, never from caller input; values always
 # bind as $N placeholders.
+
+
+def visible_metadata_source(spec: EntityMetadataSpec) -> str:
+    """The FROM item a caller-facing metadata read names in place of
+    `spec.metadata_table`: the entity's visibility function, aliased `m`.
+
+    Binds `CallerMetadataTiers.sql_args()` at $1-$3, so the read's own
+    parameters start at $4. The read filters with `AND m.visible` or reads the
+    `value_*` columns as a mask (docs/architecture/data-model.md, "Metadata
+    visibility tiers"). The function is written to be inlined (see the
+    migration that creates it).
+    """
+    return f"{spec.visibility_function}($1::bigint[], $2::text[]::qiita.tier[], $3::qiita.tier) m"
+
 
 # The {entity}_study_field columns a globally-linked row leaves NULL because
 # they live on the global-field row, so every read COALESCEs them into their
@@ -1001,7 +996,7 @@ async def fetch_entity_idx_by_unique_field_value(
     row = await pool_or_conn.fetchrow(
         f"SELECT raw.{spec.entity_key_column}"
         f" FROM {spec.metadata_table} raw"
-        f" JOIN {visible_metadata_source(spec, first_param=1)} ON m.idx = raw.idx"
+        f" JOIN {visible_metadata_source(spec)} ON m.idx = raw.idx"
         f" WHERE raw.{spec.study_field_idx_column} = $4"
         f"   AND raw.{value_column} = $5"
         f"   AND raw.unique_in_study"
@@ -1214,7 +1209,7 @@ async def fetch_global_metadata(
     rows = await pool_or_conn.fetch(
         f"SELECT gf.internal_name, gf.display_name, gf.description, gf.data_type,"
         f" {METADATA_VALUE_COLUMNS_SELECT}, {METADATA_REF_PAYLOAD_SELECT}"
-        f" FROM {visible_metadata_source(spec, first_param=1)}"
+        f" FROM {visible_metadata_source(spec)}"
         f" JOIN {spec.global_field_table} gf ON gf.idx = m.global_field_idx"
         f"{METADATA_REF_JOIN_CLAUSES}"
         f" WHERE m.{spec.entity_key_column} = $4"
@@ -1268,7 +1263,7 @@ async def fetch_local_metadata(
     rows = await pool_or_conn.fetch(
         f"SELECT sf.display_name, sf.description, sf.data_type,"
         f" {METADATA_VALUE_COLUMNS_SELECT}, {METADATA_REF_PAYLOAD_SELECT}"
-        f" FROM {visible_metadata_source(spec, first_param=1)}"
+        f" FROM {visible_metadata_source(spec)}"
         f" JOIN {spec.study_field_table} sf ON sf.idx = m.{spec.study_field_idx_column}"
         f"{METADATA_REF_JOIN_CLAUSES}"
         f" WHERE m.{spec.entity_key_column} = $4"

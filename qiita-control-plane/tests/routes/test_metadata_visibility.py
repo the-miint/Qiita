@@ -7,8 +7,8 @@ that matters, study-local fields inheriting the study default or overriding it,
 and a public global value narrowed by an admin-tier exception. The biosample
 corpus is imported through the route, so its owner-biosample-id field carries
 the tier the import pins on it. Each test asserts the exact set of keys a
-caller sees; the rule itself is pinned at the SQL level in
-tests/repositories/test_metadata_visibility.py.
+caller sees; the rule itself is pinned at the SQL level, over every
+combination of field tier, exception, and caller tier.
 """
 
 import secrets
@@ -23,27 +23,33 @@ from qiita_common.api_paths import (
     URL_BIOSAMPLE_BY_STUDY_UNIQUE_FIELD,
     URL_SEQUENCED_SAMPLE_BY_STUDY_AND_IDX,
 )
-from qiita_common.models import FieldDataType, Tier
+from qiita_common.models import (
+    BIOSAMPLE_DISPLAY_HOST_TAXON_ID,
+    BIOSAMPLE_FIELD_HOST_TAXON_ID,
+    FieldDataType,
+    Tier,
+)
 
 from qiita_control_plane.repositories._sample_helpers import EntityMetadataSpec
 from qiita_control_plane.repositories.biosample_metadata import BIOSAMPLE_METADATA_SPEC
 from qiita_control_plane.repositories.prep_sample_metadata import PREP_SAMPLE_METADATA_SPEC
 from qiita_control_plane.routes._helpers import detail_for_unique_field_miss
 from qiita_control_plane.testing.db_seeds import (
-    seed_biosample_global_field,
     seed_biosample_to_study_link,
     seed_biosample_with_sequenced_prep_sample,
     seed_field_exception,
+    seed_global_field_for_spec,
     seed_globally_linked_study_field,
     seed_local_study_field,
-    seed_prep_sample_global_field,
+    seed_metadata_text_value,
     seed_prep_sample_to_study_link,
     seed_sequenced_sample_subtype,
 )
 from qiita_control_plane.testing.db_teardown import delete_idxs, teardown_entity_graph
+from qiita_control_plane.testing.tiers import TIER_RANK
 from qiita_control_plane.testing.unique_names import unique_field_name
 
-from .conftest import _grant_study_access, _seed_study
+from .conftest import _grant_study_access, _seed_authz_case_study, _seed_study
 
 pytestmark = pytest.mark.db
 
@@ -56,13 +62,15 @@ _READ_TIER = {
     "owner": Tier.ADMIN,
     "wet_lab_admin": Tier.ADMIN,
 }
-_RANK = {Tier.PUBLIC: 0, Tier.VIEWER: 1, Tier.MEMBER: 2, Tier.ADMIN: 3}
-
-# The required field the biosample import enforces; it is seeded public, so
-# every caller sees it. It travels through the import as a missing-value
-# marker, which needs no seeded term.
-_HOST_TAXON_INTERNAL_NAME = "host_taxon_id"
-_HOST_TAXON_DISPLAY_NAME = "host taxon id"
+# Per case, who owns the study and the tier the regular user is granted on it,
+# as _seed_authz_case_study takes them.
+_CASE_STUDY = {
+    "viewer": ("wet", Tier.VIEWER),
+    "member": ("wet", Tier.MEMBER),
+    "admin": ("wet", Tier.ADMIN),
+    "owner": ("user", None),
+    "wet_lab_admin": ("wet", None),
+}
 
 
 @pytest_asyncio.fixture
@@ -100,38 +108,19 @@ class _Corpus:
     local_keys: dict[str, Tier]
 
     def visible(self, keys: dict[str, Tier], read_tier: Tier) -> set[str]:
-        return {k for k, needed in keys.items() if _RANK[read_tier] >= _RANK[needed]}
+        return {k for k, needed in keys.items() if TIER_RANK[read_tier] >= TIER_RANK[needed]}
 
 
 async def _seed_study_for_case(ctx, case: str) -> int:
     """Seed the study a case reads, owned and granted as the case says."""
-    owner = ctx["user_session"] if case == "owner" else ctx["wet_session"]
-    study_idx = await _seed_study(ctx, owner_idx=owner["principal_idx"], suffix=f"vis-{case}")
-    if case in ("viewer", "member", "admin"):
-        await _grant_study_access(
-            ctx,
-            study_idx=study_idx,
-            principal_idx=ctx["user_session"]["principal_idx"],
-            tier=case,
-            granted_by_idx=ctx["wet_session"]["principal_idx"],
-        )
-    return study_idx
+    owner_key, grant_tier = _CASE_STUDY[case]
+    return await _seed_authz_case_study(
+        ctx, owner_key=owner_key, grant_tier=grant_tier, case=f"vis-{case}"
+    )
 
 
 def _client_for_case(ctx, case: str):
     return ctx["wet"] if case == "wet_lab_admin" else ctx["user"]
-
-
-async def _insert_text_value(pool, spec, *, entity_idx, study_field_idx, created_by_idx) -> None:
-    await pool.execute(
-        f"INSERT INTO {spec.metadata_table}"
-        f" ({spec.entity_key_column}, {spec.study_field_idx_column}, value_text, created_by_idx)"
-        f" VALUES ($1, $2, $3, $4)",
-        entity_idx,
-        study_field_idx,
-        f"v-{secrets.token_hex(3)}",
-        created_by_idx,
-    )
 
 
 async def _seed_global_value(
@@ -143,26 +132,16 @@ async def _seed_global_value(
     wet_idx = ctx["wet_session"]["principal_idx"]
     suffix = secrets.token_hex(4)
     internal_name = f"vis_{suffix}"
-    if spec is BIOSAMPLE_METADATA_SPEC:
-        global_field_idx = await seed_biosample_global_field(
-            pool,
-            internal_name=internal_name,
-            display_name=f"Vis {suffix}",
-            data_type=FieldDataType.TEXT,
-            created_by_idx=wet_idx,
-            default_tier=default_tier,
-        )
-        ctx["created"]["biosample_global_field"].append(global_field_idx)
-    else:
-        global_field_idx = await seed_prep_sample_global_field(
-            pool,
-            internal_name=internal_name,
-            display_name=f"Vis {suffix}",
-            data_type=FieldDataType.TEXT,
-            created_by_idx=wet_idx,
-            default_tier=default_tier,
-        )
-        ctx["created"]["prep_sample_global_field"].append(global_field_idx)
+    global_field_idx = await seed_global_field_for_spec(
+        pool,
+        spec=spec,
+        internal_name=internal_name,
+        display_name=f"Vis {suffix}",
+        data_type=FieldDataType.TEXT,
+        created_by_idx=wet_idx,
+        default_tier=default_tier,
+    )
+    ctx["created"][f"{spec.entity_kind}_global_field"].append(global_field_idx)
     alias_idx = await seed_globally_linked_study_field(
         pool,
         spec=spec,
@@ -171,8 +150,8 @@ async def _seed_global_value(
         display_name=unique_field_name("vis_alias"),
         created_by_idx=wet_idx,
     )
-    await _insert_text_value(
-        pool, spec, entity_idx=entity_idx, study_field_idx=alias_idx, created_by_idx=wet_idx
+    await seed_metadata_text_value(
+        pool, spec=spec, entity_idx=entity_idx, study_field_idx=alias_idx, created_by_idx=wet_idx
     )
     if exception_tier is not None:
         await seed_field_exception(
@@ -201,8 +180,12 @@ async def _seed_local_value(
         created_by_idx=wet_idx,
         tier_override=tier_override,
     )
-    await _insert_text_value(
-        ctx["pool"], spec, entity_idx=entity_idx, study_field_idx=field_idx, created_by_idx=wet_idx
+    await seed_metadata_text_value(
+        ctx["pool"],
+        spec=spec,
+        entity_idx=entity_idx,
+        study_field_idx=field_idx,
+        created_by_idx=wet_idx,
     )
     return display_name
 
@@ -240,14 +223,18 @@ async def _seed_tiered_values(ctx, spec, *, study_idx, entity_idx):
     return global_keys, local_keys
 
 
-async def _import_biosample(ctx, *, study_idx: int, owner_id_field: str, owner_id_value: str):
+async def _import_biosample(
+    ctx, *, study_idx: int, owner_idx: int, owner_id_field: str, owner_id_value: str
+):
+    # The import requires host taxon id; a missing-value marker needs no
+    # seeded term. Its global field is public, so every caller sees it.
     resp = await ctx["wet"].post(
         URL_BIOSAMPLE_BY_STUDY.format(study_idx=study_idx),
         json={
-            "owner_idx": ctx["wet_session"]["principal_idx"],
+            "owner_idx": owner_idx,
             "owner_biosample_id_field_name": owner_id_field,
             "owner_biosample_id_value": owner_id_value,
-            "metadata": {_HOST_TAXON_DISPLAY_NAME: "not applicable"},
+            "metadata": {BIOSAMPLE_DISPLAY_HOST_TAXON_ID: "not applicable"},
         },
     )
     assert resp.status_code == 201, resp.text
@@ -262,11 +249,19 @@ class _BiosampleCorpus(_Corpus):
     owner_id_value: str
 
 
-async def _seed_biosample_corpus(ctx, study_idx: int) -> _BiosampleCorpus:
+async def _seed_biosample_corpus(
+    ctx, study_idx: int, *, owner_idx: int | None = None
+) -> _BiosampleCorpus:
+    """The biosample corpus; the biosample is the wet_lab_admin's unless
+    owner_idx names another owner."""
     owner_id_field = unique_field_name("vis_owner_id")
     owner_id_value = f"VIS-{secrets.token_hex(3)}"
     biosample_idx = await _import_biosample(
-        ctx, study_idx=study_idx, owner_id_field=owner_id_field, owner_id_value=owner_id_value
+        ctx,
+        study_idx=study_idx,
+        owner_idx=ctx["wet_session"]["principal_idx"] if owner_idx is None else owner_idx,
+        owner_id_field=owner_id_field,
+        owner_id_value=owner_id_value,
     )
     global_keys, local_keys = await _seed_tiered_values(
         ctx, BIOSAMPLE_METADATA_SPEC, study_idx=study_idx, entity_idx=biosample_idx
@@ -274,7 +269,7 @@ async def _seed_biosample_corpus(ctx, study_idx: int) -> _BiosampleCorpus:
     return _BiosampleCorpus(
         study_idx=study_idx,
         entity_idx=biosample_idx,
-        global_keys={_HOST_TAXON_INTERNAL_NAME: Tier.PUBLIC, **global_keys},
+        global_keys={BIOSAMPLE_FIELD_HOST_TAXON_ID: Tier.PUBLIC, **global_keys},
         # The import pins the owner-biosample-id field at member.
         local_keys={owner_id_field: Tier.MEMBER, **local_keys},
         owner_id_field=owner_id_field,
@@ -348,9 +343,24 @@ async def test_biosample_read_shows_only_visible_global_values(ctx, case):
     )
 
 
+async def test_biosample_owner_without_a_grant_reads_global_values_at_public(ctx):
+    """Owning a biosample admits a caller to its read but confers no tier: with
+    no grant on the study that wrote the values, the owner sees only the public
+    ones."""
+    study_idx = await _seed_study_for_case(ctx, "wet_lab_admin")
+    corpus = await _seed_biosample_corpus(
+        ctx, study_idx, owner_idx=ctx["user_session"]["principal_idx"]
+    )
+
+    resp = await ctx["user"].get(URL_BIOSAMPLE_BY_IDX.format(biosample_idx=corpus.entity_idx))
+
+    assert resp.status_code == 200, resp.text
+    assert set(resp.json()["global_metadata"]) == corpus.visible(corpus.global_keys, Tier.PUBLIC)
+
+
 async def test_lookup_by_unique_field_hidden_value_is_a_miss(ctx):
     """A viewer cannot see the owner-biosample-id, so a lookup by it answers
-    exactly as a lookup by a value no sample carries does; a member can."""
+    exactly as a lookup by a value no biosample carries does; a member can."""
     study_idx = await _seed_study_for_case(ctx, "viewer")
     corpus = await _seed_biosample_corpus(ctx, study_idx)
     url = URL_BIOSAMPLE_BY_STUDY_UNIQUE_FIELD.format(study_idx=study_idx)
@@ -370,10 +380,11 @@ async def test_lookup_by_unique_field_hidden_value_is_a_miss(ctx):
     )
 
     await ctx["pool"].execute(
-        "UPDATE qiita.study_access SET access_tier = 'member'"
+        "UPDATE qiita.study_access SET access_tier = $3::qiita.tier"
         " WHERE study_idx = $1 AND principal_idx = $2",
         study_idx,
         ctx["user_session"]["principal_idx"],
+        Tier.MEMBER,
     )
     shown = await ctx["user"].post(url, json=body)
 
@@ -416,7 +427,7 @@ async def test_global_value_from_another_study_judged_there(ctx):
         ctx,
         study_idx=other_study_idx,
         principal_idx=ctx["user_session"]["principal_idx"],
-        tier="member",
+        tier=Tier.MEMBER,
         granted_by_idx=ctx["wet_session"]["principal_idx"],
     )
     after = await ctx["user"].get(url)
