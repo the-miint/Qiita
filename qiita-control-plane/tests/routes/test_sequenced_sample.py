@@ -3637,9 +3637,11 @@ async def test_get_sequenced_sample_in_study_admin_tier_returns_response(ctx):
 
 
 @pytest.mark.parametrize("tier", ["viewer", "member"])
-async def test_get_sequenced_sample_in_study_below_admin_tier_403(ctx, tier):
-    """Tests the case where a regular user's study access is below the ADMIN
-    clamp (viewer or member): the study-scoped GET is 403.
+async def test_get_sequenced_sample_in_study_below_admin_tier_reads(ctx, tier):
+    """Tests the case where a regular user's study access is viewer or member:
+    the study-scoped GET is 200, since the read's floor is viewer. Which of the
+    sample's values each tier then sees is test_metadata_visibility.py's
+    subject.
     """
     seeded = await _seed_one_sequenced_sample(ctx, f"get-{tier}")
     await _grant_study_access(
@@ -3655,12 +3657,12 @@ async def test_get_sequenced_sample_in_study_below_admin_tier_403(ctx, tier):
             study_idx=seeded["study_idx"], sequenced_sample_idx=seeded["sequenced_sample_idx"]
         )
     )
-    assert resp.status_code == 403, resp.text
+    assert resp.status_code == 200, resp.text
 
 
 async def test_get_sequenced_sample_in_study_no_access_403(ctx):
     """Tests the case where a regular user has no study_access row on the study
-    (public-by-absence, below the ADMIN clamp): the GET is 403.
+    (public-by-absence, below the viewer floor): the GET is 403.
     """
     seeded = await _seed_one_sequenced_sample(ctx, "get-noaccess")
 

@@ -860,12 +860,28 @@ async def assert_study_field_create_conflict(
 
 
 # case -> (study owner, tier granted to the regular user, calling client,
-# expected status) for the study-scoped sample routes. The same ADMIN floor as
-# the field table above, plus an unauthenticated row and both sub-admin tiers:
-# viewer and member are listed separately because each pins the floor from a
-# different side. "anon" names the unauthenticated client the driver builds
-# rather than one the caller supplies.
-_STUDY_SCOPED_SAMPLE_AUTHZ: dict[str, tuple[str | None, str | None, str, int | None]] = {
+# expected status) for the study-scoped sample reads. The VIEWER floor every
+# study read shares, plus an unauthenticated row. "anon" names the
+# unauthenticated client the driver builds rather than one the caller supplies.
+# What each tier then sees of the sample's values is not this table's subject:
+# test_metadata_visibility.py pins that.
+_STUDY_SCOPED_SAMPLE_READ_AUTHZ: dict[str, tuple[str | None, str | None, str, int | None]] = {
+    "owner": ("user", None, "user", None),
+    "viewer_grant": ("wet", "viewer", "user", None),
+    "member_grant": ("wet", "member", "user", None),
+    "admin_grant": ("wet", "admin", "user", None),
+    "wet_lab_admin_bypass": ("user", None, "wet", None),
+    "no_access": ("wet", None, "user", 403),
+    "missing_scope": ("user", None, "no_scope", 403),
+    "anonymous": ("user", None, "anon", 401),
+    "nonexistent_study": (None, None, "wet", 404),
+}
+STUDY_SCOPED_SAMPLE_READ_AUTHZ_CASES = tuple(_STUDY_SCOPED_SAMPLE_READ_AUTHZ)
+
+# The same shape for the study-scoped sample writes, at the ADMIN floor: viewer
+# and member are listed separately because each pins the floor from a
+# different side.
+_STUDY_SCOPED_SAMPLE_WRITE_AUTHZ: dict[str, tuple[str | None, str | None, str, int | None]] = {
     "owner": ("user", None, "user", None),
     "admin_grant": ("wet", "admin", "user", None),
     "wet_lab_admin_bypass": ("user", None, "wet", None),
@@ -876,16 +892,17 @@ _STUDY_SCOPED_SAMPLE_AUTHZ: dict[str, tuple[str | None, str | None, str, int | N
     "anonymous": ("user", None, "anon", 401),
     "nonexistent_study": (None, None, "wet", 404),
 }
-STUDY_SCOPED_SAMPLE_AUTHZ_CASES = tuple(_STUDY_SCOPED_SAMPLE_AUTHZ)
+STUDY_SCOPED_SAMPLE_WRITE_AUTHZ_CASES = tuple(_STUDY_SCOPED_SAMPLE_WRITE_AUTHZ)
 
 # Path idx for the case whose study does not exist: no sample is seeded, and
 # the study gate answers before anything reads this.
 _UNUSED_SAMPLE_IDX = 1
 
 
-async def assert_study_scoped_sample_authz(
+async def _assert_study_scoped_sample_authz(
     ctx,
     *,
+    cases: dict[str, tuple[str | None, str | None, str, int | None]],
     case: str,
     no_scope_client,
     seed_sample,
@@ -895,7 +912,8 @@ async def assert_study_scoped_sample_authz(
 ) -> None:
     """Drive one access case of a study-scoped sample route and assert its status.
 
-    `case` names a row of `_STUDY_SCOPED_SAMPLE_AUTHZ`, which fixes the study's
+    `case` names a row of `cases` (`_STUDY_SCOPED_SAMPLE_READ_AUTHZ` or
+    `_STUDY_SCOPED_SAMPLE_WRITE_AUTHZ`), which fixes the study's
     ownership, any grant to the regular user, the calling client, and the
     expected status; a None status means the case is allowed and
     `success_status` is expected instead. `seed_sample(ctx, study_idx)` seeds
@@ -910,7 +928,7 @@ async def assert_study_scoped_sample_authz(
     The unauthenticated case drives the ASGI app directly, since every role
     client carries a token by construction.
     """
-    owner_key, grant_tier, client_key, expected_status = _STUDY_SCOPED_SAMPLE_AUTHZ[case]
+    owner_key, grant_tier, client_key, expected_status = cases[case]
     study_idx = await _seed_authz_case_study(
         ctx, owner_key=owner_key, grant_tier=grant_tier, case=case
     )
@@ -936,6 +954,20 @@ async def assert_study_scoped_sample_authz(
     # caller's role ceiling would refuse this client just as flatly.
     if client_key == "no_scope":
         assert required_scope in resp.json()["detail"], resp.text
+
+
+async def assert_study_scoped_sample_read_authz(ctx, *, case: str, **kwargs) -> None:
+    """Drive one access case of a study-scoped sample read (VIEWER floor)."""
+    await _assert_study_scoped_sample_authz(
+        ctx, cases=_STUDY_SCOPED_SAMPLE_READ_AUTHZ, case=case, **kwargs
+    )
+
+
+async def assert_study_scoped_sample_write_authz(ctx, *, case: str, **kwargs) -> None:
+    """Drive one access case of a study-scoped sample write (ADMIN floor)."""
+    await _assert_study_scoped_sample_authz(
+        ctx, cases=_STUDY_SCOPED_SAMPLE_WRITE_AUTHZ, case=case, **kwargs
+    )
 
 
 # ---------------------------------------------------------------------------

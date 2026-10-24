@@ -28,6 +28,7 @@ from qiita_common.models import (
     GenomeSource,
     ReferenceStatus,
     TerminologyStatus,
+    Tier,
 )
 
 # Re-exported (redundant-alias form, so the linter keeps what looks unused here).
@@ -448,21 +449,23 @@ async def seed_study(
     owner_idx: int,
     title: str,
     created_by_idx: int | None = None,
+    default_tier: Tier = Tier.MEMBER,
 ) -> int:
     """Insert a minimal qiita.study row; return its idx.
 
-    `created_by_idx` defaults to `owner_idx`. Only the NOT-NULL columns are
-    populated; every other column carries its schema default.
+    `created_by_idx` defaults to `owner_idx`, and `default_tier` to member, the
+    column's own default. Only those and the NOT-NULL columns are populated;
+    every other column carries its schema default.
     """
     author_idx = owner_idx if created_by_idx is None else created_by_idx
-    study_idx = await pool.fetchval(
-        "INSERT INTO qiita.study (owner_idx, title, created_by_idx)"
-        " VALUES ($1, $2, $3) RETURNING idx",
+    return await pool.fetchval(
+        "INSERT INTO qiita.study (owner_idx, title, created_by_idx, default_tier)"
+        " VALUES ($1, $2, $3, $4::qiita.tier) RETURNING idx",
         owner_idx,
         title,
         author_idx,
+        default_tier,
     )
-    return study_idx
 
 
 async def seed_exported_entity_probe(
@@ -613,6 +616,7 @@ async def seed_biosample_global_field(
     created_by_idx: int,
     terminology_idx: int | None = None,
     required: bool = False,
+    default_tier: Tier = Tier.PUBLIC,
 ) -> int:
     """Insert a qiita.biosample_global_field row and return its idx.
 
@@ -620,7 +624,8 @@ async def seed_biosample_global_field(
     internal_name, display_name, data_type, plus the principal that
     created the row. required defaults to the schema default, and is
     settable so a read test can tell an inherited value from a defaulted
-    one. default_tier relies on the schema default; description is
+    one. default_tier defaults to public, the column's own default, and is
+    settable so a visibility test can pin a field's tier. description is
     intentionally omitted -- callers that need a non-null description set
     it via UPDATE so the helper surface stays small. asyncpg coerces the
     StrEnum value to text for the qiita.field_data_type cast.
@@ -629,14 +634,16 @@ async def seed_biosample_global_field(
     """
     return await pool.fetchval(
         "INSERT INTO qiita.biosample_global_field"
-        "  (internal_name, display_name, data_type, terminology_idx, required, created_by_idx)"
-        " VALUES ($1, $2, $3, $4, $5, $6) RETURNING idx",
+        "  (internal_name, display_name, data_type, terminology_idx, required, created_by_idx,"
+        "   default_tier)"
+        " VALUES ($1, $2, $3, $4, $5, $6, $7::qiita.tier) RETURNING idx",
         internal_name,
         display_name,
         data_type,
         terminology_idx,
         required,
         created_by_idx,
+        default_tier,
     )
 
 
@@ -688,13 +695,14 @@ async def seed_prep_sample_global_field(
     created_by_idx: int,
     terminology_idx: int | None = None,
     required: bool = False,
+    default_tier: Tier = Tier.PUBLIC,
 ) -> int:
     """Insert a qiita.prep_sample_global_field row and return its idx.
 
     Parallel to seed_biosample_global_field; mirrors the same column
     subset (internal_name, display_name, data_type, required, plus the
-    creating principal). default_tier relies on the schema default;
-    description is intentionally omitted -- callers that need a non-null
+    creating principal), and default_tier the same way. description is
+    intentionally omitted -- callers that need a non-null
     description set it via UPDATE so the helper surface stays small.
     asyncpg coerces the StrEnum value to text for the
     qiita.field_data_type cast. terminology_idx must be supplied for
@@ -703,14 +711,16 @@ async def seed_prep_sample_global_field(
     """
     return await pool.fetchval(
         "INSERT INTO qiita.prep_sample_global_field"
-        "  (internal_name, display_name, data_type, terminology_idx, required, created_by_idx)"
-        " VALUES ($1, $2, $3, $4, $5, $6) RETURNING idx",
+        "  (internal_name, display_name, data_type, terminology_idx, required, created_by_idx,"
+        "   default_tier)"
+        " VALUES ($1, $2, $3, $4, $5, $6, $7::qiita.tier) RETURNING idx",
         internal_name,
         display_name,
         data_type,
         terminology_idx,
         required,
         created_by_idx,
+        default_tier,
     )
 
 
@@ -723,6 +733,7 @@ async def seed_local_study_field(
     created_by_idx: int,
     data_type: FieldDataType = FieldDataType.TEXT,
     required: bool = False,
+    tier_override: Tier | None = None,
 ) -> int:
     """Create a purely-local study field for spec's entity and return its idx.
 
@@ -740,8 +751,48 @@ async def seed_local_study_field(
             created_by_idx=created_by_idx,
             data_type=data_type,
             required=required,
+            tier_override=tier_override,
         )
     return idx
+
+
+async def seed_field_exception(
+    pool: asyncpg.Pool,
+    *,
+    spec: EntityMetadataSpec,
+    entity_idx: int,
+    tier_override: Tier,
+    created_by_idx: int,
+    global_field_idx: int | None = None,
+    study_field_idx: int | None = None,
+    reason: str | None = None,
+) -> int:
+    """Insert one per-(entity, field) visibility exception and return its idx.
+
+    Exactly one of global_field_idx / study_field_idx keys it, mirroring the
+    table's exactly-one-key CHECK; naming both or neither raises here rather
+    than at the CHECK, so a test that meant one key does not insert the other.
+    The row hangs off its entity, so the sweep takes it.
+    """
+    if (global_field_idx is None) == (study_field_idx is None):
+        raise ValueError(
+            "exactly one of global_field_idx and study_field_idx must be given;"
+            f" got global_field_idx={global_field_idx!r}, study_field_idx={study_field_idx!r}"
+        )
+    # f-string interpolation of identifiers is safe: spec fields are frozen
+    # module-level constants, never reached by caller input.
+    return await pool.fetchval(
+        f"INSERT INTO {spec.field_exception_table} ("
+        f"    {spec.entity_key_column}, {spec.study_field_idx_column}, global_field_idx,"
+        f"    tier_override, reason, created_by_idx"
+        f") VALUES ($1, $2, $3, $4::qiita.tier, $5, $6) RETURNING idx",
+        entity_idx,
+        study_field_idx,
+        global_field_idx,
+        tier_override,
+        reason,
+        created_by_idx,
+    )
 
 
 async def seed_local_metadata_value(

@@ -60,7 +60,8 @@ from .conftest import (
     STUDY_FIELD_CREATE_AUTHZ_CASES,
     STUDY_FIELD_CREATE_CONFLICT_CASES,
     STUDY_FIELD_LIST_AUTHZ_CASES,
-    STUDY_SCOPED_SAMPLE_AUTHZ_CASES,
+    STUDY_SCOPED_SAMPLE_READ_AUTHZ_CASES,
+    STUDY_SCOPED_SAMPLE_WRITE_AUTHZ_CASES,
     IneligibilityKind,
     _grant_study_access,
     _seed_study,
@@ -69,7 +70,8 @@ from .conftest import (
     assert_study_field_create_conflict,
     assert_study_field_get_authz,
     assert_study_field_list_authz,
-    assert_study_scoped_sample_authz,
+    assert_study_scoped_sample_read_authz,
+    assert_study_scoped_sample_write_authz,
     etag_for_row,
     post_study_field,
     resolve_ineligible_owner_idx,
@@ -1403,12 +1405,15 @@ async def _seed_authz_sample_with_unique_value(ctx, study_idx):
     Done as the bypass-role client so the seed succeeds whichever principal the
     case under test makes the study's owner.
     """
+    # Public, so the matrix measures the route's own gate: what each tier sees
+    # of a value is test_metadata_visibility.py's subject, not this one's.
     created = await ctx["wet"].post(
         URL_BIOSAMPLE_STUDY_FIELD_BY_STUDY.format(study_idx=study_idx),
         json={
             "display_name": _AUTHZ_FIELD_NAME,
             "data_type": "text",
             "unique_in_study": True,
+            "tier_override": "public",
         },
     )
     assert created.status_code == 201, created.text
@@ -2247,10 +2252,10 @@ async def test_get_biosample_in_study_admin_tier_returns_response(ctx):
     assert rj == expected
 
 
-@pytest.mark.parametrize("case", STUDY_SCOPED_SAMPLE_AUTHZ_CASES)
+@pytest.mark.parametrize("case", STUDY_SCOPED_SAMPLE_READ_AUTHZ_CASES)
 async def test_get_biosample_in_study_authz(ctx, case, no_biosample_read_client):
-    """Tests the case where each row of the study-scoped sample access matrix
-    calls the by-idx read: the ADMIN clamp, the role bypass, the scope check,
+    """Tests the case where each row of the study-scoped sample read matrix
+    calls the by-idx read: the VIEWER floor, the role bypass, the scope check,
     the unauthenticated refusal, and the missing-study 404 all hold.
     """
 
@@ -2259,7 +2264,7 @@ async def test_get_biosample_in_study_authz(ctx, case, no_biosample_read_client)
             URL_BIOSAMPLE_BY_STUDY_AND_IDX.format(study_idx=study_idx, biosample_idx=sample_idx)
         )
 
-    await assert_study_scoped_sample_authz(
+    await assert_study_scoped_sample_read_authz(
         ctx,
         case=case,
         no_scope_client=no_biosample_read_client,
@@ -3996,9 +4001,9 @@ async def test_patch_biosample_metadata_retired_409(ctx):
     assert "retired" in resp.json()["detail"]
 
 
-@pytest.mark.parametrize("case", STUDY_SCOPED_SAMPLE_AUTHZ_CASES)
+@pytest.mark.parametrize("case", STUDY_SCOPED_SAMPLE_WRITE_AUTHZ_CASES)
 async def test_patch_biosample_metadata_authz(ctx, case, no_biosample_write_patch_client):
-    """Tests the case where each row of the study-scoped sample access matrix
+    """Tests the case where each row of the study-scoped sample write matrix
     calls the metadata write: the ADMIN clamp, the role bypass, the scope
     check, the unauthenticated refusal, and the missing-study 404 all hold.
 
@@ -4011,7 +4016,7 @@ async def test_patch_biosample_metadata_authz(ctx, case, no_biosample_write_patc
             client, study_idx, sample_idx, {_AUTHZ_FIELD_NAME: _AUTHZ_FIELD_VALUE}
         )
 
-    await assert_study_scoped_sample_authz(
+    await assert_study_scoped_sample_write_authz(
         ctx,
         case=case,
         no_scope_client=no_biosample_write_patch_client,
@@ -4786,9 +4791,9 @@ async def test_lookup_biosample_in_study_by_unique_field_retired_biosample_404(c
     assert resp.json()["detail"] == expected_detail
 
 
-@pytest.mark.parametrize("case", STUDY_SCOPED_SAMPLE_AUTHZ_CASES)
+@pytest.mark.parametrize("case", STUDY_SCOPED_SAMPLE_READ_AUTHZ_CASES)
 async def test_lookup_biosample_in_study_by_unique_field_authz(ctx, case, no_biosample_read_client):
-    """Tests the case where each row of the study-scoped sample access matrix
+    """Tests the case where each row of the study-scoped sample read matrix
     calls the lookup: the route enforces the same bar as its by-idx twin.
     """
 
@@ -4797,7 +4802,7 @@ async def test_lookup_biosample_in_study_by_unique_field_authz(ctx, case, no_bio
             client, study_idx, _AUTHZ_FIELD_NAME, _AUTHZ_FIELD_VALUE
         )
 
-    await assert_study_scoped_sample_authz(
+    await assert_study_scoped_sample_read_authz(
         ctx,
         case=case,
         no_scope_client=no_biosample_read_client,
@@ -5010,11 +5015,11 @@ async def test_patch_biosample_metadata_by_unique_field_empty_metadata_422(ctx):
     assert resp.status_code == 422, resp.text
 
 
-@pytest.mark.parametrize("case", STUDY_SCOPED_SAMPLE_AUTHZ_CASES)
+@pytest.mark.parametrize("case", STUDY_SCOPED_SAMPLE_WRITE_AUTHZ_CASES)
 async def test_patch_biosample_metadata_by_unique_field_authz(
     ctx, case, no_biosample_write_patch_client
 ):
-    """Tests the case where each row of the study-scoped sample access matrix
+    """Tests the case where each row of the study-scoped sample write matrix
     calls the by-unique-field write: it enforces the same bar as its by-idx
     twin. The allowed rows rewrite the value the seed already wrote, so a
     permitted call answers 200 without depending on the write's outcome.
@@ -5029,7 +5034,7 @@ async def test_patch_biosample_metadata_by_unique_field_authz(
             metadata={_AUTHZ_FIELD_NAME: _AUTHZ_FIELD_VALUE},
         )
 
-    await assert_study_scoped_sample_authz(
+    await assert_study_scoped_sample_write_authz(
         ctx,
         case=case,
         no_scope_client=no_biosample_write_patch_client,
