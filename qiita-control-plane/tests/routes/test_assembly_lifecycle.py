@@ -37,6 +37,7 @@ from qiita_control_plane.testing.db_seeds import (
     seed_prep_sample_to_study_link,
 )
 from qiita_control_plane.testing.db_teardown import teardown_entity_graph
+from qiita_control_plane.testing.run_context import run_context
 
 from .conftest import DEPRECATION_FIELDS, INVALIDATION_FIELDS, PARTIAL_PROVENANCE, set_provenance
 
@@ -793,17 +794,19 @@ async def test_a_run_completing_over_a_withdrawal_fails_as_bad_input(
 
     async def _finalize():
         return await _run_action_primitive(
-            postgres_pool,
+            run_context(
+                pool=postgres_pool,
+                scope_target={
+                    "kind": ScopeTargetKind.PREP_SAMPLE.value,
+                    "prep_sample_idx": lifecycle["ps_done"],
+                },
+                work_ticket_idx=1,
+                signing_key=b"\x00" * 32,
+                data_plane_url="grpc://unused:50051",
+            ),
             entry,
             {PROCESSING_IDX_BINDING: lifecycle["processing_idx"]},
             tmp_path,
-            {
-                "kind": ScopeTargetKind.PREP_SAMPLE.value,
-                "prep_sample_idx": lifecycle["ps_done"],
-            },
-            work_ticket_idx=1,  # this arm ignores it; required by the signature
-            signing_key=b"\x00" * 32,
-            data_plane_url="grpc://unused:50051",
         )
 
     # Control: while the pair reads 'completed' the terminal step re-affirms it,

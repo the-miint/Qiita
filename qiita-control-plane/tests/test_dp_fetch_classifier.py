@@ -36,6 +36,7 @@ from qiita_common.models import WorkTicketFailureStage
 
 from qiita_control_plane.runner._upload import _submission_dp_fetch_failure
 from qiita_control_plane.testing.flight import REAL_BUSY_REFUSAL as _REAL_BUSY
+from qiita_control_plane.testing.run_context import run_context
 
 # A representative stringified pyarrow FlightError carrying the Postgres 40001
 # serialization message, as seen verbatim in a real read-mask fan-out
@@ -377,16 +378,18 @@ async def _dispatch_action_raising(
     entry = WorkflowAction(kind="action", name=name, inputs=[], outputs=[])
     try:
         await _reconstruct._dispatch_action(
-            object(),
+            run_context(
+                pool=object(),
+                scope_target={"kind": "prep_sample", "prep_sample_idx": 1},
+                work_ticket_idx=1,
+                signing_key=b"\x00" * 32,
+                data_plane_url="grpc://dp:50051",
+            ),
             entry,
             {},
             Path("/unused"),
-            {"kind": "prep_sample", "prep_sample_idx": 1},
-            work_ticket_idx=1,
             step_index=0,
             attempt=0,
-            signing_key=b"\x00" * 32,
-            data_plane_url="grpc://dp:50051",
         )
     except BaseException as raised:
         return raised, recorded
@@ -443,14 +446,16 @@ async def test_register_files_rerun_after_the_files_moved_says_so(tmp_path):
     entry = WorkflowAction(kind="action", name="register-files", inputs=["staging"], outputs=[])
     with pytest.raises(RuntimeError, match="registration may have committed"):
         await _run_action_primitive(
-            object(),
+            run_context(
+                pool=object(),
+                scope_target={"kind": "prep_sample", "prep_sample_idx": 1},
+                work_ticket_idx=1,
+                signing_key=b"\x00" * 32,
+                data_plane_url="grpc://dp:50051",
+            ),
             entry,
             {"staging": str(staging)},
             tmp_path,
-            {"kind": "prep_sample", "prep_sample_idx": 1},
-            work_ticket_idx=1,
-            signing_key=b"\x00" * 32,
-            data_plane_url="grpc://dp:50051",
         )
 
 

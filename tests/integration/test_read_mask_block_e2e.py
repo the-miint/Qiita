@@ -166,16 +166,19 @@ async def _run_block_action(
     `work_ticket_idx` names register-files' lake file (`wt{idx}-read_mask.parquet`),
     so each registration needs a distinct value (the DP refuses to overwrite)."""
     from qiita_control_plane.runner import _run_action_primitive
+    from qiita_control_plane.testing.run_context import run_context
 
     await _run_action_primitive(
-        postgres_pool,
+        run_context(
+            pool=postgres_pool,
+            scope_target={"kind": "block", "block_idx": block_idx},
+            work_ticket_idx=work_ticket_idx,
+            signing_key=data_plane["secret"],
+            data_plane_url=_data_plane_url(data_plane),
+        ),
         _block_action_entry(name),
         bound,
         workspace,
-        {"kind": "block", "block_idx": block_idx},
-        work_ticket_idx=work_ticket_idx,
-        signing_key=data_plane["secret"],
-        data_plane_url=_data_plane_url(data_plane),
     )
 
 
