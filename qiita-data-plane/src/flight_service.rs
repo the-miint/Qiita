@@ -1223,14 +1223,15 @@ impl FlightService for QiitaFlightService {
 // lands on disk as Parquet, set mode 440 on close. The consuming workflow
 // (an orchestrator native module) reads `upload.parquet` and interprets it.
 //
+// The upload is written to a sibling `upload.parquet.partial` and linked to
+// `upload.parquet` only once it is closed, fsynced and locked 440, so
+// `upload.parquet` only ever appears complete. A data plane killed mid-upload
+// leaves the `.partial`, never a truncated `upload.parquet`.
+//
 // Failure policy: any error mid-stream deletes the partial file and returns
 // a Status to the client. The upload row in `qiita.upload` stays at
 // `pending`; the client mints a fresh slot to retry. Partial-write
-// failures aren't resumable. Post-write failures (the chmod 440 or the
-// PutResult JSON encode) DO clean up the just-written file, which means
-// a retry against the same upload_idx would re-trigger `create_new`
-// successfully — but the client never learns the upload_idx is reusable
-// in that window, so in practice retries always mint a fresh slot.
+// failures aren't resumable.
 
 impl QiitaFlightService {
     /// Generic over the input stream so unit tests can drive it with an
@@ -1284,23 +1285,54 @@ impl QiitaFlightService {
             .ok_or_else(|| Status::internal("staging path has no parent"))?;
         std::fs::create_dir_all(parent)
             .map_err(|e| Status::internal(format!("mkdir {}: {e}", parent.display())))?;
+        // Refused before the stream is read, so an upload to a finished slot is
+        // not received in full only to be refused at the link below.
+        if staging_path.exists() {
+            return Err(already_uploaded(&staging_path));
+        }
+        let partial_path = {
+            let mut s = staging_path.clone().into_os_string();
+            s.push(".partial");
+            PathBuf::from(s)
+        };
 
         // Write the parquet + chmod + body-encode under a single
         // error-guarded scope. Any Err return below cleans up the partial
         // staging file via the trailing `if result.is_err()` block — this is
         // the single cleanup site so a new fallible operation in this scope
         // can't accidentally bypass it.
-        let path_for_cleanup = staging_path.clone();
+        let path_for_cleanup = partial_path.clone();
         let result: Result<PutResult, Status> = async {
             let (sha256, row_count, bytes_received) =
-                write_doput_parquet(staging_path.clone(), first, stream).await?;
+                write_doput_parquet(partial_path.clone(), first, stream).await?;
 
             // Lock the file 440 — owner+group read, no write, no world.
             // After this the data plane itself can't modify it; matches
             // the immutability assumption the consuming workflow makes.
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&staging_path, std::fs::Permissions::from_mode(0o440))
+            std::fs::set_permissions(&partial_path, std::fs::Permissions::from_mode(0o440))
                 .map_err(|e| Status::internal(format!("chmod 440: {e}")))?;
+
+            // Publish. A hard link, not a rename, because it refuses an existing
+            // `upload.parquet` (EEXIST) where a rename would replace it.
+            std::fs::hard_link(&partial_path, &staging_path).map_err(|e| match e.kind() {
+                std::io::ErrorKind::AlreadyExists => Status::internal(format!(
+                    "{} appeared while this upload was written; this upload is discarded",
+                    staging_path.display()
+                )),
+                _ => Status::internal(format!(
+                    "link {} → {}: {e}",
+                    partial_path.display(),
+                    staging_path.display()
+                )),
+            })?;
+            if let Err(e) = std::fs::remove_file(&partial_path) {
+                eprintln!(
+                    "warning: published {} but failed to remove {}: {e}",
+                    staging_path.display(),
+                    partial_path.display()
+                );
+            }
 
             let body = serde_json::to_vec(&serde_json::json!({
                 "sha256": sha256,
@@ -1315,11 +1347,10 @@ impl QiitaFlightService {
         }
         .await;
 
-        // Cleanup the partial / fully-written-but-unblessed Parquet on any
-        // error path EXCEPT AlreadyExists. AlreadyExists means we never
-        // opened the file (a prior successful DoPut owns it via
-        // create_new's atomic guard); deleting it would wipe a legitimate
-        // upload owned by a different call.
+        // Clean up the `.partial` on any error path EXCEPT AlreadyExists.
+        // AlreadyExists means we never opened it (a concurrent DoPut owns it
+        // via create_new's atomic guard); deleting it would wipe that call's
+        // upload. `upload.parquet` itself is never removed here.
         if let Err(ref e) = result {
             if e.code() != tonic::Code::AlreadyExists {
                 if let Err(cleanup_err) = std::fs::remove_file(&path_for_cleanup) {
@@ -1334,6 +1365,14 @@ impl QiitaFlightService {
         }
         result
     }
+}
+
+/// The refusal of an upload to a slot whose `upload.parquet` is already published.
+fn already_uploaded(staging_path: &Path) -> Status {
+    Status::already_exists(format!(
+        "staging file already exists — concurrent DoPut?: {}",
+        staging_path.display()
+    ))
 }
 
 /// `std::io::Write` adapter that incrementally feeds every byte the inner
@@ -1437,14 +1476,16 @@ where
                     // upload_idx silently clobbering each other's bytes via
                     // separate write() calls on the same path. The CP doesn't
                     // reissue tickets for a given slot, so this is the
-                    // contract-violation surface.
+                    // contract-violation surface. A `.partial` a killed data
+                    // plane left behind is refused the same way.
                     let file = std::fs::OpenOptions::new()
                         .write(true)
                         .create_new(true)
                         .open(&staging_path)
                         .map_err(|e| match e.kind() {
                             std::io::ErrorKind::AlreadyExists => Status::already_exists(format!(
-                                "staging file already exists — concurrent DoPut?: {}",
+                                "partial upload already exists — concurrent DoPut, or one a \
+                                 restart interrupted?: {}",
                                 staging_path.display()
                             )),
                             _ => {

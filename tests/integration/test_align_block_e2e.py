@@ -53,7 +53,9 @@ from qiita_control_plane.testing.db_teardown import teardown_entity_graph
 
 from conftest import ducklake_connect
 
-_ALIGN_YAML_PATH = Path(__file__).parent.parent.parent / "workflows" / "align" / "1.0.0.yaml"
+_ALIGN_YAML_PATH = (
+    Path(__file__).parent.parent.parent / "workflows" / "align" / "1.0.0.yaml"
+)
 
 # Reads per sample. Small — the DuckLake writes are cheap and the exact row count
 # (reads × rows-per-read) is asserted, so keep it tiny.
@@ -189,16 +191,19 @@ async def _run_align_action(
     `work_ticket_idx` names register-files' lake file (`wt{idx}-alignment.parquet`),
     so each registration needs a distinct value (the DP refuses to overwrite)."""
     from qiita_control_plane.runner import _run_action_primitive
+    from qiita_control_plane.testing.run_context import run_context
 
     await _run_action_primitive(
-        postgres_pool,
+        run_context(
+            pool=postgres_pool,
+            scope_target={"kind": "block", "block_idx": block_idx},
+            work_ticket_idx=work_ticket_idx,
+            signing_key=data_plane["secret"],
+            data_plane_url=_data_plane_url(data_plane),
+        ),
         _align_action_entry(name),
         bound,
         workspace,
-        {"kind": "block", "block_idx": block_idx},
-        work_ticket_idx=work_ticket_idx,
-        signing_key=data_plane["secret"],
-        data_plane_url=_data_plane_url(data_plane),
     )
 
 

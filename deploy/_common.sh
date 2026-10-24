@@ -503,3 +503,73 @@ qiita_require_lake_data_path() {
         exit 1
     fi
 }
+
+# Wait until the data plane `$1` (a systemd unit, env file `$2`) has nothing in
+# flight, for up to QIITA_DP_IDLE_WAIT_S seconds (default: the unit's
+# TimeoutStopSec, deploy/systemd/qiita-data-plane@.service; 0 skips the wait), then
+# return 0 whether or not it went idle: the data plane keeps serving while this
+# waits, so under steady load it may not go idle, and its drain lets what is still
+# running finish. Returns at once when the env file is absent (first deploy) or the
+# unit has no main process. Exits non-zero, before any restart, when
+# QIITA_DP_IDLE_WAIT_S is not a whole number or the catalog query fails.
+#
+# In flight, as the data plane already exposes it: a DoGet stream or a
+# register_files holds a catalog session in `active` or `idle in transaction`,
+# while an idle data plane's sessions are `idle`, and a DoPut holds its
+# `upload.parquet.partial` open (all measured against a running data plane, macOS).
+# A read export writes through a `.partial` too, so it counts as well. Open files
+# are found through /proc/<pid>/fd (the match measured in a Linux container). The
+# catalog query connects with the data plane's own role, which is what lets it see
+# those sessions' state; a lake-gc or lake-shell session under that role counts too.
+wait_for_data_plane_idle() {
+    local unit=$1 env_file=$2
+    local wait_s=${QIITA_DP_IDLE_WAIT_S:-3900}
+    case $wait_s in
+        '' | *[!0-9]*)
+            echo "ERROR: QIITA_DP_IDLE_WAIT_S must be a whole number of seconds, got '$wait_s'" >&2
+            return 1
+            ;;
+    esac
+    # Base 10, so a leading zero is not read as octal.
+    wait_s=$((10#$wait_s))
+    [ -r "$env_file" ] && [ "$wait_s" -gt 0 ] || return 0
+    local pid
+    pid=$(systemctl show -p MainPID --value "$unit")
+    [ "${pid:-0}" -gt 0 ] || return 0
+    # A subshell, so qiita_pgpass_init's EXIT trap removes the pgpass when the wait
+    # ends rather than replacing this script's own exit handling. The password
+    # reaches libpq through that 0600 file, not psql's argv (see
+    # qiita_split_conn_password).
+    (
+        local conn user password lake partials
+        IFS=$'\t' read -r conn user password \
+            < <(qiita_split_conn_password "$(read_env_var "$env_file" DUCKLAKE_CATALOG_CONNSTR)")
+        qiita_pgpass_init "qiita-dp-idle"
+        [ -z "$password" ] || qiita_pgpass_add "$user" "$password"
+        local deadline=$((SECONDS + wait_s)) next_report=$SECONDS
+        while :; do
+            lake=$(PGPASSFILE="$PGPASS_FILE" psql "$conn" -Atc "SELECT count(*) FROM pg_stat_activity
+                WHERE datname = current_database() AND pid <> pg_backend_pid()
+                  AND state IN ('active', 'idle in transaction')") || {
+                echo "ERROR: cannot query the data plane's catalog to tell whether $unit is idle; set QIITA_DP_IDLE_WAIT_S=0 to restart without waiting" >&2
+                exit 1
+            }
+            # `|| true`: find fails once the process has exited (no fd dir), and
+            # pipefail would carry that out of the assignment.
+            partials=$(find "/proc/$pid/fd" -lname '*.partial' 2>/dev/null | wc -l || true)
+            partials=$((partials))
+            if [ "$lake" -eq 0 ] && [ "$partials" -eq 0 ]; then
+                exit 0
+            fi
+            if [ "$SECONDS" -ge "$deadline" ]; then
+                echo "$unit still busy after ${wait_s}s (catalog sessions: $lake, open partial files: $partials); restarting, and its drain lets them finish" >&2
+                exit 0
+            fi
+            if [ "$SECONDS" -ge "$next_report" ]; then
+                echo "waiting for $unit to go idle (catalog sessions: $lake, open partial files: $partials); up to $((deadline - SECONDS))s more" >&2
+                next_report=$((SECONDS + 60))
+            fi
+            sleep "${QIITA_DP_IDLE_POLL_S:-5}"
+        done
+    )
+}

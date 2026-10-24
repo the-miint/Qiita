@@ -145,17 +145,20 @@ async def _run_register_files(
     """Drive the REAL runner adapter for the download-ena-study `register-files`
     entry — the exact production tail `ingest_ena_reads` hands its output to."""
     from qiita_control_plane.runner import _run_action_primitive
+    from qiita_control_plane.testing.run_context import run_context
 
     entry = _entry_by_name("register-files")
     await _run_action_primitive(
-        postgres_pool,
+        run_context(
+            pool=postgres_pool,
+            scope_target={},
+            work_ticket_idx=work_ticket_idx,
+            signing_key=data_plane["secret"],
+            data_plane_url=_data_plane_url(data_plane),
+        ),
         entry,
         {"read_staging_dir": str(staging_dir)},
         staging_dir,
-        {},
-        work_ticket_idx=work_ticket_idx,
-        signing_key=data_plane["secret"],
-        data_plane_url=_data_plane_url(data_plane),
     )
 
 

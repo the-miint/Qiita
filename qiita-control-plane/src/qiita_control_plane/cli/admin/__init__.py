@@ -92,12 +92,14 @@ from .mask import (
 from .masked_export import (
     _READ_MASKED_COLUMNS,
     _SAFE_ACCESSION,
+    DEFAULT_EXPORT_RETRY_SECONDS,
     _commit_partials,
     _count_masked,
     _export_stem,
     _handle_masked_read_export,
     _parquet_row_count,
     _peek_paired,
+    _retry_seconds_arg,
     _write_masked_sample,
 )
 from .owner_id import (
@@ -685,6 +687,19 @@ def _build_parser() -> argparse.ArgumentParser:
             " fast link (break-even is around 4 Gbit/s), so it is a loss"
             " on-host and a large win over the TLS edge from off-site. Output"
             " files are identical either way."
+        ),
+    )
+    p_export.add_argument(
+        "--retry-seconds",
+        type=_retry_seconds_arg,
+        default=DEFAULT_EXPORT_RETRY_SECONDS,
+        dest="retry_seconds",
+        help=(
+            "How long to keep retrying a prep_sample whose export failed because"
+            " the data plane or the control plane was unreachable (a restart,"
+            " e.g. a deploy), starting from its first failure. The prep_sample is"
+            " exported again from the start; 0 disables the retry."
+            f" Default {DEFAULT_EXPORT_RETRY_SECONDS:g}."
         ),
     )
     p_export.set_defaults(handler=_handle_masked_read_export)

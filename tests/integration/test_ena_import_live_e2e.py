@@ -35,11 +35,17 @@ from qiita_control_plane.ena_import import (
     DOWNLOAD_ENA_STUDY_ACTION_ID,
     DOWNLOAD_ENA_STUDY_ACTION_VERSION,
 )
-from qiita_control_plane.ena_import.batch import _process_one_study, create_ena_import_batch
+from qiita_control_plane.ena_import.batch import (
+    _process_one_study,
+    create_ena_import_batch,
+)
 from qiita_control_plane.testing.db_seeds import seed_user_principal
 
 _DOWNLOAD_ENA_STUDY_YAML_PATH = (
-    Path(__file__).parent.parent.parent / "workflows" / "download-ena-study" / "1.0.0.yaml"
+    Path(__file__).parent.parent.parent
+    / "workflows"
+    / "download-ena-study"
+    / "1.0.0.yaml"
 )
 
 # Markers meaning "network/infra unavailable, not a real bug" -- deliberately
@@ -85,7 +91,9 @@ def _write_ena_run_map(path: Path, roster: list[tuple[int, str]]) -> None:
     rows = ", ".join(f"({idx}, '{acc}')" for idx, acc in roster)
     with duckdb.connect(":memory:") as conn:
         conn.execute(
-            "COPY (SELECT * FROM (VALUES " + rows + ") AS t(prep_sample_idx, ena_run_accession)) "
+            "COPY (SELECT * FROM (VALUES "
+            + rows
+            + ") AS t(prep_sample_idx, ena_run_accession)) "
             f"TO '{path}' (FORMAT parquet)"
         )
 
@@ -110,17 +118,20 @@ async def _run_register_files(
     postgres_pool, data_plane, *, staging_dir: Path, work_ticket_idx: int
 ):
     from qiita_control_plane.runner import _run_action_primitive
+    from qiita_control_plane.testing.run_context import run_context
 
     entry = _entry_by_name("register-files")
     await _run_action_primitive(
-        postgres_pool,
+        run_context(
+            pool=postgres_pool,
+            scope_target={},
+            work_ticket_idx=work_ticket_idx,
+            signing_key=data_plane["secret"],
+            data_plane_url=_data_plane_url(data_plane),
+        ),
         entry,
         {"read_staging_dir": str(staging_dir)},
         staging_dir,
-        {},
-        work_ticket_idx=work_ticket_idx,
-        signing_key=data_plane["secret"],
-        data_plane_url=_data_plane_url(data_plane),
     )
 
 
@@ -155,7 +166,9 @@ async def batch_app(postgres_pool):
 
     yield app
 
-    pending = list(app.state.running_dispatches) + list(app.state.running_ena_import_batches)
+    pending = list(app.state.running_dispatches) + list(
+        app.state.running_ena_import_batches
+    )
     if pending:
         await asyncio.gather(*pending, return_exceptions=True)
     app.state.compute_backend_client = saved_compute_backend_client
@@ -207,7 +220,9 @@ async def download_ena_study_action(postgres_pool):
         "          $4::jsonb, $5::jsonb, 1, 1, '1 minute', 'active', 'failed')",
         DOWNLOAD_ENA_STUDY_ACTION_ID,
         DOWNLOAD_ENA_STUDY_ACTION_VERSION,
-        json.dumps({"service": False, "human_roles": ["wet_lab_admin", "system_admin"]}),
+        json.dumps(
+            {"service": False, "human_roles": ["wet_lab_admin", "system_admin"]}
+        ),
         json.dumps(
             {
                 "type": "object",

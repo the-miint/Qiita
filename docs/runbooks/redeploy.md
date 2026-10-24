@@ -210,8 +210,12 @@ which: stages into `/opt/qiita/`, `uv sync`s the Python venvs
 (`--reinstall-package qiita-common` to defeat cross-package staleness),
 **asserts every shipped migration is applied and aborts if not**, runs
 `qiita-admin actions sync` (picks up new/changed workflow YAML),
-installs systemd units + dropins, and restarts the services whose env
-files are present.
+installs systemd units + dropins, waits for the data plane to have no
+request in flight (up to `QIITA_DP_IDLE_WAIT_S`, default 3900 s, printing
+`waiting for qiita-data-plane@50051 to go idle …` once a minute), and
+restarts the services whose env files are present. The data plane's own
+restart lets requests still running finish, for up to its unit's
+`TimeoutStopSec`. See [`docs/deployments.md`](../deployments.md).
 
 If the migration guard aborts here, you skipped or under-ran the migrate
 step above — run `make migrate` and re-run this command.
