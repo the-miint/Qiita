@@ -1100,7 +1100,7 @@ async def _run_entry_with_retry(
     # override and whatever a prior run's ladder already escalated this step to
     # (`persisted_floor`), and is raised on each OOM-killed retry (see the
     # except arm below). Threaded into every step dispatch in place of the
-    # static `mem_gb_override`. Both inputs are raise-only floors, so the max is
+    # static `ctx.mem_gb_override`. Both inputs are raise-only floors, so the max is
     # the composition — and the persisted value already grew from a resolution
     # that included the static override, so it dominates in practice.
     effective_mem_override = max(

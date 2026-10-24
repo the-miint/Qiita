@@ -29,11 +29,11 @@ def run_context(
     max_inflight: int = DEFAULT_FANOUT_MAX_INFLIGHT,
     mem_gb_override: int | None = None,
 ) -> RunContext:
-    """The context a run would build. A collaborator, number or path the test
-    does not name is `None`, so a path that reaches one fails on it rather than
-    using a stand-in. `resume`, `dispatch_cb` and `max_inflight` default as
-    `run_workflow`'s do, and `mem_gb_override` as for a ticket with no
-    resource override."""
+    """The context a run would build. `resume`, `dispatch_cb` and
+    `max_inflight` default as `run_workflow`'s do, and `mem_gb_override` as for
+    a ticket with no resource override; every other argument the test does not
+    name is `None`, so a path that reaches one fails on it rather than using a
+    stand-in."""
     return RunContext(
         pool=pool,
         work_ticket_idx=work_ticket_idx,
