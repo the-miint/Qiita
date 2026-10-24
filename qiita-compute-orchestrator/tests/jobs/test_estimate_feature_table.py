@@ -224,7 +224,7 @@ def test_execute_streams_scopes_writes_and_schema(tmp_path, monkeypatch):
 
 
 def test_output_is_parquet_v2_zstd(tmp_path, monkeypatch):
-    """Repo convention: result Parquet is v2 + zstd (PARQUET_OPTS)."""
+    """Repo convention: result Parquet is v2 + zstd (PARQUET_OPTS_TRANSFER)."""
     from qiita_compute_orchestrator.jobs import estimate_feature_table as m
 
     out, _ = _run(

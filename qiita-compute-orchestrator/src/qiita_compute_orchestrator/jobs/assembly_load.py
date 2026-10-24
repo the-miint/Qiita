@@ -59,7 +59,7 @@ from qiita_common.assembly_constants import (
 from qiita_common.parquet import validate_parquet_path
 
 from ..miint import (
-    PARQUET_OPTS,
+    PARQUET_OPTS_AT_REST,
     apply_duckdb_settings,
     duckdb_tmp_dir,
     open_miint_conn,
@@ -269,7 +269,7 @@ def _write_assembly_membership(
         "  SELECT m.prep_sample_idx, m.processing_idx, m.kind, m.bin_id, m.feature_idx,"
         f"    {contig_attribute_projection('a')}"
         "  FROM member m" + contig_attribute_join("m") + "  ORDER BY m.feature_idx"
-        f") TO '{out}' ({PARQUET_OPTS})",
+        f") TO '{out}' ({PARQUET_OPTS_AT_REST})",
         [str(bin_map_path)],
     )
 
@@ -357,9 +357,9 @@ def _write_bin_quality(
         # Empty write — every source NULL, no FROM, WHERE FALSE. `bin_quality_projection`
         # is what keeps this Parquet's schema identical to a populated one.
         projection = bin_quality_projection(dict.fromkeys(BIN_QUALITY_COLUMN_NAMES, "NULL"))
-        conn.execute(f"COPY (SELECT {projection} WHERE FALSE) TO '{out}' ({PARQUET_OPTS})")
+        conn.execute(f"COPY (SELECT {projection} WHERE FALSE) TO '{out}' ({PARQUET_OPTS_AT_REST})")
         return
 
     # UNION ALL, not UNION: the arms are disjoint by `kind` and a dedupe here
     # would only cost a sort over every column.
-    conn.execute(f"COPY ({' UNION ALL '.join(arms)}) TO '{out}' ({PARQUET_OPTS})", params)
+    conn.execute(f"COPY ({' UNION ALL '.join(arms)}) TO '{out}' ({PARQUET_OPTS_AT_REST})", params)

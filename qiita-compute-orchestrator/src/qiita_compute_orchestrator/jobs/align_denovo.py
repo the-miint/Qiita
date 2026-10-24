@@ -100,7 +100,7 @@ from qiita_common.parquet import validate_parquet_path
 
 from ..data_plane_client import open_assembly_chunk_stream, open_read_masked_stream
 from ..miint import (
-    PARQUET_OPTS,
+    PARQUET_OPTS_AT_REST,
     apply_duckdb_settings,
     duckdb_tmp_dir,
     open_miint_conn,
@@ -432,13 +432,13 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 f"WHERE {SCORABLE_SECONDARY_ROW} "
                 f"AND {secondary_predicate_sql(clearance=clearance)}"
                 ") ORDER BY alignment_idx, prep_sample_idx, sequence_idx, feature_idx, "
-                f"position, flags) TO '{alignment_sql}' ({PARQUET_OPTS})",
+                f"position, flags) TO '{alignment_sql}' ({PARQUET_OPTS_AT_REST})",
                 secondary_parameters(gate),
             )
             conn.execute(
                 f"COPY ({_origin_spanning_sql()} "
                 "ORDER BY alignment_idx, prep_sample_idx, sequence_idx, feature_idx) "
-                f"TO '{origin_spanning_sql}' ({PARQUET_OPTS})"
+                f"TO '{origin_spanning_sql}' ({PARQUET_OPTS_AT_REST})"
             )
         # OUTSIDE the connection contexts, matching align_sharded: a context __exit__
         # that raises after the COPY must still take the cleanup below.

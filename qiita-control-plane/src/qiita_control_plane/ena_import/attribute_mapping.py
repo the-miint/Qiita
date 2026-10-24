@@ -9,8 +9,10 @@ since real submitters use both: the GSC-MIxS display-name form ENA's checklists 
 (`"collection date"`, ...) and the underscore MIxS short-name form (notably DDBJ) uses
 (`collection_date`, `geo_loc_name`, `lat_lon`, `depth`).
 
-  - `collection date`/`collection_date`, `depth`, and the geographic-location
-    coordinate + country/sea fields: value passes through unchanged.
+  - `collection date`/`collection_date`, `depth`, and the country/sea field: value
+    passes through unchanged.
+  - the latitude/longitude fields: a hemisphere-suffixed decimal (`"39N"`, `"12.5 W"`)
+    is signed (S/W negate); any other value passes through unchanged.
   - `geo_loc_name` -> `geographic location (country and/or sea)`: MIxS packs
     `country:region:locality`; only the country/sea part (before the first `:`) is
     kept -- region/locality dropped rather than guessed at a finer granularity.
@@ -87,6 +89,30 @@ _LAT_LON_RE = re.compile(
 )
 
 
+# One coordinate with its hemisphere after it: "39N", "39 N", "12.5°W" (or "º", the
+# ordinal indicator keyboards often give for a degree sign). A signed number with a
+# hemisphere ("-39S") is ambiguous and does not match.
+_HEMISPHERE_COORDINATE_RE = re.compile(
+    r"^(?P<value>[0-9]+(?:\.[0-9]+)?)\s*[°º]?\s*(?P<dir>[NSEWnsew])$"
+)
+
+
+def _coordinate(display_name: str, negative: str) -> _TagHandler:
+    """A latitude (`negative="S"`) or longitude (`negative="W"`) field. A decimal with
+    its hemisphere after it is signed, its digits kept verbatim; a hemisphere from the
+    other axis, or any other value, passes through unchanged for the import to parse."""
+    axis = {"S": "NS", "W": "EW"}[negative]
+
+    def _handler(value: str) -> dict[str, str]:
+        match = _HEMISPHERE_COORDINATE_RE.match(value.strip())
+        if match is None or match["dir"].upper() not in axis:
+            return {display_name: value}
+        signed = f"-{match['value']}" if match["dir"].upper() == negative else match["value"]
+        return {display_name: signed}
+
+    return _handler
+
+
 def _map_lat_lon(value: str) -> dict[str, str] | None:
     """Split MIxS `lat_lon` into the two NUMERIC coordinate fields, negating for S/W.
     Returns `None` (leave the tag unmapped) for anything not matching the exact
@@ -112,9 +138,11 @@ _ENA_ATTRIBUTE_TAG_HANDLERS: dict[str, _TagHandler] = {
     "geographic location (country and/or sea)": _passthrough(
         BIOSAMPLE_DISPLAY_GEOGRAPHIC_LOCATION_COUNTRY_OR_SEA
     ),
-    "geographic location (latitude)": _passthrough(BIOSAMPLE_DISPLAY_GEOGRAPHIC_LOCATION_LATITUDE),
-    "geographic location (longitude)": _passthrough(
-        BIOSAMPLE_DISPLAY_GEOGRAPHIC_LOCATION_LONGITUDE
+    "geographic location (latitude)": _coordinate(
+        BIOSAMPLE_DISPLAY_GEOGRAPHIC_LOCATION_LATITUDE, negative="S"
+    ),
+    "geographic location (longitude)": _coordinate(
+        BIOSAMPLE_DISPLAY_GEOGRAPHIC_LOCATION_LONGITUDE, negative="W"
     ),
     "depth": _passthrough(BIOSAMPLE_DISPLAY_DEPTH),
     "geo loc name": _map_geo_loc_name,

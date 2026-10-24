@@ -24,7 +24,7 @@ from pydantic import BaseModel
 from qiita_common.parquet import validate_parquet_path
 
 from ..miint import (
-    PARQUET_OPTS,
+    PARQUET_OPTS_AT_REST,
     apply_duckdb_settings,
     duckdb_tmp_dir,
     open_conn,
@@ -137,6 +137,6 @@ def _write_amplicon_membership(
         "  FROM read_parquet(?) c"
         "  JOIN feature_map fm ON c.sequence_hash = fm.sequence_hash"
         "  ORDER BY prep_sample_idx, feature_idx"
-        f") TO '{out}' ({PARQUET_OPTS})",
+        f") TO '{out}' ({PARQUET_OPTS_AT_REST})",
         [str(asv_counts_path)],
     )

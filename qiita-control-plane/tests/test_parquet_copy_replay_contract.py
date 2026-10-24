@@ -7,17 +7,17 @@ option, under the options these writes use.
 """
 
 import duckdb
-from qiita_common.parquet import PARQUET_OPTS
+from qiita_common.parquet import PARQUET_OPTS_TRANSFER
 
 
 def test_copy_to_an_existing_parquet_replaces_it(tmp_path):
     out = tmp_path / "feature_map.parquet"
     conn = duckdb.connect()
-    # The setting the mint writes run under; PARQUET_OPTS needs it.
+    # The setting the mint writes run under; PARQUET_OPTS_TRANSFER needs it.
     conn.execute("SET preserve_insertion_order=false")
-    conn.execute(f"COPY (SELECT 1 AS a) TO '{out}' ({PARQUET_OPTS})")
+    conn.execute(f"COPY (SELECT 1 AS a) TO '{out}' ({PARQUET_OPTS_TRANSFER})")
 
-    conn.execute(f"COPY (SELECT 2 AS a UNION ALL SELECT 3) TO '{out}' ({PARQUET_OPTS})")
+    conn.execute(f"COPY (SELECT 2 AS a UNION ALL SELECT 3) TO '{out}' ({PARQUET_OPTS_TRANSFER})")
 
     rows = conn.execute(f"SELECT a FROM read_parquet('{out}') ORDER BY a").fetchall()
     assert rows == [(2,), (3,)]

@@ -24,7 +24,16 @@ from uuid import UUID
 
 import duckdb
 import pytest
+from helpers import (
+    SHRUNK_ROW_GROUP_SIZE_BYTES,
+    WIDE_ROW_COUNT,
+    WIDE_ROW_GROUPS,
+    row_group_rows,
+)
+from qiita_common import parquet
 from qiita_common.chunking import reassemble_chunks_expr
+
+from qiita_compute_orchestrator.miint import apply_duckdb_settings
 
 _REFERENCE_LOAD_LOGGER = "qiita_compute_orchestrator.jobs.reference_load"
 
@@ -287,6 +296,68 @@ def test_chunks_batched_into_disjoint_feature_idx_ranges(staging_inputs, tmp_pat
         ).fetchall()
     fidx_to_canon = {_FEATURE_MAP[_HASHES[n]]: _CANON[n] for n in _TEST_SEQUENCES}
     assert {fidx: canon for fidx, canon in rows} == fidx_to_canon
+
+
+def _write_chunks(tmp_path: Path, widths: list[tuple[int, int]]) -> duckdb.DuckDBPyConnection:
+    """A connection carrying `feature_map`, and one hashed-chunk input part of one chunk per
+    feature: `count` features of `width` characters for each `(count, width)`, in
+    feature_idx order. Each chunk is distinct so no encoder collapses the column."""
+    src = tmp_path / "hashed_chunks"
+    src.mkdir()
+    conn = duckdb.connect(":memory:")
+    apply_duckdb_settings(conn, tmp_path, memory_gb=2, threads=4)
+    arms = []
+    first = 1
+    for count, width in widths:
+        arms.append(
+            f"SELECT range AS feature_idx, {width} AS width FROM range({first}, {first + count})"
+        )
+        first += count
+    conn.execute(
+        "CREATE TEMP TABLE feature_map AS SELECT feature_idx, uuid() AS sequence_hash, width "
+        f"FROM ({' UNION ALL '.join(arms)})"
+    )
+    conn.execute(
+        "COPY (SELECT sequence_hash, 0 AS chunk_index, "
+        "repeat(md5(feature_idx::VARCHAR), 32)[:width] AS chunk_data FROM feature_map) "
+        f"TO '{src / 'part_00000.parquet'}' (FORMAT PARQUET, ROW_GROUP_SIZE 1024)"
+    )
+    return conn
+
+
+def test_chunk_parts_keep_wide_row_groups_under_the_byte_cap(tmp_path, monkeypatch):
+    """Each part's sorted COPY ignores ROW_GROUP_SIZE_BYTES (see
+    `qiita_common.parquet.sorted_row_group_size`), so the writer asks for a row count sized
+    to its chunks. With the cap shrunk to 1 MiB, ~1 KB chunks land one vector per row group
+    instead of the whole part in one."""
+    import qiita_compute_orchestrator.jobs._feature_load as fl
+
+    monkeypatch.setattr(parquet, "ROW_GROUP_SIZE_BYTES", SHRUNK_ROW_GROUP_SIZE_BYTES)
+    out = tmp_path / "reference_sequence_chunks"
+    with _write_chunks(tmp_path, [(WIDE_ROW_COUNT, 1024)]) as conn:
+        fl.write_feature_sequence_chunks(conn, tmp_path / "hashed_chunks", out)
+    parts = sorted(out.glob("part_*.parquet"))
+    assert len(parts) == 1, "one batch's worth of chunks is one part"
+    assert row_group_rows(parts[0]) == WIDE_ROW_GROUPS
+
+
+def test_chunk_parts_size_row_groups_from_their_own_chunks(tmp_path, monkeypatch):
+    """A part's row count follows its own widest chunk, not the whole input's mean. A
+    reference that mixes short records with genomes would otherwise size a part of
+    full-width chunks for the short records, and its row groups would run far past the
+    cap."""
+    import qiita_compute_orchestrator.jobs._feature_load as fl
+
+    monkeypatch.setattr(parquet, "ROW_GROUP_SIZE_BYTES", SHRUNK_ROW_GROUP_SIZE_BYTES)
+    narrow = 5 * WIDE_ROW_COUNT
+    # One batch of the narrow features, then one of the wide.
+    monkeypatch.setattr(fl, "CHUNK_BUDGET_PER_BATCH", narrow)
+    out = tmp_path / "reference_sequence_chunks"
+    with _write_chunks(tmp_path, [(narrow, 32), (WIDE_ROW_COUNT, 1024)]) as conn:
+        fl.write_feature_sequence_chunks(conn, tmp_path / "hashed_chunks", out)
+    narrow_part, wide_part = sorted(out.glob("part_*.parquet"))
+    assert row_group_rows(wide_part) == WIDE_ROW_GROUPS
+    assert row_group_rows(narrow_part)[0] > WIDE_ROW_GROUPS[0]
 
 
 def test_emits_reference_membership_with_reference_idx(staging_inputs, tmp_path):

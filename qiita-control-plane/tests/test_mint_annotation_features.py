@@ -70,7 +70,7 @@ async def test_no_gff_still_writes_a_typed_empty_annotation_map(postgres_pool, t
     annotation set — the empty map must be written, and it must be a real Parquet.
 
     This is a regression test with a specific failure in mind: the map is COPY'd with
-    PARQUET_OPTS (which sets ROW_GROUP_SIZE_BYTES), and DuckDB rejects that at BIND time
+    PARQUET_OPTS_TRANSFER (which sets ROW_GROUP_SIZE_BYTES), and DuckDB rejects that at BIND time
     unless preserve_insertion_order is off. That raises on the ZERO-row write, so it
     broke every reference-add — GFF3 or not — while every GFF-bearing test still passed.
     """

@@ -175,11 +175,12 @@ study** fails the whole accession before anything is written, naming its status
 way (`no public runs`), before the study is even resolved or created. Within an
 otherwise-public study, an individual **suppressed run** is `excluded` — isolated from
 its siblings exactly like an unmappable platform, carrying a `failure_reason` naming
-the run and its status, and contributing no `biosample`/`prep_sample`/`sequenced_sample`
+its status (`run is suppressed`), and contributing no `biosample`/`prep_sample`/`sequenced_sample`
 rows. When a pool was created (at least one run's platform mapped) but every run in
 the item still ends up `excluded` and/or `failed` — none reaches
 `registered`/`skipped_already_present` — the item fails with "every run failed to
-register", naming every excluded or failed run; if no platform ever mapped, no pool
+register", grouping the excluded and failed runs by reason (see *Metadata
+harmonization* below); if no platform ever mapped, no pool
 exists and the item instead fails with "no run mapped to a downloadable pool".
 
 Resolution only sees public records (see `qiita_common.models.ena`), so these checks
@@ -310,16 +311,29 @@ one entry per ENA run carrying its `status` (`registered` / `skipped_already_pre
 `download_failed` — `flagged_unavailable` and `held_not_downloaded` come from a
 re-import's ENA availability re-check, see above) and a `failure_reason` on every
 status but `registered` and `skipped_already_present`. `download_failed` also carries
-a `failure_type`. A
-harmonization error (an unparseable value, or a cross-study metadata slot collision)
-fails the run, surfacing as that run's `status: failed` + `failure_reason`, isolated
-per-run exactly like an unmappable platform or a suppressed run (see *Non-public
-studies and runs* above). A checklist-required field ENA did not supply is not itself
-an error — the checklist binding, not enforcement, is what harmonization records. A
-coordinate past its bound — latitude beyond ±90, or longitude beyond ±180 — is one such
-unparseable value: every run referencing that sample fails until the coordinate is
-corrected at ENA, so a study submitted on a 0–360 longitude convention, where every
-sample is off, fails every run.
+a `failure_type`. A mapped value its global field's type cannot hold (a latitude of
+`39 deg`) does not fail the run: the global field stores `not provided`, the submitted
+text is kept study-local as `<field> (as submitted)`, and the run's harmonization
+warnings name it (unless a raw ENA attribute already carries that `(as submitted)`
+name; then the run fails on the value). A latitude or longitude with its hemisphere
+after it (`39N`, `12.5 W`) is not such a value; it is signed and stored as a number. A
+cross-study metadata slot collision still fails the run, surfacing as that run's
+`status: failed` + `failure_reason`, isolated per-run exactly like an unmappable
+platform or a suppressed run (see *Non-public studies and runs* above). When every run
+fails, the item's `failure_reason` groups the runs by cause, naming each cause once
+with how many runs hit it. A checklist-required field ENA did not supply is not itself
+an error — the checklist binding, not enforcement, is what harmonization records.
+
+**A stored `not provided` is not rewritten by a re-import.** A biosample first
+registered with the fallback (a value its global field could not hold, or a field ENA
+did not supply) keeps that `not provided`: resolve-by-accession returns the existing
+biosample unchanged, so a later re-import of the same accession — or a second study
+linking the same biosample — sees the original value, and the submitted text stays in
+the first study's `<field> (as submitted)`. To correct a value after the fact, fix it
+at ENA and PATCH the biosample's metadata directly
+(`PATCH /study/{study_idx}/biosample/{biosample_idx}/metadata`, or its
+`…/biosample/by-unique-field/metadata` twin); re-importing the accession alone does not
+update it.
 
 **A sample with zero ENA attributes is a legitimate, common result, not an import
 failure.** Real ENA/DDBJ samples sometimes carry no `<SAMPLE_ATTRIBUTE>` elements at

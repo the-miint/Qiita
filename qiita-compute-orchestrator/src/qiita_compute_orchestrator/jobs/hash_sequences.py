@@ -86,8 +86,8 @@ from qiita_common.chunking import (
 from qiita_common.parquet import validate_parquet_path
 
 from ..miint import (
-    PARQUET_OPTS,
-    PARQUET_OPTS_CHUNKED,
+    PARQUET_OPTS_CHUNKED_TRANSFER,
+    PARQUET_OPTS_TRANSFER,
     apply_duckdb_settings,
     duckdb_tmp_dir,
     open_miint_conn,
@@ -277,7 +277,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 "COPY ("
                 "  SELECT read_id, sequence_hash, sequence_length_bp"
                 "  FROM hashed"
-                f") TO '{manifest_out}' ({PARQUET_OPTS})"
+                f") TO '{manifest_out}' ({PARQUET_OPTS_TRANSFER})"
             )
 
             # reference_sequence_chunks/part_00000.parquet — relabel the
@@ -324,7 +324,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 "  SELECT cr.sequence_hash, c.chunk_index, c.chunk_data"
                 "  FROM read_parquet(?) c"
                 "  JOIN canonical cr ON c.read_id = cr.read_id"
-                f") TO '{part_out}' ({PARQUET_OPTS_CHUNKED})",
+                f") TO '{part_out}' ({PARQUET_OPTS_CHUNKED_TRANSFER})",
                 [str(inputs.fasta_path)],
             )
 
@@ -629,7 +629,7 @@ def _write_annotation_manifest(
         # Genomic order — this file is small (one row per annotated interval) and no
         # consumer keys on the order; it is for the human who opens it.
         "  ORDER BY a.parent_read_id, a.position, a.stop_position"
-        f") TO '{out}' ({PARQUET_OPTS})"
+        f") TO '{out}' ({PARQUET_OPTS_TRANSFER})"
     )
     conn.execute("DROP TABLE annotation_extracted")
     conn.execute("DROP TABLE parent_sequence")

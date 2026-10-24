@@ -20,7 +20,9 @@ from typing import get_args
 
 import pytest
 import yaml
-from qiita_common.actions import NATIVE_MODULE_PREFIX, ActionDefinition
+from qiita_common.actions import NATIVE_MODULE_PREFIX, ActionDefinition, FlatBaselineResources
+
+from qiita_compute_orchestrator.miint import duckdb_headroom_gb
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _WORKFLOWS_DIR = _REPO_ROOT / "workflows"
@@ -40,8 +42,8 @@ def _native_steps_with_params() -> list[tuple[str, str, dict[str, str]]]:
     return found
 
 
-def _baseline_cpu_every_version(workflow: str, step: str) -> list[tuple[str, int]]:
-    """`(where, baseline cpu)` for `step` in EVERY on-disk version of
+def _baselines_every_version(workflow: str, step: str) -> list[tuple[str, FlatBaselineResources]]:
+    """`(where, baseline resources)` for `step` in EVERY on-disk version of
     `workflows/<workflow>/`, where `where` is a repo-relative label for the
     assertion message.
 
@@ -53,7 +55,7 @@ def _baseline_cpu_every_version(workflow: str, step: str) -> list[tuple[str, int
 
     A version that does not declare `step` at all contributes nothing rather than
     failing — dropping a step between versions is a legitimate shape change, and
-    there is no cpu to pin on a step that is not there. Every version dropping it
+    there is nothing to pin on a step that is not there. Every version dropping it
     is the different case, and this function raises on it below, so no workflow
     can lose its pin entirely by having its step renamed out from under one. Two
     steps sharing a name — which would make the pin silently cover whichever came
@@ -71,7 +73,7 @@ def _baseline_cpu_every_version(workflow: str, step: str) -> list[tuple[str, int
     """
     yaml_paths = sorted(_WORKFLOWS_DIR.glob(f"{workflow}/*.yaml"))
     assert yaml_paths, f"no workflow YAML under workflows/{workflow}/"
-    found: list[tuple[str, int]] = []
+    found: list[tuple[str, FlatBaselineResources]] = []
     for yaml_path in yaml_paths:
         action = ActionDefinition.model_validate(yaml.safe_load(yaml_path.read_text()))
         pairs = [
@@ -80,11 +82,16 @@ def _baseline_cpu_every_version(workflow: str, step: str) -> list[tuple[str, int
             if label == step or label.startswith(f"{step}[")
         ]
         where = str(yaml_path.relative_to(_REPO_ROOT))
-        found.extend((f"{where} {label}", flat.cpu) for label, flat in pairs)
+        found.extend((f"{where} {label}", flat) for label, flat in pairs)
     assert found, (
         f"no version under workflows/{workflow}/ declares a {step} step, so this pin covers nothing"
     )
     return found
+
+
+def _baseline_cpu_every_version(workflow: str, step: str) -> list[tuple[str, int]]:
+    """`(where, baseline cpu)` for each `_baselines_every_version` entry."""
+    return [(where, flat.cpu) for where, flat in _baselines_every_version(workflow, step)]
 
 
 def test_baseline_cpu_helper_reads_both_resource_populations():
@@ -274,6 +281,63 @@ def test_build_shard_index_bowtie2_cpu_pins_duckdb_threads():
             f"build_bowtie2_index._DUCKDB_THREADS={mod._DUCKDB_THREADS}; this step "
             "computes rather than waiting on its stream, so the pool and the cores it "
             "runs on must be changed together"
+        )
+
+
+def test_fastq_to_parquet_cpu_pins_duckdb_threads():
+    """`fastq-to-parquet`'s `fastq` step: baseline `cpu:` must equal
+    `fastq_to_parquet._DUCKDB_THREADS`, in every version.
+
+    The step's cores are spent by its DuckDB pool, and above all by the final write's
+    at-rest compression (see `qiita_common.parquet.sorted_row_group_size`). A `cpu:` above
+    the literal allocates cores nothing uses; one below it oversubscribes the pool onto
+    fewer. The measurement behind the literal is stated once, on `_DUCKDB_THREADS`.
+    """
+    mod = importlib.import_module("qiita_compute_orchestrator.jobs.fastq_to_parquet")
+    for where, cpu in _baseline_cpu_every_version("fastq-to-parquet", "fastq"):
+        assert cpu == mod._DUCKDB_THREADS, (
+            f"{where} baseline cpu={cpu} but "
+            f"fastq_to_parquet._DUCKDB_THREADS={mod._DUCKDB_THREADS}; the pool is what "
+            "the cores are for, so these must be changed together"
+        )
+
+
+def test_fastq_to_parquet_mem_covers_its_duckdb_limit_and_headroom():
+    """`fastq-to-parquet`'s `fastq` step: baseline `mem_gb:` must cover
+    `fastq_to_parquet._DUCKDB_MEMORY_GB` plus `duckdb_headroom_gb(_DUCKDB_THREADS)`, in
+    every version.
+
+    That limit is a literal, not sized from the cgroup (fastq_to_parquet.py says so at
+    its DuckDB resource caps), so nothing at runtime shrinks it to fit. A cgroup below
+    the sum leaves DuckDB's above-limit overshoot nowhere to go, and the kernel kills
+    the step where DuckDB would have spilled. The headroom grows with the thread count,
+    so raising the pool without the memory fails here.
+    """
+    mod = importlib.import_module("qiita_compute_orchestrator.jobs.fastq_to_parquet")
+    need = mod._DUCKDB_MEMORY_GB + duckdb_headroom_gb(mod._DUCKDB_THREADS)
+    for where, flat in _baselines_every_version("fastq-to-parquet", "fastq"):
+        assert flat.mem_gb >= need, (
+            f"{where} baseline mem_gb={flat.mem_gb} is below fastq_to_parquet's DuckDB "
+            f"limit {mod._DUCKDB_MEMORY_GB} GB + headroom "
+            f"{duckdb_headroom_gb(mod._DUCKDB_THREADS)} GB at "
+            f"{mod._DUCKDB_THREADS} threads = {need} GB"
+        )
+
+
+def test_golay_demux_cpu_pins_duckdb_threads():
+    """`golay-demux`'s `golay_demux` step: baseline `cpu:` must equal
+    `golay_demux._DUCKDB_THREADS`.
+
+    Its per-prep_sample writes run one at a time, each a sorted COPY at the at-rest zstd
+    level, so the pool is what the step's cores are for, as on `fastq_to_parquet`'s pin
+    above.
+    """
+    mod = importlib.import_module("qiita_compute_orchestrator.jobs.golay_demux")
+    for where, cpu in _baseline_cpu_every_version("golay-demux", "golay_demux"):
+        assert cpu == mod._DUCKDB_THREADS, (
+            f"{where} baseline cpu={cpu} but "
+            f"golay_demux._DUCKDB_THREADS={mod._DUCKDB_THREADS}; the pool is what the "
+            "cores are for, so these must be changed together"
         )
 
 

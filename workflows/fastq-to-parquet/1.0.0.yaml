@@ -89,13 +89,13 @@ steps:
     optional_inputs: [reverse_fastq_path]
     outputs: [reads]
     baseline_resources:
-      cpu: 2
+      cpu: 8
       # Sized for long-read inputs; the per-thread resident derivation, the
-      # mem_gb - 1 split leaving process headroom outside DuckDB, and the two known
+      # headroom left outside DuckDB's limit, and the two known
       # gaps in that sizing (the limit does not track the cgroup, and the final
       # blocking COPY is the shape that OOMed on real long reads in bam_to_parquet)
       # are all stated at fastq_to_parquet.py's DuckDB resource caps.
-      mem_gb: 8
+      mem_gb: 13
       walltime: PT30M
 
 action_ceiling:

@@ -28,7 +28,14 @@ import asyncio
 
 import duckdb
 import pytest
-from helpers import write_chunked_blob_upload
+from helpers import (
+    SHRUNK_ROW_GROUP_SIZE_BYTES,
+    WIDE_ROW_GROUPS,
+    row_group_rows,
+    wide_reads,
+    write_chunked_blob_upload,
+)
+from qiita_common import parquet
 from qiita_common.backend_failure import StepNoData
 from qiita_common.models import WorkTicketState
 
@@ -127,6 +134,23 @@ def test_execute_writes_reads_parquet_for_fastq(fake_mint, tmp_path):
     # qual1 is UTINYINT[] (phred-decoded), not the ASCII string.
     assert by_read_id["r1"][3] == [0, 0, 0, 0]
     assert by_read_id["r2"][3] == [2, 2, 2, 2]
+
+
+def test_execute_keeps_wide_row_groups_under_the_byte_cap(fake_mint, monkeypatch, tmp_path):
+    """The final sorted COPY ignores ROW_GROUP_SIZE_BYTES (see
+    `qiita_common.parquet.sorted_row_group_size`), so it asks for a row count sized to the
+    reads. With the cap shrunk to 1 MiB, ~1 KB reads land one vector per row group instead
+    of the whole read set in one."""
+    monkeypatch.setattr(parquet, "ROW_GROUP_SIZE_BYTES", SHRUNK_ROW_GROUP_SIZE_BYTES)
+    fastq = tmp_path / "in.fastq"
+    fastq.write_text(
+        "".join(f"@{rid}\n{bases}\n+\n{'I' * len(bases)}\n" for rid, bases in wide_reads())
+    )
+    outputs = _run(
+        Inputs(fastq_path=fastq, prep_sample_idx=42, work_ticket_idx=1),
+        tmp_path / "ws",
+    )
+    assert row_group_rows(outputs["reads"]) == WIDE_ROW_GROUPS
 
 
 def test_execute_handles_fasta_with_null_quality(fake_mint, tmp_path):

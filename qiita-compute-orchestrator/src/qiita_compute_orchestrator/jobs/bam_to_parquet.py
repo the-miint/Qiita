@@ -49,16 +49,17 @@ import duckdb
 from pydantic import BaseModel
 from qiita_common.backend_failure import BackendFailure, FailureKind, StepNoData
 from qiita_common.models import WorkTicketFailureStage
-from qiita_common.parquet import validate_parquet_path
+from qiita_common.parquet import sorted_row_group_size, validate_parquet_path
 
 from ..cp_client import make_cp_client
 from ..miint import (
-    PARQUET_OPTS,
+    PARQUET_OPTS_AT_REST,
     PARQUET_OPTS_INTERMEDIATE,
     apply_duckdb_settings,
     duckdb_tmp_dir,
     open_conn,
     open_miint_conn,
+    parquet_bytes_per_row,
     resolve_duckdb_memory_gb,
 )
 from ..sequence_range_retry import mint_or_reuse_sequence_range
@@ -78,7 +79,7 @@ YAML_STEP_NAME = "bam"
 # backend / tests), where there is no cgroup to read; it is NOT the YAML baseline
 # minus headroom, and deliberately stays small so a dev box isn't asked for 29 GB.
 #
-# Peak memory is flat in the sample: the reads are written in bounded batches (see
+# Peak memory is flat in the read set's size: the reads are written in bounded batches (see
 # _write_read_parts), and the parse streams (read_sequences_sam projects the aux tags
 # away rather than materialising them). The one term that still scales with the input
 # is `count(DISTINCT read_id)` — a blocking hash aggregate, O(distinct read_ids). At a
@@ -95,7 +96,7 @@ _DUCKDB_THREADS = 2
 # There is deliberately NO plan(). Peak memory is flat in the batch, not the input, so
 # a down-only sizing hint has nothing useful to lower; and a walltime hint risks
 # burning one of the ticket's three shared retries on a TIMEOUT. What scales with a
-# long sample is walltime, which is where the ceiling headroom sits.
+# long read set is walltime, which is where the ceiling headroom sits.
 _ROWS_PER_PART_TARGET_BYTES = 1024**3
 
 
@@ -137,51 +138,37 @@ def _write_read_parts(
         COPY (SELECT ... FROM read_parquet(intermediate) ORDER BY sequence_idx)
         TO 'read.parquet'
 
-    — is a BLOCKING sort over the full seq+qual payload. For a PacBio HiFi sample
+    — is a BLOCKING sort over the full seq+qual payload. For a PacBio HiFi prep_sample
     (~15-25 kB per read, millions of reads) that is tens of GB, and it is exactly
     where the first real PacBio run died. Paying for it with a bigger allocation
     would be paying for work we do not need to do.
 
-    What the ORDER BY actually buys is NOT a globally sorted file — `PARQUET_OPTS`
-    says so explicitly: with `preserve_insertion_order=false` (which
-    `ROW_GROUP_SIZE_BYTES` requires) "row groups land in thread-finish order". What
-    it buys is that each row group stays CLUSTERED on the sort key, giving tight
-    per-group min/max, which is what DuckLake pruning and Parquet predicate pushdown
-    actually read.
+    What pruning reads from the sorted file is not its row order but each row group's
+    min/max on the sort key: DuckLake pruning and Parquet predicate pushdown both work
+    from those stats, and the sort gives every row group a tight, disjoint window.
 
-    Clustering does not need a global sort, because the data is already monotone:
+    That does not need a global sort, because the data is already monotone:
     `sequence_idx = sequence_index + start - 1`, and `sequence_index` is
     read_sequences_sam's per-file 1-based ordinal. So we slice on `sequence_index`
     and write one part per slice. Every row in part N has a sequence_idx strictly
     below every row in part N+1, so each part's row groups carry a tight, disjoint
     min/max — the same pruning the global sort produced. The ORDER BY inside a part
     then sorts at most `_ROWS_PER_PART_TARGET_BYTES` worth of payload, so peak memory
-    is bounded by the batch, not by the sample.
+    is bounded by the batch, not by the prep_sample.
 
     The multi-file table shape is not new: `register-files` maps a top-level subdir
     of `part_*.parquet` to the table named after the directory, which is what
     reference_load and hash_sequences already do — and for this same reason (a
     single-file sort+write of a large payload OOMs DuckDB).
     """
-    # Size the batch from the intermediate's UNCOMPRESSED payload, read from the
-    # Parquet footer (parquet_metadata is metadata-only — no data scan). Row count
-    # alone would be a poor proxy: HiFi reads are ~100x an Illumina read.
-    uncompressed_bytes = conn.execute(
-        "SELECT sum(total_uncompressed_size) FROM parquet_metadata(?)",
-        [str(intermediate)],
-    ).fetchone()[0]
-    if not uncompressed_bytes:
-        # Coalescing this to 0 would make bytes_per_row 1 and rows_per_part ~1e9 —
-        # i.e. ONE part, an unbounded sort over the whole sample. That is exactly the
-        # OOM this batching exists to remove, and it would come back silently. The
-        # footer of a non-empty Parquet always reports a size, so a missing one means
-        # something is wrong with the intermediate; say so.
-        raise ValueError(
-            f"parquet_metadata reported no uncompressed size for {intermediate} "
-            f"({count} rows) — cannot size the output batches"
-        )
-    bytes_per_row = max(1, uncompressed_bytes // count)
+    # Size the parts and their row groups from the intermediate's uncompressed
+    # payload, read from the Parquet footer. Row count alone would be a poor proxy:
+    # HiFi reads are ~100x an Illumina read. A footer with no size raises rather than
+    # sizing for 1-byte rows, which would make one part — an unbounded sort over the
+    # whole read set, exactly the OOM this batching exists to remove.
+    bytes_per_row = parquet_bytes_per_row(conn, intermediate)
     rows_per_part = max(1, _ROWS_PER_PART_TARGET_BYTES // bytes_per_row)
+    row_group_size = sorted_row_group_size(bytes_per_row)
 
     # Created here, not up front: a run that fails before this point (bad input, a
     # duplicate QNAME, a refused mint) must leave NO output directory behind for the
@@ -199,11 +186,11 @@ def _write_read_parts(
             "  read_id, sequence1, qual1, sequence2, qual2 "
             "FROM read_parquet(?) "
             "WHERE sequence_index BETWEEN ? AND ? "
-            # Bounded: at most one batch's payload, not the whole sample. Still
+            # Bounded: at most one batch's payload, not the whole read set. Still
             # explicit — preserve_insertion_order=false means DuckDB is free to emit
             # a batch's rows out of order, and the clustering is the point.
             "ORDER BY sequence_idx ) "
-            f"TO '{part}' ({PARQUET_OPTS})",
+            f"TO '{part}' ({PARQUET_OPTS_AT_REST}, ROW_GROUP_SIZE {row_group_size})",
             [prep_sample_idx, sequence_idx_start, str(intermediate), lo, hi],
         )
         parts += 1
@@ -211,7 +198,7 @@ def _write_read_parts(
     # The slicing above assumes `sequence_index` is DENSE 1..count (miint's per-file
     # ordinal; pinned in tests/jobs/test_bam_to_parquet_miint_contract.py). If that
     # ever stopped holding, the WHERE clauses would silently DROP rows and we would
-    # register a short sample — reads missing from the lake, with no error anywhere.
+    # register a short read set — reads missing from the lake, with no error anywhere.
     # The old single COPY had no WHERE and so could not do that. Footer-only count,
     # no data scan.
     written = conn.execute(

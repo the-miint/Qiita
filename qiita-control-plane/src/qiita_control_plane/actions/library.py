@@ -57,7 +57,7 @@ from qiita_common.models.ena_import import FailedRunOutcome
 from qiita_common.parquet import (
     PARQUET_COMPRESSION,
     PARQUET_COMPRESSION_INTERMEDIATE,
-    PARQUET_OPTS,
+    PARQUET_OPTS_TRANSFER,
     ROW_GROUP_SIZE_BYTES,
     validate_parquet_path,
 )
@@ -567,7 +567,7 @@ async def mint_features(
     read_conn = duckdb_connect()
     write_conn = duckdb_connect()
     try:
-        # ROW_GROUP_SIZE_BYTES in PARQUET_OPTS requires
+        # ROW_GROUP_SIZE_BYTES in PARQUET_OPTS_TRANSFER requires
         # preserve_insertion_order=false (DuckDB errors at bind time
         # otherwise). The COPY's explicit ORDER BY still clusters each row
         # group tightly by feature_idx — which is what row-group pushdown reads.
@@ -608,7 +608,7 @@ async def mint_features(
         await asyncio.to_thread(
             write_conn.execute,
             "COPY (SELECT DISTINCT sequence_hash, feature_idx FROM feature_map "
-            f"      ORDER BY feature_idx) TO '{out}' ({PARQUET_OPTS})",
+            f"      ORDER BY feature_idx) TO '{out}' ({PARQUET_OPTS_TRANSFER})",
         )
     finally:
         read_conn.close()
@@ -732,7 +732,7 @@ async def _write_annotation_claims(
     read_conn = duckdb_connect()
     write_conn = duckdb_connect()
     try:
-        # ROW_GROUP_SIZE_BYTES in PARQUET_OPTS requires preserve_insertion_order=false —
+        # ROW_GROUP_SIZE_BYTES in PARQUET_OPTS_TRANSFER requires preserve_insertion_order=false —
         # DuckDB errors at BIND time otherwise, so this fires on the zero-annotation
         # write too (i.e. on every reference-add, GFF3 or not). Same rule as
         # mint_features' write connection; the COPY's explicit ORDER BY is what actually
@@ -839,7 +839,8 @@ async def _write_annotation_claims(
 def _copy_annotation_map(write_conn: duckdb.DuckDBPyConnection, out_path: Path) -> None:
     out = validate_parquet_path(out_path)
     write_conn.execute(
-        f"COPY (SELECT * FROM annotation_map ORDER BY annotation_idx) TO '{out}' ({PARQUET_OPTS})"
+        f"COPY (SELECT * FROM annotation_map ORDER BY annotation_idx) "
+        f"TO '{out}' ({PARQUET_OPTS_TRANSFER})"
     )
 
 

@@ -15,7 +15,11 @@ from pathlib import Path
 
 import pytest
 import pytest_asyncio
-from qiita_common.models import LEGACY_IDX_RESERVED_CEILING, FieldDataType
+from qiita_common.models import (
+    LEGACY_IDX_RESERVED_CEILING,
+    MISSING_REASON_NOT_PROVIDED,
+    FieldDataType,
+)
 from qiita_common.models.ena import (
     EnaRunRecord,
     EnaSampleAttributes,
@@ -354,9 +358,9 @@ async def test_harmonized_attributes_land_on_global_fields_and_checklist(reg):
     }
 
 
-async def test_out_of_range_longitude_fails_the_run_with_the_range_reason(reg):
-    # A longitude past +/-180 names no place, so the run fails rather than storing a
-    # number every reader would have to range-check -- with the bound in the reason.
+async def test_out_of_range_longitude_is_kept_as_submitted(reg):
+    # A longitude past +/-180 is unparseable (range, not just type), so the run keeps it
+    # as submitted rather than failing.
     study_accession = unique_ena_accession("PRJNA")
     sample_accession = unique_accession("SAMN")
     run = _run(
@@ -375,15 +379,31 @@ async def test_out_of_range_longitude_fails_the_run_with_the_range_reason(reg):
     )
 
     outcome = result.ena_runs[0]
-    assert outcome.status == EnaRunRegistrationStatus.FAILED
-    assert outcome.failure_reason is not None
-    assert "-180 and 180 degrees" in outcome.failure_reason
+    assert outcome.status == EnaRunRegistrationStatus.REGISTERED, outcome.failure_reason
+    assert outcome.harmonization is not None
+    assert any("-180 and 180 degrees" in w for w in outcome.harmonization.warnings)
 
-    # The failed run leaves no biosample behind -- its per-run transaction rolled back.
-    biosample_count = await reg["pool"].fetchval(
-        "SELECT count(*) FROM qiita.biosample WHERE ena_sample_accession = $1", sample_accession
+    biosample_idx = await reg["pool"].fetchval(
+        "SELECT idx FROM qiita.biosample WHERE ena_sample_accession = $1", sample_accession
     )
-    assert biosample_count == 0
+    assert biosample_idx is not None
+
+    # The global longitude field stores `not provided`; the submitted text is kept local.
+    lon_missing_reason = await reg["pool"].fetchval(
+        "SELECT bm.value_missing_reason_idx FROM qiita.biosample_metadata bm"
+        " JOIN qiita.biosample_global_field gf ON gf.idx = bm.global_field_idx"
+        " WHERE bm.biosample_idx = $1 AND gf.display_name = 'geographic location (longitude)'",
+        biosample_idx,
+    )
+    assert lon_missing_reason is not None
+    lon_submitted = await reg["pool"].fetchval(
+        "SELECT bm.value_text FROM qiita.biosample_metadata bm"
+        " JOIN qiita.biosample_study_field bsf ON bsf.idx = bm.biosample_study_field_idx"
+        " WHERE bm.biosample_idx = $1"
+        " AND bsf.display_name = 'geographic location (longitude) (as submitted)'",
+        biosample_idx,
+    )
+    assert lon_submitted == "200"
 
 
 async def test_shared_biosample_harmonizes_once_across_two_studies(reg):
@@ -445,56 +465,66 @@ async def test_shared_biosample_harmonizes_once_across_two_studies(reg):
     assert linked_studies == {result_a.study_idx, result_b.study_idx}
 
 
-async def test_harmonization_parse_failure_isolated_to_its_run(reg):
-    """An unparseable mapped value fails only that run -- same per-run isolation as a
-    platform/protocol-mapping failure; never aborts siblings or the study."""
+async def test_unparseable_mapped_value_is_kept_study_local_and_the_run_registers(reg):
+    """A mapped value its global field's type cannot hold no longer fails the run: the
+    global gets `not provided` and the submitted text is kept study-local, with a
+    warning. A hemisphere-suffixed coordinate is signed, not treated as unparseable."""
     study_accession = unique_ena_accession("PRJNA")
     header = _study_header(study_accession=study_accession)
-
-    ok_sample_accession = unique_accession("SAMN")
-    ok_run = _run(
+    sample_accession = unique_accession("SAMN")
+    run = _run(
         run_accession=unique_accession("SRR"),
         experiment_accession=unique_accession("SRX"),
-        sample_accession=ok_sample_accession,
+        sample_accession=sample_accession,
         study_accession=study_accession,
     )
-    ok_attrs = _mixs_sample_attributes(ok_sample_accession)
-
-    bad_sample_accession = unique_accession("SAMN")
-    bad_run = _run(
-        run_accession=unique_accession("SRR"),
-        experiment_accession=unique_accession("SRX"),
-        sample_accession=bad_sample_accession,
-        study_accession=study_accession,
-    )
-    # 'latitude' is NUMERIC-typed; non-numeric, non-missing-marker text is a parse
-    # error, not a missing-required-field gap.
-    bad_attrs = _mixs_sample_attributes(
-        bad_sample_accession, **{"geographic location (latitude)": "not-a-number"}
+    attrs = _mixs_sample_attributes(
+        sample_accession,
+        **{
+            "geographic location (latitude)": "39N",
+            # a latitude-axis hemisphere is not signed onto a longitude
+            "geographic location (longitude)": "117N",
+        },
     )
 
-    result = await _register(
-        reg,
-        study_header=header,
-        ena_runs=[ok_run, bad_run],
-        sample_attributes=[ok_attrs, bad_attrs],
+    result = await _register(reg, study_header=header, ena_runs=[run], sample_attributes=[attrs])
+
+    outcome = result.ena_runs[0]
+    assert outcome.status == EnaRunRegistrationStatus.REGISTERED
+    assert outcome.harmonization is not None
+    assert "geographic location (longitude) (as submitted)" in (
+        outcome.harmonization.retained_unmapped
+    )
+    assert any(
+        "'geographic location (longitude)' value '117N'" in w
+        for w in outcome.harmonization.warnings
     )
 
-    outcomes_by_accession = {o.run_accession: o for o in result.ena_runs}
-    ok_outcome = outcomes_by_accession[ok_run.run_accession]
-    assert ok_outcome.status == EnaRunRegistrationStatus.REGISTERED
-    assert ok_outcome.harmonization is not None
-
-    bad_outcome = outcomes_by_accession[bad_run.run_accession]
-    assert bad_outcome.status == EnaRunRegistrationStatus.FAILED
-    assert bad_outcome.failure_reason is not None
-
-    # No orphan rows for the failed run -- its per-run transaction rolled back.
-    orphan_biosample_count = await reg["pool"].fetchval(
-        "SELECT count(*) FROM qiita.biosample WHERE ena_sample_accession = $1",
-        bad_sample_accession,
+    biosample_idx = await reg["pool"].fetchval(
+        "SELECT idx FROM qiita.biosample WHERE ena_sample_accession = $1", sample_accession
     )
-    assert orphan_biosample_count == 0
+    rows = await reg["pool"].fetch(
+        "SELECT gf.display_name, bm.value_numeric, mvr.name AS missing_reason"
+        " FROM qiita.biosample_metadata bm"
+        " JOIN qiita.biosample_global_field gf ON gf.idx = bm.global_field_idx"
+        " LEFT JOIN qiita.missing_value_reason mvr ON mvr.idx = bm.value_missing_reason_idx"
+        " WHERE bm.biosample_idx = $1",
+        biosample_idx,
+    )
+    by_display_name = {r["display_name"]: r for r in rows}
+    assert by_display_name["geographic location (latitude)"]["value_numeric"] == Decimal("39")
+    longitude = by_display_name["geographic location (longitude)"]
+    assert longitude["value_numeric"] is None
+    assert longitude["missing_reason"] == MISSING_REASON_NOT_PROVIDED
+
+    submitted = await reg["pool"].fetchval(
+        "SELECT bm.value_text FROM qiita.biosample_metadata bm"
+        " JOIN qiita.biosample_study_field bsf ON bsf.idx = bm.biosample_study_field_idx"
+        " WHERE bm.biosample_idx = $1 AND bm.global_field_idx IS NULL"
+        " AND bsf.display_name = 'geographic location (longitude) (as submitted)'",
+        biosample_idx,
+    )
+    assert submitted == "117N"
 
 
 async def test_underscore_mixs_tags_harmonize_to_correct_global_fields(reg):
@@ -2028,9 +2058,8 @@ async def test_non_public_run_isolated_others_registered(reg):
 
     excluded_outcome = outcomes_by_accession[suppressed_run.run_accession]
     assert excluded_outcome.status == EnaRunRegistrationStatus.EXCLUDED
-    assert excluded_outcome.failure_reason is not None
-    assert suppressed_run.run_accession in excluded_outcome.failure_reason
-    assert "suppressed" in excluded_outcome.failure_reason
+    # the reason leaves the accession to the outcome, so runs sharing a status group
+    assert excluded_outcome.failure_reason == "run is suppressed"
 
     # No orphan rows for the excluded run -- it never reaches a per-run write.
     orphan_sequenced_sample_count = await reg["pool"].fetchval(

@@ -107,16 +107,17 @@ import duckdb
 from pydantic import BaseModel
 from qiita_common.backend_failure import StepNoData
 from qiita_common.duckdb_miint import is_empty_sequence_file
-from qiita_common.parquet import validate_parquet_path
+from qiita_common.parquet import sorted_row_group_size, validate_parquet_path
 
 from ..cp_client import make_cp_client
 from ..miint import (
-    PARQUET_OPTS,
+    PARQUET_OPTS_AT_REST,
     PARQUET_OPTS_INTERMEDIATE,
     apply_duckdb_settings,
     duckdb_tmp_dir,
     open_conn,
     open_miint_conn,
+    parquet_bytes_per_row,
 )
 from ..read_count import write_read_count
 from ..sequence_range_retry import mint_or_reuse_sequence_range
@@ -132,26 +133,35 @@ from ._blob_input import resolve_reads_blob_input
 # instead of duplicating the literal in step_name assertions.
 YAML_STEP_NAME = "fastq"
 
-# DuckDB resource caps for this step. The YAML allocation
-# (workflows/fastq-to-parquet/1.0.0.yaml: mem_gb=8, cpu=2) sizes the
-# SLURM cgroup; DuckDB's own caps sit just below (`mem_gb - 1` leaves
-# ~1 GB for Python/miint/OS overhead). Long-read inputs need this
-# safely above ~2.4 GB resident per thread (2048 STANDARD_VECTOR_SIZE
-# × 60 default Parquet row_group_size × ~20 KB avg long-read record
-# incl. quality); 7 GB is comfortably above that.
+# DuckDB resource caps for this step. The YAML allocation sizes the SLURM
+# cgroup: in every workflows/fastq-to-parquet/ version, `cpu` is
+# _DUCKDB_THREADS and `mem_gb` covers _DUCKDB_MEMORY_GB plus
+# `duckdb_headroom_gb(_DUCKDB_THREADS)` for Python/miint/OS and DuckDB's
+# above-limit overshoot (a workflow test pins both).
+# A thread's writer state is about one row group: ~2.4 GB of long reads at
+# DuckDB's default 122,880 rows (2048 STANDARD_VECTOR_SIZE × 60 × ~20 KB avg
+# long-read record incl. quality), but both COPYs here cap it near 64 MB —
+# ROW_GROUP_SIZE_BYTES on the unsorted intermediate write, and
+# `sorted_row_group_size` on the final sorted one. So 8 threads hold well
+# under 1 GB of it, and the rest of the 7 GB is for the final COPY's sort,
+# which spills past the limit. That split is derived, not measured.
 #
-# TWO KNOWN GAPS vs bam_to_parquet, both tracked (see the issue below), both
-# deliberately not fixed in the PR that introduced this note:
+# TWO KNOWN GAPS vs bam_to_parquet:
 #
 #   1. This limit is NOT sized from the real cgroup, so the runner's OOM escalation
 #      cannot reach DuckDB here — an escalated retry re-OOMs at this same value.
 #   2. The final write is still ONE blocking `COPY ... ORDER BY sequence_idx` over
 #      the full seq+qual payload. bam_to_parquet now batches that into bounded
-#      monotone parts precisely because it OOM'd on real long reads. The claim above
-#      that 7 GB "covers long-read inputs" is the same claim that proved false there,
-#      and an ONT run arrives through THIS path as FASTQ.
+#      monotone parts precisely because it OOM'd on real long reads. A memory sizing
+#      like the one above proved false there, and an ONT run arrives through THIS
+#      path as FASTQ.
 _DUCKDB_MEMORY_GB = 7
-_DUCKDB_THREADS = 2
+# 8 threads because the final write compresses at the at-rest zstd level, one row
+# group per thread. On an unsorted COPY of synthetic paired reads, whose row groups
+# the byte cap keeps as small as `sorted_row_group_size` keeps the sorted write's,
+# that level's added cost measured ~99 s per GB of logical read data at 2 threads and
+# ~46 s at 8 (DuckDB 1.5.5, a shared 32-core dev box, fastest of repeats).
+_DUCKDB_THREADS = 8
 
 
 class Inputs(BaseModel):
@@ -366,6 +376,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             # 1), so adding it to the sort key orders nothing — the output
             # is identical to sorting by (prep_sample_idx, sequence_idx),
             # the `read` table's join key, for row-group pruning.
+            row_group_size = sorted_row_group_size(parquet_bytes_per_row(conn, intermediate))
             conn.execute(
                 "COPY ( SELECT "
                 "  ?::BIGINT AS prep_sample_idx,"
@@ -373,7 +384,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 "  read_id, sequence1, qual1, sequence2, qual2 "
                 "FROM read_parquet(?) "
                 "ORDER BY sequence_idx ) "
-                f"TO '{out}' ({PARQUET_OPTS})",
+                f"TO '{out}' ({PARQUET_OPTS_AT_REST}, ROW_GROUP_SIZE {row_group_size})",
                 [inputs.prep_sample_idx, sequence_idx_start, str(intermediate)],
             )
             # Emit the raw read count: the reads out of bcl-convert,
