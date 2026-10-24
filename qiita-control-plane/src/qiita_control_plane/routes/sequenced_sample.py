@@ -14,8 +14,7 @@ caller-creator semantics on the path's `sequenced_pool` (via
 listed in the body (via `require_caller_has_admin_on_all_studies`), both with
 a wet_lab_admin+ bypass. The run-scoped and single-resource reads gate on
 Scope.PREP_SAMPLE_READ + wet_lab_admin role unconditionally; the study-scoped
-reads gate on study existence plus a study-access tier — viewer for the roster
-read, an interim ADMIN clamp for the single read — with wet_lab_admin and
+reads gate on study existence plus viewer study access, with wet_lab_admin and
 system_admin bypassing, mirroring the biosample reads. All handlers delegate
 their DB work to the sibling repository modules.
 """
@@ -778,12 +777,14 @@ async def get_sequenced_sample_in_study(
     sequenced_sample + supertype prep_sample row, its globally-linked
     prep_sample metadata, and this study's purely-local prep_sample metadata.
 
-    Access policy is interim: gated at Tier.ADMIN study access with a
-    wet_lab_admin+ role bypass -- a coarse stand-in until per-field
-    visibility-tier enforcement lands, at which point this relaxes. 401 on
-    Anonymous, 403 on missing scope or sub-ADMIN tier, 404 on a study that does
-    not exist. require_study_exists composes alongside require_study_access so
-    an admin-bypass caller still gets 404 on a non-existent study.
+    Gated at Tier.VIEWER study access with a wet_lab_admin+ role bypass. 401 on
+    Anonymous, 403 on missing scope or on a caller who neither owns the study
+    nor holds a grant on it, 404 on a study that does not exist.
+    require_study_exists composes alongside require_study_access so a bypass
+    caller still gets 404 on a non-existent study.
+
+    Both metadata maps carry only the values the caller's tier reaches; the rest
+    are absent (docs/architecture/data-model.md, "Metadata visibility tiers").
 
     The prep_sample must be linked to this study: a sequenced_sample whose
     supertype prep_sample has no non-retired prep_sample_to_study link to

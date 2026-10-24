@@ -3535,7 +3535,7 @@ async def test_get_sequenced_sample_in_study_returns_global_and_local_metadata(c
     globally-linked prep_sample metadata value and a purely-local prep_sample
     row: the study-scoped GET returns the joined row, global_metadata keyed by
     internal_name, and local_metadata keyed by display_name, with an ETag. The
-    caller is wet_lab_admin, whose role bypasses the ADMIN tier clamp.
+    caller is wet_lab_admin, whose role reads every value.
     """
     seeded = await _seed_one_sequenced_sample(
         ctx,
@@ -3600,9 +3600,8 @@ async def test_get_sequenced_sample_in_study_returns_global_and_local_metadata(c
 
 async def test_get_sequenced_sample_in_study_admin_tier_returns_response(ctx):
     """Tests the case where a regular user holds ADMIN study access (not the
-    role bypass): the ADMIN tier clamp is satisfied by the study_access row, so
-    the study-scoped GET returns 200 with empty metadata dicts for a bare
-    sequenced_sample.
+    role bypass): the study_access row admits them, so the study-scoped GET
+    returns 200 with empty metadata dicts for a bare sequenced_sample.
     """
     seeded = await _seed_one_sequenced_sample(ctx, "get-admin-tier")
     await _grant_study_access(

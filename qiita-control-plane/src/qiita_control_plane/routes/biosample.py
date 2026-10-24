@@ -809,12 +809,12 @@ async def lookup_biosample_in_study_by_unique_field(
 
     The named field must exist on the study and must declare unique_in_study
     (otherwise 422, since its values could name several samples). A well-formed
-    pair naming no sample is 404.
+    pair naming no sample is 404, and so is one whose value the caller's tier
+    does not reach, in the same words: a lookup must not confirm a value its
+    caller could not read.
 
-    Access and the remaining refusals are those of the by-idx read: Tier.ADMIN
-    study access with a wet_lab_admin+ role bypass as an interim stand-in until
-    per-field visibility-tier enforcement lands, and a retired biosample or
-    retired link answering 404.
+    Access, the metadata the response carries, and the remaining refusals are
+    those of the by-idx read, a retired biosample or retired link answering 404.
     """
     # One REPEATABLE READ snapshot spanning resolution and the read, so the
     # value that resolved the idx and the row read back cannot straddle a
@@ -862,12 +862,14 @@ async def get_biosample_in_study(
     """Return one study's view of a biosample: the core row, its globally-linked
     metadata, and this study's purely-local metadata.
 
-    Access policy is interim: gated at Tier.ADMIN study access with a
-    wet_lab_admin+ role bypass -- a coarse stand-in until per-field
-    visibility-tier enforcement lands. 401 on Anonymous, 403 on missing scope or
-    sub-ADMIN tier, 404 on a study that does not exist. require_study_exists
-    composes alongside require_study_access so an admin-bypass caller still gets
-    404 on a non-existent study.
+    Gated at Tier.VIEWER study access with a wet_lab_admin+ role bypass. 401 on
+    Anonymous, 403 on missing scope or on a caller who neither owns the study
+    nor holds a grant on it, 404 on a study that does not exist.
+    require_study_exists composes alongside require_study_access so a bypass
+    caller still gets 404 on a non-existent study.
+
+    Both metadata maps carry only the values the caller's tier reaches; the rest
+    are absent (docs/architecture/data-model.md, "Metadata visibility tiers").
 
     The biosample must be linked to this study: a nonexistent biosample_idx and
     one with no non-retired biosample_to_study link to study_idx share the same
@@ -875,11 +877,8 @@ async def get_biosample_in_study(
     retirement is evaluated only after the link passes, and a retired biosample
     is likewise 404 (mirroring the biosample-level read's retired carve-out).
 
-    local_metadata includes the owner-biosample-id row, and every caller the
-    gate above admits sees it: an ADMIN-tier study_access row, the study's
-    owner, or a wet_lab_admin+ role, which returns before the tier check runs.
-    The field is pinned to member tier in the schema, but nothing enforces that
-    pin yet, so the gate is what restricts the value. This route does not write it.
+    The owner-biosample-id row is a study-local value like any other, so a
+    member or above sees it and a viewer does not. This route does not write it.
 
     The response carries an `ETag` header derived from the row's `updated_at`
     column; the value is a quoted ISO 8601 timestamp and is opaque by contract.
@@ -1139,6 +1138,12 @@ async def get_biosample(
     row on a non-retired biosample_to_study link (the
     fetch_caller_has_biosample_access predicate). 401 on Anonymous, 403
     on missing scope or no read path, 404 on a missing biosample.
+
+    global_metadata carries only the values the caller's tier reaches, each
+    judged on the study that wrote it; the rest are absent
+    (docs/architecture/data-model.md, "Metadata visibility tiers"). Owning
+    the biosample is a read path but not a tier: an owner with no grant on
+    the writing study reads that study's values at public.
 
     Retired biosamples currently 404 unconditionally. A future change
     will let wet_lab_admin and system_admin retrieve retired rows so

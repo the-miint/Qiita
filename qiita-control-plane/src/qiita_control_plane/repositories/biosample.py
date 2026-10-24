@@ -37,11 +37,10 @@ from .biosample_metadata import (
 from .exported_entity import export_entity_id_select
 
 # Owners' ids for their own samples sometimes inadvertently contain PII, so the
-# owner-biosample-id field is pinned above the study's default tier: the intent
-# is that even on a public study, only study members -- plus wet_lab_admin and
-# system_admin callers, who are admitted regardless of tier -- may read the
-# owner-id metadata. That intent is unenforced: no code reads tier_override, and
-# route-level access gates are what actually restrict owner-id reads today.
+# owner-biosample-id field is created at member tier whatever the study's
+# default: even on a public study, only study members (and the roles that read
+# every value) see it. The metadata visibility rule enforces the field's tier
+# (docs/architecture/data-model.md, "Metadata visibility tiers").
 OWNER_BIOSAMPLE_ID_TIER_OVERRIDE: Tier = Tier.MEMBER
 
 

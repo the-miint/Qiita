@@ -2207,8 +2207,8 @@ async def test_get_biosample_in_study_returns_global_and_local_metadata(ctx, own
 
 async def test_get_biosample_in_study_admin_tier_returns_response(ctx):
     """Tests the case where a regular user holds ADMIN study access (not the
-    role bypass): the ADMIN tier clamp is satisfied by the study_access row, so
-    the study-scoped GET returns 200 with empty metadata dicts for a bare link.
+    role bypass): the study_access row admits them, so the study-scoped GET
+    returns 200 with empty metadata dicts for a bare link.
     """
     wet_idx = ctx["wet_session"]["principal_idx"]
     user_idx = ctx["user_session"]["principal_idx"]
