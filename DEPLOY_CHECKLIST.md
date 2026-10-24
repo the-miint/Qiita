@@ -23,7 +23,7 @@ _None yet._
 
 ### 3. Migrations
 
-- `[operator]` (#feat/metadata-tier-reads) `make migrate` applies `20261024000000_metadata_visibility.sql` (three new SQL functions, `qiita.metadata_field_tier` and `qiita.{biosample,prep_sample}_metadata_visibility`; no table, row or grant changes).
+- `[operator]` (#feat/metadata-tier-reads) `make migrate` applies `20261024000000_metadata_visibility.sql` (four new SQL functions, `qiita.metadata_field_tier`, `qiita.metadata_required_tier` and `qiita.{biosample,prep_sample}_metadata_visibility`, and corrected COMMENTs on `qiita.{biosample,prep_sample}_field_exception`; no table, row or grant changes).
 
 ### 4. Deploy
 

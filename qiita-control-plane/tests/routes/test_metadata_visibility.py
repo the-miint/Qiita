@@ -53,23 +53,16 @@ from .conftest import _grant_study_access, _seed_authz_case_study, _seed_study
 
 pytestmark = pytest.mark.db
 
-# The tier a caller reads at, by case. Every case but the bypass is the regular
-# user; what differs is how the user relates to the study.
-_READ_TIER = {
-    "viewer": Tier.VIEWER,
-    "member": Tier.MEMBER,
-    "admin": Tier.ADMIN,
-    "owner": Tier.ADMIN,
-    "wet_lab_admin": Tier.ADMIN,
-}
-# Per case, who owns the study and the tier the regular user is granted on it,
-# as _seed_authz_case_study takes them.
-_CASE_STUDY = {
-    "viewer": ("wet", Tier.VIEWER),
-    "member": ("wet", Tier.MEMBER),
-    "admin": ("wet", Tier.ADMIN),
-    "owner": ("user", None),
-    "wet_lab_admin": ("wet", None),
+# case -> (study owner, tier granted to the regular user, tier the caller reads
+# at). The owner and grant are as _seed_authz_case_study takes them. Every case
+# but the bypass calls as the regular user; what differs is how the user
+# relates to the study.
+_CASES: dict[str, tuple[str, Tier | None, Tier]] = {
+    "viewer": ("wet", Tier.VIEWER, Tier.VIEWER),
+    "member": ("wet", Tier.MEMBER, Tier.MEMBER),
+    "admin": ("wet", Tier.ADMIN, Tier.ADMIN),
+    "owner": ("user", None, Tier.ADMIN),
+    "wet_lab_admin": ("wet", None, Tier.ADMIN),
 }
 
 
@@ -113,7 +106,7 @@ class _Corpus:
 
 async def _seed_study_for_case(ctx, case: str) -> int:
     """Seed the study a case reads, owned and granted as the case says."""
-    owner_key, grant_tier = _CASE_STUDY[case]
+    owner_key, grant_tier, _ = _CASES[case]
     return await _seed_authz_case_study(
         ctx, owner_key=owner_key, grant_tier=grant_tier, case=f"vis-{case}"
     )
@@ -310,7 +303,7 @@ async def _seed_sequenced_sample_corpus(ctx, study_idx: int) -> _Corpus:
     )
 
 
-@pytest.mark.parametrize("case", tuple(_READ_TIER))
+@pytest.mark.parametrize("case", tuple(_CASES))
 async def test_study_scoped_biosample_read_shows_only_visible_values(ctx, case):
     study_idx = await _seed_study_for_case(ctx, case)
     corpus = await _seed_biosample_corpus(ctx, study_idx)
@@ -321,7 +314,7 @@ async def test_study_scoped_biosample_read_shows_only_visible_values(ctx, case):
 
     assert resp.status_code == 200, resp.text
     body = resp.json()
-    read_tier = _READ_TIER[case]
+    read_tier = _CASES[case][2]
     assert set(body["global_metadata"]) == corpus.visible(corpus.global_keys, read_tier)
     assert set(body["local_metadata"]) == corpus.visible(corpus.local_keys, read_tier)
 
@@ -339,7 +332,7 @@ async def test_biosample_read_shows_only_visible_global_values(ctx, case):
 
     assert resp.status_code == 200, resp.text
     assert set(resp.json()["global_metadata"]) == corpus.visible(
-        corpus.global_keys, _READ_TIER[case]
+        corpus.global_keys, _CASES[case][2]
     )
 
 
@@ -347,7 +340,10 @@ async def test_biosample_owner_without_a_grant_reads_global_values_at_public(ctx
     """Owning a biosample admits a caller to its read but confers no tier: with
     no grant on the study that wrote the values, the owner sees only the public
     ones."""
-    study_idx = await _seed_study_for_case(ctx, "wet_lab_admin")
+    # A study the wet_lab_admin owns, where the regular user holds no grant.
+    study_idx = await _seed_authz_case_study(
+        ctx, owner_key="wet", grant_tier=None, case="vis-biosample-owner"
+    )
     corpus = await _seed_biosample_corpus(
         ctx, study_idx, owner_idx=ctx["user_session"]["principal_idx"]
     )
@@ -436,7 +432,7 @@ async def test_global_value_from_another_study_judged_there(ctx):
     assert foreign_key in after.json()["global_metadata"]
 
 
-@pytest.mark.parametrize("case", tuple(_READ_TIER))
+@pytest.mark.parametrize("case", tuple(_CASES))
 async def test_study_scoped_sequenced_sample_read_shows_only_visible_values(ctx, case):
     study_idx = await _seed_study_for_case(ctx, case)
     corpus = await _seed_sequenced_sample_corpus(ctx, study_idx)
@@ -449,6 +445,6 @@ async def test_study_scoped_sequenced_sample_read_shows_only_visible_values(ctx,
 
     assert resp.status_code == 200, resp.text
     body = resp.json()
-    read_tier = _READ_TIER[case]
+    read_tier = _CASES[case][2]
     assert set(body["global_metadata"]) == corpus.visible(corpus.global_keys, read_tier)
     assert set(body["local_metadata"]) == corpus.visible(corpus.local_keys, read_tier)

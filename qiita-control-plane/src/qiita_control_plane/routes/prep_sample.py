@@ -174,7 +174,7 @@ async def create_prep_sample_field(
     the response body is the created field.
 
     Access policy is interim: the ADMIN gate is a coarse stand-in matching the
-    study-scoped sample metadata routes, held until metadata writes enforce the
+    study-scoped prep_sample metadata routes, held until metadata writes enforce the
     visibility rule. When that clamp comes off, this route goes back to
     `Tier.MEMBER` — minting a study-local field is work a study member is meant
     to do.

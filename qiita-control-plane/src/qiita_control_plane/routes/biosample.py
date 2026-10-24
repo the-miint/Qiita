@@ -878,8 +878,8 @@ async def get_biosample_in_study(
     is likewise 404 (mirroring the biosample-level read's retired carve-out).
 
     The owner-biosample-id row is a study-local value like any other, read at
-    its field's tier (member when the field is created), so a viewer does not
-    see it. This route does not write it.
+    its field's tier (OWNER_BIOSAMPLE_ID_TIER_OVERRIDE when the field is
+    created). This route does not write it.
 
     The response carries an `ETag` header derived from the row's `updated_at`
     column; the value is a quoted ISO 8601 timestamp and is opaque by contract.

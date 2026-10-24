@@ -19,5 +19,5 @@
   - `GET /biosample/{biosample_idx}` judges each global value on the study that wrote
     it, so a caller with a grant on one of the biosample's studies no longer sees
     another study's restricted values. The biosample's owner reads at public on any
-    study they hold no grant on.
+    study they neither own nor hold a grant on.
   - Metadata writes and field creation still require `admin` on the study.

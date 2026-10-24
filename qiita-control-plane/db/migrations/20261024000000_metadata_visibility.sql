@@ -5,7 +5,7 @@
 -- read uses either as a filter (WHERE visible) or as a mask (the value_*
 -- columns are NULL on a hidden row). The rule itself is defined in
 -- docs/architecture/data-model.md, "Metadata visibility tiers"; this file
--- implements it and does not restate it.
+-- implements it.
 --
 -- The caller's tiers arrive as parallel arrays (study_idx, tier) plus the tier
 -- held on every study not in them.

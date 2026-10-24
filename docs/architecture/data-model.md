@@ -111,7 +111,8 @@ study-record rule below. Reads of biosample and prep_sample metadata enforce it 
 A caller may read a metadata value when their tier on **the value's study**
 reaches **the value's required tier**.
 
-**The value's required tier** is the most restrictive of two mechanisms:
+**The value's required tier** (`qiita.metadata_required_tier`) is the most
+restrictive of two mechanisms:
 
 - **Field tier** (`qiita.metadata_field_tier`) — for a globally-linked field,
   `*_global_field.default_tier`; for a purely study-local field, its
@@ -138,8 +139,9 @@ global value that study A wrote only if their tier on A reaches it.
 their `qiita.study_access` row, otherwise `public`. A wet_lab_admin or
 system_admin reads at `admin` on every study (`auth.guards.METADATA_BYPASS_ROLE`);
 an anonymous caller reads at `public` everywhere. Owning a biosample confers no
-tier: it is a way in to `GET /biosample/{idx}`, but an owner with no grant on
-the study that wrote a value reads that value at `public`.
+tier: it is a way in to `GET /biosample/{idx}`, but an owner who neither owns
+nor holds a grant on the study that wrote a value reads that value at
+`public`.
 
 **A hidden value is absent**, not marked: a read omits its key, and anything
 that counts values counts only the visible ones. A lookup by a unique-in-study
@@ -149,8 +151,8 @@ at `member` tier whatever the study's default, is the standing example: a
 viewer of the study does not see it.
 
 Every caller-facing metadata read names its source through
-`_sample_helpers.visible_metadata_source`. Today's reads filter on the
-function's `visible` column; its value columns, NULL on a hidden row, serve a
+`_sample_helpers.visible_metadata_source`. The reads filter on the function's
+`visible` column; its value columns, NULL on a hidden row, serve a
 read that must keep every row in place, such as an export writing one column
 per field. The study-scoped biosample and sequenced_sample reads admit any
 caller with `viewer` tier or above on the study; the rule decides which values
