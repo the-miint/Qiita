@@ -1,5 +1,7 @@
 """SIGTERM drains the data plane: a DoGet stream open when the signal lands is
-served to its last row, a new request is refused, and the process exits 0.
+served to its last row, a new request is refused, and the process exits 0. A
+second SIGTERM during the drain does not cut it short; `systemctl kill -s KILL`
+is what does (docs/deployments.md).
 
 `systemctl stop` and `restart` send SIGTERM, so this is what a deploy does to a
 stream in flight. Its own module because it stops the module's data plane.
@@ -21,6 +23,7 @@ SEQ_LEN = 1000
 # 6.5 ms before that request.
 READ_SLEEP_S = 0.2
 SIGNAL_AFTER_S = 1.0
+SECOND_SIGNAL_AFTER_S = 0.25
 
 
 def _seed(data_path: str) -> None:
@@ -38,7 +41,7 @@ def _seed(data_path: str) -> None:
         conn.close()
 
 
-def test_sigterm_finishes_an_open_stream_refuses_new_requests_and_exits_zero(
+def test_sigterm_finishes_an_open_stream_refuses_new_requests_and_exits_zero_when_repeated(
     data_plane,
 ):
     from qiita_control_plane.auth.tickets import sign_ticket
@@ -58,7 +61,9 @@ def test_sigterm_finishes_an_open_stream_refuses_new_requests_and_exits_zero(
     def signal_then_request() -> None:
         time.sleep(SIGNAL_AFTER_S)
         proc.send_signal(signal.SIGTERM)
-        time.sleep(0.5)
+        time.sleep(SECOND_SIGNAL_AFTER_S)
+        proc.send_signal(signal.SIGTERM)
+        time.sleep(0.5 - SECOND_SIGNAL_AFTER_S)
         client = flight.FlightClient(location)
         during_drain["requested_at"] = time.monotonic()
         try:
