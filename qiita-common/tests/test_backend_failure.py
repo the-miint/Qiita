@@ -29,6 +29,7 @@ from qiita_common.models import WorkTicketFailureStage
         FailureKind.CONTROL_PLANE_UNREACHABLE,
         FailureKind.PROCESS_RESTARTED,
         FailureKind.EXTERNAL_FETCH_TRANSIENT,
+        FailureKind.SEGFAULT,
     ],
 )
 def test_retriable_kinds_are_transient(kind):
@@ -75,10 +76,10 @@ def test_every_failure_kind_is_classified():
         ).transient
         for kind in FailureKind
     }
-    # 11 retriable + 6 permanent at the time of writing. If you add a
+    # 12 retriable + 6 permanent at the time of writing. If you add a
     # kind, update this count and decide which side it lands on.
-    assert sum(classifications.values()) == 11
-    assert len(classifications) == 17
+    assert sum(classifications.values()) == 12
+    assert len(classifications) == 18
 
 
 # ---------------------------------------------------------------------------

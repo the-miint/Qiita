@@ -157,8 +157,8 @@ class FailureType(StrEnum):
     """Discriminates retriable from permanent work-ticket failures.
     Mirrored DB-side by qiita.failure_type.
 
-    `retriable` failures are transient infra issues — NODE_FAIL, OOM,
-    transient FS errors, slurmrestd unreachability — that the runner
+    `retriable` failures are ones a re-run may clear — NODE_FAIL, OOM,
+    transient FS errors, slurmrestd unreachability, a segfault — that the runner
     bounces back to QUEUED for another attempt while retry_count is
     below max_retries. `permanent` failures (bad input, container
     contract violations, exit codes from a known-terminal workflow) skip

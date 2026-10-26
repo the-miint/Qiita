@@ -31,8 +31,6 @@ _None yet._
 
 ### 5. Verify
 
-- `[admin]` (#773) The SLURM partition allows a 72 h job (`local-reference-add`'s `load` can now run 48 h and retry at 72 h): `scontrol show partition <partition> | grep -o 'MaxTime=[^ ]*'` reads `UNLIMITED` or at least `3-00:00:00`, where `<partition>` is `SLURM_PARTITION` in `compute-orchestrator.env`. Below that, SLURM holds or refuses a `load` submitted with the longer walltime, so a genome-scale reference load cannot finish; raise the partition's MaxTime before running one.
-- `[admin]` (#773) Every `fastq-to-parquet` version's `fastq` step reads `cpu` 8 / `mem_gb` 13: `SELECT version, s->'baseline_resources' FROM qiita.action, jsonb_array_elements(steps) s WHERE action_id = 'fastq-to-parquet' AND s->>'name' = 'fastq';`
 - `[admin]` (#767) `systemctl show -p TimeoutStopUSec qiita-data-plane@50051` prints `TimeoutStopUSec=1h 5min`.
 
 ### 6. After the deploy verifies green
@@ -41,8 +39,6 @@ _None yet._
 
 ### Notes (no host action)
 
-- (#773) Parquet that jobs register into DuckLake is now written at zstd level 16 (was the default 3), and the data plane sets DuckLake's `parquet_compression_level` to 16 at boot, so new lake files are ~12–15% smaller (synthetic production-shaped tables; −14.6% on one real long-read prep_sample's `sequence1`) and the steps that write them take longer: read ingest (`fastq-to-parquet`, `bcl-convert`'s `ingest_reads`, `download-ena-study`, `golay-demux`, `bam-to-parquet`), host filtering, alignment, and the reference, amplicon and long-read-assembly loads. Existing lake files are untouched. Watch reference-load walltimes on the first loads after the deploy.
-- (#773) `fastq-to-parquet` 1.0.0–1.3.0 are edited in place, resources only: the `fastq` step goes from cpu 2 / mem_gb 8 to cpu 8 / mem_gb 13, re-synced by `qiita-admin actions sync` in `activate.sh`. `bam-to-parquet` 1.0.0 and `local-reference-add` 1.0.0 are edited in place the same way, for walltime: the `bam` step goes from PT4H to PT6H (its description now says prep_sample), and `local-reference-add`'s `load` step from PT36H to PT48H under an action ceiling raised from PT48H to PT72H. `golay-demux` now runs DuckDB on all 8 of the cpu its YAML already allocates (code only).
 - (#767) A killed DoPut leaves `staging/uploads/<idx>/upload.parquet.partial`, which nothing reclaims, as nothing reclaims finished uploads. `qiita-admin masked-read-export` gains `--retry-seconds` (default 3900, the data-plane unit's stop timeout).
 
 ## Deployed history

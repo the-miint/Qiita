@@ -267,6 +267,26 @@ def test_per_slot_caps_follow_run_concurrency(fake_mint, monkeypatch, tmp_path, 
     )
 
 
+def test_pre_sort_line_names_the_run_and_slot(fake_mint, monkeypatch, tmp_path, capsys):
+    """The line before each sort names the run, its read count and its memory and
+    thread budget, so a crash narrows to the runs whose sort had started."""
+    monkeypatch.setenv("SLURM_MEM_PER_NODE", str(56 * 1024))
+
+    def _fake(run_accession, download_method, intermediate_path, duckdb_tmp, memory_gb, threads):
+        _write_intermediate(intermediate_path, [(1, "r", "ACGT", None, None, None)] * 3)
+        return 3, []
+
+    monkeypatch.setattr(ingest_module, "_stage_run_reads", _fake)
+    inputs = _inputs(tmp_path, [(7, "ERR007")]).model_copy(update={"run_concurrency": 8})
+
+    _run(inputs, tmp_path / "ws")
+
+    assert (
+        "ingest_ena_reads: sorting ERR007 (prep_sample 7): 3 reads (5 GB, 2 threads)"
+        in capsys.readouterr().err
+    )
+
+
 def test_run_concurrency_bound_matches_workflow_schema():
     """The job's cap and the workflow's context_schema maximum cannot drift."""
     spec_path = Path(__file__).resolve().parents[2] / "workflows/download-ena-study/1.0.0.yaml"

@@ -291,7 +291,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
         inputs.run_concurrency, threads=_DUCKDB_THREADS, fallback_memory_gb=_DUCKDB_MEMORY_GB
     )
     print(
-        f"ingest_ena_reads: {len(roster)} runs, run_concurrency={inputs.run_concurrency} "
+        f"{YAML_STEP_NAME}: {len(roster)} runs, run_concurrency={inputs.run_concurrency} "
         f"({memory_gb} GB, {threads} threads per slot)",
         file=sys.stderr,
     )
@@ -378,6 +378,11 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                     count,
                     work_ticket_idx=inputs.work_ticket_idx,
                     step_name=YAML_STEP_NAME,
+                )
+                print(
+                    f"{YAML_STEP_NAME}: sorting {run_accession} (prep_sample {prep_sample_idx}): "
+                    f"{count} reads ({memory_gb} GB, {threads} threads)",
+                    file=sys.stderr,
                 )
                 await asyncio.to_thread(
                     write_sorted_reads,

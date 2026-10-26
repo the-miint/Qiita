@@ -398,6 +398,15 @@ qiita biosample patch-metadata-by-unique-field --study-idx S \
 The value is a loaded NCBI Taxonomy id or a missing-value reason such as `not applicable`.
 Either path takes one biosample per call and needs ADMIN on the study or `wet_lab_admin`.
 
+ENA's `neg_cont_type` and `pos_cont_type` tags (also spelled `negative control type` and
+`positive control type`) are kept as study-local text and never make a biosample a control,
+because submitters commonly record the study's control on every BioSample, host-associated
+ones included. To mark a real control, set its `qiita sample type` to a control term (the
+`negative` and `positive` lists in `qiita_common/data/control_types.yml`, such as
+`control_blank`) with the same PATCH route and body `{"qiita sample type": "control_blank"}`,
+or with `qiita biosample patch-metadata-by-unique-field` and
+`--metadata "qiita sample type=control_blank"`.
+
 ## Scope and limits
 
 These are **hard limits** of the current import surface, not partial-implementation
@@ -478,7 +487,8 @@ batch status, which lists the failed runs, and the ticket carries no `failure_re
 a run failed in a way a retry could clear, the step still fails and retries first, and a
 run that failed permanently is fetched again on each retry, so a large one is downloaded
 again. Any other error fails the step as a whole: out of memory retries with more memory,
-and anything else (a local disk fault) leaves the ticket FAILED and redrivable.
+a segfault retries on the same resources, and anything else (a local disk fault) leaves the
+ticket FAILED and redrivable.
 
 When the retries run out, or at once when no run was stored and none of the failures is one
 a retry could clear (a 404 from duckdb-miint#312 on), the ticket is FAILED `permanent` and
@@ -491,7 +501,8 @@ if the run is gone or its digest is wrong at ENA, re-import once ENA is correcte
 retry resubmits the whole `ingest_ena_reads` step (resources: `baseline_resources` in
 `workflows/download-ena-study/1.0.0.yaml`), the requeue follows the failure with no
 delay or backoff, and `max_retries` is the ticket's one budget, shared with the OOM and
-timeout retries of that step.
+timeout retries of that step and with the retry of a step killed by a segfault (SLURM
+exit 139; the crash's stack is in `qiita ticket logs --attempt <crashed attempt>`).
 
 **Network access.** The control-plane host resolves metadata from `www.ebi.ac.uk`, and
 the SLURM compute nodes running `ingest_ena_reads` reach both `www.ebi.ac.uk` and
