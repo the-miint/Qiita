@@ -1,7 +1,7 @@
 ### Changed
 
 - **Biosample and prep_sample metadata reads now honour each field's and each value's
-  visibility tier.**
+  visibility tier (#779).**
   A value is returned only when the caller's tier on the study that wrote it reaches
   the tier the value requires. That tier comes from the global field's `default_tier`,
   a study-local field's `tier_override`, or the study's `default_tier`, and a
