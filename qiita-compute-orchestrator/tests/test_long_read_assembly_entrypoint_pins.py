@@ -69,6 +69,8 @@ _ASSEMBLE_SH = _WORKFLOW_DIR / "assemble.sh"
 _BINNING_SH = _WORKFLOW_DIR / "binning.sh"
 _BINNING_DEF = _WORKFLOW_DIR / "binning.def"
 _BINNING_VERIFY = _WORKFLOW_DIR / "binning-verify.sh"
+_BINNING_MIN_CONTIG_CHECK = _WORKFLOW_DIR / "binning-min-contig-check.sh"
+_BINNING_ENV = _WORKFLOW_DIR / "sif-build.d" / "binning.env"
 _BIN_REFINE_SH = _WORKFLOW_DIR / "bin_refine.sh"
 _BIN_REFINE_DEF = _WORKFLOW_DIR / "bin_refine.def"
 _CHECKM_SH = _WORKFLOW_DIR / "checkm.sh"
@@ -93,6 +95,7 @@ _ASSERTED_VERSIONS = {
         _BINNING_SH,
         _BINNING_DEF,
         _BINNING_VERIFY,
+        _BINNING_MIN_CONTIG_CHECK,
         _BIN_REFINE_SH,
         _BIN_REFINE_DEF,
         _CHECKM_SH,
@@ -694,15 +697,22 @@ _METABAT2_NONE_MAXBIN2_DECLINED = "\n".join(
 )
 
 
+def _binning_line_index(lines: list[str], prefix: str) -> int:
+    starts = [i for i, ln in enumerate(lines) if ln.startswith(prefix)]
+    assert len(starts) == 1, f"expected one line starting {prefix!r}, got {len(starts)}"
+    return starts[0]
+
+
 def _run_metawrap_exit_handling(
     tmp_path: Path, stdout: str, exit_code: int
 ) -> subprocess.CompletedProcess[str]:
-    """Run binning.sh from its metaWRAP stdout copy to the end under bash, with a stand-in
-    `micromamba` that prints `stdout` and exits `exit_code`, and a `qiita_finish` that
-    echoes its arguments."""
+    """Run binning.sh from its metaWRAP stdout copy to the end under bash, after the
+    script's own MIN_CONTIG_LEN assignment, with a stand-in `micromamba` that echoes its
+    arguments to stderr, prints `stdout` and exits `exit_code`, and a `qiita_finish`
+    that echoes its arguments."""
     lines = _code_lines(_BINNING_SH)
-    starts = [i for i, ln in enumerate(lines) if ln.startswith("METAWRAP_STDOUT=")]
-    assert len(starts) == 1, f"expected one METAWRAP_STDOUT assignment, got {len(starts)}"
+    min_len = lines[_binning_line_index(lines, "MIN_CONTIG_LEN=")]
+    start = _binning_line_index(lines, "METAWRAP_STDOUT=")
     fixture = tmp_path / "fixture.stdout"
     fixture.write_text(stdout + "\n")
     script = "\n".join(
@@ -710,9 +720,40 @@ def _run_metawrap_exit_handling(
             "set -euo pipefail",
             f'WORK="{tmp_path}"',
             "OUT=bins THREADS=1 METAWRAP_MEM_GB=1 ORDERED_NOLCG=nolcg.fa READS_FQ=reads.fastq",
-            f'micromamba() {{ cat "{fixture}"; return {exit_code}; }}',
+            f'micromamba() {{ echo "micromamba $*" >&2; cat "{fixture}"; return {exit_code}; }}',
             'qiita_finish() { echo "qiita_finish $*"; }',
-            *lines[starts[0] :],
+            min_len,
+            *lines[start:],
+        ]
+    )
+    return subprocess.run(["bash", "-c", script], capture_output=True, text=True, check=False)
+
+
+# What the length-check runner prints when the script carries on past the check.
+_PAST_LENGTH_CHECK = "past the length check"
+
+
+def _run_contig_length_check(
+    tmp_path: Path, contig_lengths: tuple[int, ...] | None
+) -> subprocess.CompletedProcess[str]:
+    """Run binning.sh's minimum-contig-length check under bash against a `.fai` listing
+    `contig_lengths` (None: no `.fai`), with a `qiita_finish` that echoes its arguments,
+    and print `_PAST_LENGTH_CHECK` if the script carries on past it."""
+    lines = _code_lines(_BINNING_SH)
+    start = _binning_line_index(lines, "MIN_CONTIG_LEN=")
+    end = lines.index("fi", start) + 1
+    if contig_lengths is not None:
+        # samtools faidx's columns: name, length, offset, linebases, linewidth.
+        (tmp_path / "assembly.fa.fai").write_text(
+            "".join(f"c{i}\t{n}\t0\t60\t61\n" for i, n in enumerate(contig_lengths))
+        )
+    script = "\n".join(
+        [
+            "set -euo pipefail",
+            f'WORK="{tmp_path}"',
+            'qiita_finish() { echo "qiita_finish $*"; }',
+            *lines[start:end],
+            f'echo "{_PAST_LENGTH_CHECK}"',
         ]
     )
     return subprocess.run(["bash", "-c", script], capture_output=True, text=True, check=False)
@@ -766,6 +807,63 @@ def test_binning_finishes_after_a_clean_metawrap_run(tmp_path: Path) -> None:
     result = _run_metawrap_exit_handling(tmp_path, _METABAT2_BINS, 0)
     assert result.returncode == 0, (result.returncode, result.stdout, result.stderr)
     assert result.stdout.splitlines()[-1] == "qiita_finish bins_dir=bins"
+
+
+@pytest.mark.parametrize(
+    "contig_lengths",
+    [
+        pytest.param((15846,), id="one contig under the cut"),
+        pytest.param((9000, 12000, 15999), id="every contig under the cut"),
+    ],
+)
+def test_binning_finishes_when_no_contig_reaches_the_cut(
+    tmp_path: Path, contig_lengths: tuple[int, ...]
+) -> None:
+    """With no contig at or above metaWRAP's minimum contig length, the step finishes
+    with bins_dir at the check."""
+    result = _run_contig_length_check(tmp_path, contig_lengths)
+    assert result.returncode == 0, (result.returncode, result.stdout, result.stderr)
+    assert result.stdout.splitlines() == ["qiita_finish bins_dir=bins"]
+    assert "no contig is at least 16000 bp" in result.stderr
+
+
+@pytest.mark.parametrize(
+    "contig_lengths",
+    [
+        pytest.param((16000,), id="one contig at the cut"),
+        pytest.param((9000, 16001), id="one of two contigs over the cut"),
+    ],
+)
+def test_binning_carries_on_when_a_contig_reaches_the_cut(
+    tmp_path: Path, contig_lengths: tuple[int, ...]
+) -> None:
+    """A contig whose length equals the cut is binnable, so the script carries on."""
+    result = _run_contig_length_check(tmp_path, contig_lengths)
+    assert result.returncode == 0, (result.returncode, result.stdout, result.stderr)
+    assert result.stdout.splitlines() == [_PAST_LENGTH_CHECK]
+
+
+def test_binning_refuses_an_unreadable_fai(tmp_path: Path) -> None:
+    """A .fai the check cannot read fails the step rather than reading as no contig."""
+    result = _run_contig_length_check(tmp_path, None)
+    assert result.returncode != 0, (result.returncode, result.stdout, result.stderr)
+    assert result.stdout == ""
+
+
+def test_binning_checks_contig_lengths_before_staging_reads_and_bam() -> None:
+    """The length check's no-bins exit comes before the reads are decompressed, so a
+    sample with nothing to bin does not decompress its read set, and before coverage_bam
+    is copied under bins_dir, so that exit leaves bins_dir empty."""
+    lines = _code_lines(_BINNING_SH)
+    check = _binning_line_index(lines, "n_binnable=")
+    assert check < _binning_line_index(lines, "READS_FQ=")
+    assert check < _binning_line_index(lines, 'cp "${COVERAGE_BAM}"')
+
+
+def test_metawrap_gets_the_cut_as_its_minimum_contig_length(tmp_path: Path) -> None:
+    result = _run_metawrap_exit_handling(tmp_path, _METABAT2_BINS, 0)
+    assert result.returncode == 0, (result.returncode, result.stdout, result.stderr)
+    assert re.search(r"micromamba run -n metawrap metawrap binning .* -l 16000 ", result.stderr)
 
 
 def test_binning_fails_loud_on_contig_set_drift() -> None:
@@ -940,6 +1038,40 @@ def test_image_pins_are_asserted_at_build_time() -> None:
             f"green. Add it to the PINNED map there (keyed by the binary the "
             f"package provides -- metabat2's is jgi_summarize_bam_contig_depths)."
         )
+
+
+def test_min_contig_check_ships_runs_at_build_and_scopes_its_rebuild() -> None:
+    """binning-min-contig-check.sh is %files-copied, run from %test, and named in
+    HASH_INPUTS, and is not the spec's VERIFY_CMD.
+
+    Out of HASH_INPUTS, an edit to it would leave the idempotency check green and
+    the deploy would keep the old SIF. As VERIFY_CMD, every deploy's skip check
+    would run metaWRAP.
+    """
+    def_lines = _code_lines(_BINNING_DEF)
+    assert "binning-min-contig-check.sh /opt/qiita/binning-min-contig-check.sh" in def_lines, (
+        "binning.def no longer %files-copies binning-min-contig-check.sh"
+    )
+    test_section = def_lines[def_lines.index("%test") :]
+    assert "/opt/qiita/binning-min-contig-check.sh" in test_section, (
+        "binning.def's %test no longer runs binning-min-contig-check.sh"
+    )
+
+    env = _BINNING_ENV.read_text()
+    hash_inputs = re.search(r'^HASH_INPUTS="([^"]*)"', env, re.MULTILINE)
+    assert hash_inputs is not None, "binning.env no longer declares HASH_INPUTS"
+    assert "binning-min-contig-check.sh" in hash_inputs.group(1).split(), hash_inputs.group(1)
+    verify_cmd = re.search(r'^VERIFY_CMD="([^"]*)"', env, re.MULTILINE)
+    assert verify_cmd is not None, "binning.env no longer declares VERIFY_CMD"
+    assert "binning-min-contig-check" not in verify_cmd.group(1)
+
+
+def test_min_contig_check_reads_the_cut_binning_sh_ships() -> None:
+    """The check's awk reads the raw `MIN_CONTIG_LEN=` line from binning.sh, so the
+    raw file, not its code lines, must hold exactly one, with a bare number."""
+    raw = re.findall(r"^MIN_CONTIG_LEN=(.*)$", _BINNING_SH.read_text(), re.MULTILINE)
+    assert len(raw) == 1 and raw[0].isdigit(), raw
+    assert "/^MIN_CONTIG_LEN=/" in "\n".join(_code_lines(_BINNING_MIN_CONTIG_CHECK))
 
 
 def test_bin_refine_initializes_its_binner_arrays_by_assignment() -> None:

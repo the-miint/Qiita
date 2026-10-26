@@ -1,6 +1,6 @@
 # Deploy checklist
 
-Operator-facing deploy instructions — **not** a "what changed" log (that's [`CHANGELOG.md`](CHANGELOG.md); the git log is the authoritative record). `## Pending deploy` is the single consolidated checklist for the next deploy; past deploys are archived one file each under [`docs/deploy-archive/`](docs/deploy-archive/).
+Operator-facing deploy instructions — **not** a "what changed" log (that's the changelog, see [`CHANGELOG.md`](CHANGELOG.md); the git log is the authoritative record). `## Pending deploy` is the single consolidated checklist for the next deploy; past deploys are archived one file each under [`docs/deploy-archive/`](docs/deploy-archive/).
 
 - **Deploying?** Follow [`docs/runbooks/redeploy.md`](docs/runbooks/redeploy.md) — it is the source of truth for the procedure (bucket order, `[admin]`/`[operator]` labels, the migration guard, archiving).
 - **Adding to a PR?** Fold your operator steps into the `## Pending deploy` buckets with `/deploy-note`; don't add a standalone entry. The authoring rules are in CLAUDE.md ("Operator-facing changes").
@@ -36,6 +36,7 @@ _None yet._
 
 ### 4. Deploy
 
+- `[admin]` (#767) `activate.sh` now waits, before any restart, for the data plane to go idle (no DoGet stream, DoPut or registration in flight), up to 3900 s, printing `waiting for qiita-data-plane@50051 to go idle …` once a minute; it then restarts whether or not it went idle. `QIITA_DP_IDLE_WAIT_S=<s>` in the deploy's environment changes the bound (0 skips it). The deploy stops before any restart if that value is not whole seconds or the wait cannot query the catalog; `QIITA_DP_IDLE_WAIT_S=0` gets past the second. This deploy still stops the old data-plane binary at once on SIGTERM: the drain ships with the new binary, so from the next deploy the data plane's own restart can take up to the unit's `TimeoutStopSec=3900` too.
 - Nothing extra for a single instance (#363): with no `QIITA_DATA_PLANE_*` keys in
   `/etc/qiita/data-plane.env`, the deploy runs the one instance `@50051` as before. To run
   more instances or add data planes on other hosts, see
@@ -44,19 +45,7 @@ _None yet._
 
 ### 5. Verify
 
-- `[admin]` `sudo make verify-deploy QIITA_HOSTNAME=<fqdn>` now carries two ENA egress rows —
-  grep its output for both (#584):
-  - `ena-reachability` — the control-plane host HEADs `https://www.ebi.ac.uk`. Red means
-    outbound HTTPS to the archive is blocked from this host, so **every** ENA import fails at
-    metadata resolve. Hatch: `SKIP_ENA_REACHABILITY=1` (this row only).
-  - `probe/ena-from-compute` — a SLURM compute node HEADs `www.ebi.ac.uk` and
-    `ftp.sra.ebi.ac.uk`. Red means every import's read-download step fails. No per-row hatch;
-    it rides the SLURM probe job, so `SKIP_SLURM_PROBE=1` drops it along with every other
-    `probe/*` row.
-
-  These replace the manual "confirm outbound HTTPS to the ENA archives" host-setup step this
-  deploy's predecessor carried by hand. Green proves egress only: the fetch itself runs through
-  DuckDB httpfs, so a proxy or CA problem confined to httpfs still surfaces at the first import.
+- `[admin]` (#767) `systemctl show -p TimeoutStopUSec qiita-data-plane@50051` prints `TimeoutStopUSec=1h 5min`.
 
 - `verify-deploy`'s data-plane rows (#363): `health/data-plane` is now
   `health/data-plane@<port>`, one row per instance; `health/data-plane-peer@<host:port>`
@@ -75,7 +64,7 @@ _None yet._
 
 ### Notes (no host action)
 
-_None yet._
+- (#767) A killed DoPut leaves `staging/uploads/<idx>/upload.parquet.partial`, which nothing reclaims, as nothing reclaims finished uploads. `qiita-admin masked-read-export` gains `--retry-seconds` (default 3900, the data-plane unit's stop timeout).
 
 ## Deployed history
 

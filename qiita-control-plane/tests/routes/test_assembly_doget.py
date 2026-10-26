@@ -39,6 +39,7 @@ from qiita_control_plane.testing.db_seeds import (
     seed_biosample_with_sequenced_prep_sample,
     seed_user_principal,
 )
+from qiita_control_plane.testing.db_teardown import delete_principal, teardown_entity_graph
 
 pytestmark = pytest.mark.db
 
@@ -178,15 +179,11 @@ async def env(postgres_pool):
         **features,
     }
 
-    await postgres_pool.execute(
-        "DELETE FROM qiita.assembly_membership WHERE processing_idx = ANY($1::bigint[])",
-        [proc_a, proc_b],
-    )
-    await postgres_pool.execute(
-        "DELETE FROM qiita.prep_sample WHERE idx = ANY($1::bigint[])", [ps_a, ps_b]
-    )
-    await postgres_pool.execute(
-        "DELETE FROM qiita.biosample WHERE idx = ANY($1::bigint[])", [bs_a, bs_b]
+    await teardown_entity_graph(
+        postgres_pool,
+        study_idxs=[],
+        biosample_idxs=[bs_a, bs_b],
+        prep_sample_idxs=[ps_a, ps_b],
     )
     await postgres_pool.execute(
         "DELETE FROM qiita.feature WHERE feature_idx = ANY($1::bigint[])",
@@ -195,8 +192,7 @@ async def env(postgres_pool):
     await postgres_pool.execute(
         "DELETE FROM qiita.processing WHERE processing_idx = ANY($1::bigint[])", [proc_a, proc_b]
     )
-    await postgres_pool.execute("DELETE FROM qiita.user WHERE principal_idx = $1", principal_idx)
-    await postgres_pool.execute("DELETE FROM qiita.principal WHERE idx = $1", principal_idx)
+    await delete_principal(postgres_pool, principal_idx)
 
 
 def _body(
@@ -393,8 +389,9 @@ async def test_doget_assembly_surfaces_in_cp_allowlist():
     mirrors the data plane's ALLOWED_TABLES — and the junction must NOT be.
 
     `bin_quality` is on that allowlist and not on this route's: the data plane
-    serves it and the feature-table resolver signs it in-process. Asserting both
-    halves here is what makes the second one deliberate rather than an omission."""
+    serves it, the feature-table resolver signs it in-process, and the human run
+    mint signs it for one run. Asserting both halves here is what makes the second
+    one deliberate rather than an omission."""
     from qiita_control_plane.routes.reference import _DOGET_ALLOWED_TABLES
 
     assert ASSEMBLED_SEQUENCE_TABLE in _DOGET_ALLOWED_TABLES
@@ -414,11 +411,11 @@ async def test_doget_assembly_not_signable_via_reference_route():
 
 
 async def test_doget_bin_quality_not_signable_via_reference_route():
-    """`bin_quality` is on `_DOGET_ALLOWED_TABLES` and behind NO route, which is the
-    only reason it is not requestable: `_REFERENCE_DOGET_TABLES` is derived by
-    SUBTRACTION from that allowlist, so a table added to the superset and forgotten
-    in the subtraction becomes signable through the generic reference route by
-    default. That default is what this pins."""
+    """`bin_quality` is on `_DOGET_ALLOWED_TABLES` and signable only through the
+    human assembly run mint, scoped to one run: `_REFERENCE_DOGET_TABLES` is derived
+    by SUBTRACTION from that allowlist, so a table added to the superset and
+    forgotten in the subtraction becomes signable through the generic reference
+    route by default, with no run scope. That default is what this pins."""
     from qiita_control_plane.routes.reference import _REFERENCE_DOGET_TABLES
 
     assert BIN_QUALITY_TABLE not in _REFERENCE_DOGET_TABLES

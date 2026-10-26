@@ -15,14 +15,14 @@ Hello,
 No other work tickets of yours are still active.
 {% endif %}
 {% if held_total %}
-{{ held_total }} held after exhausting infrastructure retries — redrive with `qiita ticket run <idx>`.
+{{ held_total }} held after an infrastructure failure — redrive with `qiita ticket run <idx>`.
 {% endif %}
 
 Details:
 {# `+%}` keeps the newline this row's trailing `{% endif %}` would otherwise
    eat under trim_blocks — without it every detail row runs onto one line. #}
 {% for t in tickets %}
-  - ticket {{ t.idx }}: {{ t.action_id }} {{ t.action_version }} -> {{ t.state }}{% if t.failure_reason %} ({{ t.failure_reason }}){% endif +%}
+  - ticket {{ t.idx }}: {{ t.action_id }} {{ t.action_version }} -> {{ t.state }}{% if t.failure_reason %} ({{ t.failure_reason }}){% endif %}{% if t.failed_runs %}, partial: {{ t.failed_runs }} run{{ 's' if t.failed_runs != 1 else '' }} failed{% if t.batch_idx %} (see qiita ena-import-status {{ t.batch_idx }}){% endif %}{% endif +%}
 {% endfor %}
 {% if overflow %}
   ... and {{ overflow }} more

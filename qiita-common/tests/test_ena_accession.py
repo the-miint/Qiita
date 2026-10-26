@@ -1,0 +1,195 @@
+"""Tests for INSDC accession-type detection and validation (`qiita_common.ena_accession`)."""
+
+import pytest
+
+
+@pytest.mark.parametrize(
+    "accession",
+    ["PRJEB11419", "PRJNA555783", "PRJDB4321", "ERP012803", "SRP012345", "DRP001234"],
+)
+def test_detect_accession_kind_study(accession):
+    from qiita_common.ena_accession import EnaAccessionKind, detect_accession_kind
+
+    assert detect_accession_kind(accession) is EnaAccessionKind.STUDY
+
+
+@pytest.mark.parametrize(
+    "accession",
+    [
+        "SAMEA3610311",
+        "SAMEG70402",
+        "SAMN01821487",
+        "SAMNA0001",
+        "SAME1234567",
+        "SAMD00123456",
+        "SAMDA0001",
+    ],
+)
+def test_detect_accession_kind_sample(accession):
+    from qiita_common.ena_accession import EnaAccessionKind, detect_accession_kind
+
+    assert detect_accession_kind(accession) is EnaAccessionKind.SAMPLE
+
+
+@pytest.mark.parametrize("accession", ["ERR1074767", "SRR1234567", "DRR1234567"])
+def test_detect_accession_kind_run(accession):
+    from qiita_common.ena_accession import EnaAccessionKind, detect_accession_kind
+
+    assert detect_accession_kind(accession) is EnaAccessionKind.RUN
+
+
+@pytest.mark.parametrize("accession", ["ERX1111111", "SRX1234567", "DRX1234567"])
+def test_detect_accession_kind_experiment(accession):
+    from qiita_common.ena_accession import EnaAccessionKind, detect_accession_kind
+
+    assert detect_accession_kind(accession) is EnaAccessionKind.EXPERIMENT
+
+
+def test_detect_accession_kind_rejects_ers():
+    """`ERS*` is NOT a sample prefix in miint (SAMN/SAME/SAMD only); accepting it
+    would let a pre-validated accession fail opaquely later in `read_ena`."""
+    from qiita_common.ena_accession import (
+        InvalidEnaAccessionError,
+        detect_accession_kind,
+    )
+
+    with pytest.raises(InvalidEnaAccessionError, match="does not match a known"):
+        detect_accession_kind("ERS1234567")
+
+
+def test_detect_accession_kind_rejects_empty():
+    from qiita_common.ena_accession import (
+        InvalidEnaAccessionError,
+        detect_accession_kind,
+    )
+
+    with pytest.raises(InvalidEnaAccessionError, match="must not be empty"):
+        detect_accession_kind("")
+
+
+def test_detect_accession_kind_rejects_blank():
+    from qiita_common.ena_accession import (
+        InvalidEnaAccessionError,
+        detect_accession_kind,
+    )
+
+    with pytest.raises(InvalidEnaAccessionError, match="must not be empty"):
+        detect_accession_kind("   ")
+
+
+@pytest.mark.parametrize("accession", ["FOO123", "NOTANACCESSION", "12345"])
+def test_detect_accession_kind_rejects_unknown_prefix(accession):
+    from qiita_common.ena_accession import (
+        InvalidEnaAccessionError,
+        detect_accession_kind,
+    )
+
+    with pytest.raises(InvalidEnaAccessionError, match="does not match a known"):
+        detect_accession_kind(accession)
+
+
+@pytest.mark.parametrize(
+    "accession",
+    [
+        "PRJEB",
+        "PRJEBxyz",
+        "PRJEB11419,PRJNA1",
+        "PRJEB11419 PRJNA1",
+        "PRJEB١٢٣",
+        "SAMN",
+        "SAMEA",
+        "SAMEAB123",
+        "SAMEa123",
+        "ERR12a",
+        "SRX",
+    ],
+)
+def test_detect_accession_kind_rejects_malformed_shape(accession):
+    from qiita_common.ena_accession import (
+        InvalidEnaAccessionError,
+        detect_accession_kind,
+    )
+
+    with pytest.raises(InvalidEnaAccessionError, match="does not match a known"):
+        detect_accession_kind(accession)
+
+
+def test_malformed_accession_message_asks_for_digits():
+    from qiita_common.ena_accession import (
+        InvalidEnaAccessionError,
+        detect_accession_kind,
+    )
+
+    with pytest.raises(InvalidEnaAccessionError) as exc_info:
+        detect_accession_kind("PRJEB")
+    message = str(exc_info.value)
+    assert "followed by digits, e.g. PRJEB11419" in message
+    assert "SAMN/SAME/SAMD, optionally followed by one letter" in message
+
+
+@pytest.mark.parametrize(
+    "accession",
+    ["PRJEB", "PRJEB11419,PRJNA1", "PRJEB11419 PRJNA1"],
+)
+def test_validate_study_accession_rejects_malformed_shape(accession):
+    from qiita_common.ena_accession import (
+        InvalidEnaAccessionError,
+        validate_study_accession,
+    )
+
+    with pytest.raises(InvalidEnaAccessionError):
+        validate_study_accession(accession)
+
+
+def test_validate_study_accession_returns_trimmed():
+    from qiita_common.ena_accession import validate_study_accession
+
+    assert validate_study_accession("  PRJEB11419  ") == "PRJEB11419"
+
+
+def test_validate_study_accession_rejects_non_study_kind():
+    from qiita_common.ena_accession import (
+        InvalidEnaAccessionError,
+        validate_study_accession,
+    )
+
+    with pytest.raises(InvalidEnaAccessionError, match="not a study accession"):
+        validate_study_accession("SAMEA3610311")
+
+
+def test_validate_study_accession_rejects_invalid_shape():
+    from qiita_common.ena_accession import (
+        InvalidEnaAccessionError,
+        validate_study_accession,
+    )
+
+    with pytest.raises(InvalidEnaAccessionError):
+        validate_study_accession("")
+
+
+@pytest.mark.parametrize(
+    ("accession", "kind"),
+    [("PRJEB11419", "study"), ("  ERP012803 ", "study"), ("ERR1074767", "run"), ("SRR1", "run")],
+)
+def test_validate_import_accession_accepts_study_and_run(accession, kind):
+    from qiita_common.ena_accession import EnaAccessionKind, validate_import_accession
+
+    assert validate_import_accession(accession) == (
+        EnaAccessionKind(kind),
+        accession.strip(),
+    )
+
+
+@pytest.mark.parametrize("accession", ["SAMEA3610311", "SAMN01821487", "ERX1111111"])
+def test_validate_import_accession_rejects_sample_and_experiment(accession):
+    from qiita_common.ena_accession import InvalidEnaAccessionError, validate_import_accession
+
+    with pytest.raises(InvalidEnaAccessionError, match="study or run accession"):
+        validate_import_accession(accession)
+
+
+def test_validate_import_accession_rejects_garbage():
+    from qiita_common.ena_accession import InvalidEnaAccessionError, validate_import_accession
+
+    with pytest.raises(InvalidEnaAccessionError):
+        validate_import_accession("FOO123")

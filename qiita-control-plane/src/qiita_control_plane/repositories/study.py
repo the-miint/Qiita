@@ -12,19 +12,18 @@ import json
 from typing import get_args
 
 import asyncpg
-from qiita_common.models import StudyAccessionField, Tier
+from qiita_common.models import LEGACY_IDX_RESERVED_CEILING, StudyAccessionField, Tier
 
 from . import require_transaction, update_row
+from .exported_entity import export_entity_id_select
+from .study_access import insert_study_access
 
-# Columns returned by every create_study INSERT ... RETURNING. Covers every
-# caller-visible column on the row; the route consumes the result via
-# named-key access so column order in this string is not load-bearing.
 _STUDY_RETURNING_COLS = (
     "idx, owner_idx, principal_investigator_idx, title, alias,"
     " description, abstract, funding, ena_study_accession,"
     " bioproject_accession, notes, last_submission_at, submission_error,"
     " extra_metadata, default_tier, created_by_idx,"
-    " created_at, updated_at"
+    " created_at, updated_at, " + export_entity_id_select("study", alias="study")
 )
 
 
@@ -36,10 +35,7 @@ async def fetch_study(
 ) -> asyncpg.Record | None:
     """Return the qiita.study row for the given idx, or None if no match.
 
-    Selects the same caller-visible column set produced by
-    `create_study` (see `_STUDY_RETURNING_COLS`) so a route handler can
-    reuse the same row → response mapping for both POST and GET. The
-    returned record carries `extra_metadata` as a JSONB-text string
+    The returned record carries `extra_metadata` as a JSONB-text string
     when present; the caller is responsible for `json.loads` if a dict
     shape is needed (mirrors the create-route pattern). Accepts either
     a pool or a connection so the helper composes inside an open
@@ -51,8 +47,6 @@ async def fetch_study(
     single-statement transaction releases the lock immediately and
     the flag is a no-op.
     """
-    # Single-row fetch by idx; same column list as the INSERT RETURNING
-    # so route handlers share one row → response shaping path.
     sql = f"SELECT {_STUDY_RETURNING_COLS} FROM qiita.study WHERE idx = $1"
     if for_update:
         sql += " FOR UPDATE"
@@ -108,6 +102,26 @@ async def fetch_study_idxs_by_accession(
     return {r[accession_field]: r["idx"] for r in rows}
 
 
+async def fetch_study_idx_by_either_ena_accession(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
+    accession: str,
+) -> int | None:
+    """Return the study_idx whose `bioproject_accession` or `ena_study_accession`
+    equals `accession`, or None.
+
+    For a caller that only has one accession of unknown kind -- e.g. a batch
+    item's `ena_study_accession`, which validates as either a BioProject or a
+    secondary study accession (`qiita_common.ena_accession`) -- and does not
+    yet know which column it would have landed in. Unlike
+    `get_or_create_study_by_ena_accessions`, this never creates a row and does
+    not require both accessions.
+    """
+    return await pool_or_conn.fetchval(
+        "SELECT idx FROM qiita.study WHERE bioproject_accession = $1 OR ena_study_accession = $1",
+        accession,
+    )
+
+
 async def insert_study(
     conn: asyncpg.Connection,
     *,
@@ -124,33 +138,53 @@ async def insert_study(
     notes: str | None = None,
     extra_metadata: dict | None = None,
     default_tier: Tier | None = None,
-) -> asyncpg.Record:
-    """Insert one row into qiita.study and return all caller-visible columns.
+    idx: int | None = None,
+) -> int:
+    """Insert one row into qiita.study and return its idx.
 
     Exposes every column the caller may legitimately set on a fresh row.
-    `default_tier=None` lets the schema default ('member') apply. The
-    generated `search_vector` and the trigger-managed `updated_at` are
-    populated by Postgres and are part of the RETURNING list so the
-    caller has the complete row.
+    `default_tier=None` falls back to Tier.MEMBER, the column's own DEFAULT
+    (the INSERT always names the column, so the DEFAULT itself never fires).
+    `idx=None` mints the idx from the identity; an explicit `idx` must lie
+    in the band reserved below LEGACY_IDX_RESERVED_CEILING. This function
+    enforces the band for every caller, the route and any direct writer such
+    as a legacy importer, because the database cannot.
 
-    Raises asyncpg.PostgresError on FK violation (e.g., a non-existent
-    `principal_investigator_idx`) or trigger rejection (e.g., owner is
-    not a user-kind principal).
+    Raises ValueError on an explicit `idx` outside that band, and
+    asyncpg.PostgresError on FK violation (e.g., a non-existent
+    `principal_investigator_idx`), trigger rejection (e.g., owner is
+    not a user-kind principal), or an explicit `idx` already in use
+    (UniqueViolationError on study_pkey).
     """
+    if idx is not None and not 0 < idx < LEGACY_IDX_RESERVED_CEILING:
+        raise ValueError(
+            f"explicit study idx must be in [1, {LEGACY_IDX_RESERVED_CEILING}), got {idx}"
+        )
+
     # Serialize the JSONB column once so asyncpg ships it as text + ::jsonb.
     extra_metadata_json = json.dumps(extra_metadata) if extra_metadata is not None else None
 
-    # Single INSERT carrying every settable column; defaulted columns
-    # receive NULL and the schema-default kicks in for default_tier.
-    return await conn.fetchrow(
-        "INSERT INTO qiita.study ("
-        "    owner_idx, principal_investigator_idx, title, alias,"
-        "    description, abstract, funding, ena_study_accession,"
-        "    bioproject_accession, notes, extra_metadata, default_tier,"
-        "    created_by_idx"
-        ") VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb,"
-        "          COALESCE($12::qiita.tier, 'member'::qiita.tier), $13)"
-        f" RETURNING {_STUDY_RETURNING_COLS}",
+    # Single INSERT carrying every settable column; unset optional columns
+    # receive NULL, except default_tier (see the docstring).
+    columns = (
+        "owner_idx, principal_investigator_idx, title, alias,"
+        " description, abstract, funding, ena_study_accession,"
+        " bioproject_accession, notes, extra_metadata, default_tier,"
+        " created_by_idx"
+    )
+    values = "$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12::qiita.tier, $13"
+    if idx is None:
+        sql = f"INSERT INTO qiita.study ({columns}) VALUES ({values}) RETURNING idx"
+        idx_args: tuple[int, ...] = ()
+    else:
+        # idx is GENERATED ALWAYS, so an explicit value needs OVERRIDING SYSTEM VALUE.
+        sql = (
+            f"INSERT INTO qiita.study (idx, {columns}) OVERRIDING SYSTEM VALUE"
+            f" VALUES ($14, {values}) RETURNING idx"
+        )
+        idx_args = (idx,)
+    study_idx = await conn.fetchval(
+        sql,
         owner_idx,
         principal_investigator_idx,
         title,
@@ -162,41 +196,11 @@ async def insert_study(
         bioproject_accession,
         notes,
         extra_metadata_json,
-        default_tier,
+        default_tier if default_tier is not None else Tier.MEMBER,
         created_by_idx,
+        *idx_args,
     )
-
-
-async def insert_owner_study_access_admin(
-    conn: asyncpg.Connection,
-    *,
-    study_idx: int,
-    owner_idx: int,
-    granted_by_idx: int,
-) -> None:
-    """Grant the study's owner ADMIN access in qiita.study_access.
-
-    The auto-grant ensures the owner appears explicitly in study_access
-    queries even though the owner-bypass path in
-    `auth.guards.require_study_access` would let the owner through
-    without one. `granted_by_idx` is the caller (which equals owner_idx
-    on self-create and the on-behalf actor on admin-creates-for-other).
-
-    Raises asyncpg.UniqueViolationError if a row already exists for this
-    (study_idx, owner_idx) pair (impossible during create_study but
-    surfaced for callers reusing the helper later).
-    """
-    # Single INSERT against the (study_idx, principal_idx) unique constraint;
-    # access_tier is hardcoded to ADMIN because that is the only tier that
-    # makes sense for the owner-auto-grant path.
-    await conn.execute(
-        "INSERT INTO qiita.study_access ("
-        "    study_idx, principal_idx, access_tier, granted_by_idx"
-        ") VALUES ($1, $2, 'admin'::qiita.tier, $3)",
-        study_idx,
-        owner_idx,
-        granted_by_idx,
-    )
+    return study_idx
 
 
 # Columns this repo's PATCH composer is allowed to write. Held as a
@@ -268,18 +272,20 @@ async def create_study(
     notes: str | None = None,
     extra_metadata: dict | None = None,
     default_tier: Tier | None = None,
+    idx: int | None = None,
 ) -> asyncpg.Record:
     """Create a study and the owner's auto-granted ADMIN study_access row.
 
     The caller must wrap the call in `async with conn.transaction():`;
     the guard at entry raises RuntimeError otherwise so partial failure
-    cannot leave a study row without its access grant.
+    cannot leave a study row without its access grant. `idx` is passed to
+    `insert_study`, which documents the explicit-idx contract.
     """
     # Fail-fast guard against caller forgetting to wrap in a transaction.
     require_transaction(conn)
 
-    # Step a: insert the study row, returning every caller-visible column.
-    study_row = await insert_study(
+    # Step a: insert the study row.
+    study_idx = await insert_study(
         conn,
         owner_idx=owner_idx,
         created_by_idx=created_by_idx,
@@ -294,17 +300,26 @@ async def create_study(
         notes=notes,
         extra_metadata=extra_metadata,
         default_tier=default_tier,
+        idx=idx,
     )
 
-    # Step b: auto-grant the owner ADMIN access on the freshly created study.
-    await insert_owner_study_access_admin(
+    # Step b: auto-grant the owner ADMIN access on the freshly created study, so
+    # the owner appears in study_access queries even though the owner bypass in
+    # `auth.guards.require_study_access` would admit them without a row.
+    # granted_by_idx is the caller: the owner on self-create, the on-behalf actor
+    # otherwise.
+    await insert_study_access(
         conn,
-        study_idx=study_row["idx"],
-        owner_idx=owner_idx,
+        study_idx=study_idx,
+        principal_idx=owner_idx,
+        access_tier=Tier.ADMIN,
         granted_by_idx=created_by_idx,
     )
 
-    return study_row
+    # Step c: read the row back. Its export_entity_id is minted by an AFTER
+    # INSERT trigger, so the INSERT's own RETURNING could not carry it.
+    created_row = await fetch_study(conn, study_idx)
+    return created_row
 
 
 class EnaStudyAccessionConflictError(Exception):
@@ -373,8 +388,8 @@ async def get_or_create_study_by_ena_accessions(
     "reuse the existing row's access grant too" -- catch-and-refetch is
     the race-safe shape available to a composer, not a single INSERT.
 
-    Returns (row, created): row is the same RETURNING/fetch_study column
-    shape either way; created is True only on the insert branch.
+    Returns (row, created): row is the fetch_study column shape either
+    way; created is True only on the insert branch.
     """
     ena_study_accession = (ena_study_accession or "").strip() or None
     existing_row = await _resolve_study_by_ena_accessions(
@@ -470,3 +485,76 @@ async def _resolve_study_by_ena_accessions(
             detail=f"study {existing_idx} has ena_study_accession {row_ena!r}",
         )
     return row
+
+
+# The summary fields as a search document: what a caller who may read only a
+# study's summary may search (`auth.guards.study_record_view`). Same 'english'
+# configuration as the generated search_vector, which holds the full-record text.
+_STUDY_SUMMARY_TSVECTOR = (
+    "to_tsvector('english', concat_ws(' ', s.title, s.alias,"
+    " s.bioproject_accession, s.ena_study_accession))"
+)
+
+
+async def fetch_study_list_candidates(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
+    *,
+    principal_idx: int,
+    all_studies: bool,
+    include_ungranted_public: bool,
+    query: str | None,
+    after_study_idx: int | None,
+    limit: int,
+) -> list[asyncpg.Record]:
+    """Up to `limit` studies, highest idx first, that the caller MIGHT
+    read, each with the caller's access fields beside its summary columns.
+
+    A prefilter, not the access decision: rows come back when the caller owns
+    the study, holds any qiita.study_access row on it, or (with
+    `include_ungranted_public`) its default_tier is public; `all_studies`
+    (a role bypass) returns every study. The caller decides each row with
+    `auth.guards.study_record_view`, so the record-read rule keeps one
+    definition; the prefilter must stay a superset of what that admits.
+    `include_ungranted_public=False` is for a caller asking only for studies
+    where their own tier reaches above public, which a study they hold no
+    grant on can never satisfy — without it, public studies would fill pages
+    only to be dropped.
+
+    `query` is a websearch-syntax full-text query. A row matches on the full
+    record's `search_vector` or on the summary fields (title, alias,
+    accessions, which `search_vector` does not cover); `summary_match` says
+    whether the summary alone matched, so a caller who may read only the
+    summary is held to it. Both use the 'english' configuration, so words are
+    stemmed and matched whole.
+
+    Keyset paging on idx (`after_study_idx`) never re-reads a skipped row, but
+    a page scans down from the highest idx until it has `limit` candidates or
+    the table ends: a caller whose readable studies are sparse among many, or a
+    narrow `query`, scans that much, and the search is filtered on that scan
+    rather than through `study_search_vector_idx`.
+    """
+    return await pool_or_conn.fetch(
+        "SELECT s.idx, s.title, s.alias, s.bioproject_accession, s.ena_study_accession,"
+        "       s.default_tier, s.owner_idx, s.updated_at, sa.access_tier,"
+        f"      {export_entity_id_select('study', alias='s')},"
+        f"      ($3::text IS NOT NULL AND {_STUDY_SUMMARY_TSVECTOR}"
+        "        @@ websearch_to_tsquery('english', $3)) AS summary_match"
+        " FROM qiita.study s"
+        " LEFT JOIN qiita.study_access sa"
+        "   ON sa.study_idx = s.idx AND sa.principal_idx = $1"
+        " WHERE ($2 OR s.owner_idx = $1 OR sa.access_tier IS NOT NULL"
+        "        OR ($6 AND s.default_tier = $7::qiita.tier))"
+        "   AND ($3::text IS NULL"
+        "        OR s.search_vector @@ websearch_to_tsquery('english', $3)"
+        f"       OR {_STUDY_SUMMARY_TSVECTOR} @@ websearch_to_tsquery('english', $3))"
+        "   AND ($4::bigint IS NULL OR s.idx < $4)"
+        " ORDER BY s.idx DESC"
+        " LIMIT $5",
+        principal_idx,
+        all_studies,
+        query,
+        after_study_idx,
+        limit,
+        include_ungranted_public,
+        Tier.PUBLIC,
+    )

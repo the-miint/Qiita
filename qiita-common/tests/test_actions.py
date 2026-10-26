@@ -196,6 +196,73 @@ def test_alignment_gate_without_a_threaded_alignment_idx_rejected():
     assert ActionDefinition(**kwargs).steps[-1].name == "reconcile-alignment-block"
 
 
+def _qc_workflow(*names: str) -> list[dict]:
+    """`align`/`assemble` become steps threading their gate's identity; the rest are actions."""
+    binding = {"align": "alignment_idx", "assemble": "processing_idx"}
+    step = {
+        "step_type": StepType.SINGLETON,
+        "container": "img:1",
+        "entrypoint": "/opt/qiita/x.sh",
+        "baseline_resources": {"cpu": 1, "mem_gb": 1, "walltime": "PT1M"},
+    }
+    return [
+        {"step": n, "params": {binding[n]: binding[n]}, **step} if n in binding else {"action": n}
+        for n in names
+    ]
+
+
+@pytest.mark.parametrize(
+    ("names", "match"),
+    [
+        (("assemble", "finalize-assembly-sample", "persist-qc-checks"), "assembly"),
+        (
+            ("assemble", "finalize-mask-sample", "finalize-assembly-sample", "persist-qc-checks"),
+            "assembly",
+        ),
+        (
+            ("align", "persist-qc-checks", "finalize-alignment-sample"),
+            "finalize-alignment-sample",
+        ),
+        (("persist-qc-checks", "finalize-mask-sample"), "finalize-mask-sample"),
+        (
+            ("align", "finalize-mask-sample", "persist-qc-checks", "finalize-alignment-sample"),
+            "finalize-alignment-sample",
+        ),
+    ],
+)
+def test_misplaced_persist_qc_checks_rejected(names, match):
+    from qiita_common.actions import ActionDefinition
+
+    kwargs = _minimal_action_kwargs()
+    kwargs["steps"] = _qc_workflow(*names)
+    with pytest.raises(ValidationError, match=match):
+        ActionDefinition(**kwargs)
+
+
+@pytest.mark.parametrize(
+    "names",
+    [
+        ("persist-qc-checks",),
+        ("finalize-mask-sample", "persist-qc-checks"),
+        ("align", "finalize-alignment-sample", "persist-qc-checks"),
+        (
+            "align",
+            "assemble",
+            "finalize-assembly-sample",
+            "finalize-alignment-sample",
+            "persist-qc-checks",
+        ),
+        ("align", "finalize-alignment-sample", "persist-qc-checks", "finalize-mask-sample"),
+    ],
+)
+def test_persist_qc_checks_after_its_gate_accepted(names):
+    from qiita_common.actions import ActionDefinition
+
+    kwargs = _minimal_action_kwargs()
+    kwargs["steps"] = _qc_workflow(*names)
+    assert [e.name for e in ActionDefinition(**kwargs).steps] == list(names)
+
+
 def test_duplicate_action_names_allowed():
     """Two `action:` entries may share a name — they run in-process keyed on the
     step index, not the name (e.g. two `register-index` actions in the

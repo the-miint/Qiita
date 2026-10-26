@@ -2,9 +2,10 @@
 
 A **combined** table estimates over two alignment runs at once: the cohort aligned
 against a reference, and each sample aligned against its own assembled contigs. This
-module owns what is true only of the second arm and of the join between them, with
-one exception noted at `coverage._denovo_survivor_parts`, which an import cycle
-keeps where it is. Absent it, every relation and every statement here is skipped and the analytic
+module owns what is true only of the second arm and of the join between them. The
+de novo arm's survivor set is built by `coverage.survivor_table_sql`; its denominators
+are staged here.
+Absent the arm, every relation and every statement here is skipped and the analytic
 is the reference-only one.
 
 **Precedence: the de novo arm wins a read outright.** A read the de novo arm placed
@@ -55,7 +56,6 @@ from .relations import (
     ALIGNMENT_TABLE,
     DENOVO_ALIGNMENT_TABLE,
     DENOVO_CONTIG_LENGTHS_TABLE,
-    DENOVO_COVERAGE_ALIGNMENTS_VIEW,
     DENOVO_GENOME_QUALITY_TABLE,
     DENOVO_MAP_TABLE,
     GENOME_LENGTHS_TABLE,
@@ -64,17 +64,17 @@ from .stage import ALIGNMENT_COLUMNS
 
 
 def denovo_map_join(alias: str) -> str:
-    """The extra ON term a join against `DENOVO_MAP_TABLE` carries when its left side
-    has a sample: the SAMPLE, as well as the contig. `alias` is that side's table
-    alias; the map side is always `m`.
+    """The extra ON term a read-level join against `DENOVO_MAP_TABLE` carries: the
+    PREP_SAMPLE, as well as the contig. `alias` is the read side's table alias; the map
+    side is always `m`.
 
-    The one join that omits it is `denovo_genome_lengths_insert_sql`, whose left side
-    is the deduplicated lengths and has no sample column — deliberately, and it says
-    why.
+    Two consumers of the map omit it, each saying why:
+    `denovo_genome_lengths_insert_sql`, whose left side is the deduplicated lengths
+    and has no prep_sample column, and `coverage.survivor_table_sql`.
 
     A function rather than a literal at each site, and taking the alias rather than
-    baking one in, because the three call sites alias their left relation differently
-    and a constant that fixed the spelling would be copied out by hand at the others
+    baking one in, because the two call sites alias their left relation differently
+    and a constant that fixed the spelling would be copied out by hand at the other
     — which is the drift it exists to prevent.
 
     Dropping the term is not a bind error, which is why it is shared at all: two
@@ -360,23 +360,6 @@ def denovo_alignment_statements(source: str) -> tuple[str, ...]:
         f"SELECT p.sequence_idx FROM {DENOVO_ALIGNMENT_TABLE} p "
         f"JOIN {DENOVO_MAP_TABLE} m ON p.feature_idx = m.contig_id"
         f"{denovo_map_join('p')})",
-    )
-
-
-def denovo_coverage_alignments_view_sql() -> str:
-    """The de novo arm's aligned intervals, in the shape `coverage_alignments_view_sql`
-    produces for the reference arm and for the same reasons — NULL coordinates excluded
-    where the exclusion is visible, `prep_sample_idx` carried so a scope can group by it.
-
-    A separate view rather than a `UNION ALL` with the reference one, because the two
-    reach their genome through different maps; the union happens in the survivor set,
-    after each arm has been rolled up through its own.
-    """
-    return (
-        f"CREATE VIEW {DENOVO_COVERAGE_ALIGNMENTS_VIEW} AS "
-        f"SELECT prep_sample_idx, feature_idx AS reference, position, stop_position "
-        f"FROM {DENOVO_ALIGNMENT_TABLE} "
-        f"WHERE position IS NOT NULL AND stop_position IS NOT NULL"
     )
 
 

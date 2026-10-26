@@ -12,6 +12,7 @@ from enum import StrEnum
 from typing import Annotated, Any, ClassVar, Literal
 
 from pydantic import (
+    AfterValidator,
     BaseModel,
     BeforeValidator,
     ConfigDict,
@@ -62,13 +63,29 @@ def _strip_text(value: Any) -> Any:
     return value.strip() if isinstance(value, str) else value
 
 
+def _reject_nul(value: str) -> str:
+    """Refuse text carrying a NUL.
+
+    A zero byte is legal in JSON and in a Python str but cannot be stored in a
+    Postgres text column, so text carrying one validates cleanly and then fails
+    at the driver with an error no route maps. Refusing it here makes it the
+    422 it always was.
+    """
+    if "\x00" in value:
+        raise ValueError("must not contain a NUL character")
+    return value
+
+
 # Inbound text that has to carry content. Stripping runs ahead of the length
 # bounds, so whitespace-only text fails min_length instead of reaching storage
 # as '', and one identifier written with stray padding resolves to the same row
 # as the unpadded spelling. Declining to give a value should be expressed with a
-# missing-value marker, not with empty text. Read models built from stored rows
-# must NOT use this: they could refuse rows already in the database.
-NonBlankText = Annotated[str, BeforeValidator(_strip_text), Field(min_length=1)]
+# missing-value marker, not with empty text. A NUL is refused outright, for the
+# reason given at _reject_nul. Read models built from stored rows must NOT use
+# this: they could refuse rows already in the database.
+NonBlankText = Annotated[
+    str, BeforeValidator(_strip_text), Field(min_length=1), AfterValidator(_reject_nul)
+]
 NonBlankName = Annotated[NonBlankText, Field(max_length=MAX_NAME_LENGTH)]
 
 # An externally-assigned accession (ENA, BioSample, BioProject). Every accession
@@ -76,6 +93,16 @@ NonBlankName = Annotated[NonBlankText, Field(max_length=MAX_NAME_LENGTH)]
 # first caller sending empty text would take that single slot and every later one
 # would collide. Absent means NULL, never empty text.
 AccessionText = Annotated[NonBlankText, Field(max_length=MAX_ACCESSION_LENGTH)]
+
+# An email naming an existing qiita.user, which is only looked up, never stored,
+# so it is checked for shape alone: `EmailStr` would refuse addresses an account
+# can already carry (it rejects special-use domains such as `.local`). Control
+# characters are excluded because Postgres refuses a NUL in text with an error,
+# not a non-match.
+LookupEmail = Annotated[
+    str,
+    Field(max_length=320, pattern=r"^[^@\s\x00-\x1f\x7f]+@[^@\s\x00-\x1f\x7f]+$"),
+]
 
 
 def _fraction_passing_quality_filter(

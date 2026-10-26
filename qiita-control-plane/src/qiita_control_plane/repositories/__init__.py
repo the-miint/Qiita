@@ -23,6 +23,28 @@ UpdatableTable = Literal[
     "qiita.study",
 ]
 
+# pg advisory-lock keys are int4; mask a bigint (idx, cohort id) into positive
+# int4 before pairing it with a lock class. A wrap collision only serialises
+# two unrelated holders of the same key for a moment.
+INT4_MASK = 0x7FFF_FFFF
+
+# Registry of advisory-lock keys/classes, so a new one is allocated rather
+# than invented (each Python site also carries its own "distinct from" note):
+#   repositories.block             1-arg, hashtextextended(mask_idx:prep_sample_idx)
+#   repositories.sequencing_run    2-arg class POOL_RESOLVE_LOCK_CLASS (pool
+#                                  writes vs the download-roster read)
+#   repositories.sequence_range    2-arg class PREP_SAMPLE_RANGE_LOCK_CLASS (range
+#                                  mint vs the empty-completion writer)
+#   fanout_dispatch                2-arg classes 0x0FA0_0001-3 (cohort kinds)
+#   actions.library                1-arg key 4_310_290_149 (exclusion sync)
+#   notify.sweeper                 1-arg key 4_310_290_147
+#   auth.cli_login_code_sweeper    1-arg key 4_310_290_148
+# and, taken inside plpgsql (db/migrations/):
+#   qiita.mint_sequence_range      1-arg, hashtext('qiita.sequence_idx_seq') (the
+#                                  global range-allocation lock)
+#   principal role triggers        1-arg, principal_idx (the auth and role-typed FK
+#                                  triggers)
+
 
 def require_transaction(conn: asyncpg.Connection) -> None:
     """Raise RuntimeError if conn is not currently inside a transaction.
@@ -144,9 +166,9 @@ def gate_state_literal(value: str, declared: object) -> str:
     rows — the failure mode a gate query has, where a typo returns an empty
     result rather than an error.
 
-    Shared by every repository module that binds gate states as query
-    parameters (`mask_definition`, `processing`), so the two cannot drift into
-    two spellings of the same assertion.
+    Each gate's states are asserted once, beside the gate's contract
+    (`repositories.block` for `mask_sample`, `repositories.assembly` for
+    `assembly_sample`), and the service's other modules import those constants.
     """
     members = get_args(declared)
     if value not in members:

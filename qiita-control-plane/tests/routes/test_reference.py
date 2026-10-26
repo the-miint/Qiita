@@ -511,7 +511,7 @@ async def doget_ctx(postgres_pool, compute_worker_service_account):
 
     `seed_reference(status)` inserts a reference directly at an arbitrary
     status (the public create route only mints `pending`) and tracks it for
-    FK-reverse cleanup at teardown.
+    cleanup.
     """
     from qiita_control_plane.config import Settings
     from qiita_control_plane.main import app

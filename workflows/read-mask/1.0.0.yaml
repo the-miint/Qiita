@@ -145,12 +145,11 @@ steps:
     # `alignment` is the alignment the step used to build the mask, emitted verbatim
     # rather than discarded — the old step reduced each read to a boolean and threw the
     # coordinates away, which is exactly what made per-insert quantification impossible.
-    # Emitted as groundwork for a coverage-measurement consumer (deferred): no step
-    # consumes this binding yet. The name is shared with align_sharded's `alignment`
-    # output so a future consumer can bind either — but the SCHEMAS differ (syndna's
-    # subject is the whole plasmid, so it carries `parent_feature_idx` and no mate/
-    # alignment_idx columns; align_sharded's subject is the feature itself), so that
-    # consumer still has to know which producer it is reading.
+    # persist-syndna-read-count consumes it. The name is shared with
+    # align_sharded's `alignment` output, but the SCHEMAS differ (syndna's subject
+    # is the whole plasmid, so it carries `parent_feature_idx` and no mate/
+    # alignment_idx columns; align_sharded's subject is the feature itself), so a
+    # consumer has to know which producer it is reading.
     outputs: [partial_mask, alignment]
     baseline_resources:
       cpu: 4
@@ -306,10 +305,20 @@ steps:
   # per-sample twin of the block workflow's reconcile-block gate flip; consumers
   # (masked-read export, long-read-assembly input, alignment) read this gate and
   # require 'completed'. No file inputs: mask_idx from the ticket, prep_sample_idx
-  # from the scope target. MUST run last — after register-files makes the masked
-  # reads durable — so 'completed' never advertises reads that aren't in DuckLake.
+  # from the scope target. MUST run after register-files makes the masked reads
+  # durable, so 'completed' never advertises reads that aren't in DuckLake.
   - action: finalize-mask-sample
     inputs: []
+    outputs: []
+
+  # Persist the reads aligned to each SynDNA insert (ungated, mapped-primary)
+  # from the syndna step's `alignment` output into qiita.syndna_read_count.
+  # Gated with the step that produces its input. Resume matches completed steps
+  # by position, so a new entry goes after the existing ones, never between them.
+  # Until this has run, a 'completed' sample has no counts and the export refuses it.
+  - action: persist-syndna-read-count
+    when: syndna_enabled
+    inputs: [alignment]
     outputs: []
 
 # Ceiling must stay strictly ABOVE every step baseline on the escalating axes

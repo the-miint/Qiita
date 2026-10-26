@@ -1113,6 +1113,8 @@ async def submit_block_mask_plan(
         # unmapped 500 an unhandled raise gives: the request is well-formed
         # and would have succeeded before the deprecation.
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=exc.detail) from exc
+    except block_planner.BlockPlanSampleGainedReads as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     except block_planner.BlockMaskResubmitError as exc:
         # A sample already gated for the resolved mask would be re-masked
         # (completed → read_mask double-write) or wedged (pending → duplicate

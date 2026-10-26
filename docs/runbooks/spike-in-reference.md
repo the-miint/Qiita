@@ -106,3 +106,38 @@ qiita --base-url https://<host> reference list --active --index-type minimap2   
 Then submit: `qiita submit-host-filter-pool --sequencing-run-idx R \
 --sequenced-pool-idx P --syndna-reference-idx <idx>` (PacBio absquant pools
 require it; it is rejected on a non-absquant pool).
+
+## Export the per-insert read counts
+
+Each completed `read-mask` ticket under a SynDNA mask writes, per prep_sample, the number
+of reads with a mapped primary alignment to each member of the reference — ungated,
+so not the `spikein_read_count_r1r2` total — into `qiita.syndna_read_count`. A
+prep_sample that ingest found empty gets a zero per member instead. A study
+reader exports them as the table classic Qiita published as `syndna.biom`:
+
+```bash
+qiita mask syndna-read-count --mask-idx M --study-idx S --output syndna.biom \
+  --data-plane-url grpc+tls://<host>:443
+```
+
+Select by `--study-idx`, `--sequenced-pool-idx` or `--prep-sample-idx` (repeatable;
+the filters intersect). `--format parquet` writes the same values with the zero cells
+kept. Each prep_sample's `sample_id` is its biosample accession; `--prefix-pool` makes it
+`<sequenced_pool_idx>_<accession>` when one biosample was sequenced on two pools.
+Inserts are named by the taxonomy's `species` rank, read from the data plane (hence
+`--data-plane-url`); load the insert reference with each insert's FASTA header as its
+species. `--feature-names accession` names them by the header the load recorded
+instead, which a reference loaded before headers were recorded does not have.
+
+prep_samples masked before the counts were persisted are refused with a pointer to the
+backfill, which an operator runs on the deploy host with `DATABASE_URL` and
+`PATH_SCRATCH` set:
+
+```bash
+qiita-admin backfill syndna-read-count            # dry run: what it would write, and what it cannot
+qiita-admin backfill syndna-read-count --execute
+```
+
+It reads each prep_sample's `syndna` step output from the read-mask ticket's scratch
+workspace. A prep_sample whose file is gone is listed and skipped; a re-mask is then the
+only source of its counts.

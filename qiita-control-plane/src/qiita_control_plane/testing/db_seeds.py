@@ -1,16 +1,15 @@
 """Pytest seed and state-change helpers for DB-row fixtures.
 
 Plain async functions (not pytest fixtures) so callers can pass test-local
-arguments. Helpers fall into four groups: seeders that insert rows and
-return the new idx, state-changers that update existing rows (disabling,
-retiring, etc.), lookup helpers for migration-seeded reference data that
-every test DB carries, and a cleanup-tracking helper that records
-import-created rows in a test's `created` dict. Cleanup is the caller's
-responsibility
-(route tests do FK-reverse cleanup against a per-test `created` tracker;
-integration tests may rely on a session-scoped truncate). Helpers are
-pool-based and commit their writes — for repository-layer trigger tests
-that roll back, build the SQL inline against the open connection instead.
+arguments, covering what a DB-row fixture needs to insert its rows, move them
+between states, and look up the reference data every test DB carries. The study
+/ biosample / prep_sample graph is torn down by the ordered sweep in
+db_teardown, a caller's own parents by its own teardown, and integration tests
+may rely on a session-scoped truncate; the graphs that sweep does not reach —
+reference, terminology, action — are torn down by the helpers here, beside the
+seeders that build them. Helpers are pool-based and commit their writes — for
+repository-layer trigger tests that roll back, build the SQL inline against the
+open connection instead.
 """
 
 import json
@@ -22,16 +21,25 @@ import asyncpg
 from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX, SystemRole
 from qiita_common.chunking import canonical_sequence_hash_expr
 from qiita_common.hashing import canonical_params_hash
+from qiita_common.models import (
+    BIOSAMPLE_DISPLAY_QIITA_SAMPLE_TYPE,
+    BIOSAMPLE_FIELD_QIITA_SAMPLE_TYPE,
+    FieldDataType,
+    GenomeSource,
+    ReferenceStatus,
+    TerminologyStatus,
+)
 
 # Re-exported (redundant-alias form, so the linter keeps what looks unused here).
 # The taxonomy constants live in qiita_common.models now — production code must
 # not reach into `testing/` for them — but the suite imports them alongside these
 # seed helpers, so they stay reachable from here.
 from qiita_common.models import NCBI_TAXONOMY_HUMAN_TERM_ID as NCBI_TAXONOMY_HUMAN_TERM_ID
+from qiita_common.models import NCBI_TAXONOMY_METAGENOME_TERM_ID as NCBI_TAXONOMY_METAGENOME_TERM_ID
 from qiita_common.models import NCBI_TAXONOMY_NAME as NCBI_TAXONOMY_NAME
-from qiita_common.models import FieldDataType, GenomeSource, ReferenceStatus, TerminologyStatus
 
 from qiita_control_plane.miint import connect_with_miint
+from qiita_control_plane.repositories.exported_entity import ENTITY_COLUMN, EntityKind
 from qiita_control_plane.repositories.host_filter_profile import insert_host_filter_profile
 
 from ..repositories._sample_helpers import (
@@ -40,10 +48,7 @@ from ..repositories._sample_helpers import (
     _get_or_create_local_study_field,
     write_local_metadata_or_diagnose,
 )
-
-# Seeded NCBI Taxonomy fixture data — must match the seed migration at
-# qiita-control-plane/db/migrations/20260525000000_seed_ncbi_taxonomy.sql.
-NCBI_TAXONOMY_METAGENOME_TERM_ID = "256318"
+from ..repositories.biosample_metadata import BIOSAMPLE_METADATA_SPEC
 
 # Pinned loaded_at for seeded terminology rows, so a seeded row is fully
 # determined rather than stamped at insert time. UTC-aware and
@@ -78,6 +83,18 @@ async def fetch_missing_value_reason_idx(pool: asyncpg.Pool, name: str) -> int |
     migration ('not applicable', 'not collected', 'missing: control sample', …).
     """
     return await pool.fetchval("SELECT idx FROM qiita.missing_value_reason WHERE name = $1", name)
+
+
+async def fetch_export_entity_id(
+    pool: asyncpg.Pool, *, kind: EntityKind, entity_idx: int
+) -> str | None:
+    """Return the export_entity_id qiita.exported_entity holds for one study or
+    biosample, or None when it holds none."""
+    column = ENTITY_COLUMN[kind]
+    export_entity_id = await pool.fetchval(
+        f"SELECT export_entity_id FROM qiita.exported_entity WHERE {column} = $1", entity_idx
+    )
+    return export_entity_id
 
 
 async def seed_terminology(
@@ -425,6 +442,51 @@ async def seed_biosample(
     )
 
 
+async def seed_study(
+    pool: asyncpg.Pool,
+    *,
+    owner_idx: int,
+    title: str,
+    created_by_idx: int | None = None,
+) -> int:
+    """Insert a minimal qiita.study row; return its idx.
+
+    `created_by_idx` defaults to `owner_idx`. Only the NOT-NULL columns are
+    populated; every other column carries its schema default.
+    """
+    author_idx = owner_idx if created_by_idx is None else created_by_idx
+    study_idx = await pool.fetchval(
+        "INSERT INTO qiita.study (owner_idx, title, created_by_idx)"
+        " VALUES ($1, $2, $3) RETURNING idx",
+        owner_idx,
+        title,
+        author_idx,
+    )
+    return study_idx
+
+
+async def seed_exported_entity_probe(
+    pool: asyncpg.Pool,
+    *,
+    prefix: str,
+    study_count: int,
+) -> tuple[int, list[int], int]:
+    """Insert one principal owning `study_count` studies and one biosample;
+    return (principal_idx, study_idxs, biosample_idx).
+    """
+    # A user-kind principal: qiita.biosample.owner_idx is guarded by a role-typed
+    # FK trigger that rejects a service account.
+    principal_idx = await seed_user_principal(pool, prefix=prefix, suffix="probe")
+    study_idxs = [
+        await seed_study(pool, owner_idx=principal_idx, title=f"{prefix} probe {position}")
+        for position in range(study_count)
+    ]
+    biosample_idx = await seed_biosample(
+        pool, owner_idx=principal_idx, created_by_idx=principal_idx
+    )
+    return principal_idx, study_idxs, biosample_idx
+
+
 async def seed_sequenced_prep_sample(
     pool: asyncpg.Pool,
     *,
@@ -465,12 +527,12 @@ async def seed_biosample_with_sequenced_prep_sample(
     return `(biosample_idx, prep_sample_idx)`.
 
     Composes `seed_biosample` (owner + created_by both = owner_idx) and
-    `seed_sequenced_prep_sample`. Use this from fixtures that need a
-    sequenced prep_sample to scope a work_ticket or a sequence_range
-    against and want to track both rows for FK-reverse cleanup. Callers
-    that need a non-default prep_protocol pass `protocol_name`; the
-    underlying helper resolves it by lookup against the seeded protocols
-    (qiita.prep_protocol, populated by migration 20260501000010).
+    `seed_sequenced_prep_sample`. Use this from fixtures that need a sequenced
+    prep_sample to scope a work_ticket or a sequence_range against; both rows go
+    to the sweep as entities. Callers that need a non-default prep_protocol pass
+    `protocol_name`; the underlying helper resolves it by lookup against the
+    seeded protocols (qiita.prep_protocol, populated by migration
+    20260501000010).
     """
     biosample_idx = await seed_biosample(pool, owner_idx=owner_idx, created_by_idx=owner_idx)
     prep_sample_idx = await seed_sequenced_prep_sample(
@@ -502,8 +564,9 @@ async def seed_sequenced_sample_subtype(
     populated — the sequenced_sample_pool_pair_consistent CHECK requires
     the pool idx and item id to be set together. Use this from fixtures
     that need a prep_sample carrying a pool item id (e.g. the
-    work_ticket fastq-filename-prefix gate). Caller does FK-reverse
-    cleanup: sequenced_sample, then sequenced_pool, then sequencing_run.
+    work_ticket fastq-filename-prefix gate). The sweep takes the
+    sequenced_sample with its prep_sample; the pool and then the run are the
+    caller's own to delete.
 
     Pass `sequencing_run_idx` + `sequenced_pool_idx` (both, as returned by an
     earlier call) to attach this sample to an EXISTING pool instead of standing
@@ -577,6 +640,45 @@ async def seed_biosample_global_field(
     )
 
 
+async def seed_biosample_sample_type(
+    pool: asyncpg.Pool,
+    *,
+    biosample_idx: int,
+    study_idx: int,
+    created_by_idx: int,
+    term_id: str,
+) -> None:
+    """Write `qiita_sample_type = term_id` on a biosample, linking the study field if absent."""
+    async with pool.acquire() as conn, conn.transaction():
+        row = await conn.fetchrow(
+            "SELECT bgf.idx AS field_idx, tt.idx AS term_idx"
+            "  FROM qiita.biosample_global_field bgf"
+            "  JOIN qiita.terminology_term tt ON tt.terminology_idx = bgf.terminology_idx"
+            " WHERE bgf.internal_name = $1 AND tt.term_id = $2",
+            BIOSAMPLE_FIELD_QIITA_SAMPLE_TYPE,
+            term_id,
+        )
+        assert row is not None, f"{term_id!r} should be seeded for qiita_sample_type"
+        field_idx, _ = await _get_or_create_globally_linked_study_field(
+            conn,
+            spec=BIOSAMPLE_METADATA_SPEC,
+            study_idx=study_idx,
+            global_field_idx=row["field_idx"],
+            display_name=BIOSAMPLE_DISPLAY_QIITA_SAMPLE_TYPE,
+            created_by_idx=created_by_idx,
+        )
+        await conn.execute(
+            "INSERT INTO qiita.biosample_metadata"
+            " (biosample_idx, biosample_study_field_idx, value_terminology_term_idx,"
+            "  created_by_idx)"
+            " VALUES ($1, $2, $3, $4)",
+            biosample_idx,
+            field_idx,
+            row["term_idx"],
+            created_by_idx,
+        )
+
+
 async def seed_prep_sample_global_field(
     pool: asyncpg.Pool,
     *,
@@ -625,9 +727,9 @@ async def seed_local_study_field(
     """Create a purely-local study field for spec's entity and return its idx.
 
     Delegates to the repository get-or-create so the study-field INSERT and
-    inheritance rules stay single-sourced; the caller supplies display_name and
-    tracks the returned idx for cleanup. Runs inside an acquired transaction
-    because the underlying upsert requires one.
+    inheritance rules stay single-sourced; the caller supplies display_name. The
+    row is keyed on the study, so the sweep takes it. Runs inside an acquired
+    transaction because the underlying upsert requires one.
     """
     async with pool.acquire() as conn, conn.transaction():
         idx, _, _ = await _get_or_create_local_study_field(
@@ -654,12 +756,12 @@ async def seed_local_metadata_value(
     data_type: FieldDataType = FieldDataType.TEXT,
 ) -> tuple[int, int]:
     """Write one purely-local metadata value for spec's entity and return
-    (metadata_idx, study_field_idx) for cleanup.
+    (metadata_idx, study_field_idx).
 
     Delegates to the repository local writer so the study-field get-or-create
-    and the value insert stay single-sourced; the caller tracks both returned
-    idxs for FK-reverse teardown. Runs inside an acquired transaction because
-    the underlying writer requires one.
+    and the value insert stay single-sourced. Both rows are keyed on an entity
+    the sweep takes, so neither is the caller's to delete. Runs inside an
+    acquired transaction because the underlying writer requires one.
     """
     async with pool.acquire() as conn, conn.transaction():
         result = await write_local_metadata_or_diagnose(
@@ -688,9 +790,10 @@ async def seed_globally_linked_study_field(
     return its idx.
 
     Delegates to the repository get-or-create so the study-field INSERT and
-    inheritance rules stay single-sourced; the caller supplies display_name and
-    tracks the returned idx for cleanup. Runs inside an acquired transaction
-    because the underlying upsert requires one.
+    inheritance rules stay single-sourced; the caller supplies display_name. The
+    row is keyed on the study, so the sweep takes it; the global field it links
+    to is the caller's own. Runs inside an acquired transaction because the
+    underlying upsert requires one.
     """
     async with pool.acquire() as conn, conn.transaction():
         idx, _ = await _get_or_create_globally_linked_study_field(
@@ -702,43 +805,6 @@ async def seed_globally_linked_study_field(
             created_by_idx=created_by_idx,
         )
     return idx
-
-
-async def track_biosample_metadata_outputs(
-    pool: asyncpg.Pool,
-    created: dict,
-    biosample_idx: int,
-    study_idx: int,
-    global_field_idxs: list[int],
-) -> None:
-    """Record, in a test's `created` tracker, the study-field and metadata rows a
-    biosample import produced, so FK-reverse cleanup sweeps them.
-
-    Appends every globally-linked biosample_study_field at study_idx tied to one
-    of global_field_idxs, plus every non-owner-id biosample_metadata row for
-    biosample_idx. An idx already present is not re-appended.
-    """
-    # Pick up every globally-linked study field row at this study tied to
-    # one of the supplied global fields.
-    field_rows = await pool.fetch(
-        "SELECT idx FROM qiita.biosample_study_field"
-        " WHERE study_idx = $1 AND biosample_global_field_idx = ANY($2::bigint[])",
-        study_idx,
-        list(global_field_idxs),
-    )
-    for r in field_rows:
-        if r["idx"] not in created["biosample_study_field"]:
-            created["biosample_study_field"].append(r["idx"])
-
-    # Pick up every non-owner-id metadata row for this biosample.
-    meta_rows = await pool.fetch(
-        "SELECT idx FROM qiita.biosample_metadata"
-        " WHERE biosample_idx = $1 AND is_owner_biosample_id = false",
-        biosample_idx,
-    )
-    for r in meta_rows:
-        if r["idx"] not in created["biosample_metadata"]:
-            created["biosample_metadata"].append(r["idx"])
 
 
 async def seed_biosample_to_study_link(
@@ -993,8 +1059,13 @@ async def seed_feature_genome(pool: asyncpg.Pool, *, feature_idx: int, genome_id
 async def cleanup_reference_graph(
     pool: asyncpg.Pool, *, reference_idx: int, feature_idxs=(), genome_idxs=()
 ) -> None:
-    """FK-reverse teardown for the seeders above: feature_genome, membership,
-    feature, genome, then the reference itself."""
+    """Delete a reference and the features and genomes built on it.
+
+    None of these hang off a study, biosample or prep_sample, so the entity
+    sweep does not reach them. Deletes in the order the references require:
+    feature_genome and membership, then feature, then genome, then the
+    reference.
+    """
     if feature_idxs:
         await pool.execute(
             "DELETE FROM qiita.feature_genome WHERE feature_idx = ANY($1::bigint[])",

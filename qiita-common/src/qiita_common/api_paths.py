@@ -85,6 +85,11 @@ PATH_REFERENCE_GENOME_MAP = "/{reference_idx}/genome-map"
 # path with one behaviour is what the api_paths triple can express. Param path,
 # 3 segments, no literal shadow.
 PATH_REFERENCE_GENOME_MAP_PARQUET = "/{reference_idx}/genome-map/parquet"
+# Operator maintenance: give one reference's phylogeny rows the edge numbering
+# placements join on, for a tree loaded before the loader minted it. A verb segment
+# (like /revoke-all-tokens) because it is an action on the tree, not a sub-resource
+# to read. Param path, 3 segments, no literal shadow.
+PATH_REFERENCE_PHYLOGENY_MINT_EDGE_ID = "/{reference_idx}/phylogeny/mint-edge-id"
 
 URL_REFERENCE_PREFIX = f"{API_PREFIX}{PATH_REFERENCE_PREFIX}"
 URL_REFERENCE_BY_IDX = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_BY_IDX}"
@@ -98,6 +103,9 @@ URL_REFERENCE_EXCLUSION_BY_IDX = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_EXCLUSI
 URL_REFERENCE_GENOME_MEMBER = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_GENOME_MEMBER}"
 URL_REFERENCE_GENOME_MAP = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_GENOME_MAP}"
 URL_REFERENCE_GENOME_MAP_PARQUET = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_GENOME_MAP_PARQUET}"
+URL_REFERENCE_PHYLOGENY_MINT_EDGE_ID = (
+    f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_PHYLOGENY_MINT_EDGE_ID}"
+)
 
 # =============================================================================
 # /host-filter-profile/*
@@ -161,7 +169,13 @@ class LibraryPrimitive(StrEnum):
     # See qiita_control_plane.actions.library.finalize_shard.
     FINALIZE_SHARD = "finalize-shard"
     PERSIST_READ_METRICS = "persist-read-metrics"
+    PERSIST_ENA_RUN_OUTCOMES = "persist-ena-run-outcomes"
+    # Read-mask: the per-insert SynDNA read counts from the `syndna` step's
+    # alignment, into qiita.syndna_read_count. See
+    # qiita_control_plane.actions.library.persist_syndna_read_count.
+    PERSIST_SYNDNA_READ_COUNT = "persist-syndna-read-count"
     PERSIST_QC_REPORT = "persist-qc-report"
+    PERSIST_QC_CHECKS = "persist-qc-checks"
     # Block-compute: idempotent block replace. Runs immediately BEFORE
     # register-files in the bulk-block read-mask workflow — deletes this block's
     # exact read_mask footprint (its member sub-ranges under the ticket's
@@ -409,9 +423,7 @@ def compute_reads_staging_path(staging_root: Path, prep_sample_idx: int) -> Path
 # =============================================================================
 # Mints contiguous bigint ranges (`sequence_idx_start..stop`) the data
 # plane uses to key raw sequencing reads. POST is service-account-only
-# (Scope.SEQUENCE_RANGE_MINT); GET accepts Scope.PREP_SAMPLE_READ OR
-# Scope.SEQUENCE_RANGE_MINT (the latter lets the minter read back its own
-# range on the ingest_reads retry/reuse path).
+# (Scope.SEQUENCE_RANGE_MINT); who may GET is on get_sequence_range_route.
 
 PATH_SEQUENCE_RANGE_PREFIX = "/sequence-range"
 PATH_SEQUENCE_RANGE_ROOT = ""  # POST against the prefix itself
@@ -421,6 +433,16 @@ URL_SEQUENCE_RANGE_PREFIX = f"{API_PREFIX}{PATH_SEQUENCE_RANGE_PREFIX}"
 URL_SEQUENCE_RANGE_BY_PREP_SAMPLE = (
     f"{URL_SEQUENCE_RANGE_PREFIX}{PATH_SEQUENCE_RANGE_BY_PREP_SAMPLE}"
 )
+
+# =============================================================================
+# /qc-check/* — per-prep_sample QC check rows and verdict
+# =============================================================================
+
+PATH_QC_CHECK_PREFIX = "/qc-check"
+PATH_QC_CHECK_BY_PREP_SAMPLE = "/{prep_sample_idx}"
+
+URL_QC_CHECK_PREFIX = f"{API_PREFIX}{PATH_QC_CHECK_PREFIX}"
+URL_QC_CHECK_BY_PREP_SAMPLE = f"{URL_QC_CHECK_PREFIX}{PATH_QC_CHECK_BY_PREP_SAMPLE}"
 
 # =============================================================================
 # /mask-definition/* — control-plane read-filtering config identity
@@ -448,6 +470,9 @@ PATH_MASK_DEFINITION_STATUS = "/{mask_idx}/status"
 # sample. Distinct from the route above: config lifecycle and run lifecycle are
 # different questions (see qiita_common.models.MaskDefinitionStatus).
 PATH_MASK_DEFINITION_SAMPLE_STATUS = "/{mask_idx}/sample-status"
+# GET the per-insert SynDNA read counts of the selected prep_samples under the mask.
+# Who may read it is on the route (routes/read_masked.py).
+PATH_MASK_DEFINITION_SYNDNA_READ_COUNT = "/{mask_idx}/syndna-read-count"
 
 URL_MASK_DEFINITION_PREFIX = f"{API_PREFIX}{PATH_MASK_DEFINITION_PREFIX}"
 URL_MASK_DEFINITION_BY_IDX = f"{URL_MASK_DEFINITION_PREFIX}{PATH_MASK_DEFINITION_BY_IDX}"
@@ -455,6 +480,9 @@ URL_MASK_DEFINITION_PREP_SAMPLE = f"{URL_MASK_DEFINITION_PREFIX}{PATH_MASK_DEFIN
 URL_MASK_DEFINITION_STATUS = f"{URL_MASK_DEFINITION_PREFIX}{PATH_MASK_DEFINITION_STATUS}"
 URL_MASK_DEFINITION_SAMPLE_STATUS = (
     f"{URL_MASK_DEFINITION_PREFIX}{PATH_MASK_DEFINITION_SAMPLE_STATUS}"
+)
+URL_MASK_DEFINITION_SYNDNA_READ_COUNT = (
+    f"{URL_MASK_DEFINITION_PREFIX}{PATH_MASK_DEFINITION_SYNDNA_READ_COUNT}"
 )
 
 # =============================================================================
@@ -547,10 +575,11 @@ URL_READ_DOGET = f"{URL_READ_PREFIX}{PATH_READ_DOGET}"
 # =============================================================================
 # /assembly/* — one assembly run's contigs, and its feature -> genome map
 # =============================================================================
-# The two DoGet routes sign the same ticket for the same data plane surfaces
-# (`assembled_sequence` / `assembled_sequence_chunks`), scoped to ONE assembly
-# run — a `(prep_sample_idx, processing_idx)` pair — and differ only in who may
-# ask and how the pair is authorized. The split mirrors /alignment's exactly, for
+# The two DoGet routes sign the same ticket for the data plane surfaces
+# (`assembled_sequence` / `assembled_sequence_chunks`, and on the human route
+# `bin_quality`), scoped to ONE assembly run — a `(prep_sample_idx,
+# processing_idx)` pair — and differ in who may ask and how the pair is
+# authorized. The split mirrors /alignment's exactly, for
 # the reason Scope.ALIGNMENT_DOGET states there.
 #
 #   PATH_ASSEMBLY_DOGET      service-account-only (Scope.TICKET_DOGET). The job
@@ -566,7 +595,13 @@ URL_READ_DOGET = f"{URL_READ_PREFIX}{PATH_READ_DOGET}"
 #
 # PATH_ASSEMBLY_GENOME_MAP is not a ticket at all — `genome_idx` exists only in
 # Postgres, so it is a control-plane read, the assembly twin of
-# PATH_REFERENCE_GENOME_MAP.
+# PATH_REFERENCE_GENOME_MAP. PATH_ASSEMBLY_MEMBERSHIP is its sibling over every
+# kind, carrying the assembler's per-contig attributes instead of the genome.
+#
+# PATH_ASSEMBLY_PREP_SAMPLE is the export roster: the samples assembled under one
+# run that the caller may READ, at the tier the reads above check. The
+# /processing roster answers a different question (which samples the caller may
+# submit against) at a higher tier.
 
 PATH_ASSEMBLY_PREFIX = "/assembly"
 PATH_ASSEMBLY_DOGET = "/ticket/doget"
@@ -575,12 +610,18 @@ PATH_ASSEMBLY_GENOME_MAP = "/{prep_sample_idx}/{processing_idx}/genome-map"
 # The Parquet form, uncapped — the de novo twin of
 # PATH_REFERENCE_GENOME_MAP_PARQUET, which carries why it is a segment.
 PATH_ASSEMBLY_GENOME_MAP_PARQUET = "/{prep_sample_idx}/{processing_idx}/genome-map/parquet"
+PATH_ASSEMBLY_MEMBERSHIP = "/{prep_sample_idx}/{processing_idx}/membership"
+PATH_ASSEMBLY_MEMBERSHIP_PARQUET = "/{prep_sample_idx}/{processing_idx}/membership/parquet"
+PATH_ASSEMBLY_PREP_SAMPLE = "/{processing_idx}/prep-sample"
 
 URL_ASSEMBLY_PREFIX = f"{API_PREFIX}{PATH_ASSEMBLY_PREFIX}"
 URL_ASSEMBLY_DOGET = f"{URL_ASSEMBLY_PREFIX}{PATH_ASSEMBLY_DOGET}"
 URL_ASSEMBLY_RUN_DOGET = f"{URL_ASSEMBLY_PREFIX}{PATH_ASSEMBLY_RUN_DOGET}"
 URL_ASSEMBLY_GENOME_MAP = f"{URL_ASSEMBLY_PREFIX}{PATH_ASSEMBLY_GENOME_MAP}"
 URL_ASSEMBLY_GENOME_MAP_PARQUET = f"{URL_ASSEMBLY_PREFIX}{PATH_ASSEMBLY_GENOME_MAP_PARQUET}"
+URL_ASSEMBLY_MEMBERSHIP = f"{URL_ASSEMBLY_PREFIX}{PATH_ASSEMBLY_MEMBERSHIP}"
+URL_ASSEMBLY_MEMBERSHIP_PARQUET = f"{URL_ASSEMBLY_PREFIX}{PATH_ASSEMBLY_MEMBERSHIP_PARQUET}"
+URL_ASSEMBLY_PREP_SAMPLE = f"{URL_ASSEMBLY_PREFIX}{PATH_ASSEMBLY_PREP_SAMPLE}"
 
 
 # =============================================================================
@@ -645,6 +686,9 @@ URL_AUTH_CLI_EXCHANGE = f"{URL_AUTH_PREFIX}{PATH_AUTH_CLI_EXCHANGE}"
 
 PATH_ADMIN_PREFIX = "/admin"
 PATH_ADMIN_SERVICE_ACCOUNT = "/service-account"
+# Resolve a human principal by email (POST body) to the handle the role/status
+# routes below take.
+PATH_ADMIN_PRINCIPAL_LOOKUP_BY_EMAIL = "/principal/lookup-by-email"
 PATH_ADMIN_PRINCIPAL_DISABLED = "/principal/{principal_idx}/disabled"
 PATH_ADMIN_PRINCIPAL_RETIRED = "/principal/{principal_idx}/retired"
 PATH_ADMIN_PRINCIPAL_SYSTEM_ROLE = "/principal/{principal_idx}/system-role"
@@ -663,6 +707,7 @@ PATH_ADMIN_MASKED_READ_EXPORT_TICKET = "/masked-read-export/ticket"
 
 URL_ADMIN_PREFIX = f"{API_PREFIX}{PATH_ADMIN_PREFIX}"
 URL_ADMIN_SERVICE_ACCOUNT = f"{URL_ADMIN_PREFIX}{PATH_ADMIN_SERVICE_ACCOUNT}"
+URL_ADMIN_PRINCIPAL_LOOKUP_BY_EMAIL = f"{URL_ADMIN_PREFIX}{PATH_ADMIN_PRINCIPAL_LOOKUP_BY_EMAIL}"
 URL_ADMIN_PRINCIPAL_DISABLED = f"{URL_ADMIN_PREFIX}{PATH_ADMIN_PRINCIPAL_DISABLED}"
 URL_ADMIN_PRINCIPAL_RETIRED = f"{URL_ADMIN_PREFIX}{PATH_ADMIN_PRINCIPAL_RETIRED}"
 URL_ADMIN_PRINCIPAL_SYSTEM_ROLE = f"{URL_ADMIN_PREFIX}{PATH_ADMIN_PRINCIPAL_SYSTEM_ROLE}"
@@ -698,16 +743,22 @@ URL_USER_ME = f"{URL_USER_PREFIX}{PATH_USER_ME}"
 # / URL_SEQUENCED_SAMPLE_LIST_BY_STUDY below compose against this prefix.
 
 PATH_STUDY_PREFIX = "/study"
-PATH_STUDY_ROOT = ""  # POST against the prefix itself
+PATH_STUDY_ROOT = ""  # POST (create) and GET (list) against the prefix itself
 PATH_STUDY_BY_IDX = "/{study_idx}"
 # Bulk lookup of study_idx by a selectable study accession column
 # (ena_study_accession or bioproject_accession; default bioproject); same
 # body-vs-querystring rationale as the biosample lookup variants.
 PATH_STUDY_LOOKUP_BY_ACCESSION = "/lookup-by-accession"
+# Per-study access rows (qiita.study_access): list/grant against the study,
+# change-tier/revoke against one grantee's row.
+PATH_STUDY_ACCESS = "/{study_idx}/access"
+PATH_STUDY_ACCESS_BY_PRINCIPAL = "/{study_idx}/access/{principal_idx}"
 
 URL_STUDY_PREFIX = f"{API_PREFIX}{PATH_STUDY_PREFIX}"
 URL_STUDY_BY_IDX = f"{URL_STUDY_PREFIX}{PATH_STUDY_BY_IDX}"
 URL_STUDY_LOOKUP_BY_ACCESSION = f"{URL_STUDY_PREFIX}{PATH_STUDY_LOOKUP_BY_ACCESSION}"
+URL_STUDY_ACCESS = f"{URL_STUDY_PREFIX}{PATH_STUDY_ACCESS}"
+URL_STUDY_ACCESS_BY_PRINCIPAL = f"{URL_STUDY_PREFIX}{PATH_STUDY_ACCESS_BY_PRINCIPAL}"
 
 
 # =============================================================================
@@ -853,12 +904,25 @@ URL_SEQUENCED_POOL_WORK_TICKET_SUMMARY = (
 #   • GET/PATCH /biosample/{biosample_idx}          → its own prefix
 
 PATH_BIOSAMPLE_BY_STUDY = "/{study_idx}/biosample"
+# Bulk import: a sheet's biosamples in one all-or-nothing POST.
+PATH_BIOSAMPLE_BULK_BY_STUDY = "/{study_idx}/biosample/bulk"
 PATH_BIOSAMPLE_LIST_BY_STUDY = "/{study_idx}/biosample/list-idxs"
 # Study-scoped single biosample: a GET view carrying this study's local
 # metadata alongside the global metadata, and a metadata upsert PATCH. Both
 # anchor on the /study router (the caller is authorized on the study).
 PATH_BIOSAMPLE_BY_STUDY_AND_IDX = "/{study_idx}/biosample/{biosample_idx}"
 PATH_BIOSAMPLE_METADATA_BY_STUDY = "/{study_idx}/biosample/{biosample_idx}/metadata"
+# The same study-scoped view, for a caller holding a study's own unique id for the
+# sample instead of its idx: a unique-in-study field's display_name and the
+# value it carries. POST (not GET) because the identifying value lives in the
+# body — it can be the owner's own sample name, which is restricted and
+# sometimes carries PII, so it must stay out of URLs and access logs.
+PATH_BIOSAMPLE_BY_STUDY_UNIQUE_FIELD = "/{study_idx}/biosample/by-unique-field"
+# The metadata upsert under that same addressing, so a caller who never holds an
+# idx can complete a read-modify-write. It must be declared to FastAPI ahead of
+# the {biosample_idx} form above: both are PATCH on the same path shape, and the
+# literal segment is unreachable if the parameterized route registers first.
+PATH_BIOSAMPLE_METADATA_BY_STUDY_UNIQUE_FIELD = "/{study_idx}/biosample/by-unique-field/metadata"
 # Create a study-local biosample field definition (POST). The study-scoped mint
 # hangs off the /study router (the caller is authorized on the study); the
 # by-idx path addresses a single definition under it, to read (GET) or edit
@@ -879,11 +943,19 @@ PATH_BIOSAMPLE_LOOKUP_BY_ACCESSION = "/lookup-by-accession"
 # Bulk lookup of biosample_idx by matrix_tube_id; same body-vs-querystring
 # rationale as the accession variant.
 PATH_BIOSAMPLE_LOOKUP_BY_MATRIX_TUBE_ID = "/lookup-by-matrix-tube-id"
+# Resolve a pool roster (one row per pool sample: a matrix tube or accessions) to
+# biosample_idx + study links in one round trip; 422 lists every row's problem.
+PATH_BIOSAMPLE_RESOLVE_ROSTER = "/resolve-roster"
 
 URL_BIOSAMPLE_BY_STUDY = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_BY_STUDY}"
+URL_BIOSAMPLE_BULK_BY_STUDY = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_BULK_BY_STUDY}"
 URL_BIOSAMPLE_LIST_BY_STUDY = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_LIST_BY_STUDY}"
 URL_BIOSAMPLE_BY_STUDY_AND_IDX = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_BY_STUDY_AND_IDX}"
 URL_BIOSAMPLE_METADATA_BY_STUDY = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_METADATA_BY_STUDY}"
+URL_BIOSAMPLE_BY_STUDY_UNIQUE_FIELD = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_BY_STUDY_UNIQUE_FIELD}"
+URL_BIOSAMPLE_METADATA_BY_STUDY_UNIQUE_FIELD = (
+    f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_METADATA_BY_STUDY_UNIQUE_FIELD}"
+)
 URL_BIOSAMPLE_STUDY_FIELD_BY_STUDY = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_STUDY_FIELD_BY_STUDY}"
 URL_BIOSAMPLE_STUDY_FIELD_BY_IDX = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_STUDY_FIELD_BY_IDX}"
 URL_BIOSAMPLE_PREFIX = f"{API_PREFIX}{PATH_BIOSAMPLE_PREFIX}"
@@ -892,6 +964,7 @@ URL_BIOSAMPLE_LOOKUP_BY_ACCESSION = f"{URL_BIOSAMPLE_PREFIX}{PATH_BIOSAMPLE_LOOK
 URL_BIOSAMPLE_LOOKUP_BY_MATRIX_TUBE_ID = (
     f"{URL_BIOSAMPLE_PREFIX}{PATH_BIOSAMPLE_LOOKUP_BY_MATRIX_TUBE_ID}"
 )
+URL_BIOSAMPLE_RESOLVE_ROSTER = f"{URL_BIOSAMPLE_PREFIX}{PATH_BIOSAMPLE_RESOLVE_ROSTER}"
 
 
 # =============================================================================
@@ -916,6 +989,9 @@ PATH_SEQUENCED_SAMPLE_BY_STUDY_AND_IDX = "/{study_idx}/sequenced-sample/{sequenc
 PATH_SEQUENCED_SAMPLE_METADATA_BY_STUDY = (
     "/{study_idx}/sequenced-sample/{sequenced_sample_idx}/metadata"
 )
+# The distinct sequenced_pools a study's samples sit in — the study-first join
+# the run-centric pool routes never expose. Composes under PATH_STUDY_PREFIX.
+PATH_SEQUENCED_POOL_BY_STUDY = "/{study_idx}/sequenced-pool"
 # Pool-scoped sibling of LIST_BY_RUN. Returns richer per-sample rows
 # (prep_sample_idx + sequenced_pool_item_id), hence the `list` segment rather
 # than `list-idxs`. Anchored on /sequencing-run so require_sequenced_pool_in_run
@@ -933,6 +1009,7 @@ URL_SEQUENCED_SAMPLE_LIST_BY_RUN_FULL = (
     f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCED_SAMPLE_LIST_BY_RUN_FULL}"
 )
 URL_SEQUENCED_SAMPLE_LIST_BY_STUDY = f"{URL_STUDY_PREFIX}{PATH_SEQUENCED_SAMPLE_LIST_BY_STUDY}"
+URL_SEQUENCED_POOL_BY_STUDY = f"{URL_STUDY_PREFIX}{PATH_SEQUENCED_POOL_BY_STUDY}"
 URL_SEQUENCED_SAMPLE_BY_STUDY_AND_IDX = (
     f"{URL_STUDY_PREFIX}{PATH_SEQUENCED_SAMPLE_BY_STUDY_AND_IDX}"
 )

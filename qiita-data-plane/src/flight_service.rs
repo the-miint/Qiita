@@ -3,12 +3,13 @@
 //! Handles DoGet requests by verifying Ed25519-signed tickets, querying DuckLake,
 //! and streaming results as Arrow RecordBatches.
 //!
-//! Each request opens its own DuckDB connection and attaches DuckLake. This
-//! avoids shared mutable state and allows concurrent requests; DuckLake's
-//! snapshot isolation in the shared Postgres catalog keeps readers off each
-//! other. It is not sufficient for every writer, though — it detects a conflict
-//! only where two transactions touch the same existing row, so writers that must
-//! not both commit take an explicit lock (`take_registration_lock`).
+//! Each request borrows one attached instance from `pool::LakePool` for its
+//! duration, so two requests never share one at the same time and the number in
+//! flight is bounded. DuckLake's snapshot isolation in the shared Postgres
+//! catalog keeps readers off each other. It is not sufficient for every writer,
+//! though — it detects a conflict only where two transactions touch the same
+//! existing row, so writers that must not both commit take an explicit lock
+//! (`take_registration_lock`).
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -37,7 +38,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::auth;
-use crate::ducklake;
+use crate::pool::{LakePool, LakeWriter, PooledConnection};
 
 /// gRPC metadata key by which a DoGet client asks for a compressed IPC body.
 ///
@@ -102,10 +103,19 @@ pub struct QiitaFlightService {
     /// Ed25519 PUBLIC key for ticket verification. Verify-only — the private
     /// signing seed lives only in the control plane.
     flight_public_key: ed25519_dalek::VerifyingKey,
-    /// DuckLake catalog connection string (libpq format).
-    catalog_connstr: String,
-    /// Directory where DuckLake stores Parquet data files.
-    data_path: String,
+    /// The bounded pool of attached DuckLake instances every request borrows
+    /// from. Its size is the in-flight bound: a request that finds it fully
+    /// lent out is refused with a retriable status rather than opening another
+    /// DuckDB that would size itself against the whole host.
+    pool: Arc<LakePool>,
+    /// Permits for concurrent DoPuts, which borrow no connection and so are not
+    /// bounded by the pool. An upload decodes Arrow batches and writes Parquet,
+    /// so its cost is the batches in flight; the measurement the default rests
+    /// on is on `DEFAULT_MAX_CONCURRENT_DOPUT` in `config.rs`.
+    doput_permits: Arc<tokio::sync::Semaphore>,
+    /// The permit count, kept because `available_permits()` is 0 once
+    /// `try_acquire` has failed and the refusal names the bound it hit.
+    max_concurrent_doput: usize,
     /// Root for DoPut staging — uploads land at
     /// `{root}/uploads/{upload_idx}/upload.parquet`. CP and DP must agree
     /// on the layout convention (CP derives the same path on the read
@@ -121,31 +131,55 @@ pub struct QiitaFlightService {
 impl QiitaFlightService {
     pub fn new(
         flight_public_key: ed25519_dalek::VerifyingKey,
-        catalog_connstr: String,
-        data_path: String,
+        pool: Arc<LakePool>,
+        max_concurrent_doput: usize,
         upload_staging_root: PathBuf,
         scratch_root: PathBuf,
     ) -> Self {
         Self {
             flight_public_key,
-            catalog_connstr,
-            data_path,
+            pool,
+            doput_permits: Arc::new(tokio::sync::Semaphore::new(max_concurrent_doput)),
+            max_concurrent_doput,
             upload_staging_root,
             scratch_root,
         }
     }
-}
 
-/// Open a fresh in-memory DuckDB connection with DuckLake attached. Each
-/// request gets its own connection — no shared state. A free function (not a
-/// method) so the DoGet streaming task can open the connection on its own
-/// blocking thread from owned connstr/data_path, without borrowing `self`.
-fn open_ducklake(catalog_connstr: &str, data_path: &str) -> Result<Connection, Status> {
-    let conn = Connection::open_in_memory()
-        .map_err(|e| Status::internal(format!("failed to open DuckDB: {e}")))?;
-    ducklake::connect_ducklake(&conn, catalog_connstr, data_path)
-        .map_err(|e| Status::internal(format!("failed to attach DuckLake: {e}")))?;
-    Ok(conn)
+    /// Run one blocking lake operation on a borrowed connection.
+    ///
+    /// Every DoAction that touches the lake is this shape, and the shape is the
+    /// reason: DuckDB work is synchronous and some of it is long-lived, so it runs
+    /// on the blocking pool rather than starving a tonic async worker. The
+    /// checkout is part of it, since it can build and attach a connection. The
+    /// connection is borrowed inside the task, which keeps it clear of any await;
+    /// it returns to the pool when the task ends,
+    /// including when the task ends because the request failed or the client went
+    /// away. `what` names the operation in the one error this adds — a join
+    /// failure, which means the blocking task panicked or was cancelled.
+    async fn blocking_lake<T, F>(&self, what: &str, work: F) -> Result<T, Status>
+    where
+        F: FnOnce(&Connection) -> Result<T, Status> + Send + 'static,
+        T: Send + 'static,
+    {
+        let pool = Arc::clone(&self.pool);
+        tokio::task::spawn_blocking(move || work(&*pool.checkout()?))
+            .await
+            .map_err(|e| Status::internal(format!("{what} task join failed: {e}")))?
+    }
+
+    /// `blocking_lake` for an action that writes to the lake: the same bound, on a
+    /// `LakeWriter`.
+    async fn blocking_lake_write<T, F>(&self, what: &str, work: F) -> Result<T, Status>
+    where
+        F: FnOnce(&LakeWriter) -> Result<T, Status> + Send + 'static,
+        T: Send + 'static,
+    {
+        let pool = Arc::clone(&self.pool);
+        tokio::task::spawn_blocking(move || work(&pool.checkout_for_write()?))
+            .await
+            .map_err(|e| Status::internal(format!("{what} task join failed: {e}")))?
+    }
 }
 
 /// Bounded depth of the DoGet batch channel. Backpressure: the blocking producer
@@ -166,45 +200,24 @@ const DOGET_BATCH_CHANNEL_DEPTH: usize = 4;
 ///     whole-reference DoGet (the rype router streaming every genome's
 ///     `chunk_data`) OOM-killed the data plane at ~374 GB. A bounded channel
 ///     alone could never have caught that — the blow-up was upstream of it.
-///   * The `Arrow`/`ArrowStream` iterator borrows the `Statement`, which borrows
-///     the `Connection`; the `DoGetStream` we return must be `'static`, so the
-///     DuckDB iterator cannot be handed out directly. A blocking task owns the
-///     connection for the query's lifetime and pushes each `RecordBatch` into a
-///     bounded channel (`DOGET_BATCH_CHANNEL_DEPTH`); the returned stream drains
-///     the receiver, applying backpressure to the streaming producer.
-///
-/// `stream_arrow` needs the result schema up front (streaming execution doesn't
-/// surface it until a chunk is fetched), so we first probe it with a zero-row
-/// prepare — see the body.
+///   * The `Statement` borrows the `Connection`, and the `DoGetStream` we return
+///     must be `'static`, so neither can be handed out directly. A blocking task
+///     owns the borrowed instance for the query's lifetime and pushes each
+///     `RecordBatch` into a bounded channel (`DOGET_BATCH_CHANNEL_DEPTH`); the
+///     returned stream drains the receiver, applying backpressure to the
+///     streaming producer. The instance goes back to the pool when that task
+///     ends — including when it ends early because the client dropped the
+///     stream, which closes the channel the producer sends into.
 ///
 /// A zero-row result still emits one empty `RecordBatch` carrying the schema, so
-/// the client always receives a valid (possibly empty) Arrow table — the same
-/// contract the buffered path had. A connect/prepare/execute error surfaces as a
-/// single `Err` item, never a silently-truncated empty stream.
-///
-/// Caveat — mid-stream truncation is indistinguishable from completion
-/// (pre-existing, shared with the old `.collect()` path, and bounded by the
-/// DuckDB API): the DuckDB Arrow iterator's `Item` is a bare `RecordBatch`, not
-/// a `Result`, so a failure that occurs *mid-iteration* (after at least one
-/// batch has been sent) cannot be surfaced as an error. The iterator simply
-/// terminates early, the channel closes, and the consumer sees a clean EOF —
-/// byte-for-byte identical to a successful, complete stream. A DoGet client
-/// therefore CANNOT tell a truncated result from a whole one on the wire; only
-/// connect/prepare/execute errors, which occur *before* the first batch, become
-/// an `Err` item the client can see.
-///
-/// We accept this rather than work around it: the fix would require the upstream
-/// `duckdb` crate to yield `Result<RecordBatch>` from its Arrow iterator (it does
-/// not today), and there is no in-crate seam to inject a trailing sentinel that
-/// survives the `FlightDataEncoder`. Mid-iteration failures are also rare in
-/// practice — the query is already prepared and executing, and the batches are
-/// read from local/attached storage. Callers that need end-to-end integrity
-/// verify it out-of-band (row counts, digests) rather than trusting stream
-/// termination. If the `duckdb` API ever exposes a fallible per-batch iterator,
-/// revisit this to surface mid-stream errors.
+/// the client always receives a valid (possibly empty) Arrow table. A DuckDB
+/// error — prepare, execute, or a chunk fetch after batches have already gone
+/// out — surfaces as a trailing `Err` item, so a client never reads a truncated
+/// result as a whole one; so does a panic (see `run_producer`). The connection is
+/// already borrowed when this is called, so a pool with nothing left to lend
+/// never reaches here.
 fn stream_ducklake_batches(
-    catalog_connstr: String,
-    data_path: String,
+    conn: PooledConnection,
     sql: String,
     table: String,
 ) -> ReceiverStream<Result<RecordBatch, FlightError>> {
@@ -214,71 +227,77 @@ fn stream_ducklake_batches(
     // independently, draining into `tx`. Don't `.await`/`.join()` it — the
     // result is delivered through the channel, not the handle.
     tokio::task::spawn_blocking(move || {
-        let produce = || -> Result<(), Status> {
-            let conn = open_ducklake(&catalog_connstr, &data_path)?;
-
-            // Obtain the result schema WITHOUT materializing the result. DuckDB's
-            // streaming execution (below) doesn't expose the schema until the
-            // first chunk is fetched, and `stream_arrow` needs it up front, so
-            // probe with a zero-row prepare: `LIMIT 0` plans the query and returns
-            // its column schema having produced no rows (trivial memory).
-            let schema = {
-                let mut probe = conn
-                    .prepare(&format!("SELECT * FROM ({sql}) AS _schema_probe LIMIT 0"))
-                    .map_err(|e| {
-                        Status::internal(format!(
-                            "schema probe preparation failed for {table}: {e}"
-                        ))
-                    })?;
-                probe
-                    .query_arrow([])
-                    .map_err(|e| {
-                        Status::internal(format!("schema probe execution failed for {table}: {e}"))
-                    })?
-                    .get_schema()
-            };
-
-            let mut stmt = conn.prepare(&sql).map_err(|e| {
-                Status::internal(format!("query preparation failed for {table}: {e}"))
-            })?;
-            // STREAMING execution (duckdb_execute_prepared_streaming): DuckDB
-            // fetches one data chunk at a time instead of materializing the whole
-            // result set. This is load-bearing — the materialized `query_arrow`
-            // buffered the ENTIRE result in DuckDB before the first batch, which
-            // OOM-killed the data plane (~374 GB) on a whole-reference DoGet (the
-            // rype router streaming every genome's `chunk_data`). Peak memory is
-            // now the streaming query's working set (a small hash-join build side
-            // + a few vectors) plus DOGET_BATCH_CHANNEL_DEPTH batches in flight.
-            let stream = stmt.stream_arrow([], schema.clone()).map_err(|e| {
-                Status::internal(format!("query execution failed for {table}: {e}"))
-            })?;
-            let mut produced = false;
-            // `stream`'s Item is a bare `RecordBatch`, not a `Result` — a failure
-            // once iteration has begun cannot be observed here; the loop just ends
-            // and the consumer sees a clean EOF (see the fn-level caveat). Nothing
-            // to do about it until the duckdb API is fallible.
-            for batch in stream {
-                produced = true;
-                // Receiver dropped (client hung up) — stop early, don't error.
-                if tx.blocking_send(Ok(batch)).is_err() {
-                    return Ok(());
-                }
-            }
-            if !produced {
-                // Preserve the schema for a zero-row result.
-                let _ = tx.blocking_send(Ok(RecordBatch::new_empty(schema)));
-            }
-            Ok(())
-        };
-        if let Err(status) = produce() {
-            // Surface the producer error as a stream item (ignore send failure —
-            // the consumer is already gone).
-            let _ = tx.blocking_send(Err(FlightError::ExternalError(Box::new(
-                std::io::Error::other(status.message().to_string()),
-            ))));
-        }
+        run_producer(&tx, || send_query_batches(&conn, &sql, &table, &tx))
     });
     ReceiverStream::new(rx)
+}
+
+/// Run `produce`, and send its failure to `tx` as the stream's trailing `Err` item
+/// (a failed send means the consumer is already gone, so it is ignored). A panic is
+/// a failure too: left to unwind, it would drop `tx` and end the stream as though
+/// the result were complete.
+fn run_producer(
+    tx: &tokio::sync::mpsc::Sender<Result<RecordBatch, FlightError>>,
+    produce: impl FnOnce() -> Result<(), Status>,
+) {
+    let message = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(produce)) {
+        Ok(Ok(())) => return,
+        Ok(Err(status)) => status.message().to_string(),
+        Err(payload) => {
+            let what = payload
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+                .unwrap_or("a non-string payload");
+            format!("data plane producer panicked: {what}")
+        }
+    };
+    eprintln!("error: DoGet stream failed: {message}");
+    let _ = tx.blocking_send(Err(FlightError::ExternalError(Box::new(
+        std::io::Error::other(message),
+    ))));
+}
+
+/// Execute `sql` on `conn` in streaming mode and push each `RecordBatch` into
+/// `tx` — the producer half of `stream_ducklake_batches`. Returns early, without
+/// error, once the receiver is gone (the client hung up).
+fn send_query_batches(
+    conn: &Connection,
+    sql: &str,
+    table: &str,
+    tx: &tokio::sync::mpsc::Sender<Result<RecordBatch, FlightError>>,
+) -> Result<(), Status> {
+    let mut stmt = conn
+        .prepare(sql)
+        .map_err(|e| Status::internal(format!("query preparation failed for {table}: {e}")))?;
+    // Streaming execution, never the materializing `query_arrow`; see
+    // `stream_ducklake_batches` for why.
+    let schema = stmt
+        .stream_arrow([])
+        .map_err(|e| Status::internal(format!("query execution failed for {table}: {e}")))?
+        .get_schema();
+    let mut produced = false;
+    // Fetch with the fallible `step`, not the `ArrowStream` iterator, which
+    // panics on a failed fetch: a DuckDB error is an outcome to report, not a bug.
+    while let Some(chunk) = stmt.step().map_err(|e| {
+        let when = if produced {
+            "mid-stream"
+        } else {
+            "before its first batch"
+        };
+        Status::internal(format!("query failed {when} for {table}: {e}"))
+    })? {
+        produced = true;
+        // Receiver dropped (client hung up) — stop early, don't error.
+        if tx.blocking_send(Ok(RecordBatch::from(chunk))).is_err() {
+            return Ok(());
+        }
+    }
+    if !produced {
+        // Preserve the schema for a zero-row result.
+        let _ = tx.blocking_send(Ok(RecordBatch::new_empty(schema)));
+    }
+    Ok(())
 }
 
 /// Canonical staging path for an upload — single source of truth shared by
@@ -348,7 +367,8 @@ const ALLOWED_TABLES: &[&str] = &[
     "assembled_sequence",
     "assembled_sequence_chunks",
     // Per-subject CheckM quality for one assembly run, read by the feature-table
-    // resolver to attach completeness/contamination to the genomes it stages.
+    // resolver to attach completeness/contamination to the genomes it stages, and
+    // by a human through the control plane's assembly run mint.
     //
     // PRIVACY: it holds no sequence and no read — one row per assembled subject
     // carrying marker lineage, completeness, contamination, strain heterogeneity,
@@ -362,10 +382,11 @@ const ALLOWED_TABLES: &[&str] = &[
     // `bin_id` is CheckM's Bin Id column, a refined bin's FASTA stem for a MAG but
     // the ASSEMBLER'S CONTIG ID for an LCG or an UNBINNED row (the orchestrator's
     // `assembly_load` job states this), so for those kinds a row does name a contig
-    // — in the assembler's id namespace, not the minted `feature_idx` one. And its
-    // reach is not the reach of `assembled_sequence`: that surface is minted one
-    // prep_sample per ticket behind a per-principal route gate, where this is a
-    // whole-cohort read signed in-process with no route in front of it.
+    // — in the assembler's id namespace, not the minted `feature_idx` one, and a
+    // human who can mint this for a run can also mint that run's contigs. Its
+    // reach has two forms: the human mint signs one prep_sample per ticket behind
+    // the same per-principal gate as `assembled_sequence`, and the feature-table
+    // resolver signs a whole cohort in-process with no route in front of it.
     //
     // `assembly_membership` stays out regardless: it maps a run to its contigs in
     // the MINTED namespace, which is the join into the shared feature space this
@@ -547,12 +568,14 @@ fn block_read_source(table: &str) -> Option<&'static str> {
 /// justified because every action the data plane dispatches is idempotent or
 /// otherwise replay-safe (see `docs/auth.md#ticket-replay`):
 ///
-/// - `register_files` — a replay after success hits the staging-existence check
-///   first and returns `not_found`, its files having been moved out. Where the
-///   source survives instead (the EXDEV copy branch of `move_file`), the minted
-///   dest name is deterministic for the registration — see `lake_dest_filename`
-///   — so `move_file` refuses to overwrite and it fails closed rather than
-///   double-registering.
+/// - `register_files` — the dest name is deterministic for the registration
+///   (see `lake_dest_filename`), so a replay after success finds every file
+///   already a data file of its table and returns the earlier registration
+///   without writing; a replay that finds the files moved but not all
+///   registered fails closed. A call that fails after its moves returns the
+///   files to staging unless `return_to_staging` could not confirm that safe,
+///   so that state means a call still running, one the data plane stopped
+///   mid-call, or one whose error says it kept the files.
 /// - `delete_reference` / `delete_mask` / `delete_pool_reads` /
 ///   `delete_read_mask_block` / `delete_alignment` / `delete_alignment_block` /
 ///   `delete_alignment_sample` — logical DELETEs, idempotent against themselves:
@@ -567,6 +590,11 @@ fn block_read_source(table: &str) -> Option<&'static str> {
 ///   `auth::verify_ticket_raw`: 300s from
 ///   `qiita_control_plane.auth.tickets.sign_action`'s default, and
 ///   `MAX_TICKET_LIFETIME` refuses any token whose expiry is more than 3600s out.
+///   The expiry is checked when a request arrives, so it bounds a replayed
+///   request, not a call already accepted and still running: a DuckLake
+///   transaction reads the snapshot of its first statement, so such a call's
+///   DELETE can still run after the rerun's registration and drop it
+///   (`ducklake_transaction_reads_the_snapshot_of_its_first_statement`).
 /// - `export_read` — re-materializes the same prep_sample's bytes to the same ticket
 ///   path via atomic publish; a replay reproduces identical output. (The block
 ///   exports that used to sit beside it are gone: block-scoped compute now
@@ -577,6 +605,12 @@ fn block_read_source(table: &str) -> Option<&'static str> {
 ///   mirror from the CP's resolved blocklist Parquet (one DELETE + INSERT
 ///   transaction); a replay reloads the same authoritative set, so the table
 ///   converges to the same state.
+/// - `mint_phylogeny_edge_id` — sets `edge_id = node_index` on ONE reference's
+///   `reference_phylogeny` rows, and only when every one of them carries NULL.
+///   A replay re-reads the counts, finds the tree numbered, and writes nothing.
+///   The only writer that could put all-NULL rows back under the same
+///   `reference_idx` is `reference_load._write_phylogeny`, which mints them
+///   itself, so there is no window a replay could fill differently.
 ///
 /// The `do_action` dispatcher rejects any action not in this set, so a **new**
 /// action is refused until it is added here — forcing whoever adds it to
@@ -596,6 +630,7 @@ const REPLAY_SAFE_ACTIONS: &[&str] = &[
     "count_masked",
     "mask_metrics",
     "sync_reference_exclusion",
+    "mint_phylogeny_edge_id",
 ];
 
 #[tonic::async_trait]
@@ -640,19 +675,14 @@ impl FlightService for QiitaFlightService {
             &payload.columns,
         )?;
 
-        // Stream the result incrementally. Each request gets its own DuckDB
-        // connection + DuckLake snapshot, opened on a blocking task that feeds
-        // RecordBatches through a bounded channel — so the data plane never
-        // buffers the whole result set (the non-blocking, memory-bounded path).
-        // Ticket/table/query-shape errors above are returned synchronously;
-        // per-request DB errors (connect/prepare/execute) surface as the first
-        // stream item (see stream_ducklake_batches).
-        let batch_stream = stream_ducklake_batches(
-            self.catalog_connstr.clone(),
-            self.data_path.clone(),
-            sql,
-            table,
-        );
+        // Stream the result incrementally, from an instance borrowed for the
+        // life of the stream: a blocking task feeds RecordBatches through a
+        // bounded channel, so the data plane never buffers the whole result set
+        // (the non-blocking, memory-bounded path). Ticket/table/query-shape
+        // errors above are returned synchronously, and so is a pool with nothing
+        // left to lend; per-request DB errors surface as a stream item.
+        let conn = self.pool.checkout()?;
+        let batch_stream = stream_ducklake_batches(conn, sql, table);
         // With no codec these options are structurally the encoder default that
         // preceded this change (pinned by
         // `no_codec_write_options_match_the_encoder_default`), which is what keeps
@@ -766,19 +796,14 @@ impl FlightService for QiitaFlightService {
                     )));
                 }
 
-                // register_files moves files and runs a blocking DuckLake
-                // transaction; run it on the blocking pool so it never starves a
-                // tonic async worker (mirrors export_read / count_masked). The
-                // closure opens and drops its own connection, so it is Send and
-                // crosses no await.
-                let catalog = self.catalog_connstr.clone();
-                let data_path = self.data_path.clone();
+                // Moves files, then runs one DuckLake transaction.
+                let data_path = self.pool.data_path().to_string();
                 let scratch_root = self.scratch_root.clone();
-                let registration = tokio::task::spawn_blocking(move || {
-                    register_files(&catalog, &data_path, &scratch_root, &payload)
-                })
-                .await
-                .map_err(|e| Status::internal(format!("register_files task join failed: {e}")))??;
+                let registration = self
+                    .blocking_lake_write("register_files", move |conn| {
+                        register_files(conn, &data_path, &scratch_root, &payload)
+                    })
+                    .await?;
 
                 let result_body = serde_json::to_vec(&serde_json::json!({
                     "registered": registration.registered,
@@ -803,20 +828,12 @@ impl FlightService for QiitaFlightService {
                     )));
                 }
 
-                // Blocking DuckLake delete transaction — run it on the blocking
-                // pool so it never starves a tonic async worker (mirrors
-                // export_read / count_masked). The closure opens and drops its
-                // own connection, so it is Send and crosses no await.
-                let catalog = self.catalog_connstr.clone();
-                let data_path = self.data_path.clone();
                 let reference_idx = payload.reference_idx;
-                let deleted = tokio::task::spawn_blocking(move || {
-                    delete_reference(&catalog, &data_path, reference_idx)
-                })
-                .await
-                .map_err(|e| {
-                    Status::internal(format!("delete_reference task join failed: {e}"))
-                })??;
+                let deleted = self
+                    .blocking_lake_write("delete_reference", move |conn| {
+                        delete_reference(conn, reference_idx)
+                    })
+                    .await?;
 
                 let result_body = serde_json::to_vec(&deleted)
                     .map_err(|e| Status::internal(format!("json serialization failed: {e}")))?;
@@ -838,18 +855,10 @@ impl FlightService for QiitaFlightService {
                     )));
                 }
 
-                // Blocking DuckLake delete transaction — run it on the blocking
-                // pool so it never starves a tonic async worker (mirrors
-                // export_read / count_masked). The closure opens and drops its
-                // own connection, so it is Send and crosses no await.
-                let catalog = self.catalog_connstr.clone();
-                let data_path = self.data_path.clone();
                 let mask_idx = payload.mask_idx;
-                let deleted = tokio::task::spawn_blocking(move || {
-                    delete_mask(&catalog, &data_path, mask_idx)
-                })
-                .await
-                .map_err(|e| Status::internal(format!("delete_mask task join failed: {e}")))??;
+                let deleted = self
+                    .blocking_lake_write("delete_mask", move |conn| delete_mask(conn, mask_idx))
+                    .await?;
 
                 let result_body = serde_json::to_vec(&deleted)
                     .map_err(|e| Status::internal(format!("json serialization failed: {e}")))?;
@@ -871,20 +880,12 @@ impl FlightService for QiitaFlightService {
                     )));
                 }
 
-                // Blocking DuckLake delete transaction — run it on the blocking
-                // pool so it never starves a tonic async worker (mirrors
-                // export_read / count_masked). The closure opens and drops its
-                // own connection, so it is Send and crosses no await.
-                let catalog = self.catalog_connstr.clone();
-                let data_path = self.data_path.clone();
                 let prep_sample_idxs = payload.prep_sample_idxs;
-                let deleted = tokio::task::spawn_blocking(move || {
-                    delete_pool_reads(&catalog, &data_path, &prep_sample_idxs)
-                })
-                .await
-                .map_err(|e| {
-                    Status::internal(format!("delete_pool_reads task join failed: {e}"))
-                })??;
+                let deleted = self
+                    .blocking_lake_write("delete_pool_reads", move |conn| {
+                        delete_pool_reads(conn, &prep_sample_idxs)
+                    })
+                    .await?;
 
                 let result_body = serde_json::to_vec(&deleted)
                     .map_err(|e| Status::internal(format!("json serialization failed: {e}")))?;
@@ -914,21 +915,13 @@ impl FlightService for QiitaFlightService {
                     ));
                 }
 
-                // Blocking DuckLake delete transaction — run it on the blocking
-                // pool so it never starves a tonic async worker (mirrors
-                // delete_alignment_block). The closure opens and drops its own
-                // connection, so it is Send and crosses no await.
-                let catalog = self.catalog_connstr.clone();
-                let data_path = self.data_path.clone();
                 let mask_idx = payload.mask_idx;
                 let members = payload.members;
-                let deleted = tokio::task::spawn_blocking(move || {
-                    delete_read_mask_block(&catalog, &data_path, mask_idx, &members)
-                })
-                .await
-                .map_err(|e| {
-                    Status::internal(format!("delete_read_mask_block task join failed: {e}"))
-                })??;
+                let deleted = self
+                    .blocking_lake_write("delete_read_mask_block", move |conn| {
+                        delete_read_mask_block(conn, mask_idx, &members)
+                    })
+                    .await?;
 
                 let result_body = serde_json::to_vec(&deleted)
                     .map_err(|e| Status::internal(format!("json serialization failed: {e}")))?;
@@ -950,20 +943,12 @@ impl FlightService for QiitaFlightService {
                     )));
                 }
 
-                // Blocking DuckLake delete transaction — run it on the blocking
-                // pool so it never starves a tonic async worker (mirrors
-                // delete_mask). The closure opens and drops its own connection, so
-                // it is Send and crosses no await.
-                let catalog = self.catalog_connstr.clone();
-                let data_path = self.data_path.clone();
                 let alignment_idx = payload.alignment_idx;
-                let deleted = tokio::task::spawn_blocking(move || {
-                    delete_alignment(&catalog, &data_path, alignment_idx)
-                })
-                .await
-                .map_err(|e| {
-                    Status::internal(format!("delete_alignment task join failed: {e}"))
-                })??;
+                let deleted = self
+                    .blocking_lake_write("delete_alignment", move |conn| {
+                        delete_alignment(conn, alignment_idx)
+                    })
+                    .await?;
 
                 let result_body = serde_json::to_vec(&deleted)
                     .map_err(|e| Status::internal(format!("json serialization failed: {e}")))?;
@@ -994,21 +979,13 @@ impl FlightService for QiitaFlightService {
                     ));
                 }
 
-                // Blocking DuckLake delete transaction — run it on the blocking
-                // pool so it never starves a tonic async worker (mirrors
-                // delete_alignment). The closure opens and drops its own
-                // connection, so it is Send and crosses no await.
-                let catalog = self.catalog_connstr.clone();
-                let data_path = self.data_path.clone();
                 let alignment_idx = payload.alignment_idx;
                 let members = payload.members;
-                let deleted = tokio::task::spawn_blocking(move || {
-                    delete_alignment_block(&catalog, &data_path, alignment_idx, &members)
-                })
-                .await
-                .map_err(|e| {
-                    Status::internal(format!("delete_alignment_block task join failed: {e}"))
-                })??;
+                let deleted = self
+                    .blocking_lake_write("delete_alignment_block", move |conn| {
+                        delete_alignment_block(conn, alignment_idx, &members)
+                    })
+                    .await?;
 
                 let result_body = serde_json::to_vec(&deleted)
                     .map_err(|e| Status::internal(format!("json serialization failed: {e}")))?;
@@ -1032,21 +1009,13 @@ impl FlightService for QiitaFlightService {
                     )));
                 }
 
-                // Blocking DuckLake delete transaction — run it on the blocking
-                // pool so it never starves a tonic async worker (mirrors
-                // delete_alignment). The closure opens and drops its own
-                // connection, so it is Send and crosses no await.
-                let catalog = self.catalog_connstr.clone();
-                let data_path = self.data_path.clone();
                 let alignment_idx = payload.alignment_idx;
                 let prep_sample_idx = payload.prep_sample_idx;
-                let deleted = tokio::task::spawn_blocking(move || {
-                    delete_alignment_sample(&catalog, &data_path, alignment_idx, prep_sample_idx)
-                })
-                .await
-                .map_err(|e| {
-                    Status::internal(format!("delete_alignment_sample task join failed: {e}"))
-                })??;
+                let deleted = self
+                    .blocking_lake_write("delete_alignment_sample", move |conn| {
+                        delete_alignment_sample(conn, alignment_idx, prep_sample_idx)
+                    })
+                    .await?;
 
                 let result_body = serde_json::to_vec(&deleted)
                     .map_err(|e| Status::internal(format!("json serialization failed: {e}")))?;
@@ -1072,19 +1041,14 @@ impl FlightService for QiitaFlightService {
                 // inlined into a DuckDB `COPY ... TO` literal and written to.
                 let dest = validate_export_dest(&payload.dest, &self.scratch_root)?;
 
-                // `COPY` is synchronous and, for a whole prep_sample, long-lived —
-                // run it on the blocking pool so it never starves a tonic async
-                // worker. The closure opens and drops its own connection, so it
-                // is Send and crosses no await (mirrors `register_files`).
-                let catalog = self.catalog_connstr.clone();
-                let data_path = self.data_path.clone();
+                // `COPY` is long-lived for a whole prep_sample.
                 let scratch_root = self.scratch_root.clone();
                 let prep = payload.prep_sample_idx;
-                let count = tokio::task::spawn_blocking(move || {
-                    export_read_to_parquet(&catalog, &data_path, prep, &dest, &scratch_root)
-                })
-                .await
-                .map_err(|e| Status::internal(format!("export_read task join failed: {e}")))??;
+                let count = self
+                    .blocking_lake("export_read", move |conn| {
+                        export_read_to_parquet(conn, prep, &dest, &scratch_root)
+                    })
+                    .await?;
 
                 let result_body = serde_json::to_vec(&serde_json::json!({
                     "count": count,
@@ -1128,16 +1092,11 @@ impl FlightService for QiitaFlightService {
                 let prep_sample_idx = single_i64_filter(&payload.filter, "prep_sample_idx")?;
                 let mask_idx = single_i64_filter(&payload.filter, "mask_idx")?;
 
-                // count(*) is synchronous DuckDB work; run it on the blocking
-                // pool so it never starves a tonic async worker (mirrors
-                // export_read). The closure opens and drops its own connection.
-                let catalog = self.catalog_connstr.clone();
-                let data_path = self.data_path.clone();
-                let count = tokio::task::spawn_blocking(move || {
-                    count_masked_reads(&catalog, &data_path, prep_sample_idx, mask_idx)
-                })
-                .await
-                .map_err(|e| Status::internal(format!("count_masked task join failed: {e}")))??;
+                let count = self
+                    .blocking_lake("count_masked", move |conn| {
+                        count_masked_reads(conn, prep_sample_idx, mask_idx)
+                    })
+                    .await?;
 
                 let result_body = serde_json::to_vec(&serde_json::json!({ "count": count }))
                     .map_err(|e| Status::internal(format!("json serialization failed: {e}")))?;
@@ -1163,17 +1122,12 @@ impl FlightService for QiitaFlightService {
                 let mask_idx = payload.mask_idx;
                 let prep_sample_idx = payload.prep_sample_idx;
 
-                // The aggregate is a synchronous DuckDB count over the light
-                // `read_mask` table; run it on the blocking pool so it never
-                // starves a tonic async worker (mirrors count_masked). The
-                // closure opens and drops its own connection.
-                let catalog = self.catalog_connstr.clone();
-                let data_path = self.data_path.clone();
-                let counts = tokio::task::spawn_blocking(move || {
-                    mask_metrics_counts(&catalog, &data_path, mask_idx, prep_sample_idx)
-                })
-                .await
-                .map_err(|e| Status::internal(format!("mask_metrics task join failed: {e}")))??;
+                // A count over the light `read_mask` table, not over `read`.
+                let counts = self
+                    .blocking_lake("mask_metrics", move |conn| {
+                        mask_metrics_counts(conn, mask_idx, prep_sample_idx)
+                    })
+                    .await?;
 
                 let result_body = serde_json::to_vec(&counts)
                     .map_err(|e| Status::internal(format!("json serialization failed: {e}")))?;
@@ -1200,21 +1154,41 @@ impl FlightService for QiitaFlightService {
                 // is inlined into a DuckDB `read_parquet(...)` literal and read.
                 let dest = validate_export_dest(&payload.dest, &self.scratch_root)?;
 
-                // The full-replace runs a blocking DuckLake transaction (and a
-                // blocking `canonicalize` in the handler) — run it on the blocking
-                // pool so it never starves a tonic async worker (mirrors
-                // register_files / export_read). The closure opens and drops its
-                // own connection, so it is Send and crosses no await.
-                let catalog = self.catalog_connstr.clone();
-                let data_path = self.data_path.clone();
+                // A full replace, plus a blocking `canonicalize` in the handler.
                 let scratch_root = self.scratch_root.clone();
-                let result = tokio::task::spawn_blocking(move || {
-                    sync_reference_exclusion(&catalog, &data_path, &dest, &scratch_root)
-                })
-                .await
-                .map_err(|e| {
-                    Status::internal(format!("sync_reference_exclusion task join failed: {e}"))
-                })??;
+                let result = self
+                    .blocking_lake_write("sync_reference_exclusion", move |conn| {
+                        sync_reference_exclusion(conn, &dest, &scratch_root)
+                    })
+                    .await?;
+
+                let result_body = serde_json::to_vec(&result)
+                    .map_err(|e| Status::internal(format!("json serialization failed: {e}")))?;
+                let result = arrow_flight::Result {
+                    body: result_body.into(),
+                };
+                let output = stream::once(futures::future::ready(Ok(result)));
+                Ok(Response::new(Box::pin(output)))
+            }
+            "mint_phylogeny_edge_id" => {
+                let payload =
+                    auth::verify_mint_phylogeny_edge_id(&action.body, &self.flight_public_key)
+                        .map_err(|e| Status::unauthenticated(e.to_string()))?;
+
+                if payload.action != "mint_phylogeny_edge_id" {
+                    return Err(Status::invalid_argument(format!(
+                        "action type mismatch: header says 'mint_phylogeny_edge_id', \
+                         payload says {:?}",
+                        payload.action
+                    )));
+                }
+
+                let reference_idx = payload.reference_idx;
+                let result = self
+                    .blocking_lake_write("mint_phylogeny_edge_id", move |conn| {
+                        mint_phylogeny_edge_id(conn, reference_idx)
+                    })
+                    .await?;
 
                 let result_body = serde_json::to_vec(&result)
                     .map_err(|e| Status::internal(format!("json serialization failed: {e}")))?;
@@ -1249,14 +1223,15 @@ impl FlightService for QiitaFlightService {
 // lands on disk as Parquet, set mode 440 on close. The consuming workflow
 // (an orchestrator native module) reads `upload.parquet` and interprets it.
 //
+// The upload is written to a sibling `upload.parquet.partial` and linked to
+// `upload.parquet` only once it is closed, fsynced and locked 440, so
+// `upload.parquet` only ever appears complete. A data plane killed mid-upload
+// leaves the `.partial`, never a truncated `upload.parquet`.
+//
 // Failure policy: any error mid-stream deletes the partial file and returns
 // a Status to the client. The upload row in `qiita.upload` stays at
 // `pending`; the client mints a fresh slot to retry. Partial-write
-// failures aren't resumable. Post-write failures (the chmod 440 or the
-// PutResult JSON encode) DO clean up the just-written file, which means
-// a retry against the same upload_idx would re-trigger `create_new`
-// successfully — but the client never learns the upload_idx is reusable
-// in that window, so in practice retries always mint a fresh slot.
+// failures aren't resumable.
 
 impl QiitaFlightService {
     /// Generic over the input stream so unit tests can drive it with an
@@ -1289,6 +1264,20 @@ impl QiitaFlightService {
             )));
         }
 
+        // One permit per upload in flight, taken after the ticket verifies so an
+        // unauthenticated caller cannot spend one, and held until the staged file
+        // is written. `try_acquire`, not `acquire`, for the reason `pool.rs` gives
+        // for refusing rather than queueing. The refusal carries the same
+        // "data plane busy" prefix as the pool's, so one signature covers both
+        // surfaces; today both DoPut clients are user-facing CLIs that classify
+        // nothing, so what the prefix reaches is a person reading the message.
+        let _upload_permit = self.doput_permits.try_acquire().map_err(|_| {
+            Status::resource_exhausted(format!(
+                "data plane busy: all {} concurrent uploads are in use; retry",
+                self.max_concurrent_doput
+            ))
+        })?;
+
         // Resolve staging path, create parent dir.
         let staging_path = staging_path_for(&self.upload_staging_root, payload.upload_idx);
         let parent = staging_path
@@ -1296,23 +1285,54 @@ impl QiitaFlightService {
             .ok_or_else(|| Status::internal("staging path has no parent"))?;
         std::fs::create_dir_all(parent)
             .map_err(|e| Status::internal(format!("mkdir {}: {e}", parent.display())))?;
+        // Refused before the stream is read, so an upload to a finished slot is
+        // not received in full only to be refused at the link below.
+        if staging_path.exists() {
+            return Err(already_uploaded(&staging_path));
+        }
+        let partial_path = {
+            let mut s = staging_path.clone().into_os_string();
+            s.push(".partial");
+            PathBuf::from(s)
+        };
 
         // Write the parquet + chmod + body-encode under a single
         // error-guarded scope. Any Err return below cleans up the partial
         // staging file via the trailing `if result.is_err()` block — this is
         // the single cleanup site so a new fallible operation in this scope
         // can't accidentally bypass it.
-        let path_for_cleanup = staging_path.clone();
+        let path_for_cleanup = partial_path.clone();
         let result: Result<PutResult, Status> = async {
             let (sha256, row_count, bytes_received) =
-                write_doput_parquet(staging_path.clone(), first, stream).await?;
+                write_doput_parquet(partial_path.clone(), first, stream).await?;
 
             // Lock the file 440 — owner+group read, no write, no world.
             // After this the data plane itself can't modify it; matches
             // the immutability assumption the consuming workflow makes.
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&staging_path, std::fs::Permissions::from_mode(0o440))
+            std::fs::set_permissions(&partial_path, std::fs::Permissions::from_mode(0o440))
                 .map_err(|e| Status::internal(format!("chmod 440: {e}")))?;
+
+            // Publish. A hard link, not a rename, because it refuses an existing
+            // `upload.parquet` (EEXIST) where a rename would replace it.
+            std::fs::hard_link(&partial_path, &staging_path).map_err(|e| match e.kind() {
+                std::io::ErrorKind::AlreadyExists => Status::internal(format!(
+                    "{} appeared while this upload was written; this upload is discarded",
+                    staging_path.display()
+                )),
+                _ => Status::internal(format!(
+                    "link {} → {}: {e}",
+                    partial_path.display(),
+                    staging_path.display()
+                )),
+            })?;
+            if let Err(e) = std::fs::remove_file(&partial_path) {
+                eprintln!(
+                    "warning: published {} but failed to remove {}: {e}",
+                    staging_path.display(),
+                    partial_path.display()
+                );
+            }
 
             let body = serde_json::to_vec(&serde_json::json!({
                 "sha256": sha256,
@@ -1327,11 +1347,10 @@ impl QiitaFlightService {
         }
         .await;
 
-        // Cleanup the partial / fully-written-but-unblessed Parquet on any
-        // error path EXCEPT AlreadyExists. AlreadyExists means we never
-        // opened the file (a prior successful DoPut owns it via
-        // create_new's atomic guard); deleting it would wipe a legitimate
-        // upload owned by a different call.
+        // Clean up the `.partial` on any error path EXCEPT AlreadyExists.
+        // AlreadyExists means we never opened it (a concurrent DoPut owns it
+        // via create_new's atomic guard); deleting it would wipe that call's
+        // upload. `upload.parquet` itself is never removed here.
         if let Err(ref e) = result {
             if e.code() != tonic::Code::AlreadyExists {
                 if let Err(cleanup_err) = std::fs::remove_file(&path_for_cleanup) {
@@ -1346,6 +1365,14 @@ impl QiitaFlightService {
         }
         result
     }
+}
+
+/// The refusal of an upload to a slot whose `upload.parquet` is already published.
+fn already_uploaded(staging_path: &Path) -> Status {
+    Status::already_exists(format!(
+        "staging file already exists — concurrent DoPut?: {}",
+        staging_path.display()
+    ))
 }
 
 /// `std::io::Write` adapter that incrementally feeds every byte the inner
@@ -1449,14 +1476,16 @@ where
                     // upload_idx silently clobbering each other's bytes via
                     // separate write() calls on the same path. The CP doesn't
                     // reissue tickets for a given slot, so this is the
-                    // contract-violation surface.
+                    // contract-violation surface. A `.partial` a killed data
+                    // plane left behind is refused the same way.
                     let file = std::fs::OpenOptions::new()
                         .write(true)
                         .create_new(true)
                         .open(&staging_path)
                         .map_err(|e| match e.kind() {
                             std::io::ErrorKind::AlreadyExists => Status::already_exists(format!(
-                                "staging file already exists — concurrent DoPut?: {}",
+                                "partial upload already exists — concurrent DoPut, or one a \
+                                 restart interrupted?: {}",
                                 staging_path.display()
                             )),
                             _ => {
@@ -1467,20 +1496,19 @@ where
                         file.try_clone()
                             .map_err(|e| Status::internal(format!("dup file handle: {e}")))?,
                     );
-                    // Parquet v2 + zstd. The orchestrator's miint.py defines
-                    // two conventions: PARQUET_OPTS (zstd, for DuckLake-bound
-                    // durable artifacts) and PARQUET_OPTS_INTERMEDIATE (snappy,
-                    // for transient files read once then deleted in the same
-                    // job). DoPut uploads are intermediate in the consumed-once
-                    // sense — but their disk-residency is "from /done to
-                    // (eventual) cleanup," not "until the next phase in the
-                    // same job." That can be minutes to indefinitely with the
-                    // current no-sweep follow-up open. The disk-footprint
-                    // tradeoff outweighs the snappy fast-decode win at GG2
-                    // scale: backbone FASTA blew up to ~3.5× the source on
-                    // disk under uncompressed v1 (DNA-chunk VARCHAR columns
-                    // don't dictionary-encode), and zstd-default level 3
-                    // gives ~4× compression at parquet-rs's default cost.
+                    // Parquet v2 + zstd. `qiita_common.parquet` names its option
+                    // sets by where a file ends up: AT_REST (registered into
+                    // DuckLake), TRANSFER (leaves the job, but not into the lake)
+                    // and INTERMEDIATE (snappy, read once then deleted in the same
+                    // job). A DoPut upload is consumed once, like an intermediate,
+                    // but its disk-residency is "from /done to (eventual)
+                    // cleanup," not "until the next phase in the same job." That
+                    // can be minutes or much longer, so it is a transfer file: the disk-footprint
+                    // tradeoff outweighs the snappy fast-decode win at GG2 scale.
+                    // Backbone FASTA blew up to ~3.5× the source on disk under
+                    // uncompressed v1 (DNA-chunk VARCHAR columns don't
+                    // dictionary-encode), and zstd at parquet-rs's default level
+                    // (1) gives ~4× compression.
                     let props = WriterProperties::builder()
                         .set_writer_version(WriterVersion::PARQUET_2_0)
                         .set_compression(Compression::ZSTD(ZstdLevel::default()))
@@ -1601,9 +1629,12 @@ where
     task_result
 }
 
-/// Canonical Parquet write options for an exported reads file — Parquet v2 +
-/// zstd, matching `qiita_common.parquet.PARQUET_OPTS` so the materialized file
-/// is shape-identical to the durable copy `ingest_reads` first wrote.
+/// Canonical Parquet write options for an exported reads file: a copy of
+/// `qiita_common.parquet.PARQUET_OPTS_TRANSFER`, pinned equal to it by a qiita-common
+/// test. The materialized file has the shape of the
+/// durable copy `ingest_reads` first wrote (Parquet v2, zstd, 64 MB row groups), but
+/// a job reads it and it is dropped, so it takes zstd's default level rather than
+/// the at-rest one.
 const EXPORT_READ_PARQUET_OPTS: &str =
     "FORMAT PARQUET, PARQUET_VERSION 'v2', COMPRESSION 'zstd', ROW_GROUP_SIZE_BYTES '64MB'";
 
@@ -1665,8 +1696,8 @@ fn validate_export_dest(dest: &str, scratch_root: &Path) -> Result<PathBuf, Stat
 /// identical); this function owns the publish. An empty selection writes NO file
 /// and returns 0 — the control plane turns that into a clean submission failure.
 /// The `COPY` streams row groups to disk, so memory stays bounded regardless of
-/// selection size. Opens and drops its own connection so the caller can run it on
-/// the blocking pool (mirrors `register_files`).
+/// selection size. Takes a borrowed instance so the caller can run it on the
+/// blocking pool (mirrors `register_files`).
 ///
 /// `dest` arrives already lexically validated (`validate_export_dest`), but this
 /// is human-read data, so we ALSO resolve symlinks: another job on the shared
@@ -1679,20 +1710,16 @@ fn validate_export_dest(dest: &str, scratch_root: &Path) -> Result<PathBuf, Stat
 /// written file, so it always matches the bytes on disk (no separate catalog
 /// scan that could race the `COPY`).
 fn export_select_to_parquet(
-    catalog_connstr: &str,
-    data_path: &str,
+    conn: &Connection,
     select_sql: &str,
     dest: &Path,
     scratch_root: &Path,
 ) -> Result<i64, Status> {
-    let conn = duckdb::Connection::open_in_memory()
-        .map_err(|e| Status::internal(format!("failed to open DuckDB: {e}")))?;
-    ducklake::connect_ducklake(&conn, catalog_connstr, data_path)
-        .map_err(|e| Status::internal(format!("failed to attach DuckLake: {e}")))?;
     // ROW_GROUP_SIZE_BYTES (in EXPORT_READ_PARQUET_OPTS) requires insertion
     // order NOT be preserved — and we don't need it: the file is unordered
     // because every consumer (qc is per-row, host_filter collapses with
-    // DISTINCT) is order-independent.
+    // DISTINCT) is order-independent. The pool's baseline is already off; the
+    // SET stays so this requirement does not rest on that baseline.
     conn.execute_batch("SET preserve_insertion_order = false;")
         .map_err(|e| Status::internal(format!("failed to set preserve_insertion_order: {e}")))?;
 
@@ -1783,15 +1810,13 @@ fn export_select_to_parquet(
 /// writes NO file and returns 0. `prep_sample_idx` is a signature-verified i64, safe
 /// to inline. See `export_select_to_parquet` for the shared write/publish.
 fn export_read_to_parquet(
-    catalog_connstr: &str,
-    data_path: &str,
+    conn: &Connection,
     prep_sample_idx: i64,
     dest: &Path,
     scratch_root: &Path,
 ) -> Result<i64, Status> {
     export_select_to_parquet(
-        catalog_connstr,
-        data_path,
+        conn,
         &format!(
             "SELECT {EXPORT_READ_COLUMNS} FROM qiita_lake.read \
              WHERE prep_sample_idx = {prep_sample_idx}"
@@ -1933,15 +1958,13 @@ fn read_masked_relation(mask_idx: i64, preps: &[i64]) -> String {
 /// construction, so the filtered `read_mask` count equals the view's row count —
 /// while touching only the small key/`reason` columns, never joining to `read`
 /// or materializing the sequence/quality bytes. This is what makes the export's
-/// idempotency probe cheap. Opens and drops its own connection so the caller can
-/// run it on the blocking pool (mirrors `export_read_to_parquet`).
+/// idempotency probe cheap. Takes a borrowed instance so the caller can run it on
+/// the blocking pool (mirrors `export_read_to_parquet`).
 fn count_masked_reads(
-    catalog_connstr: &str,
-    data_path: &str,
+    conn: &Connection,
     prep_sample_idx: i64,
     mask_idx: i64,
 ) -> Result<i64, Status> {
-    let conn = open_ducklake(catalog_connstr, data_path)?;
     // `prep_sample_idx`/`mask_idx` are signature-verified i64s, safe to inline (same
     // rationale as build_query: parsed integers reach SQL, no string data); the
     // 'pass' filter mirrors the read_masked macro's privacy filter.
@@ -1988,22 +2011,19 @@ const SPIKEIN_REASONS: &str = "'spikein_syndna'";
 /// toward raw only.
 ///
 /// The reason lists below are the Rust twin of `READ_MASK_BUCKET` in qiita-common
-/// (`read_mask_reason_sql_list`). Rust cannot import it, so the two are pinned by
-/// `qiita-control-plane/tests/test_read_mask_counts.py::test_rust_reason_lists_match_the_python_bucket_map`,
-/// which parses these consts out of this file and compares them character for
+/// (`read_mask_reason_sql_list`). Rust cannot import it, so a control-plane test
+/// parses these consts out of this file and compares them to it character for
 /// character. (NOT the block e2e test: its fixture emits no `spikein_syndna` or
 /// `host_minimap2` rows, so a typo here would miscount silently there.) Adding a
 /// ReadMaskReason means touching BOTH sides.
 ///
-/// Opens and drops its own connection so the caller can run it on the blocking
-/// pool (mirrors `count_masked_reads`).
+/// Takes a borrowed instance so the caller can run it on the blocking pool
+/// (mirrors `count_masked_reads`).
 fn mask_metrics_counts(
-    catalog_connstr: &str,
-    data_path: &str,
+    conn: &Connection,
     mask_idx: i64,
     prep_sample_idx: i64,
 ) -> Result<serde_json::Value, Status> {
-    let conn = open_ducklake(catalog_connstr, data_path)?;
     // `mask_idx`/`prep_sample_idx` are signature-verified i64s, safe to inline (same
     // rationale as count_masked_reads: parsed integers reach SQL, no string data).
     let sql = format!(
@@ -2109,6 +2129,18 @@ const REPLACE_KEY_TABLES: &[ReplaceKey] = &[
         key: &["prep_sample_idx", "processing_idx"],
         key_source: "assembly_membership",
     },
+    // amplicon's twin of assembly_membership: same key, same argument. amplicon_load
+    // derives the whole run's rows from its own workspace and never reads the lake
+    // back, and a re-run resolves to the same processing_idx, so a --force resubmit
+    // replaces rather than doubling the counts.
+    ReplaceKey::own(
+        "amplicon_membership",
+        &["prep_sample_idx", "processing_idx"],
+    ),
+    // amplicon's ASV sequences, twins of the assembled_sequence tables: keyed on
+    // feature_idx, replaced (not appended) so a re-load of the same ASV converges.
+    ReplaceKey::own("amplicon_sequence", &["feature_idx"]),
+    ReplaceKey::own("amplicon_sequence_chunks", &["feature_idx"]),
 ];
 
 /// One `REPLACE_KEY_TABLES` entry.
@@ -2221,6 +2253,9 @@ fn replace_key_delete_sql(table: &str, keys: &[&str], n_files: usize) -> String 
 /// against a lake that already holds the incoming keys, ~7 ms when it does not.
 /// Since every writer queues behind one row, that per-transaction cost IS the
 /// queue rate, and this budget covers a queue far longer than a deploy produces.
+/// Those times were taken at the pool's threads, not at the one thread a lake
+/// write runs on (`pool::LakeWriter`); a 50M-row delete transaction measured
+/// 2.00 s at one thread against 1.32 s at six, locally.
 /// The DELETE's share of it is set by the spread of the incoming key set rather
 /// than by the table's size — `replace_key_delete_sql` carries what each key set
 /// scans, including the sets where it reads the whole table. Exceeding the
@@ -2260,7 +2295,7 @@ pub(crate) fn lake_commit_backoff(attempt: u32, salt: i64) -> std::time::Duratio
 
 /// Take the lock that serializes writers of the replace-keyed tables. Call
 /// inside an open transaction; see `register_files` for why.
-fn take_registration_lock(conn: &duckdb::Connection) -> Result<(), Status> {
+fn take_registration_lock(conn: &LakeWriter) -> Result<(), Status> {
     let locked = conn
         .execute(
             "UPDATE qiita_lake.registration_lock SET epoch = epoch + 1",
@@ -2291,11 +2326,20 @@ fn take_registration_lock(conn: &duckdb::Connection) -> Result<(), Status> {
 /// `body` must therefore be idempotent across attempts — each one re-reads a
 /// fresh snapshot after DuckLake rolled the last one back. `salt` only spreads
 /// the backoff (see `lake_commit_backoff`).
+///
+/// A COMMIT that reports an error may still have landed: when the catalog's
+/// connection drops after Postgres committed, before its answer arrives, the
+/// COMMIT errors and the rows are there, and a re-run of an add registers them
+/// again (`ducklake_commit_error_after_the_catalog_committed`). So before any
+/// re-run, `landed` reads the catalog: given the attempt's value it says whether
+/// that attempt's commit is there, and if it is the value is returned. When
+/// `landed` cannot tell, the call fails with both errors rather than re-running.
 fn transact_with_retry<T>(
-    conn: &duckdb::Connection,
+    conn: &LakeWriter,
     what: &str,
     salt: i64,
     mut body: impl FnMut() -> Result<T, Status>,
+    mut landed: impl FnMut(&T) -> Result<bool, Status>,
 ) -> Result<T, Status> {
     let deadline = std::time::Instant::now() + LAKE_COMMIT_BUDGET;
     let mut attempt: u32 = 0;
@@ -2315,6 +2359,17 @@ fn transact_with_retry<T>(
             Ok(()) => return Ok(value),
             Err(e) => e,
         };
+        match landed(&value) {
+            Ok(true) => return Ok(value),
+            Ok(false) => {}
+            Err(e) => {
+                return Err(Status::internal(format!(
+                    "failed to commit {what}: {commit_error}; whether the commit \
+                     landed could not be read: {}",
+                    e.message()
+                )))
+            }
+        }
 
         if std::time::Instant::now() >= deadline {
             return Err(Status::internal(format!(
@@ -2345,12 +2400,11 @@ struct Registration {
 
 /// Move Parquet files from staging to permanent storage and register in DuckLake.
 ///
-/// Validates all requested files exist in staging, attaches DuckLake, moves the
-/// files to permanent locations under `data_path/{table_name}/`, and registers
-/// them.
+/// Validates all requested files exist in staging, moves them to permanent
+/// locations under `data_path/{table_name}/`, and registers them.
 ///
-/// Uses `std::fs::rename` with a copy+delete fallback for cross-filesystem moves
-/// (e.g., SLURM local scratch → shared NFS).
+/// Each file is placed by `move_file`, which copies where it cannot rename or
+/// link (e.g., SLURM local scratch → shared NFS).
 ///
 /// Some tables are REPLACED on their key rather than appended to — see
 /// `REPLACE_KEY_TABLES` for which, and why. The `read` rows a ticket registered
@@ -2361,7 +2415,7 @@ struct Registration {
 /// reference_idx. The control plane is responsible for issuing tokens only for
 /// valid references in the correct state.
 fn register_files(
-    catalog_connstr: &str,
+    conn: &LakeWriter,
     data_path: &str,
     scratch_root: &std::path::Path,
     payload: &auth::ActionPayload,
@@ -2393,22 +2447,85 @@ fn register_files(
         }
     }
 
-    // Validate all requested files exist.
-    for filename in payload.files.keys() {
+    // One scope key for the whole registration; it does not vary per file.
+    let scope = staging_scope(&payload.staging_dir, scratch_root);
+
+    // Where each file is placed in the lake. Every file must be in staging, or
+    // at the destination an earlier call with this payload moved it to.
+    let mut placed: Vec<PlacedFile> = Vec::new();
+    for (filename, table) in &payload.files {
         let src = staging.join(filename);
-        if !src.exists() {
+        // Multi-file tables carry a subdir prefix in `filename`
+        // (e.g. "reference_sequence_chunks/part_00000.parquet"). Use
+        // only the basename when placing into the per-table dir —
+        // otherwise we'd nest the staging subdir inside it.
+        let basename = std::path::Path::new(filename)
+            .file_name()
+            .and_then(|b| b.to_str())
+            .ok_or_else(|| {
+                Status::invalid_argument(format!("filename has no UTF-8 basename: {filename}"))
+            })?;
+        let dest = perm_root.join(table).join(lake_dest_filename(
+            payload.work_ticket_idx,
+            &scope,
+            basename,
+        ));
+        if !src.exists() && !dest.exists() {
             return Err(Status::not_found(format!(
                 "staging file not found: {}",
                 src.display()
             )));
         }
+        // Both SQL passes below name the destination as a string, so resolve it
+        // once here rather than re-deriving (and re-erroring on) it twice.
+        let dest_str = dest
+            .to_str()
+            .ok_or_else(|| Status::internal(format!("non-UTF-8 path: {}", dest.display())))?
+            .to_string();
+        placed.push(PlacedFile {
+            table: table.clone(),
+            src,
+            dest,
+            dest_str,
+        });
     }
 
     // Tables are ensured at startup in main.rs.
-    let conn = duckdb::Connection::open_in_memory()
-        .map_err(|e| Status::internal(format!("failed to open DuckDB: {e}")))?;
-    ducklake::connect_ducklake(&conn, catalog_connstr, data_path)
-        .map_err(|e| Status::internal(format!("failed to attach DuckLake: {e}")))?;
+
+    // A file already at its lake destination is a replay of this payload: the
+    // caller lost the reply, or died before recording it, and called again. The destination name
+    // is deterministic for the (ticket, staging dir, basename), so the replay
+    // finds where the earlier call moved each file. When every file was moved and
+    // is a data file of its table, the earlier call committed, and its
+    // registration is returned without writing: `ducklake_add_data_files`
+    // accepts a path it already holds and adds its rows again. Any other state
+    // fails closed, because the earlier call may still be registering the files.
+    // Judged by the destination, not the source: `move_file` keeps a placed
+    // file when removing its staging source fails.
+    let moved_before = placed.iter().filter(|f| f.dest.exists()).count();
+    if moved_before > 0 {
+        let in_catalog = registered_data_files(conn, &placed)?;
+        if moved_before == placed.len() && in_catalog.len() == placed.len() {
+            return Ok(Registration {
+                registered: placed.into_iter().map(|p| p.dest_str).collect(),
+                replaced: BTreeMap::new(),
+            });
+        }
+        return Err(Status::failed_precondition(format!(
+            "an earlier register_files call for work_ticket {} from {} moved {} of {} \
+             files into the lake and registered {} of them. Either it is still \
+             running (or the data plane stopped mid-call), or it failed and kept \
+             the files at their lake paths, which its error names (the catalog \
+             listed some of them, could not be read, or a move back failed). \
+             Redrive again once a running call has had time to finish; if this \
+             persists, the files need an operator",
+            payload.work_ticket_idx,
+            payload.staging_dir,
+            moved_before,
+            placed.len(),
+            in_catalog.len()
+        )));
+    }
 
     // `read` is not replace-keyed, and DuckLake enforces no uniqueness. A ticket
     // re-runs a step in a new attempt dir under its own workspace, so its second
@@ -2418,56 +2535,35 @@ fn register_files(
     // deleted in the registration transaction below. Only files named for this
     // ticket are deleted from, so rows another ticket registered are left as they
     // are.
-    let staged_read = staged_read_prep_samples(&conn, staging, &payload.files)?;
+    let staged_read = staged_read_prep_samples(conn, staging, &payload.files)?;
     let replace_read_files =
-        ticket_read_files_in_lake(&conn, payload.work_ticket_idx, &staged_read)?;
+        ticket_read_files_in_lake(conn, payload.work_ticket_idx, &staged_read)?;
     let replace_read_prep_samples: Vec<i64> = staged_read.into_iter().collect();
 
-    // One scope key for the whole registration; it does not vary per file.
-    let scope = staging_scope(&payload.staging_dir, scratch_root);
-
-    // Move all files to permanent storage.
+    // Move all files to permanent storage. `move_file` refuses a destination
+    // that exists, so a call racing this one for the same payload fails closed.
     // (DuckLake table, permanent path). The path is carried as a String because
     // every consumer below binds it into SQL or reports it.
     let mut moved: Vec<(String, String)> = Vec::new();
-    for (filename, table) in &payload.files {
-        let src = staging.join(filename);
-        let dest_dir = perm_root.join(table);
-        std::fs::create_dir_all(&dest_dir).map_err(|e| {
-            Status::internal(format!(
-                "failed to create directory {}: {e}",
-                dest_dir.display()
-            ))
+    for (i, file) in placed.iter().enumerate() {
+        let dest_dir = file.dest.parent().ok_or_else(|| {
+            Status::internal(format!("lake path has no parent: {}", file.dest.display()))
         })?;
-        // Multi-file tables carry a subdir prefix in `filename`
-        // (e.g. "reference_sequence_chunks/part_00000.parquet"). Use
-        // only the basename when placing into `dest_dir` — otherwise
-        // we'd nest the staging subdir inside the per-table
-        // destination dir.
-        let basename = std::path::Path::new(filename)
-            .file_name()
-            .and_then(|b| b.to_str())
-            .ok_or_else(|| {
-                Status::invalid_argument(format!("filename has no UTF-8 basename: {filename}"))
-            })?;
-        // Mint a unique, ticket-traceable destination name — the data plane
-        // owns lake-storage layout, and the producer reuses fixed basenames
-        // across loads, so placing the bare basename would collide with an
-        // already-registered file in the same per-table dir. `move_file`
-        // refuses to overwrite besides, as a hard safety net.
-        let dest = dest_dir.join(lake_dest_filename(
-            payload.work_ticket_idx,
-            &scope,
-            basename,
-        ));
-        move_file(&src, &dest)?;
-        // Both SQL passes below name the destination as a string, so resolve it
-        // once here rather than re-deriving (and re-erroring on) it twice.
-        let dest_str = dest
-            .to_str()
-            .ok_or_else(|| Status::internal(format!("non-UTF-8 path: {}", dest.display())))?
-            .to_string();
-        moved.push((table.clone(), dest_str));
+        let placed_one = std::fs::create_dir_all(dest_dir)
+            .map_err(|e| {
+                Status::internal(format!(
+                    "failed to create directory {}: {e}",
+                    dest_dir.display()
+                ))
+            })
+            .and_then(|()| move_file(&file.src, &file.dest));
+        if let Err(e) = placed_one {
+            // `move_file` removes a destination of its own when it fails (unless
+            // that removal fails too, which it logs), so only the files before
+            // this one are this call's to move back.
+            return Err(return_to_staging(conn, &placed[..i], e));
+        }
+        moved.push((file.table.clone(), file.dest_str.clone()));
     }
 
     // Replace-by-key the `REPLACE_KEY_TABLES` targets, then register every moved
@@ -2477,14 +2573,9 @@ fn register_files(
     // ducklake_add_data_files call rather than leaving the reference
     // half-registered in the catalog.
     //
-    // Atomicity here is CATALOG-LEVEL ONLY: the filesystem moves above have
-    // already happened and are NOT rolled back. That is intentional and safe.
-    // Each dest name is registration-unique (lake_dest_filename keys on the work
-    // ticket and the staging dir) and move_file refuses to overwrite, so a rolled-back registration
-    // leaves at most an unreferenced orphan Parquet on disk — never a collision
-    // and never a double-registration. This matches how DuckLake already
-    // tolerates orphan Parquets (the delete_* actions reclaim nothing from disk
-    // either); a future maintenance pass sweeps them.
+    // Atomicity here is CATALOG-LEVEL ONLY: the filesystem moves above are not
+    // part of the transaction. When it fails, `return_to_staging` moves the files
+    // back, so the call can be made again with the same payload.
     //
     // Registrations that touch a replace-keyed table SERIALIZE against each
     // other, and retry when they lose. Both halves are needed:
@@ -2500,9 +2591,7 @@ fn register_files(
     //
     // The loser's work is fully re-runnable — its files are already at the paths
     // `lake_dest_filename` minted and the delete+add is idempotent against whatever
-    // snapshot it re-reads — so it retries here rather than failing the ticket. A
-    // retry from the top would not work: the staging files were moved above, so
-    // the caller's next attempt gets `not_found`.
+    // snapshot it re-reads — so it retries here rather than failing the ticket.
     //
     // Registrations touching none of those tables (read_mask, alignment) skip the
     // lock and so never contend.
@@ -2549,12 +2638,12 @@ fn register_files(
     });
 
     let registration = transact_with_retry(
-        &conn,
+        conn,
         "the registration transaction",
         payload.work_ticket_idx,
         || {
             if takes_lock {
-                take_registration_lock(&conn)?;
+                take_registration_lock(conn)?;
             }
 
             // Replace-by-key runs as its OWN pass, ahead of every add: one statement
@@ -2606,9 +2695,126 @@ fn register_files(
                 replaced,
             })
         },
-    )?;
+        // One transaction adds every file, so the catalog lists all of them or
+        // none; a count in between is a registration this one did not make.
+        |_| {
+            let listed = registered_data_files(conn, &placed)?.len();
+            match listed {
+                0 => Ok(false),
+                n if n == placed.len() => Ok(true),
+                n => Err(Status::internal(format!(
+                    "the catalog lists {n} of the {} files",
+                    placed.len()
+                ))),
+            }
+        },
+    );
 
-    Ok(registration)
+    registration.map_err(|e| return_to_staging(conn, &placed, e))
+}
+
+/// Move `files` back from the lake to staging after a registration failed past
+/// its moves, so a later call with the same payload starts from staging again,
+/// and return `failure` with what became of the files appended.
+///
+/// A COMMIT that reported an error may still have landed — the catalog's
+/// connection can drop after the write — so the files go back only when the
+/// catalog confirms it holds none of them. Otherwise, or when a move back fails,
+/// they stay at their lake paths and the message says so: a replay then fails
+/// closed rather than registering a payload twice.
+fn return_to_staging(conn: &duckdb::Connection, files: &[PlacedFile], failure: Status) -> Status {
+    let moved: Vec<&PlacedFile> = files.iter().filter(|f| f.dest.exists()).collect();
+    if moved.is_empty() {
+        return failure;
+    }
+    let count = moved.len();
+    let kept = |why: String| {
+        Status::new(
+            failure.code(),
+            format!(
+                "{}; {count} file(s) stay at their lake paths unregistered: {why}",
+                failure.message()
+            ),
+        )
+    };
+    match registered_data_files(conn, files) {
+        Ok(listed) if listed.is_empty() => {}
+        Ok(listed) => {
+            return kept(format!(
+                "the catalog lists {} of them, so the registration may have committed",
+                listed.len()
+            ))
+        }
+        Err(e) => {
+            return kept(format!(
+                "the catalog could not be read to confirm it holds none of them ({})",
+                e.message()
+            ))
+        }
+    }
+    let mut stuck = Vec::new();
+    for file in moved {
+        // `move_file` keeps a placed file when removing its staging source
+        // fails; the lake copy is then the one to remove.
+        let back = if file.src.exists() {
+            std::fs::remove_file(&file.dest)
+                .map_err(|e| Status::internal(format!("remove {}: {e}", file.dest.display())))
+        } else {
+            move_file(&file.dest, &file.src)
+        };
+        if let Err(e) = back {
+            stuck.push(format!("{}: {}", file.dest.display(), e.message()));
+        }
+    }
+    if stuck.is_empty() {
+        Status::new(
+            failure.code(),
+            format!(
+                "{}; the files were moved back to staging",
+                failure.message()
+            ),
+        )
+    } else {
+        kept(format!("moving them back failed: {}", stuck.join("; ")))
+    }
+}
+
+/// One file of a registration: its table, its staging source, and its lake
+/// destination (with that destination as the string the SQL binds).
+struct PlacedFile {
+    table: String,
+    src: std::path::PathBuf,
+    dest: std::path::PathBuf,
+    dest_str: String,
+}
+
+/// The destinations of `placed` that are already data files of their table in
+/// the catalog.
+fn registered_data_files(
+    conn: &duckdb::Connection,
+    placed: &[PlacedFile],
+) -> Result<Vec<String>, Status> {
+    let lookup_failed =
+        |e: duckdb::Error| Status::internal(format!("failed to list lake data files: {e}"));
+    let mut by_table: BTreeMap<&str, std::collections::BTreeSet<String>> = BTreeMap::new();
+    for file in placed {
+        if by_table.contains_key(file.table.as_str()) {
+            continue;
+        }
+        let mut stmt = conn
+            .prepare("SELECT data_file FROM ducklake_list_files('qiita_lake', ?)")
+            .map_err(lookup_failed)?;
+        let files = stmt
+            .query_map(duckdb::params![file.table], |r| r.get::<_, String>(0))
+            .and_then(|rows| rows.collect::<Result<_, _>>())
+            .map_err(lookup_failed)?;
+        by_table.insert(file.table.as_str(), files);
+    }
+    Ok(placed
+        .iter()
+        .filter(|file| by_table[file.table.as_str()].contains(&file.dest_str))
+        .map(|file| file.dest_str.clone())
+        .collect())
 }
 
 /// The prep_samples the staged `read` files hold. Files headed for other tables
@@ -2720,16 +2926,7 @@ fn lake_file_ticket(path: &str) -> Option<i64> {
 /// Order matters: the sequence deletes run *before* the membership delete so
 /// the orphan subquery can still see this reference's rows. Idempotent — a
 /// reference with no loaded data deletes zero rows and still succeeds.
-fn delete_reference(
-    catalog_connstr: &str,
-    data_path: &str,
-    reference_idx: i64,
-) -> Result<serde_json::Value, Status> {
-    let conn = duckdb::Connection::open_in_memory()
-        .map_err(|e| Status::internal(format!("failed to open DuckDB: {e}")))?;
-    ducklake::connect_ducklake(&conn, catalog_connstr, data_path)
-        .map_err(|e| Status::internal(format!("failed to attach DuckLake: {e}")))?;
-
+fn delete_reference(conn: &LakeWriter, reference_idx: i64) -> Result<serde_json::Value, Status> {
     let exec = |sql: &str, params: &[i64]| -> Result<usize, Status> {
         // duckdb's params! wants &dyn ToSql; i64 implements it. Build the
         // slice explicitly so the same helper serves the 1- and 2-param calls.
@@ -2781,51 +2978,79 @@ fn delete_reference(
     // Sequence/chunk deletes run BEFORE the membership AND annotation deletes: the
     // orphan subquery reads both of this reference's claim tables, so both must
     // still be present.
-    let counts = transact_with_retry(&conn, "the reference delete", reference_idx, || {
-        take_registration_lock(&conn)?;
-        let sequences_deleted = exec(
-            &format!("DELETE FROM qiita_lake.reference_sequences WHERE {orphan_filter}"),
-            &[reference_idx, reference_idx, reference_idx, reference_idx],
-        )?;
-        let chunks_deleted = exec(
-            &format!("DELETE FROM qiita_lake.reference_sequence_chunks WHERE {orphan_filter}"),
-            &[reference_idx, reference_idx, reference_idx, reference_idx],
-        )?;
-        let membership_deleted = exec(
-            "DELETE FROM qiita_lake.reference_membership WHERE reference_idx = ?",
-            &[reference_idx],
-        )?;
-        let taxonomy_deleted = exec(
-            "DELETE FROM qiita_lake.reference_taxonomy WHERE reference_idx = ?",
-            &[reference_idx],
-        )?;
-        let phylogeny_deleted = exec(
-            "DELETE FROM qiita_lake.reference_phylogeny WHERE reference_idx = ?",
-            &[reference_idx],
-        )?;
-        let placements_deleted = exec(
-            "DELETE FROM qiita_lake.reference_placements WHERE reference_idx = ?",
-            &[reference_idx],
-        )?;
-        // Annotation ROWS delete by reference_idx (they carry it directly), not by
-        // the orphan filter — but they must go AFTER the sequence/chunk deletes
-        // above, which read this table as one of the two claim sets in
-        // `orphan_filter`. The annotated FEATURES themselves are GC'd through that
-        // filter, like any other orphan.
-        let annotations_deleted = exec(
-            "DELETE FROM qiita_lake.reference_annotation WHERE reference_idx = ?",
-            &[reference_idx],
-        )?;
-        Ok(serde_json::json!({
-            "sequences_deleted": sequences_deleted,
-            "chunks_deleted": chunks_deleted,
-            "membership_deleted": membership_deleted,
-            "taxonomy_deleted": taxonomy_deleted,
-            "phylogeny_deleted": phylogeny_deleted,
-            "placements_deleted": placements_deleted,
-            "annotations_deleted": annotations_deleted,
-        }))
-    })?;
+    let counts = transact_with_retry(
+        conn,
+        "the reference delete",
+        reference_idx,
+        || {
+            take_registration_lock(conn)?;
+            let sequences_deleted = exec(
+                &format!("DELETE FROM qiita_lake.reference_sequences WHERE {orphan_filter}"),
+                &[reference_idx, reference_idx, reference_idx, reference_idx],
+            )?;
+            let chunks_deleted = exec(
+                &format!("DELETE FROM qiita_lake.reference_sequence_chunks WHERE {orphan_filter}"),
+                &[reference_idx, reference_idx, reference_idx, reference_idx],
+            )?;
+            let membership_deleted = exec(
+                "DELETE FROM qiita_lake.reference_membership WHERE reference_idx = ?",
+                &[reference_idx],
+            )?;
+            let taxonomy_deleted = exec(
+                "DELETE FROM qiita_lake.reference_taxonomy WHERE reference_idx = ?",
+                &[reference_idx],
+            )?;
+            let phylogeny_deleted = exec(
+                "DELETE FROM qiita_lake.reference_phylogeny WHERE reference_idx = ?",
+                &[reference_idx],
+            )?;
+            let placements_deleted = exec(
+                "DELETE FROM qiita_lake.reference_placements WHERE reference_idx = ?",
+                &[reference_idx],
+            )?;
+            // Annotation ROWS delete by reference_idx (they carry it directly), not by
+            // the orphan filter — but they must go AFTER the sequence/chunk deletes
+            // above, which read this table as one of the two claim sets in
+            // `orphan_filter`. The annotated FEATURES themselves are GC'd through that
+            // filter, like any other orphan.
+            let annotations_deleted = exec(
+                "DELETE FROM qiita_lake.reference_annotation WHERE reference_idx = ?",
+                &[reference_idx],
+            )?;
+            Ok(serde_json::json!({
+                "sequences_deleted": sequences_deleted,
+                "chunks_deleted": chunks_deleted,
+                "membership_deleted": membership_deleted,
+                "taxonomy_deleted": taxonomy_deleted,
+                "phylogeny_deleted": phylogeny_deleted,
+                "placements_deleted": placements_deleted,
+                "annotations_deleted": annotations_deleted,
+            }))
+        },
+        |_| {
+            // The deletes commit together, so none of the reference's rows left in
+            // the tables keyed by it means the reference is deleted: by this
+            // attempt, or by a delete of the same reference that committed first,
+            // whose counts this one then reports.
+            let mut remaining = 0i64;
+            for table in [
+                "reference_membership",
+                "reference_taxonomy",
+                "reference_phylogeny",
+                "reference_placements",
+                "reference_annotation",
+            ] {
+                remaining += conn
+                    .query_row(
+                        &format!("SELECT count(*) FROM qiita_lake.{table} WHERE reference_idx = ?"),
+                        [reference_idx],
+                        |r| r.get::<_, i64>(0),
+                    )
+                    .map_err(|e| Status::internal(format!("failed to count {table} rows: {e}")))?;
+            }
+            Ok(remaining == 0)
+        },
+    )?;
 
     let mut out = counts;
     out["reference_idx"] = serde_json::json!(reference_idx);
@@ -2840,16 +3065,7 @@ fn delete_reference(
 /// maintenance pass (matches `delete_reference`, which also reclaims nothing
 /// from disk). Idempotent: deleting a `mask_idx` with zero rows is success and
 /// returns `rows_deleted: 0`, so the control plane can safely retry.
-fn delete_mask(
-    catalog_connstr: &str,
-    data_path: &str,
-    mask_idx: i64,
-) -> Result<serde_json::Value, Status> {
-    let conn = duckdb::Connection::open_in_memory()
-        .map_err(|e| Status::internal(format!("failed to open DuckDB: {e}")))?;
-    ducklake::connect_ducklake(&conn, catalog_connstr, data_path)
-        .map_err(|e| Status::internal(format!("failed to attach DuckLake: {e}")))?;
-
+fn delete_mask(conn: &LakeWriter, mask_idx: i64) -> Result<serde_json::Value, Status> {
     // Single-statement delete wrapped in an explicit transaction so the action
     // is all-or-nothing and the control plane can safely retry: a failed call
     // leaves the mask's rows fully intact, so a retry sees the same row set.
@@ -2895,9 +3111,9 @@ fn delete_mask(
 /// Parquet converges to the same table, and a replay of a stale-but-valid token
 /// reloads whatever the (authoritative) file holds. An empty blocklist ships a
 /// valid zero-row Parquet, so the DELETE + zero-row INSERT simply clears the
-/// mirror (re-enabling everything). Opens and drops its own connection so the
-/// caller can run it on the blocking pool (mirrors `delete_mask` /
-/// `register_files`). Returns the loaded row count.
+/// mirror (re-enabling everything). Takes a borrowed instance so the caller can
+/// run it on the blocking pool (mirrors `delete_mask` / `register_files`).
+/// Returns the loaded row count.
 ///
 /// `dest` arrives lexically validated (`validate_export_dest`: absolute, under
 /// the scratch root, no `..`, no single quote), but that check is a string test
@@ -2913,8 +3129,7 @@ fn delete_mask(
 /// before reading, then inline the CANONICALIZED path (re-checked for a single
 /// quote a resolved symlink target could introduce) into `read_parquet`.
 fn sync_reference_exclusion(
-    catalog_connstr: &str,
-    data_path: &str,
+    conn: &LakeWriter,
     dest: &Path,
     scratch_root: &Path,
 ) -> Result<serde_json::Value, Status> {
@@ -2946,11 +3161,6 @@ fn sync_reference_exclusion(
             "resolved sync dest must not contain a single quote: {dest_str:?}"
         )));
     }
-
-    let conn = duckdb::Connection::open_in_memory()
-        .map_err(|e| Status::internal(format!("failed to open DuckDB: {e}")))?;
-    ducklake::connect_ducklake(&conn, catalog_connstr, data_path)
-        .map_err(|e| Status::internal(format!("failed to attach DuckLake: {e}")))?;
 
     // Clear-then-reload in one transaction so the swap is atomic and retryable:
     // a failure leaves the previous mirror intact.
@@ -2999,6 +3209,80 @@ fn sync_reference_exclusion(
     }))
 }
 
+/// Give one reference's phylogeny rows the edge numbering krepp placement joins on.
+///
+/// Why the numbering has to be minted, and what an all-NULL column costs: "Edge
+/// numbering (`edge_id`)" in `docs/architecture/reference-data.md`, and
+/// duckdb-miint#272. `reference_load._write_phylogeny` does this at load; this
+/// action does it for a reference already in the lake.
+///
+/// All-or-nothing per tree, the rule `reference_load._write_phylogeny` applies at
+/// load: a tree that numbers any node keeps the numbering it arrived with. Minting
+/// only the NULL rows of a partly numbered tree would leave two numberings in one
+/// column with nothing to tell them apart, so this counts first and mints only when
+/// the whole tree is NULL. `reference_idx` is an `i64` from the Ed25519-signed
+/// payload, bound as a parameter rather than inlined.
+///
+/// Reports `phylogeny_rows` (0 means the reference has no tree), the pre-mint
+/// `already_numbered_rows`, and `minted_rows`. The caller decides what each state
+/// means: a partly numbered tree comes back with `minted_rows` 0 rather than a
+/// partial write.
+fn mint_phylogeny_edge_id(
+    conn: &LakeWriter,
+    reference_idx: i64,
+) -> Result<serde_json::Value, Status> {
+    conn.execute_batch("BEGIN TRANSACTION")
+        .map_err(|e| Status::internal(format!("failed to begin transaction: {e}")))?;
+
+    let counted = (|| -> Result<(i64, i64, i64), Status> {
+        let (total, already_numbered) = conn
+            .query_row(
+                "SELECT count(*), count(edge_id) FROM qiita_lake.reference_phylogeny \
+                 WHERE reference_idx = ?",
+                duckdb::params![reference_idx],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .map_err(|e| {
+                Status::internal(format!(
+                    "failed to count phylogeny rows for reference {reference_idx}: {e}"
+                ))
+            })?;
+        if already_numbered != 0 {
+            return Ok((total, already_numbered, 0));
+        }
+        let minted = conn
+            .execute(
+                "UPDATE qiita_lake.reference_phylogeny SET edge_id = node_index \
+                 WHERE reference_idx = ? AND edge_id IS NULL",
+                duckdb::params![reference_idx],
+            )
+            .map_err(|e| {
+                Status::internal(format!(
+                    "failed to mint edge_id for reference {reference_idx}: {e}"
+                ))
+            })?;
+        Ok((total, already_numbered, minted as i64))
+    })();
+
+    let (total, already_numbered, minted) = match counted {
+        Ok(v) => v,
+        Err(e) => {
+            // Best-effort rollback; surface the original error.
+            let _ = conn.execute_batch("ROLLBACK");
+            return Err(e);
+        }
+    };
+    conn.execute_batch("COMMIT")
+        .map_err(|e| Status::internal(format!("failed to commit mint transaction: {e}")))?;
+
+    Ok(serde_json::json!({
+        "reference_idx": reference_idx,
+        "phylogeny_rows": total,
+        "already_numbered_rows": already_numbered,
+        "minted_rows": minted,
+    }))
+}
+
 /// Logically delete every `read` and `read_mask` row owned by a set of
 /// prep_samples from DuckLake.
 ///
@@ -3015,8 +3299,7 @@ fn sync_reference_exclusion(
 /// returns zero counts. The `prep_sample_idxs` are `i64` parsed from the
 /// Ed25519-signed payload and inlined through `sql_i64_list`.
 fn delete_pool_reads(
-    catalog_connstr: &str,
-    data_path: &str,
+    conn: &LakeWriter,
     prep_sample_idxs: &[i64],
 ) -> Result<serde_json::Value, Status> {
     // Empty set: nothing to do, and `IN ()` is not valid SQL. Return the
@@ -3028,11 +3311,6 @@ fn delete_pool_reads(
             "read_mask_rows_deleted": 0,
         }));
     }
-
-    let conn = duckdb::Connection::open_in_memory()
-        .map_err(|e| Status::internal(format!("failed to open DuckDB: {e}")))?;
-    ducklake::connect_ducklake(&conn, catalog_connstr, data_path)
-        .map_err(|e| Status::internal(format!("failed to attach DuckLake: {e}")))?;
 
     let in_list = sql_i64_list(prep_sample_idxs);
 
@@ -3100,8 +3378,7 @@ fn delete_pool_reads(
 /// this); guarded here too, returning a zero-count noop. All integers are
 /// signature-verified i64s, safe to inline.
 fn delete_read_mask_block(
-    catalog_connstr: &str,
-    data_path: &str,
+    conn: &LakeWriter,
     mask_idx: i64,
     members: &[auth::BlockReadMember],
 ) -> Result<serde_json::Value, Status> {
@@ -3111,11 +3388,6 @@ fn delete_read_mask_block(
             "rows_deleted": 0,
         }));
     }
-
-    let conn = duckdb::Connection::open_in_memory()
-        .map_err(|e| Status::internal(format!("failed to open DuckDB: {e}")))?;
-    ducklake::connect_ducklake(&conn, catalog_connstr, data_path)
-        .map_err(|e| Status::internal(format!("failed to attach DuckLake: {e}")))?;
 
     // Scope the shared footprint selector to this filtering identity. The
     // `read` export needs no mask column; `read_mask` is keyed by mask_idx too.
@@ -3189,7 +3461,7 @@ const _: () = assert!(!ALIGNMENT_DELETE_TABLES.is_empty());
 /// `ALIGNMENT_DELETE_TABLES` literal and a clause whose values are either bound
 /// `?`s or inlined Ed25519-verified i64s.
 fn delete_lake_rows(
-    conn: &duckdb::Connection,
+    conn: &LakeWriter,
     tables: &[&str],
     where_clause: &str,
     params: &[&dyn duckdb::ToSql],
@@ -3234,18 +3506,9 @@ fn delete_lake_rows(
 /// control plane consumes both (`PoolReadPurgeResponse`); here there is no
 /// consumer, and no producer writing the side table, so a second key would carry
 /// a structural zero. A producer PR that adds a consumer adds the key with it.
-fn delete_alignment(
-    catalog_connstr: &str,
-    data_path: &str,
-    alignment_idx: i64,
-) -> Result<serde_json::Value, Status> {
-    let conn = duckdb::Connection::open_in_memory()
-        .map_err(|e| Status::internal(format!("failed to open DuckDB: {e}")))?;
-    ducklake::connect_ducklake(&conn, catalog_connstr, data_path)
-        .map_err(|e| Status::internal(format!("failed to attach DuckLake: {e}")))?;
-
+fn delete_alignment(conn: &LakeWriter, alignment_idx: i64) -> Result<serde_json::Value, Status> {
     let counts = delete_lake_rows(
-        &conn,
+        conn,
         ALIGNMENT_DELETE_TABLES,
         "alignment_idx = ?",
         &[&alignment_idx as &dyn duckdb::ToSql],
@@ -3279,8 +3542,7 @@ fn delete_alignment(
 /// (the DoAction arm rejects it before this); guarded here too, returning a
 /// zero-count noop. All integers are Ed25519-verified i64s, safe to inline.
 fn delete_alignment_block(
-    catalog_connstr: &str,
-    data_path: &str,
+    conn: &LakeWriter,
     alignment_idx: i64,
     members: &[auth::BlockReadMember],
 ) -> Result<serde_json::Value, Status> {
@@ -3290,11 +3552,6 @@ fn delete_alignment_block(
             "rows_deleted": 0,
         }));
     }
-
-    let conn = duckdb::Connection::open_in_memory()
-        .map_err(|e| Status::internal(format!("failed to open DuckDB: {e}")))?;
-    ducklake::connect_ducklake(&conn, catalog_connstr, data_path)
-        .map_err(|e| Status::internal(format!("failed to attach DuckLake: {e}")))?;
 
     // Scope the shared footprint selector to this align-config identity. The
     // `read`/`read_mask` blocks key on sequence_idx; every
@@ -3307,7 +3564,7 @@ fn delete_alignment_block(
         block_read_where_clause(members)
     );
 
-    let counts = delete_lake_rows(&conn, ALIGNMENT_DELETE_TABLES, &where_clause, &[])?;
+    let counts = delete_lake_rows(conn, ALIGNMENT_DELETE_TABLES, &where_clause, &[])?;
 
     Ok(serde_json::json!({
         "alignment_idx": alignment_idx,
@@ -3346,18 +3603,12 @@ fn delete_alignment_block(
 /// reporting is `delete_alignment`'s. Idempotent: a prep_sample with no rows yet
 /// deletes 0 and still succeeds.
 fn delete_alignment_sample(
-    catalog_connstr: &str,
-    data_path: &str,
+    conn: &LakeWriter,
     alignment_idx: i64,
     prep_sample_idx: i64,
 ) -> Result<serde_json::Value, Status> {
-    let conn = duckdb::Connection::open_in_memory()
-        .map_err(|e| Status::internal(format!("failed to open DuckDB: {e}")))?;
-    ducklake::connect_ducklake(&conn, catalog_connstr, data_path)
-        .map_err(|e| Status::internal(format!("failed to attach DuckLake: {e}")))?;
-
     let counts = delete_lake_rows(
-        &conn,
+        conn,
         ALIGNMENT_DELETE_TABLES,
         "alignment_idx = ? AND prep_sample_idx = ?",
         &[
@@ -3399,19 +3650,16 @@ const LAKE_FILE_TICKET_PREFIX: &str = "wt";
 ///   so it separates the two loads only where the producer itself re-ran — the
 ///   case a redrive that drops the producer's `qiita.work_ticket_step` row
 ///   produces. A redrive that leaves the producer fast-forwarded rebuilds its
-///   outputs under the original attempt, yielding the same `staging_dir` and the
-///   same collision. That still fails at
-///   [`move_file`] rather than corrupting anything, but it is not covered here.
+///   outputs under the original attempt, yielding the same `staging_dir`, and so
+///   the same names: `register_files` then finds the files it placed before.
 ///
 /// Deterministic for a given (ticket, staging dir), so a replayed DoAction
-/// recomputes the same name. Most replays never reach [`move_file`]: the first
-/// run moved the staging files out, so the source-existence check in
-/// `register_files` returns `not_found` first. The name carries the guard on the
-/// one path where the source survives — the EXDEV branch below copies and then
-/// tolerates a failed `remove_file(src)`, leaving source and destination both in
-/// place. There the refusal is what stops a second registration of the tables
-/// outside `REPLACE_KEY_TABLES` (e.g. `reference_membership`), which have no
-/// replace-by-key to absorb one; a random name would register them twice.
+/// recomputes the same name, and `register_files` recognises a replay from it:
+/// it returns the earlier registration when every file is already a data file of
+/// its table, and fails closed otherwise. A random name would hide the replay
+/// from it, and the tables outside `REPLACE_KEY_TABLES` (e.g.
+/// `reference_membership`), which have no replace-by-key to absorb a second
+/// registration, would be registered twice.
 ///
 /// DuckLake names its own INSERT-written data files uniquely for the same
 /// reason; this is the equivalent for our "register an existing file" path.
@@ -3446,7 +3694,8 @@ fn staging_scope(staging_dir: &str, scratch_root: &std::path::Path) -> String {
         .unwrap_or_else(|_| staging_dir.to_string())
 }
 
-/// Move a file, falling back to copy+delete for cross-filesystem moves.
+/// Move a file: rename it, or hard-link it and remove the source, or copy it and
+/// remove the source, whichever the filesystem allows first.
 ///
 /// Refuses to overwrite an existing destination. Lake data files are
 /// registered in the DuckLake catalog by absolute path and written read-only
@@ -3456,43 +3705,154 @@ fn staging_scope(staging_dir: &str, scratch_root: &std::path::Path) -> String {
 /// double-registration — surface it loudly as `AlreadyExists` rather than
 /// touching the file.
 ///
-/// If the copy succeeds but delete fails, the dest file is kept (it's the
-/// correct data) and the error message includes the orphaned source path
-/// for cleanup.
+/// The refusal is made by the call that creates the destination (a no-replace
+/// rename, a hard link, or a `create_new` copy), never by a check before it, so
+/// two calls placing one destination cannot both succeed. On failure the
+/// destination this call created is removed; if that removal fails too, a
+/// warning names the partial file. If the move succeeds but
+/// removing the staging source fails, the dest file is kept (it's the correct
+/// data) and a warning names the orphaned source.
 fn move_file(src: &std::path::Path, dest: &std::path::Path) -> Result<(), Status> {
-    if dest.exists() {
-        return Err(Status::already_exists(format!(
+    let refused = || {
+        Status::already_exists(format!(
             "refusing to overwrite existing lake file {}",
             dest.display()
-        )));
-    }
-    match std::fs::rename(src, dest) {
-        Ok(()) => Ok(()),
-        Err(e) if e.raw_os_error() == Some(18) => {
-            // EXDEV: cross-device link — fall back to copy + delete
-            std::fs::copy(src, dest).map_err(|e| {
-                Status::internal(format!(
-                    "cross-fs copy failed {} → {}: {e}",
-                    src.display(),
-                    dest.display()
-                ))
-            })?;
-            if let Err(e) = std::fs::remove_file(src) {
-                // Copy succeeded — dest has the data. Log the orphan but
-                // don't fail the operation. The staging file is stale.
-                eprintln!(
-                    "warning: cross-fs cleanup failed for {} (dest {} is valid): {e}",
-                    src.display(),
-                    dest.display()
-                );
-            }
-            Ok(())
+        ))
+    };
+    match rename_no_replace(src, dest) {
+        Ok(true) => return Ok(()),
+        Ok(false) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Err(refused()),
+        Err(e) => {
+            return Err(Status::internal(format!(
+                "rename failed {} → {}: {e}",
+                src.display(),
+                dest.display()
+            )))
         }
-        Err(e) => Err(Status::internal(format!(
-            "rename failed {} → {}: {e}",
+    }
+    let link_error = match std::fs::hard_link(src, dest) {
+        Ok(()) => {
+            remove_moved_source(src, dest);
+            return Ok(());
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Err(refused()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(Status::internal(format!(
+                "move failed {} → {}: {e}",
+                src.display(),
+                dest.display()
+            )))
+        }
+        // Another filesystem, or a link the kernel refuses (Linux's
+        // `fs.protected_hardlinks` refuses one to a file the caller does not own
+        // and cannot write, and staged files are 0o440): copy instead.
+        Err(e) => e,
+    };
+    copy_no_replace(src, dest).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::AlreadyExists {
+            refused()
+        } else {
+            Status::internal(format!(
+                "copy failed {} → {} (the hard link was refused: {link_error}): {e}",
+                src.display(),
+                dest.display()
+            ))
+        }
+    })?;
+    remove_moved_source(src, dest);
+    Ok(())
+}
+
+/// Rename `src` to `dest` unless `dest` exists, checked by the kernel in the same
+/// call, so two callers placing one destination cannot both succeed. `Ok(false)`
+/// when this platform or filesystem has no such rename, or the two paths are on
+/// different filesystems.
+fn rename_no_replace(src: &std::path::Path, dest: &std::path::Path) -> std::io::Result<bool> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let c = |p: &std::path::Path| {
+            std::ffi::CString::new(p.as_os_str().as_bytes())
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
+        };
+        let (from, to) = (c(src)?, c(dest)?);
+        // The raw syscall rather than glibc's wrapper, which only glibc 2.28 and
+        // later has. SAFETY: both paths are NUL-terminated and outlive the call.
+        #[cfg(target_os = "linux")]
+        let rc = unsafe {
+            libc::syscall(
+                libc::SYS_renameat2,
+                libc::AT_FDCWD,
+                from.as_ptr(),
+                libc::AT_FDCWD,
+                to.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        };
+        // SAFETY: as above.
+        #[cfg(target_os = "macos")]
+        let rc = unsafe { libc::renamex_np(from.as_ptr(), to.as_ptr(), libc::RENAME_EXCL) };
+        if rc == 0 {
+            return Ok(true);
+        }
+        let e = std::io::Error::last_os_error();
+        // Another filesystem, or one without the flag. ENOTSUP and EOPNOTSUPP
+        // are one value on Linux and two on macOS.
+        let unsupported = [
+            libc::EXDEV,
+            libc::EINVAL,
+            libc::ENOSYS,
+            libc::ENOTSUP,
+            libc::EOPNOTSUPP,
+        ];
+        match e.raw_os_error() {
+            Some(n) if unsupported.contains(&n) => Ok(false),
+            _ => Err(e),
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (src, dest);
+        Ok(false)
+    }
+}
+
+/// Copy `src` to a `dest` this call creates, refused when `dest` exists. A copy
+/// that fails partway removes the `dest` it created; if that removal fails too, a
+/// warning names the partial file.
+fn copy_no_replace(src: &std::path::Path, dest: &std::path::Path) -> std::io::Result<()> {
+    let mut from = std::fs::File::open(src)?;
+    let permissions = from.metadata()?.permissions();
+    // Created writable; the source's mode is applied once the bytes are written.
+    let mut to = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(dest)?;
+    let copied =
+        std::io::copy(&mut from, &mut to).and_then(|_| std::fs::set_permissions(dest, permissions));
+    if let Err(e) = copied {
+        drop(to);
+        if let Err(cleanup) = std::fs::remove_file(dest) {
+            eprintln!(
+                "warning: failed to remove partial copy {}: {cleanup}",
+                dest.display()
+            );
+        }
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// Remove the staging source of a move that placed `dest`. A failure leaves a
+/// stale staging file and is not the move's failure: `dest` has the data.
+fn remove_moved_source(src: &std::path::Path, dest: &std::path::Path) {
+    if let Err(e) = std::fs::remove_file(src) {
+        eprintln!(
+            "warning: cleanup of moved file {} failed (dest {} is valid): {e}",
             src.display(),
             dest.display()
-        ))),
+        );
     }
 }
 
@@ -3897,4 +4257,4 @@ fn build_block_read_query(
 
 #[cfg(test)]
 #[path = "flight_service_tests.rs"]
-mod tests;
+pub(crate) mod tests;

@@ -6,7 +6,8 @@ Postgres; the test shells out to `qiita <subcommand>` for every step —
 study, biosample, sequencing-run, sequenced-pool, sequenced-sample,
 fastq-to-parquet ticket submit, ticket status. Driving the actual CLI
 (not raw HTTP) also pins the flag names documented in
-docs/runbooks/user-cli-quickstart.md against argparse drift.
+docs/runbooks/getting-started.md (study, biosample) and the smoke recipe in
+docs/runbooks/first-deploy.md (the rest) against argparse drift.
 
 Each step clears a per-resource auth gate (study owner / run-or-pool
 creator / per-study ADMIN) — the regression guard against any gate
@@ -30,6 +31,8 @@ import httpx
 import pytest
 from qiita_common.api_paths import URL_UPLOAD_PREFIX
 from qiita_common.models import WorkTicketState
+from qiita_control_plane.testing.db_teardown import teardown_entity_graph
+from qiita_control_plane.testing.unique_names import unique_ena_accession
 
 # 1.3.0, not 1.0.0: this smoke submits UPLOAD HANDLES (a USER may not name a
 # host path), and `fastq_upload_idx` only exists in the widened schema.
@@ -179,8 +182,14 @@ async def test_user_authoring_smoke_via_cli(
     created_study_idxs: list[int] = []
 
     try:
+        # Both accession columns are UNIQUE, so a fixed literal would
+        # collide with a prior run against the same database.
+        run_tag = uuid.uuid4().hex[:12]
+
         # 1. study create — USER owns the new study; satisfies the
         #    owner-bypass on every downstream require_study_access.
+        #    --bioproject-accession is the key the bundled ingest gestures
+        #    resolve a pre-flight row's project against.
         study = _run_cli(
             cp_server,
             user_token,
@@ -188,6 +197,8 @@ async def test_user_authoring_smoke_via_cli(
             "create",
             "--title",
             f"user-cli-smoke-{uuid.uuid4()}",
+            "--bioproject-accession",
+            unique_ena_accession("PRJNA"),
         )
         study_idx = study["study_idx"]
         created_study_idxs.append(study_idx)
@@ -206,6 +217,9 @@ async def test_user_authoring_smoke_via_cli(
             "sample_name",
             "--owner-biosample-id-value",
             "USER-CLI-SMOKE-1",
+            # The pre-flight join key for a biosample.
+            "--biosample-accession",
+            f"SAMN-smoke-{run_tag}",
             # host_taxon_id is enforced at intake — supply a missing-value marker
             # (this smoke sample has no host of its own).
             "--metadata",
@@ -336,31 +350,19 @@ async def test_user_authoring_smoke_via_cli(
         # valid WorkTicketState.
         assert status["state"] in _WORK_TICKET_STATES
     finally:
-        # FK-reverse cleanup of every row the flow created. The server
-        # committed these to the shared test DB; teardown runs them
-        # through the test's own pool.
+        # The server committed these to the shared test DB;
+        # teardown runs them through the test's own pool.
         if created_ticket_idxs:
             await postgres_pool.execute(
                 "DELETE FROM qiita.work_ticket WHERE work_ticket_idx = ANY($1::bigint[])",
                 created_ticket_idxs,
             )
-        if created_prep_sample_idxs:
-            await postgres_pool.execute(
-                "DELETE FROM qiita.sequenced_sample WHERE prep_sample_idx = ANY($1::bigint[])",
-                created_prep_sample_idxs,
-            )
-            await postgres_pool.execute(
-                "DELETE FROM qiita.prep_sample_metadata WHERE prep_sample_idx = ANY($1::bigint[])",
-                created_prep_sample_idxs,
-            )
-            await postgres_pool.execute(
-                "DELETE FROM qiita.prep_sample_to_study WHERE prep_sample_idx = ANY($1::bigint[])",
-                created_prep_sample_idxs,
-            )
-            await postgres_pool.execute(
-                "DELETE FROM qiita.prep_sample WHERE idx = ANY($1::bigint[])",
-                created_prep_sample_idxs,
-            )
+        await teardown_entity_graph(
+            postgres_pool,
+            study_idxs=created_study_idxs,
+            biosample_idxs=created_biosample_idxs,
+            prep_sample_idxs=created_prep_sample_idxs,
+        )
         if created_sequenced_pool_idxs:
             await postgres_pool.execute(
                 "DELETE FROM qiita.sequenced_pool WHERE idx = ANY($1::bigint[])",
@@ -370,34 +372,6 @@ async def test_user_authoring_smoke_via_cli(
             await postgres_pool.execute(
                 "DELETE FROM qiita.sequencing_run WHERE idx = ANY($1::bigint[])",
                 created_sequencing_run_idxs,
-            )
-        if created_biosample_idxs:
-            await postgres_pool.execute(
-                "DELETE FROM qiita.biosample_metadata WHERE biosample_idx = ANY($1::bigint[])",
-                created_biosample_idxs,
-            )
-            await postgres_pool.execute(
-                "DELETE FROM qiita.biosample_to_study WHERE biosample_idx = ANY($1::bigint[])",
-                created_biosample_idxs,
-            )
-            await postgres_pool.execute(
-                "DELETE FROM qiita.biosample WHERE idx = ANY($1::bigint[])",
-                created_biosample_idxs,
-            )
-        if created_study_idxs:
-            await postgres_pool.execute(
-                "DELETE FROM qiita.biosample_study_field WHERE study_idx = ANY($1::bigint[])",
-                created_study_idxs,
-            )
-            # POST /study auto-grants the owner an ADMIN study_access row
-            # inside the same transaction; drop it before the study.
-            await postgres_pool.execute(
-                "DELETE FROM qiita.study_access WHERE study_idx = ANY($1::bigint[])",
-                created_study_idxs,
-            )
-            await postgres_pool.execute(
-                "DELETE FROM qiita.study WHERE idx = ANY($1::bigint[])",
-                created_study_idxs,
             )
 
 
@@ -437,4 +411,9 @@ async def test_user_cannot_author_on_study_without_admin_access(
         )
         assert "http error 403" in result.stderr
     finally:
-        await postgres_pool.execute("DELETE FROM qiita.study WHERE idx = $1", study_idx)
+        await teardown_entity_graph(
+            postgres_pool,
+            study_idxs=[study_idx],
+            biosample_idxs=[],
+            prep_sample_idxs=[],
+        )

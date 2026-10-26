@@ -323,3 +323,38 @@ def test_handler_refuses_a_missing_local_file(capsys):
     with pytest.raises(SystemExit):
         ns.handler(ns, parser)
     assert "not a regular file" in capsys.readouterr().err
+
+
+def test_handler_reports_an_unreachable_control_plane_on_one_line(monkeypatch, tmp_path, capsys):
+    """A connection failure (no HTTP response at all) is one stderr line naming
+    the URL it tried, and exit 1, not a traceback."""
+    from qiita_control_plane.cli import _common
+    from qiita_control_plane.cli.user import _parser
+    from qiita_control_plane.cli.user import reads as _reads
+
+    async def unreachable(**kwargs):
+        request = httpx.Request("POST", f"http://localhost:9999{URL_UPLOAD_PREFIX}")
+        raise httpx.ConnectError("Connection refused", request=request)
+
+    monkeypatch.setattr(_reads, "do_submit_reads", unreachable)
+    monkeypatch.setattr(_common, "read_token", lambda: "test-pat")
+    fastq = tmp_path / "ABC_R1.fastq"
+    fastq.write_text("@r\nA\n+\nI\n")
+    parser = _parser._build_parser()
+    ns = parser.parse_args(
+        [
+            "--base-url",
+            "http://localhost:9999",
+            "submit-reads",
+            "--prep-sample-idx",
+            "1",
+            "--fastq",
+            str(fastq),
+            "--data-plane-url",
+            "grpc://localhost:0",
+        ]
+    )
+    assert ns.handler(ns, parser) == 1
+    err = capsys.readouterr().err
+    assert err.count("\n") == 1
+    assert "could not reach http://localhost:9999" in err

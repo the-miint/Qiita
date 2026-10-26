@@ -10,17 +10,22 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+from qiita_control_plane.db import PRODUCTION_POOL_MAX_SIZE
 from qiita_control_plane.dispatch import (
+    _DISPATCH_CONCURRENCY,
     build_compute_backend_client,
+    build_dispatch_semaphore,
     drain_running_dispatches,
     schedule_dispatch,
 )
-from qiita_control_plane.fanout_dispatch import shard_cohort
+from qiita_control_plane.ena_import.batch import _STUDY_CONCURRENCY
+from qiita_control_plane.fanout_dispatch import DEFAULT_FANOUT_MAX_INFLIGHT, shard_cohort
 
 
 def _async_return(value):
@@ -35,12 +40,13 @@ def _async_return(value):
 def _fake_app(*, compute_backend_client=object(), pool=object()) -> SimpleNamespace:
     """Build the minimum app.state surface schedule_dispatch reads. The
     dispatcher only touches `app.state.compute_backend_client`,
-    `app.state.running_dispatches`, `app.state.pool`, and
-    `app.state.settings`. Real values are not exercised — `_run_and_log`
-    is monkeypatched in each test."""
+    `app.state.running_dispatches`, `app.state.dispatch_semaphore`,
+    `app.state.pool`, and `app.state.settings`. Real values are not exercised
+    — `_run_and_log` is monkeypatched in each test."""
     state = SimpleNamespace(
         compute_backend_client=compute_backend_client,
         running_dispatches=set(),
+        dispatch_semaphore=build_dispatch_semaphore(),
         pool=pool,
         settings=SimpleNamespace(
             flight_signing_key=b"x" * 32,
@@ -65,6 +71,34 @@ def test_schedule_dispatch_raises_when_client_unconfigured():
     app = _fake_app(compute_backend_client=None)
     with pytest.raises(RuntimeError, match="compute_backend_client is not configured"):
         schedule_dispatch(app, work_ticket_idx=42)
+
+
+def test_schedule_dispatch_reads_the_semaphore_before_creating_a_task():
+    """Unwired lifespan state must fail here — naming the missing wiring, not
+    with a bare AttributeError — and must not orphan a background task."""
+    app = SimpleNamespace(
+        state=SimpleNamespace(compute_backend_client=object(), running_dispatches=set())
+    )
+    with pytest.raises(RuntimeError, match="dispatch_semaphore is not wired"):
+        schedule_dispatch(app, work_ticket_idx=1)
+    assert app.state.running_dispatches == set()
+
+
+def test_dispatch_concurrency_stays_well_below_pool_max_size():
+    """Well below means at most half of `PRODUCTION_POOL_MAX_SIZE`, the same
+    constant main.py's `get_pool` call actually builds the pool with. Dispatch
+    and the ENA study gate also draw on that one pool with no joint accounting
+    anywhere else, so their sum is pinned here too."""
+    assert _DISPATCH_CONCURRENCY * 2 <= PRODUCTION_POOL_MAX_SIZE
+    assert _DISPATCH_CONCURRENCY + _STUDY_CONCURRENCY <= PRODUCTION_POOL_MAX_SIZE
+
+
+def test_dispatch_concurrency_reaches_one_cohort_at_its_default_cap():
+    """A fan-out cohort at FANOUT_MAX_INFLIGHT's default must be schedulable on
+    its own: the process-wide cap shares its slots with every other dispatch,
+    so a cap below the per-cohort default would silently clamp the knob its own
+    docs tell operators to raise."""
+    assert DEFAULT_FANOUT_MAX_INFLIGHT <= _DISPATCH_CONCURRENCY
 
 
 @pytest.mark.asyncio
@@ -92,6 +126,46 @@ async def test_schedule_dispatch_registers_and_removes_task(monkeypatch):
     # event loop turn so the discard fires before we assert.
     await asyncio.sleep(0)
     assert task not in app.state.running_dispatches
+
+
+@pytest.mark.asyncio
+async def test_a_dispatch_queued_behind_the_cap_logs_the_wait(monkeypatch, caplog):
+    """A dispatch waiting for a slot must be visible in the log: no runner has
+    started it yet, so it carries no `transient_reason` and no `dispatch_held`,
+    and the queue line is the only thing telling it apart from a dead one."""
+    app = _fake_app()
+    semaphore = app.state.dispatch_semaphore
+    for _ in range(_DISPATCH_CONCURRENCY):
+        await semaphore.acquire()
+
+    started = asyncio.Event()
+    finish = asyncio.Event()
+
+    async def _fake_run(_app, ticket_idx, **_kwargs):
+        started.set()
+        await finish.wait()
+
+    monkeypatch.setattr("qiita_control_plane.dispatch._run_and_log", _fake_run)
+
+    def _logged(fragment: str) -> bool:
+        return any(fragment in record.getMessage() for record in caplog.records)
+
+    with caplog.at_level(logging.INFO, logger="qiita_control_plane.dispatch"):
+        task = schedule_dispatch(app, work_ticket_idx=8)
+        try:
+            # Poll the log itself (not a fixed sleep): the task logs the queue
+            # before it blocks on the acquire.
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and not _logged("queued behind the dispatch cap"):
+                await asyncio.sleep(0.01)
+            assert _logged("queued behind the dispatch cap")
+        finally:
+            for _ in range(_DISPATCH_CONCURRENCY):
+                semaphore.release()
+            await asyncio.wait_for(started.wait(), timeout=5)
+            finish.set()
+            await asyncio.wait_for(task, timeout=5)
+    assert _logged("dispatched after waiting")
 
 
 @pytest.mark.asyncio

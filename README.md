@@ -112,6 +112,14 @@ make lint
 make clean
 ```
 
+## Using it
+
+Bringing a sequencing run into a running deploy — create the study and its
+biosamples, build the pre-flight file, submit the ingest — is
+[`docs/runbooks/getting-started.md`](docs/runbooks/getting-started.md). It is what
+the deploy's landing page links to, and it names the runbooks for the paths that
+branch off it.
+
 ## Deployment
 
 The full first-deploy procedure — env files installed under `/etc/qiita/`,

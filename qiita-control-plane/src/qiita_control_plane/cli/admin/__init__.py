@@ -14,8 +14,9 @@ reaches the system and whether the auth model can gate it:
                  auth system can't help (no admin exists yet, the API is
                  down, or you're recovering state).
 
-`token revoke-all` is HTTP+PAT and by the rule could live in `qiita`; it
-stays here for operator discoverability, not because the split forces it.
+`token revoke-all` and `principal set-role` are HTTP+PAT and by the rule could
+live in `qiita`; they stay here for operator discoverability (beside
+`set-system-role`, in set-role's case), not because the split forces them.
 
 For the subcommand list and per-flag details, run `qiita-admin --help` (or
 `qiita-admin <subcommand> --help`) — the argparse help is the ground truth, so
@@ -51,7 +52,11 @@ from ...backfill.host_taxon import (
     plan_backfill,
 )
 from ...backfill.mask_adapter_hash import RekeyPlan, apply_rekey, plan_rekey
+from ...backfill.syndna_read_count import BackfillPlan as SyndnaBackfillPlan
+from ...backfill.syndna_read_count import apply_backfill as apply_syndna_backfill
+from ...backfill.syndna_read_count import plan_backfill as plan_syndna_backfill
 from ...config import _parse_optional_positive_int_env
+from ...workspace import WORK_TICKET_SUBDIR
 from .. import _common
 from .._reference_exclusion import add_admin_exclusion_subparsers
 from ._helpers import _DB_CONNECT_TIMEOUT_SECONDS, open_admin_pool
@@ -87,13 +92,14 @@ from .mask import (
 from .masked_export import (
     _READ_MASKED_COLUMNS,
     _SAFE_ACCESSION,
+    DEFAULT_EXPORT_RETRY_SECONDS,
     _commit_partials,
     _count_masked,
     _export_stem,
     _handle_masked_read_export,
     _parquet_row_count,
     _peek_paired,
-    _sql_str,
+    _retry_seconds_arg,
     _write_masked_sample,
 )
 from .owner_id import (
@@ -102,7 +108,14 @@ from .owner_id import (
     _handle_owner_biosample_id,
     _write_owner_biosample_id_tsv,
 )
-from .role import _VALID_ROLE_VALUES, _handle_set_system_role, _set_system_role
+from .role import (
+    _VALID_ROLE_VALUES,
+    _handle_principal_set_role,
+    _handle_set_system_role,
+    _nonblank_reason,
+    _principal_set_role,
+    _set_system_role,
+)
 from .terminology import (
     DEFAULT_ROBOT_COMMAND_LINE,
     DEFAULT_ROBOT_EXPORT_FILENAME,
@@ -125,7 +138,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p_role = sub.add_parser(
         "set-system-role",
-        help="Direct-DB role update (bootstrap path)",
+        help="Direct-DB role update, unaudited (bootstrap path; prefer `principal set-role`)",
     )
     p_role.add_argument("--email", required=True)
     p_role.add_argument(
@@ -134,6 +147,22 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=list(_VALID_ROLE_VALUES),
     )
     p_role.set_defaults(handler=_handle_set_system_role)
+
+    p_principal = sub.add_parser("principal", help="Principal administration (system_admin)")
+    p_principal_sub = p_principal.add_subparsers(dest="principal_cmd", required=True)
+    p_set_role = p_principal_sub.add_parser(
+        "set-role",
+        help="Change a user's system role via PATCH /admin/principal/{idx}/system-role"
+        " (system_admin, admin:user; audited). A demotion applies to the user's"
+        " existing tokens at once; a promotion reaches them only on a token minted"
+        " after it, so the user must `qiita login` again.",
+    )
+    p_set_role.add_argument("--email", required=True, type=_common.lookup_email_arg)
+    p_set_role.add_argument("--role", required=True, choices=list(_VALID_ROLE_VALUES))
+    p_set_role.add_argument(
+        "--reason", required=True, type=_nonblank_reason, help="Recorded in the audit event"
+    )
+    p_set_role.set_defaults(handler=_handle_principal_set_role)
 
     p_whoami = sub.add_parser("whoami", help="Print the authenticated principal")
     p_whoami.set_defaults(handler=_handle_whoami)
@@ -427,13 +456,14 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Populate biosample host_taxon_id from the sample's own taxon + control status",
         description=(
             "Backfill the host_taxon_id biosample field, which postdates every sample"
-            " we hold. A control (per the pre-flight's own is_control) gets 'missing:"
-            " control sample'; otherwise the sample's own taxon_id is mapped to a host"
-            " through a small curated table. A sample neither rule settles is REPORTED"
-            " and left unwritten — it stays UNRESOLVED at submit, which aborts rather"
-            " than passing an un-depleted sample through. Idempotent: a biosample that"
-            " already carries the field is skipped, so this can be re-run as curation"
-            " lands. Dry-run by default; pass --execute to write. Needs DATABASE_URL."
+            " we hold. A control (per the pre-flight's own is_control, or negative"
+            " control metadata) gets 'missing: control sample'; otherwise the biosample's"
+            " own taxon_id is mapped to a host through a small curated table. A biosample"
+            " neither rule settles is REPORTED and left unwritten — it stays UNRESOLVED at"
+            " submit, which aborts rather than passing an un-depleted biosample through."
+            " Idempotent: a biosample that already carries the field is skipped, so this"
+            " can be re-run as curation lands. Dry-run by default; pass --execute to write."
+            " Needs DATABASE_URL."
         ),
     )
     p_backfill_host.add_argument(
@@ -524,6 +554,25 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_backfill_genome.set_defaults(handler=_handle_backfill_assembly_genome)
 
+    p_backfill_syndna = p_backfill_sub.add_parser(
+        "syndna-read-count",
+        help="Count SynDNA insert reads for prep_samples masked before counts were persisted",
+        description=(
+            "For every prep_sample completed under a SynDNA mask with no rows in"
+            " qiita.syndna_read_count, count the reads aligned to each insert from the"
+            " syndna step's alignment file in the read-mask ticket's scratch workspace,"
+            " and write them. A prep_sample whose file is gone is listed and skipped; a"
+            " re-mask is then its only source. Idempotent; dry-run by default. Needs"
+            " DATABASE_URL and PATH_SCRATCH."
+        ),
+    )
+    p_backfill_syndna.add_argument(
+        "--execute",
+        action="store_true",
+        help="Write the counts (default: dry-run, report only, no writes).",
+    )
+    p_backfill_syndna.set_defaults(handler=_handle_backfill_syndna_read_count)
+
     p_actions = sub.add_parser("actions", help="Action registry operations")
     p_actions_sub = p_actions.add_subparsers(dest="actions_cmd", required=True)
     p_actions_sync = p_actions_sub.add_parser(
@@ -574,11 +623,12 @@ def _build_parser() -> argparse.ArgumentParser:
     p_export = sub.add_parser(
         "masked-read-export",
         help=(
-            "Export masked sequence data for every sample on a sequenced_pool"
-            " (system_admin only). Streams each sample's masked reads from the"
-            " data plane and writes per-sample files named"
-            " <biosample_accession>.<run>.<pool>.<prep>[.R1/.R2].<parquet|fastq>"
-            " (paired fastq splits into R1/R2)."
+            "Export masked sequence data for every prep_sample on a"
+            " sequenced_pool (system_admin only). Streams each prep_sample's"
+            " masked reads from the data plane and writes them to"
+            " <biosample_accession>.<run>.<pool>.<prep_sample> plus .parquet,"
+            " or .fastq.gz (single-end) / .R1.fastq.gz and .R2.fastq.gz"
+            " (paired)."
         ),
     )
     p_export.add_argument(
@@ -586,7 +636,7 @@ def _build_parser() -> argparse.ArgumentParser:
         required=True,
         type=int,
         dest="sequenced_pool_idx",
-        help="sequenced_pool to export every (non-retired) sample of (required).",
+        help="sequenced_pool to export every (non-retired) prep_sample of (required).",
     )
     p_export.add_argument(
         "--mask-idx",
@@ -600,9 +650,9 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=("parquet", "fastq"),
         default="parquet",
         help=(
-            "Output format. parquet → one <stem>.parquet per sample; fastq →"
-            " one <stem>.fastq for a single-end sample, or split"
-            " <stem>.R1.fastq + <stem>.R2.fastq for a paired sample."
+            "Output format. parquet → one <stem>.parquet per prep_sample; fastq"
+            " → one <stem>.fastq.gz for a single-end prep_sample, or split"
+            " <stem>.R1.fastq.gz + <stem>.R2.fastq.gz for a paired one."
         ),
     )
     p_export.add_argument(
@@ -611,10 +661,11 @@ def _build_parser() -> argparse.ArgumentParser:
         type=Path,
         dest="output_dir",
         help=(
-            "Directory to write per-sample files into (created, with parents, if"
-            " missing; files are mode 0600). On re-export, an existing parquet"
-            " sample is skipped when its count matches the data plane and"
-            " overwritten when it differs; an existing fastq target is refused."
+            "Directory to write each prep_sample's files into (created, with"
+            " parents, if missing; files are mode 0600). On re-export, an"
+            " existing parquet file is skipped when its count matches the data"
+            " plane and overwritten when it differs; an existing fastq target"
+            " is refused."
         ),
     )
     p_export.add_argument(
@@ -636,6 +687,19 @@ def _build_parser() -> argparse.ArgumentParser:
             " fast link (break-even is around 4 Gbit/s), so it is a loss"
             " on-host and a large win over the TLS edge from off-site. Output"
             " files are identical either way."
+        ),
+    )
+    p_export.add_argument(
+        "--retry-seconds",
+        type=_retry_seconds_arg,
+        default=DEFAULT_EXPORT_RETRY_SECONDS,
+        dest="retry_seconds",
+        help=(
+            "How long to keep retrying a prep_sample whose export failed because"
+            " the data plane or the control plane was unreachable (a restart,"
+            " e.g. a deploy), starting from its first failure. The prep_sample is"
+            " exported again from the start; 0 disables the retry."
+            f" Default {DEFAULT_EXPORT_RETRY_SECONDS:g}."
         ),
     )
     p_export.set_defaults(handler=_handle_masked_read_export)
@@ -941,9 +1005,6 @@ def _handle_mask_purge_failed(args: argparse.Namespace, parser: argparse.Argumen
         )
     except (RuntimeError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
-        return 1
-    except httpx.HTTPStatusError as exc:
-        print(f"http error {exc.response.status_code}: {exc.response.text}", file=sys.stderr)
         return 1
 
     mode = "EXECUTED" if report["executed"] else "DRY-RUN (no writes; pass --execute to commit)"
@@ -1309,6 +1370,66 @@ def _handle_backfill_assembly_genome(
     return 0
 
 
+async def _backfill_syndna_read_count(
+    database_url: str, *, ticket_root: Path, execute: bool
+) -> tuple[SyndnaBackfillPlan, int]:
+    """Plan, report, and (with `execute`) apply the SynDNA read-count backfill.
+    Returns `(plan, written)`; `written` is 0 on a dry run."""
+    pool = await open_admin_pool(database_url)
+    try:
+        plan = await plan_syndna_backfill(pool, ticket_root=ticket_root)
+        if not execute:
+            return plan, 0
+        return plan, await apply_syndna_backfill(pool, plan)
+    finally:
+        await pool.close()
+
+
+def _handle_backfill_syndna_read_count(
+    args: argparse.Namespace, parser: argparse.ArgumentParser
+) -> int:
+    database_url = os.environ.get("DATABASE_URL")
+    if not database_url:
+        print("error: DATABASE_URL not set", file=sys.stderr)
+        return 2
+    scratch = os.environ.get("PATH_SCRATCH")
+    if not scratch or not Path(scratch).is_absolute():
+        print("error: PATH_SCRATCH must be set to an absolute path", file=sys.stderr)
+        return 2
+
+    try:
+        plan, written = asyncio.run(
+            _backfill_syndna_read_count(
+                database_url,
+                ticket_root=Path(scratch) / WORK_TICKET_SUBDIR,
+                execute=args.execute,
+            )
+        )
+    except (RuntimeError, ValueError, FileNotFoundError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    writable, residue = plan.writable(), plan.residue()
+    print(f"uncounted prep_samples : {len(plan.pairs)}")
+    print(f"with a file           : {len(writable)}")
+    print(f"without one           : {len(residue)}")
+    for pair in residue:
+        print(f"  mask {pair.mask_idx} prep_sample {pair.prep_sample_idx}: {pair.reason}")
+
+    if not plan.pairs:
+        print("\nnothing to do — every completed SynDNA-masked prep_sample has counts.")
+        return 0
+
+    if args.execute:
+        print(f"\nwrote counts for {written} prep_sample(s)")
+    else:
+        print(
+            f"\nDRY RUN — nothing written. Pass --execute to write counts for"
+            f" {len(writable)} prep_sample(s)."
+        )
+    return 0
+
+
 __all__ = [
     "_DB_CONNECT_TIMEOUT_SECONDS",
     "_DEFAULT_ORCHESTRATOR_VENV",
@@ -1335,23 +1456,9 @@ __all__ = [
     "_count_non_failed_missing_mask_idx",
     "_export_stem",
     "_force_fail_ticket",
-    "_handle_actions_sync",
-    "_handle_compute_readiness",
-    "_handle_login",
-    "_handle_mask_delete",
     "_backfill_assembly_genome",
     "_backfill_host_taxon_id",
     "_backfill_mask_adapter_hash",
-    "_handle_backfill_assembly_genome",
-    "_handle_backfill_host_taxon_id",
-    "_handle_backfill_mask_adapter_hash",
-    "_handle_mask_purge_failed",
-    "_handle_masked_read_export",
-    "_handle_owner_biosample_id",
-    "_handle_set_system_role",
-    "_handle_ticket_force_fail",
-    "_handle_token_revoke_all",
-    "_handle_whoami",
     "_mask_delete_via_route",
     "_mask_shared_with_non_failed",
     "_parquet_row_count",
@@ -1360,8 +1467,9 @@ __all__ = [
     "_purge_failed",
     "_resubmit_work_ticket",
     "_select_purge_failed_candidates",
+    "_nonblank_reason",
+    "_principal_set_role",
     "_set_system_role",
-    "_sql_str",
     "_sync_actions",
     "_token_revoke_all",
     "_validate_force_fail_args",

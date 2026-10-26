@@ -415,3 +415,33 @@ def test_settings_default_adapter_reference_idx_rejects_invalid(monkeypatch):
         monkeypatch.setenv("QIITA_DEFAULT_ADAPTER_REFERENCE_IDX", bad)
         with pytest.raises(RuntimeError, match="QIITA_DEFAULT_ADAPTER_REFERENCE_IDX"):
             Settings.from_env()
+
+
+def test_settings_ena_download_run_concurrency_unset_is_none(monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@localhost:5432/db")
+    monkeypatch.delenv("ENA_DOWNLOAD_RUN_CONCURRENCY", raising=False)
+
+    from qiita_control_plane.config import Settings
+
+    assert Settings.from_env().ena_download_run_concurrency is None
+
+
+def test_settings_ena_download_run_concurrency_from_env(monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@localhost:5432/db")
+    monkeypatch.setenv("ENA_DOWNLOAD_RUN_CONCURRENCY", "8")
+
+    from qiita_control_plane.config import Settings
+
+    assert Settings.from_env().ena_download_run_concurrency == 8
+
+
+@pytest.mark.parametrize("bad_value", ["0", "9", "-1", "x"])
+def test_settings_rejects_bad_ena_download_run_concurrency(monkeypatch, bad_value):
+    """A value the job would reject must fail at boot, not on every batch ticket."""
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@localhost:5432/db")
+    monkeypatch.setenv("ENA_DOWNLOAD_RUN_CONCURRENCY", bad_value)
+
+    from qiita_control_plane.config import Settings
+
+    with pytest.raises(RuntimeError, match="ENA_DOWNLOAD_RUN_CONCURRENCY"):
+        Settings.from_env()

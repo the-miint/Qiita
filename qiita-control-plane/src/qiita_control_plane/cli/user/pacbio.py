@@ -36,6 +36,7 @@ from pathlib import Path
 from typing import NamedTuple
 
 import httpx
+from qiita_common.actions import BAM_TO_PARQUET_ACTION_ID
 from qiita_common.api_paths import (
     PATH_WORK_TICKET_PREFIX,
 )
@@ -46,18 +47,19 @@ from qiita_common.models import (
     SequencedPoolCreateRequest,
     SequencingRunCreateRequest,
     WorkTicketCreateRequest,
+    WorkTicketState,
 )
 
 from ...preflight import SHEET_TYPE_PACBIO_ABSQUANT
 from .. import _common
-from ._helpers import _inspect_run_folder, _load_preflight_conn
+from ._helpers import _inspect_run_folder, _load_preflight_conn, _refuse_malformed_accessions
 from .pool import _provision_run_pool_roster
 
 # action_id + version for the per-sample read loader this command fans out to.
-# Pinned here so the CLI does not drift from the workflow YAML the operator's
-# deploy syncs into qiita.action; PacBio ingest reuses `bam-to-parquet` verbatim
-# (a pre-demuxed uBAM -> the DuckLake `read` table) rather than a bespoke job.
-_BAM_TO_PARQUET_ACTION_ID = "bam-to-parquet"
+# The version is pinned here so the CLI does not drift from the workflow YAML the
+# operator's deploy syncs into qiita.action; PacBio ingest reuses `bam-to-parquet`
+# verbatim (a pre-demuxed uBAM -> the DuckLake `read` table) rather than a bespoke job.
+_BAM_TO_PARQUET_ACTION_ID = BAM_TO_PARQUET_ACTION_ID
 _BAM_TO_PARQUET_ACTION_VERSION = "1.0.0"
 
 # Preflight sheet_type values (kl-run-preflight [Header] SheetType). syndna is
@@ -80,8 +82,8 @@ class _PacbioPreflightRow(NamedTuple):
     LOCATE the sample's BAM on disk — it is NOT unique across all PacBio protocols
     and is never used as an identity/pool-item-id.
 
-    The project accessions are ENA **bioproject** accessions (what the study lookup
-    route resolves), matching the Illumina row; `secondary_project_accessions` is
+    The project accessions are ENA **bioproject** accessions (what resolve-roster
+    resolves), matching the Illumina row; `secondary_project_accessions` is
     populated for controls. The three protocol columns (`sheet_type`,
     `twist_adaptor_id`, `syndna_is_twisted`) feed the read-mask mask-chain
     derivation. `smrt_cell` is the SMRT-cell well (`smrt_cell_well_sample_id`, form
@@ -114,9 +116,9 @@ def _read_pacbio_preflight_rows(
     pool-item-id).
 
     Operator-actionable errors (an unloadable preflight, a non-PacBio sheet, no
-    `pacbio_sample` rows, a missing accession, or an impossible protocol combo) raise
-    via `parser.error` so the CLI surfaces one stderr line and exits 2 before any
-    network call — matching `_read_preflight_rows`.
+    `pacbio_sample` rows, a missing, blank or padded accession, or an impossible
+    protocol combo) raise via `parser.error` so the CLI surfaces one stderr line and
+    exits 2 before any network call — matching `_read_preflight_rows`.
     """
     from run_preflight import get_pacbio_sample_info  # noqa: PLC0415
     from run_preflight.db import get_run_legacy_format, get_single_run_idx  # noqa: PLC0415
@@ -186,6 +188,7 @@ def _read_pacbio_preflight_rows(
                 " is absent from the run_pacbio_sample view — the preflight is"
                 " internally inconsistent"
             )
+        _refuse_malformed_accessions(info, parser, preflight_blob, "pacbio_sample_idx")
         if not pbs.barcode_id:
             parser.error(
                 f"--preflight-blob {preflight_blob}: pacbio_sample_idx {info.sample_idx}"
@@ -329,20 +332,25 @@ def _handle_submit_pacbio_ingest(args: argparse.Namespace, parser: argparse.Argu
        makes a retry converge instead of aborting on the first already-created sample.
     5. Fan out one `bam-to-parquet` ticket per sample (scope prep_sample,
        action_context {bam_path, expect_unaligned: true}). Per-sample resilient:
-       one sample's ticket failure is recorded and the fan-out continues. A 409
-       (sample already COMPLETED under disallow-without-delete, or already
-       in-flight) is recorded as SKIPPED — the convergence signal, not a failure —
-       so re-running to retry a failed sample never reports the finished ones as
-       failures. The command exits non-zero only if a real (non-409) failure
-       occurred (mirrors submit-host-filter-pool).
+       one prep_sample's ticket failure is recorded and the fan-out continues. A
+       409 (a ticket for that prep_sample already in flight) is recorded as
+       SKIPPED — the convergence signal, not a failure. The command exits non-zero
+       only if a real (non-409) failure occurred (mirrors submit-host-filter-pool).
 
     Convergent retry: find-or-create on the run + pool, create-missing on the
     roster (step 4), and the 409-as-skip fan-out (step 5) together mean re-running
-    the identical gesture after a partial failure reuses everything already made,
-    skips the already-done samples (exit 0), and only re-submits the still-missing
-    / previously-FAILED ones (the route resets a FAILED ticket). --force is the
-    separate, deliberate re-ingest path (it re-registers reads → lake duplicates),
-    NOT the retry route. All calls share one PAT.
+    the identical gesture after a partial failure reuses everything already made
+    and re-submits the rest. The in-flight gate blocks only non-terminal tickets,
+    so a reused prep_sample with a COMPLETED bam-to-parquet ticket is SKIPPED
+    here: a fresh ticket would stop at the read-numbering step without storing
+    anything (see `sequence_range_retry.mint_or_reuse_sequence_range`). The
+    lookup uses `?all=true`, which the submitter can pass because naming the BAM
+    path already needs wet_lab_admin. A FAILED prep_sample's
+    ticket is not reset by a submit either: the new ticket converges if the failed
+    one never numbered the reads, and otherwise stops, naming `qiita ticket run`
+    for the failed one. There is no --force: Illumina's `--force` waives a
+    sequenced_pool-scoped gate, and this command has none to waive; a deliberate
+    re-load goes through removing the pool. All calls share one PAT.
     """
     # The path is checked SERVER-side (POST /run-folder/inspect, below), not
     # here: it names the folder as the CLUSTER sees it, and a check against this
@@ -394,7 +402,6 @@ def _handle_submit_pacbio_ingest(args: argparse.Namespace, parser: argparse.Argu
             prep_protocol_idx=args.prep_protocol_idx,
             pool_item_id=lambda row: str(row.pacbio_sample_idx),
             row_label=lambda row: f"pacbio_sample_idx {row.pacbio_sample_idx}",
-            row_noun="sample",
         )
         sequencing_run_idx = provision.sequencing_run_idx
         sequenced_pool_idx = provision.sequenced_pool_idx
@@ -414,20 +421,61 @@ def _handle_submit_pacbio_ingest(args: argparse.Namespace, parser: argparse.Argu
 
         # Fan out one bam-to-parquet ingest ticket per sample. Per-sample
         # resilient: a single ticket's failure is recorded and the loop CONTINUES,
-        # so one bad sample never strands the rest (mirrors submit-host-filter-pool).
+        # so one bad prep_sample never strands the rest (mirrors submit-host-filter-pool).
         #
-        # A 409 is NOT a failure — it is the convergence signal: a sample already
-        # COMPLETED (disallow-without-delete) or already in-flight
-        # (PENDING/QUEUED/PROCESSING) rejects a duplicate submit with 409. That is
-        # exactly "already done / already running", so we record it as SKIPPED and
-        # do NOT count it toward the non-zero exit — re-running the gesture to
-        # retry a failed sample must not report the finished ones as failures.
-        # (A FAILED sample's ticket is reset by the route and re-submitted 201,
-        # so it converges without a skip. --force is the separate, deliberate
-        # re-ingest path and intentionally NOT the recovery route here.)
+        # A 409 is NOT a failure — it means the prep_sample already has a ticket
+        # in flight (PENDING/QUEUED/PROCESSING), so this submit is a duplicate of
+        # work already running. Recorded as SKIPPED and NOT counted toward the
+        # non-zero exit, so re-running to retry one prep_sample does not report the
+        # running ones as failures.
+        # A reused prep_sample whose reads a COMPLETED ticket loaded is skipped
+        # before the POST; a FAILED one is admitted. The docstring's
+        # convergent-retry paragraph says why.
         failures: list[dict] = []
         skipped: list[dict] = []
+
+        def _row(entry: dict, **extra) -> dict:
+            return {
+                "pacbio_sample_idx": entry["pacbio_sample_idx"],
+                "prep_sample_idx": entry["prep_sample_idx"],
+                "barcode": entry["barcode"],
+                **extra,
+            }
+
+        def _failure(entry: dict, exc: httpx.HTTPError, context: str = "") -> dict:
+            if isinstance(exc, httpx.HTTPStatusError):
+                return _row(
+                    entry,
+                    status_code=exc.response.status_code,
+                    error=context + exc.response.text[:500],
+                )
+            return _row(entry, status_code=None, error=f"{context}{type(exc).__name__}: {exc}")
+
         for entry in per_sample:
+            if entry["reused"]:
+                try:
+                    completed = _common.call(
+                        "GET",
+                        args.base_url,
+                        token,
+                        PATH_WORK_TICKET_PREFIX,
+                        params={
+                            "all": "true",
+                            "prep_sample_idx": entry["prep_sample_idx"],
+                            "action_id": _BAM_TO_PARQUET_ACTION_ID,
+                            "state": WorkTicketState.COMPLETED.value,
+                            "limit": 1,
+                        },
+                    )
+                except httpx.HTTPError as exc:
+                    failures.append(_failure(entry, exc, "looking up its completed ingest: "))
+                    continue
+                if completed["tickets"]:
+                    loaded_by = completed["tickets"][0]["work_ticket_idx"]
+                    skipped.append(
+                        _row(entry, reason=f"reads already loaded by ticket {loaded_by}")
+                    )
+                    continue
             ticket_body = WorkTicketCreateRequest(
                 action_id=_BAM_TO_PARQUET_ACTION_ID,
                 action_version=_BAM_TO_PARQUET_ACTION_VERSION,
@@ -439,7 +487,6 @@ def _handle_submit_pacbio_ingest(args: argparse.Namespace, parser: argparse.Argu
                     "bam_path": entry["bam_path"],
                     "expect_unaligned": True,
                 },
-                force=args.force,
             ).model_dump(exclude_unset=True, mode="json")
             try:
                 ticket_resp, _status = _common.call_with_status(
@@ -447,37 +494,14 @@ def _handle_submit_pacbio_ingest(args: argparse.Namespace, parser: argparse.Argu
                 )
             except httpx.HTTPStatusError as exc:
                 if exc.response.status_code == 409:
-                    # Already ingested (COMPLETED) or already in-flight — converged,
-                    # not failed. Skip without contributing to the non-zero exit.
-                    skipped.append(
-                        {
-                            "pacbio_sample_idx": entry["pacbio_sample_idx"],
-                            "prep_sample_idx": entry["prep_sample_idx"],
-                            "barcode": entry["barcode"],
-                            "reason": exc.response.text[:500],
-                        }
-                    )
+                    # Already in flight — converged, not failed. Skip without
+                    # contributing to the non-zero exit.
+                    skipped.append(_row(entry, reason=exc.response.text[:500]))
                     continue
-                failures.append(
-                    {
-                        "pacbio_sample_idx": entry["pacbio_sample_idx"],
-                        "prep_sample_idx": entry["prep_sample_idx"],
-                        "barcode": entry["barcode"],
-                        "status_code": exc.response.status_code,
-                        "error": exc.response.text[:500],
-                    }
-                )
+                failures.append(_failure(entry, exc))
                 continue
             except httpx.HTTPError as exc:
-                failures.append(
-                    {
-                        "pacbio_sample_idx": entry["pacbio_sample_idx"],
-                        "prep_sample_idx": entry["prep_sample_idx"],
-                        "barcode": entry["barcode"],
-                        "status_code": None,
-                        "error": f"{type(exc).__name__}: {exc}",
-                    }
-                )
+                failures.append(_failure(entry, exc))
                 continue
             entry["work_ticket_idx"] = ticket_resp.get("work_ticket_idx")
 

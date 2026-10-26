@@ -60,8 +60,9 @@ from ..config import get_settings
 from ..data_plane_client import open_reference_chunk_stream
 from ..derived_store import rype_router_index_path
 from ..miint import (
-    PARQUET_OPTS_CHUNKED,
+    PARQUET_OPTS_CHUNKED_TRANSFER,
     apply_duckdb_settings,
+    detected_ram_gb,
     duckdb_headroom_gb,
     duckdb_tmp_dir,
     open_miint_conn,
@@ -159,7 +160,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
         raise FileNotFoundError(f"shard_mapping not found: {inputs.shard_mapping}")
 
     # Persistent router location under the derived-artifact root (PATH_DERIVED),
-    # NOT the ephemeral per-attempt workspace. On SLURM the backend propagates
+    # NOT the per-attempt scratch workspace. On SLURM the backend propagates
     # PATH_DERIVED into the job env so get_settings() resolves the real value. The
     # layout is owned by `derived_store` (shared with the reference-artifact purge
     # endpoint). One `.ryxdi` directory per reference (whole-reference router).
@@ -173,21 +174,33 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
         shutil.rmtree(router_dir)
 
     # DuckDB share stays bounded (cap at `_DUCKDB_MEMORY_CAP_GB`); rype gets the
-    # rest of the cgroup. Off SLURM both fall back to their literals (4 + 30). The
-    # headroom subtracted from rype's share is the same margin DuckDB reserves.
-    # Mirrors build_rype_index.
+    # rest of the cgroup. Off SLURM both literals are ceilings, each bounded by
+    # detected host RAM. The headroom subtracted from rype's share is the same
+    # margin DuckDB reserves. Mirrors build_rype_index.
     duckdb_memory_gb = resolve_duckdb_memory_gb(
         _DUCKDB_MEMORY_GB, threads=_DUCKDB_THREADS, cap_gb=_DUCKDB_MEMORY_CAP_GB
     )
     alloc_gb = slurm_alloc_gb()
-    rype_max_memory_gb = (
-        _RYPE_MAX_MEMORY_GB
-        if alloc_gb is None
-        else max(
+    if alloc_gb is not None:
+        rype_max_memory_gb = max(
             _RYPE_MAX_MEMORY_GB,
             alloc_gb - duckdb_memory_gb - duckdb_headroom_gb(_DUCKDB_THREADS),
         )
-    )
+    else:
+        # The cgroup split's terms against the host: rype is capped at what the
+        # machine has left after DuckDB's share and the headroom.
+        ram_gb = detected_ram_gb()
+        rype_max_memory_gb = (
+            _RYPE_MAX_MEMORY_GB
+            if ram_gb is None
+            else max(
+                1,
+                min(
+                    _RYPE_MAX_MEMORY_GB,
+                    ram_gb - duckdb_memory_gb - duckdb_headroom_gb(_DUCKDB_THREADS),
+                ),
+            )
+        )
 
     chunks_parquet = workspace / "router_chunks.parquet"
     # Validate the COPY target ONCE and reuse it for both the write and the re-scan
@@ -209,7 +222,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             ) as rel:
                 conn.execute(
                     f"COPY (SELECT feature_idx, chunk_index, chunk_data FROM {rel}) "
-                    f"TO '{chunks_sql}' ({PARQUET_OPTS_CHUNKED})"
+                    f"TO '{chunks_sql}' ({PARQUET_OPTS_CHUNKED_TRANSFER})"
                 )
 
             # Multi-bucket mapping straight from the staged Parquet: one bucket per

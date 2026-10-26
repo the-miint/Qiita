@@ -1,0 +1,49 @@
+{
+  "_source": "derived from the real SRR096342 row recorded from https://www.ebi.ac.uk/ena/portal/api/search?result=read_run&query=study_accession=\"PRJNA48739\"&fields=run_accession,experiment_accession,sample_accession,study_accession,library_layout,library_strategy,library_source,library_selection,instrument_platform,fastq_ftp,fastq_aspera,fastq_bytes,fastq_md5,read_count,base_count,status&limit=0&format=tsv on 2026-09-29; `status` overridden to 'suppressed' for this test -- NOT a genuine ENA response (Portal's /search only ever returns public records, so a real suppressed row cannot be recorded live)",
+  "columns": [
+    "run_accession",
+    "experiment_accession",
+    "sample_accession",
+    "study_accession",
+    "library_layout",
+    "library_strategy",
+    "library_source",
+    "library_selection",
+    "instrument_platform",
+    "fastq_ftp",
+    "fastq_aspera",
+    "fastq_bytes",
+    "fastq_md5",
+    "read_count",
+    "base_count",
+    "status"
+  ],
+  "rows": [
+    [
+      "SRR096342",
+      "SRX039368",
+      "SAMN00199006",
+      "PRJNA48739",
+      "SINGLE",
+      "WGS",
+      "GENOMIC",
+      "RANDOM",
+      "LS454",
+      [
+        "ftp.sra.ebi.ac.uk/vol1/fastq/SRR096/SRR096342/SRR096342.fastq.gz"
+      ],
+      [
+        "fasp.sra.ebi.ac.uk:/vol1/fastq/SRR096/SRR096342/SRR096342.fastq.gz"
+      ],
+      [
+        89054035
+      ],
+      [
+        "791595268ae7a965664652bde3444a2b"
+      ],
+      298966,
+      158722947,
+      "suppressed"
+    ]
+  ]
+}

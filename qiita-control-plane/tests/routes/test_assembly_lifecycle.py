@@ -16,6 +16,7 @@ answer two different questions, and the tests below are organized by which:
 import json
 import secrets
 
+import asyncpg
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
@@ -35,6 +36,9 @@ from qiita_control_plane.testing.db_seeds import (
     seed_biosample_with_sequenced_prep_sample,
     seed_prep_sample_to_study_link,
 )
+from qiita_control_plane.testing.db_teardown import teardown_entity_graph
+
+from .conftest import DEPRECATION_FIELDS, INVALIDATION_FIELDS, PARTIAL_PROVENANCE, set_provenance
 
 pytestmark = pytest.mark.db
 
@@ -107,15 +111,11 @@ async def lifecycle(postgres_pool, human_admin_session):
         # first, so the narrowing test needs the parent too.
         "bs_done": bs_done,
     }
-    await postgres_pool.execute(
-        "DELETE FROM qiita.assembly_sample WHERE processing_idx = $1", processing_idx
-    )
-    await postgres_pool.execute(
-        "DELETE FROM qiita.prep_sample WHERE idx = ANY($1::bigint[])",
-        [ps_done, ps_pend, ps_nd],
-    )
-    await postgres_pool.execute(
-        "DELETE FROM qiita.biosample WHERE idx = ANY($1::bigint[])", [bs_done, bs_pend, bs_nd]
+    await teardown_entity_graph(
+        postgres_pool,
+        study_idxs=[],
+        biosample_idxs=[bs_done, bs_pend, bs_nd],
+        prep_sample_idxs=[ps_done, ps_pend, ps_nd],
     )
     await postgres_pool.execute(
         "DELETE FROM qiita.processing WHERE processing_idx = $1", processing_idx
@@ -610,13 +610,11 @@ async def test_a_plain_user_sees_only_the_runs_over_samples_they_may_see(
         assert lifecycle["ps_done"] not in {s["prep_sample_idx"] for s in roster.json()["samples"]}
         assert by_idx.status_code == 200, by_idx.text
     finally:
-        await postgres_pool.execute(
-            "DELETE FROM qiita.prep_sample_to_study WHERE study_idx = $1", study_idx
+        # Only the study: its biosample and prep_sample belong to the lifecycle
+        # fixture, which tears them down itself.
+        await teardown_entity_graph(
+            postgres_pool, study_idxs=[study_idx], biosample_idxs=[], prep_sample_idxs=[]
         )
-        await postgres_pool.execute(
-            "DELETE FROM qiita.biosample_to_study WHERE study_idx = $1", study_idx
-        )
-        await postgres_pool.execute("DELETE FROM qiita.study WHERE idx = $1", study_idx)
 
 
 async def test_superseded_by_round_trips_and_a_re_deprecate_replaces_it(
@@ -667,10 +665,9 @@ async def test_superseded_by_round_trips_and_a_re_deprecate_replaces_it(
 
 
 async def test_the_sequenced_pool_filter_narrows_both_reads(postgres_pool, client, lifecycle):
-    """The one `sample_scope_sql` arm carrying its own subquery bind, and the only
-    one no test reached. Its `$N` differs per caller because the list and the
-    roster seed `args` to different depths, so a numbering slip shows up here and
-    nowhere else.
+    """The `sequenced_pool_idx` arm of `sample_scope_sql`, which no other test
+    reaches. Its `$N` differs per caller because the list and the roster seed `args`
+    to different depths, so a numbering slip shows up here and nowhere else.
 
     Both directions are asserted: the pool the sample is on returns it, a pool it
     is not on excludes it. Without the negative half a filter the SQL ignored
@@ -937,3 +934,28 @@ async def test_lifecycle_patches_require_the_lifecycle_scope(
     assert sample_resp.status_code == 403
     assert read_resp.status_code == 200
     assert json.loads(status_resp.text)["detail"]
+
+
+@pytest.mark.parametrize("subset", PARTIAL_PROVENANCE)
+async def test_a_live_config_cannot_hold_some_deprecation_fields(postgres_pool, lifecycle, subset):
+    assignments = set_provenance(DEPRECATION_FIELDS, subset, lifecycle["principal_idx"])
+    with pytest.raises(asyncpg.CheckViolationError):
+        await postgres_pool.execute(
+            f"UPDATE qiita.processing SET {assignments} WHERE processing_idx = $1",
+            lifecycle["processing_idx"],
+        )
+
+
+@pytest.mark.parametrize("state", ["completed", "pending", "no_data"])
+@pytest.mark.parametrize("subset", PARTIAL_PROVENANCE)
+async def test_a_live_sample_cannot_hold_some_invalidation_fields(
+    postgres_pool, lifecycle, state, subset
+):
+    assignments = set_provenance(INVALIDATION_FIELDS, subset, lifecycle["principal_idx"])
+    with pytest.raises(asyncpg.CheckViolationError):
+        await postgres_pool.execute(
+            f"UPDATE qiita.assembly_sample SET {assignments}"
+            f" WHERE processing_idx = $1 AND state = $2",
+            lifecycle["processing_idx"],
+            state,
+        )

@@ -23,16 +23,18 @@ Raw-read identifiers extend the prep_sample hierarchy:
 
 - **`sequence_idx`** — globally-unique bigint identifying a single raw read stored in the data plane. Minted by the control plane in contiguous ranges of caller-specified size via `POST /api/v1/sequence-range`, recorded in `qiita.sequence_range` (1:1 with `prep_sample_idx`, kind-pinned to `processing_kind='sequenced'` via composite FK), and never recycled — a deleted range's `sequence_idx` values stay consumed in `qiita.sequence_idx_seq`. The endpoint is service-account-only (`sequence_range:mint` scope); the compute orchestrator obtains a range before writing raw-read Parquet to the data plane.
 
-## Legacy import reserved range — study and prep_sample
+## Legacy import reserved range — study, prep_sample and sequenced_pool
 
-The live deployment partitions `study.idx` and `prep_sample.idx` into two non-overlapping bands:
+The live deployment partitions `study.idx`, `prep_sample.idx` and `sequenced_pool.idx` into two non-overlapping bands:
 
-- **`[1, 25000)`** — reserved for the one-time legacy import from the previous Qiita installation. Historic rows preserve their original integer identifiers and are inserted with `OVERRIDING SYSTEM VALUE` (both columns are `GENERATED ALWAYS AS IDENTITY`).
+- **`[1, 25000)`** — reserved for rows carried over from the previous Qiita installation, which keep their original integer identifiers and are inserted with `OVERRIDING SYSTEM VALUE` (all three columns are `GENERATED ALWAYS AS IDENTITY`).
 - **`[25000, ...)`** — every new row minted on this deployment.
 
-A schema migration fast-forwards the implicit identity sequences for `qiita.study.idx` and `qiita.prep_sample.idx` past the reserved block; existing rows in `[1, 25000)` are untouched. The threshold itself is pinned on each column in the Postgres catalog via `COMMENT ON COLUMN`, so `\d+ qiita.study` and `\d+ qiita.prep_sample` surface the invariant without consulting the migration history. The bump is one-way — the underlying sequence operation only advances and cannot rewind without risking PK collisions — so the migration's down step is a deliberate no-op.
+Schema migrations fast-forward the implicit identity sequences for `qiita.study.idx`, `qiita.prep_sample.idx` and `qiita.sequenced_pool.idx` past the reserved block; existing rows in `[1, 25000)` are untouched. The threshold itself is pinned on each column in the Postgres catalog via `COMMENT ON COLUMN`, so `\d+ qiita.study`, `\d+ qiita.prep_sample` and `\d+ qiita.sequenced_pool` surface the invariant without consulting the migration history. The bump is one-way: the down steps of the migrations that made it drop their column comments and leave the sequences where they are, because rewinding a sequence would reissue ids already minted.
 
-The reservation is intentionally scoped to `study` and `prep_sample` only — those are the identifiers legacy callers will continue to quote. Adjacent rows (`biosample`, `sequenced_sample`, `sequencing_run`, `prep_protocol`, the per-row `*_metadata` / `*_field_exception` tables, references) receive freshly-minted identifiers during the legacy import rather than preserving their originals, so their identity sequences are left on the default start.
+A study enters the reserved band through `POST /api/v1/study` with an explicit `study_idx` (`qiita study create --study-idx`), which only a system_admin may send. The ceiling the API checks against is `LEGACY_IDX_RESERVED_CEILING` in `qiita_common.models.study`. No path writes an explicit `prep_sample.idx` or `sequenced_pool.idx`.
+
+The reservation is intentionally scoped to `study` and `prep_sample` — those are the identifiers legacy callers will continue to quote — and `sequenced_pool`, the closest analog of a legacy prep, so legacy preps can migrate into pools under their ids. Adjacent rows (`biosample`, `sequenced_sample`, `sequencing_run`, `prep_protocol`, the per-row `*_metadata` / `*_field_exception` tables, references) receive freshly-minted identifiers during the legacy import rather than preserving their originals, so their identity sequences are left on the default start.
 
 ## Processing Methods
 
@@ -93,7 +95,9 @@ Note that **multiple study-local fields in one study may link to the same global
 
 The guardrail that keeps this coherent is the uniqueness on globally-linked values — `biosample_metadata_one_value_per_global_field` / `prep_sample_metadata_one_value_per_global_field`, `UNIQUE (entity_idx, global_field_idx)` — which forbids a *single* entity from carrying two values for one global field while permitting the disjoint-coverage aliasing above. It is deliberately keyed per entity, **not** per study: a `UNIQUE (study_idx, global_field_idx)` would forbid disjoint aliasing and must not be added. Consistent with this, resolving a column to a global field is keyed on `display_name` by default, or on the global field's `internal_name` when the caller sets `global_internal_names`. A globally-linked write then get-or-creates the study-local row it needs on `(study_idx, display_name)` — a new label mints a new alias, a matching label reuses the existing one — using the global field's own `display_name` when the caller keyed by `internal_name`, since the key it sent is not a label. Neither the import nor the metadata-write path creates a global field or a purely-local one: a key matching no existing field is rejected, and minting a field is the study-local field-create route's job.
 
-A study-local field's global link may be **added** (a local→global upgrade propagates the link onto the field's existing values, gated by the per-entity uniqueness index, and requires `unique_in_study` to be false, since only a purely-local field may carry that policy) but never **rebound** to a different global field, nor **unlinked** while values exist; the propagate trigger rejects both, and the correct move is to create a new study-local field.
+A study-local field's global link may be **added** (a local→global upgrade propagates the link onto the field's existing values, gated by the per-entity uniqueness index, and requires `unique_in_study` to be false, since only a purely-local field may carry that policy) but never **rebound** to a different global field, nor **unlinked** while values exist; the propagate trigger rejects both, and the correct move is to create a new study-local field. Via the wire, only a purely-local **text** field may carry `unique_in_study`, text being the data type whose values straightforwardly keep a single spelling; `UNIQUE_IN_STUDY_DATA_TYPES` in `qiita-common` carries this limit; the eligibility CHECK in the schema is deliberately wider than it, to allow room for growth if needed. A value stored through such a field is changed only by an `UPDATE` of the metadata row's `value_text`, never through the API, which refuses the rewrite so a study's own name for a sample cannot be handed to a different one. That `UPDATE` is still policed by everything governing a normal write -- the field-contract, retired-link, and publication-lock triggers, and the per-study uniqueness index -- so it fails rather than corrupts when the new value is already taken or the sample is published. No `lock_timeout` is involved; that is a requirement of the widen and of the policy propagation, not of a value write.
+
+A purely-local field's `data_type` may be **widened to `text`**, and to nothing else: `qiita.widen_study_field_to_text` redeclares the field and moves every value stored through it into `value_text` in one transaction, so no value is left in a column the declaration no longer names. Narrowing is not expressible, a globally-linked field's type is the registry's rather than the study's, and `terminology` has no text form. Both the widen and a `unique_in_study` tightening lock the metadata table against concurrent writers for the caller's transaction, and refuse to run at all without a bounded `lock_timeout`; relaxing `unique_in_study` takes no lock, though no API path relaxes it -- the policy is declared through the REST interface and never withdrawn through it.
 
 ### Metadata visibility tiers (not yet enforced)
 
@@ -107,6 +111,28 @@ Two mechanisms compose to set the tier a caller must hold — on the study, via 
 When enforcement is built, the effective required tier for a field or value is the most restrictive that applies (field-level tier, further tightened by any matching value-level exception). A caller whose study-access tier is below that threshold must not see the value on any read path, and must be refused when attempting to write it. This applies uniformly to reads and writes and to both globally-linked and study-local metadata.
 
 This is the mechanism that will ultimately decide who can see or change the owner-biosample-id (a study-local field pinned to `member` tier) and any other tier-restricted field or value — replacing today's coarse interim rule, which clamps to admin-tier callers every study-scoped route that reads or writes sample-family metadata, or that mints a study-local field. The idx-listing reads stay at viewer tier: they expose no metadata. Field creation sits under the clamp only for want of the finer gate — when enforcement lands it returns to member tier, since minting a study-local field is work a study member is meant to do.
+
+### What a tier reads of a study's own record
+
+This is the definition, and it supersedes, for the study's own record, the
+comment on `qiita.study` in the applied migration `20260501000006_study.sql`
+(an applied migration cannot be edited in place). It is enforced by
+`auth.guards.study_record_view`, which `GET /api/v1/study/{idx}` and the
+`GET /api/v1/study` listing both decide through.
+
+A caller's tier on a study is their `qiita.study_access` row (`admin` for the
+study's owner, with or without a row), or `public` when they hold none. The
+study's record has two views:
+
+| View | Who | Fields |
+|---|---|---|
+| **full** | wet_lab_admin+ by role; the owner; a caller whose tier is at or above the study's `default_tier` (so anyone, on a `public`-default study) | every column of `StudyResponse`: title, alias, description, abstract, funding, notes, `extra_metadata`, accessions, submission state, owner / PI / creator idxs, tiers, timestamps |
+| **summary** | any other grant: a tier below `default_tier` | `study_idx`, `export_entity_id`, title, alias, `bioproject_accession`, `ena_study_accession`, `default_tier`, `updated_at` |
+
+Anyone else gets nothing (403). The summary is what lets someone a study was
+shared with find it and recognise it, without the fields its tier does not
+reach. Search follows the same line: a summary reader's `q` matches only the
+summary fields, so a match cannot disclose a word in a field they cannot read.
 
 ## Raw Data Fingerprint
 

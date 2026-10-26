@@ -1,17 +1,25 @@
-"""qiita user CLI — shared body/arg helpers and generic read/patch handlers.
-
-Split out of the former single-file ``cli.user`` module; behavior unchanged.
-"""
+"""qiita user CLI — shared body/arg helpers and generic read/patch handlers."""
 
 import argparse
+import math
 import sqlite3
+from collections.abc import Callable, Iterable
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, ValidationError
 from qiita_common.api_paths import PATH_RUN_FOLDER_INSPECT, PATH_RUN_FOLDER_PREFIX
-from qiita_common.models import Platform, RunFolderInspectRequest, RunFolderInspectResponse
+from qiita_common.models import (
+    Platform,
+    RunFolderInspectRequest,
+    RunFolderInspectResponse,
+    WorkTicketFollowOn,
+)
 
 from .. import _common
+
+if TYPE_CHECKING:
+    from run_preflight.db import PlatformSampleInfo
 
 
 def _inspect_run_folder(
@@ -31,7 +39,30 @@ def _inspect_run_folder(
             token,
             f"{PATH_RUN_FOLDER_PREFIX}{PATH_RUN_FOLDER_INSPECT}",
             json=RunFolderInspectRequest(path=str(run_folder), platform=platform).model_dump(
-                mode="json"
+                mode="json", exclude_none=True
+            ),
+        )
+    )
+
+
+def _resolve_run_folder(
+    base_url: str, token: str, run_id: str, platform: Platform
+) -> RunFolderInspectResponse:
+    """Resolve a run folder from its run id on the control plane.
+
+    Like `_inspect_run_folder`, but the submitter names a run id rather than a
+    host path; the CP scans its configured roots for the matching folder and
+    returns the resolved path plus the same instrument facts. The submitter never
+    handles a filesystem path.
+    """
+    return RunFolderInspectResponse.model_validate(
+        _common.call(
+            "POST",
+            base_url,
+            token,
+            f"{PATH_RUN_FOLDER_PREFIX}{PATH_RUN_FOLDER_INSPECT}",
+            json=RunFolderInspectRequest(run_id=run_id, platform=platform).model_dump(
+                mode="json", exclude_none=True
             ),
         )
     )
@@ -59,6 +90,34 @@ def _load_preflight_conn(
     except (sqlite3.DatabaseError, ValueError) as exc:
         parser.error(f"{flag} {preflight_blob}: cannot load preflight SQLite: {exc}")
     return conn
+
+
+def _refuse_malformed_accessions(
+    info: PlatformSampleInfo, parser: argparse.ArgumentParser, preflight_blob: Path, idx_label: str
+) -> None:
+    """Refuse a pre-flight platform-sample row whose accessions are blank or padded.
+
+    The library refuses a NULL accession but not a blank or whitespace-padded one.
+    The accession lookup's request strips each value (`NonBlankText`), so a blank
+    one fails its validation with a traceback, and a padded one comes back keyed
+    on the stripped value and misses. `idx_label` names the sample-idx column in
+    the message.
+    """
+    accessions = {
+        "biosample_accession": [info.biosample_accession],
+        "primary_bioproject_accession": [info.primary_bioproject_accession],
+        "secondary_bioproject_accessions": info.secondary_bioproject_accessions,
+    }
+    bad = [
+        field
+        for field, values in accessions.items()
+        if any(not v.strip() or v != v.strip() for v in values)
+    ]
+    if bad:
+        parser.error(
+            f"--preflight-blob {preflight_blob}: {idx_label} {info.sample_idx} has a"
+            f" blank or padded {', '.join(bad)}; fix the pre-flight before re-submitting"
+        )
 
 
 def _build_body(
@@ -89,8 +148,46 @@ def _build_body(
     try:
         return model_cls(**fields).model_dump(exclude_unset=True, mode="json", by_alias=True)
     except ValidationError as exc:
-        msgs = "; ".join(f"{'.'.join(str(p) for p in e['loc'])}: {e['msg']}" for e in exc.errors())
-        parser.error(f"invalid {model_cls.__name__}: {msgs}")
+        parser.error(f"invalid {model_cls.__name__}: {_common.validation_messages(exc)}")
+
+
+def _follow_on_from_args(
+    args: argparse.Namespace, parser: argparse.ArgumentParser
+) -> WorkTicketFollowOn | None:
+    """The follow-on the `--then-*` flags name, or None when none was given.
+
+    Any `--then-*` flag needs both the action id and version; the context is
+    optional. The server checks the follow-on against its action when the
+    parent ticket is submitted."""
+    action_id, action_version = args.then_action_id, args.then_action_version
+    context = _common.parse_json_arg(args.then_context_json, parser, flag="--then-context-json")
+    if action_id is None and action_version is None and context is None:
+        return None
+    if action_id is None or action_version is None:
+        parser.error("a follow-on needs both --then-action-id and --then-action-version")
+    try:
+        return WorkTicketFollowOn(
+            action_id=action_id, action_version=action_version, action_context=context or {}
+        )
+    except ValidationError as exc:
+        parser.error(f"invalid follow-on: {_common.validation_messages(exc)}")
+
+
+def _fold_flag_values(
+    args: argparse.Namespace,
+    parser: argparse.ArgumentParser,
+    flag_names: Iterable[str],
+    parse_fn: Callable[..., dict | None],
+) -> None:
+    """Re-parse each named repeatable flag on `args`, in place.
+
+    `parse_fn` takes the raw value, the parser, and the originating flag
+    spelling, and errors out (exit 2) rather than returning on bad input.
+    Callers run this before body construction so validation sees a dict.
+    """
+    for name in flag_names:
+        raw = getattr(args, name)
+        setattr(args, name, parse_fn(raw, parser, flag=f"--{name.replace('_', '-')}"))
 
 
 # ---------------------------------------------------------------------------
@@ -133,6 +230,36 @@ def _proportion_arg(raw: str) -> float:
     return value
 
 
+def _positive_seconds_arg(raw: str) -> float:
+    """argparse `type` for a poll interval: finite and > 0, so a zero or
+    negative value can't spin the watch loop in a tight, deadline-blind loop.
+    """
+    try:
+        value = float(raw)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"must be a positive number of seconds, got {raw!r}"
+        ) from None
+    if not math.isfinite(value) or value <= 0:
+        raise argparse.ArgumentTypeError(f"must be a positive number of seconds, got {value}")
+    return value
+
+
+def _non_negative_seconds_arg(raw: str) -> float:
+    """argparse `type` for a timeout: finite and >= 0. Non-finite would let
+    `time.monotonic() >= deadline` never fire and the watch never time out.
+    """
+    try:
+        value = float(raw)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"must be a non-negative number of seconds, got {raw!r}"
+        ) from None
+    if not math.isfinite(value) or value < 0:
+        raise argparse.ArgumentTypeError(f"must be a non-negative number of seconds, got {value}")
+    return value
+
+
 # The default for a flag whose value set already includes None, so "omitted" and
 # "explicitly none" stay distinguishable — the collision `_lane_arg` avoids by being
 # `required`, which an optional threshold cannot be.
@@ -166,21 +293,22 @@ def _handle_read(args: argparse.Namespace, parser: argparse.ArgumentParser) -> i
     return _common.run_http_subcommand(lambda t: _common.call("GET", args.base_url, t, path))
 
 
-def _handle_study_field_create(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
-    """Mint a study-local field definition on one study (POST).
+def _handle_study_scoped_call(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    """Call a study-scoped route that carries a request body.
 
-    The per-command `set_defaults` supplies `study_field_model` (the request
-    model, whose mode coupling is enforced at body construction so an invalid
-    flag combination exits 2 without a request) and `study_field_path` (a
-    subpath template filled from --study-idx).
+    The per-command `set_defaults` supplies the verb, the subpath template
+    filled from --study-idx, the request model the flags map to, and the
+    names of any repeatable KEY=VALUE flags. Both the fold and the body
+    construction precede the token read, so invalid flags exit 2 without a
+    request going out.
     """
-
-    def _run(token: str) -> dict:
-        body = _build_body(args.study_field_model, args, parser)
-        path = args.study_field_path.format(study_idx=args.study_idx)
-        return _common.call("POST", args.base_url, token, path, json=body)
-
-    return _common.run_http_subcommand(_run)
+    _fold_flag_values(args, parser, args.study_call_kv_flags, _common.parse_kv_pairs)
+    body = _build_body(args.study_call_model, args, parser)
+    path = args.study_call_path.format(study_idx=args.study_idx)
+    method = args.study_call_method
+    return _common.run_http_subcommand(
+        lambda t: _common.call(method, args.base_url, t, path, json=body)
+    )
 
 
 def _handle_patch(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
@@ -193,14 +321,7 @@ def _handle_patch(args: argparse.Namespace, parser: argparse.ArgumentParser) -> 
     empty update (no field flags) fails the model's at-least-one-field
     rule and exits 2.
     """
-    for field in args.patch_json_fields:
-        setattr(
-            args,
-            field,
-            _common.parse_json_arg(
-                getattr(args, field), parser, flag=f"--{field.replace('_', '-')}"
-            ),
-        )
+    _fold_flag_values(args, parser, args.patch_json_fields, _common.parse_json_arg)
     body = _build_body(args.patch_model, args, parser)
     idx_arg = args.patch_idx_arg
     path = args.patch_path.format(**{idx_arg: getattr(args, idx_arg)})

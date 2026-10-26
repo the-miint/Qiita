@@ -23,6 +23,7 @@ import os
 import re
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -889,6 +890,33 @@ def test_native_checkout_fails_outside_git_clone(tmp_path: Path) -> None:
 _REDEPLOY = _DEPLOY / "redeploy.sh"
 
 
+def test_verify_dp_pool_row_greps_what_the_data_plane_actually_logs() -> None:
+    """`verify.sh`'s dp-pool row reads the data plane's journal by exact string, and
+    nothing in Rust knows that. A reword on either side would turn the row green (or
+    permanently red) without failing anything, so the three strings are pinned against
+    the source that writes them.
+
+    This pins the strings, not the row's logic — `bash -n` and shellcheck cover the
+    shell, and the behaviour needs a host with systemd."""
+    verify = (_DEPLOY / "verify.sh").read_text()
+    dp_src = _REPO_ROOT / "qiita-data-plane" / "src"
+    for string, writer in (
+        ("qiita-data-plane pool:", "main.rs"),
+        ("discarding a pooled DuckLake connection", "pool.rs"),
+        ("fallback default", "resources.rs"),
+    ):
+        assert string in verify, f"verify.sh no longer greps for {string!r}"
+        assert string in (dp_src / writer).read_text(), (
+            f"the data plane's {writer} no longer writes {string!r}, so verify.sh's "
+            "dp-pool row can never match it again"
+        )
+
+    # One hatch per row, documented in the header like its siblings.
+    assert verify.count("SKIP_DP_POOL") == 3, (
+        "the dp-pool hatch is missing from the row, its skip message, or the header"
+    )
+
+
 def _fake_deploy_dir(tmp_path: Path, *, script: str, common_suffix: str = "") -> Path:
     """A `deploy/`-shaped dir: a script beside a copy of the real `_common.sh`.
     The copy is what `QIITA_COMMON_SH` resolves to, so a test can edit or delete
@@ -1612,6 +1640,29 @@ def test_split_conn_password_declines_when_it_cannot_key_a_pgpass_entry(connstr:
     assert sanitized == connstr, "connstr must be left intact for the caller to use as-is"
 
 
+def _required_duckdb_cli_version() -> str:
+    """The CLI version the lake scripts require, as they read it: by sourcing _common.sh."""
+    version = subprocess.run(
+        ["bash", "-c", f'source "{_COMMON}"; printf %s "$QIITA_DUCKDB_VERSION"'],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    assert version, "deploy/_common.sh no longer sets QIITA_DUCKDB_VERSION"
+    return version
+
+
+def _write_duckdb_stub(path: Path, body: str = "exit 0\n") -> Path:
+    """A `duckdb` stand-in that reports the required version to `--version` (the
+    resolver checks it) and otherwise runs `body`."""
+    version = _required_duckdb_cli_version()
+    path.write_text(
+        f'#!/bin/sh\nif [ "$1" = --version ]; then echo "v{version} (stub) 0"; exit 0; fi\n' + body
+    )
+    path.chmod(0o755)
+    return path
+
+
 def test_lake_shell_refuses_to_open_without_the_staged_miint_extension(tmp_path: Path) -> None:
     """miint is a core dependency, so the shell must fail LOUD rather than open a
     session whose bioinformatics functions differ from production's. Everything
@@ -1631,7 +1682,7 @@ def test_lake_shell_refuses_to_open_without_the_staged_miint_extension(tmp_path:
         "DP_ENV": str(dp_env),
         "CP_ENV": str(cp_env),
         "CO_ENV": str(tmp_path / "absent.env"),
-        "QIITA_DUCKDB_BIN": "/bin/true",
+        "QIITA_DUCKDB_BIN": str(_write_duckdb_stub(tmp_path / "duckdb-stub")),
     }
     env.pop("MIINT_EXTENSION_DIRECTORY", None)
 
@@ -1715,10 +1766,10 @@ def test_lake_gc_rejects_unknown_argument() -> None:
 
 
 def _lake_gc_env(tmp_path, *, writable: bool = True) -> dict:
-    """A data-plane env plus a lake dir, with duckdb stubbed by `true` so the
-    script's own logic runs without a catalog. `true` prints nothing, which is the
-    same shape as a maintenance call that reclaims nothing. Resolved via PATH —
-    it is /usr/bin/true on macOS and /bin/true on most Linux."""
+    """A data-plane env plus a lake dir, with duckdb stubbed so the script's own
+    logic runs without a catalog. The stub reports the required version, saves the
+    SQL it is handed, and prints nothing — the same shape as a maintenance call that
+    reclaims nothing."""
     persistent = tmp_path / "persistent"
     (persistent / "ducklake").mkdir(parents=True)
     if not writable:
@@ -1732,17 +1783,40 @@ def _lake_gc_env(tmp_path, *, writable: bool = True) -> dict:
     # discard it, leaving the thing these tests are about — dry_run, the
     # transaction split — unasserted: a hardcoded `dry_run := false` would pass.
     captured = tmp_path / "captured.sql"
-    stub = tmp_path / "duckdb-stub"
-    stub.write_text(
-        "#!/bin/sh\n"
+    stub = _write_duckdb_stub(
+        tmp_path / "duckdb-stub",
         "while [ $# -gt 0 ]; do\n"
         f'  if [ "$1" = -f ]; then cat "$2" >> "{captured}"; fi\n'
         "  shift\n"
         "done\n"
-        "exit 0\n"
+        "exit 0\n",
     )
-    stub.chmod(0o755)
     return {**os.environ, "DP_ENV": str(dp_env), "QIITA_DUCKDB_BIN": str(stub)}
+
+
+@pytest.mark.parametrize("script", _LAKE_SCRIPTS, ids=lambda p: p.name)
+@pytest.mark.parametrize(
+    ("stub", "shown"),
+    [
+        ("echo 'v1.0.0 (stub) 0'", "printed 'v1.0.0 (stub) 0'"),
+        (":", "printed 'nothing'"),
+        ("echo 'cannot execute binary file' >&2; exit 126", "printed 'cannot execute binary file'"),
+    ],
+    ids=["other-version", "silent", "unrunnable"],
+)
+def test_lake_script_refuses_a_duckdb_cli_of_another_version(
+    tmp_path: Path, script: Path, stub: str, shown: str
+) -> None:
+    """The CLI must be the DuckDB the data plane links (deploy/_common.sh says why). A
+    binary that cannot say which version it is gets no benefit of the doubt, and the
+    refusal shows what it did print — stderr included, so an unrunnable one says why."""
+    env = _lake_gc_env(tmp_path)
+    Path(env["QIITA_DUCKDB_BIN"]).write_text(f"#!/bin/sh\n{stub}\n")
+    result = subprocess.run(["bash", str(script)], capture_output=True, text=True, env=env)
+    assert result.returncode != 0, f"a mismatched CLI was accepted:\n{result.stdout}"
+    assert shown in result.stderr, result.stderr
+    assert f"v{_required_duckdb_cli_version()}" in result.stderr, result.stderr
+    assert not (tmp_path / "captured.sql").exists(), "SQL ran on the wrong CLI"
 
 
 def test_lake_gc_defaults_to_report_only(tmp_path) -> None:
@@ -1903,3 +1977,147 @@ def test_workflow_script_is_valid_bash(path: Path) -> None:
     until a ticket is already running inside it."""
     result = subprocess.run(["bash", "-n", str(path)], capture_output=True, text=True)
     assert result.returncode == 0, f"bash -n failed for {path}:\n{result.stderr}"
+
+
+# --- wait_for_data_plane_idle ----------------------------------------------------
+
+
+def _run_idle_wait(
+    tmp_path: Path, counts: list[int | str], *, wait_s: str = "60", env_file=True, pid: int = 4242
+):
+    """Run `wait_for_data_plane_idle` with `systemctl` and `psql` stubbed: systemctl
+    names `pid` as the unit's main process, and psql answers the in-flight
+    catalog-session count from `counts`, one per call, then the last one again, and
+    fails on a `"fail"` entry.
+    Returns the completed process and the argv of every psql call."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "systemctl").write_text(f"#!/bin/sh\necho {pid}\n")
+    queue = tmp_path / "counts"
+    queue.write_text("".join(f"{n}\n" for n in counts))
+    calls = tmp_path / "psql-calls"
+    (bin_dir / "psql").write_text(
+        "#!/bin/sh\n"
+        'argv=$(printf %s "$*" | tr "\\n" " ")\n'
+        f'printf "%s|PGPASSFILE=%s\\n" "$argv" "$PGPASSFILE" >> "{calls}"\n'
+        f'n=$(head -n1 "{queue}")\n'
+        f'[ "$(wc -l < "{queue}")" -gt 1 ] && sed -i.bak 1d "{queue}"\n'
+        '[ "$n" = fail ] && exit 2\n'
+        'echo "$n"\n'
+    )
+    for stub in ("systemctl", "psql"):
+        (bin_dir / stub).chmod(0o755)
+    env_path = tmp_path / "data-plane.env"
+    if env_file:
+        env_path.write_text(
+            "DUCKLAKE_CATALOG_CONNSTR='dbname=lake host=db user=lake_rw password=s3cr3t'\n"
+        )
+    proc = subprocess.run(
+        [
+            "bash",
+            "-c",
+            f'set -euo pipefail; source "{_COMMON}"; '
+            f'wait_for_data_plane_idle qiita-data-plane@50051 "{env_path}"',
+        ],
+        env={
+            **os.environ,
+            "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            "QIITA_DP_IDLE_POLL_S": "0",
+            "QIITA_DP_IDLE_WAIT_S": wait_s,
+        },
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    lines = calls.read_text().splitlines() if calls.exists() else []
+    return proc, lines
+
+
+def test_idle_wait_returns_once_no_catalog_session_is_in_flight(tmp_path: Path) -> None:
+    proc, calls = _run_idle_wait(tmp_path, [2, 1, 0])
+    assert proc.returncode == 0, proc.stderr
+    assert len(calls) == 3
+    assert "waiting for qiita-data-plane@50051 to go idle (catalog sessions: 2" in proc.stderr
+
+
+def test_idle_wait_goes_ahead_when_the_wait_runs_out(tmp_path: Path) -> None:
+    proc, calls = _run_idle_wait(tmp_path, [1], wait_s="1")
+    assert proc.returncode == 0, proc.stderr
+    assert "still busy after 1s" in proc.stderr
+    assert calls
+
+
+def test_idle_wait_keeps_the_catalog_password_off_psql_argv(tmp_path: Path) -> None:
+    """The password reaches libpq through a PGPASSFILE (argv is readable by every user
+    on the host through /proc)."""
+    _proc, calls = _run_idle_wait(tmp_path, [0])
+    argv, pgpassfile = calls[0].split("|PGPASSFILE=")
+    assert "s3cr3t" not in argv
+    assert "user=lake_rw" in argv
+    assert pgpassfile, "psql ran without a PGPASSFILE"
+
+
+@pytest.mark.parametrize(("wait_s", "env_file"), [("0", True), ("60", False)])
+def test_idle_wait_skips_when_disabled_or_on_a_first_deploy(
+    tmp_path: Path, wait_s: str, env_file: bool
+) -> None:
+    proc, calls = _run_idle_wait(tmp_path, [1], wait_s=wait_s, env_file=env_file)
+    assert proc.returncode == 0, proc.stderr
+    assert calls == []
+
+
+def test_idle_wait_refuses_a_wait_that_is_not_whole_seconds(tmp_path: Path) -> None:
+    proc, calls = _run_idle_wait(tmp_path, [1], wait_s="1h")
+    assert proc.returncode != 0
+    assert "QIITA_DP_IDLE_WAIT_S must be a whole number of seconds, got '1h'" in proc.stderr
+    assert calls == []
+
+
+def test_idle_wait_reads_a_leading_zero_as_decimal(tmp_path: Path) -> None:
+    """Read as octal, `09` is an arithmetic error that ends the wait non-zero."""
+    proc, _calls = _run_idle_wait(tmp_path, [1, 0], wait_s="09")
+    assert proc.returncode == 0, proc.stderr
+
+
+def test_idle_wait_stops_the_deploy_when_the_catalog_query_fails(tmp_path: Path) -> None:
+    """A wait that cannot tell whether the data plane is idle stops the deploy before
+    any restart, and names the override."""
+    proc, _calls = _run_idle_wait(tmp_path, ["fail"])
+    assert proc.returncode != 0
+    assert "set QIITA_DP_IDLE_WAIT_S=0 to restart without waiting" in proc.stderr
+
+
+@pytest.mark.skipif(not Path("/proc/self/fd").is_dir(), reason="needs /proc (Linux)")
+@pytest.mark.parametrize(
+    ("name", "busy"), [("upload.parquet.partial", True), ("upload.parquet", False)]
+)
+def test_idle_wait_counts_an_open_partial_upload(tmp_path: Path, name: str, busy: bool) -> None:
+    """A DoPut holds its `upload.parquet.partial` open, and the wait finds it through
+    /proc/<pid>/fd; a published `upload.parquet` held open is not an upload in flight."""
+    held = tmp_path / name
+    held.touch()
+    holder = subprocess.Popen(
+        ["python3", "-c", "import sys; f = open(sys.argv[1]); sys.stdin.read()", str(held)],
+        stdin=subprocess.PIPE,
+    )
+    try:
+        fd_dir = Path(f"/proc/{holder.pid}/fd")
+        for _ in range(100):
+            if any(os.readlink(fd) == str(held) for fd in fd_dir.iterdir()):
+                break
+            time.sleep(0.05)
+        proc, _calls = _run_idle_wait(tmp_path, [0], wait_s="1", pid=holder.pid)
+    finally:
+        holder.communicate(b"")
+    assert proc.returncode == 0, proc.stderr
+    assert (
+        "still busy after 1s (catalog sessions: 0, open partial files: 1)" in proc.stderr
+    ) is busy
+
+
+def test_data_plane_unit_stop_timeout_covers_the_idle_wait() -> None:
+    """The data plane drains on SIGTERM for up to the unit's TimeoutStopSec, and the
+    deploy's idle wait defaults to the same bound."""
+    unit = (_DEPLOY / "systemd" / "qiita-data-plane@.service").read_text()
+    assert re.search(r"(?m)^TimeoutStopSec=3900$", unit)
+    assert "QIITA_DP_IDLE_WAIT_S:-3900}" in _COMMON.read_text()

@@ -6,7 +6,7 @@ from __future__ import annotations
 import pytest
 
 from qiita_common import analytic as ft
-from qiita_common.parquet import PARQUET_OPTS
+from qiita_common.parquet import PARQUET_OPTS_TRANSFER
 
 
 def test_the_public_schema_is_exactly_the_biom_writers_required_set():
@@ -33,10 +33,10 @@ def test_both_writers_copy_the_RELABELLED_relation(build, tmp_path):
     assert ft.OGU_OUTPUT_TABLE not in sql
 
 
-def test_the_parquet_writer_uses_the_canonical_options(tmp_path):
-    """One definition of the Parquet shape for every artifact qiita writes, so a
+def test_the_parquet_writer_uses_the_transfer_options(tmp_path):
+    """The analytic's files are transfer files, so they take the one transfer set, and a
     version or compression bump moves in one place."""
-    assert PARQUET_OPTS in ft.parquet_copy_sql(tmp_path / "t.parquet")
+    assert PARQUET_OPTS_TRANSFER in ft.parquet_copy_sql(tmp_path / "t.parquet")
 
 
 def test_the_biom_writer_names_qiita_as_the_generator(tmp_path):
@@ -70,5 +70,5 @@ def test_a_copy_target_that_cannot_be_interpolated_safely_is_refused(build, tmp_
 
 def test_the_tree_copy_takes_a_clearance_and_the_shared_parquet_options(tmp_path):
     sql = ft.tree_copy_sql(tmp_path / "t.tree.parquet", clearance=ft.TreeClearance(tips=4))
-    assert PARQUET_OPTS in sql
+    assert PARQUET_OPTS_TRANSFER in sql
     assert ft.TREE_TABLE in sql

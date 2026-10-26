@@ -9,10 +9,9 @@ Lives in the control plane: direct DB access for work_ticket / action /
 reference rows is legitimate here. The orchestrator is reduced to its
 SLURM-driver role behind `POST /step/*`.
 
-Workspace contract: each entry runs against a per-attempt subdir
-`<work_ticket_workspace_root>/<work_ticket_idx>/<entry-name>/attempt-<N>/`
-minted by `_run_entry_with_retry`. The nesting gives two properties at
-once — retries (and re-runs) land in fresh dirs (the verifier's "every file
+Workspace contract: each entry runs against a per-attempt subdir (layout:
+`qiita_control_plane.workspace`) minted by `_run_entry_with_retry`. The nesting
+gives two properties at once — retries (and re-runs) land in fresh dirs (the verifier's "every file
 in $output_path must be in manifest" gate stays clean), and prior attempts
 persist on disk for postmortem. An entry RE-RUN whose progress row was
 deliberately dropped (a `/run` redrive, or `update-lane` invalidating a
@@ -179,6 +178,7 @@ from ._processing import (
 )
 from ._read_ingest import (
     _REFERENCE_SEQUENCES_TABLE,
+    BARCODE_MAP_BINDING,
     ENA_RUN_MAP_BINDING,
     READS_STAGING_ROOT_BINDING,
     ROUTER_PENDING_BINDING,
@@ -191,10 +191,12 @@ from ._read_ingest import (
     _do_action_export,
     _do_action_export_read,
     _do_get_reference_sequences_roster,
+    _resolve_barcode_map,
     _resolve_sample_map,
     _resolve_staged_masked_reads,
     _resolve_staged_reads,
     _stage_ena_run_roster,
+    _stage_ena_run_roster_binding,
     _stage_shard_mapping,
     _stage_shard_roster,
     _stream_masked_reads_to_fastq,
@@ -221,6 +223,7 @@ from ._reference import (
     QC_ADAPTER_BINDING,
     ROUTER_INDEX_PATH_BINDING,
     SHARD_DIRECTORY_BINDING,
+    SORTMERNA_REF_BINDING,
     ReferenceIndexNotBuilt,
     _coerce_reference_idx,
     _do_get_reference_sequence_chunks,
@@ -232,9 +235,11 @@ from ._reference import (
     _resolve_required_host_index,
     _resolve_sharded_align_index_bindings,
     _resolve_sharded_align_indexes,
+    _resolve_sortmerna_ref,
     _workflow_needs_adapters,
     _workflow_needs_sharded_align_indexes,
     _write_adapter_parquet,
+    _write_reference_fasta,
 )
 from ._upload import (
     _consume_upload_handles,
@@ -260,6 +265,7 @@ __all__: list[str] = [
     "HOST_FILTER_INDEX_TYPE_MINIMAP2",
     "HOST_FILTER_INDEX_TYPE_RYPE",
     "IllegalStatusTransition",
+    "BARCODE_MAP_BINDING",
     "GENOME_MAP_PATH_BINDING",
     "LIBRARY",
     "LibraryPrimitive",
@@ -267,6 +273,7 @@ __all__: list[str] = [
     "MINT_FEATURES_OUTPUT_BASENAME",
     "Path",
     "QC_ADAPTER_BINDING",
+    "SORTMERNA_REF_BINDING",
     "READS_STAGING_ROOT_BINDING",
     "ReferenceIndexNotBuilt",
     "ReferenceNotFound",
@@ -365,7 +372,9 @@ __all__: list[str] = [
     "_resolve_reference_index_path",
     "_resolve_required_host_index",
     "_resolve_feature_table_bindings",
+    "_resolve_barcode_map",
     "_resolve_sample_map",
+    "_resolve_sortmerna_ref",
     "_resolve_staged_masked_reads",
     "_resolve_staged_reads",
     "_resolve_upload_handles",
@@ -386,6 +395,7 @@ __all__: list[str] = [
     "_workflow_needs_staged_masked_reads",
     "_workflow_needs_staged_reads",
     "_write_adapter_parquet",
+    "_write_reference_fasta",
     "_write_sample_map_parquet",
     "ALIGNMENT_IDX_BINDING",
     "ALIGN_MASK_IDX_BINDING",
@@ -417,6 +427,7 @@ __all__: list[str] = [
     "_workflow_needs_sharded_align_indexes",
     "ENA_RUN_MAP_BINDING",
     "_stage_ena_run_roster",
+    "_stage_ena_run_roster_binding",
     "_write_ena_run_map_parquet",
     "_write_shard_mapping_parquet",
     "asyncio",

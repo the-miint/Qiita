@@ -105,6 +105,110 @@ class InstrumentRunInfo(NamedTuple):
     instrument_model: str
 
 
+class IlluminaRead(NamedTuple):
+    """One ``<Read>`` from RunInfo.xml: its cycle count and whether it is an index."""
+
+    num_cycles: int
+    is_indexed: bool
+
+
+def read_run_reads(bcl_input_dir: Path) -> tuple[IlluminaRead, ...]:
+    """Return the ordered ``<Reads>`` structure from a run folder's RunInfo.xml.
+
+    Raises ``ValueError`` when RunInfo.xml is absent/malformed or carries no
+    reads. Used to build the amplicon dummy sample sheet (`build_amplicon_dummy_
+    sample_sheet`), whose Reads/OverrideCycles are a function of this geometry.
+    """
+    runinfo_path = bcl_input_dir / RUNINFO_FILENAME
+    if not runinfo_path.is_file():
+        raise ValueError(f"RunInfo.xml not found at top level of {bcl_input_dir}")
+    try:
+        root = ET.parse(runinfo_path).getroot()
+    except ET.ParseError as exc:
+        raise ValueError(f"{runinfo_path} is not well-formed XML: {exc}") from exc
+    reads = [
+        IlluminaRead(int(r.get("NumCycles", "0")), r.get("IsIndexedRead") == "Y")
+        for r in root.findall("./Run/Reads/Read")
+    ]
+    if not reads or any(r.num_cycles <= 0 for r in reads):
+        raise ValueError(f"{runinfo_path} has no usable <Reads> structure")
+    return tuple(reads)
+
+
+# The Golay barcode is a 12-nt index read.
+GOLAY_BARCODE_LENGTH = 12
+
+# The one index the amplicon dummy sheet names. bcl-convert (4.5.4) refuses
+# CreateFastqForIndexReads unless the sheet has an index (and an index of only
+# A/C/G/T), so the sheet names one placeholder sample with exactly this index and
+# no mismatches: a read lands there only when its index read IS this sequence,
+# and every other read goes to Undetermined with its I1. Its reverse complement
+# (the form golay_demux decodes) is 4 bits from the nearest Golay codeword,
+# beyond the correctable 3, so a read it captures is one the demux would have
+# dropped anyway.
+AMPLICON_PLACEHOLDER_INDEX = "A" * GOLAY_BARCODE_LENGTH
+
+
+def build_amplicon_dummy_sample_sheet(reads: tuple[IlluminaRead, ...], sample_id: str) -> str:
+    """Return the bcl-convert dummy sample sheet for an amplicon run.
+
+    Sends every decodable read to Undetermined and writes its index read as I1,
+    which is what carries the in-index Golay barcode out to golay_demux. OverrideCycles
+    follows RunInfo.xml's read order: template reads as reads, the first index
+    read as the 12-cycle Golay index (any tail masked), any other index read
+    masked. See AMPLICON_PLACEHOLDER_INDEX for why the sheet names an index.
+
+    Uses no preflight content: the sheet encodes only the decision to defer the demux to
+    golay_demux, not any run description.
+    """
+    template = [r for r in reads if not r.is_indexed]
+    index = [r for r in reads if r.is_indexed]
+    if len(template) != 2 or len(index) not in (1, 2):
+        raise ValueError(
+            f"expected 2 template reads and 1-2 index reads, got {len(template)} and {len(index)}"
+        )
+    golay_read = index[0]
+    if golay_read.num_cycles < GOLAY_BARCODE_LENGTH:
+        raise ValueError(
+            f"the first index read has {golay_read.num_cycles} cycles; the Golay barcode"
+            f" needs {GOLAY_BARCODE_LENGTH}"
+        )
+
+    def segment(read: IlluminaRead) -> str:
+        if not read.is_indexed:
+            return f"Y{read.num_cycles}"
+        if read is not golay_read:
+            return f"N{read.num_cycles}"
+        tail = read.num_cycles - GOLAY_BARCODE_LENGTH
+        return f"I{GOLAY_BARCODE_LENGTH}" + (f"N{tail}" if tail else "")
+
+    # bcl-convert reads OverrideCycles segments in RunInfo.xml read order, which
+    # need not be R1/I1/I2/R2.
+    override_cycles = ";".join(segment(r) for r in reads)
+    lines = [
+        "[Header]",
+        "IEMFileVersion,4",
+        "Workflow,GenerateFASTQ",
+        "Application,FASTQ Only",
+        "",
+        "[Reads]",
+        str(template[0].num_cycles),
+        str(template[1].num_cycles),
+        "",
+        "[Settings]",
+        f"OverrideCycles,{override_cycles}",
+        "MaskShortReads,1",
+        "CreateFastqForIndexReads,1",
+        "BarcodeMismatchesIndex1,0",
+        "",
+        "[Data]",
+        "Sample_ID,Sample_Plate,Sample_Well,I7_Index_ID,index,I5_Index_ID,index2",
+        f"{sample_id},,,,{AMPLICON_PLACEHOLDER_INDEX},,",
+        "",
+    ]
+    return "\n".join(lines)
+
+
 def read_instrument_run_info(bcl_input_dir: Path) -> InstrumentRunInfo:
     """Read ``RunInfo.xml`` at the top of a BCL run folder and return the
     instrument run ID and resolved model name.

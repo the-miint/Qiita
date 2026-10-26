@@ -20,12 +20,12 @@ from pathlib import Path
 import asyncpg
 import pytest
 from qiita_common.models import FieldDataType, MissingReasonRef
-from qiita_common.models.biosample import FieldWriteOutcome
 
 from qiita_control_plane.repositories._sample_helpers import (
     MissingValueOnUniqueFieldError,
     StudyUniqueValueConflictError,
     UniqueInStudyViolation,
+    ValueRewriteOnUniqueFieldError,
     _get_or_create_globally_linked_study_field,
     _get_or_create_local_study_field,
     _insert_metadata,
@@ -42,32 +42,23 @@ from qiita_control_plane.testing.db_seeds import seed_sequenced_prep_sample
 from qiita_control_plane.testing.unique_names import unique_field_name
 
 from .conftest import (
+    METADATA_WRITE_LOCK_TIMEOUT,
+    SPECS,
     _create_linked_entity_for_spec,
+    _create_plain_field,
     _seed_global_field_for_spec,
     _seed_secondary_studies_for_entity,
-    _track_to_study_link,
+    _set_unique_in_study,
+    _spec_id,
+    _write_value,
 )
 
 pytestmark = pytest.mark.db
 
-
-# Both stacks run every test; pytest reports ids as [biosample] / [prep_sample].
-SPECS = [BIOSAMPLE_METADATA_SPEC, PREP_SAMPLE_METADATA_SPEC]
-
-
-def _spec_id(spec):
-    """Pytest id for the parametrize decorator: spec.entity_kind value."""
-    return spec.entity_kind.value
-
-
-def _study_field_tracking_key(spec):
-    """Cleanup-dict key for the *_study_field rows seeded by a test."""
-    return spec.study_field_table.split(".")[-1]
-
-
-def _metadata_tracking_key(spec):
-    """Cleanup-dict key for the *_metadata rows seeded by a test."""
-    return spec.metadata_table.split(".")[-1]
+# The bound the contended-flip test expects to exhaust, sized to keep the suite
+# quick rather than to outlast anything; every other flip here uses the
+# conftest bound, which is meant to be reached only if something is wrong.
+CONTENDED_FLIP_LOCK_TIMEOUT = "250ms"
 
 
 @pytest.mark.parametrize("spec", SPECS, ids=_spec_id)
@@ -100,8 +91,6 @@ async def test_propagate_link_upgrade_null_to_non_null_propagates_to_metadata(ct
             value="kept",
             created_by_idx=ctx["principal_idx"],
         )
-    ctx["created"][_study_field_tracking_key(spec)].append(field_idx)
-    ctx["created"][_metadata_tracking_key(spec)].append(meta_idx)
 
     # Upgrade the field to global: clear the inherited columns too so the
     # *_study_field_inheritance_consistent CHECK passes after the UPDATE
@@ -143,7 +132,6 @@ async def test_propagate_link_unlink_with_no_metadata_succeeds(ctx, spec):
             display_name=unique_field_name("unlink_empty"),
             created_by_idx=ctx["principal_idx"],
         )
-    ctx["created"][_study_field_tracking_key(spec)].append(field_idx)
 
     # Unlink the field. The propagate trigger has nothing to update; the
     # CHECK requires data_type / required non-NULL once unlinked, so the
@@ -195,8 +183,6 @@ async def test_propagate_link_unlink_with_metadata_raises(ctx, spec):
             value="published",
             created_by_idx=ctx["principal_idx"],
         )
-    ctx["created"][_study_field_tracking_key(spec)].append(field_idx)
-    ctx["created"][_metadata_tracking_key(spec)].append(meta_idx)
 
     # Attempt to unlink — trigger refuses, the UPDATE rolls back.
     with pytest.raises(asyncpg.RaiseError, match="cannot unlink"):
@@ -245,7 +231,6 @@ async def test_propagate_link_rebind_raises_unconditionally(ctx, spec):
             display_name=unique_field_name("rebind"),
             created_by_idx=ctx["principal_idx"],
         )
-    ctx["created"][_study_field_tracking_key(spec)].append(field_idx)
 
     # Attempt to rebind from gf_a to gf_b. Trigger raises even though no
     # metadata exists through this field.
@@ -284,7 +269,8 @@ async def _retire_link(ctx, spec, entity_idx):
 async def _seed_global_value(ctx, spec, entity_idx, value):
     """Write one globally-linked TEXT metadata value while the link is active.
 
-    Returns (metadata_idx, global_field_idx), both tracked for cleanup.
+    Returns (metadata_idx, global_field_idx). The global field is tracked for
+    cleanup.
     """
     gf = await _seed_global_field_for_spec(ctx, spec, data_type=FieldDataType.TEXT)
     async with ctx["pool"].acquire() as conn, conn.transaction():
@@ -305,8 +291,6 @@ async def _seed_global_value(ctx, spec, entity_idx, value):
             value=value,
             created_by_idx=ctx["principal_idx"],
         )
-    ctx["created"][_study_field_tracking_key(spec)].append(field_idx)
-    ctx["created"][_metadata_tracking_key(spec)].append(metadata_idx)
     return metadata_idx, gf.idx
 
 
@@ -404,6 +388,41 @@ async def test_reject_if_link_retired_detail_identifies_the_trigger_on_insert(ct
 
 
 @pytest.mark.parametrize("spec", SPECS, ids=_spec_id)
+async def test_apply_field_contract_detail_identifies_the_trigger(ctx, spec):
+    """Tests the case where a value is written into a column its field's
+    declared type does not name: the rejection carries the raising function,
+    the field, and the type that was expected, so a route tells it from the
+    other guards sharing its SQLSTATE rather than reading it as one of them.
+
+    One statement kind is enough: both the INSERT and the UPDATE triggers run
+    the same function, so the DETAIL they carry is the same.
+    """
+    entity_idx = await _create_linked_entity_for_spec(ctx, spec)
+    field_idx = await _create_plain_field(
+        ctx, spec, suffix="contract", data_type=FieldDataType.NUMERIC
+    )
+
+    # value_text through a numeric field: the one shape the contract rejects.
+    with pytest.raises(asyncpg.RaiseError) as excinfo:
+        await ctx["pool"].execute(
+            f"INSERT INTO {spec.metadata_table} ({spec.entity_key_column},"
+            f" {spec.study_field_idx_column}, value_text, created_by_idx)"
+            " VALUES ($1, $2, $3, $4)",
+            entity_idx,
+            field_idx,
+            "not a number",
+            ctx["principal_idx"],
+        )
+
+    expected_detail = {
+        "trigger": spec.metadata_field_contract_trigger,
+        spec.study_field_idx_column: str(field_idx),
+        "data_type": FieldDataType.NUMERIC.value,
+    }
+    assert parse_kv_detail(excinfo.value.detail) == expected_detail
+
+
+@pytest.mark.parametrize("spec", SPECS, ids=_spec_id)
 async def test_reject_if_link_retired_allows_value_update_on_active_link(ctx, spec):
     """Tests the case where a metadata value is overwritten while the link is
     still active: the guard does not over-reject the ordinary upsert.
@@ -454,8 +473,6 @@ async def test_reject_if_link_retired_allows_global_link_propagation(ctx, spec):
             value="kept",
             created_by_idx=ctx["principal_idx"],
         )
-    ctx["created"][_study_field_tracking_key(spec)].append(field_idx)
-    ctx["created"][_metadata_tracking_key(spec)].append(metadata_idx)
 
     await _retire_link(ctx, spec, entity_idx)
 
@@ -556,8 +573,6 @@ async def test_set_updated_at_bumps_on_global_link_propagation(ctx, spec):
             value="kept",
             created_by_idx=ctx["principal_idx"],
         )
-    ctx["created"][_study_field_tracking_key(spec)].append(field_idx)
-    ctx["created"][_metadata_tracking_key(spec)].append(metadata_idx)
     _, seeded_updated_at = await _fetch_timestamps(ctx, spec, metadata_idx)
 
     # The inherited columns are cleared alongside the link so the
@@ -600,29 +615,9 @@ async def _create_flagged_field(ctx, spec, *, study_idx, data_type, suffix):
             data_type=data_type,
             required=False,
         )
-    ctx["created"][_study_field_tracking_key(spec)].append(field_idx)
 
-    await ctx["pool"].execute(
-        f"UPDATE {spec.study_field_table} SET unique_in_study = true WHERE idx = $1",
-        field_idx,
-    )
+    await _set_unique_in_study(ctx, spec, field_idx, True)
     return field_idx
-
-
-async def _write_value(ctx, spec, *, entity_idx, field_idx, data_type, value):
-    """Write one metadata row and track it for cleanup. Returns the row idx."""
-    async with ctx["pool"].acquire() as conn, conn.transaction():
-        meta_idx = await _insert_metadata(
-            conn,
-            spec=spec,
-            entity_idx=entity_idx,
-            study_field_idx=field_idx,
-            data_type=data_type,
-            value=value,
-            created_by_idx=ctx["principal_idx"],
-        )
-    ctx["created"][_metadata_tracking_key(spec)].append(meta_idx)
-    return meta_idx
 
 
 # The three eligible data_types and a colliding value for each, so the
@@ -682,7 +677,6 @@ async def test_unique_in_study_allows_duplicate_when_flag_false(ctx, spec):
             data_type=FieldDataType.TEXT,
             required=False,
         )
-    ctx["created"][_study_field_tracking_key(spec)].append(field_idx)
 
     for entity_idx in (first_entity_idx, second_entity_idx):
         await _write_value(
@@ -718,7 +712,6 @@ async def test_unique_in_study_allows_same_value_in_another_study(ctx, spec):
             study_idx=second_study_idx,
             created_by_idx=ctx["principal_idx"],
         )
-    _track_to_study_link(ctx, spec, entity_idx, second_study_idx)
 
     for study_idx, suffix in ((ctx["study_idx"], "own"), (second_study_idx, "other")):
         field_idx = await _create_flagged_field(
@@ -824,7 +817,6 @@ async def test_unique_in_study_rejected_on_globally_linked_field(ctx, spec):
             display_name=unique_field_name("linked"),
             created_by_idx=ctx["principal_idx"],
         )
-    ctx["created"][_study_field_tracking_key(spec)].append(field_idx)
 
     with pytest.raises(asyncpg.CheckViolationError):
         await ctx["pool"].execute(
@@ -863,7 +855,6 @@ async def test_unique_in_study_rejected_on_ineligible_data_type(ctx, spec, data_
             required=False,
             terminology_idx=terminology_idx,
         )
-    ctx["created"][_study_field_tracking_key(spec)].append(field_idx)
 
     with pytest.raises(asyncpg.CheckViolationError):
         await ctx["pool"].execute(
@@ -892,7 +883,6 @@ async def test_unique_in_study_duplicate_raises_typed_error(ctx, spec):
             required=False,
             unique_in_study=True,
         )
-    ctx["created"][_study_field_tracking_key(spec)].append(field_idx)
 
     await _write_value(
         ctx,
@@ -939,7 +929,6 @@ async def test_unique_in_study_missing_marker_raises_typed_error(ctx, spec):
             required=False,
             unique_in_study=True,
         )
-    ctx["created"][_study_field_tracking_key(spec)].append(field_idx)
 
     reason_name = f"reason_{secrets.token_hex(4)}"
     reason_idx = await ctx["pool"].fetchval(
@@ -968,33 +957,6 @@ async def test_unique_in_study_missing_marker_raises_typed_error(ctx, spec):
 # =============================================================================
 # study-field updated_at and unique_in_study propagation
 # =============================================================================
-
-
-async def _create_plain_field(ctx, spec, *, suffix, data_type=FieldDataType.TEXT):
-    """Create a purely-local study field with no uniqueness policy. Returns
-    the field idx.
-    """
-    async with ctx["pool"].acquire() as conn, conn.transaction():
-        field_idx, _, _ = await _get_or_create_local_study_field(
-            conn,
-            spec=spec,
-            study_idx=ctx["study_idx"],
-            display_name=unique_field_name(suffix),
-            created_by_idx=ctx["principal_idx"],
-            data_type=data_type,
-            required=False,
-        )
-    ctx["created"][_study_field_tracking_key(spec)].append(field_idx)
-    return field_idx
-
-
-async def _set_unique_in_study(ctx, spec, field_idx, value):
-    """Flip a study field's unique_in_study, driving the propagation trigger."""
-    await ctx["pool"].execute(
-        f"UPDATE {spec.study_field_table} SET unique_in_study = $1 WHERE idx = $2",
-        value,
-        field_idx,
-    )
 
 
 async def _read_flags(ctx, spec, field_idx):
@@ -1150,6 +1112,89 @@ async def test_unique_in_study_flip_on_rejected_when_missing_marker_exists(ctx, 
     assert await _read_flags(ctx, spec, field_idx) == (False, [False])
 
 
+@pytest.mark.parametrize("spec", SPECS, ids=_spec_id)
+async def test_unique_in_study_flip_on_refused_without_lock_timeout(ctx, spec):
+    # Tests the case where a field is declared unique in a session with no
+    # lock_timeout: the propagation takes a table lock, and an unbounded wait
+    # for it would queue every metadata write, so it refuses instead.
+    field_idx = await _create_plain_field(ctx, spec, suffix="no-bound")
+
+    # Pinned to the SQLSTATE, not the class: the lock-timeout error subclasses
+    # this one, so the class alone would not separate no bound from a bound
+    # that ran out.
+    with pytest.raises(asyncpg.ObjectNotInPrerequisiteStateError) as excinfo:
+        await ctx["pool"].execute(
+            f"UPDATE {spec.study_field_table} SET unique_in_study = true WHERE idx = $1",
+            field_idx,
+        )
+    assert excinfo.value.sqlstate == "55000"
+
+    assert await _read_flags(ctx, spec, field_idx) == (False, [])
+
+
+@pytest.mark.parametrize("spec", SPECS, ids=_spec_id)
+async def test_unique_in_study_flip_off_allowed_without_lock_timeout(ctx, spec):
+    # Tests the case where a unique field is relaxed in a session with no
+    # lock_timeout: relaxing cannot violate a constraint, so it takes no lock
+    # and the refusal above does not apply to it.
+    field_idx = await _create_flagged_field(
+        ctx, spec, study_idx=ctx["study_idx"], data_type=FieldDataType.TEXT, suffix="relax-bare"
+    )
+
+    await ctx["pool"].execute(
+        f"UPDATE {spec.study_field_table} SET unique_in_study = false WHERE idx = $1",
+        field_idx,
+    )
+
+    assert await _read_flags(ctx, spec, field_idx) == (False, [])
+
+
+@pytest.mark.parametrize("spec", SPECS, ids=_spec_id)
+async def test_unique_in_study_flip_on_gives_up_on_in_flight_write(ctx, spec):
+    # Tests the case where a metadata write is in flight when a field is
+    # declared unique: the propagation waits for the table rather than running
+    # past a row the writer has not committed, and gives up within its bound,
+    # leaving the field as it was rather than committing a policy that row
+    # escaped.
+    entity_idx = await _create_linked_entity_for_spec(ctx, spec)
+    field_idx = await _create_plain_field(ctx, spec, suffix="in-flight")
+
+    async with ctx["pool"].acquire() as writer, ctx["pool"].acquire() as flipper:
+        # Held open: the INSERT takes ROW EXCLUSIVE on the metadata table at
+        # statement start and keeps it until this transaction ends.
+        writer_tx = writer.transaction()
+        await writer_tx.start()
+        try:
+            await _insert_metadata(
+                writer,
+                spec=spec,
+                entity_idx=entity_idx,
+                study_field_idx=field_idx,
+                data_type=FieldDataType.TEXT,
+                value="Sample 1",
+                created_by_idx=ctx["principal_idx"],
+            )
+
+            # Managed by hand rather than by `async with`: the flip leaves an
+            # aborted transaction that cannot be committed on the way out.
+            flip_tx = flipper.transaction()
+            await flip_tx.start()
+            try:
+                await flipper.execute(f"SET LOCAL lock_timeout = '{CONTENDED_FLIP_LOCK_TIMEOUT}'")
+                with pytest.raises(asyncpg.LockNotAvailableError):
+                    await flipper.execute(
+                        f"UPDATE {spec.study_field_table}"
+                        " SET unique_in_study = true WHERE idx = $1",
+                        field_idx,
+                    )
+            finally:
+                await flip_tx.rollback()
+        finally:
+            await writer_tx.rollback()
+
+    assert await _read_flags(ctx, spec, field_idx) == (False, [])
+
+
 # =============================================================================
 # update_study_field, the locking read, and the violation classifier
 # =============================================================================
@@ -1163,6 +1208,7 @@ async def test_update_study_field_writes_and_returns_resolved_row(ctx, spec):
     field_idx = await _create_plain_field(ctx, spec, suffix="upd")
 
     async with ctx["pool"].acquire() as conn, conn.transaction():
+        await conn.execute(f"SET LOCAL lock_timeout = '{METADATA_WRITE_LOCK_TIMEOUT}'")
         updated = await update_study_field(
             conn,
             spec=spec,
@@ -1275,7 +1321,6 @@ async def test_classify_unique_in_study_violation_ignores_other_constraints(ctx,
             data_type=FieldDataType.TEXT,
             required=False,
         )
-    ctx["created"][_study_field_tracking_key(spec)].append(first_idx)
     second_idx = await _create_plain_field(ctx, spec, suffix="collide-b")
 
     # Rename the second field onto the first's name: the (study_idx,
@@ -1309,7 +1354,6 @@ async def _write_local(ctx, spec, *, entity_idx, display_name, value, on_conflic
             caller_idx=ctx["principal_idx"],
             on_conflict=on_conflict,
         )
-    ctx["created"][_metadata_tracking_key(spec)].append(result.metadata_idx)
     return result
 
 
@@ -1327,22 +1371,22 @@ async def _seed_unique_field(ctx, spec, *, suffix):
             required=False,
             unique_in_study=True,
         )
-    ctx["created"][_study_field_tracking_key(spec)].append(field_idx)
     return display_name, field_idx
 
 
 @pytest.mark.parametrize("spec", SPECS, ids=_spec_id)
 async def test_upsert_onto_duplicate_value_raises_typed_error(ctx, spec):
     # Tests the case where a sample that already holds a value is overwritten
-    # to a value another sample in the study holds: the overwrite trips the
-    # uniqueness index the insert never reached, and is translated the same way.
+    # to a value another sample in the study holds: the refusal is the policy
+    # on the sample's own stored value, which answers before the collision with
+    # the other sample can be reached.
     display_name, field_idx = await _seed_unique_field(ctx, spec, suffix="upsert-dup")
     holder_idx = await _create_linked_entity_for_spec(ctx, spec)
     writer_idx = await _create_linked_entity_for_spec(ctx, spec)
     await _write_local(ctx, spec, entity_idx=holder_idx, display_name=display_name, value="TAKEN")
     await _write_local(ctx, spec, entity_idx=writer_idx, display_name=display_name, value="MINE")
 
-    with pytest.raises(StudyUniqueValueConflictError) as excinfo:
+    with pytest.raises(ValueRewriteOnUniqueFieldError) as excinfo:
         await _write_local(
             ctx,
             spec,
@@ -1354,32 +1398,35 @@ async def test_upsert_onto_duplicate_value_raises_typed_error(ctx, spec):
 
     assert excinfo.value.display_name == display_name
     assert excinfo.value.study_field_idx == field_idx
+    assert excinfo.value.stored_value == "MINE"
     assert excinfo.value.attempted_value == "TAKEN"
 
 
 @pytest.mark.parametrize("spec", SPECS, ids=_spec_id)
-async def test_upsert_onto_free_value_overwrites(ctx, spec):
-    # Control for the two cases above: the same overwrite path succeeds when
-    # the new value collides with nothing, so their failures are the
-    # uniqueness rules and not the overwrite itself.
+async def test_upsert_onto_free_value_refused(ctx, spec):
+    # Tests the case where the overwrite collides with nothing at all: the
+    # refusal is the stored value's own policy, so a free value is refused the
+    # same way a taken one is, and the stored value survives.
     display_name, _ = await _seed_unique_field(ctx, spec, suffix="upsert-free")
     writer_idx = await _create_linked_entity_for_spec(ctx, spec)
-    await _write_local(ctx, spec, entity_idx=writer_idx, display_name=display_name, value="MINE")
-
-    result = await _write_local(
-        ctx,
-        spec,
-        entity_idx=writer_idx,
-        display_name=display_name,
-        value="FRESH",
-        on_conflict="upsert",
+    first = await _write_local(
+        ctx, spec, entity_idx=writer_idx, display_name=display_name, value="MINE"
     )
 
-    assert result.outcome is FieldWriteOutcome.UPDATED
+    with pytest.raises(ValueRewriteOnUniqueFieldError):
+        await _write_local(
+            ctx,
+            spec,
+            entity_idx=writer_idx,
+            display_name=display_name,
+            value="FRESH",
+            on_conflict="upsert",
+        )
+
     stored = await ctx["pool"].fetchval(
-        f"SELECT value_text FROM {spec.metadata_table} WHERE idx = $1", result.metadata_idx
+        f"SELECT value_text FROM {spec.metadata_table} WHERE idx = $1", first.metadata_idx
     )
-    assert stored == "FRESH"
+    assert stored == "MINE"
 
 
 @pytest.mark.parametrize("spec", SPECS, ids=_spec_id)
@@ -1424,6 +1471,19 @@ def _owner_id_migration_sql():
     )
     text = path.read_text()
     return text.split("-- migrate:up", 1)[1].split("-- migrate:down", 1)[0].strip()
+
+
+async def _run_owner_id_migration(ctx):
+    """Replay the migration's body in one transaction, bounding the wait its
+    bulk flip of unique_in_study needs here.
+
+    The bound belongs to the replay rather than to the migration: this runs
+    against a database that already carries the locking propagation trigger,
+    while in filename order the flip sorts ahead of the migration installing
+    that trigger and so meets the non-locking one on a real deploy."""
+    async with ctx["pool"].acquire() as conn, conn.transaction():
+        await conn.execute(f"SET LOCAL lock_timeout = '{METADATA_WRITE_LOCK_TIMEOUT}'")
+        await conn.execute(_owner_id_migration_sql())
 
 
 async def _flag_as_owner_id(ctx, metadata_idx):
@@ -1493,7 +1553,6 @@ async def _seed_owner_id_migration_cases(ctx):
             display_name=unique_field_name("linked-owner-id"),
             created_by_idx=ctx["principal_idx"],
         )
-    ctx["created"][_study_field_tracking_key(spec)].append(linked_field)
     await _write_owner_id(ctx, field_idx=linked_field, value="OWNER-LINKED")
 
     # An owner-id field a study already declared unique through the edit route.
@@ -1534,7 +1593,7 @@ async def test_owner_id_migration_flags_only_local_owner_id_fields(ctx):
         "already_field": True,
     }
 
-    await ctx["pool"].execute(_owner_id_migration_sql())
+    await _run_owner_id_migration(ctx)
 
     assert await _flags_by_case(ctx, cases) == {
         "owner_field": True,
@@ -1550,7 +1609,7 @@ async def test_owner_id_migration_propagates_the_flag_to_the_fields_values(ctx):
     # the rows written before the flip.
     cases = await _seed_owner_id_migration_cases(ctx)
 
-    await ctx["pool"].execute(_owner_id_migration_sql())
+    await _run_owner_id_migration(ctx)
 
     flagged = await ctx["pool"].fetchval(
         "SELECT unique_in_study FROM qiita.biosample_metadata WHERE idx = $1",
@@ -1565,8 +1624,8 @@ async def test_owner_id_migration_is_idempotent(ctx):
     # since NOT unique_in_study excludes what the first pass set.
     cases = await _seed_owner_id_migration_cases(ctx)
 
-    await ctx["pool"].execute(_owner_id_migration_sql())
-    await ctx["pool"].execute(_owner_id_migration_sql())
+    await _run_owner_id_migration(ctx)
+    await _run_owner_id_migration(ctx)
 
     assert await _flags_by_case(ctx, cases) == {
         "owner_field": True,
@@ -1585,7 +1644,7 @@ async def test_owner_id_migration_aborts_when_two_samples_share_an_owner_id(ctx)
     await _write_owner_id(ctx, field_idx=cases["owner_field"], value="OWNER-1")
 
     with pytest.raises(asyncpg.UniqueViolationError) as excinfo:
-        await ctx["pool"].execute(_owner_id_migration_sql())
+        await _run_owner_id_migration(ctx)
 
     assert excinfo.value.constraint_name == "biosample_metadata_unique_in_study_text"
     assert await _flags_by_case(ctx, cases) == {
@@ -1613,7 +1672,6 @@ async def _publish_prep_for_biosample(ctx, biosample_idx):
             created_by_idx=ctx["principal_idx"],
         )
     ctx["created"]["prep_sample"].append(prep_sample_idx)
-    ctx["created"]["prep_sample_to_study"].append((prep_sample_idx, ctx["study_idx"]))
 
     # The publish action, which no write path performs yet.
     await ctx["pool"].execute(
@@ -1650,7 +1708,7 @@ async def test_owner_id_migration_aborts_on_a_non_owner_duplicate(ctx):
     )
 
     with pytest.raises(asyncpg.UniqueViolationError) as excinfo:
-        await ctx["pool"].execute(_owner_id_migration_sql())
+        await _run_owner_id_migration(ctx)
 
     assert excinfo.value.constraint_name == "biosample_metadata_unique_in_study_text"
     assert await _flags_by_case(ctx, cases) == _UNCHANGED_MIGRATION_FLAGS
@@ -1678,7 +1736,7 @@ async def test_owner_id_migration_aborts_on_a_missing_value_marker(ctx):
     )
 
     with pytest.raises(asyncpg.CheckViolationError) as excinfo:
-        await ctx["pool"].execute(_owner_id_migration_sql())
+        await _run_owner_id_migration(ctx)
 
     assert excinfo.value.constraint_name == "biosample_metadata_unique_in_study_no_missing_value"
     assert await _flags_by_case(ctx, cases) == _UNCHANGED_MIGRATION_FLAGS
@@ -1696,7 +1754,7 @@ async def test_owner_id_migration_aborts_on_a_published_biosample(ctx):
     await _publish_prep_for_biosample(ctx, biosample_idx)
 
     with pytest.raises(asyncpg.RaiseError) as excinfo:
-        await ctx["pool"].execute(_owner_id_migration_sql())
+        await _run_owner_id_migration(ctx)
 
     assert excinfo.value.sqlstate == "P0001"
     assert "published prep_sample" in str(excinfo.value)

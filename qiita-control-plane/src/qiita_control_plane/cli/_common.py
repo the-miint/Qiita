@@ -55,12 +55,18 @@ from collections.abc import Callable
 from pathlib import Path
 
 import httpx
-from qiita_common.api_paths import LOOPBACK_HOST
+from pydantic import ValidationError
+from qiita_common.api_paths import (
+    LOOPBACK_HOST,
+    PATH_ADMIN_PREFIX,
+    PATH_ADMIN_PRINCIPAL_LOOKUP_BY_EMAIL,
+)
 from qiita_common.auth_constants import (
     API_PREFIX,
     BEARER_PREFIX,
     STALE_TOKEN_SCOPE_HEADER,
 )
+from qiita_common.models import PrincipalLookupRequest, PrincipalLookupResponse
 
 # Environment-variable names and CLI defaults are CLI conventions (not part of
 # the wire protocol — those live in qiita_common.auth_constants). Keep them
@@ -502,6 +508,31 @@ def whoami(base_url: str, token: str) -> dict:
     return call("GET", base_url, token, "/auth/whoami")
 
 
+def lookup_email_arg(value: str) -> str:
+    """argparse `type=` for an email the CLI resolves with
+    `lookup_principal_by_email`: a malformed address exits 2 before any
+    request is sent."""
+    try:
+        PrincipalLookupRequest(email=value)
+    except ValidationError as exc:
+        raise argparse.ArgumentTypeError(f"not an email address: {value!r}") from exc
+    return value
+
+
+def lookup_principal_by_email(base_url: str, token: str, email: str) -> PrincipalLookupResponse:
+    """Resolve a user's email to their principal through
+    POST /admin/principal/lookup-by-email (see routes/admin.py for who may)."""
+    body = PrincipalLookupRequest(email=email).model_dump(mode="json")
+    found = call(
+        "POST",
+        base_url,
+        token,
+        f"{PATH_ADMIN_PREFIX}{PATH_ADMIN_PRINCIPAL_LOOKUP_BY_EMAIL}",
+        json=body,
+    )
+    return PrincipalLookupResponse.model_validate(found)
+
+
 def resolve_owner_idx(
     args: argparse.Namespace,
     base_url: str,
@@ -576,6 +607,49 @@ def parse_kv_pairs(
     return result
 
 
+def print_http_status_error(resp: httpx.Response) -> None:
+    """Print a non-2xx response to stderr: a stale-scope 403 (flagged by the
+    server via `STALE_TOKEN_SCOPE_HEADER`) gets a clean re-login prompt;
+    every other status echoes `http error N: body`.
+    """
+    if resp.status_code == 403 and resp.headers.get(STALE_TOKEN_SCOPE_HEADER):
+        print(
+            "error: your access token predates a scope your role now grants.\n"
+            "Run `qiita login` to mint a fresh token with your full role scopes,"
+            " then retry.",
+            file=sys.stderr,
+        )
+        return
+    print(f"http error {resp.status_code}: {resp.text}", file=sys.stderr)
+
+
+def validation_messages(exc: ValidationError) -> str:
+    """A ValidationError's errors flattened to one stderr line."""
+    return "; ".join(f"{'.'.join(str(p) for p in e['loc'])}: {e['msg']}" for e in exc.errors())
+
+
+def print_validation_error(exc: ValidationError) -> None:
+    """Print a model's refusal of a body to stderr as one line naming the
+    model, in the `invalid <Model>: ...` form `parser.error` callers use."""
+    print(f"error: invalid {exc.title}: {validation_messages(exc)}", file=sys.stderr)
+
+
+def print_request_error(exc: httpx.RequestError) -> None:
+    """Print a transport-level failure (no HTTP response at all) to stderr,
+    naming the target URL so a wrong --base-url / $QIITA_CONTROL_PLANE_URL
+    is easy to spot.
+    """
+    try:
+        target = str(exc.request.url)
+    except RuntimeError:
+        target = "the control plane"
+    print(
+        f"error: could not reach {target}: {exc!r}. Is the control plane"
+        " running? Check --base-url / $QIITA_CONTROL_PLANE_URL.",
+        file=sys.stderr,
+    )
+
+
 def run_http_subcommand(
     fn: Callable[[str], dict | list],
     render: Callable[[dict | list], None] | None = None,
@@ -584,9 +658,11 @@ def run_http_subcommand(
 
     `fn` accepts a PAT string and returns the parsed JSON body (a dict for
     most routes, a list for the list endpoints). Any RuntimeError from
-    token-read, HTTPStatusError (a non-2xx response), or RequestError (no
+    token-read, HTTPStatusError (a non-2xx response), RequestError (no
     response came back at all — connection refused, DNS failure, TLS error,
-    timeout) is converted to a stderr message + exit code 1.
+    timeout), or ValidationError (a model `fn` builds or parses refused its
+    input — a request body, or a response from a control plane at a different
+    version) is converted to a stderr message + exit code 1.
 
     By default the body is pretty-printed as JSON. A verb whose payload is meant
     to be *read* rather than parsed (e.g. a log tail, whose embedded newlines are
@@ -601,39 +677,13 @@ def run_http_subcommand(
     try:
         body = fn(token)
     except httpx.HTTPStatusError as exc:
-        # A stale-scope 403 — the token predates a scope the caller's role now
-        # grants (or was deliberately minted below the ceiling) — is flagged by
-        # the server with a machine-readable header. Recognize it and surface a
-        # clean, actionable re-login prompt instead of dumping the raw JSON
-        # envelope. Every other HTTP error keeps the generic body echo.
-        if exc.response.status_code == 403 and exc.response.headers.get(STALE_TOKEN_SCOPE_HEADER):
-            print(
-                "error: your access token predates a scope your role now grants.\n"
-                "Run `qiita login` to mint a fresh token with your full role scopes,"
-                " then retry.",
-                file=sys.stderr,
-            )
-            return 1
-        print(f"http error {exc.response.status_code}: {exc.response.text}", file=sys.stderr)
+        print_http_status_error(exc.response)
         return 1
     except httpx.RequestError as exc:
-        # No HTTP response at all — the most common cause is a control plane
-        # that isn't running, or a wrong --base-url / $QIITA_CONTROL_PLANE_URL.
-        # HTTPStatusError above is a *response*
-        # and is not a RequestError, so the two branches are disjoint. Surface a
-        # friendly, actionable message naming the target instead of dumping a
-        # transport-layer traceback. httpx sets `.request` on errors raised while
-        # sending, but guard the access (it raises if somehow unset) so the
-        # error path itself can't throw.
-        try:
-            target = str(exc.request.url)
-        except RuntimeError:
-            target = "the control plane"
-        print(
-            f"error: could not reach {target}: {exc!r}. Is the control plane"
-            " running? Check --base-url / $QIITA_CONTROL_PLANE_URL.",
-            file=sys.stderr,
-        )
+        print_request_error(exc)
+        return 1
+    except ValidationError as exc:
+        print_validation_error(exc)
         return 1
     if render is not None:
         render(body)

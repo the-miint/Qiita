@@ -24,9 +24,35 @@ from uuid import UUID
 
 import duckdb
 import pytest
+from helpers import (
+    SHRUNK_ROW_GROUP_SIZE_BYTES,
+    WIDE_ROW_COUNT,
+    WIDE_ROW_GROUPS,
+    row_group_rows,
+)
+from qiita_common import parquet
 from qiita_common.chunking import reassemble_chunks_expr
 
+from qiita_compute_orchestrator.miint import apply_duckdb_settings
+
 _REFERENCE_LOAD_LOGGER = "qiita_compute_orchestrator.jobs.reference_load"
+
+
+@pytest.fixture(autouse=True)
+def _host_ram_backs_the_load_literal(monkeypatch):
+    """Run `load` off SLURM on a host big enough for its memory literal.
+
+    Off SLURM, `resolve_duckdb_memory_gb` bounds `load`'s DuckDB limit by
+    detected RAM, and on a small runner that bound falls below what
+    `read_jplace` needs: its macro passes `maximum_object_size=1000000000` to
+    DuckDB's `read_json`
+    (https://github.com/the-miint/duckdb-miint/blob/96630a5/src/include/miint_macros.hpp),
+    which on DuckDB 1.5.4 asks for about 1.8 GiB even for a 327-byte jplace.
+    Pinning RAM keeps these tests about what `load` writes, not about the
+    machine they run on; the RAM bound has tests of its own."""
+    monkeypatch.delenv("SLURM_MEM_PER_NODE", raising=False)
+    monkeypatch.setattr("qiita_compute_orchestrator.miint.detected_ram_gb", lambda: 64)
+
 
 # Canonical test sequences shared across hash_sequences and the
 # reference-load suite. Five short sequences mean every chunk is a
@@ -270,6 +296,68 @@ def test_chunks_batched_into_disjoint_feature_idx_ranges(staging_inputs, tmp_pat
         ).fetchall()
     fidx_to_canon = {_FEATURE_MAP[_HASHES[n]]: _CANON[n] for n in _TEST_SEQUENCES}
     assert {fidx: canon for fidx, canon in rows} == fidx_to_canon
+
+
+def _write_chunks(tmp_path: Path, widths: list[tuple[int, int]]) -> duckdb.DuckDBPyConnection:
+    """A connection carrying `feature_map`, and one hashed-chunk input part of one chunk per
+    feature: `count` features of `width` characters for each `(count, width)`, in
+    feature_idx order. Each chunk is distinct so no encoder collapses the column."""
+    src = tmp_path / "hashed_chunks"
+    src.mkdir()
+    conn = duckdb.connect(":memory:")
+    apply_duckdb_settings(conn, tmp_path, memory_gb=2, threads=4)
+    arms = []
+    first = 1
+    for count, width in widths:
+        arms.append(
+            f"SELECT range AS feature_idx, {width} AS width FROM range({first}, {first + count})"
+        )
+        first += count
+    conn.execute(
+        "CREATE TEMP TABLE feature_map AS SELECT feature_idx, uuid() AS sequence_hash, width "
+        f"FROM ({' UNION ALL '.join(arms)})"
+    )
+    conn.execute(
+        "COPY (SELECT sequence_hash, 0 AS chunk_index, "
+        "repeat(md5(feature_idx::VARCHAR), 32)[:width] AS chunk_data FROM feature_map) "
+        f"TO '{src / 'part_00000.parquet'}' (FORMAT PARQUET, ROW_GROUP_SIZE 1024)"
+    )
+    return conn
+
+
+def test_chunk_parts_keep_wide_row_groups_under_the_byte_cap(tmp_path, monkeypatch):
+    """Each part's sorted COPY ignores ROW_GROUP_SIZE_BYTES (see
+    `qiita_common.parquet.sorted_row_group_size`), so the writer asks for a row count sized
+    to its chunks. With the cap shrunk to 1 MiB, ~1 KB chunks land one vector per row group
+    instead of the whole part in one."""
+    import qiita_compute_orchestrator.jobs._feature_load as fl
+
+    monkeypatch.setattr(parquet, "ROW_GROUP_SIZE_BYTES", SHRUNK_ROW_GROUP_SIZE_BYTES)
+    out = tmp_path / "reference_sequence_chunks"
+    with _write_chunks(tmp_path, [(WIDE_ROW_COUNT, 1024)]) as conn:
+        fl.write_feature_sequence_chunks(conn, tmp_path / "hashed_chunks", out)
+    parts = sorted(out.glob("part_*.parquet"))
+    assert len(parts) == 1, "one batch's worth of chunks is one part"
+    assert row_group_rows(parts[0]) == WIDE_ROW_GROUPS
+
+
+def test_chunk_parts_size_row_groups_from_their_own_chunks(tmp_path, monkeypatch):
+    """A part's row count follows its own widest chunk, not the whole input's mean. A
+    reference that mixes short records with genomes would otherwise size a part of
+    full-width chunks for the short records, and its row groups would run far past the
+    cap."""
+    import qiita_compute_orchestrator.jobs._feature_load as fl
+
+    monkeypatch.setattr(parquet, "ROW_GROUP_SIZE_BYTES", SHRUNK_ROW_GROUP_SIZE_BYTES)
+    narrow = 5 * WIDE_ROW_COUNT
+    # One batch of the narrow features, then one of the wide.
+    monkeypatch.setattr(fl, "CHUNK_BUDGET_PER_BATCH", narrow)
+    out = tmp_path / "reference_sequence_chunks"
+    with _write_chunks(tmp_path, [(narrow, 32), (WIDE_ROW_COUNT, 1024)]) as conn:
+        fl.write_feature_sequence_chunks(conn, tmp_path / "hashed_chunks", out)
+    narrow_part, wide_part = sorted(out.glob("part_*.parquet"))
+    assert row_group_rows(wide_part) == WIDE_ROW_GROUPS
+    assert row_group_rows(narrow_part)[0] > WIDE_ROW_GROUPS[0]
 
 
 def test_emits_reference_membership_with_reference_idx(staging_inputs, tmp_path):
@@ -516,6 +604,57 @@ def test_phylogeny_accepts_a_RAW_newick_on_the_local_path(staging_inputs, tmp_pa
             ).fetchall()
         }
     assert tips_with_fidx == set(_FEATURE_MAP.values())
+
+
+def test_phylogeny_mints_edge_id_when_the_tree_decorates_nothing(
+    staging_inputs, tree_path, tmp_path
+):
+    """An undecorated Newick leaves `edge_id` NULL on every node, and an index built
+    from such a tree numbers its own edges, which join back to nothing here. The
+    loader supplies `node_index` instead — dense and unique, and carried through a
+    placement build verbatim. See "Edge numbering" in
+    `docs/architecture/reference-data.md`."""
+    outputs = _run(_inputs(**staging_inputs, tree_path=tree_path), tmp_path / "ws")
+    pq = outputs["staging_dir"] / "reference_phylogeny.parquet"
+    with duckdb.connect(":memory:") as conn:
+        rows, nulls, differing = conn.execute(
+            "SELECT count(*),"
+            "       count(*) FILTER (WHERE edge_id IS NULL),"
+            "       count(*) FILTER (WHERE edge_id IS DISTINCT FROM node_index)"
+            f" FROM '{pq}'"
+        ).fetchone()
+    assert rows > 0
+    assert nulls == 0, "an undecorated tree must not reach the lake with NULL edge_id"
+    assert differing == 0, "the minted numbering is node_index"
+
+
+def test_phylogeny_leaves_a_partially_decorated_tree_partial(staging_inputs, tmp_path):
+    """A tree carrying jplace `{N}` decorations keeps exactly those numbers, and the
+    nodes it left undecorated stay NULL. The mint is all-or-nothing per tree: filling
+    those NULLs with `node_index` would put two numberings in one column, and nothing
+    downstream could tell which one an edge came from."""
+    raw_nwk = tmp_path / "decorated.nwk"
+    # Every node but the root is decorated; the root carries no branch length and
+    # so no `{N}`, which is what makes this tree partially decorated.
+    raw_nwk.write_text(
+        "((seq1:0.1{5},seq2:0.2{6}):0.3{7},"
+        "(seq3:0.4{8},(seq4:0.5{9},seq5:0.6{10}):0.7{11}):0.8{12});"
+    )
+
+    outputs = _run(_inputs(**staging_inputs, tree_path=raw_nwk), tmp_path / "ws")
+    pq = outputs["staging_dir"] / "reference_phylogeny.parquet"
+    with duckdb.connect(":memory:") as conn:
+        decorated = [
+            r[0]
+            for r in conn.execute(
+                f"SELECT edge_id FROM '{pq}' WHERE edge_id IS NOT NULL ORDER BY edge_id"
+            ).fetchall()
+        ]
+        (still_null,) = conn.execute(
+            f"SELECT count(*) FILTER (WHERE edge_id IS NULL) FROM '{pq}'"
+        ).fetchone()
+    assert decorated == [5, 6, 7, 8, 9, 10, 11, 12]
+    assert still_null == 1, "the undecorated root must keep its NULL, not be minted"
 
 
 @pytest.fixture

@@ -24,6 +24,7 @@ from qiita_common.models import (
     ReferenceStatus,
     WorkTicketState,
 )
+from qiita_common.sql import sql_string_literal
 
 from .. import _common
 
@@ -145,7 +146,7 @@ async def _run_reference_load(
 def _handle_reference_load(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
     """Entry point for `qiita reference load`. Reads the PAT, builds
     a real httpx + flight client, and calls `do_reference_load`. Maps
-    every known failure shape to exit 1 with a one-line stderr message —
+    every known failure shape to exit 1 with a stderr message —
     no silent retry, no buried traceback. Terminal work_ticket=failed
     also exits 1 so callers wrapping this in a Makefile / CI step get
     the build break."""
@@ -167,10 +168,10 @@ def _handle_reference_load(args: argparse.Namespace, parser: argparse.ArgumentPa
             )
         )
     except _httpx.HTTPStatusError as exc:
-        print(
-            f"http error {exc.response.status_code}: {exc.response.text}",
-            file=sys.stderr,
-        )
+        _common.print_http_status_error(exc.response)
+        return 1
+    except _httpx.RequestError as exc:
+        _common.print_request_error(exc)
         return 1
     except _flight.FlightError as exc:
         # Catch the gRPC-level error explicitly so the operator sees a
@@ -222,11 +223,6 @@ def _serializable(obj):
 # ---------------------------------------------------------------------------
 
 _EXPORT_FORMATS = ("fasta", "parquet")
-
-
-def _sql_str(path: Path) -> str:
-    """Escape a filesystem path for inlining as a DuckDB SQL string literal."""
-    return str(path).replace("'", "''")
 
 
 def _resolve_genome_members(base_url: str, token: str, *, reference_idx: int, genome_idx: int):
@@ -323,7 +319,7 @@ def _write_genome_fasta(reader, accession_map: dict[int, str | None], target: Pa
 
     The header (accession) is carried as DATA (a registered column), never inlined
     into the COPY SQL — so it presents no SQL-injection surface; only the output
-    path is inlined (escaped via `_sql_str`). A feature with a NULL accession (a
+    path is inlined, as a quoted SQL literal. A feature with a NULL accession (a
     non-FASTA ingest, or a pre-accession-column row) falls back to a
     `feature_<idx>` header so the FASTA stays valid and traceable.
 
@@ -358,7 +354,7 @@ def _write_genome_fasta(reader, accession_map: dict[int, str | None], target: Pa
                 "   FROM chunks c JOIN accession_map m USING (feature_idx)"
                 "  GROUP BY c.feature_idx, m.accession"
                 "  ORDER BY c.feature_idx)"
-                f" TO '{_sql_str(partial)}' (FORMAT FASTA, COMPRESSION 'gzip')"
+                f" TO {sql_string_literal(partial)} (FORMAT FASTA, COMPRESSION 'gzip')"
             ).fetchone()
             return count
 
@@ -494,7 +490,10 @@ def _handle_reference_genome_export(
                 )
             )
     except _common.httpx.HTTPStatusError as exc:
-        print(f"http error {exc.response.status_code}: {exc.response.text}", file=sys.stderr)
+        _common.print_http_status_error(exc.response)
+        return 1
+    except _common.httpx.RequestError as exc:
+        _common.print_request_error(exc)
         return 1
     except flight.FlightError as exc:
         print(f"flight error: {exc}", file=sys.stderr)

@@ -40,42 +40,32 @@ def test_each_scope_builds_and_joins_a_DIFFERENTLY_NAMED_survivor_relation():
         assert other not in build and other not in join, scope
 
 
-def test_pooled_scope_uses_the_macro_and_per_sample_hand_rolls_it():
-    """Pooled delegates to `genome_coverage`. Per-sample cannot — the macro has no
-    sample key — so it hand-rolls the macro's own method (`compress_intervals` per
-    contig, summed to the genome) with one more GROUP BY key. Upstream confirms
-    this is expressible today; see duckdb-miint#217.
-    """
-    pooled = ft.survivor_table_sql(ft.CoverageScope.POOLED)
-    per_sample = ft.survivor_table_sql(ft.CoverageScope.PER_SAMPLE)
-    assert "genome_coverage(" in pooled
-    assert "compress_intervals(" not in pooled
-    assert "compress_intervals(" in per_sample
+@pytest.mark.parametrize("combined", [False, True])
+def test_each_scope_calls_its_own_miint_macro(combined):
+    """Pooled calls `genome_coverage`, per-sample `genome_coverage_per_sample`, on
+    both arms; neither restates the macros' arithmetic."""
+    pooled = ft.survivor_table_sql(ft.CoverageScope.POOLED, combined=combined)
+    per_sample = ft.survivor_table_sql(ft.CoverageScope.PER_SAMPLE, combined=combined)
+    arms = 2 if combined else 1
+    assert pooled.count("genome_coverage(") == arms
+    assert "genome_coverage_per_sample(" not in pooled
+    assert per_sample.count("genome_coverage_per_sample(") == arms
     assert "genome_coverage(" not in per_sample
+    assert "compress_intervals(" not in pooled + per_sample
 
 
-def test_per_sample_divides_by_the_same_full_length_denominator():
-    """Both scopes must divide by the genome's FULL length — the macro does it
-    internally, so the hand-rolled form has to reach for the same lengths table and
-    the same DOUBLE cast, or the two scopes' proportions are not comparable and a
-    single threshold means two different things.
-    """
-    sql = ft.survivor_table_sql(ft.CoverageScope.PER_SAMPLE)
-    assert ft.GENOME_LENGTHS_TABLE in sql
-    assert "total_length" in sql
-    assert "CAST(" in sql and "AS DOUBLE)" in sql
-
-
-def test_per_sample_merges_intervals_per_contig_before_rolling_to_the_genome():
-    """`compress_intervals` merges within one contig; a genome's covered bases are
-    the SUM over its contigs. Grouping straight to the genome would merge intervals
-    from DIFFERENT contigs as if they shared a coordinate space, understating
-    coverage for every multi-contig genome.
-    """
-    sql = ft.survivor_table_sql(ft.CoverageScope.PER_SAMPLE)
-    merge_at = sql.index("compress_intervals(")
-    rollup_at = sql.index(ft.MAP_TABLE)
-    assert merge_at < rollup_at, "intervals must be merged before the genome roll-up"
+@pytest.mark.parametrize("scope", list(ft.CoverageScope))
+def test_every_arm_divides_by_the_same_lengths_relation(scope):
+    """Both scopes and both arms hand the macro `GENOME_LENGTHS_TABLE`, so one
+    threshold means the same thing wherever a genome came from. That the relation
+    holds the FULL genome length is pinned behaviourally
+    (`test_the_denominator_is_the_full_genome_length_in_both_scopes`)."""
+    sql = ft.survivor_table_sql(scope, combined=True)
+    assert f"{ft.COVERAGE_ALIGNMENTS_VIEW}, {ft.GENOME_LENGTHS_TABLE}, {ft.MAP_TABLE})" in sql
+    assert (
+        f"{ft.DENOVO_COVERAGE_ALIGNMENTS_VIEW}, {ft.GENOME_LENGTHS_TABLE}, {ft.DENOVO_MAP_TABLE})"
+        in sql
+    )
 
 
 def test_coverage_input_excludes_null_coordinates():
@@ -88,13 +78,16 @@ def test_coverage_input_excludes_null_coordinates():
     assert "stop_position IS NOT NULL" in sql
 
 
-def test_coverage_input_carries_the_sample_key_for_both_scopes():
-    """One view feeds both scopes: per-sample needs `prep_sample_idx` to group by,
-    and `genome_coverage` tolerates the extra column because it projects the three
-    it names out of `query_table(alignments)` (probed against the mirror build).
-    A pooled-only view would force a second, near-identical view.
+@pytest.mark.parametrize(
+    "view_sql", [ft.coverage_alignments_view_sql, ft.denovo_coverage_alignments_view_sql]
+)
+def test_coverage_input_carries_the_sample_key_for_both_scopes(view_sql):
+    """One view per arm feeds both scopes: `genome_coverage_per_sample` groups on a
+    column named `sample_id`, and `genome_coverage` tolerates the extra column because
+    it projects the three it names out of `query_table(alignments)` (probed against the
+    mirror build). A pooled-only view would force a second, near-identical view.
     """
-    assert "prep_sample_idx" in ft.coverage_alignments_view_sql()
+    assert "prep_sample_idx AS sample_id" in view_sql()
 
 
 def test_threshold_is_a_bound_parameter_in_both_scopes():

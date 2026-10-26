@@ -3,9 +3,8 @@
 These tests exercise the two repository entry points
 (mint_sequence_range, fetch_sequence_range_by_prep_sample_idx) and the
 underlying qiita.mint_sequence_range plpgsql function. Each test seeds
-its own principal -> user -> biosample -> prep_sample chain so cleanup
-runs in FK-reverse order and the suite can run in parallel against the
-shared postgres_pool fixture.
+its own principal -> user -> biosample -> prep_sample chain so the suite
+can run in parallel against the shared postgres_pool fixture.
 """
 
 import asyncio
@@ -23,13 +22,14 @@ from qiita_control_plane.testing.db_seeds import (
     seed_biosample_with_sequenced_prep_sample,
     seed_user_principal,
 )
+from qiita_control_plane.testing.db_teardown import delete_principal, teardown_entity_graph
 
 pytestmark = pytest.mark.db
 
 
 @pytest_asyncio.fixture
 async def parent_chain(postgres_pool):
-    """Seed one principal + one prep_sample for the test; FK-reverse cleanup.
+    """Seed one principal + one prep_sample for the test.
 
     Tests that need a SECOND prep_sample (e.g., concurrent / disjoint
     range tests) call `seed_biosample_with_sequenced_prep_sample` again
@@ -52,24 +52,13 @@ async def parent_chain(postgres_pool):
         "created": created,
     }
 
-    # FK-reverse cleanup. sequence_range rows cascade with prep_sample,
-    # so no explicit sweep is needed for them.
-    await postgres_pool.execute(
-        "DELETE FROM qiita.prep_sample WHERE idx = ANY($1::bigint[])",
-        created["prep_sample"],
+    await teardown_entity_graph(
+        postgres_pool,
+        study_idxs=[],
+        biosample_idxs=created["biosample"],
+        prep_sample_idxs=created["prep_sample"],
     )
-    await postgres_pool.execute(
-        "DELETE FROM qiita.biosample WHERE idx = ANY($1::bigint[])",
-        created["biosample"],
-    )
-    await postgres_pool.execute(
-        "DELETE FROM qiita.user WHERE principal_idx = $1",
-        principal_idx,
-    )
-    await postgres_pool.execute(
-        "DELETE FROM qiita.principal WHERE idx = $1",
-        principal_idx,
-    )
+    await delete_principal(postgres_pool, [principal_idx])
 
 
 # ---------------------------------------------------------------------------
@@ -296,8 +285,6 @@ async def test_sequence_range_cascade_on_prep_sample_delete(parent_chain):
         "DELETE FROM qiita.prep_sample WHERE idx = $1",
         parent_chain["prep_sample_idx"],
     )
-    # Don't double-delete in teardown.
-    parent_chain["created"]["prep_sample"].remove(parent_chain["prep_sample_idx"])
     fetched = await fetch_sequence_range_by_prep_sample_idx(pool, parent_chain["prep_sample_idx"])
     assert fetched is None
 
@@ -322,8 +309,6 @@ async def test_sequence_idx_not_reused_after_cascade_delete(parent_chain):
         "DELETE FROM qiita.prep_sample WHERE idx = $1",
         parent_chain["prep_sample_idx"],
     )
-    parent_chain["created"]["prep_sample"].remove(parent_chain["prep_sample_idx"])
-
     _bs2, ps2 = await seed_biosample_with_sequenced_prep_sample(
         pool, owner_idx=parent_chain["principal_idx"]
     )

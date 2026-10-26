@@ -1,12 +1,12 @@
 """The per-sample narrowing every gate-roster read applies.
 
-Two reads answer the same shape of question over two different gates — which
-samples are masked under a `mask_idx` (`repositories.mask_definition`), which are
-assembled under a `processing_idx` (`repositories.processing`) — and both have to
-narrow the sample set identically: exclude entity-retired prep_samples, optional
-`sequenced_pool_idx` / `prep_sample_idx` filters, and the per-study visibility
+Every gate-roster read answers the same shape of question — which prep_samples
+hold a gate row under one identity (a `mask_idx`, a `processing_idx`) — and all of
+them have to narrow the sample set identically: exclude entity-retired prep_samples
+and ENA-flagged sequenced_samples, optional
+`sequenced_pool_idx` / `study_idx` / `prep_sample_idx` filters, and the per-study visibility
 policy for a caller below the bypass role. This module owns that one copy;
-neither reader restates it.
+no reader restates it.
 
 Every fragment correlates on `{alias}.prep_sample_idx`, where `{alias}` is the
 caller's gate CTE. Nothing else about the gate is assumed.
@@ -20,7 +20,7 @@ from qiita_common.models import Tier
 #
 # SQL restatement of the policy the submission gate applies in Python
 # (`auth.guards.require_caller_has_admin_on_all_studies`, as reached from
-# routes/work_ticket.py). Arm for arm: the caller must hold Tier.ADMIN — or own the
+# work_ticket_submit.py). Arm for arm: the caller must hold Tier.ADMIN — or own the
 # study — on EVERY non-retired link; a study row that does not exist is skipped
 # (inner JOIN); a sample whose links are all retired is admitted (vacuous NOT
 # EXISTS). Nothing pins the two together, so a change to either belongs in a PR
@@ -56,6 +56,21 @@ _SAMPLE_NOT_RETIRED = """
     )
 """
 
+# A prep_sample's sequenced_sample subtype (if it has one) must not be flagged
+# unavailable by ENA -- covers every gate-roster read this module serves the
+# same way retirement does; this module is not itself the submission gate (see
+# fetch_sequenced_pool_samples / block_planner._enumerate_pool_samples for
+# that). NOT EXISTS rather than a join: most gates cover every processing_kind,
+# and a non-sequenced prep_sample has no sequenced_sample row to match against,
+# so it must pass unaffected.
+SEQUENCED_SAMPLE_NOT_FLAGGED = """
+    NOT EXISTS (
+        SELECT 1 FROM qiita.sequenced_sample ss_ena
+         WHERE ss_ena.prep_sample_idx = {alias}.prep_sample_idx
+           AND ss_ena.ena_status IS NOT NULL
+    )
+"""
+
 
 def sample_scope_sql(
     *,
@@ -64,6 +79,7 @@ def sample_scope_sql(
     sequenced_pool_idx: int | None,
     prep_sample_idx: int | None,
     visible_to_principal_idx: int | None,
+    study_idx: int | None = None,
 ) -> tuple[str, bool]:
     """Build the roster-narrowing clauses, appending each bound value to `args`.
     Returns (sql, narrowed), where `narrowed` is True iff a caller-supplied
@@ -72,18 +88,20 @@ def sample_scope_sql(
     The SQL is ANDed onto a query whose FROM carries the roster CTE aliased
     `alias`. The retirement exclusion is unconditional and does not count as a
     narrowing — it bounds both reads identically rather than reflecting anything
-    the caller asked for. The three that do: `sequenced_pool_idx` joins through
-    qiita.sequenced_sample, `prep_sample_idx` matches directly, and
-    `visible_to_principal_idx` applies the per-study predicate. Pass None for
-    `visible_to_principal_idx` only for a caller holding the bypass role — it
-    means "see every sample".
+    the caller asked for. The four that do: `sequenced_pool_idx` joins through
+    qiita.sequenced_sample, `study_idx` through an active qiita.prep_sample_to_study
+    link, `prep_sample_idx` matches directly, and `visible_to_principal_idx` applies
+    the per-study predicate. Pass None for `visible_to_principal_idx` only for a
+    caller holding the bypass role, or for one that applies its own read gate to the
+    rows returned — it means "see every sample".
     """
-    # `alias` is interpolated into SQL, not bound. Both callers pass a module
+    # `alias` is interpolated into SQL, not bound. Every caller passes a module
     # constant, so nothing reaches this from a request today; the check is what
-    # keeps that true of a third caller.
+    # keeps that true of the next caller.
     if not alias.isidentifier():
         raise ValueError(f"roster alias must be a bare SQL identifier, got {alias!r}")
     clauses = " AND " + _SAMPLE_NOT_RETIRED.format(alias=alias)
+    clauses += " AND " + SEQUENCED_SAMPLE_NOT_FLAGGED.format(alias=alias)
     narrowed = False
     if sequenced_pool_idx is not None:
         narrowed = True
@@ -92,6 +110,14 @@ def sample_scope_sql(
             f" AND EXISTS (SELECT 1 FROM qiita.sequenced_sample ss"
             f"              WHERE ss.prep_sample_idx = {alias}.prep_sample_idx"
             f"                AND ss.sequenced_pool_idx = ${len(args)})"
+        )
+    if study_idx is not None:
+        narrowed = True
+        args.append(study_idx)
+        clauses += (
+            f" AND EXISTS (SELECT 1 FROM qiita.prep_sample_to_study pts_f"
+            f"              WHERE pts_f.prep_sample_idx = {alias}.prep_sample_idx"
+            f"                AND pts_f.retired = false AND pts_f.study_idx = ${len(args)})"
         )
     if prep_sample_idx is not None:
         narrowed = True

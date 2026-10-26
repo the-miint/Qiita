@@ -24,7 +24,7 @@ _COLUMNS = "prep_sample_idx, sequence_idx, read_id, sequence1, qual1, sequence2,
 def _job_conn() -> duckdb.DuckDBPyConnection:
     """A connection configured the way every real caller's is.
 
-    `bind_step_reads` writes with the shared PARQUET_OPTS, whose
+    `bind_step_reads` writes with the shared PARQUET_OPTS_TRANSFER, whose
     ROW_GROUP_SIZE_BYTES DuckDB rejects while preserving insertion order — the
     jobs get `preserve_insertion_order=false` from `apply_duckdb_settings`. Set
     it here too rather than testing against a connection no job ever uses.

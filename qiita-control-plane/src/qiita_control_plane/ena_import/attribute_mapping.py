@@ -9,8 +9,10 @@ since real submitters use both: the GSC-MIxS display-name form ENA's checklists 
 (`"collection date"`, ...) and the underscore MIxS short-name form (notably DDBJ) uses
 (`collection_date`, `geo_loc_name`, `lat_lon`, `depth`).
 
-  - `collection date`/`collection_date`, `depth`, and the geographic-location
-    coordinate + country/sea fields: value passes through unchanged.
+  - `collection date`/`collection_date`, `depth`, and the country/sea field: value
+    passes through unchanged.
+  - the latitude/longitude fields: a hemisphere-suffixed decimal (`"39N"`, `"12.5 W"`)
+    is signed (S/W negate); any other value passes through unchanged.
   - `geo_loc_name` -> `geographic location (country and/or sea)`: MIxS packs
     `country:region:locality`; only the country/sea part (before the first `:`) is
     kept -- region/locality dropped rather than guessed at a finer granularity.
@@ -18,12 +20,13 @@ since real submitters use both: the GSC-MIxS display-name form ENA's checklists 
     (`"<lat> <N|S> <lon> <E|W>"`); parsed and signed (S/W negate). A value not matching
     that exact shape (including an INSDC missing marker) is left UNMAPPED, not guessed.
 
-Deliberately NOT mapped: `host` (free-text name, not an NCBI Taxonomy id), anything
-resolving `taxon_id`/`host_taxon_id`, and the three GSC-MIxS environmental-context tags
-(`env_broad_scale`/`env_local_scale`/`env_medium`). The last are TERMINOLOGY-typed
-(bound to ENVO), resolving against an ENVO CURIE, but ENA's raw values are submitter free
-text -- mapping directly would fabricate an ENVO-resolution step this ticket doesn't own.
-All stay unmapped so a real taxon/ENVO-resolution ticket can own them.
+Deliberately NOT mapped: `host` (free-text name, not an NCBI Taxonomy id) and the three
+GSC-MIxS environmental-context tags (`env_broad_scale`/`env_local_scale`/`env_medium`).
+The latter are TERMINOLOGY-typed (bound to ENVO), but ENA's raw values are submitter free
+text, so mapping them would fabricate an ENVO-resolution step. Nor are `neg_cont_type` /
+`pos_cont_type`: submitters often copy a study's control onto every BioSample. `taxon id` and
+`host taxon id` come from the run's `tax_id`/`host_tax_id` in `ena_import.harmonization`,
+not from attributes.
 
 Normalization (whitespace-collapsed, lower-cased, underscore-folded-to-space) only
 smooths spacing/casing/vocabulary quirks; the lookup is exact-match on the normalized
@@ -87,6 +90,30 @@ _LAT_LON_RE = re.compile(
 )
 
 
+# One coordinate with its hemisphere after it: "39N", "39 N", "12.5°W" (or "º", the
+# ordinal indicator keyboards often give for a degree sign). A signed number with a
+# hemisphere ("-39S") is ambiguous and does not match.
+_HEMISPHERE_COORDINATE_RE = re.compile(
+    r"^(?P<value>[0-9]+(?:\.[0-9]+)?)\s*[°º]?\s*(?P<dir>[NSEWnsew])$"
+)
+
+
+def _coordinate(display_name: str, negative: str) -> _TagHandler:
+    """A latitude (`negative="S"`) or longitude (`negative="W"`) field. A decimal with
+    its hemisphere after it is signed, its digits kept verbatim; a hemisphere from the
+    other axis, or any other value, passes through unchanged for the import to parse."""
+    axis = {"S": "NS", "W": "EW"}[negative]
+
+    def _handler(value: str) -> dict[str, str]:
+        match = _HEMISPHERE_COORDINATE_RE.match(value.strip())
+        if match is None or match["dir"].upper() not in axis:
+            return {display_name: value}
+        signed = f"-{match['value']}" if match["dir"].upper() == negative else match["value"]
+        return {display_name: signed}
+
+    return _handler
+
+
 def _map_lat_lon(value: str) -> dict[str, str] | None:
     """Split MIxS `lat_lon` into the two NUMERIC coordinate fields, negating for S/W.
     Returns `None` (leave the tag unmapped) for anything not matching the exact
@@ -112,9 +139,11 @@ _ENA_ATTRIBUTE_TAG_HANDLERS: dict[str, _TagHandler] = {
     "geographic location (country and/or sea)": _passthrough(
         BIOSAMPLE_DISPLAY_GEOGRAPHIC_LOCATION_COUNTRY_OR_SEA
     ),
-    "geographic location (latitude)": _passthrough(BIOSAMPLE_DISPLAY_GEOGRAPHIC_LOCATION_LATITUDE),
-    "geographic location (longitude)": _passthrough(
-        BIOSAMPLE_DISPLAY_GEOGRAPHIC_LOCATION_LONGITUDE
+    "geographic location (latitude)": _coordinate(
+        BIOSAMPLE_DISPLAY_GEOGRAPHIC_LOCATION_LATITUDE, negative="S"
+    ),
+    "geographic location (longitude)": _coordinate(
+        BIOSAMPLE_DISPLAY_GEOGRAPHIC_LOCATION_LONGITUDE, negative="W"
     ),
     "depth": _passthrough(BIOSAMPLE_DISPLAY_DEPTH),
     "geo loc name": _map_geo_loc_name,

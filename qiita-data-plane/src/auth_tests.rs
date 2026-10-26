@@ -211,6 +211,30 @@ fn verify_sync_reference_exclusion_rejects_extra_fields() {
     }
 }
 
+// -------------------- mint_phylogeny_edge_id --------------------
+
+#[test]
+fn verify_mint_phylogeny_edge_id_round_trip() {
+    let payload = br#"{"action":"mint_phylogeny_edge_id","reference_idx":18}"#;
+    let ticket = build_ticket(payload, &test_signing_key(), future_expiry(300));
+    let parsed =
+        verify_mint_phylogeny_edge_id(&ticket, &test_vk()).expect("valid token should verify");
+    assert_eq!(parsed.action, "mint_phylogeny_edge_id");
+    assert_eq!(parsed.reference_idx, 18);
+}
+
+#[test]
+fn verify_mint_phylogeny_edge_id_rejects_extra_fields() {
+    // The action mints one reference's whole tree; a smuggled row selector (e.g.
+    // node_index) would read as a scoped mint the handler does not implement.
+    let payload = br#"{"action":"mint_phylogeny_edge_id","reference_idx":18,"node_index":3}"#;
+    let ticket = build_ticket(payload, &test_signing_key(), future_expiry(300));
+    match verify_mint_phylogeny_edge_id(&ticket, &test_vk()).unwrap_err() {
+        AuthError::MalformedPayload(_) => {}
+        other => panic!("expected MalformedPayload, got {other:?}"),
+    }
+}
+
 // -------------------- block-read DoGet ticket members --------------------
 //
 // Block-scoped reads are a DoGet ticket carrying `members`. A member is

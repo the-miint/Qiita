@@ -58,9 +58,14 @@ PHYLOGENY_COLUMNS = (
 # What the published tree carries: `shear_tree`'s own output columns, in its order and
 # with the types it returns (measured — see `docs/duckdb-miint.md`).
 # `node_index`/`parent_index` are the SHEAR's 0-based reindexing rather than anything of
-# ours, and they are how a tree expresses its shape; `edge_id` is the reference's own
-# jplace edge id, the only handle back to its placements. No `feature_idx` — a tip is
-# named with the handle its row in the table carries.
+# ours, and they are how a tree expresses its shape; `edge_id` is the reference's edge
+# numbering, the handle back to its placements — either the numbering a jplace-decorated
+# Newick arrived with or the one Qiita minted for a tree that had none (see "Edge
+# numbering" in `docs/architecture/reference-data.md`), which a consumer cannot tell
+# apart and does not need to: within one reference it is one numbering either way. It is
+# carried from BEFORE the shear, unlike the `node_index` beside it, which the shear
+# reindexes. No `feature_idx` — a tip is named with the handle its row in the table
+# carries.
 #
 # The types are written out only because the empty path below has to produce them without
 # the shear; the populated path takes them from `shear_tree`.

@@ -15,7 +15,7 @@ and an Illumina one has no `hifi_reads/` tree.
 
 from typing import Annotated
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from ..auth_constants import MAX_NAME_LENGTH
 from .reference import Platform
@@ -24,16 +24,24 @@ from .reference import Platform
 class RunFolderInspectRequest(BaseModel):
     """Body for POST /api/v1/run-folder/inspect.
 
-    `path` is the run folder as the CLUSTER sees it — the same value that will
-    go into `action_context`. It is bounded by PATH_INGEST_ROOTS and checked for
-    existence by the same gate the work-ticket submit uses, so a laptop path is
-    refused here too, one step earlier than it would be at submit.
+    Exactly one of `path` or `run_id` names the run folder. `path` is the folder
+    as the CLUSTER sees it (bounded by PATH_INGEST_ROOTS, checked for existence);
+    `run_id` is the instrument_run_id, resolved server-side against those roots
+    so a submitter names a run rather than a host path. Either way the response
+    echoes the resolved path, which is what goes into `action_context`.
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    path: Annotated[str, Field(min_length=1, pattern="^/")]
+    path: Annotated[str, Field(min_length=1, pattern="^/")] | None = None
+    run_id: Annotated[str, Field(min_length=1, max_length=MAX_NAME_LENGTH)] | None = None
     platform: Platform
+
+    @model_validator(mode="after")
+    def _exactly_one_locator(self) -> RunFolderInspectRequest:
+        if (self.path is None) == (self.run_id is None):
+            raise ValueError("provide exactly one of path or run_id")
+        return self
 
 
 class IlluminaRunInfo(BaseModel):

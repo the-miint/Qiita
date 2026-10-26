@@ -19,21 +19,25 @@ sequenceDiagram
     participant FS as Shared<br/>Filesystem
 
     Note over C,CP: 1. Upload request
-    C->>NX: REST: "upload amplicon data for study 42, prep 7" + JWT
+    C->>NX: POST /upload + JWT
     NX->>CP: route REST
-    CP->>PG_APP: validate access, create work ticket (PENDING)
-    CP-->>C: signed Flight ticket for DoPut
+    CP->>PG_APP: mint upload row (pending)
+    CP-->>C: upload_idx + signed Flight ticket for DoPut
 
     Note over C,DP: 2. Data upload
-    C->>NX: DoPut(signed_ticket) + JWT + FASTQ stream
+    C->>NX: DoPut(signed_ticket) + JWT + Arrow record-batch stream
     NX->>DP: route gRPC
     DP->>DP: verify JWT + ticket signature
-    DP->>FS: write FASTQ to /scratch/ephemeral/staging/ticket_001/
+    DP->>FS: write upload.parquet to PATH_SCRATCH/staging/uploads/<upload_idx>/
     DP-->>C: upload confirmed
 
-    Note over DP,CP: 3. Upload complete callback
-    DP->>CP: REST callback: upload complete, path=/scratch/ephemeral/staging/ticket_001/
-    CP->>PG_APP: update work ticket (UPLOADED)
+    Note over C,CP: 3. Upload done, work ticket submitted
+    C->>NX: POST /upload/{upload_idx}/done
+    NX->>CP: route REST
+    CP->>PG_APP: upload pending → ready
+    C->>NX: POST /work-ticket (action_context names the upload_idx)
+    NX->>CP: route REST
+    CP->>PG_APP: create work ticket (PENDING)
 
     Note over CP,CO: 4. Compute submission (CP drives; CO stateless)
     CP->>CO: POST /step/submit (work ticket X, step entry)
@@ -50,10 +54,10 @@ sequenceDiagram
     CP->>PG_APP: work_ticket_step (running); ticket PROCESSING
 
     Note over SL,FS: 6. SLURM execution
-    SL->>FS: read /scratch/ephemeral/staging/ticket_001/
+    SL->>FS: read PATH_SCRATCH/staging/uploads/<upload_idx>/
     SL->>SL: run amplicon processing workflow
-    SL->>FS: write /data/parquet/<table>/output.parquet
-    SL->>FS: stdout/stderr → /data/logs/ticket_001/step_n-98765.{out,err}
+    SL->>FS: write PATH_SCRATCH/ticket/<work_ticket_idx>/<step>/attempt-<N>/output/ (mode 440)
+    SL->>FS: stdout/stderr → PATH_SCRATCH/ticket/<work_ticket_idx>/<step>/attempt-<N>/logs/{stdout,stderr}
 
     Note over CP,CO: 7. Completion detection & file registration (CP-driven)
     CP->>CO: POST /step/status (handle)
@@ -61,10 +65,11 @@ sequenceDiagram
     SR-->>CO: state=COMPLETED, exit_code=0
     CO-->>CP: status=completed
     CP->>CO: POST /step/result (handle, status)
-    CO->>FS: verify output + manifest, collect log paths
+    CO->>FS: verify output + manifest + mode 440, collect log paths
     CO-->>CP: outputs={manifest, ...}
     CP->>PG_APP: work_ticket_step (completed)
     CP->>DP: register file into DuckLake
+    DP->>FS: move output into PATH_PERSISTENT/ducklake/<table>/<minted name>
     DP->>DP: CALL ducklake_add_data_files(catalog, T, path)<br/>(metadata only — no I/O, schema validated)
     DP-->>CP: file registered
     CP->>PG_APP: update work ticket (COMPLETED),<br/>record provenance + log paths
@@ -78,9 +83,9 @@ sequenceDiagram
 
 **Text flow:**
 
-1. **Upload request:** Client sends REST request to control plane with JWT. Control plane validates access, creates a work ticket (PENDING), and returns a signed Flight ticket authorizing a DoPut upload.
-2. **Data upload:** Client streams raw data (e.g., FASTQ) to the data plane via Arrow Flight DoPut through nginx. Data plane verifies JWT and ticket signature, writes data to the shared filesystem at a structured staging path.
-3. **Upload complete callback:** Data plane calls back to control plane with the staging path. Control plane updates the work ticket to UPLOADED.
+1. **Upload request:** Client calls `POST /upload` with its JWT. The control plane mints a `qiita.upload` row (`pending`) and returns its `upload_idx` with a signed Flight ticket authorizing one DoPut.
+2. **Data upload:** Client streams Arrow record batches to the data plane via Arrow Flight DoPut through nginx. The data plane verifies the JWT and ticket signature and writes `PATH_SCRATCH/staging/uploads/<upload_idx>/upload.parquet`.
+3. **Upload done, work ticket submitted:** The client calls `POST /upload/{upload_idx}/done` (`pending` → `ready`); the data plane does not call back. The client then submits a work ticket whose `action_context` names the `upload_idx`; the runner resolves it to the staged file before the first step and marks the upload `consumed` after the workflow succeeds (`runner/_upload.py`).
 4. **Compute submission:** Control plane calls `POST /step/submit`; the orchestrator `sbatch`es a SLURM job via slurmrestd. The job specifies a container image (e.g., `qiita-workflow-amplicon:v1.2.0`), input/output paths on the shared filesystem, and stdout/stderr log paths. SLURM jobs have no knowledge of the control plane — they are truly dumb (read input, process, write output, exit). The orchestrator returns a handle (SLURM job id + workspace paths) immediately; the CP persists it to `qiita.work_ticket_step` and updates the ticket to QUEUED. The orchestrator keeps no in-flight state.
 5. **Job monitoring:** The control plane polls `POST /step/status` (the orchestrator does a single slurmrestd read per call) at its own cadence. When the job transitions to RUNNING, the CP records it on `work_ticket_step` and updates the ticket to PROCESSING. A CO-unreachable error here is transient and retried in place, never failing the ticket.
 6. **SLURM execution:** The containerized workflow runs on the SLURM cluster, reading input from the staging path on the shared filesystem and writing Parquet results to the results path. Stdout/stderr are captured to log files on the shared filesystem.
@@ -119,29 +124,38 @@ Work ticket fields (per `qiita.work_ticket` migration `20260504000001_work_ticke
 - `action_id`, `action_version` — FK into `qiita.action`; pin the exact action definition this ticket was submitted against
 - `originator_principal_idx` — submitter; FK into `qiita.principal`
 - `scope_target_kind` plus one of `(study_idx, prep_idx)` or `reference_idx` — tagged-union scope target, governed by the `work_ticket_scope_target_consistent` CHECK
+- `shard_id` — the sharded-index fan-out discriminant; non-NULL only on a reference-scope ticket, NULL on every other kind (CHECK enforced)
+- `mask_idx` — the read-mask ticket's minted mask (FK to `qiita.mask_definition`); NULL on a ticket that mints no mask
 - `action_context` — JSONB validated at submission against `action.context_schema`
 - `state` — `pending` / `queued` / `processing` / `completed` / `failed`
 - `retry_count` — number of retry attempts so far (incremented on each PROCESSING → QUEUED retry)
 - `max_retries` — per-ticket retry budget (default 3, max 100)
+- `transient_reason` / `transient_since` — set while the runner is retrying a step in place: the reason, and when the current in-place retry began; both NULL when the ticket is not mid-retry
 - `failure_type` — `retriable` or `permanent`; non-NULL on FAILED, NULL otherwise (CHECK enforced)
 - `failure_stage` — coarse stage enum: `submission` / `step_run` / `finalize`
 - `failure_step_name` — YAML step name when `failure_stage = step_run`; NULL otherwise (CHECK enforced)
 - `failure_reason` — human-readable explanation
 - `created_at`, `updated_at` — timestamps
+- `on_success` — an optional follow-on `{action_id, action_version, action_context}` the control plane submits as the originator, on the same scope target, once the ticket COMPLETES (`qiita_control_plane.follow_on`; human submitters only). A follow-on may nest its own `on_success`: the created ticket arms the next link when it completes, so one submission runs a chain of stages in order (at most `MAX_FOLLOW_ON_CHAIN_DEPTH` deep). Each ticket still has exactly one immediate follow-on, so the outcome columns below are unchanged
+- `follow_on_work_ticket_idx` / `follow_on_error` — the follow-on's outcome, at most one set: the ticket it created (recorded in that ticket's INSERT transaction, so it is created at most once), or why it was refused
 
 The schema does not carry per-step provenance fields (slurm_job_id, log paths, current_step / total_steps, provenance JSONB, completed_at). The runner is synchronous and waits inline for each step; SLURM-side log retrieval is on the orchestrator and not surfaced on the work_ticket row.
 
-Failure classification is finer-grained at the backend layer: `BackendFailure.kind` is one of the values in `qiita_common.backend_failure.FailureKind` (NODE_FAIL, OOM_KILLED, PREEMPTED, TIMEOUT_BEFORE_START, TRANSIENT_FS_ERROR, SLURMRESTD_UNREACHABLE, PROCESS_RESTARTED for retriable; BAD_INPUT, EXIT_NONZERO, CONTRACT_VIOLATION, UNKNOWN_PERMANENT for permanent). The runner collapses these to the two-valued `failure_type` for storage; `failure_reason` carries the kind name + per-failure detail for triage.
+Failure classification is finer-grained at the backend layer: `BackendFailure.kind` is one of the values in `qiita_common.backend_failure.FailureKind` (NODE_FAIL, OOM_KILLED, PREEMPTED, TIMEOUT_BEFORE_START, TRANSIENT_FS_ERROR, SLURMRESTD_UNREACHABLE, ORCHESTRATOR_UNREACHABLE, CONTROL_PLANE_UNREACHABLE, PROCESS_RESTARTED, DATA_PLANE_TRANSIENT, EXTERNAL_FETCH_TRANSIENT, SEGFAULT for retriable; BAD_INPUT, EXIT_NONZERO, CONTRACT_VIOLATION, UNKNOWN_PERMANENT, and the runner-raised RESOURCE_CEILING_EXHAUSTED and RETRIES_EXHAUSTED for permanent). The runner collapses these to the two-valued `failure_type` for storage; `work_ticket` has no kind column (the per-attempt kind is stored in `work_ticket_step.failure_kind`), so a `RETRIES_EXHAUSTED` failure is identified by the `retries_exhausted` prefix of its `failure_reason` (`retries_exhausted (3/3); last failure [node_fail]: ...`); other reasons carry per-failure detail for triage.
 
 Retry semantics (implemented in `qiita_control_plane.runner._run_entry_with_retry`):
 - On `BackendFailure(transient=True)` and `retry_count < max_retries`: bump `retry_count`, atomically transition `PROCESSING → QUEUED → PROCESSING`, retry the same entry. Earlier successful entries are not re-run — `bound` outputs carry forward.
-- On `BackendFailure(transient=True)` with retries exhausted: transition to `FAILED` with `failure_type=retriable` (so post-mortems can distinguish "exhausted retries on a transient kind" from "permanent on first attempt").
+- On `BackendFailure(transient=True)` with retries exhausted: transition to `FAILED` with `failure_type=permanent` and kind `RETRIES_EXHAUSTED`, identified by the `retries_exhausted` prefix of `failure_reason`, which carries the last attempt's kind and reason, so the notify sweeper emails it. `failure_type=retriable` is left to failures outside the step retry loop (a transient runner DB error, a transient pre-loop resolver failure), which are held for a `/run` redrive.
 - On `BackendFailure(transient=False)`: skip the retry loop, transition straight to `FAILED` with `failure_type=permanent`.
 - On any other unwrapped `Exception` (LIBRARY primitive raising plain Python, programming bug): treat as `permanent`, `failure_type=permanent`, `failure_reason="<ExceptionType>: <message>"` truncated to 2000 chars.
 
 Manual restart (`POST /api/v1/work-ticket/{idx}/run` on a `FAILED` ticket):
 - Atomic UPDATE: state ← PENDING, `retry_count = 0`, all `failure_*` columns ← NULL (the DB CHECK requires `failure_*` all-NULL when state ≠ failed; the route clears them in one statement).
-- Triggers a fresh in-process dispatch via `schedule_dispatch`. The original FAILED-row state is not preserved on the row itself; ops dashboards that want post-mortem retention should snapshot the `failure_*` fields before triggering /run.
+- Triggers a fresh in-process dispatch via `schedule_dispatch`, which queues behind the process-wide dispatch cap below when all slots are held. The original FAILED-row state is not preserved on the row itself; ops dashboards that want post-mortem retention should snapshot the `failure_*` fields before triggering /run.
+- Entries with a `completed` step row are fast-forwarded, not re-run. A step row is read for the entry at its `step_index` only while that entry still has the row's `step_name` and kind (`step:` or `action:`), because workflow YAMLs are edited in place and re-synced (`step_progress.check_step_progress`). A ticket with a row that no longer matches — a step was inserted, removed, renamed or reordered ahead of it — is refused by `/run` with a 409 naming those rows, and fails permanently at `submission` when startup recovery resumes it; a new ticket is submitted in its place (a terminal ticket does not block one), or, for `read-mask-block`, its prep_samples are re-masked under a new mask version. `/run` also refuses a ticket whose `mask_idx` names a deprecated mask.
+- A `download-ena-study` redrive also drops completed step rows so the roster is re-read, and is refused (409) when a newer download ticket exists for the pool or a FAILED ticket still has a live job; see the [ENA import runbook](../runbooks/ena-import.md).
+
+**Dispatch concurrency.** Every dispatch path (route submit, ENA batch submit, startup reconcile, fan-out pump release) goes through `schedule_dispatch`, whose task holds one slot of the process-wide `_DISPATCH_CONCURRENCY` cap (8) for its whole workflow — an hours-long download poll included. Tasks past the cap queue FIFO and start as slots free, logging `queued behind the dispatch cap` when they start waiting and `dispatched after waiting` when they get one; nothing fails while it waits. Bounding in-flight workflows, not just connections, is the deliberate consequence: it is what keeps a burst of submits from pressuring the connection pool after `_STUDY_CONCURRENCY`'s permit has already been released at submit. Two behaviours follow that an operator should expect: a restart with more than 8 tickets in flight re-attaches the first 8 and queues the rest, and `/run` queues behind the same slots as ordinary submits. The cap is sized against the pool and `FANOUT_MAX_INFLIGHT` together — see the note on the constant.
 
 **Single-CP-process contract.** The control plane runs as a single
 `qiita-control-plane.service` instance. Dispatch tasks are bound to the
@@ -154,7 +168,16 @@ completed (rebuilding their `bound` outputs from the shared workspace),
 re-attaches a still-running SLURM job by its persisted `slurm_job_id` (or
 adopts an orphan by its deterministic name via `find-by-name`), finalizes a
 job that succeeded during the outage, and decides a purged job from its
-on-disk output manifest. This is the deliberate consequence of deploys
+on-disk output manifest. The startup hook then calls `reconcile_follow_ons`,
+which submits the follow-on of every completed ticket that records no outcome
+(one that completed while no process ran its completion hook, or whose
+submission failed with anything but a refusal). The same reconcile then runs on
+an interval from the `follow_on_sweeper` (once per `FOLLOW_ON_SWEEP_INTERVAL_SECONDS`),
+so a transiently-failed follow-on is retried within an interval rather than
+waiting for the next CP start. The sweeper takes no advisory lock (the submit
+path is create-at-most-once, so an overlapping reconcile is harmless; see
+`follow_on_sweeper`). The startup reconcile still runs first because it must be
+ordered after `reconcile_inflight_tickets`. This is the deliberate consequence of deploys
 stopping/starting CP+CO without draining — a restart with live in-flight
 work is routine, so it must never nuke running jobs (the pre-decoupling
 `recover_orphaned_tickets` blanket-failed them). The reconcile assumes no
@@ -165,18 +188,20 @@ restriction.
 ## ENA Study Import
 
 Admin-facing bulk import of public INSDC studies' metadata and reads, distinct
-from a workflow entry: `POST /api/v1/ena-import-batch` takes a list of study
+from a workflow entry: `POST /api/v1/ena-import-batch` takes a list of study or run
 accessions and returns immediately with a batch handle, while a background task
 (`qiita_control_plane.ena_import.batch`) resolves each accession's metadata (via
 `duckdb-miint`'s `read_ena` / `read_ena_attributes`), registers it into
 `study`/`biosample`/`sequenced_sample` rows (de-duplicating biosamples that share
 an ENA sample accession across studies), and submits one `download-ena-study`
-work ticket per `sequenced_pool` holding the study's runs (a re-import's new runs
+work ticket per `sequenced_pool` holding the study's runs, or a run-list item's
+listed runs (a re-import's new runs
 get a new pool once an earlier pool's download is under way). That ticket then
 runs like any other workflow: a native `ingest_ena_reads` step (`read_ena_sequences`
-+ the same mint-then-sort-and-assign pipeline `ingest_reads` uses) followed by the
-standard `register-files` action into DuckLake. One accession's failure — resolver
-error, unmappable platform, a DB conflict — is isolated to that accession; it never
++ the same mint-then-sort-and-assign pipeline `ingest_reads` uses), the standard
+`register-files` action into DuckLake, and `persist-ena-run-outcomes`, which records
+each run that could not be stored. One item's failure — resolver
+error, unmappable platform, a DB conflict — is isolated to that item; it never
 aborts the batch or its siblings. See
 [`docs/runbooks/ena-import.md`](../runbooks/ena-import.md) for the operator-facing
 walkthrough, the REST surface, and this surface's hard scope limits (INSDC only,
@@ -186,7 +211,7 @@ walkthrough, the REST surface, and this surface's hard scope limits (INSDC only,
 
 Separate Python service responsible for the full compute job lifecycle. SLURM-backend operational setup — cluster prerequisites, identity model, the `qiita-job` JWT auto-refresh timer — lives in [`docs/runbooks/slurm-backend-setup.md`](../runbooks/slurm-backend-setup.md).
 
-**Lifecycle ownership (decoupled).** The orchestrator is a stateless pass-through over three calls: `submit_step` `sbatch`es the job and returns a handle (SLURM job id + workspace paths); `status_step` is a single non-looping slurmrestd read; `result_step` verifies the output and returns it (or raises a classified `BackendFailure`). The **control plane** owns the poll loop between submit and result — it polls `status_step` at its own cadence (a ~10s constant) and persists per-step progress to `qiita.work_ticket_step`, so a long job never holds the CP→CO connection open and a CP restart can re-attach. A CO-unreachable error (transport / HTTP 5xx) during any of the three is transient and retried in place, never failing the ticket. SLURM jobs have no knowledge of the control plane — they are truly dumb (read input, process, write output, exit). As their final act before exiting, jobs must `chmod 440` all output files and write a manifest (see Container Contract below). The data plane enforces the permission check as a pre-registration gate.
+**Lifecycle ownership (decoupled).** The orchestrator is a stateless pass-through over three calls: `submit_step` `sbatch`es the job and returns a handle (SLURM job id + workspace paths); `status_step` is a single non-looping slurmrestd read; `result_step` verifies the output and returns it (or raises a classified `BackendFailure`). The **control plane** owns the poll loop between submit and result — it polls `status_step` at its own cadence (a ~10s constant) and persists per-step progress to `qiita.work_ticket_step`, so a long job never holds the CP→CO connection open and a CP restart can re-attach. A CO-unreachable error (transport / HTTP 5xx) during any of the three is transient and retried in place, never failing the ticket. SLURM jobs have no knowledge of the control plane — they are truly dumb (read input, process, write output, exit). As their final act before exiting, jobs must `chmod 440` all output files and write a manifest (see Container Contract below). The orchestrator checks the mode after the job exits (gate 3 of the output verification); the data plane does not check it when it registers a file.
 
 **Multi-step workflows:** Workflows consist of one or more sequential steps, each with independent resource requirements and a step type of `map` or `reduce`. Steps are submitted as separate SLURM jobs so each is sized for its actual resource needs.
 
@@ -205,9 +230,9 @@ Execution (the CP runner drives the per-step loop — `submit_step` → poll `st
 4. Advance `current_step` on the work ticket and continue
 5. After the final step, call back to the control plane to trigger data plane registration
 
-Intermediate outputs: `/scratch/ephemeral/staging/{ticket_id}/step_{n}/{prep_sample_idx}/` (map), `/scratch/ephemeral/staging/{ticket_id}/step_{n}/` (reduce). Final-step outputs land directly in `/data/parquet/{table}/` so the data plane can register them via in-place `ducklake_add_data_files` without a cross-filesystem move.
+Step outputs, intermediate and final, land in the step's per-attempt workspace, `PATH_SCRATCH/ticket/<work_ticket_idx>/<step>/attempt-<N>/` (see [Data Storage](storage.md#data-storage)). Jobs never write into the lake: registration has the data plane move each registered file from there into `PATH_PERSISTENT/ducklake/<table>/` and then call `ducklake_add_data_files`.
 
-Failure records which step failed (`failed_stage=processing_step_{n}`). Manual restart resets to step 0.
+Failure records which step failed (`failed_stage=processing_step_{n}`). A manual restart fast-forwards the entries that already completed (see "Manual restart" above).
 
 **Container contract:** Every workflow container must honour this interface regardless of what it does internally. Violations are rejected by the orchestrator's output verification gates and treated as permanent failures.
 
@@ -257,6 +282,8 @@ Orchestrator verification gates (all must pass before a step is accepted):
 4. The `outputs` map's relative paths resolve under `$QIITA_OUTPUT_PATH` (no traversal) and exist
 5. Every file under `$QIITA_OUTPUT_PATH` is mode `0o440` and is listed in `files` (no extras)
 
+A step re-read on a resume or redrive (`StepStatusWire.recovered`) skips the per-file gates, 3 and 5 above; `verify_container_output` (`slurm/verify.py`) says why.
+
 A gate failure after exit code 0 is a permanent failure — the container returned 0 but didn't honor the contract, so retry won't help. SlurmBackend wraps the resulting failures as `BackendFailure(kind=CONTRACT_VIOLATION, transient=False)`.
 
 **The same contract applies to native (`module:`) steps.** A native job returns a `dict[str, Path]`; the shared SLURM launcher (`jobs/__main__.py`) writes the manifest and chmods on the job's behalf, and the verifier gates it identically. Gate 4 has a consequence that is easy to trip over: **a declared step output must resolve under `$QIITA_OUTPUT_PATH`**, so a *persistent* artifact a job writes outside the per-attempt workspace — e.g. a host-filter index under `PATH_DERIVED` (see "Aligner Index Storage") — **cannot be a step output**. Record its location in an in-tree meta JSON instead (the consuming action reads `fs_path` from it, as `register-index` does for the rype/minimap2 indexes); the launcher rejects an out-of-tree output as a `CONTRACT_VIOLATION`. Note this only bites under SLURM: `LocalBackend` runs the job in-process and returns the dict directly without writing or verifying a manifest, so a bad output binding passes every local/unit test and only fails on a real submission.
@@ -269,7 +296,7 @@ A gate failure after exit code 0 is a permanent failure — the container return
 - Reports results back to control plane via REST callback after all steps pass
 - Shared filesystem assumed for all data I/O
 
-**Job logging:** SLURM captures stdout/stderr to files on the shared filesystem at `/data/logs/{study_id}/{prep_id}/{ticket_id}/step_{n}-{slurm_job_id}.{out,err}`. All step log paths are recorded on the work ticket.
+**Job logging:** SLURM captures stdout/stderr to `logs/stdout` and `logs/stderr` in the step attempt's workspace, `PATH_SCRATCH/ticket/<work_ticket_idx>/<step>/attempt-<N>/`. The path is derived from the workspace, not stored on the ticket; `GET /work-ticket/{idx}/step/{step_index}/logs` (`qiita ticket logs`) serves a bounded tail.
 
 **Workflow containerization:** Apptainer/Singularity for HPC compatibility. (Apptainer is the Linux Foundation continuation of Singularity; the `singularity` command is typically aliased to `apptainer`.)
 - Container images per workflow step, versioned (e.g., `qiita-workflow-amplicon:v1.2.0`)

@@ -15,7 +15,11 @@ connection so a caller can fold a progress write into a larger transaction.
 
 Recovery reads these rows via `load_step_progress` to decide,
 for a non-terminal ticket, which entries already completed (skip + rebuild
-`bound` from disk) and which to resume.
+`bound` from disk) and which to resume. A row is read for the entry at its
+`step_index` only while that entry still carries its `step_name` and is of the
+kind that wrote it (`check_step_progress`): the action's `steps:` list is edited in place and
+re-synced without a version bump, so a position recorded before an edit can
+name a different entry after it.
 """
 
 from __future__ import annotations
@@ -25,6 +29,7 @@ from dataclasses import dataclass
 from datetime import datetime
 
 import asyncpg
+from qiita_common.actions import BLOCK_MASK_ACTION_ID, WorkflowAction, WorkflowStep
 from qiita_common.models import ComputeTarget, StepProgressState
 
 # asyncpg accepts either a pool (auto-acquires a transient connection per
@@ -317,6 +322,68 @@ async def load_step_progress(executor: _Executor, work_ticket_idx: int) -> list[
         work_ticket_idx,
     )
     return [StepProgressRow.from_record(r) for r in rows]
+
+
+class StepProgressMismatch(Exception):
+    """A ticket's progress rows name entries its action's current `steps:` list
+    does not have at their recorded positions, so which entries already ran
+    cannot be decided from them."""
+
+
+def _runs_where_recorded(entry: WorkflowStep | WorkflowAction, row: StepProgressRow) -> bool:
+    """Whether `entry` is the kind of entry that writes `row`: an `action:` runs
+    on the control plane, a `step:` on a compute backend. A row matching an
+    entry by position and name but not by kind was written by a different entry."""
+    if isinstance(entry, WorkflowAction):
+        return row.compute_target is ComputeTarget.CONTROL_PLANE
+    return row.compute_target is not ComputeTarget.CONTROL_PLANE
+
+
+def _resubmit_advice(action_id: str) -> str:
+    """What to do with a ticket whose progress rows no longer match its steps."""
+    if action_id == BLOCK_MASK_ACTION_ID:
+        # The block planner refuses a fresh plan for a sample whose mask gate is
+        # still pending (`block_planner.BlockMaskResubmitError`), so a new block
+        # ticket for the same mask cannot be submitted.
+        return "re-mask its prep_samples under a new mask version instead"
+    return "submit a new ticket instead"
+
+
+def check_step_progress(
+    work_ticket_idx: int,
+    action_id: str,
+    rows: Sequence[StepProgressRow],
+    entries: Sequence[WorkflowStep | WorkflowAction],
+) -> None:
+    """Raise `StepProgressMismatch` when any of `rows` names an entry `entries`
+    does not have at the row's `step_index` (no entry there, one with another
+    name, or one of the other kind), naming those rows. The runner checks before
+    it resumes, and `/run` before it redrives, so a ticket that cannot resume is
+    refused rather than failed again.
+
+    Two entries may share a name (`action:` entries name their primitive), so an
+    edit that places another same-name entry at a recorded position is not
+    caught."""
+    unmatched = [
+        row
+        for row in rows
+        if row.step_index >= len(entries)
+        or entries[row.step_index].name != row.step_name
+        or not _runs_where_recorded(entries[row.step_index], row)
+    ]
+    if not unmatched:
+        return
+    described = "; ".join(
+        f"{r.step_name!r} at step {r.step_index} (attempt {r.attempt},"
+        f" {r.compute_target.value}, {r.state.value})"
+        for r in unmatched
+    )
+    raise StepProgressMismatch(
+        f"work_ticket {work_ticket_idx} has progress rows for entries the"
+        f" action's current steps list does not have at those positions: {described}."
+        " The workflow was edited after these rows were written, so the ticket"
+        f" cannot be resumed; {_resubmit_advice(action_id)}."
+    )
 
 
 def first_incomplete_step_index(rows: Sequence[StepProgressRow], total_steps: int) -> int:

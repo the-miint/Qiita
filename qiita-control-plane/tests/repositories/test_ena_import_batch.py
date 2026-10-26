@@ -10,8 +10,10 @@ unchanged -- this file only pins the query shapes these functions issue.
 import json
 import secrets
 
+import asyncpg
 import pytest
 import pytest_asyncio
+from qiita_common.models import FailureType
 from qiita_common.models.ena_import import BatchItemState
 
 from qiita_control_plane.repositories.ena_import_batch import (
@@ -20,14 +22,18 @@ from qiita_control_plane.repositories.ena_import_batch import (
     ena_import_created_study,
     fetch_ena_import_batch_items,
     fetch_inflight_ena_import_batch_items,
+    fetch_partial_download_counts,
+    fetch_pool_latest_download_ticket,
     fetch_sequenced_pool_download_states,
     fetch_work_ticket_states_for_idxs,
     insert_ena_import_batch,
     insert_ena_import_batch_item,
+    split_run_list_item,
     update_ena_import_batch_item_registered,
     update_ena_import_batch_item_state,
     update_ena_import_batch_item_study_created,
 )
+from qiita_control_plane.repositories.sequence_range import mint_sequence_range
 from qiita_control_plane.repositories.study import create_study
 from qiita_control_plane.testing.db_seeds import (
     delete_action_if_created,
@@ -36,7 +42,12 @@ from qiita_control_plane.testing.db_seeds import (
     seed_sequenced_sample_subtype,
     seed_user_principal,
 )
-from qiita_control_plane.testing.unique_names import unique_accession
+from qiita_control_plane.testing.db_teardown import (
+    delete_idxs,
+    delete_principal,
+    teardown_entity_graph,
+)
+from qiita_control_plane.testing.unique_names import unique_ena_accession
 
 pytestmark = pytest.mark.db
 
@@ -60,28 +71,20 @@ async def eib(postgres_pool):
         "created_studies": created_studies,
     }
 
-    # FK-reverse: batches first (CASCADE removes their items, which is what
-    # RESTRICTs a study delete), then studies, then the principal.
-    if created_batches:
-        await postgres_pool.execute(
-            "DELETE FROM qiita.ena_import_batch WHERE idx = ANY($1::bigint[])", created_batches
-        )
-    if created_studies:
-        await postgres_pool.execute(
-            "DELETE FROM qiita.study_access WHERE study_idx = ANY($1::bigint[])", created_studies
-        )
-        await postgres_pool.execute(
-            "DELETE FROM qiita.study WHERE idx = ANY($1::bigint[])", created_studies
-        )
-    await postgres_pool.execute("DELETE FROM qiita.user WHERE principal_idx = $1", principal_idx)
-    await postgres_pool.execute("DELETE FROM qiita.principal WHERE idx = $1", principal_idx)
+    # Batches go first so their items CASCADE away with them; the sweep would
+    # otherwise reach those items by study_idx and leave the batch behind.
+    await delete_idxs(postgres_pool, "ena_import_batch", created_batches)
+    await teardown_entity_graph(
+        postgres_pool, study_idxs=created_studies, biosample_idxs=[], prep_sample_idxs=[]
+    )
+    await delete_principal(postgres_pool, [principal_idx])
 
 
 async def _new_batch_item(eib, *, accession: str | None = None) -> tuple[int, int]:
     """insert_ena_import_batch + insert_ena_import_batch_item in one
     transaction, mirroring `ena_import.batch.create_ena_import_batch`'s own
     loop. Tracked for the `eib` fixture's teardown."""
-    accession = accession or unique_accession("PRJNA")
+    accession = accession or unique_ena_accession("PRJNA")
     pool = eib["pool"]
     async with pool.acquire() as conn, conn.transaction():
         batch_idx = await insert_ena_import_batch(
@@ -100,7 +103,7 @@ async def _new_batch_item(eib, *, accession: str | None = None) -> tuple[int, in
 
 
 async def test_insert_ena_import_batch_and_item_creates_rows(eib):
-    accession = unique_accession("PRJNA")
+    accession = unique_ena_accession("PRJNA")
     batch_idx, item_idx = await _new_batch_item(eib, accession=accession)
 
     batch_row = await eib["pool"].fetchrow(
@@ -133,7 +136,7 @@ async def test_insert_ena_import_batch_item_requires_transaction(eib):
     async with eib["pool"].acquire() as conn:
         with pytest.raises(RuntimeError):
             await insert_ena_import_batch_item(
-                conn, batch_idx=batch_idx, ena_study_accession=unique_accession("PRJNA")
+                conn, batch_idx=batch_idx, ena_study_accession=unique_ena_accession("PRJNA")
             )
 
 
@@ -186,7 +189,7 @@ async def _seed_study(eib) -> int:
             owner_idx=eib["principal_idx"],
             created_by_idx=eib["principal_idx"],
             title="eib repo test study",
-            bioproject_accession=unique_accession("PRJNA"),
+            bioproject_accession=unique_ena_accession("PRJNA"),
         )
     eib["created_studies"].append(row["idx"])
     return row["idx"]
@@ -304,7 +307,7 @@ async def test_fetch_ena_import_batch_items_orders_by_idx(eib):
         batch_idx = await insert_ena_import_batch(
             conn, submitted_by_principal_idx=eib["principal_idx"]
         )
-        accessions = [unique_accession("PRJNA") for _ in range(3)]
+        accessions = [unique_ena_accession("PRJNA") for _ in range(3)]
         item_idxs = [
             await insert_ena_import_batch_item(conn, batch_idx=batch_idx, ena_study_accession=a)
             for a in accessions
@@ -347,7 +350,8 @@ async def test_fetch_inflight_ena_import_batch_items_filters_by_state(eib):
 
 
 # ---------------------------------------------------------------------------
-# fetch_sequenced_pool_download_states / fetch_work_ticket_states_for_idxs
+# fetch_sequenced_pool_download_states / fetch_pool_latest_download_ticket /
+# fetch_work_ticket_states_for_idxs
 # ---------------------------------------------------------------------------
 
 
@@ -362,7 +366,7 @@ async def sequenced_pool_ctx(postgres_pool):
     biosample_idx, prep_sample_idx = await seed_biosample_with_sequenced_prep_sample(
         postgres_pool, owner_idx=principal_idx
     )
-    run_idx, pool_idx, sequenced_sample_idx = await seed_sequenced_sample_subtype(
+    run_idx, pool_idx, _sequenced_sample_idx = await seed_sequenced_sample_subtype(
         postgres_pool,
         prep_sample_idx=prep_sample_idx,
         owner_idx=principal_idx,
@@ -386,15 +390,15 @@ async def sequenced_pool_ctx(postgres_pool):
     await delete_action_if_created(
         postgres_pool, action_id=action_id, version=version, created=created
     )
-    await postgres_pool.execute(
-        "DELETE FROM qiita.sequenced_sample WHERE idx = $1", sequenced_sample_idx
+    await teardown_entity_graph(
+        postgres_pool,
+        study_idxs=[],
+        biosample_idxs=[biosample_idx],
+        prep_sample_idxs=[prep_sample_idx],
     )
-    await postgres_pool.execute("DELETE FROM qiita.sequenced_pool WHERE idx = $1", pool_idx)
-    await postgres_pool.execute("DELETE FROM qiita.sequencing_run WHERE idx = $1", run_idx)
-    await postgres_pool.execute("DELETE FROM qiita.prep_sample WHERE idx = $1", prep_sample_idx)
-    await postgres_pool.execute("DELETE FROM qiita.biosample WHERE idx = $1", biosample_idx)
-    await postgres_pool.execute("DELETE FROM qiita.user WHERE principal_idx = $1", principal_idx)
-    await postgres_pool.execute("DELETE FROM qiita.principal WHERE idx = $1", principal_idx)
+    await delete_idxs(postgres_pool, "sequenced_pool", pool_idx)
+    await delete_idxs(postgres_pool, "sequencing_run", run_idx)
+    await delete_principal(postgres_pool, [principal_idx])
 
 
 async def _seed_work_ticket(ctx, *, state: str = "pending") -> int:
@@ -445,6 +449,198 @@ async def test_fetch_sequenced_pool_download_states_reports_latest_ticket(sequen
         )
 
 
+async def _add_run(ctx, graphs, *, stored: bool = False, failed: bool = False) -> None:
+    pool = ctx["pool"]
+    biosample_idx, prep_sample_idx = await seed_biosample_with_sequenced_prep_sample(
+        pool, owner_idx=ctx["principal_idx"]
+    )
+    graphs.append((biosample_idx, prep_sample_idx))
+    await seed_sequenced_sample_subtype(
+        pool,
+        prep_sample_idx=prep_sample_idx,
+        owner_idx=ctx["principal_idx"],
+        sequenced_pool_item_id=f"item-{secrets.token_hex(4)}",
+        sequencing_run_idx=ctx["sequencing_run_idx"],
+        sequenced_pool_idx=ctx["sequenced_pool_idx"],
+    )
+    if stored:
+        await mint_sequence_range(
+            pool,
+            prep_sample_idx=prep_sample_idx,
+            count=10,
+            principal_idx=ctx["principal_idx"],
+            work_ticket_idx=None,
+        )
+    if failed:
+        await pool.execute(
+            "UPDATE qiita.sequenced_sample"
+            " SET download_failure_reason = 'no sequence data', download_failure_type = $2"
+            " WHERE prep_sample_idx = $1",
+            prep_sample_idx,
+            FailureType.PERMANENT.value,
+        )
+
+
+async def test_fetch_partial_download_counts_counts_failed_runs_without_reads(
+    sequenced_pool_ctx, eib
+):
+    ctx = sequenced_pool_ctx
+    graphs: list[tuple[int, int]] = []
+    ticket_idx = await _seed_work_ticket(ctx, state="completed")
+    try:
+        await _add_run(ctx, graphs, stored=True)
+        await _add_run(ctx, graphs, failed=True)
+        await _add_run(ctx, graphs, failed=True)
+        await _add_run(ctx, graphs, stored=True, failed=True)
+        older_batch, older_item = await _new_batch_item(eib)
+        newer_batch, newer_item = await _new_batch_item(eib)
+        async with ctx["pool"].acquire() as conn:
+            for item_idx in (older_item, newer_item):
+                await append_ena_import_batch_item_download_ticket(
+                    conn, item_idx=item_idx, ticket_idx=ticket_idx
+                )
+
+        counts = await fetch_partial_download_counts(ctx["pool"], ticket_idxs=[ticket_idx])
+
+        assert counts == {ticket_idx: (2, newer_batch)}
+        assert newer_batch > older_batch
+    finally:
+        await ctx["pool"].execute(
+            "DELETE FROM qiita.work_ticket WHERE work_ticket_idx = $1", ticket_idx
+        )
+        await teardown_entity_graph(
+            ctx["pool"],
+            study_idxs=[],
+            biosample_idxs=[b for b, _ in graphs],
+            prep_sample_idxs=[p for _, p in graphs],
+        )
+
+
+async def test_fetch_partial_download_counts_has_no_batch_when_no_item_names_the_ticket(
+    sequenced_pool_ctx,
+):
+    ctx = sequenced_pool_ctx
+    graphs: list[tuple[int, int]] = []
+    ticket_idx = await _seed_work_ticket(ctx, state="completed")
+    try:
+        await _add_run(ctx, graphs, failed=True)
+
+        counts = await fetch_partial_download_counts(ctx["pool"], ticket_idxs=[ticket_idx])
+
+        assert counts == {ticket_idx: (1, None)}
+    finally:
+        await ctx["pool"].execute(
+            "DELETE FROM qiita.work_ticket WHERE work_ticket_idx = $1", ticket_idx
+        )
+        await teardown_entity_graph(
+            ctx["pool"],
+            study_idxs=[],
+            biosample_idxs=[b for b, _ in graphs],
+            prep_sample_idxs=[p for _, p in graphs],
+        )
+
+
+async def test_fetch_partial_download_counts_reports_only_the_pools_newest_completed_ticket(
+    sequenced_pool_ctx,
+):
+    ctx = sequenced_pool_ctx
+    graphs: list[tuple[int, int]] = []
+    older_idx = await _seed_work_ticket(ctx, state="completed")
+    newer_idx = await _seed_work_ticket(ctx, state="completed")
+    try:
+        await _add_run(ctx, graphs, failed=True)
+
+        counts = await fetch_partial_download_counts(
+            ctx["pool"], ticket_idxs=[older_idx, newer_idx]
+        )
+
+        assert counts == {newer_idx: (1, None)}
+    finally:
+        await ctx["pool"].execute(
+            "DELETE FROM qiita.work_ticket WHERE work_ticket_idx = ANY($1::bigint[])",
+            [older_idx, newer_idx],
+        )
+        await teardown_entity_graph(
+            ctx["pool"],
+            study_idxs=[],
+            biosample_idxs=[b for b, _ in graphs],
+            prep_sample_idxs=[p for _, p in graphs],
+        )
+
+
+async def test_fetch_partial_download_counts_skips_fully_landed_and_unfinished_tickets(
+    sequenced_pool_ctx,
+):
+    ctx = sequenced_pool_ctx
+    graphs: list[tuple[int, int]] = []
+    landed_idx = await _seed_work_ticket(ctx, state="completed")
+    running_idx = await _seed_work_ticket(ctx, state="pending")
+    try:
+        await _add_run(ctx, graphs, stored=True)
+        assert (
+            await fetch_partial_download_counts(ctx["pool"], ticket_idxs=[landed_idx, running_idx])
+            == {}
+        )
+
+        await _add_run(ctx, graphs, failed=True)
+        assert await fetch_partial_download_counts(
+            ctx["pool"], ticket_idxs=[landed_idx, running_idx]
+        ) == {landed_idx: (1, None)}
+    finally:
+        await ctx["pool"].execute(
+            "DELETE FROM qiita.work_ticket WHERE work_ticket_idx = ANY($1::bigint[])",
+            [landed_idx, running_idx],
+        )
+        await teardown_entity_graph(
+            ctx["pool"],
+            study_idxs=[],
+            biosample_idxs=[b for b, _ in graphs],
+            prep_sample_idxs=[p for _, p in graphs],
+        )
+
+
+async def test_fetch_pool_latest_download_ticket_reports_newest(sequenced_pool_ctx):
+    ctx = sequenced_pool_ctx
+    older_idx = await _seed_work_ticket(ctx, state="completed")
+    newest_idx = await _seed_work_ticket(ctx, state="cancelled")
+    try:
+        ticket = await fetch_pool_latest_download_ticket(
+            ctx["pool"],
+            sequenced_pool_idx=ctx["sequenced_pool_idx"],
+            action_id=ctx["action_id"],
+            action_version=ctx["version"],
+        )
+        assert ticket["work_ticket_idx"] == newest_idx
+        assert ticket["work_ticket_state"] == "cancelled"
+
+        # Another action's tickets on the same pool are not this action's.
+        other = await fetch_pool_latest_download_ticket(
+            ctx["pool"],
+            sequenced_pool_idx=ctx["sequenced_pool_idx"],
+            action_id="some-other-action",
+            action_version=ctx["version"],
+        )
+        assert other is None
+    finally:
+        await ctx["pool"].execute(
+            "DELETE FROM qiita.work_ticket WHERE work_ticket_idx = ANY($1::bigint[])",
+            [older_idx, newest_idx],
+        )
+
+
+async def test_fetch_pool_latest_download_ticket_none_for_untouched_pool(sequenced_pool_ctx):
+    ctx = sequenced_pool_ctx
+    assert (
+        await fetch_pool_latest_download_ticket(
+            ctx["pool"],
+            sequenced_pool_idx=ctx["sequenced_pool_idx"],
+            action_id=ctx["action_id"],
+            action_version=ctx["version"],
+        )
+        is None
+    )
+
+
 async def test_fetch_work_ticket_states_for_idxs(sequenced_pool_ctx):
     ctx = sequenced_pool_ctx
     pending_idx = await _seed_work_ticket(ctx, state="pending")
@@ -473,3 +669,137 @@ async def test_fetch_work_ticket_states_for_idxs(sequenced_pool_ctx):
             "DELETE FROM qiita.work_ticket WHERE work_ticket_idx = ANY($1::bigint[])",
             [pending_idx, failed_idx],
         )
+
+
+# ---------------------------------------------------------------------------
+# run-list items
+# ---------------------------------------------------------------------------
+
+
+async def _new_run_list_item(eib, runs: list[str]) -> tuple[int, int]:
+    pool = eib["pool"]
+    async with pool.acquire() as conn, conn.transaction():
+        batch_idx = await insert_ena_import_batch(
+            conn, submitted_by_principal_idx=eib["principal_idx"]
+        )
+        item_idx = await insert_ena_import_batch_item(
+            conn, batch_idx=batch_idx, requested_run_accessions=runs
+        )
+    eib["created_batches"].append(batch_idx)
+    return batch_idx, item_idx
+
+
+async def test_insert_run_list_item_has_no_study_accession(eib):
+    batch_idx, item_idx = await _new_run_list_item(eib, ["ERR1", "ERR2"])
+    (row,) = await fetch_ena_import_batch_items(eib["pool"], batch_idx)
+    assert row["idx"] == item_idx
+    assert row["ena_study_accession"] is None
+    assert list(row["requested_run_accessions"]) == ["ERR1", "ERR2"]
+
+
+async def test_item_needs_a_study_accession_or_a_run_list(eib):
+    pool = eib["pool"]
+    async with pool.acquire() as conn, conn.transaction():
+        batch_idx = await insert_ena_import_batch(
+            conn, submitted_by_principal_idx=eib["principal_idx"]
+        )
+    eib["created_batches"].append(batch_idx)
+    async with pool.acquire() as conn, conn.transaction():
+        with pytest.raises(asyncpg.CheckViolationError, match="accession_or_runs"):
+            await insert_ena_import_batch_item(conn, batch_idx=batch_idx)
+
+
+async def test_item_run_list_must_be_nonempty(eib):
+    pool = eib["pool"]
+    async with pool.acquire() as conn, conn.transaction():
+        batch_idx = await insert_ena_import_batch(
+            conn, submitted_by_principal_idx=eib["principal_idx"]
+        )
+    eib["created_batches"].append(batch_idx)
+    async with pool.acquire() as conn, conn.transaction():
+        with pytest.raises(asyncpg.CheckViolationError, match="runs_nonempty"):
+            await insert_ena_import_batch_item(
+                conn,
+                batch_idx=batch_idx,
+                ena_study_accession=unique_ena_accession("PRJNA"),
+                requested_run_accessions=[],
+            )
+
+
+async def test_batch_holds_at_most_one_ungrouped_item(eib):
+    batch_idx, _ = await _new_run_list_item(eib, ["ERR1"])
+    async with eib["pool"].acquire() as conn, conn.transaction():
+        with pytest.raises(asyncpg.UniqueViolationError, match="one_ungrouped_per_batch"):
+            await insert_ena_import_batch_item(
+                conn, batch_idx=batch_idx, requested_run_accessions=["ERR2"]
+            )
+
+
+async def test_split_run_list_item_keeps_the_original_row_as_the_first_group(eib):
+    pool = eib["pool"]
+    batch_idx, item_idx = await _new_run_list_item(eib, ["ERR1", "ERR2", "ERR3"])
+    first, second = unique_ena_accession("PRJEB"), unique_ena_accession("PRJEB")
+
+    async with pool.acquire() as conn, conn.transaction():
+        idxs = await split_run_list_item(
+            conn, item_idx=item_idx, groups=[(first, ["ERR1", "ERR3"]), (second, ["ERR2"])]
+        )
+
+    rows = await fetch_ena_import_batch_items(pool, batch_idx)
+    assert idxs is not None and idxs[0] == item_idx
+    assert [r["idx"] for r in rows] == idxs
+    assert [r["ena_study_accession"] for r in rows] == [first, second]
+    assert [list(r["requested_run_accessions"]) for r in rows] == [["ERR1", "ERR3"], ["ERR2"]]
+    assert {r["state"] for r in rows} == {BatchItemState.PENDING.value}
+
+
+async def test_split_run_list_item_is_atomic(eib):
+    pool = eib["pool"]
+    batch_idx, item_idx = await _new_run_list_item(eib, ["ERR1", "ERR2"])
+    first = unique_ena_accession("PRJEB")
+
+    with pytest.raises(asyncpg.CheckViolationError):
+        async with pool.acquire() as conn, conn.transaction():
+            await split_run_list_item(
+                conn,
+                item_idx=item_idx,
+                groups=[(first, ["ERR1"]), (unique_ena_accession("PRJEB"), [])],
+            )
+
+    (row,) = await fetch_ena_import_batch_items(pool, batch_idx)
+    assert row["ena_study_accession"] is None
+    assert list(row["requested_run_accessions"]) == ["ERR1", "ERR2"]
+
+
+async def test_split_run_list_item_second_call_is_a_noop(eib):
+    pool = eib["pool"]
+    batch_idx, item_idx = await _new_run_list_item(eib, ["ERR1", "ERR2"])
+    groups = [(unique_ena_accession("PRJEB"), ["ERR1"]), (unique_ena_accession("PRJEB"), ["ERR2"])]
+    async with pool.acquire() as conn, conn.transaction():
+        await split_run_list_item(conn, item_idx=item_idx, groups=groups)
+    async with pool.acquire() as conn, conn.transaction():
+        again = await split_run_list_item(conn, item_idx=item_idx, groups=groups)
+
+    assert again is None
+    assert len(await fetch_ena_import_batch_items(pool, batch_idx)) == 2
+
+
+async def test_split_run_list_item_requires_transaction(eib):
+    _, item_idx = await _new_run_list_item(eib, ["ERR1"])
+    async with eib["pool"].acquire() as conn:
+        with pytest.raises(RuntimeError):
+            await split_run_list_item(
+                conn, item_idx=item_idx, groups=[(unique_ena_accession("PRJEB"), ["ERR1"])]
+            )
+
+
+async def test_inflight_items_carry_the_run_list(eib):
+    batch_idx, item_idx = await _new_run_list_item(eib, ["ERR1"])
+    rows = [
+        r
+        for r in await fetch_inflight_ena_import_batch_items(eib["pool"])
+        if r["batch_idx"] == batch_idx
+    ]
+    assert [
+        (r["idx"], r["ena_study_accession"], list(r["requested_run_accessions"])) for r in rows
+    ] == [(item_idx, None, ["ERR1"])]

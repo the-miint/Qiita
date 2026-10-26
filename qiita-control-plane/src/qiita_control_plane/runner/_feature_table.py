@@ -381,8 +381,8 @@ async def _stage_denovo_genome_quality(
     Postgres column (`fetch_assembly_genome_subject` carries that).
 
     Signed in-process rather than through a route, like the adapter set and the shard
-    roster: no route mints a `bin_quality` ticket, so this resolver is the only path
-    to the table.
+    roster: the one route that mints a `bin_quality` ticket is the human assembly run
+    mint, one prep_sample per ticket, where this reads a whole cohort in one stream.
 
     Read AFTER the map export, in a separate transaction. Nothing deletes from
     `qiita.assembly_membership` or `qiita.genome` on any production path, so the two

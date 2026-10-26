@@ -15,6 +15,7 @@ different questions, and the tests below are organized by which:
 import json
 import secrets
 
+import asyncpg
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
@@ -33,6 +34,9 @@ from qiita_control_plane.repositories.mask_definition import (
 from qiita_control_plane.testing.db_seeds import (
     seed_biosample_with_sequenced_prep_sample,
 )
+from qiita_control_plane.testing.db_teardown import teardown_entity_graph
+
+from .conftest import DEPRECATION_FIELDS, INVALIDATION_FIELDS, PARTIAL_PROVENANCE, set_provenance
 
 pytestmark = pytest.mark.db
 
@@ -94,14 +98,13 @@ async def lifecycle(postgres_pool, human_admin_session):
         "ps_done": ps_done,
         "ps_pending": ps_pend,
     }
-    await postgres_pool.execute("DELETE FROM qiita.mask_sample WHERE mask_idx = $1", mask_idx)
+    await teardown_entity_graph(
+        postgres_pool,
+        study_idxs=[],
+        biosample_idxs=[bs_done, bs_pend],
+        prep_sample_idxs=[ps_done, ps_pend],
+    )
     await postgres_pool.execute("DELETE FROM qiita.mask_definition WHERE mask_idx = $1", mask_idx)
-    await postgres_pool.execute(
-        "DELETE FROM qiita.prep_sample WHERE idx = ANY($1::bigint[])", [ps_done, ps_pend]
-    )
-    await postgres_pool.execute(
-        "DELETE FROM qiita.biosample WHERE idx = ANY($1::bigint[])", [bs_done, bs_pend]
-    )
 
 
 async def _deprecate(client, mask_idx, reason="rype_classify scored wrongly"):
@@ -475,12 +478,18 @@ async def test_align_planning_refuses_a_deprecated_mask(postgres_pool, client, l
         owner_idx=lifecycle["principal_idx"],
         sequenced_pool_item_id=f"item-{secrets.token_hex(4)}",
     )
+    # The control below needs reference resolution to be what fails, and any
+    # fixed idx stops being bogus if some other test using this database mints it.
+    bogus_reference_idx = (
+        await postgres_pool.fetchval("SELECT COALESCE(MAX(reference_idx), 0) FROM qiita.reference")
+        + 1_000_000
+    )
     try:
         kwargs = dict(
             app=None,
             sequencing_run_idx=run_idx,
             sequenced_pool_idx=pool_idx,
-            reference_idx=1,
+            reference_idx=bogus_reference_idx,
             mask_idx=lifecycle["mask_idx"],
             only_missing=False,
             originator_principal_idx=lifecycle["principal_idx"],
@@ -548,3 +557,27 @@ async def test_lifecycle_patches_require_the_lifecycle_scope(
     assert status_resp.status_code == 403
     assert sample_resp.status_code == 403
     assert json.loads(status_resp.text)["detail"]
+
+
+@pytest.mark.parametrize("subset", PARTIAL_PROVENANCE)
+async def test_a_live_config_cannot_hold_some_deprecation_fields(postgres_pool, lifecycle, subset):
+    assignments = set_provenance(DEPRECATION_FIELDS, subset, lifecycle["principal_idx"])
+    with pytest.raises(asyncpg.CheckViolationError):
+        await postgres_pool.execute(
+            f"UPDATE qiita.mask_definition SET {assignments} WHERE mask_idx = $1",
+            lifecycle["mask_idx"],
+        )
+
+
+@pytest.mark.parametrize("state", ["completed", "pending"])
+@pytest.mark.parametrize("subset", PARTIAL_PROVENANCE)
+async def test_a_live_run_cannot_hold_some_invalidation_fields(
+    postgres_pool, lifecycle, state, subset
+):
+    assignments = set_provenance(INVALIDATION_FIELDS, subset, lifecycle["principal_idx"])
+    with pytest.raises(asyncpg.CheckViolationError):
+        await postgres_pool.execute(
+            f"UPDATE qiita.mask_sample SET {assignments} WHERE mask_idx = $1 AND state = $2",
+            lifecycle["mask_idx"],
+            state,
+        )

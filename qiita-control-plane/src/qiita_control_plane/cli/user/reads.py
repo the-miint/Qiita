@@ -38,17 +38,18 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from qiita_common.actions import BAM_TO_PARQUET_ACTION_ID, FASTQ_TO_PARQUET_ACTION_ID
 from qiita_common.api_paths import URL_WORK_TICKET_PREFIX
 from qiita_common.models import ScopeTargetKind, WorkTicketCreateRequest, WorkTicketState
 
 from . import _common
 
-# Pinned here rather than taken from a flag: this gesture knows which workflow
+# Fixed here rather than taken from a flag: this gesture knows which workflow
 # loads reads, and an operator who needs a different one has `qiita ticket
 # submit`. Bumping a workflow's version means bumping it here.
-_FASTQ_ACTION_ID = "fastq-to-parquet"
+_FASTQ_ACTION_ID = FASTQ_TO_PARQUET_ACTION_ID
 _FASTQ_ACTION_VERSION = "1.3.0"
-_BAM_ACTION_ID = "bam-to-parquet"
+_BAM_ACTION_ID = BAM_TO_PARQUET_ACTION_ID
 _BAM_ACTION_VERSION = "1.0.0"
 
 # Suffixes that decide which loader a file goes to. Checked against the
@@ -223,8 +224,9 @@ async def _run_submit_reads(*, base_url: str, token: str, args: argparse.Namespa
 
 def _handle_submit_reads(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
     """Entry point for `qiita submit-reads`. Local validation runs before the
-    PAT is read so a bad filename costs no network call; every known failure
-    shape becomes exit 1 with a one-line stderr message."""
+    PAT is read so a bad filename costs no network call, and exits 2 through
+    argparse; every other known failure exits 1 with a stderr message, not a
+    traceback."""
     import httpx as _httpx
     import pyarrow.flight as _flight
 
@@ -251,7 +253,10 @@ def _handle_submit_reads(args: argparse.Namespace, parser: argparse.ArgumentPars
     try:
         result = asyncio.run(_run_submit_reads(base_url=args.base_url, token=token, args=args))
     except _httpx.HTTPStatusError as exc:
-        print(f"http error {exc.response.status_code}: {exc.response.text}", file=sys.stderr)
+        _common.print_http_status_error(exc.response)
+        return 1
+    except _httpx.RequestError as exc:
+        _common.print_request_error(exc)
         return 1
     except _flight.FlightError as exc:
         # FlightError is not a RuntimeError subclass, so the catch-all below

@@ -18,10 +18,18 @@
 
 use duckdb::Connection;
 
-/// Characters disallowed in connection strings and paths interpolated into SQL.
-/// DuckDB ATTACH does not support parameterized queries, so we validate inputs
+/// Characters disallowed in any value interpolated into a DuckDB SQL literal —
+/// connection strings and data paths for ATTACH, and the pool's resource
+/// settings for SET. Neither statement takes parameters, so inputs are validated
 /// before interpolation. This is input validation, not sanitization.
-fn validate_sql_literal(value: &str, field: &str) -> Result<(), String> {
+///
+/// These three are sufficient for that one job: without a quote or a semicolon a
+/// value cannot close the literal and start a statement. Probed on DuckDB 1.5.5 —
+/// a value ending in a backslash is taken literally, so it does not escape the
+/// closing quote the way it would in a backslash-escaping dialect. What the
+/// values must otherwise look like is DuckDB's business: a `memory_limit` it
+/// cannot parse fails the pool's first instance build, which fails boot.
+pub(crate) fn validate_sql_literal(value: &str, field: &str) -> Result<(), String> {
     if value.contains('\'') || value.contains(';') || value.contains('\0') {
         return Err(format!(
             "{field} contains disallowed characters (single quote, semicolon, or null byte)"
@@ -30,11 +38,12 @@ fn validate_sql_literal(value: &str, field: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Parquet row-group size (rows) DuckLake should use when it rewrites the chunked
-/// sequence tables. Must equal `qiita_common.chunking.CHUNK_ROW_GROUP_SIZE`: the
-/// orchestrator writes those chunk Parquets at this row count
-/// (`PARQUET_OPTS_CHUNKED` `ROW_GROUP_SIZE`), and the per-table `set_option` calls
-/// below pin DuckLake's own rewrites to the same layout.
+/// Parquet row-group size (rows) DuckLake uses when it rewrites the chunked sequence
+/// tables: `qiita_common.chunking.CHUNK_ROW_GROUP_SIZE`, ~1 GB of dense 64 KB chunks. The
+/// chunk files the orchestrator registers into those tables do not use it; their sorted
+/// writer sizes row groups from the chunks' width
+/// (`qiita_common.parquet.sorted_row_group_size`). A qiita-common test parses this line
+/// and pins it to the Python constant.
 const CHUNK_ROW_GROUP_SIZE: u64 = 16384;
 
 /// How long boot keeps re-running the catalog setup while other data-plane
@@ -118,16 +127,10 @@ fn setup_catalog_once(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let conn = Connection::open_in_memory()?;
     connect_ducklake(&conn, catalog_connstr, data_path)?;
+    // Catalog-global Parquet defaults: set once here, never per attach (see
+    // set_catalog_options).
     set_catalog_options(&conn)?;
-    ensure_reference_tables(&conn)?;
-    ensure_read_tables(&conn)?;
-    ensure_alignment_tables(&conn)?;
-    ensure_assembly_tables(&conn)?;
-    // The row concurrent registrations into the replace-keyed tables contend
-    // for. Seeded here so no request path has to create it.
-    ensure_registration_lock(&conn)?;
-    // Must run after reference + alignment tables — the `_visible` views join them.
-    ensure_exclusion_tables(&conn)?;
+    ensure_lake_tables(&conn)?;
     Ok(())
 }
 
@@ -150,24 +153,33 @@ pub fn connect_ducklake(
     Ok(())
 }
 
+/// The zstd level for data at rest: a copy of
+/// `qiita_common.parquet.PARQUET_COMPRESSION_LEVEL_AT_REST`, which carries the
+/// measurements behind it. Rust cannot import the Python, so a qiita-common test parses
+/// this line and pins the two equal.
+const PARQUET_COMPRESSION_LEVEL_AT_REST: u8 = 16;
+
 /// Set the catalog-global Parquet options DuckLake uses for its OWN writes
-/// (compaction, merge, any future direct insert), aligning them with how
-/// register_files writes our files: `qiita_common.parquet.PARQUET_OPTS` is
-/// zstd + Parquet v2, whereas DuckLake defaults to snappy + v1. Without this,
-/// DuckLake's maintenance rewrites would drift from the register-time format.
+/// (compaction, merge, direct inserts), aligning them with how register_files
+/// writes our files: `qiita_common.parquet.PARQUET_OPTS_AT_REST` is zstd at
+/// PARQUET_COMPRESSION_LEVEL_AT_REST + Parquet v2, whereas DuckLake defaults to
+/// snappy + v1. Without this, DuckLake's maintenance rewrites would drift from the
+/// register-time format.
 ///
 /// These options are PERSISTED in `ducklake_metadata` (catalog-global), so they
 /// only need to be set ONCE per catalog. Call this on the PROCESS-START
-/// connection only — NEVER on a per-request attach. Setting it on every attach
-/// made each concurrent Flight request UPDATE the same `ducklake_metadata` row,
-/// which serialized and failed under load with Postgres SQLSTATE 40001
-/// (`could not serialize access due to concurrent update`). Keep the values in
-/// sync with PARQUET_OPTS.
+/// connection only — NEVER where an attach happens per request or per pooled
+/// connection. Setting it on every attach made
+/// each concurrent Flight request UPDATE the same `ducklake_metadata` row, which
+/// serialized and failed under load with Postgres SQLSTATE 40001
+/// (`could not serialize access due to concurrent update`). A qiita-common test
+/// parses the three values below and pins them to PARQUET_OPTS_AT_REST.
 pub fn set_catalog_options(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
-    conn.execute_batch(
+    conn.execute_batch(&format!(
         "CALL qiita_lake.set_option('parquet_compression', 'zstd');
-         CALL qiita_lake.set_option('parquet_version', 2);",
-    )?;
+         CALL qiita_lake.set_option('parquet_compression_level', {PARQUET_COMPRESSION_LEVEL_AT_REST});
+         CALL qiita_lake.set_option('parquet_version', 2);"
+    ))?;
     Ok(())
 }
 
@@ -299,8 +311,7 @@ pub fn ensure_reference_tables(conn: &Connection) -> Result<(), Box<dyn std::err
             attributes MAP(VARCHAR, VARCHAR)
         );",
     )?;
-    // Pin DuckLake's own rewrites of the chunk table to the row-group the chunk
-    // writer uses (see CHUNK_ROW_GROUP_SIZE).
+    // Pin DuckLake's own rewrites of the chunk table (see CHUNK_ROW_GROUP_SIZE).
     conn.execute_batch(&format!(
         "CALL qiita_lake.set_option('parquet_row_group_size', {CHUNK_ROW_GROUP_SIZE}, \
          table_name => 'reference_sequence_chunks');"
@@ -425,7 +436,7 @@ pub fn ensure_read_tables(conn: &Connection) -> Result<(), Box<dyn std::error::E
         -- invariant (routes/read_masked.py) stays as defence in depth but is no
         -- longer the only thing between a mis-signed ticket and every study's reads.
         --
-        -- Needs DuckDB >= 1.5 (we pin libduckdb 1.5.4): on 1.4 this CREATE fails
+        -- Needs DuckDB >= 1.5: on 1.4 this CREATE fails
         -- outright with `DuckLake does not support functions`, so the parameterized
         -- form is not available on an older engine at all.
         --
@@ -860,8 +871,7 @@ pub fn ensure_assembly_tables(conn: &Connection) -> Result<(), Box<dyn std::erro
          ALTER TABLE qiita_lake.assembly_membership ADD COLUMN IF NOT EXISTS depth DOUBLE;
          ALTER TABLE qiita_lake.assembly_membership ADD COLUMN IF NOT EXISTS mult DOUBLE;",
     )?;
-    // Pin DuckLake's own rewrites of the chunk table to the row-group the chunk
-    // writer uses (see CHUNK_ROW_GROUP_SIZE).
+    // Pin DuckLake's own rewrites of the chunk table (see CHUNK_ROW_GROUP_SIZE).
     conn.execute_batch(&format!(
         "CALL qiita_lake.set_option('parquet_row_group_size', {CHUNK_ROW_GROUP_SIZE}, \
          table_name => 'assembled_sequence_chunks');"
@@ -869,13 +879,57 @@ pub fn ensure_assembly_tables(conn: &Connection) -> Result<(), Box<dyn std::erro
     Ok(())
 }
 
-/// Create the one row that registrations into the replace-keyed tables
-/// serialize on, and seed it.
+/// per-sample ASV feature counts from a deblur run: feature membership plus
+/// abundance, keyed by `processing_idx` (the run) and `feature_idx` (the ASV);
+/// plus the ASV sequences themselves (`amplicon_sequence` +
+/// `amplicon_sequence_chunks`, keyed by feature_idx, mirroring the assembly
+/// tables) so an ASV never has to be recomputed to read back. the derived
+/// closed-reference feature table aggregates membership; it is never itself
+/// stored. membership is replace-keyed on `(prep_sample_idx, processing_idx)`
+/// and the sequence tables on `feature_idx` in
+/// `flight_service::REPLACE_KEY_TABLES`, so a re-run replaces its own rows.
+pub fn ensure_amplicon_tables(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS qiita_lake.amplicon_membership (
+            prep_sample_idx BIGINT NOT NULL,
+            processing_idx BIGINT NOT NULL,
+            feature_idx BIGINT NOT NULL,
+            count BIGINT NOT NULL
+        );
+
+        -- One row per UNIQUE ASV (content-hash deduped), keyed by feature_idx.
+        -- Mirrors assembled_sequence: length here, bytes in the chunks table.
+        CREATE TABLE IF NOT EXISTS qiita_lake.amplicon_sequence (
+            feature_idx BIGINT NOT NULL,
+            sequence_hash UUID NOT NULL,
+            sequence_length_bp BIGINT NOT NULL
+        );
+
+        -- The ASV bytes in 64 KB chunks (reassemble with
+        -- string_agg(chunk_data, '' ORDER BY chunk_index)). Mirrors
+        -- assembled_sequence_chunks; loaded multi-file (a <table>/ subdir of parts).
+        CREATE TABLE IF NOT EXISTS qiita_lake.amplicon_sequence_chunks (
+            feature_idx BIGINT NOT NULL,
+            chunk_index INTEGER NOT NULL,
+            chunk_data VARCHAR NOT NULL
+        );",
+    )?;
+    // Pin DuckLake's own rewrites of the chunk table (see CHUNK_ROW_GROUP_SIZE).
+    conn.execute_batch(&format!(
+        "CALL qiita_lake.set_option('parquet_row_group_size', {CHUNK_ROW_GROUP_SIZE}, \
+         table_name => 'amplicon_sequence_chunks');"
+    ))?;
+    Ok(())
+}
+
+/// Create the one row the lake writers that take `registration_lock` serialize
+/// on, and seed it.
 ///
-/// Why a lock is needed at all, and what it buys, lives at the one site that
-/// takes it — `flight_service::register_files`. What matters here is the shape:
-/// EXACTLY ONE row, holding a value nothing reads. `register_files` fails loudly
-/// if its UPDATE matches no row, because a lock that silently stopped locking
+/// Why a lock is needed at all, and what it buys, lives where it is taken —
+/// `flight_service::register_files` and `flight_service::delete_reference`, both
+/// through `take_registration_lock`. What matters here is the shape: EXACTLY ONE
+/// row, holding a value nothing reads. `take_registration_lock` fails loudly if
+/// its UPDATE matches no row, because a lock that silently stopped locking
 /// reintroduces the duplication this table exists to prevent.
 ///
 /// The seeding INSERT is guarded so a restart does not add a second row. Two data
@@ -891,6 +945,22 @@ pub fn ensure_registration_lock(conn: &Connection) -> Result<(), Box<dyn std::er
         INSERT INTO qiita_lake.registration_lock (epoch)
         SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM qiita_lake.registration_lock);",
     )?;
+    Ok(())
+}
+
+/// Create every lake table the data plane relies on. This is the one list of
+/// them: a caller that needs a catalog shaped like a deploy's calls this rather
+/// than combining the `ensure_*` functions itself.
+pub fn ensure_lake_tables(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
+    ensure_reference_tables(conn)?;
+    ensure_read_tables(conn)?;
+    ensure_alignment_tables(conn)?;
+    ensure_assembly_tables(conn)?;
+    ensure_amplicon_tables(conn)?;
+    // The lock row is seeded here so no request path has to create it.
+    ensure_registration_lock(conn)?;
+    // Must run after reference + alignment tables — the `_visible` views join them.
+    ensure_exclusion_tables(conn)?;
     Ok(())
 }
 
@@ -939,42 +1009,45 @@ mod tests {
         TEST_ID.fetch_add(1, Ordering::Relaxed) as i64
     }
 
-    fn test_catalog_connstr() -> String {
-        // Fallback matches the Docker-compose Postgres at `:5433` so
-        // local Docker-mode runs work without setting the env var. The
-        // Makefile's test-integration recipe in host-Postgres mode (CI
-        // macOS, dev macOS without Docker) sets the env var explicitly
-        // to `:5432`. Tests that mutate this env var must use
-        // `EnvSnapshot` (see main.rs::tests) so they don't leak the
-        // default-only state into other `#[serial]` tests.
-        std::env::var("DUCKLAKE_CATALOG_CONNSTR").unwrap_or_else(|_| {
-            "dbname=qiita_ducklake host=localhost port=5433 user=qiita password=qiita".to_string()
-        })
-    }
-
+    #[cfg(feature = "integration")]
     fn setup_conn() -> Connection {
         let conn = Connection::open_in_memory().expect("open in-memory DuckDB");
-        let connstr = test_catalog_connstr();
-        // `/ducklake` must match config.rs's PATH_PERSISTENT/ducklake derivation.
-        let data_path = std::env::var("PATH_PERSISTENT")
-            .map(|base| format!("{base}/ducklake"))
-            .unwrap_or_else(|_| "/tmp/qiita-integration-ducklake-data".to_string());
-        std::fs::create_dir_all(&data_path).unwrap();
+        let connstr = crate::test_catalog::connstr();
+        let data_path = crate::test_catalog::data_path();
         connect_ducklake(&conn, &connstr, &data_path)
             .expect("failed to connect DuckLake — check DUCKLAKE_CATALOG_CONNSTR");
         // This helper mirrors the production BOOT connection (main.rs): it creates
-        // the tables AND sets the catalog-global Parquet options once. connect_ducklake
-        // no longer does. The options persist in the shared Postgres catalog, so
-        // per-request connections (flight_service, in tests as in production) inherit
-        // them and correctly do NOT re-set them.
+        // the tables AND sets the catalog-global Parquet options once, which
+        // connect_ducklake does not. The options persist in the shared Postgres
+        // catalog, so a pooled connection (flight_service, in tests as in
+        // production) inherits them and correctly does NOT re-set them.
         set_catalog_options(&conn).expect("failed to set catalog options");
         conn
+    }
+
+    /// DuckLake's own writes (inserts, compaction) land in the lake as data at rest, so
+    /// the boot connection's catalog options carry the level the job-side writers use.
+    #[test]
+    #[serial]
+    #[cfg(feature = "integration")]
+    fn catalog_options_set_the_at_rest_compression_level() {
+        let conn = setup_conn();
+        let value: String = conn
+            .query_row(
+                "SELECT value FROM qiita_lake.options() \
+                 WHERE option_name = 'parquet_compression_level' AND scope = 'GLOBAL'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("parquet_compression_level is not set on the catalog");
+        assert_eq!(value, PARQUET_COMPRESSION_LEVEL_AT_REST.to_string());
     }
 
     /// `(column_name, data_type, is_nullable)` for one `qiita_lake` table, in
     /// declared order, for the schema-drift assertions below. `is_nullable` is
     /// carried because NOT NULL is a property both alignment DDLs argue for
     /// explicitly; without it, dropping every NOT NULL leaves these tests green.
+    #[cfg(feature = "integration")]
     fn table_schema(conn: &Connection, table: &str) -> Vec<(String, String, String)> {
         let mut stmt = conn
             .prepare(
@@ -993,6 +1066,7 @@ mod tests {
     /// Uses format! for SQL — safe because table/column are &'static str from
     /// compile-time constants in the test code, and id is an integer.
     /// This pattern is test-only and must not be copied to production code.
+    #[cfg(feature = "integration")]
     struct Cleanup<'a> {
         conn: &'a Connection,
         table: &'static str,
@@ -1000,6 +1074,7 @@ mod tests {
         id: i64,
     }
 
+    #[cfg(feature = "integration")]
     impl Drop for Cleanup<'_> {
         fn drop(&mut self) {
             let _ = self.conn.execute_batch(&format!(
@@ -1613,6 +1688,23 @@ mod tests {
     #[test]
     #[serial]
     #[cfg(feature = "integration")]
+    fn ensure_amplicon_tables_is_idempotent() {
+        let conn = setup_conn();
+        ensure_amplicon_tables(&conn).expect("first ensure_amplicon_tables");
+        ensure_amplicon_tables(&conn).expect("second ensure_amplicon_tables (idempotent)");
+        let mut stmt = conn
+            .prepare(
+                "SELECT count(*) FROM information_schema.tables \
+                 WHERE table_name = 'amplicon_membership'",
+            )
+            .unwrap();
+        let n: i64 = stmt.query_row([], |row| row.get(0)).unwrap();
+        assert_eq!(n, 1, "amplicon_membership table should exist exactly once");
+    }
+
+    #[test]
+    #[serial]
+    #[cfg(feature = "integration")]
     fn ensure_assembly_tables_is_idempotent() {
         // Re-running on every DP restart must be a no-op (CREATE TABLE IF NOT
         // EXISTS), and every table must exist and be queryable afterwards.
@@ -2107,6 +2199,12 @@ mod tests {
     /// Uses `stream_arrow`, the streaming form `stream_ducklake_batches` uses in
     /// production — the materialising `query_arrow` is a different execution mode
     /// and could order differently.
+    ///
+    /// This runs at DuckDB's default, `preserve_insertion_order=true`, which is
+    /// not what a production DoGet runs under: the pool turns it off
+    /// (`pool::LakePool::apply_settings`). An encoding that consumes scan order
+    /// has to set it on its own path, and this is the measurement of what it
+    /// would then get.
     #[test]
     #[serial]
     #[cfg(feature = "integration")]
@@ -2138,14 +2236,8 @@ mod tests {
         }
 
         let ordered = |sql: &str| -> (usize, usize, usize) {
-            let schema = {
-                let mut probe = conn
-                    .prepare(&format!("SELECT * FROM ({sql}) AS _p LIMIT 0"))
-                    .expect("prepare probe");
-                probe.query_arrow([]).expect("probe").get_schema()
-            };
             let mut stmt = conn.prepare(sql).expect("prepare");
-            let stream = stmt.stream_arrow([], schema).expect("stream_arrow");
+            let stream = stmt.stream_arrow([]).expect("stream_arrow");
             let mut seen = Vec::new();
             let mut batches = 0usize;
             for batch in stream {

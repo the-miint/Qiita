@@ -14,8 +14,10 @@ The data plane is deployed as systemd instances of the `qiita-data-plane@.servic
 qiita/
 ├── Makefile                        # unified entry point: build, test, lint, deploy, migrate
 ├── .github/
+│   ├── pull_request_template.md    # PR description skeleton, incl. the Reviewer loop block
 │   └── workflows/
-│       └── ci.yml                  # lint + unit/integration tests across components (no CI deploy)
+│       ├── ci.yml                  # lint + unit/integration tests across components (no CI deploy)
+│       └── review-loop-check.yml   # the PR description carries the Reviewer loop block
 ├── qiita-common/
 │   ├── pyproject.toml              # shared Pydantic models, config, client utilities
 │   └── src/
@@ -60,7 +62,7 @@ qiita/
 │   │           ├── biosample.py             # biosample import + study-scoped metadata / field routes
 │   │           ├── host_filter_profile.py   # read-only host-filter profile catalog
 │   │           ├── prep_protocol.py         # prep-protocol discovery for the bcl-convert flow
-│   │           ├── prep_sample.py           # prep-sample reads, retirement, study-local field create
+│   │           ├── prep_sample.py           # prep-sample reads, retirement, study-local field CRUD
 │   │           ├── read.py                  # block-read DoGet ticket minting
 │   │           ├── read_masked.py           # mask_idx minting + masked-read DoGet ticket
 │   │           ├── reference.py             # reference CRUD, membership, genome/feature minting
@@ -104,7 +106,7 @@ qiita/
 │   │       │   ├── __main__.py     # `python -m` SLURM launcher (params.json → run_native_job)
 │   │       │   └── fastq_to_parquet.py  # native job: FASTQ → Parquet via DuckDB + miint
 │   │       │                            # (per-sample, sequenced_sample-scoped)
-│   │       ├── miint.py            # shared miint install + DuckDB-conn helpers, PARQUET_OPTS
+│   │       ├── miint.py            # shared miint install + DuckDB-conn helpers; re-exports the Parquet option sets
 │   │       └── slurm/
 │   │           ├── client.py       # slurmrestd REST client
 │   │           ├── contract.py     # shared constants + JobParams: EXPECTED_FILE_MODE,
@@ -128,9 +130,9 @@ qiita/
 │       └── test_system_gg2_backbone.py  # @pytest.mark.system; real GG2 backbone
 ├── workflows/
 │   ├── amplicon/
-│   │   ├── Apptainer.def           # container definition (single image for all steps)
-│   │   ├── workflow.yaml           # ordered steps: name, type (map|reduce), entrypoint, resources
-│   │   └── scripts/                # per-step entrypoints and helpers
+│   │   └── 1.0.0.yaml              # versioned amplicon denoise workflow
+│   ├── golay-demux/
+│   │   └── 1.0.0.yaml              # versioned bcl-convert + Golay demux workflow
 │   └── reference-add/
 │       └── 1.0.0.yaml              # versioned reference-ingest workflow
 ├── deploy/
@@ -215,9 +217,6 @@ test-workflows:
 		exit 0; \
 	fi; \
 	set -ex; \
-	apptainer build --force /tmp/qiita-workflow-smoke.sif workflows/amplicon/Apptainer.def; \
-	apptainer exec /tmp/qiita-workflow-smoke.sif echo "hello world"; \
-	rm -f /tmp/qiita-workflow-smoke.sif; \
 	smoke_derived=$$(mktemp -d); trap 'rm -rf "$$smoke_derived"' EXIT; \
 	mkdir -p "$$smoke_derived/images"; \
 	PATH_DERIVED="$$smoke_derived" bash scripts/build-sif.sh _sif-build-smoke
@@ -305,45 +304,8 @@ clean:
 
 ## CI (GitHub Actions)
 
-```yaml
-# .github/workflows/ci.yml
-name: CI
-on: [push, pull_request]
+CI is two workflows. [`.github/workflows/ci.yml`](../../.github/workflows/ci.yml) lints, builds and tests. [`.github/workflows/review-loop-check.yml`](../../.github/workflows/review-loop-check.yml) checks the pull request description. Where a workflow's comments give the reason for a job or step, that comment is the one place it is written, so this section does not copy it. What the files cannot say about themselves:
 
-jobs:
-  lint:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - run: make lint
-
-  test-unit:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - run: make test
-
-  test-integration:
-    runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: postgres:17
-        env:
-          POSTGRES_PASSWORD: test
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-    steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - run: make test-integration
-```
+- **Jobs.** In `ci.yml`, the `config` job runs first and picks the OS list. `lint-python` and `rust` follow, then `test-python`, `test-control-plane-with-db`, `test-integration` and `test-workflows`, each waiting on the jobs named in its `needs:`. `deploy-note-check` and `changelog-check` run on pull requests only. `review-loop-check.yml` has the one job of that name, also on pull requests only. It requires the `## Reviewer loop` block in the description (see "Reviewing a branch" in `CLAUDE.md`).
+- **OS matrix.** A pull request runs the matrix jobs on Ubuntu only. A push to `main` runs them on Ubuntu and macOS. `test-workflows` is always Ubuntu-only.
+- **Labels.** `ci-macos` adds macOS to a pull request's matrix. `no-deploy-note` skips `deploy-note-check`, `no-changelog` skips `changelog-check`, and `no-agent-review` skips `review-loop-check`.

@@ -172,6 +172,30 @@ def test_detail_rows_are_one_per_line():
     assert "Generated at 2026-07-01 12:30:45 UTC." in lines
 
 
+def test_partial_download_row_flags_failed_runs_and_batch_in_text_and_html():
+    rendered = render_work_ticket_digest(
+        recipient="pi@example.org",
+        tickets=[
+            {**_ticket(1, action_id="download-ena-study"), "failed_runs": 3, "batch_idx": 7},
+            {**_ticket(2, action_id="download-ena-study"), "failed_runs": 1, "batch_idx": None},
+            _ticket(3, action_id="download-ena-study"),
+        ],
+        generated_at=_GENERATED_AT,
+        active_rows=[],
+        held_total=0,
+    )
+    lines = rendered.text.splitlines()
+    assert (
+        "  - ticket 1: download-ena-study v1 -> completed,"
+        " partial: 3 runs failed (see qiita ena-import-status 7)"
+    ) in lines
+    assert "  - ticket 2: download-ena-study v1 -> completed, partial: 1 run failed" in lines
+    assert "  - ticket 3: download-ena-study v1 -> completed" in lines
+    assert "partial: 3 runs failed" in rendered.html
+    assert "qiita ena-import-status 7" in rendered.html
+    assert rendered.html.count("partial:") == 2
+
+
 def test_active_count_reported_in_body_and_subject():
     # A digest sent mid-fanout must say where in the batch the recipient is, not
     # just what terminalized.
@@ -217,9 +241,9 @@ def test_held_for_redrive_bucket_is_reported():
         held_total=3,
     )
     assert "No other work tickets of yours are still active." in rendered.text
-    assert "3 held after exhausting infrastructure retries" in rendered.text
+    assert "3 held after an infrastructure failure" in rendered.text
     assert "qiita ticket run" in rendered.text
-    assert "3 held after exhausting infrastructure retries" in rendered.html
+    assert "3 held after an infrastructure failure" in rendered.html
     # The redrive hint is a literal in the HTML, so its angle brackets escape.
     assert "<idx>" not in rendered.html
     assert "&lt;idx&gt;" in rendered.html
@@ -233,8 +257,8 @@ def test_no_held_tickets_renders_no_redrive_line():
         active_rows=[],
         held_total=0,
     )
-    assert "held after exhausting" not in rendered.text
-    assert "held after exhausting" not in rendered.html
+    assert "held after an infrastructure" not in rendered.text
+    assert "held after an infrastructure" not in rendered.html
 
 
 def test_active_states_listed_in_lifecycle_order():

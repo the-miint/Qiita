@@ -24,11 +24,17 @@ from pathlib import Path
 
 import asyncpg
 import pytest
-from qiita_common.actions import LONG_READ_ASSEMBLY_ACTION_ID
+from qiita_common.actions import (
+    FASTQ_TO_PARQUET_ACTION_ID,
+    LONG_READ_ASSEMBLY_ACTION_ID,
+    READ_MASK_ACTION_ID,
+)
+from qiita_common.api_paths import LibraryPrimitive
 from qiita_common.backend_failure import BackendFailure, FailureKind, StepNoData
 from qiita_common.models import (
     ComputeTarget,
     FoundJobWire,
+    ScopeTargetKind,
     StepHandleWire,
     StepProgressState,
     StepStatus,
@@ -39,6 +45,8 @@ from qiita_common.models import (
 from qiita_common.testing.containers import REFERENCE_HASH_CONTAINER, REFERENCE_LOAD_CONTAINER
 
 from qiita_control_plane import step_progress
+from qiita_control_plane.actions.library import QcProducer
+from qiita_control_plane.testing.db_teardown import delete_principal, teardown_entity_graph
 
 pytestmark = pytest.mark.db
 
@@ -627,6 +635,28 @@ async def test_refuses_unknown_ticket(postgres_pool, tmp_path):
         await _run(999_999_999, postgres_pool, FakeBackendClient(), tmp_path)
 
 
+@pytest.mark.parametrize(
+    "kind",
+    [
+        ScopeTargetKind.PREP_SAMPLE.value,
+        ScopeTargetKind.BLOCK.value,
+        ScopeTargetKind.REFERENCE.value,
+    ],
+)
+def test_barcode_map_requires_a_sequenced_pool_scope(kind):
+    """A barcode_map workflow is a sequenced_pool's roster: the scope guard accepts
+    a sequenced_pool and refuses every other scope as the submitter's bad input,
+    before the resolver reads the pool keys a non-pool scope_target lacks."""
+    from qiita_control_plane.runner._workflow import _require_sequenced_pool_scope
+
+    _require_sequenced_pool_scope({"kind": ScopeTargetKind.SEQUENCED_POOL.value})  # no raise
+    with pytest.raises(BackendFailure) as exc:
+        _require_sequenced_pool_scope({"kind": kind})
+    assert exc.value.kind == FailureKind.BAD_INPUT
+    assert "must be scoped to a sequenced_pool" in exc.value.reason
+    assert kind in exc.value.reason
+
+
 async def test_register_files_globs_staging_dir(
     postgres_pool, pending_work_ticket, library_spy, tmp_path
 ):
@@ -962,13 +992,12 @@ async def test_retry_uses_isolated_per_attempt_workspace(
     assert not (workspace / "hash" / "attempt-1" / "partial.parquet").exists()
 
 
-async def test_retry_exhausted_marks_failed_with_retriable_type(
+async def test_retry_exhausted_marks_failed_with_permanent_type(
     postgres_pool, pending_work_ticket, library_spy, tmp_path
 ):
     """Transient failures keep retrying until retry_count == max_retries,
-    then transition to FAILED with failure_type='retriable' (the
-    distinguishing post-mortem signal: retries-exhausted vs
-    permanent-on-first-attempt)."""
+    then transition to FAILED with failure_type='permanent' so the notify
+    sweeper emails it; the reason keeps the last attempt's kind."""
     from qiita_common.backend_failure import BackendFailure, FailureKind
 
     workspace_root = tmp_path / "ws"
@@ -993,10 +1022,11 @@ async def test_retry_exhausted_marks_failed_with_retriable_type(
     )
     assert row["state"] == "failed"
     assert row["retry_count"] == row["max_retries"] == 3
-    assert row["failure_type"] == "retriable"
+    assert row["failure_type"] == "permanent"
     assert row["failure_stage"] == "step_run"
     assert row["failure_step_name"] == "hash"
-    assert "node_fail" in row["failure_reason"]
+    exhausted = FailureKind.RETRIES_EXHAUSTED.value
+    assert row["failure_reason"].startswith(f"{exhausted} (3/3); last failure [node_fail]")
     # 4 total attempts: 1 initial + 3 retries.
     assert backend.attempts["hash"] == 4
 
@@ -2276,6 +2306,197 @@ async def test_run_action_primitive_finalize_mask_sample_dispatches(monkeypatch,
     )
     assert out == {}
     assert recorded == {"mask_idx": 77, "prep_sample_idx": 5}
+
+
+async def test_run_action_primitive_persist_syndna_read_count_dispatches(monkeypatch, tmp_path):
+    """The persist-syndna-read-count arm passes the runner-bound mask_idx, the scope
+    target's prep_sample_idx and the `alignment` binding's path."""
+    from pathlib import Path
+
+    from qiita_common.actions import WorkflowAction
+    from qiita_common.api_paths import LibraryPrimitive
+
+    from qiita_control_plane.actions import library
+    from qiita_control_plane.runner import _run_action_primitive
+
+    recorded: dict = {}
+
+    async def fake_persist(pool, *, mask_idx, prep_sample_idx, alignment_path):
+        recorded.update(
+            mask_idx=mask_idx, prep_sample_idx=prep_sample_idx, alignment_path=alignment_path
+        )
+        return 10
+
+    monkeypatch.setitem(library.LIBRARY, LibraryPrimitive.PERSIST_SYNDNA_READ_COUNT, fake_persist)
+
+    entry = WorkflowAction(
+        kind="action", name="persist-syndna-read-count", inputs=["alignment"], outputs=[]
+    )
+    alignment = tmp_path / "syndna_alignment.parquet"
+    out = await _run_action_primitive(
+        None,
+        entry,
+        {"mask_idx": 77, "alignment": str(alignment)},
+        tmp_path,
+        {"kind": "prep_sample", "prep_sample_idx": 5},
+        work_ticket_idx=9,
+        signing_key=b"sekret",
+        data_plane_url="grpc://dp:50051",
+    )
+    assert out == {}
+    assert recorded == {"mask_idx": 77, "prep_sample_idx": 5, "alignment_path": Path(alignment)}
+
+
+@pytest.mark.parametrize(
+    ("inputs", "scope", "match"),
+    [
+        (["read_mask"], {"kind": "prep_sample", "prep_sample_idx": 5}, "expects inputs"),
+        (["alignment"], {"kind": "block", "block_idx": 42}, "prep_sample-scoped"),
+    ],
+)
+async def test_run_action_primitive_persist_syndna_read_count_rejects_a_bad_entry(
+    tmp_path, inputs, scope, match
+):
+    from qiita_common.actions import WorkflowAction
+
+    from qiita_control_plane.runner import _run_action_primitive
+
+    entry = WorkflowAction(
+        kind="action", name="persist-syndna-read-count", inputs=inputs, outputs=[]
+    )
+    with pytest.raises(RuntimeError, match=match):
+        await _run_action_primitive(
+            None,
+            entry,
+            {"mask_idx": 1, "alignment": "x", "read_mask": "x"},
+            tmp_path,
+            scope,
+            work_ticket_idx=1,
+            signing_key=b"x",
+            data_plane_url="grpc://x",
+        )
+
+
+@pytest.mark.parametrize(
+    ("name", "inputs", "required"),
+    [
+        ("plan-shards", [], "reference"),
+        ("finalize-shard", [], "reference"),
+        ("persist-ena-run-outcomes", ["run_outcomes"], "sequenced_pool"),
+        ("persist-syndna-read-count", ["alignment"], "prep_sample"),
+        ("delete-alignment-block", [], "block"),
+        ("reconcile-alignment-block", [], "block"),
+        ("finalize-alignment-sample", [], "prep_sample"),
+        ("delete-alignment-sample", [], "prep_sample"),
+        ("finalize-mask-sample", [], "prep_sample"),
+        ("finalize-assembly-sample", [], "prep_sample"),
+        ("persist-qc-checks", ["qc_checks"], "prep_sample"),
+        ("reconcile-block", [], "block"),
+        ("delete-block-mask", [], "block"),
+    ],
+)
+async def test_run_action_primitive_refuses_a_wrongly_scoped_ticket(
+    tmp_path, name, inputs, required
+):
+    from qiita_common.actions import WorkflowAction
+
+    from qiita_control_plane.runner import _run_action_primitive
+
+    wrong = "block" if required != "block" else "reference"
+    entry = WorkflowAction(kind="action", name=name, inputs=inputs, outputs=[])
+    with pytest.raises(RuntimeError) as exc:
+        await _run_action_primitive(
+            None,
+            entry,
+            {"shard_index": True, "run_outcomes": "x", "alignment": "x"},
+            tmp_path,
+            {"kind": wrong},
+            work_ticket_idx=1,
+            signing_key=b"x",
+            data_plane_url="grpc://x",
+        )
+    assert str(exc.value) == f"{name} requires a {required}-scoped ticket; got {wrong!r}"
+
+
+async def test_run_action_primitive_persist_qc_checks_dispatches(monkeypatch, tmp_path):
+    """The persist-qc-checks arm passes the ticket idx, the scope target's prep_sample_idx
+    and the `qc_checks` binding's path."""
+    from pathlib import Path
+
+    from qiita_common.actions import WorkflowAction
+    from qiita_common.api_paths import LibraryPrimitive
+
+    from qiita_control_plane.actions import library
+    from qiita_control_plane.actions.library import QcProducer
+    from qiita_control_plane.runner import _run_action_primitive
+    from qiita_control_plane.runner._reconstruct import QC_PRODUCER_BINDING
+
+    recorded: dict = {}
+
+    async def fake_persist(
+        pool, *, work_ticket_idx, prep_sample_idx, qc_checks_path, expected_producer
+    ):
+        recorded.update(
+            work_ticket_idx=work_ticket_idx,
+            prep_sample_idx=prep_sample_idx,
+            qc_checks_path=qc_checks_path,
+            expected_producer=expected_producer,
+        )
+        return 3
+
+    monkeypatch.setitem(library.LIBRARY, LibraryPrimitive.PERSIST_QC_CHECKS, fake_persist)
+
+    entry = WorkflowAction(
+        kind="action", name="persist-qc-checks", inputs=["qc_checks"], outputs=[]
+    )
+    sidecar = tmp_path / "qc_checks.json"
+    out = await _run_action_primitive(
+        None,
+        entry,
+        {"qc_checks": str(sidecar), QC_PRODUCER_BINDING: QcProducer.ALIGNMENT},
+        tmp_path,
+        {"kind": "prep_sample", "prep_sample_idx": 5},
+        work_ticket_idx=9,
+        signing_key=b"sekret",
+        data_plane_url="grpc://dp:50051",
+    )
+    assert out == {}
+    assert recorded == {
+        "work_ticket_idx": 9,
+        "prep_sample_idx": 5,
+        "qc_checks_path": Path(sidecar),
+        "expected_producer": QcProducer.ALIGNMENT,
+    }
+
+
+@pytest.mark.parametrize(
+    ("inputs", "scope", "match"),
+    [
+        (["alignment"], {"kind": "prep_sample", "prep_sample_idx": 5}, "expects inputs"),
+        (["qc_checks"], {"kind": "block", "block_idx": 42}, "prep_sample-scoped"),
+    ],
+)
+async def test_run_action_primitive_persist_qc_checks_rejects_a_bad_entry(
+    tmp_path, inputs, scope, match
+):
+    from qiita_common.actions import WorkflowAction
+
+    from qiita_control_plane.actions.library import QcProducer
+    from qiita_control_plane.runner import _run_action_primitive
+    from qiita_control_plane.runner._reconstruct import QC_PRODUCER_BINDING
+
+    entry = WorkflowAction(kind="action", name="persist-qc-checks", inputs=inputs, outputs=[])
+    with pytest.raises(RuntimeError, match=match):
+        await _run_action_primitive(
+            None,
+            entry,
+            {"qc_checks": "x", "alignment": "x", QC_PRODUCER_BINDING: QcProducer.NONE},
+            tmp_path,
+            scope,
+            work_ticket_idx=1,
+            signing_key=b"x",
+            data_plane_url="grpc://x",
+        )
 
 
 async def test_run_action_primitive_finalize_mask_sample_rejects_non_prep_sample_scope(tmp_path):
@@ -4230,8 +4451,12 @@ async def test_fastq_to_parquet_v12_qc_binds_adapter_and_instrument_model(
             "DELETE FROM qiita.action WHERE action_id = 'fastq-to-parquet' AND version = $1",
             version,
         )
-        await postgres_pool.execute("DELETE FROM qiita.prep_sample WHERE idx = $1", prep_sample_idx)
-        await postgres_pool.execute("DELETE FROM qiita.biosample WHERE idx = $1", _bio_idx)
+        await teardown_entity_graph(
+            postgres_pool,
+            study_idxs=[],
+            biosample_idxs=[_bio_idx],
+            prep_sample_idxs=[prep_sample_idx],
+        )
 
 
 async def test_run_workflow_fails_ticket_on_host_filter_resolution_error(
@@ -4334,6 +4559,7 @@ class FakeSlurmBackendClient:
         # or on a dead one.
         self.status_handles: list = []
         self.result_handles: list = []
+        self.result_statuses: list[StepStatusWire] = []
 
     async def submit_step(
         self,
@@ -4378,6 +4604,7 @@ class FakeSlurmBackendClient:
     async def result_step(self, handle, status):
         self.result_calls += 1
         self.result_handles.append(handle)
+        self.result_statuses.append(status)
         item = self.result_script.pop(0) if self.result_script else {}
         if isinstance(item, BackendFailure):
             raise item
@@ -4842,6 +5069,42 @@ async def test_resume_skips_terminal_attempt_and_adopts_the_live_one(
     assert backend.result_handles[0].output_path.endswith("attempt-1/output")
 
 
+async def test_resume_with_terminal_attempt_and_spent_budget_fails_retries_exhausted(
+    postgres_pool, slurm_ticket, tmp_path
+):
+    """A restart that finds only a dead attempt and no retry budget left must not
+    buy a fresh submit; it fails permanent with the RETRIES_EXHAUSTED prefix."""
+    await _mark_processing(postgres_pool, slurm_ticket)
+    await _seed_submitted_step(postgres_pool, slurm_ticket, step_name="compute", slurm_job_id=905)
+    await step_progress.record_failed(
+        postgres_pool,
+        work_ticket_idx=slurm_ticket,
+        step_index=0,
+        attempt=0,
+        failure_kind=FailureKind.NODE_FAIL.value,
+        failure_reason="NODE_FAIL (simulated)",
+    )
+    await postgres_pool.execute(
+        "UPDATE qiita.work_ticket SET retry_count = max_retries WHERE work_ticket_idx = $1",
+        slurm_ticket,
+    )
+
+    backend = FakeSlurmBackendClient(status_script=[], result_script=[])
+    with pytest.raises(BackendFailure) as exc:
+        await _run(slurm_ticket, postgres_pool, backend, tmp_path / "ws", resume=True)
+
+    assert exc.value.kind is FailureKind.RETRIES_EXHAUSTED
+    assert backend.submit_calls == 0
+    row = await postgres_pool.fetchrow(
+        "SELECT state, failure_type, failure_reason FROM qiita.work_ticket"
+        " WHERE work_ticket_idx = $1",
+        slurm_ticket,
+    )
+    assert row["state"] == "failed"
+    assert row["failure_type"] == "permanent"
+    assert row["failure_reason"].startswith(f"{FailureKind.RETRIES_EXHAUSTED.value} (3/3)")
+
+
 async def test_resume_never_started_runs_from_scratch(postgres_pool, slurm_ticket, tmp_path):
     """A ticket orphaned right after PENDING → PROCESSING with no progress rows
     runs from step 0 — resume degrades to a normal dispatch."""
@@ -5235,12 +5498,100 @@ async def test_resume_multi_step_rebuilds_bound_and_skips_completed_action(
     assert [c[0] for c in library_spy.calls] == []
     # Only the final step submitted fresh; compute was reconstructed, not resubmitted.
     assert backend.submit_calls == 1
+    # The reconstruct is marked as a re-read, so the orchestrator checks the
+    # declared outputs rather than files a later step may have moved; the fresh
+    # step's result is not.
+    assert [s.recovered for s in backend.result_statuses] == [True, False]
     # All three entries end completed in the progress table.
     rows = await step_progress.load_step_progress(postgres_pool, multi_step_ticket)
     by_index = {r.step_index: r for r in rows}
     assert by_index[0].state is StepProgressState.COMPLETED
     assert by_index[1].state is StepProgressState.COMPLETED
     assert by_index[2].state is StepProgressState.COMPLETED
+
+
+async def test_resume_fails_a_ticket_whose_completed_entry_moved(
+    postgres_pool, multi_step_ticket, library_spy, tmp_path
+):
+    """Rows written under an earlier steps list, where mint-features sat at
+    index 2 (a since-removed entry at index 1 never wrote a row), resume against
+    the current list where index 2 is `finish`. The row names an entry the list
+    no longer has at that position, so the ticket fails at submission rather
+    than skipping `finish` as done."""
+    await _mark_processing(postgres_pool, multi_step_ticket)
+    await _seed_submitted_step(
+        postgres_pool, multi_step_ticket, step_name="compute", slurm_job_id=951, step_index=0
+    )
+    await step_progress.record_running(
+        postgres_pool, work_ticket_idx=multi_step_ticket, step_index=0, attempt=0
+    )
+    await step_progress.record_completed(
+        postgres_pool, work_ticket_idx=multi_step_ticket, step_index=0, attempt=0
+    )
+    await step_progress.record_submitting(
+        postgres_pool,
+        work_ticket_idx=multi_step_ticket,
+        step_index=2,
+        attempt=0,
+        step_name="mint-features",
+        compute_target=ComputeTarget.CONTROL_PLANE,
+    )
+    await step_progress.record_completed(
+        postgres_pool, work_ticket_idx=multi_step_ticket, step_index=2, attempt=0
+    )
+
+    backend = FakeSlurmBackendClient(status_script=[], result_script=[])
+    with pytest.raises(BackendFailure):
+        await _run(multi_step_ticket, postgres_pool, backend, tmp_path / "ws", resume=True)
+
+    row = await postgres_pool.fetchrow(
+        "SELECT state, failure_type, failure_stage, failure_reason"
+        " FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+        multi_step_ticket,
+    )
+    assert row["state"] == "failed"
+    assert row["failure_type"] == "permanent"
+    assert row["failure_stage"] == "submission"
+    assert "'mint-features' at step 2" in row["failure_reason"]
+    assert "submit a new ticket instead" in row["failure_reason"]
+    assert backend.submit_calls == 0
+    assert library_spy.calls == []
+
+
+async def test_resume_fails_a_ticket_whose_rows_name_a_removed_entry(
+    postgres_pool, multi_step_ticket, library_spy, tmp_path
+):
+    """A completed row for an entry the current steps list no longer has fails
+    the ticket permanently, at submission, before any entry runs."""
+    await _mark_processing(postgres_pool, multi_step_ticket)
+    await step_progress.record_submitting(
+        postgres_pool,
+        work_ticket_idx=multi_step_ticket,
+        step_index=0,
+        attempt=0,
+        step_name="dropped-entry",
+        compute_target=ComputeTarget.CONTROL_PLANE,
+    )
+    await step_progress.record_completed(
+        postgres_pool, work_ticket_idx=multi_step_ticket, step_index=0, attempt=0
+    )
+
+    backend = FakeSlurmBackendClient(status_script=[], result_script=[])
+    with pytest.raises(BackendFailure):
+        await _run(multi_step_ticket, postgres_pool, backend, tmp_path / "ws", resume=True)
+
+    row = await postgres_pool.fetchrow(
+        "SELECT state, failure_type, failure_stage, failure_step_name, failure_reason"
+        " FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+        multi_step_ticket,
+    )
+    assert row["state"] == "failed"
+    assert row["failure_type"] == "permanent"
+    assert row["failure_stage"] == "submission"
+    assert row["failure_step_name"] is None
+    assert "'dropped-entry' at step 0" in row["failure_reason"]
+    assert backend.submit_calls == 0
+    assert library_spy.calls == []
 
 
 _TARGET_STATUS_WORKFLOW = [
@@ -5954,16 +6305,14 @@ async def _seed_assembly_ticket(pool, *, prefix="mask-consume", steps=None, extr
         await pool.execute(
             "DELETE FROM qiita.action WHERE action_id = $1 AND version = $2", action_id, version
         )
-        # No-op unless `steps` declared the gate; keeps the RESTRICT FK from
-        # blocking the prep_sample delete below.
-        await pool.execute(
-            "DELETE FROM qiita.assembly_sample WHERE prep_sample_idx = $1", prep_sample_idx
+        await teardown_entity_graph(
+            pool,
+            study_idxs=[],
+            biosample_idxs=[biosample_idx],
+            prep_sample_idxs=[prep_sample_idx],
         )
         await pool.execute("DELETE FROM qiita.mask_definition WHERE mask_idx = $1", mask_idx)
-        await pool.execute("DELETE FROM qiita.prep_sample WHERE idx = $1", prep_sample_idx)
-        await pool.execute("DELETE FROM qiita.biosample WHERE idx = $1", biosample_idx)
-        await pool.execute("DELETE FROM qiita.user WHERE principal_idx = $1", principal_idx)
-        await pool.execute("DELETE FROM qiita.principal WHERE idx = $1", principal_idx)
+        await delete_principal(pool, principal_idx)
 
     return work_ticket_idx, mask_idx, prep_sample_idx, _teardown
 
@@ -6620,5 +6969,335 @@ async def test_masked_reads_workflow_rejects_a_mask_that_does_not_exist(
         assert row["mask_idx"] is None
         assert f"mask_idx {gone}" in row["failure_reason"]
         assert "does not exist" in row["failure_reason"]
+    finally:
+        await teardown()
+
+
+@pytest.mark.parametrize("bind_none", [False, True])
+async def test_run_action_primitive_persist_qc_checks_refuses_an_unresolved_producer(
+    tmp_path, bind_none
+):
+    from qiita_common.actions import WorkflowAction
+    from qiita_common.api_paths import LibraryPrimitive
+
+    from qiita_control_plane.runner import _run_action_primitive
+    from qiita_control_plane.runner._reconstruct import QC_PRODUCER_BINDING
+
+    entry = WorkflowAction(
+        kind="action", name=LibraryPrimitive.PERSIST_QC_CHECKS, inputs=["qc_checks"], outputs=[]
+    )
+    match = "cannot be counted" if bind_none else "did not bind"
+    with pytest.raises(RuntimeError, match=match):
+        await _run_action_primitive(
+            None,
+            entry,
+            {"qc_checks": "x", **({QC_PRODUCER_BINDING: None} if bind_none else {})},
+            tmp_path,
+            {"kind": "prep_sample", "prep_sample_idx": 5},
+            work_ticket_idx=1,
+            signing_key=b"x",
+            data_plane_url="grpc://x",
+        )
+
+
+@pytest.mark.parametrize(
+    ("steps", "expected"),
+    [
+        (
+            [LibraryPrimitive.FINALIZE_ALIGNMENT_SAMPLE, LibraryPrimitive.FINALIZE_MASK_SAMPLE],
+            QcProducer.ALIGNMENT,
+        ),
+        (
+            [LibraryPrimitive.FINALIZE_ALIGNMENT_SAMPLE, LibraryPrimitive.FINALIZE_ASSEMBLY_SAMPLE],
+            QcProducer.ALIGNMENT,
+        ),
+        ([LibraryPrimitive.FINALIZE_MASK_SAMPLE], QcProducer.MASK),
+        ([LibraryPrimitive.FINALIZE_ASSEMBLY_SAMPLE], None),
+        ([LibraryPrimitive.FINALIZE_MASK_SAMPLE, LibraryPrimitive.FINALIZE_ASSEMBLY_SAMPLE], None),
+        ([], QcProducer.NONE),
+    ],
+)
+def test_qc_producer_follows_the_workflow_gates(steps, expected):
+    from qiita_common.actions import WorkflowAction
+
+    from qiita_control_plane.runner._reconstruct import _workflow_qc_producer
+
+    entries = [WorkflowAction(kind="action", name=n, inputs=[], outputs=[]) for n in steps]
+    assert _workflow_qc_producer(entries) == expected
+
+
+def test_qc_producer_covers_every_per_sample_gate():
+    """A new finalize-*-sample gate must be mapped in `_workflow_qc_producer` before it
+    can fall through to an ungated `QcProducer.NONE`."""
+    gates = {p for p in LibraryPrimitive if p.startswith("finalize-") and p.endswith("-sample")}
+    assert gates == {
+        LibraryPrimitive.FINALIZE_ALIGNMENT_SAMPLE,
+        LibraryPrimitive.FINALIZE_MASK_SAMPLE,
+        LibraryPrimitive.FINALIZE_ASSEMBLY_SAMPLE,
+    }
+
+
+# =============================================================================
+# The mask_sample gate for a sample ingest found empty
+# =============================================================================
+
+# A per-sample masking workflow pared to what the empty-sample path reads: a step
+# threading `mask_idx` (so the runner mints the mask) and the terminal
+# `finalize-mask-sample` action (so it writes the gate). read-mask binds `reads`
+# from the stored reads; fastq-to-parquet produces them in its first step.
+_HOST_FILTER_STEP = {
+    "kind": "step",
+    "name": "host_filter",
+    "step_type": "singleton",
+    "module": "qiita_compute_orchestrator.jobs.host_filter",
+    "params": {"mask_idx": "mask_idx"},
+    "inputs": ["reads"],
+    "outputs": ["read_mask"],
+    "baseline_resources": {"cpu": 1, "mem_gb": 1, "walltime": "PT1M"},
+}
+_FINALIZE_MASK_SAMPLE = {
+    "kind": "action",
+    "name": LibraryPrimitive.FINALIZE_MASK_SAMPLE.value,
+    "inputs": [],
+    "outputs": [],
+}
+_READ_MASK_GATE_STEPS = [_HOST_FILTER_STEP, _FINALIZE_MASK_SAMPLE]
+_FASTQ_TO_PARQUET_GATE_STEPS = [
+    {
+        "kind": "step",
+        "name": "fastq",
+        "step_type": "singleton",
+        "module": "qiita_compute_orchestrator.jobs.fastq_to_parquet",
+        "inputs": [],
+        "outputs": ["reads"],
+        "baseline_resources": {"cpu": 1, "mem_gb": 1, "walltime": "PT1M"},
+    },
+    _HOST_FILTER_STEP,
+    _FINALIZE_MASK_SAMPLE,
+]
+
+
+async def _seed_mask_gate_ticket(pool, *, action_id, steps, ingest_state=None):
+    """A pooled prep_sample with no reads and a ticket for a masking `action_id`
+    running `steps`. With `ingest_state`, the sample also has a bam-to-parquet ticket
+    that ended in that state. Returns the ids plus a teardown."""
+    from qiita_common.actions import BAM_TO_PARQUET_ACTION_ID
+
+    from qiita_control_plane.testing.db_seeds import (
+        seed_biosample_with_sequenced_prep_sample,
+        seed_sequenced_sample_subtype,
+        seed_user_principal,
+    )
+    from qiita_control_plane.testing.db_teardown import delete_idxs
+
+    principal_idx = await seed_user_principal(pool, prefix="mask-gate", suffix=uuid.uuid4().hex[:8])
+    biosample_idx, prep_sample_idx = await seed_biosample_with_sequenced_prep_sample(
+        pool, owner_idx=principal_idx
+    )
+    run_idx, pool_idx, _ss_idx = await seed_sequenced_sample_subtype(
+        pool,
+        prep_sample_idx=prep_sample_idx,
+        owner_idx=principal_idx,
+        sequenced_pool_item_id=f"item-{uuid.uuid4().hex[:8]}",
+    )
+    version = f"runner-test-{uuid.uuid4()}"
+    actions = [(action_id, version, steps)]
+    if ingest_state is not None:
+        actions.append((BAM_TO_PARQUET_ACTION_ID, version, []))
+    for a_id, a_version, a_steps in actions:
+        await pool.execute(
+            "INSERT INTO qiita.action ("
+            "  action_id, version, target_kind, scopes, audience,"
+            "  context_schema, steps,"
+            "  cpu_ceiling, mem_ceiling_gb, walltime_ceiling"
+            ") VALUES ($1, $2, 'prep_sample', $3::text[], $4::jsonb,"
+            "  $5::jsonb, $6::jsonb, 1, 1, '1 minute')",
+            a_id,
+            a_version,
+            [],
+            json.dumps({"service": False, "human_roles": ["user"]}),
+            json.dumps({}),
+            json.dumps(a_steps),
+        )
+    if ingest_state is not None:
+        # work_ticket_failure_consistent: a FAILED ticket carries its failure columns.
+        failed = ingest_state == "failed"
+        await pool.execute(
+            "INSERT INTO qiita.work_ticket ("
+            "  action_id, action_version, originator_principal_idx,"
+            "  scope_target_kind, prep_sample_idx, state,"
+            "  failure_type, failure_stage, failure_reason"
+            ") VALUES ($1, $2, $3, 'prep_sample', $4, $5::qiita.work_ticket_state,"
+            "  $6::qiita.failure_type, $7::qiita.work_ticket_failure_stage, $8)",
+            BAM_TO_PARQUET_ACTION_ID,
+            version,
+            principal_idx,
+            prep_sample_idx,
+            ingest_state,
+            "permanent" if failed else None,
+            "submission" if failed else None,
+            "test failure" if failed else None,
+        )
+    work_ticket_idx = await pool.fetchval(
+        "INSERT INTO qiita.work_ticket ("
+        "  action_id, action_version, originator_principal_idx,"
+        "  scope_target_kind, prep_sample_idx, action_context"
+        ") VALUES ($1, $2, $3, 'prep_sample', $4, $5::jsonb) RETURNING work_ticket_idx",
+        action_id,
+        version,
+        principal_idx,
+        prep_sample_idx,
+        json.dumps({"host_filter_enabled": False, "lima_enabled": False, "syndna_enabled": False}),
+    )
+
+    async def _teardown():
+        mask_idxs = await pool.fetch(
+            "SELECT mask_idx FROM qiita.work_ticket"
+            " WHERE action_version = $1 AND mask_idx IS NOT NULL",
+            version,
+        )
+        await pool.execute("DELETE FROM qiita.work_ticket WHERE action_version = $1", version)
+        await pool.execute("DELETE FROM qiita.action WHERE version = $1", version)
+        await teardown_entity_graph(
+            pool,
+            study_idxs=[],
+            biosample_idxs=[biosample_idx],
+            prep_sample_idxs=[prep_sample_idx],
+        )
+        await delete_idxs(pool, "sequenced_pool", pool_idx)
+        await delete_idxs(pool, "sequencing_run", run_idx)
+        await pool.execute(
+            "DELETE FROM qiita.mask_definition WHERE mask_idx = ANY($1::bigint[])",
+            [r["mask_idx"] for r in mask_idxs],
+        )
+        await delete_principal(pool, principal_idx)
+
+    return work_ticket_idx, prep_sample_idx, _teardown
+
+
+def _stub_no_stored_reads(monkeypatch, *, control: bool = False):
+    """The data plane holds no reads for the sample; `control` answers the
+    expected-empty-control lookup."""
+    from qiita_control_plane.runner import _read_ingest
+
+    monkeypatch.setattr(
+        "qiita_control_plane.runner._do_action_export_read",
+        lambda _url, _token: {"count": 0, "dest": "unused"},
+    )
+
+    async def _is_control(_pool, _prep_sample_idx):
+        return control
+
+    monkeypatch.setattr(_read_ingest, "_prep_sample_is_expected_empty_control", _is_control)
+
+
+async def _ticket_and_gate(pool, work_ticket_idx, prep_sample_idx):
+    ticket = await pool.fetchrow(
+        "SELECT state, mask_idx FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+        work_ticket_idx,
+    )
+    gate = await pool.fetchval(
+        "SELECT state FROM qiita.mask_sample WHERE mask_idx = $1 AND prep_sample_idx = $2",
+        ticket["mask_idx"],
+        prep_sample_idx,
+    )
+    counts = await pool.fetchrow(
+        "SELECT raw_read_count_r1r2, quality_filtered_read_count_r1r2"
+        "  FROM qiita.sequenced_sample WHERE prep_sample_idx = $1",
+        prep_sample_idx,
+    )
+    return ticket["state"], ticket["mask_idx"], gate, tuple(counts)
+
+
+async def test_read_mask_records_a_sample_ingest_found_empty_as_masked(
+    postgres_pool, monkeypatch, tmp_path
+):
+    """The sample's BAM held no reads (bam-to-parquet ended NO_DATA). read-mask ends
+    NO_DATA too, and the sample is masked-complete under the mask the ticket minted,
+    with zero read counts: there was nothing to mask."""
+    work_ticket_idx, ps, teardown = await _seed_mask_gate_ticket(
+        postgres_pool,
+        action_id=READ_MASK_ACTION_ID,
+        steps=_READ_MASK_GATE_STEPS,
+        ingest_state="no_data",
+    )
+    _stub_no_stored_reads(monkeypatch)
+    try:
+        await _run(work_ticket_idx, postgres_pool, FakeBackendClient(), tmp_path / "ws")
+        state, mask_idx, gate, counts = await _ticket_and_gate(postgres_pool, work_ticket_idx, ps)
+        assert state == "no_data"
+        assert mask_idx is not None
+        assert gate == "completed"
+        assert counts == (0, 0)
+    finally:
+        await teardown()
+
+
+async def test_read_mask_writes_no_gate_for_an_empty_control_no_ingest_explains(
+    postgres_pool, monkeypatch, tmp_path
+):
+    """An expected-empty control with no finished ingest still ends NO_DATA, but its
+    reads may simply not be ingested yet, so no gate row claims it masked."""
+    work_ticket_idx, ps, teardown = await _seed_mask_gate_ticket(
+        postgres_pool, action_id=READ_MASK_ACTION_ID, steps=_READ_MASK_GATE_STEPS
+    )
+    _stub_no_stored_reads(monkeypatch, control=True)
+    try:
+        await _run(work_ticket_idx, postgres_pool, FakeBackendClient(), tmp_path / "ws")
+        state, mask_idx, gate, counts = await _ticket_and_gate(postgres_pool, work_ticket_idx, ps)
+        assert state == "no_data"
+        assert mask_idx is not None
+        assert gate is None
+        assert counts == (None, None)
+    finally:
+        await teardown()
+
+
+async def test_read_mask_for_a_never_ingested_sample_fails_and_carries_its_mask(
+    postgres_pool, monkeypatch, tmp_path
+):
+    """No reads, and the only ingest record is a failed one, which does not show the
+    prep_sample was read: it must be ingested first. The mask is minted before the
+    reads are bound, so the failed ticket names it."""
+    work_ticket_idx, ps, teardown = await _seed_mask_gate_ticket(
+        postgres_pool,
+        action_id=READ_MASK_ACTION_ID,
+        steps=_READ_MASK_GATE_STEPS,
+        ingest_state="failed",
+    )
+    _stub_no_stored_reads(monkeypatch)
+    try:
+        with pytest.raises(BackendFailure, match="must be ingested"):
+            await _run(work_ticket_idx, postgres_pool, FakeBackendClient(), tmp_path / "ws")
+        state, mask_idx, gate, _counts = await _ticket_and_gate(postgres_pool, work_ticket_idx, ps)
+        assert state == "failed"
+        assert mask_idx is not None
+        assert gate is None
+    finally:
+        await teardown()
+
+
+async def test_fastq_to_parquet_records_its_own_empty_input_as_masked(
+    postgres_pool, monkeypatch, tmp_path
+):
+    """fastq-to-parquet ingests and masks in one ticket. When its FASTQ is empty the
+    `fastq` step raises StepNoData after the mask is minted, and the ticket itself is
+    the ingest that found the sample empty."""
+    work_ticket_idx, ps, teardown = await _seed_mask_gate_ticket(
+        postgres_pool, action_id=FASTQ_TO_PARQUET_ACTION_ID, steps=_FASTQ_TO_PARQUET_GATE_STEPS
+    )
+    backend = FakeBackendClient()
+
+    async def _empty_fastq(*_args, **_kwargs):
+        raise StepNoData(step_name="fastq", reason="FASTQ holds no records")
+
+    monkeypatch.setattr(backend, "run_step", _empty_fastq)
+    try:
+        await _run(work_ticket_idx, postgres_pool, backend, tmp_path / "ws")
+        state, mask_idx, gate, counts = await _ticket_and_gate(postgres_pool, work_ticket_idx, ps)
+        assert state == "no_data"
+        assert mask_idx is not None
+        assert gate == "completed"
+        assert counts == (0, 0)
     finally:
         await teardown()

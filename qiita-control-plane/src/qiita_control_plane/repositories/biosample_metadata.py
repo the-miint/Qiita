@@ -106,5 +106,6 @@ BIOSAMPLE_METADATA_SPEC = EntityMetadataSpec(
     link_table="qiita.biosample_to_study",
     link_entity_key_column="biosample_idx",
     metadata_retired_link_trigger="biosample_metadata_reject_if_link_retired",
+    metadata_field_contract_trigger="biosample_metadata_apply_field_contract",
     owner_sample_id_flag_column="is_owner_biosample_id",
 )

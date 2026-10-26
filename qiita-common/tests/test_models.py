@@ -1055,6 +1055,8 @@ _NON_BLANK_TEXT_FIELDS = [
         "description",
         {"display_name": "pH", "data_type": FieldDataType.NUMERIC},
     ),
+    ("SampleUniqueFieldRef", "unique_field_display_name", {"unique_field_value": "Sample 1"}),
+    ("SampleUniqueFieldRef", "unique_field_value", {"unique_field_display_name": "Sample Id"}),
 ]
 
 
@@ -1087,6 +1089,46 @@ def test_non_blank_text_fields_strip_padding(model_name: str, field_name: str, o
     built = model_cls(**{**other_kwargs, field_name: "  padded  "})
 
     assert getattr(built, field_name) == "padded"
+
+
+@pytest.mark.parametrize("model_name, field_name, other_kwargs", _NON_BLANK_TEXT_FIELDS)
+def test_non_blank_text_fields_reject_nul(model_name: str, field_name: str, other_kwargs: dict):
+    """Tests the case where a text field carries a NUL: the wire boundary
+    rejects it, no Postgres text column being able to store one, so the
+    alternative is a request that validates and then fails at the driver.
+    """
+    model_cls = getattr(models_module, model_name)
+
+    with pytest.raises(ValidationError) as exc_info:
+        model_cls(**{**other_kwargs, field_name: "a\x00b"})
+
+    error_locs = [err["loc"] for err in exc_info.value.errors()]
+    assert (field_name,) in error_locs
+
+
+@pytest.mark.parametrize("model_name, other_kwargs", _METADATA_REQUEST_MODEL_KWARGS)
+def test_metadata_request_models_reject_nul_value(model_name: str, other_kwargs: dict):
+    """Tests the case where a metadata value carries a NUL: it is refused at
+    the wire, naming the offending field, rather than reaching the driver.
+    """
+    model_cls = getattr(models_module, model_name)
+
+    with pytest.raises(ValidationError) as exc_info:
+        model_cls(metadata={"ph": "a\x00b"}, **other_kwargs)
+
+    error_locs = [err["loc"] for err in exc_info.value.errors()]
+    assert ("metadata", "ph") in error_locs
+
+
+@pytest.mark.parametrize("model_name, other_kwargs", _METADATA_REQUEST_MODEL_KWARGS)
+def test_metadata_request_models_reject_nul_key(model_name: str, other_kwargs: dict):
+    """Tests the case where a metadata key carries a NUL: the key is refused at
+    the wire, the same as a value carrying one.
+    """
+    model_cls = getattr(models_module, model_name)
+
+    with pytest.raises(ValidationError):
+        model_cls(metadata={"a\x00b": "7.2"}, **other_kwargs)
 
 
 @pytest.mark.parametrize("model_name, other_kwargs", _METADATA_REQUEST_MODEL_KWARGS)
@@ -1441,19 +1483,13 @@ def test_biosample_study_field_create_request_linked_valid():
     assert req.tier_override is None
 
 
-@pytest.mark.parametrize(
-    "data_type,is_linked",
-    [("text", False), ("numeric", False), ("date", False)],
-)
-def test_unique_in_study_rejection_reason_accepts_eligible_shapes(data_type, is_linked):
-    """Tests the case where a purely-local field of an eligible type is asked
-    about: the predicate reports no reason to refuse.
+def test_unique_in_study_rejection_reason_accepts_eligible_shapes():
+    """Tests the case where a purely-local text field is asked about: the
+    predicate reports no reason to refuse, text being the one eligible type.
     """
     from qiita_common.models.sample_field import unique_in_study_rejection_reason
 
-    assert (
-        unique_in_study_rejection_reason(data_type=data_type, is_globally_linked=is_linked) is None
-    )
+    assert unique_in_study_rejection_reason(data_type="text", is_globally_linked=False) is None
 
 
 def test_unique_in_study_rejection_reason_refuses_globally_linked():
@@ -1467,16 +1503,16 @@ def test_unique_in_study_rejection_reason_refuses_globally_linked():
     assert reason == "unique_in_study is unavailable on a globally-linked field"
 
 
-@pytest.mark.parametrize("data_type", ["boolean", "terminology", None])
-def test_unique_in_study_rejection_reason_refuses_closed_value_sets(data_type):
-    """Tests the case where the field carries a closed value set, or no
-    resolved type at all: the predicate names the eligible types.
+@pytest.mark.parametrize("data_type", ["boolean", "terminology", "numeric", "date", None])
+def test_unique_in_study_rejection_reason_refuses_ineligible_types(data_type):
+    """Tests the case where the field carries a type that is not the one eligible type
+    for a unique_in_study field.
     """
     from qiita_common.models.sample_field import unique_in_study_rejection_reason
 
     reason = unique_in_study_rejection_reason(data_type=data_type, is_globally_linked=False)
 
-    assert reason == "unique_in_study requires data_type to be one of: date, numeric, text"
+    assert reason == "unique_in_study requires data_type to be one of: text"
 
 
 def test_sample_study_field_patch_request_rejects_empty_body():
@@ -1489,7 +1525,7 @@ def test_sample_study_field_patch_request_rejects_empty_body():
         SampleStudyFieldPatchRequest()
 
 
-@pytest.mark.parametrize("field_name", ["display_name", "required", "unique_in_study"])
+@pytest.mark.parametrize("field_name", ["display_name", "required", "unique_in_study", "data_type"])
 def test_sample_study_field_patch_request_rejects_explicit_null_on_not_null(field_name):
     """Tests the case where a patch body sends an explicit null for a column
     the database declares NOT NULL: the wire refuses it.
@@ -1657,3 +1693,65 @@ def test_terminology_manifest_file_non_bare_path(declared_path):
     value that was declared."""
     with pytest.raises(ValidationError, match="not a bare filename"):
         TerminologyManifestFile(path=declared_path, sha256="a" * 64)
+
+
+# ---------------------------------------------------------------------------
+# BiosampleBulkImportRequest — size caps and one-sheet rules
+# ---------------------------------------------------------------------------
+
+
+def _bulk_row(value: str, *, owner_idx: int = 7, field: str = "id", keys: int = 0) -> dict:
+    return {
+        "owner_idx": owner_idx,
+        "owner_biosample_id_field_name": field,
+        "owner_biosample_id_value": value,
+        "metadata": {f"k{k}": "x" for k in range(keys)},
+    }
+
+
+def test_bulk_import_request_accepts_exactly_the_caps():
+    from qiita_common.models.biosample import (
+        BIOSAMPLE_BULK_IMPORT_MAX_METADATA_VALUES,
+        BIOSAMPLE_BULK_IMPORT_MAX_ROWS,
+        BiosampleBulkImportRequest,
+    )
+
+    rows = [_bulk_row(f"v{i}") for i in range(BIOSAMPLE_BULK_IMPORT_MAX_ROWS)]
+    assert len(BiosampleBulkImportRequest(rows=rows).rows) == BIOSAMPLE_BULK_IMPORT_MAX_ROWS
+    keys = 100
+    rows = [
+        _bulk_row(f"v{i}", keys=keys)
+        for i in range(BIOSAMPLE_BULK_IMPORT_MAX_METADATA_VALUES // keys)
+    ]
+    BiosampleBulkImportRequest(rows=rows)
+
+
+@pytest.mark.parametrize("over", ["rows", "values"])
+def test_bulk_import_request_refuses_one_over_a_cap(over):
+    from qiita_common.models.biosample import (
+        BIOSAMPLE_BULK_IMPORT_MAX_METADATA_VALUES,
+        BIOSAMPLE_BULK_IMPORT_MAX_ROWS,
+        BiosampleBulkImportRequest,
+    )
+
+    if over == "rows":
+        rows = [_bulk_row(f"v{i}") for i in range(BIOSAMPLE_BULK_IMPORT_MAX_ROWS + 1)]
+    else:
+        rows = [_bulk_row("v0", keys=BIOSAMPLE_BULK_IMPORT_MAX_METADATA_VALUES)]
+        rows.append(_bulk_row("one-more", keys=1))
+    with pytest.raises(ValidationError, match="send the sheet in several requests"):
+        BiosampleBulkImportRequest(rows=rows)
+
+
+@pytest.mark.parametrize(
+    ("second", "message"),
+    [
+        ({"owner_idx": 8}, "same owner_idx"),
+        ({"field": "other"}, "same owner_biosample_id_field_name"),
+    ],
+)
+def test_bulk_import_request_is_one_owner_and_one_id_field(second, message):
+    from qiita_common.models.biosample import BiosampleBulkImportRequest
+
+    with pytest.raises(ValidationError, match=message):
+        BiosampleBulkImportRequest(rows=[_bulk_row("a"), _bulk_row("b", **second)])

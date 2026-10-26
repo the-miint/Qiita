@@ -170,3 +170,22 @@ def test_user_response_profile_complete_reflects_input():
         profile_complete=False,
     )
     assert r2.profile_complete is False
+
+
+@pytest.mark.parametrize("email", ["a+b@x.org", "pi@host.local"])
+def test_lookup_email_accepts_addresses_emailstr_refuses(email):
+    from pydantic import TypeAdapter
+
+    from qiita_common.models._base import LookupEmail
+
+    assert TypeAdapter(LookupEmail).validate_python(email) == email
+
+
+@pytest.mark.parametrize("email", ["a\x00b@x.org", "a\tb@x.org", "a b@x.org", "no-at-sign"])
+def test_lookup_email_rejects_malformed(email):
+    from pydantic import TypeAdapter
+
+    from qiita_common.models._base import LookupEmail
+
+    with pytest.raises(ValidationError):
+        TypeAdapter(LookupEmail).validate_python(email)

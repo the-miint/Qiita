@@ -1,16 +1,14 @@
 """Bounded retry + failure classification for the CP sequence-range callback.
 
-Every native job that mints a per-prep_sample sequence range — `ingest_reads` (the
-bcl-convert read-storage step, which fans over every pool sample), `fastq_to_parquet`
-and `bam_to_parquet` — calls back to the control plane's `/sequence-range` routes
-over HTTP. A *transient* blip on ONE of a pool's many per-sample callbacks (an
-HTTP 5xx from a proxy / a CP restart, or a pure transport error like a
-connection reset / read timeout) must not discard the whole multi-hour ingest:
-the mint is idempotent on retry (a minted-but-unwritten range is read back and
-reused), so re-driving the call is safe.
+Every native job that mints a per-prep_sample sequence range calls back to the
+control plane's `/sequence-range` routes over HTTP. A *transient* blip on ONE of a
+pool's many per-sample callbacks (an HTTP 5xx from a proxy / a CP restart, or a pure
+transport error like a connection reset / read timeout) must not discard the whole
+multi-hour ingest: the mint is idempotent on retry (a minted-but-unwritten range is
+read back and reused), so re-driving the call is safe.
 
-This module is the single home for that retry + classification, shared by all three
-so they can't diverge:
+This module is the single home for that retry + classification, shared by every
+such job so they can't diverge:
 
   - `cp_call_with_retry` retries a transient call a few times in-job, so a blip
     self-heals without ever failing the step.
@@ -40,11 +38,14 @@ from collections.abc import Awaitable, Callable
 
 import httpx
 from qiita_common.backend_failure import BackendFailure, FailureKind
+from qiita_common.http_status import is_transient_http_status
 from qiita_common.models import (
     NON_TERMINAL_WORK_TICKET_STATES,
+    REDRIVABLE_WORK_TICKET_STATES,
     WorkTicketFailureStage,
     WorkTicketState,
 )
+from qiita_common.work_ticket_constants import POOL_REMOVAL_RECOVERY
 
 from .sequence_range import (
     PrepSampleNotEligibleForSequenceRange,
@@ -54,8 +55,9 @@ from .sequence_range import (
 )
 
 # Attempts and exponential backoff for a transient CP sequence-range callback.
-# 401/403 and any non-5xx 4xx are NOT retried (a token/scope misconfig or a
-# missing prep_sample can't self-heal). Tests zero the backoff to avoid sleeps.
+# 401/403 and any other 4xx that `is_transient_http_status` rejects are not
+# retried (a token/scope misconfig or a missing prep_sample can't self-heal).
+# Tests zero the backoff to avoid sleeps.
 CP_RETRY_MAX_ATTEMPTS = 3
 CP_RETRY_BACKOFF_BASE_S = 0.5
 
@@ -68,21 +70,13 @@ CP_RETRY_BACKOFF_BASE_S = 0.5
 _REUSABLE_MINTER_STATES: frozenset[str] = frozenset(NON_TERMINAL_WORK_TICKET_STATES)
 
 
-def _is_transient_status(status: int) -> bool:
-    """True for an HTTP status from the CP callback that a retry can self-heal:
-    any 5xx (proxy/connection blip, CP restart, or a CP statement-timeout
-    surfacing as a 500), plus 408 (request timeout) and 429 (rate limit). 401/403
-    and any other 4xx are permanent client-side conditions → False."""
-    return status >= 500 or status in (408, 429)
-
-
 def is_transient_cp_error(exc: httpx.HTTPStatusError | httpx.TransportError) -> bool:
     """True for a CP sequence-range error a retry can self-heal: a transient HTTP
-    status (5xx / 408 / 429, per `_is_transient_status`) or a pure transport
+    status (5xx / 408 / 429, per `is_transient_http_status`) or a pure transport
     error (connect reset / read timeout — these raise before `raise_for_status`).
     A 401/403 or any other 4xx is a permanent client-side condition → False."""
     if isinstance(exc, httpx.HTTPStatusError):
-        return _is_transient_status(exc.response.status_code)
+        return is_transient_http_status(exc.response.status_code)
     return isinstance(exc, httpx.TransportError)
 
 
@@ -137,7 +131,7 @@ def cp_call_failure(
                 f"HTTP {status} — compute SA PAT misconfigured "
                 "(see docs/runbooks/compute-service-account-provisioning.md)"
             )
-        elif _is_transient_status(status):
+        elif is_transient_http_status(status):
             kind = FailureKind.CONTROL_PLANE_UNREACHABLE
             detail = f"HTTP {status}"
         else:
@@ -179,8 +173,9 @@ async def mint_or_reuse_sequence_range(
       - a prior ATTEMPT of this ticket minted then crashed → the reads are NOT in
         the lake, the range is orphaned, reuse is correct and is what makes the
         step idempotent across runner retries;
-      - a DIFFERENT ticket minted it → the sample's reads ARE already registered,
-        and reusing the range would register them a second time. DuckLake has no
+      - a DIFFERENT ticket minted it → that ticket has registered, or may yet
+        register, the sample's reads, and reusing the range would register them a
+        second time. DuckLake has no
         uniqueness, so that duplication is silent and permanent.
 
     Nothing else in the system can separate them. The submit-time
@@ -225,37 +220,100 @@ async def mint_or_reuse_sequence_range(
             raise cp_call_failure(prep_sample_idx, get_exc, step_name=step_name) from get_exc
         if existing is None:
             # 409 on mint but 404 on read-back: the range vanished between the two
-            # calls (an operator deleted the prep_sample / range mid-retry). A fresh
-            # resubmit will re-mint cleanly, but THIS attempt can't run against a
-            # moving target.
+            # calls. A range goes only with its prep_sample (ON DELETE CASCADE), and
+            # a prep_sample goes only with its pool, so there is nothing left for
+            # this ticket to load.
             raise BackendFailure(
                 kind=FailureKind.UNKNOWN_PERMANENT,
                 stage=WorkTicketFailureStage.STEP_RUN,
                 step_name=step_name,
                 reason=(
-                    f"prep_sample {prep_sample_idx} sequence_range 409'd on mint but "
-                    "404'd on read-back — concurrent deletion during retry; resubmit"
+                    f"prep_sample {prep_sample_idx}'s read numbering was deleted while "
+                    "this step was retrying, so the step could not finish against it — "
+                    "reserving the numbering reported that it already existed (409), "
+                    "then reading it back did not find it (404). The numbering is "
+                    "deleted only with the prep_sample, when its pool is removed; to "
+                    "load these reads, register the pool again and submit"
                 ),
             ) from exc
         if existing.minted_by_work_ticket_idx != work_ticket_idx:
             # A DIFFERENT ticket minted this range (or its provenance is unknown —
-            # NULL, which we read as not-mine). Either way the sample's reads are
-            # already registered in the lake, so reusing the range would register
-            # them a second time. DuckLake has no uniqueness: the duplication would
-            # be silent. Refuse, and tell the operator the one thing that fixes it.
+            # NULL, which we read as not-mine). Its reads may already be registered
+            # in the lake, so reusing the range could register them a second time.
+            # DuckLake has no uniqueness: the duplication would be silent. Refuse.
             owner = existing.minted_by_work_ticket_idx
-            owner_detail = f"work_ticket {owner}" if owner is not None else "an unknown work_ticket"
+            if owner is not None and (
+                existing.minted_by_work_ticket_state in REDRIVABLE_WORK_TICKET_STATES
+            ):
+                # The minter failed or was cancelled. Whether it registered the reads
+                # depends on where it stopped, so this cannot say. Re-driving the
+                # minter resumes it with its own range, which is what an interrupted
+                # load needs; a deliberate re-load still means removing the pool.
+                raise BackendFailure(
+                    kind=FailureKind.UNKNOWN_PERMANENT,
+                    stage=WorkTicketFailureStage.STEP_RUN,
+                    step_name=step_name,
+                    reason=(
+                        f"prep_sample {prep_sample_idx}'s read numbering was reserved "
+                        f"by ticket {owner}, which did not finish "
+                        f"(state={existing.minted_by_work_ticket_state!r}), not by "
+                        f"this one (ticket {work_ticket_idx}), so this step stopped "
+                        "without writing anything; ticket "
+                        f"{owner} may already have stored the reads. To finish that "
+                        f"load, re-drive it with `qiita ticket run {owner}`. Loading "
+                        "the reads again on purpose means removing the prep_sample's "
+                        f"pool: {POOL_REMOVAL_RECOVERY}. Then submit again"
+                    ),
+                ) from exc
+            if owner is not None and (
+                existing.minted_by_work_ticket_state in _REUSABLE_MINTER_STATES
+            ):
+                # The minter is still in flight, so its reads may not be stored yet;
+                # "already loaded" would be wrong, and so would the pool delete.
+                raise BackendFailure(
+                    kind=FailureKind.UNKNOWN_PERMANENT,
+                    stage=WorkTicketFailureStage.STEP_RUN,
+                    step_name=step_name,
+                    reason=(
+                        f"prep_sample {prep_sample_idx}'s read numbering was reserved "
+                        f"by ticket {owner}, which is still running "
+                        f"(state={existing.minted_by_work_ticket_state!r}), not by "
+                        f"this one (ticket {work_ticket_idx}), so this step stopped "
+                        f"without writing anything. Follow ticket {owner} with "
+                        f"`qiita ticket status {owner}` rather than submitting again"
+                    ),
+                ) from exc
+            state = existing.minted_by_work_ticket_state
+            # Only a COMPLETED minter is known to have stored the reads; any other
+            # minter that lands here (no_data, a ticket row that is gone, an
+            # unattributed range) may have.
+            if state == WorkTicketState.COMPLETED.value:
+                finding = (
+                    f"prep_sample {prep_sample_idx}'s reads were already loaded by ticket "
+                    f"{owner}, not by this one (ticket {work_ticket_idx}). Loading them "
+                    "again would store every read twice"
+                )
+            else:
+                if owner is None:
+                    minter = "a ticket Qiita cannot identify"
+                elif state is None:
+                    minter = f"ticket {owner}, whose record is gone"
+                else:
+                    minter = f"ticket {owner}, which ended as {state}"
+                finding = (
+                    f"prep_sample {prep_sample_idx}'s read numbering was reserved by "
+                    f"{minter}, not by this one (ticket {work_ticket_idx}); its reads may "
+                    "already have been loaded. Loading them again could store every read "
+                    "twice"
+                )
             raise BackendFailure(
                 kind=FailureKind.UNKNOWN_PERMANENT,
                 stage=WorkTicketFailureStage.STEP_RUN,
                 step_name=step_name,
                 reason=(
-                    f"prep_sample {prep_sample_idx} already has a sequence_range minted "
-                    f"by {owner_detail}, not by this one (work_ticket {work_ticket_idx}) — "
-                    "its reads are already loaded, and re-ingesting would duplicate them "
-                    "(DuckLake has no uniqueness). To re-ingest deliberately, DELETE the "
-                    "prep_sample (its sequence_range goes with it via ON DELETE CASCADE; "
-                    "for a whole pool, `qiita delete-sequenced-pool`) and resubmit"
+                    f"{finding}, so this step stopped without writing anything. Loading "
+                    "them again on purpose means removing the prep_sample's pool: "
+                    f"{POOL_REMOVAL_RECOVERY}. Then submit again"
                 ),
             ) from exc
         if existing.minted_by_work_ticket_state not in _REUSABLE_MINTER_STATES:
@@ -266,32 +324,31 @@ async def mint_or_reuse_sequence_range(
             # its own attempt must not re-write the range.
             state = existing.minted_by_work_ticket_state
             # The recovery differs by state, so name it rather than just refusing —
-            # and only offer a redrive where the CP will actually accept one. `/run`
-            # takes a ticket in PENDING or FAILED; it 409s on `no_data` and 404s on a
-            # ticket row that is gone (state=None). So the three-way is not cosmetic:
-            # the fall-through arm exists because a fail-closed allowlist must land an
+            # and only offer a redrive where the CP will actually accept one:
+            # REDRIVABLE_WORK_TICKET_STATES. `/run` 409s on `no_data` and 404s on a
+            # ticket row that is gone (state=None). So the three-way is not cosmetic: the
+            # fall-through arm exists because a fail-closed allowlist must land an
             # UNANTICIPATED state on advice that works, not on advice that bounces.
-            if state == WorkTicketState.FAILED.value:
+            if state in REDRIVABLE_WORK_TICKET_STATES:
                 recovery = (
-                    f"re-drive this ticket with `qiita ticket run {work_ticket_idx}`, "
+                    f"Re-drive this ticket with `qiita ticket run {work_ticket_idx}`, "
                     "which returns it to flight and makes its own range reusable"
                 )
             else:
                 # COMPLETED (reads registered), or a state with no in-place redrive.
                 recovery = (
-                    "there is no in-place recovery from this state — to re-ingest, "
-                    "DELETE the prep_sample (its sequence_range goes with it) and "
-                    "resubmit"
+                    "There is no way to resume from this state; starting over means "
+                    f"removing the prep_sample's pool: {POOL_REMOVAL_RECOVERY}"
                 )
             raise BackendFailure(
                 kind=FailureKind.UNKNOWN_PERMANENT,
                 stage=WorkTicketFailureStage.STEP_RUN,
                 step_name=step_name,
                 reason=(
-                    f"prep_sample {prep_sample_idx}'s sequence_range was minted by "
-                    f"work_ticket {work_ticket_idx}, which is no longer in flight "
-                    f"(state={state!r}) — this attempt is stale. Refusing to re-write "
-                    f"the range. {recovery}"
+                    f"prep_sample {prep_sample_idx}'s read numbering was reserved by "
+                    f"ticket {work_ticket_idx}, which is no longer running "
+                    f"(state={state!r}), so this attempt is out of date and stopped "
+                    f"without renumbering. {recovery}"
                 ),
             ) from exc
         recovered_count = existing.sequence_idx_stop - existing.sequence_idx_start + 1
@@ -306,11 +363,14 @@ async def mint_or_reuse_sequence_range(
                 stage=WorkTicketFailureStage.STEP_RUN,
                 step_name=step_name,
                 reason=(
-                    f"prep_sample {prep_sample_idx} has an existing sequence_range covering "
-                    f"{recovered_count} indices "
-                    f"({existing.sequence_idx_start}..{existing.sequence_idx_stop}) but its "
-                    f"input now has {count} reads — the range must match the prior mint "
-                    "count exactly; delete the prep_sample to re-mint"
+                    f"prep_sample {prep_sample_idx} already has read numbering for "
+                    f"{recovered_count} reads "
+                    f"({existing.sequence_idx_start}..{existing.sequence_idx_stop}), but "
+                    f"the input now has {count} — the numbering has to cover exactly "
+                    "as many reads as before, so the input is not the one that was "
+                    "numbered. Work out which input is the right one before destroying "
+                    "anything. If the new one is right, loading it means removing the "
+                    f"prep_sample's pool: {POOL_REMOVAL_RECOVERY}"
                 ),
             ) from exc
         return existing.sequence_idx_start

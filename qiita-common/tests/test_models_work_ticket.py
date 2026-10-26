@@ -322,3 +322,54 @@ def test_work_ticket_cancel_request_selector_and_cap():
     filtered = WorkTicketCancelRequest(action_id="read-mask", sequenced_pool_idx=9)
     assert filtered.action_id == "read-mask"
     assert filtered.sequenced_pool_idx == 9
+
+
+def test_follow_on_nests_and_round_trips():
+    """A follow-on may carry its own `on_success`; the nested chain survives a
+    JSON round-trip (the shape stored in the on_success JSONB column)."""
+    from qiita_common.models import WorkTicketFollowOn
+
+    chain = WorkTicketFollowOn(
+        action_id="golay-demux",
+        action_version="1",
+        on_success=WorkTicketFollowOn(
+            action_id="amplicon",
+            action_version="1",
+            on_success=WorkTicketFollowOn(action_id="feature-table", action_version="1"),
+        ),
+    )
+    back = WorkTicketFollowOn.model_validate_json(chain.model_dump_json())
+    assert back.on_success.action_id == "amplicon"
+    assert back.on_success.on_success.action_id == "feature-table"
+    assert back.on_success.on_success.on_success is None
+
+
+def test_follow_on_as_request_carries_next_link():
+    """`as_request` forwards the next link, so the ticket a follow-on creates
+    arms the stage after it."""
+    from qiita_common.models import WorkTicketFollowOn
+
+    chain = WorkTicketFollowOn(
+        action_id="amplicon",
+        action_version="1",
+        on_success=WorkTicketFollowOn(action_id="feature-table", action_version="1"),
+    )
+    req = chain.as_request({"kind": "reference", "reference_idx": 1})
+    assert req.action_id == "amplicon"
+    assert req.on_success.action_id == "feature-table"
+
+
+def test_follow_on_chain_depth_is_bounded():
+    """A chain deeper than MAX_FOLLOW_ON_CHAIN_DEPTH is refused; one exactly at
+    the limit is accepted."""
+    from qiita_common.models import MAX_FOLLOW_ON_CHAIN_DEPTH, WorkTicketFollowOn
+
+    def chain_of(depth: int) -> WorkTicketFollowOn:
+        node = WorkTicketFollowOn(action_id="a", action_version="1")
+        for _ in range(depth - 1):
+            node = WorkTicketFollowOn(action_id="a", action_version="1", on_success=node)
+        return node
+
+    assert chain_of(MAX_FOLLOW_ON_CHAIN_DEPTH) is not None
+    with pytest.raises(ValidationError, match="at most"):
+        chain_of(MAX_FOLLOW_ON_CHAIN_DEPTH + 1)

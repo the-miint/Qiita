@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import asyncpg
+from qiita_common.actions import BCL_CONVERT_SAMPLE_MAP_KEY
 from qiita_common.api_paths import (
     compute_reads_staging_path,
 )
@@ -20,9 +21,16 @@ from ..auth.tickets import run_signed_flight_call, sign_action, sign_ticket
 from ..block_read import READ_MASKED_TABLE
 from ..host_filter_resolver import is_control_sample
 from ..miint import connect_with_miint_staged
-from ..repositories.block import fetch_mask_sample_state
+from ..preflight import AmpliconBarcode, AmpliconPreflightError, amplicon_barcode_from_blob
+from ..problem_list import capped
+from ..repositories.block import MASK_SAMPLE_COMPLETED, fetch_mask_sample_state
 from ..repositories.prep_sample import fetch_biosample_idx_for_prep_sample
-from ..repositories.sequenced_sample import fetch_sequenced_pool_ena_run_roster
+from ..repositories.sequenced_sample import (
+    fetch_empty_ingest_tickets,
+    fetch_sequenced_pool_ena_run_roster,
+    fetch_sequenced_pool_item_prep_sample_idxs,
+)
+from ..repositories.sequencing_run import fetch_sequenced_pool_preflight, lock_sequencing_run
 from ._upload import _submission_bad_input, _submission_dp_fetch_failure
 
 _log = logging.getLogger(__name__)
@@ -43,7 +51,10 @@ _log = logging.getLogger(__name__)
 # `reads_staging_root` hands the ingest step the scratch root it writes the
 # durable copies under.
 
-SAMPLE_MAP_BINDING = "sample_map"
+SAMPLE_MAP_BINDING = BCL_CONVERT_SAMPLE_MAP_KEY
+# golay-demux's per-sample barcode roster, materialized to a parquet like
+# `sample_map`. each entry carries its own barcodes_are_rc flag.
+BARCODE_MAP_BINDING = "barcode_map"
 STAGED_READS_BINDING = "reads"
 # A workflow that consumes ready-for-consumption reads (assembly) declares
 # `masked_reads_fastq`; the runner STREAMS the `read_masked` pass-set for a
@@ -298,6 +309,24 @@ async def _resolve_sample_map(action_context: dict[str, Any], workspace: Path) -
     return {SAMPLE_MAP_BINDING: out}
 
 
+def _write_barcode_map_parquet(roster: list[dict[str, Any]], out_path: Path) -> None:
+    """write the barcode roster to a parquet for the golay_demux step."""
+    import pyarrow as pa  # noqa: PLC0415
+    import pyarrow.parquet as pq  # noqa: PLC0415
+
+    prep = [int(r["prep_sample_idx"]) for r in roster]
+    barcodes = [str(r["barcode"]) for r in roster]
+    rc = [bool(r["barcodes_are_rc"]) for r in roster]
+    table = pa.table(
+        {
+            "prep_sample_idx": pa.array(prep, type=pa.int64()),
+            "barcode": pa.array(barcodes, type=pa.string()),
+            "barcodes_are_rc": pa.array(rc, type=pa.bool_()),
+        }
+    )
+    pq.write_table(table, str(out_path))
+
+
 def _write_ena_run_map_parquet(roster: list[tuple[int, str]], out_path: Path) -> None:
     """Write the `{prep_sample_idx, ena_run_accession}` roster to a Parquet
     `(prep_sample_idx BIGINT, ena_run_accession VARCHAR)` for the
@@ -317,10 +346,151 @@ def _write_ena_run_map_parquet(roster: list[tuple[int, str]], out_path: Path) ->
     pq.write_table(table, str(out_path))
 
 
+async def _resolve_barcode_map(
+    pool: asyncpg.Pool,
+    action_context: dict[str, Any],
+    workspace: Path,
+    *,
+    sequencing_run_idx: int,
+    sequenced_pool_idx: int,
+) -> dict[str, Path]:
+    """Materialize the golay-demux barcode roster to a parquet, after checking it
+    against the pool's stored pre-flight. Mirrors `_resolve_sample_map`;
+    BAD_INPUT on a missing or empty roster, or one the pre-flight contradicts.
+
+    The submitter builds the roster (`cli/user/amplicon.py`), and a transposed
+    one would route one sample's reads under another's prep_sample_idx with
+    nothing downstream to notice. Every field of it is a fact the pre-flight
+    blob the pool carries already states, so the runner rebuilds the roster
+    from that blob and refuses a submitted one that differs.
+
+    Deliberately checked here at run time, not at submit (unlike the path
+    cross-checks that answer a synchronous 4xx): the stored blob is read once at
+    materialization, and a redrive re-checks against the pool's current blob."""
+    roster = action_context.get(BARCODE_MAP_BINDING)
+    if not roster:
+        raise _submission_bad_input("golay-demux requires a non-empty barcode_map")
+    expected = await _preflight_barcode_roster(
+        pool, sequencing_run_idx=sequencing_run_idx, sequenced_pool_idx=sequenced_pool_idx
+    )
+    mismatches = _barcode_roster_mismatches(roster, expected)
+    if mismatches:
+        raise _submission_bad_input(
+            "golay-demux barcode_map does not match sequenced_pool"
+            f" {sequenced_pool_idx}'s stored pre-flight: " + "; ".join(mismatches)
+        )
+    workspace.mkdir(parents=True, exist_ok=True)
+    out = workspace / "barcode_map.parquet"
+    _write_barcode_map_parquet(roster, out)
+    return {BARCODE_MAP_BINDING: out}
+
+
+async def _preflight_barcode_roster(
+    pool: asyncpg.Pool, *, sequencing_run_idx: int, sequenced_pool_idx: int
+) -> dict[int, AmpliconBarcode]:
+    """The pool's roster as its stored pre-flight states it:
+    `{prep_sample_idx: AmpliconBarcode}`, joining the blob's per-item barcodes to
+    the pool's sequenced samples. BAD_INPUT when the pool has no pre-flight, the
+    pre-flight fails `preflight.amplicon_samples`, or a pool sample has no row in
+    it."""
+    row = await fetch_sequenced_pool_preflight(
+        pool, sequencing_run_idx=sequencing_run_idx, sequenced_pool_idx=sequenced_pool_idx
+    )
+    if row is None or row["run_preflight_blob"] is None:
+        raise _submission_bad_input(
+            f"golay-demux: sequenced_pool {sequenced_pool_idx} carries no run pre-flight"
+            " to check barcode_map against"
+        )
+    try:
+        by_item_id = amplicon_barcode_from_blob(bytes(row["run_preflight_blob"]))
+    except AmpliconPreflightError as exc:
+        # Only the pre-flight's CONTENT being unusable for a roster is the
+        # submitter's bad input. A stored blob that cannot be READ at all —
+        # unreadable, or written against a newer pre-flight schema than this
+        # deployment ships (`open_blob` raises `ValueError`), or a dependency-drift
+        # shape error — is a deployment fault: let it propagate (→ 5xx), as the
+        # lane-update route does, rather than blame the submitter for the stored blob.
+        raise _submission_bad_input(
+            f"golay-demux: sequenced_pool {sequenced_pool_idx}'s stored pre-flight cannot"
+            f" supply a barcode roster: {exc}"
+        ) from exc
+    members = await fetch_sequenced_pool_item_prep_sample_idxs(pool, sequenced_pool_idx)
+    unknown = sorted(item_id for item_id in members if item_id not in by_item_id)
+    if unknown:
+        raise _submission_bad_input(
+            f"golay-demux: sequenced_pool {sequenced_pool_idx} has samples its stored"
+            " pre-flight does not list (sequenced_pool_item_id "
+            + ", ".join(unknown[:_MAX_ROSTER_MISMATCHES_SHOWN])
+            + (
+                f" and {len(unknown) - _MAX_ROSTER_MISMATCHES_SHOWN} more"
+                if len(unknown) > _MAX_ROSTER_MISMATCHES_SHOWN
+                else ""
+            )
+            + ")"
+        )
+    # A pool may legitimately hold only SOME of the blob's samples (a well dropped
+    # before pooling), so a blob entry with no pool member is not an error — but
+    # surface it rather than silently ignore, so a pool unexpectedly a subset of its
+    # pre-flight is visible. Those entries are simply not demultiplexed.
+    extra = sorted(item_id for item_id in by_item_id if item_id not in members)
+    if extra:
+        _log.info(
+            "golay-demux: sequenced_pool %s's stored pre-flight lists %d sample(s) absent"
+            " from the pool (sequenced_pool_item_id %s%s); they are not demultiplexed",
+            sequenced_pool_idx,
+            len(extra),
+            ", ".join(extra[:_MAX_ROSTER_MISMATCHES_SHOWN]),
+            f" and {len(extra) - _MAX_ROSTER_MISMATCHES_SHOWN} more"
+            if len(extra) > _MAX_ROSTER_MISMATCHES_SHOWN
+            else "",
+        )
+    return {prep_sample_idx: by_item_id[item_id] for item_id, prep_sample_idx in members.items()}
+
+
+# How many entries a roster message names before the rest are counted — shared by
+# the mismatch, unknown-sample and absent-from-pool messages.
+_MAX_ROSTER_MISMATCHES_SHOWN = 5
+
+
+def _barcode_roster_mismatches(
+    submitted: list[dict[str, Any]], expected: dict[int, AmpliconBarcode]
+) -> list[str]:
+    """Each way a submitted roster differs from the pre-flight's, worded for the
+    submitter; empty when they agree exactly (same samples, barcodes, and
+    orientation)."""
+    problems: list[str] = []
+    seen: set[int] = set()
+    for entry in submitted:
+        idx = entry["prep_sample_idx"]
+        if idx in seen:
+            problems.append(f"prep_sample_idx {idx} appears more than once")
+            continue
+        seen.add(idx)
+        want = expected.get(idx)
+        if want is None:
+            problems.append(f"prep_sample_idx {idx} is not a sample of this pool")
+        elif entry["barcode"].upper() != want.barcode.upper():
+            # Case-insensitive: the golay-demux job upper-cases barcodes before
+            # decoding (jobs/golay_demux.py), so case is not a real difference.
+            problems.append(
+                f"prep_sample_idx {idx} has barcode {entry['barcode']!r}, the pre-flight"
+                f" says {want.barcode!r}"
+            )
+        elif bool(entry["barcodes_are_rc"]) != want.barcodes_are_rc:
+            problems.append(
+                f"prep_sample_idx {idx} has barcodes_are_rc {entry['barcodes_are_rc']},"
+                f" the pre-flight says {want.barcodes_are_rc}"
+            )
+    for idx in sorted(set(expected) - seen):
+        problems.append(f"prep_sample_idx {idx} is missing from barcode_map")
+    return capped(problems, _MAX_ROSTER_MISMATCHES_SHOWN)
+
+
 async def _stage_ena_run_roster(
     pool: asyncpg.Pool,
     sequenced_pool_idx: int,
     *,
+    sequencing_run_idx: int,
     workspace: Path,
 ) -> dict[str, Path]:
     """Stage the download-ena-study pool's run roster before the step loop.
@@ -341,8 +511,18 @@ async def _stage_ena_run_roster(
     `ena_run_accession` is NULL: a download-ena-study ticket only makes sense
     against ENA-origin sequenced_samples, so a NULL accession is a
     misconfiguration (e.g. a non-ENA sample sharing the pool) that must never
-    be silently skipped out of the roster."""
-    rows = await fetch_sequenced_pool_ena_run_roster(pool, sequenced_pool_idx=sequenced_pool_idx)
+    be silently skipped out of the roster.
+
+    The read runs in a transaction holding `lock_sequencing_run`, so it waits
+    for an in-flight registration or native insert that already picked this
+    pool to commit first (see the helper for the race that closes). This
+    resolver also re-runs on a resume or a `/run` redrive, not only at first
+    dispatch, and a re-read may add runs or pick up a PATCHed run accession."""
+    async with pool.acquire() as conn, conn.transaction():
+        await lock_sequencing_run(conn, sequencing_run_idx=sequencing_run_idx)
+        rows = await fetch_sequenced_pool_ena_run_roster(
+            conn, sequenced_pool_idx=sequenced_pool_idx
+        )
     if not rows:
         raise _submission_bad_input(
             f"sequenced_pool {sequenced_pool_idx} has no sequenced_samples to build "
@@ -359,6 +539,37 @@ async def _stage_ena_run_roster(
     out = workspace / "ena_run_map.parquet"
     _write_ena_run_map_parquet(roster, out)
     return {ENA_RUN_MAP_BINDING: out}
+
+
+async def _stage_ena_run_roster_binding(
+    pool: asyncpg.Pool,
+    *,
+    action_steps: list[Any],
+    scope_target: dict[str, Any],
+    workspace: Path,
+) -> dict[str, Path] | None:
+    """Stage the `ena_run_map` roster for a workflow that declares that input
+    (the download-ena-study workflow's `ingest_ena_reads` step); None when the
+    workflow declares no `ena_run_map` input.
+
+    The roster comes from a LIVE Postgres query (unlike `sample_map`, which the
+    CP composer embeds in action_context at submit time): reading it live keeps
+    the two ticket-creation paths from having to agree on a duplicated roster
+    shape, and picks up a post-submit registration correction rather than a
+    submit-time snapshot. Dispatched by DECLARED-INPUT NAME, not scope-kind:
+    bcl-convert is also sequenced_pool-scoped, so keying off scope-kind would
+    wire this resolver into its ticket too. Called inside run_workflow's
+    pre-loop try, so an empty-pool / missing-accession failure lands in the
+    outer FAILED handler.
+    """
+    if not _workflow_declares_input(action_steps, ENA_RUN_MAP_BINDING):
+        return None
+    return await _stage_ena_run_roster(
+        pool,
+        scope_target["sequenced_pool_idx"],
+        sequencing_run_idx=scope_target["sequencing_run_idx"],
+        workspace=workspace,
+    )
 
 
 def _do_action_export(action_type: str, data_plane_url: str, token: bytes) -> dict[str, Any]:
@@ -429,16 +640,9 @@ def _stream_masked_reads_to_fastq(data_plane_url: str, ticket_bytes: bytes, dest
 
 
 async def _prep_sample_is_expected_empty_control(pool: asyncpg.Pool, prep_sample_idx: int) -> bool:
-    """True when this prep_sample's biosample is flagged an expected-empty control
-    (host_taxon_id == "missing: control sample"). Resolves prep_sample → biosample,
-    then defers the control classification to `is_control_sample` so the definition
-    of "control" stays shared with the host-filter resolver. Fail-safe on a missing
-    prep_sample (returns False → the zero-read ticket FAILs as a data well).
-
-    Covers BOTH positive and negative controls, because the persisted control
-    marker cannot yet tell them apart — see the KNOWN LIMITATION in
-    `is_control_sample`: a positive control (katharoseq) that yields zero reads is
-    currently classified `no_data` too, though it is really a failure."""
+    """True when this prep_sample's biosample is an expected-empty control, per
+    `is_control_sample`. Fail-safe on a missing prep_sample (False → the zero-read
+    ticket FAILs as a data well)."""
     biosample_idx = await fetch_biosample_idx_for_prep_sample(pool, prep_sample_idx)
     if biosample_idx is None:
         return False
@@ -465,14 +669,15 @@ async def _resolve_staged_reads(
     Either source binds the same `reads` path; they are byte-equivalent modulo row
     order, and qc / host_filter are order-independent.
 
-    Zero stored reads splits on whether the well is an expected-empty control: a
-    blank / no-template control legitimately produces no reads, so it ends the
-    ticket at a benign terminal `no_data` (StepNoData); a data well with no reads
-    is a genuine failure and stays SUBMISSION/BAD_INPUT (FAILED) — it must be
-    ingested before a mask can be created over it. (An unreachable data plane is
-    likewise SUBMISSION/BAD_INPUT.) Without this split every empty well — control
-    or data — lands in the pool's `samples_failed`, burying real failures among
-    blanks doing their job."""
+    Zero stored reads ends the ticket at a benign terminal `no_data` (StepNoData)
+    when ingest read the prep_sample and found it empty (`fetch_empty_ingest_tickets`)
+    — the run handler then records it as masked with an empty pass-set — or when it
+    is an expected-empty control (a blank / no-template control legitimately
+    produces no reads). Anything else is SUBMISSION/BAD_INPUT (FAILED): nothing shows
+    the prep_sample was ingested, so it must be before a mask can be created over it.
+    (An unreachable data plane is likewise SUBMISSION/BAD_INPUT.) Without this split
+    every empty well lands in the pool's `samples_failed`, burying real failures
+    among wells that were simply empty."""
     prep_sample_idx = scope_target["prep_sample_idx"]
 
     durable = compute_reads_staging_path(staging_root, prep_sample_idx)
@@ -508,12 +713,19 @@ async def _resolve_staged_reads(
     # `count` is already an int (coerced in `_do_action_export_read`).
     if result.get("count", 0) == 0:
         # The persistent store has no reads for this sample either (the data plane
-        # writes no file for an empty result). Split control from data: an
-        # expected-empty control (blank / NTC) reading zero is the benign, correct
-        # outcome → terminal no_data; a data well reading zero is a real failure →
-        # BAD_INPUT (must be ingested before a mask can be created over it). The
-        # control marker is the persisted biosample host_taxon_id == "missing:
-        # control sample" (see `is_control_sample`).
+        # writes no file for an empty result). See the docstring for the split.
+        empty_ingest_ticket_idx = (
+            await fetch_empty_ingest_tickets(
+                pool, prep_sample_idxs=[prep_sample_idx], current_work_ticket_idx=None
+            )
+        ).get(prep_sample_idx)
+        if empty_ingest_ticket_idx is not None:
+            raise StepNoData(
+                reason=(
+                    f"prep_sample {prep_sample_idx} has no stored reads: ingest ticket "
+                    f"{empty_ingest_ticket_idx} read it and found it empty"
+                )
+            )
         if await _prep_sample_is_expected_empty_control(pool, prep_sample_idx):
             raise StepNoData(
                 reason=(
@@ -523,9 +735,9 @@ async def _resolve_staged_reads(
                 )
             )
         raise _submission_bad_input(
-            f"no stored reads for prep_sample {prep_sample_idx}; the sample must be "
-            "ingested (submit-bcl-convert stores reads) before a read mask can be "
-            "created over it"
+            f"no stored reads for prep_sample {prep_sample_idx}, and no ingest shows it "
+            "was read and found empty (it has none, or its newest did not end that way); "
+            "the prep_sample must be ingested before a read mask can be created over it"
         )
     if not dest.exists():
         # The data plane reported reads but no file landed at dest (a data-plane
@@ -574,7 +786,7 @@ async def _resolve_staged_masked_reads(
     gate_state = await fetch_mask_sample_state(
         pool, mask_idx=mask_idx, prep_sample_idx=prep_sample_idx
     )
-    if gate_state != "completed":
+    if gate_state != MASK_SAMPLE_COMPLETED:
         raise _submission_bad_input(
             f"mask_idx {mask_idx} is not masked-complete for prep_sample {prep_sample_idx} "
             f"(mask_sample.state={gate_state!r}); no completed read-mask exists for this "

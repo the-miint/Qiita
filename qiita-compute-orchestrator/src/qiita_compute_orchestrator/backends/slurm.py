@@ -23,10 +23,11 @@ from __future__ import annotations
 import json
 import logging
 import os
+import signal
 from datetime import timedelta
 from pathlib import Path
 
-from qiita_common.actions import BaselineResources
+from qiita_common.actions import STEP_LOGS_SUBDIR, STEP_OUTPUT_SUBDIR, BaselineResources
 from qiita_common.backend_failure import BackendFailure, FailureKind, StepNoData
 from qiita_common.duckdb_miint import miint_job_env
 from qiita_common.log_tail import contains_oom_signature, read_text_tail
@@ -94,6 +95,9 @@ _STATE_TO_FAILURE_KIND: dict[TerminalSlurmState, FailureKind] = {
 _OOM_UPGRADABLE_KINDS: frozenset[FailureKind] = frozenset(
     {FailureKind.EXIT_NONZERO, FailureKind.UNKNOWN_PERMANENT}
 )
+
+# The job's exit status when its child process is killed by SIGSEGV.
+_SEGFAULT_EXIT_CODE = 128 + signal.SIGSEGV
 
 # Bounds for the stderr tail folded into `failure_reason` on a state-based
 # (no launcher-line) failure. Deliberately small — `failure_reason` is
@@ -409,8 +413,8 @@ class SlurmBackend(ComputeBackend):
         #   <workspace>/logs/    SLURM stdout / stderr land here
         #   <workspace>/tmp/     the container's TMPDIR (see below)
         input_path = workspace / "input"
-        output_path = workspace / "output"
-        logs_path = workspace / "logs"
+        output_path = workspace / STEP_OUTPUT_SUBDIR
+        logs_path = workspace / STEP_LOGS_SUBDIR
         # `apptainer exec --containall` gives the container a *tmpfs* /tmp sized by
         # the host's `sessiondir max size` — 64 MiB on the live deploy — and scrubs
         # the environment, so TMPDIR is unset and a bare `mktemp -d` lands there.
@@ -574,7 +578,7 @@ class SlurmBackend(ComputeBackend):
         once `status_step` reports the job terminal."""
         self._require_slurm_handle(handle)
         if status.status == StepStatus.COMPLETED:
-            failures = verify_container_output(handle.output_path)
+            failures = verify_container_output(handle.output_path, recovered=status.recovered)
             if failures:
                 # Container exited 0 but didn't honor the contract — gate
                 # 2/3/4 violation. Permanent: same container against same
@@ -653,10 +657,10 @@ class SlurmBackend(ComputeBackend):
             )
 
         # No structured launcher line (a container step, or the process was
-        # infra-killed — including by OOM — before it could write one). Read
-        # the stderr tail: a step-level cgroup oom_kill surfaces only as the
-        # coarse FAILED/exit_code=1 above, so the stderr text is the one
-        # in-band signal that an otherwise-opaque failure was a memory kill.
+        # killed — by a segfault, or by infra including OOM — before it could
+        # write one). A segfault is told by its exit code; a step-level cgroup
+        # oom_kill surfaces only as the coarse FAILED/exit_code=1 above, so the
+        # stderr text is the one in-band signal that it was a memory kill.
         # Fold the tail into failure_reason either way so `qiita ticket status`
         # carries the real error without a host shell.
         stderr_tail, _ = read_text_tail(
@@ -664,7 +668,12 @@ class SlurmBackend(ComputeBackend):
             max_lines=_FAILURE_REASON_TAIL_LINES,
             max_bytes=_FAILURE_REASON_TAIL_BYTES,
         )
-        if kind in _OOM_UPGRADABLE_KINDS and contains_oom_signature(stderr_tail):
+        if (
+            status.raw_state == TerminalSlurmState.FAILED
+            and status.exit_code == _SEGFAULT_EXIT_CODE
+        ):
+            kind = FailureKind.SEGFAULT
+        elif kind in _OOM_UPGRADABLE_KINDS and contains_oom_signature(stderr_tail):
             kind = FailureKind.OOM_KILLED
         reason = f"{state_reason}; stderr tail: {stderr_tail}" if stderr_tail else state_reason
         raise BackendFailure(

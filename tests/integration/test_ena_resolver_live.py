@@ -11,6 +11,7 @@ and stable is what a column-drift guard needs, not a growing crowdsourced projec
 """
 
 import pytest
+from qiita_common.models.ena import EnaStatus
 
 from qiita_control_plane.ena_import.miint_resolver import MiintEnaResolver
 
@@ -25,6 +26,7 @@ def test_miint_resolver_resolves_a_real_small_stable_study():
     assert header.study_accession == _STUDY_ACCESSION
     assert header.secondary_study_accession
     assert header.study_title
+    assert header.status is EnaStatus.PUBLIC
 
     runs = resolver.resolve_ena_runs(_STUDY_ACCESSION)
     assert len(runs) >= 2
@@ -38,6 +40,7 @@ def test_miint_resolver_resolves_a_real_small_stable_study():
         assert run.fastq_md5
         assert run.read_count is not None
         assert run.base_count is not None
+        assert run.status is EnaStatus.PUBLIC
 
     attrs = resolver.resolve_sample_attributes(_STUDY_ACCESSION)
     assert len(attrs) >= 1
@@ -55,3 +58,24 @@ def test_miint_resolver_unresolvable_accession_fails_loud():
     # A well-formed but non-existent BioProject accession.
     with pytest.raises(EnaAccessionNotFoundError):
         resolver.resolve_study_header("PRJNA00000000")
+
+
+@pytest.mark.system
+def test_miint_resolver_resolves_a_run_list_in_one_query():
+    resolver = MiintEnaResolver()
+    requested = ["SRR096342", "SRR096343"]
+
+    runs = resolver.resolve_runs(requested)
+    assert sorted(run.run_accession for run in runs) == requested
+    assert {run.study_accession for run in runs} == {_STUDY_ACCESSION}
+
+    samples = sorted({run.sample_accession for run in runs})
+    attrs = resolver.resolve_sample_attributes_for_samples(samples)
+    assert [a.sample_accession for a in attrs] == samples
+    assert all(a.attributes for a in attrs)
+
+
+@pytest.mark.system
+def test_miint_resolver_run_list_omits_an_unknown_run_without_raising():
+    runs = MiintEnaResolver().resolve_runs(["SRR096342", "SRR999999999"])
+    assert [run.run_accession for run in runs] == ["SRR096342"]

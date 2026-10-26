@@ -67,6 +67,8 @@ from qiita_common.actions import ALIGN_ACTION_ID, BLOCK_MASK_ACTION_ID
 # cohort in the fan-out routes), so they live with the models rather than here.
 from qiita_common.models import MAX_FANOUT_OVERRIDE, FanoutCohortKind, FanoutCohortStatus
 
+from qiita_control_plane.repositories import INT4_MASK
+
 _log = logging.getLogger(__name__)
 
 # Default per-cohort in-flight cap, the single source of truth for the number.
@@ -80,10 +82,9 @@ _LOCK_CLASS_SHARD = 0x0FA0_0001
 _LOCK_CLASS_READ_MASK_BLOCK = 0x0FA0_0002
 _LOCK_CLASS_ALIGN_BLOCK = 0x0FA0_0003
 
-# pg advisory-lock keys are int4; mask the (bigint) cohort id into positive
-# int4. A wrap collision only serialises two unrelated cohorts of the SAME type
-# for a moment — harmless (see module docstring).
-_INT4_MASK = 0x7FFF_FFFF
+# pg advisory-lock keys are int4; mask the (bigint) cohort id with the shared
+# INT4_MASK (repositories). A wrap collision here only serialises two unrelated
+# cohorts of the SAME type for a moment — harmless (see module docstring).
 
 # The only two ticket predicates `_cohorts_matching` will interpolate. Constants, not
 # literals at the call sites, so the "module-internal SQL only" constraint is checkable
@@ -150,7 +151,7 @@ def shard_cohort(reference_idx: int) -> FanoutCohort:
         where_sql="reference_idx = $1 AND shard_id IS NOT NULL",
         args=(reference_idx,),
         lock_class=_LOCK_CLASS_SHARD,
-        lock_key=reference_idx & _INT4_MASK,
+        lock_key=reference_idx & INT4_MASK,
     )
 
 
@@ -166,7 +167,7 @@ def read_mask_block_cohort(mask_idx: int) -> FanoutCohort:
         where_sql="mask_idx = $1 AND block_idx IS NOT NULL AND action_id = $2",
         args=(mask_idx, BLOCK_MASK_ACTION_ID),
         lock_class=_LOCK_CLASS_READ_MASK_BLOCK,
-        lock_key=mask_idx & _INT4_MASK,
+        lock_key=mask_idx & INT4_MASK,
     )
 
 
@@ -192,7 +193,7 @@ def align_block_cohort(alignment_idx: int) -> FanoutCohort:
         where_sql="alignment_idx = $1 AND block_idx IS NOT NULL AND action_id = $2",
         args=(alignment_idx, ALIGN_ACTION_ID),
         lock_class=_LOCK_CLASS_ALIGN_BLOCK,
-        lock_key=alignment_idx & _INT4_MASK,
+        lock_key=alignment_idx & INT4_MASK,
     )
 
 
@@ -363,7 +364,10 @@ async def top_up_dispatch(
             return []
 
         # Occupied slots = released (NOT held) tickets still in flight. A held
-        # ticket occupies no slot; a just-released-but-still-'pending' one does.
+        # ticket occupies no slot; a just-released-but-still-'pending' one does
+        # — including one still queued for a dispatch slot (see
+        # dispatch._DISPATCH_CONCURRENCY), so a cohort reading "at its cap" can
+        # be queued rather than executing; it is durably next in line either way.
         running = await conn.fetchval(
             f"SELECT count(*) FROM qiita.work_ticket"
             f" WHERE {where} AND NOT dispatch_held"

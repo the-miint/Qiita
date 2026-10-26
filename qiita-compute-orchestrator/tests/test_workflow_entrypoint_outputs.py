@@ -40,6 +40,9 @@ _WORKFLOWS_DIR = _REPO_ROOT / "workflows"
 # file exists for is invisible until a ticket runs.
 _EXPECTED_ENTRYPOINTS = {
     ("bcl-convert", "bcl_convert"),
+    # golay-demux reuses bcl-convert's image for its bcl_convert step, so its
+    # entrypoint script lives in workflows/bcl-convert/, not beside this YAML.
+    ("golay-demux", "bcl_convert"),
     ("long-read-assembly", "assemble"),
     ("long-read-assembly", "binning"),
     ("long-read-assembly", "bin_refine"),
@@ -53,14 +56,39 @@ _EXPECTED_ENTRYPOINTS = {
 _PAIR = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=([^\s]+)$")
 
 
+def _sif_owner_dirs() -> dict[str, Path]:
+    """Map each SIF filename to the workflow directory that builds it.
+
+    A step may reuse another workflow's image (golay-demux's `bcl_convert` step
+    runs `bcl-convert-4.5.4.sif`), in which case the entrypoint script is
+    `%files`-copied from the OWNING workflow, not the one declaring the step. The
+    owner is the workflow whose sif-build config (`sif-build.env`, or a
+    `sif-build.d/<step>.env`) declares `SIF_FILENAME`.
+    """
+    owners: dict[str, Path] = {}
+    env_files = list(_WORKFLOWS_DIR.glob("*/sif-build.env")) + list(
+        _WORKFLOWS_DIR.glob("*/sif-build.d/*.env")
+    )
+    for env in env_files:
+        wf_dir = env.parent.parent if env.parent.name == "sif-build.d" else env.parent
+        for line in env.read_text().splitlines():
+            match = re.match(r'\s*SIF_FILENAME\s*=\s*"?([^"\s]+)"?', line)
+            if match:
+                owners[match.group(1)] = wf_dir
+    return owners
+
+
 def _container_steps() -> list[tuple[str, str, Path, set[str]]]:
     """(workflow dir name, step name, entrypoint script, declared outputs).
 
     Only `container:` steps with an `entrypoint:`. The entrypoint is an
     in-container path (`/opt/qiita/assemble.sh`); the def `%files`-copies it from
-    the workflow directory under its own basename, so that is what resolves it
-    back to a repo file.
+    a workflow directory under its own basename, so that is what resolves it back
+    to a repo file. That directory is the step's own workflow, EXCEPT when the
+    step reuses another workflow's image, so the script resolves against the dir
+    that owns the SIF when it is not beside the step's YAML.
     """
+    sif_owners = _sif_owner_dirs()
     found: list[tuple[str, str, Path, set[str]]] = []
     for yaml_path in sorted(_WORKFLOWS_DIR.rglob("*.yaml")):
         data = yaml.safe_load(yaml_path.read_text())
@@ -76,11 +104,16 @@ def _container_steps() -> list[tuple[str, str, Path, set[str]]]:
             entrypoint = step.get("entrypoint")
             if not entrypoint:
                 continue
+            script = yaml_path.parent / Path(entrypoint).name
+            if not script.is_file():
+                owner = sif_owners.get(step["container"])
+                if owner is not None:
+                    script = owner / Path(entrypoint).name
             found.append(
                 (
                     yaml_path.parent.name,
                     step["step"],
-                    yaml_path.parent / Path(entrypoint).name,
+                    script,
                     set(step.get("outputs") or []),
                 )
             )

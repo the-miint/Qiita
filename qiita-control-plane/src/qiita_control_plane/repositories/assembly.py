@@ -25,12 +25,16 @@ from qiita_common.models import AssemblySampleState
 
 from . import gate_state_literal, require_transaction
 
-# The two `assembly_sample` states a consumer of contigs may proceed on, asserted
-# against the Literal so a renamed member fails at import rather than matching no
-# rows. Every other value, and absence, is a refusal — `fetch_assembly_sample_state`
-# is the contract that says which is which.
+# The `assembly_sample` states, asserted against the Literal so a renamed member fails
+# at import rather than matching no rows. The service's comparisons against the gate
+# import them and this module's SQL binds them; the user CLI, which imports nothing
+# from `repositories`, checks its own pair against the Literal. A consumer of contigs
+# proceeds on `completed` alone (`no_data` being "nothing to consume");
+# `fetch_assembly_sample_state` is the contract.
 ASSEMBLY_SAMPLE_COMPLETED = gate_state_literal("completed", AssemblySampleState)
 ASSEMBLY_SAMPLE_NO_DATA = gate_state_literal("no_data", AssemblySampleState)
+ASSEMBLY_SAMPLE_PENDING = gate_state_literal("pending", AssemblySampleState)
+ASSEMBLY_SAMPLE_INVALIDATED = gate_state_literal("invalidated", AssemblySampleState)
 
 
 def assembly_genome_source_id(
@@ -205,11 +209,13 @@ async def create_assembly_sample_pending(
     require_transaction(conn)
     await conn.execute(
         "INSERT INTO qiita.assembly_sample (processing_idx, prep_sample_idx, state)"
-        " VALUES ($1, $2, 'pending')"
-        " ON CONFLICT (processing_idx, prep_sample_idx) DO UPDATE SET state = 'pending'"
-        "   WHERE qiita.assembly_sample.state = 'no_data'",
+        " VALUES ($1, $2, $3)"
+        " ON CONFLICT (processing_idx, prep_sample_idx) DO UPDATE SET state = $3"
+        "   WHERE qiita.assembly_sample.state = $4",
         processing_idx,
         prep_sample_idx,
+        ASSEMBLY_SAMPLE_PENDING,
+        ASSEMBLY_SAMPLE_NO_DATA,
     )
 
 
@@ -263,12 +269,14 @@ async def upsert_assembly_sample_completed(
     require_transaction(conn)
     written = await conn.fetchval(
         "INSERT INTO qiita.assembly_sample (processing_idx, prep_sample_idx, state)"
-        " VALUES ($1, $2, 'completed')"
-        " ON CONFLICT (processing_idx, prep_sample_idx) DO UPDATE SET state = 'completed'"
-        "   WHERE qiita.assembly_sample.state <> 'invalidated'"
+        " VALUES ($1, $2, $3)"
+        " ON CONFLICT (processing_idx, prep_sample_idx) DO UPDATE SET state = $3"
+        "   WHERE qiita.assembly_sample.state <> $4"
         " RETURNING prep_sample_idx",
         processing_idx,
         prep_sample_idx,
+        ASSEMBLY_SAMPLE_COMPLETED,
+        ASSEMBLY_SAMPLE_INVALIDATED,
     )
     if written is None:
         raise AssemblySampleInvalidated(
@@ -310,12 +318,15 @@ async def upsert_assembly_sample_no_data(
     require_transaction(conn)
     written = await conn.fetchval(
         "INSERT INTO qiita.assembly_sample (processing_idx, prep_sample_idx, state)"
-        " VALUES ($1, $2, 'no_data')"
-        " ON CONFLICT (processing_idx, prep_sample_idx) DO UPDATE SET state = 'no_data'"
-        "   WHERE qiita.assembly_sample.state NOT IN ('completed', 'invalidated')"
+        " VALUES ($1, $2, $3)"
+        " ON CONFLICT (processing_idx, prep_sample_idx) DO UPDATE SET state = $3"
+        "   WHERE qiita.assembly_sample.state NOT IN ($4, $5)"
         " RETURNING prep_sample_idx",
         processing_idx,
         prep_sample_idx,
+        ASSEMBLY_SAMPLE_NO_DATA,
+        ASSEMBLY_SAMPLE_COMPLETED,
+        ASSEMBLY_SAMPLE_INVALIDATED,
     )
     if written is not None:
         return None
@@ -620,3 +631,51 @@ async def count_assembly_membership_without_genome(
         processing_idx,
     )
     return {r["prep_sample_idx"]: r["n"] for r in rows}
+
+
+# =============================================================================
+# The export reads: every membership row of one run, and the readable roster
+# =============================================================================
+
+# One run's membership rows, every kind, with the assembler's report — the row set
+# both membership forms serve (the capped JSON read appends its LIMIT as `$3`; the
+# uncapped Parquet body binds nothing further). No `genome_idx` and no kind
+# allowlist, which are the two things that separate it from the genome map: an
+# export names a subject by `(kind, bin_id)`, and a residue contig is a subject a
+# person may want to look at even though no feature table counts it.
+#
+# The Postgres copy, which keeps a superseded row where the lake's copy replaced it
+# (`routes/assembly.py` module docstring). A consumer pairing these rows with the
+# run's streamed contigs compares the two feature sets rather than trusting either.
+ASSEMBLY_MEMBERSHIP_ROWS_SQL = (
+    "SELECT feature_idx, kind, bin_id, raw_name, circularity, depth, mult"
+    " FROM qiita.assembly_membership"
+    " WHERE prep_sample_idx = $1 AND processing_idx = $2"
+    " ORDER BY kind, bin_id, feature_idx"
+)
+
+
+async def fetch_assembly_membership(
+    db: asyncpg.Pool | asyncpg.Connection,
+    *,
+    prep_sample_idx: int,
+    processing_idx: int,
+    limit: int,
+) -> list[asyncpg.Record]:
+    """At most `limit` of one run's membership rows, in `ASSEMBLY_MEMBERSHIP_ROWS_SQL`
+    order."""
+    return await db.fetch(
+        ASSEMBLY_MEMBERSHIP_ROWS_SQL + " LIMIT $3", prep_sample_idx, processing_idx, limit
+    )
+
+
+async def count_assembly_membership(
+    db: asyncpg.Pool | asyncpg.Connection, *, prep_sample_idx: int, processing_idx: int
+) -> int:
+    """How many rows `fetch_assembly_membership` would return uncapped."""
+    return await db.fetchval(
+        "SELECT count(*) FROM qiita.assembly_membership"
+        " WHERE prep_sample_idx = $1 AND processing_idx = $2",
+        prep_sample_idx,
+        processing_idx,
+    )

@@ -1,0 +1,22 @@
+{
+  "_source": "read_ena_attributes('SAMN45806981') via miint extension_version 96630a5 on 2026-10-05; cross-checked against https://www.ebi.ac.uk/ena/browser/api/xml/SAMN45806981",
+  "columns": ["sample_accession", "tag", "value"],
+  "rows": [
+    ["SAMN45806981", "collection_date", "2017"],
+    ["SAMN45806981", "ENA-FIRST-PUBLIC", "2024-12-13T01:09:31Z"],
+    ["SAMN45806981", "organism", "human metagenome"],
+    ["SAMN45806981", "ENA-LAST-UPDATE", "2024-12-13T01:09:31Z"],
+    ["SAMN45806981", "env_broad_scale", "Breast tissue"],
+    ["SAMN45806981", "host", "Homo sapiens"],
+    ["SAMN45806981", "BioSampleModel", "MIGS/MIMS/MIMARKS.human-associated"],
+    ["SAMN45806981", "BioSampleModel", "MIMARKS.survey"],
+    ["SAMN45806981", "geo_loc_name", "Argentina"],
+    ["SAMN45806981", "scientific_name", "human metagenome"],
+    ["SAMN45806981", "ID", "8"],
+    ["SAMN45806981", "env_medium", "Breast tumor tissue"],
+    ["SAMN45806981", "lat_lon", "38.42 S 63.61 W"],
+    ["SAMN45806981", "env_local_scale", "Breast tumor tissue"],
+    ["SAMN45806981", "ENA-FIRST-PUBLIC", "2024-12-13"],
+    ["SAMN45806981", "ENA-LAST-UPDATE", "2024-12-13"]
+  ]
+}

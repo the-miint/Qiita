@@ -1,16 +1,24 @@
-"""Assembly read routes: the DoGet tickets, and the run's contig -> genome map.
+"""Assembly read routes: the DoGet tickets, the run's contig -> genome map, its
+membership rows, and the roster of runs a caller may export.
 
 ``POST /assembly/ticket/doget`` and
 ``POST /assembly/{prep_sample_idx}/{processing_idx}/ticket/doget`` both sign an
 Ed25519 Flight DoGet ticket for the contig sequences ONE assembly run produced — a
 ``(prep_sample_idx, processing_idx)`` pair — on the data plane's
-``assembled_sequence`` / ``assembled_sequence_chunks`` tables. Same signed filter,
-same surfaces; they differ in who may ask and how the run is authorized, the way
+``assembled_sequence`` / ``assembled_sequence_chunks`` tables, with the same signed
+filter; they differ in who may ask and how the run is authorized, the way
 ``/alignment``'s two mints do (``Scope.ASSEMBLY_DOGET`` carries the argument).
+
+The human mint also signs ``bin_quality`` for the run: per-subject CheckM, which the
+data plane's ``ALLOWED_TABLES`` entry carries the privacy argument for. The
+service-account mint does not; the feature-table resolver signs that table
+in-process instead.
 
 ``GET /assembly/{prep_sample_idx}/{processing_idx}/genome-map[/parquet]`` is not a ticket:
 ``genome_idx`` lives only in Postgres, so there is nothing for the data plane to
 serve, and it is a control-plane read like its reference twin.
+``GET .../membership[/parquet]`` is its sibling over every kind, and
+``GET /assembly/{processing_idx}/prep-sample`` is the roster an export walks.
 
 The pair itself is what rides the ticket. Neither lake table has a
 ``prep_sample_idx`` column — a contig is stored once, keyed by the
@@ -33,32 +41,41 @@ import base64
 from typing import Annotated
 
 import asyncpg
-from fastapi import APIRouter, Depends, HTTPException, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from pydantic import Field
 from qiita_common.api_paths import (
     PATH_ASSEMBLY_DOGET,
     PATH_ASSEMBLY_GENOME_MAP,
     PATH_ASSEMBLY_GENOME_MAP_PARQUET,
+    PATH_ASSEMBLY_MEMBERSHIP,
+    PATH_ASSEMBLY_MEMBERSHIP_PARQUET,
     PATH_ASSEMBLY_PREFIX,
+    PATH_ASSEMBLY_PREP_SAMPLE,
     PATH_ASSEMBLY_RUN_DOGET,
 )
 from qiita_common.assembly_constants import (
     ASSEMBLED_SEQUENCE_CHUNKS_TABLE,
     ASSEMBLED_SEQUENCE_TABLE,
+    BIN_QUALITY_TABLE,
 )
 from qiita_common.auth_constants import Scope
 from qiita_common.models import (
     AssemblyDoGetTicketRequest,
+    AssemblyExportRosterResponse,
     AssemblyGenomeMapResponse,
+    AssemblyMembershipEntry,
+    AssemblyMembershipResponse,
     AssemblyRunDoGetTicketRequest,
     DoGetTicketResponse,
     GenomeMapEntry,
+    ProcessingPrepSample,
 )
 from qiita_common.parquet import PARQUET_MEDIA_TYPE, PARQUET_RESPONSES
 
-from ..actions.library import assembly_genome_map_parquet
+from ..actions.library import assembly_genome_map_parquet, assembly_membership_parquet
 from ..auth.guards import (
     COHORT_MIN_TIER,
+    filter_prep_samples_caller_can_read,
     require_complete_profile,
     require_scope,
     require_service_with_scope,
@@ -70,13 +87,25 @@ from ..repositories.assembly import (
     ASSEMBLY_SAMPLE_COMPLETED,
     ASSEMBLY_SAMPLE_NO_DATA,
     count_assembly_genome_map,
+    count_assembly_membership,
     count_assembly_membership_without_genome,
     fetch_assembly_genome_map,
+    fetch_assembly_membership,
     fetch_assembly_sample_state,
 )
-from ._helpers import GENOME_MAP_HARD_CAP, authorize_prep_sample_cohort
+from ..repositories.processing import fetch_processing_by_idx, fetch_processing_prep_samples
+from ._helpers import GATE_ROSTER_HARD_CAP, GENOME_MAP_HARD_CAP, authorize_prep_sample_cohort
 
 ASSEMBLY_DOGET_TABLES = frozenset({ASSEMBLED_SEQUENCE_TABLE, ASSEMBLED_SEQUENCE_CHUNKS_TABLE})
+# What the HUMAN mint signs: the two sequence surfaces plus the run's CheckM rows.
+# `bin_quality` is not added to the service mint, whose one consumer (the
+# feature-table resolver) signs it in-process for a whole cohort.
+ASSEMBLY_RUN_DOGET_TABLES = ASSEMBLY_DOGET_TABLES | {BIN_QUALITY_TABLE}
+
+# The membership read's JSON cap, sized to `GENOME_MAP_HARD_CAP`'s body budget
+# (`routes/_helpers.py`) at this read's entry size: 187 bytes with a myloasm-style
+# `raw_name`, measured over 250,000 entries. The Parquet sibling has no cap.
+ASSEMBLY_MEMBERSHIP_HARD_CAP = 120_000
 
 assembly_router = APIRouter(prefix=PATH_ASSEMBLY_PREFIX, tags=["assembly"])
 
@@ -127,6 +156,7 @@ async def create_assembly_doget_ticket(
         prep_sample_idx=body.prep_sample_idx,
         processing_idx=body.processing_idx,
         table=body.table,
+        allowed_tables=ASSEMBLY_DOGET_TABLES,
         signing_key=signing_key,
     )
 
@@ -147,19 +177,20 @@ async def _sign_assembly_ticket(
     prep_sample_idx: int,
     processing_idx: int,
     table: str,
+    allowed_tables: frozenset[str],
     signing_key: bytes,
 ) -> DoGetTicketResponse:
     """Sign the assembly DoGet ticket both mint routes return.
 
-    Shared so the allowed table set, the 404 on a run with no contigs, and the
-    signed filter's shape have one definition across the two mint routes — the same
-    device `_sign_alignment_ticket` is. What they do not share is authorization,
-    which is the whole difference between them.
+    Shared so the 404 on a run with no contigs and the signed filter's shape have
+    one definition across the two mint routes — the same device
+    `_sign_alignment_ticket` is. What they do not share is authorization, which is
+    the whole difference between them, and the table set, which each route passes.
     """
-    if table not in ASSEMBLY_DOGET_TABLES:
+    if table not in allowed_tables:
         raise HTTPException(
             status_code=422,
-            detail=f"Unknown table {table!r}; allowed: {sorted(ASSEMBLY_DOGET_TABLES)}",
+            detail=f"Unknown table {table!r}; allowed: {sorted(allowed_tables)}",
         )
 
     if not await _assembly_run_exists(
@@ -194,9 +225,9 @@ async def create_assembly_run_doget_ticket(
     scientist-facing counterpart of the work-ticket mint above.
 
     Human-callable (``assembly:doget``, on every role ceiling and on no service
-    ceiling — that scope carries why, and why it is not a widening of what an
-    assembly ticket returns). The caller must hold ``Tier.VIEWER`` on every study
-    the run's prep_sample is still linked to.
+    ceiling — that scope carries why, and what it opens beyond the service
+    route: ``bin_quality``, via ``ASSEMBLY_RUN_DOGET_TABLES``). The caller must hold
+    ``Tier.VIEWER`` on every study the run's prep_sample is still linked to.
 
     **Access is checked BEFORE existence, which inverts the alignment mint's
     ladder.** There the 404 is about an ``alignment_definition`` — a global object
@@ -207,18 +238,34 @@ async def create_assembly_run_doget_ticket(
     plane serves exactly the pair this ticket carries and knows nothing about
     studies or users.
     """
-    await authorize_prep_sample_cohort(
-        pool, caller=caller, prep_sample_idx=[prep_sample_idx], min_tier=COHORT_MIN_TIER
-    )
-    await _require_completed_assembly_run(
-        pool, prep_sample_idx=prep_sample_idx, processing_idx=processing_idx
+    await _authorize_assembly_run_read(
+        pool, caller=caller, prep_sample_idx=prep_sample_idx, processing_idx=processing_idx
     )
     return await _sign_assembly_ticket(
         pool,
         prep_sample_idx=prep_sample_idx,
         processing_idx=processing_idx,
         table=body.table,
+        allowed_tables=ASSEMBLY_RUN_DOGET_TABLES,
         signing_key=signing_key,
+    )
+
+
+async def _authorize_assembly_run_read(
+    pool: asyncpg.Pool,
+    *,
+    caller: HumanUser,
+    prep_sample_idx: int,
+    processing_idx: int,
+) -> None:
+    """The two gates every human read of one run starts with: `Tier.VIEWER` on every
+    study the prep_sample links to, then a ``'completed'`` gate row. Access first,
+    for the disclosure reason `create_assembly_run_doget_ticket` gives."""
+    await authorize_prep_sample_cohort(
+        pool, caller=caller, prep_sample_idx=[prep_sample_idx], min_tier=COHORT_MIN_TIER
+    )
+    await _require_completed_assembly_run(
+        pool, prep_sample_idx=prep_sample_idx, processing_idx=processing_idx
     )
 
 
@@ -241,11 +288,8 @@ async def _authorize_assembly_genome_map(
     downstream — the genomes they belong to keep their other contigs, so their
     length denominators come back short and their breadth comes back high.
     """
-    await authorize_prep_sample_cohort(
-        pool, caller=caller, prep_sample_idx=[prep_sample_idx], min_tier=COHORT_MIN_TIER
-    )
-    await _require_completed_assembly_run(
-        pool, prep_sample_idx=prep_sample_idx, processing_idx=processing_idx
+    await _authorize_assembly_run_read(
+        pool, caller=caller, prep_sample_idx=prep_sample_idx, processing_idx=processing_idx
     )
     unminted = await count_assembly_membership_without_genome(
         pool, prep_sample_idx=[prep_sample_idx], processing_idx=processing_idx
@@ -356,6 +400,143 @@ async def get_assembly_genome_map(
         processing_idx=processing_idx,
         entries=[GenomeMapEntry.model_validate(dict(r)) for r in rows],
         count=len(rows),
+    )
+
+
+@assembly_router.get(
+    PATH_ASSEMBLY_MEMBERSHIP_PARQUET,
+    response_class=Response,
+    responses=PARQUET_RESPONSES,
+)
+async def get_assembly_membership_parquet(
+    prep_sample_idx: Annotated[int, Field(gt=0)],
+    processing_idx: Annotated[int, Field(gt=0)],
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    caller: HumanUser = Depends(require_complete_profile),
+    _scope: Principal = Depends(require_scope(Scope.PREP_SAMPLE_READ)),
+) -> Response:
+    """The same rows as the JSON route below, as Parquet, with no cap."""
+    await _authorize_assembly_run_read(
+        pool, caller=caller, prep_sample_idx=prep_sample_idx, processing_idx=processing_idx
+    )
+    body = await assembly_membership_parquet(
+        pool, prep_sample_idx=prep_sample_idx, processing_idx=processing_idx
+    )
+    return Response(content=body, media_type=PARQUET_MEDIA_TYPE)
+
+
+@assembly_router.get(PATH_ASSEMBLY_MEMBERSHIP)
+async def get_assembly_membership(
+    prep_sample_idx: Annotated[int, Field(gt=0)],
+    processing_idx: Annotated[int, Field(gt=0)],
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    caller: HumanUser = Depends(require_complete_profile),
+    _scope: Principal = Depends(require_scope(Scope.PREP_SAMPLE_READ)),
+) -> AssemblyMembershipResponse:
+    """One assembly run's membership rows — every kind, with the assembler's
+    per-contig report.
+
+    The genome map's gates minus its mintedness 422: these rows carry no
+    ``genome_idx``, so an unminted row is not a gap in them. 413 above
+    ``ASSEMBLY_MEMBERSHIP_HARD_CAP``, for the reason the genome map gives.
+    """
+    await _authorize_assembly_run_read(
+        pool, caller=caller, prep_sample_idx=prep_sample_idx, processing_idx=processing_idx
+    )
+    rows = await fetch_assembly_membership(
+        pool,
+        prep_sample_idx=prep_sample_idx,
+        processing_idx=processing_idx,
+        limit=ASSEMBLY_MEMBERSHIP_HARD_CAP + 1,
+    )
+    if len(rows) > ASSEMBLY_MEMBERSHIP_HARD_CAP:
+        total = await count_assembly_membership(
+            pool, prep_sample_idx=prep_sample_idx, processing_idx=processing_idx
+        )
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"membership of prep_sample_idx={prep_sample_idx},"
+                f" processing_idx={processing_idx} has {total} rows, over the"
+                f" {ASSEMBLY_MEMBERSHIP_HARD_CAP} maximum this endpoint serves; use"
+                " .../membership/parquet."
+            ),
+        )
+    return AssemblyMembershipResponse(
+        prep_sample_idx=prep_sample_idx,
+        processing_idx=processing_idx,
+        entries=[AssemblyMembershipEntry.model_validate(dict(r)) for r in rows],
+        count=len(rows),
+    )
+
+
+@assembly_router.get(PATH_ASSEMBLY_PREP_SAMPLE)
+async def list_assembly_export_roster(
+    processing_idx: Annotated[int, Field(gt=0)],
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    caller: HumanUser = Depends(require_complete_profile),
+    _scope: Principal = Depends(require_scope(Scope.PREP_SAMPLE_READ)),
+    sequenced_pool_idx: int | None = Query(
+        default=None, gt=0, description="Only prep_samples on this sequenced_pool."
+    ),
+    study_idx: int | None = Query(
+        default=None, gt=0, description="Only prep_samples linked to this study."
+    ),
+    prep_sample_idx: int | None = Query(default=None, gt=0, description="Only this prep_sample."),
+) -> AssemblyExportRosterResponse:
+    """The prep_samples gated under one run that the caller may read, each with its gate
+    state and biosample accession — what `qiita assembly export` walks.
+
+    **The read tier, where the /processing roster uses the submit tier.** That roster
+    narrows a plain user to samples they hold ``Tier.ADMIN`` on, because it answers
+    "may I submit against this"; an export only reads, and the reads it composes
+    (membership, the run mint) admit ``Tier.VIEWER``. A roster at the higher tier
+    would drop exactly the samples those reads would serve.
+
+    Narrowed, not refused, for a pool or a study, as the pool discovery reads are:
+    a listing carries no result, and a pool spans studies. A named
+    ``prep_sample_idx`` is authorized all-or-nothing instead, ahead of any lookup,
+    so a 403 rather than an empty list answers a sample the caller cannot read.
+
+    404 when the run does not exist. 413 above the cap rather than a short list.
+    """
+    if prep_sample_idx is not None:
+        await authorize_prep_sample_cohort(
+            pool, caller=caller, prep_sample_idx=[prep_sample_idx], min_tier=COHORT_MIN_TIER
+        )
+    if await fetch_processing_by_idx(pool, processing_idx) is None:
+        raise HTTPException(status_code=404, detail=f"processing {processing_idx} not found")
+    rows = await fetch_processing_prep_samples(
+        pool,
+        processing_idx,
+        visible_to_principal_idx=None,
+        sequenced_pool_idx=sequenced_pool_idx,
+        study_idx=study_idx,
+        prep_sample_idx=prep_sample_idx,
+        limit=GATE_ROSTER_HARD_CAP + 1,
+    )
+    if len(rows) > GATE_ROSTER_HARD_CAP:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"processing {processing_idx} has more than {GATE_ROSTER_HARD_CAP}"
+                " prep_samples under these filters; narrow with sequenced_pool_idx or study_idx"
+            ),
+        )
+    access = await filter_prep_samples_caller_can_read(
+        pool,
+        caller=caller,
+        prep_sample_idxs=[r["prep_sample_idx"] for r in rows],
+        min_tier=COHORT_MIN_TIER,
+    )
+    readable = set(access.readable)
+    samples = [
+        ProcessingPrepSample.model_validate(dict(r))
+        for r in rows
+        if r["prep_sample_idx"] in readable
+    ]
+    return AssemblyExportRosterResponse(
+        processing_idx=processing_idx, samples=samples, count=len(samples)
     )
 
 

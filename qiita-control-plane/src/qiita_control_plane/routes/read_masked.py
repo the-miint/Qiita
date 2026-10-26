@@ -60,6 +60,7 @@ from qiita_common.api_paths import (
     PATH_MASK_DEFINITION_ROOT,
     PATH_MASK_DEFINITION_SAMPLE_STATUS,
     PATH_MASK_DEFINITION_STATUS,
+    PATH_MASK_DEFINITION_SYNDNA_READ_COUNT,
     PATH_READ_MASKED_DOGET,
     PATH_READ_MASKED_PREFIX,
 )
@@ -78,10 +79,19 @@ from qiita_common.models import (
     MaskSampleStatusUpdate,
     MaskSampleStatusUpdateResponse,
     ReadMaskedDoGetTicketRequest,
+    SyndnaInsert,
+    SyndnaReadCountResponse,
+    SyndnaReadCountSample,
 )
 
 from ..actions.library import delete_mask_data
-from ..auth.guards import require_human, require_scope, require_service_with_scope
+from ..auth.guards import (
+    COHORT_MIN_TIER,
+    require_caller_has_tier_on_all_studies,
+    require_human,
+    require_scope,
+    require_service_with_scope,
+)
 from ..auth.principal import HumanUser, Principal, ServiceAccount
 from ..auth.tickets import sign_ticket
 from ..block_read import READ_MASKED_TABLE
@@ -92,7 +102,7 @@ from ..deps import (
     get_flight_signing_key,
     get_tx_conn_factory,
 )
-from ..repositories.block import fetch_mask_sample_state
+from ..repositories.block import MASK_SAMPLE_COMPLETED, fetch_mask_sample_state
 from ..repositories.mask_definition import (
     MaskDefinitionDeprecated,
     MaskDefinitionNotFound,
@@ -103,16 +113,26 @@ from ..repositories.mask_definition import (
     set_mask_sample_states,
     transition_mask_definition_status,
 )
-from ._helpers import cap_rows, gate_roster_narrowing_idx
+from ..repositories.syndna_read_count import (
+    fetch_mask_syndna_reference,
+    fetch_syndna_export_roster,
+    fetch_syndna_inserts,
+    fetch_syndna_read_counts,
+)
+from ._helpers import (
+    GATE_ROSTER_HARD_CAP,
+    authorize_prep_sample_cohort,
+    cap_rows,
+    first_few,
+    gate_roster_narrowing_idx,
+)
 
 _MSG_MASK_NOT_FOUND = "Mask definition not found"
 
-# Hard caps on the two mask reads. The mask list is bounded by how many distinct
-# read-filtering configs the fleet has minted; the roster by a pool's sample
-# count. Both return `truncated` rather than paginating — a caller that hits
-# either cap should narrow with a filter.
+# Hard cap on the mask list, bounded by how many distinct read-filtering configs the
+# fleet has minted. It returns `truncated` rather than paginating; a caller that hits
+# it should narrow with a filter. The roster's cap is GATE_ROSTER_HARD_CAP.
 _MASK_LIST_HARD_CAP = 1_000
-_MASK_PREP_SAMPLE_HARD_CAP = 100_000
 
 
 mask_definition_router = APIRouter(prefix=PATH_MASK_DEFINITION_PREFIX, tags=["mask-definition"])
@@ -317,9 +337,9 @@ async def list_mask_prep_samples_route(
             mask_idx,
             sequenced_pool_idx=sequenced_pool_idx,
             visible_to_principal_idx=gate_roster_narrowing_idx(caller),
-            limit=_MASK_PREP_SAMPLE_HARD_CAP + 1,
+            limit=GATE_ROSTER_HARD_CAP + 1,
         ),
-        _MASK_PREP_SAMPLE_HARD_CAP,
+        GATE_ROSTER_HARD_CAP,
     )
     samples = [MaskPrepSample.model_validate(dict(row)) for row in rows]
     return MaskPrepSampleListResponse(
@@ -328,6 +348,163 @@ async def list_mask_prep_samples_route(
         count=len(samples),
         truncated=truncated,
         sequenced_pool_idx=sequenced_pool_idx,
+    )
+
+
+@mask_definition_router.get(PATH_MASK_DEFINITION_SYNDNA_READ_COUNT)
+async def get_syndna_read_count_route(
+    mask_idx: Annotated[int, Field(gt=0)],
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    caller: HumanUser = Depends(require_human),
+    _scope: Principal = Depends(require_scope(Scope.PREP_SAMPLE_READ)),
+    study_idx: int | None = Query(
+        default=None, gt=0, description="prep_samples linked to this study."
+    ),
+    sequenced_pool_idx: int | None = Query(
+        default=None, gt=0, description="prep_samples on this sequenced_pool."
+    ),
+    prep_sample_idx: list[int] | None = Query(
+        default=None, description="These prep_samples (repeatable)."
+    ),
+) -> SyndnaReadCountResponse:
+    """The per-insert SynDNA read counts of the selected prep_samples under one mask —
+    what `qiita mask syndna-read-count` writes as BIOM or Parquet.
+
+    The filters intersect, and at least one is required. The selection is every
+    non-retired prep_sample with a gate row under the mask that matches them.
+
+    **All-or-nothing, never narrowed**, because the response is a table: the caller
+    needs ``Tier.VIEWER`` on every study each selected prep_sample is linked to (403
+    otherwise; wet_lab_admin and above bypass), and every selected prep_sample must be
+    'completed' under the mask and counted (409 otherwise). A named study and named
+    prep_samples are authorized before any lookup, so a 403 rather than a 404 or 409
+    answers a selector the caller cannot read (a study that does not exist selects
+    nothing: 404, or 409 when prep_samples are also named). A pool-only selection is authorized on
+    the prep_samples it resolves to, so its 404 / 413 say whether the pool has any
+    under the mask.
+
+    404 when the mask does not exist or nothing matches; 409 when the mask ran without
+    SynDNA; 413 above the roster cap. Every read is one read-only snapshot, so a
+    re-mask landing mid-request cannot mix two states into one table.
+    """
+    if study_idx is None and sequenced_pool_idx is None and not prep_sample_idx:
+        raise HTTPException(
+            status_code=422,
+            detail="name at least one of study_idx, sequenced_pool_idx, prep_sample_idx",
+        )
+    named = sorted(set(prep_sample_idx or []))
+    async with pool.acquire() as conn, conn.transaction(isolation="repeatable_read", readonly=True):
+        if study_idx is not None:
+            await require_caller_has_tier_on_all_studies(
+                conn, caller=caller, study_idxs=[study_idx], min_tier=COHORT_MIN_TIER
+            )
+        if named:
+            await authorize_prep_sample_cohort(
+                conn, caller=caller, prep_sample_idx=named, min_tier=COHORT_MIN_TIER
+            )
+        mask = await fetch_mask_syndna_reference(conn, mask_idx)
+        if mask is None:
+            raise HTTPException(status_code=404, detail=_MSG_MASK_NOT_FOUND)
+        reference_idx = mask["reference_idx"]
+        if reference_idx is None:
+            raise HTTPException(
+                status_code=409, detail=f"mask {mask_idx} ran without SynDNA; it counted nothing"
+            )
+        rows = await fetch_syndna_export_roster(
+            conn,
+            mask_idx,
+            study_idx=study_idx,
+            sequenced_pool_idx=sequenced_pool_idx,
+            prep_sample_idxs=named or None,
+            limit=GATE_ROSTER_HARD_CAP + 1,
+        )
+        if len(rows) > GATE_ROSTER_HARD_CAP:
+            raise HTTPException(
+                status_code=413,
+                detail=(
+                    f"more than {GATE_ROSTER_HARD_CAP} prep_samples under mask {mask_idx}"
+                    " match; narrow with study_idx, sequenced_pool_idx or prep_sample_idx"
+                ),
+            )
+        unmasked = sorted(set(named) - {r["prep_sample_idx"] for r in rows})
+        if unmasked:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"{len(unmasked)} named prep_sample(s) are not masked under mask"
+                    f" {mask_idx} or do not match the other filters"
+                    f" (e.g. {first_few(unmasked)})"
+                ),
+            )
+        if not rows:
+            filters = ", ".join(
+                f"{name}={value}"
+                for name, value in (
+                    ("study_idx", study_idx),
+                    ("sequenced_pool_idx", sequenced_pool_idx),
+                )
+                if value is not None
+            )
+            raise HTTPException(
+                status_code=404,
+                detail=f"no prep_sample is masked under mask {mask_idx} with {filters}",
+            )
+        selected = [r["prep_sample_idx"] for r in rows]
+        await authorize_prep_sample_cohort(
+            conn, caller=caller, prep_sample_idx=selected, min_tier=COHORT_MIN_TIER
+        )
+        incomplete = [r["prep_sample_idx"] for r in rows if r["state"] != MASK_SAMPLE_COMPLETED]
+        if incomplete:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"{len(incomplete)} selected prep_sample(s) are not completed under mask"
+                    f" {mask_idx} (e.g. {first_few(incomplete)})"
+                ),
+            )
+        inserts = await fetch_syndna_inserts(conn, reference_idx)
+        stored = await fetch_syndna_read_counts(conn, mask_idx, selected)
+
+    order = {r["feature_idx"]: i for i, r in enumerate(inserts)}
+    counts: dict[int, list[int | None]] = {ps: [None] * len(inserts) for ps in selected}
+    for c in stored:
+        position = order.get(c["feature_idx"])
+        if position is None:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"stored counts for prep_sample {c['prep_sample_idx']} name feature"
+                    f" {c['feature_idx']}, which is not in SynDNA reference {reference_idx}"
+                ),
+            )
+        counts[c["prep_sample_idx"]][position] = c["read_count"]
+    uncounted = [ps for ps in selected if None in counts[ps]]
+    if uncounted:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"{len(uncounted)} selected prep_sample(s) have no SynDNA read counts under"
+                f" mask {mask_idx} (e.g. {first_few(uncounted)}). Either the masking"
+                " ticket has not yet written them (retry once it completes, or ask an"
+                " operator to redrive it if it failed), or the prep_sample was masked"
+                " before counts were"
+                " persisted (ask an operator to run `qiita-admin backfill"
+                " syndna-read-count`)"
+            ),
+        )
+    return SyndnaReadCountResponse(
+        mask_idx=mask_idx,
+        reference_idx=reference_idx,
+        inserts=[SyndnaInsert.model_validate(dict(r)) for r in inserts],
+        samples=[
+            SyndnaReadCountSample(
+                prep_sample_idx=r["prep_sample_idx"],
+                biosample_accession=r["biosample_accession"],
+                sequenced_pool_idx=r["sequenced_pool_idx"],
+                read_counts=counts[r["prep_sample_idx"]],
+            )
+            for r in rows
+        ],
     )
 
 
@@ -520,7 +697,7 @@ async def create_read_masked_doget_ticket(
         mask_state = await fetch_mask_sample_state(
             conn, mask_idx=body.mask_idx, prep_sample_idx=body.prep_sample_idx
         )
-    if mask_state != "completed":
+    if mask_state != MASK_SAMPLE_COMPLETED:
         raise HTTPException(
             status_code=409,
             detail={

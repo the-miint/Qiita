@@ -36,10 +36,10 @@ KIND_UNBINNED = "UNBINNED"  # a noLCG contig that no refined bin claimed
 ASSEMBLED_SEQUENCE_TABLE = "assembled_sequence"
 ASSEMBLED_SEQUENCE_CHUNKS_TABLE = "assembled_sequence_chunks"
 
-# Per-subject CheckM quality for one assembly run. On both DoGet allowlists but
-# behind no route — the feature-table resolver signs it in-process; the exclusion
-# comment in `routes/reference.py` states what that rests on, and the
-# `ALLOWED_TABLES` entry in `flight_service.rs` carries the privacy argument.
+# Per-subject CheckM quality for one assembly run. On both DoGet allowlists;
+# signed over HTTP only by the human assembly run mint (`routes/assembly.py`) and
+# in-process by the feature-table resolver. The `ALLOWED_TABLES` entry in
+# `flight_service.rs` carries the privacy argument.
 BIN_QUALITY_TABLE = "bin_quality"
 
 # The two quality columns the feature-table arm reads. A named pair rather than a
@@ -151,6 +151,12 @@ CONTIG_ATTRIBUTES_FILE = "contig_attributes.tsv"
 #                no counterpart, and empty below 1 kb where myloasm reports 0.00
 #                for absence of signal rather than a measured zero.
 CONTIG_ATTRIBUTE_COLUMNS = ("contig_id", "raw_name", "circularity", "depth", "mult")
+
+# The `circularity` value a reader counts as circular; the full set is on
+# CONTIG_ATTRIBUTE_COLUMNS above. The writers run inside the assembly image, where this
+# package is not installed, and spell the values themselves (workflows/long-read-assembly:
+# myloasm_split.py and assemble.sh).
+CIRCULARITY_YES = "yes"
 
 # The two attribute columns DuckDB must not be left to sniff. `mult` is empty on
 # EVERY row a hifiasm_meta assembly writes (it has no counterpart to myloasm's

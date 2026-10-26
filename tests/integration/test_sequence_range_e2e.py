@@ -33,6 +33,7 @@ from qiita_compute_orchestrator.sequence_range import (
 )
 from qiita_control_plane.config import Settings as CPSettings
 from qiita_control_plane.main import app as cp_app
+from qiita_control_plane.testing.db_teardown import teardown_entity_graph
 
 # The ticket recorded as the range's minter. No FK on the column, so any positive
 # idx is accepted; it is only ever compared for equality on the reuse path.
@@ -68,12 +69,11 @@ async def e2e_prep_sample(postgres_pool, human_admin_session):
         postgres_pool, owner_idx=admin_idx
     )
     yield idx
-    await postgres_pool.execute(
-        "DELETE FROM qiita.sequence_range WHERE prep_sample_idx = $1", idx
-    )
-    await postgres_pool.execute("DELETE FROM qiita.prep_sample WHERE idx = $1", idx)
-    await postgres_pool.execute(
-        "DELETE FROM qiita.biosample WHERE idx = $1", biosample_idx
+    await teardown_entity_graph(
+        postgres_pool,
+        study_idxs=[],
+        biosample_idxs=[biosample_idx],
+        prep_sample_idxs=[idx],
     )
 
 

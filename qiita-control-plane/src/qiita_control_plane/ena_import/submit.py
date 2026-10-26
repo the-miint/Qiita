@@ -27,11 +27,15 @@ def build_download_ena_study_ticket(
     sequenced_pool_idx: int,
     sequencing_run_idx: int,
     ena_study_accession: str,
+    run_concurrency: int | None = None,
 ) -> WorkTicketCreateRequest:
     """Compose ONE `sequenced_pool`-scoped `download-ena-study`
     `WorkTicketCreateRequest`. `sequenced_pool_idx` / `sequencing_run_idx`
     identify the pool `register_ena_study` already created; the caller supplies
     them and POSTs the returned model to `/api/v1/work-ticket`."""
+    action_context: dict[str, object] = {"ena_study_accession": ena_study_accession}
+    if run_concurrency is not None:
+        action_context["run_concurrency"] = run_concurrency
     return WorkTicketCreateRequest(
         action_id=DOWNLOAD_ENA_STUDY_ACTION_ID,
         action_version=DOWNLOAD_ENA_STUDY_ACTION_VERSION,
@@ -40,5 +44,5 @@ def build_download_ena_study_ticket(
             "sequenced_pool_idx": sequenced_pool_idx,
             "sequencing_run_idx": sequencing_run_idx,
         },
-        action_context={"ena_study_accession": ena_study_accession},
+        action_context=action_context,
     )

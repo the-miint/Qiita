@@ -1,26 +1,27 @@
 """Backfill `host_taxon_id` onto biosamples that predate the field.
 
 `host_taxon_id` (the host organism a sample was taken FROM) was added as a
-biosample global field after every sample we hold had already been ingested, so
-no biosample carries it. Until it is populated, `host_filter_resolver` correctly
-reports every sample as UNRESOLVED and the submit path has nothing to resolve
-against. This module fills it in.
+biosample global field after the biosamples we hold had been ingested, so those
+carry no value (ENA imports write it). Until it is populated,
+`host_filter_resolver` reports such a sample as UNRESOLVED and the submit path
+has nothing to resolve against. This module fills it in.
 
 The organism is not derivable from the taxonomy tree. `qiita.terminology_term`
 stores only `(term_id, label)` — no parent, no lineage — and NCBI's metagenome
 taxa do not sit under their host anyway (`human gut metagenome` is not a
 descendant of *Homo sapiens*). So the mapping cannot be computed; it is an
-explicit, curated table, `_HOST_BY_SAMPLE_TAXON` below. That is the point: the
-judgment is small, visible, and reviewable rather than buried in a heuristic.
+explicit, curated table, `host_by_sample_taxon.HOST_BY_SAMPLE_TAXON`. That is the
+point: the judgment is small, visible, and reviewable rather than buried in a heuristic.
 
 Two facts drive each biosample, in this order:
 
   1. IS IT A CONTROL? A blank has no host of its own regardless of what taxon it
      carries, so this is checked FIRST. The signal is the pre-flight's own
      `is_control` (`input_sample.project_idx IS NULL`), read via
-     `preflight.control_samples` — not the sample's name.
-  2. WHAT IS THE SAMPLE'S OWN TAXON? `taxon_id` (populated on every biosample we
-     hold) names the sample's organism — for a metagenome, the environment it
+     `preflight.control_samples`, or a negative control in the biosample's own
+     metadata (`negative_control_biosamples`) — not its name.
+  2. WHAT IS THE BIOSAMPLE'S OWN TAXON? `taxon_id` (populated on every biosample we
+     hold) names its organism — for a metagenome, the environment it
      came from. `human gut metagenome` implies a human host; `seawater
      metagenome` implies none.
 
@@ -31,10 +32,8 @@ submit — which aborts rather than silently passing an un-depleted sample
 through. The residue is the curation worklist, not a rounding error.
 
 Idempotent: a biosample that already carries `host_taxon_id` is skipped, so the
-backfill can be re-run as curation lands. Adding a taxon to the curated table is
-a code change plus a deploy — deliberate, given the table is expected to grow by
-one or two entries, not to become a data feed. If it starts changing often, move
-it to a seeded lookup table rather than growing this dict.
+backfill can be re-run as curation lands. Adding a taxon to the curated table
+(`host_by_sample_taxon`) is a code change plus a deploy.
 """
 
 from __future__ import annotations
@@ -51,38 +50,15 @@ from qiita_common.models import (
     MISSING_REASON_CONTROL_SAMPLE,
     MISSING_REASON_NOT_APPLICABLE,
     MISSING_REASON_VALUE_COLUMN,
-    NCBI_TAXONOMY_HUMAN_TERM_ID,
     NCBI_TAXONOMY_NAME,
     TERMINOLOGY_TERM_VALUE_COLUMN,
 )
 
+from ..host_by_sample_taxon import HOST_BY_SAMPLE_TAXON
+from ..host_filter_resolver import negative_control_biosamples
 from ..preflight import control_samples_from_blob
 from ..repositories._sample_helpers import _get_or_create_globally_linked_study_field
 from ..repositories.biosample_metadata import BIOSAMPLE_METADATA_SPEC
-
-# ---------------------------------------------------------------------------
-# The curated mapping. THIS IS THE JUDGMENT — everything else is mechanism.
-# ---------------------------------------------------------------------------
-# Keyed on the sample's OWN taxon (`taxon_id`), which for a metagenome names the
-# environment it was drawn from. The value is the host that environment implies.
-#
-# Deliberately NOT exhaustive over NCBI. A taxon that is absent here is not
-# "assumed hostless" — it is UNRESOLVED, and the submit path aborts on it. Add a
-# row only when the host is genuinely implied by the environment, and note why.
-_HOST_BY_SAMPLE_TAXON: dict[str, str | None] = {
-    # A human gut metagenome is, by construction, drawn from a human gut.
-    "408170": NCBI_TAXONOMY_HUMAN_TERM_ID,
-    # Seawater has no host. This is a decision ('not applicable'), not a gap —
-    # and it means such samples are NOT host-depleted. Whether human reads should
-    # still be removed from a host-LESS sample for contamination/privacy reasons
-    # is a separate question this table cannot express; it is tracked separately.
-    "1561972": None,
-    # Deliberately ABSENT: '256318' (the bare `metagenome` root). It names no
-    # environment, so it implies no host. On the live data these are almost
-    # entirely blanks, which rule 1 catches before this table is consulted; what
-    # is left over is genuinely under-specified metadata and must be curated, not
-    # guessed at here.
-}
 
 
 @dataclass
@@ -105,7 +81,7 @@ class HostTaxonSource(StrEnum):
     operator can see which rows rest on the pre-flight and which on the curated
     taxon mapping."""
 
-    CONTROL = "control"  # the pre-flight says it is a blank
+    CONTROL = "control"  # the pre-flight or the metadata says it is a blank
     TAXON = "taxon"  # its own taxon implies a host
     NO_HOST = "no_host"  # its own taxon implies NO host ('not applicable')
     UNRESOLVED = "unresolved"  # nothing settles it — left unwritten, reported
@@ -176,7 +152,7 @@ def classify(
     # human. `not in` rather than `.get(...) is None` — the table maps a taxon to
     # None to MEAN "this environment has no host", which is a decision, and that
     # is a different answer from "we have no row for this taxon".
-    if sample_taxon_term_id not in _HOST_BY_SAMPLE_TAXON:
+    if sample_taxon_term_id not in HOST_BY_SAMPLE_TAXON:
         return BiosampleAssignment(
             biosample_idx=biosample_idx,
             study_idx=study_idx,
@@ -185,7 +161,7 @@ def classify(
             sample_taxon_label=sample_taxon_label,
         )
 
-    host_term_id = _HOST_BY_SAMPLE_TAXON[sample_taxon_term_id]
+    host_term_id = HOST_BY_SAMPLE_TAXON[sample_taxon_term_id]
     if host_term_id is None:
         return BiosampleAssignment(
             biosample_idx=biosample_idx,
@@ -319,6 +295,10 @@ async def plan_backfill(pool: asyncpg.Pool) -> BackfillPlan:
         BIOSAMPLE_FIELD_HOST_TAXON_ID,
     )
 
+    metadata_controls = await negative_control_biosamples(
+        pool, [row["biosample_idx"] for row in rows]
+    )
+
     plan = BackfillPlan(
         already_populated=already_populated or 0,
         no_taxon=no_taxon or 0,
@@ -330,7 +310,8 @@ async def plan_backfill(pool: asyncpg.Pool) -> BackfillPlan:
             classify(
                 biosample_idx=row["biosample_idx"],
                 study_idx=row["study_idx"],
-                is_control=accession is not None and accession in scan.accessions,
+                is_control=(accession is not None and accession in scan.accessions)
+                or row["biosample_idx"] in metadata_controls,
                 sample_taxon_term_id=row["taxon_term_id"],
                 sample_taxon_label=row["taxon_label"],
             )
@@ -426,7 +407,7 @@ async def apply_backfill(
 async def _fetch_ncbi_term_idxs(conn: asyncpg.Connection) -> dict[str, int]:
     """Resolve every host term_id the curated table can assign, up front, so a
     missing seed fails once here rather than partway through a 3000-row write."""
-    wanted = sorted({t for t in _HOST_BY_SAMPLE_TAXON.values() if t is not None})
+    wanted = sorted({t for t in HOST_BY_SAMPLE_TAXON.values() if t is not None})
     rows = await conn.fetch(
         "SELECT tt.term_id, tt.idx"
         "  FROM qiita.terminology_term tt"

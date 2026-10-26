@@ -4,8 +4,8 @@ The compute orchestrator owns three distinct storage concerns, and this module
 makes the third one explicit:
 
   * the **data plane** owns persistent data (DuckLake + permanent Parquet);
-  * the orchestrator owns the **ephemeral per-attempt workspace**
-    (``$QIITA_OUTPUT_PATH`` / scratch — disposable, one per step attempt);
+  * the orchestrator owns the **per-attempt scratch workspace**
+    (``$QIITA_OUTPUT_PATH`` / scratch — one per step attempt, not durable storage);
   * the orchestrator *also* owns **derived storage** — the persistent
     host-filter indexes under ``PATH_DERIVED``. These are per-reference and
     durable (they outlive the work ticket and are consumed at host-filter

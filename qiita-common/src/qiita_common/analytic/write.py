@@ -11,7 +11,7 @@ from pathlib import Path
 # `validate_parquet_path` is named for its first caller but checks a COPY *target* —
 # a path safe to interpolate into a SQL string literal, which cannot be bound — so it
 # is what every writer below uses, BIOM included.
-from ..parquet import PARQUET_OPTS, validate_parquet_path
+from ..parquet import PARQUET_OPTS_TRANSFER, validate_parquet_path
 from ..taxonomy import QUOTED_RANK_COLUMNS
 from .relations import LABELLED_RELATION, TAXONOMY_SIDECAR_RELATION, TREE_TABLE
 from .sidecar import TaxonomyClearance, TreeClearance
@@ -27,14 +27,14 @@ BIOM_GENERATED_BY = "qiita-miint"
 
 
 def parquet_copy_sql(path: Path) -> str:
-    """COPY the relabelled table to Parquet, with the canonical options every qiita
-    Parquet artifact shares.
+    """COPY the relabelled table to Parquet with the transfer option set: the file leaves
+    the job but is never registered into the lake.
 
-    `PARQUET_OPTS`' `ROW_GROUP_SIZE_BYTES` requires `SET preserve_insertion_order =
+    `PARQUET_OPTS_TRANSFER`' `ROW_GROUP_SIZE_BYTES` requires `SET preserve_insertion_order =
     false` on the writing connection — DuckDB errors at bind time otherwise — which is
     the caller's to set (see `parquet.py`).
     """
-    return f"COPY {LABELLED_RELATION} TO '{validate_parquet_path(path)}' ({PARQUET_OPTS})"
+    return f"COPY {LABELLED_RELATION} TO '{validate_parquet_path(path)}' ({PARQUET_OPTS_TRANSFER})"
 
 
 def biom_copy_sql(path: Path) -> str:
@@ -60,8 +60,8 @@ def biom_copy_sql(path: Path) -> str:
 
 
 def taxonomy_copy_sql(path: Path, *, clearance: TaxonomyClearance) -> str:
-    """COPY the sidecar to Parquet, with the options every qiita Parquet artifact
-    shares. Parquet and not TSV: the ranks are eight nullable strings, and a TSV cannot
+    """COPY the sidecar to Parquet with the transfer option set, like the table. Parquet
+    and not TSV: the ranks are eight nullable strings, and a TSV cannot
     tell an empty rank from an absent one without a convention every reader has to be
     told about.
 
@@ -75,19 +75,20 @@ def taxonomy_copy_sql(path: Path, *, clearance: TaxonomyClearance) -> str:
     projection = ", ".join(("feature_id", *QUOTED_RANK_COLUMNS))
     return (
         f"COPY (SELECT {projection} FROM {TAXONOMY_SIDECAR_RELATION}) "
-        f"TO '{validate_parquet_path(path)}' ({PARQUET_OPTS})"
+        f"TO '{validate_parquet_path(path)}' ({PARQUET_OPTS_TRANSFER})"
     )
 
 
 def tree_copy_sql(path: Path, *, clearance: TreeClearance) -> str:
-    """COPY the sheared tree to Parquet, with the options every qiita Parquet artifact
-    shares.
+    """COPY the sheared tree to Parquet with the transfer option set, like the table.
 
     **Parquet, not Newick.** We ship the node table and let a consumer that wants Newick
     convert it — which also keeps `COPY … (FORMAT NEWICK)`'s edge-id default from being
     ours to dodge (it annotates every branch whenever an `edge_id` column is present; see
     `docs/duckdb-miint.md`). `edge_id` is worth carrying: the shear preserves the
-    surviving edge's original id, which is the handle back to the reference's placements.
+    surviving edge's original id, which is the handle back to the reference's
+    placements — see "Edge numbering" in `docs/architecture/reference-data.md` for
+    where that numbering comes from.
 
     **A consumer joining this to the table must filter `is_tip`.** Only tips are named from
     the mint; a surviving internal node keeps the reference's own Newick label, and nothing
@@ -99,4 +100,4 @@ def tree_copy_sql(path: Path, *, clearance: TreeClearance) -> str:
     dataclass.
     """
     _ = clearance
-    return f"COPY {TREE_TABLE} TO '{validate_parquet_path(path)}' ({PARQUET_OPTS})"
+    return f"COPY {TREE_TABLE} TO '{validate_parquet_path(path)}' ({PARQUET_OPTS_TRANSFER})"

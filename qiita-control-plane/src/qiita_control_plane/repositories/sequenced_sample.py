@@ -24,7 +24,14 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 
 import asyncpg
-from qiita_common.actions import READ_MASK_ACTION_ID
+from qiita_common.actions import (
+    BAM_TO_PARQUET_ACTION_ID,
+    BCL_CONVERT_ACTION_ID,
+    BCL_CONVERT_SAMPLE_MAP_KEY,
+    FASTQ_TO_PARQUET_ACTION_ID,
+    READ_MASK_ACTION_ID,
+)
+from qiita_common.models import NON_TERMINAL_WORK_TICKET_STATES, FailureType, WorkTicketState
 
 from . import require_transaction, validate_patch_fields
 from ._sample_helpers import (
@@ -115,6 +122,19 @@ async def fetch_sequenced_sample_with_prep_sample(
     return await pool_or_conn.fetchrow(sql, sequenced_sample_idx)
 
 
+async def fetch_sequenced_sample_pool_and_run(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection, sequenced_sample_idx: int
+) -> asyncpg.Record | None:
+    """`sequenced_pool_idx` and `sequencing_run_idx` of a sequenced_sample; None on miss."""
+    return await pool_or_conn.fetchrow(
+        "SELECT ss.sequenced_pool_idx, sp.sequencing_run_idx"
+        " FROM qiita.sequenced_sample ss"
+        " JOIN qiita.sequenced_pool sp ON sp.idx = ss.sequenced_pool_idx"
+        " WHERE ss.idx = $1",
+        sequenced_sample_idx,
+    )
+
+
 # Columns the PATCH composer is allowed to write on the sequenced_sample
 # subtype row. Subtype-only per the v1 design decision: supertype
 # prep_sample fields will land via a future PATCH /prep-sample/{idx}
@@ -142,6 +162,9 @@ async def update_sequenced_sample(
     written, and explicit None sets the column to NULL. Unknown keys
     and an empty dict raise ValueError so misuse fails at the repo
     boundary rather than reaching SQL.
+
+    An `ena_run_accession` write requires the caller to hold `lock_sequencing_run`
+    and to have refused a change the download could not pick up.
 
     Returns None on success and raises RuntimeError when the UPDATE
     matches zero rows. The route's FOR UPDATE preflight on the same
@@ -412,7 +435,8 @@ async def fetch_sequenced_sample_idxs_for_run(
 
     Walks the run -> sequenced_pool -> sequenced_sample -> prep_sample
     chain and excludes sequenced_samples whose supertype prep_sample row
-    is retired. Sort: (sequenced_sample.created_at DESC, idx DESC) so
+    is retired, or whose ena_status is flagged (ENA no longer reports the
+    run available). Sort: (sequenced_sample.created_at DESC, idx DESC) so
     newer rows surface first. Callers that need to detect truncation pass
     `limit = cap + 1`; if the returned list has length > cap, the
     underlying set exceeded the cap.
@@ -426,6 +450,7 @@ async def fetch_sequenced_sample_idxs_for_run(
         " JOIN qiita.prep_sample ps ON ps.idx = ss.prep_sample_idx"
         " WHERE sp.sequencing_run_idx = $1"
         "   AND ps.retired = false"
+        "   AND ss.ena_status IS NULL"
         " ORDER BY ss.created_at DESC, ss.idx DESC"
         " LIMIT $2",
         sequencing_run_idx,
@@ -449,7 +474,8 @@ async def fetch_sequenced_pool_samples(
     spans every pool in a run and returns bare idxs; this one is scoped to a
     single sequenced_pool and returns the richer per-sample rows a fan-out
     needs (e.g. submit-host-filter-pool). Excludes sequenced_samples whose
-    supertype prep_sample row is retired. Each row carries
+    supertype prep_sample row is retired, or whose ena_status is flagged.
+    Each row carries
     `has_read_mask_ticket` (any-state EXISTS over qiita.work_ticket for the
     read-mask action) so the fan-out can skip already-submitted samples and
     operators get per-sample host-processing coverage. Sort by
@@ -467,6 +493,7 @@ async def fetch_sequenced_pool_samples(
         " JOIN qiita.biosample bs ON bs.idx = ps.biosample_idx"
         " WHERE ss.sequenced_pool_idx = $1"
         "   AND ps.retired = false"
+        "   AND ss.ena_status IS NULL"
         " ORDER BY ss.sequenced_pool_item_id"
         " LIMIT $2",
         sequenced_pool_idx,
@@ -474,6 +501,54 @@ async def fetch_sequenced_pool_samples(
         READ_MASK_ACTION_ID,
     )
     return list(rows)
+
+
+async def fetch_sequenced_pool_item_prep_sample_idxs(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection, sequenced_pool_idx: int
+) -> dict[str, int]:
+    """The pool's ACTIVE sequenced_samples as `{sequenced_pool_item_id:
+    prep_sample_idx}` — the join from a pre-flight's per-sample facts (keyed on
+    item id) to the prep_sample they belong to, against which a submitted roster
+    is checked.
+
+    Excludes retired prep_samples and ena_status-flagged samples, matching
+    `fetch_sequenced_pool_samples` (the CLI's roster read) so the runner's
+    expected roster and the CLI's agree on a pool's membership: `retire` drops a
+    well from the active set the same way on both sides."""
+    rows = await pool_or_conn.fetch(
+        "SELECT ss.sequenced_pool_item_id, ss.prep_sample_idx"
+        "  FROM qiita.sequenced_sample ss"
+        "  JOIN qiita.prep_sample ps ON ps.idx = ss.prep_sample_idx"
+        " WHERE ss.sequenced_pool_idx = $1"
+        "   AND ps.retired = false"
+        "   AND ss.ena_status IS NULL",
+        sequenced_pool_idx,
+    )
+    return {r["sequenced_pool_item_id"]: r["prep_sample_idx"] for r in rows}
+
+
+async def fetch_pool_members(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection, sequenced_pool_idx: int
+) -> list[tuple[int, int, int]]:
+    """the pool's read-block members: `(prep_sample_idx, lo, hi)` per active
+    sample with stored reads, each sample's full range, not tiled.
+
+    the pool analogue of `fetch_block_members` for the amplicon read ticket.
+    deblur needs each sample whole, so members aren't split like block tiling.
+    the inner join drops un-ingested samples; retired and ena_status-flagged
+    samples are excluded."""
+    rows = await pool_or_conn.fetch(
+        "SELECT ss.prep_sample_idx, sr.sequence_idx_start, sr.sequence_idx_stop"
+        "  FROM qiita.sequenced_sample ss"
+        "  JOIN qiita.prep_sample ps ON ps.idx = ss.prep_sample_idx"
+        "  JOIN qiita.sequence_range sr ON sr.prep_sample_idx = ss.prep_sample_idx"
+        " WHERE ss.sequenced_pool_idx = $1"
+        "   AND ps.retired = false"
+        "   AND ss.ena_status IS NULL"
+        " ORDER BY ss.prep_sample_idx",
+        sequenced_pool_idx,
+    )
+    return [(r["prep_sample_idx"], r["sequence_idx_start"], r["sequence_idx_stop"]) for r in rows]
 
 
 async def fetch_sequenced_pool_ena_run_roster(
@@ -497,15 +572,17 @@ async def fetch_sequenced_pool_ena_run_roster(
     and the caller must fail loud on that instead (a download-ena-study ticket
     against a pool with a non-ENA-origin sample is a misconfiguration, not
     something to skip quietly). Excludes sequenced_samples whose supertype
-    prep_sample row is retired, mirroring fetch_sequenced_pool_samples. An
-    empty pool returns an empty list; the caller (not this repo function)
-    decides that is fail-loud territory."""
+    prep_sample row is retired, or whose ena_status is flagged (the run must
+    not be re-downloaded once ENA stops serving it), mirroring
+    fetch_sequenced_pool_samples. An empty pool returns an empty list; the
+    caller (not this repo function) decides that is fail-loud territory."""
     rows = await pool_or_conn.fetch(
         "SELECT ss.prep_sample_idx, ss.ena_run_accession"
         " FROM qiita.sequenced_sample ss"
         " JOIN qiita.prep_sample ps ON ps.idx = ss.prep_sample_idx"
         " WHERE ss.sequenced_pool_idx = $1"
         "   AND ps.retired = false"
+        "   AND ss.ena_status IS NULL"
         " ORDER BY ss.prep_sample_idx",
         sequenced_pool_idx,
     )
@@ -527,10 +604,10 @@ async def fetch_sequenced_samples_for_run(
 
     Run-scoped sibling of fetch_sequenced_pool_samples (pool-scoped): walks
     run -> sequenced_pool -> sequenced_sample -> prep_sample -> biosample and
-    excludes sequenced_samples whose supertype prep_sample row is retired.
-    Ordered by sequenced_sample idx for a stable order. Callers that need to
-    detect truncation pass `limit = cap + 1`; a returned length > cap means
-    the underlying set exceeded the cap.
+    excludes sequenced_samples whose supertype prep_sample row is retired, or
+    whose ena_status is flagged. Ordered by sequenced_sample idx for a stable
+    order. Callers that need to detect truncation pass `limit = cap + 1`; a
+    returned length > cap means the underlying set exceeded the cap.
     """
     rows = await pool_or_conn.fetch(
         f"SELECT {_LIST_ITEM_COLUMNS}"
@@ -540,6 +617,7 @@ async def fetch_sequenced_samples_for_run(
         " JOIN qiita.biosample bs ON bs.idx = ps.biosample_idx"
         " WHERE sp.sequencing_run_idx = $1"
         "   AND ps.retired = false"
+        "   AND ss.ena_status IS NULL"
         " ORDER BY ss.idx"
         " LIMIT $2",
         sequencing_run_idx,
@@ -560,9 +638,10 @@ async def fetch_sequenced_sample_idxs_for_study(
     Walks the prep_sample_to_study link to its supertype prep_sample and
     down to the sequenced_sample subtype, so only prep_samples that carry
     a sequenced_sample row surface. Excludes retired links
-    (prep_sample_to_study.retired = true) and retired prep_samples
-    (prep_sample.retired = true); the sequenced_sample subtype has no
-    own retirement surface. Sort: (prep_sample_to_study.created_at DESC,
+    (prep_sample_to_study.retired = true), retired prep_samples
+    (prep_sample.retired = true; the sequenced_sample subtype has no
+    own retirement surface), and flagged sequenced_samples (ena_status IS
+    NOT NULL). Sort: (prep_sample_to_study.created_at DESC,
     sequenced_sample.idx DESC) so newest-linked rows surface first with a
     deterministic tiebreak. Callers that need to detect truncation pass
     `limit = cap + 1`; if the returned list has length > cap, the
@@ -582,9 +661,251 @@ async def fetch_sequenced_sample_idxs_for_study(
         " WHERE pts.study_idx = $1"
         "   AND pts.retired = false"
         "   AND ps.retired = false"
+        "   AND ss.ena_status IS NULL"
         " ORDER BY pts.created_at DESC, ss.idx DESC"
         " LIMIT $2",
         study_idx,
         limit,
     )
     return [r["idx"] for r in rows]
+
+
+async def fetch_sequenced_pools_for_study(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
+    *,
+    study_idx: int,
+    limit: int,
+) -> list[asyncpg.Record]:
+    """Return up to `limit` distinct sequenced_pools a study's active
+    sequenced_samples sit in, newest run/pool first.
+
+    The study-first join the run-centric pool routes never expose: walks the
+    same prep_sample_to_study -> sequenced_sample path as
+    fetch_sequenced_sample_idxs_for_study (and the SAME exclusions -- retired
+    links, retired supertype prep_samples, ena_status-flagged samples), then
+    groups to the distinct pool. `sample_count` is how many of this study's
+    qualifying samples fall in each pool (not the pool's full size -- a pool can
+    hold other studies' samples). The INNER JOIN on sequenced_pool drops samples
+    not yet in a pool (sequenced_pool_idx IS NULL). Each pool carries its run's
+    `instrument_model` (platform). Callers that need to detect truncation pass
+    `limit = cap + 1`; a returned length > cap means the study spans more pools
+    than the cap. Accepts a pool or a connection, mirroring
+    fetch_sequenced_sample_idxs_for_study.
+    """
+    return await pool_or_conn.fetch(
+        "SELECT sp.idx AS sequenced_pool_idx, sp.sequencing_run_idx,"
+        "       sr.instrument_model, sp.created_at,"
+        "       COUNT(DISTINCT ss.idx) AS sample_count"
+        " FROM qiita.prep_sample_to_study pts"
+        " JOIN qiita.sequenced_sample ss ON ss.prep_sample_idx = pts.prep_sample_idx"
+        " JOIN qiita.prep_sample ps ON ps.idx = pts.prep_sample_idx"
+        " JOIN qiita.sequenced_pool sp ON sp.idx = ss.sequenced_pool_idx"
+        " JOIN qiita.sequencing_run sr ON sr.idx = sp.sequencing_run_idx"
+        " WHERE pts.study_idx = $1"
+        "   AND pts.retired = false"
+        "   AND ps.retired = false"
+        "   AND ss.ena_status IS NULL"
+        " GROUP BY sp.idx, sp.sequencing_run_idx,"
+        "          sr.instrument_model, sp.created_at"
+        " ORDER BY sp.sequencing_run_idx DESC, sp.idx DESC"
+        " LIMIT $2",
+        study_idx,
+        limit,
+    )
+
+
+async def fetch_sequenced_pool_idxs_for_sequenced_samples(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection, sequenced_sample_idxs: list[int]
+) -> set[int]:
+    """The sequenced_pool idxs holding any of `sequenced_sample_idxs`."""
+    rows = await pool_or_conn.fetch(
+        "SELECT sequenced_pool_idx FROM qiita.sequenced_sample WHERE idx = ANY($1::bigint[])",
+        sequenced_sample_idxs,
+    )
+    return {r["sequenced_pool_idx"] for r in rows}
+
+
+async def fetch_held_ena_run_accessions_for_study(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
+    *,
+    study_idx: int,
+) -> list[asyncpg.Record]:
+    """Every active sequenced_sample this study holds with an ENA run
+    accession, as `(ena_run_accession, sequenced_sample_idx, prep_sample_idx,
+    sequenced_pool_idx, ena_status)`, regardless of current ena_status --
+    the ENA-import re-import driver (`ena_import.batch`) needs both the
+    currently-flagged and currently-available rows, to tell candidate (missing
+    from a fresh Portal response) from reappeared (flagged, but public again)
+    apart. Excludes retired prep_samples, mirroring
+    fetch_sequenced_sample_idxs_for_study; a retired sample is gone from every
+    other roster already, so it is not a re-check candidate.
+    """
+    return list(
+        await pool_or_conn.fetch(
+            "SELECT ss.ena_run_accession, ss.idx AS sequenced_sample_idx,"
+            " ss.prep_sample_idx, ss.sequenced_pool_idx, ss.ena_status"
+            " FROM qiita.prep_sample_to_study pts"
+            " JOIN qiita.sequenced_sample ss ON ss.prep_sample_idx = pts.prep_sample_idx"
+            " JOIN qiita.prep_sample ps ON ps.idx = pts.prep_sample_idx"
+            " WHERE pts.study_idx = $1"
+            "   AND pts.retired = false"
+            "   AND ps.retired = false"
+            "   AND ss.ena_run_accession IS NOT NULL",
+            study_idx,
+        )
+    )
+
+
+async def update_sequenced_sample_ena_status(
+    conn: asyncpg.Connection,
+    *,
+    ena_run_accession: str,
+    ena_status: str | None,
+) -> None:
+    """Set (or clear, when `ena_status` is None) the ENA availability flag on
+    the sequenced_sample carrying `ena_run_accession`, stamping
+    `ena_availability_checked_at`. A no-op UPDATE (zero rows matched) is not an
+    error: the caller read the run from `fetch_held_ena_run_accessions_for_study`
+    before its Browser API lookups, in a separate transaction, and a row a pool
+    delete removed in between has nothing left to flag.
+    """
+    await conn.execute(
+        "UPDATE qiita.sequenced_sample"
+        " SET ena_status = $2, ena_availability_checked_at = now()"
+        " WHERE ena_run_accession = $1",
+        ena_run_accession,
+        ena_status,
+    )
+
+
+async def set_sequenced_sample_download_failure(
+    conn: asyncpg.Connection,
+    *,
+    sequenced_pool_idx: int,
+    prep_sample_idx: int,
+    ena_run_accession: str,
+    failure_reason: str,
+    failure_type: FailureType,
+) -> bool:
+    """Record a download failure on the run's sequenced_sample; False when no row
+    in the pool carries both `prep_sample_idx` and `ena_run_accession`."""
+    return (
+        await conn.fetchval(
+            "UPDATE qiita.sequenced_sample"
+            " SET download_failure_reason = $4, download_failure_type = $5::qiita.failure_type"
+            " WHERE sequenced_pool_idx = $1 AND prep_sample_idx = $2 AND ena_run_accession = $3"
+            " RETURNING true",
+            sequenced_pool_idx,
+            prep_sample_idx,
+            ena_run_accession,
+            failure_reason,
+            failure_type.value,
+        )
+        is True
+    )
+
+
+async def fetch_non_terminal_work_tickets_for_sequenced_sample(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
+    *,
+    prep_sample_idx: int,
+    sequenced_pool_idx: int | None,
+) -> list[asyncpg.Record]:
+    """Every non-terminal work_ticket scoped to this sample directly
+    (`prep_sample_idx`) or to its pool (`sequenced_pool_idx`, e.g. a
+    `download-ena-study` ticket), as `(work_ticket_idx, action_id, state)`.
+
+    A flagged run is not auto-cancelled (see `ena_import.batch`); this is the
+    read a caller logs so an operator can act through the existing
+    `POST /work-ticket/cancel` filter (`routes.work_ticket._resolve_cancel_filter`),
+    which this mirrors narrowed to one already-known sample/pool pair rather
+    than resolving one from an action_id + run/pool filter.
+    """
+    rows = await pool_or_conn.fetch(
+        "SELECT work_ticket_idx, action_id, state"
+        " FROM qiita.work_ticket"
+        " WHERE state = ANY($1::qiita.work_ticket_state[])"
+        "   AND (prep_sample_idx = $2 OR sequenced_pool_idx = $3)"
+        " ORDER BY work_ticket_idx",
+        list(NON_TERMINAL_WORK_TICKET_STATES),
+        prep_sample_idx,
+        sequenced_pool_idx,
+    )
+    return list(rows)
+
+
+_PER_SAMPLE_INGEST_ACTION_IDS = (FASTQ_TO_PARQUET_ACTION_ID, BAM_TO_PARQUET_ACTION_ID)
+_POOL_INGEST_DONE_STATES = (WorkTicketState.COMPLETED.value, WorkTicketState.NO_DATA.value)
+
+
+async def fetch_empty_ingest_tickets(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
+    *,
+    prep_sample_idxs: Sequence[int],
+    current_work_ticket_idx: int | None,
+) -> dict[int, int]:
+    """For each of `prep_sample_idxs` whose newest ingest read it and found it empty,
+    that ingest's work_ticket_idx; any other prep_sample is absent.
+
+    A prep_sample with no `sequence_range` was ingested empty, was never ingested, or
+    has an ingest that failed or has not finished, and only its ingest records tell
+    these apart. They are:
+
+    - its per-sample ingests (fastq-to-parquet, bam-to-parquet). One shows it empty
+      when it ended NO_DATA, which it does only when its input held no reads. A ticket
+      caller may pass its own idx as `current_work_ticket_idx`; it shows the
+      prep_sample empty while still running only when it is such an ingest, which
+      asks about its own input after finding it empty. A caller that is not a ticket
+      passes None.
+    - the bcl-convert tickets for its pool that list it in their `sample_map` roster.
+      One shows it empty when it ended COMPLETED or NO_DATA: `ingest_reads` skips an
+      empty well and fails the whole pool on a missing one, so a finished pool ingest
+      with no range for a listed prep_sample means that well was empty.
+
+    Only the newest record counts, whatever its state. A newer ingest that failed, was
+    cancelled or has not finished may have been given reads the older one never saw,
+    so it leaves the prep_sample unproven. Newest is submission order (the highest
+    work_ticket_idx): a redriven ticket keeps its place.
+
+    A prep_sample that has a range is absent whatever its tickets say: its reads
+    exist. A pool ingest counts only for the prep_samples its roster names; pool
+    membership alone does not show that the ingest read the prep_sample.
+    """
+    rows = await pool_or_conn.fetch(
+        "SELECT newest.prep_sample_idx, newest.work_ticket_idx"
+        "  FROM ("
+        "    SELECT DISTINCT ON (record.prep_sample_idx)"
+        "           record.prep_sample_idx, record.work_ticket_idx, record.shows_empty"
+        "      FROM ("
+        "        SELECT wt.prep_sample_idx, wt.work_ticket_idx,"
+        "               (wt.state = $3::qiita.work_ticket_state"
+        "                OR wt.work_ticket_idx IS NOT DISTINCT FROM $4::bigint) AS shows_empty"
+        "          FROM qiita.work_ticket wt"
+        "         WHERE wt.prep_sample_idx = ANY($1::bigint[])"
+        "           AND wt.action_id = ANY($2::text[])"
+        "        UNION ALL"
+        "        SELECT ss.prep_sample_idx, wt.work_ticket_idx,"
+        "               wt.state = ANY($6::qiita.work_ticket_state[]) AS shows_empty"
+        "          FROM qiita.sequenced_sample ss"
+        "          JOIN qiita.work_ticket wt ON wt.sequenced_pool_idx = ss.sequenced_pool_idx"
+        "         WHERE ss.prep_sample_idx = ANY($1::bigint[])"
+        "           AND wt.action_id = $5"
+        "           AND wt.action_context -> $7::text @> jsonb_build_array("
+        "                 jsonb_build_object('prep_sample_idx', ss.prep_sample_idx))"
+        "      ) record"
+        "     ORDER BY record.prep_sample_idx, record.work_ticket_idx DESC"
+        "  ) newest"
+        " WHERE newest.shows_empty"
+        "   AND NOT EXISTS ("
+        "     SELECT 1 FROM qiita.sequence_range sr"
+        "      WHERE sr.prep_sample_idx = newest.prep_sample_idx"
+        "   )",
+        list(prep_sample_idxs),
+        list(_PER_SAMPLE_INGEST_ACTION_IDS),
+        WorkTicketState.NO_DATA.value,
+        current_work_ticket_idx,
+        BCL_CONVERT_ACTION_ID,
+        list(_POOL_INGEST_DONE_STATES),
+        BCL_CONVERT_SAMPLE_MAP_KEY,
+    )
+    return {r["prep_sample_idx"]: r["work_ticket_idx"] for r in rows}

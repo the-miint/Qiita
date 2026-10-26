@@ -36,12 +36,12 @@ from qiita_common.actions import PER_SAMPLE_MASK_ACTION_IDS
 from qiita_common.hashing import canonical_params_hash
 from qiita_common.models import (
     MaskDefinitionStatus,
-    MaskSampleState,
     WorkTicketState,
 )
 
-from . import gate_state_literal, require_transaction
+from . import require_transaction
 from ._sample_scope import sample_scope_sql
+from .block import MASK_SAMPLE_COMPLETED, MASK_SAMPLE_INVALIDATED, MASK_SAMPLE_PENDING
 
 # Column projection backing every MaskDefinition response. Defined once because
 # three readers (the mint, the by-idx fetch, and the list) return the same shape,
@@ -73,17 +73,6 @@ class MaskDefinitionDeprecated(Exception):
         self.detail = detail
         super().__init__(detail)
 
-
-# The mask_sample states this module writes into SQL, each asserted against the
-# wire type so a renamed member fails at import rather than matching no rows.
-# Looked up by value, not by position: the Literal has three members and the
-# roster CTE synthesizes only two — 'invalidated' can only be read off an
-# existing mask_sample row.
-_MASK_STATE_PENDING, _MASK_STATE_COMPLETED, _MASK_STATE_INVALIDATED = (
-    gate_state_literal("pending", MaskSampleState),
-    gate_state_literal("completed", MaskSampleState),
-    gate_state_literal("invalidated", MaskSampleState),
-)
 
 # Per-(mask, sample) masking state.
 #
@@ -172,8 +161,8 @@ masked_sample AS (
 _MASKED_SAMPLE_ARGS: tuple = (
     list(PER_SAMPLE_MASK_ACTION_IDS),
     WorkTicketState.COMPLETED.value,
-    _MASK_STATE_COMPLETED,
-    _MASK_STATE_PENDING,
+    MASK_SAMPLE_COMPLETED,
+    MASK_SAMPLE_PENDING,
 )
 
 # The alias both queries below give the `masked_sample` CTE. `sample_scope_sql`
@@ -187,14 +176,15 @@ _ROSTER_ALIAS = "msk"
 # CHECK constraint in the 20260804000000 migration; adding a value changes both.
 ADAPTER_HASH_SCHEME_SEQUENCE_HASH = "sequence_hash_v1"
 
-# The two `params` keys addressing the adapter identity inside the blob
-# `runner._mask._build_mask_params` produces. They live here, not next to that
-# builder, because this module and the re-key backfill both address the path
-# without going through it — the scheme stamp below, the backfill's SQL, and its
-# params rewrite — and the repository is what every one of them already imports.
-# A rename in the builder has to reach these.
+# `params` keys inside the blob `runner._mask._build_mask_params` produces. They
+# live here, not next to that builder, because readers address the paths without
+# going through it — the adapter scheme stamp below, the re-key backfill's SQL and
+# params rewrite, and the SynDNA read-count reads — and the repository is what
+# every one of them already imports. A rename in the builder has to reach these.
 RESOLVED_QC_KEY = "resolved_qc"
 ADAPTER_SET_HASH_KEY = "adapter_set_hash"
+RESOLVED_SYNDNA_KEY = "resolved_syndna"
+SYNDNA_REFERENCE_IDX_KEY = "reference_idx"
 # The same path as a Postgres jsonb text accessor:
 # `params->'resolved_qc'->>'adapter_set_hash'`.
 ADAPTER_SET_HASH_JSON_PATH = f"'{RESOLVED_QC_KEY}'->>'{ADAPTER_SET_HASH_KEY}'"
@@ -326,7 +316,9 @@ async def list_mask_definitions(
     length > cap means the set exceeded the cap.
     """
     args: list = [*_MASKED_SAMPLE_ARGS]
-    args.append(_MASK_STATE_INVALIDATED)
+    # Not a leading bind: the roster CTE synthesizes only `pending` and `completed`,
+    # and `invalidated` can only be read off an existing mask_sample row.
+    args.append(MASK_SAMPLE_INVALIDATED)
     invalidated_param = f"${len(args)}"
     scope, narrowed = sample_scope_sql(
         alias=_ROSTER_ALIAS,
@@ -510,11 +502,11 @@ async def set_mask_sample_states(
         )
     }
     not_found = [idx for idx in prep_sample_idxs if idx not in present]
-    skipped_pending = [idx for idx, st in present.items() if st == _MASK_STATE_PENDING]
+    skipped_pending = [idx for idx, st in present.items() if st == MASK_SAMPLE_PENDING]
     unchanged = [idx for idx, st in present.items() if st == state]
-    to_update = [idx for idx, st in present.items() if st not in (state, _MASK_STATE_PENDING)]
+    to_update = [idx for idx, st in present.items() if st not in (state, MASK_SAMPLE_PENDING)]
     if to_update:
-        invalidating = state == _MASK_STATE_INVALIDATED
+        invalidating = state == MASK_SAMPLE_INVALIDATED
         await conn.execute(
             "UPDATE qiita.mask_sample"
             "    SET state = $3,"

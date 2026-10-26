@@ -7,11 +7,9 @@ composing the analytic-export routes). They differ in everything *around* the
 analytic — where the inputs come from, how the result is written — so the SQL lives
 here and the streaming and I/O stay with each caller.
 
-They disagree about the analytic in exactly one place, and it is a reachability limit
-rather than a choice: `denovo_map_statements` gates the de novo arm on CheckM scores and
-the client cannot reach `bin_quality` — no route signs a ticket for it, which the
-exclusion in `routes/reference.py` states — so a client-built combined table calls
-`denovo_map_table_sql` ungated.
+They disagree about the analytic in exactly one place: `denovo_map_statements` gates
+the de novo arm on CheckM scores, and a client-built combined table calls
+`denovo_map_table_sql` ungated, because the client recipe does not read `bin_quality`.
 
 **Plain SQL text, so nothing here needs a connection of its own.** Callers execute
 these statements on a connection that has miint loaded. (Same shape as `chunking.py`'s
@@ -51,6 +49,7 @@ from .coverage import (
     RollupCoverage,
     coverage_alignments_view_sql,
     coverage_filter_applies,
+    denovo_coverage_alignments_view_sql,
     rollup_coverage_diagnostics_sql,
     rollup_coverage_warning,
     survivor_parameters,
@@ -108,7 +107,6 @@ from .reconcile import (
     denovo_alignment_statements,
     denovo_contig_lengths_insert_sql,
     denovo_contig_lengths_table_sql,
-    denovo_coverage_alignments_view_sql,
     denovo_genome_lengths_insert_sql,
     denovo_genome_quality_table_sql,
     denovo_map_join,

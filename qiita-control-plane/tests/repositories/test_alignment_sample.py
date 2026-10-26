@@ -8,9 +8,9 @@ keyed on alignment_idx instead of mask_idx and joining the covering-block check
 on work_ticket.alignment_idx.
 
 Each test seeds its own principal + sequenced prep_samples + an
-alignment_definition so cleanup runs in FK-reverse order and the suite can run
-against the shared postgres_pool fixture. Blocks a test creates are tracked in
-`blk['created_blocks']` so teardown targets exactly those rows.
+alignment_definition so the suite can run against the shared postgres_pool
+fixture. Blocks a test creates are tracked in `blk['created_blocks']` so
+teardown targets exactly those rows.
 """
 
 import secrets
@@ -33,6 +33,7 @@ from qiita_control_plane.testing.db_seeds import (
     seed_biosample_with_sequenced_prep_sample,
     seed_user_principal,
 )
+from qiita_control_plane.testing.db_teardown import delete_principal, teardown_entity_graph
 
 pytestmark = pytest.mark.db
 
@@ -65,27 +66,26 @@ async def blk(postgres_pool):
         "created_blocks": created_blocks,
     }
 
+    # Work tickets reference the prep_samples under RESTRICT, so they go before
+    # the sweep; the block they hang off and the definition go after it.
     if created_blocks:
         await postgres_pool.execute(
             "DELETE FROM qiita.work_ticket WHERE block_idx = ANY($1::bigint[])", created_blocks
         )
+    await teardown_entity_graph(
+        postgres_pool,
+        study_idxs=[],
+        biosample_idxs=[bs1, bs2],
+        prep_sample_idxs=[ps1, ps2],
+    )
+    if created_blocks:
         await postgres_pool.execute(
             "DELETE FROM qiita.block WHERE block_idx = ANY($1::bigint[])", created_blocks
         )
     await postgres_pool.execute(
-        "DELETE FROM qiita.alignment_sample WHERE alignment_idx = $1", alignment_idx
-    )
-    await postgres_pool.execute(
-        "DELETE FROM qiita.prep_sample WHERE idx = ANY($1::bigint[])", [ps1, ps2]
-    )
-    await postgres_pool.execute(
-        "DELETE FROM qiita.biosample WHERE idx = ANY($1::bigint[])", [bs1, bs2]
-    )
-    await postgres_pool.execute(
         "DELETE FROM qiita.alignment_definition WHERE alignment_idx = $1", alignment_idx
     )
-    await postgres_pool.execute("DELETE FROM qiita.user WHERE principal_idx = $1", principal_idx)
-    await postgres_pool.execute("DELETE FROM qiita.principal WHERE idx = $1", principal_idx)
+    await delete_principal(postgres_pool, [principal_idx])
 
 
 # ---------------------------------------------------------------------------

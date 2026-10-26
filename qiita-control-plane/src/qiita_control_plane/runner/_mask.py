@@ -1,4 +1,5 @@
-"""Runner read-mask identity (mask_idx) minting."""
+"""Runner read-mask identity (mask_idx) minting, and the qiita.mask_sample gate row
+the runner writes for a prep_sample that ingest found empty."""
 
 from __future__ import annotations
 
@@ -9,15 +10,21 @@ from pathlib import Path
 from typing import Any, NamedTuple
 
 import asyncpg
+from qiita_common.api_paths import LibraryPrimitive
 
+from ..actions.library import complete_empty_mask_sample
+from ..repositories.block import MaskSampleInvalidated
 from ..repositories.mask_definition import (
     ADAPTER_HASH_SCHEME_SEQUENCE_HASH,
     ADAPTER_SET_HASH_KEY,
     RESOLVED_QC_KEY,
+    RESOLVED_SYNDNA_KEY,
+    SYNDNA_REFERENCE_IDX_KEY,
     MaskDefinitionDeprecated,
     mint_mask_definition,
 )
 from ..repositories.reference_membership import reference_sequence_set_hash
+from ._base import _log, _workflow_declares_action
 from ._db import persist_ticket_idx
 from ._reference import QC_ADAPTER_BINDING, _resolve_qc_adapters
 from ._upload import _submission_bad_input
@@ -286,7 +293,7 @@ def _resolved_syndna(action_context: Mapping[str, Any]) -> dict[str, Any] | None
     if not action_context.get("syndna_enabled"):
         return None
     return {
-        "reference_idx": action_context.get("syndna_reference_idx"),
+        SYNDNA_REFERENCE_IDX_KEY: action_context.get("syndna_reference_idx"),
         "aligner": _SYNDNA_ALIGNER,
         "preset": _SYNDNA_MM2_PRESET,
         "identity_method": _SYNDNA_IDENTITY_METHOD,
@@ -375,7 +382,7 @@ def _build_mask_params(
             ADAPTER_SET_HASH_KEY: adapter_set_hash,
         },
         "resolved_lima": resolved_lima,
-        "resolved_syndna": resolved_syndna,
+        RESOLVED_SYNDNA_KEY: resolved_syndna,
     }
 
 
@@ -536,3 +543,59 @@ async def _materialize_adapter_set_hashes(
         reference_idx=default_adapter_reference_idx,
         adapter_parquet=bound[QC_ADAPTER_BINDING],
     )
+
+
+# =============================================================================
+# The mask_sample gate for a prep_sample ingest found empty
+# =============================================================================
+
+
+def _workflow_writes_mask_gate(steps: list[Any]) -> bool:
+    """True iff some entry is the `finalize-mask-sample` action: the workflow records
+    each prep_sample it masks in qiita.mask_sample, so the runner records one it ends
+    at NO_DATA for want of reads there too."""
+    return _workflow_declares_action(steps, LibraryPrimitive.FINALIZE_MASK_SAMPLE)
+
+
+async def _record_mask_gate_empty(
+    pool: asyncpg.Pool,
+    *,
+    mask_idx: int,
+    prep_sample_idx: int,
+    work_ticket_idx: int,
+) -> None:
+    """Record the prep_sample as masked under `mask_idx` with an empty pass-set when
+    its newest ingest read it and found no reads; otherwise write nothing.
+
+    Run from the StepNoData handler, which ends a masking ticket for a prep_sample
+    with no stored reads before `finalize-mask-sample` can run. Without this it has
+    no gate row and every consumer refuses it, though there was nothing to mask. A
+    NO_DATA that no ingest explains (an expected-empty control whose newest ingest did
+    not end empty, or that has none) gets no row: its reads may simply not be
+    ingested yet.
+
+    A withdrawn row stays withdrawn: `MaskSampleInvalidated` rolls the whole write
+    back and is logged, as the assembly gate's twin does."""
+    try:
+        proof = await complete_empty_mask_sample(
+            pool,
+            mask_idx=mask_idx,
+            prep_sample_idx=prep_sample_idx,
+            current_work_ticket_idx=work_ticket_idx,
+        )
+    except MaskSampleInvalidated:
+        _log.warning(
+            "prep_sample %d was found empty at ingest, but its mask_sample row under"
+            " mask %d is 'invalidated'; it is left so",
+            prep_sample_idx,
+            mask_idx,
+        )
+        return
+    if proof is None:
+        _log.info(
+            "prep_sample %d ended with no stored reads and no ingest shows it was found"
+            " empty (it has none, or its newest did not end that way); no mask_sample row"
+            " is written under mask %d",
+            prep_sample_idx,
+            mask_idx,
+        )

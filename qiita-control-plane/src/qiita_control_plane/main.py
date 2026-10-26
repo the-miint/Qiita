@@ -1,18 +1,21 @@
 """Control plane FastAPI application."""
 
 import asyncio
+import json
 import logging
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 
 import asyncpg
 from fastapi import Depends, FastAPI, Request
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.openapi.docs import (
     get_redoc_html,
     get_swagger_ui_html,
     get_swagger_ui_oauth2_redirect_html,
 )
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from qiita_common.log import configure_logging, install_authorization_scrub
 from qiita_common.models import HealthResponse, HealthStatus
@@ -24,10 +27,14 @@ from .db import PRODUCTION_POOL_MAX_SIZE, close_pool, get_pool
 from .deps import get_db_pool
 from .dispatch import (
     build_compute_backend_client,
+    build_dispatch_semaphore,
+    dispatch_semaphore,
     drain_running_dispatches,
     reconcile_inflight_tickets,
 )
 from .ena_import.batch import build_ena_import_study_semaphore, reconcile_inflight_batches
+from .follow_on import reconcile_follow_ons
+from .follow_on_sweeper import run_follow_on_sweeper
 from .health import aggregate_health
 from .landing import router as landing_router
 from .notify import build_transport, run_sweeper
@@ -82,12 +89,20 @@ async def lifespan(app: FastAPI):
         token_path=settings.cp_to_co_token_path,
     )
     app.state.running_dispatches = set()
+    app.state.dispatch_semaphore = build_dispatch_semaphore()
+    # Boot-time read: if the assignment above was removed or reordered, fail
+    # here — before reconcile dispatches anything — rather than post-commit at
+    # the first route, or in the fan-out pump where a raise strands a released
+    # ticket that no later pump counts.
+    dispatch_semaphore(app)
     # Re-attach any tickets left in non-terminal state by a previous CP
     # process — they have no live owner. Resumed in-place (re-attach to a
     # live SLURM job, finalize one that finished while we were down, or fail
     # cleanly from the filesystem) rather than blanket-failed, so a deploy
     # that stops/starts the CP undrained doesn't nuke running work.
     await reconcile_inflight_tickets(app)
+    # After the re-attach: see reconcile_follow_ons.
+    await reconcile_follow_ons(app)
 
     # ena_import_batch's OWN tracked task set (see ena_import.batch's module
     # docstring for why it doesn't share running_dispatches). Re-drive any
@@ -129,9 +144,22 @@ async def lifespan(app: FastAPI):
         name="cli_login_code_sweeper",
     )
 
+    # follow-on sweeper — retries a transiently-failed follow-on once per
+    # FOLLOW_ON_SWEEP_INTERVAL_SECONDS instead of waiting for the next CP start.
+    # Its submit path is create-at-most-once, so it needs no advisory lock or
+    # dedicated pool (see follow_on_sweeper). Registered on app.state so the GC
+    # can't drop it; cancelled in the shutdown finally.
+    app.state.follow_on_sweeper_task = asyncio.create_task(
+        run_follow_on_sweeper(app, settings),
+        name="follow_on_sweeper",
+    )
+
     try:
         yield
     finally:
+        app.state.follow_on_sweeper_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await app.state.follow_on_sweeper_task
         app.state.cli_login_code_sweeper_task.cancel()
         with suppress(asyncio.CancelledError):
             await app.state.cli_login_code_sweeper_task
@@ -169,6 +197,23 @@ app = FastAPI(
     redoc_url=None,
 )
 app.include_router(api_router)
+
+# A 422 echoes each offending value back as `input`, which helps for a bad
+# field and is wrong for an oversized list: a bulk request over its row cap
+# would come back at its own size. Same response as FastAPI's default handler,
+# minus any `input` larger than this.
+_MAX_ECHOED_INPUT_BYTES = 1024
+
+
+@app.exception_handler(RequestValidationError)
+async def _request_validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:
+    errors = jsonable_encoder(exc.errors())
+    for error in errors:
+        if "input" in error and len(json.dumps(error["input"])) > _MAX_ECHOED_INPUT_BYTES:
+            del error["input"]
+    return JSONResponse(status_code=422, content={"detail": errors})
+
+
 app.include_router(landing_router)
 app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
 

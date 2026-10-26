@@ -476,6 +476,47 @@ def test_build_routing_index_memory_split_under_slurm(tmp_path, monkeypatch):
     assert captured["max_memory"] == 50 * 1024**3  # remainder above rype's 30 GB floor
 
 
+def test_build_routing_index_rype_memory_bounded_by_detected_ram_off_slurm(tmp_path, monkeypatch):
+    """Off SLURM the 30 GB literal is a ceiling: on a 12 GB host rype gets
+    12 - 4 - 6 = 2 GB, not 30. Mirrors build_rype_index."""
+    from qiita_compute_orchestrator import miint
+    from qiita_compute_orchestrator.jobs import build_routing_index
+
+    monkeypatch.delenv("SLURM_MEM_PER_NODE", raising=False)
+    monkeypatch.setattr(miint, "detected_ram_gb", lambda: 12)
+    monkeypatch.setattr(build_routing_index, "detected_ram_gb", lambda: 12)
+    stream_parquet = _write_chunks_parquet(
+        tmp_path / "stream.parquet", [(1, 0, "ACGT"), (2, 0, "CCCC")]
+    )
+    mapping = _write_mapping(tmp_path / "shard_mapping.parquet", [(1, "0"), (2, "1")])
+    monkeypatch.setattr(
+        build_routing_index,
+        "open_reference_chunk_stream",
+        _fake_stream_from_parquet(stream_parquet, {}),
+    )
+    captured: dict = {}
+
+    def fake_build(conn, chunk_table, output_path, mapping_table, *, k, w, max_memory):
+        captured["max_memory"] = max_memory
+        Path(output_path).mkdir(parents=True, exist_ok=True)
+        return "ok"
+
+    monkeypatch.setattr(build_routing_index, "_run_rype_index_create", fake_build)
+
+    real_apply = build_routing_index.apply_duckdb_settings
+
+    def spy_apply(conn, duckdb_tmp, *, memory_gb, threads):
+        captured["duckdb_memory_gb"] = memory_gb
+        real_apply(conn, duckdb_tmp, memory_gb=memory_gb, threads=threads)
+
+    monkeypatch.setattr(build_routing_index, "apply_duckdb_settings", spy_apply)
+
+    inputs = build_routing_index.Inputs(reference_idx=5, work_ticket_idx=1, shard_mapping=mapping)
+    asyncio.run(build_routing_index.execute(inputs, tmp_path / "ws"))
+    assert captured["duckdb_memory_gb"] == 4
+    assert captured["max_memory"] == 2 * 1024**3
+
+
 # Synthetic but STRUCTURED features (distinct motifs tiled), each ~640 bp (> k=64),
 # single-chunk. Two shards: {100,200} -> "0", {300} -> "1". Deterministic — no RNG.
 _SMOKE_FEATURES: dict[int, str] = {

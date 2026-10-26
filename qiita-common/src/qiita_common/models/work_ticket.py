@@ -28,6 +28,7 @@ from qiita_common.models._base import (
     ReadCounts,
     ScopeTarget,
 )
+from qiita_common.work_ticket_constants import FORCE_RESUBMIT_EXPLANATION
 
 
 class StepType(StrEnum):
@@ -59,7 +60,7 @@ class ProcessingKind(StrEnum):
 
     When extending the enum: each workflow YAML's `target_processing_kinds:`
     is an explicit allowlist. New kinds do NOT auto-enroll into existing
-    workflows — the submission check (qiita_control_plane/routes/work_ticket.py)
+    workflows — the submission check (qiita_control_plane/work_ticket_submit.py)
     rejects any prep_sample whose kind is not in the action's list. Adding
     a new kind means landing the DB enum value, the subtype table (see
     qiita-control-plane/tests/test_prep_sample_subtype_invariants.py for
@@ -141,13 +142,23 @@ NON_TERMINAL_WORK_TICKET_STATES: tuple[str, ...] = tuple(
     state.value for state in WorkTicketState if state.value not in TERMINAL_WORK_TICKET_STATES
 )
 
+# The terminal states `POST /work-ticket/{idx}/run` puts back in flight by
+# resetting to PENDING. Shared because both components answer questions that
+# have to agree: the control plane admits the redrive, and the orchestrator's
+# sequence-range refusal decides whether to name `qiita ticket run` ahead of
+# removing the pool, or only the pool removal. A state that stops being
+# redrivable must move here, not in one consumer.
+REDRIVABLE_WORK_TICKET_STATES: frozenset[str] = frozenset(
+    {WorkTicketState.FAILED.value, WorkTicketState.CANCELLED.value}
+)
+
 
 class FailureType(StrEnum):
     """Discriminates retriable from permanent work-ticket failures.
     Mirrored DB-side by qiita.failure_type.
 
-    `retriable` failures are transient infra issues — NODE_FAIL, OOM,
-    transient FS errors, slurmrestd unreachability — that the runner
+    `retriable` failures are ones a re-run may clear — NODE_FAIL, OOM,
+    transient FS errors, slurmrestd unreachability, a segfault — that the runner
     bounces back to QUEUED for another attempt while retry_count is
     below max_retries. `permanent` failures (bad input, container
     contract violations, exit codes from a known-terminal workflow) skip
@@ -216,6 +227,52 @@ LIVE_STEP_PROGRESS_STATES: tuple[StepProgressState, ...] = tuple(
 )
 
 
+# The longest chain of follow-ons one submission may arm. A follow-on carries
+# the next link in its own `on_success`, so a chain of stages is expressed by
+# nesting; this bounds that nesting (and the JSONB it is stored as).
+MAX_FOLLOW_ON_CHAIN_DEPTH = 8
+
+
+class WorkTicketFollowOn(BaseModel):
+    """A ticket the control plane submits once its parent COMPLETES, on the
+    parent's scope target, as the parent's originator — so it names only the
+    action and its context. A follow-on may carry its own `on_success`: the
+    control plane arms that next link when this one completes, so a chain of
+    stages runs in order (see `qiita_control_plane.follow_on` for the protocol).
+    Each ticket still has exactly one immediate follow-on; the chain is at most
+    `MAX_FOLLOW_ON_CHAIN_DEPTH` deep."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    action_id: str = Field(min_length=1, max_length=MAX_NAME_LENGTH)
+    action_version: str = Field(min_length=1, max_length=MAX_VERSION_LENGTH)
+    action_context: dict[str, Any] = Field(default_factory=dict)
+    on_success: WorkTicketFollowOn | None = None
+
+    @model_validator(mode="after")
+    def _bound_chain_depth(self) -> WorkTicketFollowOn:
+        depth, node = 1, self.on_success
+        while node is not None:
+            depth += 1
+            if depth > MAX_FOLLOW_ON_CHAIN_DEPTH:
+                raise ValueError(
+                    f"a follow-on chain may be at most {MAX_FOLLOW_ON_CHAIN_DEPTH} deep"
+                )
+            node = node.on_success
+        return self
+
+    def as_request(self, scope_target: ScopeTarget) -> WorkTicketCreateRequest:
+        """The submission this follow-on makes on `scope_target`, carrying the
+        next link so the ticket it creates arms it in turn."""
+        return WorkTicketCreateRequest(
+            action_id=self.action_id,
+            action_version=self.action_version,
+            scope_target=scope_target,
+            action_context=self.action_context,
+            on_success=self.on_success,
+        )
+
+
 class WorkTicket(BaseModel):
     """Control-plane record of an action invocation.
 
@@ -273,6 +330,12 @@ class WorkTicket(BaseModel):
     # explainable instead of silent.
     transient_reason: str | None = None
     transient_since: AwareDatetime | None = None
+    # The follow-on this ticket submits once it COMPLETES, and what became of
+    # it: the ticket it created, or why it was refused. Mirrors the
+    # qiita.work_ticket columns of the same names.
+    on_success: WorkTicketFollowOn | None = None
+    follow_on_work_ticket_idx: int | None = None
+    follow_on_error: str | None = None
     created_at: AwareDatetime
     updated_at: AwareDatetime
 
@@ -313,23 +376,32 @@ class WorkTicketCreateRequest(BaseModel):
     to wet_lab_admin / system_admin and bounded by the action's ceiling.
 
     `force` re-submits a sequenced_pool action even when a COMPLETED ticket
-    already exists for the same `(pool, action, version)`. Default-refused
-    because a re-run re-registers the pool's reads into the lake (DuckLake has
-    no uniqueness — duplicate rows result); the intended recovery for a stored
-    result is `delete-sequenced-pool` then resubmit. It is privileged regardless
-    of scope: setting `force=true` requires wet_lab_admin / system_admin (403
-    otherwise) for ANY action. It only *changes submission behavior* for the
-    sequenced_pool COMPLETED gate, though — for other scopes, or when no
-    COMPLETED ticket exists, an authorized `force=true` is simply a no-op. It
-    never relaxes the in-flight gate (a PENDING/QUEUED/PROCESSING ticket still
-    blocks)."""
+    already exists for the same `(pool, action, version)`. What it then does to
+    the pool's data is stated once in
+    `qiita_common.work_ticket_constants.FORCE_RESUBMIT_EXPLANATION`, which this
+    field's description carries. What follows is the wire semantics an operator
+    does not see. It is privileged regardless of scope: setting `force=true`
+    requires wet_lab_admin / system_admin (403 otherwise) for ANY action. It
+    only *changes submission behavior* for the sequenced_pool COMPLETED gate,
+    though — for other scopes, or when no COMPLETED ticket exists, an
+    authorized `force=true` is simply a no-op. It never relaxes the in-flight
+    gate (a PENDING/QUEUED/PROCESSING ticket still blocks)."""
 
     action_id: str = Field(min_length=1, max_length=MAX_NAME_LENGTH)
     action_version: str = Field(min_length=1, max_length=MAX_VERSION_LENGTH)
     scope_target: ScopeTarget
     action_context: dict[str, Any] = Field(default_factory=dict)
     resource_override: ResourceOverride | None = None
-    force: bool = False
+    # Submitted on this ticket's scope target once it COMPLETES; human callers
+    # only (see `qiita_control_plane.follow_on`).
+    on_success: WorkTicketFollowOn | None = None
+    force: bool = Field(
+        default=False,
+        description=(
+            "Submit anyway when a COMPLETED ticket already exists for this"
+            f" sequenced_pool and action. {FORCE_RESUBMIT_EXPLANATION}"
+        ),
+    )
 
 
 class WorkTicketResponse(BaseModel):
@@ -434,10 +506,14 @@ class BlockMaskPlanResponse(BaseModel):
     """Returned (HTTP 202) by `POST .../block-mask-plan`: the plan the server
     persisted + dispatched. `blocks` lists every created block with its
     dispatched work_ticket; `partitions` summarizes the per-mask tiling and the
-    host filtering EACH partition resolved to (there is no single pool-wide host
-    answer any more — it is per sample); the `samples_*` counts reconcile the
-    pool's samples (planned + skipped-existing + skipped-no-reads). A pool with
-    nothing to do returns 202 with zero counts."""
+    host filtering EACH partition resolved to (host filtering is resolved per
+    prep_sample, so a pool can span several partitions); the `samples_*` counts
+    reconcile the pool's prep_samples (planned + skipped-existing + skipped-no-reads
+    + completed-empty + skipped-invalidated). `samples_completed_empty` counts the
+    prep_samples whose ingest stored no reads, recorded as masked with no reads to
+    serve; `samples_skipped_invalidated` counts those of them whose masking was
+    withdrawn earlier, which the plan leaves withdrawn. A pool with nothing to do
+    returns 202 with zero counts."""
 
     sequencing_run_idx: Annotated[int, Field(gt=0)]
     sequenced_pool_idx: Annotated[int, Field(gt=0)]
@@ -445,6 +521,8 @@ class BlockMaskPlanResponse(BaseModel):
     samples_planned: Annotated[int, Field(ge=0)]
     samples_skipped_existing: Annotated[int, Field(ge=0)]
     samples_skipped_no_reads: Annotated[int, Field(ge=0)]
+    samples_completed_empty: Annotated[int, Field(ge=0)]
+    samples_skipped_invalidated: Annotated[int, Field(ge=0)]
     blocks_created: Annotated[int, Field(ge=0)]
     partitions: list[BlockPlanPartition]
     blocks: list[BlockPlanBlock]

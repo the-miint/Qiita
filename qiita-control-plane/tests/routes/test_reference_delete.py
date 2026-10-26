@@ -13,6 +13,8 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 from qiita_common.api_paths import URL_REFERENCE_BY_IDX, URL_REFERENCE_PREFIX
 
+from qiita_control_plane.testing.db_teardown import teardown_entity_graph
+
 pytestmark = pytest.mark.db
 
 
@@ -302,12 +304,12 @@ async def test_delete_reference_keeps_a_feature_an_assembly_claims(
             is None
         )
     finally:
-        await postgres_pool.execute(
-            "DELETE FROM qiita.assembly_membership WHERE feature_idx = ANY($1::bigint[])",
-            [contig, orphan],
+        await teardown_entity_graph(
+            postgres_pool,
+            study_idxs=[],
+            biosample_idxs=[biosample],
+            prep_sample_idxs=[prep_sample],
         )
-        await postgres_pool.execute("DELETE FROM qiita.prep_sample WHERE idx = $1", prep_sample)
-        await postgres_pool.execute("DELETE FROM qiita.biosample WHERE idx = $1", biosample)
         await postgres_pool.execute(
             "DELETE FROM qiita.processing WHERE processing_idx = $1",
             processing["processing_idx"],

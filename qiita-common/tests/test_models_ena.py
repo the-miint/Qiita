@@ -2,7 +2,9 @@
 
 `read_ena` returns typed columns (duckdb-miint#178): numeric fields arrive as
 `int | None`, and per-file fields arrive as `list[...]`. These tests verify
-the models validate the typed data correctly.
+the models validate the typed data correctly, including the required `status`
+field (`EnaStatus`): only `public`/`suppressed` parse, everything else --
+including `None` -- fails loud.
 """
 
 import pytest
@@ -10,19 +12,21 @@ from pydantic import ValidationError
 
 
 def test_ena_study_header_minimal():
-    from qiita_common.models.ena import EnaStudyHeader
+    from qiita_common.models.ena import EnaStatus, EnaStudyHeader
 
-    header = EnaStudyHeader(study_accession="PRJEB11419")
+    header = EnaStudyHeader(study_accession="PRJEB11419", status=EnaStatus.PUBLIC)
     assert header.study_accession == "PRJEB11419"
+    assert header.status is EnaStatus.PUBLIC
     assert header.secondary_study_accession is None
     assert header.tax_id is None
 
 
 def test_ena_study_header_full():
-    from qiita_common.models.ena import EnaStudyHeader
+    from qiita_common.models.ena import EnaStatus, EnaStudyHeader
 
     header = EnaStudyHeader(
         study_accession="PRJEB11419",
+        status=EnaStatus.PUBLIC,
         secondary_study_accession="ERP012803",
         study_title="Human gut microbiome",
         study_description="A cohort study",
@@ -41,38 +45,72 @@ def test_ena_study_header_blank_secondary_accession_is_none():
     not NULL -- this must normalize to None, not survive as a distinct
     empty-string value (qiita.study.ena_study_accession is UNIQUE, and
     Postgres admits only one '')."""
-    from qiita_common.models.ena import EnaStudyHeader
+    from qiita_common.models.ena import EnaStatus, EnaStudyHeader
 
-    blank = EnaStudyHeader(study_accession="PRJEB11419", secondary_study_accession="")
-    whitespace = EnaStudyHeader(study_accession="PRJEB11419", secondary_study_accession="  ")
+    blank = EnaStudyHeader(
+        study_accession="PRJEB11419", status=EnaStatus.PUBLIC, secondary_study_accession=""
+    )
+    whitespace = EnaStudyHeader(
+        study_accession="PRJEB11419", status=EnaStatus.PUBLIC, secondary_study_accession="  "
+    )
     assert blank.secondary_study_accession is None
     assert whitespace.secondary_study_accession is None
 
 
 def test_ena_study_header_rejects_empty_accession():
-    from qiita_common.models.ena import EnaStudyHeader
+    from qiita_common.models.ena import EnaStatus, EnaStudyHeader
 
     with pytest.raises(ValidationError):
-        EnaStudyHeader(study_accession="")
+        EnaStudyHeader(study_accession="", status=EnaStatus.PUBLIC)
 
 
 def test_ena_study_header_rejects_garbage_tax_id():
-    from qiita_common.models.ena import EnaStudyHeader
+    from qiita_common.models.ena import EnaStatus, EnaStudyHeader
 
     with pytest.raises(ValidationError):
-        EnaStudyHeader(study_accession="PRJEB11419", tax_id="not-a-number")
+        EnaStudyHeader(study_accession="PRJEB11419", status=EnaStatus.PUBLIC, tax_id="not-a-number")
 
 
 def test_ena_study_header_blank_tax_id_is_none():
     """A None value means "missing" — only a non-None unparseable value fails loud."""
-    from qiita_common.models.ena import EnaStudyHeader
+    from qiita_common.models.ena import EnaStatus, EnaStudyHeader
 
-    header = EnaStudyHeader(study_accession="PRJEB11419", tax_id=None)
+    header = EnaStudyHeader(study_accession="PRJEB11419", status=EnaStatus.PUBLIC, tax_id=None)
     assert header.tax_id is None
 
 
+def test_ena_study_header_requires_status():
+    """`status` has no default -- an omitted value must fail loud, not resolve
+    to some implicit "assume public"."""
+    from qiita_common.models.ena import EnaStudyHeader
+
+    with pytest.raises(ValidationError):
+        EnaStudyHeader(study_accession="PRJEB11419")
+
+
+def test_ena_study_header_accepts_suppressed_status():
+    from qiita_common.models.ena import EnaStatus, EnaStudyHeader
+
+    header = EnaStudyHeader(study_accession="PRJEB11419", status=EnaStatus.SUPPRESSED)
+    assert header.status is EnaStatus.SUPPRESSED
+
+
+def test_ena_study_header_rejects_unrecognized_status():
+    from qiita_common.models.ena import EnaStudyHeader
+
+    with pytest.raises(ValidationError):
+        EnaStudyHeader(study_accession="PRJEB11419", status="bogus")
+
+
+def test_ena_study_header_rejects_none_status():
+    from qiita_common.models.ena import EnaStudyHeader
+
+    with pytest.raises(ValidationError):
+        EnaStudyHeader(study_accession="PRJEB11419", status=None)
+
+
 def test_ena_run_record_minimal_requires_accessions():
-    from qiita_common.models.ena import EnaRunRecord
+    from qiita_common.models.ena import EnaRunRecord, EnaStatus
 
     with pytest.raises(ValidationError):
         EnaRunRecord(
@@ -80,17 +118,19 @@ def test_ena_run_record_minimal_requires_accessions():
             experiment_accession="",
             sample_accession="SAMEA3610311",
             study_accession="PRJEB11419",
+            status=EnaStatus.PUBLIC,
         )
 
 
 def test_ena_run_record_field_by_field():
-    from qiita_common.models.ena import EnaRunRecord
+    from qiita_common.models.ena import EnaRunRecord, EnaStatus
 
     run = EnaRunRecord(
         run_accession="ERR1074767",
         experiment_accession="ERX1111111",
         sample_accession="SAMEA3610311",
         study_accession="PRJEB11419",
+        status=EnaStatus.PUBLIC,
         library_layout="PAIRED",
         library_strategy="WGS",
         library_source="METAGENOMIC",
@@ -139,13 +179,14 @@ def test_ena_run_record_field_by_field():
 
 
 def test_ena_run_record_single_end_lists_are_single_element():
-    from qiita_common.models.ena import EnaRunRecord
+    from qiita_common.models.ena import EnaRunRecord, EnaStatus
 
     run = EnaRunRecord(
         run_accession="ERR1074767",
         experiment_accession="ERX1111111",
         sample_accession="SAMEA3610311",
         study_accession="PRJEB11419",
+        status=EnaStatus.PUBLIC,
         fastq_ftp=["ftp.sra.ebi.ac.uk/vol1/fastq/ERR107/ERR1074767.fastq.gz"],
         fastq_bytes=[123456],
         fastq_md5=["d41d8cd98f00b204e9800998ecf8427e"],
@@ -157,13 +198,14 @@ def test_ena_run_record_single_end_lists_are_single_element():
 
 
 def test_ena_run_record_blank_optional_fields_default_none():
-    from qiita_common.models.ena import EnaRunRecord
+    from qiita_common.models.ena import EnaRunRecord, EnaStatus
 
     run = EnaRunRecord(
         run_accession="ERR1074767",
         experiment_accession="ERX1111111",
         sample_accession="SAMEA3610311",
         study_accession="PRJEB11419",
+        status=EnaStatus.PUBLIC,
     )
     assert run.fastq_ftp is None
     assert run.fastq_bytes is None
@@ -174,13 +216,14 @@ def test_ena_run_record_blank_optional_fields_default_none():
 
 def test_ena_run_record_accepts_null_fastq_lists():
     """miint's `read_ena` returns NULL, not an empty list, for an empty per-file field."""
-    from qiita_common.models.ena import EnaRunRecord
+    from qiita_common.models.ena import EnaRunRecord, EnaStatus
 
     run = EnaRunRecord(
         run_accession="ERR1074767",
         experiment_accession="ERX1111111",
         sample_accession="SAMEA3610311",
         study_accession="PRJEB11419",
+        status=EnaStatus.PUBLIC,
         fastq_ftp=None,
         fastq_aspera=None,
         fastq_bytes=None,
@@ -191,7 +234,7 @@ def test_ena_run_record_accepts_null_fastq_lists():
 
 
 def test_ena_run_record_rejects_garbage_fastq_bytes():
-    from qiita_common.models.ena import EnaRunRecord
+    from qiita_common.models.ena import EnaRunRecord, EnaStatus
 
     with pytest.raises(ValidationError):
         EnaRunRecord(
@@ -199,11 +242,26 @@ def test_ena_run_record_rejects_garbage_fastq_bytes():
             experiment_accession="ERX1111111",
             sample_accession="SAMEA3610311",
             study_accession="PRJEB11419",
+            status=EnaStatus.PUBLIC,
             fastq_bytes=["not-a-number"],
         )
 
 
 def test_ena_run_record_rejects_garbage_read_count():
+    from qiita_common.models.ena import EnaRunRecord, EnaStatus
+
+    with pytest.raises(ValidationError):
+        EnaRunRecord(
+            run_accession="ERR1074767",
+            experiment_accession="ERX1111111",
+            sample_accession="SAMEA3610311",
+            study_accession="PRJEB11419",
+            status=EnaStatus.PUBLIC,
+            read_count="unknown",
+        )
+
+
+def test_ena_run_record_requires_status():
     from qiita_common.models.ena import EnaRunRecord
 
     with pytest.raises(ValidationError):
@@ -212,7 +270,45 @@ def test_ena_run_record_rejects_garbage_read_count():
             experiment_accession="ERX1111111",
             sample_accession="SAMEA3610311",
             study_accession="PRJEB11419",
-            read_count="unknown",
+        )
+
+
+def test_ena_run_record_accepts_suppressed_status():
+    from qiita_common.models.ena import EnaRunRecord, EnaStatus
+
+    run = EnaRunRecord(
+        run_accession="ERR1074767",
+        experiment_accession="ERX1111111",
+        sample_accession="SAMEA3610311",
+        study_accession="PRJEB11419",
+        status=EnaStatus.SUPPRESSED,
+    )
+    assert run.status is EnaStatus.SUPPRESSED
+
+
+def test_ena_run_record_rejects_unrecognized_status():
+    from qiita_common.models.ena import EnaRunRecord
+
+    with pytest.raises(ValidationError):
+        EnaRunRecord(
+            run_accession="ERR1074767",
+            experiment_accession="ERX1111111",
+            sample_accession="SAMEA3610311",
+            study_accession="PRJEB11419",
+            status="bogus",
+        )
+
+
+def test_ena_run_record_rejects_none_status():
+    from qiita_common.models.ena import EnaRunRecord
+
+    with pytest.raises(ValidationError):
+        EnaRunRecord(
+            run_accession="ERR1074767",
+            experiment_accession="ERX1111111",
+            sample_accession="SAMEA3610311",
+            study_accession="PRJEB11419",
+            status=None,
         )
 
 
@@ -222,12 +318,12 @@ def test_ena_sample_attributes_pivot():
     attrs = EnaSampleAttributes(
         sample_accession="SAMEA3610311",
         attributes={
-            "collection date": "2013-01-01",
-            "geographic location (country and/or sea)": "USA",
+            "collection date": ["2013-01-01"],
+            "geographic location (country and/or sea)": ["USA"],
         },
     )
     assert attrs.sample_accession == "SAMEA3610311"
-    assert attrs.attributes["collection date"] == "2013-01-01"
+    assert attrs.attributes["collection date"] == ["2013-01-01"]
     assert len(attrs.attributes) == 2
 
 
@@ -242,7 +338,7 @@ def test_ena_sample_attributes_rejects_blank_tag():
     from qiita_common.models.ena import EnaSampleAttributes
 
     with pytest.raises(ValidationError):
-        EnaSampleAttributes(sample_accession="SAMEA3610311", attributes={"": "USA"})
+        EnaSampleAttributes(sample_accession="SAMEA3610311", attributes={"": ["USA"]})
 
 
 def test_ena_sample_attributes_defaults_to_empty_map():
@@ -250,3 +346,28 @@ def test_ena_sample_attributes_defaults_to_empty_map():
 
     attrs = EnaSampleAttributes(sample_accession="SAMEA3610311")
     assert attrs.attributes == {}
+
+
+# ---------------------------------------------------------------------------
+# parse_ena_browser_status -- the Browser API's numeric status, distinct from
+# the Portal-sourced EnaStatus above.
+# ---------------------------------------------------------------------------
+
+
+def test_parse_ena_browser_status_public_is_none():
+    from qiita_common.models.ena import parse_ena_browser_status
+
+    assert parse_ena_browser_status(status=4, description="public") is None
+
+
+def test_parse_ena_browser_status_suppressed_returns_description():
+    from qiita_common.models.ena import parse_ena_browser_status
+
+    assert parse_ena_browser_status(status=5, description="suppressed") == "suppressed"
+
+
+def test_parse_ena_browser_status_unrecognized_code_raises():
+    from qiita_common.models.ena import UnknownEnaBrowserStatusError, parse_ena_browser_status
+
+    with pytest.raises(UnknownEnaBrowserStatusError):
+        parse_ena_browser_status(status=1, description="received")

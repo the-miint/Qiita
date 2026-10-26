@@ -246,6 +246,22 @@ def test_read_preflight_rows_fails_on_missing_accession(build_case5_preflight):
         _read_pacbio_preflight_rows(db, _RaisingParser())
 
 
+@pytest.mark.parametrize("bioproject", ["", "  ", " PRJNA99999 "])
+def test_read_preflight_rows_fails_on_blank_or_padded_accession(build_case5_preflight, bioproject):
+    """The library refuses a NULL accession but not a blank or padded one; the
+    reader refuses those, naming the sample."""
+    db = build_case5_preflight()
+    conn = sqlite3.connect(db)
+    conn.execute("UPDATE project SET bioproject_accession = ?", (bioproject,))
+    conn.commit()
+    conn.close()
+    with pytest.raises(
+        _RaisingParser.Error,
+        match=r"pacbio_sample_idx 1 has a blank or padded primary_bioproject_accession",
+    ):
+        _read_pacbio_preflight_rows(db, _RaisingParser())
+
+
 def test__read_pacbio_preflight_rows_rejects_a_non_sqlite_blob(tmp_path, capsys):
     """Tests the case where --preflight-blob names a file that is not a SQLite
     database at all — the operator pointed at the CSV, or at a truncated copy.
@@ -298,6 +314,8 @@ def _stub_submit_flow(
     existing_samples: list[dict] | None = None,
     fail_ticket_when=None,
     conflict_ticket_when=None,
+    completed_prep_samples=(),
+    lookup_fails=False,
 ) -> None:
     """Route each POST/GET of the submit flow to a canned response and record
     every request.
@@ -313,7 +331,7 @@ def _stub_submit_flow(
     roster = {"samples": list(existing_samples or [])}
 
     def fake_request(method, url, headers=None, json=None, params=None, timeout=None):
-        captured["requests"].append({"method": method, "url": url, "json": json})
+        captured["requests"].append({"method": method, "url": url, "json": json, "params": params})
 
         def resp(status, body):
             return httpx.Response(status, json=body, request=httpx.Request(method, url))
@@ -337,16 +355,21 @@ def _stub_submit_flow(
             )
         if url.endswith("/auth/whoami"):
             return resp(200, {"kind": "human", "principal_idx": 7})
-        if url.endswith("/lookup-by-accession") and "biosample" in url:
-            return resp(
-                200,
+        if url.endswith("/biosample/resolve-roster"):
+            biosample_idx = {"BIO_sample.1": 11, "BIO_sample.2": 12, "BIO_sample.3": 13}
+            study_idx = {"PRJNA99999": 900}
+            rows = [
                 {
-                    "resolved": {"BIO_sample.1": 11, "BIO_sample.2": 12, "BIO_sample.3": 13},
-                    "missing": [],
-                },
-            )
-        if url.endswith("/lookup-by-accession"):  # study, keyed on the bioproject accession
-            return resp(200, {"resolved": {"PRJNA99999": 900}, "missing": []})
+                    "item_id": r["item_id"],
+                    "biosample_idx": biosample_idx[r["biosample_accession"]],
+                    "primary_study_idx": study_idx[r["primary_project_accession"]],
+                    "secondary_study_idxs": [
+                        study_idx[a] for a in r["secondary_project_accessions"]
+                    ],
+                }
+                for r in json["rows"]
+            ]
+            return resp(200, {"rows": rows})
         if url.endswith("/sequenced-pool"):
             return resp(201, {"sequenced_pool_idx": 50})
         if url.rstrip("/").endswith("/sequencing-run"):
@@ -357,6 +380,12 @@ def _stub_submit_flow(
             counter["sample"] += 1
             n = counter["sample"]
             return resp(201, {"prep_sample_idx": 100 + n, "sequenced_sample_idx": 200 + n})
+        if method == "GET" and url.endswith("/work-ticket"):
+            if lookup_fails:
+                return resp(500, {"detail": "boom"})
+            idx = int(params["prep_sample_idx"])
+            tickets = [{"work_ticket_idx": 700 + idx}] if idx in completed_prep_samples else []
+            return resp(200, {"tickets": tickets, "count": len(tickets), "truncated": False})
         if url.endswith("/work-ticket"):
             if fail_ticket_when is not None and fail_ticket_when(json):
                 return resp(500, {"detail": "boom"})
@@ -516,6 +545,44 @@ def test_submit_pacbio_ingest_missing_bam_aborts_before_network(
     assert [r["url"].split("/api/v1")[-1] for r in captured["requests"]] == ["/run-folder/inspect"]
 
 
+def test_submit_pacbio_ingest_names_missing_rows_as_pacbio_sample_rows(
+    monkeypatch, tmp_path, build_case5_preflight, capsys
+):
+    """A biosample accession Qiita does not have is reported against the
+    pre-flight's `pacbio_sample` rows, as Illumina's names `illumina_sample`."""
+    db = build_case5_preflight()
+    run = tmp_path / "run"
+    for bc in ("bc3011", "bc0112", "bc9992"):
+        _make_bam(run, "1_A01", "m84_s1", bc)
+
+    captured: dict = {}
+    _stub_submit_flow(monkeypatch, captured)
+    stubbed = _common.httpx.request
+
+    def missing_one(method, url, headers=None, json=None, params=None, timeout=None):
+        if url.endswith("/biosample/resolve-roster"):
+            item_id = json["rows"][2]["item_id"]
+            return httpx.Response(
+                422,
+                json={
+                    "detail": {
+                        "message": "1 of 3 roster rows did not resolve",
+                        "problems": [
+                            {"item_id": item_id, "message": "no biosample has accession 'X'"}
+                        ],
+                    }
+                },
+                request=httpx.Request(method, url),
+            )
+        return stubbed(method, url, headers=headers, json=json, params=params, timeout=timeout)
+
+    monkeypatch.setattr(_common.httpx, "request", missing_one)
+    with pytest.raises(SystemExit):
+        main(_submit_args(run, db))
+    err = capsys.readouterr().err
+    assert "  - pacbio_sample_idx 3: no biosample has accession 'X'" in err
+
+
 def test_submit_pacbio_ingest_resilient_to_ticket_failure(
     monkeypatch, tmp_path, build_case5_preflight
 ):
@@ -545,24 +612,14 @@ def test_submit_pacbio_ingest_resilient_to_ticket_failure(
     assert len(ticket_posts) == 3
 
 
-def test_submit_pacbio_ingest_force_reaches_ticket_body(
-    monkeypatch, tmp_path, build_case5_preflight
-):
-    db = build_case5_preflight()
-    run = tmp_path / "run"
-    for bc in ("bc3011", "bc0112", "bc9992"):
-        _make_bam(run, "1_A01", "m84_s1", bc)
-
-    captured: dict = {}
-    _stub_submit_flow(monkeypatch, captured)
-    rc = main(_submit_args(run, db, force=True))
-    assert rc == 0
-    ticket_posts = [
-        r
-        for r in captured["requests"]
-        if r["method"] == "POST" and r["url"].endswith("/work-ticket")
-    ]
-    assert ticket_posts and all(r["json"]["force"] is True for r in ticket_posts)
+def test_submit_pacbio_ingest_has_no_force_flag(tmp_path, capsys):
+    """`force` waives only the sequenced_pool COMPLETED gate, and PacBio ingest
+    submits prep_sample-scoped tickets, so the flag would change nothing but the
+    role check; it is not offered."""
+    with pytest.raises(SystemExit) as ei:
+        main(_submit_args(tmp_path / "run", tmp_path / "pf.db", force=True))
+    assert ei.value.code == 2
+    assert "unrecognized arguments: --force" in capsys.readouterr().err
 
 
 def test_submit_pacbio_ingest_retry_reuses_existing_roster(
@@ -634,10 +691,10 @@ def test_submit_pacbio_ingest_reused_sample_biosample_mismatch_fails(
 def test_submit_pacbio_ingest_409_ticket_is_skip_not_failure(
     monkeypatch, tmp_path, build_case5_preflight
 ):
-    """A real re-submit: the samples exist AND their ingest tickets already
-    COMPLETED (or are in-flight), so the work-ticket POSTs 409. Those are the
-    convergence signal, not failures — the command records them as skipped and
-    exits 0 (the operator must be able to tell already-done from a real failure)."""
+    """A real re-submit: the samples exist AND their ingest tickets are in
+    flight, so the work-ticket POSTs 409. Those are the convergence signal, not
+    failures — the command records them as skipped and exits 0 (the operator
+    must be able to tell already-running from a real failure)."""
     db = build_case5_preflight()
     run = tmp_path / "run"
     for bc in ("bc3011", "bc0112", "bc9992"):
@@ -657,6 +714,98 @@ def test_submit_pacbio_ingest_409_ticket_is_skip_not_failure(
     )
     rc = main(_submit_args(run, db))
     assert rc == 0  # all-already-done converges to success, not a failure exit
+
+
+def test_submit_pacbio_ingest_skips_a_prep_sample_whose_ingest_completed(
+    monkeypatch, tmp_path, build_case5_preflight, capsys
+):
+    """A re-run does not queue a ticket for a reused prep_sample that already has a
+    COMPLETED bam-to-parquet ticket: that ticket would stop at read numbering. It is
+    reported as skipped, naming the ticket; the others are still submitted."""
+    db = build_case5_preflight()
+    run = tmp_path / "run"
+    for bc in ("bc3011", "bc0112", "bc9992"):
+        _make_bam(run, "1_A01", "m84_s1", bc)
+
+    existing = [
+        {
+            "sequenced_pool_item_id": str(i + 1),
+            "prep_sample_idx": 300 + i,
+            "sequenced_sample_idx": 400 + i,
+        }
+        for i in range(3)
+    ]
+    captured: dict = {}
+    _stub_submit_flow(
+        monkeypatch, captured, existing_samples=existing, completed_prep_samples={300}
+    )
+    assert main(_submit_args(run, db)) == 0
+
+    posted = [
+        r["json"]["scope_target"]["prep_sample_idx"]
+        for r in captured["requests"]
+        if r["method"] == "POST" and r["url"].endswith("/work-ticket")
+    ]
+    assert sorted(posted) == [301, 302]
+    # Other admins' tickets count, and only a COMPLETED one means the reads loaded.
+    lookups = [
+        r["params"]
+        for r in captured["requests"]
+        if r["method"] == "GET" and r["url"].endswith("/work-ticket")
+    ]
+    assert len(lookups) == 3
+    for params in lookups:
+        assert params["all"] == "true"
+        assert params["state"] == "completed"
+        assert params["action_id"] == "bam-to-parquet"
+    out = capsys.readouterr().out
+    assert "reads already loaded by ticket 1000" in out
+    assert '"samples_skipped": 1' in out
+
+
+def test_submit_pacbio_ingest_a_failed_lookup_is_a_failure_not_a_submit(
+    monkeypatch, tmp_path, build_case5_preflight, capsys
+):
+    """If the completed-ingest lookup fails, the prep_sample is recorded as a
+    failure and not submitted, and the run exits non-zero."""
+    db = build_case5_preflight()
+    run = tmp_path / "run"
+    for bc in ("bc3011", "bc0112", "bc9992"):
+        _make_bam(run, "1_A01", "m84_s1", bc)
+    existing = [
+        {
+            "sequenced_pool_item_id": str(i + 1),
+            "prep_sample_idx": 300 + i,
+            "sequenced_sample_idx": 400 + i,
+        }
+        for i in range(3)
+    ]
+    captured: dict = {}
+    _stub_submit_flow(monkeypatch, captured, existing_samples=existing, lookup_fails=True)
+    with pytest.raises(SystemExit) as ei:
+        main(_submit_args(run, db))
+    assert ei.value.code == 1
+    assert "looking up its completed ingest: " in capsys.readouterr().err
+    assert not [
+        r
+        for r in captured["requests"]
+        if r["method"] == "POST" and r["url"].endswith("/work-ticket")
+    ]
+
+
+def test_submit_pacbio_ingest_new_prep_samples_are_not_looked_up(
+    monkeypatch, tmp_path, build_case5_preflight
+):
+    """A prep_sample this run created cannot have tickets, so it gets no lookup."""
+    db = build_case5_preflight()
+    run = tmp_path / "run"
+    for bc in ("bc3011", "bc0112", "bc9992"):
+        _make_bam(run, "1_A01", "m84_s1", bc)
+    captured: dict = {}
+    _stub_submit_flow(monkeypatch, captured)
+    main(_submit_args(run, db))
+    ticket_calls = [r for r in captured["requests"] if r["url"].endswith("/work-ticket")]
+    assert [r["method"] for r in ticket_calls] == ["POST", "POST", "POST"]
 
 
 def test_read_preflight_rows_rejects_non_pacbio_sheet(build_case5_preflight):

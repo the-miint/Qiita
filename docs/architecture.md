@@ -21,7 +21,7 @@ The service diagram, and what each of the four components is.
 Identifier hierarchy, Parquet identifier columns, metadata, processing dedup.
 
 - [Identifier Hierarchy](architecture/data-model.md#identifier-hierarchy)
-- [Legacy import reserved range — study and prep_sample](architecture/data-model.md#legacy-import-reserved-range--study-and-prep_sample)
+- [Legacy import reserved range — study, prep_sample and sequenced_pool](architecture/data-model.md#legacy-import-reserved-range--study-prep_sample-and-sequenced_pool)
 - [Processing Methods](architecture/data-model.md#processing-methods)
 - [Identifier Columns in Parquet](architecture/data-model.md#identifier-columns-in-parquet)
 - [Biosample and Prep Sample Metadata](architecture/data-model.md#biosample-and-prep-sample-metadata)
@@ -87,7 +87,7 @@ Deployment shape, monorepo tree, Makefile targets, GitHub Actions.
 
 ### [Wiring and Cross-cutting Structure](architecture/cross-cutting.md)
 
-Wiring notes, component map and ports, identifier ownership, data-plane design, the runner.
+Wiring notes, component map and ports, identifier ownership, public handle prefixes, data-plane design, the runner.
 
 - [Wiring Notes](architecture/cross-cutting.md#wiring-notes)
 - [Cross-cutting structure](architecture/cross-cutting.md#cross-cutting-structure)

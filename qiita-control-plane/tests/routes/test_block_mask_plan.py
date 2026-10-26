@@ -31,6 +31,7 @@ from qiita_control_plane.testing.db_seeds import (
     seed_biosample_with_sequenced_prep_sample,
     seed_host_reference,
 )
+from qiita_control_plane.testing.db_teardown import teardown_entity_graph
 
 pytestmark = pytest.mark.db
 
@@ -138,7 +139,6 @@ async def planned(ctx, monkeypatch):
 
     prep_samples: list[int] = []
     biosamples: list[int] = []
-    meta_idxs: list[int] = []
     for _ in range(2):
         bs, ps = await seed_biosample_with_sequenced_prep_sample(db, owner_idx=owner)
         biosamples.append(bs)
@@ -168,16 +168,15 @@ async def planned(ctx, monkeypatch):
                 study_idx=study_idx,
                 created_by_idx=owner,
             )
-        meta_idx = await db.fetchval(
+        await db.execute(
             "INSERT INTO qiita.biosample_metadata"
             " (biosample_idx, biosample_study_field_idx, value_missing_reason_idx, created_by_idx)"
-            " VALUES ($1, $2, $3, $4) RETURNING idx",
+            " VALUES ($1, $2, $3, $4)",
             bs,
             field_idx,
             not_applicable_idx,
             owner,
         )
-        meta_idxs.append(meta_idx)
 
     yield {
         "db": db,
@@ -189,42 +188,27 @@ async def planned(ctx, monkeypatch):
         "owner": owner,
     }
 
-    # Cleanup (FK-reverse, id-scoped).
     await db.execute(
         "DELETE FROM qiita.work_ticket WHERE block_idx IN"
         " (SELECT bm.block_idx FROM qiita.block_member bm"
         "   WHERE bm.prep_sample_idx = ANY($1::bigint[]))",
         prep_samples,
     )
+    # Resolved through block_member, which the sweep clears, so it runs first.
     await db.execute(
         "DELETE FROM qiita.block WHERE block_idx IN"
         " (SELECT block_idx FROM qiita.block_member WHERE prep_sample_idx = ANY($1::bigint[]))",
         prep_samples,
     )
-    await db.execute(
-        "DELETE FROM qiita.mask_sample WHERE prep_sample_idx = ANY($1::bigint[])", prep_samples
-    )
-    # Host-filter infra teardown (before the biosamples are deleted below).
-    await db.execute(
-        "DELETE FROM qiita.biosample_metadata WHERE idx = ANY($1::bigint[])", meta_idxs
-    )
-    await db.execute("DELETE FROM qiita.biosample_to_study WHERE study_idx = $1", study_idx)
-    await db.execute(
-        "DELETE FROM qiita.sequence_range WHERE prep_sample_idx = ANY($1::bigint[])", prep_samples
-    )
-    await db.execute(
-        "DELETE FROM qiita.sequenced_sample WHERE prep_sample_idx = ANY($1::bigint[])", prep_samples
+    await teardown_entity_graph(
+        db, study_idxs=[study_idx], biosample_idxs=biosamples, prep_sample_idxs=prep_samples
     )
     await db.execute("DELETE FROM qiita.sequenced_pool WHERE idx = $1", pool_idx)
     await db.execute("DELETE FROM qiita.sequencing_run WHERE idx = $1", run_idx)
-    await db.execute("DELETE FROM qiita.prep_sample WHERE idx = ANY($1::bigint[])", prep_samples)
-    await db.execute("DELETE FROM qiita.biosample WHERE idx = ANY($1::bigint[])", biosamples)
-    await db.execute("DELETE FROM qiita.biosample_study_field WHERE idx = $1", field_idx)
     await db.execute(
         "DELETE FROM qiita.reference_index WHERE reference_idx = $1", ready_reference_idx
     )
     await db.execute("DELETE FROM qiita.reference WHERE reference_idx = $1", ready_reference_idx)
-    await db.execute("DELETE FROM qiita.study WHERE idx = $1", study_idx)
     await db.execute(
         "DELETE FROM qiita.action WHERE action_id = $1 AND version = $2",
         block_planner.BLOCK_MASK_ACTION_ID,
@@ -350,6 +334,23 @@ async def test_block_mask_plan_resubmit_over_completed_409(ctx, planned):
     assert ok.status_code == 202, ok.text
     assert ok.json()["samples_planned"] == 0
     assert ok.json()["blocks_created"] == 0
+
+
+async def test_block_mask_plan_prep_sample_gaining_reads_mid_plan_409(ctx, planned, monkeypatch):
+    """A prep_sample whose range landed while the plan ran rolls the plan back; the
+    operator is told to plan again rather than handed an unmapped 500."""
+    await _seed_block_action(planned["db"])
+    gained = planned["prep_samples"][0]
+
+    async def _raise(*_args, **_kwargs):
+        raise block_planner.BlockPlanSampleGainedReads(
+            prep_sample_idx=gained, sequenced_pool_idx=planned["pool_idx"]
+        )
+
+    monkeypatch.setattr(block_planner, "plan_and_submit_blocks", _raise)
+    resp = await ctx["wet"].post(_url(planned), json={})
+    assert resp.status_code == 409, resp.text
+    assert "plan the pool again" in resp.json()["detail"]
 
 
 async def test_block_mask_plan_missing_action_503(ctx, planned):

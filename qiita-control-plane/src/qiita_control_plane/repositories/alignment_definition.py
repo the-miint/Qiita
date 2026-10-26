@@ -170,17 +170,18 @@ async def list_pool_prep_sample_idxs(
     pool_or_conn: asyncpg.Pool | asyncpg.Connection,
     sequenced_pool_idx: int,
 ) -> list[int]:
-    """The pool's non-retired sequenced samples, as prep_sample_idx.
+    """The pool's non-retired, non-flagged sequenced samples, as prep_sample_idx.
 
-    Same sample set as the other pool rollups (`ps.retired IS NOT TRUE`), so a
-    pool's alignments are counted over the same population its completion and
-    QC reports describe.
+    Same sample set as the other pool rollups (`ps.retired IS NOT TRUE` and
+    `ss.ena_status IS NULL`), so a pool's alignments are counted over the same
+    population its completion and QC reports describe.
     """
     rows = await pool_or_conn.fetch(
         "SELECT ss.prep_sample_idx"
         "  FROM qiita.sequenced_sample ss"
         "  JOIN qiita.prep_sample ps ON ps.idx = ss.prep_sample_idx"
         " WHERE ss.sequenced_pool_idx = $1 AND ps.retired IS NOT TRUE"
+        "   AND ss.ena_status IS NULL"
         " ORDER BY ss.prep_sample_idx",
         sequenced_pool_idx,
     )

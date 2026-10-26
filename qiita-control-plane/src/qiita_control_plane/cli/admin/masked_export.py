@@ -7,8 +7,10 @@ import argparse
 import base64
 import itertools
 import json
+import math
 import re
 import sys
+import time
 from pathlib import Path
 
 import httpx
@@ -17,10 +19,13 @@ from qiita_common.api_paths import (
     PATH_ADMIN_PREFIX,
     PATH_ADMIN_SEQUENCED_POOL_MASKED_READ_EXPORT,
 )
+from qiita_common.data_plane_errors import is_data_plane_transient
 from qiita_common.flight_constants import ipc_compression_headers
 from qiita_common.parquet import PARQUET_COMPRESSION, ROW_GROUP_SIZE_BYTES
+from qiita_common.sql import sql_string_literal
 
 from qiita_control_plane.miint import connect_with_miint
+from qiita_control_plane.repositories.block import MASK_SAMPLE_COMPLETED
 
 from .. import _common
 
@@ -31,16 +36,86 @@ from .. import _common
 _SAFE_ACCESSION = re.compile(r"^[A-Za-z0-9._-]+$")
 
 
-def _sql_str(path: Path) -> str:
-    """Escape a filesystem path for inlining as a DuckDB SQL string literal."""
-    return str(path).replace("'", "''")
-
-
 # The read_masked macro's columns, in the verbatim order the miint FORMAT FASTQ
 # writer requires (read_id, sequence1, qual1, sequence2, qual2). Projected by the
 # fastq COPY; aliasing any of these away raises a BinderException (pinned by the
 # orchestrator's masked-export fastq contract test).
 _READ_MASKED_COLUMNS = "read_id, sequence1, qual1, sequence2, qual2"
+
+
+# How long a prep_sample's export is retried after the data plane or the control
+# plane became unreachable. A data plane draining for a restart refuses new requests
+# for as long as its in-flight ones run, up to the unit's TimeoutStopSec
+# (deploy/systemd/qiita-data-plane@.service), so the default matches that bound.
+DEFAULT_EXPORT_RETRY_SECONDS = 3900.0
+
+
+def _retry_seconds_arg(value: str) -> float:
+    """argparse `type=` for --retry-seconds: a finite number of seconds, 0 or more."""
+    try:
+        seconds = float(value)
+    except ValueError:
+        seconds = math.nan
+    if not math.isfinite(seconds) or seconds < 0:
+        raise argparse.ArgumentTypeError(f"must be a finite number >= 0, got {value!r}")
+    return seconds
+
+
+# The longest wait between two attempts of one prep_sample.
+_EXPORT_RETRY_MAX_DELAY_S = 30.0
+
+# A control-plane answer that means a proxy found nothing behind it, as during a
+# control-plane restart.
+_TRANSIENT_HTTP_STATUSES = frozenset({502, 503, 504})
+
+
+def _export_failure_is_transient(exc: BaseException) -> bool:
+    """True if a prep_sample's export failed because a service was unreachable rather
+    than because of the request or the output.
+
+    A data plane that goes away mid-stream reaches here as whatever was reading the
+    stream raised: a Flight error, an `OSError` from the parquet path's reader, or a
+    `duckdb.Error` from the fastq COPY over it, each carrying the gRPC message the
+    data-plane classifier matches. Gated on those types, as the runner gates on the
+    pyarrow ones, so a bug's message cannot match by text."""
+    import duckdb  # noqa: PLC0415
+    import pyarrow as pa  # noqa: PLC0415
+    import pyarrow.flight as flight  # noqa: PLC0415
+
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code in _TRANSIENT_HTTP_STATUSES
+    if isinstance(exc, httpx.TransportError):
+        return True
+    if isinstance(exc, (flight.FlightError, OSError, duckdb.Error, pa.ArrowException)):
+        return is_data_plane_transient(exc)
+    return False
+
+
+def _with_retry(export_one, prep_sample_idx: int, retry_seconds: float):
+    """Run `export_one()`, retrying on a transient failure until `retry_seconds` have
+    passed since the first one. Each attempt starts the prep_sample over: its files are
+    committed all-or-nothing (`_commit_partials`), so a failed attempt leaves none."""
+    deadline = None
+    attempt = 0
+    while True:
+        try:
+            return export_one()
+        except Exception as exc:
+            if not _export_failure_is_transient(exc):
+                raise
+            now = time.monotonic()
+            if deadline is None:
+                deadline = now + retry_seconds
+            if now >= deadline:
+                raise
+            delay = min(_EXPORT_RETRY_MAX_DELAY_S, 2.0**attempt, deadline - now)
+            print(
+                f"prep_sample {prep_sample_idx}: {type(exc).__name__}: {str(exc)[:200]}; "
+                f"retrying in {delay:.0f}s",
+                file=sys.stderr,
+            )
+            time.sleep(delay)
+            attempt += 1
 
 
 def _commit_partials(copy_fn, pairs: list[tuple[Path, Path]]) -> None:
@@ -113,7 +188,7 @@ def _write_masked_sample(reader, stem: str, output_dir: Path, fmt: str, con) -> 
             # batches up to one row group's worth and write them as a single row
             # group — reproducing the layout (and bounded peak memory) of the
             # DuckDB `COPY` this path replaced. Size the group by encoded bytes
-            # (ROW_GROUP_SIZE_BYTES, the qiita-wide cap from PARQUET_OPTS) rather
+            # (ROW_GROUP_SIZE_BYTES, the qiita-wide cap every Parquet option set carries) rather
             # than a fixed row count, so wide rows don't produce oversized groups;
             # batch.nbytes is the in-memory size DuckDB's byte cap also measures.
             writer = pq.ParquetWriter(partial, reader.schema, compression=PARQUET_COMPRESSION)
@@ -141,29 +216,35 @@ def _write_masked_sample(reader, stem: str, output_dir: Path, fmt: str, con) -> 
     elif fmt == "fastq":
         paired, stream = _peek_paired(reader)
         con.register("masked", stream)
+        pairs = [
+            (output_dir / f"{name}.partial", output_dir / name)
+            for name in _fastq_names(stem, paired=paired)
+        ]
         if paired:
             # `{ORIENTATION}` expands to R1/R2, so the one COPY emits both
             # `<stem>.R1.fastq.gz.partial` and `<stem>.R2.fastq.gz.partial`.
             target = output_dir / f"{stem}.{{ORIENTATION}}.fastq.gz.partial"
-            pairs = [
-                (
-                    output_dir / f"{stem}.{o}.fastq.gz.partial",
-                    output_dir / f"{stem}.{o}.fastq.gz",
-                )
-                for o in ("R1", "R2")
-            ]
         else:
-            target = output_dir / f"{stem}.fastq.gz.partial"
-            pairs = [(target, output_dir / f"{stem}.fastq.gz")]
+            target = pairs[0][0]
         _commit_partials(
             lambda: con.execute(
                 f"COPY (SELECT {_READ_MASKED_COLUMNS} FROM masked) "
-                f"TO '{_sql_str(target)}' (FORMAT FASTQ, COMPRESSION 'gzip')"
+                f"TO {sql_string_literal(target)} (FORMAT FASTQ, COMPRESSION 'gzip')"
             ),
             pairs,
         )
     else:
         raise ValueError(f"unsupported export format: {fmt!r}")
+
+
+def _fastq_names(stem: str, *, paired: bool) -> list[str]:
+    """The fastq files one prep_sample's export commits: `<stem>.fastq.gz`, or
+    `<stem>.R1.fastq.gz` and `<stem>.R2.fastq.gz` when paired. The writer
+    commits these and the never-overwrite pre-scan looks for them, so a rename
+    cannot leave the pre-scan checking names the writer no longer uses."""
+    if paired:
+        return [f"{stem}.R1.fastq.gz", f"{stem}.R2.fastq.gz"]
+    return [f"{stem}.fastq.gz"]
 
 
 def _export_stem(sample: dict, run_idx, pool_idx) -> str:
@@ -225,8 +306,14 @@ def _handle_masked_read_export(args: argparse.Namespace, parser: argparse.Argume
     no cheap on-disk count, so an existing fastq target is refused up front rather
     than re-exported or overwritten.
 
+    A sample whose export fails because the data plane or the control plane is
+    unreachable is exported again from the start, for up to `--retry-seconds`
+    (`_with_retry`).
+
     The output directory is created if missing (parents included).
     """
+    import duckdb  # noqa: PLC0415
+    import pyarrow as pa  # noqa: PLC0415
     import pyarrow.flight as flight  # noqa: PLC0415
     import pyarrow.ipc as ipc  # noqa: PLC0415
 
@@ -253,7 +340,10 @@ def _handle_masked_read_export(args: argparse.Namespace, parser: argparse.Argume
             "GET", args.base_url, token, manifest_path, params={"mask_idx": args.mask_idx}
         )
     except httpx.HTTPStatusError as exc:
-        print(f"http error {exc.response.status_code}: {exc.response.text}", file=sys.stderr)
+        _common.print_http_status_error(exc.response)
+        return 1
+    except httpx.RequestError as exc:
+        _common.print_request_error(exc)
         return 1
 
     samples = manifest["samples"]
@@ -261,7 +351,7 @@ def _handle_masked_read_export(args: argparse.Namespace, parser: argparse.Argume
     pool_idx = manifest["sequenced_pool_idx"]
     if not samples:
         print(
-            f"no samples on sequenced_pool {pool_idx} for mask_idx {args.mask_idx}; "
+            f"no prep_samples on sequenced_pool {pool_idx} for mask_idx {args.mask_idx}; "
             "nothing to export"
         )
         return 0
@@ -275,9 +365,9 @@ def _handle_masked_read_export(args: argparse.Namespace, parser: argparse.Argume
     )
     if bad:
         print(
-            f"error: {len(bad)} sample(s) on sequenced_pool {pool_idx} have no usable "
+            f"error: {len(bad)} prep_sample(s) on sequenced_pool {pool_idx} have no usable "
             f"biosample_accession (missing or outside [A-Za-z0-9._-]): prep_sample_idx {bad}. "
-            "The export filename requires the accession — submit/repair these samples first.",
+            "The export filename requires the accession — submit/repair these prep_samples first.",
             file=sys.stderr,
         )
         return 1
@@ -290,10 +380,12 @@ def _handle_masked_read_export(args: argparse.Namespace, parser: argparse.Argume
     # whole export up front, mirroring the accession check. Only 'completed' is
     # exportable: a 'pending' row (a covering block in flight) or NO row (absence
     # is not exempt) both mean the read_masked pass-set would be absent or partial.
-    not_complete = sorted(s["prep_sample_idx"] for s in samples if s["mask_state"] != "completed")
+    not_complete = sorted(
+        s["prep_sample_idx"] for s in samples if s["mask_state"] != MASK_SAMPLE_COMPLETED
+    )
     if not_complete:
         print(
-            f"error: {len(not_complete)} sample(s) on sequenced_pool {pool_idx} are not "
+            f"error: {len(not_complete)} prep_sample(s) on sequenced_pool {pool_idx} are not "
             f"masked-complete under mask_idx {args.mask_idx} (mask_sample.state != 'completed'): "
             f"prep_sample_idx {not_complete}. The read_masked pass-set would be absent or "
             "partial — refusing to export. Retry once masking has completed.",
@@ -312,7 +404,8 @@ def _handle_masked_read_export(args: argparse.Namespace, parser: argparse.Argume
             stem = _export_stem(s, run_idx, pool_idx)
             existing += [
                 p
-                for name in (f"{stem}.fastq.gz", f"{stem}.R1.fastq.gz", f"{stem}.R2.fastq.gz")
+                for paired in (False, True)
+                for name in _fastq_names(stem, paired=paired)
                 if (p := output_dir / name).exists()
             ]
         if existing:
@@ -349,49 +442,78 @@ def _handle_masked_read_export(args: argparse.Namespace, parser: argparse.Argume
             else None
         ),
     )
-    # The fastq writer needs a miint DuckDB connection; open it once and reuse it
-    # across all samples (each sample re-registers the `masked` view) rather than
-    # paying a fresh connect + extension LOAD per sample. Parquet needs no DuckDB.
-    con = connect_with_miint() if args.format == "fastq" else None
-    flight_client = flight.FlightClient(args.data_plane_url)
+    con = None
+    flight_client = None
     exported = 0
     skipped = 0
     try:
+        # The fastq writer needs a miint DuckDB connection; open it once and reuse
+        # it across all samples (each sample re-registers the `masked` view) rather
+        # than paying a fresh connect + extension LOAD per sample. Parquet needs no
+        # DuckDB.
+        con = connect_with_miint() if args.format == "fastq" else None
+        flight_client = flight.FlightClient(args.data_plane_url)
         for s in samples:
             prep = s["prep_sample_idx"]
             stem = _export_stem(s, run_idx, pool_idx)
-            ticket_resp = _common.call(
-                "POST",
-                args.base_url,
-                token,
-                ticket_path,
-                json={"prep_sample_idx": prep, "mask_idx": args.mask_idx},
-            )
-            ticket_bytes = base64.b64decode(ticket_resp["ticket"])
-            # Idempotent parquet re-export: only probe the data plane's count when
-            # the output file already exists (a first export pays nothing), then
-            # skip on a match (nothing changed) and fall through to overwrite on a
-            # mismatch. fastq took the all-or-nothing existence check above, so it
-            # always exports here.
-            if args.format == "parquet":
-                target = output_dir / f"{stem}.parquet"
-                if target.exists() and _parquet_row_count(target) == _count_masked(
-                    flight_client, ticket_bytes
-                ):
-                    skipped += 1
-                    continue
-            reader = flight_client.do_get(flight.Ticket(ticket_bytes), read_opts).to_reader()
-            _write_masked_sample(reader, stem, output_dir, args.format, con)
-            exported += 1
+
+            def export_one(prep=prep, stem=stem) -> bool:
+                """Export one prep_sample; False when it was already up to date."""
+                # A fresh ticket per attempt: one minted before a long outage may
+                # have expired by the time the data plane is back.
+                ticket_resp = _common.call(
+                    "POST",
+                    args.base_url,
+                    token,
+                    ticket_path,
+                    json={"prep_sample_idx": prep, "mask_idx": args.mask_idx},
+                )
+                ticket_bytes = base64.b64decode(ticket_resp["ticket"])
+                # Idempotent parquet re-export: only probe the data plane's count
+                # when the output file already exists (a first export pays
+                # nothing), then skip on a match (nothing changed) and fall through
+                # to overwrite on a mismatch. fastq took the all-or-nothing
+                # existence check above, so it always exports here.
+                if args.format == "parquet":
+                    target = output_dir / f"{stem}.parquet"
+                    if target.exists() and _parquet_row_count(target) == _count_masked(
+                        flight_client, ticket_bytes
+                    ):
+                        return False
+                reader = flight_client.do_get(flight.Ticket(ticket_bytes), read_opts).to_reader()
+                _write_masked_sample(reader, stem, output_dir, args.format, con)
+                return True
+
+            if _with_retry(export_one, prep, args.retry_seconds):
+                exported += 1
+            else:
+                skipped += 1
     except httpx.HTTPStatusError as exc:
-        print(f"http error {exc.response.status_code}: {exc.response.text}", file=sys.stderr)
+        _common.print_http_status_error(exc.response)
+        return 1
+    except httpx.RequestError as exc:
+        _common.print_request_error(exc)
+        return 1
+    except flight.FlightError as exc:
+        print(f"flight error: {exc}", file=sys.stderr)
+        return 1
+    except (duckdb.Error, OSError, pa.ArrowInvalid, pa.ArrowKeyError) as exc:
+        # The types the environment raises at these sites; a plain ValueError or
+        # RuntimeError from a bug still ends in a traceback. A data plane failure
+        # after the first batch lands here rather than above: the parquet path's
+        # reader raises OSError, the fastq path's COPY over it a duckdb.Error.
+        # ArrowInvalid and ArrowKeyError are pyarrow refusing an input, among
+        # them --data-plane-url (unparseable, or a scheme with no Flight
+        # transport, such as http) and an existing parquet target it cannot read.
+        print(f"error: {exc}", file=sys.stderr)
         return 1
     finally:
-        flight_client.close()
+        if flight_client is not None:
+            flight_client.close()
         if con is not None:
             con.close()
 
-    summary = f"exported {exported} sample(s)"
+    summary = f"exported {exported} prep_sample(s)"
     if skipped:
         summary += f" (skipped {skipped} already up to date)"
     print(f"{summary} from sequenced_pool {pool_idx} to {output_dir}")

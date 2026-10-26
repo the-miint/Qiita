@@ -16,6 +16,8 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 from qiita_common.api_paths import URL_ALIGNMENT_DEFINITION_BY_IDX
 
+from qiita_control_plane.testing.db_teardown import teardown_entity_graph
+
 pytestmark = pytest.mark.db
 
 
@@ -136,8 +138,9 @@ async def test_delete_alignment_cascades_gate(
             == 0
         )
     finally:
-        await postgres_pool.execute("DELETE FROM qiita.prep_sample WHERE idx = $1", prep)
-        await postgres_pool.execute("DELETE FROM qiita.biosample WHERE idx = $1", _bs)
+        await teardown_entity_graph(
+            postgres_pool, study_idxs=[], biosample_idxs=[_bs], prep_sample_idxs=[prep]
+        )
 
 
 async def test_delete_alignment_detaches_work_ticket(client, postgres_pool):
@@ -254,6 +257,35 @@ async def test_delete_alignment_data_plane_failure_returns_502(client, postgres_
 
     resp = await client.delete(URL_ALIGNMENT_DEFINITION_BY_IDX.format(alignment_idx=alignment_idx))
     assert resp.status_code == 502
+    assert (
+        await postgres_pool.fetchval(
+            "SELECT 1 FROM qiita.alignment_definition WHERE alignment_idx = $1", alignment_idx
+        )
+        == 1
+    )
+
+
+async def test_delete_alignment_busy_data_plane_returns_502(client, postgres_pool, monkeypatch):
+    """A busy refusal reaches pyarrow as `ArrowInvalid`, not a `FlightError`; it still
+    surfaces as the route's 502 and leaves Postgres untouched. The autouse stub is
+    undone and the Flight client replaced instead, so the library's own handling runs."""
+    import pyarrow as pa
+
+    from qiita_control_plane.actions import library as lib
+    from qiita_control_plane.testing.flight import REAL_BUSY_REFUSAL, flight_client_raising
+
+    alignment_idx = await _seed_alignment(postgres_pool, client._created)
+
+    monkeypatch.setattr(
+        "qiita_control_plane.routes.alignment.delete_alignment_data", lib.delete_alignment_data
+    )
+    monkeypatch.setattr(
+        lib._flight, "FlightClient", flight_client_raising(pa.ArrowInvalid(REAL_BUSY_REFUSAL))
+    )
+
+    resp = await client.delete(URL_ALIGNMENT_DEFINITION_BY_IDX.format(alignment_idx=alignment_idx))
+    assert resp.status_code == 502
+    assert "data plane busy" in resp.json()["detail"]
     assert (
         await postgres_pool.fetchval(
             "SELECT 1 FROM qiita.alignment_definition WHERE alignment_idx = $1", alignment_idx

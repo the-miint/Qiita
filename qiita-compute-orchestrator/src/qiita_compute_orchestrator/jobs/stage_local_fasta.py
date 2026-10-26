@@ -37,7 +37,7 @@ it lands in).
 caps each read batch by bytes so a multi-MB genome record (GG2 reaches ~21 MB)
 can't form a giant vector; `apply_duckdb_settings` sets `memory_limit` +
 `temp_directory` (operators spill, not OOM) + `preserve_insertion_order=false`;
-and `PARQUET_OPTS_CHUNKED`'s `ROW_GROUP_SIZE` bounds the write buffer. At
+and `PARQUET_OPTS_CHUNKED_TRANSFER`'s `ROW_GROUP_SIZE` bounds the write buffer. At
 ~300 GB the chunked-Parquet ingest plus the unchanged quadratic
 `hash_sequences`/`load` is still a deferred performance effort, but the external
 contract (this step's `fasta_path` output wired into `hash_sequences`) is stable
@@ -72,7 +72,7 @@ from qiita_common.duckdb_miint import is_empty_sequence_file
 from qiita_common.parquet import validate_parquet_path
 
 from ..miint import (
-    PARQUET_OPTS_CHUNKED,
+    PARQUET_OPTS_CHUNKED_TRANSFER,
     apply_duckdb_settings,
     duckdb_tmp_dir,
     open_miint_conn,
@@ -95,7 +95,7 @@ _DUCKDB_THREADS = 8
 # multi-MB genome records can't materialise a 2048-row × 21 MB chunk before the
 # chunking operator runs. One of three memory levers — the others are the
 # `memory_limit`/`temp_directory` spill (apply_duckdb_settings) and the write
-# buffer (`ROW_GROUP_SIZE` in PARQUET_OPTS_CHUNKED).
+# buffer (`ROW_GROUP_SIZE` in PARQUET_OPTS_CHUNKED_TRANSFER).
 _READ_FASTX_MAX_BATCH_BYTES = "128MB"
 
 # How many manifest paths go into ONE `read_fastx` call. `read_fastx` opens a
@@ -296,7 +296,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                     f"    SELECT read_id, UNNEST({sequence_split_expr('sequence1')}) AS c "
                     f"    FROM read_fastx(?, max_batch_bytes:='{_READ_FASTX_MAX_BATCH_BYTES}')"
                     "  )"
-                    f") TO '{part_out}' ({PARQUET_OPTS_CHUNKED})",
+                    f") TO '{part_out}' ({PARQUET_OPTS_CHUNKED_TRANSFER})",
                     [list(batch)],
                 )
         success = True

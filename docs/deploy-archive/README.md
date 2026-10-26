@@ -5,6 +5,13 @@ per deploy, newest first. Written by `/deploy-archive` when a deploy closes out;
 [`../runbooks/redeploy.md`](../runbooks/redeploy.md) §8. Each file carries the buckets exactly as the
 operator ran them, with the per-line `(#N)` provenance tags.
 
+- [2026-10-26 — `de3cf56d`](2026-10-26-de3cf56d.md)
+- [2026-10-23 — `8c21c53b`](2026-10-23-8c21c53b.md)
+- [2026-10-20 — `ad84ff21`](2026-10-20-ad84ff21.md)
+- [2026-10-12 — `46f45ee0`](2026-10-12-46f45ee0.md)
+- [2026-10-06 — `22d47d6f`](2026-10-06-22d47d6f.md)
+- [2026-09-29 — `a3c7352b`](2026-09-29-a3c7352b.md)
+- [2026-09-25 — `c90e5982`](2026-09-25-c90e5982.md)
 - [2026-09-15 — `722fc7de`](2026-09-15-722fc7de.md)
 - [2026-09-14 — `e4ab6df8`](2026-09-14-e4ab6df8.md)
 - [2026-09-11 — `940ac3b1`](2026-09-11-940ac3b1.md)

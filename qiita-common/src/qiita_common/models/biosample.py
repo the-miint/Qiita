@@ -2,6 +2,7 @@
 lookups, the shared bulk-idx / list response envelopes, and the biosample
 PATCH body."""
 
+from collections import Counter
 from datetime import date
 from decimal import Decimal
 from enum import StrEnum
@@ -13,6 +14,7 @@ from pydantic import (
     ConfigDict,
     Field,
     computed_field,
+    field_validator,
     model_validator,
 )
 
@@ -34,14 +36,17 @@ from qiita_common.models.sample_field import (
 )
 
 # matrix_tube_id values are digit-only (per local convention) and may carry
-# leading zeros; the {10} quantifier fixes the length at exactly ten digits
-# and rejects the empty string.
+# leading zeros; the width fixes the length at exactly ten digits and rejects
+# the empty string.
 #
 # Deliberately duplicated with the column-level CHECK on
 # qiita.biosample.matrix_tube_id: the Pydantic side fails at the wire
 # boundary with a per-field 422; the DB side is the last line of defense.
 # Change one and you must change the other in the same PR.
-MATRIX_TUBE_ID_PATTERN = r"^[0-9]{10}$"  # same-pattern-ok: DB CHECK parity (see above)
+MATRIX_TUBE_ID_WIDTH = 10
+MATRIX_TUBE_ID_PATTERN = (
+    rf"^[0-9]{{{MATRIX_TUBE_ID_WIDTH}}}$"  # same-pattern-ok: DB CHECK parity (see above)
+)
 
 # The wire spellings of the idx fields the biosample field shapes re-declare
 # with an entity-qualified alias. Named so a caller writing or reading one of
@@ -117,8 +122,100 @@ class BiosampleImportResponse(BaseModel):
     """
 
     biosample_idx: Annotated[int, Field(gt=0)]
+    export_entity_id: str
     owner_id_biosample_study_field_idx: Annotated[int, Field(gt=0)]
     owner_id_biosample_study_field_created: bool
+
+
+# Size caps for one bulk biosample import. A batch runs in one request and one
+# transaction, so it must fit nginx's default 1 MiB request body on the REST
+# location, finish well inside the gateway's 60 s read timeout, and not hold the
+# per-owner insert lock (taken by each biosample INSERT until commit) past the
+# pool's 10 s command timeout, which would fail other imports for that owner.
+# The request body binds first: a real sheet runs ~34 bytes per metadata value,
+# so 25,000 values is ~0.85 MiB. With the batch writing its metadata in a few
+# statements, a 75-column sheet imports at ~9 ms per row, so that is ~3 s. The
+# row cap bounds batches of very narrow rows. A sheet over either cap is sent
+# in several requests.
+BIOSAMPLE_BULK_IMPORT_MAX_ROWS = 2_000
+BIOSAMPLE_BULK_IMPORT_MAX_METADATA_VALUES = 25_000
+
+
+class BiosampleBulkImportRequest(BaseModel):
+    """Body for POST /api/v1/study/{study_idx}/biosample/bulk.
+
+    One `rows` entry per biosample, each the SAME shape as the single-biosample
+    import — so a sheet of N biosamples loads in one call instead of N, one row per
+    biosample and one text cell per (biosample, field). The route applies the rows
+    in ONE transaction — all succeed or nothing is written — and a failing row is
+    named by its index (counting from 0) so the caller can fix the sheet and
+    resubmit. See `BiosampleImportRequest` for the per-row contract (text-valued
+    metadata keyed on a field display_name, owner id, accessions,
+    matrix_tube_id).
+
+    A batch is one sheet from one owner: every row names the same `owner_idx`
+    and the same `owner_biosample_id_field_name`. One owner means the batch
+    takes one per-owner insert lock, so two concurrent batches cannot take two
+    owners' locks in opposite orders and deadlock; one id field means a sheet's
+    id column becomes one unique field on the study, not several. Sizes are
+    capped by `BIOSAMPLE_BULK_IMPORT_MAX_ROWS` and
+    `BIOSAMPLE_BULK_IMPORT_MAX_METADATA_VALUES`.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    rows: list[BiosampleImportRequest] = Field(min_length=1)
+
+    @field_validator("rows", mode="before")
+    @classmethod
+    def _cap_batch_size(cls, rows: object) -> object:
+        """Refuse an oversized batch on counts alone, before any row is parsed."""
+        if not isinstance(rows, list):
+            return rows
+        if len(rows) > BIOSAMPLE_BULK_IMPORT_MAX_ROWS:
+            raise ValueError(
+                f"at most {BIOSAMPLE_BULK_IMPORT_MAX_ROWS} rows per request, got"
+                f" {len(rows)}; send the sheet in several requests"
+            )
+        values = sum(
+            len(row["metadata"])
+            for row in rows
+            if isinstance(row, dict) and isinstance(row.get("metadata"), dict)
+        )
+        if values > BIOSAMPLE_BULK_IMPORT_MAX_METADATA_VALUES:
+            raise ValueError(
+                f"at most {BIOSAMPLE_BULK_IMPORT_MAX_METADATA_VALUES} metadata values"
+                f" per request, got {values} across {len(rows)} rows; send the sheet"
+                " in several requests"
+            )
+        return rows
+
+    @model_validator(mode="after")
+    def _one_owner_and_one_id_field(self) -> BiosampleBulkImportRequest:
+        first = self.rows[0]
+        for i, row in enumerate(self.rows):
+            if row.owner_idx != first.owner_idx:
+                raise ValueError(
+                    f"every row must name the same owner_idx: row 0 has"
+                    f" {first.owner_idx}, row {i} has {row.owner_idx} (rows count from 0)"
+                )
+            if row.owner_biosample_id_field_name != first.owner_biosample_id_field_name:
+                raise ValueError(
+                    "every row must name the same owner_biosample_id_field_name: row 0"
+                    f" has {first.owner_biosample_id_field_name!r}, row {i} has"
+                    f" {row.owner_biosample_id_field_name!r} (rows count from 0)"
+                )
+        return self
+
+
+class BiosampleBulkImportResponse(BaseModel):
+    """Returned by the bulk import on success: one `BiosampleImportResponse` per
+    input row, in request order (the batch is all-or-nothing, so a 2xx means every
+    row was created)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    results: list[BiosampleImportResponse]
 
 
 class OwnerBiosampleIdRow(BaseModel):
@@ -187,11 +284,14 @@ TERMINOLOGY_TERM_VALUE_COLUMN = "value_terminology_term_idx"
 #   HOST_TAXON_ID — the organism the sample was taken FROM. Absent for an
 #                   environmental sample; a missing-reason for a control.
 #
-# Conflating them is the bug this arc exists to prevent, so they are named side
-# by side. Shared because the resolver reads host_taxon_id and the backfill reads
-# taxon_id to derive it — two consumers, one spelling.
+# Shared so that every reader of either field spells it the same way.
 BIOSAMPLE_FIELD_TAXON_ID = "taxon_id"
 BIOSAMPLE_FIELD_HOST_TAXON_ID = "host_taxon_id"
+BIOSAMPLE_FIELD_QIITA_SAMPLE_TYPE = "qiita_sample_type"
+
+# `biosample_global_field.internal_name` values of the two coordinate fields.
+BIOSAMPLE_FIELD_GEOGRAPHIC_LOCATION_LATITUDE = "geographic_location_latitude"
+BIOSAMPLE_FIELD_GEOGRAPHIC_LOCATION_LONGITUDE = "geographic_location_longitude"
 
 # Seeded `biosample_global_field.display_name` values -- NOT the `internal_name`s above.
 BIOSAMPLE_DISPLAY_COLLECTION_DATE = "collection date"
@@ -200,21 +300,27 @@ BIOSAMPLE_DISPLAY_GEOGRAPHIC_LOCATION_LATITUDE = "geographic location (latitude)
 BIOSAMPLE_DISPLAY_GEOGRAPHIC_LOCATION_LONGITUDE = "geographic location (longitude)"
 BIOSAMPLE_DISPLAY_DEPTH = "depth"
 BIOSAMPLE_DISPLAY_HOST_TAXON_ID = "host taxon id"
+BIOSAMPLE_DISPLAY_TAXON_ID = "taxon id"
+BIOSAMPLE_DISPLAY_QIITA_SAMPLE_TYPE = "qiita sample type"
 
 # The two `qiita.missing_value_reason` names the host-filter resolver RECOGNISES
 # — i.e. the two that say something definite about whether a host exists.
 #
 # Deliberately not an exhaustive enum of the INSDC vocabulary. The other reasons
-# ('not collected', 'not provided', 'restricted access', …) exist in the DB and
+# ('not collected', 'restricted access', …) exist in the DB and
 # have no constant here ON PURPOSE: recognising a reason is an explicit act that
 # promotes it from "abort" to "proceed", and an enum listing every reason would
 # invite exactly the mechanical widening the fail-closed rule is there to stop.
 MISSING_REASON_NOT_APPLICABLE = "not applicable"
 MISSING_REASON_CONTROL_SAMPLE = "missing: control sample"
 
-# The terminology `taxon_id` / `host_taxon_id` name their terms in, and the
-# term_id of the human host. Shared so production code and the test seeds spell
-# them the same way — production must not reach into `testing/` for them.
+# Written by the ENA import for a taxon it cannot fill; the resolver does not recognise it.
+MISSING_REASON_NOT_PROVIDED = "not provided"
+
+# The terminology `taxon_id` / `host_taxon_id` name their terms in, and the term_ids of
+# the human and mouse hosts and the bare `metagenome` root (seeded by the NCBI Taxonomy
+# seed migration). Shared so production code and the test seeds spell them the same
+# way — production must not reach into `testing/` for them.
 #
 # `NCBI_TAXONOMY_HUMAN_TERM_ID` is a STRING even though an NCBI taxon id is a number,
 # and that is not an oversight. It is a `qiita.terminology_term.term_id`, whose column
@@ -229,6 +335,8 @@ MISSING_REASON_CONTROL_SAMPLE = "missing: control sample"
 # that BIGINT.
 NCBI_TAXONOMY_NAME = "NCBI Taxonomy"
 NCBI_TAXONOMY_HUMAN_TERM_ID = "9606"
+NCBI_TAXONOMY_MOUSE_TERM_ID = "10090"
+NCBI_TAXONOMY_METAGENOME_TERM_ID = "256318"
 
 
 class MissingReasonRef(BaseModel):
@@ -328,7 +436,8 @@ class MetadataEntry(BaseModel):
 class BiosampleResponse(BaseModel):
     """Returned by GET /api/v1/biosample/{biosample_idx}.
 
-    Mirrors qiita.biosample's caller-visible columns and embeds a dict
+    Mirrors qiita.biosample's caller-visible columns, adds the biosample's
+    export_entity_id from qiita.exported_entity, and embeds a dict
     of every globally-linked metadata value the biosample carries,
     keyed on biosample_global_field.internal_name. Purely-local
     metadata (including the owner-biosample-id row) and metadata whose
@@ -343,6 +452,7 @@ class BiosampleResponse(BaseModel):
     """
 
     biosample_idx: Annotated[int, Field(gt=0)]
+    export_entity_id: str
     owner_idx: Annotated[int, Field(gt=0)]
     metadata_checklist: MetadataChecklistRef | None
     biosample_accession: str | None
@@ -473,6 +583,55 @@ class SampleMetadataWriteResponse(BaseModel):
     results: dict[str, MetadataFieldWriteResult]
 
 
+class SampleUniqueFieldRef(BaseModel):
+    """The (field, value) pair naming one biosample inside a study.
+
+    unique_field_display_name is a biosample_study_field display_name as the
+    study spells it; unique_field_value is the value that field carries on the
+    sample being named. The field must declare unique_in_study, which is what
+    makes the pair resolve to at most one biosample — a field without it is
+    refused rather than resolved arbitrarily. Both strip on the way in and must
+    still carry content, so a name or value written with stray padding resolves
+    the same as its unpadded spelling.
+
+    unique_field_display_name matches the stored name exactly, case included,
+    and unique_field_value matches the stored value the same way.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    unique_field_display_name: NonBlankText
+    unique_field_value: NonBlankText
+
+
+class SampleMetadataWriteByUniqueFieldRequest(SampleUniqueFieldRef, SampleMetadataWriteRequest):
+    """Body for a study-scoped metadata write that names its sample by a
+    unique-in-study field rather than by an idx.
+
+    Carries the identifying pair alongside the metadata to write, under the
+    same rules each half already has: the pair resolves the sample, and the
+    metadata dict is upserted against the study's existing fields.
+
+    The identifying field may itself appear in metadata, but only carrying the
+    value it already holds, which changes nothing. Offering a different one is
+    refused: a value stored through a unique_in_study field is what names the
+    sample, and handing that name to another sample is not a write this surface
+    performs. The owner-biosample-id field is refused either way, being changed
+    only through its own surface.
+    """
+
+
+class BiosampleMetadataWriteByUniqueFieldResponse(SampleMetadataWriteResponse):
+    """Returned by the biosample metadata write addressed by a unique field.
+
+    Adds the biosample_idx the identifying pair resolved to, so a caller that
+    named its sample by the study's own id learns the idx the write landed on
+    and can address the idx-keyed routes with it.
+    """
+
+    biosample_idx: Annotated[int, Field(gt=0)]
+
+
 # The two qiita.biosample accession columns a lookup may key on; each value is
 # the literal Postgres column name it selects.
 BiosampleAccessionField = Literal["biosample_accession", "ena_sample_accession"]
@@ -573,6 +732,103 @@ class StudyLookupByAccessionResponse(BaseModel):
 
     resolved: dict[str, Annotated[int, Field(gt=0)]]
     missing: list[str]
+
+
+def normalize_matrix_tube_id(raw: str) -> str:
+    """The stored form of a matrix tube id: digits only, left-padded to the
+    width MATRIX_TUBE_ID_PATTERN fixes.
+
+    Sheets that pass through a spreadsheet lose the leading zero, so a tube
+    written with fewer digits is the same tube. RAISES ValueError for anything
+    that is not 1 to MATRIX_TUBE_ID_WIDTH digits once surrounding whitespace is
+    stripped.
+    """
+    value = raw.strip()
+    if not value.isascii() or not value.isdigit() or len(value) > MATRIX_TUBE_ID_WIDTH:
+        raise ValueError(f"{raw!r} is not a matrix tube id (1 to {MATRIX_TUBE_ID_WIDTH} digits)")
+    return value.zfill(MATRIX_TUBE_ID_WIDTH)
+
+
+# A roster's tube arrives as free text so a malformed one is reported per row;
+# this only bounds what a row may carry, well above any real tube.
+MAX_ROSTER_TUBE_TEXT_LENGTH = 50
+
+
+class RosterResolveRow(BaseModel):
+    """One pool row to resolve to a biosample and its studies.
+
+    A row with a `matrix_tube_id` resolves by the tube, and its primary study
+    comes from the biosample's study links (a project accession, when present, must
+    name one of them). A row without one resolves by `biosample_accession` and
+    the project accessions. `matrix_tube_id` is free text on the wire so a
+    malformed tube is reported as that row's problem with every other one.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    item_id: NonBlankText
+    matrix_tube_id: (
+        Annotated[NonBlankText, Field(max_length=MAX_ROSTER_TUBE_TEXT_LENGTH)] | None
+    ) = None
+    biosample_accession: AccessionText | None = None
+    primary_project_accession: AccessionText | None = None
+    secondary_project_accessions: list[AccessionText] = Field(default_factory=list)
+
+
+class RosterResolveRequest(BaseModel):
+    """Body for POST /api/v1/biosample/resolve-roster."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    rows: list[RosterResolveRow] = Field(min_length=1, max_length=10_000)
+
+    @model_validator(mode="after")
+    def _unique_item_ids(self) -> RosterResolveRequest:
+        counts = Counter(r.item_id for r in self.rows)
+        dups = sorted(item_id for item_id, n in counts.items() if n > 1)
+        if dups:
+            raise ValueError(f"duplicate item_id(s): {dups}")
+        return self
+
+
+class RosterResolvedRow(BaseModel):
+    """One row's resolution: the biosample and the studies its prep_sample
+    links to."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    item_id: str
+    biosample_idx: Annotated[int, Field(gt=0)]
+    primary_study_idx: Annotated[int, Field(gt=0)]
+    secondary_study_idxs: list[Annotated[int, Field(gt=0)]]
+
+
+class RosterResolveResponse(BaseModel):
+    """Returned by POST /api/v1/biosample/resolve-roster when every row
+    resolved, in request order."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    rows: list[RosterResolvedRow]
+
+
+class RosterProblem(BaseModel):
+    """Why one roster row did not resolve, as a message for the submitter."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    item_id: str
+    message: str
+
+
+class RosterResolveFailure(BaseModel):
+    """The 422 `detail` of POST /api/v1/biosample/resolve-roster: every
+    problem across the roster, so one round trip names them all."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    message: str
+    problems: list[RosterProblem] = Field(min_length=1)
 
 
 class BiosamplePatchRequest(PatchRequestModel):

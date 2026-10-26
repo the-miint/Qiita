@@ -65,7 +65,7 @@ from typing import TYPE_CHECKING
 from qiita_common.parquet import validate_parquet_path
 
 from .data_plane_client import open_read_block_stream
-from .miint import PARQUET_OPTS
+from .miint import PARQUET_OPTS_TRANSFER
 
 if TYPE_CHECKING:
     import duckdb
@@ -111,7 +111,7 @@ async def bind_step_reads(
 
     `conn` must already have been through `miint.apply_duckdb_settings` (every
     caller does, before binding): the stream branch's `COPY` uses the shared
-    `PARQUET_OPTS`, whose `ROW_GROUP_SIZE_BYTES` DuckDB rejects unless
+    `PARQUET_OPTS_TRANSFER`, whose `ROW_GROUP_SIZE_BYTES` DuckDB rejects unless
     `preserve_insertion_order=false` — which that helper sets. Row order carries
     no meaning here anyway; the retired data-plane export disabled it for the same
     reason, and every consumer (qc per-row, host_filter/align by join) is
@@ -137,7 +137,7 @@ async def bind_step_reads(
         ) as stream_rel:
             conn.execute(
                 f"COPY (SELECT * FROM {stream_rel}) "
-                f"TO '{validate_parquet_path(spilled)}' ({PARQUET_OPTS})"
+                f"TO '{validate_parquet_path(spilled)}' ({PARQUET_OPTS_TRANSFER})"
             )
         async with _bind_parquet_view(conn, spilled, relation) as rel:
             yield rel

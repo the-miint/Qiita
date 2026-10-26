@@ -62,6 +62,21 @@ def test_map_ena_attributes_leaves_taxon_id_tags_unmapped():
     assert unmapped == attributes
 
 
+def test_map_ena_attributes_leaves_control_type_tags_unmapped():
+    """A study-level control description is not a per-sample control marker."""
+    attributes = {
+        "neg_cont_type": "DNA-free PCR mix",
+        "pos_cont_type": "Escherichia coli",
+        "negative control type": "DNA-free PCR mix",
+        "positive control type": "Escherichia coli",
+    }
+
+    mapped, unmapped = map_ena_attributes(attributes)
+
+    assert mapped == {}
+    assert unmapped == attributes
+
+
 def test_map_ena_attributes_leaves_environmental_context_triad_unmapped():
     """The environmental-context triad is ENVO-typed; mapping ENA's free text would
     need an ENVO-CURIE resolution out of scope here, so they stay unmapped (like taxon)."""
@@ -244,3 +259,29 @@ def test_map_ena_attributes_emits_only_biosample_display_names():
     assert not unmapped
     display_names = {v for k, v in vars(biosample).items() if k.startswith("BIOSAMPLE_DISPLAY_")}
     assert set(mapped) <= display_names
+
+
+def test_map_ena_attributes_signs_hemisphere_suffixed_coordinates():
+    mapped, unmapped = map_ena_attributes(
+        {"geographic location (latitude)": "39N", "geographic location (longitude)": "12.5 W"}
+    )
+
+    assert mapped == {
+        "geographic location (latitude)": "39",
+        "geographic location (longitude)": "-12.5",
+    }
+    assert unmapped == {}
+
+
+def test_map_ena_attributes_coordinate_hemisphere_spellings():
+    latitude = "geographic location (latitude)"
+    for raw, expected in [("39 S", "-39"), ("39.25°N", "39.25"), ("0.5s", "-0.5")]:
+        assert map_ena_attributes({latitude: raw})[0] == {latitude: expected}
+
+
+def test_map_ena_attributes_coordinate_passes_other_values_through():
+    """A value with no hemisphere, a hemisphere from the other axis, or a sign AND a
+    hemisphere is left for the import to parse, not guessed at."""
+    latitude = "geographic location (latitude)"
+    for raw in ["32.88", "-33.8", "39E", "-39S", "not collected", "39 deg"]:
+        assert map_ena_attributes({latitude: raw})[0] == {latitude: raw}

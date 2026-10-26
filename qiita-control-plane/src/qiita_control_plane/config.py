@@ -7,8 +7,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from qiita_common.config import require_env
+from qiita_common.models.ena_import import MAX_ENA_DOWNLOAD_RUN_CONCURRENCY
 
 from .fanout_dispatch import DEFAULT_FANOUT_MAX_INFLIGHT
+from .workspace import WORK_TICKET_SUBDIR
 
 # Local@domain.tld shape check for CONTACT_EMAIL. Deliberately loose —
 # the real test is whether mail reaches the address. See from_env().
@@ -30,6 +32,9 @@ _DEFAULT_CLI_LOGIN_CODE_TTL_SECONDS = 30
 # How often the in-process sweeper deletes consumed/expired cli_login_code rows,
 # reclaiming any plaintext PAT an abandoned login left at rest.
 _DEFAULT_CLI_LOGIN_CODE_SWEEP_INTERVAL_SECONDS = 60
+# How often the sweeper retries a transiently-failed follow-on, rather than
+# waiting for the next CP start.
+_DEFAULT_FOLLOW_ON_SWEEP_INTERVAL_SECONDS = 60
 
 # Hard cap on a single POST /sequence-range allocation. The bigint domain
 # is 2^63 so a runaway loop in a compute step could otherwise burn an
@@ -49,7 +54,9 @@ _DEFAULT_CP_TO_CO_TOKEN_PATH = Path("/etc/qiita/cp-to-co.token")
 # so a 1000-shard build can't open ~1000 concurrent data-plane streams (the WOL3
 # incident). The default (mirrors the operator throttle that recovered reference
 # 16) lives in fanout_dispatch as the single source of truth; tune per deploy via
-# FANOUT_MAX_INFLIGHT once the data plane's headroom is known.
+# FANOUT_MAX_INFLIGHT once the data plane's headroom is known. A cohort gains
+# nothing above `dispatch._DISPATCH_CONCURRENCY` (8): its children dispatch
+# through the same shared process-wide slots, so they queue instead.
 _DEFAULT_FANOUT_MAX_INFLIGHT = DEFAULT_FANOUT_MAX_INFLIGHT
 
 
@@ -153,6 +160,16 @@ def _parse_optional_positive_int_env(var: str) -> int | None:
     return _parse_positive_int_env(var, default=1)
 
 
+def _parse_ena_download_run_concurrency() -> int | None:
+    value = _parse_optional_positive_int_env("ENA_DOWNLOAD_RUN_CONCURRENCY")
+    if value is not None and value > MAX_ENA_DOWNLOAD_RUN_CONCURRENCY:
+        raise RuntimeError(
+            f"ENA_DOWNLOAD_RUN_CONCURRENCY must be at most "
+            f"{MAX_ENA_DOWNLOAD_RUN_CONCURRENCY}, got {value}"
+        )
+    return value
+
+
 @dataclass(frozen=True, slots=True)
 class Settings:
     database_url: str
@@ -198,9 +215,12 @@ class Settings:
     auth_handoff_freshness_seconds: int = _DEFAULT_AUTH_HANDOFF_FRESHNESS_SECONDS
     cli_login_code_ttl_seconds: int = _DEFAULT_CLI_LOGIN_CODE_TTL_SECONDS
     cli_login_code_sweep_interval_seconds: int = _DEFAULT_CLI_LOGIN_CODE_SWEEP_INTERVAL_SECONDS
+    follow_on_sweep_interval_seconds: int = _DEFAULT_FOLLOW_ON_SWEEP_INTERVAL_SECONDS
     max_sequence_mint_count: int = _DEFAULT_MAX_SEQUENCE_MINT_COUNT
     # Per-cohort cap on concurrently-dispatched fan-out child work_tickets.
     fanout_max_inflight: int = _DEFAULT_FANOUT_MAX_INFLIGHT
+    # Runs fetched at once per batch-submitted download ticket; None keeps the job's default.
+    ena_download_run_concurrency: int | None = None
     # Per-ticket workspace root the workflow runner mints under
     # (`<root>/<work_ticket_idx>/<step>/attempt-N/`). Derived in from_env()
     # as `PATH_SCRATCH/ticket`. The CP creates the subdir; the path is
@@ -334,7 +354,7 @@ class Settings:
         scratch = Path(scratch_raw)
         if not scratch.is_absolute():
             raise RuntimeError(f"PATH_SCRATCH must be an absolute path, got {scratch_raw!r}")
-        ws_root = scratch / "ticket"
+        ws_root = scratch / WORK_TICKET_SUBDIR
         upload_root = scratch / "staging"
 
         # Colon-separated roots a submitter may name a host path under.
@@ -397,6 +417,10 @@ class Settings:
                 "CLI_LOGIN_CODE_SWEEP_INTERVAL_SECONDS",
                 _DEFAULT_CLI_LOGIN_CODE_SWEEP_INTERVAL_SECONDS,
             ),
+            follow_on_sweep_interval_seconds=_parse_positive_int_env(
+                "FOLLOW_ON_SWEEP_INTERVAL_SECONDS",
+                _DEFAULT_FOLLOW_ON_SWEEP_INTERVAL_SECONDS,
+            ),
             cli_login_code_ttl_seconds=_parse_positive_int_env(
                 "CLI_LOGIN_CODE_TTL_SECONDS", _DEFAULT_CLI_LOGIN_CODE_TTL_SECONDS
             ),
@@ -408,6 +432,7 @@ class Settings:
                 "FANOUT_MAX_INFLIGHT",
                 _DEFAULT_FANOUT_MAX_INFLIGHT,
             ),
+            ena_download_run_concurrency=_parse_ena_download_run_concurrency(),
             path_scratch_ticket=ws_root,
             path_scratch_staging=upload_root,
             path_ingest_roots=ingest_roots,

@@ -276,6 +276,115 @@ def test_load_actions_loads_on_disk_long_read_assembly_yaml(version):
     assert len({s.entrypoint for s in container_steps}) == 4
 
 
+def test_load_actions_loads_on_disk_amplicon_yaml():
+    """`workflows/amplicon/1.0.0.yaml` loads with the reference-agnostic Rapid 16S
+    shape: sequenced_pool-scoped; context REQUIRES sortmerna_reference_idx + trim;
+    the step chain is denoise (module; STREAMS the pool's reads — declares no reads
+    input) → mint-features → amplicon_load (module; threads processing_idx) →
+    register-files."""
+    from pathlib import Path
+
+    from qiita_common.models import ScopeTargetKind
+
+    from qiita_control_plane.actions import load_actions
+
+    actions = load_actions(Path(__file__).resolve().parents[2] / "workflows")
+    by_id = {a.action_id: a for a in actions}
+    assert "amplicon" in by_id, "workflows/amplicon/1.0.0.yaml must load"
+    amplicon = by_id["amplicon"]
+
+    # sequenced_pool scope subjects a re-submit to the pool COMPLETED gate; a
+    # --force re-run is safe because amplicon_membership is replace-keyed on
+    # (prep_sample_idx, processing_idx), so it replaces rather than doubling.
+    assert amplicon.target_kind == ScopeTargetKind.SEQUENCED_POOL
+    assert amplicon.version == "1.0.0"
+    assert amplicon.context_schema["required"] == ["sortmerna_reference_idx", "trim"]
+
+    assert [s.name for s in amplicon.steps] == [
+        "denoise",
+        "mint-features",
+        "amplicon_load",
+        "register-files",
+    ]
+
+    denoise = next(s for s in amplicon.steps if s.name == "denoise")
+    assert denoise.module == "qiita_compute_orchestrator.jobs.amplicon_deblur"
+    # No reads input — the pool's reads STREAM at runtime (the absence is the signal).
+    assert "pool_reads" not in denoise.inputs and "reads" not in denoise.inputs
+    assert denoise.inputs == ["sortmerna_ref"]
+    assert denoise.params == {"primer": "primer", "trim": "trim", "orient_primer": "orient_primer"}
+    # asv_chunks carries the ASV bytes so amplicon_load can store the sequences.
+    assert denoise.outputs == ["asv_counts", "manifest", "asv_chunks"]
+
+    # mint-features binds the manifest by the literal name the dispatcher pins.
+    mint = next(s for s in amplicon.steps if s.name == "mint-features")
+    assert mint.inputs == ["manifest"]
+
+    load_step = next(s for s in amplicon.steps if s.name == "amplicon_load")
+    assert load_step.module == "qiita_compute_orchestrator.jobs.amplicon_load"
+    # manifest + asv_chunks feed the ASV sequence tables alongside the counts.
+    assert load_step.inputs == ["asv_counts", "feature_map", "manifest", "asv_chunks"]
+    # processing_idx via params -> runner mints the run identity before the loop.
+    assert load_step.params == {"processing_idx": "processing_idx"}
+    # Pure native + library primitives; no container steps.
+    assert not [s for s in amplicon.steps if getattr(s, "container", None)]
+
+
+def test_every_mint_features_entry_binds_manifest():
+    """The dispatcher pins mint-features to `inputs == ["manifest"]`
+    (_reconstruct.py); a workflow naming the binding anything else fails at submit,
+    not load. Pin it here so a mismatch is caught in the unit tier."""
+    from pathlib import Path
+
+    from qiita_control_plane.actions import load_actions
+
+    actions = load_actions(Path(__file__).resolve().parents[2] / "workflows")
+    for a in actions:
+        for s in a.steps:
+            if getattr(s, "name", None) == "mint-features":
+                assert s.inputs == ["manifest"], f"{a.action_id}: mint-features got {s.inputs!r}"
+
+
+def test_load_actions_loads_on_disk_golay_demux_yaml():
+    """`workflows/golay-demux/1.0.0.yaml` loads with the ingest shape:
+    sequenced_pool-scoped; context REQUIRES bcl_input_dir + amplicon + barcode_map
+    (no golay_table_path — the decode cloud is generated in-job); the step chain is
+    bcl_convert_prep → bcl_convert → golay_demux → register-files."""
+    from pathlib import Path
+
+    from qiita_common.models import ScopeTargetKind
+
+    from qiita_control_plane.actions import load_actions
+
+    actions = load_actions(Path(__file__).resolve().parents[2] / "workflows")
+    by_id = {a.action_id: a for a in actions}
+    assert "golay-demux" in by_id, "workflows/golay-demux/1.0.0.yaml must load"
+    golay = by_id["golay-demux"]
+
+    assert golay.target_kind == ScopeTargetKind.SEQUENCED_POOL
+    assert golay.version == "1.0.0"
+    assert golay.context_schema["required"] == [
+        "bcl_input_dir",
+        "amplicon",
+        "barcode_map",
+    ]
+    # The vendored golay table is gone — the cloud is generated in-job.
+    assert "golay_table_path" not in golay.context_schema["properties"]
+
+    # bcl-convert (dummy sheet) is now in-workflow, then the demux.
+    assert [s.name for s in golay.steps] == [
+        "bcl_convert_prep",
+        "bcl_convert",
+        "golay_demux",
+        "register-files",
+    ]
+
+    demux = next(s for s in golay.steps if s.name == "golay_demux")
+    assert demux.module == "qiita_compute_orchestrator.jobs.golay_demux"
+    assert "golay_table_path" not in demux.inputs
+    assert "convert_dir" in demux.inputs
+
+
 def test_load_actions_loads_on_disk_host_reference_add_yaml():
     """The actual on-disk `workflows/host-reference-add/1.0.0.yaml` loads as a
     valid ActionDefinition with the host-indexing shape:
@@ -1131,23 +1240,43 @@ def test_load_actions_loads_on_disk_download_ena_study_yaml():
     assert DOWNLOAD_ENA_STUDY_ACTION_VERSION == dl.version == "1.0.0"
 
     step_names = [s.name for s in dl.steps]
-    assert step_names == ["ingest_ena_reads", "register-files"]
+    assert step_names == ["ingest_ena_reads", "register-files", "persist-ena-run-outcomes"]
 
     ingest = next(s for s in dl.steps if s.name == "ingest_ena_reads")
     assert ingest.module == "qiita_compute_orchestrator.jobs.ingest_ena_reads"
     assert ingest.container is None
     assert ingest.inputs == ["ena_run_map", "reads_staging_root"]
-    assert ingest.params == {"download_method": "download_method"}
-    assert ingest.outputs == ["read_staging_dir"]
+    assert ingest.params == {
+        "download_method": "download_method",
+        "run_concurrency": "run_concurrency",
+    }
+    assert ingest.outputs == ["read_staging_dir", "run_outcomes"]
 
     # download_method is OPTIONAL (not in `required`) and pinned to 'http'.
     assert dl.context_schema["required"] == ["ena_study_accession"]
     props = dl.context_schema["properties"]
     assert props["ena_study_accession"]["type"] == "string"
     assert props["download_method"]["enum"] == ["http"]
+    assert props["run_concurrency"] == {"type": "integer", "minimum": 1, "maximum": 8}
 
     # The inert placeholder must be gone now that the real workflow has landed.
     assert not (repo_root / "workflows" / "download-ena-study" / "workflow.yaml").exists()
+
+
+@pytest.mark.parametrize(
+    ("run_concurrency", "accepted"),
+    [(1, True), (8, True), (0, False), (9, False), ("8", False)],
+)
+def test_download_ena_study_run_concurrency_is_bounded(run_concurrency, accepted):
+    from pathlib import Path
+
+    from qiita_control_plane.actions import load_actions
+    from qiita_control_plane.actions.context_validator import validate_context
+
+    actions = load_actions(Path(__file__).resolve().parents[2] / "workflows")
+    schema = next(a for a in actions if a.action_id == "download-ena-study").context_schema
+    context = {"ena_study_accession": "PRJEB1", "run_concurrency": run_concurrency}
+    assert (not validate_context(schema, context)) is accepted
 
 
 def test_download_ena_study_yaml_declares_ena_run_map_binding():
@@ -1374,10 +1503,10 @@ def test_load_actions_read_mask_audience_is_admin_only():
 
 
 def test_load_actions_read_mask_finalizes_gate_after_register_files():
-    """`finalize-mask-sample` (the per-sample mask_sample completion writer) must be
-    the LAST step and run strictly AFTER `register-files`: the gate must not read
-    'completed' until the masked reads are durable in DuckLake. Pins the terminal
-    ordering so a reorder that flips the gate before register-files surfaces here."""
+    """`finalize-mask-sample` (the per-sample mask_sample completion writer) must run
+    strictly AFTER `register-files`: the gate must not read 'completed' until the
+    masked reads are durable in DuckLake. Pins that ordering so a reorder that flips
+    the gate before register-files surfaces here."""
     from pathlib import Path
 
     from qiita_control_plane.actions import load_actions
@@ -1386,10 +1515,31 @@ def test_load_actions_read_mask_finalizes_gate_after_register_files():
     by_id = {a.action_id: a for a in load_actions(repo_root / "workflows")}
     names = [s.name for s in by_id["read-mask"].steps]
 
-    assert names[-1] == "finalize-mask-sample"
     assert names.index("register-files") < names.index("finalize-mask-sample")
     # persist-read-metrics still reads the local parquet before register-files moves it.
     assert names.index("persist-read-metrics") < names.index("register-files")
+
+
+def test_load_actions_read_mask_persists_syndna_counts_after_the_gate():
+    """`persist-syndna-read-count` consumes the `syndna` step's `alignment`, is gated
+    on the same `when:` as that step, and is the last entry: appended rather than
+    inserted, so no earlier entry's position moved for a ticket resumed across the
+    deploy (resume matches completed steps by position)."""
+    from pathlib import Path
+
+    from qiita_control_plane.actions import load_actions
+
+    repo_root = Path(__file__).resolve().parents[2]
+    steps = {a.action_id: a for a in load_actions(repo_root / "workflows")}["read-mask"].steps
+    names = [s.name for s in steps]
+    persist = steps[names.index("persist-syndna-read-count")]
+    syndna = steps[names.index("syndna")]
+
+    assert persist.inputs == ["alignment"]
+    assert "alignment" in syndna.outputs
+    assert persist.when == syndna.when == "syndna_enabled"
+    assert names.index("syndna") < names.index("persist-syndna-read-count")
+    assert names[-2:] == ["finalize-mask-sample", "persist-syndna-read-count"]
 
 
 def test_load_actions_fastq_to_parquet_v130_finalizes_gate_last():

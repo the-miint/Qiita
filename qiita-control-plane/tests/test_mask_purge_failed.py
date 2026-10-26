@@ -34,6 +34,11 @@ from qiita_control_plane.testing.db_seeds import (
     seed_sequenced_sample_subtype,
     seed_user_principal,
 )
+from qiita_control_plane.testing.db_teardown import (
+    delete_idxs,
+    delete_principal,
+    teardown_entity_graph,
+)
 
 pytestmark = pytest.mark.db
 
@@ -158,13 +163,15 @@ async def seeded(postgres_pool):
     await postgres_pool.execute(
         "DELETE FROM qiita.action WHERE action_id = $1 AND version = $2", action_id, version
     )
-    await postgres_pool.execute("DELETE FROM qiita.sequenced_sample WHERE idx = $1", ss_idx)
-    await postgres_pool.execute("DELETE FROM qiita.sequenced_pool WHERE idx = $1", pool_idx)
-    await postgres_pool.execute("DELETE FROM qiita.sequencing_run WHERE idx = $1", run_idx)
-    await postgres_pool.execute("DELETE FROM qiita.prep_sample WHERE idx = $1", prep_sample_idx)
-    await postgres_pool.execute("DELETE FROM qiita.biosample WHERE idx = $1", biosample_idx)
-    await postgres_pool.execute("DELETE FROM qiita.user WHERE principal_idx = $1", principal_idx)
-    await postgres_pool.execute("DELETE FROM qiita.principal WHERE idx = $1", principal_idx)
+    await teardown_entity_graph(
+        postgres_pool,
+        study_idxs=[],
+        biosample_idxs=[biosample_idx],
+        prep_sample_idxs=[prep_sample_idx],
+    )
+    await delete_idxs(postgres_pool, "sequenced_pool", pool_idx)
+    await delete_idxs(postgres_pool, "sequencing_run", run_idx)
+    await delete_principal(postgres_pool, [principal_idx])
 
 
 # ---------------------------------------------------------------------------
@@ -205,6 +212,34 @@ async def test_selector_finds_matching_and_ignores_others(seeded):
     assert match in found
     assert other_reason not in found
     assert completed not in found
+
+
+async def test_selector_excludes_flagged_prep_sample(seeded):
+    """A candidate whose prep_sample now carries an ENA-flagged sequenced_sample
+    is not resubmitted -- resubmitting read-mask against a run ENA no longer
+    reports available would re-download it."""
+    pool = seeded["pool"]
+    await pool.execute(
+        "UPDATE qiita.sequenced_sample SET ena_status = 'suppressed',"
+        " ena_availability_checked_at = now() WHERE prep_sample_idx = $1",
+        seeded["prep_sample_idx"],
+    )
+    mask = await _seed_mask(pool, seeded["principal_idx"])
+    seeded["masks"].append(mask)
+    match = await _seed_ticket(
+        pool,
+        action_id=seeded["action_id"],
+        version=seeded["version"],
+        principal_idx=seeded["principal_idx"],
+        prep_sample_idx=seeded["prep_sample_idx"],
+        state="failed",
+        mask_idx=mask,
+        failure_reason="step persist-read-metrics: read_mask parquet not found at /staging/x",
+    )
+    seeded["tickets"].append(match)
+
+    rows = await admin._select_purge_failed_candidates(pool, action_ids=("read-mask",), limit=None)
+    assert match not in {r["work_ticket_idx"] for r in rows}
 
 
 # ---------------------------------------------------------------------------

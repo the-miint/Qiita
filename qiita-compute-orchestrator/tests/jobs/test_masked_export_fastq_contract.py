@@ -20,7 +20,7 @@ spell out, verified empirically against the build rather than paraphrased:
     `INTERLEAVE true` (one interleaved file).
   * `{ORIENTATION}` expands to exactly `R1` / `R2`, so a `<stem>.{ORIENTATION}.fastq.gz`
     target yields `<stem>.R1.fastq.gz` + `<stem>.R2.fastq.gz` — the export filename
-    spec (`<biosample_accession>.<run>.<pool>.<prep>.R1.fastq.gz`).
+    spec (`<biosample_accession>.<run>.<pool>.<prep_sample>.R1.fastq.gz`).
   * `COMPRESSION 'gzip'` gzip-compresses the output (option-driven — it gzips even
     when the path ends in `.gz.partial`, not just `.gz`), so the CLI writes
     `<stem>.fastq.gz` and may stage to a `.partial` sibling before the atomic rename.

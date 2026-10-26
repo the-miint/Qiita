@@ -66,17 +66,17 @@ from ..repositories.processing import (
     set_assembly_sample_states,
     transition_processing_status,
 )
-from ._helpers import cap_rows, gate_roster_narrowing_idx
+from ._helpers import GATE_ROSTER_HARD_CAP, cap_rows, gate_roster_narrowing_idx
 
 _MSG_PROCESSING_NOT_FOUND = "Processing run not found"
 
 # Hard caps on the two reads. The run list is bounded by how many distinct
-# assembly param sets the fleet has minted; the roster by a pool's sample count.
+# assembly param sets the fleet has minted; the roster by GATE_ROSTER_HARD_CAP, whose
+# comment says what bounds it.
 # Both return `truncated` rather than paginating — a caller that hits either cap
 # should narrow with a filter. Same values as the mask twin, which bounds the same
 # two shapes.
 _PROCESSING_LIST_HARD_CAP = 1_000
-_PROCESSING_PREP_SAMPLE_HARD_CAP = 100_000
 
 processing_router = APIRouter(prefix=PATH_PROCESSING_PREFIX, tags=["processing"])
 
@@ -230,9 +230,9 @@ async def list_processing_prep_samples_route(
             processing_idx,
             sequenced_pool_idx=sequenced_pool_idx,
             visible_to_principal_idx=gate_roster_narrowing_idx(caller),
-            limit=_PROCESSING_PREP_SAMPLE_HARD_CAP + 1,
+            limit=GATE_ROSTER_HARD_CAP + 1,
         ),
-        _PROCESSING_PREP_SAMPLE_HARD_CAP,
+        GATE_ROSTER_HARD_CAP,
     )
     samples = [ProcessingPrepSample.model_validate(dict(row)) for row in rows]
     return ProcessingPrepSampleListResponse(

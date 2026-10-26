@@ -5,8 +5,8 @@ Why this exists
 `checkm lineage_wf` scores a DIRECTORY of FASTA files, one genome per file, and
 keys its output on the filename stem. The assemble step publishes every circular
 contig in one multi-FASTA. Handed that directly, CheckM would report a single
-genome stitched from every LCG in the sample — a green run whose completeness and
-contamination describe nothing, and whose one `"Bin Id"` joins no membership row.
+genome stitched from every LCG in the prep_sample's assembly — a green run whose
+completeness and contamination describe nothing, and whose one `"Bin Id"` joins no membership row.
 So the split is pinned by EXECUTION here, not by spelling.
 
 The stem is the join key
@@ -288,3 +288,53 @@ def test_checkm_image_ships_the_split_and_rebuilds_on_its_edit() -> None:
             f"{name} is missing from HASH_INPUTS ({hash_inputs.group(1)!r}); editing "
             "it would not rebuild the image"
         )
+
+
+def _checkm_pins() -> dict[str, str]:
+    """checkm.def's `CHECKM_PINS`, the one list of exact `tool==version` pins (the def
+    says why `==`) the image is built from."""
+    m = re.search(r'^\s*CHECKM_PINS="([^"]*)"$', _CHECKM_DEF.read_text(), re.MULTILINE)
+    assert m, "checkm.def no longer sets CHECKM_PINS"
+    entries = m.group(1).split()
+    malformed = [
+        e for e in entries if not re.fullmatch(r"[a-z0-9][a-z0-9.-]*==[A-Za-z0-9._+!]+", e)
+    ]
+    assert not malformed, f"CHECKM_PINS entries must be exact `tool==version`: {malformed}"
+    return dict(e.split("==", 1) for e in entries)
+
+
+def test_checkm_image_builds_from_its_pins_and_checks_each_at_build_time() -> None:
+    """The env is created from CHECKM_PINS alone, and %test checks every pin.
+
+    checkm.def's CHECKM_PINS line says why the pins exist; this holds them in place.
+    """
+    assert "checkm-genome" in _checkm_pins(), "CheckM itself must be pinned"
+    defsrc = _CHECKM_DEF.read_text().replace("\\\n", " ")
+    create = next(
+        ln for ln in defsrc.splitlines() if "micromamba create" in ln and "-n checkm" in ln
+    )
+    assert re.fullmatch(
+        r"\s*micromamba create -y -n checkm(?: -c \S+)+ \$\{CHECKM_PINS\}\s*", create
+    ), f"the checkm env must be created from CHECKM_PINS and nothing else: {create.strip()!r}"
+    assert re.search(r"\$\{CHECKM_PINS\}\s*>\s*/opt/qiita/checkm\.pins", defsrc), (
+        "%post must hand CHECKM_PINS to %test in /opt/qiita/checkm.pins"
+    )
+    test_section = defsrc[defsrc.index("\n%test") :]
+    assert "< /opt/qiita/checkm.pins" in test_section, "%test must check every pin"
+
+
+def test_checkm_spec_verifies_the_pinned_checkm_version() -> None:
+    """The spec's verify passes an image built from the pinned CheckM and refuses any
+    other (checkm.env says why it reads the pins file)."""
+    spec = _CHECKM_ENV.read_text()
+    cmd = re.search(r'^VERIFY_CMD="([^"]*)"', spec, re.MULTILINE)
+    match = re.search(r'^VERIFY_MATCH="([^"]*)"', spec, re.MULTILINE)
+    assert cmd is not None and match is not None, "checkm.env lost VERIFY_CMD/VERIFY_MATCH"
+    pinned = _checkm_pins()["checkm-genome"]
+    assert cmd.group(1) == f"grep -x -F checkm-genome=={pinned} /opt/qiita/checkm.pins", (
+        f"VERIFY_CMD must check the pinned CheckM exactly: {cmd.group(1)!r}"
+    )
+    assert re.search(match.group(1), f"checkm-genome=={pinned}")
+    # What VERIFY_CMD prints when the pin is absent: nothing, or grep's own error.
+    assert not re.search(match.group(1), "")
+    assert not re.search(match.group(1), "grep: /opt/qiita/checkm.pins: No such file or directory")

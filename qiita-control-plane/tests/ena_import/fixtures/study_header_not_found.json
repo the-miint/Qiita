@@ -1,0 +1,16 @@
+{
+  "_source": "recorded from https://www.ebi.ac.uk/ena/portal/api/search?result=study&query=study_accession=\"PRJEB99999999\"&fields=study_accession,secondary_study_accession,study_title,study_description,center_name,first_public,last_updated,scientific_name,tax_id,status&limit=0&format=tsv on 2026-09-29 -- genuine zero-row response for an accession that does not exist, confirmed via https://www.ebi.ac.uk/ena/browser/api/xml/PRJEB99999999 returning HTTP 404 the same day",
+  "columns": [
+    "study_accession",
+    "secondary_study_accession",
+    "study_title",
+    "study_description",
+    "center_name",
+    "first_public",
+    "last_updated",
+    "scientific_name",
+    "tax_id",
+    "status"
+  ],
+  "rows": []
+}

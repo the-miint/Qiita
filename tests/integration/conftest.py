@@ -39,7 +39,10 @@ from _pg_env import (
 )
 from qiita_common.api_paths import LOOPBACK_HOST
 from qiita_common.duckdb_miint import setup_miint_test_env  # noqa: E402
-
+from qiita_control_plane.testing.db_teardown import (
+    resolve_ena_study_idxs,
+    teardown_ena_study_graph,
+)
 from qiita_control_plane.testing.jwks import jwks_harness  # noqa: F401
 from qiita_control_plane.testing.postgres import (  # noqa: F401
     _run_db_migrations,
@@ -217,6 +220,9 @@ def data_plane_env(
         "DUCKLAKE_CATALOG_CONNSTR": DUCKLAKE_CATALOG_CONNSTR,
         "PATH_PERSISTENT": str(persistent_base),
         "PATH_SCRATCH": str(scratch_base),
+        # Pinned so the data plane's boot does not depend on the memory of the
+        # machine running the suite.
+        "DUCKDB_MEMORY_LIMIT": "1GiB",
         LIB_PATH_ENV: lib_path,
     }
 
@@ -242,6 +248,18 @@ def ducklake_connect(data_path: str):
         f" (DATA_PATH '{data_path}');"
     )
     return conn
+
+
+async def cleanup_ena_study(pool, study_accession: str) -> None:
+    """Tear down the study an ENA import registered, and its whole sample graph.
+
+    `study_accession` is the bioproject accession the study was registered
+    under; nothing happens when no study carries it.
+    """
+    study_idxs = await resolve_ena_study_idxs(pool, [study_accession])
+    await teardown_ena_study_graph(
+        pool, study_idxs=study_idxs, run_accessions=[study_accession]
+    )
 
 
 @pytest.fixture(scope="module")

@@ -21,8 +21,8 @@ are the twin of the mask ones in `repositories.mask_definition`, and are deliber
 not merged with them: the two gates carry different state sets, so the skip rules and
 the response buckets differ, and a merged writer would have to interpolate the table
 and key column into a lifecycle UPDATE for a saving of about thirty lines. What IS
-shared is factored out — the narrowing predicate (`_sample_scope`) and the state-member
-assertion (`gate_state_literal`).
+shared is factored out — the narrowing predicate (`_sample_scope`). The gate's state
+constants are `repositories.assembly`'s.
 """
 
 import json
@@ -30,10 +30,16 @@ from typing import Literal
 
 import asyncpg
 from qiita_common.hashing import canonical_params_hash
-from qiita_common.models import AssemblySampleState, ProcessingStatus
+from qiita_common.models import ProcessingStatus
 
-from . import gate_state_literal, require_transaction
+from . import require_transaction
 from ._sample_scope import sample_scope_sql
+from .assembly import (
+    ASSEMBLY_SAMPLE_COMPLETED,
+    ASSEMBLY_SAMPLE_INVALIDATED,
+    ASSEMBLY_SAMPLE_NO_DATA,
+    ASSEMBLY_SAMPLE_PENDING,
+)
 
 # Column projection backing every Processing response. Defined once because three
 # readers (the mint, the by-idx fetch, and the list) return the same shape, and a
@@ -55,17 +61,6 @@ _PROCESSING_LIST_COLUMNS = ", ".join(f"p.{col.strip()}" for col in PROCESSING_RE
 # `sample_scope_sql` correlates its clauses on `<alias>.prep_sample_idx`, so the
 # two have to agree.
 _ROSTER_ALIAS = "asm"
-
-
-# The assembly_sample states this module binds as query parameters, each asserted
-# against the wire type so a renamed member fails at import rather than matching
-# no rows (`gate_state_literal` carries why).
-_STATE_PENDING, _STATE_COMPLETED, _STATE_NO_DATA, _STATE_INVALIDATED = (
-    gate_state_literal("pending", AssemblySampleState),
-    gate_state_literal("completed", AssemblySampleState),
-    gate_state_literal("no_data", AssemblySampleState),
-    gate_state_literal("invalidated", AssemblySampleState),
-)
 
 
 class ProcessingDeprecated(Exception):
@@ -181,7 +176,12 @@ async def list_processing(
     Callers that need to detect truncation pass `limit = cap + 1`; a returned
     length > cap means the set exceeded the cap.
     """
-    args: list = [_STATE_COMPLETED, _STATE_PENDING, _STATE_NO_DATA, _STATE_INVALIDATED]
+    args: list = [
+        ASSEMBLY_SAMPLE_COMPLETED,
+        ASSEMBLY_SAMPLE_PENDING,
+        ASSEMBLY_SAMPLE_NO_DATA,
+        ASSEMBLY_SAMPLE_INVALIDATED,
+    ]
     scope, narrowed = sample_scope_sql(
         alias=_ROSTER_ALIAS,
         args=args,
@@ -234,6 +234,8 @@ async def fetch_processing_prep_samples(
     *,
     visible_to_principal_idx: int | None,
     sequenced_pool_idx: int | None = None,
+    study_idx: int | None = None,
+    prep_sample_idx: int | None = None,
     limit: int,
 ) -> list[asyncpg.Record]:
     """Return up to `limit` samples assembled under `processing_idx`, ascending by
@@ -258,8 +260,9 @@ async def fetch_processing_prep_samples(
         alias=_ROSTER_ALIAS,
         args=args,
         sequenced_pool_idx=sequenced_pool_idx,
-        prep_sample_idx=None,
+        prep_sample_idx=prep_sample_idx,
         visible_to_principal_idx=visible_to_principal_idx,
+        study_idx=study_idx,
     )
     args.append(limit)
     query = (
@@ -365,14 +368,14 @@ async def set_assembly_sample_states(
             prep_sample_idxs,
         )
     }
-    skipped = (_STATE_PENDING, _STATE_NO_DATA)
+    skipped = (ASSEMBLY_SAMPLE_PENDING, ASSEMBLY_SAMPLE_NO_DATA)
     not_found = [idx for idx in prep_sample_idxs if idx not in present]
-    skipped_pending = [idx for idx, st in present.items() if st == _STATE_PENDING]
-    skipped_no_data = [idx for idx, st in present.items() if st == _STATE_NO_DATA]
+    skipped_pending = [idx for idx, st in present.items() if st == ASSEMBLY_SAMPLE_PENDING]
+    skipped_no_data = [idx for idx, st in present.items() if st == ASSEMBLY_SAMPLE_NO_DATA]
     unchanged = [idx for idx, st in present.items() if st == state]
     to_update = [idx for idx, st in present.items() if st != state and st not in skipped]
     if to_update:
-        invalidating = state == _STATE_INVALIDATED
+        invalidating = state == ASSEMBLY_SAMPLE_INVALIDATED
         await conn.execute(
             "UPDATE qiita.assembly_sample"
             "    SET state = $3,"

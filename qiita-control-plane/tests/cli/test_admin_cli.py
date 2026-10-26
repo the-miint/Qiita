@@ -16,7 +16,9 @@ import argparse
 import httpx
 import pytest
 from qiita_common.api_paths import (
+    URL_ADMIN_PRINCIPAL_LOOKUP_BY_EMAIL,
     URL_ADMIN_PRINCIPAL_REVOKE_ALL_TOKENS,
+    URL_ADMIN_PRINCIPAL_SYSTEM_ROLE,
     URL_ADMIN_STUDY_OWNER_BIOSAMPLE_ID,
     URL_AUTH_WHOAMI,
 )
@@ -119,6 +121,133 @@ def test_token_revoke_all_calls_correct_url(monkeypatch):
     )
     assert captured["auth"] == f"{BEARER_PREFIX}qk_admin"
     assert body["revoked_token_idxs"] == [1, 2]
+
+
+def _fake_lookup_then_patch(calls, *, system_role="user", disabled=False, retired=False):
+    def fake_request(method, url, headers=None, json=None, params=None, timeout=None):
+        calls.append((method, url, json))
+        if method == "POST":
+            body = {
+                "principal_idx": 42,
+                "system_role": system_role,
+                "disabled": disabled,
+                "retired": retired,
+            }
+            return httpx.Response(200, json=body, request=httpx.Request(method, url))
+        return httpx.Response(204, request=httpx.Request(method, url))
+
+    return fake_request
+
+
+def test_principal_set_role_looks_up_then_patches(monkeypatch):
+    from qiita_control_plane.cli import _common
+    from qiita_control_plane.cli import admin as cli
+
+    calls = []
+    monkeypatch.setattr(_common.httpx, "request", _fake_lookup_then_patch(calls))
+    result = cli._principal_set_role(
+        "http://localhost:8080", "qk_admin", "PI@example.com", "wet_lab_admin", "lab lead"
+    )
+    assert calls == [
+        (
+            "POST",
+            f"http://localhost:8080{URL_ADMIN_PRINCIPAL_LOOKUP_BY_EMAIL}",
+            {"email": "PI@example.com"},
+        ),
+        (
+            "PATCH",
+            f"http://localhost:8080{URL_ADMIN_PRINCIPAL_SYSTEM_ROLE.format(principal_idx=42)}",
+            {"system_role": "wet_lab_admin", "reason": "lab lead"},
+        ),
+    ]
+    assert result == {
+        "principal_idx": 42,
+        "email": "PI@example.com",
+        "from": "user",
+        "to": "wet_lab_admin",
+        "changed": True,
+    }
+
+
+def test_principal_set_role_same_role_sends_no_patch(monkeypatch):
+    from qiita_control_plane.cli import _common
+    from qiita_control_plane.cli import admin as cli
+
+    calls = []
+    monkeypatch.setattr(
+        _common.httpx, "request", _fake_lookup_then_patch(calls, system_role="wet_lab_admin")
+    )
+    result = cli._principal_set_role(
+        "http://localhost:8080", "qk_admin", "pi@example.com", "wet_lab_admin", "again"
+    )
+    assert [c[0] for c in calls] == ["POST"]
+    assert result["changed"] is False
+
+
+@pytest.mark.parametrize("flag", ["disabled", "retired"])
+def test_principal_set_role_refuses_inactive_principal(monkeypatch, capsys, flag):
+    from qiita_control_plane.cli import _common
+    from qiita_control_plane.cli import admin as cli
+
+    calls = []
+    monkeypatch.setattr(_common.httpx, "request", _fake_lookup_then_patch(calls, **{flag: True}))
+    monkeypatch.setenv("QIITA_TOKEN", "qk_admin")
+    rc = cli.main(
+        ["principal", "set-role", "--email", "x@example.com", "--role", "user", "--reason", "r"]
+    )
+    assert rc == 1
+    assert [c[0] for c in calls] == ["POST"]
+    assert flag in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("reason", ["", "   "])
+def test_principal_set_role_rejects_blank_reason(reason):
+    from qiita_control_plane.cli import admin as cli
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main(
+            [
+                "principal",
+                "set-role",
+                "--email",
+                "x@example.com",
+                "--role",
+                "user",
+                "--reason",
+                reason,
+            ]
+        )
+    assert exc.value.code == 2
+
+
+def test_principal_set_role_unknown_email_does_not_patch(monkeypatch, capsys):
+    from qiita_control_plane.cli import _common
+    from qiita_control_plane.cli import admin as cli
+
+    methods = []
+
+    def fake_request(method, url, headers=None, json=None, params=None, timeout=None):
+        methods.append(method)
+        return httpx.Response(
+            404, json={"detail": "principal not found"}, request=httpx.Request(method, url)
+        )
+
+    monkeypatch.setattr(_common.httpx, "request", fake_request)
+    monkeypatch.setenv("QIITA_TOKEN", "qk_admin")
+    rc = cli.main(
+        [
+            "principal",
+            "set-role",
+            "--email",
+            "nobody@example.com",
+            "--role",
+            "user",
+            "--reason",
+            "x",
+        ]
+    )
+    assert rc == 1
+    assert methods == ["POST"]
 
 
 def test_main_login_dispatches_to_do_login(monkeypatch):
@@ -605,6 +734,38 @@ def test_owner_biosample_id_write_failure_preserves_existing_file(monkeypatch, t
     assert leftovers == [], f"stray temp files left behind: {leftovers}"
 
 
+def test_owner_biosample_id_unreachable_control_plane_is_one_line(monkeypatch, tmp_path, capsys):
+    """A connection failure (no HTTP response at all) is one stderr line naming
+    the URL it tried, and exit 1, not a traceback; no file is written."""
+    from qiita_control_plane.cli import _common
+    from qiita_control_plane.cli import admin as cli
+
+    monkeypatch.setenv("QIITA_TOKEN", "qk_admin")
+
+    def unreachable(method, url, **kwargs):
+        raise httpx.ConnectError("Connection refused", request=httpx.Request(method, url))
+
+    monkeypatch.setattr(_common.httpx, "request", unreachable)
+
+    out = tmp_path / "owner.tsv"
+    rc = cli.main(
+        [
+            "--base-url",
+            "http://localhost:9999",
+            "owner-biosample-id",
+            "--study-idx",
+            "7",
+            "--output",
+            str(out),
+        ]
+    )
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert err.count("\n") == 1
+    assert "could not reach http://localhost:9999" in err
+    assert not out.exists()
+
+
 # ---------------------------------------------------------------------------
 # masked-read-export (parquet path)
 # ---------------------------------------------------------------------------
@@ -720,8 +881,8 @@ def _fake_masked_export_http(manifest):
 
 
 def test_masked_read_export_writes_parquet_per_sample(monkeypatch, tmp_path):
-    """Happy path: one <accession>.<run>.<pool>.<prep>.parquet per sample, with
-    the streamed rows, written 0600."""
+    """Happy path: one <accession>.<run>.<pool>.<prep_sample>.parquet per
+    prep_sample, with the streamed rows, written 0600."""
     import duckdb
     import pyarrow as pa
 
@@ -795,6 +956,205 @@ def test_masked_read_export_writes_parquet_per_sample(monkeypatch, tmp_path):
     assert n_b == 1
     # No .partial temp files left behind.
     assert sorted(p.suffix for p in out_dir.iterdir()) == [".parquet", ".parquet"]
+
+
+# The text pyarrow gives a parquet export whose data plane went away mid-stream
+# (measured against a SIGKILLed data plane: the reader raised OSError with this).
+_STREAM_DROPPED = (
+    "Flight returned unavailable error, with message: recvmsg:Connection reset by peer. "
+    "gRPC client debug context: UNKNOWN:Error received from peer"
+)
+
+
+def _failing_then_serving_client(tables, failures_by_prep, exc_factory):
+    """A fake FlightClient whose DoGet for a prep in `failures_by_prep` streams one
+    batch and then raises `exc_factory()`, that many times, before serving it whole."""
+    import pyarrow as pa
+
+    base = _fake_flight_client_class(tables)
+    remaining = dict(failures_by_prep)
+
+    class _Stream:
+        def __init__(self, table):
+            self._table = table
+
+        def to_reader(self):
+            batches = self._table.to_batches(max_chunksize=1)
+
+            def gen():
+                yield batches[0]
+                raise exc_factory()
+
+            return pa.RecordBatchReader.from_batches(self._table.schema, gen())
+
+    class _Client(base):
+        def do_get(self, ticket, options=None):
+            stream = super().do_get(ticket, options)
+            prep = self.do_get_calls[-1]
+            if remaining.get(prep, 0) > 0:
+                remaining[prep] -= 1
+                return _Stream(stream._table)
+            return stream
+
+    return _Client
+
+
+def _run_parquet_export(cli, out_dir, *extra):
+    return cli.main(
+        [
+            "masked-read-export",
+            "--sequenced-pool-idx",
+            "7",
+            "--mask-idx",
+            "3",
+            "--format",
+            "parquet",
+            "--output-dir",
+            str(out_dir),
+            "--data-plane-url",
+            "grpc://dp:50051",
+            *extra,
+        ]
+    )
+
+
+def _two_sample_export(monkeypatch, tickets):
+    import pyarrow as pa
+
+    from qiita_control_plane.cli import _common
+
+    monkeypatch.setenv("QIITA_TOKEN", "qk_admin")
+    manifest = {
+        "sequenced_pool_idx": 7,
+        "sequencing_run_idx": 5,
+        "mask_idx": 3,
+        "samples": [
+            {"prep_sample_idx": 42, "biosample_accession": "SAMN_A"},
+            {"prep_sample_idx": 43, "biosample_accession": "SAMN_B"},
+        ],
+    }
+    served = _fake_masked_export_http(manifest)
+
+    def counting_request(method, url, **kw):
+        if method == "POST":
+            tickets.append(kw["json"]["prep_sample_idx"])
+        return served(method, url, **kw)
+
+    monkeypatch.setattr(_common.httpx, "request", counting_request)
+    return {
+        42: pa.table({"read_id": ["rA0", "rA1"], "sequence1": ["ACGT", "TTGG"]}),
+        43: pa.table({"read_id": ["rB0"], "sequence1": ["CCAA"]}),
+    }
+
+
+def test_masked_read_export_retries_a_sample_whose_stream_dropped(monkeypatch, tmp_path):
+    """A data plane that goes away mid-stream (a restart) fails that prep_sample's
+    attempt; the export mints a fresh ticket and exports it again from the start, and
+    the run finishes with every file whole."""
+    import duckdb
+
+    from qiita_control_plane.cli import admin as cli
+    from qiita_control_plane.cli.admin import masked_export
+
+    tickets: list[int] = []
+    tables = _two_sample_export(monkeypatch, tickets)
+    monkeypatch.setattr(masked_export.time, "sleep", lambda _s: None)
+    client = _failing_then_serving_client(tables, {42: 2}, lambda: OSError(_STREAM_DROPPED))
+    monkeypatch.setattr("pyarrow.flight.FlightClient", client)
+
+    out_dir = tmp_path / "exp"
+    assert _run_parquet_export(cli, out_dir) == 0
+    assert client.instances[0].do_get_calls == [42, 42, 42, 43]
+    assert tickets == [42, 42, 42, 43]
+    f_a = out_dir / "SAMN_A.5.7.42.parquet"
+    n = duckdb.connect(":memory:").execute(f"SELECT count(*) FROM read_parquet('{f_a}')")
+    assert n.fetchone()[0] == 2
+    assert sorted(p.name for p in out_dir.iterdir()) == [
+        "SAMN_A.5.7.42.parquet",
+        "SAMN_B.5.7.43.parquet",
+    ]
+
+
+def test_masked_read_export_does_not_retry_a_failure_of_its_own(monkeypatch, tmp_path, capsys):
+    """An error that is not a service being unreachable fails the export on its first
+    attempt, as before."""
+    from qiita_control_plane.cli import admin as cli
+
+    tickets: list[int] = []
+    tables = _two_sample_export(monkeypatch, tickets)
+    client = _failing_then_serving_client(
+        tables, {42: 1}, lambda: OSError(28, "No space left on device")
+    )
+    monkeypatch.setattr("pyarrow.flight.FlightClient", client)
+
+    out_dir = tmp_path / "exp"
+    assert _run_parquet_export(cli, out_dir) == 1
+    assert client.instances[0].do_get_calls == [42]
+    assert "No space left on device" in capsys.readouterr().err
+    assert list(out_dir.iterdir()) == []
+
+
+def test_masked_read_export_gives_up_after_retry_seconds(monkeypatch, tmp_path, capsys):
+    """With the retry window spent, a transient failure fails the export, and the
+    sample being written leaves no file."""
+    from qiita_control_plane.cli import admin as cli
+
+    tickets: list[int] = []
+    tables = _two_sample_export(monkeypatch, tickets)
+    client = _failing_then_serving_client(tables, {42: 1}, lambda: OSError(_STREAM_DROPPED))
+    monkeypatch.setattr("pyarrow.flight.FlightClient", client)
+
+    out_dir = tmp_path / "exp"
+    assert _run_parquet_export(cli, out_dir, "--retry-seconds", "0") == 1
+    assert client.instances[0].do_get_calls == [42]
+    assert "Connection reset by peer" in capsys.readouterr().err
+    assert list(out_dir.iterdir()) == []
+
+
+@pytest.mark.parametrize("value", ["-1", "nan", "inf", "abc"])
+def test_masked_read_export_refuses_a_retry_window_that_is_not_finite_or_is_negative(
+    tmp_path, capsys, value
+):
+    from qiita_control_plane.cli import admin as cli
+
+    with pytest.raises(SystemExit) as exc:
+        _run_parquet_export(cli, tmp_path / "exp", "--retry-seconds", value)
+    assert exc.value.code == 2
+    assert "must be a finite number >= 0" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("make_exc", "transient"),
+    [
+        (lambda r: httpx.ConnectError("Connection refused", request=r), True),
+        (
+            lambda r: httpx.HTTPStatusError(
+                "bad gateway", request=r, response=httpx.Response(502, request=r)
+            ),
+            True,
+        ),
+        (
+            lambda r: httpx.HTTPStatusError(
+                "conflict", request=r, response=httpx.Response(409, request=r)
+            ),
+            False,
+        ),
+        (lambda r: OSError(_STREAM_DROPPED), True),
+        (lambda r: OSError(28, "No space left on device"), False),
+        # The fastq path's COPY over a dropped stream (measured, as for the OSError).
+        (
+            lambda r: __import__("duckdb").InvalidInputException(f"arrow_scan: {_STREAM_DROPPED}"),
+            True,
+        ),
+        (lambda r: RuntimeError(_STREAM_DROPPED), False),
+    ],
+)
+def test_export_failure_is_transient(make_exc, transient):
+    """Which failures restart a prep_sample's export: a service unreachable, by type
+    and then by text, and nothing raised as a plain bug."""
+    from qiita_control_plane.cli.admin.masked_export import _export_failure_is_transient
+
+    assert _export_failure_is_transient(make_exc(httpx.Request("POST", "http://cp"))) is transient
 
 
 def test_masked_read_export_empty_sample_parquet(monkeypatch, tmp_path):
@@ -1312,7 +1672,7 @@ def test_masked_read_export_skips_unchanged_parquet(monkeypatch, tmp_path, capsy
     capsys.readouterr()  # discard first-run output
 
     assert cli.main(argv) == 0  # second export: nothing changed
-    assert "exported 0 sample(s) (skipped 2 already up to date)" in capsys.readouterr().out
+    assert "exported 0 prep_sample(s) (skipped 2 already up to date)" in capsys.readouterr().out
     # The re-run client streamed nothing (every sample skipped) but counted both.
     rerun = fake_cls.instances[-1]
     assert rerun.do_get_calls == []
@@ -1371,6 +1731,67 @@ def test_masked_read_export_overwrites_changed_parquet(monkeypatch, tmp_path):
     assert pq.ParquetFile(out_dir / "SAMN_A.5.7.42.parquet").metadata.num_rows == 2
 
 
+# The manifest GET runs before the loop over prep_samples and the ticket POST
+# inside it; each sits under its own except arms.
+@pytest.mark.parametrize("unreachable_method", ["GET", "POST"])
+def test_masked_read_export_unreachable_control_plane_is_one_line(
+    monkeypatch, tmp_path, capsys, unreachable_method
+):
+    """A connection failure (no HTTP response at all) is one stderr line naming
+    the URL it tried, and exit 1, not a traceback, whichever request hits it.
+    `--retry-seconds 0` so the ticket POST's failure is reported on its first
+    attempt rather than after the retry window."""
+    import pyarrow as pa
+
+    from qiita_control_plane.cli import _common
+    from qiita_control_plane.cli import admin as cli
+
+    monkeypatch.setenv("QIITA_TOKEN", "qk_admin")
+    manifest = {
+        "sequenced_pool_idx": 7,
+        "sequencing_run_idx": 5,
+        "mask_idx": 3,
+        "samples": [{"prep_sample_idx": 42, "biosample_accession": "SAMN_A"}],
+    }
+    serve = _fake_masked_export_http(manifest)
+
+    def fake_request(method, url, **kwargs):
+        if method == unreachable_method:
+            raise httpx.ConnectError("Connection refused", request=httpx.Request(method, url))
+        return serve(method, url, **kwargs)
+
+    monkeypatch.setattr(_common.httpx, "request", fake_request)
+    fake_cls = _fake_flight_client_class({42: pa.table({"read_id": ["r"], "sequence1": ["A"]})})
+    monkeypatch.setattr("pyarrow.flight.FlightClient", fake_cls)
+
+    out_dir = tmp_path / "exp"
+    out_dir.mkdir()
+    rc = cli.main(
+        [
+            "--base-url",
+            "http://localhost:9999",
+            "masked-read-export",
+            "--sequenced-pool-idx",
+            "7",
+            "--mask-idx",
+            "3",
+            "--format",
+            "parquet",
+            "--output-dir",
+            str(out_dir),
+            "--data-plane-url",
+            "grpc://dp:50051",
+            "--retry-seconds",
+            "0",
+        ]
+    )
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert err.count("\n") == 1
+    assert "could not reach http://localhost:9999" in err
+    assert list(out_dir.iterdir()) == []
+
+
 # ---------------------------------------------------------------------------
 # masked-read-export (fastq path — R1/R2)
 #
@@ -1399,9 +1820,12 @@ def _read_gz_text(path):
         return fh.read()
 
 
-def _run_fastq_export(monkeypatch, tmp_path, table):
-    """Drive a single-sample fastq export against a fake Flight stream serving
-    `table`, returning (rc, out_dir)."""
+def _run_masked_export(
+    monkeypatch, tmp_path, table, *, fmt="fastq", data_plane_url="grpc://dp:50051"
+):
+    """Drive a single-prep_sample export against the fake manifest, returning
+    (rc, out_dir). A fake Flight stream serves `table`; with `table=None` none is
+    installed, so pyarrow builds a real client from `data_plane_url`."""
     from qiita_control_plane.cli import _common
     from qiita_control_plane.cli import admin as cli
 
@@ -1413,10 +1837,11 @@ def _run_fastq_export(monkeypatch, tmp_path, table):
         "samples": [{"prep_sample_idx": 42, "biosample_accession": "SAMN_A"}],
     }
     monkeypatch.setattr(_common.httpx, "request", _fake_masked_export_http(manifest))
-    monkeypatch.setattr("pyarrow.flight.FlightClient", _fake_flight_client_class({42: table}))
+    if table is not None:
+        monkeypatch.setattr("pyarrow.flight.FlightClient", _fake_flight_client_class({42: table}))
 
     out_dir = tmp_path / "exp"
-    out_dir.mkdir()
+    out_dir.mkdir(exist_ok=True)
     rc = cli.main(
         [
             "masked-read-export",
@@ -1425,11 +1850,11 @@ def _run_fastq_export(monkeypatch, tmp_path, table):
             "--mask-idx",
             "3",
             "--format",
-            "fastq",
+            fmt,
             "--output-dir",
             str(out_dir),
             "--data-plane-url",
-            "grpc://dp:50051",
+            data_plane_url,
         ]
     )
     return rc, out_dir
@@ -1449,7 +1874,7 @@ def test_masked_read_export_single_end_fastq(monkeypatch, tmp_path):
             "qual2": _qual([None, None]),
         }
     )
-    rc, out_dir = _run_fastq_export(monkeypatch, tmp_path, table)
+    rc, out_dir = _run_masked_export(monkeypatch, tmp_path, table)
     assert rc == 0
 
     f = out_dir / "SAMN_A.5.7.42.fastq.gz"
@@ -1477,7 +1902,7 @@ def test_masked_read_export_paired_fastq_r1_r2(monkeypatch, tmp_path):
             "qual2": _qual([[20, 21, 22, 23, 24, 25, 26, 27], [28] * 8]),
         }
     )
-    rc, out_dir = _run_fastq_export(monkeypatch, tmp_path, table)
+    rc, out_dir = _run_masked_export(monkeypatch, tmp_path, table)
     assert rc == 0
 
     r1 = out_dir / "SAMN_A.5.7.42.R1.fastq.gz"
@@ -1520,7 +1945,7 @@ def test_masked_read_export_paired_fastq_streams_all_batches(monkeypatch, tmp_pa
             "qual2": _qual([[40] * 8]),
         }
     )
-    rc, out_dir = _run_fastq_export(monkeypatch, tmp_path, pa.Table.from_batches([b1, b2]))
+    rc, out_dir = _run_masked_export(monkeypatch, tmp_path, pa.Table.from_batches([b1, b2]))
     assert rc == 0
 
     r1 = _read_gz_text(out_dir / "SAMN_A.5.7.42.R1.fastq.gz").splitlines()
@@ -1544,7 +1969,7 @@ def test_masked_read_export_empty_sample_fastq(monkeypatch, tmp_path):
             "qual2": _qual([]),
         }
     )
-    rc, out_dir = _run_fastq_export(monkeypatch, tmp_path, table)
+    rc, out_dir = _run_masked_export(monkeypatch, tmp_path, table)
     assert rc == 0
 
     f = out_dir / "SAMN_A.5.7.42.fastq.gz"
@@ -1554,11 +1979,13 @@ def test_masked_read_export_empty_sample_fastq(monkeypatch, tmp_path):
     assert sorted(p.name for p in out_dir.iterdir()) == ["SAMN_A.5.7.42.fastq.gz"]
 
 
-def test_masked_read_export_fastq_refuses_existing_file(monkeypatch, tmp_path, capsys):
+# Any one of the names a prep_sample's export could commit blocks the run: the
+# single-end file, or either half of a prior paired export.
+@pytest.mark.parametrize("suffix", ["fastq.gz", "R1.fastq.gz", "R2.fastq.gz"])
+def test_masked_read_export_fastq_refuses_existing_file(monkeypatch, tmp_path, capsys, suffix):
     """fastq export never overwrites: if any target filename already exists, the
     command fails up front (exit 1) before constructing a Flight client or
-    streaming — no count probe, no DoGet, and the existing file is left intact.
-    A lone R1 (from a prior paired export) is enough to block the whole run."""
+    streaming — no count probe, no DoGet, and the existing file is left intact."""
     import pyarrow as pa
 
     from qiita_control_plane.cli import _common
@@ -1590,7 +2017,7 @@ def test_masked_read_export_fastq_refuses_existing_file(monkeypatch, tmp_path, c
 
     out_dir = tmp_path / "exp"
     out_dir.mkdir()
-    preexisting = out_dir / "SAMN_B.5.7.43.R1.fastq.gz"
+    preexisting = out_dir / f"SAMN_B.5.7.43.{suffix}"
     preexisting.write_bytes(b"stale")
 
     rc = cli.main(
@@ -1611,11 +2038,171 @@ def test_masked_read_export_fastq_refuses_existing_file(monkeypatch, tmp_path, c
     assert rc == 1
     err = capsys.readouterr().err
     assert "refusing to overwrite" in err
-    assert "SAMN_B.5.7.43.R1.fastq.gz" in err
+    assert preexisting.name in err
     # Failed before any Flight work; the stale file is the only thing on disk.
     assert fake_cls.instances == []
     assert preexisting.read_bytes() == b"stale"
-    assert sorted(p.name for p in out_dir.iterdir()) == ["SAMN_B.5.7.43.R1.fastq.gz"]
+    assert sorted(p.name for p in out_dir.iterdir()) == [preexisting.name]
+
+
+# A refused DoGet and a stream cut after its first batch reach different except
+# arms in `_handle_masked_read_export`; the comment on the later arm says why.
+@pytest.mark.parametrize(
+    ("fmt", "failure", "prefix", "message"),
+    [
+        ("parquet", "refused", "flight error: ", "data plane unavailable"),
+        ("parquet", "midstream", "error: ", "data plane stream cut"),
+        ("fastq", "midstream", "error: Invalid Input Error: arrow_scan", "data plane stream cut"),
+    ],
+)
+def test_masked_read_export_data_plane_failure_is_an_error_not_a_traceback(
+    monkeypatch, tmp_path, capsys, fmt, failure, prefix, message
+):
+    """A data plane failure, whether it refuses the DoGet or cuts the stream after
+    its first batch, is a stderr message and exit 1, and the prep_sample being
+    written leaves no partial file behind."""
+    import pyarrow as pa
+    import pyarrow.flight as flight
+
+    from qiita_control_plane.cli import _common
+    from qiita_control_plane.cli import admin as cli
+
+    monkeypatch.setenv("QIITA_TOKEN", "qk_admin")
+    manifest = {
+        "sequenced_pool_idx": 7,
+        "sequencing_run_idx": 5,
+        "mask_idx": 3,
+        "samples": [{"prep_sample_idx": 42, "biosample_accession": "SAMN_A"}],
+    }
+    monkeypatch.setattr(_common.httpx, "request", _fake_masked_export_http(manifest))
+    table = pa.table(
+        {
+            "read_id": pa.array(["rS0"]),
+            "sequence1": pa.array(["GGGGCCCC"]),
+            "qual1": _qual([[40] * 8]),
+            "sequence2": pa.array([None], type=pa.string()),
+            "qual2": _qual([None]),
+        }
+    )
+
+    class _CutStream:
+        def to_reader(self):
+            def batches():
+                yield from table.to_batches()
+                raise OSError("data plane stream cut")
+
+            return pa.RecordBatchReader.from_batches(table.schema, batches())
+
+    def do_get(self, ticket, options=None):
+        if failure == "refused":
+            raise flight.FlightUnavailableError("data plane unavailable")
+        return _CutStream()
+
+    fake_cls = _fake_flight_client_class({42: table})
+    monkeypatch.setattr(fake_cls, "do_get", do_get)
+    monkeypatch.setattr("pyarrow.flight.FlightClient", fake_cls)
+
+    out_dir = tmp_path / "exp"
+    out_dir.mkdir()
+    rc = cli.main(
+        [
+            "masked-read-export",
+            "--sequenced-pool-idx",
+            "7",
+            "--mask-idx",
+            "3",
+            "--format",
+            fmt,
+            "--output-dir",
+            str(out_dir),
+            "--data-plane-url",
+            "grpc://dp:50051",
+        ]
+    )
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert err.startswith(prefix), err
+    assert message in err
+    assert list(out_dir.iterdir()) == []
+
+
+def test_masked_read_export_miint_load_failure_is_an_error_not_a_traceback(
+    monkeypatch, tmp_path, capsys
+):
+    """A fastq export on a client where miint cannot be installed or loaded is a
+    stderr message and exit 1, before any prep_sample is streamed."""
+    import duckdb
+    import pyarrow as pa
+
+    from qiita_control_plane.cli.admin import masked_export
+
+    def no_miint():
+        raise duckdb.IOException("Failed to download extension miint")
+
+    monkeypatch.setattr(masked_export, "connect_with_miint", no_miint)
+    table = pa.table({"read_id": ["rS0"], "sequence1": ["GGGG"]})
+    rc, out_dir = _run_masked_export(monkeypatch, tmp_path, table)
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert err.startswith("error: "), err
+    assert "Failed to download extension miint" in err
+    assert list(out_dir.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    ("data_plane_url", "message"),
+    [
+        ("not a uri", "Cannot parse URI"),
+        # Parses, but Flight has no transport for the scheme (ArrowKeyError).
+        ("http://dp:50051", "No client transport implementation for http"),
+    ],
+)
+def test_masked_read_export_refused_data_plane_url_is_an_error(
+    monkeypatch, tmp_path, capsys, data_plane_url, message
+):
+    """pyarrow refuses the URL when the client is built; that is a stderr
+    message and exit 1, not a traceback."""
+    rc, out_dir = _run_masked_export(
+        monkeypatch, tmp_path, None, fmt="parquet", data_plane_url=data_plane_url
+    )
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert err.startswith("error: "), err
+    assert message in err
+    assert list(out_dir.iterdir()) == []
+
+
+def test_masked_read_export_unreadable_parquet_target_is_an_error(monkeypatch, tmp_path, capsys):
+    """An existing parquet target that is not parquet cannot be counted for the
+    re-export check; that is a stderr message and exit 1, and the file is left
+    as it was."""
+    import pyarrow as pa
+
+    out_dir = tmp_path / "exp"
+    out_dir.mkdir()
+    target = out_dir / "SAMN_A.5.7.42.parquet"
+    target.write_bytes(b"not parquet")
+    table = pa.table({"read_id": ["r"], "sequence1": ["A"]})
+    rc, _ = _run_masked_export(monkeypatch, tmp_path, table, fmt="parquet")
+    assert rc == 1
+    assert capsys.readouterr().err.startswith("error: ")
+    assert target.read_bytes() == b"not parquet"
+
+
+def test_masked_read_export_bug_is_a_traceback(monkeypatch, tmp_path):
+    """A plain ValueError from this code is a bug, not a failure of the data
+    plane or the client host, so the handler lets it propagate."""
+    import pyarrow as pa
+
+    from qiita_control_plane.cli.admin import masked_export
+
+    def bug(*args, **kwargs):
+        raise ValueError("a bug in the writer")
+
+    monkeypatch.setattr(masked_export, "_write_masked_sample", bug)
+    table = pa.table({"read_id": ["r"], "sequence1": ["A"]})
+    with pytest.raises(ValueError, match="a bug in the writer"):
+        _run_masked_export(monkeypatch, tmp_path, table, fmt="parquet")
 
 
 # ---------------------------------------------------------------------------

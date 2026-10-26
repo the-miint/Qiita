@@ -46,6 +46,7 @@ from .dispatch import schedule_dispatch
 from .fanout_dispatch import align_block_cohort, top_up_dispatch
 from .repositories.alignment_definition import mint_alignment_definition
 from .repositories.block import (
+    MASK_SAMPLE_COMPLETED,
     add_block_members,
     create_alignment_sample_pending,
     create_block,
@@ -350,19 +351,10 @@ async def plan_and_submit_alignments(
     # registered after the shard assignment stamped these rows.
     shard_ids = await reference_shard_ids(pool, reference_idx)
 
-    all_samples = await _enumerate_pool_samples(pool, sequenced_pool_idx)
-
-    # ACTIVE pool samples whose reads were never ingested (no sequence_range) can't
-    # be tiled — report them (mirrors block_planner). Retired samples are already
-    # excluded from all_samples, so this count matches the active set.
-    skipped_no_reads = await pool.fetchval(
-        "SELECT count(*) FROM qiita.sequenced_sample ss"
-        "  JOIN qiita.prep_sample ps ON ps.idx = ss.prep_sample_idx"
-        "  LEFT JOIN qiita.sequence_range sr ON sr.prep_sample_idx = ss.prep_sample_idx"
-        " WHERE ss.sequenced_pool_idx = $1 AND ps.retired = false"
-        "   AND sr.prep_sample_idx IS NULL",
-        sequenced_pool_idx,
-    )
+    # ACTIVE pool samples with no stored reads (no sequence_range) have nothing to
+    # align, whether ingest found them empty or never read them — report them.
+    all_samples, rangeless = await _enumerate_pool_samples(pool, sequenced_pool_idx)
+    skipped_no_reads = len(rangeless)
 
     # Which of the pool's samples are masked under the caller-named mask_idx, and in
     # what gate state? Alignment does NOT re-derive the mask config — the caller
@@ -403,7 +395,7 @@ async def plan_and_submit_alignments(
     to_consider = [
         (s, mask_idx)
         for s in all_samples
-        if gate_state_by_prep_sample.get(s.prep_sample_idx) == "completed"
+        if gate_state_by_prep_sample.get(s.prep_sample_idx) == MASK_SAMPLE_COMPLETED
     ]
     skipped_mask_incomplete = len(gate_state_by_prep_sample) - len(to_consider)
 

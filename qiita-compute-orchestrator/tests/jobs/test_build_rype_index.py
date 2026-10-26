@@ -266,13 +266,17 @@ def test_build_rype_index_missing_chunks_raises(tmp_path, monkeypatch):
 
 
 def _run_memory_split(tmp_path, monkeypatch, alloc_gb):
-    """Run execute() under a `alloc_gb` SLURM cgroup with rype + DuckDB stubbed,
-    returning the captured (duckdb_memory_gb, rype max_memory) split."""
+    """Run execute() under a `alloc_gb` SLURM cgroup (or off SLURM when None)
+    with rype + DuckDB stubbed, returning the captured (duckdb_memory_gb, rype
+    max_memory) split."""
     from qiita_compute_orchestrator.jobs import build_rype_index
 
     monkeypatch.setenv("PATH_DERIVED", str(tmp_path / "shared"))
     # slurm_alloc_gb reads SLURM_MEM_PER_NODE in MB.
-    monkeypatch.setenv("SLURM_MEM_PER_NODE", str(alloc_gb * 1024))
+    if alloc_gb is None:
+        monkeypatch.delenv("SLURM_MEM_PER_NODE", raising=False)
+    else:
+        monkeypatch.setenv("SLURM_MEM_PER_NODE", str(alloc_gb * 1024))
     chunks_dir = _write_chunks_dir(
         tmp_path / "reference_sequence_chunks", [(1, 0, "ACGT"), (2, 0, "CCCC")]
     )
@@ -350,3 +354,17 @@ def test_build_rype_index_rype_memory_grows_on_oom_retry(tmp_path, monkeypatch):
     assert captured["duckdb_memory_gb"] == 8
     # rype gets (alloc - DuckDB cap - headroom) = 128 - 8 - 6 = 114 GB.
     assert captured["max_memory"] == 114 * 1024**3
+
+
+def test_build_rype_index_rype_memory_bounded_by_detected_ram_off_slurm(tmp_path, monkeypatch):
+    """Off SLURM the 30 GB literal is a ceiling, not the answer: on a 12 GB host
+    rype gets what the machine has left after DuckDB's 4 and the 6 GB headroom
+    — 2 GB, not 30."""
+    from qiita_compute_orchestrator import miint
+    from qiita_compute_orchestrator.jobs import build_rype_index
+
+    monkeypatch.setattr(miint, "detected_ram_gb", lambda: 12)
+    monkeypatch.setattr(build_rype_index, "detected_ram_gb", lambda: 12)
+    captured = _run_memory_split(tmp_path, monkeypatch, alloc_gb=None)
+    assert captured["duckdb_memory_gb"] == 4
+    assert captured["max_memory"] == 2 * 1024**3

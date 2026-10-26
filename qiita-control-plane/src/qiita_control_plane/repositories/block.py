@@ -19,9 +19,18 @@ from collections.abc import Sequence
 
 import asyncpg
 from qiita_common.actions import BLOCK_MASK_ACTION_ID
+from qiita_common.models import MaskSampleState
 
-from . import require_transaction
+from . import gate_state_literal, require_transaction
 from .alignment_definition import list_completed_alignment_samples
+
+# The `mask_sample` states, asserted against the Literal so a renamed member fails at
+# import rather than matching no rows. Every comparison against the gate uses these —
+# the Python ones import them, and this module's SQL binds them. A consumer of a
+# pass-set proceeds on `completed` alone; `fetch_mask_sample_state` is the contract.
+MASK_SAMPLE_PENDING = gate_state_literal("pending", MaskSampleState)
+MASK_SAMPLE_COMPLETED = gate_state_literal("completed", MaskSampleState)
+MASK_SAMPLE_INVALIDATED = gate_state_literal("invalidated", MaskSampleState)
 
 
 async def create_block(conn: asyncpg.Connection) -> int:
@@ -155,9 +164,9 @@ async def create_mask_sample_pending(
         raise ValueError("create_mask_sample_pending requires at least one prep_sample_idx")
     await conn.executemany(
         "INSERT INTO qiita.mask_sample (mask_idx, prep_sample_idx, state)"
-        " VALUES ($1, $2, 'pending')"
+        " VALUES ($1, $2, $3)"
         " ON CONFLICT (mask_idx, prep_sample_idx) DO NOTHING",
-        [(mask_idx, ps) for ps in prep_sample_idxs],
+        [(mask_idx, ps, MASK_SAMPLE_PENDING) for ps in prep_sample_idxs],
     )
 
 
@@ -238,6 +247,12 @@ async def fetch_mask_sample_state(
     deprecating the CONFIG (`MaskDefinitionStatus`). So absence (`None`) means "no
     mask has completed for this (mask_idx, prep_sample)" — NOT an exempt sample.
 
+    A prep_sample that ingest found empty has nothing to mask, so it is written
+    'completed' with an empty pass-set (`complete_empty_mask_sample_in_tx`), and that
+    row is removed if the prep_sample later gains reads. A consumer of a 'completed'
+    row therefore accepts zero rows, which is also what a prep_sample whose every
+    read failed QC yields.
+
     THE INVARIANT: any consumer that must not read an absent, PARTIAL or withdrawn
     pass-set proceeds ONLY on 'completed', rejecting `None` (absence is never
     "pass"), 'pending' and 'invalidated'. Expressing withdrawal as a state value
@@ -287,7 +302,7 @@ async def _raise_if_invalidated(
         mask_idx,
         prep_sample_idx,
     )
-    if state == "invalidated":
+    if state == MASK_SAMPLE_INVALIDATED:
         raise MaskSampleInvalidated(mask_idx=mask_idx, prep_sample_idx=prep_sample_idx)
 
 
@@ -311,12 +326,14 @@ async def finalize_mask_sample(
     pass-set; see the exception for the operator's path forward."""
     require_transaction(conn)
     updated = await conn.fetchval(
-        "UPDATE qiita.mask_sample SET state = 'completed'"
+        "UPDATE qiita.mask_sample SET state = $3"
         " WHERE mask_idx = $1 AND prep_sample_idx = $2"
-        "   AND state NOT IN ('completed', 'invalidated')"
+        "   AND state NOT IN ($3, $4)"
         " RETURNING prep_sample_idx",
         mask_idx,
         prep_sample_idx,
+        MASK_SAMPLE_COMPLETED,
+        MASK_SAMPLE_INVALIDATED,
     )
     if updated is None:
         await _raise_if_invalidated(conn, mask_idx=mask_idx, prep_sample_idx=prep_sample_idx)
@@ -344,12 +361,14 @@ async def upsert_mask_sample_completed(
     require_transaction(conn)
     written = await conn.fetchval(
         "INSERT INTO qiita.mask_sample (mask_idx, prep_sample_idx, state)"
-        " VALUES ($1, $2, 'completed')"
-        " ON CONFLICT (mask_idx, prep_sample_idx) DO UPDATE SET state = 'completed'"
-        "   WHERE qiita.mask_sample.state <> 'invalidated'"
+        " VALUES ($1, $2, $3)"
+        " ON CONFLICT (mask_idx, prep_sample_idx) DO UPDATE SET state = $3"
+        "   WHERE qiita.mask_sample.state <> $4"
         " RETURNING prep_sample_idx",
         mask_idx,
         prep_sample_idx,
+        MASK_SAMPLE_COMPLETED,
+        MASK_SAMPLE_INVALIDATED,
     )
     if written is None:
         await _raise_if_invalidated(conn, mask_idx=mask_idx, prep_sample_idx=prep_sample_idx)

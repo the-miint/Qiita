@@ -22,7 +22,7 @@ import asyncpg
 import httpx
 import pyarrow.flight as _flight
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
-from pydantic import Field
+from pydantic import Field, ValidationError
 from qiita_common.api_paths import (
     PATH_REFERENCE_BY_IDX,
     PATH_REFERENCE_DOGET,
@@ -33,6 +33,7 @@ from qiita_common.api_paths import (
     PATH_REFERENCE_GENOME_MAP_PARQUET,
     PATH_REFERENCE_GENOME_MEMBER,
     PATH_REFERENCE_INDEX,
+    PATH_REFERENCE_PHYLOGENY_MINT_EDGE_ID,
     PATH_REFERENCE_PREFIX,
     PATH_REFERENCE_ROOT,
     PATH_REFERENCE_SHARD_INDEX_STATUS,
@@ -58,6 +59,7 @@ from qiita_common.models import (
     ReferenceGenomeMember,
     ReferenceIndex,
     ReferenceKind,
+    ReferencePhylogenyEdgeIdMintResponse,
     ReferenceResponse,
     ReferenceShardIndexStatus,
     ReferenceStatus,
@@ -69,6 +71,7 @@ from qiita_common.parquet import PARQUET_MEDIA_TYPE, PARQUET_RESPONSES
 from ..actions.library import (
     delete_reference_data,
     genome_map_parquet,
+    mint_phylogeny_edge_id_data,
     sync_reference_exclusion_data,
 )
 from ..actions.reference import (
@@ -660,6 +663,106 @@ async def sync_reference_exclusion_mirror(
     return ReferenceExclusionSyncResponse(synced_feature_count=synced)
 
 
+@router.post(PATH_REFERENCE_PHYLOGENY_MINT_EDGE_ID, status_code=200)
+async def mint_reference_phylogeny_edge_id(
+    reference_idx: Annotated[int, Field(gt=0)],
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    signing_key: bytes = Depends(get_flight_signing_key),
+    data_plane_url: str = Depends(get_data_plane_url),
+    _scope: Principal = Depends(require_scope(Scope.REFERENCE_WRITE)),
+) -> ReferencePhylogenyEdgeIdMintResponse:
+    """Give one reference's phylogeny rows the edge numbering a placement joins on
+    (`reference:write` — wet_lab_admin or system_admin, the same scope that loads a
+    reference in the first place).
+
+    Why the column can be NULL and what depends on it: see "Edge numbering
+    (`edge_id`)" in `docs/architecture/reference-data.md`.
+
+    Makes NO Postgres change. Numbers the tree only when every one of its rows
+    carries NULL, so a second call mints nothing and a tree that arrived with its
+    own numbering is left alone. A partly numbered tree and a reference with no
+    phylogeny rows are both 409s (each detail says why), so a `minted_rows: 0` that
+    reaches the caller always means "already numbered" and never "there was no tree
+    to number".
+
+    Two different failures share the 502. A transport or data-plane error may be
+    re-issued — whether the write committed first is not knowable from a timeout,
+    but the second call re-reads the counts before writing, so it is safe either
+    way. A reply this route cannot take at face value is the other — counts that
+    describe no tree, or a body missing one of them — and there re-issuing is only
+    safe when nothing was written; the detail says which."""
+    await require_reference_exists(pool, reference_idx)
+    try:
+        result = ReferencePhylogenyEdgeIdMintResponse.model_validate(
+            await mint_phylogeny_edge_id_data(
+                reference_idx=reference_idx,
+                signing_key=signing_key,
+                data_plane_url=data_plane_url,
+            )
+        )
+    except (_flight.FlightError, RuntimeError) as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=(f"failed to mint edge_id for this reference; the call can be re-issued: {exc}"),
+        ) from exc
+    except ValidationError as exc:
+        # Counts that cannot describe any tree. Unlike the transport arm above, this
+        # one cannot promise a safe re-issue: a reply claiming more numbered rows
+        # than the tree holds, or numbered-plus-minted over the total, may have
+        # written some of them. Re-reading the counts is what settles it.
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                f"the data plane reported counts that do not describe reference"
+                f" {reference_idx}'s tree; do NOT re-issue before reading the"
+                f" current counts, because rows may already have been written: {exc}"
+            ),
+        ) from exc
+    if result.phylogeny_rows == 0:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"reference {reference_idx} has no phylogeny rows, so there is no"
+                " edge numbering to mint"
+            ),
+        )
+    if 0 < result.already_numbered_rows < result.phylogeny_rows:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"reference {reference_idx} already numbers"
+                f" {result.already_numbered_rows} of {result.phylogeny_rows}"
+                " phylogeny rows; minting the rest would leave two numberings in"
+                " one column"
+            ),
+        )
+    if result.already_numbered_rows == 0 and result.minted_rows != result.phylogeny_rows:
+        # The data plane counted no numbered rows and then changed a different number
+        # of them than it counted. One UPDATE in one transaction should make this
+        # unreachable; it is checked rather than assumed because the alternative is
+        # reporting a half-numbered tree as a completed mint.
+        #
+        # The two sub-cases need different advice: re-issuing after a PARTIAL write
+        # dead-ends, because the second call sees `already_numbered > 0` and the
+        # all-or-nothing gate above turns it into a 409 that no endpoint can clear.
+        if result.minted_rows == 0:
+            detail = (
+                f"the data plane numbered none of reference {reference_idx}'s"
+                f" {result.phylogeny_rows} phylogeny rows though all of them were"
+                " unnumbered; nothing was written, so the request can be re-issued"
+            )
+        else:
+            detail = (
+                f"the data plane numbered {result.minted_rows} of reference"
+                f" {reference_idx}'s {result.phylogeny_rows} phylogeny rows. The tree"
+                " now carries a partial numbering, which this endpoint will refuse to"
+                " complete — do NOT re-issue; the rows need repairing directly in the"
+                " lake"
+            )
+        raise HTTPException(status_code=502, detail=detail)
+    return result
+
+
 @router.get(PATH_REFERENCE_EXCLUSION_BY_IDX)
 async def list_reference_exclusions(
     reference_idx: Annotated[int, Field(gt=0)],
@@ -808,8 +911,8 @@ _DOGET_ALLOWED_TABLES = frozenset(
         # constants for the same reason as the block-read pair above.
         ASSEMBLED_SEQUENCE_TABLE,
         ASSEMBLED_SEQUENCE_CHUNKS_TABLE,
-        # Per-subject assembly quality. The one entry here that no route signs —
-        # the exclusion below says what that rests on.
+        # Per-subject assembly quality, signed by the human assembly run mint
+        # (routes/assembly.py) and in-process by the feature-table resolver.
         BIN_QUALITY_TABLE,
     }
 )
@@ -826,12 +929,13 @@ _DOGET_ALLOWED_TABLES = frozenset(
 # `reference_taxonomy_visible`, so external taxonomy reads also go through the
 # exclusion view.
 #
-# `bin_quality` is excluded with no route behind it AT ALL: the feature-table
-# resolver mints its ticket in-process (`runner/_feature_table.py`), the way the
-# adapter and shard-roster resolvers mint theirs, and it is absent from
-# `ASSEMBLY_DOGET_TABLES` too. Excluding it here is therefore what leaves it
-# un-mintable over HTTP by anyone, which
-# `test_doget_bin_quality_not_signable_via_reference_route` pins.
+# `bin_quality` is excluded for the reason the assembly surfaces are: its rows are
+# keyed on one assembly run, and the route that signs it over HTTP is the human
+# assembly run mint (`ASSEMBLY_RUN_DOGET_TABLES`), which authorizes that run's
+# prep_sample first. The feature-table resolver signs it in-process
+# (`runner/_feature_table.py`). Excluding it here keeps a reference-scoped ticket
+# from naming it, which `test_doget_bin_quality_not_signable_via_reference_route`
+# pins.
 _REFERENCE_DOGET_TABLES = _DOGET_ALLOWED_TABLES - frozenset(
     {
         READ_MASKED_TABLE,

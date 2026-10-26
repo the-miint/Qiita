@@ -174,3 +174,48 @@ def build_case5_preflight(tmp_path):
         return db
 
     return _build
+
+
+_AMPLICON_V1_SQLITE_GZ = (
+    Path(__file__).resolve().parent / "cli" / "data" / "good_amplicon_v1.sqlite.gz"
+)
+
+
+@pytest.fixture
+def build_amplicon_preflight(tmp_path):
+    """Build a real kl-run-preflight amplicon SQLite from the committed fixture.
+
+    The amplicon twin of `build_case5_preflight`: ONE builder shared by the ingest
+    CLI's reader tests and the server-side `preflight` reader tests (incl. the
+    CLI-vs-runner parity pin — the runner reads this roster, no route does), so
+    both parse the SAME bytes.
+
+    Decompresses the committed migrated preflight (the artifact Qiita-MIINT consumes —
+    it never migrates a classic prep template) and populates the biosample + project
+    **bioproject** accessions `get_amplicon_sample_info` REQUIRES (left NULL by the
+    fixture, set upstream in production): biosample -> BIO_<name>; each project's
+    bioproject -> PRJNA<external_project_id>. `barcodes_are_rc` overrides the
+    fixture's run-level orientation (it is True, the EMP 515rcbc set).
+    """
+    import gzip
+
+    def _build(
+        *,
+        populate_accessions: bool = True,
+        barcodes_are_rc: bool | None = None,
+        name: str = "amplicon_v1.db",
+    ) -> Path:
+        db = tmp_path / name
+        db.write_bytes(gzip.decompress(_AMPLICON_V1_SQLITE_GZ.read_bytes()))
+        conn = sqlite3.connect(db)
+        if populate_accessions:
+            conn.execute("UPDATE input_sample SET biosample_accession = 'BIO_' || sample_name")
+            conn.execute("UPDATE project SET bioproject_accession = 'PRJNA' || external_project_id")
+        if barcodes_are_rc is not None:
+            # Run-level: amplicon_run carries it; run_amplicon_sample stamps it per row.
+            conn.execute("UPDATE amplicon_run SET barcodes_are_rc = ?", (int(barcodes_are_rc),))
+        conn.commit()
+        conn.close()
+        return db
+
+    return _build

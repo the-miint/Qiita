@@ -1,49 +1,39 @@
 # PacBio ingest (runbook)
 
-**For:** whoever is ingesting a PacBio run (`qiita submit-pacbio-ingest`). Read it
-before the first ingest on a new deploy — three of its behaviours surprise people, and
-one of them (reads duplicated in the lake) is expensive to undo.
+**For:** whoever is loading a PacBio run (`qiita submit-pacbio-ingest`). Read it
+before the first PacBio run at your site — the things below catch people out.
 Not needed for Illumina.
 
-Auth and the general CLI flow are **not** repeated here — see
-[`user-cli-quickstart.md`](user-cli-quickstart.md), whose *Headless / remote hosts
-(carry the PAT)* section is the supported way to authenticate without a browser. This
-runbook covers only what is specific to PacBio.
+This covers only what is different about PacBio. Everything the two platforms
+share — where to run the command, what privileges the submit needs, working from
+a remote machine, the studies and biosamples the pre-flight file has to match,
+building that file, how to retry, and what Illumina's `--force` is — is in [`getting-started.md`](getting-started.md), which these
+examples carry on from.
 
-Paths and identifiers below are from the `qiita-miint.ucsd.edu` deploy; substitute your
-host's checkout path, mounts, and `prep_protocol` indices.
+Paths and protocol numbers below are from the `qiita-miint.ucsd.edu` deploy;
+substitute your own site's.
 
-## Where to run it
+## The run folder has to be readable by Qiita itself
 
-- **The CLI is the `qiita` console script in the deployed venv**:
-  `/home/qiita/qiita-miint/qiita-control-plane/.venv/bin/qiita`. Call the binary
-  **directly** — do *not* wrap it in `uv run`, which tries to sync the project and
-  will fail (or half-succeed) against the qiita-owned checkout when you are another
-  user.
-- **`--run-folder` is a path on the CLUSTER, not on the machine you are typing on.**
-  It is recorded on the ticket and re-opened on a compute node later, so it must name
-  the folder as the cluster sees it, under a directory the deploy configured in
-  `PATH_INGEST_ROOTS` (`/sequencing` here). The control plane checks that at submit
-  and refuses a path outside those roots, naming them — so a wrong path is an error at
-  your terminal rather than a job that fails hours later.
-- **The run folder need not be visible from the machine you type on.** The barcode → BAM
-  glob runs on the control plane (`POST /run-folder/inspect`), which opens the folder
-  as `qiita-api`, an account with a narrower filesystem view than the `qiita-job` that
-  runs the steps. The deploy grants it read on `/sequencing/gcore_runs/**`
-  (`DEPLOY_CHECKLIST.md`, one-time host setup). A **403** from the route means that grant is
-  missing on the tree you named; until it is in place, submit from a node that mounts
-  `/sequencing`.
-- **The pre-flight `.db` still has to be a local file.** `--preflight-blob` is read on the
-  machine running the CLI and base64'd into the request, so off the cluster copy it over
-  first — it is the one input that does not resolve server-side.
-- Workers have no `sudo`.
-- The PAT identifies the Qiita principal regardless of the Unix account, so
-  `sudo -u qiita env QIITA_TOKEN=… qiita …` still acts as the token's owner.
+You do not need to be on a machine that mounts the cluster: Qiita opens the run
+folder itself to find each barcode's BAM. But it opens it as its own account,
+which sees less of the filesystem than the account that later runs the jobs, and
+on this deploy the PacBio drop needs a grant that the Illumina one does not.
+
+If the submit fails at `/run-folder/inspect`, read which failure it is:
+
+- A **403 saying the control plane cannot read this run folder**, naming the
+  account: the grant is missing for the tree you named. Ask your operator to add
+  it; until it is in place, submit from a node that mounts the run folder.
+- A **403 about your own role**: `/run-folder/inspect` is `wet_lab_admin` and
+  above, like the submit itself.
+- A **422**: the path is outside the directories the site allows, or nothing is
+  there. Check the path before asking for a grant.
 
 ## Submit
 
 ```bash
-qiita --base-url https://qiita-miint.ucsd.edu/ submit-pacbio-ingest \
+qiita submit-pacbio-ingest \
     --run-folder /sequencing/gcore_runs/Knightlab/r84137_20260623_040006 \
     --preflight-blob ./r84137_preflight.db \
     --instrument-run-id r84137_20260623_040006 \
@@ -51,36 +41,36 @@ qiita --base-url https://qiita-miint.ucsd.edu/ submit-pacbio-ingest \
     --prep-protocol-idx 3
 ```
 
-- **`--instrument-run-id` is free-form.** PacBio has no `RunInfo.xml` to read it from,
-  so nothing derives or validates it; the run-folder basename is the natural value.
-- **`--prep-protocol-idx` is *not* validated against the platform.** A wrong value is
-  accepted silently, so you have to get it right yourself. The command only accepts
-  `pacbio_absquant` / `pacbio_metag` sheets, and both are metagenomics — so the answer
-  is always the **`long_read_metagenomics`** protocol, never `long_read_amplicon`, no
-  matter what the sheet filename suggests. Look the idx up on your deploy rather than
-  copying a number (`qiita prep-protocol list`); on `qiita-miint` it is **3**, and the
-  amplicon protocol you must *not* pick is 5.
-- **Retry by re-running the identical command.** Run and pool are find-or-create, the
-  roster is create-missing, and already-ingested samples come back `skipped`. Pool
-  identity is the SHA-256 of the uploaded pre-flight bytes, so a retry has to submit the
-  same file content — different bytes mint a second pool instead of converging.
-- **Never use `--force` to retry.** It re-ingests, duplicating the reads in the lake.
+- **You have to supply `--instrument-run-id` yourself.** Illumina run folders
+  carry the run's name in a file Qiita reads; PacBio's do not. Nothing checks
+  what you type, so use the run folder's own name.
+- **Which protocol to pick is a wet-lab call, and nothing here checks it.** The
+  command accepts only the two PacBio sheet types, and the convention at this
+  site is that both are metagenomics — so `long_read_metagenomics`, not the
+  amplicon protocol, whatever the sheet is called. Confirm that with whoever
+  prepped the run rather than reading it off this page, then look the number up
+  on your own site with `qiita prep-protocol list`. Qiita stores whatever number
+  you give it, and a wrong one mislabels every prep_sample in the run.
+- **Re-running the identical command retries the submit**, but it is not free.
+  The run and pool are reused and missing prep_samples are added, and any whose
+  job is still running are reported `skipped`. A prep_sample whose job *failed*
+  is re-driven with `qiita ticket run <idx>` instead; a fresh job for it stops
+  and says so if the failed one had already numbered its reads. The pool is
+  recognised by the exact contents of the pre-flight file, so submit the same
+  file again. Changed contents under the same file name are refused; under a new
+  name they create a second pool. A prep_sample whose reads a completed job
+  already loaded is reported `skipped` too, naming that job.
 
-## `pool-completion` does not report on ingest
+## `pool-completion` will not tell you the load finished
 
-Its per-sample buckets report host-MASKING, and `demux_state` keys on
-**`bcl-convert`**. PacBio ingest mints `bam-to-parquet`, which is neither, so a
-freshly-ingested PacBio pool reads `samples_not_submitted: N` and
-`demux_state: not_submitted` — that means *"not masked yet,"* not a failure.
+It reports on two later things, not on the load. Its per-sequenced_sample counts are
+about read masking — PacBio runs **are** host-filtered, exactly like Illumina
+ones, via `qiita submit-host-filter-pool`; you just have not done it yet at this
+point. Its `demux_state` is about Illumina demultiplexing, which PacBio never
+does at all, because the instrument delivers the reads already demultiplexed.
 
-PacBio never mints a `bcl-convert` ticket, so **`fully_processed` is permanently
-`false` for a PacBio pool.** Use `complete` as the done signal instead.
-
-Watch an ingest with the ticket commands:
-
-```bash
-qiita ticket list --active
-qiita ticket status <idx>
-qiita ticket logs <idx> --step-index 0
-qiita ticket run <idx>        # re-dispatch a FAILED ticket in place
-```
+So a freshly loaded PacBio pool reads `samples_not_submitted: N` and
+`demux_state: not_submitted`. The first means "not masked yet" and changes once
+you mask; the second never changes. Because it never changes, **`fully_processed`
+stays `false` for a PacBio pool forever** — use `complete` as the signal that the
+sequenced_samples are done instead.

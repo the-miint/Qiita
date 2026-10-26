@@ -15,11 +15,14 @@ from typing import NamedTuple
 
 import pytest
 from qiita_common.api_paths import (
+    URL_ADMIN_PRINCIPAL_LOOKUP_BY_EMAIL,
     URL_AUTH_WHOAMI,
     URL_BIOSAMPLE_BY_IDX,
     URL_BIOSAMPLE_BY_STUDY,
+    URL_BIOSAMPLE_BY_STUDY_UNIQUE_FIELD,
     URL_BIOSAMPLE_GLOBAL_FIELD_LIST,
     URL_BIOSAMPLE_LIST_BY_STUDY,
+    URL_BIOSAMPLE_METADATA_BY_STUDY_UNIQUE_FIELD,
     URL_BIOSAMPLE_STUDY_FIELD_BY_STUDY,
     URL_PREP_PROTOCOL_PREFIX,
     URL_PREP_SAMPLE_GLOBAL_FIELD_LIST,
@@ -41,7 +44,9 @@ from qiita_common.api_paths import (
     URL_WORK_TICKET_PREFIX,
     URL_WORK_TICKET_STEP_LOGS,
 )
-from qiita_common.auth_constants import BEARER_PREFIX
+from qiita_common.auth_constants import BEARER_PREFIX, SystemRole
+from qiita_common.models import LEGACY_IDX_RESERVED_CEILING
+from run_preflight.db import ERR_CATEGORY_MISSING_ACCESSION, PlatformSampleInfo
 
 from qiita_control_plane.cli.user import main
 
@@ -264,6 +269,55 @@ def test_ticket_submit_without_mem_gb_omits_resource_override(monkeypatch):
     )
     assert rc == 0
     assert "resource_override" not in captured["json"]
+    assert "on_success" not in captured["json"]
+
+
+def test_ticket_submit_chains_a_follow_on(monkeypatch):
+    """The --then-* flags chain any action as the ticket's follow-on, with an
+    empty context when --then-context-json is omitted."""
+    import httpx as _httpx
+
+    from qiita_control_plane.cli import _common
+
+    captured: dict = {}
+
+    def fake_request(method, url, headers=None, json=None, params=None, timeout=None):
+        captured["json"] = json
+        return _httpx.Response(
+            202,
+            json={"work_ticket_idx": 1, "state": "pending"},
+            request=_httpx.Request(method, url),
+        )
+
+    monkeypatch.setattr(_common.httpx, "request", fake_request)
+    monkeypatch.setenv("QIITA_TOKEN", "qk_test")
+
+    from qiita_control_plane.cli.user import main
+
+    rc = main(
+        [
+            "--base-url",
+            "https://q.example.test",
+            "ticket",
+            "submit",
+            "--action-id",
+            "fastq-to-parquet",
+            "--action-version",
+            "1.1.0",
+            "--prep-sample-idx",
+            "5",
+            "--then-action-id",
+            "next-action",
+            "--then-action-version",
+            "2.0.0",
+        ]
+    )
+    assert rc == 0
+    assert captured["json"]["on_success"] == {
+        "action_id": "next-action",
+        "action_version": "2.0.0",
+        "action_context": {},
+    }
 
 
 def test_ticket_run_posts_to_run_endpoint_with_no_body(monkeypatch):
@@ -467,6 +521,101 @@ def test_study_create_pydantic_validation_error_exits_2(capsys):
     err = capsys.readouterr().err
     assert "invalid StudyCreate" in err
     assert "title" in err
+
+
+def test_study_create_passes_study_idx(monkeypatch):
+    """--study-idx lands in the body as study_idx; who may use it is the
+    server's call."""
+    import httpx as _httpx
+
+    from qiita_control_plane.cli import _common
+
+    captured: dict = {}
+
+    def fake_request(method, url, headers=None, json=None, params=None, timeout=None):
+        captured["json"] = json
+        return _httpx.Response(201, json={"study_idx": 10317}, request=_httpx.Request(method, url))
+
+    monkeypatch.setattr(_common.httpx, "request", fake_request)
+    monkeypatch.setenv("QIITA_TOKEN", "qk_test")
+
+    from qiita_control_plane.cli.user import main
+
+    rc = main(["study", "create", "--title", "T", "--study-idx", "10317"])
+    assert rc == 0
+    assert captured["json"] == {"title": "T", "study_idx": 10317}
+
+
+def test_study_create_rejects_study_idx_outside_reserved_band(capsys):
+    """A --study-idx at or above the reserved ceiling fails StudyCreate
+    client-side, before any request."""
+    from qiita_control_plane.cli.user import main
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(["study", "create", "--title", "T", "--study-idx", str(LEGACY_IDX_RESERVED_CEILING)])
+    assert exc_info.value.code == 2
+    err = capsys.readouterr().err
+    assert "invalid StudyCreate" in err
+    assert "study_idx" in err
+
+
+def test_study_create_owner_email_resolves_owner_idx_before_post(monkeypatch):
+    """--owner-email is looked up through the admin principal lookup, and the
+    principal_idx it returns goes out as owner_idx on the create."""
+    import httpx as _httpx
+
+    from qiita_control_plane.cli import _common
+
+    calls: list = []
+
+    def fake_request(method, url, headers=None, json=None, params=None, timeout=None):
+        calls.append((method, url, json))
+        if url.endswith(URL_ADMIN_PRINCIPAL_LOOKUP_BY_EMAIL):
+            found = {
+                "principal_idx": 77,
+                "system_role": SystemRole.USER,
+                "disabled": False,
+                "retired": False,
+            }
+            return _httpx.Response(200, json=found, request=_httpx.Request(method, url))
+        return _httpx.Response(201, json={}, request=_httpx.Request(method, url))
+
+    monkeypatch.setattr(_common.httpx, "request", fake_request)
+    monkeypatch.setenv("QIITA_TOKEN", "qk_test")
+
+    from qiita_control_plane.cli.user import main
+
+    rc = main(
+        [
+            "--base-url",
+            "https://q.example.test",
+            "study",
+            "create",
+            "--title",
+            "T",
+            "--owner-email",
+            "owner@example.org",
+        ]
+    )
+    assert rc == 0
+    assert calls == [
+        (
+            "POST",
+            f"https://q.example.test{URL_ADMIN_PRINCIPAL_LOOKUP_BY_EMAIL}",
+            {"email": "owner@example.org"},
+        ),
+        ("POST", f"https://q.example.test{URL_STUDY_PREFIX}", {"title": "T", "owner_idx": 77}),
+    ]
+
+
+def test_study_create_rejects_malformed_owner_email(capsys):
+    """A --owner-email that is not an address exits 2 before any request."""
+    from qiita_control_plane.cli.user import main
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(["study", "create", "--title", "T", "--owner-email", "not-an-address"])
+    assert exc_info.value.code == 2
+    assert "not an email address" in capsys.readouterr().err
 
 
 def test_study_create_passes_extra_metadata(monkeypatch):
@@ -2242,6 +2391,33 @@ def test_connection_error_prints_friendly_message_and_exits_1(monkeypatch, capsy
     assert "QIITA_CONTROL_PLANE_URL" in err
 
 
+def test_response_failing_its_model_prints_one_line_and_exits_1(monkeypatch, capsys):
+    """A response a command parses into a model that refuses it (here a
+    principal lookup carrying only principal_idx) is one stderr line naming the
+    model, and exit code 1, not a traceback; the create is never sent."""
+    import httpx as _httpx
+
+    from qiita_control_plane.cli import _common
+    from qiita_control_plane.cli.user import main
+
+    urls: list[str] = []
+
+    def fake_request(method, url, headers=None, json=None, params=None, timeout=None):
+        urls.append(url)
+        return _httpx.Response(200, json={"principal_idx": 77}, request=_httpx.Request(method, url))
+
+    monkeypatch.setattr(_common.httpx, "request", fake_request)
+    monkeypatch.setenv("QIITA_TOKEN", "qk_test")
+
+    rc = main(["study", "create", "--title", "T", "--owner-email", "owner@example.org"])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert len(err.strip().splitlines()) == 1, err
+    assert "invalid PrincipalLookupResponse" in err
+    assert "system_role" in err
+    assert [u for u in urls if u.endswith(URL_STUDY_PREFIX)] == []
+
+
 # ---------------------------------------------------------------------------
 # --base-url http-to-non-localhost guard
 # ---------------------------------------------------------------------------
@@ -2354,6 +2530,25 @@ def _inspect_response(folder: Path, name: str | None = None) -> tuple[int, dict]
     )
 
 
+def _roster_response(*rows: tuple[str, int, int, list[int]]) -> tuple[int, dict]:
+    """A 200 from POST /biosample/resolve-roster, one entry per
+    (item_id, biosample_idx, primary_study_idx, secondary_study_idxs)."""
+    return (
+        200,
+        {
+            "rows": [
+                {
+                    "item_id": item_id,
+                    "biosample_idx": biosample_idx,
+                    "primary_study_idx": primary,
+                    "secondary_study_idxs": secondaries,
+                }
+                for item_id, biosample_idx, primary, secondaries in rows
+            ]
+        },
+    )
+
+
 def _stub_multi_response(monkeypatch, captured: dict, *, responses):
     """Patch httpx.request to return canned ``(status, body)`` responses in
     the order supplied. `captured['requests']` collects every call so a
@@ -2380,6 +2575,8 @@ def _stub_multi_response(monkeypatch, captured: dict, *, responses):
                 f"{method} {url}"
             )
         status, body = queue.pop(0)
+        if isinstance(body, str):  # a non-JSON body, e.g. a proxy's error page
+            return _httpx.Response(status, text=body, request=_httpx.Request(method, url))
         return _httpx.Response(status, json=body, request=_httpx.Request(method, url))
 
     monkeypatch.setattr(_common.httpx, "request", fake_request)
@@ -2413,13 +2610,9 @@ def preflight_stub(monkeypatch, tmp_path):
     so the test controls every per-sample input without a real SQLite schema.
 
     Returns `_install(rows=None, raises=None) -> Path`, writing a marker blob at
-    `tmp_path/preflight.db`. `rows` is a list of 4-tuples matching
-    `get_illumina_sample_info`; `raises` is an exception the accessor raises.
-
-    (It used to also mock `project.human_filtering` and `get_illumina_sample_rows`
-    — the reader read the project's host-filter flag off the blob. That flag is
-    gone: host filtering resolves from sample metadata, not from the pre-flight, so
-    the reader no longer touches either.)
+    `tmp_path/preflight.db`. `rows` is a list of (idx, biosample, primary,
+    secondaries) tuples, returned as the library's `PlatformSampleInfo`; `raises`
+    is an exception the accessor raises.
     """
 
     def _install(
@@ -2444,7 +2637,14 @@ def preflight_stub(monkeypatch, tmp_path):
 
             stub_module.get_illumina_sample_info = _get
         else:
-            stub_module.get_illumina_sample_info = lambda _conn: list(captured_rows)
+            # The library's own record type, so the reader is pinned to its fields.
+            # The secondaries list is passed through uncopied so a test can tell
+            # whether the reader copies it.
+            records = [
+                PlatformSampleInfo(idx, "standard", biosample, primary, secondary, None)
+                for idx, biosample, primary, secondary in captured_rows
+            ]
+            stub_module.get_illumina_sample_info = lambda _conn: list(records)
         monkeypatch.setitem(sys.modules, "run_preflight", stub_module)
         return blob
 
@@ -2456,13 +2656,11 @@ def test_submit_bcl_convert_happy_path_chains_full_flow(
 ):
     """The full bundled flow:
       1. whoami (resolve owner_idx for per-sample composer);
-      2. POST /biosample/lookup-by-accession (every biosample resolves);
-      3. POST /study/lookup-by-accession (every primary + secondary
-         study accession resolves);
-      4. POST /sequencing-run (201);
-      5. POST /sequencing-run/{R}/sequenced-pool (201);
-      6. POST sequenced-sample composer once per preflight row (201);
-      7. POST /work-ticket (202).
+      2. POST /biosample/resolve-roster (every row resolves);
+      3. POST /sequencing-run (201);
+      4. POST /sequencing-run/{R}/sequenced-pool (201);
+      5. POST sequenced-sample composer once per preflight row (201);
+      6. POST /work-ticket (202).
     Pin each leg's URL + body; check the summary echoes per-sample
     results including resolved secondary_study_idxs."""
     import base64 as _b64
@@ -2494,22 +2692,8 @@ def test_submit_bcl_convert_happy_path_chains_full_flow(
             _inspect_response(folder),
             # whoami
             (200, {"kind": "human", "principal_idx": 99}),
-            # biosample lookup-by-accession
-            (
-                200,
-                {
-                    "resolved": {"SAMN001": 41, "SAMN002": 42, "SAMN003": 43},
-                    "missing": [],
-                },
-            ),
-            # study lookup-by-accession
-            (
-                200,
-                {
-                    "resolved": {"PRJ001": 7, "PRJ002": 8, "PRJ003": 9},
-                    "missing": [],
-                },
-            ),
+            # resolve-roster
+            _roster_response(("1", 41, 7, []), ("2", 42, 7, [8]), ("3", 43, 8, [7, 9])),
             # sequencing-run, sequenced-pool
             (201, {"sequencing_run_idx": 12}),
             (201, {"sequenced_pool_idx": 34}),
@@ -2539,9 +2723,9 @@ def test_submit_bcl_convert_happy_path_chains_full_flow(
     )
     assert rc == 0
     requests = captured["requests"]
-    # run-folder-inspect + whoami + biosample-lookup + study-lookup + run + pool
-    # + roster-GET + 3 samples + ticket = 11 calls.
-    assert len(requests) == 11
+    # run-folder-inspect + whoami + resolve-roster + run + pool + roster-GET
+    # + 3 samples + ticket = 10 calls.
+    assert len(requests) == 10
 
     # Leg 1: run-folder inspect. The CLI no longer opens the run folder itself,
     # so this is the first call and the instrument identity comes back in its
@@ -2554,49 +2738,55 @@ def test_submit_bcl_convert_happy_path_chains_full_flow(
     assert requests[1]["method"] == "GET"
     assert requests[1]["url"].endswith("/auth/whoami")
 
-    # Leg 3: biosample lookup-by-accession with the deduped preflight
-    # accessions (here the same as row order since each is unique).
+    # Leg 3: resolve-roster, one row per preflight row keyed by illumina_sample_idx.
     assert requests[2]["method"] == "POST"
-    assert requests[2]["url"].endswith("/biosample/lookup-by-accession")
+    assert requests[2]["url"].endswith("/biosample/resolve-roster")
     assert requests[2]["json"] == {
-        "accessions": ["SAMN001", "SAMN002", "SAMN003"],
-        "accession_field": "biosample_accession",
+        "rows": [
+            {
+                "item_id": "1",
+                "biosample_accession": "SAMN001",
+                "primary_project_accession": "PRJ001",
+                "secondary_project_accessions": [],
+            },
+            {
+                "item_id": "2",
+                "biosample_accession": "SAMN002",
+                "primary_project_accession": "PRJ001",
+                "secondary_project_accessions": ["PRJ002"],
+            },
+            {
+                "item_id": "3",
+                "biosample_accession": "SAMN003",
+                "primary_project_accession": "PRJ002",
+                "secondary_project_accessions": ["PRJ001", "PRJ003"],
+            },
+        ]
     }
 
-    # Leg 4: study lookup-by-accession with the order-preserving dedup
-    # of every row's primary + secondary project accessions. First
-    # appearance order: row1 primary PRJ001, row2 secondary PRJ002,
-    # row3 secondary PRJ003 (PRJ001 and PRJ002 already seen).
+    # Leg 4: POST /sequencing-run.
     assert requests[3]["method"] == "POST"
-    assert requests[3]["url"].endswith("/study/lookup-by-accession")
+    assert requests[3]["url"] == f"https://q.example.test{URL_SEQUENCING_RUN_PREFIX}"
     assert requests[3]["json"] == {
-        "accessions": ["PRJ001", "PRJ002", "PRJ003"],
-        "accession_field": "bioproject_accession",
-    }
-
-    # Leg 5: POST /sequencing-run.
-    assert requests[4]["method"] == "POST"
-    assert requests[4]["url"] == f"https://q.example.test{URL_SEQUENCING_RUN_PREFIX}"
-    assert requests[4]["json"] == {
         "instrument_run_id": "230101_A00123_0001_BHXYZ",
         "platform": "illumina",
         "instrument_model": "Illumina NovaSeq 6000",
     }
 
-    # Leg 6: POST /sequencing-run/{R}/sequenced-pool. Blob round-trips
+    # Leg 5: POST /sequencing-run/{R}/sequenced-pool. Blob round-trips
     # byte-equal through base64.
-    assert requests[5]["method"] == "POST"
-    assert requests[5]["url"] == (
+    assert requests[4]["method"] == "POST"
+    assert requests[4]["url"] == (
         f"https://q.example.test{URL_SEQUENCING_RUN_SEQUENCED_POOL.format(sequencing_run_idx=12)}"
     )
-    pool_body = requests[5]["json"]
+    pool_body = requests[4]["json"]
     assert pool_body["run_preflight_filename"] == "preflight.db"
     assert _b64.b64decode(pool_body["run_preflight_blob"]) == blob.read_bytes()
 
-    # Leg 7: GET the pool roster (create-missing) — empty here, so all 3 samples
+    # Leg 6: GET the pool roster (create-missing) — empty here, so all 3 samples
     # are created next.
-    assert requests[6]["method"] == "GET"
-    assert requests[6]["url"].endswith("/sequencing-run/12/sequenced-pool/34/sequenced-sample/list")
+    assert requests[5]["method"] == "GET"
+    assert requests[5]["url"].endswith("/sequencing-run/12/sequenced-pool/34/sequenced-sample/list")
 
     # Legs 7..9: one sequenced-sample composer POST per preflight row.
     # secondary_study_idxs preserves the row's secondary order (after
@@ -2609,7 +2799,7 @@ def test_submit_bcl_convert_happy_path_chains_full_flow(
     for offset, (illumina, biosample_idx, primary_study, secondary_studies) in enumerate(
         expected_per_sample
     ):
-        req = requests[7 + offset]
+        req = requests[6 + offset]
         assert req["method"] == "POST"
         assert req["url"].endswith("/sequencing-run/12/sequenced-pool/34/sequenced-sample")
         assert req["json"] == {
@@ -2621,10 +2811,10 @@ def test_submit_bcl_convert_happy_path_chains_full_flow(
             "secondary_study_idxs": secondary_studies,
         }
 
-    # Leg 11: POST /work-ticket.
-    assert requests[10]["method"] == "POST"
-    assert requests[10]["url"] == f"https://q.example.test{URL_WORK_TICKET_PREFIX}"
-    ticket_body = requests[10]["json"]
+    # Leg 10: POST /work-ticket.
+    assert requests[9]["method"] == "POST"
+    assert requests[9]["url"] == f"https://q.example.test{URL_WORK_TICKET_PREFIX}"
+    ticket_body = requests[9]["json"]
     assert ticket_body["action_id"] == "bcl-convert"
     assert ticket_body["action_version"] == "1.0.0"
     assert ticket_body["scope_target"] == {
@@ -2659,86 +2849,12 @@ def test_submit_bcl_convert_happy_path_chains_full_flow(
     assert summary["sequenced_samples"][2]["secondary_study_idxs"] == [7, 9]
 
 
-@pytest.mark.parametrize(
-    (
-        "biosample_resolved",
-        "biosample_missing",
-        "study_resolved",
-        "study_missing",
-        "expected_substrings",
-    ),
-    [
-        # Biosample misses only — two of three biosample accessions
-        # missing; every study accession resolves. Combined-error block
-        # carries only the biosample sub-section.
-        pytest.param(
-            {"SAMN001": 41},
-            ["SAMN999", "SAMN1000"],
-            {"PRJ001": 7, "PRJ888": 8, "PRJ777": 9},
-            [],
-            (
-                "2 distinct preflight biosample accessions not found in qiita,"
-                " affecting 2 illumina_sample rows",
-                "SAMN999 (illumina_sample_idx=5)",
-                "SAMN1000 (illumina_sample_idx=8)",
-            ),
-            id="biosample_missing_only",
-        ),
-        # Study misses only — every biosample resolves; one secondary
-        # study and one primary study missing. The bullet for the row
-        # with both misses names every offending accession on that row.
-        pytest.param(
-            {"SAMN001": 41, "SAMN999": 42, "SAMN1000": 43},
-            [],
-            {"PRJ001": 7},
-            ["PRJ888", "PRJ777"],
-            (
-                "2 distinct preflight study accessions not found in qiita,"
-                " affecting 2 illumina_sample rows",
-                "PRJ888 (illumina_sample_idx=5)",
-                "PRJ777 (illumina_sample_idx=8)",
-            ),
-            id="study_missing_only",
-        ),
-        # Both classes missing — combined block carries both labelled
-        # sub-sections so the operator fixes everything in one pass.
-        pytest.param(
-            {"SAMN001": 41},
-            ["SAMN999", "SAMN1000"],
-            {"PRJ001": 7},
-            ["PRJ888", "PRJ777"],
-            (
-                "2 distinct preflight biosample accessions not found in qiita,"
-                " affecting 2 illumina_sample rows",
-                "SAMN999 (illumina_sample_idx=5)",
-                "2 distinct preflight study accessions not found in qiita,"
-                " affecting 2 illumina_sample rows",
-                "PRJ777 (illumina_sample_idx=8)",
-            ),
-            id="both_classes_missing",
-        ),
-    ],
-)
-def test_submit_bcl_convert_fails_fast_when_accessions_missing(
-    monkeypatch,
-    tmp_path,
-    capsys,
-    preflight_stub,
-    biosample_resolved,
-    biosample_missing,
-    study_resolved,
-    study_missing,
-    expected_substrings,
+def test_submit_bcl_convert_fails_fast_when_rows_do_not_resolve(
+    monkeypatch, tmp_path, capsys, preflight_stub
 ):
-    """When either lookup-by-accession response carries a non-empty
-    `missing` list, the CLI prints a combined stderr block naming the
-    offending preflight rows for each class and exits 1 with no
-    sequencing-run / sequenced-pool / sequenced-sample / ticket POSTs.
-
-    Parametrized over biosample-missing-only, study-missing-only, and
-    both-missing — they share the same bail mechanics, so one body
-    drives every case.
-    """
+    """A resolve-roster 422 prints the route's message and each problem against
+    the sheet's own row label, and exits 1 before any run, pool, sample or ticket
+    is created."""
     from qiita_control_plane.cli.user import main
 
     folder = _seed_bcl_folder(tmp_path, "230101_A00123_0001_BHXYZ")
@@ -2758,8 +2874,19 @@ def test_submit_bcl_convert_fails_fast_when_accessions_missing(
             # run-folder inspect (RunInfo.xml is read server-side now)
             _inspect_response(folder),
             (200, {"kind": "human", "principal_idx": 99}),
-            (200, {"resolved": biosample_resolved, "missing": biosample_missing}),
-            (200, {"resolved": study_resolved, "missing": study_missing}),
+            (
+                422,
+                {
+                    "detail": {
+                        "message": "2 of 3 roster rows did not resolve",
+                        "problems": [
+                            {"item_id": "5", "message": "no biosample has accession 'SAMN999'"},
+                            {"item_id": "5", "message": "no study has accession 'PRJ888'"},
+                            {"item_id": "8", "message": "no study has accession 'PRJ777'"},
+                        ],
+                    }
+                },
+            ),
         ],
     )
 
@@ -2776,12 +2903,56 @@ def test_submit_bcl_convert_fails_fast_when_accessions_missing(
             ]
         )
     assert exc_info.value.code == 1
+    assert capsys.readouterr().err.splitlines() == [
+        "error: 2 of 3 roster rows did not resolve:",
+        "  - illumina_sample_idx=5: no biosample has accession 'SAMN999'",
+        "  - illumina_sample_idx=5: no study has accession 'PRJ888'",
+        "  - illumina_sample_idx=8: no study has accession 'PRJ777'",
+        "fix the registry or the preflight and re-run.",
+    ]
+    # inspect + whoami + resolve-roster; no side-effecting call was made.
+    assert len(captured["requests"]) == 3
+
+
+@pytest.mark.parametrize(
+    "body",
+    [{"detail": [{"loc": ["body", "rows"], "msg": "bad", "type": "x"}]}, "<html>422</html>"],
+    ids=["request-shape", "non-json"],
+)
+def test_submit_bcl_convert_reraises_a_non_roster_422(
+    monkeypatch, tmp_path, capsys, preflight_stub, body
+):
+    """A 422 that is not a roster verdict (a request-shape refusal, or a non-JSON
+    body) is not reported as unresolved rows; it surfaces as the HTTP error it is."""
+    from qiita_control_plane.cli.user import main
+
+    folder = _seed_bcl_folder(tmp_path, "230101_A00123_0001_BHXYZ")
+    blob = preflight_stub(rows=[(1, "SAMN001", "PRJ001", [])])
+    captured: dict = {}
+    _stub_multi_response(
+        monkeypatch,
+        captured,
+        responses=[
+            _inspect_response(folder),
+            (200, {"kind": "human", "principal_idx": 99}),
+            (422, body),
+        ],
+    )
+    rc = main(
+        [
+            "submit-bcl-convert",
+            "--bcl-input-dir",
+            str(folder),
+            "--preflight-blob",
+            str(blob),
+            "--prep-protocol-idx",
+            "7",
+        ]
+    )
+    assert rc != 0
     err = capsys.readouterr().err
-    for fragment in expected_substrings:
-        assert fragment in err, f"expected {fragment!r} in stderr; got:\n{err}"
-    # No write-side legs ran — whoami + both lookups are the only calls.
-    # inspect + whoami + the two lookups; no side-effecting call was made.
-    assert len(captured["requests"]) == 4
+    assert "http error 422" in err
+    assert "roster rows did not resolve" not in err
 
 
 def test_submit_bcl_convert_rejects_preflight_without_illumina_samples(
@@ -2837,13 +3008,41 @@ def test_submit_bcl_convert_rejects_non_sqlite_preflight(tmp_path, capsys, prefl
     assert "preflight query failed" in err
 
 
-def test_submit_bcl_convert_dedups_repeated_accessions_in_lookup(
+def test_submit_bcl_convert_surfaces_missing_accession_refusal(tmp_path, capsys, preflight_stub):
+    """The library refuses a row missing a required accession; its message,
+    which names the offenders, reaches the operator verbatim."""
+    from qiita_control_plane.cli.user import main
+
+    folder = _seed_bcl_folder(tmp_path, "230101_A00123_0001_BHXYZ")
+    blob = preflight_stub(
+        raises=ValueError(
+            f"{ERR_CATEGORY_MISSING_ACCESSION}: illumina_sample_idx=3 (biosample_accession)"
+        ),
+    )
+    with pytest.raises(SystemExit) as exc_info:
+        main(
+            [
+                "submit-bcl-convert",
+                "--bcl-input-dir",
+                str(folder),
+                "--preflight-blob",
+                str(blob),
+                "--prep-protocol-idx",
+                "7",
+            ]
+        )
+    assert exc_info.value.code == 2
+    err = capsys.readouterr().err
+    assert "illumina_sample_idx=3 (biosample_accession)" in err
+    assert "verify the file is a kl-run-preflight SQLite" not in err
+
+
+def test_submit_bcl_convert_resolves_replicate_rows_separately(
     monkeypatch, tmp_path, preflight_stub
 ):
     """Two preflight rows pointing at the same biosample_accession and
-    primary_project_accession (replicates) → the lookup bodies carry
-    each accession once; both rows still get their own sequenced-sample
-    POST."""
+    primary_project_accession (replicates) → each is its own roster row, and
+    each gets its own sequenced-sample POST."""
     from qiita_control_plane.cli.user import main
 
     folder = _seed_bcl_folder(tmp_path, "230101_A00123_0001_BHXYZ")
@@ -2864,8 +3063,7 @@ def test_submit_bcl_convert_dedups_repeated_accessions_in_lookup(
             # run-folder inspect (RunInfo.xml is read server-side now)
             _inspect_response(folder),
             (200, {"kind": "human", "principal_idx": 99}),
-            (200, {"resolved": {"SAMN001": 41}, "missing": []}),
-            (200, {"resolved": {"PRJ001": 7}, "missing": []}),
+            _roster_response(("1", 41, 7, []), ("2", 41, 7, [])),
             (201, {"sequencing_run_idx": 12}),
             (201, {"sequenced_pool_idx": 34}),
             (200, {"samples": []}),  # pool roster GET (create-missing)
@@ -2887,13 +3085,9 @@ def test_submit_bcl_convert_dedups_repeated_accessions_in_lookup(
         ]
     )
     assert rc == 0
-    # Each lookup body carries its accession exactly once.
-    assert _bodies_for(captured, "/biosample/lookup-by-accession") == [
-        {"accessions": ["SAMN001"], "accession_field": "biosample_accession"}
-    ]
-    assert _bodies_for(captured, "/study/lookup-by-accession") == [
-        {"accessions": ["PRJ001"], "accession_field": "bioproject_accession"}
-    ]
+    # One roster row per preflight row; the route dedups its own lookups.
+    (roster_body,) = _bodies_for(captured, "/biosample/resolve-roster")
+    assert [r["item_id"] for r in roster_body["rows"]] == ["1", "2"]
     # Both rows still produce a sequenced-sample composer POST with the
     # row's distinct illumina_sample_idx.
     sample_bodies = _bodies_for(captured, "/sequenced-sample")
@@ -2927,8 +3121,7 @@ def test_submit_bcl_convert_reports_reused_when_run_post_returns_200(
             # run-folder inspect (RunInfo.xml is read server-side now)
             _inspect_response(folder),
             (200, {"kind": "human", "principal_idx": 99}),
-            (200, {"resolved": {"SAMN001": 41}, "missing": []}),
-            (200, {"resolved": {"PRJ001": 7}, "missing": []}),
+            _roster_response(("1", 41, 7, [])),
             (200, {"sequencing_run_idx": 12}),
             (200, {"sequenced_pool_idx": 34}),
             (200, {"samples": []}),  # pool roster GET (create-missing)
@@ -2974,8 +3167,7 @@ def test_submit_bcl_convert_reuses_existing_roster_samples(
             # run-folder inspect (RunInfo.xml is read server-side now)
             _inspect_response(folder),
             (200, {"kind": "human", "principal_idx": 99}),
-            (200, {"resolved": {"SAMN001": 41}, "missing": []}),
-            (200, {"resolved": {"PRJ001": 7}, "missing": []}),
+            _roster_response(("1", 41, 7, [])),
             (200, {"sequencing_run_idx": 12}),
             (200, {"sequenced_pool_idx": 34}),
             # roster already has item "1" (biosample_idx matches the resolved 41).
@@ -3146,10 +3338,8 @@ def test_submit_bcl_convert_surfaces_a_run_folder_rejection(
 
 
 def test__read_preflight_rows_round_trips_library_tuples(preflight_stub):
-    """Tests the case where the reader wraps `get_illumina_sample_info`
-    4-tuples into `_PreflightRow` instances — illumina_sample_idx is
-    cast to int and secondary_project_accessions is copied into a fresh
-    list."""
+    """The reader wraps each `PlatformSampleInfo` into a `_PreflightRow`, copying
+    secondary_project_accessions into a fresh list."""
     import argparse
 
     from qiita_control_plane.cli.user import _PreflightRow, _read_preflight_rows
@@ -3172,6 +3362,74 @@ def test__read_preflight_rows_round_trips_library_tuples(preflight_stub):
     assert rows[0].secondary_project_accessions is not library_secondaries
 
 
+_ILLUMINA_CSV = Path(__file__).resolve().parent / "data" / "good_standard_metagv100.csv"
+
+
+@pytest.fixture
+def illumina_preflight(tmp_path):
+    """Build a real Illumina pre-flight with run_preflight's own CSV loader (the
+    sheet is kl-run-preflight's `good_standard_metagv100_wo_replicates.csv`), so
+    the reader meets the true schema and the real `get_illumina_sample_info`.
+
+    `biosample` is the SQL expression for every sample's biosample accession;
+    the project's bioproject is PRJNA<external_project_id>.
+    """
+    from run_preflight.legacy.api import migrate_legacy_csv_to_db_file
+
+    def _build(biosample: str = "'BIO_' || sample_name") -> Path:
+        db = tmp_path / "illumina.db"
+        migrate_legacy_csv_to_db_file(str(_ILLUMINA_CSV), str(db))
+        conn = sqlite3.connect(db)
+        conn.execute(f"UPDATE input_sample SET biosample_accession = {biosample}")
+        conn.execute("UPDATE project SET bioproject_accession = 'PRJNA' || external_project_id")
+        conn.commit()
+        conn.close()
+        return db
+
+    return _build
+
+
+def test__read_preflight_rows_reads_a_real_preflight(illumina_preflight):
+    import argparse
+
+    from qiita_control_plane.cli.user import _read_preflight_rows
+
+    rows = _read_preflight_rows(illumina_preflight(), argparse.ArgumentParser())
+    assert [r.biosample_accession for r in rows] == [
+        "BIO_sample.1",
+        "BIO_sample.2",
+        "BIO_sample.3",
+    ]
+    assert {r.primary_project_accession for r in rows} == {"PRJNA99999"}
+    assert all(r.secondary_project_accessions == [] for r in rows)
+
+
+@pytest.mark.parametrize(
+    ("biosample", "expected"),
+    [
+        ("NULL", "(biosample_accession)"),
+        ("''", "blank or padded biosample_accession"),
+        ("'  '", "blank or padded biosample_accession"),
+        ("' BIO_x '", "blank or padded biosample_accession"),
+    ],
+)
+def test__read_preflight_rows_refuses_a_missing_or_malformed_accession(
+    illumina_preflight, capsys, biosample, expected
+):
+    """A NULL accession is refused by the library, a blank or padded one by the
+    reader; either way the operator sees the row, not a traceback."""
+    import argparse
+
+    from qiita_control_plane.cli.user import _read_preflight_rows
+
+    with pytest.raises(SystemExit) as exc_info:
+        _read_preflight_rows(illumina_preflight(biosample), argparse.ArgumentParser())
+    assert exc_info.value.code == 2
+    err = capsys.readouterr().err
+    assert expected in err
+    assert "illumina_sample_idx" in err
+
+
 def test_submit_bcl_convert_records_no_host_refs(monkeypatch, tmp_path, capsys, preflight_stub):
     """bcl-convert only demultiplexes the run: no sequenced-sample composer POST
     carries a host reference, and the summary carries no host-filter intent either.
@@ -3191,8 +3449,7 @@ def test_submit_bcl_convert_records_no_host_refs(monkeypatch, tmp_path, capsys, 
             # run-folder inspect (RunInfo.xml is read server-side now)
             _inspect_response(folder),
             (200, {"kind": "human", "principal_idx": 99}),  # whoami
-            (200, {"resolved": {"SAMN001": 41, "SAMN002": 42}, "missing": []}),  # biosample
-            (200, {"resolved": {"PRJ001": 70}, "missing": []}),  # study
+            _roster_response(("1", 41, 70, []), ("2", 42, 70, [])),
             (201, {"sequencing_run_idx": 12}),
             (201, {"sequenced_pool_idx": 34}),
             (200, {"samples": []}),  # pool roster GET (create-missing)
@@ -3894,7 +4151,8 @@ def test_submit_host_filter_pool_minimap2_ref_missing_minimap2_index_no_posts(mo
 def test_submit_host_filter_pool_unresolved_sample_aborts_no_posts(monkeypatch, capsys):
     """One sample the server could not resolve (no host_taxon_id) aborts the whole
     submission with zero POSTs, and the message names the sample and points at the
-    backfill. Refusing beats masking it against the wrong thing — or nothing."""
+    backfill and at the per-biosample patch. Refusing beats masking it against the
+    wrong thing — or nothing."""
     captured: dict = {}
     _stub_multi_response(
         monkeypatch,
@@ -3911,6 +4169,7 @@ def test_submit_host_filter_pool_unresolved_sample_aborts_no_posts(monkeypatch, 
     assert "no resolvable host" in err
     assert "11" in err
     assert "backfill host-taxon-id" in err
+    assert "patch-metadata-by-unique-field" in err
     assert not [r for r in captured["requests"] if r["method"] == "POST"]
 
 
@@ -5279,3 +5538,246 @@ def test_submit_align_pool_server_refusal_is_surfaced(monkeypatch, capsys):
         responses=[(409, {"detail": "samples already have an alignment gate"})],
     )
     assert _run_submit_align_pool() != 0
+
+
+# ---------------------------------------------------------------------------
+# qiita biosample get-by-unique-field / patch-metadata-by-unique-field
+# ---------------------------------------------------------------------------
+
+
+_BIOSAMPLE_BY_UNIQUE_FIELD_RESPONSE = {"biosample_idx": 99, "local_metadata": {}}
+_BIOSAMPLE_METADATA_WRITE_RESPONSE = {"biosample_idx": 99, "results": {}}
+
+_UNIQUE_FIELD_ARGS = [
+    "--study-idx",
+    "7",
+    "--unique-field-display-name",
+    "host subject id",
+    "--unique-field-value",
+    "HS-0042",
+]
+
+
+def test_biosample_get_by_unique_field(monkeypatch):
+    """The read posts the identifying pair as the whole body, so the value
+    never reaches a URL; the study idx is the only thing filling the path."""
+    from qiita_control_plane.cli.user import main
+
+    captured: dict = {}
+    _stub_post(monkeypatch, captured, response_json=_BIOSAMPLE_BY_UNIQUE_FIELD_RESPONSE, status=200)
+
+    rc = main(
+        ["--base-url", "https://q.example.test", "biosample", "get-by-unique-field"]
+        + _UNIQUE_FIELD_ARGS
+    )
+
+    assert rc == 0
+    assert captured["method"] == "POST"
+    assert captured["url"] == (
+        f"https://q.example.test{URL_BIOSAMPLE_BY_STUDY_UNIQUE_FIELD.format(study_idx=7)}"
+    )
+    assert captured["json"] == {
+        "unique_field_display_name": "host subject id",
+        "unique_field_value": "HS-0042",
+    }
+
+
+def test_biosample_patch_metadata_by_unique_field(monkeypatch):
+    """The write PATCHes the identifying pair alongside the metadata dict the
+    repeated KEY=VALUE flags fold into."""
+    from qiita_control_plane.cli.user import main
+
+    captured: dict = {}
+    _stub_post(monkeypatch, captured, response_json=_BIOSAMPLE_METADATA_WRITE_RESPONSE, status=200)
+
+    rc = main(
+        ["--base-url", "https://q.example.test", "biosample", "patch-metadata-by-unique-field"]
+        + _UNIQUE_FIELD_ARGS
+        + [
+            "--metadata",
+            "geographic location (latitude)=32.87",
+            "--metadata",
+            "collection date=2026-03-04",
+        ]
+    )
+
+    assert rc == 0
+    assert captured["method"] == "PATCH"
+    assert captured["url"] == (
+        f"https://q.example.test{URL_BIOSAMPLE_METADATA_BY_STUDY_UNIQUE_FIELD.format(study_idx=7)}"
+    )
+    assert captured["json"] == {
+        "unique_field_display_name": "host subject id",
+        "unique_field_value": "HS-0042",
+        "metadata": {
+            "geographic location (latitude)": "32.87",
+            "collection date": "2026-03-04",
+        },
+    }
+
+
+def test_biosample_patch_metadata_by_unique_field_value_containing_equals(monkeypatch):
+    """Only the first '=' splits a KEY=VALUE entry, so a value carrying one
+    survives intact rather than being truncated or rejected."""
+    from qiita_control_plane.cli.user import main
+
+    captured: dict = {}
+    _stub_post(monkeypatch, captured, response_json=_BIOSAMPLE_METADATA_WRITE_RESPONSE, status=200)
+
+    rc = main(
+        ["--base-url", "https://q.example.test", "biosample", "patch-metadata-by-unique-field"]
+        + _UNIQUE_FIELD_ARGS
+        + ["--metadata", "note=a=b"]
+    )
+
+    assert rc == 0
+    assert captured["json"]["metadata"] == {"note": "a=b"}
+
+
+def test_biosample_patch_metadata_by_unique_field_duplicate_key_exits_2(monkeypatch, capsys):
+    """A repeated KEY is a typo, not a last-wins overwrite: the CLI refuses
+    before any request goes out."""
+    from qiita_control_plane.cli.user import main
+
+    captured: dict = {}
+    _stub_post(monkeypatch, captured, response_json=_BIOSAMPLE_METADATA_WRITE_RESPONSE, status=200)
+
+    with pytest.raises(SystemExit) as exc:
+        main(
+            ["--base-url", "https://q.example.test", "biosample", "patch-metadata-by-unique-field"]
+            + _UNIQUE_FIELD_ARGS
+            + ["--metadata", "depth=1", "--metadata", "depth=2"]
+        )
+
+    assert exc.value.code == 2
+    assert captured["requests"] == []
+    err = capsys.readouterr().err
+    assert "--metadata" in err
+    assert "repeated" in err
+
+
+def test_biosample_patch_metadata_by_unique_field_global_internal_names_opt_in(monkeypatch):
+    """Tests the case where the opt-in is omitted and where it is passed:
+    omitted it stays off the wire so the server default applies; passed it
+    travels as true."""
+    from qiita_control_plane.cli.user import main
+
+    captured: dict = {}
+    _stub_post(monkeypatch, captured, response_json=_BIOSAMPLE_METADATA_WRITE_RESPONSE, status=200)
+
+    base = (
+        [
+            "--base-url",
+            "https://q.example.test",
+            "biosample",
+            "patch-metadata-by-unique-field",
+        ]
+        + _UNIQUE_FIELD_ARGS
+        + ["--metadata", "host_taxon_id=9606"]
+    )
+
+    assert main(base) == 0
+    assert "global_internal_names" not in captured["json"]
+
+    assert main(base + ["--global-internal-names"]) == 0
+    assert captured["json"]["global_internal_names"] is True
+
+
+def test_biosample_patch_metadata_by_unique_field_requires_metadata(monkeypatch, capsys):
+    """The write has nothing to do without at least one metadata entry, so the
+    flag is required and its absence exits 2 before any request."""
+    from qiita_control_plane.cli.user import main
+
+    captured: dict = {}
+    _stub_post(monkeypatch, captured, response_json=_BIOSAMPLE_METADATA_WRITE_RESPONSE, status=200)
+
+    with pytest.raises(SystemExit) as exc:
+        main(
+            ["--base-url", "https://q.example.test", "biosample", "patch-metadata-by-unique-field"]
+            + _UNIQUE_FIELD_ARGS
+        )
+
+    assert exc.value.code == 2
+    assert captured["requests"] == []
+    assert "the following arguments are required: --metadata" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("omitted", ["--unique-field-display-name", "--unique-field-value"])
+def test_biosample_get_by_unique_field_requires_identifying_pair(monkeypatch, capsys, omitted):
+    """Tests the case where one half of the identifying pair is missing:
+    either half's absence exits 2 before any request, rather than sending a
+    partial lookup. The flag name on stderr is what separates the argparse
+    refusal from the body-validation one that would otherwise also exit 2."""
+    from qiita_control_plane.cli.user import main
+
+    captured: dict = {}
+    _stub_post(monkeypatch, captured, response_json=_BIOSAMPLE_BY_UNIQUE_FIELD_RESPONSE, status=200)
+
+    # Drop the flag and the value that follows it from the flat argv list.
+    drop_at = _UNIQUE_FIELD_ARGS.index(omitted)
+    kept = _UNIQUE_FIELD_ARGS[:drop_at] + _UNIQUE_FIELD_ARGS[drop_at + 2 :]
+
+    with pytest.raises(SystemExit) as exc:
+        main(["--base-url", "https://q.example.test", "biosample", "get-by-unique-field"] + kept)
+
+    assert exc.value.code == 2
+    assert captured["requests"] == []
+    assert f"the following arguments are required: {omitted}" in capsys.readouterr().err
+
+
+def test_biosample_get_by_unique_field_requires_study_idx(monkeypatch, capsys):
+    """Tests the case where --study-idx is missing: the study is the only
+    thing filling the path template, so its absence must refuse rather than
+    dial a path with a placeholder left unresolved."""
+    from qiita_control_plane.cli.user import main
+
+    captured: dict = {}
+    _stub_post(monkeypatch, captured, response_json=_BIOSAMPLE_BY_UNIQUE_FIELD_RESPONSE, status=200)
+
+    with pytest.raises(SystemExit) as exc:
+        main(
+            [
+                "--base-url",
+                "https://q.example.test",
+                "biosample",
+                "get-by-unique-field",
+                "--unique-field-display-name",
+                "host subject id",
+                "--unique-field-value",
+                "HS-0042",
+            ]
+        )
+
+    assert exc.value.code == 2
+    assert captured["requests"] == []
+    assert "the following arguments are required: --study-idx" in capsys.readouterr().err
+
+
+def test_biosample_get_by_unique_field_rejects_blank_value(monkeypatch, capsys):
+    """Tests the case where the value is present but blank: argparse accepts
+    it, so the refusal comes from body construction instead, and must still
+    land before any request."""
+    from qiita_control_plane.cli.user import main
+
+    captured: dict = {}
+    _stub_post(monkeypatch, captured, response_json=_BIOSAMPLE_BY_UNIQUE_FIELD_RESPONSE, status=200)
+
+    with pytest.raises(SystemExit) as exc:
+        main(
+            [
+                "--base-url",
+                "https://q.example.test",
+                "biosample",
+                "get-by-unique-field",
+                "--study-idx",
+                "7",
+                "--unique-field-display-name",
+                "host subject id",
+                "--unique-field-value",
+                "   ",
+            ]
+        )
+
+    assert exc.value.code == 2
+    assert captured["requests"] == []
+    assert "unique_field_value" in capsys.readouterr().err

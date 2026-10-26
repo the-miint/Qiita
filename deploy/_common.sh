@@ -171,10 +171,10 @@ qiita_native_checkout_from_python() {
 
 # Content hash of a container workflow's IN-REPO build inputs, used by
 # build-sif.sh's idempotency check to detect a changed Apptainer.def /
-# entrypoint.sh / manifest_writer.py — none of which VERIFY_MATCH (binary version
-# only) can see, so such an edit would otherwise be skipped and never reach the
-# host, forcing a manual FORCE=1. Hashes every file under the workflow dir (minus
-# the spec, gitignore, and generated .sif/.rpm) plus _shared/, keyed by
+# entrypoint.sh / manifest_writer.py — none of which VERIFY_MATCH (a regex over
+# VERIFY_CMD's output) can see, so such an edit would otherwise be skipped and
+# never reach the host, forcing a manual FORCE=1. Hashes every file under the
+# workflow dir (minus the spec, gitignore, and generated .sif/.rpm) plus _shared/, keyed by
 # REPO-RELATIVE path so the digest is identical from the operator clone or an
 # INCOMING stage. Deliberately EXCLUDES the vendored SOURCES (the licensed RPM):
 # re-vendoring 4.5.4-1 → 4.5.4-2 must NOT force a rebuild, matching VERIFY_MATCH's
@@ -801,19 +801,31 @@ qiita_lake_data_path() { printf '%s/ducklake' "$1"; }
 
 # --- DuckDB CLI + pgpass plumbing, shared by scripts/lake-*.sh ---------------
 
-# The DuckDB CLI must match the version the data plane links (duckdb crate
-# 1.10504.0 == DuckDB 1.5.4): the ducklake extension is versioned with DuckDB,
-# and a newer one may want to migrate the catalog schema it opens.
-QIITA_DUCKDB_VERSION="1.5.4"
+# The DuckDB CLI the lake scripts require — held equal to the data plane's `duckdb`
+# crate by qiita-common/tests/test_duckdb_version_sync.py.
+QIITA_DUCKDB_VERSION="1.5.5"
 
-# Resolve the duckdb CLI into DUCKDB_BIN, or exit with install instructions.
+# Resolve the duckdb CLI into DUCKDB_BIN and require exactly v${QIITA_DUCKDB_VERSION},
+# or exit with install instructions. Exact, because the CLI opens the data plane's
+# catalog with the ducklake extension of its own version — a newer one may migrate
+# the catalog schema under the running data plane — and lake-shell LOADs the miint
+# staged for its own version. A binary that reports no version is refused too.
 # Two install sites because the callers run as different accounts: a human with
 # a home, or a service account (qiita-data) whose home is /dev/null.
 qiita_resolve_duckdb_bin() {
     DUCKDB_BIN="${QIITA_DUCKDB_BIN:-$(command -v duckdb || true)}"
-    [ -n "${DUCKDB_BIN}" ] && return 0
+    local problem reported
+    if [ -z "${DUCKDB_BIN}" ]; then
+        problem="no duckdb CLI on PATH."
+    else
+        # `duckdb --version` prints e.g. `v1.5.5 (Variegata) d8cdaa33fd`. stderr is
+        # kept, so a binary that cannot run says why in the message below.
+        reported=$("${DUCKDB_BIN}" --version 2>&1 | head -n 1) || true
+        [ "${reported%% *}" = "v${QIITA_DUCKDB_VERSION}" ] && return 0
+        problem="\`${DUCKDB_BIN} --version\` printed '${reported:-nothing}'; the data plane links v${QIITA_DUCKDB_VERSION}."
+    fi
     cat >&2 <<EOF
-ERROR: no duckdb CLI on PATH.
+ERROR: ${problem}
 
 Install v${QIITA_DUCKDB_VERSION} — it must match what the data plane links.
 
@@ -909,4 +921,74 @@ qiita_require_lake_data_path() {
         echo "  Check with: ls -ld ${path} && id" >&2
         exit 1
     fi
+}
+
+# Wait until the data plane `$1` (a systemd unit, env file `$2`) has nothing in
+# flight, for up to QIITA_DP_IDLE_WAIT_S seconds (default: the unit's
+# TimeoutStopSec, deploy/systemd/qiita-data-plane@.service; 0 skips the wait), then
+# return 0 whether or not it went idle: the data plane keeps serving while this
+# waits, so under steady load it may not go idle, and its drain lets what is still
+# running finish. Returns at once when the env file is absent (first deploy) or the
+# unit has no main process. Exits non-zero, before any restart, when
+# QIITA_DP_IDLE_WAIT_S is not a whole number or the catalog query fails.
+#
+# In flight, as the data plane already exposes it: a DoGet stream or a
+# register_files holds a catalog session in `active` or `idle in transaction`,
+# while an idle data plane's sessions are `idle`, and a DoPut holds its
+# `upload.parquet.partial` open (all measured against a running data plane, macOS).
+# A read export writes through a `.partial` too, so it counts as well. Open files
+# are found through /proc/<pid>/fd (the match measured in a Linux container). The
+# catalog query connects with the data plane's own role, which is what lets it see
+# those sessions' state; a lake-gc or lake-shell session under that role counts too.
+wait_for_data_plane_idle() {
+    local unit=$1 env_file=$2
+    local wait_s=${QIITA_DP_IDLE_WAIT_S:-3900}
+    case $wait_s in
+        '' | *[!0-9]*)
+            echo "ERROR: QIITA_DP_IDLE_WAIT_S must be a whole number of seconds, got '$wait_s'" >&2
+            return 1
+            ;;
+    esac
+    # Base 10, so a leading zero is not read as octal.
+    wait_s=$((10#$wait_s))
+    [ -r "$env_file" ] && [ "$wait_s" -gt 0 ] || return 0
+    local pid
+    pid=$(systemctl show -p MainPID --value "$unit")
+    [ "${pid:-0}" -gt 0 ] || return 0
+    # A subshell, so qiita_pgpass_init's EXIT trap removes the pgpass when the wait
+    # ends rather than replacing this script's own exit handling. The password
+    # reaches libpq through that 0600 file, not psql's argv (see
+    # qiita_split_conn_password).
+    (
+        local conn user password lake partials
+        IFS=$'\t' read -r conn user password \
+            < <(qiita_split_conn_password "$(read_env_var "$env_file" DUCKLAKE_CATALOG_CONNSTR)")
+        qiita_pgpass_init "qiita-dp-idle"
+        [ -z "$password" ] || qiita_pgpass_add "$user" "$password"
+        local deadline=$((SECONDS + wait_s)) next_report=$SECONDS
+        while :; do
+            lake=$(PGPASSFILE="$PGPASS_FILE" psql "$conn" -Atc "SELECT count(*) FROM pg_stat_activity
+                WHERE datname = current_database() AND pid <> pg_backend_pid()
+                  AND state IN ('active', 'idle in transaction')") || {
+                echo "ERROR: cannot query the data plane's catalog to tell whether $unit is idle; set QIITA_DP_IDLE_WAIT_S=0 to restart without waiting" >&2
+                exit 1
+            }
+            # `|| true`: find fails once the process has exited (no fd dir), and
+            # pipefail would carry that out of the assignment.
+            partials=$(find "/proc/$pid/fd" -lname '*.partial' 2>/dev/null | wc -l || true)
+            partials=$((partials))
+            if [ "$lake" -eq 0 ] && [ "$partials" -eq 0 ]; then
+                exit 0
+            fi
+            if [ "$SECONDS" -ge "$deadline" ]; then
+                echo "$unit still busy after ${wait_s}s (catalog sessions: $lake, open partial files: $partials); restarting, and its drain lets them finish" >&2
+                exit 0
+            fi
+            if [ "$SECONDS" -ge "$next_report" ]; then
+                echo "waiting for $unit to go idle (catalog sessions: $lake, open partial files: $partials); up to $((deadline - SECONDS))s more" >&2
+                next_report=$((SECONDS + 60))
+            fi
+            sleep "${QIITA_DP_IDLE_POLL_S:-5}"
+        done
+    )
 }

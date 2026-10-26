@@ -157,6 +157,24 @@ class ProcessingPrepSampleListResponse(BaseModel):
     sequenced_pool_idx: Annotated[int | None, Field(default=None, gt=0)] = None
 
 
+class AssemblyExportRosterResponse(BaseModel):
+    """Returned by GET /api/v1/assembly/{processing_idx}/prep-sample.
+
+    The samples assembled under one run that the caller may READ, ascending by
+    `prep_sample_idx`, narrowed by whichever of `sequenced_pool_idx` /
+    `study_idx` / `prep_sample_idx` the request named. Entries are
+    `ProcessingPrepSample`s, so a sample reads the same here as on the
+    /processing roster; what differs is who sees it (see the route).
+
+    No `truncated`: the route refuses over its cap, because a roster short by a
+    sample makes an export short by that sample's genomes with nothing to say so.
+    """
+
+    processing_idx: Annotated[int, Field(gt=0)]
+    samples: list[ProcessingPrepSample]
+    count: Annotated[int, Field(ge=0)]
+
+
 class ProcessingStatusUpdate(BaseModel):
     """Body for PATCH /api/v1/processing/{processing_idx}/status.
 

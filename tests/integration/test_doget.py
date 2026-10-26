@@ -156,7 +156,7 @@ def test_doget_expired_ticket_carries_the_text_the_cp_classifies_on(
     data_plane, flight_client
 ):
     """An expired ticket must reach the caller as a string carrying BOTH markers the
-    control plane keys on (`runner/_upload.py::_DP_TICKET_EXPIRED_SIGNATURES`), which
+    control plane keys on (`qiita_common.data_plane_errors.DATA_PLANE_TICKET_EXPIRED_SIGNATURES`), which
     is what routes it to a retriable DATA_PLANE_TRANSIENT instead of a permanent
     BAD_INPUT. Four layers sit between the Rust `AuthError::Expired` and that string —
     `Status::unauthenticated`, the gRPC trailer, pyarrow's exception, and its
@@ -164,7 +164,7 @@ def test_doget_expired_ticket_carries_the_text_the_cp_classifies_on(
 
     The control is the same ticket with a live expiry: it must succeed, so the failure
     is the expiry and not the connection or the scope."""
-    from qiita_control_plane.runner._upload import _DP_TICKET_EXPIRED_SIGNATURES
+    from qiita_common.data_plane_errors import DATA_PLANE_TICKET_EXPIRED_SIGNATURES
 
     filter_ = {"feature_idx": [SEED_FEATURE_IDXS[0]]}
     live = _sign_ticket("reference_sequences", filter_, data_plane["secret"])
@@ -180,7 +180,7 @@ def test_doget_expired_ticket_carries_the_text_the_cp_classifies_on(
         flight_client.do_get(flight.Ticket(expired)).read_all()
 
     text = str(exc.value).lower()
-    missing = [sig for sig in _DP_TICKET_EXPIRED_SIGNATURES if sig not in text]
+    missing = [sig for sig in DATA_PLANE_TICKET_EXPIRED_SIGNATURES if sig not in text]
     assert not missing, (
         f"the data plane's expired-ticket error no longer carries {missing}; "
         f"the CP would classify it permanent. Got: {exc.value}"

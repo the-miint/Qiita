@@ -214,8 +214,12 @@ which: stages into `/opt/qiita/`, `uv sync`s the Python venvs
 (`--reinstall-package qiita-common` to defeat cross-package staleness),
 **asserts every shipped migration is applied and aborts if not**, runs
 `qiita-admin actions sync` (picks up new/changed workflow YAML),
-installs systemd units + dropins, and restarts the services whose env
-files are present.
+installs systemd units + dropins, waits for the data plane to have no
+request in flight (up to `QIITA_DP_IDLE_WAIT_S`, default 3900 s, printing
+`waiting for qiita-data-plane@50051 to go idle …` once a minute), and
+restarts the services whose env files are present. The data plane's own
+restart lets requests still running finish, for up to its unit's
+`TimeoutStopSec`. See [`docs/deployments.md`](../deployments.md).
 
 If the migration guard aborts here, you skipped or under-ran the migrate
 step above — run `make migrate` and re-run this command.
@@ -376,7 +380,10 @@ A maintainer then, in a local checkout, runs `/deploy-archive <sha>`
 `HEAD`, which may have moved on). It moves the just-deployed `## Pending
 deploy` block out of `DEPLOY_CHECKLIST.md` into its own file under
 [`docs/deploy-archive/`](../deploy-archive/), empties Pending for the next
-cycle, and the maintainer commits + pushes.
-No Claude? Do the same move by hand, copying the shape of the newest file in
-`docs/deploy-archive/`. Either way, also record the deployed commit somewhere
+cycle, and moves the changelog entry files the deploy shipped from
+`docs/changelog-pending/` into a folder with the same stamp under
+[`docs/changelog-archive/`](../changelog-archive/); the maintainer commits + pushes.
+No Claude? Do the same two moves by hand, copying the shape of the newest file in
+`docs/deploy-archive/` and running the `git mv` loop in
+`.claude/commands/deploy-archive.md`. Either way, also record the deployed commit somewhere
 durable (deploy log, ops channel).
