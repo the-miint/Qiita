@@ -27,11 +27,9 @@ Never edit `/etc/nginx/conf.d/qiita.conf` on the host: every deploy overwrites i
 Every host needs the loopback-listener port label from
 [`first-deploy.md` §0.4](first-deploy.md#04-nginx--tls--dns) when SELinux is
 Enforcing, one instance or many; `make preflight` reports it, and `activate.sh` stops
-before installing anything while it is missing. Whether the policy lets nginx
-*connect* to an added instance's port or to a peer has not been checked on an
-Enforcing host. `verify-deploy` checks each member directly rather than through
-nginx, so after adding one, look for nginx denials with
-`sudo ausearch -m avc -c nginx -ts recent`.
+before installing anything while it is missing. `verify-deploy` checks each member
+directly rather than through nginx, so after adding an instance or a peer, look for
+nginx denials with `sudo ausearch -m avc -c nginx -ts recent`.
 
 ## More instances on this host
 

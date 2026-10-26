@@ -28,7 +28,8 @@ _None yet._
   sudo semanage port -a -t http_port_t -p tcp 50050
   ```
 
-  `make preflight` reports it as `selinux/lb-port` (fails while Enforcing and unlabelled).
+  `make preflight` reports it as `selinux/lb-port` (fails while Enforcing and unlabelled),
+  and `activate.sh` stops before installing anything until it is labelled.
 
 ### 3. Migrations
 
@@ -52,8 +53,7 @@ _None yet._
   appears per peer; `health/data-plane-lb` checks nginx's loopback listener
   `127.0.0.1:50050` (skipped when the TLS files are absent); `health/data-plane-upstream`
   fails when verify cannot read the members from the rendered nginx config, and is skipped
-  when grpcurl is missing or `SKIP_HEALTH=1`. On an Enforcing host, a red
-  `health/data-plane-lb` can mean the bucket-2 port label is missing.
+  when grpcurl is missing or `SKIP_HEALTH=1`.
 
 ### 6. After the deploy verifies green
 

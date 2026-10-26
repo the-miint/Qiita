@@ -15,7 +15,8 @@
   so the next nginx start does not fail on it. nginx also serves the upstream on a loopback
   listener, `127.0.0.1:50050`, which the control plane uses when
   `DATA_PLANE_URL=grpc://127.0.0.1:50050`. `make preflight` gains `selinux/lb-port`, which
-  fails on an Enforcing host where that port is not labelled `http_port_t`. `make deploy`
+  fails on an Enforcing host where that port is not labelled `http_port_t`, and
+  `activate.sh` stops there before installing anything. `make deploy`
   prints the `local-deploy.sh` / `make redeploy` command instead of a hand copy of
   `deploy/nginx/qiita.conf`, a template that fails `nginx -t` unrendered. The deploy's
   idle wait covers every local instance, counting each one's open `*.partial` uploads,

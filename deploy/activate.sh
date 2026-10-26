@@ -39,9 +39,12 @@ fi
 # an SELinux-Enforcing host nginx can bind its port only once it is labelled
 # http_port_t (qiita_selinux_lb_port_state). `nginx -t` does not catch that, so it
 # is checked here, before anything is installed.
-if ! selinux_reason=$(qiita_selinux_lb_port_state); then
+selinux_reason=$(qiita_selinux_lb_port_state) && selinux_rc=0 || selinux_rc=$?
+if [ "$selinux_rc" -ne 0 ]; then
     echo "ERROR: nginx cannot bind the data-plane loopback listener: $selinux_reason" >&2
-    echo "  run: semanage port -a -t http_port_t -p tcp $QIITA_DATA_PLANE_LB_PORT" >&2
+    if [ "$selinux_rc" -eq 1 ]; then
+        echo "  run: semanage port -a -t http_port_t -p tcp $QIITA_DATA_PLANE_LB_PORT" >&2
+    fi
     exit 1
 fi
 

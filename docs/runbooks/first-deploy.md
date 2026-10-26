@@ -333,7 +333,8 @@ policy nginx cannot bind it otherwise (`qiita_selinux_lb_port_state` in
 # [admin]
 sudo semanage port -a -t http_port_t -p tcp 50050
 ```
-`make preflight` reports it as `selinux/lb-port`.
+`make preflight` reports it as `selinux/lb-port`, and `activate.sh` stops before
+installing anything until it is labelled.
 
 ### 0.5 Build + ops tooling
 
