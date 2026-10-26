@@ -23,7 +23,8 @@ since real submitters use both: the GSC-MIxS display-name form ENA's checklists 
 Deliberately NOT mapped: `host` (free-text name, not an NCBI Taxonomy id) and the three
 GSC-MIxS environmental-context tags (`env_broad_scale`/`env_local_scale`/`env_medium`).
 The latter are TERMINOLOGY-typed (bound to ENVO), but ENA's raw values are submitter free
-text, so mapping them would fabricate an ENVO-resolution step. `taxon id` and
+text, so mapping them would fabricate an ENVO-resolution step. Nor are `neg_cont_type` /
+`pos_cont_type`: submitters often copy a study's control onto every BioSample. `taxon id` and
 `host taxon id` come from the run's `tax_id`/`host_tax_id` in `ena_import.harmonization`,
 not from attributes.
 

@@ -1280,6 +1280,153 @@ async def test_result_step_oom_signature_does_not_downgrade_node_fail(jwt_path, 
     assert ei.value.kind is FailureKind.NODE_FAIL
 
 
+_NATIVE_SEGFAULT_STDERR = (
+    "Fatal Python error: Segmentation fault\n"
+    "\n"
+    "Thread 0x00007f51ab3ff6c0 [sort-7] (most recent call first):\n"
+    '  File "/opt/qiita/jobs/step.py", line 7 in sort_worker\n'
+    '  File "/opt/python/lib/python3.14/threading.py", line 1024 in run\n'
+    '  File "/opt/python/lib/python3.14/threading.py", line 1082 in _bootstrap_inner\n'
+    '  File "/opt/python/lib/python3.14/threading.py", line 1044 in _bootstrap\n'
+    "\n"
+    "Thread 0x00007f51ca7fe6c0 [sort-0] (most recent call first):\n"
+    '  File "/opt/qiita/jobs/step.py", line 7 in sort_worker\n'
+    '  File "/opt/python/lib/python3.14/threading.py", line 1024 in run\n'
+    '  File "/opt/python/lib/python3.14/threading.py", line 1082 in _bootstrap_inner\n'
+    '  File "/opt/python/lib/python3.14/threading.py", line 1044 in _bootstrap\n'
+    "\n"
+    "Current thread 0x00007f51d012a740 [python3] (most recent call first):\n"
+    '  File "/opt/qiita/jobs/step.py", line 13 in <module>\n'
+    "\n"
+    "Current thread's C stack trace (most recent call first):\n"
+    '  Binary file "/opt/qiita/.venv/bin/python3", at _Py_DumpStack+0x30 [0x4bf5d0]\n'
+    '  Binary file "/opt/qiita/.venv/bin/python3" [0x54299b]\n'
+    '  Binary file "/opt/qiita/.venv/bin/python3" [0x5428e7]\n'
+    '  Binary file "/lib64/libc.so.6", at +0x41000 [0x7f51d016e000]\n'
+    '  Binary file "/lib64/libc.so.6", at +0x96f8c [0x7f51d01c3f8c]\n'
+    '  Binary file "/lib64/libc.so.6", at gsignal+0x16 [0x7f51d016df56]\n'
+    '  Binary file "/opt/qiita/.venv/bin/python3" [0x542371]\n'
+    '  Binary file "/opt/qiita/.venv/bin/python3" [0x1a74bd1]\n'
+    '  Binary file "/opt/qiita/.venv/bin/python3" [0x1a29301]\n'
+    '  Binary file "/opt/qiita/.venv/bin/python3" [0x1aabb05]\n'
+    '  Binary file "/opt/qiita/.venv/bin/python3", at PyEval_EvalCode+0xa6 [0x1a7a2e6]\n'
+    '  Binary file "/opt/qiita/.venv/bin/python3" [0x1b117c9]\n'
+    '  Binary file "/opt/qiita/.venv/bin/python3" [0x1c67fdb]\n'
+    '  Binary file "/opt/qiita/.venv/bin/python3" [0x1c67b81]\n'
+    '  Binary file "/opt/qiita/.venv/bin/python3" [0x1c676c6]\n'
+    '  Binary file "/opt/qiita/.venv/bin/python3" [0x1c6760e]\n'
+    '  Binary file "/opt/qiita/.venv/bin/python3" [0x1c6751d]\n'
+    '  Binary file "/opt/qiita/.venv/bin/python3", at Py_RunMain+0x40c [0x1b65c0c]\n'
+    '  Binary file "/opt/qiita/.venv/bin/python3" [0x1b657e6]\n'
+    '  Binary file "/opt/qiita/.venv/bin/python3" [0x1b6564a]\n'
+    '  Binary file "/lib64/libc.so.6", at +0x2a58e [0x7f51d015758e]\n'
+    '  Binary file "/lib64/libc.so.6", at __libc_start_main+0x89 [0x7f51d0157649]\n'
+    '  Binary file "/opt/qiita/.venv/bin/python3", at _start+0x29 [0x1bf3da9]\n'
+    "srun: error: b-cn-20: task 0: Segmentation fault (core dumped)\n"
+    "srun: Terminating StepId=1522031.0\n"
+)
+
+
+async def _result_for(jwt_path, tmp_path, stderr, raw_state, exit_code):
+    backend = _make_backend(httpx.MockTransport(lambda r: httpx.Response(500)), jwt_path)
+    (tmp_path / "logs").mkdir(parents=True)
+    (tmp_path / "logs" / "stderr").write_text(stderr)
+    with pytest.raises(BackendFailure) as ei:
+        await backend.result_step(
+            _slurm_handle(tmp_path),
+            StepStatusInfo(status=StepStatus.FAILED, raw_state=raw_state, exit_code=exit_code),
+        )
+    return ei.value
+
+
+@pytest.mark.asyncio
+async def test_result_step_native_segfault_is_retriable_segfault(jwt_path, tmp_path):
+    """A native step killed by SIGSEGV exits 139 with no launcher line, and is
+    classified SEGFAULT (retriable) instead of the permanent EXIT_NONZERO."""
+    failure = await _result_for(jwt_path, tmp_path, _NATIVE_SEGFAULT_STDERR, "FAILED", 139)
+    assert failure.kind is FailureKind.SEGFAULT
+    assert failure.transient is True
+    assert "exit_code=139" in failure.reason
+    assert "Segmentation fault (core dumped)" in failure.reason
+
+
+# A segfaulted native job as slurmrestd v0.0.40 returns it (Slurm 25.05.7, 2026-10-26).
+_SLURMRESTD_SEGFAULT_JOB = {
+    "job_id": 1,
+    "job_state": ["FAILED"],
+    "state_reason": "NonZeroExitCode",
+    "exit_code": {
+        "status": ["ERROR"],
+        "return_code": {"set": True, "infinite": False, "number": 139},
+        "signal": {"id": {"set": False, "infinite": False, "number": 0}, "name": ""},
+    },
+    "derived_exit_code": {
+        "status": ["SIGNALED"],
+        "return_code": {"set": False, "infinite": False, "number": 0},
+        "signal": {"id": {"set": True, "infinite": False, "number": 11}, "name": "11"},
+    },
+}
+
+
+@pytest.mark.asyncio
+async def test_run_step_slurmrestd_segfault_response_is_segfault(jwt_path, baseline, tmp_path):
+    """The job object slurmrestd serves for a segfault reaches SEGFAULT through
+    the client's parse, not only an injected exit code."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            return httpx.Response(200, json={"job_id": 1})
+        return httpx.Response(200, json={"jobs": [_SLURMRESTD_SEGFAULT_JOB]})
+
+    backend = _make_backend(httpx.MockTransport(handler), jwt_path)
+    (tmp_path / "logs").mkdir()
+    (tmp_path / "logs" / "stderr").write_text(_NATIVE_SEGFAULT_STDERR)
+
+    with pytest.raises(BackendFailure) as ei:
+        await _run_step_via_trio(
+            backend,
+            "fastq",
+            {},
+            tmp_path,
+            scope_target={"kind": "reference", "reference_idx": 1},
+            work_ticket_idx=99,
+            module=FASTQ_TO_PARQUET_MODULE,
+            baseline_resources=baseline,
+        )
+
+    assert ei.value.kind is FailureKind.SEGFAULT
+    assert "exit_code=139" in ei.value.reason
+
+
+@pytest.mark.asyncio
+async def test_result_step_segfault_text_with_other_exit_code_stays_exit_nonzero(
+    jwt_path, tmp_path
+):
+    """The exit code is the signal, not the stderr text: a traceback that merely
+    mentions a segmentation fault is not a SIGSEGV."""
+    failure = await _result_for(
+        jwt_path, tmp_path, "RuntimeError: Segmentation fault in child\n", "FAILED", 1
+    )
+    assert failure.kind is FailureKind.EXIT_NONZERO
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("raw_state", ["CANCELLED", "DEADLINE"])
+async def test_result_step_139_outside_failed_state_stays_exit_nonzero(
+    jwt_path, tmp_path, raw_state
+):
+    """An operator cancel or a deadline kill that happens to carry 139 is not a crash."""
+    failure = await _result_for(jwt_path, tmp_path, "srun: Terminated\n", raw_state, 139)
+    assert failure.kind is FailureKind.EXIT_NONZERO
+
+
+@pytest.mark.asyncio
+async def test_result_step_segfault_wins_over_oom_signature(jwt_path, tmp_path):
+    """'Killed' in a segfaulting job's stderr does not make it an OOM kill."""
+    failure = await _result_for(jwt_path, tmp_path, "srun: Killed\n", "FAILED", 139)
+    assert failure.kind is FailureKind.SEGFAULT
+
+
 @pytest.mark.asyncio
 async def test_find_jobs_by_name_returns_matching_jobs(jwt_path):
     """find_jobs_by_name lists slurmrestd jobs, filters to the deterministic

@@ -1,0 +1,2 @@
+### Changed
+- **A native step killed by a segfault is retried and leaves a stack (#781).** A SLURM job that ended `FAILED` with exit 139 failed permanently with no trace beyond the `srun` line. It now retries on the same resources within the ticket's `max_retries`, and native jobs and the compute orchestrator dump the Python and C stacks to stderr when they crash. `ingest_ena_reads` also prints one line per run before its sort, naming the run, its read count and its memory and thread budget.
