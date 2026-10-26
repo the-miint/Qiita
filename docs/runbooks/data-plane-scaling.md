@@ -41,12 +41,23 @@ lets it reach `127.0.0.1:50051` on the host (for example the
    ```
 
 2. Redeploy (`sudo make redeploy QIITA_HOSTNAME=<fqdn>`). `activate.sh` renders one
-   upstream member per port and enables and restarts each unit, so an added instance
-   also starts at boot.
+   upstream member per port, waits for every instance to go idle and restarts them
+   together ([deployments.md](../deployments.md), "Restarts wait on the data plane's
+   in-flight work"), and enables each unit, so an added instance also starts at boot.
 3. `sudo make verify-deploy QIITA_HOSTNAME=<fqdn>` shows one `health/data-plane@<port>`
    row per port and a `health/data-plane-lb` row for the loopback listener.
 
-Each instance is another process on the same cores and memory.
+Each instance is another process on the same cores and memory, and none of them knows
+about the others. Unset, `DUCKDB_MEMORY_LIMIT` and `DUCKDB_THREADS` are derived per
+instance from the whole host's memory and CPU, divided among that instance's own pool
+(`qiita-data-plane/src/config.rs`), so N instances on one host each budget for the whole
+host. Before adding an instance, set both in `/etc/qiita/data-plane.env`, which every
+local instance reads: `DUCKDB_MEMORY_LIMIT` to the memory the data plane may use divided
+by (instances × `DUCKLAKE_POOL_SIZE`, default 8), and `DUCKDB_THREADS` to the cores it may
+use divided the same way. Each pooled connection also holds one backend on the catalog's
+Postgres for as long as it lives; count instances × pool size on every host, plus the
+control plane, against that server's `max_connections` (`DEFAULT_POOL_SIZE` in the same
+file says what it was chosen against).
 
 ## Fewer instances on this host
 

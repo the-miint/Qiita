@@ -232,8 +232,10 @@ systemctl daemon-reload
 # Wait for the data plane to have nothing in flight before any service restarts:
 # restarting the control plane or orchestrator ends the data-plane calls they have
 # open, and restarting the data plane refuses new requests for as long as its drain
-# runs. See wait_for_data_plane_idle (deploy/_common.sh).
-wait_for_data_plane_idle qiita-data-plane@50051 /etc/qiita/data-plane.env
+# runs. Every local instance is waited on, then all are restarted together below.
+# See wait_for_data_plane_idle (deploy/_common.sh).
+read -r -a dp_units <<< "$(qiita_data_plane_units "$DP_PORTS")"
+wait_for_data_plane_idle "$DP_ENV" "${dp_units[@]}"
 
 # Skip restart when env file is absent (first deploy; operator writes envs in runbook steps 1/8b/9a).
 restart_if_env_present() {
@@ -248,12 +250,14 @@ restart_if_env_present qiita-compute-orchestrator  /etc/qiita/compute-orchestrat
 # One unit per port in the list that rendered the upstream above. `enable` so an
 # instance added to QIITA_DATA_PLANE_PORTS also starts at boot. A port removed from
 # the list is not disabled here; docs/runbooks/data-plane-scaling.md covers that.
-for port in $DP_PORTS; do
-    if [ -r "$DP_ENV" ]; then
-        systemctl enable "qiita-data-plane@${port}" >/dev/null
-    fi
-    restart_if_env_present "qiita-data-plane@${port}" "$DP_ENV"
-done
+# One `systemctl restart` for all of them, so their drains run at the same time and
+# no instance keeps serving the previous build after another has moved on.
+if [ -r "$DP_ENV" ]; then
+    systemctl enable "${dp_units[@]}" >/dev/null
+    systemctl restart "${dp_units[@]}"
+else
+    echo "skipping restart ${dp_units[*]} — $DP_ENV not present" >&2
+fi
 
 # Load the config tested above.
 if qiita_nginx_tls_present; then

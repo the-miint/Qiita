@@ -169,6 +169,19 @@ def test_data_plane_ports_defaults_to_the_single_instance() -> None:
     assert result.stdout == "50051"
 
 
+def test_data_plane_units_of_an_unconfigured_host_are_the_single_instance() -> None:
+    """The units the deploy waits on and restarts, from the default port list: the
+    one `qiita-data-plane@50051` a single-machine host has always run."""
+    result = _run_common('qiita_data_plane_units "$(qiita_data_plane_ports)"')
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.split() == ["qiita-data-plane@50051"]
+
+
+def test_data_plane_units_names_one_unit_per_port() -> None:
+    result = _run_common('qiita_data_plane_units "50051 50052"')
+    assert result.stdout.split() == ["qiita-data-plane@50051", "qiita-data-plane@50052"]
+
+
 def test_data_plane_ports_reads_the_host_file(tmp_path: Path) -> None:
     """The list lives in data-plane.env, so a routine redeploy — which passes no
     scaling variables — renders the instances the host was given."""
@@ -557,6 +570,19 @@ def test_activate_tests_the_nginx_config_before_restarting_services() -> None:
     tested = _first_command(src, r"qiita_render_and_test_nginx_conf ")
     first_restart = _first_command(src, r"restart_if_env_present qiita-control-plane")
     assert tested < first_restart
+
+
+def test_activate_waits_on_and_restarts_every_local_instance_together() -> None:
+    """The idle wait and the restart take the same unit list, and the restart is one
+    `systemctl restart` for all of them, so their drains overlap and no instance keeps
+    serving the previous build after another has moved on."""
+    src = (_DEPLOY / "activate.sh").read_text()
+    assert re.search(
+        r'(?m)^read -r -a dp_units <<< "\$\(qiita_data_plane_units "\$DP_PORTS"\)"$', src
+    )
+    assert re.search(r'(?m)^wait_for_data_plane_idle "\$DP_ENV" "\$\{dp_units\[@\]\}"$', src)
+    assert re.search(r'(?m)^    systemctl restart "\$\{dp_units\[@\]\}"$', src)
+    assert not re.search(r"(?m)^\s*restart_if_env_present\s+\S*qiita-data-plane", src)
 
 
 def _render_and_test(
@@ -1983,16 +2009,26 @@ def test_workflow_script_is_valid_bash(path: Path) -> None:
 
 
 def _run_idle_wait(
-    tmp_path: Path, counts: list[int | str], *, wait_s: str = "60", env_file=True, pid: int = 4242
+    tmp_path: Path,
+    counts: list[int | str],
+    *,
+    wait_s: str = "60",
+    env_file=True,
+    pids: dict[str, int] | None = None,
 ):
     """Run `wait_for_data_plane_idle` with `systemctl` and `psql` stubbed: systemctl
-    names `pid` as the unit's main process, and psql answers the in-flight
-    catalog-session count from `counts`, one per call, then the last one again, and
-    fails on a `"fail"` entry.
+    names each unit's main process from `pids` (unit name -> pid; default one unit,
+    `qiita-data-plane@50051`), and psql answers the in-flight catalog-session count
+    from `counts`, one per call, then the last one again, and fails on a `"fail"`
+    entry.
     Returns the completed process and the argv of every psql call."""
+    pids = pids or {"qiita-data-plane@50051": 4242}
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
-    (bin_dir / "systemctl").write_text(f"#!/bin/sh\necho {pid}\n")
+    cases = "".join(f"    {unit}) echo {pid} ;;\n" for unit, pid in pids.items())
+    (bin_dir / "systemctl").write_text(
+        f'#!/bin/sh\neval "unit=\\${{$#}}"\ncase "$unit" in\n{cases}    *) echo 0 ;;\nesac\n'
+    )
     queue = tmp_path / "counts"
     queue.write_text("".join(f"{n}\n" for n in counts))
     calls = tmp_path / "psql-calls"
@@ -2017,7 +2053,7 @@ def _run_idle_wait(
             "bash",
             "-c",
             f'set -euo pipefail; source "{_COMMON}"; '
-            f'wait_for_data_plane_idle qiita-data-plane@50051 "{env_path}"',
+            f'wait_for_data_plane_idle "{env_path}" {" ".join(pids)}',
         ],
         env={
             **os.environ,
@@ -2106,13 +2142,56 @@ def test_idle_wait_counts_an_open_partial_upload(tmp_path: Path, name: str, busy
             if any(os.readlink(fd) == str(held) for fd in fd_dir.iterdir()):
                 break
             time.sleep(0.05)
-        proc, _calls = _run_idle_wait(tmp_path, [0], wait_s="1", pid=holder.pid)
+        proc, _calls = _run_idle_wait(
+            tmp_path, [0], wait_s="1", pids={"qiita-data-plane@50051": holder.pid}
+        )
     finally:
         holder.communicate(b"")
     assert proc.returncode == 0, proc.stderr
     assert (
         "still busy after 1s (catalog sessions: 0, open partial files: 1)" in proc.stderr
     ) is busy
+
+
+@pytest.mark.skipif(not Path("/proc/self/fd").is_dir(), reason="needs /proc (Linux)")
+def test_idle_wait_counts_a_partial_upload_on_any_local_instance(tmp_path: Path) -> None:
+    """With several instances on the host, an upload in flight on the second one
+    keeps the wait going, as one on the first does."""
+    held = tmp_path / "upload.parquet.partial"
+    held.touch()
+    holder = subprocess.Popen(
+        ["python3", "-c", "import sys; f = open(sys.argv[1]); sys.stdin.read()", str(held)],
+        stdin=subprocess.PIPE,
+    )
+    try:
+        fd_dir = Path(f"/proc/{holder.pid}/fd")
+        for _ in range(100):
+            if any(os.readlink(fd) == str(held) for fd in fd_dir.iterdir()):
+                break
+            time.sleep(0.05)
+        proc, _calls = _run_idle_wait(
+            tmp_path,
+            [0],
+            wait_s="1",
+            pids={"qiita-data-plane@50051": os.getpid(), "qiita-data-plane@50052": holder.pid},
+        )
+    finally:
+        holder.communicate(b"")
+    assert proc.returncode == 0, proc.stderr
+    assert (
+        "qiita-data-plane@50051 qiita-data-plane@50052 still busy after 1s "
+        "(catalog sessions: 0, open partial files: 1)"
+    ) in proc.stderr
+
+
+def test_idle_wait_skips_units_with_no_main_process(tmp_path: Path) -> None:
+    """A listed instance that is not running is not waited on; with none running
+    the wait returns without querying the catalog."""
+    proc, calls = _run_idle_wait(
+        tmp_path, [1], pids={"qiita-data-plane@50051": 0, "qiita-data-plane@50052": 0}
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert calls == []
 
 
 def test_data_plane_unit_stop_timeout_covers_the_idle_wait() -> None:
