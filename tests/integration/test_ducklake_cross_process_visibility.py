@@ -1,12 +1,13 @@
-"""A DuckLake registration made by one process is visible to the next connection
-another process opens.
+"""A DuckLake registration made by one process is visible to another process's
+next query, both on a connection it opens then and on one it attached earlier.
 
-Data-plane instances are separate processes on one catalog, and each request opens
-its own DuckDB connection and ATTACH (`open_ducklake` in the data plane), so a read
-routed to one instance after a write through another depends on this. It is DuckDB
-and DuckLake behaviour, pinned here against the versions this repo ships. The two
-workers below mirror that pattern: a fresh in-memory connection per operation, and
-`CALL ducklake_add_data_files`, the call `register_files` makes.
+Data-plane instances are separate processes on one catalog, and each serves
+requests from a pool of connections attached once and reused (`pool.rs`), so a
+read routed to one instance after a write through another depends on this. It is
+DuckDB and DuckLake behaviour, pinned here against the versions this repo ships.
+The writer opens a fresh in-memory connection per write and calls
+`ducklake_add_data_files`, the call `register_files` makes; the reader checks
+with a fresh connection and with one it keeps attached, as a pool member does.
 """
 
 from __future__ import annotations
@@ -27,6 +28,7 @@ _WORKER = textwrap.dedent(
         c.execute(f"ATTACH 'ducklake:postgres:{CONN}' AS qiita_lake (DATA_PATH '{DATA}/')")
         return c
     held = None
+    pooled = None
     for line in sys.stdin:
         cmd, *arg = line.split()
         if cmd == "init":
@@ -43,6 +45,10 @@ _WORKER = textwrap.dedent(
             c = fresh()
             out = c.execute("SELECT count(*) FROM qiita_lake.cross_process_probe").fetchone()[0]
             c.close()
+        elif cmd == "pooled_count":
+            if pooled is None:
+                pooled = fresh()
+            out = pooled.execute("SELECT count(*) FROM qiita_lake.cross_process_probe").fetchone()[0]
         elif cmd == "hold_begin":
             held = fresh(); held.execute("BEGIN TRANSACTION")
             out = held.execute("SELECT count(*) FROM qiita_lake.cross_process_probe").fetchone()[0]
@@ -80,7 +86,7 @@ class _Worker:
         self.proc.wait(timeout=30)
 
 
-def test_a_registration_is_visible_to_another_process_next_connection(
+def test_a_registration_is_visible_to_another_process_next_query(
     data_plane,
 ) -> None:
     data_path = data_plane["data_path"]
@@ -90,7 +96,10 @@ def test_a_registration_is_visible_to_another_process_next_connection(
         for i in range(1, _WRITES + 1):
             writer.ask(f"add {i}")
             assert int(reader.ask("count")) == i, (
-                f"write {i} not visible to the other process"
+                f"write {i} not visible to the other process's new connection"
+            )
+            assert int(reader.ask("pooled_count")) == i, (
+                f"write {i} not visible to the other process's attached connection"
             )
 
         # Control: a read inside a transaction opened before the write keeps its
