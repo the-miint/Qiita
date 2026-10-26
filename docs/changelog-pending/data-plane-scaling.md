@@ -17,5 +17,9 @@
   `DATA_PLANE_URL=grpc://127.0.0.1:50050`. `make preflight` gains `selinux/lb-port`, which
   fails on an Enforcing host where that port is not labelled `http_port_t`. `make deploy`
   prints the `local-deploy.sh` / `make redeploy` command instead of a hand copy of
-  `deploy/nginx/qiita.conf`, a template that fails `nginx -t` unrendered. Procedure:
-  `docs/runbooks/data-plane-scaling.md`.
+  `deploy/nginx/qiita.conf`, a template that fails `nginx -t` unrendered. The deploy's
+  idle wait covers every local instance, counting each one's open `*.partial` uploads,
+  and all of them restart in one `systemctl restart`, so their drains overlap. Data
+  planes booting together against one catalog retry its setup conflicts for up to 60 s
+  (`ducklake::setup_catalog`). Procedure, including how to divide memory, threads and
+  catalog connections across instances on one host: `docs/runbooks/data-plane-scaling.md`.
