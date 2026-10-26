@@ -31,7 +31,7 @@
 | `qiita-compute-orchestrator` | Python / FastAPI | 8081 | SLURM job lifecycle |
 | `qiita-common` | Python (path dep) | — | Shared Pydantic models, config, REST client |
 
-nginx terminates TLS and routes: `REST → :8080`, `gRPC → :50051` (load-balanced across N data plane instances via `upstream qiita_data_plane` in `deploy/nginx/qiita.conf`).
+nginx terminates TLS and routes: `REST → :8080`, `gRPC →` the `qiita_data_plane` upstream (one member per data-plane instance, `:50051` on a single-instance host; rendered from `deploy/nginx/qiita.conf`). It also serves that upstream, unencrypted, on a loopback listener at `127.0.0.1:50050` for on-host clients.
 
 ### Identifier ownership
 

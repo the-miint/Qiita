@@ -15,7 +15,7 @@ Three keys in `/etc/qiita/data-plane.env`, read on every deploy by `activate.sh`
 |---|---|---|
 | `QIITA_DATA_PLANE_PORTS` | `50051` | Instances this host runs, space-separated and quoted. Each port is one `qiita-data-plane@<port>` unit. |
 | `QIITA_DATA_PLANE_PEERS` | none | Data planes on other hosts that this host's nginx also balances to, as `host:port`. |
-| `QIITA_DATA_PLANE_BIND_HOST` | `127.0.0.1` | The IPv4 address this host's instances listen on. |
+| `QIITA_DATA_PLANE_BIND_HOST` | `127.0.0.1` | The IPv4 address this host's instances listen on. Leave it at `127.0.0.1` on a host that runs the control plane, unless the control plane is first pointed at the loopback listener ([below](#the-control-plane-through-nginx)): its default `DATA_PLANE_URL`, `grpc://localhost:50051`, finds no instance once they listen elsewhere. |
 
 With none of them set, a deploy runs one instance on `127.0.0.1:50051`. The standing
 `sudo make redeploy` reads them from the file; nothing is passed on the command line.
@@ -26,10 +26,12 @@ Never edit `/etc/nginx/conf.d/qiita.conf` on the host: every deploy overwrites i
 
 Every host needs the loopback-listener port label from
 [`first-deploy.md` §0.4](first-deploy.md#04-nginx--tls--dns) when SELinux is
-Enforcing, one instance or many. `make preflight` checks that label only. Whether
-nginx may *connect* to an added instance or a peer is governed by whatever already
-lets it reach `127.0.0.1:50051` on the host (for example the
-`httpd_can_network_connect` boolean).
+Enforcing, one instance or many; `make preflight` reports it, and `activate.sh` stops
+before installing anything while it is missing. Whether the policy lets nginx
+*connect* to an added instance's port or to a peer has not been checked on an
+Enforcing host. `verify-deploy` checks each member directly rather than through
+nginx, so after adding one, look for nginx denials with
+`sudo ausearch -m avc -c nginx -ts recent`.
 
 ## More instances on this host
 

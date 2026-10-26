@@ -574,8 +574,8 @@ def test_activate_tests_the_nginx_config_before_restarting_services() -> None:
 
 def test_activate_waits_on_and_restarts_every_local_instance_together() -> None:
     """The idle wait and the restart take the same unit list, and the restart is one
-    `systemctl restart` for all of them, so their drains overlap and no instance keeps
-    serving the previous build after another has moved on."""
+    `systemctl restart` for all of them, so they stop accepting new requests together
+    and their drains overlap."""
     src = (_DEPLOY / "activate.sh").read_text()
     assert re.search(
         r'(?m)^read -r -a dp_units <<< "\$\(qiita_data_plane_units "\$DP_PORTS"\)"$', src
@@ -695,6 +695,15 @@ def _flight_locations(conf: str) -> list[dict[str, str]]:
     ]
 
 
+def test_data_plane_upstream_shares_its_balancing_state_across_workers() -> None:
+    """Without a shared `zone`, each nginx worker round-robins on its own from the
+    first member, and one-call clients all land on that member."""
+    conf = (_DEPLOY / "nginx" / "qiita.conf").read_text()
+    upstream = re.search(r"(?ms)^upstream qiita_data_plane \{\n(.*?)^\}", conf)
+    assert upstream, "no qiita_data_plane upstream block"
+    assert re.search(r"(?m)^\s*zone qiita_data_plane \d+k;$", upstream.group(1))
+
+
 def test_nginx_flight_locations_agree_on_body_cap_and_timeouts() -> None:
     """The loopback listener copies the 443 edge's Flight location; a change to the
     edge's body cap or timeouts has to reach the copy too. limit_conn is the one
@@ -713,15 +722,17 @@ def test_nginx_flight_locations_agree_on_body_cap_and_timeouts() -> None:
 
 
 def test_activate_resolves_topology_before_installing_anything() -> None:
-    """A malformed topology or an unresolvable peer has to fail with the running
-    deploy untouched: before the first rsync, the binary install, the nginx render
-    and any restart. Asserted on source order, since the order is the property."""
+    """A malformed topology, an unresolvable peer or an SELinux policy that will not
+    let nginx bind the loopback listener has to fail with the running deploy
+    untouched: before the first rsync, the binary install, the nginx render and any
+    restart. Asserted on source order, since the order is the property."""
     src = (_DEPLOY / "activate.sh").read_text()
     resolved = max(
         _first_command(src, re.escape("DP_PORTS=$(qiita_data_plane_ports)")),
         _first_command(src, re.escape("DP_PEERS=$(qiita_data_plane_peers)")),
         _first_command(src, re.escape("DP_BIND_HOST=$(qiita_data_plane_bind_host)")),
         _first_command(src, re.escape('qiita_assert_peer_resolves "$peer"')),
+        _first_command(src, re.escape("selinux_reason=$(qiita_selinux_lb_port_state)")),
     )
     for step in (
         r"rsync -a",

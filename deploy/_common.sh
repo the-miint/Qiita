@@ -292,8 +292,9 @@ env_file_sets_var() {
 # deploy's environment; BIND_HOST cannot (see qiita_data_plane_bind_host).
 # docs/runbooks/data-plane-scaling.md is the operator procedure.
 
-# The port of the loopback listener nginx serves the qiita_data_plane upstream on
-# for on-host clients.
+# The address and port of the loopback listener nginx serves the qiita_data_plane
+# upstream on for on-host clients.
+QIITA_DATA_PLANE_LB_HOST=127.0.0.1
 QIITA_DATA_PLANE_LB_PORT=50050
 
 # Succeeds when $DP_ENV is absent or unreadable (the defaults apply) or parses as
@@ -556,6 +557,7 @@ qiita_render_nginx_conf() {
         return 1
     fi
     if ! sed -e "s/__QIITA_HOSTNAME__/${server_name}/g" \
+        -e "s/__QIITA_DATA_PLANE_LB_HOST__/${QIITA_DATA_PLANE_LB_HOST}/g" \
         -e "s/__QIITA_DATA_PLANE_LB_PORT__/${QIITA_DATA_PLANE_LB_PORT}/g" \
         -e "/__QIITA_DATA_PLANE_UPSTREAM__/r $members" \
         -e "/__QIITA_DATA_PLANE_UPSTREAM__/d" \

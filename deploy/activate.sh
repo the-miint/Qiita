@@ -35,6 +35,15 @@ if [ -n "$DP_PEERS" ]; then
         qiita_assert_peer_resolves "$peer"
     done
 fi
+# Every render carries nginx's loopback listener, single instance included, and on
+# an SELinux-Enforcing host nginx can bind its port only once it is labelled
+# http_port_t (qiita_selinux_lb_port_state). `nginx -t` does not catch that, so it
+# is checked here, before anything is installed.
+if ! selinux_reason=$(qiita_selinux_lb_port_state); then
+    echo "ERROR: nginx cannot bind the data-plane loopback listener: $selinux_reason" >&2
+    echo "  run: semanage port -a -t http_port_t -p tcp $QIITA_DATA_PLANE_LB_PORT" >&2
+    exit 1
+fi
 
 # Migration-pending guard. The code we're about to deploy assumes the schema
 # produced by every file in db/migrations/; restarting services against a DB
@@ -250,8 +259,8 @@ restart_if_env_present qiita-compute-orchestrator  /etc/qiita/compute-orchestrat
 # One unit per port in the list that rendered the upstream above. `enable` so an
 # instance added to QIITA_DATA_PLANE_PORTS also starts at boot. A port removed from
 # the list is not disabled here; docs/runbooks/data-plane-scaling.md covers that.
-# One `systemctl restart` for all of them, so their drains run at the same time and
-# no instance keeps serving the previous build after another has moved on.
+# One `systemctl restart` for all of them, so they all stop accepting new requests
+# at the same moment and their drains run at the same time.
 if [ -r "$DP_ENV" ]; then
     systemctl enable "${dp_units[@]}" >/dev/null
     systemctl restart "${dp_units[@]}"

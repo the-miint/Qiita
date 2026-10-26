@@ -284,7 +284,7 @@ verify-health: $(GRPCURL_BIN)
 	@echo "Checking compute orchestrator..."
 	@curl -sf http://localhost:8081/health || (echo "FAIL: compute orchestrator" && exit 1)
 	@echo " OK"
-	@echo "Checking data plane..."
+	@echo "Checking data plane (instance 50051 only; verify-deploy checks every member)..."
 	@$(GRPCURL_BIN) -plaintext localhost:50051 grpc.health.v1.Health/Check || (echo "FAIL: data plane" && exit 1)
 	@echo " OK"
 	@echo "All services healthy."

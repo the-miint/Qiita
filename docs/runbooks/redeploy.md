@@ -214,10 +214,13 @@ which: stages into `/opt/qiita/`, `uv sync`s the Python venvs
 (`--reinstall-package qiita-common` to defeat cross-package staleness),
 **asserts every shipped migration is applied and aborts if not**, runs
 `qiita-admin actions sync` (picks up new/changed workflow YAML),
-installs systemd units + dropins, waits for the data plane to have no
+renders `/etc/nginx/conf.d/qiita.conf` from the data-plane topology in
+`/etc/qiita/data-plane.env` and runs `nginx -t` on it, installs systemd
+units + dropins, waits for every local data-plane instance to have no
 request in flight (up to `QIITA_DP_IDLE_WAIT_S`, default 3900 s, printing
-`waiting for qiita-data-plane@50051 to go idle …` once a minute), and
-restarts the services whose env files are present. The data plane's own
+`waiting for qiita-data-plane@50051 to go idle …` once a minute), restarts
+the services whose env files are present (all data-plane instances in one
+`systemctl restart`, each enabled so it starts at boot), and reloads nginx. The data plane's own
 restart lets requests still running finish, for up to its unit's
 `TimeoutStopSec`. See [`docs/deployments.md`](../deployments.md).
 

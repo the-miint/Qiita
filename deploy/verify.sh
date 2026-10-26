@@ -104,7 +104,7 @@ elif command -v grpcurl >/dev/null 2>&1; then
     done <<<"$dp_members"
     # nginx's loopback listener in front of the same upstream. Skipped without the
     # TLS files: activate.sh then skips the nginx reload, so the listener is not up.
-    lb="127.0.0.1:${QIITA_DATA_PLANE_LB_PORT}"
+    lb="${QIITA_DATA_PLANE_LB_HOST}:${QIITA_DATA_PLANE_LB_PORT}"
     if ! qiita_nginx_tls_present; then
         skip "health/data-plane-lb" "$lb not checked — nginx not reloaded (no TLS material)"
     elif grpcurl -plaintext "$lb" grpc.health.v1.Health/Check >/dev/null 2>&1; then
