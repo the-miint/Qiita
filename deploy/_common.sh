@@ -264,13 +264,21 @@ read_env_var() {
     ( set +eu; set -a; source "$env_file" >/dev/null 2>&1; set +a; printf '%s' "${!var:-}" )
 }
 
-# Does the env file assign KEY at all, even to an empty value? read_env_var cannot
+# read_env_var, blind to the caller's environment. The subshell that sources the
+# file inherits it, so read_env_var returns a KEY exported by whoever runs the script
+# when the file does not assign it. $1 = env file, $2 = KEY.
+read_env_file_var() {
+    ( unset "$2"; read_env_var "$1" "$2" )
+}
+
+# Does the env file itself assign KEY, even to an empty value? read_env_var cannot
 # tell "unset" from "set to empty"; a caller that must reject an empty assignment
-# asks this first. $1 = env file, $2 = KEY.
+# asks this first. KEY in the caller's environment does not count. $1 = env file,
+# $2 = KEY.
 env_file_sets_var() {
     local env_file="$1" var="$2"
     # shellcheck disable=SC1090,SC1091
-    ( set +eu; set -a; source "$env_file" >/dev/null 2>&1; set +a; [ -n "${!var+x}" ] )
+    ( unset "$var"; set +eu; set -a; source "$env_file" >/dev/null 2>&1; set +a; [ -n "${!var+x}" ] )
 }
 
 # --- Data-plane topology ------------------------------------------------------
@@ -288,8 +296,8 @@ env_file_sets_var() {
 # activate.sh renders the nginx upstream from them and enables/restarts one unit per
 # port on every deploy; verify.sh health-checks the rendered members. Because they
 # live in the file, a routine `make redeploy` reproduces the topology the host was
-# given. PORTS and PEERS can be overridden for one deploy by setting them in the
-# deploy's environment; BIND_HOST cannot (see qiita_data_plane_bind_host).
+# given. They are read from the file only, never the deploy's environment, so what
+# a deploy renders and enables is what the file says.
 # docs/runbooks/data-plane-scaling.md is the operator procedure.
 
 # The address and port of the loopback listener nginx serves the qiita_data_plane
@@ -357,24 +365,22 @@ qiita_data_plane_units() {
     echo "${units[*]}"
 }
 
-# The local instance ports, whitespace-separated: the deploy's environment when
-# QIITA_DATA_PLANE_PORTS is set there, else $DP_ENV, else 50051. Each port becomes a
-# systemd unit name, an nginx `server` line and a health-check target, so a
-# malformed list fails here rather than rendering broken config. Also refused: the
-# loopback listener's port, which nginx binds, and a repeated port, which would
-# render one member twice.
+# The local instance ports, whitespace-separated: QIITA_DATA_PLANE_PORTS in $DP_ENV,
+# else 50051; set but blank is an error. Each port becomes a systemd unit name, an
+# nginx `server` line and a health-check target, so a malformed list fails here
+# rather than rendering broken config. Also refused: the loopback listener's port,
+# which nginx binds, and a repeated port, which would render one member twice.
 qiita_data_plane_ports() {
     local ports="" port seen=" "
     qiita_dp_env_parses || return 1
-    if [ -n "${QIITA_DATA_PLANE_PORTS+x}" ]; then
-        ports=$QIITA_DATA_PLANE_PORTS
+    if [ -r "$DP_ENV" ] && env_file_sets_var "$DP_ENV" QIITA_DATA_PLANE_PORTS; then
+        ports=$(read_env_file_var "$DP_ENV" QIITA_DATA_PLANE_PORTS)
     else
-        [ -r "$DP_ENV" ] && ports=$(read_env_var "$DP_ENV" QIITA_DATA_PLANE_PORTS)
-        [ -n "${ports//[[:space:]]/}" ] || ports=50051
+        ports=50051
     fi
     # All whitespace, not just spaces: a tab-only value would otherwise validate
     # nothing and be echoed back as the list.
-    [ -n "${ports//[[:space:]]/}" ] || { echo "ERROR: QIITA_DATA_PLANE_PORTS is empty" >&2; return 1; }
+    [ -n "${ports//[[:space:]]/}" ] || { echo "ERROR: QIITA_DATA_PLANE_PORTS is set but empty in $DP_ENV" >&2; return 1; }
     for port in $ports; do
         qiita_valid_tcp_port "$port" "QIITA_DATA_PLANE_PORTS entry '$port'" || return 1
         if [ "$port" = "$QIITA_DATA_PLANE_LB_PORT" ]; then
@@ -392,8 +398,8 @@ qiita_data_plane_ports() {
     printf '%s' "$ports"
 }
 
-# Data planes on other hosts, as a space-separated `host:port` list: the deploy's
-# environment when QIITA_DATA_PLANE_PEERS is set there, else $DP_ENV, else none.
+# Data planes on other hosts, as a space-separated `host:port` list:
+# QIITA_DATA_PLANE_PEERS in $DP_ENV, else none.
 # Upstream members only — this deploy neither starts, restarts, nor upgrades them.
 # PORTS and PEERS are separate lists because only PORTS names systemd units here.
 #
@@ -405,11 +411,7 @@ qiita_data_plane_ports() {
 qiita_data_plane_peers() {
     local peers="" peer host port
     qiita_dp_env_parses || return 1
-    if [ -n "${QIITA_DATA_PLANE_PEERS+x}" ]; then
-        peers=$QIITA_DATA_PLANE_PEERS
-    elif [ -r "$DP_ENV" ]; then
-        peers=$(read_env_var "$DP_ENV" QIITA_DATA_PLANE_PEERS)
-    fi
+    [ -r "$DP_ENV" ] && peers=$(read_env_file_var "$DP_ENV" QIITA_DATA_PLANE_PEERS)
     [ -n "${peers//[[:space:]]/}" ] || { printf ''; return 0; }
     for peer in $peers; do
         case "$peer" in
@@ -469,7 +471,7 @@ qiita_data_plane_bind_host() {
     local host=""
     qiita_dp_env_parses || return 1
     if [ -r "$DP_ENV" ] && env_file_sets_var "$DP_ENV" QIITA_DATA_PLANE_BIND_HOST; then
-        host=$(read_env_var "$DP_ENV" QIITA_DATA_PLANE_BIND_HOST)
+        host=$(read_env_file_var "$DP_ENV" QIITA_DATA_PLANE_BIND_HOST)
         [ -n "$host" ] || { echo "ERROR: QIITA_DATA_PLANE_BIND_HOST is set but empty in $DP_ENV" >&2; return 1; }
     else
         host=127.0.0.1

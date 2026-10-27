@@ -198,15 +198,32 @@ def test_data_plane_ports_defaults_when_the_host_file_omits_it(tmp_path: Path) -
     assert result.stdout == "50051"
 
 
-def test_data_plane_ports_environment_overrides_the_host_file(tmp_path: Path) -> None:
-    env_file = _dp_env(tmp_path, 'QIITA_DATA_PLANE_PORTS="50051 50052 50053"\n')
-    result = _run_common(
-        "qiita_data_plane_ports",
-        dp_env=env_file,
-        extra_env={"QIITA_DATA_PLANE_PORTS": "50051"},
-    )
+@pytest.mark.parametrize(
+    ("snippet", "var", "file_value", "env_value", "expected"),
+    [
+        ("qiita_data_plane_ports", "QIITA_DATA_PLANE_PORTS", "50051 50052", "50053", "50051 50052"),
+        ("qiita_data_plane_ports", "QIITA_DATA_PLANE_PORTS", None, "50053", "50051"),
+        (
+            "qiita_data_plane_peers",
+            "QIITA_DATA_PLANE_PEERS",
+            "10.0.0.9:50051",
+            "",
+            "10.0.0.9:50051",
+        ),
+        ("qiita_data_plane_peers", "QIITA_DATA_PLANE_PEERS", None, "10.0.0.9:50051", ""),
+        ("qiita_data_plane_bind_host", "QIITA_DATA_PLANE_BIND_HOST", None, "10.0.0.9", "127.0.0.1"),
+    ],
+)
+def test_topology_ignores_the_deploy_environment(
+    tmp_path: Path, snippet: str, var: str, file_value: str | None, env_value: str, expected: str
+) -> None:
+    """Only the host file counts: a value exported by whoever runs the deploy, set or
+    blank, with or without the key in the file, changes nothing, so what a deploy
+    renders and enables is what the file says."""
+    body = "PATH_SCRATCH=/scratch\n" if file_value is None else f'{var}="{file_value}"\n'
+    result = _run_common(snippet, dp_env=_dp_env(tmp_path, body), extra_env={var: env_value})
     assert result.returncode == 0, result.stderr
-    assert result.stdout == "50051"
+    assert result.stdout == expected
 
 
 @pytest.mark.parametrize(
@@ -222,22 +239,21 @@ def test_data_plane_ports_environment_overrides_the_host_file(tmp_path: Path) ->
         "   ",  # blank
     ],
 )
-def test_data_plane_ports_rejects_malformed_values(value: str) -> None:
+def test_data_plane_ports_rejects_malformed_values(tmp_path: Path, value: str) -> None:
     """Each port becomes a systemd unit name, an nginx `server` line and a
     health-check target, so a bad entry fails here instead of rendering broken
     config."""
-    result = _run_common("qiita_data_plane_ports", extra_env={"QIITA_DATA_PLANE_PORTS": value})
+    env_file = _dp_env(tmp_path, f'QIITA_DATA_PLANE_PORTS="{value}"\n')
+    result = _run_common("qiita_data_plane_ports", dp_env=env_file)
     assert result.returncode != 0, f"{value!r} should be rejected, got {result.stdout!r}"
     assert result.stdout == ""
 
 
-def test_data_plane_ports_rejects_the_loopback_listener_port() -> None:
+def test_data_plane_ports_rejects_the_loopback_listener_port(tmp_path: Path) -> None:
     """nginx binds QIITA_DATA_PLANE_LB_PORT itself; an instance on it would fight
     nginx for the port."""
-    result = _run_common(
-        "qiita_data_plane_ports",
-        extra_env={"QIITA_DATA_PLANE_PORTS": f"50051 {_lb_port()}"},
-    )
+    env_file = _dp_env(tmp_path, f'QIITA_DATA_PLANE_PORTS="50051 {_lb_port()}"\n')
+    result = _run_common("qiita_data_plane_ports", dp_env=env_file)
     assert result.returncode != 0, result.stdout
     assert "loopback listener" in result.stderr
 
@@ -256,16 +272,6 @@ def test_data_plane_peers_reads_the_host_file(tmp_path: Path) -> None:
     assert result.stdout.split() == ["10.0.0.9:50051", "10.0.0.9:50052"]
 
 
-def test_data_plane_peers_blank_environment_overrides_the_host_file(tmp_path: Path) -> None:
-    """Setting the variable to blank for one deploy drops the peers the file names."""
-    env_file = _dp_env(tmp_path, 'QIITA_DATA_PLANE_PEERS="10.0.0.9:50051"\n')
-    result = _run_common(
-        "qiita_data_plane_peers", dp_env=env_file, extra_env={"QIITA_DATA_PLANE_PEERS": ""}
-    )
-    assert result.returncode == 0, result.stderr
-    assert result.stdout == ""
-
-
 @pytest.mark.parametrize(
     "value",
     [
@@ -275,8 +281,9 @@ def test_data_plane_peers_blank_environment_overrides_the_host_file(tmp_path: Pa
         "[2001:db8::1]:50051",  # bracketed IPv6 literal
     ],
 )
-def test_data_plane_peers_accepts_host_port_forms(value: str) -> None:
-    result = _run_common("qiita_data_plane_peers", extra_env={"QIITA_DATA_PLANE_PEERS": value})
+def test_data_plane_peers_accepts_host_port_forms(tmp_path: Path, value: str) -> None:
+    env_file = _dp_env(tmp_path, f'QIITA_DATA_PLANE_PEERS="{value}"\n')
+    result = _run_common("qiita_data_plane_peers", dp_env=env_file)
     assert result.returncode == 0, result.stderr
     assert result.stdout.split() == value.split()
 
@@ -302,21 +309,23 @@ def test_data_plane_peers_accepts_host_port_forms(value: str) -> None:
         "1.2.3.4.:50051",  # trailing dot; nginx fails to resolve it
     ],
 )
-def test_data_plane_peers_rejects_malformed_values(value: str) -> None:
+def test_data_plane_peers_rejects_malformed_values(tmp_path: Path, value: str) -> None:
     """Each entry is written into an nginx `server` directive verbatim, so shape
     validation is what stands between the setting and an injected directive or a
     member at an address nobody meant."""
-    result = _run_common("qiita_data_plane_peers", extra_env={"QIITA_DATA_PLANE_PEERS": value})
+    env_file = _dp_env(tmp_path, f'QIITA_DATA_PLANE_PEERS="{value}"\n')
+    result = _run_common("qiita_data_plane_peers", dp_env=env_file)
     assert result.returncode != 0, f"{value!r} should be rejected, got {result.stdout!r}"
     assert result.stdout == ""
 
 
 @pytest.mark.parametrize("blank", ["   ", "\t", " \t "])
-def test_data_plane_peers_treats_whitespace_only_as_unset(blank: str) -> None:
+def test_data_plane_peers_treats_whitespace_only_as_unset(tmp_path: Path, blank: str) -> None:
     """Whitespace-only ⇒ no peers, not an error (the ports list rejects blank because
     a host always runs at least one instance). Tabs count: a tab-only value must not
     be echoed back as a peer."""
-    result = _run_common("qiita_data_plane_peers", extra_env={"QIITA_DATA_PLANE_PEERS": blank})
+    env_file = _dp_env(tmp_path, f'QIITA_DATA_PLANE_PEERS="{blank}"\n')
+    result = _run_common("qiita_data_plane_peers", dp_env=env_file)
     assert result.returncode == 0, result.stderr
     assert result.stdout == ""
 
