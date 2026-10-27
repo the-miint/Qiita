@@ -51,18 +51,13 @@ from qiita_control_plane.testing.unique_names import (
 from conftest import cleanup_ena_study, ducklake_connect
 
 _DOWNLOAD_ENA_STUDY_YAML_PATH = (
-    Path(__file__).parent.parent.parent
-    / "workflows"
-    / "download-ena-study"
-    / "1.0.0.yaml"
+    Path(__file__).parent.parent.parent / "workflows" / "download-ena-study" / "1.0.0.yaml"
 )
 
 # Network-free resolver seam.
 _QUERY_STUDY = "qiita_control_plane.ena_import.miint_resolver._query_ena_study_header"
 _QUERY_RUNS = "qiita_control_plane.ena_import.miint_resolver._query_ena_runs"
-_QUERY_ATTRS = (
-    "qiita_control_plane.ena_import.miint_resolver._query_ena_sample_attributes"
-)
+_QUERY_ATTRS = "qiita_control_plane.ena_import.miint_resolver._query_ena_sample_attributes"
 
 _RUN_COLUMNS = (
     "run_accession",
@@ -164,9 +159,7 @@ def _write_ena_run_map(path: Path, roster: list[tuple[int, str]]) -> None:
     rows = ", ".join(f"({idx}, '{acc}')" for idx, acc in roster)
     with duckdb.connect(":memory:") as conn:
         conn.execute(
-            "COPY (SELECT * FROM (VALUES "
-            + rows
-            + ") AS t(prep_sample_idx, ena_run_accession)) "
+            "COPY (SELECT * FROM (VALUES " + rows + ") AS t(prep_sample_idx, ena_run_accession)) "
             f"TO '{path}' (FORMAT parquet)"
         )
 
@@ -282,9 +275,7 @@ async def batch_app(postgres_pool):
 
     yield app
 
-    pending = list(app.state.running_dispatches) + list(
-        app.state.running_ena_import_batches
-    )
+    pending = list(app.state.running_dispatches) + list(app.state.running_ena_import_batches)
     if pending:
         await asyncio.gather(*pending, return_exceptions=True)
     app.state.compute_backend_client = saved_compute_backend_client
@@ -338,9 +329,7 @@ async def download_ena_study_action(postgres_pool):
         "          $4::jsonb, $5::jsonb, 1, 1, '1 minute', 'active', 'failed')",
         DOWNLOAD_ENA_STUDY_ACTION_ID,
         DOWNLOAD_ENA_STUDY_ACTION_VERSION,
-        json.dumps(
-            {"service": False, "human_roles": ["wet_lab_admin", "system_admin"]}
-        ),
+        json.dumps({"service": False, "human_roles": ["wet_lab_admin", "system_admin"]}),
         json.dumps(
             {
                 "type": "object",
@@ -448,9 +437,7 @@ async def test_batch_driver_to_register_files_to_ducklake_full_span(
         " FROM qiita.ena_import_batch_item WHERE batch_idx = $1",
         batch_idx,
     )
-    assert item_row["state"] == BatchItemState.DOWNLOADING.value, item_row[
-        "failure_reason"
-    ]
+    assert item_row["state"] == BatchItemState.DOWNLOADING.value, item_row["failure_reason"]
     assert item_row["study_idx"] is not None
     assert len(item_row["download_work_ticket_idxs"]) == 1
     work_ticket_idx = item_row["download_work_ticket_idxs"][0]
@@ -506,9 +493,7 @@ async def test_batch_driver_to_register_files_to_ducklake_full_span(
     from qiita_compute_orchestrator.jobs import ingest_ena_reads
     from qiita_compute_orchestrator.sequence_range import MintedSequenceRange
 
-    monkeypatch.setattr(
-        ingest_ena_reads, "_stage_run_reads", _fake_stage_run_reads_factory(by_run)
-    )
+    monkeypatch.setattr(ingest_ena_reads, "_stage_run_reads", _fake_stage_run_reads_factory(by_run))
 
     mint_calls: list[tuple[int, int]] = []
 
@@ -609,9 +594,7 @@ async def test_run_list_import_ingests_only_the_listed_runs(
         return list(_RUN_COLUMNS), [_row(r) for r in all_runs if r in wanted]
 
     def fake_attrs(query):
-        samples = (
-            [f"SAMN{r[3:]}" for r in all_runs] if isinstance(query, str) else query
-        )
+        samples = [f"SAMN{r[3:]}" for r in all_runs] if isinstance(query, str) else query
         return [(s, {"collection date": ["2020-01-01"]}) for s in samples]
 
     monkeypatch.setattr(_QUERY_STUDY, _fake_study_header)
@@ -630,9 +613,7 @@ async def test_run_list_import_ingests_only_the_listed_runs(
         " FROM qiita.ena_import_batch_item WHERE batch_idx = $1",
         batch_idx,
     )
-    assert item_row["state"] == BatchItemState.DOWNLOADING.value, item_row[
-        "failure_reason"
-    ]
+    assert item_row["state"] == BatchItemState.DOWNLOADING.value, item_row["failure_reason"]
     assert item_row["ena_study_accession"] == accession
     (work_ticket_idx,) = item_row["download_work_ticket_idxs"]
 
@@ -656,9 +637,7 @@ async def test_run_list_import_ingests_only_the_listed_runs(
     from qiita_compute_orchestrator.jobs import ingest_ena_reads
     from qiita_compute_orchestrator.sequence_range import MintedSequenceRange
 
-    monkeypatch.setattr(
-        ingest_ena_reads, "_stage_run_reads", _fake_stage_run_reads_factory(by_run)
-    )
+    monkeypatch.setattr(ingest_ena_reads, "_stage_run_reads", _fake_stage_run_reads_factory(by_run))
 
     async def _local_mint(*, http, prep_sample_idx, count, work_ticket_idx):
         row = await postgres_pool.fetchrow(
@@ -695,9 +674,7 @@ async def test_run_list_import_ingests_only_the_listed_runs(
         work_ticket_idx=work_ticket_idx,
     )
 
-    assert _count_read_rows(data_plane, prep_sample_idxs) == len(_RUN1_ROWS) + len(
-        _RUN2_ROWS
-    )
+    assert _count_read_rows(data_plane, prep_sample_idxs) == len(_RUN1_ROWS) + len(_RUN2_ROWS)
     unlisted_prep_samples = await postgres_pool.fetch(
         "SELECT prep_sample_idx FROM qiita.sequenced_sample WHERE ena_run_accession = $1",
         all_runs[2],
@@ -729,9 +706,7 @@ async def test_pool_with_a_permanently_failed_run_lands_the_rest_and_reads_compl
         postgres_pool, accessions=[accession], principal=admin_principal
     )
     batch_cleanup.append(batch_idx)
-    await _process_one_study(
-        batch_app, postgres_pool, item=items[0], principal=admin_principal
-    )
+    await _process_one_study(batch_app, postgres_pool, item=items[0], principal=admin_principal)
     (work_ticket_idx,) = await postgres_pool.fetchval(
         "SELECT download_work_ticket_idxs FROM qiita.ena_import_batch_item WHERE batch_idx = $1",
         batch_idx,

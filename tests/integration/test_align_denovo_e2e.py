@@ -213,9 +213,7 @@ async def seeded(postgres_pool, data_plane, genome):
         "DELETE FROM qiita.processing WHERE processing_idx = ANY($1::bigint[])",
         [processing_idx, other_run["processing_idx"]],
     )
-    await postgres_pool.execute(
-        "DELETE FROM qiita.mask_definition WHERE mask_idx = $1", mask_idx
-    )
+    await postgres_pool.execute("DELETE FROM qiita.mask_definition WHERE mask_idx = $1", mask_idx)
     await delete_principal(postgres_pool, principal_idx)
 
 

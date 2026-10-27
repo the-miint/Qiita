@@ -43,10 +43,7 @@ from qiita_control_plane.testing.db_seeds import seed_user_principal
 from conftest import cleanup_ena_study, ducklake_connect
 
 _DOWNLOAD_ENA_STUDY_YAML_PATH = (
-    Path(__file__).parent.parent.parent
-    / "workflows"
-    / "download-ena-study"
-    / "1.0.0.yaml"
+    Path(__file__).parent.parent.parent / "workflows" / "download-ena-study" / "1.0.0.yaml"
 )
 
 # Markers meaning "network/infra unavailable, not a real bug" -- deliberately
@@ -92,9 +89,7 @@ def _write_ena_run_map(path: Path, roster: list[tuple[int, str]]) -> None:
     rows = ", ".join(f"({idx}, '{acc}')" for idx, acc in roster)
     with duckdb.connect(":memory:") as conn:
         conn.execute(
-            "COPY (SELECT * FROM (VALUES "
-            + rows
-            + ") AS t(prep_sample_idx, ena_run_accession)) "
+            "COPY (SELECT * FROM (VALUES " + rows + ") AS t(prep_sample_idx, ena_run_accession)) "
             f"TO '{path}' (FORMAT parquet)"
         )
 
@@ -167,9 +162,7 @@ async def batch_app(postgres_pool):
 
     yield app
 
-    pending = list(app.state.running_dispatches) + list(
-        app.state.running_ena_import_batches
-    )
+    pending = list(app.state.running_dispatches) + list(app.state.running_ena_import_batches)
     if pending:
         await asyncio.gather(*pending, return_exceptions=True)
     app.state.compute_backend_client = saved_compute_backend_client
@@ -221,9 +214,7 @@ async def download_ena_study_action(postgres_pool):
         "          $4::jsonb, $5::jsonb, 1, 1, '1 minute', 'active', 'failed')",
         DOWNLOAD_ENA_STUDY_ACTION_ID,
         DOWNLOAD_ENA_STUDY_ACTION_VERSION,
-        json.dumps(
-            {"service": False, "human_roles": ["wet_lab_admin", "system_admin"]}
-        ),
+        json.dumps({"service": False, "human_roles": ["wet_lab_admin", "system_admin"]}),
         json.dumps(
             {
                 "type": "object",

@@ -53,9 +53,7 @@ from qiita_control_plane.testing.db_teardown import teardown_entity_graph
 
 from conftest import ducklake_connect
 
-_ALIGN_YAML_PATH = (
-    Path(__file__).parent.parent.parent / "workflows" / "align" / "1.0.0.yaml"
-)
+_ALIGN_YAML_PATH = Path(__file__).parent.parent.parent / "workflows" / "align" / "1.0.0.yaml"
 
 # Reads per sample. Small — the DuckLake writes are cheap and the exact row count
 # (reads × rows-per-read) is asserted, so keep it tiny.
