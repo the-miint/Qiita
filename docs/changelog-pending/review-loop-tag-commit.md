@@ -1,7 +1,7 @@
 ### Changed
 
 - **`review-loop-check` no longer needs the PR-number tag commit named on the "Reviewed
-  at" line (#TBD).** A later commit is exempt when it only modifies files under
+  at" line (#786).** A later commit is exempt when it only modifies files under
   `docs/changelog-pending/` and `DEPLOY_CHECKLIST.md`, adds at least one tag with the
   PR's own number, adds no placeholder tag such as `(#TBD)` or `(#<branch>)`, and
   leaves each file byte-identical once that tag and the placeholder tags are dropped.
