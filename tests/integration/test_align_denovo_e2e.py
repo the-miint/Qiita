@@ -114,9 +114,7 @@ async def seeded(postgres_pool, data_plane, genome):
     )
 
     suffix = secrets.token_hex(4)
-    principal_idx = await seed_user_principal(
-        postgres_pool, prefix="denovo-e2e", suffix=suffix
-    )
+    principal_idx = await seed_user_principal(postgres_pool, prefix="denovo-e2e", suffix=suffix)
     biosample_idx, prep_sample_idx = await seed_biosample_with_sequenced_prep_sample(
         postgres_pool, owner_idx=principal_idx
     )
@@ -283,9 +281,7 @@ async def denovo(seeded, tmp_path, request):
         "workspace": tmp_path / "ws",
     }
 
-    await pool.execute(
-        "DELETE FROM qiita.work_ticket WHERE work_ticket_idx = $1", work_ticket_idx
-    )
+    await pool.execute("DELETE FROM qiita.work_ticket WHERE work_ticket_idx = $1", work_ticket_idx)
     await pool.execute("DELETE FROM qiita.action WHERE action_id = $1", action_id)
     # The PENDING gate rows cascade off the identity they are keyed on.
     await pool.execute(
@@ -307,9 +303,7 @@ def _install_real_streams(monkeypatch, denovo):
     url = f"grpc://{LOOPBACK_HOST}:{denovo['data_plane']['port']}"
 
     @asynccontextmanager
-    async def _contigs(
-        conn, *, prep_sample_idx, processing_idx, relation="assembly_chunks"
-    ):
+    async def _contigs(conn, *, prep_sample_idx, processing_idx, relation="assembly_chunks"):
         ticket = _sign(
             "assembled_sequence_chunks",
             {"prep_sample_idx": [prep_sample_idx], "processing_idx": [processing_idx]},
@@ -389,9 +383,7 @@ def _lake(denovo, sql: str):
 
 
 @pytest.mark.asyncio
-async def test_de_novo_alignment_streams_both_inputs_and_registers_both_tables(
-    denovo, monkeypatch
-):
+async def test_de_novo_alignment_streams_both_inputs_and_registers_both_tables(denovo, monkeypatch):
     """The whole path. Four assertions that each fail for a different reason:
 
     * the origin-spanning read reaches `alignment` with BOTH its records — the
@@ -443,9 +435,7 @@ async def test_de_novo_alignment_streams_both_inputs_and_registers_both_tables(
 
 
 @pytest.mark.asyncio
-async def test_a_re_run_replaces_its_own_rows_rather_than_appending(
-    denovo, monkeypatch
-):
+async def test_a_re_run_replaces_its_own_rows_rather_than_appending(denovo, monkeypatch):
     """`delete-alignment-sample` before `register-files` is what makes a retry exact.
     Without it the second registration would double every row — which is why the
     counts are asserted rather than the row set."""

@@ -98,15 +98,11 @@ async def fresh_reference(postgres_pool, human_admin_session):
         human_admin_session["principal_idx"],
     )
     yield idx
-    await postgres_pool.execute(
-        "DELETE FROM qiita.work_ticket WHERE reference_idx = $1", idx
-    )
+    await postgres_pool.execute("DELETE FROM qiita.work_ticket WHERE reference_idx = $1", idx)
     await postgres_pool.execute(
         "DELETE FROM qiita.reference_membership WHERE reference_idx = $1", idx
     )
-    await postgres_pool.execute(
-        "DELETE FROM qiita.reference WHERE reference_idx = $1", idx
-    )
+    await postgres_pool.execute("DELETE FROM qiita.reference WHERE reference_idx = $1", idx)
 
 
 _TEST_SEQUENCES = {
@@ -337,9 +333,7 @@ async def test_e2e_create_to_doget(
 
     table = _doget("reference_sequences")
     assert table.num_rows == 3
-    assert {"feature_idx", "sequence_hash", "sequence_length_bp"}.issubset(
-        set(table.column_names)
-    )
+    assert {"feature_idx", "sequence_hash", "sequence_length_bp"}.issubset(set(table.column_names))
 
     chunks = _doget("reference_sequence_chunks")
     assert chunks.num_rows == 3
@@ -347,9 +341,7 @@ async def test_e2e_create_to_doget(
     # — for the three short fixture sequences each is already canonical.
     canon_seqs = set()
     for seq in _TEST_SEQUENCES.values():
-        rc = seq.translate(str.maketrans("ACGTRYSWKMBDHVN", "TGCAYRSWMKVHDBN"))[
-            ::-1
-        ].upper()
+        rc = seq.translate(str.maketrans("ACGTRYSWKMBDHVN", "TGCAYRSWMKVHDBN"))[::-1].upper()
         canon_seqs.add(min(seq.upper(), rc))
     assert set(chunks.column("chunk_data").to_pylist()) == canon_seqs
 
@@ -509,9 +501,7 @@ async def test_e2e_exclusion_masks_taxonomy_and_reports_provenance(
         # test_e2e_create_to_doget (same fixture bytes), so a leaked block would
         # wrongly drop a row there. Do this BEFORE dropping the genome (the FK
         # CASCADE would remove the Postgres row without refreshing the mirror).
-        await cli_cp_client.delete(
-            URL_REFERENCE_EXCLUSION, params={"genome_idx": blocked_genome}
-        )
+        await cli_cp_client.delete(URL_REFERENCE_EXCLUSION, params={"genome_idx": blocked_genome})
         # Drop exactly this load's genome/junction rows (fresh_reference cleans
         # membership + reference; feature rows accumulate as they do for the
         # sibling e2e — a pre-existing property of content-hash features).
@@ -546,7 +536,6 @@ async def test_e2e_export_genome_with_shared_plasmid(
     of dropping the standalone UNIQUE(feature_idx)."""
     import pyarrow.parquet as pq
     from qiita_common.api_paths import URL_REFERENCE_GENOME_MEMBER
-
     from qiita_control_plane.auth.tickets import sign_ticket
     from qiita_control_plane.cli.reference_load import do_reference_load
     from qiita_control_plane.cli.user import reference as ref_cli
@@ -651,9 +640,7 @@ async def test_e2e_export_genome_with_shared_plasmid(
             ref_cli._write_genome_parquet(reader2, parquet_out)
 
             fasta_records = _read_fasta_gz(con, fasta_out)
-            pq_features = set(
-                pq.read_table(parquet_out).column("feature_idx").to_pylist()
-            )
+            pq_features = set(pq.read_table(parquet_out).column("feature_idx").to_pylist())
             results[genome_idx] = {"fasta": fasta_records, "pq_features": pq_features}
 
         # Genome A's FASTA: its chromosome + the shared plasmid, headed by accession.
@@ -692,9 +679,7 @@ def _read_fasta_gz(con, path: Path) -> dict[str, str]:
     the reader side of the write→read round-trip, never a hand-rolled parser (we
     do not reimplement fundamental parsers). read_fastx yields one row per record
     with `read_id` (the FASTA header) and `sequence1` (the sequence)."""
-    rows = con.execute(
-        "SELECT read_id, sequence1 FROM read_fastx(?)", [str(path)]
-    ).fetchall()
+    rows = con.execute("SELECT read_id, sequence1 FROM read_fastx(?)", [str(path)]).fetchall()
     return {read_id: sequence for read_id, sequence in rows}
 
 

@@ -101,9 +101,7 @@ def _block_action_entry(name: str):
     raise AssertionError(f"no action entry named {name!r} in read-mask-block YAML")
 
 
-def _write_block_read_mask_parquet(
-    staging_dir: Path, *, mask_idx: int, rows: list[tuple]
-) -> Path:
+def _write_block_read_mask_parquet(staging_dir: Path, *, mask_idx: int, rows: list[tuple]) -> Path:
     """Materialize a block's `read_mask.parquet` under `staging_dir` in
     host_filter's block emit shape and return the parquet path. `rows` are
     (prep_sample_idx, sequence_idx, reason, lt1, rt1, lt2, rt2) tuples — a MULTI
@@ -203,18 +201,14 @@ async def block_pool(postgres_pool, human_admin_session):
     suffix = secrets.token_hex(4)
 
     # Sample A creates the run + pool; sample B is attached to the SAME pool.
-    bs_a, prep_a = await seed_biosample_with_sequenced_prep_sample(
-        postgres_pool, owner_idx=owner
-    )
+    bs_a, prep_a = await seed_biosample_with_sequenced_prep_sample(postgres_pool, owner_idx=owner)
     run_idx, pool_idx, ss_a = await seed_sequenced_sample_subtype(
         postgres_pool,
         prep_sample_idx=prep_a,
         owner_idx=owner,
         sequenced_pool_item_id=f"a-{suffix}",
     )
-    bs_b, prep_b = await seed_biosample_with_sequenced_prep_sample(
-        postgres_pool, owner_idx=owner
-    )
+    bs_b, prep_b = await seed_biosample_with_sequenced_prep_sample(postgres_pool, owner_idx=owner)
     ss_b = await postgres_pool.fetchval(
         "INSERT INTO qiita.sequenced_sample"
         "  (prep_sample_idx, sequenced_pool_idx, sequenced_pool_item_id, created_by_idx)"
@@ -281,9 +275,7 @@ async def block_pool(postgres_pool, human_admin_session):
             mask_idx,
         )
         async with postgres_pool.acquire() as conn, conn.transaction():
-            await set_block_work_ticket(
-                conn, block_idx=block_idx, work_ticket_idx=wt_idx
-            )
+            await set_block_work_ticket(conn, block_idx=block_idx, work_ticket_idx=wt_idx)
         async with postgres_pool.acquire() as conn:
             await set_block_state(conn, block_idx=block_idx, new_state=state)
         created_blocks.append(block_idx)
@@ -320,15 +312,9 @@ async def block_pool(postgres_pool, human_admin_session):
         biosample_idxs=[bs_a, bs_b],
         prep_sample_idxs=[prep_a, prep_b],
     )
-    await postgres_pool.execute(
-        "DELETE FROM qiita.sequenced_pool WHERE idx = $1", pool_idx
-    )
-    await postgres_pool.execute(
-        "DELETE FROM qiita.sequencing_run WHERE idx = $1", run_idx
-    )
-    await postgres_pool.execute(
-        "DELETE FROM qiita.mask_definition WHERE mask_idx = $1", mask_idx
-    )
+    await postgres_pool.execute("DELETE FROM qiita.sequenced_pool WHERE idx = $1", pool_idx)
+    await postgres_pool.execute("DELETE FROM qiita.sequencing_run WHERE idx = $1", run_idx)
+    await postgres_pool.execute("DELETE FROM qiita.mask_definition WHERE mask_idx = $1", mask_idx)
 
 
 async def _metrics_row(pool, ss_idx):
@@ -355,9 +341,7 @@ async def _export_ticket_or_status(pool, data_plane, *, prep_sample_idx, mask_id
 
     try:
         await create_masked_read_export_ticket(
-            body=MaskedReadExportTicketRequest(
-                prep_sample_idx=prep_sample_idx, mask_idx=mask_idx
-            ),
+            body=MaskedReadExportTicketRequest(prep_sample_idx=prep_sample_idx, mask_idx=mask_idx),
             pool=pool,
             signing_key=data_plane["secret"],
             _role=None,
@@ -373,9 +357,7 @@ async def _export_ticket_or_status(pool, data_plane, *, prep_sample_idx, mask_id
 # ---------------------------------------------------------------------------
 
 
-async def test_block_split_sample_reconciles_and_gates_export(
-    block_pool, data_plane, tmp_path
-):
+async def test_block_split_sample_reconciles_and_gates_export(block_pool, data_plane, tmp_path):
     """A sample split across two blocks finalizes only once BOTH complete, with
     metrics rolled up from the real DuckLake aggregate and the count assertion
     satisfied; the masked-read export ticket 409s while a covering block is in
@@ -447,15 +429,11 @@ async def test_block_split_sample_reconciles_and_gates_export(
 
     # Export gate: prep_a complete -> ticket minted; prep_b partial -> 409.
     assert (
-        await _export_ticket_or_status(
-            pool, data_plane, prep_sample_idx=prep_a, mask_idx=mask_idx
-        )
+        await _export_ticket_or_status(pool, data_plane, prep_sample_idx=prep_a, mask_idx=mask_idx)
         == 201
     )
     assert (
-        await _export_ticket_or_status(
-            pool, data_plane, prep_sample_idx=prep_b, mask_idx=mask_idx
-        )
+        await _export_ticket_or_status(pool, data_plane, prep_sample_idx=prep_b, mask_idx=mask_idx)
         == 409
     )
 
@@ -506,9 +484,7 @@ async def test_block_split_sample_reconciles_and_gates_export(
 
     # Export gate now allows prep_b too.
     assert (
-        await _export_ticket_or_status(
-            pool, data_plane, prep_sample_idx=prep_b, mask_idx=mask_idx
-        )
+        await _export_ticket_or_status(pool, data_plane, prep_sample_idx=prep_b, mask_idx=mask_idx)
         == 201
     )
 
@@ -584,9 +560,7 @@ async def test_block_delete_then_register_leaves_no_duplicate_rows(
         )
 
     def count() -> int:
-        return _count_read_mask_rows(
-            data_plane, mask_idx=mask_idx, prep_sample_idx=prep_a
-        )
+        return _count_read_mask_rows(data_plane, mask_idx=mask_idx, prep_sample_idx=prep_a)
 
     # First run: delete (0 rows, fresh) then register -> exactly n rows.
     await _delete_then_register("run1", wt=block * 10 + 1)

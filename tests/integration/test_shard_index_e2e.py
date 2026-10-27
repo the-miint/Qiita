@@ -39,15 +39,13 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 import pytest
-from _runner_helpers import LocalComputeBackendClient
-from conftest import ducklake_connect
 from qiita_common.api_paths import LOOPBACK_HOST
 
+from _runner_helpers import LocalComputeBackendClient
+from conftest import ducklake_connect
+
 _BUILD_SHARD_INDEX_YAML_PATH = (
-    Path(__file__).parent.parent.parent
-    / "workflows"
-    / "build-shard-index"
-    / "1.0.0.yaml"
+    Path(__file__).parent.parent.parent / "workflows" / "build-shard-index" / "1.0.0.yaml"
 )
 
 # STRUCTURED contigs (distinct motifs tiled) so miint sees real, reproducible
@@ -132,14 +130,11 @@ async def sharded_reference(postgres_pool, human_admin_session, data_plane):
     try:
         seqs = list(_CONTIGS.values())
         seq_rows = ", ".join(
-            f"({fidx}, gen_random_uuid(), {len(seq)})"
-            for fidx, seq in zip(feature_idxs, seqs)
+            f"({fidx}, gen_random_uuid(), {len(seq)})" for fidx, seq in zip(feature_idxs, seqs)
         )
         conn.execute(f"INSERT INTO qiita_lake.reference_sequences VALUES {seq_rows}")
         member_rows = ", ".join(f"({reference_idx}, {fidx})" for fidx in feature_idxs)
-        conn.execute(
-            f"INSERT INTO qiita_lake.reference_membership VALUES {member_rows}"
-        )
+        conn.execute(f"INSERT INTO qiita_lake.reference_membership VALUES {member_rows}")
         chunk_rows = []
         for fidx, seq in zip(feature_idxs, seqs):
             mid = len(seq) // 2  # two chunks each, to exercise reassembly
@@ -175,7 +170,6 @@ def _fake_open_stream(data_plane):
     chunk ticket with the fixture DP secret and streams via the real
     `open_doget_stream` — bypassing the CP hop (which needs a running CP)."""
     from qiita_compute_orchestrator.data_plane_client import open_doget_stream
-
     from qiita_control_plane.auth.tickets import sign_ticket
 
     @asynccontextmanager
@@ -209,7 +203,6 @@ async def test_build_shard_index_workflow_end_to_end(
     `indexing -> active` by finalize-shard (which also required the pre-registered
     whole-reference rype_router row)."""
     from qiita_compute_orchestrator.jobs import build_minimap2_index
-
     from qiita_control_plane.runner import run_workflow
 
     monkeypatch.setenv("PATH_DERIVED", str(tmp_path / "derived"))

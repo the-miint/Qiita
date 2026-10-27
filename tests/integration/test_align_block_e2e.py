@@ -156,9 +156,7 @@ def _data_plane_url(data_plane) -> str:
     return f"grpc://{LOOPBACK_HOST}:{data_plane['port']}"
 
 
-def _count_alignment_rows(
-    data_plane, *, alignment_idx: int, prep_sample_idx: int
-) -> int:
+def _count_alignment_rows(data_plane, *, alignment_idx: int, prep_sample_idx: int) -> int:
     """Count DuckLake `alignment` rows for an (alignment, prep_sample) — the table
     is not Flight-reachable (a sink this milestone), so read it via a direct
     DuckLake conn (mirrors the read-mask e2e's read_mask read-back)."""
@@ -228,18 +226,14 @@ async def align_block_pool(postgres_pool, human_admin_session):
     owner = human_admin_session["principal_idx"]
     suffix = secrets.token_hex(4)
 
-    bs_a, prep_a = await seed_biosample_with_sequenced_prep_sample(
-        postgres_pool, owner_idx=owner
-    )
+    bs_a, prep_a = await seed_biosample_with_sequenced_prep_sample(postgres_pool, owner_idx=owner)
     run_idx, pool_idx, _ss_a = await seed_sequenced_sample_subtype(
         postgres_pool,
         prep_sample_idx=prep_a,
         owner_idx=owner,
         sequenced_pool_item_id=f"a-{suffix}",
     )
-    bs_b, prep_b = await seed_biosample_with_sequenced_prep_sample(
-        postgres_pool, owner_idx=owner
-    )
+    bs_b, prep_b = await seed_biosample_with_sequenced_prep_sample(postgres_pool, owner_idx=owner)
     await postgres_pool.execute(
         "INSERT INTO qiita.sequenced_sample"
         "  (prep_sample_idx, sequenced_pool_idx, sequenced_pool_item_id, created_by_idx)"
@@ -311,9 +305,7 @@ async def align_block_pool(postgres_pool, human_admin_session):
             alignment_idx,
         )
         async with postgres_pool.acquire() as conn, conn.transaction():
-            await set_block_work_ticket(
-                conn, block_idx=block_idx, work_ticket_idx=wt_idx
-            )
+            await set_block_work_ticket(conn, block_idx=block_idx, work_ticket_idx=wt_idx)
         async with postgres_pool.acquire() as conn:
             await set_block_state(conn, block_idx=block_idx, new_state=state)
         created_blocks.append(block_idx)
@@ -343,21 +335,15 @@ async def align_block_pool(postgres_pool, human_admin_session):
             "DELETE FROM qiita.block WHERE block_idx = ANY($1::bigint[])",
             created_blocks,
         )
-    await postgres_pool.execute(
-        "DELETE FROM qiita.action WHERE action_id = $1", action_id
-    )
+    await postgres_pool.execute("DELETE FROM qiita.action WHERE action_id = $1", action_id)
     await teardown_entity_graph(
         postgres_pool,
         study_idxs=[],
         biosample_idxs=[bs_a, bs_b],
         prep_sample_idxs=[prep_a, prep_b],
     )
-    await postgres_pool.execute(
-        "DELETE FROM qiita.sequenced_pool WHERE idx = $1", pool_idx
-    )
-    await postgres_pool.execute(
-        "DELETE FROM qiita.sequencing_run WHERE idx = $1", run_idx
-    )
+    await postgres_pool.execute("DELETE FROM qiita.sequenced_pool WHERE idx = $1", pool_idx)
+    await postgres_pool.execute("DELETE FROM qiita.sequencing_run WHERE idx = $1", run_idx)
     await postgres_pool.execute(
         "DELETE FROM qiita.alignment_definition WHERE alignment_idx = $1", alignment_idx
     )
@@ -377,9 +363,7 @@ async def _alignment_sample_state(pool, alignment_idx, prep_sample_idx):
 # ---------------------------------------------------------------------------
 
 
-async def test_align_block_split_sample_reconciles_gate(
-    align_block_pool, data_plane, tmp_path
-):
+async def test_align_block_split_sample_reconciles_gate(align_block_pool, data_plane, tmp_path):
     """A sample split across two blocks finalizes its alignment_sample gate only
     once BOTH complete, with the alignment rows keyed by alignment_idx and NO
     count-assertion (each read carries _ROWS_PER_READ rows).
@@ -451,15 +435,11 @@ async def test_align_block_split_sample_reconciles_gate(
     assert await _alignment_sample_state(pool, alignment_idx, prep_b) == "pending"
     # prep_a: all 4 reads, _ROWS_PER_READ each. prep_b: half its reads so far.
     assert (
-        _count_alignment_rows(
-            data_plane, alignment_idx=alignment_idx, prep_sample_idx=prep_a
-        )
+        _count_alignment_rows(data_plane, alignment_idx=alignment_idx, prep_sample_idx=prep_a)
         == _READS_PER_SAMPLE * _ROWS_PER_READ
     )
     assert (
-        _count_alignment_rows(
-            data_plane, alignment_idx=alignment_idx, prep_sample_idx=prep_b
-        )
+        _count_alignment_rows(data_plane, alignment_idx=alignment_idx, prep_sample_idx=prep_b)
         == half * _ROWS_PER_READ
     )
 
@@ -499,9 +479,7 @@ async def test_align_block_split_sample_reconciles_gate(
     # prep_b now complete: gate flipped, all its reads registered (no count-assert).
     assert await _alignment_sample_state(pool, alignment_idx, prep_b) == "completed"
     assert (
-        _count_alignment_rows(
-            data_plane, alignment_idx=alignment_idx, prep_sample_idx=prep_b
-        )
+        _count_alignment_rows(data_plane, alignment_idx=alignment_idx, prep_sample_idx=prep_b)
         == _READS_PER_SAMPLE * _ROWS_PER_READ
     )
 
@@ -530,9 +508,7 @@ async def test_align_block_delete_then_register_leaves_no_duplicate_rows(
     n = _READS_PER_SAMPLE
     footprint = n * _ROWS_PER_READ
 
-    block = await align_block_pool["make_block"](
-        members=[(prep_a, start_a, start_a + n - 1)]
-    )
+    block = await align_block_pool["make_block"](members=[(prep_a, start_a, start_a + n - 1)])
     bound = {"alignment_idx": alignment_idx}
     members = [(prep_a, start_a, start_a + n - 1)]
 

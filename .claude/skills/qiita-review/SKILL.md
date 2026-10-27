@@ -177,8 +177,10 @@ included:
   - <the question> — <why it was not run>
 ```
 
-- `Reviewed at` is a commit on the branch. If commits land after the last round, say so
-  on that line ("plus 1 later commit: changelog tag") instead of moving the sha.
+- `Reviewed at` is a commit on the branch. If commits land after the last round, name
+  each one by sha on that line ("plus 1 later commit: 1a2b3c4d changelog tag") instead
+  of moving the sha, and update the line for every later push. `CLAUDE.md`, "Reviewing
+  a branch", says which commits `review-loop-check` requires there.
 - Under `Fixed:`, list only the `[outside-subject]` fixes; the count includes them.
   With none, the line is the count alone.
 - Write `none` under any other heading with no entries; do not drop the heading.

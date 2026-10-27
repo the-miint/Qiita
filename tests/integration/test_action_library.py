@@ -50,9 +50,7 @@ def _md5_uuid(seq: str) -> uuid.UUID:
     return uuid.UUID(hashlib.md5(f"{_TEST_SALT}{seq}".encode()).hexdigest())
 
 
-def _write_manifest(
-    path, hashes: list[uuid.UUID], read_ids: list[str] | None = None
-) -> None:
+def _write_manifest(path, hashes: list[uuid.UUID], read_ids: list[str] | None = None) -> None:
     """Materialize a manifest.parquet with (read_id, sequence_hash, length).
     `read_ids` defaults to seq0..seqN; pass an explicit list to test cases
     that need duplicate sequence_hashes under distinct read_ids."""
@@ -61,9 +59,7 @@ def _write_manifest(
     assert len(read_ids) == len(hashes)
     rows = [(read_ids[i], str(hashes[i]), 32 + i) for i in range(len(hashes))]
     with duckdb.connect(":memory:") as conn:
-        conn.execute(
-            "CREATE TEMP TABLE m (read_id VARCHAR, sequence_hash UUID, length BIGINT)"
-        )
+        conn.execute("CREATE TEMP TABLE m (read_id VARCHAR, sequence_hash UUID, length BIGINT)")
         if rows:
             conn.executemany("INSERT INTO m VALUES (?, ?::uuid, ?)", rows)
         conn.execute(f"COPY m TO '{path}' (FORMAT PARQUET)")
@@ -126,9 +122,7 @@ async def fresh_reference(postgres_pool, human_admin_session):
     await postgres_pool.execute(
         "DELETE FROM qiita.reference_membership WHERE reference_idx = $1", idx
     )
-    await postgres_pool.execute(
-        "DELETE FROM qiita.reference WHERE reference_idx = $1", idx
-    )
+    await postgres_pool.execute("DELETE FROM qiita.reference WHERE reference_idx = $1", idx)
 
 
 async def test_library_mint_features_dispatch(postgres_pool, tmp_path):
@@ -161,9 +155,7 @@ async def test_library_mint_features_dispatch(postgres_pool, tmp_path):
     assert _read_feature_map(feature_map_path2) == mapping
 
 
-async def test_library_write_membership_dispatch(
-    postgres_pool, tmp_path, fresh_reference
-):
+async def test_library_write_membership_dispatch(postgres_pool, tmp_path, fresh_reference):
     """LIBRARY['write-membership'](pool, idx, manifest_path, feature_map_path)
     inserts qiita.reference_membership rows and returns (linked, already_linked)."""
     from qiita_common.api_paths import LibraryPrimitive
@@ -197,9 +189,7 @@ async def test_library_write_membership_dispatch(
     assert already_linked2 == 3
 
 
-async def test_library_mint_features_writes_genome_associations(
-    postgres_pool, tmp_path
-):
+async def test_library_mint_features_writes_genome_associations(postgres_pool, tmp_path):
     """When `genome_map_path` is supplied, mint-features additionally
     populates qiita.genome and qiita.feature_genome.
 
@@ -220,9 +210,7 @@ async def test_library_mint_features_writes_genome_associations(
     genome_source = "genbank"
     source_ids = [f"GENOME_{uuid.uuid4()}" for _ in range(2)]
     genome_map = tmp_path / "genome_map.parquet"
-    _write_genome_map(
-        genome_map, [(f"seq{i}", genome_source, source_ids[i]) for i in range(2)]
-    )
+    _write_genome_map(genome_map, [(f"seq{i}", genome_source, source_ids[i]) for i in range(2)])
 
     feature_map_path, minted, _ = await LIBRARY[LibraryPrimitive.MINT_FEATURES](
         postgres_pool, manifest, tmp_path, genome_map
@@ -353,9 +341,7 @@ async def test_library_mint_features_cross_call_dedup(postgres_pool, tmp_path):
     assert _read_feature_map(map_a)[str(h)] == _read_feature_map(map_b)[str(h)]
 
 
-async def test_library_mint_features_genome_writes_are_idempotent(
-    postgres_pool, tmp_path
-):
+async def test_library_mint_features_genome_writes_are_idempotent(postgres_pool, tmp_path):
     """Re-calling mint with the same genome_map doesn't create duplicate
     qiita.genome rows or feature_genome junction rows. The genome upsert
     is `ON CONFLICT (source, source_id) DO UPDATE`; feature_genome is
@@ -418,9 +404,7 @@ async def test_library_mint_features_handles_empty_manifest(postgres_pool, tmp_p
     assert _read_feature_map(feature_map_path) == {}
 
 
-async def test_library_mint_features_dedupes_within_batch_duplicates(
-    postgres_pool, tmp_path
-):
+async def test_library_mint_features_dedupes_within_batch_duplicates(postgres_pool, tmp_path):
     """A manifest with the same sequence_hash on two distinct read_ids
     silently dedupes to one feature row. Identical sequences validly
     share a sequence_hash (two reads with identical content), so the
@@ -444,9 +428,7 @@ async def test_library_mint_features_dedupes_within_batch_duplicates(
     assert str(h) in mapping
 
 
-async def test_library_mint_features_genome_map_with_null_source_id_fails(
-    postgres_pool, tmp_path
-):
+async def test_library_mint_features_genome_map_with_null_source_id_fails(postgres_pool, tmp_path):
     """A genome_map row with NULL in either genome_source or
     genome_source_id fails at the qiita.genome NOT NULL constraint
     (surfaced as asyncpg.NotNullViolationError). The contract is that
@@ -465,9 +447,7 @@ async def test_library_mint_features_genome_map_with_null_source_id_fails(
     _write_genome_map(genome_map, [("seq0", "genbank", None)])
 
     with pytest.raises(asyncpg.NotNullViolationError):
-        await LIBRARY[LibraryPrimitive.MINT_FEATURES](
-            postgres_pool, manifest, tmp_path, genome_map
-        )
+        await LIBRARY[LibraryPrimitive.MINT_FEATURES](postgres_pool, manifest, tmp_path, genome_map)
 
 
 async def test_library_mint_features_genome_map_with_no_matching_read_id_writes_nothing(
@@ -485,9 +465,7 @@ async def test_library_mint_features_genome_map_with_no_matching_read_id_writes_
     _write_genome_map(genome_map, [("not-in-fasta", "genbank", sid)])
 
     with pytest.raises(ValueError, match="not-in-fasta"):
-        await LIBRARY[LibraryPrimitive.MINT_FEATURES](
-            postgres_pool, manifest, tmp_path, genome_map
-        )
+        await LIBRARY[LibraryPrimitive.MINT_FEATURES](postgres_pool, manifest, tmp_path, genome_map)
 
     assert not (tmp_path / "feature_map.parquet").exists()
     assert (
@@ -506,9 +484,7 @@ async def test_library_mint_features_genome_map_with_no_matching_read_id_writes_
     )
 
 
-async def test_library_mint_features_rejects_unknown_genome_source(
-    postgres_pool, tmp_path
-):
+async def test_library_mint_features_rejects_unknown_genome_source(postgres_pool, tmp_path):
     """A genome_source outside the GenomeSource vocabulary is rejected up
     front (fail-fast) — before any qiita.genome row is written."""
     from qiita_common.api_paths import LibraryPrimitive
@@ -523,9 +499,7 @@ async def test_library_mint_features_rejects_unknown_genome_source(
     _write_genome_map(genome_map, [("seq0", "ncbi", sid)])
 
     with pytest.raises(ValueError, match="vocabulary"):
-        await LIBRARY[LibraryPrimitive.MINT_FEATURES](
-            postgres_pool, manifest, tmp_path, genome_map
-        )
+        await LIBRARY[LibraryPrimitive.MINT_FEATURES](postgres_pool, manifest, tmp_path, genome_map)
 
     leaked = await postgres_pool.fetchval(
         "SELECT count(*) FROM qiita.genome WHERE source_id = $1", sid
@@ -551,9 +525,7 @@ async def test_library_mint_features_qiita_source_records_prep_sample(
     genome_map = tmp_path / "genome_map.parquet"
     _write_genome_map_with_prep(genome_map, [("seq0", "qiita", sid, prep_sample_idx)])
 
-    await LIBRARY[LibraryPrimitive.MINT_FEATURES](
-        postgres_pool, manifest, tmp_path, genome_map
-    )
+    await LIBRARY[LibraryPrimitive.MINT_FEATURES](postgres_pool, manifest, tmp_path, genome_map)
 
     recorded = await postgres_pool.fetchval(
         "SELECT prep_sample_idx FROM qiita.genome WHERE source = 'qiita' AND source_id = $1",
@@ -579,9 +551,7 @@ async def test_library_mint_features_qiita_source_without_prep_sample_fails(
     _write_genome_map(genome_map, [("seq0", "qiita", sid)])
 
     with pytest.raises(ValueError, match="origin"):
-        await LIBRARY[LibraryPrimitive.MINT_FEATURES](
-            postgres_pool, manifest, tmp_path, genome_map
-        )
+        await LIBRARY[LibraryPrimitive.MINT_FEATURES](postgres_pool, manifest, tmp_path, genome_map)
 
     leaked = await postgres_pool.fetchval(
         "SELECT count(*) FROM qiita.genome WHERE source_id = $1", sid
@@ -608,9 +578,7 @@ async def test_library_mint_features_non_qiita_with_prep_sample_fails(
     _write_genome_map_with_prep(genome_map, [("seq0", "genbank", sid, prep_sample_idx)])
 
     with pytest.raises(ValueError, match="origin"):
-        await LIBRARY[LibraryPrimitive.MINT_FEATURES](
-            postgres_pool, manifest, tmp_path, genome_map
-        )
+        await LIBRARY[LibraryPrimitive.MINT_FEATURES](postgres_pool, manifest, tmp_path, genome_map)
 
     leaked = await postgres_pool.fetchval(
         "SELECT count(*) FROM qiita.genome WHERE source_id = $1", sid
@@ -618,9 +586,7 @@ async def test_library_mint_features_non_qiita_with_prep_sample_fails(
     assert leaked == 0
 
 
-async def test_library_mint_features_shared_genome_across_features(
-    postgres_pool, tmp_path
-):
+async def test_library_mint_features_shared_genome_across_features(postgres_pool, tmp_path):
     """Many features of one assembly share a (source, source_id) in one batch;
     the upsert must dedupe the conflict target rather than crash on it
     (Postgres forbids one ON CONFLICT DO UPDATE touching a row twice)."""
@@ -675,14 +641,10 @@ async def test_library_mint_features_qiita_reingest_updates_prep_sample(
 
     gm1 = tmp_path / "gm1.parquet"
     _write_genome_map_with_prep(gm1, [("seq0", "qiita", sid, prep1)])
-    await LIBRARY[LibraryPrimitive.MINT_FEATURES](
-        postgres_pool, manifest, tmp_path / "o1", gm1
-    )
+    await LIBRARY[LibraryPrimitive.MINT_FEATURES](postgres_pool, manifest, tmp_path / "o1", gm1)
     assert await _current_prep() == prep1
 
     gm2 = tmp_path / "gm2.parquet"
     _write_genome_map_with_prep(gm2, [("seq0", "qiita", sid, prep2)])
-    await LIBRARY[LibraryPrimitive.MINT_FEATURES](
-        postgres_pool, manifest, tmp_path / "o2", gm2
-    )
+    await LIBRARY[LibraryPrimitive.MINT_FEATURES](postgres_pool, manifest, tmp_path / "o2", gm2)
     assert await _current_prep() == prep2

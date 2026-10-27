@@ -75,15 +75,11 @@ async def smoke_reference(postgres_pool, human_admin_session):
         human_admin_session["principal_idx"],
     )
     yield idx
-    await postgres_pool.execute(
-        "DELETE FROM qiita.work_ticket WHERE reference_idx = $1", idx
-    )
+    await postgres_pool.execute("DELETE FROM qiita.work_ticket WHERE reference_idx = $1", idx)
     await postgres_pool.execute(
         "DELETE FROM qiita.reference_membership WHERE reference_idx = $1", idx
     )
-    await postgres_pool.execute(
-        "DELETE FROM qiita.reference WHERE reference_idx = $1", idx
-    )
+    await postgres_pool.execute("DELETE FROM qiita.reference WHERE reference_idx = $1", idx)
 
 
 async def test_reference_add_workflow_end_to_end(
@@ -98,14 +94,12 @@ async def test_reference_add_workflow_end_to_end(
     LocalBackend. After the run: ticket COMPLETED, reference 'active',
     feature/membership rows present, register-files invoked exactly once
     with a sensible filename → table mapping."""
-    from qiita_common.api_paths import LibraryPrimitive
-    from qiita_control_plane.actions import library as _lib
-    from qiita_control_plane.runner import run_workflow
-
     import json
 
     import duckdb
-    from qiita_common.api_paths import compute_upload_staging_path
+    from qiita_common.api_paths import LibraryPrimitive, compute_upload_staging_path
+    from qiita_control_plane.actions import library as _lib
+    from qiita_control_plane.runner import run_workflow
 
     action_id, action_version = synced_reference_add_action
     reference_idx = smoke_reference
@@ -160,9 +154,7 @@ async def test_reference_add_workflow_end_to_end(
         register_calls.append((staging_dir, dict(files)))
         return [f"{staging_dir}/{name}" for name in files]
 
-    monkeypatch.setitem(
-        _lib.LIBRARY, LibraryPrimitive.REGISTER_FILES, _stub_register_files
-    )
+    monkeypatch.setitem(_lib.LIBRARY, LibraryPrimitive.REGISTER_FILES, _stub_register_files)
 
     # Stub the post-load exclusion sync for the same reason (its real path signs a
     # sync_reference_exclusion DoAction to a running data plane). Capturing the
@@ -226,9 +218,7 @@ async def test_reference_add_workflow_end_to_end(
     assert "reference_sequences.parquet" in files
     assert files["reference_sequences.parquet"] == "reference_sequences"
     assert "reference_membership.parquet" in files
-    chunk_parts = [
-        name for name in files if name.startswith("reference_sequence_chunks/")
-    ]
+    chunk_parts = [name for name in files if name.startswith("reference_sequence_chunks/")]
     assert chunk_parts, "expected reference_sequence_chunks subdir parts"
     for name in chunk_parts:
         assert files[name] == "reference_sequence_chunks"

@@ -25,7 +25,6 @@ import uuid
 import httpx
 import pyarrow.flight as flight
 import pytest
-from conftest import ducklake_connect
 from qiita_common.api_paths import (
     LOOPBACK_HOST,
     URL_ALIGNMENT_COHORT_DOGET,
@@ -33,7 +32,6 @@ from qiita_common.api_paths import (
     URL_SEQUENCED_POOL_ALIGNMENT_COHORT,
 )
 from qiita_common.models.reference import Tier
-
 from qiita_control_plane.repositories.alignment_definition import mint_alignment_definition
 from qiita_control_plane.testing.db_seeds import (
     seed_biosample_to_study_link,
@@ -41,8 +39,9 @@ from qiita_control_plane.testing.db_seeds import (
     seed_prep_sample_to_study_link,
     seed_sequenced_sample_subtype,
 )
-
 from qiita_control_plane.testing.db_teardown import teardown_entity_graph
+
+from conftest import ducklake_connect
 
 # Narrow on purpose: `cigar` is the wide column the projection keeps off the wire
 # unless asked for, so its absence from the result schema is the assertion.

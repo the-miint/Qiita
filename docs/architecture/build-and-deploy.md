@@ -241,7 +241,7 @@ test-system: build-data-plane-debug build-integration
 # Lint
 lint: lint-python lint-rust
 
-lint-python: lint-common lint-control-plane lint-compute-orchestrator
+lint-python: lint-common lint-control-plane lint-compute-orchestrator lint-repo-python
 
 lint-rust: lint-data-plane
 
@@ -256,6 +256,9 @@ lint-data-plane:
 
 lint-compute-orchestrator:
 	cd qiita-compute-orchestrator && uv run ruff check . && uv run ruff format --check .
+
+lint-repo-python:
+	cd qiita-common && uv run ruff check ../tests/integration ../scripts && uv run ruff format --check ../tests/integration ../scripts
 
 # DB / actions
 migrate: $(DBMATE_BIN)

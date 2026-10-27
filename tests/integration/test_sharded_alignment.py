@@ -44,7 +44,6 @@ from pathlib import Path
 
 import duckdb
 import pytest
-
 from qiita_common.api_paths import LOOPBACK_HOST
 from qiita_compute_orchestrator import read_source
 from qiita_compute_orchestrator.data_plane_client import open_doget_stream
@@ -114,13 +113,9 @@ def _seed_reference_rows(data_plane):
             rows.append((fidx, 0, seq[:mid]))
             rows.append((fidx, 1, seq[mid:]))
         values = ", ".join(f"({f}, {c}, '{d}')" for f, c, d in rows)
-        conn.execute(
-            f"INSERT INTO qiita_lake.reference_sequence_chunks VALUES {values}"
-        )
+        conn.execute(f"INSERT INTO qiita_lake.reference_sequence_chunks VALUES {values}")
         member_values = ", ".join(f"({_REF_IDX}, {f})" for f in _FEATURES)
-        conn.execute(
-            f"INSERT INTO qiita_lake.reference_membership VALUES {member_values}"
-        )
+        conn.execute(f"INSERT INTO qiita_lake.reference_membership VALUES {member_values}")
     finally:
         conn.close()
 
@@ -140,9 +135,7 @@ def _fake_read_block_stream(reads_path):
 
     @asynccontextmanager
     async def fake(conn, *, work_ticket_idx, relation):
-        conn.execute(
-            f"CREATE VIEW {relation} AS SELECT * FROM read_parquet('{reads_path}')"
-        )
+        conn.execute(f"CREATE VIEW {relation} AS SELECT * FROM read_parquet('{reads_path}')")
         try:
             yield relation
         finally:
@@ -176,7 +169,8 @@ def _fake_stream(data_plane):
 def _write_roster(path, feature_idx):
     with duckdb.connect(":memory:") as conn:
         conn.execute(
-            "COPY (SELECT CAST(? AS BIGINT) AS feature_idx, CAST(? AS BIGINT) AS sequence_length_bp) "
+            "COPY (SELECT CAST(? AS BIGINT) AS feature_idx,"
+            " CAST(? AS BIGINT) AS sequence_length_bp) "
             f"TO '{path}' (FORMAT PARQUET)",
             [feature_idx, len(_FEATURES[feature_idx])],
         )
@@ -185,9 +179,7 @@ def _write_roster(path, feature_idx):
 
 def _write_shard_mapping(path):
     with duckdb.connect(":memory:") as conn:
-        values_sql = ", ".join(
-            "(CAST(? AS BIGINT), CAST(? AS VARCHAR))" for _ in _SHARD_OF
-        )
+        values_sql = ", ".join("(CAST(? AS BIGINT), CAST(? AS VARCHAR))" for _ in _SHARD_OF)
         params = []
         for fidx, shard_id in _SHARD_OF.items():
             params.extend([fidx, str(shard_id)])
@@ -231,9 +223,7 @@ def _write_reads(path, rows):
     return path
 
 
-def _build_indexes(
-    aligner, module, shard_dir_fn, data_plane, derived_root, tmp_path, monkeypatch
-):
+def _build_indexes(aligner, module, shard_dir_fn, data_plane, derived_root, tmp_path, monkeypatch):
     """Build the router + both per-shard indexes for `aligner`, returning
     (router_dir, shard_directory)."""
     monkeypatch.setenv("PATH_DERIVED", str(derived_root))
@@ -263,9 +253,7 @@ def _build_indexes(
             tmp_path / "ws_router",
         )
     )
-    router_dir = Path(
-        json.loads(Path(r_out["routing_index_meta"]).read_text())["fs_path"]
-    )
+    router_dir = Path(json.loads(Path(r_out["routing_index_meta"]).read_text())["fs_path"])
     return router_dir, shard_dir_fn(derived_root, _REF_IDX)
 
 
@@ -329,9 +317,9 @@ def test_sharded_alignment_end_to_end(
             work_ticket_idx=1,
         )
         return Path(
-            asyncio.run(
-                align_sharded.execute(inputs, tmp_path / f"ws_align_{aligner}")
-            )["alignment"]
+            asyncio.run(align_sharded.execute(inputs, tmp_path / f"ws_align_{aligner}"))[
+                "alignment"
+            ]
         )
 
     # ---- SINGLE-END batch (uniform: every sequence2 is NULL) --------------------
@@ -354,9 +342,7 @@ def test_sharded_alignment_end_to_end(
     # row (keys the DuckLake `alignment` table; register-files schema-matches).
     with duckdb.connect(":memory:") as _conn:
         assert (
-            _conn.execute(
-                f"SELECT * FROM read_parquet('{se_out}') LIMIT 0"
-            ).description[0][0]
+            _conn.execute(f"SELECT * FROM read_parquet('{se_out}') LIMIT 0").description[0][0]
             == "alignment_idx"
         )
         assert _conn.execute(
@@ -403,9 +389,7 @@ def test_sharded_alignment_end_to_end(
     assert len(mate_rows) == 2, f"expected 2 mate rows, got {mate_rows}"
     for feature_idx, mate_feature_idx, template_length in mate_rows:
         assert feature_idx == 100
-        assert mate_feature_idx == 100, (
-            f"mate not resolved to feature 100: {mate_rows!r}"
-        )
+        assert mate_feature_idx == 100, f"mate not resolved to feature 100: {mate_rows!r}"
         assert template_length != 0, "proper pair must carry a template_length"
 
     # ---- EMPTY batch (zero input reads) -----------------------------------------
@@ -422,14 +406,10 @@ def test_sharded_alignment_end_to_end(
         # A valid, correctly-typed parquet with zero rows and the alignment_idx
         # leading column (so register-files schema-matches an empty block too).
         assert (
-            _conn.execute(
-                f"SELECT * FROM read_parquet('{empty_out}') LIMIT 0"
-            ).description[0][0]
+            _conn.execute(f"SELECT * FROM read_parquet('{empty_out}') LIMIT 0").description[0][0]
             == "alignment_idx"
         )
         (empty_count,) = _conn.execute(
             f"SELECT count(*) FROM read_parquet('{empty_out}')"
         ).fetchone()
-    assert empty_count == 0, (
-        f"empty input must emit zero alignment rows, got {empty_count}"
-    )
+    assert empty_count == 0, f"empty input must emit zero alignment rows, got {empty_count}"

@@ -15,10 +15,8 @@ test_doget.py.
 
 import duckdb
 import pytest
-
 from qiita_common.api_paths import LOOPBACK_HOST
 from qiita_common.chunking import reassemble_chunks_expr
-
 from qiita_compute_orchestrator.data_plane_client import open_doget_stream
 
 from conftest import ducklake_connect
@@ -53,9 +51,7 @@ def _seed_reference_rows(data_plane):
 def _sign(filter_dict, secret_bytes):
     from qiita_control_plane.auth.tickets import sign_ticket
 
-    return sign_ticket(
-        table="reference_sequence_chunks", filter=filter_dict, secret=secret_bytes
-    )
+    return sign_ticket(table="reference_sequence_chunks", filter=filter_dict, secret=secret_bytes)
 
 
 def test_open_doget_stream_scoped_to_feature_subset(data_plane):

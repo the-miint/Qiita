@@ -23,7 +23,6 @@ import duckdb
 import pytest
 import pytest_asyncio
 import yaml
-from conftest import cleanup_ena_study, ducklake_connect
 from qiita_common.actions import ActionDefinition, WorkflowAction
 from qiita_common.api_paths import LOOPBACK_HOST
 from qiita_common.auth_constants import SystemRole
@@ -37,6 +36,8 @@ from qiita_control_plane.ena_import import (
 )
 from qiita_control_plane.ena_import.batch import _process_one_study, create_ena_import_batch
 from qiita_control_plane.testing.db_seeds import seed_user_principal
+
+from conftest import cleanup_ena_study, ducklake_connect
 
 _DOWNLOAD_ENA_STUDY_YAML_PATH = (
     Path(__file__).parent.parent.parent / "workflows" / "download-ena-study" / "1.0.0.yaml"

@@ -167,15 +167,11 @@ async def gg2_reference(postgres_pool, human_admin_session):
         human_admin_session["principal_idx"],
     )
     yield idx
-    await postgres_pool.execute(
-        "DELETE FROM qiita.work_ticket WHERE reference_idx = $1", idx
-    )
+    await postgres_pool.execute("DELETE FROM qiita.work_ticket WHERE reference_idx = $1", idx)
     await postgres_pool.execute(
         "DELETE FROM qiita.reference_membership WHERE reference_idx = $1", idx
     )
-    await postgres_pool.execute(
-        "DELETE FROM qiita.reference WHERE reference_idx = $1", idx
-    )
+    await postgres_pool.execute("DELETE FROM qiita.reference WHERE reference_idx = $1", idx)
 
 
 @pytest.fixture
