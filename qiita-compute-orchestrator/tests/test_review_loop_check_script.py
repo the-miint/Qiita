@@ -292,11 +292,19 @@ def test_a_git_failure_listing_later_commits_fails_the_check(repo, tmp_path):
 
 _ENTRY = "docs/changelog-pending/entry.md"
 _CHECKLIST = "DEPLOY_CHECKLIST.md"
+# Another PR's checklist line, whose placeholder the tag commit leaves alone.
+_OTHER = "- Other PR's step (#feat/other).\n"
+_TAGGED_ENTRY = "- **Thing is done (#12).** It works.\n  More text.\n"
+_TAGGED_CHECKLIST = "- `[operator]` (#12) `make migrate`\n- Thing needs a step (#12).\n" + _OTHER
 
 
-def _commit_files(repo, files: dict[str, str], message: str) -> str:
+def _commit_files(repo, files: dict[str, str | None], message: str) -> str:
+    """Write each file (None deletes it) and commit."""
     path = Path(repo["path"])
     for name, text in files.items():
+        if text is None:
+            _git(path, "rm", "-q", name)
+            continue
         (path / name).parent.mkdir(parents=True, exist_ok=True)
         (path / name).write_text(text)
         _git(path, "add", name)
@@ -306,49 +314,68 @@ def _commit_files(repo, files: dict[str, str], message: str) -> str:
 
 @pytest.fixture
 def tagged(repo):
-    """`repo` with a reviewed commit adding a changelog entry and a checklist line, each
+    """`repo` with a reviewed commit adding a changelog entry and checklist lines, each
     carrying a placeholder or no tag, so a later commit can write the PR number in."""
     repo["reviewed"] = _commit_files(
         repo,
         {
             _ENTRY: "- **Thing is done (#TBD).** It works.\n  More text.\n",
-            _CHECKLIST: "- `[operator]` (#feat/thing) `make migrate`\n- Thing needs a step.\n",
+            _CHECKLIST: "- `[operator]` (#feat/thing) `make migrate`\n- Thing needs a step.\n"
+            + _OTHER,
         },
         "the reviewed commit",
     )
     return repo
 
 
+def _run_tagged(repo, pr_number: str = "12") -> subprocess.CompletedProcess:
+    return _run(repo, _BLOCK.format(sha=repo["reviewed"]), pr_number=pr_number)
+
+
 @pytest.mark.parametrize(
     "files",
     [
-        {_ENTRY: "- **Thing is done (#12).** It works.\n  More text.\n"},
-        {
-            _ENTRY: "- **Thing is done (#12).** It works.\n  More text.\n",
-            _CHECKLIST: "- `[operator]` (#12) `make migrate`\n- Thing needs a step (#12).\n",
-        },
+        {_ENTRY: _TAGGED_ENTRY},
+        {_ENTRY: _TAGGED_ENTRY, _CHECKLIST: _TAGGED_CHECKLIST},
     ],
     ids=["placeholder-replaced", "checklist-tag-added"],
 )
-@pytest.mark.parametrize("pr_number", ["", "12"], ids=["no-pr-number", "pr-number"])
-def test_a_later_commit_that_only_tags_the_pr_number_needs_no_naming(tagged, files, pr_number):
+def test_a_later_commit_that_only_tags_the_pr_number_needs_no_naming(tagged, files):
     _commit_files(tagged, files, "tag the changelog entry")
-    result = _run(tagged, _BLOCK.format(sha=tagged["reviewed"]), pr_number=pr_number)
+    result = _run_tagged(tagged)
     assert result.returncode == 0, result.stderr
 
 
 @pytest.mark.parametrize(
     ("files", "pr_number"),
     [
-        ({_ENTRY: "- **Thing is done (#12).** It works well.\n  More text.\n"}, ""),
-        ({_ENTRY: "- **Thing is done (#12).** It works.\n"}, ""),
-        ({_ENTRY: "- **Thing is done (#12).** It\n  works. More text.\n"}, ""),
-        ({_ENTRY: "- **Thing is done (#12).** It works.\n  More text.\n", "f": "x"}, ""),
-        ({_ENTRY: "- **Thing is done (#12).** It works.\n  More (#12).\n"}, ""),
-        ({_ENTRY: "- **Thing is done (#13).** It works.\n  More text.\n"}, "12"),
-        ({_ENTRY: "- **Thing is done (#feat/thing).** It works.\n  More text.\n"}, ""),
+        ({_ENTRY: _TAGGED_ENTRY}, ""),
+        ({_ENTRY: _TAGGED_ENTRY.replace("works.", "works well.")}, "12"),
+        ({_ENTRY: "- **Thing is done (#12).** It works.\n"}, "12"),
+        ({_ENTRY: "- **Thing is done (#12).** It\n  works. More text.\n"}, "12"),
+        ({_ENTRY: _TAGGED_ENTRY, "f": "x"}, "12"),
+        ({_ENTRY: _TAGGED_ENTRY.replace("More text.", "More (#12).")}, "12"),
+        ({_ENTRY: _TAGGED_ENTRY.replace("(#12)", "(#13)")}, "12"),
+        ({_ENTRY: _TAGGED_ENTRY.replace("(#12)", "(#feat/thing)")}, "12"),
+        (
+            {
+                _ENTRY: _TAGGED_ENTRY,
+                _CHECKLIST: "- Thing needs a step.\n- `[operator]` (#12) `make migrate`\n" + _OTHER,
+            },
+            "12",
+        ),
+        (
+            {
+                _ENTRY: _TAGGED_ENTRY + "- Thing needs a step.\n",
+                _CHECKLIST: "- `[operator]` (#12) `make migrate`\n" + _OTHER,
+            },
+            "12",
+        ),
+        ({_ENTRY: _TAGGED_ENTRY, "docs/changelog-pending/new.md": "- New (#12).\n"}, "12"),
+        ({_ENTRY: None, "docs/changelog-pending/renamed.md": _TAGGED_ENTRY}, "12"),
     ],
     ids=[
+        "no-pr-number",
         "wording-changed",
         "line-dropped",
         "rewrapped",
@@ -356,18 +383,32 @@ def test_a_later_commit_that_only_tags_the_pr_number_needs_no_naming(tagged, fil
         "tag-replacing-a-word",
         "another-pr-number",
         "no-number",
+        "line-moved-within-a-file",
+        "line-moved-across-files",
+        "file-added",
+        "file-renamed",
     ],
 )
 def test_a_later_commit_doing_more_than_tagging_has_to_be_named(tagged, files, pr_number):
     later = _commit_files(tagged, files, "tag and something else")
-    result = _run(tagged, _BLOCK.format(sha=tagged["reviewed"]), pr_number=pr_number)
+    result = _run_tagged(tagged, pr_number=pr_number)
+    assert result.returncode == 1
+    assert later[:7] in result.stderr
+
+
+def test_a_file_renamed_into_the_changelog_directory_has_to_be_named(tagged):
+    """Rename detection would list only the destination, inside the allowed paths."""
+    path = Path(tagged["path"])
+    _git(path, "mv", "f", "docs/changelog-pending/f.md")
+    later = _commit_files(tagged, {_ENTRY: _TAGGED_ENTRY}, "move a file in and tag")
+    result = _run_tagged(tagged)
     assert result.returncode == 1
     assert later[:7] in result.stderr
 
 
 def test_a_commit_after_the_tag_commit_still_has_to_be_named(tagged):
-    _commit_files(tagged, {_ENTRY: "- **Thing is done (#12).** It works.\n  More text.\n"}, "tag")
+    _commit_files(tagged, {_ENTRY: _TAGGED_ENTRY}, "tag")
     after = _commit_files(tagged, {"f": "after the tag"}, "after the tag")
-    result = _run(tagged, _BLOCK.format(sha=tagged["reviewed"]))
+    result = _run_tagged(tagged)
     assert result.returncode == 1
     assert after[:7] in result.stderr

@@ -1,8 +1,9 @@
 ### Changed
 
 - **`review-loop-check` no longer needs the PR-number tag commit named on the "Reviewed
-  at" line (#TBD).** A later commit that touches only `docs/changelog-pending/` and
-  `DEPLOY_CHECKLIST.md`, and whose changed lines differ from the old ones only by
-  ` (#N)` tags, replacing a placeholder or adding the tag, is exempt. In CI each tag it
-  adds must be the PR's own number. Any other change in the same commit, a rewrap
-  included, still has to be named.
+  at" line (#TBD).** A later commit is exempt when it only modifies files under
+  `docs/changelog-pending/` and `DEPLOY_CHECKLIST.md`, adds at least one tag with the
+  PR's own number, and leaves each file byte-identical once that tag and placeholder tags
+  such as `(#TBD)` or `(#<branch>)` are dropped. Any other change in the same commit, a
+  rewrap or a moved line included, still has to be named. The workflow passes the PR
+  number to the script; run without one, it exempts nothing.

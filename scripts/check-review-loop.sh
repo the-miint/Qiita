@@ -5,8 +5,8 @@
 #   LABELS    comma-joined PR labels
 #   HEAD_SHA  the PR's head commit (default: HEAD)
 #   BASE_SHA  the base branch tip (default: origin/main)
-#   PR_NUMBER the PR's number (optional; when set, a PR-number tag commit must tag
-#             with this number to need no naming)
+#   PR_NUMBER the PR's number (optional; without it, a commit writing the PR number
+#             into the changelog and checklist tags has to be named like any other)
 # Run from a checkout whose history holds both.
 #
 # Passes when the 'no-agent-review' label is present, or when the description has a
@@ -63,30 +63,31 @@ if git merge-base --is-ancestor "$sha" "$base"; then
     fail "'Reviewed at: ${sha}' is a commit of the base branch, not one of this PR's."
 fi
 
-tag_re='\(#[^)]*\)'
-
-# Succeeds when the commit touches only docs/changelog-pending/ and DEPLOY_CHECKLIST.md,
-# adds at least one `(#N)`, and its removed and added lines are identical once every
-# ` (#...)` is dropped from both: a placeholder such as `(#TBD)` or `(#<branch>)`
-# replaced, or a tag added where there was none. Any other change to those lines, a
-# rewrap included, fails it. With PR_NUMBER set, each tag it adds must be that number.
+# Succeeds when the commit only writes this PR's number into its changelog and
+# checklist tags: it modifies (no add, delete or rename) files under
+# docs/changelog-pending/ and DEPLOY_CHECKLIST.md alone, each file is byte-identical
+# before and after once each ` (#PR_NUMBER)` and each placeholder tag (` (#TBD)`,
+# ` (#<branch>)`) is dropped, and the commit adds at least one ` (#PR_NUMBER)`.
+# Comparing whole files, not changed lines, keeps a line moved in the same commit from
+# passing. Without PR_NUMBER (a run outside CI) nothing is exempt.
 tags_pr_number() {
-    local commit=$1 paths path diff removed added
-    paths=$(git diff --no-ext-diff --name-only "${commit}^1" "$commit")
-    while IFS= read -r path; do
+    local commit=$1 number=${PR_NUMBER:-} statuses status path tag strip old new added=0
+    [[ "$number" =~ ^[0-9]+$ ]] || return 1
+    tag=" \\(#${number}\\)"
+    strip="s@${tag}@@g; s@ \\(#[A-Za-z][A-Za-z0-9._/-]*\\)@@g"
+    # --no-renames, so a file renamed into an allowed path lists its source as deleted.
+    statuses=$(git diff --no-ext-diff --no-renames --name-status "${commit}^1" "$commit")
+    [ -n "$statuses" ] || return 1
+    while IFS=$'\t' read -r status path; do
+        [ "$status" = M ] || return 1
         case "$path" in DEPLOY_CHECKLIST.md | docs/changelog-pending/*) ;; *) return 1 ;; esac
-    done <<<"$paths"
-    diff=$(git diff --no-ext-diff --no-color -U0 "${commit}^1" "$commit")
-    # The changed lines of each hunk, without the file headers above the first `@@`.
-    removed=$(awk '/^diff --git / {h=1} /^@@/ {h=0; next} !h && /^-/' <<<"$diff" | cut -c2-)
-    added=$(awk '/^diff --git / {h=1} /^@@/ {h=0; next} !h && /^\+/' <<<"$diff" | cut -c2-)
-    grep -qE '\(#[0-9]+\)' <<<"$added" || return 1
-    if [ -n "${PR_NUMBER:-}" ]; then
-        # Every tag on an added line that is not on the line it replaced is this PR's.
-        [ -z "$(grep -oE "$tag_re" <<<"$added" | grep -vxF "(#${PR_NUMBER})" \
-            | grep -vxF -f <(grep -oE "$tag_re" <<<"$removed") || true)" ] || return 1
-    fi
-    [ "$(sed -E "s/ ?${tag_re}//g" <<<"$removed")" = "$(sed -E "s/ ?${tag_re}//g" <<<"$added")" ]
+        old=$(git show "${commit}^1:${path}" | { grep -oE "$tag" || true; } | wc -l)
+        new=$(git show "${commit}:${path}" | { grep -oE "$tag" || true; } | wc -l)
+        [ "$new" -gt "$old" ] && added=1
+        cmp -s <(git show "${commit}^1:${path}" | sed -E "$strip") \
+            <(git show "${commit}:${path}" | sed -E "$strip") || return 1
+    done <<<"$statuses"
+    [ "$added" -eq 1 ]
 }
 
 # Every commit the branch added after the reviewed one must be named on the same
