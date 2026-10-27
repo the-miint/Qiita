@@ -75,7 +75,5 @@ def test_data_planes_booting_together_on_an_existing_catalog_all_come_up(
     signing_key: bytes, tmp_path: Path
 ) -> None:
     reset_ducklake_catalog()
-    assert _boot_together(signing_key, tmp_path, 1) == {}, (
-        "the catalog could not be created"
-    )
+    assert _boot_together(signing_key, tmp_path, 1) == {}, "the catalog could not be created"
     assert _boot_together(signing_key, tmp_path, _INSTANCES) == {}

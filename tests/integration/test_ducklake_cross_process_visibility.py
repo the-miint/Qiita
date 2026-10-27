@@ -27,6 +27,7 @@ _WORKER = textwrap.dedent(
         c.execute("LOAD ducklake; LOAD postgres;")
         c.execute(f"ATTACH 'ducklake:postgres:{CONN}' AS qiita_lake (DATA_PATH '{DATA}/')")
         return c
+    COUNT = "SELECT count(*) FROM qiita_lake.cross_process_probe"
     held = None
     pooled = None
     for line in sys.stdin:
@@ -39,7 +40,8 @@ _WORKER = textwrap.dedent(
             i = int(arg[0]); path = f"{DATA}/cross_process_probe_{i}.parquet"
             c = fresh()
             c.execute(f"COPY (SELECT {i}::INTEGER AS i) TO '{path}' (FORMAT PARQUET)")
-            c.execute("CALL ducklake_add_data_files('qiita_lake', 'cross_process_probe', ?)", [path])
+            add = "CALL ducklake_add_data_files('qiita_lake', 'cross_process_probe', ?)"
+            c.execute(add, [path])
             c.close(); out = "ok"
         elif cmd == "count":
             c = fresh()
@@ -48,7 +50,7 @@ _WORKER = textwrap.dedent(
         elif cmd == "pooled_count":
             if pooled is None:
                 pooled = fresh()
-            out = pooled.execute("SELECT count(*) FROM qiita_lake.cross_process_probe").fetchone()[0]
+            out = pooled.execute(COUNT).fetchone()[0]
         elif cmd == "hold_begin":
             held = fresh(); held.execute("BEGIN TRANSACTION")
             out = held.execute("SELECT count(*) FROM qiita_lake.cross_process_probe").fetchone()[0]
