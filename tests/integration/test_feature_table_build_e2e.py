@@ -44,7 +44,6 @@ import uuid
 
 import duckdb
 import pytest
-from conftest import ducklake_connect
 from qiita_common.api_paths import LOOPBACK_HOST
 from qiita_common.models.reference import Tier
 from qiita_common.taxonomy import RANK_COLUMNS
@@ -60,6 +59,8 @@ from qiita_control_plane.testing.db_seeds import (
     seed_sequenced_sample_subtype,
 )
 from qiita_control_plane.testing.db_teardown import teardown_entity_graph
+
+from conftest import ducklake_connect
 
 _THRESHOLD = "0.01"
 

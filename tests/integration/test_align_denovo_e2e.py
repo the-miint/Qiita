@@ -31,13 +31,14 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 import pytest
-from conftest import ducklake_connect
 from qiita_common.api_paths import LOOPBACK_HOST
 from qiita_common.models import ReadMaskReason
 from qiita_control_plane.testing.db_teardown import (
     delete_principal,
     teardown_entity_graph,
 )
+
+from conftest import ducklake_connect
 
 _CONTIG_LENGTH = 20_000
 _READ_LENGTH = 6_000

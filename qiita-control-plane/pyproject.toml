@@ -76,6 +76,5 @@ markers = [
     "db: tests that require a Postgres database (deselect with -m 'not db')",
 ]
 
-
 [tool.ruff]
 extend = "../ruff.toml"

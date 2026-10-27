@@ -35,6 +35,5 @@ packages = ["src/qiita_common"]
 pythonpath = ["src"]
 asyncio_mode = "auto"
 
-
 [tool.ruff]
 extend = "../ruff.toml"

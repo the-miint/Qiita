@@ -31,8 +31,9 @@ from pathlib import Path
 import duckdb
 import pyarrow.flight as flight
 import pytest
-from _runner_helpers import LocalComputeBackendClient
 from httpx import ASGITransport, AsyncClient
+
+from _runner_helpers import LocalComputeBackendClient
 
 _REFERENCE_ADD_YAML_PATH = (
     Path(__file__).parent.parent.parent / "workflows" / "reference-add" / "1.0.0.yaml"

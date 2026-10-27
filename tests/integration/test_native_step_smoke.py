@@ -35,9 +35,10 @@ from pathlib import Path
 
 import duckdb
 import pytest
-from _runner_helpers import LocalComputeBackendClient
 from qiita_common.models import WorkTicketState
 from qiita_control_plane.testing.db_teardown import teardown_entity_graph
+
+from _runner_helpers import LocalComputeBackendClient
 
 FIXTURE_FASTQ = Path(__file__).resolve().parent / "fixtures" / "sample.fastq"
 _FASTQ_TO_PARQUET_YAML_PATH = (

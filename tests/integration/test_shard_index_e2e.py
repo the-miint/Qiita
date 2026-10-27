@@ -39,9 +39,10 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 import pytest
+from qiita_common.api_paths import LOOPBACK_HOST
+
 from _runner_helpers import LocalComputeBackendClient
 from conftest import ducklake_connect
-from qiita_common.api_paths import LOOPBACK_HOST
 
 _BUILD_SHARD_INDEX_YAML_PATH = (
     Path(__file__).parent.parent.parent / "workflows" / "build-shard-index" / "1.0.0.yaml"

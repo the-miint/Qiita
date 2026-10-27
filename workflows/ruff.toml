@@ -1,3 +1,3 @@
 # The scripts here run inside the workflow containers, on each image's own Python
-# (3.11 in bcl-convert), not the repo's. This file keeps them on ruff's defaults
-# instead of the repo-root ruff.toml, whose target-version is py314.
+# (set in its .def), not the repo's. This file keeps them on ruff's defaults instead
+# of the repo-root ruff.toml.

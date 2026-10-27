@@ -32,11 +32,6 @@ os.environ.setdefault("CO_TO_CP_TOKEN", "test-co-to-cp-token")
 import asyncpg  # noqa: E402
 import httpx  # noqa: E402
 import pytest  # noqa: E402
-from _pg_env import (
-    LIB_PATH_ENV,
-    ducklake_catalog_connstr,
-    find_duckdb_lib_dir,
-)
 from qiita_common.api_paths import LOOPBACK_HOST
 from qiita_common.duckdb_miint import setup_miint_test_env  # noqa: E402
 from qiita_control_plane.testing.db_teardown import (
@@ -54,6 +49,12 @@ from qiita_control_plane.testing.sessions import (  # noqa: F401
     compute_worker_service_account,
     human_admin_session,
     regular_user_session,
+)
+
+from _pg_env import (
+    LIB_PATH_ENV,
+    ducklake_catalog_connstr,
+    find_duckdb_lib_dir,
 )
 
 # Integration tests run native orchestrator jobs (hash_sequences,

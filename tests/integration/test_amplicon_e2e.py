@@ -46,11 +46,12 @@ import uuid
 from pathlib import Path
 
 import pytest
-from _runner_helpers import LocalComputeBackendClient
-from conftest import ducklake_connect
 from httpx import ASGITransport
 from qiita_common.api_paths import LOOPBACK_HOST
 from qiita_control_plane.testing.db_teardown import teardown_entity_graph
+
+from _runner_helpers import LocalComputeBackendClient
+from conftest import ducklake_connect
 
 _REPO_ROOT = Path(__file__).parent.parent.parent
 _WORKFLOWS = _REPO_ROOT / "workflows"

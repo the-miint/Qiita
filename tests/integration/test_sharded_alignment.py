@@ -44,7 +44,6 @@ from pathlib import Path
 
 import duckdb
 import pytest
-from conftest import ducklake_connect
 from qiita_common.api_paths import LOOPBACK_HOST
 from qiita_compute_orchestrator import read_source
 from qiita_compute_orchestrator.data_plane_client import open_doget_stream
@@ -58,6 +57,8 @@ from qiita_compute_orchestrator.jobs import (
     build_minimap2_index,
     build_routing_index,
 )
+
+from conftest import ducklake_connect
 
 _REF_IDX = 8
 # The CP-minted alignment-config identity stamped as the leading column of every

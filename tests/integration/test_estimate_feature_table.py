@@ -38,8 +38,6 @@ from pathlib import Path
 
 import duckdb
 import pytest
-from _runner_helpers import LocalComputeBackendClient
-from conftest import ducklake_connect
 from qiita_common.api_paths import LOOPBACK_HOST
 from qiita_control_plane.repositories.alignment_definition import (
     mint_alignment_definition,
@@ -56,6 +54,9 @@ from qiita_control_plane.testing.db_teardown import (
     delete_principal,
     teardown_entity_graph,
 )
+
+from _runner_helpers import LocalComputeBackendClient
+from conftest import ducklake_connect
 
 _YAML_PATH = (
     Path(__file__).parent.parent.parent / "workflows" / "estimate-feature-table" / "1.0.0.yaml"

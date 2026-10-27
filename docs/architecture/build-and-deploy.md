@@ -257,8 +257,6 @@ lint-data-plane:
 lint-compute-orchestrator:
 	cd qiita-compute-orchestrator && uv run ruff check . && uv run ruff format --check .
 
-# Python outside the three packages, on qiita-common's ruff. workflows/ is not
-# here: its scripts run on each container's own Python (workflows/ruff.toml).
 lint-repo-python:
 	cd qiita-common && uv run ruff check ../tests/integration ../scripts && uv run ruff format --check ../tests/integration ../scripts
 

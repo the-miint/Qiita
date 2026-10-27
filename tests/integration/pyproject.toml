@@ -27,3 +27,6 @@ asyncio_default_test_loop_scope = "session"
 markers = [
     "system: system tests with real reference data (deselect with -m 'not system')",
 ]
+
+[tool.ruff]
+extend = "../../ruff.toml"

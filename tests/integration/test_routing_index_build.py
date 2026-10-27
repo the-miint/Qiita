@@ -23,11 +23,12 @@ from pathlib import Path
 
 import duckdb
 import pytest
-from conftest import ducklake_connect
 from qiita_common.api_paths import LOOPBACK_HOST
 from qiita_compute_orchestrator.data_plane_client import open_doget_stream
 from qiita_compute_orchestrator.jobs import build_routing_index
 from qiita_compute_orchestrator.miint import open_miint_conn
+
+from conftest import ducklake_connect
 
 # Out-of-band reference + feature_idx for this module's seeded rows (distinct from
 # the other stream modules). Three features across TWO shards: 830001+830002 ->

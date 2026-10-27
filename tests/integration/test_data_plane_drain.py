@@ -12,8 +12,9 @@ import threading
 import time
 
 import pyarrow.flight as flight
-from conftest import ducklake_connect
 from qiita_common.api_paths import LOOPBACK_HOST
+
+from conftest import ducklake_connect
 
 N_ROWS = 50_000
 SEQ_LEN = 1000

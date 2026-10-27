@@ -14,7 +14,6 @@ import secrets
 import uuid
 
 import pytest
-from conftest import ducklake_connect
 from qiita_common.api_paths import LOOPBACK_HOST
 from qiita_common.models.reference import Tier
 from qiita_control_plane.repositories.processing import mint_processing
@@ -24,6 +23,8 @@ from qiita_control_plane.testing.db_seeds import (
     seed_prep_sample_to_study_link,
 )
 from qiita_control_plane.testing.db_teardown import teardown_entity_graph
+
+from conftest import ducklake_connect
 
 _CHUNK_BP = 4_096
 

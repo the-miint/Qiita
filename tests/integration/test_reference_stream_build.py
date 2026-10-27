@@ -19,13 +19,14 @@ from contextlib import asynccontextmanager
 
 import duckdb
 import pytest
-from conftest import ducklake_connect
 from qiita_common.api_paths import LOOPBACK_HOST
 from qiita_compute_orchestrator.data_plane_client import open_doget_stream
 from qiita_compute_orchestrator.jobs import (
     build_bowtie2_index,
     build_minimap2_index,
 )
+
+from conftest import ducklake_connect
 
 # Out-of-band reference + feature_idx for this module's seeded rows (distinct from
 # test_reference_stream.py's 5 / 800001..3). The roster covers the two seeded

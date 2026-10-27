@@ -39,7 +39,6 @@ from pathlib import Path
 
 import duckdb
 import pytest
-from conftest import ducklake_connect
 from fastapi import HTTPException
 from qiita_common.actions import BLOCK_MASK_ACTION_ID
 from qiita_common.api_paths import LOOPBACK_HOST
@@ -50,6 +49,8 @@ from qiita_control_plane.testing.db_seeds import (
     seed_action_if_absent,
 )
 from qiita_control_plane.testing.db_teardown import teardown_entity_graph
+
+from conftest import ducklake_connect
 
 _READ_MASK_BLOCK_YAML_PATH = (
     Path(__file__).parent.parent.parent / "workflows" / "read-mask-block" / "1.0.0.yaml"

@@ -46,8 +46,9 @@ from pathlib import Path
 import duckdb
 import pyarrow.flight as flight
 import pytest
-from _runner_helpers import LocalComputeBackendClient
 from httpx import ASGITransport, AsyncClient
+
+from _runner_helpers import LocalComputeBackendClient
 
 DATA_DIR = Path(__file__).parent.parent.parent / "localdocs" / "scratch"
 FASTA = DATA_DIR / "2024.09.backbone.sequence.fna.gz"

@@ -59,6 +59,5 @@ allow-direct-references = true
 pythonpath = ["src"]
 asyncio_mode = "auto"
 
-
 [tool.ruff]
 extend = "../ruff.toml"

@@ -36,7 +36,6 @@ from pathlib import Path
 import duckdb
 import httpx
 import pytest
-from conftest import ducklake_connect
 from qiita_common.api_paths import (
     LOOPBACK_HOST,
     PATH_ADMIN_MASKED_READ_EXPORT_TICKET,
@@ -44,6 +43,8 @@ from qiita_common.api_paths import (
 )
 from qiita_common.models import MaskedReadExportTicketRequest, ReadMaskReason
 from qiita_control_plane.testing.db_teardown import teardown_entity_graph
+
+from conftest import ducklake_connect
 
 
 def _u8(values: list[int]) -> str:

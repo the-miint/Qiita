@@ -44,10 +44,11 @@ from pathlib import Path
 
 import duckdb
 import pytest
-from conftest import ducklake_connect
 from qiita_common.api_paths import LOOPBACK_HOST
 from qiita_common.models import ReadMaskReason
 from qiita_control_plane.testing.db_teardown import teardown_entity_graph
+
+from conftest import ducklake_connect
 
 _READ_MASK_YAML_PATH = (
     Path(__file__).parent.parent.parent / "workflows" / "read-mask" / "1.0.0.yaml"

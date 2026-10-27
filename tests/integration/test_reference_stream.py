@@ -15,10 +15,11 @@ test_doget.py.
 
 import duckdb
 import pytest
-from conftest import ducklake_connect
 from qiita_common.api_paths import LOOPBACK_HOST
 from qiita_common.chunking import reassemble_chunks_expr
 from qiita_compute_orchestrator.data_plane_client import open_doget_stream
+
+from conftest import ducklake_connect
 
 # Out-of-band feature_idx values for this module's seeded rows and the reference
 # they belong to. The subset excludes _EXCLUDED to prove scoping.

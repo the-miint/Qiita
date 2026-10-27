@@ -11,7 +11,6 @@ import secrets
 import uuid
 
 import pytest
-from conftest import ducklake_connect
 from qiita_common.api_paths import LOOPBACK_HOST
 from qiita_common.models import Tier
 from qiita_control_plane.testing.db_seeds import (
@@ -20,6 +19,8 @@ from qiita_control_plane.testing.db_seeds import (
     seed_prep_sample_to_study_link,
 )
 from qiita_control_plane.testing.db_teardown import teardown_entity_graph
+
+from conftest import ducklake_connect
 
 _INSERTS = {
     "synDNA_16SrRNA_seq_1_gc=0.26": ("syn one", 12),

@@ -10,8 +10,9 @@ import time
 import pyarrow as pa
 import pyarrow.flight as flight
 import pytest
-from conftest import ducklake_connect
 from qiita_common.api_paths import LOOPBACK_HOST
+
+from conftest import ducklake_connect
 
 # Deterministic, out-of-band feature_idx values for this module's seeded rows.
 SEED_FEATURE_IDXS = [700001, 700002]
