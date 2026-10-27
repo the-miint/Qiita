@@ -7,4 +7,5 @@
   by the pre-commit hook on ruff's defaults (88 columns), now follow the same
   settings, and `make lint-python` (which CI and `make lint` run) checks them through
   a new `lint-repo-python` target. `workflows/` keeps ruff's defaults through
-  `workflows/ruff.toml`: its scripts run on each container's own Python.
+  `workflows/ruff.toml`: its scripts run on each container's own Python. The
+  pre-commit hook moves from ruff 0.15.0 to 0.15.7, the version the lock files resolve.
