@@ -241,10 +241,11 @@ def _merge_elsewhere(repo) -> str:
 def test_a_merge_bringing_in_other_commits_has_to_be_named(repo):
     """A pull of work pushed from elsewhere, or another PR's branch merged in before it
     was squash-merged, brings commits no round read; the merge is what declares them."""
-    _merge_elsewhere(repo)
+    merge = _merge_elsewhere(repo)
     result = _run(repo, _BLOCK.format(sha=repo["second"]))
     assert result.returncode == 1
     assert "not named on that line" in result.stderr
+    assert merge[:7] in result.stderr
 
 
 def test_naming_the_merge_covers_what_it_brought_in(repo):

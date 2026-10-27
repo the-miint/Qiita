@@ -75,7 +75,8 @@ named=$(grep -oE "$sha_re" <<<"$line" || true)
 unnamed=()
 for commit in $later; do
     if git rev-parse --verify --quiet "${commit}^2" >/dev/null; then
-        brought=$(git rev-list "${commit}^2" --not "${commit}^1" "$base")
+        # Every parent but the first, so an octopus merge's third parent counts too.
+        brought=$(git rev-list "${commit}^@" --not "${commit}^1" "$base")
         [ -n "$brought" ] || continue
     fi
     found=0
