@@ -35,6 +35,12 @@ if [ -n "$DP_PEERS" ]; then
         qiita_assert_peer_resolves "$peer"
     done
 fi
+# Instances whose port left the list: stopped and disabled below when the deploy
+# is asked to, otherwise the deploy stops here.
+DP_DISABLE_UNITS=$(qiita_data_plane_units_to_disable "$DP_PORTS")
+if [ -n "$DP_DISABLE_UNITS" ]; then
+    echo "data plane instances to stop and disable (QIITA_DP_DISABLE_REMOVED=1): $DP_DISABLE_UNITS"
+fi
 # Every render carries nginx's loopback listener, single instance included, and on
 # an SELinux-Enforcing host nginx can bind its port only once it is labelled
 # http_port_t (qiita_selinux_lb_port_state). `nginx -t` does not catch that, so it
@@ -247,7 +253,8 @@ systemctl daemon-reload
 # runs. Every local instance is waited on, then all are restarted together below.
 # See wait_for_data_plane_idle (deploy/_common.sh).
 read -r -a dp_units <<< "$(qiita_data_plane_units "$DP_PORTS")"
-wait_for_data_plane_idle "$DP_ENV" "${dp_units[@]}"
+read -r -a dp_disable_units <<< "$DP_DISABLE_UNITS"
+wait_for_data_plane_idle "$DP_ENV" "${dp_units[@]}" "${dp_disable_units[@]}"
 
 # Skip restart when env file is absent (first deploy; operator writes envs in runbook steps 1/8b/9a).
 restart_if_env_present() {
@@ -260,13 +267,21 @@ restart_if_env_present() {
 restart_if_env_present qiita-control-plane         /etc/qiita/control-plane.env
 restart_if_env_present qiita-compute-orchestrator  /etc/qiita/compute-orchestrator.env
 # One unit per port in the list that rendered the upstream above. `enable` so an
-# instance added to QIITA_DATA_PLANE_PORTS also starts at boot. A port removed from
-# the list is not disabled here; docs/runbooks/data-plane-scaling.md covers that.
-# One `systemctl restart` for all of them, so they all stop accepting new requests
-# at the same moment and their drains run at the same time.
+# instance added to QIITA_DATA_PLANE_PORTS also starts at boot. One `systemctl
+# restart` for all of them, so they all stop accepting new requests at the same
+# moment and their drains run at the same time. A removed instance's stop is queued
+# first (--no-block) so its drain overlaps theirs; the second `stop` waits for it
+# (systemd 257: 5.2 s for two 5 s drains, 10.2 s one after the other).
 if [ -r "$DP_ENV" ]; then
+    if [ "${#dp_disable_units[@]}" -gt 0 ]; then
+        systemctl disable "${dp_disable_units[@]}" >/dev/null
+        systemctl stop --no-block "${dp_disable_units[@]}"
+    fi
     systemctl enable "${dp_units[@]}" >/dev/null
     systemctl restart "${dp_units[@]}"
+    if [ "${#dp_disable_units[@]}" -gt 0 ]; then
+        systemctl stop "${dp_disable_units[@]}"
+    fi
 else
     echo "skipping restart ${dp_units[*]} — $DP_ENV not present" >&2
 fi

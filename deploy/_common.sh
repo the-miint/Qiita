@@ -390,6 +390,30 @@ qiita_data_plane_stray_units() {
     done <<<"$listing"
 }
 
+# What the deploy does with the units qiita_data_plane_stray_units finds for the
+# ports in `$1`. With QIITA_DP_DISABLE_REMOVED=1 in the deploy's environment, prints
+# their names, space-separated, for activate.sh to stop and disable. Without it,
+# fails naming each one, so the deploy stops before installing anything rather than
+# leave an instance on the previous build. Prints nothing when there are none.
+qiita_data_plane_units_to_disable() {
+    local strays line
+    case "${QIITA_DP_DISABLE_REMOVED:-}" in
+        ''|1) ;;
+        *) echo "ERROR: QIITA_DP_DISABLE_REMOVED must be 1 or unset, not '$QIITA_DP_DISABLE_REMOVED'" >&2; return 1 ;;
+    esac
+    strays=$(qiita_data_plane_stray_units "$1") || return 1
+    [ -n "$strays" ] || return 0
+    if [ "${QIITA_DP_DISABLE_REMOVED:-}" = 1 ]; then
+        awk '{print $1}' <<<"$strays" | paste -sd ' ' -
+        return 0
+    fi
+    echo "ERROR: data-plane units running or enabled outside QIITA_DATA_PLANE_PORTS ($1):" >&2
+    while IFS= read -r line; do echo "  $line" >&2; done <<<"$strays"
+    echo "  Re-run the deploy with QIITA_DP_DISABLE_REMOVED=1 to stop and disable them, add" >&2
+    echo "  their ports back to QIITA_DATA_PLANE_PORTS, or run 'systemctl disable --now <unit>'." >&2
+    return 1
+}
+
 # The local instance ports, whitespace-separated: QIITA_DATA_PLANE_PORTS in $DP_ENV,
 # else 50051; set but blank is an error. Each port becomes a systemd unit name, an
 # nginx `server` line and a health-check target, so a malformed list fails here

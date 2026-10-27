@@ -193,7 +193,13 @@ _UNIT_STATES = {
 }
 
 
-def _run_stray_units(tmp_path: Path, ports: str, list_rc: int = 0):
+def _run_stray_units(
+    tmp_path: Path,
+    ports: str,
+    list_rc: int = 0,
+    snippet: str = "qiita_data_plane_stray_units",
+    extra_env: dict[str, str] | None = None,
+):
     stub = tmp_path / "stub"
     stub.mkdir()
     listing = "".join(
@@ -215,9 +221,9 @@ def _run_stray_units(tmp_path: Path, ports: str, list_rc: int = 0):
     )
     (stub / "systemctl").chmod(0o755)
     return _run_common(
-        'qiita_data_plane_stray_units "$1"',
+        f'{snippet} "$1"',
         ports,
-        extra_env={"PATH": f"{stub}:{os.environ['PATH']}"},
+        extra_env={"PATH": f"{stub}:{os.environ['PATH']}", **(extra_env or {})},
     )
 
 
@@ -246,6 +252,70 @@ def test_stray_units_fails_when_systemctl_cannot_list(tmp_path: Path) -> None:
     result = _run_stray_units(tmp_path, "50051", list_rc=1)
     assert result.returncode != 0
     assert "could not list" in result.stderr
+
+
+def test_units_to_disable_stops_the_deploy_without_the_flag(tmp_path: Path) -> None:
+    """Without QIITA_DP_DISABLE_REMOVED=1 a stray instance stops the deploy, naming
+    it and the ways out, so no deploy leaves an instance on the previous build."""
+    result = _run_stray_units(tmp_path, "50051", snippet="qiita_data_plane_units_to_disable")
+    assert result.returncode != 0
+    assert result.stdout == ""
+    assert "qiita-data-plane@50052.service active/disabled" in result.stderr
+    assert "QIITA_DP_DISABLE_REMOVED=1" in result.stderr
+
+
+def test_units_to_disable_names_the_strays_with_the_flag(tmp_path: Path) -> None:
+    result = _run_stray_units(
+        tmp_path,
+        "50051",
+        snippet="qiita_data_plane_units_to_disable",
+        extra_env={"QIITA_DP_DISABLE_REMOVED": "1"},
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.split() == [
+        "qiita-data-plane@50052.service",
+        "qiita-data-plane@50053.service",
+        "qiita-data-plane@50055.service",
+    ]
+
+
+@pytest.mark.parametrize("flag", ["", "1"])
+def test_units_to_disable_is_empty_without_strays(tmp_path: Path, flag: str) -> None:
+    """A host running only its listed instances deploys as before, flag or not."""
+    result = _run_stray_units(
+        tmp_path,
+        "50051 50052 50053 50054 50055",
+        snippet="qiita_data_plane_units_to_disable",
+        extra_env={"QIITA_DP_DISABLE_REMOVED": flag},
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == ""
+
+
+@pytest.mark.parametrize("flag", ["yes", "true", "0"])
+def test_units_to_disable_rejects_a_flag_other_than_1(tmp_path: Path, flag: str) -> None:
+    result = _run_stray_units(
+        tmp_path,
+        "50051 50052 50053 50054 50055",
+        snippet="qiita_data_plane_units_to_disable",
+        extra_env={"QIITA_DP_DISABLE_REMOVED": flag},
+    )
+    assert result.returncode != 0
+    assert "must be 1 or unset" in result.stderr
+
+
+def test_activate_stops_removed_instances_alongside_the_restart() -> None:
+    """The strays are resolved before anything is installed; each is disabled and its
+    stop queued before the restart, so its drain overlaps the listed instances', and
+    a blocking stop after the restart waits for it."""
+    src = (_DEPLOY / "activate.sh").read_text()
+    resolve = src.index('DP_DISABLE_UNITS=$(qiita_data_plane_units_to_disable "$DP_PORTS")')
+    assert resolve < src.index("assert_migrations_applied()")
+    disable = src.index('    systemctl disable "${dp_disable_units[@]}" >/dev/null')
+    queue = src.index('    systemctl stop --no-block "${dp_disable_units[@]}"')
+    restart = src.index('    systemctl restart "${dp_units[@]}"')
+    wait = src.index('    systemctl stop "${dp_disable_units[@]}"')
+    assert disable < queue < restart < wait
 
 
 def test_data_plane_ports_reads_the_host_file(tmp_path: Path) -> None:
@@ -644,7 +714,11 @@ def test_activate_waits_on_and_restarts_every_local_instance_together() -> None:
     assert re.search(
         r'(?m)^read -r -a dp_units <<< "\$\(qiita_data_plane_units "\$DP_PORTS"\)"$', src
     )
-    assert re.search(r'(?m)^wait_for_data_plane_idle "\$DP_ENV" "\$\{dp_units\[@\]\}"$', src)
+    assert re.search(
+        r'(?m)^wait_for_data_plane_idle "\$DP_ENV" "\$\{dp_units\[@\]\}" '
+        r'"\$\{dp_disable_units\[@\]\}"$',
+        src,
+    )
     assert re.search(r'(?m)^    systemctl restart "\$\{dp_units\[@\]\}"$', src)
     assert not re.search(r"(?m)^\s*restart_if_env_present\s+\S*qiita-data-plane", src)
 

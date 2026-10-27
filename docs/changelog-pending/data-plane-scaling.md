@@ -8,7 +8,9 @@
   `verify-deploy` checks: `health/data-plane@<port>` per instance (replacing the single
   `health/data-plane` row), `health/data-plane-peer@<host:port>` per peer,
   `health/data-plane-lb`, and `data-plane-units/<unit>`, which fails for a running or
-  enabled instance whose port the list no longer names. Before, the upstream was a checked-in literal the deploy
+  enabled instance whose port the list no longer names. A deploy that finds such an
+  instance stops before installing anything, unless it runs with
+  `QIITA_DP_DISABLE_REMOVED=1`, which disables and stops it alongside the restart. Before, the upstream was a checked-in literal the deploy
   overwrote and only `@50051` was restarted, so an added instance lost its upstream entry
   and kept running old code after the next deploy. The keys are validated, and peer names
   resolved, before anything is installed, and the rendered nginx config is tested before

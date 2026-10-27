@@ -61,17 +61,22 @@ file says what it was chosen against).
 
 ## Fewer instances on this host
 
-Remove the port from `QIITA_DATA_PLANE_PORTS` and redeploy, then disable the removed
-unit. The deploy never disables a unit; until you do, the instance keeps running on
-the previous deploy's code, outside the upstream:
+Remove the port from `QIITA_DATA_PLANE_PORTS` and redeploy with
+`QIITA_DP_DISABLE_REMOVED=1`:
 
 ```bash
 # [admin]
-sudo systemctl disable --now qiita-data-plane@50053
+sudo make redeploy QIITA_HOSTNAME=<fqdn> QIITA_DP_DISABLE_REMOVED=1
 ```
 
-Until then `sudo make verify-deploy QIITA_HOSTNAME=<fqdn>` fails `data-plane-units/<unit>` for each running or
-enabled instance whose port is not in the list.
+The deploy waits for the removed instance to go idle along with the others, then
+disables and stops it while the listed instances restart, so its drain runs at the
+same time as theirs. Without the flag, a deploy that finds a `qiita-data-plane@` unit
+running or enabled outside the list stops before installing anything and names it;
+an instance left there would keep running the previous deploy's build, outside the
+upstream. `systemctl disable --now <unit>` by hand does the same as the flag. If a
+unit is started outside the list after a deploy, `sudo make verify-deploy
+QIITA_HOSTNAME=<fqdn>` fails `data-plane-units/<unit>`.
 
 ## The control plane through nginx
 
