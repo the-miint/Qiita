@@ -699,53 +699,6 @@ qiita_data_plane_member_label() {
     esac
 }
 
-# Whether SELinux lets nginx bind the loopback listener's port. On the stock Rocky
-# 10 targeted policy (selinux-policy 42.1.18) the port is in the 32768-60999 range
-# labelled ephemeral_port_t, which the nginx domain (httpd_t) may bind only when the
-# nis_enabled or httpd_enable_ftp_server boolean is on, and both default off.
-# Labelling the port http_port_t lets it bind. Prints a one-line reason; returns
-#   0 — SELinux absent or not enforcing, or the port is labelled http_port_t
-#   1 — enforcing and the port is not labelled http_port_t
-#   2 — enforcing, but `semanage port -l` failed (it needs root)
-#   3 — enforcing, and semanage is not installed
-qiita_selinux_lb_port_state() {
-    local mode listing
-    if ! command -v getenforce >/dev/null 2>&1; then
-        echo "getenforce not found (SELinux not installed)"
-        return 0
-    fi
-    mode=$(getenforce)
-    if [ "$mode" != Enforcing ]; then
-        echo "SELinux $mode"
-        return 0
-    fi
-    if ! command -v semanage >/dev/null 2>&1; then
-        echo "SELinux Enforcing and semanage not found (dnf install policycoreutils-python-utils)"
-        return 3
-    fi
-    if ! listing=$(semanage port -l 2>/dev/null); then
-        echo "SELinux Enforcing and 'semanage port -l' failed (run as root)"
-        return 2
-    fi
-    # A row reads `http_port_t   tcp   50050, 80, 81, 443, 5671-5672`.
-    if awk -v p="$QIITA_DATA_PLANE_LB_PORT" '
-        $1 == "http_port_t" && $2 == "tcp" {
-            for (i = 3; i <= NF; i++) {
-                item = $i; sub(/,$/, "", item)
-                n = split(item, r, "-")
-                if (n == 1 && item + 0 == p) found = 1
-                if (n == 2 && p >= r[1] + 0 && p <= r[2] + 0) found = 1
-            }
-        }
-        END { exit !found }
-    ' <<<"$listing"; then
-        echo "SELinux Enforcing and tcp/$QIITA_DATA_PLANE_LB_PORT is labelled http_port_t"
-        return 0
-    fi
-    echo "SELinux Enforcing and tcp/$QIITA_DATA_PLANE_LB_PORT is not labelled http_port_t"
-    return 1
-}
-
 # Split the password out of a libpq connection string — key=value form
 # ("host=… user=… password=…") or postgres:// URI form — so a caller can hand it
 # to libpq through PGPASSFILE instead of leaving it in a SQL file or, worse, on a

@@ -19,17 +19,7 @@ _None yet._
 
 ### 2. One-time host setup
 
-- `[admin]` If `getenforce` prints `Enforcing`, let nginx bind its new loopback listener
-  (#363) — every deploy now renders it, single instance included, and the stock Rocky 10
-  policy does not let nginx bind that port:
-
-  ```bash
-  # [admin]
-  sudo semanage port -a -t http_port_t -p tcp 50050
-  ```
-
-  `make preflight` reports it as `selinux/lb-port` (fails while Enforcing and unlabelled),
-  and `activate.sh` stops before installing anything until it is labelled.
+_None yet._
 
 ### 3. Migrations
 

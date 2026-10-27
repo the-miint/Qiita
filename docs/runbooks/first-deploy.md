@@ -325,16 +325,7 @@ AuthRocket's URL validator on first realm setup:
 sudo mv /etc/nginx/conf.d/default.conf /etc/nginx/conf.d/default.conf.disabled
 ```
 
-nginx also listens on `127.0.0.1:50050`, the data-plane loopback listener. If
-`getenforce` prints `Enforcing`, label that port first; on the stock Rocky 10
-policy nginx cannot bind it otherwise (`qiita_selinux_lb_port_state` in
-`deploy/_common.sh` has the policy detail):
-```bash
-# [admin]
-sudo semanage port -a -t http_port_t -p tcp 50050
-```
-`make preflight` reports it as `selinux/lb-port`, and `activate.sh` stops before
-installing anything until it is labelled.
+nginx also listens on `127.0.0.1:50050`, the data-plane loopback listener.
 
 ### 0.5 Build + ops tooling
 

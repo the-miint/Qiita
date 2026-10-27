@@ -41,19 +41,6 @@ DP_DISABLE_UNITS=$(qiita_data_plane_units_to_disable "$DP_PORTS")
 if [ -n "$DP_DISABLE_UNITS" ]; then
     echo "data plane instances to stop and disable (QIITA_DP_DISABLE_REMOVED=1): $DP_DISABLE_UNITS"
 fi
-# Every render carries nginx's loopback listener, single instance included, and on
-# an SELinux-Enforcing host nginx can bind its port only once it is labelled
-# http_port_t (qiita_selinux_lb_port_state). `nginx -t` does not catch that, so it
-# is checked here, before anything is installed.
-selinux_reason=$(qiita_selinux_lb_port_state) && selinux_rc=0 || selinux_rc=$?
-if [ "$selinux_rc" -ne 0 ]; then
-    echo "ERROR: nginx cannot bind the data-plane loopback listener: $selinux_reason" >&2
-    if [ "$selinux_rc" -eq 1 ]; then
-        echo "  run: semanage port -a -t http_port_t -p tcp $QIITA_DATA_PLANE_LB_PORT" >&2
-    fi
-    exit 1
-fi
-
 # Migration-pending guard. The code we're about to deploy assumes the schema
 # produced by every file in db/migrations/; restarting services against a DB
 # missing any of them surfaces as runtime 500s, not a boot failure. Applying

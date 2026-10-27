@@ -862,17 +862,15 @@ def test_nginx_flight_locations_agree_on_body_cap_and_timeouts() -> None:
 
 
 def test_activate_resolves_topology_before_installing_anything() -> None:
-    """A malformed topology, an unresolvable peer or an SELinux policy that will not
-    let nginx bind the loopback listener has to fail with the running deploy
-    untouched: before the first rsync, the binary install, the nginx render and any
-    restart. Asserted on source order, since the order is the property."""
+    """A malformed topology or an unresolvable peer has to fail with the running
+    deploy untouched: before the first rsync, the binary install, the nginx render
+    and any restart. Asserted on source order, since the order is the property."""
     src = (_DEPLOY / "activate.sh").read_text()
     resolved = max(
         _first_command(src, re.escape("DP_PORTS=$(qiita_data_plane_ports)")),
         _first_command(src, re.escape("DP_PEERS=$(qiita_data_plane_peers)")),
         _first_command(src, re.escape("DP_BIND_HOST=$(qiita_data_plane_bind_host)")),
         _first_command(src, re.escape('qiita_assert_peer_resolves "$peer"')),
-        _first_command(src, re.escape("selinux_reason=$(qiita_selinux_lb_port_state)")),
     )
     for step in (
         r"rsync -a",
@@ -948,71 +946,6 @@ def test_peer_resolves_skips_when_getent_is_unavailable(tmp_path: Path) -> None:
     )
     assert result.returncode == 0, result.stderr
     assert "getent unavailable" in result.stderr
-
-
-# `semanage port -l` rows as Rocky 10 prints them (selinux-policy 42.1.18), with
-# tcp/50050 labelled http_port_t, plus two rows carrying ranges.
-_SEMANAGE_LABELLED = """\
-SELinux Port Type              Proto    Port Number
-
-amanda_port_t                  tcp      10080-10083
-amqp_port_t                    tcp      15672, 5671-5672
-http_port_t                    tcp      50050, 80, 81, 443, 488, 8008, 8009, 8443, 9000
-http_port_t                    udp      80, 443
-"""
-_SEMANAGE_UNLABELLED = _SEMANAGE_LABELLED.replace("tcp      50050, 80", "tcp      80")
-_SEMANAGE_RANGE = _SEMANAGE_UNLABELLED.replace("tcp      80, 81", "tcp      50040-50060, 80, 81")
-
-
-def _selinux_state(
-    tmp_path: Path, *, mode: str | None, listing: str | None, semanage_fails: bool = False
-) -> subprocess.CompletedProcess[str]:
-    """Run qiita_selinux_lb_port_state with stub getenforce/semanage on a PATH that
-    holds only them and the tools sourcing _common.sh and the stubs use, so a real
-    SELinux toolchain on the test host cannot answer instead."""
-    stub = tmp_path / "stub"
-    stub.mkdir()
-    bash = shutil.which("bash")
-    assert bash
-    for tool in ("awk", "cat", "dirname", "basename"):
-        found = shutil.which(tool)
-        assert found, f"{tool} not found"
-        (stub / tool).symlink_to(found)
-    if mode is not None:
-        (stub / "getenforce").write_text(f"#!/bin/sh\necho {mode}\n")
-        (stub / "getenforce").chmod(0o755)
-    if listing is not None or semanage_fails:
-        (tmp_path / "listing").write_text(listing or "")
-        body = "exit 1" if semanage_fails else f'cat "{tmp_path / "listing"}"'
-        (stub / "semanage").write_text(f"#!/bin/sh\n{body}\n")
-        (stub / "semanage").chmod(0o755)
-    return subprocess.run(
-        [bash, "-c", f'source "{_COMMON}"; qiita_selinux_lb_port_state'],
-        capture_output=True,
-        text=True,
-        env={**os.environ, "PATH": str(stub)},
-    )
-
-
-@pytest.mark.parametrize(
-    ("mode", "listing", "semanage_fails", "rc"),
-    [
-        (None, None, False, 0),  # SELinux not installed
-        ("Disabled", None, False, 0),
-        ("Permissive", None, False, 0),
-        ("Enforcing", _SEMANAGE_LABELLED, False, 0),
-        ("Enforcing", _SEMANAGE_RANGE, False, 0),  # a labelled range covering the port
-        ("Enforcing", _SEMANAGE_UNLABELLED, False, 1),
-        ("Enforcing", None, True, 2),  # semanage present but failing (non-root)
-        ("Enforcing", None, False, 3),  # semanage not installed
-    ],
-)
-def test_selinux_lb_port_state(
-    tmp_path: Path, mode: str | None, listing: str | None, semanage_fails: bool, rc: int
-) -> None:
-    result = _selinux_state(tmp_path, mode=mode, listing=listing, semanage_fails=semanage_fails)
-    assert result.returncode == rc, result.stdout + result.stderr
-    assert result.stdout.strip(), "every state prints a reason"
 
 
 def test_native_checkout_resolves_valid_layout(tmp_path: Path) -> None:
