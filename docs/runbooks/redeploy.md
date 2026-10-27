@@ -39,7 +39,10 @@ sudo make -C /home/qiita/qiita-miint redeploy QIITA_HOSTNAME=qiita-miint.ucsd.ed
 
 The data-plane instances, peers and bind address come from
 `/etc/qiita/data-plane.env`, so this command carries no scaling variables; see
-[`data-plane-scaling.md`](data-plane-scaling.md).
+[`data-plane-scaling.md`](data-plane-scaling.md). The one exception is a deploy after
+removing a port: it stops before installing anything while that instance's unit is
+running or enabled, unless run with `QIITA_DP_DISABLE_REMOVED=1`
+([Fewer instances on this host](data-plane-scaling.md#fewer-instances-on-this-host)).
 
 `deploy/redeploy.sh` drives steps 2–8 in order: pull (as the operator) →
 print buckets 1 & 2 and pause for you to apply them (only when they hold real

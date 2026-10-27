@@ -307,15 +307,17 @@ def test_units_to_disable_rejects_a_flag_other_than_1(tmp_path: Path, flag: str)
 def test_activate_stops_removed_instances_alongside_the_restart() -> None:
     """The strays are resolved before anything is installed; each is disabled and its
     stop queued before the restart, so its drain overlaps the listed instances', and
-    a blocking stop after the restart waits for it."""
+    a blocking stop after the nginx reload waits for it, so nginx drops the removed
+    member without waiting on its drain."""
     src = (_DEPLOY / "activate.sh").read_text()
     resolve = src.index('DP_DISABLE_UNITS=$(qiita_data_plane_units_to_disable "$DP_PORTS")')
     assert resolve < src.index("assert_migrations_applied()")
     disable = src.index('    systemctl disable "${dp_disable_units[@]}" >/dev/null')
     queue = src.index('    systemctl stop --no-block "${dp_disable_units[@]}"')
     restart = src.index('    systemctl restart "${dp_units[@]}"')
+    reload = src.index("    systemctl reload nginx")
     wait = src.index('    systemctl stop "${dp_disable_units[@]}"')
-    assert disable < queue < restart < wait
+    assert disable < queue < restart < reload < wait
 
 
 def test_data_plane_ports_reads_the_host_file(tmp_path: Path) -> None:

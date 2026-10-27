@@ -129,7 +129,7 @@ else
         fail "data-plane-units" "could not list the qiita-data-plane@ units"
     elif [ -n "$dp_strays" ]; then
         while read -r dp_unit dp_state; do
-            fail "data-plane-units/$dp_unit" "$dp_state, port not in QIITA_DATA_PLANE_PORTS ($dp_ports): run 'systemctl disable --now $dp_unit'"
+            fail "data-plane-units/$dp_unit" "$dp_state, port not in QIITA_DATA_PLANE_PORTS ($dp_ports); see docs/runbooks/data-plane-scaling.md, \"Fewer instances on this host\""
         done <<<"$dp_strays"
     else
         pass "data-plane-units" "no qiita-data-plane@ unit outside QIITA_DATA_PLANE_PORTS ($dp_ports) is running or enabled"

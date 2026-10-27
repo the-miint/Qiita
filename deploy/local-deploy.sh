@@ -9,7 +9,9 @@
 #   sudo QIITA_HOSTNAME=qiita.example.org /home/qiita/qiita-miint/deploy/local-deploy.sh
 #
 # Env: QIITA_HOSTNAME (required), QIITA_USER (default: qiita),
-#      QIITA_CLONE (default: this script's parent), SKIP_PULL=1, SKIP_BUILD=1.
+#      QIITA_CLONE (default: this script's parent), SKIP_PULL=1, SKIP_BUILD=1,
+#      QIITA_DP_DISABLE_REMOVED=1 (activate.sh: stop and disable data-plane units
+#      outside QIITA_DATA_PLANE_PORTS instead of refusing to deploy).
 
 set -euo pipefail
 

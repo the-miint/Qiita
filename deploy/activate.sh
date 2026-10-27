@@ -270,8 +270,8 @@ restart_if_env_present qiita-compute-orchestrator  /etc/qiita/compute-orchestrat
 # instance added to QIITA_DATA_PLANE_PORTS also starts at boot. One `systemctl
 # restart` for all of them, so they all stop accepting new requests at the same
 # moment and their drains run at the same time. A removed instance's stop is queued
-# first (--no-block) so its drain overlaps theirs; the second `stop` waits for it
-# (systemd 257: 5.2 s for two 5 s drains, 10.2 s one after the other).
+# first (--no-block) so its drain overlaps theirs; the `stop` after the nginx reload
+# waits for it (systemd 257: 5.2 s for two 5 s drains, 10.2 s one after the other).
 if [ -r "$DP_ENV" ]; then
     if [ "${#dp_disable_units[@]}" -gt 0 ]; then
         systemctl disable "${dp_disable_units[@]}" >/dev/null
@@ -279,11 +279,9 @@ if [ -r "$DP_ENV" ]; then
     fi
     systemctl enable "${dp_units[@]}" >/dev/null
     systemctl restart "${dp_units[@]}"
-    if [ "${#dp_disable_units[@]}" -gt 0 ]; then
-        systemctl stop "${dp_disable_units[@]}"
-    fi
 else
-    echo "skipping restart ${dp_units[*]} — $DP_ENV not present" >&2
+    echo "skipping restart ${dp_units[*]} and stop ${dp_disable_units[*]} — $DP_ENV not present" >&2
+    dp_disable_units=()
 fi
 
 # Load the config tested above.
@@ -291,4 +289,10 @@ if qiita_nginx_tls_present; then
     systemctl reload nginx
 else
     echo "skipping nginx reload — $QIITA_NGINX_TLS_CERT / $QIITA_NGINX_TLS_KEY not present" >&2
+fi
+# After the reload, so nginx stops routing to a removed instance without waiting for
+# its drain. `systemctl stop` returns 0 when the unit is killed at TimeoutStopSec
+# (systemd 257), so a slow drain does not fail the deploy here.
+if [ "${#dp_disable_units[@]}" -gt 0 ]; then
+    systemctl stop "${dp_disable_units[@]}"
 fi

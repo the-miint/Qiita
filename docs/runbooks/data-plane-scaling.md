@@ -74,7 +74,8 @@ disables and stops it while the listed instances restart, so its drain runs at t
 same time as theirs. Without the flag, a deploy that finds a `qiita-data-plane@` unit
 running or enabled outside the list stops before installing anything and names it;
 an instance left there would keep running the previous deploy's build, outside the
-upstream. `systemctl disable --now <unit>` by hand does the same as the flag. If a
+upstream. `systemctl disable --now <unit>` by hand also removes it, but stops it
+without first waiting for its in-flight requests the way the deploy does. If a
 unit is started outside the list after a deploy, `sudo make verify-deploy
 QIITA_HOSTNAME=<fqdn>` fails `data-plane-units/<unit>`.
 
