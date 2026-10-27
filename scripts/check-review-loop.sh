@@ -9,8 +9,10 @@
 #
 # Passes when the 'no-agent-review' label is present, or when the description has a
 # "## Reviewer loop" section whose "Reviewed at:" line names one of the PR's own
-# commits and whose four ledger headings are present. It checks that the block is
-# there and points at this branch; it cannot check that the loop was run.
+# commits, then names every later commit of the PR (merges excepted), and whose four
+# ledger headings are present. It checks that the block is there, points at this
+# branch and accounts for every commit pushed since; it cannot check that the loop
+# was run.
 set -euo pipefail
 
 fail() {
@@ -58,9 +60,30 @@ if git merge-base --is-ancestor "$sha" "$base"; then
     fail "'Reviewed at: ${sha}' is a commit of the base branch, not one of this PR's."
 fi
 
+# Every commit of the PR after the reviewed one must be named on the same line, by
+# its sha or a prefix of at least 7 characters, so a commit no round read is
+# declared there rather than passing under an earlier sha. Merge commits are exempt,
+# and so is what a merge brings in (--first-parent): the base's commits, and another
+# PR's branch merged in before it was squash-merged, whose commits then never reach
+# the base under their own shas.
+line=$(grep -m1 '^- Reviewed at:' <<<"$section")
+named=$(grep -oE '[0-9a-f]{7,40}' <<<"$line" || true)
+unnamed=()
+while IFS= read -r commit; do
+    [ -n "$commit" ] || continue
+    found=0
+    for prefix in $named; do
+        case "$commit" in "$prefix"*) found=1; break ;; esac
+    done
+    [ "$found" -eq 1 ] || unnamed+=("${commit:0:8}")
+done < <(git rev-list --first-parent --no-merges "${sha}..${head}" --not "$base")
+if [ "${#unnamed[@]}" -gt 0 ]; then
+    fail "commits after 'Reviewed at: ${sha}' are not named on that line: ${unnamed[*]}. Run another round and move the sha, or name each one there (\"plus 1 later commit: <sha> <what it does>\")."
+fi
+
 for heading in "Fixed:" "Declined:" "Deferred:" "Not probed:"; do
     grep -q "^- ${heading}" <<<"$section" \
         || fail "the Reviewer loop section has no '- ${heading}' line."
 done
 
-echo "Reviewer loop block present; reviewed at ${sha}."
+echo "Reviewer loop block present; reviewed at ${sha}, later commits named."
