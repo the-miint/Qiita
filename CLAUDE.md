@@ -189,11 +189,11 @@ branch added after it. A merge of the base needs no naming; a merge that brings 
 other commits (a pull of work pushed from elsewhere, another PR's branch) is named
 itself. A commit that only writes the PR's number into the `(#N)` tags under
 `docs/changelog-pending/` and in `DEPLOY_CHECKLIST.md`, replacing a placeholder or adding
-the tag, needs no naming either. The `no-agent-review` label opts out, for a PR whose author cannot run the
-loop or that has nothing for it to read; the description then says why under the same
-heading. The check establishes that the block is present and accounts for every push,
-not that the loop ran — the block is the author's statement, and a human reviewer
-reads it as one.
+the tag, needs no naming either. The `no-agent-review` label opts out, for a PR whose
+author cannot run the loop or that has nothing for it to read; the description then
+says why under the same heading. The check establishes that the block is present and
+accounts for every push, not that the loop ran — the block is the author's statement,
+and a human reviewer reads it as one.
 
 When a human review turns up a pattern the agent missed, fold it into the agent file in
 the PR that fixes the instance: a rule or a bullet under the rule that owns it, a

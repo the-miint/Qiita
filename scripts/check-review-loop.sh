@@ -65,27 +65,40 @@ fi
 
 # Succeeds when the commit only writes this PR's number into its changelog and
 # checklist tags: it modifies (no add, delete or rename) files under
-# docs/changelog-pending/ and DEPLOY_CHECKLIST.md alone, each file is byte-identical
-# before and after once each ` (#PR_NUMBER)` and each placeholder tag (` (#TBD)`,
-# ` (#<branch>)`) is dropped, and the commit adds at least one ` (#PR_NUMBER)`.
+# docs/changelog-pending/ and DEPLOY_CHECKLIST.md alone, adds at least one
+# ` (#PR_NUMBER)`, adds no placeholder tag (` (#TBD)`, ` (#<branch>)`), and leaves each
+# file byte-identical once each ` (#PR_NUMBER)` and placeholder tag is dropped.
 # Comparing whole files, not changed lines, keeps a line moved in the same commit from
 # passing. Without PR_NUMBER (a run outside CI) nothing is exempt.
 tags_pr_number() {
-    local commit=$1 number=${PR_NUMBER:-} statuses status path tag strip old new added=0
+    local commit=$1 number=${PR_NUMBER:-} statuses status path tag placeholder strip
+    local old new extra added=0
     [[ "$number" =~ ^[0-9]+$ ]] || return 1
     tag=" \\(#${number}\\)"
-    strip="s@${tag}@@g; s@ \\(#[A-Za-z][A-Za-z0-9._/-]*\\)@@g"
+    placeholder=' \(#[A-Za-z][A-Za-z0-9._/-]*\)'
+    strip="s@${tag}@@g; s@${placeholder}@@g"
     # --no-renames, so a file renamed into an allowed path lists its source as deleted.
     statuses=$(git diff --no-ext-diff --no-renames --name-status "${commit}^1" "$commit")
     [ -n "$statuses" ] || return 1
     while IFS=$'\t' read -r status path; do
         [ "$status" = M ] || return 1
         case "$path" in DEPLOY_CHECKLIST.md | docs/changelog-pending/*) ;; *) return 1 ;; esac
-        old=$(git show "${commit}^1:${path}" | { grep -oE "$tag" || true; } | wc -l)
-        new=$(git show "${commit}:${path}" | { grep -oE "$tag" || true; } | wc -l)
+        # Each read is a pipeline whose failure returns 1 (pipefail), so a `git show` or
+        # a `sed` that fails on both sides cannot leave two equal empty outputs. Under
+        # the C locale, macOS sed reads bytes instead of failing on non-UTF-8 input.
+        old=$(git show "${commit}^1:${path}" | { grep -oE "$tag" || true; } | wc -l) || return 1
+        new=$(git show "${commit}:${path}" | { grep -oE "$tag" || true; } | wc -l) || return 1
         [ "$new" -gt "$old" ] && added=1
-        cmp -s <(git show "${commit}^1:${path}" | sed -E "$strip") \
-            <(git show "${commit}:${path}" | sed -E "$strip") || return 1
+        extra=$(comm -13 \
+            <(git show "${commit}^1:${path}" | { grep -oE "$placeholder" || true; } | sort) \
+            <(git show "${commit}:${path}" | { grep -oE "$placeholder" || true; } | sort)) \
+            || return 1
+        [ -z "$extra" ] || return 1
+        old=$(git show "${commit}^1:${path}" | sed -E "$strip" | git hash-object --stdin) \
+            || return 1
+        new=$(git show "${commit}:${path}" | sed -E "$strip" | git hash-object --stdin) \
+            || return 1
+        [ "$old" = "$new" ] || return 1
     done <<<"$statuses"
     [ "$added" -eq 1 ]
 }
@@ -109,7 +122,7 @@ for commit in $later; do
         # Every parent but the first, so an octopus merge's third parent counts too.
         brought=$(git rev-list "${commit}^@" --not "${commit}^1" "$base")
         [ -n "$brought" ] || continue
-    elif tags_pr_number "$commit"; then
+    elif LC_ALL=C tags_pr_number "$commit"; then
         continue
     fi
     found=0

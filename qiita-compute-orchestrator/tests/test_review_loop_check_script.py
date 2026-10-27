@@ -373,6 +373,7 @@ def test_a_later_commit_that_only_tags_the_pr_number_needs_no_naming(tagged, fil
         ),
         ({_ENTRY: _TAGGED_ENTRY, "docs/changelog-pending/new.md": "- New (#12).\n"}, "12"),
         ({_ENTRY: None, "docs/changelog-pending/renamed.md": _TAGGED_ENTRY}, "12"),
+        ({_ENTRY: _TAGGED_ENTRY.replace("More text.", "More text (#skip-step).")}, "12"),
     ],
     ids=[
         "no-pr-number",
@@ -387,6 +388,7 @@ def test_a_later_commit_that_only_tags_the_pr_number_needs_no_naming(tagged, fil
         "line-moved-across-files",
         "file-added",
         "file-renamed",
+        "placeholder-added",
     ],
 )
 def test_a_later_commit_doing_more_than_tagging_has_to_be_named(tagged, files, pr_number):
@@ -412,3 +414,33 @@ def test_a_commit_after_the_tag_commit_still_has_to_be_named(tagged):
     result = _run_tagged(tagged)
     assert result.returncode == 1
     assert after[:7] in result.stderr
+
+
+def test_a_change_after_a_non_utf8_byte_has_to_be_named(tagged):
+    """macOS sed fails on a byte that is not UTF-8 in a UTF-8 locale; a failure on both
+    sides must not read as two identical files."""
+    path = Path(tagged["path"])
+    (path / _ENTRY).write_bytes(b"- **Thing is done (#TBD).** It works.\n\xff\nMore text.\n")
+    _git(path, "commit", "-q", "-am", "a non-UTF-8 byte")
+    tagged["reviewed"] = _git(path, "rev-parse", "--short", "HEAD")
+    (path / _ENTRY).write_bytes(b"- **Thing is done (#12).** It works.\n\xff\nLess text.\n")
+    _git(path, "commit", "-q", "-am", "tag and change a line")
+    later = _git(path, "rev-parse", "--short", "HEAD")
+    env_lang = {"LANG": "en_US.UTF-8", "LC_ALL": "en_US.UTF-8"}
+    result = subprocess.run(
+        ["bash", str(_SCRIPT)],
+        cwd=tagged["path"],
+        env={
+            **os.environ,
+            **env_lang,
+            "PR_BODY": _BLOCK.format(sha=tagged["reviewed"]),
+            "LABELS": "",
+            "HEAD_SHA": "pr",
+            "BASE_SHA": "base",
+            "PR_NUMBER": "12",
+        },
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 1
+    assert later[:7] in result.stderr
