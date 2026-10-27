@@ -198,6 +198,15 @@ done
 
 install -d -o root -g root -m 0755 /opt/qiita/data-plane
 install -m 0755 "$INCOMING/qiita-data-plane" /opt/qiita/data-plane/qiita-data-plane
+# The full deployed commit for the data planes (QIITA_DATA_PLANE_BUILD_ENV in
+# _common.sh); empty when QIITA_BUILD_SHA is unset, and verify.sh then skips the
+# commit check.
+if [ -n "${QIITA_BUILD_SHA:-}" ]; then
+    printf 'BUILD_SHA=%s\n' "$QIITA_BUILD_SHA" > "$QIITA_DATA_PLANE_BUILD_ENV"
+else
+    : > "$QIITA_DATA_PLANE_BUILD_ENV"
+fi
+chmod 0644 "$QIITA_DATA_PLANE_BUILD_ENV"
 
 # Build/verify container-workflow SIFs before the restarts (a SLURM step depends
 # on its image being present and current). Runs as root and chowns each produced

@@ -20,6 +20,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("Configuration error: {e}");
         e
     })?;
+    let build_service =
+        build_service_name(std::env::var("BUILD_SHA").ok().as_deref()).map_err(|e| {
+            eprintln!("Configuration error: {e}");
+            e
+        })?;
 
     // Attach the catalog and create its tables once, at boot (see setup_catalog);
     // the listen port is the retry backoff's salt.
@@ -65,6 +70,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     health_reporter
         .set_service_status("", ServingStatus::Serving)
         .await;
+    match &build_service {
+        Some(name) => {
+            health_reporter
+                .set_service_status(name, ServingStatus::Serving)
+                .await;
+            eprintln!("qiita-data-plane build: health service {name}");
+        }
+        None => eprintln!("qiita-data-plane build: BUILD_SHA unset, no build health service"),
+    }
 
     // gRPC reflection lets `grpcurl` introspect the server (used
     // by `make verify-health` from the deploy host). Both v1 and
@@ -108,6 +122,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Prefix of the health service name under which a data plane reports the commit
+/// it was deployed from. `deploy/verify.sh` asks each upstream member for the name
+/// carrying this host's commit (`qiita_data_plane_build_service` in
+/// `deploy/_common.sh` builds the same string); a member running another commit
+/// answers NOT_FOUND, which tonic-health returns for a name never registered.
+const BUILD_SERVICE_PREFIX: &str = "qiita-data-plane/build/";
+
+/// The build health service name for `BUILD_SHA`, which activate.sh writes into
+/// `/opt/qiita/data-plane/build.env`: None when it is unset or empty, an error
+/// when it is not a full 40-character lowercase commit sha.
+fn build_service_name(sha: Option<&str>) -> Result<Option<String>, String> {
+    let Some(sha) = sha.filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    if sha.len() != 40 || !sha.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        return Err(format!(
+            "BUILD_SHA {sha:?} is not a 40-character lowercase commit sha"
+        ));
+    }
+    Ok(Some(format!("{BUILD_SERVICE_PREFIX}{sha}")))
+}
+
 /// Resolves on SIGTERM (what `systemctl stop` / `restart` sends) or SIGINT, which
 /// starts tonic's graceful shutdown: the listener closes, so a new connection is
 /// refused, and `serve_with_shutdown` returns once every request already in flight
@@ -127,6 +163,28 @@ async fn drain_signal() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn build_service_name_from_build_sha() {
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        assert_eq!(
+            super::build_service_name(Some(sha)),
+            Ok(Some(format!("qiita-data-plane/build/{sha}")))
+        );
+        assert_eq!(super::build_service_name(None), Ok(None));
+        assert_eq!(super::build_service_name(Some("")), Ok(None));
+        for bad in [
+            "0123456",
+            "0123456789ABCDEF0123456789ABCDEF01234567",
+            "0123456789abcdef0123456789abcdef0123456g",
+            "0123456789abcdef0123456789abcdef012345678",
+        ] {
+            assert!(
+                super::build_service_name(Some(bad)).is_err(),
+                "{bad} accepted"
+            );
+        }
+    }
+
     use super::config::Settings;
     use super::miint;
     use base64::Engine;

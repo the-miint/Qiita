@@ -119,7 +119,11 @@ On this host:
    `/etc/qiita/data-plane.env` and redeploy. A peer name that does not resolve, or
    resolves to any public address, aborts the deploy before anything is installed. Prefer an IP address: the nginx Rocky 10
    ships resolves a name only when it loads the config (see `deploy/nginx/qiita.conf`).
-5. `verify-deploy` shows one `health/data-plane-peer@<host:port>` row per peer entry.
+5. `verify-deploy` shows one `health/data-plane-peer@<host:port>` row per peer entry,
+   and one `commit/data-plane-peer@<host:port>` row that fails unless the peer runs
+   this host's deployed commit. A peer deployed from another commit, or one whose
+   instances were not restarted, fails it; the peer's journal names the commit it
+   runs (`qiita-data-plane build:`).
 
 To remove a peer, drop it from `QIITA_DATA_PLANE_PEERS` and redeploy; it leaves the
 upstream on that deploy. Stopping the peer's own instances is done on the peer host.

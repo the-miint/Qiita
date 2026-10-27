@@ -44,7 +44,10 @@ _None yet._
   `127.0.0.1:50050` (skipped when the TLS files are absent); `health/data-plane-upstream`
   fails when verify cannot read the members from the rendered nginx config, and is skipped
   when grpcurl is missing or `SKIP_HEALTH=1`; `data-plane-units/<unit>` fails for a running
-  or enabled `qiita-data-plane@` unit whose port is not in `QIITA_DATA_PLANE_PORTS`. The
+  or enabled `qiita-data-plane@` unit whose port is not in `QIITA_DATA_PLANE_PORTS`;
+  `commit/data-plane@<port>` and `commit/data-plane-peer@<host:port>` fail for a member
+  not running this host's deployed commit (`BUILD_SHA` in
+  `/opt/qiita/data-plane/build.env`, which the deploy writes). The
   deploy itself stops before installing anything when it finds such a unit, unless run
   with `QIITA_DP_DISABLE_REMOVED=1`, which disables and stops it. A host running only
   `qiita-data-plane@50051` is unaffected.

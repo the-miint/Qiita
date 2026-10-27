@@ -74,6 +74,10 @@ elif command -v grpcurl >/dev/null 2>&1; then
     # failure, so a malformed list would iterate zero times and verify could exit 0
     # having checked nothing. The assignment trips errexit.
     dp_bind_host=$(qiita_data_plane_bind_host)
+    # This host's deployed commit; each member must report the same one.
+    dp_build_sha=""
+    [ -r "$QIITA_DATA_PLANE_BUILD_ENV" ] \
+        && dp_build_sha=$(read_env_file_var "$QIITA_DATA_PLANE_BUILD_ENV" BUILD_SHA)
     # Members from the rendered nginx config; see qiita_data_plane_rendered_members
     # for why, and for its three return codes.
     dp_members=$(qiita_data_plane_rendered_members) && dp_rc=0 || dp_rc=$?
@@ -100,6 +104,16 @@ elif command -v grpcurl >/dev/null 2>&1; then
             pass "$dp_label" "gRPC $dp_member Health/Check OK"
         else
             fail "$dp_label" "gRPC $dp_member Health/Check failed"
+            continue
+        fi
+        dp_commit_label="commit/${dp_label#health/}"
+        if [ -z "$dp_build_sha" ]; then
+            skip "$dp_commit_label" "no BUILD_SHA in $QIITA_DATA_PLANE_BUILD_ENV"
+        elif grpcurl -plaintext -d "{\"service\":\"$(qiita_data_plane_build_service "$dp_build_sha")\"}" \
+                "$dp_member" grpc.health.v1.Health/Check </dev/null >/dev/null 2>&1; then
+            pass "$dp_commit_label" "$dp_member runs ${dp_build_sha:0:7}"
+        else
+            fail "$dp_commit_label" "$dp_member does not report ${dp_build_sha:0:7}; its journal names the commit it runs"
         fi
     done <<<"$dp_members"
     # nginx's loopback listener in front of the same upstream. Skipped without the

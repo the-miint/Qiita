@@ -1060,6 +1060,23 @@ def test_native_checkout_fails_outside_git_clone(tmp_path: Path) -> None:
 _REDEPLOY = _DEPLOY / "redeploy.sh"
 
 
+def test_build_service_name_matches_the_data_plane() -> None:
+    """verify.sh asks each member for the health service qiita_data_plane_build_service
+    names; the data plane registers BUILD_SERVICE_PREFIX + BUILD_SHA, read from the
+    file activate.sh writes. Nothing else ties the two sides together, and a drift
+    fails every member's commit row."""
+    sha = "0123456789abcdef0123456789abcdef01234567"
+    result = _run_common('qiita_data_plane_build_service "$1"', sha)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == f"qiita-data-plane/build/{sha}"
+    main_rs = (_REPO_ROOT / "qiita-data-plane" / "src" / "main.rs").read_text()
+    assert 'const BUILD_SERVICE_PREFIX: &str = "qiita-data-plane/build/";' in main_rs
+    build_env = _run_common('printf %s "$QIITA_DATA_PLANE_BUILD_ENV"').stdout
+    assert build_env == "/opt/qiita/data-plane/build.env"
+    unit = (_DEPLOY / "systemd" / "qiita-data-plane@.service").read_text()
+    assert f"EnvironmentFile=-{build_env}" in unit
+
+
 def test_verify_dp_pool_row_greps_what_the_data_plane_actually_logs() -> None:
     """`verify.sh`'s dp-pool row reads the data plane's journal by exact string, and
     nothing in Rust knows that. A reword on either side would turn the row green (or

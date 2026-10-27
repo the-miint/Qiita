@@ -305,6 +305,16 @@ env_file_sets_var() {
 QIITA_DATA_PLANE_LB_HOST=127.0.0.1
 QIITA_DATA_PLANE_LB_PORT=50050
 
+# The commit this host's data planes were deployed from, as BUILD_SHA (activate.sh
+# writes it; the qiita-data-plane@ units read it), and the health service name a
+# data plane running that commit answers SERVING for (BUILD_SERVICE_PREFIX in
+# qiita-data-plane/src/main.rs). verify.sh asks every upstream member for it, so a
+# member deployed from another commit, or not restarted, fails.
+QIITA_DATA_PLANE_BUILD_ENV=/opt/qiita/data-plane/build.env
+qiita_data_plane_build_service() {
+    printf 'qiita-data-plane/build/%s' "$1"
+}
+
 # Succeeds when $DP_ENV is absent or unreadable (the defaults apply) or parses as
 # shell. read_env_var discards the file's errors, so without this an unclosed quote
 # would read every topology key as unset and deploy the default topology.

@@ -7,7 +7,9 @@
   upstream, which `qiita-data-plane@<port>` units it enables and restarts, and what
   `verify-deploy` checks: `health/data-plane@<port>` per instance (replacing the single
   `health/data-plane` row), `health/data-plane-peer@<host:port>` per peer,
-  `health/data-plane-lb`, and `data-plane-units/<unit>`, which fails for a running or
+  `health/data-plane-lb`, `commit/data-plane@<port>` and
+  `commit/data-plane-peer@<host:port>`, which fail for a member not running this
+  host's deployed commit, and `data-plane-units/<unit>`, which fails for a running or
   enabled instance whose port the list no longer names. A deploy that finds such an
   instance stops before installing anything, unless it runs with
   `QIITA_DP_DISABLE_REMOVED=1`, which disables and stops it alongside the restart. Before, the upstream was a checked-in literal the deploy
