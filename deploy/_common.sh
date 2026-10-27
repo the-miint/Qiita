@@ -367,9 +367,8 @@ qiita_data_plane_units() {
 
 # The local qiita-data-plane@ units whose port is not in `$1` (the list
 # qiita_data_plane_ports returns) and that are running or enabled, one
-# "<unit> <active>/<enabled>" per line. The deploy enables and restarts only the
-# listed ports and never disables a unit, so one of these runs the previous deploy's
-# build outside the upstream, or will start at boot. `list-units --all` includes an
+# "<unit> <active>/<enabled>" per line; docs/runbooks/data-plane-scaling.md, "Fewer
+# instances on this host", says why one is a problem. `list-units --all` includes an
 # instance that is enabled but stopped, and leaves out one that is neither (systemd
 # 257). Fails when systemctl cannot list the units.
 qiita_data_plane_stray_units() {

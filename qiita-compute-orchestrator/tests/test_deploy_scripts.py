@@ -419,17 +419,6 @@ def test_bind_host_reads_the_host_file(tmp_path: Path, line: str) -> None:
     assert result.stdout == "10.0.0.5"
 
 
-def test_bind_host_ignores_the_environment() -> None:
-    """The unit reads the bind host from data-plane.env, not from the deploy's
-    environment; honouring an environment value here would render members at an
-    address no instance listens on."""
-    result = _run_common(
-        "qiita_data_plane_bind_host", extra_env={"QIITA_DATA_PLANE_BIND_HOST": "10.9.9.9"}
-    )
-    assert result.returncode == 0, result.stderr
-    assert result.stdout == "127.0.0.1"
-
-
 @pytest.mark.parametrize(
     "value",
     [

@@ -17,8 +17,8 @@
 # question the env file is optional to and runs either way (see below).
 #
 # Hatches, one per row: SKIP_HEALTH, SKIP_ACTIONS, SKIP_COMPUTE_READINESS,
-# SKIP_SLURM_PROBE, SKIP_CP_MIINT, SKIP_DP_POOL, SKIP_ENA_REACHABILITY,
-# SKIP_PREFLIGHT (the
+# SKIP_SLURM_PROBE, SKIP_CP_MIINT, SKIP_DP_POOL, SKIP_DP_UNITS,
+# SKIP_ENA_REACHABILITY, SKIP_PREFLIGHT (the
 # last passes through to preflight.sh). SKIP_ENA_REACHABILITY skips the
 # CONTROL-PLANE row only; its compute-node counterpart (probe/ena-from-compute)
 # rides the SLURM probe job and goes with SKIP_SLURM_PROBE, which also drops
@@ -117,9 +117,10 @@ else
 fi
 
 # --- 1c. Data-plane units outside QIITA_DATA_PLANE_PORTS --------------------
-# A port removed from the list leaves its unit running the previous build, outside
-# the upstream, until someone disables it (docs/runbooks/data-plane-scaling.md).
-if ! command -v systemctl >/dev/null 2>&1; then
+# See docs/runbooks/data-plane-scaling.md, "Fewer instances on this host".
+if [ -n "${SKIP_DP_UNITS:-}" ]; then
+    skip "data-plane-units" "SKIP_DP_UNITS=1"
+elif ! command -v systemctl >/dev/null 2>&1; then
     skip "data-plane-units" "systemctl not on PATH"
 else
     dp_ports=$(qiita_data_plane_ports)

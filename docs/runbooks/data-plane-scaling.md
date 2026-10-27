@@ -70,7 +70,7 @@ the previous deploy's code, outside the upstream:
 sudo systemctl disable --now qiita-data-plane@50053
 ```
 
-Until then `make verify-deploy` fails `data-plane-units/<unit>` for each running or
+Until then `sudo make verify-deploy QIITA_HOSTNAME=<fqdn>` fails `data-plane-units/<unit>` for each running or
 enabled instance whose port is not in the list.
 
 ## The control plane through nginx
