@@ -15,7 +15,7 @@ Three keys in `/etc/qiita/data-plane.env`, read on every deploy by `activate.sh`
 |---|---|---|
 | `QIITA_DATA_PLANE_PORTS` | `50051` | Instances this host runs, space-separated and quoted. Each port is one `qiita-data-plane@<port>` unit. |
 | `QIITA_DATA_PLANE_PEERS` | none | Data planes on other hosts that this host's nginx also balances to, as `host:port`. |
-| `QIITA_DATA_PLANE_BIND_HOST` | `127.0.0.1` | The IPv4 address this host's instances listen on. Leave it at `127.0.0.1` on a host that runs the control plane, unless the control plane is first pointed at the loopback listener ([below](#the-control-plane-through-nginx)): its default `DATA_PLANE_URL`, `grpc://localhost:50051`, finds no instance once they listen elsewhere. |
+| `QIITA_DATA_PLANE_BIND_HOST` | `127.0.0.1` | The IPv4 address this host's instances listen on: loopback or private, never public. Leave it at `127.0.0.1` on a host that runs the control plane, unless the control plane is first pointed at the loopback listener ([below](#the-control-plane-through-nginx)): its default `DATA_PLANE_URL`, `grpc://localhost:50051`, finds no instance once they listen elsewhere. |
 
 With none of them set, a deploy runs one instance on `127.0.0.1:50051`. The standing
 `sudo make redeploy` reads them from the file; nothing is passed on the command line.
@@ -90,7 +90,10 @@ on port 50050.
 
 A peer is a data plane another host runs, listed in this host's upstream. Traffic from
 this host's nginx to a peer is unencrypted gRPC (see the upstream comment in
-`deploy/nginx/qiita.conf`), so a peer belongs on a private network.
+`deploy/nginx/qiita.conf`), so the deploy accepts only private addresses (10.0.0.0/8,
+172.16.0.0/12, 192.168.0.0/16): a peer, and every address a peer's name resolves to,
+must be one, and `QIITA_DATA_PLANE_BIND_HOST` must be one or loopback. Anything else
+stops the deploy before anything is installed.
 
 On the peer host:
 
@@ -113,8 +116,8 @@ On the peer host:
 On this host:
 
 4. Set `QIITA_DATA_PLANE_PEERS="<peer address>:50051"` (one entry per peer instance) in
-   `/etc/qiita/data-plane.env` and redeploy. A peer name that does not resolve aborts
-   the deploy before anything is installed. Prefer an IP address: the nginx Rocky 10
+   `/etc/qiita/data-plane.env` and redeploy. A peer name that does not resolve, or
+   resolves to any public address, aborts the deploy before anything is installed. Prefer an IP address: the nginx Rocky 10
    ships resolves a name only when it loads the config (see `deploy/nginx/qiita.conf`).
 5. `verify-deploy` shows one `health/data-plane-peer@<host:port>` row per peer entry.
 

@@ -355,6 +355,19 @@ qiita_is_ipv4_literal() {
     done
 }
 
+# Is $1 an IPv4 address in 10.0.0.0/8, 172.16.0.0/12 or 192.168.0.0/16? Data-plane
+# traffic is unencrypted gRPC (see deploy/nginx/qiita.conf), so neither a peer nor
+# an instance's listener may be on a public address.
+qiita_is_private_ipv4() {
+    local o1 o2 rest
+    qiita_is_ipv4_literal "$1" || return 1
+    IFS=. read -r o1 o2 rest <<<"$1"
+    [ "$o1" -eq 10 ] && return 0
+    [ "$o1" -eq 172 ] && [ "$o2" -ge 16 ] && [ "$o2" -le 31 ] && return 0
+    [ "$o1" -eq 192 ] && [ "$o2" -eq 168 ] && return 0
+    return 1
+}
+
 # The systemd unit of each local data-plane instance, one per port in `$1` (the
 # list qiita_data_plane_ports returns), space-separated.
 qiita_data_plane_units() {
@@ -513,9 +526,10 @@ qiita_data_plane_peers() {
 # qiita-data-plane@.service builds LISTEN_ADDR from the same key through
 # EnvironmentFile=, so a value the deploy saw but the file lacks would render
 # upstream members no instance listens on. An IPv4 address naming one interface,
-# not 0.0.0.0: traffic between nginx and the instances is unencrypted (see
-# deploy/nginx/qiita.conf). A host other than 127.0.0.1 is how a peer host's
-# instances become reachable from the host that balances to them.
+# loopback (127.0.0.0/8) or private (qiita_is_private_ipv4), never 0.0.0.0 or a
+# public address: traffic between nginx and the instances is unencrypted. A host
+# other than 127.0.0.1 is how a peer host's instances become reachable from the
+# host that balances to them.
 qiita_data_plane_bind_host() {
     local host=""
     qiita_dp_env_parses || return 1
@@ -533,39 +547,56 @@ qiita_data_plane_bind_host() {
         echo "ERROR: QIITA_DATA_PLANE_BIND_HOST must name one interface, not 0.0.0.0" >&2
         return 1
     }
+    case "$host" in
+        127.*) ;;
+        *)
+            qiita_is_private_ipv4 "$host" || {
+                echo "ERROR: QIITA_DATA_PLANE_BIND_HOST '$host' is neither loopback nor a private address" \
+                     "(10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16)" >&2
+                return 1
+            }
+            ;;
+    esac
     printf '%s' "$host"
 }
 
-# Abort unless a peer's host resolves. $1 = a validated `host:port` entry.
+# Abort unless every address a peer names is private (qiita_is_private_ipv4).
+# $1 = a validated `host:port` entry.
 #
-# nginx resolves an upstream hostname when it loads the config. activate.sh calls
-# this before installing anything; its `nginx -t` would catch the same name, but
-# only after the new code is installed.
-#
-# An IP literal needs no lookup: `getent hosts` exits non-zero for an IPv4 address
-# with no PTR record and for a bracketed IPv6 literal (glibc 2.39, Rocky 10), which
-# would reject a valid peer.
-qiita_assert_peer_resolves() {
-    local peer="$1" host
+# A hostname is resolved with `getent ahosts`, which lists every address nginx
+# could balance to; one public address among them fails the peer. activate.sh
+# calls this before installing anything, so a name that does not resolve also
+# fails here rather than at nginx's config load. Without getent nothing can be
+# checked, so a hostname fails too.
+qiita_assert_peer_private() {
+    local peer="$1" host addrs addr
     case "$peer" in
-        \[*\]:*) return 0 ;;                       # bracketed IPv6 literal
-        *:*)     host="${peer%:*}" ;;
-        *)       echo "ERROR: '$peer' is not host:port" >&2; return 1 ;;
+        \[*\]:*)
+            echo "ERROR: QIITA_DATA_PLANE_PEERS entry '$peer' is IPv6; a peer must be a private IPv4 address" >&2
+            return 1
+            ;;
+        *:*) host="${peer%:*}" ;;
+        *)   echo "ERROR: '$peer' is not host:port" >&2; return 1 ;;
     esac
     if qiita_is_ipv4_literal "$host"; then
-        return 0
+        addrs="$host"
+    else
+        if ! command -v getent >/dev/null 2>&1; then
+            echo "ERROR: getent unavailable — cannot check peer '$host' resolves to a private address" >&2
+            return 1
+        fi
+        if ! addrs=$(getent ahosts "$host" 2>/dev/null | awk '{print $1}' | sort -u) || [ -z "$addrs" ]; then
+            echo "ERROR: QIITA_DATA_PLANE_PEERS host '$host' does not resolve" >&2
+            return 1
+        fi
     fi
-    # getent is glibc — present on the Linux deploy hosts, absent on a macOS dev
-    # box. Skipped when absent: this check only moves an nginx config-load failure
-    # earlier.
-    if ! command -v getent >/dev/null 2>&1; then
-        echo "NOTE: getent unavailable — cannot pre-resolve peer '$host'" >&2
-        return 0
-    fi
-    if ! getent hosts "$host" >/dev/null 2>&1; then
-        echo "ERROR: QIITA_DATA_PLANE_PEERS host '$host' does not resolve" >&2
-        return 1
-    fi
+    for addr in $addrs; do
+        qiita_is_private_ipv4 "$addr" || {
+            echo "ERROR: QIITA_DATA_PLANE_PEERS entry '$peer' reaches $addr, not a private address" \
+                 "(10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16)" >&2
+            return 1
+        }
+    done
 }
 
 # The deployed nginx config.

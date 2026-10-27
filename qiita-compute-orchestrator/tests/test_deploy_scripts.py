@@ -501,6 +501,9 @@ def test_bind_host_reads_the_host_file(tmp_path: Path, line: str) -> None:
         "010.0.0.1",
         "10.0.0.5.",
         "::1",
+        "169.228.46.111",  # public
+        "8.8.8.8",
+        "172.32.0.1",  # outside 172.16.0.0/12
     ],
 )
 def test_bind_host_rejects_values_that_are_not_one_ipv4_interface(
@@ -510,6 +513,14 @@ def test_bind_host_rejects_values_that_are_not_one_ipv4_interface(
     result = _run_common("qiita_data_plane_bind_host", dp_env=env_file)
     assert result.returncode != 0, f"{value!r} should be rejected, got {result.stdout!r}"
     assert result.stdout == ""
+
+
+@pytest.mark.parametrize("value", ["127.0.0.1", "127.0.1.1", "172.25.212.111", "192.168.0.10"])
+def test_bind_host_accepts_loopback_and_private_addresses(tmp_path: Path, value: str) -> None:
+    env_file = _dp_env(tmp_path, f"QIITA_DATA_PLANE_BIND_HOST={value}\n")
+    result = _run_common("qiita_data_plane_bind_host", dp_env=env_file)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == value
 
 
 def test_ipv4_literal_refuses_an_octet_past_int64_without_a_shell_error() -> None:
@@ -870,7 +881,7 @@ def test_activate_resolves_topology_before_installing_anything() -> None:
         _first_command(src, re.escape("DP_PORTS=$(qiita_data_plane_ports)")),
         _first_command(src, re.escape("DP_PEERS=$(qiita_data_plane_peers)")),
         _first_command(src, re.escape("DP_BIND_HOST=$(qiita_data_plane_bind_host)")),
-        _first_command(src, re.escape('qiita_assert_peer_resolves "$peer"')),
+        _first_command(src, re.escape('qiita_assert_peer_private "$peer"')),
     )
     for step in (
         r"rsync -a",
@@ -881,57 +892,100 @@ def test_activate_resolves_topology_before_installing_anything() -> None:
         assert resolved < _first_command(src, step), f"topology must be resolved before {step!r}"
 
 
-def _call_peer_resolves(peer: str, stub_dir: str | None) -> subprocess.CompletedProcess[str]:
+def _call_peer_private(peer: str, stub_dir: str | None) -> subprocess.CompletedProcess[str]:
     env = {**os.environ}
     if stub_dir is not None:
         env["PATH"] = f"{stub_dir}:{env['PATH']}"
     return subprocess.run(
-        ["bash", "-c", f'source "{_COMMON}"; qiita_assert_peer_resolves "$1"', "_", peer],
+        ["bash", "-c", f'source "{_COMMON}"; qiita_assert_peer_private "$1"', "_", peer],
         capture_output=True,
         text=True,
         env=env,
     )
 
 
+# `getent ahosts` output for each name the stub resolves, in the layout glibc 2.39
+# prints on Rocky 10: one STREAM/DGRAM/RAW row per address.
+_AHOSTS = {
+    "private.internal": ["10.1.2.3"],
+    "public.internal": ["169.228.46.5"],
+    "mixed.internal": ["172.25.212.5", "169.228.46.5"],
+}
+
+
 @pytest.fixture
 def getent_stub(tmp_path: Path) -> str:
-    """A stand-in for glibc's getent that resolves only `good.internal`.
+    """A stand-in for glibc's getent that answers `ahosts` for the names in _AHOSTS.
 
-    getent does not exist on macOS, so without a stub the resolvable and
-    unresolvable cases are indistinguishable here — both would take the
-    tool-absent path and the test would pass without testing anything.
+    getent does not exist on macOS, so without a stub every hostname case would
+    take the tool-absent path and fail the same way.
     """
     d = tmp_path / "stub"
     d.mkdir()
+    cases = "".join(
+        f"    {name}) printf '"
+        + "".join(f"{a}    STREAM {name}\\n{a}    DGRAM\\n{a}    RAW\\n" for a in addrs)
+        + "'; exit 0 ;;\n"
+        for name, addrs in _AHOSTS.items()
+    )
     (d / "getent").write_text(
-        '#!/bin/sh\n[ "$1" = hosts ] && [ "$2" = good.internal ] && exit 0\nexit 2\n'
+        f'#!/bin/sh\n[ "$1" = ahosts ] || exit 2\ncase "$2" in\n{cases}esac\nexit 2\n'
     )
     (d / "getent").chmod(0o755)
     return str(d)
 
 
-def test_peer_resolves_accepts_a_resolvable_host(getent_stub: str) -> None:
-    result = _call_peer_resolves("good.internal:50051", getent_stub)
+def test_peer_private_accepts_a_name_resolving_to_private_addresses(getent_stub: str) -> None:
+    result = _call_peer_private("private.internal:50051", getent_stub)
     assert result.returncode == 0, result.stderr
 
 
-def test_peer_resolves_rejects_an_unresolvable_host(getent_stub: str) -> None:
-    result = _call_peer_resolves("bad.internal:50051", getent_stub)
+@pytest.mark.parametrize("peer", ["public.internal:50051", "mixed.internal:50051"])
+def test_peer_private_rejects_a_name_with_any_public_address(peer: str, getent_stub: str) -> None:
+    result = _call_peer_private(peer, getent_stub)
+    assert result.returncode != 0
+    assert "169.228.46.5, not a private address" in result.stderr
+
+
+def test_peer_private_rejects_an_unresolvable_host(getent_stub: str) -> None:
+    result = _call_peer_private("bad.internal:50051", getent_stub)
     assert result.returncode != 0
     assert "does not resolve" in result.stderr
 
 
-@pytest.mark.parametrize("peer", ["10.0.0.7:50051", "[2001:db8::1]:50051"])
-def test_peer_resolves_accepts_ip_literals_without_lookup(peer: str, getent_stub: str) -> None:
-    """The stub resolves neither, so passing means no lookup ran (see
-    qiita_assert_peer_resolves for why none should)."""
-    result = _call_peer_resolves(peer, getent_stub)
+@pytest.mark.parametrize(
+    "peer", ["10.0.0.7:50051", "172.16.0.1:50051", "172.31.255.1:50051", "192.168.1.1:50051"]
+)
+def test_peer_private_accepts_private_ipv4_literals_without_lookup(
+    peer: str, getent_stub: str
+) -> None:
+    """The stub resolves none of these, so passing means no lookup ran."""
+    result = _call_peer_private(peer, getent_stub)
     assert result.returncode == 0, result.stderr
 
 
-def test_peer_resolves_skips_when_getent_is_unavailable(tmp_path: Path) -> None:
-    """No getent ⇒ skip, not fail: the check only moves an nginx config-load failure
-    earlier, so missing tooling does not block a deploy."""
+@pytest.mark.parametrize(
+    "peer",
+    [
+        "169.228.46.111:50051",
+        "8.8.8.8:50051",
+        "172.15.255.1:50051",  # just below 172.16.0.0/12
+        "172.32.0.1:50051",  # just above it
+        "192.169.0.1:50051",
+        "11.0.0.1:50051",
+        "127.0.0.1:50051",  # a peer is another host
+        "[2001:db8::1]:50051",
+        "[fd00::1]:50051",
+    ],
+)
+def test_peer_private_rejects_other_literals(peer: str, getent_stub: str) -> None:
+    result = _call_peer_private(peer, getent_stub)
+    assert result.returncode != 0, result.stdout
+    assert "private" in result.stderr
+
+
+def test_peer_private_fails_a_name_when_getent_is_unavailable(tmp_path: Path) -> None:
+    """No getent ⇒ the name's addresses cannot be checked, so the peer fails."""
     empty = tmp_path / "empty-path"
     empty.mkdir()
     bash = shutil.which("bash")
@@ -939,12 +993,18 @@ def test_peer_resolves_skips_when_getent_is_unavailable(tmp_path: Path) -> None:
     result = subprocess.run(
         # bash by ABSOLUTE path: the empty PATH is meant to hide getent from the
         # script, not to hide the interpreter from subprocess.
-        [bash, "-c", f'source "{_COMMON}"; qiita_assert_peer_resolves "$1"', "_", "bad.internal:1"],
+        [
+            bash,
+            "-c",
+            f'source "{_COMMON}"; qiita_assert_peer_private "$1"',
+            "_",
+            "private.internal:1",
+        ],
         capture_output=True,
         text=True,
         env={**os.environ, "PATH": str(empty)},
     )
-    assert result.returncode == 0, result.stderr
+    assert result.returncode != 0
     assert "getent unavailable" in result.stderr
 
 

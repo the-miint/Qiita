@@ -13,7 +13,8 @@
   `QIITA_DP_DISABLE_REMOVED=1`, which disables and stops it alongside the restart. Before, the upstream was a checked-in literal the deploy
   overwrote and only `@50051` was restarted, so an added instance lost its upstream entry
   and kept running old code after the next deploy. The keys are validated, and peer names
-  resolved, before anything is installed, and the rendered nginx config is tested before
+  resolved, before anything is installed; a peer and the bind host must be private
+  addresses (the bind host may also be loopback), and the rendered nginx config is tested before
   any service restarts; one `nginx -t` rejects is replaced by the config it overwrote,
   so the next nginx start does not fail on it. nginx also serves the upstream on a loopback
   listener, `127.0.0.1:50050`, which the control plane uses when

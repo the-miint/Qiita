@@ -24,7 +24,7 @@ INCOMING=/opt/qiita/incoming
 
 # Data-plane topology (see "Data-plane topology" in _common.sh). Resolved before
 # the migration guard and before anything is installed, so a malformed or
-# unresolvable entry aborts with the running deploy untouched.
+# unresolvable or public entry aborts with the running deploy untouched.
 DP_PORTS=$(qiita_data_plane_ports)
 DP_PEERS=$(qiita_data_plane_peers)
 DP_BIND_HOST=$(qiita_data_plane_bind_host)
@@ -32,7 +32,7 @@ echo "data plane instances: $DP_PORTS on $DP_BIND_HOST"
 if [ -n "$DP_PEERS" ]; then
     echo "data plane peers (other hosts, not restarted by this deploy): $DP_PEERS"
     for peer in $DP_PEERS; do
-        qiita_assert_peer_resolves "$peer"
+        qiita_assert_peer_private "$peer"
     done
 fi
 # Instances whose port left the list: stopped and disabled below when the deploy
