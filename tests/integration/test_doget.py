@@ -10,9 +10,8 @@ import time
 import pyarrow as pa
 import pyarrow.flight as flight
 import pytest
-from qiita_common.api_paths import LOOPBACK_HOST
-
 from conftest import ducklake_connect
+from qiita_common.api_paths import LOOPBACK_HOST
 
 # Deterministic, out-of-band feature_idx values for this module's seeded rows.
 SEED_FEATURE_IDXS = [700001, 700002]
@@ -32,10 +31,7 @@ def _seed_reference_rows(data_plane):
             "INSERT INTO qiita_lake.reference_sequence_chunks VALUES "
             "(700001, 0, 'ATCGATCG'), (700002, 0, 'GCTAGCTA')"
         )
-        conn.execute(
-            "INSERT INTO qiita_lake.reference_membership VALUES "
-            "(1, 700001), (1, 700002)"
-        )
+        conn.execute("INSERT INTO qiita_lake.reference_membership VALUES (1, 700001), (1, 700002)")
     finally:
         conn.close()
 
@@ -152,11 +148,10 @@ def test_doget_tampered_ticket(data_plane, flight_client):
         flight_client.do_get(flight.Ticket(bytes(ticket_bytes))).read_all()
 
 
-def test_doget_expired_ticket_carries_the_text_the_cp_classifies_on(
-    data_plane, flight_client
-):
+def test_doget_expired_ticket_carries_the_text_the_cp_classifies_on(data_plane, flight_client):
     """An expired ticket must reach the caller as a string carrying BOTH markers the
-    control plane keys on (`qiita_common.data_plane_errors.DATA_PLANE_TICKET_EXPIRED_SIGNATURES`), which
+    control plane keys on
+    (`qiita_common.data_plane_errors.DATA_PLANE_TICKET_EXPIRED_SIGNATURES`), which
     is what routes it to a retriable DATA_PLANE_TRANSIENT instead of a permanent
     BAD_INPUT. Four layers sit between the Rust `AuthError::Expired` and that string —
     `Status::unauthenticated`, the gRPC trailer, pyarrow's exception, and its
@@ -198,9 +193,7 @@ def test_doget_empty_result(data_plane, flight_client):
     assert reader.read_all().num_rows == 0
 
 
-def test_doget_assembly_chunks_streams_exactly_this_runs_contigs(
-    data_plane, flight_client
-):
+def test_doget_assembly_chunks_streams_exactly_this_runs_contigs(data_plane, flight_client):
     """The signed pair IS the scope, and the data plane resolves it: the ticket
     names no contig, and what streams is exactly the run's own — excluding the
     same sample's other run, the same run's other sample, and a contig no
@@ -232,9 +225,7 @@ def test_doget_assembly_chunks_streams_exactly_this_runs_contigs(
     returned = set(table.column("feature_idx").to_pylist())
     assert sorted(returned) == ASSEMBLY_RUN_FEATURE_IDXS
     assert 700012 not in returned, "the same sample's other run"
-    assert ASSEMBLY_OTHER_SAMPLE_FEATURE_IDX not in returned, (
-        "the same run's other sample"
-    )
+    assert ASSEMBLY_OTHER_SAMPLE_FEATURE_IDX not in returned, "the same run's other sample"
     assert ASSEMBLY_UNCLAIMED_FEATURE_IDX not in returned, "a contig no run claims"
 
 
@@ -341,9 +332,7 @@ def test_doget_assembly_off_scope_or_off_surface_is_refused(
     """
     from qiita_control_plane.auth.tickets import _sign_payload
 
-    ticket_bytes = _sign_payload(
-        {"filter": filter_dict, "table": table}, data_plane["secret"]
-    )
+    ticket_bytes = _sign_payload({"filter": filter_dict, "table": table}, data_plane["secret"])
     with pytest.raises(pa.ArrowInvalid, match=message):
         flight_client.do_get(flight.Ticket(ticket_bytes)).read_all()
 
@@ -394,7 +383,5 @@ def test_doget_unsupported_codec_is_rejected(data_plane, flight_client):
     with pytest.raises(pa.ArrowInvalid, match=r'unsupported .*"lz4".*"zstd".*"none"'):
         flight_client.do_get(
             flight.Ticket(ticket_bytes),
-            flight.FlightCallOptions(
-                headers=[(IPC_COMPRESSION_HEADER.encode(), b"lz4")]
-            ),
+            flight.FlightCallOptions(headers=[(IPC_COMPRESSION_HEADER.encode(), b"lz4")]),
         ).read_all()

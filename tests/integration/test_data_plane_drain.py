@@ -12,9 +12,8 @@ import threading
 import time
 
 import pyarrow.flight as flight
-from qiita_common.api_paths import LOOPBACK_HOST
-
 from conftest import ducklake_connect
+from qiita_common.api_paths import LOOPBACK_HOST
 
 N_ROWS = 50_000
 SEQ_LEN = 1000
@@ -94,6 +93,4 @@ def test_sigterm_finishes_an_open_stream_refuses_new_requests_and_exits_zero_whe
     # The request was made while the first stream was still being read, so the
     # refusal is the drain's, not a process that had already exited.
     assert during_drain["requested_at"] < stream_ended_at
-    assert isinstance(during_drain["outcome"], flight.FlightUnavailableError), (
-        during_drain
-    )
+    assert isinstance(during_drain["outcome"], flight.FlightUnavailableError), during_drain

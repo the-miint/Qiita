@@ -185,9 +185,7 @@ def _reset_ducklake_catalog() -> None:
     asyncio.run(_do())
 
 
-def _wait_for_grpc(
-    host: str, port: int, timeout: float = _DATA_PLANE_START_TIMEOUT_S
-) -> bool:
+def _wait_for_grpc(host: str, port: int, timeout: float = _DATA_PLANE_START_TIMEOUT_S) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
@@ -228,9 +226,7 @@ async def cleanup_ena_study(pool, study_accession: str) -> None:
     under; nothing happens when no study carries it.
     """
     study_idxs = await resolve_ena_study_idxs(pool, [study_accession])
-    await teardown_ena_study_graph(
-        pool, study_idxs=study_idxs, run_accessions=[study_accession]
-    )
+    await teardown_ena_study_graph(pool, study_idxs=study_idxs, run_accessions=[study_accession])
 
 
 @pytest.fixture(scope="module")
@@ -286,9 +282,7 @@ def data_plane(signing_key, tmp_path_factory):
         "LISTEN_ADDR": f"{LOOPBACK_HOST}:{port}",
         # The data plane verifies with the PUBLIC key derived from the signing seed.
         "FLIGHT_TICKET_PUBLIC_KEY": base64.b64encode(
-            Ed25519PrivateKey.from_private_bytes(signing_key)
-            .public_key()
-            .public_bytes_raw()
+            Ed25519PrivateKey.from_private_bytes(signing_key).public_key().public_bytes_raw()
         ).decode(),
         "DUCKLAKE_CATALOG_CONNSTR": DUCKLAKE_CATALOG_CONNSTR,
         "PATH_PERSISTENT": str(persistent_base),
@@ -414,9 +408,7 @@ def cp_server(tmp_path, signing_key):
     def _fail(reason: str) -> None:
         proc.terminate()
         out, err = proc.communicate(timeout=5)
-        pytest.fail(
-            f"{reason}\nstdout: {out.decode()[:2000]}\nstderr: {err.decode()[:2000]}"
-        )
+        pytest.fail(f"{reason}\nstdout: {out.decode()[:2000]}\nstderr: {err.decode()[:2000]}")
 
     deadline = time.monotonic() + 20.0
     healthy = False

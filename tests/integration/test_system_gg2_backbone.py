@@ -46,9 +46,8 @@ from pathlib import Path
 import duckdb
 import pyarrow.flight as flight
 import pytest
-from httpx import ASGITransport, AsyncClient
-
 from _runner_helpers import LocalComputeBackendClient
+from httpx import ASGITransport, AsyncClient
 
 DATA_DIR = Path(__file__).parent.parent.parent / "localdocs" / "scratch"
 FASTA = DATA_DIR / "2024.09.backbone.sequence.fna.gz"
@@ -167,15 +166,11 @@ async def gg2_reference(postgres_pool, human_admin_session):
         human_admin_session["principal_idx"],
     )
     yield idx
-    await postgres_pool.execute(
-        "DELETE FROM qiita.work_ticket WHERE reference_idx = $1", idx
-    )
+    await postgres_pool.execute("DELETE FROM qiita.work_ticket WHERE reference_idx = $1", idx)
     await postgres_pool.execute(
         "DELETE FROM qiita.reference_membership WHERE reference_idx = $1", idx
     )
-    await postgres_pool.execute(
-        "DELETE FROM qiita.reference WHERE reference_idx = $1", idx
-    )
+    await postgres_pool.execute("DELETE FROM qiita.reference WHERE reference_idx = $1", idx)
 
 
 @pytest.fixture

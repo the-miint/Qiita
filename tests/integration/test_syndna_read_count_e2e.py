@@ -19,7 +19,6 @@ from qiita_control_plane.testing.db_seeds import (
     seed_biosample_with_sequenced_prep_sample,
     seed_prep_sample_to_study_link,
 )
-
 from qiita_control_plane.testing.db_teardown import teardown_entity_graph
 
 _INSERTS = {
@@ -131,9 +130,7 @@ async def seeded(postgres_pool, human_admin_session, regular_user_session, data_
         "DELETE FROM qiita.feature WHERE feature_idx = ANY($1::bigint[])",
         list(features.values()),
     )
-    await db.execute(
-        "DELETE FROM qiita.reference WHERE reference_idx = $1", reference_idx
-    )
+    await db.execute("DELETE FROM qiita.reference WHERE reference_idx = $1", reference_idx)
 
 
 def _cells(path, source: str) -> list[tuple]:
@@ -141,9 +138,7 @@ def _cells(path, source: str) -> list[tuple]:
 
     with connect_with_miint() as conn:
         return sorted(
-            conn.execute(
-                f"SELECT sample_id, feature_id, value FROM {source}('{path}')"
-            ).fetchall()
+            conn.execute(f"SELECT sample_id, feature_id, value FROM {source}('{path}')").fetchall()
         )
 
 

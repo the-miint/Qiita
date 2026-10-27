@@ -44,7 +44,6 @@ from qiita_control_plane.repositories.sequenced_sample import (
 )
 from qiita_control_plane.testing.db_seeds import seed_user_principal
 from qiita_control_plane.testing.db_teardown import delete_principal
-
 from qiita_control_plane.testing.unique_names import (
     unique_accession,
     unique_ena_accession,

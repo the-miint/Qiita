@@ -35,17 +35,13 @@ from pathlib import Path
 
 import duckdb
 import pytest
+from _runner_helpers import LocalComputeBackendClient
 from qiita_common.models import WorkTicketState
 from qiita_control_plane.testing.db_teardown import teardown_entity_graph
 
-from _runner_helpers import LocalComputeBackendClient
-
 FIXTURE_FASTQ = Path(__file__).resolve().parent / "fixtures" / "sample.fastq"
 _FASTQ_TO_PARQUET_YAML_PATH = (
-    Path(__file__).resolve().parents[2]
-    / "workflows"
-    / "fastq-to-parquet"
-    / "1.0.0.yaml"
+    Path(__file__).resolve().parents[2] / "workflows" / "fastq-to-parquet" / "1.0.0.yaml"
 )
 
 
@@ -105,9 +101,7 @@ async def smoke_prep_sample(postgres_pool, human_admin_session):
     # The composer used the seeded `short_read_metagenomics` prep_protocol
     # (system-owned), so we don't delete the protocol here.
     # The ticket references the prep_sample under RESTRICT, so it goes first.
-    await postgres_pool.execute(
-        "DELETE FROM qiita.work_ticket WHERE prep_sample_idx = $1", idx
-    )
+    await postgres_pool.execute("DELETE FROM qiita.work_ticket WHERE prep_sample_idx = $1", idx)
     await teardown_entity_graph(
         postgres_pool,
         study_idxs=[],
