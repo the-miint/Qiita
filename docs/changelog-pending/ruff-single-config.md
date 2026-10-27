@@ -1,6 +1,6 @@
 ### Changed
 
-- **Ruff settings live in one file, `ruff.toml` at the repo root (#TBD).** The
+- **Ruff settings live in one file, `ruff.toml` at the repo root (#783).** The
   `pyproject.toml` files of the three packages and of `tests/integration` point at it
   with `extend`, so each keeps its own first-party import detection.
   `tests/integration` and `scripts`, which had no ruff config and were formatted only
