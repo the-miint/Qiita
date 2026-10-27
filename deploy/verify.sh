@@ -116,6 +116,25 @@ else
     skip "health/data-plane-upstream" "grpcurl not on PATH (run 'make verify-health' to auto-fetch it)"
 fi
 
+# --- 1c. Data-plane units outside QIITA_DATA_PLANE_PORTS --------------------
+# A port removed from the list leaves its unit running the previous build, outside
+# the upstream, until someone disables it (docs/runbooks/data-plane-scaling.md).
+if ! command -v systemctl >/dev/null 2>&1; then
+    skip "data-plane-units" "systemctl not on PATH"
+else
+    dp_ports=$(qiita_data_plane_ports)
+    dp_strays=$(qiita_data_plane_stray_units "$dp_ports") && dp_rc=0 || dp_rc=$?
+    if [ "$dp_rc" -ne 0 ]; then
+        fail "data-plane-units" "could not list the qiita-data-plane@ units"
+    elif [ -n "$dp_strays" ]; then
+        while read -r dp_unit dp_state; do
+            fail "data-plane-units/$dp_unit" "$dp_state, port not in QIITA_DATA_PLANE_PORTS ($dp_ports): run 'systemctl disable --now $dp_unit'"
+        done <<<"$dp_strays"
+    else
+        pass "data-plane-units" "no qiita-data-plane@ unit outside QIITA_DATA_PLANE_PORTS ($dp_ports) is running or enabled"
+    fi
+fi
+
 # --- 2. Workflow actions list (as qiita-api, control-plane.env) -------------
 if [ -n "${SKIP_ACTIONS:-}" ]; then
     skip "actions" "SKIP_ACTIONS=1"

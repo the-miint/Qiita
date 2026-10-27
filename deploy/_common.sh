@@ -365,6 +365,32 @@ qiita_data_plane_units() {
     echo "${units[*]}"
 }
 
+# The local qiita-data-plane@ units whose port is not in `$1` (the list
+# qiita_data_plane_ports returns) and that are running or enabled, one
+# "<unit> <active>/<enabled>" per line. The deploy enables and restarts only the
+# listed ports and never disables a unit, so one of these runs the previous deploy's
+# build outside the upstream, or will start at boot. `list-units --all` includes an
+# instance that is enabled but stopped, and leaves out one that is neither (systemd
+# 257). Fails when systemctl cannot list the units.
+qiita_data_plane_stray_units() {
+    local configured=" " port listing unit active enabled
+    for port in $1; do configured+="$port "; done
+    listing=$(systemctl list-units --all --no-legend --plain 'qiita-data-plane@*.service') || {
+        echo "ERROR: systemctl could not list the qiita-data-plane@ units" >&2
+        return 1
+    }
+    while read -r unit _ active _; do
+        [ -n "$unit" ] || continue
+        port=${unit#qiita-data-plane@}
+        port=${port%.service}
+        case "$configured" in *" $port "*) continue ;; esac
+        enabled=$(systemctl is-enabled "$unit" 2>/dev/null) || true
+        if [ "$enabled" = enabled ] || { [ "$active" != inactive ] && [ "$active" != failed ]; }; then
+            printf '%s %s/%s\n' "$unit" "$active" "${enabled:-unknown}"
+        fi
+    done <<<"$listing"
+}
+
 # The local instance ports, whitespace-separated: QIITA_DATA_PLANE_PORTS in $DP_ENV,
 # else 50051; set but blank is an error. Each port becomes a systemd unit name, an
 # nginx `server` line and a health-check target, so a malformed list fails here

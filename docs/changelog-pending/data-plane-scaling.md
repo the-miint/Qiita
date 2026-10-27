@@ -6,8 +6,9 @@
   `127.0.0.1`) — decide what `activate.sh` renders into the nginx `qiita_data_plane`
   upstream, which `qiita-data-plane@<port>` units it enables and restarts, and what
   `verify-deploy` checks: `health/data-plane@<port>` per instance (replacing the single
-  `health/data-plane` row), `health/data-plane-peer@<host:port>` per peer, and
-  `health/data-plane-lb`. Before, the upstream was a checked-in literal the deploy
+  `health/data-plane` row), `health/data-plane-peer@<host:port>` per peer,
+  `health/data-plane-lb`, and `data-plane-units/<unit>`, which fails for a running or
+  enabled instance whose port the list no longer names. Before, the upstream was a checked-in literal the deploy
   overwrote and only `@50051` was restarted, so an added instance lost its upstream entry
   and kept running old code after the next deploy. The keys are validated, and peer names
   resolved, before anything is installed, and the rendered nginx config is tested before

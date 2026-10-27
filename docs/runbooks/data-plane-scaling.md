@@ -70,6 +70,9 @@ the previous deploy's code, outside the upstream:
 sudo systemctl disable --now qiita-data-plane@50053
 ```
 
+Until then `make verify-deploy` fails `data-plane-units/<unit>` for each running or
+enabled instance whose port is not in the list.
+
 ## The control plane through nginx
 
 The control plane's default `DATA_PLANE_URL`, `grpc://localhost:50051`, reaches

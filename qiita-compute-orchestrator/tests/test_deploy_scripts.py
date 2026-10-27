@@ -182,6 +182,72 @@ def test_data_plane_units_names_one_unit_per_port() -> None:
     assert result.stdout.split() == ["qiita-data-plane@50051", "qiita-data-plane@50052"]
 
 
+# (active, enabled) per instance, as `systemctl list-units --all` and `is-enabled`
+# report them on systemd 257: an instance neither running nor enabled is not listed.
+_UNIT_STATES = {
+    "50051": ("active", "enabled"),  # configured
+    "50052": ("active", "disabled"),  # started by hand, outside the list
+    "50053": ("inactive", "enabled"),  # stopped, but starts at boot
+    "50054": ("failed", "disabled"),  # not serving and not starting at boot
+    "50055": ("activating", "disabled"),  # restarting after a crash
+}
+
+
+def _run_stray_units(tmp_path: Path, ports: str, list_rc: int = 0):
+    stub = tmp_path / "stub"
+    stub.mkdir()
+    listing = "".join(
+        f"qiita-data-plane@{port}.service loaded {active} running x\n"
+        for port, (active, _) in _UNIT_STATES.items()
+    )
+    enabled = "".join(
+        f"  *@{port}.service) echo {state}; [ {state} = enabled ] ;;\n"
+        for port, (_, state) in _UNIT_STATES.items()
+    )
+    (stub / "systemctl").write_text(
+        "#!/bin/sh\n"
+        'case "$1" in\n'
+        f"  list-units) printf '{listing}'; exit {list_rc} ;;\n"
+        '  is-enabled) case "$2" in\n'
+        f"{enabled}"
+        "  esac ;;\n"
+        "esac\n"
+    )
+    (stub / "systemctl").chmod(0o755)
+    return _run_common(
+        'qiita_data_plane_stray_units "$1"',
+        ports,
+        extra_env={"PATH": f"{stub}:{os.environ['PATH']}"},
+    )
+
+
+def test_stray_units_reports_running_or_enabled_instances_outside_the_list(
+    tmp_path: Path,
+) -> None:
+    """A port taken out of QIITA_DATA_PLANE_PORTS leaves its unit on the previous
+    build, outside the upstream, until someone disables it; verify-deploy fails on
+    it. A failed, disabled unit serves nothing and starts at no boot."""
+    result = _run_stray_units(tmp_path, "50051")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == [
+        "qiita-data-plane@50052.service active/disabled",
+        "qiita-data-plane@50053.service inactive/enabled",
+        "qiita-data-plane@50055.service activating/disabled",
+    ]
+
+
+def test_stray_units_is_empty_when_every_instance_is_configured(tmp_path: Path) -> None:
+    result = _run_stray_units(tmp_path, "50051\t50052 50053\n50054 50055")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == ""
+
+
+def test_stray_units_fails_when_systemctl_cannot_list(tmp_path: Path) -> None:
+    result = _run_stray_units(tmp_path, "50051", list_rc=1)
+    assert result.returncode != 0
+    assert "could not list" in result.stderr
+
+
 def test_data_plane_ports_reads_the_host_file(tmp_path: Path) -> None:
     """The list lives in data-plane.env, so a routine redeploy — which passes no
     scaling variables — renders the instances the host was given."""

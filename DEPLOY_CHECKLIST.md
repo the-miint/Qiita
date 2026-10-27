@@ -53,7 +53,8 @@ _None yet._
   appears per peer; `health/data-plane-lb` checks nginx's loopback listener
   `127.0.0.1:50050` (skipped when the TLS files are absent); `health/data-plane-upstream`
   fails when verify cannot read the members from the rendered nginx config, and is skipped
-  when grpcurl is missing or `SKIP_HEALTH=1`.
+  when grpcurl is missing or `SKIP_HEALTH=1`; `data-plane-units/<unit>` fails for a running
+  or enabled `qiita-data-plane@` unit whose port is not in `QIITA_DATA_PLANE_PORTS`.
 
 ### 6. After the deploy verifies green
 
