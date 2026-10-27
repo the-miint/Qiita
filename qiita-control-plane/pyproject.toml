@@ -76,9 +76,6 @@ markers = [
     "db: tests that require a Postgres database (deselect with -m 'not db')",
 ]
 
-[tool.ruff]
-line-length = 100
-target-version = "py314"
 
-[tool.ruff.lint]
-select = ["E", "F", "I", "UP"]
+[tool.ruff]
+extend = "../ruff.toml"

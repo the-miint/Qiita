@@ -59,9 +59,6 @@ allow-direct-references = true
 pythonpath = ["src"]
 asyncio_mode = "auto"
 
-[tool.ruff]
-line-length = 100
-target-version = "py314"
 
-[tool.ruff.lint]
-select = ["E", "F", "I", "UP"]
+[tool.ruff]
+extend = "../ruff.toml"
