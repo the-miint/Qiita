@@ -1,7 +1,7 @@
 .PHONY: build test test-python test-rust test-integration test-workflows lint lint-python lint-rust deploy migrate sync-actions clean verify-health verify-deploy preflight redeploy lake-shell dev-setup install-hooks
 .PHONY: build-common build-control-plane build-data-plane build-data-plane-debug build-compute-orchestrator build-integration build-workflows
 .PHONY: test-common test-control-plane-without-db test-control-plane-with-db test-data-plane test-compute-orchestrator
-.PHONY: lint-common lint-control-plane lint-data-plane lint-compute-orchestrator
+.PHONY: lint-common lint-control-plane lint-data-plane lint-compute-orchestrator lint-repo-python
 
 UNAME_S := $(shell uname -s)
 UNAME_M := $(shell uname -m)
@@ -210,7 +210,7 @@ test-system: build-data-plane-debug build-integration
 # Lint all components
 lint: lint-python lint-rust
 
-lint-python: lint-common lint-control-plane lint-compute-orchestrator
+lint-python: lint-common lint-control-plane lint-compute-orchestrator lint-repo-python
 
 lint-rust: lint-data-plane
 
@@ -225,6 +225,11 @@ lint-data-plane:
 
 lint-compute-orchestrator:
 	cd qiita-compute-orchestrator && uv run ruff check . && uv run ruff format --check .
+
+# Python outside the three packages, with the ruff qiita-common's venv installs;
+# the settings come from ruff.toml. workflows/ is not here; see workflows/ruff.toml.
+lint-repo-python:
+	cd qiita-common && uv run ruff check ../tests/integration ../scripts && uv run ruff format --check ../tests/integration ../scripts
 
 $(DBMATE_BIN):
 	mkdir -p $(LOCAL_BIN)

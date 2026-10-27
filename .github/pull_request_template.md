@@ -11,7 +11,8 @@
 <!--
 Run the `qiita-review` skill on the branch and replace this section, heading included,
 with the block it prints.
-`review-loop-check` reads this section. A PR that cannot run the loop carries the
+`review-loop-check` reads this section. Name each commit pushed after the reviewed one
+on the "Reviewed at" line by sha. A PR that cannot run the loop carries the
 `no-agent-review` label and says why in this section.
 Open the issue for each deferred finding before opening the PR, and name it here as #N.
 -->
