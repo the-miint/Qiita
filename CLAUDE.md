@@ -187,7 +187,9 @@ fails a PR whose description lacks the block, whose "Reviewed at" is not one of 
 PR's own commits, or whose "Reviewed at" line does not name, by sha, every commit the
 branch added after it. A merge of the base needs no naming; a merge that brings in
 other commits (a pull of work pushed from elsewhere, another PR's branch) is named
-itself. The `no-agent-review` label opts out, for a PR whose author cannot run the
+itself. A commit that only writes the PR's number into its changelog entry and
+`DEPLOY_CHECKLIST.md` lines, replacing a placeholder or adding the tag, needs no naming
+either. The `no-agent-review` label opts out, for a PR whose author cannot run the
 loop or that has nothing for it to read; the description then says why under the same
 heading. The check establishes that the block is present and accounts for every push,
 not that the loop ran — the block is the author's statement, and a human reviewer

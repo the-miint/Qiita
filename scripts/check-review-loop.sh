@@ -5,6 +5,8 @@
 #   LABELS    comma-joined PR labels
 #   HEAD_SHA  the PR's head commit (default: HEAD)
 #   BASE_SHA  the base branch tip (default: origin/main)
+#   PR_NUMBER the PR's number (optional; when set, a PR-number tag commit must tag
+#             with this number to need no naming)
 # Run from a checkout whose history holds both.
 #
 # Passes when the 'no-agent-review' label is present, or when the description has a
@@ -61,6 +63,32 @@ if git merge-base --is-ancestor "$sha" "$base"; then
     fail "'Reviewed at: ${sha}' is a commit of the base branch, not one of this PR's."
 fi
 
+tag_re='\(#[^)]*\)'
+
+# Succeeds when the commit touches only docs/changelog-pending/ and DEPLOY_CHECKLIST.md,
+# adds at least one `(#N)`, and its removed and added lines are identical once every
+# ` (#...)` is dropped from both: a placeholder such as `(#TBD)` or `(#<branch>)`
+# replaced, or a tag added where there was none. Any other change to those lines, a
+# rewrap included, fails it. With PR_NUMBER set, each tag it adds must be that number.
+tags_pr_number() {
+    local commit=$1 paths path diff removed added
+    paths=$(git diff --no-ext-diff --name-only "${commit}^1" "$commit")
+    while IFS= read -r path; do
+        case "$path" in DEPLOY_CHECKLIST.md | docs/changelog-pending/*) ;; *) return 1 ;; esac
+    done <<<"$paths"
+    diff=$(git diff --no-ext-diff --no-color -U0 "${commit}^1" "$commit")
+    # The changed lines of each hunk, without the file headers above the first `@@`.
+    removed=$(awk '/^diff --git / {h=1} /^@@/ {h=0; next} !h && /^-/' <<<"$diff" | cut -c2-)
+    added=$(awk '/^diff --git / {h=1} /^@@/ {h=0; next} !h && /^\+/' <<<"$diff" | cut -c2-)
+    grep -qE '\(#[0-9]+\)' <<<"$added" || return 1
+    if [ -n "${PR_NUMBER:-}" ]; then
+        # Every tag on an added line that is not on the line it replaced is this PR's.
+        [ -z "$(grep -oE "$tag_re" <<<"$added" | grep -vxF "(#${PR_NUMBER})" \
+            | grep -vxF -f <(grep -oE "$tag_re" <<<"$removed") || true)" ] || return 1
+    fi
+    [ "$(sed -E "s/ ?${tag_re}//g" <<<"$removed")" = "$(sed -E "s/ ?${tag_re}//g" <<<"$added")" ]
+}
+
 # Every commit the branch added after the reviewed one must be named on the same
 # line, by its sha or a prefix of at least 7 characters, so a commit no round read is
 # declared there rather than passing under an earlier sha. The walk follows the
@@ -68,6 +96,8 @@ fi
 # base commits, and is itself the commit to name when it brings in others: a pull of
 # work pushed from elsewhere, or another PR's branch merged before that PR was
 # squash-merged (whose commits then never reach the base under their own shas).
+# A commit that only writes the PR's number into its changelog entry and deploy
+# checklist lines, once the PR exists, is exempt too (`tags_pr_number`).
 # Assigned before the loop, not read through `< <(...)`, so a git failure aborts the
 # check instead of reading as "no later commits".
 later=$(git rev-list --first-parent "${sha}..${head}" --not "$base")
@@ -78,6 +108,8 @@ for commit in $later; do
         # Every parent but the first, so an octopus merge's third parent counts too.
         brought=$(git rev-list "${commit}^@" --not "${commit}^1" "$base")
         [ -n "$brought" ] || continue
+    elif tags_pr_number "$commit"; then
+        continue
     fi
     found=0
     for prefix in $named; do
