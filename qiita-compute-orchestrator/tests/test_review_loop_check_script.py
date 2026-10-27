@@ -73,10 +73,16 @@ def repo(tmp_path: Path) -> dict[str, str]:
 
 
 def _run(
-    repo: dict[str, str], body: str, labels: str = "", base: str = "base", pr_number: str = ""
+    repo: dict[str, str],
+    body: str,
+    labels: str = "",
+    base: str = "base",
+    pr_number: str = "",
+    extra_env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess:
     env = {
         **os.environ,
+        **(extra_env or {}),
         "PR_BODY": body,
         "LABELS": labels,
         "HEAD_SHA": "pr",
@@ -418,7 +424,8 @@ def test_a_commit_after_the_tag_commit_still_has_to_be_named(tagged):
 
 def test_a_change_after_a_non_utf8_byte_has_to_be_named(tagged):
     """macOS sed fails on a byte that is not UTF-8 in a UTF-8 locale; a failure on both
-    sides must not read as two identical files."""
+    sides must not read as two identical files. GNU sed passes the byte through, so this
+    tells the two script versions apart only on macOS."""
     path = Path(tagged["path"])
     (path / _ENTRY).write_bytes(b"- **Thing is done (#TBD).** It works.\n\xff\nMore text.\n")
     _git(path, "commit", "-q", "-am", "a non-UTF-8 byte")
@@ -426,21 +433,11 @@ def test_a_change_after_a_non_utf8_byte_has_to_be_named(tagged):
     (path / _ENTRY).write_bytes(b"- **Thing is done (#12).** It works.\n\xff\nLess text.\n")
     _git(path, "commit", "-q", "-am", "tag and change a line")
     later = _git(path, "rev-parse", "--short", "HEAD")
-    env_lang = {"LANG": "en_US.UTF-8", "LC_ALL": "en_US.UTF-8"}
-    result = subprocess.run(
-        ["bash", str(_SCRIPT)],
-        cwd=tagged["path"],
-        env={
-            **os.environ,
-            **env_lang,
-            "PR_BODY": _BLOCK.format(sha=tagged["reviewed"]),
-            "LABELS": "",
-            "HEAD_SHA": "pr",
-            "BASE_SHA": "base",
-            "PR_NUMBER": "12",
-        },
-        capture_output=True,
-        text=True,
+    result = _run(
+        tagged,
+        _BLOCK.format(sha=tagged["reviewed"]),
+        pr_number="12",
+        extra_env={"LANG": "en_US.UTF-8", "LC_ALL": "en_US.UTF-8"},
     )
     assert result.returncode == 1
     assert later[:7] in result.stderr

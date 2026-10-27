@@ -72,7 +72,7 @@ fi
 # passing. Without PR_NUMBER (a run outside CI) nothing is exempt.
 tags_pr_number() {
     local commit=$1 number=${PR_NUMBER:-} statuses status path tag placeholder strip
-    local old new extra added=0
+    local old_tags new_tags old_placeholders new_placeholders old_hash new_hash added=0
     [[ "$number" =~ ^[0-9]+$ ]] || return 1
     tag=" \\(#${number}\\)"
     placeholder=' \(#[A-Za-z][A-Za-z0-9._/-]*\)'
@@ -83,22 +83,26 @@ tags_pr_number() {
     while IFS=$'\t' read -r status path; do
         [ "$status" = M ] || return 1
         case "$path" in DEPLOY_CHECKLIST.md | docs/changelog-pending/*) ;; *) return 1 ;; esac
-        # Each read is a pipeline whose failure returns 1 (pipefail), so a `git show` or
-        # a `sed` that fails on both sides cannot leave two equal empty outputs. Under
-        # the C locale, macOS sed reads bytes instead of failing on non-UTF-8 input.
-        old=$(git show "${commit}^1:${path}" | { grep -oE "$tag" || true; } | wc -l) || return 1
-        new=$(git show "${commit}:${path}" | { grep -oE "$tag" || true; } | wc -l) || return 1
-        [ "$new" -gt "$old" ] && added=1
-        extra=$(comm -13 \
-            <(git show "${commit}^1:${path}" | { grep -oE "$placeholder" || true; } | sort) \
-            <(git show "${commit}:${path}" | { grep -oE "$placeholder" || true; } | sort)) \
+        # Every read is a command substitution whose pipeline fails under pipefail
+        # (`grep` exiting 1 for "no match" is let through, an error is not), so a read
+        # that fails returns 1 instead of passing as an empty file. Under the C locale,
+        # macOS sed reads bytes instead of failing on non-UTF-8 input.
+        old_tags=$(git show "${commit}^1:${path}" | { grep -oE "$tag" || [ $? -eq 1 ]; } | wc -l) \
             || return 1
-        [ -z "$extra" ] || return 1
-        old=$(git show "${commit}^1:${path}" | sed -E "$strip" | git hash-object --stdin) \
+        new_tags=$(git show "${commit}:${path}" | { grep -oE "$tag" || [ $? -eq 1 ]; } | wc -l) \
             || return 1
-        new=$(git show "${commit}:${path}" | sed -E "$strip" | git hash-object --stdin) \
+        [ "$new_tags" -gt "$old_tags" ] && added=1
+        old_placeholders=$(git show "${commit}^1:${path}" \
+            | { grep -oE "$placeholder" || [ $? -eq 1 ]; } | sort) || return 1
+        new_placeholders=$(git show "${commit}:${path}" \
+            | { grep -oE "$placeholder" || [ $? -eq 1 ]; } | sort) || return 1
+        [ -z "$(comm -13 <(printf '%s\n' "$old_placeholders") \
+            <(printf '%s\n' "$new_placeholders"))" ] || return 1
+        old_hash=$(git show "${commit}^1:${path}" | sed -E "$strip" | git hash-object --stdin) \
             || return 1
-        [ "$old" = "$new" ] || return 1
+        new_hash=$(git show "${commit}:${path}" | sed -E "$strip" | git hash-object --stdin) \
+            || return 1
+        [ "$old_hash" = "$new_hash" ] || return 1
     done <<<"$statuses"
     [ "$added" -eq 1 ]
 }
