@@ -179,9 +179,8 @@ included:
 
 - `Reviewed at` is a commit on the branch. If commits land after the last round, name
   each one by sha on that line ("plus 1 later commit: 1a2b3c4d changelog tag") instead
-  of moving the sha. `review-loop-check` fails while a later commit of the branch is
-  not named there; merge commits are exempt. Every push re-runs it, so a push after the
-  block was written needs the line updated, or another round.
+  of moving the sha, and update the line for every later push. `CLAUDE.md`, "Reviewing
+  a branch", says which commits `review-loop-check` requires there.
 - Under `Fixed:`, list only the `[outside-subject]` fixes; the count includes them.
   With none, the line is the count alone.
 - Write `none` under any other heading with no entries; do not drop the heading.

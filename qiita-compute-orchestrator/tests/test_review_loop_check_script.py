@@ -231,21 +231,58 @@ def test_a_long_description_does_not_hide_the_section(repo):
     assert result.returncode == 0, result.stderr
 
 
-def test_a_merged_branch_that_never_reached_the_base_needs_no_naming(repo):
-    """Another PR's branch merged in before that PR was squash-merged: its commits are
-    not on the base under their own shas, but they were not written on this branch."""
+def _merge_elsewhere(repo) -> str:
+    """Merge the `elsewhere` branch, whose commit is not on the base, into `pr`."""
     path = Path(repo["path"])
     _git(path, "merge", "-q", "--no-edit", "-X", "theirs", "elsewhere")
-    result = _run(repo, _BLOCK.format(sha=repo["second"]))
-    assert result.returncode == 0, result.stderr
+    return _git(path, "rev-parse", "--short", "HEAD")
 
 
-def test_a_commit_after_a_merge_still_has_to_be_named(repo):
-    path = Path(repo["path"])
-    _git(path, "merge", "-q", "--no-edit", "-X", "theirs", "elsewhere")
-    (path / "h").write_text("after the merge")
-    _git(path, "add", "h")
-    _git(path, "commit", "-q", "-m", "after the merge")
+def test_a_merge_bringing_in_other_commits_has_to_be_named(repo):
+    """A pull of work pushed from elsewhere, or another PR's branch merged in before it
+    was squash-merged, brings commits no round read; the merge is what declares them."""
+    _merge_elsewhere(repo)
     result = _run(repo, _BLOCK.format(sha=repo["second"]))
     assert result.returncode == 1
     assert "not named on that line" in result.stderr
+
+
+def test_naming_the_merge_covers_what_it_brought_in(repo):
+    merge = _merge_elsewhere(repo)
+    sha = f"{repo['second']} (plus 1 later commit: {merge}, merge of elsewhere)"
+    result = _run(repo, _BLOCK.format(sha=sha))
+    assert result.returncode == 0, result.stderr
+
+
+def test_a_commit_after_a_named_merge_still_has_to_be_named(repo):
+    merge = _merge_elsewhere(repo)
+    path = Path(repo["path"])
+    (path / "h").write_text("after the merge")
+    _git(path, "add", "h")
+    _git(path, "commit", "-q", "-m", "after the merge")
+    sha = f"{repo['second']} (plus 1 later commit: {merge}, merge of elsewhere)"
+    result = _run(repo, _BLOCK.format(sha=sha))
+    assert result.returncode == 1
+    assert "not named on that line" in result.stderr
+
+
+def test_a_git_failure_listing_later_commits_fails_the_check(repo, tmp_path):
+    """A `git` that cannot list the later commits must not read as "none"."""
+    stub = tmp_path / "stub"
+    stub.mkdir()
+    real_git = subprocess.run(["which", "git"], capture_output=True, text=True).stdout.strip()
+    (stub / "git").write_text(f'#!/bin/sh\n[ "$1" = rev-list ] && exit 128\nexec {real_git} "$@"\n')
+    (stub / "git").chmod(0o755)
+    env = {
+        **os.environ,
+        "PATH": f"{stub}:{os.environ['PATH']}",
+        "PR_BODY": _BLOCK.format(sha=repo["first"]),
+        "LABELS": "",
+        "HEAD_SHA": "pr",
+        "BASE_SHA": "base",
+    }
+    result = subprocess.run(
+        ["bash", str(_SCRIPT)], cwd=repo["path"], env=env, capture_output=True, text=True
+    )
+    assert result.returncode != 0
+    assert "Reviewer loop block present" not in result.stdout

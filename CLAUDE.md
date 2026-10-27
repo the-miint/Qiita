@@ -184,10 +184,13 @@ it reviewed, each fix it made outside the PR's subject, and each finding it decl
 (with the reason), deferred (with its issue number), or left unprobed.
 `.github/pull_request_template.md` carries the heading. The `review-loop-check` CI job
 fails a PR whose description lacks the block, whose "Reviewed at" is not one of the
-PR's own commits, or whose "Reviewed at" line does not name every later commit of the
-PR by sha (merges excepted), so a push after the last round shows up there. The
-`no-agent-review` label opts out, for a PR whose author cannot run the loop or that has
-nothing for it to read; the description then says why under the same heading. The check establishes that the block is present, not that the loop ran —
+PR's own commits, or whose "Reviewed at" line does not name, by sha, every commit the
+branch added after it. A merge of the base needs no naming; a merge that brings in
+other commits (a pull of work pushed from elsewhere, another PR's branch) is named
+itself. The `no-agent-review` label opts out, for a PR whose author cannot run the
+loop or that has nothing for it to read; the description then says why under the same
+heading. The check establishes that the block is present and accounts for every push,
+not that the loop ran —
 the block is the author's statement, and a human reviewer reads it as one.
 
 When a human review turns up a pattern the agent missed, fold it into the agent file in
