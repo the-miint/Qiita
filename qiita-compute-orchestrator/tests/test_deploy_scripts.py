@@ -1060,6 +1060,12 @@ def test_native_checkout_fails_outside_git_clone(tmp_path: Path) -> None:
 _REDEPLOY = _DEPLOY / "redeploy.sh"
 
 
+def test_grpc_connect_timeout_is_set_once_for_every_data_plane_location() -> None:
+    """At http level, so a new grpc_pass location cannot miss it, and nowhere else."""
+    conf = (_DEPLOY / "nginx" / "qiita.conf").read_text()
+    assert re.findall(r"^\s*grpc_connect_timeout\b.*$", conf, re.M) == ["grpc_connect_timeout 5s;"]
+
+
 def test_build_service_name_matches_the_data_plane() -> None:
     """verify.sh asks each member for the health service qiita_data_plane_build_service
     names; the data plane registers BUILD_SERVICE_PREFIX + BUILD_SHA, read from the
