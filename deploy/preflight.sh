@@ -228,7 +228,7 @@ if [ -r "$DP_ENV" ]; then
         fail "connstr/ducklake" "DUCKLAKE_CATALOG_CONNSTR missing libpq dbname=/host= keywords"
     fi
 else
-    skip "connstr/ducklake" "data-plane.env absent (first deploy)"
+    skip "connstr/ducklake" "data-plane.env absent or unreadable"
 fi
 
 # Per-instance MemoryMax (see "Per-instance limits" in _common.sh): the configured
@@ -249,7 +249,7 @@ if [ -r "$DP_ENV" ]; then
         pass "dp-memory-max" "QIITA_DATA_PLANE_INSTANCE_MEMORY_MAX=$dp_memory_max for each of: $dp_ports"
     fi
 else
-    skip "dp-memory-max" "data-plane.env absent (first deploy)"
+    skip "dp-memory-max" "data-plane.env absent or unreadable"
 fi
 
 echo "preflight: ${n_pass} pass, ${n_fail} fail, ${n_skip} skip"
