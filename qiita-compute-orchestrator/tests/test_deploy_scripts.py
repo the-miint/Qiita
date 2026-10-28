@@ -2686,9 +2686,9 @@ def test_idle_wait_keeps_the_catalog_password_off_psql_argv(tmp_path: Path) -> N
 
 
 def test_idle_wait_counts_only_the_data_plane_roles_sessions(tmp_path: Path) -> None:
-    """With pg_read_all_stats the role sees every role's sessions; the count is limited
-    to its own, so another role's open transaction on the catalog does not hold the
-    restart."""
+    """With pg_read_all_stats the role sees the state of every role's sessions; the
+    count is limited to its own, so another role's open transaction on the catalog
+    does not hold the restart."""
     _proc, calls = _run_idle_wait(tmp_path, [0])
     argv, _pgpassfile = calls[0].split("|PGPASSFILE=")
     assert "AND usename = current_user" in argv

@@ -1220,12 +1220,8 @@ qiita_require_lake_data_path() {
 # `upload.parquet.partial` open (all measured against a running data plane, macOS).
 # A read export writes through a `.partial` too, so it counts as well. Open files
 # are found through each unit's /proc/<pid>/fd (the match measured in a Linux
-# container). The catalog query connects with the data plane's own role and counts
-# only that role's sessions (`usename = current_user`): those of every instance on
-# the catalog, a peer host's included, and a lake-gc or lake-shell session under
-# that role. The role's pg_read_all_stats grant (qiita_catalog_connection_budget)
-# shows it every other role's sessions too, so without the filter an admin's or a
-# monitor's open transaction on the catalog would hold the restart.
+# container). The catalog query, QIITA_CATALOG_IDLE_SQL, connects with the data
+# plane's own role.
 wait_for_data_plane_idle() {
     local env_file=$1
     shift
@@ -1258,10 +1254,7 @@ wait_for_data_plane_idle() {
         [ -z "$password" ] || qiita_pgpass_add "$user" "$password"
         local deadline=$((SECONDS + wait_s)) next_report=$SECONDS
         while :; do
-            lake=$(PGPASSFILE="$PGPASS_FILE" psql "$conn" -Atc "SELECT count(*) FROM pg_stat_activity
-                WHERE datname = current_database() AND pid <> pg_backend_pid()
-                  AND usename = current_user
-                  AND state IN ('active', 'idle in transaction')") || {
+            lake=$(PGPASSFILE="$PGPASS_FILE" psql "$conn" -Atc "$QIITA_CATALOG_IDLE_SQL") || {
                 echo "ERROR: cannot query the data plane's catalog to tell whether $unit_names is idle; set QIITA_DP_IDLE_WAIT_S=0 to restart without waiting" >&2
                 exit 1
             }
@@ -1320,6 +1313,18 @@ QIITA_CATALOG_BACKENDS_SQL="SELECT
   FROM pg_stat_activity
   WHERE backend_type = 'client backend' AND pid <> pg_backend_pid()
   GROUP BY 1, 3, 4 ORDER BY 1, 4"
+
+# wait_for_data_plane_idle's in-flight count. It counts only the connecting role's
+# sessions (`usename = current_user`): those of every data-plane instance on the
+# catalog, a peer host's included, and a lake-gc or lake-shell session under that
+# role. Without pg_read_all_stats another role's rows are listed but their state
+# reads NULL, so they never match; with the grant (which the connection budget
+# check above needs) their state is visible, and without the filter an admin's or
+# a monitor's open transaction on the catalog would hold the restart.
+QIITA_CATALOG_IDLE_SQL="SELECT count(*) FROM pg_stat_activity
+  WHERE datname = current_database() AND pid <> pg_backend_pid()
+    AND usename = current_user
+    AND state IN ('active', 'idle in transaction')"
 
 # Run one query against the catalog named by env file `$1`, printing psql's
 # unaligned `|`-separated rows. A subshell, so qiita_pgpass_init's EXIT trap

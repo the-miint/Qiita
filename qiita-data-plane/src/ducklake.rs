@@ -2154,8 +2154,8 @@ mod tests {
     #[serial]
     #[cfg(feature = "integration")]
     fn catalog_connections_carry_the_instance_application_name() {
-        // A per-process port, so concurrent test processes against one catalog do not
-        // share a session name.
+        // A port derived from the process id, so concurrent test processes against one
+        // catalog are unlikely to share a session name.
         let port = 1 + (std::process::id() % 60000) as u16;
         let base = crate::test_catalog::connstr();
         let data_path = crate::test_catalog::data_path();

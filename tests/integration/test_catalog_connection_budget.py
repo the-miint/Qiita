@@ -2,8 +2,9 @@
 Postgres as a role with and without `pg_read_all_stats`.
 
 `qiita_catalog_connection_budget` reads the settings row's grant flag and the
-backends rows; these pin what Postgres returns to each query on either side of the
-grant. The roles are created per test, under a random suffix, and dropped after it.
+backends rows, and `wait_for_data_plane_idle` the idle count; these pin what
+Postgres returns to each query on either side of the grant. The roles are created
+once for the module, under a random suffix, and dropped after the probe.
 """
 
 import asyncio
@@ -31,6 +32,9 @@ def _common_sql(var: str) -> str:
     return proc.stdout
 
 
+_OWN_ROLE_LINE = "\n    AND usename = current_user"
+
+
 def _as_role(url: str, role: str, password: str) -> str:
     parsed = urlparse(url)
     netloc = f"{role}:{password}@{parsed.hostname}:{parsed.port}"
@@ -45,6 +49,18 @@ async def _settings_and_backends(url: str) -> tuple[asyncpg.Record, list[asyncpg
     finally:
         await conn.close()
     return settings, backends
+
+
+async def _idle_counts(url: str) -> tuple[int, int]:
+    """QIITA_CATALOG_IDLE_SQL's count, then the same query without its own-role filter."""
+    sql = _common_sql("QIITA_CATALOG_IDLE_SQL")
+    unfiltered = sql.replace(_OWN_ROLE_LINE, "")
+    assert unfiltered != sql, f"{_OWN_ROLE_LINE!r} not found in QIITA_CATALOG_IDLE_SQL"
+    conn = await asyncpg.connect(url)
+    try:
+        return await conn.fetchval(sql), await conn.fetchval(unfiltered)
+    finally:
+        await conn.close()
 
 
 async def _probe(url: str) -> dict[str, object]:
@@ -70,6 +86,7 @@ async def _probe(url: str) -> dict[str, object]:
             without = await _settings_and_backends(_as_role(url, check, password))
             await admin.execute(f"GRANT pg_read_all_stats TO {check}")
             with_grant = await _settings_and_backends(_as_role(url, check, password))
+            idle = await _idle_counts(_as_role(url, check, password))
             await tx.rollback()
         finally:
             if other_conn is not None:
@@ -78,11 +95,18 @@ async def _probe(url: str) -> dict[str, object]:
                 await admin.execute(f"DROP ROLE IF EXISTS {role}")
     finally:
         await admin.close()
-    return {"check": check, "other": other, "without": without, "with": with_grant}
+    return {"check": check, "other": other, "without": without, "with": with_grant, "idle": idle}
 
 
-def test_catalog_queries_see_other_roles_sessions_only_with_pg_read_all_stats() -> None:
-    result = asyncio.run(_probe(resolve_postgres_url()))
+@pytest.fixture(scope="module")
+def probe() -> dict[str, object]:
+    return asyncio.run(_probe(resolve_postgres_url()))
+
+
+def test_catalog_queries_see_other_roles_sessions_only_with_pg_read_all_stats(
+    probe: dict[str, object],
+) -> None:
+    result = probe
     check, other = result["check"], result["other"]
 
     settings, backends = result["without"]
@@ -99,3 +123,14 @@ def test_catalog_queries_see_other_roles_sessions_only_with_pg_read_all_stats() 
     assert host not in ("", "local"), rows[0]
     assert count == 1
     assert appname == "budget-other"
+
+
+def test_idle_wait_does_not_count_another_roles_open_transaction(
+    probe: dict[str, object],
+) -> None:
+    """With pg_read_all_stats granted and another role idle in a transaction, the
+    idle-wait count is 0; the control, the same query without its own-role filter,
+    counts that transaction."""
+    filtered, unfiltered = probe["idle"]
+    assert filtered == 0
+    assert unfiltered >= 1
