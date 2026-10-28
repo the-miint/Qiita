@@ -748,26 +748,17 @@ qiita_data_plane_pool_size() {
     printf '%s' $((10#$value))
 }
 
-# A DUCKDB_MEMORY_LIMIT as bytes, for the spellings the deploy compares: a
-# positive integer without a leading zero, then B; KB, MB, GB or TB (powers of
-# 1000); or KiB, MiB, GiB or TiB (powers of 1024), the unit in any letter case.
-# DuckDB accepts more than this (a decimal, a space before the unit, a bare G).
-# Anything else, including a value past 2^62 bytes, fails with nothing printed.
+# A DUCKDB_MEMORY_LIMIT as bytes, for the two spellings the deploy compares: a
+# positive integer without a leading zero, then MiB or GiB, as written. DuckDB
+# accepts more than this; anything else, including a value past 2^62 bytes, fails
+# with nothing printed.
 qiita_duckdb_size_bytes() {
     local value="$1" n mult
-    [[ $value =~ ^([1-9][0-9]{0,17})([A-Za-z]{1,3})$ ]] || return 1
+    [[ $value =~ ^([1-9][0-9]{0,17})(MiB|GiB)$ ]] || return 1
     n=${BASH_REMATCH[1]}
     case ${BASH_REMATCH[2]} in
-        [Bb])         mult=1 ;;
-        [Kk][Bb])     mult=1000 ;;
-        [Mm][Bb])     mult=$((1000 ** 2)) ;;
-        [Gg][Bb])     mult=$((1000 ** 3)) ;;
-        [Tt][Bb])     mult=$((1000 ** 4)) ;;
-        [Kk][Ii][Bb]) mult=1024 ;;
-        [Mm][Ii][Bb]) mult=$((1024 ** 2)) ;;
-        [Gg][Ii][Bb]) mult=$((1024 ** 3)) ;;
-        [Tt][Ii][Bb]) mult=$((1024 ** 4)) ;;
-        *) return 1 ;;
+        MiB) mult=$((1024 ** 2)) ;;
+        GiB) mult=$((1024 ** 3)) ;;
     esac
     [ "$n" -le $(((1 << 62) / mult)) ] || return 1
     printf '%s' $((n * mult))
@@ -793,11 +784,8 @@ qiita_assert_pool_memory_fits() {
         return 1
     }
     limit_bytes=$(qiita_duckdb_size_bytes "$limit") || {
-        echo "ERROR: DUCKDB_MEMORY_LIMIT '$limit' in $DP_ENV is not a spelling the deploy can" \
-             "compare with QIITA_DATA_PLANE_INSTANCE_MEMORY_MAX. It accepts a positive integer" \
-             "followed by B; KB, MB, GB or TB (powers of 1000); or KiB, MiB, GiB or TiB (powers" \
-             "of 1024), in any letter case. Rewrite it, or unset it so the data plane derives" \
-             "each connection's limit from the instance's MemoryMax" >&2
+        echo "ERROR: DUCKDB_MEMORY_LIMIT '$limit' in $DP_ENV: write DUCKDB_MEMORY_LIMIT in MiB" \
+             "or GiB, or unset it" >&2
         return 1
     }
     pool=$(qiita_data_plane_pool_size) || return 1

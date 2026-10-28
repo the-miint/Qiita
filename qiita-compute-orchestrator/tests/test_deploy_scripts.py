@@ -1094,21 +1094,11 @@ def test_pool_size_rejects_anything_but_a_positive_integer(tmp_path: Path, value
 @pytest.mark.parametrize(
     ("value", "expected"),
     [
-        ("100B", "100"),
-        ("1b", "1"),
-        ("2KB", "2000"),
-        ("3MB", str(3 * 1000**2)),
-        ("4GB", str(4 * 1000**3)),
-        ("4gb", str(4 * 1000**3)),
-        ("5TB", str(5 * 1000**4)),
-        ("2KiB", "2048"),
         ("3MiB", str(3 * 1024**2)),
         ("4GiB", str(4 * 1024**3)),
-        ("4GIB", str(4 * 1024**3)),
-        ("5TiB", str(5 * 1024**4)),
     ],
 )
-def test_duckdb_size_bytes_reads_decimal_and_binary_units(value: str, expected: str) -> None:
+def test_duckdb_size_bytes_reads_mib_and_gib(value: str, expected: str) -> None:
     result = _run_common('qiita_duckdb_size_bytes "$1"', value)
     assert result.returncode == 0, result.stderr
     assert result.stdout == expected
@@ -1119,16 +1109,12 @@ def test_duckdb_size_bytes_reads_decimal_and_binary_units(value: str, expected: 
     [
         "",
         "4096",
-        "4G",
-        "4 GB",
-        "1.5GB",
-        "04GB",
-        "0GB",
-        "-1GB",
-        "4PB",
-        "4PiB",
-        "4GiBs",
-        "4194305TiB",
+        "1GB",
+        "1gib",
+        "4 GiB",
+        "04GiB",
+        "0GiB",
+        "4294967297GiB",  # past 2^62 bytes
     ],
 )
 def test_duckdb_size_bytes_rejects_other_spellings(value: str) -> None:
@@ -1146,11 +1132,10 @@ def _pool_memory_fits(env_file: Path | None, value: str) -> subprocess.Completed
     [
         ("DUCKDB_MEMORY_LIMIT=1GiB\n", True),  # 8 × 1GiB is exactly 8G
         ("DUCKDB_MEMORY_LIMIT=1025MiB\n", False),
-        ("DUCKDB_MEMORY_LIMIT=1074MB\n", False),  # 1.074e9 > 2^30
-        ("DUCKDB_MEMORY_LIMIT=1073MB\n", True),
+        ("DUCKDB_MEMORY_LIMIT=1024MiB\n", True),
         ("DUCKDB_MEMORY_LIMIT=2GiB\nDUCKLAKE_POOL_SIZE=4\n", True),
         ("DUCKDB_MEMORY_LIMIT=2GiB\nDUCKLAKE_POOL_SIZE=5\n", False),
-        ("DUCKDB_MEMORY_LIMIT=4194303TiB\n", False),  # past the limit without overflowing
+        ("DUCKDB_MEMORY_LIMIT=4294967296GiB\n", False),  # 2^62 bytes: past the limit, no overflow
     ],
 )
 def test_pool_memory_fits_compares_pool_times_limit_with_memory_max(
@@ -1192,12 +1177,12 @@ def test_pool_memory_fits_reads_the_limit_from_the_host_file_only(tmp_path: Path
     assert _pool_memory_fits(None, "8G").returncode == 0
 
 
-@pytest.mark.parametrize("limit", ["4G", "1.5GB", "4096", "4 GiB"])
+@pytest.mark.parametrize("limit", ["4G", "1GB", "4096"])
 def test_pool_memory_fits_refuses_a_limit_it_cannot_compare(tmp_path: Path, limit: str) -> None:
     result = _pool_memory_fits(_dp_env(tmp_path, f'DUCKDB_MEMORY_LIMIT="{limit}"\n'), "1T")
     assert result.returncode != 0
     assert f"DUCKDB_MEMORY_LIMIT '{limit}'" in result.stderr
-    assert "KiB, MiB, GiB or TiB" in result.stderr
+    assert "write DUCKDB_MEMORY_LIMIT in MiB or GiB, or unset it" in result.stderr
 
 
 def test_pool_memory_fits_refuses_an_invalid_pool_size(tmp_path: Path) -> None:
