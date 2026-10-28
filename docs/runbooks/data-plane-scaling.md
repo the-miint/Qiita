@@ -112,11 +112,11 @@ On the peer host:
    `data-plane.env`, so its instances listen where this host can reach them.
 3. Allow the peer's data-plane ports only from this host's address in the peer's
    firewall. The listener has no TLS and no authentication beyond the ticket signature.
-4. Unset, `DUCKDB_TEMP_DIRECTORY` puts spill under `PATH_SCRATCH`, the shared filesystem.
-   To spill to the peer's own disk, set it to a local path in the peer's
-   `data-plane.env`, and set `DUCKDB_MAX_TEMP_DIRECTORY_SIZE`, a cap per pooled
+4. Optional, to spill to the peer's own disk rather than the shared filesystem: set
+   `DUCKDB_TEMP_DIRECTORY` in the peer's `data-plane.env` to a local path the data
+   plane can create or write, and `DUCKDB_MAX_TEMP_DIRECTORY_SIZE`, a cap per pooled
    connection, so that instances × `DUCKLAKE_POOL_SIZE` × the cap fits that disk
-   (`.env.data-plane.example` describes both).
+   (`.env.data-plane.example` describes both and their defaults).
 
 On this host:
 
