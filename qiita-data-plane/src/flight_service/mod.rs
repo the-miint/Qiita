@@ -129,6 +129,40 @@ impl QiitaFlightService {
             .await
             .map_err(|e| Status::internal(format!("{what} task join failed: {e}")))?
     }
+
+    /// Verify a DoAction body with its action's `verify` function, then check that
+    /// the payload's own `action` field names the action in the `Action.type`
+    /// header, so a token minted for one action is refused under another header.
+    fn verify_action_payload<P, E: std::fmt::Display>(
+        &self,
+        action: &Action,
+        verify: impl FnOnce(&[u8], &ed25519_dalek::VerifyingKey) -> Result<P, E>,
+        payload_action: impl FnOnce(&P) -> &str,
+    ) -> Result<P, Status> {
+        let payload = verify(&action.body, &self.flight_public_key)
+            .map_err(|e| Status::unauthenticated(e.to_string()))?;
+        let named = payload_action(&payload);
+        if named != action.r#type {
+            return Err(Status::invalid_argument(format!(
+                "action type mismatch: header says '{}', payload says {named:?}",
+                action.r#type
+            )));
+        }
+        Ok(payload)
+    }
+
+    /// The DoAction response: `result` as JSON in a single `arrow_flight::Result`.
+    fn action_response<T: serde::Serialize>(
+        result: &T,
+    ) -> Result<Response<<Self as FlightService>::DoActionStream>, Status> {
+        let result_body = serde_json::to_vec(result)
+            .map_err(|e| Status::internal(format!("json serialization failed: {e}")))?;
+        let result = arrow_flight::Result {
+            body: result_body.into(),
+        };
+        let output = stream::once(futures::future::ready(Ok(result)));
+        Ok(Response::new(Box::pin(output)))
+    }
 }
 
 /// DoAction variants that are safe to replay — the accepted-risk registry.

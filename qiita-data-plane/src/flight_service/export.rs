@@ -5,7 +5,6 @@ use std::path::{Path, PathBuf};
 use arrow_flight::flight_service_server::FlightService;
 use arrow_flight::Action;
 use duckdb::Connection;
-use futures::stream;
 use tonic::{Response, Status};
 
 use crate::auth;
@@ -18,15 +17,8 @@ impl QiitaFlightService {
         &self,
         action: &Action,
     ) -> Result<Response<<Self as FlightService>::DoActionStream>, Status> {
-        let payload = auth::verify_export_read(&action.body, &self.flight_public_key)
-            .map_err(|e| Status::unauthenticated(e.to_string()))?;
-
-        if payload.action != "export_read" {
-            return Err(Status::invalid_argument(format!(
-                "action type mismatch: header says 'export_read', payload says {:?}",
-                payload.action
-            )));
-        }
+        let payload =
+            self.verify_action_payload(action, auth::verify_export_read, |p| p.action.as_str())?;
 
         // Defense in depth on the signature-trusted destination before it is
         // inlined into a DuckDB `COPY ... TO` literal and written to.
@@ -41,17 +33,10 @@ impl QiitaFlightService {
             })
             .await?;
 
-        let result_body = serde_json::to_vec(&serde_json::json!({
+        Self::action_response(&serde_json::json!({
             "count": count,
             "dest": payload.dest,
         }))
-        .map_err(|e| Status::internal(format!("json serialization failed: {e}")))?;
-
-        let result = arrow_flight::Result {
-            body: result_body.into(),
-        };
-        let output = stream::once(futures::future::ready(Ok(result)));
-        Ok(Response::new(Box::pin(output)))
     }
 
     pub(super) async fn count_masked_action(
@@ -93,13 +78,7 @@ impl QiitaFlightService {
             })
             .await?;
 
-        let result_body = serde_json::to_vec(&serde_json::json!({ "count": count }))
-            .map_err(|e| Status::internal(format!("json serialization failed: {e}")))?;
-        let result = arrow_flight::Result {
-            body: result_body.into(),
-        };
-        let output = stream::once(futures::future::ready(Ok(result)));
-        Ok(Response::new(Box::pin(output)))
+        Self::action_response(&serde_json::json!({ "count": count }))
     }
 
     pub(super) async fn mask_metrics_action(
@@ -110,14 +89,8 @@ impl QiitaFlightService {
         // ticket the CLI already holds), the block reconcile primitive
         // runs control-plane-side and signs a first-class action token —
         // so this arm verifies a `mask_metrics` payload, not a ticket.
-        let payload = auth::verify_mask_metrics(&action.body, &self.flight_public_key)
-            .map_err(|e| Status::unauthenticated(e.to_string()))?;
-        if payload.action != "mask_metrics" {
-            return Err(Status::invalid_argument(format!(
-                "action type mismatch: header says 'mask_metrics', payload says {:?}",
-                payload.action
-            )));
-        }
+        let payload =
+            self.verify_action_payload(action, auth::verify_mask_metrics, |p| p.action.as_str())?;
         let mask_idx = payload.mask_idx;
         let prep_sample_idx = payload.prep_sample_idx;
 
@@ -128,13 +101,7 @@ impl QiitaFlightService {
             })
             .await?;
 
-        let result_body = serde_json::to_vec(&counts)
-            .map_err(|e| Status::internal(format!("json serialization failed: {e}")))?;
-        let result = arrow_flight::Result {
-            body: result_body.into(),
-        };
-        let output = stream::once(futures::future::ready(Ok(result)));
-        Ok(Response::new(Box::pin(output)))
+        Self::action_response(&counts)
     }
 }
 

@@ -5,7 +5,6 @@ use std::collections::BTreeMap;
 
 use arrow_flight::flight_service_server::FlightService;
 use arrow_flight::Action;
-use futures::stream;
 use sha2::{Digest, Sha256};
 use tonic::{Response, Status};
 
@@ -19,15 +18,8 @@ impl QiitaFlightService {
         &self,
         action: &Action,
     ) -> Result<Response<<Self as FlightService>::DoActionStream>, Status> {
-        let payload = auth::verify_action(&action.body, &self.flight_public_key)
-            .map_err(|e| Status::unauthenticated(e.to_string()))?;
-
-        if payload.action != "register_files" {
-            return Err(Status::invalid_argument(format!(
-                "action type mismatch: header says 'register_files', payload says {:?}",
-                payload.action
-            )));
-        }
+        let payload =
+            self.verify_action_payload(action, auth::verify_action, |p| p.action.as_str())?;
 
         // Moves files, then runs one DuckLake transaction.
         let data_path = self.pool.data_path().to_string();
@@ -38,17 +30,10 @@ impl QiitaFlightService {
             })
             .await?;
 
-        let result_body = serde_json::to_vec(&serde_json::json!({
+        Self::action_response(&serde_json::json!({
             "registered": registration.registered,
             "replaced": registration.replaced,
         }))
-        .map_err(|e| Status::internal(format!("json serialization failed: {e}")))?;
-
-        let result = arrow_flight::Result {
-            body: result_body.into(),
-        };
-        let output = stream::once(futures::future::ready(Ok(result)));
-        Ok(Response::new(Box::pin(output)))
     }
 }
 

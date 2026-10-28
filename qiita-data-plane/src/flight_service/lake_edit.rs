@@ -5,7 +5,6 @@ use std::path::Path;
 
 use arrow_flight::flight_service_server::FlightService;
 use arrow_flight::Action;
-use futures::stream;
 use tonic::{Response, Status};
 
 use crate::auth;
@@ -21,15 +20,8 @@ impl QiitaFlightService {
         &self,
         action: &Action,
     ) -> Result<Response<<Self as FlightService>::DoActionStream>, Status> {
-        let payload = auth::verify_delete_reference(&action.body, &self.flight_public_key)
-            .map_err(|e| Status::unauthenticated(e.to_string()))?;
-
-        if payload.action != "delete_reference" {
-            return Err(Status::invalid_argument(format!(
-                "action type mismatch: header says 'delete_reference', payload says {:?}",
-                payload.action
-            )));
-        }
+        let payload = self
+            .verify_action_payload(action, auth::verify_delete_reference, |p| p.action.as_str())?;
 
         let reference_idx = payload.reference_idx;
         let deleted = self
@@ -38,58 +30,31 @@ impl QiitaFlightService {
             })
             .await?;
 
-        let result_body = serde_json::to_vec(&deleted)
-            .map_err(|e| Status::internal(format!("json serialization failed: {e}")))?;
-
-        let result = arrow_flight::Result {
-            body: result_body.into(),
-        };
-        let output = stream::once(futures::future::ready(Ok(result)));
-        Ok(Response::new(Box::pin(output)))
+        Self::action_response(&deleted)
     }
 
     pub(super) async fn delete_mask_action(
         &self,
         action: &Action,
     ) -> Result<Response<<Self as FlightService>::DoActionStream>, Status> {
-        let payload = auth::verify_delete_mask(&action.body, &self.flight_public_key)
-            .map_err(|e| Status::unauthenticated(e.to_string()))?;
-
-        if payload.action != "delete_mask" {
-            return Err(Status::invalid_argument(format!(
-                "action type mismatch: header says 'delete_mask', payload says {:?}",
-                payload.action
-            )));
-        }
+        let payload =
+            self.verify_action_payload(action, auth::verify_delete_mask, |p| p.action.as_str())?;
 
         let mask_idx = payload.mask_idx;
         let deleted = self
             .blocking_lake_write("delete_mask", move |conn| delete_mask(conn, mask_idx))
             .await?;
 
-        let result_body = serde_json::to_vec(&deleted)
-            .map_err(|e| Status::internal(format!("json serialization failed: {e}")))?;
-
-        let result = arrow_flight::Result {
-            body: result_body.into(),
-        };
-        let output = stream::once(futures::future::ready(Ok(result)));
-        Ok(Response::new(Box::pin(output)))
+        Self::action_response(&deleted)
     }
 
     pub(super) async fn delete_pool_reads_action(
         &self,
         action: &Action,
     ) -> Result<Response<<Self as FlightService>::DoActionStream>, Status> {
-        let payload = auth::verify_delete_pool_reads(&action.body, &self.flight_public_key)
-            .map_err(|e| Status::unauthenticated(e.to_string()))?;
-
-        if payload.action != "delete_pool_reads" {
-            return Err(Status::invalid_argument(format!(
-                "action type mismatch: header says 'delete_pool_reads', payload says {:?}",
-                payload.action
-            )));
-        }
+        let payload = self.verify_action_payload(action, auth::verify_delete_pool_reads, |p| {
+            p.action.as_str()
+        })?;
 
         let prep_sample_idxs = payload.prep_sample_idxs;
         let deleted = self
@@ -98,29 +63,18 @@ impl QiitaFlightService {
             })
             .await?;
 
-        let result_body = serde_json::to_vec(&deleted)
-            .map_err(|e| Status::internal(format!("json serialization failed: {e}")))?;
-
-        let result = arrow_flight::Result {
-            body: result_body.into(),
-        };
-        let output = stream::once(futures::future::ready(Ok(result)));
-        Ok(Response::new(Box::pin(output)))
+        Self::action_response(&deleted)
     }
 
     pub(super) async fn delete_read_mask_block_action(
         &self,
         action: &Action,
     ) -> Result<Response<<Self as FlightService>::DoActionStream>, Status> {
-        let payload = auth::verify_delete_read_mask_block(&action.body, &self.flight_public_key)
-            .map_err(|e| Status::unauthenticated(e.to_string()))?;
+        let payload =
+            self.verify_action_payload(action, auth::verify_delete_read_mask_block, |p| {
+                p.action.as_str()
+            })?;
 
-        if payload.action != "delete_read_mask_block" {
-            return Err(Status::invalid_argument(format!(
-                "action type mismatch: header says 'delete_read_mask_block', payload says {:?}",
-                payload.action
-            )));
-        }
         // An empty block is a control-plane bug, not a valid ask —
         // reject it loudly rather than deleting nothing silently.
         if payload.members.is_empty() {
@@ -137,29 +91,15 @@ impl QiitaFlightService {
             })
             .await?;
 
-        let result_body = serde_json::to_vec(&deleted)
-            .map_err(|e| Status::internal(format!("json serialization failed: {e}")))?;
-
-        let result = arrow_flight::Result {
-            body: result_body.into(),
-        };
-        let output = stream::once(futures::future::ready(Ok(result)));
-        Ok(Response::new(Box::pin(output)))
+        Self::action_response(&deleted)
     }
 
     pub(super) async fn delete_alignment_action(
         &self,
         action: &Action,
     ) -> Result<Response<<Self as FlightService>::DoActionStream>, Status> {
-        let payload = auth::verify_delete_alignment(&action.body, &self.flight_public_key)
-            .map_err(|e| Status::unauthenticated(e.to_string()))?;
-
-        if payload.action != "delete_alignment" {
-            return Err(Status::invalid_argument(format!(
-                "action type mismatch: header says 'delete_alignment', payload says {:?}",
-                payload.action
-            )));
-        }
+        let payload = self
+            .verify_action_payload(action, auth::verify_delete_alignment, |p| p.action.as_str())?;
 
         let alignment_idx = payload.alignment_idx;
         let deleted = self
@@ -168,30 +108,18 @@ impl QiitaFlightService {
             })
             .await?;
 
-        let result_body = serde_json::to_vec(&deleted)
-            .map_err(|e| Status::internal(format!("json serialization failed: {e}")))?;
-
-        let result = arrow_flight::Result {
-            body: result_body.into(),
-        };
-        let output = stream::once(futures::future::ready(Ok(result)));
-        Ok(Response::new(Box::pin(output)))
+        Self::action_response(&deleted)
     }
 
     pub(super) async fn delete_alignment_block_action(
         &self,
         action: &Action,
     ) -> Result<Response<<Self as FlightService>::DoActionStream>, Status> {
-        let payload = auth::verify_delete_alignment_block(&action.body, &self.flight_public_key)
-            .map_err(|e| Status::unauthenticated(e.to_string()))?;
+        let payload =
+            self.verify_action_payload(action, auth::verify_delete_alignment_block, |p| {
+                p.action.as_str()
+            })?;
 
-        if payload.action != "delete_alignment_block" {
-            return Err(Status::invalid_argument(format!(
-                "action type mismatch: header says 'delete_alignment_block', \
-                 payload says {:?}",
-                payload.action
-            )));
-        }
         // An empty block is a control-plane bug, not a valid ask —
         // reject it loudly rather than deleting nothing silently.
         if payload.members.is_empty() {
@@ -208,30 +136,17 @@ impl QiitaFlightService {
             })
             .await?;
 
-        let result_body = serde_json::to_vec(&deleted)
-            .map_err(|e| Status::internal(format!("json serialization failed: {e}")))?;
-
-        let result = arrow_flight::Result {
-            body: result_body.into(),
-        };
-        let output = stream::once(futures::future::ready(Ok(result)));
-        Ok(Response::new(Box::pin(output)))
+        Self::action_response(&deleted)
     }
 
     pub(super) async fn delete_alignment_sample_action(
         &self,
         action: &Action,
     ) -> Result<Response<<Self as FlightService>::DoActionStream>, Status> {
-        let payload = auth::verify_delete_alignment_sample(&action.body, &self.flight_public_key)
-            .map_err(|e| Status::unauthenticated(e.to_string()))?;
-
-        if payload.action != "delete_alignment_sample" {
-            return Err(Status::invalid_argument(format!(
-                "action type mismatch: header says 'delete_alignment_sample', \
-                 payload says {:?}",
-                payload.action
-            )));
-        }
+        let payload =
+            self.verify_action_payload(action, auth::verify_delete_alignment_sample, |p| {
+                p.action.as_str()
+            })?;
 
         let alignment_idx = payload.alignment_idx;
         let prep_sample_idx = payload.prep_sample_idx;
@@ -241,30 +156,17 @@ impl QiitaFlightService {
             })
             .await?;
 
-        let result_body = serde_json::to_vec(&deleted)
-            .map_err(|e| Status::internal(format!("json serialization failed: {e}")))?;
-
-        let result = arrow_flight::Result {
-            body: result_body.into(),
-        };
-        let output = stream::once(futures::future::ready(Ok(result)));
-        Ok(Response::new(Box::pin(output)))
+        Self::action_response(&deleted)
     }
 
     pub(super) async fn sync_reference_exclusion_action(
         &self,
         action: &Action,
     ) -> Result<Response<<Self as FlightService>::DoActionStream>, Status> {
-        let payload = auth::verify_sync_reference_exclusion(&action.body, &self.flight_public_key)
-            .map_err(|e| Status::unauthenticated(e.to_string()))?;
-
-        if payload.action != "sync_reference_exclusion" {
-            return Err(Status::invalid_argument(format!(
-                "action type mismatch: header says 'sync_reference_exclusion', \
-                 payload says {:?}",
-                payload.action
-            )));
-        }
+        let payload =
+            self.verify_action_payload(action, auth::verify_sync_reference_exclusion, |p| {
+                p.action.as_str()
+            })?;
 
         // Defense in depth on the signature-trusted destination before it
         // is inlined into a DuckDB `read_parquet(...)` literal and read.
@@ -278,29 +180,17 @@ impl QiitaFlightService {
             })
             .await?;
 
-        let result_body = serde_json::to_vec(&result)
-            .map_err(|e| Status::internal(format!("json serialization failed: {e}")))?;
-        let result = arrow_flight::Result {
-            body: result_body.into(),
-        };
-        let output = stream::once(futures::future::ready(Ok(result)));
-        Ok(Response::new(Box::pin(output)))
+        Self::action_response(&result)
     }
 
     pub(super) async fn mint_phylogeny_edge_id_action(
         &self,
         action: &Action,
     ) -> Result<Response<<Self as FlightService>::DoActionStream>, Status> {
-        let payload = auth::verify_mint_phylogeny_edge_id(&action.body, &self.flight_public_key)
-            .map_err(|e| Status::unauthenticated(e.to_string()))?;
-
-        if payload.action != "mint_phylogeny_edge_id" {
-            return Err(Status::invalid_argument(format!(
-                "action type mismatch: header says 'mint_phylogeny_edge_id', \
-                 payload says {:?}",
-                payload.action
-            )));
-        }
+        let payload =
+            self.verify_action_payload(action, auth::verify_mint_phylogeny_edge_id, |p| {
+                p.action.as_str()
+            })?;
 
         let reference_idx = payload.reference_idx;
         let result = self
@@ -309,13 +199,7 @@ impl QiitaFlightService {
             })
             .await?;
 
-        let result_body = serde_json::to_vec(&result)
-            .map_err(|e| Status::internal(format!("json serialization failed: {e}")))?;
-        let result = arrow_flight::Result {
-            body: result_body.into(),
-        };
-        let output = stream::once(futures::future::ready(Ok(result)));
-        Ok(Response::new(Box::pin(output)))
+        Self::action_response(&result)
     }
 }
 
