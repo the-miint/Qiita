@@ -62,6 +62,7 @@ _None yet._
 ### Notes (no host action)
 
 - (#767) A killed DoPut leaves `staging/uploads/<idx>/upload.parquet.partial`, which nothing reclaims, as nothing reclaims finished uploads. `qiita-admin masked-read-export` gains `--retry-seconds` (default 3900, the data-plane unit's stop timeout).
+- (#610) New `qiita-admin scratch reclaim --older-than DAYS` (dry-run by default; `--execute` deletes). Run it as the user that owns the job output dirs (the SLURM job user): it restores owner write on 0550 container output dirs before deleting; it needs `DATABASE_URL` and an absolute `PATH_SCRATCH`.
 
 ## Deployed history
 

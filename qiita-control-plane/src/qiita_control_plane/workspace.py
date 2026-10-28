@@ -15,8 +15,10 @@ from qiita_common.actions import STEP_LOGS_SUBDIR, STEP_MANIFEST_FILENAME, STEP_
 
 # The per-ticket workspace root's name under PATH_SCRATCH.
 WORK_TICKET_SUBDIR = "ticket"
+ATTEMPT_DIR_PREFIX = "attempt-"
 
 __all__ = [
+    "ATTEMPT_DIR_PREFIX",
     "STEP_MANIFEST_FILENAME",
     "WORK_TICKET_SUBDIR",
     "action_payload_record",
@@ -34,7 +36,7 @@ def ticket_workspace(workspace_root: Path, work_ticket_idx: int) -> Path:
 
 def step_attempt_dir(ticket_dir: Path, step_name: str, attempt: int) -> Path:
     """One attempt of one step, under `ticket_workspace(...)`."""
-    return ticket_dir / step_name / f"attempt-{attempt}"
+    return ticket_dir / step_name / f"{ATTEMPT_DIR_PREFIX}{attempt}"
 
 
 def step_output_dir(attempt_dir: Path) -> Path:
