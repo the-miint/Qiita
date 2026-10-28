@@ -1,8 +1,6 @@
 //! DoGet streaming: the IPC body codec a client asks for, and the bounded
 //! producer that streams a DuckLake query's batches.
 
-use std::path::{Path, PathBuf};
-
 use arrow_array::RecordBatch;
 use arrow_flight::error::FlightError;
 use arrow_ipc::CompressionType;
@@ -186,14 +184,6 @@ fn send_query_batches(
         let _ = tx.blocking_send(Ok(RecordBatch::new_empty(schema)));
     }
     Ok(())
-}
-
-/// Canonical staging path for an upload — single source of truth shared by
-/// the DoPut handler (writes here) and the control plane (reads here).
-pub fn staging_path_for(root: &Path, upload_idx: i64) -> PathBuf {
-    root.join("uploads")
-        .join(upload_idx.to_string())
-        .join("upload.parquet")
 }
 
 #[cfg(test)]

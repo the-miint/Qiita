@@ -1739,7 +1739,7 @@ async def plan_shards(
 # They do NOT converge the same way on a re-run. This side upserts and COALESCEs,
 # so a replay whose genomes_dir has no sidecar keeps the attributes an earlier
 # pass stored; the lake side is replace-keyed on (prep_sample_idx,
-# processing_idx) in `flight_service::REPLACE_KEY_TABLES`, so the same replay
+# processing_idx) in `flight_service::registration::REPLACE_KEY_TABLES`, so the same replay
 # supersedes that run's lake rows with the NULLs it just computed. Postgres is
 # the authority for these four columns; the lake copy reflects the LAST run.
 ASSEMBLY_MEMBERSHIP_JOIN_SQL = (

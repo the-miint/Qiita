@@ -511,12 +511,3 @@ async fn doget_with_an_unsupported_codec_is_rejected_before_streaming() {
         .expect_err("lz4 must be rejected, not silently ignored");
     assert_eq!(err.code(), tonic::Code::InvalidArgument);
 }
-
-#[test]
-fn staging_path_for_layout() {
-    let root = Path::new("/scratch/staging");
-    assert_eq!(
-        staging_path_for(root, 42),
-        Path::new("/scratch/staging/uploads/42/upload.parquet")
-    );
-}

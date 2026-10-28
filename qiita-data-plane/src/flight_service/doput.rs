@@ -1,4 +1,5 @@
-//! DoPut: staging an uploaded Arrow stream as Parquet.
+//! DoPut: the staging path an upload lands at, and staging an uploaded Arrow
+//! stream as Parquet.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -16,8 +17,15 @@ use tonic::Status;
 
 use crate::auth;
 
-use super::doget::staging_path_for;
 use super::QiitaFlightService;
+
+/// Canonical staging path for an upload — single source of truth shared by
+/// the DoPut handler (writes here) and the control plane (reads here).
+pub fn staging_path_for(root: &Path, upload_idx: i64) -> PathBuf {
+    root.join("uploads")
+        .join(upload_idx.to_string())
+        .join("upload.parquet")
+}
 
 // ---------------------------------------------------------------------------
 // DoPut — generic Arrow-data staging

@@ -191,7 +191,7 @@ def survivor_table_sql(scope: CoverageScope, *, combined: bool = False) -> str:
       are positions on whichever copy of the contig the lake held when each
       prep_sample's `align_denovo` ran. A contig and its reverse complement share one
       `feature_idx`, and a later assembly run's copy replaces the stored one
-      (`flight_service::REPLACE_KEY_TABLES` in the data plane). A prep_sample aligned
+      (`flight_service::registration::REPLACE_KEY_TABLES` in the data plane). A prep_sample aligned
       before a run that stored the reverse complement keeps positions on the opposite
       axis, and nothing re-aligns it, so pooled breadth on that contig can count one
       stretch twice or merge two distinct stretches into one;

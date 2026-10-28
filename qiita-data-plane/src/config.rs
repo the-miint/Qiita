@@ -117,7 +117,7 @@ const DEFAULT_MAX_TEMP_DIRECTORY_SIZE: &str = "4GiB";
 ///
 /// What a payload may be is bounded elsewhere and far higher: one client
 /// RecordBatch, which `main`'s `FLIGHT_MAX_DECODING_BYTES` admits at up to 1 GiB
-/// and `flight_service::DOPUT_WRITER_CHANNEL_DEPTH` lets that many again queue
+/// and `flight_service::doput::DOPUT_WRITER_CHANNEL_DEPTH` lets that many again queue
 /// for behind. Today's uploaders are the two user-facing CLIs, which send
 /// `qiita_common.chunking.CHUNK_ROW_GROUP_SIZE` rows per batch — stated there as
 /// ~1 GB on dense data — so eight of them is ~18 GiB of decode buffers by the

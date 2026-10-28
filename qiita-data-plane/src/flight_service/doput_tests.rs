@@ -421,3 +421,12 @@ async fn do_put_writes_multi_batch_stream() {
         .unwrap();
     assert_eq!(n, 9);
 }
+
+#[test]
+fn staging_path_for_layout() {
+    let root = Path::new("/scratch/staging");
+    assert_eq!(
+        staging_path_for(root, 42),
+        Path::new("/scratch/staging/uploads/42/upload.parquet")
+    );
+}

@@ -1,5 +1,4 @@
-//! The `export_read`, `count_masked` and `mask_metrics` DoActions and the read
-//! helpers they share with the block-read DoGet.
+//! The `export_read`, `count_masked` and `mask_metrics` DoActions.
 
 use std::path::{Path, PathBuf};
 
@@ -11,6 +10,7 @@ use tonic::{Response, Status};
 
 use crate::auth;
 
+use super::query::single_i64_filter;
 use super::QiitaFlightService;
 
 impl QiitaFlightService {
@@ -333,130 +333,6 @@ fn export_read_to_parquet(
         dest,
         scratch_root,
     )
-}
-
-/// Build a block's `read` WHERE clause from its members. The ONE translator from
-/// block members to SQL: the block-read DoGet selectors (`build_block_read_query`)
-/// and the block DELETE actions all go through it, so a block's read footprint and
-/// its delete footprint cannot drift, and the pushdown performance-assessment test
-/// exercises the EXACT predicate they emit rather than a hand-written copy.
-///
-/// Two coarse conjuncts drive pruning (both are top-level, so DuckDB pushes them
-/// to the scan): `prep_sample_idx IN (...)` prunes DuckLake data files by their
-/// per-file `prep_sample_idx` stats, and `sequence_idx BETWEEN block_min AND
-/// block_max` bounds the row-group span. A third conjunct — the per-member OR of
-/// `(prep_sample_idx = p AND sequence_idx BETWEEN start AND stop)` — is the exact
-/// residual on the pruned rows, so a split member never leaks a sibling block's
-/// rows (independent of tiling order). The coarse pair is a superset of the OR,
-/// so `coarse AND exact == exact`. `members` must be non-empty (caller guards);
-/// all integers are signature-verified i64s, safe to inline.
-pub(super) fn block_read_where_clause(members: &[auth::BlockReadMember]) -> String {
-    let in_list = block_member_preps(members)
-        .iter()
-        .map(|v| v.to_string())
-        .collect::<Vec<_>>()
-        .join(",");
-    // Unwraps are safe: `members` is non-empty (caller guards).
-    let block_min = members.iter().map(|m| m.sequence_idx_start).min().unwrap();
-    let block_max = members.iter().map(|m| m.sequence_idx_stop).max().unwrap();
-    let member_terms = members
-        .iter()
-        .map(|m| {
-            format!(
-                "(prep_sample_idx = {} AND sequence_idx BETWEEN {} AND {})",
-                m.prep_sample_idx, m.sequence_idx_start, m.sequence_idx_stop
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(" OR ");
-    format!(
-        "prep_sample_idx IN ({in_list}) \
-         AND sequence_idx BETWEEN {block_min} AND {block_max} \
-         AND ({member_terms})"
-    )
-}
-
-/// Pull exactly one i64 out of a ticket filter column. Several paths need a
-/// single-valued scope rather than an IN-set — the count/metrics aggregates on
-/// `prep_sample_idx` / `mask_idx`, and the `read_masked_block` DoGet on
-/// `mask_idx` — so a missing, empty, multi-valued, or non-integer column is a
-/// malformed-ticket error; the control plane always signs a one-element list for
-/// these. Input is signature-verified (set by the control plane), but we validate
-/// anyway for defense in depth.
-pub(super) fn single_i64_filter(filter: &auth::TicketFilter, col: &str) -> Result<i64, Status> {
-    let values = filter.get(col).ok_or_else(|| {
-        Status::invalid_argument(format!(
-            "ticket missing single-valued filter column {col:?}"
-        ))
-    })?;
-    match values.as_slice() {
-        [v] => v.as_i64().ok_or_else(|| {
-            Status::invalid_argument(format!(
-                "filter value for {col:?} must be an integer, got {v}"
-            ))
-        }),
-        _ => Err(Status::invalid_argument(format!(
-            "expected exactly one value for {col:?}, got {}",
-            values.len()
-        ))),
-    }
-}
-
-/// A non-empty integer set from a ticket filter column.
-pub(super) fn i64_list_filter(filter: &auth::TicketFilter, col: &str) -> Result<Vec<i64>, Status> {
-    let values = filter
-        .get(col)
-        .ok_or_else(|| Status::invalid_argument(format!("ticket missing filter column {col:?}")))?;
-    if values.is_empty() {
-        return Err(Status::invalid_argument(format!(
-            "filter column {col:?} has empty values list"
-        )));
-    }
-    values
-        .iter()
-        .map(|v| {
-            v.as_i64().ok_or_else(|| {
-                Status::invalid_argument(format!(
-                    "filter values for {col:?} must be integers, got {v}"
-                ))
-            })
-        })
-        .collect()
-}
-
-/// The sorted, deduplicated prep_sample set a block's members cover.
-pub(super) fn block_member_preps(members: &[auth::BlockReadMember]) -> Vec<i64> {
-    let mut preps: Vec<i64> = members.iter().map(|m| m.prep_sample_idx).collect();
-    preps.sort_unstable();
-    preps.dedup();
-    preps
-}
-
-/// The `read_masked` table-macro call for one (mask, prep_samples) scope.
-///
-/// `read_masked` is a MACRO, not a relation — it takes its scope as arguments;
-/// `ducklake.rs` carries why.
-///
-/// `preps` must be non-empty, and that is the CALLER's guarantee, not this
-/// function's: `build_read_masked_query` gets it from `i64_list_filter` (which
-/// rejects an empty list) and `build_block_read_query` refuses empty `members`
-/// first. Those two are the enforcement. An empty list here would emit
-/// `read_masked(m, [])`, which the macro reads as "match nothing" — safe, but a
-/// silent zero-row answer rather than a loud error. The `debug_assert` below is a
-/// development-time tripwire for a future caller that forgets to guard; it is
-/// compiled out of the release binary the deploy builds, so it protects the next
-/// edit rather than production.
-pub(super) fn read_masked_relation(mask_idx: i64, preps: &[i64]) -> String {
-    debug_assert!(
-        !preps.is_empty(),
-        "read_masked scope must name at least one prep_sample; callers guard this"
-    );
-    let csv = preps
-        .iter()
-        .map(|v| v.to_string())
-        .collect::<Vec<_>>()
-        .join(",");
-    format!("qiita_lake.read_masked({mask_idx}, [{csv}])")
 }
 
 /// Count the masked reads a `read_masked` ticket selects, without streaming them.

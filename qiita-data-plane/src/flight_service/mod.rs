@@ -1,15 +1,21 @@
-//! Arrow Flight service implementation for the qiita data plane.
+//! The qiita data plane's Arrow Flight service.
 //!
-//! Handles DoGet requests by verifying Ed25519-signed tickets, querying DuckLake,
-//! and streaming results as Arrow RecordBatches.
+//! This file holds the `QiitaFlightService` struct, its `blocking_lake` /
+//! `blocking_lake_write` helpers, the `REPLAY_SAFE_ACTIONS` registry and the
+//! `FlightService` impl with the `do_action` dispatcher. The submodules own the
+//! rest:
 //!
-//! Each request borrows one attached instance from `pool::LakePool` for its
-//! duration, so two requests never share one at the same time and the number in
-//! flight is bounded. DuckLake's snapshot isolation in the shared Postgres
-//! catalog keeps readers off each other. It is not sufficient for every writer,
-//! though — it detects a conflict only where two transactions touch the same
-//! existing row, so writers that must not both commit take an explicit lock
-//! (`take_registration_lock`).
+//! - `doget`: the IPC body codec a DoGet client asks for, and streaming a
+//!   DuckLake query's batches over a bounded channel.
+//! - `query`: the DoGet table and filter allowlists, projection, and building the
+//!   SQL for each ticket surface, including the block-read filter helpers.
+//! - `doput`: the staging path an upload lands at, and staging an uploaded Arrow
+//!   stream as Parquet.
+//! - `export`: the `export_read`, `count_masked` and `mask_metrics` DoActions.
+//! - `registration`: the `register_files` DoAction, the lake commit retry and
+//!   registration lock, and placing files in lake storage.
+//! - `delete`: the `delete_*`, `sync_reference_exclusion` and
+//!   `mint_phylogeny_edge_id` DoActions.
 
 use std::path::PathBuf;
 use std::pin::Pin;

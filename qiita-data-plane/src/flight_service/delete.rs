@@ -11,7 +11,8 @@ use tonic::{Response, Status};
 use crate::auth;
 use crate::pool::LakeWriter;
 
-use super::export::{block_read_where_clause, validate_export_dest};
+use super::export::validate_export_dest;
+use super::query::block_read_where_clause;
 use super::registration::{sql_i64_list, take_registration_lock, transact_with_retry};
 use super::QiitaFlightService;
 
