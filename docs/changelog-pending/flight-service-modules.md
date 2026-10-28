@@ -6,6 +6,8 @@
   dispatcher, and `doget.rs`, `query.rs`, `doput.rs`, `export.rs`, `registration.rs`
   and `lake_edit.rs` each hold one surface, with its tests beside it in
   `<module>_tests.rs`; `mod.rs`'s own tests are in `tests.rs`, and the fixtures the
-  test modules share are in `test_support.rs`. Items moved verbatim; only visibility,
-  `use` lines and module declarations changed, and each DoAction arm's body moved into
-  a method on the module that owns the action.
+  test modules share are in `test_support.rs`. Items moved verbatim apart from
+  visibility, `use` lines and module declarations. Each DoAction arm's body moved into
+  a method on the module that owns the action, and the verify preamble and response
+  tail those methods repeated are now two helpers in `mod.rs`, `verify_action_payload`
+  and `action_response`; every status code and message is unchanged.

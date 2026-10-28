@@ -1,9 +1,11 @@
 //! The qiita data plane's Arrow Flight service.
 //!
 //! This file holds the `QiitaFlightService` struct, its `blocking_lake` /
-//! `blocking_lake_write` helpers, the `REPLAY_SAFE_ACTIONS` registry and the
-//! `FlightService` impl with the `do_action` dispatcher. The submodules own the
-//! rest:
+//! `blocking_lake_write` helpers, the DoAction helpers `verify_action_payload`
+//! (verify the action token and check its `action` field against the header) and
+//! `action_response` (serialize a result into the DoAction response), the
+//! `REPLAY_SAFE_ACTIONS` registry and the `FlightService` impl with the
+//! `do_action` dispatcher. The submodules own the rest:
 //!
 //! - `doget`: the IPC body codec a DoGet client asks for, and streaming a
 //!   DuckLake query's batches over a bounded channel.

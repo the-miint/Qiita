@@ -258,6 +258,20 @@ def test_expiry_signatures_match_the_data_planes_wording():
         )
     )
     assert bodies, "no <action>_action methods found in flight_service/"
+    # Fail closed on the method set: every method the dispatcher calls must be one
+    # the match above read, so a method it misses (another visibility, another
+    # indent) fails here instead of going unchecked.
+    dispatched = set(
+        re.findall(
+            r'"(\w+)" => self\.(\w+_action)\(',
+            (DATA_PLANE_SRC / "flight_service" / "mod.rs").read_text(),
+        )
+    )
+    assert dispatched, "no do_action dispatcher arms found in flight_service/mod.rs"
+    assert {method for _, method in dispatched} == set(bodies), (
+        f"dispatcher calls {sorted(m for _, m in dispatched)}, but the methods read are "
+        f"{sorted(bodies)}"
+    )
     unchecked = [
         name
         for name, body in bodies.items()
