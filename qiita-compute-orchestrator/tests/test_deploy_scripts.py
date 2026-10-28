@@ -1174,7 +1174,10 @@ def test_pool_memory_fits_reads_the_limit_from_the_host_file_only(tmp_path: Path
         extra_env={"DUCKDB_MEMORY_LIMIT": "64GiB"},
     )
     assert result.returncode == 0, result.stderr
-    assert _pool_memory_fits(None, "8G").returncode == 0
+    no_file = _run_common(
+        'qiita_assert_pool_memory_fits "$1"', "8G", extra_env={"DUCKDB_MEMORY_LIMIT": "64GiB"}
+    )
+    assert no_file.returncode == 0, no_file.stderr
 
 
 @pytest.mark.parametrize("limit", ["4G", "1GB", "4096"])
@@ -1192,8 +1195,9 @@ def test_pool_memory_fits_refuses_an_invalid_pool_size(tmp_path: Path) -> None:
     assert "DUCKLAKE_POOL_SIZE" in result.stderr
 
 
-def _preflight_dp_memory_row(tmp_path: Path, body: str) -> str:
-    """The dp-memory-max row of a preflight run whose only env file is data-plane.env."""
+def _preflight_row(tmp_path: Path, body: str, row_name: str) -> str:
+    """The `row_name` row of a preflight run whose only env file is data-plane.env,
+    holding `body`."""
     env = {k: v for k, v in os.environ.items() if k not in _TOPOLOGY_VARS}
     env.update(
         CP_ENV=str(tmp_path / "absent-cp.env"),
@@ -1204,14 +1208,14 @@ def _preflight_dp_memory_row(tmp_path: Path, body: str) -> str:
     result = subprocess.run(
         ["bash", str(_DEPLOY / "preflight.sh")], capture_output=True, text=True, env=env
     )
-    rows = [line for line in result.stdout.splitlines() if " dp-memory-max: " in line]
+    rows = [line for line in result.stdout.splitlines() if f" {row_name}: " in line]
     assert len(rows) == 1, result.stdout + result.stderr
     return rows[0]
 
 
 def test_preflight_fails_the_memory_row_when_the_pool_exceeds_memory_max(tmp_path: Path) -> None:
     body = "QIITA_DATA_PLANE_INSTANCE_MEMORY_MAX=1G\nDUCKDB_MEMORY_LIMIT=129MiB\n"
-    row = _preflight_dp_memory_row(tmp_path, body)
+    row = _preflight_row(tmp_path, body, "dp-memory-max")
     assert row.lstrip().startswith("\u2717"), row
     assert "Unset DUCKDB_MEMORY_LIMIT" in row
 
@@ -1220,7 +1224,7 @@ def test_preflight_memory_row_accepts_a_pool_within_memory_max(tmp_path: Path) -
     """8 × 128MiB is exactly 1G. The row then reaches the MemTotal check, which reads
     /proc/meminfo, so it passes only where the host has one."""
     body = "QIITA_DATA_PLANE_INSTANCE_MEMORY_MAX=1G\nDUCKDB_MEMORY_LIMIT=128MiB\n"
-    row = _preflight_dp_memory_row(tmp_path, body)
+    row = _preflight_row(tmp_path, body, "dp-memory-max")
     assert "DUCKDB_MEMORY_LIMIT" not in row
     if Path("/proc/meminfo").is_file():
         assert row.lstrip().startswith("\u2713"), row
@@ -2984,23 +2988,6 @@ def test_verify_runs_the_budget_against_the_data_plane_env() -> None:
     assert re.search(r'(?m)^    qiita_check_catalog_connection_budget "\$DP_ENV"$', verify)
 
 
-def _preflight_connstr_row(tmp_path: Path, connstr: str) -> str:
-    """The connstr/ducklake row of a preflight run whose only env file is data-plane.env."""
-    env = {k: v for k, v in os.environ.items() if k not in _TOPOLOGY_VARS}
-    env.update(
-        CP_ENV=str(tmp_path / "absent-cp.env"),
-        CO_ENV=str(tmp_path / "absent-co.env"),
-        DP_ENV=str(_dp_env(tmp_path, f"DUCKLAKE_CATALOG_CONNSTR='{connstr}'\n")),
-    )
-    env.pop("SKIP_PREFLIGHT", None)
-    result = subprocess.run(
-        ["bash", str(_DEPLOY / "preflight.sh")], capture_output=True, text=True, env=env
-    )
-    rows = [line for line in result.stdout.splitlines() if " connstr/ducklake: " in line]
-    assert len(rows) == 1, result.stdout + result.stderr
-    return rows[0]
-
-
 @pytest.mark.parametrize(
     "connstr",
     [
@@ -3011,6 +2998,6 @@ def _preflight_connstr_row(tmp_path: Path, connstr: str) -> str:
 def test_preflight_refuses_a_catalog_connstr_that_names_the_session(
     tmp_path: Path, connstr: str
 ) -> None:
-    row = _preflight_connstr_row(tmp_path, connstr)
+    row = _preflight_row(tmp_path, f"DUCKLAKE_CATALOG_CONNSTR='{connstr}'\n", "connstr/ducklake")
     assert not _passed(row), row
     assert "sets application_name" in row

@@ -33,16 +33,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // the number in flight. Logged after it opens, so the line is a statement
     // that these settings applied rather than that they were intended.
     let pool_log = format!(
-        "qiita-data-plane pool: {} connections x {} threads, memory_limit {} \
-         (from a {:.1} GiB ceiling read via {}, CPU budget {} / {} local instances), \
+        "qiita-data-plane pool: {} connections x {} threads ({}), memory_limit {} \
+         (from a {:.1} GiB ceiling read via {}), \
          spill under {} capped at {} ({}); {} concurrent uploads",
         cfg.pool.size,
         cfg.pool.threads,
+        cfg.threads_source.describe(cfg.pool.size),
         cfg.pool.memory_limit,
         cfg.memory_ceiling.bytes as f64 / (1024.0 * 1024.0 * 1024.0),
         cfg.memory_ceiling.source.as_str(),
-        cfg.thread_budget,
-        cfg.local_instances,
         cfg.pool.temp_directory.display(),
         cfg.pool.max_temp_directory_size,
         cfg.spill_cap_source.describe(cfg.pool.size),
@@ -369,9 +368,16 @@ mod tests {
             "the default in-flight bound"
         );
         assert!(cfg.pool.threads >= 1, "a request always gets a thread");
+        let super::config::ThreadsSource::Derived { budget, instances } = cfg.threads_source else {
+            panic!(
+                "threads derived with DUCKDB_THREADS unset: {:?}",
+                cfg.threads_source
+            );
+        };
+        assert_eq!(instances, 1);
         assert_eq!(
             cfg.pool.threads,
-            super::config::derived_threads(cfg.thread_budget, 1, cfg.pool.size),
+            super::config::derived_threads(budget, 1, cfg.pool.size),
             "threads is the CPU budget divided by the bound"
         );
         assert!(
@@ -413,6 +419,7 @@ mod tests {
 
         assert_eq!(cfg.pool.size, 3);
         assert_eq!(cfg.pool.threads, 5);
+        assert_eq!(cfg.threads_source, super::config::ThreadsSource::Configured);
         assert_eq!(cfg.pool.memory_limit, "7GiB");
         assert_eq!(cfg.pool.temp_directory, std::path::PathBuf::from(spill));
         assert_eq!(cfg.pool.max_temp_directory_size, "11GiB");
@@ -442,10 +449,16 @@ mod tests {
             cfg.spill_cap_source
         );
         assert!(cfg.pool.max_temp_directory_size.ends_with("MiB"));
-        assert_eq!(cfg.local_instances, 3);
+        let super::config::ThreadsSource::Derived { budget, instances } = cfg.threads_source else {
+            panic!(
+                "threads derived with DUCKDB_THREADS unset: {:?}",
+                cfg.threads_source
+            );
+        };
+        assert_eq!(instances, 3);
         assert_eq!(
             cfg.pool.threads,
-            super::config::derived_threads(cfg.thread_budget, 3, 1),
+            super::config::derived_threads(budget, 3, 1),
             "threads are divided by the instance count too"
         );
     }

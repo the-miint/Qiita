@@ -146,9 +146,7 @@ pub fn connect_ducklake(
 }
 
 /// The libpq `application_name` an instance gives every connection it opens to the
-/// catalog. `qiita_catalog_connection_budget` in `deploy/_common.sh` parses it out of
-/// the catalog server's `pg_stat_activity` and adds up the pool sizes against
-/// `max_connections`; `test_deploy_scripts.py` feeds this format to that parser.
+/// catalog, read back by `qiita_catalog_connection_budget` in `deploy/_common.sh`.
 /// Unquoted with no spaces: a quoted value closes the ATTACH string literal.
 fn catalog_application_name(port: u16, pool_size: usize) -> String {
     format!("qiita-data-plane:{port}:pool={pool_size}")
@@ -159,11 +157,11 @@ fn catalog_application_name(port: u16, pool_size: usize) -> String {
 ///
 /// The connection string must be libpq's `keyword=value` form, which preflight
 /// already requires of it (a URI cannot take the appended setting), and must not
-/// contain `application_name`, with or without spaces around the `=` (libpq
-/// accepts both, and the substring also catches `fallback_application_name`): the
-/// instance's own name is what the connection
-/// budget check reads, so a connection string that names the session otherwise
-/// fails boot rather than leaving libpq to pick one of the two.
+/// contain `application_name`, with or without spaces around the `=` (libpq accepts
+/// both, and the substring also catches `fallback_application_name`): the
+/// instance's own name is what the connection budget check reads, so a connection
+/// string that names the session otherwise fails boot rather than leaving libpq to
+/// pick one of the two.
 pub(crate) fn tag_catalog_connstr(
     catalog_connstr: &str,
     port: u16,
@@ -2156,7 +2154,8 @@ mod tests {
     #[serial]
     #[cfg(feature = "integration")]
     fn catalog_connections_carry_the_instance_application_name() {
-        // A port no other test uses, so the count below is this test's sessions.
+        // A per-process port, so concurrent test processes against one catalog do not
+        // share a session name.
         let port = 1 + (std::process::id() % 60000) as u16;
         let base = crate::test_catalog::connstr();
         let data_path = crate::test_catalog::data_path();

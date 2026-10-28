@@ -47,9 +47,11 @@ token aged out — from one shared module
 ([`qiita_common.data_plane_errors`](../../qiita-common/src/qiita_common/data_plane_errors.py)).
 
 Each pooled connection carries its own `threads`, `memory_limit`, `temp_directory`
-and `max_temp_directory_size`, divided at boot from the memory ceiling the
-process detects for itself and overridable per deploy (`DUCKLAKE_POOL_SIZE` and
-the `DUCKDB_*` vars in `.env.data-plane.example`). The spill cap is the explicit
+and `max_temp_directory_size`, overridable per deploy (`DUCKLAKE_POOL_SIZE` and
+the `DUCKDB_*` vars in `.env.data-plane.example`). Unset, `memory_limit` is divided
+at boot from the memory ceiling the process detects for itself, and `threads` from
+the CPU budget it detects, divided by the local instances and the pool size
+(`derived_threads` in `qiita-data-plane/src/config.rs`). The spill cap is the explicit
 `DUCKDB_MAX_TEMP_DIRECTORY_SIZE` when set; else, when `DUCKDB_TEMP_DIRECTORY` is set,
 it is derived from that filesystem's free space; else it is a 4GiB default
 (`spill_cap` in `qiita-data-plane/src/config.rs`). A read runs with insertion
