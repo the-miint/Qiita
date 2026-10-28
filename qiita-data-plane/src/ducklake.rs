@@ -51,8 +51,8 @@ const CHUNK_ROW_GROUP_SIZE: u64 = 16384;
 const CATALOG_SETUP_LOCK_KEY: i64 = 0x7169_6974_615f_6470;
 
 /// How long boot waits for another data plane's catalog setup to release
-/// `CATALOG_SETUP_LOCK_KEY`. A backstop: in the measured 4-process boots every
-/// process was up within seconds, so exhausting it means a setup is stuck.
+/// `CATALOG_SETUP_LOCK_KEY`. A backstop for a setup that holds the lock and does
+/// not finish.
 const BOOT_SETUP_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Attach the catalog and create its tables, once, at boot.
@@ -66,11 +66,12 @@ const BOOT_SETUP_BUDGET: std::time::Duration = std::time::Duration::from_secs(60
 /// one after another.
 ///
 /// The lock is transaction-scoped and taken inside an open DuckDB transaction on
-/// its own attach: the postgres extension keeps one Postgres connection for the
-/// length of a DuckDB transaction, and sends `DISCARD ALL` (which drops session
-/// advisory locks) when a pooled connection is returned, so a session lock taken
-/// through it is released at once. Postgres releases the lock when the setup
-/// commits, or when the process exits and its connection closes.
+/// its own attach: measured with DuckDB 1.5.5, the postgres extension keeps one
+/// Postgres connection for the length of a DuckDB transaction, and sends
+/// `DISCARD ALL` (which drops session advisory locks) when a pooled connection is
+/// returned, so a session lock taken through it is released at once. Postgres
+/// releases the lock when the setup commits, or when the process exits and its
+/// connection closes.
 pub fn setup_catalog(
     catalog_connstr: &str,
     data_path: &str,

@@ -311,6 +311,17 @@ QIITA_DATA_PLANE_LB_PORT=50050
 # qiita-data-plane/src/main.rs). verify.sh asks every upstream member for it, so a
 # member deployed from another commit, or not restarted, fails.
 QIITA_DATA_PLANE_BUILD_ENV=/opt/qiita/data-plane/build.env
+# QIITA_BUILD_SHA, the BUILD_SHA activate.sh writes: empty when it is unset, an
+# error when it is not a full commit, on which a data plane refuses to boot
+# (build_service_name in qiita-data-plane/src/main.rs).
+qiita_data_plane_build_sha() {
+    local sha=${QIITA_BUILD_SHA:-}
+    if [ -n "$sha" ] && ! [[ $sha =~ ^[0-9a-f]{40}$ ]]; then
+        echo "ERROR: QIITA_BUILD_SHA='$sha' is not a full 40-character lowercase commit sha, so the data planes would not boot on it" >&2
+        return 1
+    fi
+    printf '%s' "$sha"
+}
 qiita_data_plane_build_service() {
     printf 'qiita-data-plane/build/%s' "$1"
 }

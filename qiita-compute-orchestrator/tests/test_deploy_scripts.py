@@ -881,6 +881,7 @@ def test_activate_resolves_topology_before_installing_anything() -> None:
         _first_command(src, re.escape("DP_PORTS=$(qiita_data_plane_ports)")),
         _first_command(src, re.escape("DP_PEERS=$(qiita_data_plane_peers)")),
         _first_command(src, re.escape("DP_BIND_HOST=$(qiita_data_plane_bind_host)")),
+        _first_command(src, re.escape("DP_BUILD_SHA=$(qiita_data_plane_build_sha)")),
         _first_command(src, re.escape('qiita_assert_peer_private "$peer"')),
     )
     for step in (
@@ -1081,6 +1082,28 @@ def test_build_service_name_matches_the_data_plane() -> None:
     assert build_env == "/opt/qiita/data-plane/build.env"
     unit = (_DEPLOY / "systemd" / "qiita-data-plane@.service").read_text()
     assert f"EnvironmentFile=-{build_env}" in unit
+
+
+@pytest.mark.parametrize("sha", ["", "0123456789abcdef0123456789abcdef01234567"])
+def test_build_sha_accepts_unset_or_a_full_commit(sha: str) -> None:
+    result = _run_common("qiita_data_plane_build_sha", extra_env={"QIITA_BUILD_SHA": sha})
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == sha
+
+
+@pytest.mark.parametrize(
+    "sha",
+    [
+        "0123456",
+        "0123456789ABCDEF0123456789ABCDEF01234567",
+        "0123456789abcdef0123456789abcdef012345678",
+        "0123456789abcdef0123456789abcdef0123456g",
+    ],
+)
+def test_build_sha_rejects_what_the_data_plane_would_not_boot_on(sha: str) -> None:
+    result = _run_common("qiita_data_plane_build_sha", extra_env={"QIITA_BUILD_SHA": sha})
+    assert result.returncode != 0
+    assert "QIITA_BUILD_SHA" in result.stderr
 
 
 def test_verify_dp_pool_row_greps_what_the_data_plane_actually_logs() -> None:
