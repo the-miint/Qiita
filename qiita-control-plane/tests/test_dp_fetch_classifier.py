@@ -235,6 +235,43 @@ def test_expiry_signatures_match_the_data_planes_wording():
         f"a ticket verification now maps to {sorted(set(verify_calls))}; the classifier's "
         f"{DATA_PLANE_TICKET_EXPIRED_SIGNATURES!r} match assumes every one is unauthenticated"
     )
+    # The DoAction methods verify through `verify_action_payload` in mod.rs, which
+    # passes `auth::verify_*` as an argument and maps its error once. Read that
+    # mapping, and require every `<action>_action` method to verify either through
+    # the helper or by a direct `auth::verify_*` call the match above already read.
+    helper = re.search(r"fn verify_action_payload<.*?\n    \}\n", service, flags=re.DOTALL)
+    assert helper, "verify_action_payload not found in flight_service/"
+    helper_maps = re.findall(
+        r"verify\(&action\.body, &self\.flight_public_key\)\s*"
+        r"\.map_err\(\|e\| Status::(\w+)\(",
+        helper.group(0),
+    )
+    assert helper_maps == ["unauthenticated"], (
+        f"verify_action_payload now maps a failed verification to {helper_maps}; the "
+        f"classifier's {DATA_PLANE_TICKET_EXPIRED_SIGNATURES!r} match assumes unauthenticated"
+    )
+    bodies = dict(
+        re.findall(
+            r"    pub\(super\) async fn (\w+_action)\((.*?)\n    \}\n",
+            service,
+            flags=re.DOTALL,
+        )
+    )
+    assert bodies, "no <action>_action methods found in flight_service/"
+    unchecked = [
+        name
+        for name, body in bodies.items()
+        if not re.search(r"self\s*\.verify_action_payload\(", body)
+        and not re.search(
+            r"auth::verify_\w+\([^;]*?\.map_err\(\|e\| Status::unauthenticated\(",
+            body,
+            flags=re.DOTALL,
+        )
+    ]
+    assert not unchecked, (
+        f"{unchecked} verify their token neither through verify_action_payload nor by an "
+        "auth::verify_* call mapped to unauthenticated"
+    )
 
 
 def test_serialization_conflict_classified_retriable():
