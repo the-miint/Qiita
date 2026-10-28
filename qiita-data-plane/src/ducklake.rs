@@ -14,7 +14,7 @@
 //! verifies before loading — but not entirely: a feature is shared across
 //! producers, so no producer can know whether the lake already holds it. That
 //! part is enforced AT insertion, by the data plane
-//! (`flight_service::REPLACE_KEY_TABLES`).
+//! (`flight_service::registration::REPLACE_KEY_TABLES`).
 
 use duckdb::Connection;
 
@@ -226,7 +226,8 @@ pub fn set_catalog_options(conn: &Connection) -> Result<(), Box<dyn std::error::
 /// - The orchestrator verifies data before loading
 /// - The data plane validates identifier sets programmatically on DoAction
 /// - `reference_sequences` / `reference_sequence_chunks` are additionally
-///   REPLACED on `feature_idx` at register time — `flight_service::REPLACE_KEY_TABLES`
+///   REPLACED on `feature_idx` at register time —
+///   `flight_service::registration::REPLACE_KEY_TABLES`
 ///
 /// Per-table storage tuning (compression, row group size) is deferred to a
 /// separate configuration pass — see DuckLake configuration docs.
@@ -366,7 +367,7 @@ pub fn ensure_reference_tables(conn: &Connection) -> Result<(), Box<dyn std::err
 /// orchestrator verifies before loading).
 ///
 /// PRIVACY: `read` and `read_mask` are deliberately NOT exposed via Flight
-/// (they are absent from `flight_service::ALLOWED_TABLES`). The only
+/// (they are absent from `flight_service::query::ALLOWED_TABLES`). The only
 /// Flight-reachable read surface is the `read_masked` MACRO, which joins read to
 /// read_mask, applies the recorded trims, and excludes every non-`pass` row
 /// (host/human hits + QC failures) via an unconditional `reason = 'pass'`. Human
@@ -564,18 +565,18 @@ pub fn ensure_read_tables(conn: &Connection) -> Result<(), Box<dyn std::error::E
 ///
 /// Same DuckLake constraint story as the read/reference tables: no PK/UNIQUE/FK
 /// (integrity is enforced upstream — the CP mints alignment_idx; align_sharded
-/// stamps feature_idx). Exposed via Flight DoGet (in flight_service::ALLOWED_TABLES)
+/// stamps feature_idx). Exposed via Flight DoGet (in flight_service::query::ALLOWED_TABLES)
 /// for the feature-table (OGU) consumer: reads are always scoped to a single
 /// alignment_idx + an explicit prep_sample_idx set, and projected to the columns
 /// the ticket signed — required on this surface, and drawn from the allowlist
-/// `flight_service::ALIGNMENT_PROJECTION_COLUMNS`, which mirrors the column list
+/// `flight_service::query::ALIGNMENT_PROJECTION_COLUMNS`, which mirrors the column list
 /// below. An unscoped or unprojected read is refused. This is host-depleted
 /// derived data, not raw human reads.
 ///
 /// The second table, `alignment_origin_spanning`, records which `alignment` rows
 /// are one read that crossed a circular contig's origin; its contract is on its
 /// DDL below. It is created here rather than by its own `ensure_*` because every
-/// `flight_service::ALIGNMENT_DELETE_TABLES` delete drops from both, so a catalog
+/// `flight_service::lake_edit::ALIGNMENT_DELETE_TABLES` delete drops from both, so a catalog
 /// holding one without the other fails those deletes.
 pub fn ensure_alignment_tables(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
     conn.execute_batch(
@@ -678,7 +679,7 @@ pub fn ensure_alignment_tables(conn: &Connection) -> Result<(), Box<dyn std::err
         -- their own CIGAR, and no row here describes one.
         --
         -- Superseded by delete-then-register, like `alignment` itself, not by
-        -- `flight_service::REPLACE_KEY_TABLES`: a replace-by-key delete reads the
+        -- `flight_service::registration::REPLACE_KEY_TABLES`: a replace-by-key delete reads the
         -- keys out of the incoming file, and a re-run that no longer finds a read
         -- origin-spanning writes no row for it, so it would name no key and the
         -- stale row would survive its own fragments. `delete_alignment_block`
@@ -686,7 +687,7 @@ pub fn ensure_alignment_tables(conn: &Connection) -> Result<(), Box<dyn std::err
         CREATE TABLE IF NOT EXISTS qiita_lake.alignment_origin_spanning (
             -- `alignment`'s leading four, same names, types and order.
             -- alignment_idx / prep_sample_idx / sequence_idx are NOT NULL because
-            -- a `flight_service::delete_alignment*` predicate keys on each, and a
+            -- a `flight_service::lake_edit::delete_alignment*` predicate keys on each, and a
             -- NULL is a row no delete can reach. feature_idx is NOT NULL because
             -- it is the contig whose origin the interval below wraps, and because
             -- it completes the join key above.
@@ -807,14 +808,14 @@ pub fn ensure_exclusion_tables(conn: &Connection) -> Result<(), Box<dyn std::err
 /// All four are additionally REPLACED at register time — `assembled_sequence` /
 /// `assembled_sequence_chunks` on `feature_idx`, `assembly_membership` /
 /// `bin_quality` on `(prep_sample_idx, processing_idx)`. The keys and what
-/// admits each table are in `flight_service::REPLACE_KEY_TABLES`.
+/// admits each table are in `flight_service::registration::REPLACE_KEY_TABLES`.
 ///
 /// `assembled_sequence` / `assembled_sequence_chunks` are Flight-readable, and so
-/// is `bin_quality` — all three are in `flight_service::ALLOWED_TABLES`, scoped to
+/// is `bin_quality` — all three are in `flight_service::query::ALLOWED_TABLES`, scoped to
 /// one `(prep_sample_idx, processing_idx)` run. `assembly_membership` is not: it is
 /// a register_files write target, SQL-queryable in the catalog, off the external
 /// read-back path, and additionally what resolves the two sequence surfaces' run
-/// scope — read by `flight_service::build_assembly_run_query` as a semi join,
+/// scope — read by `flight_service::query::build_assembly_run_query` as a semi join,
 /// never streamed.
 pub fn ensure_assembly_tables(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
     conn.execute_batch(
@@ -921,7 +922,7 @@ pub fn ensure_assembly_tables(conn: &Connection) -> Result<(), Box<dyn std::erro
 /// closed-reference feature table aggregates membership; it is never itself
 /// stored. membership is replace-keyed on `(prep_sample_idx, processing_idx)`
 /// and the sequence tables on `feature_idx` in
-/// `flight_service::REPLACE_KEY_TABLES`, so a re-run replaces its own rows.
+/// `flight_service::registration::REPLACE_KEY_TABLES`, so a re-run replaces its own rows.
 pub fn ensure_amplicon_tables(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS qiita_lake.amplicon_membership (
@@ -960,8 +961,9 @@ pub fn ensure_amplicon_tables(conn: &Connection) -> Result<(), Box<dyn std::erro
 /// on, and seed it.
 ///
 /// Why a lock is needed at all, and what it buys, lives where it is taken —
-/// `flight_service::register_files` and `flight_service::delete_reference`, both
-/// through `take_registration_lock`. What matters here is the shape: EXACTLY ONE
+/// `flight_service::registration::register_files` and
+/// `flight_service::lake_edit::delete_reference`, both through `take_registration_lock`.
+/// What matters here is the shape: EXACTLY ONE
 /// row, holding a value nothing reads. `take_registration_lock` fails loudly if
 /// its UPDATE matches no row, because a lock that silently stopped locking
 /// reintroduces the duplication this table exists to prevent.

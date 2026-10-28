@@ -222,14 +222,69 @@ def test_expiry_signatures_match_the_data_planes_wording():
     # gRPC unauthenticated, which is what puts that word in the client's error. A
     # verify site mapped to any other Status would break the match, so read them
     # out of the source rather than asserting the constant against itself.
-    service = (DATA_PLANE_SRC / "flight_service.rs").read_text()
+    service = "".join(
+        p.read_text()
+        for p in sorted((DATA_PLANE_SRC / "flight_service").glob("*.rs"))
+        if not p.stem.endswith("tests") and p.stem != "test_support"
+    )
     verify_calls = re.findall(
         r"auth::verify_\w+\([^;]*?\.map_err\(\|e\| Status::(\w+)\(", service, flags=re.DOTALL
     )
-    assert verify_calls, "no auth::verify_* -> Status mapping found in flight_service.rs"
+    assert verify_calls, "no auth::verify_* -> Status mapping found in flight_service/"
     assert set(verify_calls) == {"unauthenticated"}, (
         f"a ticket verification now maps to {sorted(set(verify_calls))}; the classifier's "
         f"{DATA_PLANE_TICKET_EXPIRED_SIGNATURES!r} match assumes every one is unauthenticated"
+    )
+    # The DoAction methods verify through `verify_action_payload` in mod.rs, which
+    # passes `auth::verify_*` as an argument and maps its error once. Read that
+    # mapping, and require every `<action>_action` method to verify either through
+    # the helper or by a direct `auth::verify_*` call the match above already read.
+    helper = re.search(r"fn verify_action_payload<.*?\n    \}\n", service, flags=re.DOTALL)
+    assert helper, "verify_action_payload not found in flight_service/"
+    helper_maps = re.findall(
+        r"verify\(&action\.body, &self\.flight_public_key\)\s*"
+        r"\.map_err\(\|e\| Status::(\w+)\(",
+        helper.group(0),
+    )
+    assert helper_maps == ["unauthenticated"], (
+        f"verify_action_payload now maps a failed verification to {helper_maps}; the "
+        f"classifier's {DATA_PLANE_TICKET_EXPIRED_SIGNATURES!r} match assumes unauthenticated"
+    )
+    bodies = dict(
+        re.findall(
+            r"    pub\(super\) async fn (\w+_action)\((.*?)\n    \}\n",
+            service,
+            flags=re.DOTALL,
+        )
+    )
+    assert bodies, "no <action>_action methods found in flight_service/"
+    # Fail closed on the method set: every method the dispatcher calls must be one
+    # the match above read, so a method it misses (another visibility, another
+    # indent) fails here instead of going unchecked.
+    dispatched = set(
+        re.findall(
+            r'"(\w+)" => self\.(\w+_action)\(',
+            (DATA_PLANE_SRC / "flight_service" / "mod.rs").read_text(),
+        )
+    )
+    assert dispatched, "no do_action dispatcher arms found in flight_service/mod.rs"
+    assert {method for _, method in dispatched} == set(bodies), (
+        f"dispatcher calls {sorted(m for _, m in dispatched)}, but the methods read are "
+        f"{sorted(bodies)}"
+    )
+    unchecked = [
+        name
+        for name, body in bodies.items()
+        if not re.search(r"self\s*\.verify_action_payload\(", body)
+        and not re.search(
+            r"auth::verify_\w+\([^;]*?\.map_err\(\|e\| Status::unauthenticated\(",
+            body,
+            flags=re.DOTALL,
+        )
+    ]
+    assert not unchecked, (
+        f"{unchecked} verify their token neither through verify_action_payload nor by an "
+        "auth::verify_* call mapped to unauthenticated"
     )
 
 

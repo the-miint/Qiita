@@ -85,7 +85,7 @@ qiita/
 │   └── src/
 │       ├── main.rs                 # tonic server entry, Flight service + gRPC health check registration
 │       ├── config.rs               # settings (DuckLake catalog DB URL, Flight public key)
-│       ├── flight_service.rs       # impl FlightService trait (do_get, do_put, do_action)
+│       ├── flight_service/         # impl FlightService trait (do_get, do_put, do_action)
 │       ├── auth.rs                 # Ed25519 Flight-ticket verification (public key)
 │       └── ducklake.rs             # DuckDB/DuckLake connection management, ducklake_add_data_files
 ├── qiita-compute-orchestrator/

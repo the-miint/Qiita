@@ -603,7 +603,7 @@ def test_workflow_declares_input_checks_optional_too():
 #     tests/test_block_read.py, on the shared rule both boundaries use;
 #   * the signed member/mask scope -> tests/routes/test_read_doget.py;
 #   * the member selector's row semantics (gap excluded, split sub-range exact)
-#     -> the block-read DoGet tests in qiita-data-plane/src/flight_service.rs.
+#     -> the block-read DoGet tests in qiita-data-plane/src/flight_service/query_tests.rs.
 #
 # The empty-block case changed MEANING and is worth stating: the masked block
 # export used to write a schema-correct 0-row parquet so an all-masked-out block

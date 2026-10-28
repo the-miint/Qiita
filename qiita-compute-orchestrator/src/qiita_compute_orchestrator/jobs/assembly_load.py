@@ -250,7 +250,7 @@ def _write_assembly_membership(
     which is the state of every run that predates the sidecar.
 
     This table is replace-keyed on (prep_sample_idx, processing_idx)
-    (flight_service::REPLACE_KEY_TABLES), so a re-run supersedes the run's rows
+    (flight_service::registration::REPLACE_KEY_TABLES), so a re-run supersedes the run's rows
     wholesale -- unlike the Postgres twin, which upserts and COALESCEs the four
     attributes. A replay with no sidecar therefore keeps them in Postgres and
     clears them here; Postgres is the authority for these columns."""

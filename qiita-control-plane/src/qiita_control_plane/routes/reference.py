@@ -876,7 +876,7 @@ async def delete_reference(
 
 
 # Tables that can appear in a DoGet ticket, CP-side mirror of the data plane's
-# ALLOWED_TABLES whitelist in flight_service.rs. Must stay in sync with it
+# ALLOWED_TABLES whitelist in flight_service/query.rs. Must stay in sync with it
 # (test_cp_doget_allowlist_matches_the_rust_one_exactly parses the Rust const and
 # fails on drift). Each non-reference entry below names the route that serves it.
 # The bare `read` / `read_mask` TABLES are deliberately absent from both
