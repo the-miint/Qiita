@@ -65,10 +65,33 @@ instance:
   the cores the data plane may use divided by (instances × `DUCKLAKE_POOL_SIZE`, default
   8).
 
-Each pooled connection also holds one backend on the catalog's Postgres for as long as
-it lives; count instances × pool size on every host, plus the control plane, against
-that server's `max_connections` (`DEFAULT_POOL_SIZE` in the same file says what it was
-chosen against).
+Each pooled connection also holds a backend on the catalog's Postgres; see
+[Catalog connections](#catalog-connections) before raising the instance count or
+`DUCKLAKE_POOL_SIZE`.
+
+## Catalog connections
+
+Every instance, on every host, names its catalog sessions
+`qiita-data-plane:<port>:pool=<pool size>`, and `verify-deploy`'s
+`catalog-connections` row reads those names back from the catalog server: the pools of
+every connected instance plus the other client sessions open now, against
+`max_connections` less the reserved slots. It passes with the numbers and one
+`<host>:<port> pool=<n>` line per instance, and fails when the total does not fit; what it
+counts, and why, is in `qiita_catalog_connection_budget` (`deploy/_common.sh`). An
+instance still running a build without the name counts only as the sessions it has open.
+
+The row queries as the data plane's catalog role, the `user=` in
+`DUCKLAKE_CATALOG_CONNSTR`, which needs `pg_read_all_stats` to see other roles'
+sessions; without it the row fails and names the grant. A superuser on the catalog server
+runs it once:
+
+```sql
+-- [admin] on the catalog server, as superuser
+GRANT pg_read_all_stats TO qiita_miint_lake_rw;
+```
+
+When the row fails on the total, lower `DUCKLAKE_POOL_SIZE` or the instance count, or
+raise `max_connections` on the catalog server (a Postgres restart).
 
 ## Fewer instances on this host
 

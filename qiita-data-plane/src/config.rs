@@ -16,8 +16,10 @@ pub struct Settings {
     /// this (publicly reachable) data plane only verifies, so it can never forge
     /// a ticket.
     pub flight_public_key: ed25519_dalek::VerifyingKey,
-    /// DuckLake catalog connection string (libpq format).
-    /// E.g., "dbname=qiita_ducklake host=localhost port=5432 user=qiita password=qiita"
+    /// DuckLake catalog connection string (libpq keyword=value format), as
+    /// `DUCKLAKE_CATALOG_CONNSTR` gives it plus this instance's `application_name`
+    /// (`ducklake::tag_catalog_connstr`). E.g.,
+    /// "dbname=qiita_ducklake host=localhost user=qiita application_name=qiita-data-plane:50051:pool=8"
     pub ducklake_catalog_connstr: String,
     /// Directory where DuckLake stores Parquet data files (system-of-record
     /// state). Derived as `PATH_PERSISTENT/ducklake`; `PATH_PERSISTENT` is a
@@ -56,10 +58,11 @@ pub struct Settings {
 /// Chosen, not measured: what is measured is the budget it is chosen against —
 /// each attached connection holds one lake-Postgres backend for as long as it
 /// lives (8 attached connections held 8 idle backends), against a
-/// `max_connections` of 100 with 3 superuser-reserved that the control plane
-/// draws on as well. Eight leaves that budget room for other data-plane
-/// processes and for the control plane; raise it with `DUCKLAKE_POOL_SIZE` where
-/// the budget allows, counting every process on every host against the same 97.
+/// `max_connections` of 100 with 3 superuser-reserved. Eight leaves that budget
+/// room for other data-plane processes; raise it with `DUCKLAKE_POOL_SIZE` where
+/// the budget allows. `make verify-deploy` adds up every instance's pool on every
+/// host against the catalog server's limit (`qiita_catalog_connection_budget` in
+/// `deploy/_common.sh`).
 pub(crate) const DEFAULT_POOL_SIZE: usize = 8;
 
 /// The pool divides half the detected ceiling, not all of it. Half is a choice;
@@ -353,6 +356,11 @@ impl Settings {
         let thread_budget = resources::detect_thread_budget();
 
         let size = parse_positive::<usize>("DUCKLAKE_POOL_SIZE")?.unwrap_or(DEFAULT_POOL_SIZE);
+        let ducklake_catalog_connstr = crate::ducklake::tag_catalog_connstr(
+            &ducklake_catalog_connstr,
+            listen_addr.port(),
+            size,
+        )?;
 
         // The CPU allowance divided by the in-flight bound, so a saturated
         // pool asks for the budget once rather than once per request. Measured

@@ -18,11 +18,12 @@
 #
 # Hatches, one per row: SKIP_HEALTH, SKIP_ACTIONS, SKIP_COMPUTE_READINESS,
 # SKIP_SLURM_PROBE, SKIP_CP_MIINT, SKIP_DP_POOL, SKIP_DP_UNITS,
-# SKIP_DP_MEMORY_MAX, SKIP_ENA_REACHABILITY, SKIP_PREFLIGHT (the
-# last passes through to preflight.sh). SKIP_ENA_REACHABILITY skips the
-# CONTROL-PLANE row only; its compute-node counterpart (probe/ena-from-compute)
-# rides the SLURM probe job and goes with SKIP_SLURM_PROBE, which also drops
-# native-import, the miint probes and shared-fs. See docs/runbooks/redeploy.md.
+# SKIP_DP_MEMORY_MAX, SKIP_CATALOG_CONNECTIONS, SKIP_ENA_REACHABILITY,
+# SKIP_PREFLIGHT (the last passes through to preflight.sh).
+# SKIP_ENA_REACHABILITY skips the CONTROL-PLANE row only; its compute-node
+# counterpart (probe/ena-from-compute) rides the SLURM probe job and goes with
+# SKIP_SLURM_PROBE, which also drops native-import, the miint probes and
+# shared-fs. See docs/runbooks/redeploy.md.
 
 set -euo pipefail
 
@@ -301,7 +302,22 @@ else
     fi
 fi
 
-# --- 4b. ENA reachability from the control plane (as qiita-api) -----------
+# --- 4b. Catalog connection budget ------------------------------------------
+# Every data-plane instance's pool, on every host, against the catalog server's
+# max_connections. What it counts and why: qiita_catalog_connection_budget in
+# _common.sh. Runs here as root with the data plane's catalog role, the way
+# activate.sh's idle wait does.
+if [ -n "${SKIP_CATALOG_CONNECTIONS:-}" ]; then
+    skip "catalog-connections" "SKIP_CATALOG_CONNECTIONS=1"
+elif [ ! -r "$DP_ENV" ]; then
+    skip "catalog-connections" "$DP_ENV absent (first deploy)"
+elif ! command -v psql >/dev/null 2>&1; then
+    skip "catalog-connections" "psql not on PATH"
+else
+    qiita_check_catalog_connection_budget "$DP_ENV"
+fi
+
+# --- 4c. ENA reachability from the control plane (as qiita-api) -----------
 # The control-plane half of the deploy's ENA egress check; the compute-node half
 # is the compute-readiness probe row `ena-from-compute`. Why the deploy asks at
 # all, and what a green row does and does not prove, is stated once on

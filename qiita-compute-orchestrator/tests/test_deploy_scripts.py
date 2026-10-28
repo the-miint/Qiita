@@ -2803,3 +2803,222 @@ def test_data_plane_unit_stop_timeout_covers_the_idle_wait() -> None:
     unit = (_DEPLOY / "systemd" / "qiita-data-plane@.service").read_text()
     assert re.search(r"(?m)^TimeoutStopSec=3900$", unit)
     assert "QIITA_DP_IDLE_WAIT_S:-3900}" in _COMMON.read_text()
+
+
+# --- catalog connection budget ---------------------------------------------------
+
+_DUCKLAKE_RS = _REPO_ROOT / "qiita-data-plane" / "src" / "ducklake.rs"
+
+
+def _budget(settings: str, rows: str) -> tuple[list[str], list[str]]:
+    """Run qiita_catalog_connection_budget on a settings row and backend rows, as
+    psql prints them. Returns the pass/fail rows and the detail lines under them."""
+    result = _run_common(
+        'n_pass=0 n_fail=0; qiita_catalog_connection_budget "$1" <<<"$2"; '
+        'echo "counts $n_pass $n_fail"',
+        settings,
+        rows,
+    )
+    assert result.returncode == 0, result.stderr
+    lines = result.stdout.splitlines()
+    assert lines[-1] in ("counts 1 0", "counts 0 1"), result.stdout
+    rows_out = [line for line in lines[:-1] if " catalog-connections: " in line]
+    assert len(rows_out) == 1, result.stdout
+    details = [line.strip() for line in lines[:-1] if line not in rows_out]
+    return rows_out, details
+
+
+def _passed(row: str) -> bool:
+    return row.lstrip().startswith("✓")
+
+
+def test_budget_counts_each_instance_once_at_its_pool_size() -> None:
+    """Two backends of one instance, under two roles, are one instance; a Unix-socket
+    session is `local`; an IPv6 address is bracketed; other clients count as they are."""
+    rows = "\n".join(
+        [
+            "10.0.0.5|3|dp|qiita-data-plane:50051:pool=8",
+            "10.0.0.5|1|dp_other|qiita-data-plane:50051:pool=8",
+            "10.0.0.5|1|dp|qiita-data-plane:50052:pool=8",
+            "10.0.0.6|2|dp|qiita-data-plane:50051:pool=6",
+            "local|1|dp|qiita-data-plane:50051:pool=4",
+            "::1|1|dp|qiita-data-plane:50053:pool=2",
+            "10.0.0.9|3|admin|psql",
+            "10.0.0.9|2|dp|",
+        ]
+    )
+    (row,), details = _budget("100|3|0|t|dp", rows)
+    assert _passed(row), row
+    assert "5 data-plane instance(s), pools 28 + 5 other client backend(s) = 33 of 97" in row
+    assert details == [
+        "10.0.0.5:50051 pool=8",
+        "10.0.0.5:50052 pool=8",
+        "10.0.0.6:50051 pool=6",
+        "local:50051 pool=4",
+        "[::1]:50053 pool=2",
+        "other: 10.0.0.9 user=admin application_name=psql x3",
+        "other: 10.0.0.9 user=dp application_name=(none) x2",
+    ]
+
+
+@pytest.mark.parametrize(("other", "passes"), [(5, True), (6, False)])
+def test_budget_fails_past_max_connections_less_the_reserved(other: int, passes: bool) -> None:
+    """20 − 3 superuser-reserved − 2 reserved leaves 15: pools 10 plus 5 others fit,
+    plus 6 do not."""
+    rows = f"10.0.0.5|1|dp|qiita-data-plane:50051:pool=10\n10.0.0.9|{other}|admin|psql"
+    (row,), _ = _budget("20|3|2|t|dp", rows)
+    assert _passed(row) is passes, row
+    assert f"= {10 + other} of 15 (max_connections 20" in row
+
+
+def test_budget_fails_without_pg_read_all_stats() -> None:
+    (row,), details = _budget(
+        "100|3|0|f|lake_rw", "10.0.0.5|1|lake_rw|qiita-data-plane:50051:pool=8"
+    )
+    assert not _passed(row), row
+    assert "GRANT pg_read_all_stats TO lake_rw;" in row
+    assert details == []
+
+
+def test_budget_fails_on_a_data_plane_session_without_a_client_address() -> None:
+    (row,), _ = _budget("100|3|0|t|lake_rw", "|1|lake_rw|qiita-data-plane:50051:pool=8")
+    assert not _passed(row), row
+    assert "grant pg_read_all_stats to role 'lake_rw'" in row
+
+
+@pytest.mark.parametrize(
+    "name", ["qiita-data-plane:50051", "qiita-data-plane:x:pool=8", "qiita-data-plane:50051:pool="]
+)
+def test_budget_fails_on_a_name_it_cannot_read(name: str) -> None:
+    (row,), _ = _budget("100|3|0|t|dp", f"10.0.0.5|1|dp|{name}")
+    assert not _passed(row), row
+    assert f"application_name '{name}'" in row
+
+
+def test_budget_fails_when_no_instance_is_connected() -> None:
+    (row,), details = _budget("100|3|0|t|dp", "10.0.0.9|2|admin|psql")
+    assert not _passed(row), row
+    assert "no catalog session is named" in row
+    assert details == ["other: 10.0.0.9 user=admin application_name=psql x2"]
+
+
+@pytest.mark.parametrize("settings", ["", "100|3||t|dp", "lots|3|0|t|dp"])
+def test_budget_fails_on_a_settings_row_it_cannot_read(settings: str) -> None:
+    (row,), _ = _budget(settings, "10.0.0.5|1|dp|qiita-data-plane:50051:pool=8")
+    assert not _passed(row), row
+    assert "unexpected settings row" in row
+
+
+def test_budget_reads_the_name_the_data_plane_writes() -> None:
+    """catalog_application_name's format, filled in, is a name the budget counts."""
+    match = re.search(
+        r"fn catalog_application_name\(port: u16, pool_size: usize\) -> String \{\s*"
+        r'format!\("([^"]+)"\)',
+        _DUCKLAKE_RS.read_text(),
+    )
+    assert match, f"catalog_application_name not found in {_DUCKLAKE_RS}"
+    name = match.group(1).replace("{port}", "50057").replace("{pool_size}", "13")
+    (row,), details = _budget("100|3|0|t|dp", f"10.0.0.5|1|dp|{name}")
+    assert _passed(row), row
+    assert details == ["10.0.0.5:50057 pool=13"]
+
+
+def _run_budget_check(
+    tmp_path: Path, *, fail_on: str = ""
+) -> tuple[subprocess.CompletedProcess[str], list[str]]:
+    """Run qiita_check_catalog_connection_budget with `psql` stubbed: it answers the
+    settings query and the backends query with one row each, records its argv and
+    PGPASSFILE, and exits 2 when its argv contains `fail_on`."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    calls = tmp_path / "psql-calls"
+    (bin_dir / "psql").write_text(
+        "#!/bin/sh\n"
+        'argv=$(printf %s "$*" | tr "\\n" " ")\n'
+        f'printf "%s|PGPASSFILE=%s\\n" "$argv" "$PGPASSFILE" >> "{calls}"\n'
+        f'if [ -n "{fail_on}" ]; then case "$argv" in *"{fail_on}"*)\n'
+        '  echo "psql: boom" >&2; exit 2 ;; esac; fi\n'
+        'case "$argv" in\n'
+        "  *max_connections*) echo '100|3|0|t|lake_rw' ;;\n"
+        "  *) echo '10.0.0.5|2|lake_rw|qiita-data-plane:50051:pool=8' ;;\n"
+        "esac\n"
+    )
+    (bin_dir / "psql").chmod(0o755)
+    env_path = tmp_path / "data-plane.env"
+    env_path.write_text(
+        "DUCKLAKE_CATALOG_CONNSTR='dbname=lake host=db user=lake_rw password=s3cr3t'\n"
+    )
+    proc = subprocess.run(
+        [
+            "bash",
+            "-c",
+            f'set -euo pipefail; source "{_COMMON}"; n_pass=0 n_fail=0; '
+            f'qiita_check_catalog_connection_budget "{env_path}"; echo "counts $n_pass $n_fail"',
+        ],
+        env={**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"},
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    lines = calls.read_text().splitlines() if calls.exists() else []
+    return proc, lines
+
+
+def test_budget_check_queries_the_catalog_with_the_password_off_argv(tmp_path: Path) -> None:
+    proc, calls = _run_budget_check(tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    assert "counts 1 0" in proc.stdout, proc.stdout
+    assert "10.0.0.5:50051 pool=8" in proc.stdout
+    assert len(calls) == 2
+    for call in calls:
+        argv, pgpassfile = call.split("|PGPASSFILE=")
+        assert "s3cr3t" not in argv
+        assert "user=lake_rw" in argv
+        assert pgpassfile, "psql ran without a PGPASSFILE"
+
+
+@pytest.mark.parametrize("fail_on", ["max_connections", "pg_stat_activity"])
+def test_budget_check_fails_the_row_when_a_query_fails(tmp_path: Path, fail_on: str) -> None:
+    proc, _calls = _run_budget_check(tmp_path, fail_on=fail_on)
+    assert proc.returncode == 0, proc.stderr
+    assert "counts 0 1" in proc.stdout, proc.stdout
+    assert "cannot query the catalog server: psql: boom" in proc.stdout
+
+
+def test_verify_runs_the_budget_against_the_data_plane_env() -> None:
+    verify = (_DEPLOY / "verify.sh").read_text()
+    assert re.search(r'(?m)^    qiita_check_catalog_connection_budget "\$DP_ENV"$', verify)
+
+
+def _preflight_connstr_row(tmp_path: Path, connstr: str) -> str:
+    """The connstr/ducklake row of a preflight run whose only env file is data-plane.env."""
+    env = {k: v for k, v in os.environ.items() if k not in _TOPOLOGY_VARS}
+    env.update(
+        CP_ENV=str(tmp_path / "absent-cp.env"),
+        CO_ENV=str(tmp_path / "absent-co.env"),
+        DP_ENV=str(_dp_env(tmp_path, f"DUCKLAKE_CATALOG_CONNSTR='{connstr}'\n")),
+    )
+    env.pop("SKIP_PREFLIGHT", None)
+    result = subprocess.run(
+        ["bash", str(_DEPLOY / "preflight.sh")], capture_output=True, text=True, env=env
+    )
+    rows = [line for line in result.stdout.splitlines() if " connstr/ducklake: " in line]
+    assert len(rows) == 1, result.stdout + result.stderr
+    return rows[0]
+
+
+@pytest.mark.parametrize(
+    "connstr",
+    ["dbname=lake host=db application_name=mine", "application_name = mine dbname=lake host=db"],
+)
+def test_preflight_refuses_a_catalog_connstr_that_names_the_session(
+    tmp_path: Path, connstr: str
+) -> None:
+    row = _preflight_connstr_row(tmp_path, connstr)
+    assert not _passed(row), row
+    assert "sets application_name" in row
+
+
+def test_preflight_accepts_fallback_application_name(tmp_path: Path) -> None:
+    row = _preflight_connstr_row(tmp_path, "dbname=lake host=db fallback_application_name=x")
+    assert _passed(row), row

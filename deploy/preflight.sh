@@ -222,7 +222,11 @@ else
 fi
 if [ -r "$DP_ENV" ]; then
     connstr=$(read_env_var "$DP_ENV" DUCKLAKE_CATALOG_CONNSTR)
-    if [[ "$connstr" == *dbname=* && "$connstr" == *host=* ]]; then
+    if [[ "$connstr" =~ (^|[[:space:]])application_name[[:space:]]*= ]]; then
+        # The data plane refuses to boot on it (tag_catalog_connstr in
+        # qiita-data-plane/src/ducklake.rs).
+        fail "connstr/ducklake" "DUCKLAKE_CATALOG_CONNSTR sets application_name; remove it, the data plane names its catalog sessions itself"
+    elif [[ "$connstr" == *dbname=* && "$connstr" == *host=* ]]; then
         pass "connstr/ducklake" "libpq dbname=/host= keywords present"
     else
         fail "connstr/ducklake" "DUCKLAKE_CATALOG_CONNSTR missing libpq dbname=/host= keywords"

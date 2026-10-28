@@ -16,10 +16,11 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
 ### 1. Env vars — set BEFORE the deploy (most are `from_env()` fail-fast; a missing one keeps the unit down)
 
 - `[admin]` (#TBD) Only if `/etc/qiita/data-plane.env` sets `DUCKDB_TEMP_DIRECTORY` without `DUCKDB_MAX_TEMP_DIRECTORY_SIZE`: the per-connection spill cap is now derived at boot as that filesystem's free space ÷ local instances ÷ `DUCKLAKE_POOL_SIZE`, so together the connections may fill it, and the data plane refuses to boot if that comes out under `MIN_DERIVED_SPILL_MIB` (`qiita-data-plane/src/config.rs`) — hence before the restart. To keep today's cap: `sudo bash -c 'grep -q "^DUCKDB_MAX_TEMP_DIRECTORY_SIZE=" /etc/qiita/data-plane.env || printf "\nDUCKDB_MAX_TEMP_DIRECTORY_SIZE=4GiB\n" >> /etc/qiita/data-plane.env'`.
+- `[admin]` (#TBD) Only if `DUCKLAKE_CATALOG_CONNSTR` in `/etc/qiita/data-plane.env` sets `application_name`: remove it, or the data plane refuses to boot (`sudo make preflight` fails `connstr/ducklake` on it).
 
 ### 2. One-time host setup
 
-_None yet._
+- `[admin]` (#TBD) On the catalog's Postgres server, as superuser: `GRANT pg_read_all_stats TO <role>;`, where `<role>` is the `user=` in `DUCKLAKE_CATALOG_CONNSTR` (`qiita_miint_lake_rw` per `first-deploy.md`). `verify-deploy`'s `catalog-connections` row fails without it ([`data-plane-scaling.md` § Catalog connections](docs/runbooks/data-plane-scaling.md#catalog-connections)).
 
 ### 3. Migrations
 
@@ -51,8 +52,11 @@ _None yet._
   not running this host's deployed commit (`BUILD_COMMIT` in
   `/opt/qiita/data-plane/build.env`, which the deploy writes);
   `dp-memory-max/qiita-data-plane@<port>` (#TBD) fails when a unit's `MemoryMax` differs
-  from `QIITA_DATA_PLANE_INSTANCE_MEMORY_MAX`, and is skipped when that key is unset. A
-  host running only `qiita-data-plane@50051` is unaffected.
+  from `QIITA_DATA_PLANE_INSTANCE_MEMORY_MAX`, and is skipped when that key is unset;
+  `catalog-connections` (#TBD) lists every connected instance as `<host>:<port> pool=<n>`
+  and fails when their pools plus the other catalog sessions exceed the catalog server's
+  `max_connections` less its reserved slots, or when the bucket-2 grant is missing. Apart
+  from `catalog-connections`, a host running only `qiita-data-plane@50051` is unaffected.
 
 ### 6. After the deploy verifies green
 

@@ -145,6 +145,82 @@ pub fn connect_ducklake(
     Ok(())
 }
 
+/// The libpq `application_name` an instance gives every connection it opens to the
+/// catalog. `qiita_catalog_connection_budget` in `deploy/_common.sh` parses it out of
+/// the catalog server's `pg_stat_activity` and adds up the pool sizes against
+/// `max_connections`; `test_deploy_scripts.py` feeds this format to that parser.
+/// Unquoted with no spaces: a quoted value closes the ATTACH string literal.
+fn catalog_application_name(port: u16, pool_size: usize) -> String {
+    format!("qiita-data-plane:{port}:pool={pool_size}")
+}
+
+/// `catalog_connstr` with this instance's `catalog_application_name` appended, for
+/// every catalog connection the process opens (`setup_catalog` and the pool).
+///
+/// The connection string must be libpq's `keyword=value` form, which preflight
+/// already requires of it, and must not set `application_name` itself: the
+/// instance's own name is what the connection budget check reads, so a
+/// connection string that names the session otherwise fails boot rather than
+/// leaving libpq to pick one of the two.
+pub(crate) fn tag_catalog_connstr(
+    catalog_connstr: &str,
+    port: u16,
+    pool_size: usize,
+) -> Result<String, String> {
+    validate_sql_literal(catalog_connstr, "DUCKLAKE_CATALOG_CONNSTR")?;
+    if catalog_connstr.starts_with("postgres://") || catalog_connstr.starts_with("postgresql://") {
+        return Err(
+            "DUCKLAKE_CATALOG_CONNSTR must be a libpq keyword=value string, not a URI".to_string(),
+        );
+    }
+    if libpq_keywords(catalog_connstr)?
+        .iter()
+        .any(|k| k == "application_name")
+    {
+        return Err(format!(
+            "DUCKLAKE_CATALOG_CONNSTR sets application_name; remove it — the data plane \
+             names its catalog connections {}",
+            catalog_application_name(port, pool_size)
+        ));
+    }
+    Ok(format!(
+        "{} application_name={}",
+        catalog_connstr.trim_end(),
+        catalog_application_name(port, pool_size)
+    ))
+}
+
+/// The keywords of a libpq `keyword=value` connection string: whitespace between
+/// settings, optional whitespace around `=`, a backslash escaping the next
+/// character of a value. Quoted values are not handled because
+/// `validate_sql_literal` has already refused any single quote.
+fn libpq_keywords(connstr: &str) -> Result<Vec<String>, String> {
+    let malformed = |why: &str| format!("DUCKLAKE_CATALOG_CONNSTR is not keyword=value: {why}");
+    let mut keywords = Vec::new();
+    let mut chars = connstr.chars().peekable();
+    loop {
+        while chars.next_if(|c| c.is_whitespace()).is_some() {}
+        if chars.peek().is_none() {
+            return Ok(keywords);
+        }
+        let mut keyword = String::new();
+        while let Some(c) = chars.next_if(|c| !c.is_whitespace() && *c != '=') {
+            keyword.push(c);
+        }
+        while chars.next_if(|c| c.is_whitespace()).is_some() {}
+        if chars.next() != Some('=') || keyword.is_empty() {
+            return Err(malformed(&format!("no `=` after {keyword:?}")));
+        }
+        while chars.next_if(|c| c.is_whitespace()).is_some() {}
+        while let Some(c) = chars.next_if(|c| !c.is_whitespace()) {
+            if c == '\\' && chars.next().is_none() {
+                return Err(malformed("it ends in a backslash"));
+            }
+        }
+        keywords.push(keyword);
+    }
+}
+
 /// The zstd level for data at rest: a copy of
 /// `qiita_common.parquet.PARQUET_COMPRESSION_LEVEL_AT_REST`, which carries the
 /// measurements behind it. Rust cannot import the Python, so a qiita-common test parses
@@ -2070,6 +2146,132 @@ mod tests {
         let conn = Connection::open_in_memory().expect("open in-memory DuckDB");
         let result = connect_ducklake(&conn, "dbname=test", "/tmp/it's bad");
         assert!(result.is_err());
+    }
+
+    // --- The catalog connections' application_name ----------------------
+
+    #[test]
+    fn tagged_connstr_appends_the_instance_application_name() {
+        let tagged = tag_catalog_connstr("dbname=lake host=db user=dp ", 50052, 6).unwrap();
+        assert_eq!(
+            tagged,
+            "dbname=lake host=db user=dp application_name=qiita-data-plane:50052:pool=6"
+        );
+    }
+
+    #[test]
+    fn tagged_connstr_refuses_a_connstr_that_sets_application_name() {
+        for connstr in [
+            "dbname=lake application_name=mine",
+            "application_name = mine dbname=lake",
+            "dbname=lake\tapplication_name=",
+        ] {
+            let err = tag_catalog_connstr(connstr, 50051, 8).unwrap_err();
+            assert!(
+                err.contains("sets application_name"),
+                "{connstr:?} -> {err}"
+            );
+        }
+    }
+
+    /// The keyword match is on keywords, not on text: a value or another keyword
+    /// containing the string is not a second application_name.
+    #[test]
+    fn tagged_connstr_accepts_application_name_inside_a_value() {
+        for connstr in [
+            "dbname=application_name host=db",
+            "fallback_application_name=x dbname=lake",
+            r"password=a\ application_name=b dbname=lake",
+        ] {
+            assert!(
+                tag_catalog_connstr(connstr, 50051, 8).is_ok(),
+                "{connstr:?} was refused"
+            );
+        }
+    }
+
+    #[test]
+    fn tagged_connstr_refuses_what_is_not_keyword_value() {
+        for connstr in [
+            "postgresql://dp@db/lake?sslmode=require",
+            "postgres://dp@db/lake?sslmode=require",
+            "dbname",
+            "=lake",
+            r"dbname=lake\",
+        ] {
+            assert!(
+                tag_catalog_connstr(connstr, 50051, 8).is_err(),
+                "{connstr:?} was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn tagged_connstr_refuses_sql_metacharacters() {
+        let err = tag_catalog_connstr("dbname=lake'", 50051, 8).unwrap_err();
+        assert!(err.contains("disallowed"), "{err}");
+    }
+
+    /// Both kinds of catalog connection — the setup lock's `TYPE postgres` attach
+    /// and the DuckLake attach — reach the catalog server under the tagged name.
+    #[test]
+    #[serial]
+    #[cfg(feature = "integration")]
+    fn catalog_connections_carry_the_instance_application_name() {
+        // A port no other test uses, so the count below is this test's sessions.
+        let port = 1 + (std::process::id() % 60000) as u16;
+        let base = crate::test_catalog::connstr();
+        let data_path = crate::test_catalog::data_path();
+
+        let observer = Connection::open_in_memory().unwrap();
+        observer
+            .execute_batch(&format!(
+                "LOAD postgres; ATTACH '{base}' AS observer (TYPE postgres);"
+            ))
+            .unwrap();
+        // Sessions under the name `pool_size` gives; each attach below uses its own
+        // pool size, so a session the other one leaves closing is not counted.
+        let sessions = |pool_size: usize| -> i64 {
+            let name = catalog_application_name(port, pool_size);
+            observer
+                .query_row(
+                    &format!(
+                        "SELECT n FROM postgres_query('observer', \
+                         'SELECT count(*) AS n FROM pg_stat_activity \
+                          WHERE application_name = ''{name}''')"
+                    ),
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+
+        assert_eq!(sessions(3), 0);
+        let lock = Connection::open_in_memory().unwrap();
+        lock.execute_batch(&format!(
+            "LOAD postgres; ATTACH '{}' AS tagged_lock (TYPE postgres); BEGIN;",
+            tag_catalog_connstr(&base, port, 3).unwrap()
+        ))
+        .unwrap();
+        let _: bool = lock
+            .query_row(
+                "SELECT t FROM postgres_query('tagged_lock', 'SELECT true AS t')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(sessions(3), 1, "the TYPE postgres attach");
+        lock.execute_batch("COMMIT;").unwrap();
+
+        assert_eq!(sessions(4), 0);
+        let lake = Connection::open_in_memory().unwrap();
+        connect_ducklake(
+            &lake,
+            &tag_catalog_connstr(&base, port, 4).unwrap(),
+            &data_path,
+        )
+        .unwrap();
+        assert!(sessions(4) >= 1, "the DuckLake attach");
     }
 
     // --- What DuckDB hands the Flight encoder ---------------------------

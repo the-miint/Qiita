@@ -263,7 +263,10 @@ mod tests {
                 .decode(&pubkey)
                 .unwrap()
         );
-        assert_eq!(cfg.ducklake_catalog_connstr, "dbname=test host=localhost");
+        assert_eq!(
+            cfg.ducklake_catalog_connstr,
+            "dbname=test host=localhost application_name=qiita-data-plane:50051:pool=8"
+        );
         // Leaf paths are derived from the base roots with fixed suffixes.
         assert_eq!(
             cfg.path_scratch_staging,

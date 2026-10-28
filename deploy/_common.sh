@@ -1296,3 +1296,124 @@ wait_for_data_plane_idle() {
         done
     )
 }
+
+# --- Catalog connection budget ------------------------------------------------
+# Every data-plane instance, on every host, holds up to its pool size of backends
+# on the catalog's Postgres (DEFAULT_POOL_SIZE in qiita-data-plane/src/config.rs),
+# and builds them as requests arrive, so the backends connected now undercount
+# what the pools may open. Each instance therefore names its catalog sessions
+# `qiita-data-plane:<listen port>:pool=<pool size>` (catalog_application_name in
+# qiita-data-plane/src/ducklake.rs), and this check reads the pool sizes back from
+# the catalog server's pg_stat_activity: an instance is one (client address,
+# application_name) pair, however many of its backends are open. It fails when
+#   Σ pool sizes + the other client backends connected now
+#     > max_connections − superuser_reserved_connections − reserved_connections,
+# the slots a role without those privileges can take. Other backends — lake-gc,
+# lake-shell, a data plane still on a build without the name — count as they are
+# now, not at their peak.
+#
+# The query connects with the data plane's own role, the user= in
+# DUCKLAKE_CATALOG_CONNSTR. Postgres shows a role the client_addr and
+# backend_type of another role's sessions only with pg_read_all_stats (without
+# it both are NULL), so the check fails rather than undercount when the role
+# lacks it. A Unix-socket session has no client_addr; its client_port is -1, and
+# it is labelled `local`.
+
+QIITA_CATALOG_SETTINGS_SQL="SELECT current_setting('max_connections'),
+    current_setting('superuser_reserved_connections'),
+    coalesce(current_setting('reserved_connections', true), '0'),
+    pg_has_role('pg_read_all_stats', 'USAGE'), current_user"
+QIITA_CATALOG_BACKENDS_SQL="SELECT
+    coalesce(host(client_addr), CASE WHEN client_port = -1 THEN 'local' END, ''),
+    count(*), coalesce(usename, ''), coalesce(application_name, '')
+  FROM pg_stat_activity
+  WHERE backend_type = 'client backend' AND pid <> pg_backend_pid()
+  GROUP BY 1, 3, 4 ORDER BY 1, 4"
+
+# Run one query against the catalog named by env file `$1`, printing psql's
+# unaligned `|`-separated rows. A subshell, so qiita_pgpass_init's EXIT trap
+# removes the pgpass when the query ends; the password reaches libpq through that
+# file, not psql's argv (see qiita_split_conn_password). $2 = the SQL.
+qiita_catalog_psql() (
+    local conn user password
+    IFS=$'\t' read -r conn user password \
+        < <(qiita_split_conn_password "$(read_env_var "$1" DUCKLAKE_CATALOG_CONNSTR)")
+    qiita_pgpass_init "qiita-catalog"
+    [ -z "$password" ] || qiita_pgpass_add "$user" "$password"
+    PGPASSFILE="$PGPASS_FILE" psql "$conn" -XAtq -F '|' -v ON_ERROR_STOP=1 -c "$2"
+)
+
+# The budget arithmetic over the two queries' output, as pass/fail rows named
+# `catalog-connections`, followed by one line per instance and per other client.
+# Pure (rows in, rows out) so the unit tests can feed it psql output.
+# $1 = the QIITA_CATALOG_SETTINGS_SQL row; stdin = the QIITA_CATALOG_BACKENDS_SQL rows.
+qiita_catalog_connection_budget() {
+    local max su reserved has_stats role
+    IFS='|' read -r max su reserved has_stats role <<<"$1"
+    local n
+    for n in "$max" "$su" "$reserved"; do
+        case $n in
+            '' | *[!0-9]*)
+                fail "catalog-connections" "unexpected settings row from the catalog server: '$1'"
+                return 0
+                ;;
+        esac
+    done
+    if [ "$has_stats" != t ]; then
+        fail "catalog-connections" "role '$role' cannot see other roles' sessions on the catalog server; an admin there runs: GRANT pg_read_all_stats TO $role; (see docs/runbooks/data-plane-scaling.md)"
+        return 0
+    fi
+    local host count usename appname port pool label
+    local instances="" seen=$'\n' others="" n_instances=0 pools=0 n_others=0 bad=""
+    while IFS='|' read -r host count usename appname; do
+        [ -n "$host$count" ] || continue
+        if [[ "$appname" == qiita-data-plane:* ]]; then
+            if [[ ! "$appname" =~ ^qiita-data-plane:([0-9]+):pool=([0-9]+)$ ]]; then
+                bad+="application_name '$appname' from ${host:-an unknown address} is not qiita-data-plane:<port>:pool=<n>; "
+                continue
+            fi
+            port=${BASH_REMATCH[1]} pool=$((10#${BASH_REMATCH[2]}))
+            if [ -z "$host" ]; then
+                bad+="no client address for '$appname' — grant pg_read_all_stats to role '$role'; "
+                continue
+            fi
+            case $seen in *$'\n'"$host $appname"$'\n'*) continue ;; esac
+            seen+="$host $appname"$'\n'
+            [[ "$host" == *:* ]] && label="[$host]:$port" || label="$host:$port"
+            instances+="    $label pool=$pool"$'\n'
+            n_instances=$((n_instances + 1))
+            pools=$((pools + pool))
+        else
+            others+="    other: ${host:-?} user=${usename:-?} application_name=${appname:-(none)} x$count"$'\n'
+            n_others=$((n_others + count))
+        fi
+    done
+    local available=$((max - su - reserved))
+    local demand=$((pools + n_others))
+    local numbers="$n_instances data-plane instance(s), pools $pools + $n_others other client backend(s) = $demand of $available (max_connections $max - superuser_reserved_connections $su - reserved_connections $reserved)"
+    if [ -n "$bad" ]; then
+        fail "catalog-connections" "${bad%; }"
+    elif [ "$n_instances" -eq 0 ]; then
+        fail "catalog-connections" "no catalog session is named qiita-data-plane:<port>:pool=<n> — no instance on this build is connected; $numbers"
+    elif [ "$demand" -gt "$available" ]; then
+        fail "catalog-connections" "$numbers — lower DUCKLAKE_POOL_SIZE or the instance count, or raise max_connections on the catalog server"
+    else
+        pass "catalog-connections" "$numbers"
+    fi
+    printf '%s%s' "$instances" "$others"
+}
+
+# The verify-deploy row: both queries against the catalog in env file `$1`, then
+# the budget. A query failure fails the row with psql's message.
+qiita_check_catalog_connection_budget() {
+    local env_file=$1 settings backends
+    if ! settings=$(qiita_catalog_psql "$env_file" "$QIITA_CATALOG_SETTINGS_SQL" 2>&1); then
+        fail "catalog-connections" "cannot query the catalog server: $settings"
+        return 0
+    fi
+    if ! backends=$(qiita_catalog_psql "$env_file" "$QIITA_CATALOG_BACKENDS_SQL" 2>&1); then
+        fail "catalog-connections" "cannot query the catalog server: $backends"
+        return 0
+    fi
+    qiita_catalog_connection_budget "$settings" <<<"$backends"
+}
