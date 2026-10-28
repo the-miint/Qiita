@@ -243,6 +243,8 @@ if [ -r "$DP_ENV" ]; then
         fail "dp-memory-max" "$dp_err"
     elif [ -z "$dp_memory_max" ]; then
         skip "dp-memory-max" "QIITA_DATA_PLANE_INSTANCE_MEMORY_MAX unset — no per-instance limit"
+    elif ! dp_err=$(qiita_assert_pool_memory_fits "$dp_memory_max" 2>&1); then
+        fail "dp-memory-max" "$dp_err"
     elif ! dp_err=$(qiita_assert_instance_memory_fits "$dp_ports" "$dp_memory_max" 2>&1); then
         fail "dp-memory-max" "$dp_err"
     else

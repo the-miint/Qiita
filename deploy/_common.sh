@@ -722,6 +722,95 @@ qiita_assert_instance_memory_fits() {
     fi
 }
 
+# The data plane's connection pool size when DUCKLAKE_POOL_SIZE is unset:
+# DEFAULT_POOL_SIZE in qiita-data-plane/src/config.rs.
+QIITA_DATA_PLANE_DEFAULT_POOL_SIZE=8
+
+# DUCKLAKE_POOL_SIZE in $DP_ENV, else QIITA_DATA_PLANE_DEFAULT_POOL_SIZE. Blank,
+# surrounding whitespace included, reads as unset, as in the data plane; anything
+# but a positive integer fails.
+qiita_data_plane_pool_size() {
+    local value=""
+    qiita_dp_env_parses || return 1
+    if [ -r "$DP_ENV" ]; then
+        value=$(read_env_file_var "$DP_ENV" DUCKLAKE_POOL_SIZE)
+    fi
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    if [ -z "$value" ]; then
+        printf '%s' "$QIITA_DATA_PLANE_DEFAULT_POOL_SIZE"
+        return 0
+    fi
+    if ! [[ $value =~ ^[0-9]{1,18}$ ]] || [ $((10#$value)) -lt 1 ]; then
+        echo "ERROR: DUCKLAKE_POOL_SIZE '$value' in $DP_ENV is not a positive integer" >&2
+        return 1
+    fi
+    printf '%s' $((10#$value))
+}
+
+# A DUCKDB_MEMORY_LIMIT as bytes, for the spellings the deploy compares: a
+# positive integer without a leading zero, then B; KB, MB, GB or TB (powers of
+# 1000); or KiB, MiB, GiB or TiB (powers of 1024), the unit in any letter case.
+# DuckDB accepts more than this (a decimal, a space before the unit, a bare G).
+# Anything else, including a value past 2^62 bytes, fails with nothing printed.
+qiita_duckdb_size_bytes() {
+    local value="$1" n mult
+    [[ $value =~ ^([1-9][0-9]{0,17})([A-Za-z]{1,3})$ ]] || return 1
+    n=${BASH_REMATCH[1]}
+    case ${BASH_REMATCH[2]} in
+        [Bb])         mult=1 ;;
+        [Kk][Bb])     mult=1000 ;;
+        [Mm][Bb])     mult=$((1000 ** 2)) ;;
+        [Gg][Bb])     mult=$((1000 ** 3)) ;;
+        [Tt][Bb])     mult=$((1000 ** 4)) ;;
+        [Kk][Ii][Bb]) mult=1024 ;;
+        [Mm][Ii][Bb]) mult=$((1024 ** 2)) ;;
+        [Gg][Ii][Bb]) mult=$((1024 ** 3)) ;;
+        [Tt][Ii][Bb]) mult=$((1024 ** 4)) ;;
+        *) return 1 ;;
+    esac
+    [ "$n" -le $(((1 << 62) / mult)) ] || return 1
+    printf '%s' $((n * mult))
+}
+
+# Fails when DUCKDB_MEMORY_LIMIT in $DP_ENV, times the pool size
+# (qiita_data_plane_pool_size), exceeds the instance's MemoryMax=. DuckDB applies
+# the limit to each pooled connection, and memory.max bounds the whole process, so
+# such a pool may account for more memory than its cgroup allows it to hold.
+# $1 = the validated QIITA_DATA_PLANE_INSTANCE_MEMORY_MAX (empty: nothing to check).
+# A blank or unset DUCKDB_MEMORY_LIMIT has nothing to check: the data plane then
+# derives each connection's limit from memory.max (derived_share_mib in
+# qiita-data-plane/src/config.rs).
+qiita_assert_pool_memory_fits() {
+    local value="$1" limit max_bytes limit_bytes pool
+    [ -n "$value" ] || return 0
+    qiita_dp_env_parses || return 1
+    [ -r "$DP_ENV" ] || return 0
+    limit=$(read_env_file_var "$DP_ENV" DUCKDB_MEMORY_LIMIT)
+    [[ $limit =~ [^[:space:]] ]] || return 0
+    max_bytes=$(qiita_size_bytes "$value") || {
+        echo "ERROR: '$value' is not a systemd size" >&2
+        return 1
+    }
+    limit_bytes=$(qiita_duckdb_size_bytes "$limit") || {
+        echo "ERROR: DUCKDB_MEMORY_LIMIT '$limit' in $DP_ENV is not a spelling the deploy can" \
+             "compare with QIITA_DATA_PLANE_INSTANCE_MEMORY_MAX. It accepts a positive integer" \
+             "followed by B; KB, MB, GB or TB (powers of 1000); or KiB, MiB, GiB or TiB (powers" \
+             "of 1024), in any letter case. Rewrite it, or unset it so the data plane derives" \
+             "each connection's limit from the instance's MemoryMax" >&2
+        return 1
+    }
+    pool=$(qiita_data_plane_pool_size) || return 1
+    # pool × limit > max exactly when limit > floor(max / pool), for integers; the
+    # product itself could overflow.
+    if [ "$limit_bytes" -gt $((max_bytes / pool)) ]; then
+        echo "ERROR: a pool of $pool connection(s) × DUCKDB_MEMORY_LIMIT=$limit exceeds" \
+             "QIITA_DATA_PLANE_INSTANCE_MEMORY_MAX=$value ($DP_ENV). Unset DUCKDB_MEMORY_LIMIT:" \
+             "the data plane then derives each connection's limit from the instance's MemoryMax" >&2
+        return 1
+    fi
+}
+
 # The drop-in qiita_write_data_plane_dropins writes for each instance. $1 = the
 # number of local instances, $2 = the MemoryMax= value, or empty for none.
 qiita_data_plane_dropin_content() {

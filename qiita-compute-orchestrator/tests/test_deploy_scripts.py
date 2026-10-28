@@ -120,14 +120,16 @@ def _fake_native_checkout(tmp_path: Path) -> Path:
     return py
 
 
-# The data-plane topology variables. Removed from every topology test's environment
-# so the caller's shell cannot reach the helpers under test.
+# The data-plane.env keys the deploy reads. Removed from every topology test's
+# environment so the caller's shell cannot reach the helpers under test.
 _TOPOLOGY_VARS = (
     "QIITA_DATA_PLANE_PORTS",
     "QIITA_DATA_PLANE_PEERS",
     "QIITA_DATA_PLANE_BIND_HOST",
     "QIITA_DATA_PLANE_INSTANCE_MEMORY_MAX",
     "QIITA_DATA_PLANE_LOCAL_INSTANCES",
+    "DUCKDB_MEMORY_LIMIT",
+    "DUCKLAKE_POOL_SIZE",
 )
 _ABSENT_DP_ENV = "/nonexistent/qiita/data-plane.env"
 
@@ -894,6 +896,7 @@ def test_activate_validates_data_plane_settings_before_installing_anything() -> 
         _first_command(
             src, re.escape('qiita_assert_instance_memory_fits "$DP_PORTS" "$DP_MEMORY_MAX"')
         ),
+        _first_command(src, re.escape('qiita_assert_pool_memory_fits "$DP_MEMORY_MAX"')),
         _first_command(src, re.escape("qiita_dp_env_omits_local_instances")),
     )
     for step in (
@@ -1037,6 +1040,205 @@ def test_instance_memory_fits_fails_without_mem_total(tmp_path: Path, body: str 
     )
     assert result.returncode != 0
     assert "MemTotal" in result.stderr
+
+
+_CONFIG_RS = _REPO_ROOT / "qiita-data-plane" / "src" / "config.rs"
+
+
+def test_default_pool_size_matches_the_data_plane() -> None:
+    """The deploy's pool size when DUCKLAKE_POOL_SIZE is unset is the data plane's."""
+    match = re.search(
+        r"^pub\(crate\) const DEFAULT_POOL_SIZE: usize = (\d+);$",
+        _CONFIG_RS.read_text(),
+        re.MULTILINE,
+    )
+    assert match, f"DEFAULT_POOL_SIZE not found in {_CONFIG_RS}"
+    result = _run_common('printf %s "$QIITA_DATA_PLANE_DEFAULT_POOL_SIZE"')
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == match.group(1)
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        (None, "8"),
+        ("PATH_SCRATCH=/scratch\n", "8"),
+        ("DUCKLAKE_POOL_SIZE=\n", "8"),
+        ('DUCKLAKE_POOL_SIZE="  "\n', "8"),
+        ("DUCKLAKE_POOL_SIZE=3\n", "3"),
+        ('DUCKLAKE_POOL_SIZE=" 12 "\n', "12"),
+    ],
+)
+def test_pool_size_reads_the_host_file_else_the_default(
+    tmp_path: Path, body: str | None, expected: str
+) -> None:
+    env_file = _dp_env(tmp_path, body) if body is not None else None
+    result = _run_common(
+        "qiita_data_plane_pool_size",
+        dp_env=env_file,
+        extra_env={"DUCKLAKE_POOL_SIZE": "99"},
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == expected
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "eight", "1.5", "4 4"])
+def test_pool_size_rejects_anything_but_a_positive_integer(tmp_path: Path, value: str) -> None:
+    env_file = _dp_env(tmp_path, f'DUCKLAKE_POOL_SIZE="{value}"\n')
+    result = _run_common("qiita_data_plane_pool_size", dp_env=env_file)
+    assert result.returncode != 0, result.stdout
+    assert result.stdout == ""
+    assert "DUCKLAKE_POOL_SIZE" in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("100B", "100"),
+        ("1b", "1"),
+        ("2KB", "2000"),
+        ("3MB", str(3 * 1000**2)),
+        ("4GB", str(4 * 1000**3)),
+        ("4gb", str(4 * 1000**3)),
+        ("5TB", str(5 * 1000**4)),
+        ("2KiB", "2048"),
+        ("3MiB", str(3 * 1024**2)),
+        ("4GiB", str(4 * 1024**3)),
+        ("4GIB", str(4 * 1024**3)),
+        ("5TiB", str(5 * 1024**4)),
+    ],
+)
+def test_duckdb_size_bytes_reads_decimal_and_binary_units(value: str, expected: str) -> None:
+    result = _run_common('qiita_duckdb_size_bytes "$1"', value)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == expected
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "",
+        "4096",
+        "4G",
+        "4 GB",
+        "1.5GB",
+        "04GB",
+        "0GB",
+        "-1GB",
+        "4PB",
+        "4PiB",
+        "4GiBs",
+        "4194305TiB",
+    ],
+)
+def test_duckdb_size_bytes_rejects_other_spellings(value: str) -> None:
+    result = _run_common('qiita_duckdb_size_bytes "$1"', value)
+    assert result.returncode != 0
+    assert result.stdout == ""
+
+
+def _pool_memory_fits(env_file: Path | None, value: str) -> subprocess.CompletedProcess[str]:
+    return _run_common('qiita_assert_pool_memory_fits "$1"', value, dp_env=env_file)
+
+
+@pytest.mark.parametrize(
+    ("body", "fits"),
+    [
+        ("DUCKDB_MEMORY_LIMIT=1GiB\n", True),  # 8 × 1GiB is exactly 8G
+        ("DUCKDB_MEMORY_LIMIT=1025MiB\n", False),
+        ("DUCKDB_MEMORY_LIMIT=1074MB\n", False),  # 1.074e9 > 2^30
+        ("DUCKDB_MEMORY_LIMIT=1073MB\n", True),
+        ("DUCKDB_MEMORY_LIMIT=2GiB\nDUCKLAKE_POOL_SIZE=4\n", True),
+        ("DUCKDB_MEMORY_LIMIT=2GiB\nDUCKLAKE_POOL_SIZE=5\n", False),
+        ("DUCKDB_MEMORY_LIMIT=4194303TiB\n", False),  # past the limit without overflowing
+    ],
+)
+def test_pool_memory_fits_compares_pool_times_limit_with_memory_max(
+    tmp_path: Path, body: str, fits: bool
+) -> None:
+    result = _pool_memory_fits(_dp_env(tmp_path, body), "8G")
+    assert (result.returncode == 0) is fits, result.stderr
+    if not fits:
+        assert "Unset DUCKDB_MEMORY_LIMIT" in result.stderr
+        assert "QIITA_DATA_PLANE_INSTANCE_MEMORY_MAX=8G" in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("body", "value"),
+    [
+        ("DUCKDB_MEMORY_LIMIT=64GiB\n", ""),  # no MemoryMax
+        ("PATH_SCRATCH=/scratch\n", "8G"),  # no DUCKDB_MEMORY_LIMIT
+        ("DUCKDB_MEMORY_LIMIT=\n", "8G"),
+        ('DUCKDB_MEMORY_LIMIT="  "\n', "8G"),
+    ],
+)
+def test_pool_memory_fits_has_nothing_to_check_unless_both_are_set(
+    tmp_path: Path, body: str, value: str
+) -> None:
+    result = _pool_memory_fits(_dp_env(tmp_path, body), value)
+    assert result.returncode == 0, result.stderr
+
+
+def test_pool_memory_fits_reads_the_limit_from_the_host_file_only(tmp_path: Path) -> None:
+    """The units read the file, so a limit in the deploy's environment is not the one
+    the data plane gets."""
+    result = _run_common(
+        'qiita_assert_pool_memory_fits "$1"',
+        "8G",
+        dp_env=_dp_env(tmp_path, "PATH_SCRATCH=/scratch\n"),
+        extra_env={"DUCKDB_MEMORY_LIMIT": "64GiB"},
+    )
+    assert result.returncode == 0, result.stderr
+    assert _pool_memory_fits(None, "8G").returncode == 0
+
+
+@pytest.mark.parametrize("limit", ["4G", "1.5GB", "4096", "4 GiB"])
+def test_pool_memory_fits_refuses_a_limit_it_cannot_compare(tmp_path: Path, limit: str) -> None:
+    result = _pool_memory_fits(_dp_env(tmp_path, f'DUCKDB_MEMORY_LIMIT="{limit}"\n'), "1T")
+    assert result.returncode != 0
+    assert f"DUCKDB_MEMORY_LIMIT '{limit}'" in result.stderr
+    assert "KiB, MiB, GiB or TiB" in result.stderr
+
+
+def test_pool_memory_fits_refuses_an_invalid_pool_size(tmp_path: Path) -> None:
+    body = "DUCKDB_MEMORY_LIMIT=1GiB\nDUCKLAKE_POOL_SIZE=0\n"
+    result = _pool_memory_fits(_dp_env(tmp_path, body), "8G")
+    assert result.returncode != 0
+    assert "DUCKLAKE_POOL_SIZE" in result.stderr
+
+
+def _preflight_dp_memory_row(tmp_path: Path, body: str) -> str:
+    """The dp-memory-max row of a preflight run whose only env file is data-plane.env."""
+    env = {k: v for k, v in os.environ.items() if k not in _TOPOLOGY_VARS}
+    env.update(
+        CP_ENV=str(tmp_path / "absent-cp.env"),
+        CO_ENV=str(tmp_path / "absent-co.env"),
+        DP_ENV=str(_dp_env(tmp_path, body)),
+    )
+    env.pop("SKIP_PREFLIGHT", None)
+    result = subprocess.run(
+        ["bash", str(_DEPLOY / "preflight.sh")], capture_output=True, text=True, env=env
+    )
+    rows = [line for line in result.stdout.splitlines() if " dp-memory-max: " in line]
+    assert len(rows) == 1, result.stdout + result.stderr
+    return rows[0]
+
+
+def test_preflight_fails_the_memory_row_when_the_pool_exceeds_memory_max(tmp_path: Path) -> None:
+    body = "QIITA_DATA_PLANE_INSTANCE_MEMORY_MAX=1G\nDUCKDB_MEMORY_LIMIT=129MiB\n"
+    row = _preflight_dp_memory_row(tmp_path, body)
+    assert row.lstrip().startswith("\u2717"), row
+    assert "Unset DUCKDB_MEMORY_LIMIT" in row
+
+
+def test_preflight_memory_row_accepts_a_pool_within_memory_max(tmp_path: Path) -> None:
+    """8 × 128MiB is exactly 1G. The row then reaches the MemTotal check, which reads
+    /proc/meminfo, so it passes only where the host has one."""
+    body = "QIITA_DATA_PLANE_INSTANCE_MEMORY_MAX=1G\nDUCKDB_MEMORY_LIMIT=128MiB\n"
+    row = _preflight_dp_memory_row(tmp_path, body)
+    assert "DUCKDB_MEMORY_LIMIT" not in row
+    if Path("/proc/meminfo").is_file():
+        assert row.lstrip().startswith("\u2713"), row
 
 
 def _write_dropins(unitdir: Path, ports: str, value: str) -> subprocess.CompletedProcess[str]:

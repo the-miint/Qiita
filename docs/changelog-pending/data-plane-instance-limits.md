@@ -8,7 +8,8 @@
   than the whole host's memory. The deploy rejects a value that is not a positive integer
   with an optional `K`/`M`/`G`/`T` suffix, or whose total across the local instances
   exceeds the host's `MemTotal`, before installing anything, and stops if
-  `data-plane.env` sets `QIITA_DATA_PLANE_LOCAL_INSTANCES` itself. `preflight` reports the
+  `data-plane.env` sets `QIITA_DATA_PLANE_LOCAL_INSTANCES` itself or sets a
+  `DUCKDB_MEMORY_LIMIT` that, times `DUCKLAKE_POOL_SIZE`, exceeds the instance's limit. `preflight` reports the
   value and `verify-deploy` compares each unit's `MemoryMax` with it (`dp-memory-max`
   rows, skipped when the key is unset).
 

@@ -56,7 +56,9 @@ instance:
   writes it as `MemoryMax=` into each instance's drop-in, and fails before installing
   anything if instances × the value exceeds the host's `MemTotal`. Each instance then
   derives its `memory_limit` from that limit instead of the host's memory. Leave
-  `DUCKDB_MEMORY_LIMIT` unset for this: an explicit value wins over the derivation. The
+  `DUCKDB_MEMORY_LIMIT` unset for this: an explicit value wins over the derivation, and the
+  deploy refuses one whose total across the pool (× `DUCKLAKE_POOL_SIZE`, default 8)
+  exceeds `QIITA_DATA_PLANE_INSTANCE_MEMORY_MAX`. The
   limit is read at boot, so a change takes the restart the redeploy does.
   `verify-deploy` shows one `dp-memory-max/qiita-data-plane@<port>` row per instance.
 - **CPU.** Set `DUCKDB_THREADS` in the same file, which every local instance reads, to

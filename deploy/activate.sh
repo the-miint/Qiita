@@ -33,6 +33,7 @@ DP_BUILD_COMMIT=$(qiita_data_plane_build_commit)
 # Per-instance limits (see "Per-instance limits" in _common.sh), written into each
 # instance's drop-in below.
 DP_MEMORY_MAX=$(qiita_data_plane_instance_memory_max)
+qiita_assert_pool_memory_fits "$DP_MEMORY_MAX"
 qiita_assert_instance_memory_fits "$DP_PORTS" "$DP_MEMORY_MAX"
 qiita_dp_env_omits_local_instances
 echo "data plane instances: $DP_PORTS on $DP_BIND_HOST"
