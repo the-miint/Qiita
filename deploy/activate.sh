@@ -22,9 +22,10 @@ INCOMING=/opt/qiita/incoming
     exit 1
 }
 
-# Data-plane topology (see "Data-plane topology" in _common.sh). Resolved before
-# the migration guard and before anything is installed, so a malformed or
-# unresolvable or public entry aborts with the running deploy untouched.
+# Data-plane topology (see "Data-plane topology" in _common.sh) and build sha.
+# Checked before the migration guard and before anything is installed, so a
+# malformed or unresolvable or public entry, or a short QIITA_BUILD_SHA, aborts
+# with the running deploy untouched.
 DP_PORTS=$(qiita_data_plane_ports)
 DP_PEERS=$(qiita_data_plane_peers)
 DP_BIND_HOST=$(qiita_data_plane_bind_host)

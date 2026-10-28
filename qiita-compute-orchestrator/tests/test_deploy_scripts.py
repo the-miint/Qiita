@@ -872,10 +872,11 @@ def test_nginx_flight_locations_agree_on_body_cap_and_timeouts() -> None:
     assert set(edge) - set(loopback) == {"limit_conn"}
 
 
-def test_activate_resolves_topology_before_installing_anything() -> None:
-    """A malformed topology or an unresolvable peer has to fail with the running
-    deploy untouched: before the first rsync, the binary install, the nginx render
-    and any restart. Asserted on source order, since the order is the property."""
+def test_activate_validates_data_plane_settings_before_installing_anything() -> None:
+    """A malformed topology, a public or unresolvable peer, or a QIITA_BUILD_SHA the
+    data planes would not boot on has to fail with the running deploy untouched:
+    before the first rsync, the binary install, the nginx render and any restart.
+    Asserted on source order, since the order is the property."""
     src = (_DEPLOY / "activate.sh").read_text()
     resolved = max(
         _first_command(src, re.escape("DP_PORTS=$(qiita_data_plane_ports)")),
@@ -890,7 +891,9 @@ def test_activate_resolves_topology_before_installing_anything() -> None:
         r"qiita_render_(?:and_test_)?nginx_conf ",
         r"systemctl restart",
     ):
-        assert resolved < _first_command(src, step), f"topology must be resolved before {step!r}"
+        assert resolved < _first_command(src, step), (
+            f"data-plane settings must be checked before {step!r}"
+        )
 
 
 def _call_peer_private(peer: str, stub_dir: str | None) -> subprocess.CompletedProcess[str]:
