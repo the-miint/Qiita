@@ -534,7 +534,7 @@ pub fn ensure_read_tables(conn: &Connection) -> Result<(), Box<dyn std::error::E
 /// The second table, `alignment_origin_spanning`, records which `alignment` rows
 /// are one read that crossed a circular contig's origin; its contract is on its
 /// DDL below. It is created here rather than by its own `ensure_*` because every
-/// `flight_service::delete::ALIGNMENT_DELETE_TABLES` delete drops from both, so a catalog
+/// `flight_service::lake_edit::ALIGNMENT_DELETE_TABLES` delete drops from both, so a catalog
 /// holding one without the other fails those deletes.
 pub fn ensure_alignment_tables(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
     conn.execute_batch(
@@ -645,7 +645,7 @@ pub fn ensure_alignment_tables(conn: &Connection) -> Result<(), Box<dyn std::err
         CREATE TABLE IF NOT EXISTS qiita_lake.alignment_origin_spanning (
             -- `alignment`'s leading four, same names, types and order.
             -- alignment_idx / prep_sample_idx / sequence_idx are NOT NULL because
-            -- a `flight_service::delete::delete_alignment*` predicate keys on each, and a
+            -- a `flight_service::lake_edit::delete_alignment*` predicate keys on each, and a
             -- NULL is a row no delete can reach. feature_idx is NOT NULL because
             -- it is the contig whose origin the interval below wraps, and because
             -- it completes the join key above.
@@ -920,7 +920,7 @@ pub fn ensure_amplicon_tables(conn: &Connection) -> Result<(), Box<dyn std::erro
 ///
 /// Why a lock is needed at all, and what it buys, lives where it is taken —
 /// `flight_service::registration::register_files` and
-/// `flight_service::delete::delete_reference`, both through `take_registration_lock`.
+/// `flight_service::lake_edit::delete_reference`, both through `take_registration_lock`.
 /// What matters here is the shape: EXACTLY ONE
 /// row, holding a value nothing reads. `take_registration_lock` fails loudly if
 /// its UPDATE matches no row, because a lock that silently stopped locking

@@ -1,5 +1,5 @@
-//! The `delete_*`, `sync_reference_exclusion` and `mint_phylogeny_edge_id`
-//! DoActions.
+//! The DoActions that change the lake other than registration: the `delete_*`
+//! actions, `sync_reference_exclusion` and `mint_phylogeny_edge_id`.
 
 use std::path::Path;
 
@@ -1033,5 +1033,5 @@ fn delete_alignment_sample(
 }
 
 #[cfg(test)]
-#[path = "delete_tests.rs"]
+#[path = "lake_edit_tests.rs"]
 mod tests;

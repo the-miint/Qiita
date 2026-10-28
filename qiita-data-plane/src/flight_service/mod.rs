@@ -14,8 +14,8 @@
 //! - `export`: the `export_read`, `count_masked` and `mask_metrics` DoActions.
 //! - `registration`: the `register_files` DoAction, the lake commit retry and
 //!   registration lock, and placing files in lake storage.
-//! - `delete`: the `delete_*`, `sync_reference_exclusion` and
-//!   `mint_phylogeny_edge_id` DoActions.
+//! - `lake_edit`: the DoActions that change the lake other than registration: the
+//!   `delete_*` actions, `sync_reference_exclusion` and `mint_phylogeny_edge_id`.
 
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -35,10 +35,10 @@ use tonic::{Request, Response, Status, Streaming};
 use crate::auth;
 use crate::pool::{LakePool, LakeWriter};
 
-mod delete;
 mod doget;
 mod doput;
 mod export;
+mod lake_edit;
 mod query;
 mod registration;
 #[cfg(test)]
