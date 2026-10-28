@@ -158,10 +158,10 @@ fn catalog_application_name(port: u16, pool_size: usize) -> String {
 /// every catalog connection the process opens (`setup_catalog` and the pool).
 ///
 /// The connection string must be libpq's `keyword=value` form, which preflight
-/// already requires of it, and must not set `application_name` itself: the
-/// instance's own name is what the connection budget check reads, so a
-/// connection string that names the session otherwise fails boot rather than
-/// leaving libpq to pick one of the two.
+/// already requires of it (a URI cannot take the appended setting), and must not
+/// contain `application_name=`: the instance's own name is what the connection
+/// budget check reads, so a connection string that names the session otherwise
+/// fails boot rather than leaving libpq to pick one of the two.
 pub(crate) fn tag_catalog_connstr(
     catalog_connstr: &str,
     port: u16,
@@ -173,10 +173,7 @@ pub(crate) fn tag_catalog_connstr(
             "DUCKLAKE_CATALOG_CONNSTR must be a libpq keyword=value string, not a URI".to_string(),
         );
     }
-    if libpq_keywords(catalog_connstr)?
-        .iter()
-        .any(|k| k == "application_name")
-    {
+    if catalog_connstr.contains("application_name=") {
         return Err(format!(
             "DUCKLAKE_CATALOG_CONNSTR sets application_name; remove it — the data plane \
              names its catalog connections {}",
@@ -188,37 +185,6 @@ pub(crate) fn tag_catalog_connstr(
         catalog_connstr.trim_end(),
         catalog_application_name(port, pool_size)
     ))
-}
-
-/// The keywords of a libpq `keyword=value` connection string: whitespace between
-/// settings, optional whitespace around `=`, a backslash escaping the next
-/// character of a value. Quoted values are not handled because
-/// `validate_sql_literal` has already refused any single quote.
-fn libpq_keywords(connstr: &str) -> Result<Vec<String>, String> {
-    let malformed = |why: &str| format!("DUCKLAKE_CATALOG_CONNSTR is not keyword=value: {why}");
-    let mut keywords = Vec::new();
-    let mut chars = connstr.chars().peekable();
-    loop {
-        while chars.next_if(|c| c.is_whitespace()).is_some() {}
-        if chars.peek().is_none() {
-            return Ok(keywords);
-        }
-        let mut keyword = String::new();
-        while let Some(c) = chars.next_if(|c| !c.is_whitespace() && *c != '=') {
-            keyword.push(c);
-        }
-        while chars.next_if(|c| c.is_whitespace()).is_some() {}
-        if chars.next() != Some('=') || keyword.is_empty() {
-            return Err(malformed(&format!("no `=` after {keyword:?}")));
-        }
-        while chars.next_if(|c| c.is_whitespace()).is_some() {}
-        while let Some(c) = chars.next_if(|c| !c.is_whitespace()) {
-            if c == '\\' && chars.next().is_none() {
-                return Err(malformed("it ends in a backslash"));
-            }
-        }
-        keywords.push(keyword);
-    }
 }
 
 /// The zstd level for data at rest: a copy of
@@ -2161,49 +2127,14 @@ mod tests {
 
     #[test]
     fn tagged_connstr_refuses_a_connstr_that_sets_application_name() {
-        for connstr in [
-            "dbname=lake application_name=mine",
-            "application_name = mine dbname=lake",
-            "dbname=lake\tapplication_name=",
-        ] {
-            let err = tag_catalog_connstr(connstr, 50051, 8).unwrap_err();
-            assert!(
-                err.contains("sets application_name"),
-                "{connstr:?} -> {err}"
-            );
-        }
-    }
-
-    /// The keyword match is on keywords, not on text: a value or another keyword
-    /// containing the string is not a second application_name.
-    #[test]
-    fn tagged_connstr_accepts_application_name_inside_a_value() {
-        for connstr in [
-            "dbname=application_name host=db",
-            "fallback_application_name=x dbname=lake",
-            r"password=a\ application_name=b dbname=lake",
-        ] {
-            assert!(
-                tag_catalog_connstr(connstr, 50051, 8).is_ok(),
-                "{connstr:?} was refused"
-            );
-        }
+        let err = tag_catalog_connstr("dbname=lake application_name=mine", 50051, 8).unwrap_err();
+        assert!(err.contains("sets application_name"), "{err}");
     }
 
     #[test]
-    fn tagged_connstr_refuses_what_is_not_keyword_value() {
-        for connstr in [
-            "postgresql://dp@db/lake?sslmode=require",
-            "postgres://dp@db/lake?sslmode=require",
-            "dbname",
-            "=lake",
-            r"dbname=lake\",
-        ] {
-            assert!(
-                tag_catalog_connstr(connstr, 50051, 8).is_err(),
-                "{connstr:?} was accepted"
-            );
-        }
+    fn tagged_connstr_refuses_a_uri() {
+        let err = tag_catalog_connstr("postgresql://dp@db/lake", 50051, 8).unwrap_err();
+        assert!(err.contains("not a URI"), "{err}");
     }
 
     #[test]

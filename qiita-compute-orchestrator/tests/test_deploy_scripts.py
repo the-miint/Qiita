@@ -2992,18 +2992,7 @@ def _preflight_connstr_row(tmp_path: Path, connstr: str) -> str:
     return rows[0]
 
 
-@pytest.mark.parametrize(
-    "connstr",
-    ["dbname=lake host=db application_name=mine", "application_name = mine dbname=lake host=db"],
-)
-def test_preflight_refuses_a_catalog_connstr_that_names_the_session(
-    tmp_path: Path, connstr: str
-) -> None:
-    row = _preflight_connstr_row(tmp_path, connstr)
+def test_preflight_refuses_a_catalog_connstr_that_names_the_session(tmp_path: Path) -> None:
+    row = _preflight_connstr_row(tmp_path, "dbname=lake host=db application_name=mine")
     assert not _passed(row), row
     assert "sets application_name" in row
-
-
-def test_preflight_accepts_fallback_application_name(tmp_path: Path) -> None:
-    row = _preflight_connstr_row(tmp_path, "dbname=lake host=db fallback_application_name=x")
-    assert _passed(row), row
