@@ -222,7 +222,7 @@ else
 fi
 if [ -r "$DP_ENV" ]; then
     connstr=$(read_env_var "$DP_ENV" DUCKLAKE_CATALOG_CONNSTR)
-    if [[ "$connstr" == *application_name=* ]]; then
+    if [[ "$connstr" == *application_name* ]]; then
         # The data plane refuses to boot on it (tag_catalog_connstr in
         # qiita-data-plane/src/ducklake.rs).
         fail "connstr/ducklake" "DUCKLAKE_CATALOG_CONNSTR sets application_name; remove it, the data plane names its catalog sessions itself"

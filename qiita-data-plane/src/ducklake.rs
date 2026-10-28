@@ -159,7 +159,9 @@ fn catalog_application_name(port: u16, pool_size: usize) -> String {
 ///
 /// The connection string must be libpq's `keyword=value` form, which preflight
 /// already requires of it (a URI cannot take the appended setting), and must not
-/// contain `application_name=`: the instance's own name is what the connection
+/// contain `application_name`, with or without spaces around the `=` (libpq
+/// accepts both, and the substring also catches `fallback_application_name`): the
+/// instance's own name is what the connection
 /// budget check reads, so a connection string that names the session otherwise
 /// fails boot rather than leaving libpq to pick one of the two.
 pub(crate) fn tag_catalog_connstr(
@@ -173,7 +175,7 @@ pub(crate) fn tag_catalog_connstr(
             "DUCKLAKE_CATALOG_CONNSTR must be a libpq keyword=value string, not a URI".to_string(),
         );
     }
-    if catalog_connstr.contains("application_name=") {
+    if catalog_connstr.contains("application_name") {
         return Err(format!(
             "DUCKLAKE_CATALOG_CONNSTR sets application_name; remove it — the data plane \
              names its catalog connections {}",
@@ -2127,8 +2129,13 @@ mod tests {
 
     #[test]
     fn tagged_connstr_refuses_a_connstr_that_sets_application_name() {
-        let err = tag_catalog_connstr("dbname=lake application_name=mine", 50051, 8).unwrap_err();
-        assert!(err.contains("sets application_name"), "{err}");
+        for connstr in [
+            "dbname=lake application_name=mine",
+            "dbname=lake application_name = mine",
+        ] {
+            let err = tag_catalog_connstr(connstr, 50051, 8).unwrap_err();
+            assert!(err.contains("sets application_name"), "{connstr}: {err}");
+        }
     }
 
     #[test]
