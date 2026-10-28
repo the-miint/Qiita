@@ -112,14 +112,19 @@ On the peer host:
    `data-plane.env`, so its instances listen where this host can reach them.
 3. Allow the peer's data-plane ports only from this host's address in the peer's
    firewall. The listener has no TLS and no authentication beyond the ticket signature.
+4. Unset, `DUCKDB_TEMP_DIRECTORY` puts spill under `PATH_SCRATCH`, the shared filesystem.
+   To spill to the peer's own disk, set it to a local path in the peer's
+   `data-plane.env`, and set `DUCKDB_MAX_TEMP_DIRECTORY_SIZE`, a cap per pooled
+   connection, so that instances × `DUCKLAKE_POOL_SIZE` × the cap fits that disk
+   (`.env.data-plane.example` describes both).
 
 On this host:
 
-4. Set `QIITA_DATA_PLANE_PEERS="<peer address>:50051"` (one entry per peer instance) in
+5. Set `QIITA_DATA_PLANE_PEERS="<peer address>:50051"` (one entry per peer instance) in
    `/etc/qiita/data-plane.env` and redeploy. A peer name that does not resolve, or
    resolves to any public address, aborts the deploy before anything is installed. Prefer an IP address: the nginx Rocky 10
    ships resolves a name only when it loads the config (see `deploy/nginx/qiita.conf`).
-5. `verify-deploy` shows one `health/data-plane-peer@<host:port>` row per peer entry,
+6. `verify-deploy` shows one `health/data-plane-peer@<host:port>` row per peer entry,
    and one `commit/data-plane-peer@<host:port>` row that fails unless the peer runs
    this host's deployed commit. A peer deployed from another commit, or one whose
    instances were not restarted, fails it; the peer's journal names the commit it

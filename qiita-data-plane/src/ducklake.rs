@@ -52,7 +52,9 @@ const CATALOG_SETUP_LOCK_KEY: i64 = 0x7169_6974_615f_6470;
 
 /// How long boot waits for another data plane's catalog setup to release
 /// `CATALOG_SETUP_LOCK_KEY`. A backstop for a setup that holds the lock and does
-/// not finish.
+/// not finish: measured with the debug build against Postgres 17 on localhost, 10
+/// instances booting together were all listening within 5.8 s on an empty catalog
+/// and 4.4 s on an existing one, and 20 within 6.8 s.
 const BOOT_SETUP_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Attach the catalog and create its tables, once, at boot.
