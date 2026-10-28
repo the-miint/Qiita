@@ -8,7 +8,7 @@ repo has no measurement of what an added instance or peer buys in throughput.
 
 ## Settings
 
-Three keys in `/etc/qiita/data-plane.env`, read on every deploy by `activate.sh` and
+Four keys in `/etc/qiita/data-plane.env`, read on every deploy by `activate.sh` and
 `verify.sh`, and (the bind host) by the `qiita-data-plane@.service` units:
 
 | Key | Default | Meaning |
@@ -16,6 +16,13 @@ Three keys in `/etc/qiita/data-plane.env`, read on every deploy by `activate.sh`
 | `QIITA_DATA_PLANE_PORTS` | `50051` | Instances this host runs, space-separated and quoted. Each port is one `qiita-data-plane@<port>` unit. |
 | `QIITA_DATA_PLANE_PEERS` | none | Data planes on other hosts that this host's nginx also balances to, as `host:port`. |
 | `QIITA_DATA_PLANE_BIND_HOST` | `127.0.0.1` | The IPv4 address this host's instances listen on: loopback or private, never public. Leave it at `127.0.0.1` on a host that runs the control plane, unless the control plane is first pointed at the loopback listener ([below](#the-control-plane-through-nginx)): its default `DATA_PLANE_URL`, `grpc://localhost:50051`, finds no instance once they listen elsewhere. |
+
+| `QIITA_DATA_PLANE_INSTANCE_MEMORY_MAX` | none | `MemoryMax=` of each local instance's unit, a positive integer with an optional `K`/`M`/`G`/`T` suffix ([below](#more-instances-on-this-host)). |
+
+The deploy also writes `QIITA_DATA_PLANE_LOCAL_INSTANCES`, the number of ports in
+`QIITA_DATA_PLANE_PORTS`, into each instance's drop-in
+(`/etc/systemd/system/qiita-data-plane@<port>.service.d/instance-limits.conf`); it is
+not set in `data-plane.env`, and a deploy stops if it is.
 
 With none of them set, a deploy runs one instance on `127.0.0.1:50051`. The standing
 `sudo make redeploy` reads them from the file; nothing is passed on the command line.
@@ -40,15 +47,27 @@ Never edit `/etc/nginx/conf.d/qiita.conf` on the host: every deploy overwrites i
 
 Each instance is another process on the same cores and memory, and none of them knows
 about the others. Unset, `DUCKDB_MEMORY_LIMIT` and `DUCKDB_THREADS` are derived per
-instance from the whole host's memory and CPU, divided among that instance's own pool
-(`qiita-data-plane/src/config.rs`), so N instances on one host each budget for the whole
-host. Before adding an instance, set both in `/etc/qiita/data-plane.env`, which every
-local instance reads: `DUCKDB_MEMORY_LIMIT` to the memory the data plane may use divided
-by (instances × `DUCKLAKE_POOL_SIZE`, default 8), and `DUCKDB_THREADS` to the cores it may
-use divided the same way. Each pooled connection also holds one backend on the catalog's
-Postgres for as long as it lives; count instances × pool size on every host, plus the
-control plane, against that server's `max_connections` (`DEFAULT_POOL_SIZE` in the same
-file says what it was chosen against).
+instance from the memory and CPU the instance sees, divided among that instance's own
+pool (`qiita-data-plane/src/config.rs`); without a per-instance limit that is the whole
+host, so N instances on one host each budget for the whole host. Before adding an
+instance:
+
+- **Memory.** Set `QIITA_DATA_PLANE_INSTANCE_MEMORY_MAX` in
+  `/etc/qiita/data-plane.env` to the memory one instance may use, e.g. `48G`. The deploy
+  writes it as `MemoryMax=` into each instance's drop-in, and fails before installing
+  anything if instances × the value exceeds the host's `MemTotal`. Each instance then
+  derives its `memory_limit` from that limit instead of the host's memory. Leave
+  `DUCKDB_MEMORY_LIMIT` unset for this: an explicit value wins over the derivation. The
+  limit is read at boot, so a change takes the restart the redeploy does.
+  `verify-deploy` shows one `dp-memory-max/qiita-data-plane@<port>` row per instance.
+- **CPU.** Set `DUCKDB_THREADS` in the same file, which every local instance reads, to
+  the cores the data plane may use divided by (instances × `DUCKLAKE_POOL_SIZE`, default
+  8).
+
+Each pooled connection also holds one backend on the catalog's Postgres for as long as
+it lives; count instances × pool size on every host, plus the control plane, against
+that server's `max_connections` (`DEFAULT_POOL_SIZE` in the same file says what it was
+chosen against).
 
 ## Fewer instances on this host
 
@@ -114,9 +133,11 @@ On the peer host:
    firewall. The listener has no TLS and no authentication beyond the ticket signature.
 4. Optional, to spill to the peer's own disk rather than the shared filesystem: set
    `DUCKDB_TEMP_DIRECTORY` in the peer's `data-plane.env` to a local path the data
-   plane can create or write, and `DUCKDB_MAX_TEMP_DIRECTORY_SIZE`, a cap per pooled
-   connection, so that instances × `DUCKLAKE_POOL_SIZE` × the cap fits that disk
-   (`.env.data-plane.example` describes both and their defaults).
+   plane can create or write. With `DUCKDB_MAX_TEMP_DIRECTORY_SIZE` unset, each
+   instance derives its cap per pooled connection at boot from the free space of that
+   disk divided by instances × `DUCKLAKE_POOL_SIZE`, and refuses to boot if that is
+   below its floor; set the cap to choose it yourself (`.env.data-plane.example`
+   describes both and their defaults).
 
 On this host:
 
