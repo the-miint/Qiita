@@ -16,7 +16,7 @@ StateDirectory=qiita-data/%i
 Environment=HOME=/var/lib/qiita-data/%i
 Environment=QIITA_DATA_PLANE_BIND_HOST=127.0.0.1
 EnvironmentFile=/etc/qiita/data-plane.env
-# BUILD_SHA, the deployed commit (QIITA_DATA_PLANE_BUILD_ENV in deploy/_common.sh).
+# BUILD_COMMIT, the deployed commit (QIITA_DATA_PLANE_BUILD_ENV in deploy/_common.sh).
 EnvironmentFile=-/opt/qiita/data-plane/build.env
 # LISTEN_ADDR is set on the command line: a variable in EnvironmentFile= overrides
 # the same variable in Environment= whatever their order in this file (systemd 257),

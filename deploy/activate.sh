@@ -22,14 +22,14 @@ INCOMING=/opt/qiita/incoming
     exit 1
 }
 
-# Data-plane topology (see "Data-plane topology" in _common.sh) and build sha.
+# Data-plane topology (see "Data-plane topology" in _common.sh) and build commit.
 # Checked before the migration guard and before anything is installed, so a
 # malformed or unresolvable or public entry, or a short QIITA_BUILD_SHA, aborts
 # with the running deploy untouched.
 DP_PORTS=$(qiita_data_plane_ports)
 DP_PEERS=$(qiita_data_plane_peers)
 DP_BIND_HOST=$(qiita_data_plane_bind_host)
-DP_BUILD_SHA=$(qiita_data_plane_build_sha)
+DP_BUILD_COMMIT=$(qiita_data_plane_build_commit)
 echo "data plane instances: $DP_PORTS on $DP_BIND_HOST"
 if [ -n "$DP_PEERS" ]; then
     echo "data plane peers (other hosts, not restarted by this deploy): $DP_PEERS"
@@ -203,8 +203,8 @@ install -m 0755 "$INCOMING/qiita-data-plane" /opt/qiita/data-plane/qiita-data-pl
 # The full deployed commit for the data planes (QIITA_DATA_PLANE_BUILD_ENV in
 # _common.sh); empty when QIITA_BUILD_SHA is unset, and verify.sh then skips the
 # commit check.
-if [ -n "$DP_BUILD_SHA" ]; then
-    printf 'BUILD_SHA=%s\n' "$DP_BUILD_SHA" > "$QIITA_DATA_PLANE_BUILD_ENV"
+if [ -n "$DP_BUILD_COMMIT" ]; then
+    printf 'BUILD_COMMIT=%s\n' "$DP_BUILD_COMMIT" > "$QIITA_DATA_PLANE_BUILD_ENV"
 else
     : > "$QIITA_DATA_PLANE_BUILD_ENV"
 fi

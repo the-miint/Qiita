@@ -882,7 +882,7 @@ def test_activate_validates_data_plane_settings_before_installing_anything() -> 
         _first_command(src, re.escape("DP_PORTS=$(qiita_data_plane_ports)")),
         _first_command(src, re.escape("DP_PEERS=$(qiita_data_plane_peers)")),
         _first_command(src, re.escape("DP_BIND_HOST=$(qiita_data_plane_bind_host)")),
-        _first_command(src, re.escape("DP_BUILD_SHA=$(qiita_data_plane_build_sha)")),
+        _first_command(src, re.escape("DP_BUILD_COMMIT=$(qiita_data_plane_build_commit)")),
         _first_command(src, re.escape('qiita_assert_peer_private "$peer"')),
     )
     for step in (
@@ -1072,7 +1072,7 @@ def test_grpc_connect_timeout_is_set_once_for_every_data_plane_location() -> Non
 
 def test_build_service_name_matches_the_data_plane() -> None:
     """verify.sh asks each member for the health service qiita_data_plane_build_service
-    names; the data plane registers BUILD_SERVICE_PREFIX + BUILD_SHA, read from the
+    names; the data plane registers BUILD_SERVICE_PREFIX + BUILD_COMMIT, read from the
     file activate.sh writes. Nothing else ties the two sides together, and a drift
     fails every member's commit row."""
     sha = "0123456789abcdef0123456789abcdef01234567"
@@ -1081,6 +1081,10 @@ def test_build_service_name_matches_the_data_plane() -> None:
     assert result.stdout == f"qiita-data-plane/build/{sha}"
     main_rs = (_REPO_ROOT / "qiita-data-plane" / "src" / "main.rs").read_text()
     assert 'const BUILD_SERVICE_PREFIX: &str = "qiita-data-plane/build/";' in main_rs
+    # The key the deploy writes, the data plane reads and verify reads back.
+    assert 'std::env::var("BUILD_COMMIT")' in main_rs
+    assert "printf 'BUILD_COMMIT=%s\\n'" in (_DEPLOY / "activate.sh").read_text()
+    assert 'BUILD_ENV" BUILD_COMMIT)' in (_DEPLOY / "verify.sh").read_text()
     build_env = _run_common('printf %s "$QIITA_DATA_PLANE_BUILD_ENV"').stdout
     assert build_env == "/opt/qiita/data-plane/build.env"
     unit = (_DEPLOY / "systemd" / "qiita-data-plane@.service").read_text()
@@ -1088,8 +1092,8 @@ def test_build_service_name_matches_the_data_plane() -> None:
 
 
 @pytest.mark.parametrize("sha", ["", "0123456789abcdef0123456789abcdef01234567"])
-def test_build_sha_accepts_unset_or_a_full_commit(sha: str) -> None:
-    result = _run_common("qiita_data_plane_build_sha", extra_env={"QIITA_BUILD_SHA": sha})
+def test_build_commit_accepts_unset_or_a_full_commit(sha: str) -> None:
+    result = _run_common("qiita_data_plane_build_commit", extra_env={"QIITA_BUILD_SHA": sha})
     assert result.returncode == 0, result.stderr
     assert result.stdout == sha
 
@@ -1103,8 +1107,8 @@ def test_build_sha_accepts_unset_or_a_full_commit(sha: str) -> None:
         "0123456789abcdef0123456789abcdef0123456g",
     ],
 )
-def test_build_sha_rejects_what_the_data_plane_would_not_boot_on(sha: str) -> None:
-    result = _run_common("qiita_data_plane_build_sha", extra_env={"QIITA_BUILD_SHA": sha})
+def test_build_commit_rejects_what_the_data_plane_would_not_boot_on(sha: str) -> None:
+    result = _run_common("qiita_data_plane_build_commit", extra_env={"QIITA_BUILD_SHA": sha})
     assert result.returncode != 0
     assert "QIITA_BUILD_SHA" in result.stderr
 

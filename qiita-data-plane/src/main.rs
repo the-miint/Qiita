@@ -21,7 +21,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         e
     })?;
     let build_service =
-        build_service_name(std::env::var("BUILD_SHA").ok().as_deref()).map_err(|e| {
+        build_service_name(std::env::var("BUILD_COMMIT").ok().as_deref()).map_err(|e| {
             eprintln!("Configuration error: {e}");
             e
         })?;
@@ -72,7 +72,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .await;
             eprintln!("qiita-data-plane build: health service {name}");
         }
-        None => eprintln!("qiita-data-plane build: BUILD_SHA unset, no build health service"),
+        None => eprintln!("qiita-data-plane build: BUILD_COMMIT unset, no build health service"),
     }
 
     // gRPC reflection lets `grpcurl` introspect the server (used
@@ -124,7 +124,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// answers NOT_FOUND, which tonic-health returns for a name never registered.
 const BUILD_SERVICE_PREFIX: &str = "qiita-data-plane/build/";
 
-/// The build health service name for `BUILD_SHA`, which activate.sh writes into
+/// The build health service name for `BUILD_COMMIT`, which activate.sh writes into
 /// `/opt/qiita/data-plane/build.env`: None when it is unset or empty, an error
 /// when it is not a full 40-character lowercase commit sha.
 fn build_service_name(sha: Option<&str>) -> Result<Option<String>, String> {
@@ -133,7 +133,7 @@ fn build_service_name(sha: Option<&str>) -> Result<Option<String>, String> {
     };
     if sha.len() != 40 || !sha.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
         return Err(format!(
-            "BUILD_SHA {sha:?} is not a 40-character lowercase commit sha"
+            "BUILD_COMMIT {sha:?} is not a 40-character lowercase commit sha"
         ));
     }
     Ok(Some(format!("{BUILD_SERVICE_PREFIX}{sha}")))
@@ -159,7 +159,7 @@ async fn drain_signal() {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn build_service_name_from_build_sha() {
+    fn build_service_name_from_build_commit() {
         let sha = "0123456789abcdef0123456789abcdef01234567";
         assert_eq!(
             super::build_service_name(Some(sha)),

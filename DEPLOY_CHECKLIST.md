@@ -48,7 +48,7 @@ _None yet._
   the deploy itself stops before installing anything when it finds such a unit, unless
   run with `QIITA_DP_DISABLE_REMOVED=1`, which disables and stops it;
   `commit/data-plane@<port>` and `commit/data-plane-peer@<host:port>` fail for a member
-  not running this host's deployed commit (`BUILD_SHA` in
+  not running this host's deployed commit (`BUILD_COMMIT` in
   `/opt/qiita/data-plane/build.env`, which the deploy writes). A host running only
   `qiita-data-plane@50051` is unaffected.
 
