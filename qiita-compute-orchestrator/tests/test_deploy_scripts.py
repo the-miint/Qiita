@@ -122,7 +122,13 @@ def _fake_native_checkout(tmp_path: Path) -> Path:
 
 # The data-plane topology variables. Removed from every topology test's environment
 # so the caller's shell cannot reach the helpers under test.
-_TOPOLOGY_VARS = ("QIITA_DATA_PLANE_PORTS", "QIITA_DATA_PLANE_PEERS", "QIITA_DATA_PLANE_BIND_HOST")
+_TOPOLOGY_VARS = (
+    "QIITA_DATA_PLANE_PORTS",
+    "QIITA_DATA_PLANE_PEERS",
+    "QIITA_DATA_PLANE_BIND_HOST",
+    "QIITA_DATA_PLANE_INSTANCE_MEMORY_MAX",
+    "QIITA_DATA_PLANE_LOCAL_INSTANCES",
+)
 _ABSENT_DP_ENV = "/nonexistent/qiita/data-plane.env"
 
 
@@ -884,16 +890,214 @@ def test_activate_validates_data_plane_settings_before_installing_anything() -> 
         _first_command(src, re.escape("DP_BIND_HOST=$(qiita_data_plane_bind_host)")),
         _first_command(src, re.escape("DP_BUILD_COMMIT=$(qiita_data_plane_build_commit)")),
         _first_command(src, re.escape('qiita_assert_peer_private "$peer"')),
+        _first_command(src, re.escape("DP_MEMORY_MAX=$(qiita_data_plane_instance_memory_max)")),
+        _first_command(
+            src, re.escape('qiita_assert_instance_memory_fits "$DP_PORTS" "$DP_MEMORY_MAX"')
+        ),
+        _first_command(src, re.escape("qiita_dp_env_omits_local_instances")),
     )
     for step in (
         r"rsync -a",
         r"install -m 0755",
         r"qiita_render_(?:and_test_)?nginx_conf ",
+        r"qiita_write_data_plane_dropins ",
         r"systemctl restart",
     ):
         assert resolved < _first_command(src, step), (
             f"data-plane settings must be checked before {step!r}"
         )
+
+
+# --- Per-instance limits ------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("4096", "4096"),
+        ("1K", "1024"),
+        ("3M", str(3 * 1024**2)),
+        ("16G", str(16 * 1024**3)),
+        ("2T", str(2 * 1024**4)),
+    ],
+)
+def test_size_bytes_reads_systemd_suffixes_as_powers_of_1024(value: str, expected: str) -> None:
+    result = _run_common('qiita_size_bytes "$1"', value)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == expected
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["", "0", "0G", "016G", "1.5G", "16g", "16GB", "16 G", "-1G", "infinity", "50%", "4194305T"],
+)
+def test_size_bytes_rejects_anything_but_a_positive_integer_and_suffix(value: str) -> None:
+    result = _run_common('qiita_size_bytes "$1"', value)
+    assert result.returncode != 0
+    assert result.stdout == ""
+
+
+def test_instance_memory_max_defaults_to_none() -> None:
+    result = _run_common("qiita_data_plane_instance_memory_max")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == ""
+
+
+def test_instance_memory_max_reads_the_host_file_only(tmp_path: Path) -> None:
+    """Like the topology keys, only the file counts: the units read the file, so a
+    value the deploy saw but the file lacks would check one limit and apply another."""
+    env_file = _dp_env(tmp_path, "QIITA_DATA_PLANE_INSTANCE_MEMORY_MAX=48G\n")
+    result = _run_common(
+        "qiita_data_plane_instance_memory_max",
+        dp_env=env_file,
+        extra_env={"QIITA_DATA_PLANE_INSTANCE_MEMORY_MAX": "1T"},
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "48G"
+
+    absent = _dp_env(tmp_path, "PATH_SCRATCH=/scratch\n")
+    result = _run_common(
+        "qiita_data_plane_instance_memory_max",
+        dp_env=absent,
+        extra_env={"QIITA_DATA_PLANE_INSTANCE_MEMORY_MAX": "1T"},
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == ""
+
+
+@pytest.mark.parametrize("value", ["", "48GB", "lots", "0"])
+def test_instance_memory_max_rejects_a_blank_or_malformed_value(tmp_path: Path, value: str) -> None:
+    env_file = _dp_env(tmp_path, f'QIITA_DATA_PLANE_INSTANCE_MEMORY_MAX="{value}"\n')
+    result = _run_common("qiita_data_plane_instance_memory_max", dp_env=env_file)
+    assert result.returncode != 0, result.stdout
+    assert result.stdout == ""
+    assert "QIITA_DATA_PLANE_INSTANCE_MEMORY_MAX" in result.stderr
+
+
+def test_host_file_may_not_set_the_local_instance_count(tmp_path: Path) -> None:
+    """The drop-in sets it with Environment=, which the shared file's
+    EnvironmentFile= would override."""
+    env_file = _dp_env(tmp_path, "QIITA_DATA_PLANE_LOCAL_INSTANCES=1\n")
+    result = _run_common("qiita_dp_env_omits_local_instances", dp_env=env_file)
+    assert result.returncode != 0
+    assert "QIITA_DATA_PLANE_LOCAL_INSTANCES" in result.stderr
+
+    clean = _dp_env(tmp_path, "PATH_SCRATCH=/scratch\n")
+    assert _run_common("qiita_dp_env_omits_local_instances", dp_env=clean).returncode == 0
+    assert _run_common("qiita_dp_env_omits_local_instances").returncode == 0
+
+
+def _meminfo(tmp_path: Path, mem_total_kib: int) -> Path:
+    path = tmp_path / "meminfo"
+    path.write_text(
+        f"MemTotal:       {mem_total_kib} kB\n"
+        "MemFree:         1000 kB\n"
+        f"MemAvailable:   {mem_total_kib // 2} kB\n"
+    )
+    return path
+
+
+@pytest.mark.parametrize(
+    ("ports", "value", "fits"),
+    [
+        ("50051 50052", "32G", True),  # exactly MemTotal
+        ("50051 50052", "33G", False),
+        ("50051 50052 50053", "22G", False),
+        ("50051", "64G", True),
+        ("50051", "65G", False),
+        ("50051", "4194303T", False),  # past MemTotal without overflowing
+    ],
+)
+def test_instance_memory_fits_compares_count_times_value_with_mem_total(
+    tmp_path: Path, ports: str, value: str, fits: bool
+) -> None:
+    meminfo = _meminfo(tmp_path, 64 * 1024 * 1024)  # 64 GiB
+    result = _run_common(
+        'qiita_assert_instance_memory_fits "$1" "$2" "$3"', ports, value, str(meminfo)
+    )
+    assert (result.returncode == 0) is fits, result.stderr
+    if not fits:
+        assert "MemTotal" in result.stderr
+
+
+def test_instance_memory_fits_has_nothing_to_check_when_unset(tmp_path: Path) -> None:
+    result = _run_common(
+        'qiita_assert_instance_memory_fits "$1" "" "$2"', "50051", str(tmp_path / "absent")
+    )
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize("body", [None, "MemFree: 1000 kB\n"])
+def test_instance_memory_fits_fails_without_mem_total(tmp_path: Path, body: str | None) -> None:
+    meminfo = tmp_path / "meminfo"
+    if body is not None:
+        meminfo.write_text(body)
+    result = _run_common(
+        'qiita_assert_instance_memory_fits "$1" "$2" "$3"', "50051", "1G", str(meminfo)
+    )
+    assert result.returncode != 0
+    assert "MemTotal" in result.stderr
+
+
+def _write_dropins(unitdir: Path, ports: str, value: str) -> subprocess.CompletedProcess[str]:
+    return _run_common('qiita_write_data_plane_dropins "$1" "$2" "$3"', ports, value, str(unitdir))
+
+
+def _dropin_name() -> str:
+    result = _run_common('printf %s "$QIITA_DATA_PLANE_DROPIN_NAME"')
+    assert result.returncode == 0 and result.stdout, result.stderr
+    return result.stdout
+
+
+def test_dropins_carry_the_instance_count_and_the_memory_max(tmp_path: Path) -> None:
+    result = _write_dropins(tmp_path, "50051 50052", "24G")
+    assert result.returncode == 0, result.stderr
+    for port in ("50051", "50052"):
+        conf = tmp_path / f"qiita-data-plane@{port}.service.d" / _dropin_name()
+        assert conf.read_text() == (
+            "[Service]\nEnvironment=QIITA_DATA_PLANE_LOCAL_INSTANCES=2\nMemoryMax=24G\n"
+        )
+
+
+def test_dropins_without_a_memory_max_set_only_the_count(tmp_path: Path) -> None:
+    """A host that sets nothing gets no MemoryMax= line, so its instances' limits
+    are what they were before the drop-in existed."""
+    result = _write_dropins(tmp_path, "50051", "")
+    assert result.returncode == 0, result.stderr
+    conf = tmp_path / "qiita-data-plane@50051.service.d" / _dropin_name()
+    assert conf.read_text() == "[Service]\nEnvironment=QIITA_DATA_PLANE_LOCAL_INSTANCES=1\n"
+
+
+def test_dropins_are_removed_from_instances_outside_the_list(tmp_path: Path) -> None:
+    """A port that left the list keeps neither the old count nor the old limit, and
+    another file in its drop-in directory is left alone."""
+    assert _write_dropins(tmp_path, "50051 50052 50053", "8G").returncode == 0
+    other = tmp_path / "qiita-data-plane@50053.service.d" / "operator.conf"
+    other.write_text("[Service]\n")
+
+    result = _write_dropins(tmp_path, "50051", "8G")
+
+    assert result.returncode == 0, result.stderr
+    assert (tmp_path / "qiita-data-plane@50051.service.d" / _dropin_name()).is_file()
+    assert not (tmp_path / "qiita-data-plane@50052.service.d").exists()
+    assert not (tmp_path / "qiita-data-plane@50053.service.d" / _dropin_name()).exists()
+    assert other.is_file()
+    assert (
+        "QIITA_DATA_PLANE_LOCAL_INSTANCES=1"
+        in (tmp_path / "qiita-data-plane@50051.service.d" / _dropin_name()).read_text()
+    )
+
+
+def test_activate_loads_the_dropins_before_restarting_the_instances() -> None:
+    """The data plane reads its limits only at boot, so the drop-ins have to be
+    written and loaded before the restart that applies them."""
+    src = (_DEPLOY / "activate.sh").read_text()
+    written = _first_command(
+        src, re.escape('qiita_write_data_plane_dropins "$DP_PORTS" "$DP_MEMORY_MAX"')
+    )
+    reload = src.index("systemctl daemon-reload", written)
+    restart = _first_command(src, re.escape('systemctl restart "${dp_units[@]}"'))
+    assert written < reload < restart
 
 
 def _call_peer_private(peer: str, stub_dir: str | None) -> subprocess.CompletedProcess[str]:

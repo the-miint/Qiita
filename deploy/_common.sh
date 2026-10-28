@@ -299,6 +299,15 @@ env_file_sets_var() {
 # given. They are read from the file only, never the deploy's environment, so what
 # a deploy renders and enables is what the file says.
 # docs/runbooks/data-plane-scaling.md is the operator procedure.
+#
+# One more host setting in $DP_ENV, read the same way, sizes each local instance
+# rather than placing it:
+#
+#   QIITA_DATA_PLANE_INSTANCE_MEMORY_MAX  MemoryMax= of every local instance's unit.
+#                               Default none (no per-instance limit).
+#
+# activate.sh writes it, with the local instance count, into a per-instance drop-in
+# (qiita_write_data_plane_dropins).
 
 # The address and port of the loopback listener nginx serves the qiita_data_plane
 # upstream on for on-host clients.
@@ -617,6 +626,134 @@ qiita_assert_peer_private() {
                  "(10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16)" >&2
             return 1
         }
+    done
+}
+
+# --- Per-instance limits -------------------------------------------------------
+# Each local instance's unit gets one drop-in, written by activate.sh on every
+# deploy. It sets QIITA_DATA_PLANE_LOCAL_INSTANCES, the number of local instances,
+# which the data plane divides the spill filesystem by (spill_cap in
+# qiita-data-plane/src/config.rs), and, when QIITA_DATA_PLANE_INSTANCE_MEMORY_MAX
+# is set, MemoryMax=. MemoryMax= sets the unit's cgroup memory.max, which the data
+# plane reads at boot as its memory ceiling (resources::detect_memory_ceiling) and
+# divides across its pool. Both take effect at the restart that follows the write.
+QIITA_DATA_PLANE_DROPIN_NAME=instance-limits.conf
+
+# The drop-in directory of one instance unit. $1 = a port, $2 = the systemd unit
+# directory (default /etc/systemd/system).
+qiita_data_plane_dropin_dir() {
+    printf '%s/qiita-data-plane@%s.service.d' "${2:-/etc/systemd/system}" "$1"
+}
+
+# A systemd size as bytes: a positive integer with an optional K, M, G or T suffix,
+# each a power of 1024 (systemd.resource-control(5), MemoryMax=). Anything else,
+# including a value past 2^62 bytes, fails with nothing printed.
+qiita_size_bytes() {
+    local value="$1" n mult=1
+    [[ $value =~ ^([1-9][0-9]{0,17})([KMGT]?)$ ]] || return 1
+    n=${BASH_REMATCH[1]}
+    case ${BASH_REMATCH[2]} in
+        K) mult=1024 ;;
+        M) mult=$((1024 ** 2)) ;;
+        G) mult=$((1024 ** 3)) ;;
+        T) mult=$((1024 ** 4)) ;;
+    esac
+    [ "$n" -le $(((1 << 62) / mult)) ] || return 1
+    printf '%s' $((n * mult))
+}
+
+# QIITA_DATA_PLANE_INSTANCE_MEMORY_MAX in $DP_ENV, else empty. Read from the file
+# only, like the topology keys. Set but blank, or not a size qiita_size_bytes
+# accepts, is an error: the value is written verbatim into a unit file.
+qiita_data_plane_instance_memory_max() {
+    local value=""
+    qiita_dp_env_parses || return 1
+    [ -r "$DP_ENV" ] && env_file_sets_var "$DP_ENV" QIITA_DATA_PLANE_INSTANCE_MEMORY_MAX || return 0
+    value=$(read_env_file_var "$DP_ENV" QIITA_DATA_PLANE_INSTANCE_MEMORY_MAX)
+    [ -n "$value" ] || {
+        echo "ERROR: QIITA_DATA_PLANE_INSTANCE_MEMORY_MAX is set but empty in $DP_ENV" >&2
+        return 1
+    }
+    qiita_size_bytes "$value" >/dev/null || {
+        echo "ERROR: QIITA_DATA_PLANE_INSTANCE_MEMORY_MAX '$value' in $DP_ENV is not a positive" \
+             "integer with an optional K, M, G or T suffix (at most 2^62 bytes)" >&2
+        return 1
+    }
+    printf '%s' "$value"
+}
+
+# Fails when $DP_ENV assigns QIITA_DATA_PLANE_LOCAL_INSTANCES. The drop-in sets it
+# with Environment=, and a variable in EnvironmentFile= overrides one in
+# Environment= (systemd 257), so a value in the file would replace the count the
+# deploy computed.
+qiita_dp_env_omits_local_instances() {
+    qiita_dp_env_parses || return 1
+    [ -r "$DP_ENV" ] && env_file_sets_var "$DP_ENV" QIITA_DATA_PLANE_LOCAL_INSTANCES || return 0
+    echo "ERROR: $DP_ENV sets QIITA_DATA_PLANE_LOCAL_INSTANCES, which the deploy computes from" \
+         "QIITA_DATA_PLANE_PORTS and the file would override; remove it" >&2
+    return 1
+}
+
+# Fails when the local instances' MemoryMax= values add up to more than the host's
+# memory. $1 = the ports (qiita_data_plane_ports), $2 = the validated
+# QIITA_DATA_PLANE_INSTANCE_MEMORY_MAX (empty: nothing to check), $3 = the meminfo
+# file (default /proc/meminfo). An unreadable meminfo or one without MemTotal fails.
+qiita_assert_instance_memory_fits() {
+    local ports="$1" value="$2" meminfo="${3:-/proc/meminfo}" count bytes total_kib total
+    [ -n "$value" ] || return 0
+    bytes=$(qiita_size_bytes "$value") || {
+        echo "ERROR: '$value' is not a systemd size" >&2
+        return 1
+    }
+    count=$(wc -w <<<"$ports")
+    count=${count//[[:space:]]/}
+    total_kib=$(awk '$1 == "MemTotal:" { print $2; exit }' "$meminfo" 2>/dev/null) || total_kib=""
+    [[ $total_kib =~ ^[0-9]+$ ]] || {
+        echo "ERROR: no MemTotal in $meminfo — cannot check QIITA_DATA_PLANE_INSTANCE_MEMORY_MAX against the host" >&2
+        return 1
+    }
+    total=$((total_kib * 1024))
+    # count × bytes > total exactly when bytes > floor(total / count), for integers;
+    # the product itself could overflow.
+    if [ "$bytes" -gt $((total / count)) ]; then
+        echo "ERROR: $count local data-plane instance(s) × QIITA_DATA_PLANE_INSTANCE_MEMORY_MAX=$value" \
+             "exceeds this host's MemTotal of $total_kib kB ($meminfo)" >&2
+        return 1
+    fi
+}
+
+# The drop-in qiita_write_data_plane_dropins writes for each instance. $1 = the
+# number of local instances, $2 = the MemoryMax= value, or empty for none.
+qiita_data_plane_dropin_content() {
+    printf '[Service]\n'
+    printf 'Environment=QIITA_DATA_PLANE_LOCAL_INSTANCES=%s\n' "$1"
+    [ -z "$2" ] || printf 'MemoryMax=%s\n' "$2"
+}
+
+# Write the drop-in of every port in $1 and remove it from every other
+# qiita-data-plane@ instance, so an instance whose port left the list (including
+# one QIITA_DP_DISABLE_REMOVED=1 disables) keeps no stale count or limit. $2 = the
+# MemoryMax= value or empty, $3 = the systemd unit directory (default
+# /etc/systemd/system). Takes effect at the next `systemctl daemon-reload`.
+qiita_write_data_plane_dropins() {
+    local ports="$1" value="$2" unitdir="${3:-/etc/systemd/system}" count port dir conf configured=" "
+    count=$(wc -w <<<"$ports")
+    count=${count//[[:space:]]/}
+    for port in $ports; do
+        configured+="$port "
+        dir=$(qiita_data_plane_dropin_dir "$port" "$unitdir")
+        install -d -m 0755 "$dir"
+        qiita_data_plane_dropin_content "$count" "$value" > "$dir/$QIITA_DATA_PLANE_DROPIN_NAME"
+        chmod 0644 "$dir/$QIITA_DATA_PLANE_DROPIN_NAME"
+    done
+    for conf in "$unitdir"/qiita-data-plane@*.service.d/"$QIITA_DATA_PLANE_DROPIN_NAME"; do
+        [ -e "$conf" ] || continue
+        dir=${conf%/*}
+        port=${dir##*/qiita-data-plane@}
+        port=${port%.service.d}
+        case "$configured" in *" $port "*) continue ;; esac
+        rm -f "$conf"
+        rmdir "$dir" 2>/dev/null || true
     done
 }
 
