@@ -15,12 +15,12 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
 
 ### 1. Env vars — set BEFORE the deploy (most are `from_env()` fail-fast; a missing one keeps the unit down)
 
-- `[admin]` (#TBD) Only if `/etc/qiita/data-plane.env` sets `DUCKDB_TEMP_DIRECTORY` without `DUCKDB_MAX_TEMP_DIRECTORY_SIZE`: the per-connection spill cap is now derived at boot as that filesystem's free space ÷ local instances ÷ `DUCKLAKE_POOL_SIZE`, so together the connections may fill it, and the data plane refuses to boot if that comes out under `MIN_DERIVED_SPILL_MIB` (`qiita-data-plane/src/config.rs`) — hence before the restart. To keep today's cap: `sudo bash -c 'grep -q "^DUCKDB_MAX_TEMP_DIRECTORY_SIZE=" /etc/qiita/data-plane.env || printf "\nDUCKDB_MAX_TEMP_DIRECTORY_SIZE=4GiB\n" >> /etc/qiita/data-plane.env'`.
-- `[admin]` (#TBD) Only if `DUCKLAKE_CATALOG_CONNSTR` in `/etc/qiita/data-plane.env` sets `application_name`: remove it, or the data plane refuses to boot (`sudo make preflight` fails `connstr/ducklake` on it).
+- `[admin]` (#791) Only if `/etc/qiita/data-plane.env` sets `DUCKDB_TEMP_DIRECTORY` without `DUCKDB_MAX_TEMP_DIRECTORY_SIZE`: the per-connection spill cap is now derived at boot as that filesystem's free space ÷ local instances ÷ `DUCKLAKE_POOL_SIZE`, so together the connections may fill it, and the data plane refuses to boot if that comes out under `MIN_DERIVED_SPILL_MIB` (`qiita-data-plane/src/config.rs`) — hence before the restart. To keep today's cap: `sudo bash -c 'grep -q "^DUCKDB_MAX_TEMP_DIRECTORY_SIZE=" /etc/qiita/data-plane.env || printf "\nDUCKDB_MAX_TEMP_DIRECTORY_SIZE=4GiB\n" >> /etc/qiita/data-plane.env'`.
+- `[admin]` (#791) Only if `DUCKLAKE_CATALOG_CONNSTR` in `/etc/qiita/data-plane.env` sets `application_name`: remove it, or the data plane refuses to boot (`sudo make preflight` fails `connstr/ducklake` on it).
 
 ### 2. One-time host setup
 
-- `[admin]` (#TBD) On the catalog's Postgres server, as superuser: `GRANT pg_read_all_stats TO <role>;`, where `<role>` is the `user=` in `DUCKLAKE_CATALOG_CONNSTR` (`qiita_miint_lake_rw` per `first-deploy.md`). `verify-deploy`'s `catalog-connections` row fails without it ([`data-plane-scaling.md` § Catalog connections](docs/runbooks/data-plane-scaling.md#catalog-connections)).
+- `[admin]` (#791) On the catalog's Postgres server, as superuser: `GRANT pg_read_all_stats TO <role>;`, where `<role>` is the `user=` in `DUCKLAKE_CATALOG_CONNSTR` (`qiita_miint_lake_rw` per `first-deploy.md`). `verify-deploy`'s `catalog-connections` row fails without it ([`data-plane-scaling.md` § Catalog connections](docs/runbooks/data-plane-scaling.md#catalog-connections)).
 
 ### 3. Migrations
 
@@ -51,9 +51,9 @@ _None yet._
   `commit/data-plane@<port>` and `commit/data-plane-peer@<host:port>` fail for a member
   not running this host's deployed commit (`BUILD_COMMIT` in
   `/opt/qiita/data-plane/build.env`, which the deploy writes);
-  `dp-memory-max/qiita-data-plane@<port>` (#TBD) fails when a unit's `MemoryMax` differs
+  `dp-memory-max/qiita-data-plane@<port>` (#791) fails when a unit's `MemoryMax` differs
   from `QIITA_DATA_PLANE_INSTANCE_MEMORY_MAX`, and is skipped when that key is unset;
-  `catalog-connections` (#TBD) lists every connected instance as `<host>:<port> pool=<n>`
+  `catalog-connections` (#791) lists every connected instance as `<host>:<port> pool=<n>`
   and fails when their pools plus the other catalog sessions exceed the catalog server's
   `max_connections` less its reserved slots, or when the bucket-2 grant is missing. Apart
   from `catalog-connections`, a host running only `qiita-data-plane@50051` is unaffected.
@@ -68,7 +68,7 @@ _None yet._
 ### Notes (no host action)
 
 - (#767) A killed DoPut leaves `staging/uploads/<idx>/upload.parquet.partial`, which nothing reclaims, as nothing reclaims finished uploads. `qiita-admin masked-read-export` gains `--retry-seconds` (default 3900, the data-plane unit's stop timeout).
-- (#TBD) Optional `QIITA_DATA_PLANE_INSTANCE_MEMORY_MAX` in `/etc/qiita/data-plane.env` sets `MemoryMax=` per local data-plane instance ([`data-plane-scaling.md` § More instances on this host](docs/runbooks/data-plane-scaling.md#more-instances-on-this-host)). Every deploy now writes `/etc/systemd/system/qiita-data-plane@<port>.service.d/instance-limits.conf` (instance count; `MemoryMax=` only when the key is set) and stops if `data-plane.env` sets `QIITA_DATA_PLANE_LOCAL_INSTANCES`, or sets `DUCKDB_MEMORY_LIMIT` to more than the key ÷ `DUCKLAKE_POOL_SIZE`; `preflight` gains a `dp-memory-max` row, skipped when the key is unset. With `DUCKDB_THREADS` unset, each instance's derived threads are also divided by the local instance count (no change at one instance).
+- (#791) Optional `QIITA_DATA_PLANE_INSTANCE_MEMORY_MAX` in `/etc/qiita/data-plane.env` sets `MemoryMax=` per local data-plane instance ([`data-plane-scaling.md` § More instances on this host](docs/runbooks/data-plane-scaling.md#more-instances-on-this-host)). Every deploy now writes `/etc/systemd/system/qiita-data-plane@<port>.service.d/instance-limits.conf` (instance count; `MemoryMax=` only when the key is set) and stops if `data-plane.env` sets `QIITA_DATA_PLANE_LOCAL_INSTANCES`, or sets `DUCKDB_MEMORY_LIMIT` to more than the key ÷ `DUCKLAKE_POOL_SIZE`; `preflight` gains a `dp-memory-max` row, skipped when the key is unset. With `DUCKDB_THREADS` unset, each instance's derived threads are also divided by the local instance count (no change at one instance).
 
 ## Deployed history
 

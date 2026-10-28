@@ -1,6 +1,6 @@
 ### Added
 
-- **A per-instance memory limit for the data planes on a host (#TBD).**
+- **A per-instance memory limit for the data planes on a host (#791).**
   `QIITA_DATA_PLANE_INSTANCE_MEMORY_MAX` in `/etc/qiita/data-plane.env`, optional, becomes
   `MemoryMax=` in a drop-in the deploy writes for each `qiita-data-plane@<port>` unit,
   together with `QIITA_DATA_PLANE_LOCAL_INSTANCES`, the number of local instances. With
@@ -16,7 +16,7 @@
   rows, skipped when the key is unset).
 
 - **verify-deploy checks the catalog connection budget across every data-plane host
-  (#TBD).** Each data-plane instance names its catalog sessions
+  (#791).** Each data-plane instance names its catalog sessions
   `qiita-data-plane:<port>:pool=<pool size>` through libpq's `application_name`, and the
   new `catalog-connections` row reads the names back from the catalog server's
   `pg_stat_activity`: it fails when the pools of every connected instance, plus the other
@@ -30,11 +30,11 @@
 ### Changed
 
 - **The data plane refuses a `DUCKLAKE_CATALOG_CONNSTR` that sets `application_name`, or
-  that is a `postgres://` URI (#TBD).** It sets its own name on every catalog connection;
+  that is a `postgres://` URI (#791).** It sets its own name on every catalog connection;
   `preflight`'s `connstr/ducklake` row fails such a connection string before the restart.
 
 - **The data plane derives its spill cap from the spill disk when the spill directory is
-  set (#TBD).** With `DUCKDB_TEMP_DIRECTORY` set and `DUCKDB_MAX_TEMP_DIRECTORY_SIZE`
+  set (#791).** With `DUCKDB_TEMP_DIRECTORY` set and `DUCKDB_MAX_TEMP_DIRECTORY_SIZE`
   unset, each connection's cap is the free space of the filesystem holding the directory
   at boot, divided by the local instances and `DUCKLAKE_POOL_SIZE`; below 64 MiB the data
   plane refuses to boot. Without `DUCKDB_TEMP_DIRECTORY` the cap stays 4GiB. The boot log
