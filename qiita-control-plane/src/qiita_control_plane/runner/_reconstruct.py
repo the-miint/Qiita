@@ -306,7 +306,7 @@ def _register_files_payload(attempt_dir: Path, staging_dir: Path) -> dict[str, s
     therefore recorded before the first call, where every attempt of the entry
     finds it, and resent on a replay whatever the directory still holds; the data plane answers a
     resent payload from where it moved the files (`register_files` in the data
-    plane's flight_service.rs). A staged file the record does not name was not
+    plane's flight_service/registration.rs). A staged file the record does not name was not
     part of the earlier call, so the replay refuses it rather than registering
     a payload neither call sent."""
     staged = _staged_register_files(staging_dir)

@@ -345,7 +345,7 @@ def test_sign_ticket_rejects_columns_on_a_table_with_no_allowlist():
 
 def test_cp_projection_allowlist_matches_the_rust_one_exactly():
     """``_PROJECTION_COLUMNS`` is a hand-copy of the data plane's
-    ``ALIGNMENT_PROJECTION_COLUMNS`` (flight_service.rs). The CP validates and
+    ``ALIGNMENT_PROJECTION_COLUMNS`` (flight_service/query.rs). The CP validates and
     signs; the DP validates again and projects. Drift fails asymmetrically:
 
     * a column the DP allows but the CP does not is UNREACHABLE — nobody can get

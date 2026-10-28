@@ -95,7 +95,7 @@ IPC codec is stamped per record-batch message by the writer, which is why the
 custom header lives at that layer rather than the transport's.)
 
 Header name constants: `IPC_COMPRESSION_HEADER` in
-`qiita-data-plane/src/flight_service.rs` and its twin in
+`qiita-data-plane/src/flight_service/doget.rs` and its twin in
 `qiita-common/src/qiita_common/flight_constants.py`.
 
 ### DoGet column projection
@@ -141,7 +141,7 @@ preferred to widening it silently. The one production consumer,
 twice — for the ticket and for the `SELECT` it binds — so the two cannot drift.
 
 Allowlist constants: `ALIGNMENT_PROJECTION_COLUMNS` in
-`qiita-data-plane/src/flight_service.rs` and `_PROJECTION_COLUMNS` in
+`qiita-data-plane/src/flight_service/query.rs` and `_PROJECTION_COLUMNS` in
 `qiita-control-plane/src/qiita_control_plane/auth/tickets.py`. Both are
 hand-copies (neither language can import the other) pinned by parity tests, and
 the Rust one is additionally checked against the live `alignment_visible`

@@ -195,7 +195,7 @@ async def delete_reference_cascade(
     #
     # Computed before the DELETEs below (the EXCEPT needs this reference's rows
     # present). The two reference-claim terms MUST match the data-plane orphan
-    # computation in qiita-data-plane's flight_service.rs::delete_reference — the two
+    # computation in qiita-data-plane's crate::flight_service::delete::delete_reference — the two
     # stores GC the same features independently, so a change to either query must
     # change the other or sequences/features desync across stores. The assembly term is
     # deliberately Postgres-only: an assembly's contig bytes land in

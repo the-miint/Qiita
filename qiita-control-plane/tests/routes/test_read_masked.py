@@ -333,7 +333,7 @@ async def test_doget_table_is_in_cp_allowlist(ctx):
 
 def test_cp_doget_allowlist_matches_the_rust_one_exactly():
     """`_DOGET_ALLOWED_TABLES` is a hand-copy of the data plane's `ALLOWED_TABLES`
-    (flight_service.rs). The CP signs tickets; the DP serves them. The two lists must
+    (flight_service/query.rs). The CP signs tickets; the DP serves them. The two lists must
     be IDENTICAL, and the failure when they aren't is asymmetric and silent:
 
     * a table in the DP list but not the CP one is UNREACHABLE — the DP would serve

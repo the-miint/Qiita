@@ -632,7 +632,7 @@ pub fn verify_sync_reference_exclusion(
 /// Wire shape pinned by
 /// `qiita_control_plane.actions.library.mint_phylogeny_edge_id_data`:
 /// `{"action": "mint_phylogeny_edge_id", "reference_idx": <i64>}`. What the mint is
-/// for: see `mint_phylogeny_edge_id` in `flight_service.rs`. Scoped to one
+/// for: see `mint_phylogeny_edge_id` in `flight_service/delete.rs`. Scoped to one
 /// reference, which is why the field is here (unlike the global exclusion mirror).
 /// `deny_unknown_fields` keeps the contract tight: any extra field is a design slip
 /// surfaced loudly here.
