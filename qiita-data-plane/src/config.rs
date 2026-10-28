@@ -112,10 +112,9 @@ pub(crate) fn derived_share_mib(ceiling_bytes: u64, size: usize) -> u64 {
 /// reaches it is a clean error naming the setting, with nothing left behind.
 const DEFAULT_MAX_TEMP_DIRECTORY_SIZE: &str = "4GiB";
 
-/// Smallest per-connection spill cap `spill_cap` will derive. It rests on the one
-/// non-zero spill recorded (see `DEFAULT_MAX_TEMP_DIRECTORY_SIZE`), written by an
-/// export that then failed its allocation: 64 MiB is the first power of two above
-/// it. It is not a size any request was measured to need.
+/// Smallest per-connection spill cap `spill_cap` will derive: the first power of
+/// two above the spill recorded on `DEFAULT_MAX_TEMP_DIRECTORY_SIZE`. It is not a
+/// size any request was measured to need.
 pub(crate) const MIN_DERIVED_SPILL_MIB: u64 = 64;
 
 /// Where the per-connection spill cap came from.

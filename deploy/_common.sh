@@ -734,7 +734,7 @@ qiita_data_plane_dropin_content() {
 # qiita-data-plane@ instance, so an instance whose port left the list (including
 # one QIITA_DP_DISABLE_REMOVED=1 disables) keeps no stale count or limit. $2 = the
 # MemoryMax= value or empty, $3 = the systemd unit directory (default
-# $QIITA_SYSTEMD_UNIT_DIR). Takes effect at the next `systemctl daemon-reload`.
+# $QIITA_SYSTEMD_UNIT_DIR). When it applies: "Per-instance limits" above.
 qiita_write_data_plane_dropins() {
     local ports="$1" value="$2" unitdir="${3:-$QIITA_SYSTEMD_UNIT_DIR}" count port dir conf configured=" "
     count=$(wc -w <<<"$ports")

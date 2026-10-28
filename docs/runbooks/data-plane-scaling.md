@@ -132,12 +132,11 @@ On the peer host:
    firewall. The listener has no TLS and no authentication beyond the ticket signature.
 4. Optional, to spill to the peer's own disk rather than the shared filesystem: set
    `DUCKDB_TEMP_DIRECTORY` in the peer's `data-plane.env` to a local path the data
-   plane can create or write. With `DUCKDB_MAX_TEMP_DIRECTORY_SIZE` unset, each
-   instance derives its cap per pooled connection at boot from the free space of that
-   disk divided by instances × `DUCKLAKE_POOL_SIZE`, and refuses to boot if that is
-   below its floor. That hands the disk's whole free space to spill, so use a
-   filesystem nothing else writes, or set the cap yourself (`.env.data-plane.example`
-   describes both and their defaults).
+   plane can create or write, on a filesystem used only for spill, or also set
+   `DUCKDB_MAX_TEMP_DIRECTORY_SIZE`, a cap per pooled connection. Left unset, the cap
+   is derived from that disk at boot, and the data plane refuses to boot if it comes
+   out under a floor (`spill_cap` in `qiita-data-plane/src/config.rs` says how and
+   why; `.env.data-plane.example` describes both settings).
 
 On this host:
 
