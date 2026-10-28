@@ -5,7 +5,8 @@
   `MemoryMax=` in a drop-in the deploy writes for each `qiita-data-plane@<port>` unit,
   together with `QIITA_DATA_PLANE_LOCAL_INSTANCES`, the number of local instances. With
   `DUCKDB_MEMORY_LIMIT` unset, each instance then sizes its pool from its own limit rather
-  than the whole host's memory. The deploy rejects a value that is not a positive integer
+  than the whole host's memory, and with `DUCKDB_THREADS` unset it divides the host's CPU
+  budget by the local instances as well as by `DUCKLAKE_POOL_SIZE`. The deploy rejects a value that is not a positive integer
   with an optional `K`/`M`/`G`/`T` suffix, or whose total across the local instances
   exceeds the host's `MemTotal`, before installing anything, and stops if
   `data-plane.env` sets `QIITA_DATA_PLANE_LOCAL_INSTANCES` itself or sets a

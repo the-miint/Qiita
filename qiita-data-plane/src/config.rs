@@ -46,6 +46,9 @@ pub struct Settings {
     pub memory_ceiling: MemoryCeiling,
     /// CPU allowance each connection's `threads` was divided from.
     pub thread_budget: usize,
+    /// `QIITA_DATA_PLANE_LOCAL_INSTANCES`: the data planes on this host, which
+    /// the derived `threads` and spill cap are divided by.
+    pub local_instances: u64,
     /// Where `pool.max_temp_directory_size` came from, carried for the boot log
     /// like `memory_ceiling`.
     pub spill_cap_source: SpillCapSource,
@@ -99,6 +102,17 @@ pub(crate) const MIN_MEMORY_LIMIT_MIB: u64 = 512;
 /// detected ceiling of `ceiling_bytes` when none is configured.
 pub(crate) fn derived_share_mib(ceiling_bytes: u64, size: usize) -> u64 {
     ceiling_bytes / CEILING_DIVISOR / size as u64 / (1024 * 1024)
+}
+
+/// The `threads` each of `size` connections in each of `instances` data planes
+/// on this host gets from a CPU allowance of `budget`, when `DUCKDB_THREADS` is
+/// not set. `budget` is what this process sees (`detect_thread_budget`), and no
+/// unit caps an instance's CPU, so every local instance sees the same cores;
+/// dividing by `instances` as well keeps N of them from each sizing for all of
+/// them. At least 1, so a request always gets a thread.
+pub(crate) fn derived_threads(budget: usize, instances: u64, size: usize) -> u32 {
+    let per_connection = budget as u64 / instances / size as u64;
+    std::cmp::max(1, u32::try_from(per_connection).unwrap_or(u32::MAX))
 }
 
 /// Per-connection ceiling on spill when `DUCKDB_TEMP_DIRECTORY` is not set (else
@@ -362,6 +376,10 @@ impl Settings {
             size,
         )?;
 
+        // Parsed whether or not threads or the spill cap is derived, so a
+        // malformed value fails boot wherever it appears.
+        let instances = parse_positive::<u64>("QIITA_DATA_PLANE_LOCAL_INSTANCES")?.unwrap_or(1);
+
         // The CPU allowance divided by the in-flight bound, so a saturated
         // pool asks for the budget once rather than once per request. Measured
         // on the deploy host (48 cores), one masked-read request fitted
@@ -370,7 +388,7 @@ impl Settings {
         // expression inflated both axes — so this is the setting that prices
         // concurrency.
         let threads = parse_positive::<u32>("DUCKDB_THREADS")?
-            .unwrap_or_else(|| std::cmp::max(1, (thread_budget / size) as u32));
+            .unwrap_or_else(|| derived_threads(thread_budget, instances, size));
 
         let memory_limit = match env_value("DUCKDB_MEMORY_LIMIT") {
             Some(raw) => raw,
@@ -417,9 +435,6 @@ impl Settings {
         let max_concurrent_doput = parse_positive::<usize>("FLIGHT_MAX_CONCURRENT_DOPUT")?
             .unwrap_or(DEFAULT_MAX_CONCURRENT_DOPUT);
 
-        // Parsed whether or not the cap is derived, so a malformed value fails boot
-        // wherever it appears.
-        let instances = parse_positive::<u64>("QIITA_DATA_PLANE_LOCAL_INSTANCES")?.unwrap_or(1);
         let (max_temp_directory_size, spill_cap_source) = spill_cap(
             env_value("DUCKDB_MAX_TEMP_DIRECTORY_SIZE"),
             explicit_temp_directory.is_some(),
@@ -444,6 +459,7 @@ impl Settings {
             },
             memory_ceiling,
             thread_budget,
+            local_instances: instances,
             spill_cap_source,
             max_concurrent_doput,
         })
@@ -493,6 +509,18 @@ mod tests {
 
     fn unread() -> impl FnOnce() -> Result<(PathBuf, u64), String> {
         || panic!("the free space is read only when the cap is derived")
+    }
+
+    #[test]
+    fn derived_threads_divide_the_budget_by_instances_and_connections() {
+        // One instance: the budget divided by the pool, as before the count existed.
+        assert_eq!(derived_threads(48, 1, 8), 6);
+        assert_eq!(derived_threads(48, 2, 8), 3);
+        assert_eq!(derived_threads(48, 3, 8), 2);
+        // Floored, and never below one thread.
+        assert_eq!(derived_threads(48, 5, 8), 1);
+        assert_eq!(derived_threads(4, 2, 8), 1);
+        assert_eq!(derived_threads(1, 1, 1), 1);
     }
 
     #[test]

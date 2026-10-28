@@ -34,7 +34,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // that these settings applied rather than that they were intended.
     let pool_log = format!(
         "qiita-data-plane pool: {} connections x {} threads, memory_limit {} \
-         (from a {:.1} GiB ceiling read via {}, CPU budget {}), \
+         (from a {:.1} GiB ceiling read via {}, CPU budget {} / {} local instances), \
          spill under {} capped at {} ({}); {} concurrent uploads",
         cfg.pool.size,
         cfg.pool.threads,
@@ -42,6 +42,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cfg.memory_ceiling.bytes as f64 / (1024.0 * 1024.0 * 1024.0),
         cfg.memory_ceiling.source.as_str(),
         cfg.thread_budget,
+        cfg.local_instances,
         cfg.pool.temp_directory.display(),
         cfg.pool.max_temp_directory_size,
         cfg.spill_cap_source.describe(cfg.pool.size),
@@ -370,7 +371,7 @@ mod tests {
         assert!(cfg.pool.threads >= 1, "a request always gets a thread");
         assert_eq!(
             cfg.pool.threads,
-            std::cmp::max(1, (cfg.thread_budget / cfg.pool.size) as u32),
+            super::config::derived_threads(cfg.thread_budget, 1, cfg.pool.size),
             "threads is the CPU budget divided by the bound"
         );
         assert!(
@@ -401,6 +402,8 @@ mod tests {
         let spill = tmp_abs("qiita-test-spill");
         std::env::set_var("DUCKLAKE_POOL_SIZE", "3");
         std::env::set_var("DUCKDB_THREADS", "5");
+        // An explicit DUCKDB_THREADS is not divided by the instance count.
+        std::env::set_var("QIITA_DATA_PLANE_LOCAL_INSTANCES", "4");
         std::env::set_var("DUCKDB_MEMORY_LIMIT", "7GiB");
         std::env::set_var("DUCKDB_TEMP_DIRECTORY", &spill);
         std::env::set_var("DUCKDB_MAX_TEMP_DIRECTORY_SIZE", "11GiB");
@@ -439,6 +442,12 @@ mod tests {
             cfg.spill_cap_source
         );
         assert!(cfg.pool.max_temp_directory_size.ends_with("MiB"));
+        assert_eq!(cfg.local_instances, 3);
+        assert_eq!(
+            cfg.pool.threads,
+            super::config::derived_threads(cfg.thread_budget, 3, 1),
+            "threads are divided by the instance count too"
+        );
     }
 
     #[test]

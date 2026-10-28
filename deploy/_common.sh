@@ -627,9 +627,9 @@ qiita_assert_peer_private() {
 # --- Per-instance limits -------------------------------------------------------
 # Each local instance's unit gets one drop-in, written by activate.sh on every
 # deploy. It sets QIITA_DATA_PLANE_LOCAL_INSTANCES, the number of local instances,
-# which the data plane divides the spill filesystem by (spill_cap in
-# qiita-data-plane/src/config.rs), and, when QIITA_DATA_PLANE_INSTANCE_MEMORY_MAX
-# is set, MemoryMax=. MemoryMax= sets the unit's cgroup memory.max, which the data
+# which the data plane divides the spill filesystem (spill_cap) and its CPU budget
+# (derived_threads) by, both in qiita-data-plane/src/config.rs, and, when
+# QIITA_DATA_PLANE_INSTANCE_MEMORY_MAX is set, MemoryMax=. MemoryMax= sets the unit's cgroup memory.max, which the data
 # plane reads at boot as its memory ceiling (resources::detect_memory_ceiling) and
 # divides across its pool. Both take effect at the restart that follows the write.
 #

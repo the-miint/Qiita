@@ -44,12 +44,12 @@ Never edit `/etc/nginx/conf.d/qiita.conf` on the host: every deploy overwrites i
 3. `sudo make verify-deploy QIITA_HOSTNAME=<fqdn>` shows one `health/data-plane@<port>`
    row per port and a `health/data-plane-lb` row for the loopback listener.
 
-Each instance is another process on the same cores and memory, and none of them knows
-about the others. Unset, `DUCKDB_MEMORY_LIMIT` and `DUCKDB_THREADS` are derived per
-instance from the memory and CPU the instance sees, divided among that instance's own
-pool (`qiita-data-plane/src/config.rs`); without a per-instance limit that is the whole
-host, so N instances on one host each budget for the whole host. Before adding an
-instance:
+Each instance is another process on the same cores and memory. Unset,
+`DUCKDB_MEMORY_LIMIT` and `DUCKDB_THREADS` are derived per instance and divided among
+that instance's own pool (`qiita-data-plane/src/config.rs`). `DUCKDB_THREADS` is also
+divided by `QIITA_DATA_PLANE_LOCAL_INSTANCES` (`derived_threads`); memory is not, and
+without a per-instance limit each instance derives it from the whole host's memory.
+Before adding an instance:
 
 - **Memory.** Set `QIITA_DATA_PLANE_INSTANCE_MEMORY_MAX` in
   `/etc/qiita/data-plane.env` to the memory one instance may use, e.g. `48G`. The deploy
@@ -61,9 +61,10 @@ instance:
   exceeds `QIITA_DATA_PLANE_INSTANCE_MEMORY_MAX`. The
   limit is read at boot, so a change takes the restart the redeploy does.
   `verify-deploy` shows one `dp-memory-max/qiita-data-plane@<port>` row per instance.
-- **CPU.** Set `DUCKDB_THREADS` in the same file, which every local instance reads, to
-  the cores the data plane may use divided by (instances × `DUCKLAKE_POOL_SIZE`, default
-  8).
+- **CPU.** No per-instance CPU limit is set. Unset, `DUCKDB_THREADS` is the cores the
+  instance sees divided by (instances × `DUCKLAKE_POOL_SIZE`, default 8), at least 1.
+  An explicit `DUCKDB_THREADS` in the same file, which every local instance reads, is
+  used as written.
 
 Each pooled connection also holds a backend on the catalog's Postgres; see
 [Catalog connections](#catalog-connections) before raising the instance count or
