@@ -301,13 +301,8 @@ env_file_sets_var() {
 # docs/runbooks/data-plane-scaling.md is the operator procedure.
 #
 # One more host setting in $DP_ENV, read the same way, sizes each local instance
-# rather than placing it:
-#
-#   QIITA_DATA_PLANE_INSTANCE_MEMORY_MAX  MemoryMax= of every local instance's unit.
-#                               Default none (no per-instance limit).
-#
-# activate.sh writes it, with the local instance count, into a per-instance drop-in
-# (qiita_write_data_plane_dropins).
+# rather than placing it: QIITA_DATA_PLANE_INSTANCE_MEMORY_MAX, under "Per-instance
+# limits" below.
 
 # The address and port of the loopback listener nginx serves the qiita_data_plane
 # upstream on for on-host clients.
@@ -637,12 +632,17 @@ qiita_assert_peer_private() {
 # is set, MemoryMax=. MemoryMax= sets the unit's cgroup memory.max, which the data
 # plane reads at boot as its memory ceiling (resources::detect_memory_ceiling) and
 # divides across its pool. Both take effect at the restart that follows the write.
+#
+#   QIITA_DATA_PLANE_INSTANCE_MEMORY_MAX  in $DP_ENV: MemoryMax= of every local
+#                               instance's unit. Default none (no per-instance limit).
 QIITA_DATA_PLANE_DROPIN_NAME=instance-limits.conf
+# Where systemd reads unit files and drop-ins from.
+QIITA_SYSTEMD_UNIT_DIR=/etc/systemd/system
 
 # The drop-in directory of one instance unit. $1 = a port, $2 = the systemd unit
-# directory (default /etc/systemd/system).
+# directory (default $QIITA_SYSTEMD_UNIT_DIR).
 qiita_data_plane_dropin_dir() {
-    printf '%s/qiita-data-plane@%s.service.d' "${2:-/etc/systemd/system}" "$1"
+    printf '%s/qiita-data-plane@%s.service.d' "${2:-$QIITA_SYSTEMD_UNIT_DIR}" "$1"
 }
 
 # A systemd size as bytes: a positive integer with an optional K, M, G or T suffix,
@@ -734,9 +734,9 @@ qiita_data_plane_dropin_content() {
 # qiita-data-plane@ instance, so an instance whose port left the list (including
 # one QIITA_DP_DISABLE_REMOVED=1 disables) keeps no stale count or limit. $2 = the
 # MemoryMax= value or empty, $3 = the systemd unit directory (default
-# /etc/systemd/system). Takes effect at the next `systemctl daemon-reload`.
+# $QIITA_SYSTEMD_UNIT_DIR). Takes effect at the next `systemctl daemon-reload`.
 qiita_write_data_plane_dropins() {
-    local ports="$1" value="$2" unitdir="${3:-/etc/systemd/system}" count port dir conf configured=" "
+    local ports="$1" value="$2" unitdir="${3:-$QIITA_SYSTEMD_UNIT_DIR}" count port dir conf configured=" "
     count=$(wc -w <<<"$ports")
     count=${count//[[:space:]]/}
     for port in $ports; do

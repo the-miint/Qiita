@@ -49,7 +49,10 @@ token aged out — from one shared module
 Each pooled connection carries its own `threads`, `memory_limit`, `temp_directory`
 and `max_temp_directory_size`, divided at boot from the memory ceiling the
 process detects for itself and overridable per deploy (`DUCKLAKE_POOL_SIZE` and
-the `DUCKDB_*` vars in `.env.data-plane.example`). A read runs with insertion
+the `DUCKDB_*` vars in `.env.data-plane.example`). The spill cap is the explicit
+`DUCKDB_MAX_TEMP_DIRECTORY_SIZE` when set; else, when `DUCKDB_TEMP_DIRECTORY` is set,
+it is derived from that filesystem's free space; else it is a 4GiB default
+(`spill_cap` in `qiita-data-plane/src/config.rs`). A read runs with insertion
 order off, so a DoGet's rows arrive in no defined order; a client that needs one
 orders them itself. A DoAction that writes to the lake runs instead on one
 thread with order on, so what it writes keeps its source's order (`LakeWriter`

@@ -15,7 +15,7 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
 
 ### 1. Env vars — set BEFORE the deploy (most are `from_env()` fail-fast; a missing one keeps the unit down)
 
-_None yet._
+- `[admin]` (#TBD) Only if `/etc/qiita/data-plane.env` sets `DUCKDB_TEMP_DIRECTORY` without `DUCKDB_MAX_TEMP_DIRECTORY_SIZE`: the per-connection spill cap is now derived from that filesystem's free space — usually larger than 4GiB, and together the connections may fill it. To keep today's cap, set it before the deploy: `sudo bash -c 'grep -q "^DUCKDB_MAX_TEMP_DIRECTORY_SIZE=" /etc/qiita/data-plane.env || echo "DUCKDB_MAX_TEMP_DIRECTORY_SIZE=4GiB" >> /etc/qiita/data-plane.env'`.
 
 ### 2. One-time host setup
 
@@ -49,8 +49,10 @@ _None yet._
   run with `QIITA_DP_DISABLE_REMOVED=1`, which disables and stops it;
   `commit/data-plane@<port>` and `commit/data-plane-peer@<host:port>` fail for a member
   not running this host's deployed commit (`BUILD_COMMIT` in
-  `/opt/qiita/data-plane/build.env`, which the deploy writes). A host running only
-  `qiita-data-plane@50051` is unaffected.
+  `/opt/qiita/data-plane/build.env`, which the deploy writes);
+  `dp-memory-max/qiita-data-plane@<port>` (#TBD) fails when a unit's `MemoryMax` differs
+  from `QIITA_DATA_PLANE_INSTANCE_MEMORY_MAX`, and is skipped when that key is unset. A
+  host running only `qiita-data-plane@50051` is unaffected.
 
 ### 6. After the deploy verifies green
 
@@ -62,7 +64,7 @@ _None yet._
 ### Notes (no host action)
 
 - (#767) A killed DoPut leaves `staging/uploads/<idx>/upload.parquet.partial`, which nothing reclaims, as nothing reclaims finished uploads. `qiita-admin masked-read-export` gains `--retry-seconds` (default 3900, the data-plane unit's stop timeout).
-- (#TBD) Optional `QIITA_DATA_PLANE_INSTANCE_MEMORY_MAX` in `/etc/qiita/data-plane.env` sets `MemoryMax=` per local data-plane instance ([`data-plane-scaling.md` § More instances on this host](docs/runbooks/data-plane-scaling.md#more-instances-on-this-host)). Every deploy now writes `/etc/systemd/system/qiita-data-plane@<port>.service.d/instance-limits.conf` (instance count; `MemoryMax=` only when the key is set) and stops if `data-plane.env` sets `QIITA_DATA_PLANE_LOCAL_INSTANCES`. New `dp-memory-max` rows in `preflight` and `verify-deploy`, skipped when the key is unset. A host with `DUCKDB_TEMP_DIRECTORY` set and `DUCKDB_MAX_TEMP_DIRECTORY_SIZE` unset gets a spill cap derived from that disk's free space instead of 4GiB, and the data plane refuses to boot if it is under 64 MiB per connection; set `DUCKDB_MAX_TEMP_DIRECTORY_SIZE=4GiB` before the deploy to keep the old cap.
+- (#TBD) Optional `QIITA_DATA_PLANE_INSTANCE_MEMORY_MAX` in `/etc/qiita/data-plane.env` sets `MemoryMax=` per local data-plane instance ([`data-plane-scaling.md` § More instances on this host](docs/runbooks/data-plane-scaling.md#more-instances-on-this-host)). Every deploy now writes `/etc/systemd/system/qiita-data-plane@<port>.service.d/instance-limits.conf` (instance count; `MemoryMax=` only when the key is set) and stops if `data-plane.env` sets `QIITA_DATA_PLANE_LOCAL_INSTANCES`; `preflight` gains a `dp-memory-max` row, skipped when the key is unset.
 
 ## Deployed history
 

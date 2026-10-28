@@ -8,15 +8,14 @@ repo has no measurement of what an added instance or peer buys in throughput.
 
 ## Settings
 
-Four keys in `/etc/qiita/data-plane.env`, read on every deploy by `activate.sh` and
-`verify.sh`, and (the bind host) by the `qiita-data-plane@.service` units:
+Four keys in `/etc/qiita/data-plane.env`, read on every deploy by `activate.sh`,
+`verify.sh` and `preflight.sh`, and (the bind host) by the `qiita-data-plane@.service` units:
 
 | Key | Default | Meaning |
 |---|---|---|
 | `QIITA_DATA_PLANE_PORTS` | `50051` | Instances this host runs, space-separated and quoted. Each port is one `qiita-data-plane@<port>` unit. |
 | `QIITA_DATA_PLANE_PEERS` | none | Data planes on other hosts that this host's nginx also balances to, as `host:port`. |
 | `QIITA_DATA_PLANE_BIND_HOST` | `127.0.0.1` | The IPv4 address this host's instances listen on: loopback or private, never public. Leave it at `127.0.0.1` on a host that runs the control plane, unless the control plane is first pointed at the loopback listener ([below](#the-control-plane-through-nginx)): its default `DATA_PLANE_URL`, `grpc://localhost:50051`, finds no instance once they listen elsewhere. |
-
 | `QIITA_DATA_PLANE_INSTANCE_MEMORY_MAX` | none | `MemoryMax=` of each local instance's unit, a positive integer with an optional `K`/`M`/`G`/`T` suffix ([below](#more-instances-on-this-host)). |
 
 The deploy also writes `QIITA_DATA_PLANE_LOCAL_INSTANCES`, the number of ports in
@@ -136,7 +135,8 @@ On the peer host:
    plane can create or write. With `DUCKDB_MAX_TEMP_DIRECTORY_SIZE` unset, each
    instance derives its cap per pooled connection at boot from the free space of that
    disk divided by instances × `DUCKLAKE_POOL_SIZE`, and refuses to boot if that is
-   below its floor; set the cap to choose it yourself (`.env.data-plane.example`
+   below its floor. That hands the disk's whole free space to spill, so use a
+   filesystem nothing else writes, or set the cap yourself (`.env.data-plane.example`
    describes both and their defaults).
 
 On this host:

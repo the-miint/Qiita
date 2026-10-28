@@ -113,10 +113,9 @@ pub(crate) fn derived_share_mib(ceiling_bytes: u64, size: usize) -> u64 {
 const DEFAULT_MAX_TEMP_DIRECTORY_SIZE: &str = "4GiB";
 
 /// Smallest per-connection spill cap `spill_cap` will derive. It rests on the one
-/// spill size measured, the largest seen anywhere (on
-/// `DEFAULT_MAX_TEMP_DIRECTORY_SIZE`): 64 MiB is the first power of two above it,
-/// so a derived cap never stops a spill as large as one already observed. It is
-/// not a size any request was measured to need.
+/// non-zero spill recorded (see `DEFAULT_MAX_TEMP_DIRECTORY_SIZE`), written by an
+/// export that then failed its allocation: 64 MiB is the first power of two above
+/// it. It is not a size any request was measured to need.
 pub(crate) const MIN_DERIVED_SPILL_MIB: u64 = 64;
 
 /// Where the per-connection spill cap came from.
@@ -173,7 +172,9 @@ pub(crate) fn derived_spill_cap_mib(available_bytes: u64, instances: u64, size: 
 /// that filesystem as it was at boot. Without an explicit directory the spill root
 /// is under `PATH_SCRATCH`, which also holds DoPut staging and ticket workspaces,
 /// so its free space is not the spill's to divide, and the cap stays
-/// `DEFAULT_MAX_TEMP_DIRECTORY_SIZE`.
+/// `DEFAULT_MAX_TEMP_DIRECTORY_SIZE`. The derivation hands the whole free space of
+/// the explicit directory's filesystem to spill, so that directory belongs on a
+/// filesystem used only for spill; on a shared one, set the cap explicitly.
 ///
 /// A derived cap below `MIN_DERIVED_SPILL_MIB` fails boot rather than being
 /// rounded up, for the reason `MIN_MEMORY_LIMIT_MIB` gives for memory: granting
