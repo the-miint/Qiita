@@ -27,6 +27,6 @@
   `deploy/nginx/qiita.conf`, a template that fails `nginx -t` unrendered. The deploy's
   idle wait covers every local instance, counting each one's open `*.partial` uploads,
   and all of them restart in one `systemctl restart`, so their drains overlap. Data
-  planes booting together against one catalog retry its setup conflicts for up to 60 s
-  (`ducklake::setup_catalog`). Procedure, including how to divide memory, threads and
+  planes booting together against one catalog set it up one at a time, on a Postgres
+  advisory lock, each waiting up to 60 s for it (`ducklake::setup_catalog`). Procedure, including how to divide memory, threads and
   catalog connections across instances on one host: `docs/runbooks/data-plane-scaling.md`.

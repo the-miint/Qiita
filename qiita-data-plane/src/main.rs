@@ -26,13 +26,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             e
         })?;
 
-    // Attach the catalog and create its tables once, at boot (see setup_catalog);
-    // the listen port is the retry backoff's salt.
-    ducklake::setup_catalog(
-        &cfg.ducklake_catalog_connstr,
-        &cfg.path_persistent_ducklake,
-        i64::from(cfg.listen_addr.port()),
-    )?;
+    // Attach the catalog and create its tables once, at boot (see setup_catalog).
+    ducklake::setup_catalog(&cfg.ducklake_catalog_connstr, &cfg.path_persistent_ducklake)?;
 
     // One bounded pool of attached connections serves every request; its size is
     // the number in flight. Logged after it opens, so the line is a statement

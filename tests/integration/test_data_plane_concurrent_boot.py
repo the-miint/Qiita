@@ -2,7 +2,7 @@
 
 A deploy restarts every instance in QIITA_DATA_PLANE_PORTS in one `systemctl restart`,
 and a reboot starts every enabled instance at once, so boots overlap. Every boot writes the catalog
-(`ducklake::setup_catalog` in the data plane, which carries the conflicts it retries);
+(`ducklake::setup_catalog` in the data plane, which serializes the setups on a lock);
 these pin that overlapping boots all come up, on an empty catalog and on one that
 already exists.
 """
