@@ -222,11 +222,15 @@ def test_expiry_signatures_match_the_data_planes_wording():
     # gRPC unauthenticated, which is what puts that word in the client's error. A
     # verify site mapped to any other Status would break the match, so read them
     # out of the source rather than asserting the constant against itself.
-    service = (DATA_PLANE_SRC / "flight_service.rs").read_text()
+    service = "".join(
+        p.read_text()
+        for p in sorted((DATA_PLANE_SRC / "flight_service").glob("*.rs"))
+        if not p.stem.endswith("tests") and p.stem != "test_support"
+    )
     verify_calls = re.findall(
         r"auth::verify_\w+\([^;]*?\.map_err\(\|e\| Status::(\w+)\(", service, flags=re.DOTALL
     )
-    assert verify_calls, "no auth::verify_* -> Status mapping found in flight_service.rs"
+    assert verify_calls, "no auth::verify_* -> Status mapping found in flight_service/"
     assert set(verify_calls) == {"unauthenticated"}, (
         f"a ticket verification now maps to {sorted(set(verify_calls))}; the classifier's "
         f"{DATA_PLANE_TICKET_EXPIRED_SIGNATURES!r} match assumes every one is unauthenticated"

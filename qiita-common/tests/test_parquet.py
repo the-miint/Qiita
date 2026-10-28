@@ -146,9 +146,9 @@ def test_data_plane_read_export_options_match_transfer_exactly():
     # set; drift would change that file's shape with nothing failing.
     import re
 
-    src = _data_plane_src("flight_service.rs")
+    src = _data_plane_src("flight_service/export.rs")
     m = re.search(r'const EXPORT_READ_PARQUET_OPTS: &str =\s*"([^"]+)";', src)
-    assert m, "EXPORT_READ_PARQUET_OPTS not found in flight_service.rs"
+    assert m, "EXPORT_READ_PARQUET_OPTS not found in flight_service/export.rs"
     assert m.group(1) == PARQUET_OPTS_TRANSFER
 
 

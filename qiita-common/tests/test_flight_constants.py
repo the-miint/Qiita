@@ -55,12 +55,16 @@ def test_constants_match_the_rust_ones_exactly():
     from pathlib import Path
 
     src = (
-        Path(__file__).resolve().parents[2] / "qiita-data-plane" / "src" / "flight_service.rs"
+        Path(__file__).resolve().parents[2]
+        / "qiita-data-plane"
+        / "src"
+        / "flight_service"
+        / "doget.rs"
     ).read_text()
 
     def rust_const(name: str) -> str:
         m = re.search(rf'const {name}: &str = "([^"]+)";', src)
-        assert m, f"{name} not found in flight_service.rs"
+        assert m, f"{name} not found in flight_service/doget.rs"
         return m.group(1)
 
     assert rust_const("IPC_COMPRESSION_HEADER") == IPC_COMPRESSION_HEADER
