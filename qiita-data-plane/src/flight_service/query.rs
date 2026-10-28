@@ -5,8 +5,6 @@ use tonic::Status;
 
 use crate::auth;
 
-use super::export::EXPORT_READ_COLUMNS;
-
 /// Allowed table names for DoGet queries. Reject anything else.
 ///
 /// PRIVACY: the bare `read` and `read_mask` tables are deliberately absent, and
@@ -257,6 +255,16 @@ fn block_read_source(table: &str) -> Option<&'static str> {
         .find(|(name, _)| *name == table)
         .map(|(_, source)| *source)
 }
+
+/// The read projection, in `read` / `read_masked` table order. Shared by the
+/// per-prep_sample `export_read` DoAction (from `qiita_lake.read`) and by BOTH
+/// block-read DoGet selectors (`read_block` from `qiita_lake.read`,
+/// `read_masked_block` from the `read_masked` MACRO), so every read payload the
+/// data plane hands a compute job has the identical column shape — the shape
+/// `align_sharded.reads` / the read-mask jobs bind. `read_masked` exposes exactly
+/// these columns (plus `mask_idx`), already trimmed and `pass`-filtered.
+pub(super) const EXPORT_READ_COLUMNS: &str =
+    "prep_sample_idx, sequence_idx, read_id, sequence1, qual1, sequence2, qual2";
 
 /// Build a block's `read` WHERE clause from its members. The ONE translator from
 /// block members to SQL: the block-read DoGet selectors (`build_block_read_query`)

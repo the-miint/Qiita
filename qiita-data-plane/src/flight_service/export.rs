@@ -10,7 +10,7 @@ use tonic::{Response, Status};
 
 use crate::auth;
 
-use super::query::single_i64_filter;
+use super::query::{single_i64_filter, EXPORT_READ_COLUMNS};
 use super::QiitaFlightService;
 
 impl QiitaFlightService {
@@ -146,16 +146,6 @@ impl QiitaFlightService {
 /// the at-rest one.
 const EXPORT_READ_PARQUET_OPTS: &str =
     "FORMAT PARQUET, PARQUET_VERSION 'v2', COMPRESSION 'zstd', ROW_GROUP_SIZE_BYTES '64MB'";
-
-/// The read projection, in `read` / `read_masked` table order. Shared by the
-/// per-prep_sample `export_read` DoAction (from `qiita_lake.read`) and by BOTH
-/// block-read DoGet selectors (`read_block` from `qiita_lake.read`,
-/// `read_masked_block` from the `read_masked` MACRO), so every read payload the
-/// data plane hands a compute job has the identical column shape — the shape
-/// `align_sharded.reads` / the read-mask jobs bind. `read_masked` exposes exactly
-/// these columns (plus `mask_idx`), already trimmed and `pass`-filtered.
-pub(super) const EXPORT_READ_COLUMNS: &str =
-    "prep_sample_idx, sequence_idx, read_id, sequence1, qual1, sequence2, qual2";
 
 /// Validate a control-plane-signed `export_read` destination before the data
 /// plane writes to it. The token is signature-trusted, so this is defense in depth:
