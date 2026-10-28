@@ -1,7 +1,7 @@
 ### Changed
 
 - **The data plane's Flight service is split into modules, with no behaviour change
-  (#TBD).** `qiita-data-plane/src/flight_service.rs` and its test file are now the
+  (#790).** `qiita-data-plane/src/flight_service.rs` and its test file are now the
   `flight_service/` module directory: `mod.rs` holds the service and the `do_action`
   dispatcher, and `doget.rs`, `query.rs`, `doput.rs`, `export.rs`, `registration.rs`
   and `lake_edit.rs` each hold one surface, with its tests beside it in
