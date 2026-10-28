@@ -1220,10 +1220,12 @@ qiita_require_lake_data_path() {
 # `upload.parquet.partial` open (all measured against a running data plane, macOS).
 # A read export writes through a `.partial` too, so it counts as well. Open files
 # are found through each unit's /proc/<pid>/fd (the match measured in a Linux
-# container). The catalog query connects with the data plane's own role, which is
-# what lets it see those sessions' state; it counts the sessions of every instance
-# on the catalog, a peer host's included, and a lake-gc or lake-shell session under
-# that role counts too.
+# container). The catalog query connects with the data plane's own role and counts
+# only that role's sessions (`usename = current_user`): those of every instance on
+# the catalog, a peer host's included, and a lake-gc or lake-shell session under
+# that role. The role's pg_read_all_stats grant (qiita_catalog_connection_budget)
+# shows it every other role's sessions too, so without the filter an admin's or a
+# monitor's open transaction on the catalog would hold the restart.
 wait_for_data_plane_idle() {
     local env_file=$1
     shift
@@ -1258,6 +1260,7 @@ wait_for_data_plane_idle() {
         while :; do
             lake=$(PGPASSFILE="$PGPASS_FILE" psql "$conn" -Atc "SELECT count(*) FROM pg_stat_activity
                 WHERE datname = current_database() AND pid <> pg_backend_pid()
+                  AND usename = current_user
                   AND state IN ('active', 'idle in transaction')") || {
                 echo "ERROR: cannot query the data plane's catalog to tell whether $unit_names is idle; set QIITA_DP_IDLE_WAIT_S=0 to restart without waiting" >&2
                 exit 1

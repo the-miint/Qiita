@@ -23,7 +23,9 @@
   client sessions open now, exceed `max_connections` less `superuser_reserved_connections`
   and `reserved_connections`, and otherwise prints the numbers and one
   `<host>:<port> pool=<n>` line per instance. The data plane's catalog role needs
-  `pg_read_all_stats`; without it the row fails and names the grant.
+  `pg_read_all_stats`; without it the row fails and names the grant. The deploy's
+  wait for the data plane to go idle counts only that role's catalog sessions, so
+  another role's open transaction does not hold the restart.
 
 ### Changed
 
