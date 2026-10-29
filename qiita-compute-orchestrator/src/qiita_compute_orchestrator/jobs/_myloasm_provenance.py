@@ -56,6 +56,8 @@ _CONTIG_REFERENCE_COLUMNS = (
     ("myloasm_link", "from_contig_id"),
     ("myloasm_link", "to_contig_id"),
 )
+# The readers name a contig only by myloasm's text id, so its number is parsed here
+# (duckdb-miint#389 asks the readers for a numeric column).
 _CONTIG_NAME_RE = "^u([0-9]+)ctg$"
 # miint's `dereplication_status` for the contigs a run hashes into features.
 _PRIMARY = "primary"

@@ -10,7 +10,8 @@
   myloasm's `u<N>ctg` name and, for a primary contig, by its `feature_idx`. Each
   registration replaces the run's rows. hifiasm_meta runs write none. On myloasm 0.6.0
   a graph edge carries no overlap evidence, so those columns are NULL
-  (duckdb-miint#358).
+  (duckdb-miint#358). The contig number is parsed from myloasm's name, since the
+  readers expose none (duckdb-miint#389).
 
 ### Changed
 
