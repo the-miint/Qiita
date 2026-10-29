@@ -299,10 +299,6 @@ env_file_sets_var() {
 # given. They are read from the file only, never the deploy's environment, so what
 # a deploy renders and enables is what the file says.
 # docs/runbooks/data-plane-scaling.md is the operator procedure.
-#
-# One more host setting in $DP_ENV, read the same way, sizes each local instance
-# rather than placing it: QIITA_DATA_PLANE_INSTANCE_MEMORY_MAX, under "Per-instance
-# limits" below.
 
 # The address and port of the loopback listener nginx serves the qiita_data_plane
 # upstream on for on-host clients.
