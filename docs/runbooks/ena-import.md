@@ -469,13 +469,11 @@ failure_type `permanent` and both digests in the reason. A run that broke mid-do
 or its file server, a failed connection to the server and an HTTP status 0 (no usable
 status) are retried the same way, as is ENA's "Not all results may have been
 written" answer with a miint build that includes duckdb-miint#310. A run whose file
-cannot be opened depends on the miint build: before duckdb-miint#312 miint skips it with
-a warning, which is retried like the rest, so a 404 costs the full retry limit; from
-duckdb-miint#312 on, a 404 fails at once.
+returns a 404 fails at once.
 
 Where verification does not apply (an SFF run, a file that is not gzip-compressed, no
-`fastq_md5` from ENA) the run still registers. A run that comes back empty with no
-warning fails permanently.
+`fastq_md5` from ENA) the run still registers. A run that comes back empty fails
+permanently.
 
 A run that fails in a way a retry cannot clear (a format error, a run with no sequence
 data, a 404 from duckdb-miint#312 on, zero reads) does not fail its pool when another run

@@ -125,14 +125,14 @@ def _inputs(tmp_path, roster: list[tuple[int, str]]) -> Inputs:
     )
 
 
-def _fake_stage_run_reads_factory(by_run: dict[str, tuple[list[tuple], list[str]]]):
+def _fake_stage_run_reads_factory(by_run: dict[str, list[tuple]]):
     """Build a `_stage_run_reads`-shaped fake keyed by run_accession; each entry
-    is `(rows, warnings)`."""
+    is the run's rows."""
 
     def _fake(run_accession, download_method, intermediate_path, duckdb_tmp, memory_gb, threads):
-        rows, warnings = by_run[run_accession]
+        rows = by_run[run_accession]
         _write_intermediate(intermediate_path, rows)
-        return len(rows), warnings
+        return len(rows)
 
     return _fake
 
@@ -147,17 +147,11 @@ def test_ingests_every_run_once_paired_and_single(fake_mint, monkeypatch, tmp_pa
     and land in both the durable staging copy and the hardlinked register part."""
     fake = _fake_stage_run_reads_factory(
         {
-            "ERR001": (
-                [
-                    (1, "r1", "ACGT", [40, 40, 40, 40], "TTTT", [40, 40, 40, 40]),
-                    (2, "r2", "GGGG", [40, 40, 40, 40], "CCCC", [40, 40, 40, 40]),
-                ],
-                [],
-            ),
-            "ERR002": (
-                [(1, "s1", "AAAA", [40, 40, 40, 40], None, None)],
-                [],
-            ),
+            "ERR001": [
+                (1, "r1", "ACGT", [40, 40, 40, 40], "TTTT", [40, 40, 40, 40]),
+                (2, "r2", "GGGG", [40, 40, 40, 40], "CCCC", [40, 40, 40, 40]),
+            ],
+            "ERR002": [(1, "s1", "AAAA", [40, 40, 40, 40], None, None)],
         }
     )
     monkeypatch.setattr(ingest_module, "_stage_run_reads", fake)
@@ -183,7 +177,7 @@ def test_concurrent_pool_ingests_every_run_above_cap(fake_mint, monkeypatch, tmp
     fan-out mints once per run and writes each durable copy + register part."""
     n = ingest_module._CONCURRENCY + 2
     by_run = {
-        f"ERR{i:03d}": ([(j + 1, f"r{i}_{j}", "ACGT", None, None, None) for j in range(i)], [])
+        f"ERR{i:03d}": [(j + 1, f"r{i}_{j}", "ACGT", None, None, None) for j in range(i)]
         for i in range(1, n + 1)
     }
     monkeypatch.setattr(ingest_module, "_stage_run_reads", _fake_stage_run_reads_factory(by_run))
@@ -213,7 +207,7 @@ def test_run_concurrency_bounds_runs_in_flight(fake_mint, monkeypatch, tmp_path,
         _write_intermediate(intermediate_path, [(1, "r", "ACGT", None, None, None)])
         with lock:
             state["now"] -= 1
-        return 1, []
+        return 1
 
     monkeypatch.setattr(ingest_module, "_stage_run_reads", _fake)
     inputs = _inputs(tmp_path, [(i, f"ERR{i:03d}") for i in range(1, n + 1)])
@@ -253,7 +247,7 @@ def test_per_slot_caps_follow_run_concurrency(fake_mint, monkeypatch, tmp_path, 
     def _fake(run_accession, download_method, intermediate_path, duckdb_tmp, memory_gb, threads):
         seen.append((memory_gb, threads))
         _write_intermediate(intermediate_path, [(1, "r", "ACGT", None, None, None)])
-        return 1, []
+        return 1
 
     monkeypatch.setattr(ingest_module, "_stage_run_reads", _fake)
     inputs = _inputs(tmp_path, [(1, "ERR001")]).model_copy(update={"run_concurrency": 8})
@@ -274,7 +268,7 @@ def test_pre_sort_line_names_the_run_and_slot(fake_mint, monkeypatch, tmp_path, 
 
     def _fake(run_accession, download_method, intermediate_path, duckdb_tmp, memory_gb, threads):
         _write_intermediate(intermediate_path, [(1, "r", "ACGT", None, None, None)] * 3)
-        return 3, []
+        return 3
 
     monkeypatch.setattr(ingest_module, "_stage_run_reads", _fake)
     inputs = _inputs(tmp_path, [(7, "ERR007")]).model_copy(update={"run_concurrency": 8})
@@ -307,7 +301,7 @@ def test_rerun_skips_already_ingested(fake_mint, monkeypatch, tmp_path):
     def _fake(run_accession, download_method, intermediate_path, duckdb_tmp, memory_gb, threads):
         calls.append(run_accession)
         _write_intermediate(intermediate_path, [(1, "r1", "ACGT", None, None, None)])
-        return 1, []
+        return 1
 
     monkeypatch.setattr(ingest_module, "_stage_run_reads", _fake)
     inputs = _inputs(tmp_path, [(10, "ERR001")])
@@ -329,7 +323,7 @@ def test_stale_partial_does_not_count_as_ingested(fake_mint, monkeypatch, tmp_pa
 
     def _fake(run_accession, download_method, intermediate_path, duckdb_tmp, memory_gb, threads):
         _write_intermediate(intermediate_path, [(1, "r1", "ACGT", None, None, None)])
-        return 1, []
+        return 1
 
     monkeypatch.setattr(ingest_module, "_stage_run_reads", _fake)
     inputs = _inputs(tmp_path, [(10, "ERR001")])
@@ -345,120 +339,18 @@ def test_stale_partial_does_not_count_as_ingested(fake_mint, monkeypatch, tmp_pa
 
 
 # ---------------------------------------------------------------------------
-# Fail-loud on a silent skip / partial download
+# Fail loud on zero reads
 # ---------------------------------------------------------------------------
 
 
-def test_mid_stream_skip_warning_is_retriable(fake_mint, monkeypatch, tmp_path):
-    """A skip warning (even alongside returned rows -- a mid-stream truncation)
-    fails the step retriably, and the incomplete read set is never registered."""
-
-    def _fake(run_accession, download_method, intermediate_path, duckdb_tmp, memory_gb, threads):
-        _write_intermediate(intermediate_path, [(1, "r1", "ACGT", None, None, None)])
-        return 1, [
-            "read_ena_sequences: WARNING: run 'ERR001' failed mid-stream after "
-            "emitting 1 read(s) (connection reset); skipping remainder — "
-            "downstream sees partial data for this run"
-        ]
-
-    monkeypatch.setattr(ingest_module, "_stage_run_reads", _fake)
-    inputs = _inputs(tmp_path, [(10, "ERR001")])
-
-    with pytest.raises(BackendFailure) as exc:
-        _run(inputs, tmp_path / "ws")
-    assert exc.value.kind == FailureKind.EXTERNAL_FETCH_TRANSIENT
-    assert exc.value.transient is True
-    assert "ERR001" in exc.value.reason
-    assert "re-run" in exc.value.reason
-    assert fake_mint == []  # never reached the mint — failed before it
-
-
-def test_skip_warning_without_transport_wording_is_retriable(fake_mint, monkeypatch, tmp_path):
-    """Truncation inside a gzip member has no transient marker in its text, so the
-    skip itself decides the kind."""
-
-    def _fake(run_accession, download_method, intermediate_path, duckdb_tmp, memory_gb, threads):
-        _write_intermediate(intermediate_path, [(1, "r1", "ACGT", None, None, None)])
-        return 1, [
-            "read_ena_sequences: WARNING: run 'ERR001' failed mid-stream after "
-            "emitting 1 read(s) (unexpected end of file); skipping remainder"
-        ]
-
-    monkeypatch.setattr(ingest_module, "_stage_run_reads", _fake)
-    inputs = _inputs(tmp_path, [(10, "ERR001")])
-
-    with pytest.raises(BackendFailure) as exc:
-        _run(inputs, tmp_path / "ws")
-    assert exc.value.kind == FailureKind.EXTERNAL_FETCH_TRANSIENT
-    assert fake_mint == []
-
-
-def test_open_failure_skip_warning_is_retriable(fake_mint, monkeypatch, tmp_path):
-    """A run that failed to open and was skipped (zero rows) reports the skip, not
-    'zero reads', and is retriable."""
-
-    def _fake(run_accession, download_method, intermediate_path, duckdb_tmp, memory_gb, threads):
-        return 0, [
-            "read_ena_sequences: warning: run 'ERR001' failed on retry (HTTP 404), skipping",
-            "read_ena_sequences: WARNING: 1 run(s) skipped due to download errors: ERR001",
-        ]
-
-    monkeypatch.setattr(ingest_module, "_stage_run_reads", _fake)
-    inputs = _inputs(tmp_path, [(10, "ERR001")])
-
-    with pytest.raises(BackendFailure) as exc:
-        _run(inputs, tmp_path / "ws")
-    assert exc.value.kind == FailureKind.EXTERNAL_FETCH_TRANSIENT
-    assert "zero reads" not in exc.value.reason
-    assert "re-run" not in exc.value.reason
-    assert fake_mint == []
-
-
-def test_retrying_warning_alone_does_not_fail(fake_mint, monkeypatch, tmp_path):
-    """A "retrying..." warning with NO "skip" substring means miint's internal
-    retry self-healed — the run is complete and must NOT be treated as a failure."""
-
-    def _fake(run_accession, download_method, intermediate_path, duckdb_tmp, memory_gb, threads):
-        _write_intermediate(intermediate_path, [(1, "r1", "ACGT", None, None, None)])
-        return 1, [
-            "read_ena_sequences: warning: run 'ERR001' failed to open "
-            "(connection reset), retrying..."
-        ]
-
-    monkeypatch.setattr(ingest_module, "_stage_run_reads", _fake)
-    inputs = _inputs(tmp_path, [(10, "ERR001")])
-
-    _run(inputs, tmp_path / "ws")
-    assert fake_mint == [(10, 1)]
-
-
-def test_md5_verification_skipped_warning_does_not_fail(fake_mint, monkeypatch, tmp_path):
-    """miint's "md5 verification skipped" warning reports a complete run it could
-    not verify, not missing data, so it must not trip the skip check."""
-
-    def _fake(run_accession, download_method, intermediate_path, duckdb_tmp, memory_gb, threads):
-        _write_intermediate(intermediate_path, [(1, "r1", "ACGT", None, None, None)])
-        return 1, [
-            "read_ena_sequences: WARNING: md5 verification skipped for run 'ERR001' — "
-            "file 'https://ftp.sra.ebi.ac.uk/vol1/ERR001.fastq' is not gzip-compressed; "
-            "md5 verification only supports the gzip transport basis"
-        ]
-
-    monkeypatch.setattr(ingest_module, "_stage_run_reads", _fake)
-    inputs = _inputs(tmp_path, [(10, "ERR001")])
-
-    _run(inputs, tmp_path / "ws")
-    assert fake_mint == [(10, 1)]
-
-
-def test_zero_reads_with_no_warning_is_permanent_bad_input(fake_mint, monkeypatch, tmp_path):
-    """Unlike ingest_reads' empty-well case, an ENA run producing zero reads with
-    NO explanatory warning is anomalous, not a legitimate empty result — fail
-    loud rather than silently register nothing."""
+def test_zero_reads_is_permanent_bad_input(fake_mint, monkeypatch, tmp_path):
+    """Unlike ingest_reads' empty-well case, an ENA run producing zero reads is
+    anomalous, not a legitimate empty result — fail loud rather than silently
+    register nothing."""
 
     def _fake(run_accession, download_method, intermediate_path, duckdb_tmp, memory_gb, threads):
         _write_intermediate(intermediate_path, [])
-        return 0, []
+        return 0
 
     monkeypatch.setattr(ingest_module, "_stage_run_reads", _fake)
     inputs = _inputs(tmp_path, [(10, "ERR001")])
@@ -637,8 +529,8 @@ def test_unavailable_server_fetch_error_is_retriable(fake_mint, monkeypatch, tmp
 def test_mid_stream_fetch_error_is_retried_as_partial_data(
     fake_mint, monkeypatch, tmp_path, first_error
 ):
-    """A run that broke mid-download is retried, as it is when miint skips it,
-    and its reason says the data is partial, not that ENA could not be reached."""
+    """A run that broke mid-download is retried, and its reason says the data is
+    partial, not that ENA could not be reached."""
 
     def _fake(run_accession, download_method, intermediate_path, duckdb_tmp, memory_gb, threads):
         raise duckdb.IOException(
@@ -787,12 +679,12 @@ def _read_run_outcomes(outputs) -> list[dict]:
 
 def _fake_with_failing_run(bad_run: str, failure):
     """A `_stage_run_reads` fake where `bad_run` fails as `failure` (a raised
-    exception, or a `(count, warnings)` return) and every other run is good."""
+    exception, or a count) and every other run is good."""
 
     def _fake(run_accession, download_method, intermediate_path, duckdb_tmp, memory_gb, threads):
         if run_accession != bad_run:
             _write_intermediate(intermediate_path, _GOOD_ROWS)
-            return 1, []
+            return 1
         if isinstance(failure, BaseException):
             raise failure
         _write_intermediate(intermediate_path, [])
@@ -811,7 +703,7 @@ def _fake_with_failing_run(bad_run: str, failure):
         _http_error(
             404, "HTTP Error: HTTP GET error on 'https://ftp.example/x.fastq.gz' (HTTP 404)"
         ),
-        (0, []),
+        0,
     ],
     ids=["format-error", "no-sequence-data", "http-404", "zero-reads"],
 )
@@ -871,7 +763,7 @@ def test_transient_failure_wins_over_an_unrecognised_error(fake_mint, monkeypatc
         if run_accession == "ERR002":
             raise duckdb.IOException("read_ena_sequences: md5 mismatch for run: expected a got b")
         _write_intermediate(intermediate_path, _GOOD_ROWS)
-        return 1, []
+        return 1
 
     monkeypatch.setattr(ingest_module, "_stage_run_reads", _fake)
     inputs = _inputs(tmp_path, [(10, "ERR001"), (11, "ERR002"), (12, "ERR003")])
@@ -900,7 +792,7 @@ def test_run_outcomes_is_a_top_level_json_file(fake_mint, monkeypatch, tmp_path)
 
 
 def test_run_outcomes_is_empty_when_every_run_is_stored(fake_mint, monkeypatch, tmp_path):
-    monkeypatch.setattr(ingest_module, "_stage_run_reads", _fake_with_failing_run("none", (0, [])))
+    monkeypatch.setattr(ingest_module, "_stage_run_reads", _fake_with_failing_run("none", 0))
     inputs = _inputs(tmp_path, [(10, "ERR001"), (11, "ERR002")])
 
     outputs = _run(inputs, tmp_path / "ws")
@@ -916,7 +808,7 @@ def test_transient_failure_beside_a_stored_run_retries_the_step(fake_mint, monke
         if run_accession == "ERR001":
             raise duckdb.IOException("read_ena_sequences: md5 mismatch for run: expected a got b")
         _write_intermediate(intermediate_path, _GOOD_ROWS)
-        return 1, []
+        return 1
 
     monkeypatch.setattr(ingest_module, "_stage_run_reads", _fake)
     inputs = _inputs(tmp_path, [(10, "ERR001"), (11, "ERR002")])
@@ -936,7 +828,7 @@ def test_transient_and_permanent_failures_beside_a_stored_run_retry_first(
         if run_accession == "ERR002":
             raise duckdb.IOException("read_ena_sequences: md5 mismatch for run: expected a got b")
         _write_intermediate(intermediate_path, _GOOD_ROWS)
-        return 1, []
+        return 1
 
     monkeypatch.setattr(ingest_module, "_stage_run_reads", _fake)
     inputs = _inputs(tmp_path, [(10, "ERR001"), (11, "ERR002"), (12, "ERR003")])
@@ -952,7 +844,7 @@ def test_permanent_mint_failure_fails_the_step_beside_a_good_run(monkeypatch, tm
 
     def _fake(run_accession, download_method, intermediate_path, duckdb_tmp, memory_gb, threads):
         _write_intermediate(intermediate_path, _GOOD_ROWS)
-        return 1, []
+        return 1
 
     monkeypatch.setattr(ingest_module, "_stage_run_reads", _fake)
 
@@ -991,7 +883,7 @@ def test_reuses_existing_range_on_mint_conflict(monkeypatch, tmp_path):
                 (2, "r2", "TTTT", None, None, None),
             ],
         )
-        return 2, []
+        return 2
 
     monkeypatch.setattr(ingest_module, "_stage_run_reads", _fake)
 
