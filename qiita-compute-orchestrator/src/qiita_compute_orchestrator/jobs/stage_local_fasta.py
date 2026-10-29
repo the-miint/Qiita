@@ -163,8 +163,10 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     fasta_paths = _read_manifest(inputs.fasta_manifest_path)
 
     workspace.mkdir(parents=True, exist_ok=True)
-    # A DIRECTORY holding one `part_00000.parquet`, the shape hash_sequences emits
-    # for `reference_sequence_chunks`. hash_sequences hands `fasta_path` to
+    # A DIRECTORY holding one `part_00000.parquet`: both local reference-add
+    # workflows declare `fasta_path` a directory of Parquet parts, and a single file
+    # would change the step's output under an unchanged workflow version.
+    # hash_sequences hands `fasta_path` to
     # `read_parquet` unglobbed, unlike the repo's other parts-directory readers,
     # because the same step also serves reference-add, where `fasta_path` is a
     # single `upload.parquet` — one bare path covers both shapes. So nothing but
@@ -184,13 +186,11 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             )
 
             # read_fastx takes a VARCHAR[] of paths — one streaming scan of the whole
-            # manifest, which closes each file once it has read it
-            # (`test_read_fastx_miint_contract.py` pins that under a descriptor limit
-            # far below the path count), and no full-sequence temp table. Pre-filter
-            # empties: read_fastx raises "Empty file" on a 0-record input, and one empty
-            # file aborts the scan. The pre-filter itself opens and reads a byte from
-            # every path, one at a time, which is the remaining per-path Python
-            # round-trip in this job.
+            # manifest, which closes each file once it has read it (duckdb-miint#261),
+            # and no full-sequence temp table. Pre-filter empties: read_fastx raises
+            # "Empty file" on a 0-record input, and one empty file aborts the scan. The
+            # pre-filter itself opens and reads a byte from every path, one at a time,
+            # which is the remaining per-path Python round-trip in this job.
             paths = [str(p) for p in fasta_paths if not is_empty_sequence_file(p)]
             if not paths:
                 raise ValueError(

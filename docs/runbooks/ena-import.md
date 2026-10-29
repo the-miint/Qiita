@@ -476,7 +476,7 @@ Where verification does not apply (an SFF run, a file that is not gzip-compresse
 permanently.
 
 A run that fails in a way a retry cannot clear (a format error, a run with no sequence
-data, a 404 from duckdb-miint#312 on, zero reads) does not fail its pool when another run
+data, a 404, zero reads) does not fail its pool when another run
 was stored: the other runs load, the ticket completes, and the failed run is recorded with
 its reason and `permanent` failure type (the item reads `completed_partial`). The ticket
 is COMPLETED, so the submitter gets the work-ticket digest unless they opted out of
@@ -489,7 +489,7 @@ a segfault retries on the same resources, and anything else (a local disk fault)
 ticket FAILED and redrivable.
 
 When the retries run out, or at once when no run was stored and none of the failures is one
-a retry could clear (a 404 from duckdb-miint#312 on), the ticket is FAILED `permanent` and
+a retry could clear (a 404), the ticket is FAILED `permanent` and
 emailed with its reason.
 Read the reason first. A dropped transfer or an ENA outage: redrive the ticket
 (`POST /work-ticket/{idx}/run`) once ENA is healthy; runs already stored are skipped, and

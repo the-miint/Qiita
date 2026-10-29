@@ -917,6 +917,25 @@ def test_reuses_existing_range_on_mint_conflict(monkeypatch, tmp_path):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("accession", ["ERX000001", "SAMEA1234", "PRJEB1", "not-an-accession"])
+def test_a_roster_accession_that_is_not_a_run_is_refused_before_any_download(
+    fake_mint, monkeypatch, tmp_path, accession
+):
+    """A scan of several runs skips one that fails instead of raising, and
+    `read_ena_sequences` expands an experiment, sample or study accession to every
+    run under it, so only run accessions may reach the scan."""
+
+    def _fake(*args):
+        raise AssertionError("nothing may be downloaded")
+
+    monkeypatch.setattr(ingest_module, "_stage_run_reads", _fake)
+    inputs = _inputs(tmp_path, [(10, "ERR001"), (11, accession)])
+
+    with pytest.raises(ValueError, match=f"not ENA runs.*{accession}"):
+        _run(inputs, tmp_path / "ws")
+    assert fake_mint == []
+
+
 def test_empty_run_map_raises_value_error(tmp_path):
     """An empty ena_run_map.parquet is a resolver/dispatch bug, not a legitimate
     empty ticket — ValueError -> BAD_INPUT via the framework dispatcher."""

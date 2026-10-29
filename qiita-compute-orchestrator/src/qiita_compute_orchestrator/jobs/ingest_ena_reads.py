@@ -21,12 +21,15 @@ Gotchas specific to the ENA source:
   raises `duckdb.IOException` naming the md5 mismatch, which
   `_classify_ena_fetch_error` classifies retriable (a truncated transfer and a
   bad digest are indistinguishable; `max_retries` bounds it).
-- One DuckDB connection PER RUN: runs fetch concurrently on worker threads
-  (`run_concurrency`), and a connection runs one statement at a time.
-- A run miint could not read raises. A scan of one run (all this job sends)
-  raises on a failed open with the server's own error, and on a mid-stream
-  failure as "every run failed" (duckdb-miint#312;
-  https://the-miint.github.io/duckdb-miint/insdc_ena/).
+- One DuckDB connection per run, each its own in-memory database, so
+  `apply_duckdb_settings` gives every concurrent run its own per-slot memory limit
+  and threads.
+- A run miint could not read raises. A scan of one run raises on a failed open
+  with the server's own error, and on a mid-stream failure as "every run failed"
+  (duckdb-miint#312; https://the-miint.github.io/duckdb-miint/insdc_ena/). A scan
+  of several runs skips one that fails and returns the rest, so `execute` refuses
+  a roster accession that is not a run: `read_ena_sequences` would expand an
+  experiment or sample accession to every run under it.
   `_classify_ena_fetch_error` classifies the raised `duckdb.Error`, and a 404 is
   permanent there. A clean 0-row result fails the run BAD_INPUT: an ENA run never
   legitimately has zero reads, unlike a demux well.
@@ -43,6 +46,11 @@ import duckdb
 from pydantic import BaseModel, Field
 from qiita_common.api_paths import compute_reads_staging_path
 from qiita_common.backend_failure import BackendFailure, FailureKind
+from qiita_common.ena_accession import (
+    EnaAccessionKind,
+    InvalidEnaAccessionError,
+    detect_accession_kind,
+)
 from qiita_common.http_status import is_transient_error_text, is_transient_http_status
 from qiita_common.models import FailureType, WorkTicketFailureStage
 from qiita_common.models.ena_import import MAX_ENA_DOWNLOAD_RUN_CONCURRENCY, FailedRunOutcome
@@ -86,7 +94,7 @@ _ENA_INCOMPLETE_ANSWER_MARKER = "not all results may have been written"
 # miint's error for a scan of one run that failed mid-stream.
 _EVERY_RUN_FAILED_MARKER = "every run failed"
 # The reason for a run whose data is partial (`_classify_ena_fetch_error`).
-_PARTIAL_RUN_TEXT = "its data is missing or partial; refusing to register an incomplete read set"
+_PARTIAL_RUN_TEXT = "its data is partial; refusing to register an incomplete read set"
 _MID_STREAM_RERUN_HINT = "miint's docs say a re-run recovers a mid-stream failure"
 
 
@@ -210,6 +218,13 @@ def _classify_ena_fetch_error(
     )
 
 
+def _is_run_accession(accession: str) -> bool:
+    try:
+        return detect_accession_kind(accession) is EnaAccessionKind.RUN
+    except InvalidEnaAccessionError:
+        return False
+
+
 def _is_permanent_fetch_error(exc: duckdb.Error) -> bool:
     """True for a raised error naming a bad run: a 404, a format error, no data."""
     text = str(exc).lower()
@@ -243,6 +258,13 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     roster = read_roster_parquet(
         inputs.ena_run_map, value_column="ena_run_accession", roster_name="ena_run_map"
     )
+    not_runs = sorted({acc for _, acc in roster if not _is_run_accession(acc)})
+    if not_runs:
+        raise ValueError(
+            f"ena_run_map holds {len(not_runs)} accession(s) that are not ENA runs, which "
+            "read_ena_sequences would expand to every run under each: "
+            + ", ".join(not_runs[:_REASON_LISTED_ACCESSIONS])
+        )
 
     workspace.mkdir(parents=True, exist_ok=True)
     # register-files maps the `read/` subdir's part files -> the `read` table.
@@ -298,8 +320,8 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
 
                 if count == 0:
                     # Zero reads is anomalous for an ENA run (unlike a legitimately
-                    # empty demux well) -- fail loud rather than silently register
-                    # nothing.
+                    # empty demux well). Failing here makes it this run's outcome;
+                    # the mint would refuse a zero count for the whole step.
                     raise _RunFetchFailure(
                         BackendFailure(
                             kind=FailureKind.BAD_INPUT,

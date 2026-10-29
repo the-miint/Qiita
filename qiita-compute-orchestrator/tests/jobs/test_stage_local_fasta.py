@@ -82,7 +82,7 @@ def _parts(path: Path) -> list[Path]:
     return sorted(path.glob("part_*.parquet"))
 
 
-class _SpyConn:
+class _FailingCopyConn:
     """Passes every `execute` through, and fails the pass-2 `COPY`."""
 
     def __init__(self, inner):
@@ -105,11 +105,11 @@ class _SpyConn:
 
 
 def _fail_pass_two(monkeypatch) -> None:
-    """Install a `_SpyConn` around `open_miint_conn`."""
+    """Wrap every connection `open_miint_conn` returns in a `_FailingCopyConn`."""
     from qiita_compute_orchestrator.jobs import stage_local_fasta
 
     real = stage_local_fasta.open_miint_conn
-    monkeypatch.setattr(stage_local_fasta, "open_miint_conn", lambda: _SpyConn(real()))
+    monkeypatch.setattr(stage_local_fasta, "open_miint_conn", lambda: _FailingCopyConn(real()))
 
 
 def _inputs(*, manifest_path: Path):

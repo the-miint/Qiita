@@ -74,14 +74,14 @@ SELECT * FROM miint_versions();  -- every embedded tool version (see below)
 
 **`miint_warnings()` is not a load-time probe** — an earlier revision of this file described it as one ("non-fatal load-time issues, e.g. GPL boundary not installed"), which is wrong twice over: a missing gpl-boundary is reported by *throwing* at call time, not by a warning row, and the table is empty on a clean load.
 
-It is a **runtime, per-query log of non-fatal warnings**, and it matters because some functions **degrade silently rather than failing**. The one that should worry qiita is `read_ena_sequences`, which skips or retries individual runs and still returns a successful-looking result — the skipped runs appear only here:
+It is a **runtime, per-query log of non-fatal warnings**, and it matters because some functions **degrade silently rather than failing**. The one that matters for ENA is `read_ena_sequences`: a scan of several runs skips or retries individual runs and still returns a successful-looking result — the skipped runs appear only here:
 
 ```sql
 SELECT * FROM read_ena_sequences(...);
 SELECT * FROM miint_warnings();  -- e.g. "run 'ERR1234567' failed on retry (...), skipping"
 ```
 
-A scan of several runs still skips a run that fails and returns the others. From duckdb-miint#312 on, a scan whose every run fails raises, so a scan of one run, which is what `ingest_ena_reads` sends, raises instead of skipping ([insdc_ena](https://the-miint.github.io/duckdb-miint/insdc_ena/)). Both staged builds include it.
+A scan whose every run fails raises instead (duckdb-miint#312), so a scan of one run raises rather than skipping ([insdc_ena](https://the-miint.github.io/duckdb-miint/insdc_ena/)). Qiita sends only one-run scans: `ingest_ena_reads` refuses a roster accession that is not a run.
 
 **Check it after any multi-run ENA scan.** A partial result that reports success is otherwise indistinguishable from a complete one.
 
@@ -164,7 +164,7 @@ Signatures are abbreviated — go to the upstream `.md` for full parameter docs.
 - `alignment_slice(table_name, start, stop, [include_deletions=false])` — restrict alignments to a reference REGION. `table_name` is a table/view NAME; `start` is 1-based INCLUSIVE, `stop` 1-based EXCLUSIVE. Non-overlapping reads are dropped; an overlapping read is TRIMMED — the clipped CIGAR portion becomes a hard clip (`H`), and `position` is advanced to the window start, while coordinates stay in PARENT (not window-local) space. One consequence worth carrying:
   - **Tags and `template_length` are NULL on any trimmed read** (documented upstream: "tags `tag_as` through `tag_sa` are set to NULL when trimming occurs"). So `alignment_seq_identity(cigar, tag_nm, tag_md, …)` returns NULL for exactly the boundary-spanning reads, and an `identity >= x` predicate over sliced rows drops them (`NULL >= x` → NULL → filtered). Score sliced rows with `cigar_sequence_identity` / `cigar_query_coverage` instead (see above); on an eqx CIGAR they need no tags. **qiita-re-verified 2026-07-30** (build `97a3fff`): trimmed rows come back `39H41=` with `tag_nm`/`tag_md`/`template_length` all NULL; the untrimmed row in the same slice keeps `tag_nm=0, tag_md=80`.
   - **`read_id` is NOT coerced to VARCHAR.** An earlier revision of this file said it was, and told readers to cast back — **that is fixed and the advice is now wrong** (upstream `e739376`, refined by `996ee5d`). `read_id`, `reference` and `mate_reference` keep their input storage type (VARCHAR/BIGINT/UUID), consistent with `align_minimap2`, and upstream documents the round-trip explicitly. Re-probed 2026-07-30 on `97a3fff`: BIGINT in → `typeof(read_id)` = `BIGINT` out. Do not add a cast.
-- `read_fastx(filename, [sequence2=filename], [include_filepath=false], [qual_offset=33])` — FASTQ/FASTA, paired. `sequence_index` contract pinned in `qiita-compute-orchestrator/tests/jobs/test_read_fastx_miint_contract.py`; consumed by `assembly_hash`. A `VARCHAR[]` of paths closes each file once it has read it (duckdb-miint#261, fixing duckdb-miint#260); the same test file pins one call over 300 paths under a 128-descriptor limit, which `stage_local_fasta` relies on to pass its whole manifest.
+- `read_fastx(filename, [sequence2=filename], [include_filepath=false], [qual_offset=33])` — FASTQ/FASTA, paired. `sequence_index` contract pinned in `qiita-compute-orchestrator/tests/jobs/test_read_fastx_miint_contract.py`; consumed by `assembly_hash`. A `VARCHAR[]` of paths closes each file once it has read it (duckdb-miint#261), which the reading page does not state; `stage_local_fasta` relies on it to pass its whole manifest in one call, and the same test file pins it.
 - `read_sequences_sff(filename, [include_filepath=false], [trim=true])`
 - `read_biom(filename, [include_filepath=false])`
 
