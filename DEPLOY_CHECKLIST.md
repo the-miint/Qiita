@@ -21,14 +21,14 @@ _None yet._
 
 - `[operator]` **Confirm the mirror publishes the DuckDB 2.0.0 miint build** before the
   restart — every component now runs 2.0.0, and the stage step fetches from here.
-  (#duckdb-2.0)
+  (#801)
   ```bash
   curl -fsSI https://ftp.microbio.me/pub/miint/v2.0.0/linux_amd64/miint.duckdb_extension.gz | head -1   # expect 200
   ```
 - `[admin]` **Install the DuckDB 2.0.0 CLI for `make lake-shell` / `scripts/lake-gc.sh`.**
   Both refuse any `duckdb` that is not the version the data plane links. The release now
   ships a tarball, not a zip. Replace any per-account copy in `~/.local/bin` the same way.
-  (#duckdb-2.0)
+  (#801)
   ```bash
   ( cd "$(mktemp -d)" \
     && curl -sSfL -O https://github.com/duckdb/duckdb/releases/download/v2.0.0/duckdb-cli-linux-amd64.tar.gz \
@@ -69,7 +69,7 @@ _None yet._
 
 - **The staged miint builds are present, and the rebuilt `long-read-assembly` images carry
   DuckDB 2.0.0** — each image loads miint only from its own DuckDB version's directory.
-  Expect `DUCKDB_200_OK`. (#duckdb-2.0)
+  Expect `DUCKDB_200_OK`. (#801)
   ```bash
   sudo -u qiita-orch bash -c 'set -a; . /etc/qiita/compute-orchestrator.env; set +a
   for v in 2.0.0 1.5.5 1.5.4; do
@@ -83,7 +83,7 @@ _None yet._
   done && echo DUCKDB_200_OK'
   ```
 - **The DuckLake catalog is still format 1.0.** Expect `1.0`; the attach itself fails if
-  the catalog was ever migrated. (#duckdb-2.0)
+  the catalog was ever migrated. (#801)
   ```bash
   bash scripts/lake-shell.sh --no-cp -noheader -list \
     -c "SELECT value FROM qiita_lake.options() WHERE option_name = 'version'"
@@ -99,7 +99,7 @@ _None yet._
 ### Notes (no host action)
 
 - (#767) A killed DoPut leaves `staging/uploads/<idx>/upload.parquet.partial`, which nothing reclaims, as nothing reclaims finished uploads. `qiita-admin masked-read-export` gains `--retry-seconds` (default 3900, the data-plane unit's stop timeout).
-- **DuckDB 1.5.5 → 2.0.0 everywhere; the DuckLake catalog stays at format 1.0.** (#duckdb-2.0)
+- **DuckDB 1.5.5 → 2.0.0 everywhere; the DuckLake catalog stays at format 1.0.** (#801)
   - The redeploy re-stages miint and httpfs into `MIINT_EXTENSION_DIRECTORY/v2.0.0/` on its
     own, because `stage-miint --check` sees the version change. `make verify-deploy`'s
     `compute-readiness` and `cp-miint` checks LOAD the new build.
