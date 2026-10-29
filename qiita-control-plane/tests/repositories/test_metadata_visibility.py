@@ -19,10 +19,15 @@ from qiita_common.models import FieldDataType, Tier
 from qiita_control_plane.repositories._sample_helpers import (
     EntityMetadataSpec,
     SampleEntityKind,
+    fetch_visible_metadata_last_change,
     insert_entity_to_study,
     visible_metadata_source,
 )
-from qiita_control_plane.repositories.biosample_metadata import BIOSAMPLE_METADATA_SPEC
+from qiita_control_plane.repositories.biosample import OWNER_BIOSAMPLE_ID_TIER_OVERRIDE
+from qiita_control_plane.repositories.biosample_metadata import (
+    BIOSAMPLE_METADATA_SPEC,
+    insert_owner_biosample_id_metadata,
+)
 from qiita_control_plane.repositories.study_access import CallerMetadataTiers
 from qiita_control_plane.testing.db_seeds import (
     fetch_missing_value_reason_idx,
@@ -50,6 +55,7 @@ from .conftest import (
     _create_linked_entity_for_spec,
     _seed_global_field_for_spec,
     _seed_secondary_studies_for_entity,
+    _set_unique_in_study,
 )
 
 pytestmark = pytest.mark.db
@@ -67,6 +73,9 @@ _VALUE_COLUMNS = (
     "value_terminology_term_idx",
     "value_missing_reason_idx",
 )
+# Every column the functions mask on a hidden row: the value, and when it last
+# changed.
+_MASKED_COLUMNS = (*_VALUE_COLUMNS, "updated_at")
 
 
 def _most_restrictive(*tiers: Tier | None) -> Tier:
@@ -323,7 +332,7 @@ def _tiers_for(corpus: _Corpus, map_name: str) -> CallerMetadataTiers:
 async def _visibility_rows(pool, spec, tiers: CallerMetadataTiers, entity_idx: int):
     return await pool.fetch(
         f"SELECT m.idx, m.study_idx, m.required_tier, m.caller_tier, m.visible,"
-        f" {', '.join(f'm.{c}' for c in _VALUE_COLUMNS)}"
+        f" {', '.join(f'm.{c}' for c in _MASKED_COLUMNS)}"
         f" FROM {visible_metadata_source(spec)}"
         f" WHERE m.{spec.entity_key_column} = $4",
         *tiers.sql_args(),
@@ -426,7 +435,7 @@ async def test_hidden_rows_null_every_value_column(ctx, spec):
     assert len(hidden) == len(seeded)
     for row in hidden:
         assert row["visible"] is False
-        assert all(row[c] is None for c in _VALUE_COLUMNS), dict(row)
+        assert all(row[c] is None for c in _MASKED_COLUMNS), dict(row)
 
     # The mask is the caller's, not the row's: at admin the same rows carry
     # their values.
@@ -436,6 +445,7 @@ async def test_hidden_rows_null_every_value_column(ctx, spec):
     for row in shown.values():
         assert row["visible"] is True
         assert any(row[c] is not None for c in populated), dict(row)
+        assert row["updated_at"] is not None, dict(row)
 
 
 @pytest.mark.parametrize("spec", SPECS, ids=_spec_id)
@@ -554,3 +564,140 @@ async def test_visibility_function_is_inlined(postgres_pool, spec):
     plan = (json.loads(raw) if isinstance(raw, str) else raw)[0]["Plan"]
     function_scans = [name for node, name in _plan_node_types(plan) if node == "Function Scan"]
     assert spec.visibility_function.removeprefix("qiita.") not in function_scans, plan
+
+
+async def test_owner_biosample_id_value_never_reads_below_its_pinned_tier(ctx):
+    """An owner-biosample-id value requires OWNER_BIOSAMPLE_ID_TIER_OVERRIDE
+    even through a field declared at public: a study that declared the field
+    before its first import must not expose the owner's names below that
+    tier."""
+    spec = BIOSAMPLE_METADATA_SPEC
+    pool = ctx["pool"]
+    entity_idx = await _create_linked_entity_for_spec(ctx, spec)
+    field_idx = await seed_local_study_field(
+        pool,
+        spec=spec,
+        study_idx=ctx["study_idx"],
+        display_name=unique_field_name("owner_id"),
+        created_by_idx=ctx["principal_idx"],
+        tier_override=Tier.PUBLIC,
+    )
+    await _set_unique_in_study(ctx, spec, field_idx, True)
+    async with pool.acquire() as conn:
+        metadata_idx = await insert_owner_biosample_id_metadata(
+            conn,
+            biosample_idx=entity_idx,
+            biosample_study_field_idx=field_idx,
+            value_text=f"OWNER-{secrets.token_hex(3)}",
+            created_by_idx=ctx["principal_idx"],
+        )
+    pinned = OWNER_BIOSAMPLE_ID_TIER_OVERRIDE
+    below = max((t for t in Tier if TIER_RANK[t] < TIER_RANK[pinned]), key=TIER_RANK.__getitem__)
+
+    for held, visible in ((below, False), (pinned, True)):
+        tiers = CallerMetadataTiers(study_tiers={ctx["study_idx"]: held}, default=Tier.PUBLIC)
+        (row,) = [
+            r
+            for r in await _visibility_rows(pool, spec, tiers, entity_idx)
+            if r["idx"] == metadata_idx
+        ]
+        assert row["required_tier"] == pinned, dict(row)
+        assert row["visible"] is visible, dict(row)
+
+
+async def _parent_timestamps(pool, spec, entity_idx):
+    return await pool.fetchrow(
+        f"SELECT updated_at, last_metadata_change_at FROM qiita.{spec.entity_kind} WHERE idx = $1",
+        entity_idx,
+    )
+
+
+@pytest.mark.parametrize("spec", SPECS, ids=_spec_id)
+async def test_metadata_write_moves_only_the_parents_metadata_timestamp(ctx, spec):
+    """A metadata write records itself in the parent's
+    last_metadata_change_at, not in its updated_at: updated_at describes the
+    entity's own record, which a caller sees whatever their tier, so a write
+    to a value they may not read must not move it."""
+    pool = ctx["pool"]
+    entity_idx = await _create_linked_entity_for_spec(ctx, spec)
+    field_idx = await seed_local_study_field(
+        pool,
+        spec=spec,
+        study_idx=ctx["study_idx"],
+        display_name=unique_field_name("touch"),
+        created_by_idx=ctx["principal_idx"],
+    )
+    before = await _parent_timestamps(pool, spec, entity_idx)
+
+    await seed_metadata_text_value(
+        pool,
+        spec=spec,
+        entity_idx=entity_idx,
+        study_field_idx=field_idx,
+        created_by_idx=ctx["principal_idx"],
+    )
+
+    after = await _parent_timestamps(pool, spec, entity_idx)
+    assert after["updated_at"] == before["updated_at"]
+    assert after["last_metadata_change_at"] is not None
+    assert after["last_metadata_change_at"] != before["last_metadata_change_at"]
+
+
+@pytest.mark.parametrize("spec", SPECS, ids=_spec_id)
+async def test_visible_metadata_last_change_counts_only_the_read_values(ctx, spec):
+    """The last change a read reports is the latest updated_at among the
+    values that read returns: the entity's global values, plus the named
+    study's local ones, each only when visible. A hidden write, or a local
+    write on another study, does not move it."""
+    pool = ctx["pool"]
+    entity_idx = await _create_linked_entity_for_spec(ctx, spec)
+    (other_study_idx,) = await _seed_secondary_studies_for_entity(ctx, spec, entity_idx, 1)
+    async with pool.acquire() as conn:
+        await insert_entity_to_study(
+            conn,
+            spec=spec,
+            entity_idx=entity_idx,
+            study_idx=other_study_idx,
+            created_by_idx=ctx["principal_idx"],
+        )
+    viewer = CallerMetadataTiers(
+        study_tiers={ctx["study_idx"]: Tier.VIEWER, other_study_idx: Tier.ADMIN},
+        default=Tier.PUBLIC,
+    )
+
+    async def last_change(study_idx=None):
+        return await fetch_visible_metadata_last_change(
+            pool, spec=spec, entity_idx=entity_idx, tiers=viewer, study_idx=study_idx
+        )
+
+    async def write_local(study_idx, tier_override):
+        field_idx = await seed_local_study_field(
+            pool,
+            spec=spec,
+            study_idx=study_idx,
+            display_name=unique_field_name("last_change"),
+            created_by_idx=ctx["principal_idx"],
+            tier_override=tier_override,
+        )
+        return await seed_metadata_text_value(
+            pool,
+            spec=spec,
+            entity_idx=entity_idx,
+            study_field_idx=field_idx,
+            created_by_idx=ctx["principal_idx"],
+        )
+
+    assert await last_change(ctx["study_idx"]) is None
+
+    shown_idx = await write_local(ctx["study_idx"], Tier.VIEWER)
+    shown_at = await pool.fetchval(
+        f"SELECT updated_at FROM {spec.metadata_table} WHERE idx = $1", shown_idx
+    )
+    assert await last_change(ctx["study_idx"]) == shown_at
+    # A study-local value belongs to its own study's read, not the
+    # entity-wide one.
+    assert await last_change() is None
+
+    await write_local(ctx["study_idx"], Tier.ADMIN)
+    await write_local(other_study_idx, Tier.VIEWER)
+    assert await last_change(ctx["study_idx"]) == shown_at

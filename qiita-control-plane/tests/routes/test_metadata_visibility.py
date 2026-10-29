@@ -12,6 +12,7 @@ combination of field tier, exception, and caller tier.
 """
 
 import secrets
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
 import pytest
@@ -21,6 +22,8 @@ from qiita_common.api_paths import (
     URL_BIOSAMPLE_BY_STUDY,
     URL_BIOSAMPLE_BY_STUDY_AND_IDX,
     URL_BIOSAMPLE_BY_STUDY_UNIQUE_FIELD,
+    URL_BIOSAMPLE_STUDY_FIELD_BY_STUDY,
+    URL_SEQUENCED_SAMPLE_BY_IDX,
     URL_SEQUENCED_SAMPLE_BY_STUDY_AND_IDX,
 )
 from qiita_common.models import (
@@ -94,7 +97,10 @@ async def ctx(role_keyed_clients):
 @dataclass(frozen=True)
 class _Corpus:
     study_idx: int
+    # The idx the route addresses, and the entity the metadata hangs off: the
+    # same biosample, or a sequenced_sample and its supertype prep_sample.
     entity_idx: int
+    metadata_entity_idx: int
     # key -> the tier a caller needs to see it. Global values key on
     # internal_name, local ones on display_name, as the response does.
     global_keys: dict[str, Tier]
@@ -262,6 +268,7 @@ async def _seed_biosample_corpus(
     return _BiosampleCorpus(
         study_idx=study_idx,
         entity_idx=biosample_idx,
+        metadata_entity_idx=biosample_idx,
         global_keys={BIOSAMPLE_FIELD_HOST_TAXON_ID: Tier.PUBLIC, **global_keys},
         # The import pins the owner-biosample-id field at member.
         local_keys={owner_id_field: Tier.MEMBER, **local_keys},
@@ -298,6 +305,7 @@ async def _seed_sequenced_sample_corpus(ctx, study_idx: int) -> _Corpus:
     return _Corpus(
         study_idx=study_idx,
         entity_idx=sequenced_sample_idx,
+        metadata_entity_idx=prep_sample_idx,
         global_keys=global_keys,
         local_keys=local_keys,
     )
@@ -448,3 +456,190 @@ async def test_study_scoped_sequenced_sample_read_shows_only_visible_values(ctx,
     read_tier = _CASES[case][2]
     assert set(body["global_metadata"]) == corpus.visible(corpus.global_keys, read_tier)
     assert set(body["local_metadata"]) == corpus.visible(corpus.local_keys, read_tier)
+
+
+async def test_owner_id_field_declared_below_its_tier_stays_hidden(ctx):
+    """A study that declares its owner-biosample-id field at public before the
+    first import does not expose the owner's names to a viewer; a member still
+    reads them."""
+    study_idx = await _seed_study_for_case(ctx, "viewer")
+    owner_id_field = unique_field_name("vis_owner_id")
+    declared = await ctx["wet"].post(
+        URL_BIOSAMPLE_STUDY_FIELD_BY_STUDY.format(study_idx=study_idx),
+        json={
+            "display_name": owner_id_field,
+            "data_type": FieldDataType.TEXT,
+            "unique_in_study": True,
+            "tier_override": Tier.PUBLIC,
+        },
+    )
+    assert declared.status_code == 201, declared.text
+    biosample_idx = await _import_biosample(
+        ctx,
+        study_idx=study_idx,
+        owner_idx=ctx["wet_session"]["principal_idx"],
+        owner_id_field=owner_id_field,
+        owner_id_value=f"VIS-{secrets.token_hex(3)}",
+    )
+    url = URL_BIOSAMPLE_BY_STUDY_AND_IDX.format(study_idx=study_idx, biosample_idx=biosample_idx)
+
+    as_viewer = await ctx["user"].get(url)
+
+    assert as_viewer.status_code == 200, as_viewer.text
+    assert owner_id_field not in as_viewer.json()["local_metadata"]
+
+    await ctx["pool"].execute(
+        "UPDATE qiita.study_access SET access_tier = $3::qiita.tier"
+        " WHERE study_idx = $1 AND principal_idx = $2",
+        study_idx,
+        ctx["user_session"]["principal_idx"],
+        Tier.MEMBER,
+    )
+    as_member = await ctx["user"].get(url)
+
+    assert as_member.status_code == 200, as_member.text
+    assert owner_id_field in as_member.json()["local_metadata"]
+
+
+@dataclass(frozen=True)
+class _TimestampSurface:
+    """One read whose timestamps and ETag must describe only what it returns."""
+
+    seed: Callable[..., Awaitable[_Corpus]]
+    url: Callable[[_Corpus], str]
+    # Writes one value on the corpus's entity that a viewer of the study can
+    # (hidden=False) or cannot (hidden=True) read through this surface.
+    write: Callable[..., Awaitable[str]]
+    # The response's own-record timestamp.
+    record_stamp: str
+
+
+async def _write_local(ctx, spec, corpus: _Corpus, *, hidden: bool) -> str:
+    return await _seed_local_value(
+        ctx,
+        spec,
+        study_idx=corpus.study_idx,
+        entity_idx=corpus.metadata_entity_idx,
+        tier_override=Tier.ADMIN if hidden else Tier.VIEWER,
+    )
+
+
+async def _write_global(ctx, spec, corpus: _Corpus, *, hidden: bool) -> str:
+    return await _seed_global_value(
+        ctx,
+        spec,
+        study_idx=corpus.study_idx,
+        entity_idx=corpus.metadata_entity_idx,
+        default_tier=Tier.MEMBER if hidden else Tier.PUBLIC,
+    )
+
+
+_TIMESTAMP_SURFACES = {
+    "study_scoped_biosample": _TimestampSurface(
+        seed=_seed_biosample_corpus,
+        url=lambda c: URL_BIOSAMPLE_BY_STUDY_AND_IDX.format(
+            study_idx=c.study_idx, biosample_idx=c.entity_idx
+        ),
+        write=lambda ctx, c, *, hidden: _write_local(
+            ctx, BIOSAMPLE_METADATA_SPEC, c, hidden=hidden
+        ),
+        record_stamp="updated_at",
+    ),
+    "biosample": _TimestampSurface(
+        seed=_seed_biosample_corpus,
+        url=lambda c: URL_BIOSAMPLE_BY_IDX.format(biosample_idx=c.entity_idx),
+        write=lambda ctx, c, *, hidden: _write_global(
+            ctx, BIOSAMPLE_METADATA_SPEC, c, hidden=hidden
+        ),
+        record_stamp="updated_at",
+    ),
+    "study_scoped_sequenced_sample": _TimestampSurface(
+        seed=_seed_sequenced_sample_corpus,
+        url=lambda c: URL_SEQUENCED_SAMPLE_BY_STUDY_AND_IDX.format(
+            study_idx=c.study_idx, sequenced_sample_idx=c.entity_idx
+        ),
+        write=lambda ctx, c, *, hidden: _write_local(
+            ctx, PREP_SAMPLE_METADATA_SPEC, c, hidden=hidden
+        ),
+        record_stamp="effective_updated_at",
+    ),
+}
+
+
+@pytest.mark.parametrize("surface", tuple(_TIMESTAMP_SURFACES))
+async def test_hidden_write_moves_nothing_the_viewer_reads(ctx, surface):
+    """A write to a value the viewer cannot read leaves the viewer's
+    last_metadata_change_at, record timestamp, and ETag where they were, so
+    the read discloses neither that hidden values exist nor when they change;
+    a caller who reads the value sees all of it move. A write the viewer can
+    read moves their last_metadata_change_at and ETag, and never the record's
+    own timestamp."""
+    s = _TIMESTAMP_SURFACES[surface]
+    study_idx = await _seed_study_for_case(ctx, "viewer")
+    corpus = await s.seed(ctx, study_idx)
+    url = s.url(corpus)
+
+    async def stamps(client) -> tuple[str, str, str | None]:
+        resp = await client.get(url)
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        return resp.headers["ETag"], body[s.record_stamp], body["last_metadata_change_at"]
+
+    viewer_before = await stamps(ctx["user"])
+    wet_before = await stamps(ctx["wet"])
+
+    await s.write(ctx, corpus, hidden=True)
+
+    assert await stamps(ctx["user"]) == viewer_before
+    wet_etag, _, wet_last_change = await stamps(ctx["wet"])
+    assert wet_etag != wet_before[0]
+    assert wet_last_change != wet_before[2]
+
+    await s.write(ctx, corpus, hidden=False)
+
+    viewer_etag, viewer_record, viewer_last_change = await stamps(ctx["user"])
+    assert viewer_etag != viewer_before[0]
+    assert viewer_last_change != viewer_before[2]
+    assert viewer_record == viewer_before[1]
+
+
+async def test_patch_biosample_refuses_an_etag_a_metadata_write_made_stale(ctx):
+    """The ETag a read hands out covers its metadata as well as the record:
+    a value written after the read makes that ETag stale for the PATCH."""
+    study_idx = await _seed_study_for_case(ctx, "wet_lab_admin")
+    corpus = await _seed_biosample_corpus(ctx, study_idx)
+    url = URL_BIOSAMPLE_BY_IDX.format(biosample_idx=corpus.entity_idx)
+    stale = (await ctx["wet"].get(url)).headers["ETag"]
+
+    await _write_global(ctx, BIOSAMPLE_METADATA_SPEC, corpus, hidden=False)
+
+    refused = await ctx["wet"].patch(
+        url, json={"submission_error": "transient"}, headers={"If-Match": stale}
+    )
+    assert refused.status_code == 412, refused.text
+    fresh = (await ctx["wet"].get(url)).headers["ETag"]
+    accepted = await ctx["wet"].patch(
+        url, json={"submission_error": "transient"}, headers={"If-Match": fresh}
+    )
+    assert accepted.status_code == 200, accepted.text
+
+
+async def test_patch_sequenced_sample_refuses_an_etag_a_metadata_write_made_stale(ctx):
+    """The sequenced-sample twin: a prep_sample value written after the read
+    makes its ETag stale for the PATCH."""
+    study_idx = await _seed_study_for_case(ctx, "wet_lab_admin")
+    corpus = await _seed_sequenced_sample_corpus(ctx, study_idx)
+    url = URL_SEQUENCED_SAMPLE_BY_IDX.format(sequenced_sample_idx=corpus.entity_idx)
+    stale = (await ctx["wet"].get(url)).headers["ETag"]
+
+    await _write_global(ctx, PREP_SAMPLE_METADATA_SPEC, corpus, hidden=False)
+
+    refused = await ctx["wet"].patch(
+        url, json={"ena_experiment_accession": "ERX9000002"}, headers={"If-Match": stale}
+    )
+    assert refused.status_code == 412, refused.text
+    fresh = (await ctx["wet"].get(url)).headers["ETag"]
+    accepted = await ctx["wet"].patch(
+        url, json={"ena_experiment_accession": "ERX9000002"}, headers={"If-Match": fresh}
+    )
+    assert accepted.status_code == 200, accepted.text
