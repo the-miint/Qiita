@@ -90,11 +90,17 @@ def _make_two_runs_sharing_one_sample(shared_sample_accession: str):
     """Build a `(runs, attrs)` fake-resolver pair for one study whose two runs
     share ONE `sample_accession`, both ILLUMINA (a single `sequenced_pool`), so
     the full span exercises intra-study biosample de-dup."""
+    # Run accessions of the real shape, since ingest refuses any other; one pair per
+    # study, so a re-run of the per-study step sees the same runs.
+    run_pairs: dict[str, tuple[str, str]] = {}
 
     def _fake_runs(accession: str) -> tuple[list[str], list[tuple]]:
+        first, second = run_pairs.setdefault(
+            accession, (unique_ena_accession("SRR"), unique_ena_accession("SRR"))
+        )
         rows = [
             (
-                f"SRR-{accession}-1",
+                first,
                 f"SRX-{accession}-1",
                 shared_sample_accession,
                 accession,
@@ -112,7 +118,7 @@ def _make_two_runs_sharing_one_sample(shared_sample_accession: str):
                 "public",
             ),
             (
-                f"SRR-{accession}-2",
+                second,
                 f"SRX-{accession}-2",
                 shared_sample_accession,
                 accession,
