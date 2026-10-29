@@ -65,7 +65,7 @@ from qiita_common.qc_reasons import load_qc_reasons
 from qiita_common.taxonomy import TAXONOMY_SOURCE_TABLE, genome_lineage_select_sql
 
 from ..auth.tickets import run_signed_flight_call, sign_action, sign_ticket
-from ..miint import arrow_batches, duckdb_connect
+from ..miint import arrow_batches, duckdb_connect, run_on_connection
 from ..problem_list import capped
 from ..repositories import require_transaction
 from ..repositories.assembly import (
@@ -610,7 +610,8 @@ async def mint_features(
         # The one large blocking step — DISTINCT + sort + Parquet encode — runs
         # off the event loop so it never starves the API the CP also serves. An
         # empty manifest yields zero rows and a valid empty Parquet here.
-        await asyncio.to_thread(
+        await run_on_connection(
+            write_conn,
             write_conn.execute,
             "COPY (SELECT DISTINCT sequence_hash, feature_idx FROM feature_map "
             f"      ORDER BY feature_idx) TO '{out}' ({PARQUET_OPTS_TRANSFER})",
@@ -836,7 +837,7 @@ async def _write_annotation_claims(
                 f"{expected} annotation(s) — an interval's feature_idx or its parent's "
                 "could not be resolved from the feature maps"
             )
-        await asyncio.to_thread(_copy_annotation_map, write_conn, out_path)
+        await run_on_connection(write_conn, _copy_annotation_map, write_conn, out_path)
     finally:
         read_conn.close()
         write_conn.close()

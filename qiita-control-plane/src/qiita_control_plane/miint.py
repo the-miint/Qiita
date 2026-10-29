@@ -32,8 +32,9 @@ via `qiita_common.duckdb_miint` (single source for the `MIINT_EXTENSION_REPO` /
 
 from __future__ import annotations
 
+import asyncio
 import threading
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING
 
 import duckdb
@@ -80,8 +81,36 @@ def arrow_batches(
     Until the reader is exhausted or closed, nothing else can run on `con`, and the
     call itself is refused while a SELECT `execute`d on `con` is part-read
     (`qiita_common.duckdb_relation` says when that is); both raise
-    `ResourceInUseException`. Closing `con` itself is always allowed."""
+    `ResourceInUseException`. Closing `con` with a reader open is allowed; closing it
+    while another thread runs a statement on it is not (`run_on_connection`)."""
     return con.sql(sql, params=list(params)).to_arrow_reader(rows_per_batch)
+
+
+async def run_on_connection[T](
+    con: duckdb.DuckDBPyConnection, fn: Callable[..., T], *args: object
+) -> T:
+    """Run `fn(*args)` in a worker thread, where `fn` uses `con`; on cancellation,
+    interrupt `con` and wait for the thread before re-raising.
+
+    `asyncio.to_thread` alone hands the cancellation back at once and leaves the
+    thread running its statement, so a caller's `finally: con.close()` races it. On
+    DuckDB 1.5.5 that `close()` blocked until the statement finished. On 2.0 it
+    raises `ResourceInUseException` ("connection is busy with another call"), which
+    replaces the `CancelledError` and leaves the connection open. The interrupt
+    stopped a multi-second COPY in about 30 ms, and the interrupted COPY left no
+    file behind. DuckDB drops an interrupt that lands before the statement starts,
+    so it is repeated until the thread returns."""
+    work = asyncio.ensure_future(asyncio.to_thread(fn, *args))
+    try:
+        return await asyncio.shield(work)
+    except asyncio.CancelledError:
+        while not work.done():
+            con.interrupt()
+            await asyncio.wait([work], timeout=0.05)
+        if not work.cancelled():
+            # Retrieved so asyncio does not log the interrupt's error as unhandled.
+            work.exception()
+        raise
 
 
 def _connect() -> duckdb.DuckDBPyConnection:

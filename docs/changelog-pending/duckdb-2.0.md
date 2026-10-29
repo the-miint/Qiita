@@ -26,6 +26,12 @@
   of its files was deleted is now refused (`FailedPrecondition`) instead of answered
   with the earlier registration, while that file is still at its lake path. Once lake
   GC has removed it, a replay cannot tell itself from a first call (#800).
+- **A control-plane restart no longer fails a `mint-features` step it cuts short
+  (#801).** A restart cancels the steps that have not finished by its drain timeout,
+  and the next startup re-attaches them. On DuckDB 2.0, cancelling `mint-features` or
+  `mint-annotation-features` while it wrote its map raised `ResourceInUseException`
+  in place of the cancellation, so the ticket failed permanently instead. The write
+  is now interrupted and the cancellation goes through.
 - **A miint COPY format can accept a DuckDB COPY option and ignore it (#801).**
   `ROW_GROUP_SIZE_BYTES` on `FORMAT BIOM` or `FORMAT NEWICK` used to be refused as an
   unknown option, and now does nothing (duckdb-miint#373). A name neither DuckDB nor
