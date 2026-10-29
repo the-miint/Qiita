@@ -90,26 +90,38 @@ async def run_on_connection[T](
     con: duckdb.DuckDBPyConnection, fn: Callable[..., T], *args: object
 ) -> T:
     """Run `fn(*args)` in a worker thread, where `fn` uses `con`; on cancellation,
-    interrupt `con` and wait for the thread before re-raising.
+    interrupt `con` and wait for the thread to return before re-raising.
 
     `asyncio.to_thread` alone hands the cancellation back at once and leaves the
-    thread running its statement, so a caller's `finally: con.close()` races it. On
-    DuckDB 1.5.5 that `close()` blocked until the statement finished. On 2.0 it
-    raises `ResourceInUseException` ("connection is busy with another call"), which
-    replaces the `CancelledError` and leaves the connection open. The interrupt
-    stopped a multi-second COPY in about 30 ms, and the interrupted COPY left no
-    file behind. DuckDB drops an interrupt that lands before the statement starts,
-    so it is repeated until the thread returns."""
-    work = asyncio.ensure_future(asyncio.to_thread(fn, *args))
+    thread running its statement, so a caller's `finally: con.close()` races it, and
+    `close()` on a connection another thread is using raises
+    `ResourceInUseException` ("connection is busy with another call"). That replaces
+    the `CancelledError` and leaves the connection open. On DuckDB 2.0.0 the
+    interrupt stopped a running COPY in about 30 ms.
+
+    The wait is on the thread itself, since cancelling the awaited future does not
+    stop the thread, and it outlasts a further cancellation, which the event loop
+    sends every task at shutdown. DuckDB drops an interrupt that lands before the
+    statement starts, so it is repeated until the thread returns. Not
+    `asyncio.shield`: once its caller is cancelled, it logs the inner task's error
+    (here, the interrupt) as an unhandled exception."""
+    returned = threading.Event()
+
+    def call() -> T:
+        try:
+            return fn(*args)
+        finally:
+            returned.set()
+
     try:
-        return await asyncio.shield(work)
+        return await asyncio.to_thread(call)
     except asyncio.CancelledError:
-        while not work.done():
+        while not returned.is_set():
             con.interrupt()
-            await asyncio.wait([work], timeout=0.05)
-        if not work.cancelled():
-            # Retrieved so asyncio does not log the interrupt's error as unhandled.
-            work.exception()
+            try:
+                await asyncio.sleep(0.05)
+            except asyncio.CancelledError:
+                pass  # The cancellation being handled is re-raised below.
         raise
 
 

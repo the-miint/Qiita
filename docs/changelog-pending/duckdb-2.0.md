@@ -26,12 +26,17 @@
   of its files was deleted is now refused (`FailedPrecondition`) instead of answered
   with the earlier registration, while that file is still at its lake path. Once lake
   GC has removed it, a replay cannot tell itself from a first call (#800).
-- **A control-plane restart no longer fails a `mint-features` step it cuts short
-  (#801).** A restart cancels the steps that have not finished by its drain timeout,
-  and the next startup re-attaches them. On DuckDB 2.0, cancelling `mint-features` or
-  `mint-annotation-features` while it wrote its map raised `ResourceInUseException`
-  in place of the cancellation, so the ticket failed permanently instead. The write
-  is now interrupted and the cancellation goes through.
+- **A control-plane restart interrupts an in-flight `mint-features` map write
+  instead of waiting for it (#801).** A restart cancels the steps that have not
+  finished by its drain timeout, and the next startup re-attaches them. A
+  `mint-features` or `mint-annotation-features` step cancelled while it wrote its
+  feature or annotation map held the shutdown until the write finished; the write is
+  now interrupted.
+- **Sorted at-rest writes no longer set a row count per row group (#801).** The read
+  and reference-chunk writers asked for a whole number of vectors sized to their rows,
+  because DuckDB 1.5.5 ignored the byte cap on a sorted COPY. DuckDB 2.0 applies it,
+  so their row groups are now cut by the 64 MB byte cap alone, as every other
+  writer's are. Write time and file size were unchanged where measured.
 - **A miint COPY format can accept a DuckDB COPY option and ignore it (#801).**
   `ROW_GROUP_SIZE_BYTES` on `FORMAT BIOM` or `FORMAT NEWICK` used to be refused as an
   unknown option, and now does nothing (duckdb-miint#373). A name neither DuckDB nor
