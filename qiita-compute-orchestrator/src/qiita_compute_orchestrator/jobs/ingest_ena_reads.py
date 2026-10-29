@@ -95,7 +95,10 @@ _ENA_INCOMPLETE_ANSWER_MARKER = "not all results may have been written"
 _EVERY_RUN_FAILED_MARKER = "every run failed"
 # The reason for a run whose data is partial (`_classify_ena_fetch_error`).
 _PARTIAL_RUN_TEXT = "its data is partial; refusing to register an incomplete read set"
-_MID_STREAM_RERUN_HINT = "miint's docs say a re-run recovers a mid-stream failure"
+_MID_STREAM_RERUN_HINT = (
+    "a re-run recovers a dropped connection, but damaged data in the file fails the same "
+    "way each time (miint's insdc_ena docs)"
+)
 
 
 class Inputs(BaseModel):

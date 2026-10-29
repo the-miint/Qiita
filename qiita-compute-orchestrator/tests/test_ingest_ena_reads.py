@@ -547,6 +547,7 @@ def test_mid_stream_fetch_error_is_retried_as_partial_data(
     assert exc.value.transient is True
     assert ingest_module.TRANSIENT_FETCH_ERROR_TEXT not in exc.value.reason
     assert ingest_module._PARTIAL_RUN_TEXT in exc.value.reason
+    assert ingest_module._MID_STREAM_RERUN_HINT in exc.value.reason
 
 
 def test_not_found_fetch_error_is_permanent(fake_mint, monkeypatch, tmp_path):
