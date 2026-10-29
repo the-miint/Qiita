@@ -103,10 +103,11 @@ async def run_on_connection[T](
     stop the thread, and it outlasts a further cancellation, which `asyncio.run`
     sends every task at shutdown. DuckDB drops an interrupt that lands before the
     statement starts, so it is repeated until the thread returns. A cancellation
-    that arrives while the call still waits for a worker (the default executor is
-    shared and bounded) settles under `gate` that `fn` never runs, so there is no
-    thread to wait for. Not `asyncio.shield`: once its caller is cancelled, it logs
-    the inner task's error (here, the interrupt) as an unhandled exception."""
+    that arrives before the call starts (the default executor is shared and
+    bounded, so it can still be waiting for a worker) is settled under `gate`: `fn`
+    never runs, and there is no thread to wait for. Not `asyncio.shield`: once its
+    caller is cancelled, it logs the inner task's error (here, the interrupt) as an
+    unhandled exception."""
     gate = threading.Lock()
     started = abandoned = False
     returned = threading.Event()

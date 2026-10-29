@@ -147,7 +147,7 @@ def test_a_cancelled_copy_is_interrupted_and_the_connection_closes(
     assert reported == []
 
 
-def test_a_call_cancelled_while_it_waits_for_a_worker_never_runs():
+def test_a_call_cancelled_while_it_waits_for_a_worker_is_not_waited_for():
     # One worker, held busy, so the call is still queued when it is cancelled.
     ran = threading.Event()
     hold = threading.Event()
@@ -167,6 +167,47 @@ def test_a_call_cancelled_while_it_waits_for_a_worker_never_runs():
         _run_bounded(scenario(), timeout=10)
     finally:
         hold.set()
+    assert not ran.is_set()
+
+
+class _HoldingExecutor(ThreadPoolExecutor):
+    """An executor whose worker, once it takes an item, waits for `proceed` before
+    running it: the item can no longer be cancelled, and the call has not started."""
+
+    def __init__(self) -> None:
+        super().__init__(max_workers=1)
+        self.taken = threading.Event()
+        self.proceed = threading.Event()
+
+    def submit(self, fn, /, *args, **kwargs):
+        def held():
+            self.taken.set()
+            self.proceed.wait()
+            return fn(*args, **kwargs)
+
+        return super().submit(held)
+
+
+def test_a_call_cancelled_after_a_worker_took_it_does_not_run():
+    ran = threading.Event()
+    executor = _HoldingExecutor()
+
+    async def scenario() -> None:
+        asyncio.get_running_loop().set_default_executor(executor)
+        task = asyncio.create_task(run_on_connection(duckdb.connect(), ran.set))
+        # Polled, not `to_thread`: the executor's one worker is the one being held.
+        while not executor.taken.is_set():
+            await asyncio.sleep(0.01)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        executor.proceed.set()
+
+    try:
+        _run_bounded(scenario(), timeout=10)
+    finally:
+        executor.proceed.set()
+    # `asyncio.run` joined the executor, so the call has run by now.
     assert not ran.is_set()
 
 
