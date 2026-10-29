@@ -17,8 +17,10 @@
 --
 -- The touch's UPDATE takes the parent's row lock, so a metadata write waits
 -- behind a PATCH holding the parent FOR UPDATE, and the PATCH's reads cannot
--- see one land midway. The guard skips only a transaction that already holds
--- that lock from its own earlier touch.
+-- see one land midway. The guard skips when the parent already holds this
+-- transaction's start time, which in practice means the transaction's own
+-- earlier touch took that lock; Postgres does not make start times unique
+-- across transactions, but two sharing one microsecond is the only exception.
 
 CREATE OR REPLACE FUNCTION qiita.biosample_metadata_touch_biosample()
 RETURNS TRIGGER AS $$

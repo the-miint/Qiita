@@ -12,6 +12,7 @@ import secrets
 from dataclasses import dataclass
 from decimal import Decimal
 
+import asyncpg
 import pytest
 import pytest_asyncio
 from qiita_common.models import FieldDataType, Tier
@@ -23,10 +24,16 @@ from qiita_control_plane.repositories._sample_helpers import (
     insert_entity_to_study,
     visible_metadata_source,
 )
-from qiita_control_plane.repositories.biosample import OWNER_BIOSAMPLE_ID_TIER_OVERRIDE
+from qiita_control_plane.repositories.biosample import (
+    OWNER_BIOSAMPLE_ID_TIER_OVERRIDE,
+    fetch_biosample,
+)
 from qiita_control_plane.repositories.biosample_metadata import (
     BIOSAMPLE_METADATA_SPEC,
     insert_owner_biosample_id_metadata,
+)
+from qiita_control_plane.repositories.sequenced_sample import (
+    fetch_sequenced_sample_with_prep_sample,
 )
 from qiita_control_plane.repositories.study_access import CallerMetadataTiers
 from qiita_control_plane.testing.db_seeds import (
@@ -39,6 +46,7 @@ from qiita_control_plane.testing.db_seeds import (
     seed_local_study_field,
     seed_metadata_text_value,
     seed_sequenced_prep_sample,
+    seed_sequenced_sample_subtype,
     seed_study,
     seed_user_principal,
 )
@@ -666,6 +674,73 @@ async def test_metadata_write_moves_only_the_parents_metadata_timestamp(ctx, spe
                 ctx["principal_idx"],
             )
     assert (await _parent_timestamps(pool, spec, entity_idx))["updated_at"] == before["updated_at"]
+
+
+@pytest.mark.parametrize("spec", SPECS, ids=_spec_id)
+async def test_metadata_write_waits_behind_a_patch_holding_the_parent(ctx, spec):
+    """A PATCH reads its response's metadata under the lock its preflight took
+    on the parent row, and a metadata write's touch needs that row, so the
+    write waits and cannot land between the PATCH's reads. The write UPDATEs
+    an existing value, so the touch, not an insert's foreign-key check, is
+    what waits."""
+    pool = ctx["pool"]
+    entity_idx = await _create_linked_entity_for_spec(ctx, spec)
+    field_idx = await seed_local_study_field(
+        pool,
+        spec=spec,
+        study_idx=ctx["study_idx"],
+        display_name=unique_field_name("lock"),
+        created_by_idx=ctx["principal_idx"],
+    )
+    metadata_idx = await seed_metadata_text_value(
+        pool,
+        spec=spec,
+        entity_idx=entity_idx,
+        study_field_idx=field_idx,
+        created_by_idx=ctx["principal_idx"],
+    )
+    update_sql = f"UPDATE {spec.metadata_table} SET value_text = $2 WHERE idx = $1"
+
+    async def write(conn):
+        await conn.execute("SET LOCAL lock_timeout = '200ms'")
+        await conn.execute(update_sql, metadata_idx, f"v-{secrets.token_hex(3)}")
+
+    # Each kind's preflight is the fetch its PATCH runs: a biosample's own row,
+    # or the sequenced_sample joined to the prep_sample the value hangs on.
+    subtype = None
+    if spec.entity_kind is SampleEntityKind.BIOSAMPLE:
+
+        async def preflight(conn):
+            await fetch_biosample(conn, entity_idx, for_update=True)
+
+    else:
+        subtype = await seed_sequenced_sample_subtype(
+            pool,
+            prep_sample_idx=entity_idx,
+            owner_idx=ctx["principal_idx"],
+            sequenced_pool_item_id=f"item-{secrets.token_hex(4)}",
+        )
+
+        async def preflight(conn):
+            await fetch_sequenced_sample_with_prep_sample(conn, subtype[2], for_update=True)
+
+    try:
+        async with pool.acquire() as holder, holder.transaction():
+            await preflight(holder)
+            async with pool.acquire() as writer, writer.transaction():
+                with pytest.raises(asyncpg.LockNotAvailableError):
+                    await write(writer)
+
+        # Control: with the PATCH's transaction closed, the same write lands,
+        # so the refusal above is the lock and not a broken statement.
+        async with pool.acquire() as writer, writer.transaction():
+            await write(writer)
+    finally:
+        if subtype is not None:
+            run_idx, pool_idx, sequenced_sample_idx = subtype
+            await delete_idxs(pool, "sequenced_sample", sequenced_sample_idx)
+            await delete_idxs(pool, "sequenced_pool", pool_idx)
+            await delete_idxs(pool, "sequencing_run", run_idx)
 
 
 @pytest.mark.parametrize("spec", SPECS, ids=_spec_id)

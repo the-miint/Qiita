@@ -1111,9 +1111,10 @@ async def patch_sequenced_sample(
                     detail=f"sequenced_sample {sequenced_sample_idx} not found",
                 )
 
-            # Re-read global metadata under the prep_sample row lock, which
-            # every metadata write's touch trigger also takes, so no write
-            # lands between the UPDATE and these two reads.
+            # Re-read global metadata under the prep_sample row lock; a
+            # metadata write waits on it
+            # (qiita.prep_sample_metadata_touch_prep_sample), so none lands
+            # between the UPDATE and these two reads.
             metadata_rows = await fetch_global_metadata(
                 conn,
                 spec=PREP_SAMPLE_METADATA_SPEC,

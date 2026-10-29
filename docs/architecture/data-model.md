@@ -160,8 +160,8 @@ latest change among the values it returns
 column, which moves on every write. The record's `updated_at` moves only with
 the record's own columns, and the read's ETag is the later of the two
 (`routes._helpers.representation_etag`). So no timestamp a caller reads shows
-that a hidden value exists or when it changed. Both are stamps of what the
-response carries, not versions of it: a change that writes no value, such as a
+that a hidden value exists or when it changed. `last_metadata_change_at` and
+the ETag are stamps of what the response carries, not versions of it: a change that writes no value, such as a
 field's tier, an exception or a grant, can change which values a read returns
 without moving either, unless it hides or reveals the latest one; and a value
 stamped by a transaction that began before the latest one's carries the

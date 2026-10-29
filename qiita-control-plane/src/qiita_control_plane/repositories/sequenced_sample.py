@@ -82,9 +82,11 @@ async def fetch_sequenced_sample_with_prep_sample(
     sequenced_sample.updated_at) so a single timestamp captures the
     latest write to either side; the route layer combines it with the
     metadata it returns (`routes._helpers.representation_etag`). The columns
-    are SequencedSampleResponse's core fields (idx -> sequenced_sample_idx
-    renamed at the route boundary), less last_metadata_change_at, which the
-    route derives from the values it returns.
+    are SequencedSampleResponse's core fields, shaped at the route boundary
+    (idx -> sequenced_sample_idx; metadata_checklist_idx and
+    metadata_checklist_name -> metadata_checklist), less
+    last_metadata_change_at, which the route derives from the values it
+    returns.
 
     `for_update=True` appends `FOR UPDATE` to the SELECT so rows from
     both joined tables are locked for the duration of the surrounding

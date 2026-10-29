@@ -823,8 +823,9 @@ async def lookup_biosample_in_study_by_unique_field(
     does not reach, in the same words: a lookup must not confirm a value its
     caller could not read.
 
-    Access, the metadata the response carries, and the remaining refusals are
-    those of the by-idx read, a retired biosample or retired link answering 404.
+    Access, the metadata the response carries, the ETag, and the remaining
+    refusals are those of the by-idx read, a retired biosample or retired link
+    answering 404.
     """
     # One REPEATABLE READ snapshot spanning resolution and the read, so the
     # value that resolved the idx and the row read back cannot straddle a
@@ -1456,9 +1457,9 @@ async def patch_biosample(
             if updated_row is None:
                 raise HTTPException(status_code=404, detail=f"biosample {biosample_idx} not found")
 
-            # Re-read global metadata under the row lock, which every metadata
-            # write's touch trigger also takes, so no write lands between the
-            # UPDATE and these two reads.
+            # Re-read global metadata under the row lock; a metadata write
+            # waits on it (qiita.biosample_metadata_touch_biosample), so none
+            # lands between the UPDATE and these two reads.
             metadata_rows = await fetch_global_metadata(
                 conn, spec=BIOSAMPLE_METADATA_SPEC, entity_idx=biosample_idx, tiers=tiers
             )

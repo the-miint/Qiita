@@ -979,8 +979,8 @@ async def etag_for_row(pool, *, table: UpdatableTable, row_idx: int) -> str:
     """Build the quoted ISO-8601 ETag a PATCH route emits for a row whose
     ETag is its own updated_at.
 
-    A biosample's or sample's ETag is that only while none of the metadata
-    its read returns is newer (`routes._helpers.representation_etag`). Reads
+    A biosample's ETag is that only while none of the metadata its read
+    returns is newer (`routes._helpers.representation_etag`). Reads
     updated_at directly so the helper does not depend on the route's
     behavior; the on-the-wire wording matches the routes'.
     """
