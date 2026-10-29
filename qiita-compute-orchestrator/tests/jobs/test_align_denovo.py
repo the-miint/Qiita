@@ -591,14 +591,13 @@ def test_a_slice_no_axis_can_score_is_still_refused():
     ).gate.circular
 
 
-def test_no_lazy_arrow_reader_in_the_feeding_path():
-    """A relation's `.arrow()` and `.to_arrow_reader()` return a lazy `RecordBatchReader`
-    on DuckDB 2.0, and a miint table function over one backed by a query on the SAME
-    connection deadlocked on DuckDB 1.5.4, where `execute(...).arrow()` built one
-    (duckdb-miint#230, open). A Flight-sourced reader is not affected, so the constraint
-    is only that this job never builds one itself."""
-    import inspect
-
-    source = inspect.getsource(align_denovo)
-    assert ".arrow()" not in source
-    assert ".to_arrow_reader(" not in source
+def test_a_reader_backed_by_its_own_connection_cannot_be_registered_on_it():
+    """A miint table function over a lazy `RecordBatchReader` backed by a query on the
+    SAME connection deadlocked on DuckDB 1.5.4 (duckdb-miint#230). DuckDB 2.0 refuses
+    the `register` while that reader is open, so the deadlock cannot be reached from
+    here; if this stops raising, it can again. A Flight-sourced reader, the kind this
+    job registers, is backed by no connection at all."""
+    conn = duckdb.connect()
+    reader = conn.sql("SELECT range AS x FROM range(5000)").to_arrow_reader(1000)
+    with pytest.raises(duckdb.ResourceInUseException):
+        conn.register("subject", reader)

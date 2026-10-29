@@ -609,6 +609,17 @@ fn block_members() -> Vec<auth::BlockReadMember> {
     ]
 }
 
+/// The coarse conjuncts come first, at the top level, so pruning never waits on
+/// the optimizer pushing the per-member OR down (`block_read_where_clause`).
+#[test]
+fn block_read_where_clause_leads_with_the_coarse_conjuncts() {
+    let clause = block_read_where_clause(&block_members());
+    assert!(
+        clause.starts_with("prep_sample_idx IN (11,12) AND sequence_idx BETWEEN 100 AND 549 AND ("),
+        "{clause}"
+    );
+}
+
 #[test]
 fn build_query_read_block_streams_the_shared_projection_from_raw_read() {
     // Resolves to the raw read table, projects the shared EXPORT_READ_COLUMNS,

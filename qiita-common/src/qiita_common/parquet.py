@@ -78,7 +78,9 @@ def sorted_row_group_size(bytes_per_row: int) -> int:
     a level-16 write on one core however many threads the connection has. DuckDB closes
     a group at whichever of ROW_GROUP_SIZE (at the first whole vector at or past it) and
     ROW_GROUP_SIZE_BYTES it reaches first; this count, just under the byte cap, is
-    reached first, so every group is whole vectors.
+    reached first, so every group is whole vectors. The byte cap alone cuts mid-vector:
+    measured on 2.0.0, ~10 KB rows came out in groups of 6,395 rows, and of 6,144 with
+    this count.
 
     Returns the most whole vectors that fit ROW_GROUP_SIZE_BYTES, never more rows than
     DuckDB's default (so narrow rows keep the groups an unsorted write would give them) and

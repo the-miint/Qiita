@@ -152,8 +152,8 @@ def test_data_plane_read_export_options_match_transfer_exactly():
     assert m.group(1) == PARQUET_OPTS_TRANSFER
 
 
-# A sorted COPY: what DuckDB does with its row groups, and the row count that keeps them
-# under the cap.
+# A sorted COPY: what DuckDB does with its row groups, and the row count
+# `sorted_row_group_size` gives them.
 
 
 def _sorted_copy(con: duckdb.DuckDBPyConnection, tmp_path: Path, opts: str) -> Path:

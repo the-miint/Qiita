@@ -4,8 +4,10 @@ DuckDB 2.0 refuses a relational call — `register`, `unregister` of a registere
 `sql`, `from_arrow`, `table` — on a connection whose last `execute`d SELECT is
 part-read, with `ResourceInUseException`. `fetchone()` leaves even a one-row result
 part-read until a fetch comes back empty; `fetchall()` does not. A plain `execute` is
-not refused (it discards the part-read result), and nothing is refused after a
-statement other than a SELECT (`SET`, `CREATE`, `INSERT`, `COPY`), read or not.
+not refused (it discards the part-read result). Measured on 2.0.0, a part-read
+`DESCRIBE` or `SHOW` is refused like a SELECT, and nothing is refused after `SET`,
+`CREATE`, `INSERT` (with or without `RETURNING`), `COPY`, `CALL` or `PRAGMA`, read or
+not.
 """
 
 from __future__ import annotations

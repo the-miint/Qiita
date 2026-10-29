@@ -106,7 +106,7 @@ _None yet._
   - The `assemble` and `checkm` (`-1.0.1`) SIFs auto-rebuild on deploy to pick up 2.0.0.
   - **Work that loads miint between the bucket-4 restart and the redeploy's miint stage
     fails at LOAD**: `v2.0.0/` is staged after everything moves to 2.0.0. Resubmit
-    anything that failed there.
+    anything that failed there; #676 would stage first and close the window.
   - **Keep `v1.5.4/` and `v1.5.5/`.** The frozen `long-read-assembly-checkm-1.0.0.sif` still
     loads miint from `v1.5.4/`, and `v1.5.5/` is what a rollback runs. Staging never
     removes an old version dir.

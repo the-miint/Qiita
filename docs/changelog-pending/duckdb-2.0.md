@@ -19,7 +19,13 @@
   build reverse-complements mate 2 before mapping a pair under the `sr` preset
   `host_filter` uses (duckdb-miint#341). A pair can now map as one fragment when neither
   mate maps alone, so `host_filter` can count a pair as host that it did not count before.
+- **A registered file whose rows are all deleted now leaves the lake (#duckdb-2.0).**
+  DuckLake on DuckDB 2.0 drops such a file from its table, so `scripts/lake-gc.sh
+  --reclaim` removes it once the snapshots that hold it expire; on 1.5.5 it stayed in
+  the table, and on disk. A `register_files` replay that arrives after every row of one
+  of its files was deleted is now refused (`FailedPrecondition`) instead of answered
+  with the earlier registration.
 - **A miint COPY format can accept a DuckDB COPY option and ignore it (#duckdb-2.0).**
-  `ROW_GROUP_SIZE_BYTES` on `FORMAT BIOM` used to be refused as an unknown option, and
-  now does nothing (duckdb-miint#373). A name neither DuckDB nor miint knows is still
+  `ROW_GROUP_SIZE_BYTES` on `FORMAT BIOM` or `FORMAT NEWICK` used to be refused as an
+  unknown option, and now does nothing (duckdb-miint#373). A name neither DuckDB nor miint knows is still
   refused.

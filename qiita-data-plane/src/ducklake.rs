@@ -1060,6 +1060,27 @@ mod tests {
             parts.push(format!("dbname={dbname}"));
             parts.join(" ")
         };
+        /// A Postgres database of its own, dropped however the test ends.
+        struct Scratch {
+            admin: Connection,
+            name: String,
+        }
+        impl Scratch {
+            // CREATE and DROP DATABASE cannot run inside a transaction.
+            fn run(&self, sql: &str) -> duckdb::Result<()> {
+                self.admin.execute_batch(&format!(
+                    "CALL postgres_execute('pg', '{sql}', use_transaction := false);"
+                ))
+            }
+        }
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = self.run(&format!(
+                    "DROP DATABASE IF EXISTS {} WITH (FORCE)",
+                    self.name
+                ));
+            }
+        }
         let admin = Connection::open_in_memory().unwrap();
         admin
             .execute_batch(&format!(
@@ -1067,18 +1088,20 @@ mod tests {
                 with_dbname("postgres")
             ))
             .unwrap();
-        // CREATE and DROP DATABASE cannot run inside a transaction.
-        let pg = |sql: &str| {
-            admin
-                .execute_batch(&format!(
-                    "CALL postgres_execute('pg', '{sql}', use_transaction := false);"
-                ))
-                .unwrap()
+        let scratch = Scratch {
+            admin,
+            name: format!("qiita_ducklake_newer_{}", std::process::id()),
         };
-        let db = format!("qiita_ducklake_newer_{}", std::process::id());
-        pg(&format!("DROP DATABASE IF EXISTS {db} WITH (FORCE)"));
-        pg(&format!("CREATE DATABASE {db}"));
-        let connstr = with_dbname(&db);
+        scratch
+            .run(&format!(
+                "DROP DATABASE IF EXISTS {} WITH (FORCE)",
+                scratch.name
+            ))
+            .unwrap();
+        scratch
+            .run(&format!("CREATE DATABASE {}", scratch.name))
+            .unwrap();
+        let connstr = with_dbname(&scratch.name);
         let data = tempfile::tempdir().unwrap();
         let data_path = data.path().to_str().unwrap();
         Connection::open_in_memory()
@@ -1091,7 +1114,6 @@ mod tests {
             .unwrap();
 
         let refused = connect_ducklake(&Connection::open_in_memory().unwrap(), &connstr, data_path);
-        pg(&format!("DROP DATABASE {db} WITH (FORCE)"));
 
         let err = refused.expect_err("a catalog past the pinned format attached");
         assert!(err.to_string().contains("Cannot downgrade"), "{err}");

@@ -111,8 +111,8 @@ const NO_TRANSACTION_TO_ROLL_BACK: &str = "no transaction is active";
 /// Cannot perform IO in in-memory database - CreateBlock!` — where a directory
 /// each returned correct results in four of four. DuckDB 2.0 names them per
 /// database (`duckdb_temp_<pid>_<n>_…`), and the same shared-directory workload
-/// returned correct results in four of four, so on 2.0 the directories are not
-/// what keeps the pool from crashing.
+/// returned correct results in four of four. The directories are kept as they
+/// were; nothing was measured for what they give on 2.0.
 ///
 /// `conn` is declared before `spill` so it drops first: DuckDB closes and
 /// releases its spill files, then the directory is removed. The data plane has

@@ -63,8 +63,8 @@ from .miint_staging import write_staging_marker
 
 # Chunked-sequence write constants. Sequence data (genome-scale up to
 # ~21 MB per record on GG2) is broken into 64 KB chunks so the DuckLake
-# row layout stays narrow on long entries. An unsorted write flushes a row
-# group on whichever cap it hits first: the ROW_GROUP_SIZE row count (16384
+# row layout stays narrow on long entries. A write flushes a row group on
+# whichever cap it hits first: the ROW_GROUP_SIZE row count (16384
 # rows × ~64 KB chunk_data ≈ 1 GB, empirically tuned against GG2 backbone —
 # 4.2 GB peak RSS; 32768 OOMs on 30 GB hosts) OR the ROW_GROUP_SIZE_BYTES
 # '64MB' size cap inherited from the base set. On dense chunk data the
