@@ -6,6 +6,7 @@ delegating multi-table work to the biosample composer.
 
 import contextlib
 from collections.abc import Awaitable, Callable, Sequence
+from datetime import datetime
 from typing import Annotated
 
 import asyncpg
@@ -85,6 +86,7 @@ from ..repositories._sample_helpers import (
     fetch_global_fields,
     fetch_global_metadata,
     fetch_study_fields_for_study,
+    fetch_visible_metadata_last_change,
     insert_new_entities_metadata_batch,
     write_resolved_metadata_entries,
 )
@@ -125,6 +127,7 @@ from ._helpers import (
     raise_transient_retry,
     read_and_map_study_field,
     read_study_scoped_entity,
+    representation_etag,
     require_etag_match,
     require_if_match,
     resolve_and_write_study_scoped_metadata,
@@ -773,16 +776,23 @@ async def _read_study_scoped_biosample(
         tiers=tiers,
         not_found_detail=not_found_detail,
     )
+    metadata_last_change = await fetch_visible_metadata_last_change(
+        conn,
+        spec=BIOSAMPLE_METADATA_SPEC,
+        entity_idx=biosample_idx,
+        tiers=tiers,
+        study_idx=study_idx,
+    )
 
-    # Set the ETag header so callers can use it as the If-Match value on a
-    # subsequent PATCH; the value is opaque-by-contract.
-    response.headers[ETAG_HEADER] = etag_for_updated_at(row["updated_at"])
+    # The ETag is opaque by contract.
+    response.headers[ETAG_HEADER] = representation_etag(row["updated_at"], metadata_last_change)
 
     return _study_scoped_response_from_row(
         row,
         global_metadata=global_metadata,
         local_metadata=local_metadata,
         caller_system_role=caller_system_role,
+        metadata_last_change=metadata_last_change,
     )
 
 
@@ -877,12 +887,13 @@ async def get_biosample_in_study(
     retirement is evaluated only after the link passes, and a retired biosample
     is likewise 404 (mirroring the biosample-level read's retired carve-out).
 
-    The owner-biosample-id row is a study-local value like any other, read at
-    its field's tier (OWNER_BIOSAMPLE_ID_TIER_OVERRIDE when the field is
-    created). This route does not write it.
+    The owner-biosample-id row is a study-local value read at no less than
+    OWNER_BIOSAMPLE_ID_TIER_OVERRIDE, whatever its field's tier. This route
+    does not write it.
 
-    The response carries an `ETag` header derived from the row's `updated_at`
-    column; the value is a quoted ISO 8601 timestamp and is opaque by contract.
+    last_metadata_change_at and the `ETag` header describe what the response
+    carries (`representation_etag`); the ETag is a quoted ISO 8601 timestamp
+    and is opaque by contract.
     """
     # One REPEATABLE READ snapshot so the row read, the link check, and both
     # metadata reads cannot disagree about a concurrent writer's commit.
@@ -1046,13 +1057,18 @@ async def patch_biosample_metadata(
     return written
 
 
-def _biosample_core_row_dict(row: asyncpg.Record) -> dict[str, object]:
+def _biosample_core_row_dict(
+    row: asyncpg.Record, *, metadata_last_change: datetime | None
+) -> dict[str, object]:
     """Map a qiita.biosample row's columns to BiosampleResponse field names.
 
     Centralises the column -> field mapping (the idx -> biosample_idx rename
     aside, every key matches its column; export_entity_id is read from
-    qiita.exported_entity). Excludes the metadata dicts and caller_system_role.
-    Runs no DB queries.
+    qiita.exported_entity). last_metadata_change_at is
+    `metadata_last_change`, when the response's own metadata values last
+    changed, never the row's column (see
+    `fetch_visible_metadata_last_change`). Excludes the metadata dicts and
+    caller_system_role. Runs no DB queries.
     """
     return {
         "biosample_idx": row["idx"],
@@ -1066,7 +1082,7 @@ def _biosample_core_row_dict(row: asyncpg.Record) -> dict[str, object]:
         "matrix_tube_id": row["matrix_tube_id"],
         "last_submission_at": row["last_submission_at"],
         "submission_error": row["submission_error"],
-        "last_metadata_change_at": row["last_metadata_change_at"],
+        "last_metadata_change_at": metadata_last_change,
         "created_by_idx": row["created_by_idx"],
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
@@ -1082,13 +1098,14 @@ def _biosample_response_from_row(
     *,
     global_metadata: dict[str, MetadataEntry],
     caller_system_role: SystemRole,
+    metadata_last_change: datetime | None,
 ) -> BiosampleResponse:
     """Shape a qiita.biosample row + decoded global metadata into BiosampleResponse.
 
     Reuses the shared core-column mapping; the global_metadata dict is supplied
     by the caller -- this helper runs no DB queries.
     """
-    payload = _biosample_core_row_dict(row) | {
+    payload = _biosample_core_row_dict(row, metadata_last_change=metadata_last_change) | {
         "global_metadata": global_metadata,
         "caller_system_role": caller_system_role,
     }
@@ -1101,6 +1118,7 @@ def _study_scoped_response_from_row(
     global_metadata: dict[str, MetadataEntry],
     local_metadata: dict[str, MetadataEntry],
     caller_system_role: SystemRole,
+    metadata_last_change: datetime | None,
 ) -> StudyScopedBiosampleResponse:
     """Shape a biosample row + its global and study-local metadata into
     StudyScopedBiosampleResponse.
@@ -1109,7 +1127,7 @@ def _study_scoped_response_from_row(
     metadata (keyed by display_name) alongside the global map. Both metadata
     dicts are supplied by the caller -- this helper runs no DB queries.
     """
-    payload = _biosample_core_row_dict(row) | {
+    payload = _biosample_core_row_dict(row, metadata_last_change=metadata_last_change) | {
         "global_metadata": global_metadata,
         "local_metadata": local_metadata,
         "caller_system_role": caller_system_role,
@@ -1145,9 +1163,10 @@ async def get_biosample(
     404 keeps callers (including admins) from seeing partially-revoked
     rows by accident.
 
-    The response carries an `ETag` header derived from the row's
-    `updated_at` column. The format is a quoted ISO 8601 timestamp;
-    clients must treat it as opaque.
+    last_metadata_change_at and the `ETag` header describe what the response
+    carries (`representation_etag`), which is what this route's PATCH checks
+    If-Match against. The ETag is a quoted ISO 8601 timestamp; clients must
+    treat it as opaque.
     """
     # All reads share one REPEATABLE READ snapshot so the supertype row,
     # the access predicate, and the metadata read cannot disagree about a
@@ -1183,23 +1202,25 @@ async def get_biosample(
 
         # Pull the globally-linked metadata once access has been resolved,
         # each value judged on the study that wrote it.
+        tiers = await caller_metadata_tiers(conn, user)
         metadata_rows = await fetch_global_metadata(
-            conn,
-            spec=BIOSAMPLE_METADATA_SPEC,
-            entity_idx=biosample_idx,
-            tiers=await caller_metadata_tiers(conn, user),
+            conn, spec=BIOSAMPLE_METADATA_SPEC, entity_idx=biosample_idx, tiers=tiers
+        )
+        metadata_last_change = await fetch_visible_metadata_last_change(
+            conn, spec=BIOSAMPLE_METADATA_SPEC, entity_idx=biosample_idx, tiers=tiers
         )
 
     global_metadata = metadata_entries_from_rows(metadata_rows)
 
     # Set the ETag header so callers can use it as the If-Match value on a
     # subsequent PATCH; the value is opaque-by-contract.
-    response.headers[ETAG_HEADER] = etag_for_updated_at(row["updated_at"])
+    response.headers[ETAG_HEADER] = representation_etag(row["updated_at"], metadata_last_change)
 
     return _biosample_response_from_row(
         row,
         global_metadata=global_metadata,
         caller_system_role=user.system_role,
+        metadata_last_change=metadata_last_change,
     )
 
 
@@ -1364,9 +1385,9 @@ async def patch_biosample(
     owner_idx (a backstop the preflight should preempt in practice) to
     the same eligibility-422.
 
-    The response carries an `ETag` header derived from the new row's
-    `updated_at` column; format mirrors the GET endpoint's contract
-    and is opaque to clients.
+    If-Match is checked against, and the response's `ETag` header carries,
+    the value GET /biosample/{idx} returns (`representation_etag`); it is
+    opaque to clients.
     """
     assert isinstance(caller, HumanUser), (
         "caller must be HumanUser pre-commit; shaper reads .system_role and "
@@ -1392,7 +1413,18 @@ async def patch_biosample(
             # the shared post-FOR-UPDATE preflight every PATCH runs.
             if row is not None and row["retired"]:
                 raise HTTPException(status_code=409, detail=f"biosample {biosample_idx} is retired")
-            require_etag_match(row, if_match=if_match, label="biosample", row_idx=biosample_idx)
+            # If-Match carries the ETag of GET /biosample/{idx}, which covers
+            # the global metadata that read returns.
+            tiers = await caller_metadata_tiers(conn, caller)
+            require_etag_match(
+                row,
+                if_match=if_match,
+                label="biosample",
+                row_idx=biosample_idx,
+                metadata_last_change=await fetch_visible_metadata_last_change(
+                    conn, spec=BIOSAMPLE_METADATA_SPEC, entity_idx=biosample_idx, tiers=tiers
+                ),
+            )
 
             # Eligibility preflight runs only when ownership is being
             # transferred; collapses every ineligibility case to 422.
@@ -1427,10 +1459,10 @@ async def patch_biosample(
             # Re-read global metadata in the same transaction so the response
             # and the UPDATE see one consistent snapshot.
             metadata_rows = await fetch_global_metadata(
-                conn,
-                spec=BIOSAMPLE_METADATA_SPEC,
-                entity_idx=biosample_idx,
-                tiers=await caller_metadata_tiers(conn, caller),
+                conn, spec=BIOSAMPLE_METADATA_SPEC, entity_idx=biosample_idx, tiers=tiers
+            )
+            metadata_last_change = await fetch_visible_metadata_last_change(
+                conn, spec=BIOSAMPLE_METADATA_SPEC, entity_idx=biosample_idx, tiers=tiers
             )
         except asyncpg.UniqueViolationError as exc:
             raise_for_unique_violation(
@@ -1456,7 +1488,9 @@ async def patch_biosample(
             raise
 
     # Set the new ETag from the updated row's bumped updated_at.
-    response.headers[ETAG_HEADER] = etag_for_updated_at(updated_row["updated_at"])
+    response.headers[ETAG_HEADER] = representation_etag(
+        updated_row["updated_at"], metadata_last_change
+    )
 
     # Reuse the GET route's row -> response shaper so the PATCH and GET
     # surfaces share one source of truth for the response shape.
@@ -1465,6 +1499,7 @@ async def patch_biosample(
         updated_row,
         global_metadata=global_metadata,
         caller_system_role=caller.system_role,
+        metadata_last_change=metadata_last_change,
     )
 
 

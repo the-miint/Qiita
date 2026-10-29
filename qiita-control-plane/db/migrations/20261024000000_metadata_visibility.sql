@@ -3,7 +3,7 @@
 -- The metadata visibility rule as SQL: two scalars for a value's required tier
 -- and, per entity kind, one set-returning function over its EAV rows that a
 -- read uses either as a filter (WHERE visible) or as a mask (the value_*
--- columns are NULL on a hidden row). The rule itself is defined in
+-- columns, and when the row last changed, are NULL on a hidden row). The rule itself is defined in
 -- docs/architecture/data-model.md, "Metadata visibility tiers"; this file
 -- implements it.
 --
@@ -62,7 +62,8 @@ CREATE FUNCTION qiita.biosample_metadata_visibility(
     value_boolean boolean,
     value_date date,
     value_terminology_term_idx bigint,
-    value_missing_reason_idx bigint
+    value_missing_reason_idx bigint,
+    updated_at timestamptz
 )
 LANGUAGE sql STABLE PARALLEL SAFE
 AS $$
@@ -79,7 +80,8 @@ AS $$
            CASE WHEN r.caller_tier >= r.required_tier THEN m.value_boolean END,
            CASE WHEN r.caller_tier >= r.required_tier THEN m.value_date END,
            CASE WHEN r.caller_tier >= r.required_tier THEN m.value_terminology_term_idx END,
-           CASE WHEN r.caller_tier >= r.required_tier THEN m.value_missing_reason_idx END
+           CASE WHEN r.caller_tier >= r.required_tier THEN m.value_missing_reason_idx END,
+           CASE WHEN r.caller_tier >= r.required_tier THEN m.updated_at END
       FROM qiita.biosample_metadata m
       JOIN qiita.biosample_study_field sf ON sf.idx = m.biosample_study_field_idx
       JOIN qiita.study s ON s.idx = sf.study_idx
@@ -92,11 +94,16 @@ AS $$
             AND el.biosample_study_field_idx = m.biosample_study_field_idx
       LEFT JOIN unnest(caller_study_idxs, caller_study_tiers) AS ct(study_idx, tier)
              ON ct.study_idx = sf.study_idx
+     -- An owner-biosample-id value never requires less than member, whatever
+     -- its field's tier (docs/architecture/data-model.md).
      CROSS JOIN LATERAL (VALUES (
-               qiita.metadata_required_tier(
-                   qiita.metadata_field_tier(gf.default_tier, sf.tier_override, s.default_tier),
-                   eg.tier_override,
-                   el.tier_override
+               GREATEST(
+                   qiita.metadata_required_tier(
+                       qiita.metadata_field_tier(gf.default_tier, sf.tier_override, s.default_tier),
+                       eg.tier_override,
+                       el.tier_override
+                   ),
+                   CASE WHEN m.is_owner_biosample_id THEN 'member'::qiita.tier END
                ),
                COALESCE(ct.tier, caller_default_tier)
            )) AS r(required_tier, caller_tier)
@@ -105,9 +112,9 @@ $$;
 COMMENT ON FUNCTION qiita.biosample_metadata_visibility(bigint[], qiita.tier[], qiita.tier) IS
     'Every biosample_metadata row with the tier it requires, the tier the caller '
     'holds on its study, and whether the caller may read it; the value columns '
-    'are NULL on a row the caller may not read. Filter with WHERE visible, or '
-    'read the value columns as a mask. Rule: docs/architecture/data-model.md, '
-    '"Metadata visibility tiers".';
+    'and updated_at are NULL on a row the caller may not read. Filter with WHERE '
+    'visible, or read those columns as a mask. Rule: '
+    'docs/architecture/data-model.md, "Metadata visibility tiers".';
 
 CREATE FUNCTION qiita.prep_sample_metadata_visibility(
     caller_study_idxs bigint[],
@@ -127,7 +134,8 @@ CREATE FUNCTION qiita.prep_sample_metadata_visibility(
     value_boolean boolean,
     value_date date,
     value_terminology_term_idx bigint,
-    value_missing_reason_idx bigint
+    value_missing_reason_idx bigint,
+    updated_at timestamptz
 )
 LANGUAGE sql STABLE PARALLEL SAFE
 AS $$
@@ -144,7 +152,8 @@ AS $$
            CASE WHEN r.caller_tier >= r.required_tier THEN m.value_boolean END,
            CASE WHEN r.caller_tier >= r.required_tier THEN m.value_date END,
            CASE WHEN r.caller_tier >= r.required_tier THEN m.value_terminology_term_idx END,
-           CASE WHEN r.caller_tier >= r.required_tier THEN m.value_missing_reason_idx END
+           CASE WHEN r.caller_tier >= r.required_tier THEN m.value_missing_reason_idx END,
+           CASE WHEN r.caller_tier >= r.required_tier THEN m.updated_at END
       FROM qiita.prep_sample_metadata m
       JOIN qiita.prep_sample_study_field sf ON sf.idx = m.prep_sample_study_field_idx
       JOIN qiita.study s ON s.idx = sf.study_idx
@@ -169,7 +178,7 @@ $$;
 
 COMMENT ON FUNCTION qiita.prep_sample_metadata_visibility(bigint[], qiita.tier[], qiita.tier) IS
     'The prep_sample_metadata twin of qiita.biosample_metadata_visibility; same '
-    'columns, same rule.';
+    'columns, same rule (a prep_sample has no owner-sample-id value).';
 
 -- The original table COMMENTs said an exception "downgrades visibility to a
 -- specified tier_override", which reads as setting the value's tier. It can

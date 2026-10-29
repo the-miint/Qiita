@@ -642,6 +642,31 @@ async def test_metadata_write_moves_only_the_parents_metadata_timestamp(ctx, spe
     assert after["last_metadata_change_at"] is not None
     assert after["last_metadata_change_at"] != before["last_metadata_change_at"]
 
+    # From the second write of one transaction on, now() is the value the
+    # parent already holds; those writes must not move updated_at either.
+    second_field_idx = await seed_local_study_field(
+        pool,
+        spec=spec,
+        study_idx=ctx["study_idx"],
+        display_name=unique_field_name("touch"),
+        created_by_idx=ctx["principal_idx"],
+    )
+    async with pool.acquire() as conn, conn.transaction():
+        for study_field_idx in (field_idx, second_field_idx):
+            await conn.execute(
+                f"INSERT INTO {spec.metadata_table}"
+                f" ({spec.entity_key_column}, {spec.study_field_idx_column}, value_text,"
+                f"  created_by_idx)"
+                f" VALUES ($1, $2, $3, $4)"
+                f" ON CONFLICT ({spec.entity_key_column}, {spec.study_field_idx_column})"
+                f" DO UPDATE SET value_text = EXCLUDED.value_text",
+                entity_idx,
+                study_field_idx,
+                f"v-{secrets.token_hex(3)}",
+                ctx["principal_idx"],
+            )
+    assert (await _parent_timestamps(pool, spec, entity_idx))["updated_at"] == before["updated_at"]
+
 
 @pytest.mark.parametrize("spec", SPECS, ids=_spec_id)
 async def test_visible_metadata_last_change_counts_only_the_read_values(ctx, spec):

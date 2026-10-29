@@ -4593,8 +4593,10 @@ async def test_lookup_biosample_in_study_by_unique_field(ctx):
     body = resp.json()
     assert body["biosample_idx"] == bs_idx
     assert body["local_metadata"][display_name]["value"] == value
-    expected_etag = await etag_for_row(ctx["pool"], table="qiita.biosample", row_idx=bs_idx)
-    assert resp.headers["ETag"] == expected_etag
+    by_idx = await ctx["wet"].get(
+        URL_BIOSAMPLE_BY_STUDY_AND_IDX.format(study_idx=study_idx, biosample_idx=bs_idx)
+    )
+    assert resp.headers["ETag"] == by_idx.headers["ETag"]
 
 
 async def test_lookup_biosample_in_study_by_unique_field_nul_value_422(ctx):

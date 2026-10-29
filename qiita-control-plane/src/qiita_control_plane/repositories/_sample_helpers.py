@@ -2,7 +2,7 @@
 
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from enum import StrEnum
 from typing import Literal, NamedTuple
@@ -1288,6 +1288,37 @@ async def fetch_local_metadata(
             value=value,
         )
     return result
+
+
+async def fetch_visible_metadata_last_change(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
+    *,
+    spec: EntityMetadataSpec,
+    entity_idx: int,
+    tiers: CallerMetadataTiers,
+    study_idx: int | None = None,
+) -> datetime | None:
+    """When the values a metadata read returns last changed, or None if it
+    returns none.
+
+    The read is `fetch_global_metadata` for the entity, plus
+    `fetch_local_metadata` on study_idx when one is given: the latest
+    updated_at among the globally-linked values and that study's purely-local
+    values visible at `tiers`. A read reports this in place of the entity's
+    own last_metadata_change_at, which moves on every write and so would show
+    a caller that hidden values exist and when they change.
+    """
+    # A NULL study_idx matches no local row, leaving only the global values.
+    return await pool_or_conn.fetchval(
+        f"SELECT max(m.updated_at)"
+        f" FROM {visible_metadata_source(spec)}"
+        f" WHERE m.{spec.entity_key_column} = $4"
+        f"   AND m.visible"
+        f"   AND (m.global_field_idx IS NOT NULL OR m.study_idx = $5)",
+        *tiers.sql_args(),
+        entity_idx,
+        study_idx,
+    )
 
 
 # ---------------------------------------------------------------------------
