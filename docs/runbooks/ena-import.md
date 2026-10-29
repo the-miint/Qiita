@@ -468,8 +468,7 @@ failure_type `permanent` and both digests in the reason. A run that broke mid-do
 (including a corrupt body that surfaces mid-stream) and an HTTP 5xx, 408 or 429 from ENA
 or its file server, a failed connection to the server and an HTTP status 0 (no usable
 status) are retried the same way, as is ENA's "Not all results may have been
-written" answer with a miint build that includes duckdb-miint#310. A run whose file
-returns a 404 fails at once.
+written" answer. A run whose file returns a 404 fails at once.
 
 Where verification does not apply (an SFF run, a file that is not gzip-compressed, no
 `fastq_md5` from ENA) the run still registers. A run that comes back empty fails

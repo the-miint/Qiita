@@ -88,8 +88,8 @@ TRANSIENT_FETCH_ERROR_TEXT = "transient fetch error"
 
 _PERMANENT_ERROR_MARKERS = ("malformed", "invalid fastq", "no sequence data")
 # ENA's own words when it answers a search with HTTP 200 but stops writing the
-# results; with duckdb-miint#310, miint quotes them when the answer survives its
-# retries.
+# results; miint quotes them when the answer survives its retries
+# (duckdb-miint#310).
 _ENA_INCOMPLETE_ANSWER_MARKER = "not all results may have been written"
 # miint's error for a scan of one run that failed mid-stream.
 _EVERY_RUN_FAILED_MARKER = "every run failed"
@@ -103,7 +103,7 @@ class Inputs(BaseModel):
 
     `ena_run_map` is the runner-staged Parquet roster `(prep_sample_idx BIGINT,
     ena_run_accession VARCHAR)` from a live Postgres query. `reads_staging_root`
-    is the scratch root durable per-sample `read.parquet` copies hang under (via
+    is the scratch root durable per-prep_sample `read.parquet` copies hang under (via
     `compute_reads_staging_path`). `download_method` defaults to 'http', the only
     transport this environment supports. `sequenced_pool_idx` / `sequencing_run_idx`
     / `work_ticket_idx` are framework-injected scope scalars."""

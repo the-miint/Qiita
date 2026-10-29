@@ -43,7 +43,7 @@ def _run(inputs: Inputs, workspace) -> dict:
 @pytest.fixture
 def fake_mint(monkeypatch):
     """Replace mint_sequence_range with a recorder. Returns the list of
-    (prep_sample_idx, count) calls; each mint starts at a per-sample base so
+    (prep_sample_idx, count) calls; each mint starts at a per-prep_sample base so
     the written sequence_idx values are visible and distinct across runs."""
     calls: list[tuple[int, int]] = []
 

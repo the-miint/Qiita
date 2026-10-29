@@ -22,22 +22,17 @@ with miint's `read_fastx` table function (native parser; `.gz` transparent;
 chunking is miint's native `sequence_split` (`UNNEST`ed) — never a hand-rolled
 Python parser. `read_fastx` accepts a `VARCHAR[]` of paths, so the whole
 manifest is one streaming scan — no sequence bytes through Python. The scan runs
-twice: pass 1 keeps only `(read_id, length, filepath)` for the sanity checks (so
-the full sequences are never materialised — the old per-file temp table was the
-dominant spill source); pass 2 streams read → split → Parquet without landing
-sequences in a table. Re-reading each FASTA (2× decompress) is deliberate — far
-cheaper than spilling hundreds of genomes. Empty files are pre-filtered out
-(`read_fastx` raises on a 0-record input, and one empty path aborts the scan).
+twice: pass 1 keeps only `(read_id, length, filepath)` for the sanity checks, so
+the full sequences are never materialised; pass 2 re-reads every file and streams
+read → split → Parquet without landing sequences in a table (it says why). Empty
+files are pre-filtered out (`read_fastx` raises on a 0-record input, and one empty
+path aborts the scan).
 
 **Bounded memory is config, not algorithm.** `read_fastx(..., max_batch_bytes)`
 caps each read batch by bytes so a multi-MB genome record (GG2 reaches ~21 MB)
 can't form a giant vector; `apply_duckdb_settings` sets `memory_limit` +
 `temp_directory` (operators spill, not OOM) + `preserve_insertion_order=false`;
-and `PARQUET_OPTS_CHUNKED_TRANSFER`'s `ROW_GROUP_SIZE` bounds the write buffer. At
-~300 GB the chunked-Parquet ingest plus the unchanged quadratic
-`hash_sequences`/`load` is still a deferred performance effort, but the external
-contract (this step's `fasta_path` output wired into `hash_sequences`) is stable
-across both phases.
+and `PARQUET_OPTS_CHUNKED_TRANSFER`'s `ROW_GROUP_SIZE` bounds the write buffer.
 
 **read_id is the global join key.** read_id is the genome_map join key and is
 globally unique by contract; a duplicate (across files or within one file) is a
@@ -199,7 +194,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
 
             # Pass 1 — lengths + filepath only; no sequence bytes retained, so
             # the sanity checks (empty-body, dup read_id) cost a tiny table
-            # instead of materialising every genome (the old spill source).
+            # instead of materialising every genome.
             # `max_batch_bytes` caps the read-side vector for genome-scale
             # records; `include_filepath` lets the dup report name the file.
             conn.execute(
@@ -255,9 +250,9 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             # `sequence_split` (shared chunker; see qiita_common.chunking). Each
             # sequence splits into 64 KB pieces in a single linear pass; UNNEST
             # gives one row per chunk. Sequences flow read -> split -> parquet
-            # without ever landing in a table. This re-reads each FASTA (2x
-            # decompress total) — deliberate: far cheaper than materialising
-            # hundreds of genomes only to spill them.
+            # without ever landing in a table. Re-reading each FASTA (2x
+            # decompress total) is far cheaper than materialising hundreds of
+            # genomes only to spill them.
             part_out = validate_parquet_path(fasta_dir / "part_00000.parquet")
             conn.execute(
                 "COPY ("
