@@ -49,7 +49,7 @@ import duckdb
 from pydantic import BaseModel
 from qiita_common.backend_failure import BackendFailure, FailureKind, StepNoData
 from qiita_common.models import WorkTicketFailureStage
-from qiita_common.parquet import sorted_row_group_size, validate_parquet_path
+from qiita_common.parquet import validate_parquet_path
 
 from ..cp_client import make_cp_client
 from ..miint import (
@@ -161,14 +161,13 @@ def _write_read_parts(
     reference_load and hash_sequences already do — and for this same reason (a
     single-file sort+write of a large payload OOMs DuckDB).
     """
-    # Size the parts and their row groups from the intermediate's uncompressed
-    # payload, read from the Parquet footer. Row count alone would be a poor proxy:
-    # HiFi reads are ~100x an Illumina read. A footer with no size raises rather than
-    # sizing for 1-byte rows, which would make one part — an unbounded sort over the
-    # whole read set, exactly the OOM this batching exists to remove.
+    # Size the parts from the intermediate's uncompressed payload, read from the
+    # Parquet footer. Row count alone would be a poor proxy: HiFi reads are ~100x an
+    # Illumina read. A footer with no size raises rather than sizing for 1-byte rows,
+    # which would make one part — an unbounded sort over the whole read set, exactly
+    # the OOM this batching exists to remove.
     bytes_per_row = parquet_bytes_per_row(conn, intermediate)
     rows_per_part = max(1, _ROWS_PER_PART_TARGET_BYTES // bytes_per_row)
-    row_group_size = sorted_row_group_size(bytes_per_row)
 
     # Created here, not up front: a run that fails before this point (bad input, a
     # duplicate QNAME, a refused mint) must leave NO output directory behind for the
@@ -190,7 +189,7 @@ def _write_read_parts(
             # explicit — preserve_insertion_order=false means DuckDB is free to emit
             # a batch's rows out of order, and the clustering is the point.
             "ORDER BY sequence_idx ) "
-            f"TO '{part}' ({PARQUET_OPTS_AT_REST}, ROW_GROUP_SIZE {row_group_size})",
+            f"TO '{part}' ({PARQUET_OPTS_AT_REST})",
             [prep_sample_idx, sequence_idx_start, str(intermediate), lo, hi],
         )
         parts += 1

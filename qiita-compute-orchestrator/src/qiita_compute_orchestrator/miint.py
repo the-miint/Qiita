@@ -70,8 +70,7 @@ from .miint_staging import write_staging_marker
 # '64MB' size cap inherited from the base set. On dense chunk data the
 # 64 MB cap binds first (~1024 chunks), so row groups land at ~64 MB
 # rather than ~1 GB — strictly lower write memory and finer pruning, with
-# the row-count cap still backstopping sparse/narrow records. A sorted
-# write sizes its row count itself (see `qiita_common.parquet.sorted_row_group_size`).
+# the row-count cap still backstopping sparse/narrow records.
 #
 # CHUNK_ROW_GROUP_SIZE (and the matching CHUNK_SIZE) are single-sourced in
 # `qiita_common.chunking`, shared with the CLI's DoPut path. The actual
@@ -85,8 +84,7 @@ PARQUET_OPTS_CHUNKED_TRANSFER: str = (
 
 def parquet_bytes_per_row(conn: duckdb.DuckDBPyConnection, path: Path | str) -> int:
     """Mean decompressed bytes per row (still Parquet-encoded) of the Parquet file or glob
-    at `path`, from its footers alone: the width a sorted write of rows of the same shape
-    passes to `qiita_common.parquet.sorted_row_group_size`.
+    at `path`, from its footers alone.
 
     Raises when the footers report no rows or no size. A default would size the write
     for rows of the wrong width, and nothing downstream would notice."""

@@ -41,10 +41,9 @@ pub(crate) fn validate_sql_literal(value: &str, field: &str) -> Result<(), Strin
 
 /// Parquet row-group size (rows) DuckLake uses when it rewrites the chunked sequence
 /// tables: `qiita_common.chunking.CHUNK_ROW_GROUP_SIZE`, ~1 GB of dense 64 KB chunks. The
-/// chunk files the orchestrator registers into those tables do not use it; their sorted
-/// writer sizes row groups from the chunks' width
-/// (`qiita_common.parquet.sorted_row_group_size`). A qiita-common test parses this line
-/// and pins it to the Python constant.
+/// chunk files the orchestrator registers into those tables do not use it; the byte cap
+/// in `qiita_common.parquet.PARQUET_OPTS_AT_REST` bounds their row groups. A qiita-common
+/// test parses this line and pins it to the Python constant.
 const CHUNK_ROW_GROUP_SIZE: u64 = 16384;
 
 /// Key of the Postgres advisory lock a data plane holds while it sets up the

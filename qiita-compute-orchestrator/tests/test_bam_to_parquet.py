@@ -27,13 +27,8 @@ import asyncio
 import duckdb
 import pytest
 from helpers import (
-    SHRUNK_ROW_GROUP_SIZE_BYTES,
-    WIDE_ROW_GROUPS,
-    row_group_rows,
-    wide_reads,
     write_chunked_blob_upload,
 )
-from qiita_common import parquet
 from qiita_common.backend_failure import BackendFailure, FailureKind, StepNoData
 from qiita_common.models import (
     REDRIVABLE_WORK_TICKET_STATES,
@@ -632,21 +627,6 @@ def test_reads_are_written_as_monotone_disjoint_parts(fake_mint, monkeypatch, tm
             bounds.append((lo, hi))
     for (_, prev_hi), (next_lo, _) in zip(bounds, bounds[1:], strict=False):
         assert prev_hi < next_lo, f"parts overlap: {bounds}"
-
-
-def test_parts_keep_wide_row_groups_under_the_byte_cap(fake_mint, monkeypatch, tmp_path):
-    """Each part's sorted COPY asks for the row count
-    `qiita_common.parquet.sorted_row_group_size` sizes to the reads. With the cap shrunk to
-    1 MiB, ~1 KB reads land one vector per row group instead of the whole part in one."""
-    monkeypatch.setattr(parquet, "ROW_GROUP_SIZE_BYTES", SHRUNK_ROW_GROUP_SIZE_BYTES)
-    sam = tmp_path / "in.sam"
-    _write_sam(sam, [_sam_record(rid, bases, "I" * len(bases)) for rid, bases in wide_reads()])
-
-    _run(Inputs(bam_path=sam, prep_sample_idx=42, work_ticket_idx=1), tmp_path / "ws")
-
-    parts = sorted((tmp_path / "ws" / "read").glob("*.parquet"))
-    assert len(parts) == 1, "a few MB of reads is well under one part's budget"
-    assert row_group_rows(parts[0]) == WIDE_ROW_GROUPS
 
 
 def test_execute_refuses_when_the_minter_state_is_unknown(monkeypatch, tmp_path):
