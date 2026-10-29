@@ -608,3 +608,109 @@ def test_a_run_with_no_unbinned_pair_still_stores_unbinned_memberships(tmp_path,
     }
     assert quality_kinds == {"LCG", "MAG"}
     assert "UNBINNED" in membership_kinds
+
+
+# --- myloasm provenance ---------------------------------------------------------
+#
+# A myloasm run's genomes_dir also holds the assemble step's provenance dump. The
+# fixture's three primary contigs stand in as one circular genome, one MAG contig and
+# one unbinned contig, so bin_map names each by the assembler's own id the way
+# assembly_hash carries it.
+_MYLOASM_SEQUENCES = {
+    "LCG:u982ctg:1": ("AAAACCCCGGGGTTTT", 501, "u982ctg"),
+    "MAG:bin.1:1": ("ACGTACGTACGTACGT", 502, "u491ctg"),
+    "UNBINNED:u912ctg:1": ("GGGGCCCCAAAATTTT", 503, "u912ctg"),
+}
+
+
+@pytest.fixture
+def myloasm_inputs(tmp_path):
+    """A myloasm run: assembly_hash / mint-features outputs over the fixture's
+    primary contigs, and genomes_dir carrying the provenance dump."""
+    from helpers import myloasm_raw_dir
+    from qiita_common.myloasm_constants import MYLOASM_RAW_DIR
+
+    from qiita_compute_orchestrator.jobs.assembly_load import Inputs
+
+    _write(
+        tmp_path / "manifest.parquet",
+        "read_id VARCHAR, sequence_hash UUID, sequence_length_bp BIGINT",
+        [(rid, str(_hash(s)), len(s)) for rid, (s, _f, _c) in _MYLOASM_SEQUENCES.items()],
+    )
+    _write(
+        tmp_path / "feature_map.parquet",
+        "sequence_hash UUID, feature_idx BIGINT",
+        [(str(_hash(s)), f) for s, f, _c in _MYLOASM_SEQUENCES.values()],
+    )
+    chunks = tmp_path / "assembly_chunks"
+    _write(
+        chunks / "part_00000.parquet",
+        "sequence_hash UUID, chunk_index INTEGER, chunk_data VARCHAR",
+        [(str(_hash(s)), 0, s) for s, _f, _c in _MYLOASM_SEQUENCES.values()],
+    )
+    _write(
+        tmp_path / "bin_map.parquet",
+        "read_id VARCHAR, kind VARCHAR, bin_id VARCHAR, contig_id VARCHAR",
+        [(rid, *_bin_kind(rid), c) for rid, (_s, _f, c) in _MYLOASM_SEQUENCES.items()],
+    )
+    genomes_dir = tmp_path / "genomes"
+    genomes_dir.mkdir()
+    raw = myloasm_raw_dir(tmp_path / "dump", "0.7.0", sequence_idx_names=True)
+    raw.rename(genomes_dir / MYLOASM_RAW_DIR)
+    for name in ("checkm", "refined"):
+        (tmp_path / name).mkdir()
+    return Inputs(
+        manifest=tmp_path / "manifest.parquet",
+        feature_map=tmp_path / "feature_map.parquet",
+        assembly_chunks=chunks,
+        bin_map=tmp_path / "bin_map.parquet",
+        genomes_dir=genomes_dir,
+        checkm_dir=tmp_path / "checkm",
+        refined_bins_dir=tmp_path / "refined",
+        processing_idx=77,
+        prep_sample_idx=42,
+        work_ticket_idx=7,
+    )
+
+
+def test_a_myloasm_run_stages_its_provenance_keyed_to_the_runs_features(tmp_path, myloasm_inputs):
+    from qiita_common.myloasm_constants import MYLOASM_TABLES
+
+    staging = _run(myloasm_inputs, tmp_path / "ws")["staging_dir"]
+    for table in MYLOASM_TABLES:
+        assert _rows(
+            staging / f"{table}.parquet", "DISTINCT prep_sample_idx, processing_idx", "1"
+        ) == [(42, 77)], table
+    assert _rows(
+        staging / "myloasm_contig.parquet",
+        "contig_num, feature_idx",
+        "contig_num",
+        where="dereplication_status = 'primary'",
+    ) == [(491, 502), (912, 503), (982, 501)]
+
+
+def test_a_run_without_a_provenance_dump_stages_none(tmp_path, staging_inputs):
+    """hifiasm_meta runs, and any run without the dump, register no myloasm table."""
+    staging = _run(_inputs(tmp_path, staging_inputs), tmp_path / "ws")["staging_dir"]
+    assert not list(staging.glob("myloasm_*"))
+
+
+def test_a_dump_that_does_not_match_the_run_fails_and_leaves_no_partial_staging(
+    tmp_path, myloasm_inputs
+):
+    """A primary contig the run's bin_map does not name means the dump and the
+    hashed contigs came from different assemblies; the load fails and leaves
+    nothing for register-files to pick up."""
+    _write(
+        myloasm_inputs.bin_map,
+        "read_id VARCHAR, kind VARCHAR, bin_id VARCHAR, contig_id VARCHAR",
+        [
+            (rid, *_bin_kind(rid), c)
+            for rid, (_s, _f, c) in _MYLOASM_SEQUENCES.items()
+            if c != "u912ctg"
+        ],
+    )
+    workspace = tmp_path / "ws"
+    with pytest.raises(ValueError, match="u912ctg"):
+        _run(myloasm_inputs, workspace)
+    assert [p.name for p in (workspace / "assembly_staging").iterdir()] == []

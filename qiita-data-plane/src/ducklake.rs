@@ -892,6 +892,141 @@ pub fn ensure_assembly_tables(conn: &Connection) -> Result<(), Box<dyn std::erro
     Ok(())
 }
 
+/// The myloasm provenance tables, in the order `ensure_myloasm_tables` creates them.
+/// Test-only: the tests that walk all six read it, and nothing at runtime does.
+#[cfg(test)]
+pub(crate) const MYLOASM_TABLES: &[&str] = &[
+    "myloasm_contig",
+    "myloasm_layout",
+    "myloasm_mapping",
+    "myloasm_link",
+    "myloasm_split",
+    "myloasm_run",
+];
+
+/// Create the myloasm provenance tables: per assembly run, which reads myloasm
+/// built each contig from and placed on it, how its contigs connect, where it
+/// split chimeric reads, and how it was invoked. No sequence bytes; a read is a
+/// `sequence_idx` and a contig a `contig_num` (plus `feature_idx` for a primary
+/// contig). What each column means, and why `contig_num` identifies a contig
+/// within a run, is stated once in `qiita_common.myloasm_constants`, which also
+/// holds the column lists the writer uses; `tests/test_myloasm_constants.py`
+/// pins those against the DDL below.
+///
+/// Every table is replaced per run at register time, keyed on
+/// `(prep_sample_idx, processing_idx)` read from `myloasm_run`
+/// (`flight_service::registration::REPLACE_KEY_TABLES`). None is Flight-readable.
+pub fn ensure_myloasm_tables(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS qiita_lake.myloasm_contig (
+            prep_sample_idx BIGINT NOT NULL,
+            processing_idx BIGINT NOT NULL,
+            contig_num BIGINT NOT NULL,
+            feature_idx BIGINT,
+            dereplication_status VARCHAR NOT NULL,
+            polished_length BIGINT,
+            unpolished_length BIGINT NOT NULL,
+            circularity VARCHAR,
+            depth_identity_99 DOUBLE,
+            depth_identity_99_75 DOUBLE,
+            depth_identity_100 DOUBLE,
+            median_depth_identity_100 DOUBLE,
+            kmer_multiplicity DOUBLE,
+            kmer_multiplicity_flag VARCHAR,
+            secondary_to_contig_num BIGINT,
+            secondary_aligned_percent DOUBLE,
+            secondary_ani_percent DOUBLE
+        );
+
+        CREATE TABLE IF NOT EXISTS qiita_lake.myloasm_layout (
+            prep_sample_idx BIGINT NOT NULL,
+            processing_idx BIGINT NOT NULL,
+            contig_num BIGINT NOT NULL,
+            layout_order BIGINT NOT NULL,
+            position BIGINT NOT NULL,
+            stop_position BIGINT NOT NULL,
+            sequence_idx BIGINT NOT NULL,
+            split_suffix VARCHAR,
+            piece_offset BIGINT NOT NULL,
+            piece_length BIGINT NOT NULL,
+            query_start BIGINT NOT NULL,
+            query_stop BIGINT NOT NULL,
+            strand VARCHAR NOT NULL,
+            read_depth_identity_99 DOUBLE,
+            read_depth_identity_99_75 DOUBLE,
+            read_depth_identity_100 DOUBLE,
+            next_overlap_length BIGINT,
+            next_shared_snpmers BIGINT,
+            next_differing_snpmers BIGINT
+        );
+
+        CREATE TABLE IF NOT EXISTS qiita_lake.myloasm_mapping (
+            prep_sample_idx BIGINT NOT NULL,
+            processing_idx BIGINT NOT NULL,
+            sequence_idx BIGINT NOT NULL,
+            split_suffix VARCHAR,
+            piece_offset BIGINT NOT NULL,
+            piece_length BIGINT NOT NULL,
+            query_start BIGINT NOT NULL,
+            query_stop BIGINT NOT NULL,
+            strand VARCHAR NOT NULL,
+            contig_num BIGINT NOT NULL,
+            position BIGINT NOT NULL,
+            stop_position BIGINT NOT NULL,
+            query_anchor_span BIGINT,
+            contig_anchor_span BIGINT,
+            shared_minimizers BIGINT,
+            shared_snpmers BIGINT,
+            differing_snpmers BIGINT
+        );
+
+        -- The overlap evidence and the two end reads are NULL for a run made by a
+        -- myloasm that did not write them on its graph edges (0.6.0).
+        CREATE TABLE IF NOT EXISTS qiita_lake.myloasm_link (
+            prep_sample_idx BIGINT NOT NULL,
+            processing_idx BIGINT NOT NULL,
+            from_contig_num BIGINT NOT NULL,
+            from_orientation VARCHAR NOT NULL,
+            to_contig_num BIGINT NOT NULL,
+            to_orientation VARCHAR NOT NULL,
+            overlap_length BIGINT,
+            shared_snpmers BIGINT,
+            differing_snpmers BIGINT,
+            shared_minimizers BIGINT,
+            snpmer_identity_percent DOUBLE,
+            from_sequence_idx BIGINT,
+            from_split_suffix VARCHAR,
+            to_sequence_idx BIGINT,
+            to_split_suffix VARCHAR
+        );
+
+        CREATE TABLE IF NOT EXISTS qiita_lake.myloasm_split (
+            prep_sample_idx BIGINT NOT NULL,
+            processing_idx BIGINT NOT NULL,
+            sequence_idx BIGINT NOT NULL,
+            parent_split_suffix VARCHAR,
+            cleaning_round INTEGER NOT NULL,
+            breakpoint_order BIGINT NOT NULL,
+            query_start BIGINT NOT NULL,
+            query_stop BIGINT NOT NULL,
+            split_condition INTEGER NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS qiita_lake.myloasm_run (
+            prep_sample_idx BIGINT NOT NULL,
+            processing_idx BIGINT NOT NULL,
+            log_name VARCHAR NOT NULL,
+            started_at TIMESTAMP,
+            myloasm_version VARCHAR NOT NULL,
+            command VARCHAR NOT NULL,
+            kmer_size INTEGER NOT NULL,
+            compression INTEGER NOT NULL,
+            hifi BOOLEAN NOT NULL
+        );",
+    )?;
+    Ok(())
+}
+
 /// per-sample ASV feature counts from a deblur run: feature membership plus
 /// abundance, keyed by `processing_idx` (the run) and `feature_idx` (the ASV);
 /// plus the ASV sequences themselves (`amplicon_sequence` +
@@ -970,6 +1105,7 @@ pub fn ensure_lake_tables(conn: &Connection) -> Result<(), Box<dyn std::error::E
     ensure_read_tables(conn)?;
     ensure_alignment_tables(conn)?;
     ensure_assembly_tables(conn)?;
+    ensure_myloasm_tables(conn)?;
     ensure_amplicon_tables(conn)?;
     // The lock row is seeded here so no request path has to create it.
     ensure_registration_lock(conn)?;
@@ -1775,6 +1911,34 @@ mod tests {
             .unwrap();
         let n: i64 = stmt.query_row([], |row| row.get(0)).unwrap();
         assert_eq!(n, 1, "amplicon_membership table should exist exactly once");
+    }
+
+    #[test]
+    #[serial]
+    #[cfg(feature = "integration")]
+    fn ensure_myloasm_tables_is_idempotent() {
+        // Re-running on every DP restart must be a no-op, and every table must
+        // exist afterwards, keyed on the assembly run.
+        let conn = setup_conn();
+        ensure_myloasm_tables(&conn).expect("first ensure_myloasm_tables");
+        ensure_myloasm_tables(&conn).expect("second ensure_myloasm_tables (idempotent)");
+
+        for table in MYLOASM_TABLES {
+            let cols = table_schema(&conn, table);
+            let lead: Vec<(&str, &str, &str)> = cols
+                .iter()
+                .take(2)
+                .map(|(n, t, null)| (n.as_str(), t.as_str(), null.as_str()))
+                .collect();
+            assert_eq!(
+                lead,
+                [
+                    ("prep_sample_idx", "BIGINT", "NO"),
+                    ("processing_idx", "BIGINT", "NO")
+                ],
+                "{table} must lead with the run key"
+            );
+        }
     }
 
     #[test]

@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import asyncpg
+import duckdb
 from qiita_common.actions import BCL_CONVERT_SAMPLE_MAP_KEY
 from qiita_common.api_paths import (
     compute_reads_staging_path,
@@ -630,12 +631,24 @@ def _stream_masked_reads_to_fastq(data_plane_url: str, ticket_bytes: bytes, dest
     with flight.FlightClient(data_plane_url) as client, connect_with_miint_staged() as con:
         reader = client.do_get(flight.Ticket(ticket_bytes), read_opts).to_reader()
         con.register("masked", reader)
-        # Single-end long reads: sequence2/qual2 are NULL, so FORMAT FASTQ writes a
-        # single-end fastq. Column order is the one the miint writer requires.
-        (count,) = con.execute(
-            "COPY (SELECT read_id, sequence1, qual1, sequence2, qual2 FROM masked) "
-            f"TO '{validate_parquet_path(dest)}' (FORMAT FASTQ, COMPRESSION 'gzip')"
-        ).fetchone()
+        return _copy_masked_to_fastq(con, dest)
+
+
+def _copy_masked_to_fastq(con: duckdb.DuckDBPyConnection, dest: Path) -> int:
+    """Write the relation registered as `masked` (the `read_masked` stream's shape)
+    to gzip FASTQ at `dest`, returning the record count.
+
+    Each record is named by its `sequence_idx`, not its `read_id` (the CLAUDE.md
+    read-identity rule): whatever the assembler reports per read then joins
+    straight back to `read`. The miint writer takes the name from a column called
+    `read_id`, hence the alias. Single-end long reads: sequence2/qual2 are NULL, so
+    FORMAT FASTQ writes a single-end fastq. Column order is the one the miint
+    writer requires."""
+    (count,) = con.execute(
+        "COPY (SELECT CAST(sequence_idx AS VARCHAR) AS read_id, "
+        "sequence1, qual1, sequence2, qual2 FROM masked) "
+        f"TO '{validate_parquet_path(dest)}' (FORMAT FASTQ, COMPRESSION 'gzip')"
+    ).fetchone()
     return int(count)
 
 

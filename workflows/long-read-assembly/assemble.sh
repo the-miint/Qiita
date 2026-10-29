@@ -263,10 +263,16 @@ case "${ASSEMBLER}" in
         # header and not the GFA, why only `circular-yes` counts, and why the id is
         # cut at `_len-`. It LOADs the deploy-staged miint bind-mounted by this
         # step's `derived_inputs: MIINT_EXTENSION_DIRECTORY`.
+        #
+        # myloasm_provenance.py then dumps which reads myloasm placed on which
+        # contig, out of the retained tree and into genomes_dir, the only place a
+        # later step can read it from. Same guard: the readers open the primary
+        # FASTA too.
         if [[ -s "${PRIMARY}" ]]; then
             python3 /opt/qiita/myloasm_split.py \
                 "${PRIMARY}" "${OUT}/circular.fa" "${OUT}/noLCG.fa" \
                 "${OUT}/contig_attributes.tsv"
+            python3 /opt/qiita/myloasm_provenance.py "${ASM_DIR}" "${OUT}/myloasm"
         fi
         ;;
     *)

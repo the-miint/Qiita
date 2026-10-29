@@ -36,6 +36,15 @@ _None yet._
   sudo -u qiita-data /usr/local/bin/duckdb --version   # expect v2.0.0 (Cyanoptera) d54cbbe3df
   ```
 
+- `[admin]` **Let in-flight `long-read-assembly` tickets finish, and submit no new ones,
+  before the restart.** The sync enables 1.0.2 and disables 1.0.1, and a ticket whose
+  action is disabled fails when the restarted runner picks it up (`not found or
+  disabled`). Expect `0`; resubmit anything that fails anyway at 1.0.2. (#TBD)
+  ```bash
+  sudo -u qiita-api bash -c 'set -a; . /etc/qiita/control-plane.env; set +a
+  psql "$DATABASE_URL" -Atc "SELECT count(*) FROM qiita.work_ticket WHERE action_id = '\''long-read-assembly'\'' AND state IN ('\''pending'\'', '\''queued'\'', '\''processing'\'');"'
+  ```
+
 ### 3. Migrations
 
 _None yet._
@@ -76,11 +85,26 @@ _None yet._
     test -s "$MIINT_EXTENSION_DIRECTORY/v$v/linux_amd64/miint.duckdb_extension" \
       || { echo "no staged miint for DuckDB $v"; exit 1; }
   done
-  cd /tmp && for s in long-read-assembly-assemble-1.0.0.sif long-read-assembly-checkm-1.0.1.sif; do
+  cd /tmp && for s in long-read-assembly-assemble-1.0.2.sif long-read-assembly-checkm-1.0.1.sif; do
     apptainer exec --no-home "${PATH_DERIVED}/images/$s" \
       python3 -c "import duckdb; print(duckdb.__version__)" | grep -Fxq 2.0.0 \
       || { echo "$s is not on DuckDB 2.0.0"; exit 1; }
   done && echo DUCKDB_200_OK'
+  ```
+- **One myloasm assembly at `long-read-assembly` 1.0.2 lands its provenance.** Submit one
+  prep_sample and, once it completes, check its run in `make lake-shell`: all six `myloasm_*` tables have rows for its
+  `(prep_sample_idx, processing_idx)`, every `myloasm_mapping.sequence_idx` joins to `read`,
+  and every primary `myloasm_contig` has a `feature_idx`. Expect `t`. (#TBD)
+  ```bash
+  qiita ticket submit --action-id long-read-assembly --action-version 1.0.2 \
+      --prep-sample-idx '<ps>' --context-json '{"mask_idx": <mask>, "assembler": "myloasm"}'
+  ```
+  ```sql
+  SELECT (SELECT count(*) FROM qiita_lake.myloasm_run WHERE prep_sample_idx = <ps> AND processing_idx = <run>) = 1
+     AND (SELECT count(*) FROM qiita_lake.myloasm_mapping m ANTI JOIN qiita_lake.read r USING (sequence_idx)
+          WHERE m.prep_sample_idx = <ps> AND m.processing_idx = <run>) = 0
+     AND (SELECT count(*) FROM qiita_lake.myloasm_contig WHERE prep_sample_idx = <ps> AND processing_idx = <run>
+          AND dereplication_status = 'primary' AND feature_idx IS NULL) = 0;
   ```
 - **The DuckLake catalog is still format 1.0.** Expect `1.0`; the attach itself fails if
   the catalog was ever migrated. (#801)
@@ -119,6 +143,15 @@ _None yet._
   - `host_filter` can count a read pair as host that it did not before: miint's 2.0
     build maps a pair under the `sr` preset as native minimap2 does
     (duckdb-miint#341).
+- **`long-read-assembly` 1.0.2 keeps myloasm's read-level provenance in six new DuckLake
+  tables.** (#TBD)
+  - The data plane creates `myloasm_contig`, `myloasm_layout`, `myloasm_mapping`,
+    `myloasm_link`, `myloasm_split` and `myloasm_run` on its next start; nothing to run.
+  - The assemble image lands under a NEW filename, `long-read-assembly-assemble-1.0.2.sif`,
+    built on deploy. **Keep `long-read-assembly-assemble-1.0.0.sif`**: 1.0.0 and 1.0.1 still
+    name it and no spec builds it any more (`sif-build.d/assemble.env`).
+  - Runs completed before this deploy have no provenance rows; a separate one-off recovery
+    loads them from the assembler trees still in the ticket workspaces.
 
 ## Deployed history
 

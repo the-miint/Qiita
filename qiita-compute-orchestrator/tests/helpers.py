@@ -63,3 +63,107 @@ def shard_yaml_baseline_gb(step_name: str) -> int:
             )
             return mem_gb
     raise AssertionError(f"build-shard-index declares no {step_name} step")
+
+
+_MYLOASM_FIXTURES = Path(__file__).resolve().parent / "data" / "myloasm"
+# Files myloasm itself writes gzipped; every other fixture file is gzipped for storage only.
+_MYLOASM_NATIVE_GZ = frozenset({"map_to_unitigs.paf.gz", "read_coverages.txt.gz"})
+MYLOASM_FIXTURE_VERSIONS = ("0.6.0", "0.7.0")
+
+
+def myloasm_output_dir(dest: Path, version: str) -> Path:
+    """Lay out the committed myloasm fixture at `dest` the way myloasm writes its `-o`
+    directory, for myloasm `version` (see `tests/data/myloasm/README.md`)."""
+    import gzip
+    import shutil
+
+    if version not in MYLOASM_FIXTURE_VERSIONS:
+        raise ValueError(f"no myloasm {version} fixture; have {MYLOASM_FIXTURE_VERSIONS}")
+    sources = [_MYLOASM_FIXTURES / "ecoli_sim"]
+    if version == "0.6.0":
+        sources.append(_MYLOASM_FIXTURES / "ecoli_sim_0.6.0")
+    for source in sources:
+        for path in source.rglob("*"):
+            if not path.is_file():
+                continue
+            target = dest / path.relative_to(source)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if path.name in _MYLOASM_NATIVE_GZ:
+                shutil.copyfile(path, target)
+            else:
+                with gzip.open(path, "rb") as src, target.with_suffix("").open("wb") as out:
+                    shutil.copyfileobj(src, out)
+    return dest
+
+
+# The first sequence_idx `myloasm_raw_dir` gives a renamed read; any value well clear of
+# a small fixture's other identifiers does.
+MYLOASM_FIRST_SEQUENCE_IDX = 9_000_000_000
+
+
+def myloasm_raw_dir(dest: Path, version: str, *, sequence_idx_names: bool) -> Path:
+    """The raw provenance dump the assemble step writes (`<table>.parquet` per miint
+    reader, verbatim), built from the committed myloasm fixture.
+
+    With `sequence_idx_names`, every read name is first replaced by an integer, the
+    way a run whose assembler input was named by `sequence_idx` reports them: names
+    sorted, numbered from `MYLOASM_FIRST_SEQUENCE_IDX`. `myloasm_read_name_map`
+    returns the same numbering for the original names."""
+    from qiita_common.myloasm_constants import MYLOASM_TABLES
+
+    from qiita_compute_orchestrator.miint import open_miint_conn
+
+    asm_dir = myloasm_output_dir(dest / "assembler", version)
+    raw = dest / "raw"
+    raw.mkdir(parents=True)
+    with open_miint_conn() as conn:
+        for table, spec in MYLOASM_TABLES.items():
+            conn.execute(
+                f"COPY (FROM {spec.reader}('{asm_dir}')) TO '{raw / f'{table}.parquet'}' "
+                "(FORMAT PARQUET)"
+            )
+        if sequence_idx_names:
+            conn.execute(
+                "CREATE TEMP TABLE name_map AS SELECT read_id, "
+                "CAST(sequence_idx AS VARCHAR) AS seq FROM (" + _read_name_map_sql(raw) + ")"
+            )
+            renames = {
+                "myloasm_mapping": ["read_id"],
+                "myloasm_layout": ["read_id"],
+                "myloasm_split": ["read_id"],
+                "myloasm_link": ["from_read_id", "to_read_id"],
+            }
+            for table, columns in renames.items():
+                path = raw / f"{table}.parquet"
+                replace = ", ".join(
+                    f"(SELECT seq FROM name_map n WHERE n.read_id = t.{c}) AS {c}" for c in columns
+                )
+                conn.execute(
+                    f"COPY (SELECT * REPLACE ({replace}) FROM '{path}' t) "
+                    f"TO '{path}.tmp' (FORMAT PARQUET)"
+                )
+                Path(f"{path}.tmp").replace(path)
+    return raw
+
+
+def myloasm_read_name_map(raw: Path) -> list[tuple[str, int]]:
+    """(original read name, sequence_idx) for every read the fixture's raw dump at
+    `raw` names, numbered as `myloasm_raw_dir(..., sequence_idx_names=True)` does."""
+    with duckdb.connect() as conn:
+        return conn.execute(_read_name_map_sql(raw) + " ORDER BY read_id").fetchall()
+
+
+def _read_name_map_sql(raw: Path) -> str:
+    """(read_id, sequence_idx) over every read name in a raw dump, sorted names
+    numbered from `MYLOASM_FIRST_SEQUENCE_IDX`."""
+    return (
+        "SELECT read_id, "
+        f"{MYLOASM_FIRST_SEQUENCE_IDX} - 1 + row_number() OVER (ORDER BY read_id) AS sequence_idx "
+        "FROM ("
+        f"  SELECT read_id FROM '{raw}/myloasm_mapping.parquet'"
+        f"  UNION SELECT read_id FROM '{raw}/myloasm_layout.parquet'"
+        f"  UNION SELECT read_id FROM '{raw}/myloasm_split.parquet'"
+        f"  UNION SELECT from_read_id FROM '{raw}/myloasm_link.parquet'"
+        f"  UNION SELECT to_read_id FROM '{raw}/myloasm_link.parquet'"
+        ") WHERE read_id IS NOT NULL"
+    )
