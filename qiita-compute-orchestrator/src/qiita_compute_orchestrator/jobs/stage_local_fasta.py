@@ -24,9 +24,9 @@ Python parser. `read_fastx` accepts a `VARCHAR[]` of paths, so the whole
 manifest is one streaming scan — no sequence bytes through Python. The scan runs
 twice: pass 1 keeps only `(read_id, length, filepath)` for the sanity checks, so
 the full sequences are never materialised; pass 2 re-reads every file and streams
-read → split → Parquet without landing sequences in a table (it says why). Empty
-files are pre-filtered out (`read_fastx` raises on a 0-record input, and one empty
-path aborts the scan).
+read → split → Parquet without landing sequences in a table (pass 2's comment
+in `execute` says why). Empty files are pre-filtered out (`read_fastx` raises on a
+0-record input, and one empty path aborts the scan).
 
 **Bounded memory is config, not algorithm.** `read_fastx(..., max_batch_bytes)`
 caps each read batch by bytes so a multi-MB genome record (GG2 reaches ~21 MB)
@@ -181,11 +181,12 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             )
 
             # read_fastx takes a VARCHAR[] of paths — one streaming scan of the whole
-            # manifest, which closes each file once it has read it (duckdb-miint#261),
-            # and no full-sequence temp table. Pre-filter empties: read_fastx raises
-            # "Empty file" on a 0-record input, and one empty file aborts the scan. The
-            # pre-filter itself opens and reads a byte from every path, one at a time,
-            # which is the remaining per-path Python round-trip in this job.
+            # manifest, which closes each file once it has read it (duckdb-miint#261;
+            # undocumented, duckdb-miint#378), and no full-sequence temp table.
+            # Pre-filter empties: read_fastx raises "Empty file" on a 0-record input,
+            # and one empty file aborts the scan. The pre-filter itself opens and reads
+            # a byte from every path, one at a time, which is the remaining per-path
+            # Python round-trip in this job.
             paths = [str(p) for p in fasta_paths if not is_empty_sequence_file(p)]
             if not paths:
                 raise ValueError(

@@ -261,12 +261,15 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     roster = read_roster_parquet(
         inputs.ena_run_map, value_column="ena_run_accession", roster_name="ena_run_map"
     )
-    not_runs = sorted({acc for _, acc in roster if not _is_run_accession(acc)})
+    not_runs = sorted((psi, acc) for psi, acc in roster if not _is_run_accession(acc))
     if not_runs:
         raise ValueError(
-            f"ena_run_map holds {len(not_runs)} accession(s) that are not ENA runs, which "
-            "read_ena_sequences would expand to every run under each: "
-            + ", ".join(not_runs[:_REASON_LISTED_ACCESSIONS])
+            f"{len(not_runs)} sequenced_sample(s) of this pool carry an ena_run_accession "
+            "that is not an ENA run accession (SRR, ERR or DRR followed by digits); a scan "
+            "of an experiment, sample or study accession would cover every run under it: "
+            + ", ".join(
+                f"prep_sample {psi}: {acc!r}" for psi, acc in not_runs[:_REASON_LISTED_ACCESSIONS]
+            )
         )
 
     workspace.mkdir(parents=True, exist_ok=True)

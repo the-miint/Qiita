@@ -490,7 +490,10 @@ ticket FAILED and redrivable.
 When the retries run out, or at once when no run was stored and none of the failures is one
 a retry could clear (a 404), the ticket is FAILED `permanent` and
 emailed with its reason.
-Read the reason first. A dropped transfer or an ENA outage: redrive the ticket
+Read the reason first. A sequenced_sample whose `ena_run_accession` is not a run
+accession (the reason lists each by prep_sample): correct it with
+`PATCH /sequenced-sample/{idx}`, then redrive; the roster is read again on `/run`. A
+dropped transfer or an ENA outage: redrive the ticket
 (`POST /work-ticket/{idx}/run`) once ENA is healthy; runs already stored are skipped, and
 a redrive resets `retry_count`, so it buys the full budget again. A bad digest or a 404:
 compare against the ENA Portal before redriving, since the same bytes fail the same way;

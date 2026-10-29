@@ -932,7 +932,8 @@ def test_a_roster_accession_that_is_not_a_run_is_refused_before_any_download(
     monkeypatch.setattr(ingest_module, "_stage_run_reads", _fake)
     inputs = _inputs(tmp_path, [(10, "ERR001"), (11, accession)])
 
-    with pytest.raises(ValueError, match=f"not ENA runs.*{accession}"):
+    refused = f"not an ENA run accession.*prep_sample 11: '{accession}'"
+    with pytest.raises(ValueError, match=refused):
         _run(inputs, tmp_path / "ws")
     assert fake_mint == []
 

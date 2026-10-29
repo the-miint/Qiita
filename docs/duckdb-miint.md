@@ -81,9 +81,9 @@ SELECT * FROM read_ena_sequences(...);
 SELECT * FROM miint_warnings();  -- e.g. "run 'ERR1234567' failed on retry (...), skipping"
 ```
 
-A scan whose every run fails raises instead (duckdb-miint#312), so a scan of one run raises rather than skipping ([insdc_ena](https://the-miint.github.io/duckdb-miint/insdc_ena/)). Qiita sends only one-run scans: `ingest_ena_reads` refuses a roster accession that is not a run.
+A scan (not a lateral call) whose every run fails raises instead (duckdb-miint#312), so a scan of one run raises rather than skipping; a lateral call skips a failed run with a warning even when every run fails ([insdc_ena](https://the-miint.github.io/duckdb-miint/insdc_ena/)). Qiita sends only one-run scans: `ingest_ena_reads` refuses a roster accession that is not a run.
 
-**Check it after any multi-run ENA scan.** A partial result that reports success is otherwise indistinguishable from a complete one.
+**Check it after any multi-run ENA scan or lateral call.** A partial result that reports success is otherwise indistinguishable from a complete one.
 
 Local builds need `allow_unsigned_extensions=true` and `LOAD '/path/to/miint.duckdb_extension'`. There is also a companion Python CLI named `miint` (lives under `python/` in the repo) that wraps the extension for `convert`/`transform`/`align` subcommands — not on PyPI; install from a local checkout with `pip install -e python/`.
 
