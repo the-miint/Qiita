@@ -241,8 +241,7 @@ second form exists for.
 and what the client already stages through
 `qiita_common.duckdb_relation.registered`, so it is where a reader would start. An
 IPC stream cut at a record-batch boundary reads back short *and silent* — one
-batch of three comes back as a third of the rows with nothing raised.
-A cut
+batch of three comes back as a third of the rows with nothing raised. A cut
 landing mid-message does raise, so the silent case needs the cut to fall on a
 boundary; that is a narrower hazard than "any truncation", and it is still one no
 caller can detect. Parquet raises on both. A contract test pins each.
