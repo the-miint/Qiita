@@ -102,11 +102,7 @@ const REPLACE_KEY_TABLES: &[ReplaceKey] = &[
         "assembly_membership",
         &["prep_sample_idx", "processing_idx"],
     ),
-    ReplaceKey {
-        table: "bin_quality",
-        key: &["prep_sample_idx", "processing_idx"],
-        key_source: "assembly_membership",
-    },
+    ReplaceKey::borrows("bin_quality", "assembly_membership"),
     // The myloasm provenance tables (`ducklake::ensure_myloasm_tables`), keyed
     // like assembly_membership and for the same reason. All six read their keys
     // from `myloasm_run`; why that table is never empty is at
