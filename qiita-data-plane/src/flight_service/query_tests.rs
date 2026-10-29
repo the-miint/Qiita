@@ -1954,7 +1954,7 @@ fn block_read_selector_prunes_and_scales() {
     );
 
     // Exactness: V3 returns the split-trimmed result; V2 over-selects the
-    // split member's tail (proving the OR residual is load-bearing).
+    // split member's tail (the OR residual is what trims it).
     let v3_rows: i64 = conn
         .query_row(&format!("SELECT count(*) FROM ({v3})"), [], |r| r.get(0))
         .unwrap();
