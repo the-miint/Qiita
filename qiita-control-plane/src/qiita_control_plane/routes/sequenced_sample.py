@@ -802,9 +802,11 @@ async def get_sequenced_sample_in_study(
     sequenced_sample is likewise 404, checked only after the link passes
     (mirroring the sequenced-sample-level read's retired carve-out).
 
-    last_metadata_change_at and the `ETag` header describe what the response
-    carries (`representation_etag` over `effective_updated_at`, the GREATEST of
-    the prep_sample and sequenced_sample timestamps); the ETag is a quoted ISO
+    last_metadata_change_at and the `ETag` header are stamps of what the
+    response carries (`representation_etag` over `effective_updated_at`, the
+    GREATEST of the prep_sample and sequenced_sample timestamps), local values
+    included, so this ETag is not an If-Match for
+    PATCH /sequenced-sample/{sequenced_sample_idx}. The ETag is a quoted ISO
     8601 timestamp and is opaque by contract.
     """
     # One REPEATABLE READ snapshot so the row read, the link check, and both
@@ -930,11 +932,12 @@ async def get_sequenced_sample(
     GET surface — a future change will let wet_lab_admin+ retrieve
     retired rows so the audit-trail surface is reachable from the API).
 
-    last_metadata_change_at and the `ETag` header describe what the
+    last_metadata_change_at and the `ETag` header are stamps of what the
     response carries (`representation_etag` over `effective_updated_at =
-    GREATEST(prep_sample.updated_at, sequenced_sample.updated_at)`), which is
-    what this route's PATCH checks If-Match against. The ETag is a quoted ISO
-    8601 timestamp; clients must treat it as opaque.
+    GREATEST(prep_sample.updated_at, sequenced_sample.updated_at)`), and this
+    ETag is what PATCH /sequenced-sample/{sequenced_sample_idx} checks If-Match
+    against. The ETag is a quoted ISO 8601 timestamp; clients must treat it as
+    opaque.
     """
     # All reads share one REPEATABLE READ snapshot so the supertype-join
     # row and the prep_sample metadata read cannot disagree about a
@@ -1108,8 +1111,9 @@ async def patch_sequenced_sample(
                     detail=f"sequenced_sample {sequenced_sample_idx} not found",
                 )
 
-            # Re-read global metadata in the same transaction so the
-            # response and the UPDATE see one consistent snapshot.
+            # Re-read global metadata under the prep_sample row lock, which
+            # every metadata write's touch trigger also takes, so no write
+            # lands between the UPDATE and these two reads.
             metadata_rows = await fetch_global_metadata(
                 conn,
                 spec=PREP_SAMPLE_METADATA_SPEC,
@@ -1128,7 +1132,7 @@ async def patch_sequenced_sample(
             )
             raise HTTPException(status_code=409, detail=detail)
 
-    # Set the new ETag from the updated row's bumped effective_updated_at.
+    # The new ETag, over the updated row and the metadata just re-read.
     response.headers[ETAG_HEADER] = representation_etag(
         updated_row["effective_updated_at"], metadata_last_change
     )

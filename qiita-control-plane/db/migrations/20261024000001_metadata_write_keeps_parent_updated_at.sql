@@ -14,6 +14,11 @@
 -- updated_at then describes the record's own columns; what a read reports of
 -- its metadata's last change is derived from the values it returns
 -- (docs/architecture/data-model.md, "Metadata visibility tiers").
+--
+-- The touch's UPDATE takes the parent's row lock, so a metadata write waits
+-- behind a PATCH holding the parent FOR UPDATE, and the PATCH's reads cannot
+-- see one land midway. The guard skips only a transaction that already holds
+-- that lock from its own earlier touch.
 
 CREATE OR REPLACE FUNCTION qiita.biosample_metadata_touch_biosample()
 RETURNS TRIGGER AS $$

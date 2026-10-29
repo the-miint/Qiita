@@ -2343,7 +2343,8 @@ async def no_biosample_write_patch_client(make_pat_client):
 
 
 async def _etag_for(pool, bs_idx: int) -> str:
-    """Build the quoted ISO-8601 ETag the route emits for a biosample row.
+    """Build the quoted ISO-8601 ETag the route emits for a biosample row
+    that carries no metadata newer than its own updated_at.
 
     Thin biosample-flavored wrapper around the shared etag_for_row
     conftest helper so the test-file call sites keep their existing

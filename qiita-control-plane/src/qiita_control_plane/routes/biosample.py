@@ -887,13 +887,13 @@ async def get_biosample_in_study(
     retirement is evaluated only after the link passes, and a retired biosample
     is likewise 404 (mirroring the biosample-level read's retired carve-out).
 
-    The owner-biosample-id row is a study-local value read at no less than
-    OWNER_BIOSAMPLE_ID_TIER_OVERRIDE, whatever its field's tier. This route
-    does not write it.
+    The owner-biosample-id row is a study-local value, read under the same
+    rule; this route does not write it.
 
-    last_metadata_change_at and the `ETag` header describe what the response
-    carries (`representation_etag`); the ETag is a quoted ISO 8601 timestamp
-    and is opaque by contract.
+    last_metadata_change_at and the `ETag` header are stamps of what the
+    response carries (`representation_etag`), local values included, so this
+    ETag is not an If-Match for PATCH /biosample/{biosample_idx}. The ETag is a
+    quoted ISO 8601 timestamp and is opaque by contract.
     """
     # One REPEATABLE READ snapshot so the row read, the link check, and both
     # metadata reads cannot disagree about a concurrent writer's commit.
@@ -1066,9 +1066,9 @@ def _biosample_core_row_dict(
     aside, every key matches its column; export_entity_id is read from
     qiita.exported_entity). last_metadata_change_at is
     `metadata_last_change`, when the response's own metadata values last
-    changed, never the row's column (see
-    `fetch_visible_metadata_last_change`). Excludes the metadata dicts and
-    caller_system_role. Runs no DB queries.
+    changed (`fetch_visible_metadata_last_change`); the row does not carry the
+    biosample's column. Excludes the metadata dicts and caller_system_role.
+    Runs no DB queries.
     """
     return {
         "biosample_idx": row["idx"],
@@ -1163,10 +1163,10 @@ async def get_biosample(
     404 keeps callers (including admins) from seeing partially-revoked
     rows by accident.
 
-    last_metadata_change_at and the `ETag` header describe what the response
-    carries (`representation_etag`), which is what this route's PATCH checks
-    If-Match against. The ETag is a quoted ISO 8601 timestamp; clients must
-    treat it as opaque.
+    last_metadata_change_at and the `ETag` header are stamps of what the
+    response carries (`representation_etag`), and this ETag is what
+    PATCH /biosample/{biosample_idx} checks If-Match against. The ETag is a
+    quoted ISO 8601 timestamp; clients must treat it as opaque.
     """
     # All reads share one REPEATABLE READ snapshot so the supertype row,
     # the access predicate, and the metadata read cannot disagree about a
@@ -1456,8 +1456,9 @@ async def patch_biosample(
             if updated_row is None:
                 raise HTTPException(status_code=404, detail=f"biosample {biosample_idx} not found")
 
-            # Re-read global metadata in the same transaction so the response
-            # and the UPDATE see one consistent snapshot.
+            # Re-read global metadata under the row lock, which every metadata
+            # write's touch trigger also takes, so no write lands between the
+            # UPDATE and these two reads.
             metadata_rows = await fetch_global_metadata(
                 conn, spec=BIOSAMPLE_METADATA_SPEC, entity_idx=biosample_idx, tiers=tiers
             )
@@ -1487,7 +1488,7 @@ async def patch_biosample(
                 raise HTTPException(status_code=422, detail=_MSG_OWNER_NOT_ELIGIBLE)
             raise
 
-    # Set the new ETag from the updated row's bumped updated_at.
+    # The new ETag, over the updated row and the metadata just re-read.
     response.headers[ETAG_HEADER] = representation_etag(
         updated_row["updated_at"], metadata_last_change
     )

@@ -20,6 +20,10 @@
     the metadata values in that response last changed. `updated_at` and
     `effective_updated_at` no longer move when metadata is written, and the ETag is the
     later of the two. A write to a value the caller cannot read moves none of them.
+  - The study-scoped reads' ETag also counts that study's local values, so it is no
+    longer an If-Match for `PATCH /biosample/{biosample_idx}` or
+    `PATCH /sequenced-sample/{sequenced_sample_idx}`; take that from the GET on the
+    PATCH's own path.
   - A lookup by a unique-in-study value the caller may not read answers 404, in the
     same words as a value that matches nothing.
   - `GET /biosample/{biosample_idx}` judges each global value on the study that wrote

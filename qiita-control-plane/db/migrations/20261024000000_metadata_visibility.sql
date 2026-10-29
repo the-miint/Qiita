@@ -1,9 +1,11 @@
 -- migrate:up
 
--- The metadata visibility rule as SQL: two scalars for a value's required tier
--- and, per entity kind, one set-returning function over its EAV rows that a
--- read uses either as a filter (WHERE visible) or as a mask (the value_*
--- columns, and when the row last changed, are NULL on a hidden row). The rule itself is defined in
+-- The metadata visibility rule as SQL: two scalars, for a field's tier and for
+-- the exceptions on one value, and, per entity kind, one set-returning function
+-- over its EAV rows that completes the required tier (the biosample function
+-- adds the owner-biosample-id floor). A read uses that function either as a
+-- filter (WHERE visible) or as a mask (the value_* columns, and when the row
+-- last changed, are NULL on a hidden row). The rule itself is defined in
 -- docs/architecture/data-model.md, "Metadata visibility tiers"; this file
 -- implements it.
 --
@@ -40,9 +42,10 @@ LANGUAGE sql IMMUTABLE PARALLEL SAFE
 AS $$ SELECT GREATEST(field_tier, global_exception_tier, local_exception_tier) $$;
 
 COMMENT ON FUNCTION qiita.metadata_required_tier(qiita.tier, qiita.tier, qiita.tier) IS
-    'The tier one metadata value requires: its field tier, raised by any '
-    'exception row on the value. Definition: docs/architecture/data-model.md, '
-    '"Metadata visibility tiers".';
+    'A metadata field tier raised by any exception row on the value. A biosample '
+    'value''s required tier also takes the owner-biosample-id floor, applied in '
+    'qiita.biosample_metadata_visibility. Definition: '
+    'docs/architecture/data-model.md, "Metadata visibility tiers".';
 
 CREATE FUNCTION qiita.biosample_metadata_visibility(
     caller_study_idxs bigint[],
@@ -94,8 +97,9 @@ AS $$
             AND el.biosample_study_field_idx = m.biosample_study_field_idx
       LEFT JOIN unnest(caller_study_idxs, caller_study_tiers) AS ct(study_idx, tier)
              ON ct.study_idx = sf.study_idx
-     -- An owner-biosample-id value never requires less than member, whatever
-     -- its field's tier (docs/architecture/data-model.md).
+     -- The owner-biosample-id floor (docs/architecture/data-model.md). The
+     -- literal is repositories.biosample.OWNER_BIOSAMPLE_ID_TIER_OVERRIDE,
+     -- which a test pins it to.
      CROSS JOIN LATERAL (VALUES (
                GREATEST(
                    qiita.metadata_required_tier(
@@ -178,7 +182,7 @@ $$;
 
 COMMENT ON FUNCTION qiita.prep_sample_metadata_visibility(bigint[], qiita.tier[], qiita.tier) IS
     'The prep_sample_metadata twin of qiita.biosample_metadata_visibility; same '
-    'columns, same rule (a prep_sample has no owner-sample-id value).';
+    'columns, same rule (a prep_sample has no owner-biosample-id value).';
 
 -- The original table COMMENTs said an exception "downgrades visibility to a
 -- specified tier_override", which reads as setting the value's tier. It can

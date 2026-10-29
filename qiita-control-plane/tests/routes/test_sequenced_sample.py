@@ -1387,8 +1387,8 @@ def _expected_read_response(
     Centralises the column-by-column expectation so the parameter list says
     only what varies between tests (owner / creator / role / metadata).
     """
-    # The composer touches last_metadata_change_at iff at least one metadata
-    # row landed; the value is non-None in that case, otherwise None.
+    # last_metadata_change_at is set iff the response carries a metadata
+    # value, which it does iff the composer wrote one.
     expected_last_meta = rj["last_metadata_change_at"] if has_metadata else None
     return {
         "sequenced_sample_idx": seeded["sequenced_sample_idx"],

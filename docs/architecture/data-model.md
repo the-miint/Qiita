@@ -159,9 +159,16 @@ latest change among the values it returns
 (`_sample_helpers.fetch_visible_metadata_last_change`), not the entity's own
 column, which moves on every write. The record's `updated_at` moves only with
 the record's own columns, and the read's ETag is the later of the two
-(`routes._helpers.representation_etag`), which is also what a PATCH's
-If-Match is checked against. So no timestamp a caller reads shows that a
-hidden value exists or when it changed.
+(`routes._helpers.representation_etag`). So no timestamp a caller reads shows
+that a hidden value exists or when it changed. Both are stamps of what the
+response carries, not versions of it: a change that writes no value, such as a
+field's tier, an exception or a grant, can change which values a read returns
+without moving either, unless it hides or reveals the latest one; and a value
+stamped by a transaction that began before the latest one's carries the
+earlier time (`now()` is the transaction's start), so it may not move them.
+`PATCH /biosample/{idx}` and `PATCH /sequenced-sample/{idx}` check If-Match
+against the ETag of the GET on the same path. A study-scoped read also counts
+that study's local values, so its ETag is not an If-Match for those PATCHes.
 
 Every caller-facing metadata read names its source through
 `_sample_helpers.visible_metadata_source`. The reads filter on the function's

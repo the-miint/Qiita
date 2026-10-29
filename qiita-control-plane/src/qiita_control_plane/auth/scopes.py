@@ -126,10 +126,9 @@ ROLE_IMPLIED_SCOPES: Mapping[SystemRole, frozenset[Scope]] = {
             Scope.ADMIN_SERVICE_ACCOUNT,
             Scope.ADMIN_AUDIT_READ,
             # Owner-id re-identification export is system_admin-only —
-            # owner-submitted names can carry incautiously-entered PII. The
-            # study-scoped reads show it only at OWNER_BIOSAMPLE_ID_TIER_OVERRIDE
-            # or above, and a caller at METADATA_BYPASS_ROLE or above reads
-            # every value regardless.
+            # owner-submitted names can carry incautiously-entered PII. What
+            # the study-scoped reads show of them is the owner-biosample-id
+            # floor (repositories.biosample.OWNER_BIOSAMPLE_ID_TIER_OVERRIDE).
             Scope.ADMIN_BIOSAMPLE_OWNER_ID_READ,
             # Per-pool masked-read export is system_admin-only — the first human
             # masked-read pull, admin-gated until there's a model for picking the

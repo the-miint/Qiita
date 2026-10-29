@@ -36,7 +36,7 @@ from .biosample_metadata import (
 )
 from .exported_entity import export_entity_id_select
 
-# Owners' ids for their own samples sometimes inadvertently contain PII, so an
+# Owners' ids for their own biosamples sometimes inadvertently contain PII, so an
 # owner-biosample-id value reads at no less than member whatever the study's
 # default or its field's tier: even on a public study, or through a field a
 # study declared lower before its first import, only members (and the roles
@@ -87,7 +87,7 @@ _BIOSAMPLE_RETURNING_COLS = (
     " (SELECT name FROM qiita.metadata_checklist mc"
     "  WHERE mc.idx = biosample.metadata_checklist_idx) AS metadata_checklist_name,"
     " biosample_accession, ena_sample_accession, matrix_tube_id,"
-    " last_submission_at, submission_error, last_metadata_change_at,"
+    " last_submission_at, submission_error,"
     " created_by_idx, created_at, updated_at,"
     " retired, retired_by_idx, retired_at, retire_reason, "
     + export_entity_id_select("biosample", alias="biosample")

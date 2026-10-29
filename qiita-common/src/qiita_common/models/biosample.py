@@ -452,10 +452,9 @@ class BiosampleResponse(BaseModel):
     caller's principal.system_role verbatim from the database.
 
     `last_metadata_change_at` is when the metadata values in this response
-    last changed (None when it carries none), so it moves only with what the
-    caller can read. `updated_at` is when the biosample's own record last
-    changed; a metadata write does not move it. The ETag header is the later
-    of the two.
+    last changed (None when it carries none). `updated_at` is when the
+    biosample's own record last changed; a metadata write does not move it.
+    The ETag header is the later of the two.
     """
 
     biosample_idx: Annotated[int, Field(gt=0)]

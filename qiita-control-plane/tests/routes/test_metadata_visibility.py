@@ -34,6 +34,7 @@ from qiita_common.models import (
 )
 
 from qiita_control_plane.repositories._sample_helpers import EntityMetadataSpec
+from qiita_control_plane.repositories.biosample import OWNER_BIOSAMPLE_ID_TIER_OVERRIDE
 from qiita_control_plane.repositories.biosample_metadata import BIOSAMPLE_METADATA_SPEC
 from qiita_control_plane.repositories.prep_sample_metadata import PREP_SAMPLE_METADATA_SPEC
 from qiita_control_plane.routes._helpers import detail_for_unique_field_miss
@@ -270,8 +271,7 @@ async def _seed_biosample_corpus(
         entity_idx=biosample_idx,
         metadata_entity_idx=biosample_idx,
         global_keys={BIOSAMPLE_FIELD_HOST_TAXON_ID: Tier.PUBLIC, **global_keys},
-        # The import pins the owner-biosample-id field at member.
-        local_keys={owner_id_field: Tier.MEMBER, **local_keys},
+        local_keys={owner_id_field: OWNER_BIOSAMPLE_ID_TIER_OVERRIDE, **local_keys},
         owner_id_field=owner_id_field,
         owner_id_value=owner_id_value,
     )
@@ -493,7 +493,7 @@ async def test_owner_id_field_declared_below_its_tier_stays_hidden(ctx):
         " WHERE study_idx = $1 AND principal_idx = $2",
         study_idx,
         ctx["user_session"]["principal_idx"],
-        Tier.MEMBER,
+        OWNER_BIOSAMPLE_ID_TIER_OVERRIDE,
     )
     as_member = await ctx["user"].get(url)
 
@@ -601,6 +601,25 @@ async def test_hidden_write_moves_nothing_the_viewer_reads(ctx, surface):
     assert viewer_etag != viewer_before[0]
     assert viewer_last_change != viewer_before[2]
     assert viewer_record == viewer_before[1]
+
+
+async def test_sequenced_sample_read_stamps_a_metadata_write_on_its_metadata(ctx):
+    """GET /sequenced-sample/{idx} admits only callers who read every value,
+    so it has no hidden write to test; a write moves its
+    last_metadata_change_at and ETag, never effective_updated_at."""
+    study_idx = await _seed_study_for_case(ctx, "wet_lab_admin")
+    corpus = await _seed_sequenced_sample_corpus(ctx, study_idx)
+    url = URL_SEQUENCED_SAMPLE_BY_IDX.format(sequenced_sample_idx=corpus.entity_idx)
+    before = await ctx["wet"].get(url)
+    assert before.status_code == 200, before.text
+
+    await _write_global(ctx, PREP_SAMPLE_METADATA_SPEC, corpus, hidden=False)
+
+    after = await ctx["wet"].get(url)
+    assert after.status_code == 200, after.text
+    assert after.headers["ETag"] != before.headers["ETag"]
+    assert after.json()["last_metadata_change_at"] != before.json()["last_metadata_change_at"]
+    assert after.json()["effective_updated_at"] == before.json()["effective_updated_at"]
 
 
 async def test_patch_biosample_refuses_an_etag_a_metadata_write_made_stale(ctx):

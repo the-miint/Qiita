@@ -53,7 +53,9 @@ _None yet._
   `last_metadata_change_at` now reflects only the metadata in the response, and
   `updated_at` / `effective_updated_at` no longer move on metadata writes; the ETag is the
   later of the two, so a client that read `updated_at` to detect metadata changes should
-  read `last_metadata_change_at` or the ETag instead.
+  read `last_metadata_change_at` or the ETag instead. The study-scoped reads' ETag is no
+  longer an If-Match for `PATCH /biosample/{b}` or `PATCH /sequenced-sample/{q}`; a client
+  takes it from the GET on the PATCH's own path (the `qiita` CLI already does).
 
 ## Deployed history
 

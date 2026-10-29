@@ -976,10 +976,13 @@ async def assert_study_scoped_sample_write_authz(ctx, *, case: str, **kwargs) ->
 
 
 async def etag_for_row(pool, *, table: UpdatableTable, row_idx: int) -> str:
-    """Build the quoted ISO-8601 ETag a PATCH route emits for a row.
+    """Build the quoted ISO-8601 ETag a PATCH route emits for a row whose
+    ETag is its own updated_at.
 
-    Reads updated_at directly so the helper does not depend on the
-    route's behavior; the on-the-wire wording matches the routes'.
+    A biosample's or sample's ETag is that only while none of the metadata
+    its read returns is newer (`routes._helpers.representation_etag`). Reads
+    updated_at directly so the helper does not depend on the route's
+    behavior; the on-the-wire wording matches the routes'.
     """
     # Python does not enforce Literal at runtime; the f-string below is raw SQL.
     if table not in get_args(UpdatableTable):

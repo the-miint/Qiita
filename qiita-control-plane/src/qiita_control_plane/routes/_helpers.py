@@ -1300,13 +1300,12 @@ def etag_for_updated_at(updated_at: datetime) -> str:
 
 
 def representation_etag(updated_at: datetime, metadata_last_change: datetime | None) -> str:
-    """The ETag of a sample read: its record's own updated_at, or when the
-    metadata values it returns last changed, whichever is later.
+    """The ETag of a sample read: the later of its record's own updated_at
+    and `metadata_last_change`, the latest updated_at among the metadata
+    values the read returns (`_sample_helpers.fetch_visible_metadata_last_change`).
 
-    It moves when anything the response carries moves, and on nothing it
-    hides: `metadata_last_change` comes from
-    `_sample_helpers.fetch_visible_metadata_last_change` over the same values.
-    A PATCH checks If-Match against the value its own read would return.
+    What moves it, and what does not, is in docs/architecture/data-model.md,
+    "Metadata visibility tiers".
     """
     if metadata_last_change is None:
         return etag_for_updated_at(updated_at)
@@ -1336,9 +1335,9 @@ def require_etag_match(
     Called after `fetch_<entity>(conn, idx, for_update=True)` to fold
     "row absent (404)" and "ETag stale (412)" into one site so every
     PATCH endpoint emits the same wording. `label` is the entity noun
-    embedded in the 404 detail (e.g. "study", "biosample"). A sample PATCH
-    passes `metadata_last_change` for the metadata its GET returns, so the
-    check matches `representation_etag`.
+    embedded in the 404 detail (e.g. "study", "biosample"). The row's ETag is
+    `representation_etag` over its updated_at and `metadata_last_change`,
+    which a route whose GET returns no metadata leaves None.
     """
     if row is None:
         raise HTTPException(status_code=404, detail=f"{label} {row_idx} not found")
