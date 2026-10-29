@@ -1875,12 +1875,15 @@ def _required_duckdb_cli_version() -> str:
     return version
 
 
-def _write_duckdb_stub(path: Path, body: str = "exit 0\n") -> Path:
+def _write_duckdb_stub(path: Path, body: str = "exit 0\n", *, banner: str = "") -> Path:
     """A `duckdb` stand-in that reports the required version to `--version` (the
-    resolver checks it) and otherwise runs `body`."""
+    resolver checks it) and otherwise runs `body`. `banner` is printed to stderr
+    before the version, as the real CLI does in agent mode."""
     version = _required_duckdb_cli_version()
+    preamble = f"echo '{banner}' >&2; " if banner else ""
     path.write_text(
-        f'#!/bin/sh\nif [ "$1" = --version ]; then echo "v{version} (stub) 0"; exit 0; fi\n' + body
+        '#!/bin/sh\nif [ "$1" = --version ]; then '
+        f'{preamble}echo "v{version} (stub) 0"; exit 0; fi\n' + body
     )
     path.chmod(0o755)
     return path
@@ -2040,6 +2043,23 @@ def test_lake_script_refuses_a_duckdb_cli_of_another_version(
     assert shown in result.stderr, result.stderr
     assert f"v{_required_duckdb_cli_version()}" in result.stderr, result.stderr
     assert not (tmp_path / "captured.sql").exists(), "SQL ran on the wrong CLI"
+
+
+def test_duckdb_cli_version_is_read_past_an_agent_mode_banner(tmp_path: Path) -> None:
+    """Run by an AI agent with stdout not a terminal, the CLI prints a banner to stderr
+    before its version. The right CLI must still be accepted, not refused on the banner."""
+    stub = _write_duckdb_stub(
+        tmp_path / "duckdb",
+        banner="duckdb agent mode on: AI_AGENT is set and stdout is not a terminal",
+    )
+    result = subprocess.run(
+        ["bash", "-c", f'source "{_COMMON}"; qiita_resolve_duckdb_bin && echo "$DUCKDB_BIN"'],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "QIITA_DUCKDB_BIN": str(stub)},
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == str(stub)
 
 
 def test_lake_gc_defaults_to_report_only(tmp_path) -> None:

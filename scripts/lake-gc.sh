@@ -204,7 +204,7 @@ MARK="@@lake-gc@@"
 # `.bail on` turns an attach failure into a non-zero exit instead of an empty
 # result that reads like "nothing to reclaim".
 #
-# Measured output shapes under `-noheader -list` (1.5.4; unchanged on 1.5.5):
+# Measured output shapes under `-noheader -list` (1.5.4; unchanged on 1.5.5 and 2.0.0):
 # cleanup_old_files and delete_orphaned_files return one bare path per line, which
 # report_paths counts and sizes; expire_snapshots returns a 7-column snapshot row,
 # which is only line-counted here. A shape change in the first two would surface
@@ -227,7 +227,7 @@ run_maintenance() {
         echo "SET threads = ${LAKE_THREADS};"
         echo "SET memory_limit = '${LAKE_MEMORY_LIMIT}';"
         echo "SET temp_directory='${SESSION_TMPDIR}';"
-        echo "ATTACH 'ducklake:postgres:${CONN_SANITIZED}' AS qiita_lake (DATA_PATH '${DATA_PATH}');"
+        echo "ATTACH 'ducklake:postgres:${CONN_SANITIZED}' AS qiita_lake (DATA_PATH '${DATA_PATH}', DUCKLAKE_VERSION '${QIITA_DUCKLAKE_VERSION}');"
         # Steps 1-2 share a transaction: cleanup only sees the expiry from inside
         # it, and the two are one catalog outcome.
         echo "BEGIN TRANSACTION;"

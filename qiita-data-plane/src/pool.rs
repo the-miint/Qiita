@@ -104,13 +104,17 @@ const NO_TRANSACTION_TO_ROLL_BACK: &str = "no transaction is active";
 
 /// One pooled database and the directory it spills into.
 ///
-/// Every database gets a directory of its own because DuckDB names its spill
-/// files the same in every database (`duckdb_temp_storage_DEFAULT-0.tmp` and
-/// siblings, measured on DuckDB 1.5.5), and does not make the directory unique
-/// itself. Measured with two databases in one process spilling into one shared
-/// directory: all four runs failed — three segfaults and one `INTERNAL Error:
-/// Cannot perform IO in in-memory database - CreateBlock!` — where the same
-/// workload with a directory each returned correct results in four of four.
+/// Every database gets a directory of its own. DuckDB 1.5.5 needed it: it named
+/// its spill files the same in every database (`duckdb_temp_storage_DEFAULT-0.tmp`
+/// and siblings) and did not make the directory unique itself, and two databases
+/// in one process spilling into one shared directory failed in all four runs —
+/// three segfaults and one `INTERNAL Error: Cannot perform IO in in-memory
+/// database - CreateBlock!` — where a directory each returned correct results in
+/// four of four. DuckDB 2.0 names them per database (`duckdb_temp_<pid>_<n>_…`,
+/// pinned by `duckdb_names_its_spill_files_uniquely_per_database`), and the same
+/// shared-directory workload returned correct results in four of four, so the
+/// directories no longer keep the pool from crashing. They stay until dropping
+/// them is a change of its own.
 ///
 /// `conn` is declared before `spill` so it drops first: DuckDB closes and
 /// releases its spill files, then the directory is removed. The data plane has

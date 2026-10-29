@@ -33,6 +33,8 @@ via `qiita_common.duckdb_miint` (single source for the `MIINT_EXTENSION_REPO` /
 from __future__ import annotations
 
 import threading
+from collections.abc import Sequence
+from typing import TYPE_CHECKING
 
 import duckdb
 from qiita_common.duckdb_miint import (
@@ -41,6 +43,9 @@ from qiita_common.duckdb_miint import (
     miint_load_sql,
     require_staged_extension_directory,
 )
+
+if TYPE_CHECKING:
+    import pyarrow as pa
 
 _install_lock = threading.Lock()
 _installed = False
@@ -59,6 +64,24 @@ def duckdb_connect() -> duckdb.DuckDBPyConnection:
     environments are dev/CI, which have a writable $HOME and no /dev/null
     failure."""
     return duckdb.connect(":memory:", config=miint_connect_config())
+
+
+def arrow_batches(
+    con: duckdb.DuckDBPyConnection, sql: str, params: Sequence[object], rows_per_batch: int
+) -> pa.RecordBatchReader:
+    """Stream `sql`'s result as Arrow batches of `rows_per_batch` rows, one at a time.
+
+    Through `con.sql(...)`, because it is the form that streams on DuckDB 2.0.
+    `con.execute(...).to_arrow_reader()` reads the same but first copies the whole
+    result (with a `UserWarning` the test suites turn into an error) — measured on
+    3M rows of ~200 B: 132 MB peak RSS through `execute` on 1.5.5, 1.2 GB through
+    `execute` on 2.0, 143 MB through `sql` on 2.0.
+
+    Until the reader is exhausted or closed, nothing else can run on `con`, and the
+    call itself is refused while a SELECT `execute`d on `con` is part-read
+    (`qiita_common.duckdb_relation` says when that is); both raise
+    `ResourceInUseException`. Closing `con` itself is always allowed."""
+    return con.sql(sql, params=list(params)).to_arrow_reader(rows_per_batch)
 
 
 def _connect() -> duckdb.DuckDBPyConnection:

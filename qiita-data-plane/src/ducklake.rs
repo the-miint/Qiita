@@ -5,7 +5,8 @@
 //! holds an independent DuckDB+DuckLake connection.
 //!
 //! ATTACH syntax: `ducklake:postgres:<libpq connection string>`
-//! with DATA_PATH as a separate option specifying Parquet storage location.
+//! with DATA_PATH as a separate option specifying Parquet storage location,
+//! and DUCKLAKE_VERSION naming the catalog format (`DUCKLAKE_CATALOG_VERSION`).
 //! Requires both `ducklake` and `postgres` extensions.
 //!
 //! DuckLake does not support UNIQUE or FK constraints, so data integrity
@@ -126,9 +127,28 @@ fn setup_catalog_once(
     Ok(())
 }
 
+/// The DuckLake catalog format every attach asks for. The catalog is held at 1.0
+/// until it is migrated on purpose: the ducklake extension DuckDB 2.0 ships writes
+/// format 1.1, and a migrated catalog cannot be downgraded.
+///
+/// Named on the ATTACH because the default is not what we run. Against an empty
+/// catalog the 2.0 extension creates 1.1 unless told otherwise, so every catalog
+/// the tests create, and a fresh deploy's, would quietly differ from production's.
+/// Against an existing 1.0 catalog the option changes nothing; against a newer one
+/// the ATTACH fails (`Cannot downgrade a DuckLake catalog`), so the attach is also
+/// the check that the catalog is still 1.0. Never pass `AUTOMATIC_MIGRATION`: it
+/// is the migration
+/// (<https://ducklake.select/docs/stable/duckdb/migrations/upgrading_to_ducklake_1_1>).
+///
+/// The lake scripts (`QIITA_DUCKLAKE_VERSION` in `deploy/_common.sh`) and the
+/// integration tests (`tests/integration/_pg_env.py`) name the same version, held
+/// equal to this one by qiita-common/tests/test_duckdb_version_sync.py.
+pub(crate) const DUCKLAKE_CATALOG_VERSION: &str = "1.0";
+
 /// Connect to DuckLake backed by a Postgres catalog.
 ///
-/// Attaches the DuckLake catalog as `qiita_lake` in the DuckDB session.
+/// Attaches the DuckLake catalog as `qiita_lake` in the DuckDB session, at
+/// `DUCKLAKE_CATALOG_VERSION`.
 /// `catalog_connstr` is a libpq-style connection string (e.g., "dbname=qiita_ducklake host=localhost").
 /// `data_path` is the directory where DuckLake stores Parquet files.
 pub fn connect_ducklake(
@@ -140,7 +160,8 @@ pub fn connect_ducklake(
     validate_sql_literal(data_path, "data_path")?;
     conn.execute_batch("LOAD ducklake; LOAD postgres;")?;
     conn.execute_batch(&format!(
-        "ATTACH 'ducklake:postgres:{catalog_connstr}' AS qiita_lake (DATA_PATH '{data_path}');"
+        "ATTACH 'ducklake:postgres:{catalog_connstr}' AS qiita_lake \
+         (DATA_PATH '{data_path}', DUCKLAKE_VERSION '{DUCKLAKE_CATALOG_VERSION}');"
     ))?;
     Ok(())
 }
@@ -1004,6 +1025,24 @@ mod tests {
             )
             .expect("parquet_compression_level is not set on the catalog");
         assert_eq!(value, PARQUET_COMPRESSION_LEVEL_AT_REST.to_string());
+    }
+
+    /// The integration recipe drops the test catalog before this suite, so its first
+    /// attach is the one that creates it: a catalog created without the version
+    /// asked for comes out at whatever the extension defaults to.
+    #[test]
+    #[serial]
+    #[cfg(feature = "integration")]
+    fn the_catalog_is_created_at_the_pinned_ducklake_format() {
+        let conn = setup_conn();
+        let version: String = conn
+            .query_row(
+                "SELECT value FROM qiita_lake.options() WHERE option_name = 'version'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("the catalog reports no format version");
+        assert_eq!(version, DUCKLAKE_CATALOG_VERSION);
     }
 
     /// `(column_name, data_type, is_nullable)` for one `qiita_lake` table, in
@@ -2204,6 +2243,7 @@ mod tests {
             let mut seen = Vec::new();
             let mut batches = 0usize;
             for batch in stream {
+                let batch = batch.expect("fetch batch");
                 batches += 1;
                 let grp = batch
                     .column(0)

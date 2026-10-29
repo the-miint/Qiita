@@ -99,7 +99,7 @@ def test_at_rest_level_reaches_the_writer(tmp_path: Path):
     con = _connect()
     con.execute(
         "CREATE TABLE t AS SELECT array_to_string(list_transform(range(150), "
-        "i -> substr('ACGT', 1 + floor(random() * 4)::INT, 1)), '') AS s FROM range(20000)"
+        "lambda i: substr('ACGT', 1 + floor(random() * 4)::INT, 1)), '') AS s FROM range(20000)"
     )
     at_rest = tmp_path / "at_rest.parquet"
     transfer = tmp_path / "transfer.parquet"
@@ -179,13 +179,17 @@ def _row_groups(con: duckdb.DuckDBPyConnection, path: Path) -> list[tuple[int, i
     ).fetchall()
 
 
-def test_a_sorted_copy_ignores_the_byte_cap(tmp_path: Path):
-    # The DuckDB behaviour sorted_row_group_size exists for. If a DuckDB bump makes this
-    # fail, check whether DuckDB now applies the byte cap to a sorted COPY; if it does,
-    # the helper may be unneeded.
+def test_a_sorted_copy_honours_the_byte_cap(tmp_path: Path):
+    # DuckDB 1.5.5 wrote these 20,000 rows as one group, which is what
+    # sorted_row_group_size was written for. If a bump makes this fail, a sorted writer
+    # is bounded by that helper's row count alone again.
     con = _connect()
     out = _sorted_copy(con, tmp_path, "FORMAT PARQUET, ROW_GROUP_SIZE_BYTES '1MB'")
-    assert [rows for rows, _, _ in _row_groups(con, out)] == [20000]
+    groups = _row_groups(con, out)
+    # ~20 MB under a 1 MB cap, each group a contiguous run of the key, in key order.
+    assert len(groups) >= 10
+    assert all(hi - lo + 1 == rows for rows, lo, hi in groups)
+    assert all(a[2] < b[1] for a, b in zip(groups, groups[1:]))
 
 
 def test_a_sorted_copy_cuts_row_groups_on_whole_vectors_in_sort_order(tmp_path: Path):

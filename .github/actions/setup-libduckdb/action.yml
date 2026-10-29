@@ -9,7 +9,7 @@ inputs:
   version:
     description: libduckdb version (without the leading 'v').
     required: false
-    default: "1.5.5"
+    default: "2.0.0"
   runtime-libpath:
     description: |
       Set DYLD_LIBRARY_PATH (macOS) or LD_LIBRARY_PATH (Linux) so test
@@ -37,13 +37,14 @@ runs:
       run: |
         mkdir -p ~/.duckdb/lib
         if [ "$RUNNER_OS" = "macOS" ]; then
-          asset="libduckdb-osx-universal.zip"
+          asset="duckdb-shared-libs-osx-universal.tar.gz"
         else
-          asset="libduckdb-linux-amd64.zip"
+          asset="duckdb-shared-libs-linux-amd64.tar.gz"
         fi
+        # A flat archive: libduckdb plus its headers, no top-level directory.
         curl -fsSL "https://github.com/duckdb/duckdb/releases/download/v${{ inputs.version }}/$asset" \
-          -o /tmp/libduckdb.zip
-        unzip -j /tmp/libduckdb.zip -d ~/.duckdb/lib
+          -o /tmp/libduckdb.tar.gz
+        tar -xzf /tmp/libduckdb.tar.gz -C ~/.duckdb/lib
 
     - name: Cache duckdb extensions
       if: inputs.cache-extensions == 'true'

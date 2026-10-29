@@ -9,7 +9,7 @@ dependencies = [
     "httpx>=0.28",
     "asyncpg>=0.31",
     "pyarrow>=19",
-    "duckdb==1.5.5",
+    "duckdb==2.0.0",
     "qiita-common",
     "qiita-control-plane",
     "qiita-compute-orchestrator",
@@ -26,6 +26,11 @@ asyncio_default_fixture_loop_scope = "session"
 asyncio_default_test_loop_scope = "session"
 markers = [
     "system: system tests with real reference data (deselect with -m 'not system')",
+]
+filterwarnings = [
+    # DuckDB copies the whole result before handing it over as Arrow from
+    # `execute()`; see qiita_control_plane.miint.arrow_batches.
+    "error:Arrow output on a DB-API result:UserWarning",
 ]
 
 [tool.ruff]

@@ -23,6 +23,7 @@ import duckdb
 import pyarrow as pa
 import pytest
 from qiita_common.analytic import MAX_SECONDARY
+from qiita_common.duckdb_relation import registered
 
 from qiita_compute_orchestrator.jobs import align_denovo
 from qiita_compute_orchestrator.jobs.align_denovo import Inputs, execute
@@ -151,20 +152,14 @@ def _install_streams(monkeypatch, genome, *, contigs=None, reads=None) -> None:
     @asynccontextmanager
     async def _chunks(conn, *, prep_sample_idx, processing_idx, relation="assembly_chunks"):
         assert (prep_sample_idx, processing_idx) == (_PREP_SAMPLE_IDX, _PROCESSING_IDX)
-        conn.register(relation, _reader(_CHUNK_SCHEMA, contig_rows))
-        try:
+        with registered(conn, relation, _reader(_CHUNK_SCHEMA, contig_rows)):
             yield relation
-        finally:
-            conn.unregister(relation)
 
     @asynccontextmanager
     async def _reads(conn, *, prep_sample_idx, mask_idx, relation="masked_reads"):
         assert (prep_sample_idx, mask_idx) == (_PREP_SAMPLE_IDX, _MASK_IDX)
-        conn.register(relation, _reader(_READ_SCHEMA, read_rows))
-        try:
+        with registered(conn, relation, _reader(_READ_SCHEMA, read_rows)):
             yield relation
-        finally:
-            conn.unregister(relation)
 
     monkeypatch.setattr(align_denovo, "open_assembly_chunk_stream", _chunks)
     monkeypatch.setattr(align_denovo, "open_read_masked_stream", _reads)

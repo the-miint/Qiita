@@ -65,7 +65,7 @@ from qiita_common.qc_reasons import load_qc_reasons
 from qiita_common.taxonomy import TAXONOMY_SOURCE_TABLE, genome_lineage_select_sql
 
 from ..auth.tickets import run_signed_flight_call, sign_action, sign_ticket
-from ..miint import duckdb_connect
+from ..miint import arrow_batches, duckdb_connect
 from ..problem_list import capped
 from ..repositories import require_transaction
 from ..repositories.assembly import (
@@ -413,13 +413,15 @@ async def _associate_genomes(
     """
     with duckdb_connect() as duck:
         prep_select = "g.prep_sample_idx" if has_prep else "CAST(NULL AS BIGINT) AS prep_sample_idx"
-        reader = duck.execute(
+        reader = arrow_batches(
+            duck,
             f"SELECT fm.feature_idx, g.genome_source, g.genome_source_id, {prep_select}"
             " FROM read_parquet(?) AS m"
             " JOIN read_parquet(?) AS g USING (read_id)"
             " JOIN read_parquet(?) AS fm USING (sequence_hash)",
             [str(manifest_path), str(genome_map_path), str(feature_map_path)],
-        ).to_arrow_reader(_CHUNK_SIZE)
+            _CHUNK_SIZE,
+        )
         for batch in reader:
             feat_idxs = batch.column("feature_idx").to_pylist()
             if not feat_idxs:
@@ -580,10 +582,12 @@ async def mint_features(
         # upsert), and an ORDER BY would force a full blocking sort before the
         # first batch, defeating the streaming. The output is separately
         # ordered by feature_idx at COPY time.
-        reader = read_conn.execute(
+        reader = arrow_batches(
+            read_conn,
             "SELECT sequence_hash FROM read_parquet(?)",
             [str(manifest_path)],
-        ).to_arrow_reader(_CHUNK_SIZE)
+            _CHUNK_SIZE,
+        )
         for batch in reader:
             raw_hashes = batch.column("sequence_hash").to_pylist()
             if not raw_hashes:
@@ -750,15 +754,16 @@ async def _write_annotation_claims(
         # Footer-only count first: on the no-GFF path this is the entire cost. The empty
         # map is still WRITTEN — reference_load binds it unconditionally, so an absent
         # file is a FileNotFoundError, not an absent annotation set.
-        expected = read_conn.execute(
+        [(expected,)] = read_conn.execute(
             "SELECT count(*) FROM read_parquet(?)", [str(annotation_manifest_path)]
-        ).fetchone()[0]
+        ).fetchall()
         if expected == 0:
             _copy_annotation_map(write_conn, out_path)
             return out_path
 
         read_conn.execute("SET preserve_insertion_order=false")
-        reader = read_conn.execute(
+        reader = arrow_batches(
+            read_conn,
             "SELECT afm.feature_idx, "
             "       fm.feature_idx AS parent_feature_idx, "
             "       am.position, am.stop_position, am.annotation_type, am.strand, "
@@ -771,7 +776,8 @@ async def _write_annotation_claims(
                 str(annotation_feature_map_path),
                 str(feature_map_path),
             ],
-        ).to_arrow_reader(_CHUNK_SIZE)
+            _CHUNK_SIZE,
+        )
 
         resolved = 0
         for batch in reader:
@@ -963,9 +969,9 @@ async def _write_annotation_terms(
     """
     read_conn = duckdb_connect()
     try:
-        expected = read_conn.execute(
+        [(expected,)] = read_conn.execute(
             "SELECT count(*) FROM read_parquet(?)", [str(annotation_manifest_path)]
-        ).fetchone()[0]
+        ).fetchall()
         if expected == 0:
             return 0
 
@@ -973,7 +979,7 @@ async def _write_annotation_terms(
         params = [str(annotation_manifest_path), str(feature_map_path)]
 
         # PASS 1 — the terms themselves.
-        terms = read_conn.execute(_term_grain_sql(), params).to_arrow_reader(_CHUNK_SIZE)
+        terms = arrow_batches(read_conn, _term_grain_sql(), params, _CHUNK_SIZE)
         for batch in terms:
             if not batch.num_rows:
                 continue
@@ -993,7 +999,7 @@ async def _write_annotation_terms(
                 )
 
         # PASS 2 — the links, now that every term they name is resolvable.
-        links = read_conn.execute(_link_grain_sql(), params).to_arrow_reader(_CHUNK_SIZE)
+        links = arrow_batches(read_conn, _link_grain_sql(), params, _CHUNK_SIZE)
         linked = 0
         for batch in links:
             if not batch.num_rows:
@@ -1192,10 +1198,12 @@ async def write_membership(
     total_seen = 0
     async with pool.acquire() as conn:
         with duckdb_connect() as duck:
-            reader = duck.execute(
+            reader = arrow_batches(
+                duck,
                 MEMBERSHIP_ACCESSION_JOIN_SQL,
                 [str(feature_map_path), str(manifest_path)],
-            ).to_arrow_reader(_CHUNK_SIZE)
+                _CHUNK_SIZE,
+            )
             for batch in reader:
                 feature_idxs = batch.column("feature_idx").to_pylist()
                 if not feature_idxs:
@@ -1827,10 +1835,12 @@ async def write_assembly_membership(
     async with pool.acquire() as conn:
         with duckdb_connect() as duck:
             register_contig_attribute_table(duck, genomes_dir / CONTIG_ATTRIBUTES_FILE)
-            reader = duck.execute(
+            reader = arrow_batches(
+                duck,
                 ASSEMBLY_MEMBERSHIP_JOIN_SQL,
                 [str(bin_map_path), str(manifest_path), str(feature_map_path)],
-            ).to_arrow_reader(_CHUNK_SIZE)
+                _CHUNK_SIZE,
+            )
             for batch in reader:
                 kinds = batch.column("kind").to_pylist()
                 if not kinds:

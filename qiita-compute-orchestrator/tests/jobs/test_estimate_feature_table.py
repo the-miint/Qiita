@@ -33,6 +33,7 @@ import duckdb
 import pyarrow.parquet as pq
 import pytest
 from qiita_common import analytic
+from qiita_common.duckdb_relation import registered
 
 # ---------------------------------------------------------------------------
 # Parquet writers (correctly-typed to mirror the real DuckLake / resolver output)
@@ -106,11 +107,8 @@ def _fake_alignment_stream(parquet: Path, captured: dict):
         # SELECT the job never asked for would hide precisely the drift this
         # projection exists to prevent, so `.select()` raises here instead.
         table = pq.read_table(str(parquet)).select(list(columns))
-        conn.register(relation, table.to_reader())
-        try:
+        with registered(conn, relation, table.to_reader()):
             yield relation
-        finally:
-            conn.unregister(relation)
 
     return fake
 
@@ -119,11 +117,8 @@ def _fake_lengths_stream(parquet: Path, captured: dict):
     @asynccontextmanager
     async def fake(conn, *, reference_idx, relation="reference_lengths"):
         captured["reference_idx"] = reference_idx
-        conn.register(relation, pq.read_table(str(parquet)).to_reader())
-        try:
+        with registered(conn, relation, pq.read_table(str(parquet)).to_reader()):
             yield relation
-        finally:
-            conn.unregister(relation)
 
     return fake
 
@@ -600,11 +595,8 @@ def _fake_two_arm_alignment_stream(reference_parquet: Path, denovo_parquet: Path
         captured.setdefault("arms", []).append(denovo)
         captured["work_ticket_idx"] = work_ticket_idx
         table = pq.read_table(str(denovo_parquet if denovo else reference_parquet))
-        conn.register(relation, table.select(list(columns)).to_reader())
-        try:
+        with registered(conn, relation, table.select(list(columns)).to_reader()):
             yield relation
-        finally:
-            conn.unregister(relation)
 
     return fake
 
@@ -622,11 +614,10 @@ def _fake_assembled_sequence_stream(per_sample: dict[int, Path], captured: dict)
     async def fake(conn, *, prep_sample_idx, processing_idx, relation="assembled_lengths"):
         captured.setdefault("lengths_samples", []).append(prep_sample_idx)
         captured["lengths_processing_idx"] = processing_idx
-        conn.register(relation, pq.read_table(str(per_sample[prep_sample_idx])).to_reader())
-        try:
+        with registered(
+            conn, relation, pq.read_table(str(per_sample[prep_sample_idx])).to_reader()
+        ):
             yield relation
-        finally:
-            conn.unregister(relation)
 
     return fake
 

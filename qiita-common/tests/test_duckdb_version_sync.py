@@ -15,9 +15,9 @@ only the environments synced from it.
 
 What it ties together, each against the crate:
 - `qiita-data-plane/Cargo.toml` `[dependencies].duckdb` — the crate, which decides
-  the embedded/linked DuckDB version. libduckdb-sys encodes the DuckDB version in
-  the crate's middle field: `<major>.1<minor:02><patch:02>.<rev>`, so crate
-  `1.10503.1` == DuckDB `1.5.3`.
+  the embedded/linked DuckDB version. libduckdb-sys keeps its own major at `1` and
+  encodes the DuckDB version in the middle field: `1.<major><minor:02><patch:02>.<rev>`,
+  so crate `1.10503.1` == DuckDB `1.5.3` and `1.20000.1` == DuckDB `2.0.0`.
 - `.github/actions/setup-libduckdb/action.yml` `version` input default — the
   libduckdb tarball CI downloads for the dynamic-link build/test path. It is a
   *default*, so any workflow that doesn't pass `version:` silently inherits it —
@@ -35,6 +35,12 @@ What it ties together, each against the crate:
 
 When this fails, bump every spot to the same DuckDB version (and update
 `_crate_to_duckdb_version` if libduckdb-sys ever changes its encoding).
+
+It also holds the DuckLake catalog format every ATTACH names to one value: the data
+plane's `DUCKLAKE_CATALOG_VERSION` (`qiita-data-plane/src/ducklake.rs` says why), the
+lake scripts' `QIITA_DUCKLAKE_VERSION` (`deploy/_common.sh`) and the integration tests'
+`DUCKLAKE_VERSION` (`tests/integration/_pg_env.py`) — and checks that no DuckLake
+ATTACH leaves the format out, which on DuckDB 2.0 creates a 1.1 catalog.
 """
 
 from __future__ import annotations
@@ -50,6 +56,8 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 CARGO_TOML = REPO_ROOT / "qiita-data-plane" / "Cargo.toml"
 ACTION_YML = REPO_ROOT / ".github" / "actions" / "setup-libduckdb" / "action.yml"
 DEPLOY_COMMON_SH = REPO_ROOT / "deploy" / "_common.sh"
+DATA_PLANE_DUCKLAKE_RS = REPO_ROOT / "qiita-data-plane" / "src" / "ducklake.rs"
+INTEGRATION_PG_ENV = REPO_ROOT / "tests" / "integration" / "_pg_env.py"
 
 # The `version:` input's `default:` inside setup-libduckdb/action.yml. Anchored on
 # the 2-space-indented `version:` key, then its 4-space-indented `default:` — so a
@@ -59,6 +67,14 @@ _ACTION_VERSION_DEFAULT_RE = re.compile(
     re.MULTILINE,
 )
 _DEPLOY_VERSION_RE = re.compile(r'^QIITA_DUCKDB_VERSION="([^"]+)"$', re.MULTILINE)
+_RUST_DUCKLAKE_VERSION_RE = re.compile(
+    r'^pub\(crate\) const DUCKLAKE_CATALOG_VERSION: &str = "([^"]+)";$', re.MULTILINE
+)
+_DEPLOY_DUCKLAKE_VERSION_RE = re.compile(r'^QIITA_DUCKLAKE_VERSION="([^"]+)"$', re.MULTILINE)
+_PY_DUCKLAKE_VERSION_RE = re.compile(r'^DUCKLAKE_VERSION = "([^"]+)"$', re.MULTILINE)
+# How far past an ATTACH's first line its option list may run: every site keeps the
+# options on the ATTACH line or within the two lines after it.
+_ATTACH_STATEMENT_LINES = 3
 # A `duckdb` requirement — any case, extras or not — and its specifier;
 # `duckdb-<suffix>` packages don't match.
 _PY_DUCKDB_REQ_RE = re.compile(r"(?i)duckdb\s*(?:\[[^\]]*\])?\s*([=<>!~].*)?")
@@ -113,17 +129,18 @@ def _data_plane_duckdb_crate_requirement() -> str:
 def _crate_to_duckdb_version(crate: str) -> str:
     """Map a libduckdb-sys crate version to the DuckDB version it links.
 
-    Crate `1.10503.1` -> DuckDB `1.5.3`: the middle field is a literal `1`
-    followed by 2-digit minor and 2-digit patch.
+    Crate `1.10503.1` -> DuckDB `1.5.3`, `1.20000.1` -> DuckDB `2.0.0`: the crate's
+    own major is `1`, and its middle field is DuckDB's major followed by a 2-digit
+    minor and a 2-digit patch.
     """
     parts = crate.split(".")
-    assert len(parts) == 3, f"unexpected duckdb crate version shape: {crate!r}"
-    major, encoded = parts[0], parts[1]
-    assert len(encoded) == 5 and encoded[0] == "1", (
+    assert len(parts) == 3 and parts[0] == "1", f"unexpected duckdb crate version: {crate!r}"
+    encoded = parts[1]
+    assert len(encoded) >= 5 and encoded.isdigit(), (
         f"unexpected duckdb crate encoding {encoded!r} in {crate!r}; "
         "update _crate_to_duckdb_version if libduckdb-sys changed its scheme"
     )
-    return f"{major}.{int(encoded[1:3])}.{int(encoded[3:5])}"
+    return f"{int(encoded[:-4])}.{int(encoded[-4:-2])}.{int(encoded[-2:])}"
 
 
 def _pinned_duckdb_version() -> str:
@@ -200,6 +217,66 @@ def test_python_lock_resolves_data_plane_duckdb(component: str) -> None:
         f"{component}/uv.lock resolves duckdb {resolved!r}, not {expected!r} — the lock is "
         "stale against the pin. Re-lock with `uv lock --upgrade-package duckdb`."
     )
+
+
+@pytest.mark.parametrize(
+    ("crate", "duckdb_version"),
+    [("1.10503.1", "1.5.3"), ("1.10505.0", "1.5.5"), ("1.20000.1", "2.0.0")],
+)
+def test_crate_version_decodes_to_the_duckdb_it_links(crate: str, duckdb_version: str) -> None:
+    assert _crate_to_duckdb_version(crate) == duckdb_version
+
+
+def _one(pattern: re.Pattern[str], path: Path) -> str:
+    m = pattern.search(path.read_text())
+    assert m, f"{path.relative_to(REPO_ROOT)} no longer declares {pattern.pattern!r}"
+    return m.group(1)
+
+
+def test_ducklake_catalog_version_is_the_same_everywhere() -> None:
+    expected = _one(_RUST_DUCKLAKE_VERSION_RE, DATA_PLANE_DUCKLAKE_RS)
+    assert _one(_DEPLOY_DUCKLAKE_VERSION_RE, DEPLOY_COMMON_SH) == expected, (
+        "deploy/_common.sh QIITA_DUCKLAKE_VERSION differs from the data plane's "
+        "DUCKLAKE_CATALOG_VERSION: the lake scripts would attach the catalog at another format."
+    )
+    assert _one(_PY_DUCKLAKE_VERSION_RE, INTEGRATION_PG_ENV) == expected, (
+        "tests/integration/_pg_env.py DUCKLAKE_VERSION differs from the data plane's "
+        "DUCKLAKE_CATALOG_VERSION: the integration tests would attach at another format."
+    )
+
+
+def test_every_ducklake_attach_names_the_catalog_version() -> None:
+    """An ATTACH that leaves DUCKLAKE_VERSION out creates a catalog at the extension's
+    default format, which on DuckDB 2.0 is 1.1, not the 1.0 production runs."""
+    hits = subprocess.run(
+        [
+            "git",
+            "grep",
+            "-n",
+            "-F",
+            "ATTACH 'ducklake:",
+            "--",
+            "*.rs",
+            "*.py",
+            "*.sh",
+            f":!{Path(__file__).relative_to(REPO_ROOT)}",
+        ],
+        cwd=REPO_ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.splitlines()
+    # The data plane, both lake scripts and both integration attaches, at least.
+    assert len(hits) >= 5, f"found only {hits!r}; the search no longer sees the attach sites"
+    missing = []
+    for hit in hits:
+        path, line, _ = hit.split(":", 2)
+        lines = (REPO_ROOT / path).read_text().splitlines()
+        start = int(line) - 1
+        statement = "\n".join(lines[start : start + _ATTACH_STATEMENT_LINES])
+        if "DUCKLAKE_VERSION" not in statement:
+            missing.append(f"{path}:{line}")
+    assert not missing, f"DuckLake ATTACH without DUCKLAKE_VERSION at {missing}"
 
 
 @pytest.mark.parametrize(

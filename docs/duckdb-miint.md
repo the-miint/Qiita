@@ -89,7 +89,7 @@ Which scans skip and which raise depends on the miint build ([insdc_ena](https:/
 
 Local builds need `allow_unsigned_extensions=true` and `LOAD '/path/to/miint.duckdb_extension'`. There is also a companion Python CLI named `miint` (lives under `python/` in the repo) that wraps the extension for `convert`/`transform`/`align` subcommands — not on PyPI; install from a local checkout with `pip install -e python/`.
 
-**In qiita, don't `INSTALL ... FROM community`.** Every component runs the same team-mirror build, single-sourced in [`qiita_common.duckdb_miint`](../qiita-common/src/qiita_common/duckdb_miint.py) (`MIINT_EXTENSION_REPO` overrides for a local/dev build; the mirror build is unsigned, so `allow_unsigned_extensions=true` is always set). On the cluster the extension is **pre-staged once at deploy** into `MIINT_EXTENSION_DIRECTORY` (`scripts/stage-miint-extension.sh`); the CO service, the native SLURM jobs, the compute-readiness probe, and the control plane (`connect_with_miint_staged`) then only `LOAD miint` — no per-job download, no compute-node mirror dependency, no writable-`$HOME` requirement. The client-side `qiita reference load` CLI, which can't reach a deploy-staged dir, does a plain cached `INSTALL` instead. The Rust data plane honors the same `MIINT_EXTENSION_REPO` / `MIINT_EXTENSION_DIRECTORY` env contract independently (it can't import the Python module — keep the two in sync). DuckDB namespaces the staged dir by version + platform, so re-run the stage step on a miint or DuckDB bump.
+**In qiita, don't `INSTALL ... FROM community`.** Every component runs the same team-mirror build, single-sourced in [`qiita_common.duckdb_miint`](../qiita-common/src/qiita_common/duckdb_miint.py) (`MIINT_EXTENSION_REPO` overrides for a local/dev build; the mirror build is unsigned, so `allow_unsigned_extensions=true` is always set). On the cluster the extension is **pre-staged once at deploy** into `MIINT_EXTENSION_DIRECTORY` (`scripts/stage-miint-extension.sh`); the CO service, the native SLURM jobs, the compute-readiness probe, and the control plane (`connect_with_miint_staged`) then only `LOAD miint` — no per-job download, no compute-node mirror dependency, no writable-`$HOME` requirement. The client-side `qiita reference load` CLI, which can't reach a deploy-staged dir, does a plain cached `INSTALL` instead. The Rust data plane honors the same `MIINT_EXTENSION_REPO` / `MIINT_EXTENSION_DIRECTORY` env contract independently (it can't import the Python module — keep the two in sync). DuckDB namespaces the staged dir by version + platform, so re-run the stage step on a miint or DuckDB bump. The mirror publishes one tree per DuckDB release (`v1.5.5/`, `v2.0.0/`); a superseded tree keeps serving but stops receiving builds, so miint fixes reach only the DuckDB release the `v2.0-cyanoptera` line targets.
 
 ## Upstream docs map
 
@@ -258,15 +258,18 @@ COPY writers are invisible to `duckdb_functions()` ([duckdb-miint#196](https://g
 
 **1. The rendered docs — <https://the-miint.github.io/duckdb-miint/writing/>.** Fastest, and correct for everything qiita does today.
 
-**2. The source, when you need certainty** (checking whether docs lag a build, or chasing an `Unknown option` error). Every writer validates options in one `if`/`else if` chain, so the valid set is one grep against a miint checkout — authoritative by construction, because that chain *is* the validator:
+**2. The source, when you need certainty** (checking whether docs lag a build, or chasing an `Unknown option` / `Unrecognized option` error). Each writer's valid set is one grep against a miint checkout at the build you run — authoritative by construction, because what it greps *is* the validator. From [duckdb-miint#368](https://github.com/the-miint/duckdb-miint/pull/368) on, every format declares its options with `DeclareCopyOption` and DuckDB refuses an undeclared name; before it, each writer validated options in one `if`/`else if` chain:
 
 ```bash
-# all option names accepted by a given writer
+# all option names a given writer declares (builds with duckdb-miint#368)
+grep -oE 'DeclareCopyOption\(input, "[a-z_0-9]+"' src/copy_sam.cpp \
+  | grep -oE '"[a-z_0-9]+"' | tr -d '"' | sort -u
+# the same, for builds before it
 grep -oE 'CIEquals\((option\.first|key), "[a-z_0-9]+"\)' src/copy_sam.cpp \
   | grep -oE '"[a-z_0-9]+"' | tr -d '"' | sort -u
 ```
 
-`src/copy_sam.cpp` backs **both** `FORMAT SAM` and `FORMAT BAM`; the others are `copy_ubam.cpp`, `copy_fastq.cpp`, `copy_fasta.cpp`, `copy_biom.cpp`, `copy_newick.cpp`. Run against `97a3fff` (2026-07-30):
+`src/copy_sam.cpp` backs **both** `FORMAT SAM` and `FORMAT BAM`; the others are `copy_ubam.cpp`, `copy_biom.cpp`, `copy_newick.cpp`, and `copy_fastq.cpp` / `copy_fasta.cpp` (whose declarations moved to `copy_format_common.cpp` with #368). Run against `97a3fff` (2026-07-30):
 
 | Writer | Accepted options |
 | --- | --- |
@@ -277,7 +280,7 @@ grep -oE 'CIEquals\((option\.first|key), "[a-z_0-9]+"\)' src/copy_sam.cpp \
 
 **This table is a worked example of the recipe, not a reference to trust** — it is exactly the kind of mirror that rotted this file before. Re-run the grep rather than reading the row. It is included because it already earned its keep: it shows `FORMAT FASTQ` accepts `id_as_sequence_index`, `include_comment` and `qual_offset`, none of which the `FORMAT FASTQ` writer notes below mention — so if those notes look like the complete surface, they aren't.
 
-**Two things that are already safe:** unknown options are **rejected**, not ignored (`COPY … (FORMAT BAM, SEQUENCEDATA 'x')` → `Binder Error: Unknown option for COPY FORMAT SAM: SEQUENCEDATA`), so a typo cannot silently no-op. And a `BinderException` naming one required option is proof a full option list exists — go read it, don't just add the one it named.
+**Two things that are already safe:** unknown options are **rejected**, not ignored (`COPY … (FORMAT BAM, SEQUENCEDATA 'x')` → `Binder Error: Unknown option for COPY FORMAT SAM: SEQUENCEDATA`; from duckdb-miint#368 on, DuckDB's `Unrecognized option "x"` with the closest names), so a typo cannot silently no-op. **One exception on DuckDB 2.0:** DuckDB's own COPY options (`ROW_GROUP_SIZE_BYTES`, …) are taken by DuckDB before the writer sees them, so for a miint format they are accepted and do nothing — `COPY … (FORMAT BIOM, ROW_GROUP_SIZE_BYTES '64MB')` succeeds where DuckDB 1.5.5 refused it ([duckdb-miint#373](https://github.com/the-miint/duckdb-miint/issues/373), qiita-verified 2026-10-28 on mirror build `72e66a3`). And a `BinderException` naming one required option is proof a full option list exists — go read it, don't just add the one it named.
 
 **Reads BAM vs alignment BAM — use the right one.** `FORMAT SAM` / `FORMAT BAM` is an ALIGNMENT writer: it takes HTSlib-style alignment columns, and by default writes SEQ/QUAL as `*` (pass `SEQUENCE_DATA` to fill them — see the writer notes below). It still can't write a *reads/uBAM*: even with `SEQUENCE_DATA` it emits alignment records under an `@SQ` header, not headerless unaligned reads. For an **unaligned reads BAM** use **`FORMAT UBAM`** (duckdb-miint#156, shipped in #157): it writes `read_id`/`sequence1`/`qual1` as name/SEQ/QUAL with no `@SQ` header, takes a `READ_GROUP {…}` struct and a `TAGS {tag: column}` map for per-read integer tags. `lima_export` uses it to build the CCS BAM lima needs (`@RG … DS:READTYPE=CCS`, a per-read `zm` tag); its call is `_UBAM_COPY_SQL`, the single place that shape lives.
 
@@ -305,7 +308,7 @@ grep -oE 'CIEquals\((option\.first|key), "[a-z_0-9]+"\)' src/copy_sam.cpp \
 - **NULL or empty-string ids are refused** (`InvalidInputException`), and the failed write leaves **no file behind**.
 - **It refuses to overwrite an existing file** — `IOException: Cannot overwrite existing file '…'. Delete it first…` — unlike the Parquet COPY, which replaces silently. This applies to any target, including a `.partial` sibling left by a killed process, so an atomic-write caller must clear its own partials or every retry fails on one.
 - **An empty relation writes a valid, readable file** (0 rows back through `read_biom`), so a legitimately empty result needs no special case.
-- Options are `COMPRESSION` (`'gzip'`/`'gz'`/`'none'`, default gzip), `GENERATED_BY` (default `miint` — the library, not the caller), and `ID` (default the literal `No Table ID`). Unknown options are rejected, not ignored.
+- Options are `COMPRESSION` (`'gzip'`/`'gz'`/`'none'`, default gzip), `GENERATED_BY` (default `miint` — the library, not the caller), and `ID` (default the literal `No Table ID`). Unknown options are rejected, not ignored — DuckDB's own COPY options excepted (duckdb-miint#373, above).
 - **gzip can make a small table BIGGER**: 200 non-zero entries measured 37 808 bytes gzipped against 30 336 uncompressed (per-dataset HDF5 deflate overhead). It is still the right default at real table sizes.
 - `read_biom(path)` reads it back as `(sample_id, feature_id, value)` — the same triple, one row per non-zero entry — which is the only round trip available from SQL.
 
@@ -313,7 +316,7 @@ grep -oE 'CIEquals\((option\.first|key), "[a-z_0-9]+"\)' src/copy_sam.cpp \
 - **Required columns, BY NAME: `node_index` and `parent_index` only** — each missing one raises `BinderException: COPY FORMAT NEWICK requires '<col>' column`. `name`, `branch_length` and `edge_id` are optional, and any other column (`is_tip`, `filepath`) is silently ignored, so `shear_tree`'s output can be passed through as-is.
 - **`EDGE_IDS` defaults to ON whenever an `edge_id` column is present** (`copy_newick.cpp`: the flag is set from the column's presence when the option is not given), writing jplace-style `{N}` annotations after each branch length: `(t1:0.3{11},t3:0.4{13});`. Documented upstream, and worth knowing anyway because **`shear_tree`'s output carries `edge_id`, so passing it straight through — the shape `docs/phylogeny.md` reaches for — writes annotated rather than plain Newick.** Suppress with `EDGE_IDS false` or by not selecting the column: measured byte-identical (`((t1:0.2,t2:0.3)innerA:0.1,t3:0.4);`), as is passing an all-NULL `edge_id`. Prefer omitting the column — an option can be forgotten, a missing column cannot.
 - Surviving internal-node names are written; a root whose `name` is the empty string writes as an unnamed root.
-- Options are `COMPRESSION` (auto-detected from a `.gz` path, so `TO 'x.nwk.gz'` needs no option), `EDGE_IDS` (BOOLEAN), and `PLACEMENTS` (a table/view name, whose schema is validated at bind time). Unknown options are rejected, not ignored.
+- Options are `COMPRESSION` (auto-detected from a `.gz` path, so `TO 'x.nwk.gz'` needs no option), `EDGE_IDS` (BOOLEAN), and `PLACEMENTS` (a table/view name, whose schema is validated at bind time). Unknown options are rejected, not ignored — DuckDB's own COPY options excepted (duckdb-miint#373, above).
 - `read_newick(path)` reads it back, which is the only round trip available from SQL.
 
 ## Internals worth knowing before extending qiita usage

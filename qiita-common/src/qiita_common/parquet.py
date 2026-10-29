@@ -23,8 +23,8 @@ from pathlib import Path
 # ~64 MB instead of buffering one giant group — sharper row-group predicate pushdown
 # (tighter per-group min/max) and lower peak write memory. It requires
 # `SET preserve_insertion_order=false` on the writing connection (DuckDB errors at bind
-# time otherwise). A COPY whose query ends in ORDER BY does not get the cap; a sorted
-# writer of wide rows adds the row count `sorted_row_group_size` gives it.
+# time otherwise). A sorted writer of wide rows also adds the row count
+# `sorted_row_group_size` gives it.
 
 
 def _copy_options(codec: str, level: int | None = None) -> str:
@@ -74,11 +74,14 @@ def sorted_row_group_size(bytes_per_row: int) -> int:
     """`ROW_GROUP_SIZE` for a COPY whose query ends in ORDER BY, given its rows' mean width.
 
     A sorted COPY writes one file in sort order, each row group a contiguous run of the
-    key, but DuckDB 1.5.5 cuts those row groups by row count alone. ROW_GROUP_SIZE_BYTES
-    does not apply, and a group closes at the first whole vector at or past ROW_GROUP_SIZE
-    (122,880 rows unless set), so 122,880 HiFi reads become one ~3.7 GB row group. The
+    key. DuckDB 1.5.5 cut those row groups by row count alone: ROW_GROUP_SIZE_BYTES did
+    not apply, and a group closed at the first whole vector at or past ROW_GROUP_SIZE
+    (122,880 rows unless set), so 122,880 HiFi reads became one ~3.7 GB row group. The
     writer compresses each row group on one thread, so a level-16 write of such a group
-    runs on one core however many threads the connection has.
+    ran on one core however many threads the connection had. DuckDB 2.0 applies the
+    byte cap to a sorted COPY too (`test_a_sorted_copy_honours_the_byte_cap`), and with
+    both the smaller wins; this count, just under the cap, keeps the vector-aligned
+    groups the sorted writers had on 1.5.5.
 
     Returns the most whole vectors that fit ROW_GROUP_SIZE_BYTES, never more rows than
     DuckDB's default (so narrow rows keep the groups an unsorted write would give them) and

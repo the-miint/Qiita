@@ -14,7 +14,7 @@ dependencies = [
     # behaviour is pinned by tests that execute it here rather than in a
     # consumer's suite. Exact, and equal to every other DuckDB pin in the repo:
     # see tests/test_duckdb_version_sync.py.
-    "duckdb==1.5.5",
+    "duckdb==2.0.0",
 ]
 
 [dependency-groups]
@@ -34,6 +34,11 @@ packages = ["src/qiita_common"]
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 asyncio_mode = "auto"
+filterwarnings = [
+    # DuckDB copies the whole result before handing it over as Arrow from
+    # `execute()`; see qiita_control_plane.miint.arrow_batches.
+    "error:Arrow output on a DB-API result:UserWarning",
+]
 
 [tool.ruff]
 extend = "../ruff.toml"

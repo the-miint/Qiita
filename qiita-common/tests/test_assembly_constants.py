@@ -58,6 +58,16 @@ def test_absent_file_registers_the_table_empty_with_the_declared_types(tmp_path)
     ]
 
 
+def test_the_caller_s_next_relational_call_is_not_refused(tmp_path):
+    """The control plane streams from the same connection right after this, through
+    `con.sql`, which DuckDB refuses while a result is left part-read."""
+    path = tmp_path / "contig_attributes.tsv"
+    path.write_text(f"{_HEADER}\ns1\ts1\tyes\t29\t\n")
+    conn = duckdb.connect(":memory:")
+    register_contig_attribute_table(conn, path)
+    assert conn.sql("SELECT contig_id FROM contig_attribute").fetchall() == [("s1",)]
+
+
 def test_empty_cells_read_as_null_doubles(tmp_path):
     """The shape the DEFAULT assembler always writes.
 

@@ -11,7 +11,7 @@ dependencies = [
     "httpx>=0.28",
     # DuckDB+miint run in-process here: the LocalBackend in dev/test, and native
     # `module:` steps under SLURM, which run from this environment.
-    "duckdb==1.5.5",
+    "duckdb==2.0.0",
     # The sharded reference-index build steps (build_routing_index,
     # build_minimap2_index, build_bowtie2_index) are `module:` (native) steps that
     # stream reference chunks from the data plane over Arrow Flight via
@@ -58,6 +58,11 @@ allow-direct-references = true
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 asyncio_mode = "auto"
+filterwarnings = [
+    # DuckDB copies the whole result before handing it over as Arrow from
+    # `execute()`; see qiita_control_plane.miint.arrow_batches.
+    "error:Arrow output on a DB-API result:UserWarning",
+]
 
 [tool.ruff]
 extend = "../ruff.toml"

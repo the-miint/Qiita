@@ -26,7 +26,6 @@ import base64
 import contextlib
 import re
 import sys
-from collections.abc import Iterator
 from pathlib import Path
 from typing import get_args
 
@@ -46,6 +45,7 @@ from qiita_common.assembly_constants import (
     KIND_UNBINNED,
 )
 from qiita_common.chunking import reassemble_chunks_expr
+from qiita_common.duckdb_relation import registered
 from qiita_common.models import AssemblySampleState
 from qiita_common.parquet import PARQUET_MEDIA_TYPE
 from qiita_common.sql import sql_string_literal
@@ -135,15 +135,6 @@ def _mint_run_ticket(
     return base64.b64decode(resp["ticket"])
 
 
-@contextlib.contextmanager
-def _registered(con, relation: str, obj) -> Iterator[str]:
-    con.register(relation, obj)
-    try:
-        yield relation
-    finally:
-        con.unregister(relation)
-
-
 def _stage_run_table(con, flight_client, ticket: bytes, *, relation: str, table_sql) -> None:
     """Drain one run-scoped DoGet into the table `table_sql(source)` builds.
 
@@ -156,7 +147,7 @@ def _stage_run_table(con, flight_client, ticket: bytes, *, relation: str, table_
         read_options=ipc.IpcReadOptions(ensure_alignment=ipc.Alignment.DataTypeSpecific)
     )
     reader = flight_client.do_get(flight.Ticket(ticket), options).to_reader()
-    with _registered(con, relation, reader) as source:
+    with registered(con, relation, reader) as source:
         con.execute(table_sql(source))
 
 
@@ -394,7 +385,7 @@ def _export_sample(
     _drop_sample_tables(con)
 
     membership = _fetch_membership(args.base_url, token, prep_sample_idx=ps, processing_idx=run)
-    with _registered(con, "membership_arrow", membership):
+    with registered(con, "membership_arrow", membership):
         con.execute("CREATE TEMP TABLE membership AS SELECT * FROM membership_arrow")
 
     def _ticket(table: str) -> bytes:
@@ -423,7 +414,7 @@ def _export_sample(
     )
     _check_streams_match_membership(con, prep_sample_idx=ps)
     _select_genomes(con, args, accession=sample["biosample_accession"])
-    (selected,) = con.execute("SELECT count(*) FROM genome_sel").fetchone()
+    [(selected,)] = con.execute("SELECT count(*) FROM genome_sel").fetchall()
     if not selected:
         return 0
 
