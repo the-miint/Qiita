@@ -9,7 +9,7 @@ bytes. Why the id needs each is in `assembly_hash`.
 
 The third pins that one multi-path scan closes each file once it has read it,
 which `stage_local_fasta` relies on when it hands its whole manifest to one call.
-The reading page does not state it.
+The reading page does not state it (duckdb-miint#378).
 
 Runs against the team-mirror miint build staged by the session-autouse fixture in
 tests/conftest.py (`open_miint_conn` is LOAD-only).
