@@ -109,9 +109,8 @@ const REPLACE_KEY_TABLES: &[ReplaceKey] = &[
     },
     // The myloasm provenance tables (`ducklake::ensure_myloasm_tables`), keyed
     // like assembly_membership and for the same reason. All six read their keys
-    // from `myloasm_run`, which every myloasm run writes at least one row of
-    // (`read_myloasm_run` requires the run's log), so an empty table in a re-run
-    // still supersedes the earlier run's rows.
+    // from `myloasm_run`; why that table is never empty is at
+    // `qiita_common.myloasm_constants.MYLOASM_RUN_TABLE`.
     ReplaceKey::own("myloasm_run", &["prep_sample_idx", "processing_idx"]),
     ReplaceKey::borrows("myloasm_contig", "myloasm_run"),
     ReplaceKey::borrows("myloasm_layout", "myloasm_run"),
@@ -166,8 +165,8 @@ impl ReplaceKey {
         }
     }
 
-    /// An entry whose delete keys come from `key_source`'s incoming files, keyed
-    /// on the run.
+    /// An entry keyed on the run, `(prep_sample_idx, processing_idx)`, whose
+    /// delete keys come from `key_source`'s incoming files.
     const fn borrows(table: &'static str, key_source: &'static str) -> Self {
         Self {
             table,

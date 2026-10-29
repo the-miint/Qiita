@@ -14,12 +14,15 @@ places depending on how the run was made:
   `sequence_idx` builds it with `read_names_from_sequence_idx`; an earlier run's
   tree, named by the sequencer's `read_id`, needs a lookup against the lake.
 - `CONTIG_FEATURE_TABLE (contig_id VARCHAR, feature_idx BIGINT)`: each primary
-  contig's minted `feature_idx`, keyed on myloasm's `u<N>ctg` name.
+  contig's minted `feature_idx`, keyed on myloasm's `u<N>ctg` name. A repeated
+  identical pair is allowed (the transform deduplicates); two different
+  `feature_idx` for one contig are refused.
 
 Everything that could make a row wrong is checked before anything is written, and
-fails the step with the offending names: a read the lookup does not resolve, a
-contig name that is not myloasm's, a repeated `contig_num`, a contig referenced but
-not in the run, a primary contig with no feature or a feature on anything else.
+fails the step with the offending names: a dump with no `myloasm_run` row, a read
+the lookup does not resolve, a contig name that is not myloasm's, a repeated
+`contig_num`, a contig referenced but not in the run, a primary contig with no
+feature or a feature on anything else.
 """
 
 from __future__ import annotations
@@ -35,10 +38,10 @@ from ..miint import PARQUET_OPTS_AT_REST
 READ_NAME_TABLE = "myloasm_read_name"
 CONTIG_FEATURE_TABLE = "myloasm_contig_feature"
 
-# Every read name the dump uses, from every column that holds one. NULL link ends
-# (myloasm 0.6.0 writes none) name no read.
+# Every read name the dump uses, from every column that holds one. A NULL link end
+# names no read (docs/duckdb-miint.md, the `read_myloasm_*` entry).
 _RAW_READ_NAMES = "myloasm_raw_read_name"
-_READ_NAME_COLUMNS = (
+READ_NAME_COLUMNS = (
     ("myloasm_mapping", "read_id"),
     ("myloasm_layout", "read_id"),
     ("myloasm_split", "read_id"),
@@ -54,6 +57,8 @@ _CONTIG_REFERENCE_COLUMNS = (
     ("myloasm_link", "to_contig_id"),
 )
 _CONTIG_NAME_RE = "^u([0-9]+)ctg$"
+# miint's `dereplication_status` for the contigs a run hashes into features.
+_PRIMARY = "primary"
 # How many offending names an error quotes.
 _SHOWN = 10
 
@@ -88,7 +93,7 @@ def register_raw_tables(conn: duckdb.DuckDBPyConnection, raw_dir: Path) -> None:
         f"CREATE TEMP VIEW {_RAW_READ_NAMES} AS "
         + " UNION ".join(
             f"SELECT {column} AS read_id FROM {_raw(table)} WHERE {column} IS NOT NULL"
-            for table, column in _READ_NAME_COLUMNS
+            for table, column in READ_NAME_COLUMNS
         )
     )
 
@@ -122,6 +127,13 @@ def _require_none(conn: duckdb.DuckDBPyConnection, sql: str, message: str) -> No
 
 
 def _validate(conn: duckdb.DuckDBPyConnection) -> None:
+    # `myloasm_run` is the replace-key source for all six tables
+    # (`qiita_common.myloasm_constants`), so a dump without a run row could not
+    # supersede an earlier registration of the same run.
+    (runs,) = conn.execute(f"SELECT count(*) FROM {_raw('myloasm_run')}").fetchone()
+    if runs == 0:
+        raise ValueError("myloasm provenance dump has no myloasm_run row")
+
     contig = _raw("myloasm_contig")
     every_name = " UNION ".join(
         [f"SELECT contig_id AS name FROM {contig}"]
@@ -170,14 +182,14 @@ def _validate(conn: duckdb.DuckDBPyConnection) -> None:
     _require_none(
         conn,
         f"SELECT f.contig_id FROM {CONTIG_FEATURE_TABLE} f ANTI JOIN {contig} c "
-        "ON c.contig_id = f.contig_id AND c.dereplication_status = 'primary' "
+        f"ON c.contig_id = f.contig_id AND c.dereplication_status = '{_PRIMARY}' "
         "ORDER BY f.contig_id",
         "feature_idx given for contig(s) that are not this run's primary contigs",
     )
     _require_none(
         conn,
         f"SELECT c.contig_id FROM {contig} c ANTI JOIN {CONTIG_FEATURE_TABLE} f "
-        "ON f.contig_id = c.contig_id WHERE c.dereplication_status = 'primary' "
+        f"ON f.contig_id = c.contig_id WHERE c.dereplication_status = '{_PRIMARY}' "
         "ORDER BY c.contig_id",
         "primary contig(s) with no feature_idx",
     )

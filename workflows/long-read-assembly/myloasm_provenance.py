@@ -7,16 +7,15 @@ Run by assemble.sh's myloasm branch, after the splitter:
 
 The assembler's output tree is not a declared output of the assemble step, so no
 later step can mount it. What `assembly_load` needs from it is written here, into
-`genomes_dir`, which is. Each table is written VERBATIM: miint's columns, with
+`genomes_dir`, which is. Each table is written verbatim: miint's columns, with
 myloasm's own read and contig names. Re-keying onto our identifiers happens in the
 orchestrator's `jobs/_myloasm_provenance.py`, where the run's `feature_idx` values
-are known; keeping this side a plain dump lets the one-off recovery of earlier
-runs, which reads the same trees outside the container, share that transform.
+are known; keeping this side a plain dump lets a tree read outside the container
+share that transform.
 
 What the tables are, and the lake tables they become, is
 `qiita_common.myloasm_constants`; this container cannot import it, so `READERS`
-restates the table -> reader map and `tests/test_myloasm_provenance.py` pins the two
-together.
+restates the table -> reader map and a test pins the two together.
 """
 
 from __future__ import annotations

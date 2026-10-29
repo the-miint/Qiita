@@ -627,7 +627,7 @@ _MYLOASM_SEQUENCES = {
 def myloasm_inputs(tmp_path):
     """A myloasm run: assembly_hash / mint-features outputs over the fixture's
     primary contigs, and genomes_dir carrying the provenance dump."""
-    from helpers import myloasm_raw_dir
+    from myloasm_fixture import myloasm_raw_dir
     from qiita_common.myloasm_constants import MYLOASM_RAW_DIR
 
     from qiita_compute_orchestrator.jobs.assembly_load import Inputs

@@ -41,6 +41,9 @@ A myloasm run's genomes_dir also carries the assemble step's provenance dump
 Parquets: `_myloasm_provenance` re-keys them, with the reads' names taken as their
 `sequence_idx` and each primary contig's `feature_idx` taken from this run's own
 `bin_map` x `id_map`. A run without the dump (hifiasm_meta) stages none of them.
+The directory's presence is a sound test for a myloasm run: assemble.sh writes the
+dump for every non-empty myloasm assembly or fails the step, and an empty one ends
+the ticket as no-data at assembly_hash, before this step.
 """
 
 from __future__ import annotations
@@ -324,7 +327,7 @@ def _write_myloasm_provenance(
     read_names_from_sequence_idx(conn)
     conn.execute(
         f"CREATE TEMP TABLE {CONTIG_FEATURE_TABLE} AS "
-        "SELECT DISTINCT bm.contig_id, im.feature_idx "
+        "SELECT bm.contig_id, im.feature_idx "
         "FROM read_parquet(?) bm JOIN id_map im ON bm.read_id = im.read_id",
         [str(bin_map_path)],
     )

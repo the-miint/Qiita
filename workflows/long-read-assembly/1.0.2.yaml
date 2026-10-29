@@ -178,10 +178,10 @@ steps:
     # time every node reported 0 idle CPUs with 60-354 GiB free. 250 preserves the
     # slot rather than demonstrating one, and stops 3.97 GiB above this cohort's max.
     # An earlier and larger cohort — 59 first attempts at 192, of which 30 OOMed —
-    # peaked at 259.3 GiB on its 384 GiB retries, so a sample in that range still
+    # peaked at 259.3 GiB on its 384 GiB retries, so a prep_sample in that range still
     # escalates here. That peak is THIS profile's, not the other one's: `assembler`
     # is a closed two-value enum, no 1.0.0 work ticket ever recorded myloasm (its
-    # first run is 2026-09-02, under this version), and the version's default is
+    # first run is 2026-09-02, under 1.0.1), and the version's default is
     # hifiasm_meta — so with the only alternative ruled out directly, every 1.0.0
     # assemble ran hifiasm_meta whether the key was recorded or defaulted. Which
     # matters because the two are now sized separately: 259.3 constrains the
@@ -190,8 +190,8 @@ steps:
     # So 250 is knowingly below a hifiasm_meta peak, and covering it would cost the
     # second slot: the smallest allocation above 259.3 is 260, and 260 x 1024 x 2 =
     # 532480 MB exceeds the node, so this step would drop from two per node to one.
-    # The trade taken is one escalation rung for a sample in that range against
-    # halving the step's per-node occupancy for every sample that is not. The input
+    # The trade taken is one escalation rung for a prep_sample in that range against
+    # halving the step's per-node occupancy for every prep_sample that is not. The input
     # scale behind that peak was not recorded and its sacct rows are gone, so it
     # cannot be re-sized against more precisely than this.
     #
@@ -339,7 +339,7 @@ steps:
   # unbinned_qa.tsv (assembly_load joins each pair in DuckDB). The classes are scored
   # SEPARATELY because the file a row came from is what gives it a `kind`; checkm.sh
   # carries why that beats one merged directory. Nothing to score → empty
-  # checkm_dir (exit 0). The residue run is what 1.0.1 adds over 1.0.0; this file's
+  # checkm_dir (exit 0). The residue run is what 1.0.1 adds over 1.0.0; 1.0.1's
   # description says what it is for.
   - step: checkm
     step_type: singleton
@@ -366,7 +366,7 @@ steps:
       QIITA_CHECKM_DB: checkm_data
       MIINT_EXTENSION_DIRECTORY: duckdb-ext
     outputs: [checkm_dir]
-    # Measured on this version's first cohort: nine runs, each scoring whichever of the
+    # Measured on 1.0.1's first cohort: nine runs, each scoring whichever of the
     # three passes (refined MAGs, circular contigs (LCGs), unbinned residue >=300 kb)
     # its assembly had subjects for. Subject counts are the row counts of the three
     # per-pass lineage TSVs named above. MaxRSS and Elapsed are `sacct` on the `.batch`
@@ -407,7 +407,7 @@ steps:
     # 1 subject cost 31.78 GiB and 445 cost 38.88 — a large fixed floor plus a small
     # sublinear term. That floor is why the margin is sized as headroom over a measured
     # peak rather than as a scaling allowance; how RSS behaves past 445 is unmeasured.
-    # (`jobs/assembly_coverage.py` declines to re-size on a larger sample for the
+    # (`jobs/assembly_coverage.py` declines to re-size on a larger prep_sample for the
     # opposite reason: there the question was the shape of a distribution, not headroom
     # over a peak.)
     #
@@ -493,7 +493,9 @@ steps:
     # same 16 GiB allocation without the headroom subtracted — was not tried, so the
     # headroom's share is a candidate for the fix rather than an established cause.
     # Re-sizing that helper against real MaxRSS is the route back down. Runs take
-    # 2-23 s, so the allocation is held briefly.
+    # 2-23 s, so the allocation is held briefly. The myloasm re-keying this version
+    # adds was not measured in this step; its largest input, the read mappings, runs
+    # to about 1.4M rows per prep_sample on production myloasm trees.
     baseline_resources:
       cpu: 4
       mem_gb: 32

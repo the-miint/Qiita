@@ -147,11 +147,10 @@ _None yet._
   tables.** (#TBD)
   - The data plane creates `myloasm_contig`, `myloasm_layout`, `myloasm_mapping`,
     `myloasm_link`, `myloasm_split` and `myloasm_run` on its next start; nothing to run.
-  - The assemble image lands under a NEW filename, `long-read-assembly-assemble-1.0.2.sif`,
+  - The assemble image lands under a new filename, `long-read-assembly-assemble-1.0.2.sif`,
     built on deploy. **Keep `long-read-assembly-assemble-1.0.0.sif`**: 1.0.0 and 1.0.1 still
     name it and no spec builds it any more (`sif-build.d/assemble.env`).
-  - Runs completed before this deploy have no provenance rows; a separate one-off recovery
-    loads them from the assembler trees still in the ticket workspaces.
+  - Runs completed before this deploy have no provenance rows.
 
 ## Deployed history
 

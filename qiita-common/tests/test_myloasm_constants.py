@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import re
+from pathlib import Path
+
 import pytest
 
 from qiita_common.myloasm_constants import (
@@ -31,6 +34,19 @@ def test_the_six_tables_are_named_singular_and_cover_every_reader():
         "read_myloasm_splits",
         "read_myloasm_run",
     }
+
+
+def test_the_data_plane_creates_and_lists_exactly_these_tables():
+    """A table the DDL creates but the data plane's own list (which the
+    replace-on-re-run registry tests walk) or this contract lacks would pile up a
+    copy of its rows on every re-run, and fail no other test."""
+    src = (
+        Path(__file__).resolve().parents[2] / "qiita-data-plane" / "src" / "ducklake.rs"
+    ).read_text()
+    created = set(re.findall(r"CREATE TABLE IF NOT EXISTS qiita_lake\.(myloasm_\w+)", src))
+    (listed_src,) = re.findall(r"MYLOASM_TABLES: &\[&str\] = &\[(.*?)\];", src, re.S)
+    listed = set(re.findall(r'"(myloasm_\w+)"', listed_src))
+    assert created == listed == set(MYLOASM_TABLES)
 
 
 @pytest.mark.parametrize("table", sorted(MYLOASM_TABLES))

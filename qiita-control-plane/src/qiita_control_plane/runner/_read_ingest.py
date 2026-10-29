@@ -639,13 +639,11 @@ def _copy_masked_to_fastq(con: duckdb.DuckDBPyConnection, dest: Path) -> int:
     to gzip FASTQ at `dest`, returning the record count.
 
     Each record is named by its `sequence_idx`, not its `read_id` (the CLAUDE.md
-    read-identity rule): whatever the assembler reports per read then joins
-    straight back to `read`. The miint writer takes the name from a column called
-    `read_id`, hence the alias. Single-end long reads: sequence2/qual2 are NULL, so
-    FORMAT FASTQ writes a single-end fastq. Column order is the one the miint
-    writer requires."""
+    read-identity rule). miint's FASTQ writer contract is
+    https://the-miint.github.io/duckdb-miint/writing/; it names a record from the
+    `read_id` column, hence the alias."""
     (count,) = con.execute(
-        "COPY (SELECT CAST(sequence_idx AS VARCHAR) AS read_id, "
+        "COPY (SELECT sequence_idx AS read_id, "
         "sequence1, qual1, sequence2, qual2 FROM masked) "
         f"TO '{validate_parquet_path(dest)}' (FORMAT FASTQ, COMPRESSION 'gzip')"
     ).fetchone()

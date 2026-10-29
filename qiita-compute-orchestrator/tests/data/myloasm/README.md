@@ -13,4 +13,4 @@ built and how to regenerate the files.
 
 Text files are stored gzipped with `.gz` added. myloasm itself gzips
 `3-mapping/map_to_unitigs.paf.gz` and both `read_coverages.txt.gz`, so those keep their
-names. `tests/helpers.py::myloasm_output_dir` lays a directory out the way myloasm writes it.
+names. `tests/myloasm_fixture.py::myloasm_output_dir` lays a directory out the way myloasm writes it.

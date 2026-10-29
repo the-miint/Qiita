@@ -910,8 +910,8 @@ pub(crate) const MYLOASM_TABLES: &[&str] = &[
 /// `sequence_idx` and a contig a `contig_num` (plus `feature_idx` for a primary
 /// contig). What each column means, and why `contig_num` identifies a contig
 /// within a run, is stated once in `qiita_common.myloasm_constants`, which also
-/// holds the column lists the writer uses; `tests/test_myloasm_constants.py`
-/// pins those against the DDL below.
+/// holds the column lists the writer uses; a qiita-common test pins those, and
+/// this table list, against the DDL below.
 ///
 /// Every table is replaced per run at register time, keyed on
 /// `(prep_sample_idx, processing_idx)` read from `myloasm_run`
@@ -980,8 +980,8 @@ pub fn ensure_myloasm_tables(conn: &Connection) -> Result<(), Box<dyn std::error
             differing_snpmers BIGINT
         );
 
-        -- The overlap evidence and the two end reads are NULL for a run made by a
-        -- myloasm that did not write them on its graph edges (0.6.0).
+        -- The overlap evidence and the two end reads are nullable: see the
+        -- `read_myloasm_*` entry in docs/duckdb-miint.md.
         CREATE TABLE IF NOT EXISTS qiita_lake.myloasm_link (
             prep_sample_idx BIGINT NOT NULL,
             processing_idx BIGINT NOT NULL,

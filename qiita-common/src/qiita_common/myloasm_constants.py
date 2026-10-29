@@ -25,8 +25,8 @@ of how myloasm builds contigs, not a documented contract, and `N` means nothing
 across runs. The transform therefore checks uniqueness per run rather than
 assuming it, and every key that uses `contig_num` also carries the run.
 
-Neither component can import the other, so each table's column list here is pinned
-against `qiita-data-plane/src/ducklake.rs` by `tests/test_myloasm_constants.py`.
+Neither component can import the other, so a test pins each table's column list
+here against `qiita-data-plane/src/ducklake.rs`.
 """
 
 from __future__ import annotations
@@ -41,7 +41,7 @@ MYLOASM_RAW_DIR = "myloasm"
 # Every table is replaced per assembly run at registration. `myloasm_run` is the
 # key source for all six: every myloasm run writes at least one log, which
 # `read_myloasm_run` requires, so its file always names the run even when another
-# table is empty.
+# table is empty. The transform refuses a dump without a run row.
 MYLOASM_RUN_TABLE = "myloasm_run"
 MYLOASM_RUN_KEY = ("prep_sample_idx", "processing_idx")
 
@@ -63,6 +63,12 @@ class MyloasmTable:
 
 # Column meanings are miint's (the reading docs linked above); the only renames are
 # the identity columns: `contig_id` -> `contig_num`, `read_id` -> `sequence_idx`.
+# One row is miint's row: a contig (contig), a read piece in a contig's layout
+# (layout), a read piece's mapping to a contig (mapping), a graph edge (link), a
+# split breakpoint (split), and a myloasm log in the run's output tree (run). The
+# run key is therefore not unique in `myloasm_run` by construction: myloasm writes
+# one log per invocation, and the assemble step invokes it once per attempt into a
+# fresh directory, so a run has one row in practice.
 MYLOASM_TABLES: dict[str, MyloasmTable] = {
     "myloasm_contig": MyloasmTable(
         reader="read_myloasm_contigs",
@@ -188,6 +194,9 @@ def myloasm_projection(table: str, sources: dict[str, str]) -> str:
     and a stray one would be dropped in silence, and both would surface only as a
     register-files rejection at the end of an assembly. Every column is CAST so an
     empty table's Parquet still carries the lake types.
+
+    Each source is SQL pasted in as is, so it must be built from constants and
+    integers, never from text a caller or a file supplied.
     """
     spec = MYLOASM_TABLES[table]
     if set(sources) != set(spec.column_names):

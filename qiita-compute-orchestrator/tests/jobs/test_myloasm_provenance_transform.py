@@ -14,8 +14,9 @@ from pathlib import Path
 
 import duckdb
 import pytest
-from helpers import (
+from myloasm_fixture import (
     MYLOASM_FIRST_SEQUENCE_IDX,
+    MYLOASM_FIXTURE_ROWS,
     MYLOASM_FIXTURE_VERSIONS,
     myloasm_raw_dir,
     myloasm_read_name_map,
@@ -35,14 +36,6 @@ _RUN = 77
 # The fixture's three primary contigs, given feature_idx values the way the run's
 # assembly_hash -> mint-features would.
 _PRIMARY_FEATURES = {"u491ctg": 1001, "u912ctg": 1002, "u982ctg": 1003}
-_ROWS = {
-    "myloasm_contig": 5,
-    "myloasm_layout": 173,
-    "myloasm_mapping": 1085,
-    "myloasm_link": 2,
-    "myloasm_split": 40,
-    "myloasm_run": 1,
-}
 
 
 def _contig_feature(conn: duckdb.DuckDBPyConnection, features: dict[str, int]) -> None:
@@ -96,7 +89,7 @@ def test_sequence_idx_named_reads_stage_all_six_tables_in_the_lake_shape(
         path = written[table]
         assert path == tmp_path / "staging" / f"{table}.parquet"
         assert [r[:2] for r in _q(f"DESCRIBE FROM '{path}'")] == list(spec.columns), table
-        assert _q(f"SELECT count(*) FROM '{path}'") == [(_ROWS[table],)], table
+        assert _q(f"SELECT count(*) FROM '{path}'") == [(MYLOASM_FIXTURE_ROWS[table],)], table
         assert _q(f"SELECT DISTINCT prep_sample_idx, processing_idx FROM '{path}'") == [
             (_PREP_SAMPLE, _RUN)
         ], table
@@ -254,4 +247,13 @@ def test_a_missing_raw_table_fails(tmp_path: Path) -> None:
     raw = myloasm_raw_dir(tmp_path / "in", "0.7.0", sequence_idx_names=True)
     (raw / "myloasm_split.parquet").unlink()
     with pytest.raises(FileNotFoundError, match="myloasm_split"):
+        _stage(tmp_path, raw)
+
+
+def test_a_dump_without_a_run_row_fails(tmp_path: Path) -> None:
+    """`myloasm_run` names the run every table is replaced on, so a dump without
+    one could not supersede an earlier registration of the same run."""
+    raw = myloasm_raw_dir(tmp_path / "in", "0.7.0", sequence_idx_names=True)
+    _rewrite(raw / "myloasm_run.parquet", "SELECT * FROM {src} WHERE false")
+    with pytest.raises(ValueError, match="no myloasm_run row"):
         _stage(tmp_path, raw)

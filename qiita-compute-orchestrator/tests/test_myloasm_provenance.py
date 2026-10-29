@@ -6,7 +6,7 @@ container, after the splitter, and writes each `read_myloasm_*` table verbatim i
 declared output, so no later step can read it; this dump is how its read placements
 reach `assembly_load`.
 
-The behavioural tests EXECUTE the script against the real miint this component's
+The behavioural tests run the script against the real miint this component's
 conftest stages, over committed myloasm 0.6.0 and 0.7.0 output
 (`tests/data/myloasm/`). The static pins cover the wiring that only runs inside the
 built image.
@@ -17,49 +17,33 @@ from __future__ import annotations
 import importlib.util
 import os
 import re
-import subprocess
 import sys
 from pathlib import Path
 
 import duckdb
 import pytest
-from helpers import MYLOASM_FIXTURE_VERSIONS, myloasm_output_dir
+from myloasm_fixture import (
+    MYLOASM_FIXTURE_ROWS,
+    MYLOASM_FIXTURE_VERSIONS,
+    PROVENANCE_SCRIPT,
+    myloasm_output_dir,
+    run_provenance_dump,
+)
 from qiita_common.myloasm_constants import MYLOASM_RAW_DIR, MYLOASM_TABLES
 
 from qiita_compute_orchestrator.miint import open_miint_conn
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _WORKFLOW_DIR = _REPO_ROOT / "workflows" / "long-read-assembly"
-_PROVENANCE_PY = _WORKFLOW_DIR / "myloasm_provenance.py"
 _ASSEMBLE_SH = _WORKFLOW_DIR / "assemble.sh"
 _ASSEMBLE_DEF = _WORKFLOW_DIR / "assemble.def"
 _ASSEMBLE_ENV = _WORKFLOW_DIR / "sif-build.d" / "assemble.env"
 
 _EXIT_CONTRACT_VIOLATION = 64
 
-# Row counts of the committed fixture, from duckdb-miint's own fixture README.
-_FIXTURE_ROWS = {
-    "myloasm_contig": 5,
-    "myloasm_layout": 173,
-    "myloasm_mapping": 1085,
-    "myloasm_link": 2,
-    "myloasm_split": 40,
-    "myloasm_run": 1,
-}
-
-
-def _dump(asm_dir: Path, out_dir: Path) -> subprocess.CompletedProcess[str]:
-    """Run the script the way assemble.sh does."""
-    return subprocess.run(
-        [sys.executable, str(_PROVENANCE_PY), str(asm_dir), str(out_dir)],
-        capture_output=True,
-        text=True,
-        env=dict(os.environ),
-    )
-
 
 def _script_module():
-    spec = importlib.util.spec_from_file_location("myloasm_provenance", _PROVENANCE_PY)
+    spec = importlib.util.spec_from_file_location("myloasm_provenance", PROVENANCE_SCRIPT)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
     sys.path.insert(0, str(_WORKFLOW_DIR))
@@ -77,7 +61,7 @@ def test_every_reader_is_dumped_verbatim(tmp_path: Path, version: str) -> None:
     asm_dir = myloasm_output_dir(tmp_path / "assembler", version)
     out_dir = tmp_path / "genomes" / MYLOASM_RAW_DIR
 
-    result = _dump(asm_dir, out_dir)
+    result = run_provenance_dump(asm_dir, out_dir)
     assert result.returncode == 0, result.stderr
 
     assert sorted(p.name for p in out_dir.iterdir()) == sorted(
@@ -87,11 +71,26 @@ def test_every_reader_is_dumped_verbatim(tmp_path: Path, version: str) -> None:
         for table, spec in MYLOASM_TABLES.items():
             dumped = out_dir / f"{table}.parquet"
             assert con.execute(f"SELECT count(*) FROM '{dumped}'").fetchone() == (
-                _FIXTURE_ROWS[table],
+                MYLOASM_FIXTURE_ROWS[table],
             ), table
             reader_cols = con.execute(f"DESCRIBE FROM {spec.reader}('{asm_dir}')").fetchall()
             dumped_cols = con.execute(f"DESCRIBE FROM '{dumped}'").fetchall()
             assert [c[:2] for c in dumped_cols] == [c[:2] for c in reader_cols], table
+
+
+def test_every_kept_column_already_has_its_lake_type(tmp_path: Path) -> None:
+    """Every reader column the lake keeps under its own name arrives with the lake's
+    type, so the transform's CAST changes nothing for it. A reader that changes a
+    column's type fails here rather than being converted in silence."""
+    asm_dir = myloasm_output_dir(tmp_path / "assembler", "0.7.0")
+    with open_miint_conn() as con:
+        for table, spec in MYLOASM_TABLES.items():
+            raw = dict(
+                c[:2] for c in con.execute(f"DESCRIBE FROM {spec.reader}('{asm_dir}')").fetchall()
+            )
+            kept = {name: sqltype for name, sqltype in spec.columns if name in raw}
+            assert kept, table
+            assert {name: raw[name] for name in kept} == kept, table
 
 
 def test_tagless_links_are_null_not_zero_on_0_6_0(tmp_path: Path) -> None:
@@ -99,7 +98,7 @@ def test_tagless_links_are_null_not_zero_on_0_6_0(tmp_path: Path) -> None:
     that as NULL, never a zero that would read as a measured overlap."""
     asm_dir = myloasm_output_dir(tmp_path / "assembler", "0.6.0")
     out_dir = tmp_path / "out"
-    assert _dump(asm_dir, out_dir).returncode == 0
+    assert run_provenance_dump(asm_dir, out_dir).returncode == 0
     with duckdb.connect() as con:
         assert con.execute(
             "SELECT count(*), count(overlap_length), count(from_read_id) "
@@ -117,7 +116,7 @@ def test_a_directory_myloasm_did_not_finish_fails_loud(tmp_path: Path) -> None:
     """A missing member file is miint's error, surfaced as the step's failure."""
     asm_dir = myloasm_output_dir(tmp_path / "assembler", "0.7.0")
     (asm_dir / "3-mapping" / "map_to_unitigs.paf.gz").unlink()
-    result = _dump(asm_dir, tmp_path / "out")
+    result = run_provenance_dump(asm_dir, tmp_path / "out")
     assert result.returncode == _EXIT_CONTRACT_VIOLATION
     assert "map_to_unitigs.paf.gz" in result.stderr
 
@@ -126,12 +125,7 @@ def test_missing_extension_directory_fails_loud(tmp_path: Path) -> None:
     asm_dir = myloasm_output_dir(tmp_path / "assembler", "0.7.0")
     env = dict(os.environ)
     env.pop("MIINT_EXTENSION_DIRECTORY", None)
-    result = subprocess.run(
-        [sys.executable, str(_PROVENANCE_PY), str(asm_dir), str(tmp_path / "out")],
-        capture_output=True,
-        text=True,
-        env=env,
-    )
+    result = run_provenance_dump(asm_dir, tmp_path / "out", env=env)
     assert result.returncode == _EXIT_CONTRACT_VIOLATION
     assert "MIINT_EXTENSION_DIRECTORY" in result.stderr
 
@@ -151,7 +145,7 @@ def test_assemble_sh_dumps_provenance_only_for_a_non_empty_assembly() -> None:
 
 
 def test_script_uses_the_staged_miint_and_never_installs() -> None:
-    src = _PROVENANCE_PY.read_text()
+    src = PROVENANCE_SCRIPT.read_text()
     assert "from miint_connect import" in src
     assert "duckdb.connect" not in src
     assert not re.search(r"[\"']\s*INSTALL\b", src)
