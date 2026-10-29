@@ -2,7 +2,8 @@
 
 DuckDB 2.0 refuses a relational call — `register`, `unregister` of a registered name,
 `sql`, `from_arrow`, `table` — on a connection whose last `execute`d SELECT is
-part-read, with `ResourceInUseException`. `fetchone()` leaves even a one-row result
+part-read, or that an open Arrow reader of its own (`sql(...).to_arrow_reader()`) is
+still streaming, with `ResourceInUseException`. `fetchone()` leaves even a one-row result
 part-read until a fetch comes back empty; `fetchall()` does not. A plain `execute` is
 not refused (it discards the part-read result). Measured on 2.0.0, a part-read
 `DESCRIBE` or `SHOW` is refused like a SELECT, and nothing is refused after `SET`,

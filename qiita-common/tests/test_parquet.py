@@ -187,6 +187,8 @@ def test_a_sorted_copy_honours_the_byte_cap(tmp_path: Path):
     groups = _row_groups(con, out)
     # ~20 MB under a 1 MB cap, each group a contiguous run of the key, in key order.
     assert len(groups) >= 10
+    # Cut by bytes, not on whole vectors: what sorted_row_group_size's count avoids.
+    assert any(rows % 2048 for rows, _, _ in groups[:-1])
     assert all(hi - lo + 1 == rows for rows, lo, hi in groups)
     assert all(a[2] < b[1] for a, b in zip(groups, groups[1:]))
 

@@ -24,8 +24,9 @@
   --reclaim` removes it once the snapshots that hold it expire; on 1.5.5 it stayed in
   the table, and on disk. A `register_files` replay that arrives after every row of one
   of its files was deleted is now refused (`FailedPrecondition`) instead of answered
-  with the earlier registration.
+  with the earlier registration, while that file is still at its lake path. Once lake
+  GC has removed it, a replay cannot tell itself from a first call (#800).
 - **A miint COPY format can accept a DuckDB COPY option and ignore it (#duckdb-2.0).**
   `ROW_GROUP_SIZE_BYTES` on `FORMAT BIOM` or `FORMAT NEWICK` used to be refused as an
-  unknown option, and now does nothing (duckdb-miint#373). A name neither DuckDB nor miint knows is still
-  refused.
+  unknown option, and now does nothing (duckdb-miint#373). A name neither DuckDB nor
+  miint knows is still refused.

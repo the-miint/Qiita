@@ -482,7 +482,8 @@ fn register_files(
     // deleted: DuckLake drops a file from the table once a DELETE empties it, so
     // nothing left in the catalog says the call committed. Once lake GC has
     // removed such a file as well, nothing is at its destination either, and a
-    // replay cannot tell itself from a first call.
+    // replay cannot tell itself from a first call: it fails on the missing
+    // staging file, or, if that survived, registers the deleted rows again.
     // Judged by the destination, not the source: `move_file` keeps a placed
     // file when removing its staging source fails.
     let moved_before = placed.iter().filter(|f| f.dest.exists()).count();

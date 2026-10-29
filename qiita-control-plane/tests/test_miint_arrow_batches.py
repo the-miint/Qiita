@@ -11,6 +11,8 @@ from pathlib import Path
 import duckdb
 import pytest
 
+from qiita_control_plane.actions.library import _CHUNK_SIZE
+from qiita_control_plane.cli.reference_load import _CHUNK_ROWS_PER_BATCH
 from qiita_control_plane.miint import arrow_batches
 
 _REPO = Path(__file__).resolve().parents[2]
@@ -22,10 +24,17 @@ _LATE_ERROR = (
 )
 
 
-def test_batches_hold_the_rows_per_batch_asked_for():
+@pytest.mark.parametrize("rows_per_batch", [_CHUNK_SIZE, _CHUNK_ROWS_PER_BATCH])
+def test_batches_hold_the_rows_per_batch_asked_for(rows_per_batch):
+    # The sizes the control plane's callers ask for.
     con = duckdb.connect()
-    reader = arrow_batches(con, "SELECT range AS x FROM range(?)", [25_000], 10_000)
-    assert [batch.num_rows for batch in reader] == [10_000, 10_000, 5_000]
+    total = 2 * rows_per_batch + rows_per_batch // 2
+    reader = arrow_batches(con, "SELECT range AS x FROM range(?)", [total], rows_per_batch)
+    assert [batch.num_rows for batch in reader] == [
+        rows_per_batch,
+        rows_per_batch,
+        rows_per_batch // 2,
+    ]
 
 
 def test_the_reader_streams():
