@@ -24,6 +24,7 @@ _None yet._
 ### 3. Migrations
 
 - `[operator]` (#779) `make migrate` applies `20261024000000_metadata_visibility.sql` (four new SQL functions, `qiita.metadata_field_tier`, `qiita.metadata_required_tier` and `qiita.{biosample,prep_sample}_metadata_visibility`, and corrected COMMENTs on `qiita.{biosample,prep_sample}_field_exception`; no table, row or grant changes).
+- `[operator]` (#779) `make migrate` applies `20261024000001_metadata_write_keeps_parent_updated_at.sql` (the biosample and prep_sample `set_updated_at` triggers skip the metadata-touch UPDATE, and the two touch functions skip a no-op UPDATE; column COMMENTs on `updated_at` / `last_metadata_change_at`; no table or row changes).
 
 ### 4. Deploy
 
@@ -47,8 +48,12 @@ _None yet._
   The study-scoped biosample and sequenced-sample reads (`GET /study/{s}/biosample/{b}`,
   `POST /study/{s}/biosample/by-unique-field`, `GET /study/{s}/sequenced-sample/{q}`) now
   admit `viewer` and above instead of only `admin`; `GET /biosample/{b}` drops global values
-  the caller's tier does not reach, including for the biosample's owner. wet_lab_admin+
-  responses are unchanged.
+  the caller's tier does not reach, including for the biosample's owner. An
+  owner-biosample-id value reads at `member` or above whatever its field's tier.
+  `last_metadata_change_at` now reflects only the metadata in the response, and
+  `updated_at` / `effective_updated_at` no longer move on metadata writes; the ETag is the
+  later of the two, so a client that read `updated_at` to detect metadata changes should
+  read `last_metadata_change_at` or the ETag instead.
 
 ## Deployed history
 

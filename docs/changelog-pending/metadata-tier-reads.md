@@ -14,6 +14,12 @@
     with `viewer` tier on the study, instead of only `admin`. A viewer sees the
     `public`- and `viewer`-tier values, and a member also sees `member`-tier values,
     including the owner-biosample-id.
+  - An owner-biosample-id value requires `member` or above even when its study
+    declared the field at a lower tier before the first import.
+  - `last_metadata_change_at` on the biosample and sequenced-sample reads is now when
+    the metadata values in that response last changed. `updated_at` and
+    `effective_updated_at` no longer move when metadata is written, and the ETag is the
+    later of the two. A write to a value the caller cannot read moves none of them.
   - A lookup by a unique-in-study value the caller may not read answers 404, in the
     same words as a value that matches nothing.
   - `GET /biosample/{biosample_idx}` judges each global value on the study that wrote

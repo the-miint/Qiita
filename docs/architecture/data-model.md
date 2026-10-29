@@ -111,8 +111,7 @@ study-record rule below. Reads of biosample and prep_sample metadata enforce it 
 A caller may read a metadata value when their tier on **the value's study**
 reaches **the value's required tier**.
 
-**The value's required tier** (`qiita.metadata_required_tier`) is the most
-restrictive of two mechanisms:
+**The value's required tier** is the most restrictive of what applies to it:
 
 - **Field tier** (`qiita.metadata_field_tier`) — for a globally-linked field,
   `*_global_field.default_tier`; for a purely study-local field, its
@@ -125,9 +124,15 @@ restrictive of two mechanisms:
   submitter entered PII. The required tier is the greater of the field tier and
   the exception's `tier_override`, so an exception only ever restricts. It is
   keyed on `global_field_idx` for a globally-linked value, so it follows the
-  value into every study, or on `*_study_field_idx` for a purely-local one.
-  Both keys are checked against every value, so an exception filed under the
-  wrong one still restricts.
+  value into every study, or on `*_study_field_idx` for a purely-local one. A
+  value matches an exception keyed on its global field or on the study-local
+  field it was written through, so one keyed on the local field still applies
+  after that field is linked; one keyed on another study's alias of the same
+  global field does not. `qiita.metadata_required_tier` combines these two.
+- **Owner-biosample-id floor** — an owner-biosample-id value requires at least
+  `member` (`repositories.biosample.OWNER_BIOSAMPLE_ID_TIER_OVERRIDE`), whatever
+  its field's tier, so a study that declared the field lower before its first
+  import does not expose the owner's names.
 
 **The value's study** is the study of the study-local field it was written
 through. For a globally-linked value, that is the study that wrote it first:
@@ -146,9 +151,17 @@ nor holds a grant on the study that wrote a value reads that value at
 **A hidden value is absent**, not marked: a read omits its key, and anything
 that counts values counts only the visible ones. A lookup by a unique-in-study
 value the caller may not read answers exactly as one matching nothing, so it
-cannot confirm the value. The owner-biosample-id, a study-local field created
-at `member` tier whatever the study's default, is the standing example: a
+cannot confirm the value. The owner-biosample-id is the standing example: a
 viewer of the study does not see it.
+
+**Timestamps describe the response.** A read's `last_metadata_change_at` is the
+latest change among the values it returns
+(`_sample_helpers.fetch_visible_metadata_last_change`), not the entity's own
+column, which moves on every write. The record's `updated_at` moves only with
+the record's own columns, and the read's ETag is the later of the two
+(`routes._helpers.representation_etag`), which is also what a PATCH's
+If-Match is checked against. So no timestamp a caller reads shows that a
+hidden value exists or when it changed.
 
 Every caller-facing metadata read names its source through
 `_sample_helpers.visible_metadata_source`. The reads filter on the function's

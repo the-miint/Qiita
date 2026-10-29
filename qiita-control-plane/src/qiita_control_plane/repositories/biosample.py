@@ -36,11 +36,13 @@ from .biosample_metadata import (
 )
 from .exported_entity import export_entity_id_select
 
-# Owners' ids for their own samples sometimes inadvertently contain PII, so the
-# owner-biosample-id field is created at member tier whatever the study's
-# default: even on a public study, only callers at the field's tier (and the
-# roles that read every value) see it. The metadata visibility rule enforces
-# the field's tier (docs/architecture/data-model.md, "Metadata visibility
+# Owners' ids for their own samples sometimes inadvertently contain PII, so an
+# owner-biosample-id value reads at no less than member whatever the study's
+# default or its field's tier: even on a public study, or through a field a
+# study declared lower before its first import, only members (and the roles
+# that read every value) see it. The import creates the field at this tier, and
+# qiita.biosample_metadata_visibility floors every owner-id value at it; a test
+# pins the two together (docs/architecture/data-model.md, "Metadata visibility
 # tiers").
 OWNER_BIOSAMPLE_ID_TIER_OVERRIDE: Tier = Tier.MEMBER
 

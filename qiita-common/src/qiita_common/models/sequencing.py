@@ -832,8 +832,11 @@ class SequencedSampleResponse(ReadCounts):
 
     `effective_updated_at` = GREATEST(prep_sample.updated_at,
     sequenced_sample.updated_at) — a single timestamp that bumps on a
-    write to either table, used as the source for the ETag header on
-    the GET and the If-Match contract on the PATCH.
+    write to either record; a metadata write does not move it.
+    `last_metadata_change_at` is when the metadata values in this response
+    last changed (None when it carries none), so it moves only with what the
+    caller can read. The ETag header on the GET, and the If-Match contract on
+    the PATCH, use the later of the two.
     `caller_system_role` carries the caller's principal.system_role
     verbatim from the database.
     """
