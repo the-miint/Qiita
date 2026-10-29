@@ -100,14 +100,23 @@ async def run_on_connection[T](
     interrupt stopped a running COPY in about 30 ms.
 
     The wait is on the thread itself, since cancelling the awaited future does not
-    stop the thread, and it outlasts a further cancellation, which the event loop
+    stop the thread, and it outlasts a further cancellation, which `asyncio.run`
     sends every task at shutdown. DuckDB drops an interrupt that lands before the
-    statement starts, so it is repeated until the thread returns. Not
-    `asyncio.shield`: once its caller is cancelled, it logs the inner task's error
-    (here, the interrupt) as an unhandled exception."""
+    statement starts, so it is repeated until the thread returns. A cancellation
+    that arrives while the call still waits for a worker (the default executor is
+    shared and bounded) settles under `gate` that `fn` never runs, so there is no
+    thread to wait for. Not `asyncio.shield`: once its caller is cancelled, it logs
+    the inner task's error (here, the interrupt) as an unhandled exception."""
+    gate = threading.Lock()
+    started = abandoned = False
     returned = threading.Event()
 
     def call() -> T:
+        nonlocal started
+        with gate:
+            if abandoned:
+                raise asyncio.CancelledError
+            started = True
         try:
             return fn(*args)
         finally:
@@ -116,7 +125,10 @@ async def run_on_connection[T](
     try:
         return await asyncio.to_thread(call)
     except asyncio.CancelledError:
-        while not returned.is_set():
+        with gate:
+            abandoned = True
+            running = started
+        while running and not returned.is_set():
             con.interrupt()
             try:
                 await asyncio.sleep(0.05)

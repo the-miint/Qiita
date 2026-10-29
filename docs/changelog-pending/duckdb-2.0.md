@@ -33,10 +33,11 @@
   feature or annotation map held the shutdown until the write finished; the write is
   now interrupted.
 - **Sorted at-rest writes no longer set a row count per row group (#801).** The read
-  and reference-chunk writers asked for a whole number of vectors sized to their rows,
-  because DuckDB 1.5.5 ignored the byte cap on a sorted COPY. DuckDB 2.0 applies it,
-  so their row groups are now cut by the 64 MB byte cap alone, as every other
-  writer's are. Write time and file size were unchanged where measured.
+  and reference-chunk writers asked for a whole number of vectors sized to their rows'
+  width, because DuckDB 1.5.5 ignored the byte cap on a sorted COPY. DuckDB 2.0 applies
+  it, so their row groups are now cut by the 64 MB byte cap alone, as every other
+  writer's are. On ~300 MB of 15 KB rows, write time and file size were unchanged at
+  both the transfer and the at-rest compression level.
 - **A miint COPY format can accept a DuckDB COPY option and ignore it (#801).**
   `ROW_GROUP_SIZE_BYTES` on `FORMAT BIOM` or `FORMAT NEWICK` used to be refused as an
   unknown option, and now does nothing (duckdb-miint#373). A name neither DuckDB nor
