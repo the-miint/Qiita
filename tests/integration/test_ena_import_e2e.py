@@ -186,8 +186,9 @@ def _write_intermediate(
         )
 
 
-def _fake_stage_run_reads_factory(by_run: dict[str, tuple[list[tuple], list[str]]]):
-    """Build a `_stage_run_reads`-shaped fake keyed by run_accession."""
+def _fake_stage_run_reads_factory(by_run: dict[str, list[tuple]]):
+    """Build a `_stage_run_reads`-shaped fake keyed by run_accession; each entry
+    is the run's rows."""
 
     def _fake(
         run_accession,
@@ -197,9 +198,9 @@ def _fake_stage_run_reads_factory(by_run: dict[str, tuple[list[tuple], list[str]
         memory_gb,
         threads,
     ):
-        rows, warnings = by_run[run_accession]
+        rows = by_run[run_accession]
         _write_intermediate(intermediate_path, rows)
-        return len(rows), warnings
+        return len(rows)
 
     return _fake
 
@@ -486,8 +487,8 @@ async def test_batch_driver_to_register_files_to_ducklake_full_span(
     # inline DuckDB COPY, keyed by the REAL ena_run_accession the roster
     # carries. ---
     by_run = {
-        roster[0][1]: (_RUN1_ROWS, []),
-        roster[1][1]: (_RUN2_ROWS, []),
+        roster[0][1]: _RUN1_ROWS,
+        roster[1][1]: _RUN2_ROWS,
     }
     from qiita_compute_orchestrator import sequence_range_retry
     from qiita_compute_orchestrator.jobs import ingest_ena_reads
@@ -632,7 +633,7 @@ async def test_run_list_import_ingests_only_the_listed_runs(
     assert [run for run, _ in roster] == sorted(listed)
     prep_sample_idxs = [psi for _, psi in roster]
 
-    by_run = {roster[0][0]: (_RUN1_ROWS, []), roster[1][0]: (_RUN2_ROWS, [])}
+    by_run = {roster[0][0]: _RUN1_ROWS, roster[1][0]: _RUN2_ROWS}
     from qiita_compute_orchestrator import sequence_range_retry
     from qiita_compute_orchestrator.jobs import ingest_ena_reads
     from qiita_compute_orchestrator.sequence_range import MintedSequenceRange
@@ -729,7 +730,7 @@ async def test_pool_with_a_permanently_failed_run_lands_the_rest_and_reads_compl
     from qiita_compute_orchestrator.jobs import ingest_ena_reads
     from qiita_compute_orchestrator.sequence_range import MintedSequenceRange
 
-    good_fake = _fake_stage_run_reads_factory({good_run: (_RUN1_ROWS, [])})
+    good_fake = _fake_stage_run_reads_factory({good_run: _RUN1_ROWS})
 
     def _stage(run_accession, *args):
         if run_accession == bad_run:
