@@ -39,7 +39,7 @@ _None yet._
 - `[admin]` **Let in-flight `long-read-assembly` tickets finish, and submit no new ones,
   before the restart.** The sync enables 1.0.2 and disables 1.0.1, and a ticket whose
   action is disabled fails when the restarted runner picks it up (`not found or
-  disabled`). Expect `0`; resubmit anything that fails anyway at 1.0.2. (#TBD)
+  disabled`). Expect `0`; resubmit anything that fails anyway at 1.0.2. (#813)
   ```bash
   sudo -u qiita-api bash -c 'set -a; . /etc/qiita/control-plane.env; set +a
   psql "$DATABASE_URL" -Atc "SELECT count(*) FROM qiita.work_ticket WHERE action_id = '\''long-read-assembly'\'' AND state IN ('\''pending'\'', '\''queued'\'', '\''processing'\'');"'
@@ -94,7 +94,7 @@ _None yet._
 - **One myloasm assembly at `long-read-assembly` 1.0.2 lands its provenance.** Submit one
   prep_sample and, once it completes, check its run in `make lake-shell`: all six `myloasm_*` tables have rows for its
   `(prep_sample_idx, processing_idx)`, every `myloasm_mapping.sequence_idx` joins to `read`,
-  and every primary `myloasm_contig` has a `feature_idx`. Expect `t`. (#TBD)
+  and every primary `myloasm_contig` has a `feature_idx`. Expect `t`. (#813)
   ```bash
   qiita ticket submit --action-id long-read-assembly --action-version 1.0.2 \
       --prep-sample-idx '<ps>' --context-json '{"mask_idx": <mask>, "assembler": "myloasm"}'
@@ -144,7 +144,7 @@ _None yet._
     build maps a pair under the `sr` preset as native minimap2 does
     (duckdb-miint#341).
 - **`long-read-assembly` 1.0.2 keeps myloasm's read-level provenance in six new DuckLake
-  tables.** (#TBD)
+  tables.** (#813)
   - The data plane creates `myloasm_contig`, `myloasm_layout`, `myloasm_mapping`,
     `myloasm_link`, `myloasm_split` and `myloasm_run` on its next start; nothing to run.
   - The assemble image lands under a new filename, `long-read-assembly-assemble-1.0.2.sif`,

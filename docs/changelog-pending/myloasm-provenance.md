@@ -1,6 +1,6 @@
 ### Added
 
-- **A myloasm assembly keeps its read-level provenance (#TBD).** long-read-assembly
+- **A myloasm assembly keeps its read-level provenance (#813).** long-read-assembly
   1.0.2 dumps the six tables duckdb-miint reads out of a myloasm output directory and
   loads them into six new DuckLake tables: `myloasm_contig`, `myloasm_layout`,
   `myloasm_mapping`, `myloasm_link`, `myloasm_split` and `myloasm_run`. They hold which
@@ -15,7 +15,7 @@
 
 ### Changed
 
-- **The assembler's reads are named by `sequence_idx` (#TBD).** The FASTQ that
+- **The assembler's reads are named by `sequence_idx` (#813).** The FASTQ that
   long-read-assembly hands its assembler now names each read by its `sequence_idx`
   instead of the sequencer's `read_id`, so anything the assembler writes about a read
   joins to `read` directly. Assembled contigs and bins are unaffected.
