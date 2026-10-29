@@ -19,7 +19,22 @@ _None yet._
 
 ### 2. One-time host setup
 
-_None yet._
+- `[operator]` **Confirm the mirror publishes the DuckDB 2.0.0 miint build** before the
+  restart — every component now runs 2.0.0, and the stage step fetches from here.
+  (#duckdb-2.0)
+  ```bash
+  curl -fsSI https://ftp.microbio.me/pub/miint/v2.0.0/linux_amd64/miint.duckdb_extension.gz | head -1   # expect 200
+  ```
+- `[admin]` **Install the DuckDB 2.0.0 CLI for `make lake-shell` / `scripts/lake-gc.sh`.**
+  Both refuse any `duckdb` that is not the version the data plane links. The release now
+  ships a tarball, not a zip. Replace any per-account copy in `~/.local/bin` the same way.
+  (#duckdb-2.0)
+  ```bash
+  ( cd "$(mktemp -d)" \
+    && curl -sSfL -O https://github.com/duckdb/duckdb/releases/download/v2.0.0/duckdb-cli-linux-amd64.tar.gz \
+    && tar -xzf duckdb-cli-linux-amd64.tar.gz && sudo install -m 0755 duckdb /usr/local/bin/duckdb )
+  sudo -u qiita-data /usr/local/bin/duckdb --version   # expect v2.0.0 (Cyanoptera) d54cbbe3df
+  ```
 
 ### 3. Migrations
 
@@ -52,6 +67,28 @@ _None yet._
   `/opt/qiita/data-plane/build.env`, which the deploy writes). A host running only
   `qiita-data-plane@50051` is unaffected.
 
+- **The staged miint builds are present, and the rebuilt `long-read-assembly` images carry
+  DuckDB 2.0.0** — each image loads miint only from its own DuckDB version's directory.
+  Expect `DUCKDB_200_OK`. (#duckdb-2.0)
+  ```bash
+  sudo -u qiita-orch bash -c 'set -a; . /etc/qiita/compute-orchestrator.env; set +a
+  for v in 2.0.0 1.5.5 1.5.4; do
+    test -s "$MIINT_EXTENSION_DIRECTORY/v$v/linux_amd64/miint.duckdb_extension" \
+      || { echo "no staged miint for DuckDB $v"; exit 1; }
+  done
+  cd /tmp && for s in long-read-assembly-assemble-1.0.0.sif long-read-assembly-checkm-1.0.1.sif; do
+    apptainer exec --no-home "${PATH_DERIVED}/images/$s" \
+      python3 -c "import duckdb; print(duckdb.__version__)" | grep -Fxq 2.0.0 \
+      || { echo "$s is not on DuckDB 2.0.0"; exit 1; }
+  done && echo DUCKDB_200_OK'
+  ```
+- **The DuckLake catalog is still format 1.0.** Expect `1.0`; the attach itself fails if
+  the catalog was ever migrated. (#duckdb-2.0)
+  ```bash
+  bash scripts/lake-shell.sh --no-cp -noheader -list \
+    -c "SELECT value FROM qiita_lake.options() WHERE option_name = 'version'"
+  ```
+
 ### 6. After the deploy verifies green
 
 - Only on a host running more than one data-plane instance (#363): point the control plane
@@ -62,6 +99,25 @@ _None yet._
 ### Notes (no host action)
 
 - (#767) A killed DoPut leaves `staging/uploads/<idx>/upload.parquet.partial`, which nothing reclaims, as nothing reclaims finished uploads. `qiita-admin masked-read-export` gains `--retry-seconds` (default 3900, the data-plane unit's stop timeout).
+- **DuckDB 1.5.5 → 2.0.0 everywhere; the DuckLake catalog stays at format 1.0.** (#duckdb-2.0)
+  - The redeploy re-stages miint and httpfs into `MIINT_EXTENSION_DIRECTORY/v2.0.0/` on its
+    own, because `stage-miint --check` sees the version change. `make verify-deploy`'s
+    `compute-readiness` and `cp-miint` checks LOAD the new build.
+  - The `assemble` and `checkm` (`-1.0.1`) SIFs auto-rebuild on deploy to pick up 2.0.0.
+  - **Work that loads miint between the bucket-4 restart and the redeploy's miint stage
+    fails at LOAD**, the same window as the last DuckDB bump: `v2.0.0/` is staged after
+    everything moves to 2.0.0. Resubmit anything that failed there.
+  - **Keep `v1.5.4/` and `v1.5.5/`.** The frozen `long-read-assembly-checkm-1.0.0.sif` still
+    loads miint from `v1.5.4/`, and `v1.5.5/` is what a rollback runs. Staging never
+    removes an old version dir.
+  - Each data-plane instance installs the 2.0.0 `ducklake` and `postgres` extensions under
+    its `HOME` on first start, so it needs to reach extensions.duckdb.org.
+  - That ducklake writes catalog format 1.1 by default, so every attach names
+    `DUCKLAKE_VERSION '1.0'` and the catalog is not migrated. Never attach it with
+    `AUTOMATIC_MIGRATION` by hand: the migration is one-way. A rollback to the 1.5.5 build
+    still reads everything 2.0 wrote to the catalog.
+  - `host_filter` now counts somewhat more read pairs as host: miint's 2.0 build
+    reverse-complements mate 2 for the paired `sr` preset (duckdb-miint#341).
 
 ## Deployed history
 
