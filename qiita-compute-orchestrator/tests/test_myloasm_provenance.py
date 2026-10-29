@@ -78,11 +78,12 @@ def test_every_reader_is_dumped_verbatim(tmp_path: Path, version: str) -> None:
             assert [c[:2] for c in dumped_cols] == [c[:2] for c in reader_cols], table
 
 
-def test_every_kept_column_already_has_its_lake_type(tmp_path: Path) -> None:
+@pytest.mark.parametrize("version", MYLOASM_FIXTURE_VERSIONS)
+def test_every_kept_column_already_has_its_lake_type(tmp_path: Path, version: str) -> None:
     """Every reader column the lake keeps under its own name arrives with the lake's
     type, so the transform's CAST changes nothing for it. A reader that changes a
     column's type fails here rather than being converted in silence."""
-    asm_dir = myloasm_output_dir(tmp_path / "assembler", "0.7.0")
+    asm_dir = myloasm_output_dir(tmp_path / "assembler", version)
     with open_miint_conn() as con:
         for table, spec in MYLOASM_TABLES.items():
             raw = dict(

@@ -494,8 +494,9 @@ steps:
     # headroom's share is a candidate for the fix rather than an established cause.
     # Re-sizing that helper against real MaxRSS is the route back down. Runs take
     # 2-23 s, so the allocation is held briefly. The myloasm re-keying this version
-    # adds was not measured in this step; its largest input, the read mappings, runs
-    # to about 1.4M rows per prep_sample on production myloasm trees.
+    # adds was not measured in this step, so for it 32 is a starting point, not a
+    # measurement. Its largest input, the read mappings, was about 1.4M rows on the
+    # one production myloasm tree counted while designing it.
     baseline_resources:
       cpu: 4
       mem_gb: 32
