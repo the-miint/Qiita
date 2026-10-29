@@ -174,10 +174,9 @@ def test_write_sorted_reads_golay_mode_renumbers_per_sample(tmp_path):
 
 
 def test_write_sorted_reads_keeps_wide_row_groups_under_the_byte_cap(tmp_path, monkeypatch):
-    """A sorted COPY ignores ROW_GROUP_SIZE_BYTES (see
-    `qiita_common.parquet.sorted_row_group_size`), so the writer asks for a row count sized
-    to its reads. With the cap shrunk to 1 MiB, ~1 KB reads land one vector per row group
-    instead of the whole read set in one."""
+    """The sorted COPY asks for the row count `qiita_common.parquet.sorted_row_group_size`
+    sizes to its reads. With the cap shrunk to 1 MiB, ~1 KB reads land one vector per row
+    group instead of the whole read set in one."""
     monkeypatch.setattr(parquet, "ROW_GROUP_SIZE_BYTES", SHRUNK_ROW_GROUP_SIZE_BYTES)
     src = tmp_path / "intermediate.parquet"
     with duckdb.connect() as conn:

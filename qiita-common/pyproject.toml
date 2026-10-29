@@ -34,11 +34,6 @@ packages = ["src/qiita_common"]
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 asyncio_mode = "auto"
-filterwarnings = [
-    # DuckDB copies the whole result before handing it over as Arrow from
-    # `execute()`; see qiita_control_plane.miint.arrow_batches.
-    "error:Arrow output on a DB-API result:UserWarning",
-]
 
 [tool.ruff]
 extend = "../ruff.toml"

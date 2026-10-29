@@ -49,9 +49,11 @@ make clean
 # Python
 cd qiita-control-plane && uv run pytest tests/test_smoke.py::test_health
 
-# Rust — DUCKDB_DOWNLOAD_LIB=1 dynamically links a prebuilt libduckdb from
-# target/duckdb-download instead of rebuilding the bundled DuckDB from source.
-# Without it, every invocation can spend many minutes compiling DuckDB.
+# Rust — DUCKDB_DOWNLOAD_LIB=1 links the prebuilt libduckdb cached in
+# target/duckdb-download. The duckdb crate fetches it when the variable is unset
+# too; only `--features duckdb/bundled` (make build's release binary) compiles
+# DuckDB from source. Set it as the Makefile does: a change in it reruns the
+# crate's build script and relinks the data plane.
 cd qiita-data-plane && DUCKDB_DOWNLOAD_LIB=1 cargo test config_with_valid_env
 ```
 

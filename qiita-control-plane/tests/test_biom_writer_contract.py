@@ -190,11 +190,11 @@ def test_an_unknown_copy_option_is_rejected_not_ignored(tmp_path):
     """So a typo in the writer's option list cannot silently no-op — which is what
     makes the explicit `COMPRESSION 'gzip'` in `biom_copy_sql` worth trusting.
 
-    The name must be one DuckDB does not know either: DuckDB 2.0 takes its own COPY
-    options (`ROW_GROUP_SIZE_BYTES`, …) before the writer sees them, so for a miint
-    format those are dropped without an error (duckdb-miint#373). The error is matched loosely
-    because the mirror's build moves: `BinderException: Unknown option` until
-    duckdb-miint#368, `NotImplementedException: Unrecognized option` after it."""
+    The name must be one DuckDB does not know either: DuckDB 2.0 accepts
+    `ROW_GROUP_SIZE_BYTES` here without an error or effect (duckdb-miint#373). The
+    error is matched loosely because the mirror's build moves: `BinderException:
+    Unknown option` until duckdb-miint#368, `NotImplementedException: Unrecognized
+    option` after it."""
     with connect_with_miint() as conn:
         _staged(conn, [("QM1", "GCF_1", 1.0)])
         with pytest.raises(duckdb.Error, match=r"(?i)(unknown|unrecognized) option"):

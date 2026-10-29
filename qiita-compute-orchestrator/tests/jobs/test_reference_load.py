@@ -326,10 +326,9 @@ def _write_chunks(tmp_path: Path, widths: list[tuple[int, int]]) -> duckdb.DuckD
 
 
 def test_chunk_parts_keep_wide_row_groups_under_the_byte_cap(tmp_path, monkeypatch):
-    """Each part's sorted COPY ignores ROW_GROUP_SIZE_BYTES (see
-    `qiita_common.parquet.sorted_row_group_size`), so the writer asks for a row count sized
-    to its chunks. With the cap shrunk to 1 MiB, ~1 KB chunks land one vector per row group
-    instead of the whole part in one."""
+    """Each part's sorted COPY asks for the row count
+    `qiita_common.parquet.sorted_row_group_size` sizes to its chunks. With the cap shrunk to
+    1 MiB, ~1 KB chunks land one vector per row group instead of the whole part in one."""
     import qiita_compute_orchestrator.jobs._feature_load as fl
 
     monkeypatch.setattr(parquet, "ROW_GROUP_SIZE_BYTES", SHRUNK_ROW_GROUP_SIZE_BYTES)

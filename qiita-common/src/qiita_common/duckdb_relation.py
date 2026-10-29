@@ -1,11 +1,11 @@
 """An Arrow object registered on a DuckDB connection for the length of a block.
 
-DuckDB 2.0 refuses a relational call — `register`, `unregister`, `sql`, `from_arrow` —
-on a connection whose last `execute`d SELECT is part-read, with
-`ResourceInUseException`. `fetchone()` leaves even a one-row result part-read until a
-fetch comes back empty; `fetchall()` does not. A plain `execute` is not refused (it
-discards the part-read result), and neither is a statement that returns no rows to
-read (`SET`, `CREATE`, `INSERT`, `COPY`). DuckDB 1.5.5 refused none of this.
+DuckDB 2.0 refuses a relational call — `register`, `unregister` of a registered name,
+`sql`, `from_arrow`, `table` — on a connection whose last `execute`d SELECT is
+part-read, with `ResourceInUseException`. `fetchone()` leaves even a one-row result
+part-read until a fetch comes back empty; `fetchall()` does not. A plain `execute` is
+not refused (it discards the part-read result), and nothing is refused after a
+statement other than a SELECT (`SET`, `CREATE`, `INSERT`, `COPY`), read or not.
 """
 
 from __future__ import annotations

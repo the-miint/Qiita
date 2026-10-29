@@ -1045,6 +1045,58 @@ mod tests {
         assert_eq!(version, DUCKLAKE_CATALOG_VERSION);
     }
 
+    /// A catalog past the pinned format is refused at attach rather than used.
+    /// Built in a database of its own: the shared test catalog stays at the pin.
+    #[test]
+    #[serial]
+    #[cfg(feature = "integration")]
+    fn a_catalog_past_the_pinned_format_is_refused_at_attach() {
+        let with_dbname = |dbname: &str| {
+            let mut parts: Vec<String> = crate::test_catalog::connstr()
+                .split_whitespace()
+                .filter(|kv| !kv.starts_with("dbname="))
+                .map(str::to_string)
+                .collect();
+            parts.push(format!("dbname={dbname}"));
+            parts.join(" ")
+        };
+        let admin = Connection::open_in_memory().unwrap();
+        admin
+            .execute_batch(&format!(
+                "LOAD postgres; ATTACH '{}' AS pg (TYPE postgres);",
+                with_dbname("postgres")
+            ))
+            .unwrap();
+        // CREATE and DROP DATABASE cannot run inside a transaction.
+        let pg = |sql: &str| {
+            admin
+                .execute_batch(&format!(
+                    "CALL postgres_execute('pg', '{sql}', use_transaction := false);"
+                ))
+                .unwrap()
+        };
+        let db = format!("qiita_ducklake_newer_{}", std::process::id());
+        pg(&format!("DROP DATABASE IF EXISTS {db} WITH (FORCE)"));
+        pg(&format!("CREATE DATABASE {db}"));
+        let connstr = with_dbname(&db);
+        let data = tempfile::tempdir().unwrap();
+        let data_path = data.path().to_str().unwrap();
+        Connection::open_in_memory()
+            .unwrap()
+            .execute_batch(&format!(
+                "LOAD ducklake; LOAD postgres; \
+                 ATTACH 'ducklake:postgres:{connstr}' AS newer \
+                 (DATA_PATH '{data_path}', DUCKLAKE_VERSION '1.1');"
+            ))
+            .unwrap();
+
+        let refused = connect_ducklake(&Connection::open_in_memory().unwrap(), &connstr, data_path);
+        pg(&format!("DROP DATABASE {db} WITH (FORCE)"));
+
+        let err = refused.expect_err("a catalog past the pinned format attached");
+        assert!(err.to_string().contains("Cannot downgrade"), "{err}");
+    }
+
     /// `(column_name, data_type, is_nullable)` for one `qiita_lake` table, in
     /// declared order, for the schema-drift assertions below. `is_nullable` is
     /// carried because NOT NULL is a property both alignment DDLs argue for

@@ -15,11 +15,11 @@
   `DUCKLAKE_VERSION '1.0'`. The existing catalog stays 1.0, a 1.1 catalog is refused
   rather than used, and a DuckDB 1.5.5 client can still read what 2.0 writes there, so
   rolling back keeps working.
-- **Host filtering counts somewhat more read pairs as host (#duckdb-2.0).** miint's 2.0 build
-  reverse-complements mate 2 when paired `align_minimap2` runs under the `sr` preset
-  `host_filter` uses (duckdb-miint#341). Forward–reverse pairs now align as pairs, and
-  some pairs that did not align before now do.
-- **A miint COPY writer accepts DuckDB's own COPY options and ignores them (#duckdb-2.0).** For
-  example, `ROW_GROUP_SIZE_BYTES` on `FORMAT BIOM` used to be refused as an unknown
-  option and now does nothing (duckdb-miint#373). A name neither DuckDB nor miint knows
-  is still refused.
+- **Host filtering maps read pairs as native minimap2 does (#duckdb-2.0).** miint's 2.0
+  build reverse-complements mate 2 before mapping a pair under the `sr` preset
+  `host_filter` uses (duckdb-miint#341). A pair can now map as one fragment when neither
+  mate maps alone, so `host_filter` can count a pair as host that it did not count before.
+- **A miint COPY format can accept a DuckDB COPY option and ignore it (#duckdb-2.0).**
+  `ROW_GROUP_SIZE_BYTES` on `FORMAT BIOM` used to be refused as an unknown option, and
+  now does nothing (duckdb-miint#373). A name neither DuckDB nor miint knows is still
+  refused.

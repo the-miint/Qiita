@@ -180,9 +180,8 @@ def _row_groups(con: duckdb.DuckDBPyConnection, path: Path) -> list[tuple[int, i
 
 
 def test_a_sorted_copy_honours_the_byte_cap(tmp_path: Path):
-    # DuckDB 1.5.5 wrote these 20,000 rows as one group, which is what
-    # sorted_row_group_size was written for. If a bump makes this fail, a sorted writer
-    # is bounded by that helper's row count alone again.
+    # If a bump makes this fail, DuckDB no longer applies the byte cap to a sorted COPY,
+    # and a sorted writer is bounded by sorted_row_group_size's row count alone.
     con = _connect()
     out = _sorted_copy(con, tmp_path, "FORMAT PARQUET, ROW_GROUP_SIZE_BYTES '1MB'")
     groups = _row_groups(con, out)

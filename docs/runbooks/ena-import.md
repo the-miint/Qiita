@@ -80,7 +80,7 @@ less memory per run, and scratch disk grows with it:
 
 Worst-case connections to ENA are 8 dispatch slots times this value, so raise it by
 measuring. Above 4 the step oversubscribes its 8 CPUs during sorts. Keep production at
-4: 8 concurrent sorts at 5 GB per run is untested on DuckDB 1.5.5.
+4: 8 concurrent sorts at 5 GB per run is untested.
 On the local backend all tickets share one executor, so the effective total is lower.
 
 A download ticket's roster read also waits at most 90 s

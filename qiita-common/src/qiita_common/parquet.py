@@ -74,14 +74,11 @@ def sorted_row_group_size(bytes_per_row: int) -> int:
     """`ROW_GROUP_SIZE` for a COPY whose query ends in ORDER BY, given its rows' mean width.
 
     A sorted COPY writes one file in sort order, each row group a contiguous run of the
-    key. DuckDB 1.5.5 cut those row groups by row count alone: ROW_GROUP_SIZE_BYTES did
-    not apply, and a group closed at the first whole vector at or past ROW_GROUP_SIZE
-    (122,880 rows unless set), so 122,880 HiFi reads became one ~3.7 GB row group. The
-    writer compresses each row group on one thread, so a level-16 write of such a group
-    ran on one core however many threads the connection had. DuckDB 2.0 applies the
-    byte cap to a sorted COPY too (`test_a_sorted_copy_honours_the_byte_cap`), and with
-    both the smaller wins; this count, just under the cap, keeps the vector-aligned
-    groups the sorted writers had on 1.5.5.
+    key. The writer compresses each row group on one thread, so an oversized group runs
+    a level-16 write on one core however many threads the connection has. DuckDB closes
+    a group at whichever of ROW_GROUP_SIZE (at the first whole vector at or past it) and
+    ROW_GROUP_SIZE_BYTES it reaches first; this count, just under the byte cap, is
+    reached first, so every group is whole vectors.
 
     Returns the most whole vectors that fit ROW_GROUP_SIZE_BYTES, never more rows than
     DuckDB's default (so narrow rows keep the groups an unsorted write would give them) and

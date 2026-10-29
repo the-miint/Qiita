@@ -137,10 +137,9 @@ def test_execute_writes_reads_parquet_for_fastq(fake_mint, tmp_path):
 
 
 def test_execute_keeps_wide_row_groups_under_the_byte_cap(fake_mint, monkeypatch, tmp_path):
-    """The final sorted COPY ignores ROW_GROUP_SIZE_BYTES (see
-    `qiita_common.parquet.sorted_row_group_size`), so it asks for a row count sized to the
-    reads. With the cap shrunk to 1 MiB, ~1 KB reads land one vector per row group instead
-    of the whole read set in one."""
+    """The final sorted COPY asks for the row count
+    `qiita_common.parquet.sorted_row_group_size` sizes to the reads. With the cap shrunk to
+    1 MiB, ~1 KB reads land one vector per row group instead of the whole read set in one."""
     monkeypatch.setattr(parquet, "ROW_GROUP_SIZE_BYTES", SHRUNK_ROW_GROUP_SIZE_BYTES)
     fastq = tmp_path / "in.fastq"
     fastq.write_text(

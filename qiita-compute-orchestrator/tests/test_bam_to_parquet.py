@@ -635,10 +635,9 @@ def test_reads_are_written_as_monotone_disjoint_parts(fake_mint, monkeypatch, tm
 
 
 def test_parts_keep_wide_row_groups_under_the_byte_cap(fake_mint, monkeypatch, tmp_path):
-    """Each part's sorted COPY ignores ROW_GROUP_SIZE_BYTES (see
-    `qiita_common.parquet.sorted_row_group_size`), so it asks for a row count sized to the
-    reads. With the cap shrunk to 1 MiB, ~1 KB reads land one vector per row group instead
-    of the whole part in one."""
+    """Each part's sorted COPY asks for the row count
+    `qiita_common.parquet.sorted_row_group_size` sizes to the reads. With the cap shrunk to
+    1 MiB, ~1 KB reads land one vector per row group instead of the whole part in one."""
     monkeypatch.setattr(parquet, "ROW_GROUP_SIZE_BYTES", SHRUNK_ROW_GROUP_SIZE_BYTES)
     sam = tmp_path / "in.sam"
     _write_sam(sam, [_sam_record(rid, bases, "I" * len(bases)) for rid, bases in wide_reads()])

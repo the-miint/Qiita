@@ -105,8 +105,8 @@ _None yet._
     `compute-readiness` and `cp-miint` checks LOAD the new build.
   - The `assemble` and `checkm` (`-1.0.1`) SIFs auto-rebuild on deploy to pick up 2.0.0.
   - **Work that loads miint between the bucket-4 restart and the redeploy's miint stage
-    fails at LOAD**, the same window as the last DuckDB bump: `v2.0.0/` is staged after
-    everything moves to 2.0.0. Resubmit anything that failed there.
+    fails at LOAD**: `v2.0.0/` is staged after everything moves to 2.0.0. Resubmit
+    anything that failed there.
   - **Keep `v1.5.4/` and `v1.5.5/`.** The frozen `long-read-assembly-checkm-1.0.0.sif` still
     loads miint from `v1.5.4/`, and `v1.5.5/` is what a rollback runs. Staging never
     removes an old version dir.
@@ -116,8 +116,9 @@ _None yet._
     `DUCKLAKE_VERSION '1.0'` and the catalog is not migrated. Never attach it with
     `AUTOMATIC_MIGRATION` by hand: the migration is one-way. A rollback to the 1.5.5 build
     still reads everything 2.0 wrote to the catalog.
-  - `host_filter` now counts somewhat more read pairs as host: miint's 2.0 build
-    reverse-complements mate 2 for the paired `sr` preset (duckdb-miint#341).
+  - `host_filter` can count a read pair as host that it did not before: miint's 2.0
+    build maps a pair under the `sr` preset as native minimap2 does
+    (duckdb-miint#341).
 
 ## Deployed history
 

@@ -71,7 +71,7 @@ from .miint_staging import write_staging_marker
 # 64 MB cap binds first (~1024 chunks), so row groups land at ~64 MB
 # rather than ~1 GB — strictly lower write memory and finer pruning, with
 # the row-count cap still backstopping sparse/narrow records. A sorted
-# write gets the row count alone (see `qiita_common.parquet.sorted_row_group_size`).
+# write sizes its row count itself (see `qiita_common.parquet.sorted_row_group_size`).
 #
 # CHUNK_ROW_GROUP_SIZE (and the matching CHUNK_SIZE) are single-sourced in
 # `qiita_common.chunking`, shared with the CLI's DoPut path. The actual

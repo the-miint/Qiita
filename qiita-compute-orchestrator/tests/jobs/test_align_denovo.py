@@ -591,11 +591,14 @@ def test_a_slice_no_axis_can_score_is_still_refused():
     ).gate.circular
 
 
-def test_no_arrow_materialization_in_the_feeding_path():
-    """`con.execute(...).arrow()` returns a lazy `RecordBatchReader` in DuckDB 1.5.4,
-    and a miint table function over one backed by a query on the SAME connection
-    deadlocks (duckdb-miint#230, open). A Flight-sourced reader is not affected, so the
-    constraint is only that this job never builds one itself."""
+def test_no_lazy_arrow_reader_in_the_feeding_path():
+    """A relation's `.arrow()` and `.to_arrow_reader()` return a lazy `RecordBatchReader`
+    on DuckDB 2.0, and a miint table function over one backed by a query on the SAME
+    connection deadlocked on DuckDB 1.5.4, where `execute(...).arrow()` built one
+    (duckdb-miint#230, open). A Flight-sourced reader is not affected, so the constraint
+    is only that this job never builds one itself."""
     import inspect
 
-    assert ".arrow()" not in inspect.getsource(align_denovo)
+    source = inspect.getsource(align_denovo)
+    assert ".arrow()" not in source
+    assert ".to_arrow_reader(" not in source
