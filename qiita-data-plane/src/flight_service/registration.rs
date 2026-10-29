@@ -478,6 +478,9 @@ fn register_files(
     // registration is returned without writing: `ducklake_add_data_files`
     // accepts a path it already holds and adds its rows again. Any other state
     // fails closed, because the earlier call may still be registering the files.
+    // That includes a committed call whose files have since had every row
+    // deleted: DuckLake drops a file from the table once a DELETE empties it, so
+    // nothing left in the catalog says the call committed.
     // Judged by the destination, not the source: `move_file` keeps a placed
     // file when removing its staging source fails.
     let moved_before = placed.iter().filter(|f| f.dest.exists()).count();
@@ -494,9 +497,10 @@ fn register_files(
              files into the lake and registered {} of them. Either it is still \
              running (or the data plane stopped mid-call), or it failed and kept \
              the files at their lake paths, which its error names (the catalog \
-             listed some of them, could not be read, or a move back failed). \
-             Redrive again once a running call has had time to finish; if this \
-             persists, the files need an operator",
+             listed some of them, could not be read, or a move back failed), or \
+             it committed and every row of a file it registered has been deleted \
+             since. Redrive again once a running call has had time to finish; if \
+             this persists, the files need an operator",
             payload.work_ticket_idx,
             payload.staging_dir,
             moved_before,

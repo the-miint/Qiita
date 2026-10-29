@@ -1815,9 +1815,10 @@ fn files_read_for(conn: &Connection, query: &str) -> i64 {
 /// 4-file block (one a mid-file split member) is queried after seeding a
 /// SMALL then a LARGE set of disjoint filler files; `Total Files Read` must
 /// stay == the block's file count both times. Also confirms the shipped
-/// `IN + BETWEEN + OR` (V3) prunes exactly as well as `IN + BETWEEN` (V2) and
-/// the per-member `OR` alone (V1) — the exactness residual does not defeat
-/// file pruning.
+/// `IN + BETWEEN + OR` (V3) prunes exactly as well as `IN + BETWEEN` (V2) — the
+/// exactness residual does not defeat file pruning — and pins that the
+/// per-member `OR` alone (V1) prunes too, which `block_read_where_clause` says
+/// it does not rely on.
 #[test]
 #[serial_test::serial]
 #[cfg(feature = "integration")]
@@ -1929,19 +1930,16 @@ fn block_read_selector_prunes_and_scales() {
         v3_large, v3_small,
         "files read must not grow with table size"
     );
-    // The coarse IN+BETWEEN is load-bearing: V2 prunes to the block's files,
-    // but V1 (the exact per-member OR ALONE) does NOT prune — a bare
-    // OR-of-ANDs full-scans every file. That is precisely why the shipped V3
-    // keeps IN+BETWEEN in front of the OR: those top-level conjuncts drive the
-    // file pruning, and the OR rides along as an exact residual on the pruned
-    // rows without defeating it (V3 == V2, not V1).
     assert_eq!(
         v2_large, block_files,
         "V2 (IN+BETWEEN) prunes to block files"
     );
+    // A canary for the fact `block_read_where_clause` records. If it fails,
+    // DuckDB stopped pushing the OR down; V3 still prunes on its coarse
+    // conjuncts, as the assertions above show.
     assert_eq!(
-        v1_large, files_large,
-        "per-member OR ALONE does not prune (full scan) — coarse IN+BETWEEN is load-bearing"
+        v1_large, block_files,
+        "the per-member OR alone no longer prunes to the block's files"
     );
 
     // Exactness: V3 returns the split-trimmed result; V2 over-selects the

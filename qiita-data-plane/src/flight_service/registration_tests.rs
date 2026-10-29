@@ -788,8 +788,9 @@ fn register_files_replayed_before_the_earlier_call_committed_fails_closed() {
 }
 
 /// A replay that lands after the earlier registration's rows were deleted
-/// (all of them, or some) still registers nothing: DuckLake keeps listing a
-/// data file whose rows are deleted.
+/// registers nothing. With some rows left, DuckLake still lists the file, and
+/// the replay returns the earlier registration. With every row gone, DuckLake
+/// has dropped the file from the table, so the replay fails closed.
 #[test]
 #[serial_test::serial]
 #[cfg(feature = "integration")]
@@ -822,10 +823,15 @@ fn register_files_replayed_after_its_rows_were_deleted_registers_nothing() {
             &data_path,
             std::path::Path::new("/"),
             &payload,
-        )
-        .expect("replayed register_files failed");
+        );
 
-        assert_eq!(replay.registered, first.registered);
+        if rows_left == 0 {
+            let err = replay.expect_err("a replay of an emptied file's registration succeeded");
+            assert_eq!(err.code(), tonic::Code::FailedPrecondition, "{err}");
+        } else {
+            let replay = replay.expect("replayed register_files failed");
+            assert_eq!(replay.registered, first.registered);
+        }
         assert_eq!(membership_rows(&connstr, &data_path, ref_idx), rows_left);
     }
 }
