@@ -104,15 +104,17 @@ const NO_TRANSACTION_TO_ROLL_BACK: &str = "no transaction is active";
 
 /// One pooled database and the directory it spills into.
 ///
-/// Every database gets a directory of its own. DuckDB 1.5.5 named its spill
-/// files the same in every database (`duckdb_temp_storage_DEFAULT-0.tmp` and
-/// siblings), and two databases in one process spilling into one shared
-/// directory failed in all four runs — three segfaults and one `INTERNAL Error:
-/// Cannot perform IO in in-memory database - CreateBlock!` — where a directory
-/// each returned correct results in four of four. DuckDB 2.0 names them per
-/// database (`duckdb_temp_<pid>_<n>_…`), and the same shared-directory workload
-/// returned correct results in four of four. The directories stay for the
-/// removal on drop below.
+/// Every database gets a directory of its own, named `<host>-<pid>-<suffix>`.
+/// That name is what lets `sweep_abandoned_spill_directories` remove a stopped
+/// process's spill at boot without touching a running instance's, on this host
+/// or on another host sharing the root. DuckDB's own spill-file names carry a
+/// pid but no host. DuckDB 1.5.5 needed the separation for correctness as well:
+/// it named its spill files the same in every database
+/// (`duckdb_temp_storage_DEFAULT-0.tmp` and siblings), and two databases
+/// spilling into one shared directory failed in all four runs — three segfaults
+/// and one `INTERNAL Error: Cannot perform IO in in-memory database -
+/// CreateBlock!`. DuckDB 2.0 names them per database (`duckdb_temp_<pid>_<n>_…`),
+/// and the same workload returned correct results in four of four.
 ///
 /// `conn` is declared before `spill` so it drops first: DuckDB closes and
 /// releases its spill files, then the directory is removed. The data plane has
