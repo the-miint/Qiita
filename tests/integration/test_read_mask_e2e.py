@@ -162,12 +162,8 @@ async def sequenced_prep_sample(postgres_pool, human_admin_session):
         biosample_idxs=[biosample_idx],
         prep_sample_idxs=[prep_sample_idx],
     )
-    await postgres_pool.execute(
-        "DELETE FROM qiita.sequenced_pool WHERE idx = $1", pool_idx
-    )
-    await postgres_pool.execute(
-        "DELETE FROM qiita.sequencing_run WHERE idx = $1", run_idx
-    )
+    await postgres_pool.execute("DELETE FROM qiita.sequenced_pool WHERE idx = $1", pool_idx)
+    await postgres_pool.execute("DELETE FROM qiita.sequencing_run WHERE idx = $1", run_idx)
 
 
 def _data_plane_url(data_plane) -> str:
@@ -193,17 +189,20 @@ async def _run_persist_read_metrics(
 ):
     """Drive the REAL runner adapter for the `persist-read-metrics` YAML entry."""
     from qiita_control_plane.runner import _run_action_primitive
+    from qiita_control_plane.testing.run_context import run_context
 
     entry = _entry_by_name("persist-read-metrics")
     await _run_action_primitive(
-        postgres_pool,
+        run_context(
+            pool=postgres_pool,
+            scope_target={"prep_sample_idx": prep_sample_idx},
+            work_ticket_idx=0,
+            signing_key=data_plane["secret"],
+            data_plane_url=_data_plane_url(data_plane),
+        ),
         entry,
         {"read_mask": str(read_mask_path)},
-        Path(read_mask_path).parent,  # workspace (unused by this primitive)
-        {"prep_sample_idx": prep_sample_idx},
-        work_ticket_idx=0,
-        signing_key=data_plane["secret"],
-        data_plane_url=_data_plane_url(data_plane),
+        Path(read_mask_path).parent,
     )
 
 
@@ -213,17 +212,20 @@ async def _run_register_files(
     """Drive the REAL runner adapter for the `register-files` YAML entry — moves
     read_mask.parquet out of staging into DuckLake via the data plane DoAction."""
     from qiita_control_plane.runner import _run_action_primitive
+    from qiita_control_plane.testing.run_context import run_context
 
     entry = _entry_by_name("register-files")
     await _run_action_primitive(
-        postgres_pool,
+        run_context(
+            pool=postgres_pool,
+            scope_target={},
+            work_ticket_idx=work_ticket_idx,
+            signing_key=data_plane["secret"],
+            data_plane_url=_data_plane_url(data_plane),
+        ),
         entry,
         {"read_mask_staging_dir": str(staging_dir)},
         staging_dir,
-        {},
-        work_ticket_idx=work_ticket_idx,
-        signing_key=data_plane["secret"],
-        data_plane_url=_data_plane_url(data_plane),
     )
 
 
@@ -363,9 +365,7 @@ async def _register_fresh_mask(
     )
 
 
-async def test_purge_before_resubmit_leaves_no_duplicate_rows(
-    postgres_pool, data_plane, tmp_path
-):
+async def test_purge_before_resubmit_leaves_no_duplicate_rows(postgres_pool, data_plane, tmp_path):
     """The recovery contract: register a mask, purge it via the real delete_mask
     DoAction, then re-register (the resubmit) — exactly ONE logical copy of the
     mask's rows remains.

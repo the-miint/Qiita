@@ -62,7 +62,9 @@ async def ctx(postgres_pool, monkeypatch):
     app.state.settings = Settings(
         database_url="unused", flight_signing_key=b"\x00" * 32, data_plane_url="unused"
     )
-    app.state.compute_backend_client = object()
+    # The app is shared across the worker's tests; monkeypatch restores the client so
+    # a later test does not call this stub (reference delete purges through it).
+    monkeypatch.setattr(app.state, "compute_backend_client", object(), raising=False)
     app.state.running_dispatches = set()
 
     dispatched: list[int] = []

@@ -22,6 +22,36 @@ INCOMING=/opt/qiita/incoming
     exit 1
 }
 
+# Data-plane topology (see "Data-plane topology" in _common.sh) and build commit.
+# Checked before the migration guard and before anything is installed, so a
+# malformed or unresolvable or public entry, or a short QIITA_BUILD_SHA, aborts
+# with the running deploy untouched.
+DP_PORTS=$(qiita_data_plane_ports)
+DP_PEERS=$(qiita_data_plane_peers)
+DP_BIND_HOST=$(qiita_data_plane_bind_host)
+DP_BUILD_COMMIT=$(qiita_data_plane_build_commit)
+# Per-instance limits (see "Per-instance limits" in _common.sh), written into each
+# instance's drop-in below.
+DP_MEMORY_MAX=$(qiita_data_plane_instance_memory_max)
+qiita_assert_pool_memory_fits "$DP_MEMORY_MAX"
+qiita_assert_instance_memory_fits "$DP_PORTS" "$DP_MEMORY_MAX"
+qiita_dp_env_omits_local_instances
+echo "data plane instances: $DP_PORTS on $DP_BIND_HOST"
+if [ -n "$DP_MEMORY_MAX" ]; then
+    echo "data plane instance MemoryMax: $DP_MEMORY_MAX each"
+fi
+if [ -n "$DP_PEERS" ]; then
+    echo "data plane peers (other hosts, not restarted by this deploy): $DP_PEERS"
+    for peer in $DP_PEERS; do
+        qiita_assert_peer_private "$peer"
+    done
+fi
+# Instances whose port left the list: stopped and disabled below when the deploy
+# is asked to, otherwise the deploy stops here.
+DP_DISABLE_UNITS=$(qiita_data_plane_units_to_disable "$DP_PORTS")
+if [ -n "$DP_DISABLE_UNITS" ]; then
+    echo "data plane instances to stop and disable (QIITA_DP_DISABLE_REMOVED=1): $DP_DISABLE_UNITS"
+fi
 # Migration-pending guard. The code we're about to deploy assumes the schema
 # produced by every file in db/migrations/; restarting services against a DB
 # missing any of them surfaces as runtime 500s, not a boot failure. Applying
@@ -179,6 +209,15 @@ done
 
 install -d -o root -g root -m 0755 /opt/qiita/data-plane
 install -m 0755 "$INCOMING/qiita-data-plane" /opt/qiita/data-plane/qiita-data-plane
+# The full deployed commit for the data planes (QIITA_DATA_PLANE_BUILD_ENV in
+# _common.sh); empty when QIITA_BUILD_SHA is unset, and verify.sh then skips the
+# commit check.
+if [ -n "$DP_BUILD_COMMIT" ]; then
+    printf 'BUILD_COMMIT=%s\n' "$DP_BUILD_COMMIT" > "$QIITA_DATA_PLANE_BUILD_ENV"
+else
+    : > "$QIITA_DATA_PLANE_BUILD_ENV"
+fi
+chmod 0644 "$QIITA_DATA_PLANE_BUILD_ENV"
 
 # Build/verify container-workflow SIFs before the restarts (a SLURM step depends
 # on its image being present and current). Runs as root and chowns each produced
@@ -188,8 +227,17 @@ install -m 0755 "$INCOMING/qiita-data-plane" /opt/qiita/data-plane/qiita-data-pl
 # here, before any service restarts onto a broken image. See build-sifs.sh.
 "$(dirname "${BASH_SOURCE[0]}")/build-sifs.sh"
 
-cp "$INCOMING/deploy/nginx/qiita.conf" /etc/nginx/conf.d/qiita.conf
-sed -i "s/__QIITA_HOSTNAME__/${QIITA_HOSTNAME}/g" /etc/nginx/conf.d/qiita.conf
+# Tested before any service restarts, so anything nginx rejects (a peer it cannot
+# resolve, a malformed address) fails the deploy with the running services and the
+# deployed nginx config untouched. Without the TLS files `nginx -t` cannot run, so
+# the config is only rendered; the reload below is skipped then too.
+if qiita_nginx_tls_present; then
+    qiita_render_and_test_nginx_conf "$INCOMING/deploy/nginx/qiita.conf" "$QIITA_NGINX_CONF" \
+        "$QIITA_HOSTNAME" "$DP_BIND_HOST" "$DP_PORTS" "$DP_PEERS"
+else
+    qiita_render_nginx_conf "$INCOMING/deploy/nginx/qiita.conf" "$QIITA_NGINX_CONF" \
+        "$QIITA_HOSTNAME" "$DP_BIND_HOST" "$DP_PORTS" "$DP_PEERS"
+fi
 cp "$INCOMING/deploy/systemd/"*.service /etc/systemd/system/
 # Install systemd dropin directories. Each dropin lives under
 # deploy/systemd/<unit>.service.d/*.conf and is materialized at
@@ -204,7 +252,19 @@ for dropin_src in "$INCOMING/deploy/systemd/"*.service.d; do
         install -m 0644 -o root -g root "$conf" "/etc/systemd/system/$unit_dropin_name/"
     done
 done
+# Per-instance drop-ins, loaded by the daemon-reload below so the restart applies
+# them.
+qiita_write_data_plane_dropins "$DP_PORTS" "$DP_MEMORY_MAX"
 systemctl daemon-reload
+
+# Wait for the data plane to have nothing in flight before any service restarts:
+# restarting the control plane or orchestrator ends the data-plane calls they have
+# open, and restarting the data plane refuses new requests for as long as its drain
+# runs. Every local instance is waited on, then all are restarted together below.
+# See wait_for_data_plane_idle (deploy/_common.sh).
+read -r -a dp_units <<< "$(qiita_data_plane_units "$DP_PORTS")"
+read -r -a dp_disable_units <<< "$DP_DISABLE_UNITS"
+wait_for_data_plane_idle "$DP_ENV" "${dp_units[@]}" "${dp_disable_units[@]}"
 
 # Skip restart when env file is absent (first deploy; operator writes envs in runbook steps 1/8b/9a).
 restart_if_env_present() {
@@ -216,17 +276,33 @@ restart_if_env_present() {
 }
 restart_if_env_present qiita-control-plane         /etc/qiita/control-plane.env
 restart_if_env_present qiita-compute-orchestrator  /etc/qiita/compute-orchestrator.env
-restart_if_env_present qiita-data-plane@50051      /etc/qiita/data-plane.env
-# If you scale out the data plane (additional qiita-data-plane@NNNN instances),
-# add a restart_if_env_present line for each here.
+# One unit per port in the list that rendered the upstream above. `enable` so an
+# instance added to QIITA_DATA_PLANE_PORTS also starts at boot. One `systemctl
+# restart` for all of them, so they all stop accepting new requests at the same
+# moment and their drains run at the same time. A removed instance's stop is queued
+# first (--no-block) so its drain overlaps theirs; the `stop` after the nginx reload
+# waits for it (systemd 257: 5.2 s for two 5 s drains, 10.2 s one after the other).
+if [ -r "$DP_ENV" ]; then
+    if [ "${#dp_disable_units[@]}" -gt 0 ]; then
+        systemctl disable "${dp_disable_units[@]}" >/dev/null
+        systemctl stop --no-block "${dp_disable_units[@]}"
+    fi
+    systemctl enable "${dp_units[@]}" >/dev/null
+    systemctl restart "${dp_units[@]}"
+else
+    echo "skipping restart ${dp_units[*]} and stop ${dp_disable_units[*]} — $DP_ENV not present" >&2
+    dp_disable_units=()
+fi
 
-# Validate the rendered config before reloading. Skip both when TLS files are
-# absent (nginx -t would fail on the missing cert/key and refuse reload). With
-# set -e, a bad config fails the deploy here loudly instead of a silently-failed
-# reload leaving the old config live.
-if [ -r /etc/ssl/certs/qiita.crt ] && [ -r /etc/ssl/private/qiita.key ]; then
-    nginx -t
+# Load the config tested above.
+if qiita_nginx_tls_present; then
     systemctl reload nginx
 else
-    echo "skipping nginx reload — TLS files at /etc/ssl/{certs,private}/qiita.{crt,key} not present" >&2
+    echo "skipping nginx reload — $QIITA_NGINX_TLS_CERT / $QIITA_NGINX_TLS_KEY not present" >&2
+fi
+# After the reload, so nginx stops routing to a removed instance without waiting for
+# its drain. `systemctl stop` returns 0 when the unit is killed at TimeoutStopSec
+# (systemd 257), so a slow drain does not fail the deploy here.
+if [ "${#dp_disable_units[@]}" -gt 0 ]; then
+    systemctl stop "${dp_disable_units[@]}"
 fi

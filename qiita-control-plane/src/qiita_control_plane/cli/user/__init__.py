@@ -17,8 +17,9 @@ command reaches the system and whether the auth model can gate it:
                  moments the auth system can't help — no admin exists yet,
                  the API is down, or you're recovering state.
 
-This module owns the user-facing argparse surface and its subcommand
-handlers. PAT file I/O, the LoginRocket loopback flow, the
+The entry point is `main`. `_parser.py` builds the user-facing argparse
+surface, and each subcommand's handler lives in the submodule for its
+area. PAT file I/O, the LoginRocket loopback flow, the
 authenticated HTTP call helper, and the generic token-read + invoke +
 JSON-print runner live in `cli._common`.
 
@@ -27,14 +28,11 @@ from ~/.qiita/token (mode 0600).
 """
 
 from .. import _common
-from ._helpers import _build_body, _handle_patch, _handle_read, _lane_arg
+from ._helpers import _build_body, _lane_arg
 from ._parser import _build_parser
-from .alignment import _handle_alignment_cohort, _handle_alignment_list
-from .auth import _handle_login, _handle_profile_set, _handle_whoami, _patch_user_me
-from .biosample import _handle_biosample_create, _post_biosample
-from .feature_table import _handle_feature_table_build
+from .auth import _patch_user_me
+from .biosample import _post_biosample
 from .pacbio import (
-    _handle_submit_pacbio_ingest,
     _PacbioPreflightRow,
     _read_pacbio_preflight_rows,
     _resolve_sample_bams,
@@ -45,43 +43,21 @@ from .pool import (
     _READ_MASK_ACTION_VERSION,
     _assert_host_reference_ready,
     _assert_resolved_references_ready,
-    _handle_delete_sequenced_pool,
-    _handle_pool_completion,
-    _handle_submit_bcl_convert,
-    _handle_submit_block_mask_pool,
-    _handle_submit_host_filter_pool,
     _PreflightRow,
     _read_preflight_rows,
     _resolved_decisions,
 )
-from .reference import (
-    _handle_reference_list,
-    _handle_reference_load,
-    _run_reference_load,
-    _serializable,
-)
+from .reference import _run_reference_load, _serializable
 from .sequencing import (
-    _handle_prep_protocol_list,
-    _handle_prep_sample_retire,
-    _handle_run_preflight_update_lane,
-    _handle_sequenced_pool_create,
-    _handle_sequenced_sample_create,
-    _handle_sequencing_run_create,
-    _handle_sequencing_run_lookup,
     _post_preflight_update_lane,
     _post_sequenced_pool,
     _post_sequenced_sample,
     _post_sequencing_run,
 )
-from .study import _handle_study_create, _post_study
+from .study import _post_study
 from .ticket import (
     _get_work_ticket,
     _get_work_ticket_step_logs,
-    _handle_ticket_list,
-    _handle_ticket_logs,
-    _handle_ticket_run,
-    _handle_ticket_status,
-    _handle_ticket_submit,
     _list_work_tickets,
     _post_work_ticket,
     _render_ticket_logs,
@@ -108,36 +84,6 @@ __all__ = [
     "_build_body",
     "_get_work_ticket",
     "_get_work_ticket_step_logs",
-    "_handle_alignment_cohort",
-    "_handle_alignment_list",
-    "_handle_biosample_create",
-    "_handle_delete_sequenced_pool",
-    "_handle_feature_table_build",
-    "_handle_login",
-    "_handle_patch",
-    "_handle_pool_completion",
-    "_handle_prep_protocol_list",
-    "_handle_prep_sample_retire",
-    "_handle_profile_set",
-    "_handle_read",
-    "_handle_reference_list",
-    "_handle_reference_load",
-    "_handle_run_preflight_update_lane",
-    "_handle_sequenced_pool_create",
-    "_handle_sequenced_sample_create",
-    "_handle_sequencing_run_create",
-    "_handle_sequencing_run_lookup",
-    "_handle_study_create",
-    "_handle_submit_bcl_convert",
-    "_handle_submit_block_mask_pool",
-    "_handle_submit_host_filter_pool",
-    "_handle_submit_pacbio_ingest",
-    "_handle_ticket_list",
-    "_handle_ticket_logs",
-    "_handle_ticket_run",
-    "_handle_ticket_status",
-    "_handle_ticket_submit",
-    "_handle_whoami",
     "_lane_arg",
     "_list_work_tickets",
     "_patch_user_me",

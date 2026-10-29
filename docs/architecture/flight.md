@@ -47,9 +47,14 @@ token aged out — from one shared module
 ([`qiita_common.data_plane_errors`](../../qiita-common/src/qiita_common/data_plane_errors.py)).
 
 Each pooled connection carries its own `threads`, `memory_limit`, `temp_directory`
-and `max_temp_directory_size`, divided at boot from the memory ceiling the
-process detects for itself and overridable per deploy (`DUCKLAKE_POOL_SIZE` and
-the `DUCKDB_*` vars in `.env.data-plane.example`). A read runs with insertion
+and `max_temp_directory_size`, overridable per deploy (`DUCKLAKE_POOL_SIZE` and
+the `DUCKDB_*` vars in `.env.data-plane.example`). Unset, `memory_limit` is divided
+at boot from the memory ceiling the process detects for itself, and `threads` from
+the CPU budget it detects, divided by the local instances and the pool size
+(`derived_threads` in `qiita-data-plane/src/config.rs`). The spill cap is the explicit
+`DUCKDB_MAX_TEMP_DIRECTORY_SIZE` when set; else, when `DUCKDB_TEMP_DIRECTORY` is set,
+it is derived from that filesystem's free space; else it is a 4GiB default
+(`spill_cap` in `qiita-data-plane/src/config.rs`). A read runs with insertion
 order off, so a DoGet's rows arrive in no defined order; a client that needs one
 orders them itself. A DoAction that writes to the lake runs instead on one
 thread with order on, so what it writes keeps its source's order (`LakeWriter`
@@ -95,7 +100,7 @@ IPC codec is stamped per record-batch message by the writer, which is why the
 custom header lives at that layer rather than the transport's.)
 
 Header name constants: `IPC_COMPRESSION_HEADER` in
-`qiita-data-plane/src/flight_service.rs` and its twin in
+`qiita-data-plane/src/flight_service/doget.rs` and its twin in
 `qiita-common/src/qiita_common/flight_constants.py`.
 
 ### DoGet column projection
@@ -141,7 +146,7 @@ preferred to widening it silently. The one production consumer,
 twice — for the ticket and for the `SELECT` it binds — so the two cannot drift.
 
 Allowlist constants: `ALIGNMENT_PROJECTION_COLUMNS` in
-`qiita-data-plane/src/flight_service.rs` and `_PROJECTION_COLUMNS` in
+`qiita-data-plane/src/flight_service/query.rs` and `_PROJECTION_COLUMNS` in
 `qiita-control-plane/src/qiita_control_plane/auth/tickets.py`. Both are
 hand-copies (neither language can import the other) pinned by parity tests, and
 the Rust one is additionally checked against the live `alignment_visible`

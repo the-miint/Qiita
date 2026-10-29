@@ -44,11 +44,9 @@ import uuid
 
 import duckdb
 import pytest
-from conftest import ducklake_connect
 from qiita_common.api_paths import LOOPBACK_HOST
 from qiita_common.models.reference import Tier
 from qiita_common.taxonomy import RANK_COLUMNS
-
 from qiita_control_plane.repositories.alignment_definition import mint_alignment_definition
 from qiita_control_plane.repositories.block import (
     create_alignment_sample_pending,
@@ -60,8 +58,9 @@ from qiita_control_plane.testing.db_seeds import (
     seed_prep_sample_to_study_link,
     seed_sequenced_sample_subtype,
 )
-
 from qiita_control_plane.testing.db_teardown import teardown_entity_graph
+
+from conftest import ducklake_connect
 
 _THRESHOLD = "0.01"
 
@@ -271,8 +270,7 @@ async def publishable_cohort(postgres_pool, human_admin_session, regular_user_se
             "INSERT INTO qiita_lake.reference_sequences"
             " (feature_idx, sequence_hash, sequence_length_bp) VALUES "
             + ", ".join(
-                f"({features[contig]}, gen_random_uuid(), {bp})"
-                for contig, bp in _LENGTHS.items()
+                f"({features[contig]}, gen_random_uuid(), {bp})" for contig, bp in _LENGTHS.items()
             )
         )
         lake.execute(

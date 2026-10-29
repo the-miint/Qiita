@@ -11,7 +11,6 @@ import asyncpg
 import httpx
 import pytest_asyncio
 from fastapi import Depends, FastAPI
-
 from qiita_control_plane.deps import TxConnFactory, get_tx_conn_factory
 
 
@@ -34,17 +33,13 @@ async def clean_kv(_kv_table: None, postgres_pool: asyncpg.Pool) -> None:
 
 
 @pytest_asyncio.fixture(scope="module")
-async def client(
-    postgres_pool: asyncpg.Pool, _kv_table: None
-) -> AsyncIterator[httpx.AsyncClient]:
+async def client(postgres_pool: asyncpg.Pool, _kv_table: None) -> AsyncIterator[httpx.AsyncClient]:
     """Tiny FastAPI app with two test routes exercising get_tx_conn_factory."""
     app = FastAPI()
     app.state.pool = postgres_pool
 
     @app.post("/insert/{key}")
-    async def _insert(
-        key: str, tx: TxConnFactory = Depends(get_tx_conn_factory)
-    ) -> dict:
+    async def _insert(key: str, tx: TxConnFactory = Depends(get_tx_conn_factory)) -> dict:
         async with tx() as conn:
             await conn.execute(
                 "INSERT INTO _test_db_deps_kv (key, value) VALUES ($1, $2)",
@@ -54,9 +49,7 @@ async def client(
         return {"key": key}
 
     @app.post("/insert-fail/{key}")
-    async def _insert_fail(
-        key: str, tx: TxConnFactory = Depends(get_tx_conn_factory)
-    ) -> dict:
+    async def _insert_fail(key: str, tx: TxConnFactory = Depends(get_tx_conn_factory)) -> dict:
         # Insert a row, then raise inside the `async with` block — the
         # factory's `conn.transaction()` must roll back the insert.
         async with tx() as conn:

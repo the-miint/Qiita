@@ -23,7 +23,6 @@ from pathlib import Path
 
 import duckdb
 import pytest
-
 from qiita_common.api_paths import LOOPBACK_HOST
 from qiita_compute_orchestrator.data_plane_client import open_doget_stream
 from qiita_compute_orchestrator.jobs import build_routing_index
@@ -60,13 +59,9 @@ def _seed_reference_rows(data_plane):
             rows.append((fidx, 0, seq[:mid]))
             rows.append((fidx, 1, seq[mid:]))
         values = ", ".join(f"({f}, {c}, '{d}')" for f, c, d in rows)
-        conn.execute(
-            f"INSERT INTO qiita_lake.reference_sequence_chunks VALUES {values}"
-        )
+        conn.execute(f"INSERT INTO qiita_lake.reference_sequence_chunks VALUES {values}")
         member_values = ", ".join(f"({_REF_IDX}, {f})" for f in _CONTIGS)
-        conn.execute(
-            f"INSERT INTO qiita_lake.reference_membership VALUES {member_values}"
-        )
+        conn.execute(f"INSERT INTO qiita_lake.reference_membership VALUES {member_values}")
     finally:
         conn.close()
 
@@ -99,9 +94,7 @@ def _write_shard_mapping(path):
     """Write the shard_mapping Parquet `(feature_idx BIGINT, bucket_name VARCHAR)`
     — one row per feature, bucket_name = str(shard_id)."""
     with duckdb.connect(":memory:") as conn:
-        values_sql = ", ".join(
-            "(CAST(? AS BIGINT), CAST(? AS VARCHAR))" for _ in _SHARD_OF
-        )
+        values_sql = ", ".join("(CAST(? AS BIGINT), CAST(? AS VARCHAR))" for _ in _SHARD_OF)
         params = []
         for fidx, shard_id in _SHARD_OF.items():
             params.extend([fidx, str(shard_id)])
@@ -134,9 +127,7 @@ def _classify_bucket(router_dir, read_id, sequence):
     return {r[0] for r in rows}
 
 
-def test_build_routing_index_routes_reads_to_expected_shard(
-    data_plane, tmp_path, monkeypatch
-):
+def test_build_routing_index_routes_reads_to_expected_shard(data_plane, tmp_path, monkeypatch):
     """Build the router over the live DP, then classify a read drawn from each
     feature and assert it routes to that feature's shard bucket
     (`bucket_name == str(shard_id)`)."""
@@ -155,10 +146,7 @@ def test_build_routing_index_routes_reads_to_expected_shard(
 
     meta = json.loads(Path(out["routing_index_meta"]).read_text())
     router_dir = Path(meta["fs_path"])
-    assert (
-        router_dir
-        == tmp_path / "derived" / "references" / str(_REF_IDX) / "rype-router.ryxdi"
-    )
+    assert router_dir == tmp_path / "derived" / "references" / str(_REF_IDX) / "rype-router.ryxdi"
     assert router_dir.is_dir(), "router .ryxdi was not built"
     assert meta["index_type"] == "rype_router"
     # Two shard buckets over three features (830001+830002 -> 0, 830003 -> 1).

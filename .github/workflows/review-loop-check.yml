@@ -30,6 +30,7 @@ jobs:
           PR_BODY: ${{ github.event.pull_request.body }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           BASE_REF: ${{ github.base_ref }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           git fetch --quiet origin "$BASE_REF"
           BASE_SHA="origin/$BASE_REF" bash scripts/check-review-loop.sh

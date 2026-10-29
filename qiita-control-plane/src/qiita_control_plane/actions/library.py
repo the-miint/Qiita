@@ -66,6 +66,7 @@ from qiita_common.taxonomy import TAXONOMY_SOURCE_TABLE, genome_lineage_select_s
 
 from ..auth.tickets import run_signed_flight_call, sign_action, sign_ticket
 from ..miint import duckdb_connect
+from ..problem_list import capped
 from ..repositories import require_transaction
 from ..repositories.assembly import (
     ASSEMBLY_GENOME_MAP_PAIRS_SQL,
@@ -1738,7 +1739,7 @@ async def plan_shards(
 # They do NOT converge the same way on a re-run. This side upserts and COALESCEs,
 # so a replay whose genomes_dir has no sidecar keeps the attributes an earlier
 # pass stored; the lake side is replace-keyed on (prep_sample_idx,
-# processing_idx) in `flight_service::REPLACE_KEY_TABLES`, so the same replay
+# processing_idx) in `flight_service::registration::REPLACE_KEY_TABLES`, so the same replay
 # supersedes that run's lake rows with the NULLs it just computed. Postgres is
 # the authority for these four columns; the lake copy reflects the LAST run.
 ASSEMBLY_MEMBERSHIP_JOIN_SQL = (
@@ -2361,9 +2362,7 @@ async def persist_qc_checks(
         if c.reason is not None and c.reason not in allowed[c.check]:
             problems.append(f"{c.check}: reason {c.reason!r} is not listed in qc_reasons.yml")
     if problems:
-        shown = "; ".join(problems[:_MAX_REPORTED])
-        rest = len(problems) - _MAX_REPORTED
-        raise ValueError(f"invalid qc_checks: {shown}" + (f"; and {rest} more" if rest > 0 else ""))
+        raise ValueError(f"invalid qc_checks: {'; '.join(capped(problems, _MAX_REPORTED))}")
     async with pool.acquire() as conn, conn.transaction():
         ticket = await conn.fetchrow(
             "SELECT mask_idx, alignment_idx FROM qiita.work_ticket WHERE work_ticket_idx = $1",

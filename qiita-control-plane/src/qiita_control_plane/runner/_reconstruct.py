@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -20,7 +19,6 @@ from qiita_common.api_paths import (
     LibraryPrimitive,
 )
 from qiita_common.backend_failure import BackendFailure, FailureKind
-from qiita_common.compute_backend_client import ComputeBackendClient
 from qiita_common.data_plane_errors import (
     is_data_plane_transient,
 )
@@ -42,7 +40,6 @@ from ..actions.library import (
     MINT_FEATURES_OUTPUT_BASENAME,
     QcProducer,
 )
-from ..fanout_dispatch import DEFAULT_FANOUT_MAX_INFLIGHT
 from ..repositories.assembly import AssemblySampleInvalidated
 from ..repositories.reference_membership import count_reference_shards
 from ..shard_orchestration import (
@@ -59,6 +56,7 @@ from ..workspace import (
     step_output_dir,
 )
 from ._alignment import _workflow_writes_alignment_gate
+from ._context import RunContext
 from ._dispatch import _best_effort_record_failed, _result_with_infra_retry
 from ._mask import MASK_IDX_BINDING, _workflow_writes_mask_gate
 from ._processing import _workflow_writes_assembly_gate
@@ -154,15 +152,9 @@ def _attempt_is_terminal(
 
 
 async def _reconstruct_completed_outputs(
+    ctx: RunContext,
     entry: WorkflowStep | WorkflowAction,
     completed: step_progress.StepProgressRow,
-    workspace: Path,
-    backend_client: ComputeBackendClient,
-    *,
-    pool: asyncpg.Pool,
-    work_ticket_idx: int,
-    poll_interval_seconds: float,
-    scope_target: dict[str, Any],
 ) -> dict[str, Any]:
     """Rebuild the bound outputs of an already-COMPLETED entry from disk,
     without re-running it.
@@ -186,10 +178,12 @@ async def _reconstruct_completed_outputs(
     recovery is a SLURM-backend concern (local steps are synchronous and don't
     survive a restart mid-flight), so this returns its outputs empty — a
     downstream consumer that needs a missing binding fails loudly via KeyError."""
-    attempt_workspace = step_attempt_dir(workspace, entry.name, completed.attempt)
+    attempt_workspace = step_attempt_dir(ctx.workspace, entry.name, completed.attempt)
     if isinstance(entry, WorkflowAction):
         if entry.name == LibraryPrimitive.PLAN_SHARDS:
-            return await _reconstruct_plan_shards_outputs(pool, scope_target, attempt_workspace)
+            return await _reconstruct_plan_shards_outputs(
+                ctx.pool, ctx.scope_target, attempt_workspace
+            )
         return _reconstruct_action_outputs(entry, attempt_workspace)
     if completed.compute_target is not ComputeTarget.SLURM:
         return {}
@@ -203,12 +197,12 @@ async def _reconstruct_completed_outputs(
     )
     status = StepStatusWire(status=StepStatus.COMPLETED, recovered=True)
     raw_outputs = await _result_with_infra_retry(
-        backend_client,
+        ctx.backend_client,
         handle,
         status,
-        pool=pool,
-        work_ticket_idx=work_ticket_idx,
-        poll_interval_seconds=poll_interval_seconds,
+        pool=ctx.pool,
+        work_ticket_idx=ctx.work_ticket_idx,
+        poll_interval_seconds=ctx.poll_interval_seconds,
     )
     return {name: Path(raw_outputs[name]) for name in entry.outputs}
 
@@ -312,7 +306,7 @@ def _register_files_payload(attempt_dir: Path, staging_dir: Path) -> dict[str, s
     therefore recorded before the first call, where every attempt of the entry
     finds it, and resent on a replay whatever the directory still holds; the data plane answers a
     resent payload from where it moved the files (`register_files` in the data
-    plane's flight_service.rs). A staged file the record does not name was not
+    plane's flight_service/registration.rs). A staged file the record does not name was not
     part of the earlier call, so the replay refuses it rather than registering
     a payload neither call sent."""
     staged = _staged_register_files(staging_dir)
@@ -346,19 +340,13 @@ def _register_files_payload(attempt_dir: Path, staging_dir: Path) -> dict[str, s
 
 
 async def _dispatch_action(
-    pool: asyncpg.Pool,
+    ctx: RunContext,
     entry: WorkflowAction,
     bound: dict[str, Any],
     workspace: Path,
-    scope_target: dict[str, Any],
     *,
-    work_ticket_idx: int,
     step_index: int,
     attempt: int,
-    signing_key: bytes,
-    data_plane_url: str,
-    dispatch_cb: Callable[[int], Any] | None = None,
-    max_inflight: int = DEFAULT_FANOUT_MAX_INFLIGHT,
 ) -> dict[str, Any]:
     """Run one in-process `action:` entry and record its progress.
 
@@ -376,30 +364,19 @@ async def _dispatch_action(
     `DATA_PLANE_TRANSIENT` BackendFailure, so the retry loop re-runs the entry;
     any other exception is re-raised unchanged."""
     await step_progress.record_submitting(
-        pool,
-        work_ticket_idx=work_ticket_idx,
+        ctx.pool,
+        work_ticket_idx=ctx.work_ticket_idx,
         step_index=step_index,
         attempt=attempt,
         step_name=entry.name,
         compute_target=ComputeTarget.CONTROL_PLANE,
     )
     try:
-        outputs = await _run_action_primitive(
-            pool,
-            entry,
-            bound,
-            workspace,
-            scope_target,
-            work_ticket_idx=work_ticket_idx,
-            signing_key=signing_key,
-            data_plane_url=data_plane_url,
-            dispatch_cb=dispatch_cb,
-            max_inflight=max_inflight,
-        )
+        outputs = await _run_action_primitive(ctx, entry, bound, workspace)
     except BackendFailure as exc:
         await _best_effort_record_failed(
-            pool,
-            work_ticket_idx=work_ticket_idx,
+            ctx.pool,
+            work_ticket_idx=ctx.work_ticket_idx,
             step_index=step_index,
             attempt=attempt,
             failure_kind=exc.kind.value,
@@ -415,8 +392,8 @@ async def _dispatch_action(
                 reason=f"{type(exc).__name__}: {exc!s}"[:2000],
             )
             await _best_effort_record_failed(
-                pool,
-                work_ticket_idx=work_ticket_idx,
+                ctx.pool,
+                work_ticket_idx=ctx.work_ticket_idx,
                 step_index=step_index,
                 attempt=attempt,
                 failure_kind=failure.kind.value,
@@ -428,8 +405,8 @@ async def _dispatch_action(
         # handler classifies it UNKNOWN_PERMANENT; record the same on the progress
         # row, then re-raise unchanged.
         await _best_effort_record_failed(
-            pool,
-            work_ticket_idx=work_ticket_idx,
+            ctx.pool,
+            work_ticket_idx=ctx.work_ticket_idx,
             step_index=step_index,
             attempt=attempt,
             failure_kind=FailureKind.UNKNOWN_PERMANENT.value,
@@ -437,7 +414,7 @@ async def _dispatch_action(
         )
         raise
     await step_progress.record_completed(
-        pool, work_ticket_idx=work_ticket_idx, step_index=step_index, attempt=attempt
+        ctx.pool, work_ticket_idx=ctx.work_ticket_idx, step_index=step_index, attempt=attempt
     )
     return outputs
 
@@ -459,6 +436,14 @@ def _workflow_qc_producer(steps: list[Any]) -> QcProducer | None:
     return QcProducer.NONE
 
 
+def _require_scope(entry_name: str, scope_target: dict[str, Any], kind: ScopeTargetKind) -> None:
+    """Refuse a ticket whose scope target is not `kind`."""
+    if scope_target["kind"] != kind.value:
+        raise RuntimeError(
+            f"{entry_name} requires a {kind.value}-scoped ticket; got {scope_target['kind']!r}"
+        )
+
+
 async def _ticket_alignment_idx(
     pool: asyncpg.Pool, work_ticket_idx: int, *, entry: str, scope_target: dict[str, Any]
 ) -> int:
@@ -476,10 +461,7 @@ async def _ticket_alignment_idx(
     (`_alignment._persist_alignment_idx`) or `align_planner` — or a
     `DELETE /alignment-definition/{idx}` detached it mid-flight (ON DELETE SET NULL).
     """
-    if scope_target["kind"] != ScopeTargetKind.PREP_SAMPLE.value:
-        raise RuntimeError(
-            f"{entry} requires a prep_sample-scoped ticket; got {scope_target['kind']!r}"
-        )
+    _require_scope(entry, scope_target, ScopeTargetKind.PREP_SAMPLE)
     alignment_idx = await pool.fetchval(
         "SELECT alignment_idx FROM qiita.work_ticket WHERE work_ticket_idx = $1",
         work_ticket_idx,
@@ -494,17 +476,10 @@ async def _ticket_alignment_idx(
 
 
 async def _run_action_primitive(
-    pool: asyncpg.Pool,
+    ctx: RunContext,
     entry: WorkflowAction,
     bound: dict[str, Any],
     workspace: Path,
-    scope_target: dict[str, Any],
-    *,
-    work_ticket_idx: int,
-    signing_key: bytes,
-    data_plane_url: str,
-    dispatch_cb: Callable[[int], Any] | None = None,
-    max_inflight: int = DEFAULT_FANOUT_MAX_INFLIGHT,
 ) -> dict[str, Any]:
     """Translate a workflow `action:` entry into the matching LIBRARY call.
     Per-primitive logic lives here because each primitive has its own
@@ -516,7 +491,7 @@ async def _run_action_primitive(
         # features out of whatever path sat first. Same shape as the other
         # input-pinning dispatches in this ladder.
         if set(entry.inputs) != {"manifest"}:
-            raise RuntimeError(f"mint-features expects inputs [manifest]; got {entry.inputs!r}")
+            raise RuntimeError(f"{entry.name} expects inputs [manifest]; got {entry.inputs!r}")
         manifest_path = Path(bound["manifest"])
         # `genome_map_path` is a workflow-context optional, not an entry input —
         # the YAML's mint-features `inputs:` stays single-valued. Pulled directly
@@ -524,11 +499,11 @@ async def _run_action_primitive(
         # genome-association writes for free.
         genome_map = bound.get("genome_map_path")
         feature_map_path, _, _ = await LIBRARY[LibraryPrimitive.MINT_FEATURES](
-            pool,
+            ctx.pool,
             manifest_path,
             workspace,
             genome_map_path=Path(genome_map) if genome_map else None,
-            scope=f"work_ticket {work_ticket_idx}",
+            scope=f"work_ticket {ctx.work_ticket_idx}",
         )
         # YAML declares one output (typically "feature_map"); bind it.
         return {entry.outputs[0]: feature_map_path}
@@ -539,12 +514,12 @@ async def _run_action_primitive(
         # overlapping column names and the swap would mint the wrong features.
         if set(entry.inputs) != {"annotation_manifest", "feature_map"}:
             raise RuntimeError(
-                "mint-annotation-features expects inputs "
+                f"{entry.name} expects inputs "
                 f"[annotation_manifest, feature_map]; got {entry.inputs!r}"
             )
         annotation_map_path, _, _ = await LIBRARY[LibraryPrimitive.MINT_ANNOTATION_FEATURES](
-            pool,
-            scope_target["reference_idx"],
+            ctx.pool,
+            ctx.scope_target["reference_idx"],
             Path(bound["annotation_manifest"]),
             Path(bound["feature_map"]),
             workspace,
@@ -559,11 +534,11 @@ async def _run_action_primitive(
         # feature_map supplies feature_idx. Mirrors write-assembly-membership below.
         if set(entry.inputs) != {"manifest", "feature_map"}:
             raise RuntimeError(
-                f"write-membership expects inputs [manifest, feature_map]; got {entry.inputs!r}"
+                f"{entry.name} expects inputs [manifest, feature_map]; got {entry.inputs!r}"
             )
         await LIBRARY[LibraryPrimitive.WRITE_MEMBERSHIP](
-            pool,
-            scope_target["reference_idx"],
+            ctx.pool,
+            ctx.scope_target["reference_idx"],
             Path(bound["manifest"]),
             Path(bound["feature_map"]),
         )
@@ -581,12 +556,12 @@ async def _run_action_primitive(
         # via params — mirrors how the reference dispatch reads reference_idx).
         if set(entry.inputs) != {"bin_map", "manifest", "feature_map", "genomes_dir"}:
             raise RuntimeError(
-                "write-assembly-membership expects inputs "
+                f"{entry.name} expects inputs "
                 f"[bin_map, manifest, feature_map, genomes_dir]; got {entry.inputs!r}"
             )
         await LIBRARY[LibraryPrimitive.WRITE_ASSEMBLY_MEMBERSHIP](
-            pool,
-            scope_target["prep_sample_idx"],
+            ctx.pool,
+            ctx.scope_target["prep_sample_idx"],
             bound[PROCESSING_IDX_BINDING],
             Path(bound["bin_map"]),
             Path(bound["manifest"]),
@@ -601,9 +576,9 @@ async def _run_action_primitive(
         await LIBRARY[LibraryPrimitive.REGISTER_FILES](
             staging_dir=str(staging_dir),
             files=files,
-            work_ticket_idx=work_ticket_idx,
-            signing_key=signing_key,
-            data_plane_url=data_plane_url,
+            work_ticket_idx=ctx.work_ticket_idx,
+            signing_key=ctx.signing_key,
+            data_plane_url=ctx.data_plane_url,
         )
         return {}
 
@@ -620,13 +595,13 @@ async def _run_action_primitive(
         # index builder emits one meta per shard carrying its shard_id.
         if len(entry.inputs) != 1:
             raise RuntimeError(
-                f"register-index expects exactly one input (the index meta); got {entry.inputs!r}"
+                f"{entry.name} expects exactly one input (the index meta); got {entry.inputs!r}"
             )
         meta_path = Path(bound[entry.inputs[0]])
         meta = json.loads(meta_path.read_text())
         await LIBRARY[LibraryPrimitive.REGISTER_INDEX](
-            pool,
-            reference_idx=scope_target["reference_idx"],
+            ctx.pool,
+            reference_idx=ctx.scope_target["reference_idx"],
             index_type=meta["index_type"],
             fs_path=meta["fs_path"],
             params=meta["params"],
@@ -654,32 +629,29 @@ async def _run_action_primitive(
         # False so the router build entries stay OFF (see ROUTER_PENDING_BINDING).
         if not bound.get("shard_index"):
             return {ROUTER_PENDING_BINDING: False}
-        if scope_target["kind"] != ScopeTargetKind.REFERENCE.value:
-            raise RuntimeError(
-                f"plan-shards requires a reference-scoped ticket; got {scope_target['kind']!r}"
-            )
-        if dispatch_cb is None:
+        _require_scope(entry.name, ctx.scope_target, ScopeTargetKind.REFERENCE)
+        if ctx.dispatch_cb is None:
             # Fanning out without a dispatch mechanism would silently strand the
             # shard tickets in PENDING until the next startup reconcile — fail
             # loud instead (dispatch always threads a callback in production).
-            raise RuntimeError("plan-shards requires a dispatch_cb to fan out shard tickets")
-        originator_principal_idx = await pool.fetchval(
+            raise RuntimeError(f"{entry.name} requires a dispatch_cb to fan out shard tickets")
+        originator_principal_idx = await ctx.pool.fetchval(
             "SELECT originator_principal_idx FROM qiita.work_ticket WHERE work_ticket_idx = $1",
-            work_ticket_idx,
+            ctx.work_ticket_idx,
         )
         shard_context = {k: bound[k] for k in SHARD_BUILD_CONTEXT_KEYS if k in bound}
         summary = await plan_and_submit_shards(
-            pool,
-            scope_target["reference_idx"],
-            signing_key=signing_key,
-            data_plane_url=data_plane_url,
+            ctx.pool,
+            ctx.scope_target["reference_idx"],
+            signing_key=ctx.signing_key,
+            data_plane_url=ctx.data_plane_url,
             workspace=workspace,
             originator_principal_idx=originator_principal_idx,
             build_action_id=BUILD_SHARD_INDEX_ACTION_ID,
             build_action_version=BUILD_SHARD_INDEX_ACTION_VERSION,
             action_context=shard_context,
-            dispatch_cb=dispatch_cb,
-            max_inflight=max_inflight,
+            dispatch_cb=ctx.dispatch_cb,
+            max_inflight=ctx.max_inflight,
         )
         # N == 0 here means an EXPLICIT shard_index=true request (the :416 guard
         # already returned for the absent/false case) produced zero shard-bearing
@@ -695,14 +667,14 @@ async def _run_action_primitive(
         # flip router_pending True so the router build entries run.
         if summary.get("shards", 0) <= 0:
             raise RuntimeError(
-                f"plan-shards: reference {scope_target['reference_idx']} was requested "
+                f"{entry.name}: reference {ctx.scope_target['reference_idx']} was requested "
                 "with shard_index=true but has no genome-bearing features to shard "
                 "(N=0); refusing to finalize an unroutable `active` reference. Supply "
                 "genomes / a genome map and redrive, or omit shard_index."
             )
         mapping_path = await _stage_shard_mapping(
-            pool,
-            scope_target["reference_idx"],
+            ctx.pool,
+            ctx.scope_target["reference_idx"],
             workspace / "shard_mapping.parquet",
         )
         return {ROUTER_PENDING_BINDING: True, SHARD_MAPPING_BINDING: mapping_path}
@@ -712,13 +684,10 @@ async def _run_action_primitive(
         # completion. The expected index_types are derived from THIS ticket's
         # build gates (in `bound`), so finalize counts exactly what was built.
         # No file inputs; reference_idx from the scope target.
-        if scope_target["kind"] != ScopeTargetKind.REFERENCE.value:
-            raise RuntimeError(
-                f"finalize-shard requires a reference-scoped ticket; got {scope_target['kind']!r}"
-            )
+        _require_scope(entry.name, ctx.scope_target, ScopeTargetKind.REFERENCE)
         await LIBRARY[LibraryPrimitive.FINALIZE_SHARD](
-            pool,
-            scope_target["reference_idx"],
+            ctx.pool,
+            ctx.scope_target["reference_idx"],
             expected_shard_index_types(bound),
         )
         return {}
@@ -731,29 +700,21 @@ async def _run_action_primitive(
         # both-mates `_r1r2` totals from the mask (raw/biological/quality_filtered
         # by reason). Resolved by its fixed binding name, not positionally.
         if entry.inputs != ["read_mask"]:
-            raise RuntimeError(
-                f"persist-read-metrics expects inputs [read_mask]; got {entry.inputs!r}"
-            )
+            raise RuntimeError(f"{entry.name} expects inputs [read_mask]; got {entry.inputs!r}")
         await LIBRARY[LibraryPrimitive.PERSIST_READ_METRICS](
-            pool,
-            scope_target["prep_sample_idx"],
+            ctx.pool,
+            ctx.scope_target["prep_sample_idx"],
             Path(bound["read_mask"]),
         )
         return {}
 
     if entry.name == LibraryPrimitive.PERSIST_ENA_RUN_OUTCOMES:
         if entry.inputs != ["run_outcomes"]:
-            raise RuntimeError(
-                f"persist-ena-run-outcomes expects inputs [run_outcomes]; got {entry.inputs!r}"
-            )
-        if scope_target["kind"] != ScopeTargetKind.SEQUENCED_POOL.value:
-            raise RuntimeError(
-                "persist-ena-run-outcomes requires a sequenced_pool-scoped ticket; "
-                f"got {scope_target['kind']!r}"
-            )
+            raise RuntimeError(f"{entry.name} expects inputs [run_outcomes]; got {entry.inputs!r}")
+        _require_scope(entry.name, ctx.scope_target, ScopeTargetKind.SEQUENCED_POOL)
         await LIBRARY[LibraryPrimitive.PERSIST_ENA_RUN_OUTCOMES](
-            pool,
-            scope_target["sequenced_pool_idx"],
+            ctx.pool,
+            ctx.scope_target["sequenced_pool_idx"],
             Path(bound["run_outcomes"]),
         )
         return {}
@@ -763,18 +724,12 @@ async def _run_action_primitive(
         # mask_idx from the ticket (runner-bound for the prep_sample branch), the
         # sample from the scope target.
         if entry.inputs != ["alignment"]:
-            raise RuntimeError(
-                f"persist-syndna-read-count expects inputs [alignment]; got {entry.inputs!r}"
-            )
-        if scope_target["kind"] != ScopeTargetKind.PREP_SAMPLE.value:
-            raise RuntimeError(
-                "persist-syndna-read-count requires a prep_sample-scoped ticket; "
-                f"got {scope_target['kind']!r}"
-            )
+            raise RuntimeError(f"{entry.name} expects inputs [alignment]; got {entry.inputs!r}")
+        _require_scope(entry.name, ctx.scope_target, ScopeTargetKind.PREP_SAMPLE)
         await LIBRARY[LibraryPrimitive.PERSIST_SYNDNA_READ_COUNT](
-            pool,
+            ctx.pool,
             mask_idx=bound[MASK_IDX_BINDING],
-            prep_sample_idx=scope_target["prep_sample_idx"],
+            prep_sample_idx=ctx.scope_target["prep_sample_idx"],
             alignment_path=Path(bound["alignment"]),
         )
         return {}
@@ -786,15 +741,11 @@ async def _run_action_primitive(
         # reads 'completed' before the masked reads are in DuckLake. No file inputs:
         # prep_sample_idx from the scope target, mask_idx from the ticket (runner-bound
         # above for the prep_sample branch).
-        if scope_target["kind"] != ScopeTargetKind.PREP_SAMPLE.value:
-            raise RuntimeError(
-                "finalize-mask-sample requires a prep_sample-scoped ticket; "
-                f"got {scope_target['kind']!r}"
-            )
+        _require_scope(entry.name, ctx.scope_target, ScopeTargetKind.PREP_SAMPLE)
         await LIBRARY[LibraryPrimitive.FINALIZE_MASK_SAMPLE](
-            pool,
+            ctx.pool,
             mask_idx=bound[MASK_IDX_BINDING],
-            prep_sample_idx=scope_target["prep_sample_idx"],
+            prep_sample_idx=ctx.scope_target["prep_sample_idx"],
         )
         return {}
 
@@ -812,20 +763,16 @@ async def _run_action_primitive(
         # `_run_action_primitive` call reaches it. The mask sibling above is not in
         # that position — its pre-loop guard admits block-scoped tickets too, so
         # its arm is the only prep_sample check on that path.
-        if scope_target["kind"] != ScopeTargetKind.PREP_SAMPLE.value:
-            raise RuntimeError(
-                "finalize-assembly-sample requires a prep_sample-scoped ticket; "
-                f"got {scope_target['kind']!r}"
-            )
+        _require_scope(entry.name, ctx.scope_target, ScopeTargetKind.PREP_SAMPLE)
         # `bound` rather than a threaded local, for the same reason
         # write-assembly-membership above reads it: the pre-loop mint has already
         # overwritten any submitter-supplied `processing_idx` by the time any entry
         # runs, and the gate keys on the value that stamped the rows it gates.
         try:
             await LIBRARY[LibraryPrimitive.FINALIZE_ASSEMBLY_SAMPLE](
-                pool,
+                ctx.pool,
                 processing_idx=bound[PROCESSING_IDX_BINDING],
-                prep_sample_idx=scope_target["prep_sample_idx"],
+                prep_sample_idx=ctx.scope_target["prep_sample_idx"],
             )
         except AssemblySampleInvalidated as exc:
             # A person withdrew this (run, sample) while the run was in flight, and
@@ -855,39 +802,33 @@ async def _run_action_primitive(
         # used. The pre-loop resolver writes the column and binds the same value, so
         # through `run_workflow` the two agree by construction.
         alignment_idx = await _ticket_alignment_idx(
-            pool,
-            work_ticket_idx,
-            entry=LibraryPrimitive.FINALIZE_ALIGNMENT_SAMPLE,
-            scope_target=scope_target,
+            ctx.pool,
+            ctx.work_ticket_idx,
+            entry=entry.name,
+            scope_target=ctx.scope_target,
         )
         await LIBRARY[LibraryPrimitive.FINALIZE_ALIGNMENT_SAMPLE](
-            pool,
+            ctx.pool,
             alignment_idx=alignment_idx,
-            prep_sample_idx=scope_target["prep_sample_idx"],
+            prep_sample_idx=ctx.scope_target["prep_sample_idx"],
         )
         return {}
 
     if entry.name == LibraryPrimitive.PERSIST_QC_CHECKS:
         if entry.inputs != ["qc_checks"]:
-            raise RuntimeError(
-                f"persist-qc-checks expects inputs [qc_checks]; got {entry.inputs!r}"
-            )
-        if scope_target["kind"] != ScopeTargetKind.PREP_SAMPLE.value:
-            raise RuntimeError(
-                "persist-qc-checks requires a prep_sample-scoped ticket; "
-                f"got {scope_target['kind']!r}"
-            )
+            raise RuntimeError(f"{entry.name} expects inputs [qc_checks]; got {entry.inputs!r}")
+        _require_scope(entry.name, ctx.scope_target, ScopeTargetKind.PREP_SAMPLE)
         if QC_PRODUCER_BINDING not in bound:
-            raise RuntimeError(f"persist-qc-checks: the runner did not bind {QC_PRODUCER_BINDING}")
+            raise RuntimeError(f"{entry.name}: the runner did not bind {QC_PRODUCER_BINDING}")
         if bound[QC_PRODUCER_BINDING] is None:
             raise RuntimeError(
-                "persist-qc-checks: this workflow finalizes a gate QC checks cannot be "
+                f"{entry.name}: this workflow finalizes a gate QC checks cannot be "
                 "counted under (assembly)"
             )
         await LIBRARY[LibraryPrimitive.PERSIST_QC_CHECKS](
-            pool,
-            work_ticket_idx=work_ticket_idx,
-            prep_sample_idx=scope_target["prep_sample_idx"],
+            ctx.pool,
+            work_ticket_idx=ctx.work_ticket_idx,
+            prep_sample_idx=ctx.scope_target["prep_sample_idx"],
             qc_checks_path=Path(bound["qc_checks"]),
             expected_producer=QcProducer(bound[QC_PRODUCER_BINDING]),
         )
@@ -902,7 +843,7 @@ async def _run_action_primitive(
         # reorder can't silently swap raw/filtered.
         if set(entry.inputs) != {"raw_qc_report", "filtered_qc_report"}:
             raise RuntimeError(
-                "persist-qc-report expects inputs "
+                f"{entry.name} expects inputs "
                 "[raw_qc_report, filtered_qc_report]; "
                 f"got {entry.inputs!r}"
             )
@@ -911,8 +852,8 @@ async def _run_action_primitive(
             return json.loads(Path(bound[name]).read_text())
 
         await LIBRARY[LibraryPrimitive.PERSIST_QC_REPORT](
-            pool,
-            scope_target["prep_sample_idx"],
+            ctx.pool,
+            ctx.scope_target["prep_sample_idx"],
             _report("raw_qc_report"),
             _report("filtered_qc_report"),
         )
@@ -925,16 +866,13 @@ async def _run_action_primitive(
         # construction (per-member OR), so a split sample's sibling-block rows
         # survive. No file inputs: block_idx from the scope target, mask_idx from
         # the ticket (runner-bound above for the block branch).
-        if scope_target["kind"] != ScopeTargetKind.BLOCK.value:
-            raise RuntimeError(
-                f"delete-block-mask requires a block-scoped ticket; got {scope_target['kind']!r}"
-            )
+        _require_scope(entry.name, ctx.scope_target, ScopeTargetKind.BLOCK)
         await LIBRARY[LibraryPrimitive.DELETE_READ_MASK_BLOCK](
-            pool,
-            block_idx=scope_target["block_idx"],
+            ctx.pool,
+            block_idx=ctx.scope_target["block_idx"],
             mask_idx=bound[MASK_IDX_BINDING],
-            signing_key=signing_key,
-            data_plane_url=data_plane_url,
+            signing_key=ctx.signing_key,
+            data_plane_url=ctx.data_plane_url,
         )
         return {}
 
@@ -945,16 +883,13 @@ async def _run_action_primitive(
         # mask counts from DuckLake (across all the sample's blocks), so it runs
         # AFTER register-files. No file inputs: block_idx from the scope target,
         # mask_idx from the ticket (runner-bound above for the block branch).
-        if scope_target["kind"] != ScopeTargetKind.BLOCK.value:
-            raise RuntimeError(
-                f"reconcile-block requires a block-scoped ticket; got {scope_target['kind']!r}"
-            )
+        _require_scope(entry.name, ctx.scope_target, ScopeTargetKind.BLOCK)
         await LIBRARY[LibraryPrimitive.RECONCILE_BLOCK](
-            pool,
-            block_idx=scope_target["block_idx"],
+            ctx.pool,
+            block_idx=ctx.scope_target["block_idx"],
             mask_idx=bound[MASK_IDX_BINDING],
-            signing_key=signing_key,
-            data_plane_url=data_plane_url,
+            signing_key=ctx.signing_key,
+            data_plane_url=ctx.data_plane_url,
         )
         return {}
 
@@ -966,17 +901,13 @@ async def _run_action_primitive(
         # alignment rows go), so a split sample's sibling-block rows survive. No
         # file inputs: block_idx from the scope target, alignment_idx from the
         # ticket (runner-bound above for the align block branch).
-        if scope_target["kind"] != ScopeTargetKind.BLOCK.value:
-            raise RuntimeError(
-                f"delete-alignment-block requires a block-scoped ticket; got "
-                f"{scope_target['kind']!r}"
-            )
+        _require_scope(entry.name, ctx.scope_target, ScopeTargetKind.BLOCK)
         await LIBRARY[LibraryPrimitive.DELETE_ALIGNMENT_BLOCK](
-            pool,
-            block_idx=scope_target["block_idx"],
+            ctx.pool,
+            block_idx=ctx.scope_target["block_idx"],
             alignment_idx=bound[ALIGNMENT_IDX_BINDING],
-            signing_key=signing_key,
-            data_plane_url=data_plane_url,
+            signing_key=ctx.signing_key,
+            data_plane_url=ctx.data_plane_url,
         )
         return {}
 
@@ -997,15 +928,15 @@ async def _run_action_primitive(
         # step loop; `align_planner.plan_and_submit_alignments` is the block-scoped
         # one. So a NULL here means neither ran for this ticket.
         alignment_idx = await _ticket_alignment_idx(
-            pool,
-            work_ticket_idx,
-            entry=LibraryPrimitive.DELETE_ALIGNMENT_SAMPLE,
-            scope_target=scope_target,
+            ctx.pool,
+            ctx.work_ticket_idx,
+            entry=entry.name,
+            scope_target=ctx.scope_target,
         )
         context_alignment_idx = bound.get(ALIGNMENT_IDX_BINDING)
         if context_alignment_idx is not None and context_alignment_idx != alignment_idx:
             raise RuntimeError(
-                f"delete-alignment-sample: work_ticket {work_ticket_idx} carries "
+                f"{entry.name}: work_ticket {ctx.work_ticket_idx} carries "
                 f"alignment_idx {alignment_idx} but its action_context declares "
                 f"{context_alignment_idx}; a step binding alignment_idx from "
                 f"action_context would write under {context_alignment_idx} while this "
@@ -1013,9 +944,9 @@ async def _run_action_primitive(
             )
         await LIBRARY[LibraryPrimitive.DELETE_ALIGNMENT_SAMPLE](
             alignment_idx=alignment_idx,
-            prep_sample_idx=scope_target["prep_sample_idx"],
-            signing_key=signing_key,
-            data_plane_url=data_plane_url,
+            prep_sample_idx=ctx.scope_target["prep_sample_idx"],
+            signing_key=ctx.signing_key,
+            data_plane_url=ctx.data_plane_url,
         )
         return {}
 
@@ -1026,14 +957,10 @@ async def _run_action_primitive(
         # (alignment rows are not 1:1 with reads), so no data-plane hop. Runs AFTER
         # register-files. No file inputs: block_idx from the scope target,
         # alignment_idx from the ticket (runner-bound above for the align branch).
-        if scope_target["kind"] != ScopeTargetKind.BLOCK.value:
-            raise RuntimeError(
-                f"reconcile-alignment-block requires a block-scoped ticket; got "
-                f"{scope_target['kind']!r}"
-            )
+        _require_scope(entry.name, ctx.scope_target, ScopeTargetKind.BLOCK)
         await LIBRARY[LibraryPrimitive.RECONCILE_ALIGNMENT_BLOCK](
-            pool,
-            block_idx=scope_target["block_idx"],
+            ctx.pool,
+            block_idx=ctx.scope_target["block_idx"],
             alignment_idx=bound[ALIGNMENT_IDX_BINDING],
         )
         return {}
@@ -1047,10 +974,10 @@ async def _run_action_primitive(
         # plane re-validates under its scratch_root (same containment the DoGet
         # exporters rely on). Idempotent full-replace ⇒ safe to re-run on a redrive.
         await LIBRARY[LibraryPrimitive.SYNC_REFERENCE_EXCLUSION](
-            pool,
+            ctx.pool,
             dest=workspace / "reference_exclusion.parquet",
-            signing_key=signing_key,
-            data_plane_url=data_plane_url,
+            signing_key=ctx.signing_key,
+            data_plane_url=ctx.data_plane_url,
         )
         return {}
 

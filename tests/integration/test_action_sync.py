@@ -5,7 +5,6 @@ from datetime import timedelta
 
 import pytest
 
-
 _REFERENCE_ADD_YAML = """\
 action_id: reference-add
 version: 1.0.0
@@ -56,9 +55,7 @@ async def clean_action_table(postgres_pool):
         )
 
 
-async def test_sync_inserts_new_action(
-    postgres_pool, workflows_dir, clean_action_table
-):
+async def test_sync_inserts_new_action(postgres_pool, workflows_dir, clean_action_table):
     """First sync of a YAML inserts the row with enabled=true and stamps
     first_seen_at."""
     from qiita_control_plane.actions import load_actions, sync_actions
@@ -270,9 +267,7 @@ async def test_sync_handles_empty_action_list(postgres_pool, clean_action_table)
         assert result == {"inserted": 0, "updated": 0}
 
 
-async def test_sync_round_trips_status_fields(
-    postgres_pool, tmp_path, clean_action_table
-):
+async def test_sync_round_trips_status_fields(postgres_pool, tmp_path, clean_action_table):
     """Workflow-level success_status / failure_status and per-entry
     target_status survive sync into qiita.action.{success_status,
     failure_status} columns and the steps JSONB respectively. Absence

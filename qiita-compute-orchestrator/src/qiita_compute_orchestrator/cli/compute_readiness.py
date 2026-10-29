@@ -43,7 +43,7 @@ switches to machine-readable JSON for scripted consumption.
 
 Invoked by `qiita-admin compute-readiness` on the control plane side
 via subprocess into the orchestrator's venv — see
-`qiita_control_plane.cli.admin._handle_compute_readiness`.
+`qiita_control_plane.cli.admin.compute_readiness._handle_compute_readiness`.
 """
 
 from __future__ import annotations

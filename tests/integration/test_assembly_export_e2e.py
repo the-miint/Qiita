@@ -14,18 +14,17 @@ import secrets
 import uuid
 
 import pytest
-from conftest import ducklake_connect
 from qiita_common.api_paths import LOOPBACK_HOST
 from qiita_common.models.reference import Tier
-
 from qiita_control_plane.repositories.processing import mint_processing
 from qiita_control_plane.testing.db_seeds import (
     seed_biosample_to_study_link,
     seed_biosample_with_sequenced_prep_sample,
     seed_prep_sample_to_study_link,
 )
-
 from qiita_control_plane.testing.db_teardown import teardown_entity_graph
+
+from conftest import ducklake_connect
 
 _CHUNK_BP = 4_096
 
@@ -52,8 +51,7 @@ async def seeded(postgres_pool, human_admin_session, regular_user_session, data_
     tag = secrets.token_hex(4)
     rng = random.Random(594)
     sequences = {
-        n: "".join(rng.choice("ACGT") for _ in range(ln))
-        for n, (ln, _) in _CONTIGS.items()
+        n: "".join(rng.choice("ACGT") for _ in range(ln)) for n, (ln, _) in _CONTIGS.items()
     }
 
     study_idx = await db.fetchval(
@@ -131,8 +129,7 @@ async def seeded(postgres_pool, human_admin_session, regular_user_session, data_
         lake.execute(
             "INSERT INTO qiita_lake.assembled_sequence VALUES "
             + ", ".join(
-                f"({features[n]}, gen_random_uuid(), {len(sequences[n])})"
-                for n in _CONTIGS
+                f"({features[n]}, gen_random_uuid(), {len(sequences[n])})" for n in _CONTIGS
             )
         )
         lake.execute(
@@ -239,9 +236,7 @@ async def test_a_viewer_exports_each_runs_genomes_once(
     assert _fasta(p_out / f"{acc}_u7ctg.fasta.gz") == [(f"{acc}_u7ctg_1", seqs["lcg"])]
     genomes = {g["genome"]: g for g in _tsv(p_out / "genomes.tsv")}
     assert float(genomes[f"{acc}_bin.1"]["completeness"]) == 91.5
-    assert int(genomes[f"{acc}_bin.1"]["length_bp"]) == len(seqs["mag"]) + len(
-        seqs["shared"]
-    )
+    assert int(genomes[f"{acc}_bin.1"]["length_bp"]) == len(seqs["mag"]) + len(seqs["shared"])
     assert int(genomes[f"{acc}_u7ctg"]["n_circular"]) == 1
 
     # Run Q holds the same contig as UNBINNED, which the default kinds leave out.
@@ -251,9 +246,7 @@ async def test_a_viewer_exports_each_runs_genomes_once(
 
     q_out = tmp_path / "q"
     assert _export("q", q_out, "--kind", "UNBINNED") == 0
-    assert _fasta(q_out / f"{acc}_u3ctg.fasta.gz") == [
-        (f"{acc}_u3ctg_1", seqs["shared"])
-    ]
+    assert _fasta(q_out / f"{acc}_u3ctg.fasta.gz") == [(f"{acc}_u3ctg_1", seqs["shared"])]
     # UNBINNED under the length cut has no CheckM row, so its scores are empty.
     (unbinned,) = _tsv(q_out / "genomes.tsv")
     assert unbinned["completeness"] == ""

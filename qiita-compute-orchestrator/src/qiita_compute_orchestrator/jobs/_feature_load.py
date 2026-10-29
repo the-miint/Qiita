@@ -12,7 +12,7 @@ Both writers emit the run's whole feature set, a feature another run
 already loaded included — a native job has no DuckLake access, so there
 is nothing here to anti-join against. Convergence happens at register
 time instead: the data plane replaces these tables on `feature_idx`
-rather than appending (`flight_service::REPLACE_KEY_TABLES`). What that
+rather than appending (`flight_service::registration::REPLACE_KEY_TABLES`). What that
 requires is that a feature's rows all arrive in ONE registration, not in
 one part — the replace unions the keys of every part headed for a table
 before deleting anything, so a feature spread across several parts of

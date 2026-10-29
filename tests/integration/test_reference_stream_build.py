@@ -15,13 +15,11 @@ streaming build. Mirrors test_reference_stream.py's seeding + direct-sign trick.
 """
 
 import asyncio
+from contextlib import asynccontextmanager
 
 import duckdb
 import pytest
-from contextlib import asynccontextmanager
-
 from qiita_common.api_paths import LOOPBACK_HOST
-
 from qiita_compute_orchestrator.data_plane_client import open_doget_stream
 from qiita_compute_orchestrator.jobs import (
     build_bowtie2_index,
@@ -58,13 +56,9 @@ def _seed_reference_rows(data_plane):
             rows.append((fidx, 0, seq[:mid]))
             rows.append((fidx, 1, seq[mid:]))
         values = ", ".join(f"({f}, {c}, '{d}')" for f, c, d in rows)
-        conn.execute(
-            f"INSERT INTO qiita_lake.reference_sequence_chunks VALUES {values}"
-        )
+        conn.execute(f"INSERT INTO qiita_lake.reference_sequence_chunks VALUES {values}")
         member_values = ", ".join(f"({_REF_IDX}, {f})" for f in _CONTIGS)
-        conn.execute(
-            f"INSERT INTO qiita_lake.reference_membership VALUES {member_values}"
-        )
+        conn.execute(f"INSERT INTO qiita_lake.reference_membership VALUES {member_values}")
     finally:
         conn.close()
 
@@ -126,9 +120,7 @@ def test_shard_build_streams_and_writes_artifact(
     from pathlib import Path
 
     monkeypatch.setenv("PATH_DERIVED", str(tmp_path / "derived"))
-    monkeypatch.setattr(
-        module, "open_reference_chunk_stream", _fake_open_stream(data_plane)
-    )
+    monkeypatch.setattr(module, "open_reference_chunk_stream", _fake_open_stream(data_plane))
 
     shard_id = 4
     roster = _write_roster(

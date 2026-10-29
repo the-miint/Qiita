@@ -15,11 +15,12 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
 
 ### 1. Env vars — set BEFORE the deploy (most are `from_env()` fail-fast; a missing one keeps the unit down)
 
-_None yet._
+- `[admin]` (#791) Only if `/etc/qiita/data-plane.env` sets `DUCKDB_TEMP_DIRECTORY` without `DUCKDB_MAX_TEMP_DIRECTORY_SIZE`: the per-connection spill cap is now derived at boot as that filesystem's free space ÷ local instances ÷ `DUCKLAKE_POOL_SIZE`, so together the connections may fill it, and the data plane refuses to boot if that comes out under `MIN_DERIVED_SPILL_MIB` (`qiita-data-plane/src/config.rs`) — hence before the restart. To keep today's cap: `sudo bash -c 'grep -q "^DUCKDB_MAX_TEMP_DIRECTORY_SIZE=" /etc/qiita/data-plane.env || printf "\nDUCKDB_MAX_TEMP_DIRECTORY_SIZE=4GiB\n" >> /etc/qiita/data-plane.env'`.
+- `[admin]` (#791) Only if `DUCKLAKE_CATALOG_CONNSTR` in `/etc/qiita/data-plane.env` sets `application_name`: remove it, or the data plane refuses to boot (`sudo make preflight` fails `connstr/ducklake` on it).
 
 ### 2. One-time host setup
 
-_None yet._
+- `[admin]` (#791) On the catalog's Postgres server, as superuser: `GRANT pg_read_all_stats TO <role>;`, where `<role>` is the `user=` in `DUCKLAKE_CATALOG_CONNSTR` (`qiita_miint_lake_rw` per `first-deploy.md`). `verify-deploy`'s `catalog-connections` row fails without it ([`data-plane-scaling.md` § Catalog connections](docs/runbooks/data-plane-scaling.md#catalog-connections)).
 
 ### 3. Migrations
 
@@ -28,21 +29,47 @@ _None yet._
 
 ### 4. Deploy
 
-_None yet._
+- `[admin]` (#767) `activate.sh` now waits, before any restart, for the data plane to go idle (no DoGet stream, DoPut or registration in flight), up to 3900 s, printing `waiting for qiita-data-plane@50051 to go idle …` once a minute; it then restarts whether or not it went idle. `QIITA_DP_IDLE_WAIT_S=<s>` in the deploy's environment changes the bound (0 skips it). The deploy stops before any restart if that value is not whole seconds or the wait cannot query the catalog; `QIITA_DP_IDLE_WAIT_S=0` gets past the second. This deploy still stops the old data-plane binary at once on SIGTERM: the drain ships with the new binary, so from the next deploy the data plane's own restart can take up to the unit's `TimeoutStopSec=3900` too.
+- Nothing extra for a single instance (#363): with no `QIITA_DATA_PLANE_*` keys in
+  `/etc/qiita/data-plane.env`, the deploy runs the one instance `@50051` as before. To run
+  more instances or add data planes on other hosts, see
+  [`docs/runbooks/data-plane-scaling.md`](docs/runbooks/data-plane-scaling.md) before
+  deploying.
 
 ### 5. Verify
 
-- `[admin]` (#773) The SLURM partition allows a 72 h job (`local-reference-add`'s `load` can now run 48 h and retry at 72 h): `scontrol show partition <partition> | grep -o 'MaxTime=[^ ]*'` reads `UNLIMITED` or at least `3-00:00:00`, where `<partition>` is `SLURM_PARTITION` in `compute-orchestrator.env`. Below that, SLURM holds or refuses a `load` submitted with the longer walltime, so a genome-scale reference load cannot finish; raise the partition's MaxTime before running one.
-- `[admin]` (#773) Every `fastq-to-parquet` version's `fastq` step reads `cpu` 8 / `mem_gb` 13: `SELECT version, s->'baseline_resources' FROM qiita.action, jsonb_array_elements(steps) s WHERE action_id = 'fastq-to-parquet' AND s->>'name' = 'fastq';`
+- `[admin]` (#767) `systemctl show -p TimeoutStopUSec qiita-data-plane@50051` prints `TimeoutStopUSec=1h 5min`.
+
+- `verify-deploy`'s data-plane rows (#363): `health/data-plane` is now
+  `health/data-plane@<port>`, one row per instance; `health/data-plane-peer@<host:port>`
+  appears per peer; `health/data-plane-lb` checks nginx's loopback listener
+  `127.0.0.1:50050` (skipped when the TLS files are absent); `health/data-plane-upstream`
+  fails when verify cannot read the members from the rendered nginx config, and is skipped
+  when grpcurl is missing or `SKIP_HEALTH=1`; `data-plane-units/<unit>` fails for a running
+  or enabled `qiita-data-plane@` unit whose port is not in `QIITA_DATA_PLANE_PORTS`, and
+  the deploy itself stops before installing anything when it finds such a unit, unless
+  run with `QIITA_DP_DISABLE_REMOVED=1`, which disables and stops it;
+  `commit/data-plane@<port>` and `commit/data-plane-peer@<host:port>` fail for a member
+  not running this host's deployed commit (`BUILD_COMMIT` in
+  `/opt/qiita/data-plane/build.env`, which the deploy writes);
+  `dp-memory-max/qiita-data-plane@<port>` (#791) fails when a unit's `MemoryMax` differs
+  from `QIITA_DATA_PLANE_INSTANCE_MEMORY_MAX`, and is skipped when that key is unset;
+  `catalog-connections` (#791) lists every connected instance as `<host>:<port> pool=<n>`
+  and fails when their pools plus the other catalog sessions exceed the catalog server's
+  `max_connections` less its reserved slots, or when the bucket-2 grant is missing. Apart
+  from `catalog-connections`, a host running only `qiita-data-plane@50051` is unaffected.
 
 ### 6. After the deploy verifies green
 
-_None yet._
+- Only on a host running more than one data-plane instance (#363): point the control plane
+  at nginx's loopback listener so its calls spread across them —
+  [`data-plane-scaling.md` § The control plane through nginx](docs/runbooks/data-plane-scaling.md#the-control-plane-through-nginx).
+  Undo it before any rollback to a commit without that listener.
 
 ### Notes (no host action)
 
-- (#773) Parquet that jobs register into DuckLake is now written at zstd level 16 (was the default 3), and the data plane sets DuckLake's `parquet_compression_level` to 16 at boot, so new lake files are ~12–15% smaller (synthetic production-shaped tables; −14.6% on one real long-read prep_sample's `sequence1`) and the steps that write them take longer: read ingest (`fastq-to-parquet`, `bcl-convert`'s `ingest_reads`, `download-ena-study`, `golay-demux`, `bam-to-parquet`), host filtering, alignment, and the reference, amplicon and long-read-assembly loads. Existing lake files are untouched. Watch reference-load walltimes on the first loads after the deploy.
-- (#773) `fastq-to-parquet` 1.0.0–1.3.0 are edited in place, resources only: the `fastq` step goes from cpu 2 / mem_gb 8 to cpu 8 / mem_gb 13, re-synced by `qiita-admin actions sync` in `activate.sh`. `bam-to-parquet` 1.0.0 and `local-reference-add` 1.0.0 are edited in place the same way, for walltime: the `bam` step goes from PT4H to PT6H (its description now says prep_sample), and `local-reference-add`'s `load` step from PT36H to PT48H under an action ceiling raised from PT48H to PT72H. `golay-demux` now runs DuckDB on all 8 of the cpu its YAML already allocates (code only).
+- (#767) A killed DoPut leaves `staging/uploads/<idx>/upload.parquet.partial`, which nothing reclaims, as nothing reclaims finished uploads. `qiita-admin masked-read-export` gains `--retry-seconds` (default 3900, the data-plane unit's stop timeout).
+- (#791) Optional `QIITA_DATA_PLANE_INSTANCE_MEMORY_MAX` in `/etc/qiita/data-plane.env` sets `MemoryMax=` per local data-plane instance ([`data-plane-scaling.md` § More instances on this host](docs/runbooks/data-plane-scaling.md#more-instances-on-this-host)). Every deploy now writes `/etc/systemd/system/qiita-data-plane@<port>.service.d/instance-limits.conf` (instance count; `MemoryMax=` only when the key is set) and stops if `data-plane.env` sets `QIITA_DATA_PLANE_LOCAL_INSTANCES`, or sets `DUCKDB_MEMORY_LIMIT` to more than the key ÷ `DUCKLAKE_POOL_SIZE`; `preflight` gains a `dp-memory-max` row, skipped when the key is unset. With `DUCKDB_THREADS` unset, each instance's derived threads are also divided by the local instance count (no change at one instance).
 - (#779) Soft API-contract change: biosample and prep_sample metadata
   reads omit any value above the caller's tier on the study that wrote it (no placeholder).
   The study-scoped biosample and sequenced-sample reads (`GET /study/{s}/biosample/{b}`,

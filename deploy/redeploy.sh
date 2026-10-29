@@ -57,6 +57,8 @@
 #      anything — they overrode a skip that no longer exists. Where the refresh
 #      runs, the script says so and refreshes regardless; where it is skipped
 #      (SKIP_*, or step 5 with SLURM_NATIVE_PYTHON unset) they are silent.
+#      QIITA_DP_DISABLE_REMOVED=1 (activate.sh: stop and disable data-plane units
+#      outside QIITA_DATA_PLANE_PORTS instead of refusing to deploy).
 
 set -euo pipefail
 

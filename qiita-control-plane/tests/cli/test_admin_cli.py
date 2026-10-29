@@ -958,6 +958,205 @@ def test_masked_read_export_writes_parquet_per_sample(monkeypatch, tmp_path):
     assert sorted(p.suffix for p in out_dir.iterdir()) == [".parquet", ".parquet"]
 
 
+# The text pyarrow gives a parquet export whose data plane went away mid-stream
+# (measured against a SIGKILLed data plane: the reader raised OSError with this).
+_STREAM_DROPPED = (
+    "Flight returned unavailable error, with message: recvmsg:Connection reset by peer. "
+    "gRPC client debug context: UNKNOWN:Error received from peer"
+)
+
+
+def _failing_then_serving_client(tables, failures_by_prep, exc_factory):
+    """A fake FlightClient whose DoGet for a prep in `failures_by_prep` streams one
+    batch and then raises `exc_factory()`, that many times, before serving it whole."""
+    import pyarrow as pa
+
+    base = _fake_flight_client_class(tables)
+    remaining = dict(failures_by_prep)
+
+    class _Stream:
+        def __init__(self, table):
+            self._table = table
+
+        def to_reader(self):
+            batches = self._table.to_batches(max_chunksize=1)
+
+            def gen():
+                yield batches[0]
+                raise exc_factory()
+
+            return pa.RecordBatchReader.from_batches(self._table.schema, gen())
+
+    class _Client(base):
+        def do_get(self, ticket, options=None):
+            stream = super().do_get(ticket, options)
+            prep = self.do_get_calls[-1]
+            if remaining.get(prep, 0) > 0:
+                remaining[prep] -= 1
+                return _Stream(stream._table)
+            return stream
+
+    return _Client
+
+
+def _run_parquet_export(cli, out_dir, *extra):
+    return cli.main(
+        [
+            "masked-read-export",
+            "--sequenced-pool-idx",
+            "7",
+            "--mask-idx",
+            "3",
+            "--format",
+            "parquet",
+            "--output-dir",
+            str(out_dir),
+            "--data-plane-url",
+            "grpc://dp:50051",
+            *extra,
+        ]
+    )
+
+
+def _two_sample_export(monkeypatch, tickets):
+    import pyarrow as pa
+
+    from qiita_control_plane.cli import _common
+
+    monkeypatch.setenv("QIITA_TOKEN", "qk_admin")
+    manifest = {
+        "sequenced_pool_idx": 7,
+        "sequencing_run_idx": 5,
+        "mask_idx": 3,
+        "samples": [
+            {"prep_sample_idx": 42, "biosample_accession": "SAMN_A"},
+            {"prep_sample_idx": 43, "biosample_accession": "SAMN_B"},
+        ],
+    }
+    served = _fake_masked_export_http(manifest)
+
+    def counting_request(method, url, **kw):
+        if method == "POST":
+            tickets.append(kw["json"]["prep_sample_idx"])
+        return served(method, url, **kw)
+
+    monkeypatch.setattr(_common.httpx, "request", counting_request)
+    return {
+        42: pa.table({"read_id": ["rA0", "rA1"], "sequence1": ["ACGT", "TTGG"]}),
+        43: pa.table({"read_id": ["rB0"], "sequence1": ["CCAA"]}),
+    }
+
+
+def test_masked_read_export_retries_a_sample_whose_stream_dropped(monkeypatch, tmp_path):
+    """A data plane that goes away mid-stream (a restart) fails that prep_sample's
+    attempt; the export mints a fresh ticket and exports it again from the start, and
+    the run finishes with every file whole."""
+    import duckdb
+
+    from qiita_control_plane.cli import admin as cli
+    from qiita_control_plane.cli.admin import masked_export
+
+    tickets: list[int] = []
+    tables = _two_sample_export(monkeypatch, tickets)
+    monkeypatch.setattr(masked_export.time, "sleep", lambda _s: None)
+    client = _failing_then_serving_client(tables, {42: 2}, lambda: OSError(_STREAM_DROPPED))
+    monkeypatch.setattr("pyarrow.flight.FlightClient", client)
+
+    out_dir = tmp_path / "exp"
+    assert _run_parquet_export(cli, out_dir) == 0
+    assert client.instances[0].do_get_calls == [42, 42, 42, 43]
+    assert tickets == [42, 42, 42, 43]
+    f_a = out_dir / "SAMN_A.5.7.42.parquet"
+    n = duckdb.connect(":memory:").execute(f"SELECT count(*) FROM read_parquet('{f_a}')")
+    assert n.fetchone()[0] == 2
+    assert sorted(p.name for p in out_dir.iterdir()) == [
+        "SAMN_A.5.7.42.parquet",
+        "SAMN_B.5.7.43.parquet",
+    ]
+
+
+def test_masked_read_export_does_not_retry_a_failure_of_its_own(monkeypatch, tmp_path, capsys):
+    """An error that is not a service being unreachable fails the export on its first
+    attempt, as before."""
+    from qiita_control_plane.cli import admin as cli
+
+    tickets: list[int] = []
+    tables = _two_sample_export(monkeypatch, tickets)
+    client = _failing_then_serving_client(
+        tables, {42: 1}, lambda: OSError(28, "No space left on device")
+    )
+    monkeypatch.setattr("pyarrow.flight.FlightClient", client)
+
+    out_dir = tmp_path / "exp"
+    assert _run_parquet_export(cli, out_dir) == 1
+    assert client.instances[0].do_get_calls == [42]
+    assert "No space left on device" in capsys.readouterr().err
+    assert list(out_dir.iterdir()) == []
+
+
+def test_masked_read_export_gives_up_after_retry_seconds(monkeypatch, tmp_path, capsys):
+    """With the retry window spent, a transient failure fails the export, and the
+    sample being written leaves no file."""
+    from qiita_control_plane.cli import admin as cli
+
+    tickets: list[int] = []
+    tables = _two_sample_export(monkeypatch, tickets)
+    client = _failing_then_serving_client(tables, {42: 1}, lambda: OSError(_STREAM_DROPPED))
+    monkeypatch.setattr("pyarrow.flight.FlightClient", client)
+
+    out_dir = tmp_path / "exp"
+    assert _run_parquet_export(cli, out_dir, "--retry-seconds", "0") == 1
+    assert client.instances[0].do_get_calls == [42]
+    assert "Connection reset by peer" in capsys.readouterr().err
+    assert list(out_dir.iterdir()) == []
+
+
+@pytest.mark.parametrize("value", ["-1", "nan", "inf", "abc"])
+def test_masked_read_export_refuses_a_retry_window_that_is_not_finite_or_is_negative(
+    tmp_path, capsys, value
+):
+    from qiita_control_plane.cli import admin as cli
+
+    with pytest.raises(SystemExit) as exc:
+        _run_parquet_export(cli, tmp_path / "exp", "--retry-seconds", value)
+    assert exc.value.code == 2
+    assert "must be a finite number >= 0" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("make_exc", "transient"),
+    [
+        (lambda r: httpx.ConnectError("Connection refused", request=r), True),
+        (
+            lambda r: httpx.HTTPStatusError(
+                "bad gateway", request=r, response=httpx.Response(502, request=r)
+            ),
+            True,
+        ),
+        (
+            lambda r: httpx.HTTPStatusError(
+                "conflict", request=r, response=httpx.Response(409, request=r)
+            ),
+            False,
+        ),
+        (lambda r: OSError(_STREAM_DROPPED), True),
+        (lambda r: OSError(28, "No space left on device"), False),
+        # The fastq path's COPY over a dropped stream (measured, as for the OSError).
+        (
+            lambda r: __import__("duckdb").InvalidInputException(f"arrow_scan: {_STREAM_DROPPED}"),
+            True,
+        ),
+        (lambda r: RuntimeError(_STREAM_DROPPED), False),
+    ],
+)
+def test_export_failure_is_transient(make_exc, transient):
+    """Which failures restart a prep_sample's export: a service unreachable, by type
+    and then by text, and nothing raised as a plain bug."""
+    from qiita_control_plane.cli.admin.masked_export import _export_failure_is_transient
+
+    assert _export_failure_is_transient(make_exc(httpx.Request("POST", "http://cp"))) is transient
+
+
 def test_masked_read_export_empty_sample_parquet(monkeypatch, tmp_path):
     """A sample with zero masked reads → a valid empty `<stem>.parquet`. The
     ParquetWriter is opened from `reader.schema`, so even a zero-batch stream
@@ -1539,7 +1738,9 @@ def test_masked_read_export_unreachable_control_plane_is_one_line(
     monkeypatch, tmp_path, capsys, unreachable_method
 ):
     """A connection failure (no HTTP response at all) is one stderr line naming
-    the URL it tried, and exit 1, not a traceback, whichever request hits it."""
+    the URL it tried, and exit 1, not a traceback, whichever request hits it.
+    `--retry-seconds 0` so the ticket POST's failure is reported on its first
+    attempt rather than after the retry window."""
     import pyarrow as pa
 
     from qiita_control_plane.cli import _common
@@ -1580,6 +1781,8 @@ def test_masked_read_export_unreachable_control_plane_is_one_line(
             str(out_dir),
             "--data-plane-url",
             "grpc://dp:50051",
+            "--retry-seconds",
+            "0",
         ]
     )
     assert rc == 1

@@ -14,7 +14,7 @@
 //! verifies before loading — but not entirely: a feature is shared across
 //! producers, so no producer can know whether the lake already holds it. That
 //! part is enforced AT insertion, by the data plane
-//! (`flight_service::REPLACE_KEY_TABLES`).
+//! (`flight_service::registration::REPLACE_KEY_TABLES`).
 
 use duckdb::Connection;
 
@@ -46,6 +46,86 @@ pub(crate) fn validate_sql_literal(value: &str, field: &str) -> Result<(), Strin
 /// and pins it to the Python constant.
 const CHUNK_ROW_GROUP_SIZE: u64 = 16384;
 
+/// Key of the Postgres advisory lock a data plane holds while it sets up the
+/// catalog (`setup_catalog`).
+const CATALOG_SETUP_LOCK_KEY: i64 = 0x7169_6974_615f_6470;
+
+/// How long boot waits for another data plane's catalog setup to release
+/// `CATALOG_SETUP_LOCK_KEY`. A backstop for a setup that holds the lock and does
+/// not finish: measured with the debug build against Postgres 17 on localhost, 10
+/// instances booting together were all listening within 5.8 s on an empty catalog
+/// and 4.4 s on an existing one, and 20 within 6.8 s.
+const BOOT_SETUP_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Attach the catalog and create its tables, once, at boot.
+///
+/// Every data plane runs this when it starts, and a deploy or a reboot starts all
+/// of a host's instances together. Two setups running at once conflict on the
+/// catalog (measured with 4 processes, DuckDB 1.5.4, ducklake d318a545, Postgres
+/// 17: a serialization failure on `ducklake_metadata`, a duplicate `pg_type` key
+/// during the first ATTACH, and DuckLake commit conflicts on the `ensure_*`
+/// statements), so each takes `CATALOG_SETUP_LOCK_KEY` first and the setups run
+/// one after another.
+///
+/// The lock is transaction-scoped and taken inside an open DuckDB transaction on
+/// its own attach: measured with DuckDB 1.5.5, the postgres extension keeps one
+/// Postgres connection for the length of a DuckDB transaction, and sends
+/// `DISCARD ALL` (which drops session advisory locks) when a pooled connection is
+/// returned, so a session lock taken through it is released at once. Postgres
+/// releases the lock when the setup commits, or when the process exits and its
+/// connection closes.
+pub fn setup_catalog(
+    catalog_connstr: &str,
+    data_path: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    validate_sql_literal(catalog_connstr, "catalog_connstr")?;
+    let lock = Connection::open_in_memory()?;
+    lock.execute_batch(&format!(
+        "LOAD postgres;
+         ATTACH '{catalog_connstr}' AS catalog_setup_lock (TYPE postgres);
+         BEGIN;"
+    ))?;
+    let deadline = std::time::Instant::now() + BOOT_SETUP_BUDGET;
+    loop {
+        let taken: bool = lock.query_row(
+            &format!(
+                "SELECT taken FROM postgres_query('catalog_setup_lock', \
+                 'SELECT pg_try_advisory_xact_lock({CATALOG_SETUP_LOCK_KEY}) AS taken')"
+            ),
+            [],
+            |row| row.get(0),
+        )?;
+        if taken {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "another data plane held the catalog setup lock for {}s",
+                BOOT_SETUP_BUDGET.as_secs()
+            )
+            .into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    setup_catalog_once(catalog_connstr, data_path)?;
+    lock.execute_batch("COMMIT;")?;
+    Ok(())
+}
+
+/// The catalog setup `setup_catalog` runs under its lock, on its own connection.
+fn setup_catalog_once(
+    catalog_connstr: &str,
+    data_path: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let conn = Connection::open_in_memory()?;
+    connect_ducklake(&conn, catalog_connstr, data_path)?;
+    // Catalog-global Parquet defaults: set once here, never per attach (see
+    // set_catalog_options).
+    set_catalog_options(&conn)?;
+    ensure_lake_tables(&conn)?;
+    Ok(())
+}
+
 /// Connect to DuckLake backed by a Postgres catalog.
 ///
 /// Attaches the DuckLake catalog as `qiita_lake` in the DuckDB session.
@@ -63,6 +143,48 @@ pub fn connect_ducklake(
         "ATTACH 'ducklake:postgres:{catalog_connstr}' AS qiita_lake (DATA_PATH '{data_path}');"
     ))?;
     Ok(())
+}
+
+/// The libpq `application_name` an instance gives every connection it opens to the
+/// catalog, read back by `qiita_catalog_connection_budget` in `deploy/_common.sh`.
+/// Unquoted with no spaces: a quoted value closes the ATTACH string literal.
+fn catalog_application_name(port: u16, pool_size: usize) -> String {
+    format!("qiita-data-plane:{port}:pool={pool_size}")
+}
+
+/// `catalog_connstr` with this instance's `catalog_application_name` appended, for
+/// every catalog connection the process opens (`setup_catalog` and the pool).
+///
+/// The connection string must be libpq's `keyword=value` form, which preflight
+/// already requires of it (a URI cannot take the appended setting), and must not
+/// contain `application_name`, with or without spaces around the `=` (libpq accepts
+/// both, and the substring also catches `fallback_application_name`): the
+/// instance's own name is what the connection budget check reads, so a connection
+/// string that names the session otherwise fails boot rather than leaving libpq to
+/// pick one of the two.
+pub(crate) fn tag_catalog_connstr(
+    catalog_connstr: &str,
+    port: u16,
+    pool_size: usize,
+) -> Result<String, String> {
+    validate_sql_literal(catalog_connstr, "DUCKLAKE_CATALOG_CONNSTR")?;
+    if catalog_connstr.starts_with("postgres://") || catalog_connstr.starts_with("postgresql://") {
+        return Err(
+            "DUCKLAKE_CATALOG_CONNSTR must be a libpq keyword=value string, not a URI".to_string(),
+        );
+    }
+    if catalog_connstr.contains("application_name") {
+        return Err(format!(
+            "DUCKLAKE_CATALOG_CONNSTR sets application_name; remove it — the data plane \
+             names its catalog connections {}",
+            catalog_application_name(port, pool_size)
+        ));
+    }
+    Ok(format!(
+        "{} application_name={}",
+        catalog_connstr.trim_end(),
+        catalog_application_name(port, pool_size)
+    ))
 }
 
 /// The zstd level for data at rest: a copy of
@@ -104,7 +226,8 @@ pub fn set_catalog_options(conn: &Connection) -> Result<(), Box<dyn std::error::
 /// - The orchestrator verifies data before loading
 /// - The data plane validates identifier sets programmatically on DoAction
 /// - `reference_sequences` / `reference_sequence_chunks` are additionally
-///   REPLACED on `feature_idx` at register time — `flight_service::REPLACE_KEY_TABLES`
+///   REPLACED on `feature_idx` at register time —
+///   `flight_service::registration::REPLACE_KEY_TABLES`
 ///
 /// Per-table storage tuning (compression, row group size) is deferred to a
 /// separate configuration pass — see DuckLake configuration docs.
@@ -244,7 +367,7 @@ pub fn ensure_reference_tables(conn: &Connection) -> Result<(), Box<dyn std::err
 /// orchestrator verifies before loading).
 ///
 /// PRIVACY: `read` and `read_mask` are deliberately NOT exposed via Flight
-/// (they are absent from `flight_service::ALLOWED_TABLES`). The only
+/// (they are absent from `flight_service::query::ALLOWED_TABLES`). The only
 /// Flight-reachable read surface is the `read_masked` MACRO, which joins read to
 /// read_mask, applies the recorded trims, and excludes every non-`pass` row
 /// (host/human hits + QC failures) via an unconditional `reason = 'pass'`. Human
@@ -442,18 +565,18 @@ pub fn ensure_read_tables(conn: &Connection) -> Result<(), Box<dyn std::error::E
 ///
 /// Same DuckLake constraint story as the read/reference tables: no PK/UNIQUE/FK
 /// (integrity is enforced upstream — the CP mints alignment_idx; align_sharded
-/// stamps feature_idx). Exposed via Flight DoGet (in flight_service::ALLOWED_TABLES)
+/// stamps feature_idx). Exposed via Flight DoGet (in flight_service::query::ALLOWED_TABLES)
 /// for the feature-table (OGU) consumer: reads are always scoped to a single
 /// alignment_idx + an explicit prep_sample_idx set, and projected to the columns
 /// the ticket signed — required on this surface, and drawn from the allowlist
-/// `flight_service::ALIGNMENT_PROJECTION_COLUMNS`, which mirrors the column list
+/// `flight_service::query::ALIGNMENT_PROJECTION_COLUMNS`, which mirrors the column list
 /// below. An unscoped or unprojected read is refused. This is host-depleted
 /// derived data, not raw human reads.
 ///
 /// The second table, `alignment_origin_spanning`, records which `alignment` rows
 /// are one read that crossed a circular contig's origin; its contract is on its
 /// DDL below. It is created here rather than by its own `ensure_*` because every
-/// `flight_service::ALIGNMENT_DELETE_TABLES` delete drops from both, so a catalog
+/// `flight_service::lake_edit::ALIGNMENT_DELETE_TABLES` delete drops from both, so a catalog
 /// holding one without the other fails those deletes.
 pub fn ensure_alignment_tables(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
     conn.execute_batch(
@@ -556,7 +679,7 @@ pub fn ensure_alignment_tables(conn: &Connection) -> Result<(), Box<dyn std::err
         -- their own CIGAR, and no row here describes one.
         --
         -- Superseded by delete-then-register, like `alignment` itself, not by
-        -- `flight_service::REPLACE_KEY_TABLES`: a replace-by-key delete reads the
+        -- `flight_service::registration::REPLACE_KEY_TABLES`: a replace-by-key delete reads the
         -- keys out of the incoming file, and a re-run that no longer finds a read
         -- origin-spanning writes no row for it, so it would name no key and the
         -- stale row would survive its own fragments. `delete_alignment_block`
@@ -564,7 +687,7 @@ pub fn ensure_alignment_tables(conn: &Connection) -> Result<(), Box<dyn std::err
         CREATE TABLE IF NOT EXISTS qiita_lake.alignment_origin_spanning (
             -- `alignment`'s leading four, same names, types and order.
             -- alignment_idx / prep_sample_idx / sequence_idx are NOT NULL because
-            -- a `flight_service::delete_alignment*` predicate keys on each, and a
+            -- a `flight_service::lake_edit::delete_alignment*` predicate keys on each, and a
             -- NULL is a row no delete can reach. feature_idx is NOT NULL because
             -- it is the contig whose origin the interval below wraps, and because
             -- it completes the join key above.
@@ -685,14 +808,14 @@ pub fn ensure_exclusion_tables(conn: &Connection) -> Result<(), Box<dyn std::err
 /// All four are additionally REPLACED at register time — `assembled_sequence` /
 /// `assembled_sequence_chunks` on `feature_idx`, `assembly_membership` /
 /// `bin_quality` on `(prep_sample_idx, processing_idx)`. The keys and what
-/// admits each table are in `flight_service::REPLACE_KEY_TABLES`.
+/// admits each table are in `flight_service::registration::REPLACE_KEY_TABLES`.
 ///
 /// `assembled_sequence` / `assembled_sequence_chunks` are Flight-readable, and so
-/// is `bin_quality` — all three are in `flight_service::ALLOWED_TABLES`, scoped to
+/// is `bin_quality` — all three are in `flight_service::query::ALLOWED_TABLES`, scoped to
 /// one `(prep_sample_idx, processing_idx)` run. `assembly_membership` is not: it is
 /// a register_files write target, SQL-queryable in the catalog, off the external
 /// read-back path, and additionally what resolves the two sequence surfaces' run
-/// scope — read by `flight_service::build_assembly_run_query` as a semi join,
+/// scope — read by `flight_service::query::build_assembly_run_query` as a semi join,
 /// never streamed.
 pub fn ensure_assembly_tables(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
     conn.execute_batch(
@@ -799,7 +922,7 @@ pub fn ensure_assembly_tables(conn: &Connection) -> Result<(), Box<dyn std::erro
 /// closed-reference feature table aggregates membership; it is never itself
 /// stored. membership is replace-keyed on `(prep_sample_idx, processing_idx)`
 /// and the sequence tables on `feature_idx` in
-/// `flight_service::REPLACE_KEY_TABLES`, so a re-run replaces its own rows.
+/// `flight_service::registration::REPLACE_KEY_TABLES`, so a re-run replaces its own rows.
 pub fn ensure_amplicon_tables(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS qiita_lake.amplicon_membership (
@@ -838,8 +961,9 @@ pub fn ensure_amplicon_tables(conn: &Connection) -> Result<(), Box<dyn std::erro
 /// on, and seed it.
 ///
 /// Why a lock is needed at all, and what it buys, lives where it is taken —
-/// `flight_service::register_files` and `flight_service::delete_reference`, both
-/// through `take_registration_lock`. What matters here is the shape: EXACTLY ONE
+/// `flight_service::registration::register_files` and
+/// `flight_service::lake_edit::delete_reference`, both through `take_registration_lock`.
+/// What matters here is the shape: EXACTLY ONE
 /// row, holding a value nothing reads. `take_registration_lock` fails loudly if
 /// its UPDATE matches no row, because a lock that silently stopped locking
 /// reintroduces the duplication this table exists to prevent.
@@ -1990,6 +2114,103 @@ mod tests {
         let conn = Connection::open_in_memory().expect("open in-memory DuckDB");
         let result = connect_ducklake(&conn, "dbname=test", "/tmp/it's bad");
         assert!(result.is_err());
+    }
+
+    // --- The catalog connections' application_name ----------------------
+
+    #[test]
+    fn tagged_connstr_appends_the_instance_application_name() {
+        let tagged = tag_catalog_connstr("dbname=lake host=db user=dp ", 50052, 6).unwrap();
+        assert_eq!(
+            tagged,
+            "dbname=lake host=db user=dp application_name=qiita-data-plane:50052:pool=6"
+        );
+    }
+
+    #[test]
+    fn tagged_connstr_refuses_a_connstr_that_sets_application_name() {
+        for connstr in [
+            "dbname=lake application_name=mine",
+            "dbname=lake application_name = mine",
+        ] {
+            let err = tag_catalog_connstr(connstr, 50051, 8).unwrap_err();
+            assert!(err.contains("sets application_name"), "{connstr}: {err}");
+        }
+    }
+
+    #[test]
+    fn tagged_connstr_refuses_a_uri() {
+        let err = tag_catalog_connstr("postgresql://dp@db/lake", 50051, 8).unwrap_err();
+        assert!(err.contains("not a URI"), "{err}");
+    }
+
+    #[test]
+    fn tagged_connstr_refuses_sql_metacharacters() {
+        let err = tag_catalog_connstr("dbname=lake'", 50051, 8).unwrap_err();
+        assert!(err.contains("disallowed"), "{err}");
+    }
+
+    /// Both kinds of catalog connection — the setup lock's `TYPE postgres` attach
+    /// and the DuckLake attach — reach the catalog server under the tagged name.
+    #[test]
+    #[serial]
+    #[cfg(feature = "integration")]
+    fn catalog_connections_carry_the_instance_application_name() {
+        // A port derived from the process id, so concurrent test processes against one
+        // catalog are unlikely to share a session name.
+        let port = 1 + (std::process::id() % 60000) as u16;
+        let base = crate::test_catalog::connstr();
+        let data_path = crate::test_catalog::data_path();
+
+        let observer = Connection::open_in_memory().unwrap();
+        observer
+            .execute_batch(&format!(
+                "LOAD postgres; ATTACH '{base}' AS observer (TYPE postgres);"
+            ))
+            .unwrap();
+        // Sessions under the name `pool_size` gives; each attach below uses its own
+        // pool size, so a session the other one leaves closing is not counted.
+        let sessions = |pool_size: usize| -> i64 {
+            let name = catalog_application_name(port, pool_size);
+            observer
+                .query_row(
+                    &format!(
+                        "SELECT n FROM postgres_query('observer', \
+                         'SELECT count(*) AS n FROM pg_stat_activity \
+                          WHERE application_name = ''{name}''')"
+                    ),
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+
+        assert_eq!(sessions(3), 0);
+        let lock = Connection::open_in_memory().unwrap();
+        lock.execute_batch(&format!(
+            "LOAD postgres; ATTACH '{}' AS tagged_lock (TYPE postgres); BEGIN;",
+            tag_catalog_connstr(&base, port, 3).unwrap()
+        ))
+        .unwrap();
+        let _: bool = lock
+            .query_row(
+                "SELECT t FROM postgres_query('tagged_lock', 'SELECT true AS t')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(sessions(3), 1, "the TYPE postgres attach");
+        lock.execute_batch("COMMIT;").unwrap();
+
+        assert_eq!(sessions(4), 0);
+        let lake = Connection::open_in_memory().unwrap();
+        connect_ducklake(
+            &lake,
+            &tag_catalog_connstr(&base, port, 4).unwrap(),
+            &data_path,
+        )
+        .unwrap();
+        assert!(sessions(4) >= 1, "the DuckLake attach");
     }
 
     // --- What DuckDB hands the Flight encoder ---------------------------

@@ -70,7 +70,7 @@ class FailureKind(StrEnum):
     retriable, add it to `_RETRIABLE`.
     """
 
-    # ---- Retriable: transient infra / scheduling issues ------------------
+    # ---- Retriable ---------------------------------------------------------
     NODE_FAIL = "node_fail"
     OOM_KILLED = "oom_killed"
     TIMEOUT_BEFORE_START = "timeout_before_start"
@@ -106,6 +106,8 @@ class FailureKind(StrEnum):
     # from a truncated transfer), or a run miint skipped. A format error does
     # NOT belong here (see BAD_INPUT).
     EXTERNAL_FETCH_TRANSIENT = "external_fetch_transient"
+    # A step died on SIGSEGV; it is re-run on the same resources.
+    SEGFAULT = "segfault"
 
     # ---- Permanent: workflow / input / contract issues -------------------
     BAD_INPUT = "bad_input"
@@ -140,6 +142,7 @@ _RETRIABLE: frozenset[FailureKind] = frozenset(
         FailureKind.PROCESS_RESTARTED,
         FailureKind.DATA_PLANE_TRANSIENT,
         FailureKind.EXTERNAL_FETCH_TRANSIENT,
+        FailureKind.SEGFAULT,
     }
 )
 

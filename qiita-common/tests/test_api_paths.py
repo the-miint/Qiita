@@ -18,7 +18,7 @@ def test_compute_upload_staging_path_matches_rust_layout():
     """Locked layout: ``{root}/uploads/{idx}/upload.parquet``.
 
     Mirrors the Rust unit test ``staging_path_for_layout`` in
-    ``qiita-data-plane/src/flight_service.rs``. If you change one,
+    ``qiita-data-plane/src/flight_service/doput_tests.rs``. If you change one,
     change the other in the same commit; both sides will move together
     or not at all."""
     assert compute_upload_staging_path(Path("/scratch/staging"), 42) == Path(

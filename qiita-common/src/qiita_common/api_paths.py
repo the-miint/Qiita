@@ -380,7 +380,7 @@ def compute_upload_staging_path(staging_root: Path, upload_idx: int) -> Path:
     """Canonical filesystem path for a staged DoPut upload.
 
     Mirrors the Rust ``staging_path_for(root, idx)`` in
-    ``qiita-data-plane/src/flight_service.rs``: a single source of truth
+    ``qiita-data-plane/src/flight_service/doput.rs``: a single source of truth
     so the data plane (writes here on DoPut) and the control-plane
     runner (reads here on workflow start) agree byte-for-byte. The
     layout — ``{root}/uploads/{idx}/upload.parquet`` — is locked by

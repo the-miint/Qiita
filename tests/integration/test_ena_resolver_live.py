@@ -12,7 +12,6 @@ and stable is what a column-drift guard needs, not a growing crowdsourced projec
 
 import pytest
 from qiita_common.models.ena import EnaStatus
-
 from qiita_control_plane.ena_import.miint_resolver import MiintEnaResolver
 
 _STUDY_ACCESSION = "PRJNA48739"

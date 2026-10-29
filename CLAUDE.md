@@ -31,7 +31,7 @@ make lint
 # Database migrations (auto-installs dbmate)
 make migrate
 
-# Deploy (prints systemd + nginx instructions; does not sudo)
+# Build, then print the admin deploy command (local-deploy.sh / redeploy); does not sudo
 make deploy
 make verify-health         # auto-installs grpcurl; localhost-only health curls
 
@@ -80,7 +80,7 @@ cd qiita-control-plane && uv sync --reinstall-package qiita-common
 
 **No development-plan vocabulary in code.** "M0", "M3", "Phase 4", "item 6", "the milestone" — these name a planning document that is not in the repo and will not outlive the branch, so they say nothing to whoever reads the line next. This covers comments, docstrings, test names, and changelog entries alike. Write the substance instead: not "M0 measured the break-even at ~4 Gbit/s", just "the measured break-even is ~4 Gbit/s". The `(#N)` carve-out above does not extend to these — a PR number resolves forever, a milestone label does not.
 
-**Don't whole-file-read the big files.** Several source and test modules here run past 3,000 lines (the control-plane CLI/runner test modules, `qiita-data-plane/src/flight_service.rs`). Reading one whole costs more context than every instruction file in this repo combined, so locate first (grep / LSP / a targeted `Read` offset+limit) and read only the span you need. The two `<date>-<sha>.md` files in `docs/changelog-archive/` are long for the same reason, and nothing adds to them: a changelog entry is a new file (see `CHANGELOG.md`). `docs/architecture.md` is an index over `docs/architecture/` — grep it for the section you want, then read that one file.
+**Don't whole-file-read the big files.** Several source and test modules here run past 3,000 lines (the control-plane CLI/runner test modules). Reading one whole costs more context than every instruction file in this repo combined, so locate first (grep / LSP / a targeted `Read` offset+limit) and read only the span you need. The two `<date>-<sha>.md` files in `docs/changelog-archive/` are long for the same reason, and nothing adds to them: a changelog entry is a new file (see `CHANGELOG.md`). `docs/architecture.md` is an index over `docs/architecture/` — grep it for the section you want, then read that one file.
 
 ## miint is a core dependency
 
@@ -183,11 +183,17 @@ The loop ends by printing a `## Reviewer loop` block for the PR description: the
 it reviewed, each fix it made outside the PR's subject, and each finding it declined
 (with the reason), deferred (with its issue number), or left unprobed.
 `.github/pull_request_template.md` carries the heading. The `review-loop-check` CI job
-fails a PR whose description lacks the block or whose "Reviewed at" is not one of the
-PR's own commits; the `no-agent-review` label opts out, for a PR whose author cannot run
-the loop or that has nothing for it to read; the description then says why under the
-same heading. The check establishes that the block is present, not that the loop ran —
-the block is the author's statement, and a human reviewer reads it as one.
+fails a PR whose description lacks the block, whose "Reviewed at" is not one of the
+PR's own commits, or whose "Reviewed at" line does not name, by sha, every commit the
+branch added after it. A merge of the base needs no naming; a merge that brings in
+other commits (a pull of work pushed from elsewhere, another PR's branch) is named
+itself. A commit that only writes the PR's number into the `(#N)` tags under
+`docs/changelog-pending/` and in `DEPLOY_CHECKLIST.md`, replacing a placeholder or adding
+the tag, needs no naming either. The `no-agent-review` label opts out, for a PR whose
+author cannot run the loop or that has nothing for it to read; the description then
+says why under the same heading. The check establishes that the block is present and
+accounts for every push, not that the loop ran — the block is the author's statement,
+and a human reviewer reads it as one.
 
 When a human review turns up a pattern the agent missed, fold it into the agent file in
 the PR that fixes the instance: a rule or a bullet under the rule that owns it, a

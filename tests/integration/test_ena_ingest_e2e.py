@@ -30,10 +30,7 @@ from qiita_control_plane.testing.db_teardown import teardown_entity_graph
 from conftest import ducklake_connect
 
 _DOWNLOAD_ENA_STUDY_YAML_PATH = (
-    Path(__file__).parent.parent.parent
-    / "workflows"
-    / "download-ena-study"
-    / "1.0.0.yaml"
+    Path(__file__).parent.parent.parent / "workflows" / "download-ena-study" / "1.0.0.yaml"
 )
 
 # The DuckLake `read` table's 7-column shape (qiita-data-plane/src/ducklake.rs
@@ -73,9 +70,7 @@ def _write_ena_run_map(path: Path, roster: list[tuple[int, str]]) -> None:
     rows = ", ".join(f"({idx}, '{acc}')" for idx, acc in roster)
     with duckdb.connect(":memory:") as conn:
         conn.execute(
-            "COPY (SELECT * FROM (VALUES "
-            + rows
-            + ") AS t(prep_sample_idx, ena_run_accession)) "
+            "COPY (SELECT * FROM (VALUES " + rows + ") AS t(prep_sample_idx, ena_run_accession)) "
             f"TO '{path}' (FORMAT parquet)"
         )
 
@@ -145,17 +140,20 @@ async def _run_register_files(
     """Drive the REAL runner adapter for the download-ena-study `register-files`
     entry — the exact production tail `ingest_ena_reads` hands its output to."""
     from qiita_control_plane.runner import _run_action_primitive
+    from qiita_control_plane.testing.run_context import run_context
 
     entry = _entry_by_name("register-files")
     await _run_action_primitive(
-        postgres_pool,
+        run_context(
+            pool=postgres_pool,
+            scope_target={},
+            work_ticket_idx=work_ticket_idx,
+            signing_key=data_plane["secret"],
+            data_plane_url=_data_plane_url(data_plane),
+        ),
         entry,
         {"read_staging_dir": str(staging_dir)},
         staging_dir,
-        {},
-        work_ticket_idx=work_ticket_idx,
-        signing_key=data_plane["secret"],
-        data_plane_url=_data_plane_url(data_plane),
     )
 
 
@@ -249,9 +247,7 @@ async def test_ena_reads_land_in_ducklake_read_via_register_files(
         _PAIRED_RUN_ACCESSION: (_PAIRED_ROWS, []),
         _SINGLE_RUN_ACCESSION: (_SINGLE_ROWS, []),
     }
-    monkeypatch.setattr(
-        ingest_ena_reads, "_stage_run_reads", _fake_stage_run_reads_factory(by_run)
-    )
+    monkeypatch.setattr(ingest_ena_reads, "_stage_run_reads", _fake_stage_run_reads_factory(by_run))
 
     roster = [
         (prep_paired, _PAIRED_RUN_ACCESSION),
