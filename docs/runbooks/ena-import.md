@@ -477,8 +477,8 @@ Where verification does not apply (an SFF run, a file that is not gzip-compresse
 `fastq_md5` from ENA) the run still registers. A run that comes back empty with no
 warning fails permanently.
 
-**Dropped connections are retried by DuckDB.** The compute orchestrator's miint connections
-retry a dropped HTTP request up to 8 times, at random waits that add up to about 35 s on
+**Dropped connections are retried by DuckDB.** A FASTQ download retries a dropped HTTP
+request up to 8 times (miint's Portal requests keep DuckDB's default retries), at random waits that add up to about 35 s on
 average and 70 s at most. A 3 GB run makes about 95 requests, and DuckDB caps the retries
 of all of them together at about 50 dropped connections, giving one back for each request
 that succeeds. The values are constants (`MIINT_HTTP_RETRY_SETTINGS` in
