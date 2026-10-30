@@ -102,11 +102,17 @@ const REPLACE_KEY_TABLES: &[ReplaceKey] = &[
         "assembly_membership",
         &["prep_sample_idx", "processing_idx"],
     ),
-    ReplaceKey {
-        table: "bin_quality",
-        key: &["prep_sample_idx", "processing_idx"],
-        key_source: "assembly_membership",
-    },
+    ReplaceKey::borrows("bin_quality", "assembly_membership"),
+    // The myloasm provenance tables (`ducklake::ensure_myloasm_tables`), keyed
+    // like assembly_membership and for the same reason. All six read their keys
+    // from `myloasm_run`; why that table is never empty is at
+    // `qiita_common.myloasm_constants.MYLOASM_RUN_TABLE`.
+    ReplaceKey::own("myloasm_run", &["prep_sample_idx", "processing_idx"]),
+    ReplaceKey::borrows("myloasm_contig", "myloasm_run"),
+    ReplaceKey::borrows("myloasm_layout", "myloasm_run"),
+    ReplaceKey::borrows("myloasm_mapping", "myloasm_run"),
+    ReplaceKey::borrows("myloasm_link", "myloasm_run"),
+    ReplaceKey::borrows("myloasm_split", "myloasm_run"),
     // amplicon's twin of assembly_membership: same key, same argument. amplicon_load
     // derives the whole run's rows from its own workspace and never reads the lake
     // back, and a re-run resolves to the same processing_idx, so a --force resubmit
@@ -139,8 +145,9 @@ struct ReplaceKey {
     /// nothing, leaving the previous run's rows joined to a membership set that
     /// was replaced out from under them. `assembly_membership` carries the run's
     /// key on every row and is never empty where the load runs at all
-    /// (`assembly_hash` raises `StepNoData` at zero contigs of any kind). Every
-    /// other entry is its own source.
+    /// (`assembly_hash` raises `StepNoData` at zero contigs of any kind). The
+    /// myloasm tables borrow `myloasm_run`'s for the same reason; the argument is
+    /// at their entries. Every other entry is its own source.
     key_source: &'static str,
 }
 
@@ -151,6 +158,16 @@ impl ReplaceKey {
             table,
             key,
             key_source: table,
+        }
+    }
+
+    /// An entry keyed on the run, `(prep_sample_idx, processing_idx)`, whose
+    /// delete keys come from `key_source`'s incoming files.
+    const fn borrows(table: &'static str, key_source: &'static str) -> Self {
+        Self {
+            table,
+            key: &["prep_sample_idx", "processing_idx"],
+            key_source,
         }
     }
 }

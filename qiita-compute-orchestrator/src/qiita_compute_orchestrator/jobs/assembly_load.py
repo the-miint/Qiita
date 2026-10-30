@@ -35,6 +35,15 @@ of the UNBINNED membership rows: `residue_split.py` scores only the contigs abov
 length cut, because completeness against a marker set describes nothing for a short
 fragment and CheckM's cost is per subject scored. A short unbinned contig therefore has a
 membership row and no quality row — read the two with a LEFT join, not an inner one.
+
+A myloasm run's genomes_dir also carries the assemble step's provenance dump
+(`<MYLOASM_RAW_DIR>/`). When it is there, this job adds the six `myloasm_*` staging
+Parquets: `_myloasm_provenance` re-keys them, with the reads' names taken as their
+`sequence_idx` and each primary contig's `feature_idx` taken from this run's own
+`bin_map` x `id_map`. A run without the dump (hifiasm_meta) stages none of them.
+The directory's presence is a sound test for a myloasm run: assemble.sh writes the
+dump for every non-empty myloasm assembly or fails the step, and an empty one ends
+the ticket as no-data at assembly_hash, before this step.
 """
 
 from __future__ import annotations
@@ -56,6 +65,7 @@ from qiita_common.assembly_constants import (
     contig_attribute_projection,
     register_contig_attribute_table,
 )
+from qiita_common.myloasm_constants import MYLOASM_RAW_DIR
 from qiita_common.parquet import validate_parquet_path
 
 from ..miint import (
@@ -69,6 +79,13 @@ from ._feature_load import (
     build_feature_id_map,
     write_feature_sequence_chunks,
     write_feature_sequences,
+)
+from ._myloasm_provenance import (
+    CONTIG_FEATURE_TABLE,
+    read_names_from_sequence_idx,
+    register_raw_tables,
+    staging_paths,
+    write_myloasm_staging,
 )
 
 YAML_STEP_NAME = "assembly_load"
@@ -113,7 +130,8 @@ class Inputs(BaseModel):
     container-step outputs holding CheckM's raw `lineage.tsv` + `qa.tsv` and
     DAS_Tool's raw `das_tool_summary.tsv`. `genomes_dir` is the assemble step's
     output, read here only for the per-contig attribute sidecar the entrypoint
-    wrote beside the two FASTAs. `processing_idx` is
+    wrote beside the two FASTAs and, for a myloasm run, its provenance dump.
+    `processing_idx` is
     threaded via the step's `params:` (so the runner mints the run identity before
     the loop); `prep_sample_idx` / `work_ticket_idx` are framework-injected scope
     scalars.
@@ -203,13 +221,29 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 out=bin_quality_out,
             )
 
+            myloasm_dump = inputs.genomes_dir / MYLOASM_RAW_DIR
+            if myloasm_dump.is_dir():
+                _write_myloasm_provenance(
+                    conn,
+                    raw_dir=myloasm_dump,
+                    bin_map_path=inputs.bin_map,
+                    staging=staging,
+                    prep_sample_idx=inputs.prep_sample_idx,
+                    processing_idx=inputs.processing_idx,
+                )
+
             conn.execute("DROP TABLE contig_attribute")
             conn.execute("DROP TABLE id_map")
             conn.execute("DROP TABLE feature_map")
         success = True
     finally:
         if not success:
-            for partial in (sequences_path, membership_path, bin_quality_path):
+            for partial in (
+                sequences_path,
+                membership_path,
+                bin_quality_path,
+                *staging_paths(staging).values(),
+            ):
                 partial.unlink(missing_ok=True)
             shutil.rmtree(chunks_dir, ignore_errors=True)
 
@@ -271,6 +305,34 @@ def _write_assembly_membership(
         "  FROM member m" + contig_attribute_join("m") + "  ORDER BY m.feature_idx"
         f") TO '{out}' ({PARQUET_OPTS_AT_REST})",
         [str(bin_map_path)],
+    )
+
+
+def _write_myloasm_provenance(
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    raw_dir: Path,
+    bin_map_path: Path,
+    staging: Path,
+    prep_sample_idx: int,
+    processing_idx: int,
+) -> None:
+    """The six `myloasm_*` staging Parquets from the assemble step's dump.
+
+    The reads were named by `sequence_idx` when the runner wrote the assembler's
+    input, so each name is its own `sequence_idx`. A primary contig's `feature_idx`
+    is this run's: `bin_map` names every contig assembly_hash hashed by the
+    assembler's own id, and `id_map` carries the minted feature_idx for each."""
+    register_raw_tables(conn, raw_dir)
+    read_names_from_sequence_idx(conn)
+    conn.execute(
+        f"CREATE TEMP TABLE {CONTIG_FEATURE_TABLE} AS "
+        "SELECT bm.contig_id, im.feature_idx "
+        "FROM read_parquet(?) bm JOIN id_map im ON bm.read_id = im.read_id",
+        [str(bin_map_path)],
+    )
+    write_myloasm_staging(
+        conn, staging_dir=staging, prep_sample_idx=prep_sample_idx, processing_idx=processing_idx
     )
 
 

@@ -222,13 +222,40 @@ else
 fi
 if [ -r "$DP_ENV" ]; then
     connstr=$(read_env_var "$DP_ENV" DUCKLAKE_CATALOG_CONNSTR)
-    if [[ "$connstr" == *dbname=* && "$connstr" == *host=* ]]; then
+    if [[ "$connstr" == *application_name* ]]; then
+        # The data plane refuses to boot on it (tag_catalog_connstr in
+        # qiita-data-plane/src/ducklake.rs).
+        fail "connstr/ducklake" "DUCKLAKE_CATALOG_CONNSTR sets application_name; remove it, the data plane names its catalog sessions itself"
+    elif [[ "$connstr" == *dbname=* && "$connstr" == *host=* ]]; then
         pass "connstr/ducklake" "libpq dbname=/host= keywords present"
     else
         fail "connstr/ducklake" "DUCKLAKE_CATALOG_CONNSTR missing libpq dbname=/host= keywords"
     fi
 else
-    skip "connstr/ducklake" "data-plane.env absent (first deploy)"
+    skip "connstr/ducklake" "data-plane.env absent or unreadable"
+fi
+
+# Per-instance MemoryMax (see "Per-instance limits" in _common.sh): the configured
+# value, and the same checks activate.sh makes before installing anything.
+if [ -r "$DP_ENV" ]; then
+    dp_ports=$(qiita_data_plane_ports 2>&1) && dp_rc=0 || dp_rc=$?
+    if [ "$dp_rc" -ne 0 ]; then
+        fail "dp-memory-max" "$dp_ports"
+    elif ! dp_memory_max=$(qiita_data_plane_instance_memory_max 2>&1); then
+        fail "dp-memory-max" "$dp_memory_max"
+    elif ! dp_err=$(qiita_dp_env_omits_local_instances 2>&1); then
+        fail "dp-memory-max" "$dp_err"
+    elif [ -z "$dp_memory_max" ]; then
+        skip "dp-memory-max" "QIITA_DATA_PLANE_INSTANCE_MEMORY_MAX unset — no per-instance limit"
+    elif ! dp_err=$(qiita_assert_pool_memory_fits "$dp_memory_max" 2>&1); then
+        fail "dp-memory-max" "$dp_err"
+    elif ! dp_err=$(qiita_assert_instance_memory_fits "$dp_ports" "$dp_memory_max" 2>&1); then
+        fail "dp-memory-max" "$dp_err"
+    else
+        pass "dp-memory-max" "QIITA_DATA_PLANE_INSTANCE_MEMORY_MAX=$dp_memory_max for each of: $dp_ports"
+    fi
+else
+    skip "dp-memory-max" "data-plane.env absent or unreadable"
 fi
 
 echo "preflight: ${n_pass} pass, ${n_fail} fail, ${n_skip} skip"

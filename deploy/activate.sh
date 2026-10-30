@@ -30,7 +30,16 @@ DP_PORTS=$(qiita_data_plane_ports)
 DP_PEERS=$(qiita_data_plane_peers)
 DP_BIND_HOST=$(qiita_data_plane_bind_host)
 DP_BUILD_COMMIT=$(qiita_data_plane_build_commit)
+# Per-instance limits (see "Per-instance limits" in _common.sh), written into each
+# instance's drop-in below.
+DP_MEMORY_MAX=$(qiita_data_plane_instance_memory_max)
+qiita_assert_pool_memory_fits "$DP_MEMORY_MAX"
+qiita_assert_instance_memory_fits "$DP_PORTS" "$DP_MEMORY_MAX"
+qiita_dp_env_omits_local_instances
 echo "data plane instances: $DP_PORTS on $DP_BIND_HOST"
+if [ -n "$DP_MEMORY_MAX" ]; then
+    echo "data plane instance MemoryMax: $DP_MEMORY_MAX each"
+fi
 if [ -n "$DP_PEERS" ]; then
     echo "data plane peers (other hosts, not restarted by this deploy): $DP_PEERS"
     for peer in $DP_PEERS; do
@@ -243,6 +252,9 @@ for dropin_src in "$INCOMING/deploy/systemd/"*.service.d; do
         install -m 0644 -o root -g root "$conf" "/etc/systemd/system/$unit_dropin_name/"
     done
 done
+# Per-instance drop-ins, loaded by the daemon-reload below so the restart applies
+# them.
+qiita_write_data_plane_dropins "$DP_PORTS" "$DP_MEMORY_MAX"
 systemctl daemon-reload
 
 # Wait for the data plane to have nothing in flight before any service restarts:

@@ -19,6 +19,12 @@
   build reverse-complements mate 2 before mapping a pair under the `sr` preset
   `host_filter` uses (duckdb-miint#341). A pair can now map as one fragment when neither
   mate maps alone, so `host_filter` can count a pair as host that it did not count before.
+- **A dropped ENA download connection is retried at random waits, under a per-run limit
+  (#801).** DuckDB 2.0 draws each wait between retries at random, so a request's 8 retries
+  wait up to about 70 s in all (about 35 s on average) rather than about a minute. It also
+  limits one ENA run's retries to about 50 dropped connections, with no setting; a run
+  that reaches the limit is retried as a transient fetch failure, and so is an import's
+  ENA lookup that reports the same limit.
 - **A registered file whose rows are all deleted now leaves the lake (#801).**
   DuckLake on DuckDB 2.0 drops such a file from its table, so `scripts/lake-gc.sh
   --reclaim` removes it once the snapshots that hold it expire; on 1.5.5 it stayed in
@@ -26,6 +32,10 @@
   of its files was deleted is now refused (`FailedPrecondition`) instead of answered
   with the earlier registration, while that file is still at its lake path. Once lake
   GC has removed it, a replay cannot tell itself from a first call (#800).
+- **`scripts/lake-gc.sh` reports without write access to the lake data path (#801).**
+  On DuckDB 2.0 a dry run only reads it, so a member of group `qiita-data` can run the
+  report as themselves; `--reclaim` and `--reclaim-orphans` still refuse unless the
+  account can write it (`sudo -u qiita-data`).
 - **A control-plane restart interrupts an in-flight `mint-features` map write
   instead of waiting for it (#801).** A restart cancels the steps that have not
   finished by its drain timeout, and the next startup re-attaches them. A

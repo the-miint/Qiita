@@ -13,6 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import duckdb
 import pytest
+from qiita_common.testing.bounded import run_bounded
 
 from qiita_control_plane.miint import run_on_connection
 
@@ -28,24 +29,10 @@ _POLL = 0.1
 
 
 def _run_bounded[T](scenario: Coroutine[object, object, T], timeout: float) -> T:
-    """`asyncio.run(scenario)` on a thread of its own, failing after `timeout` s. A
-    helper that never stops waiting would otherwise hang the run, since it absorbs the
-    cancellation `asyncio.run`'s teardown sends it too."""
-    outcome: dict[str, object] = {}
-
-    def run() -> None:
-        try:
-            outcome["value"] = asyncio.run(scenario)
-        except BaseException as exc:
-            outcome["error"] = exc
-
-    runner = threading.Thread(target=run, daemon=True)
-    runner.start()
-    runner.join(timeout)
-    assert not runner.is_alive(), f"still waiting after {timeout} s"
-    if "error" in outcome:
-        raise outcome["error"]
-    return outcome["value"]
+    """`asyncio.run(scenario)` under `run_bounded`. A helper that never stops waiting
+    would otherwise hang the run, since it absorbs the cancellation `asyncio.run`'s
+    teardown sends it too."""
+    return run_bounded(lambda: asyncio.run(scenario), timeout)
 
 
 async def _cancel(task: asyncio.Task) -> None:

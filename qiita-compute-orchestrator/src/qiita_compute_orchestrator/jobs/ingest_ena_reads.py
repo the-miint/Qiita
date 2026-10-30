@@ -23,7 +23,8 @@ Gotchas specific to the ENA source:
   bad digest are indistinguishable; `max_retries` bounds it).
 - One DuckDB connection per run, each its own in-memory database, so
   `apply_duckdb_settings` gives every concurrent run its own per-slot memory limit
-  and threads.
+  and threads, and each run gets its own DuckDB HTTP retry quota (see
+  `MIINT_HTTP_RETRY_SETTINGS`): one run's dropped connections do not spend another's.
 - A run miint could not read raises. A scan of one run raises on a failed open
   with the server's own error, and on a mid-stream failure as "every run failed"
   (duckdb-miint#312; https://the-miint.github.io/duckdb-miint/insdc_ena/). A scan

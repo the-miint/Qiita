@@ -7,9 +7,6 @@ behaviour is pinned here rather than in either consumer's suite. Both writers of
 misread: the values land in nullable columns nothing else cross-checks.
 """
 
-import re
-from pathlib import Path
-
 import duckdb
 import pytest
 
@@ -210,35 +207,7 @@ def test_a_missing_depth_is_distinguishable_from_a_missing_sidecar(tmp_path):
     ]
 
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-
-
-def _lake_bin_quality_ddl() -> list[tuple[str, str]]:
-    """The `bin_quality` columns as `(name, type)` in DDL order, read out of the data
-    plane's Rust source.
-
-    The two components cannot import each other, so the shared contract is a
-    constant here plus this parse. `projection_allowlist_matches_the_alignment_ddl`
-    does the same thing in the other direction for the alignment surface.
-    """
-    src = (REPO_ROOT / "qiita-data-plane" / "src" / "ducklake.rs").read_text()
-    marker = f"CREATE TABLE IF NOT EXISTS qiita_lake.{BIN_QUALITY_TABLE} ("
-    start = src.find(marker)
-    assert start != -1, f"the {BIN_QUALITY_TABLE} DDL moved; this test reads it out of ducklake.rs"
-    body = src[start + len(marker) :]
-    body = body[: body.index(")")]
-
-    columns = []
-    for line in body.splitlines():
-        line = line.strip()
-        if not line or line.startswith("--"):
-            continue
-        parts = re.split(r"\s+", line.rstrip(","))
-        columns.append((parts[0], parts[1]))
-    return columns
-
-
-def test_bin_quality_columns_match_the_lake_ddl_exactly():
+def test_bin_quality_columns_match_the_lake_ddl_exactly(lake_table_ddl):
     """`BIN_QUALITY_COLUMNS` is the schema `assembly_load` writes its staging Parquet
     with; the DDL is the schema register-files loads it into. Name, TYPE and ORDER
     all have to match — a Parquet whose columns are ordered or typed differently is a
@@ -252,7 +221,7 @@ def test_bin_quality_columns_match_the_lake_ddl_exactly():
     Neither component can import the other, so this parse is the only mechanical link
     between the writer's schema and the schema it writes into.
     """
-    assert list(BIN_QUALITY_COLUMNS) == _lake_bin_quality_ddl()
+    assert list(BIN_QUALITY_COLUMNS) == lake_table_ddl(BIN_QUALITY_TABLE)
 
 
 def test_the_columns_the_resolver_binds_are_bin_quality_columns():
