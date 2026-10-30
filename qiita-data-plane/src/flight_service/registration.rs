@@ -313,11 +313,12 @@ pub(super) fn take_registration_lock(conn: &LakeWriter) -> Result<(), Status> {
 /// re-run, `landed` reads the catalog: given the attempt's value it says whether
 /// that attempt's commit is there, and if it is the value is returned. When
 /// `landed` cannot tell, the call fails with both errors rather than re-running.
-/// `landed` reads committed state only: a failed COMMIT has already ended the
-/// transaction (`ducklake_failed_commit_ends_the_transaction`; measured too for a
-/// COMMIT whose catalog connection dropped before Postgres committed, on DuckDB
-/// 2.0.0, ducklake 417a9117: the attempt's own writes were gone and a new BEGIN
-/// was accepted).
+/// `landed` reads committed state only: DuckDB clears the connection's
+/// transaction before it attempts the commit (`TransactionContext::Commit`), so a
+/// COMMIT that fails, for whatever reason, has already ended it. Pinned for a
+/// conflict by `ducklake_failed_commit_ends_the_transaction`, and measured for a
+/// catalog connection that dropped before Postgres committed (DuckDB 2.0.0,
+/// ducklake 417a9117).
 pub(super) fn transact_with_retry<T>(
     conn: &LakeWriter,
     what: &str,
@@ -496,11 +497,11 @@ fn register_files(
                 replaced: BTreeMap::new(),
             })
         }
-        Ledgered::Partly { files, rows } => {
+        Ledgered::Inconsistent { files, rows } => {
             return Err(Status::internal(format!(
                 "qiita_lake.registered_file records {files} of the {} files this \
                  register_files call for work_ticket {} from {} carries, in {rows} \
-                 rows, though one transaction records each of a registration's \
+                 row(s), though one transaction records each of a registration's \
                  files once; the files are left where they are for an operator",
                 placed.len(),
                 payload.work_ticket_idx,
@@ -753,8 +754,8 @@ fn register_files(
         |_| match ledgered(conn, &placed)? {
             Ledgered::Nothing => Ok(false),
             Ledgered::All => Ok(true),
-            Ledgered::Partly { files, rows } => Err(Status::internal(format!(
-                "qiita_lake.registered_file records {files} of the {} files, in {rows} rows",
+            Ledgered::Inconsistent { files, rows } => Err(Status::internal(format!(
+                "qiita_lake.registered_file records {files} of the {} files, in {rows} row(s)",
                 placed.len()
             ))),
         },
@@ -797,9 +798,9 @@ fn return_to_staging(conn: &duckdb::Connection, files: &[PlacedFile], failure: S
                     .to_string(),
             )
         }
-        Ok(Ledgered::Partly { files, rows }) => {
+        Ok(Ledgered::Inconsistent { files, rows }) => {
             return kept(format!(
-                "qiita_lake.registered_file records {files} of them, in {rows} rows, \
+                "qiita_lake.registered_file records {files} of them, in {rows} row(s), \
                  which one transaction recording each file once cannot leave"
             ))
         }
@@ -849,12 +850,13 @@ struct PlacedFile {
 
 /// How much of a registration's files `qiita_lake.registered_file` records.
 enum Ledgered {
-    /// None of them: no call with this payload committed.
+    /// None of them.
     Nothing,
-    /// Each of them once: a call with this payload committed.
+    /// Each of them once.
     All,
-    /// Anything else: `files` of them, in `rows` rows.
-    Partly { files: usize, rows: usize },
+    /// Anything else, which one transaction recording each of a registration's
+    /// files once cannot leave: `files` of them, in `rows` rows.
+    Inconsistent { files: usize, rows: usize },
 }
 
 /// What `qiita_lake.registered_file` records of `placed`. Why a replay asks this
@@ -866,6 +868,8 @@ enum Ledgered {
 /// `ducklake_list_files` does not), so it would report a commit that has not
 /// happened.
 fn ledgered(conn: &duckdb::Connection, placed: &[PlacedFile]) -> Result<Ledgered, Status> {
+    // An empty payload has nothing to record, so the replay check answers it
+    // with an empty registration.
     if placed.is_empty() {
         return Ok(Ledgered::All);
     }
@@ -886,7 +890,7 @@ fn ledgered(conn: &duckdb::Connection, placed: &[PlacedFile]) -> Result<Ledgered
     } else if rows == placed.len() && files == placed.len() {
         Ledgered::All
     } else {
-        Ledgered::Partly { files, rows }
+        Ledgered::Inconsistent { files, rows }
     })
 }
 

@@ -1008,8 +1008,9 @@ pub fn ensure_registered_file_table(conn: &Connection) -> Result<(), Box<dyn std
 /// bounds the inlined rows by the registrations made since.
 ///
 /// Each flush with rows to move writes one more file, and nothing merges them.
-/// The lookup over 100,000 rows took 4 ms spread over 50 files and 9 ms over
-/// 200, so the file count matters only after hundreds of starts.
+/// The lookup over 100,000 rows took 4 ms in one file, 4 ms spread over 50 and
+/// 9 ms over 200: two hundred starts about double it, still well under the cost
+/// of the same rows left inline.
 ///
 /// A flush never failed beside registrations committing, so it is safe while
 /// other data planes serve. Lock-free registrations lost no COMMIT to it; for

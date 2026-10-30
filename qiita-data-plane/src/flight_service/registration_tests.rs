@@ -1020,7 +1020,7 @@ fn register_files_with_its_payload_partly_in_the_ledger_fails_closed() {
             err.message()
         );
         assert!(
-            err.message().contains(&format!("in {rows} rows")),
+            err.message().contains(&format!("in {rows} row(s)")),
             "{}",
             err.message()
         );
