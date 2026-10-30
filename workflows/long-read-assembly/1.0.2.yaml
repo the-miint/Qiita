@@ -17,8 +17,11 @@ description: >
   output tree into genomes_dir, and assembly_load re-keys them — reads by
   `sequence_idx`, contigs by `contig_num` and, for primary contigs, `feature_idx` —
   into the `myloasm_*` lake tables (`qiita_common.myloasm_constants`). A hifiasm_meta
-  run writes none of them. The reads handed to the assembler are named by
-  `sequence_idx`, so the dump needs no lookup to resolve them.
+  run writes none of them. The runner names the reads it hands the assembler by
+  `sequence_idx`, so the dump needs no lookup to resolve them. That naming is the
+  runner's, not this file's, so it reaches every version; an assembler's contigs do
+  not depend on read names (`_read_ingest._copy_masked_to_fastq` says how that was
+  checked).
 
   A sync leaves only the highest version of an action_id enabled
   (`actions/sync.py`), so once this file is synced 1.0.1 stops accepting

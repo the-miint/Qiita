@@ -24,7 +24,13 @@ import sys
 from pathlib import Path
 
 import duckdb
-from miint_connect import connect, die, sql_path
+
+# `miint_connect` sits beside this file, both in the repo and at /opt/qiita in the
+# image. Running the script directly puts that directory on sys.path already; the
+# insert is for assemble.def's %test, which loads this module by spec and does not.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from miint_connect import connect, die, sql_path  # noqa: E402
 
 PROG = "myloasm_provenance"
 

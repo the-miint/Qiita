@@ -18,4 +18,7 @@
 - **The assembler's reads are named by `sequence_idx` (#813).** The FASTQ that
   long-read-assembly hands its assembler now names each read by its `sequence_idx`
   instead of the sequencer's `read_id`, so anything the assembler writes about a read
-  joins to `read` directly. Assembled contigs and bins are unaffected.
+  joins to `read` directly. This is the runner's, so it applies to every version of
+  the workflow, not only 1.0.2. Contigs are unaffected: myloasm 0.6.0 and
+  hifiasm_meta produced byte-identical contigs, names included, from the same reads
+  under both namings.

@@ -17,6 +17,7 @@ from __future__ import annotations
 import importlib.util
 import os
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -133,7 +134,8 @@ def test_missing_extension_directory_fails_loud(tmp_path: Path) -> None:
 
 def test_assemble_sh_dumps_provenance_only_for_a_non_empty_assembly() -> None:
     """The dump runs in the myloasm arm, inside the same non-empty-primary guard as
-    the splitter (miint refuses an empty FASTA), and writes under genomes_dir."""
+    the splitter (an empty assembly ends the ticket before anything would read the
+    dump), and writes under genomes_dir."""
     src = _ASSEMBLE_SH.read_text()
     myloasm_arm = src[src.index("    myloasm)") : src.index("    *)")]
     guard = myloasm_arm[myloasm_arm.index('if [[ -s "${PRIMARY}" ]]; then') :]
@@ -143,6 +145,22 @@ def test_assemble_sh_dumps_provenance_only_for_a_non_empty_assembly() -> None:
         rf'"\$\{{OUT\}}/{MYLOASM_RAW_DIR}"',
         guard,
     ), "assemble.sh must dump provenance from ${ASM_DIR} into ${OUT}/" + MYLOASM_RAW_DIR
+
+
+def test_the_image_test_can_load_the_script_by_spec(tmp_path: Path) -> None:
+    """assemble.def's %test loads the script by spec from elsewhere, which puts
+    nothing on sys.path; the script must find `miint_connect` beside itself."""
+    (line,) = [
+        ln.strip()
+        for ln in _ASSEMBLE_DEF.read_text().splitlines()
+        if "spec_from_file_location('mp','/opt/qiita/myloasm_provenance.py')" in ln
+    ]
+    line = line.replace("/opt/qiita/myloasm_provenance.py", str(PROVENANCE_SCRIPT))
+    command = line.removeprefix("python3 -c ").strip('"')
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", command], cwd=tmp_path, capture_output=True, text=True
+    )
+    assert result.returncode == 0, result.stderr
 
 
 def test_script_uses_the_staged_miint_and_never_installs() -> None:

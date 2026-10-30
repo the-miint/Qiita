@@ -12,6 +12,9 @@
 #                 one row per contig across both FASTAs — the assembler's own
 #                 per-contig report, joined onto qiita.assembly_membership by
 #                 both writers. Not read by any container step.
+#   myloasm/      myloasm runs only: one Parquet per miint `read_myloasm_*` reader,
+#                 written by myloasm_provenance.py; assembly_load re-keys them into
+#                 the `myloasm_*` lake tables.
 # Zero contigs is left as an empty genomes_dir; downstream steps skip cleanly and
 # assembly_hash turns the all-empty result into StepNoData.
 #
@@ -33,7 +36,10 @@
 # directory hold both arms' layouts and survive a release that renames one — a
 # rename changes this directory's contents instead of needing a change here. The
 # two files each arm reads back to build its published output are named below,
-# and a moved name fails the step there rather than silently emptying it.
+# and a moved name fails the step there rather than silently emptying it. The
+# myloasm arm's provenance dump also reads the tree, through miint's
+# `read_myloasm_*` readers, which own that layout; a file they need that has moved
+# fails the dump, and with it the step.
 #
 # It is not free. On a 1.24 Gbp masked read set — 12% of one real ticket's reads
 # — the tree is 1.44 GB for myloasm and 697 MB for hifiasm_meta, against the
@@ -266,8 +272,9 @@ case "${ASSEMBLER}" in
         #
         # myloasm_provenance.py then dumps which reads myloasm placed on which
         # contig, out of the retained tree and into genomes_dir, the only place a
-        # later step can read it from. Same guard: the readers open the primary
-        # FASTA too.
+        # later step can read it from. Same guard, for its own reason: an empty
+        # assembly ends the ticket as no-data at assembly_hash, before
+        # assembly_load, so there is nothing to persist.
         if [[ -s "${PRIMARY}" ]]; then
             python3 /opt/qiita/myloasm_split.py \
                 "${PRIMARY}" "${OUT}/circular.fa" "${OUT}/noLCG.fa" \

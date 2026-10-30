@@ -641,7 +641,14 @@ def _copy_masked_to_fastq(con: duckdb.DuckDBPyConnection, dest: Path) -> int:
     Each record is named by its `sequence_idx`, not its `read_id` (the CLAUDE.md
     read-identity rule). miint's FASTQ writer contract is
     https://the-miint.github.io/duckdb-miint/writing/; it names a record from the
-    `read_id` column, hence the alias."""
+    `read_id` column, hence the alias.
+
+    This runs for every long-read-assembly version, not only the one whose
+    provenance dump needs it. That is safe because the assemblies do not depend on
+    read names: myloasm 0.6.0 and hifiasm_meta (the 1.0.0 assemble image), each
+    run on duckdb-miint's 1006-read myloasm fixture once with its own names and once
+    with integer names in the same order, wrote byte-identical contigs, names
+    included. Binning and coverage only match names within this one file."""
     (count,) = con.execute(
         "COPY (SELECT sequence_idx AS read_id, "
         "sequence1, qual1, sequence2, qual2 FROM masked) "

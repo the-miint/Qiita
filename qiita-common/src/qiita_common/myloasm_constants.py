@@ -61,8 +61,10 @@ class MyloasmTable:
         return tuple(name for name, _ in self.columns)
 
 
-# Column meanings are miint's (the reading docs linked above); the only renames are
-# the identity columns: `contig_id` -> `contig_num`, `read_id` -> `sequence_idx`.
+# Column meanings are miint's (the reading docs linked above). The identity columns
+# are renamed (`contig_id` -> `contig_num`, `read_id` -> `sequence_idx`), the run's
+# `log_file` path is cut to `log_name`, and `fasta_id` is dropped: it is the contig's
+# FASTA header, rebuilt from the attribute columns.
 # One row is miint's row: a contig (contig), a read piece in a contig's layout
 # (layout), a read piece's mapping to a contig (mapping), a graph edge (link), a
 # split breakpoint (split), and a myloasm log in the run's output tree (run). The
