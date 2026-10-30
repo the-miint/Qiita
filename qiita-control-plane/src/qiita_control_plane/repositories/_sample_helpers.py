@@ -824,9 +824,7 @@ def visible_metadata_source(spec: EntityMetadataSpec) -> str:
     `spec.metadata_table`: the entity's visibility function, aliased `m`.
 
     Binds `CallerMetadataTiers.sql_args()` at $1-$3, so the read's own
-    parameters start at $4. The read filters with `AND m.visible` or reads the
-    `value_*` columns as a mask (docs/architecture/data-model.md, "Metadata
-    visibility tiers"). The function is written to be inlined (see the
+    parameters start at $4. The function is written to be inlined (see the
     migration that creates it).
     """
     return f"{spec.visibility_function}($1::bigint[], $2::text[]::qiita.tier[], $3::qiita.tier) m"
@@ -1298,15 +1296,13 @@ async def fetch_visible_metadata_last_change(
     tiers: CallerMetadataTiers,
     study_idx: int | None = None,
 ) -> datetime | None:
-    """When the values a metadata read returns last changed, or None if it
-    returns none.
+    """The latest updated_at among the entity's metadata values that a caller
+    at `tiers` may read: its globally-linked values, plus its purely-local
+    values on study_idx when one is given. None when there is no such value.
 
-    The read is `fetch_global_metadata` for the entity, plus
-    `fetch_local_metadata` on study_idx when one is given: the latest
-    updated_at among the globally-linked values and that study's purely-local
-    values visible at `tiers`. A read reports this in place of the entity's
-    own last_metadata_change_at, which moves on every write and so would show
-    a caller that hidden values exist and when they change.
+    A read reports this in place of the entity's own last_metadata_change_at,
+    which moves on every write and so would show a caller that hidden values
+    exist and when they change.
     """
     # A NULL study_idx matches no local row, leaving only the global values.
     return await pool_or_conn.fetchval(

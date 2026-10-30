@@ -826,9 +826,10 @@ class SequencedSampleResponse(ReadCounts):
     the caller's tier reaches (each judged on the study that wrote it;
     the rest are absent), keyed on prep_sample_global_field.internal_name.
     Purely-local metadata is excluded: its
-    prep_sample_metadata.global_field_idx is NULL. A global value still
-    surfaces after the prep_sample_to_study link it was written through is
-    retired, since the canonical value outlives the link.
+    prep_sample_metadata.global_field_idx is NULL. A prep_sample holds one
+    value per global field, shared by every study that reads the field,
+    whichever study wrote it; so retiring the link to the study that wrote a
+    global value does not remove it from this response.
 
     `effective_updated_at` = GREATEST(prep_sample.updated_at,
     sequenced_sample.updated_at) — a single timestamp that bumps on a

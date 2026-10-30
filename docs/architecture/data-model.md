@@ -118,7 +118,7 @@ reaches **the value's required tier**.
   `*_study_field.tier_override`, or the study's `default_tier` when that is
   NULL. A linked study-local row always leaves `tier_override` NULL, so the
   global field's tier is the one that applies.
-- **Value-level exception** — a `*_field_exception` row raises the required
+- **Value-level exception** — a `*_field_exception` row increases the required
   tier of one `(entity, field)` value, for a field that is broadly visible
   where one entity's value must not be, e.g. a free-text field into which one
   submitter entered PII. The required tier is the greater of the field tier and
@@ -160,12 +160,19 @@ latest change among the values it returns
 column, which moves on every write. The record's `updated_at` moves only with
 the record's own columns, and the read's ETag is the later of the two
 (`routes._helpers.representation_etag`). So no timestamp a caller reads shows
-that a hidden value exists or when it changed. `last_metadata_change_at` and
-the ETag are stamps of what the response carries, not versions of it: a change that writes no value, such as a
-field's tier, an exception or a grant, can change which values a read returns
-without moving either, unless it hides or reveals the latest one; and a value
-stamped by a transaction that began before the latest one's carries the
-earlier time (`now()` is the transaction's start), so it may not move them.
+that a hidden value exists or when it changed.
+
+Both `last_metadata_change_at` and the ETag are computed from the timestamps of
+the values a response returns, so they do not always move when the response
+changes:
+
+- A change that writes no value, such as a field's tier, an exception or a
+  grant, can change which values a read returns. It moves them only if it
+  hides or reveals the most recently changed value.
+- A value written by a transaction that started before the latest value's
+  transaction carries the earlier time, even if it commits later, since
+  `now()` is when a transaction started. So it may not move them either.
+
 `PATCH /biosample/{idx}` and `PATCH /sequenced-sample/{idx}` check If-Match
 against the ETag of the GET on the same path. A study-scoped read also counts
 that study's local values, so its ETag is not an If-Match for those PATCHes.
@@ -182,7 +189,7 @@ the system_admin owner-biosample-id export — read the tables directly.
 
 **Writes are gated separately.** Every study-scoped route that writes
 biosample or prep_sample metadata, or mints a study-local field, requires
-`admin` on the study (wet_lab_admin+ bypassing), so only a caller who reads
+`admin` on the study (wet_lab_admin+ bypassing), so only a caller who can read
 every value there can write.
 
 ### What a tier reads of a study's own record

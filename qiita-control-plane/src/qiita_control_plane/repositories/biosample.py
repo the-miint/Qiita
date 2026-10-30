@@ -41,9 +41,9 @@ from .exported_entity import export_entity_id_select
 # default or its field's tier: even on a public study, or through a field a
 # study declared lower before its first import, only members (and the roles
 # that read every value) see it. The import creates the field at this tier, and
-# qiita.biosample_metadata_visibility floors every owner-id value at it; a test
-# pins the two together (docs/architecture/data-model.md, "Metadata visibility
-# tiers").
+# qiita.biosample_metadata_visibility requires at least this tier for every
+# owner-id value; a test pins the two together (docs/architecture/data-model.md,
+# "Metadata visibility tiers").
 OWNER_BIOSAMPLE_ID_TIER_OVERRIDE: Tier = Tier.MEMBER
 
 

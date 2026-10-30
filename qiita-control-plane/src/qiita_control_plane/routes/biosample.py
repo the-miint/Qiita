@@ -570,11 +570,10 @@ async def create_biosample_field(
     non-existent study_idx. A field of that name already on the study is a 409;
     the response body is the created field.
 
-    Access policy is interim: the ADMIN gate is a coarse stand-in matching the
-    study-scoped biosample metadata writes, held until metadata writes enforce
-    the visibility rule. When that clamp comes off, this route goes back to
-    `Tier.MEMBER` — minting a study-local field is work a study member is meant
-    to do.
+    Access policy is interim: this route requires `Tier.ADMIN`, as the
+    study-scoped biosample metadata writes do, until those writes apply the
+    visibility rule. It then requires `Tier.MEMBER`, since minting a
+    study-local field is work a study member is meant to do.
 
     biosample_global_field_idx discriminates two mutually-exclusive modes.
     Purely-local (omitted): data_type is required, plus optional required /
@@ -889,7 +888,7 @@ async def get_biosample_in_study(
     is likewise 404 (mirroring the biosample-level read's retired carve-out).
 
     The owner-biosample-id row is a study-local value, read under the same
-    rule; this route does not write it.
+    rule.
 
     last_metadata_change_at and the `ETag` header are stamps of what the
     response carries (`representation_etag`), local values included, so this

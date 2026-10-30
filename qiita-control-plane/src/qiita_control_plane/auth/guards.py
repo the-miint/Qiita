@@ -520,11 +520,12 @@ def caller_tier_reaches(row: CallerStudyAccessRow, *, caller: Principal, tier: T
 
 
 # The role at or above which a caller reads and writes every metadata value on
-# every study, whatever its tier. A route gate that admits a caller by role and
-# then reads metadata names this constant for its bypass
-# (`require_study_access(bypass_role=METADATA_BYPASS_ROLE)`), and the two must
-# agree: a caller the gate admitted by role and the value rule then judged by
-# grant would be let in to read only public values. The wet-lab routes gated on
+# every study, whatever its tier. A route that admits a caller by role and then
+# reads metadata passes this constant as its bypass
+# (`require_study_access(bypass_role=METADATA_BYPASS_ROLE)`), so the route and
+# the metadata rule agree on who reads everything. If they disagreed, a caller
+# the route let in by role, with no grant on the study, would then read only
+# its public values. The wet-lab routes gated on
 # `require_role_at_least(SystemRole.WET_LAB_ADMIN)` admit a role for the
 # route's own work, not as a stand-in for a grant, and keep their literal.
 METADATA_BYPASS_ROLE = SystemRole.WET_LAB_ADMIN
@@ -533,7 +534,7 @@ METADATA_BYPASS_ROLE = SystemRole.WET_LAB_ADMIN
 async def caller_metadata_tiers(
     pool_or_conn: asyncpg.Pool | asyncpg.Connection, caller: Principal
 ) -> CallerMetadataTiers:
-    """The tier `caller` reads metadata values at, on every study.
+    """The tier at which `caller` reads metadata values, on every study.
 
     Anonymous reads at public everywhere. A caller at or above
     `METADATA_BYPASS_ROLE` reads at admin everywhere, with no lookup. Anyone

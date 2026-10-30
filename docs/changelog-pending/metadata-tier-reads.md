@@ -1,11 +1,11 @@
 ### Changed
 
-- **Biosample and prep_sample metadata reads now honour each field's and each value's
+- **Biosample and prep_sample metadata reads now honor each field's and each value's
   visibility tier (#779).**
   A value is returned only when the caller's tier on the study that wrote it reaches
   the tier the value requires. That tier comes from the global field's `default_tier`,
   a study-local field's `tier_override`, or the study's `default_tier`, and a
-  `*_field_exception` row on that one value can raise it. A value the caller may not
+  `*_field_exception` row on that one value can increase it. A value the caller may not
   read is absent from `global_metadata` / `local_metadata`, with no placeholder.
   wet_lab_admin and system_admin read every value.
   - `GET /study/{study_idx}/biosample/{biosample_idx}`,

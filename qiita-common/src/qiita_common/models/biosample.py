@@ -442,9 +442,10 @@ class BiosampleResponse(BaseModel):
     the caller's tier reaches (each judged on the study that wrote it;
     the rest are absent), keyed on biosample_global_field.internal_name.
     Purely-local metadata (including the owner-biosample-id row) is
-    excluded: its biosample_metadata.global_field_idx is NULL. A global
-    value still surfaces after the biosample_to_study link it was written
-    through is retired, since the canonical value outlives the link.
+    excluded: its biosample_metadata.global_field_idx is NULL. A biosample
+    holds one value per global field, shared by every study that reads the
+    field, whichever study wrote it; so retiring the link to the study that
+    wrote a global value does not remove it from this response.
     Intentionally-missing entries (value_missing_reason_idx populated)
     surface via a MissingReasonRef in the entry's `value` field;
     terminology-term entries (value_terminology_term_idx populated)

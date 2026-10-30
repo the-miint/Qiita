@@ -1,13 +1,11 @@
 -- migrate:up
 
--- The metadata visibility rule as SQL: two scalars, for a field's tier and for
--- the exceptions on one value, and, per entity kind, one set-returning function
--- over its EAV rows that completes the required tier (the biosample function
--- adds the owner-biosample-id floor). A read uses that function either as a
--- filter (WHERE visible) or as a mask (the value_* columns, and when the row
--- last changed, are NULL on a hidden row). The rule itself is defined in
--- docs/architecture/data-model.md, "Metadata visibility tiers"; this file
--- implements it.
+-- The metadata visibility rule as SQL. Two scalar functions compute a field's
+-- tier, and the greater of that and the tiers of a value's exception rows. Per
+-- entity kind, one set-returning function reports, for each EAV row, the tier
+-- it requires, the tier the caller holds on its study, and whether the caller
+-- may read it. The rule itself is defined in docs/architecture/data-model.md,
+-- "Metadata visibility tiers"; this file implements it.
 --
 -- The caller's tiers arrive as parallel arrays (study_idx, tier) plus the tier
 -- held on every study not in them.
@@ -42,9 +40,8 @@ LANGUAGE sql IMMUTABLE PARALLEL SAFE
 AS $$ SELECT GREATEST(field_tier, global_exception_tier, local_exception_tier) $$;
 
 COMMENT ON FUNCTION qiita.metadata_required_tier(qiita.tier, qiita.tier, qiita.tier) IS
-    'A metadata field tier raised by any exception row on the value. A biosample '
-    'value''s required tier also takes the owner-biosample-id floor, applied in '
-    'qiita.biosample_metadata_visibility. Definition: '
+    'The greater of a metadata field''s tier and the tier_override of any '
+    '*_field_exception row on one value of that field. Definition: '
     'docs/architecture/data-model.md, "Metadata visibility tiers".';
 
 CREATE FUNCTION qiita.biosample_metadata_visibility(
@@ -116,8 +113,7 @@ $$;
 COMMENT ON FUNCTION qiita.biosample_metadata_visibility(bigint[], qiita.tier[], qiita.tier) IS
     'Every biosample_metadata row with the tier it requires, the tier the caller '
     'holds on its study, and whether the caller may read it; the value columns '
-    'and updated_at are NULL on a row the caller may not read. Filter with WHERE '
-    'visible, or read those columns as a mask. Rule: '
+    'and updated_at are NULL on a row the caller may not read. Rule: '
     'docs/architecture/data-model.md, "Metadata visibility tiers".';
 
 CREATE FUNCTION qiita.prep_sample_metadata_visibility(
@@ -186,12 +182,12 @@ COMMENT ON FUNCTION qiita.prep_sample_metadata_visibility(bigint[], qiita.tier[]
 
 -- The original table COMMENTs said an exception "downgrades visibility to a
 -- specified tier_override", which reads as setting the value's tier. It can
--- only raise it.
+-- only increase it.
 COMMENT ON TABLE qiita.biosample_field_exception IS
     'Per-(biosample, field) visibility overrides. Used to restrict the audience for '
     'specific metadata values that need narrower visibility than their field''s general '
     'policy (e.g., a description field where one biosample accidentally received PII). '
-    'An exception raises the value''s required tier to tier_override; one at or below '
+    'An exception increases the value''s required tier to tier_override; one at or below '
     'the field''s tier changes nothing. Exceptions on globally-linked metadata are keyed '
     'on global_field_idx so they follow the value across studies; exceptions on purely '
     'study-local metadata are keyed on biosample_study_field_idx. Rule: '
@@ -200,7 +196,7 @@ COMMENT ON TABLE qiita.biosample_field_exception IS
 COMMENT ON TABLE qiita.prep_sample_field_exception IS
     'Per-(prep_sample, field) visibility overrides. Used to restrict '
     'the audience for specific metadata values that need narrower visibility '
-    'than their field''s general policy. An exception raises the value''s required '
+    'than their field''s general policy. An exception increases the value''s required '
     'tier to tier_override; one at or below the field''s tier changes nothing. '
     'Exceptions on globally-linked metadata are keyed on global_field_idx so they '
     'follow the value across studies; exceptions on purely study-local metadata are '

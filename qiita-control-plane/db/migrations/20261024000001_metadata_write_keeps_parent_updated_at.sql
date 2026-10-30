@@ -11,9 +11,7 @@
 -- function skips its UPDATE when last_metadata_change_at already holds now(),
 -- as it does from the second metadata write of one transaction on: that
 -- UPDATE would move nothing, so the WHEN clause would let set_updated_at run.
--- updated_at then describes the record's own columns; what a read reports of
--- its metadata's last change is derived from the values it returns
--- (docs/architecture/data-model.md, "Metadata visibility tiers").
+-- updated_at then describes the record's own columns.
 --
 -- The touch's UPDATE takes the parent's row lock, so a metadata write waits
 -- behind a PATCH holding the parent FOR UPDATE, and the PATCH's reads cannot

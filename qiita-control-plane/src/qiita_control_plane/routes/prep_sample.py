@@ -173,11 +173,10 @@ async def create_prep_sample_field(
     non-existent study_idx. A field of that name already on the study is a 409;
     the response body is the created field.
 
-    Access policy is interim: the ADMIN gate is a coarse stand-in matching the
-    study-scoped prep_sample metadata writes, held until metadata writes enforce
-    the visibility rule. When that clamp comes off, this route goes back to
-    `Tier.MEMBER` — minting a study-local field is work a study member is meant
-    to do.
+    Access policy is interim: this route requires `Tier.ADMIN`, as the
+    study-scoped prep_sample metadata writes do, until those writes apply the
+    visibility rule. It then requires `Tier.MEMBER`, since minting a
+    study-local field is work a study member is meant to do.
 
     prep_sample_global_field_idx discriminates two mutually-exclusive modes.
     Purely-local (omitted): data_type is required, plus optional required /

@@ -69,7 +69,7 @@ from .conftest import (
 pytestmark = pytest.mark.db
 
 _ALL_TIERS = (Tier.PUBLIC, Tier.VIEWER, Tier.MEMBER, Tier.ADMIN)
-# An exception can only raise a value's required tier, so a public one would
+# An exception can only increase a value's required tier, so a public one would
 # never restrict anything; the corpus seeds the three that can.
 _EXCEPTION_TIERS = (None, Tier.VIEWER, Tier.MEMBER, Tier.ADMIN)
 
