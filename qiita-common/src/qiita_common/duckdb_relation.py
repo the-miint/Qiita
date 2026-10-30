@@ -5,11 +5,12 @@ relation — fetching from one `sql`, `from_arrow` or `table` built, opening an 
 reader on one (`to_arrow_reader`), or a `sql` call that is not a SELECT and so runs at
 once — on a connection whose last `execute`d SELECT is part-read, or that an open Arrow
 reader of its own is still streaming, with `ResourceInUseException`. Building such a
-relation is accepted. `fetchone()` leaves even a one-row result part-read until a fetch
-comes back empty; `fetchall()` does not. A plain `execute` is not refused (it discards
-the part-read result). Measured on 2.0.0, a part-read `DESCRIBE` or `SHOW` is refused
-like a SELECT, and nothing is refused after `SET`, `CREATE`, `INSERT` (with or without
-`RETURNING`), `COPY`, `CALL` or `PRAGMA`, read or not.
+relation is accepted. The two cases differ on a plain `execute`: it discards a
+part-read result, but is refused while an Arrow reader is open. `fetchone()` leaves
+even a one-row result part-read until a fetch comes back empty; `fetchall()` does not.
+Measured on 2.0.0, a part-read `DESCRIBE` or `SHOW` is refused like a SELECT, and
+nothing is refused after `SET`, `CREATE`, `INSERT` (with or without `RETURNING`),
+`COPY`, `CALL` or `PRAGMA`, read or not.
 """
 
 from __future__ import annotations

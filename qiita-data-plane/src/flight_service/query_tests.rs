@@ -1945,15 +1945,14 @@ fn block_read_selector_prunes_and_scales() {
         v2_large, block_files,
         "V2 (IN+BETWEEN) prunes to block files"
     );
-    // A canary for the fact `block_read_where_clause` records. If it fails,
-    // DuckDB stopped pushing the OR down. Nothing breaks, since V3 still prunes on
-    // its coarse conjuncts (the assertions above), but that docstring's sentence
-    // saying DuckDB prunes on the OR alone is then false and needs correcting.
+    // A canary for the fact `block_read_where_clause`'s docstring records: DuckDB
+    // prunes on the per-member OR alone. V3 still prunes on its coarse conjuncts
+    // (the assertions above), so a failure here breaks no query.
     assert_eq!(
         v1_large, block_files,
-        "the per-member OR alone no longer prunes to the block's files: correct the \
-         sentence in block_read_where_clause's docstring that says it does; the \
-         coarse conjuncts still prune, so nothing else needs to change"
+        "DuckDB no longer prunes on the per-member OR alone: correct the sentence in \
+         block_read_where_clause's docstring that says it does, and drop or invert \
+         this assertion"
     );
 
     // Exactness: V3 returns the split-trimmed result; V2 over-selects the

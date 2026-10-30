@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import random
+import threading
 from contextlib import asynccontextmanager
 
 import duckdb
@@ -591,6 +592,10 @@ def test_a_slice_no_axis_can_score_is_still_refused():
     ).gate.circular
 
 
+# Long enough for a refusal on a loaded machine; the deadlock never returns.
+_DEADLOCK_BOUND_SECONDS = 30
+
+
 @pytest.mark.parametrize(
     "scan",
     [
@@ -603,12 +608,30 @@ def test_a_slice_no_axis_can_score_is_still_refused():
 )
 def test_a_reader_backed_by_its_own_connection_cannot_be_scanned_on_it(scan):
     """A miint table function over a lazy `RecordBatchReader` backed by a query on the
-    SAME connection deadlocked on DuckDB 1.5.4 (duckdb-miint#230). DuckDB 2.0 refuses
-    any new query on the connection while that reader is open, so neither way of
-    handing it to one — `register`, or a replacement scan of the Python variable —
-    reaches the deadlock; if either stops raising, it can again. A Flight-sourced
-    reader, the kind this job registers, is backed by no connection at all."""
+    SAME connection deadlocked on DuckDB 1.5.4 (duckdb-miint#230). While that reader is
+    open, DuckDB 2.0 refuses `register` of it and any new query, a replacement scan of
+    the Python variable included, so neither can hand it to a table function on that
+    connection; if either stops raising, the deadlock may be reachable again. The call
+    runs on a daemon thread so a deadlock fails the test instead of hanging the suite.
+    A Flight-sourced reader, the kind this job registers, is backed by no connection
+    at all."""
     conn = duckdb.connect()
     reader = conn.sql("SELECT range AS x FROM range(5000)").to_arrow_reader(1000)
-    with pytest.raises(duckdb.ResourceInUseException):
-        scan(conn, reader)
+    raised: list[BaseException | None] = []
+
+    def attempt() -> None:
+        try:
+            scan(conn, reader)
+        except BaseException as exc:
+            raised.append(exc)
+        else:
+            raised.append(None)
+
+    thread = threading.Thread(target=attempt, daemon=True)
+    thread.start()
+    thread.join(_DEADLOCK_BOUND_SECONDS)
+    assert not thread.is_alive(), f"still running after {_DEADLOCK_BOUND_SECONDS} s"
+    assert isinstance(raised[0], duckdb.ResourceInUseException), raised[0]
+    # The open reader is what refuses it: once closed, the connection queries again.
+    reader.close()
+    assert conn.execute("SELECT 1").fetchall() == [(1,)]

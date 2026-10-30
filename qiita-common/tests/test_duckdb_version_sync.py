@@ -75,6 +75,12 @@ _PY_DUCKLAKE_VERSION_RE = re.compile(r'^DUCKLAKE_VERSION = "([^"]+)"$', re.MULTI
 # How far past an ATTACH's first line its option list may run: every site keeps the
 # options on the ATTACH line or within the two lines after it.
 _ATTACH_STATEMENT_LINES = 3
+# A DuckLake ATTACH names its catalog by a quoted `ducklake:` path or by `TYPE
+# ducklake`; searching for those, not for the ATTACH keyword, finds it whatever stands
+# between ATTACH and the path.
+_DUCKLAKE_ATTACH_PATTERNS = ("['\"]ducklake:", "type[[:space:]]+ducklake")
+# The option and the start of its quoted value; a bare mention in a comment is not it.
+_DUCKLAKE_VERSION_OPTION_RE = re.compile(r"(?i)\bDUCKLAKE_VERSION\s+['\"]")
 # A `duckdb` requirement — any case, extras or not — and its specifier;
 # `duckdb-<suffix>` packages don't match.
 _PY_DUCKDB_REQ_RE = re.compile(r"(?i)duckdb\s*(?:\[[^\]]*\])?\s*([=<>!~].*)?")
@@ -245,31 +251,25 @@ def test_ducklake_catalog_version_is_the_same_everywhere() -> None:
     )
 
 
-def test_every_ducklake_attach_names_the_catalog_version() -> None:
-    """An ATTACH that leaves DUCKLAKE_VERSION out creates a catalog at the extension's
-    default format, which on DuckDB 2.0 is 1.1, not the 1.0 production runs. DuckDB reads
-    the keywords in any case, with either quote, and with `DATABASE` or `IF NOT EXISTS`
-    between them and the path, so the search does too."""
-    hits = subprocess.run(
-        [
-            "git",
-            "grep",
-            "-n",
-            "-i",
-            "-E",
-            "attach([[:space:]]+database)?([[:space:]]+if[[:space:]]+not[[:space:]]+exists)?"
-            "[[:space:]]+['\"]ducklake:",
-            "--",
-            "*.rs",
-            "*.py",
-            "*.sh",
-            f":!{Path(__file__).relative_to(REPO_ROOT)}",
-        ],
-        cwd=REPO_ROOT,
+def _ducklake_attach_hits(*pathspec: str, cwd: Path = REPO_ROOT, no_index: bool = False):
+    """`git grep -n` lines naming a DuckLake catalog, under `pathspec` in `cwd`."""
+    patterns = [arg for pattern in _DUCKLAKE_ATTACH_PATTERNS for arg in ("-e", pattern)]
+    return subprocess.run(
+        ["git", "grep", *(["--no-index"] if no_index else []), "-n", "-i", "-E", *patterns]
+        + ["--", *pathspec],
+        cwd=cwd,
         check=True,
         capture_output=True,
         text=True,
     ).stdout.splitlines()
+
+
+def test_every_ducklake_attach_names_the_catalog_version() -> None:
+    """An ATTACH that leaves DUCKLAKE_VERSION out creates a catalog at the extension's
+    default format, which on DuckDB 2.0 is 1.1, not the 1.0 production runs."""
+    hits = _ducklake_attach_hits(
+        "*.rs", "*.py", "*.sh", f":!{Path(__file__).relative_to(REPO_ROOT)}"
+    )
     # The data plane, both lake scripts and both integration attaches, at least.
     assert len(hits) >= 5, f"found only {hits!r}; the search no longer sees the attach sites"
     missing = []
@@ -278,9 +278,38 @@ def test_every_ducklake_attach_names_the_catalog_version() -> None:
         lines = (REPO_ROOT / path).read_text().splitlines()
         start = int(line) - 1
         statement = "\n".join(lines[start : start + _ATTACH_STATEMENT_LINES])
-        if "DUCKLAKE_VERSION" not in statement.upper():
+        if not _DUCKLAKE_VERSION_OPTION_RE.search(statement):
             missing.append(f"{path}:{line}")
     assert not missing, f"DuckLake ATTACH without DUCKLAKE_VERSION at {missing}"
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "ATTACH 'ducklake:postgres:x' AS l",
+        'attach "ducklake:postgres:x" as l',
+        "ATTACH OR REPLACE 'ducklake:x' AS l",
+        "ATTACH IF NOT EXISTS 'ducklake:x' AS l",
+        "ATTACH 'postgres:x' AS l (TYPE ducklake)",
+        "ATTACH 'postgres:x' AS l (type  DuckLake)",
+    ],
+)
+def test_the_attach_search_finds_a_ducklake_attach_written(statement: str, tmp_path: Path):
+    (tmp_path / "site.py").write_text(f'SQL = """{statement}"""\n')
+    assert _ducklake_attach_hits("site.py", cwd=tmp_path, no_index=True)
+
+
+@pytest.mark.parametrize(
+    ("options", "names_it"),
+    [
+        ("(DUCKLAKE_VERSION '1.0')", True),
+        ('(ducklake_version "{v}")', True),
+        ("(DATA_PATH 'x')  -- set DUCKLAKE_VERSION later", False),
+        ("(DUCKLAKE_VERSION_FOO '1.0')", False),
+    ],
+)
+def test_the_version_check_needs_the_option_and_its_value(options: str, names_it: bool):
+    assert bool(_DUCKLAKE_VERSION_OPTION_RE.search(options)) is names_it
 
 
 @pytest.mark.parametrize(

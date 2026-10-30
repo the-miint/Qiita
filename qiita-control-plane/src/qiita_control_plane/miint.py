@@ -29,9 +29,10 @@ The connect-config + install/load statements are shared with the orchestrator
 via `qiita_common.duckdb_miint` (single source for the `MIINT_EXTENSION_REPO` /
 `MIINT_EXTENSION_DIRECTORY` env contract).
 
-Beside them sit two helpers for any DuckDB connection the control plane uses, miint
-loaded or not: `arrow_batches` streams a result as Arrow, and `run_on_connection`
-runs a statement in a worker thread so that a cancelled caller interrupts it.
+Beside them sit `duckdb_connect`, for service code that needs no miint, and two
+helpers for any DuckDB connection the control plane uses, miint loaded or not:
+`arrow_batches` streams a result as Arrow, and `run_on_connection` runs a statement in
+a worker thread so that a cancelled caller interrupts it.
 """
 
 from __future__ import annotations
