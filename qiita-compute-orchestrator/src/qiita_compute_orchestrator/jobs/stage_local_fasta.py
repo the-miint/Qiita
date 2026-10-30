@@ -20,28 +20,19 @@ here.
 with miint's `read_fastx` table function (native parser; `.gz` transparent;
 `read_id` is the header's first token, matching the remote path), and the 64 KB
 chunking is miint's native `sequence_split` (`UNNEST`ed) — never a hand-rolled
-Python parser. `read_fastx` accepts a `VARCHAR[]` of paths, so a batch of the
-manifest is one streaming scan — no sequence bytes through Python. The manifest
-is fed in batches rather than one call; `_MANIFEST_BATCH_FILES` carries why. The
-scan runs twice: pass 1 keeps only `(read_id, length,
-filepath)` for the sanity checks (so the full sequences are never materialised —
-the old per-file temp table was the dominant spill source), accumulating into
-one temp table so the checks still see the whole manifest; pass 2 streams
-read → split → Parquet without landing sequences in a table, one Parquet part
-per batch. Re-reading each FASTA (2× decompress) is deliberate — far cheaper
-than spilling hundreds of genomes. Empty files are pre-filtered out
-(`read_fastx` raises on a 0-record input, and one empty path aborts the batch
-it lands in).
+Python parser. `read_fastx` accepts a `VARCHAR[]` of paths, so the whole
+manifest is one streaming scan — no sequence bytes through Python. The scan runs
+twice: pass 1 keeps only `(read_id, length, filepath)` for the sanity checks, so
+the full sequences are never materialised; pass 2 re-reads every file and streams
+read → split → Parquet without landing sequences in a table (pass 2's comment
+in `execute` says why). Empty files are pre-filtered out (`read_fastx` raises on a
+0-record input, and one empty path aborts the scan).
 
 **Bounded memory is config, not algorithm.** `read_fastx(..., max_batch_bytes)`
 caps each read batch by bytes so a multi-MB genome record (GG2 reaches ~21 MB)
 can't form a giant vector; `apply_duckdb_settings` sets `memory_limit` +
 `temp_directory` (operators spill, not OOM) + `preserve_insertion_order=false`;
-and `PARQUET_OPTS_CHUNKED_TRANSFER`'s `ROW_GROUP_SIZE` bounds the write buffer. At
-~300 GB the chunked-Parquet ingest plus the unchanged quadratic
-`hash_sequences`/`load` is still a deferred performance effort, but the external
-contract (this step's `fasta_path` output wired into `hash_sequences`) is stable
-across both phases.
+and `PARQUET_OPTS_CHUNKED_TRANSFER`'s `ROW_GROUP_SIZE` bounds the write buffer.
 
 **read_id is the global join key.** read_id is the genome_map join key and is
 globally unique by contract; a duplicate (across files or within one file) is a
@@ -59,7 +50,6 @@ from __future__ import annotations
 
 import logging
 import shutil
-from itertools import batched
 from pathlib import Path
 
 from pydantic import BaseModel
@@ -97,23 +87,6 @@ _DUCKDB_THREADS = 8
 # `memory_limit`/`temp_directory` spill (apply_duckdb_settings) and the write
 # buffer (`ROW_GROUP_SIZE` in PARQUET_OPTS_CHUNKED_TRANSFER).
 _READ_FASTX_MAX_BATCH_BYTES = "128MB"
-
-# How many manifest paths go into ONE `read_fastx` call. `read_fastx` opens a
-# file per path and holds that handle until the whole call ends — a reader is
-# never released when its file is exhausted — so open descriptors and zlib
-# state grow with the number of paths in a single call, not with the bytes read
-# (duckdb-miint#260). Measured on gzipped WoL3 genomes: ~1 descriptor and
-# ~464 KB of RSS retained per path, both linear. A 196,062-path manifest
-# therefore needs ~196k descriptors and ~89 GB before the call can finish; a
-# 64 GB run of it stopped at path 131,070 with `Empty file`, which is what
-# `read_fastx` reports when an open fails.
-#
-# 500 is sized against the descriptor limit a SLURM step actually gets, measured
-# on a compute node: soft 1024, hard 131072. Nothing in the job raises the soft
-# limit (probed: importing duckdb and opening a connection leave RLIMIT_NOFILE
-# untouched), so 500 leaves the same headroom again for DuckDB's own
-# descriptors. Pass `paths` whole again once duckdb-miint#260 ships.
-_MANIFEST_BATCH_FILES = 500
 
 _LOG = logging.getLogger(__name__)
 
@@ -168,12 +141,12 @@ def _read_manifest(manifest_path: Path) -> list[Path]:
 
 
 async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
-    """Read every manifest FASTA with batched `read_fastx(VARCHAR[])` scans; emit
-    the chunked Parquet parts. Validates the manifest and each listed file, stages
-    only `(read_id, length, filepath)` into a small temp table, fails fast on an
-    empty-body record or a duplicate read_id, then re-scans and COPYs the
-    `sequence_split`/`UNNEST` chunking to one Parquet part per batch without
-    materialising the sequences. Returns `{"fasta_path": <directory>}`.
+    """Read every manifest FASTA with one `read_fastx(VARCHAR[])` scan per pass;
+    emit the chunked Parquet part. Validates the manifest and each listed file,
+    stages only `(read_id, length, filepath)` into a small temp table, fails fast on
+    an empty-body record or a duplicate read_id, then re-scans and COPYs the
+    `sequence_split`/`UNNEST` chunking to Parquet without materialising the
+    sequences. Returns `{"fasta_path": <directory>}`.
     """
     if not inputs.fasta_manifest_path.is_absolute():
         raise ValueError(
@@ -185,9 +158,10 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     fasta_paths = _read_manifest(inputs.fasta_manifest_path)
 
     workspace.mkdir(parents=True, exist_ok=True)
-    # A DIRECTORY of `part_*.parquet`, not one file: Parquet has no append, so a
-    # batched pass 2 writes a part per batch. Same shape hash_sequences emits for
-    # `reference_sequence_chunks`. hash_sequences hands `fasta_path` to
+    # A DIRECTORY holding one `part_00000.parquet`: both local reference-add
+    # workflows declare `fasta_path` a directory of Parquet parts, and a single file
+    # would change the step's output under an unchanged workflow version.
+    # hash_sequences hands `fasta_path` to
     # `read_parquet` unglobbed, unlike the repo's other parts-directory readers,
     # because the same step also serves reference-add, where `fasta_path` is a
     # single `upload.parquet` — one bare path covers both shapes. So nothing but
@@ -206,11 +180,12 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 threads=_DUCKDB_THREADS,
             )
 
-            # read_fastx takes a VARCHAR[] of paths — one streaming scan per
-            # batch, no full-sequence temp table. Pre-filter empties: read_fastx
-            # raises "Empty file" on a 0-record input, and one empty file aborts
-            # the batch it lands in. The pre-filter itself opens and reads a byte
-            # from every path, one at a time, which is the remaining per-path
+            # read_fastx takes a VARCHAR[] of paths — one streaming scan of the whole
+            # manifest, which closes each file once it has read it (duckdb-miint#261;
+            # undocumented, duckdb-miint#378), and no full-sequence temp table.
+            # Pre-filter empties: read_fastx raises "Empty file" on a 0-record input,
+            # and one empty file aborts the scan. The pre-filter itself opens and reads
+            # a byte from every path, one at a time, which is the remaining per-path
             # Python round-trip in this job.
             paths = [str(p) for p in fasta_paths if not is_empty_sequence_file(p)]
             if not paths:
@@ -220,26 +195,17 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
 
             # Pass 1 — lengths + filepath only; no sequence bytes retained, so
             # the sanity checks (empty-body, dup read_id) cost a tiny table
-            # instead of materialising every genome (the old spill source).
+            # instead of materialising every genome.
             # `max_batch_bytes` caps the read-side vector for genome-scale
             # records; `include_filepath` lets the dup report name the file.
-            # One statement per batch, all appending to the SAME temp table, so
-            # the checks below still run once over the whole manifest. The
-            # accumulated table holds exactly the rows the single-call version
-            # built — four scalars per read, no sequences.
-            sanity_select = (
+            conn.execute(
+                "CREATE TEMP TABLE read_sanity AS "
                 "SELECT read_id, length(sequence1) AS length, filepath, "
                 f"{soft_masked_expr('sequence1')} AS soft_masked "
                 f"FROM read_fastx(?, max_batch_bytes:='{_READ_FASTX_MAX_BATCH_BYTES}', "
-                "include_filepath:=true)"
+                "include_filepath:=true)",
+                [paths],
             )
-            for index, batch in enumerate(batched(paths, _MANIFEST_BATCH_FILES)):
-                statement = (
-                    f"CREATE TEMP TABLE read_sanity AS {sanity_select}"
-                    if index == 0
-                    else f"INSERT INTO read_sanity {sanity_select}"
-                )
-                conn.execute(statement, [list(batch)])
 
             # Empty-body records: a named read with no sequence is bad data.
             # read_fastx surfaces them as length-0 rows, so detect in SQL.
@@ -281,31 +247,29 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             if masked:
                 _LOG.warning(SOFT_MASK_WARNING, ", ".join(row[0] for row in masked))
 
-            # Pass 2 — chunk + write in one streaming COPY per batch using
-            # miint's native `sequence_split` (shared chunker; see
-            # qiita_common.chunking). Each sequence splits into 64 KB pieces in a
-            # single linear pass; UNNEST gives one row per chunk. Sequences flow
-            # read -> split -> parquet without ever landing in a table. This
-            # re-reads each FASTA (2x decompress total) — deliberate: far cheaper
-            # than materialising hundreds of genomes only to spill them.
-            for index, batch in enumerate(batched(paths, _MANIFEST_BATCH_FILES)):
-                part_out = validate_parquet_path(fasta_dir / f"part_{index:05d}.parquet")
-                conn.execute(
-                    "COPY ("
-                    "  SELECT read_id, c.chunk_index, c.chunk_data FROM ("
-                    f"    SELECT read_id, UNNEST({sequence_split_expr('sequence1')}) AS c "
-                    f"    FROM read_fastx(?, max_batch_bytes:='{_READ_FASTX_MAX_BATCH_BYTES}')"
-                    "  )"
-                    f") TO '{part_out}' ({PARQUET_OPTS_CHUNKED_TRANSFER})",
-                    [list(batch)],
-                )
+            # Pass 2 — chunk + write in one streaming COPY using miint's native
+            # `sequence_split` (shared chunker; see qiita_common.chunking). Each
+            # sequence splits into 64 KB pieces in a single linear pass; UNNEST
+            # gives one row per chunk. Sequences flow read -> split -> parquet
+            # without ever landing in a table. Re-reading each FASTA (2x
+            # decompress total) is far cheaper than materialising hundreds of
+            # genomes only to spill them.
+            part_out = validate_parquet_path(fasta_dir / "part_00000.parquet")
+            conn.execute(
+                "COPY ("
+                "  SELECT read_id, c.chunk_index, c.chunk_data FROM ("
+                f"    SELECT read_id, UNNEST({sequence_split_expr('sequence1')}) AS c "
+                f"    FROM read_fastx(?, max_batch_bytes:='{_READ_FASTX_MAX_BATCH_BYTES}')"
+                "  )"
+                f") TO '{part_out}' ({PARQUET_OPTS_CHUNKED_TRANSFER})",
+                [paths],
+            )
         success = True
     finally:
         # On any failure (bad manifest entry, empty-body, dup read_id,
         # interrupted COPY) remove the parts directory so the launcher's manifest
-        # walker (which runs after execute()) can't promote a partial set of
-        # parts as this step's output. A batched pass 2 makes that a real
-        # possibility: batch 0 can be on disk when batch 7 raises.
+        # walker (which runs after execute()) can't promote a half-written part
+        # as this step's output.
         if not success:
             shutil.rmtree(fasta_dir, ignore_errors=True)
 
