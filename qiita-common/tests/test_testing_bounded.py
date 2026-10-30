@@ -11,11 +11,17 @@ def test_returns_what_the_call_returned():
     assert run_bounded(lambda: 42, timeout=5) == 42
 
 
-def test_raises_what_the_call_raised():
-    def boom():
-        raise KeyError("x")
+class _NotAnException(BaseException):
+    """Like `pytest.fail`'s `Failed` or `asyncio.CancelledError`: a `BaseException`
+    that is not an `Exception`, which the callers' scenarios raise on the thread."""
 
-    with pytest.raises(KeyError):
+
+@pytest.mark.parametrize("raised", [KeyError("x"), _NotAnException()])
+def test_raises_what_the_call_raised(raised):
+    def boom():
+        raise raised
+
+    with pytest.raises(type(raised)):
         run_bounded(boom, timeout=5)
 
 

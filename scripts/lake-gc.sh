@@ -218,7 +218,7 @@ run_maintenance() {
         echo "SET home_directory='${SESSION_TMPDIR}';"
         # ducklake, plus postgres for the catalog backend — `ducklake:postgres:`
         # below needs it. It would autoload, but autoINSTALL is the part that
-        # would reach for a home this account does not have, so both are named.
+        # would reach for a home qiita-data does not have, so both are named.
         # No miint: this never reads a sequence (unlike lake-shell.sh), so it
         # also never switches extension_directory to the staged build.
         echo "INSTALL ducklake; LOAD ducklake;"

@@ -479,8 +479,8 @@ warning fails permanently.
 
 **Dropped connections are retried by DuckDB.** A FASTQ download retries a dropped HTTP
 request up to 8 times, at random waits that add up to about 35 s on average and 70 s at
-most; a FASTQ that cannot be opened at all is tried twice (duckdb-miint#391). This
-covers FASTQ downloads only: [`docs/duckdb-miint.md`](../duckdb-miint.md) says what
+most. An open whose requests all drop goes through those retries twice
+(duckdb-miint#391), up to about 140 s. This covers FASTQ downloads only: [`docs/duckdb-miint.md`](../duckdb-miint.md) says what
 miint's Portal requests do. A 3 GB run makes about 95 requests, and DuckDB also limits
 how many retries they make together, to about 50 dropped connections a run. A run that
 reaches the limit fails with `retry quota for '…' exhausted` in its reason and is

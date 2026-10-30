@@ -371,8 +371,8 @@ def resolve_duckdb_memory_gb(
 # back 1 token, one that succeeds after retrying gives back its last retry's cost, and a
 # minute without a request to the host refills the quota. The waits, the throttle rule
 # and the quota are read from DuckDB 2.0.0's source; a loopback probe confirmed the ~50
-# dropped-connection retries. miint opens a run whose open failed once more
-# (duckdb-miint#391), so a FASTQ that cannot be opened waits and spends all this twice.
+# dropped-connection retries. miint's own reopen of a failed FASTQ open doubles what a
+# dead open costs (docs/duckdb-miint.md, duckdb-miint#391).
 # Applied as session SETs after httpfs is loaded, not in the connect config: a
 # connect-time httpfs setting makes connect() autoinstall httpfs, and a GLOBAL value would
 # nest under the 3-try retry loop of miint's Portal ENAClient. FASTQ downloads run through
