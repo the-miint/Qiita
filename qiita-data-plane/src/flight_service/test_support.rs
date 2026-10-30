@@ -95,7 +95,6 @@ pub(super) fn catalog_that_loses_a_commit_answer(
         out
     }
 
-    // A snapshot insert, which only a commit of a write sends.
     const ARMS: &[u8] = b"ducklake_snapshot VALUES";
     let cut_flag = cut.clone();
     std::thread::spawn(move || {

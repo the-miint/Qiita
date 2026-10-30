@@ -957,61 +957,135 @@ fn register_files_replayed_after_a_registration_the_ledger_never_recorded_regist
     );
 }
 
-/// A ledger recording only some of a payload's files fails the call closed and
-/// leaves the files as they are: one transaction records all of a registration's
-/// files, so this payload is not the one that wrote them.
+/// A ledger recording a payload's files other than each once fails the call
+/// closed and leaves the files as they are: one transaction records each of a
+/// registration's files once, so the ledger has been edited. Here one of two
+/// files is missing, and then one is missing and the other recorded twice,
+/// which a count of rows alone would read as complete.
 #[test]
 #[serial_test::serial]
 #[cfg(feature = "integration")]
-fn register_files_with_part_of_its_payload_in_the_ledger_fails_closed() {
+fn register_files_with_its_payload_partly_in_the_ledger_fails_closed() {
     let connstr = crate::test_catalog::connstr();
     let data_path = crate::test_catalog::data_path();
-    let ref_idx: i64 = 988_000;
-    let ticket: i64 = 988_000_000 + std::process::id() as i64;
-    prepare_membership_table(&connstr, &data_path, ref_idx);
-    let (staging, mut payload) = seed_membership_registration(ref_idx, ticket);
-    std::fs::copy(
-        staging.path().join("reference_membership.parquet"),
-        staging.path().join("second.parquet"),
-    )
-    .unwrap();
-    payload.files.insert(
-        "second.parquet".to_string(),
-        "reference_membership".to_string(),
-    );
-    let first = register_files(
-        &attached_writer(&connstr, &data_path),
-        &data_path,
-        std::path::Path::new("/"),
-        &payload,
-    )
-    .expect("first register_files failed");
-    let conn = Connection::open_in_memory().unwrap();
-    ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
-    conn.execute(
-        "DELETE FROM qiita_lake.registered_file WHERE data_file = ?",
-        [&first.registered[0]],
-    )
-    .unwrap();
+    for (ref_idx, duplicated) in [(988_000_i64, false), (989_000_i64, true)] {
+        let ticket: i64 = ref_idx * 1000 + std::process::id() as i64;
+        prepare_membership_table(&connstr, &data_path, ref_idx);
+        let (staging, mut payload) = seed_membership_registration(ref_idx, ticket);
+        std::fs::copy(
+            staging.path().join("reference_membership.parquet"),
+            staging.path().join("second.parquet"),
+        )
+        .unwrap();
+        payload.files.insert(
+            "second.parquet".to_string(),
+            "reference_membership".to_string(),
+        );
+        let first = register_files(
+            &attached_writer(&connstr, &data_path),
+            &data_path,
+            std::path::Path::new("/"),
+            &payload,
+        )
+        .expect("first register_files failed");
+        let conn = Connection::open_in_memory().unwrap();
+        ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
+        conn.execute(
+            "DELETE FROM qiita_lake.registered_file WHERE data_file = ?",
+            [&first.registered[0]],
+        )
+        .unwrap();
+        if duplicated {
+            conn.execute(
+                "INSERT INTO qiita_lake.registered_file \
+                 SELECT * FROM qiita_lake.registered_file WHERE data_file = ?",
+                [&first.registered[1]],
+            )
+            .unwrap();
+        }
 
-    let err = register_files(
-        &attached_writer(&connstr, &data_path),
-        &data_path,
-        std::path::Path::new("/"),
-        &payload,
-    )
-    .expect_err("a replay with part of its payload in the ledger succeeded");
+        let err = register_files(
+            &attached_writer(&connstr, &data_path),
+            &data_path,
+            std::path::Path::new("/"),
+            &payload,
+        )
+        .expect_err("a replay with its payload partly in the ledger succeeded");
 
-    assert_eq!(err.code(), tonic::Code::Internal, "{}", err.message());
-    assert!(
-        err.message().contains(&first.registered[1]),
-        "{}",
-        err.message()
-    );
-    for file in &first.registered {
-        assert!(std::path::Path::new(file).exists(), "{file} was moved");
+        assert_eq!(err.code(), tonic::Code::Internal, "{}", err.message());
+        let rows = if duplicated { 2 } else { 1 };
+        assert!(
+            err.message().contains("records 1 of the 2 files"),
+            "{}",
+            err.message()
+        );
+        assert!(
+            err.message().contains(&format!("in {rows} rows")),
+            "{}",
+            err.message()
+        );
+        for file in &first.registered {
+            assert!(std::path::Path::new(file).exists(), "{file} was moved");
+        }
+        assert_eq!(membership_rows(&connstr, &data_path, ref_idx), 4);
     }
-    assert_eq!(membership_rows(&connstr, &data_path, ref_idx), 4);
+}
+
+/// Why `landed` can read the ledger after a failed COMMIT: the failure has ended
+/// the transaction, so the attempt's own ledger row is gone rather than visible
+/// to it, and the connection can BEGIN again. Two writers take
+/// `registration_lock` and each record a row; the second to commit loses.
+#[test]
+#[serial_test::serial]
+#[cfg(feature = "integration")]
+fn ducklake_failed_commit_ends_the_transaction() {
+    let connstr = crate::test_catalog::connstr();
+    let data_path = crate::test_catalog::data_path();
+    let setup = Connection::open_in_memory().unwrap();
+    ducklake::connect_ducklake(&setup, &connstr, &data_path).unwrap();
+    ducklake::ensure_registration_lock(&setup).unwrap();
+    ducklake::ensure_registered_file_table(&setup).unwrap();
+    let loser_file = format!("failed-commit-{}", std::process::id());
+    let record = |conn: &Connection, file: &str| {
+        conn.execute_batch("BEGIN TRANSACTION").unwrap();
+        conn.execute_batch("UPDATE qiita_lake.registration_lock SET epoch = epoch + 1")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO qiita_lake.registered_file VALUES (?, 'read', 0, now())",
+            [file],
+        )
+        .unwrap();
+    };
+    let recorded = |conn: &Connection| -> i64 {
+        conn.query_row(
+            "SELECT count(*) FROM qiita_lake.registered_file WHERE data_file = ?",
+            [&loser_file],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    let loser = attached_conn(&connstr, &data_path);
+    let winner = attached_conn(&connstr, &data_path);
+    record(&loser, &loser_file);
+    record(&winner, &format!("{loser_file}-winner"));
+    assert_eq!(recorded(&loser), 1, "the open transaction sees its own row");
+    winner.execute_batch("COMMIT").unwrap();
+
+    loser
+        .execute_batch("COMMIT")
+        .expect_err("both writers of registration_lock committed");
+
+    assert_eq!(
+        recorded(&loser),
+        0,
+        "the failed attempt's row is still visible"
+    );
+    loser.execute_batch("BEGIN TRANSACTION; ROLLBACK").unwrap();
+    assert_eq!(recorded(&setup), 0);
+    let _ = setup.execute(
+        "DELETE FROM qiita_lake.registered_file WHERE data_file LIKE ?",
+        [format!("{loser_file}%")],
+    );
 }
 
 /// A registration that fails after its moves — here `ducklake_add_data_files`

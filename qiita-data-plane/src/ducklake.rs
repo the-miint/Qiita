@@ -970,8 +970,8 @@ pub fn ensure_registration_lock(conn: &Connection) -> Result<(), Box<dyn std::er
 /// `data_inlining_row_limit` per statement, with a default of 10. An INSERT per
 /// file would stay under the default, at a statement per file; `register_files`
 /// records a registration in one INSERT instead, so the limit sits above the
-/// most files one registration carries. A load's files are parts of a gigabyte
-/// or more, so 10,000 of them is terabytes. A registration past the limit is
+/// most files one registration carries. A load splits into about one part per
+/// gigabyte, so 10,000 files is terabytes. A registration past the limit is
 /// still recorded, in a small file of its own.
 const REGISTERED_FILE_INLINING_ROW_LIMIT: u32 = 10_000;
 
@@ -1003,13 +1003,20 @@ pub fn ensure_registered_file_table(conn: &Connection) -> Result<(), Box<dyn std
 ///
 /// DuckLake reads a table's inlined rows without pushing a filter down, so the
 /// ledger lookup `register_files` makes on every call costs in proportion to the
-/// rows still inlined: 25 ms at 100,000, against 4 ms once the same rows were
-/// flushed. Each flush writes one more file, which costs little: 100,000 rows
-/// over 50 files took 4 ms, and over 200 files 9 ms. A flush did not conflict
-/// with registrations committing beside it (DuckDB 2.0.0, ducklake 417a9117), so
-/// it is safe while other data planes serve. `setup_catalog_once` runs it at
-/// each start, which bounds the cost by the registrations made since.
-pub fn flush_registered_file(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
+/// rows still inlined: 25 ms at 100,000 rows, against 5 ms once the same rows
+/// were flushed to one file. `setup_catalog_once` flushes at each start, which
+/// bounds the inlined rows by the registrations made since.
+///
+/// Each flush with rows to move writes one more file, and nothing merges them.
+/// The lookup over 100,000 rows took 4 ms spread over 50 files and 9 ms over
+/// 200, so the file count matters only after hundreds of starts.
+///
+/// A flush never failed beside registrations committing, so it is safe while
+/// other data planes serve. Lock-free registrations lost no COMMIT to it; for
+/// registrations taking `registration_lock`, a flush running back to back raised
+/// the lost COMMITs from about 22 to 27 of 40, which their retry absorbs, and a
+/// boot flushes once. (DuckDB 2.0.0, ducklake 417a9117.)
+fn flush_registered_file(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
     conn.execute_batch(
         "CALL ducklake_flush_inlined_data('qiita_lake', table_name => 'registered_file');",
     )?;
