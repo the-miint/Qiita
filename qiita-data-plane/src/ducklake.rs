@@ -25,7 +25,7 @@ use duckdb::Connection;
 /// before interpolation. This is input validation, not sanitization.
 ///
 /// These three are sufficient for that one job: without a quote or a semicolon a
-/// value cannot close the literal and start a statement. Probed on DuckDB 1.5.5 —
+/// value cannot close the literal and start a statement. Probed on DuckDB 2.0.0 —
 /// a value ending in a backslash is taken literally, so it does not escape the
 /// closing quote the way it would in a backslash-escaping dialect. What the
 /// values must otherwise look like is DuckDB's business: a `memory_limit` it
@@ -166,6 +166,48 @@ pub fn connect_ducklake(
          (DATA_PATH '{data_path}', DUCKLAKE_VERSION '{DUCKLAKE_CATALOG_VERSION}');"
     ))?;
     Ok(())
+}
+
+/// The libpq `application_name` an instance gives every connection it opens to the
+/// catalog, read back by `qiita_catalog_connection_budget` in `deploy/_common.sh`.
+/// Unquoted with no spaces: a quoted value closes the ATTACH string literal.
+fn catalog_application_name(port: u16, pool_size: usize) -> String {
+    format!("qiita-data-plane:{port}:pool={pool_size}")
+}
+
+/// `catalog_connstr` with this instance's `catalog_application_name` appended, for
+/// every catalog connection the process opens (`setup_catalog` and the pool).
+///
+/// The connection string must be libpq's `keyword=value` form, which preflight
+/// already requires of it (a URI cannot take the appended setting), and must not
+/// contain `application_name`, with or without spaces around the `=` (libpq accepts
+/// both, and the substring also catches `fallback_application_name`): the
+/// instance's own name is what the connection budget check reads, so a connection
+/// string that names the session otherwise fails boot rather than leaving libpq to
+/// pick one of the two.
+pub(crate) fn tag_catalog_connstr(
+    catalog_connstr: &str,
+    port: u16,
+    pool_size: usize,
+) -> Result<String, String> {
+    validate_sql_literal(catalog_connstr, "DUCKLAKE_CATALOG_CONNSTR")?;
+    if catalog_connstr.starts_with("postgres://") || catalog_connstr.starts_with("postgresql://") {
+        return Err(
+            "DUCKLAKE_CATALOG_CONNSTR must be a libpq keyword=value string, not a URI".to_string(),
+        );
+    }
+    if catalog_connstr.contains("application_name") {
+        return Err(format!(
+            "DUCKLAKE_CATALOG_CONNSTR sets application_name; remove it — the data plane \
+             names its catalog connections {}",
+            catalog_application_name(port, pool_size)
+        ));
+    }
+    Ok(format!(
+        "{} application_name={}",
+        catalog_connstr.trim_end(),
+        catalog_application_name(port, pool_size)
+    ))
 }
 
 /// The zstd level for data at rest: a copy of
@@ -895,6 +937,141 @@ pub fn ensure_assembly_tables(conn: &Connection) -> Result<(), Box<dyn std::erro
     Ok(())
 }
 
+/// The myloasm provenance tables, in the order `ensure_myloasm_tables` creates them.
+/// Test-only: the tests that walk all six read it, and nothing at runtime does.
+#[cfg(test)]
+pub(crate) const MYLOASM_TABLES: &[&str] = &[
+    "myloasm_contig",
+    "myloasm_layout",
+    "myloasm_mapping",
+    "myloasm_link",
+    "myloasm_split",
+    "myloasm_run",
+];
+
+/// Create the myloasm provenance tables: per assembly run, which reads myloasm
+/// built each contig from and placed on it, how its contigs connect, where it
+/// split chimeric reads, and how it was invoked. No sequence bytes; a read is a
+/// `sequence_idx` and a contig a `contig_num` (plus `feature_idx` for a primary
+/// contig). What each column means, and why `contig_num` identifies a contig
+/// within a run, is stated once in `qiita_common.myloasm_constants`, which also
+/// holds the column lists the writer uses; a qiita-common test pins those, and
+/// this table list, against the DDL below.
+///
+/// Every table is replaced per run at register time, keyed on
+/// `(prep_sample_idx, processing_idx)` read from `myloasm_run`
+/// (`flight_service::registration::REPLACE_KEY_TABLES`). None is Flight-readable.
+pub fn ensure_myloasm_tables(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS qiita_lake.myloasm_contig (
+            prep_sample_idx BIGINT NOT NULL,
+            processing_idx BIGINT NOT NULL,
+            contig_num BIGINT NOT NULL,
+            feature_idx BIGINT,
+            dereplication_status VARCHAR NOT NULL,
+            polished_length BIGINT,
+            unpolished_length BIGINT NOT NULL,
+            circularity VARCHAR,
+            depth_identity_99 DOUBLE,
+            depth_identity_99_75 DOUBLE,
+            depth_identity_100 DOUBLE,
+            median_depth_identity_100 DOUBLE,
+            kmer_multiplicity DOUBLE,
+            kmer_multiplicity_flag VARCHAR,
+            secondary_to_contig_num BIGINT,
+            secondary_aligned_percent DOUBLE,
+            secondary_ani_percent DOUBLE
+        );
+
+        CREATE TABLE IF NOT EXISTS qiita_lake.myloasm_layout (
+            prep_sample_idx BIGINT NOT NULL,
+            processing_idx BIGINT NOT NULL,
+            contig_num BIGINT NOT NULL,
+            layout_order BIGINT NOT NULL,
+            position BIGINT NOT NULL,
+            stop_position BIGINT NOT NULL,
+            sequence_idx BIGINT NOT NULL,
+            split_suffix VARCHAR,
+            piece_offset BIGINT NOT NULL,
+            piece_length BIGINT NOT NULL,
+            query_start BIGINT NOT NULL,
+            query_stop BIGINT NOT NULL,
+            strand VARCHAR NOT NULL,
+            read_depth_identity_99 DOUBLE,
+            read_depth_identity_99_75 DOUBLE,
+            read_depth_identity_100 DOUBLE,
+            next_overlap_length BIGINT,
+            next_shared_snpmers BIGINT,
+            next_differing_snpmers BIGINT
+        );
+
+        CREATE TABLE IF NOT EXISTS qiita_lake.myloasm_mapping (
+            prep_sample_idx BIGINT NOT NULL,
+            processing_idx BIGINT NOT NULL,
+            sequence_idx BIGINT NOT NULL,
+            split_suffix VARCHAR,
+            piece_offset BIGINT NOT NULL,
+            piece_length BIGINT NOT NULL,
+            query_start BIGINT NOT NULL,
+            query_stop BIGINT NOT NULL,
+            strand VARCHAR NOT NULL,
+            contig_num BIGINT NOT NULL,
+            position BIGINT NOT NULL,
+            stop_position BIGINT NOT NULL,
+            query_anchor_span BIGINT,
+            contig_anchor_span BIGINT,
+            shared_minimizers BIGINT,
+            shared_snpmers BIGINT,
+            differing_snpmers BIGINT
+        );
+
+        -- The overlap evidence and the two end reads are nullable: see the
+        -- `read_myloasm_*` entry in docs/duckdb-miint.md.
+        CREATE TABLE IF NOT EXISTS qiita_lake.myloasm_link (
+            prep_sample_idx BIGINT NOT NULL,
+            processing_idx BIGINT NOT NULL,
+            from_contig_num BIGINT NOT NULL,
+            from_orientation VARCHAR NOT NULL,
+            to_contig_num BIGINT NOT NULL,
+            to_orientation VARCHAR NOT NULL,
+            overlap_length BIGINT,
+            shared_snpmers BIGINT,
+            differing_snpmers BIGINT,
+            shared_minimizers BIGINT,
+            snpmer_identity_percent DOUBLE,
+            from_sequence_idx BIGINT,
+            from_split_suffix VARCHAR,
+            to_sequence_idx BIGINT,
+            to_split_suffix VARCHAR
+        );
+
+        CREATE TABLE IF NOT EXISTS qiita_lake.myloasm_split (
+            prep_sample_idx BIGINT NOT NULL,
+            processing_idx BIGINT NOT NULL,
+            sequence_idx BIGINT NOT NULL,
+            parent_split_suffix VARCHAR,
+            cleaning_round INTEGER NOT NULL,
+            breakpoint_order BIGINT NOT NULL,
+            query_start BIGINT NOT NULL,
+            query_stop BIGINT NOT NULL,
+            split_condition INTEGER NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS qiita_lake.myloasm_run (
+            prep_sample_idx BIGINT NOT NULL,
+            processing_idx BIGINT NOT NULL,
+            log_name VARCHAR NOT NULL,
+            started_at TIMESTAMP,
+            myloasm_version VARCHAR NOT NULL,
+            command VARCHAR NOT NULL,
+            kmer_size INTEGER NOT NULL,
+            compression INTEGER NOT NULL,
+            hifi BOOLEAN NOT NULL
+        );",
+    )?;
+    Ok(())
+}
+
 /// per-sample ASV feature counts from a deblur run: feature membership plus
 /// abundance, keyed by `processing_idx` (the run) and `feature_idx` (the ASV);
 /// plus the ASV sequences themselves (`amplicon_sequence` +
@@ -1032,6 +1209,7 @@ pub fn ensure_lake_tables(conn: &Connection) -> Result<(), Box<dyn std::error::E
     ensure_read_tables(conn)?;
     ensure_alignment_tables(conn)?;
     ensure_assembly_tables(conn)?;
+    ensure_myloasm_tables(conn)?;
     ensure_amplicon_tables(conn)?;
     // The lock row is seeded here so no request path has to create it.
     ensure_registration_lock(conn)?;
@@ -1973,6 +2151,34 @@ mod tests {
     #[test]
     #[serial]
     #[cfg(feature = "integration")]
+    fn ensure_myloasm_tables_is_idempotent() {
+        // Re-running on every DP restart must be a no-op, and every table must
+        // exist afterwards, keyed on the assembly run.
+        let conn = setup_conn();
+        ensure_myloasm_tables(&conn).expect("first ensure_myloasm_tables");
+        ensure_myloasm_tables(&conn).expect("second ensure_myloasm_tables (idempotent)");
+
+        for table in MYLOASM_TABLES {
+            let cols = table_schema(&conn, table);
+            let lead: Vec<(&str, &str, &str)> = cols
+                .iter()
+                .take(2)
+                .map(|(n, t, null)| (n.as_str(), t.as_str(), null.as_str()))
+                .collect();
+            assert_eq!(
+                lead,
+                [
+                    ("prep_sample_idx", "BIGINT", "NO"),
+                    ("processing_idx", "BIGINT", "NO")
+                ],
+                "{table} must lead with the run key"
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    #[cfg(feature = "integration")]
     fn ensure_assembly_tables_is_idempotent() {
         // Re-running on every DP restart must be a no-op (CREATE TABLE IF NOT
         // EXISTS), and every table must exist and be queryable afterwards.
@@ -2377,6 +2583,103 @@ mod tests {
         let conn = Connection::open_in_memory().expect("open in-memory DuckDB");
         let result = connect_ducklake(&conn, "dbname=test", "/tmp/it's bad");
         assert!(result.is_err());
+    }
+
+    // --- The catalog connections' application_name ----------------------
+
+    #[test]
+    fn tagged_connstr_appends_the_instance_application_name() {
+        let tagged = tag_catalog_connstr("dbname=lake host=db user=dp ", 50052, 6).unwrap();
+        assert_eq!(
+            tagged,
+            "dbname=lake host=db user=dp application_name=qiita-data-plane:50052:pool=6"
+        );
+    }
+
+    #[test]
+    fn tagged_connstr_refuses_a_connstr_that_sets_application_name() {
+        for connstr in [
+            "dbname=lake application_name=mine",
+            "dbname=lake application_name = mine",
+        ] {
+            let err = tag_catalog_connstr(connstr, 50051, 8).unwrap_err();
+            assert!(err.contains("sets application_name"), "{connstr}: {err}");
+        }
+    }
+
+    #[test]
+    fn tagged_connstr_refuses_a_uri() {
+        let err = tag_catalog_connstr("postgresql://dp@db/lake", 50051, 8).unwrap_err();
+        assert!(err.contains("not a URI"), "{err}");
+    }
+
+    #[test]
+    fn tagged_connstr_refuses_sql_metacharacters() {
+        let err = tag_catalog_connstr("dbname=lake'", 50051, 8).unwrap_err();
+        assert!(err.contains("disallowed"), "{err}");
+    }
+
+    /// Both kinds of catalog connection — the setup lock's `TYPE postgres` attach
+    /// and the DuckLake attach — reach the catalog server under the tagged name.
+    #[test]
+    #[serial]
+    #[cfg(feature = "integration")]
+    fn catalog_connections_carry_the_instance_application_name() {
+        // A port derived from the process id, so concurrent test processes against one
+        // catalog are unlikely to share a session name.
+        let port = 1 + (std::process::id() % 60000) as u16;
+        let base = crate::test_catalog::connstr();
+        let data_path = crate::test_catalog::data_path();
+
+        let observer = Connection::open_in_memory().unwrap();
+        observer
+            .execute_batch(&format!(
+                "LOAD postgres; ATTACH '{base}' AS observer (TYPE postgres);"
+            ))
+            .unwrap();
+        // Sessions under the name `pool_size` gives; each attach below uses its own
+        // pool size, so a session the other one leaves closing is not counted.
+        let sessions = |pool_size: usize| -> i64 {
+            let name = catalog_application_name(port, pool_size);
+            observer
+                .query_row(
+                    &format!(
+                        "SELECT n FROM postgres_query('observer', \
+                         'SELECT count(*) AS n FROM pg_stat_activity \
+                          WHERE application_name = ''{name}''')"
+                    ),
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+
+        assert_eq!(sessions(3), 0);
+        let lock = Connection::open_in_memory().unwrap();
+        lock.execute_batch(&format!(
+            "LOAD postgres; ATTACH '{}' AS tagged_lock (TYPE postgres); BEGIN;",
+            tag_catalog_connstr(&base, port, 3).unwrap()
+        ))
+        .unwrap();
+        let _: bool = lock
+            .query_row(
+                "SELECT t FROM postgres_query('tagged_lock', 'SELECT true AS t')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(sessions(3), 1, "the TYPE postgres attach");
+        lock.execute_batch("COMMIT;").unwrap();
+
+        assert_eq!(sessions(4), 0);
+        let lake = Connection::open_in_memory().unwrap();
+        connect_ducklake(
+            &lake,
+            &tag_catalog_connstr(&base, port, 4).unwrap(),
+            &data_path,
+        )
+        .unwrap();
+        assert!(sessions(4) >= 1, "the DuckLake attach");
     }
 
     // --- What DuckDB hands the Flight encoder ---------------------------

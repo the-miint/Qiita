@@ -620,6 +620,216 @@ qiita_assert_peer_private() {
     done
 }
 
+# --- Per-instance limits -------------------------------------------------------
+# Each local instance's unit gets one drop-in, written by activate.sh on every
+# deploy. It sets QIITA_DATA_PLANE_LOCAL_INSTANCES, the number of local instances,
+# which the data plane divides the spill filesystem (spill_cap) and its CPU budget
+# (derived_threads) by, both in qiita-data-plane/src/config.rs, and, when
+# QIITA_DATA_PLANE_INSTANCE_MEMORY_MAX is set, MemoryMax=. MemoryMax= sets the unit's cgroup memory.max, which the data
+# plane reads at boot as its memory ceiling (resources::detect_memory_ceiling) and
+# divides across its pool. Both take effect at the restart that follows the write.
+#
+#   QIITA_DATA_PLANE_INSTANCE_MEMORY_MAX  in $DP_ENV: MemoryMax= of every local
+#                               instance's unit. Default none (no per-instance limit).
+QIITA_DATA_PLANE_DROPIN_NAME=instance-limits.conf
+# Where systemd reads unit files and drop-ins from.
+QIITA_SYSTEMD_UNIT_DIR=/etc/systemd/system
+
+# The drop-in directory of one instance unit. $1 = a port, $2 = the systemd unit
+# directory (default $QIITA_SYSTEMD_UNIT_DIR).
+qiita_data_plane_dropin_dir() {
+    printf '%s/qiita-data-plane@%s.service.d' "${2:-$QIITA_SYSTEMD_UNIT_DIR}" "$1"
+}
+
+# A systemd size as bytes: a positive integer with an optional K, M, G or T suffix,
+# each a power of 1024 (systemd.resource-control(5), MemoryMax=). Anything else,
+# including a value past 2^62 bytes, fails with nothing printed.
+qiita_size_bytes() {
+    local value="$1" n mult=1
+    [[ $value =~ ^([1-9][0-9]{0,17})([KMGT]?)$ ]] || return 1
+    n=${BASH_REMATCH[1]}
+    case ${BASH_REMATCH[2]} in
+        K) mult=1024 ;;
+        M) mult=$((1024 ** 2)) ;;
+        G) mult=$((1024 ** 3)) ;;
+        T) mult=$((1024 ** 4)) ;;
+    esac
+    [ "$n" -le $(((1 << 62) / mult)) ] || return 1
+    printf '%s' $((n * mult))
+}
+
+# QIITA_DATA_PLANE_INSTANCE_MEMORY_MAX in $DP_ENV, else empty. Read from the file
+# only, like the topology keys. Set but blank, or not a size qiita_size_bytes
+# accepts, is an error: the value is written verbatim into a unit file.
+qiita_data_plane_instance_memory_max() {
+    local value=""
+    qiita_dp_env_parses || return 1
+    [ -r "$DP_ENV" ] && env_file_sets_var "$DP_ENV" QIITA_DATA_PLANE_INSTANCE_MEMORY_MAX || return 0
+    value=$(read_env_file_var "$DP_ENV" QIITA_DATA_PLANE_INSTANCE_MEMORY_MAX)
+    [ -n "$value" ] || {
+        echo "ERROR: QIITA_DATA_PLANE_INSTANCE_MEMORY_MAX is set but empty in $DP_ENV" >&2
+        return 1
+    }
+    qiita_size_bytes "$value" >/dev/null || {
+        echo "ERROR: QIITA_DATA_PLANE_INSTANCE_MEMORY_MAX '$value' in $DP_ENV is not a positive" \
+             "integer with an optional K, M, G or T suffix (at most 2^62 bytes)" >&2
+        return 1
+    }
+    printf '%s' "$value"
+}
+
+# Fails when $DP_ENV assigns QIITA_DATA_PLANE_LOCAL_INSTANCES. The drop-in sets it
+# with Environment=, and a variable in EnvironmentFile= overrides one in
+# Environment= (systemd 257), so a value in the file would replace the count the
+# deploy computed.
+qiita_dp_env_omits_local_instances() {
+    qiita_dp_env_parses || return 1
+    [ -r "$DP_ENV" ] && env_file_sets_var "$DP_ENV" QIITA_DATA_PLANE_LOCAL_INSTANCES || return 0
+    echo "ERROR: $DP_ENV sets QIITA_DATA_PLANE_LOCAL_INSTANCES, which the deploy computes from" \
+         "QIITA_DATA_PLANE_PORTS and the file would override; remove it" >&2
+    return 1
+}
+
+# Fails when the local instances' MemoryMax= values add up to more than the host's
+# memory. $1 = the ports (qiita_data_plane_ports), $2 = the validated
+# QIITA_DATA_PLANE_INSTANCE_MEMORY_MAX (empty: nothing to check), $3 = the meminfo
+# file (default /proc/meminfo). An unreadable meminfo or one without MemTotal fails.
+qiita_assert_instance_memory_fits() {
+    local ports="$1" value="$2" meminfo="${3:-/proc/meminfo}" count bytes total_kib total
+    [ -n "$value" ] || return 0
+    bytes=$(qiita_size_bytes "$value") || {
+        echo "ERROR: '$value' is not a systemd size" >&2
+        return 1
+    }
+    count=$(wc -w <<<"$ports")
+    count=${count//[[:space:]]/}
+    total_kib=$(awk '$1 == "MemTotal:" { print $2; exit }' "$meminfo" 2>/dev/null) || total_kib=""
+    [[ $total_kib =~ ^[0-9]+$ ]] || {
+        echo "ERROR: no MemTotal in $meminfo — cannot check QIITA_DATA_PLANE_INSTANCE_MEMORY_MAX against the host" >&2
+        return 1
+    }
+    total=$((total_kib * 1024))
+    # count × bytes > total exactly when bytes > floor(total / count), for integers;
+    # the product itself could overflow.
+    if [ "$bytes" -gt $((total / count)) ]; then
+        echo "ERROR: $count local data-plane instance(s) × QIITA_DATA_PLANE_INSTANCE_MEMORY_MAX=$value" \
+             "exceeds this host's MemTotal of $total_kib kB ($meminfo)" >&2
+        return 1
+    fi
+}
+
+# The data plane's connection pool size when DUCKLAKE_POOL_SIZE is unset:
+# DEFAULT_POOL_SIZE in qiita-data-plane/src/config.rs.
+QIITA_DATA_PLANE_DEFAULT_POOL_SIZE=8
+
+# DUCKLAKE_POOL_SIZE in $DP_ENV, else QIITA_DATA_PLANE_DEFAULT_POOL_SIZE. Blank,
+# surrounding whitespace included, reads as unset, as in the data plane; anything
+# but a positive integer fails.
+qiita_data_plane_pool_size() {
+    local value=""
+    qiita_dp_env_parses || return 1
+    if [ -r "$DP_ENV" ]; then
+        value=$(read_env_file_var "$DP_ENV" DUCKLAKE_POOL_SIZE)
+    fi
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    if [ -z "$value" ]; then
+        printf '%s' "$QIITA_DATA_PLANE_DEFAULT_POOL_SIZE"
+        return 0
+    fi
+    if ! [[ $value =~ ^[0-9]{1,18}$ ]] || [ $((10#$value)) -lt 1 ]; then
+        echo "ERROR: DUCKLAKE_POOL_SIZE '$value' in $DP_ENV is not a positive integer" >&2
+        return 1
+    fi
+    printf '%s' $((10#$value))
+}
+
+# A DUCKDB_MEMORY_LIMIT as bytes, for the two spellings the deploy compares: a
+# positive integer without a leading zero, then MiB or GiB, as written. DuckDB
+# accepts more than this; anything else, including a value past 2^62 bytes, fails
+# with nothing printed.
+qiita_duckdb_size_bytes() {
+    local value="$1" n mult
+    [[ $value =~ ^([1-9][0-9]{0,17})(MiB|GiB)$ ]] || return 1
+    n=${BASH_REMATCH[1]}
+    case ${BASH_REMATCH[2]} in
+        MiB) mult=$((1024 ** 2)) ;;
+        GiB) mult=$((1024 ** 3)) ;;
+    esac
+    [ "$n" -le $(((1 << 62) / mult)) ] || return 1
+    printf '%s' $((n * mult))
+}
+
+# Fails when DUCKDB_MEMORY_LIMIT in $DP_ENV, times the pool size
+# (qiita_data_plane_pool_size), exceeds the instance's MemoryMax=. DuckDB applies
+# the limit to each pooled connection, and memory.max bounds the whole process, so
+# such a pool may account for more memory than its cgroup allows it to hold.
+# $1 = the validated QIITA_DATA_PLANE_INSTANCE_MEMORY_MAX (empty: nothing to check).
+# A blank or unset DUCKDB_MEMORY_LIMIT has nothing to check: the data plane then
+# derives each connection's limit from memory.max (derived_share_mib in
+# qiita-data-plane/src/config.rs).
+qiita_assert_pool_memory_fits() {
+    local value="$1" limit max_bytes limit_bytes pool
+    [ -n "$value" ] || return 0
+    qiita_dp_env_parses || return 1
+    [ -r "$DP_ENV" ] || return 0
+    limit=$(read_env_file_var "$DP_ENV" DUCKDB_MEMORY_LIMIT)
+    [[ $limit =~ [^[:space:]] ]] || return 0
+    max_bytes=$(qiita_size_bytes "$value") || {
+        echo "ERROR: '$value' is not a systemd size" >&2
+        return 1
+    }
+    limit_bytes=$(qiita_duckdb_size_bytes "$limit") || {
+        echo "ERROR: DUCKDB_MEMORY_LIMIT '$limit' in $DP_ENV: write DUCKDB_MEMORY_LIMIT in MiB" \
+             "or GiB, or unset it" >&2
+        return 1
+    }
+    pool=$(qiita_data_plane_pool_size) || return 1
+    # pool × limit > max exactly when limit > floor(max / pool), for integers; the
+    # product itself could overflow.
+    if [ "$limit_bytes" -gt $((max_bytes / pool)) ]; then
+        echo "ERROR: a pool of $pool connection(s) × DUCKDB_MEMORY_LIMIT=$limit exceeds" \
+             "QIITA_DATA_PLANE_INSTANCE_MEMORY_MAX=$value ($DP_ENV). Unset DUCKDB_MEMORY_LIMIT:" \
+             "the data plane then derives each connection's limit from the instance's MemoryMax" >&2
+        return 1
+    fi
+}
+
+# The drop-in qiita_write_data_plane_dropins writes for each instance. $1 = the
+# number of local instances, $2 = the MemoryMax= value, or empty for none.
+qiita_data_plane_dropin_content() {
+    printf '[Service]\n'
+    printf 'Environment=QIITA_DATA_PLANE_LOCAL_INSTANCES=%s\n' "$1"
+    [ -z "$2" ] || printf 'MemoryMax=%s\n' "$2"
+}
+
+# Write the drop-in of every port in $1 and remove it from every other
+# qiita-data-plane@ instance, so an instance whose port left the list (including
+# one QIITA_DP_DISABLE_REMOVED=1 disables) keeps no stale count or limit. $2 = the
+# MemoryMax= value or empty, $3 = the systemd unit directory (default
+# $QIITA_SYSTEMD_UNIT_DIR). When it applies: "Per-instance limits" above.
+qiita_write_data_plane_dropins() {
+    local ports="$1" value="$2" unitdir="${3:-$QIITA_SYSTEMD_UNIT_DIR}" count port dir conf configured=" "
+    count=$(wc -w <<<"$ports")
+    count=${count//[[:space:]]/}
+    for port in $ports; do
+        configured+="$port "
+        dir=$(qiita_data_plane_dropin_dir "$port" "$unitdir")
+        install -d -m 0755 "$dir"
+        qiita_data_plane_dropin_content "$count" "$value" > "$dir/$QIITA_DATA_PLANE_DROPIN_NAME"
+        chmod 0644 "$dir/$QIITA_DATA_PLANE_DROPIN_NAME"
+    done
+    for conf in "$unitdir"/qiita-data-plane@*.service.d/"$QIITA_DATA_PLANE_DROPIN_NAME"; do
+        [ -e "$conf" ] || continue
+        dir=${conf%/*}
+        port=${dir##*/qiita-data-plane@}
+        port=${port%.service.d}
+        case "$configured" in *" $port "*) continue ;; esac
+        rm -f "$conf"
+        rmdir "$dir" 2>/dev/null || true
+    done
+}
+
 # The deployed nginx config.
 QIITA_NGINX_CONF=/etc/nginx/conf.d/qiita.conf
 
@@ -1016,10 +1226,8 @@ qiita_require_lake_data_path() {
 # `upload.parquet.partial` open (all measured against a running data plane, macOS).
 # A read export writes through a `.partial` too, so it counts as well. Open files
 # are found through each unit's /proc/<pid>/fd (the match measured in a Linux
-# container). The catalog query connects with the data plane's own role, which is
-# what lets it see those sessions' state; it counts the sessions of every instance
-# on the catalog, a peer host's included, and a lake-gc or lake-shell session under
-# that role counts too.
+# container). The catalog query, QIITA_CATALOG_IDLE_SQL, connects with the data
+# plane's own role.
 wait_for_data_plane_idle() {
     local env_file=$1
     shift
@@ -1052,9 +1260,7 @@ wait_for_data_plane_idle() {
         [ -z "$password" ] || qiita_pgpass_add "$user" "$password"
         local deadline=$((SECONDS + wait_s)) next_report=$SECONDS
         while :; do
-            lake=$(PGPASSFILE="$PGPASS_FILE" psql "$conn" -Atc "SELECT count(*) FROM pg_stat_activity
-                WHERE datname = current_database() AND pid <> pg_backend_pid()
-                  AND state IN ('active', 'idle in transaction')") || {
+            lake=$(PGPASSFILE="$PGPASS_FILE" psql "$conn" -Atc "$QIITA_CATALOG_IDLE_SQL") || {
                 echo "ERROR: cannot query the data plane's catalog to tell whether $unit_names is idle; set QIITA_DP_IDLE_WAIT_S=0 to restart without waiting" >&2
                 exit 1
             }
@@ -1079,4 +1285,137 @@ wait_for_data_plane_idle() {
             sleep "${QIITA_DP_IDLE_POLL_S:-5}"
         done
     )
+}
+
+# --- Catalog connection budget ------------------------------------------------
+# Every data-plane instance, on every host, holds up to its pool size of backends
+# on the catalog's Postgres (DEFAULT_POOL_SIZE in qiita-data-plane/src/config.rs),
+# and builds them as requests arrive, so the backends connected now undercount
+# what the pools may open. Each instance therefore names its catalog sessions
+# `qiita-data-plane:<listen port>:pool=<pool size>` (catalog_application_name in
+# qiita-data-plane/src/ducklake.rs), and this check reads the pool sizes back from
+# the catalog server's pg_stat_activity: an instance is one (client address,
+# application_name) pair, however many of its backends are open. It fails when
+#   Σ pool sizes + the other client backends connected now
+#     > max_connections − superuser_reserved_connections − reserved_connections,
+# the slots a role without those privileges can take. Other backends — lake-gc,
+# lake-shell, a data plane still on a build without the name — count as they are
+# now, not at their peak.
+#
+# The query connects with the data plane's own role, the user= in
+# DUCKLAKE_CATALOG_CONNSTR. Postgres shows a role the client_addr and
+# backend_type of another role's sessions only with pg_read_all_stats (without
+# it both are NULL), so the check fails rather than undercount when the role
+# lacks it. A Unix-socket session has no client_addr; its client_port is -1, and
+# it is labelled `local`.
+
+QIITA_CATALOG_SETTINGS_SQL="SELECT current_setting('max_connections'),
+    current_setting('superuser_reserved_connections'),
+    coalesce(current_setting('reserved_connections', true), '0'),
+    pg_has_role('pg_read_all_stats', 'USAGE'), current_user"
+QIITA_CATALOG_BACKENDS_SQL="SELECT
+    coalesce(host(client_addr), CASE WHEN client_port = -1 THEN 'local' END, ''),
+    count(*), coalesce(usename, ''), coalesce(application_name, '')
+  FROM pg_stat_activity
+  WHERE backend_type = 'client backend' AND pid <> pg_backend_pid()
+  GROUP BY 1, 3, 4 ORDER BY 1, 4"
+
+# wait_for_data_plane_idle's in-flight count. It counts only the connecting role's
+# sessions (`usename = current_user`): those of every data-plane instance on the
+# catalog, a peer host's included, and a lake-gc or lake-shell session under that
+# role. Without pg_read_all_stats another role's rows are listed but their state
+# reads NULL, so they never match; with the grant (which the connection budget
+# check above needs) their state is visible, and without the filter an admin's or
+# a monitor's open transaction on the catalog would hold the restart.
+QIITA_CATALOG_IDLE_SQL="SELECT count(*) FROM pg_stat_activity
+  WHERE datname = current_database() AND pid <> pg_backend_pid()
+    AND usename = current_user
+    AND state IN ('active', 'idle in transaction')"
+
+# Run one query against the catalog named by env file `$1`, printing psql's
+# unaligned `|`-separated rows. A subshell, so qiita_pgpass_init's EXIT trap
+# removes the pgpass when the query ends; the password reaches libpq through that
+# file, not psql's argv (see qiita_split_conn_password). $2 = the SQL.
+qiita_catalog_psql() (
+    local conn user password
+    IFS=$'\t' read -r conn user password \
+        < <(qiita_split_conn_password "$(read_env_var "$1" DUCKLAKE_CATALOG_CONNSTR)")
+    qiita_pgpass_init "qiita-catalog"
+    [ -z "$password" ] || qiita_pgpass_add "$user" "$password"
+    PGPASSFILE="$PGPASS_FILE" psql "$conn" -XAtq -F '|' -v ON_ERROR_STOP=1 -c "$2"
+)
+
+# The budget arithmetic over the two queries' output, as pass/fail rows named
+# `catalog-connections`, followed by one line per instance and per other client.
+# Pure (rows in, rows out) so the unit tests can feed it psql output.
+# $1 = the QIITA_CATALOG_SETTINGS_SQL row; stdin = the QIITA_CATALOG_BACKENDS_SQL rows.
+qiita_catalog_connection_budget() {
+    local max su reserved has_stats role
+    IFS='|' read -r max su reserved has_stats role <<<"$1"
+    local n
+    for n in "$max" "$su" "$reserved"; do
+        case $n in
+            '' | *[!0-9]*)
+                fail "catalog-connections" "unexpected settings row from the catalog server: '$1'"
+                return 0
+                ;;
+        esac
+    done
+    if [ "$has_stats" != t ]; then
+        fail "catalog-connections" "role '$role' cannot see other roles' sessions on the catalog server; an admin there runs: GRANT pg_read_all_stats TO $role; (see docs/runbooks/data-plane-scaling.md)"
+        return 0
+    fi
+    local host count usename appname port pool label
+    local instances="" seen=$'\n' others="" n_instances=0 pools=0 n_others=0 bad=""
+    while IFS='|' read -r host count usename appname; do
+        [ -n "$host$count" ] || continue
+        if [[ "$appname" == qiita-data-plane:* ]]; then
+            if [[ ! "$appname" =~ ^qiita-data-plane:([0-9]+):pool=([0-9]+)$ ]]; then
+                bad+="application_name '$appname' from ${host:-an unknown address} is not qiita-data-plane:<port>:pool=<n>; "
+                continue
+            fi
+            port=${BASH_REMATCH[1]} pool=$((10#${BASH_REMATCH[2]}))
+            if [ -z "$host" ]; then
+                bad+="no client address for '$appname' — grant pg_read_all_stats to role '$role'; "
+                continue
+            fi
+            case $seen in *$'\n'"$host $appname"$'\n'*) continue ;; esac
+            seen+="$host $appname"$'\n'
+            [[ "$host" == *:* ]] && label="[$host]:$port" || label="$host:$port"
+            instances+="    $label pool=$pool"$'\n'
+            n_instances=$((n_instances + 1))
+            pools=$((pools + pool))
+        else
+            others+="    other: ${host:-?} user=${usename:-?} application_name=${appname:-(none)} x$count"$'\n'
+            n_others=$((n_others + count))
+        fi
+    done
+    local available=$((max - su - reserved))
+    local demand=$((pools + n_others))
+    local numbers="$n_instances data-plane instance(s), pools $pools + $n_others other client backend(s) = $demand of $available (max_connections $max - superuser_reserved_connections $su - reserved_connections $reserved)"
+    if [ -n "$bad" ]; then
+        fail "catalog-connections" "${bad%; }"
+    elif [ "$n_instances" -eq 0 ]; then
+        fail "catalog-connections" "no catalog session is named qiita-data-plane:<port>:pool=<n> — no instance on this build is connected; $numbers"
+    elif [ "$demand" -gt "$available" ]; then
+        fail "catalog-connections" "$numbers — lower DUCKLAKE_POOL_SIZE or the instance count, or raise max_connections on the catalog server"
+    else
+        pass "catalog-connections" "$numbers"
+    fi
+    printf '%s%s' "$instances" "$others"
+}
+
+# The verify-deploy row: both queries against the catalog in env file `$1`, then
+# the budget. A query failure fails the row with psql's message.
+qiita_check_catalog_connection_budget() {
+    local env_file=$1 settings backends
+    if ! settings=$(qiita_catalog_psql "$env_file" "$QIITA_CATALOG_SETTINGS_SQL" 2>&1); then
+        fail "catalog-connections" "cannot query the catalog server: $settings"
+        return 0
+    fi
+    if ! backends=$(qiita_catalog_psql "$env_file" "$QIITA_CATALOG_BACKENDS_SQL" 2>&1); then
+        fail "catalog-connections" "cannot query the catalog server: $backends"
+        return 0
+    fi
+    qiita_catalog_connection_budget "$settings" <<<"$backends"
 }

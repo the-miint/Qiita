@@ -1,6 +1,6 @@
 use base64::Engine;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::pool::PoolSettings;
 use crate::resources::{self, MemoryCeiling};
@@ -16,8 +16,10 @@ pub struct Settings {
     /// this (publicly reachable) data plane only verifies, so it can never forge
     /// a ticket.
     pub flight_public_key: ed25519_dalek::VerifyingKey,
-    /// DuckLake catalog connection string (libpq format).
-    /// E.g., "dbname=qiita_ducklake host=localhost port=5432 user=qiita password=qiita"
+    /// DuckLake catalog connection string (libpq keyword=value format), as
+    /// `DUCKLAKE_CATALOG_CONNSTR` gives it plus this instance's `application_name`
+    /// (`ducklake::tag_catalog_connstr`). E.g.,
+    /// "dbname=qiita_ducklake host=localhost user=qiita application_name=qiita-data-plane:50051:pool=8"
     pub ducklake_catalog_connstr: String,
     /// Directory where DuckLake stores Parquet data files (system-of-record
     /// state). Derived as `PATH_PERSISTENT/ducklake`; `PATH_PERSISTENT` is a
@@ -42,8 +44,12 @@ pub struct Settings {
     /// answered. Carried so boot can log both — a number alone does not say
     /// whether it came from a cgroup or from the fallback.
     pub memory_ceiling: MemoryCeiling,
-    /// CPU allowance each connection's `threads` was divided from.
-    pub thread_budget: usize,
+    /// Where `pool.threads` came from, carried for the boot log like
+    /// `spill_cap_source`.
+    pub threads_source: ThreadsSource,
+    /// Where `pool.max_temp_directory_size` came from, carried for the boot log
+    /// like `memory_ceiling`.
+    pub spill_cap_source: SpillCapSource,
     /// DoPuts the data plane will serve at once. Not part of the pool: an upload
     /// borrows no connection, so the pool does not bound it.
     pub max_concurrent_doput: usize,
@@ -53,10 +59,11 @@ pub struct Settings {
 /// Chosen, not measured: what is measured is the budget it is chosen against —
 /// each attached connection holds one lake-Postgres backend for as long as it
 /// lives (8 attached connections held 8 idle backends), against a
-/// `max_connections` of 100 with 3 superuser-reserved that the control plane
-/// draws on as well. Eight leaves that budget room for other data-plane
-/// processes and for the control plane; raise it with `DUCKLAKE_POOL_SIZE` where
-/// the budget allows, counting every process on every host against the same 97.
+/// `max_connections` of 100 with 3 superuser-reserved. Eight leaves that budget
+/// room for other data-plane processes; raise it with `DUCKLAKE_POOL_SIZE` where
+/// the budget allows. `make verify-deploy` adds up every instance's pool on every
+/// host against the catalog server's limit (`qiita_catalog_connection_budget` in
+/// `deploy/_common.sh`).
 pub(crate) const DEFAULT_POOL_SIZE: usize = 8;
 
 /// The pool divides half the detected ceiling, not all of it. Half is a choice;
@@ -95,9 +102,43 @@ pub(crate) fn derived_share_mib(ceiling_bytes: u64, size: usize) -> u64 {
     ceiling_bytes / CEILING_DIVISOR / size as u64 / (1024 * 1024)
 }
 
-/// Per-connection ceiling on spill. DuckDB's own default is 90% of the
-/// filesystem holding `temp_directory` — which every connection would claim in
-/// full — so an explicit value is required rather than optional.
+/// The `threads` each of `size` connections in each of `instances` data planes
+/// on this host gets from a CPU allowance of `budget`, when `DUCKDB_THREADS` is
+/// not set. `budget` is what this process sees (`detect_thread_budget`), and no
+/// unit caps an instance's CPU, so every local instance sees the same cores;
+/// dividing by `instances` as well keeps N of them from each sizing for all of
+/// them. At least 1, so a request always gets a thread.
+pub(crate) fn derived_threads(budget: usize, instances: u64, size: usize) -> u32 {
+    let per_connection = budget as u64 / instances / size as u64;
+    std::cmp::max(1, u32::try_from(per_connection).unwrap_or(u32::MAX))
+}
+
+/// Where the per-connection `threads` came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ThreadsSource {
+    /// `DUCKDB_THREADS`.
+    Configured,
+    /// `derived_threads` of `budget` (`detect_thread_budget`) and `instances`
+    /// (`QIITA_DATA_PLANE_LOCAL_INSTANCES`).
+    Derived { budget: usize, instances: u64 },
+}
+
+impl ThreadsSource {
+    /// For the boot log: `size` is the pool size the threads were divided by.
+    pub fn describe(&self, size: usize) -> String {
+        match self {
+            Self::Configured => "DUCKDB_THREADS".to_string(),
+            Self::Derived { budget, instances } => {
+                format!("derived: CPU budget {budget} / {instances} instances / {size} connections")
+            }
+        }
+    }
+}
+
+/// Per-connection ceiling on spill when `DUCKDB_TEMP_DIRECTORY` is not set (else
+/// see `spill_cap`). DuckDB's own default is 90% of the filesystem holding
+/// `temp_directory` — which every connection would claim in full — so an
+/// explicit value is required rather than optional.
 ///
 /// It is a backstop, and measurement is why: none of the four shapes this process
 /// runs spills anything at all when it completes, at either payload tested, and
@@ -107,6 +148,147 @@ pub(crate) fn derived_share_mib(ceiling_bytes: u64, size: usize) -> u64 {
 /// deploy host's 378 G of free root, and the measured behaviour when a connection
 /// reaches it is a clean error naming the setting, with nothing left behind.
 const DEFAULT_MAX_TEMP_DIRECTORY_SIZE: &str = "4GiB";
+
+/// Smallest per-connection spill cap `spill_cap` will derive: the first power of
+/// two above the spill recorded on `DEFAULT_MAX_TEMP_DIRECTORY_SIZE`. It is not a
+/// size any request was measured to need.
+pub(crate) const MIN_DERIVED_SPILL_MIB: u64 = 64;
+
+/// Where the per-connection spill cap came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SpillCapSource {
+    /// `DUCKDB_MAX_TEMP_DIRECTORY_SIZE`.
+    Configured,
+    /// `DEFAULT_MAX_TEMP_DIRECTORY_SIZE`.
+    Default,
+    /// Divided from the free space of the filesystem holding
+    /// `DUCKDB_TEMP_DIRECTORY`, measured at `statvfs_path`.
+    Derived {
+        statvfs_path: PathBuf,
+        available_bytes: u64,
+        instances: u64,
+    },
+}
+
+impl SpillCapSource {
+    /// For the boot log: `size` is the pool size the cap was divided by.
+    pub fn describe(&self, size: usize) -> String {
+        match self {
+            Self::Configured => "DUCKDB_MAX_TEMP_DIRECTORY_SIZE".to_string(),
+            Self::Default => "default".to_string(),
+            Self::Derived {
+                statvfs_path,
+                available_bytes,
+                instances,
+            } => format!(
+                "derived: {:.1} GiB free at {} / {} instances / {} connections",
+                *available_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+                statvfs_path.display(),
+                instances,
+                size,
+            ),
+        }
+    }
+}
+
+/// The spill cap, in MiB, each of `size` connections in each of `instances` data
+/// planes gets from `available_bytes` free on the spill filesystem.
+pub(crate) fn derived_spill_cap_mib(available_bytes: u64, instances: u64, size: usize) -> u64 {
+    available_bytes / instances / size as u64 / (1024 * 1024)
+}
+
+/// The per-connection `max_temp_directory_size` and where it came from.
+///
+/// `configured` (`DUCKDB_MAX_TEMP_DIRECTORY_SIZE`) wins. Otherwise, when
+/// `DUCKDB_TEMP_DIRECTORY` is set (`explicit_temp_directory`), the cap is the free
+/// space of the filesystem holding it, as `available` reports at boot, divided
+/// across every connection of every local data plane — `instances`
+/// (`QIITA_DATA_PLANE_LOCAL_INSTANCES`, which the deploy writes into each
+/// instance's unit) times `size` — so all of them reaching the cap at once fit on
+/// that filesystem as it was at boot. Without an explicit directory the spill root
+/// is under `PATH_SCRATCH`, which also holds DoPut staging and ticket workspaces,
+/// so its free space is not the spill's to divide, and the cap stays
+/// `DEFAULT_MAX_TEMP_DIRECTORY_SIZE`. The derivation hands the whole free space of
+/// the explicit directory's filesystem to spill, so that directory belongs on a
+/// filesystem used only for spill; on a shared one, set the cap explicitly.
+///
+/// A derived cap below `MIN_DERIVED_SPILL_MIB` fails boot rather than being
+/// rounded up, for the reason `MIN_MEMORY_LIMIT_MIB` gives for memory: granting
+/// the floor anyway would hand out more than the filesystem has.
+fn spill_cap(
+    configured: Option<String>,
+    explicit_temp_directory: bool,
+    instances: u64,
+    size: usize,
+    available: impl FnOnce() -> Result<(PathBuf, u64), String>,
+) -> Result<(String, SpillCapSource), String> {
+    if let Some(raw) = configured {
+        return Ok((raw, SpillCapSource::Configured));
+    }
+    if !explicit_temp_directory {
+        return Ok((
+            DEFAULT_MAX_TEMP_DIRECTORY_SIZE.to_string(),
+            SpillCapSource::Default,
+        ));
+    }
+    let (statvfs_path, available_bytes) = available()?;
+    let cap_mib = derived_spill_cap_mib(available_bytes, instances, size);
+    if cap_mib < MIN_DERIVED_SPILL_MIB {
+        return Err(format!(
+            concat!(
+                "{} instance(s) x a pool of {} would get a {} MiB spill cap each from ",
+                "the {:.1} GiB free at {} — below the {} MiB floor. Set ",
+                "DUCKDB_MAX_TEMP_DIRECTORY_SIZE explicitly, or run fewer instances on ",
+                "this host or a smaller DUCKLAKE_POOL_SIZE.",
+            ),
+            instances,
+            size,
+            cap_mib,
+            available_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+            statvfs_path.display(),
+            MIN_DERIVED_SPILL_MIB,
+        ));
+    }
+    Ok((
+        format!("{cap_mib}MiB"),
+        SpillCapSource::Derived {
+            statvfs_path,
+            available_bytes,
+            instances,
+        },
+    ))
+}
+
+/// Bytes available to an unprivileged writer on the filesystem holding `path`,
+/// and the path `statvfs` was asked about: `path` itself, or its nearest existing
+/// ancestor when it does not exist yet (the pool creates the spill root later).
+fn available_bytes(path: &Path) -> Result<(PathBuf, u64), String> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let existing = path
+        .ancestors()
+        .find(|p| p.exists())
+        .ok_or_else(|| format!("no existing ancestor of {}", path.display()))?;
+    let c_path = std::ffi::CString::new(existing.as_os_str().as_bytes())
+        .map_err(|e| format!("{} contains a NUL byte: {e}", existing.display()))?;
+    let mut st = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: `c_path` is NUL-terminated and outlives the call; `st` is written in
+    // full by a successful statvfs and read only then.
+    let rc = unsafe { libc::statvfs(c_path.as_ptr(), st.as_mut_ptr()) };
+    if rc != 0 {
+        return Err(format!(
+            "statvfs({}) failed: {}",
+            existing.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    let st = unsafe { st.assume_init() };
+    // The field widths differ by platform (u32 f_bavail on macOS), so the casts
+    // are not redundant everywhere.
+    #[allow(clippy::unnecessary_cast)]
+    let bytes = (st.f_bavail as u64).saturating_mul(st.f_frsize as u64);
+    Ok((existing.to_path_buf(), bytes))
+}
 
 /// Uploads one data plane serves at once. Chosen, not measured: what is measured
 /// is the cost curve it bounds — against a real data plane, peak RSS was 165 MiB
@@ -208,6 +390,15 @@ impl Settings {
         let thread_budget = resources::detect_thread_budget();
 
         let size = parse_positive::<usize>("DUCKLAKE_POOL_SIZE")?.unwrap_or(DEFAULT_POOL_SIZE);
+        let ducklake_catalog_connstr = crate::ducklake::tag_catalog_connstr(
+            &ducklake_catalog_connstr,
+            listen_addr.port(),
+            size,
+        )?;
+
+        // Parsed whether or not threads or the spill cap is derived, so a
+        // malformed value fails boot wherever it appears.
+        let instances = parse_positive::<u64>("QIITA_DATA_PLANE_LOCAL_INSTANCES")?.unwrap_or(1);
 
         // The CPU allowance divided by the in-flight bound, so a saturated
         // pool asks for the budget once rather than once per request. Measured
@@ -216,8 +407,16 @@ impl Settings {
         // about 509 MiB per thread — an upper bound, since the probe's own
         // expression inflated both axes — so this is the setting that prices
         // concurrency.
-        let threads = parse_positive::<u32>("DUCKDB_THREADS")?
-            .unwrap_or_else(|| std::cmp::max(1, (thread_budget / size) as u32));
+        let (threads, threads_source) = match parse_positive::<u32>("DUCKDB_THREADS")? {
+            Some(threads) => (threads, ThreadsSource::Configured),
+            None => (
+                derived_threads(thread_budget, instances, size),
+                ThreadsSource::Derived {
+                    budget: thread_budget,
+                    instances,
+                },
+            ),
+        };
 
         let memory_limit = match env_value("DUCKDB_MEMORY_LIMIT") {
             Some(raw) => raw,
@@ -242,9 +441,10 @@ impl Settings {
             }
         };
 
-        let temp_directory = match env_value("DUCKDB_TEMP_DIRECTORY") {
+        let explicit_temp_directory = env_value("DUCKDB_TEMP_DIRECTORY");
+        let temp_directory = match &explicit_temp_directory {
             Some(raw) => {
-                let path = PathBuf::from(&raw);
+                let path = PathBuf::from(raw);
                 if !path.is_absolute() {
                     return Err(format!(
                         "DUCKDB_TEMP_DIRECTORY must be an absolute path, got {raw:?}"
@@ -263,8 +463,13 @@ impl Settings {
         let max_concurrent_doput = parse_positive::<usize>("FLIGHT_MAX_CONCURRENT_DOPUT")?
             .unwrap_or(DEFAULT_MAX_CONCURRENT_DOPUT);
 
-        let max_temp_directory_size = env_value("DUCKDB_MAX_TEMP_DIRECTORY_SIZE")
-            .unwrap_or_else(|| DEFAULT_MAX_TEMP_DIRECTORY_SIZE.to_string());
+        let (max_temp_directory_size, spill_cap_source) = spill_cap(
+            env_value("DUCKDB_MAX_TEMP_DIRECTORY_SIZE"),
+            explicit_temp_directory.is_some(),
+            instances,
+            size,
+            || available_bytes(&temp_directory),
+        )?;
 
         Ok(Self {
             listen_addr,
@@ -281,7 +486,8 @@ impl Settings {
                 max_temp_directory_size,
             },
             memory_ceiling,
-            thread_budget,
+            threads_source,
+            spill_cap_source,
             max_concurrent_doput,
         })
     }
@@ -315,4 +521,119 @@ where
         return Err(format!("{var} must be at least 1, got 0"));
     }
     Ok(Some(value))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MIB: u64 = 1024 * 1024;
+    const GIB: u64 = 1024 * MIB;
+
+    fn free(bytes: u64) -> impl FnOnce() -> Result<(PathBuf, u64), String> {
+        move || Ok((PathBuf::from("/spill"), bytes))
+    }
+
+    fn unread() -> impl FnOnce() -> Result<(PathBuf, u64), String> {
+        || panic!("the free space is read only when the cap is derived")
+    }
+
+    #[test]
+    fn derived_threads_divide_the_budget_by_instances_and_connections() {
+        // One instance: the budget divided by the pool, as before the count existed.
+        assert_eq!(derived_threads(48, 1, 8), 6);
+        assert_eq!(derived_threads(48, 2, 8), 3);
+        assert_eq!(derived_threads(48, 3, 8), 2);
+        // Floored, and never below one thread.
+        assert_eq!(derived_threads(48, 5, 8), 1);
+        assert_eq!(derived_threads(4, 2, 8), 1);
+        assert_eq!(derived_threads(1, 1, 1), 1);
+    }
+
+    #[test]
+    fn the_threads_source_names_the_variable_or_the_division() {
+        assert_eq!(ThreadsSource::Configured.describe(8), "DUCKDB_THREADS");
+        let derived = ThreadsSource::Derived {
+            budget: 48,
+            instances: 2,
+        };
+        assert_eq!(
+            derived.describe(8),
+            "derived: CPU budget 48 / 2 instances / 8 connections"
+        );
+    }
+
+    #[test]
+    fn the_derived_cap_divides_free_space_by_instances_and_connections() {
+        assert_eq!(derived_spill_cap_mib(64 * GIB, 1, 8), 8 * 1024);
+        assert_eq!(derived_spill_cap_mib(64 * GIB, 2, 8), 4 * 1024);
+        // Floored to whole MiB.
+        assert_eq!(derived_spill_cap_mib(3 * MIB - 1, 1, 1), 2);
+        assert_eq!(derived_spill_cap_mib(0, 1, 1), 0);
+    }
+
+    #[test]
+    fn a_configured_cap_wins_over_derivation() {
+        let got = spill_cap(Some("11GiB".into()), true, 2, 8, unread()).unwrap();
+        assert_eq!(got, ("11GiB".to_string(), SpillCapSource::Configured));
+    }
+
+    #[test]
+    fn without_an_explicit_spill_directory_the_cap_is_the_default() {
+        let got = spill_cap(None, false, 4, 8, unread()).unwrap();
+        assert_eq!(
+            got,
+            (
+                DEFAULT_MAX_TEMP_DIRECTORY_SIZE.to_string(),
+                SpillCapSource::Default
+            )
+        );
+    }
+
+    #[test]
+    fn an_explicit_spill_directory_derives_the_cap_from_its_filesystem() {
+        let (cap, source) = spill_cap(None, true, 2, 8, free(1024 * GIB)).unwrap();
+        assert_eq!(cap, "65536MiB");
+        assert_eq!(
+            source,
+            SpillCapSource::Derived {
+                statvfs_path: PathBuf::from("/spill"),
+                available_bytes: 1024 * GIB,
+                instances: 2,
+            }
+        );
+        assert!(source.describe(8).contains("2 instances / 8 connections"));
+    }
+
+    #[test]
+    fn a_derived_cap_at_the_floor_is_accepted_and_below_it_fails_boot() {
+        let at_floor = MIN_DERIVED_SPILL_MIB * MIB * 2 * 8;
+        let (cap, _) = spill_cap(None, true, 2, 8, free(at_floor)).unwrap();
+        assert_eq!(cap, format!("{MIN_DERIVED_SPILL_MIB}MiB"));
+
+        let err = spill_cap(None, true, 2, 8, free(at_floor - 1)).unwrap_err();
+        assert!(
+            err.contains("DUCKDB_MAX_TEMP_DIRECTORY_SIZE")
+                && err.contains("fewer instances")
+                && err.contains("DUCKLAKE_POOL_SIZE"),
+            "the error names both ways out: {err}"
+        );
+    }
+
+    #[test]
+    fn a_failed_free_space_read_fails_boot() {
+        let err = spill_cap(None, true, 1, 8, || Err("statvfs(/x) failed".into())).unwrap_err();
+        assert!(err.contains("statvfs"), "{err}");
+    }
+
+    #[test]
+    fn free_space_of_a_missing_directory_is_read_at_its_nearest_existing_ancestor() {
+        let root = tempfile::tempdir().unwrap();
+        let missing = root.path().join("not").join("yet");
+        let (asked, bytes) = available_bytes(&missing).unwrap();
+        assert_eq!(asked, root.path());
+        assert!(bytes > 0, "a writable temp directory reports free space");
+        let (asked, _) = available_bytes(root.path()).unwrap();
+        assert_eq!(asked, root.path());
+    }
 }

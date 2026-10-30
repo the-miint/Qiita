@@ -18,11 +18,12 @@
 #
 # Hatches, one per row: SKIP_HEALTH, SKIP_ACTIONS, SKIP_COMPUTE_READINESS,
 # SKIP_SLURM_PROBE, SKIP_CP_MIINT, SKIP_DP_POOL, SKIP_DP_UNITS,
-# SKIP_ENA_REACHABILITY, SKIP_PREFLIGHT (the
-# last passes through to preflight.sh). SKIP_ENA_REACHABILITY skips the
-# CONTROL-PLANE row only; its compute-node counterpart (probe/ena-from-compute)
-# rides the SLURM probe job and goes with SKIP_SLURM_PROBE, which also drops
-# native-import, the miint probes and shared-fs. See docs/runbooks/redeploy.md.
+# SKIP_DP_MEMORY_MAX, SKIP_CATALOG_CONNECTIONS, SKIP_ENA_REACHABILITY,
+# SKIP_PREFLIGHT (the last passes through to preflight.sh).
+# SKIP_ENA_REACHABILITY skips the CONTROL-PLANE row only; its compute-node
+# counterpart (probe/ena-from-compute) rides the SLURM probe job and goes with
+# SKIP_SLURM_PROBE, which also drops native-import, the miint probes and
+# shared-fs. See docs/runbooks/redeploy.md.
 
 set -euo pipefail
 
@@ -147,6 +148,32 @@ else
         done <<<"$dp_strays"
     else
         pass "data-plane-units" "no qiita-data-plane@ unit outside QIITA_DATA_PLANE_PORTS ($dp_ports) is running or enabled"
+    fi
+fi
+
+# --- 1d. Per-instance MemoryMax ---------------------------------------------
+# What systemd applied to each local instance against
+# QIITA_DATA_PLANE_INSTANCE_MEMORY_MAX (see "Per-instance limits" in _common.sh).
+# A mismatch means the drop-in was not written or not loaded.
+if [ -n "${SKIP_DP_MEMORY_MAX:-}" ]; then
+    skip "dp-memory-max" "SKIP_DP_MEMORY_MAX=1"
+elif ! command -v systemctl >/dev/null 2>&1; then
+    skip "dp-memory-max" "systemctl not on PATH"
+else
+    dp_ports=$(qiita_data_plane_ports)
+    dp_memory_max=$(qiita_data_plane_instance_memory_max)
+    if [ -z "$dp_memory_max" ]; then
+        skip "dp-memory-max" "QIITA_DATA_PLANE_INSTANCE_MEMORY_MAX unset in $DP_ENV"
+    else
+        dp_memory_max_bytes=$(qiita_size_bytes "$dp_memory_max")
+        for dp_port in $dp_ports; do
+            dp_applied=$(systemctl show -p MemoryMax --value "qiita-data-plane@${dp_port}" 2>/dev/null) || dp_applied=""
+            if [ "$dp_applied" = "$dp_memory_max_bytes" ]; then
+                pass "dp-memory-max/qiita-data-plane@${dp_port}" "MemoryMax=$dp_memory_max ($dp_applied bytes)"
+            else
+                fail "dp-memory-max/qiita-data-plane@${dp_port}" "MemoryMax is '${dp_applied:-unreadable}', configured $dp_memory_max ($dp_memory_max_bytes bytes)"
+            fi
+        done
     fi
 fi
 
@@ -275,7 +302,22 @@ else
     fi
 fi
 
-# --- 4b. ENA reachability from the control plane (as qiita-api) -----------
+# --- 4b. Catalog connection budget ------------------------------------------
+# Every data-plane instance's pool, on every host, against the catalog server's
+# max_connections. What it counts and why: qiita_catalog_connection_budget in
+# _common.sh. Runs here as root with the data plane's catalog role, the way
+# activate.sh's idle wait does.
+if [ -n "${SKIP_CATALOG_CONNECTIONS:-}" ]; then
+    skip "catalog-connections" "SKIP_CATALOG_CONNECTIONS=1"
+elif [ ! -r "$DP_ENV" ]; then
+    skip "catalog-connections" "$DP_ENV absent (first deploy)"
+elif ! command -v psql >/dev/null 2>&1; then
+    skip "catalog-connections" "psql not on PATH"
+else
+    qiita_check_catalog_connection_budget "$DP_ENV"
+fi
+
+# --- 4c. ENA reachability from the control plane (as qiita-api) -----------
 # The control-plane half of the deploy's ENA egress check; the compute-node half
 # is the compute-readiness probe row `ena-from-compute`. Why the deploy asks at
 # all, and what a green row does and does not prove, is stated once on

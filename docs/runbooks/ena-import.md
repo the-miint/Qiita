@@ -477,6 +477,19 @@ Where verification does not apply (an SFF run, a file that is not gzip-compresse
 `fastq_md5` from ENA) the run still registers. A run that comes back empty with no
 warning fails permanently.
 
+**Dropped connections are retried by DuckDB.** A FASTQ download retries a dropped HTTP
+request up to 8 times, at random waits that add up to about 35 s on average and 70 s at
+most. An open whose requests all drop goes through those retries twice
+(duckdb-miint#391), up to about 140 s. This covers FASTQ downloads only: [`docs/duckdb-miint.md`](../duckdb-miint.md) says what
+miint's Portal requests do. A 3 GB run makes about 95 requests, and DuckDB also limits
+how many retries they make together, to about 50 dropped connections a run. A run that
+reaches the limit fails with `retry quota for '…' exhausted` in its reason and is
+retried up to the ticket's retry limit, like a run that broke mid-download. The
+retry values are constants (`MIINT_HTTP_RETRY_SETTINGS` in
+`qiita_compute_orchestrator.miint`, whose comment says how DuckDB spends and refills the
+limit), not configuration: changing them takes a code change and a release, and the limit
+itself has no setting.
+
 A run that fails in a way a retry cannot clear (a format error, a run with no sequence
 data, a 404 from duckdb-miint#312 on, zero reads) does not fail its pool when another run
 was stored: the other runs load, the ticket completes, and the failed run is recorded with

@@ -29,7 +29,8 @@ markers = [
 ]
 filterwarnings = [
     # DuckDB copies the whole result before handing it over as Arrow from
-    # `execute()`; see qiita_control_plane.miint.arrow_batches.
+    # `execute()`; `arrow_batches` in qiita-control-plane/src/qiita_control_plane/miint.py
+    # carries the measurement.
     "error:Arrow output on a DB-API result:UserWarning",
 ]
 
