@@ -31,6 +31,10 @@
   of its files was deleted is now refused (`FailedPrecondition`) instead of answered
   with the earlier registration, while that file is still at its lake path. Once lake
   GC has removed it, a replay cannot tell itself from a first call (#800).
+- **`scripts/lake-gc.sh` reports without write access to the lake data path (#801).**
+  On DuckDB 2.0 a dry run only reads it, so a member of `qiita-data` can run the
+  report as themselves; `--reclaim` and `--reclaim-orphans` still refuse unless the
+  account can write it (`sudo -u qiita-data`).
 - **A control-plane restart interrupts an in-flight `mint-features` map write
   instead of waiting for it (#801).** A restart cancels the steps that have not
   finished by its drain timeout, and the next startup re-attaches them. A

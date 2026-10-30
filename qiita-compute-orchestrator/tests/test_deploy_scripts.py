@@ -2527,12 +2527,27 @@ def test_lake_gc_reclaim_requires_typed_confirmation(tmp_path) -> None:
     assert not (tmp_path / "captured.sql").exists(), "aborting must not reach the database"
 
 
-def test_lake_gc_refuses_unwritable_data_path(tmp_path) -> None:
-    """The gate is unconditional, so it fires in report mode too — which is what
-    this exercises. DuckLake needs to write the data path even for the dry-run
-    orphan scan (it fails read-only there), so a group-read operator cannot run
-    even the report. Failing here names the right run-as instead of surfacing as
-    a permission error from inside duckdb."""
+@pytest.mark.parametrize("flag", ["--reclaim", "--reclaim-orphans"])
+def test_lake_gc_refuses_to_reclaim_on_an_unwritable_data_path(tmp_path, flag) -> None:
+    """A reclaim unlinks files under the data path. Failing before the prompt names
+    the right run-as instead of surfacing as a permission error from inside duckdb."""
+    if os.geteuid() == 0:
+        pytest.skip("root ignores the write bit")
+    result = subprocess.run(
+        ["bash", str(_LAKE_GC), flag],
+        capture_output=True,
+        text=True,
+        env={**_lake_gc_env(tmp_path, writable=False), "ASSUME_YES": "1"},
+    )
+    assert result.returncode == 1
+    assert "not writable" in result.stderr
+    assert "sudo -u qiita-data" in result.stderr
+    assert not (tmp_path / "captured.sql").exists(), "the refusal must precede the database"
+
+
+def test_lake_gc_reports_on_an_unwritable_data_path(tmp_path) -> None:
+    """A report only reads the data path, so group read is enough (the script says
+    where that was measured)."""
     if os.geteuid() == 0:
         pytest.skip("root ignores the write bit")
     result = subprocess.run(
@@ -2541,9 +2556,8 @@ def test_lake_gc_refuses_unwritable_data_path(tmp_path) -> None:
         text=True,
         env=_lake_gc_env(tmp_path, writable=False),
     )
-    assert result.returncode == 1
-    assert "not writable" in result.stderr
-    assert "qiita-data" in result.stderr
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    assert "report only" in result.stdout
 
 
 def test_lake_gc_never_passes_cleanup_all() -> None:
@@ -2554,9 +2568,8 @@ def test_lake_gc_never_passes_cleanup_all() -> None:
 
 
 def test_lake_gc_uses_the_documented_call_form() -> None:
-    """DuckLake documents these table functions as `CALL f(...)`. `SELECT * FROM
-    f(...)` behaves identically (measured on 1.5.4 — same rows, same deletions),
-    but a reader checking this against the docs should find the documented form.
+    """DuckLake documents these table functions as `CALL f(...)`, and a reader
+    checking the script against the docs should find that form there.
     https://ducklake.select/docs/stable/duckdb/maintenance/expire_snapshots"""
     code = _lake_gc_code()
     assert "SELECT * FROM ducklake_" not in code
@@ -2566,11 +2579,10 @@ def test_lake_gc_uses_the_documented_call_form() -> None:
 
 def test_lake_gc_scopes_the_orphan_scan_to_its_own_transaction() -> None:
     """Steps 1-2 share a transaction (cleanup only sees the expiry from inside
-    it). Step 3 must open a NEW one: measured on 1.5.4, an orphan scan inside a
-    transaction that opened earlier reports a file another session registered and
-    COMMITTED in the meantime, so acting on it would unlink a live file whose
-    catalog row survives. Asserting positions, not mere presence — a CALL that
-    drifts across a COMMIT is exactly the regression this guards."""
+    it). Step 3 must open a NEW one, or it can report, and so unlink, a file
+    another session registered since (the script's step-3 comment says why).
+    Asserting positions, not mere presence — a CALL that drifts across a COMMIT is
+    exactly the regression this guards."""
     code = _lake_gc_code()
     assert code.count("BEGIN TRANSACTION;") == 2, "expected the 1-2 / 3 split"
     assert code.count("COMMIT;") == 2
