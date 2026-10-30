@@ -2,8 +2,8 @@
 and the per-entity `qiita.*_metadata_visibility` functions.
 
 The functions are called directly with synthesized caller tier maps, so these
-tests pin the SQL rule on its own; how a principal becomes a map is pinned with
-the guards. The expected answer comes from an oracle written here,
+tests pin the SQL rule on its own; the guards' tests pin how a principal's map
+is built. The expected answer comes from an oracle written here,
 independently of the SQL, so a drift in either one fails.
 """
 
@@ -445,8 +445,7 @@ async def test_hidden_rows_null_every_value_column(ctx, spec):
         assert row["visible"] is False
         assert all(row[c] is None for c in _MASKED_COLUMNS), dict(row)
 
-    # The mask is the caller's, not the row's: at admin the same rows carry
-    # their values.
+    # Masking depends on the caller: at admin the same rows carry their values.
     admin = CallerMetadataTiers(study_tiers={ctx["study_idx"]: Tier.ADMIN}, default=Tier.PUBLIC)
     shown = {r["idx"]: r for r in await _visibility_rows(pool, spec, admin, entity_idx)}
     populated = {column for _, column, _ in seeded}
@@ -496,9 +495,9 @@ async def test_misfiled_local_exception_on_linked_value_still_restricts(ctx, spe
 
 
 @pytest.mark.parametrize("spec", SPECS, ids=_spec_id)
-async def test_global_value_judged_on_contributing_study(ctx, spec):
-    """A global value belongs to the study whose alias wrote it: a grant on
-    another study the entity is linked to does not reach it."""
+async def test_global_value_is_checked_on_the_study_that_wrote_it(ctx, spec):
+    """A global value belongs to the study that wrote it: a grant on another
+    study linked to the entity does not reach it."""
     pool = ctx["pool"]
     entity_idx = await _create_linked_entity_for_spec(ctx, spec)
     (other_study_idx,) = await _seed_secondary_studies_for_entity(ctx, spec, entity_idx, 1)
@@ -678,8 +677,8 @@ async def test_metadata_write_moves_only_the_parents_metadata_timestamp(ctx, spe
 
 @pytest.mark.parametrize("spec", SPECS, ids=_spec_id)
 async def test_metadata_write_waits_behind_a_patch_holding_the_parent(ctx, spec):
-    """A PATCH reads its response's metadata under the lock its preflight took
-    on the parent row, and a metadata write's touch needs that row, so the
+    """A PATCH reads its response's metadata while holding the parent-row lock
+    that its preflight took; a metadata write's touch needs that lock, so the
     write waits and cannot land between the PATCH's reads. The write UPDATEs
     an existing value, so the touch, not an insert's foreign-key check, is
     what waits."""
@@ -706,7 +705,7 @@ async def test_metadata_write_waits_behind_a_patch_holding_the_parent(ctx, spec)
         await conn.execute(update_sql, metadata_idx, f"v-{secrets.token_hex(3)}")
 
     # Each kind's preflight is the fetch its PATCH runs: a biosample's own row,
-    # or the sequenced_sample joined to the prep_sample the value hangs on.
+    # or the sequenced_sample joined to the prep_sample that holds the value.
     subtype = None
     if spec.entity_kind is SampleEntityKind.BIOSAMPLE:
 
@@ -745,8 +744,8 @@ async def test_metadata_write_waits_behind_a_patch_holding_the_parent(ctx, spec)
 
 @pytest.mark.parametrize("spec", SPECS, ids=_spec_id)
 async def test_visible_metadata_last_change_counts_only_the_read_values(ctx, spec):
-    """The last change a read reports is the latest updated_at among the
-    values that read returns: the entity's global values, plus the named
+    """A read's last_metadata_change_at is the latest updated_at among the
+    values it returns: the entity's global values, plus the named
     study's local ones, each only when visible. A hidden write, or a local
     write on another study, does not move it."""
     pool = ctx["pool"]
@@ -794,8 +793,7 @@ async def test_visible_metadata_last_change_counts_only_the_read_values(ctx, spe
         f"SELECT updated_at FROM {spec.metadata_table} WHERE idx = $1", shown_idx
     )
     assert await last_change(ctx["study_idx"]) == shown_at
-    # A study-local value belongs to its own study's read, not the
-    # entity-wide one.
+    # A study-local value counts only on its own study's read.
     assert await last_change() is None
 
     await write_local(ctx["study_idx"], Tier.ADMIN)

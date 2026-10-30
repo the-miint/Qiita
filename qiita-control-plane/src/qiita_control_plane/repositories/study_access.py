@@ -127,9 +127,8 @@ class CallerMetadataTiers:
     """The tier a caller holds on each study, for reading metadata values.
 
     `study_tiers` names the studies where the caller holds more than
-    `default`; every other study is read at `default`. Built by
-    `auth.guards.caller_metadata_tiers`, which owns the policy; this is the
-    shape it hands the visibility SQL (`_sample_helpers.visible_metadata_source`).
+    `default`; every other study is read at `default`.
+    `auth.guards.caller_metadata_tiers` builds it.
     """
 
     study_tiers: Mapping[int, Tier]

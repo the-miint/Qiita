@@ -3,8 +3,8 @@
 -- The metadata visibility rule as SQL. Two scalar functions compute a field's
 -- tier, and the greater of that and the tiers of a value's exception rows. Per
 -- entity kind, one set-returning function reports, for each EAV row, the tier
--- it requires, the tier the caller holds on its study, and whether the caller
--- may read it. The rule itself is defined in docs/architecture/data-model.md,
+-- it requires, the caller's tier on the row's study, and whether the caller may
+-- read it. The rule itself is defined in docs/architecture/data-model.md,
 -- "Metadata visibility tiers"; this file implements it.
 --
 -- The caller's tiers arrive as parallel arrays (study_idx, tier) plus the tier
@@ -94,9 +94,8 @@ AS $$
             AND el.biosample_study_field_idx = m.biosample_study_field_idx
       LEFT JOIN unnest(caller_study_idxs, caller_study_tiers) AS ct(study_idx, tier)
              ON ct.study_idx = sf.study_idx
-     -- The owner-biosample-id floor (docs/architecture/data-model.md). The
-     -- literal is repositories.biosample.OWNER_BIOSAMPLE_ID_TIER_OVERRIDE,
-     -- which a test pins it to.
+     -- The owner-biosample-id floor (docs/architecture/data-model.md). A test
+     -- pins the literal to repositories.biosample.OWNER_BIOSAMPLE_ID_TIER_OVERRIDE.
      CROSS JOIN LATERAL (VALUES (
                GREATEST(
                    qiita.metadata_required_tier(
@@ -111,8 +110,8 @@ AS $$
 $$;
 
 COMMENT ON FUNCTION qiita.biosample_metadata_visibility(bigint[], qiita.tier[], qiita.tier) IS
-    'Every biosample_metadata row with the tier it requires, the tier the caller '
-    'holds on its study, and whether the caller may read it; the value columns '
+    'Every biosample_metadata row with the tier it requires, the caller''s tier '
+    'on the row''s study, and whether the caller may read it; the value columns '
     'and updated_at are NULL on a row the caller may not read. Rule: '
     'docs/architecture/data-model.md, "Metadata visibility tiers".';
 

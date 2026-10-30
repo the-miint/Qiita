@@ -822,9 +822,9 @@ class SequencedSampleResponse(ReadCounts):
 
     Carries every caller-visible column from the sequenced_sample subtype
     row plus the controlling supertype prep_sample row, and embeds a dict
-    of the globally-linked metadata values the prep_sample carries that
-    the caller's tier reaches (each judged on the study that wrote it;
-    the rest are absent), keyed on prep_sample_global_field.internal_name.
+    of the prep_sample's globally-linked metadata values that the caller may
+    read, by their tier on the study that wrote each (the rest are absent),
+    keyed on prep_sample_global_field.internal_name.
     Purely-local metadata is excluded: its
     prep_sample_metadata.global_field_idx is NULL. A prep_sample holds one
     value per global field, shared by every study that reads the field,

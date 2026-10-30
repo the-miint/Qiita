@@ -101,12 +101,12 @@ A purely-local field's `data_type` may be **widened to `text`**, and to nothing 
 
 ### Metadata visibility tiers
 
-This is the definition. Where it differs from the comment on the `qiita.tier`
-type in the applied migration `20260501000006_study.sql` — which names only
-system admins as reading every value — this one supersedes it, as with the
-study-record rule below. Reads of biosample and prep_sample metadata enforce it through `qiita.biosample_metadata_visibility` /
-`qiita.prep_sample_metadata_visibility`, fed the caller's tiers by
-`auth.guards.caller_metadata_tiers`.
+This section defines the rule. It supersedes the comment on the `qiita.tier`
+type in the applied migration `20260501000006_study.sql`, which names only
+system admins as reading every value, as the study-record rule below does.
+Reads of biosample and prep_sample metadata enforce it through
+`qiita.biosample_metadata_visibility` / `qiita.prep_sample_metadata_visibility`,
+which take the caller's tiers from `auth.guards.caller_metadata_tiers`.
 
 A caller may read a metadata value when their tier on **the value's study**
 reaches **the value's required tier**.
@@ -126,7 +126,7 @@ reaches **the value's required tier**.
   keyed on `global_field_idx` for a globally-linked value, so it follows the
   value into every study, or on `*_study_field_idx` for a purely-local one. A
   value matches an exception keyed on its global field or on the study-local
-  field it was written through, so one keyed on the local field still applies
+  field that it was written through, so one keyed on the local field still applies
   after that field is linked; one keyed on another study's alias of the same
   global field does not. `qiita.metadata_required_tier` combines these two.
 - **Owner-biosample-id floor** — an owner-biosample-id value requires at least
@@ -134,9 +134,9 @@ reaches **the value's required tier**.
   its field's tier, so a study that declared the field lower before its first
   import does not expose the owner's names.
 
-**The value's study** is the study of the study-local field it was written
-through. For a globally-linked value, that is the study that wrote it first:
-it holds the entity's one slot for that global field, and no other study can
+**The value's study** is the study of the study-local field that the value was
+written through. For a globally-linked value, that is the study that wrote it
+first: the entity has one value per global field, and no other study can
 overwrite it. A caller reading an entity through study B therefore sees a
 global value that study A wrote only if their tier on A reaches it.
 
@@ -144,14 +144,13 @@ global value that study A wrote only if their tier on A reaches it.
 their `qiita.study_access` row, otherwise `public`. A wet_lab_admin or
 system_admin reads at `admin` on every study (`auth.guards.METADATA_BYPASS_ROLE`);
 an anonymous caller reads at `public` everywhere. Owning a biosample confers no
-tier: it is a way in to `GET /biosample/{idx}`, but an owner who neither owns
-nor holds a grant on the study that wrote a value reads that value at
-`public`.
+tier: it admits the owner to `GET /biosample/{idx}`, but they read a value at
+`public` unless they own, or hold a grant on, the study that wrote it.
 
 **A hidden value is absent**, not marked: a read omits its key, and anything
 that counts values counts only the visible ones. A lookup by a unique-in-study
-value the caller may not read answers exactly as one matching nothing, so it
-cannot confirm the value. The owner-biosample-id is the standing example: a
+value hidden from the caller answers as one matching nothing does, so it cannot
+confirm the value. The owner-biosample-id is the standing example: a
 viewer of the study does not see it.
 
 **Timestamps describe the response.** A read's `last_metadata_change_at` is the
@@ -174,22 +173,21 @@ changes:
   `now()` is when a transaction started. So it may not move them either.
 
 `PATCH /biosample/{idx}` and `PATCH /sequenced-sample/{idx}` check If-Match
-against the ETag of the GET on the same path. A study-scoped read also counts
-that study's local values, so its ETag is not an If-Match for those PATCHes.
+against the ETag of the GET on the same path. A study-scoped read's ETag also
+covers that study's local values, so it is not the If-Match for those PATCHes.
 
-Every caller-facing metadata read names its source through
-`_sample_helpers.visible_metadata_source`. The reads filter on the function's
-`visible` column; its value columns, NULL on a hidden row, serve a
-read that must keep every row in place, such as an export writing one column
-per field. The study-scoped biosample and sequenced_sample reads admit any
+Every caller-facing metadata read selects from
+`_sample_helpers.visible_metadata_source` and filters on its `visible` column.
+Its value columns are also NULL on a hidden row, for a read that must return
+every row. The study-scoped biosample and sequenced_sample reads admit any
 caller with `viewer` tier or above on the study; the rule decides which values
 they carry. Readers that serve operators
 rather than callers — the host-filter resolver, the host-taxon backfill, and
 the system_admin owner-biosample-id export — read the tables directly.
 
-**Writes are gated separately.** Every study-scoped route that writes
+**Writes are checked separately.** Every study-scoped route that writes
 biosample or prep_sample metadata, or mints a study-local field, requires
-`admin` on the study (wet_lab_admin+ bypassing), so only a caller who can read
+`admin` on the study, or a wet_lab_admin+ role, so only a caller who can read
 every value there can write.
 
 ### What a tier reads of a study's own record

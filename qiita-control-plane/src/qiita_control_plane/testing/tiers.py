@@ -1,4 +1,4 @@
-"""A ranking of `Tier` for tests to judge expected visibility against.
+"""A ranking of `Tier` that tests compute expected visibility from.
 
 Written here rather than imported from `auth.guards`: a test that borrowed the
 production ordering could not catch that ordering being wrong.

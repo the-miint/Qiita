@@ -6,19 +6,20 @@
 -- read from it, moved on every metadata write: a reader who may not see the
 -- written value could still tell that it exists and when it changed.
 --
--- Two changes close it. Each set_updated_at trigger skips an UPDATE that moves
--- last_metadata_change_at, which only the touch functions set. And each touch
--- function skips its UPDATE when last_metadata_change_at already holds now(),
--- as it does from the second metadata write of one transaction on: that
--- UPDATE would move nothing, so the WHEN clause would let set_updated_at run.
+-- Two changes close this leak. Each set_updated_at trigger skips an UPDATE
+-- that moves last_metadata_change_at, which only the touch functions set. And
+-- each touch function skips its UPDATE when last_metadata_change_at already
+-- holds now(), as it does from the second metadata write of one transaction
+-- on: that UPDATE would move nothing, so the WHEN clause would let
+-- set_updated_at run.
 -- updated_at then describes the record's own columns.
 --
--- The touch's UPDATE takes the parent's row lock, so a metadata write waits
--- behind a PATCH holding the parent FOR UPDATE, and the PATCH's reads cannot
--- see one land midway. The guard skips when the parent already holds this
--- transaction's start time, which in practice means the transaction's own
--- earlier touch took that lock; Postgres does not make start times unique
--- across transactions, but two sharing one microsecond is the only exception.
+-- The touch's UPDATE takes the parent's row lock, so a metadata write waits for
+-- a PATCH holding the parent FOR UPDATE, and none lands between the PATCH's
+-- reads. The touch skips its UPDATE only when last_metadata_change_at already
+-- equals this transaction's start time, which means this transaction's earlier
+-- touch already took the lock, unless another transaction started in the same
+-- microsecond.
 
 CREATE OR REPLACE FUNCTION qiita.biosample_metadata_touch_biosample()
 RETURNS TRIGGER AS $$
@@ -61,15 +62,15 @@ COMMENT ON COLUMN qiita.biosample.updated_at IS
     'last_metadata_change_at instead.';
 COMMENT ON COLUMN qiita.biosample.last_metadata_change_at IS
     'When any biosample_metadata row of this biosample was last written, '
-    'whatever its tier. Not returned to callers as is: a read reports the '
-    'latest change among the values it returns.';
+    'whatever its tier. Not returned to callers; see '
+    'docs/architecture/data-model.md, "Metadata visibility tiers".';
 COMMENT ON COLUMN qiita.prep_sample.updated_at IS
     'When the prep_sample''s own columns last changed. A metadata write moves '
     'last_metadata_change_at instead.';
 COMMENT ON COLUMN qiita.prep_sample.last_metadata_change_at IS
     'When any prep_sample_metadata row of this prep_sample was last written, '
-    'whatever its tier. Not returned to callers as is: a read reports the '
-    'latest change among the values it returns.';
+    'whatever its tier. Not returned to callers; see '
+    'docs/architecture/data-model.md, "Metadata visibility tiers".';
 
 -- migrate:down
 

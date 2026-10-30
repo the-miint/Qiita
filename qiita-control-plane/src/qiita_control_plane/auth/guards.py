@@ -524,10 +524,10 @@ def caller_tier_reaches(row: CallerStudyAccessRow, *, caller: Principal, tier: T
 # reads metadata passes this constant as its bypass
 # (`require_study_access(bypass_role=METADATA_BYPASS_ROLE)`), so the route and
 # the metadata rule agree on who reads everything. If they disagreed, a caller
-# the route let in by role, with no grant on the study, would then read only
-# its public values. The wet-lab routes gated on
-# `require_role_at_least(SystemRole.WET_LAB_ADMIN)` admit a role for the
-# route's own work, not as a stand-in for a grant, and keep their literal.
+# that the route admitted by role, with no grant on the study, would read only
+# its public values. The wet-lab routes that call
+# `require_role_at_least(SystemRole.WET_LAB_ADMIN)` admit that role for their
+# own work, not in place of a grant, so they name the role directly.
 METADATA_BYPASS_ROLE = SystemRole.WET_LAB_ADMIN
 
 
@@ -539,7 +539,7 @@ async def caller_metadata_tiers(
     Anonymous reads at public everywhere. A caller at or above
     `METADATA_BYPASS_ROLE` reads at admin everywhere, with no lookup. Anyone
     else reads at `caller_effective_tier` on each study they own or hold a grant
-    on, and at public on the rest. The rule these tiers feed is defined in
+    on, and at public on the rest. The rule is defined in
     docs/architecture/data-model.md, "Metadata visibility tiers".
     """
     if isinstance(caller, Anonymous):

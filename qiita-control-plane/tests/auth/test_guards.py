@@ -1230,8 +1230,8 @@ async def test_caller_metadata_tiers_bypass_role_reads_at_admin_everywhere(study
 
 @pytest.mark.db
 async def test_caller_metadata_tiers_maps_grants_and_ownership(study_access_ctx):
-    """A grant reads at its tier, an owned study at admin even without a row,
-    and every other study at public."""
+    """The caller reads at a grant's tier, at admin on an owned study even
+    without a row, and at public on every other study."""
     pool = study_access_ctx["pool"]
     caller_idx = study_access_ctx["caller_idx"]
     owned_idx = await seed_study(

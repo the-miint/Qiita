@@ -76,13 +76,14 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
   `POST /study/{s}/biosample/by-unique-field`, `GET /study/{s}/sequenced-sample/{q}`) now
   admit `viewer` and above instead of only `admin`; `GET /biosample/{b}` drops global values
   the caller's tier does not reach, including for the biosample's owner. An
-  owner-biosample-id value reads at `member` or above whatever its field's tier.
+  owner-biosample-id value requires `member` or above, whatever its field's tier.
   `last_metadata_change_at` now reflects only the metadata in the response, and
   `updated_at` / `effective_updated_at` no longer move on metadata writes; the ETag is the
-  later of the two, so a client that read `updated_at` to detect metadata changes should
-  read `last_metadata_change_at` or the ETag instead. The study-scoped reads' ETag is no
-  longer an If-Match for `PATCH /biosample/{b}` or `PATCH /sequenced-sample/{q}`; a client
-  takes it from the GET on the PATCH's own path (the `qiita` CLI already does).
+  later of `last_metadata_change_at` and the record's timestamp, so a client that read
+  `updated_at` to detect metadata changes should read `last_metadata_change_at` or the
+  ETag instead. The study-scoped reads' ETag no longer works as If-Match for
+  `PATCH /biosample/{b}` or `PATCH /sequenced-sample/{q}`; a client uses the ETag from the
+  GET on the PATCH's own path (the `qiita` CLI already does).
 
 ## Deployed history
 

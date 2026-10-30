@@ -438,9 +438,9 @@ class BiosampleResponse(BaseModel):
 
     Mirrors qiita.biosample's caller-visible columns, adds the biosample's
     export_entity_id from qiita.exported_entity, and embeds a dict
-    of the globally-linked metadata values the biosample carries that
-    the caller's tier reaches (each judged on the study that wrote it;
-    the rest are absent), keyed on biosample_global_field.internal_name.
+    of the biosample's globally-linked metadata values that the caller may
+    read, by their tier on the study that wrote each (the rest are absent),
+    keyed on biosample_global_field.internal_name.
     Purely-local metadata (including the owner-biosample-id row) is
     excluded: its biosample_metadata.global_field_idx is NULL. A biosample
     holds one value per global field, shared by every study that reads the

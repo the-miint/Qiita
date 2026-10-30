@@ -14,8 +14,8 @@ caller-creator semantics on the path's `sequenced_pool` (via
 listed in the body (via `require_caller_has_admin_on_all_studies`), both with
 a wet_lab_admin+ bypass. The run-scoped and single-resource reads gate on
 Scope.PREP_SAMPLE_READ + wet_lab_admin role unconditionally; the study-scoped
-reads gate on study existence plus viewer study access, with wet_lab_admin and
-system_admin bypassing, mirroring the biosample reads. All handlers delegate
+reads require the study to exist and viewer access to it, or the wet_lab_admin
+or system_admin role, as the biosample reads do. All handlers delegate
 their DB work to the sibling repository modules.
 """
 
@@ -786,14 +786,14 @@ async def get_sequenced_sample_in_study(
     sequenced_sample + supertype prep_sample row, its globally-linked
     prep_sample metadata, and this study's purely-local prep_sample metadata.
 
-    Gated at Tier.VIEWER study access with a wet_lab_admin+ role bypass. 401 on
+    Requires Tier.VIEWER on the study, or a wet_lab_admin+ role. 401 on
     Anonymous, 403 on missing scope or on a caller who neither owns the study
     nor holds a grant on it, 404 on a study that does not exist.
     require_study_exists composes alongside require_study_access so a bypass
     caller still gets 404 on a non-existent study.
 
-    Both metadata maps carry only the values the caller's tier reaches; the rest
-    are absent (docs/architecture/data-model.md, "Metadata visibility tiers").
+    Which values the metadata maps carry is defined in
+    docs/architecture/data-model.md, "Metadata visibility tiers".
 
     The prep_sample must be linked to this study: a sequenced_sample whose
     supertype prep_sample has no non-retired prep_sample_to_study link to
@@ -802,10 +802,10 @@ async def get_sequenced_sample_in_study(
     sequenced_sample is likewise 404, checked only after the link passes
     (mirroring the sequenced-sample-level read's retired carve-out).
 
-    last_metadata_change_at and the `ETag` header are stamps of what the
-    response carries (`representation_etag` over `effective_updated_at`, the
-    GREATEST of the prep_sample and sequenced_sample timestamps), local values
-    included, so this ETag is not an If-Match for
+    last_metadata_change_at and the `ETag` header (`representation_etag` over
+    `effective_updated_at`, the GREATEST of the prep_sample and
+    sequenced_sample timestamps) come from the values this response carries,
+    local ones included, so this is not the ETag to send as If-Match to
     PATCH /sequenced-sample/{sequenced_sample_idx}. The ETag is a quoted ISO
     8601 timestamp and is opaque by contract.
     """
@@ -863,9 +863,9 @@ async def patch_sequenced_sample_metadata(
     """Upsert this study's metadata values on a sequenced_sample's supertype
     prep_sample.
 
-    Access policy is interim: gated at Tier.ADMIN study access with a
-    wet_lab_admin+ role bypass -- a coarse stand-in until metadata writes
-    enforce the visibility rule. 401 on Anonymous, 403 on missing scope,
+    Access policy is interim: this route requires Tier.ADMIN on the study, or a
+    wet_lab_admin+ role, until metadata writes apply the visibility rule. 401 on
+    Anonymous, 403 on missing scope,
     an incomplete profile, or sub-ADMIN tier, 404 on a study that does not
     exist. require_study_exists composes alongside require_study_access so an
     admin-bypass caller still gets 404 on a non-existent study.
@@ -932,11 +932,11 @@ async def get_sequenced_sample(
     GET surface — a future change will let wet_lab_admin+ retrieve
     retired rows so the audit-trail surface is reachable from the API).
 
-    last_metadata_change_at and the `ETag` header are stamps of what the
-    response carries (`representation_etag` over `effective_updated_at =
-    GREATEST(prep_sample.updated_at, sequenced_sample.updated_at)`), and this
-    ETag is what PATCH /sequenced-sample/{sequenced_sample_idx} checks If-Match
-    against. The ETag is a quoted ISO 8601 timestamp; clients must treat it as
+    last_metadata_change_at and the `ETag` header (`representation_etag` over
+    `effective_updated_at = GREATEST(prep_sample.updated_at,
+    sequenced_sample.updated_at)`) come from the values this response carries;
+    PATCH /sequenced-sample/{sequenced_sample_idx} checks If-Match against this
+    ETag. The ETag is a quoted ISO 8601 timestamp; clients must treat it as
     opaque.
     """
     # All reads share one REPEATABLE READ snapshot so the supertype-join
@@ -1023,9 +1023,9 @@ async def patch_sequenced_sample(
     post-commit `effective_updated_at` and 412s on its now-stale
     If-Match header. ENA-accession uniqueness violations map to 409.
 
-    If-Match is checked against, and the response's `ETag` header carries,
-    the value GET /sequenced-sample/{idx} returns (`representation_etag`);
-    it is opaque to clients. The schema trigger
+    If-Match must equal the ETag of GET /sequenced-sample/{idx}
+    (`representation_etag`), and the response's `ETag` is what that GET now
+    returns; it is opaque to clients. The schema trigger
     sequenced_sample_clear_submission_error_on_new_attempt nulls
     submission_error when last_submission_at changes unless the same
     UPDATE explicitly sets submission_error; callers recording a failed
@@ -1081,7 +1081,7 @@ async def patch_sequenced_sample(
                     detail=f"sequenced_sample {sequenced_sample_idx} is retired",
                 )
             # If-Match carries the ETag of GET /sequenced-sample/{idx}, which
-            # covers the global metadata that read returns.
+            # also covers that GET's global metadata.
             tiers = await caller_metadata_tiers(conn, caller)
             pre_change = await fetch_visible_metadata_last_change(
                 conn, spec=PREP_SAMPLE_METADATA_SPEC, entity_idx=row["prep_sample_idx"], tiers=tiers

@@ -799,9 +799,9 @@ class EntityMetadataSpec:
     # tagged and kept in lockstep the same way. It rejects a row whose
     # populated value column does not match its field's declared type.
     metadata_field_contract_trigger: str
-    # The set-returning function judging every metadata row against a caller's
-    # tiers (qiita.biosample_metadata_visibility / ...), named only through
-    # `visible_metadata_source`.
+    # The set-returning function that checks every metadata row against a
+    # caller's tiers (qiita.biosample_metadata_visibility / ...); reads use it
+    # only through `visible_metadata_source`.
     visibility_function: str
     # The per-(entity, field) exception table (biosample_field_exception /
     # prep_sample_field_exception), keyed on the entity, on
@@ -820,10 +820,10 @@ class EntityMetadataSpec:
 
 
 def visible_metadata_source(spec: EntityMetadataSpec) -> str:
-    """The FROM item a caller-facing metadata read names in place of
-    `spec.metadata_table`: the entity's visibility function, aliased `m`.
+    """The entity's visibility function as a FROM item aliased `m`, to use in
+    place of `spec.metadata_table`.
 
-    Binds `CallerMetadataTiers.sql_args()` at $1-$3, so the read's own
+    It takes `CallerMetadataTiers.sql_args()` as $1-$3, so the query's own
     parameters start at $4. The function is written to be inlined (see the
     migration that creates it).
     """
@@ -965,8 +965,8 @@ async def fetch_entity_idx_by_unique_field_value(
     """Return the entity idx carrying `value` through the given study field, or
     None when no row does or the matching value is hidden from `tiers`.
 
-    A hidden match is a miss, indistinguishable from no match: answering
-    otherwise would confirm a value the caller may not read.
+    A hidden match returns None, as no match does, so the lookup cannot
+    confirm a hidden value.
 
     The caller must have established that the field declares unique_in_study.
     Without it every row under the field carries the flag false, so the term
@@ -986,11 +986,11 @@ async def fetch_entity_idx_by_unique_field_value(
     # Closed-set lookup; a data_type with no typed column reaches the write and
     # read guards as NotImplementedError rather than matching NULL here.
     value_column = GLOBAL_METADATA_VALUE_COLUMN[data_type]
-    # The match reads the base table, not the visibility function: the
-    # function's value columns are masked expressions, which no index serves.
-    # The unique_in_study term spells the partial index's own predicate, which
-    # the planner needs in order to use that index. The matched row is then
-    # judged by primary key.
+    # The match reads the base table, because the visibility function's value
+    # columns are CASE expressions, which no index serves. The unique_in_study
+    # term spells the partial index's own predicate, which the planner needs in
+    # order to use that index. The join on m.idx then checks the matched row's
+    # visibility.
     row = await pool_or_conn.fetchrow(
         f"SELECT raw.{spec.entity_key_column}"
         f" FROM {spec.metadata_table} raw"
@@ -1252,7 +1252,7 @@ async def fetch_local_metadata(
     missing and terminology-term entries surface as MissingReasonRef /
     TerminologyTermRef; any other row is decoded from the value column its
     data_type maps to. An owner-sample-id row (where the spec has one) is a
-    study-local value like any other, judged by the same rule.
+    study-local value like any other, under the same rule.
     """
     # The study_field join scopes to one study and supplies the field's
     # display_name + data_type; the LEFT JOINs recover a missing-reason or

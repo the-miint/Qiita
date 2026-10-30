@@ -98,12 +98,12 @@ async def ctx(role_keyed_clients):
 @dataclass(frozen=True)
 class _Corpus:
     study_idx: int
-    # The idx the route addresses, and the entity the metadata hangs off: the
+    # The idx in the route path, and the entity that holds the metadata: the
     # same biosample, or a sequenced_sample and its supertype prep_sample.
     entity_idx: int
     metadata_entity_idx: int
-    # key -> the tier a caller needs to see it. Global values key on
-    # internal_name, local ones on display_name, as the response does.
+    # key -> the tier a caller needs to see it. Global values are keyed by
+    # internal_name, local ones by display_name, as in the response.
     global_keys: dict[str, Tier]
     local_keys: dict[str, Tier]
 
@@ -327,8 +327,8 @@ async def test_study_scoped_biosample_read_shows_only_visible_values(ctx, case):
     assert set(body["local_metadata"]) == corpus.visible(corpus.local_keys, read_tier)
 
 
-# The study's owner is absent: this read admits by a grant on a linked study or
-# by owning the biosample, and the corpus's biosample is the wet_lab_admin's.
+# No study-owner case: this read admits by a grant on a linked study or by
+# owning the biosample, and the corpus's biosample is the wet_lab_admin's.
 @pytest.mark.parametrize("case", ("viewer", "member", "admin", "wet_lab_admin"))
 async def test_biosample_read_shows_only_visible_global_values(ctx, case):
     study_idx = await _seed_study_for_case(ctx, case)
@@ -363,8 +363,9 @@ async def test_biosample_owner_without_a_grant_reads_global_values_at_public(ctx
 
 
 async def test_lookup_by_unique_field_hidden_value_is_a_miss(ctx):
-    """A viewer cannot see the owner-biosample-id, so a lookup by it answers
-    exactly as a lookup by a value no biosample carries does; a member can."""
+    """A viewer cannot see the owner-biosample-id, so a lookup by it gets the
+    same answer as one by a value that no biosample carries; a member's lookup
+    finds it."""
     study_idx = await _seed_study_for_case(ctx, "viewer")
     corpus = await _seed_biosample_corpus(ctx, study_idx)
     url = URL_BIOSAMPLE_BY_STUDY_UNIQUE_FIELD.format(study_idx=study_idx)
@@ -396,10 +397,10 @@ async def test_lookup_by_unique_field_hidden_value_is_a_miss(ctx):
     assert shown.json()["biosample_idx"] == corpus.entity_idx
 
 
-async def test_global_value_from_another_study_judged_there(ctx):
-    """A global value another study wrote is judged on that study: a member of
-    this study alone does not see a member-tier value the other study holds,
-    and a grant on the other study brings it into view."""
+async def test_global_value_from_another_study_is_checked_there(ctx):
+    """A global value that another study wrote is checked against the caller's
+    tier there: a member of only this study does not see the other study's
+    member-tier value, and a grant on the other study reveals it."""
     study_idx = await _seed_study_for_case(ctx, "member")
     corpus = await _seed_biosample_corpus(ctx, study_idx)
     other_study_idx = await _seed_study(
@@ -571,7 +572,8 @@ async def test_hidden_write_moves_nothing_the_viewer_reads(ctx, surface):
     """A write to a value the viewer cannot read leaves the viewer's
     last_metadata_change_at, record timestamp, and ETag where they were, so
     the read discloses neither that hidden values exist nor when they change;
-    a caller who reads the value sees all of it move. A write the viewer can
+    a caller who reads the value sees its last_metadata_change_at and ETag
+    move. A write the viewer can
     read moves their last_metadata_change_at and ETag, and never the record's
     own timestamp."""
     s = _TIMESTAMP_SURFACES[surface]
@@ -603,7 +605,7 @@ async def test_hidden_write_moves_nothing_the_viewer_reads(ctx, surface):
     assert viewer_record == viewer_before[1]
 
 
-async def test_sequenced_sample_read_stamps_a_metadata_write_on_its_metadata(ctx):
+async def test_sequenced_sample_metadata_write_moves_its_etag_not_its_record(ctx):
     """GET /sequenced-sample/{idx} admits only callers who read every value,
     so it has no hidden write to test; a write moves its
     last_metadata_change_at and ETag, never effective_updated_at."""

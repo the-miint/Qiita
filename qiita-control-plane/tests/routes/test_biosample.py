@@ -4005,7 +4005,7 @@ async def test_patch_biosample_metadata_retired_409(ctx):
 @pytest.mark.parametrize("case", STUDY_SCOPED_SAMPLE_WRITE_AUTHZ_CASES)
 async def test_patch_biosample_metadata_authz(ctx, case, no_biosample_write_patch_client):
     """Tests the case where each row of the study-scoped sample write matrix
-    calls the metadata write: the ADMIN clamp, the role bypass, the scope
+    calls the metadata write: the ADMIN minimum, the role bypass, the scope
     check, the unauthenticated refusal, and the missing-study 404 all hold.
 
     The allowed rows rewrite the value the seed already wrote, so a permitted
@@ -4030,7 +4030,7 @@ async def test_patch_biosample_metadata_authz(ctx, case, no_biosample_write_patc
 
 async def test_patch_biosample_metadata_admin_tier_writes(ctx):
     """Tests the case where a regular user with ADMIN study access (not the role
-    bypass) writes metadata: the ADMIN clamp is satisfied and the value is
+    bypass) writes metadata: the ADMIN minimum is satisfied and the value is
     INSERTED.
     """
     (

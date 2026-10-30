@@ -459,9 +459,9 @@ async def read_study_scoped_entity(
 
     Gates via resolve_linked_study_entity with a read's 404-on-retired, then
     reads the entity's global and study-local metadata visible at `tiers`.
-    not_found_detail words both of those 404s at once -- on a read, unlinked
-    and retired are one answer -- for a caller that named the entity by
-    something other than its idx. Returns the (non-None) row plus the two
+    not_found_detail is the detail of both 404s, since a read answers unlinked
+    and retired alike, for a caller that named the entity by something other
+    than its idx. Returns the (non-None) row plus the two
     MetadataEntry dicts.
     """
     retired_detail = (
@@ -1337,7 +1337,7 @@ def require_etag_match(
     PATCH endpoint emits the same wording. `label` is the entity noun
     embedded in the 404 detail (e.g. "study", "biosample"). The row's ETag is
     `representation_etag` over its updated_at and `metadata_last_change`,
-    which a route whose GET returns no metadata leaves None.
+    which is None when the GET returns no metadata.
     """
     if row is None:
         raise HTTPException(status_code=404, detail=f"{label} {row_idx} not found")

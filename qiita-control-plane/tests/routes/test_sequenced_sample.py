@@ -3536,7 +3536,7 @@ async def test_get_sequenced_sample_in_study_returns_global_and_local_metadata(c
     globally-linked prep_sample metadata value and a purely-local prep_sample
     row: the study-scoped GET returns the joined row, global_metadata keyed by
     internal_name, and local_metadata keyed by display_name, with an ETag. The
-    caller is wet_lab_admin, whose role reads every value.
+    caller is wet_lab_admin, whose role sees every value.
     """
     seeded = await _seed_one_sequenced_sample(
         ctx,
@@ -3639,7 +3639,7 @@ async def test_get_sequenced_sample_in_study_admin_tier_returns_response(ctx):
 @pytest.mark.parametrize("tier", [Tier.VIEWER, Tier.MEMBER])
 async def test_get_sequenced_sample_in_study_viewer_and_member_read(ctx, tier):
     """Tests the case where a regular user's study access is viewer or member:
-    the study-scoped GET is 200, since the read's floor is viewer. Which of the
+    the study-scoped GET is 200, since the read requires viewer. Which of the
     sequenced_sample's values each tier then sees is pinned by the metadata
     visibility route tests.
     """
@@ -4205,7 +4205,7 @@ async def test_patch_sequenced_sample_metadata_missing_scope_403(ctx, no_prep_sa
 @pytest.mark.parametrize("tier", ["viewer", "member"])
 async def test_patch_sequenced_sample_metadata_below_admin_tier_403(ctx, tier):
     """Tests the case where a regular user's study access is below the ADMIN
-    clamp (viewer or member): the write is 403.
+    minimum (viewer or member): the write is 403.
     """
     seeded = await _seed_one_sequenced_sample(ctx, f"patch-{tier}")
     await _grant_study_access(
@@ -4234,7 +4234,7 @@ async def test_patch_sequenced_sample_metadata_no_access_403(ctx):
 
 async def test_patch_sequenced_sample_metadata_admin_tier_writes(ctx):
     """Tests the case where a regular user with ADMIN study access (not the role
-    bypass) writes metadata: the ADMIN clamp is satisfied and the value is
+    bypass) writes metadata: the ADMIN minimum is satisfied and the value is
     INSERTED.
     """
     seeded = await _seed_one_sequenced_sample(ctx, "patch-admin")

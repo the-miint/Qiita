@@ -453,8 +453,8 @@ async def _insert_returning_idx(
 ) -> int:
     """INSERT one row of `columns` plus each `optional` column whose value is
     not None, and return its idx. An omitted optional column takes its schema
-    default, so a seeder does not restate it. `table` and the column names are
-    the calling seeder's literals."""
+    default, so a seeder does not restate it. `table` and the column names must
+    be literals, never input."""
     values = columns | {name: value for name, value in optional.items() if value is not None}
     placeholders = ", ".join(f"${i}" for i in range(1, len(values) + 1))
     return await pool.fetchval(
@@ -749,8 +749,7 @@ async def _insert_global_field(
     required: bool,
     default_tier: Tier | None,
 ) -> int:
-    """The INSERT the two global-field seeders share; `table` is one of their
-    literals."""
+    """Insert one global-field row into `table`, a literal; return its idx."""
     return await _insert_returning_idx(
         pool,
         table,
@@ -838,8 +837,8 @@ async def seed_field_exception(
 ) -> int:
     """Insert one per-(entity, field) visibility exception and return its idx.
 
-    Exactly one of global_field_idx / study_field_idx keys it; the table's
-    CHECK refuses both or neither. The row hangs off its entity, so the sweep
+    Pass exactly one of global_field_idx / study_field_idx; the table's CHECK
+    refuses both or neither. The row hangs off its entity, so the sweep
     takes it.
     """
     # f-string interpolation of identifiers is safe: spec fields are frozen
@@ -902,8 +901,8 @@ async def seed_metadata_text_value(
     """Insert a random text value for spec's entity through an existing study
     field, local or globally linked, and return the metadata row's idx.
 
-    A bare INSERT, so a test can place a value through a field it already
-    holds; the triggers still derive the row's global_field_idx. The row hangs
+    A plain INSERT through a study field the test already has; the triggers
+    still derive the row's global_field_idx. The row hangs
     off its entity, so the sweep takes it.
     """
     # f-string interpolation of identifiers is safe: spec fields are frozen
