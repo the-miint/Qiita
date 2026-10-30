@@ -60,6 +60,7 @@ from qiita_common.assembly_constants import (
     CONTIG_ATTRIBUTES_FILE,
 )
 from qiita_common.log_tail import contains_oom_signature
+from qiita_common.myloasm_constants import MYLOASM_RAW_DIR
 
 from qiita_compute_orchestrator.jobs._assembly import LCG_FILE, NOLCG_FILE
 
@@ -176,7 +177,7 @@ def _strip_comment(line: str) -> str:
 @pytest.mark.parametrize(
     ("path", "dir_var", "expected"),
     [
-        (_ASSEMBLE_SH, "OUT", {LCG_FILE, NOLCG_FILE, CONTIG_ATTRIBUTES_FILE}),
+        (_ASSEMBLE_SH, "OUT", {LCG_FILE, NOLCG_FILE, CONTIG_ATTRIBUTES_FILE, MYLOASM_RAW_DIR}),
         (_BINNING_SH, "GENOMES_DIR", {NOLCG_FILE}),
         (_BIN_REFINE_SH, "GENOMES_DIR", {NOLCG_FILE}),
         (_CHECKM_SH, "GENOMES_DIR", {LCG_FILE, NOLCG_FILE}),

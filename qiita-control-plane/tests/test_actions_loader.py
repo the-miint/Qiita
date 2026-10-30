@@ -181,7 +181,7 @@ def test_load_actions_loads_on_disk_reference_add_yaml():
     assert _REFERENCE_ADD_ACTION_VERSION == ref_add.version == "1.0.0"
 
 
-@pytest.mark.parametrize("version", ["1.0.0", "1.0.1"])
+@pytest.mark.parametrize("version", ["1.0.0", "1.0.1", "1.0.2"])
 def test_load_actions_loads_on_disk_long_read_assembly_yaml(version):
     """Each on-disk `workflows/long-read-assembly/<version>.yaml` loads as a valid
     ActionDefinition with the per-sample assembly→MAG shape:
@@ -263,12 +263,13 @@ def test_load_actions_loads_on_disk_long_read_assembly_yaml(version):
     # checkm), each with its own SIF + entrypoint — the multi-SIF packaging.
     container_steps = [s for s in assembly.steps if getattr(s, "container", None)]
     assert len(container_steps) == 4
-    # checkm is per-version: 1.0.1 scores the unbinned residue and 1.0.0 does not, so
-    # the two run DIFFERENT images and the filenames say so. The other three are the
-    # same image for both versions, which is what a SIF name is for.
-    checkm_sif = f"long-read-assembly-checkm-{version}.sif"
+    # A SIF name names the image, so it moves only with the version that changed the
+    # image: checkm with 1.0.1 (the unbinned residue), assemble with 1.0.2 (the
+    # myloasm provenance dump). binning and dastool are one image for all three.
+    checkm_sif = f"long-read-assembly-checkm-{'1.0.0' if version == '1.0.0' else '1.0.1'}.sif"
+    assemble_sif = f"long-read-assembly-assemble-{'1.0.2' if version == '1.0.2' else '1.0.0'}.sif"
     assert {s.container for s in container_steps} == {
-        "long-read-assembly-assemble-1.0.0.sif",
+        assemble_sif,
         "long-read-assembly-binning-1.0.0.sif",
         "long-read-assembly-dastool-1.0.0.sif",
         checkm_sif,
@@ -1624,9 +1625,9 @@ def test_the_version_sync_leaves_enabled_is_the_highest_of_each_action():
             f"{semver}; sync enables the LAST one, so the newest must come last."
         )
 
-    # Named rather than left to the sweep: 1.0.1 exists to be submitted against, and
+    # Named rather than left to the sweep: 1.0.2 exists to be submitted against, and
     # it only reaches an operator if it is the version sync leaves enabled.
-    assert by_action["long-read-assembly"][-1] == "1.0.1", by_action["long-read-assembly"]
+    assert by_action["long-read-assembly"][-1] == "1.0.2", by_action["long-read-assembly"]
 
 
 def test_load_actions_orders_a_two_digit_minor_after_a_one_digit_one(tmp_path):

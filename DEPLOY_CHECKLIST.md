@@ -36,6 +36,15 @@ _None yet._
   sudo -u qiita-data /usr/local/bin/duckdb --version   # expect v2.0.0 (Cyanoptera) d54cbbe3df
   ```
 
+- `[admin]` **Let in-flight `long-read-assembly` tickets finish, and submit no new ones,
+  before the restart.** The sync enables 1.0.2 and disables 1.0.1, and a ticket whose
+  action is disabled fails when the restarted runner picks it up (`not found or
+  disabled`). Expect `0`; resubmit anything that fails anyway at 1.0.2. (#813)
+  ```bash
+  sudo -u qiita-api bash -c 'set -a; . /etc/qiita/control-plane.env; set +a
+  psql "$DATABASE_URL" -Atc "SELECT count(*) FROM qiita.work_ticket WHERE action_id = '\''long-read-assembly'\'' AND state IN ('\''pending'\'', '\''queued'\'', '\''processing'\'');"'
+  ```
+
 ### 3. Migrations
 
 _None yet._
@@ -76,11 +85,38 @@ _None yet._
     test -s "$MIINT_EXTENSION_DIRECTORY/v$v/linux_amd64/miint.duckdb_extension" \
       || { echo "no staged miint for DuckDB $v"; exit 1; }
   done
-  cd /tmp && for s in long-read-assembly-assemble-1.0.0.sif long-read-assembly-checkm-1.0.1.sif; do
+  cd /tmp && for s in long-read-assembly-assemble-1.0.2.sif long-read-assembly-checkm-1.0.1.sif; do
     apptainer exec --no-home "${PATH_DERIVED}/images/$s" \
       python3 -c "import duckdb; print(duckdb.__version__)" | grep -Fxq 2.0.0 \
       || { echo "$s is not on DuckDB 2.0.0"; exit 1; }
   done && echo DUCKDB_200_OK'
+  ```
+- **One myloasm assembly at `long-read-assembly` 1.0.2 lands its provenance.** Submit one
+  prep_sample, wait for the ticket to complete, look up the run it minted, then check that
+  run's six `myloasm_*` tables. Expect `runs`, `contigs`, `layouts` and `mappings` above 0
+  (`runs` is one per myloasm log, so 1 unless myloasm restarted); `links` and `splits`
+  can be 0; `reads_not_in_read` and `primaries_without_feature` must be 0. (#813)
+  ```bash
+  PS='<prep_sample_idx>'; MASK='<mask_idx completed for it>'
+  qiita ticket submit --action-id long-read-assembly --action-version 1.0.2 \
+      --prep-sample-idx "$PS" --context-json "{\"mask_idx\": $MASK, \"assembler\": \"myloasm\"}"
+  # once `qiita ticket status <ticket>` says completed:
+  RUN=$(sudo -u qiita-api bash -c 'set -a; . /etc/qiita/control-plane.env; set +a
+    psql "$DATABASE_URL" -Atc "SELECT a.processing_idx FROM qiita.assembly_sample a JOIN qiita.processing p USING (processing_idx) WHERE a.prep_sample_idx = '"$PS"' AND a.state = '\''completed'\'' AND p.workflow = '\''long-read-assembly'\'' AND p.version = '\''1.0.2'\'' AND p.params->>'\''assembler'\'' = '\''myloasm'\'';"')
+  echo "run=$RUN"   # expect one processing_idx
+  bash scripts/lake-shell.sh --no-cp -c "
+    SELECT (SELECT count(*) FROM qiita_lake.myloasm_run      WHERE prep_sample_idx = $PS AND processing_idx = $RUN) AS runs,
+           (SELECT count(*) FROM qiita_lake.myloasm_contig   WHERE prep_sample_idx = $PS AND processing_idx = $RUN) AS contigs,
+           (SELECT count(*) FROM qiita_lake.myloasm_layout   WHERE prep_sample_idx = $PS AND processing_idx = $RUN) AS layouts,
+           (SELECT count(*) FROM qiita_lake.myloasm_mapping  WHERE prep_sample_idx = $PS AND processing_idx = $RUN) AS mappings,
+           (SELECT count(*) FROM qiita_lake.myloasm_link     WHERE prep_sample_idx = $PS AND processing_idx = $RUN) AS links,
+           (SELECT count(*) FROM qiita_lake.myloasm_split    WHERE prep_sample_idx = $PS AND processing_idx = $RUN) AS splits,
+           (SELECT count(*) FROM qiita_lake.myloasm_mapping m
+              ANTI JOIN (SELECT sequence_idx FROM qiita_lake.read WHERE prep_sample_idx = $PS) r USING (sequence_idx)
+              WHERE m.prep_sample_idx = $PS AND m.processing_idx = $RUN) AS reads_not_in_read,
+           (SELECT count(*) FROM qiita_lake.myloasm_contig
+              WHERE prep_sample_idx = $PS AND processing_idx = $RUN
+                AND dereplication_status = 'primary' AND feature_idx IS NULL) AS primaries_without_feature"
   ```
 - **The DuckLake catalog is still format 1.0.** Expect `1.0`; the attach itself fails if
   the catalog was ever migrated. (#801)
@@ -103,13 +139,16 @@ _None yet._
   - The redeploy re-stages miint and httpfs into `MIINT_EXTENSION_DIRECTORY/v2.0.0/` on its
     own, because `stage-miint --check` sees the version change. `make verify-deploy`'s
     `compute-readiness` and `cp-miint` checks LOAD the new build.
-  - The `assemble` and `checkm` (`-1.0.1`) SIFs auto-rebuild on deploy to pick up 2.0.0.
+  - The `checkm` (`-1.0.1`) SIF auto-rebuilds on deploy to pick up 2.0.0, and the new
+    `long-read-assembly-assemble-1.0.2.sif` is built on it. `-assemble-1.0.0.sif` is no
+    longer built, so it stays on the DuckDB it has (#813).
   - **Work that loads miint between the bucket-4 restart and the redeploy's miint stage
     fails at LOAD**: `v2.0.0/` is staged after everything moves to 2.0.0. Resubmit
     anything that failed there; #676 would stage first and close the window.
   - **Keep `v1.5.4/` and `v1.5.5/`.** The frozen `long-read-assembly-checkm-1.0.0.sif` still
-    loads miint from `v1.5.4/`, and `v1.5.5/` is what a rollback runs. Staging never
-    removes an old version dir.
+    loads miint from `v1.5.4/`, the frozen `long-read-assembly-assemble-1.0.0.sif` (named by
+    1.0.0 and 1.0.1) from `v1.5.5/` (#813), and `v1.5.5/` is also what a rollback runs.
+    Staging never removes an old version dir.
   - Each data-plane instance installs the 2.0.0 `ducklake` and `postgres` extensions under
     its `HOME` on first start, so it needs to reach extensions.duckdb.org.
   - That ducklake writes catalog format 1.1 by default, so every attach names
@@ -119,6 +158,14 @@ _None yet._
   - `host_filter` can count a read pair as host that it did not before: miint's 2.0
     build maps a pair under the `sr` preset as native minimap2 does
     (duckdb-miint#341).
+- **`long-read-assembly` 1.0.2 keeps myloasm's read-level provenance in six new DuckLake
+  tables.** (#813)
+  - The data plane creates `myloasm_contig`, `myloasm_layout`, `myloasm_mapping`,
+    `myloasm_link`, `myloasm_split` and `myloasm_run` on its next start; nothing to run.
+  - The assemble image lands under a new filename, `long-read-assembly-assemble-1.0.2.sif`,
+    built on deploy. **Keep `long-read-assembly-assemble-1.0.0.sif`**: 1.0.0 and 1.0.1 still
+    name it and no spec builds it any more (`sif-build.d/assemble.env`).
+  - Runs completed before this deploy have no provenance rows.
 
 ## Deployed history
 
