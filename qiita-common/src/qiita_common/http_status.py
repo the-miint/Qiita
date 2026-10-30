@@ -12,6 +12,9 @@ _TRANSIENT_ERROR_MARKERS = (
     "temporarily",
     "curl",
     "could not connect",
+    # DuckDB's suffix once its per-host retry quota refuses a retry ("retry quota for
+    # '<host>' exhausted"): the host kept failing, which a later attempt can outlast.
+    "retry quota",
 )
 
 

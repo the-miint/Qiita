@@ -362,17 +362,18 @@ def resolve_duckdb_memory_gb(
 
 # ENA's file server drops connections in bursts that outlast DuckDB's default of 3
 # retries. These allow 8 retries per request. DuckDB 2.0 draws each wait at random from
-# [0, 500 ms × 2^(retry - 1)], capped at 20 s, so 8 retries take up to about 70 s, about
-# 35 s on average (38-46 s measured). It also charges every retry against one host to a
-# quota per database that no setting changes (`HTTPRetryQuota`, DuckDB's
-# main/http/http_retry_budget.hpp): about 50 retries of a dropped connection, a token back
-# for each request that succeeds, and full again after a minute without a request.
-# `open_miint_conn` opens a new database, so each ENA run has a quota of its own.
-# Applied as session SETs
-# after httpfs is loaded, not in the connect config: a connect-time httpfs setting makes
-# connect() autoinstall httpfs, and a GLOBAL value would nest under the 3-try retry loop of
-# miint's Portal ENAClient. FASTQ downloads run through the connection's own filesystem and
-# take the session values.
+# [0, 500 ms × 2^(retry - 1)], capped at 20 s, so 8 retries wait up to about 70 s in all,
+# about 35 s on average (38-46 s measured). A throttled 429 or 503 gets 5 retries more,
+# each waiting in the upper half of its range and at least the server's Retry-After (up
+# to 20 s). DuckDB also charges each retry to its per-host retry quota, which belongs to
+# the database and has no setting: 500 tokens, 10 for a retry after a dropped connection
+# (so about 50 of those) and 5 for any other. A request that succeeds first time gives
+# back 1 token, one that succeeds after retrying gives back its last retry's cost, and a
+# minute without a request to the host refills the quota.
+# Applied as session SETs after httpfs is loaded, not in the connect config: a
+# connect-time httpfs setting makes connect() autoinstall httpfs, and a GLOBAL value would
+# nest under the 3-try retry loop of miint's Portal ENAClient. FASTQ downloads run through
+# the connection's own filesystem and take the session values.
 MIINT_HTTP_RETRY_SETTINGS: dict[str, str] = {
     "http_retries": "8",
     "http_retry_wait_ms": "500",

@@ -11,6 +11,7 @@ import duckdb
 import pytest
 from qiita_common.api_paths import LOOPBACK_HOST
 from qiita_common.duckdb_miint import miint_load_sql
+from qiita_common.http_status import is_transient_error_text
 from qiita_common.testing.loopback import serve_on_loopback
 
 from qiita_compute_orchestrator.miint import MIINT_HTTP_RETRY_SETTINGS, open_conn, open_miint_conn
@@ -152,3 +153,26 @@ def test_read_fails_at_duckdb_default_retries(miint_conn, head_limit, body_limit
     with _flaky_url(head_limit, body_limit) as url:
         with pytest.raises(duckdb.IOException, match=message):
             _read_ids(miint_conn, url)
+
+
+# More reads than the quota's dropped-connection retries can cover at 8 retries each.
+_READS_PAST_THE_QUOTA = 20
+
+
+def test_an_exhausted_retry_quota_reads_as_transient(miint_conn):
+    """Every HEAD is dropped until DuckDB's per-host retry quota refuses a retry,
+    which shows as a read the server saw fewer than 1 + `http_retries` times. That
+    read's error must read as transient, so a run that spent its quota is retried."""
+    miint_conn.execute("SET threads=1")
+    miint_conn.execute("SET http_retry_wait_ms=1")
+    attempts = 1 + int(MIINT_HTTP_RETRY_SETTINGS["http_retries"])
+    with _flaky_url(head_limit=10**6, body_limit=0) as url:
+        for _ in range(_READS_PAST_THE_QUOTA):
+            before = _FlakyFastqHandler.head_drops
+            with pytest.raises(duckdb.IOException) as raised:
+                _read_ids(miint_conn, url)
+            if _FlakyFastqHandler.head_drops - before < attempts:
+                break
+        else:
+            pytest.fail(f"the retry quota never cut a read short in {_READS_PAST_THE_QUOTA}")
+    assert is_transient_error_text(str(raised.value)), str(raised.value)

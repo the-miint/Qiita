@@ -19,11 +19,11 @@
   build reverse-complements mate 2 before mapping a pair under the `sr` preset
   `host_filter` uses (duckdb-miint#341). A pair can now map as one fragment when neither
   mate maps alone, so `host_filter` can count a pair as host that it did not count before.
-- **A dropped ENA download connection is retried at random waits, under a cap (#801).**
-  DuckDB 2.0 draws each wait between retries at random, so a request's 8 retries take up to
-  about 70 s (about 35 s on average) rather than about a minute. It also caps the retries
-  of one ENA run at about 50 dropped connections, giving one back for each request that
-  succeeds. DuckDB offers no setting for the cap.
+- **A dropped ENA download connection is retried at random waits, under a per-run limit
+  (#801).** DuckDB 2.0 draws each wait between retries at random, so a request's 8 retries
+  wait up to about 70 s in all (about 35 s on average) rather than about a minute. It also
+  limits one ENA run's retries to about 50 dropped connections, with no setting; a run
+  that reaches the limit is retried as a transient fetch failure.
 - **A registered file whose rows are all deleted now leaves the lake (#801).**
   DuckLake on DuckDB 2.0 drops such a file from its table, so `scripts/lake-gc.sh
   --reclaim` removes it once the snapshots that hold it expire; on 1.5.5 it stayed in
