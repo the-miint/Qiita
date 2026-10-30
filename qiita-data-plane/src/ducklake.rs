@@ -25,7 +25,7 @@ use duckdb::Connection;
 /// before interpolation. This is input validation, not sanitization.
 ///
 /// These three are sufficient for that one job: without a quote or a semicolon a
-/// value cannot close the literal and start a statement. Probed on DuckDB 1.5.5 —
+/// value cannot close the literal and start a statement. Probed on DuckDB 2.0.0 —
 /// a value ending in a backslash is taken literally, so it does not escape the
 /// closing quote the way it would in a backslash-escaping dialect. What the
 /// values must otherwise look like is DuckDB's business: a `memory_limit` it

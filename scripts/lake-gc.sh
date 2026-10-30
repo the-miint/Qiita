@@ -21,9 +21,11 @@
 #   2. ducklake_cleanup_old_files     remove files no surviving snapshot holds
 #   3. ducklake_delete_orphaned_files remove files the catalog never references
 #
-# Step 1 gates step 2: measured on DuckDB/DuckLake 1.5.4, cleanup_old_files
-# reports nothing for a file whose rows were all deleted until the snapshots
-# referencing it are expired. Running 2 without 1 is a no-op, not a shortcut.
+# Step 1 gates step 2: measured on DuckDB 1.5.4 and again on 2.0.0 (ducklake
+# 417a9117), cleanup_old_files reports nothing for a file whose rows were all
+# deleted until the snapshots referencing it are expired. On 2.0.0 such a file
+# also leaves its table at the DELETE, and is still not reclaimed before the
+# expiry. Running 2 without 1 is a no-op, not a shortcut.
 #
 # For an operator reclaiming space on the deploy host. Reports by default;
 # nothing is removed unless you pass --reclaim (or --reclaim-orphans), which then
@@ -34,11 +36,12 @@
 # time-travel queries read. --older-than sets how much history is kept (default
 # 7 days) and is the same cutoff the two file-deleting steps filter on.
 #
-# Why not READ_ONLY for the report: ducklake_delete_orphaned_files fails with
-# "Cannot append to a readonly database" even at dry_run := true (measured,
-# 1.5.4), while the other two work read-only. Attaching read-only would silently
-# drop orphan reporting, so the attach is writable and `dry_run` is what makes
-# the default run inert. Do not add READ_ONLY without re-checking step 3.
+# The attach is writable even for a report, and `dry_run` is what makes the
+# default run inert. On 1.5.4 that was forced: ducklake_delete_orphaned_files
+# failed with "Cannot append to a readonly database" even at dry_run := true,
+# while the other two worked read-only. On 2.0.0 (ducklake 417a9117) all three
+# run read-only at dry_run := true (measured), so a report-only run could now
+# attach READ_ONLY.
 #
 # Step 3 is the only one that can touch a live file, so it has its own flag.
 # register_files moves a Parquet to its lake path BEFORE opening the catalog
@@ -48,7 +51,7 @@
 # does, and a mid-flight file was never referenced.
 #
 # The mtime cutoff does not separate the two. `older_than` filters on filesystem
-# mtime (measured, 1.5.4: of two byte-identical unreferenced files, only the one
+# mtime (measured on 1.5.4 and 2.0.0: of two unreferenced files, only the one
 # stamped 30 days back was listed under a 7-day cutoff), and rename carries over
 # the mtime the producing job gave the file in staging — so a lake file's mtime is
 # when it was PRODUCED, not when it entered the lake, and a Parquet that sat in
@@ -187,18 +190,20 @@ qiita_pgpass_init "qiita-lake-gc"
 MARK="@@lake-gc@@"
 
 # All three steps in one duckdb process, across TWO transactions: steps 1-2
-# together, step 3 on its own. Measured on 1.5.4 for both halves — cleanup_old_files
-# sees step 1's expiry from inside the same transaction, and step 3's catalog read
-# is the snapshot from its BEGIN, so it must open after 1-2 finish. See the
-# per-step comments below.
+# together, step 3 on its own. Measured on 1.5.4 and 2.0.0 for both halves —
+# cleanup_old_files sees step 1's expiry from inside the same transaction, and
+# step 3 reads the catalog as of its transaction's first catalog read, so it must
+# open after 1-2 finish. See the per-step comments below.
 #
 # What a transaction does NOT cover: the unlinking. A file removed by step 2 or 3
-# stays removed even if the transaction then rolls back (measured — ROLLBACK left
-# the file gone). A transaction bounds the CATALOG changes only.
+# stays removed even if the transaction then rolls back (measured on 1.5.4 and
+# 2.0.0: ROLLBACK left the file gone). A transaction bounds the CATALOG changes
+# only.
 #
 # `CALL` is the documented invocation form for these table functions
 # (https://ducklake.select/docs/stable/duckdb/maintenance/expire_snapshots).
-# `SELECT * FROM` behaves identically here (measured, same rows, same deletions),
+# `SELECT * FROM` behaves identically here (measured on 1.5.4, same rows, same
+# deletions; same rows on 2.0.0),
 # but the docs are what the next reader will check this against.
 #
 # `.bail on` turns an attach failure into a non-zero exit instead of an empty
@@ -236,13 +241,15 @@ run_maintenance() {
         echo ".print ${MARK}old_files"
         echo "CALL ducklake_cleanup_old_files('qiita_lake', dry_run := ${DRY_RUN}, older_than := ${CUTOFF});"
         echo "COMMIT;"
-        # Step 3 takes its OWN transaction, and must. Measured on 1.5.4: an orphan
-        # scan run inside a transaction that opened earlier reports a file another
-        # session registered and COMMITTED in the meantime — its catalog read is
-        # the snapshot from that BEGIN. At dry_run := false that unlinks a live
-        # file whose catalog row survives. Re-opening takes the read after the
-        # work above, which the same probe showed reports nothing. Keep this
-        # COMMIT/BEGIN pair; folding step 3 upward reintroduces the window.
+        # Step 3 takes its OWN transaction, and must. Measured on 1.5.4 and 2.0.0:
+        # an orphan scan in a transaction that had already read the catalog
+        # reports a file another session registered and COMMITTED since; on 2.0.0
+        # the catalog is read as of the transaction's first catalog read, not its
+        # BEGIN. At dry_run := false that unlinks a live file whose catalog row
+        # survives. Steps 1-2 read the catalog, so re-opening here makes the scan
+        # the new transaction's first read, which the same probes showed reports
+        # nothing. Keep this COMMIT/BEGIN pair; folding step 3 upward reintroduces
+        # the window.
         echo "BEGIN TRANSACTION;"
         echo ".print ${MARK}orphans"
         echo "CALL ducklake_delete_orphaned_files('qiita_lake', dry_run := ${ORPHAN_DRY_RUN}, older_than := ${CUTOFF});"
