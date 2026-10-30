@@ -17,13 +17,12 @@ service accounts have no usable `$HOME` (`qiita-api` / `qiita-orch` are
 `/dev/null`), so a service-side INSTALL dies with `IO Error: Can't find the home
 directory at '/dev/null'`. Service-side code must therefore never reach the
 INSTALL path. This is a property of where the code RUNS, not of which CLI it
-belongs to: `qiita-admin` subcommands
-are run as `qiita-api` on the deploy host (see `deploy/verify.sh`), so an
-admin-CLI path that INSTALLs is only safe while it stays off the service
-accounts. This mirrors the reasoning
-already spelled out in `qiita_common.duckdb_miint.miint_load_sql`: cluster
-runtime LOADs from a pre-staged directory so no node "depends on mirror
-reachability, or needs a writable `$HOME`". The control plane is no different.
+belongs to: `qiita-admin` subcommands are run as `qiita-api` on the deploy host
+(see `deploy/verify.sh`), so an admin-CLI path that INSTALLs is only safe while it
+stays off the service accounts. This mirrors the reasoning already spelled out in
+`qiita_common.duckdb_miint.miint_load_sql`: cluster runtime LOADs from a
+pre-staged directory so no node "depends on mirror reachability, or needs a
+writable `$HOME`". The control plane is no different.
 
 The connect-config + install/load statements are shared with the orchestrator
 via `qiita_common.duckdb_miint` (single source for the `MIINT_EXTENSION_REPO` /
