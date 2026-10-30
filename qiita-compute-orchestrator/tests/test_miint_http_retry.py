@@ -155,8 +155,9 @@ def test_read_fails_at_duckdb_default_retries(miint_conn, head_limit, body_limit
             _read_ids(miint_conn, url)
 
 
-# More reads than the quota's dropped-connection retries can cover at 8 retries each.
-_READS_PAST_THE_QUOTA = 20
+# More reads than DuckDB's ~50 dropped-connection retries can cover, at any
+# `http_retries` of 1 or more.
+_READS_PAST_THE_QUOTA = 60
 
 
 def test_an_exhausted_retry_quota_reads_as_transient(miint_conn):

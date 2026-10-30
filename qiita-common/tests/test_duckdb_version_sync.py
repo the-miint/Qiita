@@ -72,13 +72,13 @@ _RUST_DUCKLAKE_VERSION_RE = re.compile(
 )
 _DEPLOY_DUCKLAKE_VERSION_RE = re.compile(r'^QIITA_DUCKLAKE_VERSION="([^"]+)"$', re.MULTILINE)
 _PY_DUCKLAKE_VERSION_RE = re.compile(r'^DUCKLAKE_VERSION = "([^"]+)"$', re.MULTILINE)
-# How far past an ATTACH's first line its option list may run: every site keeps the
-# options on the ATTACH line or within the two lines after it.
+# How far past the line naming the catalog an ATTACH's option list may run: every
+# site names it on the ATTACH line and keeps the options there or within two lines.
 _ATTACH_STATEMENT_LINES = 3
 # A DuckLake ATTACH names its catalog by a quoted `ducklake:` path or by `TYPE
 # ducklake`; searching for those, not for the ATTACH keyword, finds it whatever stands
 # between ATTACH and the path.
-_DUCKLAKE_ATTACH_PATTERNS = ("['\"]ducklake:", "type[[:space:]]+ducklake")
+_DUCKLAKE_ATTACH_PATTERNS = ("['\"]ducklake:", "type[[:space:]]+['\"]?ducklake")
 # The option and the start of its quoted value; a bare mention in a comment is not it.
 _DUCKLAKE_VERSION_OPTION_RE = re.compile(r"(?i)\bDUCKLAKE_VERSION\s+['\"]")
 # A `duckdb` requirement — any case, extras or not — and its specifier;
@@ -292,6 +292,7 @@ def test_every_ducklake_attach_names_the_catalog_version() -> None:
         "ATTACH IF NOT EXISTS 'ducklake:x' AS l",
         "ATTACH 'postgres:x' AS l (TYPE ducklake)",
         "ATTACH 'postgres:x' AS l (type  DuckLake)",
+        "ATTACH 'postgres:x' AS l (TYPE 'ducklake')",
     ],
 )
 def test_the_attach_search_finds_a_ducklake_attach_written(statement: str, tmp_path: Path):

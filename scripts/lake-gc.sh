@@ -79,7 +79,8 @@
 #
 # Needs, all established at first deploy:
 #   * /etc/qiita/data-plane.env   0440 root:qiita-data
-#   * PATH_PERSISTENT/ducklake    0750 qiita-data   (WRITE access, unlike lake-shell.sh)
+#   * PATH_PERSISTENT/ducklake    0750 qiita-data   (WRITE access for a reclaim, unlike
+#                                                    lake-shell.sh; read for a report)
 #
 # The catalog password never reaches the SQL file or argv (both readable via
 # /proc): it goes to libpq through a 0600 PGPASSFILE deleted on exit.
@@ -148,11 +149,12 @@ PERSISTENT="$(read_env_var "${DP_ENV}" PATH_PERSISTENT)"
 
 DATA_PATH="$(qiita_lake_data_path "${PERSISTENT}")"
 qiita_require_lake_data_path "${DATA_PATH}"
-# Only a reclaim writes here. A report needs to read it alone: all three dry runs
-# work over a data path the account cannot write (measured on 2.0.0).
-if [[ "${DRY_RUN}" == false && ! -w "${DATA_PATH}" ]]; then
+# Only a reclaim writes here; a report only reads it. All three dry runs work over a
+# data path the account cannot write (measured on 2.0.0).
+if [[ "${DRY_RUN}" != true && ! -w "${DATA_PATH}" ]]; then
     echo "ERROR: ${DATA_PATH} is not writable by $(id -un), and a reclaim removes files there." >&2
-    echo "  It is 0750 qiita-data. A report (no flag) needs only group read." >&2
+    echo "  It is 0750 qiita-data. A report (without --reclaim or --reclaim-orphans)" >&2
+    echo "  needs only group read." >&2
     echo "  Re-run the reclaim as: sudo -u qiita-data bash scripts/lake-gc.sh <same flags>" >&2
     exit 1
 fi
@@ -210,8 +212,8 @@ run_maintenance() {
     local sql="${TMPROOT}/gc.sql"
     {
         echo ".bail on"
-        # FIRST: INSTALL resolves against $HOME/.duckdb, and this runs as
-        # qiita-data, whose home is /dev/null ("Can't find the home directory").
+        # FIRST: INSTALL resolves against $HOME/.duckdb, and when this runs as
+        # qiita-data, its home is /dev/null ("Can't find the home directory").
         # Redirect before anything can install.
         echo "SET home_directory='${SESSION_TMPDIR}';"
         # ducklake, plus postgres for the catalog backend — `ducklake:postgres:`

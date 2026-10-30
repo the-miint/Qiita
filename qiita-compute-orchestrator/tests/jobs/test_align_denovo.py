@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import asyncio
 import random
-import threading
 from contextlib import asynccontextmanager
 
 import duckdb
@@ -25,6 +24,7 @@ import pyarrow as pa
 import pytest
 from qiita_common.analytic import MAX_SECONDARY
 from qiita_common.duckdb_relation import registered
+from qiita_common.testing.bounded import run_bounded
 
 from qiita_compute_orchestrator.jobs import align_denovo
 from qiita_compute_orchestrator.jobs.align_denovo import Inputs, execute
@@ -612,26 +612,13 @@ def test_a_reader_backed_by_its_own_connection_cannot_be_scanned_on_it(scan):
     open, DuckDB 2.0 refuses `register` of it and any new query, a replacement scan of
     the Python variable included, so neither can hand it to a table function on that
     connection; if either stops raising, the deadlock may be reachable again. The call
-    runs on a daemon thread so a deadlock fails the test instead of hanging the suite.
-    A Flight-sourced reader, the kind this job registers, is backed by no connection
-    at all."""
+    is bounded so a deadlock fails the test instead of hanging the suite. A
+    Flight-sourced reader, the kind this job registers, is backed by no connection at
+    all."""
     conn = duckdb.connect()
     reader = conn.sql("SELECT range AS x FROM range(5000)").to_arrow_reader(1000)
-    raised: list[BaseException | None] = []
-
-    def attempt() -> None:
-        try:
-            scan(conn, reader)
-        except BaseException as exc:
-            raised.append(exc)
-        else:
-            raised.append(None)
-
-    thread = threading.Thread(target=attempt, daemon=True)
-    thread.start()
-    thread.join(_DEADLOCK_BOUND_SECONDS)
-    assert not thread.is_alive(), f"still running after {_DEADLOCK_BOUND_SECONDS} s"
-    assert isinstance(raised[0], duckdb.ResourceInUseException), raised[0]
+    with pytest.raises(duckdb.ResourceInUseException):
+        run_bounded(lambda: scan(conn, reader), _DEADLOCK_BOUND_SECONDS)
     # The open reader is what refuses it: once closed, the connection queries again.
     reader.close()
     assert conn.execute("SELECT 1").fetchall() == [(1,)]

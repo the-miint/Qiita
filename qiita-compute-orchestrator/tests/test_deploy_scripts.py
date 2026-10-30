@@ -2578,9 +2578,9 @@ def test_lake_gc_uses_the_documented_call_form() -> None:
 
 
 def test_lake_gc_scopes_the_orphan_scan_to_its_own_transaction() -> None:
-    """Steps 1-2 share a transaction (cleanup only sees the expiry from inside
-    it). Step 3 must open a NEW one, or it can report, and so unlink, a file
-    another session registered since (the script's step-3 comment says why).
+    """Steps 1-2 share a transaction and step 3 opens a NEW one, or it can report,
+    and so unlink, a file another session registered since (the script's comment at
+    each BEGIN says why).
     Asserting positions, not mere presence — a CALL that drifts across a COMMIT is
     exactly the regression this guards."""
     code = _lake_gc_code()
