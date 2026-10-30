@@ -477,6 +477,12 @@ Where verification does not apply (an SFF run, a file that is not gzip-compresse
 `fastq_md5` from ENA) the run still registers. A run that comes back empty with no
 warning fails permanently.
 
+**Dropped connections are retried by DuckDB.** The compute orchestrator's miint connections
+retry a dropped HTTP request up to 8 times, about a minute per request; a 3 GB run makes
+about 95 requests, each with its own retries. The values are constants
+(`MIINT_HTTP_RETRY_SETTINGS` in `qiita_compute_orchestrator.miint`), not configuration:
+changing them takes a code change and a release.
+
 A run that fails in a way a retry cannot clear (a format error, a run with no sequence
 data, a 404 from duckdb-miint#312 on, zero reads) does not fail its pool when another run
 was stored: the other runs load, the ticket completes, and the failed run is recorded with

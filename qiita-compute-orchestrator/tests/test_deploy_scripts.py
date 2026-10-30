@@ -120,9 +120,17 @@ def _fake_native_checkout(tmp_path: Path) -> Path:
     return py
 
 
-# The data-plane topology variables. Removed from every topology test's environment
-# so the caller's shell cannot reach the helpers under test.
-_TOPOLOGY_VARS = ("QIITA_DATA_PLANE_PORTS", "QIITA_DATA_PLANE_PEERS", "QIITA_DATA_PLANE_BIND_HOST")
+# The data-plane.env keys the deploy reads. Removed from every topology test's
+# environment so the caller's shell cannot reach the helpers under test.
+_TOPOLOGY_VARS = (
+    "QIITA_DATA_PLANE_PORTS",
+    "QIITA_DATA_PLANE_PEERS",
+    "QIITA_DATA_PLANE_BIND_HOST",
+    "QIITA_DATA_PLANE_INSTANCE_MEMORY_MAX",
+    "QIITA_DATA_PLANE_LOCAL_INSTANCES",
+    "DUCKDB_MEMORY_LIMIT",
+    "DUCKLAKE_POOL_SIZE",
+)
 _ABSENT_DP_ENV = "/nonexistent/qiita/data-plane.env"
 
 
@@ -884,16 +892,403 @@ def test_activate_validates_data_plane_settings_before_installing_anything() -> 
         _first_command(src, re.escape("DP_BIND_HOST=$(qiita_data_plane_bind_host)")),
         _first_command(src, re.escape("DP_BUILD_COMMIT=$(qiita_data_plane_build_commit)")),
         _first_command(src, re.escape('qiita_assert_peer_private "$peer"')),
+        _first_command(src, re.escape("DP_MEMORY_MAX=$(qiita_data_plane_instance_memory_max)")),
+        _first_command(
+            src, re.escape('qiita_assert_instance_memory_fits "$DP_PORTS" "$DP_MEMORY_MAX"')
+        ),
+        _first_command(src, re.escape('qiita_assert_pool_memory_fits "$DP_MEMORY_MAX"')),
+        _first_command(src, re.escape("qiita_dp_env_omits_local_instances")),
     )
     for step in (
         r"rsync -a",
         r"install -m 0755",
         r"qiita_render_(?:and_test_)?nginx_conf ",
+        r"qiita_write_data_plane_dropins ",
         r"systemctl restart",
     ):
         assert resolved < _first_command(src, step), (
             f"data-plane settings must be checked before {step!r}"
         )
+
+
+# --- Per-instance limits ------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("4096", "4096"),
+        ("1K", "1024"),
+        ("3M", str(3 * 1024**2)),
+        ("16G", str(16 * 1024**3)),
+        ("2T", str(2 * 1024**4)),
+    ],
+)
+def test_size_bytes_reads_systemd_suffixes_as_powers_of_1024(value: str, expected: str) -> None:
+    result = _run_common('qiita_size_bytes "$1"', value)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == expected
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["", "0", "0G", "016G", "1.5G", "16g", "16GB", "16 G", "-1G", "infinity", "50%", "4194305T"],
+)
+def test_size_bytes_rejects_anything_but_a_positive_integer_and_suffix(value: str) -> None:
+    result = _run_common('qiita_size_bytes "$1"', value)
+    assert result.returncode != 0
+    assert result.stdout == ""
+
+
+def test_instance_memory_max_defaults_to_none() -> None:
+    result = _run_common("qiita_data_plane_instance_memory_max")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == ""
+
+
+def test_instance_memory_max_reads_the_host_file_only(tmp_path: Path) -> None:
+    """Like the topology keys, only the file counts: the units read the file, so a
+    value the deploy saw but the file lacks would check one limit and apply another."""
+    env_file = _dp_env(tmp_path, "QIITA_DATA_PLANE_INSTANCE_MEMORY_MAX=48G\n")
+    result = _run_common(
+        "qiita_data_plane_instance_memory_max",
+        dp_env=env_file,
+        extra_env={"QIITA_DATA_PLANE_INSTANCE_MEMORY_MAX": "1T"},
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "48G"
+
+    absent = _dp_env(tmp_path, "PATH_SCRATCH=/scratch\n")
+    result = _run_common(
+        "qiita_data_plane_instance_memory_max",
+        dp_env=absent,
+        extra_env={"QIITA_DATA_PLANE_INSTANCE_MEMORY_MAX": "1T"},
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == ""
+
+
+@pytest.mark.parametrize("value", ["", "48GB", "lots", "0"])
+def test_instance_memory_max_rejects_a_blank_or_malformed_value(tmp_path: Path, value: str) -> None:
+    env_file = _dp_env(tmp_path, f'QIITA_DATA_PLANE_INSTANCE_MEMORY_MAX="{value}"\n')
+    result = _run_common("qiita_data_plane_instance_memory_max", dp_env=env_file)
+    assert result.returncode != 0, result.stdout
+    assert result.stdout == ""
+    assert "QIITA_DATA_PLANE_INSTANCE_MEMORY_MAX" in result.stderr
+
+
+def test_host_file_may_not_set_the_local_instance_count(tmp_path: Path) -> None:
+    """The drop-in sets it with Environment=, which the shared file's
+    EnvironmentFile= would override."""
+    env_file = _dp_env(tmp_path, "QIITA_DATA_PLANE_LOCAL_INSTANCES=1\n")
+    result = _run_common("qiita_dp_env_omits_local_instances", dp_env=env_file)
+    assert result.returncode != 0
+    assert "QIITA_DATA_PLANE_LOCAL_INSTANCES" in result.stderr
+
+    clean = _dp_env(tmp_path, "PATH_SCRATCH=/scratch\n")
+    assert _run_common("qiita_dp_env_omits_local_instances", dp_env=clean).returncode == 0
+    assert _run_common("qiita_dp_env_omits_local_instances").returncode == 0
+
+
+def _meminfo(tmp_path: Path, mem_total_kib: int) -> Path:
+    path = tmp_path / "meminfo"
+    path.write_text(
+        f"MemTotal:       {mem_total_kib} kB\n"
+        "MemFree:         1000 kB\n"
+        f"MemAvailable:   {mem_total_kib // 2} kB\n"
+    )
+    return path
+
+
+@pytest.mark.parametrize(
+    ("ports", "value", "fits"),
+    [
+        ("50051 50052", "32G", True),  # exactly MemTotal
+        ("50051 50052", "33G", False),
+        ("50051 50052 50053", "22G", False),
+        ("50051", "64G", True),
+        ("50051", "65G", False),
+        ("50051", "4194303T", False),  # past MemTotal without overflowing
+    ],
+)
+def test_instance_memory_fits_compares_count_times_value_with_mem_total(
+    tmp_path: Path, ports: str, value: str, fits: bool
+) -> None:
+    meminfo = _meminfo(tmp_path, 64 * 1024 * 1024)  # 64 GiB
+    result = _run_common(
+        'qiita_assert_instance_memory_fits "$1" "$2" "$3"', ports, value, str(meminfo)
+    )
+    assert (result.returncode == 0) is fits, result.stderr
+    if not fits:
+        assert "MemTotal" in result.stderr
+
+
+def test_instance_memory_fits_has_nothing_to_check_when_unset(tmp_path: Path) -> None:
+    result = _run_common(
+        'qiita_assert_instance_memory_fits "$1" "" "$2"', "50051", str(tmp_path / "absent")
+    )
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize("body", [None, "MemFree: 1000 kB\n"])
+def test_instance_memory_fits_fails_without_mem_total(tmp_path: Path, body: str | None) -> None:
+    meminfo = tmp_path / "meminfo"
+    if body is not None:
+        meminfo.write_text(body)
+    result = _run_common(
+        'qiita_assert_instance_memory_fits "$1" "$2" "$3"', "50051", "1G", str(meminfo)
+    )
+    assert result.returncode != 0
+    assert "MemTotal" in result.stderr
+
+
+_CONFIG_RS = _REPO_ROOT / "qiita-data-plane" / "src" / "config.rs"
+
+
+def test_default_pool_size_matches_the_data_plane() -> None:
+    """The deploy's pool size when DUCKLAKE_POOL_SIZE is unset is the data plane's."""
+    match = re.search(
+        r"^pub\(crate\) const DEFAULT_POOL_SIZE: usize = (\d+);$",
+        _CONFIG_RS.read_text(),
+        re.MULTILINE,
+    )
+    assert match, f"DEFAULT_POOL_SIZE not found in {_CONFIG_RS}"
+    result = _run_common('printf %s "$QIITA_DATA_PLANE_DEFAULT_POOL_SIZE"')
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == match.group(1)
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        (None, "8"),
+        ("PATH_SCRATCH=/scratch\n", "8"),
+        ("DUCKLAKE_POOL_SIZE=\n", "8"),
+        ('DUCKLAKE_POOL_SIZE="  "\n', "8"),
+        ("DUCKLAKE_POOL_SIZE=3\n", "3"),
+        ('DUCKLAKE_POOL_SIZE=" 12 "\n', "12"),
+    ],
+)
+def test_pool_size_reads_the_host_file_else_the_default(
+    tmp_path: Path, body: str | None, expected: str
+) -> None:
+    env_file = _dp_env(tmp_path, body) if body is not None else None
+    result = _run_common(
+        "qiita_data_plane_pool_size",
+        dp_env=env_file,
+        extra_env={"DUCKLAKE_POOL_SIZE": "99"},
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == expected
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "eight", "1.5", "4 4"])
+def test_pool_size_rejects_anything_but_a_positive_integer(tmp_path: Path, value: str) -> None:
+    env_file = _dp_env(tmp_path, f'DUCKLAKE_POOL_SIZE="{value}"\n')
+    result = _run_common("qiita_data_plane_pool_size", dp_env=env_file)
+    assert result.returncode != 0, result.stdout
+    assert result.stdout == ""
+    assert "DUCKLAKE_POOL_SIZE" in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("3MiB", str(3 * 1024**2)),
+        ("4GiB", str(4 * 1024**3)),
+    ],
+)
+def test_duckdb_size_bytes_reads_mib_and_gib(value: str, expected: str) -> None:
+    result = _run_common('qiita_duckdb_size_bytes "$1"', value)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == expected
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "",
+        "4096",
+        "1GB",
+        "1gib",
+        "4 GiB",
+        "04GiB",
+        "0GiB",
+        "4294967297GiB",  # past 2^62 bytes
+    ],
+)
+def test_duckdb_size_bytes_rejects_other_spellings(value: str) -> None:
+    result = _run_common('qiita_duckdb_size_bytes "$1"', value)
+    assert result.returncode != 0
+    assert result.stdout == ""
+
+
+def _pool_memory_fits(env_file: Path | None, value: str) -> subprocess.CompletedProcess[str]:
+    return _run_common('qiita_assert_pool_memory_fits "$1"', value, dp_env=env_file)
+
+
+@pytest.mark.parametrize(
+    ("body", "fits"),
+    [
+        ("DUCKDB_MEMORY_LIMIT=1GiB\n", True),  # 8 × 1GiB is exactly 8G
+        ("DUCKDB_MEMORY_LIMIT=1025MiB\n", False),
+        ("DUCKDB_MEMORY_LIMIT=1024MiB\n", True),
+        ("DUCKDB_MEMORY_LIMIT=2GiB\nDUCKLAKE_POOL_SIZE=4\n", True),
+        ("DUCKDB_MEMORY_LIMIT=2GiB\nDUCKLAKE_POOL_SIZE=5\n", False),
+        ("DUCKDB_MEMORY_LIMIT=4294967296GiB\n", False),  # 2^62 bytes: past the limit, no overflow
+    ],
+)
+def test_pool_memory_fits_compares_pool_times_limit_with_memory_max(
+    tmp_path: Path, body: str, fits: bool
+) -> None:
+    result = _pool_memory_fits(_dp_env(tmp_path, body), "8G")
+    assert (result.returncode == 0) is fits, result.stderr
+    if not fits:
+        assert "Unset DUCKDB_MEMORY_LIMIT" in result.stderr
+        assert "QIITA_DATA_PLANE_INSTANCE_MEMORY_MAX=8G" in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("body", "value"),
+    [
+        ("DUCKDB_MEMORY_LIMIT=64GiB\n", ""),  # no MemoryMax
+        ("PATH_SCRATCH=/scratch\n", "8G"),  # no DUCKDB_MEMORY_LIMIT
+        ("DUCKDB_MEMORY_LIMIT=\n", "8G"),
+        ('DUCKDB_MEMORY_LIMIT="  "\n', "8G"),
+    ],
+)
+def test_pool_memory_fits_has_nothing_to_check_unless_both_are_set(
+    tmp_path: Path, body: str, value: str
+) -> None:
+    result = _pool_memory_fits(_dp_env(tmp_path, body), value)
+    assert result.returncode == 0, result.stderr
+
+
+def test_pool_memory_fits_reads_the_limit_from_the_host_file_only(tmp_path: Path) -> None:
+    """The units read the file, so a limit in the deploy's environment is not the one
+    the data plane gets."""
+    result = _run_common(
+        'qiita_assert_pool_memory_fits "$1"',
+        "8G",
+        dp_env=_dp_env(tmp_path, "PATH_SCRATCH=/scratch\n"),
+        extra_env={"DUCKDB_MEMORY_LIMIT": "64GiB"},
+    )
+    assert result.returncode == 0, result.stderr
+    no_file = _run_common(
+        'qiita_assert_pool_memory_fits "$1"', "8G", extra_env={"DUCKDB_MEMORY_LIMIT": "64GiB"}
+    )
+    assert no_file.returncode == 0, no_file.stderr
+
+
+@pytest.mark.parametrize("limit", ["4G", "1GB", "4096"])
+def test_pool_memory_fits_refuses_a_limit_it_cannot_compare(tmp_path: Path, limit: str) -> None:
+    result = _pool_memory_fits(_dp_env(tmp_path, f'DUCKDB_MEMORY_LIMIT="{limit}"\n'), "1T")
+    assert result.returncode != 0
+    assert f"DUCKDB_MEMORY_LIMIT '{limit}'" in result.stderr
+    assert "write DUCKDB_MEMORY_LIMIT in MiB or GiB, or unset it" in result.stderr
+
+
+def test_pool_memory_fits_refuses_an_invalid_pool_size(tmp_path: Path) -> None:
+    body = "DUCKDB_MEMORY_LIMIT=1GiB\nDUCKLAKE_POOL_SIZE=0\n"
+    result = _pool_memory_fits(_dp_env(tmp_path, body), "8G")
+    assert result.returncode != 0
+    assert "DUCKLAKE_POOL_SIZE" in result.stderr
+
+
+def _preflight_row(tmp_path: Path, body: str, row_name: str) -> str:
+    """The `row_name` row of a preflight run whose only env file is data-plane.env,
+    holding `body`."""
+    env = {k: v for k, v in os.environ.items() if k not in _TOPOLOGY_VARS}
+    env.update(
+        CP_ENV=str(tmp_path / "absent-cp.env"),
+        CO_ENV=str(tmp_path / "absent-co.env"),
+        DP_ENV=str(_dp_env(tmp_path, body)),
+    )
+    env.pop("SKIP_PREFLIGHT", None)
+    result = subprocess.run(
+        ["bash", str(_DEPLOY / "preflight.sh")], capture_output=True, text=True, env=env
+    )
+    rows = [line for line in result.stdout.splitlines() if f" {row_name}: " in line]
+    assert len(rows) == 1, result.stdout + result.stderr
+    return rows[0]
+
+
+def test_preflight_fails_the_memory_row_when_the_pool_exceeds_memory_max(tmp_path: Path) -> None:
+    body = "QIITA_DATA_PLANE_INSTANCE_MEMORY_MAX=1G\nDUCKDB_MEMORY_LIMIT=129MiB\n"
+    row = _preflight_row(tmp_path, body, "dp-memory-max")
+    assert row.lstrip().startswith("\u2717"), row
+    assert "Unset DUCKDB_MEMORY_LIMIT" in row
+
+
+def test_preflight_memory_row_accepts_a_pool_within_memory_max(tmp_path: Path) -> None:
+    """8 × 128MiB is exactly 1G. The row then reaches the MemTotal check, which reads
+    /proc/meminfo, so it passes only where the host has one."""
+    body = "QIITA_DATA_PLANE_INSTANCE_MEMORY_MAX=1G\nDUCKDB_MEMORY_LIMIT=128MiB\n"
+    row = _preflight_row(tmp_path, body, "dp-memory-max")
+    assert "DUCKDB_MEMORY_LIMIT" not in row
+    if Path("/proc/meminfo").is_file():
+        assert row.lstrip().startswith("\u2713"), row
+
+
+def _write_dropins(unitdir: Path, ports: str, value: str) -> subprocess.CompletedProcess[str]:
+    return _run_common('qiita_write_data_plane_dropins "$1" "$2" "$3"', ports, value, str(unitdir))
+
+
+def _dropin_name() -> str:
+    result = _run_common('printf %s "$QIITA_DATA_PLANE_DROPIN_NAME"')
+    assert result.returncode == 0 and result.stdout, result.stderr
+    return result.stdout
+
+
+def test_dropins_carry_the_instance_count_and_the_memory_max(tmp_path: Path) -> None:
+    result = _write_dropins(tmp_path, "50051 50052", "24G")
+    assert result.returncode == 0, result.stderr
+    for port in ("50051", "50052"):
+        conf = tmp_path / f"qiita-data-plane@{port}.service.d" / _dropin_name()
+        assert conf.read_text() == (
+            "[Service]\nEnvironment=QIITA_DATA_PLANE_LOCAL_INSTANCES=2\nMemoryMax=24G\n"
+        )
+
+
+def test_dropins_without_a_memory_max_set_only_the_count(tmp_path: Path) -> None:
+    """A host that sets nothing gets no MemoryMax= line, so its instances' limits
+    are what they were before the drop-in existed."""
+    result = _write_dropins(tmp_path, "50051", "")
+    assert result.returncode == 0, result.stderr
+    conf = tmp_path / "qiita-data-plane@50051.service.d" / _dropin_name()
+    assert conf.read_text() == "[Service]\nEnvironment=QIITA_DATA_PLANE_LOCAL_INSTANCES=1\n"
+
+
+def test_dropins_are_removed_from_instances_outside_the_list(tmp_path: Path) -> None:
+    """A port that left the list keeps neither the old count nor the old limit, and
+    another file in its drop-in directory is left alone."""
+    assert _write_dropins(tmp_path, "50051 50052 50053", "8G").returncode == 0
+    other = tmp_path / "qiita-data-plane@50053.service.d" / "operator.conf"
+    other.write_text("[Service]\n")
+
+    result = _write_dropins(tmp_path, "50051", "8G")
+
+    assert result.returncode == 0, result.stderr
+    assert (tmp_path / "qiita-data-plane@50051.service.d" / _dropin_name()).is_file()
+    assert not (tmp_path / "qiita-data-plane@50052.service.d").exists()
+    assert not (tmp_path / "qiita-data-plane@50053.service.d" / _dropin_name()).exists()
+    assert other.is_file()
+    assert (
+        "QIITA_DATA_PLANE_LOCAL_INSTANCES=1"
+        in (tmp_path / "qiita-data-plane@50051.service.d" / _dropin_name()).read_text()
+    )
+
+
+def test_activate_loads_the_dropins_before_restarting_the_instances() -> None:
+    """The data plane reads its limits only at boot, so the drop-ins have to be
+    written and loaded before the restart that applies them."""
+    src = (_DEPLOY / "activate.sh").read_text()
+    written = _first_command(
+        src, re.escape('qiita_write_data_plane_dropins "$DP_PORTS" "$DP_MEMORY_MAX"')
+    )
+    reload = src.index("systemctl daemon-reload", written)
+    restart = _first_command(src, re.escape('systemctl restart "${dp_units[@]}"'))
+    assert written < reload < restart
 
 
 def _call_peer_private(peer: str, stub_dir: str | None) -> subprocess.CompletedProcess[str]:
@@ -2310,6 +2705,15 @@ def test_idle_wait_keeps_the_catalog_password_off_psql_argv(tmp_path: Path) -> N
     assert pgpassfile, "psql ran without a PGPASSFILE"
 
 
+def test_idle_wait_counts_only_the_data_plane_roles_sessions(tmp_path: Path) -> None:
+    """With pg_read_all_stats the role sees the state of every role's sessions; the
+    count is limited to its own, so another role's open transaction on the catalog
+    does not hold the restart."""
+    _proc, calls = _run_idle_wait(tmp_path, [0])
+    argv, _pgpassfile = calls[0].split("|PGPASSFILE=")
+    assert "AND usename = current_user" in argv
+
+
 @pytest.mark.parametrize(("wait_s", "env_file"), [("0", True), ("60", False)])
 def test_idle_wait_skips_when_disabled_or_on_a_first_deploy(
     tmp_path: Path, wait_s: str, env_file: bool
@@ -2417,3 +2821,203 @@ def test_data_plane_unit_stop_timeout_covers_the_idle_wait() -> None:
     unit = (_DEPLOY / "systemd" / "qiita-data-plane@.service").read_text()
     assert re.search(r"(?m)^TimeoutStopSec=3900$", unit)
     assert "QIITA_DP_IDLE_WAIT_S:-3900}" in _COMMON.read_text()
+
+
+# --- catalog connection budget ---------------------------------------------------
+
+_DUCKLAKE_RS = _REPO_ROOT / "qiita-data-plane" / "src" / "ducklake.rs"
+
+
+def _budget(settings: str, rows: str) -> tuple[list[str], list[str]]:
+    """Run qiita_catalog_connection_budget on a settings row and backend rows, as
+    psql prints them. Returns the pass/fail rows and the detail lines under them."""
+    result = _run_common(
+        'n_pass=0 n_fail=0; qiita_catalog_connection_budget "$1" <<<"$2"; '
+        'echo "counts $n_pass $n_fail"',
+        settings,
+        rows,
+    )
+    assert result.returncode == 0, result.stderr
+    lines = result.stdout.splitlines()
+    assert lines[-1] in ("counts 1 0", "counts 0 1"), result.stdout
+    rows_out = [line for line in lines[:-1] if " catalog-connections: " in line]
+    assert len(rows_out) == 1, result.stdout
+    details = [line.strip() for line in lines[:-1] if line not in rows_out]
+    return rows_out, details
+
+
+def _passed(row: str) -> bool:
+    return row.lstrip().startswith("✓")
+
+
+def test_budget_counts_each_instance_once_at_its_pool_size() -> None:
+    """Two backends of one instance, under two roles, are one instance; a Unix-socket
+    session is `local`; an IPv6 address is bracketed; other clients count as they are."""
+    rows = "\n".join(
+        [
+            "10.0.0.5|3|dp|qiita-data-plane:50051:pool=8",
+            "10.0.0.5|1|dp_other|qiita-data-plane:50051:pool=8",
+            "10.0.0.5|1|dp|qiita-data-plane:50052:pool=8",
+            "10.0.0.6|2|dp|qiita-data-plane:50051:pool=6",
+            "local|1|dp|qiita-data-plane:50051:pool=4",
+            "::1|1|dp|qiita-data-plane:50053:pool=2",
+            "10.0.0.9|3|admin|psql",
+            "10.0.0.9|2|dp|",
+        ]
+    )
+    (row,), details = _budget("100|3|0|t|dp", rows)
+    assert _passed(row), row
+    assert "5 data-plane instance(s), pools 28 + 5 other client backend(s) = 33 of 97" in row
+    assert details == [
+        "10.0.0.5:50051 pool=8",
+        "10.0.0.5:50052 pool=8",
+        "10.0.0.6:50051 pool=6",
+        "local:50051 pool=4",
+        "[::1]:50053 pool=2",
+        "other: 10.0.0.9 user=admin application_name=psql x3",
+        "other: 10.0.0.9 user=dp application_name=(none) x2",
+    ]
+
+
+@pytest.mark.parametrize(("other", "passes"), [(5, True), (6, False)])
+def test_budget_fails_past_max_connections_less_the_reserved(other: int, passes: bool) -> None:
+    """20 − 3 superuser-reserved − 2 reserved leaves 15: pools 10 plus 5 others fit,
+    plus 6 do not."""
+    rows = f"10.0.0.5|1|dp|qiita-data-plane:50051:pool=10\n10.0.0.9|{other}|admin|psql"
+    (row,), _ = _budget("20|3|2|t|dp", rows)
+    assert _passed(row) is passes, row
+    assert f"= {10 + other} of 15 (max_connections 20" in row
+
+
+def test_budget_fails_without_pg_read_all_stats() -> None:
+    (row,), details = _budget(
+        "100|3|0|f|lake_rw", "10.0.0.5|1|lake_rw|qiita-data-plane:50051:pool=8"
+    )
+    assert not _passed(row), row
+    assert "GRANT pg_read_all_stats TO lake_rw;" in row
+    assert details == []
+
+
+def test_budget_fails_on_a_data_plane_session_without_a_client_address() -> None:
+    (row,), _ = _budget("100|3|0|t|lake_rw", "|1|lake_rw|qiita-data-plane:50051:pool=8")
+    assert not _passed(row), row
+    assert "grant pg_read_all_stats to role 'lake_rw'" in row
+
+
+@pytest.mark.parametrize(
+    "name", ["qiita-data-plane:50051", "qiita-data-plane:x:pool=8", "qiita-data-plane:50051:pool="]
+)
+def test_budget_fails_on_a_name_it_cannot_read(name: str) -> None:
+    (row,), _ = _budget("100|3|0|t|dp", f"10.0.0.5|1|dp|{name}")
+    assert not _passed(row), row
+    assert f"application_name '{name}'" in row
+
+
+def test_budget_fails_when_no_instance_is_connected() -> None:
+    (row,), details = _budget("100|3|0|t|dp", "10.0.0.9|2|admin|psql")
+    assert not _passed(row), row
+    assert "no catalog session is named" in row
+    assert details == ["other: 10.0.0.9 user=admin application_name=psql x2"]
+
+
+@pytest.mark.parametrize("settings", ["", "100|3||t|dp", "lots|3|0|t|dp"])
+def test_budget_fails_on_a_settings_row_it_cannot_read(settings: str) -> None:
+    (row,), _ = _budget(settings, "10.0.0.5|1|dp|qiita-data-plane:50051:pool=8")
+    assert not _passed(row), row
+    assert "unexpected settings row" in row
+
+
+def test_budget_reads_the_name_the_data_plane_writes() -> None:
+    """catalog_application_name's format, filled in, is a name the budget counts."""
+    match = re.search(
+        r"fn catalog_application_name\(port: u16, pool_size: usize\) -> String \{\s*"
+        r'format!\("([^"]+)"\)',
+        _DUCKLAKE_RS.read_text(),
+    )
+    assert match, f"catalog_application_name not found in {_DUCKLAKE_RS}"
+    name = match.group(1).replace("{port}", "50057").replace("{pool_size}", "13")
+    (row,), details = _budget("100|3|0|t|dp", f"10.0.0.5|1|dp|{name}")
+    assert _passed(row), row
+    assert details == ["10.0.0.5:50057 pool=13"]
+
+
+def _run_budget_check(
+    tmp_path: Path, *, fail_on: str = ""
+) -> tuple[subprocess.CompletedProcess[str], list[str]]:
+    """Run qiita_check_catalog_connection_budget with `psql` stubbed: it answers the
+    settings query and the backends query with one row each, records its argv and
+    PGPASSFILE, and exits 2 when its argv contains `fail_on`."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    calls = tmp_path / "psql-calls"
+    (bin_dir / "psql").write_text(
+        "#!/bin/sh\n"
+        'argv=$(printf %s "$*" | tr "\\n" " ")\n'
+        f'printf "%s|PGPASSFILE=%s\\n" "$argv" "$PGPASSFILE" >> "{calls}"\n'
+        f'if [ -n "{fail_on}" ]; then case "$argv" in *"{fail_on}"*)\n'
+        '  echo "psql: boom" >&2; exit 2 ;; esac; fi\n'
+        'case "$argv" in\n'
+        "  *max_connections*) echo '100|3|0|t|lake_rw' ;;\n"
+        "  *) echo '10.0.0.5|2|lake_rw|qiita-data-plane:50051:pool=8' ;;\n"
+        "esac\n"
+    )
+    (bin_dir / "psql").chmod(0o755)
+    env_path = tmp_path / "data-plane.env"
+    env_path.write_text(
+        "DUCKLAKE_CATALOG_CONNSTR='dbname=lake host=db user=lake_rw password=s3cr3t'\n"
+    )
+    proc = subprocess.run(
+        [
+            "bash",
+            "-c",
+            f'set -euo pipefail; source "{_COMMON}"; n_pass=0 n_fail=0; '
+            f'qiita_check_catalog_connection_budget "{env_path}"; echo "counts $n_pass $n_fail"',
+        ],
+        env={**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"},
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    lines = calls.read_text().splitlines() if calls.exists() else []
+    return proc, lines
+
+
+def test_budget_check_queries_the_catalog_with_the_password_off_argv(tmp_path: Path) -> None:
+    proc, calls = _run_budget_check(tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    assert "counts 1 0" in proc.stdout, proc.stdout
+    assert "10.0.0.5:50051 pool=8" in proc.stdout
+    assert len(calls) == 2
+    for call in calls:
+        argv, pgpassfile = call.split("|PGPASSFILE=")
+        assert "s3cr3t" not in argv
+        assert "user=lake_rw" in argv
+        assert pgpassfile, "psql ran without a PGPASSFILE"
+
+
+@pytest.mark.parametrize("fail_on", ["max_connections", "pg_stat_activity"])
+def test_budget_check_fails_the_row_when_a_query_fails(tmp_path: Path, fail_on: str) -> None:
+    proc, _calls = _run_budget_check(tmp_path, fail_on=fail_on)
+    assert proc.returncode == 0, proc.stderr
+    assert "counts 0 1" in proc.stdout, proc.stdout
+    assert "cannot query the catalog server: psql: boom" in proc.stdout
+
+
+def test_verify_runs_the_budget_against_the_data_plane_env() -> None:
+    verify = (_DEPLOY / "verify.sh").read_text()
+    assert re.search(r'(?m)^    qiita_check_catalog_connection_budget "\$DP_ENV"$', verify)
+
+
+@pytest.mark.parametrize(
+    "connstr",
+    [
+        "dbname=lake host=db application_name=mine",
+        "dbname=lake host=db application_name = mine",
+    ],
+)
+def test_preflight_refuses_a_catalog_connstr_that_names_the_session(
+    tmp_path: Path, connstr: str
+) -> None:
+    row = _preflight_row(tmp_path, f"DUCKLAKE_CATALOG_CONNSTR='{connstr}'\n", "connstr/ducklake")
+    assert not _passed(row), row
+    assert "sets application_name" in row

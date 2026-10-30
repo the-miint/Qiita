@@ -14,6 +14,7 @@ from urllib.parse import parse_qs, urlparse
 
 import pytest
 from qiita_common.api_paths import LOOPBACK_HOST
+from qiita_common.testing.loopback import serve_on_loopback
 
 from qiita_control_plane.ena_submission import catalog as catalog_module
 from qiita_control_plane.ena_submission.catalog import (
@@ -24,7 +25,6 @@ from qiita_control_plane.ena_submission.catalog import (
     EnaObjectKind,
     EnaSubmissionCatalog,
 )
-from qiita_control_plane.testing.loopback import serve_on_loopback
 
 from .conftest import (
     _CHECKLIST,

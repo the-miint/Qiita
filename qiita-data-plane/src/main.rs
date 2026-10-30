@@ -33,17 +33,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // the number in flight. Logged after it opens, so the line is a statement
     // that these settings applied rather than that they were intended.
     let pool_log = format!(
-        "qiita-data-plane pool: {} connections x {} threads, memory_limit {} \
-         (from a {:.1} GiB ceiling read via {}, CPU budget {}), \
-         spill under {} capped at {}; {} concurrent uploads",
+        "qiita-data-plane pool: {} connections x {} threads ({}), memory_limit {} \
+         (from a {:.1} GiB ceiling read via {}), \
+         spill under {} capped at {} ({}); {} concurrent uploads",
         cfg.pool.size,
         cfg.pool.threads,
+        cfg.threads_source.describe(cfg.pool.size),
         cfg.pool.memory_limit,
         cfg.memory_ceiling.bytes as f64 / (1024.0 * 1024.0 * 1024.0),
         cfg.memory_ceiling.source.as_str(),
-        cfg.thread_budget,
         cfg.pool.temp_directory.display(),
         cfg.pool.max_temp_directory_size,
+        cfg.spill_cap_source.describe(cfg.pool.size),
         cfg.max_concurrent_doput,
     );
     let lake_pool = pool::LakePool::open(
@@ -262,7 +263,10 @@ mod tests {
                 .decode(&pubkey)
                 .unwrap()
         );
-        assert_eq!(cfg.ducklake_catalog_connstr, "dbname=test host=localhost");
+        assert_eq!(
+            cfg.ducklake_catalog_connstr,
+            "dbname=test host=localhost application_name=qiita-data-plane:50051:pool=8"
+        );
         // Leaf paths are derived from the base roots with fixed suffixes.
         assert_eq!(
             cfg.path_scratch_staging,
@@ -308,6 +312,7 @@ mod tests {
         "DUCKDB_TEMP_DIRECTORY",
         "DUCKDB_MAX_TEMP_DIRECTORY_SIZE",
         "FLIGHT_MAX_CONCURRENT_DOPUT",
+        "QIITA_DATA_PLANE_LOCAL_INSTANCES",
     ];
 
     /// A memory limit for the tests that are not about deriving one, so they do
@@ -363,9 +368,16 @@ mod tests {
             "the default in-flight bound"
         );
         assert!(cfg.pool.threads >= 1, "a request always gets a thread");
+        let super::config::ThreadsSource::Derived { budget, instances } = cfg.threads_source else {
+            panic!(
+                "threads derived with DUCKDB_THREADS unset: {:?}",
+                cfg.threads_source
+            );
+        };
+        assert_eq!(instances, 1);
         assert_eq!(
             cfg.pool.threads,
-            std::cmp::max(1, (cfg.thread_budget / cfg.pool.size) as u32),
+            super::config::derived_threads(budget, 1, cfg.pool.size),
             "threads is the CPU budget divided by the bound"
         );
         assert!(
@@ -396,6 +408,8 @@ mod tests {
         let spill = tmp_abs("qiita-test-spill");
         std::env::set_var("DUCKLAKE_POOL_SIZE", "3");
         std::env::set_var("DUCKDB_THREADS", "5");
+        // An explicit DUCKDB_THREADS is not divided by the instance count.
+        std::env::set_var("QIITA_DATA_PLANE_LOCAL_INSTANCES", "4");
         std::env::set_var("DUCKDB_MEMORY_LIMIT", "7GiB");
         std::env::set_var("DUCKDB_TEMP_DIRECTORY", &spill);
         std::env::set_var("DUCKDB_MAX_TEMP_DIRECTORY_SIZE", "11GiB");
@@ -405,10 +419,63 @@ mod tests {
 
         assert_eq!(cfg.pool.size, 3);
         assert_eq!(cfg.pool.threads, 5);
+        assert_eq!(cfg.threads_source, super::config::ThreadsSource::Configured);
         assert_eq!(cfg.pool.memory_limit, "7GiB");
         assert_eq!(cfg.pool.temp_directory, std::path::PathBuf::from(spill));
         assert_eq!(cfg.pool.max_temp_directory_size, "11GiB");
         assert_eq!(cfg.max_concurrent_doput, 2);
+    }
+
+    /// The derivation's branches are config.rs's unit tests; this pins that
+    /// `from_env` takes the derived branch for an explicit spill directory with no
+    /// cap, and reads the instance count.
+    #[test]
+    #[serial]
+    fn an_explicit_spill_directory_without_a_cap_derives_one() {
+        let _env = pool_test_env();
+        std::env::set_var("DUCKDB_MEMORY_LIMIT", TEST_MEMORY_LIMIT);
+        std::env::set_var("DUCKDB_TEMP_DIRECTORY", tmp_abs("qiita-test-spill-derived"));
+        std::env::set_var("DUCKLAKE_POOL_SIZE", "1");
+        std::env::set_var("QIITA_DATA_PLANE_LOCAL_INSTANCES", "3");
+
+        let cfg = Settings::from_env().expect("from_env deriving the spill cap");
+
+        assert!(
+            matches!(
+                cfg.spill_cap_source,
+                super::config::SpillCapSource::Derived { instances: 3, .. }
+            ),
+            "{:?}",
+            cfg.spill_cap_source
+        );
+        assert!(cfg.pool.max_temp_directory_size.ends_with("MiB"));
+        let super::config::ThreadsSource::Derived { budget, instances } = cfg.threads_source else {
+            panic!(
+                "threads derived with DUCKDB_THREADS unset: {:?}",
+                cfg.threads_source
+            );
+        };
+        assert_eq!(instances, 3);
+        assert_eq!(
+            cfg.pool.threads,
+            super::config::derived_threads(budget, 3, 1),
+            "threads are divided by the instance count too"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn config_rejects_a_local_instance_count_that_is_not_positive() {
+        let _env = pool_test_env();
+        std::env::set_var("DUCKDB_MEMORY_LIMIT", TEST_MEMORY_LIMIT);
+        for bad in ["0", "two", "-1"] {
+            std::env::set_var("QIITA_DATA_PLANE_LOCAL_INSTANCES", bad);
+            let err = Settings::from_env().unwrap_err();
+            assert!(
+                err.contains("QIITA_DATA_PLANE_LOCAL_INSTANCES"),
+                "unexpected error for {bad:?}: {err}"
+            );
+        }
     }
 
     #[test]
