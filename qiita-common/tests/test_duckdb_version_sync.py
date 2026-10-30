@@ -247,14 +247,18 @@ def test_ducklake_catalog_version_is_the_same_everywhere() -> None:
 
 def test_every_ducklake_attach_names_the_catalog_version() -> None:
     """An ATTACH that leaves DUCKLAKE_VERSION out creates a catalog at the extension's
-    default format, which on DuckDB 2.0 is 1.1, not the 1.0 production runs."""
+    default format, which on DuckDB 2.0 is 1.1, not the 1.0 production runs. DuckDB reads
+    the keywords in any case, with either quote, and with `DATABASE` or `IF NOT EXISTS`
+    between them and the path, so the search does too."""
     hits = subprocess.run(
         [
             "git",
             "grep",
             "-n",
-            "-F",
-            "ATTACH 'ducklake:",
+            "-i",
+            "-E",
+            "attach([[:space:]]+database)?([[:space:]]+if[[:space:]]+not[[:space:]]+exists)?"
+            "[[:space:]]+['\"]ducklake:",
             "--",
             "*.rs",
             "*.py",
@@ -274,7 +278,7 @@ def test_every_ducklake_attach_names_the_catalog_version() -> None:
         lines = (REPO_ROOT / path).read_text().splitlines()
         start = int(line) - 1
         statement = "\n".join(lines[start : start + _ATTACH_STATEMENT_LINES])
-        if "DUCKLAKE_VERSION" not in statement:
+        if "DUCKLAKE_VERSION" not in statement.upper():
             missing.append(f"{path}:{line}")
     assert not missing, f"DuckLake ATTACH without DUCKLAKE_VERSION at {missing}"
 
