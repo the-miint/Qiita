@@ -361,7 +361,14 @@ def resolve_duckdb_memory_gb(
 
 
 # ENA's file server drops connections in bursts that outlast DuckDB's default of 3
-# retries. These allow 8 retries over about a minute per request. Applied as session SETs
+# retries. These allow 8 retries per request. DuckDB 2.0 draws each wait at random from
+# [0, 500 ms × 2^(retry - 1)], capped at 20 s, so 8 retries take up to about 70 s, about
+# 35 s on average (38-46 s measured). It also charges every retry against one host to a
+# quota per database that no setting changes (`HTTPRetryQuota`, DuckDB's
+# main/http/http_retry_budget.hpp): about 50 retries of a dropped connection, a token back
+# for each request that succeeds, and full again after a minute without a request.
+# `open_miint_conn` opens a new database, so each ENA run has a quota of its own.
+# Applied as session SETs
 # after httpfs is loaded, not in the connect config: a connect-time httpfs setting makes
 # connect() autoinstall httpfs, and a GLOBAL value would nest under the 3-try retry loop of
 # miint's Portal ENAClient. FASTQ downloads run through the connection's own filesystem and
