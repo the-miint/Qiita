@@ -11,13 +11,13 @@ places and they have opposite requirements:
   systemd). LOAD-only from the deploy-staged `MIINT_EXTENSION_DIRECTORY`,
   exactly like the cluster paths (CO service, native jobs, the probe).
 
-The distinction is load-bearing, not stylistic. `INSTALL` resolves DuckDB's
-extension directory, which defaults to `$HOME/.duckdb/extensions` when
-`MIINT_EXTENSION_DIRECTORY` is unset — and the service accounts have no usable
-`$HOME` (`qiita-api` / `qiita-orch` are `/dev/null`), so a service-side INSTALL
-dies with `IO Error: Can't find the home directory at '/dev/null'`. Service-side
-code must therefore never reach the INSTALL path. Note this is a property of
-where the code RUNS, not of which CLI it belongs to: `qiita-admin` subcommands
+`INSTALL` resolves DuckDB's extension directory, which defaults to
+`$HOME/.duckdb/extensions` when `MIINT_EXTENSION_DIRECTORY` is unset — and the
+service accounts have no usable `$HOME` (`qiita-api` / `qiita-orch` are
+`/dev/null`), so a service-side INSTALL dies with `IO Error: Can't find the home
+directory at '/dev/null'`. Service-side code must therefore never reach the
+INSTALL path. This is a property of where the code RUNS, not of which CLI it
+belongs to: `qiita-admin` subcommands
 are run as `qiita-api` on the deploy host (see `deploy/verify.sh`), so an
 admin-CLI path that INSTALLs is only safe while it stays off the service
 accounts. This mirrors the reasoning
