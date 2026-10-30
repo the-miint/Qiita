@@ -362,6 +362,19 @@ def resolve_duckdb_memory_gb(
     return max(1, resolved)
 
 
+# ENA's file server drops connections in bursts that outlast DuckDB's default of 3
+# retries. These allow 8 retries over about a minute per request. Applied as session SETs
+# after httpfs is loaded, not in the connect config: a connect-time httpfs setting makes
+# connect() autoinstall httpfs, and a GLOBAL value would nest under the 3-try retry loop of
+# miint's Portal ENAClient. FASTQ downloads run through the connection's own filesystem and
+# take the session values.
+MIINT_HTTP_RETRY_SETTINGS: dict[str, str] = {
+    "http_retries": "8",
+    "http_retry_wait_ms": "500",
+    "http_retry_backoff": "2",
+}
+
+
 def open_conn() -> duckdb.DuckDBPyConnection:
     """Open an in-memory DuckDB connection with the miint-load config: unsigned
     extensions are always allowed (miint installs from a mirror, not a
@@ -373,7 +386,8 @@ def open_conn() -> duckdb.DuckDBPyConnection:
 
 
 def open_miint_conn() -> duckdb.DuckDBPyConnection:
-    """Open a fresh DuckDB connection with the miint extension LOADed.
+    """Open a fresh DuckDB connection with the miint extension LOADed and
+    `MIINT_HTTP_RETRY_SETTINGS` applied.
 
     LOAD-only: miint is pre-staged into MIINT_EXTENSION_DIRECTORY at deploy, so
     this never installs, downloads, or touches the mirror. If the extension is
@@ -393,6 +407,8 @@ def open_miint_conn() -> duckdb.DuckDBPyConnection:
     requiring it here would break that path for every native job."""
     conn = open_conn()
     conn.execute(miint_load_sql())
+    for name, value in MIINT_HTTP_RETRY_SETTINGS.items():
+        conn.execute(f"SET {name}={value}")
     return conn
 
 
