@@ -123,6 +123,14 @@ fn setup_catalog_once(
     // set_catalog_options).
     set_catalog_options(&conn)?;
     ensure_lake_tables(&conn)?;
+    // DuckLake reads a table's inlined rows without pushing a filter down, so the
+    // ledger lookup `register_files` makes on every call costs in proportion to
+    // the rows still inlined: 25 ms at 100,000, against 5 ms once the same rows
+    // were flushed to Parquet (DuckDB 2.0.0, ducklake 417a9117). Flushing here
+    // bounds it by the registrations made since the last start.
+    conn.execute_batch(
+        "CALL ducklake_flush_inlined_data('qiita_lake', table_name => 'registered_file');",
+    )?;
     Ok(())
 }
 
@@ -962,6 +970,37 @@ pub fn ensure_registration_lock(conn: &Connection) -> Result<(), Box<dyn std::er
     Ok(())
 }
 
+/// The most rows one INSERT into `registered_file` keeps inline in the catalog
+/// rather than writing to a Parquet file of its own. DuckLake applies
+/// `data_inlining_row_limit` per statement, with a default of 10. `register_files`
+/// records a registration in one INSERT of a row per file, so the limit sits
+/// above the most files a registration carries: the largest are a load's
+/// gigabyte-scale parts (`_feature_load.bin_pack_by_chunks`,
+/// `bam_to_parquet._ROWS_PER_PART_TARGET_BYTES`), and 10,000 of those is
+/// terabytes. A registration past it is still recorded, in a small file.
+const REGISTERED_FILE_INLINING_ROW_LIMIT: u32 = 10_000;
+
+/// Create the ledger of completed registrations: a row per file
+/// `register_files` registered, written in the same transaction and never
+/// deleted. What reads it, and why it is a lake table, is at its replay check
+/// (`flight_service::registration::register_files`). Its rows stay inline in the
+/// catalog until `setup_catalog_once` flushes them.
+pub fn ensure_registered_file_table(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
+    conn.execute_batch(&format!(
+        "CREATE TABLE IF NOT EXISTS qiita_lake.registered_file (
+            -- The lake path, as `ducklake_add_data_files` was given it.
+            data_file VARCHAR NOT NULL,
+            lake_table VARCHAR NOT NULL,
+            work_ticket_idx BIGINT NOT NULL,
+            -- When the registration's transaction began.
+            registered_at TIMESTAMPTZ NOT NULL
+        );
+        CALL qiita_lake.set_option('data_inlining_row_limit', \
+         {REGISTERED_FILE_INLINING_ROW_LIMIT}, table_name => 'registered_file');"
+    ))?;
+    Ok(())
+}
+
 /// Create every lake table the data plane relies on. This is the one list of
 /// them: a caller that needs a catalog shaped like a deploy's calls this rather
 /// than combining the `ensure_*` functions itself.
@@ -973,6 +1012,7 @@ pub fn ensure_lake_tables(conn: &Connection) -> Result<(), Box<dyn std::error::E
     ensure_amplicon_tables(conn)?;
     // The lock row is seeded here so no request path has to create it.
     ensure_registration_lock(conn)?;
+    ensure_registered_file_table(conn)?;
     // Must run after reference + alignment tables — the `_visible` views join them.
     ensure_exclusion_tables(conn)?;
     Ok(())
@@ -1775,6 +1815,120 @@ mod tests {
             .unwrap();
         let n: i64 = stmt.query_row([], |row| row.get(0)).unwrap();
         assert_eq!(n, 1, "amplicon_membership table should exist exactly once");
+    }
+
+    /// The live rows of `qiita_lake.{table}` held inline in the catalog's Postgres,
+    /// read from DuckLake's own catalog tables.
+    #[cfg(feature = "integration")]
+    fn inlined_rows(table: &str) -> i64 {
+        let pg = Connection::open_in_memory().unwrap();
+        pg.execute_batch(&format!(
+            "LOAD postgres; ATTACH '{}' AS catalog_pg (TYPE postgres, READ_ONLY);",
+            crate::test_catalog::connstr()
+        ))
+        .unwrap();
+        let names: Vec<String> = pg
+            .prepare(&format!(
+                "SELECT table_name FROM postgres_query('catalog_pg', \
+                 'SELECT i.table_name FROM ducklake_inlined_data_tables i \
+                  JOIN ducklake_table t USING (table_id) \
+                  WHERE t.table_name = ''{table}'' AND t.end_snapshot IS NULL')"
+            ))
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        names
+            .iter()
+            .map(|name| {
+                pg.query_row(
+                    &format!(
+                        "SELECT n FROM postgres_query('catalog_pg', \
+                         'SELECT count(*) AS n FROM {name} WHERE end_snapshot IS NULL')"
+                    ),
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )
+                .unwrap()
+            })
+            .sum()
+    }
+
+    /// The ledger's columns are the ones `register_files` writes and looks up by,
+    /// and a registration's rows are kept inline (`REGISTERED_FILE_INLINING_ROW_LIMIT`).
+    #[test]
+    #[serial]
+    #[cfg(feature = "integration")]
+    fn ensure_registered_file_table_is_idempotent_and_keeps_a_registration_inline() {
+        let conn = setup_conn();
+        ensure_registered_file_table(&conn).expect("first ensure_registered_file_table");
+        ensure_registered_file_table(&conn).expect("second (idempotent)");
+
+        let expected: Vec<(String, String, String)> = [
+            ("data_file", "VARCHAR"),
+            ("lake_table", "VARCHAR"),
+            ("work_ticket_idx", "BIGINT"),
+            ("registered_at", "TIMESTAMP WITH TIME ZONE"),
+        ]
+        .iter()
+        .map(|(name, ty)| (name.to_string(), ty.to_string(), "NO".to_string()))
+        .collect();
+        assert_eq!(table_schema(&conn, "registered_file"), expected);
+
+        let limit: String = conn
+            .query_row(
+                "SELECT value FROM qiita_lake.options() \
+                 WHERE option_name = 'data_inlining_row_limit' AND scope = 'TABLE' \
+                   AND scope_entry = 'main.registered_file'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("registered_file has no inlining limit of its own");
+        assert_eq!(limit, REGISTERED_FILE_INLINING_ROW_LIMIT.to_string());
+    }
+
+    /// A boot leaves no ledger rows inline: `setup_catalog_once` flushes them, so
+    /// the lookup cost it bounds starts again from nothing.
+    #[test]
+    #[serial]
+    #[cfg(feature = "integration")]
+    fn setup_catalog_flushes_the_inlined_ledger() {
+        let conn = setup_conn();
+        ensure_registered_file_table(&conn).unwrap();
+        let ticket = next_test_id();
+        let _cleanup = Cleanup {
+            conn: &conn,
+            table: "registered_file",
+            column: "work_ticket_idx",
+            id: ticket,
+        };
+        conn.execute(
+            "INSERT INTO qiita_lake.registered_file \
+             SELECT 'flush-' || range, 'read', ?, now() FROM range(3)",
+            [ticket],
+        )
+        .unwrap();
+        assert!(
+            inlined_rows("registered_file") >= 3,
+            "the rows were not inlined, so the flush below has nothing to show"
+        );
+
+        setup_catalog(
+            &crate::test_catalog::connstr(),
+            &crate::test_catalog::data_path(),
+        )
+        .expect("setup_catalog");
+
+        assert_eq!(inlined_rows("registered_file"), 0);
+        let kept: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM qiita_lake.registered_file WHERE work_ticket_idx = ?",
+                [ticket],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(kept, 3, "the flush lost ledger rows");
     }
 
     #[test]

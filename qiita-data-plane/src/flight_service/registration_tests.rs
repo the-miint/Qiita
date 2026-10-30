@@ -563,6 +563,7 @@ fn register_files_moves_and_registers_end_to_end() {
         ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
         ducklake::ensure_reference_tables(&conn).unwrap();
         ducklake::ensure_registration_lock(&conn).unwrap();
+        ducklake::ensure_registered_file_table(&conn).unwrap();
         conn.execute_batch(&format!(
             "DELETE FROM qiita_lake.reference_membership WHERE reference_idx = {ref_idx};"
         ))
@@ -626,6 +627,14 @@ fn register_files_moves_and_registers_end_to_end() {
     assert!(
         !src.exists(),
         "staging source was moved out, not left behind"
+    );
+    assert_eq!(
+        ledger_rows(&connstr, &data_path, ticket),
+        vec![(
+            outcome.registered[0].clone(),
+            "reference_membership".to_string()
+        )],
+        "the registration is not in the ledger a replay reads"
     );
 
     // The rows are queryable through the catalog via a fresh connection.
@@ -708,6 +717,7 @@ fn prepare_membership_table(connstr: &str, data_path: &str, ref_idx: i64) {
     ducklake::connect_ducklake(&conn, connstr, data_path).unwrap();
     ducklake::ensure_reference_tables(&conn).unwrap();
     ducklake::ensure_registration_lock(&conn).unwrap();
+    ducklake::ensure_registered_file_table(&conn).unwrap();
     conn.execute_batch(&format!(
         "DELETE FROM qiita_lake.reference_membership WHERE reference_idx = {ref_idx};"
     ))
@@ -788,9 +798,9 @@ fn register_files_replayed_before_the_earlier_call_committed_fails_closed() {
 }
 
 /// A replay that lands after the earlier registration's rows were deleted
-/// registers nothing. With some rows left, DuckLake still lists the file, and
-/// the replay returns the earlier registration. With every row gone, DuckLake
-/// has dropped the file from the table, so the replay fails closed.
+/// returns that registration and registers nothing, with some rows left or none.
+/// With none left DuckLake has dropped the file from its table, so only the
+/// registration ledger says the earlier call committed.
 #[test]
 #[serial_test::serial]
 #[cfg(feature = "integration")]
@@ -823,17 +833,184 @@ fn register_files_replayed_after_its_rows_were_deleted_registers_nothing() {
             &data_path,
             std::path::Path::new("/"),
             &payload,
-        );
+        )
+        .expect("replayed register_files failed");
 
-        if rows_left == 0 {
-            let err = replay.expect_err("a replay of an emptied file's registration succeeded");
-            assert_eq!(err.code(), tonic::Code::FailedPrecondition, "{err}");
-        } else {
-            let replay = replay.expect("replayed register_files failed");
-            assert_eq!(replay.registered, first.registered);
-        }
+        assert_eq!(replay.registered, first.registered);
+        assert!(replay.replaced.is_empty());
         assert_eq!(membership_rows(&connstr, &data_path, ref_idx), rows_left);
     }
+}
+
+/// The `(data_file, lake_table)` rows the registration ledger holds for `ticket`.
+#[cfg(feature = "integration")]
+fn ledger_rows(connstr: &str, data_path: &str, ticket: i64) -> Vec<(String, String)> {
+    let reader = Connection::open_in_memory().unwrap();
+    ducklake::connect_ducklake(&reader, connstr, data_path).unwrap();
+    let mut stmt = reader
+        .prepare(
+            "SELECT data_file, lake_table FROM qiita_lake.registered_file \
+             WHERE work_ticket_idx = ? ORDER BY data_file",
+        )
+        .unwrap();
+    stmt.query_map([ticket], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect()
+}
+
+/// A replay that lands after lake GC removed the earlier registration's emptied
+/// file returns that registration and registers nothing, with its staging file
+/// gone or, where removing it failed, still there. Nothing is left at the
+/// destination or in the catalog to show the earlier call committed. The test
+/// removes the file itself, as `ducklake_cleanup_old_files` would once a DELETE
+/// emptied it and DuckLake dropped it from its table.
+#[test]
+#[serial_test::serial]
+#[cfg(feature = "integration")]
+fn register_files_replayed_after_lake_gc_removed_its_files_registers_nothing() {
+    let connstr = crate::test_catalog::connstr();
+    let data_path = crate::test_catalog::data_path();
+    for (ref_idx, staging_kept) in [(985_000_i64, false), (986_000_i64, true)] {
+        let ticket: i64 = ref_idx * 1000 + std::process::id() as i64;
+        prepare_membership_table(&connstr, &data_path, ref_idx);
+        let (staging, payload) = seed_membership_registration(ref_idx, ticket);
+        let staged = staging.path().join("reference_membership.parquet");
+        let staged_bytes = std::fs::read(&staged).unwrap();
+        let first = register_files(
+            &attached_writer(&connstr, &data_path),
+            &data_path,
+            std::path::Path::new("/"),
+            &payload,
+        )
+        .expect("first register_files failed");
+        let conn = Connection::open_in_memory().unwrap();
+        ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
+        conn.execute_batch(&format!(
+            "DELETE FROM qiita_lake.reference_membership WHERE reference_idx = {ref_idx};"
+        ))
+        .unwrap();
+        let lake_file = std::path::Path::new(&first.registered[0]);
+        std::fs::remove_file(lake_file).unwrap();
+        if staging_kept {
+            std::fs::write(&staged, &staged_bytes).unwrap();
+        }
+
+        let replay = register_files(
+            &attached_writer(&connstr, &data_path),
+            &data_path,
+            std::path::Path::new("/"),
+            &payload,
+        )
+        .expect("replayed register_files failed");
+
+        assert_eq!(replay.registered, first.registered);
+        assert!(replay.replaced.is_empty());
+        assert_eq!(membership_rows(&connstr, &data_path, ref_idx), 0);
+        assert!(!lake_file.exists(), "the replay moved a file into the lake");
+        assert_eq!(staged.exists(), staging_kept);
+    }
+}
+
+/// A replay of a registration made before the ledger recorded registrations is
+/// still recognised, from the catalog, while its files are there. The ledger
+/// rows are deleted here to stand in for one made before it existed.
+#[test]
+#[serial_test::serial]
+#[cfg(feature = "integration")]
+fn register_files_replayed_after_a_registration_the_ledger_never_recorded_registers_nothing() {
+    let connstr = crate::test_catalog::connstr();
+    let data_path = crate::test_catalog::data_path();
+    let ref_idx: i64 = 987_000;
+    let ticket: i64 = 987_000_000 + std::process::id() as i64;
+    prepare_membership_table(&connstr, &data_path, ref_idx);
+    let (_staging, payload) = seed_membership_registration(ref_idx, ticket);
+    let first = register_files(
+        &attached_writer(&connstr, &data_path),
+        &data_path,
+        std::path::Path::new("/"),
+        &payload,
+    )
+    .expect("first register_files failed");
+    let conn = Connection::open_in_memory().unwrap();
+    ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
+    conn.execute(
+        "DELETE FROM qiita_lake.registered_file WHERE work_ticket_idx = ?",
+        [ticket],
+    )
+    .unwrap();
+
+    let replay = register_files(
+        &attached_writer(&connstr, &data_path),
+        &data_path,
+        std::path::Path::new("/"),
+        &payload,
+    )
+    .expect("replayed register_files failed");
+
+    assert_eq!(replay.registered, first.registered);
+    assert_eq!(membership_rows(&connstr, &data_path, ref_idx), 2);
+    assert!(
+        ledger_rows(&connstr, &data_path, ticket).is_empty(),
+        "a replay wrote to the ledger"
+    );
+}
+
+/// A ledger recording only some of a payload's files fails the call closed and
+/// leaves the files as they are: one transaction records all of a registration's
+/// files, so this payload is not the one that wrote them.
+#[test]
+#[serial_test::serial]
+#[cfg(feature = "integration")]
+fn register_files_with_part_of_its_payload_in_the_ledger_fails_closed() {
+    let connstr = crate::test_catalog::connstr();
+    let data_path = crate::test_catalog::data_path();
+    let ref_idx: i64 = 988_000;
+    let ticket: i64 = 988_000_000 + std::process::id() as i64;
+    prepare_membership_table(&connstr, &data_path, ref_idx);
+    let (staging, mut payload) = seed_membership_registration(ref_idx, ticket);
+    std::fs::copy(
+        staging.path().join("reference_membership.parquet"),
+        staging.path().join("second.parquet"),
+    )
+    .unwrap();
+    payload.files.insert(
+        "second.parquet".to_string(),
+        "reference_membership".to_string(),
+    );
+    let first = register_files(
+        &attached_writer(&connstr, &data_path),
+        &data_path,
+        std::path::Path::new("/"),
+        &payload,
+    )
+    .expect("first register_files failed");
+    let conn = Connection::open_in_memory().unwrap();
+    ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
+    conn.execute(
+        "DELETE FROM qiita_lake.registered_file WHERE data_file = ?",
+        [&first.registered[0]],
+    )
+    .unwrap();
+
+    let err = register_files(
+        &attached_writer(&connstr, &data_path),
+        &data_path,
+        std::path::Path::new("/"),
+        &payload,
+    )
+    .expect_err("a replay with part of its payload in the ledger succeeded");
+
+    assert_eq!(err.code(), tonic::Code::Internal, "{}", err.message());
+    assert!(
+        err.message().contains(&first.registered[1]),
+        "{}",
+        err.message()
+    );
+    for file in &first.registered {
+        assert!(std::path::Path::new(file).exists(), "{file} was moved");
+    }
+    assert_eq!(membership_rows(&connstr, &data_path, ref_idx), 4);
 }
 
 /// A registration that fails after its moves — here `ducklake_add_data_files`
@@ -874,6 +1051,10 @@ fn register_files_that_fails_after_its_moves_returns_the_files_to_staging() {
     );
     assert!(good.exists(), "the staged file was not returned");
     assert_eq!(membership_rows(&connstr, &data_path, ref_idx), 0);
+    assert!(
+        ledger_rows(&connstr, &data_path, ref_idx).is_empty(),
+        "a failed registration is in the ledger"
+    );
 
     // The same payload, with the file fixed in staging, registers.
     std::fs::write(&good, good_bytes).unwrap();
@@ -885,6 +1066,7 @@ fn register_files_that_fails_after_its_moves_returns_the_files_to_staging() {
     )
     .expect("the retried registration failed");
     assert_eq!(membership_rows(&connstr, &data_path, ref_idx), 2);
+    assert_eq!(ledger_rows(&connstr, &data_path, ref_idx).len(), 1);
 }
 
 /// A destination already there when the call starts is read as an earlier call's
@@ -1289,6 +1471,7 @@ fn register_files_replaces_shared_contigs_across_assembly_runs() {
         ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
         ducklake::ensure_assembly_tables(&conn).unwrap();
         ducklake::ensure_registration_lock(&conn).unwrap();
+        ducklake::ensure_registered_file_table(&conn).unwrap();
         conn.execute_batch(&format!(
             "DELETE FROM qiita_lake.assembled_sequence \
                WHERE feature_idx IN ({a_only}, {shared}, {b_only});
@@ -1425,6 +1608,7 @@ fn register_files_re_registering_the_same_contigs_does_not_accumulate() {
         ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
         ducklake::ensure_assembly_tables(&conn).unwrap();
         ducklake::ensure_registration_lock(&conn).unwrap();
+        ducklake::ensure_registered_file_table(&conn).unwrap();
         conn.execute_batch(&format!(
             "DELETE FROM qiita_lake.assembled_sequence WHERE feature_idx = {feature};
              DELETE FROM qiita_lake.assembled_sequence_chunks WHERE feature_idx = {feature};"
@@ -1574,6 +1758,7 @@ fn register_files_re_registering_a_tickets_reads_leaves_one_copy() {
         let conn = Connection::open_in_memory().unwrap();
         ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
         ducklake::ensure_read_tables(&conn).unwrap();
+        ducklake::ensure_registered_file_table(&conn).unwrap();
         conn.execute_batch(&clear).unwrap();
     }
 
@@ -1724,6 +1909,7 @@ fn register_files_decides_per_read_prep_sample() {
         let conn = Connection::open_in_memory().unwrap();
         ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
         ducklake::ensure_read_tables(&conn).unwrap();
+        ducklake::ensure_registered_file_table(&conn).unwrap();
         conn.execute_batch(&clear).unwrap();
     }
 
@@ -1795,6 +1981,7 @@ fn register_files_leaves_reads_another_ticket_registered() {
         let conn = Connection::open_in_memory().unwrap();
         ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
         ducklake::ensure_read_tables(&conn).unwrap();
+        ducklake::ensure_registered_file_table(&conn).unwrap();
         conn.execute_batch(&clear).unwrap();
     }
 
@@ -1861,6 +2048,7 @@ fn register_files_replaces_a_tickets_rows_from_a_file_spanning_prep_samples() {
         let conn = Connection::open_in_memory().unwrap();
         ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
         ducklake::ensure_read_tables(&conn).unwrap();
+        ducklake::ensure_registered_file_table(&conn).unwrap();
         conn.execute_batch(&clear).unwrap();
     }
 
@@ -1958,6 +2146,7 @@ fn register_files_replaces_run_scoped_tables_on_the_whole_key() {
         ducklake::ensure_assembly_tables(&conn).unwrap();
         ducklake::ensure_reference_tables(&conn).unwrap();
         ducklake::ensure_registration_lock(&conn).unwrap();
+        ducklake::ensure_registered_file_table(&conn).unwrap();
         for where_clause in [&a_p, &b_p, &a_q] {
             conn.execute_batch(&format!(
                 "DELETE FROM qiita_lake.assembly_membership WHERE {where_clause};
@@ -2151,6 +2340,7 @@ fn an_empty_bin_quality_still_supersedes_the_runs_rows() {
         ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
         ducklake::ensure_assembly_tables(&conn).unwrap();
         ducklake::ensure_registration_lock(&conn).unwrap();
+        ducklake::ensure_registered_file_table(&conn).unwrap();
         conn.execute_batch(&format!(
             "DELETE FROM qiita_lake.assembly_membership WHERE {where_clause};
              DELETE FROM qiita_lake.bin_quality WHERE {where_clause};"
@@ -2355,6 +2545,7 @@ fn concurrent_registrations_of_one_feature_leave_one_row() {
         ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
         ducklake::ensure_assembly_tables(&conn).unwrap();
         ducklake::ensure_registration_lock(&conn).unwrap();
+        ducklake::ensure_registered_file_table(&conn).unwrap();
         conn.execute_batch(&format!(
             "DELETE FROM qiita_lake.assembled_sequence WHERE feature_idx = {shared};
              DELETE FROM qiita_lake.assembled_sequence_chunks WHERE feature_idx = {shared};"
@@ -2453,6 +2644,7 @@ fn register_files_replaces_sequences_shared_across_references() {
         ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
         ducklake::ensure_reference_tables(&conn).unwrap();
         ducklake::ensure_registration_lock(&conn).unwrap();
+        ducklake::ensure_registered_file_table(&conn).unwrap();
         conn.execute_batch(&format!(
             "DELETE FROM qiita_lake.reference_sequences \
                WHERE feature_idx IN ({shared}, {b_only});
