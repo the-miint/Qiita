@@ -863,8 +863,9 @@ fn ledger_rows(connstr: &str, data_path: &str, ticket: i64) -> Vec<(String, Stri
 /// file returns that registration and registers nothing, with its staging file
 /// gone or, where removing it failed, still there. Nothing is left at the
 /// destination or in the catalog to show the earlier call committed. The test
-/// removes the file itself, as `ducklake_cleanup_old_files` would once a DELETE
-/// emptied it and DuckLake dropped it from its table.
+/// removes the file itself, as `scripts/lake-gc.sh --reclaim` does once a DELETE
+/// has emptied it and the snapshots holding it expire; running that GC here
+/// would remove files under the other tests sharing the catalog.
 #[test]
 #[serial_test::serial]
 #[cfg(feature = "integration")]
@@ -912,9 +913,9 @@ fn register_files_replayed_after_lake_gc_removed_its_files_registers_nothing() {
     }
 }
 
-/// A replay of a registration made before the ledger recorded registrations is
-/// still recognised, from the catalog, while its files are there. The ledger
-/// rows are deleted here to stand in for one made before it existed.
+/// A replay of a registration made before the ledger existed is recognised from
+/// the catalog while its files are registered there. Deleting the registration's
+/// ledger rows stands in for one made before it existed.
 #[test]
 #[serial_test::serial]
 #[cfg(feature = "integration")]
@@ -1183,7 +1184,7 @@ fn register_files_whose_commit_answer_is_lost_registers_once() {
     assert_eq!(membership_rows(&connstr, &data_path, ref_idx), 2);
 }
 
-/// The reason a replay checks the catalog before registering: in the DuckLake
+/// The reason a replay must be recognised before registering: in the DuckLake
 /// we ship, adding a path the table already holds succeeds and counts its rows
 /// twice.
 #[test]
@@ -2618,6 +2619,21 @@ fn concurrent_registrations_of_one_feature_leave_one_row() {
         .unwrap();
     assert_eq!(sequences, 1, "{WRITERS} concurrent loads, one sequence row");
     assert_eq!(chunks, 2, "one chunk row per chunk_index, not {WRITERS}x");
+    // Writers here lose commits and retry, and a retry registers the same paths,
+    // so each file recorded exactly once shows a conflicted attempt left no rows
+    // behind, and that `landed` did not read one as committed.
+    for (i, outcome) in outcomes.iter().enumerate() {
+        for file in &outcome.as_ref().unwrap().registered {
+            let recorded: i64 = reader
+                .query_row(
+                    "SELECT count(*) FROM qiita_lake.registered_file WHERE data_file = ?",
+                    [file],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(recorded, 1, "writer {i}'s {file}");
+        }
+    }
 
     let _ = reader.execute_batch(&format!(
         "DELETE FROM qiita_lake.assembled_sequence WHERE feature_idx = {shared};

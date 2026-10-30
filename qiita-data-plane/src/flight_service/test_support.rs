@@ -95,6 +95,8 @@ pub(super) fn catalog_that_loses_a_commit_answer(
         out
     }
 
+    // A snapshot insert, which only a commit of a write sends.
+    const ARMS: &[u8] = b"ducklake_snapshot VALUES";
     let cut_flag = cut.clone();
     std::thread::spawn(move || {
         for client in listener.incoming() {
@@ -111,7 +113,7 @@ pub(super) fn catalog_that_loses_a_commit_answer(
                 while let Ok(n @ 1..) = c_read.read(&mut chunk) {
                     buf.extend_from_slice(&chunk[..n]);
                     for m in split(&mut buf, &mut untyped) {
-                        if m.windows(24).any(|w| w == b"ducklake_snapshot VALUES") {
+                        if m.windows(ARMS.len()).any(|w| w == ARMS) {
                             client_armed.store(true, Ordering::SeqCst);
                         }
                         if s_write.write_all(&m).is_err() {

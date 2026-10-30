@@ -1,7 +1,7 @@
 ### Added
 
 - **The lake records every registration in `qiita_lake.registered_file` (#TBD).** Each
-  `register_files` call writes a row per file (its lake path, table, work ticket and time)
+  registration writes a row per file (its lake path, table, work ticket and time)
   in the transaction that registers the files, and nothing deletes from the table. The
   data plane creates it at boot, and at each start moves the rows registered since the
   last one out of the catalog's Postgres into a Parquet file under the lake's data path.

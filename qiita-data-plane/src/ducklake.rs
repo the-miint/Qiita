@@ -57,7 +57,9 @@ const CATALOG_SETUP_LOCK_KEY: i64 = 0x7169_6974_615f_6470;
 /// and 4.4 s on an existing one, and 20 within 6.8 s.
 const BOOT_SETUP_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// Attach the catalog and create its tables, once, at boot.
+/// Attach the catalog, create its tables, and flush the registration ledger
+/// (`flush_registered_file`), once, at boot. A failure in any of it stops the
+/// data plane from starting.
 ///
 /// Every data plane runs this when it starts, and a deploy or a reboot starts all
 /// of a host's instances together. Two setups running at once conflict on the
@@ -123,14 +125,7 @@ fn setup_catalog_once(
     // set_catalog_options).
     set_catalog_options(&conn)?;
     ensure_lake_tables(&conn)?;
-    // DuckLake reads a table's inlined rows without pushing a filter down, so the
-    // ledger lookup `register_files` makes on every call costs in proportion to
-    // the rows still inlined: 25 ms at 100,000, against 5 ms once the same rows
-    // were flushed to Parquet (DuckDB 2.0.0, ducklake 417a9117). Flushing here
-    // bounds it by the registrations made since the last start.
-    conn.execute_batch(
-        "CALL ducklake_flush_inlined_data('qiita_lake', table_name => 'registered_file');",
-    )?;
+    flush_registered_file(&conn)?;
     Ok(())
 }
 
@@ -972,19 +967,21 @@ pub fn ensure_registration_lock(conn: &Connection) -> Result<(), Box<dyn std::er
 
 /// The most rows one INSERT into `registered_file` keeps inline in the catalog
 /// rather than writing to a Parquet file of its own. DuckLake applies
-/// `data_inlining_row_limit` per statement, with a default of 10. `register_files`
-/// records a registration in one INSERT of a row per file, so the limit sits
-/// above the most files a registration carries: the largest are a load's
-/// gigabyte-scale parts (`_feature_load.bin_pack_by_chunks`,
-/// `bam_to_parquet._ROWS_PER_PART_TARGET_BYTES`), and 10,000 of those is
-/// terabytes. A registration past it is still recorded, in a small file.
+/// `data_inlining_row_limit` per statement, with a default of 10. An INSERT per
+/// file would stay under the default, at a statement per file; `register_files`
+/// records a registration in one INSERT instead, so the limit sits above the
+/// most files one registration carries. A load's files are parts of a gigabyte
+/// or more, so 10,000 of them is terabytes. A registration past the limit is
+/// still recorded, in a small file of its own.
 const REGISTERED_FILE_INLINING_ROW_LIMIT: u32 = 10_000;
 
 /// Create the ledger of completed registrations: a row per file
-/// `register_files` registered, written in the same transaction and never
-/// deleted. What reads it, and why it is a lake table, is at its replay check
-/// (`flight_service::registration::register_files`). Its rows stay inline in the
-/// catalog until `setup_catalog_once` flushes them.
+/// `register_files` registered, written in the transaction that registered it,
+/// and never deleted. What reads it, and why it is a lake table, is at its
+/// replay check (`flight_service::registration::register_files`), which keys on
+/// `data_file` alone; `lake_table`, `work_ticket_idx` and `registered_at` are for
+/// an operator reading the table. Its rows stay inline in the catalog until
+/// `flush_registered_file` writes them out.
 pub fn ensure_registered_file_table(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
     conn.execute_batch(&format!(
         "CREATE TABLE IF NOT EXISTS qiita_lake.registered_file (
@@ -998,6 +995,24 @@ pub fn ensure_registered_file_table(conn: &Connection) -> Result<(), Box<dyn std
         CALL qiita_lake.set_option('data_inlining_row_limit', \
          {REGISTERED_FILE_INLINING_ROW_LIMIT}, table_name => 'registered_file');"
     ))?;
+    Ok(())
+}
+
+/// Move the ledger's inlined rows out of the catalog's Postgres into a Parquet
+/// file.
+///
+/// DuckLake reads a table's inlined rows without pushing a filter down, so the
+/// ledger lookup `register_files` makes on every call costs in proportion to the
+/// rows still inlined: 25 ms at 100,000, against 4 ms once the same rows were
+/// flushed. Each flush writes one more file, which costs little: 100,000 rows
+/// over 50 files took 4 ms, and over 200 files 9 ms. A flush did not conflict
+/// with registrations committing beside it (DuckDB 2.0.0, ducklake 417a9117), so
+/// it is safe while other data planes serve. `setup_catalog_once` runs it at
+/// each start, which bounds the cost by the registrations made since.
+pub fn flush_registered_file(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
+    conn.execute_batch(
+        "CALL ducklake_flush_inlined_data('qiita_lake', table_name => 'registered_file');",
+    )?;
     Ok(())
 }
 
@@ -1886,10 +1901,26 @@ mod tests {
             )
             .expect("registered_file has no inlining limit of its own");
         assert_eq!(limit, REGISTERED_FILE_INLINING_ROW_LIMIT.to_string());
+
+        // One INSERT past the default limit of 10 stays inline.
+        let ticket = next_test_id();
+        let _cleanup = Cleanup {
+            conn: &conn,
+            table: "registered_file",
+            column: "work_ticket_idx",
+            id: ticket,
+        };
+        let before = inlined_rows("registered_file");
+        conn.execute(
+            "INSERT INTO qiita_lake.registered_file \
+             SELECT 'inline-' || range, 'read', ?, now() FROM range(50)",
+            [ticket],
+        )
+        .unwrap();
+        assert_eq!(inlined_rows("registered_file"), before + 50);
     }
 
-    /// A boot leaves no ledger rows inline: `setup_catalog_once` flushes them, so
-    /// the lookup cost it bounds starts again from nothing.
+    /// A boot leaves no ledger rows inline (`flush_registered_file`).
     #[test]
     #[serial]
     #[cfg(feature = "integration")]
