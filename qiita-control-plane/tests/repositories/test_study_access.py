@@ -1,4 +1,4 @@
-"""DB-bound tests for fetch_caller_study_access.
+"""DB-bound tests for fetch_caller_study_access and fetch_caller_study_access_all.
 
 Exercises the SQL JOIN paths: nonexistent study, study with no
 study_access row for the caller, study with an access row at a given
@@ -16,6 +16,7 @@ from qiita_common.models import Tier
 from qiita_control_plane.repositories.study_access import (
     CallerStudyAccessRow,
     fetch_caller_study_access,
+    fetch_caller_study_access_all,
 )
 from qiita_control_plane.testing.db_seeds import seed_study
 from qiita_control_plane.testing.db_teardown import delete_principal, teardown_entity_graph
@@ -74,8 +75,8 @@ async def test_fetch_caller_study_access_returns_owner_with_null_tier_when_calle
     access_ctx,
 ):
     # Caller has no study_access row; LEFT JOIN yields a row with
-    # access_tier as NULL → mapped to None. Schema-default default_tier
-    # ('member') applies because the seed insert omits the column.
+    # access_tier as NULL → mapped to None. default_tier is seed_study's
+    # default, 'member', the column's own.
     row = await fetch_caller_study_access(
         access_ctx["pool"],
         principal_idx=access_ctx["caller_idx"],
@@ -146,3 +147,63 @@ async def test_fetch_caller_study_access_surfaces_non_default_default_tier(acces
         access_tier=None,
         default_tier=Tier.VIEWER,
     )
+
+
+async def _grant(pool, *, study_idx, principal_idx, tier):
+    await pool.execute(
+        "INSERT INTO qiita.study_access (study_idx, principal_idx, access_tier)"
+        " VALUES ($1, $2, $3)",
+        study_idx,
+        principal_idx,
+        tier,
+    )
+
+
+async def test_fetch_caller_study_access_all_returns_every_owned_or_granted_study(access_ctx):
+    """One row per study the caller owns or holds a grant on, and no other.
+
+    The caller owns one study with no row of its own, holds a grant on the
+    fixture's study, and both owns and holds a row on a third (one entry, not
+    two). A study the caller has nothing to do with is absent, as is another
+    principal's grant.
+    """
+    pool = access_ctx["pool"]
+    caller_idx = access_ctx["caller_idx"]
+    owner_idx = access_ctx["owner_idx"]
+    owned = await seed_study(pool, owner_idx=caller_idx, title=f"sa-own-{secrets.token_hex(4)}")
+    owned_and_granted = await seed_study(
+        pool, owner_idx=caller_idx, title=f"sa-both-{secrets.token_hex(4)}"
+    )
+    unrelated = await seed_study(pool, owner_idx=owner_idx, title=f"sa-none-{secrets.token_hex(4)}")
+    extra_studies = [owned, owned_and_granted, unrelated]
+    try:
+        await _grant(
+            pool, study_idx=access_ctx["study_idx"], principal_idx=caller_idx, tier=Tier.VIEWER
+        )
+        await _grant(pool, study_idx=owned_and_granted, principal_idx=caller_idx, tier=Tier.MEMBER)
+        await _grant(pool, study_idx=unrelated, principal_idx=owner_idx, tier=Tier.ADMIN)
+
+        rows = await fetch_caller_study_access_all(pool, principal_idx=caller_idx)
+
+        assert rows == {
+            owned: CallerStudyAccessRow(
+                owner_idx=caller_idx, access_tier=None, default_tier=Tier.MEMBER
+            ),
+            access_ctx["study_idx"]: CallerStudyAccessRow(
+                owner_idx=owner_idx, access_tier=Tier.VIEWER, default_tier=Tier.MEMBER
+            ),
+            owned_and_granted: CallerStudyAccessRow(
+                owner_idx=caller_idx, access_tier=Tier.MEMBER, default_tier=Tier.MEMBER
+            ),
+        }
+    finally:
+        await teardown_entity_graph(
+            pool, study_idxs=extra_studies, biosample_idxs=[], prep_sample_idxs=[]
+        )
+
+
+async def test_fetch_caller_study_access_all_is_empty_for_a_caller_with_nothing(access_ctx):
+    rows = await fetch_caller_study_access_all(
+        access_ctx["pool"], principal_idx=access_ctx["caller_idx"]
+    )
+    assert rows == {}

@@ -25,7 +25,7 @@ from qiita_common.api_paths import (
     URL_BIOSAMPLE_STUDY_FIELD_BY_STUDY,
 )
 from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX, Scope, SystemRole
-from qiita_common.models import BiosampleAccessionField, FieldDataType
+from qiita_common.models import BiosampleAccessionField, FieldDataType, Tier
 
 from qiita_control_plane.repositories import _sample_helpers as sample_helpers
 from qiita_control_plane.repositories.biosample_metadata import BIOSAMPLE_METADATA_SPEC
@@ -60,7 +60,8 @@ from .conftest import (
     STUDY_FIELD_CREATE_AUTHZ_CASES,
     STUDY_FIELD_CREATE_CONFLICT_CASES,
     STUDY_FIELD_LIST_AUTHZ_CASES,
-    STUDY_SCOPED_SAMPLE_AUTHZ_CASES,
+    STUDY_SCOPED_SAMPLE_READ_AUTHZ_CASES,
+    STUDY_SCOPED_SAMPLE_WRITE_AUTHZ_CASES,
     IneligibilityKind,
     _grant_study_access,
     _seed_study,
@@ -69,7 +70,8 @@ from .conftest import (
     assert_study_field_create_conflict,
     assert_study_field_get_authz,
     assert_study_field_list_authz,
-    assert_study_scoped_sample_authz,
+    assert_study_scoped_sample_read_authz,
+    assert_study_scoped_sample_write_authz,
     etag_for_row,
     post_study_field,
     resolve_ineligible_owner_idx,
@@ -1403,12 +1405,15 @@ async def _seed_authz_sample_with_unique_value(ctx, study_idx):
     Done as the bypass-role client so the seed succeeds whichever principal the
     case under test makes the study's owner.
     """
+    # Public, so the matrix measures the route's own gate: what each tier sees
+    # of a value is pinned by the metadata visibility route tests.
     created = await ctx["wet"].post(
         URL_BIOSAMPLE_STUDY_FIELD_BY_STUDY.format(study_idx=study_idx),
         json={
             "display_name": _AUTHZ_FIELD_NAME,
             "data_type": "text",
             "unique_in_study": True,
+            "tier_override": Tier.PUBLIC,
         },
     )
     assert created.status_code == 201, created.text
@@ -2202,8 +2207,8 @@ async def test_get_biosample_in_study_returns_global_and_local_metadata(ctx, own
 
 async def test_get_biosample_in_study_admin_tier_returns_response(ctx):
     """Tests the case where a regular user holds ADMIN study access (not the
-    role bypass): the ADMIN tier clamp is satisfied by the study_access row, so
-    the study-scoped GET returns 200 with empty metadata dicts for a bare link.
+    role bypass): the study_access row admits them, so the study-scoped GET
+    returns 200 with empty metadata dicts for a bare link.
     """
     wet_idx = ctx["wet_session"]["principal_idx"]
     user_idx = ctx["user_session"]["principal_idx"]
@@ -2247,10 +2252,10 @@ async def test_get_biosample_in_study_admin_tier_returns_response(ctx):
     assert rj == expected
 
 
-@pytest.mark.parametrize("case", STUDY_SCOPED_SAMPLE_AUTHZ_CASES)
+@pytest.mark.parametrize("case", STUDY_SCOPED_SAMPLE_READ_AUTHZ_CASES)
 async def test_get_biosample_in_study_authz(ctx, case, no_biosample_read_client):
-    """Tests the case where each row of the study-scoped sample access matrix
-    calls the by-idx read: the ADMIN clamp, the role bypass, the scope check,
+    """Tests the case where each row of the study-scoped sample read matrix
+    calls the by-idx read: the VIEWER floor, the role bypass, the scope check,
     the unauthenticated refusal, and the missing-study 404 all hold.
     """
 
@@ -2259,7 +2264,7 @@ async def test_get_biosample_in_study_authz(ctx, case, no_biosample_read_client)
             URL_BIOSAMPLE_BY_STUDY_AND_IDX.format(study_idx=study_idx, biosample_idx=sample_idx)
         )
 
-    await assert_study_scoped_sample_authz(
+    await assert_study_scoped_sample_read_authz(
         ctx,
         case=case,
         no_scope_client=no_biosample_read_client,
@@ -2338,7 +2343,8 @@ async def no_biosample_write_patch_client(make_pat_client):
 
 
 async def _etag_for(pool, bs_idx: int) -> str:
-    """Build the quoted ISO-8601 ETag the route emits for a biosample row.
+    """Build the quoted ISO-8601 ETag the route emits for a biosample row
+    that carries no metadata newer than its own updated_at.
 
     Thin biosample-flavored wrapper around the shared etag_for_row
     conftest helper so the test-file call sites keep their existing
@@ -3996,10 +4002,10 @@ async def test_patch_biosample_metadata_retired_409(ctx):
     assert "retired" in resp.json()["detail"]
 
 
-@pytest.mark.parametrize("case", STUDY_SCOPED_SAMPLE_AUTHZ_CASES)
+@pytest.mark.parametrize("case", STUDY_SCOPED_SAMPLE_WRITE_AUTHZ_CASES)
 async def test_patch_biosample_metadata_authz(ctx, case, no_biosample_write_patch_client):
-    """Tests the case where each row of the study-scoped sample access matrix
-    calls the metadata write: the ADMIN clamp, the role bypass, the scope
+    """Tests the case where each row of the study-scoped sample write matrix
+    calls the metadata write: the ADMIN minimum, the role bypass, the scope
     check, the unauthenticated refusal, and the missing-study 404 all hold.
 
     The allowed rows rewrite the value the seed already wrote, so a permitted
@@ -4011,7 +4017,7 @@ async def test_patch_biosample_metadata_authz(ctx, case, no_biosample_write_patc
             client, study_idx, sample_idx, {_AUTHZ_FIELD_NAME: _AUTHZ_FIELD_VALUE}
         )
 
-    await assert_study_scoped_sample_authz(
+    await assert_study_scoped_sample_write_authz(
         ctx,
         case=case,
         no_scope_client=no_biosample_write_patch_client,
@@ -4024,7 +4030,7 @@ async def test_patch_biosample_metadata_authz(ctx, case, no_biosample_write_patc
 
 async def test_patch_biosample_metadata_admin_tier_writes(ctx):
     """Tests the case where a regular user with ADMIN study access (not the role
-    bypass) writes metadata: the ADMIN clamp is satisfied and the value is
+    bypass) writes metadata: the ADMIN minimum is satisfied and the value is
     INSERTED.
     """
     (
@@ -4588,8 +4594,10 @@ async def test_lookup_biosample_in_study_by_unique_field(ctx):
     body = resp.json()
     assert body["biosample_idx"] == bs_idx
     assert body["local_metadata"][display_name]["value"] == value
-    expected_etag = await etag_for_row(ctx["pool"], table="qiita.biosample", row_idx=bs_idx)
-    assert resp.headers["ETag"] == expected_etag
+    by_idx = await ctx["wet"].get(
+        URL_BIOSAMPLE_BY_STUDY_AND_IDX.format(study_idx=study_idx, biosample_idx=bs_idx)
+    )
+    assert resp.headers["ETag"] == by_idx.headers["ETag"]
 
 
 async def test_lookup_biosample_in_study_by_unique_field_nul_value_422(ctx):
@@ -4786,9 +4794,9 @@ async def test_lookup_biosample_in_study_by_unique_field_retired_biosample_404(c
     assert resp.json()["detail"] == expected_detail
 
 
-@pytest.mark.parametrize("case", STUDY_SCOPED_SAMPLE_AUTHZ_CASES)
+@pytest.mark.parametrize("case", STUDY_SCOPED_SAMPLE_READ_AUTHZ_CASES)
 async def test_lookup_biosample_in_study_by_unique_field_authz(ctx, case, no_biosample_read_client):
-    """Tests the case where each row of the study-scoped sample access matrix
+    """Tests the case where each row of the study-scoped sample read matrix
     calls the lookup: the route enforces the same bar as its by-idx twin.
     """
 
@@ -4797,7 +4805,7 @@ async def test_lookup_biosample_in_study_by_unique_field_authz(ctx, case, no_bio
             client, study_idx, _AUTHZ_FIELD_NAME, _AUTHZ_FIELD_VALUE
         )
 
-    await assert_study_scoped_sample_authz(
+    await assert_study_scoped_sample_read_authz(
         ctx,
         case=case,
         no_scope_client=no_biosample_read_client,
@@ -5010,11 +5018,11 @@ async def test_patch_biosample_metadata_by_unique_field_empty_metadata_422(ctx):
     assert resp.status_code == 422, resp.text
 
 
-@pytest.mark.parametrize("case", STUDY_SCOPED_SAMPLE_AUTHZ_CASES)
+@pytest.mark.parametrize("case", STUDY_SCOPED_SAMPLE_WRITE_AUTHZ_CASES)
 async def test_patch_biosample_metadata_by_unique_field_authz(
     ctx, case, no_biosample_write_patch_client
 ):
-    """Tests the case where each row of the study-scoped sample access matrix
+    """Tests the case where each row of the study-scoped sample write matrix
     calls the by-unique-field write: it enforces the same bar as its by-idx
     twin. The allowed rows rewrite the value the seed already wrote, so a
     permitted call answers 200 without depending on the write's outcome.
@@ -5029,7 +5037,7 @@ async def test_patch_biosample_metadata_by_unique_field_authz(
             metadata={_AUTHZ_FIELD_NAME: _AUTHZ_FIELD_VALUE},
         )
 
-    await assert_study_scoped_sample_authz(
+    await assert_study_scoped_sample_write_authz(
         ctx,
         case=case,
         no_scope_client=no_biosample_write_patch_client,

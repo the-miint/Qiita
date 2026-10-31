@@ -127,9 +127,8 @@ ROLE_IMPLIED_SCOPES: Mapping[SystemRole, frozenset[Scope]] = {
             Scope.ADMIN_AUDIT_READ,
             # Owner-id re-identification export is system_admin-only —
             # owner-submitted names can carry incautiously-entered PII. The
-            # field is pinned to member tier, but nothing enforces that pin
-            # yet, and wet_lab_admin and system_admin reach owner-ids
-            # regardless of tier.
+            # study-scoped reads return them only to callers whose tier on the
+            # study reaches repositories.biosample.OWNER_BIOSAMPLE_ID_TIER_OVERRIDE.
             Scope.ADMIN_BIOSAMPLE_OWNER_ID_READ,
             # Per-pool masked-read export is system_admin-only — the first human
             # masked-read pull, admin-gated until there's a model for picking the

@@ -17,18 +17,25 @@ from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX, Scope, SystemRole
 from qiita_common.models import StudyRecordView, Tier
 
 from qiita_control_plane.auth.guards import (
+    _TIER_ORDER,
     caller_effective_tier,
+    caller_metadata_tiers,
     caller_tier_reaches,
     study_access_via,
     study_record_view,
+    tier_at_least,
 )
-from qiita_control_plane.repositories.study_access import CallerStudyAccessRow
+from qiita_control_plane.repositories.study_access import (
+    CallerMetadataTiers,
+    CallerStudyAccessRow,
+)
 from qiita_control_plane.testing.db_seeds import seed_study
 from qiita_control_plane.testing.db_teardown import (
     delete_idxs,
     delete_principal,
     teardown_entity_graph,
 )
+from qiita_control_plane.testing.tiers import TIER_RANK
 
 
 def _human(*, role=SystemRole.USER, scopes=frozenset(), profile_complete=True):
@@ -1172,3 +1179,122 @@ def test_caller_tier_reaches_ignores_a_bypass_role():
 )
 def test_study_access_via_names_the_strongest_reason(row, role, expected):
     assert study_access_via(row, caller=_human_with_idx(7, role=role)) == expected
+
+
+# ---------------------------------------------------------------------------
+# Metadata read tiers (caller_metadata_tiers, tier_at_least)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("held", list(Tier))
+@pytest.mark.parametrize("required", list(Tier))
+def test_tier_at_least_follows_privilege_not_spelling(held, required):
+    """Tier is a StrEnum, so a bare >= would compare spellings; tier_at_least
+    must follow the privilege order."""
+    assert tier_at_least(held, required) is (TIER_RANK[held] >= TIER_RANK[required])
+
+
+@pytest.mark.db
+async def test_tier_order_matches_postgres_enum_order(postgres_pool):
+    """The Python ranking and qiita.tier's declaration order must agree: the
+    visibility functions compare tiers in SQL, the guards in Python, and a
+    caller judged by both would otherwise be admitted by one and refused by
+    the other."""
+    labels = await postgres_pool.fetch(
+        "SELECT e.enumlabel FROM pg_enum e"
+        " JOIN pg_type t ON t.oid = e.enumtypid"
+        " JOIN pg_namespace n ON n.oid = t.typnamespace"
+        " WHERE n.nspname = 'qiita' AND t.typname = 'tier'"
+        " ORDER BY e.enumsortorder"
+    )
+    assert [Tier(r["enumlabel"]) for r in labels] == sorted(_TIER_ORDER, key=_TIER_ORDER.get)
+
+
+@pytest.mark.db
+async def test_caller_metadata_tiers_anonymous_reads_at_public(postgres_pool):
+    assert await caller_metadata_tiers(postgres_pool, _anon()) == CallerMetadataTiers(
+        study_tiers={}, default=Tier.PUBLIC
+    )
+
+
+@pytest.mark.db
+@pytest.mark.parametrize("role", [SystemRole.WET_LAB_ADMIN, SystemRole.SYSTEM_ADMIN])
+async def test_caller_metadata_tiers_bypass_role_reads_at_admin_everywhere(study_access_ctx, role):
+    """A bypass-role caller reads every value, including on a study they hold
+    no grant on, without a per-study lookup."""
+    caller = _human_with_idx(study_access_ctx["caller_idx"], role=role)
+    tiers = await caller_metadata_tiers(study_access_ctx["pool"], caller)
+    assert tiers == CallerMetadataTiers(study_tiers={}, default=Tier.ADMIN)
+    assert tiers.tier_on(study_access_ctx["study_idx"]) is Tier.ADMIN
+
+
+@pytest.mark.db
+async def test_caller_metadata_tiers_maps_grants_and_ownership(study_access_ctx):
+    """The caller reads at a grant's tier, at admin on an owned study even
+    without a row, and at public on every other study."""
+    pool = study_access_ctx["pool"]
+    caller_idx = study_access_ctx["caller_idx"]
+    owned_idx = await seed_study(
+        pool, owner_idx=caller_idx, title=f"req-sa-owned-{secrets.token_hex(4)}"
+    )
+    try:
+        await pool.execute(
+            "INSERT INTO qiita.study_access (study_idx, principal_idx, access_tier)"
+            " VALUES ($1, $2, $3)",
+            study_access_ctx["study_idx"],
+            caller_idx,
+            Tier.VIEWER,
+        )
+
+        tiers = await caller_metadata_tiers(pool, _human_with_idx(caller_idx))
+
+        assert tiers == CallerMetadataTiers(
+            study_tiers={study_access_ctx["study_idx"]: Tier.VIEWER, owned_idx: Tier.ADMIN},
+            default=Tier.PUBLIC,
+        )
+        assert tiers.tier_on(owned_idx + 100_000) is Tier.PUBLIC
+    finally:
+        await teardown_entity_graph(
+            pool, study_idxs=[owned_idx], biosample_idxs=[], prep_sample_idxs=[]
+        )
+
+
+@pytest.mark.db
+async def test_caller_metadata_tiers_service_account_reads_at_its_grants(study_access_ctx):
+    """A service account holds no role, so no bypass: it reads at whatever
+    grants its principal holds, and public everywhere else."""
+    from qiita_control_plane.auth.principal import ServiceAccount
+
+    pool = study_access_ctx["pool"]
+    service_idx = await pool.fetchval(
+        "INSERT INTO qiita.principal (display_name, system_role, created_by_idx)"
+        " VALUES ($1, $2, $3) RETURNING idx",
+        f"req-sa-svc-{secrets.token_hex(4)}",
+        SystemRole.USER,
+        SYSTEM_PRINCIPAL_IDX,
+    )
+    try:
+        await pool.execute(
+            "INSERT INTO qiita.study_access (study_idx, principal_idx, access_tier)"
+            " VALUES ($1, $2, $3)",
+            study_access_ctx["study_idx"],
+            service_idx,
+            Tier.MEMBER,
+        )
+        caller = ServiceAccount(
+            principal_idx=service_idx,
+            name="svc",
+            scopes=frozenset(),
+            disabled=False,
+            retired=False,
+        )
+
+        tiers = await caller_metadata_tiers(pool, caller)
+
+        assert tiers == CallerMetadataTiers(
+            study_tiers={study_access_ctx["study_idx"]: Tier.MEMBER}, default=Tier.PUBLIC
+        )
+    finally:
+        # Ahead of the sweep: the grant references the principal deleted next.
+        await pool.execute("DELETE FROM qiita.study_access WHERE principal_idx = $1", service_idx)
+        await delete_idxs(pool, "principal", service_idx)

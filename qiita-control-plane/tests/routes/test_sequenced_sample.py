@@ -52,6 +52,7 @@ from qiita_common.models import (
     StepProgressState,
     StepStatus,
     StepStatusWire,
+    Tier,
     WorkTicketFailureStage,
     WorkTicketState,
 )
@@ -1386,8 +1387,8 @@ def _expected_read_response(
     Centralises the column-by-column expectation so the parameter list says
     only what varies between tests (owner / creator / role / metadata).
     """
-    # The composer touches last_metadata_change_at iff at least one metadata
-    # row landed; the value is non-None in that case, otherwise None.
+    # last_metadata_change_at is set iff the response carries a metadata
+    # value; has_metadata says whether it does.
     expected_last_meta = rj["last_metadata_change_at"] if has_metadata else None
     return {
         "sequenced_sample_idx": seeded["sequenced_sample_idx"],
@@ -3535,7 +3536,7 @@ async def test_get_sequenced_sample_in_study_returns_global_and_local_metadata(c
     globally-linked prep_sample metadata value and a purely-local prep_sample
     row: the study-scoped GET returns the joined row, global_metadata keyed by
     internal_name, and local_metadata keyed by display_name, with an ETag. The
-    caller is wet_lab_admin, whose role bypasses the ADMIN tier clamp.
+    caller is wet_lab_admin, whose role sees every value.
     """
     seeded = await _seed_one_sequenced_sample(
         ctx,
@@ -3600,9 +3601,8 @@ async def test_get_sequenced_sample_in_study_returns_global_and_local_metadata(c
 
 async def test_get_sequenced_sample_in_study_admin_tier_returns_response(ctx):
     """Tests the case where a regular user holds ADMIN study access (not the
-    role bypass): the ADMIN tier clamp is satisfied by the study_access row, so
-    the study-scoped GET returns 200 with empty metadata dicts for a bare
-    sequenced_sample.
+    role bypass): the study_access row admits them, so the study-scoped GET
+    returns 200 with empty metadata dicts for a bare sequenced_sample.
     """
     seeded = await _seed_one_sequenced_sample(ctx, "get-admin-tier")
     await _grant_study_access(
@@ -3636,10 +3636,12 @@ async def test_get_sequenced_sample_in_study_admin_tier_returns_response(ctx):
     assert etag.startswith('"') and etag.endswith('"')
 
 
-@pytest.mark.parametrize("tier", ["viewer", "member"])
-async def test_get_sequenced_sample_in_study_below_admin_tier_403(ctx, tier):
-    """Tests the case where a regular user's study access is below the ADMIN
-    clamp (viewer or member): the study-scoped GET is 403.
+@pytest.mark.parametrize("tier", [Tier.VIEWER, Tier.MEMBER])
+async def test_get_sequenced_sample_in_study_viewer_and_member_read(ctx, tier):
+    """Tests the case where a regular user's study access is viewer or member:
+    the study-scoped GET is 200, since the read requires viewer. Which of the
+    sequenced_sample's values each tier then sees is pinned by the metadata
+    visibility route tests.
     """
     seeded = await _seed_one_sequenced_sample(ctx, f"get-{tier}")
     await _grant_study_access(
@@ -3655,12 +3657,12 @@ async def test_get_sequenced_sample_in_study_below_admin_tier_403(ctx, tier):
             study_idx=seeded["study_idx"], sequenced_sample_idx=seeded["sequenced_sample_idx"]
         )
     )
-    assert resp.status_code == 403, resp.text
+    assert resp.status_code == 200, resp.text
 
 
 async def test_get_sequenced_sample_in_study_no_access_403(ctx):
     """Tests the case where a regular user has no study_access row on the study
-    (public-by-absence, below the ADMIN clamp): the GET is 403.
+    (public-by-absence, below the viewer floor): the GET is 403.
     """
     seeded = await _seed_one_sequenced_sample(ctx, "get-noaccess")
 
@@ -4203,7 +4205,7 @@ async def test_patch_sequenced_sample_metadata_missing_scope_403(ctx, no_prep_sa
 @pytest.mark.parametrize("tier", ["viewer", "member"])
 async def test_patch_sequenced_sample_metadata_below_admin_tier_403(ctx, tier):
     """Tests the case where a regular user's study access is below the ADMIN
-    clamp (viewer or member): the write is 403.
+    minimum (viewer or member): the write is 403.
     """
     seeded = await _seed_one_sequenced_sample(ctx, f"patch-{tier}")
     await _grant_study_access(
@@ -4232,7 +4234,7 @@ async def test_patch_sequenced_sample_metadata_no_access_403(ctx):
 
 async def test_patch_sequenced_sample_metadata_admin_tier_writes(ctx):
     """Tests the case where a regular user with ADMIN study access (not the role
-    bypass) writes metadata: the ADMIN clamp is satisfied and the value is
+    bypass) writes metadata: the ADMIN minimum is satisfied and the value is
     INSERTED.
     """
     seeded = await _seed_one_sequenced_sample(ctx, "patch-admin")
