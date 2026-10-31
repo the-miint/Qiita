@@ -6,5 +6,5 @@
   that rules out what the code is unable to do or names a case that the code does not
   treat differently, and British spelling in words that a diff adds. R4 now flags a
   create-or-reuse path that sets a property on create but does not check it on reuse,
-  and a timestamp, count, ETag or error detail that reveals rows that a permission
-  filter hides; both have their own Trigger-map row.
+  and a timestamp, count, ETag or error detail that reveals the existence of rows
+  hidden by a permission filter; both have their own Trigger-map row.
