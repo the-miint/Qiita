@@ -1,7 +1,7 @@
 ### Changed
 
 - **The `qiita-reviewer` agent flags more prose patterns and two code patterns
-  (#TBD).** R2 now flags a counterfactual written as current behavior, an action where
+  (#821).** R2 now flags a counterfactual written as current behavior, an action where
   a capability is meant, a docstring that restates its own name or signature, a comment
   that rules out what the code is unable to do or names a case that the code does not
   treat differently, and British spelling in words that a diff adds. R4 now flags a
