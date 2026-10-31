@@ -21,7 +21,7 @@ import shutil
 from pathlib import Path
 
 import duckdb
-from qiita_common.parquet import sorted_row_group_size, validate_parquet_path
+from qiita_common.parquet import validate_parquet_path
 
 from .miint import (
     PARQUET_OPTS_AT_REST,
@@ -29,7 +29,6 @@ from .miint import (
     detected_ram_gb,
     duckdb_headroom_gb,
     open_conn,
-    parquet_bytes_per_row,
     slurm_alloc_gb,
 )
 
@@ -107,7 +106,6 @@ def write_sorted_reads(
     try:
         with open_conn() as conn:
             apply_duckdb_settings(conn, duckdb_tmp, memory_gb=memory_gb, threads=threads)
-            row_group_size = sorted_row_group_size(parquet_bytes_per_row(conn, intermediate_path))
             conn.execute(
                 "COPY ( SELECT "
                 "  ?::BIGINT AS prep_sample_idx,"
@@ -115,7 +113,7 @@ def write_sorted_reads(
                 "  read_id, sequence1, qual1, sequence2, qual2 "
                 f"FROM read_parquet(?){where_clause} "
                 "ORDER BY sequence_idx ) "
-                f"TO '{partial}' ({PARQUET_OPTS_AT_REST}, ROW_GROUP_SIZE {row_group_size})",
+                f"TO '{partial}' ({PARQUET_OPTS_AT_REST})",
                 [prep_sample_idx, sequence_idx_start, str(intermediate_path)],
             )
         # Publish atomically: the durable path only ever appears complete.

@@ -609,6 +609,17 @@ fn block_members() -> Vec<auth::BlockReadMember> {
     ]
 }
 
+/// The coarse conjuncts come first, at the top level, so pruning never waits on
+/// the optimizer pushing the per-member OR down (`block_read_where_clause`).
+#[test]
+fn block_read_where_clause_leads_with_the_coarse_conjuncts() {
+    let clause = block_read_where_clause(&block_members());
+    assert!(
+        clause.starts_with("prep_sample_idx IN (11,12) AND sequence_idx BETWEEN 100 AND 549 AND ("),
+        "{clause}"
+    );
+}
+
 #[test]
 fn build_query_read_block_streams_the_shared_projection_from_raw_read() {
     // Resolves to the raw read table, projects the shared EXPORT_READ_COLUMNS,
@@ -1815,9 +1826,10 @@ fn files_read_for(conn: &Connection, query: &str) -> i64 {
 /// 4-file block (one a mid-file split member) is queried after seeding a
 /// SMALL then a LARGE set of disjoint filler files; `Total Files Read` must
 /// stay == the block's file count both times. Also confirms the shipped
-/// `IN + BETWEEN + OR` (V3) prunes exactly as well as `IN + BETWEEN` (V2) and
-/// the per-member `OR` alone (V1) — the exactness residual does not defeat
-/// file pruning.
+/// `IN + BETWEEN + OR` (V3) prunes exactly as well as `IN + BETWEEN` (V2) — the
+/// exactness residual does not defeat file pruning — and pins that the
+/// per-member `OR` alone (V1) prunes too, which `block_read_where_clause` says
+/// it does not rely on.
 #[test]
 #[serial_test::serial]
 #[cfg(feature = "integration")]
@@ -1929,23 +1941,22 @@ fn block_read_selector_prunes_and_scales() {
         v3_large, v3_small,
         "files read must not grow with table size"
     );
-    // The coarse IN+BETWEEN is load-bearing: V2 prunes to the block's files,
-    // but V1 (the exact per-member OR ALONE) does NOT prune — a bare
-    // OR-of-ANDs full-scans every file. That is precisely why the shipped V3
-    // keeps IN+BETWEEN in front of the OR: those top-level conjuncts drive the
-    // file pruning, and the OR rides along as an exact residual on the pruned
-    // rows without defeating it (V3 == V2, not V1).
     assert_eq!(
         v2_large, block_files,
         "V2 (IN+BETWEEN) prunes to block files"
     );
+    // A canary for the fact `block_read_where_clause`'s docstring records: DuckDB
+    // prunes on the per-member OR alone. V3 still prunes on its coarse conjuncts
+    // (the assertions above), so a failure here breaks no query.
     assert_eq!(
-        v1_large, files_large,
-        "per-member OR ALONE does not prune (full scan) — coarse IN+BETWEEN is load-bearing"
+        v1_large, block_files,
+        "DuckDB no longer prunes on the per-member OR alone: correct the sentence in \
+         block_read_where_clause's docstring that says it does, and drop or invert \
+         this assertion"
     );
 
     // Exactness: V3 returns the split-trimmed result; V2 over-selects the
-    // split member's tail (proving the OR residual is load-bearing).
+    // split member's tail (the OR residual is what trims it).
     let v3_rows: i64 = conn
         .query_row(&format!("SELECT count(*) FROM ({v3})"), [], |r| r.get(0))
         .unwrap();

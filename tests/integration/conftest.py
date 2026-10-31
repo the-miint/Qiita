@@ -52,6 +52,7 @@ from qiita_control_plane.testing.sessions import (  # noqa: F401
 )
 
 from _pg_env import (
+    DUCKLAKE_VERSION,
     LIB_PATH_ENV,
     ducklake_catalog_connstr,
     find_duckdb_lib_dir,
@@ -242,7 +243,7 @@ def ducklake_connect(data_path: str):
     conn.execute("LOAD ducklake; LOAD postgres;")
     conn.execute(
         f"ATTACH 'ducklake:postgres:{DUCKLAKE_CATALOG_CONNSTR}' AS qiita_lake"
-        f" (DATA_PATH '{data_path}');"
+        f" (DATA_PATH '{data_path}', DUCKLAKE_VERSION '{DUCKLAKE_VERSION}');"
     )
     return conn
 

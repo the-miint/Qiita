@@ -63,15 +63,14 @@ from .miint_staging import write_staging_marker
 
 # Chunked-sequence write constants. Sequence data (genome-scale up to
 # ~21 MB per record on GG2) is broken into 64 KB chunks so the DuckLake
-# row layout stays narrow on long entries. An unsorted write flushes a row
-# group on whichever cap it hits first: the ROW_GROUP_SIZE row count (16384
+# row layout stays narrow on long entries. A write flushes a row group on
+# whichever cap it hits first: the ROW_GROUP_SIZE row count (16384
 # rows × ~64 KB chunk_data ≈ 1 GB, empirically tuned against GG2 backbone —
 # 4.2 GB peak RSS; 32768 OOMs on 30 GB hosts) OR the ROW_GROUP_SIZE_BYTES
 # '64MB' size cap inherited from the base set. On dense chunk data the
 # 64 MB cap binds first (~1024 chunks), so row groups land at ~64 MB
 # rather than ~1 GB — strictly lower write memory and finer pruning, with
-# the row-count cap still backstopping sparse/narrow records. A sorted
-# write gets the row count alone (see `qiita_common.parquet.sorted_row_group_size`).
+# the row-count cap still backstopping sparse/narrow records.
 #
 # CHUNK_ROW_GROUP_SIZE (and the matching CHUNK_SIZE) are single-sourced in
 # `qiita_common.chunking`, shared with the CLI's DoPut path. The actual
@@ -85,8 +84,7 @@ PARQUET_OPTS_CHUNKED_TRANSFER: str = (
 
 def parquet_bytes_per_row(conn: duckdb.DuckDBPyConnection, path: Path | str) -> int:
     """Mean decompressed bytes per row (still Parquet-encoded) of the Parquet file or glob
-    at `path`, from its footers alone: the width a sorted write of rows of the same shape
-    passes to `qiita_common.parquet.sorted_row_group_size`.
+    at `path`, from its footers alone.
 
     Raises when the footers report no rows or no size. A default would size the write
     for rows of the wrong width, and nothing downstream would notice."""
@@ -363,11 +361,22 @@ def resolve_duckdb_memory_gb(
 
 
 # ENA's file server drops connections in bursts that outlast DuckDB's default of 3
-# retries. These allow 8 retries over about a minute per request. Applied as session SETs
-# after httpfs is loaded, not in the connect config: a connect-time httpfs setting makes
-# connect() autoinstall httpfs, and a GLOBAL value would nest under the 3-try retry loop of
-# miint's Portal ENAClient. FASTQ downloads run through the connection's own filesystem and
-# take the session values.
+# retries. These allow 8 retries per request. DuckDB 2.0 draws each wait at random from
+# [0, 500 ms × 2^(retry - 1)], capped at 20 s, so 8 retries wait up to about 70 s in all,
+# about 35 s on average (38-46 s measured). A throttled 429 or 503 gets 5 retries more,
+# each waiting in the upper half of its range and at least the server's Retry-After (up
+# to 20 s). DuckDB also charges each retry to its per-host retry quota, which belongs to
+# the database and has no setting: 500 tokens, 10 for a retry after a dropped connection
+# (so about 50 of those) and 5 for any other. A request that succeeds first time gives
+# back 1 token, one that succeeds after retrying gives back its last retry's cost, and a
+# minute without a request to the host refills the quota. The waits, the throttle rule
+# and the quota are read from DuckDB 2.0.0's source; a loopback probe confirmed the ~50
+# dropped-connection retries. miint's own reopen of a failed FASTQ open doubles what a
+# dead open costs (docs/duckdb-miint.md, duckdb-miint#391).
+# Applied as session SETs after httpfs is loaded, not in the connect config: a
+# connect-time httpfs setting makes connect() autoinstall httpfs, and a GLOBAL value would
+# nest under the 3-try retry loop of miint's Portal ENAClient. FASTQ downloads run through
+# the connection's own filesystem and take the session values.
 MIINT_HTTP_RETRY_SETTINGS: dict[str, str] = {
     "http_retries": "8",
     "http_retry_wait_ms": "500",

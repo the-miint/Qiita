@@ -247,7 +247,7 @@ reject_sql_metacharacters "${LAKE_MEMORY_LIMIT}" "QIITA_LAKE_MEMORY_LIMIT"
     echo "SET memory_limit = '${LAKE_MEMORY_LIMIT}';"
     # An in-memory DB spills to ./.tmp by default, which fails from a read-only cwd.
     echo "SET temp_directory='${SESSION_TMPDIR}';"
-    echo "ATTACH 'ducklake:postgres:${LAKE_CONNSTR}' AS qiita_lake (DATA_PATH '${DATA_PATH}', READ_ONLY);"
+    echo "ATTACH 'ducklake:postgres:${LAKE_CONNSTR}' AS qiita_lake (DATA_PATH '${DATA_PATH}', DUCKLAKE_VERSION '${QIITA_DUCKLAKE_VERSION}', READ_ONLY);"
     [[ -z "${CP_URL}" ]] || echo "ATTACH '${CP_URL}' AS qiita_cp (TYPE postgres, READ_ONLY);"
     echo "USE qiita_lake;"
 } > "${INIT_SQL}"

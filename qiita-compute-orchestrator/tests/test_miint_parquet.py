@@ -1,10 +1,9 @@
 """The Parquet helpers `miint` adds to `qiita_common.parquet`'s option sets.
 
-`parquet_bytes_per_row` is the row width a sorted at-rest writer sizes its row groups by,
-read from the source's footers. The chunked option set only adds the chunk row-group
-count, so it must still carry no compression level. There is no at-rest chunked set: every
-registered chunk file comes from a sorted COPY, which takes its row count from the chunks'
-width instead (`qiita_common.parquet.sorted_row_group_size`).
+`parquet_bytes_per_row` is the row width a writer sizes its parts by, read from the
+source's footers. The chunked option set only adds the chunk row-group count, so it must
+still carry no compression level. There is no at-rest chunked set: every registered chunk
+file comes from a sorted COPY, whose row groups the byte cap bounds instead.
 """
 
 from __future__ import annotations

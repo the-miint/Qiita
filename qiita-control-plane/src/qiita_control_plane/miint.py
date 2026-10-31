@@ -11,28 +11,35 @@ places and they have opposite requirements:
   systemd). LOAD-only from the deploy-staged `MIINT_EXTENSION_DIRECTORY`,
   exactly like the cluster paths (CO service, native jobs, the probe).
 
-The distinction is load-bearing, not stylistic. `INSTALL` resolves DuckDB's
-extension directory, which defaults to `$HOME/.duckdb/extensions` when
-`MIINT_EXTENSION_DIRECTORY` is unset — and the service accounts have no usable
-`$HOME` (`qiita-api` / `qiita-orch` are `/dev/null`), so a service-side INSTALL
-dies with `IO Error: Can't find the home directory at '/dev/null'`. Service-side
-code must therefore never reach the INSTALL path. Note this is a property of
-where the code RUNS, not of which CLI it belongs to: `qiita-admin` subcommands
-are run as `qiita-api` on the deploy host (see `deploy/verify.sh`), so an
-admin-CLI path that INSTALLs is only safe while it stays off the service
-accounts. This mirrors the reasoning
-already spelled out in `qiita_common.duckdb_miint.miint_load_sql`: cluster
-runtime LOADs from a pre-staged directory so no node "depends on mirror
-reachability, or needs a writable `$HOME`". The control plane is no different.
+`INSTALL` resolves DuckDB's extension directory, which defaults to
+`$HOME/.duckdb/extensions` when `MIINT_EXTENSION_DIRECTORY` is unset — and the
+service accounts have no usable `$HOME` (`qiita-api` / `qiita-orch` are
+`/dev/null`), so a service-side INSTALL dies with `IO Error: Can't find the home
+directory at '/dev/null'`. Service-side code must therefore never reach the
+INSTALL path. This is a property of where the code RUNS, not of which CLI it
+belongs to: `qiita-admin` subcommands are run as `qiita-api` on the deploy host
+(see `deploy/verify.sh`), so an admin-CLI path that INSTALLs is only safe while it
+stays off the service accounts. This mirrors the reasoning already spelled out in
+`qiita_common.duckdb_miint.miint_load_sql`: cluster runtime LOADs from a
+pre-staged directory so no node "depends on mirror reachability, or needs a
+writable `$HOME`". The control plane is no different.
 
 The connect-config + install/load statements are shared with the orchestrator
 via `qiita_common.duckdb_miint` (single source for the `MIINT_EXTENSION_REPO` /
 `MIINT_EXTENSION_DIRECTORY` env contract).
+
+Beside them sit `duckdb_connect`, for service code that needs no miint, and two
+helpers for any DuckDB connection the control plane uses, miint loaded or not:
+`arrow_batches` streams a result as Arrow, and `run_on_connection` runs a statement in
+a worker thread so that a cancelled caller interrupts it.
 """
 
 from __future__ import annotations
 
+import asyncio
 import threading
+from collections.abc import Callable, Sequence
+from typing import TYPE_CHECKING
 
 import duckdb
 from qiita_common.duckdb_miint import (
@@ -41,6 +48,9 @@ from qiita_common.duckdb_miint import (
     miint_load_sql,
     require_staged_extension_directory,
 )
+
+if TYPE_CHECKING:
+    import pyarrow as pa
 
 _install_lock = threading.Lock()
 _installed = False
@@ -59,6 +69,77 @@ def duckdb_connect() -> duckdb.DuckDBPyConnection:
     environments are dev/CI, which have a writable $HOME and no /dev/null
     failure."""
     return duckdb.connect(":memory:", config=miint_connect_config())
+
+
+def arrow_batches(
+    con: duckdb.DuckDBPyConnection, sql: str, params: Sequence[object], rows_per_batch: int
+) -> pa.RecordBatchReader:
+    """Stream `sql`'s result as Arrow batches of `rows_per_batch` rows, one at a time.
+
+    Through `con.sql(...)`, because it is the form that streams on DuckDB 2.0.
+    `con.execute(...).to_arrow_reader()` reads the same but first copies the whole
+    result (with a `UserWarning` the test suites turn into an error) — measured on
+    3M rows of ~200 B: 132 MB peak RSS through `execute` on 1.5.5, 1.2 GB through
+    `execute` on 2.0, 143 MB through `sql` on 2.0.
+
+    Until the reader is exhausted or closed, nothing else can run on `con`, and the
+    call itself is refused while a SELECT `execute`d on `con` is part-read
+    (`qiita_common.duckdb_relation` says when that is); both raise
+    `ResourceInUseException`. Closing `con` with a reader open is allowed; closing it
+    while another thread runs a statement on it is not (`run_on_connection`)."""
+    return con.sql(sql, params=list(params)).to_arrow_reader(rows_per_batch)
+
+
+async def run_on_connection[T](
+    con: duckdb.DuckDBPyConnection, fn: Callable[..., T], *args: object
+) -> T:
+    """Run `fn(*args)` in a worker thread, where `fn` uses `con`; on cancellation,
+    interrupt `con` and wait for the thread to return before re-raising.
+
+    `asyncio.to_thread` alone hands the cancellation back at once and leaves the
+    thread running its statement, so a caller's `finally: con.close()` races it, and
+    `close()` on a connection another thread is using raises
+    `ResourceInUseException` ("connection is busy with another call"). That replaces
+    the `CancelledError` and leaves the connection open. On DuckDB 2.0.0 the
+    interrupt stopped a running COPY in about 30 ms.
+
+    The wait is on the thread itself, since cancelling the awaited future does not
+    stop the thread, and it outlasts a further cancellation, which `asyncio.run`
+    sends every task at shutdown. DuckDB drops an interrupt that lands before the
+    statement starts, so it is repeated until the thread returns. A cancellation
+    that arrives before the call starts (the default executor is shared and
+    bounded, so it can still be waiting for a worker) is settled under `gate`: `fn`
+    never runs, and there is no thread to wait for. Not `asyncio.shield`: once its
+    caller is cancelled, it logs the inner task's error (here, the interrupt) as an
+    unhandled exception."""
+    gate = threading.Lock()
+    started = abandoned = False
+    returned = threading.Event()
+
+    def call() -> T:
+        nonlocal started
+        with gate:
+            if abandoned:
+                raise asyncio.CancelledError
+            started = True
+        try:
+            return fn(*args)
+        finally:
+            returned.set()
+
+    try:
+        return await asyncio.to_thread(call)
+    except asyncio.CancelledError:
+        with gate:
+            abandoned = True
+            running = started
+        while running and not returned.is_set():
+            con.interrupt()
+            try:
+                await asyncio.sleep(0.05)
+            except asyncio.CancelledError:
+                pass  # The cancellation being handled is re-raised below.
+        raise
 
 
 def _connect() -> duckdb.DuckDBPyConnection:

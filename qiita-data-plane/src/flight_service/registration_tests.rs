@@ -374,6 +374,22 @@ fn read_is_not_replace_keyed_so_a_forced_rerun_appends() {
     );
 }
 
+/// The six myloasm provenance tables are replaced per assembly run, and all six
+/// read their delete keys from `myloasm_run`, the one that is never empty for a
+/// myloasm run. A table keyed on its own file instead would leave a previous
+/// run's rows behind whenever the re-run's copy of it is empty.
+#[test]
+fn myloasm_tables_are_replaced_per_run_on_the_run_tables_keys() {
+    for table in crate::ducklake::MYLOASM_TABLES {
+        let entry = REPLACE_KEY_TABLES
+            .iter()
+            .find(|entry| entry.table == *table)
+            .unwrap_or_else(|| panic!("{table} is not replace-keyed"));
+        assert_eq!(entry.key, &["prep_sample_idx", "processing_idx"], "{table}");
+        assert_eq!(entry.key_source, "myloasm_run", "{table}");
+    }
+}
+
 /// Every `key_source` is itself a registered table carrying the same key.
 /// The borrowing delete SELECTs this entry's key columns out of the source's
 /// Parquet, so a source keyed on anything else would name a column that file
@@ -788,8 +804,9 @@ fn register_files_replayed_before_the_earlier_call_committed_fails_closed() {
 }
 
 /// A replay that lands after the earlier registration's rows were deleted
-/// (all of them, or some) still registers nothing: DuckLake keeps listing a
-/// data file whose rows are deleted.
+/// registers nothing. With some rows left, DuckLake still lists the file, and
+/// the replay returns the earlier registration. With every row gone, DuckLake
+/// has dropped the file from the table, so the replay fails closed.
 #[test]
 #[serial_test::serial]
 #[cfg(feature = "integration")]
@@ -822,10 +839,15 @@ fn register_files_replayed_after_its_rows_were_deleted_registers_nothing() {
             &data_path,
             std::path::Path::new("/"),
             &payload,
-        )
-        .expect("replayed register_files failed");
+        );
 
-        assert_eq!(replay.registered, first.registered);
+        if rows_left == 0 {
+            let err = replay.expect_err("a replay of an emptied file's registration succeeded");
+            assert_eq!(err.code(), tonic::Code::FailedPrecondition, "{err}");
+        } else {
+            let replay = replay.expect("replayed register_files failed");
+            assert_eq!(replay.registered, first.registered);
+        }
         assert_eq!(membership_rows(&connstr, &data_path, ref_idx), rows_left);
     }
 }
@@ -2232,6 +2254,111 @@ fn an_empty_bin_quality_still_supersedes_the_runs_rows() {
     let _ = reader.execute_batch(&format!(
         "DELETE FROM qiita_lake.assembly_membership WHERE {where_clause};
          DELETE FROM qiita_lake.bin_quality WHERE {where_clause};"
+    ));
+}
+
+/// A re-registered myloasm run supersedes every one of its tables, including one
+/// that is empty this time: the delete keys come from `myloasm_run`, so an empty
+/// `myloasm_mapping` still removes the earlier run's mapping rows.
+///
+/// The control is `myloasm_run` itself, superseded in the same call.
+#[test]
+#[serial_test::serial]
+#[cfg(feature = "integration")]
+fn an_empty_myloasm_table_still_supersedes_the_runs_rows() {
+    let connstr = crate::test_catalog::connstr();
+    let data_path = crate::test_catalog::data_path();
+
+    let prep_sample: i64 = 975_010;
+    let run: i64 = 975_020;
+    let base_ticket: i64 = 975_000_000 + std::process::id() as i64;
+    let where_clause = format!("prep_sample_idx = {prep_sample} AND processing_idx = {run}");
+
+    {
+        let conn = Connection::open_in_memory().unwrap();
+        ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
+        ducklake::ensure_myloasm_tables(&conn).unwrap();
+        ducklake::ensure_registration_lock(&conn).unwrap();
+        conn.execute_batch(&format!(
+            "DELETE FROM qiita_lake.myloasm_run WHERE {where_clause};
+             DELETE FROM qiita_lake.myloasm_mapping WHERE {where_clause};"
+        ))
+        .unwrap();
+    }
+
+    let run_values = |version: &str| {
+        format!(
+            "SELECT * FROM (VALUES \
+                 ({prep_sample}::BIGINT, {run}::BIGINT, 'myloasm_x.log'::VARCHAR, \
+                  TIMESTAMP '2026-10-29 10:00:00', '{version}'::VARCHAR, \
+                  'myloasm reads.fq --hifi'::VARCHAR, 21::INTEGER, 11::INTEGER, TRUE)) \
+                 t(prep_sample_idx, processing_idx, log_name, started_at, myloasm_version, \
+                   command, kmer_size, compression, hifi)"
+        )
+    };
+    let mapping_values = |suffix: &str| {
+        format!(
+            "SELECT * FROM (VALUES \
+                 ({prep_sample}::BIGINT, {run}::BIGINT, 9000000001::BIGINT, NULL::VARCHAR, \
+                  0::BIGINT, 15000::BIGINT, 0::BIGINT, 15000::BIGINT, '+'::VARCHAR, \
+                  491::BIGINT, 1::BIGINT, 15001::BIGINT, 14990::BIGINT, 14990::BIGINT, \
+                  1300::BIGINT, 12::BIGINT, 0::BIGINT)) \
+                 t(prep_sample_idx, processing_idx, sequence_idx, split_suffix, piece_offset, \
+                   piece_length, query_start, query_stop, strand, contig_num, position, \
+                   stop_position, query_anchor_span, contig_anchor_span, shared_minimizers, \
+                   shared_snpmers, differing_snpmers){suffix}"
+        )
+    };
+
+    let reader = Connection::open_in_memory().unwrap();
+    ducklake::connect_ducklake(&reader, &connstr, &data_path).unwrap();
+    let run_count = format!("SELECT count(*) FROM qiita_lake.myloasm_run WHERE {where_clause}");
+    let mapping_count =
+        format!("SELECT count(*) FROM qiita_lake.myloasm_mapping WHERE {where_clause}");
+
+    register_parquets(
+        &connstr,
+        &data_path,
+        &[
+            ("myloasm_run", &run_values("0.6.0")),
+            ("myloasm_mapping", &mapping_values("")),
+        ],
+        base_ticket,
+    );
+    assert_eq!(lake_count(&reader, &run_count), 1, "first run loaded");
+    assert_eq!(lake_count(&reader, &mapping_count), 1, "first run loaded");
+
+    let replaced = register_parquets(
+        &connstr,
+        &data_path,
+        &[
+            ("myloasm_run", &run_values("0.7.0")),
+            ("myloasm_mapping", &mapping_values(" WHERE FALSE")),
+        ],
+        base_ticket + 1,
+    )
+    .replaced;
+
+    assert_eq!(
+        replaced.get("myloasm_run").copied(),
+        Some(1),
+        "control: the re-run supersedes the first run's run row",
+    );
+    assert_eq!(
+        replaced.get("myloasm_mapping").copied(),
+        Some(1),
+        "the empty mapping file supersedes the first run's mapping row",
+    );
+    assert_eq!(lake_count(&reader, &run_count), 1, "one run's rows");
+    assert_eq!(
+        lake_count(&reader, &mapping_count),
+        0,
+        "no stale mapping row"
+    );
+
+    let _ = reader.execute_batch(&format!(
+        "DELETE FROM qiita_lake.myloasm_run WHERE {where_clause};
+         DELETE FROM qiita_lake.myloasm_mapping WHERE {where_clause};"
     ));
 }
 

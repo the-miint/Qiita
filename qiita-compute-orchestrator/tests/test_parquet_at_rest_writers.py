@@ -68,6 +68,7 @@ _AT_REST_HELPERS: dict[str, frozenset[str]] = {
     "qiita_compute_orchestrator.jobs._feature_load": frozenset(
         {"write_feature_sequences", "write_feature_sequence_chunks"}
     ),
+    "qiita_compute_orchestrator.jobs._myloasm_provenance": frozenset({"write_myloasm_staging"}),
 }
 _HELPER_FUNCTIONS = frozenset().union(*_AT_REST_HELPERS.values())
 

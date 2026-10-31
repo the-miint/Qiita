@@ -23,6 +23,8 @@ import duckdb
 import pyarrow as pa
 import pytest
 from qiita_common.analytic import MAX_SECONDARY
+from qiita_common.duckdb_relation import registered
+from qiita_common.testing.bounded import run_bounded
 
 from qiita_compute_orchestrator.jobs import align_denovo
 from qiita_compute_orchestrator.jobs.align_denovo import Inputs, execute
@@ -151,20 +153,14 @@ def _install_streams(monkeypatch, genome, *, contigs=None, reads=None) -> None:
     @asynccontextmanager
     async def _chunks(conn, *, prep_sample_idx, processing_idx, relation="assembly_chunks"):
         assert (prep_sample_idx, processing_idx) == (_PREP_SAMPLE_IDX, _PROCESSING_IDX)
-        conn.register(relation, _reader(_CHUNK_SCHEMA, contig_rows))
-        try:
+        with registered(conn, relation, _reader(_CHUNK_SCHEMA, contig_rows)):
             yield relation
-        finally:
-            conn.unregister(relation)
 
     @asynccontextmanager
     async def _reads(conn, *, prep_sample_idx, mask_idx, relation="masked_reads"):
         assert (prep_sample_idx, mask_idx) == (_PREP_SAMPLE_IDX, _MASK_IDX)
-        conn.register(relation, _reader(_READ_SCHEMA, read_rows))
-        try:
+        with registered(conn, relation, _reader(_READ_SCHEMA, read_rows)):
             yield relation
-        finally:
-            conn.unregister(relation)
 
     monkeypatch.setattr(align_denovo, "open_assembly_chunk_stream", _chunks)
     monkeypatch.setattr(align_denovo, "open_read_masked_stream", _reads)
@@ -596,11 +592,33 @@ def test_a_slice_no_axis_can_score_is_still_refused():
     ).gate.circular
 
 
-def test_no_arrow_materialization_in_the_feeding_path():
-    """`con.execute(...).arrow()` returns a lazy `RecordBatchReader` in DuckDB 1.5.4,
-    and a miint table function over one backed by a query on the SAME connection
-    deadlocks (duckdb-miint#230, open). A Flight-sourced reader is not affected, so the
-    constraint is only that this job never builds one itself."""
-    import inspect
+# Long enough for a refusal on a loaded machine; the deadlock never returns.
+_DEADLOCK_BOUND_SECONDS = 30
 
-    assert ".arrow()" not in inspect.getsource(align_denovo)
+
+@pytest.mark.parametrize(
+    "scan",
+    [
+        pytest.param(lambda conn, reader: conn.register("subject", reader), id="register"),
+        pytest.param(
+            lambda conn, reader: conn.execute("SELECT count(*) FROM reader"),
+            id="replacement-scan",
+        ),
+    ],
+)
+def test_a_reader_backed_by_its_own_connection_cannot_be_scanned_on_it(scan):
+    """A miint table function over a lazy `RecordBatchReader` backed by a query on the
+    SAME connection deadlocked on DuckDB 1.5.4 (duckdb-miint#230). While that reader is
+    open, DuckDB 2.0 refuses `register` of it and any new query, a replacement scan of
+    the Python variable included, so neither can hand it to a table function on that
+    connection; if either stops raising, the deadlock may be reachable again. The call
+    is bounded so a deadlock fails the test instead of hanging the suite. A
+    Flight-sourced reader, the kind this job registers, is backed by no connection at
+    all."""
+    conn = duckdb.connect()
+    reader = conn.sql("SELECT range AS x FROM range(5000)").to_arrow_reader(1000)
+    with pytest.raises(duckdb.ResourceInUseException):
+        run_bounded(lambda: scan(conn, reader), _DEADLOCK_BOUND_SECONDS)
+    # The open reader is what refuses it: once closed, the connection queries again.
+    reader.close()
+    assert conn.execute("SELECT 1").fetchall() == [(1,)]

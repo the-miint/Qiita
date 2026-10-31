@@ -1081,7 +1081,12 @@ qiita_lake_data_path() { printf '%s/ducklake' "$1"; }
 
 # The DuckDB CLI the lake scripts require — held equal to the data plane's `duckdb`
 # crate by qiita-common/tests/test_duckdb_version_sync.py.
-QIITA_DUCKDB_VERSION="1.5.5"
+QIITA_DUCKDB_VERSION="2.0.0"
+
+# The DuckLake catalog format every lake-script ATTACH names: the data plane's
+# `DUCKLAKE_CATALOG_VERSION` (qiita-data-plane/src/ducklake.rs says why), held equal
+# to it by qiita-common/tests/test_duckdb_version_sync.py.
+QIITA_DUCKLAKE_VERSION="1.0"
 
 # Resolve the duckdb CLI into DUCKDB_BIN and require exactly v${QIITA_DUCKDB_VERSION},
 # or exit with install instructions. Exact, because the CLI opens the data plane's
@@ -1092,14 +1097,19 @@ QIITA_DUCKDB_VERSION="1.5.5"
 # a home, or a service account (qiita-data) whose home is /dev/null.
 qiita_resolve_duckdb_bin() {
     DUCKDB_BIN="${QIITA_DUCKDB_BIN:-$(command -v duckdb || true)}"
-    local problem reported
+    local problem reported version_line
     if [ -z "${DUCKDB_BIN}" ]; then
         problem="no duckdb CLI on PATH."
     else
-        # `duckdb --version` prints e.g. `v1.5.5 (Variegata) d8cdaa33fd`. stderr is
-        # kept, so a binary that cannot run says why in the message below.
-        reported=$("${DUCKDB_BIN}" --version 2>&1 | head -n 1) || true
-        [ "${reported%% *}" = "v${QIITA_DUCKDB_VERSION}" ] && return 0
+        # `duckdb --version` prints e.g. `v2.0.0 (Cyanoptera) d54cbbe3df`. stderr is
+        # kept, so a binary that cannot run says why in the message below. That
+        # line is not always the first: run under an AI agent with stdout not a
+        # terminal, the CLI first prints a `duckdb agent mode on: …` banner to
+        # stderr, so take the line that starts with the version.
+        reported=$("${DUCKDB_BIN}" --version 2>&1) || true
+        version_line=$(printf '%s\n' "${reported}" | grep -m 1 '^v[0-9]' || true)
+        [ "${version_line%% *}" = "v${QIITA_DUCKDB_VERSION}" ] && return 0
+        reported="${version_line:-${reported%%$'\n'*}}"
         problem="\`${DUCKDB_BIN} --version\` printed '${reported:-nothing}'; the data plane links v${QIITA_DUCKDB_VERSION}."
     fi
     cat >&2 <<EOF
@@ -1108,8 +1118,8 @@ ERROR: ${problem}
 Install v${QIITA_DUCKDB_VERSION} — it must match what the data plane links.
 
   cd "\$(mktemp -d)" \\
-    && curl -sSfL -O https://github.com/duckdb/duckdb/releases/download/v${QIITA_DUCKDB_VERSION}/duckdb_cli-linux-amd64.zip \\
-    && unzip -q duckdb_cli-linux-amd64.zip
+    && curl -sSfL -O https://github.com/duckdb/duckdb/releases/download/v${QIITA_DUCKDB_VERSION}/duckdb-cli-linux-amd64.tar.gz \\
+    && tar -xzf duckdb-cli-linux-amd64.tar.gz
 
 Then, for your own account (no root needed):
     mkdir -p ~/.local/bin && install -m 0755 duckdb ~/.local/bin/duckdb
