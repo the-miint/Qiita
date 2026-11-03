@@ -13,9 +13,9 @@ description: >
   for one assembly run that finished on long-read-assembly 1.0.0 or 1.0.1. The native
   `myloasm_provenance_recover` job reads the run's own `assemble` step output, still
   in its ticket workspace, which the context names by ticket and attempt number. It
-  looks each read name up in the sample's `read_masked` pass-set under the run's
+  looks each read name up in the prep_sample's `read_masked` pass-set under the run's
   mask, and matches each genome contig to the run's `assembled_sequence` rows by
-  hash. register-files then replaces the run's rows, so re-submitting a run is safe.
+  hash.
 
 scopes:
   - prep_sample:write
@@ -28,20 +28,21 @@ context_schema:
   type: object
   required: [assembly_processing_idx, assembly_mask_idx, source_work_ticket_idx, assemble_attempt]
   properties:
-    # The finished run, and the mask its reads came from.
+    # The finished run, and the mask that its reads came from.
     assembly_processing_idx:
       type: integer
       minimum: 1
     assembly_mask_idx:
       type: integer
       minimum: 1
-    # The run's completed `assemble` attempt: whose workspace, which attempt.
+    # The run's completed `assemble` attempt: whose workspace, which attempt. The
+    # runner numbers attempts from 0.
     source_work_ticket_idx:
       type: integer
       minimum: 1
     assemble_attempt:
       type: integer
-      minimum: 1
+      minimum: 0
 
 steps:
   - step: myloasm_provenance_recover
@@ -53,8 +54,8 @@ steps:
       source_work_ticket_idx: source_work_ticket_idx
       assemble_attempt: assemble_attempt
     outputs: [staging_dir]
-    # Not measured. The bulk is the read-name lookup, two columns of one sample's
-    # pass-set, and myloasm's per-read mapping table.
+    # Not measured. The bulk is the read-name lookup, two columns of one
+    # prep_sample's pass-set, and myloasm's per-read mapping table.
     baseline_resources:
       cpu: 4
       mem_gb: 16

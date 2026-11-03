@@ -542,7 +542,8 @@ async fn doget_with_an_unsupported_codec_is_rejected_before_streaming() {
 /// consumer comparing the column to a UUID casts it back. The setting stays off
 /// because it is connection-wide: it would also re-type every BOOLEAN
 /// (`arrow.bool8`) and JSON column for every Flight client, to save bytes on small
-/// per-feature tables. Pinned here, through the pooled connection DoGet uses.
+/// per-feature tables (`lossless_conversion_would_re_type_boolean_and_json_columns`).
+/// Pinned here, through the pooled connection that DoGet uses.
 #[tokio::test]
 #[serial_test::serial]
 #[cfg(feature = "integration")]
@@ -575,4 +576,39 @@ async fn a_uuid_column_streams_as_its_canonical_text() {
         .value(0)
         .to_string();
     assert_eq!(text, "0f8fad5b-d9cb-469f-a165-70867728950e");
+}
+
+/// The other half of why `arrow_lossless_conversion` stays off: turned on, it
+/// re-types BOOLEAN and JSON columns into Arrow extension types, not only UUID.
+#[tokio::test]
+#[serial_test::serial]
+#[cfg(feature = "integration")]
+async fn lossless_conversion_would_re_type_boolean_and_json_columns() {
+    let connstr = crate::test_catalog::connstr();
+    let data_path = crate::test_catalog::data_path();
+    let conn = pooled_conn(&connstr, &data_path);
+    conn.execute_batch("SET arrow_lossless_conversion = true")
+        .expect("set lossless conversion");
+    let batches: Vec<arrow_array::RecordBatch> = stream_ducklake_batches(
+        conn,
+        "SELECT true AS b, '{}'::JSON AS j, uuid() AS u".to_string(),
+        "lossless_probe".to_string(),
+    )
+    .collect::<Vec<_>>()
+    .await
+    .into_iter()
+    .map(|r| r.expect("stream item should be Ok"))
+    .collect();
+    let schema = batches[0].schema();
+    let extension = |name: &str| {
+        schema
+            .field_with_name(name)
+            .unwrap()
+            .metadata()
+            .get("ARROW:extension:name")
+            .cloned()
+    };
+    assert_eq!(extension("b").as_deref(), Some("arrow.bool8"), "{schema:?}");
+    assert_eq!(extension("j").as_deref(), Some("arrow.json"), "{schema:?}");
+    assert_eq!(extension("u").as_deref(), Some("arrow.uuid"), "{schema:?}");
 }

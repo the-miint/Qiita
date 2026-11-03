@@ -14,13 +14,13 @@ so a run counts as recovered when a recovery ticket naming it in
 `action_context.assembly_processing_idx` completed. register-files replaces a run's
 rows, so a re-submitted run is harmless.
 
-**Residue, not a guess.** A run whose ticket, step row or tree cannot be found, or
-whose recovery ticket failed, is listed with the reason. Runs with nothing to
-recover (an assembly that produced nothing, a deprecated run) are skipped and
-counted.
+**Residue.** A run whose ticket, step row or tree cannot be found, or whose
+recovery ticket failed, is listed with the reason rather than guessed at. A run
+whose `assembly_sample` is not `completed`, or whose processing is deprecated, is
+skipped and counted.
 
-Retire with the workflow and job once every run is done, skipped, or explained
-(`workflows/myloasm-provenance-recover/1.0.0.yaml`'s header names the issue).
+A one-off; `workflows/myloasm-provenance-recover/1.0.0.yaml`'s header names the
+issue that removes it.
 """
 
 from __future__ import annotations
@@ -37,11 +37,13 @@ from qiita_common.actions import LONG_READ_ASSEMBLY_ACTION_ID
 from qiita_common.models import (
     NON_TERMINAL_WORK_TICKET_STATES,
     ProcessingStatus,
+    ScopeTargetKind,
     StepProgressState,
     WorkTicketState,
 )
 
 from ..repositories.assembly import ASSEMBLY_SAMPLE_COMPLETED
+from ..runner._mask import MASK_IDX_BINDING
 from ..runner._processing import ASSEMBLER_BINDING
 from ..workspace import (
     STEP_MANIFEST_FILENAME,
@@ -55,11 +57,17 @@ RECOVER_ACTION_VERSION = "1.0.0"
 # The long-read-assembly versions that predate the provenance tables.
 SOURCE_VERSIONS = ("1.0.0", "1.0.1")
 
-# The `assembler` value of a myloasm run, and the step and subdirectory the recovery
-# reads — the names in workflows/long-read-assembly/<version>.yaml and assemble.sh.
+# The `assembler` value of a myloasm run, and the step and subdirectory that the
+# recovery reads — the names in workflows/long-read-assembly/<version>.yaml and
+# assemble.sh.
 _MYLOASM = "myloasm"
 _ASSEMBLE_STEP = "assemble"
 _ASSEMBLER_DIR = "assembler"
+# The recovery's `action_context` keys (its workflow's `context_schema`).
+_PROCESSING_KEY = "assembly_processing_idx"
+_MASK_KEY = "assembly_mask_idx"
+_SOURCE_TICKET_KEY = "source_work_ticket_idx"
+_ATTEMPT_KEY = "assemble_attempt"
 
 # Every run of a source version's myloasm processing, with its source ticket and
 # attempt (NULL when either is missing) and its newest recovery ticket (NULL when
@@ -67,9 +75,9 @@ _ASSEMBLER_DIR = "assembler"
 # which is how the runner resolved it.
 _RUNS_SQL = """
 SELECT s.prep_sample_idx, s.processing_idx, s.state AS sample_state,
-       p.status AS processing_status, (p.params->>'mask_idx')::bigint AS mask_idx,
+       p.status AS processing_status, (p.params->>$9::text)::bigint AS mask_idx,
        t.work_ticket_idx AS source_ticket, st.attempt,
-       r.work_ticket_idx AS recover_ticket, r.state::text AS recover_state,
+       r.work_ticket_idx AS recover_ticket, r.state AS recover_state,
        r.failure_reason AS recover_failure
   FROM qiita.assembly_sample s
   JOIN qiita.processing p USING (processing_idx)
@@ -80,7 +88,7 @@ SELECT s.prep_sample_idx, s.processing_idx, s.state AS sample_state,
          WHERE wt.action_id = p.workflow
            AND wt.action_version = p.version
            AND wt.prep_sample_idx = s.prep_sample_idx
-           AND wt.mask_idx = (p.params->>'mask_idx')::bigint
+           AND wt.mask_idx = (p.params->>$9::text)::bigint
            AND COALESCE(wt.action_context->>$3::text,
                         a.context_schema->'properties'->$3::text->>'default') = $4
            AND wt.state = $5::qiita.work_ticket_state
@@ -101,7 +109,7 @@ SELECT s.prep_sample_idx, s.processing_idx, s.state AS sample_state,
           FROM qiita.work_ticket rt
          WHERE rt.action_id = $8
            AND rt.prep_sample_idx = s.prep_sample_idx
-           AND rt.action_context->>'assembly_processing_idx' = s.processing_idx::text
+           AND rt.action_context->$10::text = to_jsonb(s.processing_idx)
          ORDER BY rt.created_at DESC, rt.work_ticket_idx DESC
          LIMIT 1
        ) r ON true
@@ -137,12 +145,15 @@ class Run:
         return {
             "action_id": RECOVER_ACTION_ID,
             "action_version": RECOVER_ACTION_VERSION,
-            "scope_target": {"kind": "prep_sample", "prep_sample_idx": self.prep_sample_idx},
+            "scope_target": {
+                "kind": ScopeTargetKind.PREP_SAMPLE.value,
+                "prep_sample_idx": self.prep_sample_idx,
+            },
             "action_context": {
-                "assembly_processing_idx": self.processing_idx,
-                "assembly_mask_idx": self.mask_idx,
-                "source_work_ticket_idx": self.source_work_ticket_idx,
-                "assemble_attempt": self.assemble_attempt,
+                _PROCESSING_KEY: self.processing_idx,
+                _MASK_KEY: self.mask_idx,
+                _SOURCE_TICKET_KEY: self.source_work_ticket_idx,
+                _ATTEMPT_KEY: self.assemble_attempt,
             },
         }
 
@@ -241,6 +252,8 @@ async def plan_backfill(
         _ASSEMBLE_STEP,
         StepProgressState.COMPLETED.value,
         RECOVER_ACTION_ID,
+        MASK_IDX_BINDING,
+        _PROCESSING_KEY,
     )
     return BackfillPlan(
         runs=[_classify(r, ticket_root=ticket_root, retry_failed=retry_failed) for r in rows]

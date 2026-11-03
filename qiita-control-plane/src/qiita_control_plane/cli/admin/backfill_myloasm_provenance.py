@@ -2,9 +2,10 @@
 and, with `--execute`, submit its tickets. The planner and the submit loop are
 `backfill/myloasm_provenance.py`; this is the operator's view of them.
 
-Kept in its own module so the one-off retires as a unit: this file, the backfill,
-the job and the workflow, plus the two lines in `cli/admin/__init__.py` that
-register the parser.
+A one-off, kept in its own module so its removal touches `cli/admin/__init__.py`
+only at the two lines that register the parser;
+`workflows/myloasm-provenance-recover/1.0.0.yaml`'s header names the issue that
+removes it.
 """
 
 from __future__ import annotations
@@ -52,7 +53,10 @@ def add_myloasm_provenance_parser(backfill_sub: argparse._SubParsersAction) -> N
     p.add_argument(
         "--retry-failed",
         action="store_true",
-        help="Plan a run whose recovery ticket failed as writable again.",
+        help=(
+            "Resubmit runs whose recovery ticket failed (otherwise listed as residue"
+            " with the failure)."
+        ),
     )
     p.add_argument(
         "--limit",

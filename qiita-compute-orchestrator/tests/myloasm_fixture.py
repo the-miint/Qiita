@@ -20,8 +20,6 @@ _FIXTURES = Path(__file__).resolve().parent / "data" / "myloasm"
 _NATIVE_GZ = frozenset({"map_to_unitigs.paf.gz", "read_coverages.txt.gz"})
 
 PROVENANCE_SCRIPT = _REPO_ROOT / "workflows" / "long-read-assembly" / "myloasm_provenance.py"
-SPLIT_SCRIPT = _REPO_ROOT / "workflows" / "long-read-assembly" / "myloasm_split.py"
-MANIFEST_WRITER = _REPO_ROOT / "workflows" / "_shared" / "manifest_writer.py"
 MYLOASM_FIXTURE_VERSIONS = ("0.6.0", "0.7.0")
 # Rows each reader returns over the fixture, from duckdb-miint's own fixture README;
 # the same for both versions.
@@ -58,32 +56,6 @@ def myloasm_output_dir(dest: Path, version: str) -> Path:
                 with gzip.open(path, "rb") as src, target.with_suffix("").open("wb") as out:
                     shutil.copyfileobj(src, out)
     return dest
-
-
-def myloasm_assemble_output(out: Path, version: str) -> Path:
-    """A finished long-read-assembly 1.0.1 `assemble` step's output directory for a
-    myloasm run, built the way that step built it: myloasm's `-o` tree under
-    `assembler/`, the splitter's `genomes/`, and the step's `manifest.json` over
-    both. 1.0.1 wrote no provenance dump, so there is none here."""
-    asm = myloasm_output_dir(out / "assembler", version)
-    genomes = out / "genomes"
-    genomes.mkdir(parents=True)
-    for argv in (
-        [
-            SPLIT_SCRIPT,
-            asm / "assembly_primary.fa",
-            genomes / "circular.fa",
-            genomes / "noLCG.fa",
-            genomes / "contig_attributes.tsv",
-        ],
-        [MANIFEST_WRITER, out, "genomes_dir=genomes"],
-    ):
-        result = subprocess.run(
-            [sys.executable, *map(str, argv)], capture_output=True, text=True, env=dict(os.environ)
-        )
-        if result.returncode != 0:
-            raise RuntimeError(f"{argv[0].name} failed: {result.stderr}")
-    return out
 
 
 def run_provenance_dump(

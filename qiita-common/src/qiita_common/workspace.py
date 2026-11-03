@@ -1,10 +1,8 @@
 """Where a work ticket's steps write on the shared scratch filesystem.
 
 `PATH_SCRATCH/ticket/<work_ticket_idx>/<step>/attempt-<n>/`, holding the step's
-`output/` (with its manifest) and `logs/`. The control plane's runner creates each
-attempt directory and hands it to the compute backend; everything that later finds
-a step's files derives the path here — the runner on resume, the step-logs route,
-the admin backfills, and a native job that reads another ticket's finished step.
+`output/` (with its manifest) and `logs/`. Anything that finds a step's files
+derives the path here.
 """
 
 from pathlib import Path

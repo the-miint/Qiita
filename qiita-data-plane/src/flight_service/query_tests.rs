@@ -1302,7 +1302,7 @@ fn read_masked_scope() -> auth::TicketFilter {
 
 #[test]
 fn read_masked_projects_the_signed_columns_through_the_macro() {
-    // The projection is the OUTER select list over the macro call; the scope
+    // The projection is the select list over the macro call; the scope
     // stays the macro's arguments (see build_query_read_masked_calls_the_scoped_macro
     // for why it must never become a WHERE).
     let cols = columns(&["sequence_idx", "read_id"]);
@@ -1340,9 +1340,8 @@ fn read_masked_projection_is_whitelisted() {
 #[test]
 fn only_the_alignment_surface_requires_a_projection() {
     // `read_masked` is projectable but streams its full shape when the ticket
-    // names no columns — the default its every existing consumer relies on.
-    // The alignment surface is the one table where an unprojected read is the
-    // wrong default. Pin both directions, so a rule flipped either way fails.
+    // names no columns; the alignment surface refuses that ticket. Pin both
+    // directions, so a rule flipped either way fails.
     for (table, rule) in PROJECTION_RULES {
         assert_eq!(
             rule.required,
@@ -1848,6 +1847,56 @@ fn read_masked_projection_allowlist_matches_the_macro_exactly() {
         actual, READ_MASKED_PROJECTION_COLUMNS,
         "the read_masked projection allowlist and the macro's output have drifted"
     );
+}
+
+#[test]
+#[serial_test::serial]
+#[cfg(feature = "integration")]
+fn a_read_masked_projection_reaches_the_read_scan() {
+    // The claim in docs/architecture/flight.md: a projected `read_masked` ticket
+    // stops the scan inside the macro from reading the sequences and qualities,
+    // not only the stream from carrying them. `SELECT *` is the control.
+    let conn = Connection::open_in_memory().unwrap();
+    ducklake::connect_ducklake(
+        &conn,
+        &crate::test_catalog::connstr(),
+        &crate::test_catalog::data_path(),
+    )
+    .unwrap();
+    ducklake::ensure_read_tables(&conn).unwrap();
+    let plan = |query: &str| -> String {
+        let mut stmt = conn.prepare(&format!("EXPLAIN {query}")).unwrap();
+        let mut rows = stmt.query([]).unwrap();
+        let mut text = String::new();
+        while let Some(row) = rows.next().unwrap() {
+            for i in 0..2 {
+                if let Ok(s) = row.get::<usize, String>(i) {
+                    text.push_str(&s);
+                    text.push('\n');
+                }
+            }
+        }
+        text
+    };
+    let payload = ["sequence1", "qual1", "sequence2", "qual2"];
+
+    let full = plan("SELECT * FROM qiita_lake.read_masked(0, [0])");
+    assert!(
+        full.contains("sequence1"),
+        "the control plan names no sequence1:\n{full}"
+    );
+
+    let projected = plan("SELECT read_id, sequence_idx FROM qiita_lake.read_masked(0, [0])");
+    assert!(
+        projected.contains("read_id"),
+        "the projected plan names no read_id:\n{projected}"
+    );
+    for column in payload {
+        assert!(
+            !projected.contains(column),
+            "the projected plan still reads {column}:\n{projected}"
+        );
+    }
 }
 
 // --- pushdown performance assessment helpers/tests ----------------------

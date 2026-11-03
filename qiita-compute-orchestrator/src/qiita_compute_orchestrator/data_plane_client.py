@@ -328,8 +328,7 @@ async def open_read_masked_stream(
     `mask_idx, prep_sample_idx, sequence_idx, read_id, sequence1, qual1, sequence2,
     qual2` — with the trims already applied and the macro's unconditional
     `reason = 'pass'` excluding human/host reads by construction. `columns` narrows
-    that to the named subset, in that order; a consumer that binds two columns of a
-    long-read sample should not pull its sequences and qualities over the wire.
+    that to the named subset, in that order.
 
     **Completion gate, requiring no code here.** The CP refuses to sign unless
     `mask_sample.state = 'completed'` for this pair, so a 409 is what a caller gets

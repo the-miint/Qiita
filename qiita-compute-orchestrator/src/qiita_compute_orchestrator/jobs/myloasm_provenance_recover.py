@@ -1,30 +1,27 @@
 """Recover the `myloasm_*` provenance tables for one myloasm run that finished on
-long-read-assembly 1.0.0 or 1.0.1, which did not write them. A one-off: this job, its
-`myloasm-provenance-recover` workflow and the backfill that submits it are deleted
-once every such run has its tables or an explained residue line (the workflow's
-header names the issue that tracks it).
+long-read-assembly 1.0.0 or 1.0.1, which did not write them. A one-off; the
+workflow's header names the issue that removes it.
 
-The source is the run's own `assemble` step output, still in its ticket's workspace:
-myloasm's `-o` tree under `assembler/`, the splitter's `genomes/`, and the
-`manifest.json` the step wrote when it finished. The ticket names it by
+The source is the run's own `assemble` step output, still in the workspace of the
+ticket that ran it: myloasm's `-o` tree under `assembler/`, the splitter's `genomes/`,
+and the `manifest.json` that the step wrote when it finished. The ticket names it by
 `(source_work_ticket_idx, assemble_attempt)`, which `qiita_common.workspace` turns into
-a path under `PATH_SCRATCH`, never by a path a submitter could point elsewhere.
+a path under `PATH_SCRATCH`, never by a path that a submitter could point elsewhere.
 
 What 1.0.2 does inside the container and in `assembly_load` happens here instead,
 through the same shared transform (`_myloasm_provenance`). Two inputs differ:
 
-- **Read names.** Those versions named the assembler's reads by `read_id`, so each name is
-  looked up in the sample's `read_masked` pass-set under the run's mask, fetching
-  only `(read_id, sequence_idx)`.
+- **Read names.** Those versions named the assembler's reads by `read_id`, so each
+  name is looked up in the prep_sample's `read_masked` pass-set under the run's mask.
 - **Contig features.** 1.0.2 joins `bin_map` to the run's minted features. Here the
   lake is the authority: each genome contig's canonical hash is matched to the run's
   `assembled_sequence` rows.
 
 Three checks tie the tree to the registered run before anything is written. The
-manifest must list the files read here, at the sizes they have now. The genome
-contigs and the run's `assembled_sequence` rows must match one to one by hash, in
-both directions. Every read name the dump uses must resolve (the transform's own
-check).
+manifest must list the primary contig FASTA and the two genome FASTAs, at the sizes
+they have now. Every genome contig must hash to one of the run's `assembled_sequence`
+rows, and every one of those rows must be some genome contig's hash. Every read name
+the dump uses must resolve (the transform's own check).
 """
 
 from __future__ import annotations
@@ -38,6 +35,9 @@ from pydantic import BaseModel, Field
 from qiita_common.actions import STEP_MANIFEST_FILENAME
 from qiita_common.chunking import canonical_sequence_hash_expr
 from qiita_common.duckdb_miint import is_empty_sequence_file
+from qiita_common.myloasm_constants import MYLOASM_TABLES
+from qiita_common.parquet import validate_parquet_path
+from qiita_common.sql import sql_string_literal
 from qiita_common.workspace import (
     WORK_TICKET_SUBDIR,
     step_attempt_dir,
@@ -48,29 +48,30 @@ from qiita_common.workspace import (
 from ..config import get_settings
 from ..data_plane_client import open_assembled_sequence_stream, open_read_masked_stream
 from ..miint import (
+    PARQUET_OPTS_INTERMEDIATE,
     apply_duckdb_settings,
     duckdb_tmp_dir,
     open_miint_conn,
     resolve_duckdb_memory_gb,
 )
-from ._assembly import LCG_FILE, NOLCG_FILE
+from ._assembly import LCG_FILE, NOLCG_FILE, READ_FASTX_MAX_BATCH_BYTES
 from ._myloasm_provenance import (
     CONTIG_FEATURE_TABLE,
-    dump_raw_tables,
-    read_names_from_lookup,
+    RAW_READ_NAMES,
+    READ_NAME_TABLE,
     register_raw_tables,
     require_none,
     staging_paths,
     write_myloasm_staging,
 )
 
-# The step whose output is the source, and where its assemble.sh put each part.
+# The step whose output is the source, and where assemble.sh put each part of it.
 _SOURCE_STEP = "assemble"
 _ASSEMBLER_DIR = "assembler"
 _GENOMES_DIR = "genomes"
 _PRIMARY_FASTA = f"{_ASSEMBLER_DIR}/assembly_primary.fa"
-# The two columns the read lookup binds; the rest of a long-read sample's
-# `read_masked` rows are its sequences and qualities.
+# The two columns that the read lookup binds; the rest of a long-read prep_sample's
+# `read_masked` row is its sequences and qualities, which the lookup never reads.
 _READ_LOOKUP_COLUMNS = ["read_id", "sequence_idx"]
 
 _DUCKDB_MEMORY_GB = 8
@@ -85,10 +86,10 @@ class Inputs(BaseModel):
 
     `prep_sample_idx` / `work_ticket_idx` are framework-injected. The rest ride the
     workflow's `params:`. `assembly_processing_idx` and `assembly_mask_idx` name the
-    finished run and the mask its reads came from; they are prefixed because the bare
-    `processing_idx` / `mask_idx` are bindings the runner acts on (it would mint a new
-    run or mask). `source_work_ticket_idx` and `assemble_attempt` locate that run's
-    completed `assemble` attempt.
+    finished run and the mask that its reads came from; they are prefixed because the
+    bare `processing_idx` / `mask_idx` are bindings that the runner acts on (it would
+    mint a new run or mask). `source_work_ticket_idx` and `assemble_attempt` locate
+    that run's completed `assemble` attempt; the runner numbers attempts from 0.
     """
 
     prep_sample_idx: int
@@ -96,7 +97,7 @@ class Inputs(BaseModel):
     assembly_processing_idx: int = Field(gt=0)
     assembly_mask_idx: int = Field(gt=0)
     source_work_ticket_idx: int = Field(gt=0)
-    assemble_attempt: int = Field(gt=0)
+    assemble_attempt: int = Field(ge=0)
 
 
 def _source_output(inputs: Inputs) -> Path:
@@ -107,7 +108,8 @@ def _source_output(inputs: Inputs) -> Path:
 
 
 def _check_source(output: Path) -> None:
-    """Refuse a source that is not the finished step's output as it was written."""
+    """Refuse a source unless its manifest lists each file read directly here, at
+    the size that the file has now."""
     manifest = output / STEP_MANIFEST_FILENAME
     if not manifest.is_file():
         raise FileNotFoundError(
@@ -130,9 +132,37 @@ def _check_source(output: Path) -> None:
             )
 
 
+def _dump_raw_tables(conn: duckdb.DuckDBPyConnection, asm_dir: Path, raw_dir: Path) -> None:
+    """Write the raw dump that 1.0.2's assemble step writes in its container: each
+    `MYLOASM_TABLES` reader over `asm_dir` into `raw_dir/<table>.parquet`, verbatim,
+    as `workflows/long-read-assembly/myloasm_provenance.py` does, refusing zero
+    contigs as it does."""
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    src = sql_string_literal(asm_dir)
+    for table, spec in MYLOASM_TABLES.items():
+        dest = validate_parquet_path(raw_dir / f"{table}.parquet")
+        (rows,) = conn.execute(
+            f"COPY (FROM {spec.reader}({src})) TO '{dest}' ({PARQUET_OPTS_INTERMEDIATE})"
+        ).fetchone()
+        if table == "myloasm_contig" and rows == 0:
+            raise ValueError(f"{spec.reader} returned no contigs for {asm_dir}")
+
+
+def _read_names_from_lookup(conn: duckdb.DuckDBPyConnection, lookup: str) -> None:
+    """`READ_NAME_TABLE` from `lookup`, the prep_sample's `(read_id, sequence_idx)`
+    pairs, keeping only the names that the dump uses: the lookup is the whole
+    pass-set. `lookup` is read once, so a single-consumption stream will do. A name
+    that the lookup lacks is the transform's refusal ("no sequence_idx")."""
+    conn.execute(
+        f"CREATE TEMP TABLE {READ_NAME_TABLE} AS "
+        f"SELECT read_id, sequence_idx FROM {lookup} "
+        f"WHERE read_id IN (SELECT read_id FROM {RAW_READ_NAMES})"
+    )
+
+
 def _genome_contigs(conn: duckdb.DuckDBPyConnection, genomes: Path) -> None:
-    """Each genome contig's id and canonical hash: the files `assembly_hash` hashed
-    for this run, so the same bytes give the same hash."""
+    """Each genome contig's id and canonical hash, from the files that
+    `assembly_hash` hashed for this run, read as it reads them."""
     fastas = [
         str(p) for p in (genomes / LCG_FILE, genomes / NOLCG_FILE) if not is_empty_sequence_file(p)
     ]
@@ -140,7 +170,8 @@ def _genome_contigs(conn: duckdb.DuckDBPyConnection, genomes: Path) -> None:
         raise ValueError(f"no genome contigs under {genomes}")
     conn.execute(
         f"CREATE TEMP TABLE {_GENOME_CONTIG} AS SELECT read_id AS contig_id, "
-        f"{canonical_sequence_hash_expr('sequence1')} AS sequence_hash FROM read_fastx(?)",
+        f"{canonical_sequence_hash_expr('sequence1')} AS sequence_hash "
+        f"FROM read_fastx(?, max_batch_bytes:='{READ_FASTX_MAX_BATCH_BYTES}')",
         [fastas],
     )
 
@@ -148,8 +179,9 @@ def _genome_contigs(conn: duckdb.DuckDBPyConnection, genomes: Path) -> None:
 def _contig_features(conn: duckdb.DuckDBPyConnection, lake: str) -> None:
     """`CONTIG_FEATURE_TABLE` from the genome contigs and the run's lake rows,
     refusing any contig or feature the other side lacks."""
-    # The CAST is correct, not a workaround: the data plane streams a UUID as its
-    # canonical text by design (`a_uuid_column_streams_as_its_canonical_text`).
+    # The CAST is the intended use, not a workaround: the data plane streams a UUID
+    # column as its canonical text, pinned by its test
+    # `a_uuid_column_streams_as_its_canonical_text`.
     conn.execute(
         f"CREATE TEMP TABLE {_RUN_FEATURE} AS "
         f"SELECT feature_idx, CAST(sequence_hash AS UUID) AS sequence_hash FROM {lake}"
@@ -193,7 +225,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 memory_gb=resolve_duckdb_memory_gb(_DUCKDB_MEMORY_GB, threads=_DUCKDB_THREADS),
                 threads=_DUCKDB_THREADS,
             )
-            dump_raw_tables(conn, output / _ASSEMBLER_DIR, raw)
+            _dump_raw_tables(conn, output / _ASSEMBLER_DIR, raw)
             register_raw_tables(conn, raw)
 
             async with open_read_masked_stream(
@@ -202,7 +234,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 mask_idx=inputs.assembly_mask_idx,
                 columns=_READ_LOOKUP_COLUMNS,
             ) as reads:
-                read_names_from_lookup(conn, reads)
+                _read_names_from_lookup(conn, reads)
 
             _genome_contigs(conn, output / _GENOMES_DIR)
             async with open_assembled_sequence_stream(

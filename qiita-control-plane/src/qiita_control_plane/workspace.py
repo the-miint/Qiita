@@ -4,8 +4,8 @@ The layout itself — `PATH_SCRATCH/ticket/<work_ticket_idx>/<step>/attempt-<n>/
 the helpers that build it — is shared with the compute side and lives in
 `qiita_common.workspace`; it is re-exported here so the control plane's callers
 import one module. What only the control plane needs is defined below: the logs
-directory it reads, and the payload record an `action:` entry keeps beside its
-attempts.
+directory that it reads, and the payload record that an `action:` entry keeps
+beside its attempts.
 """
 
 import hashlib

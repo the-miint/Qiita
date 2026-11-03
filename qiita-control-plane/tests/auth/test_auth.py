@@ -437,7 +437,7 @@ def test_cp_projection_allowlist_matches_the_rust_one_exactly():
 
 
 def test_cp_projection_tables_and_requirement_match_the_dp():
-    """The mapping's KEYS, and which of them REQUIRE a list, must match the data
+    """The mapping's keys, and which of them require a list, must match the data
     plane's too — in both directions.
 
     A table the CP thinks is projectable but the DP does not mints tickets

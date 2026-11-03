@@ -336,7 +336,7 @@ async def test_doget_signs_a_requested_projection(ctx):
 )
 async def test_doget_bad_column_list_422(ctx, columns):
     """A bad projection is refused at mint and never signed. The empty case is
-    the one only this layer can catch: on the wire an empty list is
+    the one that only this layer can catch: on the wire an empty list is
     indistinguishable from an absent one, which means the full shape."""
     pool = ctx["pool"]
     prep, mask, bs = await _seed_gate(pool, ctx["principal_idx"], state="completed")

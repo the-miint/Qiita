@@ -95,7 +95,7 @@ async fn replay_safe_actions_matches_dispatcher() {
     assert_eq!(err.code(), tonic::Code::InvalidArgument);
 }
 
-/// `count_masked` reuses a `read_masked` DoGet ticket, which may now carry an
+/// `count_masked` reuses a `read_masked` DoGet ticket, which can carry an
 /// optional projection. A count has no columns to narrow, so a projected ticket
 /// is refused rather than counted with the signed field disregarded. Checked
 /// before the lake is touched, so no catalog is needed.

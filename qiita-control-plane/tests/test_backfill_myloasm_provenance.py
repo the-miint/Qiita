@@ -15,11 +15,24 @@ import uuid
 import pytest
 import pytest_asyncio
 from qiita_common.actions import LONG_READ_ASSEMBLY_ACTION_ID
+from qiita_common.models import (
+    ComputeTarget,
+    FailureType,
+    ProcessingStatus,
+    ScopeTargetKind,
+    StepProgressState,
+    WorkTicketFailureStage,
+    WorkTicketState,
+)
 
 from qiita_control_plane.backfill.myloasm_provenance import (
     RECOVER_ACTION_ID,
     RunStatus,
     plan_backfill,
+)
+from qiita_control_plane.repositories.assembly import (
+    ASSEMBLY_SAMPLE_COMPLETED,
+    ASSEMBLY_SAMPLE_NO_DATA,
 )
 from qiita_control_plane.testing.db_seeds import (
     seed_biosample_with_sequenced_prep_sample,
@@ -35,12 +48,13 @@ async def _seed_action(pool, action_id: str, version: str, context_schema: dict)
         "INSERT INTO qiita.action"
         " (action_id, version, target_kind, scopes, audience, context_schema, steps,"
         "  cpu_ceiling, mem_ceiling_gb, walltime_ceiling, success_status, failure_status)"
-        " VALUES ($1, $2, 'prep_sample', '{}'::text[], $3::jsonb,"
+        " VALUES ($1, $2, $5, '{}'::text[], $3::jsonb,"
         "         $4::jsonb, '[]'::jsonb, 1, 1, '1 minute', 'active', 'failed')",
         action_id,
         version,
         '{"service": false, "human_roles": ["system_admin"]}',
         json.dumps(context_schema),
+        ScopeTargetKind.PREP_SAMPLE.value,
     )
 
 
@@ -78,7 +92,7 @@ async def world(postgres_pool, tmp_path):
         *,
         assembler: str = "myloasm",
         version: str = source_version,
-        state: str = "completed",
+        state: str = ASSEMBLY_SAMPLE_COMPLETED,
     ) -> int:
         """An assembly run of `ps` and its `assembly_sample` row; returns processing_idx."""
         params = {
@@ -109,19 +123,19 @@ async def world(postgres_pool, tmp_path):
         ps: int,
         *,
         context: dict | None = None,
-        state: str = "completed",
+        state: WorkTicketState = WorkTicketState.COMPLETED,
         version: str = source_version,
         action_id: str = LONG_READ_ASSEMBLY_ACTION_ID,
         mask: int | None = mask_idx,
         failure_reason: str | None = None,
     ) -> int:
-        failed = state == "failed"
+        failed = state is WorkTicketState.FAILED
         idx = await pool.fetchval(
             "INSERT INTO qiita.work_ticket"
             " (action_id, action_version, originator_principal_idx, scope_target_kind,"
             "  prep_sample_idx, action_context, mask_idx, state,"
             "  failure_type, failure_stage, failure_reason)"
-            " VALUES ($1, $2, $3, 'prep_sample', $4, $5::jsonb, $6,"
+            " VALUES ($1, $2, $3, $11, $4, $5::jsonb, $6,"
             "         $7::qiita.work_ticket_state, $8::qiita.failure_type,"
             "         $9::qiita.work_ticket_failure_stage, $10) RETURNING work_ticket_idx",
             action_id,
@@ -130,28 +144,37 @@ async def world(postgres_pool, tmp_path):
             ps,
             json.dumps({"assembler": "myloasm"} if context is None else context),
             mask,
-            state,
-            "permanent" if failed else None,
-            "submission" if failed else None,
+            state.value,
+            FailureType.PERMANENT.value if failed else None,
+            WorkTicketFailureStage.SUBMISSION.value if failed else None,
             (failure_reason or "failed") if failed else None,
+            ScopeTargetKind.PREP_SAMPLE.value,
         )
         tickets.append(idx)
         return idx
 
-    async def step(wt: int, attempt: int, *, state: str = "completed", tree: bool = True):
+    async def step(
+        wt: int,
+        attempt: int,
+        *,
+        state: StepProgressState = StepProgressState.COMPLETED,
+        tree: bool = True,
+    ):
         """An `assemble` step row, and (for a completed one with `tree`) its output on
-        scratch: the manifest and the assembler tree."""
-        failed = state == "failed"
+        scratch: the manifest and the assembler tree. The runner numbers attempts
+        from 0."""
+        failed = state is StepProgressState.FAILED
         await pool.execute(
             "INSERT INTO qiita.work_ticket_step"
             " (work_ticket_idx, step_index, attempt, step_name, compute_target, state,"
             "  failure_kind, failure_reason)"
-            " VALUES ($1, 0, $2, 'assemble', 'local', $3, $4, $5)",
+            " VALUES ($1, 0, $2, 'assemble', $6, $3, $4, $5)",
             wt,
             attempt,
-            state,
+            state.value,
             "oom" if failed else None,
             "out of memory" if failed else None,
+            ComputeTarget.LOCAL.value,
         )
         out = tmp_path / str(wt) / "assemble" / f"attempt-{attempt}" / "output"
         if tree:
@@ -159,7 +182,9 @@ async def world(postgres_pool, tmp_path):
             (out / "manifest.json").write_text('{"files": [], "outputs": {}}')
         return out
 
-    async def recover(ps: int, processing_idx: int, *, state: str, failure_reason=None) -> int:
+    async def recover(
+        ps: int, processing_idx: int, *, state: WorkTicketState, failure_reason=None
+    ) -> int:
         return await ticket(
             ps,
             action_id=RECOVER_ACTION_ID,
@@ -170,9 +195,9 @@ async def world(postgres_pool, tmp_path):
             failure_reason=failure_reason,
         )
 
-    async def plan(**kwargs):
+    async def plan(*, source_versions=(source_version,), **kwargs):
         p = await plan_backfill(
-            pool, ticket_root=tmp_path, source_versions=(source_version,), **kwargs
+            pool, ticket_root=tmp_path, source_versions=source_versions, **kwargs
         )
         return {(r.prep_sample_idx, r.processing_idx): r for r in p.runs}
 
@@ -180,6 +205,7 @@ async def world(postgres_pool, tmp_path):
         "pool": pool,
         "owner": owner,
         "mask_idx": mask_idx,
+        "source_version": source_version,
         "other_version": other_version,
         "prep_sample": prep_sample,
         "run": run,
@@ -213,21 +239,21 @@ async def test_a_finished_run_is_writable_from_its_completed_attempt(world):
     ps = await w["prep_sample"]()
     p = await w["run"](ps)
     wt = await w["ticket"](ps)
-    await w["step"](wt, 1, state="failed", tree=False)
-    await w["step"](wt, 2)
+    await w["step"](wt, 0, state=StepProgressState.FAILED, tree=False)
+    await w["step"](wt, 1)
 
     run = (await w["plan"]())[(ps, p)]
     assert run.status is RunStatus.WRITABLE, run.reason
-    assert (run.source_work_ticket_idx, run.assemble_attempt) == (wt, 2)
+    assert (run.source_work_ticket_idx, run.assemble_attempt) == (wt, 1)
     assert run.submit_body() == {
         "action_id": RECOVER_ACTION_ID,
         "action_version": "1.0.0",
-        "scope_target": {"kind": "prep_sample", "prep_sample_idx": ps},
+        "scope_target": {"kind": ScopeTargetKind.PREP_SAMPLE, "prep_sample_idx": ps},
         "action_context": {
             "assembly_processing_idx": p,
             "assembly_mask_idx": w["mask_idx"],
             "source_work_ticket_idx": wt,
-            "assemble_attempt": 2,
+            "assemble_attempt": 1,
         },
     }
 
@@ -250,15 +276,15 @@ async def test_the_newest_completed_ticket_of_the_runs_assembler_is_the_source(w
     ps = await w["prep_sample"]()
     p = await w["run"](ps)
     old = await w["ticket"](ps)
-    await w["step"](old, 1)
+    await w["step"](old, 0)
     newer = await w["ticket"](ps)
-    await w["step"](newer, 1)
-    await w["step"](await w["ticket"](ps, context={}), 1)
-    await w["ticket"](ps, state="failed")
+    await w["step"](newer, 0)
+    await w["step"](await w["ticket"](ps, context={}), 0)
+    await w["ticket"](ps, state=WorkTicketState.FAILED)
 
     run = (await w["plan"]())[(ps, p)]
     assert run.status is RunStatus.WRITABLE, run.reason
-    assert run.source_work_ticket_idx == newer
+    assert (run.source_work_ticket_idx, run.assemble_attempt) == (newer, 0)
 
 
 @pytest.mark.parametrize(
@@ -277,9 +303,9 @@ async def test_a_run_whose_source_cannot_be_found_is_residue(world, setup, reaso
     if setup != "no-ticket":
         wt = await w["ticket"](ps)
         if setup == "no-tree":
-            await w["step"](wt, 1, tree=False)
+            await w["step"](wt, 0, tree=False)
         elif setup == "no-assembler":
-            out = await w["step"](wt, 1)
+            out = await w["step"](wt, 0)
             (out / "assembler").rmdir()
 
     run = (await w["plan"]())[(ps, p)]
@@ -290,27 +316,28 @@ async def test_a_run_whose_source_cannot_be_found_is_residue(world, setup, reaso
 async def test_runs_with_nothing_to_recover_are_skipped(world):
     w = world
     ps = await w["prep_sample"]()
-    empty = await w["run"](ps, state="no_data")
+    empty = await w["run"](ps, state=ASSEMBLY_SAMPLE_NO_DATA)
     deprecated = await w["run"](ps)
     await w["pool"].execute(
-        "UPDATE qiita.processing SET status = 'deprecated', deprecated_at = now(),"
+        "UPDATE qiita.processing SET status = $3, deprecated_at = now(),"
         " deprecated_by_idx = $2, deprecation_reason = 'test' WHERE processing_idx = $1",
         deprecated,
         w["owner"],
+        ProcessingStatus.DEPRECATED.value,
     )
     planned = await w["plan"]()
     assert planned[(ps, empty)].status is RunStatus.SKIPPED
-    assert "no_data" in planned[(ps, empty)].reason
+    assert ASSEMBLY_SAMPLE_NO_DATA in planned[(ps, empty)].reason
     assert planned[(ps, deprecated)].status is RunStatus.SKIPPED
-    assert "deprecated" in planned[(ps, deprecated)].reason
+    assert ProcessingStatus.DEPRECATED in planned[(ps, deprecated)].reason
 
 
 @pytest.mark.parametrize(
     ("state", "status"),
     [
-        ("completed", RunStatus.DONE),
-        ("processing", RunStatus.IN_FLIGHT),
-        ("failed", RunStatus.RESIDUE),
+        (WorkTicketState.COMPLETED, RunStatus.DONE),
+        (WorkTicketState.PROCESSING, RunStatus.IN_FLIGHT),
+        (WorkTicketState.FAILED, RunStatus.RESIDUE),
     ],
 )
 async def test_a_runs_own_recovery_ticket_decides_its_status(world, state, status):
@@ -318,16 +345,16 @@ async def test_a_runs_own_recovery_ticket_decides_its_status(world, state, statu
     ps = await w["prep_sample"]()
     p = await w["run"](ps)
     wt = await w["ticket"](ps)
-    await w["step"](wt, 1)
+    await w["step"](wt, 0)
     rec = await w["recover"](
-        ps, p, state=state, failure_reason="boom" if state == "failed" else None
+        ps, p, state=state, failure_reason="boom" if state is WorkTicketState.FAILED else None
     )
 
     run = (await w["plan"]())[(ps, p)]
     assert run.status is status
     if status is not RunStatus.DONE:
         assert str(rec) in run.reason
-    if state == "failed":
+    if state is WorkTicketState.FAILED:
         assert "boom" in run.reason
         retried = (await w["plan"](retry_failed=True))[(ps, p)]
         assert retried.status is RunStatus.WRITABLE
@@ -335,13 +362,14 @@ async def test_a_runs_own_recovery_ticket_decides_its_status(world, state, statu
 
 
 async def test_another_runs_recovery_ticket_does_not_count_as_this_runs(world):
+    """One prep_sample assembled with myloasm on both source versions: two runs."""
     w = world
     ps = await w["prep_sample"]()
-    a, b = await w["run"](ps), await w["run"](ps)
-    wt = await w["ticket"](ps)
-    await w["step"](wt, 1)
-    await w["recover"](ps, a, state="completed")
+    a, b = await w["run"](ps), await w["run"](ps, version=w["other_version"])
+    await w["step"](await w["ticket"](ps), 0)
+    await w["step"](await w["ticket"](ps, version=w["other_version"]), 0)
+    await w["recover"](ps, a, state=WorkTicketState.COMPLETED)
 
-    planned = await w["plan"]()
+    planned = await w["plan"](source_versions=(w["source_version"], w["other_version"]))
     assert planned[(ps, a)].status is RunStatus.DONE
-    assert planned[(ps, b)].status is RunStatus.WRITABLE
+    assert planned[(ps, b)].status is RunStatus.WRITABLE, planned[(ps, b)].reason

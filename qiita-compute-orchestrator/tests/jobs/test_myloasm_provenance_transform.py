@@ -25,7 +25,7 @@ from qiita_common.myloasm_constants import MYLOASM_TABLES
 
 from qiita_compute_orchestrator.jobs._myloasm_provenance import (
     CONTIG_FEATURE_TABLE,
-    read_names_from_lookup,
+    READ_NAME_TABLE,
     read_names_from_sequence_idx,
     register_raw_tables,
     write_myloasm_staging,
@@ -62,9 +62,10 @@ def _stage(
         if lookup is None:
             read_names_from_sequence_idx(conn)
         else:
-            conn.execute("CREATE TEMP TABLE lookup (read_id VARCHAR, sequence_idx BIGINT)")
-            conn.executemany("INSERT INTO lookup VALUES (?, ?)", lookup)
-            read_names_from_lookup(conn, "lookup")
+            conn.execute(
+                f"CREATE TEMP TABLE {READ_NAME_TABLE} (read_id VARCHAR, sequence_idx BIGINT)"
+            )
+            conn.executemany(f"INSERT INTO {READ_NAME_TABLE} VALUES (?, ?)", lookup)
         _contig_feature(conn, features)
         return write_myloasm_staging(
             conn, staging_dir=staging, prep_sample_idx=_PREP_SAMPLE, processing_idx=_RUN

@@ -3,18 +3,20 @@ long-read-assembly 1.0.0/1.0.1 run (`jobs/myloasm_provenance_recover.py`).
 
 The source is a real-shaped `assemble` step output under a scratch tree — myloasm's
 `-o` tree from the committed fixture, the splitter's `genomes/`, and the step's
-manifest — at the path the ticket workspace layout gives it. The two data-plane
+manifest — at the path that the ticket workspace layout gives it. The two data-plane
 streams are replaced: the read lookup by the fixture's read names, and the run's
-`assembled_sequence` by the genome contigs' canonical hashes, computed here in plain
-Python so the job's own hashing is checked against an independent oracle.
+`assembled_sequence` by what `assembly_hash` itself writes for those genomes, so the
+job must reproduce the producer's hashes from the same bytes.
 """
 
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
+import os
 import shutil
+import subprocess
+import sys
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -27,7 +29,7 @@ import pytest
 from myloasm_fixture import (
     MYLOASM_FIXTURE_ROWS,
     MYLOASM_FIXTURE_VERSIONS,
-    myloasm_assemble_output,
+    myloasm_output_dir,
     myloasm_raw_dir,
     myloasm_read_name_map,
 )
@@ -40,6 +42,7 @@ from qiita_common.workspace import (
     ticket_workspace,
 )
 
+from qiita_compute_orchestrator.jobs import assembly_hash
 from qiita_compute_orchestrator.jobs import myloasm_provenance_recover as job
 from qiita_compute_orchestrator.jobs._myloasm_provenance import (
     CONTIG_FEATURE_TABLE,
@@ -52,10 +55,11 @@ _PREP_SAMPLE = 41
 _RUN = 77
 _MASK = 5
 _SOURCE_TICKET = 4834
-_ATTEMPT = 2
+# The runner's first attempt, which is most runs' only one.
+_ATTEMPT = 0
 _FIRST_FEATURE = 1001
-# Reads the mask passed that the assembler never used: the lookup is the sample's
-# whole pass-set, and the job must keep only the names the dump uses.
+# Reads that the mask passed and the assembler never used: the lookup is the
+# prep_sample's whole pass-set, and the job must keep only the names that the dump uses.
 _UNUSED_READS = [("m84001/1/ccs", 1), ("m84001/2/ccs", 2)]
 
 _READ_SCHEMA = pa.schema([("read_id", pa.string()), ("sequence_idx", pa.int64())])
@@ -68,27 +72,62 @@ _LAKE_SCHEMA = pa.schema(
         ("sequence_length_bp", pa.int64()),
     ]
 )
-_COMPLEMENT = str.maketrans("ACGT", "TGCA")
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+_SPLIT_SCRIPT = _REPO_ROOT / "workflows" / "long-read-assembly" / "myloasm_split.py"
+_MANIFEST_WRITER = _REPO_ROOT / "workflows" / "_shared" / "manifest_writer.py"
 
 
-def _canonical_hash(sequence: str) -> str:
-    """`qiita_common.chunking.canonical_sequence_hash_expr`, restated in Python."""
-    forward = sequence.upper()
-    reverse = forward.translate(_COMPLEMENT)[::-1]
-    digest = min(hashlib.md5(s.encode()).hexdigest() for s in (forward, reverse))
-    return str(uuid.UUID(digest))
+def _assemble_output(out: Path, version: str) -> Path:
+    """A finished 1.0.0/1.0.1 `assemble` step's output for a myloasm run, built as
+    that step built it: myloasm's `-o` tree under `assembler/`, the splitter's
+    `genomes/`, and the step's `manifest.json` over both. Those versions wrote no
+    provenance dump, so there is none here."""
+    asm = myloasm_output_dir(out / "assembler", version)
+    genomes = out / "genomes"
+    genomes.mkdir(parents=True)
+    for argv in (
+        [
+            _SPLIT_SCRIPT,
+            asm / "assembly_primary.fa",
+            genomes / "circular.fa",
+            genomes / "noLCG.fa",
+            genomes / "contig_attributes.tsv",
+        ],
+        [_MANIFEST_WRITER, out, "genomes_dir=genomes"],
+    ):
+        result = subprocess.run(
+            [sys.executable, *map(str, argv)], capture_output=True, text=True, env=dict(os.environ)
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"{argv[0].name} failed: {result.stderr}")
+    return out
 
 
-def _fasta(path: Path) -> dict[str, str]:
-    records: dict[str, list[str]] = {}
-    name = None
-    for line in path.read_text().splitlines():
-        if line.startswith(">"):
-            name = line[1:].split()[0]
-            records[name] = []
-        elif name is not None:
-            records[name].append(line.strip())
-    return {k: "".join(v) for k, v in records.items()}
+def _producer_features(genomes: Path, work: Path) -> dict[str, tuple[int, str, int]]:
+    """`contig_id -> (feature_idx, sequence_hash, length)` as the run's lake rows hold
+    them: `assembly_hash` run over the genomes, one feature per canonical hash as
+    minting assigns them, the hash as the data plane streams it (canonical text)."""
+    bins = work / "refined_bins"
+    bins.mkdir(parents=True)
+    out = asyncio.run(
+        assembly_hash.execute(
+            assembly_hash.Inputs(
+                genomes_dir=genomes,
+                refined_bins_dir=bins,
+                prep_sample_idx=_PREP_SAMPLE,
+                work_ticket_idx=1,
+            ),
+            work / "ws",
+        )
+    )
+    with duckdb.connect() as conn:
+        rows = conn.execute(
+            "SELECT b.contig_id, CAST(m.sequence_hash AS VARCHAR), m.sequence_length_bp, "
+            "dense_rank() OVER (ORDER BY m.sequence_hash) "
+            "FROM read_parquet(?) m JOIN read_parquet(?) b USING (read_id) ORDER BY 1",
+            [str(out["manifest"]), str(out["bin_map"])],
+        ).fetchall()
+    return {c: (_FIRST_FEATURE + rank - 1, h, n) for c, h, n, rank in rows}
 
 
 @dataclass(frozen=True)
@@ -115,18 +154,11 @@ def _output_dir(scratch: Path) -> Path:
 def built(request, tmp_path_factory) -> Source:
     root = tmp_path_factory.mktemp(f"myloasm-{request.param}")
     scratch = root / "scratch"
-    output = myloasm_assemble_output(_output_dir(scratch), request.param)
+    output = _assemble_output(_output_dir(scratch), request.param)
     names = myloasm_read_name_map(
         myloasm_raw_dir(root / "names", request.param, sequence_idx_names=False)
     )
-    contigs = {
-        **_fasta(output / "genomes" / "circular.fa"),
-        **_fasta(output / "genomes" / "noLCG.fa"),
-    }
-    features = {
-        contig: (_FIRST_FEATURE + i, _canonical_hash(seq), len(seq))
-        for i, (contig, seq) in enumerate(sorted(contigs.items()))
-    }
+    features = _producer_features(output / "genomes", root / "producer")
     return Source(request.param, scratch, output, names, features)
 
 
@@ -154,7 +186,7 @@ def _install(monkeypatch, source: Source, *, reads=None, lake=None) -> dict:
     ]
     lake_rows = [
         {"feature_idx": f, "sequence_hash": h, "sequence_length_bp": n}
-        for f, h, n in (source.features.values() if lake is None else lake)
+        for f, h, n in (sorted(set(source.features.values())) if lake is None else lake)
     ]
 
     @asynccontextmanager
@@ -233,7 +265,7 @@ def test_recovers_the_six_tables_the_transform_stages_for_the_run(monkeypatch, s
     assert sorted(p.name for p in staging.iterdir()) == sorted(
         f"{t}.parquet" for t in MYLOASM_TABLES
     )
-    # Only the two columns the lookup binds cross the wire.
+    # Only the two columns that the lookup binds cross the wire.
     assert asked["reads"] == (_PREP_SAMPLE, _MASK, ["read_id", "sequence_idx"])
     assert asked["lake"] == (_PREP_SAMPLE, _RUN)
 
@@ -317,8 +349,10 @@ def test_a_read_the_lookup_does_not_resolve_fails_and_stages_nothing(monkeypatch
     [
         # A genome contig whose bytes the run's lake rows do not carry: the tree is
         # not the registered attempt's.
-        pytest.param(lambda f: list(f.values())[1:], "not in the run's", id="contig-missing"),
-        # A lake feature no genome contig hashes to.
+        pytest.param(
+            lambda f: sorted(set(f.values()))[1:], "not in the run's", id="contig-missing"
+        ),
+        # A lake feature that no genome contig hashes to.
         pytest.param(
             lambda f: [*f.values(), (9999, str(uuid.UUID(int=1)), 10)],
             "no genome contig",
@@ -336,9 +370,15 @@ def test_genome_contigs_must_be_exactly_the_runs_lake_features(
 
 
 @pytest.mark.parametrize(
-    "field",
-    ["assembly_processing_idx", "assembly_mask_idx", "source_work_ticket_idx", "assemble_attempt"],
+    ("field", "bad"),
+    [
+        ("assembly_processing_idx", 0),
+        ("assembly_mask_idx", 0),
+        ("source_work_ticket_idx", 0),
+        # An attempt counts from 0 (the happy path runs attempt 0).
+        ("assemble_attempt", -1),
+    ],
 )
-def test_inputs_refuse_a_non_positive_identifier(field):
+def test_inputs_refuse_an_identifier_out_of_range(field, bad):
     with pytest.raises(ValueError):
-        _inputs(**{field: 0})
+        _inputs(**{field: bad})

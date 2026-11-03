@@ -533,7 +533,7 @@ else
 fi
 rm -f "$MIINT_AMPLICON_PROBE"
 
-# The per-ticket workspace SLURM jobs actually run in (qiita_common.workspace).
+# The per-ticket workspace that SLURM jobs run in (qiita_common.workspace).
 SF="${{PATH_SCRATCH:-{sf_default}}}/{WORK_TICKET_SUBDIR}"
 if [ -d "$SF" ]; then
     echo "{_PROBE_LINE_PREFIX} shared-fs-visible=ok path=$SF"

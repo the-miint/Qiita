@@ -1,4 +1,4 @@
-"""The `assemble` step's output basenames, shared by the native assembly jobs.
+"""The `assemble` step's output basenames, and how the native assembly jobs read them.
 
 The `kind` value set those jobs also share lives in the contract layer,
 `qiita_common.assembly_constants` — these basenames do not, because they are
@@ -20,3 +20,7 @@ from __future__ import annotations
 # tests/test_long_read_assembly_entrypoint_pins.py.
 LCG_FILE = "circular.fa"  # every circular contig, as one multi-FASTA
 NOLCG_FILE = "noLCG.fa"  # the non-circular contigs; the binning input
+
+# Byte budget for each `read_fastx` batch over these files — caps the read-side vector
+# so a run of multi-MB contig records can't materialise a giant chunk at once.
+READ_FASTX_MAX_BATCH_BYTES = "128MB"

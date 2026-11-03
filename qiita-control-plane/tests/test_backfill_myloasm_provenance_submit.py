@@ -4,15 +4,23 @@ No database: the loop takes the plan and a `submit` callable, so these pin what 
 sends, what it holds back, and that one refused submission never stops the rest.
 """
 
+from pathlib import Path
+
 import httpx
 import pytest
 
+from qiita_control_plane.actions.context_validator import validate_context
+from qiita_control_plane.actions.loader import load_actions
 from qiita_control_plane.backfill.myloasm_provenance import (
+    RECOVER_ACTION_ID,
+    RECOVER_ACTION_VERSION,
     BackfillPlan,
     Run,
     RunStatus,
     submit_runs,
 )
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 def _run(ps: int, p: int, status: RunStatus = RunStatus.WRITABLE) -> Run:
@@ -94,3 +102,15 @@ def test_limit_caps_attempts_and_rate_sleeps_between_them():
 def test_a_non_positive_limit_is_refused(limit):
     with pytest.raises(ValueError, match="limit"):
         submit_runs(BackfillPlan(runs=[]), submit=_Submit(), limit=limit)
+
+
+def test_the_submit_body_satisfies_the_shipped_workflow():
+    """The body's action names the shipped workflow, and its context passes that
+    workflow's `context_schema` for a first attempt (0), the common case."""
+    [action] = [
+        a
+        for a in load_actions(_REPO_ROOT / "workflows")
+        if (a.action_id, a.version) == (RECOVER_ACTION_ID, RECOVER_ACTION_VERSION)
+    ]
+    run = Run(1, 10, 5, RunStatus.WRITABLE, source_work_ticket_idx=100, assemble_attempt=0)
+    assert validate_context(action.context_schema, run.submit_body()["action_context"]) == []

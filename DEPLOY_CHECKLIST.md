@@ -142,7 +142,7 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
   [`data-plane-scaling.md` § The control plane through nginx](docs/runbooks/data-plane-scaling.md#the-control-plane-through-nginx).
   Undo it before any rollback to a commit without that listener.
 - `[admin]` **Recover the provenance of the myloasm runs finished before this deploy**
-  (long-read-assembly 1.0.0/1.0.1, about 1,062 runs). Each run gets one
+  (long-read-assembly 1.0.0/1.0.1; the dry run counts them). Each run gets one
   `myloasm-provenance-recover` ticket, which reads the `assemble` output left in that run's
   ticket workspace. Run it soon after the deploy, since those files last only as long as
   the scratch workspace does. (#TBD)
@@ -154,14 +154,16 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
   ```
   Once those five tickets complete, run bucket 5's 1.0.2 provenance query for each one, with
   `PS`/`RUN` taken from the `prep_sample <PS> run <RUN> -> ticket <T>` lines it printed.
-  Expect the same results as that check. Then submit the rest, paced:
+  Expect the same results as that check. Note their peak memory and elapsed time
+  (`sacct -j <job> -o MaxRSS,Elapsed`) against the step's unmeasured 16 GB / 2 h
+  baseline. Then submit the rest, paced:
   `qiita-admin backfill myloasm-provenance --execute --rate 10`.
 
   Each pass submits one ticket per prep_sample, so rerun it once the pass's tickets finish.
   You are done when the dry run shows `writable : 0` and `in flight : 0` and every
   `residue` line has an explanation. `--retry-failed` resubmits runs whose recovery ticket
-  failed. Post the final dry run and the residue explanations on #827, which removes the
-  one-off.
+  failed. Post the final counts per status and each residue reason with its count
+  (no `_idx` values: the repository is public) on #827, which removes the one-off.
 
 ### Notes (no host action)
 

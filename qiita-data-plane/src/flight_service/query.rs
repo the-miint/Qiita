@@ -158,7 +158,7 @@ const ALIGNMENT_PROJECTION_COLUMNS: &[&str] = &[
 /// `no_membership_join_table_has_a_projection_allowlist` does.
 const MEMBERSHIP_JOIN_TABLES: &[&str] = &["reference_sequences", "reference_sequence_chunks"];
 
-/// The columns a `read_masked` ticket may project: the macro's output, in its
+/// The columns that a `read_masked` ticket may project: the macro's output, in its
 /// order (`ensure_read_tables` in ducklake.rs). Nothing here is wider than the
 /// unprojected stream — a projection only narrows it — so the list is the
 /// macro's whole shape, not a curated subset.
@@ -173,14 +173,13 @@ const READ_MASKED_PROJECTION_COLUMNS: &[&str] = &[
     "qual2",
 ];
 
-/// How one table takes a projection: the columns a ticket may name, and whether
-/// it must name some.
+/// How one table takes a projection: the columns that a ticket may name, and
+/// whether it must name some.
 struct ProjectionRule {
     columns: &'static [&'static str],
-    /// `true` where serving the table unprojected is the wrong default, so a
-    /// ticket without a list is refused rather than widened to `SELECT *`.
-    /// `false` where the full shape is the default every existing consumer
-    /// reads, and a list is a consumer opting into fewer columns.
+    /// `true` where a ticket without a list is refused rather than widened to
+    /// `SELECT *`; `false` where it streams the full shape. Why each table is
+    /// which: `docs/architecture/flight.md`.
     required: bool,
 }
 
@@ -215,8 +214,8 @@ fn projection_rule(table: &str) -> Option<&'static ProjectionRule> {
 }
 
 /// The SQL select list for `table`, given the ticket's (possibly empty) column
-/// list: the signed columns in the ticket's own order, or `*` for a table whose
-/// rule does not require a list (or that has none).
+/// list: the signed columns in the ticket's own order, or `*` when the ticket
+/// names none and the table's rule does not require it (or the table has no rule).
 ///
 /// Every rejection is a control-plane bug rather than client input — the CP
 /// validates the same set before signing — so failing loudly is the point: the

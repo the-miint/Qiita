@@ -34,8 +34,9 @@ from ..block_read import READ_BLOCK_TABLE, READ_MASKED_BLOCK_TABLE
 _MEMBERS_TABLES = frozenset({READ_BLOCK_TABLE, READ_MASKED_BLOCK_TABLE})
 
 # Columns each table may have signed into a ticket's projection list, and the
-# tables that REQUIRE one — the CP mirror of the data plane's `PROJECTION_RULES`
-# (flight_service/query.rs), where the rule and its rationale live. Neither
+# tables that require one — the CP mirror of the data plane's `PROJECTION_RULES`
+# (flight_service/query.rs); why each table is which is
+# docs/architecture/flight.md. Neither
 # language can import the other, so the two are kept honest by a test that parses
 # the Rust source — see tests/auth/test_auth.py.
 #
