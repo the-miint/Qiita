@@ -28,7 +28,7 @@ From: mambaorg/micromamba:1.5.8
 %labels
     workflow long-read-assembly
     tool assemble
-    version 1.0.0
+    version 1.0.2
 
 %files
     # Workflow-agnostic output-dir → manifest.json walker, copied from _shared
@@ -46,6 +46,9 @@ From: mambaorg/micromamba:1.5.8
     # checkm.def copies the same file for lcg_split.py, and the connect config has
     # to stay identical to what the three services run.
     miint_connect.py /opt/qiita/miint_connect.py
+    # The myloasm provenance dump (miint read_myloasm_* -> Parquet into genomes_dir).
+    # Its own file for the same reason as the splitter.
+    myloasm_provenance.py /opt/qiita/myloasm_provenance.py
 
 %environment
     export MAMBA_ROOT_PREFIX=/opt/conda
@@ -78,7 +81,7 @@ From: mambaorg/micromamba:1.5.8
     # `duckdb` version resolved in qiita-compute-orchestrator/uv.lock —
     # a unit test asserts the two match, so a lockfile bump fails the unit suite
     # rather than the next assembly.
-    micromamba install -y -n base -c conda-forge python-duckdb=1.5.5
+    micromamba install -y -n base -c conda-forge python-duckdb=2.0.0
 
     # ONE ENV PER ASSEMBLER, deliberately, even though only one runs per step. A
     # single shared solve couples them: bumping either pin could make the other
@@ -114,7 +117,7 @@ From: mambaorg/micromamba:1.5.8
     micromamba create -y -n myloasm -c bioconda -c conda-forge myloasm=0.6.0
 
     chmod 0755 /opt/qiita/_lib.sh /opt/qiita/assemble.sh
-    chmod 0644 /opt/qiita/manifest_writer.py /opt/qiita/myloasm_split.py
+    chmod 0644 /opt/qiita/manifest_writer.py /opt/qiita/myloasm_split.py /opt/qiita/myloasm_provenance.py
 
     micromamba clean -a -y
 
@@ -167,11 +170,12 @@ From: mambaorg/micromamba:1.5.8
     grep -q 'micromamba run -n hifiasm_meta hifiasm_meta' /opt/qiita/assemble.sh
     grep -q 'micromamba run -n myloasm myloasm' /opt/qiita/assemble.sh
     grep -q 'python3 /opt/qiita/myloasm_split\.py' /opt/qiita/assemble.sh
+    grep -q 'python3 /opt/qiita/myloasm_provenance\.py' /opt/qiita/assemble.sh
     # The splitter's DuckDB must be the version the orchestrator staged the miint
     # extension with — DuckDB namespaces the staged dir by engine version, so a
     # skew is a LOAD failure at run time. Assert it here so a drifted solve fails
     # the BUILD instead.
-    python3 -c "import duckdb; assert duckdb.__version__ == '1.5.5', duckdb.__version__"
+    python3 -c "import duckdb; assert duckdb.__version__ == '2.0.0', duckdb.__version__"
     # The splitter is %files-copied, so it can go missing independently of the
     # entrypoint that runs it. It cannot be RUN here — it LOADs the deploy-staged
     # miint extension, which does not exist at build time and is bind-mounted only
@@ -185,13 +189,15 @@ From: mambaorg/micromamba:1.5.8
     test -s /opt/qiita/myloasm_split.py
     test -s /opt/qiita/miint_connect.py
     python3 -c "import importlib.util as u; s=u.spec_from_file_location('ms','/opt/qiita/myloasm_split.py'); m=u.module_from_spec(s); s.loader.exec_module(m)"
+    test -s /opt/qiita/myloasm_provenance.py
+    python3 -c "import importlib.util as u; s=u.spec_from_file_location('mp','/opt/qiita/myloasm_provenance.py'); m=u.module_from_spec(s); s.loader.exec_module(m)"
     # The connect module must stay LOAD-only: an INSTALL would need the team mirror
     # reachable from every compute node and a writable $HOME, the footgun the staged
     # dir replaced. Both files, because the LOAD lives in miint_connect.py and the
     # splitter must not open a connection of its own beside it.
     # Anchored at a string-literal quote so the prose explaining why we do NOT
     # install cannot fail the build.
-    ! grep -qE "[\"']\s*INSTALL\b" /opt/qiita/miint_connect.py /opt/qiita/myloasm_split.py
+    ! grep -qE "[\"']\s*INSTALL\b" /opt/qiita/miint_connect.py /opt/qiita/myloasm_split.py /opt/qiita/myloasm_provenance.py
 
 %runscript
     echo "long-read-assembly-assemble image: invoke the step entrypoint, e.g." >&2

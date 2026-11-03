@@ -16,7 +16,14 @@ def test_permanent_statuses(status):
 
 
 @pytest.mark.parametrize(
-    "text", ["read_ena failed: Connection refused (URL: x)", "Operation TIMED OUT", "curl error 7"]
+    "text",
+    [
+        "read_ena failed: Connection refused (URL: x)",
+        "Operation TIMED OUT",
+        "curl error 7",
+        "Transferred a partial file (retry quota for 'http://h' exhausted: requests to this "
+        "host keep failing)",
+    ],
 )
 def test_transient_error_text(text):
     assert is_transient_error_text(text) is True

@@ -16,16 +16,20 @@ import subprocess
 import sys
 import textwrap
 
+from _pg_env import DUCKLAKE_VERSION
 from conftest import DUCKLAKE_CATALOG_CONNSTR
 
 _WORKER = textwrap.dedent(
     """
     import sys, duckdb
-    CONN, DATA = sys.argv[1], sys.argv[2]
+    CONN, DATA, VERSION = sys.argv[1], sys.argv[2], sys.argv[3]
     def fresh():
         c = duckdb.connect()
         c.execute("LOAD ducklake; LOAD postgres;")
-        c.execute(f"ATTACH 'ducklake:postgres:{CONN}' AS qiita_lake (DATA_PATH '{DATA}/')")
+        c.execute(
+            f"ATTACH 'ducklake:postgres:{CONN}' AS qiita_lake"
+            f" (DATA_PATH '{DATA}/', DUCKLAKE_VERSION '{VERSION}')"
+        )
         return c
     COUNT = "SELECT count(*) FROM qiita_lake.cross_process_probe"
     held = None
@@ -68,7 +72,7 @@ _WRITES = 25
 class _Worker:
     def __init__(self, data_path: str) -> None:
         self.proc = subprocess.Popen(
-            [sys.executable, "-c", _WORKER, DUCKLAKE_CATALOG_CONNSTR, data_path],
+            [sys.executable, "-c", _WORKER, DUCKLAKE_CATALOG_CONNSTR, data_path, DUCKLAKE_VERSION],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             text=True,

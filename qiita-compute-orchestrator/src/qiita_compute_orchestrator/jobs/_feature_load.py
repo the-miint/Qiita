@@ -30,7 +30,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import duckdb
-from qiita_common.parquet import sorted_row_group_size, validate_parquet_path
+from qiita_common.parquet import validate_parquet_path
 
 from ..miint import PARQUET_OPTS_AT_REST
 
@@ -43,10 +43,6 @@ from ..miint import PARQUET_OPTS_AT_REST
 # `string_agg` / sort over the whole corpus), so a tuning change that fixes one and
 # not the others is not a fix.
 CHUNK_BUDGET_PER_BATCH = 50_000
-
-# The bytes beside each `chunk_data` in a written chunk row: feature_idx BIGINT and
-# chunk_index INTEGER.
-_CHUNK_KEY_BYTES = 12
 
 
 def bin_pack_by_chunks[K](items: list[tuple[K, int]]) -> list[list[K]]:
@@ -259,24 +255,15 @@ def write_feature_sequence_chunks(
             # without this sort a point query would scan a whole part. The
             # secondary `chunk_index` orders a feature's chunks for cheap
             # reassembly.
-            #
-            # The row count comes from this part's widest chunk, not a mean: a
-            # reference that mixes short records with genomes would otherwise size a
-            # part, or a run of genome chunks inside one, for the short records. Sized
-            # for the widest, a group never holds more than one vector of it, at the
-            # cost of smaller groups where short records share a part with genomes.
-            chunks, widest = conn.execute(
-                "SELECT count(*), max(strlen(chunk_data)) FROM part_chunks"
-            ).fetchone()
+            (chunks,) = conn.execute("SELECT count(*) FROM part_chunks").fetchone()
             if not chunks:
                 raise ValueError(f"batch {i} matched no chunks in {parts_glob}")
-            row_group_size = sorted_row_group_size(_CHUNK_KEY_BYTES + widest)
             conn.execute(
                 "COPY ("
                 "  SELECT feature_idx, chunk_index, chunk_data"
                 "  FROM part_chunks"
                 "  ORDER BY feature_idx, chunk_index"
-                f") TO '{part_out}' ({PARQUET_OPTS_AT_REST}, ROW_GROUP_SIZE {row_group_size})"
+                f") TO '{part_out}' ({PARQUET_OPTS_AT_REST})"
             )
         conn.execute("DROP TABLE IF EXISTS part_chunks")
     else:

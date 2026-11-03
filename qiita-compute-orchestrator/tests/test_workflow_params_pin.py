@@ -289,7 +289,7 @@ def test_fastq_to_parquet_cpu_pins_duckdb_threads():
     `fastq_to_parquet._DUCKDB_THREADS`, in every version.
 
     The step's cores are spent by its DuckDB pool, and above all by the final write's
-    at-rest compression (see `qiita_common.parquet.sorted_row_group_size`). A `cpu:` above
+    at-rest compression (see the option-set comment in `qiita_common.parquet`). A `cpu:` above
     the literal allocates cores nothing uses; one below it oversubscribes the pool onto
     fewer. The measurement behind the literal is stated once, on `_DUCKDB_THREADS`.
     """

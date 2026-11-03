@@ -2270,12 +2270,15 @@ def _required_duckdb_cli_version() -> str:
     return version
 
 
-def _write_duckdb_stub(path: Path, body: str = "exit 0\n") -> Path:
+def _write_duckdb_stub(path: Path, body: str = "exit 0\n", *, banner: str = "") -> Path:
     """A `duckdb` stand-in that reports the required version to `--version` (the
-    resolver checks it) and otherwise runs `body`."""
+    resolver checks it) and otherwise runs `body`. `banner` is printed to stderr
+    before the version, as the real CLI does in agent mode."""
     version = _required_duckdb_cli_version()
+    preamble = f"echo '{banner}' >&2; " if banner else ""
     path.write_text(
-        f'#!/bin/sh\nif [ "$1" = --version ]; then echo "v{version} (stub) 0"; exit 0; fi\n' + body
+        '#!/bin/sh\nif [ "$1" = --version ]; then '
+        f'{preamble}echo "v{version} (stub) 0"; exit 0; fi\n' + body
     )
     path.chmod(0o755)
     return path
@@ -2437,6 +2440,23 @@ def test_lake_script_refuses_a_duckdb_cli_of_another_version(
     assert not (tmp_path / "captured.sql").exists(), "SQL ran on the wrong CLI"
 
 
+def test_duckdb_cli_version_is_read_past_an_agent_mode_banner(tmp_path: Path) -> None:
+    """Run by an AI agent with stdout not a terminal, the CLI prints a banner to stderr
+    before its version. The right CLI must still be accepted, not refused on the banner."""
+    stub = _write_duckdb_stub(
+        tmp_path / "duckdb",
+        banner="duckdb agent mode on: AI_AGENT is set and stdout is not a terminal",
+    )
+    result = subprocess.run(
+        ["bash", "-c", f'source "{_COMMON}"; qiita_resolve_duckdb_bin && echo "$DUCKDB_BIN"'],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "QIITA_DUCKDB_BIN": str(stub)},
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == str(stub)
+
+
 def test_lake_gc_defaults_to_report_only(tmp_path) -> None:
     """No flag must never reclaim: the whole point of the default run is that an
     operator can look before anything is unlinked."""
@@ -2507,12 +2527,27 @@ def test_lake_gc_reclaim_requires_typed_confirmation(tmp_path) -> None:
     assert not (tmp_path / "captured.sql").exists(), "aborting must not reach the database"
 
 
-def test_lake_gc_refuses_unwritable_data_path(tmp_path) -> None:
-    """The gate is unconditional, so it fires in report mode too — which is what
-    this exercises. DuckLake needs to write the data path even for the dry-run
-    orphan scan (it fails read-only there), so a group-read operator cannot run
-    even the report. Failing here names the right run-as instead of surfacing as
-    a permission error from inside duckdb."""
+@pytest.mark.parametrize("flag", ["--reclaim", "--reclaim-orphans"])
+def test_lake_gc_refuses_to_reclaim_on_an_unwritable_data_path(tmp_path, flag) -> None:
+    """A reclaim unlinks files under the data path. Failing before the prompt names
+    the right run-as instead of surfacing as a permission error from inside duckdb."""
+    if os.geteuid() == 0:
+        pytest.skip("root ignores the write bit")
+    result = subprocess.run(
+        ["bash", str(_LAKE_GC), flag],
+        capture_output=True,
+        text=True,
+        env={**_lake_gc_env(tmp_path, writable=False), "ASSUME_YES": "1"},
+    )
+    assert result.returncode == 1
+    assert "not writable" in result.stderr
+    assert "sudo -u qiita-data" in result.stderr
+    assert not (tmp_path / "captured.sql").exists(), "the refusal must precede the database"
+
+
+def test_lake_gc_reports_on_an_unwritable_data_path(tmp_path) -> None:
+    """A report only reads the data path, so group read is enough (the script says
+    where that was measured)."""
     if os.geteuid() == 0:
         pytest.skip("root ignores the write bit")
     result = subprocess.run(
@@ -2521,9 +2556,8 @@ def test_lake_gc_refuses_unwritable_data_path(tmp_path) -> None:
         text=True,
         env=_lake_gc_env(tmp_path, writable=False),
     )
-    assert result.returncode == 1
-    assert "not writable" in result.stderr
-    assert "qiita-data" in result.stderr
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    assert "report only" in result.stdout
 
 
 def test_lake_gc_never_passes_cleanup_all() -> None:
@@ -2534,9 +2568,8 @@ def test_lake_gc_never_passes_cleanup_all() -> None:
 
 
 def test_lake_gc_uses_the_documented_call_form() -> None:
-    """DuckLake documents these table functions as `CALL f(...)`. `SELECT * FROM
-    f(...)` behaves identically (measured on 1.5.4 — same rows, same deletions),
-    but a reader checking this against the docs should find the documented form.
+    """DuckLake documents these table functions as `CALL f(...)`, and a reader
+    checking the script against the docs should find that form there.
     https://ducklake.select/docs/stable/duckdb/maintenance/expire_snapshots"""
     code = _lake_gc_code()
     assert "SELECT * FROM ducklake_" not in code
@@ -2545,12 +2578,11 @@ def test_lake_gc_uses_the_documented_call_form() -> None:
 
 
 def test_lake_gc_scopes_the_orphan_scan_to_its_own_transaction() -> None:
-    """Steps 1-2 share a transaction (cleanup only sees the expiry from inside
-    it). Step 3 must open a NEW one: measured on 1.5.4, an orphan scan inside a
-    transaction that opened earlier reports a file another session registered and
-    COMMITTED in the meantime, so acting on it would unlink a live file whose
-    catalog row survives. Asserting positions, not mere presence — a CALL that
-    drifts across a COMMIT is exactly the regression this guards."""
+    """Steps 1-2 share a transaction and step 3 opens a NEW one, or it can report,
+    and so unlink, a file another session registered since (the script's comment at
+    each BEGIN says why).
+    Asserting positions, not mere presence — a CALL that drifts across a COMMIT is
+    exactly the regression this guards."""
     code = _lake_gc_code()
     assert code.count("BEGIN TRANSACTION;") == 2, "expected the 1-2 / 3 split"
     assert code.count("COMMIT;") == 2

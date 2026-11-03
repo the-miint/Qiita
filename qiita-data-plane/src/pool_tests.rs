@@ -315,13 +315,13 @@ fn every_connection_spills_into_a_directory_of_its_own_and_takes_it_when_dropped
     }
 }
 
-/// The premise `Member` rests on, pinned so a DuckDB bump that changes it fails
-/// here: two databases spilling into directories of their own write files of the
-/// same names, so sharing one directory would have them write the same files.
-/// What sharing does instead — the crash — is measured, not tested, since a
-/// segfault takes the test binary with it.
+/// How the linked DuckDB names its spill files, pinned so a bump that changes it
+/// fails here: two databases spilling into directories of their own write files of
+/// different names, which is what lets them share one directory (`Member` says
+/// what sharing did when the names were the same). The sharing itself is measured,
+/// not tested, since a segfault takes the test binary with it.
 #[test]
-fn duckdb_names_its_spill_files_the_same_in_every_database() {
+fn duckdb_names_its_spill_files_uniquely_per_database() {
     let tmp = tempfile::tempdir().unwrap();
     let spilled_names = |dir: &std::path::Path| -> std::collections::BTreeSet<String> {
         std::fs::create_dir_all(dir).unwrap();
@@ -353,9 +353,9 @@ fn duckdb_names_its_spill_files_the_same_in_every_database() {
         "the sort must spill for this to say anything"
     );
     assert!(
-        !a.is_disjoint(&b),
-        "DuckDB now names spill files uniquely per database ({a:?} vs {b:?}) — the \
-         per-connection directories in `Member` may no longer be needed"
+        a.is_disjoint(&b),
+        "DuckDB names spill files the same in every database again ({a:?} vs {b:?}) — \
+         two databases sharing a spill directory would write the same files"
     );
 }
 

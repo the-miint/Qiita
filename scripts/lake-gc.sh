@@ -21,9 +21,10 @@
 #   2. ducklake_cleanup_old_files     remove files no surviving snapshot holds
 #   3. ducklake_delete_orphaned_files remove files the catalog never references
 #
-# Step 1 gates step 2: measured on DuckDB/DuckLake 1.5.4, cleanup_old_files
-# reports nothing for a file whose rows were all deleted until the snapshots
-# referencing it are expired. Running 2 without 1 is a no-op, not a shortcut.
+# Step 1 gates step 2: measured on DuckDB 2.0.0 (ducklake 417a9117), a file whose
+# rows were all deleted leaves its table at the DELETE, but cleanup_old_files
+# reports nothing for it until the snapshots referencing it are expired. Running 2
+# without 1 is a no-op, not a shortcut.
 #
 # For an operator reclaiming space on the deploy host. Reports by default;
 # nothing is removed unless you pass --reclaim (or --reclaim-orphans), which then
@@ -34,11 +35,8 @@
 # time-travel queries read. --older-than sets how much history is kept (default
 # 7 days) and is the same cutoff the two file-deleting steps filter on.
 #
-# Why not READ_ONLY for the report: ducklake_delete_orphaned_files fails with
-# "Cannot append to a readonly database" even at dry_run := true (measured,
-# 1.5.4), while the other two work read-only. Attaching read-only would silently
-# drop orphan reporting, so the attach is writable and `dry_run` is what makes
-# the default run inert. Do not add READ_ONLY without re-checking step 3.
+# The attach is writable even for a report, and `dry_run` is what makes the
+# default run inert.
 #
 # Step 3 is the only one that can touch a live file, so it has its own flag.
 # register_files moves a Parquet to its lake path BEFORE opening the catalog
@@ -48,7 +46,7 @@
 # does, and a mid-flight file was never referenced.
 #
 # The mtime cutoff does not separate the two. `older_than` filters on filesystem
-# mtime (measured, 1.5.4: of two byte-identical unreferenced files, only the one
+# mtime (measured on 2.0.0: of two unreferenced files, only the one
 # stamped 30 days back was listed under a 7-day cutoff), and rename carries over
 # the mtime the producing job gave the file in staging — so a lake file's mtime is
 # when it was PRODUCED, not when it entered the lake, and a Parquet that sat in
@@ -74,13 +72,15 @@
 #   bash scripts/lake-gc.sh --older-than '30 DAYS'   # keep 30 days of history
 #
 # Run as the account that owns the lake data path (qiita-data on the deploy
-# host); it is a non-login account with no PATH and no home, so:
+# host); a report also runs as any member of group qiita-data. qiita-data is a
+# non-login account with no PATH and no home, so:
 #   sudo -u qiita-data /usr/local/bin/duckdb --version   # confirm reachable
 #   sudo -u qiita-data bash scripts/lake-gc.sh
 #
 # Needs, all established at first deploy:
 #   * /etc/qiita/data-plane.env   0440 root:qiita-data
-#   * PATH_PERSISTENT/ducklake    0750 qiita-data   (WRITE access, unlike lake-shell.sh)
+#   * PATH_PERSISTENT/ducklake    0750 qiita-data   (WRITE access for a reclaim, unlike
+#                                                    lake-shell.sh; read for a report)
 #
 # The catalog password never reaches the SQL file or argv (both readable via
 # /proc): it goes to libpq through a 0600 PGPASSFILE deleted on exit.
@@ -149,12 +149,13 @@ PERSISTENT="$(read_env_var "${DP_ENV}" PATH_PERSISTENT)"
 
 DATA_PATH="$(qiita_lake_data_path "${PERSISTENT}")"
 qiita_require_lake_data_path "${DATA_PATH}"
-if [[ ! -w "${DATA_PATH}" ]]; then
-    echo "ERROR: ${DATA_PATH} is not writable by $(id -un)." >&2
-    echo "  It is 0750 qiita-data. Group read is not enough even to REPORT: the" >&2
-    echo "  dry-run orphan scan fails on a read-only attach, so DuckLake needs to" >&2
-    echo "  write here in both modes." >&2
-    echo "  Re-run as: sudo -u qiita-data bash scripts/lake-gc.sh" >&2
+# Only a reclaim writes here; a report only reads it. All three dry runs work over a
+# data path the account cannot write (measured on 2.0.0).
+if [[ "${DRY_RUN}" != true && ! -w "${DATA_PATH}" ]]; then
+    echo "ERROR: ${DATA_PATH} is not writable by $(id -un), and a reclaim removes files there." >&2
+    echo "  It is 0750 qiita-data. A report (without --reclaim or --reclaim-orphans)" >&2
+    echo "  needs only group read." >&2
+    echo "  Re-run the reclaim as: sudo -u qiita-data bash scripts/lake-gc.sh <same flags>" >&2
     exit 1
 fi
 
@@ -187,24 +188,22 @@ qiita_pgpass_init "qiita-lake-gc"
 MARK="@@lake-gc@@"
 
 # All three steps in one duckdb process, across TWO transactions: steps 1-2
-# together, step 3 on its own. Measured on 1.5.4 for both halves — cleanup_old_files
-# sees step 1's expiry from inside the same transaction, and step 3's catalog read
-# is the snapshot from its BEGIN, so it must open after 1-2 finish. See the
-# per-step comments below.
+# together, step 3 on its own. The comment at each BEGIN says why.
 #
 # What a transaction does NOT cover: the unlinking. A file removed by step 2 or 3
-# stays removed even if the transaction then rolls back (measured — ROLLBACK left
-# the file gone). A transaction bounds the CATALOG changes only.
+# stays removed even if the transaction then rolls back (measured on 2.0.0:
+# ROLLBACK left the file gone). A transaction bounds the CATALOG changes
+# only.
 #
 # `CALL` is the documented invocation form for these table functions
 # (https://ducklake.select/docs/stable/duckdb/maintenance/expire_snapshots).
-# `SELECT * FROM` behaves identically here (measured, same rows, same deletions),
-# but the docs are what the next reader will check this against.
+# `SELECT * FROM` lists the same rows (measured on 2.0.0), but the docs are what
+# the next reader will check this against.
 #
 # `.bail on` turns an attach failure into a non-zero exit instead of an empty
 # result that reads like "nothing to reclaim".
 #
-# Measured output shapes under `-noheader -list` (1.5.4; unchanged on 1.5.5):
+# Measured output shapes under `-noheader -list` (2.0.0):
 # cleanup_old_files and delete_orphaned_files return one bare path per line, which
 # report_paths counts and sizes; expire_snapshots returns a 7-column snapshot row,
 # which is only line-counted here. A shape change in the first two would surface
@@ -213,13 +212,13 @@ run_maintenance() {
     local sql="${TMPROOT}/gc.sql"
     {
         echo ".bail on"
-        # FIRST: INSTALL resolves against $HOME/.duckdb, and this runs as
-        # qiita-data, whose home is /dev/null ("Can't find the home directory").
+        # FIRST: INSTALL resolves against $HOME/.duckdb, and when this runs as
+        # qiita-data, its home is /dev/null ("Can't find the home directory").
         # Redirect before anything can install.
         echo "SET home_directory='${SESSION_TMPDIR}';"
         # ducklake, plus postgres for the catalog backend — `ducklake:postgres:`
         # below needs it. It would autoload, but autoINSTALL is the part that
-        # would reach for a home this account does not have, so both are named.
+        # would reach for a home qiita-data does not have, so both are named.
         # No miint: this never reads a sequence (unlike lake-shell.sh), so it
         # also never switches extension_directory to the staged build.
         echo "INSTALL ducklake; LOAD ducklake;"
@@ -227,22 +226,24 @@ run_maintenance() {
         echo "SET threads = ${LAKE_THREADS};"
         echo "SET memory_limit = '${LAKE_MEMORY_LIMIT}';"
         echo "SET temp_directory='${SESSION_TMPDIR}';"
-        echo "ATTACH 'ducklake:postgres:${CONN_SANITIZED}' AS qiita_lake (DATA_PATH '${DATA_PATH}');"
-        # Steps 1-2 share a transaction: cleanup only sees the expiry from inside
-        # it, and the two are one catalog outcome.
+        echo "ATTACH 'ducklake:postgres:${CONN_SANITIZED}' AS qiita_lake (DATA_PATH '${DATA_PATH}', DUCKLAKE_VERSION '${QIITA_DUCKLAKE_VERSION}');"
+        # Steps 1-2 share a transaction: cleanup sees the expiry from inside it
+        # (measured on 2.0.0), and the two are one catalog outcome.
         echo "BEGIN TRANSACTION;"
         echo ".print ${MARK}snapshots"
         echo "CALL ducklake_expire_snapshots('qiita_lake', dry_run := ${DRY_RUN}, older_than := ${CUTOFF});"
         echo ".print ${MARK}old_files"
         echo "CALL ducklake_cleanup_old_files('qiita_lake', dry_run := ${DRY_RUN}, older_than := ${CUTOFF});"
         echo "COMMIT;"
-        # Step 3 takes its OWN transaction, and must. Measured on 1.5.4: an orphan
-        # scan run inside a transaction that opened earlier reports a file another
-        # session registered and COMMITTED in the meantime — its catalog read is
-        # the snapshot from that BEGIN. At dry_run := false that unlinks a live
-        # file whose catalog row survives. Re-opening takes the read after the
-        # work above, which the same probe showed reports nothing. Keep this
-        # COMMIT/BEGIN pair; folding step 3 upward reintroduces the window.
+        # Step 3 takes its OWN transaction, and must. Measured on 2.0.0: a
+        # transaction reads the catalog as of its first catalog read, not its
+        # BEGIN, so an orphan scan in one that had already read the catalog
+        # reports a file another session registered and COMMITTED since. At
+        # dry_run := false that unlinks a live file whose catalog row
+        # survives. Steps 1-2 read the catalog, so re-opening here makes the scan
+        # the new transaction's first read, which the same probes showed reports
+        # nothing. Keep this COMMIT/BEGIN pair; folding step 3 upward reintroduces
+        # the window.
         echo "BEGIN TRANSACTION;"
         echo ".print ${MARK}orphans"
         echo "CALL ducklake_delete_orphaned_files('qiita_lake', dry_run := ${ORPHAN_DRY_RUN}, older_than := ${CUTOFF});"

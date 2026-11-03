@@ -23,7 +23,10 @@ Gotchas specific to the ENA source:
   bad digest are indistinguishable; `max_retries` bounds it).
 - One FRESH DuckDB connection PER RUN. `miint_warnings()` accumulates across
   queries in a session (duckdb-miint/docs/utilities.md), so a reused connection
-  would leak one run's warnings into the next run's fail-loud check.
+  would leak one run's warnings into the next run's fail-loud check. Each
+  connection is its own database, so each run also gets its own DuckDB HTTP retry
+  quota (see `MIINT_HTTP_RETRY_SETTINGS`): one run's dropped connections do not
+  spend another's.
 - Fail loud on a silent skip. How `read_ena_sequences` reports a run it could
   not read depends on the miint build
   (https://the-miint.github.io/duckdb-miint/insdc_ena/):

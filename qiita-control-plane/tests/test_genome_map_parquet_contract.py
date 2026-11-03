@@ -56,7 +56,7 @@ def test_a_truncated_arrow_ipc_stream_reads_back_short_and_silent():
     """The measurement behind serving Parquet rather than an Arrow IPC stream.
 
     IPC is what Flight already carries and what the client already stages through
-    `_registered`, so it is where a reader would start. Three batches cut to one
+    `registered`, so it is where a reader would start. Three batches cut to one
     come back as a third of the rows with nothing raised, so a partial map would
     stage as complete. A cut landing mid-message does raise — the silent case
     needs the cut on a boundary, which is narrower than "any truncation" and still

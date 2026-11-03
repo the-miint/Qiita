@@ -2052,7 +2052,7 @@ def test_masked_read_export_fastq_refuses_existing_file(monkeypatch, tmp_path, c
     [
         ("parquet", "refused", "flight error: ", "data plane unavailable"),
         ("parquet", "midstream", "error: ", "data plane stream cut"),
-        ("fastq", "midstream", "error: Invalid Input Error: arrow_scan", "data plane stream cut"),
+        ("fastq", "midstream", "error: Invalid Input Error: ", "data plane stream cut"),
     ],
 )
 def test_masked_read_export_data_plane_failure_is_an_error_not_a_traceback(
