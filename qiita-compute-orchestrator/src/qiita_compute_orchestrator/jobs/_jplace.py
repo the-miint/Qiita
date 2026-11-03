@@ -1,0 +1,319 @@
+"""Read a jplace of any size through miint's `read_jplace`, refusing what it would truncate.
+
+`read_jplace` is a table macro over DuckDB's `read_json` (`SELECT macro_definition FROM
+duckdb_functions() WHERE function_name = 'read_jplace'`), and two of its properties shape
+this module:
+
+* It passes `maximum_object_size = 1000000000`, and a jplace is ONE JSON object, so a
+  file over 1 GB cannot be read at all (duckdb-miint#400). Greengenes2 2024.09's
+  placement file is 2.26 GB as released. `load_jplace` therefore splits the
+  `placements` array across part files under `_PART_MAX_BYTES` and reads them one at a
+  time — one `read_jplace` call over all the parts ran out of memory at an 18 GB limit.
+* It reads only the first location (`p[0]`) and the first name (`nm[0][0]`, else
+  `n[0]`), at fixed positions in the location row, without consulting the file's
+  `fields` (duckdb-miint#407). A placement with a second location or a second name, or
+  a file whose `fields` are in another order, would load as something other than what it
+  says, with no error. The split refuses all of them.
+
+The split is JSON framing only: each placement is located with
+`json.JSONDecoder.raw_decode`, checked, and its source text copied through unchanged, so
+miint still does the parsing. A part carries only the `placements` array — `read_jplace`
+reads nothing else — so it is not a jplace by the spec, and it never leaves the job's
+temp directory.
+
+This is a **private helper**, not a dispatchable native job: it exports neither `Inputs`
+nor `execute`, and its leading underscore exempts it from the boot-time job scan.
+"""
+
+from __future__ import annotations
+
+import json
+from collections.abc import Iterator
+from pathlib import Path
+from typing import BinaryIO, TextIO
+
+import duckdb
+
+# The location-row layout `read_jplace` assumes: it takes edge_num from `p[0][0]`,
+# likelihood from `p[0][1]`, and so on, whatever the file's `fields` say.
+EXPECTED_FIELDS = ("edge_num", "likelihood", "like_weight_ratio", "distal_length", "pendant_length")
+
+# Upper bound on one part file. The macro's 1e9-byte object limit (duckdb-miint#400) is
+# the hard ceiling, but time sets the size: one `read_jplace` call grows much faster
+# than linearly in the placements it reads. Measured on Greengenes2 2024.09's placement
+# file (DuckDB 2.0.0, miint e88619bf00, 8 threads), a first part of
+#    16 MiB (173K placements) read in 0.6 s,     64 MiB (699K) in 5.9 s,
+#   128 MiB (1.4M) in 45 s,                     256 MiB (2.8M) in 214 s,
+# and the whole 2.26 GB file, split at 16 MiB, loaded in 115 s at 2.4 GB peak RSS.
+_PART_MAX_BYTES = 16 * 1024 * 1024
+
+# Characters pulled from the source per read, at least. A placement is a few hundred
+# bytes, so this only sets how often the buffer is refilled; a value longer than the
+# buffer (a tree string) doubles it per refill, so the copying stays linear.
+_READ_CHARS = 16 * 1024 * 1024
+
+_PART_PREFIX = b'{"placements": ['
+_PART_SUFFIX = b"]}"
+
+_DECODER = json.JSONDecoder()
+
+
+class _JsonStream:
+    """A cursor over one JSON document, decoding one value at a time.
+
+    `raw_decode` needs a whole value in memory but not the whole document, so the
+    buffer holds the unread tail of what has been read, and grows whenever a value runs
+    past its end."""
+
+    def __init__(self, fh: TextIO, source: Path) -> None:
+        self._fh = fh
+        self._source = source
+        self._buf = ""
+        self._pos = 0
+        self._eof = False
+
+    def _fill(self) -> bool:
+        if self._eof:
+            return False
+        more = self._fh.read(max(_READ_CHARS, len(self._buf) - self._pos))
+        if not more:
+            self._eof = True
+            return False
+        self._buf = self._buf[self._pos :] + more
+        self._pos = 0
+        return True
+
+    def peek(self) -> str:
+        """The next non-whitespace character, without consuming it; "" at end of file."""
+        while True:
+            buf, pos = self._buf, self._pos
+            while pos < len(buf) and buf[pos] in " \t\r\n":
+                pos += 1
+            self._pos = pos
+            if pos < len(buf):
+                return buf[pos]
+            if not self._fill():
+                return ""
+
+    def expect(self, char: str) -> None:
+        found = self.peek()
+        if found != char:
+            raise ValueError(
+                f"{self._source}: expected {char!r} in the jplace's JSON, found {found or 'EOF'!r}"
+            )
+        self._pos += 1
+
+    def value(self, *, max_chars: int | None = None) -> tuple[object, str]:
+        """Decode the next value and return it with its exact source text.
+
+        `max_chars` bounds how far a value that will not decode is read before it is
+        called malformed; without it, a broken value is read to end of file first."""
+        self.peek()
+        while True:
+            try:
+                obj, end = _DECODER.raw_decode(self._buf, self._pos)
+            except json.JSONDecodeError as e:
+                within = max_chars is None or len(self._buf) - self._pos <= max_chars
+                if within and self._fill():
+                    continue
+                raise ValueError(f"{self._source}: malformed jplace JSON: {e}") from e
+            # A number that ends exactly at the buffer's end may be cut short ("12" of
+            # "123"); an object, array or string would have failed to decode instead.
+            if end == len(self._buf) and self._fill():
+                continue
+            text = self._buf[self._pos : end]
+            self._pos = end
+            return obj, text
+
+
+def _check_fields(fields: object, source: Path) -> None:
+    if not isinstance(fields, list) or tuple(fields) != EXPECTED_FIELDS:
+        raise ValueError(
+            f"{source}: jplace fields are {fields!r}; read_jplace reads each location row by "
+            f"position as {list(EXPECTED_FIELDS)} and ignores 'fields' (duckdb-miint#407), "
+            "so any other order or set would load the wrong values"
+        )
+
+
+def _check_placement(obj: object, source: Path, index: int) -> None:
+    """Refuse a placement `read_jplace` would load as anything other than what it says."""
+
+    def refuse(why: str) -> ValueError:
+        return ValueError(
+            f"{source}: placement {index} {why}, which read_jplace would not load as written "
+            f"(it reads one name and one location per placement, duckdb-miint#407): "
+            f"{json.dumps(obj)[:200]}"
+        )
+
+    if not isinstance(obj, dict):
+        raise refuse("is not a JSON object")
+    if not obj.keys() <= {"p", "n", "nm"}:
+        raise refuse(f"carries keys {sorted(obj.keys() - {'p', 'n', 'nm'})}")
+    if ("n" in obj) == ("nm" in obj):
+        raise refuse("does not carry exactly one of 'n' and 'nm'")
+    if "n" in obj:
+        names = obj["n"]
+        if not (isinstance(names, list) and len(names) == 1 and isinstance(names[0], str)):
+            raise refuse("does not name exactly one fragment in 'n'")
+    else:
+        names = obj["nm"]
+        if not (
+            isinstance(names, list)
+            and len(names) == 1
+            and isinstance(names[0], list)
+            and len(names[0]) == 2
+            and isinstance(names[0][0], str)
+            and names[0][1] == 1
+        ):
+            raise refuse("does not name exactly one fragment of multiplicity 1 in 'nm'")
+    locations = obj.get("p")
+    if not (isinstance(locations, list) and len(locations) == 1):
+        raise refuse("does not carry exactly one location in 'p'")
+    row = locations[0]
+    if not (isinstance(row, list) and len(row) == len(EXPECTED_FIELDS)):
+        raise refuse(f"has a location row that is not {len(EXPECTED_FIELDS)} values")
+    edge_num = row[0]
+    if not isinstance(edge_num, int) or isinstance(edge_num, bool):
+        raise refuse(f"has an edge_num that is not an integer ({edge_num!r})")
+
+
+class _PartWriter:
+    """Write placements into numbered part files, none over `max_bytes`."""
+
+    def __init__(self, out_dir: Path, max_bytes: int) -> None:
+        self._out_dir = out_dir
+        self._max_bytes = max_bytes
+        self._parts = 0
+        self._fh: BinaryIO | None = None
+        self._path: Path | None = None
+        self._size = 0
+        self._placements = 0
+
+    def add(self, text: str) -> tuple[Path, int] | None:
+        """Append one placement; return the part it closed, if it closed one."""
+        data = text.encode()
+        if len(_PART_PREFIX) + len(data) + len(_PART_SUFFIX) > self._max_bytes:
+            raise ValueError(
+                f"one placement is {len(data)} bytes, more than a part may hold "
+                f"({self._max_bytes} bytes)"
+            )
+        closed = None
+        if self._fh is not None and (
+            self._size + 1 + len(data) + len(_PART_SUFFIX) > self._max_bytes
+        ):
+            closed = self.close()
+        if self._fh is None:
+            self._path = self._out_dir / f"part-{self._parts:05d}.json"
+            self._parts += 1
+            self._fh = self._path.open("wb")
+            self._fh.write(_PART_PREFIX)
+            self._size = len(_PART_PREFIX)
+            self._placements = 0
+        if self._placements:
+            self._fh.write(b",")
+            self._size += 1
+        self._fh.write(data)
+        self._size += len(data)
+        self._placements += 1
+        return closed
+
+    def close(self) -> tuple[Path, int] | None:
+        """Finish the open part, if any; return its path and placement count."""
+        if self._fh is None:
+            return None
+        self._fh.write(_PART_SUFFIX)
+        self._fh.close()
+        self._fh = None
+        assert self._path is not None
+        return self._path, self._placements
+
+
+def split_jplace(source: Path, out_dir: Path, *, part_max_bytes: int) -> Iterator[tuple[Path, int]]:
+    """Yield `(part_path, placement_count)` for parts that together carry every
+    placement in `source`, in file order.
+
+    A part is complete when yielded, and the caller may delete it before asking for the
+    next, so at most one part is on disk at a time. Every placement is checked as it
+    passes. `fields` may come before or after `placements` — pplacer writes it after —
+    so a wrong or missing `fields` can raise after parts have been yielded: nothing a
+    caller builds from the parts is final until the generator is exhausted. A jplace
+    with an empty `placements` array yields nothing.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    writer = _PartWriter(out_dir, part_max_bytes)
+    keys: set[str] = set()
+    try:
+        with source.open(encoding="utf-8") as fh:
+            stream = _JsonStream(fh, source)
+            stream.expect("{")
+            while stream.peek() != "}":
+                if keys:
+                    stream.expect(",")
+                key, _ = stream.value()
+                if not isinstance(key, str):
+                    raise ValueError(f"{source}: a jplace key is not a string: {key!r}")
+                if key in keys:
+                    raise ValueError(f"{source}: the jplace repeats the key {key!r}")
+                keys.add(key)
+                stream.expect(":")
+                if key != "placements":
+                    value, _ = stream.value()
+                    if key == "fields":
+                        _check_fields(value, source)
+                    continue
+                stream.expect("[")
+                index = 0
+                while stream.peek() != "]":
+                    if index:
+                        stream.expect(",")
+                    obj, text = stream.value(max_chars=part_max_bytes)
+                    _check_placement(obj, source, index)
+                    closed = writer.add(text)
+                    if closed is not None:
+                        yield closed
+                    index += 1
+                stream.expect("]")
+            stream.expect("}")
+            if stream.peek():
+                raise ValueError(f"{source}: unexpected content after the jplace's JSON object")
+        for required in ("placements", "fields"):
+            if required not in keys:
+                raise ValueError(f"{source}: the jplace has no {required!r}")
+        last = writer.close()
+        if last is not None:
+            yield last
+    finally:
+        writer.close()
+
+
+def load_jplace(
+    conn: duckdb.DuckDBPyConnection,
+    jplace_path: Path,
+    *,
+    table: str,
+    work_dir: Path,
+) -> None:
+    """Read every placement in `jplace_path` into a new TEMP TABLE `table`.
+
+    The table has `read_jplace`'s columns minus `filepath`, one row per placement in
+    the file: the split refuses every shape `read_jplace` would collapse, and each part
+    is checked to come back with as many rows as it was written with.
+    """
+    conn.execute(
+        f"CREATE TEMP TABLE {table} ("
+        "  fragment VARCHAR, edge_num INTEGER, likelihood DOUBLE,"
+        "  like_weight_ratio DOUBLE, distal_length DOUBLE, pendant_length DOUBLE)"
+    )
+    for part, written in split_jplace(jplace_path, work_dir, part_max_bytes=_PART_MAX_BYTES):
+        (inserted,) = conn.execute(
+            f"INSERT INTO {table} "
+            "SELECT fragment, edge_num, likelihood, like_weight_ratio,"
+            "  distal_length, pendant_length "
+            "FROM read_jplace(?)",
+            [str(part)],
+        ).fetchone()
+        if inserted != written:
+            raise ValueError(
+                f"{part.name}: read_jplace returned {inserted} rows for {written} placements"
+            )
+        part.unlink()

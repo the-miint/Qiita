@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 from pathlib import Path
 from uuid import UUID
@@ -364,7 +365,7 @@ def test_taxonomy_lifted_writer_keys_by_feature_idx(
     assert [r for r in caplog.records if r.name == _REFERENCE_LOAD_LOGGER] == []
 
 
-def _taxonomy_warnings(caplog) -> list[str]:
+def _load_warnings(caplog) -> list[str]:
     """Lower-cased WARNING messages emitted by the reference_load logger."""
     return [
         r.getMessage().lower()
@@ -393,7 +394,7 @@ def test_unclassified_feature_recorded_as_null_rank_row(staging_inputs, tmp_path
             f" FROM '{pq}' WHERE feature_idx = {seq5_fidx}"
         ).fetchone()
         assert row == (None,) * 8
-    assert any("unclassified" in w for w in _taxonomy_warnings(caplog))
+    assert any("unclassified" in w for w in _load_warnings(caplog))
 
 
 def test_stray_taxonomy_rows_warn_and_are_dropped(staging_inputs, tmp_path, caplog):
@@ -416,7 +417,7 @@ def test_stray_taxonomy_rows_warn_and_are_dropped(staging_inputs, tmp_path, capl
             0
         ]
         assert dom == "Bacteria"
-    warnings = _taxonomy_warnings(caplog)
+    warnings = _load_warnings(caplog)
     assert any("stray" in w or "unmatched" in w for w in warnings)
 
 
@@ -440,7 +441,44 @@ def test_duplicate_supplied_taxonomy_warns_and_stays_one_to_one(staging_inputs, 
             == 1
         )
         assert conn.execute(f"SELECT count(*) FROM '{pq}'").fetchone()[0] == len(_FEATURE_MAP)
-    assert any("duplicate" in w for w in _taxonomy_warnings(caplog))
+    assert any("duplicate" in w for w in _load_warnings(caplog))
+
+
+def test_conflicting_lineages_on_one_feature_keep_the_smallest_read_id(
+    staging_inputs, tmp_path, caplog
+):
+    """Two read_ids of one feature with different lineages: the feature takes the
+    lexicographically smallest read_id's — not whichever row came first — and warns."""
+    inputs = _with_twin(staging_inputs, tmp_path, twin="aaa_twin_of_seq1", of="seq1")
+    tax = _write_taxonomy_parquet(
+        tmp_path / "taxonomy.parquet",
+        [(name, _TAXONOMY_STRINGS[name]) for name in _TEST_SEQUENCES]
+        + [("aaa_twin_of_seq1", _TAXONOMY_STRINGS["seq2"])],
+    )
+    with caplog.at_level(logging.WARNING, logger=_REFERENCE_LOAD_LOGGER):
+        outputs = _run(_inputs(**inputs, taxonomy_path=tax), tmp_path / "ws")
+    pq = outputs["staging_dir"] / "reference_taxonomy.parquet"
+    seq1_fidx = _FEATURE_MAP[_HASHES["seq1"]]
+    with duckdb.connect(":memory:") as conn:
+        assert conn.execute(f"SELECT count(*) FROM '{pq}'").fetchone()[0] == len(_FEATURE_MAP)
+        genus = conn.execute(
+            f"SELECT genus FROM '{pq}' WHERE feature_idx = {seq1_fidx}"
+        ).fetchone()[0]
+    assert genus == "Escherichia"
+    [warning] = [w for w in _load_warnings(caplog) if "conflicting lineages" in w]
+    assert "['aaa_twin_of_seq1', 'seq1']" in warning
+
+
+def test_agreeing_lineages_on_one_feature_do_not_warn(staging_inputs, tmp_path, caplog):
+    inputs = _with_twin(staging_inputs, tmp_path, twin="aaa_twin_of_seq1", of="seq1")
+    tax = _write_taxonomy_parquet(
+        tmp_path / "taxonomy.parquet",
+        [(name, _TAXONOMY_STRINGS[name]) for name in _TEST_SEQUENCES]
+        + [("aaa_twin_of_seq1", _TAXONOMY_STRINGS["seq1"])],
+    )
+    with caplog.at_level(logging.WARNING, logger=_REFERENCE_LOAD_LOGGER):
+        _run(_inputs(**inputs, taxonomy_path=tax), tmp_path / "ws")
+    assert _load_warnings(caplog) == []
 
 
 @pytest.mark.parametrize(
@@ -604,12 +642,53 @@ def jplace_path(tmp_path):
     return _wrap_chunked_blob_parquet(tmp_path / "jplace_upload.parquet", jplace_text)
 
 
+def _raw_jplace(path: Path, placements: list[tuple[str, int]]) -> Path:
+    """A raw jplace (the local-path shape) placing each `(fragment, edge_num)`, with
+    likelihoods that differ per row so a test can tell which row landed."""
+    doc = {
+        "tree": "((seq1:0.1{0},seq2:0.2{1}):0.3{2});",
+        "placements": [
+            {"p": [[edge, -1.0 - i, 0.5, 0.01, 0.02]], "n": [name]}
+            for i, (name, edge) in enumerate(placements)
+        ],
+        "fields": [
+            "edge_num",
+            "likelihood",
+            "like_weight_ratio",
+            "distal_length",
+            "pendant_length",
+        ],
+        "version": 3,
+    }
+    path.write_text(json.dumps(doc))
+    return path
+
+
+def _with_twin(staging_inputs: dict, tmp_path: Path, *, twin: str, of: str) -> dict:
+    """`staging_inputs` with one more manifest read_id, `twin`, whose sequence
+    canonicalises to `of`'s — two names for one feature, as a reverse-complement pair or
+    a repeated record would be."""
+    manifest = tmp_path / "manifest_with_twin.parquet"
+    _write_parquet(
+        manifest,
+        "read_id VARCHAR, sequence_hash UUID, sequence_length_bp BIGINT",
+        [(name, str(_HASHES[name]), len(_TEST_SEQUENCES[name])) for name in _TEST_SEQUENCES]
+        + [(twin, str(_HASHES[of]), len(_TEST_SEQUENCES[of]))],
+    )
+    return {**staging_inputs, "manifest": manifest}
+
+
+def _placements(pq: Path) -> list[tuple]:
+    with duckdb.connect(":memory:") as conn:
+        return conn.execute(
+            f"SELECT feature_idx, edge_num, likelihood FROM '{pq}' ORDER BY feature_idx"
+        ).fetchall()
+
+
 def test_placements_lifted_writer_maps_fragment_to_feature_idx(
     staging_inputs, jplace_path, tmp_path
 ):
-    """Placements writer maps `fragment` → manifest.read_id → feature_idx;
-    rows whose fragment isn't in id_map are silently dropped (a jplace
-    may carry fragments outside the current reference's mint scope)."""
+    """Placements writer maps `fragment` → manifest.read_id → feature_idx."""
     outputs = _run(_inputs(**staging_inputs, jplace_path=jplace_path), tmp_path / "ws")
     pq = outputs["staging_dir"] / "reference_placements.parquet"
     assert pq.exists()
@@ -619,6 +698,77 @@ def test_placements_lifted_writer_maps_fragment_to_feature_idx(
         ).fetchall()
         expected = sorted([(_FEATURE_MAP[_HASHES["seq1"]], 5), (_FEATURE_MAP[_HASHES["seq2"]], 7)])
         assert rows == expected
+
+
+def test_placements_split_across_parts_load_the_same_rows(staging_inputs, tmp_path, monkeypatch):
+    """A jplace too big for one `read_jplace` call is split and read part by part
+    (duckdb-miint#400); the rows that land must not depend on where it was cut."""
+    from qiita_compute_orchestrator.jobs import _jplace
+
+    jplace = _raw_jplace(tmp_path / "in.jplace", [(name, i) for i, name in enumerate(_CANON)])
+    whole = _placements(
+        _run(_inputs(**staging_inputs, jplace_path=jplace), tmp_path / "whole")["staging_dir"]
+        / "reference_placements.parquet"
+    )
+    # Small enough for one placement per part.
+    monkeypatch.setattr(_jplace, "_PART_MAX_BYTES", 100)
+    split = _placements(
+        _run(_inputs(**staging_inputs, jplace_path=jplace), tmp_path / "split")["staging_dir"]
+        / "reference_placements.parquet"
+    )
+    assert len(whole) == len(_CANON)
+    assert split == whole
+
+
+def test_placement_of_an_unknown_fragment_raises(staging_inputs, tmp_path):
+    """A fragment that is no sequence's read_id used to be dropped by an inner join,
+    which published a placement set other than the one supplied."""
+    jplace = _raw_jplace(tmp_path / "in.jplace", [("seq1", 0), ("not_a_read", 1)])
+    with pytest.raises(ValueError, match=r"1 jplace fragment\(s\) are not the read_id.*not_a_read"):
+        _run(_inputs(**staging_inputs, jplace_path=jplace), tmp_path / "ws")
+    assert not (tmp_path / "ws" / "reference_placements.parquet").exists()
+
+
+def test_fragment_placed_twice_raises(staging_inputs, tmp_path):
+    jplace = _raw_jplace(tmp_path / "in.jplace", [("seq1", 0), ("seq2", 1), ("seq1", 2)])
+    with pytest.raises(ValueError, match=r"placed more than once.*seq1"):
+        _run(_inputs(**staging_inputs, jplace_path=jplace), tmp_path / "ws")
+
+
+def test_placement_on_an_edge_the_tree_lacks_raises(staging_inputs, tree_path, tmp_path):
+    """With the tree in the same load, every edge_num must be one of its edge_ids. The
+    fixture tree is undecorated, so its edge_ids are its node_indexes, 0 to 8."""
+    jplace = _raw_jplace(tmp_path / "in.jplace", [("seq1", 3), ("seq2", 999), ("seq3", 999)])
+    with pytest.raises(ValueError, match=r"1 jplace edge_num\(s\).*999 \(2 placements\)"):
+        _run(_inputs(**staging_inputs, tree_path=tree_path, jplace_path=jplace), tmp_path / "ws")
+
+
+def test_placements_on_tree_edges_load_with_the_tree(staging_inputs, tree_path, tmp_path):
+    jplace = _raw_jplace(tmp_path / "in.jplace", [("seq1", 0), ("seq2", 8)])
+    outputs = _run(
+        _inputs(**staging_inputs, tree_path=tree_path, jplace_path=jplace), tmp_path / "ws"
+    )
+    assert [r[1] for r in _placements(outputs["staging_dir"] / "reference_placements.parquet")] == [
+        0,
+        8,
+    ]
+
+
+def test_a_feature_placed_under_two_fragments_keeps_the_smallest(staging_inputs, tmp_path, caplog):
+    """Two read_ids of one feature, each placed: the feature takes the lexicographically
+    smallest fragment's placement — not whichever came first in the file — and warns."""
+    inputs = _with_twin(staging_inputs, tmp_path, twin="aaa_twin_of_seq1", of="seq1")
+    jplace = _raw_jplace(
+        tmp_path / "in.jplace", [("seq1", 0), ("seq2", 1), ("aaa_twin_of_seq1", 2)]
+    )
+    with caplog.at_level(logging.WARNING, logger=_REFERENCE_LOAD_LOGGER):
+        outputs = _run(_inputs(**inputs, jplace_path=jplace), tmp_path / "ws")
+    rows = _placements(outputs["staging_dir"] / "reference_placements.parquet")
+    seq1_fidx = _FEATURE_MAP[_HASHES["seq1"]]
+    assert [r for r in rows if r[0] == seq1_fidx] == [(seq1_fidx, 2, -3.0)]
+    assert len(rows) == 2
+    [warning] = [w for w in _load_warnings(caplog) if "more than one fragment" in w]
+    assert "aaa_twin_of_seq1" in warning
 
 
 # =============================================================================
