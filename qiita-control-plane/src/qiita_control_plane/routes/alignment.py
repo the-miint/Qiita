@@ -92,10 +92,8 @@ async def delete_alignment_definition_route(
     is removed last, so a crash between them leaves at worst a recoverable
     orphan-Postgres row, never an unrecoverable orphan-lake.
 
-    **Intentional divergence from reference-delete (a conscious decision, not an
-    oversight):** this route
-    deliberately does NOT gate on in-flight align block tickets. It is an
-    admin-only sharp primitive; the `work_ticket.alignment_idx` FK
+    Unlike reference-delete, this route does not gate on in-flight align block
+    tickets. It is an admin-only primitive; the `work_ticket.alignment_idx` FK
     (`ON DELETE SET NULL`) detaches any referencing ticket. So an operator who
     DELETEs while a covering block is still PROCESSING can strand that block: on
     completion its `register-files` writes rows under the now-deleted

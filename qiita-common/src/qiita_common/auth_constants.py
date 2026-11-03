@@ -138,11 +138,11 @@ class Scope(StrEnum):
     # in ROLE_IMPLIED_SCOPES.
     PROCESSING_LIFECYCLE = "processing:lifecycle"
     # Full purge of an alignment (the alignment_definition row + its DuckLake
-    # alignment rows; the alignment_sample gate cascade-deletes). Deliberately
-    # distinct from the align-submitting capability (PREP_SAMPLE_WRITE): deletion
-    # is destructive and admin-only, granted solely to system_admin in
-    # ROLE_IMPLIED_SCOPES — never to wet_lab_admin or service accounts. It is the
-    # disallow-without-delete escape hatch.
+    # alignment rows; the alignment_sample gate cascade-deletes). Distinct from the
+    # align-submitting capability (PREP_SAMPLE_WRITE): deletion is destructive and
+    # admin-only, granted solely to system_admin in ROLE_IMPLIED_SCOPES — never to
+    # wet_lab_admin or service accounts. It is the disallow-without-delete escape
+    # hatch.
     ALIGNMENT_DEFINITION_DELETE = "alignment_definition:delete"
     # Generic upload domain. Gates the slot-minting + DoPut path; not
     # reference-specific. On every role ceiling and on service accounts: it
