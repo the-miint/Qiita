@@ -1,7 +1,7 @@
 """Read a jplace of any size through miint's `read_jplace`, refusing what it would truncate.
 
 Two properties of `read_jplace` shape this module; the `read_jplace` entry in
-`docs/duckdb-miint.md` has both, measured:
+`docs/duckdb-miint.md` describes both:
 
 * It cannot read a file over 1 GB (duckdb-miint#400), so `load_jplace` splits the
   `placements` array across part files under `_PART_MAX_BYTES` and reads them one call
@@ -131,8 +131,7 @@ def _check_fields(fields: object, source: Path) -> None:
         raise ValueError(
             f"{source}: jplace fields are {fields!r}; read_jplace reads each location row by "
             f"position as {list(EXPECTED_FIELDS)} and ignores 'fields' (duckdb-miint#407), "
-            "so another order would load values into the wrong columns, and a field beyond "
-            "those would be dropped"
+            "so any other list would load values into the wrong columns or drop some"
         )
 
 

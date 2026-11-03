@@ -450,14 +450,10 @@ def _warn_anomaly(
     """Emit a loud WARNING (never a raise) with the count and first five rows of
     `sql`, when it returns any.
 
-    For anomalies real corpora carry and the load must survive. Taxonomy
-    coverage gaps and namespace mismatches are the standing case: GG2's
-    2024.09 backbone has ~29 features with no taxonomy row, and a supplied
-    taxonomy keyed in a different ID namespace than the FASTA is the exact
-    class that already bit the genome map — so they must NOT fail the
-    ingest. They must be visible, though: an unconfigured WARNING reaches
-    stderr via Python's last-resort handler and lands in the SLURM job log,
-    the loudest channel this architecture offers today."""
+    For anomalies that real corpora carry and that the load must survive. An
+    unconfigured WARNING reaches stderr via Python's last-resort handler and
+    lands in the SLURM job log, the loudest channel this architecture offers
+    today."""
     n, first = _anomaly(conn, sql, params)
     if n:
         _LOG.warning("%d %s (e.g. %s)", n, describe, first)
@@ -520,9 +516,12 @@ def _write_taxonomy(
         ids = [r[0] for r in bad]
         raise ValueError(f"Taxonomy has wrong rank prefix order for feature_idx: {ids}")
 
-    # Warn (don't raise) on coverage anomalies. One row per feature, not per
-    # read_id, so a canonical-hash collision (two read_ids → one feature) isn't
-    # double-counted.
+    # Warn (don't raise) on coverage anomalies: real corpora have them, so they
+    # must NOT fail the ingest. GG2's 2024.09 backbone has ~29 features with no
+    # taxonomy row, and a supplied taxonomy keyed in a different ID namespace
+    # than the FASTA is the exact class that already bit the genome map. One row
+    # per feature, not per read_id, so a canonical-hash collision (two read_ids
+    # → one feature) isn't double-counted.
     _warn_anomaly(
         conn,
         "SELECT min(x.read_id) FROM id_map x "
@@ -546,11 +545,11 @@ def _write_taxonomy(
     )
 
     # Read_ids whose sequences canonicalize to one feature can carry different
-    # lineages, and so can duplicate rows for one read_id. The feature takes the
-    # lineage of its lexicographically smallest read_id that carries one, the
-    # lineage itself breaking a tie between duplicate rows. Whenever that record
-    # has a lineage, it is the record the feature's accession names: the
-    # accession is the smallest of the feature's read_ids.
+    # lineages, and so can duplicate rows for one read_id. Of the feature's
+    # read_ids that carry a lineage, the lexicographically smallest one's wins,
+    # the lineage itself breaking a tie between duplicate rows. The feature's
+    # accession is its smallest read_id overall, so when that read_id carries a
+    # lineage, the lineage kept is the accession's.
     _warn_anomaly(
         conn,
         "SELECT list(DISTINCT read_id ORDER BY read_id) FROM parsed_taxonomy"
@@ -717,15 +716,19 @@ def _write_placements(
 def _refuse_a_tree_other_than_the_jplaces(conn: duckdb.DuckDBPyConnection, phylogeny: str) -> None:
     """Raise unless the tree staged at `phylogeny` is the TEMP TABLE `jplace_tree`, as
     far as a placement can tell: every node's edge number, its parent's edge number,
-    and, at a tip, its name. Branch lengths and internal labels are not compared; a
-    placement's meaning does not depend on them."""
+    its branch length, and, at a tip, its name. Branch lengths count because a
+    placement's `distal_length` is a position along its edge, and its likelihoods were
+    computed on those lengths. Internal labels and the order of a node's children are
+    not compared; a placement's meaning does not depend on them."""
     conn.execute(
         "CREATE TEMP TABLE load_tree AS"
-        " SELECT node_index, parent_index, edge_id, is_tip, name FROM read_parquet(?)",
+        " SELECT node_index, parent_index, edge_id, branch_length, is_tip, name"
+        " FROM read_parquet(?)",
         [phylogeny],
     )
     shape = (
-        "SELECT c.edge_id, p.edge_id AS parent_edge_id, CASE WHEN c.is_tip THEN c.name END AS tip"
+        "SELECT c.edge_id, p.edge_id AS parent_edge_id, c.branch_length,"
+        " CASE WHEN c.is_tip THEN c.name END AS tip"
         " FROM {t} c LEFT JOIN {t} p ON c.parent_index = p.node_index"
     )
     jplace_nodes, load_nodes = conn.execute(
@@ -735,6 +738,7 @@ def _refuse_a_tree_other_than_the_jplaces(conn: duckdb.DuckDBPyConnection, phylo
         conn,
         "SELECT 'edge ' || coalesce(CAST(edge_id AS VARCHAR), 'none')"
         " || ' under edge ' || coalesce(CAST(parent_edge_id AS VARCHAR), 'none')"
+        " || ', length ' || coalesce(CAST(branch_length AS VARCHAR), 'none')"
         " || coalesce(', tip ' || tip, '') FROM ("
         f"{shape.format(t='jplace_tree')} EXCEPT ALL {shape.format(t='load_tree')}"
         ") ORDER BY edge_id NULLS FIRST, parent_edge_id NULLS FIRST, tip NULLS FIRST",
@@ -744,7 +748,8 @@ def _refuse_a_tree_other_than_the_jplaces(conn: duckdb.DuckDBPyConnection, phylo
         raise ValueError(
             f"the tree in this load is not the jplace's tree: it has {load_nodes} nodes to the "
             f"jplace tree's {jplace_nodes}, and {n} of the jplace tree's nodes have no node in "
-            f"it with the same edge number, parent edge number and tip name (e.g. {first}). "
+            f"it with the same edge number, parent edge number, branch length and tip name "
+            f"(e.g. {first}). "
             "A jplace's edge_nums name edges of its own tree, so load that tree, `{N}` "
             "decorations included"
         )
