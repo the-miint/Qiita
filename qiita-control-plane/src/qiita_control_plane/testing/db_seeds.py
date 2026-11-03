@@ -28,6 +28,7 @@ from qiita_common.models import (
     GenomeSource,
     ReferenceStatus,
     TerminologyStatus,
+    Tier,
 )
 
 # Re-exported (redundant-alias form, so the linter keeps what looks unused here).
@@ -44,6 +45,7 @@ from qiita_control_plane.repositories.host_filter_profile import insert_host_fil
 
 from ..repositories._sample_helpers import (
     EntityMetadataSpec,
+    SampleEntityKind,
     _get_or_create_globally_linked_study_field,
     _get_or_create_local_study_field,
     write_local_metadata_or_diagnose,
@@ -442,27 +444,45 @@ async def seed_biosample(
     )
 
 
+async def _insert_returning_idx(
+    pool: asyncpg.Pool,
+    table: str,
+    columns: dict[str, object],
+    *,
+    optional: dict[str, object | None],
+) -> int:
+    """INSERT one row of `columns` plus each `optional` column whose value is
+    not None, and return its idx. An omitted optional column takes its schema
+    default, so a seeder does not restate it. `table` and the column names must
+    be literals, never input."""
+    values = columns | {name: value for name, value in optional.items() if value is not None}
+    placeholders = ", ".join(f"${i}" for i in range(1, len(values) + 1))
+    return await pool.fetchval(
+        f"INSERT INTO {table} ({', '.join(values)}) VALUES ({placeholders}) RETURNING idx",
+        *values.values(),
+    )
+
+
 async def seed_study(
     pool: asyncpg.Pool,
     *,
     owner_idx: int,
     title: str,
     created_by_idx: int | None = None,
+    default_tier: Tier | None = None,
 ) -> int:
     """Insert a minimal qiita.study row; return its idx.
 
-    `created_by_idx` defaults to `owner_idx`. Only the NOT-NULL columns are
-    populated; every other column carries its schema default.
+    `created_by_idx` defaults to `owner_idx`. `default_tier` is written only
+    when given; otherwise it and every other column carry their schema default.
     """
     author_idx = owner_idx if created_by_idx is None else created_by_idx
-    study_idx = await pool.fetchval(
-        "INSERT INTO qiita.study (owner_idx, title, created_by_idx)"
-        " VALUES ($1, $2, $3) RETURNING idx",
-        owner_idx,
-        title,
-        author_idx,
+    return await _insert_returning_idx(
+        pool,
+        "qiita.study",
+        {"owner_idx": owner_idx, "title": title, "created_by_idx": author_idx},
+        optional={"default_tier": default_tier},
     )
-    return study_idx
 
 
 async def seed_exported_entity_probe(
@@ -613,6 +633,7 @@ async def seed_biosample_global_field(
     created_by_idx: int,
     terminology_idx: int | None = None,
     required: bool = False,
+    default_tier: Tier | None = None,
 ) -> int:
     """Insert a qiita.biosample_global_field row and return its idx.
 
@@ -620,23 +641,24 @@ async def seed_biosample_global_field(
     internal_name, display_name, data_type, plus the principal that
     created the row. required defaults to the schema default, and is
     settable so a read test can tell an inherited value from a defaulted
-    one. default_tier relies on the schema default; description is
+    one. default_tier is written only when given, so a visibility test can
+    pin a field's tier; otherwise the schema default applies. description is
     intentionally omitted -- callers that need a non-null description set
     it via UPDATE so the helper surface stays small. asyncpg coerces the
     StrEnum value to text for the qiita.field_data_type cast.
     terminology_idx must be supplied for data_type=TERMINOLOGY (the CHECK
     enforces the iff coupling) and omitted otherwise.
     """
-    return await pool.fetchval(
-        "INSERT INTO qiita.biosample_global_field"
-        "  (internal_name, display_name, data_type, terminology_idx, required, created_by_idx)"
-        " VALUES ($1, $2, $3, $4, $5, $6) RETURNING idx",
-        internal_name,
-        display_name,
-        data_type,
-        terminology_idx,
-        required,
-        created_by_idx,
+    return await _insert_global_field(
+        pool,
+        "qiita.biosample_global_field",
+        internal_name=internal_name,
+        display_name=display_name,
+        data_type=data_type,
+        created_by_idx=created_by_idx,
+        terminology_idx=terminology_idx,
+        required=required,
+        default_tier=default_tier,
     )
 
 
@@ -688,29 +710,85 @@ async def seed_prep_sample_global_field(
     created_by_idx: int,
     terminology_idx: int | None = None,
     required: bool = False,
+    default_tier: Tier | None = None,
 ) -> int:
     """Insert a qiita.prep_sample_global_field row and return its idx.
 
     Parallel to seed_biosample_global_field; mirrors the same column
     subset (internal_name, display_name, data_type, required, plus the
-    creating principal). default_tier relies on the schema default;
-    description is intentionally omitted -- callers that need a non-null
+    creating principal), and default_tier the same way. description is
+    intentionally omitted -- callers that need a non-null
     description set it via UPDATE so the helper surface stays small.
     asyncpg coerces the StrEnum value to text for the
     qiita.field_data_type cast. terminology_idx must be supplied for
     data_type=TERMINOLOGY (the CHECK enforces the iff coupling) and
     omitted otherwise.
     """
-    return await pool.fetchval(
-        "INSERT INTO qiita.prep_sample_global_field"
-        "  (internal_name, display_name, data_type, terminology_idx, required, created_by_idx)"
-        " VALUES ($1, $2, $3, $4, $5, $6) RETURNING idx",
-        internal_name,
-        display_name,
-        data_type,
-        terminology_idx,
-        required,
-        created_by_idx,
+    return await _insert_global_field(
+        pool,
+        "qiita.prep_sample_global_field",
+        internal_name=internal_name,
+        display_name=display_name,
+        data_type=data_type,
+        created_by_idx=created_by_idx,
+        terminology_idx=terminology_idx,
+        required=required,
+        default_tier=default_tier,
+    )
+
+
+async def _insert_global_field(
+    pool: asyncpg.Pool,
+    table: str,
+    *,
+    internal_name: str,
+    display_name: str,
+    data_type: FieldDataType,
+    created_by_idx: int,
+    terminology_idx: int | None,
+    required: bool,
+    default_tier: Tier | None,
+) -> int:
+    """Insert one global-field row into `table`, a literal; return its idx."""
+    return await _insert_returning_idx(
+        pool,
+        table,
+        {
+            "internal_name": internal_name,
+            "display_name": display_name,
+            "data_type": data_type,
+            "terminology_idx": terminology_idx,
+            "required": required,
+            "created_by_idx": created_by_idx,
+        },
+        optional={"default_tier": default_tier},
+    )
+
+
+async def seed_global_field_for_spec(
+    pool: asyncpg.Pool,
+    *,
+    spec: EntityMetadataSpec,
+    internal_name: str,
+    display_name: str,
+    data_type: FieldDataType,
+    created_by_idx: int,
+    default_tier: Tier | None = None,
+) -> int:
+    """`seed_biosample_global_field` or `seed_prep_sample_global_field`, as
+    spec's entity kind selects; returns the new idx."""
+    seed = (
+        seed_biosample_global_field
+        if spec.entity_kind is SampleEntityKind.BIOSAMPLE
+        else seed_prep_sample_global_field
+    )
+    return await seed(
+        pool,
+        internal_name=internal_name,
+        display_name=display_name,
+        data_type=data_type,
+        created_by_idx=created_by_idx,
+        default_tier=default_tier,
     )
 
 
@@ -723,6 +801,7 @@ async def seed_local_study_field(
     created_by_idx: int,
     data_type: FieldDataType = FieldDataType.TEXT,
     required: bool = False,
+    tier_override: Tier | None = None,
 ) -> int:
     """Create a purely-local study field for spec's entity and return its idx.
 
@@ -740,8 +819,42 @@ async def seed_local_study_field(
             created_by_idx=created_by_idx,
             data_type=data_type,
             required=required,
+            tier_override=tier_override,
         )
     return idx
+
+
+async def seed_field_exception(
+    pool: asyncpg.Pool,
+    *,
+    spec: EntityMetadataSpec,
+    entity_idx: int,
+    tier_override: Tier,
+    created_by_idx: int,
+    global_field_idx: int | None = None,
+    study_field_idx: int | None = None,
+    reason: str | None = None,
+) -> int:
+    """Insert one per-(entity, field) visibility exception and return its idx.
+
+    Pass exactly one of global_field_idx / study_field_idx; the table's CHECK
+    refuses both or neither. The row hangs off its entity, so the sweep
+    takes it.
+    """
+    # f-string interpolation of identifiers is safe: spec fields are frozen
+    # module-level constants, never reached by caller input.
+    return await pool.fetchval(
+        f"INSERT INTO {spec.field_exception_table} ("
+        f"    {spec.entity_key_column}, {spec.study_field_idx_column}, global_field_idx,"
+        f"    tier_override, reason, created_by_idx"
+        f") VALUES ($1, $2, $3, $4::qiita.tier, $5, $6) RETURNING idx",
+        entity_idx,
+        study_field_idx,
+        global_field_idx,
+        tier_override,
+        reason,
+        created_by_idx,
+    )
 
 
 async def seed_local_metadata_value(
@@ -775,6 +888,34 @@ async def seed_local_metadata_value(
             caller_idx=created_by_idx,
         )
     return result.metadata_idx, result.study_field_idx
+
+
+async def seed_metadata_text_value(
+    pool: asyncpg.Pool,
+    *,
+    spec: EntityMetadataSpec,
+    entity_idx: int,
+    study_field_idx: int,
+    created_by_idx: int,
+) -> int:
+    """Insert a random text value for spec's entity through an existing study
+    field, local or globally linked, and return the metadata row's idx.
+
+    A plain INSERT through a study field the test already has; the triggers
+    still derive the row's global_field_idx. The row hangs
+    off its entity, so the sweep takes it.
+    """
+    # f-string interpolation of identifiers is safe: spec fields are frozen
+    # module-level constants, never reached by caller input.
+    return await pool.fetchval(
+        f"INSERT INTO {spec.metadata_table}"
+        f" ({spec.entity_key_column}, {spec.study_field_idx_column}, value_text, created_by_idx)"
+        f" VALUES ($1, $2, $3, $4) RETURNING idx",
+        entity_idx,
+        study_field_idx,
+        f"v-{secrets.token_hex(3)}",
+        created_by_idx,
+    )
 
 
 async def seed_globally_linked_study_field(
