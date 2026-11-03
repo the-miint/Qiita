@@ -497,6 +497,27 @@ async def test_fetch_read_masked_doget_sends_both_scope_keys():
     assert json.loads(captured[0].content) == {"prep_sample_idx": 7, "mask_idx": 3}
 
 
+async def test_fetch_read_masked_doget_sends_a_requested_projection():
+    """A `columns` list rides the body in the caller's order; omitting it (above)
+    sends no key at all, which the CP reads as "the full shape"."""
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return _ticket_response()
+
+    async with _client(handler) as http:
+        await fetch_read_masked_doget_ticket(
+            http=http, prep_sample_idx=7, mask_idx=3, columns=["read_id", "sequence_idx"]
+        )
+
+    assert json.loads(captured[0].content) == {
+        "prep_sample_idx": 7,
+        "mask_idx": 3,
+        "columns": ["read_id", "sequence_idx"],
+    }
+
+
 @pytest.mark.parametrize("status", [404, 409, 422, 403, 500])
 async def test_fetch_read_masked_doget_raises_on_non_2xx(status):
     """Any non-2xx raises HTTPStatusError for the caller to map to a
@@ -527,9 +548,10 @@ async def test_open_read_masked_stream_composes_ticket_and_stream(monkeypatch):
         yield object()
         captured["cp_client_closed"] = True
 
-    async def fake_fetch(*, http, prep_sample_idx, mask_idx):
+    async def fake_fetch(*, http, prep_sample_idx, mask_idx, columns):
         captured["prep_sample_idx"] = prep_sample_idx
         captured["mask_idx"] = mask_idx
+        captured["columns"] = columns
         return b"signed-read-masked-ticket"
 
     @contextmanager
@@ -557,6 +579,7 @@ async def test_open_read_masked_stream_composes_ticket_and_stream(monkeypatch):
 
     assert captured["prep_sample_idx"] == 7
     assert captured["mask_idx"] == 3
+    assert captured["columns"] is None
     assert captured["stream"]["conn"] is sentinel_conn
     assert captured["stream"]["data_plane_url"] == "grpc://dp.test:50051"
     assert captured["stream"]["ticket_bytes"] == b"signed-read-masked-ticket"
@@ -572,7 +595,8 @@ async def test_open_read_masked_stream_relation_name_is_overridable(monkeypatch)
     async def fake_make_cp_client():
         yield object()
 
-    async def fake_fetch(*, http, prep_sample_idx, mask_idx):
+    async def fake_fetch(*, http, prep_sample_idx, mask_idx, columns):
+        captured["columns"] = columns
         return b"t"
 
     @contextmanager
@@ -589,11 +613,16 @@ async def test_open_read_masked_stream_relation_name_is_overridable(monkeypatch)
     monkeypatch.setattr(dpc, "get_settings", lambda: _Settings())
 
     async with dpc.open_read_masked_stream(
-        object(), prep_sample_idx=7, mask_idx=3, relation="denovo_reads"
+        object(),
+        prep_sample_idx=7,
+        mask_idx=3,
+        relation="denovo_reads",
+        columns=["read_id", "sequence_idx"],
     ) as rel:
         assert rel == "denovo_reads"
 
     assert captured["relation"] == "denovo_reads"
+    assert captured["columns"] == ["read_id", "sequence_idx"]
 
 
 async def test_open_read_masked_stream_mint_failure_never_opens_the_stream(monkeypatch):
@@ -611,7 +640,7 @@ async def test_open_read_masked_stream_mint_failure_never_opens_the_stream(monke
     async def fake_make_cp_client():
         yield object()
 
-    async def fake_fetch(*, http, prep_sample_idx, mask_idx):
+    async def fake_fetch(*, http, prep_sample_idx, mask_idx, columns):
         raise httpx.HTTPStatusError(
             "409", request=httpx.Request("POST", "http://cp.test"), response=httpx.Response(409)
         )

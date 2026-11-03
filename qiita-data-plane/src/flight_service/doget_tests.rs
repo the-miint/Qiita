@@ -232,6 +232,30 @@ async fn stream_ducklake_batches_streams_rows_and_empty_schema_branch() {
         "empty batch carries the full read_masked schema"
     );
 
+    // A projected ticket streams exactly the signed columns, in the signed
+    // order, over the same pass rows.
+    let projection = vec!["read_id".to_string(), "sequence_idx".to_string()];
+    let (psql, ptable) = build_query("read_masked", &filter, &[], &projection).unwrap();
+    let projected: Vec<arrow_array::RecordBatch> =
+        stream_ducklake_batches(pooled_conn(&connstr, &data_path), psql, ptable)
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|r| r.expect("projected stream item should be Ok"))
+            .collect();
+    let names: Vec<String> = projected[0]
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.name().clone())
+        .collect();
+    assert_eq!(
+        names, projection,
+        "a projected read_masked carries only the signed columns"
+    );
+    let projected_rows: usize = projected.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(projected_rows, 3, "projection narrows columns, never rows");
+
     let conn = Connection::open_in_memory().unwrap();
     ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
     let _ = conn.execute_batch(&format!(
@@ -510,4 +534,45 @@ async fn doget_with_an_unsupported_codec_is_rejected_before_streaming() {
         .await
         .expect_err("lz4 must be rejected, not silently ignored");
     assert_eq!(err.code(), tonic::Code::InvalidArgument);
+}
+
+/// A UUID column streams as its canonical hyphenated text (Arrow `Utf8`), not a
+/// 128-bit integer or the 16-byte `arrow.uuid` extension: DuckDB's export with
+/// `arrow_lossless_conversion` off, its default. The text is lossless for a UUID; a
+/// consumer comparing the column to a UUID casts it back. The setting stays off
+/// because it is connection-wide: it would also re-type every BOOLEAN
+/// (`arrow.bool8`) and JSON column for every Flight client, to save bytes on small
+/// per-feature tables. Pinned here, through the pooled connection DoGet uses.
+#[tokio::test]
+#[serial_test::serial]
+#[cfg(feature = "integration")]
+async fn a_uuid_column_streams_as_its_canonical_text() {
+    use arrow_schema::DataType;
+
+    let connstr = crate::test_catalog::connstr();
+    let data_path = crate::test_catalog::data_path();
+    let batches: Vec<arrow_array::RecordBatch> = stream_ducklake_batches(
+        pooled_conn(&connstr, &data_path),
+        "SELECT CAST('0F8FAD5B-D9CB-469F-A165-70867728950E' AS UUID) AS sequence_hash".to_string(),
+        "uuid_probe".to_string(),
+    )
+    .collect::<Vec<_>>()
+    .await
+    .into_iter()
+    .map(|r| r.expect("stream item should be Ok"))
+    .collect();
+    let field = batches[0].schema().field(0).clone();
+    assert_eq!(field.data_type(), &DataType::Utf8, "got: {field:?}");
+    assert!(
+        field.metadata().is_empty(),
+        "no extension type rides the field: {field:?}"
+    );
+    let text = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow_array::StringArray>()
+        .expect("a Utf8 column is a StringArray")
+        .value(0)
+        .to_string();
+    assert_eq!(text, "0f8fad5b-d9cb-469f-a165-70867728950e");
 }

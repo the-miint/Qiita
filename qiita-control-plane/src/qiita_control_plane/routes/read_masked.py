@@ -600,7 +600,8 @@ async def create_read_masked_doget_ticket(
     Caller must be a ServiceAccount holding `read_masked:doget`. The ticket
     filters the data plane's read_masked macro to exactly one sample under
     exactly one mask config; the macro's unconditional `reason='pass'` excludes human/host
-    reads by construction.
+    reads by construction. An optional `columns` list narrows each row to those
+    of the macro's columns; omitted, the ticket streams the full shape.
 
     Mandatory-filter invariant: both identifiers are required and positive
     (Pydantic gt=0), so the signed filter is always non-empty. The route
@@ -649,9 +650,15 @@ async def create_read_masked_doget_ticket(
             },
         )
 
-    ticket_bytes = sign_ticket(
-        table=READ_MASKED_TABLE,
-        filter=filter_,
-        secret=signing_key,
-    )
+    try:
+        ticket_bytes = sign_ticket(
+            table=READ_MASKED_TABLE,
+            filter=filter_,
+            columns=body.columns,
+            secret=signing_key,
+        )
+    except ValueError as exc:
+        # An unknown or repeated projection column; the allowlist lives at the
+        # signing boundary (`auth/tickets.py`).
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     return DoGetTicketResponse(ticket=base64.b64encode(ticket_bytes).decode())

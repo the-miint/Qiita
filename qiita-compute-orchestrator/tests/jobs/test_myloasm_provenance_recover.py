@@ -1,0 +1,344 @@
+"""Tests for the one-off recovery of myloasm provenance from a finished
+long-read-assembly 1.0.0/1.0.1 run (`jobs/myloasm_provenance_recover.py`).
+
+The source is a real-shaped `assemble` step output under a scratch tree — myloasm's
+`-o` tree from the committed fixture, the splitter's `genomes/`, and the step's
+manifest — at the path the ticket workspace layout gives it. The two data-plane
+streams are replaced: the read lookup by the fixture's read names, and the run's
+`assembled_sequence` by the genome contigs' canonical hashes, computed here in plain
+Python so the job's own hashing is checked against an independent oracle.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+import shutil
+import uuid
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
+from pathlib import Path
+from types import SimpleNamespace
+
+import duckdb
+import pyarrow as pa
+import pytest
+from myloasm_fixture import (
+    MYLOASM_FIXTURE_ROWS,
+    MYLOASM_FIXTURE_VERSIONS,
+    myloasm_assemble_output,
+    myloasm_raw_dir,
+    myloasm_read_name_map,
+)
+from qiita_common.duckdb_relation import registered
+from qiita_common.myloasm_constants import MYLOASM_TABLES
+from qiita_common.workspace import (
+    WORK_TICKET_SUBDIR,
+    step_attempt_dir,
+    step_output_dir,
+    ticket_workspace,
+)
+
+from qiita_compute_orchestrator.jobs import myloasm_provenance_recover as job
+from qiita_compute_orchestrator.jobs._myloasm_provenance import (
+    CONTIG_FEATURE_TABLE,
+    READ_NAME_TABLE,
+    register_raw_tables,
+    write_myloasm_staging,
+)
+
+_PREP_SAMPLE = 41
+_RUN = 77
+_MASK = 5
+_SOURCE_TICKET = 4834
+_ATTEMPT = 2
+_FIRST_FEATURE = 1001
+# Reads the mask passed that the assembler never used: the lookup is the sample's
+# whole pass-set, and the job must keep only the names the dump uses.
+_UNUSED_READS = [("m84001/1/ccs", 1), ("m84001/2/ccs", 2)]
+
+_READ_SCHEMA = pa.schema([("read_id", pa.string()), ("sequence_idx", pa.int64())])
+# `sequence_hash` as the data plane streams it: canonical text, not UUID (see the
+# job's CAST).
+_LAKE_SCHEMA = pa.schema(
+    [
+        ("feature_idx", pa.int64()),
+        ("sequence_hash", pa.string()),
+        ("sequence_length_bp", pa.int64()),
+    ]
+)
+_COMPLEMENT = str.maketrans("ACGT", "TGCA")
+
+
+def _canonical_hash(sequence: str) -> str:
+    """`qiita_common.chunking.canonical_sequence_hash_expr`, restated in Python."""
+    forward = sequence.upper()
+    reverse = forward.translate(_COMPLEMENT)[::-1]
+    digest = min(hashlib.md5(s.encode()).hexdigest() for s in (forward, reverse))
+    return str(uuid.UUID(digest))
+
+
+def _fasta(path: Path) -> dict[str, str]:
+    records: dict[str, list[str]] = {}
+    name = None
+    for line in path.read_text().splitlines():
+        if line.startswith(">"):
+            name = line[1:].split()[0]
+            records[name] = []
+        elif name is not None:
+            records[name].append(line.strip())
+    return {k: "".join(v) for k, v in records.items()}
+
+
+@dataclass(frozen=True)
+class Source:
+    """One finished source run: its scratch root, its read names, and the run's lake
+    features (`contig_id -> (feature_idx, sequence_hash, length)`)."""
+
+    version: str
+    scratch: Path
+    output: Path
+    read_names: list[tuple[str, int]]
+    features: dict[str, tuple[int, str, int]]
+
+
+def _output_dir(scratch: Path) -> Path:
+    return step_output_dir(
+        step_attempt_dir(
+            ticket_workspace(scratch / WORK_TICKET_SUBDIR, _SOURCE_TICKET), "assemble", _ATTEMPT
+        )
+    )
+
+
+@pytest.fixture(scope="module", params=MYLOASM_FIXTURE_VERSIONS)
+def built(request, tmp_path_factory) -> Source:
+    root = tmp_path_factory.mktemp(f"myloasm-{request.param}")
+    scratch = root / "scratch"
+    output = myloasm_assemble_output(_output_dir(scratch), request.param)
+    names = myloasm_read_name_map(
+        myloasm_raw_dir(root / "names", request.param, sequence_idx_names=False)
+    )
+    contigs = {
+        **_fasta(output / "genomes" / "circular.fa"),
+        **_fasta(output / "genomes" / "noLCG.fa"),
+    }
+    features = {
+        contig: (_FIRST_FEATURE + i, _canonical_hash(seq), len(seq))
+        for i, (contig, seq) in enumerate(sorted(contigs.items()))
+    }
+    return Source(request.param, scratch, output, names, features)
+
+
+@pytest.fixture
+def source(built, tmp_path) -> Source:
+    """A private copy of the built source, for tests that damage it."""
+    scratch = tmp_path / "scratch"
+    shutil.copytree(built.scratch, scratch)
+    return Source(built.version, scratch, _output_dir(scratch), built.read_names, built.features)
+
+
+def _reader(schema: pa.Schema, rows: list[dict]) -> pa.RecordBatchReader:
+    return pa.RecordBatchReader.from_batches(
+        schema, [pa.RecordBatch.from_pylist(rows, schema=schema)] if rows else []
+    )
+
+
+def _install(monkeypatch, source: Source, *, reads=None, lake=None) -> dict:
+    """Point the job at `source`'s scratch root and replace both streams. Returns
+    what the job asked the streams for."""
+    asked: dict = {}
+    read_rows = [
+        {"read_id": r, "sequence_idx": i}
+        for r, i in (source.read_names + _UNUSED_READS if reads is None else reads)
+    ]
+    lake_rows = [
+        {"feature_idx": f, "sequence_hash": h, "sequence_length_bp": n}
+        for f, h, n in (source.features.values() if lake is None else lake)
+    ]
+
+    @asynccontextmanager
+    async def _reads(conn, *, prep_sample_idx, mask_idx, relation="masked_reads", columns=None):
+        asked["reads"] = (prep_sample_idx, mask_idx, columns)
+        with registered(conn, relation, _reader(_READ_SCHEMA, read_rows)):
+            yield relation
+
+    @asynccontextmanager
+    async def _lake(conn, *, prep_sample_idx, processing_idx, relation="assembled_lengths"):
+        asked["lake"] = (prep_sample_idx, processing_idx)
+        with registered(conn, relation, _reader(_LAKE_SCHEMA, lake_rows)):
+            yield relation
+
+    monkeypatch.setattr(
+        job, "get_settings", lambda: SimpleNamespace(path_scratch=str(source.scratch))
+    )
+    monkeypatch.setattr(job, "open_read_masked_stream", _reads)
+    monkeypatch.setattr(job, "open_assembled_sequence_stream", _lake)
+    return asked
+
+
+def _inputs(**overrides) -> job.Inputs:
+    return job.Inputs(
+        **{
+            "prep_sample_idx": _PREP_SAMPLE,
+            "work_ticket_idx": 9001,
+            "assembly_processing_idx": _RUN,
+            "assembly_mask_idx": _MASK,
+            "source_work_ticket_idx": _SOURCE_TICKET,
+            "assemble_attempt": _ATTEMPT,
+            **overrides,
+        }
+    )
+
+
+def _run(workspace: Path, **overrides) -> dict[str, Path]:
+    return asyncio.run(job.execute(_inputs(**overrides), workspace))
+
+
+def _expected(source: Source, tmp_path: Path) -> Path:
+    """The same run staged through the shared transform directly, from the container's
+    own dump script: what the recovery must reproduce."""
+    raw = myloasm_raw_dir(tmp_path / "expected", source.version, sequence_idx_names=False)
+    staging = tmp_path / "expected" / "staging"
+    staging.mkdir()
+    with duckdb.connect() as conn:
+        register_raw_tables(conn, raw)
+        conn.execute(f"CREATE TEMP TABLE {READ_NAME_TABLE} (read_id VARCHAR, sequence_idx BIGINT)")
+        conn.executemany(f"INSERT INTO {READ_NAME_TABLE} VALUES (?, ?)", source.read_names)
+        conn.execute(
+            f"CREATE TEMP TABLE {CONTIG_FEATURE_TABLE} (contig_id VARCHAR, feature_idx BIGINT)"
+        )
+        conn.executemany(
+            f"INSERT INTO {CONTIG_FEATURE_TABLE} VALUES (?, ?)",
+            [(c, f) for c, (f, _, _) in source.features.items()],
+        )
+        write_myloasm_staging(
+            conn, staging_dir=staging, prep_sample_idx=_PREP_SAMPLE, processing_idx=_RUN
+        )
+    return staging
+
+
+def _staged_parquet(staging: Path) -> list[Path]:
+    return sorted(staging.glob("*.parquet")) if staging.is_dir() else []
+
+
+def test_recovers_the_six_tables_the_transform_stages_for_the_run(monkeypatch, source, tmp_path):
+    asked = _install(monkeypatch, source)
+    outputs = _run(tmp_path / "ws")
+
+    staging = outputs["staging_dir"]
+    assert staging.parent == tmp_path / "ws", "the staging dir must be a step output"
+    # register-files loads everything in the staging dir, so it holds the six
+    # tables and nothing else (no raw dump, no spill).
+    assert sorted(p.name for p in staging.iterdir()) == sorted(
+        f"{t}.parquet" for t in MYLOASM_TABLES
+    )
+    # Only the two columns the lookup binds cross the wire.
+    assert asked["reads"] == (_PREP_SAMPLE, _MASK, ["read_id", "sequence_idx"])
+    assert asked["lake"] == (_PREP_SAMPLE, _RUN)
+
+    expected = _expected(source, tmp_path)
+    with duckdb.connect() as conn:
+        for table, rows in MYLOASM_FIXTURE_ROWS.items():
+            got, want = staging / f"{table}.parquet", expected / f"{table}.parquet"
+            (n,) = conn.execute(f"SELECT count(*) FROM '{got}'").fetchone()
+            assert n == rows, table
+            for a, b in ((got, want), (want, got)):
+                diff = conn.execute(f"FROM '{a}' EXCEPT ALL FROM '{b}'").fetchall()
+                assert diff == [], f"{table}: {a.parent.name} has rows {b.parent.name} lacks"
+            keys = conn.execute(
+                f"SELECT DISTINCT prep_sample_idx, processing_idx FROM '{got}'"
+            ).fetchall()
+            assert keys == [(_PREP_SAMPLE, _RUN)], table
+
+
+def test_the_source_tree_is_left_as_it_was(monkeypatch, source, tmp_path):
+    """The source is another ticket's finished output; reading it writes nothing."""
+    before = sorted(p.relative_to(source.scratch) for p in source.scratch.rglob("*"))
+    _install(monkeypatch, source)
+    _run(tmp_path / "ws")
+    assert sorted(p.relative_to(source.scratch) for p in source.scratch.rglob("*")) == before
+
+
+def _drop_manifest(source: Source) -> None:
+    (source.output / "manifest.json").unlink()
+
+
+def _unlist_primary(source: Source) -> None:
+    manifest = source.output / "manifest.json"
+    body = json.loads(manifest.read_text())
+    body["files"] = [f for f in body["files"] if f["path"] != "assembler/assembly_primary.fa"]
+    manifest.write_text(json.dumps(body))
+
+
+def _grow_a_genome_file(source: Source) -> None:
+    with (source.output / "genomes" / "noLCG.fa").open("a") as f:
+        f.write("\n")
+
+
+def _drop_assembler_tree(source: Source) -> None:
+    shutil.rmtree(source.output / "assembler")
+
+
+@pytest.mark.parametrize(
+    ("damage", "error", "match"),
+    [
+        pytest.param(_drop_manifest, FileNotFoundError, "manifest", id="no-manifest"),
+        pytest.param(_unlist_primary, ValueError, "assembly_primary.fa", id="primary-unlisted"),
+        pytest.param(_grow_a_genome_file, ValueError, "noLCG.fa", id="changed-since-finish"),
+        pytest.param(_drop_assembler_tree, FileNotFoundError, "assembler", id="no-tree"),
+    ],
+)
+def test_a_source_that_is_not_the_finished_step_output_is_refused(
+    monkeypatch, source, tmp_path, damage, error, match
+):
+    damage(source)
+    _install(monkeypatch, source)
+    with pytest.raises(error, match=match):
+        _run(tmp_path / "ws")
+    assert _staged_parquet(tmp_path / "ws" / "myloasm_staging") == []
+
+
+def test_a_source_attempt_that_does_not_exist_is_refused(monkeypatch, source, tmp_path):
+    _install(monkeypatch, source)
+    with pytest.raises(FileNotFoundError, match=f"attempt-{_ATTEMPT + 1}"):
+        _run(tmp_path / "ws", assemble_attempt=_ATTEMPT + 1)
+
+
+def test_a_read_the_lookup_does_not_resolve_fails_and_stages_nothing(monkeypatch, source, tmp_path):
+    _install(monkeypatch, source, reads=source.read_names[1:])
+    with pytest.raises(ValueError, match="no sequence_idx"):
+        _run(tmp_path / "ws")
+    assert _staged_parquet(tmp_path / "ws" / "myloasm_staging") == []
+
+
+@pytest.mark.parametrize(
+    ("lake_of", "match"),
+    [
+        # A genome contig whose bytes the run's lake rows do not carry: the tree is
+        # not the registered attempt's.
+        pytest.param(lambda f: list(f.values())[1:], "not in the run's", id="contig-missing"),
+        # A lake feature no genome contig hashes to.
+        pytest.param(
+            lambda f: [*f.values(), (9999, str(uuid.UUID(int=1)), 10)],
+            "no genome contig",
+            id="feature-extra",
+        ),
+    ],
+)
+def test_genome_contigs_must_be_exactly_the_runs_lake_features(
+    monkeypatch, source, tmp_path, lake_of, match
+):
+    _install(monkeypatch, source, lake=lake_of(source.features))
+    with pytest.raises(ValueError, match=match):
+        _run(tmp_path / "ws")
+    assert _staged_parquet(tmp_path / "ws" / "myloasm_staging") == []
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["assembly_processing_idx", "assembly_mask_idx", "source_work_ticket_idx", "assemble_attempt"],
+)
+def test_inputs_refuse_a_non_positive_identifier(field):
+    with pytest.raises(ValueError):
+        _inputs(**{field: 0})

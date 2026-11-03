@@ -12,7 +12,8 @@ places depending on how the run was made:
 - `READ_NAME_TABLE (read_id VARCHAR, sequence_idx BIGINT)`: every read name the
   dump uses -> its `sequence_idx`. A run whose assembler input was named by
   `sequence_idx` builds it with `read_names_from_sequence_idx`; an earlier run's
-  tree, named by the sequencer's `read_id`, needs a lookup against the lake.
+  tree, named by the sequencer's `read_id`, with `read_names_from_lookup` over the
+  sample's `(read_id, sequence_idx)` pairs from the lake.
 - `CONTIG_FEATURE_TABLE (contig_id VARCHAR, feature_idx BIGINT)`: each primary
   contig's minted `feature_idx`, keyed on myloasm's `u<N>ctg` name. A repeated
   identical pair is allowed (the transform deduplicates); two different
@@ -32,6 +33,7 @@ from pathlib import Path
 import duckdb
 from qiita_common.myloasm_constants import MYLOASM_TABLES, myloasm_projection
 from qiita_common.parquet import validate_parquet_path
+from qiita_common.sql import sql_string_literal
 
 from ..miint import PARQUET_OPTS_AT_REST
 
@@ -79,6 +81,26 @@ def staging_paths(staging_dir: Path) -> dict[str, Path]:
     return {table: staging_dir / f"{table}.parquet" for table in MYLOASM_TABLES}
 
 
+def dump_raw_tables(conn: duckdb.DuckDBPyConnection, asm_dir: Path, raw_dir: Path) -> None:
+    """Write the raw dump from a myloasm `-o` tree outside the container: each
+    `MYLOASM_TABLES` reader into `raw_dir/<table>.parquet`, verbatim, as the assemble
+    step's `myloasm_provenance.py` does. `conn` must have miint loaded.
+
+    A tree with no contigs is refused, as that script refuses it: this is only ever
+    run over an assembly that produced primary contigs, so zero rows is a reader or
+    layout change rather than an empty assembly. A missing run row is the
+    transform's own refusal."""
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    src = sql_string_literal(asm_dir)
+    for table, spec in MYLOASM_TABLES.items():
+        dest = validate_parquet_path(raw_dir / f"{table}.parquet")
+        (rows,) = conn.execute(
+            f"COPY (FROM {spec.reader}({src})) TO '{dest}' ({PARQUET_OPTS_AT_REST})"
+        ).fetchone()
+        if table == "myloasm_contig" and rows == 0:
+            raise ValueError(f"{spec.reader} returned no contigs for {asm_dir}")
+
+
 def register_raw_tables(conn: duckdb.DuckDBPyConnection, raw_dir: Path) -> None:
     """Register the dump's six Parquets as `raw_<table>` views, and every read name
     they use as one distinct list. All six are required: the dump writes all six
@@ -121,7 +143,24 @@ def read_names_from_sequence_idx(conn: duckdb.DuckDBPyConnection) -> None:
         )
 
 
-def _require_none(conn: duckdb.DuckDBPyConnection, sql: str, message: str) -> None:
+def read_names_from_lookup(conn: duckdb.DuckDBPyConnection, lookup: str) -> None:
+    """Build `READ_NAME_TABLE` for a run whose reads were named by `read_id`, from
+    `lookup`, a relation of the sample's `(read_id, sequence_idx)` pairs.
+
+    Only the names the dump uses are kept: the lookup is the sample's whole
+    pass-set, and a long-read sample's names are its largest column after the
+    sequences. `lookup` is read once, so a single-consumption stream will do. A name
+    the lookup lacks is the transform's refusal ("no sequence_idx")."""
+    conn.execute(
+        f"CREATE TEMP TABLE {READ_NAME_TABLE} AS "
+        f"SELECT read_id, sequence_idx FROM {lookup} "
+        f"WHERE read_id IN (SELECT read_id FROM {_RAW_READ_NAMES})"
+    )
+
+
+def require_none(conn: duckdb.DuckDBPyConnection, sql: str, message: str) -> None:
+    """Raise `ValueError(message: <rows>)` if `sql` returns any row, quoting the
+    first few."""
     rows = conn.execute(f"{sql} LIMIT {_SHOWN}").fetchall()
     if rows:
         shown = [r[0] if len(r) == 1 else r for r in rows]
@@ -144,51 +183,51 @@ def _validate(conn: duckdb.DuckDBPyConnection) -> None:
             for table, column in _CONTIG_REFERENCE_COLUMNS
         ]
     )
-    _require_none(
+    require_none(
         conn,
         f"SELECT name FROM ({every_name}) WHERE NOT regexp_matches(name, '{_CONTIG_NAME_RE}') "
         "ORDER BY name",
         "contig name(s) not myloasm's u<N>ctg",
     )
-    _require_none(
+    require_none(
         conn,
         f"SELECT {_contig_num('contig_id')} AS n FROM {contig} GROUP BY n HAVING count(*) > 1 "
         "ORDER BY n",
         "contig_num repeated within one run",
     )
-    _require_none(
+    require_none(
         conn,
         f"SELECT name FROM ({every_name}) ANTI JOIN {contig} c ON c.contig_id = name ORDER BY name",
         "contig(s) referenced but not in the run's contigs",
     )
 
-    _require_none(
+    require_none(
         conn,
         f"SELECT read_id FROM {READ_NAME_TABLE} GROUP BY read_id HAVING count(*) > 1 "
         "ORDER BY read_id",
         "read name(s) with more than one sequence_idx",
     )
-    _require_none(
+    require_none(
         conn,
         f"SELECT r.read_id FROM {_RAW_READ_NAMES} r ANTI JOIN {READ_NAME_TABLE} n "
         "USING (read_id) ORDER BY r.read_id",
         "read name(s) with no sequence_idx",
     )
 
-    _require_none(
+    require_none(
         conn,
         f"SELECT contig_id FROM {CONTIG_FEATURE_TABLE} GROUP BY contig_id "
         "HAVING count(DISTINCT feature_idx) > 1 ORDER BY contig_id",
         "contig(s) with more than one feature_idx",
     )
-    _require_none(
+    require_none(
         conn,
         f"SELECT f.contig_id FROM {CONTIG_FEATURE_TABLE} f ANTI JOIN {contig} c "
         f"ON c.contig_id = f.contig_id AND c.dereplication_status = '{_PRIMARY}' "
         "ORDER BY f.contig_id",
         "feature_idx given for contig(s) that are not this run's primary contigs",
     )
-    _require_none(
+    require_none(
         conn,
         f"SELECT c.contig_id FROM {contig} c ANTI JOIN {CONTIG_FEATURE_TABLE} f "
         f"ON f.contig_id = c.contig_id WHERE c.dereplication_status = '{_PRIMARY}' "

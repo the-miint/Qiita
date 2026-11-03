@@ -236,22 +236,53 @@ def test_sign_ticket_omits_columns_when_absent():
     ``"columns": []`` would change the canonical-JSON payload every existing
     ticket signs over, for nothing.
 
-    Demonstrated on a NON-projectable table, because that is now the only kind
-    that may omit the list at all — see
-    ``test_sign_ticket_requires_columns_for_a_projectable_table``.
+    Demonstrated on both kinds that may omit the list: a non-projectable table,
+    and ``read_masked``, which is projectable but does not require one (see
+    ``test_sign_ticket_requires_columns_for_a_projectable_table`` for the kind
+    that does).
     """
     import json
 
     from qiita_control_plane.auth.tickets import sign_ticket
 
-    kwargs = {
-        "table": "read_masked",
-        "filter": {"mask_idx": [7], "prep_sample_idx": [3]},
-        "secret": _TEST_SEED,
-        "expiry_epoch": 1_800_000_000,
-    }
-    assert "columns" not in json.loads(_payload_of(sign_ticket(**kwargs)))
-    assert sign_ticket(**kwargs) == sign_ticket(**kwargs, columns=None)
+    for table, filter_ in (
+        ("reference_taxonomy", {"reference_idx": [42]}),
+        ("read_masked", {"mask_idx": [7], "prep_sample_idx": [3]}),
+    ):
+        kwargs = {
+            "table": table,
+            "filter": filter_,
+            "secret": _TEST_SEED,
+            "expiry_epoch": 1_800_000_000,
+        }
+        assert "columns" not in json.loads(_payload_of(sign_ticket(**kwargs)))
+        assert sign_ticket(**kwargs) == sign_ticket(**kwargs, columns=None)
+
+
+def test_sign_ticket_signs_a_read_masked_projection():
+    """``read_masked`` takes an optional projection, validated like any other:
+    the list is signed in the caller's order, and an unknown, empty, or repeated
+    list is refused at mint."""
+    import json
+
+    from qiita_control_plane.auth.tickets import sign_ticket
+
+    scope = {"mask_idx": [7], "prep_sample_idx": [3]}
+    ticket = sign_ticket(
+        table="read_masked",
+        filter=scope,
+        columns=["read_id", "sequence_idx"],
+        secret=_TEST_SEED,
+    )
+    assert json.loads(_payload_of(ticket))["columns"] == ["read_id", "sequence_idx"]
+
+    for bad, match in (
+        (["sequence_idx", "left_trim1"], "left_trim1"),
+        ([], "empty projection"),
+        (["read_id", "read_id"], "duplicate projection"),
+    ):
+        with pytest.raises(ValueError, match=match):
+            sign_ticket(table="read_masked", filter=scope, columns=bad, secret=_TEST_SEED)
 
 
 def test_sign_ticket_requires_columns_for_a_projectable_table():
@@ -326,7 +357,7 @@ def test_sign_ticket_rejects_duplicate_projection_columns():
 
 
 def test_sign_ticket_rejects_columns_on_a_table_with_no_allowlist():
-    """Only the alignment surface takes a projection, by decision.
+    """Only the tables in ``_PROJECTION_COLUMNS`` take a projection, by decision.
 
     Every other table streams every column, so a list signed onto one would be
     a ticket the data plane rejects outright — mint-time is the cheaper place to
@@ -336,92 +367,97 @@ def test_sign_ticket_rejects_columns_on_a_table_with_no_allowlist():
 
     with pytest.raises(ValueError, match="no projection"):
         sign_ticket(
-            table="read_masked",
-            filter={"mask_idx": [7], "prep_sample_idx": [3]},
-            columns=["sequence_idx"],
+            table="reference_taxonomy",
+            filter={"reference_idx": [42]},
+            columns=["feature_idx"],
             secret=_TEST_SEED,
         )
 
 
+def _rust_projection_rules() -> dict[str, tuple[frozenset[str], bool]]:
+    """The data plane's projection rules, parsed out of `flight_service/query.rs`.
+
+    Rust cannot import the Python and vice versa, so `PROJECTION_RULES` and the
+    column consts it names are read from the source — exactly as
+    ``test_cp_doget_allowlist_matches_the_rust_one_exactly`` does for
+    ALLOWED_TABLES. Returns ``{table: (columns, required)}``.
+    """
+    import re
+    from pathlib import Path
+
+    src = (
+        Path(__file__).resolve().parents[3]
+        / "qiita-data-plane"
+        / "src"
+        / "flight_service"
+        / "query.rs"
+    ).read_text()
+    rules = re.search(
+        r"const PROJECTION_RULES: &\[\(&str, ProjectionRule\)\] = &\[(.*?)\n\];",
+        src,
+        flags=re.DOTALL,
+    )
+    assert rules, "PROJECTION_RULES not found in flight_service/query.rs"
+    entries = re.findall(
+        r'\(\s*"([^"]+)",\s*ProjectionRule\s*\{\s*columns:\s*(\w+),\s*required:\s*(true|false),?\s*\},?\s*\)',
+        rules.group(1),
+    )
+    assert entries, (
+        "PROJECTION_RULES no longer reads as (table, ProjectionRule { columns, required }) "
+        "entries; this test can no longer see the DP's rules and must be rewritten"
+    )
+    parsed: dict[str, tuple[frozenset[str], bool]] = {}
+    for table, const, required in entries:
+        body = re.search(rf"const {const}: &\[&str\] = &\[(.*?)\];", src, flags=re.DOTALL)
+        assert body, f"{const} (named by PROJECTION_RULES for {table}) not found"
+        parsed[table] = (frozenset(re.findall(r'"([^"]+)"', body.group(1))), required == "true")
+    return parsed
+
+
 def test_cp_projection_allowlist_matches_the_rust_one_exactly():
-    """``_PROJECTION_COLUMNS`` is a hand-copy of the data plane's
-    ``ALIGNMENT_PROJECTION_COLUMNS`` (flight_service/query.rs). The CP validates and
-    signs; the DP validates again and projects. Drift fails asymmetrically:
+    """``_PROJECTION_COLUMNS`` is a hand-copy of the data plane's per-table
+    allowlists (``PROJECTION_RULES`` in flight_service/query.rs). The CP validates
+    and signs; the DP validates again and projects. Drift fails asymmetrically:
 
     * a column the DP allows but the CP does not is UNREACHABLE — nobody can get
       it signed, so the feature quietly does not work and no test notices;
     * a column the CP allows but the DP does not mints tickets the DP rejects,
       turning a deploy into a stream of InvalidArgument.
-
-    Rust cannot import the Python and vice versa, so the const is parsed out of
-    the source — exactly as ``test_cp_doget_allowlist_matches_the_rust_one_exactly``
-    does for ALLOWED_TABLES.
     """
-    import re
-    from pathlib import Path
-
     from qiita_control_plane.auth.tickets import _PROJECTION_COLUMNS
 
-    src = (
-        Path(__file__).resolve().parents[3]
-        / "qiita-data-plane"
-        / "src"
-        / "flight_service"
-        / "query.rs"
-    ).read_text()
-    m = re.search(
-        r"const ALIGNMENT_PROJECTION_COLUMNS: &\[&str\] = &\[(.*?)\];", src, flags=re.DOTALL
-    )
-    assert m, "ALIGNMENT_PROJECTION_COLUMNS not found in flight_service/query.rs"
-    rust_columns = set(re.findall(r'"([^"]+)"', m.group(1)))
-    cp_columns = _PROJECTION_COLUMNS["alignment_visible"]
-
-    assert rust_columns == set(cp_columns), (
-        "the CP projection allowlist and the data plane's have drifted; "
-        f"only in Rust: {sorted(rust_columns - set(cp_columns))}; "
-        f"only in Python: {sorted(set(cp_columns) - rust_columns)}"
-    )
+    rust = _rust_projection_rules()
+    for table, (rust_columns, _) in rust.items():
+        cp_columns = _PROJECTION_COLUMNS.get(table, frozenset())
+        assert rust_columns == cp_columns, (
+            f"the CP and DP projection allowlists for {table} have drifted; "
+            f"only in Rust: {sorted(rust_columns - cp_columns)}; "
+            f"only in Python: {sorted(cp_columns - rust_columns)}"
+        )
 
 
-def test_cp_projection_allowlist_covers_only_tables_the_dp_projects():
-    """The mapping's KEYS must match the data plane's, too, and in BOTH
-    directions.
+def test_cp_projection_tables_and_requirement_match_the_dp():
+    """The mapping's KEYS, and which of them REQUIRE a list, must match the data
+    plane's too — in both directions.
 
     A table the CP thinks is projectable but the DP does not mints tickets
     rejected on arrival. The reverse — a table the DP projects that the CP does
-    not know about — is worse in a quieter way: the DP then requires a column list
-    the CP can never sign, so that table's DoGet fails for everyone with nothing
-    to point at.
-
-    So the key set is read out of the Rust rather than compared against a literal.
-    The DP decides projectability in `is_alignment_doget_surface`, which is a
-    disjunction of table-name equalities; parsing those is what makes a second
-    Rust-side table fail here instead of nowhere.
+    not know about — is worse in a quieter way: if the DP requires a list the CP
+    can never sign, that table's DoGet fails for everyone with nothing to point
+    at. The requirement drifts the same two ways: a CP that omits a list the DP
+    requires mints dead tickets, and a CP that demands one the DP does not breaks
+    every caller that omits it.
     """
-    import re
-    from pathlib import Path
+    from qiita_control_plane.auth.tickets import _PROJECTION_COLUMNS, _PROJECTION_REQUIRED
 
-    from qiita_control_plane.auth.tickets import _PROJECTION_COLUMNS
-
-    src = (
-        Path(__file__).resolve().parents[3]
-        / "qiita-data-plane"
-        / "src"
-        / "flight_service"
-        / "query.rs"
-    ).read_text()
-    body = re.search(
-        r"fn is_alignment_doget_surface\(table: &str\) -> bool \{(.*?)\n\}", src, flags=re.DOTALL
-    )
-    assert body, "is_alignment_doget_surface not found in flight_service/query.rs"
-    dp_tables = set(re.findall(r'table == "([^"]+)"', body.group(1)))
-    assert dp_tables, (
-        "is_alignment_doget_surface no longer decides by table-name equality; this "
-        "test can no longer read the DP's projectable set and must be rewritten"
-    )
-
-    assert dp_tables == set(_PROJECTION_COLUMNS), (
+    rust = _rust_projection_rules()
+    assert set(rust) == set(_PROJECTION_COLUMNS), (
         "the projectable-table sets have drifted; "
-        f"only the DP projects: {sorted(dp_tables - set(_PROJECTION_COLUMNS))}; "
-        f"only the CP signs: {sorted(set(_PROJECTION_COLUMNS) - dp_tables)}"
+        f"only the DP projects: {sorted(set(rust) - set(_PROJECTION_COLUMNS))}; "
+        f"only the CP signs: {sorted(set(_PROJECTION_COLUMNS) - set(rust))}"
+    )
+    rust_required = {table for table, (_, required) in rust.items() if required}
+    assert rust_required == _PROJECTION_REQUIRED, (
+        "the CP and DP disagree on which tables require a projection; "
+        f"DP: {sorted(rust_required)}; CP: {sorted(_PROJECTION_REQUIRED)}"
     )

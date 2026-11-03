@@ -113,9 +113,19 @@ into a 422 with a useful message, and the data plane's is the defense-in-depth
 that keeps a signed name out of interpolated SQL, the same argument
 `ALLOWED_FILTER_COLUMNS` makes for the filter.
 
-**Only `alignment_visible` is projectable, and it *requires* a column list.**
-Every other DoGet table streams `SELECT *` and rejects a list rather than
-ignoring one. The asymmetry is not arbitrary, and this is the one measured number
+**Two tables are projectable, and only `alignment_visible` *requires* a column
+list.** The rule per table is `PROJECTION_RULES` in
+`qiita-data-plane/src/flight_service/query.rs`, mirrored at the signer. Every
+other DoGet table streams `SELECT *` and rejects a list rather than ignoring one.
+
+`read_masked` takes an optional list. Omitted, it streams the macro's full shape,
+which is the default its readers were built on. Given, it lets a consumer that
+binds only identifiers skip a long-read sample's sequences and qualities. The
+projection reaches the `read` scan inside the macro: an EXPLAIN of
+`SELECT read_id, sequence_idx FROM qiita_lake.read_masked(…)` scans only
+`prep_sample_idx, sequence_idx, read_id`.
+
+The alignment surface's requirement is not arbitrary, and this is the one measured number
 behind it: on a **HiFi** alignment payload of 716,187 rows (mean CIGAR ≈ 1,092
 bytes), the Arrow stream was 775.6 MiB, of which `cigar` alone was 746.1 MiB
 (96.2%) and the six identifier/position columns the feature-table consumer

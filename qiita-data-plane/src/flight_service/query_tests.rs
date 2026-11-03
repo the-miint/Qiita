@@ -1029,7 +1029,7 @@ fn build_query_assembly_requires_exactly_the_run_key() {
 
 #[test]
 fn build_query_assembly_takes_no_projection_and_no_members() {
-    // No projection allowlist (only the alignment surface has one), so a
+    // No projection rule (see PROJECTION_RULES), so a
     // signed column list is refused rather than dropped; and `members` is
     // only meaningful for the block-read selectors.
     for table in ["assembled_sequence", "assembled_sequence_chunks"] {
@@ -1165,8 +1165,8 @@ fn build_query_bin_quality_requires_exactly_the_run_key() {
 
 #[test]
 fn build_query_bin_quality_takes_no_projection_and_no_members() {
-    // Same two refusals the assembly surfaces make: only the alignment surface
-    // is projectable, and `members` is only meaningful for the block selectors.
+    // Same two refusals the assembly surfaces make: it has no projection rule,
+    // and `members` is only meaningful for the block selectors.
     assert!(
         build_query(
             "bin_quality",
@@ -1252,9 +1252,9 @@ fn duplicate_projection_columns_are_rejected() {
 
 #[test]
 fn projection_columns_are_rejected_on_a_table_with_no_allowlist() {
-    // Only the alignment surface takes a column list; every other table
-    // streams SELECT * by decision. A list elsewhere is a control-plane bug,
-    // and *ignoring* it would serve wider rows than the ticket asked for —
+    // Only the tables in PROJECTION_RULES take a column list; every other
+    // table streams SELECT * by decision. A list elsewhere is a control-plane
+    // bug, and *ignoring* it would serve wider rows than the ticket asked for —
     // the exact silent widening this whole mechanism exists to prevent.
     let cols = columns(&["feature_idx"]);
 
@@ -1268,28 +1268,91 @@ fn projection_columns_are_rejected_on_a_table_with_no_allowlist() {
         "a reference table must refuse a projection column list"
     );
 
-    // The block-read and read_masked selectors build their SQL on their own
-    // early-return paths, so they are the cases that would silently skip a
-    // gate placed further down build_query. Pin them explicitly.
-    assert!(
-        build_query(
-            "read_block",
+    // The block-read selectors build their SQL on their own early-return path,
+    // so they are the case that would silently skip a gate placed further down
+    // build_query. Pin it explicitly — `read_masked_block` included, which
+    // reuses the `read_masked` macro but not its projection rule.
+    // The message is asserted, not just the error: a `read_masked_block`
+    // ticket with no `mask_idx` filter is refused for its scope too.
+    for selector in ["read_block", "read_masked_block"] {
+        let err = build_query(
+            selector,
             &auth::TicketFilter::new(),
             &block_members(),
-            &cols
+            &cols,
         )
-        .is_err(),
-        "a block-read selector must refuse a projection column list"
+        .expect_err("a block-read selector must refuse a projection column list");
+        assert!(
+            err.message().contains("projection"),
+            "{selector} must be refused for its column list, got: {err}"
+        );
+    }
+}
+
+/// A `read_masked` scope: one mask, two prep_samples.
+fn read_masked_scope() -> auth::TicketFilter {
+    filter_of(&[
+        ("mask_idx", vec![serde_json::json!(7)]),
+        (
+            "prep_sample_idx",
+            vec![serde_json::json!(11), serde_json::json!(12)],
+        ),
+    ])
+}
+
+#[test]
+fn read_masked_projects_the_signed_columns_through_the_macro() {
+    // The projection is the OUTER select list over the macro call; the scope
+    // stays the macro's arguments (see build_query_read_masked_calls_the_scoped_macro
+    // for why it must never become a WHERE).
+    let cols = columns(&["sequence_idx", "read_id"]);
+    let (sql, table) = build_query("read_masked", &read_masked_scope(), &[], &cols).unwrap();
+    assert_eq!(table, "qiita_lake.read_masked");
+    assert_eq!(
+        sql,
+        "SELECT sequence_idx, read_id FROM qiita_lake.read_masked(7, [11,12])"
     );
-    let mut masked = auth::TicketFilter::new();
-    masked.insert("mask_idx".to_string(), vec![serde_json::Value::from(1)]);
-    masked.insert(
-        "prep_sample_idx".to_string(),
-        vec![serde_json::Value::from(3)],
-    );
+}
+
+#[test]
+fn read_masked_projection_is_whitelisted() {
+    for bad in [
+        "no_such_column",
+        "read_id; DROP TABLE read",
+        "*",
+        "left_trim1",
+    ] {
+        let cols = columns(&["sequence_idx", bad]);
+        let err = build_query("read_masked", &read_masked_scope(), &[], &cols)
+            .expect_err("an unknown read_masked projection column must be rejected");
+        assert!(
+            err.message().contains(bad),
+            "the error should name the offending column, got: {err}"
+        );
+    }
+    let dup = columns(&["read_id", "sequence_idx", "read_id"]);
     assert!(
-        build_query("read_masked", &masked, &[], &cols).is_err(),
-        "the read_masked macro must refuse a projection column list"
+        build_query("read_masked", &read_masked_scope(), &[], &dup).is_err(),
+        "a duplicated read_masked projection column must be rejected"
+    );
+}
+
+#[test]
+fn only_the_alignment_surface_requires_a_projection() {
+    // `read_masked` is projectable but streams its full shape when the ticket
+    // names no columns — the default its every existing consumer relies on.
+    // The alignment surface is the one table where an unprojected read is the
+    // wrong default. Pin both directions, so a rule flipped either way fails.
+    for (table, rule) in PROJECTION_RULES {
+        assert_eq!(
+            rule.required,
+            is_alignment_doget_surface(table),
+            "{table}: only the alignment surface requires a projection"
+        );
+    }
+    assert!(
+        projection_rule("read_masked").is_some_and(|r| !r.required),
+        "read_masked must be projectable and optional"
     );
 }
 
@@ -1354,7 +1417,7 @@ fn projection_allowlist_matches_the_alignment_ddl() {
 fn no_membership_join_table_has_a_projection_allowlist() {
     for table in MEMBERSHIP_JOIN_TABLES {
         assert!(
-            projection_allowlist(table).is_none(),
+            projection_rule(table).is_none(),
             "{table} takes the membership JOIN, whose SELECT t.* would silently \
              drop a projection — teach build_query to qualify the columns with \
              the base alias before giving it an allowlist"
@@ -1751,6 +1814,39 @@ fn projection_allowlist_matches_the_alignment_schema_exactly() {
          only in the view: {:?}; only in the allowlist: {:?}",
         actual.difference(&allowed).collect::<Vec<_>>(),
         allowed.difference(&actual).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+#[serial_test::serial]
+#[cfg(feature = "integration")]
+fn read_masked_projection_allowlist_matches_the_macro_exactly() {
+    // The same drift argument as the alignment test above, against the
+    // `read_masked` macro's output — which a macro does not expose through
+    // duckdb_columns(), so the shape is read off a zero-row DESCRIBE of a call.
+    // In order, too: an unprojected ticket streams the macro's own order, and
+    // the allowlist is the documented list of what that stream carries.
+    let conn = Connection::open_in_memory().unwrap();
+    ducklake::connect_ducklake(
+        &conn,
+        &crate::test_catalog::connstr(),
+        &crate::test_catalog::data_path(),
+    )
+    .unwrap();
+    ducklake::ensure_read_tables(&conn).unwrap();
+
+    let mut stmt = conn
+        .prepare("DESCRIBE SELECT * FROM qiita_lake.read_masked(0, [0])")
+        .unwrap();
+    let actual: Vec<String> = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+
+    assert_eq!(
+        actual, READ_MASKED_PROJECTION_COLUMNS,
+        "the read_masked projection allowlist and the macro's output have drifted"
     );
 }
 

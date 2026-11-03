@@ -94,3 +94,28 @@ async fn replay_safe_actions_matches_dispatcher() {
     };
     assert_eq!(err.code(), tonic::Code::InvalidArgument);
 }
+
+/// `count_masked` reuses a `read_masked` DoGet ticket, which may now carry an
+/// optional projection. A count has no columns to narrow, so a projected ticket
+/// is refused rather than counted with the signed field disregarded. Checked
+/// before the lake is touched, so no catalog is needed.
+#[tokio::test]
+async fn count_masked_refuses_a_projected_read_masked_ticket() {
+    let tmp = tempfile::tempdir().unwrap();
+    let service = make_service(tmp.path().to_path_buf());
+    let payload = br#"{"table":"read_masked","filter":{"mask_idx":[7],"prep_sample_idx":[3]},"columns":["read_id","sequence_idx"]}"#;
+    let action = Action {
+        r#type: "count_masked".to_string(),
+        body: sign_raw(payload, &TEST_SEED, future_expiry_secs(300)).into(),
+    };
+    let err = match service.do_action(Request::new(action)).await {
+        Ok(_) => panic!("a projected ticket must not be counted"),
+        Err(e) => e,
+    };
+    assert_eq!(err.code(), tonic::Code::InvalidArgument, "got: {err}");
+    assert!(
+        err.message().contains("projection"),
+        "the refusal should name the projection: {}",
+        err.message()
+    );
+}

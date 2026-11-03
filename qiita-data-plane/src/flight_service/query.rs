@@ -120,9 +120,9 @@ const ALLOWED_FILTER_COLUMNS: &[&str] = &[
 /// into a 422 with a useful message, and this one is the defense-in-depth that
 /// keeps a signed name out of interpolated SQL.
 ///
-/// The allowlist is per-table (see `projection_allowlist`) and today only the
-/// alignment surface has one; every other DoGet table streams `SELECT *` and
-/// refuses a column list outright. Why the asymmetry: `docs/architecture/flight.md`.
+/// The allowlist is per-table (see `PROJECTION_RULES`); a DoGet table with no
+/// rule streams `SELECT *` and refuses a column list outright. Why the
+/// asymmetry: `docs/architecture/flight.md`.
 const ALIGNMENT_PROJECTION_COLUMNS: &[&str] = &[
     "alignment_idx",
     "prep_sample_idx",
@@ -158,28 +158,73 @@ const ALIGNMENT_PROJECTION_COLUMNS: &[&str] = &[
 /// `no_membership_join_table_has_a_projection_allowlist` does.
 const MEMBERSHIP_JOIN_TABLES: &[&str] = &["reference_sequences", "reference_sequence_chunks"];
 
-/// The projection allowlist for `table`, or `None` when the table takes no
-/// column list at all (it streams `SELECT *`, and a list is a control-plane bug).
-fn projection_allowlist(table: &str) -> Option<&'static [&'static str]> {
-    is_alignment_doget_surface(table).then_some(ALIGNMENT_PROJECTION_COLUMNS)
+/// The columns a `read_masked` ticket may project: the macro's output, in its
+/// order (`ensure_read_tables` in ducklake.rs). Nothing here is wider than the
+/// unprojected stream — a projection only narrows it — so the list is the
+/// macro's whole shape, not a curated subset.
+const READ_MASKED_PROJECTION_COLUMNS: &[&str] = &[
+    "mask_idx",
+    "prep_sample_idx",
+    "sequence_idx",
+    "read_id",
+    "sequence1",
+    "qual1",
+    "sequence2",
+    "qual2",
+];
+
+/// How one table takes a projection: the columns a ticket may name, and whether
+/// it must name some.
+struct ProjectionRule {
+    columns: &'static [&'static str],
+    /// `true` where serving the table unprojected is the wrong default, so a
+    /// ticket without a list is refused rather than widened to `SELECT *`.
+    /// `false` where the full shape is the default every existing consumer
+    /// reads, and a list is a consumer opting into fewer columns.
+    required: bool,
+}
+
+/// Every table that takes a projection column list. A table absent here
+/// streams `SELECT *` and refuses a list. Mirrored by `_PROJECTION_COLUMNS` and
+/// `_PROJECTION_REQUIRED` in the control plane's `auth/tickets.py`, which a test
+/// there parses out of this source — keep each entry on the
+/// `(name, ProjectionRule { columns, required })` shape it reads.
+const PROJECTION_RULES: &[(&str, ProjectionRule)] = &[
+    (
+        "alignment_visible",
+        ProjectionRule {
+            columns: ALIGNMENT_PROJECTION_COLUMNS,
+            required: true,
+        },
+    ),
+    (
+        "read_masked",
+        ProjectionRule {
+            columns: READ_MASKED_PROJECTION_COLUMNS,
+            required: false,
+        },
+    ),
+];
+
+/// The projection rule for `table`, or `None` when it takes no column list.
+fn projection_rule(table: &str) -> Option<&'static ProjectionRule> {
+    PROJECTION_RULES
+        .iter()
+        .find(|(name, _)| *name == table)
+        .map(|(_, rule)| rule)
 }
 
 /// The SQL select list for `table`, given the ticket's (possibly empty) column
-/// list: the signed columns in the ticket's own order, or `*` for a table that
-/// takes no projection.
-///
-/// **Having an allowlist and requiring a list are the same property.** A table
-/// only gets an allowlist because serving it unprojected is the wrong default,
-/// so the four cases below are total and there is no "projection is optional
-/// here" state to reason about. Splitting them is a one-line change if that ever
-/// becomes something we want.
+/// list: the signed columns in the ticket's own order, or `*` for a table whose
+/// rule does not require a list (or that has none).
 ///
 /// Every rejection is a control-plane bug rather than client input — the CP
 /// validates the same set before signing — so failing loudly is the point: the
 /// alternative is quietly serving a different set of columns than was signed.
 fn select_list_for(table: &str, columns: &[String]) -> Result<String, Status> {
-    match (projection_allowlist(table), columns.is_empty()) {
+    match (projection_rule(table), columns.is_empty()) {
         (None, true) => Ok("*".to_string()),
+        (Some(rule), true) if !rule.required => Ok("*".to_string()),
         // No server-side default to fall back to, deliberately: the consumer is
         // the only component that knows which columns it binds, and a fallback
         // here would be a second answer to that question, free to drift wider
@@ -194,8 +239,8 @@ fn select_list_for(table: &str, columns: &[String]) -> Result<String, Status> {
         (None, false) => Err(Status::invalid_argument(format!(
             "table {table:?} does not accept a projection column list"
         ))),
-        (Some(allowed), false) => {
-            check_projection_columns(allowed, columns)?;
+        (Some(rule), false) => {
+            check_projection_columns(rule.columns, columns)?;
             Ok(columns.join(", "))
         }
     }
@@ -479,7 +524,7 @@ pub(super) fn build_query(
     // `read_masked` is a table macro whose (mask, prep_samples) scope IS its argument
     // list, so it cannot be assembled by the generic WHERE-clause path below.
     if table == "read_masked" {
-        return build_read_masked_query(filter);
+        return build_read_masked_query(filter, &select_list);
     }
 
     // An assembly surface is scoped by a run, which is a fact in another table
@@ -627,7 +672,10 @@ pub(super) fn build_query(
 /// outer filter: on the human-read surface an unrecognised scope column is a
 /// control-plane bug, and quietly reading "the macro's scope, plus whatever else"
 /// is how an under-scoped read would pass.
-fn build_read_masked_query(filter: &auth::TicketFilter) -> Result<(String, String), Status> {
+fn build_read_masked_query(
+    filter: &auth::TicketFilter,
+    select_list: &str,
+) -> Result<(String, String), Status> {
     let mask_idx = single_i64_filter(filter, "mask_idx")?;
     let preps = i64_list_filter(filter, "prep_sample_idx")?;
     if filter.len() != 2 {
@@ -637,7 +685,10 @@ fn build_read_masked_query(filter: &auth::TicketFilter) -> Result<(String, Strin
         )));
     }
     Ok((
-        format!("SELECT * FROM {}", read_masked_relation(mask_idx, &preps)),
+        format!(
+            "SELECT {select_list} FROM {}",
+            read_masked_relation(mask_idx, &preps)
+        ),
         "qiita_lake.read_masked".to_string(),
     ))
 }
