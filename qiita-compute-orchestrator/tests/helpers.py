@@ -1,5 +1,6 @@
 """Shared test constants and builders for qiita-compute-orchestrator."""
 
+import gzip
 from pathlib import Path
 
 import duckdb
@@ -12,6 +13,19 @@ TEST_SEQUENCES = {
     "seq4": "TTTTAAAACCCC",
     "seq5": "GGGGCCCCAAAA",
 }
+
+
+def write_fasta(path: Path, records: list[tuple[str, str]]) -> Path:
+    """Write `(read_id, sequence)` records as FASTA at `path`, gzipped when it ends
+    in `.gz`, creating its directory."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    text = "".join(f">{read_id}\n{seq}\n" for read_id, seq in records)
+    if path.suffix == ".gz":
+        with gzip.open(path, "wt") as fh:
+            fh.write(text)
+    else:
+        path.write_text(text)
+    return path
 
 
 def write_chunked_blob_upload(dest: Path, payload: bytes) -> Path:
