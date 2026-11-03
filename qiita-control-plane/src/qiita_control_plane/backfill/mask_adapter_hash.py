@@ -253,8 +253,7 @@ async def apply_rekey(pool: asyncpg.Pool, plan: RekeyPlan) -> int:
     absence is an out-of-band edit the operator has to look at. Rows written before
     the raise stay written; a re-run plans only what is left.
 
-    Returns the count of rows actually written, which is why a skip is not a
-    silent no-op: the caller reports it against `len(plan.writable())`.
+    Returns the count of rows written.
     """
     if plan.blocked():
         raise RuntimeError(

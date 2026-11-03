@@ -274,6 +274,25 @@ async def test_apply_raises_on_a_row_deleted_since_the_plan(seeded):
         await apply_rekey(seeded["pool"], plan)
 
 
+async def test_apply_keeps_rows_written_before_a_vanished_row(seeded):
+    """Each row is its own transaction, so the rows apply wrote before the vanished
+    one stay re-keyed, and a fresh plan has only the rest left."""
+    tag = secrets.token_hex(4)
+    await seeded["legacy"](_params("legacy-bytes-digest", version=f"{tag}-a"))
+    await seeded["legacy"](_params("legacy-bytes-digest", version=f"{tag}-b"))
+
+    plan = await seeded["plan"]()
+    first, second = (r.mask_idx for r in plan.writable())
+    await seeded["pool"].execute("DELETE FROM qiita.mask_definition WHERE mask_idx = $1", second)
+
+    with pytest.raises(RuntimeError, match=f"mask_idx={second} is gone.*; 1 row"):
+        await apply_rekey(seeded["pool"], plan)
+
+    row = await fetch_mask_definition_by_idx(seeded["pool"], first)
+    assert row["adapter_hash_scheme"] == ADAPTER_HASH_SCHEME_SEQUENCE_HASH
+    assert (await seeded["plan"]()).writable() == []
+
+
 async def test_plan_reports_a_collision_rather_than_planning_a_write(seeded):
     """When the same config already exists under the current derivation, the
     legacy row's re-keyed params_hash is taken. Merging means repointing
