@@ -50,8 +50,8 @@ async def client(postgres_pool, human_admin_session):
 
     app.state.pool = postgres_pool
     _install_settings(app)
-    # No orchestrator: the route skips the on-disk artifact purge, so these tests
-    # cover the Postgres teardown without a backend client.
+    # No backend client: the orchestrator purge branch in `delete_reference` is
+    # skipped, so these tests cover the Postgres teardown alone.
     saved_compute_backend_client = getattr(app.state, "compute_backend_client", None)
     app.state.compute_backend_client = None
     created_refs: list[int] = []

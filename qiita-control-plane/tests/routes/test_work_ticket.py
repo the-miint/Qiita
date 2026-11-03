@@ -88,6 +88,7 @@ async def wt_client(postgres_pool, stub_compute_backend_client, ingest_root):
         data_plane_url="unused",
         path_ingest_roots=(ingest_root,),
     )
+    saved_compute_backend_client = getattr(app.state, "compute_backend_client", None)
     app.state.compute_backend_client = stub_compute_backend_client
     app.state.running_dispatches = set()
     app.state.dispatch_semaphore = build_dispatch_semaphore()
@@ -99,6 +100,7 @@ async def wt_client(postgres_pool, stub_compute_backend_client, ingest_root):
         ac._created_tickets = created_tickets  # type: ignore[attr-defined]
         yield ac
 
+    app.state.compute_backend_client = saved_compute_backend_client
     # Cleanup. work_tickets first (FK to action / reference / principal).
     if created_tickets:
         await postgres_pool.execute(
