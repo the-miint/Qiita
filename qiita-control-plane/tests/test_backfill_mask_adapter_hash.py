@@ -274,6 +274,25 @@ async def test_apply_raises_on_a_row_deleted_since_the_plan(seeded):
         await apply_rekey(seeded["pool"], plan)
 
 
+async def test_apply_skips_a_row_rekeyed_since_the_plan(seeded):
+    """A row whose params_hash changed after the plan read it (the mint re-keyed it)
+    is left as it is: the plan's rewritten params describe the old blob."""
+    tag = secrets.token_hex(4)
+    mask_idx = await seeded["legacy"](_params("legacy-bytes-digest", version=f"{tag}-a"))
+
+    plan = await seeded["plan"]()
+    assert [r.mask_idx for r in plan.writable()] == [mask_idx]
+    moved = secrets.token_bytes(32)
+    await seeded["pool"].execute(
+        "UPDATE qiita.mask_definition SET params_hash = $1 WHERE mask_idx = $2", moved, mask_idx
+    )
+
+    assert await apply_rekey(seeded["pool"], plan) == 0
+    row = await fetch_mask_definition_by_idx(seeded["pool"], mask_idx)
+    assert bytes(row["params_hash"]) == moved
+    assert row["adapter_hash_scheme"] is None
+
+
 async def test_apply_keeps_rows_written_before_a_vanished_row(seeded):
     """Each row is its own transaction, so the rows apply wrote before the vanished
     one stay re-keyed, and a fresh plan has only the rest left."""

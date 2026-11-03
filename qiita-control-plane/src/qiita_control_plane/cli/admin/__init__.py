@@ -864,7 +864,11 @@ def _handle_backfill_mask_adapter_hash(
         return 1
 
     if args.execute:
-        print(f"\nwrote {written} mask_definition row(s)")
+        skipped = len(plan.writable()) - written
+        print(
+            f"\nwrote {written} mask_definition row(s); skipped {skipped} re-keyed since"
+            " the plan read them"
+        )
     else:
         print(
             f"\nDRY RUN — nothing written. Pass --execute to write {len(plan.writable())} row(s)."

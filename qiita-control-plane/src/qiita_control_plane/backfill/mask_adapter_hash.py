@@ -253,7 +253,8 @@ async def apply_rekey(pool: asyncpg.Pool, plan: RekeyPlan) -> int:
     absence is an out-of-band edit the operator has to look at. Rows written before
     the raise stay written; a re-run plans only what is left.
 
-    Returns the count of rows written.
+    Returns the count of rows written; it is short of `len(plan.writable())` by the
+    rows skipped.
     """
     if plan.blocked():
         raise RuntimeError(
@@ -274,6 +275,8 @@ async def apply_rekey(pool: asyncpg.Pool, plan: RekeyPlan) -> int:
                         f"mask_definition row mask_idx={row.mask_idx} is gone since the plan"
                         f" read it; {written} row(s) were written before it"
                     )
+                if bytes(locked["params_hash"]) != row.planned_params_hash:
+                    continue
                 await conn.execute(
                     "UPDATE qiita.mask_definition"
                     "   SET params = $1::jsonb, params_hash = $2, adapter_hash_scheme = $3"

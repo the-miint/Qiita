@@ -19,3 +19,9 @@
   planned mask whose row is gone at write time (#remove-mask-deletion).** It skipped
   the row before. Rows written before the error stay written; a re-run plans only the
   rest.
+
+### Fixed
+
+- **`qiita-admin backfill mask-adapter-hash --execute` skips a mask the mint re-keyed
+  after the plan read it, instead of overwriting it with the plan's stale params
+  (#remove-mask-deletion).** The summary line reports how many it skipped.
