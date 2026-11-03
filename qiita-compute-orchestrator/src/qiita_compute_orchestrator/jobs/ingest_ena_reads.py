@@ -47,11 +47,7 @@ import duckdb
 from pydantic import BaseModel, Field
 from qiita_common.api_paths import compute_reads_staging_path
 from qiita_common.backend_failure import BackendFailure, FailureKind
-from qiita_common.ena_accession import (
-    EnaAccessionKind,
-    InvalidEnaAccessionError,
-    detect_accession_kind,
-)
+from qiita_common.ena_accession import InvalidEnaAccessionError, validate_run_accession
 from qiita_common.http_status import is_transient_error_text, is_transient_http_status
 from qiita_common.models import FailureType, WorkTicketFailureStage
 from qiita_common.models.ena_import import MAX_ENA_DOWNLOAD_RUN_CONCURRENCY, FailedRunOutcome
@@ -80,7 +76,7 @@ _CONCURRENCY = 4
 _DUCKDB_MEMORY_GB = 7
 _DUCKDB_THREADS = 2
 
-# Cap on the combined failure reason, which lands in a DB column and an email.
+# Caps on a failure reason, which lands in a DB column and an email.
 _REASON_FULL_RUNS = 3
 _REASON_LISTED_ACCESSIONS = 20
 
@@ -222,11 +218,15 @@ def _classify_ena_fetch_error(
     )
 
 
-def _is_run_accession(accession: str) -> bool:
+def _run_accession_error(accession: str) -> str | None:
+    """Why the roster's `accession` cannot be scanned as one run, or None when it can.
+    The scan takes the value as stored, so a padded one is refused too."""
     try:
-        return detect_accession_kind(accession) is EnaAccessionKind.RUN
-    except InvalidEnaAccessionError:
-        return False
+        if validate_run_accession(accession) == accession:
+            return None
+    except InvalidEnaAccessionError as exc:
+        return str(exc)
+    return f"{accession!r} carries surrounding whitespace"
 
 
 def _is_permanent_fetch_error(exc: duckdb.Error) -> bool:
@@ -235,6 +235,12 @@ def _is_permanent_fetch_error(exc: duckdb.Error) -> bool:
     return getattr(exc, "status_code", None) == 404 or any(
         marker in text for marker in _PERMANENT_ERROR_MARKERS
     )
+
+
+def _capped_list(items: list[str], sep: str = ", ") -> str:
+    """The first `_REASON_LISTED_ACCESSIONS` of `items`, with "…" when there are more."""
+    ellipsis = "…" if len(items) > _REASON_LISTED_ACCESSIONS else ""
+    return sep.join(items[:_REASON_LISTED_ACCESSIONS]) + ellipsis
 
 
 def _combine_failures(failed: list[tuple[str, BackendFailure]]) -> BackendFailure:
@@ -250,9 +256,7 @@ def _combine_failures(failed: list[tuple[str, BackendFailure]]) -> BackendFailur
     )
     rest = [acc for acc, _ in ordered[_REASON_FULL_RUNS:]]
     if rest:
-        listed = ", ".join(rest[:_REASON_LISTED_ACCESSIONS])
-        ellipsis = "…" if len(rest) > _REASON_LISTED_ACCESSIONS else ""
-        reason += f" | and {len(rest)} more failed runs: {listed}{ellipsis}"
+        reason += f" | and {len(rest)} more failed runs: {_capped_list(rest)}"
     return BackendFailure(kind=lead.kind, stage=lead.stage, step_name=lead.step_name, reason=reason)
 
 
@@ -262,15 +266,15 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     roster = read_roster_parquet(
         inputs.ena_run_map, value_column="ena_run_accession", roster_name="ena_run_map"
     )
-    not_runs = sorted((psi, acc) for psi, acc in roster if not _is_run_accession(acc))
-    if not_runs:
+    refused = sorted(
+        (psi, error) for psi, acc in roster if (error := _run_accession_error(acc)) is not None
+    )
+    if refused:
         raise ValueError(
-            f"{len(not_runs)} sequenced_sample(s) of this pool carry an ena_run_accession "
-            "that is not an ENA run accession (SRR, ERR or DRR followed by digits); a scan "
-            "of an experiment, sample or study accession would cover every run under it: "
-            + ", ".join(
-                f"prep_sample {psi}: {acc!r}" for psi, acc in not_runs[:_REASON_LISTED_ACCESSIONS]
-            )
+            f"{len(refused)} sequenced_sample(s) of this pool carry an ena_run_accession "
+            "that is not one ENA run accession; a scan of an experiment, sample or study "
+            "accession would cover every run under it: "
+            + _capped_list([f"prep_sample {psi}: {error}" for psi, error in refused], sep="; ")
         )
 
     workspace.mkdir(parents=True, exist_ok=True)

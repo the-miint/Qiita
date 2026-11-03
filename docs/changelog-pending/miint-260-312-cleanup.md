@@ -6,9 +6,10 @@
   duckdb-miint#261 fixed that, so each pass is one call again and `fasta_chunks/` holds a
   single part. It relies on that release, which miint does not yet document
   (duckdb-miint#378).
-- **ENA ingest refuses a run accession that is not a run (#806).** A pool whose
-  sequenced_sample carries an experiment, sample, study or malformed accession as its
-  `ena_run_accession` now fails its download at once, naming each prep_sample:
+- **ENA ingest refuses an `ena_run_accession` that is not a run accession (#806).** A
+  pool whose sequenced_sample carries an experiment, sample, study or malformed accession
+  as its `ena_run_accession`, or a run accession with surrounding whitespace, now fails
+  its download at once, naming each prep_sample (the first 20 of a longer list):
   `read_ena_sequences` would expand such an accession to every run under it, and a scan
   of several runs skips a run that fails. Correct the accession and redrive.
 

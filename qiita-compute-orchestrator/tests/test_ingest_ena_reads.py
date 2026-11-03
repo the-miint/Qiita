@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import threading
 import time
 from pathlib import Path
@@ -918,23 +919,61 @@ def test_reuses_existing_range_on_mint_conflict(monkeypatch, tmp_path):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("accession", ["ERX000001", "SAMEA1234", "PRJEB1", "not-an-accession"])
-def test_a_roster_accession_that_is_not_a_run_is_refused_before_any_download(
-    fake_mint, monkeypatch, tmp_path, accession
-):
-    """A scan of several runs skips one that fails instead of raising, and
-    `read_ena_sequences` expands an experiment, sample or study accession to every
-    run under it, so only run accessions may reach the scan."""
+@pytest.fixture
+def no_download(monkeypatch):
+    """Fail the test if any run is fetched."""
 
     def _fake(*args):
         raise AssertionError("nothing may be downloaded")
 
     monkeypatch.setattr(ingest_module, "_stage_run_reads", _fake)
+
+
+@pytest.mark.parametrize("accession", ["ERX000001", "SAMEA1234", "PRJEB1", "not-an-accession"])
+def test_a_roster_accession_that_is_not_a_run_is_refused_before_any_download(
+    fake_mint, no_download, tmp_path, accession
+):
+    """A scan of several runs skips one that fails instead of raising, and
+    `read_ena_sequences` expands an experiment, sample or study accession to every
+    run under it, so only run accessions may reach the scan."""
+
     inputs = _inputs(tmp_path, [(10, "ERR001"), (11, accession)])
 
-    refused = f"not an ENA run accession.*prep_sample 11: '{accession}'"
+    refused = re.escape(f"prep_sample 11: '{accession}' is not a run accession")
     with pytest.raises(ValueError, match=refused):
         _run(inputs, tmp_path / "ws")
+    assert fake_mint == []
+
+
+@pytest.mark.parametrize("accession", [" ERR001", "ERR001\n"])
+def test_a_padded_run_accession_is_refused_before_any_download(
+    fake_mint, no_download, tmp_path, accession
+):
+    """The scan takes the roster's value as stored, so a run accession with
+    surrounding whitespace is refused, not passed to it."""
+
+    inputs = _inputs(tmp_path, [(10, "ERR001"), (11, accession)])
+
+    refused = re.escape(f"prep_sample 11: {accession!r} carries surrounding whitespace")
+    with pytest.raises(ValueError, match=refused):
+        _run(inputs, tmp_path / "ws")
+    assert fake_mint == []
+
+
+def test_the_refusal_lists_the_first_prep_samples_and_marks_the_rest(
+    fake_mint, no_download, tmp_path
+):
+    listed = ingest_module._REASON_LISTED_ACCESSIONS
+    inputs = _inputs(tmp_path, [(psi, f"ERX{psi:06d}") for psi in range(listed + 1)])
+
+    with pytest.raises(ValueError) as raised:
+        _run(inputs, tmp_path / "ws")
+
+    message = str(raised.value)
+    assert message.startswith(f"{listed + 1} sequenced_sample(s) ")
+    assert f"prep_sample {listed - 1}: " in message
+    assert f"prep_sample {listed}: " not in message
+    assert message.endswith("…")
     assert fake_mint == []
 
 

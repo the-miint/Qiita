@@ -17,12 +17,12 @@ tests/conftest.py (`open_miint_conn` is LOAD-only).
 
 from __future__ import annotations
 
-import gzip
 import json
 import subprocess
 import sys
 import textwrap
-from pathlib import Path
+
+from helpers import write_fasta
 
 from qiita_compute_orchestrator.miint import open_miint_conn
 
@@ -35,25 +35,16 @@ _SCAN = (
 )
 
 
-def _fasta(path: Path, records: list[tuple[str, str]]) -> str:
-    """Write `records` as FASTA at `path`, gzipped when it ends in `.gz`."""
-    text = "".join(f">{rid}\n{seq}\n" for rid, seq in records)
-    if path.suffix == ".gz":
-        with gzip.open(path, "wt") as fh:
-            fh.write(text)
-    else:
-        path.write_text(text)
-    return str(path)
-
-
 def test_sequence_index_restarts_at_one_in_each_file(tmp_path):
     """Dense 1..N per file, 1-based, restarting in the next file of one scan.
 
     The two files hold different record counts, so a scan-global counter would put
     `b.fa` at 4..5 rather than 1..2.
     """
-    a = _fasta(tmp_path / "a.fa", [("a1", "ACGTACGT"), ("a2", "AAAACCCC"), ("a3", "TTTTGGGG")])
-    b = _fasta(tmp_path / "b.fa", [("b1", "CCCCAAAA"), ("b2", "GGGGTTTT")])
+    a = str(
+        write_fasta(tmp_path / "a.fa", [("a1", "ACGTACGT"), ("a2", "AAAACCCC"), ("a3", "TTTTGGGG")])
+    )
+    b = str(write_fasta(tmp_path / "b.fa", [("b1", "CCCCAAAA"), ("b2", "GGGGTTTT")]))
 
     with open_miint_conn() as conn:
         rows = conn.execute(_SCAN.format(opts=""), [[a, b]]).fetchall()
@@ -68,8 +59,8 @@ def test_sequence_index_is_the_same_in_a_second_scan(tmp_path):
     (~12 kB and ~6 kB of 2 kb records), so the two runs do not divide the files the
     same way.
     """
-    a = _fasta(tmp_path / "a.fa", [(f"a{i}", "ACGT" * 500 + "A" * i) for i in range(6)])
-    b = _fasta(tmp_path / "b.fa", [(f"b{i}", "TGCA" * 500 + "T" * i) for i in range(3)])
+    a = str(write_fasta(tmp_path / "a.fa", [(f"a{i}", "ACGT" * 500 + "A" * i) for i in range(6)]))
+    b = str(write_fasta(tmp_path / "b.fa", [(f"b{i}", "TGCA" * 500 + "T" * i) for i in range(3)]))
     paths = [a, b]
 
     with open_miint_conn() as conn:
@@ -100,7 +91,8 @@ def test_a_scan_of_many_paths_closes_each_file_once_read(tmp_path):
     under, so nothing that raised it can pass the test.
     """
     paths = [
-        _fasta(tmp_path / f"g{i:04d}.fa.gz", [(f"g{i}", "ACGTACGT")]) for i in range(_MANY_PATHS)
+        str(write_fasta(tmp_path / f"g{i:04d}.fa.gz", [(f"g{i}", "ACGTACGT")]))
+        for i in range(_MANY_PATHS)
     ]
     script = textwrap.dedent(
         f"""
