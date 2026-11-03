@@ -221,8 +221,8 @@ class BlockMaskResubmitError(RuntimeError):
       non-exportable).
 
     The block-compute analog of the sequenced_pool COMPLETED-resubmit rule. A mask
-    is never deleted; one whose config is bad is deprecated, which stops anything
-    further being minted or consumed under it. Resuming an interrupted plan passes
+    is never deleted; one whose config is bad is deprecated, which stops new data
+    being masked or aligned under it. Resuming an interrupted plan passes
     `only_missing=true` to plan only the not-yet-gated samples. The route maps this
     to 409."""
 
@@ -231,10 +231,10 @@ class BlockMaskResubmitError(RuntimeError):
         self.mask_idxs = mask_idxs
         super().__init__(
             f"{len(conflicting_prep_sample_idxs)} sample(s) already have a read-mask gate "
-            f"(pending or completed) under mask_idx {mask_idxs}; a fresh plan would "
+            f"(pending or completed) under mask_idx(s) {mask_idxs}; a fresh plan would "
             "double-write a completed mask or wedge an in-flight one. If that mask is bad, "
-            f"deprecate it (PATCH {URL_MASK_DEFINITION_STATUS}). To resume an interrupted "
-            "plan, pass only_missing=true to plan only the ungated samples. "
+            f"a system_admin deprecates it (PATCH {URL_MASK_DEFINITION_STATUS}). To resume "
+            "an interrupted plan, pass only_missing=true to plan only the ungated samples. "
             f"prep_sample_idxs: {conflicting_prep_sample_idxs}"
         )
 
