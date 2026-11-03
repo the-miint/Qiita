@@ -99,9 +99,9 @@ def _write_intermediate(
         )
 
 
-def _fake_stage_run_reads_factory(by_run: dict[str, tuple[list[tuple], list[str]]]):
+def _fake_stage_run_reads_factory(by_run: dict[str, list[tuple]]):
     """Build a `_stage_run_reads`-shaped fake keyed by run_accession; each entry
-    is `(rows, warnings)`."""
+    is the run's rows."""
 
     def _fake(
         run_accession,
@@ -111,9 +111,9 @@ def _fake_stage_run_reads_factory(by_run: dict[str, tuple[list[tuple], list[str]
         memory_gb,
         threads,
     ):
-        rows, warnings = by_run[run_accession]
+        rows = by_run[run_accession]
         _write_intermediate(intermediate_path, rows)
-        return len(rows), warnings
+        return len(rows)
 
     return _fake
 
@@ -193,8 +193,8 @@ _SINGLE_ROWS = [
     (1, "ERR-SINGLE-r1", "ACGTACGTAC", [30] * 10, None, None),
     (2, "ERR-SINGLE-r2", "GGGGCCCCTT", [35] * 10, None, None),
 ]
-_PAIRED_RUN_ACCESSION = "ERR_PAIR001"
-_SINGLE_RUN_ACCESSION = "ERR_SINGLE001"
+_PAIRED_RUN_ACCESSION = "ERR900000001"
+_SINGLE_RUN_ACCESSION = "ERR900000002"
 _WORK_TICKET_IDX = 91001
 
 
@@ -244,8 +244,8 @@ async def test_ena_reads_land_in_ducklake_read_via_register_files(
     # No network, no checked-in fixture: the whole read_ena_sequences seam is
     # replaced with an inline DuckDB COPY of a few ENA-shaped rows.
     by_run = {
-        _PAIRED_RUN_ACCESSION: (_PAIRED_ROWS, []),
-        _SINGLE_RUN_ACCESSION: (_SINGLE_ROWS, []),
+        _PAIRED_RUN_ACCESSION: _PAIRED_ROWS,
+        _SINGLE_RUN_ACCESSION: _SINGLE_ROWS,
     }
     monkeypatch.setattr(ingest_ena_reads, "_stage_run_reads", _fake_stage_run_reads_factory(by_run))
 
