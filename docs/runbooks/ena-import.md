@@ -490,12 +490,17 @@ itself has no setting.
 A pool with a sequenced_sample whose `ena_run_accession` is not exactly one run accession
 (an experiment, sample, study or malformed accession, or one with surrounding whitespace)
 fails before any download: the ticket is FAILED `permanent` at once and emailed with a
-reason naming each such prep_sample, a longer list cut short with `…`.
-`qiita sequenced-sample list --sequencing-run-idx <idx>` gives each row's
-`sequenced_sample_idx` beside its `prep_sample_idx` and `ena_run_accession`. Correct each
-with `qiita sequenced-sample patch --sequenced-sample-idx <idx> --ena-run-accession <run>`
-(`PATCH /sequenced-sample/{idx}`), then redrive the ticket (`POST /work-ticket/{idx}/run`),
-which reads the roster again.
+reason naming each such prep_sample; past a fixed length the list ends with `…`. To
+correct them, find the sequencing run in the ticket's `scope_target`, map each prep_sample
+to the `sequenced_sample_idx` the PATCH takes (the list gives both beside each
+`ena_run_accession`), patch each, then redrive the ticket, which reads the roster again:
+
+```
+qiita ticket status <work_ticket_idx>
+qiita sequenced-sample list --sequencing-run-idx <sequencing_run_idx>
+qiita sequenced-sample patch --sequenced-sample-idx <sequenced_sample_idx> --ena-run-accession <run>
+qiita ticket run <work_ticket_idx>
+```
 
 A run that fails in a way a retry cannot clear (a format error, a run with no sequence
 data, a 404, zero reads) does not fail its pool when another run

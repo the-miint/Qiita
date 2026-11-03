@@ -22,6 +22,7 @@ import yaml
 from pydantic import ValidationError
 from qiita_common.api_paths import compute_reads_staging_path
 from qiita_common.backend_failure import BackendFailure, FailureKind
+from qiita_common.ena_accession import RUN_ACCESSION_FORM
 from qiita_common.models import FailureType, WorkTicketFailureStage
 from qiita_common.models.ena_import import MAX_ENA_DOWNLOAD_RUN_CONCURRENCY
 
@@ -944,8 +945,8 @@ def test_a_roster_accession_that_is_not_exactly_a_run_is_refused_before_any_down
 
     message = str(raised.value)
     assert message.startswith("1 sequenced_sample(s) of this pool carry an ena_run_accession ")
-    assert "(SRR/ERR/DRR followed by digits, with no surrounding whitespace)" in message
-    assert message.endswith(f": prep_sample 11: {accession!r}")
+    assert f"({RUN_ACCESSION_FORM}, with no surrounding whitespace)" in message
+    assert message.endswith(f"every run under it. Refused: prep_sample 11: {accession!r}")
     assert fake_mint == []
 
 

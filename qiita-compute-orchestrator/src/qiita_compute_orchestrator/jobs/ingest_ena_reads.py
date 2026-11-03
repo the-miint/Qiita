@@ -80,7 +80,8 @@ _CONCURRENCY = 4
 _DUCKDB_MEMORY_GB = 7
 _DUCKDB_THREADS = 2
 
-# Caps on a failure reason, which lands in a DB column and an email.
+# Caps on a failure reason, which lands in a DB column and an email; the step row keeps
+# only a prefix of it (the control plane's `runner/_dispatch.py` cuts it).
 _REASON_FULL_RUNS = 3
 _REASON_LISTED_ITEMS = 20
 
@@ -224,7 +225,7 @@ def _classify_ena_fetch_error(
 
 def _is_scannable_run(accession: str) -> bool:
     """True when the roster's `accession` is one run accession exactly as stored: the
-    scan takes the stored value, so a padded one is refused too."""
+    scan takes the stored value, so a padded one is not scannable."""
     try:
         return validate_run_accession(accession) == accession
     except InvalidEnaAccessionError:
@@ -275,7 +276,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             f"{len(refused)} sequenced_sample(s) of this pool carry an ena_run_accession "
             f"that is not exactly one run accession ({RUN_ACCESSION_FORM}, with no "
             "surrounding whitespace); a scan of an experiment, sample or study accession "
-            "would cover every run under it: "
+            "would cover every run under it. Refused: "
             + _capped_join([f"prep_sample {psi}: {acc!r}" for psi, acc in refused])
         )
 
