@@ -394,7 +394,10 @@ def test_unclassified_feature_recorded_as_null_rank_row(staging_inputs, tmp_path
             f" FROM '{pq}' WHERE feature_idx = {seq5_fidx}"
         ).fetchone()
         assert row == (None,) * 8
-    assert any("unclassified" in w for w in _load_warnings(caplog))
+    assert any(
+        w.startswith("1 feature(s) have no supplied taxonomy") and "seq5" in w
+        for w in _load_warnings(caplog)
+    )
 
 
 def test_stray_taxonomy_rows_warn_and_are_dropped(staging_inputs, tmp_path, caplog):
@@ -418,7 +421,9 @@ def test_stray_taxonomy_rows_warn_and_are_dropped(staging_inputs, tmp_path, capl
         ]
         assert dom == "Bacteria"
     warnings = _load_warnings(caplog)
-    assert any("stray" in w or "unmatched" in w for w in warnings)
+    assert any(
+        w.startswith("1 supplied taxonomy row(s)") and "nz_cp039371.1" in w for w in warnings
+    )
 
 
 def test_duplicate_supplied_taxonomy_warns_and_stays_one_to_one(staging_inputs, tmp_path, caplog):
@@ -441,7 +446,10 @@ def test_duplicate_supplied_taxonomy_warns_and_stays_one_to_one(staging_inputs, 
             == 1
         )
         assert conn.execute(f"SELECT count(*) FROM '{pq}'").fetchone()[0] == len(_FEATURE_MAP)
-    assert any("duplicate" in w for w in _load_warnings(caplog))
+    assert any(
+        w.startswith("1 feature_id(s) have duplicate") and "seq1" in w
+        for w in _load_warnings(caplog)
+    )
 
 
 def test_conflicting_lineages_on_one_feature_keep_the_smallest_read_id(

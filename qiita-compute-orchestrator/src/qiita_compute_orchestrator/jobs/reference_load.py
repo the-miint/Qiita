@@ -441,28 +441,26 @@ def _anomaly(
     return n, [r[0] for r in conn.execute(f"{sql} LIMIT 5", params).fetchall()]
 
 
-def _warn_taxonomy_anomaly(
+def _warn_anomaly(
     conn: duckdb.DuckDBPyConnection,
-    *,
-    count_sql: str,
-    sample_sql: str,
-    params: list,
+    sql: str,
     describe: str,
+    params: list | None = None,
 ) -> None:
-    """Emit a loud WARNING (never a raise) with a LIMIT-5 sample when a
-    taxonomy-coverage anomaly is present.
+    """Emit a loud WARNING (never a raise) with the count and first five rows of
+    `sql`, when it returns any.
 
-    Coverage gaps and namespace mismatches are expected on real corpora —
-    GG2's 2024.09 backbone has ~29 features with no taxonomy row, and a
-    supplied taxonomy keyed in a different ID namespace than the FASTA is
-    the exact class that already bit the genome map — so they must NOT
-    fail the ingest. They must be visible, though: an unconfigured WARNING
-    reaches stderr via Python's last-resort handler and lands in the SLURM
-    job log, the loudest channel this architecture offers today."""
-    n = conn.execute(count_sql, params).fetchone()[0]
+    For anomalies real corpora carry and the load must survive. Taxonomy
+    coverage gaps and namespace mismatches are the standing case: GG2's
+    2024.09 backbone has ~29 features with no taxonomy row, and a supplied
+    taxonomy keyed in a different ID namespace than the FASTA is the exact
+    class that already bit the genome map — so they must NOT fail the
+    ingest. They must be visible, though: an unconfigured WARNING reaches
+    stderr via Python's last-resort handler and lands in the SLURM job log,
+    the loudest channel this architecture offers today."""
+    n, first = _anomaly(conn, sql, params)
     if n:
-        sample = [r[0] for r in conn.execute(sample_sql, params).fetchall()]
-        _LOG.warning("%d %s (sample: %s)", n, describe, sample)
+        _LOG.warning("%d %s (e.g. %s)", n, describe, first)
 
 
 def _write_taxonomy(
@@ -522,50 +520,29 @@ def _write_taxonomy(
         ids = [r[0] for r in bad]
         raise ValueError(f"Taxonomy has wrong rank prefix order for feature_idx: {ids}")
 
-    # Warn (don't raise) on coverage anomalies. Distinct-feature counts so
-    # a canonical-hash collision (two read_ids → one feature) isn't
+    # Warn (don't raise) on coverage anomalies. One row per feature, not per
+    # read_id, so a canonical-hash collision (two read_ids → one feature) isn't
     # double-counted.
-    _warn_taxonomy_anomaly(
+    _warn_anomaly(
         conn,
-        count_sql=(
-            "SELECT count(*) FROM (SELECT DISTINCT feature_idx FROM id_map) x "
-            "ANTI JOIN parsed_taxonomy p ON x.feature_idx = p.feature_idx"
-        ),
-        sample_sql=(
-            "SELECT DISTINCT x.read_id FROM id_map x "
-            "ANTI JOIN parsed_taxonomy p ON x.feature_idx = p.feature_idx LIMIT 5"
-        ),
-        params=[],
-        describe="feature(s) have no supplied taxonomy; recording as unclassified (NULL ranks)",
+        "SELECT min(x.read_id) FROM id_map x "
+        "ANTI JOIN parsed_taxonomy p ON x.feature_idx = p.feature_idx "
+        "GROUP BY x.feature_idx ORDER BY 1",
+        "feature(s) have no supplied taxonomy; recording as unclassified (NULL ranks)",
     )
-    _warn_taxonomy_anomaly(
+    _warn_anomaly(
         conn,
-        count_sql=(
-            "SELECT count(*) FROM read_parquet(?) t ANTI JOIN id_map m ON t.feature_id = m.read_id"
-        ),
-        sample_sql=(
-            "SELECT t.feature_id FROM read_parquet(?) t "
-            "ANTI JOIN id_map m ON t.feature_id = m.read_id LIMIT 5"
-        ),
-        params=[str(taxonomy_path)],
-        describe=(
-            "supplied taxonomy row(s) reference a feature_id that is not a sequence read_id "
-            "(stray / unmatched — ID-namespace mismatch); dropping them"
-        ),
+        "SELECT t.feature_id FROM read_parquet(?) t "
+        "ANTI JOIN id_map m ON t.feature_id = m.read_id ORDER BY 1",
+        "supplied taxonomy row(s) reference a feature_id that is not a sequence read_id "
+        "(stray / unmatched — ID-namespace mismatch); dropping them",
+        [str(taxonomy_path)],
     )
-    _warn_taxonomy_anomaly(
+    _warn_anomaly(
         conn,
-        count_sql=(
-            "SELECT count(*) FROM "
-            "(SELECT feature_id FROM read_parquet(?) GROUP BY feature_id HAVING count(*) > 1)"
-        ),
-        sample_sql=(
-            "SELECT feature_id FROM read_parquet(?) GROUP BY feature_id HAVING count(*) > 1 LIMIT 5"
-        ),
-        params=[str(taxonomy_path)],
-        describe=(
-            "feature_id(s) have duplicate supplied taxonomy rows; collapsing to one per feature"
-        ),
+        "SELECT feature_id FROM read_parquet(?) GROUP BY feature_id HAVING count(*) > 1 ORDER BY 1",
+        "feature_id(s) have duplicate supplied taxonomy rows; collapsing to one per feature",
+        [str(taxonomy_path)],
     )
 
     # Read_ids whose sequences canonicalise to one feature can carry different
