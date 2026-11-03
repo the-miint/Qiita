@@ -313,8 +313,8 @@ async def test_block_mask_plan_host_ref_without_force_422(ctx, planned):
 
 async def test_block_mask_plan_resubmit_over_completed_409(ctx, planned):
     """Re-planning a pool whose samples are already COMPLETED for the resolved
-    mask is a 409 (mirrors the sequenced_pool COMPLETED-resubmit rule) — the
-    operator DELETEs the mask or passes only_missing=true. only_missing then skips
+    mask is a 409 (mirrors the sequenced_pool COMPLETED-resubmit rule); a resume
+    passes only_missing=true. only_missing then skips
     the completed samples and returns 202 with nothing new planned."""
     await _seed_block_action(planned["db"])
     first = await ctx["wet"].post(_url(planned), json={})

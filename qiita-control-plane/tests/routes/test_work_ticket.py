@@ -909,9 +909,8 @@ async def test_submit_prep_sample_completed_does_not_block(
 
     The prep_sample arm of `_check_disallow_without_delete` binds only
     `NON_TERMINAL_WORK_TICKET_STATES`; the COMPLETED gate is sequenced_pool-only.
-    For actions whose result is a minted row (a mask), a downstream
-    DELETE-gated check refuses the re-run. `long-read-assembly` has no such
-    gate, so this 202 is what a re-run of an already-assembled sample gets.
+    `long-read-assembly` has no downstream gate either, so this 202 is what a
+    re-run of an already-assembled sample gets.
     """
     token, admin_idx = admin_token
     action_id, version = prep_sample_action

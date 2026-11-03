@@ -1285,18 +1285,6 @@ class MaskSampleStatusUpdateResponse(BaseModel):
     skipped_pending: list[int] = []
 
 
-class MaskDefinitionDeleteResponse(BaseModel):
-    """Returned by DELETE /api/v1/mask-definition/{mask_idx}.
-
-    `rows_deleted` is the DuckLake `read_mask` row count the data plane removed
-    (0 on an idempotent re-run); the Postgres `mask_definition` row is purged
-    last. Referencing `work_ticket` rows detach automatically via the
-    `ON DELETE SET NULL` FK."""
-
-    mask_idx: Annotated[int, Field(gt=0)]
-    rows_deleted: int
-
-
 class AlignmentDefinitionDeleteResponse(BaseModel):
     """Returned by DELETE /api/v1/alignment-definition/{alignment_idx}.
 

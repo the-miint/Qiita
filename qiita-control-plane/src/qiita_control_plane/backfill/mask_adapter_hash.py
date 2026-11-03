@@ -246,11 +246,12 @@ async def apply_rekey(pool: asyncpg.Pool, plan: RekeyPlan) -> int:
     is written until they are resolved.
 
     Each row is written in its own transaction with the row locked, so the mint's
-    own in-place re-key cannot land between the plan's read and this write. Two
-    things are skipped rather than crashing, both reachable while the CP serves
-    traffic: a row deleted since the plan (`qiita-admin mask delete`), and one
-    whose params_hash has moved since the plan read it — the mint re-keyed it
-    first, so the plan's rewritten params describe a stale blob.
+    own in-place re-key cannot land between the plan's read and this write. A row
+    whose params_hash has moved since the plan read it is skipped — the mint
+    re-keyed it first, so the plan's rewritten params describe a stale blob. A row
+    gone since the plan raises: nothing deletes a `mask_definition` row, so its
+    absence is an out-of-band edit the operator has to look at. Rows written before
+    the raise stay written; a re-run plans only what is left.
 
     Returns the count of rows actually written, which is why a skip is not a
     silent no-op: the caller reports it against `len(plan.writable())`.
@@ -270,7 +271,10 @@ async def apply_rekey(pool: asyncpg.Pool, plan: RekeyPlan) -> int:
                     row.mask_idx,
                 )
                 if locked is None:
-                    continue
+                    raise RuntimeError(
+                        f"mask_definition row mask_idx={row.mask_idx} is gone since the plan"
+                        f" read it; {written} row(s) were written before it"
+                    )
                 await conn.execute(
                     "UPDATE qiita.mask_definition"
                     "   SET params = $1::jsonb, params_hash = $2, adapter_hash_scheme = $3"

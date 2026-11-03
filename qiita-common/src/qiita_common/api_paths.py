@@ -460,7 +460,7 @@ URL_QC_CHECK_BY_PREP_SAMPLE = f"{URL_QC_CHECK_PREFIX}{PATH_QC_CHECK_BY_PREP_SAMP
 
 PATH_MASK_DEFINITION_PREFIX = "/mask-definition"
 PATH_MASK_DEFINITION_ROOT = ""  # POST (mint) / GET (list) against the prefix itself
-PATH_MASK_DEFINITION_BY_IDX = "/{mask_idx}"  # GET one mask; DELETE (lake rows + Postgres row)
+PATH_MASK_DEFINITION_BY_IDX = "/{mask_idx}"  # GET one mask
 PATH_MASK_DEFINITION_PREP_SAMPLE = "/{mask_idx}/prep-sample"  # GET the per-sample roster
 # PATCH the CONFIG's lifecycle (active <-> deprecated). Mirrors
 # PATH_REFERENCE_STATUS; a deprecated config cannot be minted against.

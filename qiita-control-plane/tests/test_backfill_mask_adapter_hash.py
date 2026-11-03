@@ -260,6 +260,20 @@ async def test_apply_rekeys_in_place_and_is_idempotent(seeded):
     assert again.writable() == []
 
 
+async def test_apply_raises_on_a_row_deleted_since_the_plan(seeded):
+    """A planned row that is gone at apply time is an out-of-band edit, so apply
+    raises naming it rather than reporting a short write count."""
+    tag = secrets.token_hex(4)
+    mask_idx = await seeded["legacy"](_params("legacy-bytes-digest", version=f"{tag}-a"))
+
+    plan = await seeded["plan"]()
+    assert [r.mask_idx for r in plan.writable()] == [mask_idx]
+    await seeded["pool"].execute("DELETE FROM qiita.mask_definition WHERE mask_idx = $1", mask_idx)
+
+    with pytest.raises(RuntimeError, match=f"mask_idx={mask_idx} is gone"):
+        await apply_rekey(seeded["pool"], plan)
+
+
 async def test_plan_reports_a_collision_rather_than_planning_a_write(seeded):
     """When the same config already exists under the current derivation, the
     legacy row's re-keyed params_hash is taken. Merging means repointing

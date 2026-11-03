@@ -11,8 +11,7 @@ DuckLake rows + the Postgres `alignment_definition` row) — which is the escape
 hatch the align planner's disallow-without-delete rule requires: an operator must
 DELETE a completed alignment before re-aligning the same config.
 
-Modelled on the mask-definition purge (`routes/read_masked.py`): lake-first,
-system_admin-only, idempotent/retriable.
+Lake-first, system_admin-only, idempotent/retriable.
 """
 
 import base64
@@ -86,7 +85,7 @@ async def delete_alignment_definition_route(
     a fresh align plan re-creates them PENDING) and detaches any referencing
     `work_ticket` via the `work_ticket.alignment_idx` `ON DELETE SET NULL` FK.
 
-    Order of operations mirrors the mask purge: existence check first (404 if
+    Order of operations: existence check first (404 if
     absent) → DuckLake delete (one all-or-nothing transaction; a 502 on failure
     removes nothing yet) → Postgres `alignment_definition` delete last. This makes
     it *retriable*: both mutating steps are idempotent and the row a retry keys off
@@ -94,7 +93,7 @@ async def delete_alignment_definition_route(
     orphan-Postgres row, never an unrecoverable orphan-lake.
 
     **Intentional divergence from reference-delete (a conscious decision, not an
-    oversight — same as the mask purge in `routes/read_masked.py`):** this route
+    oversight):** this route
     deliberately does NOT gate on in-flight align block tickets. It is an
     admin-only sharp primitive; the `work_ticket.alignment_idx` FK
     (`ON DELETE SET NULL`) detaches any referencing ticket. So an operator who
@@ -103,9 +102,7 @@ async def delete_alignment_definition_route(
     `alignment_idx` (an orphan) and `reconcile-alignment-block` then RuntimeErrors
     on the cascade-deleted `alignment_sample` gate, FAILing the ticket. The
     disallow-without-delete rule directs re-aligns here, so the operator's
-    responsibility is to purge only an alignment whose blocks are all terminal
-    (a bulk safety wrapper, like the mask `purge-failed` tool, can enforce that
-    later if the sharp edge proves error-prone in practice)."""
+    responsibility is to purge only an alignment whose blocks are all terminal."""
     # Existence check (a read; safe before the lake delete).
     exists = await pool.fetchval(
         "SELECT 1 FROM qiita.alignment_definition WHERE alignment_idx = $1", alignment_idx

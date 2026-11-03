@@ -95,13 +95,9 @@ ROLE_IMPLIED_SCOPES: Mapping[SystemRole, frozenset[Scope]] = {
             # PREP_SAMPLE_WRITE but not destroy them. Service accounts never
             # get it.
             Scope.SEQUENCED_POOL_DELETE,
-            # Full mask purge is system_admin-only, same as REFERENCE_DELETE:
-            # deleting a mask drops its mask_definition row and DuckLake
-            # read_mask data. Service accounts never get it.
-            Scope.MASK_DEFINITION_DELETE,
-            # Deprecating a mask / withdrawing its runs is system_admin-only for
-            # the same reason: it decides that published results were produced by
-            # a filter we no longer stand behind. Non-destructive, but not a
+            # Deprecating a mask / withdrawing its runs is system_admin-only: it
+            # decides that published results were produced by a filter we no
+            # longer stand behind. Non-destructive, but not a
             # judgement a service account or wet_lab_admin makes.
             Scope.MASK_DEFINITION_LIFECYCLE,
             # Deprecating an assembly run / withdrawing its per-sample results is
@@ -110,7 +106,7 @@ ROLE_IMPLIED_SCOPES: Mapping[SystemRole, frozenset[Scope]] = {
             # stand behind.
             Scope.PROCESSING_LIFECYCLE,
             # Full alignment purge is system_admin-only, same as
-            # MASK_DEFINITION_DELETE: deleting an alignment drops its
+            # REFERENCE_DELETE: deleting an alignment drops its
             # alignment_definition row (cascading the alignment_sample gate) and
             # its DuckLake alignment data. The disallow-without-delete escape
             # hatch. Service accounts never get it.

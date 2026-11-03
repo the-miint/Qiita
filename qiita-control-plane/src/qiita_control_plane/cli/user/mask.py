@@ -5,7 +5,7 @@ is this pool filtered under, and which of its samples are ready to act on?" — 
 three questions that otherwise need a psql shell on the deploy host and
 DATABASE_URL. A `mask_idx` is a required input to `long-read-assembly`, whose
 audience includes a plain `user`, so the reads sit in this CLI rather than
-`qiita-admin` (which keeps the destructive `mask delete` / `purge-failed`).
+`qiita-admin`.
 
 Thin clients: each of those verbs is one GET, printed verbatim, so a new
 server-side field reaches the user without a CLI change.

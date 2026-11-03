@@ -71,7 +71,7 @@ async def bf(postgres_pool):
         )
     consumed_idx, already_idx = consumed["mask_idx"], already["mask_idx"]
     # A mask_idx that resolves to no row: what action_context still names after the
-    # mask itself was deleted (`qiita-admin mask purge-failed` does exactly that).
+    # mask itself was deleted; a deploy's existing tickets can carry one.
     gone_idx = (
         await postgres_pool.fetchval("SELECT COALESCE(MAX(mask_idx), 0) FROM qiita.mask_definition")
     ) + 1000

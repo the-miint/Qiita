@@ -8,7 +8,7 @@
 #   * `register_files` replace-by-key supersedes rows in every table listed in
 #     REPLACE_KEY_TABLES (flight_service/registration.rs) and leaves the previous load's
 #     Parquet behind;
-#   * delete_reference / delete_mask / delete_pool_reads / delete_alignment
+#   * delete_reference / delete_pool_reads / delete_alignment
 #     reclaim nothing from disk either;
 #   * a registration whose catalog transaction rolls back leaves the moved file
 #     with no catalog entry at all (see flight_service/registration.rs, register_files).

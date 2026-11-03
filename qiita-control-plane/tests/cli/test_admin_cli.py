@@ -13,6 +13,7 @@ argparse wiring on the admin entry point.
 
 import argparse
 
+import asyncpg
 import httpx
 import pytest
 from qiita_common.api_paths import (
@@ -382,7 +383,7 @@ def test_force_fail_refuses_terminal_ticket(monkeypatch):
     async def fake_connect(database_url, **kwargs):
         return fake
 
-    monkeypatch.setattr(cli.asyncpg, "connect", fake_connect)
+    monkeypatch.setattr(asyncpg, "connect", fake_connect)
     with pytest.raises(RuntimeError, match="terminal state 'completed'"):
         asyncio.run(
             cli._force_fail_ticket(
@@ -433,7 +434,7 @@ def test_force_fail_happy_path_runs_update(monkeypatch):
     async def fake_connect(database_url, **kwargs):
         return fake
 
-    monkeypatch.setattr(cli.asyncpg, "connect", fake_connect)
+    monkeypatch.setattr(asyncpg, "connect", fake_connect)
     result = asyncio.run(
         cli._force_fail_ticket(
             "postgres://x",

@@ -546,7 +546,7 @@ fn register_files(
 
     // Replace-by-key the `REPLACE_KEY_TABLES` targets, then register every moved
     // file, in ONE DuckLake transaction so the catalog update is all-or-nothing
-    // (mirrors delete_reference / delete_mask / delete_pool_reads). A failure
+    // (mirrors delete_reference / delete_pool_reads). A failure
     // part-way through rolls back every prior delete and
     // ducklake_add_data_files call rather than leaving the reference
     // half-registered in the catalog.

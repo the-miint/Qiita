@@ -219,19 +219,20 @@ class BlockMaskResubmitError(RuntimeError):
       non-completed block, so the gate never flips and the sample stays
       non-exportable).
 
-    The block-compute analog of the sequenced_pool COMPLETED-resubmit rule: an
-    existing gate requires an explicit DELETE before resubmission. The operator
-    either DELETEs the mask first (to genuinely re-mask) or passes
-    `only_missing=true` to plan only the not-yet-gated samples. The route maps this
-    to 409."""
+    The block-compute analog of the sequenced_pool COMPLETED-resubmit rule. A mask
+    is never deleted, so re-masking a gated sample needs a different mask identity:
+    a change to the filtering config the mask hashes, such as a new read-mask filter
+    version. Resuming an interrupted plan passes `only_missing=true` to plan only the
+    not-yet-gated samples. The route maps this to 409."""
 
     def __init__(self, conflicting_prep_sample_idxs: list[int]):
         self.conflicting_prep_sample_idxs = conflicting_prep_sample_idxs
         super().__init__(
             f"{len(conflicting_prep_sample_idxs)} sample(s) already have a read-mask gate "
             "(pending or completed) for the resolved filtering config; a fresh plan would "
-            "double-write a completed mask or wedge an in-flight one. DELETE the mask first "
-            "to re-mask, or pass only_missing=true to plan only the ungated samples. "
+            "double-write a completed mask or wedge an in-flight one. Re-masking needs a "
+            "different filtering config (a new mask identity); pass only_missing=true to "
+            "plan only the ungated samples. "
             f"prep_sample_idxs: {conflicting_prep_sample_idxs}"
         )
 
@@ -728,7 +729,8 @@ async def plan_and_submit_blocks(
         # dropped ALL gated samples above (pending or completed), so this fires only
         # when only_missing is False (a fresh plan over an already-block-masked pool).
         # One batched query over the (mask_idx, prep_sample_idx) pairs; a genuine
-        # re-mask DELETEs first, an interrupted plan resumes with only_missing=true.
+        # re-mask needs a new mask identity (see BlockMaskResubmitError), an
+        # interrupted plan resumes with only_missing=true.
         # Runs INSIDE the lock+txn (above) so a concurrent per-sample finalize cannot
         # slip a 'completed' row between this check and create_mask_sample_pending.
         if to_plan:

@@ -2506,35 +2506,6 @@ async def delete_pool_reads_data(
     return json.loads(results[0].body.to_pybytes())
 
 
-async def delete_mask_data(
-    *,
-    mask_idx: int,
-    signing_key: bytes,
-    data_plane_url: str,
-) -> int:
-    """Delete a mask's DuckLake read_mask rows via the data plane's DoAction.
-
-    Signs a `delete_mask` action token carrying only `mask_idx` and returns the
-    data plane's rows-deleted count. The delete is a logical `DELETE FROM
-    read_mask WHERE mask_idx = ?` inside one DuckLake transaction — no parquet is
-    reclaimed from disk (mirrors `delete_reference`).
-
-    Idempotent: a mask whose rows never registered (or were already deleted)
-    deletes zero rows and still succeeds. Raises pyarrow.flight.FlightError on
-    transport / data-plane failure."""
-    results = await run_signed_flight_call(
-        lambda: sign_action(
-            action="delete_mask",
-            payload={"mask_idx": mask_idx},
-            secret=signing_key,
-        ),
-        lambda token: _do_action("delete_mask", data_plane_url, token),
-    )
-    if not results:
-        return 0
-    return json.loads(results[0].body.to_pybytes()).get("rows_deleted", 0)
-
-
 # Fixed advisory-lock key that serializes every reference-exclusion sync (see
 # sync_reference_exclusion_data). Chosen distinct from the sweepers' keys
 # (notify=…147, cli-login=…148) so it never blocks them.
@@ -2888,14 +2859,13 @@ async def delete_alignment_data(
     data_plane_url: str,
 ) -> int:
     """Delete an alignment's DuckLake `alignment` rows via the data plane's
-    `delete_alignment` DoAction, returning the rows-deleted count. The alignment
-    twin of `delete_mask_data` — the whole-alignment purge the
-    disallow-without-delete resubmission rule needs.
+    `delete_alignment` DoAction, returning the rows-deleted count. The
+    whole-alignment purge the disallow-without-delete resubmission rule needs.
 
     Signs a `delete_alignment` action token carrying only `alignment_idx`. The
     delete is a logical `DELETE FROM alignment WHERE alignment_idx = ?` inside one
     DuckLake transaction — no parquet is reclaimed from disk (mirrors
-    `delete_mask`). Idempotent: an alignment whose rows never registered (or were
+    `delete_reference`). Idempotent: an alignment whose rows never registered (or were
     already deleted) deletes zero rows and still succeeds. Raises
     pyarrow.flight.FlightError on transport / data-plane failure."""
     results = await run_signed_flight_call(
