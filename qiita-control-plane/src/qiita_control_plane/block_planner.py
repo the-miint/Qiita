@@ -34,6 +34,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 
 import asyncpg
 from qiita_common.actions import BLOCK_MASK_ACTION_ID as _BLOCK_MASK_ACTION_ID
+from qiita_common.api_paths import URL_MASK_DEFINITION_STATUS
 from qiita_common.host_filter_plan import (
     PoolPlanRefusal,
     SampleHostFilter,
@@ -220,19 +221,20 @@ class BlockMaskResubmitError(RuntimeError):
       non-exportable).
 
     The block-compute analog of the sequenced_pool COMPLETED-resubmit rule. A mask
-    is never deleted, so re-masking a gated sample needs a different mask identity:
-    a change to the filtering config the mask hashes, such as a new read-mask filter
-    version. Resuming an interrupted plan passes `only_missing=true` to plan only the
-    not-yet-gated samples. The route maps this to 409."""
+    is never deleted; one whose config is bad is deprecated, which stops anything
+    further being minted or consumed under it. Resuming an interrupted plan passes
+    `only_missing=true` to plan only the not-yet-gated samples. The route maps this
+    to 409."""
 
-    def __init__(self, conflicting_prep_sample_idxs: list[int]):
+    def __init__(self, conflicting_prep_sample_idxs: list[int], mask_idxs: list[int]):
         self.conflicting_prep_sample_idxs = conflicting_prep_sample_idxs
+        self.mask_idxs = mask_idxs
         super().__init__(
             f"{len(conflicting_prep_sample_idxs)} sample(s) already have a read-mask gate "
-            "(pending or completed) for the resolved filtering config; a fresh plan would "
-            "double-write a completed mask or wedge an in-flight one. Re-masking needs a "
-            "different filtering config (a new mask identity); pass only_missing=true to "
-            "plan only the ungated samples. "
+            f"(pending or completed) under mask_idx {mask_idxs}; a fresh plan would "
+            "double-write a completed mask or wedge an in-flight one. If that mask is bad, "
+            f"deprecate it (PATCH {URL_MASK_DEFINITION_STATUS}). To resume an interrupted "
+            "plan, pass only_missing=true to plan only the ungated samples. "
             f"prep_sample_idxs: {conflicting_prep_sample_idxs}"
         )
 
@@ -729,20 +731,23 @@ async def plan_and_submit_blocks(
         # dropped ALL gated samples above (pending or completed), so this fires only
         # when only_missing is False (a fresh plan over an already-block-masked pool).
         # One batched query over the (mask_idx, prep_sample_idx) pairs; a genuine
-        # re-mask needs a new mask identity (see BlockMaskResubmitError), an
-        # interrupted plan resumes with only_missing=true.
+        # bad mask is deprecated (see BlockMaskResubmitError), an interrupted plan
+        # resumes with only_missing=true.
         # Runs INSIDE the lock+txn (above) so a concurrent per-sample finalize cannot
         # slip a 'completed' row between this check and create_mask_sample_pending.
         if to_plan:
             conflicting = await conn.fetch(
-                "SELECT ms.prep_sample_idx FROM qiita.mask_sample ms"
+                "SELECT ms.prep_sample_idx, ms.mask_idx FROM qiita.mask_sample ms"
                 "  JOIN unnest($1::bigint[], $2::bigint[]) AS t(mask_idx, prep_sample_idx)"
                 "    ON ms.mask_idx = t.mask_idx AND ms.prep_sample_idx = t.prep_sample_idx",
                 [mask_by_prep_sample[s.prep_sample_idx] for s in to_plan],
                 [s.prep_sample_idx for s in to_plan],
             )
             if conflicting:
-                raise BlockMaskResubmitError(sorted(r["prep_sample_idx"] for r in conflicting))
+                raise BlockMaskResubmitError(
+                    sorted(r["prep_sample_idx"] for r in conflicting),
+                    sorted({r["mask_idx"] for r in conflicting}),
+                )
 
         for mask_idx, samples in sorted(partitions.items()):
             # Each partition carries ITS OWN host refs — the decision that minted

@@ -1125,6 +1125,7 @@ async def submit_block_mask_plan(
             detail={
                 "reason": str(exc),
                 "conflicting_prep_sample_idxs": exc.conflicting_prep_sample_idxs,
+                "mask_idxs": exc.mask_idxs,
             },
         ) from exc
     return BlockMaskPlanResponse(**summary)

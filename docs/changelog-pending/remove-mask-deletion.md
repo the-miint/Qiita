@@ -13,8 +13,9 @@
 ### Changed
 
 - **The block-mask plan's 409 for an already-gated sample no longer says to delete the
-  mask (#remove-mask-deletion).** Re-masking a gated sample needs a different filtering config, which
-  mints a new `mask_idx`; `only_missing=true` still plans only the ungated samples.
+  mask (#remove-mask-deletion).** It names the mask (`mask_idxs` in the body) and says
+  to deprecate it if it is bad; `only_missing=true` still plans only the ungated
+  samples.
 - **`qiita-admin backfill mask-adapter-hash --execute` stops with an error naming a
   planned mask whose row is gone at write time (#remove-mask-deletion).** It skipped
   the row before. Rows written before the error stay written; a re-run plans only the
