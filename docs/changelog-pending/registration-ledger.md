@@ -19,7 +19,7 @@
   (#800). A registration made before the ledger existed is still recognised as before,
   while its files are registered.
 - **A registration whose COMMIT reported an error is answered as committed when it
-  landed (#818).** The data plane already checked the lake after such an error. When that
-  check could not be read, the call failed, and the files stayed in the lake. Now it reads
-  the ledger once more, and a registration recorded there succeeds instead of failing its
-  step.
+  landed (#818).** After such an error the data plane reads the lake to learn whether the
+  commit landed. When that read failed and a later one found the registration, the call
+  still failed its step and kept the files in the lake. Now a registration the ledger
+  records whole is answered as committed.
