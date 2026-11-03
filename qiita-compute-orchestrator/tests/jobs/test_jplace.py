@@ -3,8 +3,8 @@
 The split stands between a jplace and miint's `read_jplace`, so it has two jobs: carry
 every placement through, byte for byte, into parts small enough to read; and refuse
 every placement the macro would load as something other than what it says. Neither
-needs miint, so these run without it; the read through `read_jplace` is covered in
-`test_reference_load.py`.
+needs miint, so these run without it; the read through `read_jplace` is tested where
+`reference_load` makes it.
 """
 
 from __future__ import annotations
@@ -22,6 +22,7 @@ def _placement(name: str, edge: int) -> dict:
 
 
 _PLACEMENTS = [_placement(f"frag{i}", i * 3) for i in range(40)]
+_TREE = "((frag0:0.1{0},frag1:0.2{1}):0.3{2});"
 
 
 def _write(tmp_path, doc, *, raw: str | None = None):
@@ -32,7 +33,7 @@ def _write(tmp_path, doc, *, raw: str | None = None):
 
 def _doc(placements=None, **overrides):
     doc = {
-        "tree": "((frag0:0.1{0},frag1:0.2{1}):0.3{2});",
+        "tree": _TREE,
         "placements": _PLACEMENTS if placements is None else placements,
         "metadata": {"invocation": "test"},
         "version": 3,
@@ -46,7 +47,8 @@ def _split(source, out_dir, cap=1 << 20):
     """Run the split, reading each part back as it is yielded (the split's caller
     deletes each part before taking the next, so a test must read it then too)."""
     parts = []
-    for path, count in split_jplace(source, out_dir, part_max_bytes=cap):
+    tree_out = out_dir.with_name("tree.nwk")
+    for path, count in split_jplace(source, out_dir, part_max_bytes=cap, tree_out=tree_out):
         data = path.read_bytes()
         parts.append((len(data), count, json.loads(data)))
     return parts
@@ -70,7 +72,7 @@ def test_a_small_cap_splits_without_losing_or_reordering_a_placement(tmp_path):
 
 
 def test_placement_text_is_copied_through_unchanged(tmp_path):
-    """The split frames placements; it does not re-serialise them, so a float's
+    """The split frames placements; it does not re-serialize them, so a float's
     spelling reaches miint as the producer wrote it."""
     raw = (
         '{"fields": ["edge_num", "likelihood", "like_weight_ratio", "distal_length",'
@@ -78,16 +80,27 @@ def test_placement_text_is_copied_through_unchanged(tmp_path):
         ' "tree": "(a:1{7});", "version": 3}'
     )
     path = _write(tmp_path, None, raw=raw)
-    [(part_path, _)] = list(split_jplace(path, tmp_path / "parts", part_max_bytes=1 << 20))
+    [(part_path, _)] = list(
+        split_jplace(
+            path, tmp_path / "parts", part_max_bytes=1 << 20, tree_out=tmp_path / "tree.nwk"
+        )
+    )
     assert "[[7, -1.50e+02, 1.0, 0.0, 1e-5]]" in part_path.read_text()
 
 
-def test_fields_after_placements_is_accepted(tmp_path):
-    """pplacer writes `fields` after `placements`."""
+@pytest.mark.parametrize(
+    "order",
+    [
+        ("fields", "metadata", "placements", "tree", "version"),
+        # pplacer's order: `fields` after `placements`.
+        ("tree", "placements", "metadata", "version", "fields"),
+    ],
+)
+def test_keys_in_either_order_carry_placements_and_tree(tmp_path, order):
     doc = _doc()
-    reordered = {k: doc[k] for k in ("tree", "placements", "metadata", "version", "fields")}
-    parts = _split(_write(tmp_path, reordered), tmp_path / "parts")
+    parts = _split(_write(tmp_path, {k: doc[k] for k in order}), tmp_path / "parts")
     assert [p for _, _, part in parts for p in part["placements"]] == _PLACEMENTS
+    assert (tmp_path / "tree.nwk").read_text() == _TREE
 
 
 def test_buffer_refills_mid_value(tmp_path, monkeypatch):
@@ -103,7 +116,7 @@ def test_a_number_cut_by_the_buffer_end_is_read_whole(tmp_path, monkeypatch):
     """A bare number is the one value that decodes when cut short: the first read here
     ends at `{"version": 1234`, which `raw_decode` takes as 1234."""
     raw = '{"version": 1234567, "fields": ' + json.dumps(list(EXPECTED_FIELDS))
-    raw += ', "placements": ' + json.dumps(_PLACEMENTS) + "}"
+    raw += ', "placements": ' + json.dumps(_PLACEMENTS) + ', "tree": ' + json.dumps(_TREE) + "}"
     assert raw[:16] == '{"version": 1234'
     monkeypatch.setattr(_jplace, "_READ_CHARS", 16)
     parts = _split(_write(tmp_path, None, raw=raw), tmp_path / "parts")
@@ -163,23 +176,49 @@ def test_fields_read_jplace_would_misread_are_refused(tmp_path, fields, fields_l
         _split(_write(tmp_path, doc), tmp_path / "parts")
 
 
-def test_missing_fields_is_refused(tmp_path):
+@pytest.mark.parametrize("key", ["fields", "placements", "tree"])
+def test_a_missing_required_key_is_refused(tmp_path, key):
     doc = _doc()
-    del doc["fields"]
-    with pytest.raises(ValueError, match="no 'fields'"):
+    del doc[key]
+    with pytest.raises(ValueError, match=f"no '{key}'"):
         _split(_write(tmp_path, doc), tmp_path / "parts")
 
 
-def test_missing_placements_is_refused(tmp_path):
-    doc = _doc()
-    del doc["placements"]
-    with pytest.raises(ValueError, match="no 'placements'"):
-        _split(_write(tmp_path, doc), tmp_path / "parts")
+def test_a_tree_that_is_not_a_string_is_refused(tmp_path):
+    with pytest.raises(ValueError, match="not a Newick string"):
+        _split(_write(tmp_path, _doc(tree={"newick": _TREE})), tmp_path / "parts")
+
+
+# A part's framing around its placements: `{"placements": [` and `]}`.
+_FRAMING = len(b'{"placements": [') + len(b"]}")
+
+
+def test_a_placement_that_exactly_fills_a_part_is_accepted(tmp_path):
+    one = len(json.dumps(_PLACEMENTS[0]).encode())
+    [(size, count, _)] = _split(
+        _write(tmp_path, _doc(_PLACEMENTS[:1])), tmp_path / "parts", cap=_FRAMING + one
+    )
+    assert (size, count) == (_FRAMING + one, 1)
 
 
 def test_a_placement_larger_than_a_part_is_refused(tmp_path):
+    one = len(json.dumps(_PLACEMENTS[0]).encode())
     with pytest.raises(ValueError, match="more than a part may hold"):
-        _split(_write(tmp_path, _doc()), tmp_path / "parts", cap=40)
+        _split(_write(tmp_path, _doc(_PLACEMENTS[:1])), tmp_path / "parts", cap=_FRAMING + one - 1)
+
+
+@pytest.mark.parametrize(("slack", "parts"), [(0, 1), (-1, 2)])
+def test_a_part_closes_at_exactly_its_cap(tmp_path, slack, parts):
+    """Two placements of equal length and the comma between them: a cap of exactly
+    that holds both, one byte less needs a second part."""
+    two = [_placement("a", 10), _placement("b", 11)]
+    one = len(json.dumps(two[0]).encode())
+    assert one == len(json.dumps(two[1]).encode())
+    split = _split(
+        _write(tmp_path, _doc(two)), tmp_path / "parts", cap=_FRAMING + 2 * one + 1 + slack
+    )
+    assert len(split) == parts
+    assert [p for _, _, part in split for p in part["placements"]] == two
 
 
 _FIELDS_JSON = json.dumps(list(EXPECTED_FIELDS))

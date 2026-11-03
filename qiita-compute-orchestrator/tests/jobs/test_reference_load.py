@@ -473,7 +473,7 @@ def test_conflicting_lineages_on_one_feature_keep_the_smallest_read_id(
             f"SELECT genus FROM '{pq}' WHERE feature_idx = {seq1_fidx}"
         ).fetchone()[0]
     assert genus == "Escherichia"
-    [warning] = [w for w in _load_warnings(caplog) if "conflicting lineages" in w]
+    [warning] = [w for w in _load_warnings(caplog) if "more than one distinct lineage" in w]
     assert "['aaa_twin_of_seq1', 'seq1']" in warning
 
 
@@ -632,13 +632,20 @@ def test_phylogeny_leaves_a_partially_decorated_tree_partial(staging_inputs, tmp
     assert still_null == 1, "the undecorated root must keep its NULL, not be minted"
 
 
+# The tree every placement fixture is made against: the five test sequences, every
+# node but the root decorated with a jplace `{N}` edge number, 0 to 7.
+_JPLACE_TREE = (
+    "((seq1:0.1{0},seq2:0.2{1}):0.3{2},(seq3:0.4{3},(seq4:0.5{4},seq5:0.6{5}):0.7{6}):0.8{7});"
+)
+
+
 @pytest.fixture
 def jplace_path(tmp_path):
     """jplace input wrapped in the CLI's chunked DoPut shape.
     reference_load stitches chunks back to a temp `.jplace` file before
     passing to miint's `read_jplace`."""
     jplace_text = (
-        b'{"version": 3, "tree": "((seq1:0.1{0},seq2:0.2{1}):0.3{2}):0.4{3};",'
+        b'{"version": 3, "tree": "' + _JPLACE_TREE.encode() + b'",'
         b' "placements": ['
         b'   {"p": [[5, -1.0, 0.9, 0.01, 0.02]], "nm": [["seq1", 1]]},'
         b'   {"p": [[7, -2.0, 0.8, 0.03, 0.04]], "nm": [["seq2", 1]]}'
@@ -651,10 +658,11 @@ def jplace_path(tmp_path):
 
 
 def _raw_jplace(path: Path, placements: list[tuple[str, int]]) -> Path:
-    """A raw jplace (the local-path shape) placing each `(fragment, edge_num)`, with
-    likelihoods that differ per row so a test can tell which row landed."""
+    """A raw jplace (the local-path shape) on `_JPLACE_TREE`, placing each
+    `(fragment, edge_num)`, with likelihoods that differ per row so a test can tell
+    which row landed."""
     doc = {
-        "tree": "((seq1:0.1{0},seq2:0.2{1}):0.3{2});",
+        "tree": _JPLACE_TREE,
         "placements": [
             {"p": [[edge, -1.0 - i, 0.5, 0.01, 0.02]], "n": [name]}
             for i, (name, edge) in enumerate(placements)
@@ -674,7 +682,7 @@ def _raw_jplace(path: Path, placements: list[tuple[str, int]]) -> Path:
 
 def _with_twin(staging_inputs: dict, tmp_path: Path, *, twin: str, of: str) -> dict:
     """`staging_inputs` with one more manifest read_id, `twin`, whose sequence
-    canonicalises to `of`'s — two names for one feature, as a reverse-complement pair or
+    canonicalizes to `of`'s — two names for one feature, as a reverse-complement pair or
     a repeated record would be."""
     manifest = tmp_path / "manifest_with_twin.parquet"
     _write_parquet(
@@ -708,31 +716,35 @@ def test_placements_lifted_writer_maps_fragment_to_feature_idx(
         assert rows == expected
 
 
-def test_placements_split_across_parts_load_the_same_rows(staging_inputs, tmp_path, monkeypatch):
+@pytest.mark.parametrize("part_max_bytes", [None, 100])
+def test_placements_load_as_written_however_the_file_is_split(
+    staging_inputs, tmp_path, monkeypatch, part_max_bytes
+):
     """A jplace too big for one `read_jplace` call is split and read part by part
-    (duckdb-miint#400); the rows that land must not depend on where it was cut."""
+    (duckdb-miint#400). Whether it fits one part or takes one part per placement (100
+    bytes), every placement lands as the file wrote it."""
     from qiita_compute_orchestrator.jobs import _jplace
 
-    jplace = _raw_jplace(tmp_path / "in.jplace", [(name, i) for i, name in enumerate(_CANON)])
-    whole = _placements(
-        _run(_inputs(**staging_inputs, jplace_path=jplace), tmp_path / "whole")["staging_dir"]
+    if part_max_bytes is not None:
+        monkeypatch.setattr(_jplace, "_PART_MAX_BYTES", part_max_bytes)
+    written = [(name, i) for i, name in enumerate(_CANON)]
+    jplace = _raw_jplace(tmp_path / "in.jplace", written)
+    rows = _placements(
+        _run(_inputs(**staging_inputs, jplace_path=jplace), tmp_path / "ws")["staging_dir"]
         / "reference_placements.parquet"
     )
-    # Small enough for one placement per part.
-    monkeypatch.setattr(_jplace, "_PART_MAX_BYTES", 100)
-    split = _placements(
-        _run(_inputs(**staging_inputs, jplace_path=jplace), tmp_path / "split")["staging_dir"]
-        / "reference_placements.parquet"
+    assert rows == sorted(
+        (_FEATURE_MAP[_HASHES[name]], edge, -1.0 - edge) for name, edge in written
     )
-    assert len(whole) == len(_CANON)
-    assert split == whole
 
 
 def test_placement_of_an_unknown_fragment_raises(staging_inputs, tmp_path):
-    """A fragment that is no sequence's read_id used to be dropped by an inner join,
-    which published a placement set other than the one supplied."""
+    """A fragment that is no sequence's read_id cannot be keyed to a feature; dropping
+    it would publish a placement set other than the one supplied."""
     jplace = _raw_jplace(tmp_path / "in.jplace", [("seq1", 0), ("not_a_read", 1)])
-    with pytest.raises(ValueError, match=r"1 jplace fragment\(s\) are not the read_id.*not_a_read"):
+    with pytest.raises(
+        ValueError, match=r"1 jplace fragment\(s\) match no sequence identifier.*not_a_read"
+    ):
         _run(_inputs(**staging_inputs, jplace_path=jplace), tmp_path / "ws")
     assert not (tmp_path / "ws" / "reference_placements.parquet").exists()
 
@@ -743,23 +755,56 @@ def test_fragment_placed_twice_raises(staging_inputs, tmp_path):
         _run(_inputs(**staging_inputs, jplace_path=jplace), tmp_path / "ws")
 
 
-def test_placement_on_an_edge_the_tree_lacks_raises(staging_inputs, tree_path, tmp_path):
-    """With the tree in the same load, every edge_num must be one of its edge_ids. The
-    fixture tree is undecorated, so its edge_ids are its node_indexes, 0 to 8."""
+def test_placement_on_an_edge_the_jplace_tree_lacks_raises(staging_inputs, tmp_path):
+    """Every edge_num must be an edge of the jplace's own tree, whether or not this
+    load carries a tree. `_JPLACE_TREE` numbers 0 to 7."""
     jplace = _raw_jplace(tmp_path / "in.jplace", [("seq1", 3), ("seq2", 999), ("seq3", 999)])
-    with pytest.raises(ValueError, match=r"1 jplace edge_num\(s\).*999 \(2 placements\)"):
-        _run(_inputs(**staging_inputs, tree_path=tree_path, jplace_path=jplace), tmp_path / "ws")
+    with pytest.raises(
+        ValueError, match=r"1 jplace edge_num\(s\) are not an edge of.*999 \(2 placements\)"
+    ):
+        _run(_inputs(**staging_inputs, jplace_path=jplace), tmp_path / "ws")
 
 
-def test_placements_on_tree_edges_load_with_the_tree(staging_inputs, tree_path, tmp_path):
-    jplace = _raw_jplace(tmp_path / "in.jplace", [("seq1", 0), ("seq2", 8)])
-    outputs = _run(
-        _inputs(**staging_inputs, tree_path=tree_path, jplace_path=jplace), tmp_path / "ws"
-    )
+def test_placements_load_with_the_jplaces_own_tree(staging_inputs, tmp_path):
+    nwk = tmp_path / "tree.nwk"
+    nwk.write_text(_JPLACE_TREE)
+    jplace = _raw_jplace(tmp_path / "in.jplace", [("seq1", 0), ("seq2", 7)])
+    outputs = _run(_inputs(**staging_inputs, tree_path=nwk, jplace_path=jplace), tmp_path / "ws")
     assert [r[1] for r in _placements(outputs["staging_dir"] / "reference_placements.parquet")] == [
         0,
-        8,
+        7,
     ]
+
+
+@pytest.mark.parametrize(
+    ("tree", "why"),
+    [
+        # The same topology without its `{N}` decorations: the loader numbers it by
+        # node_index, which is not the jplace's numbering.
+        (
+            "((seq1:0.1,seq2:0.2):0.3,(seq3:0.4,(seq4:0.5,seq5:0.6):0.7):0.8);",
+            "undecorated",
+        ),
+        (
+            _JPLACE_TREE.replace("seq1:", "tmp:")
+            .replace("seq2:", "seq1:")
+            .replace("tmp:", "seq2:"),
+            "two tips swapped",
+        ),
+        (
+            "((seq1:0.1{0},seq2:0.2{1}):0.3{2},(seq3:0.4{3},seq4:0.5{4}):0.7{6},seq5:0.6{5});",
+            "another topology",
+        ),
+    ],
+)
+def test_a_tree_other_than_the_jplaces_is_refused(staging_inputs, tmp_path, tree, why):
+    """A jplace's edge_nums name edges of its own tree, so a load carrying both must
+    carry that tree: anything else joins placements to the wrong edges."""
+    nwk = tmp_path / "tree.nwk"
+    nwk.write_text(tree)
+    jplace = _raw_jplace(tmp_path / "in.jplace", [("seq1", 0), ("seq2", 1)])
+    with pytest.raises(ValueError, match="not the jplace's tree"):
+        _run(_inputs(**staging_inputs, tree_path=nwk, jplace_path=jplace), tmp_path / "ws")
 
 
 def test_a_feature_placed_under_two_fragments_keeps_the_smallest(staging_inputs, tmp_path, caplog):

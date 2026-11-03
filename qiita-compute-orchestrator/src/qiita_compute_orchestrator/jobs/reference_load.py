@@ -545,24 +545,19 @@ def _write_taxonomy(
         [str(taxonomy_path)],
     )
 
-    # Read_ids whose sequences canonicalise to one feature can carry different
-    # lineages. The feature takes the lineage of the lexicographically smallest
-    # read_id that carries one — the record `write-membership` names as the
-    # feature's accession, whenever that record has a lineage
-    # (`MEMBERSHIP_ACCESSION_JOIN_SQL`, qiita_control_plane.actions.library) — and
-    # the lineage itself breaks a tie between duplicate rows for one read_id.
-    n, sample = _anomaly(
+    # Read_ids whose sequences canonicalize to one feature can carry different
+    # lineages, and so can duplicate rows for one read_id. The feature takes the
+    # lineage of its lexicographically smallest read_id that carries one, the
+    # lineage itself breaking a tie between duplicate rows. Whenever that record
+    # has a lineage, it is the record the feature's accession names: the
+    # accession is the smallest of the feature's read_ids.
+    _warn_anomaly(
         conn,
         "SELECT list(DISTINCT read_id ORDER BY read_id) FROM parsed_taxonomy"
         " GROUP BY feature_idx HAVING count(DISTINCT ranks) > 1 ORDER BY min(read_id)",
+        "feature(s) carry more than one distinct lineage; keeping the lineage of the "
+        "lexicographically smallest read_id",
     )
-    if n:
-        _LOG.warning(
-            "%d feature(s) carry conflicting lineages across their read_ids; keeping the "
-            "lexicographically smallest read_id's (sample: %s)",
-            n,
-            sample,
-        )
 
     # LEFT JOIN off the distinct reference feature set (same features
     # reference_sequences / reference_membership emit) so every feature
@@ -642,65 +637,68 @@ def _write_placements(
     work_dir: Path,
     phylogeny: str | None,
 ) -> None:
-    """Parse a jplace file and emit one DuckLake row per placement, keyed by the
-    fragment's feature_idx.
+    """Parse a jplace file and emit one DuckLake row per placed feature.
 
-    Every placement in the file lands, or the load fails. A fragment placed twice, a
-    fragment that is no sequence's read_id, and — when this load carries the tree
-    (`phylogeny` is its staged Parquet) — an edge_num the tree does not number are each
-    refused with a count and a sample: dropping them would publish a placement set
-    that is not the one supplied, and nothing downstream could tell.
+    Every placed sequence lands, or the load fails. Each of these is refused with a
+    count and examples, because dropping or keeping it would publish a placement set
+    other than the one supplied, and nothing downstream could tell:
 
-    Fragments whose sequences canonicalise to one feature are each placed in the file,
-    but a feature takes one fragment's placement: the lexicographically smallest
-    fragment's, the same rule `_write_taxonomy` applies to lineages. How many features
-    had more than one is warned."""
-    load_jplace(conn, jplace_path, table="jplace_rows", work_dir=work_dir)
+      * a fragment placed twice;
+      * a fragment that matches no sequence identifier in this load;
+      * an edge_num the jplace's own tree does not number;
+      * when this load also carries a tree (`phylogeny` is its staged Parquet), a tree
+        other than the jplace's: a jplace's edge_nums name edges of its own tree, so
+        any other tree, or the same topology numbered another way, would join
+        placements to the wrong edges.
+
+    Fragments that are one feature (identical bytes, or reverse complements, under
+    different names) are placements of the same sequence. The feature keeps the
+    placement of its lexicographically smallest placed fragment, the rule
+    `_write_taxonomy` applies to lineages, and the load warns how many features had
+    more than one. That is a choice among placements of one sequence rather than the
+    loss of a sequence's placement, which is why it warns where the checks above
+    raise."""
+    load_jplace(conn, jplace_path, table="jplace_rows", tree_table="jplace_tree", work_dir=work_dir)
     conn.execute(
         "CREATE TEMP TABLE placed AS "
         "SELECT j.*, m.feature_idx FROM jplace_rows j LEFT JOIN id_map m ON j.fragment = m.read_id"
     )
     conn.execute("DROP TABLE jplace_rows")
 
-    n, sample = _anomaly(
+    n, first = _anomaly(
         conn, "SELECT fragment FROM placed GROUP BY fragment HAVING count(*) > 1 ORDER BY fragment"
     )
     if n:
-        raise ValueError(f"{n} jplace fragment(s) are placed more than once (sample: {sample})")
-    n, sample = _anomaly(
+        raise ValueError(f"{n} jplace fragment(s) are placed more than once (e.g. {first})")
+    n, first = _anomaly(
         conn, "SELECT fragment FROM placed WHERE feature_idx IS NULL ORDER BY fragment"
     )
     if n:
         raise ValueError(
-            f"{n} jplace fragment(s) are not the read_id of any sequence in this load "
-            f"(sample: {sample})"
+            f"{n} jplace fragment(s) match no sequence identifier in this load (e.g. {first})"
+        )
+    n, first = _anomaly(
+        conn,
+        "SELECT e.edge_num || ' (' || e.placements || ' placements)'"
+        " FROM (SELECT edge_num, count(*) AS placements FROM placed GROUP BY edge_num) e"
+        " ANTI JOIN jplace_tree t ON e.edge_num = t.edge_id"
+        " ORDER BY e.edge_num",
+    )
+    if n:
+        raise ValueError(
+            f"{n} jplace edge_num(s) are not an edge of the jplace's own tree (e.g. {first})"
         )
     if phylogeny is not None:
-        n, sample = _anomaly(
-            conn,
-            "SELECT edge_num || ' (' || count(*) || ' placements)' FROM placed"
-            " WHERE edge_num NOT IN (SELECT edge_id FROM read_parquet(?) WHERE edge_id IS NOT NULL)"
-            " GROUP BY edge_num ORDER BY edge_num",
-            [phylogeny],
-        )
-        if n:
-            raise ValueError(
-                f"{n} jplace edge_num(s) are not an edge_id of the tree in this load "
-                f"(sample: {sample})"
-            )
+        _refuse_a_tree_other_than_the_jplaces(conn, phylogeny)
+    conn.execute("DROP TABLE jplace_tree")
 
-    n, sample = _anomaly(
+    _warn_anomaly(
         conn,
         "SELECT list(fragment ORDER BY fragment) FROM placed"
         " GROUP BY feature_idx HAVING count(*) > 1 ORDER BY min(fragment)",
+        "feature(s) have placements from more than one fragment; keeping the "
+        "lexicographically smallest fragment's",
     )
-    if n:
-        _LOG.warning(
-            "%d feature(s) have placements from more than one fragment; keeping the "
-            "lexicographically smallest fragment's (sample: %s)",
-            n,
-            sample,
-        )
 
     conn.execute(
         "COPY ("
@@ -709,8 +707,44 @@ def _write_placements(
         "    likelihood, like_weight_ratio,"
         "    distal_length, pendant_length"
         "  FROM placed"
-        "  QUALIFY fragment = min(fragment) OVER (PARTITION BY feature_idx)"
-        "  ORDER BY feature_idx, edge_num"
+        "  QUALIFY row_number() OVER (PARTITION BY feature_idx ORDER BY fragment) = 1"
+        "  ORDER BY feature_idx"
         f") TO '{out}' ({PARQUET_OPTS_AT_REST})",
     )
     conn.execute("DROP TABLE placed")
+
+
+def _refuse_a_tree_other_than_the_jplaces(conn: duckdb.DuckDBPyConnection, phylogeny: str) -> None:
+    """Raise unless the tree staged at `phylogeny` is the TEMP TABLE `jplace_tree`, as
+    far as a placement can tell: every node's edge number, its parent's edge number,
+    and, at a tip, its name. Branch lengths and internal labels are not compared; a
+    placement's meaning does not depend on them."""
+    conn.execute(
+        "CREATE TEMP TABLE load_tree AS"
+        " SELECT node_index, parent_index, edge_id, is_tip, name FROM read_parquet(?)",
+        [phylogeny],
+    )
+    shape = (
+        "SELECT c.edge_id, p.edge_id AS parent_edge_id, CASE WHEN c.is_tip THEN c.name END AS tip"
+        " FROM {t} c LEFT JOIN {t} p ON c.parent_index = p.node_index"
+    )
+    jplace_nodes, load_nodes = conn.execute(
+        "SELECT (SELECT count(*) FROM jplace_tree), (SELECT count(*) FROM load_tree)"
+    ).fetchone()
+    n, first = _anomaly(
+        conn,
+        "SELECT 'edge ' || coalesce(CAST(edge_id AS VARCHAR), 'none')"
+        " || ' under edge ' || coalesce(CAST(parent_edge_id AS VARCHAR), 'none')"
+        " || coalesce(', tip ' || tip, '') FROM ("
+        f"{shape.format(t='jplace_tree')} EXCEPT ALL {shape.format(t='load_tree')}"
+        ") ORDER BY edge_id NULLS FIRST, parent_edge_id NULLS FIRST, tip NULLS FIRST",
+    )
+    conn.execute("DROP TABLE load_tree")
+    if n or jplace_nodes != load_nodes:
+        raise ValueError(
+            f"the tree in this load is not the jplace's tree: it has {load_nodes} nodes to the "
+            f"jplace tree's {jplace_nodes}, and {n} of the jplace tree's nodes have no node in "
+            f"it with the same edge number, parent edge number and tip name (e.g. {first}). "
+            "A jplace's edge_nums name edges of its own tree, so load that tree, `{N}` "
+            "decorations included"
+        )

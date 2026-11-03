@@ -1,25 +1,21 @@
 """Read a jplace of any size through miint's `read_jplace`, refusing what it would truncate.
 
-`read_jplace` is a table macro over DuckDB's `read_json` (`SELECT macro_definition FROM
-duckdb_functions() WHERE function_name = 'read_jplace'`), and two of its properties shape
-this module:
+Two properties of `read_jplace` shape this module; the `read_jplace` entry in
+`docs/duckdb-miint.md` has both, measured:
 
-* It passes `maximum_object_size = 1000000000`, and a jplace is ONE JSON object, so a
-  file over 1 GB cannot be read at all (duckdb-miint#400). Greengenes2 2024.09's
-  placement file is 2.26 GB as released. `load_jplace` therefore splits the
-  `placements` array across part files under `_PART_MAX_BYTES` and reads them one at a
-  time — one `read_jplace` call over all the parts ran out of memory at an 18 GB limit.
-* It reads only the first location (`p[0]`) and the first name (`nm[0][0]`, else
-  `n[0]`), at fixed positions in the location row, without consulting the file's
-  `fields` (duckdb-miint#407). A placement with a second location or a second name, or
-  a file whose `fields` are in another order, would load as something other than what it
-  says, with no error. The split refuses all of them.
+* It cannot read a file over 1 GB (duckdb-miint#400), so `load_jplace` splits the
+  `placements` array across part files under `_PART_MAX_BYTES` and reads them one call
+  at a time.
+* It keeps one name and one location per placement and reads the location row by
+  position, ignoring `fields` (duckdb-miint#407), so the split refuses any placement or
+  `fields` list it would load as something other than what the file says.
 
 The split is JSON framing only: each placement is located with
 `json.JSONDecoder.raw_decode`, checked, and its source text copied through unchanged, so
 miint still does the parsing. A part carries only the `placements` array — `read_jplace`
 reads nothing else — so it is not a jplace by the spec, and it never leaves the job's
-temp directory.
+temp directory. The jplace's own `tree` is kept too: its `{N}` decorations are what the
+placements' `edge_num`s name.
 
 This is a **private helper**, not a dispatchable native job: it exports neither `Inputs`
 nor `execute`, and its leading underscore exempts it from the boot-time job scan.
@@ -45,11 +41,15 @@ EXPECTED_FIELDS = ("edge_num", "likelihood", "like_weight_ratio", "distal_length
 #    16 MiB (173K placements) read in 0.6 s,     64 MiB (699K) in 5.9 s,
 #   128 MiB (1.4M) in 45 s,                     256 MiB (2.8M) in 214 s,
 # and the whole 2.26 GB file, split at 16 MiB, loaded in 115 s at 2.4 GB peak RSS.
+# The growth is the macro's: plain `read_json` with `columns={'placements': 'JSON[]'}`
+# read the same 256 MiB part in 6.9 s. Neither reads the whole file in one call: that
+# `read_json` ran out of memory at a 24 GB limit.
 _PART_MAX_BYTES = 16 * 1024 * 1024
 
-# Characters pulled from the source per read, at least. A placement is a few hundred
-# bytes, so this only sets how often the buffer is refilled; a value longer than the
-# buffer (a tree string) doubles it per refill, so the copying stays linear.
+# Characters pulled from the source per read, at least. A GG2 placement is about 100
+# bytes as released and about 200 once its name is its sequence, so this only sets how
+# often the buffer is refilled; a value longer than the buffer (a tree string) doubles
+# it per refill, so the copying stays linear.
 _READ_CHARS = 16 * 1024 * 1024
 
 _PART_PREFIX = b'{"placements": ['
@@ -131,7 +131,8 @@ def _check_fields(fields: object, source: Path) -> None:
         raise ValueError(
             f"{source}: jplace fields are {fields!r}; read_jplace reads each location row by "
             f"position as {list(EXPECTED_FIELDS)} and ignores 'fields' (duckdb-miint#407), "
-            "so any other order or set would load the wrong values"
+            "so another order would load values into the wrong columns, and a field beyond "
+            "those would be dropped"
         )
 
 
@@ -228,20 +229,24 @@ class _PartWriter:
         return self._path, self._placements
 
 
-def split_jplace(source: Path, out_dir: Path, *, part_max_bytes: int) -> Iterator[tuple[Path, int]]:
+def split_jplace(
+    source: Path, out_dir: Path, *, part_max_bytes: int, tree_out: Path
+) -> Iterator[tuple[Path, int]]:
     """Yield `(part_path, placement_count)` for parts that together carry every
-    placement in `source`, in file order.
+    placement in `source`, in file order, and write the jplace's `tree` string to
+    `tree_out` once the whole file has been read.
 
     A part is complete when yielded, and the caller may delete it before asking for the
     next, so at most one part is on disk at a time. Every placement is checked as it
-    passes. `fields` may come before or after `placements` — pplacer writes it after —
-    so a wrong or missing `fields` can raise after parts have been yielded: nothing a
-    caller builds from the parts is final until the generator is exhausted. A jplace
-    with an empty `placements` array yields nothing.
+    passes. `fields` and `tree` may come before or after `placements` — pplacer writes
+    `fields` after — so a wrong or missing one can raise after parts have been yielded:
+    nothing a caller builds from the parts is final until the generator is exhausted. A
+    jplace with an empty `placements` array yields nothing.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
     writer = _PartWriter(out_dir, part_max_bytes)
     keys: set[str] = set()
+    tree: object = None
     try:
         with source.open(encoding="utf-8") as fh:
             stream = _JsonStream(fh, source)
@@ -260,6 +265,8 @@ def split_jplace(source: Path, out_dir: Path, *, part_max_bytes: int) -> Iterato
                     value, _ = stream.value()
                     if key == "fields":
                         _check_fields(value, source)
+                    elif key == "tree":
+                        tree = value
                     continue
                 stream.expect("[")
                 index = 0
@@ -276,9 +283,12 @@ def split_jplace(source: Path, out_dir: Path, *, part_max_bytes: int) -> Iterato
             stream.expect("}")
             if stream.peek():
                 raise ValueError(f"{source}: unexpected content after the jplace's JSON object")
-        for required in ("placements", "fields"):
+        for required in ("placements", "fields", "tree"):
             if required not in keys:
                 raise ValueError(f"{source}: the jplace has no {required!r}")
+        if not isinstance(tree, str):
+            raise ValueError(f"{source}: the jplace's 'tree' is not a Newick string")
+        tree_out.write_text(tree)
         last = writer.close()
         if last is not None:
             yield last
@@ -291,20 +301,29 @@ def load_jplace(
     jplace_path: Path,
     *,
     table: str,
+    tree_table: str,
     work_dir: Path,
 ) -> None:
-    """Read every placement in `jplace_path` into a new TEMP TABLE `table`.
+    """Read every placement in `jplace_path` into a new TEMP TABLE `table`, and the
+    jplace's own tree into a new TEMP TABLE `tree_table` (`read_newick`'s columns).
 
-    The table has `read_jplace`'s columns minus `filepath`, one row per placement in
-    the file: the split refuses every shape `read_jplace` would collapse, and each part
-    is checked to come back with as many rows as it was written with.
+    `table` has `read_jplace`'s columns minus `filepath`, one row per placement in the
+    file: the split refuses every shape `read_jplace` would collapse, and each part is
+    checked to come back with as many rows as it was written with, since a part that
+    loads fewer is exactly the silent loss this module exists to rule out.
     """
+    for name in (table, tree_table):
+        if not name.isidentifier():
+            raise ValueError(f"not a table name: {name!r}")
+    tree_path = work_dir / "jplace_tree.nwk"
     conn.execute(
         f"CREATE TEMP TABLE {table} ("
         "  fragment VARCHAR, edge_num INTEGER, likelihood DOUBLE,"
         "  like_weight_ratio DOUBLE, distal_length DOUBLE, pendant_length DOUBLE)"
     )
-    for part, written in split_jplace(jplace_path, work_dir, part_max_bytes=_PART_MAX_BYTES):
+    for part, written in split_jplace(
+        jplace_path, work_dir, part_max_bytes=_PART_MAX_BYTES, tree_out=tree_path
+    ):
         (inserted,) = conn.execute(
             f"INSERT INTO {table} "
             "SELECT fragment, edge_num, likelihood, like_weight_ratio,"
@@ -317,3 +336,7 @@ def load_jplace(
                 f"{part.name}: read_jplace returned {inserted} rows for {written} placements"
             )
         part.unlink()
+    conn.execute(
+        f"CREATE TEMP TABLE {tree_table} AS SELECT * FROM read_newick(?)", [str(tree_path)]
+    )
+    tree_path.unlink()
