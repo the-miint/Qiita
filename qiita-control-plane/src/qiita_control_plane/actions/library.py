@@ -3100,8 +3100,7 @@ async def _complete_mask_sample_gate(
     short-circuit (it reads 'completed' as "already finalized"), silently dropping
     the block's per-sample finalize over a now-double-written read_mask footprint. So
     refuse loudly when a covering block is still masking this footprint — the block
-    path owns that gate; the operator must delete the conflicting block-mask (or the
-    per-sample duplicate) rather than let two masking runs race the same footprint.
+    path owns that gate.
 
     The check (`has_incomplete_covering_block`) and the write
     (`upsert_mask_sample_completed`) are made atomic w.r.t. the concurrent block
@@ -3123,8 +3122,7 @@ async def _complete_mask_sample_gate(
             f"refusing to finalize the mask_sample gate for (mask={mask_idx}, "
             f"prep_sample={prep_sample_idx}): a covering block is still masking the "
             "same footprint under this mask_idx (cross-path double-mask). The block "
-            "path owns this gate — delete the conflicting block-mask (or the "
-            "per-sample duplicate) before masking the same config twice."
+            "path owns this gate."
         )
     await upsert_mask_sample_completed(conn, mask_idx=mask_idx, prep_sample_idx=prep_sample_idx)
 
