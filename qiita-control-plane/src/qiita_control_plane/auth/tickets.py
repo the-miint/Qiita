@@ -36,9 +36,8 @@ _MEMBERS_TABLES = frozenset({READ_BLOCK_TABLE, READ_MASKED_BLOCK_TABLE})
 # Columns each table may have signed into a ticket's projection list, and the
 # tables that require one — the CP mirror of the data plane's `PROJECTION_RULES`
 # (flight_service/query.rs); why each table is which is
-# docs/architecture/flight.md. Neither
-# language can import the other, so the two are kept honest by a test that parses
-# the Rust source — see tests/auth/test_auth.py.
+# docs/architecture/flight.md. Neither language can import the other, so the two
+# are kept honest by a test that parses the Rust source.
 #
 # A table absent from this mapping takes no projection at all: the data plane
 # streams every column and rejects a list outright.
@@ -197,11 +196,9 @@ def sign_ticket(
     ``columns`` is the orthogonal, *projection* scope: it narrows what each
     returned row carries rather than which rows are returned. It is **only
     accepted for** the tables in ``_PROJECTION_COLUMNS``, and **required for**
-    those in ``_PROJECTION_REQUIRED`` — the data plane refuses such a table's
-    ticket that omits the list, so signing one here would only defer the failure
-    to a client already holding a signed ticket. Validating it here rather than
-    at the route is the same choice ``members`` makes above — this is the one
-    place every ticket passes through, so a future caller cannot mint an
+    those in ``_PROJECTION_REQUIRED`` (why: the guard below). Validating it here
+    rather than at the route is the same choice ``members`` makes above — this is
+    the one place every ticket passes through, so a future caller cannot mint an
     unvalidated projection by forgetting a route-level guard.
 
     Both ``members`` and ``columns`` are omitted from the payload entirely when
