@@ -487,6 +487,16 @@ retry values are constants (`MIINT_HTTP_RETRY_SETTINGS` in
 limit), not configuration: changing them takes a code change and a release, and the limit
 itself has no setting.
 
+A pool with a sequenced_sample whose `ena_run_accession` is not exactly one run accession
+(an experiment, sample, study or malformed accession, or one with surrounding whitespace)
+fails before any download: the ticket is FAILED `permanent` at once and emailed with a
+reason naming each such prep_sample, a longer list cut short with `…`.
+`qiita sequenced-sample list --sequencing-run-idx <idx>` gives each row's
+`sequenced_sample_idx` beside its `prep_sample_idx` and `ena_run_accession`. Correct each
+with `qiita sequenced-sample patch --sequenced-sample-idx <idx> --ena-run-accession <run>`
+(`PATCH /sequenced-sample/{idx}`), then redrive the ticket (`POST /work-ticket/{idx}/run`),
+which reads the roster again.
+
 A run that fails in a way a retry cannot clear (a format error, a run with no sequence
 data, a 404, zero reads) does not fail its pool when another run
 was stored: the other runs load, the ticket completes, and the failed run is recorded with
@@ -499,12 +509,6 @@ run that failed permanently is fetched again on each retry, so a large one is do
 again. Any other error fails the step as a whole: out of memory retries with more memory,
 a segfault retries on the same resources, and anything else (a local disk fault) leaves the
 ticket FAILED and redrivable.
-
-A pool with a sequenced_sample whose `ena_run_accession` is not a run accession, or
-carries surrounding whitespace, fails before any download: the ticket is FAILED
-`permanent` at once and emailed with a reason naming each such prep_sample (the first 20
-of a longer list). Correct each with `PATCH /sequenced-sample/{idx}`, then redrive the
-ticket (`POST /work-ticket/{idx}/run`), which reads the roster again.
 
 When the retries run out, or at once when no run was stored and none of the failures is one
 a retry could clear (a 404), the ticket is FAILED `permanent` and

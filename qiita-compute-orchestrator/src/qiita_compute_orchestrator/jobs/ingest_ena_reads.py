@@ -30,7 +30,7 @@ Gotchas specific to the ENA source:
   (duckdb-miint#312; https://the-miint.github.io/duckdb-miint/insdc_ena/). A scan
   of several runs skips one that fails and returns the rest, so `execute` refuses
   a roster accession that is not a run: `read_ena_sequences` would expand an
-  experiment or sample accession to every run under it.
+  experiment, sample or study accession to every run under it.
   `_classify_ena_fetch_error` classifies the raised `duckdb.Error`, and a 404 is
   permanent there. A clean 0-row result fails the run BAD_INPUT: an ENA run never
   legitimately has zero reads, unlike a demux well.
@@ -47,7 +47,11 @@ import duckdb
 from pydantic import BaseModel, Field
 from qiita_common.api_paths import compute_reads_staging_path
 from qiita_common.backend_failure import BackendFailure, FailureKind
-from qiita_common.ena_accession import InvalidEnaAccessionError, validate_run_accession
+from qiita_common.ena_accession import (
+    RUN_ACCESSION_FORM,
+    InvalidEnaAccessionError,
+    validate_run_accession,
+)
 from qiita_common.http_status import is_transient_error_text, is_transient_http_status
 from qiita_common.models import FailureType, WorkTicketFailureStage
 from qiita_common.models.ena_import import MAX_ENA_DOWNLOAD_RUN_CONCURRENCY, FailedRunOutcome
@@ -78,7 +82,7 @@ _DUCKDB_THREADS = 2
 
 # Caps on a failure reason, which lands in a DB column and an email.
 _REASON_FULL_RUNS = 3
-_REASON_LISTED_ACCESSIONS = 20
+_REASON_LISTED_ITEMS = 20
 
 # Prefix of the transient-fetch reason; the live e2e test keys its skip on it.
 TRANSIENT_FETCH_ERROR_TEXT = "transient fetch error"
@@ -218,15 +222,13 @@ def _classify_ena_fetch_error(
     )
 
 
-def _run_accession_error(accession: str) -> str | None:
-    """Why the roster's `accession` cannot be scanned as one run, or None when it can.
-    The scan takes the value as stored, so a padded one is refused too."""
+def _is_scannable_run(accession: str) -> bool:
+    """True when the roster's `accession` is one run accession exactly as stored: the
+    scan takes the stored value, so a padded one is refused too."""
     try:
-        if validate_run_accession(accession) == accession:
-            return None
-    except InvalidEnaAccessionError as exc:
-        return str(exc)
-    return f"{accession!r} carries surrounding whitespace"
+        return validate_run_accession(accession) == accession
+    except InvalidEnaAccessionError:
+        return False
 
 
 def _is_permanent_fetch_error(exc: duckdb.Error) -> bool:
@@ -237,10 +239,11 @@ def _is_permanent_fetch_error(exc: duckdb.Error) -> bool:
     )
 
 
-def _capped_list(items: list[str], sep: str = ", ") -> str:
-    """The first `_REASON_LISTED_ACCESSIONS` of `items`, with "…" when there are more."""
-    ellipsis = "…" if len(items) > _REASON_LISTED_ACCESSIONS else ""
-    return sep.join(items[:_REASON_LISTED_ACCESSIONS]) + ellipsis
+def _capped_join(items: list[str]) -> str:
+    """The first `_REASON_LISTED_ITEMS` of `items`, comma-joined, ending ", …" when
+    there are more."""
+    more = ", …" if len(items) > _REASON_LISTED_ITEMS else ""
+    return ", ".join(items[:_REASON_LISTED_ITEMS]) + more
 
 
 def _combine_failures(failed: list[tuple[str, BackendFailure]]) -> BackendFailure:
@@ -256,7 +259,7 @@ def _combine_failures(failed: list[tuple[str, BackendFailure]]) -> BackendFailur
     )
     rest = [acc for acc, _ in ordered[_REASON_FULL_RUNS:]]
     if rest:
-        reason += f" | and {len(rest)} more failed runs: {_capped_list(rest)}"
+        reason += f" | and {len(rest)} more failed runs: {_capped_join(rest)}"
     return BackendFailure(kind=lead.kind, stage=lead.stage, step_name=lead.step_name, reason=reason)
 
 
@@ -266,15 +269,14 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     roster = read_roster_parquet(
         inputs.ena_run_map, value_column="ena_run_accession", roster_name="ena_run_map"
     )
-    refused = sorted(
-        (psi, error) for psi, acc in roster if (error := _run_accession_error(acc)) is not None
-    )
+    refused = sorted((psi, acc) for psi, acc in roster if not _is_scannable_run(acc))
     if refused:
         raise ValueError(
             f"{len(refused)} sequenced_sample(s) of this pool carry an ena_run_accession "
-            "that is not one ENA run accession; a scan of an experiment, sample or study "
-            "accession would cover every run under it: "
-            + _capped_list([f"prep_sample {psi}: {error}" for psi, error in refused], sep="; ")
+            f"that is not exactly one run accession ({RUN_ACCESSION_FORM}, with no "
+            "surrounding whitespace); a scan of an experiment, sample or study accession "
+            "would cover every run under it: "
+            + _capped_join([f"prep_sample {psi}: {acc!r}" for psi, acc in refused])
         )
 
     workspace.mkdir(parents=True, exist_ok=True)

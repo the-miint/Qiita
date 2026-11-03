@@ -208,7 +208,7 @@ def test_validate_run_accession_returns_the_stripped_run(accession):
 def test_validate_run_accession_refuses_anything_but_a_run(accession):
     from qiita_common.ena_accession import InvalidEnaAccessionError, validate_run_accession
 
-    expected = f"{accession!r} is not a run accession (expected SRR/ERR/DRR followed by digits)"
+    expected = f"'{accession}' is not a run accession (expected SRR/ERR/DRR followed by digits)"
     with pytest.raises(InvalidEnaAccessionError) as raised:
         validate_run_accession(accession)
     assert str(raised.value) == expected

@@ -12,7 +12,6 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import re
 import threading
 import time
 from pathlib import Path
@@ -633,7 +632,7 @@ def test_many_failed_runs_cap_the_combined_reason(fake_mint, monkeypatch, tmp_pa
     assert "and 37 more failed runs: " in reason
     assert "ERR004" in reason and "ERR023" in reason
     assert "ERR024" not in reason and "ERR040" not in reason
-    assert reason.endswith("…")
+    assert reason.endswith(", ERR023, …")
 
 
 def test_deciding_transient_run_keeps_its_full_reason_in_a_capped_reason(
@@ -929,41 +928,41 @@ def no_download(monkeypatch):
     monkeypatch.setattr(ingest_module, "_stage_run_reads", _fake)
 
 
-@pytest.mark.parametrize("accession", ["ERX000001", "SAMEA1234", "PRJEB1", "not-an-accession"])
-def test_a_roster_accession_that_is_not_a_run_is_refused_before_any_download(
+@pytest.mark.parametrize(
+    "accession",
+    ["ERX000001", "SAMEA1234", "PRJEB1", "not-an-accession", " ERR001", "ERR001\n"],
+)
+def test_a_roster_accession_that_is_not_exactly_a_run_is_refused_before_any_download(
     fake_mint, no_download, tmp_path, accession
 ):
-    """A scan of several runs skips one that fails instead of raising, and
-    `read_ena_sequences` expands an experiment, sample or study accession to every
-    run under it, so only run accessions may reach the scan."""
-
+    """Another kind, a malformed value and a padded run accession are each refused,
+    named by prep_sample, before any run is fetched."""
     inputs = _inputs(tmp_path, [(10, "ERR001"), (11, accession)])
 
-    refused = re.escape(f"prep_sample 11: '{accession}' is not a run accession")
-    with pytest.raises(ValueError, match=refused):
+    with pytest.raises(ValueError) as raised:
         _run(inputs, tmp_path / "ws")
+
+    message = str(raised.value)
+    assert message.startswith("1 sequenced_sample(s) of this pool carry an ena_run_accession ")
+    assert "(SRR/ERR/DRR followed by digits, with no surrounding whitespace)" in message
+    assert message.endswith(f": prep_sample 11: {accession!r}")
     assert fake_mint == []
 
 
-@pytest.mark.parametrize("accession", [" ERR001", "ERR001\n"])
-def test_a_padded_run_accession_is_refused_before_any_download(
-    fake_mint, no_download, tmp_path, accession
-):
-    """The scan takes the roster's value as stored, so a run accession with
-    surrounding whitespace is refused, not passed to it."""
+@pytest.mark.parametrize("extra", [0, 1])
+def test_capped_join_marks_only_a_list_past_the_cap(extra):
+    listed = ingest_module._REASON_LISTED_ITEMS
+    items = [f"i{n}" for n in range(listed + extra)]
 
-    inputs = _inputs(tmp_path, [(10, "ERR001"), (11, accession)])
+    joined = ingest_module._capped_join(items)
 
-    refused = re.escape(f"prep_sample 11: {accession!r} carries surrounding whitespace")
-    with pytest.raises(ValueError, match=refused):
-        _run(inputs, tmp_path / "ws")
-    assert fake_mint == []
+    assert joined == ", ".join(items[:listed]) + (", …" if extra else "")
 
 
 def test_the_refusal_lists_the_first_prep_samples_and_marks_the_rest(
     fake_mint, no_download, tmp_path
 ):
-    listed = ingest_module._REASON_LISTED_ACCESSIONS
+    listed = ingest_module._REASON_LISTED_ITEMS
     inputs = _inputs(tmp_path, [(psi, f"ERX{psi:06d}") for psi in range(listed + 1)])
 
     with pytest.raises(ValueError) as raised:
@@ -973,7 +972,7 @@ def test_the_refusal_lists_the_first_prep_samples_and_marks_the_rest(
     assert message.startswith(f"{listed + 1} sequenced_sample(s) ")
     assert f"prep_sample {listed - 1}: " in message
     assert f"prep_sample {listed}: " not in message
-    assert message.endswith("…")
+    assert message.endswith(f"prep_sample {listed - 1}: 'ERX{listed - 1:06d}', …")
     assert fake_mint == []
 
 
