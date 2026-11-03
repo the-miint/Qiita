@@ -391,8 +391,8 @@ struct Registration {
     /// Rows the replace passes removed, per table — non-zero entries only. Empty
     /// when no `REPLACE_KEY_TABLES` key this call carried was already in the lake
     /// and this ticket had registered none of its `read` prep_samples before, and
-    /// when the call answers a registration that already committed, whose
-    /// removals nothing kept.
+    /// when the call answers a replay of a registration that already committed,
+    /// whose removals nothing kept.
     ///
     /// Rides back to the control plane in the DoAction body, which logs it: a
     /// delete nothing recorded is the one thing an operator reconciling row
@@ -414,9 +414,10 @@ impl Registration {
 /// Move Parquet files from staging to permanent storage and register in DuckLake.
 ///
 /// A payload that already committed is answered from the ledger without touching
-/// a file (the replay check below says how). Otherwise every file must be in
-/// staging; they are moved to permanent locations under `data_path/{table_name}/`
-/// and registered.
+/// a file (the replay check below says how), or from the catalog for one that
+/// committed before the ledger existed. Otherwise every file must be in staging;
+/// they are moved to permanent locations under `data_path/{table_name}/` and
+/// registered.
 ///
 /// Each file is placed by `move_file`, which copies where it cannot rename or
 /// link (e.g., SLURM local scratch → shared NFS).
@@ -603,7 +604,11 @@ fn register_files(
             // `move_file` removes a destination of its own when it fails (unless
             // that removal fails too, which it logs), so only the files before
             // this one are this call's to move back.
-            return Err(return_to_staging(conn, &placed[..i], e));
+            return Err(return_to_staging(
+                &placed[..i],
+                e,
+                ledgered(conn, &placed[..i]),
+            ));
         }
         moved.push((file.table.clone(), file.dest_str.clone()));
     }
@@ -702,6 +707,9 @@ fn register_files(
         })
         .collect();
 
+    // The removals of the last attempt `landed` was asked about: the attempt whose
+    // COMMIT `settle_failed_registration` may find landed.
+    let mut last_replaced = BTreeMap::new();
     let registration = transact_with_retry(
         conn,
         "the registration transaction",
@@ -765,17 +773,26 @@ fn register_files(
                 replaced,
             })
         },
-        |_| match ledgered(conn, &placed)? {
-            Ledgered::Nothing => Ok(false),
-            Ledgered::All => Ok(true),
-            Ledgered::Inconsistent(inconsistency) => {
-                Err(Status::internal(inconsistency.to_string()))
+        |attempt| {
+            last_replaced.clone_from(&attempt.replaced);
+            match ledgered(conn, &placed)? {
+                Ledgered::Nothing => Ok(false),
+                Ledgered::All => Ok(true),
+                Ledgered::Inconsistent(inconsistency) => {
+                    Err(Status::internal(inconsistency.to_string()))
+                }
             }
         },
     );
 
     registration.or_else(|failure| {
-        settle_failed_registration(conn, &placed, payload.work_ticket_idx, failure)
+        settle_failed_registration(
+            conn,
+            &placed,
+            payload.work_ticket_idx,
+            last_replaced,
+            failure,
+        )
     })
 }
 
@@ -783,25 +800,32 @@ fn register_files(
 ///
 /// `transact_with_retry` fails when `landed` cannot read the ledger after a COMMIT
 /// that reported an error, and that commit may have landed. So the ledger is read
-/// once more: when it records every file, the registration committed and is
-/// answered as a replay of it would be, with `failure` logged. Otherwise the files
-/// go back to staging (`return_to_staging`) and `failure` is the answer.
+/// once more. When it records every file, that attempt committed: every earlier
+/// one was read as not committed. The call then answers with the registration and
+/// that attempt's removals (`replaced`), and logs `failure`. Otherwise
+/// `return_to_staging` decides, from the same read, what becomes of the files.
 fn settle_failed_registration(
     conn: &duckdb::Connection,
     placed: &[PlacedFile],
     work_ticket_idx: i64,
+    replaced: BTreeMap<&'static str, usize>,
     failure: Status,
 ) -> Result<Registration, Status> {
-    if let Ok(Ledgered::All) = ledgered(conn, placed) {
-        eprintln!(
-            "warning: register_files for work_ticket {work_ticket_idx} reported an error \
-             after its COMMIT, and qiita_lake.registered_file records every file, so it \
-             committed: {}",
-            failure.message()
-        );
-        return Ok(Registration::already_committed(placed));
+    match ledgered(conn, placed) {
+        Ok(Ledgered::All) => {
+            eprintln!(
+                "warning: register_files for work_ticket {work_ticket_idx} failed ({}), but \
+                 qiita_lake.registered_file records every file, so it committed and is \
+                 answered as committed",
+                failure.message()
+            );
+            Ok(Registration {
+                replaced,
+                ..Registration::already_committed(placed)
+            })
+        }
+        ledger => Err(return_to_staging(placed, failure, ledger)),
     }
-    Err(return_to_staging(conn, placed, failure))
 }
 
 /// Move `files` back from the lake to staging after a registration failed past
@@ -809,12 +833,17 @@ fn settle_failed_registration(
 /// and return `failure` with what became of the files appended.
 ///
 /// A COMMIT that reported an error may still have landed — the catalog's
-/// connection can drop after the write — so the files go back only when the
-/// ledger confirms it records none of them. Otherwise, or when a move back fails,
+/// connection can drop after the write — so the files go back only when `ledger`,
+/// the caller's read of the ledger, records none of them. Otherwise, or when a
+/// move back fails,
 /// they stay at their lake paths and the message says so: a replay then returns
 /// the registration if the ledger records it, and otherwise fails closed, rather
 /// than registering a payload twice.
-fn return_to_staging(conn: &duckdb::Connection, files: &[PlacedFile], failure: Status) -> Status {
+fn return_to_staging(
+    files: &[PlacedFile],
+    failure: Status,
+    ledger: Result<Ledgered, Status>,
+) -> Status {
     let moved: Vec<&PlacedFile> = files.iter().filter(|f| f.dest.exists()).collect();
     if moved.is_empty() {
         return failure;
@@ -829,7 +858,7 @@ fn return_to_staging(conn: &duckdb::Connection, files: &[PlacedFile], failure: S
             ),
         )
     };
-    match ledgered(conn, files) {
+    match ledger {
         Ok(Ledgered::Nothing) => {}
         Ok(Ledgered::All) => {
             return kept(
@@ -909,7 +938,8 @@ impl std::fmt::Display for Inconsistency {
         write!(
             f,
             "qiita_lake.registered_file records {} of the {} files of this registration, \
-             in {} row(s), which its one transaction cannot leave",
+             in {} row(s); its one transaction records each file once, so the ledger \
+             has been edited",
             self.files, self.of, self.rows
         )
     }

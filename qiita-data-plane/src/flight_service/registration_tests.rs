@@ -974,8 +974,8 @@ fn register_files_replayed_after_a_registration_the_ledger_never_recorded_regist
 }
 
 /// A ledger recording a payload's files other than each once fails the call
-/// closed and leaves the files as they are: one transaction records each of a
-/// registration's files once, so the ledger has been edited. Here one of two
+/// closed and leaves the files as they are (`Ledgered::Inconsistent` says why).
+/// Here one of two
 /// files is missing, and then one is missing and the other recorded twice,
 /// which a count of rows alone would read as complete.
 #[test]
@@ -1307,11 +1307,16 @@ fn a_failed_registration_the_ledger_records_whole_is_answered_as_committed() {
         &writer,
         &placed,
         ticket,
+        BTreeMap::from([("reference_membership", 2)]),
         Status::internal("whether the commit landed could not be read"),
     )
     .expect("a registration the ledger records whole was answered with an error");
 
     assert_eq!(settled.registered, committed.registered);
+    assert_eq!(
+        settled.replaced,
+        BTreeMap::from([("reference_membership", 2)])
+    );
     for file in &committed.registered {
         assert!(std::path::Path::new(file).exists(), "{file} was moved");
     }
@@ -1448,7 +1453,8 @@ fn ducklake_transaction_reads_the_snapshot_of_its_first_statement() {
     assert_eq!(membership_rows(&connstr, &data_path, ref_idx), 0);
 }
 
-/// What `return_to_staging`'s catalog check rests on: after a COMMIT that fails,
+/// What a read of the ledger after a failed COMMIT rests on (`landed`,
+/// `settle_failed_registration`): after a COMMIT that fails,
 /// the connection is out of its transaction, and a read on it sees the catalog as
 /// it now is — here, a registration another connection committed meanwhile.
 #[test]

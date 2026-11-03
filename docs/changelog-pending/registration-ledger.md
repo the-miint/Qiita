@@ -18,3 +18,8 @@
   staging file or, if that file was still in staging, registered the deleted rows again
   (#800). A registration made before the ledger existed is still recognised as before,
   while its files are registered.
+- **A registration whose COMMIT reported an error is answered as committed when it
+  landed (#818).** The data plane already checked the lake after such an error. When that
+  check could not be read, the call failed, and the files stayed in the lake. Now it reads
+  the ledger once more, and a registration recorded there succeeds instead of failing its
+  step.
