@@ -1274,6 +1274,50 @@ fn register_files_whose_commit_answer_is_lost_registers_once() {
     assert_eq!(membership_rows(&connstr, &data_path, ref_idx), 2);
 }
 
+/// A registration whose transaction failed is answered as committed when the
+/// ledger records every one of its files, and its files stay at their lake paths.
+/// It stands in for a COMMIT that reported an error, landed, and whose landing
+/// `landed` could not read: the registration here is a real one, and the failure
+/// is made up.
+#[test]
+#[serial_test::serial]
+#[cfg(feature = "integration")]
+fn a_failed_registration_the_ledger_records_whole_is_answered_as_committed() {
+    let connstr = crate::test_catalog::connstr();
+    let data_path = crate::test_catalog::data_path();
+    let ref_idx: i64 = 990_000;
+    let ticket: i64 = 990_000_000 + std::process::id() as i64;
+    prepare_membership_table(&connstr, &data_path, ref_idx);
+    let (staging, payload) = seed_membership_registration(ref_idx, ticket);
+    let writer = attached_writer(&connstr, &data_path);
+    let committed = register_files(&writer, &data_path, std::path::Path::new("/"), &payload)
+        .expect("register_files failed");
+    let placed: Vec<PlacedFile> = committed
+        .registered
+        .iter()
+        .map(|dest| PlacedFile {
+            table: "reference_membership".to_string(),
+            src: staging.path().join("reference_membership.parquet"),
+            dest: std::path::PathBuf::from(dest),
+            dest_str: dest.clone(),
+        })
+        .collect();
+
+    let settled = settle_failed_registration(
+        &writer,
+        &placed,
+        ticket,
+        Status::internal("whether the commit landed could not be read"),
+    )
+    .expect("a registration the ledger records whole was answered with an error");
+
+    assert_eq!(settled.registered, committed.registered);
+    for file in &committed.registered {
+        assert!(std::path::Path::new(file).exists(), "{file} was moved");
+    }
+    assert_eq!(membership_rows(&connstr, &data_path, ref_idx), 2);
+}
+
 /// The reason a replay must be recognised before registering: in the DuckLake
 /// we ship, adding a path the table already holds succeeds and counts its rows
 /// twice.

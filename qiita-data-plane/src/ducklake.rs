@@ -1147,9 +1147,10 @@ pub fn ensure_registration_lock(conn: &Connection) -> Result<(), Box<dyn std::er
 /// `data_inlining_row_limit` per statement, with a default of 10. An INSERT per
 /// file would stay under the default, at a statement per file; `register_files`
 /// records a registration in one INSERT instead, so the limit sits above the
-/// most files one registration carries. A load splits into about one part per
-/// gigabyte, so 10,000 files is terabytes. A registration past the limit is
-/// still recorded, in a small file of its own.
+/// most files one registration carries. A producer stages one file, a file per
+/// prep_sample of a pool, or a part per gigabyte or more of a large load, so
+/// 10,000 files is a pool of 10,000 prep_samples or terabytes of one load. A
+/// registration past the limit is still recorded, in a small file of its own.
 const REGISTERED_FILE_INLINING_ROW_LIMIT: u32 = 10_000;
 
 /// Create the ledger of completed registrations: a row per file

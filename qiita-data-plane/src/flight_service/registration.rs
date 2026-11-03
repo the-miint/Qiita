@@ -326,16 +326,14 @@ pub(super) fn take_registration_lock(conn: &LakeWriter) -> Result<(), Status> {
 /// A COMMIT that reports an error may still have landed: when the catalog's
 /// connection drops after Postgres committed, before its answer arrives, the
 /// COMMIT errors and the rows are there, and a re-run of an add registers them
-/// again (`ducklake_commit_error_after_the_catalog_committed`). So before any
-/// re-run, `landed` reads the catalog: given the attempt's value it says whether
-/// that attempt's commit is there, and if it is the value is returned. When
-/// `landed` cannot tell, the call fails with both errors rather than re-running.
-/// `landed` reads committed state only: DuckDB clears the connection's
-/// transaction before it attempts the commit (`TransactionContext::Commit`), so a
-/// COMMIT that fails, for whatever reason, has already ended it. Pinned for a
-/// conflict by `ducklake_failed_commit_ends_the_transaction`, and measured for a
-/// catalog connection that dropped before Postgres committed (DuckDB 2.0.0,
-/// ducklake 417a9117).
+/// again. So before any re-run, `landed` reads the catalog: given the attempt's
+/// value it says whether that attempt's commit is there, and if it is the value
+/// is returned. When `landed` cannot tell, the call fails with both errors rather
+/// than re-running. `landed` reads committed state only: DuckDB ends the
+/// connection's transaction before it attempts the commit, so a COMMIT that
+/// fails, for whatever reason, has already ended it. A conflict test pins that,
+/// and it was measured for a catalog connection that dropped before Postgres
+/// committed (DuckDB 2.0.0, ducklake 417a9117).
 pub(super) fn transact_with_retry<T>(
     conn: &LakeWriter,
     what: &str,
@@ -392,7 +390,9 @@ struct Registration {
     registered: Vec<String>,
     /// Rows the replace passes removed, per table — non-zero entries only. Empty
     /// when no `REPLACE_KEY_TABLES` key this call carried was already in the lake
-    /// and this ticket had registered none of its `read` prep_samples before.
+    /// and this ticket had registered none of its `read` prep_samples before, and
+    /// when the call answers a registration that already committed, whose
+    /// removals nothing kept.
     ///
     /// Rides back to the control plane in the DoAction body, which logs it: a
     /// delete nothing recorded is the one thing an operator reconciling row
@@ -400,10 +400,23 @@ struct Registration {
     replaced: BTreeMap<&'static str, usize>,
 }
 
+impl Registration {
+    /// A registration that already committed, answered from what the lake records
+    /// of it: its paths, and no `replaced`.
+    fn already_committed(placed: &[PlacedFile]) -> Self {
+        Self {
+            registered: placed.iter().map(|p| p.dest_str.clone()).collect(),
+            replaced: BTreeMap::new(),
+        }
+    }
+}
+
 /// Move Parquet files from staging to permanent storage and register in DuckLake.
 ///
-/// Validates all requested files exist in staging, moves them to permanent
-/// locations under `data_path/{table_name}/`, and registers them.
+/// A payload that already committed is answered from the ledger without touching
+/// a file (the replay check below says how). Otherwise every file must be in
+/// staging; they are moved to permanent locations under `data_path/{table_name}/`
+/// and registered.
 ///
 /// Each file is placed by `move_file`, which copies where it cannot rename or
 /// link (e.g., SLURM local scratch → shared NFS).
@@ -503,26 +516,15 @@ fn register_files(
     // again. The ledger is a lake table because a DuckDB transaction writes one
     // attached database, so a row anywhere else could not commit with the add.
     //
-    // One transaction records each of a registration's files once, and the
-    // control plane sends one payload per staging dir (it refuses a file its
-    // recorded payload does not name), so a ledger recording this payload any
-    // other way than all or nothing has been edited. The call fails closed.
+    // A ledger recording this payload any other way than all or nothing fails the
+    // call closed (`Ledgered::Inconsistent` says why).
     match ledgered(conn, &placed)? {
-        Ledgered::All => {
-            return Ok(Registration {
-                registered: placed.into_iter().map(|p| p.dest_str).collect(),
-                replaced: BTreeMap::new(),
-            })
-        }
-        Ledgered::Inconsistent { files, rows } => {
+        Ledgered::All => return Ok(Registration::already_committed(&placed)),
+        Ledgered::Inconsistent(inconsistency) => {
             return Err(Status::internal(format!(
-                "qiita_lake.registered_file records {files} of the {} files this \
-                 register_files call for work_ticket {} from {} carries, in {rows} \
-                 row(s), though one transaction records each of a registration's \
-                 files once; the files are left where they are for an operator",
-                placed.len(),
-                payload.work_ticket_idx,
-                payload.staging_dir,
+                "{inconsistency}; this register_files call for work_ticket {} from {} \
+                 leaves the files where they are for an operator",
+                payload.work_ticket_idx, payload.staging_dir,
             )))
         }
         Ledgered::Nothing => {}
@@ -547,10 +549,7 @@ fn register_files(
     if moved_before > 0 {
         let in_catalog = registered_data_files(conn, &placed)?;
         if moved_before == placed.len() && in_catalog.len() == placed.len() {
-            return Ok(Registration {
-                registered: placed.into_iter().map(|p| p.dest_str).collect(),
-                replaced: BTreeMap::new(),
-            });
+            return Ok(Registration::already_committed(&placed));
         }
         return Err(Status::failed_precondition(format!(
             "an earlier register_files call for work_ticket {} from {} moved {} of {} \
@@ -766,19 +765,43 @@ fn register_files(
                 replaced,
             })
         },
-        // Anything but all or nothing is a ledger this call did not write (the
-        // replay check above says why).
         |_| match ledgered(conn, &placed)? {
             Ledgered::Nothing => Ok(false),
             Ledgered::All => Ok(true),
-            Ledgered::Inconsistent { files, rows } => Err(Status::internal(format!(
-                "qiita_lake.registered_file records {files} of the {} files, in {rows} row(s)",
-                placed.len()
-            ))),
+            Ledgered::Inconsistent(inconsistency) => {
+                Err(Status::internal(inconsistency.to_string()))
+            }
         },
     );
 
-    registration.map_err(|e| return_to_staging(conn, &placed, e))
+    registration.or_else(|failure| {
+        settle_failed_registration(conn, &placed, payload.work_ticket_idx, failure)
+    })
+}
+
+/// Answer a registration whose transaction failed after its moves.
+///
+/// `transact_with_retry` fails when `landed` cannot read the ledger after a COMMIT
+/// that reported an error, and that commit may have landed. So the ledger is read
+/// once more: when it records every file, the registration committed and is
+/// answered as a replay of it would be, with `failure` logged. Otherwise the files
+/// go back to staging (`return_to_staging`) and `failure` is the answer.
+fn settle_failed_registration(
+    conn: &duckdb::Connection,
+    placed: &[PlacedFile],
+    work_ticket_idx: i64,
+    failure: Status,
+) -> Result<Registration, Status> {
+    if let Ok(Ledgered::All) = ledgered(conn, placed) {
+        eprintln!(
+            "warning: register_files for work_ticket {work_ticket_idx} reported an error \
+             after its COMMIT, and qiita_lake.registered_file records every file, so it \
+             committed: {}",
+            failure.message()
+        );
+        return Ok(Registration::already_committed(placed));
+    }
+    Err(return_to_staging(conn, placed, failure))
 }
 
 /// Move `files` back from the lake to staging after a registration failed past
@@ -815,12 +838,7 @@ fn return_to_staging(conn: &duckdb::Connection, files: &[PlacedFile], failure: S
                     .to_string(),
             )
         }
-        Ok(Ledgered::Inconsistent { files, rows }) => {
-            return kept(format!(
-                "qiita_lake.registered_file records {files} of them, in {rows} row(s), \
-                 which one transaction recording each file once cannot leave"
-            ))
-        }
+        Ok(Ledgered::Inconsistent(inconsistency)) => return kept(inconsistency.to_string()),
         Err(e) => {
             return kept(format!(
                 "qiita_lake.registered_file could not be read to confirm it records \
@@ -871,9 +889,30 @@ enum Ledgered {
     Nothing,
     /// Each of them once.
     All,
-    /// Anything else, which one transaction recording each of a registration's
-    /// files once cannot leave: `files` of them, in `rows` rows.
-    Inconsistent { files: usize, rows: usize },
+    /// Anything else. One transaction records each of a registration's files once,
+    /// and the control plane sends one payload per staging dir (it refuses a file
+    /// its recorded payload does not name), so this ledger has been edited, and a
+    /// call that reads it fails closed and leaves the files where they are.
+    Inconsistent(Inconsistency),
+}
+
+/// What an inconsistent ledger records of a registration's files: `files` of the
+/// `of` it carries, in `rows` rows.
+struct Inconsistency {
+    files: usize,
+    rows: usize,
+    of: usize,
+}
+
+impl std::fmt::Display for Inconsistency {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "qiita_lake.registered_file records {} of the {} files of this registration, \
+             in {} row(s), which its one transaction cannot leave",
+            self.files, self.of, self.rows
+        )
+    }
 }
 
 /// What `qiita_lake.registered_file` records of `placed`. Why a replay asks this
@@ -907,7 +946,11 @@ fn ledgered(conn: &duckdb::Connection, placed: &[PlacedFile]) -> Result<Ledgered
     } else if rows == placed.len() && files == placed.len() {
         Ledgered::All
     } else {
-        Ledgered::Inconsistent { files, rows }
+        Ledgered::Inconsistent(Inconsistency {
+            files,
+            rows,
+            of: placed.len(),
+        })
     })
 }
 
