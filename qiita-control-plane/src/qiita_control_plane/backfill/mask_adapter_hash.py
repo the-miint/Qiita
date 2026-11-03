@@ -246,8 +246,8 @@ async def apply_rekey(pool: asyncpg.Pool, plan: RekeyPlan) -> int:
     is written until they are resolved.
 
     Each row is written in its own transaction with the row locked, so the mint's
-    own in-place re-key cannot land between the plan's read and this write. A row
-    whose params_hash has moved since the plan read it is skipped — the mint
+    own in-place re-key cannot land between this check and the write. A row whose
+    params_hash has moved since the plan read it is skipped — the mint
     re-keyed it first, so the plan's rewritten params describe a stale blob. A row
     gone since the plan raises: nothing deletes a `mask_definition` row, so its
     absence is an out-of-band edit the operator has to look at. Rows written before

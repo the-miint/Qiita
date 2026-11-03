@@ -2524,3 +2524,24 @@ def test_export_stem_ignores_an_ena_run_accession():
         "ena_run_accession": "ERR1234567",
     }
     assert _export_stem(sample, 5, 7) == "SAMN_A.5.7.42"
+
+
+def test_backfill_mask_adapter_hash_execute_reports_skipped_rows(monkeypatch, capsys):
+    """`--execute` reports the rows apply skipped, as planned minus written."""
+    from qiita_control_plane.backfill.mask_adapter_hash import RekeyPlan, RekeyRow
+    from qiita_control_plane.cli import admin as cli
+
+    rows = [RekeyRow(i, b"\x00" * 32, {}, b"\x01" * 32) for i in (7, 8)]
+    plan = RekeyPlan(reference_idx=5, current_hash="h", convertible=rows)
+
+    async def _fake(database_url, *, report, execute, **_):
+        report(plan)
+        assert execute
+        return plan, 1
+
+    monkeypatch.setenv("DATABASE_URL", "postgresql://unused")
+    monkeypatch.setattr(cli, "_backfill_mask_adapter_hash", _fake)
+    rc = cli.main(["backfill", "mask-adapter-hash", "--reference-idx", "5", "--execute"])
+
+    assert rc == 0
+    assert "wrote 1 mask_definition row(s); skipped 1 re-keyed since" in capsys.readouterr().out
