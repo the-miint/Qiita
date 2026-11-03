@@ -50,6 +50,10 @@ async def client(postgres_pool, human_admin_session):
 
     app.state.pool = postgres_pool
     _install_settings(app)
+    # No orchestrator: the route skips the on-disk artifact purge, so these tests
+    # cover the Postgres teardown without a backend client.
+    saved_compute_backend_client = getattr(app.state, "compute_backend_client", None)
+    app.state.compute_backend_client = None
     created_refs: list[int] = []
 
     async with AsyncClient(
@@ -60,6 +64,7 @@ async def client(postgres_pool, human_admin_session):
         ac._created_refs = created_refs
         yield ac
 
+    app.state.compute_backend_client = saved_compute_backend_client
     if created_refs:
         for table in ("reference_index", "reference_membership", "work_ticket"):
             await postgres_pool.execute(
