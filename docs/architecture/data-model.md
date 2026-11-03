@@ -99,18 +99,96 @@ A study-local field's global link may be **added** (a local→global upgrade pro
 
 A purely-local field's `data_type` may be **widened to `text`**, and to nothing else: `qiita.widen_study_field_to_text` redeclares the field and moves every value stored through it into `value_text` in one transaction, so no value is left in a column the declaration no longer names. Narrowing is not expressible, a globally-linked field's type is the registry's rather than the study's, and `terminology` has no text form. Both the widen and a `unique_in_study` tightening lock the metadata table against concurrent writers for the caller's transaction, and refuse to run at all without a bounded `lock_timeout`; relaxing `unique_in_study` takes no lock, though no API path relaxes it -- the policy is declared through the REST interface and never withdrawn through it.
 
-### Metadata visibility tiers (not yet enforced)
+### Metadata visibility tiers
 
-The schema models per-field and per-value access tiers, but no code reads or enforces them yet. Every metadata read and write today ignores these columns entirely; visibility is instead controlled coarsely, at the route's `require_study_access` tier gate. Building the enforcement described here is outstanding work.
+This section defines the rule. It supersedes the comment on the `qiita.tier`
+type in the applied migration `20260501000006_study.sql`, which names only
+system admins as reading every value, as the study-record rule below does.
+Reads of biosample and prep_sample metadata enforce it through
+`qiita.biosample_metadata_visibility` / `qiita.prep_sample_metadata_visibility`,
+which take the caller's tiers from `auth.guards.caller_metadata_tiers`.
 
-Two mechanisms compose to set the tier a caller must hold — on the study, via their `study_access` row — to read *or* write a given metadata field or value:
+A caller may read a metadata value when their tier on **the value's study**
+reaches **the value's required tier**.
 
-- **Field-level tier** — the minimum tier for every value of one field within a study. For a globally-linked field this is `*_global_field.default_tier` (NOT NULL, defaults to `public`); for a purely study-local field it is `*_study_field.tier_override` (nullable; NULL means no field-level restriction). A linked `*_study_field` row leaves `tier_override` NULL and inherits the global field's `default_tier`.
-- **Value-level exception** — a row in `*_field_exception` narrows one individual `(biosample, field)` value below its field-level tier, carrying a NOT NULL `tier_override`. It is keyed on `global_field_idx` (so a globally-linked value's exception follows it across studies) or on `*_study_field_idx` (for a purely-local value). The motivating case is a field that is broadly visible in general but where one biosample's value must be restricted — e.g. a free-text field into which one submitter incautiously entered PII.
+**The value's required tier** is the most restrictive of what applies to it:
 
-When enforcement is built, the effective required tier for a field or value is the most restrictive that applies (field-level tier, further tightened by any matching value-level exception). A caller whose study-access tier is below that threshold must not see the value on any read path, and must be refused when attempting to write it. This applies uniformly to reads and writes and to both globally-linked and study-local metadata.
+- **Field tier** (`qiita.metadata_field_tier`) — for a globally-linked field,
+  `*_global_field.default_tier`; for a purely study-local field, its
+  `*_study_field.tier_override`, or the study's `default_tier` when that is
+  NULL. A linked study-local row always leaves `tier_override` NULL, so the
+  global field's tier is the one that applies.
+- **Value-level exception** — a `*_field_exception` row increases the required
+  tier of one `(entity, field)` value, for a field that is broadly visible
+  where one entity's value must not be, e.g. a free-text field into which one
+  submitter entered PII. The required tier is the greater of the field tier and
+  the exception's `tier_override`, so an exception only ever restricts. It is
+  keyed on `global_field_idx` for a globally-linked value, so it follows the
+  value into every study, or on `*_study_field_idx` for a purely-local one. A
+  value matches an exception keyed on its global field or on the study-local
+  field that it was written through, so one keyed on the local field still applies
+  after that field is linked; one keyed on another study's alias of the same
+  global field does not. `qiita.metadata_required_tier` combines these two.
+- **Owner-biosample-id floor** — an owner-biosample-id value requires at least
+  `member` (`repositories.biosample.OWNER_BIOSAMPLE_ID_TIER_OVERRIDE`), whatever
+  its field's tier, so a study that declared the field lower before its first
+  import does not expose the owner's names.
 
-This is the mechanism that will ultimately decide who can see or change the owner-biosample-id (a study-local field pinned to `member` tier) and any other tier-restricted field or value — replacing today's coarse interim rule, which clamps to admin-tier callers every study-scoped route that reads or writes sample-family metadata, or that mints a study-local field. The idx-listing reads stay at viewer tier: they expose no metadata. Field creation sits under the clamp only for want of the finer gate — when enforcement lands it returns to member tier, since minting a study-local field is work a study member is meant to do.
+**The value's study** is the study of the study-local field that the value was
+written through. For a globally-linked value, that is the study that wrote it
+first: the entity has one value per global field, and no other study can
+overwrite it. A caller reading an entity through study B therefore sees a
+global value that study A wrote only if their tier on A reaches it.
+
+**The caller's tier on a study** is `admin` for the study's owner, otherwise
+their `qiita.study_access` row, otherwise `public`. A wet_lab_admin or
+system_admin reads at `admin` on every study (`auth.guards.METADATA_BYPASS_ROLE`);
+an anonymous caller reads at `public` everywhere. Owning a biosample confers no
+tier: it admits the owner to `GET /biosample/{idx}`, but they read a value at
+`public` unless they own, or hold a grant on, the study that wrote it.
+
+**A hidden value is absent**, not marked: a read omits its key, and anything
+that counts values counts only the visible ones. A lookup by a unique-in-study
+value hidden from the caller answers as one matching nothing does, so it cannot
+confirm the value. The owner-biosample-id is the standing example: a
+viewer of the study does not see it.
+
+**Timestamps describe the response.** A read's `last_metadata_change_at` is the
+latest change among the values it returns
+(`_sample_helpers.fetch_visible_metadata_last_change`), not the entity's own
+column, which moves on every write. The record's `updated_at` moves only with
+the record's own columns, and the read's ETag is the later of the two
+(`routes._helpers.representation_etag`). So no timestamp a caller reads shows
+that a hidden value exists or when it changed.
+
+Both `last_metadata_change_at` and the ETag are computed from the timestamps of
+the values a response returns, so they do not always move when the response
+changes:
+
+- A change that writes no value, such as a field's tier, an exception or a
+  grant, can change which values a read returns. It moves them only if it
+  hides or reveals the most recently changed value.
+- A value written by a transaction that started before the latest value's
+  transaction carries the earlier time, even if it commits later, since
+  `now()` is when a transaction started. So it may not move them either.
+
+`PATCH /biosample/{idx}` and `PATCH /sequenced-sample/{idx}` check If-Match
+against the ETag of the GET on the same path. A study-scoped read's ETag also
+covers that study's local values, so it is not the If-Match for those PATCHes.
+
+Every caller-facing metadata read selects from
+`_sample_helpers.visible_metadata_source` and filters on its `visible` column.
+Its value columns are also NULL on a hidden row, for a read that must return
+every row. The study-scoped biosample and sequenced_sample reads admit any
+caller with `viewer` tier or above on the study; the rule decides which values
+they carry. Readers that serve operators
+rather than callers — the host-filter resolver, the host-taxon backfill, and
+the system_admin owner-biosample-id export — read the tables directly.
+
+**Writes are checked separately.** Every study-scoped route that writes
+biosample or prep_sample metadata, or mints a study-local field, requires
+`admin` on the study, or a wet_lab_admin+ role, so only a caller who can read
+every value there can write.
 
 ### What a tier reads of a study's own record
 

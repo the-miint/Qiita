@@ -14,14 +14,14 @@ caller-creator semantics on the path's `sequenced_pool` (via
 listed in the body (via `require_caller_has_admin_on_all_studies`), both with
 a wet_lab_admin+ bypass. The run-scoped and single-resource reads gate on
 Scope.PREP_SAMPLE_READ + wet_lab_admin role unconditionally; the study-scoped
-reads gate on study existence plus a study-access tier — viewer for the roster
-read, an interim ADMIN clamp for the single read — with wet_lab_admin and
-system_admin bypassing, mirroring the biosample reads. All handlers delegate
+reads require the study to exist and viewer access to it, or the wet_lab_admin
+or system_admin role, as the biosample reads do. All handlers delegate
 their DB work to the sibling repository modules.
 """
 
 import logging
 import sqlite3
+from datetime import datetime
 from typing import Annotated
 
 import asyncpg
@@ -62,6 +62,8 @@ from qiita_common.models import (
 )
 
 from ..auth.guards import (
+    METADATA_BYPASS_ROLE,
+    caller_metadata_tiers,
     require_caller_has_admin_on_all_studies,
     require_caller_owns_pool,
     require_complete_profile,
@@ -87,7 +89,10 @@ from ..preflight import (
     open_blob,
     pacbio_protocol_by_sample_idx,
 )
-from ..repositories._sample_helpers import fetch_global_metadata
+from ..repositories._sample_helpers import (
+    fetch_global_metadata,
+    fetch_visible_metadata_last_change,
+)
 from ..repositories.prep_sample_metadata import PREP_SAMPLE_METADATA_SPEC
 from ..repositories.sequence_range import fetch_sequence_range_by_prep_sample_idx
 from ..repositories.sequenced_sample import (
@@ -114,12 +119,12 @@ from ._helpers import (
     build_idxs_list_response,
     cap_rows,
     detail_for_biosample_link_rejection,
-    etag_for_updated_at,
     metadata_entries_from_rows,
     parse_kv_detail,
     raise_http_for_sample_metadata_write_error,
     raise_transient_retry,
     read_study_scoped_entity,
+    representation_etag,
     resolve_and_write_study_scoped_metadata,
     resolve_metadata_checklist_idx,
 )
@@ -680,13 +685,16 @@ async def list_sequenced_pools_in_study(
     )
 
 
-def _sequenced_sample_core_row_dict(row: asyncpg.Record) -> dict[str, object]:
+def _sequenced_sample_core_row_dict(
+    row: asyncpg.Record, *, metadata_last_change: datetime | None
+) -> dict[str, object]:
     """Map a JOIN(sequenced_sample, prep_sample) row's columns to
     SequencedSampleResponse field names.
 
     Centralises the column -> field mapping (ss.idx -> sequenced_sample_idx,
-    GREATEST(...) -> effective_updated_at). Excludes the metadata dicts and
-    caller_system_role. Runs no DB queries.
+    GREATEST(...) -> effective_updated_at). last_metadata_change_at is
+    `metadata_last_change`, as on the biosample reads. Excludes the metadata
+    dicts and caller_system_role. Runs no DB queries.
     """
     return {
         "sequenced_sample_idx": row["idx"],
@@ -707,7 +715,7 @@ def _sequenced_sample_core_row_dict(row: asyncpg.Record) -> dict[str, object]:
         "biological_read_count_r1r2": row["biological_read_count_r1r2"],
         "quality_filtered_read_count_r1r2": row["quality_filtered_read_count_r1r2"],
         "spikein_read_count_r1r2": row["spikein_read_count_r1r2"],
-        "last_metadata_change_at": row["last_metadata_change_at"],
+        "last_metadata_change_at": metadata_last_change,
         "created_by_idx": row["created_by_idx"],
         "created_at": row["created_at"],
         "effective_updated_at": row["effective_updated_at"],
@@ -723,6 +731,7 @@ def _sequenced_sample_response_from_row(
     *,
     global_metadata: dict[str, MetadataEntry],
     caller_system_role: SystemRole,
+    metadata_last_change: datetime | None,
 ) -> SequencedSampleResponse:
     """Shape a JOIN(sequenced_sample, prep_sample) row + decoded global
     metadata into SequencedSampleResponse.
@@ -730,7 +739,7 @@ def _sequenced_sample_response_from_row(
     Reuses the shared core-column mapping; the global_metadata dict is supplied
     by the caller — this helper runs no DB queries.
     """
-    payload = _sequenced_sample_core_row_dict(row) | {
+    payload = _sequenced_sample_core_row_dict(row, metadata_last_change=metadata_last_change) | {
         "global_metadata": global_metadata,
         "caller_system_role": caller_system_role,
     }
@@ -743,6 +752,7 @@ def _study_scoped_sequenced_sample_response_from_row(
     global_metadata: dict[str, MetadataEntry],
     local_metadata: dict[str, MetadataEntry],
     caller_system_role: SystemRole,
+    metadata_last_change: datetime | None,
 ) -> StudyScopedSequencedSampleResponse:
     """Shape a JOIN(sequenced_sample, prep_sample) row + its global and
     study-local prep_sample metadata into StudyScopedSequencedSampleResponse.
@@ -751,7 +761,7 @@ def _study_scoped_sequenced_sample_response_from_row(
     metadata (keyed by display_name) alongside the global map. Both metadata
     dicts are supplied by the caller — this helper runs no DB queries.
     """
-    payload = _sequenced_sample_core_row_dict(row) | {
+    payload = _sequenced_sample_core_row_dict(row, metadata_last_change=metadata_last_change) | {
         "global_metadata": global_metadata,
         "local_metadata": local_metadata,
         "caller_system_role": caller_system_role,
@@ -769,19 +779,21 @@ async def get_sequenced_sample_in_study(
     _scope: Principal = Depends(require_scope(Scope.PREP_SAMPLE_READ)),
     _exists: None = Depends(require_study_exists),
     _access: None = Depends(
-        require_study_access(min_tier=Tier.ADMIN, bypass_role=SystemRole.WET_LAB_ADMIN)
+        require_study_access(min_tier=Tier.VIEWER, bypass_role=METADATA_BYPASS_ROLE)
     ),
 ) -> StudyScopedSequencedSampleResponse:
     """Return one study's view of a sequenced_sample: the joined
     sequenced_sample + supertype prep_sample row, its globally-linked
     prep_sample metadata, and this study's purely-local prep_sample metadata.
 
-    Access policy is interim: gated at Tier.ADMIN study access with a
-    wet_lab_admin+ role bypass -- a coarse stand-in until per-field
-    visibility-tier enforcement lands, at which point this relaxes. 401 on
-    Anonymous, 403 on missing scope or sub-ADMIN tier, 404 on a study that does
-    not exist. require_study_exists composes alongside require_study_access so
-    an admin-bypass caller still gets 404 on a non-existent study.
+    Requires Tier.VIEWER on the study, or a wet_lab_admin+ role. 401 on
+    Anonymous, 403 on missing scope or on a caller who neither owns the study
+    nor holds a grant on it, 404 on a study that does not exist.
+    require_study_exists composes alongside require_study_access so a bypass
+    caller still gets 404 on a non-existent study.
+
+    Which values the metadata maps carry is defined in
+    docs/architecture/data-model.md, "Metadata visibility tiers".
 
     The prep_sample must be linked to this study: a sequenced_sample whose
     supertype prep_sample has no non-retired prep_sample_to_study link to
@@ -790,15 +802,19 @@ async def get_sequenced_sample_in_study(
     sequenced_sample is likewise 404, checked only after the link passes
     (mirroring the sequenced-sample-level read's retired carve-out).
 
-    The response carries an `ETag` header derived from `effective_updated_at`
-    (GREATEST of the prep_sample and sequenced_sample timestamps); the value is
-    a quoted ISO 8601 timestamp and is opaque by contract.
+    last_metadata_change_at and the `ETag` header (`representation_etag` over
+    `effective_updated_at`, the GREATEST of the prep_sample and
+    sequenced_sample timestamps) come from the values this response carries,
+    local ones included, so this is not the ETag to send as If-Match to
+    PATCH /sequenced-sample/{sequenced_sample_idx}. The ETag is a quoted ISO
+    8601 timestamp and is opaque by contract.
     """
     # One REPEATABLE READ snapshot so the row read, the link check, and both
     # metadata reads cannot disagree about a concurrent writer's commit. The
     # shared helper fetches the joined row and keys the link + metadata on the
     # supertype prep_sample_idx (nonexistent and unlinked share one 404).
     async with snapshot() as conn:
+        tiers = await caller_metadata_tiers(conn, user)
         row, global_metadata, local_metadata = await read_study_scoped_entity(
             conn,
             spec=PREP_SAMPLE_METADATA_SPEC,
@@ -807,16 +823,27 @@ async def get_sequenced_sample_in_study(
             metadata_idx_column="prep_sample_idx",
             study_idx=study_idx,
             noun="sequenced_sample",
+            tiers=tiers,
+        )
+        metadata_last_change = await fetch_visible_metadata_last_change(
+            conn,
+            spec=PREP_SAMPLE_METADATA_SPEC,
+            entity_idx=row["prep_sample_idx"],
+            tiers=tiers,
+            study_idx=study_idx,
         )
 
-    # ETag from the GREATEST-of-both timestamp; opaque-by-contract to clients.
-    response.headers[ETAG_HEADER] = etag_for_updated_at(row["effective_updated_at"])
+    # Opaque by contract to clients.
+    response.headers[ETAG_HEADER] = representation_etag(
+        row["effective_updated_at"], metadata_last_change
+    )
 
     return _study_scoped_sequenced_sample_response_from_row(
         row,
         global_metadata=global_metadata,
         local_metadata=local_metadata,
         caller_system_role=user.system_role,
+        metadata_last_change=metadata_last_change,
     )
 
 
@@ -836,9 +863,9 @@ async def patch_sequenced_sample_metadata(
     """Upsert this study's metadata values on a sequenced_sample's supertype
     prep_sample.
 
-    Access policy is interim: gated at Tier.ADMIN study access with a
-    wet_lab_admin+ role bypass -- a coarse stand-in until per-field
-    visibility-tier enforcement lands. 401 on Anonymous, 403 on missing scope,
+    Access policy is interim: this route requires Tier.ADMIN on the study, or a
+    wet_lab_admin+ role, until metadata writes apply the visibility rule. 401 on
+    Anonymous, 403 on missing scope,
     an incomplete profile, or sub-ADMIN tier, 404 on a study that does not
     exist. require_study_exists composes alongside require_study_access so an
     admin-bypass caller still gets 404 on a non-existent study.
@@ -905,10 +932,12 @@ async def get_sequenced_sample(
     GET surface — a future change will let wet_lab_admin+ retrieve
     retired rows so the audit-trail surface is reachable from the API).
 
-    The response carries an `ETag` header derived from
+    last_metadata_change_at and the `ETag` header (`representation_etag` over
     `effective_updated_at = GREATEST(prep_sample.updated_at,
-    sequenced_sample.updated_at)`. The format is a quoted ISO 8601
-    timestamp; clients must treat it as opaque.
+    sequenced_sample.updated_at)`) come from the values this response carries;
+    PATCH /sequenced-sample/{sequenced_sample_idx} checks If-Match against this
+    ETag. The ETag is a quoted ISO 8601 timestamp; clients must treat it as
+    opaque.
     """
     # All reads share one REPEATABLE READ snapshot so the supertype-join
     # row and the prep_sample metadata read cannot disagree about a
@@ -935,19 +964,26 @@ async def get_sequenced_sample(
         # Pull globally-linked metadata for the supertype prep_sample; the
         # repo function handles the global_field_idx IS NOT NULL filter and
         # the data_type-driven value-column dispatch.
+        tiers = await caller_metadata_tiers(conn, user)
         metadata_rows = await fetch_global_metadata(
-            conn, spec=PREP_SAMPLE_METADATA_SPEC, entity_idx=row["prep_sample_idx"]
+            conn, spec=PREP_SAMPLE_METADATA_SPEC, entity_idx=row["prep_sample_idx"], tiers=tiers
+        )
+        metadata_last_change = await fetch_visible_metadata_last_change(
+            conn, spec=PREP_SAMPLE_METADATA_SPEC, entity_idx=row["prep_sample_idx"], tiers=tiers
         )
 
     global_metadata = metadata_entries_from_rows(metadata_rows)
 
-    # ETag from the GREATEST-of-both timestamp; opaque-by-contract to clients.
-    response.headers[ETAG_HEADER] = etag_for_updated_at(row["effective_updated_at"])
+    # Opaque by contract to clients.
+    response.headers[ETAG_HEADER] = representation_etag(
+        row["effective_updated_at"], metadata_last_change
+    )
 
     return _sequenced_sample_response_from_row(
         row,
         global_metadata=global_metadata,
         caller_system_role=user.system_role,
+        metadata_last_change=metadata_last_change,
     )
 
 
@@ -987,10 +1023,9 @@ async def patch_sequenced_sample(
     post-commit `effective_updated_at` and 412s on its now-stale
     If-Match header. ENA-accession uniqueness violations map to 409.
 
-    The response carries an `ETag` header derived from the post-update
-    `effective_updated_at` = GREATEST(prep_sample.updated_at,
-    sequenced_sample.updated_at); format mirrors the GET endpoint's
-    contract and is opaque to clients. The schema trigger
+    If-Match must equal the ETag of GET /sequenced-sample/{idx}
+    (`representation_etag`), and the response's `ETag` is what that GET now
+    returns; it is opaque to clients. The schema trigger
     sequenced_sample_clear_submission_error_on_new_attempt nulls
     submission_error when last_submission_at changes unless the same
     UPDATE explicitly sets submission_error; callers recording a failed
@@ -1045,7 +1080,13 @@ async def patch_sequenced_sample(
                     status_code=409,
                     detail=f"sequenced_sample {sequenced_sample_idx} is retired",
                 )
-            if if_match != etag_for_updated_at(row["effective_updated_at"]):
+            # If-Match carries the ETag of GET /sequenced-sample/{idx}, which
+            # also covers that GET's global metadata.
+            tiers = await caller_metadata_tiers(conn, caller)
+            pre_change = await fetch_visible_metadata_last_change(
+                conn, spec=PREP_SAMPLE_METADATA_SPEC, entity_idx=row["prep_sample_idx"], tiers=tiers
+            )
+            if if_match != representation_etag(row["effective_updated_at"], pre_change):
                 raise HTTPException(status_code=412, detail="If-Match did not match")
             if (
                 sequencing_run_idx is not None
@@ -1070,10 +1111,21 @@ async def patch_sequenced_sample(
                     detail=f"sequenced_sample {sequenced_sample_idx} not found",
                 )
 
-            # Re-read global metadata in the same transaction so the
-            # response and the UPDATE see one consistent snapshot.
+            # Re-read global metadata under the prep_sample row lock; a
+            # metadata write waits on it
+            # (qiita.prep_sample_metadata_touch_prep_sample), so none lands
+            # between the UPDATE and these two reads.
             metadata_rows = await fetch_global_metadata(
-                conn, spec=PREP_SAMPLE_METADATA_SPEC, entity_idx=updated_row["prep_sample_idx"]
+                conn,
+                spec=PREP_SAMPLE_METADATA_SPEC,
+                entity_idx=updated_row["prep_sample_idx"],
+                tiers=tiers,
+            )
+            metadata_last_change = await fetch_visible_metadata_last_change(
+                conn,
+                spec=PREP_SAMPLE_METADATA_SPEC,
+                entity_idx=updated_row["prep_sample_idx"],
+                tiers=tiers,
             )
         except asyncpg.UniqueViolationError as exc:
             detail = _SEQUENCED_SAMPLE_PATCH_UNIQUE_MESSAGES.get(
@@ -1081,8 +1133,10 @@ async def patch_sequenced_sample(
             )
             raise HTTPException(status_code=409, detail=detail)
 
-    # Set the new ETag from the updated row's bumped effective_updated_at.
-    response.headers[ETAG_HEADER] = etag_for_updated_at(updated_row["effective_updated_at"])
+    # The new ETag, over the updated row and the metadata just re-read.
+    response.headers[ETAG_HEADER] = representation_etag(
+        updated_row["effective_updated_at"], metadata_last_change
+    )
 
     # Reuse the GET route's row -> response shaper so PATCH and GET share
     # one source of truth for the response shape.
@@ -1091,4 +1145,5 @@ async def patch_sequenced_sample(
         updated_row,
         global_metadata=global_metadata,
         caller_system_role=caller.system_role,
+        metadata_last_change=metadata_last_change,
     )

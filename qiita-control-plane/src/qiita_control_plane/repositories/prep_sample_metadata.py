@@ -40,4 +40,6 @@ PREP_SAMPLE_METADATA_SPEC = EntityMetadataSpec(
     link_entity_key_column="prep_sample_idx",
     metadata_retired_link_trigger="prep_sample_metadata_reject_if_link_retired",
     metadata_field_contract_trigger="prep_sample_metadata_apply_field_contract",
+    visibility_function="qiita.prep_sample_metadata_visibility",
+    field_exception_table="qiita.prep_sample_field_exception",
 )

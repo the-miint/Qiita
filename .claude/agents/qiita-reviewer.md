@@ -105,6 +105,8 @@ Only rules whose trigger appears in the diff can fire.
 | A guard, fallback or presence-probe for a state that may be unreachable, including a missing miint function in a request or job path | R4 |
 | A fix that cleans up bad state after it lands; a dedup, cleanup or GC pass | R4, R9 |
 | A write decided by a row being absent that another path inserts; a query that takes a past ticket's or record's outcome as proof | R4, R9 |
+| A path that either creates an object or reuses an existing one (get-or-create, resolve-or-create, `INSERT … ON CONFLICT` followed by a read) | R4 |
+| A read that hides rows or values by the caller's permission; a timestamp, count, ETag or error detail returned beside them | R4 |
 | A Pydantic `Field(...)` constraint or a validation regex | R5 |
 | Several values stored in one column with a non-empty separator; a hash, UUID or id cast to text | R5 |
 | A filename, digest, or identity input built from an absolute path or another host-specific value | R5 |
@@ -125,6 +127,7 @@ Only rules whose trigger appears in the diff can fire.
 | A CLI command's error handling or exit path | R9 |
 | A delete of a row in a table the sweep owns, under `tests/**` or `src/**/testing/**` | R9 |
 | Any new or changed doc, runbook, docstring or comment | R2 |
+| Prose about a domain object whose name is also a programming term (`*_field_exception`, a work ticket) | R11 |
 | A user-facing string: a runbook, a workflow `description:`, argparse `help=`, an HTTPException `detail`, a failure reason, or a test assertion on one; a `generated_by` value | R11, R2 |
 | A new file, moved code, a helper in a feature-specific module, feature- or platform-specific naming, a one-shot script | R10 |
 | A private (`_`-prefixed) name imported into, or listed in `__all__` of, a package `__init__.py` | R10 |
@@ -166,7 +169,19 @@ Flag in new code:
 Flag:
 - **Development-process narration:** phase or milestone labels, test counts, status language ("ready to merge"), "this ticket", "a follow-up".
 - **Forward-looking or historical narration:** what a future migration will do, what the code used to do, what an earlier draft called something. Git carries history.
-- **A docstring that enumerates current consumers** or explains a general capability through one caller. Describe what the thing is and does.
+- **A docstring that enumerates current consumers** or explains a general capability through one caller, or that describes what another layer does with its result (a repository function narrating its route, a helper naming the reads that call it). Describe what the thing is and does.
+- **Prose a reader cannot parse on first read:**
+  - an object relative clause without "that" ("the row the trigger updates");
+  - a noun pressed into service as a verb ("floors the value at member");
+  - a compressed contrast or aphorism in place of a plain statement ("a pointer, not a copy").
+
+  Write the plain sentence a reader new to the code follows the first time.
+- **Prose that says something other than what it means:**
+  - a counterfactual written as current behavior. A sentence about what would happen under another design reads as what the code does now. Mark it as a hypothetical ("if the route admitted callers by role alone, they would…"), or state what the code does and why;
+  - an action where a capability is meant ("a caller who reads every value" for "a caller who can read every value").
+- **A docstring that restates its own name or signature** ("returns the count, or None if there is no count"). Say what is counted and when it returns None.
+- **A comment that rules out what the code is unable to do, or names a case that the code does not treat differently**: a GET handler that "does not write" a field, a sentence about one entity kind in a function with no branch for it. Delete it. A comment explaining a design choice (the code could do X and does not, because of Y) is not this; the counterfactual bullet above covers its wording.
+- **British spelling in words that the diff adds** ("honour", "behaviour", "recognise"). New prose uses American spelling. Existing text, an existing word on a line edited for another reason, code identifiers and quoted upstream text are not findings.
 - **A comment that contradicts the code beside it**, or argues against the line it sits on. Includes stale env-var names and version-tagged upstream paths.
 - **The docstring a PR's own change falsifies.** Read the module docstring and comments of every changed file, not only the hunks.
 - **A doc, runbook or checklist asserting a step, check, table or capability that does not exist**, or denying one that does. Verify against the migrations, the code or the tool.
@@ -178,7 +193,7 @@ Flag:
 - **A removed audience statement**, and a new runbook that does not say who it is for and whether it applies to everyone.
 - **A definition that would be equally true of the parent object**, an unqualified generalization that holds for only some kinds, a dangling pronoun, troubleshooting placed away from the step that fails.
 - **Comments naming a test file, a migration filename, an upstream source symbol, a distant module's internals, or an issue number of this repo.** State the invariant in words. A pointer to the one module or doc that holds a rationale is fine (`CLAUDE.md`, "State a rationale once"); so is a qualified external issue (`duckdb-miint#173`).
-- **One rationale stated at several sites**, or a comment restating `CLAUDE.md`. One home; the rest point at it.
+- **One rationale stated at several sites**, one piece of usage guidance repeated across a docstring, a migration comment and a doc, or a comment restating `CLAUDE.md`. One home; the rest point at it.
 - **A `TODO` in a shipped doc** [soft]: ask whether an issue tracks it.
 - **A runbook that is mostly commands:** propose a script under `scripts/` with the doc explaining why and when.
 
@@ -197,6 +212,8 @@ Safety must not rest on convention or a comment; and a guard must be real, so do
 - **Fail-closed allowlist, not fail-open denylist.** A guard that rejects known-bad values lets every future value through. Invert it and pin the rejection with a test.
 - **Co-locate a dynamic-SQL allowlist with the construction site**: an assert directly above the f-string, not a validator elsewhere. When a PR makes a SQL-building helper public or adds a build site, ask whether inputs can reach the SQL text at that site [soft].
 - **Enforce assumptions.** A migration that assumes "no rows reference this" raises if rows exist; a seed that must match N rows asserts it; an invariant enforced only in the CLI while the server accepts anything is not enforced.
+- **A property set when an object is created is checked when an existing one is reused.** A get-or-create or resolve-or-create path that sets a property (a visibility tier, a flag) only on its create branch checks that property on its reuse branch, and raises rather than reusing an object that lacks it. The test creates the object without the property first, so the call goes through the reuse branch.
+- **A value derived from rows that a caller cannot see is hidden from that caller too.** On a read that hides rows or values by permission, a timestamp, count, ETag or error detail computed over every row tells the caller that hidden rows exist and when they changed. Compute it over the rows that the caller can see, or ask whether the exposure is accepted. The test writes a hidden value and asserts that the caller's response does not change.
 - **A check must fail loud.** A check that swallows the error, a `skipif` on the assertion the test exists for [soft], and an empty or no-op result read as success are fail-open. An empty result is a trap only if something keys on it: a status flips, an identity is minted, a gate opens. If nothing does, zero rows is a legitimate answer.
 - **Discriminate on the trusted source, and validate before the expensive or irreversible step.**
 - **Proof from history is the newest record's, not any record's.** A query that opens a gate or writes a state because some past ticket ended a certain way must say whether a newer one supersedes it. A later attempt that failed, was cancelled or is still running usually does.
@@ -288,6 +305,7 @@ When two similar code paths solve the same problem differently, factor out the s
 
 - **Never a bare "sample" where it reaches a human**: docs, `--help`, error bodies, failure reasons, test assertions, comments. `biosample` and `prep_sample` are different objects. Carve-out: control-plane code that handles both identically may say "sample". When this fires, sweep every prose surface the PR touches; cited sites are examples.
 - **Established field terms keep their field meaning.** A new behaviour gets its own name instead of borrowing one that means something else.
+- **A verb that collides with a programming term in the same sentence.** When a domain noun is also a programming word (a `*_field_exception` row, a work ticket), do not pair it with that word's programming verb: an exception that "raises" a tier reads as error handling, so say it "increases" the tier.
 - **Insider nouns in user-facing prose** are replaced with what the reader would call the thing.
 - **A provenance string in an exported artifact** (`generated_by`) names the product `qiita-miint`. [soft]
 
