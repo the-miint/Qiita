@@ -212,7 +212,7 @@ def _fasta_upload_stream(fasta_path: Path) -> Iterator[UploadStream]:
     the shared `is_empty_sequence_file` (matching `stage_local_fasta`)."""
     from qiita_common.duckdb_miint import is_empty_sequence_file
 
-    from qiita_control_plane.miint import connect_with_miint
+    from qiita_control_plane.miint import arrow_batches, connect_with_miint
 
     if is_empty_sequence_file(fasta_path):
         raise ValueError(f"FASTA file contains no records: {fasta_path}")
@@ -227,18 +227,20 @@ def _fasta_upload_stream(fasta_path: Path) -> Iterator[UploadStream]:
             f"{_READ_FASTX_MAX_BATCH_BYTES}') "
             f"WHERE {soft_masked_expr('sequence1')} LIMIT 1",
             [str(fasta_path)],
-        ).fetchone():
+        ).fetchall():
             _log.warning(SOFT_MASK_WARNING, fasta_path)
         # miint's native `sequence_split` is the shared chunker (one definition
         # for both the CLI and the orchestrator's stage_local_fasta; see
         # qiita_common.chunking).
-        reader = conn.execute(
+        reader = arrow_batches(
+            conn,
             "SELECT read_id, c.chunk_index, c.chunk_data FROM ("
             f"  SELECT read_id, UNNEST({sequence_split_expr('sequence1')}) AS c"
             f"  FROM read_fastx(?, max_batch_bytes:='{_READ_FASTX_MAX_BATCH_BYTES}')"
             ")",
             [str(fasta_path)],
-        ).to_arrow_reader(_CHUNK_ROWS_PER_BATCH)
+            _CHUNK_ROWS_PER_BATCH,
+        )
         yield UploadStream(schema=reader.schema, batches=reader)
     finally:
         conn.close()

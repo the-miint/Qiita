@@ -163,8 +163,8 @@ fn send_query_batches(
         .map_err(|e| Status::internal(format!("query execution failed for {table}: {e}")))?
         .get_schema();
     let mut produced = false;
-    // Fetch with the fallible `step`, not the `ArrowStream` iterator, which
-    // panics on a failed fetch: a DuckDB error is an outcome to report, not a bug.
+    // Fetch with the fallible `step`: a DuckDB error is an outcome to report to the
+    // client, not a bug.
     while let Some(chunk) = stmt.step().map_err(|e| {
         let when = if produced {
             "mid-stream"

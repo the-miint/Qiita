@@ -222,10 +222,12 @@ def register_contig_attribute_table(conn: Any, path: Path) -> None:
         f" delim='\t', header=true, columns={{{types}}})",
         [str(path)],
     )
-    (repeated,) = conn.execute(
+    # `fetchall`, not `fetchone`: a part-read result would refuse the caller's next
+    # relational call on `conn` (see `qiita_common.duckdb_relation`).
+    [(repeated,)] = conn.execute(
         "SELECT count(*) FROM (SELECT contig_id FROM contig_attribute"
         " GROUP BY contig_id HAVING count(*) > 1)"
-    ).fetchone()
+    ).fetchall()
     if repeated:
         raise ValueError(
             f"{path} repeats {repeated} contig_id(s); the attribute join would "

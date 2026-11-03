@@ -5,7 +5,8 @@
 //! holds an independent DuckDB+DuckLake connection.
 //!
 //! ATTACH syntax: `ducklake:postgres:<libpq connection string>`
-//! with DATA_PATH as a separate option specifying Parquet storage location.
+//! with DATA_PATH as a separate option specifying Parquet storage location,
+//! and DUCKLAKE_VERSION naming the catalog format (`DUCKLAKE_CATALOG_VERSION`).
 //! Requires both `ducklake` and `postgres` extensions.
 //!
 //! DuckLake does not support UNIQUE or FK constraints, so data integrity
@@ -24,7 +25,7 @@ use duckdb::Connection;
 /// before interpolation. This is input validation, not sanitization.
 ///
 /// These three are sufficient for that one job: without a quote or a semicolon a
-/// value cannot close the literal and start a statement. Probed on DuckDB 1.5.5 —
+/// value cannot close the literal and start a statement. Probed on DuckDB 2.0.0 —
 /// a value ending in a backslash is taken literally, so it does not escape the
 /// closing quote the way it would in a backslash-escaping dialect. What the
 /// values must otherwise look like is DuckDB's business: a `memory_limit` it
@@ -40,10 +41,9 @@ pub(crate) fn validate_sql_literal(value: &str, field: &str) -> Result<(), Strin
 
 /// Parquet row-group size (rows) DuckLake uses when it rewrites the chunked sequence
 /// tables: `qiita_common.chunking.CHUNK_ROW_GROUP_SIZE`, ~1 GB of dense 64 KB chunks. The
-/// chunk files the orchestrator registers into those tables do not use it; their sorted
-/// writer sizes row groups from the chunks' width
-/// (`qiita_common.parquet.sorted_row_group_size`). A qiita-common test parses this line
-/// and pins it to the Python constant.
+/// chunk files the orchestrator registers into those tables do not use it; the byte cap
+/// in `qiita_common.parquet.PARQUET_OPTS_AT_REST` bounds their row groups. A qiita-common
+/// test parses this line and pins it to the Python constant.
 const CHUNK_ROW_GROUP_SIZE: u64 = 16384;
 
 /// Key of the Postgres advisory lock a data plane holds while it sets up the
@@ -126,9 +126,28 @@ fn setup_catalog_once(
     Ok(())
 }
 
+/// The DuckLake catalog format every attach asks for. The catalog is held at 1.0
+/// until it is migrated on purpose: the ducklake extension DuckDB 2.0 ships writes
+/// format 1.1, and a migrated catalog cannot be downgraded.
+///
+/// Named on the ATTACH because the default is not what we run. Against an empty
+/// catalog the 2.0 extension creates 1.1 unless told otherwise, so every catalog
+/// the tests create, and a fresh deploy's, would quietly differ from production's.
+/// Against an existing 1.0 catalog the option changes nothing; against a newer one
+/// the ATTACH fails (`Cannot downgrade a DuckLake catalog`), so the attach is also
+/// the check that the catalog is still 1.0. Never pass `AUTOMATIC_MIGRATION`: it
+/// is the migration
+/// (<https://ducklake.select/docs/stable/duckdb/migrations/upgrading_to_ducklake_1_1>).
+///
+/// The lake scripts (`QIITA_DUCKLAKE_VERSION` in `deploy/_common.sh`) and the
+/// integration tests (`tests/integration/_pg_env.py`) name the same version, held
+/// equal to this one by qiita-common/tests/test_duckdb_version_sync.py.
+pub(crate) const DUCKLAKE_CATALOG_VERSION: &str = "1.0";
+
 /// Connect to DuckLake backed by a Postgres catalog.
 ///
-/// Attaches the DuckLake catalog as `qiita_lake` in the DuckDB session.
+/// Attaches the DuckLake catalog as `qiita_lake` in the DuckDB session, at
+/// `DUCKLAKE_CATALOG_VERSION`.
 /// `catalog_connstr` is a libpq-style connection string (e.g., "dbname=qiita_ducklake host=localhost").
 /// `data_path` is the directory where DuckLake stores Parquet files.
 pub fn connect_ducklake(
@@ -140,7 +159,8 @@ pub fn connect_ducklake(
     validate_sql_literal(data_path, "data_path")?;
     conn.execute_batch("LOAD ducklake; LOAD postgres;")?;
     conn.execute_batch(&format!(
-        "ATTACH 'ducklake:postgres:{catalog_connstr}' AS qiita_lake (DATA_PATH '{data_path}');"
+        "ATTACH 'ducklake:postgres:{catalog_connstr}' AS qiita_lake \
+         (DATA_PATH '{data_path}', DUCKLAKE_VERSION '{DUCKLAKE_CATALOG_VERSION}');"
     ))?;
     Ok(())
 }
@@ -914,6 +934,141 @@ pub fn ensure_assembly_tables(conn: &Connection) -> Result<(), Box<dyn std::erro
     Ok(())
 }
 
+/// The myloasm provenance tables, in the order `ensure_myloasm_tables` creates them.
+/// Test-only: the tests that walk all six read it, and nothing at runtime does.
+#[cfg(test)]
+pub(crate) const MYLOASM_TABLES: &[&str] = &[
+    "myloasm_contig",
+    "myloasm_layout",
+    "myloasm_mapping",
+    "myloasm_link",
+    "myloasm_split",
+    "myloasm_run",
+];
+
+/// Create the myloasm provenance tables: per assembly run, which reads myloasm
+/// built each contig from and placed on it, how its contigs connect, where it
+/// split chimeric reads, and how it was invoked. No sequence bytes; a read is a
+/// `sequence_idx` and a contig a `contig_num` (plus `feature_idx` for a primary
+/// contig). What each column means, and why `contig_num` identifies a contig
+/// within a run, is stated once in `qiita_common.myloasm_constants`, which also
+/// holds the column lists the writer uses; a qiita-common test pins those, and
+/// this table list, against the DDL below.
+///
+/// Every table is replaced per run at register time, keyed on
+/// `(prep_sample_idx, processing_idx)` read from `myloasm_run`
+/// (`flight_service::registration::REPLACE_KEY_TABLES`). None is Flight-readable.
+pub fn ensure_myloasm_tables(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS qiita_lake.myloasm_contig (
+            prep_sample_idx BIGINT NOT NULL,
+            processing_idx BIGINT NOT NULL,
+            contig_num BIGINT NOT NULL,
+            feature_idx BIGINT,
+            dereplication_status VARCHAR NOT NULL,
+            polished_length BIGINT,
+            unpolished_length BIGINT NOT NULL,
+            circularity VARCHAR,
+            depth_identity_99 DOUBLE,
+            depth_identity_99_75 DOUBLE,
+            depth_identity_100 DOUBLE,
+            median_depth_identity_100 DOUBLE,
+            kmer_multiplicity DOUBLE,
+            kmer_multiplicity_flag VARCHAR,
+            secondary_to_contig_num BIGINT,
+            secondary_aligned_percent DOUBLE,
+            secondary_ani_percent DOUBLE
+        );
+
+        CREATE TABLE IF NOT EXISTS qiita_lake.myloasm_layout (
+            prep_sample_idx BIGINT NOT NULL,
+            processing_idx BIGINT NOT NULL,
+            contig_num BIGINT NOT NULL,
+            layout_order BIGINT NOT NULL,
+            position BIGINT NOT NULL,
+            stop_position BIGINT NOT NULL,
+            sequence_idx BIGINT NOT NULL,
+            split_suffix VARCHAR,
+            piece_offset BIGINT NOT NULL,
+            piece_length BIGINT NOT NULL,
+            query_start BIGINT NOT NULL,
+            query_stop BIGINT NOT NULL,
+            strand VARCHAR NOT NULL,
+            read_depth_identity_99 DOUBLE,
+            read_depth_identity_99_75 DOUBLE,
+            read_depth_identity_100 DOUBLE,
+            next_overlap_length BIGINT,
+            next_shared_snpmers BIGINT,
+            next_differing_snpmers BIGINT
+        );
+
+        CREATE TABLE IF NOT EXISTS qiita_lake.myloasm_mapping (
+            prep_sample_idx BIGINT NOT NULL,
+            processing_idx BIGINT NOT NULL,
+            sequence_idx BIGINT NOT NULL,
+            split_suffix VARCHAR,
+            piece_offset BIGINT NOT NULL,
+            piece_length BIGINT NOT NULL,
+            query_start BIGINT NOT NULL,
+            query_stop BIGINT NOT NULL,
+            strand VARCHAR NOT NULL,
+            contig_num BIGINT NOT NULL,
+            position BIGINT NOT NULL,
+            stop_position BIGINT NOT NULL,
+            query_anchor_span BIGINT,
+            contig_anchor_span BIGINT,
+            shared_minimizers BIGINT,
+            shared_snpmers BIGINT,
+            differing_snpmers BIGINT
+        );
+
+        -- The overlap evidence and the two end reads are nullable: see the
+        -- `read_myloasm_*` entry in docs/duckdb-miint.md.
+        CREATE TABLE IF NOT EXISTS qiita_lake.myloasm_link (
+            prep_sample_idx BIGINT NOT NULL,
+            processing_idx BIGINT NOT NULL,
+            from_contig_num BIGINT NOT NULL,
+            from_orientation VARCHAR NOT NULL,
+            to_contig_num BIGINT NOT NULL,
+            to_orientation VARCHAR NOT NULL,
+            overlap_length BIGINT,
+            shared_snpmers BIGINT,
+            differing_snpmers BIGINT,
+            shared_minimizers BIGINT,
+            snpmer_identity_percent DOUBLE,
+            from_sequence_idx BIGINT,
+            from_split_suffix VARCHAR,
+            to_sequence_idx BIGINT,
+            to_split_suffix VARCHAR
+        );
+
+        CREATE TABLE IF NOT EXISTS qiita_lake.myloasm_split (
+            prep_sample_idx BIGINT NOT NULL,
+            processing_idx BIGINT NOT NULL,
+            sequence_idx BIGINT NOT NULL,
+            parent_split_suffix VARCHAR,
+            cleaning_round INTEGER NOT NULL,
+            breakpoint_order BIGINT NOT NULL,
+            query_start BIGINT NOT NULL,
+            query_stop BIGINT NOT NULL,
+            split_condition INTEGER NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS qiita_lake.myloasm_run (
+            prep_sample_idx BIGINT NOT NULL,
+            processing_idx BIGINT NOT NULL,
+            log_name VARCHAR NOT NULL,
+            started_at TIMESTAMP,
+            myloasm_version VARCHAR NOT NULL,
+            command VARCHAR NOT NULL,
+            kmer_size INTEGER NOT NULL,
+            compression INTEGER NOT NULL,
+            hifi BOOLEAN NOT NULL
+        );",
+    )?;
+    Ok(())
+}
+
 /// per-sample ASV feature counts from a deblur run: feature membership plus
 /// abundance, keyed by `processing_idx` (the run) and `feature_idx` (the ASV);
 /// plus the ASV sequences themselves (`amplicon_sequence` +
@@ -992,6 +1147,7 @@ pub fn ensure_lake_tables(conn: &Connection) -> Result<(), Box<dyn std::error::E
     ensure_read_tables(conn)?;
     ensure_alignment_tables(conn)?;
     ensure_assembly_tables(conn)?;
+    ensure_myloasm_tables(conn)?;
     ensure_amplicon_tables(conn)?;
     // The lock row is seeded here so no request path has to create it.
     ensure_registration_lock(conn)?;
@@ -1046,6 +1202,98 @@ mod tests {
             )
             .expect("parquet_compression_level is not set on the catalog");
         assert_eq!(value, PARQUET_COMPRESSION_LEVEL_AT_REST.to_string());
+    }
+
+    /// The integration recipe drops the test catalog before this suite, so its first
+    /// attach is the one that creates it: a catalog created without the version
+    /// asked for comes out at whatever the extension defaults to.
+    #[test]
+    #[serial]
+    #[cfg(feature = "integration")]
+    fn the_catalog_is_created_at_the_pinned_ducklake_format() {
+        let conn = setup_conn();
+        let version: String = conn
+            .query_row(
+                "SELECT value FROM qiita_lake.options() WHERE option_name = 'version'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("the catalog reports no format version");
+        assert_eq!(version, DUCKLAKE_CATALOG_VERSION);
+    }
+
+    /// A catalog past the pinned format is refused at attach rather than used.
+    /// Built in a database of its own: the shared test catalog stays at the pin.
+    #[test]
+    #[serial]
+    #[cfg(feature = "integration")]
+    fn a_catalog_past_the_pinned_format_is_refused_at_attach() {
+        let with_dbname = |dbname: &str| {
+            let mut parts: Vec<String> = crate::test_catalog::connstr()
+                .split_whitespace()
+                .filter(|kv| !kv.starts_with("dbname="))
+                .map(str::to_string)
+                .collect();
+            parts.push(format!("dbname={dbname}"));
+            parts.join(" ")
+        };
+        /// A Postgres database of its own, dropped however the test ends.
+        struct Scratch {
+            admin: Connection,
+            name: String,
+        }
+        impl Scratch {
+            // CREATE and DROP DATABASE cannot run inside a transaction.
+            fn run(&self, sql: &str) -> duckdb::Result<()> {
+                self.admin.execute_batch(&format!(
+                    "CALL postgres_execute('pg', '{sql}', use_transaction := false);"
+                ))
+            }
+        }
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = self.run(&format!(
+                    "DROP DATABASE IF EXISTS {} WITH (FORCE)",
+                    self.name
+                ));
+            }
+        }
+        let admin = Connection::open_in_memory().unwrap();
+        admin
+            .execute_batch(&format!(
+                "LOAD postgres; ATTACH '{}' AS pg (TYPE postgres);",
+                with_dbname("postgres")
+            ))
+            .unwrap();
+        let scratch = Scratch {
+            admin,
+            name: format!("qiita_ducklake_newer_{}", std::process::id()),
+        };
+        scratch
+            .run(&format!(
+                "DROP DATABASE IF EXISTS {} WITH (FORCE)",
+                scratch.name
+            ))
+            .unwrap();
+        scratch
+            .run(&format!("CREATE DATABASE {}", scratch.name))
+            .unwrap();
+        let connstr = with_dbname(&scratch.name);
+        let data = tempfile::tempdir().unwrap();
+        let data_path = data.path().to_str().unwrap();
+        Connection::open_in_memory()
+            .unwrap()
+            .execute_batch(&format!(
+                "LOAD ducklake; LOAD postgres; \
+                 ATTACH 'ducklake:postgres:{connstr}' AS newer \
+                 (DATA_PATH '{data_path}', DUCKLAKE_VERSION '1.1');"
+            ))
+            .unwrap();
+
+        let refused = connect_ducklake(&Connection::open_in_memory().unwrap(), &connstr, data_path);
+
+        let err = refused.expect_err("a catalog past the pinned format attached");
+        assert!(err.to_string().contains("Cannot downgrade"), "{err}");
     }
 
     /// `(column_name, data_type, is_nullable)` for one `qiita_lake` table, in
@@ -1710,6 +1958,34 @@ mod tests {
     #[test]
     #[serial]
     #[cfg(feature = "integration")]
+    fn ensure_myloasm_tables_is_idempotent() {
+        // Re-running on every DP restart must be a no-op, and every table must
+        // exist afterwards, keyed on the assembly run.
+        let conn = setup_conn();
+        ensure_myloasm_tables(&conn).expect("first ensure_myloasm_tables");
+        ensure_myloasm_tables(&conn).expect("second ensure_myloasm_tables (idempotent)");
+
+        for table in MYLOASM_TABLES {
+            let cols = table_schema(&conn, table);
+            let lead: Vec<(&str, &str, &str)> = cols
+                .iter()
+                .take(2)
+                .map(|(n, t, null)| (n.as_str(), t.as_str(), null.as_str()))
+                .collect();
+            assert_eq!(
+                lead,
+                [
+                    ("prep_sample_idx", "BIGINT", "NO"),
+                    ("processing_idx", "BIGINT", "NO")
+                ],
+                "{table} must lead with the run key"
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    #[cfg(feature = "integration")]
     fn ensure_assembly_tables_is_idempotent() {
         // Re-running on every DP restart must be a no-op (CREATE TABLE IF NOT
         // EXISTS), and every table must exist and be queryable afterwards.
@@ -2343,6 +2619,7 @@ mod tests {
             let mut seen = Vec::new();
             let mut batches = 0usize;
             for batch in stream {
+                let batch = batch.expect("fetch batch");
                 batches += 1;
                 let grp = batch
                     .column(0)

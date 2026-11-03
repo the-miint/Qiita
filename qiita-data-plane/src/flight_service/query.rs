@@ -279,7 +279,10 @@ pub(super) const EXPORT_READ_COLUMNS: &str =
 /// `(prep_sample_idx = p AND sequence_idx BETWEEN start AND stop)` — is the exact
 /// residual on the pruned rows, so a split member never leaks a sibling block's
 /// rows (independent of tiling order). The coarse pair is a superset of the OR,
-/// so `coarse AND exact == exact`. `members` must be non-empty (caller guards);
+/// so `coarse AND exact == exact`. DuckDB 2.0 prunes files on the OR alone too,
+/// but 1.5 full-scanned it: pushing an OR of ANDs down to the scan is the
+/// optimizer's choice, and the coarse pair keeps the pruning from depending on
+/// it. `members` must be non-empty (caller guards);
 /// all integers are signature-verified i64s, safe to inline.
 pub(super) fn block_read_where_clause(members: &[auth::BlockReadMember]) -> String {
     let in_list = block_member_preps(members)

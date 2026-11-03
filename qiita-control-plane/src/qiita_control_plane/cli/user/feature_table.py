@@ -46,6 +46,7 @@ from qiita_common.api_paths import (
     PATH_REFERENCE_PREFIX,
 )
 from qiita_common.assembly_constants import ASSEMBLED_SEQUENCE_TABLE
+from qiita_common.duckdb_relation import registered
 from qiita_common.models import (
     MAX_EXPORTED_FEATURE_ENTITIES,
     ExportedFeatureRequest,
@@ -409,7 +410,7 @@ def _stage_response(
     import pyarrow as pa  # noqa: PLC0415
 
     source = pa.Table.from_pylist(entries, schema=pa.schema(columns))
-    with _registered(con, relation, source):
+    with registered(con, relation, source):
         con.execute(table_sql(relation))
 
 
@@ -425,7 +426,10 @@ def _stage_genome_map(con, table: pa.Table) -> None:
     schema is typed, so an empty map stages BIGINT columns rather than NULL-typed
     ones the first join would reject.
     """
-    with _registered(con, _GENOME_MAP_SOURCE, table.select(_MAP_KEY_COLUMNS)):
+    # Released as soon as it is copied: the genome map is the largest staged input by
+    # far, and uncapped, so holding it alongside the relations copied out of it would
+    # double that for nothing.
+    with registered(con, _GENOME_MAP_SOURCE, table.select(_MAP_KEY_COLUMNS)):
         con.execute(ft.map_table_sql(_GENOME_MAP_SOURCE))
 
 
@@ -466,7 +470,7 @@ def _stage_denovo_genome_map(con, per_sample: dict[int, pa.Table]) -> None:
     # so the no-run case is the `empty_table()` branch, not an argument. A cohort
     # that assembled nothing still has to stage typed columns.
     combined = pa.concat_tables(per_run) if per_run else schema.empty_table()
-    with _registered(con, _DENOVO_GENOME_MAP_SOURCE, combined):
+    with registered(con, _DENOVO_GENOME_MAP_SOURCE, combined):
         con.execute(ft.denovo_map_table_sql(_DENOVO_GENOME_MAP_SOURCE))
 
 
@@ -524,25 +528,8 @@ def _stage_exported_identifiers(con, identifiers: list[dict[str, Any]]) -> None:
 
 
 @contextlib.contextmanager
-def _registered(con, relation: str, obj) -> Iterator[str]:
-    """Register an Arrow object on `con` as `relation` for the block's duration, and
-    release it however the block ends.
-
-    One lifecycle for every staged input — `con.register` takes an Arrow table as
-    happily as a stream reader. The release matters most for what it frees soonest:
-    the genome map is the largest of them by far, and uncapped, so holding it
-    alongside the relations copied out of it doubles that for nothing.
-    """
-    con.register(relation, obj)
-    try:
-        yield relation
-    finally:
-        con.unregister(relation)
-
-
-@contextlib.contextmanager
 def staged_stream(con, flight_client, ticket: bytes, *, relation: str) -> Iterator[str]:
-    """`_registered` over a Flight DoGet stream.
+    """`registered` over a Flight DoGet stream.
 
     DuckDB pulls the Arrow stream lazily as the query scans `relation`, so the rows are
     never buffered in Python — the reason each caller reads the relation exactly once
@@ -556,7 +543,7 @@ def staged_stream(con, flight_client, ticket: bytes, *, relation: str) -> Iterat
     """
     import pyarrow.flight as flight  # noqa: PLC0415
 
-    with _registered(con, relation, flight_client.do_get(flight.Ticket(ticket)).to_reader()):
+    with registered(con, relation, flight_client.do_get(flight.Ticket(ticket)).to_reader()):
         yield relation
 
 

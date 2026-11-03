@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import asyncpg
+import duckdb
 from qiita_common.actions import BCL_CONVERT_SAMPLE_MAP_KEY
 from qiita_common.api_paths import (
     compute_reads_staging_path,
@@ -630,12 +631,29 @@ def _stream_masked_reads_to_fastq(data_plane_url: str, ticket_bytes: bytes, dest
     with flight.FlightClient(data_plane_url) as client, connect_with_miint_staged() as con:
         reader = client.do_get(flight.Ticket(ticket_bytes), read_opts).to_reader()
         con.register("masked", reader)
-        # Single-end long reads: sequence2/qual2 are NULL, so FORMAT FASTQ writes a
-        # single-end fastq. Column order is the one the miint writer requires.
-        (count,) = con.execute(
-            "COPY (SELECT read_id, sequence1, qual1, sequence2, qual2 FROM masked) "
-            f"TO '{validate_parquet_path(dest)}' (FORMAT FASTQ, COMPRESSION 'gzip')"
-        ).fetchone()
+        return _copy_masked_to_fastq(con, dest)
+
+
+def _copy_masked_to_fastq(con: duckdb.DuckDBPyConnection, dest: Path) -> int:
+    """Write the relation registered as `masked` (the `read_masked` stream's shape)
+    to gzip FASTQ at `dest`, returning the record count.
+
+    Each record is named by its `sequence_idx`, not its `read_id` (the CLAUDE.md
+    read-identity rule). miint's FASTQ writer contract is
+    https://the-miint.github.io/duckdb-miint/writing/; it names a record from the
+    `read_id` column, hence the alias.
+
+    This runs for every long-read-assembly version, not only the one whose
+    provenance dump needs it. That is safe because the assemblies do not depend on
+    read names: myloasm 0.6.0 and hifiasm_meta (the 1.0.0 assemble image), each
+    run on duckdb-miint's 1006-read myloasm fixture once with its own names and once
+    with integer names in the same order, wrote byte-identical contigs, names
+    included. Binning and coverage only match names within this one file."""
+    (count,) = con.execute(
+        "COPY (SELECT sequence_idx AS read_id, "
+        "sequence1, qual1, sequence2, qual2 FROM masked) "
+        f"TO '{validate_parquet_path(dest)}' (FORMAT FASTQ, COMPRESSION 'gzip')"
+    ).fetchone()
     return int(count)
 
 
