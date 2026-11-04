@@ -146,8 +146,7 @@ of this vintage or later refuses a ticket carrying a field it does not know
 older one silently applied its own idea of the projection instead.
 
 For `alignment_visible` there is **no server-side default projection** — a ticket
-without a column list is refused. Why, and what that costs a ticket minted
-across a deploy, is stated at the guard in `select_list_for`
+without a column list is refused. Why is stated at the guard in `select_list_for`
 (`qiita-data-plane/src/flight_service/query.rs`).
 
 A consumer of either table owns its list as one constant and uses it twice — for

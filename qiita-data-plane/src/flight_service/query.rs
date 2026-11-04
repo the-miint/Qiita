@@ -224,12 +224,12 @@ fn select_list_for(table: &str, columns: &[String]) -> Result<String, Status> {
     match (projection_rule(table), columns.is_empty()) {
         (None, true) => Ok("*".to_string()),
         (Some(rule), true) if !rule.required => Ok("*".to_string()),
-        // No server-side default to fall back to, deliberately: the consumer is
-        // the only component that knows which columns it binds, and a fallback
-        // here would be a second answer to that question, free to drift wider
-        // than what was asked for. A ticket minted before this shipped and
-        // redeemed after lands here — loudly, inside its 300 s TTL — rather than
-        // being silently widened.
+        // No server-side default to fall back to: the consumer is the only
+        // component that knows which columns it binds, and a fallback here would
+        // be a second answer to that question, free to drift wider than what was
+        // asked for. A ticket that a control plane signed without a list, before
+        // the table required one, lands here — loudly, inside its 300 s TTL —
+        // rather than being silently widened.
         (Some(_), true) => Err(Status::invalid_argument(format!(
             "{table} requires an explicit projection column list"
         ))),
