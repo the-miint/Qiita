@@ -434,10 +434,13 @@ async def refuse_deprecating_with_live_work(conn: asyncpg.Connection, alignment_
     """Raise AlignmentHasLiveWork if `alignment_idx` is active and any work ticket
     under it is not terminal (held tickets included: the fan-out would release them).
 
-    Takes the definition row `FOR UPDATE`. The ticket writers take it `FOR SHARE`
-    (`lock_active_alignment`) in the transaction that creates their tickets, so a
-    plan either commits its tickets before this count or finds the row deprecated.
-    An already-deprecated row is not checked, so its reason can still be corrected."""
+    Takes the definition row `FOR UPDATE`. Each writer of `work_ticket.alignment_idx`
+    takes it `FOR SHARE` (`lock_active_alignment`) in the transaction that writes the
+    column, so a plan either commits its tickets before this count or finds the row
+    deprecated. A de novo ticket the runner has not yet stamped with its alignment
+    is not counted; its stamp takes the share lock and refuses once the alignment is
+    deprecated. An already-deprecated row is not checked, so its reason can still be
+    corrected."""
     require_transaction(conn)
     status = await conn.fetchval(
         "SELECT status FROM qiita.alignment_definition WHERE alignment_idx = $1 FOR UPDATE",
@@ -463,9 +466,9 @@ async def refuse_deprecating_with_live_work(conn: asyncpg.Connection, alignment_
 
 async def lock_active_alignment(conn: asyncpg.Connection, alignment_idx: int) -> None:
     """Hold the definition row `FOR SHARE` for the caller's transaction and raise
-    AlignmentDefinitionDeprecated if it is deprecated. Called by the transactions
-    that create an alignment's work, so a deprecation cannot commit between the mint
-    and the tickets (`refuse_deprecating_with_live_work`)."""
+    AlignmentDefinitionDeprecated if it is deprecated. Called by every transaction
+    that writes `work_ticket.alignment_idx`, so a deprecation cannot commit between
+    the mint and the ticket recording it (`refuse_deprecating_with_live_work`)."""
     require_transaction(conn)
     row = await conn.fetchrow(
         "SELECT status, deprecation_reason FROM qiita.alignment_definition"

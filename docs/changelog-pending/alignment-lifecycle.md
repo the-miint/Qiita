@@ -5,11 +5,11 @@
   - `PATCH /alignment-definition/{alignment_idx}/status` deprecates an alignment
     config (or returns it to active). Deprecation is refused (409, listing them)
     while any work ticket under the alignment is unfinished, held ones included. A
-    deprecated alignment is refused by feature-table submit, both alignment DoGet mints, the exported-identifier and
-    exported-processing mints, the de novo align resolver, `/run` on its tickets, and
-    the QC verdict. A block alignment's identity has no version, so the same
-    reference, aligner and mask resolve to the deprecated row again: re-aligning
-    needs a different config.
+    deprecated alignment is refused by feature-table submit, both alignment DoGet
+    mints, the exported-identifier and exported-processing mints, the de novo align
+    resolver, `/run` on its tickets, and the QC verdict. A block alignment's
+    identity has no version, so the same reference, aligner and mask resolve to the
+    deprecated row again: re-aligning needs a different config.
   - `PATCH /alignment-definition/{alignment_idx}/sample-status` invalidates (or
     restores) individual prep_samples' completed runs.
   - `POST /alignment-definition/{alignment_idx}/abandon-plan` gives up on an align

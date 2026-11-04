@@ -21,7 +21,7 @@ from qiita_common.api_paths import (
     URL_ALIGNMENT_DEFINITION_STATUS,
     URL_WORK_TICKET_RUN,
 )
-from qiita_common.models import WorkTicketState
+from qiita_common.models import AlignmentDefinitionStatus, WorkTicketState
 
 from qiita_control_plane.align_planner import ALIGN_ACTION_VERSION
 from qiita_control_plane.fanout_dispatch import align_block_cohort, top_up_dispatch
@@ -147,7 +147,7 @@ async def lc(postgres_pool, human_admin_session):
             block_idx = await create_block(conn)
             await add_block_members(conn, block_idx=block_idx, members=members)
         blocks.append(block_idx)
-        failed = ticket_state == "failed"
+        failed = ticket_state == WorkTicketState.FAILED
         wt_idx = await postgres_pool.fetchval(
             "INSERT INTO qiita.work_ticket ("
             "  action_id, action_version, originator_principal_idx, scope_target_kind,"
@@ -268,9 +268,14 @@ async def test_deprecation_waits_for_unfinished_tickets(client, lc):
     would write rows under a void config. Deprecation names the tickets, and goes
     through once they are terminal. A terminal ticket never blocks it."""
     a, b, _c = lc["samples"]
-    await lc["make_block"]([(a, 1, 100)], block_state="completed", ticket_state="completed")
+    await lc["make_block"](
+        [(a, 1, 100)], block_state="completed", ticket_state=WorkTicketState.COMPLETED
+    )
     _block, held = await lc["make_block"](
-        [(b, 1, 100)], block_state="pending", ticket_state="pending", dispatch_held=True
+        [(b, 1, 100)],
+        block_state="pending",
+        ticket_state=WorkTicketState.PENDING,
+        dispatch_held=True,
     )
     resp = await _deprecate(client, lc["alignment_idx"])
     assert resp.status_code == 409, resp.text
@@ -293,31 +298,50 @@ async def test_a_deprecated_alignment_cannot_be_recorded_on_a_ticket(lc):
     """The de novo writer of work_ticket.alignment_idx re-checks the status under a
     share lock, so a deprecation landing after the mint still stops the run before it
     records the alignment."""
+    from qiita_common.actions import ALIGN_DENOVO_ACTION_ID
     from qiita_common.backend_failure import BackendFailure, FailureKind
 
     from qiita_control_plane.runner._alignment import _persist_alignment_idx
 
+    pool = lc["pool"]
     a, _b, _c = lc["samples"]
-    _block, wt = await lc["make_block"](
-        [(a, 1, 100)], block_state="completed", ticket_state="completed"
+    version = f"lifecycle-{secrets.token_hex(4)}"
+    created = await seed_action_if_absent(
+        pool, action_id=ALIGN_DENOVO_ACTION_ID, version=version, target_kind="prep_sample"
     )
-    await lc["pool"].execute(
-        "UPDATE qiita.work_ticket SET alignment_idx = NULL WHERE work_ticket_idx = $1", wt
-    )
-    await lc["pool"].execute(
-        "UPDATE qiita.alignment_definition SET status = 'deprecated', deprecated_at = now(),"
-        "       deprecated_by_idx = $2, deprecation_reason = 'late'"
-        " WHERE alignment_idx = $1",
-        lc["alignment_idx"],
+    # The shape the de novo runner stamps: a processing prep_sample ticket that does
+    # not carry the alignment yet.
+    wt = await pool.fetchval(
+        "INSERT INTO qiita.work_ticket (action_id, action_version, originator_principal_idx,"
+        "  scope_target_kind, prep_sample_idx, state)"
+        " VALUES ($1, $2, $3, 'prep_sample', $4, $5) RETURNING work_ticket_idx",
+        ALIGN_DENOVO_ACTION_ID,
+        version,
         lc["owner"],
+        a,
+        WorkTicketState.PROCESSING.value,
     )
-    with pytest.raises(BackendFailure, match="late") as ei:
-        await _persist_alignment_idx(lc["pool"], wt, lc["alignment_idx"])
-    assert ei.value.kind == FailureKind.BAD_INPUT
-    recorded = await lc["pool"].fetchval(
-        "SELECT alignment_idx FROM qiita.work_ticket WHERE work_ticket_idx = $1", wt
-    )
-    assert recorded is None
+    try:
+        await pool.execute(
+            "UPDATE qiita.alignment_definition SET status = $3, deprecated_at = now(),"
+            "       deprecated_by_idx = $2, deprecation_reason = 'late'"
+            " WHERE alignment_idx = $1",
+            lc["alignment_idx"],
+            lc["owner"],
+            AlignmentDefinitionStatus.DEPRECATED.value,
+        )
+        with pytest.raises(BackendFailure, match="late") as ei:
+            await _persist_alignment_idx(pool, wt, lc["alignment_idx"])
+        assert ei.value.kind == FailureKind.BAD_INPUT
+        recorded = await pool.fetchval(
+            "SELECT alignment_idx FROM qiita.work_ticket WHERE work_ticket_idx = $1", wt
+        )
+        assert recorded is None
+    finally:
+        await pool.execute("DELETE FROM qiita.work_ticket WHERE work_ticket_idx = $1", wt)
+        await delete_action_if_created(
+            pool, action_id=ALIGN_DENOVO_ACTION_ID, version=version, created=created
+        )
 
 
 async def test_deprecate_without_reason_is_422(client, lc):
@@ -449,16 +473,19 @@ async def test_abandon_clears_pending_gates_and_keeps_completed(client, lc, purg
     pool, alignment_idx = lc["pool"], lc["alignment_idx"]
     a, b, c = lc["samples"]
     done_a, _ = await lc["make_block"](
-        [(a, 1, 100)], block_state="completed", ticket_state="completed"
+        [(a, 1, 100)], block_state="completed", ticket_state=WorkTicketState.COMPLETED
     )
     done_b, _ = await lc["make_block"](
-        [(b, 1, 50)], block_state="completed", ticket_state="completed"
+        [(b, 1, 50)], block_state="completed", ticket_state=WorkTicketState.COMPLETED
     )
     failed_b, failed_wt = await lc["make_block"](
-        [(b, 51, 100)], block_state="pending", ticket_state="failed"
+        [(b, 51, 100)], block_state="pending", ticket_state=WorkTicketState.FAILED
     )
     held_c, held_wt = await lc["make_block"](
-        [(c, 1, 100)], block_state="pending", ticket_state="pending", dispatch_held=True
+        [(c, 1, 100)],
+        block_state="pending",
+        ticket_state=WorkTicketState.PENDING,
+        dispatch_held=True,
     )
     await lc["set_gate"](a, "completed")
     await lc["set_gate"](b, "pending")
@@ -532,7 +559,7 @@ async def test_abandon_clears_pending_gates_and_keeps_completed(client, lc, purg
 async def test_abandon_refuses_while_a_released_block_runs(client, lc, purge):
     a = lc["samples"][0]
     block, wt = await lc["make_block"](
-        [(a, 1, 100)], block_state="processing", ticket_state="processing"
+        [(a, 1, 100)], block_state="processing", ticket_state=WorkTicketState.PROCESSING
     )
     await lc["set_gate"](a, "pending")
     resp = await client.post(
@@ -556,7 +583,9 @@ async def test_a_failed_purge_leaves_the_abandon_committed_and_is_retried(client
 
     purge.error = flight.FlightUnavailableError("data plane down")
     a = lc["samples"][0]
-    block, _wt = await lc["make_block"]([(a, 1, 100)], block_state="pending", ticket_state="failed")
+    block, _wt = await lc["make_block"](
+        [(a, 1, 100)], block_state="pending", ticket_state=WorkTicketState.FAILED
+    )
     await lc["set_gate"](a, "pending")
     url = URL_ALIGNMENT_DEFINITION_ABANDON_PLAN.format(alignment_idx=lc["alignment_idx"])
     resp = await client.post(url)
@@ -589,12 +618,16 @@ async def test_an_abandoned_block_owes_its_samples_nothing(client, lc, purge):
     the abandoned sibling is not read as an incomplete cover."""
     pool, alignment_idx = lc["pool"], lc["alignment_idx"]
     a = lc["samples"][0]
-    await lc["make_block"]([(a, 1, 100)], block_state="pending", ticket_state="failed")
+    await lc["make_block"](
+        [(a, 1, 100)], block_state="pending", ticket_state=WorkTicketState.FAILED
+    )
     await lc["set_gate"](a, "pending")
     assert (
         await client.post(URL_ALIGNMENT_DEFINITION_ABANDON_PLAN.format(alignment_idx=alignment_idx))
     ).status_code == 200
-    await lc["make_block"]([(a, 1, 100)], block_state="completed", ticket_state="completed")
+    await lc["make_block"](
+        [(a, 1, 100)], block_state="completed", ticket_state=WorkTicketState.COMPLETED
+    )
     async with pool.acquire() as conn:
         assert not await has_incomplete_covering_alignment_block(
             conn, alignment_idx=alignment_idx, prep_sample_idx=a
@@ -604,13 +637,18 @@ async def test_an_abandoned_block_owes_its_samples_nothing(client, lc, purge):
 async def test_an_abandoned_failed_ticket_does_not_fail_stop_the_replan(client, lc, purge):
     pool, alignment_idx = lc["pool"], lc["alignment_idx"]
     a, b, _c = lc["samples"]
-    await lc["make_block"]([(a, 1, 100)], block_state="pending", ticket_state="failed")
+    await lc["make_block"](
+        [(a, 1, 100)], block_state="pending", ticket_state=WorkTicketState.FAILED
+    )
     await lc["set_gate"](a, "pending")
     assert (
         await client.post(URL_ALIGNMENT_DEFINITION_ABANDON_PLAN.format(alignment_idx=alignment_idx))
     ).status_code == 200
     _block, held = await lc["make_block"](
-        [(a, 1, 100)], block_state="pending", ticket_state="pending", dispatch_held=True
+        [(a, 1, 100)],
+        block_state="pending",
+        ticket_state=WorkTicketState.PENDING,
+        dispatch_held=True,
     )
     dispatched: list[int] = []
     released = await top_up_dispatch(
@@ -618,9 +656,14 @@ async def test_an_abandoned_failed_ticket_does_not_fail_stop_the_replan(client, 
     )
     assert released == [held]
     # The control: a failed ticket whose block was NOT abandoned still fail-stops.
-    await lc["make_block"]([(b, 1, 100)], block_state="pending", ticket_state="failed")
     await lc["make_block"](
-        [(b, 1, 100)], block_state="pending", ticket_state="pending", dispatch_held=True
+        [(b, 1, 100)], block_state="pending", ticket_state=WorkTicketState.FAILED
+    )
+    await lc["make_block"](
+        [(b, 1, 100)],
+        block_state="pending",
+        ticket_state=WorkTicketState.PENDING,
+        dispatch_held=True,
     )
     assert (
         await top_up_dispatch(
@@ -646,7 +689,7 @@ async def test_redrive_refuses_an_abandoned_block_and_a_deprecated_alignment(
     monkeypatch.setattr("qiita_control_plane.routes.work_ticket._fetch_action", _any_definition)
     a, b, _c = lc["samples"]
     _block, abandoned_wt = await lc["make_block"](
-        [(a, 1, 100)], block_state="pending", ticket_state="failed"
+        [(a, 1, 100)], block_state="pending", ticket_state=WorkTicketState.FAILED
     )
     await lc["set_gate"](a, "pending")
     assert (
@@ -659,7 +702,7 @@ async def test_redrive_refuses_an_abandoned_block_and_a_deprecated_alignment(
     assert "abandoned" in resp.json()["detail"]
 
     _block, failed_wt = await lc["make_block"](
-        [(b, 1, 100)], block_state="pending", ticket_state="failed"
+        [(b, 1, 100)], block_state="pending", ticket_state=WorkTicketState.FAILED
     )
     assert (await _deprecate(client, lc["alignment_idx"])).status_code == 200
     resp = await client.post(URL_WORK_TICKET_RUN.format(work_ticket_idx=failed_wt))
@@ -698,7 +741,7 @@ async def test_qc_verdict_ignores_a_deprecated_alignment(client, lc):
     a = lc["samples"][0]
     await lc["set_gate"](a, "completed")
     _block, wt = await lc["make_block"](
-        [(a, 1, 100)], block_state="completed", ticket_state="completed"
+        [(a, 1, 100)], block_state="completed", ticket_state=WorkTicketState.COMPLETED
     )
     await lc["pool"].execute(
         "INSERT INTO qiita.prep_sample_qc_check"
