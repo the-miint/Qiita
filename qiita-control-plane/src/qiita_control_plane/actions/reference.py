@@ -64,8 +64,8 @@ class ReferenceDeleteBlocked(Exception):
         # reference delete removes features the DuckLake `alignment` rows are keyed
         # on (`feature_idx`), and the data plane's delete_reference does not touch
         # `alignment`. The route purges a DEPRECATED alignment's rows first
-        # (`deprecated_alignments_against`); an active one is still in use, so it
-        # must be deprecated before its rows may go.
+        # (`mark_deprecated_alignments_purged`); an active one is still in use, so
+        # it must be deprecated before its rows may go.
         if alignment_definitions:
             reason = (
                 f"{alignment_definitions} active alignment definition(s) align against it; "
@@ -389,18 +389,25 @@ async def transition_reference_status(
     raise IllegalStatusTransition(current=current, target=target)
 
 
-async def deprecated_alignments_against(
+async def mark_deprecated_alignments_purged(
     conn: asyncpg.Pool | asyncpg.Connection, reference_idx: int
 ) -> list[int]:
-    """The deprecated alignments whose config names this reference, sorted. The
-    reference-delete route purges their DuckLake `alignment` rows before the
-    reference's own data, since those rows are keyed on features the delete removes.
-    The alignment_definition rows stay, as the record of what was aligned."""
+    """Stamp `rows_purged_at` on the deprecated alignments whose config names this
+    reference, and return them sorted. The reference-delete route calls this before
+    purging their DuckLake rows, which are keyed on features the delete removes.
+
+    Stamping first is what keeps a purged alignment from being made active again:
+    reactivation refuses a stamped row, and the UPDATE's row lock serializes with
+    the status route's. An alignment reactivated before this runs is not stamped or
+    purged, and the teardown's re-gate then refuses the delete. A stamp left by a
+    delete that failed later stays: some of the rows may already be gone. The
+    alignment_definition rows themselves stay, as the record of what was aligned."""
     rows = await conn.fetch(
-        "SELECT alignment_idx FROM qiita.alignment_definition"
+        "UPDATE qiita.alignment_definition"
+        "   SET rows_purged_at = COALESCE(rows_purged_at, now())"
         " WHERE (params->>'reference_idx')::bigint = $1 AND status = $2"
-        " ORDER BY alignment_idx",
+        " RETURNING alignment_idx",
         reference_idx,
         AlignmentDefinitionStatus.DEPRECATED.value,
     )
-    return [r["alignment_idx"] for r in rows]
+    return sorted(r["alignment_idx"] for r in rows)

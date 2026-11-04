@@ -82,7 +82,7 @@ from ..actions.reference import (
     ReferenceNotFound,
     assert_reference_deletable,
     delete_reference_cascade,
-    deprecated_alignments_against,
+    mark_deprecated_alignments_purged,
     transition_reference_status,
 )
 from ..auth.guards import (
@@ -829,7 +829,7 @@ async def delete_reference(
     # reference's own data: they are keyed on features that delete removes. Each
     # purge is idempotent, so a retry after a later failure re-runs it harmlessly.
     alignment_rows_deleted = 0
-    for alignment_idx in await deprecated_alignments_against(pool, reference_idx):
+    for alignment_idx in await mark_deprecated_alignments_purged(pool, reference_idx):
         try:
             alignment_rows_deleted += await delete_alignment_data(
                 alignment_idx=alignment_idx,

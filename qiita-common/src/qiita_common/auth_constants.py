@@ -138,8 +138,8 @@ class Scope(StrEnum):
     # in ROLE_IMPLIED_SCOPES.
     PROCESSING_LIFECYCLE = "processing:lifecycle"
     # Alignment LIFECYCLE: deprecate an alignment config, withdraw individual
-    # (alignment, sample) runs of a sound one, and abandon an align plan whose
-    # blocks failed so its samples can be re-planned. Separate from
+    # (alignment, prep_sample) runs of a sound one, and abandon an align plan
+    # whose blocks failed so its prep_samples can be re-planned. Separate from
     # MASK_DEFINITION_LIFECYCLE and PROCESSING_LIFECYCLE because each names a
     # different identity: an alignment can be wrong while the mask under it is
     # sound. system_admin only, in ROLE_IMPLIED_SCOPES.

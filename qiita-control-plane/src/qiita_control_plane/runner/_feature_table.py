@@ -155,7 +155,7 @@ async def _validate_denovo_arm(
 
 
 def _refuse_deprecated_alignment(row: asyncpg.Record) -> None:
-    """Refuse a deprecated alignment as either arm. An invalidated sample needs no
+    """Refuse a deprecated alignment as either arm. An invalidated prep_sample needs no
     check of its own: it is not 'completed', so the cohort gate refuses it."""
     if row["status"] == AlignmentDefinitionStatus.DEPRECATED.value:
         raise _submission_bad_input(

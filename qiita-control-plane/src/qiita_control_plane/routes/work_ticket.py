@@ -959,7 +959,7 @@ async def run_work_ticket(
                     ),
                 )
             # Same reason for an alignment: a redrive fast-forwards the mint that
-            # would have refused it. And an abandoned block's samples have been
+            # would have refused it. And an abandoned block's prep_samples have been
             # handed to a re-plan, whose rows this block's replace step would delete.
             align = await conn.fetchrow(
                 "SELECT ad.alignment_idx, ad.status, wt.block_idx"

@@ -105,7 +105,7 @@ ROLE_IMPLIED_SCOPES: Mapping[SystemRole, frozenset[Scope]] = {
             # decides that published contigs were produced by a run we no longer
             # stand behind.
             Scope.PROCESSING_LIFECYCLE,
-            # Deprecating an alignment / withdrawing its per-sample runs /
+            # Deprecating an alignment / withdrawing its per-prep_sample runs /
             # abandoning a failed align plan is system_admin-only for the same
             # reason as the mask and processing twins above.
             Scope.ALIGNMENT_DEFINITION_LIFECYCLE,

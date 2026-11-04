@@ -499,7 +499,7 @@ PATH_ALIGNMENT_DEFINITION_STATUS = "/{alignment_idx}/status"
 # PATCH specific RUNS of the config (completed <-> invalidated).
 PATH_ALIGNMENT_DEFINITION_SAMPLE_STATUS = "/{alignment_idx}/sample-status"
 # POST: give up on the align plan's unfinished blocks and clear the pending gates
-# they covered, so the samples can be re-planned with only_missing=true.
+# they covered, so the prep_samples can be re-planned with only_missing=true.
 PATH_ALIGNMENT_DEFINITION_ABANDON_PLAN = "/{alignment_idx}/abandon-plan"
 
 URL_ALIGNMENT_DEFINITION_PREFIX = f"{API_PREFIX}{PATH_ALIGNMENT_DEFINITION_PREFIX}"

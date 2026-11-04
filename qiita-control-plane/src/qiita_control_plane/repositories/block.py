@@ -583,7 +583,7 @@ async def has_incomplete_covering_alignment_block(
     Checking `state <> 'completed'` (not "non-terminal") means a failed block
     correctly blocks finalize until re-driven — the strict, fail-closed reading. An
     'abandoned' block is the exception: abandon-plan purged its rows and cleared the
-    pending gates it covered, so it no longer owes any sample anything.
+    pending gates it covered, so it no longer owes any prep_sample anything.
     Twin of `has_incomplete_covering_block` (joins on alignment_idx not mask_idx).
 
     Needs no `action_id` filter, unlike that twin: `alignment_idx` is set only by

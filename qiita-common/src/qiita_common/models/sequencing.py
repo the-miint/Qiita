@@ -1326,6 +1326,9 @@ class AlignmentDefinition(BaseModel):
     deprecated_by_idx: Annotated[int | None, Field(default=None, gt=0)] = None
     deprecation_reason: str | None = None
     superseded_by: Annotated[int | None, Field(default=None, gt=0)] = None
+    # Set when a reference delete purged this alignment's rows; it then stays
+    # deprecated.
+    rows_purged_at: AwareDatetime | None = None
 
 
 class AlignmentDefinitionStatusUpdate(BaseModel):
@@ -1401,7 +1404,7 @@ class AlignmentPlanAbandonResponse(BaseModel):
     `cancelled_work_ticket_idx` the held tickets of those blocks that were never
     released and are now 'cancelled'; `cleared_prep_sample_idx` the samples whose
     pending gate was removed, which `only_missing=true` will now re-plan;
-    `rows_deleted` the DuckLake `alignment` rows purged from those samples. All
+    `rows_deleted` the DuckLake `alignment` rows purged from those prep_samples. All
     empty and 0 when nothing was unfinished."""
 
     alignment_idx: Annotated[int, Field(gt=0)]

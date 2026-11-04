@@ -16,7 +16,7 @@
 --
 --   * `block.state = 'abandoned'` marks a block an operator gave up on
 --     (POST /alignment-definition/{idx}/abandon-plan). The pending gates it
---     covered are cleared so the samples can be re-planned under the same
+--     covered are cleared so the prep_samples can be re-planned under the same
 --     alignment_idx; the block row and its ticket stay as the record of the
 --     attempt. A covering-block check reads 'abandoned' as not owing anything.
 --
@@ -50,6 +50,13 @@ ALTER TABLE qiita.alignment_definition
     ),
     ADD CONSTRAINT alignment_definition_supersede_not_self CHECK (
         superseded_by IS NULL OR superseded_by <> alignment_idx
+    ),
+    -- Set by reference delete, before it purges this alignment's DuckLake rows.
+    -- Only a deprecated alignment is purged, and a purged one cannot be made active
+    -- again: the rows it would serve are gone.
+    ADD COLUMN rows_purged_at TIMESTAMPTZ,
+    ADD CONSTRAINT alignment_definition_purged_only_when_deprecated CHECK (
+        rows_purged_at IS NULL OR status = 'deprecated'
     );
 
 COMMENT ON COLUMN qiita.alignment_definition.status IS
@@ -58,6 +65,10 @@ COMMENT ON COLUMN qiita.alignment_definition.status IS
     '''deprecated'' means the configuration is void: qiita.mint_alignment_definition '
     'refuses to return the row, and every consumer refuses to read it. It does not '
     'judge any one sample''s run -- that is alignment_sample.state.';
+
+COMMENT ON COLUMN qiita.alignment_definition.rows_purged_at IS
+    'When reference delete purged this alignment''s DuckLake rows. Set before the '
+    'purge, so a set value means the rows may be gone; the row stays deprecated.';
 
 COMMENT ON COLUMN qiita.alignment_definition.superseded_by IS
     'The alignment_definition that replaces this one, when there is one. Settable '
@@ -92,14 +103,14 @@ COMMENT ON TABLE qiita.alignment_sample IS
     'a block identity hashes a reference_idx and a shard set, a de novo one hashes an '
     'assembly subject. A completed run later judged untrustworthy is set '
     '''invalidated'', with who/when/why. A ''pending'' row whose covering blocks were '
-    'abandoned is deleted by the abandon-plan route so the sample can be re-planned. '
+    'abandoned is deleted by the abandon-plan route so the prep_sample can be re-planned. '
     'Consumers read ONLY ''completed'' samples -- alignment rows are NOT 1:1 with '
     'reads, so presence of rows must never be read as "done". Python twin: '
     'qiita_common.models.AlignmentSampleState. Twin of qiita.mask_sample.';
 
 COMMENT ON COLUMN qiita.alignment_sample.state IS
     'Gate state: ''pending'' | ''completed'' | ''invalidated'' (TEXT + CHECK, not a '
-    'Postgres ENUM). ''invalidated'' is terminal for this (alignment, sample) pair: '
+    'Postgres ENUM). ''invalidated'' is terminal for this (alignment, prep_sample) pair: '
     'the run finished and its output is not to be consumed.';
 
 ALTER TABLE qiita.block
@@ -111,7 +122,7 @@ COMMENT ON COLUMN qiita.block.state IS
     '''pending'' | ''processing'' | ''completed'' | ''failed'' | ''abandoned'' (TEXT + '
     'CHECK). ''abandoned'' is set only by the align abandon-plan route: the block''s '
     'rows were purged and the pending gates it covered were cleared, so it no longer '
-    'counts toward any sample''s completion and its ticket may not be redriven.';
+    'counts toward any prep_sample''s completion and its ticket may not be redriven.';
 
 -- ---------------------------------------------------------------------------
 -- mint_alignment_definition: refuse to hand back a deprecated config
@@ -283,6 +294,7 @@ ALTER TABLE qiita.block
 COMMENT ON COLUMN qiita.block.state IS NULL;
 
 ALTER TABLE qiita.alignment_definition
+    DROP CONSTRAINT IF EXISTS alignment_definition_purged_only_when_deprecated,
     DROP CONSTRAINT IF EXISTS alignment_definition_supersede_not_self,
     DROP CONSTRAINT IF EXISTS alignment_definition_superseded_only_when_deprecated,
     DROP CONSTRAINT IF EXISTS alignment_definition_deprecation_reason_nonblank,
@@ -302,6 +314,7 @@ ALTER TABLE qiita.alignment_sample
     ADD CONSTRAINT alignment_sample_state_check CHECK (state IN ('pending', 'completed'));
 
 ALTER TABLE qiita.alignment_definition
+    DROP COLUMN IF EXISTS rows_purged_at,
     DROP COLUMN IF EXISTS superseded_by,
     DROP COLUMN IF EXISTS deprecation_reason,
     DROP COLUMN IF EXISTS deprecated_by_idx,

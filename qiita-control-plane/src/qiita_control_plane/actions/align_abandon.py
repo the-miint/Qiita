@@ -1,8 +1,8 @@
-"""Abandon an align plan's unfinished blocks so their samples can be re-planned.
+"""Abandon an align plan's unfinished blocks so their prep_samples can be re-planned.
 
-The align planner refuses a fresh plan for any sample already gated under the
+The align planner refuses a fresh plan for any prep_sample already gated under the
 resolved alignment (`AlignResubmitError`), and `only_missing=true` skips every gated
-sample — including the PENDING gates a failed plan leaves behind. This gives up on
+prep_sample — including the PENDING gates a failed plan leaves behind. This gives up on
 the blocks that did not complete and clears only the pending gates they covered.
 
 Two phases.

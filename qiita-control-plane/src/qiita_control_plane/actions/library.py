@@ -2876,8 +2876,7 @@ async def delete_alignment_data(
     data_plane_url: str,
 ) -> int:
     """Delete an alignment's DuckLake `alignment` rows via the data plane's
-    `delete_alignment` DoAction, returning the rows-deleted count. The
-    alignment_definition row is not touched.
+    `delete_alignment` DoAction, returning the rows-deleted count.
 
     Signs a `delete_alignment` action token carrying only `alignment_idx`. The
     delete is a logical `DELETE FROM alignment WHERE alignment_idx = ?` inside one
@@ -3372,7 +3371,7 @@ async def delete_alignment_block(
     Returns the rows-deleted count for the workflow log.
 
     Refuses an 'abandoned' block: abandon-plan purged its footprint and cleared its
-    samples' gates, so a re-plan may already have registered rows over the same
+    prep_samples' gates, so a re-plan may already have registered rows over the same
     ranges, and this delete would remove them."""
     await _refuse_abandoned_block(pool, block_idx)
     members = [

@@ -587,6 +587,40 @@ async def test_delete_reference_purges_a_deprecated_alignment_and_keeps_its_row(
         )
 
 
+async def test_a_failed_reference_delete_leaves_the_purged_alignment_unreactivatable(
+    client, postgres_pool, monkeypatch
+):
+    """The deprecated alignment's rows are purged before the reference's own data. A
+    data-plane failure after that leaves the reference row in place, so it cannot be
+    what proves the purge: the stamp on the alignment is, and it is written first."""
+    import pyarrow.flight as flight
+
+    async def _purge(*, alignment_idx, signing_key, data_plane_url):
+        return 3
+
+    async def _boom(*, reference_idx, signing_key, data_plane_url):
+        raise flight.FlightUnavailableError("data plane down")
+
+    monkeypatch.setattr("qiita_control_plane.routes.reference.delete_alignment_data", _purge)
+    monkeypatch.setattr("qiita_control_plane.routes.reference.delete_reference_data", _boom)
+    ref_idx = await _create_ref(client, f"del-partial-{uuid.uuid4()}")
+    align_idx = await _seed_deprecated_alignment(postgres_pool, ref_idx)
+    try:
+        resp = await client.delete(URL_REFERENCE_BY_IDX.format(reference_idx=ref_idx))
+        assert resp.status_code == 502
+        row = await postgres_pool.fetchrow(
+            "SELECT status, rows_purged_at FROM qiita.alignment_definition"
+            " WHERE alignment_idx = $1",
+            align_idx,
+        )
+        assert row["status"] == "deprecated"
+        assert row["rows_purged_at"] is not None
+    finally:
+        await postgres_pool.execute(
+            "DELETE FROM qiita.alignment_definition WHERE alignment_idx = $1", align_idx
+        )
+
+
 async def test_delete_reference_blocked_by_a_running_deprecated_alignment_block(
     client, postgres_pool, monkeypatch
 ):

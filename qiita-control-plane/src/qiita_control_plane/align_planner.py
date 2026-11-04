@@ -464,7 +464,7 @@ async def plan_and_submit_alignments(
         ]
         skipped_existing = len(to_consider) - len(to_plan)
 
-    # On a fresh plan (only_missing=False) refuse to re-plan ANY sample already
+    # On a fresh plan (only_missing=False) refuse to re-plan ANY prep_sample already
     # carrying an alignment_sample gate for its resolved alignment, whatever its
     # state; AlignResubmitError gives the reasons and the ways out.
     # `only_missing` already dropped all gated samples above, so this fires only

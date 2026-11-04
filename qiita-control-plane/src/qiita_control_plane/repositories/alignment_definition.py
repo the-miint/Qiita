@@ -44,7 +44,7 @@ ALIGNMENT_SAMPLE_INVALIDATED = gate_state_literal("invalidated", AlignmentSample
 
 ALIGNMENT_DEFINITION_RETURNING = (
     "alignment_idx, params_hash, params, created_by_idx, created_at, status,"
-    " deprecated_at, deprecated_by_idx, deprecation_reason, superseded_by"
+    " deprecated_at, deprecated_by_idx, deprecation_reason, superseded_by, rows_purged_at"
 )
 
 

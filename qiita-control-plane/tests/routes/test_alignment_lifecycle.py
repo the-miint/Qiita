@@ -321,21 +321,34 @@ async def test_mint_refuses_a_deprecated_config(client, lc):
             )
 
 
-async def test_reactivation_refused_once_the_reference_is_gone(client, lc):
+async def test_reactivation_refused_once_rows_were_purged(client, lc):
+    """Reference delete stamps rows_purged_at before purging. The stamp, not the
+    reference row, is the proof: a reference delete that failed after its purge
+    leaves the reference in place and the rows gone."""
     assert (await _deprecate(client, lc["alignment_idx"])).status_code == 200
-    # What reference delete leaves: the definition, naming a reference that is gone.
-    await lc["pool"].execute(
-        "UPDATE qiita.alignment_definition"
-        "   SET params = jsonb_set(params, '{reference_idx}', to_jsonb(2000000000::bigint))"
-        " WHERE alignment_idx = $1",
-        lc["alignment_idx"],
-    )
+    from qiita_control_plane.actions.reference import mark_deprecated_alignments_purged
+
+    assert await mark_deprecated_alignments_purged(lc["pool"], lc["reference_idx"]) == [
+        lc["alignment_idx"]
+    ]
     resp = await client.patch(
         URL_ALIGNMENT_DEFINITION_STATUS.format(alignment_idx=lc["alignment_idx"]),
         json={"status": "active"},
     )
     assert resp.status_code == 409
-    assert "has been deleted" in resp.json()["detail"]
+    assert "purged" in resp.json()["detail"]
+    # Re-deprecating with a corrected reason is still allowed, and keeps the stamp.
+    again = await _deprecate(client, lc["alignment_idx"])
+    assert again.status_code == 200
+    assert again.json()["rows_purged_at"] is not None
+
+
+async def test_an_active_alignment_is_not_stamped(client, lc):
+    """Only deprecated alignments are stamped, so one reactivated before reference
+    delete's stamp is left alone (and the delete's re-gate then refuses)."""
+    from qiita_control_plane.actions.reference import mark_deprecated_alignments_purged
+
+    assert await mark_deprecated_alignments_purged(lc["pool"], lc["reference_idx"]) == []
 
 
 # ---------------------------------------------------------------------------
