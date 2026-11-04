@@ -37,12 +37,12 @@ pub(super) fn setup_full_lake(conn: &duckdb::Connection) {
 }
 
 /// A TCP proxy in front of the test catalog's Postgres. Once a client message on
-/// a connection names `ducklake_snapshot` (DuckLake's commit writes a snapshot
-/// row), the proxy drops Postgres's answer to the next COMMIT on it and closes
-/// that connection, so
-/// the commit is in the catalog and the client is told it failed. Returns the
-/// connection string through the proxy, and whether it has cut a connection.
-/// Only the first such COMMIT is cut.
+/// a connection inserts a `ducklake_snapshot` row, which DuckLake's commit of a
+/// write does and a read (which only selects from that table) does not, the
+/// proxy drops Postgres's answer to the next COMMIT on it and closes that
+/// connection, so the commit is in the catalog and the client is told it failed.
+/// Returns the connection string through the proxy, and whether it has cut a
+/// connection. Only the first such COMMIT is cut.
 #[cfg(feature = "integration")]
 pub(super) fn catalog_that_loses_a_commit_answer(
     connstr: &str,
@@ -95,6 +95,7 @@ pub(super) fn catalog_that_loses_a_commit_answer(
         out
     }
 
+    const ARMS: &[u8] = b"ducklake_snapshot VALUES";
     let cut_flag = cut.clone();
     std::thread::spawn(move || {
         for client in listener.incoming() {
@@ -111,7 +112,7 @@ pub(super) fn catalog_that_loses_a_commit_answer(
                 while let Ok(n @ 1..) = c_read.read(&mut chunk) {
                     buf.extend_from_slice(&chunk[..n]);
                     for m in split(&mut buf, &mut untyped) {
-                        if m.windows(17).any(|w| w == b"ducklake_snapshot") {
+                        if m.windows(ARMS.len()).any(|w| w == ARMS) {
                             client_armed.store(true, Ordering::SeqCst);
                         }
                         if s_write.write_all(&m).is_err() {
