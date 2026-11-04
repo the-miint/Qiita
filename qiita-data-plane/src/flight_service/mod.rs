@@ -180,7 +180,7 @@ impl QiitaFlightService {
 ///   (see `lake_dest_filename`), so a replay recognises the earlier call's
 ///   files: it returns a committed registration without writing, and fails
 ///   closed otherwise (the replay check in `register_files` has the cases).
-/// - `delete_reference` / `delete_mask` / `delete_pool_reads` /
+/// - `delete_reference` / `delete_pool_reads` /
 ///   `delete_read_mask_block` / `delete_alignment` / `delete_alignment_block` /
 ///   `delete_alignment_sample` — logical DELETEs, idempotent against themselves:
 ///   a replay with no write in between deletes zero rows. Not commutative with
@@ -224,7 +224,6 @@ impl QiitaFlightService {
 const REPLAY_SAFE_ACTIONS: &[&str] = &[
     "register_files",
     "delete_reference",
-    "delete_mask",
     "delete_pool_reads",
     "delete_read_mask_block",
     "delete_alignment",
@@ -391,7 +390,6 @@ impl FlightService for QiitaFlightService {
         match action.r#type.as_str() {
             "register_files" => self.register_files_action(&action).await,
             "delete_reference" => self.delete_reference_action(&action).await,
-            "delete_mask" => self.delete_mask_action(&action).await,
             "delete_pool_reads" => self.delete_pool_reads_action(&action).await,
             "delete_read_mask_block" => self.delete_read_mask_block_action(&action).await,
             "delete_alignment" => self.delete_alignment_action(&action).await,

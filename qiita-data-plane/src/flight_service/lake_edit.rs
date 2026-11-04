@@ -33,21 +33,6 @@ impl QiitaFlightService {
         Self::action_response(&deleted)
     }
 
-    pub(super) async fn delete_mask_action(
-        &self,
-        action: &Action,
-    ) -> Result<Response<<Self as FlightService>::DoActionStream>, Status> {
-        let payload =
-            self.verify_action_payload(action, auth::verify_delete_mask, |p| p.action.as_str())?;
-
-        let mask_idx = payload.mask_idx;
-        let deleted = self
-            .blocking_lake_write("delete_mask", move |conn| delete_mask(conn, mask_idx))
-            .await?;
-
-        Self::action_response(&deleted)
-    }
-
     pub(super) async fn delete_pool_reads_action(
         &self,
         action: &Action,
@@ -350,45 +335,6 @@ fn delete_reference(conn: &LakeWriter, reference_idx: i64) -> Result<serde_json:
     Ok(out)
 }
 
-/// Logically delete every row a mask owns from the DuckLake `read_mask` table.
-///
-/// Mirrors `delete_reference`: one DuckLake transaction, logical `DELETE` only.
-/// No raw parquet `unlink` — DuckLake owns file lifecycle and a manual unlink
-/// would corrupt the catalog; orphan parquets are tolerated until a future
-/// maintenance pass (matches `delete_reference`, which also reclaims nothing
-/// from disk). Idempotent: deleting a `mask_idx` with zero rows is success and
-/// returns `rows_deleted: 0`, so the control plane can safely retry.
-fn delete_mask(conn: &LakeWriter, mask_idx: i64) -> Result<serde_json::Value, Status> {
-    // Single-statement delete wrapped in an explicit transaction so the action
-    // is all-or-nothing and the control plane can safely retry: a failed call
-    // leaves the mask's rows fully intact, so a retry sees the same row set.
-    conn.execute_batch("BEGIN TRANSACTION")
-        .map_err(|e| Status::internal(format!("failed to begin transaction: {e}")))?;
-
-    let deleted = conn.execute(
-        "DELETE FROM qiita_lake.read_mask WHERE mask_idx = ?",
-        [&mask_idx as &dyn duckdb::ToSql],
-    );
-
-    let rows_deleted = match deleted {
-        Ok(n) => n,
-        Err(e) => {
-            // Best-effort rollback; surface the original delete error.
-            let _ = conn.execute_batch("ROLLBACK");
-            return Err(Status::internal(format!(
-                "delete failed (DELETE FROM qiita_lake.read_mask WHERE mask_idx = ?): {e}"
-            )));
-        }
-    };
-    conn.execute_batch("COMMIT")
-        .map_err(|e| Status::internal(format!("failed to commit delete transaction: {e}")))?;
-
-    Ok(serde_json::json!({
-        "mask_idx": mask_idx,
-        "rows_deleted": rows_deleted,
-    }))
-}
-
 /// Replace the DuckLake `reference_exclusion` mirror wholesale from the control
 /// plane's resolved-blocklist Parquet.
 ///
@@ -405,7 +351,7 @@ fn delete_mask(conn: &LakeWriter, mask_idx: i64) -> Result<serde_json::Value, St
 /// reloads whatever the (authoritative) file holds. An empty blocklist ships a
 /// valid zero-row Parquet, so the DELETE + zero-row INSERT simply clears the
 /// mirror (re-enabling everything). Takes a borrowed instance so the caller can
-/// run it on the blocking pool (mirrors `delete_mask` / `register_files`).
+/// run it on the blocking pool (mirrors `delete_reference` / `register_files`).
 /// Returns the loaded row count.
 ///
 /// `dest` arrives lexically validated (`validate_export_dest`: absolute, under
@@ -584,7 +530,7 @@ fn mint_phylogeny_edge_id(
 /// `ingest_reads`) and any masks over them are orphaned once the pool's Postgres
 /// rows are gone. Both tables are keyed by `prep_sample_idx`.
 ///
-/// Mirrors `delete_reference` / `delete_mask`: one DuckLake transaction
+/// Mirrors `delete_reference`: one DuckLake transaction
 /// (all-or-nothing, so a failure leaves both tables intact and the control plane
 /// can safely retry), logical `DELETE` only — no raw parquet `unlink` (DuckLake
 /// owns file lifecycle; orphan parquets are reclaimed by a future maintenance
@@ -663,7 +609,7 @@ fn delete_pool_reads(
 /// order). The coarse `IN + BETWEEN` pair is a pushdown hint (see
 /// `block_read_where_clause`).
 ///
-/// Mirrors `delete_mask` / `delete_pool_reads`: one DuckLake transaction
+/// Mirrors `delete_pool_reads`: one DuckLake transaction
 /// (all-or-nothing, retriable — a failed call leaves the block's rows intact so a
 /// retry sees the same set), logical `DELETE` only (no raw parquet unlink —
 /// DuckLake owns file lifecycle). Idempotent: a fresh block (no rows yet) deletes
@@ -746,7 +692,7 @@ const _: () = assert!(!ALIGNMENT_DELETE_TABLES.is_empty());
 /// so a retry sees the same row set. Logical `DELETE` only. No raw parquet
 /// `unlink` — DuckLake owns file lifecycle and a manual unlink would corrupt the
 /// catalog; orphan parquets are tolerated until a future maintenance pass
-/// (matches `delete_mask`).
+/// (matches `delete_reference`).
 ///
 /// `tables` and `where_clause` are interpolated and `params` binds any `?` the
 /// clause carries, so the caller owns the injection argument for both — as
@@ -789,8 +735,7 @@ fn delete_lake_rows(
 /// disallow-without-delete resubmission rule needs (a completed
 /// `alignment_sample` must be cleared before re-aligning).
 ///
-/// The alignment twin of `delete_mask`; transaction, lockstep and parquet
-/// lifecycle are `delete_lake_rows`'. Idempotent: deleting an `alignment_idx`
+/// Transaction, lockstep and parquet lifecycle are `delete_lake_rows`'. Idempotent: deleting an `alignment_idx`
 /// with zero rows is success and returns `rows_deleted: 0`, so the control plane
 /// can safely retry. `alignment_idx` is an Ed25519-verified i64.
 ///

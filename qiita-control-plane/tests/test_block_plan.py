@@ -499,7 +499,7 @@ async def test_plan_only_missing_skips_already_gated(pooled, planapp):
 
 async def test_plan_disallow_resubmit_over_completed_mask(pooled, planapp):
     """A sample already COMPLETED for its resolved mask cannot be re-planned
-    without a DELETE (mirrors the pool COMPLETED-resubmit rule): re-masking would
+    under that mask (mirrors the pool COMPLETED-resubmit rule): re-masking would
     double-write its read_mask. only_missing=False raises BlockMaskResubmitError;
     only_missing=True skips it (the resume path)."""
     pool = pooled["pool"]

@@ -1,6 +1,5 @@
 """DB tests for DELETE /alignment-definition/{alignment_idx} — full alignment
-purge (the disallow-without-delete escape hatch), the alignment analog of
-test_mask_definition_delete.py.
+purge (the disallow-without-delete escape hatch).
 
 Exercises the Postgres-teardown + gating half against a real Postgres. The
 data-plane DoAction (DuckLake `alignment` cleanup) is stubbed — this tier has no

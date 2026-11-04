@@ -141,22 +141,6 @@ def test_ticket_doput_on_every_role_ceiling():
     assert Scope.REFERENCE_WRITE not in ROLE_IMPLIED_SCOPES[SystemRole.USER]
 
 
-def test_mask_definition_delete_is_system_admin_only():
-    """mask-definition:delete is the full-mask-purge scope — system_admin
-    only, like reference:delete and sequenced-pool:delete. wet_lab_admin can
-    create masks but not destroy them, and service accounts never get it.
-    The human_admin_session fixture derives its scopes from the system_admin
-    ceiling, so keeping the scope here is what lets that fixture drive
-    mask-delete route tests without a 403."""
-    from qiita_control_plane.auth.scopes import (
-        ROLE_IMPLIED_SCOPES,
-    )
-
-    assert Scope.MASK_DEFINITION_DELETE in ROLE_IMPLIED_SCOPES[SystemRole.SYSTEM_ADMIN]
-    assert Scope.MASK_DEFINITION_DELETE not in ROLE_IMPLIED_SCOPES[SystemRole.WET_LAB_ADMIN]
-    assert Scope.MASK_DEFINITION_DELETE not in ROLE_IMPLIED_SCOPES[SystemRole.USER]
-
-
 def test_work_ticket_cancel_is_system_admin_only():
     """work_ticket:cancel gates the operator-cancel of in-flight compute (flip
     terminal + scancel) — system_admin only, like reference:delete and the other
@@ -171,12 +155,11 @@ def test_work_ticket_cancel_is_system_admin_only():
     assert Scope.WORK_TICKET_CANCEL not in ROLE_IMPLIED_SCOPES[SystemRole.WET_LAB_ADMIN]
     assert Scope.WORK_TICKET_CANCEL not in ROLE_IMPLIED_SCOPES[SystemRole.USER]
     assert Scope.WORK_TICKET_CANCEL not in SERVICE_ACCOUNT_SCOPE_CEILING
-    assert Scope.MASK_DEFINITION_DELETE not in SERVICE_ACCOUNT_SCOPE_CEILING
 
 
 def test_alignment_definition_delete_is_system_admin_only():
     """alignment-definition:delete is the full-alignment-purge scope — system_admin
-    only, like mask-definition:delete. wet_lab_admin can submit align runs (via
+    only, like reference:delete. wet_lab_admin can submit align runs (via
     prep_sample:write) but not destroy their alignments, and service accounts never
     get it. It is the disallow-without-delete escape hatch, gated like every other
     destructive purge."""

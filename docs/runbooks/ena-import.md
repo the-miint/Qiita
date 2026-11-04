@@ -238,7 +238,7 @@ automatic retry for it yet.
 already filters out a retired prep_sample.** That includes the download roster,
 the block planners, the run, pool and study rosters, the amplicon pool roster, the
 rollups and exports, `has_sequenced_sample` (so a pool whose only runs are flagged
-gets no download ticket), `mask purge-failed` and the backfills. It is not deleted or retired, so it stays
+gets no download ticket) and the backfills. It is not deleted or retired, so it stays
 visible on the sample's own record and reappears the moment a later re-import finds
 it public again. Two things do **not** filter it, deliberately: a route that reads
 a sample by its own id (`read_masked`, alignment/assembly DoGets, the per-sample

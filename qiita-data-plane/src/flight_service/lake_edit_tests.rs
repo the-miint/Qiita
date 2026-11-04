@@ -131,63 +131,6 @@ fn delete_reference_whose_commit_answer_is_lost_reports_what_it_deleted() {
     assert_eq!(left, 0);
 }
 
-/// `delete_mask` drops exactly the target mask's `read_mask` rows, leaves a
-/// different mask untouched, and is idempotent: a second delete of the same
-/// mask_idx succeeds and reports `rows_deleted: 0`.
-#[test]
-#[serial_test::serial]
-#[cfg(feature = "integration")]
-fn delete_mask_drops_target_idempotently() {
-    let connstr = crate::test_catalog::connstr();
-    let data_path = crate::test_catalog::data_path();
-    let conn = Connection::open_in_memory().unwrap();
-    ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
-    ducklake::ensure_read_tables(&conn).unwrap();
-
-    // Unique ids so leftover rows never collide with other serial tests.
-    let mask_a: i64 = 930_000;
-    let mask_b: i64 = 930_001;
-    let prep: i64 = 930_010;
-    let seq1: i64 = 930_020;
-    let seq2: i64 = 930_021;
-
-    conn.execute_batch(&format!(
-        "DELETE FROM qiita_lake.read_mask WHERE mask_idx IN ({mask_a}, {mask_b});
-         INSERT INTO qiita_lake.read_mask \
-             (mask_idx, prep_sample_idx, sequence_idx, reason) VALUES \
-             ({mask_a}, {prep}, {seq1}, 'pass'), \
-             ({mask_a}, {prep}, {seq2}, 'pass'), \
-             ({mask_b}, {prep}, {seq1}, 'pass');"
-    ))
-    .unwrap();
-
-    let first =
-        delete_mask(&attached_writer(&connstr, &data_path), mask_a).expect("delete_mask failed");
-    assert_eq!(first["rows_deleted"], 2, "both mask_a rows deleted");
-    assert_eq!(first["mask_idx"], mask_a);
-
-    let count = |mask: i64| -> i64 {
-        conn.query_row(
-            &format!("SELECT count(*) FROM qiita_lake.read_mask WHERE mask_idx = {mask}"),
-            [],
-            |r| r.get(0),
-        )
-        .unwrap()
-    };
-    assert_eq!(count(mask_a), 0, "mask_a rows gone");
-    assert_eq!(count(mask_b), 1, "mask_b untouched");
-
-    // Idempotency: re-deleting the now-empty mask is success with 0 rows.
-    let second = delete_mask(&attached_writer(&connstr, &data_path), mask_a)
-        .expect("idempotent re-delete failed");
-    assert_eq!(second["rows_deleted"], 0, "second delete removes nothing");
-
-    // Best-effort cleanup of the surviving mask_b row.
-    let _ = conn.execute_batch(&format!(
-        "DELETE FROM qiita_lake.read_mask WHERE mask_idx = {mask_b};"
-    ));
-}
-
 /// `delete_read_mask_block` deletes EXACTLY one block's footprint: the
 /// per-member OR residual keeps a split prep_sample's sibling-block sub-range, the
 /// `mask_idx` scope keeps a different mask's rows for the same prep_sample, and a
@@ -284,8 +227,7 @@ fn delete_read_mask_block_deletes_footprint_only() {
 /// `delete_alignment` drops exactly the target alignment_idx's rows from
 /// every `ALIGNMENT_DELETE_TABLES` table, leaves a different alignment
 /// untouched in each, and is idempotent: a second delete of the same
-/// alignment_idx succeeds and reports `rows_deleted: 0`. The alignment twin of
-/// `delete_mask_drops_target_idempotently`.
+/// alignment_idx succeeds and reports `rows_deleted: 0`.
 ///
 /// The side table carries fewer rows than `alignment` here (only one of the
 /// two reads is origin-spanning), so `rows_deleted` cannot be satisfied by the

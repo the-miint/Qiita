@@ -189,6 +189,10 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
   ETag instead. The study-scoped reads' ETag no longer works as If-Match for
   `PATCH /biosample/{b}` or `PATCH /sequenced-sample/{q}`; a client uses the ETag from the
   GET on the PATCH's own path (the `qiita` CLI already does).
+- (#824) Soft API-contract change: `DELETE /mask-definition/{mask_idx}`,
+  `qiita-admin mask delete` / `mask purge-failed` and the `mask_definition:delete` scope are
+  removed. A PAT mint requesting that scope now gets `422 unknown scopes`; an existing token
+  carrying it keeps working without it. Deprecate a mask or invalidate its runs instead.
 
 ## Deployed history
 

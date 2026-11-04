@@ -122,19 +122,12 @@ class Scope(StrEnum):
     # two scopes above establish. Granted only to the service account that drives
     # block compute.
     READ_DOGET = "read:doget"
-    # Full purge of a mask (the mask_definition row + its DuckLake read_mask
-    # rows). Deliberately distinct from the mask-minting capability: deletion
-    # is destructive and admin-only, granted solely to system_admin in
-    # ROLE_IMPLIED_SCOPES — never to wet_lab_admin or service accounts.
-    # Mirrors REFERENCE_DELETE.
-    MASK_DEFINITION_DELETE = "mask_definition:delete"
     # Mask LIFECYCLE: deprecate a config so it can no longer be minted against, and
-    # withdraw individual runs of a sound config. Separate from
-    # MASK_DEFINITION_DELETE because the two are opposites — deletion destroys the
-    # record of what filtered published data, deprecation preserves it and adds the
-    # judgement. Separate from the minting capability (READ_MASKED_DOGET) because a
-    # service account that mints masks must not be able to void them. system_admin
-    # only, in ROLE_IMPLIED_SCOPES.
+    # withdraw individual runs of a sound config. A mask is kept as the record of
+    # what filtered published data; deprecation preserves it and adds the
+    # judgement. Separate from the minting capability (READ_MASKED_DOGET) because
+    # a service account that mints masks must not be able to void them.
+    # system_admin only, in ROLE_IMPLIED_SCOPES.
     MASK_DEFINITION_LIFECYCLE = "mask_definition:lifecycle"
     # Processing-run LIFECYCLE: deprecate a qiita.processing config, and withdraw
     # individual (run, sample) pairs of a sound one. Separate from
@@ -145,11 +138,11 @@ class Scope(StrEnum):
     # in ROLE_IMPLIED_SCOPES.
     PROCESSING_LIFECYCLE = "processing:lifecycle"
     # Full purge of an alignment (the alignment_definition row + its DuckLake
-    # alignment rows; the alignment_sample gate cascade-deletes). Deliberately
-    # distinct from the align-submitting capability (PREP_SAMPLE_WRITE): deletion
-    # is destructive and admin-only, granted solely to system_admin in
-    # ROLE_IMPLIED_SCOPES — never to wet_lab_admin or service accounts. Mirrors
-    # MASK_DEFINITION_DELETE; it is the disallow-without-delete escape hatch.
+    # alignment rows; the alignment_sample gate cascade-deletes). Distinct from the
+    # align-submitting capability (PREP_SAMPLE_WRITE): deletion is destructive and
+    # admin-only, granted solely to system_admin in ROLE_IMPLIED_SCOPES — never to
+    # wet_lab_admin or service accounts. It is the disallow-without-delete escape
+    # hatch.
     ALIGNMENT_DEFINITION_DELETE = "alignment_definition:delete"
     # Generic upload domain. Gates the slot-minting + DoPut path; not
     # reference-specific. On every role ceiling and on service accounts: it
