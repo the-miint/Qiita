@@ -42,7 +42,9 @@ def _decode_ticket_payload(ticket_b64: str) -> dict:
     return json.loads(raw[5 : 5 + payload_len])
 
 
-async def _seed_feature_table_ticket(pool, *, alignment_idx, prep_sample_idx):
+async def _seed_feature_table_ticket(
+    pool, *, alignment_idx, prep_sample_idx, denovo_alignment_idx=None
+):
     """Insert the minimal reference + action + work_ticket carrying a
     feature-table action_context. Returns (work_ticket_idx, action_id, version,
     reference_idx) for teardown."""
@@ -76,7 +78,14 @@ async def _seed_feature_table_ticket(pool, *, alignment_idx, prep_sample_idx):
         action_id,
         version,
         ref_idx,
-        json.dumps({"alignment_idx": alignment_idx, "prep_sample_idx": prep_sample_idx}),
+        json.dumps(
+            {"alignment_idx": alignment_idx, "prep_sample_idx": prep_sample_idx}
+            | (
+                {}
+                if denovo_alignment_idx is None
+                else {"denovo_alignment_idx": denovo_alignment_idx}
+            )
+        ),
     )
     return wt_idx, action_id, version, ref_idx
 
@@ -460,5 +469,106 @@ async def test_doget_refuses_an_alignment_deprecated_since_submit(ctx, aligned):
         )
         assert resp.status_code == 409, resp.text
         assert "bad build" in resp.json()["detail"]
+    finally:
+        await _cleanup_ticket(ctx["pool"], wt_idx, *rest)
+
+
+@pytest_asyncio.fixture
+async def denovo(postgres_pool, aligned):
+    """A de novo alignment paired with `aligned`, over an assembly run in which the
+    first and last prep_samples assembled and the middle one had nothing to assemble
+    (`no_data`), so it has no de novo gate row."""
+    from qiita_control_plane.repositories.alignment_definition import mint_alignment_definition
+
+    a, b, c = aligned["samples"]
+    processing_idx = await postgres_pool.fetchval(
+        "INSERT INTO qiita.processing (params_hash, workflow, version, params)"
+        " VALUES ($1, 'long-read-assembly', '1.0.0', '{}'::jsonb) RETURNING processing_idx",
+        uuid.uuid4().bytes + uuid.uuid4().bytes,
+    )
+    async with postgres_pool.acquire() as conn:
+        row = await mint_alignment_definition(
+            conn,
+            # No mask_idx, like `aligned`'s params: the two arms must agree on it.
+            params={"subject": "assembly", "aligner": "minimap2", "processing_idx": processing_idx},
+            principal_idx=aligned["owner"],
+        )
+    denovo_alignment_idx = row["alignment_idx"]
+    await postgres_pool.executemany(
+        "INSERT INTO qiita.assembly_sample (processing_idx, prep_sample_idx, state)"
+        " VALUES ($1, $2, $3)",
+        [
+            (processing_idx, a, "completed"),
+            (processing_idx, b, "no_data"),
+            (processing_idx, c, "completed"),
+        ],
+    )
+    await postgres_pool.executemany(
+        "INSERT INTO qiita.alignment_sample (alignment_idx, prep_sample_idx, state)"
+        " VALUES ($1, $2, 'completed')",
+        [(denovo_alignment_idx, a), (denovo_alignment_idx, c)],
+    )
+    yield {"alignment_idx": denovo_alignment_idx, "processing_idx": processing_idx}
+    await postgres_pool.execute(
+        "DELETE FROM qiita.alignment_sample WHERE alignment_idx = $1", denovo_alignment_idx
+    )
+    await postgres_pool.execute(
+        "DELETE FROM qiita.alignment_definition WHERE alignment_idx = $1", denovo_alignment_idx
+    )
+    await postgres_pool.execute(
+        "DELETE FROM qiita.assembly_sample WHERE processing_idx = $1", processing_idx
+    )
+    await postgres_pool.execute(
+        "DELETE FROM qiita.processing WHERE processing_idx = $1", processing_idx
+    )
+
+
+async def test_doget_denovo_arm_signs_a_cohort_with_a_no_data_member(ctx, aligned, denovo):
+    """Submit expects a de novo row only for the assembled members; a `no_data` one is
+    reference-only. The re-check at mint applies the same split, so the cohort is
+    signed rather than refused for the member that never had a de novo row."""
+    wt_idx, *rest = await _seed_feature_table_ticket(
+        ctx["pool"],
+        alignment_idx=aligned["alignment_idx"],
+        prep_sample_idx=aligned["samples"],
+        denovo_alignment_idx=denovo["alignment_idx"],
+    )
+    try:
+        resp = await ctx["sa"].post(
+            URL_ALIGNMENT_DOGET,
+            json={"work_ticket_idx": wt_idx, "columns": ["feature_idx"], "denovo": True},
+        )
+        assert resp.status_code == 201, resp.text
+        payload = _decode_ticket_payload(resp.json()["ticket"])
+        assert str(denovo["alignment_idx"]) in json.dumps(payload)
+    finally:
+        await _cleanup_ticket(ctx["pool"], wt_idx, *rest)
+
+
+async def test_doget_denovo_arm_refuses_an_assembled_member_invalidated_since_submit(
+    ctx, aligned, denovo
+):
+    a, _b, c = aligned["samples"]
+    wt_idx, *rest = await _seed_feature_table_ticket(
+        ctx["pool"],
+        alignment_idx=aligned["alignment_idx"],
+        prep_sample_idx=aligned["samples"],
+        denovo_alignment_idx=denovo["alignment_idx"],
+    )
+    await ctx["pool"].execute(
+        "UPDATE qiita.alignment_sample SET state = 'invalidated', invalidated_at = now(),"
+        "       invalidated_by_idx = $3, invalidation_reason = 'bad run'"
+        " WHERE alignment_idx = $1 AND prep_sample_idx = $2",
+        denovo["alignment_idx"],
+        c,
+        aligned["owner"],
+    )
+    try:
+        resp = await ctx["sa"].post(
+            URL_ALIGNMENT_DOGET,
+            json={"work_ticket_idx": wt_idx, "columns": ["feature_idx"], "denovo": True},
+        )
+        assert resp.status_code == 409, resp.text
+        assert str(c) in resp.json()["detail"]
     finally:
         await _cleanup_ticket(ctx["pool"], wt_idx, *rest)

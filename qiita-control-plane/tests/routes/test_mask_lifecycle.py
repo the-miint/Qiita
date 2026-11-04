@@ -667,3 +667,65 @@ async def test_a_deprecated_mask_cannot_be_recorded_on_a_ticket(client, lifecycl
         await delete_action_if_created(
             postgres_pool, action_id=READ_MASK_ACTION_ID, version=version, created=created
         )
+
+
+async def test_mask_deprecation_waits_for_a_writer_holding_the_definition(
+    client, lifecycle, postgres_pool
+):
+    """A writer holds the mask row `FOR SHARE` until its ticket commits. The
+    deprecation waits for it and then counts the ticket, rather than committing
+    between the writer's check and its ticket."""
+    import asyncio
+
+    from qiita_common.actions import READ_MASK_ACTION_ID
+
+    from qiita_control_plane.repositories.mask_definition import lock_active_mask
+    from qiita_control_plane.testing.db_seeds import (
+        delete_action_if_created,
+        seed_action_if_absent,
+    )
+
+    version = f"lifecycle-{secrets.token_hex(4)}"
+    created = await seed_action_if_absent(
+        postgres_pool, action_id=READ_MASK_ACTION_ID, version=version, target_kind="prep_sample"
+    )
+    wt = None
+    try:
+        async with postgres_pool.acquire() as conn:
+            tx = conn.transaction()
+            await tx.start()
+            try:
+                await lock_active_mask(conn, lifecycle["mask_idx"])
+                # Only the check's lock is held: the ticket's own FK lock would make the
+                # deprecation wait too, and would hide a check taken without a lock.
+                deprecation = asyncio.create_task(_deprecate(client, lifecycle["mask_idx"]))
+                # Long enough for a request that does not wait on a lock to finish.
+                await asyncio.sleep(0.5)
+                assert not deprecation.done(), "the deprecation did not wait for the writer"
+                wt = await conn.fetchval(
+                    "INSERT INTO qiita.work_ticket (action_id, action_version,"
+                    "  originator_principal_idx, scope_target_kind, prep_sample_idx,"
+                    "  mask_idx, state)"
+                    " VALUES ($1, $2, $3, 'prep_sample', $4, $5, $6) RETURNING work_ticket_idx",
+                    READ_MASK_ACTION_ID,
+                    version,
+                    lifecycle["principal_idx"],
+                    lifecycle["ps_pending"],
+                    lifecycle["mask_idx"],
+                    WorkTicketState.PROCESSING.value,
+                )
+                await tx.commit()
+            except BaseException:
+                await tx.rollback()
+                raise
+        resp = await deprecation
+        assert resp.status_code == 409, resp.text
+        assert resp.json()["detail"]["work_ticket_idx"] == [wt]
+    finally:
+        if wt is not None:
+            await postgres_pool.execute(
+                "DELETE FROM qiita.work_ticket WHERE work_ticket_idx = $1", wt
+            )
+        await delete_action_if_created(
+            postgres_pool, action_id=READ_MASK_ACTION_ID, version=version, created=created
+        )

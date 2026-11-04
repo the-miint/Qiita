@@ -59,7 +59,11 @@ from ..deps import (
     get_flight_signing_key,
     get_tx_conn_factory,
 )
-from ..feature_table import parse_feature_table_denovo, parse_feature_table_scope
+from ..feature_table import (
+    denovo_alignment_processing_idx,
+    parse_feature_table_denovo,
+    parse_feature_table_scope,
+)
 from ..repositories.alignment_definition import (
     AlignmentDefinitionNotFound,
     AlignmentHasLiveWork,
@@ -69,6 +73,7 @@ from ..repositories.alignment_definition import (
     set_alignment_sample_states,
     transition_alignment_definition_status,
 )
+from ..repositories.assembly import classify_denovo_arm_cohort
 from ..repositories.block import list_incomplete_alignment_samples
 from ._helpers import ALIGNMENT_NOT_FOUND_DETAIL, authorize_completed_alignment_cohort, first_few
 
@@ -306,12 +311,21 @@ async def create_alignment_doget_ticket(
                     " so there is no de novo arm to sign"
                 ),
             )
+        covered = await _denovo_arm_covered(
+            pool,
+            work_ticket_idx=body.work_ticket_idx,
+            reference_alignment_idx=alignment_idx,
+            denovo_alignment_idx=denovo_alignment_idx,
+            prep_sample_idx=prep_sample_idx,
+        )
         alignment_idx = denovo_alignment_idx
+    else:
+        covered = prep_sample_idx
     await _refuse_withdrawn_since_submit(
         pool,
         work_ticket_idx=body.work_ticket_idx,
         alignment_idx=alignment_idx,
-        prep_sample_idx=prep_sample_idx,
+        prep_sample_idx=covered,
     )
     return _sign_alignment_ticket(
         alignment_idx=alignment_idx,
@@ -368,6 +382,51 @@ async def create_alignment_cohort_doget_ticket(
         columns=body.columns,
         signing_key=signing_key,
     )
+
+
+async def _denovo_arm_covered(
+    pool: asyncpg.Pool,
+    *,
+    work_ticket_idx: int,
+    reference_alignment_idx: int,
+    denovo_alignment_idx: int,
+    prep_sample_idx: list[int],
+) -> list[int]:
+    """The cohort members the de novo arm must cover: the assembled ones, as decided
+    at submit (`classify_denovo_arm_cohort`). A `no_data` member has no de novo
+    alignment row and is reference-only, so it is not re-checked against that
+    alignment. 409 when a member's assembly gate has since left `completed` /
+    `no_data`."""
+    denovo = await fetch_alignment_definition_by_idx(pool, denovo_alignment_idx)
+    reference = await fetch_alignment_definition_by_idx(pool, reference_alignment_idx)
+    if denovo is None or reference is None:
+        raise HTTPException(status_code=404, detail=ALIGNMENT_NOT_FOUND_DETAIL)
+    try:
+        processing_idx = denovo_alignment_processing_idx(
+            denovo_alignment_idx=denovo_alignment_idx,
+            denovo_params=_params(denovo),
+            reference_params=_params(reference),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    cohort = await classify_denovo_arm_cohort(
+        pool, processing_idx=processing_idx, prep_sample_idx=prep_sample_idx
+    )
+    if cohort.unusable:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"{len(cohort.unusable)} prep_sample(s) of work ticket {work_ticket_idx} are"
+                f" no longer 'completed' or 'no_data' in assembly run {processing_idx}"
+                f" (e.g. {first_few(sorted(cohort.unusable))})"
+            ),
+        )
+    return cohort.expected
+
+
+def _params(row: asyncpg.Record) -> object:
+    params = row["params"]
+    return json.loads(params) if isinstance(params, str) else params
 
 
 async def _refuse_withdrawn_since_submit(

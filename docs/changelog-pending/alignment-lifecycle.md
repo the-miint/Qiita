@@ -49,4 +49,11 @@
   reference with any alignment against it, deprecated or not, cannot be deleted.
 - **The service-account alignment DoGet re-checks its cohort (#829).** It returns 409
   when the alignment was deprecated, or a prep_sample invalidated, after the
-  feature-table ticket was submitted.
+  feature-table ticket was submitted. The de novo arm re-checks only the prep_samples
+  whose assembly completed, as submit does: one with nothing to assemble (`no_data`)
+  stays reference-only. A prep_sample whose assembly gate has since left `completed`
+  or `no_data` is a 409.
+- **`POST /work-ticket/{work_ticket_idx}/run` clears `dispatch_held` (#829).** The
+  ticket it dispatches is no longer held, so the fan-out pump does not count it as
+  waiting for a slot. It also waits for a deprecation of the ticket's alignment or
+  mask that is in progress, and then refuses (409).

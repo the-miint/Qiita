@@ -60,11 +60,9 @@ from ..feature_table import (
 from ..miint import duckdb_connect
 from ..repositories.alignment_definition import fetch_alignment_definition_by_idx
 from ..repositories.assembly import (
-    ASSEMBLY_SAMPLE_COMPLETED,
-    ASSEMBLY_SAMPLE_NO_DATA,
+    classify_denovo_arm_cohort,
     count_assembly_membership_without_genome,
     fetch_assembly_genome_subject,
-    fetch_assembly_sample_states,
 )
 from ..repositories.block import list_incomplete_alignment_samples
 from ..repositories.processing import fetch_processing_by_idx
@@ -228,17 +226,10 @@ async def _apply_arm_gate(
     The last three are refusals whatever the alignment gate says, because none of
     them is a state a table may be built over.
     """
-    assembly_states = await fetch_assembly_sample_states(
+    cohort = await classify_denovo_arm_cohort(
         pool, processing_idx=processing_idx, prep_sample_idx=prep_sample_idx
     )
-    expected = [
-        idx for idx in prep_sample_idx if assembly_states.get(idx) == ASSEMBLY_SAMPLE_COMPLETED
-    ]
-    unusable = {
-        idx: assembly_states.get(idx)
-        for idx in prep_sample_idx
-        if assembly_states.get(idx) not in (ASSEMBLY_SAMPLE_COMPLETED, ASSEMBLY_SAMPLE_NO_DATA)
-    }
+    expected, unusable = cohort.expected, cohort.unusable
     if unusable:
         listed = sorted(unusable.items())[:_MAX_REPORTED]
         raise _submission_bad_input(

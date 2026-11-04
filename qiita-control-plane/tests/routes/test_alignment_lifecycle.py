@@ -7,8 +7,10 @@ replaced by a recording stub, so these tests check what the control plane owns: 
 Postgres transitions, the purge's arguments, and that a failed purge changes nothing.
 """
 
+import asyncio
 import json
 import secrets
+import types
 
 import pytest
 import pytest_asyncio
@@ -28,6 +30,7 @@ from qiita_control_plane.fanout_dispatch import align_block_cohort, top_up_dispa
 from qiita_control_plane.repositories.alignment_definition import (
     AlignmentDefinitionDeprecated,
     mint_alignment_definition,
+    refuse_deprecating_with_live_work,
 )
 from qiita_control_plane.repositories.block import (
     AlignmentSampleInvalidated,
@@ -708,6 +711,160 @@ async def test_redrive_refuses_an_abandoned_block_and_a_deprecated_alignment(
     resp = await client.post(URL_WORK_TICKET_RUN.format(work_ticket_idx=failed_wt))
     assert resp.status_code == 409
     assert "deprecated" in resp.json()["detail"]
+
+
+_WT = "qiita_control_plane.routes.work_ticket"
+# Long enough for a request that does not wait on a lock to have finished.
+_BLOCKED_FOR = 0.5
+
+
+@pytest.fixture
+def run_stubs(monkeypatch):
+    """Let /run reach its UPDATE and dispatch: the shared seeded align action has no
+    steps, and these tests have no compute backend. Returns the dispatched idxs."""
+    dispatched: list[int] = []
+
+    async def _definition(*_a, **_k):
+        return types.SimpleNamespace(steps=[])
+
+    monkeypatch.setattr(f"{_WT}._fetch_action", _definition)
+    monkeypatch.setattr(f"{_WT}.check_step_progress", lambda *_a, **_k: None)
+    monkeypatch.setattr(f"{_WT}.schedule_dispatch", lambda _app, idx: dispatched.append(idx))
+    return dispatched
+
+
+async def _dispatch_held(pool, wt):
+    return await pool.fetchval(
+        "SELECT dispatch_held FROM qiita.work_ticket WHERE work_ticket_idx = $1", wt
+    )
+
+
+@pytest.mark.parametrize("ticket_state", [WorkTicketState.FAILED, WorkTicketState.PENDING])
+async def test_run_releases_a_held_ticket_it_dispatches(client, lc, run_stubs, ticket_state):
+    """/run dispatches the ticket itself, so it clears `dispatch_held`: otherwise
+    abandon-plan would take a running ticket for a held one and cancel it without a
+    scancel."""
+    a, _b, _c = lc["samples"]
+    _block, wt = await lc["make_block"](
+        [(a, 1, 100)], block_state="pending", ticket_state=ticket_state, dispatch_held=True
+    )
+    resp = await client.post(URL_WORK_TICKET_RUN.format(work_ticket_idx=wt))
+    assert resp.is_success, resp.text
+    assert run_stubs == [wt]
+    assert await _dispatch_held(lc["pool"], wt) is False
+
+
+async def test_abandon_refuses_a_flagged_ticket_that_is_running(client, lc, purge):
+    """A ticket still flagged `dispatch_held` but past 'pending' was dispatched, so it
+    may have a job: it is running, not held, and abandon-plan refuses."""
+    a, _b, _c = lc["samples"]
+    _block, wt = await lc["make_block"](
+        [(a, 1, 100)],
+        block_state="processing",
+        ticket_state=WorkTicketState.PROCESSING,
+        dispatch_held=True,
+    )
+    await lc["set_gate"](a, "pending")
+    resp = await client.post(
+        URL_ALIGNMENT_DEFINITION_ABANDON_PLAN.format(alignment_idx=lc["alignment_idx"])
+    )
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["detail"]["work_ticket_idx"] == [wt]
+    state = await lc["pool"].fetchval(
+        "SELECT state::text FROM qiita.work_ticket WHERE work_ticket_idx = $1", wt
+    )
+    assert state == WorkTicketState.PROCESSING.value
+    assert purge.calls == []
+
+
+async def test_run_waits_for_a_deprecation_holding_the_definition(client, lc, run_stubs):
+    """A deprecation holds the definition `FOR UPDATE` while it counts unfinished
+    tickets; a failed ticket is not one. /run takes the row `FOR SHARE`, so it waits
+    for the deprecation and then refuses, rather than reviving the ticket under a
+    config that is void."""
+    a, _b, _c = lc["samples"]
+    _block, wt = await lc["make_block"](
+        [(a, 1, 100)], block_state="pending", ticket_state=WorkTicketState.FAILED
+    )
+    conn = await lc["pool"].acquire()
+    tx = conn.transaction()
+    await tx.start()
+    try:
+        await refuse_deprecating_with_live_work(conn, lc["alignment_idx"])
+        run = asyncio.create_task(client.post(URL_WORK_TICKET_RUN.format(work_ticket_idx=wt)))
+        await asyncio.sleep(_BLOCKED_FOR)
+        assert not run.done(), "/run did not wait for the definition lock"
+        await conn.execute(
+            "UPDATE qiita.alignment_definition SET status = $3, deprecated_at = now(),"
+            "       deprecated_by_idx = $2, deprecation_reason = 'late'"
+            " WHERE alignment_idx = $1",
+            lc["alignment_idx"],
+            lc["owner"],
+            AlignmentDefinitionStatus.DEPRECATED.value,
+        )
+        await tx.commit()
+    except BaseException:
+        await tx.rollback()
+        raise
+    finally:
+        await lc["pool"].release(conn)
+    resp = await run
+    assert resp.status_code == 409, resp.text
+    assert "deprecated" in resp.json()["detail"]
+    assert run_stubs == []
+
+
+async def test_deprecation_waits_for_a_writer_holding_the_definition(client, lc):
+    """A writer holds the definition `FOR SHARE` until its ticket commits. The
+    deprecation waits for it and then counts the ticket, rather than committing
+    between the writer's check and its ticket."""
+    from qiita_common.actions import ALIGN_DENOVO_ACTION_ID
+
+    from qiita_control_plane.repositories.alignment_definition import lock_active_alignment
+
+    pool = lc["pool"]
+    a, _b, _c = lc["samples"]
+    version = f"lifecycle-{secrets.token_hex(4)}"
+    created = await seed_action_if_absent(
+        pool, action_id=ALIGN_DENOVO_ACTION_ID, version=version, target_kind="prep_sample"
+    )
+    wt = None
+    try:
+        async with pool.acquire() as conn:
+            tx = conn.transaction()
+            await tx.start()
+            try:
+                await lock_active_alignment(conn, lc["alignment_idx"])
+                # Only the check's lock is held: the ticket's own FK lock would make the
+                # deprecation wait too, and would hide a check taken without a lock.
+                deprecation = asyncio.create_task(_deprecate(client, lc["alignment_idx"]))
+                await asyncio.sleep(_BLOCKED_FOR)
+                assert not deprecation.done(), "the deprecation did not wait for the writer"
+                wt = await conn.fetchval(
+                    "INSERT INTO qiita.work_ticket (action_id, action_version,"
+                    "  originator_principal_idx, scope_target_kind, prep_sample_idx,"
+                    "  alignment_idx, state)"
+                    " VALUES ($1, $2, $3, 'prep_sample', $4, $5, $6) RETURNING work_ticket_idx",
+                    ALIGN_DENOVO_ACTION_ID,
+                    version,
+                    lc["owner"],
+                    a,
+                    lc["alignment_idx"],
+                    WorkTicketState.PROCESSING.value,
+                )
+                await tx.commit()
+            except BaseException:
+                await tx.rollback()
+                raise
+        resp = await deprecation
+        assert resp.status_code == 409, resp.text
+        assert resp.json()["detail"]["work_ticket_idx"] == [wt]
+    finally:
+        if wt is not None:
+            await pool.execute("DELETE FROM qiita.work_ticket WHERE work_ticket_idx = $1", wt)
+        await delete_action_if_created(
+            pool, action_id=ALIGN_DENOVO_ACTION_ID, version=version, created=created
+        )
 
 
 async def test_cohort_doget_refuses_a_deprecated_alignment(client, lc):

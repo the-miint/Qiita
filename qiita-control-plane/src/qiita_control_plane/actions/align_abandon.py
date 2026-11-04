@@ -12,10 +12,11 @@ The first is one Postgres transaction:
 1. Lock the alignment_definition row (404 if absent) and the align fan-out cohort's
    advisory lock, so no pump releases a held ticket while this reads them.
 2. Collect the blocks under this alignment that are neither 'completed' nor already
-   'abandoned', locking them and their tickets. Refuse (`AlignPlanInFlight`) if any
-   ticket was released and is still non-terminal: a running block would register
+   'abandoned', locking them and their tickets. A ticket is held when it is flagged
+   `dispatch_held` and still 'pending'. Refuse (`AlignPlanInFlight`) if any other
+   ticket is non-terminal: it may have a job, and a running block would register
    rows and reconcile after its gates were cleared.
-3. Cancel the still-held tickets (never released, so there is no SLURM job to reap),
+3. Cancel the held tickets (never released, so there is no SLURM job to reap),
    set every collected block 'abandoned', and delete the 'pending' gates those blocks
    covered.
 
@@ -99,18 +100,22 @@ async def abandon_align_plan(
             alignment_idx,
             [BLOCK_COMPLETED, BLOCK_ABANDONED],
         )
+        # The flag alone is not enough: a ticket /run dispatched before /run cleared
+        # the flag still carries it while queued or processing.
+        held = [
+            r["work_ticket_idx"]
+            for r in blocks
+            if r["dispatch_held"] and r["state"] == WorkTicketState.PENDING.value
+        ]
         running = [
             r["work_ticket_idx"]
             for r in blocks
-            if not r["dispatch_held"] and r["state"] in in_flight
+            if r["state"] in in_flight and r["work_ticket_idx"] not in held
         ]
         if running:
             raise AlignPlanInFlight(alignment_idx, running)
 
         block_idxs = [r["block_idx"] for r in blocks]
-        held = [
-            r["work_ticket_idx"] for r in blocks if r["dispatch_held"] and r["state"] in in_flight
-        ]
         if held:
             # The flip of work_ticket_cancel.cancel_work_ticket without its scancel: a
             # held ticket was never released, so no job exists.

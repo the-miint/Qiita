@@ -643,3 +643,34 @@ async def test_align_plan_requires_wet_lab_admin(ctx, planned):
     await _seed_align_action(planned["db"])
     resp = await ctx["user"].post(_url(planned), json=_body(planned))
     assert resp.status_code == 403, resp.text
+
+
+async def test_align_plan_holds_both_definitions_in_its_ticket_transaction(
+    ctx, planned, monkeypatch
+):
+    """The plan takes the alignment and mask rows `FOR SHARE` in the transaction that
+    writes the tickets, so a deprecation either commits first (and the plan refuses)
+    or waits and then counts the tickets. Recorded at the call, because a deprecated
+    config is refused earlier by the mint and so cannot tell a missing lock apart."""
+    locked: list[tuple[str, int, bool]] = []
+    real_alignment = align_planner.lock_active_alignment
+    real_mask = align_planner.lock_active_mask
+
+    async def _alignment(conn, idx):
+        locked.append(("alignment", idx, conn.is_in_transaction()))
+        await real_alignment(conn, idx)
+
+    async def _mask(conn, idx):
+        locked.append(("mask", idx, conn.is_in_transaction()))
+        await real_mask(conn, idx)
+
+    monkeypatch.setattr(align_planner, "lock_active_alignment", _alignment)
+    monkeypatch.setattr(align_planner, "lock_active_mask", _mask)
+    await _seed_align_action(planned["db"])
+    resp = await ctx["wet"].post(_url(planned), json=_body(planned))
+    assert resp.status_code == 202, resp.text
+    alignment_idx = resp.json()["partitions"][0]["alignment_idx"]
+    assert locked == [
+        ("alignment", alignment_idx, True),
+        ("mask", planned["mask_idx"], True),
+    ]
