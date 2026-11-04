@@ -146,13 +146,12 @@ of this vintage or later refuses a ticket carrying a field it does not know
 older one silently applied its own idea of the projection instead.
 
 For `alignment_visible` there is **no server-side default projection** — a ticket
-without a column list is refused. Only the consumer knows which columns it binds, and a fallback in
-the data plane would be a second answer to that question, free to drift wider
-than what was asked for. The cost is that a ticket minted before a deploy and
-redeemed inside its 300 s TTL after it fails with `InvalidArgument`; that is
-preferred to widening it silently. A consumer of either table owns its list as
-one constant and uses it twice — for the ticket and for the `SELECT` that it
-binds — so the two cannot drift.
+without a column list is refused. Why, and what that costs a ticket minted
+across a deploy, is stated at the guard in `select_list_for`
+(`qiita-data-plane/src/flight_service/query.rs`).
+
+A consumer of either table owns its list as one constant and uses it twice — for
+the ticket and for the `SELECT` that it binds — so the two cannot drift.
 
 Allowlist constants: `PROJECTION_RULES` and its column lists
 (`ALIGNMENT_PROJECTION_COLUMNS`, `READ_MASKED_PROJECTION_COLUMNS`) in

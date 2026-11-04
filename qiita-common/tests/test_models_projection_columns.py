@@ -1,5 +1,5 @@
-"""The caps on `ProjectionColumns`, the one alias every projecting ticket body uses:
-at most 128 names, each 1 to 64 characters, and never an empty list."""
+"""The caps on `ProjectionColumns`, the one alias that every projecting ticket body
+uses: at most 128 names, each 1 to 64 characters, and never an empty list."""
 
 import pydantic
 import pytest
