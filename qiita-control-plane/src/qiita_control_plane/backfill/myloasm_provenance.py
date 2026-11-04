@@ -72,8 +72,9 @@ _ATTEMPT_KEY = "assemble_attempt"
 # Every run of a source version's myloasm processing, with its source ticket and
 # attempt (NULL when either is missing) and its newest recovery ticket (NULL when
 # none). An omitted `assembler` on a ticket is the action's context_schema default,
-# which is how the runner resolved it. A run's `processing.params` keys are the
-# binding names that the runner's `_build_processing_params` writes them under.
+# which is how the runner resolved it. `_build_processing_params`
+# (runner/_processing.py) writes `processing.params` under keys equal to
+# `MASK_IDX_BINDING` and `ASSEMBLER_BINDING`, so the query reads it with those.
 _RUNS_SQL = """
 SELECT s.prep_sample_idx, s.processing_idx, s.state AS sample_state,
        p.status AS processing_status, (p.params->>$9::text)::bigint AS mask_idx,
@@ -130,8 +131,9 @@ class RunStatus(StrEnum):
 
 
 class ResidueKind(StrEnum):
-    """Why a run is residue, with no identifier in it: what the dry run counts, so
-    the counts can be reported where an `_idx` must not go."""
+    """The reason that a run is residue, as a fixed label that names no run. The
+    dry run prints a count per kind, which can be posted where an `_idx` must not
+    appear."""
 
     RECOVERY_FAILED = "recovery ticket failed"
     NO_SOURCE_TICKET = "no completed source ticket"
@@ -150,6 +152,13 @@ class Run:
     residue_kind: ResidueKind | None = None
     source_work_ticket_idx: int | None = None
     assemble_attempt: int | None = None
+
+    def __post_init__(self) -> None:
+        if (self.residue_kind is not None) != (self.status is RunStatus.RESIDUE):
+            raise ValueError(
+                f"run {self.processing_idx}: a residue kind goes with residue status, "
+                f"got {self.status} with {self.residue_kind!r}"
+            )
 
     def submit_body(self) -> dict:
         """The `POST /work-ticket` body that recovers this run."""
@@ -182,9 +191,11 @@ class BackfillPlan:
 def _source_tree_residue(output: Path) -> tuple[ResidueKind, str] | None:
     """Why the attempt's output cannot be read, or None if it can."""
     if not (output / STEP_MANIFEST_FILENAME).is_file():
-        return ResidueKind.NO_MANIFEST, f"no manifest at {output / STEP_MANIFEST_FILENAME}"
+        kind = ResidueKind.NO_MANIFEST
+        return kind, f"{kind} at {output / STEP_MANIFEST_FILENAME}"
     if not (output / _ASSEMBLER_DIR).is_dir():
-        return ResidueKind.NO_ASSEMBLER_TREE, f"no assembler tree at {output / _ASSEMBLER_DIR}"
+        kind = ResidueKind.NO_ASSEMBLER_TREE
+        return kind, f"{kind} at {output / _ASSEMBLER_DIR}"
     return None
 
 

@@ -15,6 +15,7 @@ from qiita_control_plane.backfill.myloasm_provenance import (
     RECOVER_ACTION_ID,
     RECOVER_ACTION_VERSION,
     BackfillPlan,
+    ResidueKind,
     Run,
     RunStatus,
     submit_runs,
@@ -30,6 +31,7 @@ def _run(ps: int, p: int, status: RunStatus = RunStatus.WRITABLE) -> Run:
         mask_idx=5,
         status=status,
         reason=None if status is RunStatus.WRITABLE else "x",
+        residue_kind=ResidueKind.NO_MANIFEST if status is RunStatus.RESIDUE else None,
         source_work_ticket_idx=100 + p if status is RunStatus.WRITABLE else None,
         assemble_attempt=1 if status is RunStatus.WRITABLE else None,
     )
@@ -114,3 +116,15 @@ def test_the_submit_body_satisfies_the_shipped_workflow():
     ]
     run = Run(1, 10, 5, RunStatus.WRITABLE, source_work_ticket_idx=100, assemble_attempt=0)
     assert validate_context(action.context_schema, run.submit_body()["action_context"]) == []
+
+
+@pytest.mark.parametrize(
+    ("status", "kind"),
+    [
+        pytest.param(RunStatus.RESIDUE, None, id="residue-without-kind"),
+        pytest.param(RunStatus.SKIPPED, ResidueKind.NO_MANIFEST, id="kind-without-residue"),
+    ],
+)
+def test_a_residue_kind_goes_with_residue_status_only(status, kind):
+    with pytest.raises(ValueError, match="residue kind"):
+        Run(1, 10, 5, status, reason="x", residue_kind=kind)

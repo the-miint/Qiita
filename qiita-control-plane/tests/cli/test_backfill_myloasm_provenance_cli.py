@@ -69,7 +69,6 @@ def test_a_dry_run_reports_and_posts_nothing(monkeypatch, planned, tmp_path, cap
     assert planned["retry_failed"] is False and planned["closed"]
     assert "writable  : 2" in out and "residue   : 1" in out
     assert "prep_sample 5 run 50: no manifest at /scratch/ticket/500/x" in out
-    # The per-kind count carries no identifier, so it can be reported publicly.
     assert "residue, no manifest: 1" in out
     assert "assembly is no_data: 1" in out
     assert "DRY RUN" in out

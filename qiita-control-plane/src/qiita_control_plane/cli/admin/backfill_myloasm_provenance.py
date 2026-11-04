@@ -40,7 +40,8 @@ def add_myloasm_provenance_parser(backfill_sub: argparse._SubParsersAction) -> N
             f" {'/'.join(SOURCE_VERSIONS)}, find the completed assemble attempt whose"
             " output is still in its ticket workspace, and submit one"
             " myloasm-provenance-recover ticket for it. A run whose recovery ticket"
-            " completed is done. One ticket per prep_sample per pass: re-run the"
+            " completed is done; a run that cannot be recovered is listed as residue,"
+            " with the reason. One ticket per prep_sample per pass: re-run the"
             " command until nothing is writable. Dry-run by default. Needs"
             " DATABASE_URL and PATH_SCRATCH, and a PAT with --execute."
         ),
@@ -54,8 +55,8 @@ def add_myloasm_provenance_parser(backfill_sub: argparse._SubParsersAction) -> N
         "--retry-failed",
         action="store_true",
         help=(
-            "Resubmit runs whose recovery ticket failed (otherwise listed among the"
-            " runs it cannot recover, with the failure)."
+            "Resubmit runs whose recovery ticket failed (otherwise listed as residue,"
+            " with the failure)."
         ),
     )
     p.add_argument(

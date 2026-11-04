@@ -149,26 +149,26 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
   ```bash
   # DATABASE_URL and PATH_SCRATCH exported, as for any `qiita-admin backfill`;
   # QIITA_TOKEN is a system_admin's PAT (only --execute reads it).
-  qiita-admin backfill myloasm-provenance                       # dry run: counts per status, and each run it cannot recover, with the reason
+  qiita-admin backfill myloasm-provenance                       # dry run: counts per status, and each run it cannot recover (residue), with the reason
   qiita-admin backfill myloasm-provenance --execute --limit 5
   ```
   Once those five tickets complete, run bucket 5's 1.0.2 provenance query for each one, with
-  `PS`/`RUN` taken from the `prep_sample <PS> run <RUN> -> ticket <T>` lines that it
-  printed. Expect the same results as that check. Record each one's peak memory and
-  elapsed time on #827, against the step's unmeasured 16 GB / 2 h baseline:
-  `sacct -j <job> -o MaxRSS,Elapsed`, with `<job>` from
-  `SELECT slurm_job_id FROM qiita.work_ticket_step WHERE work_ticket_idx = <T>`.
+  `PS`/`RUN` taken from the `prep_sample <PS> run <RUN> -> ticket <T>` lines that the
+  `--limit 5` run printed. Expect the same results as that check. Measure each one's
+  peak memory and elapsed time against the step's unmeasured 16 GB / 2 h baseline,
+  for every attempt (an OOM retry runs at a higher memory floor):
+  `sacct -j <job> -o MaxRSS,Elapsed`, with each `<job>` from
+  `SELECT attempt, state, slurm_job_id FROM qiita.work_ticket_step WHERE work_ticket_idx = <T> AND slurm_job_id IS NOT NULL ORDER BY attempt`.
   Then submit the rest, paced:
   `qiita-admin backfill myloasm-provenance --execute --rate 10`.
 
   Each pass submits one ticket per prep_sample, so rerun it once the pass's tickets finish.
   You are done when the dry run counts no writable and no in-flight runs and every
-  residue line has an explanation. Expect `residue, no assembler tree` for 1.0.0 runs
-  that finished before the 2026-09-02 deploy, when the assemble step started keeping
-  myloasm's tree: their provenance is gone. `--retry-failed` resubmits runs whose
-  recovery ticket failed. On #827, which removes the one-off, post only the dry run's
-  status counts and its `residue, <kind>: <n>` lines, each with its explanation. The
-  per-run lines carry `_idx` values and the repository is public.
+  residue line has an explanation. `--retry-failed` resubmits runs whose recovery
+  ticket failed. On #827, which removes the one-off, post the measurements and the
+  dry run's status counts and `residue, <kind>: <n>` lines, each kind with its
+  explanation. Name no run, ticket or job by its id there: the per-run lines carry
+  `_idx` values, and the repository is public.
 
 ### Notes (no host action)
 
