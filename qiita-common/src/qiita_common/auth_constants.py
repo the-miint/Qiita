@@ -137,13 +137,13 @@ class Scope(StrEnum):
     # `assembly_sample.processing_idx` FK is ON DELETE RESTRICT. system_admin only,
     # in ROLE_IMPLIED_SCOPES.
     PROCESSING_LIFECYCLE = "processing:lifecycle"
-    # Full purge of an alignment (the alignment_definition row + its DuckLake
-    # alignment rows; the alignment_sample gate cascade-deletes). Distinct from the
-    # align-submitting capability (PREP_SAMPLE_WRITE): deletion is destructive and
-    # admin-only, granted solely to system_admin in ROLE_IMPLIED_SCOPES — never to
-    # wet_lab_admin or service accounts. It is the disallow-without-delete escape
-    # hatch.
-    ALIGNMENT_DEFINITION_DELETE = "alignment_definition:delete"
+    # Alignment LIFECYCLE: deprecate an alignment config, withdraw individual
+    # (alignment, prep_sample) runs of a sound one, and abandon an align plan
+    # whose blocks failed so its prep_samples can be re-planned. Separate from
+    # MASK_DEFINITION_LIFECYCLE and PROCESSING_LIFECYCLE because each names a
+    # different identity: an alignment can be wrong while the mask under it is
+    # sound. system_admin only, in ROLE_IMPLIED_SCOPES.
+    ALIGNMENT_DEFINITION_LIFECYCLE = "alignment_definition:lifecycle"
     # Generic upload domain. Gates the slot-minting + DoPut path; not
     # reference-specific. On every role ceiling and on service accounts: it
     # buys a numbered staging slot the caller owns and nothing else, so what

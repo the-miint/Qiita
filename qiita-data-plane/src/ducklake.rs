@@ -710,7 +710,7 @@ pub fn ensure_alignment_tables(conn: &Connection) -> Result<(), Box<dyn std::err
         CREATE TABLE IF NOT EXISTS qiita_lake.alignment_origin_spanning (
             -- `alignment`'s leading four, same names, types and order.
             -- alignment_idx / prep_sample_idx / sequence_idx are NOT NULL because
-            -- a `flight_service::lake_edit::delete_alignment*` predicate keys on each, and a
+            -- a `flight_service::lake_edit::delete_alignment_*` predicate keys on each, and a
             -- NULL is a row no delete can reach. feature_idx is NOT NULL because
             -- it is the contig whose origin the interval below wraps, and because
             -- it completes the join key above.

@@ -150,6 +150,7 @@ from ..deps import (
 )
 from ..preflight import open_blob
 from ..repositories.alignment_definition import (
+    fetch_alignment_definition_by_idx,
     list_alignments_over_prep_samples,
     list_completed_alignment_samples,
     list_pool_prep_sample_idxs,
@@ -173,7 +174,12 @@ from ..repositories.sequencing_run import (
     list_sequenced_pools,
     update_sequenced_pool_preflight_blob,
 )
-from ._helpers import GENERIC_FK_VIOLATION, cap_rows, resolve_idxs_by_natural_key
+from ._helpers import (
+    GENERIC_FK_VIOLATION,
+    cap_rows,
+    refuse_deprecated_alignment,
+    resolve_idxs_by_natural_key,
+)
 
 router = APIRouter(prefix=PATH_SEQUENCING_RUN_PREFIX, tags=["sequencing-run"])
 
@@ -779,6 +785,9 @@ async def list_sequenced_pool_alignments(
                 params_hash=row["params_hash"].hex(),
                 samples_completed=row["samples_completed"],
                 samples_total=row["samples_total"],
+                status=row["status"],
+                deprecation_reason=row["deprecation_reason"],
+                superseded_by=row["superseded_by"],
             )
             for row in rows
         ],
@@ -809,17 +818,23 @@ async def get_sequenced_pool_alignment_cohort(
     An empty cohort is a legitimate answer, not a 404 or a 403 — it means
     "nothing here you may mint", and unlike a rejection it does not confirm
     which of the pool's alignments touch data the caller lacks.
+
+    A deprecated alignment with a non-empty cohort is 409: no mint accepts it, so
+    the cohort is not a valid mint body. Checked after the cohort is resolved, so
+    the status is told only to a caller who may read some of it, as in
+    `authorize_completed_alignment_cohort`.
     """
     prep_sample_idxs = await _readable_pool_prep_samples(
         pool, sequenced_pool_idx=sequenced_pool_idx, caller=caller
     )
+    cohort = await list_completed_alignment_samples(pool, alignment_idx, prep_sample_idxs)
+    if cohort:
+        refuse_deprecated_alignment(await fetch_alignment_definition_by_idx(pool, alignment_idx))
     return PoolAlignmentCohort(
         sequencing_run_idx=sequencing_run_idx,
         sequenced_pool_idx=sequenced_pool_idx,
         alignment_idx=alignment_idx,
-        prep_sample_idx=await list_completed_alignment_samples(
-            pool, alignment_idx, prep_sample_idxs
-        ),
+        prep_sample_idx=cohort,
     )
 
 
@@ -1241,14 +1256,15 @@ async def submit_align_plan(
         # Reference exists but is not ACTIVE + sharded — the operator must build /
         # shard it (or wait for it to go active) before aligning against it.
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    except align_planner.AlignDefinitionDeprecated as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     except align_planner.AlignResubmitError as exc:
-        # A sample already gated for the resolved alignment would be re-aligned
-        # (completed → alignment double-write) or wedged (pending → duplicate
-        # covering block). DELETE the alignment or pass only_missing.
+        # The exception's message carries the way out for each gate state.
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail={
                 "reason": str(exc),
+                "alignment_idx": exc.alignment_idx,
                 "conflicting_prep_sample_idxs": exc.conflicting_prep_sample_idxs,
             },
         ) from exc

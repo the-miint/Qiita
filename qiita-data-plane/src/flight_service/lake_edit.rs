@@ -79,23 +79,6 @@ impl QiitaFlightService {
         Self::action_response(&deleted)
     }
 
-    pub(super) async fn delete_alignment_action(
-        &self,
-        action: &Action,
-    ) -> Result<Response<<Self as FlightService>::DoActionStream>, Status> {
-        let payload = self
-            .verify_action_payload(action, auth::verify_delete_alignment, |p| p.action.as_str())?;
-
-        let alignment_idx = payload.alignment_idx;
-        let deleted = self
-            .blocking_lake_write("delete_alignment", move |conn| {
-                delete_alignment(conn, alignment_idx)
-            })
-            .await?;
-
-        Self::action_response(&deleted)
-    }
-
     pub(super) async fn delete_alignment_block_action(
         &self,
         action: &Action,
@@ -665,8 +648,8 @@ fn delete_read_mask_block(
     }))
 }
 
-/// Every `qiita_lake` table an alignment delete clears, in delete order.
-/// `alignment` leads: every `delete_alignment*` reports its count as
+/// Every `qiita_lake` table the `delete_alignment_*` handlers clear, in delete order.
+/// `alignment` leads: both `delete_alignment_*` handlers report its count as
 /// `rows_deleted`.
 ///
 /// `alignment_delete_covers_every_alignment_scoped_lake_table` pins the set
@@ -679,7 +662,7 @@ const ALIGNMENT_DELETE_TABLES: &[&str] = &["alignment", "alignment_origin_spanni
 const _: () = assert!(!ALIGNMENT_DELETE_TABLES.is_empty());
 
 /// Delete `where_clause`'s rows from each of `tables`, in order, returning one
-/// count per table positionally. The shared body of the `delete_alignment*`
+/// count per table positionally. The shared body of the `delete_alignment_*`
 /// handlers; each builds its own clause and shapes its own response.
 ///
 /// The tables go in lockstep because they describe each other:
@@ -730,34 +713,6 @@ fn delete_lake_rows(
     Ok(counts)
 }
 
-/// Logically delete one `alignment_idx`'s rows from every
-/// `ALIGNMENT_DELETE_TABLES` table in DuckLake — the whole-alignment purge the
-/// disallow-without-delete resubmission rule needs (a completed
-/// `alignment_sample` must be cleared before re-aligning).
-///
-/// Transaction, lockstep and parquet lifecycle are `delete_lake_rows`'. Idempotent: deleting an `alignment_idx`
-/// with zero rows is success and returns `rows_deleted: 0`, so the control plane
-/// can safely retry. `alignment_idx` is an Ed25519-verified i64.
-///
-/// `rows_deleted` is the `alignment` count alone; the side table's count is not
-/// reported. `delete_pool_reads` reports one qualified key per table because the
-/// control plane consumes both (`PoolReadPurgeResponse`); here there is no
-/// consumer, and no producer writing the side table, so a second key would carry
-/// a structural zero. A producer PR that adds a consumer adds the key with it.
-fn delete_alignment(conn: &LakeWriter, alignment_idx: i64) -> Result<serde_json::Value, Status> {
-    let counts = delete_lake_rows(
-        conn,
-        ALIGNMENT_DELETE_TABLES,
-        "alignment_idx = ?",
-        &[&alignment_idx as &dyn duckdb::ToSql],
-    )?;
-
-    Ok(serde_json::json!({
-        "alignment_idx": alignment_idx,
-        "rows_deleted": counts[0],
-    }))
-}
-
 /// Delete exactly one block's footprint from every `ALIGNMENT_DELETE_TABLES`
 /// table: the rows for `alignment_idx` whose `(prep_sample_idx, sequence_idx)`
 /// fall in the members' sub-ranges. This is the idempotent-block-replace
@@ -775,7 +730,8 @@ fn delete_alignment(conn: &LakeWriter, alignment_idx: i64) -> Result<serde_json:
 /// multiplicity) — exactly what a re-run must replace.
 ///
 /// Mirrors `delete_read_mask_block`; transaction, lockstep and parquet lifecycle
-/// are `delete_lake_rows`', count reporting is `delete_alignment`'s. Idempotent:
+/// are `delete_lake_rows`'. `rows_deleted` is the `alignment` count alone; the side
+/// table's count is not reported, since nothing consumes it. Idempotent:
 /// a fresh block (no rows yet) deletes 0. Empty `members` is a control-plane bug
 /// (the DoAction arm rejects it before this); guarded here too, returning a
 /// zero-count noop. All integers are Ed25519-verified i64s, safe to inline.
@@ -815,11 +771,8 @@ fn delete_alignment_block(
 /// immediately before `register-files` and a re-run deletes the prior run's rows
 /// before writing fresh ones, so it never double-counts.
 ///
-/// The pair is the unit because none of the three mechanisms already here selects
-/// it:
+/// The pair is the unit because neither mechanism already here selects it:
 ///
-/// * `delete_alignment` keys on `alignment_idx` alone, so it takes every other
-///   prep_sample's rows with it.
 /// * `delete_alignment_block` needs a `block_member` cover-map, which a caller
 ///   holding one prep_sample has none of.
 /// * `REPLACE_KEY_TABLES` is matched on the destination TABLE name alone (see
@@ -838,7 +791,7 @@ fn delete_alignment_block(
 /// feature_idx-agnostic, so ALL of a read's alignment rows go.
 ///
 /// Transaction, lockstep and parquet lifecycle are `delete_lake_rows`', count
-/// reporting is `delete_alignment`'s. Idempotent: a prep_sample with no rows yet
+/// reporting is `delete_alignment_block`'s. Idempotent: a prep_sample with no rows yet
 /// deletes 0 and still succeeds.
 fn delete_alignment_sample(
     conn: &LakeWriter,

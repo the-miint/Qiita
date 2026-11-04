@@ -216,8 +216,8 @@ async def fetch_read_doget_ticket(
     the CP) from `cp_client.make_cp_client()`. The CP returns the ticket
     base64-encoded; this decodes it to the raw bytes `open_doget_stream` wraps in
     a `flight.Ticket`. Raises `httpx.HTTPStatusError` on any non-2xx (404 missing
-    ticket, 422 a non-block ticket / an empty block / an alignment deleted
-    mid-flight, 403 missing scope, 5xx) — the caller maps it to a BackendFailure.
+    ticket, 422 a non-block ticket / an empty block / an alignment_definition row
+    removed mid-flight, 403 missing scope, 5xx) — the caller maps it to a BackendFailure.
     """
     resp = await http.post(URL_READ_DOGET, json={"work_ticket_idx": work_ticket_idx})
     resp.raise_for_status()

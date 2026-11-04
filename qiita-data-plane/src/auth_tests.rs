@@ -346,40 +346,9 @@ fn verify_delete_read_mask_block_rejects_extra_fields() {
 }
 
 // --------------------------------------------------------------------
-// delete_alignment / delete_alignment_block / delete_alignment_sample
+// delete_alignment_block / delete_alignment_sample
 // action token variants
 // --------------------------------------------------------------------
-
-#[test]
-fn verify_delete_alignment_round_trip() {
-    let payload = br#"{"action":"delete_alignment","alignment_idx":77}"#;
-    let ticket = build_ticket(payload, &test_signing_key(), future_expiry(300));
-    let parsed = verify_delete_alignment(&ticket, &test_vk()).expect("valid token should verify");
-    assert_eq!(parsed.action, "delete_alignment");
-    assert_eq!(parsed.alignment_idx, 77);
-}
-
-#[test]
-fn verify_delete_alignment_rejects_bad_signature() {
-    let payload = br#"{"action":"delete_alignment","alignment_idx":1}"#;
-    let mut ticket = build_ticket(payload, &test_signing_key(), future_expiry(300));
-    ticket[10] ^= 0xFF;
-    assert_eq!(
-        verify_delete_alignment(&ticket, &test_vk()).unwrap_err(),
-        AuthError::InvalidSignature
-    );
-}
-
-#[test]
-fn verify_delete_alignment_rejects_extra_fields() {
-    // deny_unknown_fields: a smuggled field is a contract slip surfaced here.
-    let payload = br#"{"action":"delete_alignment","alignment_idx":1,"mask_idx":9}"#;
-    let ticket = build_ticket(payload, &test_signing_key(), future_expiry(300));
-    match verify_delete_alignment(&ticket, &test_vk()).unwrap_err() {
-        AuthError::MalformedPayload(_) => {}
-        other => panic!("expected MalformedPayload, got {other:?}"),
-    }
-}
 
 #[test]
 fn verify_delete_alignment_block_round_trip() {

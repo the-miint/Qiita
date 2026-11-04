@@ -59,8 +59,8 @@ def resolve_block_read_scope(
 
     **Why the discriminator is action_context, not the column.** An align block
     ticket carries a non-NULL ``alignment_idx`` and must read MASKED reads. But
-    ``work_ticket.alignment_idx`` is ``ON DELETE SET NULL``, so a mid-flight
-    ``DELETE /alignment-definition`` NULLs the column while ``action_context``
+    ``work_ticket.alignment_idx`` is ``ON DELETE SET NULL``, so removing the
+    alignment_definition row mid-flight NULLs the column while ``action_context``
     still carries the idx. Discriminating on the column would then silently fall
     through to the raw-reads branch and stream un-QC'd, non-host-depleted reads
     into an aligner. So we read the intent from ``action_context`` and treat any
@@ -87,8 +87,8 @@ def resolve_block_read_scope(
         raise ValueError(
             f"align block ticket action_context alignment_idx {context_alignment_idx} "
             f"disagrees with work_ticket.alignment_idx {ticket_alignment_idx!r} — the "
-            "alignment definition was likely deleted mid-flight (the column is ON "
-            "DELETE SET NULL); refusing to silently stream raw reads to an aligner"
+            "alignment_definition row was likely removed by hand mid-flight (the column "
+            "is ON DELETE SET NULL); refusing to silently stream raw reads to an aligner"
         )
     if ticket_mask_idx is None:
         raise ValueError(

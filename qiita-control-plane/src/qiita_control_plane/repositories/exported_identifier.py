@@ -78,7 +78,7 @@ async def mint_exported_identifiers(
     **Raises `IncompleteMintError` rather than returning a short list.** The
     INSERT guarantees a live row per cohort member at the moment it runs, but the
     transaction is READ COMMITTED, so the SELECT takes a fresh snapshot: an
-    alignment purged by an admin in between retires the rows it named
+    alignment_definition row removed in between retires the rows it named
     (`retire_detached_exported_identifier`) and they drop out of this SELECT. The
     caller's promise is all-or-nothing, and a map quietly missing a sample is a
     published table with an unnamed column — far worse than a failed request. So

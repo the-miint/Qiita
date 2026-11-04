@@ -11,10 +11,10 @@ caller cannot reach and a future migration could quietly drop:
   constraint a new processing type must extend.
 * One LIVE identifier per processing, so a manifest written twice names the
   processing the same way both times.
-* An identifier OUTLIVES the processing it names: purging an alignment detaches
-  and retires it instead of deleting it. The trigger that does this is what makes
-  the FK's `ON DELETE SET NULL` satisfy the check at all, so without it an
-  alignment purge fails outright.
+* An identifier OUTLIVES the processing it names: deleting an alignment_definition
+  row detaches and retires it instead of deleting it. The trigger that does this
+  is what makes the FK's `ON DELETE SET NULL` satisfy the check at all, so without
+  it that delete fails outright.
 
 There is no accession half here, unlike `exported_feature`: a processing is
 something we performed, so nobody else has a name for it. The namespace is
@@ -110,8 +110,8 @@ async def test_one_live_identifier_per_processing(postgres_pool, probe):
 
 async def test_a_retired_row_does_not_block_a_fresh_identifier(postgres_pool, probe):
     """Partial on `NOT retired`, for the deliberate-retirement case (published in
-    error, an embargo) where alignment_idx stays attached. The purge path nulls the
-    column and so could never collide anyway."""
+    error, an embargo) where alignment_idx stays attached. Deleting the
+    alignment_definition nulls the column and so could never collide anyway."""
     first = await _insert(postgres_pool, probe)
     await postgres_pool.execute(
         "UPDATE qiita.exported_processing"
@@ -125,9 +125,9 @@ async def test_a_retired_row_does_not_block_a_fresh_identifier(postgres_pool, pr
 
 
 async def test_an_identifier_outlives_the_processing_it_names(postgres_pool, probe):
-    """The alignment purge hard-DELETEs the definition row. Without the
-    detach-and-retire trigger either that purge fails on the one-processing CHECK or
-    a published citation stops resolving."""
+    """Deleting the alignment_definition row nulls the FK. Without the
+    detach-and-retire trigger either that delete fails on the one-processing CHECK
+    or a published citation stops resolving."""
     row = await _insert(postgres_pool, probe)
     await postgres_pool.execute(
         "DELETE FROM qiita.alignment_definition WHERE alignment_idx = $1", probe["alignment_idx"]
@@ -141,7 +141,10 @@ async def test_an_identifier_outlives_the_processing_it_names(postgres_pool, pro
     assert after["alignment_idx"] is None
     assert after["retired"] is True
     assert after["retired_at"] is not None
-    assert str(probe["alignment_idx"]) in after["retire_reason"]
+    assert after["retire_reason"] == (
+        f"alignment_definition {probe['alignment_idx']} was deleted; the processing"
+        " this identifier named no longer exists"
+    )
     assert after["export_processing_id"] == row["export_processing_id"]
 
 

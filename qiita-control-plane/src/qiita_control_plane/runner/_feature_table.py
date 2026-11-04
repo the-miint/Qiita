@@ -46,6 +46,7 @@ from qiita_common.assembly_constants import (
     BIN_QUALITY_SUBJECT_KEY,
     BIN_QUALITY_TABLE,
 )
+from qiita_common.models import AlignmentDefinitionStatus
 from qiita_common.parquet import PARQUET_OPTS_INTERMEDIATE, validate_parquet_path
 
 from ..actions.library import export_assembly_member_genome, export_member_genome
@@ -59,11 +60,9 @@ from ..feature_table import (
 from ..miint import duckdb_connect
 from ..repositories.alignment_definition import fetch_alignment_definition_by_idx
 from ..repositories.assembly import (
-    ASSEMBLY_SAMPLE_COMPLETED,
-    ASSEMBLY_SAMPLE_NO_DATA,
+    classify_denovo_arm_cohort,
     count_assembly_membership_without_genome,
     fetch_assembly_genome_subject,
-    fetch_assembly_sample_states,
 )
 from ..repositories.block import list_incomplete_alignment_samples
 from ..repositories.processing import fetch_processing_by_idx
@@ -130,6 +129,7 @@ async def _validate_denovo_arm(
     row = await fetch_alignment_definition_by_idx(pool, denovo_alignment_idx)
     if row is None:
         raise _submission_bad_input(f"alignment {denovo_alignment_idx} not found")
+    _refuse_deprecated_alignment(row)
     params = row["params"]
     if isinstance(params, str):
         params = json.loads(params)
@@ -150,6 +150,15 @@ async def _validate_denovo_arm(
         prep_sample_idx=prep_sample_idx,
     )
     return processing_idx
+
+
+def _refuse_deprecated_alignment(row: asyncpg.Record) -> None:
+    """Refuse a deprecated alignment as either arm. An invalidated prep_sample needs no
+    check of its own: it is not 'completed', so the cohort gate refuses it."""
+    if row["status"] == AlignmentDefinitionStatus.DEPRECATED.value:
+        raise _submission_bad_input(
+            f"alignment {row['alignment_idx']} is deprecated: {row['deprecation_reason']}"
+        )
 
 
 async def _refuse_deprecated_assembly(pool: asyncpg.Pool, *, processing_idx: int) -> None:
@@ -217,17 +226,10 @@ async def _apply_arm_gate(
     The last three are refusals whatever the alignment gate says, because none of
     them is a state a table may be built over.
     """
-    assembly_states = await fetch_assembly_sample_states(
+    cohort = await classify_denovo_arm_cohort(
         pool, processing_idx=processing_idx, prep_sample_idx=prep_sample_idx
     )
-    expected = [
-        idx for idx in prep_sample_idx if assembly_states.get(idx) == ASSEMBLY_SAMPLE_COMPLETED
-    ]
-    unusable = {
-        idx: assembly_states.get(idx)
-        for idx in prep_sample_idx
-        if assembly_states.get(idx) not in (ASSEMBLY_SAMPLE_COMPLETED, ASSEMBLY_SAMPLE_NO_DATA)
-    }
+    expected, unusable = cohort.expected, cohort.unusable
     if unusable:
         listed = sorted(unusable.items())[:_MAX_REPORTED]
         raise _submission_bad_input(
@@ -481,6 +483,7 @@ async def _resolve_feature_table_bindings(
     row = await fetch_alignment_definition_by_idx(pool, alignment_idx)
     if row is None:
         raise _submission_bad_input(f"alignment {alignment_idx} not found")
+    _refuse_deprecated_alignment(row)
     params = row["params"]
     if isinstance(params, str):
         params = json.loads(params)

@@ -168,7 +168,7 @@ authorization models:
 
 | Route | Caller | Cohort source | Authorization |
 |---|---|---|---|
-| `POST /alignment/ticket/doget` | service account, `ticket:doget` | the work ticket's `action_context` | scope only — the runner resolver already validated the cohort at submit |
+| `POST /alignment/ticket/doget` | service account, `ticket:doget` | the work ticket's `action_context` | scope, then a re-check of what the runner resolver validated at submit: 409 if the alignment was deprecated or a prep_sample is no longer `completed` (for the de novo arm: only the prep_samples whose assembly completed, plus a 409 if the assembly run was deprecated or a prep_sample's assembly gate left `completed` / `no_data`) |
 | `POST /alignment/{alignment_idx}/ticket/doget` | human, `alignment:doget` | the request body | `Tier.VIEWER` on every study each `prep_sample_idx` links to, all-or-nothing, plus a completeness re-check |
 
 The second exists because a scientist pulling their own data has no runner

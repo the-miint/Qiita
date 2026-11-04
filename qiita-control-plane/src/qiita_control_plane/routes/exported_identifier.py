@@ -92,11 +92,11 @@ async def mint_exported_identifier_map(
             created_by_idx=caller.principal_idx,
         )
     except IncompleteMintError as exc:
-        # The only way to get here is a concurrent purge of this alignment (which
-        # retires the identifiers it named) between the checks above and the mint.
-        # 409 rather than 500 because nothing is wrong with the request: the
-        # alignment it named stopped existing mid-flight, and a retry against the
-        # re-aligned data is the correct next move.
+        # The alignment_definition row was removed between the checks above and the
+        # mint, which retires the identifiers it named (`qiita_common.actions`, at
+        # `BLOCK_MASK_ACTION_ID`, says how one can be removed). 409 rather than 500
+        # because nothing is wrong with the request: the alignment it named stopped
+        # existing mid-flight.
         raise HTTPException(
             status_code=409,
             detail=(

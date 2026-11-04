@@ -410,7 +410,7 @@ def test_do_action_raises_a_busy_refusal_as_a_flight_error(monkeypatch):
         lib._flight, "FlightClient", flight_client_raising(pa.ArrowInvalid(REAL_BUSY_REFUSAL))
     )
     with pytest.raises(flight.FlightUnavailableError, match="data plane busy") as info:
-        lib._do_action("delete_alignment", "grpc://dp:50051", b"token")
+        lib._do_action("delete_alignment_block", "grpc://dp:50051", b"token")
     assert is_data_plane_transient(info.value)
 
 
@@ -427,7 +427,7 @@ def test_do_action_leaves_other_arrow_invalid_as_it_is(monkeypatch):
         lib._flight, "FlightClient", flight_client_raising(pa.ArrowInvalid("bad payload"))
     )
     with pytest.raises(pa.ArrowInvalid, match="bad payload"):
-        lib._do_action("delete_alignment", "grpc://dp:50051", b"token")
+        lib._do_action("delete_alignment_block", "grpc://dp:50051", b"token")
 
 
 async def test_sync_reference_exclusion_primitive_swallows_a_busy_refusal(tmp_path, monkeypatch):

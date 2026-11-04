@@ -73,8 +73,8 @@ async def create_read_doget_ticket(
     * a ticket that is neither BLOCK- nor SEQUENCED_POOL-scoped → 422. A block
       streams its tiled sub-ranges; a pool streams the whole pool;
     * an ``action_context`` whose alignment intent disagrees with the
-      ``work_ticket.alignment_idx`` column → 422 (a mid-flight alignment DELETE;
-      see ``resolve_block_read_scope``);
+      ``work_ticket.alignment_idx`` column → 422 (an alignment_definition row
+      removed mid-flight; see ``resolve_block_read_scope``);
     * a block or pool with no members → 422 (a planning bug, or a pool with no
       ingested reads — never a licence to read unscoped).
 

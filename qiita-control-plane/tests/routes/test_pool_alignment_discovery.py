@@ -22,6 +22,7 @@ from qiita_common.api_paths import (
     URL_SEQUENCED_POOL_ALIGNMENT_COHORT,
 )
 from qiita_common.hashing import canonical_params_hash
+from qiita_common.models import AlignmentDefinitionStatus
 
 pytestmark = pytest.mark.db
 
@@ -237,6 +238,46 @@ async def test_cohort_of_an_alignment_the_caller_cannot_read_is_empty_not_403(ct
     caller cannot read comes back with an empty cohort, which is the honest
     answer to "what may I mint here" — and, unlike a 403, does not confirm which
     of the pool's alignments touch data they lack."""
+    resp = await ctx["user"].get(_cohort_url(seeded, seeded["align_2"]))
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["prep_sample_idx"] == []
+
+
+async def _deprecate(ctx, alignment_idx, reason="bad aligner build"):
+    await ctx["pool"].execute(
+        "UPDATE qiita.alignment_definition SET status = $2, deprecated_at = now(),"
+        "       deprecated_by_idx = (SELECT MIN(idx) FROM qiita.principal),"
+        "       deprecation_reason = $3"
+        " WHERE alignment_idx = $1",
+        alignment_idx,
+        AlignmentDefinitionStatus.DEPRECATED.value,
+        reason,
+    )
+
+
+async def test_pool_alignment_list_reports_a_deprecated_alignment_with_its_status(ctx, seeded):
+    """Still listed, so the record of what produced published data survives, but
+    marked, so a caller does not pick it for new work."""
+    await _deprecate(ctx, seeded["align_1"])
+    resp = await ctx["user"].get(_list_url(seeded))
+    assert resp.status_code == 200, resp.text
+    by_idx = {a["alignment_idx"]: a for a in resp.json()["alignments"]}
+    assert by_idx[seeded["align_1"]]["status"] == AlignmentDefinitionStatus.DEPRECATED.value
+    assert by_idx[seeded["align_1"]]["deprecation_reason"] == "bad aligner build"
+
+
+async def test_cohort_of_a_deprecated_alignment_is_409(ctx, seeded):
+    """The cohort is a mint body, and no mint accepts a deprecated alignment."""
+    await _deprecate(ctx, seeded["align_1"])
+    resp = await ctx["user"].get(_cohort_url(seeded, seeded["align_1"]))
+    assert resp.status_code == 409, resp.text
+    assert "bad aligner build" in resp.json()["detail"]
+
+
+async def test_cohort_of_a_deprecated_alignment_the_caller_cannot_read_stays_empty(ctx, seeded):
+    """The status is told only to a caller who may read some of the cohort, as for
+    every other route over an alignment."""
+    await _deprecate(ctx, seeded["align_2"])
     resp = await ctx["user"].get(_cohort_url(seeded, seeded["align_2"]))
     assert resp.status_code == 200, resp.text
     assert resp.json()["prep_sample_idx"] == []
