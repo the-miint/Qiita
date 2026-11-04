@@ -1,6 +1,6 @@
 ### Added
 
-- **Alignment lifecycle (#N).** Mirrors the mask and assembly lifecycles, system_admin
+- **Alignment lifecycle (#829).** Mirrors the mask and assembly lifecycles, system_admin
   only under the new `alignment_definition:lifecycle` scope:
   - `PATCH /alignment-definition/{alignment_idx}/status` deprecates an alignment
     config (or returns it to active). Deprecation is refused (409, listing them)
@@ -21,12 +21,12 @@
     prep_samples are untouched. An abandoned block's ticket cannot be redriven, and
     its failure no longer fail-stops the align fan-out.
 
-- **`qiita-admin alignment` (#N)** drives the three routes: `deprecate` /
+- **`qiita-admin alignment` (#829)** drives the three routes: `deprecate` /
   `activate`, `invalidate` / `restore` for prep_sample runs, and `abandon-plan`.
 
 ### Removed
 
-- **Alignments can no longer be deleted (#N).** Removed:
+- **Alignments can no longer be deleted (#829).** Removed:
   - `DELETE /alignment-definition/{alignment_idx}`.
   - The `alignment_definition:delete` scope. A personal access token minted with it
     keeps working; the scope is dropped from its effective set.
@@ -34,19 +34,19 @@
 
 ### Changed
 
-- **Deprecating a mask is refused while its work tickets are unfinished (#N).**
+- **Deprecating a mask is refused while its work tickets are unfinished (#829).**
   `PATCH /mask-definition/{mask_idx}/status` to `deprecated` is refused (409, listing
   them) while any work ticket carrying the mask is unfinished, held ones included,
   so no masking run or alignment over its pass-set is still to write under it.
 
 - **The align plan's 409 for an already-gated prep_sample no longer says to delete the
-  alignment (#N).** It names the alignment (`alignment_idx` in the body) and the way
+  alignment (#829).** It names the alignment (`alignment_idx` in the body) and the way
   out for each case: abandon the plan for prep_samples left pending by failed blocks,
   deprecate a bad completed alignment. A plan whose config resolves to a deprecated
   alignment is a 409.
 - **Reference delete's refusal for an aligned-against reference no longer says to
-  delete the alignment (#N).** No route deletes a completed alignment's rows, so a
+  delete the alignment (#829).** No route deletes a completed alignment's rows, so a
   reference with any alignment against it, deprecated or not, cannot be deleted.
-- **The service-account alignment DoGet re-checks its cohort (#N).** It returns 409
+- **The service-account alignment DoGet re-checks its cohort (#829).** It returns 409
   when the alignment was deprecated, or a prep_sample invalidated, after the
   feature-table ticket was submitted.
