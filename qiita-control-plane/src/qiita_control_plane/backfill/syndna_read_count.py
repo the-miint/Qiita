@@ -93,6 +93,7 @@ class Pair:
     prep_sample_idx: int
     alignment_path: Path | None
     reason: str | None
+    work_ticket_idx: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -146,7 +147,7 @@ async def plan_backfill(pool: asyncpg.Pool, *, ticket_root: Path) -> BackfillPla
                 ticket_workspace(ticket_root, r["work_ticket_idx"]), _SYNDNA_STEP, r["attempt"]
             )
             path, reason = _alignment_from_manifest(attempt_dir)
-        pairs.append(Pair(r["mask_idx"], r["prep_sample_idx"], path, reason))
+        pairs.append(Pair(r["mask_idx"], r["prep_sample_idx"], path, reason, r["work_ticket_idx"]))
     return BackfillPlan(pairs=pairs)
 
 

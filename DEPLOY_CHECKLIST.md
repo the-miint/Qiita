@@ -193,6 +193,7 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
   `qiita-admin mask delete` / `mask purge-failed` and the `mask_definition:delete` scope are
   removed. A PAT mint requesting that scope now gets `422 unknown scopes`; an existing token
   carrying it keeps working without it. Deprecate a mask or invalidate its runs instead.
+- (#610) New `qiita-admin scratch reclaim --older-than DAYS` (dry-run by default; `--execute` deletes). Run it as the user that owns the job output dirs (the SLURM job user): it restores owner write on 0550 container output dirs before deleting; it needs `DATABASE_URL` and an absolute `PATH_SCRATCH`.
 
 ## Deployed history
 

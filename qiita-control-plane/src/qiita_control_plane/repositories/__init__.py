@@ -39,6 +39,7 @@ INT4_MASK = 0x7FFF_FFFF
 #   actions.library                1-arg key 4_310_290_149 (exclusion sync)
 #   notify.sweeper                 1-arg key 4_310_290_147
 #   auth.cli_login_code_sweeper    1-arg key 4_310_290_148
+#   scratch_reclaim                1-arg key 4_310_290_150
 # and, taken inside plpgsql (db/migrations/):
 #   qiita.mint_sequence_range      1-arg, hashtext('qiita.sequence_idx_seq') (the
 #                                  global range-allocation lock)
