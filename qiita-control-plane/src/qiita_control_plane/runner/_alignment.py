@@ -39,6 +39,7 @@ from ..repositories.alignment_definition import (
     AlignmentDefinitionDeprecated,
     ParamsDoNotSurviveStorageError,
     fetch_alignment_definition_by_idx,
+    lock_active_alignment,
     mint_alignment_definition,
 )
 from ..repositories.assembly import (
@@ -210,6 +211,10 @@ async def _create_alignment_gate_pending(
     step could not complete the row anyway (`AlignmentSampleInvalidated`).
     """
     async with pool.acquire() as conn, conn.transaction():
+        try:
+            await lock_active_alignment(conn, alignment_idx)
+        except AlignmentDefinitionDeprecated as exc:
+            raise _submission_bad_input(exc.detail) from exc
         state = await conn.fetchval(
             "SELECT state FROM qiita.alignment_sample"
             " WHERE alignment_idx = $1 AND prep_sample_idx = $2 FOR UPDATE",

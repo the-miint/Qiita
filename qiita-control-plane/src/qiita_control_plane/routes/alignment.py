@@ -62,8 +62,10 @@ from ..deps import (
 from ..feature_table import parse_feature_table_denovo, parse_feature_table_scope
 from ..repositories.alignment_definition import (
     AlignmentDefinitionNotFound,
+    AlignmentHasLiveWork,
     alignment_definition_exists,
     fetch_alignment_definition_by_idx,
+    refuse_deprecating_with_live_work,
     set_alignment_sample_states,
     transition_alignment_definition_status,
 )
@@ -131,8 +133,10 @@ async def update_alignment_definition_status_route(
     mask cannot be aligned again while this row is deprecated; re-aligning means a
     different config.
 
-    Returning a deprecated alignment to active is refused (409) once a reference
-    delete has purged its rows.
+    Deprecating is refused (409, listing them) while any work ticket under the
+    alignment is unfinished, held ones included: they would still write rows under
+    a void config. Returning a deprecated alignment to active is refused (409) once
+    a reference delete has purged its rows.
 
     system_admin only (`alignment_definition:lifecycle`).
     """
@@ -140,6 +144,8 @@ async def update_alignment_definition_status_route(
         async with tx() as conn:
             if body.status is AlignmentDefinitionStatus.ACTIVE:
                 await _refuse_reactivating_purged_rows(conn, alignment_idx)
+            else:
+                await refuse_deprecating_with_live_work(conn, alignment_idx)
             row = await transition_alignment_definition_status(
                 conn,
                 alignment_idx=alignment_idx,
@@ -150,6 +156,11 @@ async def update_alignment_definition_status_route(
             )
     except AlignmentDefinitionNotFound:
         raise HTTPException(status_code=404, detail=ALIGNMENT_NOT_FOUND_DETAIL)
+    except AlignmentHasLiveWork as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"reason": str(exc), "work_ticket_idx": exc.work_ticket_idxs},
+        ) from exc
     except asyncpg.ForeignKeyViolationError as exc:
         raise HTTPException(
             status_code=422,

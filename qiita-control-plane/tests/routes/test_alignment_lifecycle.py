@@ -262,6 +262,48 @@ async def test_deprecate_records_provenance_and_restore_clears_it(client, lc):
     assert body["deprecated_by_idx"] is None
 
 
+async def test_deprecation_waits_for_unfinished_tickets(client, lc):
+    """A held ticket is unfinished too: the fan-out would release it and its block
+    would write rows under a void config. Deprecation names the tickets, and goes
+    through once they are terminal. A terminal ticket never blocks it."""
+    a, b, _c = lc["samples"]
+    await lc["make_block"]([(a, 1, 100)], block_state="completed", ticket_state="completed")
+    _block, held = await lc["make_block"](
+        [(b, 1, 100)], block_state="pending", ticket_state="pending", dispatch_held=True
+    )
+    resp = await _deprecate(client, lc["alignment_idx"])
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["detail"]["work_ticket_idx"] == [held]
+    status = await lc["pool"].fetchval(
+        "SELECT status FROM qiita.alignment_definition WHERE alignment_idx = $1",
+        lc["alignment_idx"],
+    )
+    assert status == "active"
+
+    await lc["pool"].execute(
+        "UPDATE qiita.work_ticket SET state = 'cancelled' WHERE work_ticket_idx = $1", held
+    )
+    assert (await _deprecate(client, lc["alignment_idx"])).status_code == 200
+
+
+async def test_a_plan_cannot_create_tickets_under_a_deprecated_alignment(lc):
+    """The ticket writers re-check the status under a share lock in the transaction
+    that creates the tickets, so a deprecation landing after the mint still stops
+    them."""
+    from qiita_control_plane.repositories.alignment_definition import lock_active_alignment
+
+    await lc["pool"].execute(
+        "UPDATE qiita.alignment_definition SET status = 'deprecated', deprecated_at = now(),"
+        "       deprecated_by_idx = $2, deprecation_reason = 'late'"
+        " WHERE alignment_idx = $1",
+        lc["alignment_idx"],
+        lc["owner"],
+    )
+    with pytest.raises(AlignmentDefinitionDeprecated, match="late"):
+        async with lc["pool"].acquire() as conn, conn.transaction():
+            await lock_active_alignment(conn, lc["alignment_idx"])
+
+
 async def test_deprecate_without_reason_is_422(client, lc):
     resp = await client.patch(
         URL_ALIGNMENT_DEFINITION_STATUS.format(alignment_idx=lc["alignment_idx"]),

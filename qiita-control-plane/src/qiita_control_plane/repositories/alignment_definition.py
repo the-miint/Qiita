@@ -31,7 +31,11 @@ from typing import Literal
 
 import asyncpg
 from qiita_common.hashing import canonical_params_hash
-from qiita_common.models import AlignmentDefinitionStatus, AlignmentSampleState
+from qiita_common.models import (
+    NON_TERMINAL_WORK_TICKET_STATES,
+    AlignmentDefinitionStatus,
+    AlignmentSampleState,
+)
 
 from . import gate_state_literal, require_transaction
 
@@ -409,3 +413,69 @@ async def set_alignment_sample_states(
         "not_found": sorted(not_found),
         "skipped_pending": sorted(skipped_pending),
     }
+
+
+class AlignmentHasLiveWork(Exception):
+    """Raised when deprecating an alignment that still has unfinished work tickets.
+    Deprecation is refused until they finish or are cancelled, so no block or de novo
+    run of a void config is still to write rows after it."""
+
+    def __init__(self, alignment_idx: int, work_ticket_idxs: list[int]) -> None:
+        self.alignment_idx = alignment_idx
+        self.work_ticket_idxs = work_ticket_idxs
+        super().__init__(
+            f"alignment {alignment_idx} has {len(work_ticket_idxs)} unfinished work"
+            f" ticket(s): {work_ticket_idxs}. Wait for them to finish, or cancel them,"
+            " then deprecate"
+        )
+
+
+async def refuse_deprecating_with_live_work(conn: asyncpg.Connection, alignment_idx: int) -> None:
+    """Raise AlignmentHasLiveWork if `alignment_idx` is active and any work ticket
+    under it is not terminal (held tickets included: the fan-out would release them).
+
+    Takes the definition row `FOR UPDATE`. The ticket writers take it `FOR SHARE`
+    (`lock_active_alignment`) in the transaction that creates their tickets, so a
+    plan either commits its tickets before this count or finds the row deprecated.
+    An already-deprecated row is not checked, so its reason can still be corrected."""
+    require_transaction(conn)
+    status = await conn.fetchval(
+        "SELECT status FROM qiita.alignment_definition WHERE alignment_idx = $1 FOR UPDATE",
+        alignment_idx,
+    )
+    if status is None:
+        raise AlignmentDefinitionNotFound(alignment_idx)
+    if status != AlignmentDefinitionStatus.ACTIVE.value:
+        return
+    live = [
+        r["work_ticket_idx"]
+        for r in await conn.fetch(
+            "SELECT work_ticket_idx FROM qiita.work_ticket"
+            " WHERE alignment_idx = $1 AND state::text = ANY($2::text[])"
+            " ORDER BY work_ticket_idx",
+            alignment_idx,
+            list(NON_TERMINAL_WORK_TICKET_STATES),
+        )
+    ]
+    if live:
+        raise AlignmentHasLiveWork(alignment_idx, live)
+
+
+async def lock_active_alignment(conn: asyncpg.Connection, alignment_idx: int) -> None:
+    """Hold the definition row `FOR SHARE` for the caller's transaction and raise
+    AlignmentDefinitionDeprecated if it is deprecated. Called by the transactions
+    that create an alignment's work, so a deprecation cannot commit between the mint
+    and the tickets (`refuse_deprecating_with_live_work`)."""
+    require_transaction(conn)
+    row = await conn.fetchrow(
+        "SELECT status, deprecation_reason FROM qiita.alignment_definition"
+        " WHERE alignment_idx = $1 FOR SHARE",
+        alignment_idx,
+    )
+    if row is None:
+        raise AlignmentDefinitionNotFound(alignment_idx)
+    if row["status"] == AlignmentDefinitionStatus.DEPRECATED.value:
+        raise AlignmentDefinitionDeprecated(
+            f"alignment_definition {alignment_idx} is deprecated and cannot be minted"
+            f" against: {row['deprecation_reason']}"
+        )

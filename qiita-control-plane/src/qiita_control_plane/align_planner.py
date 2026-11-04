@@ -50,6 +50,7 @@ from .dispatch import schedule_dispatch
 from .fanout_dispatch import align_block_cohort, top_up_dispatch
 from .repositories.alignment_definition import (
     AlignmentDefinitionDeprecated,
+    lock_active_alignment,
     mint_alignment_definition,
 )
 from .repositories.block import (
@@ -495,6 +496,10 @@ async def plan_and_submit_alignments(
         samples = [s for (s, _m) in to_plan]
         async with pool.acquire() as conn, conn.transaction():
             alignment_idx = alignment_by_mask[mask_idx]
+            try:
+                await lock_active_alignment(conn, alignment_idx)
+            except AlignmentDefinitionDeprecated as exc:
+                raise AlignDefinitionDeprecated(exc.detail) from exc
             await create_alignment_sample_pending(
                 conn,
                 alignment_idx=alignment_idx,

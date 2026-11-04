@@ -3,7 +3,8 @@
 - **Alignment lifecycle (#N).** Mirrors the mask and assembly lifecycles, system_admin
   only under the new `alignment_definition:lifecycle` scope:
   - `PATCH /alignment-definition/{alignment_idx}/status` deprecates an alignment
-    config (or returns it to active). A deprecated alignment is refused by
+    config (or returns it to active). Deprecation is refused (409, listing them)
+    while any work ticket under the alignment is unfinished, held ones included. A deprecated alignment is refused by
     feature-table submit, both alignment DoGet mints, the exported-identifier and
     exported-processing mints, the de novo align resolver, `/run` on its tickets, and
     the QC verdict. A block alignment's identity has no version, so the same
