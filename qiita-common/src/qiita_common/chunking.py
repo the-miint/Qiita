@@ -66,7 +66,7 @@ def normalized_sequence_expr(seq: str) -> str:
     Which bytes survive is not this identity's to decide, and is not one rule:
     within a load, the lex-smallest `read_id` of a canonical hash wins
     (`hash_sequences`' `DISTINCT ON`); across loads, the newest.
-    `flight_service::REPLACE_KEY_TABLES` carries why the newest load's strand wins
+    `flight_service::registration::REPLACE_KEY_TABLES` carries why the newest load's strand wins
     and why keeping the older one is not expressible; the export-side consequence
     is on the control plane's `_write_genome_fasta`. Neither rule is bound to the
     record an annotation was cut from, so the two can disagree —

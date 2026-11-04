@@ -29,19 +29,14 @@ and the generic HTTP runner live in `cli._common`.
 
 import argparse
 import asyncio
-import json
 import os
 import sys
-import time
 from collections import Counter, defaultdict
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-import asyncpg
-import httpx
 from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX
-from qiita_common.models import TERMINAL_WORK_TICKET_STATES
 
 from ...backfill.assembly_genome import BackfillPlan as GenomeBackfillPlan
 from ...backfill.assembly_genome import apply_backfill as apply_assembly_genome_backfill
@@ -84,22 +79,6 @@ from .force_fail import (
     _force_fail_ticket,
     _handle_ticket_force_fail,
     _validate_force_fail_args,
-)
-from .mask import (
-    _MASK_IDX_COVERAGE_ACTION_IDS,
-    _PURGE_FAILED_ACTION_IDS,
-    _READ_MASK_PARQUET_NOT_FOUND,
-    _RESUBMITTABLE_SCOPE_KIND,
-    _WAIT_POLL_INTERVAL_SECONDS,
-    _WAIT_TIMEOUT_SECONDS,
-    _build_resubmit_body,
-    _count_non_failed_missing_mask_idx,
-    _handle_mask_delete,
-    _mask_delete_via_route,
-    _mask_shared_with_non_failed,
-    _poll_ticket_to_terminal,
-    _resubmit_work_ticket,
-    _select_purge_failed_candidates,
 )
 from .masked_export import (
     _READ_MASKED_COLUMNS,
@@ -388,74 +367,6 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_terminology_load.set_defaults(handler=_handle_terminology_load)
-
-    p_mask = sub.add_parser("mask", help="Mask-definition maintenance operations")
-    p_mask_sub = p_mask.add_subparsers(dest="mask_cmd", required=True)
-    p_mask_delete = p_mask_sub.add_parser(
-        "delete",
-        help=(
-            "Delete one mask via DELETE /mask-definition/{mask_idx} (system_admin,"
-            " mask_definition:delete). Drops its DuckLake read_mask rows then the"
-            " Postgres mask_definition row; referencing work_tickets detach"
-            " (ON DELETE SET NULL). Prints rows_deleted."
-        ),
-    )
-    p_mask_delete.add_argument("mask_idx", type=int, help="mask_idx to delete")
-    p_mask_delete.set_defaults(handler=_handle_mask_delete)
-
-    p_purge = p_mask_sub.add_parser(
-        "purge-failed",
-        help=(
-            "Bulk purge-and-resubmit recovery for read-mask / fastq-to-parquet"
-            " tickets that FAILED with 'read_mask parquet not found' (the mask is"
-            " registered in DuckLake; only persist-read-metrics failed). Per"
-            " ticket: capture resubmit params, delete the stale mask (so the"
-            " re-run won't duplicate read_mask rows), optionally delete the FAILED"
-            " ticket (--with-tickets), then RESUBMIT a fresh ticket. NEVER deletes"
-            " a mask referenced by a non-failed work_ticket (shared-mask guard:"
-            " skipped + reported). Dry-run by default; pass --execute to mutate."
-            " Needs DATABASE_URL and a PAT."
-        ),
-    )
-    p_purge.add_argument(
-        "--action",
-        required=True,
-        choices=["read-mask", "fastq-to-parquet", "all"],
-        help="Which action(s) to recover. 'all' covers both affected workflows.",
-    )
-    p_purge.add_argument(
-        "--execute",
-        action="store_true",
-        help="Perform the purge + resubmit (default: dry-run, report only, no writes).",
-    )
-    p_purge.add_argument(
-        "--with-tickets",
-        action="store_true",
-        dest="with_tickets",
-        help=(
-            "Also DELETE the FAILED work_ticket rows (work_ticket_step CASCADEs)."
-            " Only ever deletes tickets in state='failed'."
-        ),
-    )
-    p_purge.add_argument(
-        "--limit",
-        type=int,
-        default=None,
-        help="Cap how many candidate tickets are processed (ordered by work_ticket_idx).",
-    )
-    p_purge.add_argument(
-        "--rate",
-        type=float,
-        default=0.0,
-        dest="rate_seconds",
-        help="Seconds to sleep between resubmits so SLURM isn't flooded (default: 0).",
-    )
-    p_purge.add_argument(
-        "--wait",
-        action="store_true",
-        help="After each resubmit, poll the new ticket to a terminal state and report it.",
-    )
-    p_purge.set_defaults(handler=_handle_mask_purge_failed)
 
     p_reference = sub.add_parser("reference", help="Reference maintenance operations")
     p_reference_sub = p_reference.add_subparsers(dest="reference_cmd", required=True)
@@ -802,363 +713,6 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-async def _purge_failed(
-    database_url: str,
-    base_url: str,
-    token: str,
-    *,
-    action_ids: tuple[str, ...],
-    execute: bool,
-    with_tickets: bool,
-    limit: int | None,
-    rate_seconds: float,
-    wait: bool,
-) -> dict:
-    """Drive the bulk purge-and-resubmit recovery.
-
-    Dry-run (default): select candidates, run the shared-mask guard, and report
-    exactly what WOULD be purged/resubmitted — writes NOTHING.
-
-    --execute, per ticket (capture-before-delete, with per-item isolation so one
-    failure doesn't abort the batch):
-      1. capture the resubmit body from the ticket row FIRST;
-      2. delete the mask via the route (drops the registered read_mask rows so
-         the resubmit won't duplicate them);
-      3. if --with-tickets, DELETE the FAILED work_ticket row (steps CASCADE);
-      4. resubmit a fresh ticket via POST /work-ticket;
-      5. if --wait, poll the resubmit to a terminal state.
-
-    Recovery: per-item failures are isolated and reported with everything
-    needed to replay the submission by hand — work_ticket_idx, mask_idx, the
-    captured resubmit_body, and what already happened (mask_deleted,
-    ticket_deleted). If a resubmit fails AFTER its mask was deleted, the mask's
-    read_mask rows are already gone, so a plain re-POST of the reported
-    resubmit_body to POST /work-ticket is safe: the re-run mints a fresh
-    mask_idx and cannot duplicate rows. The command exits non-zero whenever the
-    failures list is non-empty.
-    """
-    pool = await open_admin_pool(database_url)
-    try:
-        # Mask-idx coverage gate (computed up front so dry-run reports it and
-        # --execute can refuse on it before any destructive work). The shared-mask
-        # guard is only sound once every NON-failed ticket carries its mask_idx;
-        # a non-failed sharer with a NULL mask_idx is invisible to the guard, so
-        # the mask could be wrongly deleted out from under a live result. Scoped to
-        # _MASK_IDX_COVERAGE_ACTION_IDS rather than this run's `action_ids`: the
-        # guard reads tickets of every action, so narrowing the candidate set with
-        # --action must not narrow what counts as a blind spot.
-        non_failed_missing_mask_idx = await _count_non_failed_missing_mask_idx(
-            pool, action_ids=_MASK_IDX_COVERAGE_ACTION_IDS
-        )
-
-        candidates = await _select_purge_failed_candidates(pool, action_ids=action_ids, limit=limit)
-
-        # Classify candidates up front so the dry-run report and the execute
-        # path see the same buckets. A candidate is:
-        #   - skipped_no_mask_idx: mask_idx is NULL (never populated —
-        #     can't safely purge a mask we can't name; resubmit alone would
-        #     duplicate the existing read_mask rows). Report, never touch.
-        #   - skipped_wrong_kind: not prep_sample-scoped (defensive; the two
-        #     affected actions are always prep_sample). Report, never touch.
-        #   - skipped_shared: mask_idx referenced by a non-failed ticket. The
-        #     critical guard — report, never delete that mask.
-        #   - eligible: safe to purge + resubmit.
-        eligible: list[dict] = []
-        skipped_no_mask_idx: list[int] = []
-        skipped_wrong_kind: list[int] = []
-        skipped_shared: list[dict] = []
-        # One mask can back several failed candidates; guard each distinct mask
-        # once and cache the verdict so the report counts a shared mask once.
-        guard_cache: dict[int, list[int]] = {}
-
-        for row in candidates:
-            wt_idx = row["work_ticket_idx"]
-            mask_idx = row["mask_idx"]
-            if row["scope_target_kind"] != _RESUBMITTABLE_SCOPE_KIND:
-                skipped_wrong_kind.append(wt_idx)
-                continue
-            if mask_idx is None:
-                skipped_no_mask_idx.append(wt_idx)
-                continue
-            if mask_idx not in guard_cache:
-                guard_cache[mask_idx] = await _mask_shared_with_non_failed(pool, mask_idx)
-            non_failed = guard_cache[mask_idx]
-            if non_failed:
-                skipped_shared.append(
-                    {
-                        "work_ticket_idx": wt_idx,
-                        "mask_idx": mask_idx,
-                        "non_failed_work_ticket_idxs": non_failed,
-                    }
-                )
-                continue
-            eligible.append(
-                {
-                    "work_ticket_idx": wt_idx,
-                    "mask_idx": mask_idx,
-                    "prep_sample_idx": row["prep_sample_idx"],
-                    "row": row,
-                }
-            )
-
-        report: dict = {
-            "executed": execute,
-            "with_tickets": with_tickets,
-            "action_ids": list(action_ids),
-            # The coverage gate's own scope, reported separately because it is
-            # deliberately wider than the candidate `action_ids` above — a reader
-            # comparing the count to the wrong list looks in the wrong place.
-            "coverage_action_ids": list(_MASK_IDX_COVERAGE_ACTION_IDS),
-            "non_failed_missing_mask_idx": non_failed_missing_mask_idx,
-            "candidates": len(candidates),
-            "eligible": [
-                {k: e[k] for k in ("work_ticket_idx", "mask_idx", "prep_sample_idx")}
-                for e in eligible
-            ],
-            "skipped_shared": skipped_shared,
-            "skipped_no_mask_idx": skipped_no_mask_idx,
-            "skipped_wrong_kind": skipped_wrong_kind,
-            "purged": [],
-            "resubmitted": [],
-            "failures": [],
-        }
-
-        if not execute:
-            return report
-
-        # Refuse to do any destructive work while the shared-mask guard is unsound
-        # (some non-failed ticket still has a NULL mask_idx, invisible to the
-        # guard). Fail loudly with the count and how to investigate.
-        if non_failed_missing_mask_idx:
-            raise RuntimeError(
-                f"mask-idx coverage incomplete: {non_failed_missing_mask_idx} non-failed"
-                f" work_ticket(s) for {list(_MASK_IDX_COVERAGE_ACTION_IDS)} have mask_idx"
-                " IS NULL, so the shared-mask guard cannot see them and a shared mask"
-                " could be wrongly deleted. Note this list is WIDER than the --action"
-                " selection: the guard reads tickets of every action, so the blind spot"
-                " may be outside what this run would purge. A non-failed ticket that"
-                " mints or consumes a mask should always carry its mask_idx (the runner"
-                " writes it before the step loop). Investigate why these are unmasked and"
-                " set their mask_idx before re-running."
-            )
-
-        # --execute: process each eligible candidate in isolation. Mask deletes
-        # dedup across candidates that share a mask (only the first delete finds
-        # rows; the route is idempotent for the rest).
-        deleted_masks: set[int] = set()
-        for i, e in enumerate(eligible):
-            wt_idx = e["work_ticket_idx"]
-            mask_idx = e["mask_idx"]
-            # Capture the resubmit body BEFORE the try so it (and the
-            # progress flags) are always available for a recoverable failure
-            # report, even if mask-delete itself raises.
-            resubmit_body = _build_resubmit_body(e["row"])
-            mask_deleted = mask_idx in deleted_masks
-            ticket_deleted = False
-            try:
-                # 1. Delete the mask via the route (lake-first; idempotent).
-                if mask_idx not in deleted_masks:
-                    del_result = _mask_delete_via_route(base_url, token, mask_idx)
-                    deleted_masks.add(mask_idx)
-                    mask_deleted = True
-                    report["purged"].append(
-                        {
-                            "work_ticket_idx": wt_idx,
-                            "mask_idx": mask_idx,
-                            "rows_deleted": del_result.get("rows_deleted"),
-                        }
-                    )
-
-                # 2. Optionally delete the FAILED ticket (work_ticket_step
-                #    CASCADEs). Re-assert state='failed' in the WHERE so a ticket
-                #    that somehow moved off 'failed' between select and now is
-                #    never deleted.
-                if with_tickets:
-                    await pool.execute(
-                        "DELETE FROM qiita.work_ticket"
-                        " WHERE work_ticket_idx = $1 AND state = 'failed'",
-                        wt_idx,
-                    )
-                    ticket_deleted = True
-
-                # 3. Resubmit a fresh ticket via the normal submission path.
-                submitted = _resubmit_work_ticket(base_url, token, resubmit_body)
-                new_idx = submitted.get("work_ticket_idx")
-                entry = {
-                    "original_work_ticket_idx": wt_idx,
-                    "new_work_ticket_idx": new_idx,
-                    "prep_sample_idx": e["prep_sample_idx"],
-                    "state": submitted.get("state"),
-                }
-
-                # 4. Optionally poll the resubmit to terminal.
-                if wait and new_idx is not None:
-                    poll_state = _poll_ticket_to_terminal(base_url, token, new_idx)
-                    entry["observed_state"] = poll_state
-                    if poll_state not in TERMINAL_WORK_TICKET_STATES:
-                        # The wait ceiling was hit before a terminal state; mark
-                        # the entry honestly rather than asserting terminality.
-                        entry["timed_out"] = True
-                report["resubmitted"].append(entry)
-            except (httpx.HTTPError, asyncpg.PostgresError, ValueError, RuntimeError) as exc:
-                # Capture enough to REPLAY this submission by hand. If the mask
-                # was already deleted, a plain re-POST of resubmit_body is safe —
-                # the mask's read_mask rows are gone, so the re-run mints a fresh
-                # mask_idx and cannot duplicate rows.
-                report["failures"].append(
-                    {
-                        "work_ticket_idx": wt_idx,
-                        "mask_idx": mask_idx,
-                        "mask_deleted": mask_deleted,
-                        "ticket_deleted": ticket_deleted,
-                        "resubmit_body": resubmit_body,
-                        "error": f"{type(exc).__name__}: {exc}",
-                    }
-                )
-
-            # Throttle SLURM resubmits (skip the sleep after the final item).
-            if rate_seconds > 0 and i < len(eligible) - 1:
-                time.sleep(rate_seconds)
-
-        return report
-    finally:
-        await pool.close()
-
-
-def _handle_mask_purge_failed(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
-    database_url = os.environ.get("DATABASE_URL")
-    if not database_url:
-        print("error: DATABASE_URL not set", file=sys.stderr)
-        return 2
-    try:
-        token = _common.read_token()
-    except RuntimeError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 1
-
-    if args.action == "all":
-        action_ids = _PURGE_FAILED_ACTION_IDS
-    else:
-        action_ids = (args.action,)
-
-    try:
-        report = asyncio.run(
-            _purge_failed(
-                database_url,
-                args.base_url,
-                token,
-                action_ids=action_ids,
-                execute=args.execute,
-                with_tickets=args.with_tickets,
-                limit=args.limit,
-                rate_seconds=args.rate_seconds,
-                wait=args.wait,
-            )
-        )
-    except (RuntimeError, ValueError) as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 1
-
-    mode = "EXECUTED" if report["executed"] else "DRY-RUN (no writes; pass --execute to commit)"
-    print(f"mask purge-failed [{mode}]")
-    print(f"  actions:    {report['action_ids']}")
-    if report["non_failed_missing_mask_idx"]:
-        # Prominent banner so the operator sees this BEFORE attempting --execute
-        # (which refuses outright while mask-idx coverage is incomplete).
-        print(
-            f"  *** MASK-IDX COVERAGE INCOMPLETE:"
-            f" {report['non_failed_missing_mask_idx']} non-failed work_ticket(s)"
-            f" for {report['coverage_action_ids']} have mask_idx IS NULL."
-        )
-        print(
-            "      The shared-mask guard cannot see them; a shared mask could be wrongly deleted."
-        )
-        print(
-            "      That list is WIDER than --action: the guard reads tickets of every"
-            " action, so the blind spot may be outside what this run would purge."
-            " Investigate and set their mask_idx before proceeding."
-            " --execute will REFUSE until this is 0."
-        )
-    print(f"  candidates: {report['candidates']}")
-    print(f"  eligible:   {len(report['eligible'])}")
-    for e in report["eligible"]:
-        print(
-            f"    would purge+resubmit: work_ticket_idx={e['work_ticket_idx']}"
-            f" mask_idx={e['mask_idx']} prep_sample_idx={e['prep_sample_idx']}"
-        )
-    if report["skipped_shared"]:
-        print(f"  skipped (shared mask — NOT deleted): {len(report['skipped_shared'])}")
-        for s in report["skipped_shared"]:
-            print(
-                f"    SKIP work_ticket_idx={s['work_ticket_idx']} mask_idx={s['mask_idx']}"
-                f" — referenced by non-failed tickets {s['non_failed_work_ticket_idxs']}"
-            )
-    if report["skipped_no_mask_idx"]:
-        print(
-            f"  skipped (mask_idx IS NULL — predates mask tracking):"
-            f" {report['skipped_no_mask_idx']}"
-        )
-    if report["skipped_wrong_kind"]:
-        print(f"  skipped (not prep_sample-scoped): {report['skipped_wrong_kind']}")
-
-    if report["executed"]:
-        print(f"  purged masks:  {len(report['purged'])}")
-        for p in report["purged"]:
-            print(
-                f"    purged mask_idx={p['mask_idx']} (rows_deleted={p['rows_deleted']})"
-                f" for original work_ticket_idx={p['work_ticket_idx']}"
-            )
-        print(f"  resubmitted:   {len(report['resubmitted'])}")
-        for r in report["resubmitted"]:
-            if "observed_state" in r:
-                marker = " (TIMED OUT)" if r.get("timed_out") else ""
-                tail = f" observed_state={r['observed_state']}{marker}"
-            else:
-                tail = ""
-            print(
-                f"    original={r['original_work_ticket_idx']} ->"
-                f" new={r['new_work_ticket_idx']} state={r['state']}{tail}"
-            )
-        if report["failures"]:
-            # This branch exits nonzero, so its operator-actionable failure
-            # lines go to stderr (distinct from the run report on stdout).
-            print(
-                f"  FAILURES (isolated; batch continued): {len(report['failures'])}",
-                file=sys.stderr,
-            )
-            for f in report["failures"]:
-                print(
-                    f"    FAIL work_ticket_idx={f['work_ticket_idx']}"
-                    f" mask_idx={f['mask_idx']}"
-                    f" (mask_deleted={f['mask_deleted']} ticket_deleted={f['ticket_deleted']}):"
-                    f" {f['error']}",
-                    file=sys.stderr,
-                )
-                # Replay hint: with the mask already deleted, a plain re-POST of
-                # this body is safe (no duplicate read_mask rows).
-                print(
-                    f"      replay POST /work-ticket: {json.dumps(f['resubmit_body'])}",
-                    file=sys.stderr,
-                )
-            # A non-empty failures list is an operator-actionable signal.
-            return 1
-    else:
-        # "Verify before you commit" caveat for the destructive --execute path.
-        print(
-            "  Before running --execute: eyeball the eligible list above and"
-            " confirm the skipped-shared masks are genuinely shared (a non-failed"
-            " ticket really depends on them). --execute purges each listed mask"
-            " and resubmits a fresh ticket; nothing is written in this dry-run."
-        )
-        print(
-            "  Recovery: if a resubmit fails mid-batch it is reported with its"
-            " resubmit_body; the mask is already deleted by then, so a plain"
-            " re-POST of that body to POST /work-ticket is safe (no duplicate"
-            " read_mask rows)."
-        )
-    return 0
-
-
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
@@ -1362,7 +916,11 @@ def _handle_backfill_mask_adapter_hash(
         return 1
 
     if args.execute:
-        print(f"\nwrote {written} mask_definition row(s)")
+        skipped = len(plan.writable()) - written
+        print(
+            f"\nwrote {written} mask_definition row(s); skipped {skipped} re-keyed since"
+            " the plan read them"
+        )
     else:
         print(
             f"\nDRY RUN — nothing written. Pass --execute to write {len(plan.writable())} row(s)."
@@ -1594,36 +1152,22 @@ __all__ = [
     "_FAILURE_STAGES_REQUIRING_STEP_NAME",
     "_FAILURE_STAGE_CHOICES",
     "_FORCE_FAIL_ELIGIBLE_STATES",
-    "_MASK_IDX_COVERAGE_ACTION_IDS",
     "_OWNER_ID_BASE_COLUMNS",
     "_OWNER_ID_POOL_COLUMNS",
-    "_PURGE_FAILED_ACTION_IDS",
     "_READ_MASKED_COLUMNS",
-    "_READ_MASK_PARQUET_NOT_FOUND",
-    "_RESUBMITTABLE_SCOPE_KIND",
     "_SAFE_ACCESSION",
     "_VALID_ROLE_VALUES",
-    "_WAIT_POLL_INTERVAL_SECONDS",
-    "_WAIT_TIMEOUT_SECONDS",
     "_build_parser",
-    "_build_resubmit_body",
     "_commit_partials",
     "_count_masked",
     "add_admin_exclusion_subparsers",
-    "_count_non_failed_missing_mask_idx",
     "_export_stem",
     "_force_fail_ticket",
     "_backfill_assembly_genome",
     "_backfill_host_taxon_id",
     "_backfill_mask_adapter_hash",
-    "_mask_delete_via_route",
-    "_mask_shared_with_non_failed",
     "_parquet_row_count",
     "_peek_paired",
-    "_poll_ticket_to_terminal",
-    "_purge_failed",
-    "_resubmit_work_ticket",
-    "_select_purge_failed_candidates",
     "_nonblank_reason",
     "_principal_set_role",
     "_set_system_role",

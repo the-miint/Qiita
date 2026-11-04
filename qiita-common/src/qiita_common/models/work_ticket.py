@@ -298,8 +298,8 @@ class WorkTicket(BaseModel):
     shard_id: int | None = None
     # The mask this ticket minted or filtered against (qiita.mask_definition),
     # None for every ticket that carries no mask. Mirrors qiita.work_ticket.
-    # mask_idx, whose FK is ON DELETE SET NULL — a purged mask detaches its
-    # tickets, so a None here can also mean "the mask this ticket used is gone".
+    # mask_idx, whose FK is ON DELETE SET NULL — a ticket whose mask_definition
+    # row has been deleted reads None too.
     # Surfaced so `qiita ticket status` on a read-mask ticket names the mask it
     # produced, which is one of the ways a client resolves a mask_idx without a
     # DB shell (the mask-definition reads are the other).

@@ -36,12 +36,14 @@ from .biosample_metadata import (
 )
 from .exported_entity import export_entity_id_select
 
-# Owners' ids for their own samples sometimes inadvertently contain PII, so the
-# owner-biosample-id field is pinned above the study's default tier: the intent
-# is that even on a public study, only study members -- plus wet_lab_admin and
-# system_admin callers, who are admitted regardless of tier -- may read the
-# owner-id metadata. That intent is unenforced: no code reads tier_override, and
-# route-level access gates are what actually restrict owner-id reads today.
+# Owners' ids for their own biosamples sometimes inadvertently contain PII, so an
+# owner-biosample-id value requires at least member, whatever the study's
+# default or its field's tier: even on a public study, or through a field that
+# a study declared lower before its first import, only members (and the roles
+# that read every value) see it. The import creates the field at this tier, and
+# qiita.biosample_metadata_visibility requires at least this tier for every
+# owner-id value; a test pins the two together (docs/architecture/data-model.md,
+# "Metadata visibility tiers").
 OWNER_BIOSAMPLE_ID_TIER_OVERRIDE: Tier = Tier.MEMBER
 
 
@@ -85,7 +87,7 @@ _BIOSAMPLE_RETURNING_COLS = (
     " (SELECT name FROM qiita.metadata_checklist mc"
     "  WHERE mc.idx = biosample.metadata_checklist_idx) AS metadata_checklist_name,"
     " biosample_accession, ena_sample_accession, matrix_tube_id,"
-    " last_submission_at, submission_error, last_metadata_change_at,"
+    " last_submission_at, submission_error,"
     " created_by_idx, created_at, updated_at,"
     " retired, retired_by_idx, retired_at, retire_reason, "
     + export_entity_id_select("biosample", alias="biosample")
@@ -541,11 +543,8 @@ async def import_biosample_from_owner_biosample_id(
         caller_idx=caller_idx,
     )
 
-    # tier_override pins the field to member tier: the owner's sample name
-    # is theirs to see, but restricted to study members because sample
-    # names sometimes carry incautiously-entered PII. wet_lab_admin and
-    # system_admin callers are admitted regardless of tier. (Tier
-    # enforcement is not yet built — see docs/architecture/data-model.md.)
+    # tier_override creates the field at OWNER_BIOSAMPLE_ID_TIER_OVERRIDE (the
+    # constant says why).
     # The shape this PII write needs -- purely-local, text, unique within the
     # study; the docstring above says why each matters -- is refused by the
     # resolver when the resolved row contradicts it.

@@ -13,6 +13,7 @@ argparse wiring on the admin entry point.
 
 import argparse
 
+import asyncpg
 import httpx
 import pytest
 from qiita_common.api_paths import (
@@ -382,7 +383,7 @@ def test_force_fail_refuses_terminal_ticket(monkeypatch):
     async def fake_connect(database_url, **kwargs):
         return fake
 
-    monkeypatch.setattr(cli.asyncpg, "connect", fake_connect)
+    monkeypatch.setattr(asyncpg, "connect", fake_connect)
     with pytest.raises(RuntimeError, match="terminal state 'completed'"):
         asyncio.run(
             cli._force_fail_ticket(
@@ -433,7 +434,7 @@ def test_force_fail_happy_path_runs_update(monkeypatch):
     async def fake_connect(database_url, **kwargs):
         return fake
 
-    monkeypatch.setattr(cli.asyncpg, "connect", fake_connect)
+    monkeypatch.setattr(asyncpg, "connect", fake_connect)
     result = asyncio.run(
         cli._force_fail_ticket(
             "postgres://x",
@@ -2052,7 +2053,7 @@ def test_masked_read_export_fastq_refuses_existing_file(monkeypatch, tmp_path, c
     [
         ("parquet", "refused", "flight error: ", "data plane unavailable"),
         ("parquet", "midstream", "error: ", "data plane stream cut"),
-        ("fastq", "midstream", "error: Invalid Input Error: arrow_scan", "data plane stream cut"),
+        ("fastq", "midstream", "error: Invalid Input Error: ", "data plane stream cut"),
     ],
 )
 def test_masked_read_export_data_plane_failure_is_an_error_not_a_traceback(
@@ -2523,3 +2524,24 @@ def test_export_stem_ignores_an_ena_run_accession():
         "ena_run_accession": "ERR1234567",
     }
     assert _export_stem(sample, 5, 7) == "SAMN_A.5.7.42"
+
+
+def test_backfill_mask_adapter_hash_execute_reports_skipped_rows(monkeypatch, capsys):
+    """`--execute` reports the rows apply skipped, as planned minus written."""
+    from qiita_control_plane.backfill.mask_adapter_hash import RekeyPlan, RekeyRow
+    from qiita_control_plane.cli import admin as cli
+
+    rows = [RekeyRow(i, b"\x00" * 32, {}, b"\x01" * 32) for i in (7, 8)]
+    plan = RekeyPlan(reference_idx=5, current_hash="h", convertible=rows)
+
+    async def _fake(database_url, *, report, execute, **_):
+        report(plan)
+        assert execute
+        return plan, 1
+
+    monkeypatch.setenv("DATABASE_URL", "postgresql://unused")
+    monkeypatch.setattr(cli, "_backfill_mask_adapter_hash", _fake)
+    rc = cli.main(["backfill", "mask-adapter-hash", "--reference-idx", "5", "--execute"])
+
+    assert rc == 0
+    assert "wrote 1 mask_definition row(s); skipped 1 re-keyed since" in capsys.readouterr().out

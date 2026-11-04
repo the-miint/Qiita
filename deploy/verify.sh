@@ -17,12 +17,13 @@
 # question the env file is optional to and runs either way (see below).
 #
 # Hatches, one per row: SKIP_HEALTH, SKIP_ACTIONS, SKIP_COMPUTE_READINESS,
-# SKIP_SLURM_PROBE, SKIP_CP_MIINT, SKIP_DP_POOL, SKIP_ENA_REACHABILITY,
-# SKIP_PREFLIGHT (the
-# last passes through to preflight.sh). SKIP_ENA_REACHABILITY skips the
-# CONTROL-PLANE row only; its compute-node counterpart (probe/ena-from-compute)
-# rides the SLURM probe job and goes with SKIP_SLURM_PROBE, which also drops
-# native-import, the miint probes and shared-fs. See docs/runbooks/redeploy.md.
+# SKIP_SLURM_PROBE, SKIP_CP_MIINT, SKIP_DP_POOL, SKIP_DP_UNITS,
+# SKIP_DP_MEMORY_MAX, SKIP_CATALOG_CONNECTIONS, SKIP_ENA_REACHABILITY,
+# SKIP_PREFLIGHT (the last passes through to preflight.sh).
+# SKIP_ENA_REACHABILITY skips the CONTROL-PLANE row only; its compute-node
+# counterpart (probe/ena-from-compute) rides the SLURM probe job and goes with
+# SKIP_SLURM_PROBE, which also drops native-import, the miint probes and
+# shared-fs. See docs/runbooks/redeploy.md.
 
 set -euo pipefail
 
@@ -61,14 +62,118 @@ else
     else
         fail "health/compute-orchestrator" "localhost:8081/health unreachable"
     fi
-    if command -v grpcurl >/dev/null 2>&1; then
-        if grpcurl -plaintext localhost:50051 grpc.health.v1.Health/Check >/dev/null 2>&1; then
-            pass "health/data-plane" "gRPC localhost:50051 Health/Check OK"
-        else
-            fail "health/data-plane" "gRPC localhost:50051 Health/Check failed"
-        fi
+fi
+
+# --- 1b. Data-plane upstream members ----------------------------------------
+# Outside the branch above. The aggregate `https://<host>/health` reaches whichever
+# one member nginx balanced it to, so it stays green with every other instance
+# down; each member is checked here directly.
+if [ -n "${SKIP_HEALTH:-}" ]; then
+    skip "health/data-plane-upstream" "SKIP_HEALTH=1"
+elif command -v grpcurl >/dev/null 2>&1; then
+    # Assigned before use, not iterated as `for x in $(f)`: that form swallows f's
+    # failure, so a malformed list would iterate zero times and verify could exit 0
+    # having checked nothing. The assignment trips errexit.
+    dp_bind_host=$(qiita_data_plane_bind_host)
+    # This host's deployed commit; each member must report the same one.
+    dp_build_commit=""
+    [ -r "$QIITA_DATA_PLANE_BUILD_ENV" ] \
+        && dp_build_commit=$(read_env_file_var "$QIITA_DATA_PLANE_BUILD_ENV" BUILD_COMMIT)
+    # Members from the rendered nginx config; see qiita_data_plane_rendered_members
+    # for why, and for its three return codes.
+    dp_members=$(qiita_data_plane_rendered_members) && dp_rc=0 || dp_rc=$?
+    if [ "$dp_rc" -eq 1 ]; then
+        # No config rendered yet (first deploy): the $DP_ENV lists are the only source.
+        dp_ports=$(qiita_data_plane_ports)
+        dp_peers=$(qiita_data_plane_peers)
+        dp_members=""
+        for dp_port in $dp_ports; do dp_members+="${dp_bind_host}:${dp_port}"$'\n'; done
+        for dp_peer in $dp_peers; do dp_members+="${dp_peer}"$'\n'; done
+        echo "  data-plane members from $DP_ENV (no rendered nginx upstream yet)"
+    elif [ "$dp_rc" -ne 0 ]; then
+        fail "health/data-plane-upstream" "could not read upstream members from $QIITA_NGINX_CONF"
+        dp_members=""
     else
-        skip "health/data-plane" "grpcurl not on PATH (run 'make verify-health' to auto-fetch it)"
+        echo "  data-plane members from the rendered nginx upstream"
+    fi
+    while IFS= read -r dp_member; do
+        [ -n "$dp_member" ] || continue
+        dp_label=$(qiita_data_plane_member_label "$dp_member" "$dp_bind_host")
+        # </dev/null: the loop body inherits the here-string as stdin, so a command
+        # here that reads stdin would consume the remaining members.
+        if grpcurl -plaintext "$dp_member" grpc.health.v1.Health/Check </dev/null >/dev/null 2>&1; then
+            pass "$dp_label" "gRPC $dp_member Health/Check OK"
+        else
+            fail "$dp_label" "gRPC $dp_member Health/Check failed"
+            continue
+        fi
+        dp_commit_label="commit/${dp_label#health/}"
+        if [ -z "$dp_build_commit" ]; then
+            skip "$dp_commit_label" "no BUILD_COMMIT in $QIITA_DATA_PLANE_BUILD_ENV"
+        elif grpcurl -plaintext -d "{\"service\":\"$(qiita_data_plane_build_service "$dp_build_commit")\"}" \
+                "$dp_member" grpc.health.v1.Health/Check </dev/null >/dev/null 2>&1; then
+            pass "$dp_commit_label" "$dp_member runs ${dp_build_commit:0:7}"
+        else
+            fail "$dp_commit_label" "$dp_member does not report ${dp_build_commit:0:7}; its journal names the commit it runs"
+        fi
+    done <<<"$dp_members"
+    # nginx's loopback listener in front of the same upstream. Skipped without the
+    # TLS files: activate.sh then skips the nginx reload, so the listener is not up.
+    lb="${QIITA_DATA_PLANE_LB_HOST}:${QIITA_DATA_PLANE_LB_PORT}"
+    if ! qiita_nginx_tls_present; then
+        skip "health/data-plane-lb" "$lb not checked — nginx not reloaded (no TLS material)"
+    elif grpcurl -plaintext "$lb" grpc.health.v1.Health/Check >/dev/null 2>&1; then
+        pass "health/data-plane-lb" "gRPC $lb (nginx → upstream) Health/Check OK"
+    else
+        fail "health/data-plane-lb" "gRPC $lb (nginx → upstream) Health/Check failed"
+    fi
+else
+    skip "health/data-plane-upstream" "grpcurl not on PATH (run 'make verify-health' to auto-fetch it)"
+fi
+
+# --- 1c. Data-plane units outside QIITA_DATA_PLANE_PORTS --------------------
+# See docs/runbooks/data-plane-scaling.md, "Fewer instances on this host".
+if [ -n "${SKIP_DP_UNITS:-}" ]; then
+    skip "data-plane-units" "SKIP_DP_UNITS=1"
+elif ! command -v systemctl >/dev/null 2>&1; then
+    skip "data-plane-units" "systemctl not on PATH"
+else
+    dp_ports=$(qiita_data_plane_ports)
+    dp_strays=$(qiita_data_plane_stray_units "$dp_ports") && dp_rc=0 || dp_rc=$?
+    if [ "$dp_rc" -ne 0 ]; then
+        fail "data-plane-units" "could not list the qiita-data-plane@ units"
+    elif [ -n "$dp_strays" ]; then
+        while read -r dp_unit dp_state; do
+            fail "data-plane-units/$dp_unit" "$dp_state, port not in QIITA_DATA_PLANE_PORTS ($dp_ports); see docs/runbooks/data-plane-scaling.md, \"Fewer instances on this host\""
+        done <<<"$dp_strays"
+    else
+        pass "data-plane-units" "no qiita-data-plane@ unit outside QIITA_DATA_PLANE_PORTS ($dp_ports) is running or enabled"
+    fi
+fi
+
+# --- 1d. Per-instance MemoryMax ---------------------------------------------
+# What systemd applied to each local instance against
+# QIITA_DATA_PLANE_INSTANCE_MEMORY_MAX (see "Per-instance limits" in _common.sh).
+# A mismatch means the drop-in was not written or not loaded.
+if [ -n "${SKIP_DP_MEMORY_MAX:-}" ]; then
+    skip "dp-memory-max" "SKIP_DP_MEMORY_MAX=1"
+elif ! command -v systemctl >/dev/null 2>&1; then
+    skip "dp-memory-max" "systemctl not on PATH"
+else
+    dp_ports=$(qiita_data_plane_ports)
+    dp_memory_max=$(qiita_data_plane_instance_memory_max)
+    if [ -z "$dp_memory_max" ]; then
+        skip "dp-memory-max" "QIITA_DATA_PLANE_INSTANCE_MEMORY_MAX unset in $DP_ENV"
+    else
+        dp_memory_max_bytes=$(qiita_size_bytes "$dp_memory_max")
+        for dp_port in $dp_ports; do
+            dp_applied=$(systemctl show -p MemoryMax --value "qiita-data-plane@${dp_port}" 2>/dev/null) || dp_applied=""
+            if [ "$dp_applied" = "$dp_memory_max_bytes" ]; then
+                pass "dp-memory-max/qiita-data-plane@${dp_port}" "MemoryMax=$dp_memory_max ($dp_applied bytes)"
+            else
+                fail "dp-memory-max/qiita-data-plane@${dp_port}" "MemoryMax is '${dp_applied:-unreadable}', configured $dp_memory_max ($dp_memory_max_bytes bytes)"
+            fi
+        done
     fi
 fi
 
@@ -197,7 +302,22 @@ else
     fi
 fi
 
-# --- 4b. ENA reachability from the control plane (as qiita-api) -----------
+# --- 4b. Catalog connection budget ------------------------------------------
+# Every data-plane instance's pool, on every host, against the catalog server's
+# max_connections. What it counts and why: qiita_catalog_connection_budget in
+# _common.sh. Runs here as root with the data plane's catalog role, the way
+# activate.sh's idle wait does.
+if [ -n "${SKIP_CATALOG_CONNECTIONS:-}" ]; then
+    skip "catalog-connections" "SKIP_CATALOG_CONNECTIONS=1"
+elif [ ! -r "$DP_ENV" ]; then
+    skip "catalog-connections" "$DP_ENV absent (first deploy)"
+elif ! command -v psql >/dev/null 2>&1; then
+    skip "catalog-connections" "psql not on PATH"
+else
+    qiita_check_catalog_connection_budget "$DP_ENV"
+fi
+
+# --- 4c. ENA reachability from the control plane (as qiita-api) -----------
 # The control-plane half of the deploy's ENA egress check; the compute-node half
 # is the compute-readiness probe row `ena-from-compute`. Why the deploy asks at
 # all, and what a green row does and does not prove, is stated once on

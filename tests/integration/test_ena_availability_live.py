@@ -5,7 +5,6 @@ via `make test-system`, like `test_ena_resolver_live.py`.
 """
 
 import pytest
-
 from qiita_control_plane.ena_import.availability import EnaAvailabilityClient
 
 _PUBLIC_RUN = "SRR096342"

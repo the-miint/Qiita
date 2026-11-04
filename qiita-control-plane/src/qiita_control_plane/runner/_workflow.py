@@ -11,7 +11,6 @@ import asyncpg
 from qiita_common.actions import (
     ALIGNMENT_IDX_BINDING,
     PROCESSING_IDX_BINDING,
-    ActionCeiling,
     ActionDefinition,
     WorkflowAction,
     WorkflowStep,
@@ -49,6 +48,7 @@ from ._base import (
     _is_transient_db_error,
     _log,
 )
+from ._context import RunContext
 from ._db import (
     _NO_STEP_FLOOR,
     StepResourceFloor,
@@ -752,6 +752,23 @@ async def run_workflow(
         # workflows with no router entries (nothing reads the key).
         bound.setdefault(ROUTER_PENDING_BINDING, False)
 
+        ctx = RunContext(
+            pool=pool,
+            work_ticket_idx=work_ticket_idx,
+            backend_client=backend_client,
+            signing_key=signing_key,
+            data_plane_url=data_plane_url,
+            scope_target=scope_target,
+            action_ceiling=action.action_ceiling,
+            max_retries=max_retries,
+            poll_interval_seconds=poll_interval_seconds,
+            resume=resume,
+            dispatch_cb=dispatch_cb,
+            max_inflight=max_inflight,
+            mem_gb_override=mem_gb_override,
+            workspace=workspace,
+            prior_progress=progress,
+        )
         for index, entry in enumerate(action.steps):
             # Conditional gate (WorkflowStep/WorkflowAction.when): skip this
             # entry when its named action_context key is present and falsy
@@ -802,18 +819,7 @@ async def run_workflow(
                 # a rejected backward edge, both benign.
                 if entry.target_status:
                     await _advance_completed_step_status(pool, scope_target, entry.target_status)
-                bound.update(
-                    await _reconstruct_completed_outputs(
-                        entry,
-                        completed,
-                        workspace,
-                        backend_client,
-                        pool=pool,
-                        work_ticket_idx=work_ticket_idx,
-                        poll_interval_seconds=poll_interval_seconds,
-                        scope_target=scope_target,
-                    )
-                )
+                bound.update(await _reconstruct_completed_outputs(ctx, entry, completed))
                 continue
 
             if entry.target_status:
@@ -826,12 +832,9 @@ async def run_workflow(
                     await _patch_resource_status(pool, scope_target, entry.target_status)
 
             outputs = await _run_entry_with_retry(
-                pool=pool,
-                work_ticket_idx=work_ticket_idx,
+                ctx,
                 index=index,
                 entry=entry,
-                action_ceiling=action.action_ceiling,
-                mem_gb_override=mem_gb_override,
                 # Only `step:` entries carry baseline_resources and escalate, so
                 # only they ever WRITE a floor. `_step_entry_names_unique`
                 # constrains `step:` names only, so an `action:` entry may share
@@ -840,17 +843,6 @@ async def run_workflow(
                 # which an `action:` entry never reaches.
                 persisted_floor=escalated_floor.get(entry.name, _NO_STEP_FLOOR),
                 bound=bound,
-                workspace=workspace,
-                scope_target=scope_target,
-                backend_client=backend_client,
-                signing_key=signing_key,
-                data_plane_url=data_plane_url,
-                max_retries=max_retries,
-                poll_interval_seconds=poll_interval_seconds,
-                prior_progress=progress,
-                resume=resume,
-                dispatch_cb=dispatch_cb,
-                max_inflight=max_inflight,
             )
             bound.update(outputs)
 
@@ -1040,33 +1032,19 @@ async def run_workflow(
 
 
 async def _run_entry_with_retry(
+    ctx: RunContext,
     *,
-    pool: asyncpg.Pool,
-    work_ticket_idx: int,
     index: int,
     entry: WorkflowStep | WorkflowAction,
-    action_ceiling: ActionCeiling,
-    mem_gb_override: int | None = None,
     persisted_floor: StepResourceFloor = _NO_STEP_FLOOR,
     bound: dict[str, Any],
-    workspace: Path,
-    scope_target: dict[str, Any],
-    backend_client: ComputeBackendClient,
-    signing_key: bytes,
-    data_plane_url: str,
-    max_retries: int,
-    poll_interval_seconds: float,
-    prior_progress: list[step_progress.StepProgressRow],
-    resume: bool = False,
-    dispatch_cb: Callable[[int], Any] | None = None,
-    max_inflight: int = DEFAULT_FANOUT_MAX_INFLIGHT,
 ) -> dict[str, Any]:
     """Dispatch one workflow entry, with auto-retry on transient
     `BackendFailure`. Returns the entry's output map on success; raises
     `BackendFailure` on permanent failure or once retry budget is
     exhausted.
 
-    `resume` flows down to `_dispatch_step` → `_adopt_or_submit`: on a resumed
+    `ctx.resume` flows down to `_dispatch_step` → `_adopt_or_submit`: on a resumed
     run a write-ahead 'submitting' row with no persisted job id may be an
     orphan from a crashed prior process, so the adopt path does a find-by-name
     lookup before re-submitting. On a fresh run the row was just written by
@@ -1078,12 +1056,12 @@ async def _run_entry_with_retry(
         atomically, retry the same step. Earlier successful entries are
         not re-run — `bound` carries their outputs forward.
       * On an `OOM_KILLED` retry specifically, grow the step's memory floor
-        (×`_OOM_MEMORY_GROWTH`, clamped to `action_ceiling.mem_gb`) before the
+        (×`_OOM_MEMORY_GROWTH`, clamped to `ctx.action_ceiling.mem_gb`) before the
         next attempt — a step the scheduler OOM-killed will OOM again at the
         same size. Symmetrically, on a `TIMEOUT_BEFORE_START` retry (SLURM
         marks a job TIMEOUT when it exceeds walltime) grow the step's walltime
         floor (×`_TIMEOUT_WALLTIME_GROWTH`, clamped to
-        `action_ceiling.walltime`) — a step that hit the wall needs more time,
+        `ctx.action_ceiling.walltime`) — a step that hit the wall needs more time,
         not a re-run at the same limit. Other transient kinds retry at the same
         allocation. Both escalated floors are PERSISTED per step, on
         `qiita.work_ticket.escalated_resource_floor`, as they grow: a CP restart
@@ -1122,11 +1100,11 @@ async def _run_entry_with_retry(
     # override and whatever a prior run's ladder already escalated this step to
     # (`persisted_floor`), and is raised on each OOM-killed retry (see the
     # except arm below). Threaded into every step dispatch in place of the
-    # static `mem_gb_override`. Both inputs are raise-only floors, so the max is
+    # static `ctx.mem_gb_override`. Both inputs are raise-only floors, so the max is
     # the composition — and the persisted value already grew from a resolution
     # that included the static override, so it dominates in practice.
     effective_mem_override = max(
-        (v for v in (mem_gb_override, persisted_floor.mem_gb) if v is not None),
+        (v for v in (ctx.mem_gb_override, persisted_floor.mem_gb) if v is not None),
         default=None,
     )
     # Escalating walltime floor: starts at the persisted floor (there is no
@@ -1143,10 +1121,10 @@ async def _run_entry_with_retry(
     plan_hint: StepPlanResponse | None = None
     if isinstance(entry, WorkflowStep):
         plan_hint = await _fetch_plan_hint(
-            backend_client, entry, bound, scope_target, work_ticket_idx=work_ticket_idx
+            ctx.backend_client, entry, bound, ctx.scope_target, work_ticket_idx=ctx.work_ticket_idx
         )
     while True:
-        attempt_workspace = step_attempt_dir(workspace, entry.name, attempt)
+        attempt_workspace = step_attempt_dir(ctx.workspace, entry.name, attempt)
         # Only a LIVE attempt is adoptable. `attempt` restarts at 0 on every
         # invocation, so a restart-recovery resume of a step that failed at
         # attempt N and escalated to N+1 lands back on N first — and
@@ -1155,11 +1133,11 @@ async def _run_entry_with_retry(
         # re-attaching to a job that already ended. Checked before the
         # orphan-dir branch and independently of whether the dir exists: a row
         # is terminal whether or not its workspace survived.
-        if _attempt_is_terminal(prior_progress, step_index=index, attempt=attempt):
+        if _attempt_is_terminal(ctx.prior_progress, step_index=index, attempt=attempt):
             _log.info(
                 "work_ticket %d entry %r attempt %d: prior attempt already terminal; "
                 "advancing to the next attempt",
-                work_ticket_idx,
+                ctx.work_ticket_idx,
                 entry.name,
                 attempt,
             )
@@ -1180,12 +1158,12 @@ async def _run_entry_with_retry(
         # re-attach to its job and reuse the workspace, so we leave it and
         # proceed. (A present-but-terminal row was already skipped above.)
         if attempt_workspace.exists() and _attempt_is_unowned(
-            prior_progress, step_index=index, attempt=attempt
+            ctx.prior_progress, step_index=index, attempt=attempt
         ):
             _log.info(
                 "work_ticket %d entry %r attempt %d: orphaned attempt dir from a "
                 "dropped progress row; advancing to a fresh attempt dir",
-                work_ticket_idx,
+                ctx.work_ticket_idx,
                 entry.name,
                 attempt,
             )
@@ -1198,54 +1176,37 @@ async def _run_entry_with_retry(
         # and died before transitioning the ticket — reconcile then re-drives a
         # still-PROCESSING ticket and would buy a free submit on every restart.
         if skipped_terminal_attempts:
-            current_retry = await _retry_count(pool, work_ticket_idx)
-            if current_retry >= max_retries:
+            current_retry = await _retry_count(ctx.pool, ctx.work_ticket_idx)
+            if current_retry >= ctx.max_retries:
                 _log.warning(
                     "work_ticket %d entry %r: %d prior attempt(s) already terminal and "
                     "retry budget spent (%d/%d); not submitting a fresh attempt",
-                    work_ticket_idx,
+                    ctx.work_ticket_idx,
                     entry.name,
                     skipped_terminal_attempts,
                     current_retry,
-                    max_retries,
+                    ctx.max_retries,
                 )
                 raise _terminal_attempts_exhausted_failure(
-                    entry, retry_count=current_retry, max_retries=max_retries
+                    entry, retry_count=current_retry, max_retries=ctx.max_retries
                 )
         attempt_workspace.mkdir(parents=True, exist_ok=True)
         try:
             if isinstance(entry, WorkflowStep):
                 return await _dispatch_step(
-                    backend_client,
+                    ctx,
                     entry,
                     bound,
                     attempt_workspace,
-                    scope_target,
-                    pool=pool,
-                    work_ticket_idx=work_ticket_idx,
                     step_index=index,
                     attempt=attempt,
-                    action_ceiling=action_ceiling,
                     mem_gb_override=effective_mem_override,
                     walltime_override=effective_walltime_override,
                     plan_hint=plan_hint,
-                    poll_interval_seconds=poll_interval_seconds,
-                    resume=resume,
                 )
             if isinstance(entry, WorkflowAction):
                 return await _dispatch_action(
-                    pool,
-                    entry,
-                    bound,
-                    attempt_workspace,
-                    scope_target,
-                    work_ticket_idx=work_ticket_idx,
-                    step_index=index,
-                    attempt=attempt,
-                    signing_key=signing_key,
-                    data_plane_url=data_plane_url,
-                    dispatch_cb=dispatch_cb,
-                    max_inflight=max_inflight,
+                    ctx, entry, bound, attempt_workspace, step_index=index, attempt=attempt
                 )
             # WorkflowEntry is a closed union; the discriminator on
             # ActionDefinition guarantees one of the two arms above.
@@ -1253,17 +1214,17 @@ async def _run_entry_with_retry(
         except BackendFailure as exc:
             if not exc.transient:
                 raise
-            current_retry = await _retry_count(pool, work_ticket_idx)
-            if current_retry >= max_retries:
+            current_retry = await _retry_count(ctx.pool, ctx.work_ticket_idx)
+            if current_retry >= ctx.max_retries:
                 _log.warning(
                     "work_ticket %d step %r exhausted retries (%d/%d); failing",
-                    work_ticket_idx,
+                    ctx.work_ticket_idx,
                     entry.name,
                     current_retry,
-                    max_retries,
+                    ctx.max_retries,
                 )
                 raise _retries_exhausted_failure(
-                    exc, retry_count=current_retry, max_retries=max_retries
+                    exc, retry_count=current_retry, max_retries=ctx.max_retries
                 ) from exc
             # An OOM-killed step would OOM again at the same size, so grow its
             # memory floor (clamped to the action ceiling) before re-queuing.
@@ -1273,7 +1234,7 @@ async def _run_entry_with_retry(
                 grown = _escalated_mem_floor_after_oom(
                     entry=entry,
                     bound=bound,
-                    action_ceiling=action_ceiling,
+                    action_ceiling=ctx.action_ceiling,
                     current_override=effective_mem_override,
                 )
                 if grown == effective_mem_override:
@@ -1287,15 +1248,15 @@ async def _run_entry_with_retry(
                         "work_ticket %d step %r OOM-killed at the action memory "
                         "ceiling (%d GB); escalation exhausted, failing instead "
                         "of retrying at the same size",
-                        work_ticket_idx,
+                        ctx.work_ticket_idx,
                         entry.name,
-                        action_ceiling.mem_gb,
+                        ctx.action_ceiling.mem_gb,
                     )
                     raise _ceiling_exhausted_failure(
                         exc,
                         event="OOM-killed",
                         axis="memory",
-                        ceiling=f"{action_ceiling.mem_gb} GB",
+                        ceiling=f"{ctx.action_ceiling.mem_gb} GB",
                     ) from exc
                 effective_mem_override = grown
                 # Persist BEFORE the requeue below, so the ladder's position is
@@ -1304,7 +1265,7 @@ async def _run_entry_with_retry(
                 # `entry` is a WorkflowStep on this arm, so its name is unique
                 # within the action — the key this floor is stored under.
                 await _persist_escalated_floor(
-                    pool, work_ticket_idx, step_name=entry.name, mem_gb=grown
+                    ctx.pool, ctx.work_ticket_idx, step_name=entry.name, mem_gb=grown
                 )
             # A timed-out step needs more wall to finish, not a re-run at the same
             # limit; grow its walltime floor (clamped to the action ceiling) before
@@ -1313,7 +1274,7 @@ async def _run_entry_with_retry(
                 grown_walltime = _escalated_walltime_after_timeout(
                     entry=entry,
                     bound=bound,
-                    action_ceiling=action_ceiling,
+                    action_ceiling=ctx.action_ceiling,
                     current_override=effective_walltime_override,
                 )
                 if grown_walltime == effective_walltime_override:
@@ -1324,39 +1285,39 @@ async def _run_entry_with_retry(
                         "work_ticket %d step %r timed out at the action walltime "
                         "ceiling (%s); escalation exhausted, failing instead of "
                         "retrying at the same limit",
-                        work_ticket_idx,
+                        ctx.work_ticket_idx,
                         entry.name,
-                        action_ceiling.walltime,
+                        ctx.action_ceiling.walltime,
                     )
                     raise _ceiling_exhausted_failure(
                         exc,
                         event="timed out",
                         axis="walltime",
-                        ceiling=str(action_ceiling.walltime),
+                        ceiling=str(ctx.action_ceiling.walltime),
                     ) from exc
                 effective_walltime_override = grown_walltime
                 # Same durability as the memory arm above. Merged into this
                 # step's existing object, so it never clobbers a memory floor
                 # the same step learned from an earlier OOM.
                 await _persist_escalated_floor(
-                    pool, work_ticket_idx, step_name=entry.name, walltime=grown_walltime
+                    ctx.pool, ctx.work_ticket_idx, step_name=entry.name, walltime=grown_walltime
                 )
             _log.warning(
                 "work_ticket %d step %r transient failure (%s); retrying %d/%d "
                 "(mem_gb floor=%s, walltime floor=%s)",
-                work_ticket_idx,
+                ctx.work_ticket_idx,
                 entry.name,
                 exc.kind.value,
                 current_retry + 1,
-                max_retries,
+                ctx.max_retries,
                 effective_mem_override,
                 effective_walltime_override,
             )
             attempt += 1
-            await _bump_retry_and_requeue(pool, work_ticket_idx)
+            await _bump_retry_and_requeue(ctx.pool, ctx.work_ticket_idx)
             await _atomic_transition(
-                pool,
-                work_ticket_idx,
+                ctx.pool,
+                ctx.work_ticket_idx,
                 expected=WorkTicketState.QUEUED,
                 new=WorkTicketState.PROCESSING,
             )

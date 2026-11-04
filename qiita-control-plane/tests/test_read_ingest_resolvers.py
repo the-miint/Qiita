@@ -55,6 +55,7 @@ from qiita_control_plane.runner import (
 )
 from qiita_control_plane.runner._read_ingest import (
     _barcode_roster_mismatches,
+    _copy_masked_to_fastq,
     _preflight_barcode_roster,
 )
 from qiita_control_plane.testing.db_seeds import (
@@ -585,6 +586,33 @@ def test_resolve_staged_masked_reads_stream_failure_is_bad_input(tmp_path, monke
     assert "data plane" in exc.value.reason
 
 
+def test_masked_fastq_names_each_read_by_its_sequence_idx(tmp_path):
+    """The FASTQ handed to the assembler names each record `@<sequence_idx>`, not
+    the sequencer's `read_id`, so per-read output joins straight back to `read`.
+    Runs the real miint FORMAT FASTQ writer over a relation shaped like the
+    `read_masked` stream."""
+    from qiita_common.duckdb_miint import miint_connect_config, miint_load_sql
+
+    dest = tmp_path / "masked_reads.fastq.gz"
+    with duckdb.connect(":memory:", config=miint_connect_config()) as con:
+        con.execute(miint_load_sql())
+        con.execute(
+            "CREATE TABLE masked AS SELECT * FROM (VALUES "
+            "(3, 11, 9000000001, 'm84/1/ccs', 'ACGT', [40, 40, 40, 40]::UTINYINT[], "
+            " NULL::VARCHAR, NULL::UTINYINT[]),"
+            "(3, 11, 9000000007, 'm84/2/ccs', 'GGCC', [30, 30, 30, 30]::UTINYINT[], "
+            " NULL::VARCHAR, NULL::UTINYINT[])"
+            ") t(mask_idx, prep_sample_idx, sequence_idx, read_id, sequence1, qual1, "
+            "sequence2, qual2)"
+        )
+        count = _copy_masked_to_fastq(con, dest)
+
+    assert count == 2
+    with gzip.open(dest, "rt") as fh:
+        headers = [line for i, line in enumerate(fh.read().splitlines()) if i % 4 == 0]
+    assert sorted(headers) == ["@9000000001", "@9000000007"]
+
+
 def test_workflow_declares_input_checks_optional_too():
     steps = [_step(inputs=["reads"], optional_inputs=["host_rype_path"])]
     assert _workflow_declares_input(steps, "host_rype_path") is True
@@ -603,7 +631,7 @@ def test_workflow_declares_input_checks_optional_too():
 #     tests/test_block_read.py, on the shared rule both boundaries use;
 #   * the signed member/mask scope -> tests/routes/test_read_doget.py;
 #   * the member selector's row semantics (gap excluded, split sub-range exact)
-#     -> the block-read DoGet tests in qiita-data-plane/src/flight_service.rs.
+#     -> the block-read DoGet tests in qiita-data-plane/src/flight_service/query_tests.rs.
 #
 # The empty-block case changed MEANING and is worth stating: the masked block
 # export used to write a schema-correct 0-row parquet so an all-masked-out block

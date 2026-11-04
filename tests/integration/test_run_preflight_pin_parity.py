@@ -21,14 +21,9 @@ def _run_preflight_sha(pyproject_path: Path) -> str:
         data = tomllib.load(fh)
 
     # Locate the single dependency string that pins run-preflight
-    matches = [
-        dep
-        for dep in data["project"]["dependencies"]
-        if dep.startswith("run-preflight")
-    ]
+    matches = [dep for dep in data["project"]["dependencies"] if dep.startswith("run-preflight")]
     assert len(matches) == 1, (
-        f"{pyproject_path} should declare run-preflight exactly once,"
-        f" got {len(matches)}: {matches}"
+        f"{pyproject_path} should declare run-preflight exactly once, got {len(matches)}: {matches}"
     )
 
     # Pull the SHA suffix from the git+url spec

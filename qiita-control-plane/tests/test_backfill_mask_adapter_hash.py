@@ -260,6 +260,58 @@ async def test_apply_rekeys_in_place_and_is_idempotent(seeded):
     assert again.writable() == []
 
 
+async def test_apply_raises_on_a_row_deleted_since_the_plan(seeded):
+    """A planned row that is gone at apply time is an out-of-band edit, so apply
+    raises naming it rather than reporting a short write count."""
+    tag = secrets.token_hex(4)
+    mask_idx = await seeded["legacy"](_params("legacy-bytes-digest", version=f"{tag}-a"))
+
+    plan = await seeded["plan"]()
+    assert [r.mask_idx for r in plan.writable()] == [mask_idx]
+    await seeded["pool"].execute("DELETE FROM qiita.mask_definition WHERE mask_idx = $1", mask_idx)
+
+    with pytest.raises(RuntimeError, match=f"mask_idx={mask_idx} is gone"):
+        await apply_rekey(seeded["pool"], plan)
+
+
+async def test_apply_skips_a_row_rekeyed_since_the_plan(seeded):
+    """A row whose params_hash changed after the plan read it (the mint re-keyed it)
+    is left as it is: the plan's rewritten params describe the old blob."""
+    tag = secrets.token_hex(4)
+    mask_idx = await seeded["legacy"](_params("legacy-bytes-digest", version=f"{tag}-a"))
+
+    plan = await seeded["plan"]()
+    assert [r.mask_idx for r in plan.writable()] == [mask_idx]
+    moved = secrets.token_bytes(32)
+    await seeded["pool"].execute(
+        "UPDATE qiita.mask_definition SET params_hash = $1 WHERE mask_idx = $2", moved, mask_idx
+    )
+
+    assert await apply_rekey(seeded["pool"], plan) == 0
+    row = await fetch_mask_definition_by_idx(seeded["pool"], mask_idx)
+    assert bytes(row["params_hash"]) == moved
+    assert row["adapter_hash_scheme"] is None
+
+
+async def test_apply_keeps_rows_written_before_a_vanished_row(seeded):
+    """Each row is its own transaction, so the rows apply wrote before the vanished
+    one stay re-keyed, and a fresh plan has only the rest left."""
+    tag = secrets.token_hex(4)
+    await seeded["legacy"](_params("legacy-bytes-digest", version=f"{tag}-a"))
+    await seeded["legacy"](_params("legacy-bytes-digest", version=f"{tag}-b"))
+
+    plan = await seeded["plan"]()
+    first, second = (r.mask_idx for r in plan.writable())
+    await seeded["pool"].execute("DELETE FROM qiita.mask_definition WHERE mask_idx = $1", second)
+
+    with pytest.raises(RuntimeError, match=f"mask_idx={second} is gone.*; 1 row"):
+        await apply_rekey(seeded["pool"], plan)
+
+    row = await fetch_mask_definition_by_idx(seeded["pool"], first)
+    assert row["adapter_hash_scheme"] == ADAPTER_HASH_SCHEME_SEQUENCE_HASH
+    assert (await seeded["plan"]()).writable() == []
+
+
 async def test_plan_reports_a_collision_rather_than_planning_a_write(seeded):
     """When the same config already exists under the current derivation, the
     legacy row's re-keyed params_hash is taken. Merging means repointing

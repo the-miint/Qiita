@@ -12,7 +12,7 @@ both 23.0.1 and 25.0.0), so a caller that classifies by exception type files it 
 and never retries it.
 
 **Rust twin:** the refusal is built in `qiita-data-plane/src/pool.rs`, and the upload bound
-in `flight_service.rs` answers with the same prefix; the signature below and both texts must
+in `flight_service/doput.rs` answers with the same prefix; the signature below and both texts must
 change together. A control-plane test parses the signature out of the Rust, so a reword fails
 a test rather than silently making every refusal permanent.
 

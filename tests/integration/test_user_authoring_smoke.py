@@ -134,9 +134,7 @@ def _run_cli(base_url: str, token: str, *args: str) -> dict:
     return json.loads(result.stdout)
 
 
-def _run_cli_expect_failure(
-    base_url: str, token: str, *args: str
-) -> subprocess.CompletedProcess:
+def _run_cli_expect_failure(base_url: str, token: str, *args: str) -> subprocess.CompletedProcess:
     """Invoke the CLI; assert it exited non-zero; return the
     CompletedProcess so the caller can inspect stderr."""
     result = _invoke_cli(base_url, token, *args)
@@ -147,15 +145,11 @@ def _run_cli_expect_failure(
     return result
 
 
-async def _fetch_prep_protocol_idx(
-    postgres_pool, name: str = "short_read_metagenomics"
-) -> int:
+async def _fetch_prep_protocol_idx(postgres_pool, name: str = "short_read_metagenomics") -> int:
     """The standard prep_protocol seeded by migrations is referenced by
     name from the CLI flag; tests resolve by lookup so a renumber on the
     seed doesn't fan out to every fixture."""
-    return await postgres_pool.fetchval(
-        "SELECT idx FROM qiita.prep_protocol WHERE name = $1", name
-    )
+    return await postgres_pool.fetchval("SELECT idx FROM qiita.prep_protocol WHERE name = $1", name)
 
 
 async def test_user_authoring_smoke_via_cli(
@@ -295,12 +289,8 @@ async def test_user_authoring_smoke_via_cli(
         #    already tolerates; what is under test here is the submit gate.
         #    Each source_filename starts with the --pool-item-id from step 5,
         #    so the route's filename-prefix gate admits the submission.
-        fwd_upload = _create_upload_slot(
-            cp_server, user_token, f"{pool_item_id}_R1.fastq"
-        )
-        rev_upload = _create_upload_slot(
-            cp_server, user_token, f"{pool_item_id}_R2.fastq"
-        )
+        fwd_upload = _create_upload_slot(cp_server, user_token, f"{pool_item_id}_R1.fastq")
+        rev_upload = _create_upload_slot(cp_server, user_token, f"{pool_item_id}_R2.fastq")
         ticket = _run_cli(
             cp_server,
             user_token,

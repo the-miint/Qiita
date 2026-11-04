@@ -438,17 +438,24 @@ class BiosampleResponse(BaseModel):
 
     Mirrors qiita.biosample's caller-visible columns, adds the biosample's
     export_entity_id from qiita.exported_entity, and embeds a dict
-    of every globally-linked metadata value the biosample carries,
-    keyed on biosample_global_field.internal_name. Purely-local
-    metadata (including the owner-biosample-id row) and metadata whose
-    biosample_to_study link has been retired are excluded -- both
-    surface as biosample_metadata.global_field_idx IS NULL via the
-    existing schema triggers and are filtered out by the read.
+    of the biosample's globally-linked metadata values that the caller may
+    read, by their tier on the study that wrote each (the rest are absent),
+    keyed on biosample_global_field.internal_name.
+    Purely-local metadata (including the owner-biosample-id row) is
+    excluded: its biosample_metadata.global_field_idx is NULL. A biosample
+    holds one value per global field, shared by every study that reads the
+    field, whichever study wrote it; so retiring the link to the study that
+    wrote a global value does not remove it from this response.
     Intentionally-missing entries (value_missing_reason_idx populated)
     surface via a MissingReasonRef in the entry's `value` field;
     terminology-term entries (value_terminology_term_idx populated)
     surface via a TerminologyTermRef. `caller_system_role` carries the
     caller's principal.system_role verbatim from the database.
+
+    `last_metadata_change_at` is when the metadata values in this response
+    last changed (None when it carries none). `updated_at` is when the
+    biosample's own record last changed; a metadata write does not move it.
+    The ETag header is the later of the two.
     """
 
     biosample_idx: Annotated[int, Field(gt=0)]
@@ -479,7 +486,8 @@ class StudyScopedBiosampleResponse(BiosampleResponse):
     (core columns, caller_system_role, and the globally-linked global_metadata
     keyed by internal_name) plus this study's purely-local metadata, keyed by
     display_name. local_metadata is returned only on a study-scoped response,
-    where the caller is already authorized on the study.
+    where the caller is already authorized on the study. Both maps carry only
+    the values the caller's tier reaches; the rest are absent.
     """
 
     local_metadata: dict[str, MetadataEntry]

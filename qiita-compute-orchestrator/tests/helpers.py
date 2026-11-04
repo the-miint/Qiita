@@ -1,6 +1,6 @@
 """Shared test constants and builders for qiita-compute-orchestrator."""
 
-import hashlib
+import gzip
 from pathlib import Path
 
 import duckdb
@@ -13,6 +13,19 @@ TEST_SEQUENCES = {
     "seq4": "TTTTAAAACCCC",
     "seq5": "GGGGCCCCAAAA",
 }
+
+
+def write_fasta(path: Path, records: list[tuple[str, str]]) -> Path:
+    """Write `(read_id, sequence)` records as FASTA at `path`, gzipped when it ends
+    in `.gz`, creating its directory."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    text = "".join(f">{read_id}\n{seq}\n" for read_id, seq in records)
+    if path.suffix == ".gz":
+        with gzip.open(path, "wt") as fh:
+            fh.write(text)
+    else:
+        path.write_text(text)
+    return path
 
 
 def write_chunked_blob_upload(dest: Path, payload: bytes) -> Path:
@@ -64,39 +77,3 @@ def shard_yaml_baseline_gb(step_name: str) -> int:
             )
             return mem_gb
     raise AssertionError(f"build-shard-index declares no {step_name} step")
-
-
-# Rows wide enough that one 2,048-row vector of them overruns a 1 MiB row-group byte cap,
-# and enough of them for three row groups once a writer sizes its sorted row groups to that
-# cap (`qiita_common.parquet.sorted_row_group_size`). A test shrinks the cap to
-# SHRUNK_ROW_GROUP_SIZE_BYTES so a few MB of rows show what 64 MB groups of real ones do.
-SHRUNK_ROW_GROUP_SIZE_BYTES = 1024 * 1024
-WIDE_READ_BASES = 1000
-WIDE_ROW_COUNT = 6000
-WIDE_ROW_GROUPS = [2048, 2048, WIDE_ROW_COUNT - 2 * 2048]
-
-_HEX_TO_BASE = str.maketrans("0123456789abcdef", "ACGTACGTACGTACGT")
-
-
-def wide_reads() -> list[tuple[str, str]]:
-    """(read_id, bases) for WIDE_ROW_COUNT reads of WIDE_READ_BASES bases each, distinct
-    per read so no Parquet encoder can collapse the column."""
-    return [
-        (
-            f"r{i}",
-            hashlib.shake_256(str(i).encode())
-            .hexdigest(WIDE_READ_BASES // 2)
-            .translate(_HEX_TO_BASE),
-        )
-        for i in range(1, WIDE_ROW_COUNT + 1)
-    ]
-
-
-def row_group_rows(path: Path) -> list[int]:
-    """Rows in each row group of the Parquet at `path`, largest first."""
-    with duckdb.connect(":memory:") as conn:
-        rows = conn.execute(
-            "SELECT DISTINCT row_group_id, row_group_num_rows FROM parquet_metadata(?)",
-            [str(path)],
-        ).fetchall()
-    return sorted((n for _, n in rows), reverse=True)

@@ -207,12 +207,12 @@ pub struct ActionPayload {
     pub action: String,
     /// Staging directory containing the Parquet files to register. Also one of
     /// the two inputs to each placed lake file's name — see
-    /// `flight_service::lake_dest_filename` for why both are needed.
+    /// `flight_service::registration::lake_dest_filename` for why both are needed.
     pub staging_dir: String,
     /// Map of {filename: ducklake_table_name}.
     pub files: HashMap<String, String>,
     /// Originating work ticket. Composed with `staging_dir` into each placed
-    /// lake file's name (`flight_service::lake_dest_filename`), so the file
+    /// lake file's name (`flight_service::registration::lake_dest_filename`), so the file
     /// traces back to the ticket that wrote it. Required: pinned by
     /// `qiita_control_plane.actions.library.register_files`.
     pub work_ticket_idx: i64,
@@ -250,33 +250,6 @@ pub fn verify_delete_reference(
     ticket: &[u8],
     verifying_key: &VerifyingKey,
 ) -> Result<DeleteReferencePayload, AuthError> {
-    let payload_bytes = verify_ticket_raw(ticket, verifying_key)?;
-    serde_json::from_slice(&payload_bytes).map_err(|e| AuthError::MalformedPayload(e.to_string()))
-}
-
-/// Parsed payload for the `delete_mask` DoAction.
-///
-/// Wire shape pinned by `qiita_control_plane.actions.library.delete_mask_data`:
-/// `{"action": "delete_mask", "mask_idx": N}`. `deny_unknown_fields` keeps the
-/// contract tight — the data plane needs only the identifier and drops every
-/// row that carries it from its own DuckLake `read_mask` table, so any extra
-/// field on the ticket is a design slip surfaced loudly here.
-#[derive(Debug, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct DeleteMaskPayload {
-    /// Action discriminator; the gRPC handler also rejects a payload whose
-    /// `action` is not "delete_mask".
-    pub action: String,
-    /// `i64`, matching the Postgres `mask_definition.idx BIGINT` source of
-    /// truth and the `read_mask.mask_idx BIGINT` column in the DuckLake table.
-    pub mask_idx: i64,
-}
-
-/// Verify a `delete_mask` DoAction token and return its parsed payload.
-pub fn verify_delete_mask(
-    ticket: &[u8],
-    verifying_key: &VerifyingKey,
-) -> Result<DeleteMaskPayload, AuthError> {
     let payload_bytes = verify_ticket_raw(ticket, verifying_key)?;
     serde_json::from_slice(&payload_bytes).map_err(|e| AuthError::MalformedPayload(e.to_string()))
 }
@@ -458,7 +431,7 @@ pub fn verify_delete_alignment_block(
 }
 
 /// Parsed payload for the `delete_alignment` DoAction — the whole-alignment
-/// purge, the alignment twin of `delete_mask`.
+/// purge.
 ///
 /// Wire shape pinned by `qiita_control_plane.actions.library.delete_alignment_data`:
 /// `{"action": "delete_alignment", "alignment_idx": N}`. The data plane deletes
@@ -495,7 +468,7 @@ pub fn verify_delete_alignment(
 /// `{"action": "delete_alignment_sample", "alignment_idx": N,
 ///   "prep_sample_idx": M}`. What the pair selects, and why the prep_sample rather
 /// than the block or the whole alignment is the unit, is on
-/// `flight_service::delete_alignment_sample`. `deny_unknown_fields` rejects any
+/// `flight_service::lake_edit::delete_alignment_sample`. `deny_unknown_fields` rejects any
 /// extra field rather than dropping it — a `members` list in particular, which
 /// a caller reaching for the block scope would send and which this delete would
 /// otherwise ignore while taking the whole prep_sample.
@@ -632,7 +605,7 @@ pub fn verify_sync_reference_exclusion(
 /// Wire shape pinned by
 /// `qiita_control_plane.actions.library.mint_phylogeny_edge_id_data`:
 /// `{"action": "mint_phylogeny_edge_id", "reference_idx": <i64>}`. What the mint is
-/// for: see `mint_phylogeny_edge_id` in `flight_service.rs`. Scoped to one
+/// for: see `mint_phylogeny_edge_id` in `flight_service/lake_edit.rs`. Scoped to one
 /// reference, which is why the field is here (unlike the global exclusion mirror).
 /// `deny_unknown_fields` keeps the contract tight: any extra field is a design slip
 /// surfaced loudly here.

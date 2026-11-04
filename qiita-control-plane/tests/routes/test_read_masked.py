@@ -333,7 +333,7 @@ async def test_doget_table_is_in_cp_allowlist(ctx):
 
 def test_cp_doget_allowlist_matches_the_rust_one_exactly():
     """`_DOGET_ALLOWED_TABLES` is a hand-copy of the data plane's `ALLOWED_TABLES`
-    (flight_service.rs). The CP signs tickets; the DP serves them. The two lists must
+    (flight_service/query.rs). The CP signs tickets; the DP serves them. The two lists must
     be IDENTICAL, and the failure when they aren't is asymmetric and silent:
 
     * a table in the DP list but not the CP one is UNREACHABLE — the DP would serve
@@ -353,10 +353,14 @@ def test_cp_doget_allowlist_matches_the_rust_one_exactly():
     from qiita_control_plane.routes.reference import _DOGET_ALLOWED_TABLES
 
     src = (
-        Path(__file__).resolve().parents[3] / "qiita-data-plane" / "src" / "flight_service.rs"
+        Path(__file__).resolve().parents[3]
+        / "qiita-data-plane"
+        / "src"
+        / "flight_service"
+        / "query.rs"
     ).read_text()
     m = re.search(r"const ALLOWED_TABLES: &\[&str\] = &\[(.*?)\];", src, flags=re.DOTALL)
-    assert m, "ALLOWED_TABLES not found in flight_service.rs"
+    assert m, "ALLOWED_TABLES not found in flight_service/query.rs"
     rust_tables = set(re.findall(r'"([^"]+)"', m.group(1)))
 
     assert rust_tables == set(_DOGET_ALLOWED_TABLES), (

@@ -43,6 +43,7 @@ from ._base import (
     _log,
     _raise_if_ticket_terminal,
 )
+from ._context import RunContext
 
 # =============================================================================
 # Dispatch helpers
@@ -617,22 +618,16 @@ async def _fetch_plan_hint(
 
 
 async def _dispatch_step(
-    backend_client: ComputeBackendClient,
+    ctx: RunContext,
     entry: WorkflowStep,
     bound: dict[str, Any],
     workspace: Path,
-    scope_target: dict[str, Any],
     *,
-    pool: asyncpg.Pool,
-    work_ticket_idx: int,
     step_index: int,
     attempt: int,
-    action_ceiling: ActionCeiling,
     mem_gb_override: int | None = None,
     walltime_override: timedelta | None = None,
     plan_hint: StepPlanResponse | None = None,
-    poll_interval_seconds: float,
-    resume: bool = False,
 ) -> dict[str, Any]:
     """Dispatch one `step:` entry: write-ahead intent, submit to the
     orchestrator, then poll status until terminal and fetch the verified
@@ -651,14 +646,14 @@ async def _dispatch_step(
         (transient kinds) vs. fail (permanent / exhausted).
 
     `optional_inputs` flow through if present in the binding map; missing
-    ones are simply omitted. `action_ceiling` clamps the resolved baseline;
+    ones are simply omitted. `ctx.action_ceiling` clamps the resolved baseline;
     the lookup population reads an upstream step's named output file and
     selects the matching profile, the flat population uses the YAML values."""
     inputs = _bind_step_inputs(entry, bound)
     resolved = _resolve_baseline_for_step(
         entry=entry,
         bound=bound,
-        action_ceiling=action_ceiling,
+        action_ceiling=ctx.action_ceiling,
         mem_gb_override=mem_gb_override,
         walltime_override=walltime_override,
         plan_hint=plan_hint,
@@ -675,10 +670,10 @@ async def _dispatch_step(
     # turns out to be the in-process LocalBackend, record_synchronous_completion
     # below corrects it. record_submitting is idempotent on re-entry, so a
     # recovery resuming this exact attempt doesn't reset the row.
-    job_name = f"qiita-wt{work_ticket_idx}-{entry.name}-a{attempt}"
+    job_name = f"qiita-wt{ctx.work_ticket_idx}-{entry.name}-a{attempt}"
     await step_progress.record_submitting(
-        pool,
-        work_ticket_idx=work_ticket_idx,
+        ctx.pool,
+        work_ticket_idx=ctx.work_ticket_idx,
         step_index=step_index,
         attempt=attempt,
         step_name=entry.name,
@@ -687,18 +682,13 @@ async def _dispatch_step(
     )
 
     handle = await _adopt_or_submit(
-        backend_client,
-        pool,
+        ctx,
         entry=entry,
         inputs=inputs,
         workspace=workspace,
-        scope_target=scope_target,
-        work_ticket_idx=work_ticket_idx,
         step_index=step_index,
         attempt=attempt,
         baseline=baseline,
-        poll_interval_seconds=poll_interval_seconds,
-        resume=resume,
     )
 
     # Synchronous backend (LocalBackend ran the module in-process and handed
@@ -707,8 +697,8 @@ async def _dispatch_step(
     # non-None ⇒ non-empty.
     if handle.terminal_outputs is not None:
         await step_progress.record_synchronous_completion(
-            pool,
-            work_ticket_idx=work_ticket_idx,
+            ctx.pool,
+            work_ticket_idx=ctx.work_ticket_idx,
             step_index=step_index,
             attempt=attempt,
             compute_target=handle.compute_target,
@@ -721,29 +711,29 @@ async def _dispatch_step(
     # verified result.
     try:
         status = await _poll_until_terminal(
-            backend_client,
+            ctx.backend_client,
             handle,
-            pool,
-            work_ticket_idx=work_ticket_idx,
+            ctx.pool,
+            work_ticket_idx=ctx.work_ticket_idx,
             step_index=step_index,
             attempt=attempt,
-            poll_interval_seconds=poll_interval_seconds,
+            poll_interval_seconds=ctx.poll_interval_seconds,
         )
         raw_outputs = await _result_with_infra_retry(
-            backend_client,
+            ctx.backend_client,
             handle,
             status,
-            pool=pool,
-            work_ticket_idx=work_ticket_idx,
-            poll_interval_seconds=poll_interval_seconds,
+            pool=ctx.pool,
+            work_ticket_idx=ctx.work_ticket_idx,
+            poll_interval_seconds=ctx.poll_interval_seconds,
         )
     except BackendFailure as exc:
         # Genuine step failure (infra-unreachable kinds loop forever inside
         # the helpers and never reach here). Mark this attempt failed; the
         # retry loop decides retry-as-new-attempt vs. fail.
         await _best_effort_record_failed(
-            pool,
-            work_ticket_idx=work_ticket_idx,
+            ctx.pool,
+            work_ticket_idx=ctx.work_ticket_idx,
             step_index=step_index,
             attempt=attempt,
             failure_kind=exc.kind.value,
@@ -751,7 +741,7 @@ async def _dispatch_step(
         )
         raise
     await step_progress.record_completed(
-        pool, work_ticket_idx=work_ticket_idx, step_index=step_index, attempt=attempt
+        ctx.pool, work_ticket_idx=ctx.work_ticket_idx, step_index=step_index, attempt=attempt
     )
     # Convention: the orchestrator's output dict keys match the YAML's
     # `outputs:` names exactly. A mismatch is a workflow authoring error and
@@ -760,19 +750,14 @@ async def _dispatch_step(
 
 
 async def _adopt_or_submit(
-    backend_client: ComputeBackendClient,
-    pool: asyncpg.Pool,
+    ctx: RunContext,
     *,
     entry: WorkflowStep,
     inputs: dict[str, Path],
     workspace: Path,
-    scope_target: dict[str, Any],
-    work_ticket_idx: int,
     step_index: int,
     attempt: int,
     baseline: StepBaselineResources,
-    poll_interval_seconds: float,
-    resume: bool = False,
 ) -> StepHandleWire:
     """Submit the step, or adopt a job already recorded for this exact
     `(work_ticket_idx, step_index, attempt)`.
@@ -804,7 +789,7 @@ async def _adopt_or_submit(
     lookup would be wasted. If the lookup can't reach slurmrestd it retries in
     place (recovery never fails on a CO/slurmrestd blip); if slurmrestd has
     purged the job (no match), we fall through to a fresh submit."""
-    rows = await step_progress.load_step_progress(pool, work_ticket_idx)
+    rows = await step_progress.load_step_progress(ctx.pool, ctx.work_ticket_idx)
     existing = next((r for r in rows if r.step_index == step_index and r.attempt == attempt), None)
     # Adoption assumes `attempt` names a LIVE attempt. It is the caller's job to
     # have skipped any already-terminal one (`_attempt_is_terminal`) — adopting a
@@ -816,7 +801,7 @@ async def _adopt_or_submit(
     if existing is not None and existing.slurm_job_id is not None:
         _log.info(
             "work_ticket %d step %r attempt %d already submitted as job %s; adopting",
-            work_ticket_idx,
+            ctx.work_ticket_idx,
             entry.name,
             attempt,
             existing.slurm_job_id,
@@ -834,31 +819,31 @@ async def _adopt_or_submit(
     # recorded job_name may be a job a crashed prior process launched but
     # never persisted. Find it by name before re-submitting.
     if (
-        resume
+        ctx.resume
         and existing is not None
         and existing.slurm_job_id is None
         and existing.job_name is not None
     ):
         found = await _find_existing_job(
-            backend_client,
+            ctx.backend_client,
             existing.job_name,
-            pool=pool,
-            work_ticket_idx=work_ticket_idx,
-            poll_interval_seconds=poll_interval_seconds,
+            pool=ctx.pool,
+            work_ticket_idx=ctx.work_ticket_idx,
+            poll_interval_seconds=ctx.poll_interval_seconds,
         )
         if found is not None:
             _log.warning(
                 "work_ticket %d step %r attempt %d: adopting orphaned SLURM job %s found by"
                 " name %r (its id was never persisted); not re-submitting",
-                work_ticket_idx,
+                ctx.work_ticket_idx,
                 entry.name,
                 attempt,
                 found.slurm_job_id,
                 existing.job_name,
             )
             await step_progress.record_submitted(
-                pool,
-                work_ticket_idx=work_ticket_idx,
+                ctx.pool,
+                work_ticket_idx=ctx.work_ticket_idx,
                 step_index=step_index,
                 attempt=attempt,
                 slurm_job_id=found.slurm_job_id,
@@ -874,12 +859,12 @@ async def _adopt_or_submit(
     n = 0
     while True:
         try:
-            handle = await backend_client.submit_step(
+            handle = await ctx.backend_client.submit_step(
                 step_name=entry.name,
                 inputs=inputs,
                 workspace=workspace,
-                scope_target=scope_target,
-                work_ticket_idx=work_ticket_idx,
+                scope_target=ctx.scope_target,
+                work_ticket_idx=ctx.work_ticket_idx,
                 attempt=attempt,
                 container=entry.container,
                 module=entry.module,
@@ -893,30 +878,30 @@ async def _adopt_or_submit(
                 raise
             _log.warning(
                 "work_ticket %d step %r submit unreachable (%s); retry %d",
-                work_ticket_idx,
+                ctx.work_ticket_idx,
                 entry.name,
                 exc.kind.value,
                 n + 1,
             )
             n = await _infra_retry_wait(
-                pool,
-                work_ticket_idx,
+                ctx.pool,
+                ctx.work_ticket_idx,
                 what="submit",
                 kind=exc.kind,
                 n=n,
-                base=poll_interval_seconds,
+                base=ctx.poll_interval_seconds,
             )
     if n:
         # Submit got through after an outage — clear the stuck marker.
-        await _clear_transient_retry(pool, work_ticket_idx)
+        await _clear_transient_retry(ctx.pool, ctx.work_ticket_idx)
     # SLURM async submit — persist the job id before returning so the poll
     # loop and any restart re-entry resolve to the same job. A synchronous
     # (local) handle has no job id; the caller's terminal_outputs branch
     # corrects the row's compute_target instead.
     if handle.terminal_outputs is None:
         await step_progress.record_submitted(
-            pool,
-            work_ticket_idx=work_ticket_idx,
+            ctx.pool,
+            work_ticket_idx=ctx.work_ticket_idx,
             step_index=step_index,
             attempt=attempt,
             slurm_job_id=handle.slurm_job_id,

@@ -31,7 +31,7 @@ make lint
 # Database migrations (auto-installs dbmate)
 make migrate
 
-# Deploy (prints systemd + nginx instructions; does not sudo)
+# Build, then print the admin deploy command (local-deploy.sh / redeploy); does not sudo
 make deploy
 make verify-health         # auto-installs grpcurl; localhost-only health curls
 
@@ -49,9 +49,11 @@ make clean
 # Python
 cd qiita-control-plane && uv run pytest tests/test_smoke.py::test_health
 
-# Rust — DUCKDB_DOWNLOAD_LIB=1 dynamically links a prebuilt libduckdb from
-# target/duckdb-download instead of rebuilding the bundled DuckDB from source.
-# Without it, every invocation can spend many minutes compiling DuckDB.
+# Rust — DUCKDB_DOWNLOAD_LIB=1 links the prebuilt libduckdb cached in
+# target/duckdb-download. The duckdb crate fetches it when the variable is unset
+# too; only `--features duckdb/bundled` (make build's release binary) compiles
+# DuckDB from source. Set it as the Makefile does: a change in it reruns the
+# crate's build script and relinks the data plane.
 cd qiita-data-plane && DUCKDB_DOWNLOAD_LIB=1 cargo test config_with_valid_env
 ```
 
@@ -76,11 +78,13 @@ cd qiita-control-plane && uv sync --reinstall-package qiita-common
 
 **Use of opaque identifiers outside of Qiita requires explicit approval; stable and publicly sharable IDs are prioritized** (e.g., biosample, `exported_identifier`, etc). Our minted `*_idx` values — `prep_sample_idx`, `sequenced_pool_idx`, `sequencing_run_idx`, `alignment_idx`, `study_idx` — are internal: they mean nothing to anyone outside this system, they expose our structure, and they are a handle we do not promise to keep. This governs everything that crosses the boundary, not just API bodies: a response a user publishes beside a result, an exported filename, a column in a feature table or BIOM file, a label composed for a manuscript. Echoing back an identifier the caller themselves sent is not a leak; composing one into something they will publish is. When a public handle is needed and no accession exists, mint one (`qiita.exported_identifier`; for a study or biosample, its `qiita.exported_entity` row's `export_entity_id`) rather than reaching for an `_idx`. One carve-out: a study created at an explicit `study_idx` below 25000 (`qiita study create --study-idx`) holds its legacy-Qiita id there. That id is already public (cited in papers, and part of the ENA aliases legacy Qiita submitted), and we keep it, so quoting it is not a leak ([legacy reserved range](docs/architecture/data-model.md#legacy-import-reserved-range--study-prep_sample-and-sequenced_pool)). Code composing a public handle still uses `export_entity_id`, since it cannot assume a study is a legacy one.
 
+**Inside the system, a read is named by its `sequence_idx`, not its `read_id`.** This covers every place a read's identity travels within Qiita: a FASTQ or FASTA handed to an assembler, aligner or classifier, a staging Parquet, a lake table column, a join key. `sequence_idx` is a globally unique integer. A table that carries it joins to `read` directly, with no `(prep_sample_idx, read_id)` lookup to resolve. `read_id` is the sequencer's free text: unique only within its prep_sample, and a tool may rewrite it (myloasm appends `+split<N>` to pieces of a read). Keep `read_id` only where it cannot or should not be replaced. That covers the `read` table's record of what the sequencer wrote, and anything that leaves the system, where the rule above keeps `sequence_idx` out. A new use of `read_id` as an identity says which of the two it is.
+
 **State a rationale once, at the site that acts on it.** A measured number, a security argument, or a design trade-off belongs at the one place that *enforces* it — the constant, the guard, the signing boundary — and nowhere else. Every other site that touches the same subject either points at that one ("see `auth/tickets.py`") or says nothing. The test: **would this comment have to change if the underlying fact changed?** If yes, it is a second copy, not context — replace it with a pointer. Repetition is not merely wasteful: each copy drifts on its own schedule, and a reader who finds two versions of a claim has no way to tell which one is current. If a fact really is needed at N sites, that is a signal it wants to be a named constant or a helper whose docstring is the single copy. A worked example: `cigar` being ~96% of an alignment row was, at one point, asserted in nine files.
 
 **No development-plan vocabulary in code.** "M0", "M3", "Phase 4", "item 6", "the milestone" — these name a planning document that is not in the repo and will not outlive the branch, so they say nothing to whoever reads the line next. This covers comments, docstrings, test names, and changelog entries alike. Write the substance instead: not "M0 measured the break-even at ~4 Gbit/s", just "the measured break-even is ~4 Gbit/s". The `(#N)` carve-out above does not extend to these — a PR number resolves forever, a milestone label does not.
 
-**Don't whole-file-read the big files.** Several source and test modules here run past 3,000 lines (the control-plane CLI/runner test modules, `qiita-data-plane/src/flight_service.rs`). Reading one whole costs more context than every instruction file in this repo combined, so locate first (grep / LSP / a targeted `Read` offset+limit) and read only the span you need. The two `<date>-<sha>.md` files in `docs/changelog-archive/` are long for the same reason, and nothing adds to them: a changelog entry is a new file (see `CHANGELOG.md`). `docs/architecture.md` is an index over `docs/architecture/` — grep it for the section you want, then read that one file.
+**Don't whole-file-read the big files.** Several source and test modules here run past 3,000 lines (the control-plane CLI/runner test modules). Reading one whole costs more context than every instruction file in this repo combined, so locate first (grep / LSP / a targeted `Read` offset+limit) and read only the span you need. The two `<date>-<sha>.md` files in `docs/changelog-archive/` are long for the same reason, and nothing adds to them: a changelog entry is a new file (see `CHANGELOG.md`). `docs/architecture.md` is an index over `docs/architecture/` — grep it for the section you want, then read that one file.
 
 ## miint is a core dependency
 
@@ -183,11 +187,17 @@ The loop ends by printing a `## Reviewer loop` block for the PR description: the
 it reviewed, each fix it made outside the PR's subject, and each finding it declined
 (with the reason), deferred (with its issue number), or left unprobed.
 `.github/pull_request_template.md` carries the heading. The `review-loop-check` CI job
-fails a PR whose description lacks the block or whose "Reviewed at" is not one of the
-PR's own commits; the `no-agent-review` label opts out, for a PR whose author cannot run
-the loop or that has nothing for it to read; the description then says why under the
-same heading. The check establishes that the block is present, not that the loop ran —
-the block is the author's statement, and a human reviewer reads it as one.
+fails a PR whose description lacks the block, whose "Reviewed at" is not one of the
+PR's own commits, or whose "Reviewed at" line does not name, by sha, every commit the
+branch added after it. A merge of the base needs no naming; a merge that brings in
+other commits (a pull of work pushed from elsewhere, another PR's branch) is named
+itself. A commit that only writes the PR's number into the `(#N)` tags under
+`docs/changelog-pending/` and in `DEPLOY_CHECKLIST.md`, replacing a placeholder or adding
+the tag, needs no naming either. The `no-agent-review` label opts out, for a PR whose
+author cannot run the loop or that has nothing for it to read; the description then
+says why under the same heading. The check establishes that the block is present and
+accounts for every push, not that the loop ran — the block is the author's statement,
+and a human reviewer reads it as one.
 
 When a human review turns up a pattern the agent missed, fold it into the agent file in
 the PR that fixes the instance: a rule or a bullet under the rule that owns it, a

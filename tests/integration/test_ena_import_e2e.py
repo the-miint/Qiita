@@ -19,7 +19,6 @@ import duckdb
 import pytest
 import pytest_asyncio
 import yaml
-from conftest import cleanup_ena_study, ducklake_connect
 from qiita_common.actions import ActionDefinition, WorkflowAction
 from qiita_common.api_paths import LOOPBACK_HOST
 from qiita_common.auth_constants import SystemRole
@@ -44,11 +43,12 @@ from qiita_control_plane.repositories.sequenced_sample import (
 )
 from qiita_control_plane.testing.db_seeds import seed_user_principal
 from qiita_control_plane.testing.db_teardown import delete_principal
-
 from qiita_control_plane.testing.unique_names import (
     unique_accession,
     unique_ena_accession,
 )
+
+from conftest import cleanup_ena_study, ducklake_connect
 
 _DOWNLOAD_ENA_STUDY_YAML_PATH = (
     Path(__file__).parent.parent.parent / "workflows" / "download-ena-study" / "1.0.0.yaml"
@@ -90,11 +90,17 @@ def _make_two_runs_sharing_one_sample(shared_sample_accession: str):
     """Build a `(runs, attrs)` fake-resolver pair for one study whose two runs
     share ONE `sample_accession`, both ILLUMINA (a single `sequenced_pool`), so
     the full span exercises intra-study biosample de-dup."""
+    # Run accessions of the real shape, since ingest refuses any other; one pair per
+    # study, so a re-run of the per-study step sees the same runs.
+    run_pairs: dict[str, tuple[str, str]] = {}
 
     def _fake_runs(accession: str) -> tuple[list[str], list[tuple]]:
+        first, second = run_pairs.setdefault(
+            accession, (unique_ena_accession("SRR"), unique_ena_accession("SRR"))
+        )
         rows = [
             (
-                f"SRR-{accession}-1",
+                first,
                 f"SRX-{accession}-1",
                 shared_sample_accession,
                 accession,
@@ -112,7 +118,7 @@ def _make_two_runs_sharing_one_sample(shared_sample_accession: str):
                 "public",
             ),
             (
-                f"SRR-{accession}-2",
+                second,
                 f"SRX-{accession}-2",
                 shared_sample_accession,
                 accession,
@@ -186,8 +192,9 @@ def _write_intermediate(
         )
 
 
-def _fake_stage_run_reads_factory(by_run: dict[str, tuple[list[tuple], list[str]]]):
-    """Build a `_stage_run_reads`-shaped fake keyed by run_accession."""
+def _fake_stage_run_reads_factory(by_run: dict[str, list[tuple]]):
+    """Build a `_stage_run_reads`-shaped fake keyed by run_accession; each entry
+    is the run's rows."""
 
     def _fake(
         run_accession,
@@ -197,9 +204,9 @@ def _fake_stage_run_reads_factory(by_run: dict[str, tuple[list[tuple], list[str]
         memory_gb,
         threads,
     ):
-        rows, warnings = by_run[run_accession]
+        rows = by_run[run_accession]
         _write_intermediate(intermediate_path, rows)
-        return len(rows), warnings
+        return len(rows)
 
     return _fake
 
@@ -226,17 +233,20 @@ async def _run_register_files(
     """Drive the REAL runner adapter for the download-ena-study `register-files`
     entry."""
     from qiita_control_plane.runner import _run_action_primitive
+    from qiita_control_plane.testing.run_context import run_context
 
     entry = _entry_by_name("register-files")
     await _run_action_primitive(
-        postgres_pool,
+        run_context(
+            pool=postgres_pool,
+            scope_target={},
+            work_ticket_idx=work_ticket_idx,
+            signing_key=data_plane["secret"],
+            data_plane_url=_data_plane_url(data_plane),
+        ),
         entry,
         {"read_staging_dir": str(staging_dir)},
         staging_dir,
-        {},
-        work_ticket_idx=work_ticket_idx,
-        signing_key=data_plane["secret"],
-        data_plane_url=_data_plane_url(data_plane),
     )
 
 
@@ -483,8 +493,8 @@ async def test_batch_driver_to_register_files_to_ducklake_full_span(
     # inline DuckDB COPY, keyed by the REAL ena_run_accession the roster
     # carries. ---
     by_run = {
-        roster[0][1]: (_RUN1_ROWS, []),
-        roster[1][1]: (_RUN2_ROWS, []),
+        roster[0][1]: _RUN1_ROWS,
+        roster[1][1]: _RUN2_ROWS,
     }
     from qiita_compute_orchestrator import sequence_range_retry
     from qiita_compute_orchestrator.jobs import ingest_ena_reads
@@ -619,7 +629,8 @@ async def test_run_list_import_ingests_only_the_listed_runs(
         work_ticket_idx,
     )
     sequencing_run_idx = await postgres_pool.fetchval(
-        "SELECT sequencing_run_idx FROM qiita.sequenced_pool WHERE idx = $1", sequenced_pool_idx
+        "SELECT sequencing_run_idx FROM qiita.sequenced_pool WHERE idx = $1",
+        sequenced_pool_idx,
     )
     roster_rows = await fetch_sequenced_pool_ena_run_roster(
         postgres_pool, sequenced_pool_idx=sequenced_pool_idx
@@ -628,7 +639,7 @@ async def test_run_list_import_ingests_only_the_listed_runs(
     assert [run for run, _ in roster] == sorted(listed)
     prep_sample_idxs = [psi for _, psi in roster]
 
-    by_run = {roster[0][0]: (_RUN1_ROWS, []), roster[1][0]: (_RUN2_ROWS, [])}
+    by_run = {roster[0][0]: _RUN1_ROWS, roster[1][0]: _RUN2_ROWS}
     from qiita_compute_orchestrator import sequence_range_retry
     from qiita_compute_orchestrator.jobs import ingest_ena_reads
     from qiita_compute_orchestrator.sequence_range import MintedSequenceRange
@@ -712,7 +723,8 @@ async def test_pool_with_a_permanently_failed_run_lands_the_rest_and_reads_compl
         work_ticket_idx,
     )
     sequencing_run_idx = await postgres_pool.fetchval(
-        "SELECT sequencing_run_idx FROM qiita.sequenced_pool WHERE idx = $1", sequenced_pool_idx
+        "SELECT sequencing_run_idx FROM qiita.sequenced_pool WHERE idx = $1",
+        sequenced_pool_idx,
     )
     roster_rows = await fetch_sequenced_pool_ena_run_roster(
         postgres_pool, sequenced_pool_idx=sequenced_pool_idx
@@ -724,7 +736,7 @@ async def test_pool_with_a_permanently_failed_run_lands_the_rest_and_reads_compl
     from qiita_compute_orchestrator.jobs import ingest_ena_reads
     from qiita_compute_orchestrator.sequence_range import MintedSequenceRange
 
-    good_fake = _fake_stage_run_reads_factory({good_run: (_RUN1_ROWS, [])})
+    good_fake = _fake_stage_run_reads_factory({good_run: _RUN1_ROWS})
 
     def _stage(run_accession, *args):
         if run_accession == bad_run:
@@ -770,16 +782,22 @@ async def test_pool_with_a_permanently_failed_run_lands_the_rest_and_reads_compl
         work_ticket_idx=work_ticket_idx,
     )
     from qiita_control_plane.runner import _run_action_primitive
+    from qiita_control_plane.testing.run_context import run_context
 
     await _run_action_primitive(
-        postgres_pool,
+        run_context(
+            pool=postgres_pool,
+            scope_target={
+                "kind": "sequenced_pool",
+                "sequenced_pool_idx": sequenced_pool_idx,
+            },
+            work_ticket_idx=work_ticket_idx,
+            signing_key=data_plane["secret"],
+            data_plane_url=_data_plane_url(data_plane),
+        ),
         _entry_by_name("persist-ena-run-outcomes"),
         {"run_outcomes": str(outputs["run_outcomes"])},
         tmp_path / "ws1",
-        {"kind": "sequenced_pool", "sequenced_pool_idx": sequenced_pool_idx},
-        work_ticket_idx=work_ticket_idx,
-        signing_key=data_plane["secret"],
-        data_plane_url=_data_plane_url(data_plane),
     )
 
     assert _count_read_rows(data_plane, [good_psi]) == len(_RUN1_ROWS)

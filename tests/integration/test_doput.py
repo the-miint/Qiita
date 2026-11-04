@@ -93,9 +93,7 @@ def _do_put_one_batch(
     return _json.loads(bytes(put_metadata).decode())
 
 
-async def test_doput_happy_path_round_trip(
-    postgres_pool, cp_client, flight_client, data_plane
-):
+async def test_doput_happy_path_round_trip(postgres_pool, cp_client, flight_client, data_plane):
     """Mint slot → DoPut Arrow batch → done callback → verify ready state.
 
     Lock the cross-component contract: the CP-minted ticket verifies on
@@ -104,9 +102,7 @@ async def test_doput_happy_path_round_trip(
     the qiita.upload row.
     """
     # 1) Mint the upload slot.
-    create_resp = await cp_client.post(
-        URL_UPLOAD_PREFIX, json={"description": "doput e2e"}
-    )
+    create_resp = await cp_client.post(URL_UPLOAD_PREFIX, json={"description": "doput e2e"})
     assert create_resp.status_code == 201, create_resp.text
     upload_idx = create_resp.json()["upload_idx"]
     ticket_bytes = base64.b64decode(create_resp.json()["doput_ticket"])
@@ -126,9 +122,7 @@ async def test_doput_happy_path_round_trip(
     assert "staging_path" not in put_body, (
         "staging_path leaked in PutResult — clients should not see server paths"
     )
-    expected_path = (
-        f"{data_plane['upload_staging_root']}/uploads/{upload_idx}/upload.parquet"
-    )
+    expected_path = f"{data_plane['upload_staging_root']}/uploads/{upload_idx}/upload.parquet"
 
     # 3) Verify the file actually landed at that path with mode 440.
     import os
@@ -161,9 +155,7 @@ async def test_doput_happy_path_round_trip(
     assert body["row_count"] == 3
 
     # Cleanup
-    await postgres_pool.execute(
-        "DELETE FROM qiita.upload WHERE upload_idx = $1", upload_idx
-    )
+    await postgres_pool.execute("DELETE FROM qiita.upload WHERE upload_idx = $1", upload_idx)
 
 
 async def test_doput_rejects_tampered_ticket(postgres_pool, cp_client, flight_client):
@@ -187,9 +179,7 @@ async def test_doput_rejects_tampered_ticket(postgres_pool, cp_client, flight_cl
     )
     assert row["status"] == "pending"
 
-    await postgres_pool.execute(
-        "DELETE FROM qiita.upload WHERE upload_idx = $1", upload_idx
-    )
+    await postgres_pool.execute("DELETE FROM qiita.upload WHERE upload_idx = $1", upload_idx)
 
 
 async def test_doput_rejects_missing_ticket(flight_client):

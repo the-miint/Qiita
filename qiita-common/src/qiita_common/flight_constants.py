@@ -10,7 +10,7 @@ imports `pyarrow.flight` lazily at its own call site.
 # gRPC metadata key by which a DoGet client asks for a compressed IPC body.
 #
 # Lowercase because HTTP/2 requires it of header names. **Rust twin:**
-# `IPC_COMPRESSION_HEADER` in `qiita-data-plane/src/flight_service.rs` — the two
+# `IPC_COMPRESSION_HEADER` in `qiita-data-plane/src/flight_service/doget.rs` — the two
 # are a wire contract and must change together.
 IPC_COMPRESSION_HEADER = "qiita-ipc-compression"
 

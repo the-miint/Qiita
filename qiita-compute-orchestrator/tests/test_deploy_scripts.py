@@ -120,6 +120,1293 @@ def _fake_native_checkout(tmp_path: Path) -> Path:
     return py
 
 
+# The data-plane.env keys the deploy reads. Removed from every topology test's
+# environment so the caller's shell cannot reach the helpers under test.
+_TOPOLOGY_VARS = (
+    "QIITA_DATA_PLANE_PORTS",
+    "QIITA_DATA_PLANE_PEERS",
+    "QIITA_DATA_PLANE_BIND_HOST",
+    "QIITA_DATA_PLANE_INSTANCE_MEMORY_MAX",
+    "QIITA_DATA_PLANE_LOCAL_INSTANCES",
+    "DUCKDB_MEMORY_LIMIT",
+    "DUCKLAKE_POOL_SIZE",
+)
+_ABSENT_DP_ENV = "/nonexistent/qiita/data-plane.env"
+
+
+def _run_common(
+    snippet: str,
+    *args: str,
+    dp_env: Path | None = None,
+    extra_env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Source _common.sh and run `snippet`, with `args` as $1…
+
+    The topology variables are removed from the environment and DP_ENV points at
+    `dp_env`, or at a path that does not exist, so neither the caller's shell nor a
+    real /etc/qiita/data-plane.env reaches the test. `extra_env` is applied last."""
+    env = {k: v for k, v in os.environ.items() if k not in _TOPOLOGY_VARS}
+    env["DP_ENV"] = str(dp_env) if dp_env is not None else _ABSENT_DP_ENV
+    env.update(extra_env or {})
+    return subprocess.run(
+        ["bash", "-c", f'source "{_COMMON}"; {snippet}', "_", *args],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+
+def _dp_env(tmp_path: Path, body: str) -> Path:
+    path = tmp_path / "data-plane.env"
+    path.write_text(body)
+    return path
+
+
+def _lb_port() -> str:
+    """QIITA_DATA_PLANE_LB_PORT as _common.sh defines it."""
+    result = _run_common('printf %s "$QIITA_DATA_PLANE_LB_PORT"')
+    assert result.returncode == 0 and result.stdout, result.stderr
+    return result.stdout
+
+
+def test_data_plane_ports_defaults_to_the_single_instance() -> None:
+    """Set neither in the environment nor in data-plane.env ⇒ the one instance every
+    host has run, so a host that sets nothing deploys as before."""
+    result = _run_common("qiita_data_plane_ports")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "50051"
+
+
+def test_data_plane_units_of_an_unconfigured_host_are_the_single_instance() -> None:
+    """The units the deploy waits on and restarts, from the default port list: the
+    one `qiita-data-plane@50051` a single-machine host has always run."""
+    result = _run_common('qiita_data_plane_units "$(qiita_data_plane_ports)"')
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.split() == ["qiita-data-plane@50051"]
+
+
+def test_data_plane_units_names_one_unit_per_port() -> None:
+    result = _run_common('qiita_data_plane_units "50051 50052"')
+    assert result.stdout.split() == ["qiita-data-plane@50051", "qiita-data-plane@50052"]
+
+
+# (active, enabled) per instance, as `systemctl list-units --all` and `is-enabled`
+# report them on systemd 257: an instance neither running nor enabled is not listed.
+_UNIT_STATES = {
+    "50051": ("active", "enabled"),  # configured
+    "50052": ("active", "disabled"),  # started by hand, outside the list
+    "50053": ("inactive", "enabled"),  # stopped, but starts at boot
+    "50054": ("failed", "disabled"),  # not serving and not starting at boot
+    "50055": ("activating", "disabled"),  # restarting after a crash
+}
+
+
+def _run_stray_units(
+    tmp_path: Path,
+    ports: str,
+    list_rc: int = 0,
+    snippet: str = "qiita_data_plane_stray_units",
+    extra_env: dict[str, str] | None = None,
+):
+    stub = tmp_path / "stub"
+    stub.mkdir()
+    listing = "".join(
+        f"qiita-data-plane@{port}.service loaded {active} running x\n"
+        for port, (active, _) in _UNIT_STATES.items()
+    )
+    enabled = "".join(
+        f"  *@{port}.service) echo {state}; [ {state} = enabled ] ;;\n"
+        for port, (_, state) in _UNIT_STATES.items()
+    )
+    (stub / "systemctl").write_text(
+        "#!/bin/sh\n"
+        'case "$1" in\n'
+        f"  list-units) printf '{listing}'; exit {list_rc} ;;\n"
+        '  is-enabled) case "$2" in\n'
+        f"{enabled}"
+        "  esac ;;\n"
+        "esac\n"
+    )
+    (stub / "systemctl").chmod(0o755)
+    return _run_common(
+        f'{snippet} "$1"',
+        ports,
+        extra_env={"PATH": f"{stub}:{os.environ['PATH']}", **(extra_env or {})},
+    )
+
+
+def test_stray_units_reports_running_or_enabled_instances_outside_the_list(
+    tmp_path: Path,
+) -> None:
+    """A port taken out of QIITA_DATA_PLANE_PORTS leaves its unit on the previous
+    build, outside the upstream, until someone disables it; verify-deploy fails on
+    it. A failed, disabled unit serves nothing and starts at no boot."""
+    result = _run_stray_units(tmp_path, "50051")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == [
+        "qiita-data-plane@50052.service active/disabled",
+        "qiita-data-plane@50053.service inactive/enabled",
+        "qiita-data-plane@50055.service activating/disabled",
+    ]
+
+
+def test_stray_units_is_empty_when_every_instance_is_configured(tmp_path: Path) -> None:
+    result = _run_stray_units(tmp_path, "50051\t50052 50053\n50054 50055")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == ""
+
+
+def test_stray_units_fails_when_systemctl_cannot_list(tmp_path: Path) -> None:
+    result = _run_stray_units(tmp_path, "50051", list_rc=1)
+    assert result.returncode != 0
+    assert "could not list" in result.stderr
+
+
+def test_units_to_disable_stops_the_deploy_without_the_flag(tmp_path: Path) -> None:
+    """Without QIITA_DP_DISABLE_REMOVED=1 a stray instance stops the deploy, naming
+    it and the ways out, so no deploy leaves an instance on the previous build."""
+    result = _run_stray_units(tmp_path, "50051", snippet="qiita_data_plane_units_to_disable")
+    assert result.returncode != 0
+    assert result.stdout == ""
+    assert "qiita-data-plane@50052.service active/disabled" in result.stderr
+    assert "QIITA_DP_DISABLE_REMOVED=1" in result.stderr
+
+
+def test_units_to_disable_names_the_strays_with_the_flag(tmp_path: Path) -> None:
+    result = _run_stray_units(
+        tmp_path,
+        "50051",
+        snippet="qiita_data_plane_units_to_disable",
+        extra_env={"QIITA_DP_DISABLE_REMOVED": "1"},
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.split() == [
+        "qiita-data-plane@50052.service",
+        "qiita-data-plane@50053.service",
+        "qiita-data-plane@50055.service",
+    ]
+
+
+@pytest.mark.parametrize("flag", ["", "1"])
+def test_units_to_disable_is_empty_without_strays(tmp_path: Path, flag: str) -> None:
+    """A host running only its listed instances deploys as before, flag or not."""
+    result = _run_stray_units(
+        tmp_path,
+        "50051 50052 50053 50054 50055",
+        snippet="qiita_data_plane_units_to_disable",
+        extra_env={"QIITA_DP_DISABLE_REMOVED": flag},
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == ""
+
+
+@pytest.mark.parametrize("flag", ["yes", "true", "0"])
+def test_units_to_disable_rejects_a_flag_other_than_1(tmp_path: Path, flag: str) -> None:
+    result = _run_stray_units(
+        tmp_path,
+        "50051 50052 50053 50054 50055",
+        snippet="qiita_data_plane_units_to_disable",
+        extra_env={"QIITA_DP_DISABLE_REMOVED": flag},
+    )
+    assert result.returncode != 0
+    assert "must be 1 or unset" in result.stderr
+
+
+def test_activate_stops_removed_instances_alongside_the_restart() -> None:
+    """The strays are resolved before anything is installed; each is disabled and its
+    stop queued before the restart, so its drain overlaps the listed instances', and
+    a blocking stop after the nginx reload waits for it, so nginx drops the removed
+    member without waiting on its drain."""
+    src = (_DEPLOY / "activate.sh").read_text()
+    resolve = src.index('DP_DISABLE_UNITS=$(qiita_data_plane_units_to_disable "$DP_PORTS")')
+    assert resolve < src.index("assert_migrations_applied()")
+    disable = src.index('    systemctl disable "${dp_disable_units[@]}" >/dev/null')
+    queue = src.index('    systemctl stop --no-block "${dp_disable_units[@]}"')
+    restart = src.index('    systemctl restart "${dp_units[@]}"')
+    reload = src.index("    systemctl reload nginx")
+    wait = src.index('    systemctl stop "${dp_disable_units[@]}"')
+    assert disable < queue < restart < reload < wait
+
+
+def test_data_plane_ports_reads_the_host_file(tmp_path: Path) -> None:
+    """The list lives in data-plane.env, so a routine redeploy — which passes no
+    scaling variables — renders the instances the host was given."""
+    env_file = _dp_env(tmp_path, 'QIITA_DATA_PLANE_PORTS="50051 50052 50053"\n')
+    result = _run_common("qiita_data_plane_ports", dp_env=env_file)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.split() == ["50051", "50052", "50053"]
+
+
+def test_data_plane_ports_defaults_when_the_host_file_omits_it(tmp_path: Path) -> None:
+    env_file = _dp_env(tmp_path, "PATH_SCRATCH=/scratch\n")
+    result = _run_common("qiita_data_plane_ports", dp_env=env_file)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "50051"
+
+
+@pytest.mark.parametrize(
+    ("snippet", "var", "file_value", "env_value", "expected"),
+    [
+        ("qiita_data_plane_ports", "QIITA_DATA_PLANE_PORTS", "50051 50052", "50053", "50051 50052"),
+        ("qiita_data_plane_ports", "QIITA_DATA_PLANE_PORTS", None, "50053", "50051"),
+        (
+            "qiita_data_plane_peers",
+            "QIITA_DATA_PLANE_PEERS",
+            "10.0.0.9:50051",
+            "",
+            "10.0.0.9:50051",
+        ),
+        ("qiita_data_plane_peers", "QIITA_DATA_PLANE_PEERS", None, "10.0.0.9:50051", ""),
+        ("qiita_data_plane_bind_host", "QIITA_DATA_PLANE_BIND_HOST", None, "10.0.0.9", "127.0.0.1"),
+    ],
+)
+def test_topology_ignores_the_deploy_environment(
+    tmp_path: Path, snippet: str, var: str, file_value: str | None, env_value: str, expected: str
+) -> None:
+    """Only the host file counts: a value exported by whoever runs the deploy, set or
+    blank, with or without the key in the file, changes nothing, so what a deploy
+    renders and enables is what the file says."""
+    body = "PATH_SCRATCH=/scratch\n" if file_value is None else f'{var}="{file_value}"\n'
+    result = _run_common(snippet, dp_env=_dp_env(tmp_path, body), extra_env={var: env_value})
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == expected
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "50051 abc",  # non-numeric entry
+        "0",  # not a valid TCP port
+        "99999",  # out of range
+        "-1",  # negative
+        "050051",  # a second unit name for port 50051
+        "50051 50052 50051",  # one member rendered twice
+        "50051; rm -rf /",  # the value reaches a systemd unit name + nginx config
+        "   ",  # blank
+    ],
+)
+def test_data_plane_ports_rejects_malformed_values(tmp_path: Path, value: str) -> None:
+    """Each port becomes a systemd unit name, an nginx `server` line and a
+    health-check target, so a bad entry fails here instead of rendering broken
+    config."""
+    env_file = _dp_env(tmp_path, f'QIITA_DATA_PLANE_PORTS="{value}"\n')
+    result = _run_common("qiita_data_plane_ports", dp_env=env_file)
+    assert result.returncode != 0, f"{value!r} should be rejected, got {result.stdout!r}"
+    assert result.stdout == ""
+
+
+def test_data_plane_ports_rejects_the_loopback_listener_port(tmp_path: Path) -> None:
+    """nginx binds QIITA_DATA_PLANE_LB_PORT itself; an instance on it would fight
+    nginx for the port."""
+    env_file = _dp_env(tmp_path, f'QIITA_DATA_PLANE_PORTS="50051 {_lb_port()}"\n')
+    result = _run_common("qiita_data_plane_ports", dp_env=env_file)
+    assert result.returncode != 0, result.stdout
+    assert "loopback listener" in result.stderr
+
+
+def test_data_plane_peers_defaults_to_empty() -> None:
+    """Unset everywhere ⇒ no remote members; a single-host deploy is unchanged."""
+    result = _run_common("qiita_data_plane_peers")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == ""
+
+
+def test_data_plane_peers_reads_the_host_file(tmp_path: Path) -> None:
+    env_file = _dp_env(tmp_path, 'QIITA_DATA_PLANE_PEERS="10.0.0.9:50051 10.0.0.9:50052"\n')
+    result = _run_common("qiita_data_plane_peers", dp_env=env_file)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.split() == ["10.0.0.9:50051", "10.0.0.9:50052"]
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "dp2.example.org:50051",
+        "dp2.example.org:50051 dp3.example.org:50051",
+        "10.0.0.7:50051",
+        "[2001:db8::1]:50051",  # bracketed IPv6 literal
+    ],
+)
+def test_data_plane_peers_accepts_host_port_forms(tmp_path: Path, value: str) -> None:
+    env_file = _dp_env(tmp_path, f'QIITA_DATA_PLANE_PEERS="{value}"\n')
+    result = _run_common("qiita_data_plane_peers", dp_env=env_file)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.split() == value.split()
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "dp2.example.org",  # no port
+        "dp2.example.org:",  # empty port
+        ":50051",  # empty host
+        "dp2.example.org:abc",  # non-numeric port
+        "dp2.example.org:0",  # not a valid TCP port
+        "dp2.example.org:99999",  # out of range
+        "2001:db8::1:50051",  # unbracketed IPv6 — ambiguous
+        "dp2.example.org:50051; rm -rf /",  # reaches an nginx `server` directive
+        "dp2.example.org:50051;",  # a bare `;` would inject config
+        "dp2.example.org:50051 }",  # would close the upstream block early
+        "999.999.999.999:50051",  # digits and dots, not an address
+        "10.0.0.256:50051",  # one octet out of range
+        "1.2.3:50051",  # nginx and getent read this as 1.2.0.3
+        "1.2.3.4.5:50051",  # too many octets
+        "010.0.0.1:50051",  # inet_aton reads 010 as octal 8
+        "1.2.3.4.:50051",  # trailing dot; nginx fails to resolve it
+    ],
+)
+def test_data_plane_peers_rejects_malformed_values(tmp_path: Path, value: str) -> None:
+    """Each entry is written into an nginx `server` directive verbatim, so shape
+    validation is what stands between the setting and an injected directive or a
+    member at an address nobody meant."""
+    env_file = _dp_env(tmp_path, f'QIITA_DATA_PLANE_PEERS="{value}"\n')
+    result = _run_common("qiita_data_plane_peers", dp_env=env_file)
+    assert result.returncode != 0, f"{value!r} should be rejected, got {result.stdout!r}"
+    assert result.stdout == ""
+
+
+@pytest.mark.parametrize("blank", ["   ", "\t", " \t "])
+def test_data_plane_peers_treats_whitespace_only_as_unset(tmp_path: Path, blank: str) -> None:
+    """Whitespace-only ⇒ no peers, not an error (the ports list rejects blank because
+    a host always runs at least one instance). Tabs count: a tab-only value must not
+    be echoed back as a peer."""
+    env_file = _dp_env(tmp_path, f'QIITA_DATA_PLANE_PEERS="{blank}"\n')
+    result = _run_common("qiita_data_plane_peers", dp_env=env_file)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == ""
+
+
+def test_bind_host_defaults_to_loopback() -> None:
+    result = _run_common("qiita_data_plane_bind_host")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "127.0.0.1"
+
+
+def test_bind_host_defaults_to_loopback_when_the_host_file_omits_it(tmp_path: Path) -> None:
+    env_file = _dp_env(tmp_path, "PATH_SCRATCH=/scratch\n")
+    result = _run_common("qiita_data_plane_bind_host", dp_env=env_file)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "127.0.0.1"
+
+
+@pytest.mark.parametrize(
+    "line",
+    ["QIITA_DATA_PLANE_BIND_HOST=10.0.0.5", 'QIITA_DATA_PLANE_BIND_HOST="10.0.0.5"'],
+)
+def test_bind_host_reads_the_host_file(tmp_path: Path, line: str) -> None:
+    result = _run_common("qiita_data_plane_bind_host", dp_env=_dp_env(tmp_path, line + "\n"))
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "10.0.0.5"
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "",  # set but empty: the unit would build LISTEN_ADDR=":<port>"
+        "0.0.0.0",  # every interface
+        "dp1.internal",  # a name, not an address
+        "10.0.0.256",
+        "010.0.0.1",
+        "10.0.0.5.",
+        "::1",
+        "169.228.46.111",  # public
+        "8.8.8.8",
+        "172.32.0.1",  # outside 172.16.0.0/12
+    ],
+)
+def test_bind_host_rejects_values_that_are_not_one_ipv4_interface(
+    tmp_path: Path, value: str
+) -> None:
+    env_file = _dp_env(tmp_path, f"QIITA_DATA_PLANE_BIND_HOST={value}\n")
+    result = _run_common("qiita_data_plane_bind_host", dp_env=env_file)
+    assert result.returncode != 0, f"{value!r} should be rejected, got {result.stdout!r}"
+    assert result.stdout == ""
+
+
+@pytest.mark.parametrize("value", ["127.0.0.1", "127.0.1.1", "172.25.212.111", "192.168.0.10"])
+def test_bind_host_accepts_loopback_and_private_addresses(tmp_path: Path, value: str) -> None:
+    env_file = _dp_env(tmp_path, f"QIITA_DATA_PLANE_BIND_HOST={value}\n")
+    result = _run_common("qiita_data_plane_bind_host", dp_env=env_file)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == value
+
+
+def test_ipv4_literal_refuses_an_octet_past_int64_without_a_shell_error() -> None:
+    result = _run_common('qiita_is_ipv4_literal "$1"', "1.2.3.99999999999999999999")
+    assert result.returncode != 0
+    assert result.stderr == ""
+
+
+@pytest.mark.parametrize(
+    "helper", ["qiita_data_plane_ports", "qiita_data_plane_peers", "qiita_data_plane_bind_host"]
+)
+def test_topology_refuses_a_host_file_that_does_not_parse(tmp_path: Path, helper: str) -> None:
+    """An unclosed quote would otherwise read every key as unset and deploy the
+    default topology on a host configured for more."""
+    env_file = _dp_env(tmp_path, 'QIITA_DATA_PLANE_PORTS="50051 50052\nPATH_SCRATCH=/scratch\n')
+    result = _run_common(helper, dp_env=env_file)
+    assert result.returncode != 0, result.stdout
+    assert result.stdout == ""
+    assert "does not parse" in result.stderr
+
+
+def test_data_plane_unit_sets_listen_addr_on_the_command_line() -> None:
+    """The unit's comment carries why an `Environment=LISTEN_ADDR` line does not
+    hold against data-plane.env. This pins the form that does: LISTEN_ADDR on the
+    ExecStart command line from the bind host and the instance port, with the bind
+    host defaulting to loopback."""
+    unit = (_DEPLOY / "systemd" / "qiita-data-plane@.service").read_text().splitlines()
+    assert not [line for line in unit if line.startswith("Environment=LISTEN_ADDR")]
+    assert "Environment=QIITA_DATA_PLANE_BIND_HOST=127.0.0.1" in unit
+    assert [line for line in unit if line.startswith("ExecStart=")] == [
+        "ExecStart=/usr/bin/env LISTEN_ADDR=${QIITA_DATA_PLANE_BIND_HOST}:%i "
+        "/opt/qiita/data-plane/qiita-data-plane"
+    ]
+
+
+def _render(
+    tmp_path: Path,
+    *,
+    bind_host: str = "127.0.0.1",
+    ports: str = "50051",
+    peers: str = "",
+    template: Path | None = None,
+) -> tuple[subprocess.CompletedProcess[str], Path]:
+    """Render deploy/nginx/qiita.conf (or `template`) with the function activate.sh
+    calls, into tmp_path/qiita.conf."""
+    dest = tmp_path / "qiita.conf"
+    result = _run_common(
+        'qiita_render_nginx_conf "$1" "$2" "$3" "$4" "$5" "$6"',
+        str(template or _DEPLOY / "nginx" / "qiita.conf"),
+        str(dest),
+        "qiita.example.org",
+        bind_host,
+        ports,
+        peers,
+    )
+    return result, dest
+
+
+def _call_rendered_members(conf: str) -> subprocess.CompletedProcess[str]:
+    return _run_common('qiita_data_plane_rendered_members "$1"', conf)
+
+
+def test_render_fills_every_placeholder(tmp_path: Path) -> None:
+    result, dest = _render(tmp_path)
+    assert result.returncode == 0, result.stderr
+    text = dest.read_text()
+    assert "__QIITA_" not in text
+    assert "server_name qiita.example.org;" in text
+    assert f"listen 127.0.0.1:{_lb_port()};" in text
+
+
+def test_render_places_local_members_at_the_bind_host_then_peers(tmp_path: Path) -> None:
+    """Local instances at the bind host, then peers verbatim, read back through the
+    same parser verify.sh uses."""
+    result, dest = _render(
+        tmp_path,
+        bind_host="10.0.0.5",
+        ports="50051 50052",
+        peers="dp2.internal:50051 [2001:db8::1]:50052",
+    )
+    assert result.returncode == 0, result.stderr
+    members = _call_rendered_members(str(dest))
+    assert members.returncode == 0, members.stderr
+    assert members.stdout.split() == [
+        "10.0.0.5:50051",
+        "10.0.0.5:50052",
+        "dp2.internal:50051",
+        "[2001:db8::1]:50052",
+    ]
+
+
+def test_render_from_an_unconfigured_host_is_one_loopback_member(tmp_path: Path) -> None:
+    """The validators' defaults fed to the render, as activate.sh chains them: one
+    member, 127.0.0.1:50051."""
+    dest = tmp_path / "qiita.conf"
+    result = _run_common(
+        'qiita_render_nginx_conf "$1" "$2" example.org "$(qiita_data_plane_bind_host)" '
+        '"$(qiita_data_plane_ports)" "$(qiita_data_plane_peers)"',
+        str(_DEPLOY / "nginx" / "qiita.conf"),
+        str(dest),
+    )
+    assert result.returncode == 0, result.stderr
+    assert _call_rendered_members(str(dest)).stdout.split() == ["127.0.0.1:50051"]
+
+
+def _template_with_unfilled_placeholder(tmp_path: Path) -> Path:
+    """deploy/nginx/qiita.conf plus a placeholder the render has no substitution for."""
+    template = tmp_path / "template.conf"
+    template.write_text((_DEPLOY / "nginx" / "qiita.conf").read_text() + "# __QIITA_NEW__\n")
+    return template
+
+
+def test_render_refuses_a_placeholder_it_does_not_fill(tmp_path: Path) -> None:
+    """A placeholder added to the template without a matching substitution fails the
+    render and leaves no config behind, instead of reaching `nginx -t`."""
+    template = _template_with_unfilled_placeholder(tmp_path)
+    result, dest = _render(tmp_path, template=template)
+    assert result.returncode != 0
+    assert "__QIITA_NEW__" in result.stderr
+    assert not dest.exists()
+
+
+def test_rendered_members_ignores_the_sibling_control_plane_upstream(tmp_path: Path) -> None:
+    """`upstream qiita_control_plane { server 127.0.0.1:8080; }` is in the same file;
+    picking it up would health-check the control plane as a data plane."""
+    result, dest = _render(tmp_path)
+    assert result.returncode == 0, result.stderr
+    assert "qiita_control_plane" in dest.read_text(), "fixture no longer has the sibling"
+    assert _call_rendered_members(str(dest)).stdout.split() == ["127.0.0.1:50051"]
+
+
+def test_rendered_members_signals_fallback_when_config_is_absent(tmp_path: Path) -> None:
+    """rc 1 = no config ⇒ verify.sh falls back to the data-plane.env lists, the real
+    state on a first deploy."""
+    result = _call_rendered_members(str(tmp_path / "does-not-exist.conf"))
+    assert result.returncode == 1
+    assert result.stdout == ""
+
+
+def test_rendered_members_distinguishes_unparseable_from_absent(tmp_path: Path) -> None:
+    """rc 2 = config present, nothing parsed. The fallback would yield the single
+    default port whatever the host runs, so verify.sh fails instead of falling back."""
+    conf = tmp_path / "qiita.conf"
+    conf.write_text("upstream qiita_control_plane {\n    server 127.0.0.1:8080;\n}\n")
+    result = _call_rendered_members(str(conf))
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert "no 'upstream qiita_data_plane' members" in result.stderr
+
+
+def test_rendered_members_ignores_upstream_server_parameters(tmp_path: Path) -> None:
+    """A `server` line may carry parameters; only the address is a health-check
+    target."""
+    conf = tmp_path / "qiita.conf"
+    conf.write_text(
+        "upstream qiita_data_plane {\n    server 127.0.0.1:50051 max_fails=3 fail_timeout=30s;\n}\n"
+    )
+    result = _call_rendered_members(str(conf))
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.split() == ["127.0.0.1:50051"]
+
+
+@pytest.mark.parametrize(
+    ("member", "bind_host", "label"),
+    [
+        ("127.0.0.1:50051", "127.0.0.1", "health/data-plane@50051"),
+        ("10.0.0.5:50052", "10.0.0.5", "health/data-plane@50052"),
+        ("10.0.0.50:50051", "10.0.0.5", "health/data-plane-peer@10.0.0.50:50051"),
+        ("[2001:db8::1]:50052", "127.0.0.1", "health/data-plane-peer@[2001:db8::1]:50052"),
+    ],
+)
+def test_member_label_names_local_instances_by_port(
+    member: str, bind_host: str, label: str
+) -> None:
+    result = _run_common('qiita_data_plane_member_label "$1" "$2"', member, bind_host)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == label
+
+
+def _first_command(src: str, pattern: str) -> int:
+    """Offset of the first non-comment line of a shell script matching `pattern`, so
+    an ordering assertion cannot be satisfied by a comment that mentions the step."""
+    match = re.search(rf"^(?![ \t]*#)[^\n]*{pattern}", src, re.M)
+    assert match, f"no command matching {pattern!r}"
+    return match.start()
+
+
+def test_activate_tests_the_nginx_config_before_restarting_services() -> None:
+    """`nginx -t` rejects what the shell checks do not (a peer such as
+    `[1::2::3]:50051`, whose characters pass the IPv6 check but which is not an
+    address); run after the restarts, it would fail the deploy with the services
+    already on new code."""
+    src = (_DEPLOY / "activate.sh").read_text()
+    tested = _first_command(src, r"qiita_render_and_test_nginx_conf ")
+    first_restart = _first_command(src, r"restart_if_env_present qiita-control-plane")
+    assert tested < first_restart
+
+
+def test_activate_waits_on_and_restarts_every_local_instance_together() -> None:
+    """The idle wait and the restart take the same unit list, and the restart is one
+    `systemctl restart` for all of them, so they stop accepting new requests together
+    and their drains overlap."""
+    src = (_DEPLOY / "activate.sh").read_text()
+    assert re.search(
+        r'(?m)^read -r -a dp_units <<< "\$\(qiita_data_plane_units "\$DP_PORTS"\)"$', src
+    )
+    assert re.search(
+        r'(?m)^wait_for_data_plane_idle "\$DP_ENV" "\$\{dp_units\[@\]\}" '
+        r'"\$\{dp_disable_units\[@\]\}"$',
+        src,
+    )
+    assert re.search(r'(?m)^    systemctl restart "\$\{dp_units\[@\]\}"$', src)
+    assert not re.search(r"(?m)^\s*restart_if_env_present\s+\S*qiita-data-plane", src)
+
+
+def _render_and_test(
+    tmp_path: Path,
+    *,
+    nginx_accepts: bool,
+    previous: str | None,
+    template: Path | None = None,
+    failing: tuple[str, ...] = (),
+) -> tuple[subprocess.CompletedProcess[str], Path]:
+    """Run qiita_render_and_test_nginx_conf with a stub `nginx` whose `-t` accepts or
+    rejects, over an existing deployed file holding `previous` (or none). Each command
+    in `failing` is stubbed to exit 1."""
+    stub = tmp_path / "stub"
+    stub.mkdir()
+    stubs = {"nginx": 0 if nginx_accepts else 1, **dict.fromkeys(failing, 1)}
+    for command, rc in stubs.items():
+        (stub / command).write_text(f"#!/bin/sh\nexit {rc}\n")
+        (stub / command).chmod(0o755)
+    dest = tmp_path / "qiita.conf"
+    if previous is not None:
+        dest.write_text(previous)
+    result = _run_common(
+        'qiita_render_and_test_nginx_conf "$1" "$2" example.org 127.0.0.1 50051 ""',
+        str(template or _DEPLOY / "nginx" / "qiita.conf"),
+        str(dest),
+        extra_env={"PATH": f"{stub}:{os.environ['PATH']}"},
+    )
+    return result, dest
+
+
+def test_a_rejected_render_puts_the_previous_config_back(tmp_path: Path) -> None:
+    """nginx refuses to start on a config `nginx -t` rejects, so the rejected render
+    must not stay in conf.d for the next nginx start."""
+    result, dest = _render_and_test(tmp_path, nginx_accepts=False, previous="# previous\n")
+    assert result.returncode != 0
+    assert dest.read_text() == "# previous\n"
+    assert not (tmp_path / "qiita.conf.previous").exists()
+
+
+def test_a_rejected_first_render_leaves_no_config(tmp_path: Path) -> None:
+    result, dest = _render_and_test(tmp_path, nginx_accepts=False, previous=None)
+    assert result.returncode != 0
+    assert not dest.exists()
+
+
+def test_an_accepted_render_replaces_the_config(tmp_path: Path) -> None:
+    result, dest = _render_and_test(tmp_path, nginx_accepts=True, previous="# previous\n")
+    assert result.returncode == 0, result.stderr
+    assert "upstream qiita_data_plane" in dest.read_text()
+    assert not (tmp_path / "qiita.conf.previous").exists()
+
+
+def test_a_render_failure_leaves_the_config_untouched(tmp_path: Path) -> None:
+    template = _template_with_unfilled_placeholder(tmp_path)
+    result, dest = _render_and_test(
+        tmp_path, nginx_accepts=True, previous="# previous\n", template=template
+    )
+    assert result.returncode != 0
+    assert dest.read_text() == "# previous\n"
+    assert not (tmp_path / "qiita.conf.previous").exists()
+
+
+@pytest.mark.parametrize("failure", ["missing template", "mktemp fails"])
+def test_a_failed_render_step_fails_the_tested_render(tmp_path: Path, failure: str) -> None:
+    """A failed step inside the render fails the wrapper, with `nginx -t` accepting,
+    and leaves the deployed file as it was. Why each step checks its own status: the
+    comment above qiita_render_nginx_conf."""
+    result, dest = _render_and_test(
+        tmp_path,
+        nginx_accepts=True,
+        previous="# previous\n",
+        template=tmp_path / "missing.conf" if failure == "missing template" else None,
+        failing=("mktemp",) if failure == "mktemp fails" else (),
+    )
+    assert result.returncode != 0
+    assert dest.read_text() == "# previous\n"
+    assert not (tmp_path / "qiita.conf.previous").exists()
+    assert not (tmp_path / "qiita.conf.tmp").exists()
+
+
+def test_a_member_list_write_error_fails_the_render(tmp_path: Path) -> None:
+    """With no peers, the default, a failed write of the member list fails the render
+    instead of rendering an empty upstream. `printf` is shadowed by a function that
+    fails, standing in for a write error such as ENOSPC on $TMPDIR."""
+    dest = tmp_path / "qiita.conf"
+    dest.write_text("# previous\n")
+    result = _run_common(
+        'printf() { return 1; }; qiita_render_nginx_conf "$1" "$2" example.org 127.0.0.1 50051 ""',
+        str(_DEPLOY / "nginx" / "qiita.conf"),
+        str(dest),
+    )
+    assert result.returncode != 0
+    assert dest.read_text() == "# previous\n"
+    assert not (tmp_path / "qiita.conf.tmp").exists()
+
+
+def _flight_locations(conf: str) -> list[dict[str, str]]:
+    """The directives of each `location /arrow.flight.protocol.FlightService/` block."""
+    blocks = re.findall(
+        r"location /arrow\.flight\.protocol\.FlightService/ \{(.*?)\n    \}", conf, re.S
+    )
+    return [
+        dict(
+            line.strip().rstrip(";").split(None, 1)
+            for line in block.splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        )
+        for block in blocks
+    ]
+
+
+def test_data_plane_upstream_shares_its_balancing_state_across_workers() -> None:
+    """Without a shared `zone`, each nginx worker round-robins on its own from the
+    first member, and one-call clients all land on that member."""
+    conf = (_DEPLOY / "nginx" / "qiita.conf").read_text()
+    upstream = re.search(r"(?ms)^upstream qiita_data_plane \{\n(.*?)^\}", conf)
+    assert upstream, "no qiita_data_plane upstream block"
+    assert re.search(r"(?m)^\s*zone qiita_data_plane \d+k;$", upstream.group(1))
+
+
+def test_nginx_flight_locations_agree_on_body_cap_and_timeouts() -> None:
+    """The loopback listener copies the 443 edge's Flight location; a change to the
+    edge's body cap or timeouts has to reach the copy too. limit_conn is the one
+    directive only the public edge carries."""
+    locations = _flight_locations((_DEPLOY / "nginx" / "qiita.conf").read_text())
+    assert len(locations) == 2, "expected the 443 edge and the loopback listener"
+    edge, loopback = locations
+    for directive in (
+        "grpc_pass",
+        "client_max_body_size",
+        "grpc_read_timeout",
+        "grpc_send_timeout",
+    ):
+        assert edge[directive] == loopback[directive], directive
+    assert set(edge) - set(loopback) == {"limit_conn"}
+
+
+def test_activate_validates_data_plane_settings_before_installing_anything() -> None:
+    """A malformed topology, a public or unresolvable peer, or a QIITA_BUILD_SHA the
+    data planes would not boot on has to fail with the running deploy untouched:
+    before the first rsync, the binary install, the nginx render and any restart.
+    Asserted on source order, since the order is the property."""
+    src = (_DEPLOY / "activate.sh").read_text()
+    resolved = max(
+        _first_command(src, re.escape("DP_PORTS=$(qiita_data_plane_ports)")),
+        _first_command(src, re.escape("DP_PEERS=$(qiita_data_plane_peers)")),
+        _first_command(src, re.escape("DP_BIND_HOST=$(qiita_data_plane_bind_host)")),
+        _first_command(src, re.escape("DP_BUILD_COMMIT=$(qiita_data_plane_build_commit)")),
+        _first_command(src, re.escape('qiita_assert_peer_private "$peer"')),
+        _first_command(src, re.escape("DP_MEMORY_MAX=$(qiita_data_plane_instance_memory_max)")),
+        _first_command(
+            src, re.escape('qiita_assert_instance_memory_fits "$DP_PORTS" "$DP_MEMORY_MAX"')
+        ),
+        _first_command(src, re.escape('qiita_assert_pool_memory_fits "$DP_MEMORY_MAX"')),
+        _first_command(src, re.escape("qiita_dp_env_omits_local_instances")),
+    )
+    for step in (
+        r"rsync -a",
+        r"install -m 0755",
+        r"qiita_render_(?:and_test_)?nginx_conf ",
+        r"qiita_write_data_plane_dropins ",
+        r"systemctl restart",
+    ):
+        assert resolved < _first_command(src, step), (
+            f"data-plane settings must be checked before {step!r}"
+        )
+
+
+# --- Per-instance limits ------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("4096", "4096"),
+        ("1K", "1024"),
+        ("3M", str(3 * 1024**2)),
+        ("16G", str(16 * 1024**3)),
+        ("2T", str(2 * 1024**4)),
+    ],
+)
+def test_size_bytes_reads_systemd_suffixes_as_powers_of_1024(value: str, expected: str) -> None:
+    result = _run_common('qiita_size_bytes "$1"', value)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == expected
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["", "0", "0G", "016G", "1.5G", "16g", "16GB", "16 G", "-1G", "infinity", "50%", "4194305T"],
+)
+def test_size_bytes_rejects_anything_but_a_positive_integer_and_suffix(value: str) -> None:
+    result = _run_common('qiita_size_bytes "$1"', value)
+    assert result.returncode != 0
+    assert result.stdout == ""
+
+
+def test_instance_memory_max_defaults_to_none() -> None:
+    result = _run_common("qiita_data_plane_instance_memory_max")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == ""
+
+
+def test_instance_memory_max_reads_the_host_file_only(tmp_path: Path) -> None:
+    """Like the topology keys, only the file counts: the units read the file, so a
+    value the deploy saw but the file lacks would check one limit and apply another."""
+    env_file = _dp_env(tmp_path, "QIITA_DATA_PLANE_INSTANCE_MEMORY_MAX=48G\n")
+    result = _run_common(
+        "qiita_data_plane_instance_memory_max",
+        dp_env=env_file,
+        extra_env={"QIITA_DATA_PLANE_INSTANCE_MEMORY_MAX": "1T"},
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "48G"
+
+    absent = _dp_env(tmp_path, "PATH_SCRATCH=/scratch\n")
+    result = _run_common(
+        "qiita_data_plane_instance_memory_max",
+        dp_env=absent,
+        extra_env={"QIITA_DATA_PLANE_INSTANCE_MEMORY_MAX": "1T"},
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == ""
+
+
+@pytest.mark.parametrize("value", ["", "48GB", "lots", "0"])
+def test_instance_memory_max_rejects_a_blank_or_malformed_value(tmp_path: Path, value: str) -> None:
+    env_file = _dp_env(tmp_path, f'QIITA_DATA_PLANE_INSTANCE_MEMORY_MAX="{value}"\n')
+    result = _run_common("qiita_data_plane_instance_memory_max", dp_env=env_file)
+    assert result.returncode != 0, result.stdout
+    assert result.stdout == ""
+    assert "QIITA_DATA_PLANE_INSTANCE_MEMORY_MAX" in result.stderr
+
+
+def test_host_file_may_not_set_the_local_instance_count(tmp_path: Path) -> None:
+    """The drop-in sets it with Environment=, which the shared file's
+    EnvironmentFile= would override."""
+    env_file = _dp_env(tmp_path, "QIITA_DATA_PLANE_LOCAL_INSTANCES=1\n")
+    result = _run_common("qiita_dp_env_omits_local_instances", dp_env=env_file)
+    assert result.returncode != 0
+    assert "QIITA_DATA_PLANE_LOCAL_INSTANCES" in result.stderr
+
+    clean = _dp_env(tmp_path, "PATH_SCRATCH=/scratch\n")
+    assert _run_common("qiita_dp_env_omits_local_instances", dp_env=clean).returncode == 0
+    assert _run_common("qiita_dp_env_omits_local_instances").returncode == 0
+
+
+def _meminfo(tmp_path: Path, mem_total_kib: int) -> Path:
+    path = tmp_path / "meminfo"
+    path.write_text(
+        f"MemTotal:       {mem_total_kib} kB\n"
+        "MemFree:         1000 kB\n"
+        f"MemAvailable:   {mem_total_kib // 2} kB\n"
+    )
+    return path
+
+
+@pytest.mark.parametrize(
+    ("ports", "value", "fits"),
+    [
+        ("50051 50052", "32G", True),  # exactly MemTotal
+        ("50051 50052", "33G", False),
+        ("50051 50052 50053", "22G", False),
+        ("50051", "64G", True),
+        ("50051", "65G", False),
+        ("50051", "4194303T", False),  # past MemTotal without overflowing
+    ],
+)
+def test_instance_memory_fits_compares_count_times_value_with_mem_total(
+    tmp_path: Path, ports: str, value: str, fits: bool
+) -> None:
+    meminfo = _meminfo(tmp_path, 64 * 1024 * 1024)  # 64 GiB
+    result = _run_common(
+        'qiita_assert_instance_memory_fits "$1" "$2" "$3"', ports, value, str(meminfo)
+    )
+    assert (result.returncode == 0) is fits, result.stderr
+    if not fits:
+        assert "MemTotal" in result.stderr
+
+
+def test_instance_memory_fits_has_nothing_to_check_when_unset(tmp_path: Path) -> None:
+    result = _run_common(
+        'qiita_assert_instance_memory_fits "$1" "" "$2"', "50051", str(tmp_path / "absent")
+    )
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize("body", [None, "MemFree: 1000 kB\n"])
+def test_instance_memory_fits_fails_without_mem_total(tmp_path: Path, body: str | None) -> None:
+    meminfo = tmp_path / "meminfo"
+    if body is not None:
+        meminfo.write_text(body)
+    result = _run_common(
+        'qiita_assert_instance_memory_fits "$1" "$2" "$3"', "50051", "1G", str(meminfo)
+    )
+    assert result.returncode != 0
+    assert "MemTotal" in result.stderr
+
+
+_CONFIG_RS = _REPO_ROOT / "qiita-data-plane" / "src" / "config.rs"
+
+
+def test_default_pool_size_matches_the_data_plane() -> None:
+    """The deploy's pool size when DUCKLAKE_POOL_SIZE is unset is the data plane's."""
+    match = re.search(
+        r"^pub\(crate\) const DEFAULT_POOL_SIZE: usize = (\d+);$",
+        _CONFIG_RS.read_text(),
+        re.MULTILINE,
+    )
+    assert match, f"DEFAULT_POOL_SIZE not found in {_CONFIG_RS}"
+    result = _run_common('printf %s "$QIITA_DATA_PLANE_DEFAULT_POOL_SIZE"')
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == match.group(1)
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        (None, "8"),
+        ("PATH_SCRATCH=/scratch\n", "8"),
+        ("DUCKLAKE_POOL_SIZE=\n", "8"),
+        ('DUCKLAKE_POOL_SIZE="  "\n', "8"),
+        ("DUCKLAKE_POOL_SIZE=3\n", "3"),
+        ('DUCKLAKE_POOL_SIZE=" 12 "\n', "12"),
+    ],
+)
+def test_pool_size_reads_the_host_file_else_the_default(
+    tmp_path: Path, body: str | None, expected: str
+) -> None:
+    env_file = _dp_env(tmp_path, body) if body is not None else None
+    result = _run_common(
+        "qiita_data_plane_pool_size",
+        dp_env=env_file,
+        extra_env={"DUCKLAKE_POOL_SIZE": "99"},
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == expected
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "eight", "1.5", "4 4"])
+def test_pool_size_rejects_anything_but_a_positive_integer(tmp_path: Path, value: str) -> None:
+    env_file = _dp_env(tmp_path, f'DUCKLAKE_POOL_SIZE="{value}"\n')
+    result = _run_common("qiita_data_plane_pool_size", dp_env=env_file)
+    assert result.returncode != 0, result.stdout
+    assert result.stdout == ""
+    assert "DUCKLAKE_POOL_SIZE" in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("3MiB", str(3 * 1024**2)),
+        ("4GiB", str(4 * 1024**3)),
+    ],
+)
+def test_duckdb_size_bytes_reads_mib_and_gib(value: str, expected: str) -> None:
+    result = _run_common('qiita_duckdb_size_bytes "$1"', value)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == expected
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "",
+        "4096",
+        "1GB",
+        "1gib",
+        "4 GiB",
+        "04GiB",
+        "0GiB",
+        "4294967297GiB",  # past 2^62 bytes
+    ],
+)
+def test_duckdb_size_bytes_rejects_other_spellings(value: str) -> None:
+    result = _run_common('qiita_duckdb_size_bytes "$1"', value)
+    assert result.returncode != 0
+    assert result.stdout == ""
+
+
+def _pool_memory_fits(env_file: Path | None, value: str) -> subprocess.CompletedProcess[str]:
+    return _run_common('qiita_assert_pool_memory_fits "$1"', value, dp_env=env_file)
+
+
+@pytest.mark.parametrize(
+    ("body", "fits"),
+    [
+        ("DUCKDB_MEMORY_LIMIT=1GiB\n", True),  # 8 × 1GiB is exactly 8G
+        ("DUCKDB_MEMORY_LIMIT=1025MiB\n", False),
+        ("DUCKDB_MEMORY_LIMIT=1024MiB\n", True),
+        ("DUCKDB_MEMORY_LIMIT=2GiB\nDUCKLAKE_POOL_SIZE=4\n", True),
+        ("DUCKDB_MEMORY_LIMIT=2GiB\nDUCKLAKE_POOL_SIZE=5\n", False),
+        ("DUCKDB_MEMORY_LIMIT=4294967296GiB\n", False),  # 2^62 bytes: past the limit, no overflow
+    ],
+)
+def test_pool_memory_fits_compares_pool_times_limit_with_memory_max(
+    tmp_path: Path, body: str, fits: bool
+) -> None:
+    result = _pool_memory_fits(_dp_env(tmp_path, body), "8G")
+    assert (result.returncode == 0) is fits, result.stderr
+    if not fits:
+        assert "Unset DUCKDB_MEMORY_LIMIT" in result.stderr
+        assert "QIITA_DATA_PLANE_INSTANCE_MEMORY_MAX=8G" in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("body", "value"),
+    [
+        ("DUCKDB_MEMORY_LIMIT=64GiB\n", ""),  # no MemoryMax
+        ("PATH_SCRATCH=/scratch\n", "8G"),  # no DUCKDB_MEMORY_LIMIT
+        ("DUCKDB_MEMORY_LIMIT=\n", "8G"),
+        ('DUCKDB_MEMORY_LIMIT="  "\n', "8G"),
+    ],
+)
+def test_pool_memory_fits_has_nothing_to_check_unless_both_are_set(
+    tmp_path: Path, body: str, value: str
+) -> None:
+    result = _pool_memory_fits(_dp_env(tmp_path, body), value)
+    assert result.returncode == 0, result.stderr
+
+
+def test_pool_memory_fits_reads_the_limit_from_the_host_file_only(tmp_path: Path) -> None:
+    """The units read the file, so a limit in the deploy's environment is not the one
+    the data plane gets."""
+    result = _run_common(
+        'qiita_assert_pool_memory_fits "$1"',
+        "8G",
+        dp_env=_dp_env(tmp_path, "PATH_SCRATCH=/scratch\n"),
+        extra_env={"DUCKDB_MEMORY_LIMIT": "64GiB"},
+    )
+    assert result.returncode == 0, result.stderr
+    no_file = _run_common(
+        'qiita_assert_pool_memory_fits "$1"', "8G", extra_env={"DUCKDB_MEMORY_LIMIT": "64GiB"}
+    )
+    assert no_file.returncode == 0, no_file.stderr
+
+
+@pytest.mark.parametrize("limit", ["4G", "1GB", "4096"])
+def test_pool_memory_fits_refuses_a_limit_it_cannot_compare(tmp_path: Path, limit: str) -> None:
+    result = _pool_memory_fits(_dp_env(tmp_path, f'DUCKDB_MEMORY_LIMIT="{limit}"\n'), "1T")
+    assert result.returncode != 0
+    assert f"DUCKDB_MEMORY_LIMIT '{limit}'" in result.stderr
+    assert "write DUCKDB_MEMORY_LIMIT in MiB or GiB, or unset it" in result.stderr
+
+
+def test_pool_memory_fits_refuses_an_invalid_pool_size(tmp_path: Path) -> None:
+    body = "DUCKDB_MEMORY_LIMIT=1GiB\nDUCKLAKE_POOL_SIZE=0\n"
+    result = _pool_memory_fits(_dp_env(tmp_path, body), "8G")
+    assert result.returncode != 0
+    assert "DUCKLAKE_POOL_SIZE" in result.stderr
+
+
+def _preflight_row(tmp_path: Path, body: str, row_name: str) -> str:
+    """The `row_name` row of a preflight run whose only env file is data-plane.env,
+    holding `body`."""
+    env = {k: v for k, v in os.environ.items() if k not in _TOPOLOGY_VARS}
+    env.update(
+        CP_ENV=str(tmp_path / "absent-cp.env"),
+        CO_ENV=str(tmp_path / "absent-co.env"),
+        DP_ENV=str(_dp_env(tmp_path, body)),
+    )
+    env.pop("SKIP_PREFLIGHT", None)
+    result = subprocess.run(
+        ["bash", str(_DEPLOY / "preflight.sh")], capture_output=True, text=True, env=env
+    )
+    rows = [line for line in result.stdout.splitlines() if f" {row_name}: " in line]
+    assert len(rows) == 1, result.stdout + result.stderr
+    return rows[0]
+
+
+def test_preflight_fails_the_memory_row_when_the_pool_exceeds_memory_max(tmp_path: Path) -> None:
+    body = "QIITA_DATA_PLANE_INSTANCE_MEMORY_MAX=1G\nDUCKDB_MEMORY_LIMIT=129MiB\n"
+    row = _preflight_row(tmp_path, body, "dp-memory-max")
+    assert row.lstrip().startswith("\u2717"), row
+    assert "Unset DUCKDB_MEMORY_LIMIT" in row
+
+
+def test_preflight_memory_row_accepts_a_pool_within_memory_max(tmp_path: Path) -> None:
+    """8 × 128MiB is exactly 1G. The row then reaches the MemTotal check, which reads
+    /proc/meminfo, so it passes only where the host has one."""
+    body = "QIITA_DATA_PLANE_INSTANCE_MEMORY_MAX=1G\nDUCKDB_MEMORY_LIMIT=128MiB\n"
+    row = _preflight_row(tmp_path, body, "dp-memory-max")
+    assert "DUCKDB_MEMORY_LIMIT" not in row
+    if Path("/proc/meminfo").is_file():
+        assert row.lstrip().startswith("\u2713"), row
+
+
+def _write_dropins(unitdir: Path, ports: str, value: str) -> subprocess.CompletedProcess[str]:
+    return _run_common('qiita_write_data_plane_dropins "$1" "$2" "$3"', ports, value, str(unitdir))
+
+
+def _dropin_name() -> str:
+    result = _run_common('printf %s "$QIITA_DATA_PLANE_DROPIN_NAME"')
+    assert result.returncode == 0 and result.stdout, result.stderr
+    return result.stdout
+
+
+def test_dropins_carry_the_instance_count_and_the_memory_max(tmp_path: Path) -> None:
+    result = _write_dropins(tmp_path, "50051 50052", "24G")
+    assert result.returncode == 0, result.stderr
+    for port in ("50051", "50052"):
+        conf = tmp_path / f"qiita-data-plane@{port}.service.d" / _dropin_name()
+        assert conf.read_text() == (
+            "[Service]\nEnvironment=QIITA_DATA_PLANE_LOCAL_INSTANCES=2\nMemoryMax=24G\n"
+        )
+
+
+def test_dropins_without_a_memory_max_set_only_the_count(tmp_path: Path) -> None:
+    """A host that sets nothing gets no MemoryMax= line, so its instances' limits
+    are what they were before the drop-in existed."""
+    result = _write_dropins(tmp_path, "50051", "")
+    assert result.returncode == 0, result.stderr
+    conf = tmp_path / "qiita-data-plane@50051.service.d" / _dropin_name()
+    assert conf.read_text() == "[Service]\nEnvironment=QIITA_DATA_PLANE_LOCAL_INSTANCES=1\n"
+
+
+def test_dropins_are_removed_from_instances_outside_the_list(tmp_path: Path) -> None:
+    """A port that left the list keeps neither the old count nor the old limit, and
+    another file in its drop-in directory is left alone."""
+    assert _write_dropins(tmp_path, "50051 50052 50053", "8G").returncode == 0
+    other = tmp_path / "qiita-data-plane@50053.service.d" / "operator.conf"
+    other.write_text("[Service]\n")
+
+    result = _write_dropins(tmp_path, "50051", "8G")
+
+    assert result.returncode == 0, result.stderr
+    assert (tmp_path / "qiita-data-plane@50051.service.d" / _dropin_name()).is_file()
+    assert not (tmp_path / "qiita-data-plane@50052.service.d").exists()
+    assert not (tmp_path / "qiita-data-plane@50053.service.d" / _dropin_name()).exists()
+    assert other.is_file()
+    assert (
+        "QIITA_DATA_PLANE_LOCAL_INSTANCES=1"
+        in (tmp_path / "qiita-data-plane@50051.service.d" / _dropin_name()).read_text()
+    )
+
+
+def test_activate_loads_the_dropins_before_restarting_the_instances() -> None:
+    """The data plane reads its limits only at boot, so the drop-ins have to be
+    written and loaded before the restart that applies them."""
+    src = (_DEPLOY / "activate.sh").read_text()
+    written = _first_command(
+        src, re.escape('qiita_write_data_plane_dropins "$DP_PORTS" "$DP_MEMORY_MAX"')
+    )
+    reload = src.index("systemctl daemon-reload", written)
+    restart = _first_command(src, re.escape('systemctl restart "${dp_units[@]}"'))
+    assert written < reload < restart
+
+
+def _call_peer_private(peer: str, stub_dir: str | None) -> subprocess.CompletedProcess[str]:
+    env = {**os.environ}
+    if stub_dir is not None:
+        env["PATH"] = f"{stub_dir}:{env['PATH']}"
+    return subprocess.run(
+        ["bash", "-c", f'source "{_COMMON}"; qiita_assert_peer_private "$1"', "_", peer],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+
+# `getent ahosts` output for each name the stub resolves, in the layout glibc 2.39
+# prints on Rocky 10: one STREAM/DGRAM/RAW row per address.
+_AHOSTS = {
+    "private.internal": ["10.1.2.3"],
+    "public.internal": ["169.228.46.5"],
+    "mixed.internal": ["172.25.212.5", "169.228.46.5"],
+}
+
+
+@pytest.fixture
+def getent_stub(tmp_path: Path) -> str:
+    """A stand-in for glibc's getent that answers `ahosts` for the names in _AHOSTS.
+
+    getent does not exist on macOS, so without a stub every hostname case would
+    take the tool-absent path and fail the same way.
+    """
+    d = tmp_path / "stub"
+    d.mkdir()
+    cases = "".join(
+        f"    {name}) printf '"
+        + "".join(f"{a}    STREAM {name}\\n{a}    DGRAM\\n{a}    RAW\\n" for a in addrs)
+        + "'; exit 0 ;;\n"
+        for name, addrs in _AHOSTS.items()
+    )
+    (d / "getent").write_text(
+        f'#!/bin/sh\n[ "$1" = ahosts ] || exit 2\ncase "$2" in\n{cases}esac\nexit 2\n'
+    )
+    (d / "getent").chmod(0o755)
+    return str(d)
+
+
+def test_peer_private_accepts_a_name_resolving_to_private_addresses(getent_stub: str) -> None:
+    result = _call_peer_private("private.internal:50051", getent_stub)
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize("peer", ["public.internal:50051", "mixed.internal:50051"])
+def test_peer_private_rejects_a_name_with_any_public_address(peer: str, getent_stub: str) -> None:
+    result = _call_peer_private(peer, getent_stub)
+    assert result.returncode != 0
+    assert "169.228.46.5, not a private address" in result.stderr
+
+
+def test_peer_private_rejects_an_unresolvable_host(getent_stub: str) -> None:
+    result = _call_peer_private("bad.internal:50051", getent_stub)
+    assert result.returncode != 0
+    assert "does not resolve" in result.stderr
+
+
+@pytest.mark.parametrize(
+    "peer", ["10.0.0.7:50051", "172.16.0.1:50051", "172.31.255.1:50051", "192.168.1.1:50051"]
+)
+def test_peer_private_accepts_private_ipv4_literals_without_lookup(
+    peer: str, getent_stub: str
+) -> None:
+    """The stub resolves none of these, so passing means no lookup ran."""
+    result = _call_peer_private(peer, getent_stub)
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize(
+    "peer",
+    [
+        "169.228.46.111:50051",
+        "8.8.8.8:50051",
+        "172.15.255.1:50051",  # just below 172.16.0.0/12
+        "172.32.0.1:50051",  # just above it
+        "192.169.0.1:50051",
+        "11.0.0.1:50051",
+        "127.0.0.1:50051",  # a peer is another host
+        "[2001:db8::1]:50051",
+        "[fd00::1]:50051",
+    ],
+)
+def test_peer_private_rejects_other_literals(peer: str, getent_stub: str) -> None:
+    result = _call_peer_private(peer, getent_stub)
+    assert result.returncode != 0, result.stdout
+    assert "private" in result.stderr
+
+
+def test_peer_private_fails_a_name_when_getent_is_unavailable(tmp_path: Path) -> None:
+    """No getent ⇒ the name's addresses cannot be checked, so the peer fails."""
+    empty = tmp_path / "empty-path"
+    empty.mkdir()
+    bash = shutil.which("bash")
+    assert bash, "bash not found"
+    result = subprocess.run(
+        # bash by ABSOLUTE path: the empty PATH is meant to hide getent from the
+        # script, not to hide the interpreter from subprocess.
+        [
+            bash,
+            "-c",
+            f'source "{_COMMON}"; qiita_assert_peer_private "$1"',
+            "_",
+            "private.internal:1",
+        ],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "PATH": str(empty)},
+    )
+    assert result.returncode != 0
+    assert "getent unavailable" in result.stderr
+
+
 def test_native_checkout_resolves_valid_layout(tmp_path: Path) -> None:
     py = _fake_native_checkout(tmp_path)
     result = _call_native_checkout(str(py))
@@ -170,6 +1457,55 @@ def test_native_checkout_fails_outside_git_clone(tmp_path: Path) -> None:
 # shipped ones. -----------------------------------------------------------------
 
 _REDEPLOY = _DEPLOY / "redeploy.sh"
+
+
+def test_grpc_connect_timeout_is_set_once_for_every_data_plane_location() -> None:
+    """At http level, so a new grpc_pass location cannot miss it, and nowhere else."""
+    conf = (_DEPLOY / "nginx" / "qiita.conf").read_text()
+    assert re.findall(r"^\s*grpc_connect_timeout\b.*$", conf, re.M) == ["grpc_connect_timeout 5s;"]
+
+
+def test_build_service_name_matches_the_data_plane() -> None:
+    """verify.sh asks each member for the health service qiita_data_plane_build_service
+    names; the data plane registers BUILD_SERVICE_PREFIX + BUILD_COMMIT, read from the
+    file activate.sh writes. Nothing else ties the two sides together, and a drift
+    fails every member's commit row."""
+    sha = "0123456789abcdef0123456789abcdef01234567"
+    result = _run_common('qiita_data_plane_build_service "$1"', sha)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == f"qiita-data-plane/build/{sha}"
+    main_rs = (_REPO_ROOT / "qiita-data-plane" / "src" / "main.rs").read_text()
+    assert 'const BUILD_SERVICE_PREFIX: &str = "qiita-data-plane/build/";' in main_rs
+    # The key the deploy writes, the data plane reads and verify reads back.
+    assert 'std::env::var("BUILD_COMMIT")' in main_rs
+    assert "printf 'BUILD_COMMIT=%s\\n'" in (_DEPLOY / "activate.sh").read_text()
+    assert 'BUILD_ENV" BUILD_COMMIT)' in (_DEPLOY / "verify.sh").read_text()
+    build_env = _run_common('printf %s "$QIITA_DATA_PLANE_BUILD_ENV"').stdout
+    assert build_env == "/opt/qiita/data-plane/build.env"
+    unit = (_DEPLOY / "systemd" / "qiita-data-plane@.service").read_text()
+    assert f"EnvironmentFile=-{build_env}" in unit
+
+
+@pytest.mark.parametrize("sha", ["", "0123456789abcdef0123456789abcdef01234567"])
+def test_build_commit_accepts_unset_or_a_full_commit(sha: str) -> None:
+    result = _run_common("qiita_data_plane_build_commit", extra_env={"QIITA_BUILD_SHA": sha})
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == sha
+
+
+@pytest.mark.parametrize(
+    "sha",
+    [
+        "0123456",
+        "0123456789ABCDEF0123456789ABCDEF01234567",
+        "0123456789abcdef0123456789abcdef012345678",
+        "0123456789abcdef0123456789abcdef0123456g",
+    ],
+)
+def test_build_commit_rejects_what_the_data_plane_would_not_boot_on(sha: str) -> None:
+    result = _run_common("qiita_data_plane_build_commit", extra_env={"QIITA_BUILD_SHA": sha})
+    assert result.returncode != 0
+    assert "QIITA_BUILD_SHA" in result.stderr
 
 
 def test_verify_dp_pool_row_greps_what_the_data_plane_actually_logs() -> None:
@@ -934,12 +2270,15 @@ def _required_duckdb_cli_version() -> str:
     return version
 
 
-def _write_duckdb_stub(path: Path, body: str = "exit 0\n") -> Path:
+def _write_duckdb_stub(path: Path, body: str = "exit 0\n", *, banner: str = "") -> Path:
     """A `duckdb` stand-in that reports the required version to `--version` (the
-    resolver checks it) and otherwise runs `body`."""
+    resolver checks it) and otherwise runs `body`. `banner` is printed to stderr
+    before the version, as the real CLI does in agent mode."""
     version = _required_duckdb_cli_version()
+    preamble = f"echo '{banner}' >&2; " if banner else ""
     path.write_text(
-        f'#!/bin/sh\nif [ "$1" = --version ]; then echo "v{version} (stub) 0"; exit 0; fi\n' + body
+        '#!/bin/sh\nif [ "$1" = --version ]; then '
+        f'{preamble}echo "v{version} (stub) 0"; exit 0; fi\n' + body
     )
     path.chmod(0o755)
     return path
@@ -1101,6 +2440,23 @@ def test_lake_script_refuses_a_duckdb_cli_of_another_version(
     assert not (tmp_path / "captured.sql").exists(), "SQL ran on the wrong CLI"
 
 
+def test_duckdb_cli_version_is_read_past_an_agent_mode_banner(tmp_path: Path) -> None:
+    """Run by an AI agent with stdout not a terminal, the CLI prints a banner to stderr
+    before its version. The right CLI must still be accepted, not refused on the banner."""
+    stub = _write_duckdb_stub(
+        tmp_path / "duckdb",
+        banner="duckdb agent mode on: AI_AGENT is set and stdout is not a terminal",
+    )
+    result = subprocess.run(
+        ["bash", "-c", f'source "{_COMMON}"; qiita_resolve_duckdb_bin && echo "$DUCKDB_BIN"'],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "QIITA_DUCKDB_BIN": str(stub)},
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == str(stub)
+
+
 def test_lake_gc_defaults_to_report_only(tmp_path) -> None:
     """No flag must never reclaim: the whole point of the default run is that an
     operator can look before anything is unlinked."""
@@ -1171,12 +2527,27 @@ def test_lake_gc_reclaim_requires_typed_confirmation(tmp_path) -> None:
     assert not (tmp_path / "captured.sql").exists(), "aborting must not reach the database"
 
 
-def test_lake_gc_refuses_unwritable_data_path(tmp_path) -> None:
-    """The gate is unconditional, so it fires in report mode too — which is what
-    this exercises. DuckLake needs to write the data path even for the dry-run
-    orphan scan (it fails read-only there), so a group-read operator cannot run
-    even the report. Failing here names the right run-as instead of surfacing as
-    a permission error from inside duckdb."""
+@pytest.mark.parametrize("flag", ["--reclaim", "--reclaim-orphans"])
+def test_lake_gc_refuses_to_reclaim_on_an_unwritable_data_path(tmp_path, flag) -> None:
+    """A reclaim unlinks files under the data path. Failing before the prompt names
+    the right run-as instead of surfacing as a permission error from inside duckdb."""
+    if os.geteuid() == 0:
+        pytest.skip("root ignores the write bit")
+    result = subprocess.run(
+        ["bash", str(_LAKE_GC), flag],
+        capture_output=True,
+        text=True,
+        env={**_lake_gc_env(tmp_path, writable=False), "ASSUME_YES": "1"},
+    )
+    assert result.returncode == 1
+    assert "not writable" in result.stderr
+    assert "sudo -u qiita-data" in result.stderr
+    assert not (tmp_path / "captured.sql").exists(), "the refusal must precede the database"
+
+
+def test_lake_gc_reports_on_an_unwritable_data_path(tmp_path) -> None:
+    """A report only reads the data path, so group read is enough (the script says
+    where that was measured)."""
     if os.geteuid() == 0:
         pytest.skip("root ignores the write bit")
     result = subprocess.run(
@@ -1185,9 +2556,8 @@ def test_lake_gc_refuses_unwritable_data_path(tmp_path) -> None:
         text=True,
         env=_lake_gc_env(tmp_path, writable=False),
     )
-    assert result.returncode == 1
-    assert "not writable" in result.stderr
-    assert "qiita-data" in result.stderr
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    assert "report only" in result.stdout
 
 
 def test_lake_gc_never_passes_cleanup_all() -> None:
@@ -1198,9 +2568,8 @@ def test_lake_gc_never_passes_cleanup_all() -> None:
 
 
 def test_lake_gc_uses_the_documented_call_form() -> None:
-    """DuckLake documents these table functions as `CALL f(...)`. `SELECT * FROM
-    f(...)` behaves identically (measured on 1.5.4 — same rows, same deletions),
-    but a reader checking this against the docs should find the documented form.
+    """DuckLake documents these table functions as `CALL f(...)`, and a reader
+    checking the script against the docs should find that form there.
     https://ducklake.select/docs/stable/duckdb/maintenance/expire_snapshots"""
     code = _lake_gc_code()
     assert "SELECT * FROM ducklake_" not in code
@@ -1209,12 +2578,11 @@ def test_lake_gc_uses_the_documented_call_form() -> None:
 
 
 def test_lake_gc_scopes_the_orphan_scan_to_its_own_transaction() -> None:
-    """Steps 1-2 share a transaction (cleanup only sees the expiry from inside
-    it). Step 3 must open a NEW one: measured on 1.5.4, an orphan scan inside a
-    transaction that opened earlier reports a file another session registered and
-    COMMITTED in the meantime, so acting on it would unlink a live file whose
-    catalog row survives. Asserting positions, not mere presence — a CALL that
-    drifts across a COMMIT is exactly the regression this guards."""
+    """Steps 1-2 share a transaction and step 3 opens a NEW one, or it can report,
+    and so unlink, a file another session registered since (the script's comment at
+    each BEGIN says why).
+    Asserting positions, not mere presence — a CALL that drifts across a COMMIT is
+    exactly the regression this guards."""
     code = _lake_gc_code()
     assert code.count("BEGIN TRANSACTION;") == 2, "expected the 1-2 / 3 split"
     assert code.count("COMMIT;") == 2
@@ -1265,16 +2633,26 @@ def test_workflow_script_is_valid_bash(path: Path) -> None:
 
 
 def _run_idle_wait(
-    tmp_path: Path, counts: list[int | str], *, wait_s: str = "60", env_file=True, pid: int = 4242
+    tmp_path: Path,
+    counts: list[int | str],
+    *,
+    wait_s: str = "60",
+    env_file=True,
+    pids: dict[str, int] | None = None,
 ):
     """Run `wait_for_data_plane_idle` with `systemctl` and `psql` stubbed: systemctl
-    names `pid` as the unit's main process, and psql answers the in-flight
-    catalog-session count from `counts`, one per call, then the last one again, and
-    fails on a `"fail"` entry.
+    names each unit's main process from `pids` (unit name -> pid; default one unit,
+    `qiita-data-plane@50051`), and psql answers the in-flight catalog-session count
+    from `counts`, one per call, then the last one again, and fails on a `"fail"`
+    entry.
     Returns the completed process and the argv of every psql call."""
+    pids = pids or {"qiita-data-plane@50051": 4242}
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
-    (bin_dir / "systemctl").write_text(f"#!/bin/sh\necho {pid}\n")
+    cases = "".join(f"    {unit}) echo {pid} ;;\n" for unit, pid in pids.items())
+    (bin_dir / "systemctl").write_text(
+        f'#!/bin/sh\neval "unit=\\${{$#}}"\ncase "$unit" in\n{cases}    *) echo 0 ;;\nesac\n'
+    )
     queue = tmp_path / "counts"
     queue.write_text("".join(f"{n}\n" for n in counts))
     calls = tmp_path / "psql-calls"
@@ -1299,7 +2677,7 @@ def _run_idle_wait(
             "bash",
             "-c",
             f'set -euo pipefail; source "{_COMMON}"; '
-            f'wait_for_data_plane_idle qiita-data-plane@50051 "{env_path}"',
+            f'wait_for_data_plane_idle "{env_path}" {" ".join(pids)}',
         ],
         env={
             **os.environ,
@@ -1337,6 +2715,15 @@ def test_idle_wait_keeps_the_catalog_password_off_psql_argv(tmp_path: Path) -> N
     assert "s3cr3t" not in argv
     assert "user=lake_rw" in argv
     assert pgpassfile, "psql ran without a PGPASSFILE"
+
+
+def test_idle_wait_counts_only_the_data_plane_roles_sessions(tmp_path: Path) -> None:
+    """With pg_read_all_stats the role sees the state of every role's sessions; the
+    count is limited to its own, so another role's open transaction on the catalog
+    does not hold the restart."""
+    _proc, calls = _run_idle_wait(tmp_path, [0])
+    argv, _pgpassfile = calls[0].split("|PGPASSFILE=")
+    assert "AND usename = current_user" in argv
 
 
 @pytest.mark.parametrize(("wait_s", "env_file"), [("0", True), ("60", False)])
@@ -1388,7 +2775,9 @@ def test_idle_wait_counts_an_open_partial_upload(tmp_path: Path, name: str, busy
             if any(os.readlink(fd) == str(held) for fd in fd_dir.iterdir()):
                 break
             time.sleep(0.05)
-        proc, _calls = _run_idle_wait(tmp_path, [0], wait_s="1", pid=holder.pid)
+        proc, _calls = _run_idle_wait(
+            tmp_path, [0], wait_s="1", pids={"qiita-data-plane@50051": holder.pid}
+        )
     finally:
         holder.communicate(b"")
     assert proc.returncode == 0, proc.stderr
@@ -1397,9 +2786,250 @@ def test_idle_wait_counts_an_open_partial_upload(tmp_path: Path, name: str, busy
     ) is busy
 
 
+@pytest.mark.skipif(not Path("/proc/self/fd").is_dir(), reason="needs /proc (Linux)")
+def test_idle_wait_counts_a_partial_upload_on_any_local_instance(tmp_path: Path) -> None:
+    """With several instances on the host, an upload in flight on the second one
+    keeps the wait going, as one on the first does."""
+    held = tmp_path / "upload.parquet.partial"
+    held.touch()
+    holder = subprocess.Popen(
+        ["python3", "-c", "import sys; f = open(sys.argv[1]); sys.stdin.read()", str(held)],
+        stdin=subprocess.PIPE,
+    )
+    try:
+        fd_dir = Path(f"/proc/{holder.pid}/fd")
+        for _ in range(100):
+            if any(os.readlink(fd) == str(held) for fd in fd_dir.iterdir()):
+                break
+            time.sleep(0.05)
+        proc, _calls = _run_idle_wait(
+            tmp_path,
+            [0],
+            wait_s="1",
+            pids={"qiita-data-plane@50051": os.getpid(), "qiita-data-plane@50052": holder.pid},
+        )
+    finally:
+        holder.communicate(b"")
+    assert proc.returncode == 0, proc.stderr
+    assert (
+        "qiita-data-plane@50051 qiita-data-plane@50052 still busy after 1s "
+        "(catalog sessions: 0, open partial files: 1)"
+    ) in proc.stderr
+
+
+def test_idle_wait_skips_units_with_no_main_process(tmp_path: Path) -> None:
+    """A listed instance that is not running is not waited on; with none running
+    the wait returns without querying the catalog."""
+    proc, calls = _run_idle_wait(
+        tmp_path, [1], pids={"qiita-data-plane@50051": 0, "qiita-data-plane@50052": 0}
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert calls == []
+
+
 def test_data_plane_unit_stop_timeout_covers_the_idle_wait() -> None:
     """The data plane drains on SIGTERM for up to the unit's TimeoutStopSec, and the
     deploy's idle wait defaults to the same bound."""
     unit = (_DEPLOY / "systemd" / "qiita-data-plane@.service").read_text()
     assert re.search(r"(?m)^TimeoutStopSec=3900$", unit)
     assert "QIITA_DP_IDLE_WAIT_S:-3900}" in _COMMON.read_text()
+
+
+# --- catalog connection budget ---------------------------------------------------
+
+_DUCKLAKE_RS = _REPO_ROOT / "qiita-data-plane" / "src" / "ducklake.rs"
+
+
+def _budget(settings: str, rows: str) -> tuple[list[str], list[str]]:
+    """Run qiita_catalog_connection_budget on a settings row and backend rows, as
+    psql prints them. Returns the pass/fail rows and the detail lines under them."""
+    result = _run_common(
+        'n_pass=0 n_fail=0; qiita_catalog_connection_budget "$1" <<<"$2"; '
+        'echo "counts $n_pass $n_fail"',
+        settings,
+        rows,
+    )
+    assert result.returncode == 0, result.stderr
+    lines = result.stdout.splitlines()
+    assert lines[-1] in ("counts 1 0", "counts 0 1"), result.stdout
+    rows_out = [line for line in lines[:-1] if " catalog-connections: " in line]
+    assert len(rows_out) == 1, result.stdout
+    details = [line.strip() for line in lines[:-1] if line not in rows_out]
+    return rows_out, details
+
+
+def _passed(row: str) -> bool:
+    return row.lstrip().startswith("✓")
+
+
+def test_budget_counts_each_instance_once_at_its_pool_size() -> None:
+    """Two backends of one instance, under two roles, are one instance; a Unix-socket
+    session is `local`; an IPv6 address is bracketed; other clients count as they are."""
+    rows = "\n".join(
+        [
+            "10.0.0.5|3|dp|qiita-data-plane:50051:pool=8",
+            "10.0.0.5|1|dp_other|qiita-data-plane:50051:pool=8",
+            "10.0.0.5|1|dp|qiita-data-plane:50052:pool=8",
+            "10.0.0.6|2|dp|qiita-data-plane:50051:pool=6",
+            "local|1|dp|qiita-data-plane:50051:pool=4",
+            "::1|1|dp|qiita-data-plane:50053:pool=2",
+            "10.0.0.9|3|admin|psql",
+            "10.0.0.9|2|dp|",
+        ]
+    )
+    (row,), details = _budget("100|3|0|t|dp", rows)
+    assert _passed(row), row
+    assert "5 data-plane instance(s), pools 28 + 5 other client backend(s) = 33 of 97" in row
+    assert details == [
+        "10.0.0.5:50051 pool=8",
+        "10.0.0.5:50052 pool=8",
+        "10.0.0.6:50051 pool=6",
+        "local:50051 pool=4",
+        "[::1]:50053 pool=2",
+        "other: 10.0.0.9 user=admin application_name=psql x3",
+        "other: 10.0.0.9 user=dp application_name=(none) x2",
+    ]
+
+
+@pytest.mark.parametrize(("other", "passes"), [(5, True), (6, False)])
+def test_budget_fails_past_max_connections_less_the_reserved(other: int, passes: bool) -> None:
+    """20 − 3 superuser-reserved − 2 reserved leaves 15: pools 10 plus 5 others fit,
+    plus 6 do not."""
+    rows = f"10.0.0.5|1|dp|qiita-data-plane:50051:pool=10\n10.0.0.9|{other}|admin|psql"
+    (row,), _ = _budget("20|3|2|t|dp", rows)
+    assert _passed(row) is passes, row
+    assert f"= {10 + other} of 15 (max_connections 20" in row
+
+
+def test_budget_fails_without_pg_read_all_stats() -> None:
+    (row,), details = _budget(
+        "100|3|0|f|lake_rw", "10.0.0.5|1|lake_rw|qiita-data-plane:50051:pool=8"
+    )
+    assert not _passed(row), row
+    assert "GRANT pg_read_all_stats TO lake_rw;" in row
+    assert details == []
+
+
+def test_budget_fails_on_a_data_plane_session_without_a_client_address() -> None:
+    (row,), _ = _budget("100|3|0|t|lake_rw", "|1|lake_rw|qiita-data-plane:50051:pool=8")
+    assert not _passed(row), row
+    assert "grant pg_read_all_stats to role 'lake_rw'" in row
+
+
+@pytest.mark.parametrize(
+    "name", ["qiita-data-plane:50051", "qiita-data-plane:x:pool=8", "qiita-data-plane:50051:pool="]
+)
+def test_budget_fails_on_a_name_it_cannot_read(name: str) -> None:
+    (row,), _ = _budget("100|3|0|t|dp", f"10.0.0.5|1|dp|{name}")
+    assert not _passed(row), row
+    assert f"application_name '{name}'" in row
+
+
+def test_budget_fails_when_no_instance_is_connected() -> None:
+    (row,), details = _budget("100|3|0|t|dp", "10.0.0.9|2|admin|psql")
+    assert not _passed(row), row
+    assert "no catalog session is named" in row
+    assert details == ["other: 10.0.0.9 user=admin application_name=psql x2"]
+
+
+@pytest.mark.parametrize("settings", ["", "100|3||t|dp", "lots|3|0|t|dp"])
+def test_budget_fails_on_a_settings_row_it_cannot_read(settings: str) -> None:
+    (row,), _ = _budget(settings, "10.0.0.5|1|dp|qiita-data-plane:50051:pool=8")
+    assert not _passed(row), row
+    assert "unexpected settings row" in row
+
+
+def test_budget_reads_the_name_the_data_plane_writes() -> None:
+    """catalog_application_name's format, filled in, is a name the budget counts."""
+    match = re.search(
+        r"fn catalog_application_name\(port: u16, pool_size: usize\) -> String \{\s*"
+        r'format!\("([^"]+)"\)',
+        _DUCKLAKE_RS.read_text(),
+    )
+    assert match, f"catalog_application_name not found in {_DUCKLAKE_RS}"
+    name = match.group(1).replace("{port}", "50057").replace("{pool_size}", "13")
+    (row,), details = _budget("100|3|0|t|dp", f"10.0.0.5|1|dp|{name}")
+    assert _passed(row), row
+    assert details == ["10.0.0.5:50057 pool=13"]
+
+
+def _run_budget_check(
+    tmp_path: Path, *, fail_on: str = ""
+) -> tuple[subprocess.CompletedProcess[str], list[str]]:
+    """Run qiita_check_catalog_connection_budget with `psql` stubbed: it answers the
+    settings query and the backends query with one row each, records its argv and
+    PGPASSFILE, and exits 2 when its argv contains `fail_on`."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    calls = tmp_path / "psql-calls"
+    (bin_dir / "psql").write_text(
+        "#!/bin/sh\n"
+        'argv=$(printf %s "$*" | tr "\\n" " ")\n'
+        f'printf "%s|PGPASSFILE=%s\\n" "$argv" "$PGPASSFILE" >> "{calls}"\n'
+        f'if [ -n "{fail_on}" ]; then case "$argv" in *"{fail_on}"*)\n'
+        '  echo "psql: boom" >&2; exit 2 ;; esac; fi\n'
+        'case "$argv" in\n'
+        "  *max_connections*) echo '100|3|0|t|lake_rw' ;;\n"
+        "  *) echo '10.0.0.5|2|lake_rw|qiita-data-plane:50051:pool=8' ;;\n"
+        "esac\n"
+    )
+    (bin_dir / "psql").chmod(0o755)
+    env_path = tmp_path / "data-plane.env"
+    env_path.write_text(
+        "DUCKLAKE_CATALOG_CONNSTR='dbname=lake host=db user=lake_rw password=s3cr3t'\n"
+    )
+    proc = subprocess.run(
+        [
+            "bash",
+            "-c",
+            f'set -euo pipefail; source "{_COMMON}"; n_pass=0 n_fail=0; '
+            f'qiita_check_catalog_connection_budget "{env_path}"; echo "counts $n_pass $n_fail"',
+        ],
+        env={**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"},
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    lines = calls.read_text().splitlines() if calls.exists() else []
+    return proc, lines
+
+
+def test_budget_check_queries_the_catalog_with_the_password_off_argv(tmp_path: Path) -> None:
+    proc, calls = _run_budget_check(tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    assert "counts 1 0" in proc.stdout, proc.stdout
+    assert "10.0.0.5:50051 pool=8" in proc.stdout
+    assert len(calls) == 2
+    for call in calls:
+        argv, pgpassfile = call.split("|PGPASSFILE=")
+        assert "s3cr3t" not in argv
+        assert "user=lake_rw" in argv
+        assert pgpassfile, "psql ran without a PGPASSFILE"
+
+
+@pytest.mark.parametrize("fail_on", ["max_connections", "pg_stat_activity"])
+def test_budget_check_fails_the_row_when_a_query_fails(tmp_path: Path, fail_on: str) -> None:
+    proc, _calls = _run_budget_check(tmp_path, fail_on=fail_on)
+    assert proc.returncode == 0, proc.stderr
+    assert "counts 0 1" in proc.stdout, proc.stdout
+    assert "cannot query the catalog server: psql: boom" in proc.stdout
+
+
+def test_verify_runs_the_budget_against_the_data_plane_env() -> None:
+    verify = (_DEPLOY / "verify.sh").read_text()
+    assert re.search(r'(?m)^    qiita_check_catalog_connection_budget "\$DP_ENV"$', verify)
+
+
+@pytest.mark.parametrize(
+    "connstr",
+    [
+        "dbname=lake host=db application_name=mine",
+        "dbname=lake host=db application_name = mine",
+    ],
+)
+def test_preflight_refuses_a_catalog_connstr_that_names_the_session(
+    tmp_path: Path, connstr: str
+) -> None:
+    row = _preflight_row(tmp_path, f"DUCKLAKE_CATALOG_CONNSTR='{connstr}'\n", "connstr/ducklake")
+    assert not _passed(row), row
+    assert "sets application_name" in row

@@ -37,6 +37,13 @@ on your `[admin]` account**:
 sudo make -C /home/qiita/qiita-miint redeploy QIITA_HOSTNAME=qiita-miint.ucsd.edu
 ```
 
+The data-plane instances, peers and bind address come from
+`/etc/qiita/data-plane.env`, so this command carries no scaling variables; see
+[`data-plane-scaling.md`](data-plane-scaling.md). The one exception is a deploy after
+removing a port: it stops before installing anything while that instance's unit is
+running or enabled, unless run with `QIITA_DP_DISABLE_REMOVED=1`
+([Fewer instances on this host](data-plane-scaling.md#fewer-instances-on-this-host)).
+
 `deploy/redeploy.sh` drives steps 2–8 in order: pull (as the operator) →
 print buckets 1 & 2 and pause for you to apply them (only when they hold real
 steps — see below) → `preflight` → migration gate → `local-deploy.sh` → native
@@ -210,10 +217,13 @@ which: stages into `/opt/qiita/`, `uv sync`s the Python venvs
 (`--reinstall-package qiita-common` to defeat cross-package staleness),
 **asserts every shipped migration is applied and aborts if not**, runs
 `qiita-admin actions sync` (picks up new/changed workflow YAML),
-installs systemd units + dropins, waits for the data plane to have no
+renders `/etc/nginx/conf.d/qiita.conf` from the data-plane topology in
+`/etc/qiita/data-plane.env` and runs `nginx -t` on it, installs systemd
+units + dropins, waits for every local data-plane instance to have no
 request in flight (up to `QIITA_DP_IDLE_WAIT_S`, default 3900 s, printing
-`waiting for qiita-data-plane@50051 to go idle …` once a minute), and
-restarts the services whose env files are present. The data plane's own
+`waiting for qiita-data-plane@50051 to go idle …` once a minute), restarts
+the services whose env files are present (all data-plane instances in one
+`systemctl restart`, each enabled so it starts at boot), and reloads nginx. The data plane's own
 restart lets requests still running finish, for up to its unit's
 `TimeoutStopSec`. See [`docs/deployments.md`](../deployments.md).
 

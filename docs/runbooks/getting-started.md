@@ -165,8 +165,8 @@ field named by `--owner-biosample-id-field-name` (the field is created the first
 time you use it, so there is nothing to set up). This is the name to match your
 sheet, since the accession is what the machines match on and rarely what you say
 out loud. It does not travel with the biosample: someone reading the biosample on
-its own sees only the shared metadata, but anyone with access to *this study* sees
-it, so keep any personally identifying information out of it.
+its own sees only the shared metadata, but anyone with `member` access or above on
+*this study* sees it, so keep any personally identifying information out of it.
 
 You can add more `--metadata KEY=VALUE` pairs, but only for fields that already
 exist: a standard Qiita field, or one you created for this study. A key that

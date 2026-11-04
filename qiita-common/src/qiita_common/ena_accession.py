@@ -85,6 +85,22 @@ def validate_study_accession(accession: str) -> str:
     return accession.strip()
 
 
+# A run accession's form, as an error message states it.
+RUN_ACCESSION_FORM = f"{'/'.join(_ACCESSION_PREFIXES[EnaAccessionKind.RUN])} followed by digits"
+
+
+def validate_run_accession(accession: str) -> str:
+    """Validate `accession` is a well-formed INSDC RUN accession and return it
+    stripped. Raises `InvalidEnaAccessionError` on anything else, including a
+    well-formed accession of another kind."""
+    candidate = accession.strip()
+    if not _ACCESSION_PATTERNS[EnaAccessionKind.RUN].fullmatch(candidate):
+        raise InvalidEnaAccessionError(
+            f"'{accession}' is not a run accession (expected {RUN_ACCESSION_FORM})"
+        )
+    return candidate
+
+
 def validate_import_accession(accession: str) -> tuple[EnaAccessionKind, str]:
     """Validate `accession` is an importable INSDC study or run accession; return its kind
     and stripped value. Raises `InvalidEnaAccessionError` for any other kind."""

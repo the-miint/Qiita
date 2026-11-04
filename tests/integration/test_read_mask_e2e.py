@@ -1,27 +1,17 @@
 """Cross-component integration tests for the read-mask workflow's final two
-`action:` entries (`persist-read-metrics` → `register-files`) and the
-`delete_mask` purge primitive, against a real control plane, a real
-data-plane Flight/DuckLake process, and the integration Postgres.
+`action:` entries (`persist-read-metrics` → `register-files`), against a real
+control plane, a real data-plane Flight/DuckLake process, and the integration
+Postgres.
 
-Two regressions this branch fixed are otherwise unproven end-to-end:
-
-1. ORDERING. `read-mask/1.0.0` and `fastq-to-parquet/1.3.0` previously ran
-   `register-files` BEFORE `persist-read-metrics`. `register-files` MOVES
-   `read_mask.parquet` out of the staging workspace into permanent DuckLake
-   storage (the data plane's `move_file`/`std::fs::rename`), so the later
-   `persist-read-metrics` re-opened a now-gone staging path and raised
-   `FileNotFoundError`. The fix reorders to
-   `host_filter → persist-read-metrics → register-files`. This file proves the
-   shipped order works (metrics land AND the mask registers) and proves the
-   OLD order fails (so the ordering assertion has teeth).
-
-2. PURGE → RESUBMIT NO-DUPLICATE-ROWS. `read_mask` is append-only with no
-   unique key, and a resubmit re-resolves to the SAME `mask_idx` (config-hash
-   upsert), so a no-cleanup resubmit appends a duplicate copy. The recovery
-   path purges the mask (`delete_mask` DoAction) before resubmitting. This
-   file proves purge-then-register leaves exactly one logical copy, and that
-   register-twice-without-purge WOULD duplicate (so the no-dup assertion has
-   teeth).
+ORDERING. `read-mask/1.0.0` and `fastq-to-parquet/1.3.0` previously ran
+`register-files` BEFORE `persist-read-metrics`. `register-files` MOVES
+`read_mask.parquet` out of the staging workspace into permanent DuckLake
+storage (the data plane's `move_file`/`std::fs::rename`), so the later
+`persist-read-metrics` re-opened a now-gone staging path and raised
+`FileNotFoundError`. The fix reorders to
+`host_filter → persist-read-metrics → register-files`. This file proves the
+shipped order works (metrics land AND the mask registers) and proves the
+OLD order fails (so the ordering assertion has teeth).
 
 host_filter itself is NOT run here: it depends on miint/rype/minimap2 and real
 stored reads (system-tier). Instead we pre-stage a `read_mask.parquet`
@@ -31,8 +21,8 @@ left_trim2, right_trim2`; see
 qiita_compute_orchestrator.jobs.host_filter.execute's final COPY) and drive the
 REAL runner adapter `_run_action_primitive` for the two final action entries —
 parsed in their shipped order from the real workflow YAML — exercising the real
-LIBRARY primitives, the real data-plane `register_files`/`delete_mask`
-DoActions, and the real DuckLake catalog.
+LIBRARY primitives, the real data-plane `register_files` DoAction, and the real
+DuckLake catalog.
 
 Shared fixtures (`data_plane`, `signing_key`, `postgres_pool`,
 `human_admin_session`, `ducklake_connect`) live in conftest.py.
@@ -162,12 +152,8 @@ async def sequenced_prep_sample(postgres_pool, human_admin_session):
         biosample_idxs=[biosample_idx],
         prep_sample_idxs=[prep_sample_idx],
     )
-    await postgres_pool.execute(
-        "DELETE FROM qiita.sequenced_pool WHERE idx = $1", pool_idx
-    )
-    await postgres_pool.execute(
-        "DELETE FROM qiita.sequencing_run WHERE idx = $1", run_idx
-    )
+    await postgres_pool.execute("DELETE FROM qiita.sequenced_pool WHERE idx = $1", pool_idx)
+    await postgres_pool.execute("DELETE FROM qiita.sequencing_run WHERE idx = $1", run_idx)
 
 
 def _data_plane_url(data_plane) -> str:
@@ -193,17 +179,20 @@ async def _run_persist_read_metrics(
 ):
     """Drive the REAL runner adapter for the `persist-read-metrics` YAML entry."""
     from qiita_control_plane.runner import _run_action_primitive
+    from qiita_control_plane.testing.run_context import run_context
 
     entry = _entry_by_name("persist-read-metrics")
     await _run_action_primitive(
-        postgres_pool,
+        run_context(
+            pool=postgres_pool,
+            scope_target={"prep_sample_idx": prep_sample_idx},
+            work_ticket_idx=0,
+            signing_key=data_plane["secret"],
+            data_plane_url=_data_plane_url(data_plane),
+        ),
         entry,
         {"read_mask": str(read_mask_path)},
-        Path(read_mask_path).parent,  # workspace (unused by this primitive)
-        {"prep_sample_idx": prep_sample_idx},
-        work_ticket_idx=0,
-        signing_key=data_plane["secret"],
-        data_plane_url=_data_plane_url(data_plane),
+        Path(read_mask_path).parent,
     )
 
 
@@ -213,17 +202,20 @@ async def _run_register_files(
     """Drive the REAL runner adapter for the `register-files` YAML entry — moves
     read_mask.parquet out of staging into DuckLake via the data plane DoAction."""
     from qiita_control_plane.runner import _run_action_primitive
+    from qiita_control_plane.testing.run_context import run_context
 
     entry = _entry_by_name("register-files")
     await _run_action_primitive(
-        postgres_pool,
+        run_context(
+            pool=postgres_pool,
+            scope_target={},
+            work_ticket_idx=work_ticket_idx,
+            signing_key=data_plane["secret"],
+            data_plane_url=_data_plane_url(data_plane),
+        ),
         entry,
         {"read_mask_staging_dir": str(staging_dir)},
         staging_dir,
-        {},
-        work_ticket_idx=work_ticket_idx,
-        signing_key=data_plane["secret"],
-        data_plane_url=_data_plane_url(data_plane),
     )
 
 
@@ -334,113 +326,3 @@ async def test_old_order_register_then_persist_fails_filenotfound(
         prep_sample_idx,
     )
     assert row["raw_read_count_r1r2"] is None
-
-
-# ---------------------------------------------------------------------------
-# Test 2: purge → resubmit leaves no duplicate read_mask rows.
-# ---------------------------------------------------------------------------
-
-
-async def _register_fresh_mask(
-    postgres_pool, data_plane, tmp_path, *, mask_idx, prep_sample_idx, work_ticket_idx
-):
-    """Stage a fresh read_mask.parquet for `mask_idx` and run register-files,
-    moving it into DuckLake. A new staging dir per call (register-files MOVES the
-    file, so each registration needs its own copy — exactly as a resubmit would
-    re-emit a fresh read_mask from host_filter)."""
-    staging_dir = tmp_path / f"stage-wt{work_ticket_idx}" / "host_filter" / "attempt-0"
-    _write_read_mask_parquet(
-        staging_dir,
-        mask_idx=mask_idx,
-        prep_sample_idx=prep_sample_idx,
-        rows=_SAMPLE_MASK_ROWS,
-    )
-    await _run_register_files(
-        postgres_pool,
-        data_plane,
-        staging_dir=staging_dir,
-        work_ticket_idx=work_ticket_idx,
-    )
-
-
-async def test_purge_before_resubmit_leaves_no_duplicate_rows(
-    postgres_pool, data_plane, tmp_path
-):
-    """The recovery contract: register a mask, purge it via the real delete_mask
-    DoAction, then re-register (the resubmit) — exactly ONE logical copy of the
-    mask's rows remains.
-
-    Also proves the no-dup assertion has teeth: re-registering WITHOUT purging
-    first DOES duplicate (the append-only read_mask hazard the purge prevents).
-    """
-    from qiita_control_plane.actions.library import delete_mask_data
-
-    mask_idx = 77001
-    prep_sample_idx = 999001  # lake-only mask rows; no Postgres FK on read_mask
-    n_rows = len(_SAMPLE_MASK_ROWS)
-
-    # --- Teeth: register twice WITHOUT a purge → rows duplicate. ---
-    await _register_fresh_mask(
-        postgres_pool,
-        data_plane,
-        tmp_path,
-        mask_idx=mask_idx,
-        prep_sample_idx=prep_sample_idx,
-        work_ticket_idx=77001,
-    )
-    assert _count_read_mask_rows(data_plane, mask_idx) == n_rows
-
-    await _register_fresh_mask(
-        postgres_pool,
-        data_plane,
-        tmp_path,
-        mask_idx=mask_idx,
-        prep_sample_idx=prep_sample_idx,
-        work_ticket_idx=77002,  # distinct ticket → distinct lake filename
-    )
-    # No purge between the two registrations: read_mask is append-only with no
-    # unique key, so the second copy duplicates every row.
-    assert _count_read_mask_rows(data_plane, mask_idx) == 2 * n_rows
-
-    # --- Recovery: purge via delete_mask, then re-register → one logical copy. ---
-    deleted = await delete_mask_data(
-        mask_idx=mask_idx,
-        signing_key=data_plane["secret"],
-        data_plane_url=_data_plane_url(data_plane),
-    )
-    # Purge removed every row currently registered for the mask (both copies).
-    assert deleted == 2 * n_rows
-    assert _count_read_mask_rows(data_plane, mask_idx) == 0
-
-    # The resubmit's register-files re-registers exactly the mask's rows — once.
-    await _register_fresh_mask(
-        postgres_pool,
-        data_plane,
-        tmp_path,
-        mask_idx=mask_idx,
-        prep_sample_idx=prep_sample_idx,
-        work_ticket_idx=77003,
-    )
-    assert _count_read_mask_rows(data_plane, mask_idx) == n_rows
-
-    # Final cleanup so the mask leaves no rows behind for other modules sharing
-    # the data plane's catalog.
-    await delete_mask_data(
-        mask_idx=mask_idx,
-        signing_key=data_plane["secret"],
-        data_plane_url=_data_plane_url(data_plane),
-    )
-    assert _count_read_mask_rows(data_plane, mask_idx) == 0
-
-
-async def test_delete_mask_is_idempotent_on_absent_mask(postgres_pool, data_plane):
-    """delete_mask on a mask_idx with zero registered rows is success (0 rows) —
-    the idempotency the bulk purge-and-resubmit tooling relies on to retry."""
-    from qiita_control_plane.actions.library import delete_mask_data
-
-    deleted = await delete_mask_data(
-        mask_idx=66001,
-        signing_key=data_plane["secret"],
-        data_plane_url=_data_plane_url(data_plane),
-    )
-    assert deleted == 0

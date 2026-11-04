@@ -50,7 +50,6 @@ import json
 from typing import Annotated
 
 import asyncpg
-import pyarrow.flight as _flight
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import Field
 from qiita_common.api_paths import (
@@ -68,7 +67,6 @@ from qiita_common.auth_constants import Scope
 from qiita_common.models import (
     DoGetTicketResponse,
     MaskDefinition,
-    MaskDefinitionDeleteResponse,
     MaskDefinitionListResponse,
     MaskDefinitionMintRequest,
     MaskDefinitionStatus,
@@ -84,7 +82,6 @@ from qiita_common.models import (
     SyndnaReadCountSample,
 )
 
-from ..actions.library import delete_mask_data
 from ..auth.guards import (
     COHORT_MIN_TIER,
     require_caller_has_tier_on_all_studies,
@@ -97,7 +94,6 @@ from ..auth.tickets import sign_ticket
 from ..block_read import READ_MASKED_TABLE
 from ..deps import (
     TxConnFactory,
-    get_data_plane_url,
     get_db_pool,
     get_flight_signing_key,
     get_tx_conn_factory,
@@ -506,69 +502,6 @@ async def get_syndna_read_count_route(
             for r in rows
         ],
     )
-
-
-@mask_definition_router.delete(PATH_MASK_DEFINITION_BY_IDX)
-async def delete_mask_definition_route(
-    mask_idx: Annotated[int, Field(gt=0)],
-    pool: asyncpg.Pool = Depends(get_db_pool),
-    signing_key: bytes = Depends(get_flight_signing_key),
-    data_plane_url: str = Depends(get_data_plane_url),
-    _scope: Principal = Depends(require_scope(Scope.MASK_DEFINITION_DELETE)),
-) -> MaskDefinitionDeleteResponse:
-    """Fully purge a mask — its DuckLake `read_mask` rows then its Postgres
-    `mask_definition` row. system_admin only (`mask_definition:delete`).
-
-    Order of operations: existence check first (404 if the mask is absent) →
-    DuckLake delete (one all-or-nothing transaction; a 502 on failure removes
-    nothing yet, since the existence check is a read and the Postgres delete
-    hasn't run) → Postgres `mask_definition` delete last. This ordering makes the
-    operation *retriable*: both mutating steps are idempotent and the
-    `qiita.mask_definition` row — the thing a retry keys off — is removed last. If
-    the lake delete succeeds but the Postgres delete fails, the mask row survives
-    and re-issuing the DELETE re-runs both idempotent steps (the second lake
-    delete removes 0 rows). A crash therefore leaves at worst a recoverable
-    orphan-Postgres row, never an unrecoverable orphan-lake.
-
-    Referencing `qiita.work_ticket` rows detach automatically — the
-    `work_ticket.mask_idx` FK is `ON DELETE SET NULL` — so no work-ticket touch
-    is needed here.
-
-    Intentional divergence from reference-delete: that route gates on in-flight
-    work_tickets (409 via `assert_reference_deletable`); this primitive
-    deliberately does NOT. It is an admin-only sharp primitive that lets the FK
-    detach any referencing ticket. The shared-mask SAFETY guard — don't delete a
-    mask still referenced by a non-failed ticket — lives in the bulk
-    purge-failed tool that wraps this route, not in the primitive itself. The
-    absence of gating here is a conscious decision, not an oversight.
-    """
-    # Existence check (a read; safe before the lake delete).
-    exists = await pool.fetchval(
-        "SELECT 1 FROM qiita.mask_definition WHERE mask_idx = $1", mask_idx
-    )
-    if exists is None:
-        raise HTTPException(status_code=404, detail=_MSG_MASK_NOT_FOUND)
-
-    # DuckLake read_mask rows (idempotent, atomic delete-by-mask_idx in the data
-    # plane). Lake-first so a crash before the Postgres delete leaves a
-    # recoverable orphan-Postgres row, not an unrecoverable orphan-lake.
-    try:
-        rows_deleted = await delete_mask_data(
-            mask_idx=mask_idx,
-            signing_key=signing_key,
-            data_plane_url=data_plane_url,
-        )
-    except _flight.FlightError as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"data plane mask delete failed; nothing removed yet: {exc}",
-        ) from exc
-
-    # Postgres row last. The work_ticket FK is ON DELETE SET NULL, so referencing
-    # tickets detach automatically — no need to touch work_ticket here.
-    await pool.execute("DELETE FROM qiita.mask_definition WHERE mask_idx = $1", mask_idx)
-
-    return MaskDefinitionDeleteResponse(mask_idx=mask_idx, rows_deleted=rows_deleted)
 
 
 @mask_definition_router.patch(PATH_MASK_DEFINITION_STATUS)

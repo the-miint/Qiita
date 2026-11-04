@@ -80,7 +80,7 @@ less memory per run, and scratch disk grows with it:
 
 Worst-case connections to ENA are 8 dispatch slots times this value, so raise it by
 measuring. Above 4 the step oversubscribes its 8 CPUs during sorts. Keep production at
-4: 8 concurrent sorts at 5 GB per run is untested on DuckDB 1.5.5.
+4: 8 concurrent sorts at 5 GB per run is untested.
 On the local backend all tickets share one executor, so the effective total is lower.
 
 A download ticket's roster read also waits at most 90 s
@@ -238,7 +238,7 @@ automatic retry for it yet.
 already filters out a retired prep_sample.** That includes the download roster,
 the block planners, the run, pool and study rosters, the amplicon pool roster, the
 rollups and exports, `has_sequenced_sample` (so a pool whose only runs are flagged
-gets no download ticket), `mask purge-failed` and the backfills. It is not deleted or retired, so it stays
+gets no download ticket) and the backfills. It is not deleted or retired, so it stays
 visible on the sample's own record and reappears the moment a later re-import finds
 it public again. Two things do **not** filter it, deliberately: a route that reads
 a sample by its own id (`read_masked`, alignment/assembly DoGets, the per-sample
@@ -468,17 +468,42 @@ failure_type `permanent` and both digests in the reason. A run that broke mid-do
 (including a corrupt body that surfaces mid-stream) and an HTTP 5xx, 408 or 429 from ENA
 or its file server, a failed connection to the server and an HTTP status 0 (no usable
 status) are retried the same way, as is ENA's "Not all results may have been
-written" answer with a miint build that includes duckdb-miint#310. A run whose file
-cannot be opened depends on the miint build: before duckdb-miint#312 miint skips it with
-a warning, which is retried like the rest, so a 404 costs the full retry limit; from
-duckdb-miint#312 on, a 404 fails at once.
+written" answer. A run whose file returns a 404 fails at once.
 
 Where verification does not apply (an SFF run, a file that is not gzip-compressed, no
-`fastq_md5` from ENA) the run still registers. A run that comes back empty with no
-warning fails permanently.
+`fastq_md5` from ENA) the run still registers. A run that comes back empty fails
+permanently.
+
+**Dropped connections are retried by DuckDB.** A FASTQ download retries a dropped HTTP
+request up to 8 times, at random waits that add up to about 35 s on average and 70 s at
+most. An open whose requests all drop goes through those retries twice
+(duckdb-miint#391), up to about 140 s. This covers FASTQ downloads only: [`docs/duckdb-miint.md`](../duckdb-miint.md) says what
+miint's Portal requests do. A 3 GB run makes about 95 requests, and DuckDB also limits
+how many retries they make together, to about 50 dropped connections a run. A run that
+reaches the limit fails with `retry quota for '…' exhausted` in its reason and is
+retried up to the ticket's retry limit, like a run that broke mid-download. The
+retry values are constants (`MIINT_HTTP_RETRY_SETTINGS` in
+`qiita_compute_orchestrator.miint`, whose comment says how DuckDB spends and refills the
+limit), not configuration: changing them takes a code change and a release, and the limit
+itself has no setting.
+
+A pool with a sequenced_sample whose `ena_run_accession` is not exactly one run accession
+(an experiment, sample, study or malformed accession, or one with surrounding whitespace)
+fails before any download: the ticket is FAILED `permanent` at once and emailed with a
+reason naming each such prep_sample; past a fixed length the list ends with `…`. To
+correct them, find the sequencing run in the ticket's `scope_target`, map each prep_sample
+to the `sequenced_sample_idx` the PATCH takes (the list gives both beside each
+`ena_run_accession`), patch each, then redrive the ticket, which reads the roster again:
+
+```
+qiita ticket status <work_ticket_idx>
+qiita sequenced-sample list --sequencing-run-idx <sequencing_run_idx>
+qiita sequenced-sample patch --sequenced-sample-idx <sequenced_sample_idx> --ena-run-accession <run>
+qiita ticket run <work_ticket_idx>
+```
 
 A run that fails in a way a retry cannot clear (a format error, a run with no sequence
-data, a 404 from duckdb-miint#312 on, zero reads) does not fail its pool when another run
+data, a 404, zero reads) does not fail its pool when another run
 was stored: the other runs load, the ticket completes, and the failed run is recorded with
 its reason and `permanent` failure type (the item reads `completed_partial`). The ticket
 is COMPLETED, so the submitter gets the work-ticket digest unless they opted out of
@@ -491,7 +516,7 @@ a segfault retries on the same resources, and anything else (a local disk fault)
 ticket FAILED and redrivable.
 
 When the retries run out, or at once when no run was stored and none of the failures is one
-a retry could clear (a 404 from duckdb-miint#312 on), the ticket is FAILED `permanent` and
+a retry could clear (a 404), the ticket is FAILED `permanent` and
 emailed with its reason.
 Read the reason first. A dropped transfer or an ENA outage: redrive the ticket
 (`POST /work-ticket/{idx}/run`) once ENA is healthy; runs already stored are skipped, and

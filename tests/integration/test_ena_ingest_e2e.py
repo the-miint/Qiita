@@ -30,10 +30,7 @@ from qiita_control_plane.testing.db_teardown import teardown_entity_graph
 from conftest import ducklake_connect
 
 _DOWNLOAD_ENA_STUDY_YAML_PATH = (
-    Path(__file__).parent.parent.parent
-    / "workflows"
-    / "download-ena-study"
-    / "1.0.0.yaml"
+    Path(__file__).parent.parent.parent / "workflows" / "download-ena-study" / "1.0.0.yaml"
 )
 
 # The DuckLake `read` table's 7-column shape (qiita-data-plane/src/ducklake.rs
@@ -73,9 +70,7 @@ def _write_ena_run_map(path: Path, roster: list[tuple[int, str]]) -> None:
     rows = ", ".join(f"({idx}, '{acc}')" for idx, acc in roster)
     with duckdb.connect(":memory:") as conn:
         conn.execute(
-            "COPY (SELECT * FROM (VALUES "
-            + rows
-            + ") AS t(prep_sample_idx, ena_run_accession)) "
+            "COPY (SELECT * FROM (VALUES " + rows + ") AS t(prep_sample_idx, ena_run_accession)) "
             f"TO '{path}' (FORMAT parquet)"
         )
 
@@ -104,9 +99,9 @@ def _write_intermediate(
         )
 
 
-def _fake_stage_run_reads_factory(by_run: dict[str, tuple[list[tuple], list[str]]]):
+def _fake_stage_run_reads_factory(by_run: dict[str, list[tuple]]):
     """Build a `_stage_run_reads`-shaped fake keyed by run_accession; each entry
-    is `(rows, warnings)`."""
+    is the run's rows."""
 
     def _fake(
         run_accession,
@@ -116,9 +111,9 @@ def _fake_stage_run_reads_factory(by_run: dict[str, tuple[list[tuple], list[str]
         memory_gb,
         threads,
     ):
-        rows, warnings = by_run[run_accession]
+        rows = by_run[run_accession]
         _write_intermediate(intermediate_path, rows)
-        return len(rows), warnings
+        return len(rows)
 
     return _fake
 
@@ -145,17 +140,20 @@ async def _run_register_files(
     """Drive the REAL runner adapter for the download-ena-study `register-files`
     entry — the exact production tail `ingest_ena_reads` hands its output to."""
     from qiita_control_plane.runner import _run_action_primitive
+    from qiita_control_plane.testing.run_context import run_context
 
     entry = _entry_by_name("register-files")
     await _run_action_primitive(
-        postgres_pool,
+        run_context(
+            pool=postgres_pool,
+            scope_target={},
+            work_ticket_idx=work_ticket_idx,
+            signing_key=data_plane["secret"],
+            data_plane_url=_data_plane_url(data_plane),
+        ),
         entry,
         {"read_staging_dir": str(staging_dir)},
         staging_dir,
-        {},
-        work_ticket_idx=work_ticket_idx,
-        signing_key=data_plane["secret"],
-        data_plane_url=_data_plane_url(data_plane),
     )
 
 
@@ -195,8 +193,8 @@ _SINGLE_ROWS = [
     (1, "ERR-SINGLE-r1", "ACGTACGTAC", [30] * 10, None, None),
     (2, "ERR-SINGLE-r2", "GGGGCCCCTT", [35] * 10, None, None),
 ]
-_PAIRED_RUN_ACCESSION = "ERR_PAIR001"
-_SINGLE_RUN_ACCESSION = "ERR_SINGLE001"
+_PAIRED_RUN_ACCESSION = "ERR900000001"
+_SINGLE_RUN_ACCESSION = "ERR900000002"
 _WORK_TICKET_IDX = 91001
 
 
@@ -246,12 +244,10 @@ async def test_ena_reads_land_in_ducklake_read_via_register_files(
     # No network, no checked-in fixture: the whole read_ena_sequences seam is
     # replaced with an inline DuckDB COPY of a few ENA-shaped rows.
     by_run = {
-        _PAIRED_RUN_ACCESSION: (_PAIRED_ROWS, []),
-        _SINGLE_RUN_ACCESSION: (_SINGLE_ROWS, []),
+        _PAIRED_RUN_ACCESSION: _PAIRED_ROWS,
+        _SINGLE_RUN_ACCESSION: _SINGLE_ROWS,
     }
-    monkeypatch.setattr(
-        ingest_ena_reads, "_stage_run_reads", _fake_stage_run_reads_factory(by_run)
-    )
+    monkeypatch.setattr(ingest_ena_reads, "_stage_run_reads", _fake_stage_run_reads_factory(by_run))
 
     roster = [
         (prep_paired, _PAIRED_RUN_ACCESSION),

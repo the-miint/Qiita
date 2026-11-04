@@ -77,13 +77,9 @@ async def fetch_sequenced_sample_with_prep_sample(
     """Return the joined sequenced_sample + supertype prep_sample row, or
     None on miss.
 
-    Selects every caller-visible column from both tables in one round
-    trip and computes `effective_updated_at` = GREATEST(prep_sample.updated_at,
-    sequenced_sample.updated_at) so a single timestamp captures the
-    latest write to either side; the route layer feeds it directly to
-    etag_for_updated_at. Column list mirrors SequencedSampleResponse
-    one-for-one (with idx -> sequenced_sample_idx and ps.idx ->
-    prep_sample_idx renamed at the route boundary).
+    Selects the caller-visible columns of both tables in one round trip
+    and computes `effective_updated_at` = GREATEST(prep_sample.updated_at,
+    sequenced_sample.updated_at), the latest write to either row.
 
     `for_update=True` appends `FOR UPDATE` to the SELECT so rows from
     both joined tables are locked for the duration of the surrounding
@@ -98,7 +94,7 @@ async def fetch_sequenced_sample_with_prep_sample(
     """
     # Single-row fetch by sequenced_sample.idx; supertype prep_sample is
     # joined 1:1 via the subtype FK and contributes the owner / retirement
-    # / metadata-touch / created-* columns.
+    # / created-* columns.
     sql = (
         "SELECT ss.idx, ss.prep_sample_idx, ss.sequenced_pool_idx,"
         " ss.sequenced_pool_item_id, ss.ena_experiment_accession,"
@@ -109,7 +105,6 @@ async def fetch_sequenced_sample_with_prep_sample(
         " ps.metadata_checklist_idx,"
         " (SELECT name FROM qiita.metadata_checklist mc"
         "  WHERE mc.idx = ps.metadata_checklist_idx) AS metadata_checklist_name,"
-        " ps.last_metadata_change_at,"
         " ps.created_by_idx, ps.created_at,"
         " GREATEST(ps.updated_at, ss.updated_at) AS effective_updated_at,"
         " ps.retired, ps.retired_by_idx, ps.retired_at, ps.retire_reason"
