@@ -21,6 +21,9 @@
     prep_samples are untouched. An abandoned block's ticket cannot be redriven, and
     its failure no longer fail-stops the align fan-out.
 
+- **`qiita-admin alignment` (#N)** drives the three routes: `deprecate` /
+  `activate`, `invalidate` / `restore` for prep_sample runs, and `abandon-plan`.
+
 ### Removed
 
 - **Alignments can no longer be deleted (#N).** Removed:

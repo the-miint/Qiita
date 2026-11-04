@@ -56,6 +56,7 @@ from .. import _common
 from .._reference_exclusion import add_admin_exclusion_subparsers
 from ._helpers import _DB_CONNECT_TIMEOUT_SECONDS, open_admin_pool
 from .actions_sync import _handle_actions_sync, _sync_actions
+from .alignment import add_alignment_parser
 from .auth import _handle_login, _handle_token_revoke_all, _handle_whoami, _token_revoke_all
 from .compute_readiness import _DEFAULT_ORCHESTRATOR_VENV, _handle_compute_readiness
 from .fanout import add_fanout_parser
@@ -232,6 +233,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_cancel.set_defaults(handler=_handle_ticket_cancel)
 
     add_fanout_parser(sub)
+    add_alignment_parser(sub)
 
     p_terminology = sub.add_parser("terminology", help="Terminology release operations")
     p_terminology_sub = p_terminology.add_subparsers(dest="terminology_cmd", required=True)
