@@ -153,17 +153,22 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
   qiita-admin backfill myloasm-provenance --execute --limit 5
   ```
   Once those five tickets complete, run bucket 5's 1.0.2 provenance query for each one, with
-  `PS`/`RUN` taken from the `prep_sample <PS> run <RUN> -> ticket <T>` lines it printed.
-  Expect the same results as that check. Note their peak memory and elapsed time
-  (`sacct -j <job> -o MaxRSS,Elapsed`) against the step's unmeasured 16 GB / 2 h
-  baseline. Then submit the rest, paced:
+  `PS`/`RUN` taken from the `prep_sample <PS> run <RUN> -> ticket <T>` lines that it
+  printed. Expect the same results as that check. Record each one's peak memory and
+  elapsed time on #827, against the step's unmeasured 16 GB / 2 h baseline:
+  `sacct -j <job> -o MaxRSS,Elapsed`, with `<job>` from
+  `SELECT slurm_job_id FROM qiita.work_ticket_step WHERE work_ticket_idx = <T>`.
+  Then submit the rest, paced:
   `qiita-admin backfill myloasm-provenance --execute --rate 10`.
 
   Each pass submits one ticket per prep_sample, so rerun it once the pass's tickets finish.
-  You are done when the dry run shows `writable : 0` and `in flight : 0` and every
-  `residue` line has an explanation. `--retry-failed` resubmits runs whose recovery ticket
-  failed. Post the final counts per status and each residue reason with its count
-  (no `_idx` values: the repository is public) on #827, which removes the one-off.
+  You are done when the dry run counts no writable and no in-flight runs and every
+  residue line has an explanation. Expect `residue, no assembler tree` for 1.0.0 runs
+  that finished before the 2026-09-02 deploy, when the assemble step started keeping
+  myloasm's tree: their provenance is gone. `--retry-failed` resubmits runs whose
+  recovery ticket failed. On #827, which removes the one-off, post only the dry run's
+  status counts and its `residue, <kind>: <n>` lines, each with its explanation. The
+  per-run lines carry `_idx` values and the repository is public.
 
 ### Notes (no host action)
 

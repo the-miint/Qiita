@@ -55,7 +55,6 @@ _PREP_SAMPLE = 41
 _RUN = 77
 _MASK = 5
 _SOURCE_TICKET = 4834
-# The runner's first attempt, which is most runs' only one.
 _ATTEMPT = 0
 _FIRST_FEATURE = 1001
 # Reads that the mask passed and the assembler never used: the lookup is the
@@ -354,7 +353,7 @@ def test_a_read_the_lookup_does_not_resolve_fails_and_stages_nothing(monkeypatch
         ),
         # A lake feature that no genome contig hashes to.
         pytest.param(
-            lambda f: [*f.values(), (9999, str(uuid.UUID(int=1)), 10)],
+            lambda f: [*sorted(set(f.values())), (9999, str(uuid.UUID(int=1)), 10)],
             "no genome contig",
             id="feature-extra",
         ),
@@ -375,7 +374,6 @@ def test_genome_contigs_must_be_exactly_the_runs_lake_features(
         ("assembly_processing_idx", 0),
         ("assembly_mask_idx", 0),
         ("source_work_ticket_idx", 0),
-        # An attempt counts from 0 (the happy path runs attempt 0).
         ("assemble_attempt", -1),
     ],
 )

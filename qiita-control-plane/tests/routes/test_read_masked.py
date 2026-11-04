@@ -27,6 +27,7 @@ from qiita_common.api_paths import (
 from qiita_common.auth_constants import Scope
 
 from qiita_control_plane.auth.token import mint_api_token
+from qiita_control_plane.repositories.block import MASK_SAMPLE_COMPLETED
 from qiita_control_plane.repositories.mask_definition import mint_mask_definition
 from qiita_control_plane.testing.db_seeds import (
     seed_biosample_with_sequenced_prep_sample,
@@ -307,7 +308,7 @@ async def test_doget_signs_mandatory_filter(ctx):
 async def test_doget_signs_a_requested_projection(ctx):
     """A `columns` list rides the ticket in the caller's order."""
     pool = ctx["pool"]
-    prep, mask, bs = await _seed_gate(pool, ctx["principal_idx"], state="completed")
+    prep, mask, bs = await _seed_gate(pool, ctx["principal_idx"], state=MASK_SAMPLE_COMPLETED)
     try:
         resp = await ctx["sa"].post(
             URL_READ_MASKED_DOGET,
@@ -339,7 +340,7 @@ async def test_doget_bad_column_list_422(ctx, columns):
     the one that only this layer can catch: on the wire an empty list is
     indistinguishable from an absent one, which means the full shape."""
     pool = ctx["pool"]
-    prep, mask, bs = await _seed_gate(pool, ctx["principal_idx"], state="completed")
+    prep, mask, bs = await _seed_gate(pool, ctx["principal_idx"], state=MASK_SAMPLE_COMPLETED)
     try:
         resp = await ctx["sa"].post(
             URL_READ_MASKED_DOGET,

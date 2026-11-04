@@ -19,9 +19,10 @@ through the same shared transform (`_myloasm_provenance`). Two inputs differ:
 
 Three checks tie the tree to the registered run before anything is written. The
 manifest must list the primary contig FASTA and the two genome FASTAs, at the sizes
-they have now. Every genome contig must hash to one of the run's `assembled_sequence`
-rows, and every one of those rows must be some genome contig's hash. Every read name
-the dump uses must resolve (the transform's own check).
+that they have now (`_check_source`). Every genome contig must hash to one of the
+run's `assembled_sequence` rows, and every one of those rows must be some genome
+contig's hash (`_contig_features`). Every read name that the dump uses must resolve
+(the transform's own check).
 """
 
 from __future__ import annotations
@@ -70,8 +71,9 @@ _SOURCE_STEP = "assemble"
 _ASSEMBLER_DIR = "assembler"
 _GENOMES_DIR = "genomes"
 _PRIMARY_FASTA = f"{_ASSEMBLER_DIR}/assembly_primary.fa"
-# The two columns that the read lookup binds; the rest of a long-read prep_sample's
-# `read_masked` row is its sequences and qualities, which the lookup never reads.
+# The two columns that the read lookup binds, and so the only two that it asks the
+# data plane for: a long-read prep_sample's `read_masked` rows are mostly their
+# sequences and qualities.
 _READ_LOOKUP_COLUMNS = ["read_id", "sequence_idx"]
 
 _DUCKDB_MEMORY_GB = 8
@@ -155,7 +157,7 @@ def _read_names_from_lookup(conn: duckdb.DuckDBPyConnection, lookup: str) -> Non
     that the lookup lacks is the transform's refusal ("no sequence_idx")."""
     conn.execute(
         f"CREATE TEMP TABLE {READ_NAME_TABLE} AS "
-        f"SELECT read_id, sequence_idx FROM {lookup} "
+        f"SELECT {', '.join(_READ_LOOKUP_COLUMNS)} FROM {lookup} "
         f"WHERE read_id IN (SELECT read_id FROM {RAW_READ_NAMES})"
     )
 

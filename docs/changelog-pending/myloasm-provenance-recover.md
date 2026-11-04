@@ -12,7 +12,7 @@
   and submits one ticket per run. It is a dry run by default; `--execute` submits, with
   `--limit`, `--rate` and `--retry-failed`. It lists every run that it cannot recover,
   with the reason.
-- **A `read_masked` DoGet ticket can name the columns it streams (#TBD).**
+- **A `read_masked` DoGet ticket can name the columns that it streams (#TBD).**
   `POST /api/v1/read-masked/ticket/doget` takes an optional `columns` list, drawn from
   the `read_masked` columns. An unknown or repeated name is a 422. Left out, the ticket
   streams every column, as before.

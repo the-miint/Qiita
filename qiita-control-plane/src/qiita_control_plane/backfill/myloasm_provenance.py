@@ -72,7 +72,8 @@ _ATTEMPT_KEY = "assemble_attempt"
 # Every run of a source version's myloasm processing, with its source ticket and
 # attempt (NULL when either is missing) and its newest recovery ticket (NULL when
 # none). An omitted `assembler` on a ticket is the action's context_schema default,
-# which is how the runner resolved it.
+# which is how the runner resolved it. A run's `processing.params` keys are the
+# binding names that the runner's `_build_processing_params` writes them under.
 _RUNS_SQL = """
 SELECT s.prep_sample_idx, s.processing_idx, s.state AS sample_state,
        p.status AS processing_status, (p.params->>$9::text)::bigint AS mask_idx,
@@ -128,6 +129,17 @@ class RunStatus(StrEnum):
     RESIDUE = "residue"  # needs a person: the reason says why
 
 
+class ResidueKind(StrEnum):
+    """Why a run is residue, with no identifier in it: what the dry run counts, so
+    the counts can be reported where an `_idx` must not go."""
+
+    RECOVERY_FAILED = "recovery ticket failed"
+    NO_SOURCE_TICKET = "no completed source ticket"
+    NO_ASSEMBLE_STEP = "no completed assemble step"
+    NO_MANIFEST = "no manifest"
+    NO_ASSEMBLER_TREE = "no assembler tree"
+
+
 @dataclass(frozen=True, slots=True)
 class Run:
     prep_sample_idx: int
@@ -135,6 +147,7 @@ class Run:
     mask_idx: int
     status: RunStatus
     reason: str | None = None
+    residue_kind: ResidueKind | None = None
     source_work_ticket_idx: int | None = None
     assemble_attempt: int | None = None
 
@@ -166,12 +179,12 @@ class BackfillPlan:
         return [r for r in self.runs if r.status is status]
 
 
-def _source_tree_reason(output: Path) -> str | None:
+def _source_tree_residue(output: Path) -> tuple[ResidueKind, str] | None:
     """Why the attempt's output cannot be read, or None if it can."""
     if not (output / STEP_MANIFEST_FILENAME).is_file():
-        return f"no manifest at {output / STEP_MANIFEST_FILENAME}"
+        return ResidueKind.NO_MANIFEST, f"no manifest at {output / STEP_MANIFEST_FILENAME}"
     if not (output / _ASSEMBLER_DIR).is_dir():
-        return f"no assembler tree at {output / _ASSEMBLER_DIR}"
+        return ResidueKind.NO_ASSEMBLER_TREE, f"no assembler tree at {output / _ASSEMBLER_DIR}"
     return None
 
 
@@ -199,6 +212,7 @@ def _classify(row: asyncpg.Record, *, ticket_root: Path, retry_failed: bool) -> 
         return Run(
             **key,
             status=RunStatus.RESIDUE,
+            residue_kind=ResidueKind.RECOVERY_FAILED,
             reason=f"recovery ticket {recover} {recover_state}: {row['recover_failure']}",
         )
 
@@ -206,12 +220,14 @@ def _classify(row: asyncpg.Record, *, ticket_root: Path, retry_failed: bool) -> 
         return Run(
             **key,
             status=RunStatus.RESIDUE,
+            residue_kind=ResidueKind.NO_SOURCE_TICKET,
             reason=f"no completed {LONG_READ_ASSEMBLY_ACTION_ID} ticket for the run",
         )
     if row["attempt"] is None:
         return Run(
             **key,
             status=RunStatus.RESIDUE,
+            residue_kind=ResidueKind.NO_ASSEMBLE_STEP,
             reason=f"ticket {row['source_ticket']} has no completed {_ASSEMBLE_STEP!r} step",
         )
     output = step_output_dir(
@@ -219,9 +235,10 @@ def _classify(row: asyncpg.Record, *, ticket_root: Path, retry_failed: bool) -> 
             ticket_workspace(ticket_root, row["source_ticket"]), _ASSEMBLE_STEP, row["attempt"]
         )
     )
-    reason = _source_tree_reason(output)
-    if reason is not None:
-        return Run(**key, status=RunStatus.RESIDUE, reason=reason)
+    residue = _source_tree_residue(output)
+    if residue is not None:
+        kind, reason = residue
+        return Run(**key, status=RunStatus.RESIDUE, residue_kind=kind, reason=reason)
     return Run(
         **key,
         status=RunStatus.WRITABLE,

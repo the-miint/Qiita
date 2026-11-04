@@ -9,7 +9,12 @@ import httpx
 import pytest
 from qiita_common.api_paths import PATH_WORK_TICKET_PREFIX, PATH_WORK_TICKET_ROOT
 
-from qiita_control_plane.backfill.myloasm_provenance import BackfillPlan, Run, RunStatus
+from qiita_control_plane.backfill.myloasm_provenance import (
+    BackfillPlan,
+    ResidueKind,
+    Run,
+    RunStatus,
+)
 from qiita_control_plane.cli.admin import backfill_myloasm_provenance as cli
 from qiita_control_plane.cli.admin import main
 
@@ -19,7 +24,14 @@ _PLAN = BackfillPlan(
         Run(2, 20, 5, RunStatus.WRITABLE, source_work_ticket_idx=200, assemble_attempt=1),
         Run(3, 30, 5, RunStatus.DONE),
         Run(4, 40, 5, RunStatus.SKIPPED, reason="assembly is no_data"),
-        Run(5, 50, 5, RunStatus.RESIDUE, reason="no manifest at /scratch/x"),
+        Run(
+            5,
+            50,
+            5,
+            RunStatus.RESIDUE,
+            reason="no manifest at /scratch/ticket/500/x",
+            residue_kind=ResidueKind.NO_MANIFEST,
+        ),
     ]
 )
 
@@ -56,7 +68,9 @@ def test_a_dry_run_reports_and_posts_nothing(monkeypatch, planned, tmp_path, cap
     assert planned["ticket_root"] == Path(tmp_path) / "ticket"
     assert planned["retry_failed"] is False and planned["closed"]
     assert "writable  : 2" in out and "residue   : 1" in out
-    assert "prep_sample 5 run 50: no manifest at /scratch/x" in out
+    assert "prep_sample 5 run 50: no manifest at /scratch/ticket/500/x" in out
+    # The per-kind count carries no identifier, so it can be reported publicly.
+    assert "residue, no manifest: 1" in out
     assert "assembly is no_data: 1" in out
     assert "DRY RUN" in out
 

@@ -106,7 +106,7 @@ def test_a_non_positive_limit_is_refused(limit):
 
 def test_the_submit_body_satisfies_the_shipped_workflow():
     """The body's action names the shipped workflow, and its context passes that
-    workflow's `context_schema` for a first attempt (0), the common case."""
+    workflow's `context_schema`, attempt 0 included."""
     [action] = [
         a
         for a in load_actions(_REPO_ROOT / "workflows")

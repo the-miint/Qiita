@@ -35,8 +35,7 @@ context_schema:
     assembly_mask_idx:
       type: integer
       minimum: 1
-    # The run's completed `assemble` attempt: whose workspace, which attempt. The
-    # runner numbers attempts from 0.
+    # The run's completed `assemble` attempt: whose workspace, which attempt.
     source_work_ticket_idx:
       type: integer
       minimum: 1

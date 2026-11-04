@@ -26,7 +26,7 @@ from typing import Any
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from qiita_common.hashing import canonical_json
 
-from ..block_read import READ_BLOCK_TABLE, READ_MASKED_BLOCK_TABLE
+from ..block_read import READ_BLOCK_TABLE, READ_MASKED_BLOCK_TABLE, READ_MASKED_TABLE
 
 # The only tables a `members` selector may be signed onto — the block-read
 # selectors, mirroring the data plane's BLOCK_READ_SOURCES. Sourced from the
@@ -35,9 +35,9 @@ _MEMBERS_TABLES = frozenset({READ_BLOCK_TABLE, READ_MASKED_BLOCK_TABLE})
 
 # Columns each table may have signed into a ticket's projection list, and the
 # tables that require one — the CP mirror of the data plane's `PROJECTION_RULES`
-# (flight_service/query.rs); why each table is which is
-# docs/architecture/flight.md. Neither language can import the other, so the two
-# are kept honest by a test that parses the Rust source.
+# (flight_service/query.rs); docs/architecture/flight.md says why a table does or
+# does not require a list. Neither language can import the other, so the two are
+# kept honest by a test that parses the Rust source.
 #
 # A table absent from this mapping takes no projection at all: the data plane
 # streams every column and rejects a list outright.
@@ -69,7 +69,7 @@ _PROJECTION_COLUMNS: dict[str, frozenset[str]] = {
             "tag_sa",
         }
     ),
-    "read_masked": frozenset(
+    READ_MASKED_TABLE: frozenset(
         {
             "mask_idx",
             "prep_sample_idx",

@@ -15,6 +15,7 @@ import uuid
 import pytest
 import pytest_asyncio
 from qiita_common.actions import LONG_READ_ASSEMBLY_ACTION_ID
+from qiita_common.backend_failure import FailureKind
 from qiita_common.models import (
     ComputeTarget,
     FailureType,
@@ -27,6 +28,7 @@ from qiita_common.models import (
 
 from qiita_control_plane.backfill.myloasm_provenance import (
     RECOVER_ACTION_ID,
+    ResidueKind,
     RunStatus,
     plan_backfill,
 )
@@ -161,8 +163,9 @@ async def world(postgres_pool, tmp_path):
         tree: bool = True,
     ):
         """An `assemble` step row, and (for a completed one with `tree`) its output on
-        scratch: the manifest and the assembler tree. The runner numbers attempts
-        from 0."""
+        scratch: the manifest and the assembler tree. The path is spelled out rather
+        than built with `qiita_common.workspace`, so the layout of trees already on
+        disk is pinned independently of the helpers that the planner uses."""
         failed = state is StepProgressState.FAILED
         await pool.execute(
             "INSERT INTO qiita.work_ticket_step"
@@ -172,7 +175,7 @@ async def world(postgres_pool, tmp_path):
             wt,
             attempt,
             state.value,
-            "oom" if failed else None,
+            FailureKind.OOM_KILLED.value if failed else None,
             "out of memory" if failed else None,
             ComputeTarget.LOCAL.value,
         )
@@ -288,15 +291,19 @@ async def test_the_newest_completed_ticket_of_the_runs_assembler_is_the_source(w
 
 
 @pytest.mark.parametrize(
-    ("setup", "reason"),
+    ("setup", "kind", "reason"),
     [
-        pytest.param("no-ticket", "no completed", id="no-ticket"),
-        pytest.param("no-step", "no completed 'assemble' step", id="no-step"),
-        pytest.param("no-tree", "no manifest", id="output-gone"),
-        pytest.param("no-assembler", "no assembler tree", id="assembler-gone"),
+        pytest.param("no-ticket", ResidueKind.NO_SOURCE_TICKET, "no completed", id="no-ticket"),
+        pytest.param(
+            "no-step", ResidueKind.NO_ASSEMBLE_STEP, "no completed 'assemble' step", id="no-step"
+        ),
+        pytest.param("no-tree", ResidueKind.NO_MANIFEST, "no manifest", id="output-gone"),
+        pytest.param(
+            "no-assembler", ResidueKind.NO_ASSEMBLER_TREE, "no assembler tree", id="assembler-gone"
+        ),
     ],
 )
-async def test_a_run_whose_source_cannot_be_found_is_residue(world, setup, reason):
+async def test_a_run_whose_source_cannot_be_found_is_residue(world, setup, kind, reason):
     w = world
     ps = await w["prep_sample"]()
     p = await w["run"](ps)
@@ -310,6 +317,7 @@ async def test_a_run_whose_source_cannot_be_found_is_residue(world, setup, reaso
 
     run = (await w["plan"]())[(ps, p)]
     assert run.status is RunStatus.RESIDUE
+    assert run.residue_kind is kind
     assert reason in run.reason
 
 
@@ -355,6 +363,7 @@ async def test_a_runs_own_recovery_ticket_decides_its_status(world, state, statu
     if status is not RunStatus.DONE:
         assert str(rec) in run.reason
     if state is WorkTicketState.FAILED:
+        assert run.residue_kind is ResidueKind.RECOVERY_FAILED
         assert "boom" in run.reason
         retried = (await w["plan"](retry_failed=True))[(ps, p)]
         assert retried.status is RunStatus.WRITABLE

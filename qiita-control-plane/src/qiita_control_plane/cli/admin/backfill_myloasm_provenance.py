@@ -54,8 +54,8 @@ def add_myloasm_provenance_parser(backfill_sub: argparse._SubParsersAction) -> N
         "--retry-failed",
         action="store_true",
         help=(
-            "Resubmit runs whose recovery ticket failed (otherwise listed as residue"
-            " with the failure)."
+            "Resubmit runs whose recovery ticket failed (otherwise listed among the"
+            " runs it cannot recover, with the failure)."
         ),
     )
     p.add_argument(
@@ -94,7 +94,10 @@ def _print_plan(plan: BackfillPlan) -> None:
         print(f"  {label} : {len(plan.by_status(status))}")
     for reason, n in sorted(Counter(r.reason for r in plan.by_status(RunStatus.SKIPPED)).items()):
         print(f"    skipped, {reason}: {n}")
-    for run in plan.by_status(RunStatus.RESIDUE):
+    residue = plan.by_status(RunStatus.RESIDUE)
+    for kind, n in sorted(Counter(r.residue_kind for r in residue).items()):
+        print(f"    residue, {kind}: {n}")
+    for run in residue:
         print(f"    prep_sample {run.prep_sample_idx} run {run.processing_idx}: {run.reason}")
 
 

@@ -178,8 +178,8 @@ const READ_MASKED_PROJECTION_COLUMNS: &[&str] = &[
 struct ProjectionRule {
     columns: &'static [&'static str],
     /// `true` where a ticket without a list is refused rather than widened to
-    /// `SELECT *`; `false` where it streams the full shape. Why each table is
-    /// which: `docs/architecture/flight.md`.
+    /// `SELECT *`; `false` where it streams the full shape.
+    /// `docs/architecture/flight.md` says why a table does or does not require one.
     required: bool,
 }
 
