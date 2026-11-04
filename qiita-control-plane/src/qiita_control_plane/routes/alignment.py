@@ -99,10 +99,7 @@ alignment_router = APIRouter(prefix=PATH_ALIGNMENT_PREFIX, tags=["alignment"])
 
 
 def _alignment_record_to_response(row: asyncpg.Record) -> AlignmentDefinition:
-    params = row["params"]
-    return AlignmentDefinition.model_validate(
-        {**dict(row), "params": json.loads(params) if isinstance(params, str) else params}
-    )
+    return AlignmentDefinition.model_validate({**dict(row), "params": _params(row)})
 
 
 @alignment_definition_router.patch(PATH_ALIGNMENT_DEFINITION_STATUS)
@@ -434,6 +431,8 @@ async def _denovo_arm_covered(
 
 
 def _params(row: asyncpg.Record) -> object:
+    """`alignment_definition.params`, decoded: asyncpg returns JSONB as str under the
+    default codec, or already decoded when a codec is registered."""
     params = row["params"]
     return json.loads(params) if isinstance(params, str) else params
 
