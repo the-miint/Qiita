@@ -509,6 +509,8 @@ async def denovo(postgres_pool, aligned):
         [(denovo_alignment_idx, a), (denovo_alignment_idx, c)],
     )
     yield {"alignment_idx": denovo_alignment_idx, "processing_idx": processing_idx}
+    # Runs before `aligned`'s entity sweep, and the definition and the run below
+    # cannot be deleted while gate rows reference them, so their gate rows go first.
     await postgres_pool.execute(
         "DELETE FROM qiita.alignment_sample WHERE alignment_idx = $1", denovo_alignment_idx
     )
@@ -570,5 +572,39 @@ async def test_doget_denovo_arm_refuses_an_assembled_member_invalidated_since_su
         )
         assert resp.status_code == 409, resp.text
         assert str(c) in resp.json()["detail"]
+    finally:
+        await _cleanup_ticket(ctx["pool"], wt_idx, *rest)
+
+
+async def test_doget_denovo_arm_refuses_an_assembly_run_deprecated_since_submit(
+    ctx, aligned, denovo
+):
+    """Submit refuses a deprecated assembly run as the de novo arm; the re-check at
+    mint refuses one deprecated after submit, with the same wording."""
+    from qiita_common.models import ProcessingStatus
+
+    from qiita_control_plane.repositories.processing import transition_processing_status
+
+    wt_idx, *rest = await _seed_feature_table_ticket(
+        ctx["pool"],
+        alignment_idx=aligned["alignment_idx"],
+        prep_sample_idx=aligned["samples"],
+        denovo_alignment_idx=denovo["alignment_idx"],
+    )
+    await transition_processing_status(
+        ctx["pool"],
+        processing_idx=denovo["processing_idx"],
+        status=ProcessingStatus.DEPRECATED,
+        reason="bad assembler build",
+        superseded_by=None,
+        principal_idx=aligned["owner"],
+    )
+    try:
+        resp = await ctx["sa"].post(
+            URL_ALIGNMENT_DOGET,
+            json={"work_ticket_idx": wt_idx, "columns": ["feature_idx"], "denovo": True},
+        )
+        assert resp.status_code == 409, resp.text
+        assert str(denovo["processing_idx"]) in resp.json()["detail"]
     finally:
         await _cleanup_ticket(ctx["pool"], wt_idx, *rest)

@@ -82,7 +82,6 @@ from qiita_common.api_paths import (
 from qiita_common.auth_constants import Scope, SystemRole
 from qiita_common.host_filter_plan import PoolPlanRefusal
 from qiita_common.models import (
-    AlignmentDefinitionStatus,
     AlignPlanRequest,
     AlignPlanResponse,
     BlockMaskPlanRequest,
@@ -175,7 +174,12 @@ from ..repositories.sequencing_run import (
     list_sequenced_pools,
     update_sequenced_pool_preflight_blob,
 )
-from ._helpers import GENERIC_FK_VIOLATION, cap_rows, resolve_idxs_by_natural_key
+from ._helpers import (
+    GENERIC_FK_VIOLATION,
+    cap_rows,
+    refuse_deprecated_alignment,
+    resolve_idxs_by_natural_key,
+)
 
 router = APIRouter(prefix=PATH_SEQUENCING_RUN_PREFIX, tags=["sequencing-run"])
 
@@ -825,14 +829,7 @@ async def get_sequenced_pool_alignment_cohort(
     )
     cohort = await list_completed_alignment_samples(pool, alignment_idx, prep_sample_idxs)
     if cohort:
-        definition = await fetch_alignment_definition_by_idx(pool, alignment_idx)
-        if definition["status"] == AlignmentDefinitionStatus.DEPRECATED.value:
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    f"alignment {alignment_idx} is deprecated: {definition['deprecation_reason']}"
-                ),
-            )
+        refuse_deprecated_alignment(await fetch_alignment_definition_by_idx(pool, alignment_idx))
     return PoolAlignmentCohort(
         sequencing_run_idx=sequencing_run_idx,
         sequenced_pool_idx=sequenced_pool_idx,

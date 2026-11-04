@@ -652,16 +652,18 @@ async def test_align_plan_holds_both_definitions_in_its_ticket_transaction(
     writes the tickets, so a deprecation either commits first (and the plan refuses)
     or waits and then counts the tickets. Recorded at the call, because a deprecated
     config is refused earlier by the mint and so cannot tell a missing lock apart."""
-    locked: list[tuple[str, int, bool]] = []
+    locked: list[tuple[str, int]] = []
     real_alignment = align_planner.lock_active_alignment
     real_mask = align_planner.lock_active_mask
 
     async def _alignment(conn, idx):
-        locked.append(("alignment", idx, conn.is_in_transaction()))
+        assert conn.is_in_transaction()
+        locked.append(("alignment", idx))
         await real_alignment(conn, idx)
 
     async def _mask(conn, idx):
-        locked.append(("mask", idx, conn.is_in_transaction()))
+        assert conn.is_in_transaction()
+        locked.append(("mask", idx))
         await real_mask(conn, idx)
 
     monkeypatch.setattr(align_planner, "lock_active_alignment", _alignment)
@@ -670,9 +672,12 @@ async def test_align_plan_holds_both_definitions_in_its_ticket_transaction(
     resp = await ctx["wet"].post(_url(planned), json=_body(planned))
     assert resp.status_code == 202, resp.text
     alignment_idx = resp.json()["partitions"][0]["alignment_idx"]
+    # The early check locks the mask in a transaction of its own and releases it;
+    # the plan's transaction locks it again before the mint, then the alignment.
     assert locked == [
-        ("mask", planned["mask_idx"], True),
-        ("alignment", alignment_idx, True),
+        ("mask", planned["mask_idx"]),
+        ("mask", planned["mask_idx"]),
+        ("alignment", alignment_idx),
     ]
 
 

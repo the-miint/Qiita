@@ -51,8 +51,8 @@
   when the alignment was deprecated, or a prep_sample invalidated, after the
   feature-table ticket was submitted. The de novo arm re-checks only the prep_samples
   whose assembly completed, as submit does: one with nothing to assemble (`no_data`)
-  stays reference-only. A prep_sample whose assembly gate has since left `completed`
-  or `no_data` is a 409.
+  stays reference-only. An assembly run deprecated since submit, or a prep_sample
+  whose assembly gate has since left `completed` or `no_data`, is a 409.
 - **The pool alignment listing reports each alignment's `status` (#829).**
   `GET …/sequenced-pool/{sequenced_pool_idx}/alignment` keeps listing a deprecated
   alignment, now with `status`, `deprecation_reason` and `superseded_by`. Its cohort
@@ -64,5 +64,5 @@
   alignment deprecated while the plan runs waits for it and then counts its tickets.
 - **`POST /work-ticket/{work_ticket_idx}/run` clears `dispatch_held` (#829).** The
   ticket it dispatches is no longer held, so the fan-out pump does not count it as
-  waiting for a slot. It also waits for a deprecation of the ticket's alignment or
-  mask that is in progress, and then refuses (409).
+  waiting for a slot. A redrive of a failed or cancelled ticket also waits for a
+  deprecation of its alignment or mask that is in progress, and then refuses (409).

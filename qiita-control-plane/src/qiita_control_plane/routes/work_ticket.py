@@ -153,6 +153,9 @@ _RUN_NOT_APPLICABLE_STATES = tuple(
     state.value for state in WorkTicketState if state.value not in _RUN_APPLICABLE_STATES
 )
 
+# /run's guarded UPDATEs bind the state they read; a concurrent change loses the race.
+_RUN_STATE_CHANGED = "work_ticket state changed under /run; retry"
+
 router = APIRouter(prefix=PATH_WORK_TICKET_PREFIX, tags=["work-ticket"])
 
 
@@ -1019,7 +1022,7 @@ async def run_work_ticket(
                 "     notify_attempts = 0,"
                 # /run dispatches the ticket itself, so it is no longer held: the
                 # pump must not release it a second time, and abandon-plan must see
-                # it as running (`fanout_dispatch`).
+                # it as running (`actions/align_abandon.py`).
                 "     dispatch_held = false"
                 " WHERE work_ticket_idx = $2"
                 "   AND state = $3::qiita.work_ticket_state"
@@ -1031,7 +1034,7 @@ async def run_work_ticket(
             if updated is None:
                 raise HTTPException(
                     status_code=status.HTTP_409_CONFLICT,
-                    detail="work_ticket state changed under /run; retry",
+                    detail=_RUN_STATE_CHANGED,
                 )
 
             # Which prior progress rows survive the redrive. `completed` survives,
@@ -1125,7 +1128,7 @@ async def run_work_ticket(
         if released is None:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
-                detail="work_ticket state changed under /run; retry",
+                detail=_RUN_STATE_CHANGED,
             )
 
     schedule_dispatch(request.app, work_ticket_idx)

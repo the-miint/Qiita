@@ -144,6 +144,19 @@ ALIGNMENT_NOT_FOUND_DETAIL = "alignment not found"
 GENOME_MAP_HARD_CAP = 250_000
 
 
+def refuse_deprecated_alignment(alignment: asyncpg.Record) -> None:
+    """409 when `alignment` (an `alignment_definition` row) is deprecated: a
+    deprecated config is void for every consumer that names a cohort of it."""
+    if alignment["status"] == AlignmentDefinitionStatus.DEPRECATED.value:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"alignment {alignment['alignment_idx']} is deprecated:"
+                f" {alignment['deprecation_reason']}"
+            ),
+        )
+
+
 async def authorize_completed_alignment_cohort(
     pool: asyncpg.Pool,
     *,
@@ -184,11 +197,7 @@ async def authorize_completed_alignment_cohort(
         pool, caller=caller, prep_sample_idx=prep_sample_idx, min_tier=COHORT_MIN_TIER
     )
 
-    if alignment["status"] == AlignmentDefinitionStatus.DEPRECATED.value:
-        raise HTTPException(
-            status_code=409,
-            detail=f"alignment {alignment_idx} is deprecated: {alignment['deprecation_reason']}",
-        )
+    refuse_deprecated_alignment(alignment)
 
     incomplete = await list_incomplete_alignment_samples(pool, alignment_idx, cohort)
     if incomplete:

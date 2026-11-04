@@ -98,8 +98,8 @@ async def abandon_align_plan(
             alignment_idx,
             [BLOCK_COMPLETED, BLOCK_ABANDONED],
         )
-        # The flag alone is not enough: a ticket /run dispatched before /run cleared
-        # the flag still carries it while queued or processing.
+        # The flag alone is not enough: a row can carry `dispatch_held` past
+        # 'pending', and such a row may have a job, so it counts as running.
         held = [
             r["work_ticket_idx"]
             for r in blocks

@@ -38,7 +38,6 @@ from qiita_common.api_paths import (
     URL_ALIGNMENT_DEFINITION_ABANDON_PLAN,
     URL_ALIGNMENT_DEFINITION_STATUS,
 )
-from qiita_common.models import MaskDefinitionStatus
 
 from .actions.reference import ReferenceNotFound
 from .block_planner import (
@@ -60,7 +59,11 @@ from .repositories.block import (
     create_block,
     set_block_work_ticket,
 )
-from .repositories.mask_definition import MaskDefinitionDeprecated, lock_active_mask
+from .repositories.mask_definition import (
+    MaskDefinitionDeprecated,
+    MaskDefinitionNotFound,
+    lock_active_mask,
+)
 from .repositories.reference_membership import reference_shard_ids
 from .runner import (
     ReferenceIndexNotBuilt,
@@ -242,6 +245,17 @@ class AlignResubmitError(RuntimeError):
         )
 
 
+async def _lock_align_mask(conn: asyncpg.Connection, mask_idx: int) -> None:
+    """`lock_active_mask`, translated to the plan's refusals: 404 for a mask that
+    does not exist, 409 for a deprecated one."""
+    try:
+        await lock_active_mask(conn, mask_idx)
+    except MaskDefinitionNotFound as exc:
+        raise AlignMaskNotFound(f"no mask_definition with mask_idx={mask_idx}") from exc
+    except MaskDefinitionDeprecated as exc:
+        raise AlignMaskDeprecated(f"{exc.detail}; it cannot be aligned against") from exc
+
+
 class AlignDefinitionDeprecated(RuntimeError):
     """The plan's config resolves to a deprecated alignment. A block identity has no
     version, so re-planning the same reference, aligner and mask always lands on it;
@@ -338,19 +352,14 @@ async def plan_and_submit_alignments(
     # The caller names the mask to align under; it must exist. A pool with no sample
     # masked under an EXISTING mask is AlignNoMasksFound (422, below); a nonexistent
     # mask_idx is a client error (404).
-    mask_status = await pool.fetchval(
-        "SELECT status FROM qiita.mask_definition WHERE mask_idx = $1", mask_idx
-    )
-    if mask_status is None:
-        raise AlignMaskNotFound(f"no mask_definition with mask_idx={mask_idx}")
     # A deprecated config is void. Aligning against it would build new results on a
     # filter we no longer stand behind — the same reason the mint refuses it, one
     # step further downstream. Individual withdrawn RUNS need no check here: the
     # cohort below admits only gate state 'completed', which 'invalidated' is not.
-    if mask_status == MaskDefinitionStatus.DEPRECATED.value:
-        raise AlignMaskDeprecated(
-            f"mask_definition {mask_idx} is deprecated and cannot be aligned against"
-        )
+    # Checked here so a deprecated mask fails fast, and again under the lock the
+    # persist transaction takes, with the same refusal.
+    async with pool.acquire() as conn, conn.transaction():
+        await _lock_align_mask(conn, mask_idx)
 
     # Assert ACTIVE + sharded (fail-fast; the route maps the typed errors to 4xx).
     # We don't need the resolved paths here — the runner resolves them per block at
@@ -422,7 +431,7 @@ async def plan_and_submit_alignments(
     ]
     skipped_mask_incomplete = len(gate_state_by_prep_sample) - len(to_consider)
 
-    # Mint, filter and persist in ONE transaction. The mint's row is new when this
+    # Mint, filter and persist in one transaction. The mint's row is new when this
     # config was never planned, and only the tickets written below give it any data;
     # minted in a transaction of its own, a plan refused after the mint would leave
     # an alignment with no gates and no tickets, which blocks its reference's delete
@@ -441,10 +450,7 @@ async def plan_and_submit_alignments(
     partition_summaries: list[dict[str, Any]] = []
     if to_consider:
         async with pool.acquire() as conn, conn.transaction():
-            try:
-                await lock_active_mask(conn, mask_idx)
-            except MaskDefinitionDeprecated as exc:
-                raise AlignMaskDeprecated(f"{exc.detail}; it cannot be aligned against") from exc
+            await _lock_align_mask(conn, mask_idx)
             try:
                 row = await mint_alignment_definition(
                     conn,

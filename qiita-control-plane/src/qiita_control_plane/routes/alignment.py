@@ -61,6 +61,7 @@ from ..deps import (
 )
 from ..feature_table import (
     denovo_alignment_processing_idx,
+    denovo_assembly_deprecation_error,
     parse_feature_table_denovo,
     parse_feature_table_scope,
 )
@@ -75,6 +76,7 @@ from ..repositories.alignment_definition import (
 )
 from ..repositories.assembly import classify_denovo_arm_cohort
 from ..repositories.block import list_incomplete_alignment_samples
+from ..repositories.processing import fetch_processing_by_idx
 from ._helpers import ALIGNMENT_NOT_FOUND_DETAIL, authorize_completed_alignment_cohort, first_few
 
 # The DuckLake relation this route signs DoGet tickets for: the exclusion-aware
@@ -393,8 +395,9 @@ async def _denovo_arm_covered(
     """The cohort members the de novo arm must cover: the assembled ones, as decided
     at submit (`classify_denovo_arm_cohort`). A `no_data` member has no de novo
     alignment row and is reference-only, so it is not re-checked against that
-    alignment. 409 when a member's assembly gate has since left `completed` /
-    `no_data`."""
+    alignment. 409 when the assembly run was deprecated since submit (the wording is
+    `denovo_assembly_deprecation_error`, as at submit), or a member's assembly gate
+    has since left `completed` / `no_data`."""
     denovo = await fetch_alignment_definition_by_idx(pool, denovo_alignment_idx)
     reference = await fetch_alignment_definition_by_idx(pool, reference_alignment_idx)
     if denovo is None or reference is None:
@@ -407,6 +410,14 @@ async def _denovo_arm_covered(
         )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    run = await fetch_processing_by_idx(pool, processing_idx)
+    if run is None:
+        raise HTTPException(status_code=404, detail=f"assembly run {processing_idx} not found")
+    deprecated = denovo_assembly_deprecation_error(
+        processing_idx=processing_idx, status=run["status"], superseded_by=run["superseded_by"]
+    )
+    if deprecated is not None:
+        raise HTTPException(status_code=409, detail=deprecated)
     cohort = await classify_denovo_arm_cohort(
         pool, processing_idx=processing_idx, prep_sample_idx=prep_sample_idx
     )
