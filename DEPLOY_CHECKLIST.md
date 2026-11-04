@@ -52,7 +52,7 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
 - `[operator]` (#779) `make migrate` applies `20261024000000_metadata_visibility.sql` (four new SQL functions, `qiita.metadata_field_tier`, `qiita.metadata_required_tier` and `qiita.{biosample,prep_sample}_metadata_visibility`, and corrected COMMENTs on `qiita.{biosample,prep_sample}_field_exception`; no table, row or grant changes).
 - `[operator]` (#779) `make migrate` applies `20261024000001_metadata_write_keeps_parent_updated_at.sql` (the biosample and prep_sample `set_updated_at` triggers skip the metadata-touch UPDATE, and the two touch functions skip a no-op UPDATE; column COMMENTs on `updated_at` / `last_metadata_change_at`; no table or row changes).
 - `[operator]` (#829) `make migrate` applies `20261104000000_alignment_lifecycle.sql` (lifecycle columns and CHECKs on `qiita.alignment_definition`, `invalidated` on `qiita.alignment_sample`, `abandoned` on `qiita.block`, `qiita.mint_alignment_definition` refusing a deprecated config, `qiita.qc_verdict` restated; no row changes).
-- `[operator]` (#N) `make migrate` applies `20261105000000_exported_retire_wording.sql` (`qiita.retire_detached_exported_identifier` and `qiita.retire_detached_exported_processing` re-created with a reworded retire reason, and their COMMENTs; no table or row changes).
+- `[operator]` (#831) `make migrate` applies `20261105000000_exported_retire_wording.sql` (`qiita.retire_detached_exported_identifier` and `qiita.retire_detached_exported_processing` re-created with a reworded retire reason, and their COMMENTs; no table or row changes).
 
 ### 4. Deploy
 
