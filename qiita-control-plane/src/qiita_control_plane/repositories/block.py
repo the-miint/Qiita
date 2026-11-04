@@ -414,11 +414,12 @@ async def has_incomplete_covering_block(
         "  JOIN qiita.block_member bm ON bm.block_idx = b.block_idx"
         "  JOIN qiita.work_ticket wt ON wt.work_ticket_idx = b.work_ticket_idx"
         " WHERE bm.prep_sample_idx = $1 AND wt.mask_idx = $2"
-        "   AND wt.action_id = $3 AND b.state <> 'completed'"
+        "   AND wt.action_id = $3 AND b.state <> $4"
         " LIMIT 1",
         prep_sample_idx,
         mask_idx,
         BLOCK_MASK_ACTION_ID,
+        BLOCK_COMPLETED,
     )
     return incomplete is not None
 
