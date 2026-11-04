@@ -2398,7 +2398,7 @@ async def persist_qc_checks(
             if ticket[column] is None:
                 raise RuntimeError(
                     f"persist-qc-checks requires work_ticket {work_ticket_idx} to carry a "
-                    f"{column}; the column is NULL (the definition was deleted mid-flight)"
+                    f"{column}; the column is NULL (the definition was removed by hand mid-flight)"
                 )
             producer[column] = ticket[column]
         return await upsert_qc_checks(

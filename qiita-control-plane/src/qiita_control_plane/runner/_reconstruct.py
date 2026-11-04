@@ -469,8 +469,8 @@ async def _ticket_alignment_idx(
     if alignment_idx is None:
         raise RuntimeError(
             f"{entry} requires work_ticket {work_ticket_idx} to carry an alignment_idx; "
-            "the column is NULL (nothing set it, or the alignment definition was "
-            "deleted mid-flight)"
+            "the column is NULL (nothing set it, or the alignment_definition row was "
+            "removed by hand mid-flight)"
         )
     return alignment_idx
 

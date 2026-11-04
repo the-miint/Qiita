@@ -435,9 +435,9 @@ async def plan_and_submit_alignments(
     # config was never planned, and only the tickets written below give it any data;
     # minted in a transaction of its own, a plan refused after the mint would leave
     # an alignment with no gates and no tickets, which blocks its reference's delete
-    # (`actions/reference.py`) and which no route removes. Here a refusal rolls the
-    # new row back with everything else. A re-plan of the same config resolves to
-    # the same alignment_idx (the mint is idempotent on the config hash).
+    # (`actions/reference.py`). Here a refusal rolls the new row back with everything
+    # else. A re-plan of the same config resolves to the same alignment_idx (the mint
+    # is idempotent on the config hash).
     #
     # Lock order: the mask, then the alignment, each `FOR SHARE` to commit, so a
     # deprecation of either commits before this plan (and the plan refuses) or waits

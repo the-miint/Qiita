@@ -108,11 +108,10 @@ def test_cohort_for_ticket_row_detached_align_block_is_not_a_read_mask_block():
     """A detached align block ticket must NOT route into the read-mask cohort.
 
     Deleting the alignment_definition row NULLs `work_ticket.alignment_idx` but
-    leaves the ticket's `mask_idx` and `block_idx`, so on the column shape alone it
-    is
+    leaves the ticket's `mask_idx` and `block_idx`, so on the column shape alone it is
     indistinguishable from a read-mask block. Routing it there puts it in the wrong
-    fan-out: a `failed` one fail-stops the read-mask cohort for that mask_idx, and
-    the whole cohort then releases nothing. It routes by action instead, so a detached
+    fan-out: a `failed` one fail-stops the read-mask cohort for that mask_idx, and the
+    whole cohort then releases nothing. It routes by action instead, so a detached
     align ticket belongs to no cohort at all.
     """
     detached = _row(block_idx=5, mask_idx=9, alignment_idx=None, action_id=ALIGN_ACTION_ID)
