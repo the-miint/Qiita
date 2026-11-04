@@ -4,7 +4,9 @@
   whole jplace to miint's `read_jplace`, which cannot read a file over 1 GB
   (duckdb-miint#400), so Greengenes2 2024.09's 2.26 GB placement file could not load at
   all. The job now streams the placements into 16 MiB parts and reads them one at a
-  time; that whole file loads in about two minutes.
+  time; that whole file loads in about two minutes. The jplace's tree is taken from that
+  same pass, not from miint's `read_jplace_newick`. That function holds the whole file in
+  memory and returns the first `"tree"` string anywhere in the file (duckdb-miint#413).
 
 ### Changed
 

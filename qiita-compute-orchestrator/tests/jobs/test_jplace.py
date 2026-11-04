@@ -103,6 +103,24 @@ def test_keys_in_either_order_carry_placements_and_tree(tmp_path, order):
     assert (tmp_path / "tree.nwk").read_text() == _TREE
 
 
+def test_the_tree_is_the_top_level_key_decoded(tmp_path):
+    """A `"tree"` key in `metadata` and a fragment named `tree`, both ahead of the tree,
+    and a tip name `json.dumps` writes as a `\\u` escape: the cases duckdb-miint#413
+    gets wrong."""
+    tree = "((Ésp:0.1{0},tree:0.2{1}):0.3{2});"
+    doc = {
+        "metadata": {"tree": "(decoy:1{0});"},
+        "placements": [_placement("tree", 1)],
+        "fields": list(EXPECTED_FIELDS),
+        "version": 3,
+        "tree": tree,
+    }
+    path = _write(tmp_path, doc)
+    assert "\\u00c9sp" in path.read_text()
+    _split(path, tmp_path / "parts")
+    assert (tmp_path / "tree.nwk").read_text(encoding="utf-8") == tree
+
+
 def test_buffer_refills_mid_value(tmp_path, monkeypatch):
     """A refill can land inside any value — a placement, a key, the tree string.
     Reading a few characters at a time puts one in all of them."""

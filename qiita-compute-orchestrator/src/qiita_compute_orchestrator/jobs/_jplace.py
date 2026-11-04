@@ -14,8 +14,8 @@ The split is JSON framing only: each placement is located with
 `json.JSONDecoder.raw_decode`, checked, and its source text copied through unchanged, so
 miint still does the parsing. A part carries only the `placements` array — `read_jplace`
 reads nothing else — so it is not a jplace by the spec, and it never leaves the job's
-temp directory. The jplace's own `tree` is kept too: its `{N}` decorations are what the
-placements' `edge_num`s name.
+temp directory. The jplace's own `tree` is kept too, from the same pass (`split_jplace`
+says why): its `{N}` decorations are what the placements' `edge_num`s name.
 
 This is a **private helper**, not a dispatchable native job: it exports neither `Inputs`
 nor `execute`, and its leading underscore exempts it from the boot-time job scan.
@@ -287,7 +287,10 @@ def split_jplace(
                 raise ValueError(f"{source}: the jplace has no {required!r}")
         if not isinstance(tree, str):
             raise ValueError(f"{source}: the jplace's 'tree' is not a Newick string")
-        tree_out.write_text(tree)
+        # Taken from this pass rather than miint's `read_jplace_newick`, which returns
+        # the first `"tree"` string anywhere in the file, decodes only the `\\` and `\"`
+        # escapes, and holds the whole file in memory to do it (duckdb-miint#413).
+        tree_out.write_text(tree, encoding="utf-8")
         last = writer.close()
         if last is not None:
             yield last
