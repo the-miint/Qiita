@@ -97,9 +97,8 @@ def _alignment_record_to_response(row: asyncpg.Record) -> AlignmentDefinition:
 
 
 async def _refuse_reactivating_purged_rows(conn: asyncpg.Connection, alignment_idx: int):
-    """409 when reference delete has purged this alignment's rows
-    (`rows_purged_at`). The row lock serializes with the stamp, which reference
-    delete writes before it purges (`actions.reference.mark_deprecated_alignments_purged`)."""
+    """409 once reference delete has stamped `rows_purged_at`. The row lock is the
+    one `actions.reference.mark_deprecated_alignments_purged` takes."""
     purged_at = await conn.fetchrow(
         "SELECT rows_purged_at FROM qiita.alignment_definition WHERE alignment_idx = $1 FOR UPDATE",
         alignment_idx,

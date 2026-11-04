@@ -38,8 +38,9 @@
   DuckLake `alignment` rows first and keeps their definitions
   (`alignment_rows_deleted` in the response). An active alignment against the
   reference still blocks the delete, now with a message saying to deprecate it; so
-  does a deprecated alignment's block ticket that is still running. A deprecated
-  alignment whose reference was deleted cannot be returned to active.
+  does a deprecated alignment's block ticket that is still running. An alignment
+  whose rows a reference delete has purged, or started to purge, cannot be returned
+  to active.
 - **The service-account alignment DoGet re-checks its cohort (#N).** It returns 409
   when the alignment was deprecated, or a prep_sample invalidated, after the
   feature-table ticket was submitted.

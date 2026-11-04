@@ -10,7 +10,7 @@
 --     same row: a deprecated block alignment is retired, and re-aligning means a
 --     different config.
 --
---   * `alignment_sample.state = 'invalidated'` withdraws one sample's RUN of a
+--   * `alignment_sample.state = 'invalidated'` withdraws one prep_sample's RUN of a
 --     sound config. Every consumer reads only 'completed', so the third value is
 --     refused without editing them.
 --
@@ -51,9 +51,6 @@ ALTER TABLE qiita.alignment_definition
     ADD CONSTRAINT alignment_definition_supersede_not_self CHECK (
         superseded_by IS NULL OR superseded_by <> alignment_idx
     ),
-    -- Set by reference delete, before it purges this alignment's DuckLake rows.
-    -- Only a deprecated alignment is purged, and a purged one cannot be made active
-    -- again: the rows it would serve are gone.
     ADD COLUMN rows_purged_at TIMESTAMPTZ,
     ADD CONSTRAINT alignment_definition_purged_only_when_deprecated CHECK (
         rows_purged_at IS NULL OR status = 'deprecated'
@@ -64,11 +61,12 @@ COMMENT ON COLUMN qiita.alignment_definition.status IS
     'not a Postgres ENUM). Python twin: qiita_common.models.AlignmentDefinitionStatus. '
     '''deprecated'' means the configuration is void: qiita.mint_alignment_definition '
     'refuses to return the row, and every consumer refuses to read it. It does not '
-    'judge any one sample''s run -- that is alignment_sample.state.';
+    'judge any one prep_sample''s run -- that is alignment_sample.state.';
 
 COMMENT ON COLUMN qiita.alignment_definition.rows_purged_at IS
-    'When reference delete purged this alignment''s DuckLake rows. Set before the '
-    'purge, so a set value means the rows may be gone; the row stays deprecated.';
+    'Set by reference delete before it purges this alignment''s DuckLake rows, so a '
+    'set value means the rows may be gone. Only a deprecated row is stamped, and a '
+    'stamped row cannot be made active again.';
 
 COMMENT ON COLUMN qiita.alignment_definition.superseded_by IS
     'The alignment_definition that replaces this one, when there is one. Settable '
@@ -97,14 +95,14 @@ COMMENT ON TABLE qiita.alignment_sample IS
     'Per-(alignment_idx, prep_sample) completion gate for alignment, written by two '
     'paths that never share an identity: bulk-block sharded alignment materializes '
     '''pending'' at plan time and flips ''completed'' at reconcile once every '
-    'covering block finished, and per-sample de novo alignment materializes it when '
+    'covering block finished, and per-prep_sample de novo alignment materializes it when '
     'the runner mints the identity and flips it at the workflow''s terminal step. '
     'Which path a row came from is readable from the alignment_definition''s params: '
     'a block identity hashes a reference_idx and a shard set, a de novo one hashes an '
     'assembly subject. A completed run later judged untrustworthy is set '
     '''invalidated'', with who/when/why. A ''pending'' row whose covering blocks were '
     'abandoned is deleted by the abandon-plan route so the prep_sample can be re-planned. '
-    'Consumers read ONLY ''completed'' samples -- alignment rows are NOT 1:1 with '
+    'Consumers read ONLY ''completed'' prep_samples -- alignment rows are NOT 1:1 with '
     'reads, so presence of rows must never be read as "done". Python twin: '
     'qiita_common.models.AlignmentSampleState. Twin of qiita.mask_sample.';
 

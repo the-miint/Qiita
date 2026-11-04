@@ -806,7 +806,8 @@ async def delete_reference(
     alignment_definition row is kept. Shared features (claimed by another reference)
     are never deleted.
 
-    Ordering is data-plane → orchestrator → Postgres, chosen so the operation
+    Ordering is deprecated alignments' rows → data-plane → orchestrator → Postgres,
+    chosen so the operation
     is *retriable*: every step is idempotent and the `qiita.reference` row — the
     thing a retry keys off — is removed last. The data-plane delete is one
     DuckLake transaction (all-or-nothing), so a failure there leaves DuckLake
@@ -828,8 +829,13 @@ async def delete_reference(
     # The DuckLake rows of deprecated alignments against this reference, before the
     # reference's own data: they are keyed on features that delete removes. Each
     # purge is idempotent, so a retry after a later failure re-runs it harmlessly.
+    try:
+        async with tx() as conn:
+            purged = await mark_deprecated_alignments_purged(conn, reference_idx)
+    except ReferenceDeleteBlocked as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
     alignment_rows_deleted = 0
-    for alignment_idx in await mark_deprecated_alignments_purged(pool, reference_idx):
+    for alignment_idx in purged:
         try:
             alignment_rows_deleted += await delete_alignment_data(
                 alignment_idx=alignment_idx,
@@ -855,7 +861,11 @@ async def delete_reference(
     except _flight.FlightError as exc:
         raise HTTPException(
             status_code=502,
-            detail=f"data plane reference delete failed; nothing removed yet: {exc}",
+            detail=(
+                "data plane reference delete failed; the reference's data was not removed,"
+                " though deprecated alignments' rows against it may already be purged."
+                f" Re-run the delete: {exc}"
+            ),
         ) from exc
 
     # On-disk index artifacts (orchestrator-side; only it can reach

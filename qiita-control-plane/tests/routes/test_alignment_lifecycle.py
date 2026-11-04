@@ -328,9 +328,9 @@ async def test_reactivation_refused_once_rows_were_purged(client, lc):
     assert (await _deprecate(client, lc["alignment_idx"])).status_code == 200
     from qiita_control_plane.actions.reference import mark_deprecated_alignments_purged
 
-    assert await mark_deprecated_alignments_purged(lc["pool"], lc["reference_idx"]) == [
-        lc["alignment_idx"]
-    ]
+    async with lc["pool"].acquire() as conn, conn.transaction():
+        stamped = await mark_deprecated_alignments_purged(conn, lc["reference_idx"])
+    assert stamped == [lc["alignment_idx"]]
     resp = await client.patch(
         URL_ALIGNMENT_DEFINITION_STATUS.format(alignment_idx=lc["alignment_idx"]),
         json={"status": "active"},
@@ -343,12 +343,25 @@ async def test_reactivation_refused_once_rows_were_purged(client, lc):
     assert again.json()["rows_purged_at"] is not None
 
 
-async def test_an_active_alignment_is_not_stamped(client, lc):
-    """Only deprecated alignments are stamped, so one reactivated before reference
-    delete's stamp is left alone (and the delete's re-gate then refuses)."""
-    from qiita_control_plane.actions.reference import mark_deprecated_alignments_purged
+async def test_an_active_alignment_stops_the_stamp_before_any_purge(client, lc):
+    """An alignment reactivated after reference delete's precheck is found active
+    here, under the row lock, and stops the delete before anything is stamped or
+    purged."""
+    from qiita_control_plane.actions.reference import (
+        ReferenceDeleteBlocked,
+        mark_deprecated_alignments_purged,
+    )
 
-    assert await mark_deprecated_alignments_purged(lc["pool"], lc["reference_idx"]) == []
+    with pytest.raises(ReferenceDeleteBlocked, match="active alignment"):
+        async with lc["pool"].acquire() as conn, conn.transaction():
+            await mark_deprecated_alignments_purged(conn, lc["reference_idx"])
+    assert (
+        await lc["pool"].fetchval(
+            "SELECT rows_purged_at FROM qiita.alignment_definition WHERE alignment_idx = $1",
+            lc["alignment_idx"],
+        )
+        is None
+    )
 
 
 # ---------------------------------------------------------------------------

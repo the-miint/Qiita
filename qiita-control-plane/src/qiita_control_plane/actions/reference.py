@@ -18,6 +18,8 @@ from qiita_common.models import (
     ReferenceStatus,
 )
 
+from ..repositories import require_transaction
+
 # Column projection backing every ReferenceResponse. Imported by
 # routes/reference.py too, so the two callers can't drift (they previously
 # kept hand-synced copies).
@@ -390,24 +392,35 @@ async def transition_reference_status(
 
 
 async def mark_deprecated_alignments_purged(
-    conn: asyncpg.Pool | asyncpg.Connection, reference_idx: int
+    conn: asyncpg.Connection, reference_idx: int
 ) -> list[int]:
     """Stamp `rows_purged_at` on the deprecated alignments whose config names this
     reference, and return them sorted. The reference-delete route calls this before
     purging their DuckLake rows, which are keyed on features the delete removes.
 
-    Stamping first is what keeps a purged alignment from being made active again:
-    reactivation refuses a stamped row, and the UPDATE's row lock serializes with
-    the status route's. An alignment reactivated before this runs is not stamped or
-    purged, and the teardown's re-gate then refuses the delete. A stamp left by a
-    delete that failed later stays: some of the rows may already be gone. The
-    alignment_definition rows themselves stay, as the record of what was aligned."""
+    Takes every alignment row against the reference `FOR UPDATE` and raises
+    ReferenceDeleteBlocked if any is active, so an alignment reactivated since the
+    precheck stops the delete here, before anything is purged. The status route takes
+    the same row lock, and refuses to reactivate a stamped row. A stamp left by a
+    delete that failed later stays: some of the rows may already be gone."""
+    require_transaction(conn)
     rows = await conn.fetch(
-        "UPDATE qiita.alignment_definition"
-        "   SET rows_purged_at = COALESCE(rows_purged_at, now())"
-        " WHERE (params->>'reference_idx')::bigint = $1 AND status = $2"
-        " RETURNING alignment_idx",
+        "SELECT alignment_idx, status FROM qiita.alignment_definition"
+        " WHERE (params->>'reference_idx')::bigint = $1"
+        " ORDER BY alignment_idx FOR UPDATE",
         reference_idx,
-        AlignmentDefinitionStatus.DEPRECATED.value,
     )
-    return sorted(r["alignment_idx"] for r in rows)
+    active = sum(r["status"] != AlignmentDefinitionStatus.DEPRECATED.value for r in rows)
+    if active:
+        raise ReferenceDeleteBlocked(
+            reference_idx=reference_idx, in_flight=0, terminal=0, alignment_definitions=active
+        )
+    deprecated = [r["alignment_idx"] for r in rows]
+    if deprecated:
+        await conn.execute(
+            "UPDATE qiita.alignment_definition"
+            "   SET rows_purged_at = COALESCE(rows_purged_at, now())"
+            " WHERE alignment_idx = ANY($1::bigint[])",
+            deprecated,
+        )
+    return deprecated
