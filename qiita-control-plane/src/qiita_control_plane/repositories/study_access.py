@@ -2,11 +2,14 @@
 
 Functions take an asyncpg.Connection or asyncpg.Pool as their first
 positional argument; they never acquire their own connection or
-transaction. They return data, not policy — the access predicate lives
-in qiita_control_plane.auth.study_access and consumes the shapes
+transaction. They return data, not policy — the access predicates live
+in qiita_control_plane.auth.guards and the grant rules in
+qiita_control_plane.auth.study_access_policy, which consume the shapes
 returned here.
 """
 
+from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import NamedTuple
 
 import asyncpg
@@ -91,8 +94,61 @@ async def fetch_caller_study_access_batch(
     return {row["idx"]: _to_access_row(row) for row in rows}
 
 
+async def fetch_caller_study_access_all(
+    conn: asyncpg.Connection | asyncpg.Pool,
+    *,
+    principal_idx: int,
+) -> dict[int, CallerStudyAccessRow]:
+    """Every study the caller owns or holds a qiita.study_access row on.
+
+    A study the caller neither owns nor holds a row on is absent; the caller
+    holds 'public' there by absence. One entry per study even when the caller
+    both owns it and holds a row on it. Each arm of the UNION is served by its
+    own index (`study_owner_idx`, `study_access_principal_idx`).
+    """
+    rows = await conn.fetch(
+        "SELECT s.idx, s.owner_idx, s.default_tier, sa.access_tier"
+        " FROM qiita.study s"
+        " LEFT JOIN qiita.study_access sa"
+        "   ON sa.study_idx = s.idx AND sa.principal_idx = $1"
+        " WHERE s.owner_idx = $1"
+        " UNION"
+        " SELECT s.idx, s.owner_idx, s.default_tier, sa.access_tier"
+        " FROM qiita.study_access sa"
+        " JOIN qiita.study s ON s.idx = sa.study_idx"
+        " WHERE sa.principal_idx = $1",
+        principal_idx,
+    )
+    return {row["idx"]: _to_access_row(row) for row in rows}
+
+
+@dataclass(frozen=True, kw_only=True)
+class CallerMetadataTiers:
+    """The tier a caller holds on each study, for reading metadata values.
+
+    `study_tiers` names the studies where the caller holds more than
+    `default`; every other study is read at `default`.
+    `auth.guards.caller_metadata_tiers` builds it.
+    """
+
+    study_tiers: Mapping[int, Tier]
+    default: Tier
+
+    def tier_on(self, study_idx: int) -> Tier:
+        """The caller's tier on one study."""
+        return self.study_tiers.get(study_idx, self.default)
+
+    def sql_args(self) -> tuple[list[int], list[str], str]:
+        """The three arguments of `qiita.*_metadata_visibility`, in order.
+
+        Tiers bind as text; the SQL casts them to `qiita.tier`.
+        """
+        idxs = list(self.study_tiers)
+        return idxs, [self.study_tiers[i].value for i in idxs], self.default.value
+
+
 def _to_access_row(row: asyncpg.Record) -> CallerStudyAccessRow:
-    """Shared row → CallerStudyAccessRow mapping for the two fetches above, so
+    """Shared row → CallerStudyAccessRow mapping for the fetches above, so
     the NULL-access_tier convention has one definition."""
     return CallerStudyAccessRow(
         owner_idx=row["owner_idx"],

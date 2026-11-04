@@ -1,16 +1,21 @@
-"""qiita user CLI — work-ticket subcommands.
-
-Split out of the former single-file ``cli.user`` module; behavior unchanged.
-"""
+"""qiita user CLI — work-ticket subcommands: submit, status, run, list, redrive
+and logs, each a thin client over the /work-ticket routes."""
 
 import argparse
+import json
+import sys
+import time
 
+import httpx
+from pydantic import ValidationError
 from qiita_common.api_paths import (
     PATH_WORK_TICKET_PREFIX,
 )
 from qiita_common.models import (
+    NON_TERMINAL_WORK_TICKET_STATES,
     ScopeTargetKind,
     WorkTicketCreateRequest,
+    WorkTicketListResponse,
 )
 
 from .. import _common
@@ -82,6 +87,7 @@ def _list_work_tickets(
     prep_sample_idx: int | None,
     action_id: str | None,
     limit: int | None,
+    failure_type: str | None = None,
 ) -> dict:
     """GET /api/v1/work-ticket. Returns the WorkTicketListResponse envelope:
     `tickets` (each ticket plus its current step's compute_target /
@@ -106,6 +112,8 @@ def _list_work_tickets(
         params["action_id"] = action_id
     if limit is not None:
         params["limit"] = str(limit)
+    if failure_type is not None:
+        params["failure_type"] = failure_type
     return _common.call("GET", base_url, token, PATH_WORK_TICKET_PREFIX, params=params)
 
 
@@ -223,3 +231,150 @@ def _handle_ticket_logs(args: argparse.Namespace, parser: argparse.ArgumentParse
         ),
         render=_render_ticket_logs,
     )
+
+
+# `/run` answers these when it refuses this one ticket (gone or not visible to
+# the caller; not in a redrivable state, or a refusal of its own such as a
+# download ticket's). The run records the refusal and goes on to the next ticket.
+# Any other answer stops the run, so an outage is not met with one call per
+# remaining ticket.
+_PER_TICKET_REFUSALS = (404, 409)
+
+
+def _redrive(args: argparse.Namespace, token: str) -> tuple[dict, bool]:
+    """Select, then (with --execute) redrive one at a time. Returns the report
+    and whether every selected ticket was redriven."""
+    listing = WorkTicketListResponse.model_validate(
+        _list_work_tickets(
+            args.base_url,
+            token,
+            state=args.state,
+            active=False,
+            all_tickets=args.all_tickets,
+            sequenced_pool_idx=args.sequenced_pool_idx,
+            prep_sample_idx=args.prep_sample_idx,
+            action_id=args.action_id,
+            limit=args.limit,
+            failure_type=args.failure_type,
+        )
+    )
+    if listing.truncated:
+        raise RuntimeError(
+            f"the selection matches more than the {listing.count} tickets returned;"
+            " narrow it or raise --limit, so the run covers the whole selection"
+        )
+    # The server filters on failure_type; filtering again here keeps a server
+    # that predates the parameter, and so ignores it, from widening the selection.
+    selected = [
+        t
+        for t in listing.tickets
+        if args.failure_type is None or t.failure_type == args.failure_type
+    ]
+    report: dict = {
+        "mode": "execute" if args.execute else "dry-run",
+        "selected": [
+            {
+                "work_ticket_idx": t.work_ticket_idx,
+                "action_id": t.action_id,
+                "action_version": t.action_version,
+                "state": t.state.value,
+                "failure_type": t.failure_type.value if t.failure_type else None,
+                "failure_step_name": t.failure_step_name,
+            }
+            for t in selected
+        ],
+    }
+    if not args.execute:
+        return report, True
+    redriven: list[dict] = []
+    refused: list[dict] = []
+    in_flight: list[int] = []
+    report.update(redriven=redriven, refused=refused, not_attempted=[])
+    for position, ticket in enumerate(selected):
+        if position and args.rate_seconds:
+            time.sleep(args.rate_seconds)
+        try:
+            _wait_for_room(args, token, in_flight)
+        except (httpx.HTTPStatusError, httpx.RequestError) as exc:
+            report["stopped"] = {
+                "work_ticket_idx": ticket.work_ticket_idx,
+                "error": f"reading the redriven tickets' states failed: {exc!r}",
+            }
+            report["not_attempted"] = [t.work_ticket_idx for t in selected[position:]]
+            return report, False
+        try:
+            redriven.append(_run_work_ticket(args.base_url, token, ticket.work_ticket_idx))
+            in_flight.append(ticket.work_ticket_idx)
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code not in _PER_TICKET_REFUSALS:
+                report["stopped"] = {
+                    "work_ticket_idx": ticket.work_ticket_idx,
+                    "status": exc.response.status_code,
+                    "detail": exc.response.text,
+                }
+                report["not_attempted"] = [t.work_ticket_idx for t in selected[position + 1 :]]
+                return report, False
+            refused.append(
+                {
+                    "work_ticket_idx": ticket.work_ticket_idx,
+                    "status": exc.response.status_code,
+                    "detail": exc.response.text,
+                }
+            )
+        except httpx.RequestError as exc:
+            report["stopped"] = {"work_ticket_idx": ticket.work_ticket_idx, "error": repr(exc)}
+            report["not_attempted"] = [t.work_ticket_idx for t in selected[position + 1 :]]
+            return report, False
+    return report, not refused
+
+
+def _wait_for_room(args: argparse.Namespace, token: str, in_flight: list[int]) -> None:
+    """Block until fewer than --max-inflight of the tickets this run redrove are
+    still pending, queued or processing, dropping the finished ones from
+    `in_flight`. A redrive dispatches at once, and what overloads the data
+    plane's edge is how many run together, not how fast they are sent."""
+    while len(in_flight) >= args.max_inflight:
+        time.sleep(args.poll_seconds)
+        in_flight[:] = [
+            idx
+            for idx in in_flight
+            if _get_work_ticket(args.base_url, token, idx)["state"]
+            in NON_TERMINAL_WORK_TICKET_STATES
+        ]
+
+
+def _handle_ticket_redrive(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    """Redrive every ticket a selector picks, as `ticket run` does one: select
+    FAILED (or CANCELLED) tickets with the `ticket list` filters, print them, and
+    with --execute POST /work-ticket/{idx}/run for each in turn, --rate seconds
+    apart and with at most --max-inflight of them unfinished at once. Prints a
+    JSON report, to stdout on a dry run or when every selected ticket was
+    redriven, and to stderr with exit 1 when any was not (refused, or not attempted after the run
+    stopped)."""
+    if args.rate_seconds < 0:
+        parser.error(f"--rate must be >= 0, got {args.rate_seconds}")
+    if args.max_inflight < 1:
+        parser.error(f"--max-inflight must be >= 1, got {args.max_inflight}")
+    if args.poll_seconds <= 0:
+        parser.error(f"--poll-seconds must be > 0, got {args.poll_seconds}")
+    try:
+        token = _common.read_token()
+    except RuntimeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    try:
+        report, complete = _redrive(args, token)
+    except RuntimeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    except httpx.HTTPStatusError as exc:
+        _common.print_http_status_error(exc.response)
+        return 1
+    except httpx.RequestError as exc:
+        _common.print_request_error(exc)
+        return 1
+    except ValidationError as exc:
+        _common.print_validation_error(exc)
+        return 1
+    print(json.dumps(report, indent=2), file=sys.stdout if complete else sys.stderr)
+    return 0 if complete else 1

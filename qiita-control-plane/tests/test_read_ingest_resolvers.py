@@ -55,6 +55,7 @@ from qiita_control_plane.runner import (
 )
 from qiita_control_plane.runner._read_ingest import (
     _barcode_roster_mismatches,
+    _copy_masked_to_fastq,
     _preflight_barcode_roster,
 )
 from qiita_control_plane.testing.db_seeds import (
@@ -280,18 +281,31 @@ def test_workflow_declares_run_map_binding_gate():
 _EXPORT_READ = "qiita_control_plane.runner._do_action_export_read"
 # The zero-read control-split lookup, monkeypatched so these pure-unit tests
 # exercise the routing decision without a DB. The seam's real DB behavior
-# (prep_sample -> biosample -> control marker) is pinned by the DB-bound tests
-# in test_host_filter_resolver.py.
+# (prep_sample -> biosample -> control marker) is pinned by `is_control_sample`'s
+# own DB-bound tests.
 _CONTROL_LOOKUP = "qiita_control_plane.runner._read_ingest._prep_sample_is_expected_empty_control"
-# `_resolve_staged_reads` now takes a pool first; the branches these tests reach
-# either don't touch it or monkeypatch the one helper that would, so a sentinel
-# stands in for it.
+# `_resolve_staged_reads` takes a pool; the branches these tests reach either don't
+# touch it or monkeypatch the helpers that would, so a sentinel stands in for it.
 _FAKE_POOL = object()
 
 
 def _control_lookup(is_control: bool):
     async def _fn(_pool, _prep_sample_idx):
         return is_control
+
+    return _fn
+
+
+# The zero-read empty-ingest lookup, monkeypatched for the same reason; its query is
+# pinned by `fetch_empty_ingest_tickets`' own DB-bound tests.
+_EMPTY_INGEST_LOOKUP = "qiita_control_plane.runner._read_ingest.fetch_empty_ingest_tickets"
+
+
+def _empty_ingest_lookup(work_ticket_idx: int | None):
+    async def _fn(_pool, *, prep_sample_idxs, current_work_ticket_idx):
+        if work_ticket_idx is None:
+            return {}
+        return dict.fromkeys(prep_sample_idxs, work_ticket_idx)
 
     return _fn
 
@@ -354,10 +368,11 @@ def test_resolve_staged_reads_export_fallback_binds_workspace_parquet(tmp_path, 
 
 
 def test_resolve_staged_reads_empty_data_well_fails_must_be_ingested(tmp_path, monkeypatch):
-    """Durable absent, the data plane returns 0 rows, and the well is NOT a control
-    → BAD_INPUT 'must be ingested' — an unexpected-empty data well is a real
-    failure, the no-stored-reads semantics preserved."""
+    """Durable absent, the data plane returns 0 rows, no ingest shows the prep_sample
+    empty (it has none, or its newest did not end that way), and the well is NOT a
+    control → BAD_INPUT 'must be ingested'."""
     monkeypatch.setattr(_EXPORT_READ, lambda _u, _t: {"count": 0, "dest": "x"})
+    monkeypatch.setattr(_EMPTY_INGEST_LOOKUP, _empty_ingest_lookup(None))
     monkeypatch.setattr(_CONTROL_LOOKUP, _control_lookup(False))
     with pytest.raises(BackendFailure) as exc:
         asyncio.run(
@@ -374,6 +389,7 @@ def test_resolve_staged_reads_empty_control_well_is_no_data(tmp_path, monkeypatc
     expected-empty control (blank / NTC) → StepNoData (terminal no_data), NOT a
     failure — an empty control must not land in the pool's samples_failed."""
     monkeypatch.setattr(_EXPORT_READ, lambda _u, _t: {"count": 0, "dest": "x"})
+    monkeypatch.setattr(_EMPTY_INGEST_LOOKUP, _empty_ingest_lookup(None))
     monkeypatch.setattr(_CONTROL_LOOKUP, _control_lookup(True))
     with pytest.raises(StepNoData) as exc:
         asyncio.run(
@@ -383,6 +399,27 @@ def test_resolve_staged_reads_empty_control_well_is_no_data(tmp_path, monkeypatc
         )
     assert "expected-empty control" in exc.value.reason
     assert "7" in exc.value.reason
+
+
+def test_resolve_staged_reads_empty_ingest_is_no_data(tmp_path, monkeypatch):
+    """Durable absent, the data plane returns 0 rows, and an ingest read the sample
+    and found it empty → StepNoData naming that ingest, whether or not the well is a
+    control: the sample was ingested, there is just nothing in it."""
+    monkeypatch.setattr(_EXPORT_READ, lambda _u, _t: {"count": 0, "dest": "x"})
+    monkeypatch.setattr(_EMPTY_INGEST_LOOKUP, _empty_ingest_lookup(12218))
+
+    async def _not_consulted(_pool, _prep_sample_idx):
+        raise AssertionError("the control lookup must not decide an ingested-empty sample")
+
+    monkeypatch.setattr(_CONTROL_LOOKUP, _not_consulted)
+    with pytest.raises(StepNoData) as exc:
+        asyncio.run(
+            _resolve_staged_reads(
+                _FAKE_POOL, {"prep_sample_idx": 7}, tmp_path / "staging", **_staged_kwargs(tmp_path)
+            )
+        )
+    assert "ingest ticket 12218" in exc.value.reason
+    assert "prep_sample 7" in exc.value.reason
 
 
 def test_resolve_staged_reads_export_failure_is_bad_input(tmp_path, monkeypatch):
@@ -549,6 +586,33 @@ def test_resolve_staged_masked_reads_stream_failure_is_bad_input(tmp_path, monke
     assert "data plane" in exc.value.reason
 
 
+def test_masked_fastq_names_each_read_by_its_sequence_idx(tmp_path):
+    """The FASTQ handed to the assembler names each record `@<sequence_idx>`, not
+    the sequencer's `read_id`, so per-read output joins straight back to `read`.
+    Runs the real miint FORMAT FASTQ writer over a relation shaped like the
+    `read_masked` stream."""
+    from qiita_common.duckdb_miint import miint_connect_config, miint_load_sql
+
+    dest = tmp_path / "masked_reads.fastq.gz"
+    with duckdb.connect(":memory:", config=miint_connect_config()) as con:
+        con.execute(miint_load_sql())
+        con.execute(
+            "CREATE TABLE masked AS SELECT * FROM (VALUES "
+            "(3, 11, 9000000001, 'm84/1/ccs', 'ACGT', [40, 40, 40, 40]::UTINYINT[], "
+            " NULL::VARCHAR, NULL::UTINYINT[]),"
+            "(3, 11, 9000000007, 'm84/2/ccs', 'GGCC', [30, 30, 30, 30]::UTINYINT[], "
+            " NULL::VARCHAR, NULL::UTINYINT[])"
+            ") t(mask_idx, prep_sample_idx, sequence_idx, read_id, sequence1, qual1, "
+            "sequence2, qual2)"
+        )
+        count = _copy_masked_to_fastq(con, dest)
+
+    assert count == 2
+    with gzip.open(dest, "rt") as fh:
+        headers = [line for i, line in enumerate(fh.read().splitlines()) if i % 4 == 0]
+    assert sorted(headers) == ["@9000000001", "@9000000007"]
+
+
 def test_workflow_declares_input_checks_optional_too():
     steps = [_step(inputs=["reads"], optional_inputs=["host_rype_path"])]
     assert _workflow_declares_input(steps, "host_rype_path") is True
@@ -567,7 +631,7 @@ def test_workflow_declares_input_checks_optional_too():
 #     tests/test_block_read.py, on the shared rule both boundaries use;
 #   * the signed member/mask scope -> tests/routes/test_read_doget.py;
 #   * the member selector's row semantics (gap excluded, split sub-range exact)
-#     -> the block-read DoGet tests in qiita-data-plane/src/flight_service.rs.
+#     -> the block-read DoGet tests in qiita-data-plane/src/flight_service/query_tests.rs.
 #
 # The empty-block case changed MEANING and is worth stating: the masked block
 # export used to write a schema-correct 0-row parquet so an all-masked-out block

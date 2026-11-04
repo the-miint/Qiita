@@ -822,17 +822,21 @@ class SequencedSampleResponse(ReadCounts):
 
     Carries every caller-visible column from the sequenced_sample subtype
     row plus the controlling supertype prep_sample row, and embeds a dict
-    of every globally-linked metadata value the prep_sample carries,
-    keyed on prep_sample_global_field.internal_name. Purely-local
-    metadata and metadata whose prep_sample_to_study link has been
-    retired are excluded -- both surface as
-    prep_sample_metadata.global_field_idx IS NULL via the existing
-    schema triggers and are filtered out by the read.
+    of the prep_sample's globally-linked metadata values that the caller may
+    read, by their tier on the study that wrote each (the rest are absent),
+    keyed on prep_sample_global_field.internal_name.
+    Purely-local metadata is excluded: its
+    prep_sample_metadata.global_field_idx is NULL. A prep_sample holds one
+    value per global field, shared by every study that reads the field,
+    whichever study wrote it; so retiring the link to the study that wrote a
+    global value does not remove it from this response.
 
     `effective_updated_at` = GREATEST(prep_sample.updated_at,
     sequenced_sample.updated_at) — a single timestamp that bumps on a
-    write to either table, used as the source for the ETag header on
-    the GET and the If-Match contract on a future PATCH.
+    write to either record; a metadata write does not move it.
+    `last_metadata_change_at` is when the metadata values in this response
+    last changed (None when it carries none). The ETag header on the GET, and
+    the If-Match contract on the PATCH, use the later of the two.
     `caller_system_role` carries the caller's principal.system_role
     verbatim from the database.
     """
@@ -869,7 +873,8 @@ class StudyScopedSequencedSampleResponse(SequencedSampleResponse):
     globally-linked global_metadata keyed by internal_name) plus this study's
     purely-local prep_sample metadata, keyed by display_name. local_metadata is
     returned only on a study-scoped response, where the caller is already
-    authorized on the study.
+    authorized on the study. Both maps carry only the values the caller's tier
+    reaches; the rest are absent.
     """
 
     local_metadata: dict[str, MetadataEntry]
@@ -1278,18 +1283,6 @@ class MaskSampleStatusUpdateResponse(BaseModel):
     unchanged: list[int]
     not_found: list[int]
     skipped_pending: list[int] = []
-
-
-class MaskDefinitionDeleteResponse(BaseModel):
-    """Returned by DELETE /api/v1/mask-definition/{mask_idx}.
-
-    `rows_deleted` is the DuckLake `read_mask` row count the data plane removed
-    (0 on an idempotent re-run); the Postgres `mask_definition` row is purged
-    last. Referencing `work_ticket` rows detach automatically via the
-    `ON DELETE SET NULL` FK."""
-
-    mask_idx: Annotated[int, Field(gt=0)]
-    rows_deleted: int
 
 
 class AlignmentDefinitionDeleteResponse(BaseModel):

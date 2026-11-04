@@ -287,6 +287,11 @@ TERMINOLOGY_TERM_VALUE_COLUMN = "value_terminology_term_idx"
 # Shared so that every reader of either field spells it the same way.
 BIOSAMPLE_FIELD_TAXON_ID = "taxon_id"
 BIOSAMPLE_FIELD_HOST_TAXON_ID = "host_taxon_id"
+BIOSAMPLE_FIELD_QIITA_SAMPLE_TYPE = "qiita_sample_type"
+
+# `biosample_global_field.internal_name` values of the two coordinate fields.
+BIOSAMPLE_FIELD_GEOGRAPHIC_LOCATION_LATITUDE = "geographic_location_latitude"
+BIOSAMPLE_FIELD_GEOGRAPHIC_LOCATION_LONGITUDE = "geographic_location_longitude"
 
 # Seeded `biosample_global_field.display_name` values -- NOT the `internal_name`s above.
 BIOSAMPLE_DISPLAY_COLLECTION_DATE = "collection date"
@@ -296,6 +301,7 @@ BIOSAMPLE_DISPLAY_GEOGRAPHIC_LOCATION_LONGITUDE = "geographic location (longitud
 BIOSAMPLE_DISPLAY_DEPTH = "depth"
 BIOSAMPLE_DISPLAY_HOST_TAXON_ID = "host taxon id"
 BIOSAMPLE_DISPLAY_TAXON_ID = "taxon id"
+BIOSAMPLE_DISPLAY_QIITA_SAMPLE_TYPE = "qiita sample type"
 
 # The two `qiita.missing_value_reason` names the host-filter resolver RECOGNISES
 # — i.e. the two that say something definite about whether a host exists.
@@ -432,17 +438,24 @@ class BiosampleResponse(BaseModel):
 
     Mirrors qiita.biosample's caller-visible columns, adds the biosample's
     export_entity_id from qiita.exported_entity, and embeds a dict
-    of every globally-linked metadata value the biosample carries,
-    keyed on biosample_global_field.internal_name. Purely-local
-    metadata (including the owner-biosample-id row) and metadata whose
-    biosample_to_study link has been retired are excluded -- both
-    surface as biosample_metadata.global_field_idx IS NULL via the
-    existing schema triggers and are filtered out by the read.
+    of the biosample's globally-linked metadata values that the caller may
+    read, by their tier on the study that wrote each (the rest are absent),
+    keyed on biosample_global_field.internal_name.
+    Purely-local metadata (including the owner-biosample-id row) is
+    excluded: its biosample_metadata.global_field_idx is NULL. A biosample
+    holds one value per global field, shared by every study that reads the
+    field, whichever study wrote it; so retiring the link to the study that
+    wrote a global value does not remove it from this response.
     Intentionally-missing entries (value_missing_reason_idx populated)
     surface via a MissingReasonRef in the entry's `value` field;
     terminology-term entries (value_terminology_term_idx populated)
     surface via a TerminologyTermRef. `caller_system_role` carries the
     caller's principal.system_role verbatim from the database.
+
+    `last_metadata_change_at` is when the metadata values in this response
+    last changed (None when it carries none). `updated_at` is when the
+    biosample's own record last changed; a metadata write does not move it.
+    The ETag header is the later of the two.
     """
 
     biosample_idx: Annotated[int, Field(gt=0)]
@@ -473,7 +486,8 @@ class StudyScopedBiosampleResponse(BiosampleResponse):
     (core columns, caller_system_role, and the globally-linked global_metadata
     keyed by internal_name) plus this study's purely-local metadata, keyed by
     display_name. local_metadata is returned only on a study-scoped response,
-    where the caller is already authorized on the study.
+    where the caller is already authorized on the study. Both maps carry only
+    the values the caller's tier reaches; the rest are absent.
     """
 
     local_metadata: dict[str, MetadataEntry]

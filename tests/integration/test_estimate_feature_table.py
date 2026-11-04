@@ -38,10 +38,7 @@ from pathlib import Path
 
 import duckdb
 import pytest
-from _runner_helpers import LocalComputeBackendClient
-from conftest import ducklake_connect
 from qiita_common.api_paths import LOOPBACK_HOST
-
 from qiita_control_plane.repositories.alignment_definition import (
     mint_alignment_definition,
 )
@@ -49,7 +46,6 @@ from qiita_control_plane.repositories.block import (
     create_alignment_sample_pending,
     finalize_alignment_sample,
 )
-
 from qiita_control_plane.testing.db_seeds import (
     seed_biosample_with_sequenced_prep_sample,
     seed_user_principal,
@@ -59,11 +55,11 @@ from qiita_control_plane.testing.db_teardown import (
     teardown_entity_graph,
 )
 
+from _runner_helpers import LocalComputeBackendClient
+from conftest import ducklake_connect
+
 _YAML_PATH = (
-    Path(__file__).parent.parent.parent
-    / "workflows"
-    / "estimate-feature-table"
-    / "1.0.0.yaml"
+    Path(__file__).parent.parent.parent / "workflows" / "estimate-feature-table" / "1.0.0.yaml"
 )
 
 # Genome A: 10 kb, covered 0.6% + 0.6% across the two samples in EXTENDING regions
@@ -258,7 +254,6 @@ def _fake_alignment_stream(data_plane, *, alignment_idx, prep_sample_idx):
     from action_context) and streams via the real `open_doget_stream`. Reads go
     through the exclusion-aware view, matching what routes/alignment.py signs."""
     from qiita_compute_orchestrator.data_plane_client import open_doget_stream
-
     from qiita_control_plane.auth.tickets import sign_ticket
 
     @asynccontextmanager
@@ -288,7 +283,6 @@ def _fake_lengths_stream(data_plane):
     """Drop-in `open_reference_sequences_stream` that signs a whole-reference
     `reference_sequences` DoGet ticket directly with the fixture DP secret."""
     from qiita_compute_orchestrator.data_plane_client import open_doget_stream
-
     from qiita_control_plane.auth.tickets import sign_ticket
 
     @asynccontextmanager
@@ -328,7 +322,6 @@ async def test_estimate_feature_table_end_to_end(
     the emitted `ogu_table.parquet` carries genome A (pooled coverage) for both
     samples and NOT genome B (below-threshold)."""
     from qiita_compute_orchestrator.jobs import estimate_feature_table
-
     from qiita_control_plane.runner import run_workflow
 
     action_id, action_version = synced_estimate_feature_table_action
@@ -386,9 +379,7 @@ async def test_estimate_feature_table_end_to_end(
 
     # The resolver staged the genome map into the ticket workspace (proves the
     # resolver->job handoff ran).
-    assert (
-        workspace_root / str(work_ticket_idx) / "feature_genome_map.parquet"
-    ).exists()
+    assert (workspace_root / str(work_ticket_idx) / "feature_genome_map.parquet").exists()
 
     # The single job output — not registered into DuckLake (compute-on-demand), so
     # it stays in the workspace; locate it robustly.

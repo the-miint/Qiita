@@ -40,10 +40,7 @@ import pytest
 from _runner_helpers import LocalComputeBackendClient
 
 _LOCAL_REFERENCE_ADD_YAML_PATH = (
-    Path(__file__).parent.parent.parent
-    / "workflows"
-    / "local-reference-add"
-    / "1.0.0.yaml"
+    Path(__file__).parent.parent.parent / "workflows" / "local-reference-add" / "1.0.0.yaml"
 )
 
 
@@ -92,15 +89,11 @@ async def smoke_reference(postgres_pool, human_admin_session):
         human_admin_session["principal_idx"],
     )
     yield idx
-    await postgres_pool.execute(
-        "DELETE FROM qiita.work_ticket WHERE reference_idx = $1", idx
-    )
+    await postgres_pool.execute("DELETE FROM qiita.work_ticket WHERE reference_idx = $1", idx)
     await postgres_pool.execute(
         "DELETE FROM qiita.reference_membership WHERE reference_idx = $1", idx
     )
-    await postgres_pool.execute(
-        "DELETE FROM qiita.reference WHERE reference_idx = $1", idx
-    )
+    await postgres_pool.execute("DELETE FROM qiita.reference WHERE reference_idx = $1", idx)
 
 
 async def test_local_reference_add_workflow_end_to_end(
@@ -161,9 +154,7 @@ async def test_local_reference_add_workflow_end_to_end(
         register_calls.append((staging_dir, dict(files)))
         return [f"{staging_dir}/{name}" for name in files]
 
-    monkeypatch.setitem(
-        _lib.LIBRARY, LibraryPrimitive.REGISTER_FILES, _stub_register_files
-    )
+    monkeypatch.setitem(_lib.LIBRARY, LibraryPrimitive.REGISTER_FILES, _stub_register_files)
 
     # Stub the post-load exclusion sync too (real path signs a DoAction to a
     # running data plane). Capturing the call proves the hook fires on the local
@@ -225,9 +216,7 @@ async def test_local_reference_add_workflow_end_to_end(
     _staging_dir, files = register_calls[0]
     assert files.get("reference_sequences.parquet") == "reference_sequences"
     assert "reference_membership.parquet" in files
-    chunk_parts = [
-        name for name in files if name.startswith("reference_sequence_chunks/")
-    ]
+    chunk_parts = [name for name in files if name.startswith("reference_sequence_chunks/")]
     assert chunk_parts, "expected reference_sequence_chunks subdir parts"
     for name in chunk_parts:
         assert files[name] == "reference_sequence_chunks"
@@ -241,7 +230,5 @@ async def test_local_reference_add_workflow_end_to_end(
     workspace = workspace_root / str(work_ticket_idx)
     fasta_chunks = workspace / "stage_local_fasta" / "attempt-0" / "fasta_chunks"
     assert fasta_chunks.is_dir()
-    assert sorted(p.name for p in fasta_chunks.glob("part_*.parquet")) == [
-        "part_00000.parquet"
-    ]
+    assert sorted(p.name for p in fasta_chunks.glob("part_*.parquet")) == ["part_00000.parquet"]
     assert (workspace / "hash_sequences" / "attempt-0" / "manifest.parquet").exists()

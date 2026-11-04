@@ -44,3 +44,18 @@ async def test_lifespan_configures_logging_and_narrates_boot(monkeypatch, caplog
     # The deploy check greps `INFO <dotted.logger.name>`; only a configured root logger
     # emits that shape, which is what makes it fail on a CO still carrying the bug.
     assert boot[0].name == "qiita_compute_orchestrator.main"
+
+
+async def test_lifespan_enables_faulthandler_once(monkeypatch):
+    """A native crash in the orchestrator process leaves a Python stack in the journal."""
+    from qiita_compute_orchestrator import main as co_main
+
+    calls = []
+    monkeypatch.setattr(co_main, "configure_logging", lambda level=None: "INFO")
+    monkeypatch.setattr(co_main, "install_authorization_scrub", lambda *a, **k: None)
+    monkeypatch.setattr(co_main.faulthandler, "enable", lambda *a, **k: calls.append(1))
+
+    async with co_main.lifespan(FastAPI()):
+        pass
+
+    assert calls == [1]

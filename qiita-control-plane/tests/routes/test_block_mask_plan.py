@@ -16,7 +16,7 @@ import secrets
 
 import pytest
 import pytest_asyncio
-from qiita_common.api_paths import URL_SEQUENCED_POOL_BLOCK_MASK_PLAN
+from qiita_common.api_paths import URL_MASK_DEFINITION_STATUS, URL_SEQUENCED_POOL_BLOCK_MASK_PLAN
 from qiita_common.models import HOST_FILTER_INDEX_TYPE_RYPE, MISSING_REASON_NOT_APPLICABLE
 
 from qiita_control_plane import block_planner
@@ -313,8 +313,8 @@ async def test_block_mask_plan_host_ref_without_force_422(ctx, planned):
 
 async def test_block_mask_plan_resubmit_over_completed_409(ctx, planned):
     """Re-planning a pool whose samples are already COMPLETED for the resolved
-    mask is a 409 (mirrors the sequenced_pool COMPLETED-resubmit rule) — the
-    operator DELETEs the mask or passes only_missing=true. only_missing then skips
+    mask is a 409 (mirrors the sequenced_pool COMPLETED-resubmit rule); a resume
+    passes only_missing=true. only_missing then skips
     the completed samples and returns 202 with nothing new planned."""
     await _seed_block_action(planned["db"])
     first = await ctx["wet"].post(_url(planned), json={})
@@ -329,11 +329,30 @@ async def test_block_mask_plan_resubmit_over_completed_409(ctx, planned):
     assert resp.status_code == 409, resp.text
     conflicting = resp.json()["detail"]["conflicting_prep_sample_idxs"]
     assert set(conflicting) == set(planned["prep_samples"])
+    assert resp.json()["detail"]["mask_idxs"] == [mask_idx]
+    assert URL_MASK_DEFINITION_STATUS in resp.json()["detail"]["reason"]
 
     ok = await ctx["wet"].post(_url(planned), json={"only_missing": True})
     assert ok.status_code == 202, ok.text
     assert ok.json()["samples_planned"] == 0
     assert ok.json()["blocks_created"] == 0
+
+
+async def test_block_mask_plan_prep_sample_gaining_reads_mid_plan_409(ctx, planned, monkeypatch):
+    """A prep_sample whose range landed while the plan ran rolls the plan back; the
+    operator is told to plan again rather than handed an unmapped 500."""
+    await _seed_block_action(planned["db"])
+    gained = planned["prep_samples"][0]
+
+    async def _raise(*_args, **_kwargs):
+        raise block_planner.BlockPlanSampleGainedReads(
+            prep_sample_idx=gained, sequenced_pool_idx=planned["pool_idx"]
+        )
+
+    monkeypatch.setattr(block_planner, "plan_and_submit_blocks", _raise)
+    resp = await ctx["wet"].post(_url(planned), json={})
+    assert resp.status_code == 409, resp.text
+    assert "plan the pool again" in resp.json()["detail"]
 
 
 async def test_block_mask_plan_missing_action_503(ctx, planned):

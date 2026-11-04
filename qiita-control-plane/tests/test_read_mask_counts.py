@@ -77,10 +77,14 @@ def _rust_const(name: str) -> str:
     from pathlib import Path
 
     src = (
-        Path(__file__).resolve().parents[2] / "qiita-data-plane" / "src" / "flight_service.rs"
+        Path(__file__).resolve().parents[2]
+        / "qiita-data-plane"
+        / "src"
+        / "flight_service"
+        / "export.rs"
     ).read_text()
     m = re.search(rf'^const {name}: &str = "(.*)";$', src, flags=re.MULTILINE)
-    assert m, f"{name} not found in flight_service.rs"
+    assert m, f"{name} not found in flight_service/export.rs"
     return m.group(1)
 
 

@@ -101,8 +101,8 @@ steps:
     # a future per-sample persistence consumer.
     outputs: [reads, raw_read_count]
     baseline_resources:
-      cpu: 2
-      mem_gb: 8
+      cpu: 8
+      mem_gb: 13
       walltime: PT30M
 
   # fastqc-equivalent QC summary on the RAW reads (the fastq output, before qc

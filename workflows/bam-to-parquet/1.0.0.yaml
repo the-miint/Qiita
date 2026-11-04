@@ -6,7 +6,7 @@ target_kind: prep_sample
 target_processing_kinds: [sequenced]
 
 description: >
-  Load a single sample's BAM (or SAM/CRAM) into the DuckLake `read` table — the
+  Load a single prep_sample's BAM (or SAM/CRAM) into the DuckLake `read` table — the
   BAM analogue of fastq-to-parquet. It reads the file with miint's
   `read_sequences_sam`, keeps only the read payload (read_id, sequence, quality),
   mints a contiguous sequence_idx range from the control plane
@@ -81,19 +81,25 @@ steps:
     # `read_staging_dir` is the workspace holding the `read/` parts directory, which
     # the register-files step below loads into the DuckLake `read` table.
     outputs: [read_staging_dir]
-    # Memory does NOT scale with the sample. The job writes the reads as bounded
+    # Memory does NOT scale with the read set. The job writes the reads as bounded
     # monotone parts (read/part_*.parquet) instead of one globally sorted file, so
     # the only blocking operator is a per-part ORDER BY over ~1 GiB of payload. A
-    # 2M-read HiFi sample and a 10k-read control therefore need the same envelope;
+    # 2M-read HiFi prep_sample and a 10k-read control therefore need the same envelope;
     # what scales is WALLTIME, which is why that is the axis with headroom.
     #
-    # (The earlier single-file sorted COPY was tens of GB for a HiFi sample and
-    # OOM-killed 24 of 26 samples on the first real PacBio run. Batching removes the
+    # (The earlier single-file sorted COPY was tens of GB for a HiFi prep_sample and
+    # OOM-killed 24 of 26 prep_samples on the first real PacBio run. Batching removes the
     # cost rather than paying for it with an allocation.)
+    #
+    # The walltime carries the at-rest zstd level's write cost: ~102 s per GB of
+    # logical read data at this step's 2 threads, ~1.7 h on a 60 GB HiFi read set
+    # (synthetic 10 kb reads written in this job's sorted shape, DuckDB 1.5.5, a shared
+    # 32-core dev box). No real prep_sample's runtime at either level has been measured.
+    # cpu stays 2: at 4, the action ceiling, the same measurement falls only to ~76 s.
     baseline_resources:
       cpu: 2
       mem_gb: 12
-      walltime: PT4H
+      walltime: PT6H
 
   # Load the full reads into the DuckLake `read` table (register-files maps a
   # top-level subdir of part_*.parquet to table = directory name — the multi-file
@@ -107,7 +113,7 @@ steps:
 # DuckDB limit and (b) reuses a minted-but-unwritten sequence_range on retry —
 # before both, an escalated attempt re-OOM'd at the same in-process limit, or died
 # on the one-shot mint. Memory headroom is modest because peak memory is bounded by
-# the part budget; the walltime headroom is the one that matters for a long sample.
+# the part budget; the walltime headroom is the one that matters for a long read set.
 action_ceiling:
   cpu: 4
   mem_gb: 32

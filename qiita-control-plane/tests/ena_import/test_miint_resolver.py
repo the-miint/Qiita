@@ -6,6 +6,7 @@ fully-qualified name; the attribute query runs its own SQL on plain DuckDB behin
 `read_ena_attributes` stand-in. Fixtures under `fixtures/` are real rows from public
 study PRJNA48739 and BioSample SAMN45806981."""
 
+import asyncio
 import json
 from contextlib import contextmanager
 from pathlib import Path
@@ -13,10 +14,13 @@ from pathlib import Path
 import duckdb
 import pytest
 from pydantic import ValidationError
+from qiita_common.ena_accession import InvalidEnaAccessionError
 from qiita_common.models.ena import EnaRunRecord, EnaSampleAttributes, EnaStatus, EnaStudyHeader
 
 from qiita_control_plane.ena_import import miint_resolver
 from qiita_control_plane.ena_import.resolver import EnaAccessionNotFoundError
+
+from .conftest import _http_error
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -423,3 +427,198 @@ def test_resolver_binds_the_staged_helper_not_the_client_installer():
 
     assert miint_resolver.connect_with_miint_staged is miint_module.connect_with_miint_staged
     assert not hasattr(miint_resolver, "connect_with_miint")
+
+
+def test_resolve_listed_runs_makes_one_seam_call_with_the_list(monkeypatch):
+    from qiita_control_plane.ena_import.miint_resolver import MiintEnaResolver
+
+    columns, rows = _load_fixture("ena_runs.json")
+    calls = []
+    monkeypatch.setattr(_QUERY_RUNS, lambda accession: calls.append(accession) or (columns, rows))
+
+    runs = MiintEnaResolver().resolve_runs(["SRR096342", "SRR096343"])
+
+    assert calls == [["SRR096342", "SRR096343"]]
+    assert_prjna48739_runs(runs)
+
+
+def test_resolve_listed_runs_returns_a_partial_result_without_raising(monkeypatch):
+    from qiita_control_plane.ena_import.miint_resolver import MiintEnaResolver
+
+    columns, rows = _load_fixture("ena_runs.json")
+    monkeypatch.setattr(_QUERY_RUNS, lambda accession: (columns, rows[:1]))
+
+    runs = MiintEnaResolver().resolve_runs(["SRR096342", "SRR000000"])
+
+    assert [r.run_accession for r in runs] == ["SRR096342"]
+
+
+def test_resolve_listed_runs_zero_rows_is_not_found(monkeypatch):
+    from qiita_control_plane.ena_import.miint_resolver import MiintEnaResolver
+
+    monkeypatch.setattr(_QUERY_RUNS, lambda accession: (["run_accession"], []))
+
+    with pytest.raises(EnaAccessionNotFoundError, match="SRR000000"):
+        MiintEnaResolver().resolve_runs(["SRR000000"])
+
+
+@pytest.mark.parametrize("bad", ["PRJNA48739", "SAMN00199006", "nonsense"])
+def test_resolve_listed_runs_rejects_a_non_run_accession(monkeypatch, bad):
+    from qiita_common.ena_accession import InvalidEnaAccessionError
+
+    from qiita_control_plane.ena_import.miint_resolver import MiintEnaResolver
+
+    monkeypatch.setattr(_QUERY_RUNS, lambda accession: pytest.fail("must not query"))
+
+    with pytest.raises(InvalidEnaAccessionError):
+        MiintEnaResolver().resolve_runs(["SRR096342", bad])
+
+
+def test_query_ena_runs_binds_a_list_as_given(monkeypatch):
+    fake = _FakeCapturingConnection()
+    monkeypatch.setattr(miint_resolver, "connect_with_miint_staged", lambda: fake)
+
+    miint_resolver._query_ena_runs(["SRR1", "SRR2"])
+
+    assert fake.captured_params["accession"] == ["SRR1", "SRR2"]
+
+
+def test_resolve_sample_attributes_for_samples_makes_one_seam_call_with_the_list(monkeypatch):
+    from qiita_control_plane.ena_import.miint_resolver import MiintEnaResolver
+
+    calls = []
+    monkeypatch.setattr(
+        _QUERY_ATTRS, lambda accession: calls.append(accession) or [("SAMN1", {"tag": ["x"]})]
+    )
+
+    attrs = MiintEnaResolver().resolve_sample_attributes_for_samples(["SAMN1", "SAMEA2"])
+
+    assert calls == [["SAMN1", "SAMEA2"]]
+    assert [(a.sample_accession, a.attributes) for a in attrs] == [("SAMN1", {"tag": ["x"]})]
+
+
+def test_resolve_sample_attributes_for_samples_rejects_a_non_sample_accession(monkeypatch):
+    from qiita_common.ena_accession import InvalidEnaAccessionError
+
+    from qiita_control_plane.ena_import.miint_resolver import MiintEnaResolver
+
+    monkeypatch.setattr(_QUERY_ATTRS, lambda accession: pytest.fail("must not query"))
+
+    with pytest.raises(InvalidEnaAccessionError):
+        MiintEnaResolver().resolve_sample_attributes_for_samples(["SAMN1", "SRR1"])
+
+
+# ---------------------------------------------------------------------------
+# call_with_ena_retry
+# ---------------------------------------------------------------------------
+
+
+class _Flaky:
+    """Raises each exception in `failures` in turn, then returns `"ok"`."""
+
+    __name__ = "flaky"
+
+    def __init__(self, *failures: Exception):
+        self.failures = list(failures)
+        self.calls = 0
+
+    def __call__(self, arg):
+        self.calls += 1
+        if self.failures:
+            raise self.failures.pop(0)
+        return "ok"
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        _http_error(500),
+        _http_error(503),
+        _http_error(408),
+        _http_error(429),
+        _http_error(0),
+        duckdb.IOException("read_ena failed: Connection reset by peer (URL: https://ena)"),
+        duckdb.IOException("read_ena failed: Connection refused (URL: https://ena)"),
+    ],
+)
+async def test_call_with_ena_retry_recovers_from_an_outage(no_backoff, error):
+    flaky = _Flaky(error)
+
+    assert await miint_resolver.call_with_ena_retry(flaky, "PRJNA1") == "ok"
+    assert flaky.calls == 2
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        _http_error(400),
+        _http_error(401),
+        _http_error(404),
+        duckdb.IOException("read_ena: could not resolve 'SRR1' to a study accession"),
+        EnaAccessionNotFoundError("none"),
+        InvalidEnaAccessionError("bad"),
+    ],
+)
+async def test_call_with_ena_retry_raises_anything_else_on_the_first_attempt(no_backoff, error):
+    flaky = _Flaky(error)
+
+    with pytest.raises(type(error)) as raised:
+        await miint_resolver.call_with_ena_retry(flaky, "PRJNA1")
+
+    assert raised.value is error
+    assert flaky.calls == 1
+
+
+async def test_call_with_ena_retry_gives_up_at_the_deadline_naming_the_outage(
+    no_backoff, monkeypatch
+):
+    deadline = miint_resolver._RESOLVE_DEADLINE_S
+    ticks = iter([0, 0, deadline])
+    monkeypatch.setattr(miint_resolver, "monotonic", lambda: next(ticks))
+    last = _http_error(503)
+    flaky = _Flaky(_http_error(500), last)
+
+    with pytest.raises(RuntimeError, match=r"ENA .*unavailable.*HTTP 503") as raised:
+        await miint_resolver.call_with_ena_retry(flaky, "PRJNA1")
+
+    assert flaky.calls == 2
+    assert raised.value.__cause__ is last
+
+
+async def test_call_with_ena_retry_gives_up_naming_a_connection_failure(no_backoff, monkeypatch):
+    ticks = iter([0, miint_resolver._RESOLVE_DEADLINE_S])
+    monkeypatch.setattr(miint_resolver, "monotonic", lambda: next(ticks))
+    flaky = _Flaky(*[duckdb.IOException("read_ena failed: Connection refused")] * 2)
+
+    with pytest.raises(RuntimeError, match=r"ENA unavailable: a connection failure") as raised:
+        await miint_resolver.call_with_ena_retry(flaky, "PRJNA1")
+
+    assert "HTTP" not in str(raised.value)
+
+
+async def test_call_with_ena_retry_backs_off_exponentially_to_the_cap(monkeypatch):
+    sleeps = []
+
+    async def record(delay):
+        sleeps.append(delay)
+
+    monkeypatch.setattr(miint_resolver.asyncio, "sleep", record)
+    flaky = _Flaky(*[_http_error(503)] * 6)
+
+    assert await miint_resolver.call_with_ena_retry(flaky, "PRJNA1") == "ok"
+    assert sleeps == [30, 60, 120, 240, 300, 300]
+
+
+async def test_call_with_ena_retry_is_cancellable_while_backing_off(monkeypatch):
+    monkeypatch.setattr(miint_resolver, "_RESOLVE_BACKOFF_BASE_S", 3600)
+    flaky = _Flaky(*[_http_error(500)] * 5)
+    task = asyncio.create_task(miint_resolver.call_with_ena_retry(flaky, "PRJNA1"))
+    while flaky.calls == 0:
+        await asyncio.sleep(0.01)
+    await asyncio.sleep(0.05)
+
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert flaky.calls == 1

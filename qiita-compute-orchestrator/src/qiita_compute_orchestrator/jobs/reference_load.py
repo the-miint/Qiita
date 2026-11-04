@@ -63,7 +63,7 @@ from qiita_common.parquet import validate_parquet_path
 from qiita_common.taxonomy import RANK_COLUMNS, RANK_PREFIXES, quote_rank
 
 from ..miint import (
-    PARQUET_OPTS,
+    PARQUET_OPTS_AT_REST,
     apply_duckdb_settings,
     duckdb_tmp_dir,
     open_miint_conn,
@@ -305,7 +305,7 @@ def _write_reference_membership(
         f"  SELECT CAST({reference_idx} AS BIGINT) AS reference_idx, feature_idx"
         "  FROM feature_map"
         "  ORDER BY feature_idx"
-        f") TO '{out}' ({PARQUET_OPTS})"
+        f") TO '{out}' ({PARQUET_OPTS_AT_REST})"
     )
 
 
@@ -414,7 +414,7 @@ def _write_annotation(
         "  FROM annotation_manifest am "
         + natural_key_join.format(kind="")
         + "  ORDER BY map.parent_feature_idx, am.position, am.stop_position"
-        f") TO '{out}' ({PARQUET_OPTS})"
+        f") TO '{out}' ({PARQUET_OPTS_AT_REST})"
     )
     conn.execute("DROP TABLE annotation_manifest")
     conn.execute("DROP TABLE annotation_map")
@@ -576,7 +576,7 @@ def _write_taxonomy(
         "    FROM parsed_taxonomy GROUP BY feature_idx"
         "  ) p ON m.feature_idx = p.feature_idx"
         "  ORDER BY m.feature_idx"
-        f") TO '{out}' ({PARQUET_OPTS})"
+        f") TO '{out}' ({PARQUET_OPTS_AT_REST})"
     )
     conn.execute("DROP TABLE parsed_taxonomy")
 
@@ -611,7 +611,7 @@ def _write_phylogeny(
         "  FROM tree_nodes t"
         "  LEFT JOIN id_map m ON t.is_tip AND t.name = m.read_id"
         "  ORDER BY t.node_index"
-        f") TO '{out}' ({PARQUET_OPTS})",
+        f") TO '{out}' ({PARQUET_OPTS_AT_REST})",
     )
     conn.execute("DROP TABLE tree_nodes")
 
@@ -634,6 +634,6 @@ def _write_placements(
         "  FROM read_jplace(?) j"
         "  INNER JOIN id_map m ON j.fragment = m.read_id"
         "  ORDER BY m.feature_idx, j.edge_num"
-        f") TO '{out}' ({PARQUET_OPTS})",
+        f") TO '{out}' ({PARQUET_OPTS_AT_REST})",
         [str(jplace_path)],
     )

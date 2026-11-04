@@ -4,8 +4,8 @@ Step 1 of the bcl-convert workflow: produce the sample sheet and read the BCL
 run folder's RunInfo.xml to derive the Illumina instrument model, writing the
 model to a sidecar file for the bcl_convert step's lookup baseline_resources
 population. Metagenomic runs fetch the pool's run_preflight_blob from the CP and
-rehydrate it to a per-sample CSV; amplicon runs build a no-index dummy sheet from
-RunInfo.xml (``amplicon`` input), sending every read to Undetermined so the Golay
+rehydrate it to a per-sample CSV; amplicon runs build a dummy sheet from
+RunInfo.xml (``amplicon`` input), sending every decodable read to Undetermined so the Golay
 barcode is emitted for golay_demux.
 
 The downstream bcl_convert step (container:) consumes:
@@ -58,8 +58,8 @@ class Inputs(BaseModel):
     ``work_ticket_idx`` is always available.
 
     ``amplicon`` selects the sample sheet: a per-sample sheet rehydrated from the
-    pool's preflight (the default, metagenomic), or a no-index dummy sheet built
-    from RunInfo.xml so every read lands in Undetermined and the in-index Golay
+    pool's preflight (the default, metagenomic), or a dummy sheet built
+    from RunInfo.xml so every decodable read lands in Undetermined and the in-index Golay
     barcode is emitted for golay_demux to demultiplex on."""
 
     bcl_input_dir: Path
@@ -106,7 +106,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
 
     if inputs.amplicon:
         # No per-sample indices for EMP 16S: a dummy sheet from RunInfo.xml sends
-        # every read to Undetermined and emits the Golay index as a FASTQ.
+        # every decodable read to Undetermined and emits the Golay index as a FASTQ.
         reads = read_run_reads(inputs.bcl_input_dir)
         sample_id = f"{inputs.bcl_input_dir.name}_SMPL1"
         samplesheet.write_text(

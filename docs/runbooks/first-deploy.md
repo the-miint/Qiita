@@ -196,7 +196,7 @@ id qiita
 Provided by your DBA:
 
 - `qiita_miint` database with `qiita_miint_rw` role (used by the control plane)
-- `qiita_miint_lake` database with `qiita_miint_lake_rw` role (used by the data plane as DuckLake catalog)
+- `qiita_miint_lake` database with `qiita_miint_lake_rw` role (used by the data plane as DuckLake catalog), granted `pg_read_all_stats` (`GRANT pg_read_all_stats TO qiita_miint_lake_rw;`, as superuser) for `verify-deploy`'s `catalog-connections` row ([`data-plane-scaling.md`](data-plane-scaling.md#catalog-connections))
 - Network reachability from the deploy host to the Postgres host
 - **Postgres extensions enabled** in `qiita_miint`: `citext` (required by the auth migrations) and `btree_gist` (the `assembly_membership` one-genome-per-subject EXCLUDE constraint). Created by the DBA as superuser: `sudo -u postgres psql -d qiita_miint -c "CREATE EXTENSION IF NOT EXISTS citext; CREATE EXTENSION IF NOT EXISTS btree_gist;"`. Installing them here means no migration has to, which is why this step exists at all — though `btree_gist`'s migration will self-install it if you skip this (it is TRUSTED, and the `qiita_miint_rw` role holds `CREATE` on the database; that migration records the measurement). Doing it here keeps the deploy working if those grants are ever tightened. Keep this list current by grepping `qiita-control-plane/db/migrations/` for `CREATE EXTENSION` before each deploy.
 - **NTP** running on both the deploy host and the PG host. A `cli_login_code` CHECK constraint (`expires_at > created_at`) compares a Python-computed `expires_at` against a PG-computed `created_at`; clock drift larger than `CLI_LOGIN_CODE_TTL_SECONDS` (default 30s) violates it and produces a 500 on `/auth/handoff`. Standard `chronyd` setup on both hosts; verify with `chronyc tracking` and `timedatectl`.
@@ -223,8 +223,8 @@ Qiita's filesystem paths derive from three **base roots** the operator
 sets once per component env file; the services compute fixed subdirs from
 them (no per-leaf env var). The data plane writes Parquet under a durable
 mount (`PATH_PERSISTENT/ducklake`); SLURM upload staging lives under a
-scratch mount (`PATH_SCRATCH/staging`), ideally on the same filesystem as
-the lake for the atomic-rename fast path; the orchestrator stages
+scratch mount (`PATH_SCRATCH/staging`), a separate filesystem from the
+lake's ([storage](../architecture/storage.md)); the orchestrator stages
 per-ticket workspaces under the same scratch mount (`PATH_SCRATCH/ticket`),
 visible from every compute node (SLURM uses it as the job's
 `current_working_directory`).
@@ -233,6 +233,7 @@ visible from every compute node (SLURM uses it as the job's
 |---|---|---|---|---|---|
 | `PATH_PERSISTENT` | `…/ducklake` | `qiita-data` | `qiita-data` | `0750` | DuckLake data path. DP-only. |
 | `PATH_SCRATCH` | `…/staging` | `qiita-data` | `qiita-pipeline` | `2770` | DoPut upload staging. Setgid forces `qiita-pipeline` group on inherited files. |
+| `PATH_SCRATCH` | `…/duckdb-spill` | `qiita-data` | `qiita-data` | `0700` | DuckDB spill root. Each pooled connection creates a directory of its own under it; a stopped data plane leaves its directories, and the next boot on the same host removes them. DP-only. |
 | `PATH_SCRATCH` | `…/ticket` | `qiita-orch` | `qiita-pipeline` | `2770` | Per-ticket workspace trees (`<work_ticket_idx>/<step>/attempt-N/`). `qiita-orch` writes per-step subdirs as owner; `qiita-api` (CP runner) and `qiita-job` (SLURM job outputs) write via the `qiita-pipeline` group. Setgid carries the group to inherited files. |
 | `PATH_DERIVED` | `…/images` | `qiita-orch` | `qiita-orch` | `0755` | Apptainer SIF tier (SLURM container steps). Created at the bcl-convert deploy, not here — see `DEPLOY_CHECKLIST.md`. |
 | `PATH_DERIVED` | `…/references` | `qiita-orch` | `qiita-pipeline` | `2770` | Host-reference index tier (rype `.ryxdi` + minimap2 `.mmi`, built by `host-reference-add`). The index build *and* its consumer (`host_filter`) both run as `qiita-job`, which `mkdir`s `{idx}/{rype,minimap2}/` at runtime — so the leaf must be group-writable by `qiita-job`, **not** owned `qiita-orch:qiita-orch` like `…/images` (whose SIFs `qiita-orch` builds). Setgid + `qiita-pipeline` group-write let `qiita-job` create the subdirs and read them back. The base root is `root:root 0755`, so a missing leaf fails the first `host-reference-add` build with Permission Denied at `mkdir`. Created at the first host-reference deploy. |
@@ -264,13 +265,14 @@ doesn't strand the reference:
 Verification:
 ```bash
 # [either]
-stat -c '%n  owner=%U  group=%G  mode=%a  device=%d' <persistent>/ducklake <scratch>/staging <scratch>/ticket
+stat -c '%n  owner=%U  group=%G  mode=%a  device=%d' <persistent>/ducklake <scratch>/staging <scratch>/duckdb-spill <scratch>/ticket
 ```
 
-Watch the **device numbers**: if `<persistent>/ducklake` and
-`<scratch>/staging` are on different volumes, the DP's rename from staging
-to final falls back to copy+delete. Works correctly, just slower. Flag to
-infra if you want the fast path; not blocking otherwise.
+The **device numbers** of `<persistent>/ducklake` and `<scratch>/ticket` /
+`<scratch>/staging` should differ: they are meant to be separate filesystems
+([storage](../architecture/storage.md), "`PATH_SCRATCH` and `PATH_PERSISTENT` are
+separate filesystems"). Matching numbers mean both are on one mount; raise it with
+infra before going on.
 
 ### 0.4 nginx + TLS + DNS
 
@@ -322,6 +324,8 @@ AuthRocket's URL validator on first realm setup:
 # [admin]
 sudo mv /etc/nginx/conf.d/default.conf /etc/nginx/conf.d/default.conf.disabled
 ```
+
+nginx also listens on `127.0.0.1:50050`, the data-plane loopback listener.
 
 ### 0.5 Build + ops tooling
 
@@ -449,8 +453,9 @@ sudo QIITA_HOSTNAME=<fqdn> /home/qiita/qiita-miint/deploy/local-deploy.sh
 Expected: build runs to completion; rsyncs land in `/opt/qiita/`; `uv
 sync` populates each Python venv under `/opt/qiita/<service>/.venv/`;
 data-plane binary is installed at `/opt/qiita/data-plane/qiita-data-plane`;
-systemd units land in `/etc/systemd/system/`; nginx config installs at
-`/etc/nginx/conf.d/qiita.conf` with `__QIITA_HOSTNAME__` substituted.
+systemd units land in `/etc/systemd/system/`; nginx config is rendered to
+`/etc/nginx/conf.d/qiita.conf` with every `__QIITA_…__` placeholder (the
+hostname, the loopback listener port, the data-plane upstream) filled in.
 
 Verify the venvs use a world-traversable Python (not `/root/.local/`):
 ```bash
@@ -672,9 +677,10 @@ Failure modes:
 - **`curl: (60) SSL certificate problem`** — cert/key mismatch, expired
   cert, or the symlinks at `/etc/ssl/{certs,private}/qiita.{crt,key}`
   don't resolve. `sudo readlink -f` them.
-- **`404 Not Found` on `/health` but other paths return 502** — the
-  `__QIITA_HOSTNAME__` substitution didn't run. Check `grep server_name
-  /etc/nginx/conf.d/qiita.conf` for the placeholder still present.
+- **`404 Not Found` on `/health` but other paths return 502** — the config
+  was not rendered (e.g. `deploy/nginx/qiita.conf` copied by hand). Check
+  `grep -n __QIITA_ /etc/nginx/conf.d/qiita.conf` for a placeholder still
+  present, and re-run `local-deploy.sh`.
 - **`502 Bad Gateway`** — nginx is up but the CP isn't on `127.0.0.1:8080`.
   `systemctl status qiita-control-plane` and `journalctl -u qiita-control-plane`.
 
@@ -783,19 +789,21 @@ Parquet files, and an env file.
 
 ### 8a. Create the Parquet data and staging directories
 
-The data plane derives `PATH_PERSISTENT/ducklake` (lake data) and
-`PATH_SCRATCH/staging` (DoPut upload staging), so create exactly those
-leaf dirs under the mount roots picked in §0.3. The mounts themselves stay
+The data plane derives `PATH_PERSISTENT/ducklake` (lake data),
+`PATH_SCRATCH/staging` (DoPut upload staging) and `PATH_SCRATCH/duckdb-spill`
+(DuckDB spill), so create exactly those leaf dirs under the mount roots picked
+in §0.3. The mounts themselves stay
 infra-owned.
 
 ```bash
 # [admin]
 sudo install -d -o qiita-data -g qiita-data -m 0750     <persistent>/ducklake
 sudo install -d -o qiita-data -g qiita-pipeline -m 2770 <scratch>/staging
+sudo install -d -o qiita-data -g qiita-data -m 0700     <scratch>/duckdb-spill
 ```
 
 Then `PATH_PERSISTENT=<persistent>` and `PATH_SCRATCH=<scratch>` in step 8b
-(the data plane appends `/ducklake` and `/staging` itself).
+(the data plane appends `/ducklake`, `/staging` and `/duckdb-spill` itself).
 
 The setgid bit on the staging dir (`2770`) is load-bearing: files
 written by `qiita-job` inherit the `qiita-pipeline` group regardless
@@ -855,12 +863,13 @@ unset FLIGHT_TICKET_SIGNING_KEY FLIGHT_TICKET_PUBLIC_KEY LOGIN_COOKIE_SECRET_KEY
 sudo systemctl enable --now qiita-data-plane@50051
 ```
 
-The systemd template `qiita-data-plane@.service` reads
-`LISTEN_ADDR=127.0.0.1:%i` — the instance number *is* the port.
+The systemd template `qiita-data-plane@.service` sets `LISTEN_ADDR` to
+`${QIITA_DATA_PLANE_BIND_HOST}:%i` (bind host default `127.0.0.1`) — the
+instance number *is* the port.
 `qiita-data-plane@50051` listens on `127.0.0.1:50051`, the upstream
-nginx already routes to. For first deploy a single instance is fine;
-add `qiita-data-plane@50052` (etc.) and the matching nginx upstream
-entry when traffic warrants horizontal scaling.
+nginx already routes to. A single instance is right for first deploy.
+Running more instances, or data planes on other hosts, is
+[`data-plane-scaling.md`](data-plane-scaling.md).
 
 On first start, the DP attaches DuckLake to `qiita_miint_lake` (creates
 metadata tables) and creates the lake tables (`ensure_lake_tables`). All

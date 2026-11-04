@@ -70,9 +70,7 @@ class LocalComputeBackendClient:
         return _handle_to_wire(handle)
 
     async def status_step(self, handle: StepHandleWire) -> StepStatusWire:
-        info: StepStatusInfo = await self._backend.status_step(
-            _handle_from_wire(handle)
-        )
+        info: StepStatusInfo = await self._backend.status_step(_handle_from_wire(handle))
         return StepStatusWire(
             status=info.status,
             raw_state=info.raw_state,
@@ -80,9 +78,7 @@ class LocalComputeBackendClient:
             reason=info.reason,
         )
 
-    async def result_step(
-        self, handle: StepHandleWire, status: StepStatusWire
-    ) -> dict[str, Path]:
+    async def result_step(self, handle: StepHandleWire, status: StepStatusWire) -> dict[str, Path]:
         return await self._backend.result_step(
             _handle_from_wire(handle),
             StepStatusInfo(

@@ -1,6 +1,5 @@
 """DB tests for DELETE /alignment-definition/{alignment_idx} — full alignment
-purge (the disallow-without-delete escape hatch), the alignment analog of
-test_mask_definition_delete.py.
+purge (the disallow-without-delete escape hatch).
 
 Exercises the Postgres-teardown + gating half against a real Postgres. The
 data-plane DoAction (DuckLake `alignment` cleanup) is stubbed — this tier has no
@@ -257,6 +256,35 @@ async def test_delete_alignment_data_plane_failure_returns_502(client, postgres_
 
     resp = await client.delete(URL_ALIGNMENT_DEFINITION_BY_IDX.format(alignment_idx=alignment_idx))
     assert resp.status_code == 502
+    assert (
+        await postgres_pool.fetchval(
+            "SELECT 1 FROM qiita.alignment_definition WHERE alignment_idx = $1", alignment_idx
+        )
+        == 1
+    )
+
+
+async def test_delete_alignment_busy_data_plane_returns_502(client, postgres_pool, monkeypatch):
+    """A busy refusal reaches pyarrow as `ArrowInvalid`, not a `FlightError`; it still
+    surfaces as the route's 502 and leaves Postgres untouched. The autouse stub is
+    undone and the Flight client replaced instead, so the library's own handling runs."""
+    import pyarrow as pa
+
+    from qiita_control_plane.actions import library as lib
+    from qiita_control_plane.testing.flight import REAL_BUSY_REFUSAL, flight_client_raising
+
+    alignment_idx = await _seed_alignment(postgres_pool, client._created)
+
+    monkeypatch.setattr(
+        "qiita_control_plane.routes.alignment.delete_alignment_data", lib.delete_alignment_data
+    )
+    monkeypatch.setattr(
+        lib._flight, "FlightClient", flight_client_raising(pa.ArrowInvalid(REAL_BUSY_REFUSAL))
+    )
+
+    resp = await client.delete(URL_ALIGNMENT_DEFINITION_BY_IDX.format(alignment_idx=alignment_idx))
+    assert resp.status_code == 502
+    assert "data plane busy" in resp.json()["detail"]
     assert (
         await postgres_pool.fetchval(
             "SELECT 1 FROM qiita.alignment_definition WHERE alignment_idx = $1", alignment_idx

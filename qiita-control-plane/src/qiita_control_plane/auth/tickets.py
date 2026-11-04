@@ -35,7 +35,7 @@ _MEMBERS_TABLES = frozenset({READ_BLOCK_TABLE, READ_MASKED_BLOCK_TABLE})
 
 # Columns each table may have signed into a ticket's projection list, mirroring
 # the data plane's per-table allowlist (ALIGNMENT_PROJECTION_COLUMNS in
-# flight_service.rs). Neither language can import the other, so the two are kept
+# flight_service/query.rs). Neither language can import the other, so the two are kept
 # honest by a test that parses the Rust source — see tests/auth/test_auth.py.
 #
 # A table absent from this mapping takes no projection at all: the data plane

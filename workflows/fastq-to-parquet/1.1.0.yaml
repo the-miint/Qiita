@@ -75,8 +75,8 @@ steps:
     optional_inputs: [reverse_fastq_path]
     outputs: [reads]
     baseline_resources:
-      cpu: 2
-      mem_gb: 8
+      cpu: 8
+      mem_gb: 13
       walltime: PT30M
 
   # Optional host depletion on the minted reads. `host_rype_path` /

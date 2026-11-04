@@ -111,8 +111,8 @@ from qiita_common.duckdb_miint import is_empty_sequence_file
 from qiita_common.parquet import validate_parquet_path
 
 from ..miint import (
-    PARQUET_OPTS,
-    PARQUET_OPTS_CHUNKED,
+    PARQUET_OPTS_CHUNKED_TRANSFER,
+    PARQUET_OPTS_TRANSFER,
     apply_duckdb_settings,
     duckdb_tmp_dir,
     open_miint_conn,
@@ -310,11 +310,11 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
 
             conn.execute(
                 "COPY (SELECT read_id, sequence_hash, sequence_length_bp FROM contig) "
-                f"TO '{manifest_out}' ({PARQUET_OPTS})"
+                f"TO '{manifest_out}' ({PARQUET_OPTS_TRANSFER})"
             )
             conn.execute(
                 "COPY (SELECT read_id, kind, bin_id, contig_id FROM contig) "
-                f"TO '{bin_map_out}' ({PARQUET_OPTS})"
+                f"TO '{bin_map_out}' ({PARQUET_OPTS_TRANSFER})"
             )
 
             # winner — the ONE surviving contig per canonical sequence_hash, chosen
@@ -353,7 +353,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 "    JOIN file_meta fm ON rf.filepath = fm.filepath "
                 f"    JOIN winner w ON w.read_id = ({_READ_ID_EXPR})"
                 "  )"
-                f") TO '{chunks_part_out}' ({PARQUET_OPTS_CHUNKED})",
+                f") TO '{chunks_part_out}' ({PARQUET_OPTS_CHUNKED_TRANSFER})",
                 [paths],
             )
 

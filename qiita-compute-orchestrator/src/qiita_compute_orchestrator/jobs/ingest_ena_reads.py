@@ -8,6 +8,12 @@ For every `(prep_sample_idx, ena_run_accession)` in the runner-staged
 the same mint-then-sort-and-assign pipeline as `ingest_reads` (`..read_staging`).
 Two-write-target and idempotent/re-runnable semantics are identical too.
 
+A run whose fetch fails permanently (a 404, a format error, no sequence data, zero
+reads) does not fail the pool when another run was stored: it is listed in the
+`run_outcomes` JSON for `persist-ena-run-outcomes` and the rest land. Any
+transient failure, any unrecognised error (OOM, local staging), or no run stored
+fails the step.
+
 Gotchas specific to the ENA source:
 - md5 verification is miint's, not this job's: `read_ena_sequences`'s
   `verify_md5` defaults to true
@@ -15,28 +21,40 @@ Gotchas specific to the ENA source:
   raises `duckdb.IOException` naming the md5 mismatch, which
   `_classify_ena_fetch_error` classifies retriable (a truncated transfer and a
   bad digest are indistinguishable; `max_retries` bounds it).
-- One FRESH DuckDB connection PER RUN. `miint_warnings()` accumulates across
-  queries in a session (duckdb-miint/docs/utilities.md), so a reused connection
-  would leak one run's warnings into the next run's fail-loud check.
-- Fail loud on a silent skip. `read_ena_sequences` does not raise on a run that
-  fails to open or fails mid-stream — it retries once, then skips/truncates and
-  records a `miint_warnings()` entry, returning fewer/zero rows. So a "skip"
-  warning (`_skip_warnings`) fails the run retriably and a clean 0-row result
-  fails it BAD_INPUT (an ENA run never legitimately has zero reads, unlike a
-  demux well). A raised
-  `duckdb.Error` is classified separately (`_classify_ena_fetch_error`).
+- One DuckDB connection per run, each its own in-memory database, so
+  `apply_duckdb_settings` gives every concurrent run its own per-slot memory limit
+  and threads, and each run gets its own DuckDB HTTP retry quota (see
+  `MIINT_HTTP_RETRY_SETTINGS`): one run's dropped connections do not spend another's.
+- A run miint could not read raises. A scan of one run raises on a failed open
+  with the server's own error, and on a mid-stream failure as "every run failed"
+  (duckdb-miint#312; https://the-miint.github.io/duckdb-miint/insdc_ena/). A scan
+  of several runs skips one that fails and returns the rest, so `execute` refuses
+  a roster accession that is not a run: `read_ena_sequences` would expand an
+  experiment, sample or study accession to every run under it.
+  `_classify_ena_fetch_error` classifies the raised `duckdb.Error`, and a 404 is
+  permanent there. A clean 0-row result fails the run BAD_INPUT: an ENA run never
+  legitimately has zero reads, unlike a demux well.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
+import sys
 from pathlib import Path
 
 import duckdb
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from qiita_common.api_paths import compute_reads_staging_path
 from qiita_common.backend_failure import BackendFailure, FailureKind
-from qiita_common.models import WorkTicketFailureStage
+from qiita_common.ena_accession import (
+    RUN_ACCESSION_FORM,
+    InvalidEnaAccessionError,
+    validate_run_accession,
+)
+from qiita_common.http_status import is_transient_error_text, is_transient_http_status
+from qiita_common.models import FailureType, WorkTicketFailureStage
+from qiita_common.models.ena_import import MAX_ENA_DOWNLOAD_RUN_CONCURRENCY, FailedRunOutcome
 from qiita_common.parquet import validate_parquet_path
 
 from ..cp_client import make_cp_client
@@ -53,44 +71,35 @@ from ..sequence_range_retry import mint_or_reuse_sequence_range
 # `- step: ingest_ena_reads` entry fails loudly at BackendFailure attribution.
 YAML_STEP_NAME = "ingest_ena_reads"
 
-# Bounded per-run fan-out, same shape as ingest_reads' _CONCURRENCY (here
-# network-bound). Per-slot DuckDB caps come from `per_slot_caps`; the two
-# _DUCKDB_* values are the off-SLURM (test/local) per-slot fallback.
+RUN_OUTCOMES_FILENAME = "run_outcomes.json"
+
+# Default per-run fan-out (network-bound); `Inputs.run_concurrency` overrides it.
+# Per-slot DuckDB caps come from `per_slot_caps`; the two _DUCKDB_* values are
+# the off-SLURM (test/local) per-slot fallback.
 _CONCURRENCY = 4
 _DUCKDB_MEMORY_GB = 7
 _DUCKDB_THREADS = 2
 
-# Cap on the combined failure reason, which lands in a DB column and an email.
+# Caps on a failure reason, which lands in a DB column and an email; the step row keeps
+# only a prefix of it (the control plane's `runner/_dispatch.py` cuts it).
 _REASON_FULL_RUNS = 3
-_REASON_LISTED_ACCESSIONS = 20
-
-# Substring marking a `miint_warnings()` message where THIS run's data is
-# missing/partial: both the end-of-scan skip summary and the mid-stream
-# truncation warning contain "skip". A self-healed "...retrying..." message
-# does not, so a once-retried successful run is never mistaken for a skip.
-_SKIP_WARNING_MARKER = "skip"
-# Also contains "skip", but reports a complete run whose md5 could not be
-# checked (SFF, a non-gzip file), not missing data.
-_MD5_SKIPPED_WARNING_MARKER = "md5 verification skipped"
-# miint's mid-stream failure warning (https://the-miint.github.io/duckdb-miint/insdc_ena/).
-_MID_STREAM_WARNING_MARKER = "mid-stream"
+_REASON_LISTED_ITEMS = 20
 
 # Prefix of the transient-fetch reason; the live e2e test keys its skip on it.
 TRANSIENT_FETCH_ERROR_TEXT = "transient fetch error"
 
-# Substrings marking a raised duckdb.Error as transport/network-shaped (vs.
-# format/parse) — see `_classify_ena_fetch_error`. A non-match is permanent
-# unless it is an md5 mismatch, which miint cannot tell from a truncation.
-_TRANSIENT_ERROR_MARKERS = (
-    "connection",
-    "timed out",
-    "timeout",
-    "network",
-    "reset",
-    "refused",
-    "unreachable",
-    "temporarily",
-    "curl",
+_PERMANENT_ERROR_MARKERS = ("malformed", "invalid fastq", "no sequence data")
+# ENA's own words when it answers a search with HTTP 200 but stops writing the
+# results; miint quotes them when the answer survives its retries
+# (duckdb-miint#310).
+_ENA_INCOMPLETE_ANSWER_MARKER = "not all results may have been written"
+# miint's error for a scan of one run that failed mid-stream.
+_EVERY_RUN_FAILED_MARKER = "every run failed"
+# The reason for a run whose data is partial (`_classify_ena_fetch_error`).
+_PARTIAL_RUN_TEXT = "its data is partial; refusing to register an incomplete read set"
+_MID_STREAM_RERUN_HINT = (
+    "a re-run recovers a dropped connection, but damaged data in the file fails the same "
+    "way each time (miint's insdc_ena docs)"
 )
 
 
@@ -99,7 +108,7 @@ class Inputs(BaseModel):
 
     `ena_run_map` is the runner-staged Parquet roster `(prep_sample_idx BIGINT,
     ena_run_accession VARCHAR)` from a live Postgres query. `reads_staging_root`
-    is the scratch root durable per-sample `read.parquet` copies hang under (via
+    is the scratch root durable per-prep_sample `read.parquet` copies hang under (via
     `compute_reads_staging_path`). `download_method` defaults to 'http', the only
     transport this environment supports. `sequenced_pool_idx` / `sequencing_run_idx`
     / `work_ticket_idx` are framework-injected scope scalars."""
@@ -107,19 +116,18 @@ class Inputs(BaseModel):
     ena_run_map: Path
     reads_staging_root: Path
     download_method: str = "http"
+    run_concurrency: int = Field(_CONCURRENCY, ge=1, le=MAX_ENA_DOWNLOAD_RUN_CONCURRENCY)
     sequenced_pool_idx: int
     sequencing_run_idx: int
     work_ticket_idx: int
 
 
-def _skip_warnings(messages: list[str]) -> list[str]:
-    """Filter `messages` down to the ones meaning this run's data is missing or
-    partial. See `_SKIP_WARNING_MARKER` for why a substring match suffices."""
-    return [
-        m
-        for m in messages
-        if _SKIP_WARNING_MARKER in m.lower() and _MD5_SKIPPED_WARNING_MARKER not in m.lower()
-    ]
+class _RunFetchFailure(Exception):
+    """A run's fetch failure; `failure` is its classification."""
+
+    def __init__(self, failure: BackendFailure) -> None:
+        super().__init__(failure.reason)
+        self.failure = failure
 
 
 def _stage_run_reads(
@@ -129,21 +137,16 @@ def _stage_run_reads(
     duckdb_tmp: Path,
     memory_gb: int,
     threads: int,
-) -> tuple[int, list[str]]:
+) -> int:
     """Fetch one ENA run's reads via `read_ena_sequences` into a transient
-    intermediate Parquet at `intermediate_path`, on a FRESH per-run DuckDB
-    connection (see module docstring). Returns `(row_count, warning_messages)`.
+    intermediate Parquet at `intermediate_path`, on a connection of its own (see
+    module docstring). Returns the row count.
 
     The explicit 6-column projection drops the `comment`/`*_accession` columns
-    the caller already knows from the roster/scope. `warning_messages` is read
-    from `miint_warnings()` on the SAME connection right after the COPY (empty
-    until then, so every message is about exactly this run); this function does
-    not interpret them — the caller applies `_skip_warnings`.
+    the caller already knows from the roster/scope.
 
-    Raises `duckdb.Error` on a raised transport/format failure (caller
-    classifies via `_classify_ena_fetch_error`). Does NOT raise on an internal
-    skip/partial-download — that returns normally with a warning, which is why
-    the caller must inspect `warning_messages`."""
+    Raises `duckdb.Error` on a transport/format failure (caller classifies via
+    `_classify_ena_fetch_error`)."""
     intermediate = validate_parquet_path(intermediate_path)
     with open_miint_conn() as conn:
         apply_duckdb_settings(conn, duckdb_tmp, memory_gb=memory_gb, threads=threads)
@@ -153,21 +156,40 @@ def _stage_run_reads(
             f"TO '{intermediate}' ({PARQUET_OPTS_INTERMEDIATE})",
             [run_accession, download_method],
         ).fetchone()
-        warnings = [
-            str(row[0]) for row in conn.execute("SELECT message FROM miint_warnings()").fetchall()
-        ]
-    return int(count), warnings
+    return int(count)
 
 
 def _classify_ena_fetch_error(
     run_accession: str, exc: duckdb.Error, *, step_name: str
 ) -> BackendFailure:
-    """Classify a raised `duckdb.Error` from `_stage_run_reads` as retriable
-    (transport/network-shaped or md5 mismatch) or permanent (format/parse, or
-    anything not confidently network-shaped). The exception text is all the
-    caller has: a raise means miint's open-retry-then-skip did not run."""
+    """Classify a raised `duckdb.Error` from `_stage_run_reads`. Retriable: a
+    network-shaped error, a transient or zero HTTP status, ENA's incomplete answer,
+    a mid-stream failure, an md5 mismatch. Anything else is BAD_INPUT, which
+    `_is_permanent_fetch_error` then narrows to the recognised bad runs."""
     text = str(exc).lower()
-    if any(marker in text for marker in _TRANSIENT_ERROR_MARKERS):
+    # A run that broke mid-download: its data is partial, which is not the same
+    # as ENA being unreachable, so the reason does not carry
+    # TRANSIENT_FETCH_ERROR_TEXT. Checked first, because miint's message ends
+    # with the transfer's own error, which may carry a network word.
+    if _EVERY_RUN_FAILED_MARKER in text:
+        return BackendFailure(
+            kind=FailureKind.EXTERNAL_FETCH_TRANSIENT,
+            stage=WorkTicketFailureStage.STEP_RUN,
+            step_name=step_name,
+            reason=(
+                f"ENA run {run_accession} broke mid-download -- {_PARTIAL_RUN_TEXT}; "
+                f"{_MID_STREAM_RERUN_HINT} ({type(exc).__name__}): {exc}"
+            ),
+        )
+    # httpfs and miint's ENA client raise duckdb.HTTPException with the status;
+    # status 0 means no usable HTTP status, so it retries.
+    status = getattr(exc, "status_code", None)
+    unavailable = (
+        is_transient_error_text(text)
+        or (status is not None and (status == 0 or is_transient_http_status(status)))
+        or _ENA_INCOMPLETE_ANSWER_MARKER in text
+    )
+    if unavailable:
         return BackendFailure(
             kind=FailureKind.EXTERNAL_FETCH_TRANSIENT,
             stage=WorkTicketFailureStage.STEP_RUN,
@@ -201,31 +223,62 @@ def _classify_ena_fetch_error(
     )
 
 
+def _is_scannable_run(accession: str) -> bool:
+    """True when the roster's `accession` is one run accession exactly as stored: the
+    scan takes the stored value, so a padded one is not scannable."""
+    try:
+        return validate_run_accession(accession) == accession
+    except InvalidEnaAccessionError:
+        return False
+
+
+def _is_permanent_fetch_error(exc: duckdb.Error) -> bool:
+    """True for a raised error naming a bad run: a 404, a format error, no data."""
+    text = str(exc).lower()
+    return getattr(exc, "status_code", None) == 404 or any(
+        marker in text for marker in _PERMANENT_ERROR_MARKERS
+    )
+
+
+def _capped_join(items: list[str]) -> str:
+    """The first `_REASON_LISTED_ITEMS` of `items`, comma-joined, ending ", …" when
+    there are more."""
+    more = ", …" if len(items) > _REASON_LISTED_ITEMS else ""
+    return ", ".join(items[:_REASON_LISTED_ITEMS]) + more
+
+
 def _combine_failures(failed: list[tuple[str, BackendFailure]]) -> BackendFailure:
-    """One failure for the step from `(run_accession, failure)` pairs: a permanent
-    outcome wins over a transient one so it is not retried. The reason gives the
-    first few runs in full (permanent ones first) and only lists the rest."""
+    """One failure for the step from `(run_accession, failure)` pairs: a transient
+    outcome wins so the ticket retries before landing. The reason gives the first
+    few runs in full (transient ones first) and only lists the rest."""
     if len(failed) == 1:
         return failed[0][1]
-    ordered = sorted(failed, key=lambda pair: pair[1].transient)
+    ordered = sorted(failed, key=lambda pair: not pair[1].transient)
     lead = ordered[0][1]
     reason = f"{len(failed)} runs failed: " + " | ".join(
         f.reason for _, f in ordered[:_REASON_FULL_RUNS]
     )
     rest = [acc for acc, _ in ordered[_REASON_FULL_RUNS:]]
     if rest:
-        listed = ", ".join(rest[:_REASON_LISTED_ACCESSIONS])
-        ellipsis = "…" if len(rest) > _REASON_LISTED_ACCESSIONS else ""
-        reason += f" | and {len(rest)} more failed runs: {listed}{ellipsis}"
+        reason += f" | and {len(rest)} more failed runs: {_capped_join(rest)}"
     return BackendFailure(kind=lead.kind, stage=lead.stage, step_name=lead.step_name, reason=reason)
 
 
 async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
-    """Download every pool run's reads, up to `_CONCURRENCY` at once. See the
+    """Download every pool run's reads, up to `inputs.run_concurrency` at once. See the
     module docstring for the per-run pipeline and fail-loud checks."""
     roster = read_roster_parquet(
         inputs.ena_run_map, value_column="ena_run_accession", roster_name="ena_run_map"
     )
+    refused = sorted((psi, acc) for psi, acc in roster if not _is_scannable_run(acc))
+    if refused:
+        raise ValueError(
+            f"{len(refused)} sequenced_sample(s) of this pool carry an ena_run_accession "
+            f"that is not exactly one run accession ({RUN_ACCESSION_FORM}, with no "
+            "surrounding whitespace); a scan of an experiment, sample or study accession "
+            "would cover every run under it. Refused: "
+            + _capped_join([f"prep_sample {psi}: {acc!r}" for psi, acc in refused])
+        )
 
     workspace.mkdir(parents=True, exist_ok=True)
     # register-files maps the `read/` subdir's part files -> the `read` table.
@@ -233,14 +286,18 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     register_dir.mkdir(parents=True, exist_ok=True)
 
     memory_gb, threads = per_slot_caps(
-        _CONCURRENCY, threads=_DUCKDB_THREADS, fallback_memory_gb=_DUCKDB_MEMORY_GB
+        inputs.run_concurrency, threads=_DUCKDB_THREADS, fallback_memory_gb=_DUCKDB_MEMORY_GB
     )
-    sem = asyncio.Semaphore(_CONCURRENCY)
+    print(
+        f"{YAML_STEP_NAME}: {len(roster)} runs, run_concurrency={inputs.run_concurrency} "
+        f"({memory_gb} GB, {threads} threads per slot)",
+        file=sys.stderr,
+    )
+    sem = asyncio.Semaphore(inputs.run_concurrency)
 
     async def _process_run(http: object, prep_sample_idx: int, run_accession: str) -> str:
         """Store one run's reads. Returns `"registered"`; raises on any failure
-        — unlike `ingest_reads`, an ENA run has no legitimate "empty" outcome,
-        so every run either registers or fails the whole step."""
+        — unlike `ingest_reads`, an ENA run has no legitimate "empty" outcome."""
         async with sem:
             durable = compute_reads_staging_path(inputs.reads_staging_root, prep_sample_idx)
             part = register_dir / f"{prep_sample_idx}.parquet"
@@ -258,7 +315,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             run_tmp.mkdir(parents=True, exist_ok=True)
             try:
                 try:
-                    count, warnings = await asyncio.to_thread(
+                    count = await asyncio.to_thread(
                         _stage_run_reads,
                         run_accession,
                         inputs.download_method,
@@ -268,43 +325,28 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                         threads,
                     )
                 except duckdb.Error as exc:
-                    raise _classify_ena_fetch_error(
+                    failure = _classify_ena_fetch_error(
                         run_accession, exc, step_name=YAML_STEP_NAME
-                    ) from exc
-
-                skip_msgs = _skip_warnings(warnings)
-                if skip_msgs:
-                    mid_stream = any(_MID_STREAM_WARNING_MARKER in m.lower() for m in skip_msgs)
-                    raise BackendFailure(
-                        kind=FailureKind.EXTERNAL_FETCH_TRANSIENT,
-                        stage=WorkTicketFailureStage.STEP_RUN,
-                        step_name=YAML_STEP_NAME,
-                        reason=(
-                            f"ENA run {run_accession} (prep_sample {prep_sample_idx}) "
-                            "was skipped by miint -- its data is missing or partial; "
-                            "refusing to register an incomplete read set"
-                            + (
-                                "; miint's docs say a re-run recovers a mid-stream failure"
-                                if mid_stream
-                                else ""
-                            )
-                            + f": {'; '.join(skip_msgs)}"
-                        ),
                     )
+                    if failure.transient or _is_permanent_fetch_error(exc):
+                        raise _RunFetchFailure(failure) from exc
+                    raise
+
                 if count == 0:
-                    # Zero reads with no explanatory warning is anomalous for an
-                    # ENA run (unlike a legitimately empty demux well) -- fail
-                    # loud rather than silently register nothing.
-                    raise BackendFailure(
-                        kind=FailureKind.BAD_INPUT,
-                        stage=WorkTicketFailureStage.STEP_RUN,
-                        step_name=YAML_STEP_NAME,
-                        reason=(
-                            f"ENA run {run_accession} (prep_sample {prep_sample_idx}) "
-                            "produced zero reads with no explanatory "
-                            "miint_warnings() entry -- refusing to silently "
-                            "register an empty read set"
-                        ),
+                    # Zero reads is anomalous for an ENA run (unlike a legitimately
+                    # empty demux well). Failing here makes it this run's outcome;
+                    # the mint would refuse a zero count for the whole step.
+                    raise _RunFetchFailure(
+                        BackendFailure(
+                            kind=FailureKind.BAD_INPUT,
+                            stage=WorkTicketFailureStage.STEP_RUN,
+                            step_name=YAML_STEP_NAME,
+                            reason=(
+                                f"ENA run {run_accession} (prep_sample {prep_sample_idx}) "
+                                "produced zero reads -- refusing to silently register "
+                                "an empty read set"
+                            ),
+                        )
                     )
 
                 sequence_idx_start = await mint_or_reuse_sequence_range(
@@ -313,6 +355,11 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                     count,
                     work_ticket_idx=inputs.work_ticket_idx,
                     step_name=YAML_STEP_NAME,
+                )
+                print(
+                    f"{YAML_STEP_NAME}: sorting {run_accession} (prep_sample {prep_sample_idx}): "
+                    f"{count} reads ({memory_gb} GB, {threads} threads)",
+                    file=sys.stderr,
                 )
                 await asyncio.to_thread(
                     write_sorted_reads,
@@ -336,16 +383,36 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 return_exceptions=True,
             )
 
-    # Runs that already completed only wrote their own durable copy, which is
-    # harmless.
+    fetch_failures = [
+        (psi, acc, o.failure)
+        for (psi, acc), o in zip(roster, outcomes, strict=True)
+        if isinstance(o, _RunFetchFailure)
+    ]
+    combined = (
+        _combine_failures([(acc, f) for _, acc, f in fetch_failures]) if fetch_failures else None
+    )
+    # Runs that already completed only wrote their own durable copy, which is harmless.
+    if combined is not None and combined.transient:
+        raise combined
     for outcome in outcomes:
-        if isinstance(outcome, BaseException) and not isinstance(outcome, BackendFailure):
+        if isinstance(outcome, BaseException) and not isinstance(outcome, _RunFetchFailure):
             raise outcome
-    # Retriable and permanent runs can mix; collect all so a permanent one
-    # decides the kind.
-    failed = [(acc, o) for (_, acc), o in zip(roster, outcomes) if isinstance(o, BackendFailure)]
-    if failed:
-        raise _combine_failures(failed)
+    if combined is not None and len(fetch_failures) == len(roster):
+        raise combined
 
+    run_outcomes = workspace / RUN_OUTCOMES_FILENAME
+    run_outcomes.write_text(
+        json.dumps(
+            [
+                FailedRunOutcome(
+                    prep_sample_idx=psi,
+                    ena_run_accession=acc,
+                    failure_reason=f.reason,
+                    failure_type=FailureType.PERMANENT,
+                ).model_dump(mode="json")
+                for psi, acc, f in fetch_failures
+            ]
+        )
+    )
     # register-files loads the workspace's `read/` parts into the `read` table.
-    return {"read_staging_dir": workspace}
+    return {"read_staging_dir": workspace, "run_outcomes": run_outcomes}

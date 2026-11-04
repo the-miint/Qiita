@@ -345,7 +345,7 @@ def test_sign_ticket_rejects_columns_on_a_table_with_no_allowlist():
 
 def test_cp_projection_allowlist_matches_the_rust_one_exactly():
     """``_PROJECTION_COLUMNS`` is a hand-copy of the data plane's
-    ``ALIGNMENT_PROJECTION_COLUMNS`` (flight_service.rs). The CP validates and
+    ``ALIGNMENT_PROJECTION_COLUMNS`` (flight_service/query.rs). The CP validates and
     signs; the DP validates again and projects. Drift fails asymmetrically:
 
     * a column the DP allows but the CP does not is UNREACHABLE — nobody can get
@@ -363,12 +363,16 @@ def test_cp_projection_allowlist_matches_the_rust_one_exactly():
     from qiita_control_plane.auth.tickets import _PROJECTION_COLUMNS
 
     src = (
-        Path(__file__).resolve().parents[3] / "qiita-data-plane" / "src" / "flight_service.rs"
+        Path(__file__).resolve().parents[3]
+        / "qiita-data-plane"
+        / "src"
+        / "flight_service"
+        / "query.rs"
     ).read_text()
     m = re.search(
         r"const ALIGNMENT_PROJECTION_COLUMNS: &\[&str\] = &\[(.*?)\];", src, flags=re.DOTALL
     )
-    assert m, "ALIGNMENT_PROJECTION_COLUMNS not found in flight_service.rs"
+    assert m, "ALIGNMENT_PROJECTION_COLUMNS not found in flight_service/query.rs"
     rust_columns = set(re.findall(r'"([^"]+)"', m.group(1)))
     cp_columns = _PROJECTION_COLUMNS["alignment_visible"]
 
@@ -400,12 +404,16 @@ def test_cp_projection_allowlist_covers_only_tables_the_dp_projects():
     from qiita_control_plane.auth.tickets import _PROJECTION_COLUMNS
 
     src = (
-        Path(__file__).resolve().parents[3] / "qiita-data-plane" / "src" / "flight_service.rs"
+        Path(__file__).resolve().parents[3]
+        / "qiita-data-plane"
+        / "src"
+        / "flight_service"
+        / "query.rs"
     ).read_text()
     body = re.search(
         r"fn is_alignment_doget_surface\(table: &str\) -> bool \{(.*?)\n\}", src, flags=re.DOTALL
     )
-    assert body, "is_alignment_doget_surface not found in flight_service.rs"
+    assert body, "is_alignment_doget_surface not found in flight_service/query.rs"
     dp_tables = set(re.findall(r'table == "([^"]+)"', body.group(1)))
     assert dp_tables, (
         "is_alignment_doget_surface no longer decides by table-name equality; this "

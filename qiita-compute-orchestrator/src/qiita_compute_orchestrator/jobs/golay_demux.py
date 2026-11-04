@@ -1,16 +1,16 @@
 """Golay-barcode demux of a pool's multiplexed 16S run into the DuckLake `read`
 table — the amplicon analogue of ingest_reads. It runs after bcl_convert, which
-sent every read to Undetermined (the dummy no-index sheet) and emitted the Golay
+sent every decodable read to Undetermined (the dummy sheet) and emitted the Golay
 I1 index, and reads that convert_dir's I1/R1/R2 FASTQs directly.
 
 Two halves: demux (build the Golay cloud, pair I1 against R1/R2 by record order with
 I1 reverse-complemented, assign each read to its prep_sample) and ingest (mint a
-sequence_idx range per sample, write the sorted read.parquet). The I1 index keys the
+sequence_idx range per prep_sample, write the sorted read.parquet). The I1 index keys the
 record, so R1 and R2 land under the same prep_sample; R2 is persisted as
 sequence2/qual2 in `read` (deblur is R1-only, matching the GG2 V4 catalog).
 
-The per-sample mint + sorted write is the shared `read_staging` core `ingest_reads`
-and `ingest_ena_reads` use; golay only differs in re-numbering each sample's slice of
+The per-prep_sample mint + sorted write is the shared `read_staging` core `ingest_reads`
+and `ingest_ena_reads` use; golay only differs in re-numbering each prep_sample's slice of
 the pooled demux intermediate (see the `write_sorted_reads` call below).
 """
 
@@ -24,6 +24,7 @@ from pathlib import Path
 from pydantic import BaseModel
 from qiita_common.api_paths import compute_reads_staging_path
 from qiita_common.backend_failure import StepNoData
+from qiita_common.illumina import GOLAY_BARCODE_LENGTH
 from qiita_common.parquet import validate_parquet_path
 
 from ..cp_client import make_cp_client
@@ -40,8 +41,11 @@ from ..sequence_range_retry import mint_or_reuse_sequence_range
 
 YAML_STEP_NAME = "golay_demux"
 
-# per-sample writes run one at a time, so each gets the full budget.
-_DUCKDB_THREADS = 4
+# per-prep_sample writes run one at a time, so each gets the full budget. 8 threads, the
+# step's whole cpu allocation, for the writes' at-rest compression (see the option-set
+# comment in `qiita_common.parquet`; the measurement is on fastq_to_parquet's
+# _DUCKDB_THREADS).
+_DUCKDB_THREADS = 8
 _DUCKDB_FALLBACK_MEMORY_GB = 8
 
 # extended binary Golay [24,12,8], the EMP 16S barcode code. a 12-nt barcode is
@@ -128,13 +132,13 @@ class Inputs(BaseModel):
     """input contract for golay_demux.
 
     convert_dir: the bcl_convert step's output dir, holding the pool's Undetermined
-        I1/R1/R2 FASTQs (no per-sample demux happened upstream — the dummy sheet
-        sent everything to Undetermined and emitted the Golay I1 index).
+        I1/R1/R2 FASTQs (no per-prep_sample demux happened upstream — the dummy sheet
+        sent every decodable read to Undetermined and emitted the Golay I1 index).
     barcode_map: runner-staged roster (prep_sample_idx, barcode, barcodes_are_rc);
-        the RC flag is per-sample provenance.
+        the RC flag is per-prep_sample provenance.
     golay_error_threshold: max Golay errors to accept a match (EMP: 1.5). the
         decode cloud is generated in-job; this bounds its radius.
-    reads_staging_root: scratch root for the durable per-sample copies.
+    reads_staging_root: scratch root for the durable per-prep_sample copies.
     """
 
     convert_dir: Path
@@ -218,7 +222,7 @@ def _run_demux(
         )
         conn.execute("CREATE UNIQUE INDEX gc_idx ON golay_codes(raw)")
         # fail loud on any barcode that decodes to no codeword (a typo, the wrong
-        # barcodes_are_rc, or a non-Golay barcode) — else that sample silently drops.
+        # barcodes_are_rc, or a non-Golay barcode) — else that prep_sample silently drops.
         bad = conn.execute(
             "SELECT prep_sample_idx, barcode FROM prep_bc "
             "WHERE prep_sample_idx NOT IN (SELECT prep_sample_idx FROM golay_codes) "
@@ -227,11 +231,12 @@ def _run_demux(
         if bad:
             named = ", ".join(f"{r[0]}:{r[1]}" for r in bad)
             raise ValueError(f"barcodes decode to no Golay codeword: {named}")
-        # per-record RC'd 12-nt index read, keyed by record order. sequence1[:12] is
-        # correct at any length (a shorter I1 just won't match a 12-mer codeword).
+        # per-record RC'd barcode-length index read, keyed by record order. The
+        # prefix is correct at any length (a shorter I1 just won't match a codeword).
         conn.execute(
             "CREATE OR REPLACE VIEW idx_reads AS SELECT sequence_index, "
-            "sequence_dna_reverse_complement(upper(sequence1[:12])) AS index_read "
+            "sequence_dna_reverse_complement("
+            f"upper(sequence1[:{GOLAY_BARCODE_LENGTH}])) AS index_read "
             f"FROM read_fastx('{i1}')"
         )
         # per-record R1(+R2), keyed by record order (matches I1's order).
@@ -272,7 +277,7 @@ def _sample_counts(demuxed_out: Path, duckdb_tmp: Path, *, memory_gb: int) -> li
 
 
 async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
-    """demux the pool's FASTQ and ingest per-sample reads. returns
+    """demux the pool's FASTQ and ingest per-prep_sample reads. returns
     {"read_staging_dir": workspace}; StepNoData when no read matches a barcode."""
     workspace = workspace.resolve()
     inputs.convert_dir = inputs.convert_dir.resolve()
@@ -319,10 +324,10 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                         work_ticket_idx=inputs.work_ticket_idx,
                         step_name=YAML_STEP_NAME,
                     )
-                    # The demux intermediate numbers reads across ALL samples, so
-                    # re-number this sample's slice 1..count with ROW_NUMBER before
+                    # The demux intermediate numbers reads across ALL prep_samples, so
+                    # re-number this prep_sample's slice 1..count with ROW_NUMBER before
                     # applying the mint offset (ingest_reads' source is already
-                    # per-sample and passes sequence_index verbatim).
+                    # per-prep_sample and passes sequence_index verbatim).
                     await asyncio.to_thread(
                         write_sorted_reads,
                         demuxed,

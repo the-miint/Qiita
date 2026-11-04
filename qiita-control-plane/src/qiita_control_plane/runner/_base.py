@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from typing import Any
 
 import asyncpg
-from qiita_common.actions import PATH_SUFFIX, UPLOAD_IDX_SUFFIX
+from qiita_common.actions import PATH_SUFFIX, UPLOAD_IDX_SUFFIX, WorkflowAction
+from qiita_common.api_paths import LibraryPrimitive
 from qiita_common.backend_failure import FailureKind
 from qiita_common.models import (
     TERMINAL_WORK_TICKET_STATES,
@@ -82,6 +84,12 @@ _TRANSIENT_DB_ERRORS: tuple[type[BaseException], ...] = (
     asyncpg.PostgresConnectionError,
     asyncpg.InterfaceError,
 )
+
+
+def _workflow_declares_action(steps: list[Any], primitive: LibraryPrimitive) -> bool:
+    """True iff some entry is the `action:` entry for `primitive`. A step that shares the
+    name does not count: only an action entry dispatches the primitive."""
+    return any(isinstance(entry, WorkflowAction) and entry.name == primitive for entry in steps)
 
 
 def _is_transient_db_error(exc: BaseException) -> bool:

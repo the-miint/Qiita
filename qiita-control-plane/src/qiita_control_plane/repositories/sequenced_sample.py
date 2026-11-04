@@ -24,8 +24,14 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 
 import asyncpg
-from qiita_common.actions import READ_MASK_ACTION_ID
-from qiita_common.models import NON_TERMINAL_WORK_TICKET_STATES
+from qiita_common.actions import (
+    BAM_TO_PARQUET_ACTION_ID,
+    BCL_CONVERT_ACTION_ID,
+    BCL_CONVERT_SAMPLE_MAP_KEY,
+    FASTQ_TO_PARQUET_ACTION_ID,
+    READ_MASK_ACTION_ID,
+)
+from qiita_common.models import NON_TERMINAL_WORK_TICKET_STATES, FailureType, WorkTicketState
 
 from . import require_transaction, validate_patch_fields
 from ._sample_helpers import (
@@ -71,13 +77,9 @@ async def fetch_sequenced_sample_with_prep_sample(
     """Return the joined sequenced_sample + supertype prep_sample row, or
     None on miss.
 
-    Selects every caller-visible column from both tables in one round
-    trip and computes `effective_updated_at` = GREATEST(prep_sample.updated_at,
-    sequenced_sample.updated_at) so a single timestamp captures the
-    latest write to either side; the route layer feeds it directly to
-    etag_for_updated_at. Column list mirrors SequencedSampleResponse
-    one-for-one (with idx -> sequenced_sample_idx and ps.idx ->
-    prep_sample_idx renamed at the route boundary).
+    Selects the caller-visible columns of both tables in one round trip
+    and computes `effective_updated_at` = GREATEST(prep_sample.updated_at,
+    sequenced_sample.updated_at), the latest write to either row.
 
     `for_update=True` appends `FOR UPDATE` to the SELECT so rows from
     both joined tables are locked for the duration of the surrounding
@@ -92,7 +94,7 @@ async def fetch_sequenced_sample_with_prep_sample(
     """
     # Single-row fetch by sequenced_sample.idx; supertype prep_sample is
     # joined 1:1 via the subtype FK and contributes the owner / retirement
-    # / metadata-touch / created-* columns.
+    # / created-* columns.
     sql = (
         "SELECT ss.idx, ss.prep_sample_idx, ss.sequenced_pool_idx,"
         " ss.sequenced_pool_item_id, ss.ena_experiment_accession,"
@@ -103,7 +105,6 @@ async def fetch_sequenced_sample_with_prep_sample(
         " ps.metadata_checklist_idx,"
         " (SELECT name FROM qiita.metadata_checklist mc"
         "  WHERE mc.idx = ps.metadata_checklist_idx) AS metadata_checklist_name,"
-        " ps.last_metadata_change_at,"
         " ps.created_by_idx, ps.created_at,"
         " GREATEST(ps.updated_at, ss.updated_at) AS effective_updated_at,"
         " ps.retired, ps.retired_by_idx, ps.retired_at, ps.retire_reason"
@@ -708,6 +709,17 @@ async def fetch_sequenced_pools_for_study(
     )
 
 
+async def fetch_sequenced_pool_idxs_for_sequenced_samples(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection, sequenced_sample_idxs: list[int]
+) -> set[int]:
+    """The sequenced_pool idxs holding any of `sequenced_sample_idxs`."""
+    rows = await pool_or_conn.fetch(
+        "SELECT sequenced_pool_idx FROM qiita.sequenced_sample WHERE idx = ANY($1::bigint[])",
+        sequenced_sample_idxs,
+    )
+    return {r["sequenced_pool_idx"] for r in rows}
+
+
 async def fetch_held_ena_run_accessions_for_study(
     pool_or_conn: asyncpg.Pool | asyncpg.Connection,
     *,
@@ -761,6 +773,33 @@ async def update_sequenced_sample_ena_status(
     )
 
 
+async def set_sequenced_sample_download_failure(
+    conn: asyncpg.Connection,
+    *,
+    sequenced_pool_idx: int,
+    prep_sample_idx: int,
+    ena_run_accession: str,
+    failure_reason: str,
+    failure_type: FailureType,
+) -> bool:
+    """Record a download failure on the run's sequenced_sample; False when no row
+    in the pool carries both `prep_sample_idx` and `ena_run_accession`."""
+    return (
+        await conn.fetchval(
+            "UPDATE qiita.sequenced_sample"
+            " SET download_failure_reason = $4, download_failure_type = $5::qiita.failure_type"
+            " WHERE sequenced_pool_idx = $1 AND prep_sample_idx = $2 AND ena_run_accession = $3"
+            " RETURNING true",
+            sequenced_pool_idx,
+            prep_sample_idx,
+            ena_run_accession,
+            failure_reason,
+            failure_type.value,
+        )
+        is True
+    )
+
+
 async def fetch_non_terminal_work_tickets_for_sequenced_sample(
     pool_or_conn: asyncpg.Pool | asyncpg.Connection,
     *,
@@ -788,3 +827,80 @@ async def fetch_non_terminal_work_tickets_for_sequenced_sample(
         sequenced_pool_idx,
     )
     return list(rows)
+
+
+_PER_SAMPLE_INGEST_ACTION_IDS = (FASTQ_TO_PARQUET_ACTION_ID, BAM_TO_PARQUET_ACTION_ID)
+_POOL_INGEST_DONE_STATES = (WorkTicketState.COMPLETED.value, WorkTicketState.NO_DATA.value)
+
+
+async def fetch_empty_ingest_tickets(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
+    *,
+    prep_sample_idxs: Sequence[int],
+    current_work_ticket_idx: int | None,
+) -> dict[int, int]:
+    """For each of `prep_sample_idxs` whose newest ingest read it and found it empty,
+    that ingest's work_ticket_idx; any other prep_sample is absent.
+
+    A prep_sample with no `sequence_range` was ingested empty, was never ingested, or
+    has an ingest that failed or has not finished, and only its ingest records tell
+    these apart. They are:
+
+    - its per-sample ingests (fastq-to-parquet, bam-to-parquet). One shows it empty
+      when it ended NO_DATA, which it does only when its input held no reads. A ticket
+      caller may pass its own idx as `current_work_ticket_idx`; it shows the
+      prep_sample empty while still running only when it is such an ingest, which
+      asks about its own input after finding it empty. A caller that is not a ticket
+      passes None.
+    - the bcl-convert tickets for its pool that list it in their `sample_map` roster.
+      One shows it empty when it ended COMPLETED or NO_DATA: `ingest_reads` skips an
+      empty well and fails the whole pool on a missing one, so a finished pool ingest
+      with no range for a listed prep_sample means that well was empty.
+
+    Only the newest record counts, whatever its state. A newer ingest that failed, was
+    cancelled or has not finished may have been given reads the older one never saw,
+    so it leaves the prep_sample unproven. Newest is submission order (the highest
+    work_ticket_idx): a redriven ticket keeps its place.
+
+    A prep_sample that has a range is absent whatever its tickets say: its reads
+    exist. A pool ingest counts only for the prep_samples its roster names; pool
+    membership alone does not show that the ingest read the prep_sample.
+    """
+    rows = await pool_or_conn.fetch(
+        "SELECT newest.prep_sample_idx, newest.work_ticket_idx"
+        "  FROM ("
+        "    SELECT DISTINCT ON (record.prep_sample_idx)"
+        "           record.prep_sample_idx, record.work_ticket_idx, record.shows_empty"
+        "      FROM ("
+        "        SELECT wt.prep_sample_idx, wt.work_ticket_idx,"
+        "               (wt.state = $3::qiita.work_ticket_state"
+        "                OR wt.work_ticket_idx IS NOT DISTINCT FROM $4::bigint) AS shows_empty"
+        "          FROM qiita.work_ticket wt"
+        "         WHERE wt.prep_sample_idx = ANY($1::bigint[])"
+        "           AND wt.action_id = ANY($2::text[])"
+        "        UNION ALL"
+        "        SELECT ss.prep_sample_idx, wt.work_ticket_idx,"
+        "               wt.state = ANY($6::qiita.work_ticket_state[]) AS shows_empty"
+        "          FROM qiita.sequenced_sample ss"
+        "          JOIN qiita.work_ticket wt ON wt.sequenced_pool_idx = ss.sequenced_pool_idx"
+        "         WHERE ss.prep_sample_idx = ANY($1::bigint[])"
+        "           AND wt.action_id = $5"
+        "           AND wt.action_context -> $7::text @> jsonb_build_array("
+        "                 jsonb_build_object('prep_sample_idx', ss.prep_sample_idx))"
+        "      ) record"
+        "     ORDER BY record.prep_sample_idx, record.work_ticket_idx DESC"
+        "  ) newest"
+        " WHERE newest.shows_empty"
+        "   AND NOT EXISTS ("
+        "     SELECT 1 FROM qiita.sequence_range sr"
+        "      WHERE sr.prep_sample_idx = newest.prep_sample_idx"
+        "   )",
+        list(prep_sample_idxs),
+        list(_PER_SAMPLE_INGEST_ACTION_IDS),
+        WorkTicketState.NO_DATA.value,
+        current_work_ticket_idx,
+        BCL_CONVERT_ACTION_ID,
+        list(_POOL_INGEST_DONE_STATES),
+        BCL_CONVERT_SAMPLE_MAP_KEY,
+    )
+    return {r["prep_sample_idx"]: r["work_ticket_idx"] for r in rows}

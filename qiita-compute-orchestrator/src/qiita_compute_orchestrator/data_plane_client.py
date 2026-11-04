@@ -42,6 +42,7 @@ from qiita_common.assembly_constants import (
     ASSEMBLED_SEQUENCE_CHUNKS_TABLE,
     ASSEMBLED_SEQUENCE_TABLE,
 )
+from qiita_common.duckdb_relation import registered
 
 from .config import get_settings
 from .cp_client import make_cp_client
@@ -125,11 +126,8 @@ def open_doget_stream(
     client = flight.FlightClient(data_plane_url)
     try:
         reader = client.do_get(flight.Ticket(ticket_bytes)).to_reader()
-        conn.register(relation, reader)
-        try:
+        with registered(conn, relation, reader):
             yield relation
-        finally:
-            conn.unregister(relation)
     finally:
         client.close()
 

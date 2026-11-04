@@ -12,31 +12,38 @@ from qiita_control_plane.ena_import.protocol_mapping import (
 
 
 @pytest.mark.parametrize(
-    ("library_strategy", "library_source", "platform", "expected"),
+    ("library_strategy", "library_source", "library_selection", "platform", "expected"),
     [
         # Metagenomics -- WGS strategy or METAGENOMIC source, either arm.
-        ("WGS", "GENOMIC", Platform.ILLUMINA, "short_read_metagenomics"),
-        ("WGS", "GENOMIC", Platform.OXFORD_NANOPORE, "long_read_metagenomics"),
-        ("OTHER", "METAGENOMIC", Platform.ILLUMINA, "short_read_metagenomics"),
-        ("OTHER", "METAGENOMIC", Platform.PACBIO_SMRT, "long_read_metagenomics"),
+        ("WGS", "GENOMIC", None, Platform.ILLUMINA, "short_read_metagenomics"),
+        ("WGS", "GENOMIC", None, Platform.OXFORD_NANOPORE, "long_read_metagenomics"),
+        ("OTHER", "METAGENOMIC", None, Platform.ILLUMINA, "short_read_metagenomics"),
+        ("OTHER", "METAGENOMIC", None, Platform.PACBIO_SMRT, "long_read_metagenomics"),
         # Amplicon.
-        ("AMPLICON", "GENOMIC", Platform.ILLUMINA, "short_read_amplicon"),
-        ("AMPLICON", "GENOMIC", Platform.OXFORD_NANOPORE, "long_read_amplicon"),
-        ("AMPLICON", "GENOMIC", Platform.PACBIO_SMRT, "long_read_amplicon"),
+        ("AMPLICON", "GENOMIC", None, Platform.ILLUMINA, "short_read_amplicon"),
+        ("AMPLICON", "GENOMIC", None, Platform.OXFORD_NANOPORE, "long_read_amplicon"),
+        ("AMPLICON", "GENOMIC", None, Platform.PACBIO_SMRT, "long_read_amplicon"),
         # Transcriptomics -- short-read only (no long_read_transcriptomics).
-        ("RNA-Seq", "TRANSCRIPTOMIC", Platform.ILLUMINA, "short_read_transcriptomics"),
-        ("OTHER", "TRANSCRIPTOMIC", Platform.ILLUMINA, "short_read_transcriptomics"),
-        ("OTHER", "METATRANSCRIPTOMIC", Platform.DNBSEQ, "short_read_transcriptomics"),
+        ("RNA-Seq", "TRANSCRIPTOMIC", None, Platform.ILLUMINA, "short_read_transcriptomics"),
+        ("OTHER", "TRANSCRIPTOMIC", None, Platform.ILLUMINA, "short_read_transcriptomics"),
+        ("OTHER", "METATRANSCRIPTOMIC", None, Platform.DNBSEQ, "short_read_transcriptomics"),
         # Case-insensitivity + whitespace tolerance.
-        ("amplicon", " genomic ", Platform.ILLUMINA, "short_read_amplicon"),
-        ("wgs", None, Platform.ILLUMINA, "short_read_metagenomics"),
+        ("amplicon", " genomic ", None, Platform.ILLUMINA, "short_read_amplicon"),
+        ("wgs", None, None, Platform.ILLUMINA, "short_read_metagenomics"),
+        # PCR selection only refuses outside AMPLICON; RANDOM PCR and RT-PCR are distinct.
+        ("AMPLICON", "METAGENOMIC", "PCR", Platform.ILLUMINA, "short_read_amplicon"),
+        ("WGS", "METAGENOMIC", "RANDOM PCR", Platform.ILLUMINA, "short_read_metagenomics"),
+        ("RNA-Seq", "TRANSCRIPTOMIC", "RT-PCR", Platform.ILLUMINA, "short_read_transcriptomics"),
     ],
 )
-def test_map_ena_run_to_prep_protocol_name(library_strategy, library_source, platform, expected):
+def test_map_ena_run_to_prep_protocol_name(
+    library_strategy, library_source, library_selection, platform, expected
+):
     assert (
         map_ena_run_to_prep_protocol_name(
             library_strategy=library_strategy,
             library_source=library_source,
+            library_selection=library_selection,
             platform=platform,
         )
         == expected
@@ -50,6 +57,7 @@ def test_long_read_transcriptomic_run_raises_no_curated_protocol():
         map_ena_run_to_prep_protocol_name(
             library_strategy="RNA-Seq",
             library_source="TRANSCRIPTOMIC",
+            library_selection=None,
             platform=Platform.OXFORD_NANOPORE,
         )
     assert excinfo.value.library_strategy == "RNA-Seq"
@@ -61,6 +69,7 @@ def test_unrecognized_strategy_raises_and_surfaces_strategy():
         map_ena_run_to_prep_protocol_name(
             library_strategy="ChIP-Seq",
             library_source="GENOMIC",
+            library_selection=None,
             platform=Platform.ILLUMINA,
         )
     assert excinfo.value.library_strategy == "ChIP-Seq"
@@ -72,5 +81,35 @@ def test_none_strategy_and_source_raises():
         map_ena_run_to_prep_protocol_name(
             library_strategy=None,
             library_source=None,
+            library_selection=None,
             platform=Platform.ILLUMINA,
         )
+
+
+@pytest.mark.parametrize(
+    ("library_strategy", "library_source", "library_selection", "platform"),
+    [
+        ("OTHER", "METAGENOMIC", "PCR", Platform.ION_TORRENT),
+        ("RNA-Seq", "METAGENOMIC", "PCR", Platform.ILLUMINA),
+        ("RNA-Seq", "TRANSCRIPTOMIC", "PCR", Platform.ILLUMINA),
+        ("WGS", "METAGENOMIC", " pcr ", Platform.ILLUMINA),
+        ("OTHER", "METAGENOMIC", "PCR", Platform.PACBIO_SMRT),
+    ],
+    ids=["PRJNA1127492", "PRJNA1256458", "rna-seq-transcriptomic", "wgs-padded", "long-read"],
+)
+def test_pcr_selection_on_a_non_amplicon_strategy_raises(
+    library_strategy, library_source, library_selection, platform
+):
+    with pytest.raises(
+        UnmappableEnaLibraryStrategyError,
+        match="is not AMPLICON; ask the depositor to correct the ENA record, or register",
+    ) as excinfo:
+        map_ena_run_to_prep_protocol_name(
+            library_strategy=library_strategy,
+            library_source=library_source,
+            library_selection=library_selection,
+            platform=platform,
+        )
+    assert excinfo.value.library_strategy == library_strategy
+    assert excinfo.value.library_source == library_source
+    assert excinfo.value.library_selection == library_selection

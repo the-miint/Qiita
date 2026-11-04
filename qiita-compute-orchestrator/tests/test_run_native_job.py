@@ -18,6 +18,7 @@ from pathlib import Path
 import pytest
 from pydantic import BaseModel
 from qiita_common.backend_failure import BackendFailure, FailureKind, StepNoData
+from qiita_common.data_plane_errors import DATA_PLANE_BUSY_SIGNATURE
 from qiita_common.models import WorkTicketFailureStage
 
 from qiita_compute_orchestrator.jobs import (
@@ -220,6 +221,136 @@ async def test_value_error_in_execute_maps_to_bad_input(monkeypatch, tmp_path):
         await run_native_job(name, {"x": 1}, tmp_path, step_name="step")
     assert ei.value.kind is FailureKind.BAD_INPUT
     assert "duplicate read_id" in ei.value.reason
+
+
+async def test_busy_data_plane_maps_to_a_retriable_failure(monkeypatch, tmp_path):
+    """A step whose Flight call is refused because the data plane has no free
+    DuckLake connection is overload, not bad data. pyarrow raises `ArrowInvalid` for
+    that gRPC status and `ArrowInvalid` is a ValueError, so this arm has to be
+    separated from the data-quality one or the ticket records a malformed-input
+    reason and never retries."""
+    import pyarrow
+
+    async def execute(inputs, workspace):
+        raise pyarrow.ArrowInvalid(
+            "gRPC returned resource exhausted error, with message: data plane busy: "
+            "all 8 DuckLake connections are in use; retry"
+        )
+
+    name = _install_stub(monkeypatch, short_name="dp_busy", inputs_cls=_Inputs, execute_fn=execute)
+    with pytest.raises(BackendFailure) as ei:
+        await run_native_job(name, {"x": 1}, tmp_path, step_name="step")
+    assert ei.value.kind is FailureKind.DATA_PLANE_TRANSIENT
+    assert ei.value.transient is True
+    assert DATA_PLANE_BUSY_SIGNATURE in ei.value.reason
+
+
+async def test_a_value_error_that_merely_mentions_the_data_plane_stays_permanent(
+    monkeypatch, tmp_path
+):
+    """The match is the data plane's refusal wording, not the words "data plane"."""
+
+    async def execute(inputs, workspace):
+        raise ValueError("data plane returned 3 rows for a 4-row prep_sample")
+
+    name = _install_stub(
+        monkeypatch, short_name="dp_mismatch", inputs_cls=_Inputs, execute_fn=execute
+    )
+    with pytest.raises(BackendFailure) as ei:
+        await run_native_job(name, {"x": 1}, tmp_path, step_name="step")
+    assert ei.value.kind is FailureKind.BAD_INPUT
+
+
+async def test_unreachable_data_plane_maps_to_a_retriable_failure(monkeypatch, tmp_path):
+    """gRPC UNAVAILABLE — the data plane restarting mid-deploy, or unable to open a
+    DuckLake connection — arrives as a `FlightUnavailableError`, which is not a
+    `ValueError`, so only the typed arm reaches it; the data-quality arm does not."""
+    import pyarrow.flight
+
+    async def execute(inputs, workspace):
+        raise pyarrow.flight.FlightUnavailableError(
+            "Flight returned unavailable error, with message: failed to connect to all "
+            "addresses; last error: UNKNOWN: ipv4:127.0.0.1:50051"
+        )
+
+    name = _install_stub(monkeypatch, short_name="dp_down", inputs_cls=_Inputs, execute_fn=execute)
+    with pytest.raises(BackendFailure) as ei:
+        await run_native_job(name, {"x": 1}, tmp_path, step_name="step")
+    assert ei.value.kind is FailureKind.DATA_PLANE_TRANSIENT
+    assert ei.value.transient is True
+
+
+async def test_an_unsupported_arrow_cast_is_not_reported_as_an_unimplemented_job(
+    monkeypatch, tmp_path
+):
+    """`ArrowNotImplementedError` is a `NotImplementedError`, which the skeleton arm
+    claims unless the pyarrow arm sits above it — reporting an unsupported cast as a
+    job module that ships without an `execute()`. It is not a data-plane condition
+    either, so it propagates with its traceback."""
+    import pyarrow
+
+    async def execute(inputs, workspace):
+        raise pyarrow.ArrowNotImplementedError("Unsupported cast from string to null")
+
+    name = _install_stub(
+        monkeypatch, short_name="arrow_cast", inputs_cls=_Inputs, execute_fn=execute
+    )
+    with pytest.raises(pyarrow.ArrowNotImplementedError):
+        await run_native_job(name, {"x": 1}, tmp_path, step_name="step")
+
+
+async def test_a_non_data_plane_arrow_invalid_propagates_rather_than_reading_as_bad_input(
+    monkeypatch, tmp_path
+):
+    """`ArrowInvalid` is a `ValueError`, which the data-quality arm would classify as
+    permanent BAD_INPUT. The typed arm takes it first and re-raises one that is not a
+    data-plane condition, so a cast failure inside a job surfaces with its traceback.
+
+    `ArrowCapacityError`, which the test above uses, derives from `ArrowException` alone
+    — it never reached the data-quality arm, so it cannot pin this."""
+    import pyarrow
+
+    async def execute(inputs, workspace):
+        raise pyarrow.ArrowInvalid(
+            "Could not convert 'abc' with type str: tried to convert to int64"
+        )
+
+    name = _install_stub(
+        monkeypatch, short_name="arrow_invalid", inputs_cls=_Inputs, execute_fn=execute
+    )
+    with pytest.raises(pyarrow.ArrowInvalid):
+        await run_native_job(name, {"x": 1}, tmp_path, step_name="step")
+
+
+async def test_a_skeleton_job_is_still_reported_as_unimplemented(monkeypatch, tmp_path):
+    """The control for the test above: a bare `NotImplementedError` is the skeleton
+    path and must keep its own classification."""
+
+    async def execute(inputs, workspace):
+        raise NotImplementedError("execute() not written yet")
+
+    name = _install_stub(
+        monkeypatch, short_name="skeleton3", inputs_cls=_Inputs, execute_fn=execute
+    )
+    with pytest.raises(BackendFailure) as ei:
+        await run_native_job(name, {"x": 1}, tmp_path, step_name="step")
+    assert ei.value.kind is FailureKind.UNKNOWN_PERMANENT
+    assert "not implemented" in ei.value.reason
+
+
+async def test_a_pyarrow_error_that_is_not_a_data_plane_condition_propagates(monkeypatch, tmp_path):
+    """A job's own Arrow or Parquet failure is not a data-plane condition, so it keeps
+    propagating uncaught rather than being relabelled retriable."""
+    import pyarrow
+
+    async def execute(inputs, workspace):
+        raise pyarrow.ArrowCapacityError("array cannot contain more than 2147483646 bytes")
+
+    name = _install_stub(
+        monkeypatch, short_name="arrow_capacity", inputs_cls=_Inputs, execute_fn=execute
+    )
+    with pytest.raises(pyarrow.ArrowCapacityError):
+        await run_native_job(name, {"x": 1}, tmp_path, step_name="step")
 
 
 async def test_step_no_data_propagates_unchanged(monkeypatch, tmp_path):

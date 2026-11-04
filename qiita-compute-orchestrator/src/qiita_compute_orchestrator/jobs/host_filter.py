@@ -73,7 +73,7 @@ from pydantic import BaseModel
 from qiita_common.models import ReadMaskReason
 from qiita_common.parquet import validate_parquet_path
 
-from ..miint import PARQUET_OPTS, apply_duckdb_settings, duckdb_tmp_dir, open_miint_conn
+from ..miint import PARQUET_OPTS_AT_REST, apply_duckdb_settings, duckdb_tmp_dir, open_miint_conn
 from ..read_source import bind_step_reads
 
 YAML_STEP_NAME = "host_filter"
@@ -367,7 +367,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                     f"LEFT JOIN {_RYPE_HOST} ry USING (sequence_idx) "
                     f"LEFT JOIN {_MM2_HOST} mm USING (sequence_idx) "
                     "ORDER BY mask_idx, prep_sample_idx, sequence_idx) "
-                    f"TO '{out_sql}' ({PARQUET_OPTS})",
+                    f"TO '{out_sql}' ({PARQUET_OPTS_AT_REST})",
                     [inputs.mask_idx],
                 )
         success = True

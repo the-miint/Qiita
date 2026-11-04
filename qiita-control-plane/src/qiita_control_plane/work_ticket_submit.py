@@ -262,8 +262,8 @@ async def _check_disallow_without_delete(
     elif scope_target["kind"] == ScopeTargetKind.BLOCK.value:
         # Block scope: only the in-flight (non-terminal) gate applies here.
         # A COMPLETED block does not block resubmission at the ticket level —
-        # the per-(prep_sample, mask_idx) COMPLETED gate on qiita.mask_sample
-        # is what a re-run must clear (DELETE-gated), not the block ticket.
+        # the per-(prep_sample, mask_idx) gate on qiita.mask_sample is what the
+        # block planner refuses a re-plan over (BlockMaskResubmitError).
         existing = await pool.fetchval(
             "SELECT work_ticket_idx FROM qiita.work_ticket"
             " WHERE action_id = $1 AND action_version = $2"

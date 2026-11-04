@@ -138,6 +138,10 @@ READ_MASK_ACTION_ID = "read-mask"
 # rather than on version.
 FASTQ_TO_PARQUET_ACTION_ID = "fastq-to-parquet"
 
+# The per-sample BAM ingest action's bare id (workflows/bam-to-parquet/<version>.yaml).
+# Bare id for the same reason as the ones above. It stores reads and mints no mask.
+BAM_TO_PARQUET_ACTION_ID = "bam-to-parquet"
+
 # The PER-SAMPLE masking actions: one ticket masks one prep_sample, minting a
 # mask_idx and writing read_mask, and writing the qiita.mask_sample gate row at
 # its terminal step. Distinct from the block path (BLOCK_MASK_ACTION_ID), where
@@ -158,6 +162,10 @@ PER_SAMPLE_MASK_ACTION_IDS = (READ_MASK_ACTION_ID, FASTQ_TO_PARQUET_ACTION_ID)
 # NOT a (id, version) pair: "did this pool's demux finish?" holds regardless of
 # which bcl-convert version produced it.
 BCL_CONVERT_ACTION_ID = "bcl-convert"
+
+# The bcl-convert action_context key that holds the pool roster: one
+# `{prep_sample_idx, pool_item_id}` entry per prep_sample the ingest reads.
+BCL_CONVERT_SAMPLE_MAP_KEY = "sample_map"
 
 # The two BLOCK-scoped actions' bare ids (their YAML lives at
 # workflows/read-mask-block/<version>.yaml and workflows/align/<version>.yaml).
@@ -685,6 +693,29 @@ class ActionDefinition(BaseModel):
                 "`params:` — the gate row and the rows it gates must carry the same "
                 "alignment identity"
             )
+        return self
+
+    @model_validator(mode="after")
+    def _qc_checks_persist_after_their_gate(self) -> ActionDefinition:
+        """Checks describe the gated output, so they persist after its gate's finalize. The gate
+        follows `_workflow_qc_producer`'s precedence: alignment, refuse assembly, mask."""
+        names = [e.name for e in self.steps if isinstance(e, WorkflowAction)]
+        if LibraryPrimitive.PERSIST_QC_CHECKS not in names:
+            return self
+        if LibraryPrimitive.FINALIZE_ALIGNMENT_SAMPLE in names:
+            gate = LibraryPrimitive.FINALIZE_ALIGNMENT_SAMPLE
+        elif LibraryPrimitive.FINALIZE_ASSEMBLY_SAMPLE in names:
+            raise ValueError(
+                f"{LibraryPrimitive.PERSIST_QC_CHECKS} cannot run in a workflow that "
+                f"declares {LibraryPrimitive.FINALIZE_ASSEMBLY_SAMPLE}: QC checks have no "
+                "assembly producer"
+            )
+        elif LibraryPrimitive.FINALIZE_MASK_SAMPLE in names:
+            gate = LibraryPrimitive.FINALIZE_MASK_SAMPLE
+        else:
+            return self
+        if names.index(LibraryPrimitive.PERSIST_QC_CHECKS) < names.index(gate):
+            raise ValueError(f"{LibraryPrimitive.PERSIST_QC_CHECKS} must come after {gate}")
         return self
 
     def _labelled_baselines(self) -> list[tuple[str, FlatBaselineResources]]:

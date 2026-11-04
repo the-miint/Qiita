@@ -180,6 +180,7 @@ def _status_from_wire(wire: StepStatusWire) -> StepStatusInfo:
         raw_state=wire.raw_state,
         exit_code=wire.exit_code,
         reason=wire.reason,
+        recovered=wire.recovered,
     )
 
 
@@ -189,6 +190,7 @@ def _status_to_wire(info: StepStatusInfo) -> StepStatusWire:
         raw_state=info.raw_state,
         exit_code=info.exit_code,
         reason=info.reason,
+        recovered=info.recovered,
     )
 
 

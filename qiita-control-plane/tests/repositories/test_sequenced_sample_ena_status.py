@@ -304,8 +304,13 @@ async def test_enumerate_pool_samples_excludes_flagged(postgres_pool):
                     work_ticket_idx=None,
                 )
 
-            samples = await _enumerate_pool_samples(conn, pool_idx)
-            assert [s.prep_sample_idx for s in samples] == [healthy_ps]
+            # No range for these two: the flag filter holds on the range-less side.
+            healthy_empty_ps, _ = await _seed_sample(conn, owner, sequenced_pool_idx=pool_idx)
+            await _seed_sample(conn, owner, sequenced_pool_idx=pool_idx, ena_status="suppressed")
+
+            ranged, rangeless = await _enumerate_pool_samples(conn, pool_idx)
+            assert [s.prep_sample_idx for s in ranged] == [healthy_ps]
+            assert [s.prep_sample_idx for s in rangeless] == [healthy_empty_ps]
         finally:
             await tr.rollback()
 

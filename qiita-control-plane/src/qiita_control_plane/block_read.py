@@ -29,7 +29,7 @@ block's (``routes/read.py`` supplies them from ``fetch_pool_members``).
 from typing import Any
 
 # The two block-read DoGet selector names. Must match the data plane's
-# BLOCK_READ_SOURCES (flight_service.rs) — these are the values we sign into a
+# BLOCK_READ_SOURCES (flight_service/query.rs) — these are the values we sign into a
 # ticket's `table`, and the data plane rejects anything else.
 READ_BLOCK_TABLE = "read_block"
 READ_MASKED_BLOCK_TABLE = "read_masked_block"

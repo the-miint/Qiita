@@ -6,8 +6,8 @@ description: >
   Convert and Golay-barcode demultiplex a sequenced_pool's Illumina 16S run into
   per-sample reads in the DuckLake `read` table. EMP 16S has no per-sample
   Illumina indices — the per-sample identity is a Golay barcode carried IN the
-  index read (I1) — so this runs bcl-convert with a no-index dummy sample sheet
-  (every read to Undetermined, the Golay I1 emitted as a FASTQ), then demuxes on
+  index read (I1) — so this runs bcl-convert with a dummy sample sheet
+  (every decodable read to Undetermined, the Golay I1 emitted as a FASTQ), then demuxes on
   the Golay barcode.
 
   bcl_convert_prep (amplicon mode) builds the dummy sheet from RunInfo.xml and

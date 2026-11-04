@@ -44,6 +44,8 @@ from qiita_common.models import (
     EmailReceiptStatus,
 )
 
+from ..ena_import.submit import DOWNLOAD_ENA_STUDY_ACTION_ID
+from ..repositories.ena_import_batch import fetch_partial_download_counts
 from .render import (
     WORK_TICKET_DIGEST_TEMPLATE,
     render_work_ticket_digest,
@@ -249,6 +251,11 @@ def _digest_context(
         "active_counts": active["by_state"],
         "active_actions": active["actions"],
         "held_total": held_total,
+        "partial_downloads": [
+            {"idx": t["idx"], "failed_runs": t["failed_runs"], "batch_idx": t["batch_idx"]}
+            for t in tickets
+            if "failed_runs" in t
+        ],
     }
 
 
@@ -310,6 +317,15 @@ async def _process_group(
         }
         for r in fresh
     ]
+    download_idxs = [t["idx"] for t in tickets if t["action_id"] == DOWNLOAD_ENA_STUDY_ACTION_ID]
+    partial = (
+        await fetch_partial_download_counts(conn, ticket_idxs=download_idxs)
+        if download_idxs
+        else {}
+    )
+    for t in tickets:
+        if t["idx"] in partial:
+            t["failed_runs"], t["batch_idx"] = partial[t["idx"]]
     active_rows = await _active_rows(conn, originator)
     held_total = await _held_count(conn, originator)
     rendered = render_work_ticket_digest(

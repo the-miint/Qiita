@@ -97,6 +97,7 @@ class StepStatusInfo:
     raw_state: str | None = None
     exit_code: int | None = None
     reason: str | None = None
+    recovered: bool = False  # see `StepStatusWire.recovered`
 
     @property
     def is_terminal(self) -> bool:

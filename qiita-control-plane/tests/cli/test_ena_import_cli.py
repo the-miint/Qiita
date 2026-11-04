@@ -10,15 +10,21 @@ codes) patches `httpx.AsyncClient` to use a `httpx.MockTransport`, mirroring
 from __future__ import annotations
 
 import json
+import zlib
 
 import httpx
 import pytest
 from qiita_common.api_paths import URL_ENA_IMPORT_BATCH_BY_IDX
+from qiita_common.models import BatchItemState, FailureType
+
+from qiita_control_plane.ena_import.registration import EnaRunRegistrationStatus
 
 
 def _item(accession: str, state: str, **extra) -> dict:
     base = {
+        "idx": zlib.crc32(accession.encode()),
         "ena_study_accession": accession,
+        "requested_run_accessions": None,
         "state": state,
         "study_idx": None,
         "failure_reason": None,
@@ -269,7 +275,8 @@ def test_handler_refuses_a_bad_line_naming_its_physical_line_after_a_comment_and
     [
         ("NOTANACCESSION", "does not match a known"),
         ("PRJEB", "does not match a known"),
-        ("SRR1234567", "not a study accession"),
+        ("SAMEA3610311", "study or run accession"),
+        ("ERX1111111", "study or run accession"),
     ],
 )
 def test_handler_refuses_invalid_accession_before_any_http_call(
@@ -288,6 +295,39 @@ def test_handler_refuses_invalid_accession_before_any_http_call(
     err = capsys.readouterr().err
     assert accession in err
     assert expected_message in err
+
+
+def test_run_accessions_are_accepted_positionally_and_posted_mixed(monkeypatch, patch_async_client):
+    from qiita_control_plane.cli.user._parser import _build_parser
+
+    post_body = {"ena_import_batch_idx": 3, "items": [_item("PRJEB11419", "pending")]}
+    handler, calls = _make_handler(post_body=post_body)
+    patch_async_client(httpx.MockTransport(handler))
+    monkeypatch.setenv("QIITA_TOKEN", "qk_test")
+
+    parser = _build_parser()
+    ns = parser.parse_args(["submit-ena-import", "PRJEB11419", "ERR1074767", "--no-watch"])
+
+    assert ns.handler(ns, parser) == 0
+    assert calls[0][2] == {"accessions": ["PRJEB11419", "ERR1074767"]}
+
+
+def test_run_accessions_are_accepted_from_file(tmp_path, monkeypatch, patch_async_client):
+    from qiita_control_plane.cli.user._parser import _build_parser
+
+    accession_file = tmp_path / "runs.txt"
+    accession_file.write_text("ERR1074767\nSRR1234567\n")
+    handler, calls = _make_handler(
+        post_body={"ena_import_batch_idx": 3, "items": [_item("", "pending")]}
+    )
+    patch_async_client(httpx.MockTransport(handler))
+    monkeypatch.setenv("QIITA_TOKEN", "qk_test")
+
+    parser = _build_parser()
+    ns = parser.parse_args(["submit-ena-import", "--from-file", str(accession_file), "--no-watch"])
+
+    assert ns.handler(ns, parser) == 0
+    assert calls[0][2] == {"accessions": ["ERR1074767", "SRR1234567"]}
 
 
 # ---------------------------------------------------------------------------
@@ -396,6 +436,57 @@ def test_watch_exits_1_when_any_item_failed(monkeypatch, patch_async_client, cap
     out, err = capsys.readouterr()
     assert "ENA returned no runs" in err
     assert "ENA returned no runs" in out
+
+
+def test_watch_exits_1_and_names_the_failed_runs_when_an_item_is_completed_partial(
+    monkeypatch, patch_async_client, capsys
+):
+    from qiita_control_plane.cli.user._parser import _build_parser
+
+    post_body = {"ena_import_batch_idx": 5, "items": [_item("PRJEB11419", "pending")]}
+    get_bodies = [
+        {
+            "ena_import_batch_idx": 5,
+            "items": [
+                _item(
+                    "PRJEB11419",
+                    BatchItemState.COMPLETED_PARTIAL,
+                    failure_reason=f"ERR1 ({FailureType.PERMANENT.value})",
+                    ena_runs=[
+                        {
+                            "run_accession": "ERR1",
+                            "status": EnaRunRegistrationStatus.DOWNLOAD_FAILED.value,
+                            "failure_reason": "no sequence data found",
+                            "failure_type": FailureType.PERMANENT.value,
+                        }
+                    ],
+                )
+            ],
+        },
+    ]
+    handler, calls = _make_handler(post_body=post_body, get_bodies=get_bodies)
+    patch_async_client(httpx.MockTransport(handler))
+    monkeypatch.setenv("QIITA_TOKEN", "qk_test")
+
+    parser = _build_parser()
+    ns = parser.parse_args(
+        [
+            "--base-url",
+            "https://q.example.test",
+            "submit-ena-import",
+            "PRJEB11419",
+            "--poll-interval-seconds",
+            "0.001",
+        ]
+    )
+    rc = ns.handler(ns, parser)
+
+    assert rc == 1
+    out, err = capsys.readouterr()
+    partial, permanent = BatchItemState.COMPLETED_PARTIAL.value, FailureType.PERMANENT.value
+    assert f"PRJEB11419 -> {partial} (ERR1 ({permanent}))" in err
+    assert "no sequence data found" in out
+    assert [m for m, _p, _b in calls] == ["POST", "GET"]
 
 
 def test_watch_exits_0_when_a_done_item_has_failed_ena_runs(
@@ -723,6 +814,49 @@ def test_watch_retries_503_forever_until_zero_timeout_fires(
     assert "did not reach a terminal state" in err
 
 
+def test_watch_follows_an_ungrouped_run_list_item_as_it_splits_into_study_items(
+    monkeypatch, patch_async_client, capsys
+):
+    """The ungrouped item keeps its idx when it takes a study accession."""
+    from qiita_control_plane.cli.user._parser import _build_parser
+
+    ungrouped = _item("", "pending", idx=10, ena_study_accession=None)
+    ungrouped["requested_run_accessions"] = ["ERR1", "ERR2"]
+    first = _item("PRJEB1", "pending", idx=10, requested_run_accessions=["ERR1"])
+    second = _item("PRJEB2", "pending", idx=11, requested_run_accessions=["ERR2"])
+    get_bodies = [
+        {"ena_import_batch_idx": 5, "items": [ungrouped]},
+        {"ena_import_batch_idx": 5, "items": [first, second]},
+        {
+            "ena_import_batch_idx": 5,
+            "items": [
+                {**first, "state": "done"},
+                {**second, "state": "failed", "failure_reason": "no public runs"},
+            ],
+        },
+    ]
+    handler, calls = _make_handler(
+        post_body={"ena_import_batch_idx": 5, "items": [ungrouped]}, get_bodies=get_bodies
+    )
+    patch_async_client(httpx.MockTransport(handler))
+    monkeypatch.setenv("QIITA_TOKEN", "qk_test")
+
+    parser = _build_parser()
+    ns = parser.parse_args(
+        ["submit-ena-import", "ERR1", "ERR2", "--poll-interval-seconds", "0.001"]
+    )
+    rc = ns.handler(ns, parser)
+
+    assert rc == 1
+    assert [m for m, _p, _b in calls] == ["POST", "GET", "GET", "GET"]
+    err = capsys.readouterr().err
+    assert "2 requested run(s) -> pending" in err
+    assert "PRJEB1 -> pending" not in err
+    assert "PRJEB2 -> pending" in err
+    assert "PRJEB1 -> done" in err
+    assert "PRJEB2 -> failed (no public runs)" in err
+
+
 def test_watch_times_out_naming_the_batch(monkeypatch, patch_async_client, capsys):
     from qiita_control_plane.cli.user._parser import _build_parser
 
@@ -861,6 +995,33 @@ def test_ena_import_status_issues_get_against_the_idx(monkeypatch):
         f"https://q.example.test{URL_ENA_IMPORT_BATCH_BY_IDX.format(ena_import_batch_idx=5)}"
     )
     assert captured["json"] is None
+
+
+def test_ena_import_status_exits_0_for_a_completed_partial_item(monkeypatch, capsys):
+    from qiita_control_plane.cli import _common
+    from qiita_control_plane.cli.user import main
+
+    response_json = {
+        "ena_import_batch_idx": 5,
+        "items": [
+            _item(
+                "PRJEB11419",
+                BatchItemState.COMPLETED_PARTIAL,
+                failure_reason=f"ERR1 ({FailureType.PERMANENT.value})",
+            )
+        ],
+    }
+
+    def fake_request(method, url, headers=None, json=None, params=None, timeout=None):
+        return httpx.Response(200, json=response_json, request=httpx.Request(method, url))
+
+    monkeypatch.setattr(_common.httpx, "request", fake_request)
+    monkeypatch.setenv("QIITA_TOKEN", "qk_test")
+
+    rc = main(["--base-url", "https://q.example.test", "ena-import-status", "5"])
+
+    assert rc == 0
+    assert BatchItemState.COMPLETED_PARTIAL.value in capsys.readouterr().out
 
 
 def test_ena_import_status_non_200_surfaces_status_and_body(monkeypatch, capsys):

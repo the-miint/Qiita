@@ -35,8 +35,14 @@ from qiita_common.models import (
     TerminologyTermRef,
     Tier,
 )
+from qiita_common.models.biosample import (
+    BIOSAMPLE_DISPLAY_GEOGRAPHIC_LOCATION_LATITUDE,
+    BIOSAMPLE_FIELD_GEOGRAPHIC_LOCATION_LATITUDE,
+    BIOSAMPLE_FIELD_GEOGRAPHIC_LOCATION_LONGITUDE,
+)
 
 from qiita_control_plane.repositories._sample_helpers import (
+    BIOSAMPLE_COORDINATE_DEGREE_BOUNDS,
     GLOBAL_METADATA_VALUE_COLUMN,
     MAX_PG_NUMERIC_INTEGER_DIGITS,
     MAX_PG_NUMERIC_SCALE_DIGITS,
@@ -70,6 +76,7 @@ from qiita_control_plane.repositories._sample_helpers import (
     _get_or_create_local_study_field,
     _insert_metadata,
     _update_metadata,
+    coordinate_degree_bound,
     create_study_field,
     create_study_field_and_read_back,
     fetch_biosample_checklist_requirements,
@@ -100,6 +107,7 @@ from qiita_control_plane.repositories.biosample_metadata import (
     insert_owner_biosample_id_metadata,
 )
 from qiita_control_plane.repositories.prep_sample_metadata import PREP_SAMPLE_METADATA_SPEC
+from qiita_control_plane.repositories.study_access import CallerMetadataTiers
 from qiita_control_plane.testing.db_seeds import (
     NCBI_TAXONOMY_METAGENOME_TERM_ID,
     fetch_seeded_metagenome_term,
@@ -126,6 +134,11 @@ from .conftest import (
 )
 
 pytestmark = pytest.mark.db
+
+# The reads below are tested for what they decode, not for what they hide (that
+# is pinned against the visibility functions directly), so they read at admin
+# everywhere.
+_READ_ALL = CallerMetadataTiers(study_tiers={}, default=Tier.ADMIN)
 
 
 # ---------------------------------------------------------------------------
@@ -1985,6 +1998,71 @@ def test_parse_text_for_data_type_raises_parse_error(data_type, text_value):
     assert excinfo.value.text_value == text_value
 
 
+_LAT_BOUND = Decimal(90)
+_LON_BOUND = Decimal(180)
+
+
+@pytest.mark.parametrize(
+    "bound, text_value, expected",
+    [
+        (_LAT_BOUND, "90", Decimal("90")),
+        (_LAT_BOUND, "-90.000", Decimal("-90.000")),
+        (_LON_BOUND, "180", Decimal("180")),
+        (_LON_BOUND, "-180", Decimal("-180")),
+        (_LON_BOUND, "1.2e2", Decimal("120")),
+    ],
+)
+def test_parse_text_for_data_type_degree_bound_accepts_its_bounds(bound, text_value, expected):
+    """Tests the case where a coordinate sits on or inside its degree bound: it
+    parses like any other number.
+    """
+    parsed = parse_text_for_data_type(
+        "field_x", FieldDataType.NUMERIC, text_value, degree_bound=bound
+    )
+    assert parsed == expected
+
+
+@pytest.mark.parametrize(
+    "bound, text_value",
+    [
+        (_LAT_BOUND, "90.0001"),
+        (_LAT_BOUND, "-91"),
+        (_LON_BOUND, "180.5"),
+        (_LON_BOUND, "-1e3"),
+        (_LAT_BOUND, "NaN"),
+        (_LAT_BOUND, "sNaN"),
+        (_LON_BOUND, "Infinity"),
+        (_LON_BOUND, "-Infinity"),
+    ],
+)
+def test_parse_text_for_data_type_degree_bound_rejects_out_of_range(bound, text_value):
+    """Tests the case where a coordinate is past its degree bound or not finite:
+    it names no place, so it is a parse error, not a stored number.
+    """
+    with pytest.raises(MetadataParseError) as excinfo:
+        parse_text_for_data_type("field_x", FieldDataType.NUMERIC, text_value, degree_bound=bound)
+    assert excinfo.value.field_key == "field_x"
+    assert excinfo.value.reason == f"not a coordinate between -{bound} and {bound} degrees"
+
+
+@pytest.mark.parametrize(
+    "entity_kind, internal_name, expected",
+    [
+        (SampleEntityKind.BIOSAMPLE, BIOSAMPLE_FIELD_GEOGRAPHIC_LOCATION_LATITUDE, _LAT_BOUND),
+        (SampleEntityKind.BIOSAMPLE, BIOSAMPLE_FIELD_GEOGRAPHIC_LOCATION_LONGITUDE, _LON_BOUND),
+        (SampleEntityKind.BIOSAMPLE, "depth", None),
+        (SampleEntityKind.BIOSAMPLE, None, None),
+        (SampleEntityKind.PREP_SAMPLE, BIOSAMPLE_FIELD_GEOGRAPHIC_LOCATION_LATITUDE, None),
+    ],
+)
+def test_coordinate_degree_bound_is_biosample_coordinate_only(entity_kind, internal_name, expected):
+    """Tests the case where a field is not a biosample coordinate global: a
+    non-coordinate global, a purely-local field, and a prep_sample field of the
+    same internal_name carry no bound.
+    """
+    assert coordinate_degree_bound(entity_kind, internal_name) == expected
+
+
 def test_parse_text_for_data_type_raises_not_implemented():
     """Tests the case where the data_type is TERMINOLOGY, which the caller
     resolves against its terminology before dispatching here — reaching the
@@ -3104,7 +3182,9 @@ async def test_fetch_global_metadata_typed_values(ctx, spec):
         value=False,
     )
 
-    result = await fetch_global_metadata(ctx["pool"], spec=spec, entity_idx=entity_idx)
+    result = await fetch_global_metadata(
+        ctx["pool"], spec=spec, entity_idx=entity_idx, tiers=_READ_ALL
+    )
 
     expected = {
         f"host_subject_id_{suffix}": GlobalMetadataRow(
@@ -3187,7 +3267,7 @@ async def test_fetch_global_metadata_excludes_purely_local_rows(ctx, spec):
             created_by_idx=ctx["principal_idx"],
         )
 
-    result = await fetch_global_metadata(ctx["pool"], spec=spec, entity_idx=bs_idx)
+    result = await fetch_global_metadata(ctx["pool"], spec=spec, entity_idx=bs_idx, tiers=_READ_ALL)
 
     # Only the globally-linked row appears; both purely-local rows are filtered.
     expected = {
@@ -3254,7 +3334,7 @@ async def test_fetch_local_metadata_returns_local_excludes_global(ctx, spec):
     )
 
     result = await fetch_local_metadata(
-        ctx["pool"], spec=spec, entity_idx=entity_idx, study_idx=ctx["study_idx"]
+        ctx["pool"], spec=spec, entity_idx=entity_idx, study_idx=ctx["study_idx"], tiers=_READ_ALL
     )
 
     expected = {
@@ -3307,10 +3387,18 @@ async def test_fetch_local_metadata_scopes_to_study(ctx):
         )
 
     first_result = await fetch_local_metadata(
-        ctx["pool"], spec=BIOSAMPLE_METADATA_SPEC, entity_idx=bs_idx, study_idx=ctx["study_idx"]
+        ctx["pool"],
+        spec=BIOSAMPLE_METADATA_SPEC,
+        entity_idx=bs_idx,
+        study_idx=ctx["study_idx"],
+        tiers=_READ_ALL,
     )
     second_result = await fetch_local_metadata(
-        ctx["pool"], spec=BIOSAMPLE_METADATA_SPEC, entity_idx=bs_idx, study_idx=second_study_idx
+        ctx["pool"],
+        spec=BIOSAMPLE_METADATA_SPEC,
+        entity_idx=bs_idx,
+        study_idx=second_study_idx,
+        tiers=_READ_ALL,
     )
 
     assert first_result == {
@@ -3346,7 +3434,11 @@ async def test_fetch_local_metadata_includes_owner_sample_id_row(ctx):
         )
 
     result = await fetch_local_metadata(
-        ctx["pool"], spec=BIOSAMPLE_METADATA_SPEC, entity_idx=bs_idx, study_idx=ctx["study_idx"]
+        ctx["pool"],
+        spec=BIOSAMPLE_METADATA_SPEC,
+        entity_idx=bs_idx,
+        study_idx=ctx["study_idx"],
+        tiers=_READ_ALL,
     )
     assert result == {
         owner_field_name: MetadataRow(
@@ -3389,7 +3481,9 @@ async def test_fetch_global_metadata_preserves_link_retired_rows(ctx, spec):
     )
     await _retire_entity_to_study_link(ctx, spec, entity_idx)
 
-    result = await fetch_global_metadata(ctx["pool"], spec=spec, entity_idx=entity_idx)
+    result = await fetch_global_metadata(
+        ctx["pool"], spec=spec, entity_idx=entity_idx, tiers=_READ_ALL
+    )
 
     # The row still satisfies global_field_idx IS NOT NULL and surfaces
     # unchanged through the cross-study read.
@@ -3418,7 +3512,9 @@ async def test_fetch_global_metadata_empty_when_none_exist(ctx, spec):
         else _create_prep_sample_with_link(ctx)
     )
 
-    result = await fetch_global_metadata(ctx["pool"], spec=spec, entity_idx=entity_idx)
+    result = await fetch_global_metadata(
+        ctx["pool"], spec=spec, entity_idx=entity_idx, tiers=_READ_ALL
+    )
     assert result == {}
 
 
@@ -3466,7 +3562,9 @@ async def test_fetch_global_metadata_surfaces_missing_reason_rows(ctx, spec):
         value=MissingReasonRef(idx=reason_idx, name=reason_name),
     )
 
-    result = await fetch_global_metadata(ctx["pool"], spec=spec, entity_idx=entity_idx)
+    result = await fetch_global_metadata(
+        ctx["pool"], spec=spec, entity_idx=entity_idx, tiers=_READ_ALL
+    )
 
     expected = {
         f"host_subject_id_{suffix}": GlobalMetadataRow(
@@ -5167,7 +5265,9 @@ async def test_fetch_global_metadata_surfaces_terminology_term_rows(ctx, spec, m
         terminology_idx=terminology_idx,
     )
 
-    result = await fetch_global_metadata(ctx["pool"], spec=spec, entity_idx=entity_idx)
+    result = await fetch_global_metadata(
+        ctx["pool"], spec=spec, entity_idx=entity_idx, tiers=_READ_ALL
+    )
 
     expected = {
         internal_name: GlobalMetadataRow(
@@ -6981,6 +7081,7 @@ async def test_fetch_entity_idx_by_unique_field_value(ctx, spec):
             study_field_idx=field_idx,
             data_type=FieldDataType.TEXT,
             value="Sample 1",
+            tiers=_READ_ALL,
         )
         missed = await fetch_entity_idx_by_unique_field_value(
             conn,
@@ -6988,6 +7089,7 @@ async def test_fetch_entity_idx_by_unique_field_value(ctx, spec):
             study_field_idx=field_idx,
             data_type=FieldDataType.TEXT,
             value="Sample 2",
+            tiers=_READ_ALL,
         )
 
     assert found == entity_idx
@@ -7027,6 +7129,7 @@ async def test_fetch_entity_idx_by_unique_field_value_not_unique_returns_none(ct
             study_field_idx=field_idx,
             data_type=FieldDataType.TEXT,
             value="Sample 1",
+            tiers=_READ_ALL,
         )
 
     assert found is None
@@ -7056,6 +7159,7 @@ async def test_fetch_entity_idx_by_unique_field_value_scoped_to_its_field(ctx, s
             study_field_idx=first_field,
             data_type=FieldDataType.TEXT,
             value="Shared",
+            tiers=_READ_ALL,
         )
         via_second = await fetch_entity_idx_by_unique_field_value(
             conn,
@@ -7063,7 +7167,74 @@ async def test_fetch_entity_idx_by_unique_field_value_scoped_to_its_field(ctx, s
             study_field_idx=second_field,
             data_type=FieldDataType.TEXT,
             value="Shared",
+            tiers=_READ_ALL,
         )
 
     assert via_first == first_entity
     assert via_second == second_entity
+
+
+# ---------------------------------------------------------------------------
+# Coordinate degree bound through preflight_sample_metadata
+# ---------------------------------------------------------------------------
+
+
+async def test_biosample_coordinate_bounds_name_seeded_numeric_globals(ctx):
+    """Tests the case where a bound's internal_name drifts from the seeded
+    global: the bound would silently never fire, so each must name a NUMERIC
+    biosample global.
+    """
+    rows = await ctx["pool"].fetch(
+        "SELECT internal_name, data_type FROM qiita.biosample_global_field"
+        " WHERE internal_name = ANY($1::text[])",
+        list(BIOSAMPLE_COORDINATE_DEGREE_BOUNDS),
+    )
+    assert {r["internal_name"]: r["data_type"] for r in rows} == dict.fromkeys(
+        BIOSAMPLE_COORDINATE_DEGREE_BOUNDS, FieldDataType.NUMERIC.value
+    )
+
+
+async def _latitude_alias(ctx) -> str:
+    """A study-local field under a new display name, linked to the latitude global."""
+    alias = unique_field_name()
+    global_field_idx = await ctx["pool"].fetchval(
+        "SELECT idx FROM qiita.biosample_global_field WHERE internal_name = $1",
+        BIOSAMPLE_FIELD_GEOGRAPHIC_LOCATION_LATITUDE,
+    )
+    async with ctx["pool"].acquire() as conn, conn.transaction():
+        await _get_or_create_globally_linked_study_field(
+            conn,
+            spec=BIOSAMPLE_METADATA_SPEC,
+            study_idx=ctx["study_idx"],
+            global_field_idx=global_field_idx,
+            display_name=alias,
+            created_by_idx=ctx["principal_idx"],
+        )
+    return alias
+
+
+@pytest.mark.parametrize("keyed_by", ["display_name", "internal_name", "alias"])
+async def test_preflight_sample_metadata_bounds_latitude_however_keyed(ctx, keyed_by):
+    """Tests the case where a latitude past 90 reaches the global latitude by its
+    display name, by its internal_name, or through a study-local alias: the
+    bound follows the resolved global, so every route rejects it.
+    """
+    key = {
+        "display_name": BIOSAMPLE_DISPLAY_GEOGRAPHIC_LOCATION_LATITUDE,
+        "internal_name": BIOSAMPLE_FIELD_GEOGRAPHIC_LOCATION_LATITUDE,
+        "alias": await _latitude_alias(ctx) if keyed_by == "alias" else None,
+    }[keyed_by]
+
+    async with ctx["pool"].acquire() as conn:
+        with pytest.raises(MetadataParseError) as excinfo:
+            await preflight_sample_metadata(
+                conn,
+                spec=BIOSAMPLE_METADATA_SPEC,
+                study_idx=ctx["study_idx"],
+                metadata={key: "200"},
+                allow_local=True,
+                global_internal_names=keyed_by == "internal_name",
+            )
+
+    assert excinfo.value.field_key == key
+    assert "degrees" in excinfo.value.reason

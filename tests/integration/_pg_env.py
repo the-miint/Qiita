@@ -23,6 +23,11 @@ DUCKLAKE_CONNSTR_DEFAULT = (
 )
 LIB_PATH_ENV = "DYLD_LIBRARY_PATH" if sys.platform == "darwin" else "LD_LIBRARY_PATH"
 
+# The DuckLake catalog format every test ATTACH names: the data plane's
+# `DUCKLAKE_CATALOG_VERSION` (qiita-data-plane/src/ducklake.rs says why), held equal
+# to it by qiita-common/tests/test_duckdb_version_sync.py.
+DUCKLAKE_VERSION = "1.0"
+
 
 def ducklake_catalog_connstr() -> str:
     return os.environ.get("DUCKLAKE_CATALOG_CONNSTR", DUCKLAKE_CONNSTR_DEFAULT)
@@ -47,6 +52,7 @@ def find_duckdb_lib_dir(data_plane_dir: Path) -> Path | None:
 
 __all__ = [
     "DUCKLAKE_CONNSTR_DEFAULT",
+    "DUCKLAKE_VERSION",
     "LIB_PATH_ENV",
     "ducklake_catalog_connstr",
     "find_duckdb_lib_dir",

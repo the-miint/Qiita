@@ -22,7 +22,9 @@ description: >
   fetches every run with `read_ena_sequences`, mints a sequence_idx range
   per run, and writes the FULL reads into the DuckLake `read` table (once,
   independent of any mask) plus a durable per-sample copy the repeatable
-  read-mask workflow consumes. Transport is pinned to `download_method:
+  read-mask workflow consumes. A run whose fetch fails permanently does not
+  fail the pool when another run was stored: `persist-ena-run-outcomes`
+  records it on its sequenced_sample. Transport is pinned to `download_method:
   http` (no Aspera key-staging exists in the compute env; see
   `docs/architecture.md`'s ENA Study Import download-ticket-granularity decision).
 
@@ -56,6 +58,11 @@ context_schema:
     download_method:
       type: string
       enum: [http]
+    # Runs fetched at once per ticket; omitted -> the job's default.
+    run_concurrency:
+      type: integer
+      minimum: 1
+      maximum: 8
 
 steps:
   # Store the pool's reads once. For each run in `ena_run_map`, fetch its
@@ -73,16 +80,15 @@ steps:
     # scalar, not a path) — optional; the job defaults to 'http' when
     # a submitter omits it.
     inputs: [ena_run_map, reads_staging_root]
-    params: { download_method: download_method }
-    outputs: [read_staging_dir]
+    params: { download_method: download_method, run_concurrency: run_concurrency }
+    outputs: [read_staging_dir, run_outcomes]
     baseline_resources:
-      # Bounded-concurrent per-run loop (up to _CONCURRENCY=4 runs fetched at
-      # once, 2 DuckDB threads each -> cpu = 4*2 = 8, mem_gb split across the
-      # 4 slots from the cgroup — see per_slot_caps in
+      # Bounded-concurrent per-run loop (`run_concurrency` runs fetched at
+      # once, default 4, 2 DuckDB threads each; mem_gb is split across the
+      # slots from the cgroup — see per_slot_caps in
       # qiita_compute_orchestrator/read_staging.py).
-      # Network-bound (well under miint's ENAClient outbound rate limit), so
-      # walltime is sized well above ingest_reads' local-parse PT8H baseline to
-      # cover a pool of real-world-sized public runs over the network.
+      # Network-bound, so walltime is sized well above ingest_reads' local-parse
+      # PT8H baseline to cover a pool of real-world-sized public runs over the network.
       # mem_gb tracks ingest_reads' baseline (bcl-convert/1.0.0.yaml) -- the two
       # share the read_staging per-slot DuckDB path -- rather than diverging on an
       # unmeasured figure.
@@ -95,6 +101,11 @@ steps:
   # maps the subdir -> the `read` table (subdir-of-parts convention).
   - action: register-files
     inputs: [read_staging_dir]
+    outputs: []
+
+  # Last: step progress is keyed by index, so a resumed ticket never re-runs register-files.
+  - action: persist-ena-run-outcomes
+    inputs: [run_outcomes]
     outputs: []
 
 # Headroom above the single baseline for the runner's OOM/TIMEOUT

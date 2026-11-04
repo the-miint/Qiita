@@ -337,6 +337,51 @@ async def test_submit_returns_202_with_pending_items(
         await _cleanup_study(postgres_pool, accession)
 
 
+async def test_submit_accepts_study_and_run_accessions_mixed(
+    eib_client, postgres_pool, admin_token, download_ena_study_action
+):
+    token, _ = admin_token
+    study = unique_ena_accession("PRJNA")
+    runs = [unique_ena_accession("ERR"), unique_ena_accession("SRR")]
+
+    resp = await eib_client.post(
+        URL_ENA_IMPORT_BATCH_PREFIX,
+        json={"accessions": [study, *runs]},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 202, resp.text
+    body = resp.json()
+    eib_client._created_batches.append(body["ena_import_batch_idx"])
+    whole, listed = body["items"]
+    assert (whole["ena_study_accession"], whole["requested_run_accessions"]) == (study, None)
+    assert (listed["ena_study_accession"], listed["requested_run_accessions"]) == (None, runs)
+    assert {whole["state"], listed["state"]} == {"pending"}
+    assert whole["idx"] != listed["idx"]
+
+    await _await_batch_tasks(eib_client)
+    await _cleanup_study(postgres_pool, study)
+
+
+@pytest.mark.parametrize("bad", ["SAMEA3610311", "ERX1111111"])
+async def test_submit_rejects_sample_and_experiment_accessions_without_creating_batch(
+    bad, eib_client, admin_token, postgres_pool
+):
+    token, pidx = admin_token
+    resp = await eib_client.post(
+        URL_ENA_IMPORT_BATCH_PREFIX,
+        json={"accessions": [unique_ena_accession("ERR"), bad]},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 422, resp.text
+    assert "study or run" in resp.json()["detail"]
+
+    count = await postgres_pool.fetchval(
+        "SELECT count(*) FROM qiita.ena_import_batch WHERE submitted_by_principal_idx = $1",
+        pidx,
+    )
+    assert count == 0
+
+
 async def test_submit_requires_admin_role(eib_client, regular_token):
     token, _ = regular_token
     resp = await eib_client.post(

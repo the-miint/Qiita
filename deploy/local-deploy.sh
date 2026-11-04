@@ -9,7 +9,9 @@
 #   sudo QIITA_HOSTNAME=qiita.example.org /home/qiita/qiita-miint/deploy/local-deploy.sh
 #
 # Env: QIITA_HOSTNAME (required), QIITA_USER (default: qiita),
-#      QIITA_CLONE (default: this script's parent), SKIP_PULL=1, SKIP_BUILD=1.
+#      QIITA_CLONE (default: this script's parent), SKIP_PULL=1, SKIP_BUILD=1,
+#      QIITA_DP_DISABLE_REMOVED=1 (activate.sh: stop and disable data-plane units
+#      outside QIITA_DATA_PLANE_PORTS instead of refusing to deploy).
 
 set -euo pipefail
 
@@ -26,13 +28,14 @@ qiita_resolve_user_clone
 [ -z "${SKIP_PULL:-}" ]  && sudo -u "$QIITA_USER" git -C "$QIITA_CLONE" pull --ff-only
 [ -z "${SKIP_BUILD:-}" ] && sudo -u "$QIITA_USER" make -C "$QIITA_CLONE" build-data-plane
 
-# Stamp the deployed commit so the CP landing page can show it. Captured
-# here (the only stage with a git clone — /opt/qiita has no .git) and
-# handed to activate.sh via the environment; activate.sh writes it into
-# the deploy-owned build.env the systemd unit reads. The FULL 40-char SHA is
-# passed; activate.sh owns the single truncation site so the footer short SHA
-# is consistently shaped. Non-fatal: an unset SHA just leaves the footer
-# version-only.
+# Stamp the deployed commit for the CP landing page and the data planes.
+# Captured here (the only stage with a git clone — /opt/qiita has no .git)
+# and handed to activate.sh via the environment; activate.sh writes it into
+# each deploy-owned build.env its systemd units read: truncated for the CP
+# footer (activate.sh owns that single truncation site), and in full for the
+# data planes' commit check. An unset SHA is non-fatal: the footer stays
+# version-only and verify skips the commit check. A SHA that is not a full
+# commit aborts activate.sh (qiita_data_plane_build_commit in _common.sh).
 QIITA_BUILD_SHA="$(sudo -u "$QIITA_USER" git -C "$QIITA_CLONE" rev-parse HEAD 2>/dev/null || true)"
 export QIITA_BUILD_SHA
 

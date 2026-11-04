@@ -111,7 +111,8 @@ require it; it is rejected on a non-absquant pool).
 
 Each completed `read-mask` ticket under a SynDNA mask writes, per prep_sample, the number
 of reads with a mapped primary alignment to each member of the reference — ungated,
-so not the `spikein_read_count_r1r2` total — into `qiita.syndna_read_count`. A study
+so not the `spikein_read_count_r1r2` total — into `qiita.syndna_read_count`. A
+prep_sample that ingest found empty gets a zero per member instead. A study
 reader exports them as the table classic Qiita published as `syndna.biom`:
 
 ```bash

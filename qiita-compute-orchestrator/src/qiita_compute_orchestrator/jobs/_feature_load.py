@@ -12,7 +12,7 @@ Both writers emit the run's whole feature set, a feature another run
 already loaded included — a native job has no DuckLake access, so there
 is nothing here to anti-join against. Convergence happens at register
 time instead: the data plane replaces these tables on `feature_idx`
-rather than appending (`flight_service::REPLACE_KEY_TABLES`). What that
+rather than appending (`flight_service::registration::REPLACE_KEY_TABLES`). What that
 requires is that a feature's rows all arrive in ONE registration, not in
 one part — the replace unions the keys of every part headed for a table
 before deleting anything, so a feature spread across several parts of
@@ -32,7 +32,7 @@ from pathlib import Path
 import duckdb
 from qiita_common.parquet import validate_parquet_path
 
-from ..miint import PARQUET_OPTS, PARQUET_OPTS_CHUNKED
+from ..miint import PARQUET_OPTS_AT_REST
 
 # Per-batch chunk budget, shared by every pass that reassembles or rewrites
 # chunked sequence data (`write_feature_sequence_chunks` here; the hashing pass and
@@ -128,7 +128,7 @@ def write_feature_sequences(
         "    feature_idx, sequence_hash, sequence_length_bp"
         "  FROM id_map"
         "  ORDER BY feature_idx"
-        f") TO '{out}' ({PARQUET_OPTS})"
+        f") TO '{out}' ({PARQUET_OPTS_AT_REST})"
     )
 
 
@@ -255,12 +255,15 @@ def write_feature_sequence_chunks(
             # without this sort a point query would scan a whole part. The
             # secondary `chunk_index` orders a feature's chunks for cheap
             # reassembly.
+            (chunks,) = conn.execute("SELECT count(*) FROM part_chunks").fetchone()
+            if not chunks:
+                raise ValueError(f"batch {i} matched no chunks in {parts_glob}")
             conn.execute(
                 "COPY ("
                 "  SELECT feature_idx, chunk_index, chunk_data"
                 "  FROM part_chunks"
                 "  ORDER BY feature_idx, chunk_index"
-                f") TO '{part_out}' ({PARQUET_OPTS_CHUNKED})"
+                f") TO '{part_out}' ({PARQUET_OPTS_AT_REST})"
             )
         conn.execute("DROP TABLE IF EXISTS part_chunks")
     else:
@@ -277,5 +280,5 @@ def write_feature_sequence_chunks(
             "    CAST(NULL AS INTEGER) AS chunk_index,"
             "    CAST(NULL AS VARCHAR) AS chunk_data"
             "  WHERE FALSE"
-            f") TO '{empty_out}' ({PARQUET_OPTS_CHUNKED})"
+            f") TO '{empty_out}' ({PARQUET_OPTS_AT_REST})"
         )

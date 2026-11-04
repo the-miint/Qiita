@@ -169,11 +169,13 @@ class LibraryPrimitive(StrEnum):
     # See qiita_control_plane.actions.library.finalize_shard.
     FINALIZE_SHARD = "finalize-shard"
     PERSIST_READ_METRICS = "persist-read-metrics"
+    PERSIST_ENA_RUN_OUTCOMES = "persist-ena-run-outcomes"
     # Read-mask: the per-insert SynDNA read counts from the `syndna` step's
     # alignment, into qiita.syndna_read_count. See
     # qiita_control_plane.actions.library.persist_syndna_read_count.
     PERSIST_SYNDNA_READ_COUNT = "persist-syndna-read-count"
     PERSIST_QC_REPORT = "persist-qc-report"
+    PERSIST_QC_CHECKS = "persist-qc-checks"
     # Block-compute: idempotent block replace. Runs immediately BEFORE
     # register-files in the bulk-block read-mask workflow — deletes this block's
     # exact read_mask footprint (its member sub-ranges under the ticket's
@@ -378,7 +380,7 @@ def compute_upload_staging_path(staging_root: Path, upload_idx: int) -> Path:
     """Canonical filesystem path for a staged DoPut upload.
 
     Mirrors the Rust ``staging_path_for(root, idx)`` in
-    ``qiita-data-plane/src/flight_service.rs``: a single source of truth
+    ``qiita-data-plane/src/flight_service/doput.rs``: a single source of truth
     so the data plane (writes here on DoPut) and the control-plane
     runner (reads here on workflow start) agree byte-for-byte. The
     layout — ``{root}/uploads/{idx}/upload.parquet`` — is locked by
@@ -433,6 +435,16 @@ URL_SEQUENCE_RANGE_BY_PREP_SAMPLE = (
 )
 
 # =============================================================================
+# /qc-check/* — per-prep_sample QC check rows and verdict
+# =============================================================================
+
+PATH_QC_CHECK_PREFIX = "/qc-check"
+PATH_QC_CHECK_BY_PREP_SAMPLE = "/{prep_sample_idx}"
+
+URL_QC_CHECK_PREFIX = f"{API_PREFIX}{PATH_QC_CHECK_PREFIX}"
+URL_QC_CHECK_BY_PREP_SAMPLE = f"{URL_QC_CHECK_PREFIX}{PATH_QC_CHECK_BY_PREP_SAMPLE}"
+
+# =============================================================================
 # /mask-definition/* — control-plane read-filtering config identity
 # =============================================================================
 # Mints (idempotently, deduped on a canonical-config hash) the mask_idx that
@@ -448,7 +460,7 @@ URL_SEQUENCE_RANGE_BY_PREP_SAMPLE = (
 
 PATH_MASK_DEFINITION_PREFIX = "/mask-definition"
 PATH_MASK_DEFINITION_ROOT = ""  # POST (mint) / GET (list) against the prefix itself
-PATH_MASK_DEFINITION_BY_IDX = "/{mask_idx}"  # GET one mask; DELETE (lake rows + Postgres row)
+PATH_MASK_DEFINITION_BY_IDX = "/{mask_idx}"  # GET one mask
 PATH_MASK_DEFINITION_PREP_SAMPLE = "/{mask_idx}/prep-sample"  # GET the per-sample roster
 # PATCH the CONFIG's lifecycle (active <-> deprecated). Mirrors
 # PATH_REFERENCE_STATUS; a deprecated config cannot be minted against.

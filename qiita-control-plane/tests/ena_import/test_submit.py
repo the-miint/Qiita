@@ -30,6 +30,20 @@ def test_builds_sequenced_pool_scoped_ticket():
     assert req.action_context == {"ena_study_accession": "PRJEB1234"}
 
 
+def test_run_concurrency_is_carried_only_when_set():
+    unset = build_download_ena_study_ticket(
+        sequenced_pool_idx=7, sequencing_run_idx=3, ena_study_accession="PRJEB1234"
+    )
+    set_ = build_download_ena_study_ticket(
+        sequenced_pool_idx=7,
+        sequencing_run_idx=3,
+        ena_study_accession="PRJEB1234",
+        run_concurrency=8,
+    )
+    assert unset.action_context == {"ena_study_accession": "PRJEB1234"}
+    assert set_.action_context == {"ena_study_accession": "PRJEB1234", "run_concurrency": 8}
+
+
 def test_action_id_version_pinned_against_the_synced_workflow():
     """The pinned constants must match the on-disk workflow YAML synced into
     qiita.action -- a drift would submit tickets against a non-existent action."""

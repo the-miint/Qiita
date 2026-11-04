@@ -1,10 +1,11 @@
 """Sequence-range allocation routes.
 
-POST /sequence-range mints a contiguous bigint range for a prep_sample.
-Service-account callers with the `sequence_range:mint` scope only —
-humans never mint sequence ranges. The cap on a single allocation is
-read from Settings.max_sequence_mint_count (so a runaway compute step
-can't burn an unbounded slice of the sequence_idx space).
+POST /sequence-range mints a contiguous bigint range for a prep_sample, and in
+the same transaction removes any record that the prep_sample was masked with no
+reads (`clear_empty_mask_completions`). Service-account callers with the
+`sequence_range:mint` scope only — humans never mint sequence ranges. The cap on
+a single allocation is read from Settings.max_sequence_mint_count (so a runaway
+compute step can't burn an unbounded slice of the sequence_idx space).
 
 GET /sequence-range/{prep_sample_idx} reads the row back. Who may read it is
 on `get_sequence_range_route`.
@@ -27,11 +28,13 @@ from qiita_common.api_paths import (
 from qiita_common.auth_constants import Scope
 from qiita_common.models import SequenceRange, SequenceRangeMintRequest
 
+from ..actions.library import clear_empty_mask_completions
 from ..auth.guards import COHORT_MIN_TIER, require_any_scope, require_service_with_scope
 from ..auth.principal import Principal, ServiceAccount
 from ..deps import TxConnFactory, get_db_pool, get_settings, get_tx_conn_factory
 from ..repositories.sequence_range import (
     fetch_sequence_range_by_prep_sample_idx,
+    lock_prep_sample_range,
     mint_sequence_range,
 )
 from ._helpers import authorize_prep_sample_cohort
@@ -66,12 +69,16 @@ async def mint_sequence_range_route(
     tx: TxConnFactory = Depends(get_tx_conn_factory),
     sa: ServiceAccount = Depends(require_service_with_scope(Scope.SEQUENCE_RANGE_MINT)),
 ) -> SequenceRange:
-    """Mint a contiguous sequence_idx range for `body.prep_sample_idx`.
+    """Mint a contiguous sequence_idx range for `body.prep_sample_idx`, and remove any
+    record that it was masked with no reads (`clear_empty_mask_completions`) in the
+    same transaction.
 
     Caller must be a ServiceAccount holding `sequence_range:mint`.
     Pydantic enforces count > 0 and prep_sample_idx > 0; the route adds
     the dynamic cap from Settings. The plpgsql function holds an
-    advisory lock for the nextval/setval/INSERT critical section.
+    advisory lock for the nextval/setval/INSERT critical section; the
+    route takes the prep_sample's own lock before it
+    (`lock_prep_sample_range`).
 
     Maps repository-layer exceptions to HTTP status:
       - asyncpg.UniqueViolationError → 409 (prep_sample already has a range)
@@ -98,6 +105,7 @@ async def mint_sequence_range_route(
 
     async with tx() as conn:
         try:
+            await lock_prep_sample_range(conn, prep_sample_idx=body.prep_sample_idx)
             row = await mint_sequence_range(
                 conn,
                 prep_sample_idx=body.prep_sample_idx,
@@ -105,6 +113,7 @@ async def mint_sequence_range_route(
                 principal_idx=sa.principal_idx,
                 work_ticket_idx=body.work_ticket_idx,
             )
+            await clear_empty_mask_completions(conn, prep_sample_idx=body.prep_sample_idx)
         except asyncpg.UniqueViolationError:
             raise HTTPException(
                 status_code=409,

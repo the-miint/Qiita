@@ -39,7 +39,7 @@ ASSEMBLED_SEQUENCE_CHUNKS_TABLE = "assembled_sequence_chunks"
 # Per-subject CheckM quality for one assembly run. On both DoGet allowlists;
 # signed over HTTP only by the human assembly run mint (`routes/assembly.py`) and
 # in-process by the feature-table resolver. The `ALLOWED_TABLES` entry in
-# `flight_service.rs` carries the privacy argument.
+# `flight_service/query.rs` carries the privacy argument.
 BIN_QUALITY_TABLE = "bin_quality"
 
 # The two quality columns the feature-table arm reads. A named pair rather than a
@@ -222,10 +222,12 @@ def register_contig_attribute_table(conn: Any, path: Path) -> None:
         f" delim='\t', header=true, columns={{{types}}})",
         [str(path)],
     )
-    (repeated,) = conn.execute(
+    # `fetchall`, not `fetchone`: a part-read result would refuse the caller's next
+    # relational call on `conn` (see `qiita_common.duckdb_relation`).
+    [(repeated,)] = conn.execute(
         "SELECT count(*) FROM (SELECT contig_id FROM contig_attribute"
         " GROUP BY contig_id HAVING count(*) > 1)"
-    ).fetchone()
+    ).fetchall()
     if repeated:
         raise ValueError(
             f"{path} repeats {repeated} contig_id(s); the attribute join would "

@@ -19,6 +19,38 @@ through HTTP.
 
 import asyncpg
 
+from . import INT4_MASK, require_transaction
+
+# pg_advisory_xact_lock(class, key) class for a prep_sample's range mint vs the
+# writers that act on its having none; allocated in repositories/__init__'s registry,
+# distinct from sequencing_run's and fanout_dispatch's.
+PREP_SAMPLE_RANGE_LOCK_CLASS = 0x05E9_0001
+
+
+async def lock_prep_sample_range(conn: asyncpg.Connection, *, prep_sample_idx: int) -> None:
+    """Take the transaction-scoped advisory lock on `prep_sample_idx`'s sequence_range,
+    held to commit.
+
+    The range mint (`POST /sequence-range`) and its `clear_empty_mask_completions`
+    take it, and so does `complete_empty_mask_sample_in_tx`, before it reads that the
+    prep_sample has no range. Under READ COMMITTED neither side sees the other's
+    uncommitted rows: without the lock, a writer can find no range while a mint's
+    is still uncommitted, and the mint's removal of empty completions
+    (`clear_empty_mask_completions`) can miss the writer's uncommitted row. The
+    prep_sample then holds reads and an empty completion at once. With the lock,
+    whichever side takes it second waits for the first to commit, then sees its rows.
+
+    The mint takes it before `mint_sequence_range`, whose allocation lock is global
+    and held to commit: waiting for this lock after that one would stall every mint
+    behind a block plan that holds it. A caller taking it for many prep_samples takes
+    them in ascending prep_sample_idx order, so two such callers cannot deadlock."""
+    require_transaction(conn)
+    await conn.execute(
+        "SELECT pg_advisory_xact_lock($1, $2)",
+        PREP_SAMPLE_RANGE_LOCK_CLASS,
+        prep_sample_idx & INT4_MASK,
+    )
+
 
 async def mint_sequence_range(
     conn: asyncpg.Connection,

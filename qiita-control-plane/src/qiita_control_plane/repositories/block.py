@@ -247,6 +247,12 @@ async def fetch_mask_sample_state(
     deprecating the CONFIG (`MaskDefinitionStatus`). So absence (`None`) means "no
     mask has completed for this (mask_idx, prep_sample)" — NOT an exempt sample.
 
+    A prep_sample that ingest found empty has nothing to mask, so it is written
+    'completed' with an empty pass-set (`complete_empty_mask_sample_in_tx`), and that
+    row is removed if the prep_sample later gains reads. A consumer of a 'completed'
+    row therefore accepts zero rows, which is also what a prep_sample whose every
+    read failed QC yields.
+
     THE INVARIANT: any consumer that must not read an absent, PARTIAL or withdrawn
     pass-set proceeds ONLY on 'completed', rejecting `None` (absence is never
     "pass"), 'pending' and 'invalidated'. Expressing withdrawal as a state value

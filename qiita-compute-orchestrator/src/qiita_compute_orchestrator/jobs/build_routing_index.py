@@ -60,7 +60,7 @@ from ..config import get_settings
 from ..data_plane_client import open_reference_chunk_stream
 from ..derived_store import rype_router_index_path
 from ..miint import (
-    PARQUET_OPTS_CHUNKED,
+    PARQUET_OPTS_CHUNKED_TRANSFER,
     apply_duckdb_settings,
     detected_ram_gb,
     duckdb_headroom_gb,
@@ -222,7 +222,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             ) as rel:
                 conn.execute(
                     f"COPY (SELECT feature_idx, chunk_index, chunk_data FROM {rel}) "
-                    f"TO '{chunks_sql}' ({PARQUET_OPTS_CHUNKED})"
+                    f"TO '{chunks_sql}' ({PARQUET_OPTS_CHUNKED_TRANSFER})"
                 )
 
             # Multi-bucket mapping straight from the staged Parquet: one bucket per

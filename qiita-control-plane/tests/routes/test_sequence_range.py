@@ -6,6 +6,7 @@ cascade error paths, and concurrent-mint behaviour through the HTTP surface.
 """
 
 import asyncio
+import contextlib
 import secrets
 
 import pytest
@@ -19,6 +20,11 @@ from qiita_common.auth_constants import Scope
 from qiita_common.models import Tier
 
 from qiita_control_plane.auth.token import mint_api_token
+from qiita_control_plane.repositories import INT4_MASK
+from qiita_control_plane.repositories.sequence_range import (
+    PREP_SAMPLE_RANGE_LOCK_CLASS,
+    lock_prep_sample_range,
+)
 from qiita_control_plane.testing.db_seeds import (
     seed_biosample_to_study_link,
     seed_biosample_with_sequenced_prep_sample,
@@ -26,6 +32,7 @@ from qiita_control_plane.testing.db_seeds import (
     seed_user_principal,
 )
 from qiita_control_plane.testing.db_teardown import delete_principal, teardown_entity_graph
+from qiita_control_plane.testing.postgres import until_advisory_lock_awaited
 
 from .conftest import _grant_study_access, _seed_study
 
@@ -448,6 +455,35 @@ async def test_post_concurrent_mints_disjoint(ctx):
     assert lo["sequence_idx_stop"] < hi["sequence_idx_start"], (lo, hi)
 
 
+async def test_post_takes_the_prep_samples_lock_before_allocating(ctx, foreign_prep_sample):
+    """A mint whose prep_sample's range lock is held (as an empty-completion writer
+    holds it) waits before it takes the global allocation lock, so a mint for another
+    prep_sample goes through meanwhile."""
+    pool, ps = ctx["pool"], ctx["prep_sample_idx"]
+    waiting = None
+    try:
+        async with pool.acquire() as conn, conn.transaction():
+            await lock_prep_sample_range(conn, prep_sample_idx=ps)
+            waiting = asyncio.create_task(_mint(ctx, ps))
+            await asyncio.wait_for(
+                until_advisory_lock_awaited(
+                    pool, lock_class=PREP_SAMPLE_RANGE_LOCK_CLASS, key=ps & INT4_MASK, task=waiting
+                ),
+                timeout=10,
+            )
+            other = await asyncio.wait_for(_mint(ctx, foreign_prep_sample), timeout=10)
+            assert not waiting.done()
+
+        first = await asyncio.wait_for(waiting, timeout=10)
+    finally:
+        # A failure above leaves the mint running; reap it before teardown.
+        if waiting is not None and not waiting.done():
+            waiting.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await waiting
+    assert first["sequence_idx_start"] > other["sequence_idx_stop"]
+
+
 # ---------------------------------------------------------------------------
 # GET /sequence-range/{prep_sample_idx}
 # ---------------------------------------------------------------------------
@@ -638,3 +674,35 @@ async def test_cascade_then_remint_yields_advanced_start(ctx):
     assert second_resp.status_code == 201, second_resp.text
     second = second_resp.json()
     assert second["sequence_idx_start"] > first["sequence_idx_stop"]
+
+
+async def test_post_removes_a_record_that_the_prep_sample_was_masked_with_no_reads(ctx):
+    """A prep_sample recorded as masked with no reads (ingest found it empty) that
+    now gets a range is gaining reads: the record goes in the mint's transaction, so
+    no consumer is served an empty pass-set over reads that exist."""
+    pool, ps = ctx["pool"], ctx["prep_sample_idx"]
+    mask_idx = await pool.fetchval(
+        "INSERT INTO qiita.mask_definition"
+        " (params_hash, filter_workflow, filter_version, params, created_by_idx)"
+        " VALUES ($1, 'read-mask', '1.0.0', '{}'::jsonb, $2) RETURNING mask_idx",
+        secrets.token_bytes(32),
+        ctx["principal_idx"],
+    )
+    try:
+        await pool.execute(
+            "INSERT INTO qiita.mask_sample (mask_idx, prep_sample_idx, state)"
+            " VALUES ($1, $2, 'completed')",
+            mask_idx,
+            ps,
+        )
+
+        await _mint(ctx, ps)
+
+        assert (
+            await pool.fetchval(
+                "SELECT count(*) FROM qiita.mask_sample WHERE prep_sample_idx = $1", ps
+            )
+            == 0
+        )
+    finally:
+        await pool.execute("DELETE FROM qiita.mask_definition WHERE mask_idx = $1", mask_idx)

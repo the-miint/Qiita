@@ -25,6 +25,11 @@ runs:
     # — a fully static key would pin the bottle forever); restore-keys falls
     # back to the latest prior week so a new week is still a warm restore, not a
     # cold download.
+    #
+    # Only `downloads/` (the bottles) is cached. `brew link` backs up each file it
+    # overwrites into `~/Library/Caches/Homebrew/Backup`; with that directory
+    # cached, a restoring job's `brew install` fails with
+    # "same file: /opt/homebrew/bin/openssl and .../Backup/bin/openssl".
     - name: Compute weekly cache suffix
       id: cache-suffix
       shell: bash
@@ -32,10 +37,10 @@ runs:
     - name: Cache Homebrew downloads
       uses: actions/cache@v5
       with:
-        path: ~/Library/Caches/Homebrew
-        key: brew-postgresql17-${{ runner.os }}-${{ steps.cache-suffix.outputs.week }}
+        path: ~/Library/Caches/Homebrew/downloads
+        key: brew-downloads-postgresql17-${{ runner.os }}-${{ steps.cache-suffix.outputs.week }}
         restore-keys: |
-          brew-postgresql17-${{ runner.os }}-
+          brew-downloads-postgresql17-${{ runner.os }}-
 
     - name: Install and start PostgreSQL 17
       shell: bash

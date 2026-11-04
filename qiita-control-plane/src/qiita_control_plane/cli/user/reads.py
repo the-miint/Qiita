@@ -38,17 +38,18 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from qiita_common.actions import BAM_TO_PARQUET_ACTION_ID, FASTQ_TO_PARQUET_ACTION_ID
 from qiita_common.api_paths import URL_WORK_TICKET_PREFIX
 from qiita_common.models import ScopeTargetKind, WorkTicketCreateRequest, WorkTicketState
 
 from . import _common
 
-# Pinned here rather than taken from a flag: this gesture knows which workflow
+# Fixed here rather than taken from a flag: this gesture knows which workflow
 # loads reads, and an operator who needs a different one has `qiita ticket
 # submit`. Bumping a workflow's version means bumping it here.
-_FASTQ_ACTION_ID = "fastq-to-parquet"
+_FASTQ_ACTION_ID = FASTQ_TO_PARQUET_ACTION_ID
 _FASTQ_ACTION_VERSION = "1.3.0"
-_BAM_ACTION_ID = "bam-to-parquet"
+_BAM_ACTION_ID = BAM_TO_PARQUET_ACTION_ID
 _BAM_ACTION_VERSION = "1.0.0"
 
 # Suffixes that decide which loader a file goes to. Checked against the

@@ -18,7 +18,7 @@ def test_compute_upload_staging_path_matches_rust_layout():
     """Locked layout: ``{root}/uploads/{idx}/upload.parquet``.
 
     Mirrors the Rust unit test ``staging_path_for_layout`` in
-    ``qiita-data-plane/src/flight_service.rs``. If you change one,
+    ``qiita-data-plane/src/flight_service/doput_tests.rs``. If you change one,
     change the other in the same commit; both sides will move together
     or not at all."""
     assert compute_upload_staging_path(Path("/scratch/staging"), 42) == Path(
@@ -136,6 +136,12 @@ _TRIPLES: list[tuple[str, str, str]] = [
         "URL_SEQUENCE_RANGE_BY_PREP_SAMPLE",
         "PATH_SEQUENCE_RANGE_PREFIX",
         "PATH_SEQUENCE_RANGE_BY_PREP_SAMPLE",
+    ),
+    # /qc-check
+    (
+        "URL_QC_CHECK_BY_PREP_SAMPLE",
+        "PATH_QC_CHECK_PREFIX",
+        "PATH_QC_CHECK_BY_PREP_SAMPLE",
     ),
     # /auth
     ("URL_AUTH_WHOAMI", "PATH_AUTH_PREFIX", "PATH_AUTH_WHOAMI"),

@@ -318,6 +318,19 @@ def test_native_payload_has_no_bind_mounts(native_kwargs):
     assert "--env" not in payload["script"]
 
 
+def test_native_payload_enables_faulthandler(native_kwargs):
+    """A segfaulting native job dumps its Python stack to the job stderr."""
+    payload = build_job_submit_payload(**native_kwargs)
+    env = dict(item.split("=", 1) for item in payload["job"]["environment"])
+    assert env["PYTHONFAULTHANDLER"] == "1"
+
+
+def test_container_payload_does_not_set_faulthandler(common_kwargs):
+    payload = build_job_submit_payload(**common_kwargs)
+    env = dict(item.split("=", 1) for item in payload["job"]["environment"])
+    assert "PYTHONFAULTHANDLER" not in env
+
+
 def test_native_payload_keeps_qiita_env_vars(native_kwargs):
     """The launcher reads $QIITA_INPUT_PATH / $QIITA_OUTPUT_PATH from
     environment just like the container does — both runtimes share the

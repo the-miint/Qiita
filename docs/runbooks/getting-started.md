@@ -155,16 +155,18 @@ much that covers is a per-site choice: a deploy starts with a small seeded set
 (`9606` human, `10090` mouse, a few metagenome taxa), and an operator can load a
 full NCBI release, after which the whole taxonomy is accepted. An id your site does
 not have is refused, and there is no self-service way to list or add one — ask your
-operator. For a biosample with no host of its own — a blank, a control, an
-environmental biosample — use `not applicable`.
+operator. For an environmental biosample with no host of its own, use
+`not applicable`. A blank or other control still needs a `host taxon id` (any accepted
+value, `not applicable` included) and is marked by a `control_*` `qiita sample type` term
+(`--metadata "qiita sample type=…"`), which makes it a control whatever its `host taxon id`.
 
 `--owner-biosample-id-value` is your own name for the biosample, stored under the
 field named by `--owner-biosample-id-field-name` (the field is created the first
 time you use it, so there is nothing to set up). This is the name to match your
 sheet, since the accession is what the machines match on and rarely what you say
 out loud. It does not travel with the biosample: someone reading the biosample on
-its own sees only the shared metadata, but anyone with access to *this study* sees
-it, so keep any personally identifying information out of it.
+its own sees only the shared metadata, but anyone with `member` access or above on
+*this study* sees it, so keep any personally identifying information out of it.
 
 You can add more `--metadata KEY=VALUE` pairs, but only for fields that already
 exist: a standard Qiita field, or one you created for this study. A key that
@@ -367,6 +369,7 @@ qiita ticket list --active
 qiita ticket status <idx>
 qiita ticket logs <idx> --step-index 0
 qiita ticket run <idx>        # re-drive a failed job, resuming at the first unfinished step
+qiita ticket redrive --sequenced-pool-idx <pool>   # list your failed jobs in the pool; --execute re-drives each
 qiita pool-completion --sequencing-run-idx <run> --sequenced-pool-idx <pool>
 ```
 
@@ -378,7 +381,13 @@ surprise. `cancelled` means somebody stopped it; `qiita ticket run` restarts it.
 `failed` comes with the reason and the step it failed at, and the reason says what
 to do next. A job that fails on a transient problem, such as a node failure or running out
 of memory, is retried automatically; other
-read-loading failures are re-driven with `qiita ticket run`. The ones that
+read-loading failures are re-driven with `qiita ticket run`, or many at once with
+`qiita ticket redrive`, which takes the `ticket list` filters, prints what it
+selected, and re-drives them one at a time only with `--execute`, with at most
+`--max-inflight` of them running at once (default 8; `--rate` adds seconds between
+them). A job whose workflow lost or renamed a step it already ran cannot be
+re-driven: `/run` refuses it naming that step, and it is resubmitted instead. A job
+under a deprecated mask is refused too. The ones that
 cannot be re-driven end in removing the pool, which only an
 operator can do — so take the reason to yours;
 [`fastq-to-parquet-retry-recovery.md`](fastq-to-parquet-retry-recovery.md) is the

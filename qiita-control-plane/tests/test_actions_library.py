@@ -45,6 +45,7 @@ def test_library_re_exports_match_module_callables():
     assert LIBRARY[LibraryPrimitive.REGISTER_INDEX] is lib.register_index
     assert LIBRARY[LibraryPrimitive.PERSIST_READ_METRICS] is lib.persist_read_metrics
     assert LIBRARY[LibraryPrimitive.PERSIST_QC_REPORT] is lib.persist_qc_report
+    assert LIBRARY[LibraryPrimitive.PERSIST_QC_CHECKS] is lib.persist_qc_checks
     assert LIBRARY[LibraryPrimitive.DELETE_READ_MASK_BLOCK] is lib.delete_read_mask_block
     assert LIBRARY[LibraryPrimitive.RECONCILE_BLOCK] is lib.reconcile_block
     assert LIBRARY[LibraryPrimitive.FINALIZE_MASK_SAMPLE] is lib.finalize_mask_sample_gate
@@ -391,6 +392,66 @@ async def test_sync_reference_exclusion_primitive_still_raises_non_transient(tmp
             signing_key=b"\x00" * 32,
             data_plane_url="grpc://dp:50051",
         )
+
+
+def test_do_action_raises_a_busy_refusal_as_a_flight_error(monkeypatch):
+    """A busy refusal leaves `_do_action` as a `FlightUnavailableError` carrying the
+    refusal's text, so every caller that catches `FlightError` handles it and the
+    transient classifier still recognises it."""
+    import pyarrow as pa
+    import pyarrow.flight as flight
+    import pytest
+    from qiita_common.data_plane_errors import is_data_plane_transient
+
+    from qiita_control_plane.actions import library as lib
+    from qiita_control_plane.testing.flight import REAL_BUSY_REFUSAL, flight_client_raising
+
+    monkeypatch.setattr(
+        lib._flight, "FlightClient", flight_client_raising(pa.ArrowInvalid(REAL_BUSY_REFUSAL))
+    )
+    with pytest.raises(flight.FlightUnavailableError, match="data plane busy") as info:
+        lib._do_action("delete_alignment", "grpc://dp:50051", b"token")
+    assert is_data_plane_transient(info.value)
+
+
+def test_do_action_leaves_other_arrow_invalid_as_it_is(monkeypatch):
+    """An `ArrowInvalid` that is not a busy refusal propagates unchanged: only the
+    refusal is the data plane's state rather than the request's."""
+    import pyarrow as pa
+    import pytest
+
+    from qiita_control_plane.actions import library as lib
+    from qiita_control_plane.testing.flight import flight_client_raising
+
+    monkeypatch.setattr(
+        lib._flight, "FlightClient", flight_client_raising(pa.ArrowInvalid("bad payload"))
+    )
+    with pytest.raises(pa.ArrowInvalid, match="bad payload"):
+        lib._do_action("delete_alignment", "grpc://dp:50051", b"token")
+
+
+async def test_sync_reference_exclusion_primitive_swallows_a_busy_refusal(tmp_path, monkeypatch):
+    """A busy data plane during the post-load mirror sync reports `synced=False`
+    rather than raising, so it cannot mark the loaded reference `failed`."""
+    import pyarrow as pa
+
+    from qiita_control_plane.actions import library as lib
+    from qiita_control_plane.testing.flight import REAL_BUSY_REFUSAL, flight_client_raising
+
+    async def _fake_resolve(pool):
+        return [10, 20, 30]
+
+    monkeypatch.setattr(lib, "resolve_excluded_features", _fake_resolve)
+    monkeypatch.setattr(
+        lib._flight, "FlightClient", flight_client_raising(pa.ArrowInvalid(REAL_BUSY_REFUSAL))
+    )
+    out = await lib.sync_reference_exclusion(
+        _FakeExclusionPool(),
+        dest=tmp_path / "reference_exclusion.parquet",
+        signing_key=b"\x00" * 32,
+        data_plane_url="grpc://dp:50051",
+    )
+    assert out == {"synced_feature_count": None, "synced": False}
 
 
 def test_assembly_membership_join_resolves_contigs_to_bins_and_features(tmp_path):

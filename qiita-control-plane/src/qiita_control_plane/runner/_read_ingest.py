@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import Any
 
 import asyncpg
+import duckdb
+from qiita_common.actions import BCL_CONVERT_SAMPLE_MAP_KEY
 from qiita_common.api_paths import (
     compute_reads_staging_path,
 )
@@ -21,9 +23,11 @@ from ..block_read import READ_MASKED_TABLE
 from ..host_filter_resolver import is_control_sample
 from ..miint import connect_with_miint_staged
 from ..preflight import AmpliconBarcode, AmpliconPreflightError, amplicon_barcode_from_blob
+from ..problem_list import capped
 from ..repositories.block import MASK_SAMPLE_COMPLETED, fetch_mask_sample_state
 from ..repositories.prep_sample import fetch_biosample_idx_for_prep_sample
 from ..repositories.sequenced_sample import (
+    fetch_empty_ingest_tickets,
     fetch_sequenced_pool_ena_run_roster,
     fetch_sequenced_pool_item_prep_sample_idxs,
 )
@@ -48,7 +52,7 @@ _log = logging.getLogger(__name__)
 # `reads_staging_root` hands the ingest step the scratch root it writes the
 # durable copies under.
 
-SAMPLE_MAP_BINDING = "sample_map"
+SAMPLE_MAP_BINDING = BCL_CONVERT_SAMPLE_MAP_KEY
 # golay-demux's per-sample barcode roster, materialized to a parquet like
 # `sample_map`. each entry carries its own barcodes_are_rc flag.
 BARCODE_MAP_BINDING = "barcode_map"
@@ -480,10 +484,7 @@ def _barcode_roster_mismatches(
             )
     for idx in sorted(set(expected) - seen):
         problems.append(f"prep_sample_idx {idx} is missing from barcode_map")
-    if len(problems) > _MAX_ROSTER_MISMATCHES_SHOWN:
-        extra = len(problems) - _MAX_ROSTER_MISMATCHES_SHOWN
-        problems = [*problems[:_MAX_ROSTER_MISMATCHES_SHOWN], f"and {extra} more"]
-    return problems
+    return capped(problems, _MAX_ROSTER_MISMATCHES_SHOWN)
 
 
 async def _stage_ena_run_roster(
@@ -630,26 +631,36 @@ def _stream_masked_reads_to_fastq(data_plane_url: str, ticket_bytes: bytes, dest
     with flight.FlightClient(data_plane_url) as client, connect_with_miint_staged() as con:
         reader = client.do_get(flight.Ticket(ticket_bytes), read_opts).to_reader()
         con.register("masked", reader)
-        # Single-end long reads: sequence2/qual2 are NULL, so FORMAT FASTQ writes a
-        # single-end fastq. Column order is the one the miint writer requires.
-        (count,) = con.execute(
-            "COPY (SELECT read_id, sequence1, qual1, sequence2, qual2 FROM masked) "
-            f"TO '{validate_parquet_path(dest)}' (FORMAT FASTQ, COMPRESSION 'gzip')"
-        ).fetchone()
+        return _copy_masked_to_fastq(con, dest)
+
+
+def _copy_masked_to_fastq(con: duckdb.DuckDBPyConnection, dest: Path) -> int:
+    """Write the relation registered as `masked` (the `read_masked` stream's shape)
+    to gzip FASTQ at `dest`, returning the record count.
+
+    Each record is named by its `sequence_idx`, not its `read_id` (the CLAUDE.md
+    read-identity rule). miint's FASTQ writer contract is
+    https://the-miint.github.io/duckdb-miint/writing/; it names a record from the
+    `read_id` column, hence the alias.
+
+    This runs for every long-read-assembly version, not only the one whose
+    provenance dump needs it. That is safe because the assemblies do not depend on
+    read names: myloasm 0.6.0 and hifiasm_meta (the 1.0.0 assemble image), each
+    run on duckdb-miint's 1006-read myloasm fixture once with its own names and once
+    with integer names in the same order, wrote byte-identical contigs, names
+    included. Binning and coverage only match names within this one file."""
+    (count,) = con.execute(
+        "COPY (SELECT sequence_idx AS read_id, "
+        "sequence1, qual1, sequence2, qual2 FROM masked) "
+        f"TO '{validate_parquet_path(dest)}' (FORMAT FASTQ, COMPRESSION 'gzip')"
+    ).fetchone()
     return int(count)
 
 
 async def _prep_sample_is_expected_empty_control(pool: asyncpg.Pool, prep_sample_idx: int) -> bool:
-    """True when this prep_sample's biosample is flagged an expected-empty control
-    (host_taxon_id == "missing: control sample"). Resolves prep_sample → biosample,
-    then defers the control classification to `is_control_sample` so the definition
-    of "control" stays shared with the host-filter resolver. Fail-safe on a missing
-    prep_sample (returns False → the zero-read ticket FAILs as a data well).
-
-    Covers BOTH positive and negative controls, because the persisted control
-    marker cannot yet tell them apart — see the KNOWN LIMITATION in
-    `is_control_sample`: a positive control (katharoseq) that yields zero reads is
-    currently classified `no_data` too, though it is really a failure."""
+    """True when this prep_sample's biosample is an expected-empty control, per
+    `is_control_sample`. Fail-safe on a missing prep_sample (False → the zero-read
+    ticket FAILs as a data well)."""
     biosample_idx = await fetch_biosample_idx_for_prep_sample(pool, prep_sample_idx)
     if biosample_idx is None:
         return False
@@ -676,14 +687,15 @@ async def _resolve_staged_reads(
     Either source binds the same `reads` path; they are byte-equivalent modulo row
     order, and qc / host_filter are order-independent.
 
-    Zero stored reads splits on whether the well is an expected-empty control: a
-    blank / no-template control legitimately produces no reads, so it ends the
-    ticket at a benign terminal `no_data` (StepNoData); a data well with no reads
-    is a genuine failure and stays SUBMISSION/BAD_INPUT (FAILED) — it must be
-    ingested before a mask can be created over it. (An unreachable data plane is
-    likewise SUBMISSION/BAD_INPUT.) Without this split every empty well — control
-    or data — lands in the pool's `samples_failed`, burying real failures among
-    blanks doing their job."""
+    Zero stored reads ends the ticket at a benign terminal `no_data` (StepNoData)
+    when ingest read the prep_sample and found it empty (`fetch_empty_ingest_tickets`)
+    — the run handler then records it as masked with an empty pass-set — or when it
+    is an expected-empty control (a blank / no-template control legitimately
+    produces no reads). Anything else is SUBMISSION/BAD_INPUT (FAILED): nothing shows
+    the prep_sample was ingested, so it must be before a mask can be created over it.
+    (An unreachable data plane is likewise SUBMISSION/BAD_INPUT.) Without this split
+    every empty well lands in the pool's `samples_failed`, burying real failures
+    among wells that were simply empty."""
     prep_sample_idx = scope_target["prep_sample_idx"]
 
     durable = compute_reads_staging_path(staging_root, prep_sample_idx)
@@ -719,12 +731,19 @@ async def _resolve_staged_reads(
     # `count` is already an int (coerced in `_do_action_export_read`).
     if result.get("count", 0) == 0:
         # The persistent store has no reads for this sample either (the data plane
-        # writes no file for an empty result). Split control from data: an
-        # expected-empty control (blank / NTC) reading zero is the benign, correct
-        # outcome → terminal no_data; a data well reading zero is a real failure →
-        # BAD_INPUT (must be ingested before a mask can be created over it). The
-        # control marker is the persisted biosample host_taxon_id == "missing:
-        # control sample" (see `is_control_sample`).
+        # writes no file for an empty result). See the docstring for the split.
+        empty_ingest_ticket_idx = (
+            await fetch_empty_ingest_tickets(
+                pool, prep_sample_idxs=[prep_sample_idx], current_work_ticket_idx=None
+            )
+        ).get(prep_sample_idx)
+        if empty_ingest_ticket_idx is not None:
+            raise StepNoData(
+                reason=(
+                    f"prep_sample {prep_sample_idx} has no stored reads: ingest ticket "
+                    f"{empty_ingest_ticket_idx} read it and found it empty"
+                )
+            )
         if await _prep_sample_is_expected_empty_control(pool, prep_sample_idx):
             raise StepNoData(
                 reason=(
@@ -734,9 +753,9 @@ async def _resolve_staged_reads(
                 )
             )
         raise _submission_bad_input(
-            f"no stored reads for prep_sample {prep_sample_idx}; the sample must be "
-            "ingested (submit-bcl-convert stores reads) before a read mask can be "
-            "created over it"
+            f"no stored reads for prep_sample {prep_sample_idx}, and no ingest shows it "
+            "was read and found empty (it has none, or its newest did not end that way); "
+            "the prep_sample must be ingested before a read mask can be created over it"
         )
     if not dest.exists():
         # The data plane reported reads but no file landed at dest (a data-plane

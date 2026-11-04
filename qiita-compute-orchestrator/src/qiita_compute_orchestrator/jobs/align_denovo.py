@@ -100,7 +100,7 @@ from qiita_common.parquet import validate_parquet_path
 
 from ..data_plane_client import open_assembly_chunk_stream, open_read_masked_stream
 from ..miint import (
-    PARQUET_OPTS,
+    PARQUET_OPTS_AT_REST,
     apply_duckdb_settings,
     duckdb_tmp_dir,
     open_miint_conn,
@@ -282,8 +282,8 @@ def _origin_spanning_sql() -> str:
     # without a second grouping to rebuild the fragment first.
     fragment = (
         "SELECT * EXCLUDE (query_interval), "
-        "list_min(list_transform(query_interval, x -> x.start)) AS query_start, "
-        "list_max(list_transform(query_interval, x -> x.stop)) AS query_stop "
+        "list_min(list_transform(query_interval, lambda x: x.start)) AS query_start, "
+        "list_max(list_transform(query_interval, lambda x: x.stop)) AS query_stop "
         "FROM scored"
     )
     # `position` is 1-based inclusive and `stop_position` exclusive (the aligner's own
@@ -395,12 +395,13 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
 
             # Diagnose, then gate: `circular_predicate_sql` takes the clearance
             # `check_gate_diagnostics` returns, so the refusals cannot be skipped.
-            diagnostics = conn.sql(gate_diagnostics_sql(gate))
+            diagnostics = conn.execute(gate_diagnostics_sql(gate))
+            names = [column[0] for column in diagnostics.description]
             # By NAME, not position: `gate_diagnostics_sql` emits three different SELECT
             # shapes, and a reorder would hand one count to another's parameter — both
             # ints, both plausible. The client-side consumer binds the same way.
             clearance = check_gate_diagnostics(
-                gate, **dict(zip(diagnostics.columns, diagnostics.fetchone(), strict=True))
+                gate, **dict(zip(names, diagnostics.fetchone(), strict=True))
             )
 
             conn.execute(circular_alignments_view_sql())
@@ -432,13 +433,13 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 f"WHERE {SCORABLE_SECONDARY_ROW} "
                 f"AND {secondary_predicate_sql(clearance=clearance)}"
                 ") ORDER BY alignment_idx, prep_sample_idx, sequence_idx, feature_idx, "
-                f"position, flags) TO '{alignment_sql}' ({PARQUET_OPTS})",
+                f"position, flags) TO '{alignment_sql}' ({PARQUET_OPTS_AT_REST})",
                 secondary_parameters(gate),
             )
             conn.execute(
                 f"COPY ({_origin_spanning_sql()} "
                 "ORDER BY alignment_idx, prep_sample_idx, sequence_idx, feature_idx) "
-                f"TO '{origin_spanning_sql}' ({PARQUET_OPTS})"
+                f"TO '{origin_spanning_sql}' ({PARQUET_OPTS_AT_REST})"
             )
         # OUTSIDE the connection contexts, matching align_sharded: a context __exit__
         # that raises after the COPY must still take the cleanup below.

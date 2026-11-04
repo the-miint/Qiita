@@ -34,6 +34,7 @@ from typing import Any
 from pydantic import BaseModel, ValidationError
 from qiita_common.actions import NATIVE_MODULE_PREFIX
 from qiita_common.backend_failure import BackendFailure, FailureKind, StepNoData
+from qiita_common.data_plane_errors import is_data_plane_transient
 from qiita_common.models import ScopeTargetKind, WorkTicketFailureStage
 
 
@@ -182,10 +183,14 @@ async def run_native_job(
       `Inputs` / `execute` exports → CONTRACT_VIOLATION (permanent;
       the job tree is broken).
     - `Inputs.model_validate` rejects `raw_inputs`, or `execute` raises
-      `FileNotFoundError` / `ValueError` → BAD_INPUT (permanent;
-      same inputs would fail the same way on retry).
-    - `execute` raises `NotImplementedError` → UNKNOWN_PERMANENT
-      (the job module is a skeleton; auto-retry would not help).
+      `FileNotFoundError` / a `ValueError` that is not a pyarrow one →
+      BAD_INPUT (permanent; same inputs would fail the same way on retry).
+    - `execute` raises one of the data plane's recoverable conditions
+      (`qiita_common.data_plane_errors.is_data_plane_transient`) →
+      DATA_PLANE_TRANSIENT (the runner re-dispatches the step).
+    - `execute` raises a `NotImplementedError` that is not a pyarrow one →
+      UNKNOWN_PERMANENT (the job module is a skeleton; auto-retry would not
+      help).
 
     `StepNoData` raised by `execute` propagates UNCHANGED — it is a
     terminal no-data outcome (an empty FASTQ well), NOT a failure, so it
@@ -196,8 +201,19 @@ async def run_native_job(
 
     Other exception types from `execute` propagate so they surface in
     the orchestrator's logs with full traceback rather than being
-    silently classified.
+    silently classified. Every pyarrow and Flight exception that
+    `is_data_plane_transient` does not recognise propagates for the same reason, which is
+    what the pyarrow arm's placement above the builtin arms buys: an
+    `ArrowInvalid` is a `ValueError` and an `ArrowNotImplementedError` is a
+    `NotImplementedError`, and neither is the thing those arms describe.
     """
+    # Deferred: only the `except` arm below needs these, and importing both measured
+    # ~50 ms with a warm file cache and +28 MiB maxrss (pyarrow 25.0.0, orchestrator
+    # venv, an M1 Max) on every import of this package — the boot scan and the SLURM
+    # launcher included.
+    import pyarrow  # noqa: PLC0415
+    import pyarrow.flight  # noqa: PLC0415
+
     if not module_name.startswith(NATIVE_MODULE_PREFIX):
         raise _contract_violation(
             step_name=step_name,
@@ -252,6 +268,32 @@ async def run_native_job(
         # NO_DATA transition. Must sit ABOVE the generic `except ValueError`
         # below so empty input is never reclassified as BAD_INPUT.
         raise
+    except (pyarrow.ArrowException, pyarrow.flight.FlightError) as exc:
+        # A pyarrow or Flight failure. Only the conditions the data plane is known
+        # to recover from are classified — the same set the control plane's pre-loop
+        # resolvers use, from one shared module so a reword in the data plane cannot
+        # leave the two disagreeing. Everything else re-raises and propagates with
+        # its traceback, which is what a job's own Arrow or Parquet failure should
+        # do.
+        #
+        # This arm catches by type and sits ABOVE the `NotImplementedError` and
+        # `ValueError` arms, because pyarrow's classes inherit from builtins that
+        # those arms would otherwise claim first: the refusal arrives as
+        # `ArrowInvalid`, which IS a ValueError, and an unsupported cast arrives as
+        # `ArrowNotImplementedError`, which IS a NotImplementedError and would
+        # otherwise be reported as a job module that ships without an `execute()`.
+        # Both bases are listed because the two hierarchies overlap only in the
+        # concrete classes: `FlightUnavailableError` is a `(FlightError,
+        # ArrowException)`, while `FlightError` itself derives from `Exception`
+        # alone (measured on pyarrow 23.0.1 and 25.0.0).
+        if not is_data_plane_transient(exc):
+            raise
+        raise BackendFailure(
+            kind=FailureKind.DATA_PLANE_TRANSIENT,
+            stage=WorkTicketFailureStage.STEP_RUN,
+            step_name=step_name,
+            reason=f"native job {module_name!r}: {exc}",
+        ) from exc
     except NotImplementedError as exc:
         # Skeleton path: a job module that ships before its execute() is
         # written. Permanent — retry produces the same NotImplementedError.
@@ -271,7 +313,9 @@ async def run_native_job(
     except ValueError as exc:
         # Data-quality issues raised from inside execute() (malformed
         # FASTA, unmapped hashes, etc.). Permanent because the same
-        # input always fails the same way.
+        # input always fails the same way. A data-plane failure cannot
+        # land here: pyarrow's are caught by type above, so job text that
+        # happens to quote a data-plane message is not reclassified.
         raise BackendFailure(
             kind=FailureKind.BAD_INPUT,
             stage=WorkTicketFailureStage.STEP_RUN,

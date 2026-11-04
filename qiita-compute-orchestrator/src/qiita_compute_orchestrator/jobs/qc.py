@@ -88,7 +88,7 @@ from qiita_common.parquet import validate_parquet_path
 
 from ..job_resource_plan import count_read_pairs, linear_walltime
 from ..miint import (
-    PARQUET_OPTS,
+    PARQUET_OPTS_TRANSFER,
     apply_duckdb_settings,
     duckdb_tmp_dir,
     open_miint_conn,
@@ -588,7 +588,8 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                     branches.append(carry_select)
                 union_sql = " UNION ALL ".join(f"({b})" for b in branches)
                 conn.execute(
-                    f"COPY ({union_sql} ORDER BY sequence_idx) TO '{out_sql}' ({PARQUET_OPTS})"
+                    f"COPY ({union_sql} ORDER BY sequence_idx) "
+                    f"TO '{out_sql}' ({PARQUET_OPTS_TRANSFER})"
                 )
         success = True
     finally:

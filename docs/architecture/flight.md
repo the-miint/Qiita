@@ -16,6 +16,53 @@ Client interfaces are the user-facing layer through which researchers and system
 - **DoPut**: upload data (stream RecordBatches to shared filesystem via FlightDescriptor, authorized by signed action token)
 - **DoAction**: register file (`ducklake_add_data_files`), delete by key, insert-from-processing-method (authorized by signed action token)
 
+### Concurrency bound
+
+Every DoGet and every DoAction borrows one connection from a bounded pool
+([`qiita-data-plane/src/pool.rs`](../../qiita-data-plane/src/pool.rs)), so the
+pool's size is the number of DoGets and DoActions one data plane serves at once.
+**DoPut is bounded separately**, by
+`FLIGHT_MAX_CONCURRENT_DOPUT` permits rather than by the pool: an upload streams
+straight to Parquet without touching the catalog, so it borrows no connection,
+and its cost is the batches in flight, which grows with both the number of
+uploads and their batch size. **It bounds uploads, not bytes**, and nothing
+derives it from the host, so a small host needs the value lowered by hand; the
+measurements, and what the default costs at the batch size the CLIs send, are on
+`DEFAULT_MAX_CONCURRENT_DOPUT` in `qiita-data-plane/src/config.rs`. A request that arrives with every
+connection (or permit) taken is refused immediately with gRPC
+`RESOURCE_EXHAUSTED` and a message naming the bound, rather than queued — the
+reasoning, and the edge limits it rests on, are in `pool.rs`. **No client retries
+the call itself.** What a refusal becomes instead depends on the caller: a
+native job step is classified `data_plane_transient` and re-dispatched by the
+runner, a control-plane pre-loop fetch is held for an operator redrive, a
+DoAction from the control plane's action library is classified the same way and
+re-run by the runner when a workflow `action:` entry made it, or answered with a
+502 when a REST route did, and a refused
+upload reaches a person — both DoPut clients are the user-facing CLIs
+(`qiita reference load`, `qiita submit-reads`), which classify nothing and print
+the message. The
+same classification covers the data plane's other recoverable failures — it
+could not open a connection, a catalog write lost a serialization race, a signing
+token aged out — from one shared module
+([`qiita_common.data_plane_errors`](../../qiita-common/src/qiita_common/data_plane_errors.py)).
+
+Each pooled connection carries its own `threads`, `memory_limit`, `temp_directory`
+and `max_temp_directory_size`, overridable per deploy (`DUCKLAKE_POOL_SIZE` and
+the `DUCKDB_*` vars in `.env.data-plane.example`). Unset, `memory_limit` is divided
+at boot from the memory ceiling the process detects for itself, and `threads` from
+the CPU budget it detects, divided by the local instances and the pool size
+(`derived_threads` in `qiita-data-plane/src/config.rs`). The spill cap is the explicit
+`DUCKDB_MAX_TEMP_DIRECTORY_SIZE` when set; else, when `DUCKDB_TEMP_DIRECTORY` is set,
+it is derived from that filesystem's free space; else it is a 4GiB default
+(`spill_cap` in `qiita-data-plane/src/config.rs`). A read runs with insertion
+order off, so a DoGet's rows arrive in no defined order; a client that needs one
+orders them itself. A DoAction that writes to the lake runs instead on one
+thread with order on, so what it writes keeps its source's order (`LakeWriter`
+in `qiita-data-plane/src/pool.rs` says why one thread). The size is a catalog budget
+too: each attached connection holds one lake-Postgres backend for as long as it
+lives, and every data-plane process on every host draws on the same
+`max_connections`.
+
 ### DoGet stream compression
 
 A DoGet client may ask for a zstd-compressed Arrow IPC body by sending the
@@ -53,7 +100,7 @@ IPC codec is stamped per record-batch message by the writer, which is why the
 custom header lives at that layer rather than the transport's.)
 
 Header name constants: `IPC_COMPRESSION_HEADER` in
-`qiita-data-plane/src/flight_service.rs` and its twin in
+`qiita-data-plane/src/flight_service/doget.rs` and its twin in
 `qiita-common/src/qiita_common/flight_constants.py`.
 
 ### DoGet column projection
@@ -99,7 +146,7 @@ preferred to widening it silently. The one production consumer,
 twice — for the ticket and for the `SELECT` it binds — so the two cannot drift.
 
 Allowlist constants: `ALIGNMENT_PROJECTION_COLUMNS` in
-`qiita-data-plane/src/flight_service.rs` and `_PROJECTION_COLUMNS` in
+`qiita-data-plane/src/flight_service/query.rs` and `_PROJECTION_COLUMNS` in
 `qiita-control-plane/src/qiita_control_plane/auth/tickets.py`. Both are
 hand-copies (neither language can import the other) pinned by parity tests, and
 the Rust one is additionally checked against the live `alignment_visible`
@@ -196,10 +243,10 @@ records which of the deploy's references already exceed it — which is what the
 second form exists for.
 
 **It is Parquet and not an Arrow IPC stream.** IPC is what Flight already carries
-and what the client already stages through `_registered`, so it is where a reader
-would start. An IPC stream cut at a record-batch boundary reads back short *and
-silent* — one batch of three comes back as a third of the rows with nothing raised.
-A cut
+and what the client already stages through
+`qiita_common.duckdb_relation.registered`, so it is where a reader would start. An
+IPC stream cut at a record-batch boundary reads back short *and silent* — one
+batch of three comes back as a third of the rows with nothing raised. A cut
 landing mid-message does raise, so the silent case needs the cut to fall on a
 boundary; that is a narrower hazard than "any truncation", and it is still one no
 caller can detect. Parquet raises on both. A contract test pins each.

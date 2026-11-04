@@ -66,11 +66,20 @@ class VerificationFailure:
     detail: str | None = None
 
 
-def verify_container_output(output_path: Path) -> list[VerificationFailure]:
+def verify_container_output(
+    output_path: Path, *, recovered: bool = False
+) -> list[VerificationFailure]:
     """Walk `output_path` and validate the container contract.
 
     Returns an empty list when all gates pass; otherwise a non-empty
     list with one VerificationFailure per problem found.
+
+    `recovered` re-reads a step that passed every check when it finished, for a
+    resume or a redrive: only the manifest and its `outputs` map are checked, with each
+    declared output still present. The per-file checks (each listed file at its
+    size; every file listed and read-only) are skipped, because a later step may
+    have moved the files the manifest lists — `register-files` moves its staging
+    files into the lake.
 
     Caller is responsible for ensuring the SLURM job exited 0 before
     calling this (gate 1 lives outside the file-system surface).
@@ -193,6 +202,9 @@ def verify_container_output(output_path: Path) -> list[VerificationFailure]:
                     detail=value,
                 )
             )
+
+    if recovered:
+        return failures
 
     # Gate 2: every listed file exists with declared size.
     for i, entry in enumerate(files):

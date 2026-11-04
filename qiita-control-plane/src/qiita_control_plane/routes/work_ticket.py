@@ -70,10 +70,12 @@ from qiita_common.log_tail import read_text_tail
 from qiita_common.models import (
     NON_TERMINAL_WORK_TICKET_STATES,
     REDRIVABLE_WORK_TICKET_STATES,
+    FailureType,
     FanoutCohortKind,
     FanoutListResponse,
     FanoutOverrideRequest,
     FanoutPumpResponse,
+    MaskDefinitionStatus,
     ScopeTargetKind,
     StepProgressState,
     WorkTicket,
@@ -105,7 +107,8 @@ from ..fanout_dispatch import (
     set_override,
     top_up_dispatch,
 )
-from ..step_progress import load_step_progress
+from ..runner import _fetch_action
+from ..step_progress import StepProgressMismatch, check_step_progress, load_step_progress
 from ..work_ticket_cancel import WorkTicketNotFound, cancel_work_ticket
 from ..work_ticket_submit import (
     _check_audience,
@@ -615,6 +618,9 @@ async def list_work_tickets(
         min_length=1,
         description="Filter to one action_id (e.g. read-mask), across every action_version.",
     ),
+    failure_type: FailureType | None = Query(
+        default=None, description="Filter to FAILED tickets whose failure was of this type."
+    ),
     limit: int = Query(
         default=_WORK_TICKET_LIST_DEFAULT_LIMIT, ge=1, le=_WORK_TICKET_LIST_MAX_LIMIT
     ),
@@ -689,6 +695,9 @@ async def list_work_tickets(
     if action_id is not None:
         args.append(action_id)
         conditions.append(f"wt.action_id = ${len(args)}")
+    if failure_type is not None:
+        args.append(failure_type.value)
+        conditions.append(f"wt.failure_type = ${len(args)}::qiita.failure_type")
     if sequenced_pool_idx is not None:
         args.append(sequenced_pool_idx)
         n = len(args)
@@ -892,15 +901,12 @@ async def run_work_ticket(
     # "row missing" and "row exists but disabled" the same for redrive:
     # both mean the action is unreachable from this ticket. Submission
     # cares about the distinction (404 vs 410); redrive doesn't.
+    disabled = (
+        f"action {row['action_id']!r}/{row['action_version']!r} no longer enabled — cannot redrive"
+    )
     action = await _fetch_action_for_submission(pool, row["action_id"], row["action_version"])
     if action is None or not action["enabled"]:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=(
-                f"action {row['action_id']!r}/{row['action_version']!r} "
-                "no longer enabled — cannot redrive"
-            ),
-        )
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=disabled)
     _check_audience(principal, action["audience"])
     _check_scopes(principal, action["scopes"])
 
@@ -926,7 +932,30 @@ async def run_work_ticket(
         # under us between the SELECT and now (the WHERE binds the exact
         # from-state we read, so a concurrent flip loses the race cleanly).
         is_download = row["action_id"] == DOWNLOAD_ENA_STUDY_ACTION_ID
+        # Read before the transaction so the request holds one connection. None
+        # here means the action was disabled since the check above.
+        definition = await _fetch_action(pool, row["action_id"], row["action_version"])
+        if definition is None:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=disabled)
         async with pool.acquire() as conn, conn.transaction():
+            # A redrive fast-forwards the completed mint, so the mint's own refusal
+            # of a deprecated config never runs: the ticket would mask, or build
+            # on, a filter that is void.
+            mask = await conn.fetchrow(
+                "SELECT md.mask_idx, md.status FROM qiita.work_ticket wt"
+                " JOIN qiita.mask_definition md ON md.mask_idx = wt.mask_idx"
+                " WHERE wt.work_ticket_idx = $1",
+                work_ticket_idx,
+            )
+            if mask is not None and mask["status"] == MaskDefinitionStatus.DEPRECATED.value:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=(
+                        f"work_ticket {work_ticket_idx} runs under mask_definition"
+                        f" {mask['mask_idx']}, which is deprecated; it is not redriven."
+                        " Submit the work under a current mask instead"
+                    ),
+                )
             if is_download:
                 await _refuse_unsafe_download_redrive(
                     conn,
@@ -1013,6 +1042,18 @@ async def run_work_ticket(
                     work_ticket_idx,
                     StepProgressState.COMPLETED.value,
                 )
+
+            # Rows that no longer match the action's steps would only fail the
+            # ticket again at submission; refused here, it stays as it was.
+            try:
+                check_step_progress(
+                    work_ticket_idx,
+                    row["action_id"],
+                    await load_step_progress(conn, work_ticket_idx),
+                    definition.steps,
+                )
+            except StepProgressMismatch as exc:
+                raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
 
             await _reset_failed_reference_scope_for_dispatch(
                 conn,

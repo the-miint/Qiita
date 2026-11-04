@@ -36,6 +36,7 @@ from pathlib import Path
 from typing import NamedTuple
 
 import httpx
+from qiita_common.actions import BAM_TO_PARQUET_ACTION_ID
 from qiita_common.api_paths import (
     PATH_WORK_TICKET_PREFIX,
 )
@@ -55,10 +56,10 @@ from ._helpers import _inspect_run_folder, _load_preflight_conn, _refuse_malform
 from .pool import _provision_run_pool_roster
 
 # action_id + version for the per-sample read loader this command fans out to.
-# Pinned here so the CLI does not drift from the workflow YAML the operator's
-# deploy syncs into qiita.action; PacBio ingest reuses `bam-to-parquet` verbatim
-# (a pre-demuxed uBAM -> the DuckLake `read` table) rather than a bespoke job.
-_BAM_TO_PARQUET_ACTION_ID = "bam-to-parquet"
+# The version is pinned here so the CLI does not drift from the workflow YAML the
+# operator's deploy syncs into qiita.action; PacBio ingest reuses `bam-to-parquet`
+# verbatim (a pre-demuxed uBAM -> the DuckLake `read` table) rather than a bespoke job.
+_BAM_TO_PARQUET_ACTION_ID = BAM_TO_PARQUET_ACTION_ID
 _BAM_TO_PARQUET_ACTION_VERSION = "1.0.0"
 
 # Preflight sheet_type values (kl-run-preflight [Header] SheetType). syndna is

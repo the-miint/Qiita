@@ -26,6 +26,10 @@ From: mambaorg/micromamba:1.5.8
     binning.sh /opt/qiita/binning.sh
     # Required-tool assertion, shared by %test and the spec's VERIFY_CMD.
     binning-verify.sh /opt/qiita/binning-verify.sh
+    # Build-time test: run from %test below, so a failure fails the build; no job
+    # calls it. It is copied in because %test runs inside the finished image. It
+    # asserts the metaWRAP behaviour binning.sh's minimum-contig-length skip rests on.
+    binning-min-contig-check.sh /opt/qiita/binning-min-contig-check.sh
 
 %environment
     export MAMBA_ROOT_PREFIX=/opt/conda
@@ -98,7 +102,7 @@ From: mambaorg/micromamba:1.5.8
     # (exit 1), not a loader verdict (126/127).
     micromamba install -y -n metawrap -c conda-forge libgfortran=3.0.0
 
-    chmod 0755 /opt/qiita/_lib.sh /opt/qiita/binning.sh /opt/qiita/binning-verify.sh
+    chmod 0755 /opt/qiita/_lib.sh /opt/qiita/binning.sh /opt/qiita/binning-verify.sh /opt/qiita/binning-min-contig-check.sh
     chmod 0644 /opt/qiita/manifest_writer.py
 
     micromamba clean -a -y
@@ -122,6 +126,8 @@ From: mambaorg/micromamba:1.5.8
     # a binner-less image shipped. This asserts every tool metaWRAP actually
     # invokes, and fails the BUILD when one is absent.
     /opt/qiita/binning-verify.sh
+    # The min-contig check; its %files comment above says what it is.
+    /opt/qiita/binning-min-contig-check.sh
     # Base utilities the entrypoints actually invoke — assert each one, since the
     # whole point of this %test is to fail the BUILD on a missing runtime dep
     # rather than at the end of a long job.

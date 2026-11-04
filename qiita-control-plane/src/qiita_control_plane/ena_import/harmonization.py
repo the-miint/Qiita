@@ -20,10 +20,17 @@ from qiita_common.models import (
     BIOSAMPLE_DISPLAY_TAXON_ID,
     MISSING_REASON_NOT_APPLICABLE,
     MISSING_REASON_NOT_PROVIDED,
+    FieldDataType,
 )
 from qiita_common.models.ena import EnaRunRecord
 
 from qiita_control_plane.host_by_sample_taxon import NON_HOST_TAXA
+from qiita_control_plane.repositories._sample_helpers import (
+    MetadataParseError,
+    SampleEntityKind,
+    coordinate_degree_bound,
+    parse_text_for_data_type,
+)
 
 from .attribute_mapping import map_ena_attributes
 
@@ -35,9 +42,11 @@ class HarmonizationResult:
     """One biosample's harmonization outcome.
 
     `mapped_count`: attributes written as globally-linked metadata.
-    `retained_unmapped`: raw ENA tags written as study-local metadata (not
-    dropped).
-    `warnings`: taxon fields written as `not provided`, or ENA data that disagrees.
+    `retained_unmapped`: the study-local fields written: raw ENA tags (not dropped),
+    and `<field> (as submitted)` for a mapped value its global field could not hold.
+    Such a field still counts in `mapped_count`; its global slot holds `not provided`.
+    `warnings`: taxon fields written as `not provided`, mapped values kept
+    `(as submitted)`, or ENA data that disagrees.
     """
 
     mapped_count: int
@@ -187,3 +196,77 @@ def build_biosample_metadata(
             warnings=host_warnings + taxon_warnings + attribute_warnings,
         ),
     )
+
+
+# The study-local field a mapped value its global field cannot hold is kept under: a
+# local field may not share a global's name within one study.
+AS_SUBMITTED_SUFFIX = " (as submitted)"
+
+
+def retain_unparseable_as_submitted(
+    metadata: Mapping[str, str],
+    local_metadata: Mapping[str, str],
+    *,
+    data_types: Mapping[str, FieldDataType],
+    internal_names: Mapping[str, str | None],
+    missing_reasons: Collection[str],
+    sample_accession: str,
+) -> tuple[dict[str, str], dict[str, str], list[str]]:
+    """Keep a mapped value its global field's type cannot hold (`"39 deg"` for a
+    coordinate, a longitude of `"200"` past its degree bound, `"deep"` for a depth)
+    instead of letting it fail the whole run.
+
+    The global field gets `not provided` and the submitted text is kept study-local
+    under `<field> (as submitted)`, with a warning. `internal_names` carries each
+    field's global internal_name, so a coordinate is range-checked (past ±90/±180 is
+    unparseable), not just type-checked. A missing-value reason the import recognizes
+    (`missing_reasons`) is left as is, and so is a field absent from `data_types` or a
+    TERMINOLOGY field, whose values the import resolves itself.
+
+    A blank value has no submitted text worth keeping, so it stores `not provided`
+    alone, with no `(as submitted)` field. When the `(as submitted)` name is already a
+    raw ENA tag, keeping both would overwrite one, so this raises a `MetadataParseError`
+    naming the taken field (the caller folds it into a `failed` outcome). Returns
+    `(metadata, local_metadata, warnings)`.
+    """
+    kept = dict(metadata)
+    local = dict(local_metadata)
+    warnings: list[str] = []
+    for display_name, value in metadata.items():
+        data_type = data_types.get(display_name)
+        if (
+            data_type is None
+            or data_type is FieldDataType.TERMINOLOGY
+            or value.strip() in missing_reasons
+        ):
+            continue
+        degree_bound = coordinate_degree_bound(
+            SampleEntityKind.BIOSAMPLE, internal_names.get(display_name)
+        )
+        try:
+            parse_text_for_data_type(display_name, data_type, value, degree_bound=degree_bound)
+        except MetadataParseError as exc:
+            if not value.strip():
+                kept[display_name] = MISSING_REASON_NOT_PROVIDED
+                warnings.append(
+                    f"{sample_accession}: {display_name!r} is blank;"
+                    f" stored {MISSING_REASON_NOT_PROVIDED!r}"
+                )
+                continue
+            local_name = f"{display_name}{AS_SUBMITTED_SUFFIX}"
+            if local_name in local:
+                raise MetadataParseError(
+                    field_key=display_name,
+                    data_type=data_type,
+                    text_value=value,
+                    reason=f"{exc.reason}; cannot keep the submitted text as"
+                    f" {local_name!r}, already a submitted attribute",
+                ) from exc
+            kept[display_name] = MISSING_REASON_NOT_PROVIDED
+            local[local_name] = value
+            warnings.append(
+                f"{sample_accession}: {display_name!r} value {value!r} cannot be stored as"
+                f" {data_type} ({exc.reason}); stored {MISSING_REASON_NOT_PROVIDED!r} and"
+                f" kept the submitted text as {local_name!r}"
+            )
+    return kept, local, warnings

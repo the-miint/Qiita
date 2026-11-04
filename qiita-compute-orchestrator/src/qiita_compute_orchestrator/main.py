@@ -1,3 +1,4 @@
+import faulthandler
 import logging
 from contextlib import asynccontextmanager
 
@@ -72,6 +73,7 @@ async def lifespan(app: FastAPI):
     # handlers on its own loggers, so without this root has none and the scrubber is
     # inert — bearer tokens in httpx logs would go out unscrubbed.
     log_level = configure_logging()
+    faulthandler.enable()
     install_authorization_scrub()
     settings = Settings.from_env()
     # The one unconditional INFO this service emits at boot, and the only proof from

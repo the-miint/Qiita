@@ -1,6 +1,6 @@
-"""`qiita submit-ena-import` / `qiita ena-import-status` — batch ENA study import.
+"""`qiita submit-ena-import` / `qiita ena-import-status` — batch ENA import.
 
-`submit-ena-import` POSTs a list of INSDC STUDY accessions (positional, or one
+`submit-ena-import` POSTs a list of INSDC study or run accessions (positional, or one
 per line via `--from-file`) and by default watches the batch to terminal;
 `ena-import-status` reads a batch's current per-item status. Both require
 wet_lab_admin or system_admin (the route's own gate).
@@ -23,10 +23,12 @@ from qiita_common.api_paths import (
     URL_ENA_IMPORT_BATCH_BY_IDX,
     URL_ENA_IMPORT_BATCH_PREFIX,
 )
-from qiita_common.ena_accession import InvalidEnaAccessionError, validate_study_accession
+from qiita_common.ena_accession import InvalidEnaAccessionError, validate_import_accession
 from qiita_common.models.ena_import import TERMINAL_BATCH_ITEM_STATES, BatchItemState
 
 from .. import _common
+
+_FAILED_STATES = (BatchItemState.FAILED, BatchItemState.COMPLETED_PARTIAL)
 
 
 def _read_accessions_from_file(path: Path) -> list[str]:
@@ -73,14 +75,20 @@ def _announce(batch_idx: int) -> None:
     )
 
 
+def _item_label(item: dict) -> str:
+    return (
+        item["ena_study_accession"] or f"{len(item['requested_run_accessions'])} requested run(s)"
+    )
+
+
 def _report_state_change(batch_idx: int, item: dict) -> None:
-    accession, state = item["ena_study_accession"], item["state"]
+    label, state = _item_label(item), item["state"]
     detail = ""
-    if state == BatchItemState.FAILED and item.get("failure_reason"):
+    if state in _FAILED_STATES and item.get("failure_reason"):
         detail = f" ({item['failure_reason']})"
     elif item.get("download_work_ticket_idxs"):
         detail = f" tickets={item['download_work_ticket_idxs']}"
-    print(f"ena_import_batch {batch_idx}: {accession} -> {state}{detail}", file=sys.stderr)
+    print(f"ena_import_batch {batch_idx}: {label} -> {state}{detail}", file=sys.stderr)
 
 
 async def _watch_ena_import_batch(
@@ -92,11 +100,11 @@ async def _watch_ena_import_batch(
     poll_interval_seconds: float,
     timeout_seconds: float,
 ) -> dict:
-    """Poll until every item is `done` or `failed`.
+    """Poll until every item is terminal.
 
     A `RequestError` or 5xx response is retried until `timeout_seconds`
     elapses, logging one stderr line per retry; any other status is fatal
-    and propagates. Raises TimeoutError naming each still-pending accession's
+    and propagates. Raises TimeoutError naming each still-pending item's
     last known state — from the last successful poll, or `seed_items` if none
     succeeded — otherwise returns the final status body.
     """
@@ -104,7 +112,7 @@ async def _watch_ena_import_batch(
 
     url = URL_ENA_IMPORT_BATCH_BY_IDX.format(ena_import_batch_idx=batch_idx)
     deadline = time.monotonic() + timeout_seconds
-    last_states: dict[str, str] = {}
+    last_states: dict[int, str] = {}
     last_items = seed_items
     while True:
         try:
@@ -129,9 +137,8 @@ async def _watch_ena_import_batch(
         body = resp.json()
         last_items = body["items"]
         for item in last_items:
-            accession = item["ena_study_accession"]
-            if last_states.get(accession) != item["state"]:
-                last_states[accession] = item["state"]
+            if last_states.get(item["idx"]) != item["state"]:
+                last_states[item["idx"]] = item["state"]
                 _report_state_change(batch_idx, item)
         if all(item["state"] in TERMINAL_BATCH_ITEM_STATES for item in last_items):
             return body
@@ -140,7 +147,7 @@ async def _watch_ena_import_batch(
         await asyncio.sleep(max(0.0, min(poll_interval_seconds, deadline - time.monotonic())))
 
     pending = ", ".join(
-        f"{item['ena_study_accession']} (last state: {item['state']!r})"
+        f"{_item_label(item)} (last state: {item['state']!r})"
         for item in last_items
         if item["state"] not in TERMINAL_BATCH_ITEM_STATES
     )
@@ -228,7 +235,7 @@ def _handle_submit_ena_import(args: argparse.Namespace, parser: argparse.Argumen
     accessions = _resolve_accessions(args, parser)
     for accession in accessions:
         try:
-            validate_study_accession(accession)
+            validate_import_accession(accession)
         except InvalidEnaAccessionError as exc:
             parser.error(str(exc))
 
@@ -280,7 +287,7 @@ def _handle_submit_ena_import(args: argparse.Namespace, parser: argparse.Argumen
 
     print(json.dumps(result, indent=2, default=str))
     watching_failed = not args.no_watch and any(
-        item["state"] == BatchItemState.FAILED for item in result["items"]
+        item["state"] in _FAILED_STATES for item in result["items"]
     )
     return 1 if watching_failed else 0
 

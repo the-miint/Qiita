@@ -157,8 +157,8 @@ class FailureType(StrEnum):
     """Discriminates retriable from permanent work-ticket failures.
     Mirrored DB-side by qiita.failure_type.
 
-    `retriable` failures are transient infra issues — NODE_FAIL, OOM,
-    transient FS errors, slurmrestd unreachability — that the runner
+    `retriable` failures are ones a re-run may clear — NODE_FAIL, OOM,
+    transient FS errors, slurmrestd unreachability, a segfault — that the runner
     bounces back to QUEUED for another attempt while retry_count is
     below max_retries. `permanent` failures (bad input, container
     contract violations, exit codes from a known-terminal workflow) skip
@@ -298,8 +298,8 @@ class WorkTicket(BaseModel):
     shard_id: int | None = None
     # The mask this ticket minted or filtered against (qiita.mask_definition),
     # None for every ticket that carries no mask. Mirrors qiita.work_ticket.
-    # mask_idx, whose FK is ON DELETE SET NULL — a purged mask detaches its
-    # tickets, so a None here can also mean "the mask this ticket used is gone".
+    # mask_idx, whose FK is ON DELETE SET NULL — a ticket whose mask_definition
+    # row has been deleted reads None too.
     # Surfaced so `qiita ticket status` on a read-mask ticket names the mask it
     # produced, which is one of the ways a client resolves a mask_idx without a
     # DB shell (the mask-definition reads are the other).
@@ -506,10 +506,14 @@ class BlockMaskPlanResponse(BaseModel):
     """Returned (HTTP 202) by `POST .../block-mask-plan`: the plan the server
     persisted + dispatched. `blocks` lists every created block with its
     dispatched work_ticket; `partitions` summarizes the per-mask tiling and the
-    host filtering EACH partition resolved to (there is no single pool-wide host
-    answer any more — it is per sample); the `samples_*` counts reconcile the
-    pool's samples (planned + skipped-existing + skipped-no-reads). A pool with
-    nothing to do returns 202 with zero counts."""
+    host filtering EACH partition resolved to (host filtering is resolved per
+    prep_sample, so a pool can span several partitions); the `samples_*` counts
+    reconcile the pool's prep_samples (planned + skipped-existing + skipped-no-reads
+    + completed-empty + skipped-invalidated). `samples_completed_empty` counts the
+    prep_samples whose ingest stored no reads, recorded as masked with no reads to
+    serve; `samples_skipped_invalidated` counts those of them whose masking was
+    withdrawn earlier, which the plan leaves withdrawn. A pool with nothing to do
+    returns 202 with zero counts."""
 
     sequencing_run_idx: Annotated[int, Field(gt=0)]
     sequenced_pool_idx: Annotated[int, Field(gt=0)]
@@ -517,6 +521,8 @@ class BlockMaskPlanResponse(BaseModel):
     samples_planned: Annotated[int, Field(ge=0)]
     samples_skipped_existing: Annotated[int, Field(ge=0)]
     samples_skipped_no_reads: Annotated[int, Field(ge=0)]
+    samples_completed_empty: Annotated[int, Field(ge=0)]
+    samples_skipped_invalidated: Annotated[int, Field(ge=0)]
     blocks_created: Annotated[int, Field(ge=0)]
     partitions: list[BlockPlanPartition]
     blocks: list[BlockPlanBlock]

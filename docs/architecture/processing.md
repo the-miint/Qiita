@@ -141,7 +141,7 @@ Work ticket fields (per `qiita.work_ticket` migration `20260504000001_work_ticke
 
 The schema does not carry per-step provenance fields (slurm_job_id, log paths, current_step / total_steps, provenance JSONB, completed_at). The runner is synchronous and waits inline for each step; SLURM-side log retrieval is on the orchestrator and not surfaced on the work_ticket row.
 
-Failure classification is finer-grained at the backend layer: `BackendFailure.kind` is one of the values in `qiita_common.backend_failure.FailureKind` (NODE_FAIL, OOM_KILLED, PREEMPTED, TIMEOUT_BEFORE_START, TRANSIENT_FS_ERROR, SLURMRESTD_UNREACHABLE, ORCHESTRATOR_UNREACHABLE, CONTROL_PLANE_UNREACHABLE, PROCESS_RESTARTED, DATA_PLANE_TRANSIENT, EXTERNAL_FETCH_TRANSIENT for retriable; BAD_INPUT, EXIT_NONZERO, CONTRACT_VIOLATION, UNKNOWN_PERMANENT, and the runner-raised RESOURCE_CEILING_EXHAUSTED and RETRIES_EXHAUSTED for permanent). The runner collapses these to the two-valued `failure_type` for storage; `work_ticket` has no kind column (the per-attempt kind is stored in `work_ticket_step.failure_kind`), so a `RETRIES_EXHAUSTED` failure is identified by the `retries_exhausted` prefix of its `failure_reason` (`retries_exhausted (3/3); last failure [node_fail]: ...`); other reasons carry per-failure detail for triage.
+Failure classification is finer-grained at the backend layer: `BackendFailure.kind` is one of the values in `qiita_common.backend_failure.FailureKind` (NODE_FAIL, OOM_KILLED, PREEMPTED, TIMEOUT_BEFORE_START, TRANSIENT_FS_ERROR, SLURMRESTD_UNREACHABLE, ORCHESTRATOR_UNREACHABLE, CONTROL_PLANE_UNREACHABLE, PROCESS_RESTARTED, DATA_PLANE_TRANSIENT, EXTERNAL_FETCH_TRANSIENT, SEGFAULT for retriable; BAD_INPUT, EXIT_NONZERO, CONTRACT_VIOLATION, UNKNOWN_PERMANENT, and the runner-raised RESOURCE_CEILING_EXHAUSTED and RETRIES_EXHAUSTED for permanent). The runner collapses these to the two-valued `failure_type` for storage; `work_ticket` has no kind column (the per-attempt kind is stored in `work_ticket_step.failure_kind`), so a `RETRIES_EXHAUSTED` failure is identified by the `retries_exhausted` prefix of its `failure_reason` (`retries_exhausted (3/3); last failure [node_fail]: ...`); other reasons carry per-failure detail for triage.
 
 Retry semantics (implemented in `qiita_control_plane.runner._run_entry_with_retry`):
 - On `BackendFailure(transient=True)` and `retry_count < max_retries`: bump `retry_count`, atomically transition `PROCESSING → QUEUED → PROCESSING`, retry the same entry. Earlier successful entries are not re-run — `bound` outputs carry forward.
@@ -152,6 +152,7 @@ Retry semantics (implemented in `qiita_control_plane.runner._run_entry_with_retr
 Manual restart (`POST /api/v1/work-ticket/{idx}/run` on a `FAILED` ticket):
 - Atomic UPDATE: state ← PENDING, `retry_count = 0`, all `failure_*` columns ← NULL (the DB CHECK requires `failure_*` all-NULL when state ≠ failed; the route clears them in one statement).
 - Triggers a fresh in-process dispatch via `schedule_dispatch`, which queues behind the process-wide dispatch cap below when all slots are held. The original FAILED-row state is not preserved on the row itself; ops dashboards that want post-mortem retention should snapshot the `failure_*` fields before triggering /run.
+- Entries with a `completed` step row are fast-forwarded, not re-run. A step row is read for the entry at its `step_index` only while that entry still has the row's `step_name` and kind (`step:` or `action:`), because workflow YAMLs are edited in place and re-synced (`step_progress.check_step_progress`). A ticket with a row that no longer matches — a step was inserted, removed, renamed or reordered ahead of it — is refused by `/run` with a 409 naming those rows, and fails permanently at `submission` when startup recovery resumes it; a new ticket is submitted in its place (a terminal ticket does not block one), or, for `read-mask-block`, its prep_samples are re-masked under a new mask version. `/run` also refuses a ticket whose `mask_idx` names a deprecated mask.
 - A `download-ena-study` redrive also drops completed step rows so the roster is re-read, and is refused (409) when a newer download ticket exists for the pool or a FAILED ticket still has a live job; see the [ENA import runbook](../runbooks/ena-import.md).
 
 **Dispatch concurrency.** Every dispatch path (route submit, ENA batch submit, startup reconcile, fan-out pump release) goes through `schedule_dispatch`, whose task holds one slot of the process-wide `_DISPATCH_CONCURRENCY` cap (8) for its whole workflow — an hours-long download poll included. Tasks past the cap queue FIFO and start as slots free, logging `queued behind the dispatch cap` when they start waiting and `dispatched after waiting` when they get one; nothing fails while it waits. Bounding in-flight workflows, not just connections, is the deliberate consequence: it is what keeps a burst of submits from pressuring the connection pool after `_STUDY_CONCURRENCY`'s permit has already been released at submit. Two behaviours follow that an operator should expect: a restart with more than 8 tickets in flight re-attaches the first 8 and queues the rest, and `/run` queues behind the same slots as ordinary submits. The cap is sized against the pool and `FANOUT_MAX_INFLIGHT` together — see the note on the constant.
@@ -187,18 +188,20 @@ restriction.
 ## ENA Study Import
 
 Admin-facing bulk import of public INSDC studies' metadata and reads, distinct
-from a workflow entry: `POST /api/v1/ena-import-batch` takes a list of study
+from a workflow entry: `POST /api/v1/ena-import-batch` takes a list of study or run
 accessions and returns immediately with a batch handle, while a background task
 (`qiita_control_plane.ena_import.batch`) resolves each accession's metadata (via
 `duckdb-miint`'s `read_ena` / `read_ena_attributes`), registers it into
 `study`/`biosample`/`sequenced_sample` rows (de-duplicating biosamples that share
 an ENA sample accession across studies), and submits one `download-ena-study`
-work ticket per `sequenced_pool` holding the study's runs (a re-import's new runs
+work ticket per `sequenced_pool` holding the study's runs, or a run-list item's
+listed runs (a re-import's new runs
 get a new pool once an earlier pool's download is under way). That ticket then
 runs like any other workflow: a native `ingest_ena_reads` step (`read_ena_sequences`
-+ the same mint-then-sort-and-assign pipeline `ingest_reads` uses) followed by the
-standard `register-files` action into DuckLake. One accession's failure — resolver
-error, unmappable platform, a DB conflict — is isolated to that accession; it never
++ the same mint-then-sort-and-assign pipeline `ingest_reads` uses), the standard
+`register-files` action into DuckLake, and `persist-ena-run-outcomes`, which records
+each run that could not be stored. One item's failure — resolver
+error, unmappable platform, a DB conflict — is isolated to that item; it never
 aborts the batch or its siblings. See
 [`docs/runbooks/ena-import.md`](../runbooks/ena-import.md) for the operator-facing
 walkthrough, the REST surface, and this surface's hard scope limits (INSDC only,
@@ -229,7 +232,7 @@ Execution (the CP runner drives the per-step loop — `submit_step` → poll `st
 
 Step outputs, intermediate and final, land in the step's per-attempt workspace, `PATH_SCRATCH/ticket/<work_ticket_idx>/<step>/attempt-<N>/` (see [Data Storage](storage.md#data-storage)). Jobs never write into the lake: registration has the data plane move each registered file from there into `PATH_PERSISTENT/ducklake/<table>/` and then call `ducklake_add_data_files`.
 
-Failure records which step failed (`failed_stage=processing_step_{n}`). Manual restart resets to step 0.
+Failure records which step failed (`failed_stage=processing_step_{n}`). A manual restart fast-forwards the entries that already completed (see "Manual restart" above).
 
 **Container contract:** Every workflow container must honour this interface regardless of what it does internally. Violations are rejected by the orchestrator's output verification gates and treated as permanent failures.
 
@@ -278,6 +281,8 @@ Orchestrator verification gates (all must pass before a step is accepted):
 3. Every file listed in `files` exists at its declared `size_bytes`
 4. The `outputs` map's relative paths resolve under `$QIITA_OUTPUT_PATH` (no traversal) and exist
 5. Every file under `$QIITA_OUTPUT_PATH` is mode `0o440` and is listed in `files` (no extras)
+
+A step re-read on a resume or redrive (`StepStatusWire.recovered`) skips the per-file gates, 3 and 5 above; `verify_container_output` (`slurm/verify.py`) says why.
 
 A gate failure after exit code 0 is a permanent failure — the container returned 0 but didn't honor the contract, so retry won't help. SlurmBackend wraps the resulting failures as `BackendFailure(kind=CONTRACT_VIOLATION, transient=False)`.
 

@@ -62,6 +62,7 @@ SWEEP_TIERS = (
         ("mask_sample", (("prep_sample_idx", PREP_SAMPLE),)),
         ("prep_sample_field_exception", (("prep_sample_idx", PREP_SAMPLE),)),
         ("prep_sample_metadata", (("prep_sample_idx", PREP_SAMPLE),)),
+        ("prep_sample_qc_check", (("prep_sample_idx", PREP_SAMPLE),)),
         ("prep_sample_to_study", (("prep_sample_idx", PREP_SAMPLE), ("study_idx", STUDY))),
         ("sequence_range", (("prep_sample_idx", PREP_SAMPLE),)),
         ("sequenced_sample", (("prep_sample_idx", PREP_SAMPLE),)),

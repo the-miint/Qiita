@@ -151,7 +151,7 @@ from qiita_common.analytic import PAIRED_PLACEMENT_PARTITION
 from qiita_common.parquet import validate_parquet_path
 
 from ..miint import (
-    PARQUET_OPTS,
+    PARQUET_OPTS_AT_REST,
     PARQUET_OPTS_INTERMEDIATE,
     apply_duckdb_settings,
     duckdb_tmp_dir,
@@ -678,7 +678,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 routed = conn.execute(f"SELECT count(*) FROM {_READ_TO_SHARD}").fetchone()[0]
                 if routed == 0:
                     conn.execute(
-                        f"COPY ({_EMPTY_ALIGNMENT_SELECT}) TO '{out_sql}' ({PARQUET_OPTS})"
+                        f"COPY ({_EMPTY_ALIGNMENT_SELECT}) TO '{out_sql}' ({PARQUET_OPTS_AT_REST})"
                     )
                     success = True
                     return {"alignment": alignment, "alignment_staging_dir": workspace}
@@ -705,7 +705,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 # total BYTES (so it grows with read count AND read length); the table's
                 # tracks reads-per-shard only, and is flat in read length. Measured per
                 # shard (1000 shards, scattered membership, threads=8, warm cache,
-                # PARQUET_OPTS; see docs/duckdb-miint.md for the full table):
+                # zstd at the default level; see docs/duckdb-miint.md for the full table):
                 #
                 #   1M x 160 bp   ( 49 MB):  view  20.0 ms  table  3.4 ms
                 #   1M x 320 bp   ( 99 MB):  view  34.9 ms  table  3.5 ms  <- view +75%,
@@ -933,7 +933,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                     f"{pooled_qualify}"
                     "ORDER BY alignment_idx, prep_sample_idx, sequence_idx, feature_idx, "
                     "position, flags) "
-                    f"TO '{out_sql}' ({PARQUET_OPTS})"
+                    f"TO '{out_sql}' ({PARQUET_OPTS_AT_REST})"
                 )
         # OUTSIDE the connection contexts, matching qc and host_filter: a context
         # __exit__ that raises after the COPY must still take the partial-output
