@@ -60,6 +60,7 @@ from .repositories.block import (
     create_block,
     set_block_work_ticket,
 )
+from .repositories.mask_definition import MaskDefinitionDeprecated, lock_active_mask
 from .repositories.reference_membership import reference_shard_ids
 from .runner import (
     ReferenceIndexNotBuilt,
@@ -500,6 +501,11 @@ async def plan_and_submit_alignments(
                 await lock_active_alignment(conn, alignment_idx)
             except AlignmentDefinitionDeprecated as exc:
                 raise AlignDefinitionDeprecated(exc.detail) from exc
+            # The block tickets carry mask_idx too, so the mask is held the same way.
+            try:
+                await lock_active_mask(conn, mask_idx)
+            except MaskDefinitionDeprecated as exc:
+                raise AlignMaskDeprecated(exc.detail) from exc
             await create_alignment_sample_pending(
                 conn,
                 alignment_idx=alignment_idx,

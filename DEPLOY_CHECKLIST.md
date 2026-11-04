@@ -201,6 +201,10 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
   `ROLE_IMPLIED_SCOPES`, with no host action. Deprecate an alignment, invalidate its runs,
   or abandon a failed plan instead. Any alignment against a reference, deprecated or not,
   blocks the reference's delete. The data plane's `delete_alignment` DoAction is removed.
+- (#N) Soft API-contract change: deprecating a mask or an alignment
+  (`PATCH /mask-definition/{mask_idx}/status`, `PATCH /alignment-definition/{alignment_idx}/status`)
+  now returns 409, listing the tickets, while any work ticket under it is unfinished.
+  Cancel or wait for them first.
 
 ## Deployed history
 

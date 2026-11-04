@@ -102,10 +102,12 @@ from ..repositories.block import MASK_SAMPLE_COMPLETED, fetch_mask_sample_state
 from ..repositories.mask_definition import (
     MaskDefinitionDeprecated,
     MaskDefinitionNotFound,
+    MaskHasLiveWork,
     fetch_mask_definition_by_idx,
     fetch_mask_prep_samples,
     list_mask_definitions,
     mint_mask_definition,
+    refuse_deprecating_mask_with_live_work,
     set_mask_sample_states,
     transition_mask_definition_status,
 )
@@ -508,7 +510,7 @@ async def get_syndna_read_count_route(
 async def update_mask_definition_status_route(
     mask_idx: Annotated[int, Field(gt=0)],
     body: MaskDefinitionStatusUpdate,
-    pool: asyncpg.Pool = Depends(get_db_pool),
+    tx: TxConnFactory = Depends(get_tx_conn_factory),
     caller: HumanUser = Depends(require_human),
     _scope: Principal = Depends(require_scope(Scope.MASK_DEFINITION_LIFECYCLE)),
 ) -> MaskDefinition:
@@ -524,19 +526,30 @@ async def update_mask_definition_status_route(
     query-time macro, so dropping read_mask removes the record of the filtering
     decision while leaving the raw reads Flight-reachable.
 
+    Deprecating is refused (409, listing them) while any work ticket carrying the
+    mask is unfinished, held ones included.
+
     system_admin only (`mask_definition:lifecycle`).
     """
     try:
-        row = await transition_mask_definition_status(
-            pool,
-            mask_idx=mask_idx,
-            status=body.status,
-            reason=body.reason,
-            superseded_by=body.superseded_by,
-            principal_idx=caller.principal_idx,
-        )
+        async with tx() as conn:
+            if body.status is MaskDefinitionStatus.DEPRECATED:
+                await refuse_deprecating_mask_with_live_work(conn, mask_idx)
+            row = await transition_mask_definition_status(
+                conn,
+                mask_idx=mask_idx,
+                status=body.status,
+                reason=body.reason,
+                superseded_by=body.superseded_by,
+                principal_idx=caller.principal_idx,
+            )
     except MaskDefinitionNotFound:
         raise HTTPException(status_code=404, detail=_MSG_MASK_NOT_FOUND)
+    except MaskHasLiveWork as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"reason": str(exc), "work_ticket_idx": exc.work_ticket_idxs},
+        ) from exc
     except asyncpg.ForeignKeyViolationError as exc:
         raise HTTPException(
             status_code=422,

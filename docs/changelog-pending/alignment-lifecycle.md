@@ -31,6 +31,11 @@
 
 ### Changed
 
+- **Deprecating a mask waits for its unfinished work tickets (#N).**
+  `PATCH /mask-definition/{mask_idx}/status` to `deprecated` is refused (409, listing
+  them) while any work ticket carrying the mask is unfinished, held ones included,
+  so no masking run or alignment over its pass-set is still to write under it.
+
 - **The align plan's 409 for an already-gated prep_sample no longer says to delete the
   alignment (#N).** It names the alignment (`alignment_idx` in the body) and the way
   out for each case: abandon the plan for prep_samples left pending by failed blocks,
