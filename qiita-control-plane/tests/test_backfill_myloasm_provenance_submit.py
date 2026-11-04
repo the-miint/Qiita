@@ -1,9 +1,11 @@
-"""Unit tests for `qiita-admin backfill myloasm-provenance --execute`'s submit loop.
+"""Unit tests for `qiita-admin backfill myloasm-provenance`: its submit loop, and the
+planner's source-tree check.
 
 No database: the loop takes the plan and a `submit` callable, so these pin what it
 sends, what it holds back, and that one refused submission never stops the rest.
 """
 
+import os
 from pathlib import Path
 
 import httpx
@@ -18,6 +20,7 @@ from qiita_control_plane.backfill.myloasm_provenance import (
     ResidueKind,
     Run,
     RunStatus,
+    _source_tree_residue,
     submit_runs,
 )
 
@@ -97,7 +100,33 @@ def test_limit_caps_attempts_and_rate_sleeps_between_them():
     # The refused first attempt counts against the limit.
     assert [r.processing_idx for r, _ in report.submitted] == [20]
     assert [r.processing_idx for r, _ in report.failed] == [10]
+    assert [r.processing_idx for r in report.not_attempted] == [30]
     assert slept == [1.5]
+
+
+def test_every_writable_run_is_accounted_for_under_a_limit():
+    """Submitted, deferred, refused and not attempted together are the writable runs,
+    each once, so a capped pass reports what it left outstanding."""
+    plan = BackfillPlan(
+        runs=[
+            _run(1, 10),
+            _run(1, 11),
+            _run(2, 20),
+            _run(3, 30),
+            _run(4, 40, RunStatus.IN_FLIGHT),
+            _run(4, 41),
+            _run(5, 50),
+        ]
+    )
+    report = submit_runs(plan, submit=_Submit(fail={20: 409}), limit=2, sleep=lambda _s: None)
+    seen = sorted(
+        [r.processing_idx for r, _ in report.submitted]
+        + [r.processing_idx for r in report.deferred]
+        + [r.processing_idx for r, _ in report.failed]
+        + [r.processing_idx for r in report.not_attempted]
+    )
+    assert seen == sorted(r.processing_idx for r in plan.by_status(RunStatus.WRITABLE))
+    assert [r.processing_idx for r in report.not_attempted] == [30, 50]
 
 
 @pytest.mark.parametrize("limit", [0, -1])
@@ -128,3 +157,20 @@ def test_the_submit_body_satisfies_the_shipped_workflow():
 def test_a_residue_kind_goes_with_residue_status_only(status, kind):
     with pytest.raises(ValueError, match="residue kind"):
         Run(1, 10, 5, status, reason="x", residue_kind=kind)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root traverses a mode-000 directory")
+def test_a_source_tree_that_cannot_be_looked_at_raises_rather_than_reading_as_missing(
+    tmp_path,
+):
+    output = tmp_path / "ticket" / "1" / "assemble" / "attempt-0" / "output"
+    (output / "assembler").mkdir(parents=True)
+    (output / "manifest.json").write_text("{}")
+    assert _source_tree_residue(output) is None
+    locked = output.parent
+    locked.chmod(0)
+    try:
+        with pytest.raises(PermissionError):
+            _source_tree_residue(output)
+    finally:
+        locked.chmod(0o755)

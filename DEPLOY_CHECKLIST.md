@@ -165,7 +165,9 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
   Each pass submits one ticket per prep_sample, so rerun it once the pass's tickets finish.
   You are done when the dry run counts no writable and no in-flight runs and every
   residue line has an explanation. `--retry-failed` resubmits runs whose recovery
-  ticket failed. On #827, which removes the one-off, post the measurements and the
+  ticket ended without completing (failed, cancelled or no_data). If the dry run stops
+  with a permission error, run it as an account that can read the ticket workspaces.
+  On #827, which removes the one-off, post the measurements and the
   dry run's status counts and `residue, <kind>: <n>` lines, each kind with its
   explanation. Name no run, ticket or job by its id there: the per-run lines carry
   `_idx` values, and the repository is public.

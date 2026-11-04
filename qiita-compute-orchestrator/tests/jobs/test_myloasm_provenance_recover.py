@@ -4,16 +4,19 @@ long-read-assembly 1.0.0/1.0.1 run (`jobs/myloasm_provenance_recover.py`).
 The source is a real-shaped `assemble` step output under a scratch tree — myloasm's
 `-o` tree from the committed fixture, the splitter's `genomes/`, and the step's
 manifest — at the path that the ticket workspace layout gives it. The two data-plane
-streams are replaced: the read lookup by the fixture's read names, and the run's
-`assembled_sequence` by what `assembly_hash` itself writes for those genomes, so the
-job must reproduce the producer's hashes from the same bytes.
+streams are replaced: the read lookup by the names that myloasm was given (read off
+its own mapping file, independently of the miint readers that the job dumps with),
+and the run's `assembled_sequence` by what `assembly_hash` itself writes for those
+genomes, so the job must reproduce the producer's hashes from the same bytes.
 """
 
 from __future__ import annotations
 
 import asyncio
+import gzip
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -31,7 +34,6 @@ from myloasm_fixture import (
     MYLOASM_FIXTURE_VERSIONS,
     myloasm_output_dir,
     myloasm_raw_dir,
-    myloasm_read_name_map,
 )
 from qiita_common.duckdb_relation import registered
 from qiita_common.myloasm_constants import MYLOASM_TABLES
@@ -102,6 +104,21 @@ def _assemble_output(out: Path, version: str) -> Path:
     return out
 
 
+# myloasm's decoration of an input read's name in its own files: an `r<N>-` index
+# prefix, and a `+split<N>` suffix on a piece of a split read.
+_MYLOASM_NAME_DECORATION = re.compile(r"^r\d+-|\+split\d+$")
+
+
+def _input_read_names(asm: Path) -> list[tuple[str, int]]:
+    """`(read_id, sequence_idx)` for every read that myloasm was given, as the run's
+    pass-set holds them: each query name in myloasm's own mapping file with its
+    decoration removed, numbered in name order. Read from the file, not through a
+    miint reader, so the job's reader-derived names must match the input."""
+    with gzip.open(asm / "3-mapping" / "map_to_unitigs.paf.gz", "rt") as paf:
+        names = {_MYLOASM_NAME_DECORATION.sub("", line.split("\t", 1)[0]) for line in paf}
+    return [(name, i) for i, name in enumerate(sorted(names), start=1)]
+
+
 def _producer_features(genomes: Path, work: Path) -> dict[str, tuple[int, str, int]]:
     """`contig_id -> (feature_idx, sequence_hash, length)` as the run's lake rows hold
     them: `assembly_hash` run over the genomes, one feature per canonical hash as
@@ -154,9 +171,7 @@ def built(request, tmp_path_factory) -> Source:
     root = tmp_path_factory.mktemp(f"myloasm-{request.param}")
     scratch = root / "scratch"
     output = _assemble_output(_output_dir(scratch), request.param)
-    names = myloasm_read_name_map(
-        myloasm_raw_dir(root / "names", request.param, sequence_idx_names=False)
-    )
+    names = _input_read_names(output / "assembler")
     features = _producer_features(output / "genomes", root / "producer")
     return Source(request.param, scratch, output, names, features)
 
@@ -311,6 +326,11 @@ def _drop_assembler_tree(source: Source) -> None:
     shutil.rmtree(source.output / "assembler")
 
 
+def _empty_the_run_log(source: Source) -> None:
+    # Not in the manifest's checked files, so only the dump can catch it.
+    (source.output / "assembler" / "myloasm.log").write_text("")
+
+
 @pytest.mark.parametrize(
     ("damage", "error", "match"),
     [
@@ -318,6 +338,10 @@ def _drop_assembler_tree(source: Source) -> None:
         pytest.param(_unlist_primary, ValueError, "assembly_primary.fa", id="primary-unlisted"),
         pytest.param(_grow_a_genome_file, ValueError, "noLCG.fa", id="changed-since-finish"),
         pytest.param(_drop_assembler_tree, FileNotFoundError, "assembler", id="no-tree"),
+        # 1.0.2's dump refuses an empty run log; so does the recovery's.
+        pytest.param(
+            _empty_the_run_log, ValueError, "read_myloasm_run returned no rows", id="no-run"
+        ),
     ],
 )
 def test_a_source_that_is_not_the_finished_step_output_is_refused(
@@ -327,6 +351,21 @@ def test_a_source_that_is_not_the_finished_step_output_is_refused(
     _install(monkeypatch, source)
     with pytest.raises(error, match=match):
         _run(tmp_path / "ws")
+    assert _staged_parquet(tmp_path / "ws" / "myloasm_staging") == []
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root traverses a mode-000 directory")
+def test_a_source_that_cannot_be_looked_at_raises_rather_than_reading_as_missing(
+    monkeypatch, source, tmp_path
+):
+    _install(monkeypatch, source)
+    locked = source.output.parent
+    locked.chmod(0)
+    try:
+        with pytest.raises(PermissionError):
+            _run(tmp_path / "ws")
+    finally:
+        locked.chmod(0o755)
     assert _staged_parquet(tmp_path / "ws" / "myloasm_staging") == []
 
 

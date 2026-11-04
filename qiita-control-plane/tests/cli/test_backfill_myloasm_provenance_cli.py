@@ -100,4 +100,7 @@ def test_a_refused_submission_exits_non_zero(monkeypatch, planned, capsys):
 
     monkeypatch.setattr(cli._common, "call", _call)
     assert main(["backfill", "myloasm-provenance", "--execute", "--limit", "1"]) == 1
-    assert "prep_sample 1 run 10: 409: busy" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "prep_sample 1 run 10: 409: busy" in out
+    # The second writable run is past the limit, and says so.
+    assert "not attempted (over --limit): 1" in out

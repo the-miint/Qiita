@@ -25,6 +25,7 @@ issue that removes it.
 
 from __future__ import annotations
 
+import stat
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -136,6 +137,8 @@ class ResidueKind(StrEnum):
     appear."""
 
     RECOVERY_FAILED = "recovery ticket failed"
+    RECOVERY_CANCELLED = "recovery ticket cancelled"
+    RECOVERY_NO_DATA = "recovery ticket ended no_data"
     NO_SOURCE_TICKET = "no completed source ticket"
     NO_ASSEMBLE_STEP = "no completed assemble step"
     NO_MANIFEST = "no manifest"
@@ -188,12 +191,30 @@ class BackfillPlan:
         return [r for r in self.runs if r.status is status]
 
 
+# The residue kind of a run whose newest recovery ticket ended without completing.
+_RECOVERY_ENDED = {
+    WorkTicketState.FAILED: ResidueKind.RECOVERY_FAILED,
+    WorkTicketState.CANCELLED: ResidueKind.RECOVERY_CANCELLED,
+    WorkTicketState.NO_DATA: ResidueKind.RECOVERY_NO_DATA,
+}
+
+
+def _is(path: Path, mode_test: Callable[[int], bool]) -> bool:
+    """Whether `path` exists and passes `mode_test` (`stat.S_ISREG`, `stat.S_ISDIR`).
+    Only absence reads as False: a path that cannot be looked at (no permission to
+    traverse its parent) raises, where `Path.is_file()` would report it missing."""
+    try:
+        return mode_test(path.stat().st_mode)
+    except FileNotFoundError, NotADirectoryError:
+        return False
+
+
 def _source_tree_residue(output: Path) -> tuple[ResidueKind, str] | None:
     """Why the attempt's output cannot be read, or None if it can."""
-    if not (output / STEP_MANIFEST_FILENAME).is_file():
+    if not _is(output / STEP_MANIFEST_FILENAME, stat.S_ISREG):
         kind = ResidueKind.NO_MANIFEST
         return kind, f"{kind} at {output / STEP_MANIFEST_FILENAME}"
-    if not (output / _ASSEMBLER_DIR).is_dir():
+    if not _is(output / _ASSEMBLER_DIR, stat.S_ISDIR):
         kind = ResidueKind.NO_ASSEMBLER_TREE
         return kind, f"{kind} at {output / _ASSEMBLER_DIR}"
     return None
@@ -220,11 +241,14 @@ def _classify(row: asyncpg.Record, *, ticket_root: Path, retry_failed: bool) -> 
             reason=f"recovery ticket {recover} is {recover_state}",
         )
     if recover is not None and not retry_failed:
+        failure = row["recover_failure"]
         return Run(
             **key,
             status=RunStatus.RESIDUE,
-            residue_kind=ResidueKind.RECOVERY_FAILED,
-            reason=f"recovery ticket {recover} {recover_state}: {row['recover_failure']}",
+            # A state outside the map is one this planner does not know: KeyError.
+            residue_kind=_RECOVERY_ENDED[WorkTicketState(recover_state)],
+            reason=f"recovery ticket {recover} {recover_state}"
+            + (f": {failure}" if failure else ""),
         )
 
     if row["source_ticket"] is None:
@@ -268,7 +292,8 @@ async def plan_backfill(
     """Read-only: every myloasm run of `source_versions`, classified.
 
     `ticket_root` is the per-ticket workspace root (`PATH_SCRATCH/ticket`).
-    `retry_failed` makes a run whose recovery ticket failed writable again.
+    `retry_failed` makes a run whose recovery ticket ended without completing
+    (failed, cancelled or no_data) writable again.
     """
     rows = await pool.fetch(
         _RUNS_SQL,
@@ -293,6 +318,8 @@ class SubmitReport:
     submitted: list[tuple[Run, int]] = field(default_factory=list)
     deferred: list[Run] = field(default_factory=list)
     failed: list[tuple[Run, str]] = field(default_factory=list)
+    # Writable runs left for a later pass by `limit`.
+    not_attempted: list[Run] = field(default_factory=list)
 
 
 def submit_runs(
@@ -310,7 +337,8 @@ def submit_runs(
     action and prep_sample whatever its context, so a second run of a prep_sample,
     or one whose prep_sample has a recovery ticket in flight, is deferred to the
     next pass. A refused submission is recorded and the loop carries on. `limit`
-    caps the attempts, refused ones included; `rate_seconds` is slept between them.
+    caps the attempts, refused ones included, and the writable runs past it are
+    reported as not attempted; `rate_seconds` is slept between attempts.
     """
     if limit is not None and limit <= 0:
         raise ValueError(f"limit must be positive, got {limit}")
@@ -322,7 +350,8 @@ def submit_runs(
             report.deferred.append(run)
             continue
         if limit is not None and attempts >= limit:
-            break
+            report.not_attempted.append(run)
+            continue
         if attempts and rate_seconds > 0:
             sleep(rate_seconds)
         attempts += 1

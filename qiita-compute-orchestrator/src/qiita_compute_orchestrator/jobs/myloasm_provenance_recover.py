@@ -29,6 +29,8 @@ from __future__ import annotations
 
 import json
 import shutil
+import stat
+from collections.abc import Callable
 from pathlib import Path
 
 import duckdb
@@ -71,6 +73,9 @@ _SOURCE_STEP = "assemble"
 _ASSEMBLER_DIR = "assembler"
 _GENOMES_DIR = "genomes"
 _PRIMARY_FASTA = f"{_ASSEMBLER_DIR}/assembly_primary.fa"
+# The dump's tables that are never empty for a run with primary contigs: the
+# container's own set (`_NEVER_EMPTY` in workflows/long-read-assembly/myloasm_provenance.py).
+_NEVER_EMPTY = ("myloasm_contig", "myloasm_run")
 # The two columns that the read lookup binds, and so the only two that it asks the
 # data plane for: a long-read prep_sample's `read_masked` rows are mostly their
 # sequences and qualities.
@@ -109,22 +114,32 @@ def _source_output(inputs: Inputs) -> Path:
     return step_output_dir(step_attempt_dir(ticket, _SOURCE_STEP, inputs.assemble_attempt))
 
 
+def _is(path: Path, mode_test: Callable[[int], bool]) -> bool:
+    """Whether `path` exists and passes `mode_test` (`stat.S_ISREG`, `stat.S_ISDIR`).
+    Only absence reads as False: a path that cannot be looked at (no permission to
+    traverse its parent) raises, where `Path.is_file()` would report it missing."""
+    try:
+        return mode_test(path.stat().st_mode)
+    except FileNotFoundError, NotADirectoryError:
+        return False
+
+
 def _check_source(output: Path) -> None:
     """Refuse a source unless its manifest lists each file read directly here, at
     the size that the file has now."""
     manifest = output / STEP_MANIFEST_FILENAME
-    if not manifest.is_file():
+    if not _is(manifest, stat.S_ISREG):
         raise FileNotFoundError(
             f"no {STEP_MANIFEST_FILENAME} at {manifest}: no finished {_SOURCE_STEP} attempt there"
         )
-    if not (output / _ASSEMBLER_DIR).is_dir():
+    if not _is(output / _ASSEMBLER_DIR, stat.S_ISDIR):
         raise FileNotFoundError(f"no assembler tree at {output / _ASSEMBLER_DIR}")
     listed = {f["path"]: f["size_bytes"] for f in json.loads(manifest.read_text())["files"]}
     for rel in (_PRIMARY_FASTA, f"{_GENOMES_DIR}/{LCG_FILE}", f"{_GENOMES_DIR}/{NOLCG_FILE}"):
         if rel not in listed:
             raise ValueError(f"{manifest} does not list {rel}")
         path = output / rel
-        if not path.is_file():
+        if not _is(path, stat.S_ISREG):
             raise FileNotFoundError(f"{path} is listed in {manifest} but missing")
         size = path.stat().st_size
         if size != listed[rel]:
@@ -137,8 +152,8 @@ def _check_source(output: Path) -> None:
 def _dump_raw_tables(conn: duckdb.DuckDBPyConnection, asm_dir: Path, raw_dir: Path) -> None:
     """Write the raw dump that 1.0.2's assemble step writes in its container: each
     `MYLOASM_TABLES` reader over `asm_dir` into `raw_dir/<table>.parquet`, verbatim,
-    as `workflows/long-read-assembly/myloasm_provenance.py` does, refusing zero
-    contigs as it does."""
+    as `workflows/long-read-assembly/myloasm_provenance.py` does, refusing an empty
+    `_NEVER_EMPTY` table as it does."""
     raw_dir.mkdir(parents=True, exist_ok=True)
     src = sql_string_literal(asm_dir)
     for table, spec in MYLOASM_TABLES.items():
@@ -146,8 +161,8 @@ def _dump_raw_tables(conn: duckdb.DuckDBPyConnection, asm_dir: Path, raw_dir: Pa
         (rows,) = conn.execute(
             f"COPY (FROM {spec.reader}({src})) TO '{dest}' ({PARQUET_OPTS_INTERMEDIATE})"
         ).fetchone()
-        if table == "myloasm_contig" and rows == 0:
-            raise ValueError(f"{spec.reader} returned no contigs for {asm_dir}")
+        if table in _NEVER_EMPTY and rows == 0:
+            raise ValueError(f"{spec.reader} returned no rows for {asm_dir}")
 
 
 def _read_names_from_lookup(conn: duckdb.DuckDBPyConnection, lookup: str) -> None:

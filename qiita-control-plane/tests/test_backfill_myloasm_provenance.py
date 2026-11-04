@@ -346,6 +346,8 @@ async def test_runs_with_nothing_to_recover_are_skipped(world):
         (WorkTicketState.COMPLETED, RunStatus.DONE),
         (WorkTicketState.PROCESSING, RunStatus.IN_FLIGHT),
         (WorkTicketState.FAILED, RunStatus.RESIDUE),
+        (WorkTicketState.CANCELLED, RunStatus.RESIDUE),
+        (WorkTicketState.NO_DATA, RunStatus.RESIDUE),
     ],
 )
 async def test_a_runs_own_recovery_ticket_decides_its_status(world, state, status):
@@ -362,9 +364,20 @@ async def test_a_runs_own_recovery_ticket_decides_its_status(world, state, statu
     assert run.status is status
     if status is not RunStatus.DONE:
         assert str(rec) in run.reason
-    if state is WorkTicketState.FAILED:
-        assert run.residue_kind is ResidueKind.RECOVERY_FAILED
-        assert "boom" in run.reason
+    if status is RunStatus.RESIDUE:
+        assert (
+            run.residue_kind
+            is {
+                WorkTicketState.FAILED: ResidueKind.RECOVERY_FAILED,
+                WorkTicketState.CANCELLED: ResidueKind.RECOVERY_CANCELLED,
+                WorkTicketState.NO_DATA: ResidueKind.RECOVERY_NO_DATA,
+            }[state]
+        )
+        if state is WorkTicketState.FAILED:
+            assert run.reason.endswith(": boom")
+        else:
+            # No failure columns outside FAILED, so no dangling ": None".
+            assert run.reason == f"recovery ticket {rec} {state}"
         retried = (await w["plan"](retry_failed=True))[(ps, p)]
         assert retried.status is RunStatus.WRITABLE
         assert retried.source_work_ticket_idx == wt

@@ -55,8 +55,8 @@ def add_myloasm_provenance_parser(backfill_sub: argparse._SubParsersAction) -> N
         "--retry-failed",
         action="store_true",
         help=(
-            "Resubmit runs whose recovery ticket failed (otherwise listed as residue,"
-            " with the failure)."
+            "Resubmit runs whose recovery ticket ended without completing: failed,"
+            " cancelled or no_data (otherwise listed as residue, with the reason)."
         ),
     )
     p.add_argument(
@@ -130,7 +130,9 @@ def _handle(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
                 retry_failed=args.retry_failed,
             )
         )
-    except (RuntimeError, ValueError) as exc:
+    except (RuntimeError, ValueError, OSError) as exc:
+        # OSError: a source tree that this account cannot look at (PermissionError)
+        # stops the plan rather than reading as missing.
         print(f"error: {exc}", file=sys.stderr)
         return 1
     _print_plan(plan)
@@ -154,6 +156,7 @@ def _handle(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
     for run, ticket in report.submitted:
         print(f"  prep_sample {run.prep_sample_idx} run {run.processing_idx} -> ticket {ticket}")
     print(f"deferred to the next pass: {len(report.deferred)}")
+    print(f"not attempted (over --limit): {len(report.not_attempted)}")
     print(f"refused: {len(report.failed)}")
     for run, error in report.failed:
         print(f"  prep_sample {run.prep_sample_idx} run {run.processing_idx}: {error}")
