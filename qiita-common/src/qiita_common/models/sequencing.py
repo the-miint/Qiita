@@ -1326,9 +1326,6 @@ class AlignmentDefinition(BaseModel):
     deprecated_by_idx: Annotated[int | None, Field(default=None, gt=0)] = None
     deprecation_reason: str | None = None
     superseded_by: Annotated[int | None, Field(default=None, gt=0)] = None
-    # Set when a reference delete began purging this alignment's rows (see the
-    # column's COMMENT).
-    rows_purged_at: AwareDatetime | None = None
 
 
 class AlignmentDefinitionStatusUpdate(BaseModel):

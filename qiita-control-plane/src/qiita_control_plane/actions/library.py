@@ -2869,34 +2869,6 @@ async def delete_alignment_sample_data(
     return json.loads(results[0].body.to_pybytes()).get("rows_deleted", 0)
 
 
-async def delete_alignment_data(
-    *,
-    alignment_idx: int,
-    signing_key: bytes,
-    data_plane_url: str,
-) -> int:
-    """Delete an alignment's DuckLake `alignment` rows via the data plane's
-    `delete_alignment` DoAction, returning the rows-deleted count.
-
-    Signs a `delete_alignment` action token carrying only `alignment_idx`. The
-    delete is a logical `DELETE FROM alignment WHERE alignment_idx = ?` inside one
-    DuckLake transaction — no parquet is reclaimed from disk (mirrors
-    `delete_reference`). Idempotent: an alignment whose rows never registered (or were
-    already deleted) deletes zero rows and still succeeds. Raises
-    pyarrow.flight.FlightError on transport / data-plane failure."""
-    results = await run_signed_flight_call(
-        lambda: sign_action(
-            action="delete_alignment",
-            payload={"alignment_idx": alignment_idx},
-            secret=signing_key,
-        ),
-        lambda token: _do_action("delete_alignment", data_plane_url, token),
-    )
-    if not results:
-        return 0
-    return json.loads(results[0].body.to_pybytes()).get("rows_deleted", 0)
-
-
 async def _finalize_sample_metrics(
     conn: asyncpg.Connection,
     *,

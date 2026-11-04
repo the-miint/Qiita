@@ -430,34 +430,6 @@ pub fn verify_delete_alignment_block(
     serde_json::from_slice(&payload_bytes).map_err(|e| AuthError::MalformedPayload(e.to_string()))
 }
 
-/// Parsed payload for the `delete_alignment` DoAction — the whole-alignment
-/// purge.
-///
-/// Wire shape pinned by `qiita_control_plane.actions.library.delete_alignment_data`:
-/// `{"action": "delete_alignment", "alignment_idx": N}`. The data plane deletes
-/// every `alignment` row for `alignment_idx` in one DuckLake transaction. Idempotent:
-/// an alignment whose rows never registered deletes zero rows. `deny_unknown_fields`
-/// keeps the contract tight: any extra field is a design slip surfaced loudly here.
-#[derive(Debug, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct DeleteAlignmentPayload {
-    /// Action discriminator; the gRPC handler also rejects a payload whose
-    /// `action` is not "delete_alignment".
-    pub action: String,
-    /// `i64`, matching the Postgres `alignment_definition.alignment_idx BIGINT`
-    /// source of truth and the `alignment.alignment_idx BIGINT` DuckLake column.
-    pub alignment_idx: i64,
-}
-
-/// Verify a `delete_alignment` DoAction token and return its parsed payload.
-pub fn verify_delete_alignment(
-    ticket: &[u8],
-    verifying_key: &VerifyingKey,
-) -> Result<DeleteAlignmentPayload, AuthError> {
-    let payload_bytes = verify_ticket_raw(ticket, verifying_key)?;
-    serde_json::from_slice(&payload_bytes).map_err(|e| AuthError::MalformedPayload(e.to_string()))
-}
-
 /// Parsed payload for the `delete_alignment_sample` DoAction — the per-prep_sample
 /// idempotent replace.
 ///
@@ -476,7 +448,7 @@ pub struct DeleteAlignmentSamplePayload {
     /// Action discriminator; the gRPC handler also rejects a payload whose
     /// `action` is not "delete_alignment_sample".
     pub action: String,
-    /// `i64`, as `DeleteAlignmentPayload::alignment_idx`.
+    /// `i64`, as `DeleteAlignmentBlockPayload::alignment_idx`.
     pub alignment_idx: i64,
     /// `i64`, matching the `alignment.prep_sample_idx BIGINT` DuckLake column.
     pub prep_sample_idx: i64,

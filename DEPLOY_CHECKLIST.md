@@ -199,8 +199,8 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
   `422 unknown scopes`; an existing token carrying it keeps working without it. The new
   `alignment_definition:lifecycle` scope reaches `system_admin` through
   `ROLE_IMPLIED_SCOPES`, with no host action. Deprecate an alignment, invalidate its runs,
-  or abandon a failed plan instead. Reference delete now purges a deprecated alignment's
-  DuckLake rows; an active one still blocks it.
+  or abandon a failed plan instead. Any alignment against a reference, deprecated or not,
+  blocks the reference's delete. The data plane's `delete_alignment` DoAction is removed.
 
 ## Deployed history
 

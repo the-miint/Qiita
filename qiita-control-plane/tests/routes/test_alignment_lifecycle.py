@@ -363,49 +363,6 @@ async def test_mint_refuses_a_deprecated_config(client, lc):
             )
 
 
-async def test_reactivation_refused_once_rows_were_purged(client, lc):
-    """Reference delete stamps rows_purged_at before purging. The stamp, not the
-    reference row, is the proof: a reference delete that failed after its purge
-    leaves the reference in place and the rows gone."""
-    assert (await _deprecate(client, lc["alignment_idx"])).status_code == 200
-    from qiita_control_plane.actions.reference import mark_deprecated_alignments_purged
-
-    async with lc["pool"].acquire() as conn, conn.transaction():
-        stamped = await mark_deprecated_alignments_purged(conn, lc["reference_idx"])
-    assert stamped == [lc["alignment_idx"]]
-    resp = await client.patch(
-        URL_ALIGNMENT_DEFINITION_STATUS.format(alignment_idx=lc["alignment_idx"]),
-        json={"status": "active"},
-    )
-    assert resp.status_code == 409
-    assert "purged" in resp.json()["detail"]
-    # Re-deprecating with a corrected reason is still allowed, and keeps the stamp.
-    again = await _deprecate(client, lc["alignment_idx"])
-    assert again.status_code == 200
-    assert again.json()["rows_purged_at"] is not None
-
-
-async def test_an_active_alignment_stops_the_stamp_before_any_purge(client, lc):
-    """An alignment reactivated after reference delete's precheck is found active
-    here, under the row lock, and stops the delete before anything is stamped or
-    purged."""
-    from qiita_control_plane.actions.reference import (
-        ReferenceDeleteBlocked,
-        mark_deprecated_alignments_purged,
-    )
-
-    with pytest.raises(ReferenceDeleteBlocked, match="active alignment"):
-        async with lc["pool"].acquire() as conn, conn.transaction():
-            await mark_deprecated_alignments_purged(conn, lc["reference_idx"])
-    assert (
-        await lc["pool"].fetchval(
-            "SELECT rows_purged_at FROM qiita.alignment_definition WHERE alignment_idx = $1",
-            lc["alignment_idx"],
-        )
-        is None
-    )
-
-
 # ---------------------------------------------------------------------------
 # Per-sample lifecycle
 # ---------------------------------------------------------------------------

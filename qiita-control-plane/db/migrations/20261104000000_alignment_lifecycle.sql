@@ -50,10 +50,6 @@ ALTER TABLE qiita.alignment_definition
     ),
     ADD CONSTRAINT alignment_definition_supersede_not_self CHECK (
         superseded_by IS NULL OR superseded_by <> alignment_idx
-    ),
-    ADD COLUMN rows_purged_at TIMESTAMPTZ,
-    ADD CONSTRAINT alignment_definition_purged_only_when_deprecated CHECK (
-        rows_purged_at IS NULL OR status = 'deprecated'
     );
 
 COMMENT ON COLUMN qiita.alignment_definition.status IS
@@ -62,11 +58,6 @@ COMMENT ON COLUMN qiita.alignment_definition.status IS
     '''deprecated'' means the configuration is void: qiita.mint_alignment_definition '
     'refuses to return the row, and every consumer refuses to read it. It does not '
     'judge any one prep_sample''s run -- that is alignment_sample.state.';
-
-COMMENT ON COLUMN qiita.alignment_definition.rows_purged_at IS
-    'Set by reference delete before it purges this alignment''s DuckLake rows, so a '
-    'set value means the rows may be gone. Only a deprecated row is stamped, and a '
-    'stamped row cannot be made active again.';
 
 COMMENT ON COLUMN qiita.alignment_definition.superseded_by IS
     'The alignment_definition that replaces this one, when there is one. Settable '
@@ -292,7 +283,6 @@ ALTER TABLE qiita.block
 COMMENT ON COLUMN qiita.block.state IS NULL;
 
 ALTER TABLE qiita.alignment_definition
-    DROP CONSTRAINT IF EXISTS alignment_definition_purged_only_when_deprecated,
     DROP CONSTRAINT IF EXISTS alignment_definition_supersede_not_self,
     DROP CONSTRAINT IF EXISTS alignment_definition_superseded_only_when_deprecated,
     DROP CONSTRAINT IF EXISTS alignment_definition_deprecation_reason_nonblank,
@@ -312,7 +302,6 @@ ALTER TABLE qiita.alignment_sample
     ADD CONSTRAINT alignment_sample_state_check CHECK (state IN ('pending', 'completed'));
 
 ALTER TABLE qiita.alignment_definition
-    DROP COLUMN IF EXISTS rows_purged_at,
     DROP COLUMN IF EXISTS superseded_by,
     DROP COLUMN IF EXISTS deprecation_reason,
     DROP COLUMN IF EXISTS deprecated_by_idx,

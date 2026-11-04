@@ -27,6 +27,7 @@
   - `DELETE /alignment-definition/{alignment_idx}`.
   - The `alignment_definition:delete` scope. A personal access token minted with it
     keeps working; the scope is dropped from its effective set.
+  - The data plane's `delete_alignment` DoAction.
 
 ### Changed
 
@@ -35,13 +36,9 @@
   out for each case: abandon the plan for prep_samples left pending by failed blocks,
   deprecate a bad completed alignment. A plan whose config resolves to a deprecated
   alignment is a 409.
-- **Reference delete proceeds past deprecated alignments (#N).** It purges their
-  DuckLake `alignment` rows first and keeps their definitions
-  (`alignment_rows_deleted` in the response). An active alignment against the
-  reference still blocks the delete, now with a message saying to deprecate it; so
-  does a deprecated alignment's block ticket that is still running. An alignment
-  whose rows a reference delete has purged, or started to purge, cannot be returned
-  to active.
+- **Reference delete's refusal for an aligned-against reference no longer says to
+  delete the alignment (#N).** Alignment data is never purged, so a reference with
+  any alignment against it, deprecated or not, cannot be deleted.
 - **The service-account alignment DoGet re-checks its cohort (#N).** It returns 409
   when the alignment was deprecated, or a prep_sample invalidated, after the
   feature-table ticket was submitted.

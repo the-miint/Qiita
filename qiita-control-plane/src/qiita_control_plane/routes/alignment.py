@@ -98,25 +98,6 @@ def _alignment_record_to_response(row: asyncpg.Record) -> AlignmentDefinition:
     )
 
 
-async def _refuse_reactivating_purged_rows(conn: asyncpg.Connection, alignment_idx: int):
-    """409 once reference delete has stamped `rows_purged_at`. The row lock is the
-    one `actions.reference.mark_deprecated_alignments_purged` takes."""
-    purged_at = await conn.fetchrow(
-        "SELECT rows_purged_at FROM qiita.alignment_definition WHERE alignment_idx = $1 FOR UPDATE",
-        alignment_idx,
-    )
-    if purged_at is None:
-        raise AlignmentDefinitionNotFound(alignment_idx)
-    if purged_at["rows_purged_at"] is not None:
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                f"alignment {alignment_idx}'s rows were purged by a delete of the reference"
-                " it aligned against; it cannot be returned to active"
-            ),
-        )
-
-
 @alignment_definition_router.patch(PATH_ALIGNMENT_DEFINITION_STATUS)
 async def update_alignment_definition_status_route(
     alignment_idx: Annotated[int, Field(gt=0)],
@@ -135,16 +116,13 @@ async def update_alignment_definition_status_route(
 
     Deprecating is refused (409, listing them) while any work ticket under the
     alignment is unfinished, held ones included: they would still write rows under
-    a void config. Returning a deprecated alignment to active is refused (409) once
-    a reference delete has purged its rows.
+    a void config.
 
     system_admin only (`alignment_definition:lifecycle`).
     """
     try:
         async with tx() as conn:
-            if body.status is AlignmentDefinitionStatus.ACTIVE:
-                await _refuse_reactivating_purged_rows(conn, alignment_idx)
-            else:
+            if body.status is AlignmentDefinitionStatus.DEPRECATED:
                 await refuse_deprecating_with_live_work(conn, alignment_idx)
             row = await transition_alignment_definition_status(
                 conn,

@@ -224,85 +224,6 @@ fn delete_read_mask_block_deletes_footprint_only() {
     ));
 }
 
-/// `delete_alignment` drops exactly the target alignment_idx's rows from
-/// every `ALIGNMENT_DELETE_TABLES` table, leaves a different alignment
-/// untouched in each, and is idempotent: a second delete of the same
-/// alignment_idx succeeds and reports `rows_deleted: 0`.
-///
-/// The side table carries fewer rows than `alignment` here (only one of the
-/// two reads is origin-spanning), so `rows_deleted` cannot be satisfied by the
-/// side table's count.
-#[test]
-#[serial_test::serial]
-#[cfg(feature = "integration")]
-fn delete_alignment_drops_target_idempotently() {
-    let connstr = crate::test_catalog::connstr();
-    let data_path = crate::test_catalog::data_path();
-    let conn = Connection::open_in_memory().unwrap();
-    ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
-    ducklake::ensure_alignment_tables(&conn).unwrap();
-
-    // Unique ids so leftover rows never collide with other serial tests.
-    let align_a: i64 = 960_100;
-    let align_b: i64 = 960_101;
-    let prep: i64 = 960_110;
-
-    // Only the identity columns are populated — this exercises the delete
-    // predicate, and the score columns are not derivable here without an
-    // aligner.
-    conn.execute_batch(&format!(
-        "DELETE FROM qiita_lake.alignment WHERE alignment_idx IN ({align_a}, {align_b});
-         DELETE FROM qiita_lake.alignment_origin_spanning \
-             WHERE alignment_idx IN ({align_a}, {align_b});
-         INSERT INTO qiita_lake.alignment \
-             (alignment_idx, prep_sample_idx, sequence_idx, feature_idx) VALUES \
-             ({align_a}, {prep}, 1, 10), \
-             ({align_a}, {prep}, 2, 11), \
-             ({align_b}, {prep}, 1, 10);
-         INSERT INTO qiita_lake.alignment_origin_spanning \
-             (alignment_idx, prep_sample_idx, sequence_idx, feature_idx) VALUES \
-             ({align_a}, {prep}, 1, 10), \
-             ({align_b}, {prep}, 1, 10);"
-    ))
-    .unwrap();
-
-    let first = delete_alignment(&attached_writer(&connstr, &data_path), align_a)
-        .expect("delete_alignment failed");
-    assert_eq!(first["rows_deleted"], 2, "both align_a rows deleted");
-    assert_eq!(first["alignment_idx"], align_a);
-
-    let count = |table: &str, align: i64| -> i64 {
-        conn.query_row(
-            &format!("SELECT count(*) FROM qiita_lake.{table} WHERE alignment_idx = {align}"),
-            [],
-            |r| r.get(0),
-        )
-        .unwrap()
-    };
-    assert_eq!(count("alignment", align_a), 0, "align_a rows gone");
-    assert_eq!(count("alignment", align_b), 1, "align_b untouched");
-    assert_eq!(
-        count("alignment_origin_spanning", align_a),
-        0,
-        "align_a evidence rows gone"
-    );
-    assert_eq!(
-        count("alignment_origin_spanning", align_b),
-        1,
-        "align_b evidence untouched"
-    );
-
-    // Idempotency: re-deleting the now-empty alignment is success with 0 rows.
-    let second = delete_alignment(&attached_writer(&connstr, &data_path), align_a)
-        .expect("idempotent re-delete failed");
-    assert_eq!(second["rows_deleted"], 0, "second delete removes nothing");
-
-    let _ = conn.execute_batch(&format!(
-        "DELETE FROM qiita_lake.alignment WHERE alignment_idx = {align_b};
-         DELETE FROM qiita_lake.alignment_origin_spanning WHERE alignment_idx = {align_b};"
-    ));
-}
-
 /// `delete_alignment_block` deletes EXACTLY one block's footprint from every
 /// `ALIGNMENT_DELETE_TABLES` table: the per-member OR residual keeps a split
 /// prep_sample's sibling-block sub-range, the `alignment_idx` scope keeps a
@@ -449,7 +370,7 @@ fn delete_alignment_block_deletes_footprint_only() {
 /// `delete_alignment_sample` deletes EXACTLY one `(alignment_idx,
 /// prep_sample_idx)` pair's rows from every `ALIGNMENT_DELETE_TABLES` table.
 /// Both halves of the pair are pinned: a sibling prep_sample under the SAME
-/// alignment_idx survives (so the delete is not `delete_alignment`), and the
+/// alignment_idx survives (so the delete is not keyed on alignment_idx alone), and the
 /// target prep_sample's rows under a DIFFERENT alignment_idx survive (so it is not
 /// keyed on prep_sample_idx alone). All of a read's rows go regardless of
 /// feature_idx, and a prep_sample with no rows deletes an idempotent 0.
@@ -656,7 +577,7 @@ fn delete_pool_reads_drops_target_idempotently() {
 
 /// Membership runs both ways. Every `qiita_lake` BASE TABLE scoped by
 /// `alignment_idx` is in `ALIGNMENT_DELETE_TABLES`, and every table in the
-/// list carries every column a `delete_alignment*` clause keys on.
+/// list carries every column a `delete_alignment_*` clause keys on.
 ///
 /// The first direction is the shape query, as in
 /// `every_content_addressed_lake_table_is_registered`: an `alignment_idx`
@@ -708,20 +629,19 @@ fn alignment_delete_covers_every_alignment_scoped_lake_table() {
         assert!(
             ALIGNMENT_DELETE_TABLES.contains(&table.as_str()),
             "qiita_lake.{table} is scoped by alignment_idx but absent from \
-             ALIGNMENT_DELETE_TABLES, so the delete_alignment* handlers leave its \
+             ALIGNMENT_DELETE_TABLES, so the delete_alignment_* handlers leave its \
              rows behind; found scoped tables: {scoped:?}"
         );
     }
     assert_eq!(
         ALIGNMENT_DELETE_TABLES.first(),
         Some(&"alignment"),
-        "the delete_alignment* handlers report counts[0] as rows_deleted"
+        "the delete_alignment_* handlers report counts[0] as rows_deleted"
     );
 
-    // The columns the three clauses key on: `delete_alignment` on
-    // alignment_idx, `delete_alignment_sample` on that plus prep_sample_idx,
-    // `delete_alignment_block` on that plus `block_read_where_clause`'s
-    // sequence_idx.
+    // The columns the two clauses key on: `delete_alignment_sample` on
+    // alignment_idx and prep_sample_idx, `delete_alignment_block` on those plus
+    // `block_read_where_clause`'s sequence_idx.
     for table in ALIGNMENT_DELETE_TABLES {
         let mut stmt = conn
             .prepare(
@@ -743,7 +663,7 @@ fn alignment_delete_covers_every_alignment_scoped_lake_table() {
             assert!(
                 columns.iter().any(|c| c == key),
                 "qiita_lake.{table} is in ALIGNMENT_DELETE_TABLES but carries no \
-                 {key}, which a delete_alignment* clause keys on — every delete \
+                 {key}, which a delete_alignment_* clause keys on — every delete \
                  using it would bind-error and roll back; found columns: {columns:?}"
             );
         }
