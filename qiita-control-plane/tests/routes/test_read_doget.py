@@ -363,7 +363,7 @@ async def test_read_doget_alignment_deleted_mid_flight_422(ctx, env):
     try:
         resp = await ctx["sa"].post(URL_READ_DOGET, json={"work_ticket_idx": wt_idx})
         assert resp.status_code == 422, resp.text
-        assert "deleted mid-flight" in resp.json()["detail"]
+        assert "removed by hand mid-flight" in resp.json()["detail"]
     finally:
         await _cleanup_block_ticket(ctx["pool"], wt_idx, *rest)
 

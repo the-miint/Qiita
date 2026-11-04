@@ -516,8 +516,8 @@ async def run_workflow(
                 #
                 # (The raw-vs-masked decision that used to live here moved to
                 # `block_read.resolve_block_read_scope`, applied by the mint route
-                # at runtime — where it also sees an alignment deleted after
-                # submission.)
+                # at runtime — where it also sees an alignment_definition row
+                # removed after submission.)
                 raise _submission_bad_input(
                     "a block-scoped workflow must not declare a `reads` input: a "
                     "block's steps stream their reads from the data plane at "

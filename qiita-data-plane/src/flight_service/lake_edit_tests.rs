@@ -399,7 +399,7 @@ fn delete_alignment_sample_deletes_the_pair_only() {
     // read aligned to two shards' features), exercising the feature_idx-agnostic
     // multiplicity delete. align_a/prep_b is a sibling prep_sample under the same
     // align-config identity; align_b/prep_a is the same prep_sample under a different
-    // one. Identity columns only, as in the other alignment delete tests.
+    // one. Identity columns only, as in the other `delete_alignment_*` tests.
     conn.execute_batch(&format!(
         "DELETE FROM qiita_lake.alignment WHERE alignment_idx IN ({align_a}, {align_b});
          DELETE FROM qiita_lake.alignment_origin_spanning \

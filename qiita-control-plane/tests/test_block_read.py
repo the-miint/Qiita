@@ -46,7 +46,7 @@ def test_alignment_deleted_mid_flight_is_a_hard_error():
     would stream un-QC'd, non-host-depleted reads into an aligner, so the
     disagreement must fail loudly instead.
     """
-    with pytest.raises(ValueError, match="deleted mid-flight"):
+    with pytest.raises(ValueError, match="removed by hand mid-flight"):
         resolve_block_read_scope(
             action_context={"alignment_idx": 7},
             ticket_alignment_idx=None,

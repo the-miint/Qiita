@@ -77,9 +77,9 @@ async def mint_exported_processing_handle(
         )
     except ProcessingVanishedError as exc:
         # The alignment_definition row was removed between the check above and the
-        # mint. No route removes one, so only a removal by hand reaches this. 409
-        # rather than 500 because nothing is wrong with the request: the processing
-        # it named stopped existing mid-flight.
+        # mint (`qiita_common.actions`, at `BLOCK_MASK_ACTION_ID`, says how one can
+        # be removed). 409 rather than 500 because nothing is wrong with the request:
+        # the processing it named stopped existing mid-flight.
         raise HTTPException(
             status_code=409,
             detail=(

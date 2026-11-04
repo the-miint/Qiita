@@ -648,7 +648,7 @@ fn delete_read_mask_block(
     }))
 }
 
-/// Every `qiita_lake` table an alignment delete clears, in delete order.
+/// Every `qiita_lake` table the `delete_alignment_*` handlers clear, in delete order.
 /// `alignment` leads: both `delete_alignment_*` handlers report its count as
 /// `rows_deleted`.
 ///

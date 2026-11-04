@@ -19,7 +19,8 @@ class ProcessingVanishedError(RuntimeError):
     """The processing had no live handle after minting one for it.
 
     Reachable only if the alignment_definition row is removed concurrently, which
-    retires the handles it named; no route removes one.
+    retires the handles it named. `qiita_common.actions`, at `BLOCK_MASK_ACTION_ID`,
+    says how one can be removed.
     """
 
     def __init__(self, alignment_idx: int) -> None:

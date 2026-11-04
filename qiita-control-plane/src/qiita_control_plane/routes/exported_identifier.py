@@ -93,10 +93,10 @@ async def mint_exported_identifier_map(
         )
     except IncompleteMintError as exc:
         # The alignment_definition row was removed between the checks above and the
-        # mint, which retires the identifiers it named. No route removes an
-        # alignment_definition, so only a removal by hand reaches this. 409 rather
-        # than 500 because nothing is wrong with the request: the alignment it named
-        # stopped existing mid-flight.
+        # mint, which retires the identifiers it named (`qiita_common.actions`, at
+        # `BLOCK_MASK_ACTION_ID`, says how one can be removed). 409 rather than 500
+        # because nothing is wrong with the request: the alignment it named stopped
+        # existing mid-flight.
         raise HTTPException(
             status_code=409,
             detail=(
