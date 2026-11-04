@@ -193,3 +193,22 @@ def test_validate_import_accession_rejects_garbage():
 
     with pytest.raises(InvalidEnaAccessionError):
         validate_import_accession("FOO123")
+
+
+@pytest.mark.parametrize("accession", ["SRR1", "ERR1074767", "DRR037815", "  ERR1074767\n"])
+def test_validate_run_accession_returns_the_stripped_run(accession):
+    from qiita_common.ena_accession import validate_run_accession
+
+    assert validate_run_accession(accession) == accession.strip()
+
+
+@pytest.mark.parametrize(
+    "accession", ["ERX1111111", "SAMEA3610311", "PRJEB11419", "ERR", "ERR1 ERR2", "", "FOO123"]
+)
+def test_validate_run_accession_refuses_anything_but_a_run(accession):
+    from qiita_common.ena_accession import InvalidEnaAccessionError, validate_run_accession
+
+    expected = f"'{accession}' is not a run accession (expected SRR/ERR/DRR followed by digits)"
+    with pytest.raises(InvalidEnaAccessionError) as raised:
+        validate_run_accession(accession)
+    assert str(raised.value) == expected

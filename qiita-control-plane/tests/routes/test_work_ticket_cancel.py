@@ -50,6 +50,7 @@ async def ctx(postgres_pool):
         database_url="unused", flight_signing_key=b"\x00" * 32, data_plane_url="unused"
     )
     backend = _FakeBackendClient()
+    saved_compute_backend_client = getattr(app.state, "compute_backend_client", None)
     app.state.compute_backend_client = backend
     app.state.running_dispatches = set()
     app.state.dispatch_semaphore = build_dispatch_semaphore()
@@ -144,6 +145,7 @@ async def ctx(postgres_pool):
         "action_id": action_id,
     }
 
+    app.state.compute_backend_client = saved_compute_backend_client
     await postgres_pool.execute(
         "DELETE FROM qiita.work_ticket WHERE work_ticket_idx = ANY($1::bigint[])", tickets
     )
