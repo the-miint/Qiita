@@ -106,6 +106,9 @@ Only rules whose trigger appears in the diff can fire.
 | A fix that cleans up bad state after it lands; a dedup, cleanup or GC pass | R4, R9 |
 | A write decided by a row being absent that another path inserts; a query that takes a past ticket's or record's outcome as proof | R4, R9 |
 | A decision keyed on a flag (`dispatch_held`, `is_*`) that summarizes a state other paths change | R4 |
+| A new lifecycle state (deprecated, invalidated, abandoned) on a row other routes list or hand out | R4 |
+| An identity minted (get-or-create) before, and outside the transaction of, the rows that give it data | R4 |
+| A test of a filter, exclusion or predicate | R4 |
 | A path that either creates an object or reuses an existing one (get-or-create, resolve-or-create, `INSERT … ON CONFLICT` followed by a read) | R4 |
 | A read that hides rows or values by the caller's permission; a timestamp, count, ETag or error detail returned beside them | R4 |
 | A Pydantic `Field(...)` constraint or a validation regex | R5 |
@@ -219,6 +222,9 @@ Safety must not rest on convention or a comment; and a guard must be real, so do
 - **A value derived from rows that a caller cannot see is hidden from that caller too.** On a read that hides rows or values by permission, a timestamp, count, ETag or error detail computed over every row tells the caller that hidden rows exist and when they changed. Compute it over the rows that the caller can see, or ask whether the exposure is accepted. The test writes a hidden value and asserts that the caller's response does not change.
 - **A check must fail loud.** A check that swallows the error, a `skipif` on the assertion the test exists for [soft], and an empty or no-op result read as success are fail-open. An empty result is a trap only if something keys on it: a status flips, an identity is minted, a gate opens. If nothing does, zero rows is a legitimate answer.
 - **Discriminate on the trusted source, and validate before the expensive or irreversible step.**
+- **A new lifecycle state reaches every route that reads the row.** When a change adds a state that makes a row unusable (deprecated, invalidated, abandoned), list the routes that list it, resolve it or return it as a request body for another route. Each either reports the state or refuses the row; a discovery route whose answer is "a valid body by construction" must not hand out one the target now refuses.
+- **Mint an identity in the transaction of what gives it meaning.** A get-or-create committed before the rows that make it real (its gates, tickets, members) leaves an empty identity when a later step refuses or fails. Flag it where something keys on the identity's existence (a delete gate, a listing) and nothing removes it. The test makes a step after the mint fail and asserts no row remains.
+- **A test of a predicate pins both directions.** A test that an exclusion holds also shows, on the same fixture, a case the predicate still catches; otherwise a predicate that always returns the excluded answer passes it.
 - **A flag is trusted only as far as every path maintains it.** A decision keyed on a flag that summarizes a state (held, released, dirty) names every path that changes the state, and each one must set or clear the flag. Where one does not, decide on the state itself, or on the flag and the state together. The test drives the path that leaves the flag stale, then the decision.
 - **Proof from history is the newest record's, not any record's.** A query that opens a gate or writes a state because some past ticket ended a certain way must say whether a newer one supersedes it. A later attempt that failed, was cancelled or is still running usually does.
 - **Cause, not aftermath** [soft]. For a fix that removes bad state after it lands, ask whether the state can be refused where it is created.
