@@ -178,10 +178,10 @@ def align_block_cohort(alignment_idx: int) -> FanoutCohort:
 
     ``alignment_idx`` is already unambiguous (only an align block sets it, and
     deleting its alignment_definition NULLs it, so a detached ticket drops out
-    either way) — unlike ``mask_idx``,
-    which both block kinds carry. The ``action_id`` test is here because a cohort
-    is a throttle over ONE workflow's fan-out, so scoping it to that workflow is
-    what the cohort means, not because the idx needs disambiguating.
+    either way) — unlike ``mask_idx``, which both block kinds carry. The
+    ``action_id`` test is here because a cohort is a throttle over ONE workflow's
+    fan-out, so scoping it to that workflow is what the cohort means, not because
+    the idx needs disambiguating.
 
     **If a second action ever sets `alignment_idx`, these two diverge.** This
     cohort would exclude its tickets from the in-flight cap while
@@ -287,9 +287,9 @@ def cohort_for_ticket_row(row: asyncpg.Record | dict[str, Any]) -> FanoutCohort 
     released — not by a later top-up, not by startup reconcile. That is the
     intended end state here: the alternative is releasing a block whose alignment
     no longer exists. It leaves a permanently-pending held ticket behind, which is
-    litter rather than a hazard. No route deletes an alignment_definition, so only
-    a removal by hand produces one; abandon-plan (`actions/align_abandon.py`)
-    cancels a plan's held tickets while its alignment still exists.
+    litter rather than a hazard (see `qiita_common.actions` for when the row is
+    deleted); abandon-plan (`actions/align_abandon.py`) cancels a plan's held
+    tickets while its alignment still exists.
 
     A block ticket is routed by its ACTION, not by whether ``alignment_idx`` is
     set: deleting an alignment_definition NULLs that column, which would otherwise

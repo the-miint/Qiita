@@ -512,9 +512,8 @@ async def test_has_incomplete_covering_block_ignores_a_detached_align_block(blk)
     """A DETACHED align block must not wedge the read-mask finalize gate.
 
     An align block ticket carries both mask_idx and alignment_idx, and deleting the
-    alignment_definition row (by hand: no route deletes one) NULLs the alignment
-    (`ON DELETE SET NULL`) while leaving mask_idx and block_idx. On column shape
-    alone the leftover is
+    alignment_definition row NULLs the alignment (`ON DELETE SET NULL`) while
+    leaving mask_idx and block_idx. On column shape alone the leftover is
     indistinguishable from a read-mask block covering the same sample under the same
     mask — so a discriminator of `alignment_idx IS NULL` would count it here and
     refuse to finalize a sample whose masking is genuinely complete. Discriminating
@@ -540,8 +539,8 @@ async def test_has_incomplete_covering_block_ignores_a_detached_align_block(blk)
             is False
         )
         # A FAILED align block over the same footprint, detached (alignment_idx
-        # NULL) — the leftover deleting its alignment_definition leaves. Masking is still
-        # complete, so the gate must stay open.
+        # NULL) — the leftover that deleting its alignment_definition row leaves.
+        # Masking is still complete, so the gate must stay open.
         await _block_with_ticket(
             blk,
             action=align_action,

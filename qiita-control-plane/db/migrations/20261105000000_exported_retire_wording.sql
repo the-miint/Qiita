@@ -1,10 +1,9 @@
 -- migrate:up
 
--- No route deletes an alignment_definition any more, so the retirement the two
--- detach triggers write no longer follows an admin purge. The row can still be
--- deleted by hand, and the `ON DELETE SET NULL` FK action then nulls the column
--- these triggers watch; what they do is unchanged, only the wording they write and
--- their COMMENTs. Rows retired before this migration keep the text they were
+-- The two detach triggers retire an exported row when the `ON DELETE SET NULL`
+-- FK action that follows deleting an alignment_definition row nulls the column
+-- that they watch. What they do is unchanged; this rewords the reason they write
+-- and their COMMENTs. Rows retired before this migration keep the text they were
 -- written with.
 CREATE OR REPLACE FUNCTION qiita.retire_detached_exported_identifier()
 RETURNS TRIGGER LANGUAGE plpgsql AS $$

@@ -12,10 +12,9 @@ caller cannot reach and a future migration could quietly drop:
 * One LIVE identifier per processing, so a manifest written twice names the
   processing the same way both times.
 * An identifier OUTLIVES the processing it names: deleting an alignment_definition
-  row detaches and retires it instead of deleting it. No route deletes one; the
-  row can still be deleted by hand. The trigger that does this is what makes the
-  FK's `ON DELETE SET NULL` satisfy the check at all, so without it that delete
-  fails outright.
+  row detaches and retires it instead of deleting it. The trigger that does this
+  is what makes the FK's `ON DELETE SET NULL` satisfy the check at all, so without
+  it that delete fails outright.
 
 There is no accession half here, unlike `exported_feature`: a processing is
 something we performed, so nobody else has a name for it. The namespace is
@@ -126,9 +125,9 @@ async def test_a_retired_row_does_not_block_a_fresh_identifier(postgres_pool, pr
 
 
 async def test_an_identifier_outlives_the_processing_it_names(postgres_pool, probe):
-    """Deleting the alignment_definition row (by hand: no route deletes one) nulls
-    the FK. Without the detach-and-retire trigger either that delete fails on the
-    one-processing CHECK or a published citation stops resolving."""
+    """Deleting the alignment_definition row nulls the FK. Without the
+    detach-and-retire trigger either that delete fails on the one-processing CHECK
+    or a published citation stops resolving."""
     row = await _insert(postgres_pool, probe)
     await postgres_pool.execute(
         "DELETE FROM qiita.alignment_definition WHERE alignment_idx = $1", probe["alignment_idx"]

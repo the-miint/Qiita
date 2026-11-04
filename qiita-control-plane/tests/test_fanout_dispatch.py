@@ -107,9 +107,9 @@ def test_cohort_for_ticket_row_read_mask_block():
 def test_cohort_for_ticket_row_detached_align_block_is_not_a_read_mask_block():
     """A detached align block ticket must NOT route into the read-mask cohort.
 
-    Deleting the alignment_definition row (by hand: no route deletes one) NULLs
-    `work_ticket.alignment_idx` but leaves the ticket's `mask_idx` and `block_idx`,
-    so on the column shape alone it is
+    Deleting the alignment_definition row NULLs `work_ticket.alignment_idx` but
+    leaves the ticket's `mask_idx` and `block_idx`, so on the column shape alone it
+    is
     indistinguishable from a read-mask block. Routing it there puts it in the wrong
     fan-out: a `failed` one fail-stops the read-mask cohort for that mask_idx, and
     the whole cohort then releases nothing. It routes by action instead, so a detached
@@ -891,13 +891,12 @@ async def _insert_block_ticket(
 async def test_detached_align_ticket_does_not_fail_stop_the_read_mask_cohort(postgres_pool):
     """A failed, detached align block must not halt read-mask fan-out for its mask.
 
-    Deleting an alignment_definition row (by hand: no route deletes one) NULLs
-    `work_ticket.alignment_idx` but leaves mask_idx and block_idx, so a discriminator
-    of `alignment_idx IS NULL` sweeps the leftover into
-    `read_mask_block_cohort(mask_idx)`. Since the pump fail-stops a cohort containing
-    any `failed` child, a timed-out align plan would then permanently stop every
-    future block-mask fan-out under that mask — a fleet-wide config hash, so any pool
-    masked the same way. Discriminating by action_id keeps the cohorts disjoint.
+    Deleting an alignment_definition row NULLs `work_ticket.alignment_idx` but leaves
+    mask_idx and block_idx, so a discriminator of `alignment_idx IS NULL` sweeps the
+    leftover into `read_mask_block_cohort(mask_idx)`. Since the pump fail-stops a cohort
+    containing any `failed` child, a timed-out align plan would then permanently stop
+    every future block-mask fan-out under that mask — a fleet-wide config hash, so any
+    pool masked the same way. Discriminating by action_id keeps the cohorts disjoint.
     """
     sc = await _seed_block_cohort_scaffold(postgres_pool)
     mask_idx = sc["mask_idx"]

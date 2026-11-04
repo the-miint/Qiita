@@ -4,5 +4,4 @@
   When an `alignment_definition` row is deleted, the `exported_identifier` and
   `exported_processing` rows that named it are retired with the reason
   "alignment_definition N was deleted; the processing this identifier named no longer
-  exists". No route deletes one since alignment deletion was removed, so this follows
-  a removal by hand. Rows retired earlier keep the reason they were written with.
+  exists". Rows retired earlier keep the reason they were written with.

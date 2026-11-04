@@ -10,10 +10,9 @@ cannot reach and a future migration could quietly drop:
 * Exactly one processing identifier on a live row (`num_nonnulls`), which is the
   constraint a new processing type must extend.
 * An identifier OUTLIVES the processing it names: deleting an alignment_definition
-  row detaches and retires it instead of deleting it. No route deletes one; the
-  row can still be deleted by hand. The trigger that does this is what makes the
-  FK's `ON DELETE SET NULL` satisfy the check at all, so without it that delete
-  fails outright.
+  row detaches and retires it instead of deleting it. The trigger that does this
+  is what makes the FK's `ON DELETE SET NULL` satisfy the check at all, so without
+  it that delete fails outright.
 * Retirement columns cannot disagree with each other.
 """
 
@@ -184,7 +183,7 @@ async def test_deleting_the_alignment_retires_the_identifier_rather_than_deletin
 
 async def test_a_retired_tuple_can_be_reminted(postgres_pool, probe):
     """The unique index is partial on `NOT retired` precisely so a retired-then-
-    realigned sample gets a FRESH identifier instead of colliding with its own
+    re-exported sample gets a FRESH identifier instead of colliding with its own
     history. Re-pointing the old one would silently change what a citation means."""
     first = await _mint(postgres_pool, probe)
     await postgres_pool.execute(
@@ -248,11 +247,10 @@ async def test_deleting_the_alignment_does_not_give_the_alignment_idx_back(postg
 
 def test_missing_from_reports_the_gap():
     """The mint's all-or-nothing guard. Exercised directly because the only thing
-    that makes it fire — an alignment_definition row deleted (by hand: no route
-    deletes one) between the INSERT and the SELECT of one READ COMMITTED
-    transaction — cannot be staged deterministically without racing two
-    connections, and the promise it protects (every requested sample is present or
-    the request fails) is the response's headline claim."""
+    that makes it fire — an alignment_definition row deleted between the INSERT and the
+    SELECT of one READ COMMITTED transaction — cannot be staged deterministically
+    without racing two connections, and the promise it protects (every requested sample
+    is present or the request fails) is the response's headline claim."""
     from qiita_control_plane.repositories.exported_identifier import _missing_from
 
     rows = [{"prep_sample_idx": 4}, {"prep_sample_idx": 9}]
