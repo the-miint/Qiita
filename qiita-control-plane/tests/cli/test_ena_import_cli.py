@@ -1,4 +1,4 @@
-"""CLI-side tests for `qiita submit-ena-import` / `qiita ena-import-status`.
+"""CLI-side tests for `qiita submit-ena-import`, `ena-import-status` and `ena-import-list`.
 
 Local validation (source refusal, accession shape) is exercised through the
 argparse shim directly; wire behavior (POST body, poll progression, exit
@@ -10,11 +10,13 @@ codes) patches `httpx.AsyncClient` to use a `httpx.MockTransport`, mirroring
 from __future__ import annotations
 
 import json
+import re
 import zlib
+from datetime import UTC, datetime
 
 import httpx
 import pytest
-from qiita_common.api_paths import URL_ENA_IMPORT_BATCH_BY_IDX
+from qiita_common.api_paths import URL_ENA_IMPORT_BATCH_BY_IDX, URL_ENA_IMPORT_BATCH_PREFIX
 from qiita_common.models import BatchItemState, FailureType
 
 from qiita_control_plane.ena_import.registration import EnaRunRegistrationStatus
@@ -960,7 +962,55 @@ def test_ctrl_c_during_post_exits_130_naming_uncertain_batch(
         pytest.fail("KeyboardInterrupt escaped the handler instead of exiting 130")
 
     assert rc == 130
-    assert "may still have been created" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "may still have been created" in err
+    assert "ena-import-list --mine --since" in err
+
+
+@pytest.mark.parametrize("error", [httpx.ReadTimeout, httpx.ReadError, httpx.RemoteProtocolError])
+def test_lost_post_response_names_the_list_command_with_a_since(
+    error, monkeypatch, patch_async_client, capsys
+):
+    from qiita_control_plane.cli.user._parser import _build_parser
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise error("no response", request=request)
+
+    patch_async_client(httpx.MockTransport(handler))
+    monkeypatch.setenv("QIITA_TOKEN", "qk_test")
+
+    before = datetime.now(UTC).replace(microsecond=0)
+    parser = _build_parser()
+    ns = parser.parse_args(
+        ["--base-url", "https://q.example.test", "submit-ena-import", "PRJEB11419"]
+    )
+    rc = ns.handler(ns, parser)
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "could not reach" not in err
+    assert "may still have been created" in err
+    since = re.search(r"ena-import-list --mine --since (\S+)`", err).group(1)
+    assert datetime.fromisoformat(since) >= before
+
+
+def test_unreachable_control_plane_gives_no_batch_hint(monkeypatch, patch_async_client, capsys):
+    from qiita_control_plane.cli.user._parser import _build_parser
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("refused", request=request)
+
+    patch_async_client(httpx.MockTransport(handler))
+    monkeypatch.setenv("QIITA_TOKEN", "qk_test")
+
+    parser = _build_parser()
+    ns = parser.parse_args(
+        ["--base-url", "https://q.example.test", "submit-ena-import", "PRJEB11419"]
+    )
+    assert ns.handler(ns, parser) == 1
+    err = capsys.readouterr().err
+    assert "could not reach" in err
+    assert "ena-import-list" not in err
 
 
 # ---------------------------------------------------------------------------
@@ -1074,3 +1124,82 @@ def test_ena_import_status_requires_idx(capsys):
         main(["ena-import-status"])
     assert exc_info.value.code == 2
     assert "ena_import_batch_idx" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# ena-import-list
+# ---------------------------------------------------------------------------
+
+
+def _capture_list_request(monkeypatch, response_json=None):
+    from qiita_control_plane.cli import _common
+
+    captured: dict = {}
+
+    def fake_request(method, url, headers=None, json=None, params=None, timeout=None):
+        captured.update(method=method, url=url, params=params)
+        body = response_json if response_json is not None else {"batches": []}
+        return httpx.Response(200, json=body, request=httpx.Request(method, url))
+
+    monkeypatch.setattr(_common.httpx, "request", fake_request)
+    monkeypatch.setenv("QIITA_TOKEN", "qk_test")
+    return captured
+
+
+def test_ena_import_list_sends_exactly_the_flags_given(monkeypatch):
+    from qiita_control_plane.cli.user import main
+
+    captured = _capture_list_request(monkeypatch)
+
+    rc = main(
+        [
+            "--base-url",
+            "https://q.example.test",
+            "ena-import-list",
+            "--mine",
+            "--since",
+            "2026-11-04T10:00:00Z",
+            "--limit",
+            "5",
+        ]
+    )
+
+    assert rc == 0
+    assert captured["method"] == "GET"
+    assert captured["url"] == f"https://q.example.test{URL_ENA_IMPORT_BATCH_PREFIX}"
+    assert captured["params"] == {
+        "submitted_by": "me",
+        "since": "2026-11-04T10:00:00Z",
+        "limit": "5",
+    }
+
+
+def test_ena_import_list_without_flags_sends_no_params(monkeypatch, capsys):
+    from qiita_control_plane.cli.user import main
+
+    captured = _capture_list_request(monkeypatch, {"batches": [], "count": 0, "truncated": False})
+
+    rc = main(["--base-url", "https://q.example.test", "ena-import-list"])
+
+    assert rc == 0
+    assert not captured["params"]
+    assert json.loads(capsys.readouterr().out)["count"] == 0
+
+
+def test_ena_import_list_non_200_surfaces_status_and_body(monkeypatch, capsys):
+    from qiita_control_plane.cli import _common
+    from qiita_control_plane.cli.user import main
+
+    def fake_request(method, url, headers=None, json=None, params=None, timeout=None):
+        request = httpx.Request(method, url)
+        return httpx.Response(422, json={"detail": "bad since"}, request=request)
+
+    monkeypatch.setattr(_common.httpx, "request", fake_request)
+    monkeypatch.setenv("QIITA_TOKEN", "qk_test")
+
+    rc = main(["--base-url", "https://q.example.test", "ena-import-list", "--since", "yesterday"])
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "422" in err
+    assert "bad since" in err

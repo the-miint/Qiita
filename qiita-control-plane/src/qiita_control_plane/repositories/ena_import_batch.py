@@ -9,6 +9,7 @@ take a Pool or a Connection so they compose either way.
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from typing import Any
 
 import asyncpg
@@ -357,6 +358,33 @@ async def ena_import_batch_exists(
             "SELECT 1 FROM qiita.ena_import_batch WHERE idx = $1", batch_idx
         )
         is not None
+    )
+
+
+async def fetch_ena_import_batches(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
+    *,
+    submitted_by_principal_idx: int | None,
+    since: datetime | None,
+    limit: int,
+) -> list[asyncpg.Record]:
+    """The newest `limit` batches by idx, optionally of one principal and created at or
+    after `since`."""
+    conditions: list[str] = []
+    args: list[Any] = []
+    if submitted_by_principal_idx is not None:
+        args.append(submitted_by_principal_idx)
+        conditions.append(f"submitted_by_principal_idx = ${len(args)}")
+    if since is not None:
+        args.append(since)
+        conditions.append(f"created_at >= ${len(args)}")
+    where = (" WHERE " + " AND ".join(conditions)) if conditions else ""
+    args.append(limit)
+    return await pool_or_conn.fetch(
+        "SELECT idx AS ena_import_batch_idx, submitted_by_principal_idx, created_at"
+        " FROM qiita.ena_import_batch"
+        f"{where} ORDER BY idx DESC LIMIT ${len(args)}",
+        *args,
     )
 
 
