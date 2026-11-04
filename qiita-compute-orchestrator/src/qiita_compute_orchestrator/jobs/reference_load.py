@@ -646,9 +646,8 @@ def _write_placements(
       * a fragment that matches no sequence identifier in this load;
       * an edge_num the jplace's own tree does not number;
       * when this load also carries a tree (`phylogeny` is its staged Parquet), a tree
-        other than the jplace's: a jplace's edge_nums name edges of its own tree, so
-        any other tree, or the same topology numbered another way, would join
-        placements to the wrong edges.
+        other than the jplace's, as `_refuse_a_tree_other_than_the_jplaces` defines
+        it.
 
     Fragments that are one feature (identical bytes, or reverse complements, under
     different names) are placements of the same sequence. The feature keeps the
@@ -716,7 +715,9 @@ def _write_placements(
 def _refuse_a_tree_other_than_the_jplaces(conn: duckdb.DuckDBPyConnection, phylogeny: str) -> None:
     """Raise unless the tree staged at `phylogeny` is the TEMP TABLE `jplace_tree`, as
     far as a placement can tell: every node's edge number, its parent's edge number,
-    its branch length, and, at a tip, its name. Branch lengths count because a
+    its branch length, and, at a tip, its name. Edge numbers count because a jplace's
+    edge_nums name edges of its own tree, so the same topology numbered another way
+    joins placements to the wrong edges. Branch lengths count because a
     placement's `distal_length` is a position along its edge, and its likelihoods were
     computed on those lengths. Internal labels and the order of a node's children are
     not compared; a placement's meaning does not depend on them."""

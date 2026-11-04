@@ -769,7 +769,7 @@ def test_placement_on_an_edge_the_jplace_tree_lacks_raises(staging_inputs, tmp_p
     "tree",
     [
         _JPLACE_TREE,
-        # The same tree with labelled internal nodes and every node's children reversed:
+        # The same tree with labeled internal nodes and every node's children reversed:
         # neither changes what a placement on it means.
         "(((seq5:0.6{5},seq4:0.5{4})x:0.7{6},seq3:0.4{3})y:0.8{7},(seq2:0.2{1},seq1:0.1{0})z:0.3{2});",
     ],
@@ -808,8 +808,8 @@ def test_placements_load_with_the_jplaces_own_tree(staging_inputs, tmp_path, tre
     ],
 )
 def test_a_tree_other_than_the_jplaces_is_refused(staging_inputs, tmp_path, tree, why):
-    """A jplace's edge_nums name edges of its own tree, so a load carrying both must
-    carry that tree: anything else joins placements to the wrong edges."""
+    """A load carrying a tree and a jplace must carry the jplace's own tree; each case
+    differs from it in one way a placement depends on."""
     nwk = tmp_path / "tree.nwk"
     nwk.write_text(tree)
     jplace = _raw_jplace(tmp_path / "in.jplace", [("seq1", 0), ("seq2", 1)])
