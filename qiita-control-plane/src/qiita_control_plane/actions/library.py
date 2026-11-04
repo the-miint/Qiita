@@ -34,7 +34,7 @@ import pyarrow as pa
 import pyarrow.flight as _flight
 import pyarrow.parquet as pq
 from pydantic import TypeAdapter
-from qiita_common.api_paths import LibraryPrimitive
+from qiita_common.api_paths import URL_ALIGNMENT_DEFINITION_ABANDON_PLAN, LibraryPrimitive
 from qiita_common.assembly_constants import (
     CONTIG_ATTRIBUTE_REPRESENTATIVE_SQL,
     CONTIG_ATTRIBUTES_FILE,
@@ -2876,9 +2876,8 @@ async def delete_alignment_data(
     data_plane_url: str,
 ) -> int:
     """Delete an alignment's DuckLake `alignment` rows via the data plane's
-    `delete_alignment` DoAction, returning the rows-deleted count. Used only by
-    reference delete, for the deprecated alignments against the reference being
-    removed (`actions/reference.py`); the alignment_definition row stays.
+    `delete_alignment` DoAction, returning the rows-deleted count. The
+    alignment_definition row is not touched.
 
     Signs a `delete_alignment` action token carrying only `alignment_idx`. The
     delete is a logical `DELETE FROM alignment WHERE alignment_idx = ?` inside one
@@ -3339,8 +3338,8 @@ async def _refuse_abandoned_block(pool_or_conn: asyncpg.Pool | asyncpg.Connectio
     )
     if state == BLOCK_ABANDONED:
         raise RuntimeError(
-            f"block {block_idx} was abandoned (POST /alignment-definition/{{idx}}/abandon-plan);"
-            " its samples are re-planned under new blocks, so it must not write"
+            f"block {block_idx} was abandoned ({URL_ALIGNMENT_DEFINITION_ABANDON_PLAN});"
+            " its prep_samples are re-planned under new blocks, so it must not write"
         )
 
 

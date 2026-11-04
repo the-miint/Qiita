@@ -146,17 +146,14 @@ async def aligned(postgres_pool, regular_user_session):
         [(alignment_idx, p) for p in samples],
     )
     yield {"alignment_idx": alignment_idx, "samples": samples, "owner": owner}
-    await postgres_pool.execute(
-        "DELETE FROM qiita.alignment_sample WHERE alignment_idx = $1", alignment_idx
-    )
-    await postgres_pool.execute(
-        "DELETE FROM qiita.alignment_definition WHERE alignment_idx = $1", alignment_idx
-    )
     await teardown_entity_graph(
         postgres_pool,
         study_idxs=[],
         biosample_idxs=[b for b, _p in seeded],
         prep_sample_idxs=samples,
+    )
+    await postgres_pool.execute(
+        "DELETE FROM qiita.alignment_definition WHERE alignment_idx = $1", alignment_idx
     )
 
 

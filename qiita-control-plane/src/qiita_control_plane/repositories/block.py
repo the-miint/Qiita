@@ -19,6 +19,7 @@ from collections.abc import Sequence
 
 import asyncpg
 from qiita_common.actions import BLOCK_MASK_ACTION_ID
+from qiita_common.api_paths import URL_ALIGNMENT_DEFINITION_SAMPLE_STATUS
 from qiita_common.models import MaskSampleState
 
 from . import gate_state_literal, require_transaction
@@ -36,9 +37,10 @@ MASK_SAMPLE_PENDING = gate_state_literal("pending", MaskSampleState)
 MASK_SAMPLE_COMPLETED = gate_state_literal("completed", MaskSampleState)
 MASK_SAMPLE_INVALIDATED = gate_state_literal("invalidated", MaskSampleState)
 
+BLOCK_COMPLETED = "completed"
 # Set only by the align abandon-plan route (`actions.align_abandon`). An abandoned
-# block owes no sample anything: the covering-block checks skip it, and its ticket
-# is not redriven.
+# block owes no prep_sample anything: the covering-block checks skip it, and its
+# ticket is not redriven.
 BLOCK_ABANDONED = "abandoned"
 
 
@@ -484,15 +486,15 @@ class AlignmentSampleInvalidated(Exception):
     """Raised when an align run tries to complete an `(alignment_idx, prep_sample)`
     pair whose previous run was withdrawn. The twin of `MaskSampleInvalidated`: a
     redrive does not quietly overturn a withdrawal, and the pair stays refused until
-    someone restores it via PATCH /alignment-definition/{alignment_idx}/sample-status."""
+    someone restores it (the message names the route)."""
 
     def __init__(self, *, alignment_idx: int, prep_sample_idx: int) -> None:
         self.alignment_idx = alignment_idx
         self.prep_sample_idx = prep_sample_idx
         super().__init__(
             f"alignment_sample ({alignment_idx}, {prep_sample_idx}) was invalidated; an "
-            "align run cannot complete it. Restore it via PATCH "
-            "/alignment-definition/{alignment_idx}/sample-status once the output is trusted."
+            f"align run cannot complete it. Restore it via PATCH "
+            f"{URL_ALIGNMENT_DEFINITION_SAMPLE_STATUS} once the output is trusted."
         )
 
 
@@ -597,10 +599,10 @@ async def has_incomplete_covering_alignment_block(
         "  JOIN qiita.block_member bm ON bm.block_idx = b.block_idx"
         "  JOIN qiita.work_ticket wt ON wt.work_ticket_idx = b.work_ticket_idx"
         " WHERE bm.prep_sample_idx = $1 AND wt.alignment_idx = $2"
-        "   AND b.state NOT IN ('completed', $3)"
+        "   AND b.state <> ALL($3::text[])"
         " LIMIT 1",
         prep_sample_idx,
         alignment_idx,
-        BLOCK_ABANDONED,
+        [BLOCK_COMPLETED, BLOCK_ABANDONED],
     )
     return incomplete is not None

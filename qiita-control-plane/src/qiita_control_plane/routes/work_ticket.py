@@ -962,12 +962,18 @@ async def run_work_ticket(
             # would have refused it. And an abandoned block's samples have been
             # handed to a re-plan, whose rows this block's replace step would delete.
             align = await conn.fetchrow(
-                "SELECT ad.alignment_idx, ad.status, b.block_idx, b.state AS block_state"
+                "SELECT ad.alignment_idx, ad.status, wt.block_idx"
                 "  FROM qiita.work_ticket wt"
                 "  LEFT JOIN qiita.alignment_definition ad ON ad.alignment_idx = wt.alignment_idx"
-                "  LEFT JOIN qiita.block b ON b.block_idx = wt.block_idx"
                 " WHERE wt.work_ticket_idx = $1",
                 work_ticket_idx,
+            )
+            # Locked so an abandon-plan, which locks the block too, either commits
+            # before this read or waits for this redrive to commit and then refuses it
+            # as running.
+            block_state = await conn.fetchval(
+                "SELECT state FROM qiita.block WHERE block_idx = $1 FOR UPDATE",
+                align["block_idx"],
             )
             if align["status"] == AlignmentDefinitionStatus.DEPRECATED.value:
                 raise HTTPException(
@@ -977,12 +983,12 @@ async def run_work_ticket(
                         f" {align['alignment_idx']}, which is deprecated; it is not redriven"
                     ),
                 )
-            if align["block_state"] == BLOCK_ABANDONED:
+            if block_state == BLOCK_ABANDONED:
                 raise HTTPException(
                     status_code=status.HTTP_409_CONFLICT,
                     detail=(
                         f"work_ticket {work_ticket_idx} runs block {align['block_idx']},"
-                        " which was abandoned; its samples are re-planned with"
+                        " which was abandoned; its prep_samples are re-planned with"
                         " only_missing=true instead"
                     ),
                 )

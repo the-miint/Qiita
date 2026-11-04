@@ -194,6 +194,11 @@ async def lc(postgres_pool, human_admin_session):
         "set_gate": set_gate,
     }
 
+    # The entity sweep owns the gate, cover-map and QC rows keyed on these
+    # prep_samples; what it does not reach goes after it.
+    await teardown_entity_graph(
+        postgres_pool, study_idxs=[], biosample_idxs=biosamples, prep_sample_idxs=samples
+    )
     if blocks:
         await postgres_pool.execute(
             "DELETE FROM qiita.work_ticket WHERE block_idx = ANY($1::bigint[])", blocks
@@ -201,9 +206,6 @@ async def lc(postgres_pool, human_admin_session):
         await postgres_pool.execute(
             "DELETE FROM qiita.block WHERE block_idx = ANY($1::bigint[])", blocks
         )
-    await postgres_pool.execute(
-        "DELETE FROM qiita.alignment_sample WHERE prep_sample_idx = ANY($1::bigint[])", samples
-    )
     await postgres_pool.execute(
         "DELETE FROM qiita.alignment_definition WHERE (params->>'reference_idx')::bigint = $1",
         reference_idx,
@@ -216,9 +218,6 @@ async def lc(postgres_pool, human_admin_session):
         action_id=ALIGN_ACTION_ID,
         version=ALIGN_ACTION_VERSION,
         created=created_action,
-    )
-    await teardown_entity_graph(
-        postgres_pool, study_idxs=[], biosample_idxs=biosamples, prep_sample_idxs=samples
     )
 
 
@@ -472,14 +471,21 @@ async def test_abandon_clears_pending_gates_and_keeps_completed(client, lc, purg
     assert await _gate(pool, alignment_idx, b) is None
     assert await _gate(pool, alignment_idx, c) is None
 
-    # Nothing unfinished is left, so a second call is a no-op.
+    # Nothing unfinished is left, so a second call changes nothing in Postgres. It
+    # purges the same footprint again: the purge set is derived from state so that a
+    # failed purge can be retried, and the purge is idempotent.
     again = await client.post(
         URL_ALIGNMENT_DEFINITION_ABANDON_PLAN.format(alignment_idx=alignment_idx)
     )
     assert again.status_code == 200
     assert again.json()["abandoned_block_idx"] == []
     assert again.json()["cleared_prep_sample_idx"] == []
-    assert len(purge.calls) == 1
+    assert purge.calls == [purge.calls[0], purge.calls[0]]
+
+    # Once a prep_sample is re-planned it has a gate again, and drops out of the purge.
+    await lc["set_gate"](c, "pending")
+    await client.post(URL_ALIGNMENT_DEFINITION_ABANDON_PLAN.format(alignment_idx=alignment_idx))
+    assert {m["prep_sample_idx"] for m in purge.calls[-1]["members"]} == {b}
 
 
 async def test_abandon_refuses_while_a_released_block_runs(client, lc, purge):
@@ -501,22 +507,33 @@ async def test_abandon_refuses_while_a_released_block_runs(client, lc, purge):
     )
 
 
-async def test_abandon_purge_failure_changes_nothing(client, lc, purge):
+async def test_a_failed_purge_leaves_the_abandon_committed_and_is_retried(client, lc, purge):
+    """The purge runs after the commit, so its failure leaves the plan abandoned and
+    the gates cleared (no gate a redrive could complete over purged rows), and a
+    second call purges what the first could not."""
     import pyarrow.flight as flight
 
     purge.error = flight.FlightUnavailableError("data plane down")
     a = lc["samples"][0]
-    block, wt = await lc["make_block"]([(a, 1, 100)], block_state="pending", ticket_state="failed")
+    block, _wt = await lc["make_block"]([(a, 1, 100)], block_state="pending", ticket_state="failed")
     await lc["set_gate"](a, "pending")
-    resp = await client.post(
-        URL_ALIGNMENT_DEFINITION_ABANDON_PLAN.format(alignment_idx=lc["alignment_idx"])
-    )
+    url = URL_ALIGNMENT_DEFINITION_ABANDON_PLAN.format(alignment_idx=lc["alignment_idx"])
+    resp = await client.post(url)
     assert resp.status_code == 502
-    assert await _gate(lc["pool"], lc["alignment_idx"], a) == "pending"
+    assert "again" in resp.json()["detail"]
+    assert await _gate(lc["pool"], lc["alignment_idx"], a) is None
     assert (
         await lc["pool"].fetchval("SELECT state FROM qiita.block WHERE block_idx = $1", block)
-        == "pending"
+        == "abandoned"
     )
+
+    purge.error = None
+    retry = await client.post(url)
+    assert retry.status_code == 200, retry.text
+    assert retry.json()["rows_deleted"] == 7
+    assert purge.calls[-1]["members"] == [
+        {"prep_sample_idx": a, "sequence_idx_start": 1, "sequence_idx_stop": 100}
+    ]
 
 
 async def test_abandon_unknown_alignment_is_404(client, purge):
@@ -650,12 +667,7 @@ async def test_qc_verdict_ignores_a_deprecated_alignment(client, lc):
         lc["alignment_idx"],
         wt,
     )
-    try:
-        verdict = "SELECT severity FROM qiita.qc_verdict WHERE prep_sample_idx = $1"
-        assert await lc["pool"].fetchval(verdict, a) == "fail"
-        assert (await _deprecate(client, lc["alignment_idx"])).status_code == 200
-        assert await lc["pool"].fetchval(verdict, a) is None
-    finally:
-        await lc["pool"].execute(
-            "DELETE FROM qiita.prep_sample_qc_check WHERE prep_sample_idx = $1", a
-        )
+    verdict = "SELECT severity FROM qiita.qc_verdict WHERE prep_sample_idx = $1"
+    assert await lc["pool"].fetchval(verdict, a) == "fail"
+    assert (await _deprecate(client, lc["alignment_idx"])).status_code == 200
+    assert await lc["pool"].fetchval(verdict, a) is None

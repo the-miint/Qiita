@@ -9,7 +9,7 @@ that already exists.
 The /alignment-definition routes are the alignment lifecycle, system_admin-only
 (`alignment_definition:lifecycle`): deprecate a config, withdraw or restore
 individual runs, and abandon a plan's unfinished blocks. None of them deletes an
-alignment; the record of what aligned published data outlives the judgement that
+alignment; the record of what aligned published data outlives the judgment that
 it was wrong.
 """
 
@@ -91,70 +91,71 @@ alignment_router = APIRouter(prefix=PATH_ALIGNMENT_PREFIX, tags=["alignment"])
 
 def _alignment_record_to_response(row: asyncpg.Record) -> AlignmentDefinition:
     params = row["params"]
+    return AlignmentDefinition.model_validate(
+        {**dict(row), "params": json.loads(params) if isinstance(params, str) else params}
+    )
+
+
+async def _refuse_reactivation_without_reference(conn: asyncpg.Connection, alignment_idx: int):
+    """409 when the reference a deprecated alignment aligned against has been
+    deleted: reference delete purged its rows. `FOR KEY SHARE` holds the reference
+    row until the caller's transaction commits, so a reference delete cannot remove
+    it between this check and the status update."""
+    current = await fetch_alignment_definition_by_idx(conn, alignment_idx)
+    if current is None:
+        raise AlignmentDefinitionNotFound(alignment_idx)
+    params = current["params"]
     if isinstance(params, str):
         params = json.loads(params)
-    return AlignmentDefinition(
-        alignment_idx=row["alignment_idx"],
-        params=params,
-        created_at=row["created_at"],
-        status=row["status"],
-        deprecated_at=row["deprecated_at"],
-        deprecated_by_idx=row["deprecated_by_idx"],
-        deprecation_reason=row["deprecation_reason"],
-        superseded_by=row["superseded_by"],
-    )
+    reference_idx = params.get("reference_idx")
+    if reference_idx is None:
+        return
+    if not await conn.fetchval(
+        "SELECT 1 FROM qiita.reference WHERE reference_idx = $1 FOR KEY SHARE", reference_idx
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"alignment {alignment_idx} aligned against reference {reference_idx},"
+                " which has been deleted along with this alignment's rows; it cannot"
+                " be returned to active"
+            ),
+        )
 
 
 @alignment_definition_router.patch(PATH_ALIGNMENT_DEFINITION_STATUS)
 async def update_alignment_definition_status_route(
     alignment_idx: Annotated[int, Field(gt=0)],
     body: AlignmentDefinitionStatusUpdate,
-    pool: asyncpg.Pool = Depends(get_db_pool),
+    tx: TxConnFactory = Depends(get_tx_conn_factory),
     caller: HumanUser = Depends(require_human),
     _scope: Principal = Depends(require_scope(Scope.ALIGNMENT_DEFINITION_LIFECYCLE)),
 ) -> AlignmentDefinition:
     """Deprecate an alignment CONFIG, or return it to active.
 
-    Deprecating stops the alignment being minted against and makes every consumer
-    refuse it: feature-table submit, both DoGet mints, exported-identifier and
-    exported-processing mints, and the QC verdict. Its rows and its per-sample
-    states are left as they are. A block alignment's identity has no version in it,
-    so the same reference, aligner and mask cannot be aligned again while this row
-    is deprecated; re-aligning means a different config.
+    Deprecating stops the alignment being minted against and makes its consumers
+    refuse it. Its rows and its per-sample states are left as they are. A block
+    alignment's identity has no version in it, so the same reference, aligner and
+    mask cannot be aligned again while this row is deprecated; re-aligning means a
+    different config.
 
     Returning a deprecated alignment to active is refused (409) when the reference
     it aligned against has been deleted: reference delete purged its rows.
 
     system_admin only (`alignment_definition:lifecycle`).
     """
-    if body.status is AlignmentDefinitionStatus.ACTIVE:
-        current = await fetch_alignment_definition_by_idx(pool, alignment_idx)
-        if current is None:
-            raise HTTPException(status_code=404, detail=ALIGNMENT_NOT_FOUND_DETAIL)
-        params = current["params"]
-        if isinstance(params, str):
-            params = json.loads(params)
-        reference_idx = params.get("reference_idx")
-        if reference_idx is not None and not await pool.fetchval(
-            "SELECT 1 FROM qiita.reference WHERE reference_idx = $1", reference_idx
-        ):
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    f"alignment {alignment_idx} aligned against reference {reference_idx},"
-                    " which has been deleted along with this alignment's rows; it cannot"
-                    " be returned to active"
-                ),
-            )
     try:
-        row = await transition_alignment_definition_status(
-            pool,
-            alignment_idx=alignment_idx,
-            status=body.status,
-            reason=body.reason,
-            superseded_by=body.superseded_by,
-            principal_idx=caller.principal_idx,
-        )
+        async with tx() as conn:
+            if body.status is AlignmentDefinitionStatus.ACTIVE:
+                await _refuse_reactivation_without_reference(conn, alignment_idx)
+            row = await transition_alignment_definition_status(
+                conn,
+                alignment_idx=alignment_idx,
+                status=body.status,
+                reason=body.reason,
+                superseded_by=body.superseded_by,
+                principal_idx=caller.principal_idx,
+            )
     except AlignmentDefinitionNotFound:
         raise HTTPException(status_code=404, detail=ALIGNMENT_NOT_FOUND_DETAIL)
     except asyncpg.ForeignKeyViolationError as exc:
@@ -218,9 +219,8 @@ async def abandon_alignment_plan_route(
     alignment. Completed and invalidated samples are not touched.
 
     `actions/align_abandon.py` documents the steps. 409 while a released block
-    ticket is still running; 502 if the DuckLake purge fails, in which case nothing
-    changed. Idempotent: a second call finds nothing unfinished and returns empty
-    lists.
+    ticket is still running. 502 if the DuckLake purge fails: the abandon itself has
+    committed, and calling this again redoes the purge.
 
     system_admin only (`alignment_definition:lifecycle`).
     """
@@ -241,7 +241,10 @@ async def abandon_alignment_plan_route(
     except _flight.FlightError as exc:
         raise HTTPException(
             status_code=502,
-            detail=f"data plane alignment purge failed; nothing changed: {exc}",
+            detail=(
+                "the plan was abandoned but the data plane purge of its prep_samples'"
+                f" rows failed; call abandon-plan again to retry the purge: {exc}"
+            ),
         ) from exc
     return AlignmentPlanAbandonResponse(**outcome)
 

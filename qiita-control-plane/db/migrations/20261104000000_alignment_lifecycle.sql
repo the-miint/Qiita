@@ -4,8 +4,8 @@
 -- alignment.
 --
 --   * `alignment_definition.status = 'deprecated'` voids a CONFIG.
---     qiita.mint_alignment_definition refuses to hand the row back, so no new data
---     is aligned under it. A block alignment's identity carries no workflow
+--     qiita.mint_alignment_definition refuses to hand the row back, so no new plan or
+--     de novo run is minted under it. A block alignment's identity carries no workflow
 --     version, so re-planning the same reference + aligner + mask resolves to the
 --     same row: a deprecated block alignment is retired, and re-aligning means a
 --     different config.
@@ -260,12 +260,22 @@ COMMENT ON FUNCTION qiita.mint_alignment_definition(bytea, jsonb, bigint) IS
     'new row. Raises SQLSTATE 22023 when p_params_hash is not 32 bytes; '
     'propagates ForeignKeyViolation (unknown p_principal_idx) from the INSERT.';
 
--- A block or gate this migration marked goes back to what it was before there was
--- anywhere to say otherwise: an abandoned block to 'failed' (it did not complete),
--- an invalidated run to 'completed', a deprecated config to 'active'. The
--- judgement is lost, not translated. The CHECKs that tie provenance to state go
+-- An abandoned block has no faithful earlier value. As 'failed' it would count as an
+-- incomplete cover for its prep_samples' re-planned gates, which would never
+-- finalize, and its ticket would fail-stop the re-plan's fan-out. So the rollback
+-- stops instead of rewriting it.
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM qiita.block WHERE state = 'abandoned') THEN
+        RAISE EXCEPTION 'qiita.block has abandoned blocks; the schema before this '
+            'migration cannot represent them, so it is not rolled back';
+    END IF;
+END
+$$;
+
+-- An invalidated run goes back to 'completed' and a deprecated config to 'active':
+-- the judgment is lost, not translated. The CHECKs that tie provenance to state go
 -- first, since a reverted row still carries its provenance until the columns drop.
-UPDATE qiita.block SET state = 'failed' WHERE state = 'abandoned';
 ALTER TABLE qiita.block
     DROP CONSTRAINT block_state_check,
     ADD CONSTRAINT block_state_check

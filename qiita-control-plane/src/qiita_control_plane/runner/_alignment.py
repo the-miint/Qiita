@@ -206,7 +206,7 @@ async def _create_alignment_gate_pending(
 
     Refuses a row an earlier run's withdrawal set 'invalidated', before any step
     runs: the workflow's first tail step deletes this sample's alignment rows, which
-    would destroy the output the withdrawal was a judgement about, and its terminal
+    would destroy the output the withdrawal was a judgment about, and its terminal
     step could not complete the row anyway (`AlignmentSampleInvalidated`).
     """
     async with pool.acquire() as conn, conn.transaction():

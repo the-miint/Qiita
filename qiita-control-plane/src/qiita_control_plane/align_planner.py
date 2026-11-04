@@ -228,14 +228,14 @@ class AlignResubmitError(RuntimeError):
         self.alignment_idx = alignment_idx
         self.conflicting_prep_sample_idxs = conflicting_prep_sample_idxs
         super().__init__(
-            f"{len(conflicting_prep_sample_idxs)} sample(s) already have an alignment gate "
-            f"under alignment_idx {alignment_idx}; a fresh plan would double-write a "
-            "completed alignment or wedge an in-flight one. Samples left pending by failed "
-            "blocks: a system_admin abandons the plan (POST "
+            f"{len(conflicting_prep_sample_idxs)} prep_sample(s) already have an alignment "
+            f"gate under alignment_idx {alignment_idx}; a fresh plan would double-write a "
+            "completed alignment or wedge an in-flight one. Prep_samples left pending by "
+            "failed blocks: a system_admin abandons the plan (POST "
             f"{URL_ALIGNMENT_DEFINITION_ABANDON_PLAN}), then re-plan with only_missing=true. "
             "A completed alignment is not re-run under the same config: if it is bad, a "
             f"system_admin deprecates it (PATCH {URL_ALIGNMENT_DEFINITION_STATUS}) and the "
-            "samples are aligned under a different config. "
+            "prep_samples are aligned under a different config. "
             f"prep_sample_idxs: {conflicting_prep_sample_idxs}"
         )
 
@@ -247,7 +247,7 @@ class AlignDefinitionDeprecated(RuntimeError):
 
     def __init__(self, detail: str):
         super().__init__(
-            f"{detail}. A deprecated alignment is retired: align these samples under a "
+            f"{detail}. A deprecated alignment is retired: align these prep_samples under a "
             "different reference, aligner or mask"
         )
 
