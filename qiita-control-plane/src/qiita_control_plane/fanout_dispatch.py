@@ -176,8 +176,9 @@ def read_mask_block_cohort(mask_idx: int) -> FanoutCohort:
 def align_block_cohort(alignment_idx: int) -> FanoutCohort:
     """The bulk sharded-alignment block children of one alignment.
 
-    ``alignment_idx`` is already unambiguous (only an align block sets it, and a
-    purge NULLs it, so a purged ticket drops out either way) — unlike ``mask_idx``,
+    ``alignment_idx`` is already unambiguous (only an align block sets it, and
+    deleting its alignment_definition NULLs it, so a detached ticket drops out
+    either way) — unlike ``mask_idx``,
     which both block kinds carry. The ``action_id`` test is here because a cohort
     is a throttle over ONE workflow's fan-out, so scoping it to that workflow is
     what the cohort means, not because the idx needs disambiguating.
@@ -281,19 +282,19 @@ def cohort_for_ticket_row(row: asyncpg.Record | dict[str, Any]) -> FanoutCohort 
       * align block  → block_idx set + the align action;
       * read-mask block → block_idx set + the read-mask-block action.
 
-    A PURGED align ticket (align action, ``alignment_idx`` NULLed by the delete)
-    therefore belongs to NO cohort, and a held one is never released — not by a
-    later top-up, not by startup reconcile. That is the intended end state here:
-    the alternative is releasing a block whose alignment no longer exists, which
-    is what the pre-`action_id` routing did. It leaves a permanently-pending held
-    ticket behind, which is litter rather than a hazard; making the purge flip
-    those to `cancelled` is the abandon primitive tracked separately, not
-    something this routing can do.
+    A DETACHED align ticket (align action, ``alignment_idx`` NULLed by deleting its
+    alignment_definition) therefore belongs to NO cohort, and a held one is never
+    released — not by a later top-up, not by startup reconcile. That is the
+    intended end state here: the alternative is releasing a block whose alignment
+    no longer exists. It leaves a permanently-pending held ticket behind, which is
+    litter rather than a hazard. No route deletes an alignment_definition, so only
+    a removal by hand produces one; abandon-plan (`actions/align_abandon.py`)
+    cancels a plan's held tickets while its alignment still exists.
 
     A block ticket is routed by its ACTION, not by whether ``alignment_idx`` is
-    set: purging an alignment NULLs that column, which would otherwise route the
-    align ticket into the read-mask cohort of the ``mask_idx`` it still carries
-    (see `qiita_common.actions`). A block ticket whose action is neither — or
+    set: deleting an alignment_definition NULLs that column, which would otherwise
+    route the align ticket into the read-mask cohort of the ``mask_idx`` it still
+    carries (see `qiita_common.actions`). A block ticket whose action is neither — or
     missing the idx its cohort is keyed by — is not a fan-out child.
     """
     if row["shard_id"] is not None and row["reference_idx"] is not None:

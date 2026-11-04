@@ -406,7 +406,7 @@ async def has_incomplete_covering_block(
     Without that filter a pending/failed ALIGN block over the same (mask_idx,
     sample) would spuriously wedge this sample's read-mask finalize — align blocks
     carry BOTH mask_idx and alignment_idx. The filter is deliberately NOT
-    `wt.alignment_idx IS NULL`: purging an alignment NULLs that column
+    `wt.alignment_idx IS NULL`: deleting an alignment_definition NULLs that column
     (`ON DELETE SET NULL`), which would hand this query exactly the align blocks it
     exists to exclude. See `qiita_common.actions`."""
     incomplete = await conn.fetchval(
