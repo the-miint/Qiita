@@ -54,7 +54,6 @@ from ..repositories.block import (
     fetch_mask_sample_state,
 )
 from ._base import _workflow_declares_action
-from ._db import persist_ticket_idx
 from ._upload import _submission_bad_input
 
 # action_context keys the de novo resolver reads. Prefixed like `align/1.0.0.yaml`'s
@@ -190,10 +189,21 @@ async def _persist_alignment_idx(
     `delete-alignment-sample` and `finalize-alignment-sample` both read this COLUMN
     rather than action_context, and refuse on NULL; so does the resume path in
     `_resolve_denovo_alignment_idx`, which re-attaches to it instead of re-deriving.
-    Writing it again on a resume writes the same value."""
-    await persist_ticket_idx(
-        pool, column="alignment_idx", work_ticket_idx=work_ticket_idx, value=alignment_idx
-    )
+    Writing it again on a resume writes the same value.
+
+    Holds the definition row `FOR SHARE` across the write and refuses a deprecated
+    alignment (`lock_active_alignment`), so a deprecation that counted this ticket's
+    work as absent cannot be followed by the ticket recording it."""
+    async with pool.acquire() as conn, conn.transaction():
+        try:
+            await lock_active_alignment(conn, alignment_idx)
+        except AlignmentDefinitionDeprecated as exc:
+            raise _submission_bad_input(exc.detail) from exc
+        await conn.execute(
+            "UPDATE qiita.work_ticket SET alignment_idx = $1 WHERE work_ticket_idx = $2",
+            alignment_idx,
+            work_ticket_idx,
+        )
 
 
 async def _create_alignment_gate_pending(

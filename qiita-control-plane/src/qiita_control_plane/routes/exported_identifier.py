@@ -92,11 +92,10 @@ async def mint_exported_identifier_map(
             created_by_idx=caller.principal_idx,
         )
     except IncompleteMintError as exc:
-        # The only way to get here is a concurrent purge of this alignment (which
-        # retires the identifiers it named) between the checks above and the mint.
-        # 409 rather than 500 because nothing is wrong with the request: the
-        # alignment it named stopped existing mid-flight, and a retry against the
-        # re-aligned data is the correct next move.
+        # The alignment's rows were removed between the checks above and the mint.
+        # No route removes an alignment_definition, so only a removal by hand
+        # reaches this. 409 rather than 500 because nothing is wrong with the
+        # request: the alignment it named stopped existing mid-flight.
         raise HTTPException(
             status_code=409,
             detail=(

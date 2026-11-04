@@ -21,6 +21,7 @@ from qiita_common.api_paths import (
     URL_ALIGNMENT_DEFINITION_STATUS,
     URL_WORK_TICKET_RUN,
 )
+from qiita_common.models import WorkTicketState
 
 from qiita_control_plane.align_planner import ALIGN_ACTION_VERSION
 from qiita_control_plane.fanout_dispatch import align_block_cohort, top_up_dispatch
@@ -281,17 +282,28 @@ async def test_deprecation_waits_for_unfinished_tickets(client, lc):
     assert status == "active"
 
     await lc["pool"].execute(
-        "UPDATE qiita.work_ticket SET state = 'cancelled' WHERE work_ticket_idx = $1", held
+        "UPDATE qiita.work_ticket SET state = $2 WHERE work_ticket_idx = $1",
+        held,
+        WorkTicketState.CANCELLED.value,
     )
     assert (await _deprecate(client, lc["alignment_idx"])).status_code == 200
 
 
-async def test_a_plan_cannot_create_tickets_under_a_deprecated_alignment(lc):
-    """The ticket writers re-check the status under a share lock in the transaction
-    that creates the tickets, so a deprecation landing after the mint still stops
-    them."""
-    from qiita_control_plane.repositories.alignment_definition import lock_active_alignment
+async def test_a_deprecated_alignment_cannot_be_recorded_on_a_ticket(lc):
+    """The de novo writer of work_ticket.alignment_idx re-checks the status under a
+    share lock, so a deprecation landing after the mint still stops the run before it
+    records the alignment."""
+    from qiita_common.backend_failure import BackendFailure, FailureKind
 
+    from qiita_control_plane.runner._alignment import _persist_alignment_idx
+
+    a, _b, _c = lc["samples"]
+    _block, wt = await lc["make_block"](
+        [(a, 1, 100)], block_state="completed", ticket_state="completed"
+    )
+    await lc["pool"].execute(
+        "UPDATE qiita.work_ticket SET alignment_idx = NULL WHERE work_ticket_idx = $1", wt
+    )
     await lc["pool"].execute(
         "UPDATE qiita.alignment_definition SET status = 'deprecated', deprecated_at = now(),"
         "       deprecated_by_idx = $2, deprecation_reason = 'late'"
@@ -299,9 +311,13 @@ async def test_a_plan_cannot_create_tickets_under_a_deprecated_alignment(lc):
         lc["alignment_idx"],
         lc["owner"],
     )
-    with pytest.raises(AlignmentDefinitionDeprecated, match="late"):
-        async with lc["pool"].acquire() as conn, conn.transaction():
-            await lock_active_alignment(conn, lc["alignment_idx"])
+    with pytest.raises(BackendFailure, match="late") as ei:
+        await _persist_alignment_idx(lc["pool"], wt, lc["alignment_idx"])
+    assert ei.value.kind == FailureKind.BAD_INPUT
+    recorded = await lc["pool"].fetchval(
+        "SELECT alignment_idx FROM qiita.work_ticket WHERE work_ticket_idx = $1", wt
+    )
+    assert recorded is None
 
 
 async def test_deprecate_without_reason_is_422(client, lc):

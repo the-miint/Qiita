@@ -158,8 +158,8 @@ def shard_cohort(reference_idx: int) -> FanoutCohort:
 
 def read_mask_block_cohort(mask_idx: int) -> FanoutCohort:
     """The bulk read-mask block children of one mask partition. Discriminated
-    from align blocks by ``action_id`` — NOT by ``alignment_idx IS NULL``, which a
-    purge of the alignment produces from an align ticket (see
+    from align blocks by ``action_id`` — NOT by ``alignment_idx IS NULL``, which
+    removing the alignment_definition row produces from an align ticket (see
     `qiita_common.actions`)."""
     return FanoutCohort(
         label=f"read_mask_block(mask_idx={mask_idx})",
@@ -502,9 +502,9 @@ async def _cohorts_matching(pool: asyncpg.Pool, ticket_predicate: str) -> list[F
     means a later refactor that threads a caller-supplied predicate here fails at once
     instead of opening an injection.
 
-    Both block scans key on action_id, not on whether alignment_idx is set: a purged
-    align ticket keeps its mask_idx and would otherwise be reported here as a
-    read-mask block (see `qiita_common.actions`)."""
+    Both block scans key on action_id, not on whether alignment_idx is set: an align
+    ticket whose alignment_definition row was removed keeps its mask_idx and would
+    otherwise be reported here as a read-mask block (see `qiita_common.actions`)."""
     assert ticket_predicate in (_PRED_HELD, _PRED_ACTIVE), (
         f"ticket_predicate is interpolated into SQL and must be a module constant, "
         f"got {ticket_predicate!r}"

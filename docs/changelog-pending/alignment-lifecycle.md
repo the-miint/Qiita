@@ -4,8 +4,8 @@
   only under the new `alignment_definition:lifecycle` scope:
   - `PATCH /alignment-definition/{alignment_idx}/status` deprecates an alignment
     config (or returns it to active). Deprecation is refused (409, listing them)
-    while any work ticket under the alignment is unfinished, held ones included. A deprecated alignment is refused by
-    feature-table submit, both alignment DoGet mints, the exported-identifier and
+    while any work ticket under the alignment is unfinished, held ones included. A
+    deprecated alignment is refused by feature-table submit, both alignment DoGet mints, the exported-identifier and
     exported-processing mints, the de novo align resolver, `/run` on its tickets, and
     the QC verdict. A block alignment's identity has no version, so the same
     reference, aligner and mask resolve to the deprecated row again: re-aligning
@@ -34,7 +34,7 @@
 
 ### Changed
 
-- **Deprecating a mask waits for its unfinished work tickets (#N).**
+- **Deprecating a mask is refused while its work tickets are unfinished (#N).**
   `PATCH /mask-definition/{mask_idx}/status` to `deprecated` is refused (409, listing
   them) while any work ticket carrying the mask is unfinished, held ones included,
   so no masking run or alignment over its pass-set is still to write under it.
@@ -45,8 +45,8 @@
   deprecate a bad completed alignment. A plan whose config resolves to a deprecated
   alignment is a 409.
 - **Reference delete's refusal for an aligned-against reference no longer says to
-  delete the alignment (#N).** Alignment data is never purged, so a reference with
-  any alignment against it, deprecated or not, cannot be deleted.
+  delete the alignment (#N).** No route deletes a completed alignment's rows, so a
+  reference with any alignment against it, deprecated or not, cannot be deleted.
 - **The service-account alignment DoGet re-checks its cohort (#N).** It returns 409
   when the alignment was deprecated, or a prep_sample invalidated, after the
   feature-table ticket was submitted.

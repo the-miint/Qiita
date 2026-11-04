@@ -25,7 +25,7 @@ from qiita_common.api_paths import (
     URL_MASK_DEFINITION_SAMPLE_STATUS,
     URL_MASK_DEFINITION_STATUS,
 )
-from qiita_common.models import MaskDefinitionStatus
+from qiita_common.models import MaskDefinitionStatus, WorkTicketState
 
 from qiita_control_plane.repositories.mask_definition import (
     MaskDefinitionDeprecated,
@@ -601,19 +601,22 @@ async def test_deprecation_waits_for_the_masks_unfinished_tickets(client, postgr
     wt = await postgres_pool.fetchval(
         "INSERT INTO qiita.work_ticket (action_id, action_version, originator_principal_idx,"
         "  scope_target_kind, prep_sample_idx, mask_idx, state)"
-        " VALUES ($1, $2, $3, 'prep_sample', $4, $5, 'processing') RETURNING work_ticket_idx",
+        " VALUES ($1, $2, $3, 'prep_sample', $4, $5, $6) RETURNING work_ticket_idx",
         READ_MASK_ACTION_ID,
         version,
         lifecycle["principal_idx"],
         lifecycle["ps_pending"],
         lifecycle["mask_idx"],
+        WorkTicketState.PROCESSING.value,
     )
     try:
         resp = await _deprecate(client, lifecycle["mask_idx"])
         assert resp.status_code == 409, resp.text
         assert resp.json()["detail"]["work_ticket_idx"] == [wt]
         await postgres_pool.execute(
-            "UPDATE qiita.work_ticket SET state = 'cancelled' WHERE work_ticket_idx = $1", wt
+            "UPDATE qiita.work_ticket SET state = $2 WHERE work_ticket_idx = $1",
+            wt,
+            WorkTicketState.CANCELLED.value,
         )
         assert (await _deprecate(client, lifecycle["mask_idx"])).status_code == 200
     finally:
@@ -623,15 +626,44 @@ async def test_deprecation_waits_for_the_masks_unfinished_tickets(client, postgr
         )
 
 
-async def test_a_deprecated_mask_cannot_be_recorded_on_new_work(client, lifecycle, postgres_pool):
-    """Every writer of work_ticket.mask_idx re-checks the status under a share lock,
-    so a deprecation landing after the mask was resolved still stops the work."""
-    from qiita_control_plane.repositories.mask_definition import (
-        MaskDefinitionDeprecated,
-        lock_active_mask,
+async def test_a_deprecated_mask_cannot_be_recorded_on_a_ticket(client, lifecycle, postgres_pool):
+    """The runner's writer of work_ticket.mask_idx re-checks the status under a share
+    lock, so a deprecation landing after the mask was minted still stops the run
+    before it records the mask."""
+    from qiita_common.actions import READ_MASK_ACTION_ID
+    from qiita_common.backend_failure import BackendFailure, FailureKind
+
+    from qiita_control_plane.runner._mask import _persist_mask_idx
+    from qiita_control_plane.testing.db_seeds import (
+        delete_action_if_created,
+        seed_action_if_absent,
     )
 
-    assert (await _deprecate(client, lifecycle["mask_idx"], reason="late")).status_code == 200
-    with pytest.raises(MaskDefinitionDeprecated, match="late"):
-        async with postgres_pool.acquire() as conn, conn.transaction():
-            await lock_active_mask(conn, lifecycle["mask_idx"])
+    version = f"lifecycle-{secrets.token_hex(4)}"
+    created = await seed_action_if_absent(
+        postgres_pool, action_id=READ_MASK_ACTION_ID, version=version, target_kind="prep_sample"
+    )
+    wt = await postgres_pool.fetchval(
+        "INSERT INTO qiita.work_ticket (action_id, action_version, originator_principal_idx,"
+        "  scope_target_kind, prep_sample_idx, state)"
+        " VALUES ($1, $2, $3, 'prep_sample', $4, $5) RETURNING work_ticket_idx",
+        READ_MASK_ACTION_ID,
+        version,
+        lifecycle["principal_idx"],
+        lifecycle["ps_pending"],
+        WorkTicketState.PROCESSING.value,
+    )
+    try:
+        assert (await _deprecate(client, lifecycle["mask_idx"], reason="late")).status_code == 200
+        with pytest.raises(BackendFailure, match="late") as ei:
+            await _persist_mask_idx(postgres_pool, wt, lifecycle["mask_idx"])
+        assert ei.value.kind == FailureKind.BAD_INPUT
+        recorded = await postgres_pool.fetchval(
+            "SELECT mask_idx FROM qiita.work_ticket WHERE work_ticket_idx = $1", wt
+        )
+        assert recorded is None
+    finally:
+        await postgres_pool.execute("DELETE FROM qiita.work_ticket WHERE work_ticket_idx = $1", wt)
+        await delete_action_if_created(
+            postgres_pool, action_id=READ_MASK_ACTION_ID, version=version, created=created
+        )

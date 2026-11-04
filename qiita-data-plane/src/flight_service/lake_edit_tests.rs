@@ -581,11 +581,11 @@ fn delete_pool_reads_drops_target_idempotently() {
 ///
 /// The first direction is the shape query, as in
 /// `every_content_addressed_lake_table_is_registered`: an `alignment_idx`
-/// column means the rows belong to one align-config identity and die with it,
-/// so a table added later carrying that column and left off the list would
-/// survive a DELETE that is supposed to purge the whole alignment — and
-/// disallow-without-delete would then re-admit a submission over rows that are
-/// still there.
+/// column means the rows belong to one align-config identity, so a table added
+/// later carrying that column and left off the list would survive the
+/// `delete_alignment_block` / `delete_alignment_sample` that clear a
+/// prep_sample's rows before a re-run — and the re-run would then write over
+/// rows that are still there.
 ///
 /// The second is the columns. `delete_lake_rows` applies ONE clause to every
 /// listed table, so a table joining the list without `prep_sample_idx` or

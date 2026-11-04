@@ -76,15 +76,15 @@ async def mint_exported_processing_handle(
             pool, alignment_idx=body.alignment_idx, created_by_idx=caller.principal_idx
         )
     except ProcessingVanishedError as exc:
-        # A concurrent purge of this alignment between the check above and the mint.
-        # 409 rather than 500 because nothing is wrong with the request: the
-        # processing it named stopped existing mid-flight.
+        # The alignment_definition row was removed between the check above and the
+        # mint. No route removes one, so only a removal by hand reaches this. 409
+        # rather than 500 because nothing is wrong with the request: the processing
+        # it named stopped existing mid-flight.
         raise HTTPException(
             status_code=409,
             detail=(
-                f"alignment {body.alignment_idx} was purged while minting its public"
-                " handle; there is no processing left to name — retry against the"
-                " re-run data"
+                f"alignment {body.alignment_idx} was removed while minting its public"
+                " handle; there is no processing left to name"
             ),
         ) from exc
 

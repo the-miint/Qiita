@@ -61,16 +61,16 @@ class ReferenceDeleteBlocked(Exception):
         # Alignment definitions are the force-proof reason and the one the operator
         # most needs to act on, so it is reported first when present. The DuckLake
         # `alignment` rows are keyed on `feature_idx`, which this delete would
-        # orphan-GC, and alignment data is never purged, so a reference that has been
-        # aligned against is kept.
+        # orphan-GC, and no route deletes a completed alignment's rows, so a
+        # reference that has been aligned against is kept.
         if alignment_definitions:
             reason = (
                 f"{alignment_definitions} alignment definition(s) align against it; "
                 "their DuckLake `alignment` rows are keyed on this reference's features "
-                "and alignment data is never purged, so a reference that has been "
-                "aligned against cannot be deleted, with or without force. A bad "
-                "alignment is deprecated instead "
-                f"(PATCH {URL_ALIGNMENT_DEFINITION_STATUS})"
+                "and no route deletes a completed alignment's rows, so a reference "
+                "that has been aligned against cannot be deleted, with or without "
+                "force. Deprecating the alignment "
+                f"(PATCH {URL_ALIGNMENT_DEFINITION_STATUS}) does not change that"
             )
         elif in_flight:
             reason = (
