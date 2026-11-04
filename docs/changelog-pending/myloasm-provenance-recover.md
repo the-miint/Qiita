@@ -16,3 +16,13 @@
   `POST /api/v1/read-masked/ticket/doget` takes an optional `columns` list, drawn from
   the `read_masked` columns. An unknown or repeated name is a 422. Left out, the ticket
   streams every column, as before.
+
+### Changed
+
+- **The `qiita-reviewer` agent flags five more patterns (#830).** R4 now flags an
+  existence check (`Path.is_file()` and its siblings) that reads a permission error as
+  absence, a classifier that folds several states of a closed set into one label, and
+  a capped loop whose report drops the items past the cap. R6 now flags a test oracle
+  built from the same reader that the code under test calls. R9 now flags code that
+  says it does what another site does but mirrors only some of that site's guards.
+  Each has a Trigger-map row.
