@@ -2853,7 +2853,7 @@ async def delete_alignment_sample_data(
 
     Signs an action token carrying that pair and nothing else — the data plane's
     payload rejects any extra field. What the pair selects, and why it rather than
-    the block or the whole alignment, is on the Rust `delete_alignment_sample`.
+    the block, is on the Rust `delete_alignment_sample`.
     Idempotent: a fresh sample (no rows yet) deletes 0 and still succeeds. Raises
     pyarrow.flight.FlightError on transport / data-plane failure."""
     results = await run_signed_flight_call(

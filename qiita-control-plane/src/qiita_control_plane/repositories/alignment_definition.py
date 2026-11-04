@@ -279,7 +279,8 @@ async def list_alignments_over_prep_samples(
         "   GROUP BY alignment_idx"
         ")"
         " SELECT c.alignment_idx, ad.params, ad.params_hash,"
-        "        c.samples_completed, c.samples_total"
+        "        c.samples_completed, c.samples_total,"
+        "        ad.status, ad.deprecation_reason, ad.superseded_by"
         "   FROM counted c"
         "   JOIN qiita.alignment_definition ad ON ad.alignment_idx = c.alignment_idx"
         "  ORDER BY c.alignment_idx",
@@ -479,6 +480,5 @@ async def lock_active_alignment(conn: asyncpg.Connection, alignment_idx: int) ->
         raise AlignmentDefinitionNotFound(alignment_idx)
     if row["status"] == AlignmentDefinitionStatus.DEPRECATED.value:
         raise AlignmentDefinitionDeprecated(
-            f"alignment_definition {alignment_idx} is deprecated and cannot be minted"
-            f" against: {row['deprecation_reason']}"
+            f"alignment_definition {alignment_idx} is deprecated: {row['deprecation_reason']}"
         )

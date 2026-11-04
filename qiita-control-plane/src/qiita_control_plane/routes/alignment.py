@@ -43,7 +43,7 @@ from qiita_common.models import (
     DoGetTicketResponse,
 )
 
-from ..actions.align_abandon import AlignmentNotFound, AlignPlanInFlight, abandon_align_plan
+from ..actions.align_abandon import AlignPlanInFlight, abandon_align_plan
 from ..auth.guards import (
     require_complete_profile,
     require_human,
@@ -219,7 +219,7 @@ async def abandon_alignment_plan_route(
             signing_key=signing_key,
             data_plane_url=data_plane_url,
         )
-    except AlignmentNotFound:
+    except AlignmentDefinitionNotFound:
         raise HTTPException(status_code=404, detail=ALIGNMENT_NOT_FOUND_DETAIL)
     except AlignPlanInFlight as exc:
         raise HTTPException(
@@ -360,13 +360,11 @@ async def create_alignment_cohort_doget_ticket(
     function; every check below is the only one there is.
 
     Validation is `authorize_completed_alignment_cohort`, whose docstring is the
-    single copy of why its three checks run in the order they do; the signing that
-    follows shares one helper with the work-ticket route so the two cannot drift.
-    Two things specific to this route and not to that gate: the cohort is never
-    narrowed because coverage filtering makes a feature table cohort-dependent, so
-    trimming the request would answer a different scientific question under the name
-    of the one asked; and the completeness check is the one the work-ticket route can
-    skip, its runner resolver having already run it at submit.
+    single copy of why its checks run in the order they do; the signing that follows
+    shares one helper with the work-ticket route so the two cannot drift. Specific to
+    this route and not to that gate: the cohort is never narrowed because coverage
+    filtering makes a feature table cohort-dependent, so trimming the request would
+    answer a different scientific question under the name of the one asked.
     """
     cohort = await authorize_completed_alignment_cohort(
         pool,

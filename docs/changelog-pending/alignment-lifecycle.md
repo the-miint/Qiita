@@ -53,6 +53,15 @@
   whose assembly completed, as submit does: one with nothing to assemble (`no_data`)
   stays reference-only. A prep_sample whose assembly gate has since left `completed`
   or `no_data` is a 409.
+- **The pool alignment listing reports each alignment's `status` (#829).**
+  `GET …/sequenced-pool/{sequenced_pool_idx}/alignment` keeps listing a deprecated
+  alignment, now with `status`, `deprecation_reason` and `superseded_by`. Its cohort
+  route returns 409 for a deprecated alignment when the caller can read part of the
+  cohort; one who can read none of it still gets an empty cohort.
+- **An align plan mints its alignment in the transaction that writes its tickets
+  (#829).** A plan refused after the mint no longer leaves an alignment with no
+  gates and no tickets, which would block its reference's delete. A mask or
+  alignment deprecated while the plan runs waits for it and then counts its tickets.
 - **`POST /work-ticket/{work_ticket_idx}/run` clears `dispatch_held` (#829).** The
   ticket it dispatches is no longer held, so the fan-out pump does not count it as
   waiting for a slot. It also waits for a deprecation of the ticket's alignment or

@@ -590,6 +590,5 @@ async def lock_active_mask(conn: asyncpg.Connection, mask_idx: int) -> None:
         raise MaskDefinitionNotFound(mask_idx)
     if row["status"] == MaskDefinitionStatus.DEPRECATED.value:
         raise MaskDefinitionDeprecated(
-            f"mask_definition {mask_idx} is deprecated and cannot be minted against:"
-            f" {row['deprecation_reason']}"
+            f"mask_definition {mask_idx} is deprecated: {row['deprecation_reason']}"
         )

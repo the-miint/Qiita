@@ -948,25 +948,14 @@ async def run_work_ticket(
             # a config that is void. The definitions are held `FOR SHARE` to commit,
             # like every other writer of their work (`lock_active_alignment`): a
             # deprecation either commits first and is refused here, or waits for this
-            # redrive and then counts the revived ticket. Taken before the block lock,
-            # in the order abandon-plan takes them (definition, then block).
+            # redrive and then counts the revived ticket. Taken mask first, as the align
+            # planner takes them, and before the block lock, in the order abandon-plan
+            # takes its own (definition, then block).
             ids = await conn.fetchrow(
                 "SELECT mask_idx, alignment_idx, block_idx FROM qiita.work_ticket"
                 " WHERE work_ticket_idx = $1",
                 work_ticket_idx,
             )
-            if ids["alignment_idx"] is not None:
-                try:
-                    await lock_active_alignment(conn, ids["alignment_idx"])
-                except AlignmentDefinitionDeprecated as exc:
-                    raise HTTPException(
-                        status_code=status.HTTP_409_CONFLICT,
-                        detail=(
-                            f"work_ticket {work_ticket_idx} runs under alignment"
-                            f" {ids['alignment_idx']}, which is deprecated; it is not"
-                            " redriven"
-                        ),
-                    ) from exc
             if ids["mask_idx"] is not None:
                 try:
                     await lock_active_mask(conn, ids["mask_idx"])
@@ -977,6 +966,18 @@ async def run_work_ticket(
                             f"work_ticket {work_ticket_idx} runs under mask_definition"
                             f" {ids['mask_idx']}, which is deprecated; it is not redriven."
                             " Submit the work under a current mask instead"
+                        ),
+                    ) from exc
+            if ids["alignment_idx"] is not None:
+                try:
+                    await lock_active_alignment(conn, ids["alignment_idx"])
+                except AlignmentDefinitionDeprecated as exc:
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail=(
+                            f"work_ticket {work_ticket_idx} runs under alignment"
+                            f" {ids['alignment_idx']}, which is deprecated; it is not"
+                            " redriven"
                         ),
                     ) from exc
             # Locked so an abandon-plan, which locks the block too, either commits

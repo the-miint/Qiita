@@ -635,6 +635,15 @@ async def test_an_abandoned_block_owes_its_samples_nothing(client, lc, purge):
         assert not await has_incomplete_covering_alignment_block(
             conn, alignment_idx=alignment_idx, prep_sample_idx=a
         )
+    # The other direction, on the same fixture: an unfinished block that was not
+    # abandoned is still an incomplete cover.
+    await lc["make_block"](
+        [(a, 1, 100)], block_state="pending", ticket_state=WorkTicketState.PENDING
+    )
+    async with pool.acquire() as conn:
+        assert await has_incomplete_covering_alignment_block(
+            conn, alignment_idx=alignment_idx, prep_sample_idx=a
+        )
 
 
 async def test_an_abandoned_failed_ticket_does_not_fail_stop_the_replan(client, lc, purge):

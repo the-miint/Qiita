@@ -38,18 +38,16 @@ write steps refuse it (actions/library.py).
 from __future__ import annotations
 
 import asyncpg
+from qiita_common.api_paths import URL_WORK_TICKET_CANCEL
 from qiita_common.models import NON_TERMINAL_WORK_TICKET_STATES, WorkTicketState
 
 from ..fanout_dispatch import align_block_cohort
-from ..repositories.alignment_definition import ALIGNMENT_SAMPLE_PENDING
+from ..repositories.alignment_definition import (
+    ALIGNMENT_SAMPLE_PENDING,
+    AlignmentDefinitionNotFound,
+)
 from ..repositories.block import BLOCK_ABANDONED, BLOCK_COMPLETED
 from .library import delete_alignment_block_data
-
-
-class AlignmentNotFound(Exception):
-    def __init__(self, alignment_idx: int) -> None:
-        self.alignment_idx = alignment_idx
-        super().__init__(f"no alignment_definition with alignment_idx={alignment_idx}")
 
 
 class AlignPlanInFlight(Exception):
@@ -61,7 +59,7 @@ class AlignPlanInFlight(Exception):
         super().__init__(
             f"alignment {alignment_idx} has {len(work_ticket_idxs)} block ticket(s) still"
             f" running: {work_ticket_idxs}. Wait for them to finish or cancel them"
-            " (POST /work-ticket/cancel), then abandon the plan"
+            f" (POST {URL_WORK_TICKET_CANCEL}), then abandon the plan"
         )
 
 
@@ -74,7 +72,7 @@ async def abandon_align_plan(
 ) -> dict:
     """See the module docstring. Returns the fields of `AlignmentPlanAbandonResponse`.
 
-    Raises AlignmentNotFound, AlignPlanInFlight, or pyarrow.flight.FlightError (the
+    Raises AlignmentDefinitionNotFound, AlignPlanInFlight, or pyarrow.flight.FlightError (the
     purge failed after the abandon committed; re-running this redoes the purge)."""
     cohort = align_block_cohort(alignment_idx)
     in_flight = NON_TERMINAL_WORK_TICKET_STATES
@@ -84,7 +82,7 @@ async def abandon_align_plan(
             alignment_idx,
         )
         if found is None:
-            raise AlignmentNotFound(alignment_idx)
+            raise AlignmentDefinitionNotFound(alignment_idx)
         await conn.execute(
             "SELECT pg_advisory_xact_lock($1, $2)", cohort.lock_class, cohort.lock_key
         )

@@ -437,7 +437,7 @@ pub fn verify_delete_alignment_block(
 /// `qiita_control_plane.actions.library.delete_alignment_sample_data`:
 /// `{"action": "delete_alignment_sample", "alignment_idx": N,
 ///   "prep_sample_idx": M}`. What the pair selects, and why the prep_sample rather
-/// than the block or the whole alignment is the unit, is on
+/// than the block is the unit, is on
 /// `flight_service::lake_edit::delete_alignment_sample`. `deny_unknown_fields` rejects any
 /// extra field rather than dropping it — a `members` list in particular, which
 /// a caller reaching for the block scope would send and which this delete would

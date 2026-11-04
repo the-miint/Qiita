@@ -82,6 +82,7 @@ from qiita_common.api_paths import (
 from qiita_common.auth_constants import Scope, SystemRole
 from qiita_common.host_filter_plan import PoolPlanRefusal
 from qiita_common.models import (
+    AlignmentDefinitionStatus,
     AlignPlanRequest,
     AlignPlanResponse,
     BlockMaskPlanRequest,
@@ -150,6 +151,7 @@ from ..deps import (
 )
 from ..preflight import open_blob
 from ..repositories.alignment_definition import (
+    fetch_alignment_definition_by_idx,
     list_alignments_over_prep_samples,
     list_completed_alignment_samples,
     list_pool_prep_sample_idxs,
@@ -779,6 +781,9 @@ async def list_sequenced_pool_alignments(
                 params_hash=row["params_hash"].hex(),
                 samples_completed=row["samples_completed"],
                 samples_total=row["samples_total"],
+                status=row["status"],
+                deprecation_reason=row["deprecation_reason"],
+                superseded_by=row["superseded_by"],
             )
             for row in rows
         ],
@@ -809,17 +814,30 @@ async def get_sequenced_pool_alignment_cohort(
     An empty cohort is a legitimate answer, not a 404 or a 403 — it means
     "nothing here you may mint", and unlike a rejection it does not confirm
     which of the pool's alignments touch data the caller lacks.
+
+    A deprecated alignment with a non-empty cohort is 409: no mint accepts it, so
+    the cohort is not a valid mint body. Checked after the cohort is resolved, so
+    the status is told only to a caller who may read some of it, as in
+    `authorize_completed_alignment_cohort`.
     """
     prep_sample_idxs = await _readable_pool_prep_samples(
         pool, sequenced_pool_idx=sequenced_pool_idx, caller=caller
     )
+    cohort = await list_completed_alignment_samples(pool, alignment_idx, prep_sample_idxs)
+    if cohort:
+        definition = await fetch_alignment_definition_by_idx(pool, alignment_idx)
+        if definition["status"] == AlignmentDefinitionStatus.DEPRECATED.value:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"alignment {alignment_idx} is deprecated: {definition['deprecation_reason']}"
+                ),
+            )
     return PoolAlignmentCohort(
         sequencing_run_idx=sequencing_run_idx,
         sequenced_pool_idx=sequenced_pool_idx,
         alignment_idx=alignment_idx,
-        prep_sample_idx=await list_completed_alignment_samples(
-            pool, alignment_idx, prep_sample_idxs
-        ),
+        prep_sample_idx=cohort,
     )
 
 

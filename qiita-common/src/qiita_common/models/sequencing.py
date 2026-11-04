@@ -1431,6 +1431,10 @@ class PoolAlignmentSummary(BaseModel):
     from `params` is only as trustworthy as the round trip that delivered them, and a
     published manifest cites this digest as the reproducibility key. A client that
     copied a hash it never checked would be publishing a claim it cannot support.
+
+    A deprecated alignment is still listed, with its `status` and the reason: the
+    record of what produced published data outlives the judgement that the config
+    was wrong. No mint accepts it, and its cohort route refuses it.
     """
 
     alignment_idx: Annotated[int, Field(gt=0)]
@@ -1438,6 +1442,9 @@ class PoolAlignmentSummary(BaseModel):
     params_hash: str
     samples_completed: int
     samples_total: int
+    status: AlignmentDefinitionStatus
+    deprecation_reason: str | None = None
+    superseded_by: Annotated[int | None, Field(default=None, gt=0)] = None
 
 
 class PoolAlignmentList(BaseModel):

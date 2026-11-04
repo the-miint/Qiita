@@ -203,7 +203,10 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
 - (#829) Soft API-contract change: deprecating a mask or an alignment
   (`PATCH /mask-definition/{mask_idx}/status`, `PATCH /alignment-definition/{alignment_idx}/status`)
   now returns 409, listing the tickets, while any work ticket under it is unfinished.
-  Cancel or wait for them first.
+  Cancel or wait for them first. The pool alignment listing
+  (`GET /sequencing-run/{run}/sequenced-pool/{pool}/alignment`) adds `status`,
+  `deprecation_reason` and `superseded_by`; its cohort route returns 409 for a
+  deprecated alignment.
 
 ## Deployed history
 

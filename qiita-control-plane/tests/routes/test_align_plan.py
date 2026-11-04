@@ -671,6 +671,66 @@ async def test_align_plan_holds_both_definitions_in_its_ticket_transaction(
     assert resp.status_code == 202, resp.text
     alignment_idx = resp.json()["partitions"][0]["alignment_idx"]
     assert locked == [
-        ("alignment", alignment_idx, True),
         ("mask", planned["mask_idx"], True),
+        ("alignment", alignment_idx, True),
     ]
+
+
+async def _alignments_of(db, reference_idx):
+    return await db.fetchval(
+        "SELECT count(*) FROM qiita.alignment_definition"
+        " WHERE (params->>'reference_idx')::bigint = $1",
+        reference_idx,
+    )
+
+
+async def test_a_plan_refused_after_the_mint_leaves_no_alignment(ctx, planned, monkeypatch):
+    """The mint shares the plan's transaction, so a plan that fails after it rolls
+    the new alignment back. Left behind, it would have no gates and no tickets, and
+    would still block its reference's delete with nothing able to remove it."""
+    await _seed_align_action(planned["db"])
+
+    async def _fail(*_a, **_k):
+        raise RuntimeError("persist failed")
+
+    monkeypatch.setattr(align_planner, "create_alignment_sample_pending", _fail)
+    with pytest.raises(RuntimeError, match="persist failed"):
+        await ctx["wet"].post(_url(planned), json=_body(planned))
+    assert await _alignments_of(planned["db"], planned["reference_idx"]) == 0
+
+
+async def test_a_mask_deprecation_during_the_mint_waits_and_counts_the_plan(
+    ctx, planned, monkeypatch
+):
+    """The plan holds the mask `FOR SHARE` from before its mint to its commit. A
+    deprecation that starts during the mint waits for the plan, then finds its
+    tickets and is refused, rather than committing between the mint and the
+    tickets."""
+    import asyncio
+
+    from qiita_control_plane.repositories.mask_definition import (
+        MaskHasLiveWork,
+        refuse_deprecating_mask_with_live_work,
+    )
+
+    await _seed_align_action(planned["db"])
+    real_mint = align_planner.mint_alignment_definition
+    attempts: list[asyncio.Task] = []
+
+    async def _deprecate_mask():
+        async with planned["db"].acquire() as conn, conn.transaction():
+            await refuse_deprecating_mask_with_live_work(conn, planned["mask_idx"])
+
+    async def _mint_while_deprecating(conn, **kwargs):
+        attempt = asyncio.create_task(_deprecate_mask())
+        attempts.append(attempt)
+        # Long enough for a deprecation that does not wait on a lock to finish.
+        await asyncio.sleep(0.5)
+        assert not attempt.done(), "the deprecation did not wait for the plan"
+        return await real_mint(conn, **kwargs)
+
+    monkeypatch.setattr(align_planner, "mint_alignment_definition", _mint_while_deprecating)
+    resp = await ctx["wet"].post(_url(planned), json=_body(planned))
+    assert resp.status_code == 202, resp.text
+    with pytest.raises(MaskHasLiveWork):
+        await attempts[0]

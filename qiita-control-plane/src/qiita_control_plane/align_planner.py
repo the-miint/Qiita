@@ -422,13 +422,29 @@ async def plan_and_submit_alignments(
     ]
     skipped_mask_incomplete = len(gate_state_by_prep_sample) - len(to_consider)
 
-    # Mint the alignment_idx for {reference_idx, aligner, mask_idx, shard_ids} — the
-    # mask-style identity, idempotent on the config hash (a re-plan of the same
-    # config resolves to the same alignment_idx). shard_ids is reference-constant.
-    # Skipped when nothing is to-align (an all-incomplete pool returns a 202/0).
-    alignment_by_mask: dict[int, int] = {}
+    # Mint, filter and persist in ONE transaction. The mint's row is new when this
+    # config was never planned, and only the tickets written below give it any data;
+    # minted in a transaction of its own, a plan refused after the mint would leave
+    # an alignment with no gates and no tickets, which blocks its reference's delete
+    # (`actions/reference.py`) and which no route removes. Here a refusal rolls the
+    # new row back with everything else. A re-plan of the same config resolves to
+    # the same alignment_idx (the mint is idempotent on the config hash).
+    #
+    # Lock order: the mask, then the alignment, each `FOR SHARE` to commit, so a
+    # deprecation of either commits before this plan (and the plan refuses) or waits
+    # for its tickets and counts them. Skipped when nothing is to-align (an
+    # all-incomplete pool returns a 202/0).
+    alignment_idx: int | None = None
+    skipped_existing = 0
+    to_plan: list = []
+    block_summaries: list[dict[str, Any]] = []
+    partition_summaries: list[dict[str, Any]] = []
     if to_consider:
-        async with pool.acquire() as conn:
+        async with pool.acquire() as conn, conn.transaction():
+            try:
+                await lock_active_mask(conn, mask_idx)
+            except MaskDefinitionDeprecated as exc:
+                raise AlignMaskDeprecated(f"{exc.detail}; it cannot be aligned against") from exc
             try:
                 row = await mint_alignment_definition(
                     conn,
@@ -440,137 +456,107 @@ async def plan_and_submit_alignments(
                     },
                     principal_idx=originator_principal_idx,
                 )
-            except AlignmentDefinitionDeprecated as exc:
-                raise AlignDefinitionDeprecated(exc.detail) from exc
-            alignment_by_mask[mask_idx] = row["alignment_idx"]
-
-    # only_missing: drop samples already gated under their resolved alignment (a
-    # prior plan reached them) so an interrupted plan re-runs only the gap. One
-    # batched query over the (alignment_idx, prep_sample_idx) pairs.
-    skipped_existing = 0
-    to_plan = list(to_consider)
-    if only_missing and to_consider:
-        gated = await pool.fetch(
-            "SELECT als.alignment_idx, als.prep_sample_idx FROM qiita.alignment_sample als"
-            "  JOIN unnest($1::bigint[], $2::bigint[]) AS t(alignment_idx, prep_sample_idx)"
-            "    ON als.alignment_idx = t.alignment_idx"
-            "   AND als.prep_sample_idx = t.prep_sample_idx",
-            [alignment_by_mask[m] for (_s, m) in to_consider],
-            [s.prep_sample_idx for (s, _m) in to_consider],
-        )
-        gated_pairs = {(r["alignment_idx"], r["prep_sample_idx"]) for r in gated}
-        to_plan = [
-            (s, m)
-            for (s, m) in to_consider
-            if (alignment_by_mask[m], s.prep_sample_idx) not in gated_pairs
-        ]
-        skipped_existing = len(to_consider) - len(to_plan)
-
-    # On a fresh plan (only_missing=False) refuse to re-plan ANY prep_sample already
-    # carrying an alignment_sample gate for its resolved alignment, whatever its
-    # state; AlignResubmitError gives the reasons and the ways out.
-    # `only_missing` already dropped all gated samples above, so this fires only
-    # when only_missing is False. One batched query over the pairs.
-    if not only_missing and to_plan:
-        conflicting = await pool.fetch(
-            "SELECT als.prep_sample_idx FROM qiita.alignment_sample als"
-            "  JOIN unnest($1::bigint[], $2::bigint[]) AS t(alignment_idx, prep_sample_idx)"
-            "    ON als.alignment_idx = t.alignment_idx"
-            "   AND als.prep_sample_idx = t.prep_sample_idx",
-            [alignment_by_mask[m] for (_s, m) in to_plan],
-            [s.prep_sample_idx for (s, _m) in to_plan],
-        )
-        if conflicting:
-            raise AlignResubmitError(
-                alignment_by_mask[mask_idx], sorted(r["prep_sample_idx"] for r in conflicting)
-            )
-
-    # Persist the whole plan in ONE transaction — a partial plan must roll back
-    # (the alignment_definitions minted above are idempotent and survive a rollback
-    # harmlessly). By construction there is a single partition: every `to_plan` entry
-    # is keyed by the caller's `mask_idx` and its one minted `alignment_idx`, so we
-    # persist that partition directly instead of block_planner's per-mask loop. An
-    # empty `to_plan` (all samples skipped) persists nothing and returns a 202/0.
-    block_summaries: list[dict[str, Any]] = []
-    partition_summaries: list[dict[str, Any]] = []
-    if to_plan:
-        samples = [s for (s, _m) in to_plan]
-        async with pool.acquire() as conn, conn.transaction():
-            alignment_idx = alignment_by_mask[mask_idx]
-            try:
+                alignment_idx = row["alignment_idx"]
                 await lock_active_alignment(conn, alignment_idx)
             except AlignmentDefinitionDeprecated as exc:
                 raise AlignDefinitionDeprecated(exc.detail) from exc
-            # The block tickets carry mask_idx too, so the mask is held the same way.
-            try:
-                await lock_active_mask(conn, mask_idx)
-            except MaskDefinitionDeprecated as exc:
-                raise AlignMaskDeprecated(exc.detail) from exc
-            await create_alignment_sample_pending(
-                conn,
-                alignment_idx=alignment_idx,
-                prep_sample_idxs=[s.prep_sample_idx for s in samples],
-            )
-            # The align block ticket's action_context: the sharded-index resolver
-            # keys on align_reference_idx + aligner; alignment_idx rides through the
-            # step's params (+ is stamped on every output row); align_mask_idx is a
-            # provenance mirror of the ticket's mask_idx.
-            action_context_json = json.dumps(
-                {
-                    "align_reference_idx": reference_idx,
-                    "aligner": aligner,
-                    "alignment_idx": alignment_idx,
-                    "align_mask_idx": mask_idx,
-                }
-            )
-            blocks = tile_partition([s.sample_range for s in samples], target_reads=target_reads)
-            for members in blocks:
-                block_idx = await create_block(conn)
-                await add_block_members(
-                    conn,
-                    block_idx=block_idx,
-                    members=[
-                        (m.prep_sample_idx, m.min_sequence_idx, m.max_sequence_idx) for m in members
-                    ],
-                )
-                work_ticket_idx = await conn.fetchval(
-                    "INSERT INTO qiita.work_ticket ("
-                    "  action_id, action_version, originator_principal_idx,"
-                    "  scope_target_kind, block_idx, mask_idx, alignment_idx,"
-                    "  action_context, dispatch_held"
-                    ") VALUES ($1, $2, $3, 'block', $4, $5, $6, $7::jsonb, true)"
-                    " RETURNING work_ticket_idx",
-                    align_action_id,
-                    align_action_version,
-                    originator_principal_idx,
-                    block_idx,
-                    mask_idx,
+
+            gated = {
+                r["prep_sample_idx"]
+                for r in await conn.fetch(
+                    "SELECT prep_sample_idx FROM qiita.alignment_sample"
+                    " WHERE alignment_idx = $1 AND prep_sample_idx = ANY($2::bigint[])",
                     alignment_idx,
-                    action_context_json,
+                    [s.prep_sample_idx for (s, _m) in to_consider],
                 )
-                await set_block_work_ticket(
-                    conn, block_idx=block_idx, work_ticket_idx=work_ticket_idx
+            }
+            if only_missing:
+                # Drop prep_samples a prior plan already gated, so an interrupted plan
+                # re-runs only the gap.
+                to_plan = [(s, m) for (s, m) in to_consider if s.prep_sample_idx not in gated]
+                skipped_existing = len(to_consider) - len(to_plan)
+            elif gated:
+                # A fresh plan refuses ANY prep_sample already carrying a gate for this
+                # alignment, whatever its state; AlignResubmitError gives the reasons
+                # and the ways out.
+                raise AlignResubmitError(alignment_idx, sorted(gated))
+            else:
+                to_plan = list(to_consider)
+
+            # By construction there is a single partition: every `to_plan` entry is
+            # keyed by the caller's `mask_idx` and its one minted `alignment_idx`, so
+            # it is persisted directly instead of block_planner's per-mask loop. An
+            # empty `to_plan` (everything already gated) persists nothing.
+            if to_plan:
+                samples = [s for (s, _m) in to_plan]
+                await create_alignment_sample_pending(
+                    conn,
+                    alignment_idx=alignment_idx,
+                    prep_sample_idxs=[s.prep_sample_idx for s in samples],
                 )
-                block_summaries.append(
+                # The align block ticket's action_context: the sharded-index resolver
+                # keys on align_reference_idx + aligner; alignment_idx rides through the
+                # step's params (+ is stamped on every output row); align_mask_idx is a
+                # provenance mirror of the ticket's mask_idx.
+                action_context_json = json.dumps(
                     {
-                        "block_idx": block_idx,
-                        "work_ticket_idx": work_ticket_idx,
+                        "align_reference_idx": reference_idx,
+                        "aligner": aligner,
                         "alignment_idx": alignment_idx,
-                        "mask_idx": mask_idx,
-                        "member_count": len(members),
-                        "read_count": sum(
-                            m.max_sequence_idx - m.min_sequence_idx + 1 for m in members
-                        ),
+                        "align_mask_idx": mask_idx,
                     }
                 )
-            partition_summaries.append(
-                {
-                    "alignment_idx": alignment_idx,
-                    "mask_idx": mask_idx,
-                    "sample_count": len(samples),
-                    "block_count": len(blocks),
-                }
-            )
+                blocks = tile_partition(
+                    [s.sample_range for s in samples], target_reads=target_reads
+                )
+                for members in blocks:
+                    block_idx = await create_block(conn)
+                    await add_block_members(
+                        conn,
+                        block_idx=block_idx,
+                        members=[
+                            (m.prep_sample_idx, m.min_sequence_idx, m.max_sequence_idx)
+                            for m in members
+                        ],
+                    )
+                    work_ticket_idx = await conn.fetchval(
+                        "INSERT INTO qiita.work_ticket ("
+                        "  action_id, action_version, originator_principal_idx,"
+                        "  scope_target_kind, block_idx, mask_idx, alignment_idx,"
+                        "  action_context, dispatch_held"
+                        ") VALUES ($1, $2, $3, 'block', $4, $5, $6, $7::jsonb, true)"
+                        " RETURNING work_ticket_idx",
+                        align_action_id,
+                        align_action_version,
+                        originator_principal_idx,
+                        block_idx,
+                        mask_idx,
+                        alignment_idx,
+                        action_context_json,
+                    )
+                    await set_block_work_ticket(
+                        conn, block_idx=block_idx, work_ticket_idx=work_ticket_idx
+                    )
+                    block_summaries.append(
+                        {
+                            "block_idx": block_idx,
+                            "work_ticket_idx": work_ticket_idx,
+                            "alignment_idx": alignment_idx,
+                            "mask_idx": mask_idx,
+                            "member_count": len(members),
+                            "read_count": sum(
+                                m.max_sequence_idx - m.min_sequence_idx + 1 for m in members
+                            ),
+                        }
+                    )
+                partition_summaries.append(
+                    {
+                        "alignment_idx": alignment_idx,
+                        "mask_idx": mask_idx,
+                        "sample_count": len(samples),
+                        "block_count": len(blocks),
+                    }
+                )
 
     # Every block ticket was INSERTed `dispatch_held`; the pump releases up to
     # FANOUT_MAX_INFLIGHT per alignment cohort and refills as each block finishes
