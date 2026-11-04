@@ -516,12 +516,11 @@ def _write_taxonomy(
         ids = [r[0] for r in bad]
         raise ValueError(f"Taxonomy has wrong rank prefix order for feature_idx: {ids}")
 
-    # Warn (don't raise) on coverage anomalies: real corpora have them, so they
-    # must NOT fail the ingest. GG2's 2024.09 backbone has ~29 features with no
-    # taxonomy row, and a supplied taxonomy keyed in a different ID namespace
-    # than the FASTA is the exact class that already bit the genome map. One row
-    # per feature, not per read_id, so a canonical-hash collision (two read_ids
-    # → one feature) isn't double-counted.
+    # Coverage anomalies warn rather than fail the load, because real corpora have
+    # them: GG2's 2024.09 backbone has ~29 features with no taxonomy row. The count
+    # in each warning is what shows a taxonomy keyed by identifiers other than the
+    # FASTA's, which leaves nearly every feature unclassified. Each check counts
+    # features, not read_ids, so a feature known by several read_ids counts once.
     _warn_anomaly(
         conn,
         "SELECT min(x.read_id) FROM id_map x "
