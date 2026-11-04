@@ -512,7 +512,7 @@ async def test_has_incomplete_covering_block_ignores_a_purged_align_block(blk):
     """A PURGED align block must not wedge the read-mask finalize gate.
 
     An align block ticket carries both mask_idx and alignment_idx, and
-    `DELETE /alignment-definition` NULLs the alignment (`ON DELETE SET NULL`) while
+    Removing the alignment_definition row NULLs the alignment (`ON DELETE SET NULL`) while
     leaving mask_idx and block_idx. On column shape alone the leftover is
     indistinguishable from a read-mask block covering the same sample under the same
     mask — so a discriminator of `alignment_idx IS NULL` would count it here and

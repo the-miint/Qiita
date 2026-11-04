@@ -105,12 +105,10 @@ ROLE_IMPLIED_SCOPES: Mapping[SystemRole, frozenset[Scope]] = {
             # decides that published contigs were produced by a run we no longer
             # stand behind.
             Scope.PROCESSING_LIFECYCLE,
-            # Full alignment purge is system_admin-only, same as
-            # REFERENCE_DELETE: deleting an alignment drops its
-            # alignment_definition row (cascading the alignment_sample gate) and
-            # its DuckLake alignment data. The disallow-without-delete escape
-            # hatch. Service accounts never get it.
-            Scope.ALIGNMENT_DEFINITION_DELETE,
+            # Deprecating an alignment / withdrawing its per-sample runs /
+            # abandoning a failed align plan is system_admin-only for the same
+            # reason as the mask and processing twins above.
+            Scope.ALIGNMENT_DEFINITION_LIFECYCLE,
             Scope.STUDY_READ,
             Scope.STUDY_WRITE,
             # Human-callable alignment / assembly DoGet mints. On every ceiling,

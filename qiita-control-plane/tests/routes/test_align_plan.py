@@ -582,11 +582,34 @@ async def test_align_plan_resubmit_over_completed_409(ctx, planned):
     assert resp.status_code == 409, resp.text
     conflicting = resp.json()["detail"]["conflicting_prep_sample_idxs"]
     assert set(conflicting) == set(planned["prep_samples"])
+    assert resp.json()["detail"]["alignment_idx"] == first.json()["partitions"][0]["alignment_idx"]
+    assert "abandon-plan" in resp.json()["detail"]["reason"]
 
     ok = await ctx["wet"].post(_url(planned), json=_body(planned, only_missing=True))
     assert ok.status_code == 202, ok.text
     assert ok.json()["samples_planned"] == 0
     assert ok.json()["blocks_created"] == 0
+
+
+async def test_align_plan_deprecated_alignment_409(ctx, planned):
+    """A deprecated alignment is retired: the same reference, aligner and mask
+    resolve to it again, the mint refuses, and the route says so — even for
+    only_missing, which would otherwise plan nothing and return 202."""
+    await _seed_align_action(planned["db"])
+    first = await ctx["wet"].post(_url(planned), json=_body(planned))
+    assert first.status_code == 202, first.text
+    alignment_idx = first.json()["partitions"][0]["alignment_idx"]
+    await planned["db"].execute(
+        "UPDATE qiita.alignment_definition"
+        "   SET status = 'deprecated', deprecated_at = now(),"
+        "       deprecated_by_idx = created_by_idx, deprecation_reason = 'bad aligner build'"
+        " WHERE alignment_idx = $1",
+        alignment_idx,
+    )
+    resp = await ctx["wet"].post(_url(planned), json=_body(planned, only_missing=True))
+    assert resp.status_code == 409, resp.text
+    assert "bad aligner build" in resp.json()["detail"]
+    assert "retired" in resp.json()["detail"]
 
 
 async def test_align_plan_reference_not_active_409(ctx, planned):

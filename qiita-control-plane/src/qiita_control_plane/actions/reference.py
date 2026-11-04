@@ -8,10 +8,12 @@ have one home.
 from __future__ import annotations
 
 import asyncpg
+from qiita_common.api_paths import URL_ALIGNMENT_DEFINITION_STATUS
 from qiita_common.models import (
     NON_TERMINAL_WORK_TICKET_STATES,
     TERMINAL_WORK_TICKET_STATES,
     VALID_STATUS_TRANSITIONS,
+    AlignmentDefinitionStatus,
     ReferenceResponse,
     ReferenceStatus,
 )
@@ -41,8 +43,8 @@ _WORK_TICKET_TERMINAL_STATES = TERMINAL_WORK_TICKET_STATES
 
 
 class ReferenceDeleteBlocked(Exception):
-    """Raised when a reference cannot be deleted. `alignment_definitions` blocks
-    UNCONDITIONALLY (even with force); `in_flight` work tickets always block;
+    """Raised when a reference cannot be deleted. `alignment_definitions` (ACTIVE ones)
+    block UNCONDITIONALLY (even with force); `in_flight` work tickets always block;
     `terminal` work tickets block only when the caller did not pass force=True."""
 
     def __init__(
@@ -57,21 +59,20 @@ class ReferenceDeleteBlocked(Exception):
         self.in_flight = in_flight
         self.terminal = terminal
         self.alignment_definitions = alignment_definitions
-        # Alignment definitions are the force-proof reason and the one the operator
-        # most needs to act on, so it is reported first when present. A reference
-        # delete cascades neither `alignment_definition` nor the DuckLake `alignment`
-        # rows it owns (those are keyed on `feature_idx`, which this delete would
-        # orphan-GC in both stores), and the data plane's delete_reference does not
-        # touch `alignment` — so force cannot make this delete safe. The
-        # DELETE /alignment-definition/{idx} route DOES purge the lake rows and
-        # cascade its gates, so send the operator there first.
+        # Active alignment definitions are the force-proof reason and the one the
+        # operator most needs to act on, so it is reported first when present. A
+        # reference delete removes features the DuckLake `alignment` rows are keyed
+        # on (`feature_idx`), and the data plane's delete_reference does not touch
+        # `alignment`. The route purges a DEPRECATED alignment's rows first
+        # (`deprecated_alignments_against`); an active one is still in use, so it
+        # must be deprecated before its rows may go.
         if alignment_definitions:
             reason = (
-                f"{alignment_definitions} alignment definition(s) align against it; "
-                "force cannot be used because it cannot clean the DuckLake "
-                "`alignment` rows they own (keyed on feature_idx this delete would "
-                "orphan). Delete each via DELETE /alignment-definition/{idx} first "
-                "(that route purges the lake rows and cascades its gates), then retry"
+                f"{alignment_definitions} active alignment definition(s) align against it; "
+                "force cannot be used because this delete would orphan the DuckLake "
+                "`alignment` rows they own (keyed on feature_idx). A system_admin "
+                f"deprecates each (PATCH {URL_ALIGNMENT_DEFINITION_STATUS}); this delete "
+                "then purges a deprecated alignment's rows. Retry after that"
             )
         elif in_flight:
             reason = (
@@ -109,7 +110,7 @@ async def assert_reference_deletable(
     Returns the reference's current status on success. Raises
     ReferenceNotFound if it doesn't exist, or ReferenceDeleteBlocked if work
     tickets reference it (in-flight always; terminal unless force) or if any
-    alignment definition aligns against it (always, even with force). Run this
+    ACTIVE alignment definition aligns against it (always, even with force). Run this
     *before* any destructive step so a blocked delete touches nothing."""
     status = await conn.fetchval(
         "SELECT status FROM qiita.reference WHERE reference_idx = $1", reference_idx
@@ -127,17 +128,24 @@ async def assert_reference_deletable(
     # Align-block work tickets are block-scoped and leave work_ticket.reference_idx
     # NULL, so the gate above cannot see them — the reference↔alignment link lives
     # only in alignment_definition.params (JSON `reference_idx`, an int; there is no
-    # FK). Gate on that row directly: it is the durable record that an alignment was
-    # built against this reference, and it outlives the (transient) work tickets.
-    # This blocks EVEN WITH force, because neither the Postgres cascade nor the data
-    # plane's delete_reference touches the DuckLake `alignment` rows those
-    # definitions own (keyed on feature_idx this delete would orphan-GC in both
-    # stores) — so no force can make the delete safe. DELETE /alignment-definition
-    # first purges the lake rows and cascades the gates.
+    # FK). An ACTIVE alignment blocks even with force (ReferenceDeleteBlocked says
+    # why); a deprecated one is purged by the route.
     alignment_definitions = await conn.fetchval(
         "SELECT count(*) FROM qiita.alignment_definition"
-        " WHERE (params->>'reference_idx')::bigint = $1",
+        " WHERE (params->>'reference_idx')::bigint = $1 AND status = $2",
         reference_idx,
+        AlignmentDefinitionStatus.ACTIVE.value,
+    )
+    # A deprecated alignment's block tickets carry alignment_idx, not reference_idx,
+    # so the count above misses them. One still running would register rows keyed on
+    # features this delete removes, after the route purged that alignment's rows.
+    in_flight += await conn.fetchval(
+        "SELECT count(*) FROM qiita.work_ticket wt"
+        "  JOIN qiita.alignment_definition ad ON ad.alignment_idx = wt.alignment_idx"
+        " WHERE (ad.params->>'reference_idx')::bigint = $1"
+        "   AND wt.state::text = ANY($2::text[])",
+        reference_idx,
+        list(_WORK_TICKET_IN_FLIGHT_STATES),
     )
     if alignment_definitions or in_flight or (terminal and not force):
         raise ReferenceDeleteBlocked(
@@ -379,3 +387,20 @@ async def transition_reference_status(
     if current is None:
         raise ReferenceNotFound(reference_idx)
     raise IllegalStatusTransition(current=current, target=target)
+
+
+async def deprecated_alignments_against(
+    conn: asyncpg.Pool | asyncpg.Connection, reference_idx: int
+) -> list[int]:
+    """The deprecated alignments whose config names this reference, sorted. The
+    reference-delete route purges their DuckLake `alignment` rows before the
+    reference's own data, since those rows are keyed on features the delete removes.
+    The alignment_definition rows stay, as the record of what was aligned."""
+    rows = await conn.fetch(
+        "SELECT alignment_idx FROM qiita.alignment_definition"
+        " WHERE (params->>'reference_idx')::bigint = $1 AND status = $2"
+        " ORDER BY alignment_idx",
+        reference_idx,
+        AlignmentDefinitionStatus.DEPRECATED.value,
+    )
+    return [r["alignment_idx"] for r in rows]

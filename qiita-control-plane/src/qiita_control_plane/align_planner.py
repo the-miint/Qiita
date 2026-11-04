@@ -34,6 +34,10 @@ from typing import TYPE_CHECKING, Any
 
 import asyncpg
 from qiita_common.actions import ALIGN_ACTION_ID as _ALIGN_ACTION_ID
+from qiita_common.api_paths import (
+    URL_ALIGNMENT_DEFINITION_ABANDON_PLAN,
+    URL_ALIGNMENT_DEFINITION_STATUS,
+)
 from qiita_common.models import MaskDefinitionStatus
 
 from .actions.reference import ReferenceNotFound
@@ -44,7 +48,10 @@ from .block_planner import (
 )
 from .dispatch import schedule_dispatch
 from .fanout_dispatch import align_block_cohort, top_up_dispatch
-from .repositories.alignment_definition import mint_alignment_definition
+from .repositories.alignment_definition import (
+    AlignmentDefinitionDeprecated,
+    mint_alignment_definition,
+)
 from .repositories.block import (
     MASK_SAMPLE_COMPLETED,
     add_block_members,
@@ -208,26 +215,40 @@ class AlignResubmitError(RuntimeError):
     their resolved `alignment_idx`, so a fresh (`only_missing=False`) plan is
     refused — the alignment analog of `BlockMaskResubmitError`:
 
-    - a COMPLETED gate → re-planning re-aligns reads already aligned,
-      double-writing `alignment` rows (DuckLake has no uniqueness);
+    - a COMPLETED or INVALIDATED gate → re-planning re-aligns reads already
+      aligned, double-writing `alignment` rows (DuckLake has no uniqueness);
     - a still-PENDING gate → a prior plan's covering block is in-flight or failed,
       and minting a fresh same-footprint covering block would wedge the sample's
       finalize forever (`has_incomplete_covering_alignment_block` keeps seeing the
       stale non-completed block, so the gate never flips).
 
-    An existing gate requires an explicit DELETE before resubmission. The operator
-    either DELETEs the alignment first (to genuinely re-align) or passes
-    `only_missing=true` to plan only the not-yet-gated samples. The route maps this
-    to 409."""
+    The message names the way out for each. The route maps this to 409."""
 
-    def __init__(self, conflicting_prep_sample_idxs: list[int]):
+    def __init__(self, alignment_idx: int, conflicting_prep_sample_idxs: list[int]):
+        self.alignment_idx = alignment_idx
         self.conflicting_prep_sample_idxs = conflicting_prep_sample_idxs
         super().__init__(
             f"{len(conflicting_prep_sample_idxs)} sample(s) already have an alignment gate "
-            "(pending or completed) for the resolved alignment config; a fresh plan would "
-            "double-write a completed alignment or wedge an in-flight one. DELETE the "
-            "alignment first to re-align, or pass only_missing=true to plan only the ungated "
-            f"samples. prep_sample_idxs: {conflicting_prep_sample_idxs}"
+            f"under alignment_idx {alignment_idx}; a fresh plan would double-write a "
+            "completed alignment or wedge an in-flight one. Samples left pending by failed "
+            "blocks: a system_admin abandons the plan (POST "
+            f"{URL_ALIGNMENT_DEFINITION_ABANDON_PLAN}), then re-plan with only_missing=true. "
+            "A completed alignment is not re-run under the same config: if it is bad, a "
+            f"system_admin deprecates it (PATCH {URL_ALIGNMENT_DEFINITION_STATUS}) and the "
+            "samples are aligned under a different config. "
+            f"prep_sample_idxs: {conflicting_prep_sample_idxs}"
+        )
+
+
+class AlignDefinitionDeprecated(RuntimeError):
+    """The plan's config resolves to a deprecated alignment. A block identity has no
+    version, so re-planning the same reference, aligner and mask always lands on it;
+    the route maps this to 409."""
+
+    def __init__(self, detail: str):
+        super().__init__(
+            f"{detail}. A deprecated alignment is retired: align these samples under a "
+            "different reference, aligner or mask"
         )
 
 
@@ -406,16 +427,19 @@ async def plan_and_submit_alignments(
     alignment_by_mask: dict[int, int] = {}
     if to_consider:
         async with pool.acquire() as conn:
-            row = await mint_alignment_definition(
-                conn,
-                params={
-                    "reference_idx": reference_idx,
-                    "aligner": aligner,
-                    "mask_idx": mask_idx,
-                    "shard_ids": shard_ids,
-                },
-                principal_idx=originator_principal_idx,
-            )
+            try:
+                row = await mint_alignment_definition(
+                    conn,
+                    params={
+                        "reference_idx": reference_idx,
+                        "aligner": aligner,
+                        "mask_idx": mask_idx,
+                        "shard_ids": shard_ids,
+                    },
+                    principal_idx=originator_principal_idx,
+                )
+            except AlignmentDefinitionDeprecated as exc:
+                raise AlignDefinitionDeprecated(exc.detail) from exc
             alignment_by_mask[mask_idx] = row["alignment_idx"]
 
     # only_missing: drop samples already gated under their resolved alignment (a
@@ -440,10 +464,9 @@ async def plan_and_submit_alignments(
         ]
         skipped_existing = len(to_consider) - len(to_plan)
 
-    # disallow-without-delete: on a fresh plan (only_missing=False) refuse to
-    # re-plan ANY sample already carrying an alignment_sample gate for its resolved
-    # alignment — pending (a prior in-flight/failed plan; a fresh same-footprint
-    # block would wedge finalize) or completed (re-aligning double-writes rows).
+    # On a fresh plan (only_missing=False) refuse to re-plan ANY sample already
+    # carrying an alignment_sample gate for its resolved alignment, whatever its
+    # state; AlignResubmitError gives the reasons and the ways out.
     # `only_missing` already dropped all gated samples above, so this fires only
     # when only_missing is False. One batched query over the pairs.
     if not only_missing and to_plan:
@@ -456,7 +479,9 @@ async def plan_and_submit_alignments(
             [s.prep_sample_idx for (s, _m) in to_plan],
         )
         if conflicting:
-            raise AlignResubmitError(sorted(r["prep_sample_idx"] for r in conflicting))
+            raise AlignResubmitError(
+                alignment_by_mask[mask_idx], sorted(r["prep_sample_idx"] for r in conflicting)
+            )
 
     # Persist the whole plan in ONE transaction — a partial plan must roll back
     # (the alignment_definitions minted above are idempotent and survive a rollback

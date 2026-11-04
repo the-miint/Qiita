@@ -731,9 +731,9 @@ fn delete_lake_rows(
 }
 
 /// Logically delete one `alignment_idx`'s rows from every
-/// `ALIGNMENT_DELETE_TABLES` table in DuckLake — the whole-alignment purge the
-/// disallow-without-delete resubmission rule needs (a completed
-/// `alignment_sample` must be cleared before re-aligning).
+/// `ALIGNMENT_DELETE_TABLES` table in DuckLake. Its one caller is reference
+/// delete, purging the rows of a deprecated alignment against the reference
+/// being removed (`qiita_control_plane.routes.reference`).
 ///
 /// Transaction, lockstep and parquet lifecycle are `delete_lake_rows`'. Idempotent: deleting an `alignment_idx`
 /// with zero rows is success and returns `rows_deleted: 0`, so the control plane

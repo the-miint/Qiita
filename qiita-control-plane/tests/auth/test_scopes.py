@@ -157,21 +157,20 @@ def test_work_ticket_cancel_is_system_admin_only():
     assert Scope.WORK_TICKET_CANCEL not in SERVICE_ACCOUNT_SCOPE_CEILING
 
 
-def test_alignment_definition_delete_is_system_admin_only():
-    """alignment-definition:delete is the full-alignment-purge scope — system_admin
-    only, like reference:delete. wet_lab_admin can submit align runs (via
-    prep_sample:write) but not destroy their alignments, and service accounts never
-    get it. It is the disallow-without-delete escape hatch, gated like every other
-    destructive purge."""
+def test_alignment_definition_lifecycle_is_system_admin_only():
+    """alignment_definition:lifecycle deprecates an alignment, withdraws its runs and
+    abandons a failed plan — system_admin only, like its mask and processing twins.
+    wet_lab_admin can submit align runs (via prep_sample:write) but not withdraw
+    them, and service accounts never get it."""
     from qiita_control_plane.auth.scopes import (
         ROLE_IMPLIED_SCOPES,
         SERVICE_ACCOUNT_SCOPE_CEILING,
     )
 
-    assert Scope.ALIGNMENT_DEFINITION_DELETE in ROLE_IMPLIED_SCOPES[SystemRole.SYSTEM_ADMIN]
-    assert Scope.ALIGNMENT_DEFINITION_DELETE not in ROLE_IMPLIED_SCOPES[SystemRole.WET_LAB_ADMIN]
-    assert Scope.ALIGNMENT_DEFINITION_DELETE not in ROLE_IMPLIED_SCOPES[SystemRole.USER]
-    assert Scope.ALIGNMENT_DEFINITION_DELETE not in SERVICE_ACCOUNT_SCOPE_CEILING
+    assert Scope.ALIGNMENT_DEFINITION_LIFECYCLE in ROLE_IMPLIED_SCOPES[SystemRole.SYSTEM_ADMIN]
+    assert Scope.ALIGNMENT_DEFINITION_LIFECYCLE not in ROLE_IMPLIED_SCOPES[SystemRole.WET_LAB_ADMIN]
+    assert Scope.ALIGNMENT_DEFINITION_LIFECYCLE not in ROLE_IMPLIED_SCOPES[SystemRole.USER]
+    assert Scope.ALIGNMENT_DEFINITION_LIFECYCLE not in SERVICE_ACCOUNT_SCOPE_CEILING
 
 
 def test_masked_read_export_is_system_admin_only():

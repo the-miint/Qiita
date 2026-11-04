@@ -69,6 +69,7 @@ from qiita_common.models import (
 from qiita_common.parquet import PARQUET_MEDIA_TYPE, PARQUET_RESPONSES
 
 from ..actions.library import (
+    delete_alignment_data,
     delete_reference_data,
     genome_map_parquet,
     mint_phylogeny_edge_id_data,
@@ -81,6 +82,7 @@ from ..actions.reference import (
     ReferenceNotFound,
     assert_reference_deletable,
     delete_reference_cascade,
+    deprecated_alignments_against,
     transition_reference_status,
 )
 from ..auth.guards import (
@@ -799,7 +801,10 @@ async def delete_reference(
 
     Gating: work tickets in-flight (pending/queued/processing) block the delete
     unconditionally (409); terminal tickets (completed/no_data/failed) block it
-    unless `force=true` is passed. Shared features (claimed by another reference) are never deleted.
+    unless `force=true` is passed. An active alignment against the reference blocks
+    it even with force; a deprecated one has its DuckLake rows purged first, and its
+    alignment_definition row is kept. Shared features (claimed by another reference)
+    are never deleted.
 
     Ordering is data-plane → orchestrator → Postgres, chosen so the operation
     is *retriable*: every step is idempotent and the `qiita.reference` row — the
@@ -819,6 +824,26 @@ async def delete_reference(
         raise HTTPException(status_code=404, detail=REFERENCE_NOT_FOUND_DETAIL)
     except ReferenceDeleteBlocked as exc:
         raise HTTPException(status_code=409, detail=str(exc))
+
+    # The DuckLake rows of deprecated alignments against this reference, before the
+    # reference's own data: they are keyed on features that delete removes. Each
+    # purge is idempotent, so a retry after a later failure re-runs it harmlessly.
+    alignment_rows_deleted = 0
+    for alignment_idx in await deprecated_alignments_against(pool, reference_idx):
+        try:
+            alignment_rows_deleted += await delete_alignment_data(
+                alignment_idx=alignment_idx,
+                signing_key=signing_key,
+                data_plane_url=data_plane_url,
+            )
+        except _flight.FlightError as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    f"data plane purge of deprecated alignment {alignment_idx} failed;"
+                    f" the reference is untouched, re-run the delete: {exc}"
+                ),
+            ) from exc
 
     # DuckLake data (idempotent, atomic delete-by-reference_idx in the data plane).
     try:
@@ -871,6 +896,7 @@ async def delete_reference(
     return ReferenceDeleteResponse(
         reference_idx=reference_idx,
         artifacts_removed=artifacts_removed,
+        alignment_rows_deleted=alignment_rows_deleted,
         **counts,
     )
 

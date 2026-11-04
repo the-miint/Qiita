@@ -500,13 +500,11 @@ async def test_delete_reference_gcs_annotated_features(client, postgres_pool):
 async def test_delete_reference_blocked_by_alignment_definition_even_with_force(
     client, postgres_pool
 ):
-    """An alignment definition that aligns against the reference blocks its delete
-    UNCONDITIONALLY — even with force. Align-block tickets leave work_ticket.
+    """An ACTIVE alignment definition that aligns against the reference blocks its
+    delete UNCONDITIONALLY — even with force. Align-block tickets leave work_ticket.
     reference_idx NULL, so the work-ticket gate cannot see them; the reference↔
-    alignment link lives only in alignment_definition.params. Force must not bypass
-    it, because neither the cascade nor the data plane cleans the DuckLake
-    `alignment` rows the definition owns (keyed on feature_idx this delete would
-    orphan). The operator must DELETE /alignment-definition first."""
+    alignment link lives only in alignment_definition.params. The message names
+    deprecation as the way forward."""
     ref_idx = await _create_ref(client, f"del-align-{uuid.uuid4()}")
     align_idx = await postgres_pool.fetchval(
         "INSERT INTO qiita.alignment_definition (params_hash, params, created_by_idx)"
@@ -527,7 +525,8 @@ async def test_delete_reference_blocked_by_alignment_definition_even_with_force(
             URL_REFERENCE_BY_IDX.format(reference_idx=ref_idx), params={"force": "true"}
         )
         assert r2.status_code == 409, r2.text
-        assert "alignment definition" in r2.json()["detail"]
+        assert "active alignment definition" in r2.json()["detail"]
+        assert "deprecates" in r2.json()["detail"]
         # The reference survives untouched.
         assert (
             await postgres_pool.fetchval(
@@ -536,6 +535,103 @@ async def test_delete_reference_blocked_by_alignment_definition_even_with_force(
             == 1
         )
     finally:
+        await postgres_pool.execute(
+            "DELETE FROM qiita.alignment_definition WHERE alignment_idx = $1", align_idx
+        )
+
+
+async def _seed_deprecated_alignment(pool, ref_idx):
+    return await pool.fetchval(
+        "INSERT INTO qiita.alignment_definition"
+        " (params_hash, params, created_by_idx, status, deprecated_at, deprecated_by_idx,"
+        "  deprecation_reason)"
+        " VALUES ($1, $2::jsonb, (SELECT MIN(idx) FROM qiita.principal), 'deprecated', now(),"
+        "         (SELECT MIN(idx) FROM qiita.principal), 'bad build')"
+        " RETURNING alignment_idx",
+        uuid.uuid4().bytes + uuid.uuid4().bytes,
+        json.dumps(
+            {"reference_idx": ref_idx, "aligner": "bowtie2", "mask_idx": 1, "shard_ids": [0]}
+        ),
+    )
+
+
+async def test_delete_reference_purges_a_deprecated_alignment_and_keeps_its_row(
+    client, postgres_pool, monkeypatch
+):
+    """A deprecated alignment does not block the delete: its DuckLake rows are purged
+    before the reference's own data, and its alignment_definition row is kept."""
+    calls: list[int] = []
+
+    async def _purge(*, alignment_idx, signing_key, data_plane_url):
+        calls.append(alignment_idx)
+        return 11
+
+    monkeypatch.setattr("qiita_control_plane.routes.reference.delete_alignment_data", _purge)
+    ref_idx = await _create_ref(client, f"del-deprecated-align-{uuid.uuid4()}")
+    align_idx = await _seed_deprecated_alignment(postgres_pool, ref_idx)
+    try:
+        resp = await client.delete(URL_REFERENCE_BY_IDX.format(reference_idx=ref_idx))
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["alignment_rows_deleted"] == 11
+        assert calls == [align_idx]
+        assert (
+            await postgres_pool.fetchval(
+                "SELECT status FROM qiita.alignment_definition WHERE alignment_idx = $1",
+                align_idx,
+            )
+            == "deprecated"
+        )
+    finally:
+        await postgres_pool.execute(
+            "DELETE FROM qiita.alignment_definition WHERE alignment_idx = $1", align_idx
+        )
+
+
+async def test_delete_reference_blocked_by_a_running_deprecated_alignment_block(
+    client, postgres_pool, monkeypatch
+):
+    """A deprecated alignment's block ticket carries alignment_idx, not reference_idx.
+    One still running would register rows keyed on features this delete removes, so
+    it blocks the delete like any in-flight ticket, before anything is purged."""
+    calls: list[int] = []
+
+    async def _purge(*, alignment_idx, signing_key, data_plane_url):
+        calls.append(alignment_idx)
+        return 0
+
+    monkeypatch.setattr("qiita_control_plane.routes.reference.delete_alignment_data", _purge)
+    ref_idx = await _create_ref(client, f"del-running-align-{uuid.uuid4()}")
+    align_idx = await _seed_deprecated_alignment(postgres_pool, ref_idx)
+    wt_idx, action_id, version = await _seed_work_ticket(postgres_pool, ref_idx, "processing")
+    from qiita_control_plane.repositories.block import create_block
+
+    async with postgres_pool.acquire() as conn, conn.transaction():
+        block_idx = await create_block(conn)
+    # An align block ticket: scoped to its block, so reference_idx is NULL.
+    await postgres_pool.execute(
+        "UPDATE qiita.work_ticket"
+        "   SET scope_target_kind = 'block', reference_idx = NULL, block_idx = $3,"
+        "       alignment_idx = $2"
+        " WHERE work_ticket_idx = $1",
+        wt_idx,
+        align_idx,
+        block_idx,
+    )
+    try:
+        resp = await client.delete(
+            URL_REFERENCE_BY_IDX.format(reference_idx=ref_idx), params={"force": "true"}
+        )
+        assert resp.status_code == 409, resp.text
+        assert "in-flight" in resp.json()["detail"]
+        assert calls == []
+    finally:
+        await postgres_pool.execute(
+            "DELETE FROM qiita.work_ticket WHERE work_ticket_idx = $1", wt_idx
+        )
+        await postgres_pool.execute("DELETE FROM qiita.block WHERE block_idx = $1", block_idx)
+        await postgres_pool.execute(
+            "DELETE FROM qiita.action WHERE action_id = $1 AND version = $2", action_id, version
+        )
         await postgres_pool.execute(
             "DELETE FROM qiita.alignment_definition WHERE alignment_idx = $1", align_idx
         )

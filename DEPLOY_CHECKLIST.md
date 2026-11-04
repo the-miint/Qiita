@@ -51,6 +51,7 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
 
 - `[operator]` (#779) `make migrate` applies `20261024000000_metadata_visibility.sql` (four new SQL functions, `qiita.metadata_field_tier`, `qiita.metadata_required_tier` and `qiita.{biosample,prep_sample}_metadata_visibility`, and corrected COMMENTs on `qiita.{biosample,prep_sample}_field_exception`; no table, row or grant changes).
 - `[operator]` (#779) `make migrate` applies `20261024000001_metadata_write_keeps_parent_updated_at.sql` (the biosample and prep_sample `set_updated_at` triggers skip the metadata-touch UPDATE, and the two touch functions skip a no-op UPDATE; column COMMENTs on `updated_at` / `last_metadata_change_at`; no table or row changes).
+- `[operator]` (#N) `make migrate` applies `20261104000000_alignment_lifecycle.sql` (lifecycle columns and CHECKs on `qiita.alignment_definition`, `invalidated` on `qiita.alignment_sample`, `abandoned` on `qiita.block`, `qiita.mint_alignment_definition` refusing a deprecated config, `qiita.qc_verdict` restated; no row changes).
 
 ### 4. Deploy
 
@@ -193,6 +194,13 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
   `qiita-admin mask delete` / `mask purge-failed` and the `mask_definition:delete` scope are
   removed. A PAT mint requesting that scope now gets `422 unknown scopes`; an existing token
   carrying it keeps working without it. Deprecate a mask or invalidate its runs instead.
+- (#N) Soft API-contract change: `DELETE /alignment-definition/{alignment_idx}` and the
+  `alignment_definition:delete` scope are removed. A PAT mint requesting that scope now gets
+  `422 unknown scopes`; an existing token carrying it keeps working without it. The new
+  `alignment_definition:lifecycle` scope reaches `system_admin` through
+  `ROLE_IMPLIED_SCOPES`, with no host action. Deprecate an alignment, invalidate its runs,
+  or abandon a failed plan instead. Reference delete now purges a deprecated alignment's
+  DuckLake rows; an active one still blocks it.
 
 ## Deployed history
 

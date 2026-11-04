@@ -435,9 +435,8 @@ pub fn verify_delete_alignment_block(
 ///
 /// Wire shape pinned by `qiita_control_plane.actions.library.delete_alignment_data`:
 /// `{"action": "delete_alignment", "alignment_idx": N}`. The data plane deletes
-/// every `alignment` row for `alignment_idx` in one DuckLake transaction — the
-/// minimal DELETE path the disallow-without-delete resubmission rule requires (a
-/// completed `alignment_sample` must be cleared before re-aligning). Idempotent:
+/// every `alignment` row for `alignment_idx` in one DuckLake transaction; its
+/// caller is reference delete (see `flight_service::lake_edit::delete_alignment`). Idempotent:
 /// an alignment whose rows never registered deletes zero rows. `deny_unknown_fields`
 /// keeps the contract tight: any extra field is a design slip surfaced loudly here.
 #[derive(Debug, serde::Deserialize)]

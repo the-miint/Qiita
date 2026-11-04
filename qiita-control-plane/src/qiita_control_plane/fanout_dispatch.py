@@ -68,6 +68,7 @@ from qiita_common.actions import ALIGN_ACTION_ID, BLOCK_MASK_ACTION_ID
 from qiita_common.models import MAX_FANOUT_OVERRIDE, FanoutCohortKind, FanoutCohortStatus
 
 from qiita_control_plane.repositories import INT4_MASK
+from qiita_control_plane.repositories.block import BLOCK_ABANDONED
 
 _log = logging.getLogger(__name__)
 
@@ -190,8 +191,17 @@ def align_block_cohort(alignment_idx: int) -> FanoutCohort:
         label=f"align_block(alignment_idx={alignment_idx})",
         kind=FanoutCohortKind.ALIGN_BLOCK,
         key=alignment_idx,
-        where_sql="alignment_idx = $1 AND block_idx IS NOT NULL AND action_id = $2",
-        args=(alignment_idx, ALIGN_ACTION_ID),
+        # An abandoned block's ticket has left the fan-out: abandon-plan cleared the
+        # gates it covered, so its failure must not fail-stop the re-plan that
+        # follows under the same alignment_idx. Unaliased `work_ticket` because every
+        # query this predicate goes into reads `FROM qiita.work_ticket` bare.
+        where_sql=(
+            "alignment_idx = $1 AND block_idx IS NOT NULL AND action_id = $2"
+            " AND NOT EXISTS (SELECT 1 FROM qiita.block ab"
+            "                  WHERE ab.block_idx = work_ticket.block_idx"
+            "                    AND ab.state = $3)"
+        ),
+        args=(alignment_idx, ALIGN_ACTION_ID, BLOCK_ABANDONED),
         lock_class=_LOCK_CLASS_ALIGN_BLOCK,
         lock_key=alignment_idx & INT4_MASK,
     )

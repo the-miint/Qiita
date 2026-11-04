@@ -3,15 +3,14 @@
 
 The `alignment_idx` that keys the DuckLake `alignment` rows is minted at plan time
 by the align-plan route (`POST .../sequenced-pool/{P}/align-plan`), so **no route
-here mints one** — the POSTs below sign Flight DoGet tickets against an alignment
+here mints one** — the DoGet POSTs below sign Flight tickets against an alignment
 that already exists.
 
-This module owns the destructive DELETE — the full purge of an alignment (its
-DuckLake rows + the Postgres `alignment_definition` row) — which is the escape
-hatch the align planner's disallow-without-delete rule requires: an operator must
-DELETE a completed alignment before re-aligning the same config.
-
-Lake-first, system_admin-only, idempotent/retriable.
+The /alignment-definition routes are the alignment lifecycle, system_admin-only
+(`alignment_definition:lifecycle`): deprecate a config, withdraw or restore
+individual runs, and abandon a plan's unfinished blocks. None of them deletes an
+alignment; the record of what aligned published data outlives the judgement that
+it was wrong.
 """
 
 import base64
@@ -24,30 +23,52 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import Field
 from qiita_common.api_paths import (
     PATH_ALIGNMENT_COHORT_DOGET,
-    PATH_ALIGNMENT_DEFINITION_BY_IDX,
+    PATH_ALIGNMENT_DEFINITION_ABANDON_PLAN,
     PATH_ALIGNMENT_DEFINITION_PREFIX,
+    PATH_ALIGNMENT_DEFINITION_SAMPLE_STATUS,
+    PATH_ALIGNMENT_DEFINITION_STATUS,
     PATH_ALIGNMENT_DOGET,
     PATH_ALIGNMENT_PREFIX,
 )
 from qiita_common.auth_constants import Scope
 from qiita_common.models import (
     AlignmentCohortDoGetTicketRequest,
-    AlignmentDefinitionDeleteResponse,
+    AlignmentDefinition,
+    AlignmentDefinitionStatus,
+    AlignmentDefinitionStatusUpdate,
     AlignmentDoGetTicketRequest,
+    AlignmentPlanAbandonResponse,
+    AlignmentSampleStatusUpdate,
+    AlignmentSampleStatusUpdateResponse,
     DoGetTicketResponse,
 )
 
-from ..actions.library import delete_alignment_data
+from ..actions.align_abandon import AlignmentNotFound, AlignPlanInFlight, abandon_align_plan
 from ..auth.guards import (
     require_complete_profile,
+    require_human,
     require_scope,
     require_service_with_scope,
 )
 from ..auth.principal import HumanUser, Principal, ServiceAccount
 from ..auth.tickets import sign_ticket
-from ..deps import get_data_plane_url, get_db_pool, get_flight_signing_key
+from ..deps import (
+    TxConnFactory,
+    get_data_plane_url,
+    get_db_pool,
+    get_flight_signing_key,
+    get_tx_conn_factory,
+)
 from ..feature_table import parse_feature_table_denovo, parse_feature_table_scope
-from ._helpers import ALIGNMENT_NOT_FOUND_DETAIL, authorize_completed_alignment_cohort
+from ..repositories.alignment_definition import (
+    AlignmentDefinitionNotFound,
+    alignment_definition_exists,
+    fetch_alignment_definition_by_idx,
+    set_alignment_sample_states,
+    transition_alignment_definition_status,
+)
+from ..repositories.block import list_incomplete_alignment_samples
+from ._helpers import ALIGNMENT_NOT_FOUND_DETAIL, authorize_completed_alignment_cohort, first_few
 
 # The DuckLake relation this route signs DoGet tickets for: the exclusion-aware
 # VIEW (`alignment` ANTI JOIN the resolved blocklist), never the raw base table —
@@ -62,74 +83,167 @@ alignment_definition_router = APIRouter(
 )
 
 # Distinct from alignment_definition_router (the /alignment-definition identity
-# CRUD): this serves the /alignment Flight DoGet-ticket surface for the alignment
-# sink, mirroring how read_masked.py holds its doget router beside mask-definition.
+# lifecycle): this serves the /alignment Flight DoGet-ticket surface for the
+# alignment sink, mirroring how read_masked.py holds its doget router beside
+# mask-definition.
 alignment_router = APIRouter(prefix=PATH_ALIGNMENT_PREFIX, tags=["alignment"])
 
 
-@alignment_definition_router.delete(PATH_ALIGNMENT_DEFINITION_BY_IDX)
-async def delete_alignment_definition_route(
+def _alignment_record_to_response(row: asyncpg.Record) -> AlignmentDefinition:
+    params = row["params"]
+    if isinstance(params, str):
+        params = json.loads(params)
+    return AlignmentDefinition(
+        alignment_idx=row["alignment_idx"],
+        params=params,
+        created_at=row["created_at"],
+        status=row["status"],
+        deprecated_at=row["deprecated_at"],
+        deprecated_by_idx=row["deprecated_by_idx"],
+        deprecation_reason=row["deprecation_reason"],
+        superseded_by=row["superseded_by"],
+    )
+
+
+@alignment_definition_router.patch(PATH_ALIGNMENT_DEFINITION_STATUS)
+async def update_alignment_definition_status_route(
+    alignment_idx: Annotated[int, Field(gt=0)],
+    body: AlignmentDefinitionStatusUpdate,
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    caller: HumanUser = Depends(require_human),
+    _scope: Principal = Depends(require_scope(Scope.ALIGNMENT_DEFINITION_LIFECYCLE)),
+) -> AlignmentDefinition:
+    """Deprecate an alignment CONFIG, or return it to active.
+
+    Deprecating stops the alignment being minted against and makes every consumer
+    refuse it: feature-table submit, both DoGet mints, exported-identifier and
+    exported-processing mints, and the QC verdict. Its rows and its per-sample
+    states are left as they are. A block alignment's identity has no version in it,
+    so the same reference, aligner and mask cannot be aligned again while this row
+    is deprecated; re-aligning means a different config.
+
+    Returning a deprecated alignment to active is refused (409) when the reference
+    it aligned against has been deleted: reference delete purged its rows.
+
+    system_admin only (`alignment_definition:lifecycle`).
+    """
+    if body.status is AlignmentDefinitionStatus.ACTIVE:
+        current = await fetch_alignment_definition_by_idx(pool, alignment_idx)
+        if current is None:
+            raise HTTPException(status_code=404, detail=ALIGNMENT_NOT_FOUND_DETAIL)
+        params = current["params"]
+        if isinstance(params, str):
+            params = json.loads(params)
+        reference_idx = params.get("reference_idx")
+        if reference_idx is not None and not await pool.fetchval(
+            "SELECT 1 FROM qiita.reference WHERE reference_idx = $1", reference_idx
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"alignment {alignment_idx} aligned against reference {reference_idx},"
+                    " which has been deleted along with this alignment's rows; it cannot"
+                    " be returned to active"
+                ),
+            )
+    try:
+        row = await transition_alignment_definition_status(
+            pool,
+            alignment_idx=alignment_idx,
+            status=body.status,
+            reason=body.reason,
+            superseded_by=body.superseded_by,
+            principal_idx=caller.principal_idx,
+        )
+    except AlignmentDefinitionNotFound:
+        raise HTTPException(status_code=404, detail=ALIGNMENT_NOT_FOUND_DETAIL)
+    except asyncpg.ForeignKeyViolationError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=f"superseded_by names no alignment_definition: {body.superseded_by}",
+        ) from exc
+    except asyncpg.CheckViolationError as exc:
+        # Reachable for superseded_by = alignment_idx, which the wire model cannot
+        # see (it does not know the path parameter).
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return _alignment_record_to_response(row)
+
+
+@alignment_definition_router.patch(PATH_ALIGNMENT_DEFINITION_SAMPLE_STATUS)
+async def update_alignment_sample_status_route(
+    alignment_idx: Annotated[int, Field(gt=0)],
+    body: AlignmentSampleStatusUpdate,
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    tx: TxConnFactory = Depends(get_tx_conn_factory),
+    caller: HumanUser = Depends(require_human),
+    _scope: Principal = Depends(require_scope(Scope.ALIGNMENT_DEFINITION_LIFECYCLE)),
+) -> AlignmentSampleStatusUpdateResponse:
+    """Withdraw (or restore) specific RUNS of one alignment.
+
+    An invalidated `(alignment, sample)` stops being consumable at once: every
+    alignment consumer proceeds only on `'completed'`. Bulk and idempotent; the
+    response separates what changed, what already held the state, what has no gate
+    row under this alignment, and what is still `'pending'` (left alone — a failed
+    plan's pending rows are the abandon-plan route's to clear).
+
+    system_admin only (`alignment_definition:lifecycle`).
+    """
+    if not await alignment_definition_exists(pool, alignment_idx):
+        raise HTTPException(status_code=404, detail=ALIGNMENT_NOT_FOUND_DETAIL)
+    async with tx() as conn:
+        outcome = await set_alignment_sample_states(
+            conn,
+            alignment_idx=alignment_idx,
+            prep_sample_idxs=body.prep_sample_idx,
+            state=body.state,
+            reason=body.reason,
+            principal_idx=caller.principal_idx,
+        )
+    return AlignmentSampleStatusUpdateResponse(
+        alignment_idx=alignment_idx, state=body.state, **outcome
+    )
+
+
+@alignment_definition_router.post(PATH_ALIGNMENT_DEFINITION_ABANDON_PLAN)
+async def abandon_alignment_plan_route(
     alignment_idx: Annotated[int, Field(gt=0)],
     pool: asyncpg.Pool = Depends(get_db_pool),
     signing_key: bytes = Depends(get_flight_signing_key),
     data_plane_url: str = Depends(get_data_plane_url),
-    _scope: Principal = Depends(require_scope(Scope.ALIGNMENT_DEFINITION_DELETE)),
-) -> AlignmentDefinitionDeleteResponse:
-    """Fully purge an alignment — its DuckLake `alignment` rows then its Postgres
-    `alignment_definition` row. system_admin only (`alignment_definition:delete`).
+    _caller: HumanUser = Depends(require_human),
+    _scope: Principal = Depends(require_scope(Scope.ALIGNMENT_DEFINITION_LIFECYCLE)),
+) -> AlignmentPlanAbandonResponse:
+    """Give up on an align plan's unfinished blocks and clear the pending gates
+    they covered, so `only_missing=true` re-plans those samples under the same
+    alignment. Completed and invalidated samples are not touched.
 
-    This is the disallow-without-delete escape hatch: the align planner refuses to
-    re-plan any sample already carrying an `alignment_sample` gate for its resolved
-    alignment, so re-aligning a config requires purging it first. Deleting the
-    `alignment_definition` row CASCADE-deletes its `alignment_sample` gate rows (so
-    a fresh align plan re-creates them PENDING) and detaches any referencing
-    `work_ticket` via the `work_ticket.alignment_idx` `ON DELETE SET NULL` FK.
+    `actions/align_abandon.py` documents the steps. 409 while a released block
+    ticket is still running; 502 if the DuckLake purge fails, in which case nothing
+    changed. Idempotent: a second call finds nothing unfinished and returns empty
+    lists.
 
-    Order of operations: existence check first (404 if
-    absent) → DuckLake delete (one all-or-nothing transaction; a 502 on failure
-    removes nothing yet) → Postgres `alignment_definition` delete last. This makes
-    it *retriable*: both mutating steps are idempotent and the row a retry keys off
-    is removed last, so a crash between them leaves at worst a recoverable
-    orphan-Postgres row, never an unrecoverable orphan-lake.
-
-    Unlike reference-delete, this route does not gate on in-flight align block
-    tickets. It is an admin-only primitive; the `work_ticket.alignment_idx` FK
-    (`ON DELETE SET NULL`) detaches any referencing ticket. So an operator who
-    DELETEs while a covering block is still PROCESSING can strand that block: on
-    completion its `register-files` writes rows under the now-deleted
-    `alignment_idx` (an orphan) and `reconcile-alignment-block` then RuntimeErrors
-    on the cascade-deleted `alignment_sample` gate, FAILing the ticket. The
-    disallow-without-delete rule directs re-aligns here, so the operator's
-    responsibility is to purge only an alignment whose blocks are all terminal."""
-    # Existence check (a read; safe before the lake delete).
-    exists = await pool.fetchval(
-        "SELECT 1 FROM qiita.alignment_definition WHERE alignment_idx = $1", alignment_idx
-    )
-    if exists is None:
-        raise HTTPException(status_code=404, detail=ALIGNMENT_NOT_FOUND_DETAIL)
-
-    # DuckLake alignment rows (idempotent, atomic delete-by-alignment_idx in the
-    # data plane). Lake-first so a crash before the Postgres delete leaves a
-    # recoverable orphan-Postgres row, not an unrecoverable orphan-lake.
+    system_admin only (`alignment_definition:lifecycle`).
+    """
     try:
-        rows_deleted = await delete_alignment_data(
+        outcome = await abandon_align_plan(
+            pool,
             alignment_idx=alignment_idx,
             signing_key=signing_key,
             data_plane_url=data_plane_url,
         )
+    except AlignmentNotFound:
+        raise HTTPException(status_code=404, detail=ALIGNMENT_NOT_FOUND_DETAIL)
+    except AlignPlanInFlight as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"reason": str(exc), "work_ticket_idx": exc.work_ticket_idxs},
+        ) from exc
     except _flight.FlightError as exc:
         raise HTTPException(
             status_code=502,
-            detail=f"data plane alignment delete failed; nothing removed yet: {exc}",
+            detail=f"data plane alignment purge failed; nothing changed: {exc}",
         ) from exc
-
-    # Postgres row last. The alignment_sample gate CASCADEs and the work_ticket FK
-    # is ON DELETE SET NULL, so referencing rows detach automatically.
-    await pool.execute(
-        "DELETE FROM qiita.alignment_definition WHERE alignment_idx = $1", alignment_idx
-    )
-
-    return AlignmentDefinitionDeleteResponse(alignment_idx=alignment_idx, rows_deleted=rows_deleted)
+    return AlignmentPlanAbandonResponse(**outcome)
 
 
 @alignment_router.post(PATH_ALIGNMENT_DOGET, status_code=201)
@@ -166,25 +280,11 @@ async def create_alignment_doget_ticket(
     into both arms and reconcile it against itself, which removes every read from
     the reference side and returns a de-novo-only table under the combined name.
 
-    Cohort completeness is NOT re-checked here. That every ``prep_sample_idx`` is a
-    member of this alignment and its ``qiita.alignment_sample`` gate is
-    ``'completed'`` is validated at SUBMIT time by the feature-table runner
-    resolver (``runner/_feature_table.py``), which fails the submission before any
-    compute runs. ``alignment_sample`` state is monotonic (pending→completed), so a
-    cohort validated at submit stays valid at this runtime mint call, and the
-    resolver runs unconditionally for this workflow before the job calls this
-    route — so this route trusts the validated ``action_context`` cohort rather
-    than re-querying the gate.
-
-    One residual race the monotonicity argument does NOT cover: a concurrent
-    ``DELETE /alignment-definition/{idx}`` landing between submit and this mint
-    cascade-deletes the ``alignment_sample`` gate and purges the DuckLake
-    ``alignment`` rows, so the ticket signed here then streams an empty slice and the
-    job produces a valid 0-row OGU table (compute-on-demand — an empty result is
-    legitimate), not an error. This is accepted rather than re-checked: DELETE is an
-    admin-only sharp primitive whose own route documents this class of edge
-    (disallow-without-delete directs re-aligns there), and a re-check here would
-    still race a DELETE that lands immediately after it.
+    Cohort completeness is validated at SUBMIT time by the feature-table runner
+    resolver (``runner/_feature_table.py``) and checked again here (409), because
+    the alignment can be deprecated, or a sample invalidated, between submit and
+    this runtime mint. A withdrawal landing after this check is not seen by a ticket
+    already signed.
 
     Authorization is scope-only at this layer (matching the reference/read_masked
     doget routes): any service account holding ``ticket:doget`` can request a
@@ -220,6 +320,12 @@ async def create_alignment_doget_ticket(
                 ),
             )
         alignment_idx = denovo_alignment_idx
+    await _refuse_withdrawn_since_submit(
+        pool,
+        work_ticket_idx=body.work_ticket_idx,
+        alignment_idx=alignment_idx,
+        prep_sample_idx=prep_sample_idx,
+    )
     return _sign_alignment_ticket(
         alignment_idx=alignment_idx,
         prep_sample_idx=prep_sample_idx,
@@ -275,6 +381,34 @@ async def create_alignment_cohort_doget_ticket(
         columns=body.columns,
         signing_key=signing_key,
     )
+
+
+async def _refuse_withdrawn_since_submit(
+    pool: asyncpg.Pool, *, work_ticket_idx: int, alignment_idx: int, prep_sample_idx: list[int]
+) -> None:
+    """409 when the alignment the ticket was validated against at submit has since
+    been deprecated, or any of its cohort is no longer 'completed'."""
+    row = await fetch_alignment_definition_by_idx(pool, alignment_idx)
+    if row is None:
+        raise HTTPException(status_code=404, detail=ALIGNMENT_NOT_FOUND_DETAIL)
+    if row["status"] == AlignmentDefinitionStatus.DEPRECATED.value:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"alignment {alignment_idx} was deprecated after work ticket"
+                f" {work_ticket_idx} was submitted: {row['deprecation_reason']}"
+            ),
+        )
+    incomplete = await list_incomplete_alignment_samples(pool, alignment_idx, prep_sample_idx)
+    if incomplete:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"{len(incomplete)} prep_sample(s) of work ticket {work_ticket_idx} are no"
+                f" longer completed for alignment {alignment_idx} (e.g."
+                f" {first_few(incomplete)})"
+            ),
+        )
 
 
 def _sign_alignment_ticket(

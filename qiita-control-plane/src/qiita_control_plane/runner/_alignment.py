@@ -25,11 +25,18 @@ from qiita_common.actions import (
     context_schema_default,
 )
 from qiita_common.analytic import MAX_SECONDARY
-from qiita_common.api_paths import URL_PROCESSING_SAMPLE_STATUS, LibraryPrimitive
+from qiita_common.api_paths import (
+    URL_ALIGNMENT_DEFINITION_SAMPLE_STATUS,
+    URL_PROCESSING_SAMPLE_STATUS,
+    LibraryPrimitive,
+)
 from qiita_common.backend_failure import StepNoData
+from qiita_common.models import AlignmentDefinitionStatus
 
 from ..feature_table import SUBJECT_ASSEMBLY
 from ..repositories.alignment_definition import (
+    ALIGNMENT_SAMPLE_INVALIDATED,
+    AlignmentDefinitionDeprecated,
     ParamsDoNotSurviveStorageError,
     fetch_alignment_definition_by_idx,
     mint_alignment_definition,
@@ -196,8 +203,25 @@ async def _create_alignment_gate_pending(
     Run immediately after the mint, which is the earliest point the row's key exists.
     Idempotent, and it never resurrects a row an earlier run flipped to 'completed'
     (`create_alignment_sample_pending`'s ON CONFLICT DO NOTHING).
+
+    Refuses a row an earlier run's withdrawal set 'invalidated', before any step
+    runs: the workflow's first tail step deletes this sample's alignment rows, which
+    would destroy the output the withdrawal was a judgement about, and its terminal
+    step could not complete the row anyway (`AlignmentSampleInvalidated`).
     """
     async with pool.acquire() as conn, conn.transaction():
+        state = await conn.fetchval(
+            "SELECT state FROM qiita.alignment_sample"
+            " WHERE alignment_idx = $1 AND prep_sample_idx = $2 FOR UPDATE",
+            alignment_idx,
+            prep_sample_idx,
+        )
+        if state == ALIGNMENT_SAMPLE_INVALIDATED:
+            raise _submission_bad_input(
+                f"prep_sample {prep_sample_idx}'s run under alignment {alignment_idx} was "
+                "invalidated; it is not re-run under the same config. Restore it via PATCH "
+                f"{URL_ALIGNMENT_DEFINITION_SAMPLE_STATUS} if the output is trusted"
+            )
         await create_alignment_sample_pending(
             conn, alignment_idx=alignment_idx, prep_sample_idxs=[prep_sample_idx]
         )
@@ -317,9 +341,9 @@ async def _resolve_denovo_alignment_idx(
     prevent.
 
     So the knobs are read back from the STORED params rather than re-resolved, and the
-    job runs the configuration the identity actually names. A ticket whose definition
-    was deleted mid-flight does not reach this branch: the FK is ON DELETE SET NULL, so
-    the column is NULL and the mint below runs.
+    job runs the configuration the identity actually names. Both branches refuse a
+    deprecated alignment: the mint by `AlignmentDefinitionDeprecated`, the re-attach by
+    reading the stored status, since it never calls the mint.
 
     Like the other pre-loop resolvers, any failure raises a SUBMISSION-attributed
     BAD_INPUT the outer handler turns into a FAILED ticket.
@@ -330,14 +354,19 @@ async def _resolve_denovo_alignment_idx(
     )
     if existing is not None:
         row = await fetch_alignment_definition_by_idx(pool, existing)
+        if row["status"] == AlignmentDefinitionStatus.DEPRECATED.value:
+            raise _submission_bad_input(
+                f"alignment definition {existing} on this ticket is deprecated: "
+                f"{row['deprecation_reason']}"
+            )
         stored = json.loads(row["params"])
         absent = sorted(key for key in _KNOB_BINDINGS if key not in stored)
         if absent:
             raise _submission_bad_input(
                 f"alignment definition {existing} on this ticket was minted under an "
                 f"older params shape: {absent} are missing from its stored config, so "
-                "the run this ticket resumes cannot be reconstructed. Delete the "
-                "definition and resubmit"
+                "the run this ticket resumes cannot be reconstructed. Submit a new "
+                "ticket, which mints the current params shape"
             )
         return {
             ALIGNMENT_IDX_BINDING: existing,
@@ -354,6 +383,8 @@ async def _resolve_denovo_alignment_idx(
             )
     except ParamsDoNotSurviveStorageError as exc:
         raise _submission_bad_input(str(exc)) from exc
+    except AlignmentDefinitionDeprecated as exc:
+        raise _submission_bad_input(exc.detail) from exc
     except asyncpg.ForeignKeyViolationError as exc:
         raise _submission_bad_input(
             f"could not mint the de novo alignment definition: originator principal "

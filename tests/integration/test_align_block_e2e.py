@@ -654,3 +654,42 @@ async def test_delete_alignment_sample_round_trips_the_signed_action(data_plane)
         )
         == 0
     )
+
+
+async def test_abandon_purge_payload_deletes_a_split_sample_across_blocks(data_plane):
+    """abandon-plan purges a re-planned sample's rows across every block that
+    covered it, so one `delete_alignment_block` payload carries the same
+    prep_sample_idx more than once (one member per covering block). The block
+    replace step never sends that shape, so this pins that the data plane accepts it
+    and deletes exactly the union: both halves of the split sample go, and a
+    neighbouring sample under the same alignment stays."""
+    from qiita_control_plane.actions.library import delete_alignment_block_data
+
+    alignment_idx = 981_300
+    split, kept = 981_400, 981_401
+    conn = ducklake_connect(data_plane["data_path"])
+    try:
+        conn.execute(
+            "INSERT INTO qiita_lake.alignment"
+            " (alignment_idx, prep_sample_idx, sequence_idx, feature_idx)"
+            " VALUES (?, ?, 1, 10), (?, ?, 2, 10), (?, ?, 3, 10), (?, ?, 4, 10),"
+            "        (?, ?, 1, 10)",
+            [alignment_idx, split] * 4 + [alignment_idx, kept],
+        )
+    finally:
+        conn.close()
+
+    deleted = await delete_alignment_block_data(
+        alignment_idx=alignment_idx,
+        members=[
+            {"prep_sample_idx": split, "sequence_idx_start": 1, "sequence_idx_stop": 2},
+            {"prep_sample_idx": split, "sequence_idx_start": 3, "sequence_idx_stop": 4},
+        ],
+        signing_key=data_plane["secret"],
+        data_plane_url=_data_plane_url(data_plane),
+    )
+    assert deleted == 4
+    assert (
+        _count_alignment_rows(data_plane, alignment_idx=alignment_idx, prep_sample_idx=split) == 0
+    )
+    assert _count_alignment_rows(data_plane, alignment_idx=alignment_idx, prep_sample_idx=kept) == 1

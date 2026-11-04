@@ -46,6 +46,7 @@ from qiita_common.assembly_constants import (
     BIN_QUALITY_SUBJECT_KEY,
     BIN_QUALITY_TABLE,
 )
+from qiita_common.models import AlignmentDefinitionStatus
 from qiita_common.parquet import PARQUET_OPTS_INTERMEDIATE, validate_parquet_path
 
 from ..actions.library import export_assembly_member_genome, export_member_genome
@@ -130,6 +131,7 @@ async def _validate_denovo_arm(
     row = await fetch_alignment_definition_by_idx(pool, denovo_alignment_idx)
     if row is None:
         raise _submission_bad_input(f"alignment {denovo_alignment_idx} not found")
+    _refuse_deprecated_alignment(row)
     params = row["params"]
     if isinstance(params, str):
         params = json.loads(params)
@@ -150,6 +152,15 @@ async def _validate_denovo_arm(
         prep_sample_idx=prep_sample_idx,
     )
     return processing_idx
+
+
+def _refuse_deprecated_alignment(row: asyncpg.Record) -> None:
+    """Refuse a deprecated alignment as either arm. An invalidated sample needs no
+    check of its own: it is not 'completed', so the cohort gate refuses it."""
+    if row["status"] == AlignmentDefinitionStatus.DEPRECATED.value:
+        raise _submission_bad_input(
+            f"alignment {row['alignment_idx']} is deprecated: {row['deprecation_reason']}"
+        )
 
 
 async def _refuse_deprecated_assembly(pool: asyncpg.Pool, *, processing_idx: int) -> None:
@@ -481,6 +492,7 @@ async def _resolve_feature_table_bindings(
     row = await fetch_alignment_definition_by_idx(pool, alignment_idx)
     if row is None:
         raise _submission_bad_input(f"alignment {alignment_idx} not found")
+    _refuse_deprecated_alignment(row)
     params = row["params"]
     if isinstance(params, str):
         params = json.loads(params)

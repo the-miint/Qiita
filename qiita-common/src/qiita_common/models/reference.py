@@ -395,6 +395,9 @@ class ReferenceDeleteResponse(BaseModel):
     work_ticket_deleted: int
     orphan_feature_count: int
     artifacts_removed: bool
+    # DuckLake `alignment` rows purged from deprecated alignments against this
+    # reference; their alignment_definition rows are kept.
+    alignment_rows_deleted: int = 0
 
 
 # `genome_source` / `genome_source_id` and the `genome_fields_consistent`

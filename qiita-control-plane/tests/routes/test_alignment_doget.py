@@ -120,6 +120,47 @@ async def ctx(postgres_pool, regular_user_session, compute_worker_service_accoun
 
 
 @pytest_asyncio.fixture
+async def aligned(postgres_pool, regular_user_session):
+    """A real alignment with three prep_samples whose gates are 'completed' — what
+    the route re-checks before signing."""
+    from qiita_control_plane.repositories.alignment_definition import mint_alignment_definition
+    from qiita_control_plane.testing.db_seeds import seed_biosample_with_sequenced_prep_sample
+    from qiita_control_plane.testing.db_teardown import teardown_entity_graph
+
+    owner = regular_user_session["principal_idx"]
+    seeded = [
+        await seed_biosample_with_sequenced_prep_sample(postgres_pool, owner_idx=owner)
+        for _ in range(3)
+    ]
+    samples = [p for _b, p in seeded]
+    async with postgres_pool.acquire() as conn:
+        row = await mint_alignment_definition(
+            conn,
+            params={"reference_idx": 1, "aligner": "bowtie2", "s": secrets.token_hex(4)},
+            principal_idx=owner,
+        )
+    alignment_idx = row["alignment_idx"]
+    await postgres_pool.executemany(
+        "INSERT INTO qiita.alignment_sample (alignment_idx, prep_sample_idx, state)"
+        " VALUES ($1, $2, 'completed')",
+        [(alignment_idx, p) for p in samples],
+    )
+    yield {"alignment_idx": alignment_idx, "samples": samples, "owner": owner}
+    await postgres_pool.execute(
+        "DELETE FROM qiita.alignment_sample WHERE alignment_idx = $1", alignment_idx
+    )
+    await postgres_pool.execute(
+        "DELETE FROM qiita.alignment_definition WHERE alignment_idx = $1", alignment_idx
+    )
+    await teardown_entity_graph(
+        postgres_pool,
+        study_idxs=[],
+        biosample_idxs=[b for b, _p in seeded],
+        prep_sample_idxs=samples,
+    )
+
+
+@pytest_asyncio.fixture
 async def sa_no_scope_client(postgres_pool, compute_worker_service_account):
     """An SA token carrying a scope that is NOT tickets:doget, to exercise the
     require_scope 403 path."""
@@ -183,9 +224,9 @@ async def test_doget_sa_without_scope_403(ctx, sa_no_scope_client):
 # ---------------------------------------------------------------------------
 
 
-async def test_doget_sa_signs_scoped_filter(ctx):
+async def test_doget_sa_signs_scoped_filter(ctx, aligned):
     wt_idx, *rest = await _seed_feature_table_ticket(
-        ctx["pool"], alignment_idx=777, prep_sample_idx=[11, 12, 13]
+        ctx["pool"], alignment_idx=aligned["alignment_idx"], prep_sample_idx=aligned["samples"]
     )
     try:
         resp = await ctx["sa"].post(
@@ -196,8 +237,8 @@ async def test_doget_sa_signs_scoped_filter(ctx):
         payload = _decode_ticket_payload(resp.json()["ticket"])
         assert payload["table"] == "alignment_visible"
         assert payload["filter"] == {
-            "alignment_idx": [777],
-            "prep_sample_idx": [11, 12, 13],
+            "alignment_idx": [aligned["alignment_idx"]],
+            "prep_sample_idx": aligned["samples"],
         }
     finally:
         await _cleanup_ticket(ctx["pool"], wt_idx, *rest)
@@ -308,14 +349,14 @@ async def test_doget_alignment_not_signable_via_reference_route():
 # ---------------------------------------------------------------------------
 
 
-async def test_doget_signs_the_requested_columns(ctx):
+async def test_doget_signs_the_requested_columns(ctx, aligned):
     """The consumer names its columns; the route validates and signs them.
 
     Includes `cigar`, the column the whole mechanism exists for: it must be
     askable without being paid for by default.
     """
     wt_idx, *rest = await _seed_feature_table_ticket(
-        ctx["pool"], alignment_idx=778, prep_sample_idx=[11]
+        ctx["pool"], alignment_idx=aligned["alignment_idx"], prep_sample_idx=aligned["samples"][:1]
     )
     try:
         resp = await ctx["sa"].post(
@@ -329,7 +370,7 @@ async def test_doget_signs_the_requested_columns(ctx):
         await _cleanup_ticket(ctx["pool"], wt_idx, *rest)
 
 
-async def test_doget_without_columns_is_refused_at_mint(ctx):
+async def test_doget_without_columns_is_refused_at_mint(ctx, aligned):
     """Omitting the list on a projectable table is a 422, not a signed ticket.
 
     The data plane requires the list for this table, so a ticket signed without
@@ -338,7 +379,7 @@ async def test_doget_without_columns_is_refused_at_mint(ctx):
     signing boundary so the caller learns here.
     """
     wt_idx, *rest = await _seed_feature_table_ticket(
-        ctx["pool"], alignment_idx=779, prep_sample_idx=[11]
+        ctx["pool"], alignment_idx=aligned["alignment_idx"], prep_sample_idx=aligned["samples"][:1]
     )
     try:
         resp = await ctx["sa"].post(URL_ALIGNMENT_DOGET, json={"work_ticket_idx": wt_idx})
@@ -357,7 +398,7 @@ async def test_doget_without_columns_is_refused_at_mint(ctx):
         pytest.param([], id="empty"),
     ],
 )
-async def test_doget_bad_column_list_422(ctx, columns):
+async def test_doget_bad_column_list_422(ctx, aligned, columns):
     """A bad projection is refused at mint and never signed.
 
     The empty case is the one that could not be caught downstream: on the wire
@@ -365,12 +406,62 @@ async def test_doget_bad_column_list_422(ctx, columns):
     last place it can be told apart from "no opinion".
     """
     wt_idx, *rest = await _seed_feature_table_ticket(
-        ctx["pool"], alignment_idx=780, prep_sample_idx=[11]
+        ctx["pool"], alignment_idx=aligned["alignment_idx"], prep_sample_idx=aligned["samples"][:1]
     )
     try:
         resp = await ctx["sa"].post(
             URL_ALIGNMENT_DOGET, json={"work_ticket_idx": wt_idx, "columns": columns}
         )
         assert resp.status_code == 422, resp.text
+    finally:
+        await _cleanup_ticket(ctx["pool"], wt_idx, *rest)
+
+
+# ---------------------------------------------------------------------------
+# Withdrawn since submit
+# ---------------------------------------------------------------------------
+
+
+async def test_doget_refuses_a_cohort_invalidated_since_submit(ctx, aligned):
+    """Submit validated a completed cohort; a sample invalidated afterwards is
+    refused here rather than streamed."""
+    wt_idx, *rest = await _seed_feature_table_ticket(
+        ctx["pool"], alignment_idx=aligned["alignment_idx"], prep_sample_idx=aligned["samples"]
+    )
+    await ctx["pool"].execute(
+        "UPDATE qiita.alignment_sample SET state = 'invalidated', invalidated_at = now(),"
+        "       invalidated_by_idx = $3, invalidation_reason = 'bad run'"
+        " WHERE alignment_idx = $1 AND prep_sample_idx = $2",
+        aligned["alignment_idx"],
+        aligned["samples"][1],
+        aligned["owner"],
+    )
+    try:
+        resp = await ctx["sa"].post(
+            URL_ALIGNMENT_DOGET, json={"work_ticket_idx": wt_idx, "columns": ["feature_idx"]}
+        )
+        assert resp.status_code == 409, resp.text
+        assert str(aligned["samples"][1]) in resp.json()["detail"]
+    finally:
+        await _cleanup_ticket(ctx["pool"], wt_idx, *rest)
+
+
+async def test_doget_refuses_an_alignment_deprecated_since_submit(ctx, aligned):
+    wt_idx, *rest = await _seed_feature_table_ticket(
+        ctx["pool"], alignment_idx=aligned["alignment_idx"], prep_sample_idx=aligned["samples"]
+    )
+    await ctx["pool"].execute(
+        "UPDATE qiita.alignment_definition SET status = 'deprecated', deprecated_at = now(),"
+        "       deprecated_by_idx = $2, deprecation_reason = 'bad build'"
+        " WHERE alignment_idx = $1",
+        aligned["alignment_idx"],
+        aligned["owner"],
+    )
+    try:
+        resp = await ctx["sa"].post(
+            URL_ALIGNMENT_DOGET, json={"work_ticket_idx": wt_idx, "columns": ["feature_idx"]}
+        )
+        assert resp.status_code == 409, resp.text
+        assert "bad build" in resp.json()["detail"]
     finally:
         await _cleanup_ticket(ctx["pool"], wt_idx, *rest)

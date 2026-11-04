@@ -1241,14 +1241,15 @@ async def submit_align_plan(
         # Reference exists but is not ACTIVE + sharded — the operator must build /
         # shard it (or wait for it to go active) before aligning against it.
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    except align_planner.AlignDefinitionDeprecated as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     except align_planner.AlignResubmitError as exc:
-        # A sample already gated for the resolved alignment would be re-aligned
-        # (completed → alignment double-write) or wedged (pending → duplicate
-        # covering block). DELETE the alignment or pass only_missing.
+        # The exception's message carries the way out for each gate state.
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail={
                 "reason": str(exc),
+                "alignment_idx": exc.alignment_idx,
                 "conflicting_prep_sample_idxs": exc.conflicting_prep_sample_idxs,
             },
         ) from exc
