@@ -34,7 +34,7 @@ import pyarrow as pa
 import pyarrow.flight as _flight
 import pyarrow.parquet as pq
 from pydantic import TypeAdapter
-from qiita_common.api_paths import LibraryPrimitive
+from qiita_common.api_paths import URL_ALIGNMENT_DEFINITION_ABANDON_PLAN, LibraryPrimitive
 from qiita_common.assembly_constants import (
     CONTIG_ATTRIBUTE_REPRESENTATIVE_SQL,
     CONTIG_ATTRIBUTES_FILE,
@@ -68,6 +68,10 @@ from ..auth.tickets import run_signed_flight_call, sign_action, sign_ticket
 from ..miint import arrow_batches, duckdb_connect, run_on_connection
 from ..problem_list import capped
 from ..repositories import require_transaction
+from ..repositories.alignment_definition import (
+    ALIGNMENT_SAMPLE_COMPLETED,
+    ALIGNMENT_SAMPLE_INVALIDATED,
+)
 from ..repositories.assembly import (
     ASSEMBLY_GENOME_MAP_PAIRS_SQL,
     ASSEMBLY_GENOME_MAP_ROWS_SQL,
@@ -77,8 +81,10 @@ from ..repositories.assembly import (
     upsert_assembly_sample_completed,
 )
 from ..repositories.block import (
+    BLOCK_ABANDONED,
     MASK_SAMPLE_COMPLETED,
     MASK_SAMPLE_INVALIDATED,
+    AlignmentSampleInvalidated,
     MaskSampleInvalidated,
     fetch_block_members,
     finalize_alignment_sample,
@@ -2847,7 +2853,7 @@ async def delete_alignment_sample_data(
 
     Signs an action token carrying that pair and nothing else — the data plane's
     payload rejects any extra field. What the pair selects, and why it rather than
-    the block or the whole alignment, is on the Rust `delete_alignment_sample`.
+    the block, is on the Rust `delete_alignment_sample`.
     Idempotent: a fresh sample (no rows yet) deletes 0 and still succeeds. Raises
     pyarrow.flight.FlightError on transport / data-plane failure."""
     results = await run_signed_flight_call(
@@ -2857,35 +2863,6 @@ async def delete_alignment_sample_data(
             secret=signing_key,
         ),
         lambda token: _do_action("delete_alignment_sample", data_plane_url, token),
-    )
-    if not results:
-        return 0
-    return json.loads(results[0].body.to_pybytes()).get("rows_deleted", 0)
-
-
-async def delete_alignment_data(
-    *,
-    alignment_idx: int,
-    signing_key: bytes,
-    data_plane_url: str,
-) -> int:
-    """Delete an alignment's DuckLake `alignment` rows via the data plane's
-    `delete_alignment` DoAction, returning the rows-deleted count. The
-    whole-alignment purge the disallow-without-delete resubmission rule needs.
-
-    Signs a `delete_alignment` action token carrying only `alignment_idx`. The
-    delete is a logical `DELETE FROM alignment WHERE alignment_idx = ?` inside one
-    DuckLake transaction — no parquet is reclaimed from disk (mirrors
-    `delete_reference`). Idempotent: an alignment whose rows never registered (or were
-    already deleted) deletes zero rows and still succeeds. Raises
-    pyarrow.flight.FlightError on transport / data-plane failure."""
-    results = await run_signed_flight_call(
-        lambda: sign_action(
-            action="delete_alignment",
-            payload={"alignment_idx": alignment_idx},
-            secret=signing_key,
-        ),
-        lambda token: _do_action("delete_alignment", data_plane_url, token),
     )
     if not results:
         return 0
@@ -3324,6 +3301,19 @@ async def finalize_alignment_sample_gate(
     return {"alignment_idx": alignment_idx, "prep_sample_idx": prep_sample_idx}
 
 
+async def _refuse_abandoned_block(pool_or_conn: asyncpg.Pool | asyncpg.Connection, block_idx: int):
+    """Raise when abandon-plan has given up on this block. Its ticket's /run is
+    refused too (routes/work_ticket.py); this is the check at the steps that write."""
+    state = await pool_or_conn.fetchval(
+        "SELECT state FROM qiita.block WHERE block_idx = $1", block_idx
+    )
+    if state == BLOCK_ABANDONED:
+        raise RuntimeError(
+            f"block {block_idx} was abandoned ({URL_ALIGNMENT_DEFINITION_ABANDON_PLAN});"
+            " its prep_samples are re-planned under new blocks, so it must not write"
+        )
+
+
 async def delete_alignment_block(
     pool: asyncpg.Pool,
     *,
@@ -3350,7 +3340,12 @@ async def delete_alignment_block(
     is no reconcile count-assertion for alignment (rows are not 1:1 with reads), but
     the delete-then-register discipline keeps a retried block from accumulating
     duplicate alignment rows. Read-only on Postgres — the delete lands in DuckLake.
-    Returns the rows-deleted count for the workflow log."""
+    Returns the rows-deleted count for the workflow log.
+
+    Refuses an 'abandoned' block: abandon-plan purged its footprint and cleared its
+    prep_samples' gates, so a re-plan may already have registered rows over the same
+    ranges, and this delete would remove them."""
+    await _refuse_abandoned_block(pool, block_idx)
     members = [
         {
             "prep_sample_idx": prep_sample_idx,
@@ -3387,8 +3382,7 @@ async def delete_alignment_sample(
     Takes no `pool`: the caller supplies both identifiers, so unlike the block
     twin there is no `block_member` lookup to do. Like it, this touches only
     DuckLake — the Postgres `alignment_sample` gate row is the terminal step's to
-    flip, and clearing a gate is `DELETE /alignment-definition/{idx}` (which
-    CASCADEs it), not a mid-workflow replace.
+    flip, not a mid-workflow replace's.
 
     Returns the rows-deleted count for the workflow log."""
     rows_deleted = await delete_alignment_sample_data(
@@ -3433,6 +3427,7 @@ async def reconcile_alignment_block(
     finalized."""
     finalized: list[int] = []
     async with pool.acquire() as conn, conn.transaction():
+        await _refuse_abandoned_block(conn, block_idx)
         # This block's work is done; count it as completed BEFORE the per-sample
         # gate check below (same txn — the UPDATE is visible to our own SELECTs).
         # We proceed regardless of the guarded bool: a re-run where it is already
@@ -3453,10 +3448,16 @@ async def reconcile_alignment_block(
                     f"prep_sample={prep_sample_idx}); it must be materialized PENDING "
                     "at plan time before any block runs"
                 )
-            if state == "completed":
+            if state == ALIGNMENT_SAMPLE_COMPLETED:
                 # Already finalized (idempotent re-run, or a concurrent block
                 # finalizer won this sample's race) — nothing to do.
                 continue
+            if state == ALIGNMENT_SAMPLE_INVALIDATED:
+                # The pair was withdrawn; the withdrawal stands until someone
+                # restores it.
+                raise AlignmentSampleInvalidated(
+                    alignment_idx=alignment_idx, prep_sample_idx=prep_sample_idx
+                )
             if await has_incomplete_covering_alignment_block(
                 conn, alignment_idx=alignment_idx, prep_sample_idx=prep_sample_idx
             ):

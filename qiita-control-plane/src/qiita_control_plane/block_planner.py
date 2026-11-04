@@ -58,7 +58,7 @@ from .repositories.block import (
     lock_mask_sample_gate_advisory,
     set_block_work_ticket,
 )
-from .repositories.mask_definition import mint_mask_definition
+from .repositories.mask_definition import lock_active_mask, mint_mask_definition
 from .repositories.sequenced_sample import fetch_empty_ingest_tickets
 from .repositories.sequencing_run import fetch_sequencing_run_platform
 from .runner import (
@@ -699,6 +699,10 @@ async def plan_and_submit_blocks(
     block_summaries: list[dict[str, Any]] = []
     partition_summaries: list[dict[str, Any]] = []
     async with pool.acquire() as conn, conn.transaction():
+        # A deprecation landing between the mints above and this transaction would
+        # otherwise see none of the tickets below (`lock_active_mask`).
+        for partition_mask_idx in sorted(partitions):
+            await lock_active_mask(conn, partition_mask_idx)
         # NB1: serialize the cross-path double-mask race. Take a per-sample advisory
         # lock (mask_idx, prep_sample), held to commit, BEFORE the disallow-without-
         # delete check + create_mask_sample_pending below, so that check→write is

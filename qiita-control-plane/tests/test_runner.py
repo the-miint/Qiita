@@ -2788,8 +2788,8 @@ async def test_run_action_primitive_delete_alignment_sample_refuses_null_alignme
     monkeypatch, tmp_path
 ):
     """A ticket whose `alignment_idx` column is NULL has no alignment to scope the
-    delete to — no planner set it, or a mid-flight DELETE /alignment-definition
-    detached it (ON DELETE SET NULL). Refuse rather than fall back to the
+    delete to — no planner set it, or its alignment_definition row was removed
+    mid-flight (ON DELETE SET NULL). Refuse rather than fall back to the
     caller-chosen `action_context` value."""
     from qiita_common.actions import WorkflowAction
     from qiita_common.api_paths import LibraryPrimitive

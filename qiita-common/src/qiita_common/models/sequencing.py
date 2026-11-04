@@ -1285,16 +1285,129 @@ class MaskSampleStatusUpdateResponse(BaseModel):
     skipped_pending: list[int] = []
 
 
-class AlignmentDefinitionDeleteResponse(BaseModel):
-    """Returned by DELETE /api/v1/alignment-definition/{alignment_idx}.
+AlignmentSampleState = Literal["pending", "completed", "invalidated"]
+"""A sample's per-`(alignment_idx, prep_sample)` alignment state.
 
-    `rows_deleted` is the DuckLake `alignment` row count the data plane removed
-    (0 on an idempotent re-run); the Postgres `alignment_definition` row is purged
-    last, cascading the `alignment_sample` gate rows (so a fresh align plan can
-    re-create them) and detaching any referencing `work_ticket` via its
-    `ON DELETE SET NULL` FK. The disallow-without-delete escape hatch."""
+Mirrors the `qiita.alignment_sample.state` TEXT/CHECK column (not a Postgres ENUM,
+so out of the enum-parity test). A consumer proceeds on `'completed'` alone;
+`'invalidated'` is a finished run withdrawn by PATCH
+/alignment-definition/{alignment_idx}/sample-status."""
+
+
+class AlignmentDefinitionStatus(StrEnum):
+    """Lifecycle of an alignment CONFIG (`qiita.alignment_definition.status`).
+
+    Mirrors a TEXT + CHECK column, NOT a Postgres ENUM, so it has no `ENUM_PAIRS`
+    entry. Keep this set and the CHECK in the `alignment_lifecycle` migration in sync
+    by hand.
+
+    `DEPRECATED` voids the configuration: `qiita.mint_alignment_definition` refuses
+    to return the row and every consumer refuses to read it. A block alignment's
+    identity carries no workflow version, so the same reference, aligner and mask
+    resolve to the same deprecated row: re-aligning needs a different config.
+    Deprecation never deletes the alignment rows or the definition.
+    """
+
+    ACTIVE = "active"
+    DEPRECATED = "deprecated"
+
+
+class AlignmentDefinition(BaseModel):
+    """Returned by PATCH /api/v1/alignment-definition/{alignment_idx}/status.
+
+    The provenance fields are set exactly when `status` is DEPRECATED (a CHECK
+    enforces it)."""
 
     alignment_idx: Annotated[int, Field(gt=0)]
+    params: dict[str, Any]
+    created_at: AwareDatetime
+    status: AlignmentDefinitionStatus
+    deprecated_at: AwareDatetime | None = None
+    deprecated_by_idx: Annotated[int | None, Field(default=None, gt=0)] = None
+    deprecation_reason: str | None = None
+    superseded_by: Annotated[int | None, Field(default=None, gt=0)] = None
+
+
+class AlignmentDefinitionStatusUpdate(BaseModel):
+    """Body for PATCH /api/v1/alignment-definition/{alignment_idx}/status.
+
+    Same contract as `MaskDefinitionStatusUpdate`: a reason is required to
+    deprecate, and `superseded_by` is accepted only alongside DEPRECATED."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    status: AlignmentDefinitionStatus
+    reason: Annotated[str | None, Field(default=None, min_length=1, max_length=2000)] = None
+    superseded_by: Annotated[int | None, Field(default=None, gt=0)] = None
+
+    @model_validator(mode="after")
+    def _reason_required_to_deprecate(self) -> AlignmentDefinitionStatusUpdate:
+        deprecating = self.status is AlignmentDefinitionStatus.DEPRECATED
+        check_withdrawal_reason(
+            withdrawing=deprecating,
+            reason=self.reason,
+            field="status",
+            value=AlignmentDefinitionStatus.DEPRECATED.value,
+        )
+        if not deprecating and self.superseded_by is not None:
+            raise ValueError("superseded_by is only accepted when status is 'deprecated'")
+        return self
+
+
+class AlignmentSampleStatusUpdate(BaseModel):
+    """Body for PATCH /api/v1/alignment-definition/{alignment_idx}/sample-status.
+
+    Same contract as `MaskSampleStatusUpdate`: bulk, `state` limited to the two
+    settable values, a reason required to invalidate."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    prep_sample_idx: Annotated[list[Annotated[int, Field(gt=0)]], Field(min_length=1)]
+    state: Literal["completed", "invalidated"]
+    reason: Annotated[str | None, Field(default=None, min_length=1, max_length=2000)] = None
+
+    @model_validator(mode="after")
+    def _reason_required_to_invalidate(self) -> AlignmentSampleStatusUpdate:
+        check_withdrawal_reason(
+            withdrawing=self.state == "invalidated",
+            reason=self.reason,
+            field="state",
+            value="invalidated",
+        )
+        if len(set(self.prep_sample_idx)) != len(self.prep_sample_idx):
+            raise ValueError("prep_sample_idx must not repeat")
+        return self
+
+
+class AlignmentSampleStatusUpdateResponse(BaseModel):
+    """Returned by PATCH /api/v1/alignment-definition/{alignment_idx}/sample-status.
+
+    The four lists mean what they mean on `MaskSampleStatusUpdateResponse`. A
+    `'pending'` row is left alone: the align pipeline flips it, and a failed plan's
+    pending rows are cleared by the abandon-plan route instead."""
+
+    alignment_idx: Annotated[int, Field(gt=0)]
+    state: Literal["completed", "invalidated"]
+    updated: list[int]
+    unchanged: list[int]
+    not_found: list[int]
+    skipped_pending: list[int] = []
+
+
+class AlignmentPlanAbandonResponse(BaseModel):
+    """Returned by POST /api/v1/alignment-definition/{alignment_idx}/abandon-plan.
+
+    `abandoned_block_idx` are the blocks set 'abandoned' by this call;
+    `cancelled_work_ticket_idx` the held tickets of those blocks that were never
+    released and are now 'cancelled'; `cleared_prep_sample_idx` the prep_samples whose
+    pending gate was removed, which `only_missing=true` will now re-plan;
+    `rows_deleted` the DuckLake `alignment` rows purged from those prep_samples. All
+    empty and 0 when nothing was unfinished."""
+
+    alignment_idx: Annotated[int, Field(gt=0)]
+    abandoned_block_idx: list[int]
+    cancelled_work_ticket_idx: list[int]
+    cleared_prep_sample_idx: list[int]
     rows_deleted: int
 
 
@@ -1318,6 +1431,10 @@ class PoolAlignmentSummary(BaseModel):
     from `params` is only as trustworthy as the round trip that delivered them, and a
     published manifest cites this digest as the reproducibility key. A client that
     copied a hash it never checked would be publishing a claim it cannot support.
+
+    A deprecated alignment is still listed, with its `status` and the reason: the
+    record of what produced published data outlives the judgement that the config
+    was wrong. No mint accepts it, and its cohort route refuses it.
     """
 
     alignment_idx: Annotated[int, Field(gt=0)]
@@ -1325,6 +1442,9 @@ class PoolAlignmentSummary(BaseModel):
     params_hash: str
     samples_completed: int
     samples_total: int
+    status: AlignmentDefinitionStatus
+    deprecation_reason: str | None = None
+    superseded_by: Annotated[int | None, Field(default=None, gt=0)] = None
 
 
 class PoolAlignmentList(BaseModel):

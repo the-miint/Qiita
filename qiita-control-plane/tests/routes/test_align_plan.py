@@ -582,11 +582,34 @@ async def test_align_plan_resubmit_over_completed_409(ctx, planned):
     assert resp.status_code == 409, resp.text
     conflicting = resp.json()["detail"]["conflicting_prep_sample_idxs"]
     assert set(conflicting) == set(planned["prep_samples"])
+    assert resp.json()["detail"]["alignment_idx"] == first.json()["partitions"][0]["alignment_idx"]
+    assert "abandon-plan" in resp.json()["detail"]["reason"]
 
     ok = await ctx["wet"].post(_url(planned), json=_body(planned, only_missing=True))
     assert ok.status_code == 202, ok.text
     assert ok.json()["samples_planned"] == 0
     assert ok.json()["blocks_created"] == 0
+
+
+async def test_align_plan_deprecated_alignment_409(ctx, planned):
+    """A deprecated alignment is retired: the same reference, aligner and mask
+    resolve to it again, the mint refuses, and the route says so — even for
+    only_missing, which would otherwise plan nothing and return 202."""
+    await _seed_align_action(planned["db"])
+    first = await ctx["wet"].post(_url(planned), json=_body(planned))
+    assert first.status_code == 202, first.text
+    alignment_idx = first.json()["partitions"][0]["alignment_idx"]
+    await planned["db"].execute(
+        "UPDATE qiita.alignment_definition"
+        "   SET status = 'deprecated', deprecated_at = now(),"
+        "       deprecated_by_idx = created_by_idx, deprecation_reason = 'bad aligner build'"
+        " WHERE alignment_idx = $1",
+        alignment_idx,
+    )
+    resp = await ctx["wet"].post(_url(planned), json=_body(planned, only_missing=True))
+    assert resp.status_code == 409, resp.text
+    assert "bad aligner build" in resp.json()["detail"]
+    assert "retired" in resp.json()["detail"]
 
 
 async def test_align_plan_reference_not_active_409(ctx, planned):
@@ -620,3 +643,99 @@ async def test_align_plan_requires_wet_lab_admin(ctx, planned):
     await _seed_align_action(planned["db"])
     resp = await ctx["user"].post(_url(planned), json=_body(planned))
     assert resp.status_code == 403, resp.text
+
+
+async def test_align_plan_holds_both_definitions_in_its_ticket_transaction(
+    ctx, planned, monkeypatch
+):
+    """The plan takes the alignment and mask rows `FOR SHARE` in the transaction that
+    writes the tickets, so a deprecation either commits first (and the plan refuses)
+    or waits and then counts the tickets. Recorded at the call, because a deprecated
+    config is refused earlier by the mint and so cannot tell a missing lock apart."""
+    locked: list[tuple[str, int]] = []
+    real_alignment = align_planner.lock_active_alignment
+    real_mask = align_planner.lock_active_mask
+
+    async def _alignment(conn, idx):
+        assert conn.is_in_transaction()
+        locked.append(("alignment", idx))
+        await real_alignment(conn, idx)
+
+    async def _mask(conn, idx):
+        assert conn.is_in_transaction()
+        locked.append(("mask", idx))
+        await real_mask(conn, idx)
+
+    monkeypatch.setattr(align_planner, "lock_active_alignment", _alignment)
+    monkeypatch.setattr(align_planner, "lock_active_mask", _mask)
+    await _seed_align_action(planned["db"])
+    resp = await ctx["wet"].post(_url(planned), json=_body(planned))
+    assert resp.status_code == 202, resp.text
+    alignment_idx = resp.json()["partitions"][0]["alignment_idx"]
+    # The early check locks the mask in a transaction of its own and releases it;
+    # the plan's transaction locks it again before the mint, then the alignment.
+    assert locked == [
+        ("mask", planned["mask_idx"]),
+        ("mask", planned["mask_idx"]),
+        ("alignment", alignment_idx),
+    ]
+
+
+async def _alignments_of(db, reference_idx):
+    return await db.fetchval(
+        "SELECT count(*) FROM qiita.alignment_definition"
+        " WHERE (params->>'reference_idx')::bigint = $1",
+        reference_idx,
+    )
+
+
+async def test_a_plan_refused_after_the_mint_leaves_no_alignment(ctx, planned, monkeypatch):
+    """The mint shares the plan's transaction, so a plan that fails after it rolls
+    the new alignment back. Left behind, it would have no gates and no tickets, and
+    would still block its reference's delete with nothing able to remove it."""
+    await _seed_align_action(planned["db"])
+
+    async def _fail(*_a, **_k):
+        raise RuntimeError("persist failed")
+
+    monkeypatch.setattr(align_planner, "create_alignment_sample_pending", _fail)
+    with pytest.raises(RuntimeError, match="persist failed"):
+        await ctx["wet"].post(_url(planned), json=_body(planned))
+    assert await _alignments_of(planned["db"], planned["reference_idx"]) == 0
+
+
+async def test_a_mask_deprecation_during_the_mint_waits_and_counts_the_plan(
+    ctx, planned, monkeypatch
+):
+    """The plan holds the mask `FOR SHARE` from before its mint to its commit. A
+    deprecation that starts during the mint waits for the plan, then finds its
+    tickets and is refused, rather than committing between the mint and the
+    tickets."""
+    import asyncio
+
+    from qiita_control_plane.repositories.mask_definition import (
+        MaskHasLiveWork,
+        refuse_deprecating_mask_with_live_work,
+    )
+
+    await _seed_align_action(planned["db"])
+    real_mint = align_planner.mint_alignment_definition
+    attempts: list[asyncio.Task] = []
+
+    async def _deprecate_mask():
+        async with planned["db"].acquire() as conn, conn.transaction():
+            await refuse_deprecating_mask_with_live_work(conn, planned["mask_idx"])
+
+    async def _mint_while_deprecating(conn, **kwargs):
+        attempt = asyncio.create_task(_deprecate_mask())
+        attempts.append(attempt)
+        # Long enough for a deprecation that does not wait on a lock to finish.
+        await asyncio.sleep(0.5)
+        assert not attempt.done(), "the deprecation did not wait for the plan"
+        return await real_mint(conn, **kwargs)
+
+    monkeypatch.setattr(align_planner, "mint_alignment_definition", _mint_while_deprecating)
+    resp = await ctx["wet"].post(_url(planned), json=_body(planned))
+    assert resp.status_code == 202, resp.text
+    with pytest.raises(MaskHasLiveWork):
+        await attempts[0]

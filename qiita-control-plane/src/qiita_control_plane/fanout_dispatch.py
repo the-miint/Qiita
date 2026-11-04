@@ -34,8 +34,9 @@ this pump releases them a capped number at a time:
     nothing. One failing child halts the whole fan-out rather than burning
     through the remaining shards against a sick backend. The operator
     investigates and redrives the failed child(ren) directly (a `/run` redrive
-    dispatches a specific ticket regardless of `dispatch_held`); once no failed
-    ticket remains, the next child completion re-starts the pump automatically.
+    dispatches a specific ticket whatever its `dispatch_held`, and clears it); once
+    no failed ticket remains, the next child completion re-starts the pump
+    automatically.
 
 Startup reconcile (`dispatch.reconcile_inflight_tickets`) re-dispatches only
 non-held in-flight tickets and then calls the pump for every cohort that still
@@ -68,6 +69,7 @@ from qiita_common.actions import ALIGN_ACTION_ID, BLOCK_MASK_ACTION_ID
 from qiita_common.models import MAX_FANOUT_OVERRIDE, FanoutCohortKind, FanoutCohortStatus
 
 from qiita_control_plane.repositories import INT4_MASK
+from qiita_control_plane.repositories.block import BLOCK_ABANDONED
 
 _log = logging.getLogger(__name__)
 
@@ -157,8 +159,8 @@ def shard_cohort(reference_idx: int) -> FanoutCohort:
 
 def read_mask_block_cohort(mask_idx: int) -> FanoutCohort:
     """The bulk read-mask block children of one mask partition. Discriminated
-    from align blocks by ``action_id`` — NOT by ``alignment_idx IS NULL``, which a
-    purge of the alignment produces from an align ticket (see
+    from align blocks by ``action_id`` — NOT by ``alignment_idx IS NULL``, which
+    removing the alignment_definition row produces from an align ticket (see
     `qiita_common.actions`)."""
     return FanoutCohort(
         label=f"read_mask_block(mask_idx={mask_idx})",
@@ -190,8 +192,17 @@ def align_block_cohort(alignment_idx: int) -> FanoutCohort:
         label=f"align_block(alignment_idx={alignment_idx})",
         kind=FanoutCohortKind.ALIGN_BLOCK,
         key=alignment_idx,
-        where_sql="alignment_idx = $1 AND block_idx IS NOT NULL AND action_id = $2",
-        args=(alignment_idx, ALIGN_ACTION_ID),
+        # An abandoned block's ticket has left the fan-out: abandon-plan cleared the
+        # gates it covered, so its failure must not fail-stop the re-plan that
+        # follows under the same alignment_idx. Unaliased `work_ticket` because every
+        # query this predicate goes into reads `FROM qiita.work_ticket` bare.
+        where_sql=(
+            "alignment_idx = $1 AND block_idx IS NOT NULL AND action_id = $2"
+            " AND NOT EXISTS (SELECT 1 FROM qiita.block ab"
+            "                  WHERE ab.block_idx = work_ticket.block_idx"
+            "                    AND ab.state = $3)"
+        ),
+        args=(alignment_idx, ALIGN_ACTION_ID, BLOCK_ABANDONED),
         lock_class=_LOCK_CLASS_ALIGN_BLOCK,
         lock_key=alignment_idx & INT4_MASK,
     )
@@ -492,9 +503,9 @@ async def _cohorts_matching(pool: asyncpg.Pool, ticket_predicate: str) -> list[F
     means a later refactor that threads a caller-supplied predicate here fails at once
     instead of opening an injection.
 
-    Both block scans key on action_id, not on whether alignment_idx is set: a purged
-    align ticket keeps its mask_idx and would otherwise be reported here as a
-    read-mask block (see `qiita_common.actions`)."""
+    Both block scans key on action_id, not on whether alignment_idx is set: an align
+    ticket whose alignment_definition row was removed keeps its mask_idx and would
+    otherwise be reported here as a read-mask block (see `qiita_common.actions`)."""
     assert ticket_predicate in (_PRED_HELD, _PRED_ACTIVE), (
         f"ticket_predicate is interpolated into SQL and must be a module constant, "
         f"got {ticket_predicate!r}"

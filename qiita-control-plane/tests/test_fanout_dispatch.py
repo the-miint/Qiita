@@ -107,7 +107,7 @@ def test_cohort_for_ticket_row_read_mask_block():
 def test_cohort_for_ticket_row_purged_align_block_is_not_a_read_mask_block():
     """A purged align block ticket must NOT route into the read-mask cohort.
 
-    `DELETE /alignment-definition` NULLs `work_ticket.alignment_idx` but leaves the
+    Removing the alignment_definition row NULLs `work_ticket.alignment_idx` but leaves the
     ticket's `mask_idx` and `block_idx`, so on the column shape alone it is
     indistinguishable from a read-mask block. Routing it there puts it in the wrong
     fan-out: a `failed` one fail-stops the read-mask cohort for that mask_idx, and

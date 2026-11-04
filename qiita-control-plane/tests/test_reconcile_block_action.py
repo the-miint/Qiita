@@ -124,7 +124,7 @@ async def rb(postgres_pool):
         # block — which is how the planners actually write them. Pass `action_id`
         # explicitly to build the one shape that combination cannot express: a
         # PURGED align block, still the align action but with its alignment_idx
-        # NULLed by `DELETE /alignment-definition`.
+        # NULLed by its alignment_definition row's removal (ON DELETE SET NULL).
         if action_id is None:
             action_id = ALIGN_ACTION_ID if alignment_idx is not None else BLOCK_MASK_ACTION_ID
         async with postgres_pool.acquire() as conn, conn.transaction():
@@ -280,7 +280,7 @@ async def test_finalize_mask_sample_gate_ignores_inflight_align_block(rb):
 
     Covers both align shapes, because they are not the same row: a live align block
     (alignment_idx set) and a PURGED one, whose alignment_idx
-    `DELETE /alignment-definition` NULLed while leaving the mask_idx and block_idx
+    the alignment_definition FK (ON DELETE SET NULL) NULLed while leaving the mask_idx and block_idx
     that make it look like a read-mask block. Only the action tells them apart.
     """
     pool, ps, mask_idx = rb["pool"], rb["prep_sample_idx"], rb["mask_idx"]
