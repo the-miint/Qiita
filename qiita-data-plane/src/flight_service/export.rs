@@ -58,12 +58,11 @@ impl QiitaFlightService {
             )));
         }
         // Refused, not ignored — the same rule the DoGet projection
-        // follows. Unreachable today (`read_masked` takes no projection,
-        // so the control plane cannot sign one) and harmless if it were
-        // reached, since this returns a count and no rows. It is here
-        // because "a signed field this arm silently disregards" is the one
-        // shape that turns a narrowed ticket into a wider answer, and this
-        // was the only place in the ticket surface still allowing it.
+        // follows. A `read_masked` ticket may carry an optional projection
+        // (`PROJECTION_RULES` in query.rs), and a count has no columns for it
+        // to narrow. Disregarding a signed field is the one shape that turns
+        // a narrowed ticket into a wider answer, so the arm refuses it even
+        // though a count would be harmless.
         if !payload.columns.is_empty() {
             return Err(Status::invalid_argument(
                 "count_masked takes no projection column list",

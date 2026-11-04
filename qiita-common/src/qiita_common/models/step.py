@@ -283,8 +283,8 @@ class DoGetTicketResponse(BaseModel):
 # The names themselves are checked against a per-table allowlist at signing time
 # (auth/tickets.py), which is what bounds this list in practice; the caps here
 # only keep an absurd request from being parsed before it is rejected, and are
-# deliberately wider than any projectable table. One alias so the two ticket
-# bodies that carry a projection cannot drift on any of the four numbers.
+# deliberately wider than any projectable table. One alias so the ticket bodies
+# that carry a projection cannot drift on any of the four numbers.
 ProjectionColumns = Annotated[
     list[Annotated[str, Field(min_length=1, max_length=64)]],
     Field(min_length=1, max_length=128),

@@ -36,6 +36,7 @@ from qiita_common.models.biosample import (
     MetadataEntry,
 )
 from qiita_common.models.reference import Platform
+from qiita_common.models.step import ProjectionColumns
 from qiita_common.models.work_ticket import WorkTicketState
 
 
@@ -1488,12 +1489,17 @@ class ReadMaskedDoGetTicketRequest(BaseModel):
     they are the macro's required arguments — and the route refuses to sign a
     ticket missing either, as defence in depth (the mandatory-filter invariant,
     `routes/read_masked.py`).
+
+    ``columns`` optionally narrows the stream to those of the macro's columns,
+    in that order; omitted, the ticket streams the macro's full shape. The names
+    are validated when the ticket is signed (``auth/tickets.py``).
     """
 
     model_config = ConfigDict(extra="forbid")
 
     prep_sample_idx: Annotated[int, Field(gt=0)]
     mask_idx: Annotated[int, Field(gt=0)]
+    columns: ProjectionColumns | None = None
 
 
 class MaskedReadExportSample(BaseModel):

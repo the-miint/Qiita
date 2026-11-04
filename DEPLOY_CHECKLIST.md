@@ -134,6 +134,8 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
   bash scripts/lake-shell.sh --no-cp -noheader -list \
     -c "SELECT value FROM qiita_lake.options() WHERE option_name = 'version'"
   ```
+- `make verify-deploy`'s action list shows `myloasm-provenance-recover` 1.0.0 enabled.
+  (#830)
 
 ### 6. After the deploy verifies green
 
@@ -141,6 +143,36 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
   at nginx's loopback listener so its calls spread across them —
   [`data-plane-scaling.md` § The control plane through nginx](docs/runbooks/data-plane-scaling.md#the-control-plane-through-nginx).
   Undo it before any rollback to a commit without that listener.
+- `[admin]` **Recover the provenance of the myloasm runs finished before this deploy**
+  (long-read-assembly 1.0.0/1.0.1; the dry run counts them). Each run gets one
+  `myloasm-provenance-recover` ticket, which reads the `assemble` output left in that run's
+  ticket workspace. Run it soon after the deploy, since those files last only as long as
+  the scratch workspace does. (#830)
+  ```bash
+  # DATABASE_URL and PATH_SCRATCH exported, as for any `qiita-admin backfill`;
+  # QIITA_TOKEN is a system_admin's PAT (only --execute reads it).
+  qiita-admin backfill myloasm-provenance                       # dry run: counts per status, and each run it cannot recover (residue), with the reason
+  qiita-admin backfill myloasm-provenance --execute --limit 5
+  ```
+  Once those five tickets complete, run bucket 5's 1.0.2 provenance query for each one, with
+  `PS`/`RUN` taken from the `prep_sample <PS> run <RUN> -> ticket <T>` lines that the
+  `--limit 5` run printed. Expect the same results as that check. Measure each one's
+  peak memory and elapsed time against the step's unmeasured 16 GB / 2 h baseline,
+  for every attempt (an OOM retry runs at a higher memory floor):
+  `sacct -j <job> -o MaxRSS,Elapsed`, with each `<job>` from
+  `SELECT attempt, state, slurm_job_id FROM qiita.work_ticket_step WHERE work_ticket_idx = <T> AND slurm_job_id IS NOT NULL ORDER BY attempt`.
+  Then submit the rest, paced:
+  `qiita-admin backfill myloasm-provenance --execute --rate 10`.
+
+  Each pass submits one ticket per prep_sample, so rerun it once the pass's tickets finish.
+  You are done when the dry run counts no writable and no in-flight runs and every
+  residue line has an explanation. `--retry-failed` resubmits runs whose recovery
+  ticket ended without completing (failed, cancelled or no_data). If the dry run stops
+  with a permission error, run it as an account that can read the ticket workspaces.
+  On #827, which removes the one-off, post the measurements and the
+  dry run's status counts and `residue, <kind>: <n>` lines, each kind with its
+  explanation. Name no run, ticket or job by its id there: the per-run lines carry
+  `_idx` values, and the repository is public.
 
 ### Notes (no host action)
 
@@ -175,7 +207,8 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
   - The assemble image lands under a new filename, `long-read-assembly-assemble-1.0.2.sif`,
     built on deploy. **Keep `long-read-assembly-assemble-1.0.0.sif`**: 1.0.0 and 1.0.1 still
     name it and no spec builds it any more (`sif-build.d/assemble.env`).
-  - Runs completed before this deploy have no provenance rows.
+  - Runs completed before this deploy have no provenance rows until bucket 6's
+    recovery writes them (#830).
 - (#791) Optional `QIITA_DATA_PLANE_INSTANCE_MEMORY_MAX` in `/etc/qiita/data-plane.env` sets `MemoryMax=` per local data-plane instance ([`data-plane-scaling.md` § More instances on this host](docs/runbooks/data-plane-scaling.md#more-instances-on-this-host)). Every deploy now writes `/etc/systemd/system/qiita-data-plane@<port>.service.d/instance-limits.conf` (instance count; `MemoryMax=` only when the key is set) and stops if `data-plane.env` sets `QIITA_DATA_PLANE_LOCAL_INSTANCES`, or sets `DUCKDB_MEMORY_LIMIT` to more than the key ÷ `DUCKLAKE_POOL_SIZE`; `preflight` gains a `dp-memory-max` row, skipped when the key is unset. With `DUCKDB_THREADS` unset, each instance's derived threads are also divided by the local instance count (no change at one instance).
 - (#779) Soft API-contract change: biosample and prep_sample metadata
   reads omit any value above the caller's tier on the study that wrote it (no placeholder).

@@ -113,14 +113,23 @@ into a 422 with a useful message, and the data plane's is the defense-in-depth
 that keeps a signed name out of interpolated SQL, the same argument
 `ALLOWED_FILTER_COLUMNS` makes for the filter.
 
-**Only `alignment_visible` is projectable, and it *requires* a column list.**
-Every other DoGet table streams `SELECT *` and rejects a list rather than
-ignoring one. The asymmetry is not arbitrary, and this is the one measured number
-behind it: on a **HiFi** alignment payload of 716,187 rows (mean CIGAR ≈ 1,092
-bytes), the Arrow stream was 775.6 MiB, of which `cigar` alone was 746.1 MiB
-(96.2%) and the six identifier/position columns the feature-table consumer
-actually binds were 29.5 MiB combined. Serving that unprojected is ~26x the
-bytes. Two caveats the figure needs: the projection is 6 of 23 columns rather
+**Two tables are projectable, and only `alignment_visible` *requires* a column
+list.** The rule per table is `PROJECTION_RULES` in
+`qiita-data-plane/src/flight_service/query.rs`, mirrored at the signer. Every
+other DoGet table streams `SELECT *` and rejects a list rather than ignoring one.
+
+`read_masked` takes an optional list. A ticket without a list streams the
+macro's full shape, which its existing readers bind; no cost of that shape has
+been measured, so the data plane does not refuse it. With a list, each row is
+narrowed to the named columns, and the projection reaches the `read` scan inside
+the macro, so the scan skips the sequences and qualities too
+(`a_read_masked_projection_reaches_the_read_scan`).
+
+The alignment surface requires a list because of one measured number: on a
+**HiFi** alignment payload of 716,187 rows (mean CIGAR ≈ 1,092 bytes), the Arrow
+stream was 775.6 MiB, of which `cigar` alone was 746.1 MiB (96.2%) and the six
+identifier/position columns that the feature-table consumer binds were 29.5 MiB
+combined. Serving that unprojected is ~26x the bytes. Two caveats the figure needs: the projection is 6 of 23 columns rather
 than "everything but `cigar`", so it is not a `cigar`-only saving; and the
 equivalent **short-read** shape was never measured — short-read CIGARs are
 near-degenerate, so expect a much smaller share there and do not quote 96% for
@@ -136,21 +145,20 @@ of this vintage or later refuses a ticket carrying a field it does not know
 (`deny_unknown_fields` on `TicketPayload`), which makes the mismatch loud; an
 older one silently applied its own idea of the projection instead.
 
-There is **no server-side default projection** — a ticket without a column list
-is refused. Only the consumer knows which columns it binds, and a fallback in
-the data plane would be a second answer to that question, free to drift wider
-than what was asked for. The cost is that a ticket minted before a deploy and
-redeemed inside its 300 s TTL after it fails with `InvalidArgument`; that is
-preferred to widening it silently. The one production consumer,
-`estimate_feature_table`, owns its list as `_ALIGNMENT_COLUMNS` and uses it
-twice — for the ticket and for the `SELECT` it binds — so the two cannot drift.
+For `alignment_visible` there is **no server-side default projection** — a ticket
+without a column list is refused. Why is stated at the guard in `select_list_for`
+(`qiita-data-plane/src/flight_service/query.rs`).
 
-Allowlist constants: `ALIGNMENT_PROJECTION_COLUMNS` in
-`qiita-data-plane/src/flight_service/query.rs` and `_PROJECTION_COLUMNS` in
-`qiita-control-plane/src/qiita_control_plane/auth/tickets.py`. Both are
-hand-copies (neither language can import the other) pinned by parity tests, and
-the Rust one is additionally checked against the live `alignment_visible`
-schema.
+A consumer of either table owns its list as one constant and uses it twice — for
+the ticket and for the `SELECT` that it binds — so the two cannot drift.
+
+Allowlist constants: `PROJECTION_RULES` and its column lists
+(`ALIGNMENT_PROJECTION_COLUMNS`, `READ_MASKED_PROJECTION_COLUMNS`) in
+`qiita-data-plane/src/flight_service/query.rs`, and `_PROJECTION_COLUMNS` with
+`_PROJECTION_REQUIRED` in `qiita-control-plane/src/qiita_control_plane/auth/tickets.py`.
+Both are hand-copies (neither language can import the other) pinned by parity
+tests, and each Rust column list is also checked against the live shape that it
+projects: the `alignment_visible` schema, and a `DESCRIBE` of a `read_masked` call.
 
 ### Two mint paths for the alignment DoGet
 

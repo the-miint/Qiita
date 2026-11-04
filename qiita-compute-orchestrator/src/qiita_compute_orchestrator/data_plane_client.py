@@ -278,6 +278,7 @@ async def fetch_read_masked_doget_ticket(
     http: httpx.AsyncClient,
     prep_sample_idx: int,
     mask_idx: int,
+    columns: Sequence[str] | None = None,
 ) -> bytes:
     """POST /read-masked/ticket/doget and return the raw signed ticket bytes.
 
@@ -290,14 +291,17 @@ async def fetch_read_masked_doget_ticket(
     unrepresentable rather than merely refused, the DP rejecting any filter but
     those two keys.
 
+    `columns`, when given, is signed as the ticket's projection, in that order;
+    omitted, no key is sent and the ticket streams the macro's full shape.
+
     Transport and error mapping are the module's (see the header). The status worth
     naming here is **409**: the mask-completion gate, described on
     `open_read_masked_stream`.
     """
-    resp = await http.post(
-        URL_READ_MASKED_DOGET,
-        json={"prep_sample_idx": prep_sample_idx, "mask_idx": mask_idx},
-    )
+    body: dict[str, object] = {"prep_sample_idx": prep_sample_idx, "mask_idx": mask_idx}
+    if columns is not None:
+        body["columns"] = list(columns)
+    resp = await http.post(URL_READ_MASKED_DOGET, json=body)
     resp.raise_for_status()
     return base64.b64decode(resp.json()["ticket"])
 
@@ -309,6 +313,7 @@ async def open_read_masked_stream(
     prep_sample_idx: int,
     mask_idx: int,
     relation: str = "masked_reads",
+    columns: Sequence[str] | None = None,
 ) -> AsyncIterator[str]:
     """Mint a `(prep_sample_idx, mask_idx)`-scoped read_masked DoGet ticket (CO→CP)
     and stream that sample's passing masked reads (CO→DP Flight) into `conn` as
@@ -322,11 +327,8 @@ async def open_read_masked_stream(
     The relation carries the data plane's `read_masked` macro columns —
     `mask_idx, prep_sample_idx, sequence_idx, read_id, sequence1, qual1, sequence2,
     qual2` — with the trims already applied and the macro's unconditional
-    `reason = 'pass'` excluding human/host reads by construction. Note
-    `sequence_idx`: the CP-side FASTQ streamer that feeds the assembly workflow
-    (`runner/_read_ingest.py`) writes the VARCHAR `read_id` instead, which is why an
-    `alignment`-producing consumer streams here rather than reusing that FASTQ —
-    `alignment` rows are keyed on `sequence_idx`.
+    `reason = 'pass'` excluding human/host reads by construction. `columns` narrows
+    that to the named subset, in that order.
 
     **Completion gate, requiring no code here.** The CP refuses to sign unless
     `mask_sample.state = 'completed'` for this pair, so a 409 is what a caller gets
@@ -353,7 +355,7 @@ async def open_read_masked_stream(
 
     async def _mint(http: httpx.AsyncClient) -> bytes:
         return await fetch_read_masked_doget_ticket(
-            http=http, prep_sample_idx=prep_sample_idx, mask_idx=mask_idx
+            http=http, prep_sample_idx=prep_sample_idx, mask_idx=mask_idx, columns=columns
         )
 
     async with _open_ticket_stream(conn, mint=_mint, relation=relation) as rel:
