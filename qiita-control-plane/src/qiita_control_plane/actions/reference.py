@@ -8,6 +8,7 @@ have one home.
 from __future__ import annotations
 
 import asyncpg
+from qiita_common.api_paths import URL_ALIGNMENT_DEFINITION_STATUS
 from qiita_common.models import (
     NON_TERMINAL_WORK_TICKET_STATES,
     TERMINAL_WORK_TICKET_STATES,
@@ -58,20 +59,18 @@ class ReferenceDeleteBlocked(Exception):
         self.terminal = terminal
         self.alignment_definitions = alignment_definitions
         # Alignment definitions are the force-proof reason and the one the operator
-        # most needs to act on, so it is reported first when present. A reference
-        # delete cascades neither `alignment_definition` nor the DuckLake `alignment`
-        # rows it owns (those are keyed on `feature_idx`, which this delete would
-        # orphan-GC in both stores), and the data plane's delete_reference does not
-        # touch `alignment` — so force cannot make this delete safe. The
-        # DELETE /alignment-definition/{idx} route DOES purge the lake rows and
-        # cascade its gates, so send the operator there first.
+        # most needs to act on, so it is reported first when present. The DuckLake
+        # `alignment` rows are keyed on `feature_idx`, which this delete would
+        # orphan-GC, and no route deletes a completed alignment's rows, so a
+        # reference that has been aligned against is kept.
         if alignment_definitions:
             reason = (
                 f"{alignment_definitions} alignment definition(s) align against it; "
-                "force cannot be used because it cannot clean the DuckLake "
-                "`alignment` rows they own (keyed on feature_idx this delete would "
-                "orphan). Delete each via DELETE /alignment-definition/{idx} first "
-                "(that route purges the lake rows and cascades its gates), then retry"
+                "their DuckLake `alignment` rows are keyed on this reference's features "
+                "and no route deletes a completed alignment's rows, so a reference "
+                "that has been aligned against cannot be deleted, with or without "
+                "force. Deprecating the alignment "
+                f"(PATCH {URL_ALIGNMENT_DEFINITION_STATUS}) does not change that"
             )
         elif in_flight:
             reason = (
@@ -129,11 +128,7 @@ async def assert_reference_deletable(
     # only in alignment_definition.params (JSON `reference_idx`, an int; there is no
     # FK). Gate on that row directly: it is the durable record that an alignment was
     # built against this reference, and it outlives the (transient) work tickets.
-    # This blocks EVEN WITH force, because neither the Postgres cascade nor the data
-    # plane's delete_reference touches the DuckLake `alignment` rows those
-    # definitions own (keyed on feature_idx this delete would orphan-GC in both
-    # stores) — so no force can make the delete safe. DELETE /alignment-definition
-    # first purges the lake rows and cascades the gates.
+    # This blocks EVEN WITH force: ReferenceDeleteBlocked says why.
     alignment_definitions = await conn.fetchval(
         "SELECT count(*) FROM qiita.alignment_definition"
         " WHERE (params->>'reference_idx')::bigint = $1",

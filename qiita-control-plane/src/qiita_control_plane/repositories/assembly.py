@@ -17,6 +17,8 @@ completion gate — the assembly twin of qiita.mask_sample / qiita.alignment_sam
 Its contract lives on `fetch_assembly_sample_state` below.
 """
 
+from dataclasses import dataclass
+
 import asyncpg
 from qiita_common.api_paths import URL_PROCESSING_SAMPLE_STATUS
 from qiita_common.assembly_constants import KIND_LCG, KIND_MAG
@@ -421,6 +423,43 @@ async def fetch_assembly_sample_states(
         prep_sample_idx,
     )
     return {r["prep_sample_idx"]: r["state"] for r in rows}
+
+
+@dataclass(frozen=True)
+class DenovoArmCohort:
+    """Which members of a combined feature table's cohort the de novo arm covers.
+
+    ``expected``: assembled (``completed``), so a de novo ``alignment_sample`` row is
+    required. ``unusable``: neither ``completed`` nor ``no_data`` (``None`` when the
+    run has no row), which no table may be built over. Every other member is
+    ``no_data``: nothing was assembled, so it is reference-only."""
+
+    expected: list[int]
+    unusable: dict[int, str | None]
+
+
+async def classify_denovo_arm_cohort(
+    db: asyncpg.Pool | asyncpg.Connection,
+    *,
+    processing_idx: int,
+    prep_sample_idx: list[int],
+) -> DenovoArmCohort:
+    """Split a combined table's cohort by its assembly gate under `processing_idx`.
+
+    The one definition of which members the de novo arm must cover, read by the
+    feature-table submit (`runner/_feature_table._apply_arm_gate`, which states why
+    each state lands where it does) and by the alignment DoGet's re-check at mint."""
+    states = await fetch_assembly_sample_states(
+        db, processing_idx=processing_idx, prep_sample_idx=prep_sample_idx
+    )
+    return DenovoArmCohort(
+        expected=[idx for idx in prep_sample_idx if states.get(idx) == ASSEMBLY_SAMPLE_COMPLETED],
+        unusable={
+            idx: states.get(idx)
+            for idx in prep_sample_idx
+            if states.get(idx) not in (ASSEMBLY_SAMPLE_COMPLETED, ASSEMBLY_SAMPLE_NO_DATA)
+        },
+    )
 
 
 # The de novo arm's feature -> genome row set, shared verbatim between the Parquet

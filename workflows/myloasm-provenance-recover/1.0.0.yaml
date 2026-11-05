@@ -1,0 +1,71 @@
+# One-off. Recovers the `myloasm_*` provenance tables for myloasm runs that finished
+# on long-read-assembly 1.0.0 or 1.0.1, which predate them; 1.0.2 writes them itself.
+# The `qiita-admin backfill myloasm-provenance` command submits one ticket per run.
+# This workflow, its job and that backfill are removed once every such run has its
+# tables or an explained residue line, tracked by the Qiita issue "Remove the
+# myloasm-provenance-recover workflow, job and backfill".
+action_id: myloasm-provenance-recover
+version: 1.0.0
+target_kind: prep_sample
+
+description: >
+  Recover myloasm's read-to-contig provenance (the six `myloasm_*` DuckLake tables)
+  for one assembly run that finished on long-read-assembly 1.0.0 or 1.0.1. The native
+  `myloasm_provenance_recover` job reads the run's own `assemble` step output, still
+  in its ticket workspace, which the context names by ticket and attempt number. It
+  looks each read name up in the prep_sample's `read_masked` pass-set under the run's
+  mask, and matches each genome contig to the run's `assembled_sequence` rows by
+  hash.
+
+scopes:
+  - prep_sample:write
+
+audience:
+  service: false
+  human_roles: [system_admin]
+
+context_schema:
+  type: object
+  required: [assembly_processing_idx, assembly_mask_idx, source_work_ticket_idx, assemble_attempt]
+  properties:
+    # The finished run, and the mask that its reads came from.
+    assembly_processing_idx:
+      type: integer
+      minimum: 1
+    assembly_mask_idx:
+      type: integer
+      minimum: 1
+    # The run's completed `assemble` attempt: the ticket whose workspace holds the
+    # output, and the attempt number.
+    source_work_ticket_idx:
+      type: integer
+      minimum: 1
+    assemble_attempt:
+      type: integer
+      minimum: 0
+
+steps:
+  - step: myloasm_provenance_recover
+    step_type: singleton
+    module: qiita_compute_orchestrator.jobs.myloasm_provenance_recover
+    params:
+      assembly_processing_idx: assembly_processing_idx
+      assembly_mask_idx: assembly_mask_idx
+      source_work_ticket_idx: source_work_ticket_idx
+      assemble_attempt: assemble_attempt
+    outputs: [staging_dir]
+    # Not measured. The bulk is the read-name lookup, two columns of one
+    # prep_sample's pass-set, and myloasm's per-read mapping table.
+    baseline_resources:
+      cpu: 4
+      mem_gb: 16
+      walltime: PT2H
+
+  - action: register-files
+    inputs: [staging_dir]
+    outputs: []
+
+action_ceiling:
+  cpu: 4
+  mem_gb: 64
+  walltime: PT8H

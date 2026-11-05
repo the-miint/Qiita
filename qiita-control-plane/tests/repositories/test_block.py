@@ -437,8 +437,8 @@ async def _block_with_ticket(blk, *, action, mask_idx, state, members, alignment
     the block's state, and return its block_idx. Tracked for fixture cleanup.
 
     `alignment_idx` mirrors the align-block shape (which carries BOTH ids); left
-    None it also reproduces a PURGED align ticket, whose alignment_idx the
-    alignment delete NULLed.
+    None it also reproduces a DETACHED align ticket, whose alignment_idx was NULLed
+    by its alignment_definition row's removal (ON DELETE SET NULL).
     """
     pool = blk["pool"]
     action_id, version = action
@@ -508,11 +508,11 @@ async def test_has_incomplete_covering_block_gates_on_all_blocks_completed(blk):
         await _drop_seeded_actions(pool, created_actions)
 
 
-async def test_has_incomplete_covering_block_ignores_a_purged_align_block(blk):
-    """A PURGED align block must not wedge the read-mask finalize gate.
+async def test_has_incomplete_covering_block_ignores_a_detached_align_block(blk):
+    """A DETACHED align block must not wedge the read-mask finalize gate.
 
-    An align block ticket carries both mask_idx and alignment_idx, and
-    `DELETE /alignment-definition` NULLs the alignment (`ON DELETE SET NULL`) while
+    An align block ticket carries both mask_idx and alignment_idx, and deleting the
+    alignment_definition row NULLs the alignment (`ON DELETE SET NULL`) while
     leaving mask_idx and block_idx. On column shape alone the leftover is
     indistinguishable from a read-mask block covering the same sample under the same
     mask — so a discriminator of `alignment_idx IS NULL` would count it here and
@@ -538,9 +538,9 @@ async def test_has_incomplete_covering_block_ignores_a_purged_align_block(blk):
             await has_incomplete_covering_block(pool, mask_idx=mask_idx, prep_sample_idx=ps1)
             is False
         )
-        # A FAILED align block over the same footprint, already purged (alignment_idx
-        # NULL) — the exact leftover an alignment delete produces. Masking is still
-        # complete, so the gate must stay open.
+        # A FAILED align block over the same footprint, detached (alignment_idx
+        # NULL) — the leftover that deleting its alignment_definition row leaves.
+        # Masking is still complete, so the gate must stay open.
         await _block_with_ticket(
             blk,
             action=align_action,

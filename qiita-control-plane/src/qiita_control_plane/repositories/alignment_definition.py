@@ -27,9 +27,50 @@ the digest) propagate to the caller.
 
 import json
 from collections.abc import Sequence
+from typing import Literal
 
 import asyncpg
 from qiita_common.hashing import canonical_params_hash
+from qiita_common.models import (
+    NON_TERMINAL_WORK_TICKET_STATES,
+    AlignmentDefinitionStatus,
+    AlignmentSampleState,
+)
+
+from . import gate_state_literal, require_transaction
+
+# The `alignment_sample` states, asserted against the Literal so a renamed member
+# fails at import rather than matching no rows. A consumer proceeds on `completed`
+# alone; `list_completed_alignment_samples` is the one copy of that predicate.
+ALIGNMENT_SAMPLE_PENDING = gate_state_literal("pending", AlignmentSampleState)
+ALIGNMENT_SAMPLE_COMPLETED = gate_state_literal("completed", AlignmentSampleState)
+ALIGNMENT_SAMPLE_INVALIDATED = gate_state_literal("invalidated", AlignmentSampleState)
+
+ALIGNMENT_DEFINITION_RETURNING = (
+    "alignment_idx, params_hash, params, created_by_idx, created_at, status,"
+    " deprecated_at, deprecated_by_idx, deprecation_reason, superseded_by"
+)
+
+
+class AlignmentDefinitionDeprecated(Exception):
+    """Raised when a mint resolves to an alignment whose config is deprecated.
+
+    Carries the SQLSTATE 23514 the plpgsql mint raises, translated here so routes
+    and the runner match on a type. A deprecated config is void: no new data is
+    aligned under it, and because a block identity carries no version, re-planning
+    the same reference, aligner and mask always lands on this row."""
+
+    def __init__(self, detail: str) -> None:
+        self.detail = detail
+        super().__init__(detail)
+
+
+class AlignmentDefinitionNotFound(Exception):
+    """Raised when the alignment_idx does not exist."""
+
+    def __init__(self, alignment_idx: int) -> None:
+        self.alignment_idx = alignment_idx
+        super().__init__(f"no alignment_definition with alignment_idx={alignment_idx}")
 
 
 class ParamsDoNotSurviveStorageError(RuntimeError):
@@ -94,6 +135,7 @@ async def mint_alignment_definition(
     comment for the properties real growth support would need.
 
     Returns the qiita.alignment_definition row as an asyncpg.Record. Raises
+    AlignmentDefinitionDeprecated when the config resolves to a deprecated row,
     asyncpg.ForeignKeyViolationError when principal_idx does not exist, and
     ParamsDoNotSurviveStorageError for a config whose stored form would stop matching
     the digest stored beside it.
@@ -107,13 +149,20 @@ async def mint_alignment_definition(
     # asyncpg encodes a dict bound to a jsonb parameter via the JSON codec; pass
     # the serialized string explicitly so the behaviour is independent of
     # whether a JSON codec is registered on the connection.
-    return await conn.fetchrow(
-        "SELECT alignment_idx, params_hash, params, created_by_idx, created_at"
-        "  FROM qiita.mint_alignment_definition($1, $2::jsonb, $3)",
-        params_hash,
-        json.dumps(params),
-        principal_idx,
-    )
+    try:
+        return await conn.fetchrow(
+            f"SELECT {ALIGNMENT_DEFINITION_RETURNING}"
+            "  FROM qiita.mint_alignment_definition($1, $2::jsonb, $3)",
+            params_hash,
+            json.dumps(params),
+            principal_idx,
+        )
+    except asyncpg.CheckViolationError as exc:
+        # SQLSTATE 23514 is also what a genuine table CHECK raises, so match on the
+        # message the function sets and re-raise anything else untouched.
+        if "is deprecated" not in str(exc):
+            raise
+        raise AlignmentDefinitionDeprecated(str(exc)) from exc
 
 
 async def lookup_alignment_idx_by_params(
@@ -144,7 +193,7 @@ async def fetch_alignment_definition_by_idx(
     transaction or stands alone.
     """
     return await pool_or_conn.fetchrow(
-        "SELECT alignment_idx, params_hash, params, created_by_idx, created_at"
+        f"SELECT {ALIGNMENT_DEFINITION_RETURNING}"
         "  FROM qiita.alignment_definition"
         " WHERE alignment_idx = $1",
         alignment_idx,
@@ -230,7 +279,8 @@ async def list_alignments_over_prep_samples(
         "   GROUP BY alignment_idx"
         ")"
         " SELECT c.alignment_idx, ad.params, ad.params_hash,"
-        "        c.samples_completed, c.samples_total"
+        "        c.samples_completed, c.samples_total,"
+        "        ad.status, ad.deprecation_reason, ad.superseded_by"
         "   FROM counted c"
         "   JOIN qiita.alignment_definition ad ON ad.alignment_idx = c.alignment_idx"
         "  ORDER BY c.alignment_idx",
@@ -259,9 +309,176 @@ async def list_completed_alignment_samples(
     rows = await pool_or_conn.fetch(
         "SELECT prep_sample_idx FROM qiita.alignment_sample"
         " WHERE alignment_idx = $1 AND prep_sample_idx = ANY($2::bigint[])"
-        "   AND state = 'completed'"
+        "   AND state = $3"
         " ORDER BY prep_sample_idx",
         alignment_idx,
         list(prep_sample_idxs),
+        ALIGNMENT_SAMPLE_COMPLETED,
     )
     return [r["prep_sample_idx"] for r in rows]
+
+
+async def transition_alignment_definition_status(
+    conn: asyncpg.Pool | asyncpg.Connection,
+    *,
+    alignment_idx: int,
+    status: AlignmentDefinitionStatus,
+    reason: str | None,
+    superseded_by: int | None,
+    principal_idx: int,
+) -> asyncpg.Record:
+    """Set an alignment CONFIG's lifecycle status and return the updated row.
+
+    The twin of `transition_mask_definition_status`: the provenance columns move
+    with `status` in one UPDATE, so the CHECK tying them together never sees a
+    half-applied transition, and re-deprecating restamps who/when/why.
+
+    Raises AlignmentDefinitionNotFound when the row does not exist, and
+    asyncpg.ForeignKeyViolationError when `superseded_by` names no alignment.
+    """
+    deprecating = status is AlignmentDefinitionStatus.DEPRECATED
+    row = await conn.fetchrow(
+        "UPDATE qiita.alignment_definition"
+        "    SET status = $2,"
+        "        deprecated_at = CASE WHEN $3::boolean THEN now() END,"
+        "        deprecated_by_idx = CASE WHEN $3::boolean THEN $4::bigint END,"
+        "        deprecation_reason = CASE WHEN $3::boolean THEN $5::text END,"
+        "        superseded_by = CASE WHEN $3::boolean THEN $6::bigint END"
+        "  WHERE alignment_idx = $1"
+        f" RETURNING {ALIGNMENT_DEFINITION_RETURNING}",
+        alignment_idx,
+        status.value,
+        deprecating,
+        principal_idx,
+        reason,
+        superseded_by,
+    )
+    if row is None:
+        raise AlignmentDefinitionNotFound(alignment_idx)
+    return row
+
+
+async def set_alignment_sample_states(
+    conn: asyncpg.Connection,
+    *,
+    alignment_idx: int,
+    prep_sample_idxs: list[int],
+    state: Literal["completed", "invalidated"],
+    reason: str | None,
+    principal_idx: int,
+) -> dict[str, list[int]]:
+    """Withdraw (or restore) specific RUNS of one alignment.
+
+    The twin of `set_mask_sample_states`, and the same rules: a `'pending'` row is
+    skipped (the align pipeline owns that value and would overwrite a withdrawal),
+    and each row's `FOR UPDATE` lock is taken before classifying, the lock every
+    other `alignment_sample` writer takes (`lock_alignment_sample`).
+
+    Returns `{"updated", "unchanged", "not_found", "skipped_pending"}`.
+    """
+    require_transaction(conn)
+    present = {
+        r["prep_sample_idx"]: r["state"]
+        for r in await conn.fetch(
+            "SELECT prep_sample_idx, state FROM qiita.alignment_sample"
+            " WHERE alignment_idx = $1 AND prep_sample_idx = ANY($2::bigint[])"
+            " ORDER BY prep_sample_idx"
+            " FOR UPDATE",
+            alignment_idx,
+            prep_sample_idxs,
+        )
+    }
+    not_found = [idx for idx in prep_sample_idxs if idx not in present]
+    skipped_pending = [idx for idx, st in present.items() if st == ALIGNMENT_SAMPLE_PENDING]
+    unchanged = [idx for idx, st in present.items() if st == state]
+    to_update = [idx for idx, st in present.items() if st not in (state, ALIGNMENT_SAMPLE_PENDING)]
+    if to_update:
+        invalidating = state == ALIGNMENT_SAMPLE_INVALIDATED
+        await conn.execute(
+            "UPDATE qiita.alignment_sample"
+            "    SET state = $3,"
+            "        invalidated_at = CASE WHEN $4::boolean THEN now() END,"
+            "        invalidated_by_idx = CASE WHEN $4::boolean THEN $5::bigint END,"
+            "        invalidation_reason = CASE WHEN $4::boolean THEN $6::text END"
+            "  WHERE alignment_idx = $1 AND prep_sample_idx = ANY($2::bigint[])",
+            alignment_idx,
+            to_update,
+            state,
+            invalidating,
+            principal_idx,
+            reason,
+        )
+    return {
+        "updated": sorted(to_update),
+        "unchanged": sorted(unchanged),
+        "not_found": sorted(not_found),
+        "skipped_pending": sorted(skipped_pending),
+    }
+
+
+class AlignmentHasLiveWork(Exception):
+    """Raised when deprecating an alignment that still has unfinished work tickets.
+    Deprecation is refused until they finish or are cancelled, so no block or de novo
+    run of a void config is still to write rows after it."""
+
+    def __init__(self, alignment_idx: int, work_ticket_idxs: list[int]) -> None:
+        self.alignment_idx = alignment_idx
+        self.work_ticket_idxs = work_ticket_idxs
+        super().__init__(
+            f"alignment {alignment_idx} has {len(work_ticket_idxs)} unfinished work"
+            f" ticket(s): {work_ticket_idxs}. Wait for them to finish, or cancel them,"
+            " then deprecate"
+        )
+
+
+async def refuse_deprecating_with_live_work(conn: asyncpg.Connection, alignment_idx: int) -> None:
+    """Raise AlignmentHasLiveWork if `alignment_idx` is active and any work ticket
+    under it is not terminal (held tickets included: the fan-out would release them).
+
+    Takes the definition row `FOR UPDATE`. Each writer of `work_ticket.alignment_idx`
+    takes it `FOR SHARE` (`lock_active_alignment`) in the transaction that writes the
+    column, so a plan either commits its tickets before this count or finds the row
+    deprecated. A de novo ticket the runner has not yet stamped with its alignment
+    is not counted; its stamp takes the share lock and refuses once the alignment is
+    deprecated. An already-deprecated row is not checked, so its reason can still be
+    corrected."""
+    require_transaction(conn)
+    status = await conn.fetchval(
+        "SELECT status FROM qiita.alignment_definition WHERE alignment_idx = $1 FOR UPDATE",
+        alignment_idx,
+    )
+    if status is None:
+        raise AlignmentDefinitionNotFound(alignment_idx)
+    if status != AlignmentDefinitionStatus.ACTIVE.value:
+        return
+    live = [
+        r["work_ticket_idx"]
+        for r in await conn.fetch(
+            "SELECT work_ticket_idx FROM qiita.work_ticket"
+            " WHERE alignment_idx = $1 AND state::text = ANY($2::text[])"
+            " ORDER BY work_ticket_idx",
+            alignment_idx,
+            list(NON_TERMINAL_WORK_TICKET_STATES),
+        )
+    ]
+    if live:
+        raise AlignmentHasLiveWork(alignment_idx, live)
+
+
+async def lock_active_alignment(conn: asyncpg.Connection, alignment_idx: int) -> None:
+    """Hold the definition row `FOR SHARE` for the caller's transaction and raise
+    AlignmentDefinitionDeprecated if it is deprecated. Called by every transaction
+    that writes `work_ticket.alignment_idx`, so a deprecation cannot commit between
+    the mint and the ticket recording it (`refuse_deprecating_with_live_work`)."""
+    require_transaction(conn)
+    row = await conn.fetchrow(
+        "SELECT status, deprecation_reason FROM qiita.alignment_definition"
+        " WHERE alignment_idx = $1 FOR SHARE",
+        alignment_idx,
+    )
+    if row is None:
+        raise AlignmentDefinitionNotFound(alignment_idx)
+    if row["status"] == AlignmentDefinitionStatus.DEPRECATED.value:
+        raise AlignmentDefinitionDeprecated(
+            f"alignment_definition {alignment_idx} is deprecated: {row['deprecation_reason']}"
+        )

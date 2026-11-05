@@ -504,9 +504,9 @@ async def test_delete_reference_blocked_by_alignment_definition_even_with_force(
     UNCONDITIONALLY — even with force. Align-block tickets leave work_ticket.
     reference_idx NULL, so the work-ticket gate cannot see them; the reference↔
     alignment link lives only in alignment_definition.params. Force must not bypass
-    it, because neither the cascade nor the data plane cleans the DuckLake
-    `alignment` rows the definition owns (keyed on feature_idx this delete would
-    orphan). The operator must DELETE /alignment-definition first."""
+    it: the DuckLake `alignment` rows are keyed on feature_idx this delete would
+    orphan, and no route deletes a completed alignment's rows. A deprecated
+    alignment blocks it the same way."""
     ref_idx = await _create_ref(client, f"del-align-{uuid.uuid4()}")
     align_idx = await postgres_pool.fetchval(
         "INSERT INTO qiita.alignment_definition (params_hash, params, created_by_idx)"
@@ -528,6 +528,19 @@ async def test_delete_reference_blocked_by_alignment_definition_even_with_force(
         )
         assert r2.status_code == 409, r2.text
         assert "alignment definition" in r2.json()["detail"]
+        assert "no route deletes a completed alignment's rows" in r2.json()["detail"]
+        # Deprecating the alignment does not release the reference.
+        await postgres_pool.execute(
+            "UPDATE qiita.alignment_definition SET status = 'deprecated',"
+            "       deprecated_at = now(), deprecation_reason = 'bad build',"
+            "       deprecated_by_idx = (SELECT MIN(idx) FROM qiita.principal)"
+            " WHERE alignment_idx = $1",
+            align_idx,
+        )
+        r3 = await client.delete(
+            URL_REFERENCE_BY_IDX.format(reference_idx=ref_idx), params={"force": "true"}
+        )
+        assert r3.status_code == 409, r3.text
         # The reference survives untouched.
         assert (
             await postgres_pool.fetchval(

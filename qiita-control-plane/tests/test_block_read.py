@@ -41,12 +41,12 @@ def test_align_block_resolves_to_the_mask_scoped_selector():
 def test_alignment_deleted_mid_flight_is_a_hard_error():
     """work_ticket.alignment_idx is ON DELETE SET NULL.
 
-    A mid-flight `DELETE /alignment-definition` NULLs the column while
+    Removing the alignment_definition row mid-flight NULLs the column while
     action_context still names the alignment. Falling through to the raw branch
     would stream un-QC'd, non-host-depleted reads into an aligner, so the
     disagreement must fail loudly instead.
     """
-    with pytest.raises(ValueError, match="deleted mid-flight"):
+    with pytest.raises(ValueError, match="removed by hand mid-flight"):
         resolve_block_read_scope(
             action_context={"alignment_idx": 7},
             ticket_alignment_idx=None,

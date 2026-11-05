@@ -118,7 +118,7 @@ from ..miint import (
     open_miint_conn,
     resolve_duckdb_memory_gb,
 )
-from ._assembly import LCG_FILE, NOLCG_FILE
+from ._assembly import LCG_FILE, NOLCG_FILE, READ_FASTX_MAX_BATCH_BYTES
 
 YAML_STEP_NAME = "assembly_hash"
 
@@ -131,10 +131,6 @@ _FASTA_GLOBS = ("*.fna", "*.fna.gz", "*.fa", "*.fa.gz", "*.fasta", "*.fasta.gz")
 # co-consumer), so it gets the allocation minus headroom.
 _DUCKDB_MEMORY_GB = 6
 _DUCKDB_THREADS = 4
-
-# Byte budget for each `read_fastx` batch — caps the read-side vector so a run of
-# multi-MB contig records can't materialise a giant chunk before the chunker runs.
-_READ_FASTX_MAX_BATCH_BYTES = "128MB"
 
 # The synthetic read_id (module docstring), over a `read_fastx rf` x `file_meta fm`
 # join. Both passes compose it and pass 2 joins `winner` on the string pass 1
@@ -281,7 +277,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 f"  {_READ_ID_EXPR} AS read_id, "
                 f"  {canonical_sequence_hash_expr('rf.sequence1')} AS sequence_hash, "
                 "  CAST(length(rf.sequence1) AS BIGINT) AS sequence_length_bp "
-                f"FROM read_fastx(?, max_batch_bytes:='{_READ_FASTX_MAX_BATCH_BYTES}', "
+                f"FROM read_fastx(?, max_batch_bytes:='{READ_FASTX_MAX_BATCH_BYTES}', "
                 "  include_filepath:=true) rf "
                 "JOIN file_meta fm ON rf.filepath = fm.filepath",
                 [paths],
@@ -348,7 +344,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 "  SELECT sequence_hash, c.chunk_index, c.chunk_data FROM ("
                 "    SELECT w.sequence_hash AS sequence_hash, "
                 f"      UNNEST({sequence_split_expr('rf.sequence1')}) AS c "
-                f"    FROM read_fastx(?, max_batch_bytes:='{_READ_FASTX_MAX_BATCH_BYTES}', "
+                f"    FROM read_fastx(?, max_batch_bytes:='{READ_FASTX_MAX_BATCH_BYTES}', "
                 "      include_filepath:=true) rf "
                 "    JOIN file_meta fm ON rf.filepath = fm.filepath "
                 f"    JOIN winner w ON w.read_id = ({_READ_ID_EXPR})"

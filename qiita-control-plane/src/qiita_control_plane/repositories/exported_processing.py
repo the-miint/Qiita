@@ -18,8 +18,9 @@ _SELECT_LIVE = (
 class ProcessingVanishedError(RuntimeError):
     """The processing had no live handle after minting one for it.
 
-    The only way to get here is a concurrent purge of the alignment, which retires
-    the handles it named.
+    Reachable only if the alignment_definition row is removed concurrently, which
+    retires the handles it named. `qiita_common.actions`, at `BLOCK_MASK_ACTION_ID`,
+    says how one can be removed.
     """
 
     def __init__(self, alignment_idx: int) -> None:
@@ -44,7 +45,7 @@ async def mint_exported_processing(
 
     Raises `ProcessingVanishedError` rather than returning None. The INSERT
     guarantees a live row at the moment it runs, but READ COMMITTED means the SELECT
-    takes a fresh snapshot, so an alignment purged in between retires the row and it
+    takes a fresh snapshot, so an alignment_definition row removed in between retires the row and it
     drops out — and a manifest citing nothing is worse than a failed build.
     """
     async with pool.acquire() as conn, conn.transaction():

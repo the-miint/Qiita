@@ -62,6 +62,7 @@ from typing import Any
 
 import httpx
 from qiita_common.duckdb_miint import miint_job_env
+from qiita_common.workspace import WORK_TICKET_SUBDIR
 
 from ..config import (
     CORRECT_COMPUTE_READINESS_INVOCATION,
@@ -532,10 +533,8 @@ else
 fi
 rm -f "$MIINT_AMPLICON_PROBE"
 
-# The `/ticket` leaf must match the control plane's PATH_SCRATCH/ticket
-# derivation (qiita_control_plane.config.Settings.from_env) — that's the
-# per-ticket workspace SLURM jobs actually run in.
-SF="${{PATH_SCRATCH:-{sf_default}}}/ticket"
+# The per-ticket workspace that SLURM jobs run in (qiita_common.workspace).
+SF="${{PATH_SCRATCH:-{sf_default}}}/{WORK_TICKET_SUBDIR}"
 if [ -d "$SF" ]; then
     echo "{_PROBE_LINE_PREFIX} shared-fs-visible=ok path=$SF"
     PROBE_DIR="$SF/.compute-readiness.$$"
@@ -638,7 +637,7 @@ def _default_probe_log_dir(settings: Settings) -> Path:
     previous default — node-local /tmp — was written on the compute node and
     unreadable from the head node, so slurm-probe-log always failed to open it
     and those results never surfaced."""
-    return Path(settings.path_scratch) / "ticket"
+    return Path(settings.path_scratch) / WORK_TICKET_SUBDIR
 
 
 async def submit_probe_and_collect(

@@ -362,3 +362,44 @@ async def _seed_ticket(sample) -> int:
         sample["principal_idx"],
         sample["prep_sample_idx"],
     )
+
+
+async def test_an_invalidated_run_is_not_re_run_under_the_same_identity(sample):
+    """The workflow's first tail step deletes the sample's alignment rows, which would
+    destroy the output a withdrawal judged, and its terminal step could not complete the
+    row anyway. So the gate step refuses before any step runs."""
+    pool = sample["pool"]
+    alignment_idx = (await _resolve(sample))["alignment_idx"]
+    await _create_alignment_gate_pending(
+        pool, alignment_idx=alignment_idx, prep_sample_idx=sample["prep_sample_idx"]
+    )
+    await pool.execute(
+        "UPDATE qiita.alignment_sample SET state = 'invalidated', invalidated_at = now(),"
+        "       invalidated_by_idx = $3, invalidation_reason = 'bad run'"
+        " WHERE alignment_idx = $1 AND prep_sample_idx = $2",
+        alignment_idx,
+        sample["prep_sample_idx"],
+        sample["principal_idx"],
+    )
+    with pytest.raises(Exception, match="invalidated"):
+        await _create_alignment_gate_pending(
+            pool, alignment_idx=alignment_idx, prep_sample_idx=sample["prep_sample_idx"]
+        )
+    assert await _gate_state(sample, alignment_idx) == "invalidated"
+
+
+async def test_a_deprecated_alignment_is_refused_on_mint_and_on_resume(sample):
+    ticket = await _seed_ticket(sample)
+    first = await _resolve(sample, work_ticket_idx=ticket)
+    await _persist_alignment_idx(sample["pool"], ticket, first["alignment_idx"])
+    await sample["pool"].execute(
+        "UPDATE qiita.alignment_definition SET status = 'deprecated', deprecated_at = now(),"
+        "       deprecated_by_idx = $2, deprecation_reason = 'bad preset'"
+        " WHERE alignment_idx = $1",
+        first["alignment_idx"],
+        sample["principal_idx"],
+    )
+    with pytest.raises(Exception, match="bad preset"):
+        await _resolve(sample, work_ticket_idx=ticket)
+    with pytest.raises(Exception, match="bad preset"):
+        await _resolve(sample)

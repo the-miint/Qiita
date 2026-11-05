@@ -21,11 +21,11 @@ from ..repositories.mask_definition import (
     RESOLVED_SYNDNA_KEY,
     SYNDNA_REFERENCE_IDX_KEY,
     MaskDefinitionDeprecated,
+    lock_active_mask,
     mint_mask_definition,
 )
 from ..repositories.reference_membership import reference_sequence_set_hash
 from ._base import _log, _workflow_declares_action
-from ._db import persist_ticket_idx
 from ._reference import QC_ADAPTER_BINDING, _resolve_qc_adapters
 from ._upload import _submission_bad_input
 
@@ -500,10 +500,21 @@ async def _persist_mask_idx(pool: asyncpg.Pool, work_ticket_idx: int, mask_idx: 
     """Write the minted `mask_idx` onto the ticket row (durable ticket→mask
     traceability + a cheap shared-mask guard). Idempotent: a re-mint on resume
     re-resolves to the same mask_idx via the config-hash upsert, so re-running
-    this writes the same value."""
-    await persist_ticket_idx(
-        pool, column="mask_idx", work_ticket_idx=work_ticket_idx, value=mask_idx
-    )
+    this writes the same value.
+
+    Holds the mask row `FOR SHARE` across the write and refuses a deprecated mask
+    (`lock_active_mask`), so a deprecation that counted this ticket's work as absent
+    cannot be followed by the ticket recording it."""
+    async with pool.acquire() as conn, conn.transaction():
+        try:
+            await lock_active_mask(conn, mask_idx)
+        except MaskDefinitionDeprecated as exc:
+            raise _submission_bad_input(exc.detail) from exc
+        await conn.execute(
+            "UPDATE qiita.work_ticket SET mask_idx = $1 WHERE work_ticket_idx = $2",
+            mask_idx,
+            work_ticket_idx,
+        )
 
 
 async def _materialize_adapter_set_hashes(
