@@ -1,7 +1,7 @@
 ### Changed
 
 - **Study members can write biosample and prep_sample metadata and create study
-  fields, within their visibility tier (#TBD).**
+  fields, within their visibility tier (#838).**
   A write may touch only the fields and values that the caller can read, by the same
   rule that the metadata reads apply.
   - `PATCH /study/{study_idx}/biosample/{biosample_idx}/metadata`,

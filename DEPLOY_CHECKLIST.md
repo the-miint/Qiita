@@ -224,7 +224,7 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
   ETag instead. The study-scoped reads' ETag no longer works as If-Match for
   `PATCH /biosample/{b}` or `PATCH /sequenced-sample/{q}`; a client uses the ETag from the
   GET on the PATCH's own path (the `qiita` CLI already does).
-- (#feat/metadata-tier-writes) Soft API-contract change: the study-scoped biosample and
+- (#838) Soft API-contract change: the study-scoped biosample and
   sequenced-sample metadata PATCHes and the study-field create and edit routes
   (`/study/{s}/biosample-field`, `/study/{s}/prep-sample-field`) now admit `member` and
   above instead of only `admin`. A write naming a field, or touching a value, above the
