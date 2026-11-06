@@ -1365,8 +1365,8 @@ def require_tiers_read_every_value(tiers: CallerMetadataTiers, *, study_idx: int
     An import calls this first. Creating a biosample or a prep_sample with its
     metadata requires admin on the study, so an import writes only values that
     its caller can read, including those that it writes without a tier check.
-    A caller below admin here is a defect in the caller, so it raises
-    RuntimeError.
+    Tiers below admin here mean that the calling code skipped the gate that its
+    route applies, which is a defect rather than a refusal.
     """
     held = tiers.tier_on(study_idx)
     if held is not Tier.ADMIN:
@@ -3479,11 +3479,10 @@ async def write_resolved_metadata_entries(
     Every value that the write would touch must be one that a caller at `tiers`
     may read once it is written. Otherwise MetadataValueTierError names the
     caller's keys for the values that fail, and no write persists. Every entry
-    is checked before the first write (_fetch_keys_restricted_on_entity), so
-    the answer depends neither on what the caller sent nor on which restricted
-    values exist. The values are checked again once written, which catches a
-    tier that a concurrent transaction changed in between; the caller's
-    transaction then rolls every write back.
+    is checked before the first write (_fetch_keys_restricted_on_entity says
+    what that answer depends on). The values are checked again once written,
+    which catches a tier that a concurrent transaction changed in between; the
+    caller's transaction then rolls every write back.
     """
     require_transaction(conn)
     restricted_keys = await _fetch_keys_restricted_on_entity(
@@ -3564,40 +3563,63 @@ async def _fetch_keys_restricted_on_entity(
     `tiers` may not read, either as it is stored now or once a write through
     study_idx stores it.
 
-    A key is named when its slot already holds a value that the caller cannot
-    read, or when an exception on its slot requires more than the caller's tier
-    on study_idx, whether or not the slot holds a value yet. An exception names
-    the key either way, so the answer does not show whether a restricted value
-    exists. A global entry's slot is the entity's one value for that global
-    field, whichever study wrote it; a local entry's is the value through its
+    A key is named for either of two reasons. Its slot already holds a value
+    that the caller cannot read. Or an exception on its slot requires more than
+    the caller's tier on study_idx, whether or not the slot holds a value yet.
+    The second restates, for a slot that may hold no row yet, the exception
+    joins of `spec.visibility_function`: an exception keyed on the global field,
+    or on the study field that the write lands on. The field's own tier is
+    preflight_sample_metadata's check.
+
+    An exception names its key whether or not a value is stored, so the answer
+    does not show whether a value under an exception exists. A hidden value
+    under no exception, such as another study's value in a global field, does
+    show; docs/architecture/data-model.md lists it under "What a refused write
+    can still reveal".
+
+    A global entry's slot is the entity's one value for that global field,
+    whichever study wrote it; a local entry's is the value through its
     study-local field.
     """
     if not resolved:
         return []
+    # The study field that the write lands on is the matched row, or, for a
+    # global matched by its own name, the study's row at that name linked to
+    # it, which is how the write resolves it
+    # (_get_or_create_globally_linked_study_field).
     rows = await conn.fetch(
-        f"SELECT k.key"
-        f"  FROM unnest($4::text[], $5::bigint[], $6::bigint[]) WITH ORDINALITY"
-        f"       AS k(key, global_field_idx, study_field_idx, position)"
-        f" WHERE EXISTS ("
-        f"           SELECT 1 FROM {visible_metadata_source(spec)}"
-        f"            WHERE m.{spec.entity_key_column} = $7"
-        f"              AND NOT m.visible"
-        f"              AND (m.global_field_idx = k.global_field_idx"
-        f"                   OR (k.global_field_idx IS NULL"
-        f"                       AND m.{spec.study_field_idx_column} = k.study_field_idx)))"
-        f"    OR EXISTS ("
-        f"           SELECT 1 FROM {spec.field_exception_table} e"
-        f"            WHERE e.{spec.entity_key_column} = $7"
-        f"              AND (e.global_field_idx = k.global_field_idx"
-        f"                   OR e.{spec.study_field_idx_column} = k.study_field_idx)"
-        f"              AND e.tier_override > $8::qiita.tier)"
-        f" ORDER BY k.position",
+        f"WITH hidden AS MATERIALIZED ("
+        f"         SELECT m.global_field_idx, m.{spec.study_field_idx_column} AS study_field_idx"
+        f"           FROM {visible_metadata_source(spec)}"
+        f"          WHERE m.{spec.entity_key_column} = $8 AND NOT m.visible),"
+        f"     restricted AS MATERIALIZED ("
+        f"         SELECT e.global_field_idx, e.{spec.study_field_idx_column} AS study_field_idx"
+        f"           FROM {spec.field_exception_table} e"
+        f"          WHERE e.{spec.entity_key_column} = $8 AND e.tier_override > $9::qiita.tier)"
+        f" SELECT k.key"
+        f"   FROM unnest($4::text[], $5::bigint[], $6::bigint[], $7::text[]) WITH ORDINALITY"
+        f"        AS k(key, global_field_idx, study_field_idx, canonical_display, position)"
+        f"   LEFT JOIN {spec.study_field_table} sf"
+        f"          ON sf.study_idx = $10"
+        f"         AND sf.display_name = k.canonical_display"
+        f"         AND sf.{spec.study_field_global_fk_column}"
+        f"             IS NOT DISTINCT FROM k.global_field_idx"
+        f"  WHERE EXISTS (SELECT 1 FROM hidden h"
+        f"                 WHERE h.global_field_idx = k.global_field_idx"
+        f"                    OR (k.global_field_idx IS NULL"
+        f"                        AND h.study_field_idx = k.study_field_idx))"
+        f"     OR EXISTS (SELECT 1 FROM restricted r"
+        f"                 WHERE r.global_field_idx = k.global_field_idx"
+        f"                    OR r.study_field_idx = COALESCE(k.study_field_idx, sf.idx))"
+        f"  ORDER BY k.position",
         *tiers.sql_args(),
         [rf.caller_key for rf in resolved],
         [rf.global_field_idx for rf in resolved],
         [rf.study_field_idx for rf in resolved],
+        [rf.canonical_display for rf in resolved],
         entity_idx,
         tiers.tier_on(study_idx).value,
+        study_idx,
     )
     return [row["key"] for row in rows]
 

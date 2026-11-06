@@ -521,11 +521,11 @@ def caller_tier_reaches(row: CallerStudyAccessRow, *, caller: Principal, tier: T
 
 # The role at or above which a caller reads and writes every metadata value on
 # every study, whatever its tier. A route that admits a caller by role and then
-# reads or writes metadata passes this constant as its bypass
-# (`require_study_access(bypass_role=METADATA_BYPASS_ROLE)`), so the route and
-# the metadata rule agree on who reads everything. If they disagreed, a caller
-# that the route admitted by role, with no grant on the study, would read only
-# its public values. The wet-lab routes that call
+# reads or writes metadata passes this constant, as its bypass
+# (`require_study_access(bypass_role=METADATA_BYPASS_ROLE)`) or as its role
+# gate, so the route and the metadata rule agree on who reads everything. If
+# they disagreed, a caller that the route admitted by role, with no grant on
+# the study, would read only its public values. The wet-lab routes that call
 # `require_role_at_least(SystemRole.WET_LAB_ADMIN)` admit that role for their
 # own work, not in place of a grant, so they name the role directly.
 METADATA_BYPASS_ROLE = SystemRole.WET_LAB_ADMIN

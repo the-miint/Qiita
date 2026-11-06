@@ -303,23 +303,32 @@ async def test_write_refuses_into_empty_slot_carrying_exception(ctx, spec):
 
 @pytest.mark.parametrize("spec", SPECS, ids=_spec_id)
 @pytest.mark.parametrize(
+    "global_exception_key",
+    ["global_field", "link_row"],
+    ids=["on-global-field", "on-link-row"],
+)
+@pytest.mark.parametrize(
     ("global_held", "local_held"),
     [(True, False), (False, True), (True, True), (False, False)],
     ids=["global-held", "local-held", "both-held", "neither-held"],
 )
 async def test_refusal_names_the_same_keys_whether_a_restricted_value_exists(
-    ctx, spec, global_held, local_held
+    ctx, spec, global_exception_key, global_held, local_held
 ):
     """Tests the case where one body names two values under exceptions above
-    the caller's tier, one keyed on a global field and one on a local field.
-    The refusal names both keys whichever of them already holds a value, so
-    it does not show which hidden values exist.
+    the caller's tier, one on a global field and one on a local field, around
+    a value that no exception restricts. The global field's exception is keyed
+    either on the global field or on the study's link row to it, which the
+    body reaches by the global's own name. The refusal names the two
+    restricted keys whichever of them already holds a value, so it does not
+    show which hidden values exist.
     """
     entity_idx = await _create_linked_entity_for_spec(ctx, spec)
     global_field_idx, global_name, alias_idx = await _global_field(
         ctx, spec, default_tier=Tier.PUBLIC, alias=True
     )
     local_field_idx, local_name = await _local_field(ctx, spec, tier_override=Tier.PUBLIC)
+    _, open_name = await _local_field(ctx, spec, tier_override=Tier.PUBLIC)
     for held, study_field_idx in ((global_held, alias_idx), (local_held, local_field_idx)):
         if held:
             await seed_metadata_text_value(
@@ -329,7 +338,12 @@ async def test_refusal_names_the_same_keys_whether_a_restricted_value_exists(
                 study_field_idx=study_field_idx,
                 created_by_idx=ctx["principal_idx"],
             )
-    for key in ({"global_field_idx": global_field_idx}, {"study_field_idx": local_field_idx}):
+    global_key = (
+        {"global_field_idx": global_field_idx}
+        if global_exception_key == "global_field"
+        else {"study_field_idx": alias_idx}
+    )
+    for key in (global_key, {"study_field_idx": local_field_idx}):
         await seed_field_exception(
             ctx["pool"],
             spec=spec,
@@ -345,7 +359,7 @@ async def test_refusal_names_the_same_keys_whether_a_restricted_value_exists(
             ctx,
             spec,
             entity_idx=entity_idx,
-            metadata={global_name: "sent", local_name: "sent"},
+            metadata={global_name: "sent", open_name: "sent", local_name: "sent"},
             tiers=_tiers_on(ctx["study_idx"], Tier.MEMBER),
         )
 

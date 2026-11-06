@@ -1221,6 +1221,15 @@ async def test_patch_study_field_widen_admits_a_concurrent_write(ctx, surface, m
 # ---------------------------------------------------------------------------
 
 
+async def _stored_attribute(ctx, surface, field_idx, attribute):
+    """Read one attribute straight from the field's row, to show what an edit
+    left there."""
+    return await ctx["pool"].fetchval(
+        f"SELECT {attribute} FROM {surface.metadata_spec.study_field_table} WHERE idx = $1",
+        field_idx,
+    )
+
+
 async def _fields_named(ctx, surface, *, study_idx: int, display_name: str) -> int:
     return await ctx["pool"].fetchval(
         f"SELECT count(*) FROM {surface.metadata_spec.study_field_table}"
@@ -1355,15 +1364,12 @@ async def test_patch_field_tier_override_requires_admin(ctx, surface, tier, expe
     assert resp.status_code == expected, resp.text
     if expected == 403:
         assert "tier_override" in resp.json()["detail"]
-    stored = await ctx["pool"].fetchval(
-        f"SELECT tier_override FROM {surface.metadata_spec.study_field_table} WHERE idx = $1",
-        field_idx,
-    )
+    stored = await _stored_attribute(ctx, surface, field_idx, "tier_override")
     assert stored == (None if expected == 403 else Tier.PUBLIC)
 
 
-# Each attribute that only an admin may change, with the type a field is
-# created at and a value of the attribute that changes it.
+# Each attribute that is judged against the field's values, with the type that
+# a field is created with and a value of the attribute that changes it.
 _VALUE_POLICY_EDITS = pytest.mark.parametrize(
     ("attribute", "created_type", "sent"),
     [
@@ -1372,13 +1378,6 @@ _VALUE_POLICY_EDITS = pytest.mark.parametrize(
     ],
     ids=["unique_in_study", "data_type"],
 )
-
-
-async def _stored_attribute(ctx, surface, field_idx, attribute):
-    return await ctx["pool"].fetchval(
-        f"SELECT {attribute} FROM {surface.metadata_spec.study_field_table} WHERE idx = $1",
-        field_idx,
-    )
 
 
 @pytest.mark.parametrize("surface", SAMPLE_FIELD_SURFACES, ids=_surface_id)
@@ -1416,7 +1415,8 @@ async def test_patch_field_value_policy_requires_admin(
 
     assert resp.status_code == expected, resp.text
     if expected == 403:
-        # The detail names the attribute, which the member tier alone refuses.
+        # The admin-only rule names the attribute; the field-tier rule would
+        # name the field.
         assert attribute in resp.json()["detail"]
     stored = await _stored_attribute(ctx, surface, field_idx, attribute)
     assert stored == (before if expected == 403 else sent)
@@ -1428,10 +1428,10 @@ async def test_member_policy_refusal_does_not_depend_on_the_field_values(
     ctx, surface, attribute, created_type, sent
 ):
     """Tests the case where a member names a policy attribute on a field whose
-    values would refuse the change for an admin: two of them share a value, or
-    one sits on a published sample. The member gets the 403 that names the
+    values refuse the change for an admin: two of them share a value, or one
+    sits on a published sample. The member gets the 403 that names the
     attribute, the same as on a field with no values, and the field is
-    unchanged.
+    unchanged. The owner's same edit, refused for the values, is the control.
     """
     study_idx = await _seed_authz_case_study(
         ctx, owner_key="wet", grant_tier=Tier.MEMBER, case=f"policy-values-{attribute}"
@@ -1470,6 +1470,17 @@ async def test_member_policy_refusal_does_not_depend_on_the_field_values(
     assert detail.startswith(f"setting {attribute} on a {surface.metadata_spec.entity_kind}")
     assert await _stored_attribute(ctx, surface, field_idx, attribute) == before
 
+    control = await patch_study_field(
+        surface=surface,
+        client=ctx["wet"],
+        study_idx=study_idx,
+        study_field_idx=field_idx,
+        if_match=await _etag(ctx, surface, field_idx),
+        **{attribute: sent},
+    )
+    assert control.status_code == 409, control.text
+    assert await _stored_attribute(ctx, surface, field_idx, attribute) == before
+
 
 @pytest.mark.parametrize("surface", SAMPLE_FIELD_SURFACES, ids=_surface_id)
 async def test_patch_field_above_caller_tier_refused(ctx, surface):
@@ -1503,8 +1514,4 @@ async def test_patch_field_above_caller_tier_refused(ctx, surface):
 
     assert resp.status_code == 403, resp.text
     assert display_name in resp.json()["detail"]
-    stored = await ctx["pool"].fetchval(
-        f"SELECT description FROM {surface.metadata_spec.study_field_table} WHERE idx = $1",
-        field_idx,
-    )
-    assert stored is None
+    assert await _stored_attribute(ctx, surface, field_idx, "description") is None
