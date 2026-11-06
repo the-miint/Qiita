@@ -47,6 +47,7 @@ from qiita_control_plane.testing.db_teardown import (
     delete_principal,
     teardown_ena_study_graph,
 )
+from qiita_control_plane.testing.tiers import ADMIN_EVERYWHERE
 from qiita_control_plane.testing.unique_names import unique_accession, unique_ena_accession
 
 pytestmark = pytest.mark.db
@@ -228,6 +229,7 @@ async def _register(reg, *, study_header, ena_runs, sample_attributes=()):
         sample_attributes=list(sample_attributes),
         owner_idx=reg["owner_idx"],
         caller_idx=reg["caller_idx"],
+        tiers=ADMIN_EVERYWHERE,
     )
 
 
@@ -1469,6 +1471,7 @@ async def test_library_field_wrong_data_type_fails_the_whole_study_first(reg):
             sample_attributes=[],
             owner_idx=reg["owner_idx"],
             caller_idx=reg["caller_idx"],
+            tiers=ADMIN_EVERYWHERE,
         )
     # The refusal names the field, since the fix (rename/clear the field) is
     # the submitter's to make.
@@ -1541,6 +1544,7 @@ async def test_library_field_unique_in_study_fails_the_whole_study_first(reg):
             sample_attributes=[],
             owner_idx=reg["owner_idx"],
             caller_idx=reg["caller_idx"],
+            tiers=ADMIN_EVERYWHERE,
         )
     assert ENA_LIBRARY_STRATEGY_FIELD_NAME in str(excinfo.value)
 

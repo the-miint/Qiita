@@ -47,6 +47,7 @@ from qiita_common.models.ena_import import (
     EnaRunImportOutcome,
 )
 
+from ..auth.guards import caller_metadata_tiers
 from ..auth.principal import HumanUser, PrincipalUnusableError, load_human_user
 from ..repositories.ena_import_batch import (
     FailedDownload,
@@ -612,6 +613,7 @@ async def _process_one_study(
             sample_attributes=sample_attributes,
             owner_idx=principal.principal_idx,
             caller_idx=principal.principal_idx,
+            tiers=await caller_metadata_tiers(pool, principal),
         )
         run_outcomes = await _mark_runs_held_not_downloaded(pool, result.ena_runs)
         await _set_item_registered(

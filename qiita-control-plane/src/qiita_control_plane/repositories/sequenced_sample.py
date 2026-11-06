@@ -41,6 +41,7 @@ from ._sample_helpers import (
 )
 from .prep_sample import insert_prep_sample
 from .prep_sample_metadata import PREP_SAMPLE_METADATA_SPEC
+from .study_access import CallerMetadataTiers
 
 # The single supported processing_kind today. The supertype's
 # processing_kind column is plain NOT NULL (not GENERATED ALWAYS), so the
@@ -278,6 +279,7 @@ async def import_sequenced_prep_sample(
     primary_study_idx: int,
     secondary_study_idxs: Sequence[int] = (),
     caller_idx: int,
+    tiers: CallerMetadataTiers,
     metadata_checklist_idx: int | None = None,
     ena_experiment_accession: str | None = None,
     ena_run_accession: str | None = None,
@@ -312,7 +314,8 @@ async def import_sequenced_prep_sample(
          prep_sample_study_field for a global field and through the existing
          local field row otherwise. A name matching neither raises. This must
          follow step 5 because the reject_if_link_retired trigger fires on each
-         metadata insert.
+         metadata insert. tiers is the caller's, and bounds the write as
+         `write_sample_metadata` says.
 
     Unknown-name, parse-failure, and unresolved-terminology cases raise
     typed exceptions. The caller must wrap the call in `async with
@@ -385,6 +388,7 @@ async def import_sequenced_prep_sample(
         caller_idx=caller_idx,
         allow_local=True,
         global_internal_names=global_internal_names,
+        tiers=tiers,
     )
 
     return SequencedPrepSampleImportResult(
