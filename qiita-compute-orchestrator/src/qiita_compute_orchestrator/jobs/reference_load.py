@@ -552,9 +552,10 @@ def _write_taxonomy(
     _warn_anomaly(
         conn,
         "SELECT list(DISTINCT read_id ORDER BY read_id) FROM parsed_taxonomy"
+        " WHERE ranks IS NOT NULL"
         " GROUP BY feature_idx HAVING count(DISTINCT ranks) > 1 ORDER BY min(read_id)",
         "feature(s) carry more than one distinct lineage; keeping the lineage of the "
-        "lexicographically smallest read_id",
+        "lexicographically smallest read_id that carries one",
     )
 
     # LEFT JOIN off the distinct reference feature set (same features

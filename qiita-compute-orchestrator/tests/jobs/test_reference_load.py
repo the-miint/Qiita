@@ -457,7 +457,7 @@ def test_conflicting_lineages_on_one_feature_keep_the_smallest_read_id(
 ):
     """Two read_ids of one feature with different lineages: the feature takes the
     lexicographically smallest read_id's — not whichever row came first — and warns."""
-    inputs = _with_twin(staging_inputs, tmp_path, twin="aaa_twin_of_seq1", of="seq1")
+    inputs = _with_twins(staging_inputs, tmp_path, {"aaa_twin_of_seq1": "seq1"})
     tax = _write_taxonomy_parquet(
         tmp_path / "taxonomy.parquet",
         [(name, _TAXONOMY_STRINGS[name]) for name in _TEST_SEQUENCES]
@@ -478,7 +478,7 @@ def test_conflicting_lineages_on_one_feature_keep_the_smallest_read_id(
 
 
 def test_agreeing_lineages_on_one_feature_do_not_warn(staging_inputs, tmp_path, caplog):
-    inputs = _with_twin(staging_inputs, tmp_path, twin="aaa_twin_of_seq1", of="seq1")
+    inputs = _with_twins(staging_inputs, tmp_path, {"aaa_twin_of_seq1": "seq1"})
     tax = _write_taxonomy_parquet(
         tmp_path / "taxonomy.parquet",
         [(name, _TAXONOMY_STRINGS[name]) for name in _TEST_SEQUENCES]
@@ -492,9 +492,9 @@ def test_agreeing_lineages_on_one_feature_do_not_warn(staging_inputs, tmp_path, 
 def test_a_null_lineage_on_the_smallest_read_id_does_not_displace_a_lineage(
     staging_inputs, tmp_path, caplog
 ):
-    """A NULL taxonomy carries no lineage, so the feature takes the one its other
-    read_id carries, though the NULL's read_id sorts first."""
-    inputs = _with_twin(staging_inputs, tmp_path, twin="aaa_twin_of_seq1", of="seq1")
+    """A NULL taxonomy carries no lineage, so the feature takes the lineage that its
+    other read_id carries, even though the read_id with the NULL taxonomy sorts first."""
+    inputs = _with_twins(staging_inputs, tmp_path, {"aaa_twin_of_seq1": "seq1"})
     tax = _write_taxonomy_parquet(
         tmp_path / "taxonomy.parquet",
         [(name, _TAXONOMY_STRINGS[name]) for name in _TEST_SEQUENCES]
@@ -510,6 +510,32 @@ def test_a_null_lineage_on_the_smallest_read_id_does_not_displace_a_lineage(
         ).fetchone()[0]
     assert genus == "Lactobacillus"
     assert _load_warnings(caplog) == []
+
+
+def test_a_conflict_warning_names_only_read_ids_that_carry_a_lineage(
+    staging_inputs, tmp_path, caplog
+):
+    """The read_id with the NULL taxonomy sorts first but carries no lineage, so the
+    warning starts from seq1, whose lineage is the one kept."""
+    inputs = _with_twins(
+        staging_inputs, tmp_path, {"aaa_twin_of_seq1": "seq1", "zzz_twin_of_seq1": "seq1"}
+    )
+    tax = _write_taxonomy_parquet(
+        tmp_path / "taxonomy.parquet",
+        [(name, _TAXONOMY_STRINGS[name]) for name in _TEST_SEQUENCES]
+        + [("aaa_twin_of_seq1", None), ("zzz_twin_of_seq1", _TAXONOMY_STRINGS["seq2"])],
+    )
+    with caplog.at_level(logging.WARNING, logger=_REFERENCE_LOAD_LOGGER):
+        outputs = _run(_inputs(**inputs, taxonomy_path=tax), tmp_path / "ws")
+    pq = outputs["staging_dir"] / "reference_taxonomy.parquet"
+    seq1_fidx = _FEATURE_MAP[_HASHES["seq1"]]
+    with duckdb.connect(":memory:") as conn:
+        genus = conn.execute(
+            f"SELECT genus FROM '{pq}' WHERE feature_idx = {seq1_fidx}"
+        ).fetchone()[0]
+    assert genus == "Lactobacillus"
+    [warning] = [w for w in _load_warnings(caplog) if "more than one distinct lineage" in w]
+    assert "['seq1', 'zzz_twin_of_seq1']" in warning
 
 
 @pytest.mark.parametrize(
@@ -703,16 +729,16 @@ def _raw_jplace(path: Path, placements: list[tuple[str, int]], *, tree: str = _J
     return path
 
 
-def _with_twin(staging_inputs: dict, tmp_path: Path, *, twin: str, of: str) -> dict:
-    """`staging_inputs` with one more manifest read_id, `twin`, whose sequence
-    canonicalizes to `of`'s — two names for one feature, as a reverse-complement pair or
-    a repeated record would be."""
-    manifest = tmp_path / "manifest_with_twin.parquet"
+def _with_twins(staging_inputs: dict, tmp_path: Path, twins: dict[str, str]) -> dict:
+    """`staging_inputs` with more manifest read_ids, each `twin` in `twins` sharing the
+    sequence of the read_id it maps to: several names for one feature, as a
+    reverse-complement pair or a repeated record would be."""
+    manifest = tmp_path / "manifest_with_twins.parquet"
     _write_parquet(
         manifest,
         "read_id VARCHAR, sequence_hash UUID, sequence_length_bp BIGINT",
         [(name, str(_HASHES[name]), len(_TEST_SEQUENCES[name])) for name in _TEST_SEQUENCES]
-        + [(twin, str(_HASHES[of]), len(_TEST_SEQUENCES[of]))],
+        + [(twin, str(_HASHES[of]), len(_TEST_SEQUENCES[of])) for twin, of in twins.items()],
     )
     return {**staging_inputs, "manifest": manifest}
 
@@ -855,7 +881,7 @@ def test_a_tree_other_than_the_jplaces_is_refused(staging_inputs, tmp_path, tree
 def test_a_feature_placed_under_two_fragments_keeps_the_smallest(staging_inputs, tmp_path, caplog):
     """Two read_ids of one feature, each placed: the feature takes the lexicographically
     smallest fragment's placement — not whichever came first in the file — and warns."""
-    inputs = _with_twin(staging_inputs, tmp_path, twin="aaa_twin_of_seq1", of="seq1")
+    inputs = _with_twins(staging_inputs, tmp_path, {"aaa_twin_of_seq1": "seq1"})
     jplace = _raw_jplace(
         tmp_path / "in.jplace", [("seq1", 0), ("seq2", 1), ("aaa_twin_of_seq1", 2)]
     )

@@ -137,11 +137,12 @@ def test_buffer_refills_mid_value(tmp_path, monkeypatch):
         ("1234567", '{"version": 1234'),
         ("3.5", '{"version": 3.'),
         ("1e5", '{"version": 1e'),
+        ("2E-3", '{"version": 2E-'),
     ],
 )
 def test_a_number_cut_by_the_buffer_end_is_read_whole(tmp_path, monkeypatch, number, first_read):
     """The first read ends partway through a top-level number: within its digits, or
-    just after its "." or "e"."""
+    just after its "." or an unfinished exponent."""
     raw = '{"version": ' + number + ', "fields": ' + json.dumps(list(EXPECTED_FIELDS))
     raw += ', "placements": ' + json.dumps(_PLACEMENTS) + ', "tree": ' + json.dumps(_TREE) + "}"
     assert raw.startswith(first_read)

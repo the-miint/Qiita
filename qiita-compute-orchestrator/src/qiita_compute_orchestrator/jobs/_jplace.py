@@ -57,8 +57,11 @@ _PART_PREFIX = b'{"placements": ['
 _PART_SUFFIX = b"]}"
 
 _DECODER = json.JSONDecoder()
-# A character that can continue a JSON number past where `raw_decode` stopped.
-_NUMBER_CONTINUES = frozenset("0123456789.eE+-")
+# What `raw_decode` leaves unread of a valid number cut short by the buffer's end. It
+# takes the longest number it can, so the rest is nothing ("12" of "123"), or a "." or
+# an exponent it could not finish ("3" of "3.5", "1" of "1e+5"). Anything else after a
+# number is malformed, and is not read further looking for more.
+_CUT_NUMBER_TAILS = frozenset({"", ".", "e", "E", "e+", "e-", "E+", "E-"})
 
 
 class _JsonStream:
@@ -120,14 +123,13 @@ class _JsonStream:
                 if within and self._fill():
                     continue
                 raise ValueError(f"{self._source}: malformed jplace JSON: {e}") from e
-            # A number is the one value that decodes when cut short: "12" of "123" when
-            # the read stops at the buffer's end, and "3" of "3.5" or "1" of "1e5" when
-            # it stops after the "." or "e", since `raw_decode` takes the longest number
-            # it can and leaves the rest. A cut object, array or string fails instead.
+            # A number is the one value that decodes when cut short (`_CUT_NUMBER_TAILS`);
+            # a cut object, array or string fails to decode instead.
             if (
                 isinstance(obj, int | float)
                 and not isinstance(obj, bool)
-                and (end == len(self._buf) or self._buf[end] in _NUMBER_CONTINUES)
+                and len(self._buf) - end <= 2
+                and self._buf[end:] in _CUT_NUMBER_TAILS
                 and self._fill()
             ):
                 continue
@@ -176,7 +178,7 @@ def _check_placement(obj: object, source: Path, index: int) -> None:
             and type(names[0][1]) is int
             and names[0][1] == 1
         ):
-            raise refuse("does not name exactly one fragment of multiplicity 1 in 'nm'")
+            raise refuse("does not name exactly one fragment, of integer multiplicity 1, in 'nm'")
     locations = obj.get("p")
     if not (isinstance(locations, list) and len(locations) == 1):
         raise refuse("does not carry exactly one location in 'p'")
@@ -248,7 +250,8 @@ def split_jplace(
 
     A part is complete when yielded, and the caller may delete it before asking for the
     next, so at most two parts are on disk at a time: the one yielded, and the next one,
-    which already holds the placement that closed it. Every placement is checked as it
+    which already holds the placement that did not fit in the yielded one. Every
+    placement is checked as it
     passes. `fields` and `tree` may come before or after `placements` — pplacer writes
     `fields` after — so a wrong or missing one can raise after parts have been yielded:
     nothing a caller builds from the parts is final until the generator is exhausted. A
@@ -364,6 +367,6 @@ def load_jplace(
     if unnumbered:
         raise ValueError(
             f"{jplace_path}: {unnumbered} of the {edges} edges in the jplace's tree carry no "
-            "{N} edge number. A tree that numbers its edges [N] is not read: read_newick "
-            "takes [N] as a comment (duckdb-miint#419)"
+            "{N} edge number, so the tree is refused; number every edge {N}. An edge number "
+            "written [N] does not count: read_newick takes it as a comment (duckdb-miint#419)"
         )

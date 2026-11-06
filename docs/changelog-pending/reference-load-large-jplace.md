@@ -15,12 +15,12 @@
   now fails the load. So do a fragment placed twice, an `edge_num` that is not an edge
   of the jplace's own tree, and a tree loaded alongside the jplace that is not the
   jplace's own tree, `{N}` edge numbers and branch lengths included. So does a jplace
-  whose tree has an edge with no `{N}` number, as a tree numbered `[N]` has once read
-  (duckdb-miint#419). Each error gives a count and examples. A placement with more
-  than one name or location, an `nm` multiplicity other than 1, or a jplace whose
-  `fields` are in another order is refused before it is read, because `read_jplace`
-  would keep only part of it or put its values in the wrong columns
-  (duckdb-miint#407).
+  whose tree has an edge with no `{N}` number. An edge number written `[N]` does not
+  count, because `read_newick` reads it as a comment (duckdb-miint#419). Each error
+  gives a count and examples. A placement with more than one name or location, an
+  `nm` multiplicity other than 1, or a jplace whose `fields` are in another order is
+  refused before it is read, because `read_jplace` would keep only part of it or put
+  its values in the wrong columns (duckdb-miint#407).
 - **A feature known by several names takes its lineage and its placement each from the
   lexicographically smallest name that has one (#833).** When read_ids whose sequences
   collapse to one feature carry different lineages, the load kept an arbitrary one. It
