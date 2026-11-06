@@ -27,3 +27,6 @@
   now keeps the lineage of the smallest read_id that has one (the record the feature's
   accession names, when that record has a lineage) and warns with a count and examples.
   Placements from several of a feature's fragments follow the same rule.
+- **A feature whose supplied taxonomy rows are all NULL counts toward the "no supplied
+  taxonomy" warning (#833).** It was already written as unclassified, but the warning
+  counted only features with no taxonomy row at all.

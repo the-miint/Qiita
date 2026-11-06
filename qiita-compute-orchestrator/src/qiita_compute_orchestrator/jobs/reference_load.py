@@ -524,7 +524,8 @@ def _write_taxonomy(
     _warn_anomaly(
         conn,
         "SELECT min(x.read_id) FROM id_map x "
-        "ANTI JOIN parsed_taxonomy p ON x.feature_idx = p.feature_idx "
+        "ANTI JOIN (SELECT feature_idx FROM parsed_taxonomy WHERE ranks IS NOT NULL) p"
+        " ON x.feature_idx = p.feature_idx "
         "GROUP BY x.feature_idx ORDER BY 1",
         "feature(s) have no supplied taxonomy; recording as unclassified (NULL ranks)",
     )

@@ -374,13 +374,16 @@ def _load_warnings(caplog) -> list[str]:
     ]
 
 
-def test_unclassified_feature_recorded_as_null_rank_row(staging_inputs, tmp_path, caplog):
-    """A feature with no supplied taxonomy is recorded at rest as a
-    NULL-rank row (reference_taxonomy stays 1-1 with features), and the
-    coverage gap is warned — not silently dropped (the old INNER JOIN)."""
+@pytest.mark.parametrize("seq5_rows", [[], [("seq5", None)]], ids=["no row", "a NULL taxonomy"])
+def test_unclassified_feature_recorded_as_null_rank_row(
+    staging_inputs, tmp_path, caplog, seq5_rows
+):
+    """A feature with no supplied taxonomy, whether it has no row or only a NULL one, is
+    recorded at rest as a NULL-rank row (reference_taxonomy stays 1-1 with features),
+    and the coverage gap is warned — not silently dropped (the old INNER JOIN)."""
     tax = _write_taxonomy_parquet(
         tmp_path / "taxonomy.parquet",
-        [(name, _TAXONOMY_STRINGS[name]) for name in ("seq1", "seq2", "seq3", "seq4")],
+        [(name, _TAXONOMY_STRINGS[name]) for name in ("seq1", "seq2", "seq3", "seq4")] + seq5_rows,
     )
     with caplog.at_level(logging.WARNING, logger=_REFERENCE_LOAD_LOGGER):
         outputs = _run(_inputs(**staging_inputs, taxonomy_path=tax), tmp_path / "ws")
