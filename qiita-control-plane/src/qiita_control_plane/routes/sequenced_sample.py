@@ -347,12 +347,11 @@ async def import_sequenced_sample_from_run(
                 global_internal_names=body.global_internal_names,
             )
         except SAMPLE_METADATA_WRITE_ERRORS as exc:
-            # Shared metadata-write arms (parse / unknown / conflict /
-            # duplicate-global-target / slot-collision / transient-race) map
-            # through one place. The asyncpg arms below stay route-specific.
-            # SlotOccupiedError is unreachable through this POST (a fresh
-            # prep_sample per call cannot pre-occupy a slot) but is handled for
-            # the shared PATCH path that reuses this composer.
+            # Every member of SAMPLE_METADATA_WRITE_ERRORS maps through the
+            # shared mapper; the asyncpg arms below stay route-specific.
+            # SlotOccupiedError is unreachable here, since a fresh prep_sample
+            # cannot already occupy a slot, and the shared mapping answers it
+            # regardless.
             await raise_http_for_sample_metadata_write_error(
                 conn, exc, spec=PREP_SAMPLE_METADATA_SPEC, tiers=tiers
             )
