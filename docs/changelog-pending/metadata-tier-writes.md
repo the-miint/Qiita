@@ -12,7 +12,9 @@
     anything is written. The detail names each such field and the tier that it requires.
   - A write that would insert, change, or confirm a value that the caller cannot read,
     such as one that a value-level exception restricts, is refused with 403 and writes
-    nothing. The answer is the same whatever the body sent for that value.
+    nothing. The answer is the same whatever the body sent for that value, and whether
+    or not a restricted value is stored yet. The data model lists what a refusal can
+    still reveal.
   - That 403 replaces the 409 for another study's value in a global field, and the 422
     for a change to a value stored through a `unique_in_study` field, when the caller
     cannot read the stored value. It names neither the value nor the other study.

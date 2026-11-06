@@ -283,9 +283,9 @@ Beyond the kind / role / scope guards above, `auth.guards` carries resource-acce
 | `filter_studies_caller_can_read(min_tier, ...)` | the **narrowing** counterpart: returns the subset of a study list the caller may read, rather than raising. One query for the whole set. Anonymous narrows to nothing. |
 | `filter_prep_samples_caller_can_read(min_tier, ...)` | resolves a **prep_sample** cohort: readable / unlinked / blocked-by-study. A sample survives only if the caller holds `min_tier` on *every* study it is still linked to. |
 
-`require_study_access` admits a caller to a study-scoped biosample,
-sequenced-sample, or study-field route. Which metadata fields and values that
-caller may then read or write is decided by
+`require_study_access` admits a caller to a study-scoped route. On a route
+that reads or writes metadata, which fields and values that caller may then
+read or write is decided by
 [Metadata visibility tiers](architecture/data-model.md#metadata-visibility-tiers),
 from the tiers that `caller_metadata_tiers` returns.
 

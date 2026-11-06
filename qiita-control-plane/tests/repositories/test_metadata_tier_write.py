@@ -1,11 +1,9 @@
 """DB-bound tests: a sample-metadata write refuses what the caller's tier
 cannot read.
 
-A write is checked twice. Before anything is written, every field the body
-names must require no more than the caller's tier on the study. Once the
-values are written, and before the caller's transaction commits, every value
-the write touched must be visible to the caller: an exception on one value can
-hide it even when its field is reachable. The rule is defined in
+Every field that the body names must require no more than the caller's tier on
+the study, and so must every value that the write would touch: an exception on
+one value can hide it even when its field is reachable. The rule is defined in
 docs/architecture/data-model.md, "Metadata visibility tiers".
 """
 
@@ -304,6 +302,58 @@ async def test_write_refuses_into_empty_slot_carrying_exception(ctx, spec):
 
 
 @pytest.mark.parametrize("spec", SPECS, ids=_spec_id)
+@pytest.mark.parametrize(
+    ("global_held", "local_held"),
+    [(True, False), (False, True), (True, True), (False, False)],
+    ids=["global-held", "local-held", "both-held", "neither-held"],
+)
+async def test_refusal_names_the_same_keys_whether_a_restricted_value_exists(
+    ctx, spec, global_held, local_held
+):
+    """Tests the case where one body names two values under exceptions above
+    the caller's tier, one keyed on a global field and one on a local field.
+    The refusal names both keys whichever of them already holds a value, so
+    it does not show which hidden values exist.
+    """
+    entity_idx = await _create_linked_entity_for_spec(ctx, spec)
+    global_field_idx, global_name, alias_idx = await _global_field(
+        ctx, spec, default_tier=Tier.PUBLIC, alias=True
+    )
+    local_field_idx, local_name = await _local_field(ctx, spec, tier_override=Tier.PUBLIC)
+    for held, study_field_idx in ((global_held, alias_idx), (local_held, local_field_idx)):
+        if held:
+            await seed_metadata_text_value(
+                ctx["pool"],
+                spec=spec,
+                entity_idx=entity_idx,
+                study_field_idx=study_field_idx,
+                created_by_idx=ctx["principal_idx"],
+            )
+    for key in ({"global_field_idx": global_field_idx}, {"study_field_idx": local_field_idx}):
+        await seed_field_exception(
+            ctx["pool"],
+            spec=spec,
+            entity_idx=entity_idx,
+            tier_override=Tier.ADMIN,
+            created_by_idx=ctx["principal_idx"],
+            **key,
+        )
+    before = await _metadata_rows(ctx, spec, entity_idx)
+
+    with pytest.raises(MetadataValueTierError) as refused:
+        await _write(
+            ctx,
+            spec,
+            entity_idx=entity_idx,
+            metadata={global_name: "sent", local_name: "sent"},
+            tiers=_tiers_on(ctx["study_idx"], Tier.MEMBER),
+        )
+
+    assert refused.value.field_keys == [global_name, local_name]
+    assert await _metadata_rows(ctx, spec, entity_idx) == before
+
+
+@pytest.mark.parametrize("spec", SPECS, ids=_spec_id)
 async def test_write_at_the_exception_tier_lands(ctx, spec):
     """A caller whose tier meets the exception writes the value."""
     entity_idx, display_name, metadata_idx = await _public_value_under_exception(ctx, spec)
@@ -323,8 +373,8 @@ async def test_write_at_the_exception_tier_lands(ctx, spec):
 
 
 async def test_write_requires_a_transaction(ctx):
-    """The value check refuses after writing, which undoes nothing outside a
-    transaction, so the write refuses to start without one."""
+    """The values are checked again once written, and a refusal then undoes
+    nothing outside a transaction, so the write refuses to start without one."""
     async with ctx["pool"].acquire() as conn:
         with pytest.raises(RuntimeError, match="transaction"):
             await write_resolved_metadata_entries(
@@ -339,13 +389,13 @@ async def test_write_requires_a_transaction(ctx):
 
 
 async def test_imports_refuse_tiers_below_admin(ctx):
-    """An import writes values no tier check covers, so each one refuses at entry
-    tiers that do not reach every value on its study."""
+    """An import requires admin on its study, so each import refuses, before it
+    writes anything, tiers that do not hold admin there."""
     member = _tiers_on(ctx["study_idx"], Tier.MEMBER)
     caller_idx = ctx["principal_idx"]
 
     async with ctx["pool"].acquire() as conn, conn.transaction():
-        with pytest.raises(RuntimeError, match="checks no tier"):
+        with pytest.raises(RuntimeError, match="an import needs"):
             await import_biosample_from_owner_biosample_id(
                 conn,
                 primary_study_idx=ctx["study_idx"],
@@ -357,7 +407,7 @@ async def test_imports_refuse_tiers_below_admin(ctx):
                 tiers=member,
             )
     async with ctx["pool"].acquire() as conn, conn.transaction():
-        with pytest.raises(RuntimeError, match="checks no tier"):
+        with pytest.raises(RuntimeError, match="an import needs"):
             await import_sequenced_prep_sample(
                 conn,
                 sequenced_pool_idx=1,
@@ -371,7 +421,7 @@ async def test_imports_refuse_tiers_below_admin(ctx):
                 tiers=member,
             )
     # Refused before it reads any of its inputs, so none are built.
-    with pytest.raises(RuntimeError, match="checks no tier"):
+    with pytest.raises(RuntimeError, match="an import needs"):
         await register_ena_study(
             ctx["pool"],
             study_idx=ctx["study_idx"],

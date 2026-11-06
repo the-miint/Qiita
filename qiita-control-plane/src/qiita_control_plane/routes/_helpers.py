@@ -672,7 +672,7 @@ def _raise_value_above_tier(*, spec: EntityMetadataSpec, field_keys: list[str]) 
         status_code=403,
         detail=(
             f"{spec.entity_kind} metadata {', '.join(repr(k) for k in field_keys)}:"
-            " the value is restricted to a tier above yours"
+            " restricted to a tier above yours"
         ),
     )
 
@@ -694,11 +694,9 @@ async def raise_http_for_sample_metadata_write_error(
     conn); a transient write race to 503; a field or a value above the
     caller's tier to 403. Always raises.
 
-    A slot collision or a unique-field rewrite whose stored value is one that a
-    caller at `tiers` may not read answers the value-tier 403 instead, since
-    its own answer would quote that value or the study that wrote it.
-    `write_resolved_metadata_entries` refuses such a write before it collides,
-    so this branch answers for a value that a concurrent write stored.
+    A slot collision or a unique-field rewrite whose stored value a caller at
+    `tiers` may not read answers the value-tier 403 instead, since its own
+    answer would quote that value or the study that wrote it.
     """
     if isinstance(exc, MetadataUnknownFieldsError):
         raise HTTPException(
@@ -891,15 +889,15 @@ async def write_and_map_sample_metadata(
     )
 
 
-# The field attributes that only an admin on the study may set, in the order a
-# refusal names them. tier_override decides which tier the field's values
-# require, which is a study admin's decision whatever tier it sets.
-# unique_in_study and data_type are judged against every value the field
+# The field attributes that only an admin on the study may set, in the order in
+# which a refusal names them. tier_override decides which tier the field's
+# values require, which is a study admin's decision whatever tier it sets.
+# unique_in_study and data_type are judged against every value that the field
 # holds: values that already repeat, a missing-value marker, a value on a
 # published sample. Each answer would tell a caller below admin about values
-# hidden from them, and an admin on the study reads every value. The refusal
-# turns on the keys a body names, never on what the field holds, so it says
-# nothing about the field's values either.
+# hidden from them, and an admin on the study can read every value. The
+# refusal turns on the keys that a body names, never on what the field holds,
+# so it says nothing about the field's values either.
 _ADMIN_ONLY_FIELD_ATTRIBUTES = ("tier_override", "unique_in_study", "data_type")
 
 
@@ -963,8 +961,9 @@ async def create_and_map_study_field(
     is 403 as well; that is checked once the row exists, so the caller's
     transaction rolls the row back. The caller owns the transaction.
 
-    unique_in_study and data_type need no admin here, unlike on an edit: a new
-    field holds no values for either to be judged against.
+    unique_in_study and data_type need no admin here, unlike on an edit. A
+    local field is new, so it holds no values for either to be judged against;
+    a linked field cannot carry either one (NOT_SETTABLE_ON_LINKED_FIELD).
     """
     noun = spec.entity_kind
     if body.tier_override is not None:
@@ -1177,10 +1176,11 @@ async def patch_and_map_study_field(
     also 404 (it exists, but not where this path addresses, and saying so
     differently would confirm it), and a stale tag is 412.
 
-    Then two tier rules, both 403: a field whose tier is above the caller's at
-    `tiers` cannot be edited at all, and only an admin on the study may name
+    Two tier rules, both 403. Only an admin on the study may name
     tier_override, unique_in_study or data_type (_ADMIN_ONLY_FIELD_ATTRIBUTES
-    says why).
+    says why); that turns on the body alone, so it is checked before the row
+    is read or locked. Once the row is read, a field whose tier is above the
+    caller's at `tiers` cannot be edited at all.
 
     Then the two shape rules, both 422. A linked row refuses the attributes it
     inherits, judged against the stored row because the body carries no link to
@@ -1215,6 +1215,11 @@ async def patch_and_map_study_field(
     noun = spec.entity_kind
     if_match = require_if_match(if_match)
     named = body.model_fields_set
+    admin_only = [name for name in _ADMIN_ONLY_FIELD_ATTRIBUTES if name in named]
+    if admin_only:
+        _require_admin_to_set_field_attributes(
+            tiers=tiers, study_idx=study_idx, noun=noun, attributes=admin_only
+        )
 
     # Bound the waits before taking the first of the locks these keys cause.
     if named & _METADATA_LOCKING_PATCH_FIELDS:
@@ -1243,11 +1248,6 @@ async def patch_and_map_study_field(
         display_name=row["display_name"],
         tiers=tiers,
     )
-    admin_only = [name for name in _ADMIN_ONLY_FIELD_ATTRIBUTES if name in named]
-    if admin_only:
-        _require_admin_to_set_field_attributes(
-            tiers=tiers, study_idx=study_idx, noun=noun, attributes=admin_only
-        )
 
     if row[spec.study_field_global_fk_column] is not None:
         inherited = [name for name in NOT_SETTABLE_ON_LINKED_FIELD if name in named]

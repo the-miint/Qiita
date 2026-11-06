@@ -291,7 +291,9 @@ async def import_sequenced_prep_sample(
     Composer order of operations (the order matters because of trigger
     interactions):
 
-      1. Require an open transaction (fail-fast at the function boundary).
+      1. Require an open transaction (fail-fast at the function boundary),
+         and require that tiers, the caller's, meet
+         `require_tiers_read_every_value` on primary_study_idx.
       2. Reject primary_study_idx also appearing in secondary_study_idxs.
       3. INSERT qiita.prep_sample with processing_kind='sequenced'
          supplied explicitly (the supertype column is plain NOT NULL,
@@ -315,9 +317,7 @@ async def import_sequenced_prep_sample(
          prep_sample_study_field for a global field and through the existing
          local field row otherwise. A name matching neither raises. This must
          follow step 5 because the reject_if_link_retired trigger fires on each
-         metadata insert. tiers is the caller's, and must meet
-         `require_tiers_read_every_value` on primary_study_idx, checked at
-         entry with the transaction.
+         metadata insert.
 
     Unknown-name, parse-failure, and unresolved-terminology cases raise
     typed exceptions. The caller must wrap the call in `async with

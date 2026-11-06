@@ -289,9 +289,9 @@ class MetadataFieldTierError(Exception):
 
 class MetadataValueTierError(Exception):
     """Raised when a metadata write would touch a value that the caller may not
-    read. A value-level exception on that one value can cause this even when
-    its field is within the caller's tier. Carries only the keys that the
-    caller sent, never the value or the study that wrote it.
+    read. A `*_field_exception` row on that one value can put it above the
+    caller's tier even when its field is within it. Carries only the keys that
+    the caller sent, never the value or the study that wrote it.
     """
 
     def __init__(self, *, entity_kind: SampleEntityKind, field_keys: list[str]) -> None:
@@ -1362,15 +1362,17 @@ def require_tiers_read_every_value(tiers: CallerMetadataTiers, *, study_idx: int
     """Raise RuntimeError unless `tiers` holds admin on study_idx, the tier at
     which every metadata value there is readable.
 
-    A write that checks no value against the caller's tier calls this first, so
-    it runs only for a caller who could read whatever it writes. Its routes
-    admit only such callers, so the raise marks a caller that bypassed them.
+    An import calls this first. Creating a biosample or a prep_sample with its
+    metadata requires admin on the study, so an import writes only values that
+    its caller can read, including those that it writes without a tier check.
+    A caller below admin here is a defect in the caller, so it raises
+    RuntimeError.
     """
     held = tiers.tier_on(study_idx)
     if held is not Tier.ADMIN:
         raise RuntimeError(
-            f"a metadata write that checks no tier needs {Tier.ADMIN.value!r} on study"
-            f" {study_idx}; the tiers given hold {held.value!r} there"
+            f"an import needs {Tier.ADMIN.value!r} on study {study_idx};"
+            f" the tiers given hold {held.value!r} there"
         )
 
 
@@ -3475,24 +3477,25 @@ async def write_resolved_metadata_entries(
     rolls partial state back.
 
     Every value that the write would touch must be one that a caller at `tiers`
-    may read. Otherwise MetadataValueTierError names the caller's keys for the
-    values that fail, and nothing is written. A value already in an entry's
-    slot is checked before the first write, so the answer does not depend on
-    what the caller sent for it. A value that the write puts into an empty slot
-    is checked once written, since a value-level exception can restrict a slot
-    that holds no value yet; the caller's transaction then rolls every write
-    back.
+    may read once it is written. Otherwise MetadataValueTierError names the
+    caller's keys for the values that fail, and no write persists. Every entry
+    is checked before the first write (_fetch_keys_restricted_on_entity), so
+    the answer depends neither on what the caller sent nor on which restricted
+    values exist. The values are checked again once written, which catches a
+    tier that a concurrent transaction changed in between; the caller's
+    transaction then rolls every write back.
     """
     require_transaction(conn)
-    hidden_keys = await _fetch_keys_holding_hidden_values(
+    restricted_keys = await _fetch_keys_restricted_on_entity(
         conn,
         spec=spec,
         tiers=tiers,
         entity_idx=entity_idx,
+        study_idx=study_idx,
         resolved=[resolved_field for resolved_field, _ in resolved_metadata],
     )
-    if hidden_keys:
-        raise MetadataValueTierError(entity_kind=spec.entity_kind, field_keys=hidden_keys)
+    if restricted_keys:
+        raise MetadataValueTierError(entity_kind=spec.entity_kind, field_keys=restricted_keys)
 
     # One write per entry, sequentially; the outer transaction is the atomicity
     # boundary. The global path writes through the global field (minting the
@@ -3548,45 +3551,55 @@ async def write_resolved_metadata_entries(
     return results
 
 
-async def _fetch_keys_holding_hidden_values(
+async def _fetch_keys_restricted_on_entity(
     conn: asyncpg.Connection,
     *,
     spec: EntityMetadataSpec,
     tiers: CallerMetadataTiers,
     entity_idx: int,
+    study_idx: int,
     resolved: Sequence[ResolvedField],
 ) -> list[str]:
-    """The caller's keys, in input order, whose slot on entity_idx already holds
-    a value that a caller at `tiers` may not read. A global entry's slot is the
-    entity's one value for that global field, whichever study wrote it; a local
-    entry's is the value through its study-local field.
+    """The caller's keys, in input order, whose value on entity_idx a caller at
+    `tiers` may not read, either as it is stored now or once a write through
+    study_idx stores it.
+
+    A key is named when its slot already holds a value that the caller cannot
+    read, or when an exception on its slot requires more than the caller's tier
+    on study_idx, whether or not the slot holds a value yet. An exception names
+    the key either way, so the answer does not show whether a restricted value
+    exists. A global entry's slot is the entity's one value for that global
+    field, whichever study wrote it; a local entry's is the value through its
+    study-local field.
     """
-    global_field_idxs = [rf.global_field_idx for rf in resolved if rf.scope == "global"]
-    study_field_idxs = [rf.study_field_idx for rf in resolved if rf.scope == "local"]
+    if not resolved:
+        return []
     rows = await conn.fetch(
-        f"SELECT m.global_field_idx, m.{spec.study_field_idx_column} AS study_field_idx"
-        f"  FROM {visible_metadata_source(spec)}"
-        f" WHERE m.{spec.entity_key_column} = $4"
-        f"   AND NOT m.visible"
-        f"   AND (m.global_field_idx = ANY($5::bigint[])"
-        f"        OR (m.global_field_idx IS NULL"
-        f"            AND m.{spec.study_field_idx_column} = ANY($6::bigint[])))",
+        f"SELECT k.key"
+        f"  FROM unnest($4::text[], $5::bigint[], $6::bigint[]) WITH ORDINALITY"
+        f"       AS k(key, global_field_idx, study_field_idx, position)"
+        f" WHERE EXISTS ("
+        f"           SELECT 1 FROM {visible_metadata_source(spec)}"
+        f"            WHERE m.{spec.entity_key_column} = $7"
+        f"              AND NOT m.visible"
+        f"              AND (m.global_field_idx = k.global_field_idx"
+        f"                   OR (k.global_field_idx IS NULL"
+        f"                       AND m.{spec.study_field_idx_column} = k.study_field_idx)))"
+        f"    OR EXISTS ("
+        f"           SELECT 1 FROM {spec.field_exception_table} e"
+        f"            WHERE e.{spec.entity_key_column} = $7"
+        f"              AND (e.global_field_idx = k.global_field_idx"
+        f"                   OR e.{spec.study_field_idx_column} = k.study_field_idx)"
+        f"              AND e.tier_override > $8::qiita.tier)"
+        f" ORDER BY k.position",
         *tiers.sql_args(),
+        [rf.caller_key for rf in resolved],
+        [rf.global_field_idx for rf in resolved],
+        [rf.study_field_idx for rf in resolved],
         entity_idx,
-        global_field_idxs,
-        study_field_idxs,
+        tiers.tier_on(study_idx).value,
     )
-    hidden_global = {row["global_field_idx"] for row in rows if row["global_field_idx"] is not None}
-    hidden_local = {row["study_field_idx"] for row in rows if row["global_field_idx"] is None}
-    return [
-        rf.caller_key
-        for rf in resolved
-        if (
-            rf.global_field_idx in hidden_global
-            if rf.scope == "global"
-            else rf.study_field_idx in hidden_local
-        )
-    ]
+    return [row["key"] for row in rows]
 
 
 async def insert_new_entities_metadata_batch(

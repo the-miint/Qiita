@@ -196,36 +196,44 @@ What such a caller may touch:
   (`_sample_helpers.preflight_sample_metadata`). A global field that the study
   has not linked yet is judged on its own tier.
 - **Values.** Every value that a write would touch must be one that the caller
-  can read, or the write is refused with 403 and nothing is written
-  (`_sample_helpers.write_resolved_metadata_entries`). The 403 names field keys
-  only: no value, no study, and nothing that differs with what a hidden value
-  holds.
-  - A value already in a slot that the write names is checked before anything
-    is written, so the answer does not depend on what the caller sent for it.
-    This covers another study's value in a global field's slot, and a value
-    stored through a `unique_in_study` field on the same biosample or
-    prep_sample.
-  - A value written into an empty slot is checked once written, because a
-    value-level exception can restrict a slot before it holds a value.
-  - A hidden value that a concurrent write stores after that first check
-    surfaces as a collision, which answers the same 403
-    (`routes._helpers.raise_http_for_sample_metadata_write_error`).
-- **Field definitions.** Setting `tier_override` requires `admin` on the study,
-  whatever tier it sets. So does changing `unique_in_study` or `data_type` on an
-  existing field, because each is judged against every value the field holds,
-  and its answer would describe values hidden from a caller below `admin`. The
-  refusal turns only on the attributes named, never on what the field holds
-  (`routes._helpers._ADMIN_ONLY_FIELD_ATTRIBUTES`). A caller may create, link,
-  or edit only a field whose field tier is within their own tier on the study.
+  can read once it is written, or the write is refused with 403 and no write
+  persists (`_sample_helpers.write_resolved_metadata_entries`). The 403 names
+  only the field keys that the caller sent
+  (`routes._helpers._raise_value_above_tier`). The check runs before anything
+  is written, and names a key for either of two reasons:
+  - the field's value already on that biosample or prep_sample is hidden from
+    the caller, including another study's value in a global field and a value
+    stored through a `unique_in_study` field;
+  - a value-level exception on that field and biosample or prep_sample is above
+    the caller's tier, whether or not a value is stored yet.
+
+  So the answer depends neither on what the body sent nor on whether a value
+  under an exception exists. The written values are checked again before
+  commit, and a collision with a hidden value answers the same 403
+  (`routes._helpers.raise_http_for_sample_metadata_write_error`), so a value or
+  tier that another transaction changes in between is still refused.
+- **Field definitions.** Setting `tier_override`, or changing `unique_in_study`
+  or `data_type` on an existing field, requires `admin` on the study, whatever
+  the body sets (`routes._helpers._ADMIN_ONLY_FIELD_ATTRIBUTES` says why). A
+  caller may create, link, or edit only a field whose field tier is within
+  their own tier on the study.
 - **Imports.** Creating a biosample or a prep_sample with its metadata requires
   `admin` on the study or a wet_lab_admin+ role, so an import writes only values
   that its caller can read (`_sample_helpers.require_tiers_read_every_value`).
 
-**What a refused write can still reveal.** `unique_in_study` is enforced over
-every value, including ones that the caller cannot read. A write that repeats a
-value already stored through such a field on another biosample or prep_sample is
-refused for that collision, which shows the caller that a hidden value equals
-the one that they sent.
+**What a refused write can still reveal.**
+
+- `unique_in_study` is enforced over every value, including ones that the
+  caller cannot read. A write that repeats a value already stored through such
+  a field on another biosample or prep_sample is refused for that collision,
+  which shows the caller that a hidden value equals the one that they sent.
+- A global field holds one value per biosample or prep_sample, whichever linked
+  study wrote it. A write into one that holds another study's value, which the
+  caller cannot read, is refused rather than overwriting that value, so the
+  refusal shows that a value is there.
+- A tier that another transaction changes while a write runs, such as an admin
+  setting a field's `tier_override`, can make the 403 name different keys
+  depending on what the body sent.
 
 ### What a tier reads of a study's own record
 

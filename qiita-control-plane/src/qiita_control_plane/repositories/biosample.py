@@ -189,9 +189,8 @@ async def resolve_or_import_biosample_by_ena_accession(
     tags are spelled exactly like their ENVO-typed globals, and its values are
     submitter free text).
 
-    tiers is the caller's. The import requires of it what
-    `require_tiers_read_every_value` says, which covers the `local_metadata`
-    writes as well, since they check no tier.
+    tiers is the caller's, and must meet `require_tiers_read_every_value` on
+    study_idx: the `local_metadata` writes check no tier.
     """
     require_transaction(conn)
 
