@@ -19,6 +19,8 @@
   - `POST /study/{study_idx}/biosample-field`,
     `PATCH /study/{study_idx}/biosample-field/{study_field_idx}` and their
     `prep-sample-field` twins now admit `member` instead of only `admin`. Setting
-    `tier_override` still requires `admin`, and a member cannot create, link, or edit a
-    field whose tier is above `member`.
+    `tier_override` still requires `admin`, as does changing `unique_in_study` or
+    `data_type` on an existing field, since either is judged against values that a
+    member may not be able to read. A member cannot create, link, or edit a field whose
+    tier is above `member`.
   - Biosample and sequenced-sample imports still require `admin` on the study.

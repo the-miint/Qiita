@@ -211,8 +211,12 @@ What such a caller may touch:
     surfaces as a collision, which answers the same 403
     (`routes._helpers.raise_http_for_sample_metadata_write_error`).
 - **Field definitions.** Setting `tier_override` requires `admin` on the study,
-  whatever tier it sets. A caller may create, link, or edit only a field whose
-  field tier is within their own tier on the study.
+  whatever tier it sets. So does changing `unique_in_study` or `data_type` on an
+  existing field, because each is judged against every value the field holds,
+  and its answer would describe values hidden from a caller below `admin`. The
+  refusal turns only on the attributes named, never on what the field holds
+  (`routes._helpers._ADMIN_ONLY_FIELD_ATTRIBUTES`). A caller may create, link,
+  or edit only a field whose field tier is within their own tier on the study.
 - **Imports.** Creating a biosample or a prep_sample with its metadata requires
   `admin` on the study or a wet_lab_admin+ role, so an import writes only values
   that its caller can read (`_sample_helpers.require_tiers_read_every_value`).

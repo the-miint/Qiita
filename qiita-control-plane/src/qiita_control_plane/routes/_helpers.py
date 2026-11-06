@@ -891,18 +891,30 @@ async def write_and_map_sample_metadata(
     )
 
 
-def _require_admin_to_set_field_tier(
-    *, tiers: CallerMetadataTiers, study_idx: int, noun: str
+# The field attributes that only an admin on the study may set, in the order a
+# refusal names them. tier_override decides which tier the field's values
+# require, which is a study admin's decision whatever tier it sets.
+# unique_in_study and data_type are judged against every value the field
+# holds: values that already repeat, a missing-value marker, a value on a
+# published sample. Each answer would tell a caller below admin about values
+# hidden from them, and an admin on the study reads every value. The refusal
+# turns on the keys a body names, never on what the field holds, so it says
+# nothing about the field's values either.
+_ADMIN_ONLY_FIELD_ATTRIBUTES = ("tier_override", "unique_in_study", "data_type")
+
+
+def _require_admin_to_set_field_attributes(
+    *, tiers: CallerMetadataTiers, study_idx: int, noun: str, attributes: list[str]
 ) -> None:
-    """403 unless the caller is admin on the study: which tier a field requires
-    is a study admin's decision, whatever tier the request sets."""
+    """403 unless the caller is admin on the study, naming the attributes that
+    require it (see _ADMIN_ONLY_FIELD_ATTRIBUTES)."""
     caller_tier = tiers.tier_on(study_idx)
     if not tier_at_least(caller_tier, Tier.ADMIN):
         raise HTTPException(
             status_code=403,
             detail=(
-                f"setting a {noun} field's tier_override requires {Tier.ADMIN.value!r} on"
-                f" study {study_idx}; you hold {caller_tier.value!r}"
+                f"setting {', '.join(attributes)} on a {noun} field requires"
+                f" {Tier.ADMIN.value!r} on study {study_idx}; you hold {caller_tier.value!r}"
             ),
         )
 
@@ -950,10 +962,15 @@ async def create_and_map_study_field(
     is admin on the study. A field whose tier is above the caller's at `tiers`
     is 403 as well; that is checked once the row exists, so the caller's
     transaction rolls the row back. The caller owns the transaction.
+
+    unique_in_study and data_type need no admin here, unlike on an edit: a new
+    field holds no values for either to be judged against.
     """
     noun = spec.entity_kind
     if body.tier_override is not None:
-        _require_admin_to_set_field_tier(tiers=tiers, study_idx=study_idx, noun=noun)
+        _require_admin_to_set_field_attributes(
+            tiers=tiers, study_idx=study_idx, noun=noun, attributes=["tier_override"]
+        )
     try:
         row = await create_study_field_and_read_back(
             conn,
@@ -1162,7 +1179,8 @@ async def patch_and_map_study_field(
 
     Then two tier rules, both 403: a field whose tier is above the caller's at
     `tiers` cannot be edited at all, and only an admin on the study may name
-    tier_override.
+    tier_override, unique_in_study or data_type (_ADMIN_ONLY_FIELD_ATTRIBUTES
+    says why).
 
     Then the two shape rules, both 422. A linked row refuses the attributes it
     inherits, judged against the stored row because the body carries no link to
@@ -1225,8 +1243,11 @@ async def patch_and_map_study_field(
         display_name=row["display_name"],
         tiers=tiers,
     )
-    if "tier_override" in named:
-        _require_admin_to_set_field_tier(tiers=tiers, study_idx=study_idx, noun=noun)
+    admin_only = [name for name in _ADMIN_ONLY_FIELD_ATTRIBUTES if name in named]
+    if admin_only:
+        _require_admin_to_set_field_attributes(
+            tiers=tiers, study_idx=study_idx, noun=noun, attributes=admin_only
+        )
 
     if row[spec.study_field_global_fk_column] is not None:
         inherited = [name for name in NOT_SETTABLE_ON_LINKED_FIELD if name in named]

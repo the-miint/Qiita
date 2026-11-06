@@ -1534,8 +1534,9 @@ async def patch_biosample_field(
 
     Same access bar as the create route on this study. If-Match is required;
     patch_and_map_study_field carries the rest of the contract, including which
-    attributes a globally-linked field refuses and what happens when a field's
-    existing values cannot satisfy a uniqueness policy being switched on.
+    attributes only an admin on the study may change, which attributes a
+    globally-linked field refuses, and what happens when a field's existing
+    values cannot satisfy a uniqueness policy being switched on.
 
     The response carries an `ETag` header derived from the new row's
     `updated_at`, matching the create and read endpoints' contract.

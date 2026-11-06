@@ -1363,6 +1363,57 @@ async def test_patch_field_tier_override_requires_admin(ctx, surface, tier, expe
 
 
 @pytest.mark.parametrize("surface", SAMPLE_FIELD_SURFACES, ids=_surface_id)
+@pytest.mark.parametrize(("tier", "expected"), [(Tier.MEMBER, 403), (Tier.ADMIN, 200)])
+@pytest.mark.parametrize(
+    ("attribute", "created_as", "sent", "after"),
+    [
+        ("unique_in_study", {"data_type": "text"}, True, True),
+        ("data_type", {"data_type": "numeric"}, "text", "text"),
+    ],
+    ids=["unique_in_study", "data_type"],
+)
+async def test_patch_field_value_policy_requires_admin(
+    ctx, surface, tier, expected, attribute, created_as, sent, after
+):
+    """Tests the case where an edit changes a policy judged against every value
+    the field holds: only an admin may, and a member's attempt leaves the field
+    as it was.
+    """
+    study_idx = await _seed_authz_case_study(
+        ctx, owner_key="wet", grant_tier=tier, case=f"policy-patch-{attribute}-{tier}"
+    )
+    created = await post_study_field(
+        surface=surface,
+        client=ctx["wet"],
+        study_idx=study_idx,
+        display_name=unique_field_name("PolicyEdit"),
+        **created_as,
+    )
+    assert created.status_code == 201, created.text
+    field_idx = created.json()[surface.idx_key]
+    before = created.json()[attribute]
+
+    resp = await patch_study_field(
+        surface=surface,
+        client=ctx["user"],
+        study_idx=study_idx,
+        study_field_idx=field_idx,
+        if_match=await _etag(ctx, surface, field_idx),
+        **{attribute: sent},
+    )
+
+    assert resp.status_code == expected, resp.text
+    if expected == 403:
+        # Refused for the policy change, not by the route's floor.
+        assert attribute in resp.json()["detail"]
+    stored = await ctx["pool"].fetchval(
+        f"SELECT {attribute}::text FROM {surface.metadata_spec.study_field_table} WHERE idx = $1",
+        field_idx,
+    )
+    assert stored == str(before if expected == 403 else after).lower()
+
+
+@pytest.mark.parametrize("surface", SAMPLE_FIELD_SURFACES, ids=_surface_id)
 async def test_patch_field_above_caller_tier_refused(ctx, surface):
     """Tests the case where a member edits a field that requires admin: a
     member may not touch a field whose values they could not read, so even a
