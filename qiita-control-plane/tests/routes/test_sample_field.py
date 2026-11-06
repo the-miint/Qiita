@@ -671,7 +671,7 @@ async def test_patch_study_field_enable_unique_over_duplicates_409(ctx, surface)
 
     assert resp.status_code == 409, resp.text
     assert "already share a value" in resp.json()["detail"]
-    assert await _stored_unique_in_study(ctx, surface, field_idx) is False
+    assert await _stored_attribute(ctx, surface, field_idx, "unique_in_study") is False
 
 
 @pytest.mark.parametrize("surface", SAMPLE_FIELD_SURFACES, ids=_surface_id)
@@ -701,7 +701,7 @@ async def test_patch_study_field_enable_unique_over_missing_marker_422(ctx, surf
 
     assert resp.status_code == 422, resp.text
     assert "carries a missing-value marker" in resp.json()["detail"]
-    assert await _stored_unique_in_study(ctx, surface, field_idx) is False
+    assert await _stored_attribute(ctx, surface, field_idx, "unique_in_study") is False
 
 
 @pytest.mark.parametrize("surface", SAMPLE_FIELD_SURFACES, ids=_surface_id)
@@ -735,7 +735,7 @@ async def test_patch_study_field_unique_on_published_sample_409(ctx, surface):
 
     assert resp.status_code == 409, resp.text
     assert "published" in resp.json()["detail"]
-    assert await _stored_unique_in_study(ctx, surface, field_idx) is False
+    assert await _stored_attribute(ctx, surface, field_idx, "unique_in_study") is False
 
 
 @pytest.mark.parametrize("surface", SAMPLE_FIELD_SURFACES, ids=_surface_id)
@@ -770,7 +770,7 @@ async def test_patch_study_field_relax_unique_in_study_422(ctx, surface, publish
 
     assert resp.status_code == 422, resp.text
     assert "cannot be withdrawn" in resp.json()["detail"]
-    assert await _stored_unique_in_study(ctx, surface, field_idx) is True
+    assert await _stored_attribute(ctx, surface, field_idx, "unique_in_study") is True
 
 
 @pytest.mark.parametrize("surface", SAMPLE_FIELD_SURFACES, ids=_surface_id)
@@ -800,16 +800,7 @@ async def test_patch_study_field_unique_in_study_no_op_allowed(ctx, surface, sto
 
     assert resp.status_code == 200, resp.text
     assert resp.json()["display_name"] == renamed
-    assert await _stored_unique_in_study(ctx, surface, field_idx) is stored
-
-
-async def _stored_unique_in_study(ctx, surface, study_field_idx):
-    """Read the policy straight from the row, to show a refusal left it alone."""
-    spec = surface.metadata_spec
-    stored = await ctx["pool"].fetchval(
-        f"SELECT unique_in_study FROM {spec.study_field_table} WHERE idx = $1", study_field_idx
-    )
-    return stored
+    assert await _stored_attribute(ctx, surface, field_idx, "unique_in_study") is stored
 
 
 @pytest.mark.parametrize("surface", SAMPLE_FIELD_SURFACES, ids=_surface_id)
@@ -842,7 +833,7 @@ async def test_patch_study_field_resends_unique_on_published_sample(ctx, surface
 
     assert resp.status_code == 200, resp.text
     assert resp.json()["display_name"] == renamed
-    assert await _stored_unique_in_study(ctx, surface, field_idx) is True
+    assert await _stored_attribute(ctx, surface, field_idx, "unique_in_study") is True
 
 
 # =============================================================================
