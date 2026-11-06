@@ -263,6 +263,45 @@ class MetadataUnknownFieldsError(Exception):
         super().__init__(f"unknown {entity_kind} metadata field keys: {field_keys!r}")
 
 
+class MetadataFieldTierError(Exception):
+    """Raised when metadata input names fields whose tier is above the
+    caller's tier on the study being written. `refused` maps each such key,
+    as the caller keyed it, to the tier its field requires.
+    """
+
+    def __init__(
+        self,
+        *,
+        entity_kind: SampleEntityKind,
+        study_idx: int,
+        refused: dict[str, Tier],
+        caller_tier: Tier,
+    ) -> None:
+        self.entity_kind = entity_kind
+        self.study_idx = study_idx
+        self.refused = refused
+        self.caller_tier = caller_tier
+        super().__init__(
+            f"{entity_kind} metadata fields {refused!r} on study {study_idx} require more"
+            f" than the caller's tier {caller_tier.value!r}"
+        )
+
+
+class MetadataValueTierError(Exception):
+    """Raised when a metadata write would touch a value that the caller may not
+    read. A `*_field_exception` row on that one value can put it above the
+    caller's tier even when its field is within it. Carries only the keys that
+    the caller sent, never the value or the study that wrote it.
+    """
+
+    def __init__(self, *, entity_kind: SampleEntityKind, field_keys: list[str]) -> None:
+        self.entity_kind = entity_kind
+        self.field_keys = field_keys
+        super().__init__(
+            f"{entity_kind} metadata fields {field_keys!r} hold a value above the caller's tier"
+        )
+
+
 class MetadataMissingRequiredFieldsError(Exception):
     """Raised when an import omits a global field marked `required`.
 
@@ -352,12 +391,14 @@ class ValueRewriteOnUniqueFieldError(Exception):
         entity_kind: SampleEntityKind,
         display_name: str,
         study_field_idx: int,
+        existing_metadata_idx: int,
         stored_value: object,
         attempted_value: object,
     ) -> None:
         self.entity_kind = entity_kind
         self.display_name = display_name
         self.study_field_idx = study_field_idx
+        self.existing_metadata_idx = existing_metadata_idx
         self.stored_value = stored_value
         self.attempted_value = attempted_value
         super().__init__(
@@ -1317,6 +1358,47 @@ async def fetch_visible_metadata_last_change(
     )
 
 
+def require_tiers_read_every_value(tiers: CallerMetadataTiers, *, study_idx: int) -> None:
+    """Raise RuntimeError unless `tiers` holds admin on study_idx, the tier at
+    which every metadata value there is readable.
+
+    An import calls this first. Creating a biosample or a prep_sample with its
+    metadata requires admin on the study, so an import writes only values that
+    its caller can read, including those that it writes without a tier check.
+    Tiers below admin here mean that the calling code skipped the gate that its
+    route applies, which is a defect rather than a refusal.
+    """
+    held = tiers.tier_on(study_idx)
+    if held is not Tier.ADMIN:
+        raise RuntimeError(
+            f"an import needs {Tier.ADMIN.value!r} on study {study_idx};"
+            f" the tiers given hold {held.value!r} there"
+        )
+
+
+async def fetch_hidden_metadata_idxs(
+    conn: asyncpg.Connection,
+    *,
+    spec: EntityMetadataSpec,
+    tiers: CallerMetadataTiers,
+    metadata_idxs: Sequence[int],
+) -> set[int]:
+    """The members of metadata_idxs that a caller at `tiers` may not read.
+
+    An idx naming no row is reported too, so a value deleted since its idx was
+    taken counts as hidden rather than as readable.
+    """
+    if not metadata_idxs:
+        return set()
+    rows = await conn.fetch(
+        f"SELECT m.idx FROM {visible_metadata_source(spec)}"
+        f" WHERE m.idx = ANY($4::bigint[]) AND m.visible",
+        *tiers.sql_args(),
+        list(metadata_idxs),
+    )
+    return set(metadata_idxs) - {row["idx"] for row in rows}
+
+
 # ---------------------------------------------------------------------------
 # Metadata slot-collision exception family
 # ---------------------------------------------------------------------------
@@ -2053,6 +2135,7 @@ async def _insert_metadata_or_diagnose(
                 entity_kind=spec.entity_kind,
                 display_name=display_name,
                 study_field_idx=occupant_field_idx,
+                existing_metadata_idx=existing_metadata_idx,
                 stored_value=existing_value,
                 attempted_value=value,
             )
@@ -2317,6 +2400,29 @@ def _study_field_read_sql(spec: EntityMetadataSpec) -> str:
         f" LEFT JOIN {spec.global_field_table} gf"
         f"     ON gf.idx = sf.{fk_column}"
     )
+
+
+async def fetch_study_field_tier(
+    conn: asyncpg.Connection, *, spec: EntityMetadataSpec, study_field_idx: int
+) -> Tier:
+    """The tier a {entity}_study_field requires before any per-value exception,
+    as `qiita.metadata_field_tier` computes it. Raises LookupError when the row
+    does not exist.
+    """
+    # f-string interpolation of identifiers is safe: spec fields are frozen
+    # module-level constants, never reached by caller input.
+    tier = await conn.fetchval(
+        f"SELECT qiita.metadata_field_tier(gf.default_tier, sf.tier_override, s.default_tier)"
+        f"  FROM {spec.study_field_table} sf"
+        f"  JOIN qiita.study s ON s.idx = sf.study_idx"
+        f"  LEFT JOIN {spec.global_field_table} gf"
+        f"         ON gf.idx = sf.{spec.study_field_global_fk_column}"
+        f" WHERE sf.idx = $1",
+        study_field_idx,
+    )
+    if tier is None:
+        raise LookupError(f"{spec.study_field_table} row {study_field_idx} does not exist")
+    return Tier(tier)
 
 
 async def fetch_study_field(
@@ -2739,6 +2845,9 @@ async def write_local_metadata_on_resolved_field(
     transaction. study_field_created is reported back in the result only --
     write_local_metadata_or_diagnose forwards the flag its own get-or-create
     returned.
+
+    No metadata tier is checked here, so the caller must hold what
+    `require_tiers_read_every_value` requires on study_idx.
     """
     require_transaction(conn)
     # Insert-and-diagnose; the local path has no cross-study slot key, so
@@ -2787,7 +2896,8 @@ async def write_local_metadata_or_diagnose(
     text write against a non-text field, refused here rather than by the
     contract trigger), and TransientWriteRaceError also propagate. A
     purely-local slot is single-study by construction, so upsert always
-    overwrites the caller's own value here (no foreign-study case).
+    overwrites the caller's own value here (no foreign-study case). Like
+    write_local_metadata_on_resolved_field, it checks no metadata tier.
     """
     # Fail-fast: the caller must own the transaction so the typed exception
     # rolls back any study_field row this function created before raising.
@@ -3044,12 +3154,50 @@ async def _fetch_owner_sample_id_study_field_idxs(
     return {r["study_field_idx"] for r in rows}
 
 
+async def fetch_fields_above_tier(
+    conn: asyncpg.Connection,
+    *,
+    spec: EntityMetadataSpec,
+    study_idx: int,
+    resolved: Sequence[ResolvedField],
+    caller_tier: Tier,
+) -> dict[str, Tier]:
+    """Map each resolved field whose tier on study_idx is above caller_tier,
+    keyed as the caller keyed it, to that tier, in input order.
+
+    A global field the study has not linked yet is judged on the global's own
+    tier, which is the tier its value would require once written.
+    """
+    if not resolved:
+        return {}
+    rows = await conn.fetch(
+        f"SELECT k.key, t.field_tier"
+        f"  FROM unnest($1::text[], $2::bigint[], $3::bigint[]) WITH ORDINALITY"
+        f"       AS k(key, global_field_idx, study_field_idx, position)"
+        f"  JOIN qiita.study s ON s.idx = $4"
+        f"  LEFT JOIN {spec.global_field_table} gf ON gf.idx = k.global_field_idx"
+        f"  LEFT JOIN {spec.study_field_table} sf ON sf.idx = k.study_field_idx"
+        f" CROSS JOIN LATERAL (VALUES ("
+        f"           qiita.metadata_field_tier(gf.default_tier, sf.tier_override, s.default_tier)"
+        f"       )) AS t(field_tier)"
+        f" WHERE t.field_tier > $5::qiita.tier"
+        f" ORDER BY k.position",
+        [rf.caller_key for rf in resolved],
+        [rf.global_field_idx for rf in resolved],
+        [rf.study_field_idx for rf in resolved],
+        study_idx,
+        caller_tier.value,
+    )
+    return {row["key"]: Tier(row["field_tier"]) for row in rows}
+
+
 async def preflight_sample_metadata(
     conn: asyncpg.Connection,
     *,
     spec: EntityMetadataSpec,
     study_idx: int,
     metadata: Mapping[str, str],
+    tiers: CallerMetadataTiers,
     known_missing_reasons: Mapping[str, int] | None = None,
     allow_local: bool = False,
     global_internal_names: bool = False,
@@ -3068,6 +3216,8 @@ async def preflight_sample_metadata(
     (a display-name-keyed name is a global field but also a study-local field
     bound elsewhere — suppressed under global_internal_names, where a global's
     internal_name and a study field's display_name are distinct namespaces),
+    MetadataFieldTierError (a name resolves to a field whose tier is above the
+    caller's tier on study_idx, per `tiers`),
     DuplicateGlobalFieldTargetError (two columns target one global field),
     OwnerSampleIdMetadataWriteError (a name resolves to a study-local field
     serving as an owner-sample-id field, for a spec that defines one), or
@@ -3144,6 +3294,26 @@ async def preflight_sample_metadata(
 
     if unknown:
         raise MetadataUnknownFieldsError(spec.entity_kind, unknown)
+
+    # A field above the caller's tier is refused before parsing, before any
+    # check that compares a stored value, and before anything is written. A
+    # parse error would name its type, and a uniqueness or slot collision would
+    # say what it holds.
+    caller_tier = tiers.tier_on(study_idx)
+    refused = await fetch_fields_above_tier(
+        conn,
+        spec=spec,
+        study_idx=study_idx,
+        resolved=list(resolved.values()),
+        caller_tier=caller_tier,
+    )
+    if refused:
+        raise MetadataFieldTierError(
+            entity_kind=spec.entity_kind,
+            study_idx=study_idx,
+            refused=refused,
+            caller_tier=caller_tier,
+        )
 
     # Refuse a write that targets an owner-sample-id field: that value is owned
     # by the dedicated import/admin path, never written as ordinary metadata.
@@ -3293,6 +3463,7 @@ async def write_resolved_metadata_entries(
     study_idx: int,
     caller_idx: int,
     resolved_metadata: Sequence[ResolvedFieldValue],
+    tiers: CallerMetadataTiers,
     on_conflict: MetadataConflictMode = "raise",
 ) -> list[SampleMetadataFieldResult]:
     """Write each resolved entry against study_idx, dispatched by scope, and
@@ -3304,12 +3475,33 @@ async def write_resolved_metadata_entries(
     collision, "upsert" overwrites the caller's own study's value. The first
     collision or rollback signal propagates, and the caller's outer transaction
     rolls partial state back.
+
+    Every value that the write would touch must be one that a caller at `tiers`
+    may read once it is written. Otherwise MetadataValueTierError names the
+    caller's keys for the values that fail, and no write persists. Every entry
+    is checked before the first write (_fetch_keys_restricted_on_entity says
+    what that answer depends on). The values are checked again once written,
+    which catches a tier that a concurrent transaction changed in between; the
+    caller's transaction then rolls every write back.
     """
+    require_transaction(conn)
+    restricted_keys = await _fetch_keys_restricted_on_entity(
+        conn,
+        spec=spec,
+        tiers=tiers,
+        entity_idx=entity_idx,
+        study_idx=study_idx,
+        resolved=[resolved_field for resolved_field, _ in resolved_metadata],
+    )
+    if restricted_keys:
+        raise MetadataValueTierError(entity_kind=spec.entity_kind, field_keys=restricted_keys)
+
     # One write per entry, sequentially; the outer transaction is the atomicity
     # boundary. The global path writes through the global field (minting the
     # study-local row as needed); the local path writes against the resolved
     # study_field with global_field_idx omitted, selecting the per-field slot.
     results: list[SampleMetadataFieldResult] = []
+    written_keys: dict[int, str] = {}
     for resolved_field, parsed_value in resolved_metadata:
         if resolved_field.scope == "global":
             write_result = await write_global_metadata_or_diagnose(
@@ -3338,6 +3530,7 @@ async def write_resolved_metadata_entries(
                 caller_idx=caller_idx,
                 on_conflict=on_conflict,
             )
+        written_keys[write_result.metadata_idx] = resolved_field.caller_key
         results.append(
             SampleMetadataFieldResult(
                 field_key=resolved_field.caller_key,
@@ -3346,7 +3539,88 @@ async def write_resolved_metadata_entries(
                 value=parsed_value,
             )
         )
+    hidden = await fetch_hidden_metadata_idxs(
+        conn, spec=spec, tiers=tiers, metadata_idxs=list(written_keys)
+    )
+    if hidden:
+        raise MetadataValueTierError(
+            entity_kind=spec.entity_kind,
+            field_keys=[key for idx, key in written_keys.items() if idx in hidden],
+        )
     return results
+
+
+async def _fetch_keys_restricted_on_entity(
+    conn: asyncpg.Connection,
+    *,
+    spec: EntityMetadataSpec,
+    tiers: CallerMetadataTiers,
+    entity_idx: int,
+    study_idx: int,
+    resolved: Sequence[ResolvedField],
+) -> list[str]:
+    """The caller's keys, in input order, whose value on entity_idx a caller at
+    `tiers` may not read, either as it is stored now or once a write through
+    study_idx stores it.
+
+    A key is named for either of two reasons. Its slot already holds a value
+    that the caller cannot read. Or an exception on its slot requires more than
+    the caller's tier on study_idx, whether or not the slot holds a value yet.
+    The second restates, for a slot that may hold no row yet, the exception
+    joins of `spec.visibility_function`. For a local entry, that is an
+    exception on its field. For a global entry, it is an exception on the
+    global field or on any of study_idx's fields linked to it: the study's
+    value may be held through any of them, and an exception on one that the
+    write would not land on refuses too, which errs toward refusing. The
+    field's own tier is preflight_sample_metadata's check.
+
+    An exception names its key whether or not a value is stored, so for the
+    study's own values the answer does not show whether a value under an
+    exception exists. Another study's hidden value in a global field does show,
+    whatever hides it; docs/architecture/data-model.md lists it under "What a
+    refused write can still reveal".
+
+    A global entry's slot is the entity's one value for that global field,
+    whichever study wrote it; a local entry's is the value through its
+    study-local field.
+    """
+    if not resolved:
+        return []
+    # MATERIALIZED evaluates each set once for the statement, not once per key.
+    rows = await conn.fetch(
+        f"WITH hidden AS MATERIALIZED ("
+        f"         SELECT m.global_field_idx, m.{spec.study_field_idx_column} AS study_field_idx"
+        f"           FROM {visible_metadata_source(spec)}"
+        f"          WHERE m.{spec.entity_key_column} = $7 AND NOT m.visible),"
+        f"     restricted AS MATERIALIZED ("
+        f"         SELECT e.global_field_idx,"
+        f"                e.{spec.study_field_idx_column} AS study_field_idx,"
+        f"                sf.{spec.study_field_global_fk_column} AS linked_global_field_idx"
+        f"           FROM {spec.field_exception_table} e"
+        f"           LEFT JOIN {spec.study_field_table} sf"
+        f"                  ON sf.idx = e.{spec.study_field_idx_column} AND sf.study_idx = $9"
+        f"          WHERE e.{spec.entity_key_column} = $7 AND e.tier_override > $8::qiita.tier)"
+        f" SELECT k.key"
+        f"   FROM unnest($4::text[], $5::bigint[], $6::bigint[]) WITH ORDINALITY"
+        f"        AS k(key, global_field_idx, study_field_idx, position)"
+        f"  WHERE EXISTS (SELECT 1 FROM hidden h"
+        f"                 WHERE h.global_field_idx = k.global_field_idx"
+        f"                    OR (k.global_field_idx IS NULL"
+        f"                        AND h.study_field_idx = k.study_field_idx))"
+        f"     OR EXISTS (SELECT 1 FROM restricted r"
+        f"                 WHERE r.global_field_idx = k.global_field_idx"
+        f"                    OR r.linked_global_field_idx = k.global_field_idx"
+        f"                    OR r.study_field_idx = k.study_field_idx)"
+        f"  ORDER BY k.position",
+        *tiers.sql_args(),
+        [rf.caller_key for rf in resolved],
+        [rf.global_field_idx for rf in resolved],
+        [rf.study_field_idx for rf in resolved],
+        entity_idx,
+        tiers.tier_on(study_idx).value,
+        study_idx,
+    )
+    return [row["key"] for row in rows]
 
 
 async def insert_new_entities_metadata_batch(
@@ -3359,6 +3633,10 @@ async def insert_new_entities_metadata_batch(
 ) -> bool:
     """Write the resolved metadata of many entities CREATED IN THIS TRANSACTION
     in a few statements, instead of a savepoint and an INSERT per value.
+
+    Every entry must have passed `preflight_sample_metadata` under the caller's
+    tiers. No value is checked here: an entity created in this transaction has
+    no value-level exception row that could hide one of its values.
 
     `write_resolved_metadata_entries` wraps every value in its own SAVEPOINT so
     a rejected INSERT can be diagnosed field by field; that is ~1.4 ms per value,
@@ -3429,6 +3707,7 @@ async def write_sample_metadata(
     metadata: Mapping[str, str],
     caller_idx: int,
     allow_local: bool,
+    tiers: CallerMetadataTiers,
     known_missing_reasons: Mapping[str, int] | None = None,
     on_conflict: MetadataConflictMode = "raise",
     global_internal_names: bool = False,
@@ -3448,7 +3727,9 @@ async def write_sample_metadata(
     True also writes existing local ones. global_internal_names keys global
     fields on internal_name rather than display_name (globals only; local fields
     are always keyed on display_name). on_conflict: "raise" (default) fails on a
-    slot collision, "upsert" overwrites the caller's own study's value.
+    slot collision, "upsert" overwrites the caller's own study's value. tiers
+    is the caller's, which bounds the fields and values the write may touch
+    (see `preflight_sample_metadata` and `write_resolved_metadata_entries`).
 
     Caller owns the transaction (require_transaction raises otherwise) so
     every validation and write error propagates and rolls partial state back.
@@ -3476,6 +3757,7 @@ async def write_sample_metadata(
         known_missing_reasons=known_missing_reasons,
         allow_local=allow_local,
         global_internal_names=global_internal_names,
+        tiers=tiers,
     )
 
     return await write_resolved_metadata_entries(
@@ -3485,5 +3767,6 @@ async def write_sample_metadata(
         study_idx=study_idx,
         caller_idx=caller_idx,
         resolved_metadata=resolved_metadata,
+        tiers=tiers,
         on_conflict=on_conflict,
     )

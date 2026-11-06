@@ -36,11 +36,13 @@ from qiita_common.models import NON_TERMINAL_WORK_TICKET_STATES, FailureType, Wo
 from . import require_transaction, validate_patch_fields
 from ._sample_helpers import (
     link_entity_to_studies,
+    require_tiers_read_every_value,
     validate_primary_secondary_studies,
     write_sample_metadata,
 )
 from .prep_sample import insert_prep_sample
 from .prep_sample_metadata import PREP_SAMPLE_METADATA_SPEC
+from .study_access import CallerMetadataTiers
 
 # The single supported processing_kind today. The supertype's
 # processing_kind column is plain NOT NULL (not GENERATED ALWAYS), so the
@@ -278,6 +280,7 @@ async def import_sequenced_prep_sample(
     primary_study_idx: int,
     secondary_study_idxs: Sequence[int] = (),
     caller_idx: int,
+    tiers: CallerMetadataTiers,
     metadata_checklist_idx: int | None = None,
     ena_experiment_accession: str | None = None,
     ena_run_accession: str | None = None,
@@ -288,7 +291,9 @@ async def import_sequenced_prep_sample(
     Composer order of operations (the order matters because of trigger
     interactions):
 
-      1. Require an open transaction (fail-fast at the function boundary).
+      1. Require an open transaction (fail-fast at the function boundary),
+         and require that tiers, the caller's, meet
+         `require_tiers_read_every_value` on primary_study_idx.
       2. Reject primary_study_idx also appearing in secondary_study_idxs.
       3. INSERT qiita.prep_sample with processing_kind='sequenced'
          supplied explicitly (the supertype column is plain NOT NULL,
@@ -331,6 +336,7 @@ async def import_sequenced_prep_sample(
     """
     # Fail-fast guard against caller forgetting to wrap in a transaction.
     require_transaction(conn)
+    require_tiers_read_every_value(tiers, study_idx=primary_study_idx)
 
     # Reject primary appearing in the secondary list at the composer boundary;
     # defense-in-depth against callers bypassing the wire-level guard.
@@ -385,6 +391,7 @@ async def import_sequenced_prep_sample(
         caller_idx=caller_idx,
         allow_local=True,
         global_internal_names=global_internal_names,
+        tiers=tiers,
     )
 
     return SequencedPrepSampleImportResult(

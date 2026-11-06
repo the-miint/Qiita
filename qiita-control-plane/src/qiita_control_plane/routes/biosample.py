@@ -177,7 +177,7 @@ async def import_biosample(
     _scope: Principal = Depends(require_scope(Scope.BIOSAMPLE_WRITE)),
     _exists: None = Depends(require_study_exists),
     _access: None = Depends(
-        require_study_access(min_tier=Tier.ADMIN, bypass_role=SystemRole.WET_LAB_ADMIN)
+        require_study_access(min_tier=Tier.ADMIN, bypass_role=METADATA_BYPASS_ROLE)
     ),
 ) -> BiosampleImportResponse:
     """Create a biosample on a study, atomically with its owner-provided id and metadata.
@@ -197,6 +197,7 @@ async def import_biosample(
             study_idx=study_idx,
             body=body,
             caller_idx=user.principal_idx,
+            tiers=await caller_metadata_tiers(conn, user),
             metadata_checklist_idx=await resolve_metadata_checklist_idx(
                 conn, body.metadata_checklist_name
             ),
@@ -217,6 +218,7 @@ async def _import_one_biosample(
     study_idx: int,
     body: BiosampleImportRequest,
     caller_idx: int,
+    tiers: CallerMetadataTiers,
     metadata_checklist_idx: int | None,
     defer_metadata_write: bool = False,
 ) -> tuple[BiosampleImportResponse, Sequence[ResolvedFieldValue] | None]:
@@ -239,6 +241,7 @@ async def _import_one_biosample(
     result = await _with_import_error_mapping(
         conn,
         body,
+        tiers,
         lambda: import_biosample_from_owner_biosample_id(
             conn,
             primary_study_idx=study_idx,
@@ -247,6 +250,7 @@ async def _import_one_biosample(
             owner_biosample_id_value=body.owner_biosample_id_value,
             caller_idx=caller_idx,
             metadata=body.metadata,
+            tiers=tiers,
             metadata_checklist_idx=metadata_checklist_idx,
             biosample_accession=body.biosample_accession,
             ena_sample_accession=body.ena_sample_accession,
@@ -270,6 +274,7 @@ async def _import_one_biosample(
 async def _with_import_error_mapping[T](
     conn: asyncpg.Connection,
     body: BiosampleImportRequest,
+    tiers: CallerMetadataTiers,
     operation: Callable[[], Awaitable[T]],
 ) -> T:
     """Run one import step, mapping composer and DB errors to HTTPException.
@@ -312,13 +317,9 @@ async def _with_import_error_mapping[T](
             ),
         )
     except SAMPLE_METADATA_WRITE_ERRORS as exc:
-        # Shared metadata-write arms (parse / unknown / conflict /
-        # duplicate-global-target / slot-collision / transient-race) map
-        # through one place. The owner-id and asyncpg arms below stay
-        # route-specific. SlotOccupiedError is unreachable through this POST
-        # (a fresh biosample per call cannot pre-occupy a slot) but is
-        # handled for the shared PATCH path that reuses this composer.
-        await raise_http_for_sample_metadata_write_error(conn, exc)
+        await raise_http_for_sample_metadata_write_error(
+            conn, exc, spec=BIOSAMPLE_METADATA_SPEC, tiers=tiers
+        )
     except LocalWriteOnGloballyLinkedFieldError as exc:
         # The requested owner-biosample-id field name resolves to a
         # field already globally linked on this study. The owner-id
@@ -453,7 +454,7 @@ async def import_biosamples_bulk(
     _scope: Principal = Depends(require_scope(Scope.BIOSAMPLE_WRITE)),
     _exists: None = Depends(require_study_exists),
     _access: None = Depends(
-        require_study_access(min_tier=Tier.ADMIN, bypass_role=SystemRole.WET_LAB_ADMIN)
+        require_study_access(min_tier=Tier.ADMIN, bypass_role=METADATA_BYPASS_ROLE)
     ),
 ) -> BiosampleBulkImportResponse:
     """Create many biosamples on a study in ONE transaction — the wetlab front door.
@@ -483,6 +484,7 @@ async def import_biosamples_bulk(
 
     async with tx() as conn:
         await _require_eligible_import_owner(conn, body.rows[0].owner_idx)
+        tiers = await caller_metadata_tiers(conn, user)
         checklist_idx_for: dict[str | None, int | None] = {}
         results: list[BiosampleImportResponse] = []
         deferred: list[tuple[int, Sequence[ResolvedFieldValue]]] = []
@@ -498,6 +500,7 @@ async def import_biosamples_bulk(
                     study_idx=study_idx,
                     body=row,
                     caller_idx=user.principal_idx,
+                    tiers=tiers,
                     metadata_checklist_idx=checklist_idx_for[name],
                     defer_metadata_write=True,
                 )
@@ -517,6 +520,7 @@ async def import_biosamples_bulk(
         written = await _with_import_error_mapping(
             conn,
             body.rows[0],
+            tiers,
             lambda: insert_new_entities_metadata_batch(
                 conn,
                 spec=BIOSAMPLE_METADATA_SPEC,
@@ -533,6 +537,7 @@ async def import_biosamples_bulk(
                     await _with_import_error_mapping(
                         conn,
                         row,
+                        tiers,
                         lambda biosample_idx=biosample_idx, resolved=resolved: (
                             write_resolved_metadata_entries(
                                 conn,
@@ -541,6 +546,7 @@ async def import_biosamples_bulk(
                                 study_idx=study_idx,
                                 caller_idx=user.principal_idx,
                                 resolved_metadata=resolved,
+                                tiers=tiers,
                             )
                         ),
                     )
@@ -557,23 +563,20 @@ async def create_biosample_field(
     _scope: Principal = Depends(require_scope(Scope.BIOSAMPLE_WRITE)),
     _exists: None = Depends(require_study_exists),
     _access: None = Depends(
-        require_study_access(min_tier=Tier.ADMIN, bypass_role=SystemRole.WET_LAB_ADMIN)
+        require_study_access(min_tier=Tier.MEMBER, bypass_role=METADATA_BYPASS_ROLE)
     ),
 ) -> BiosampleStudyFieldResponse:
     """Create a study-local biosample field definition (no metadata value).
 
     The caller must be a HumanUser with profile_complete=True, hold the
-    biosample:write scope, and have `Tier.ADMIN` access (or higher) to the
-    path's study — study owner, an ADMIN study_access row, or wet_lab_admin /
-    system_admin (role bypass). `require_study_exists` composes alongside
-    `require_study_access` so role-bypass callers still get 404 on a
+    biosample:write scope, and have `Tier.MEMBER` access (or higher) to the
+    path's study — study owner, a MEMBER or ADMIN study_access row, or
+    wet_lab_admin / system_admin (role bypass). `require_study_exists` composes
+    alongside `require_study_access` so role-bypass callers still get 404 on a
     non-existent study_idx. A field of that name already on the study is a 409;
-    the response body is the created field.
-
-    Access policy is interim: this route requires `Tier.ADMIN`, as the
-    study-scoped biosample metadata writes do, until those writes apply the
-    visibility rule. It then requires `Tier.MEMBER`, since minting a
-    study-local field is work a study member is meant to do.
+    the response body is the created field. Setting tier_override, or creating
+    a field whose tier is above the caller's, is a 403
+    (create_and_map_study_field).
 
     biosample_global_field_idx discriminates two mutually-exclusive modes.
     Purely-local (omitted): data_type is required, plus optional required /
@@ -598,6 +601,7 @@ async def create_biosample_field(
             study_idx=study_idx,
             body=body,
             caller_idx=user.principal_idx,
+            tiers=await caller_metadata_tiers(conn, user),
             response_model=BiosampleStudyFieldResponse,
         )
 
@@ -919,7 +923,7 @@ async def patch_biosample_metadata_by_unique_field(
     _scope: Principal = Depends(require_scope(Scope.BIOSAMPLE_WRITE)),
     _exists: None = Depends(require_study_exists),
     _access: None = Depends(
-        require_study_access(min_tier=Tier.ADMIN, bypass_role=METADATA_BYPASS_ROLE)
+        require_study_access(min_tier=Tier.MEMBER, bypass_role=METADATA_BYPASS_ROLE)
     ),
 ) -> BiosampleMetadataWriteByUniqueFieldResponse:
     """Upsert this study's metadata on the biosample the study's own id names.
@@ -941,9 +945,9 @@ async def patch_biosample_metadata_by_unique_field(
     refused. The owner-biosample-id field is a 422 either way, being written
     only through its own surface.
 
-    Access and the remaining refusals are the by-idx write's: for now, Tier.ADMIN
-    on the study or a wet_lab_admin+ role, until metadata writes apply the
-    visibility rule; a retired biosample answers 409, and a retired study link
+    Access and the remaining refusals are the by-idx write's: Tier.MEMBER on
+    the study or a wet_lab_admin+ role, a field or value above the caller's
+    tier answers 403, a retired biosample answers 409, and a retired study link
     404.
 
     There is NO If-Match on this route, exactly as on the by-idx write: a
@@ -955,6 +959,7 @@ async def patch_biosample_metadata_by_unique_field(
     none.
     """
     async with tx() as conn:
+        tiers = await caller_metadata_tiers(conn, user)
         biosample_idx = await resolve_study_entity_by_unique_field(
             conn,
             spec=BIOSAMPLE_METADATA_SPEC,
@@ -962,7 +967,7 @@ async def patch_biosample_metadata_by_unique_field(
             display_name=body.unique_field_display_name,
             value=body.unique_field_value,
             noun="biosample",
-            tiers=await caller_metadata_tiers(conn, user),
+            tiers=tiers,
         )
         written = await resolve_and_write_study_scoped_metadata(
             conn,
@@ -974,6 +979,7 @@ async def patch_biosample_metadata_by_unique_field(
             noun="biosample",
             metadata=body.metadata,
             caller_idx=user.principal_idx,
+            tiers=tiers,
             global_internal_names=body.global_internal_names,
             unlinked_detail=detail_for_unique_field_miss(
                 noun="biosample",
@@ -1003,17 +1009,16 @@ async def patch_biosample_metadata(
     _scope: Principal = Depends(require_scope(Scope.BIOSAMPLE_WRITE)),
     _exists: None = Depends(require_study_exists),
     _access: None = Depends(
-        require_study_access(min_tier=Tier.ADMIN, bypass_role=SystemRole.WET_LAB_ADMIN)
+        require_study_access(min_tier=Tier.MEMBER, bypass_role=METADATA_BYPASS_ROLE)
     ),
 ) -> SampleMetadataWriteResponse:
     """Upsert this study's metadata values on a biosample.
 
-    Access policy is interim: this route requires Tier.ADMIN on the study, or a
-    wet_lab_admin+ role, until metadata writes apply the visibility rule. 401 on
-    Anonymous, 403 on missing scope,
-    an incomplete profile, or sub-ADMIN tier, 404 on a study that does not
-    exist. require_study_exists composes alongside require_study_access so an
-    admin-bypass caller still gets 404 on a non-existent study.
+    This route requires Tier.MEMBER on the study, or a wet_lab_admin+ role. 401
+    on Anonymous, 403 on missing scope, an incomplete profile, a sub-MEMBER
+    tier, or a field or value above the caller's tier, 404 on a study that does
+    not exist. require_study_exists composes alongside require_study_access so
+    an admin-bypass caller still gets 404 on a non-existent study.
 
     The biosample must be linked to this study: a nonexistent biosample_idx and
     one with no non-retired biosample_to_study link to study_idx share the same
@@ -1029,7 +1034,8 @@ async def patch_biosample_metadata(
     global or study-local fields and is upserted (unknown fields -> 422, an empty
     body -> 422 at the wire boundary, the owner-biosample-id field -> 422 since
     it is changed only through its own surface, a cross-study global slot
-    collision -> 409). The response reports per field, in input order, whether it
+    collision -> 409, or 403 when the caller cannot read the value already there).
+    The response reports per field, in input order, whether it
     resolved global or local, the write outcome (inserted / updated /
     unchanged), the value now in the slot, and the internal_name a globally
     linked value reads back under.
@@ -1051,6 +1057,7 @@ async def patch_biosample_metadata(
             noun="biosample",
             metadata=body.metadata,
             caller_idx=user.principal_idx,
+            tiers=await caller_metadata_tiers(conn, user),
             global_internal_names=body.global_internal_names,
         )
     return written
@@ -1516,15 +1523,16 @@ async def patch_biosample_field(
     _scope: Principal = Depends(require_scope(Scope.BIOSAMPLE_WRITE)),
     _exists: None = Depends(require_study_exists),
     _access: None = Depends(
-        require_study_access(min_tier=Tier.ADMIN, bypass_role=SystemRole.WET_LAB_ADMIN)
+        require_study_access(min_tier=Tier.MEMBER, bypass_role=METADATA_BYPASS_ROLE)
     ),
 ) -> BiosampleStudyFieldResponse:
     """Edit a study-local biosample field definition.
 
     Same access bar as the create route on this study. If-Match is required;
     patch_and_map_study_field carries the rest of the contract, including which
-    attributes a globally-linked field refuses and what happens when a field's
-    existing values cannot satisfy a uniqueness policy being switched on.
+    attributes only an admin on the study may change, which attributes a
+    globally-linked field refuses, and what happens when a field's existing
+    values cannot satisfy a uniqueness policy being switched on.
 
     The response carries an `ETag` header derived from the new row's
     `updated_at`, matching the create and read endpoints' contract.
@@ -1537,6 +1545,7 @@ async def patch_biosample_field(
             study_field_idx=study_field_idx,
             body=body,
             if_match=if_match,
+            tiers=await caller_metadata_tiers(conn, user),
             response_model=BiosampleStudyFieldResponse,
         )
 

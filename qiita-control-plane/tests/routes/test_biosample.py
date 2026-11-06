@@ -3296,9 +3296,9 @@ async def test_create_biosample_field_admin_linked_inherits(ctx):
 @pytest.mark.parametrize("case", STUDY_FIELD_CREATE_AUTHZ_CASES)
 async def test_create_biosample_field_authz(ctx, case, no_biosample_write_client):
     """Tests the case where each row of the shared access matrix calls the
-    create-field route: owner, admin grant, and wet_lab_admin bypass are
-    admitted; no access, sub-ADMIN tier, and a missing scope are refused; a
-    nonexistent study is 404 even for a role-bypass caller.
+    create-field route: owner, admin and member grants, and wet_lab_admin
+    bypass are admitted; no access, a viewer grant, and a missing scope are
+    refused; a nonexistent study is 404 even for a role-bypass caller.
     """
     await assert_study_field_create_authz(
         ctx,
@@ -4005,7 +4005,7 @@ async def test_patch_biosample_metadata_retired_409(ctx):
 @pytest.mark.parametrize("case", STUDY_SCOPED_SAMPLE_WRITE_AUTHZ_CASES)
 async def test_patch_biosample_metadata_authz(ctx, case, no_biosample_write_patch_client):
     """Tests the case where each row of the study-scoped sample write matrix
-    calls the metadata write: the ADMIN minimum, the role bypass, the scope
+    calls the metadata write: the MEMBER minimum, the role bypass, the scope
     check, the unauthenticated refusal, and the missing-study 404 all hold.
 
     The allowed rows rewrite the value the seed already wrote, so a permitted
@@ -4030,8 +4030,7 @@ async def test_patch_biosample_metadata_authz(ctx, case, no_biosample_write_patc
 
 async def test_patch_biosample_metadata_admin_tier_writes(ctx):
     """Tests the case where a regular user with ADMIN study access (not the role
-    bypass) writes metadata: the ADMIN minimum is satisfied and the value is
-    INSERTED.
+    bypass) writes metadata: the value is INSERTED.
     """
     (
         study_idx,
