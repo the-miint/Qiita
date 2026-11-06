@@ -521,7 +521,7 @@ def caller_tier_reaches(row: CallerStudyAccessRow, *, caller: Principal, tier: T
 
 # The role at or above which a caller reads and writes every metadata value on
 # every study, whatever its tier. A route that admits a caller by role and then
-# reads metadata passes this constant as its bypass
+# reads or writes metadata passes this constant as its bypass
 # (`require_study_access(bypass_role=METADATA_BYPASS_ROLE)`), so the route and
 # the metadata rule agree on who reads everything. If they disagreed, a caller
 # that the route admitted by role, with no grant on the study, would read only

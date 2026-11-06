@@ -665,14 +665,14 @@ SAMPLE_METADATA_WRITE_ERRORS = (
 
 
 def _raise_value_above_tier(*, spec: EntityMetadataSpec, field_keys: list[str]) -> NoReturn:
-    """The 403 for a write that touched a value the caller may not read. It
-    names only the caller's keys: no value, no missing reason, no study, and
+    """The 403 for a write that would touch a value that the caller may not
+    read. It names field keys only: no value, no missing reason, no study, and
     nothing that differs with what the hidden value holds."""
     raise HTTPException(
         status_code=403,
         detail=(
-            f"metadata fields {', '.join(repr(k) for k in field_keys)} on this"
-            f" {spec.entity_kind} hold a value restricted above the caller's tier"
+            f"{spec.entity_kind} metadata {', '.join(repr(k) for k in field_keys)}:"
+            " the value is restricted to a tier above yours"
         ),
     )
 
@@ -686,7 +686,7 @@ async def raise_http_for_sample_metadata_write_error(
 ) -> NoReturn:
     """Map a sample-family metadata-write exception to its HTTPException.
 
-    One exception maps to exactly one response, so the mapping cannot drift.
+    Each exception type has one branch here, so the mapping cannot drift.
     Parse, unknown-field, study-field-conflict, duplicate-global-target,
     owner-sample-id, missing-value-on-a-unique-field, and
     value-rewrite-on-a-unique-field errors map to 422; a slot collision and a
@@ -694,9 +694,11 @@ async def raise_http_for_sample_metadata_write_error(
     conn); a transient write race to 503; a field or a value above the
     caller's tier to 403. Always raises.
 
-    A slot collision or a unique-field rewrite whose stored value a caller at
-    `tiers` may not read answers the value-tier 403 instead, since its own
-    answer would quote that value or the study that wrote it.
+    A slot collision or a unique-field rewrite whose stored value is one that a
+    caller at `tiers` may not read answers the value-tier 403 instead, since
+    its own answer would quote that value or the study that wrote it.
+    `write_resolved_metadata_entries` refuses such a write before it collides,
+    so this branch answers for a value that a concurrent write stored.
     """
     if isinstance(exc, MetadataUnknownFieldsError):
         raise HTTPException(
@@ -708,7 +710,7 @@ async def raise_http_for_sample_metadata_write_error(
         raise HTTPException(
             status_code=403,
             detail=(
-                f"metadata fields above the caller's tier {exc.caller_tier.value!r}"
+                f"metadata fields above your tier {exc.caller_tier.value!r}"
                 f" on study {exc.study_idx}: {refused}"
             ),
         )
@@ -900,7 +902,7 @@ def _require_admin_to_set_field_tier(
             status_code=403,
             detail=(
                 f"setting a {noun} field's tier_override requires {Tier.ADMIN.value!r} on"
-                f" study {study_idx}; the caller holds {caller_tier.value!r}"
+                f" study {study_idx}; you hold {caller_tier.value!r}"
             ),
         )
 
@@ -916,7 +918,7 @@ async def _require_field_within_caller_tier(
 ) -> None:
     """403 unless the field's tier is within the caller's tier on the study. A
     caller may create, link, or edit only a field whose values they could read,
-    so a field's definition cannot be used to reach values above their tier."""
+    so that a field's definition cannot reach values above their tier."""
     caller_tier = tiers.tier_on(study_idx)
     field_tier = await fetch_study_field_tier(conn, spec=spec, study_field_idx=study_field_idx)
     if not tier_at_least(caller_tier, field_tier):
@@ -924,7 +926,7 @@ async def _require_field_within_caller_tier(
             status_code=403,
             detail=(
                 f"{spec.entity_kind} field {display_name!r} requires {field_tier.value!r} on"
-                f" study {study_idx}, above the caller's tier {caller_tier.value!r}"
+                f" study {study_idx}, above your tier {caller_tier.value!r}"
             ),
         )
 
@@ -944,10 +946,10 @@ async def create_and_map_study_field(
 
     Create-side conflicts map to 409 and DB-level violations to 422 (the
     Pydantic body should preempt the CHECK, but it is the last defense). A body
-    setting tier_override from a caller who is not admin on the study is 403
-    before anything is written, and so is a field the caller at `tiers` could
-    not read once created, which the caller's transaction then rolls back. The
-    caller owns the transaction.
+    that sets tier_override is 403 before anything is written unless the caller
+    is admin on the study. A field whose tier is above the caller's at `tiers`
+    is 403 as well; that is checked once the row exists, so the caller's
+    transaction rolls the row back. The caller owns the transaction.
     """
     noun = spec.entity_kind
     if body.tier_override is not None:

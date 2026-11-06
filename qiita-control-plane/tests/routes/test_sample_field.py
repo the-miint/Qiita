@@ -23,6 +23,7 @@ from .conftest import (
     SAMPLE_FIELD_SURFACES,
     STUDY_FIELD_CREATE_AUTHZ_CASES,
     _grant_study_access,
+    _seed_authz_case_study,
     _seed_field_global,
     _seed_study,
     assert_study_field_authz,
@@ -1220,20 +1221,6 @@ async def test_patch_study_field_widen_admits_a_concurrent_write(ctx, surface, m
 # ---------------------------------------------------------------------------
 
 
-async def _study_with_grant(ctx, suffix: str, tier: Tier) -> int:
-    """Seed a study owned by the wet-lab session where the user session holds
-    `tier`; the study's own default tier is the schema's, member."""
-    study_idx = await _seed_study(ctx, owner_idx=ctx["wet_session"]["principal_idx"], suffix=suffix)
-    await _grant_study_access(
-        ctx,
-        study_idx=study_idx,
-        principal_idx=ctx["user_session"]["principal_idx"],
-        tier=tier,
-        granted_by_idx=ctx["wet_session"]["principal_idx"],
-    )
-    return study_idx
-
-
 async def _fields_named(ctx, surface, *, study_idx: int, display_name: str) -> int:
     return await ctx["pool"].fetchval(
         f"SELECT count(*) FROM {surface.metadata_spec.study_field_table}"
@@ -1247,9 +1234,11 @@ async def _fields_named(ctx, surface, *, study_idx: int, display_name: str) -> i
 @pytest.mark.parametrize(("tier", "expected"), [(Tier.MEMBER, 403), (Tier.ADMIN, 201)])
 async def test_create_field_with_tier_override_requires_admin(ctx, surface, tier, expected):
     """Tests the case where a create sets the field's tier: only an admin may,
-    even when the tier set is below the caller's own.
+    even when the tier it sets is below the caller's own.
     """
-    study_idx = await _study_with_grant(ctx, f"tier-create-{tier}", tier)
+    study_idx = await _seed_authz_case_study(
+        ctx, owner_key="wet", grant_tier=tier, case=f"tier-create-{tier}"
+    )
     display_name = unique_field_name("TierSet")
 
     resp = await post_study_field(
@@ -1275,7 +1264,9 @@ async def test_create_local_field_above_caller_tier_refused(ctx, surface):
     study default: a member may not create a field whose values they could not
     read, and nothing is created.
     """
-    study_idx = await _study_with_grant(ctx, "tier-create-admin-default", Tier.MEMBER)
+    study_idx = await _seed_authz_case_study(
+        ctx, owner_key="wet", grant_tier=Tier.MEMBER, case="tier-create-admin-default"
+    )
     await ctx["pool"].execute(
         "UPDATE qiita.study SET default_tier = $2::qiita.tier WHERE idx = $1", study_idx, Tier.ADMIN
     )
@@ -1295,19 +1286,25 @@ async def test_create_local_field_above_caller_tier_refused(ctx, surface):
 
 
 @pytest.mark.parametrize("surface", SAMPLE_FIELD_SURFACES, ids=_surface_id)
-async def test_link_field_to_global_above_caller_tier_refused(ctx, surface):
-    """Tests the case where a member links the study to a global field whose
-    default tier is admin: refused, and no link is created.
+@pytest.mark.parametrize(("global_tier", "expected"), [(Tier.ADMIN, 403), (Tier.PUBLIC, 201)])
+async def test_member_links_a_global_field_only_within_their_tier(
+    ctx, surface, global_tier, expected
+):
+    """Tests the case where a member links the study to a global field: a
+    public one is linked, and one whose default tier is admin is refused with
+    no link created.
     """
-    study_idx = await _study_with_grant(ctx, "tier-link-admin-global", Tier.MEMBER)
-    suffix = unique_field_name("admin_global").lower()
+    study_idx = await _seed_authz_case_study(
+        ctx, owner_key="wet", grant_tier=Tier.MEMBER, case=f"tier-link-{global_tier}"
+    )
+    suffix = unique_field_name("link_global").lower()
     global_idx = await surface.seed_global_field(
         ctx["pool"],
         internal_name=suffix,
-        display_name=f"Admin Global {suffix}",
+        display_name=f"Link Global {suffix}",
         data_type=FieldDataType.TEXT,
         created_by_idx=ctx["wet_session"]["principal_idx"],
-        default_tier=Tier.ADMIN,
+        default_tier=global_tier,
     )
     ctx["created"][surface.global_created_key].append(global_idx)
     display_name = unique_field_name("LinkAbove")
@@ -1320,9 +1317,11 @@ async def test_link_field_to_global_above_caller_tier_refused(ctx, surface):
         **{surface.global_fk_key: global_idx},
     )
 
-    assert resp.status_code == 403, resp.text
-    assert display_name in resp.json()["detail"]
-    assert await _fields_named(ctx, surface, study_idx=study_idx, display_name=display_name) == 0
+    assert resp.status_code == expected, resp.text
+    if expected == 403:
+        assert display_name in resp.json()["detail"]
+    created = await _fields_named(ctx, surface, study_idx=study_idx, display_name=display_name)
+    assert created == (1 if expected == 201 else 0)
 
 
 @pytest.mark.parametrize("surface", SAMPLE_FIELD_SURFACES, ids=_surface_id)
@@ -1331,7 +1330,9 @@ async def test_patch_field_tier_override_requires_admin(ctx, surface, tier, expe
     """Tests the case where an edit changes a field's tier: only an admin may,
     and a member's attempt leaves it as it was.
     """
-    study_idx = await _study_with_grant(ctx, f"tier-patch-{tier}", tier)
+    study_idx = await _seed_authz_case_study(
+        ctx, owner_key="wet", grant_tier=tier, case=f"tier-patch-{tier}"
+    )
     created = await post_study_field(
         surface=surface,
         client=ctx["wet"],
@@ -1367,7 +1368,9 @@ async def test_patch_field_above_caller_tier_refused(ctx, surface):
     member may not touch a field whose values they could not read, so even a
     description edit is refused and nothing changes.
     """
-    study_idx = await _study_with_grant(ctx, "tier-patch-above", Tier.MEMBER)
+    study_idx = await _seed_authz_case_study(
+        ctx, owner_key="wet", grant_tier=Tier.MEMBER, case="tier-patch-above"
+    )
     display_name = unique_field_name("AdminField")
     created = await post_study_field(
         surface=surface,

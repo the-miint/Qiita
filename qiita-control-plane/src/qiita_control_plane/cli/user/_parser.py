@@ -228,7 +228,7 @@ def _add_study_field_create_args(subparser: argparse.ArgumentParser, *, entity_n
     subparser.add_argument(
         "--tier-override",
         choices=tuple(t.value for t in Tier),
-        help="visibility tier override; local-mode only",
+        help="visibility tier override; local-mode only; needs admin on the study",
     )
 
 

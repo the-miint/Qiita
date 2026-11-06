@@ -65,6 +65,7 @@ from qiita_control_plane.repositories._sample_helpers import (
     fetch_missing_value_reason_names,
     fetch_terminology_term_idxs_by_term_ids,
     insert_entity_to_study,
+    require_tiers_read_every_value,
     resolve_local_study_field,
     write_local_metadata_on_resolved_field,
 )
@@ -288,10 +289,10 @@ async def register_ena_study(
     one of the four `library_*` display names cannot hold these values (see
     `_ensure_library_fields`), so the whole accession fails loudly rather than run by run.
 
-    tiers is the caller's. Only part of the metadata written here is checked
-    against it (see `resolve_or_import_biosample_by_ena_accession`), so the
-    caller must be one who may read every value on study_idx.
+    tiers is the caller's, and must meet `require_tiers_read_every_value` on
+    study_idx: the per-run `library_*` writes check no tier.
     """
+    require_tiers_read_every_value(tiers, study_idx=study_idx)
     # A run whose sample has no entry here harmonizes against an empty map
     # rather than failing.
     attrs_by_sample_accession: dict[str, EnaSampleAttributes] = {

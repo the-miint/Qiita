@@ -228,9 +228,11 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
   sequenced-sample metadata PATCHes and the study-field create and edit routes
   (`/study/{s}/biosample-field`, `/study/{s}/prep-sample-field`) now admit `member` and
   above instead of only `admin`. A write naming a field, or touching a value, above the
-  caller's tier is a 403 that writes nothing. A collision with a value the caller cannot
-  read is that same 403 instead of a 409, and no longer names the other study. Setting a
-  field's `tier_override` still requires `admin`; imports are unchanged.
+  caller's tier is a 403 that writes nothing. Where the caller cannot read the stored
+  value, that 403 replaces the 409 for another study's value in a global field and the
+  422 for a change to a `unique_in_study` value, and names neither the value nor the
+  other study. Setting a field's `tier_override` still requires `admin`; imports are
+  unchanged.
 - (#824) Soft API-contract change: `DELETE /mask-definition/{mask_idx}`,
   `qiita-admin mask delete` / `mask purge-failed` and the `mask_definition:delete` scope are
   removed. A PAT mint requesting that scope now gets `422 unknown scopes`; an existing token

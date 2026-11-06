@@ -23,6 +23,7 @@ from ._sample_helpers import (
     fetch_missing_value_reason_idxs_by_names,
     link_entity_to_studies,
     preflight_sample_metadata,
+    require_tiers_read_every_value,
     resolve_local_study_field,
     validate_primary_secondary_studies,
     write_local_metadata_or_diagnose,
@@ -188,9 +189,9 @@ async def resolve_or_import_biosample_by_ena_accession(
     tags are spelled exactly like their ENVO-typed globals, and its values are
     submitter free text).
 
-    tiers is the caller's, and bounds `metadata` as `write_sample_metadata`
-    says. `local_metadata` is written with no tier check, so the caller must be
-    one who may read every value on study_idx.
+    tiers is the caller's. The import requires of it what
+    `require_tiers_read_every_value` says, which covers the `local_metadata`
+    writes as well, since they check no tier.
     """
     require_transaction(conn)
 
@@ -432,8 +433,9 @@ async def import_biosample_from_owner_biosample_id(
     display_name; an existing study-local alias of a global field writes
     through to that global field. No new purely-local field is ever created
     for a metadata key — only the owner-biosample-id field is created on
-    import. tiers is the caller's, and bounds the metadata as
-    `write_sample_metadata` says; the owner-biosample-id write checks none.
+    import. tiers is the caller's, and must meet
+    `require_tiers_read_every_value` on primary_study_idx, since the
+    owner-biosample-id write checks no tier.
 
     primary_study_idx owns the globally-linked field rows and the
     owner-biosample-id local field row; secondary studies share the
@@ -496,6 +498,7 @@ async def import_biosample_from_owner_biosample_id(
     """
     # Fail-fast guard against caller forgetting to wrap in a transaction.
     require_transaction(conn)
+    require_tiers_read_every_value(tiers, study_idx=primary_study_idx)
 
     # Reject primary appearing in the secondary list at the composer boundary.
     validate_primary_secondary_studies(primary_study_idx, secondary_study_idxs)

@@ -36,6 +36,7 @@ from qiita_common.models import NON_TERMINAL_WORK_TICKET_STATES, FailureType, Wo
 from . import require_transaction, validate_patch_fields
 from ._sample_helpers import (
     link_entity_to_studies,
+    require_tiers_read_every_value,
     validate_primary_secondary_studies,
     write_sample_metadata,
 )
@@ -314,8 +315,9 @@ async def import_sequenced_prep_sample(
          prep_sample_study_field for a global field and through the existing
          local field row otherwise. A name matching neither raises. This must
          follow step 5 because the reject_if_link_retired trigger fires on each
-         metadata insert. tiers is the caller's, and bounds the write as
-         `write_sample_metadata` says.
+         metadata insert. tiers is the caller's, and must meet
+         `require_tiers_read_every_value` on primary_study_idx, checked at
+         entry with the transaction.
 
     Unknown-name, parse-failure, and unresolved-terminology cases raise
     typed exceptions. The caller must wrap the call in `async with
@@ -334,6 +336,7 @@ async def import_sequenced_prep_sample(
     """
     # Fail-fast guard against caller forgetting to wrap in a transaction.
     require_transaction(conn)
+    require_tiers_read_every_value(tiers, study_idx=primary_study_idx)
 
     # Reject primary appearing in the secondary list at the composer boundary;
     # defense-in-depth against callers bypassing the wire-level guard.

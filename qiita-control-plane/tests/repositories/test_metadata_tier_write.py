@@ -14,6 +14,7 @@ import secrets
 import pytest
 from qiita_common.models import FieldDataType, Tier
 
+from qiita_control_plane.ena_import.registration import register_ena_study
 from qiita_control_plane.repositories._sample_helpers import (
     EntityMetadataSpec,
     MetadataFieldTierError,
@@ -21,8 +22,12 @@ from qiita_control_plane.repositories._sample_helpers import (
     MetadataValueTierError,
     SampleEntityKind,
     preflight_sample_metadata,
+    write_resolved_metadata_entries,
     write_sample_metadata,
 )
+from qiita_control_plane.repositories.biosample import import_biosample_from_owner_biosample_id
+from qiita_control_plane.repositories.biosample_metadata import BIOSAMPLE_METADATA_SPEC
+from qiita_control_plane.repositories.sequenced_sample import import_sequenced_prep_sample
 from qiita_control_plane.repositories.study_access import CallerMetadataTiers
 from qiita_control_plane.testing.db_seeds import (
     seed_field_exception,
@@ -315,3 +320,65 @@ async def test_write_at_the_exception_tier_lands(ctx, spec):
         f"SELECT value_text FROM {spec.metadata_table} WHERE idx = $1", metadata_idx
     )
     assert stored == "rewritten"
+
+
+async def test_write_requires_a_transaction(ctx):
+    """The value check refuses after writing, which undoes nothing outside a
+    transaction, so the write refuses to start without one."""
+    async with ctx["pool"].acquire() as conn:
+        with pytest.raises(RuntimeError, match="transaction"):
+            await write_resolved_metadata_entries(
+                conn,
+                spec=BIOSAMPLE_METADATA_SPEC,
+                entity_idx=1,
+                study_idx=ctx["study_idx"],
+                caller_idx=ctx["principal_idx"],
+                resolved_metadata=[],
+                tiers=_tiers_on(ctx["study_idx"], Tier.ADMIN),
+            )
+
+
+async def test_imports_refuse_tiers_below_admin(ctx):
+    """An import writes values no tier check covers, so each one refuses at entry
+    tiers that do not reach every value on its study."""
+    member = _tiers_on(ctx["study_idx"], Tier.MEMBER)
+    caller_idx = ctx["principal_idx"]
+
+    async with ctx["pool"].acquire() as conn, conn.transaction():
+        with pytest.raises(RuntimeError, match="checks no tier"):
+            await import_biosample_from_owner_biosample_id(
+                conn,
+                primary_study_idx=ctx["study_idx"],
+                owner_idx=caller_idx,
+                owner_biosample_id_field_name=unique_field_name("tier_write_owner_id"),
+                owner_biosample_id_value="unused",
+                caller_idx=caller_idx,
+                metadata={},
+                tiers=member,
+            )
+    async with ctx["pool"].acquire() as conn, conn.transaction():
+        with pytest.raises(RuntimeError, match="checks no tier"):
+            await import_sequenced_prep_sample(
+                conn,
+                sequenced_pool_idx=1,
+                biosample_idx=1,
+                prep_protocol_idx=1,
+                owner_idx=caller_idx,
+                sequenced_pool_item_id="unused",
+                metadata={},
+                primary_study_idx=ctx["study_idx"],
+                caller_idx=caller_idx,
+                tiers=member,
+            )
+    # Refused before it reads any of its inputs, so none are built.
+    with pytest.raises(RuntimeError, match="checks no tier"):
+        await register_ena_study(
+            ctx["pool"],
+            study_idx=ctx["study_idx"],
+            study_header=None,
+            ena_runs=[],
+            sample_attributes=[],
+            owner_idx=caller_idx,
+            caller_idx=caller_idx,
+            tiers=member,
+        )

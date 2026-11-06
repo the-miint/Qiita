@@ -193,27 +193,35 @@ What such a caller may touch:
 
 - **Fields.** A write naming a field whose field tier is above the caller's
   tier on the study is refused with 403, before anything is written or parsed
-  (`_sample_helpers.preflight_sample_metadata`). A global field the study has
-  not linked yet is judged on its own tier.
-- **Values.** Every value a write inserts, overwrites, or leaves unchanged must
-  be one the caller can read once written. Otherwise the write is refused with
-  403 and rolls back (`_sample_helpers.write_resolved_metadata_entries`). An
-  exception can cause this on a field the caller otherwise reaches.
-- **Values the caller cannot read already in the way.** A write that collides
-  with such a value, whether another study's value in a global slot or a value
-  stored through a `unique_in_study` field, answers the same 403. It names no
-  value and no study, and does not say whether the two values agree
-  (`routes._helpers.raise_http_for_sample_metadata_write_error`).
+  (`_sample_helpers.preflight_sample_metadata`). A global field that the study
+  has not linked yet is judged on its own tier.
+- **Values.** Every value that a write would touch must be one that the caller
+  can read, or the write is refused with 403 and nothing is written
+  (`_sample_helpers.write_resolved_metadata_entries`). The 403 names field keys
+  only: no value, no study, and nothing that differs with what a hidden value
+  holds.
+  - A value already in a slot that the write names is checked before anything
+    is written, so the answer does not depend on what the caller sent for it.
+    This covers another study's value in a global field's slot, and a value
+    stored through a `unique_in_study` field on the same biosample or
+    prep_sample.
+  - A value written into an empty slot is checked once written, because a
+    value-level exception can restrict a slot before it holds a value.
+  - A hidden value that a concurrent write stores after that first check
+    surfaces as a collision, which answers the same 403
+    (`routes._helpers.raise_http_for_sample_metadata_write_error`).
 - **Field definitions.** Setting `tier_override` requires `admin` on the study,
   whatever tier it sets. A caller may create, link, or edit only a field whose
   field tier is within their own tier on the study.
-- **Imports.** Creating a sample with its metadata requires `admin` on the
-  study, so an import writes only values its caller can read.
+- **Imports.** Creating a biosample or a prep_sample with its metadata requires
+  `admin` on the study or a wet_lab_admin+ role, so an import writes only values
+  that its caller can read (`_sample_helpers.require_tiers_read_every_value`).
 
 **What a refused write can still reveal.** `unique_in_study` is enforced over
-every value, including ones the caller cannot read. A write that repeats a value
-already stored through such a field on another sample is refused for that
-collision, which shows the caller that a hidden value equals the one they sent.
+every value, including ones that the caller cannot read. A write that repeats a
+value already stored through such a field on another biosample or prep_sample is
+refused for that collision, which shows the caller that a hidden value equals
+the one that they sent.
 
 ### What a tier reads of a study's own record
 

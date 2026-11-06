@@ -290,6 +290,7 @@ async def import_sequenced_sample_from_run(
             conn,
             caller=user,
             study_idxs=[body.primary_study_idx, *body.secondary_study_idxs],
+            bypass_role=METADATA_BYPASS_ROLE,
         )
 
         # Owner eligibility pre-flight inside the transaction; collapses
@@ -887,7 +888,8 @@ async def patch_sequenced_sample_metadata(
     fields display-name-keyed. Each key resolves against the study's existing
     global or study-local prep_sample fields and is upserted (unknown fields
     -> 422, an empty body -> 422 at the wire boundary, a cross-study global slot
-    collision -> 409). The response reports per field, in input order, whether it
+    collision -> 409, or 403 when the caller cannot read the value already there).
+    The response reports per field, in input order, whether it
     resolved global or local, the write outcome (inserted / updated / unchanged),
     the value now in the slot, and the internal_name a globally linked value
     reads back under.

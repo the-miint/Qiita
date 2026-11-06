@@ -819,9 +819,10 @@ async def test_member_refused_a_value_under_an_exception(ctx, surface):
 
 
 async def test_foreign_hidden_occupant_reveals_nothing(ctx):
-    """An admin of one study writing a global value that another study already
-    holds, where the caller cannot read that study's value, is refused without
-    the value, the other study, or whether the two values agree."""
+    """Another study already holds the biosample's value for a global field, and
+    the caller, an admin of this study only, cannot read it. The caller's write
+    of that field is refused, and the refusal names neither the value nor the
+    other study, and does not say whether the two values agree."""
     study_idx = await _seed_study_for_case(ctx, "admin")
     corpus = await _seed_biosample_corpus(ctx, study_idx)
     other_study_idx = await _seed_study(
@@ -857,15 +858,13 @@ async def test_foreign_hidden_occupant_reveals_nothing(ctx):
     assert different.json()["detail"] == same.json()["detail"]
 
 
-async def test_unique_rewrite_masks_a_hidden_stored_value(ctx):
-    """Changing a value stored through a unique_in_study field is refused
-    either way; when an exception hides that value from the caller, the
-    refusal does not quote it."""
-    study_idx = await _seed_study_for_case(ctx, "member")
-    corpus = await _seed_biosample_corpus(ctx, study_idx)
+async def _seed_hidden_unique_value(ctx, corpus: _Corpus) -> tuple[str, str]:
+    """A study-local unique_in_study field on the corpus's study, holding a value
+    on its biosample that an admin-tier exception hides from a member. Returns
+    (display_name, the stored value)."""
     unique_field = unique_field_name("vis_unique")
     declared = await ctx["wet"].post(
-        URL_BIOSAMPLE_STUDY_FIELD_BY_STUDY.format(study_idx=study_idx),
+        URL_BIOSAMPLE_STUDY_FIELD_BY_STUDY.format(study_idx=corpus.study_idx),
         json={
             "display_name": unique_field,
             "data_type": FieldDataType.TEXT,
@@ -893,6 +892,16 @@ async def test_unique_rewrite_masks_a_hidden_stored_value(ctx):
         tier_override=Tier.ADMIN,
         created_by_idx=wet_idx,
     )
+    return unique_field, stored
+
+
+async def test_unique_rewrite_masks_a_hidden_stored_value(ctx):
+    """Changing a value stored through a unique_in_study field is refused
+    either way; when an exception hides that value from the caller, the
+    refusal does not quote it."""
+    study_idx = await _seed_study_for_case(ctx, "member")
+    corpus = await _seed_biosample_corpus(ctx, study_idx)
+    unique_field, stored = await _seed_hidden_unique_value(ctx, corpus)
 
     resp = await _patch_metadata(
         ctx["user"], _WRITE_SURFACES["biosample"].write_url(corpus), {unique_field: "by-member"}
@@ -901,3 +910,21 @@ async def test_unique_rewrite_masks_a_hidden_stored_value(ctx):
     assert resp.status_code == 403, resp.text
     assert "restricted" in resp.json()["detail"]
     assert stored not in resp.text
+
+
+async def test_refusal_is_the_same_whether_a_guess_at_a_hidden_value_is_right(ctx):
+    """A body that guesses a hidden value, beside a second key that is also
+    refused, gets the same answer for a right guess and a wrong one."""
+    study_idx = await _seed_study_for_case(ctx, "member")
+    corpus = await _seed_biosample_corpus(ctx, study_idx)
+    unique_field, stored = await _seed_hidden_unique_value(ctx, corpus)
+    (g_exception,) = _keys_at(corpus.global_keys, Tier.ADMIN, corpus=corpus)
+    url = _WRITE_SURFACES["biosample"].write_url(corpus)
+
+    right = await _patch_metadata(ctx["user"], url, {unique_field: stored, g_exception: "x"})
+    wrong = await _patch_metadata(ctx["user"], url, {unique_field: "not-it", g_exception: "x"})
+
+    for resp in (right, wrong):
+        assert resp.status_code == 403, resp.text
+        assert stored not in resp.text
+    assert right.json()["detail"] == wrong.json()["detail"]

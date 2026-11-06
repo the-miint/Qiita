@@ -177,7 +177,7 @@ async def import_biosample(
     _scope: Principal = Depends(require_scope(Scope.BIOSAMPLE_WRITE)),
     _exists: None = Depends(require_study_exists),
     _access: None = Depends(
-        require_study_access(min_tier=Tier.ADMIN, bypass_role=SystemRole.WET_LAB_ADMIN)
+        require_study_access(min_tier=Tier.ADMIN, bypass_role=METADATA_BYPASS_ROLE)
     ),
 ) -> BiosampleImportResponse:
     """Create a biosample on a study, atomically with its owner-provided id and metadata.
@@ -460,7 +460,7 @@ async def import_biosamples_bulk(
     _scope: Principal = Depends(require_scope(Scope.BIOSAMPLE_WRITE)),
     _exists: None = Depends(require_study_exists),
     _access: None = Depends(
-        require_study_access(min_tier=Tier.ADMIN, bypass_role=SystemRole.WET_LAB_ADMIN)
+        require_study_access(min_tier=Tier.ADMIN, bypass_role=METADATA_BYPASS_ROLE)
     ),
 ) -> BiosampleBulkImportResponse:
     """Create many biosamples on a study in ONE transaction — the wetlab front door.
@@ -1040,7 +1040,8 @@ async def patch_biosample_metadata(
     global or study-local fields and is upserted (unknown fields -> 422, an empty
     body -> 422 at the wire boundary, the owner-biosample-id field -> 422 since
     it is changed only through its own surface, a cross-study global slot
-    collision -> 409). The response reports per field, in input order, whether it
+    collision -> 409, or 403 when the caller cannot read the value already there).
+    The response reports per field, in input order, whether it
     resolved global or local, the write outcome (inserted / updated /
     unchanged), the value now in the slot, and the internal_name a globally
     linked value reads back under.
