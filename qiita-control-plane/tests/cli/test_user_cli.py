@@ -45,12 +45,23 @@ from qiita_common.api_paths import (
     URL_WORK_TICKET_STEP_LOGS,
 )
 from qiita_common.auth_constants import BEARER_PREFIX, SystemRole
-from qiita_common.models import LEGACY_IDX_RESERVED_CEILING
-from run_preflight.db import ERR_CATEGORY_MISSING_ACCESSION, PlatformSampleInfo
+from qiita_common.models import LEGACY_IDX_RESERVED_CEILING, BiosampleRef, StudyRef
+from run_preflight.db import (
+    ERR_CATEGORY_MISSING_IDENTIFIER,
+    InputSampleIdentifiers,
+    PlatformSampleInfo,
+    ProjectIdentifiers,
+)
 
 from qiita_control_plane.cli.user import main
+from qiita_control_plane.preflight import SampleRefs
 
 _BASE = "https://q.example.test"
+_ILLUMINA_CSV = Path(__file__).resolve().parent / "data" / "good_standard_metagv100.csv"
+_ILLUMINA_ACCESSION_SQL = (
+    "UPDATE input_sample SET biosample_accession = 'BIO_' || sample_name",
+    "UPDATE project SET bioproject_accession = 'PRJNA' || external_project_id",
+)
 
 
 def test_help_exits_cleanly(capsys):
@@ -2610,9 +2621,9 @@ def preflight_stub(monkeypatch, tmp_path):
     so the test controls every per-sample input without a real SQLite schema.
 
     Returns `_install(rows=None, raises=None) -> Path`, writing a marker blob at
-    `tmp_path/preflight.db`. `rows` is a list of (idx, biosample, primary,
-    secondaries) tuples, returned as the library's `PlatformSampleInfo`; `raises`
-    is an exception the accessor raises.
+    `tmp_path/preflight.db`. `rows` is a list of (idx, biosample accession, primary
+    bioproject accession, secondary bioproject accessions) tuples, returned as the
+    library's `PlatformSampleInfo`; `raises` is an exception the accessor raises.
     """
 
     def _install(
@@ -2637,12 +2648,17 @@ def preflight_stub(monkeypatch, tmp_path):
 
             stub_module.get_illumina_sample_info = _get
         else:
-            # The library's own record type, so the reader is pinned to its fields.
-            # The secondaries list is passed through uncopied so a test can tell
-            # whether the reader copies it.
+            # The library's own record types, so the reader is pinned to their fields
             records = [
-                PlatformSampleInfo(idx, "standard", biosample, primary, secondary, None)
-                for idx, biosample, primary, secondary in captured_rows
+                PlatformSampleInfo(
+                    idx,
+                    "standard",
+                    InputSampleIdentifiers(biosample, None, None, None),
+                    ProjectIdentifiers(primary, None, None),
+                    tuple(ProjectIdentifiers(s, None, None) for s in secondaries),
+                    None,
+                )
+                for idx, biosample, primary, secondaries in captured_rows
             ]
             stub_module.get_illumina_sample_info = lambda _conn: list(records)
         monkeypatch.setitem(sys.modules, "run_preflight", stub_module)
@@ -2844,7 +2860,7 @@ def test_submit_bcl_convert_happy_path_chains_full_flow(
     assert summary["sequenced_pool"]["status"] == "created"
     assert summary["work_ticket"]["work_ticket_idx"] == 56
     assert [s["sequenced_sample_idx"] for s in summary["sequenced_samples"]] == [71, 72, 73]
-    assert summary["sequenced_samples"][0]["biosample_accession"] == "SAMN001"
+    assert summary["sequenced_samples"][0]["biosample"] == {"biosample_accession": "SAMN001"}
     assert summary["sequenced_samples"][0]["biosample_idx"] == 41
     assert summary["sequenced_samples"][0]["illumina_sample_idx"] == 1
     assert summary["sequenced_samples"][0]["primary_study_idx"] == 7
@@ -3011,16 +3027,15 @@ def test_submit_bcl_convert_rejects_non_sqlite_preflight(tmp_path, capsys, prefl
     assert "preflight query failed" in err
 
 
-def test_submit_bcl_convert_surfaces_missing_accession_refusal(tmp_path, capsys, preflight_stub):
-    """The library refuses a row missing a required accession; its message,
-    which names the offenders, reaches the operator verbatim."""
+def test_submit_bcl_convert_surfaces_missing_identifier_refusal(tmp_path, capsys, preflight_stub):
+    """Tests the case where the library refuses a row missing a required
+    identifier: its message, which names the offenders, reaches the operator
+    verbatim."""
     from qiita_control_plane.cli.user import main
 
     folder = _seed_bcl_folder(tmp_path, "230101_A00123_0001_BHXYZ")
     blob = preflight_stub(
-        raises=ValueError(
-            f"{ERR_CATEGORY_MISSING_ACCESSION}: illumina_sample_idx=3 (biosample_accession)"
-        ),
+        raises=ValueError(f"{ERR_CATEGORY_MISSING_IDENTIFIER}: illumina_sample_idx=3 (biosample)"),
     )
     with pytest.raises(SystemExit) as exc_info:
         main(
@@ -3036,7 +3051,7 @@ def test_submit_bcl_convert_surfaces_missing_accession_refusal(tmp_path, capsys,
         )
     assert exc_info.value.code == 2
     err = capsys.readouterr().err
-    assert "illumina_sample_idx=3 (biosample_accession)" in err
+    assert "illumina_sample_idx=3 (biosample)" in err
     assert "verify the file is a kl-run-preflight SQLite" not in err
 
 
@@ -3340,32 +3355,26 @@ def test_submit_bcl_convert_surfaces_a_run_folder_rejection(
     assert [r["url"].split("/api/v1")[-1] for r in captured["requests"]] == ["/run-folder/inspect"]
 
 
-def test__read_preflight_rows_round_trips_library_tuples(preflight_stub):
-    """The reader wraps each `PlatformSampleInfo` into a `_PreflightRow`, copying
-    secondary_project_accessions into a fresh list."""
+def test__read_preflight_rows_round_trips_library_records(preflight_stub):
+    """Tests the case where the library returns a sample with secondary projects:
+    the reader carries each record over as a ref."""
     import argparse
 
     from qiita_control_plane.cli.user import _PreflightRow, _read_preflight_rows
 
-    library_secondaries = ["PRJ002", "PRJ003"]
-    blob = preflight_stub(rows=[(7, "SAMN001", "PRJ001", library_secondaries)])
-    parser = argparse.ArgumentParser()
-    rows = _read_preflight_rows(blob, parser)
-    assert rows == [
+    blob = preflight_stub(rows=[(7, "SAMN001", "PRJ001", ["PRJ002", "PRJ003"])])
+    rows = _read_preflight_rows(blob, argparse.ArgumentParser())
+    expected = [
         _PreflightRow(
             illumina_sample_idx=7,
-            biosample_accession="SAMN001",
-            primary_project_accession="PRJ001",
-            secondary_project_accessions=["PRJ002", "PRJ003"],
+            refs=SampleRefs(
+                BiosampleRef(biosample_accession="SAMN001"),
+                StudyRef(bioproject_accession="PRJ001"),
+                (StudyRef(bioproject_accession="PRJ002"), StudyRef(bioproject_accession="PRJ003")),
+            ),
         )
     ]
-    # NamedTuple field carries a fresh list, not an alias to the
-    # library's return — mutating downstream does not contaminate the
-    # caller's data.
-    assert rows[0].secondary_project_accessions is not library_secondaries
-
-
-_ILLUMINA_CSV = Path(__file__).resolve().parent / "data" / "good_standard_metagv100.csv"
+    assert rows == expected
 
 
 @pytest.fixture
@@ -3374,17 +3383,17 @@ def illumina_preflight(tmp_path):
     sheet is kl-run-preflight's `good_standard_metagv100_wo_replicates.csv`), so
     the reader meets the true schema and the real `get_illumina_sample_info`.
 
-    `biosample` is the SQL expression for every sample's biosample accession;
-    the project's bioproject is PRJNA<external_project_id>.
+    `identifier_sql` is the statements that set the samples' and project's
+    identifiers; the default names each by accession.
     """
     from run_preflight.legacy.api import migrate_legacy_csv_to_db_file
 
-    def _build(biosample: str = "'BIO_' || sample_name") -> Path:
+    def _build(identifier_sql: tuple[str, ...] = _ILLUMINA_ACCESSION_SQL) -> Path:
         db = tmp_path / "illumina.db"
         migrate_legacy_csv_to_db_file(str(_ILLUMINA_CSV), str(db))
         conn = sqlite3.connect(db)
-        conn.execute(f"UPDATE input_sample SET biosample_accession = {biosample}")
-        conn.execute("UPDATE project SET bioproject_accession = 'PRJNA' || external_project_id")
+        for sql in identifier_sql:
+            conn.execute(sql)
         conn.commit()
         conn.close()
         return db
@@ -3392,45 +3401,55 @@ def illumina_preflight(tmp_path):
     return _build
 
 
-def test__read_preflight_rows_reads_a_real_preflight(illumina_preflight):
-    import argparse
-
-    from qiita_control_plane.cli.user import _read_preflight_rows
-
-    rows = _read_preflight_rows(illumina_preflight(), argparse.ArgumentParser())
-    assert [r.biosample_accession for r in rows] == [
-        "BIO_sample.1",
-        "BIO_sample.2",
-        "BIO_sample.3",
-    ]
-    assert {r.primary_project_accession for r in rows} == {"PRJNA99999"}
-    assert all(r.secondary_project_accessions == [] for r in rows)
-
-
 @pytest.mark.parametrize(
-    ("biosample", "expected"),
+    ("identifier_sql", "biosample_refs", "project_ref"),
     [
-        ("NULL", "(biosample_accession)"),
-        ("''", "blank or padded biosample_accession"),
-        ("'  '", "blank or padded biosample_accession"),
-        ("' BIO_x '", "blank or padded biosample_accession"),
+        (
+            _ILLUMINA_ACCESSION_SQL,
+            [BiosampleRef(biosample_accession=f"BIO_sample.{i}") for i in (1, 2, 3)],
+            StudyRef(bioproject_accession="PRJNA99999"),
+        ),
+        (
+            (
+                "UPDATE input_sample SET biosample_export_entity_id = 'QB' || input_sample_idx",
+                "UPDATE project SET study_export_entity_id = 'QS1'",
+            ),
+            [BiosampleRef(export_entity_id=f"QB{i}") for i in (1, 2, 3)],
+            StudyRef(export_entity_id="QS1"),
+        ),
     ],
+    ids=["accessions", "export-ids-only"],
 )
-def test__read_preflight_rows_refuses_a_missing_or_malformed_accession(
-    illumina_preflight, capsys, biosample, expected
+def test__read_preflight_rows_reads_a_real_preflight(
+    illumina_preflight, identifier_sql, biosample_refs, project_ref
 ):
-    """A NULL accession is refused by the library, a blank or padded one by the
-    reader; either way the operator sees the row, not a traceback."""
+    """Tests the case where a real pre-flight names its entities by accessions,
+    or by export IDs alone: each row carries the identifiers the sheet gives."""
+    import argparse
+
+    from qiita_control_plane.cli.user import _PreflightRow, _read_preflight_rows
+
+    rows = _read_preflight_rows(illumina_preflight(identifier_sql), argparse.ArgumentParser())
+    expected = [
+        _PreflightRow(illumina_sample_idx=idx, refs=SampleRefs(biosample, project_ref, ()))
+        for idx, biosample in zip((1, 2, 3), biosample_refs, strict=True)
+    ]
+    assert rows == expected
+
+
+def test__read_preflight_rows_refuses_a_missing_identifier(illumina_preflight, capsys):
+    """Tests the case where a biosample carries no identifier: the library refuses
+    it, and the operator sees the row, not a traceback."""
     import argparse
 
     from qiita_control_plane.cli.user import _read_preflight_rows
 
+    project_only = (_ILLUMINA_ACCESSION_SQL[1],)
     with pytest.raises(SystemExit) as exc_info:
-        _read_preflight_rows(illumina_preflight(biosample), argparse.ArgumentParser())
+        _read_preflight_rows(illumina_preflight(project_only), argparse.ArgumentParser())
     assert exc_info.value.code == 2
     err = capsys.readouterr().err
-    assert expected in err
-    assert "illumina_sample_idx" in err
+    assert f"{ERR_CATEGORY_MISSING_IDENTIFIER}: illumina_sample_idx=1 (biosample)" in err
 
 
 def test_submit_bcl_convert_records_no_host_refs(monkeypatch, tmp_path, capsys, preflight_stub):

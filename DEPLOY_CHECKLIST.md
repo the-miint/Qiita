@@ -45,6 +45,18 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
   sudo -u qiita-api bash -c 'set -a; . /etc/qiita/control-plane.env; set +a
   psql "$DATABASE_URL" -Atc "SELECT count(*) FROM qiita.work_ticket WHERE action_id = '\''long-read-assembly'\'' AND state IN ('\''pending'\'', '\''queued'\'', '\''processing'\'');"'
   ```
+- `[operator]` **After pulling and before the restart, confirm every stored run pre-flight
+  still opens under the new kl-run-preflight.** Its schema patch refuses a blank or padded
+  identity value (`sample_name`, `external_project_id`, an accession, an export ID,
+  `matrix_tube_id`), and a stored pre-flight that fails to open can no longer be read by the
+  pool roster, the runner or a re-submit. Expect `unopenable: 0` and exit 0; if any are
+  listed, stop before deploying and raise them. On the `redeploy.sh` fast path, pull first
+  and run this before it. (#N)
+  ```bash
+  # [operator] in the pulled checkout; DATABASE_URL as in redeploy.md §4
+  set -a; . /etc/qiita/control-plane.env; set +a
+  cd ~/qiita-miint/qiita-control-plane && /usr/local/bin/uv run --reinstall-package qiita-common qiita-admin backfill check-stored-preflights
+  ```
 - `[admin]` (#791) On the catalog's Postgres server, as superuser: `GRANT pg_read_all_stats TO <role>;`, where `<role>` is the `user=` in `DUCKLAKE_CATALOG_CONNSTR` (`qiita_miint_lake_rw` per `first-deploy.md`). `verify-deploy`'s `catalog-connections` row fails without it ([`data-plane-scaling.md` § Catalog connections](docs/runbooks/data-plane-scaling.md#catalog-connections)).
 
 ### 3. Migrations
@@ -242,6 +254,8 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
   `deprecation_reason` and `superseded_by`; its cohort route returns 409 for a
   deprecated alignment.
 - (#N) `POST /biosample/resolve-roster` takes a new, incompatible row shape (nested `biosample` / `primary_project` / `secondary_projects` refs); a `qiita` CLI installed before this deploy gets a 422 from `submit-bcl-convert`, `submit-pacbio-ingest` and `submit-golay-demux` until it is upgraded.
+- (#N) Deploy this before kl-metapool moves to the kl-run-preflight release that adds export IDs: Qiita refuses a pre-flight written against a newer schema than the one it ships, so a pre-flight from the new kl-metapool fails every submit until this is live.
+- (#N) Soft output change: in the `submit-bcl-convert` and `submit-golay-demux` JSON, each sample's `biosample_accession` is replaced by `biosample`, an object holding the identifiers the pre-flight gave for it.
 
 ## Deployed history
 

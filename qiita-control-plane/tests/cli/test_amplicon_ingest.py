@@ -11,6 +11,8 @@ Two surfaces, pure-unit (no Postgres):
 
 from __future__ import annotations
 
+import json
+
 import httpx
 import pytest
 
@@ -47,8 +49,8 @@ def test_read_amplicon_preflight_rows_v1(build_amplicon_preflight):
     # biosample/bioproject accession.
     assert all(r.barcode for r in rows)
     assert all(r.barcodes_are_rc is True for r in rows)  # EMP 515rcbc set
-    assert all(r.biosample_accession.startswith("BIO_") for r in rows)
-    assert all(r.primary_project_accession.startswith("PRJNA") for r in rows)
+    assert all(r.refs.biosample.biosample_accession.startswith("BIO_") for r in rows)
+    assert all(r.refs.primary_project.bioproject_accession.startswith("PRJNA") for r in rows)
     # prepped_sample_idx is the unique pool-item key.
     assert len({r.prepped_sample_idx for r in rows}) == len(rows)
 
@@ -131,9 +133,10 @@ def _stub_submit_flow(monkeypatch, captured: dict) -> None:
 
 
 def test_submit_golay_demux_builds_barcode_map_and_one_ticket(
-    monkeypatch, build_amplicon_preflight
+    monkeypatch, capsys, build_amplicon_preflight
 ):
     db = build_amplicon_preflight()
+    rows = _read_amplicon_preflight_rows(db, _RaisingParser())
 
     captured: dict = {}
     _stub_submit_flow(monkeypatch, captured)
@@ -183,6 +186,11 @@ def test_submit_golay_demux_builds_barcode_map_and_one_ticket(
     assert len(run_posts) == 1
     assert run_posts[0]["json"]["instrument_run_id"] == _RUN_ID
     assert run_posts[0]["json"]["instrument_model"] == "Illumina MiSeq i100"
+
+    # Each summary entry names its biosample by the identifiers the sheet gave
+    summary = json.loads(capsys.readouterr().out)
+    expected_biosamples = [r.refs.biosample.model_dump(exclude_none=True) for r in rows]
+    assert [s["biosample"] for s in summary["sequenced_samples"]] == expected_biosamples
 
 
 def _golay_argv(db, *extra: str) -> list[str]:

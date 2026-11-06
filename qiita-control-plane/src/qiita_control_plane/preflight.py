@@ -29,7 +29,18 @@ import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
+
+from qiita_common.models import BiosampleRef, StudyRef
+
+if TYPE_CHECKING:
+    from run_preflight.db import PlatformSampleInfo
+
+# Library record fields whose ref field has another name
+_RECORD_FIELD_RENAMES = {
+    "biosample_export_entity_id": "export_entity_id",
+    "study_export_entity_id": "export_entity_id",
+}
 
 # Sheet types the PacBio path recognizes. `pacbio_absquant` is the absolute-
 # quantification protocol — the one that carries SynDNA spike-ins. The ingest CLI
@@ -59,6 +70,33 @@ class PacbioProtocol:
     sheet_type: str
     twist_adaptor_id: str | None
     syndna_is_twisted: bool | None
+
+
+class SampleRefs(NamedTuple):
+    """A pre-flight sample's biosample and studies, each named by every identifier
+    the pre-flight holds for it."""
+
+    biosample: BiosampleRef
+    primary_project: StudyRef
+    secondary_projects: tuple[StudyRef, ...]
+
+
+def _ref_from_record[RefT: (BiosampleRef, StudyRef)](
+    record: NamedTuple, ref_model: type[RefT]
+) -> RefT:
+    """Build `ref_model` from a kl-run-preflight identifier record."""
+    fields = {_RECORD_FIELD_RENAMES.get(k, k): v for k, v in record._asdict().items()}
+    ref = ref_model(**fields)
+    return ref
+
+
+def sample_refs(info: PlatformSampleInfo) -> SampleRefs:
+    """The refs for one sample read by a kl-run-preflight platform reader."""
+    biosample = _ref_from_record(info.biosample, BiosampleRef)
+    primary_project = _ref_from_record(info.primary_project, StudyRef)
+    secondary_projects = tuple(_ref_from_record(p, StudyRef) for p in info.secondary_projects)
+    refs = SampleRefs(biosample, primary_project, secondary_projects)
+    return refs
 
 
 def is_pacbio_sheet_type(sheet_type: str | None) -> bool:
@@ -163,8 +201,8 @@ def pacbio_protocol_from_blob(blob: bytes) -> dict[str, PacbioProtocol]:
 
 class AmpliconPreflightError(ValueError):
     """An amplicon pre-flight that cannot supply a demux roster: not an amplicon
-    sheet, no samples, or a sample missing its barcode or a required accession.
-    The message names the sample by `prepped_sample_idx`, its id on the sheet."""
+    sheet, no samples, or a sample missing its barcode or an identifier. The
+    message names the sample by `prepped_sample_idx`, its id on the sheet."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -175,9 +213,7 @@ class AmpliconSample:
     barcode: str
     # Run-level in the pre-flight (inferred from the primer), stamped per row.
     barcodes_are_rc: bool
-    biosample_accession: str
-    primary_bioproject_accession: str
-    secondary_bioproject_accessions: tuple[str, ...]
+    refs: SampleRefs
 
 
 def amplicon_samples(conn: sqlite3.Connection) -> list[AmpliconSample]:
@@ -190,15 +226,15 @@ def amplicon_samples(conn: sqlite3.Connection) -> list[AmpliconSample]:
     `barcode_map` (`runner/_read_ingest.py`), so the two cannot accept different
     sheets. Reads kl-run-preflight's own `get_amplicon_sample_info`.
 
-    Accessions are required even though the roster itself uses only the barcode:
-    `get_amplicon_sample_info` refuses a NULL biosample or bioproject accession,
-    and a sample without them cannot be registered anyway, so the barcode lookup
-    asks for the same accessioned pre-flight the submission does.
+    Identifiers are required even though the roster itself uses only the barcode:
+    `get_amplicon_sample_info` refuses a biosample or project with none, and such
+    a sample cannot be registered anyway, so the barcode lookup asks for the same
+    identified pre-flight the submission does.
 
     RAISES `AmpliconPreflightError` for a non-amplicon sheet, an empty sample set,
-    or a sample with an empty or NULL barcode or accession — the accessor's
-    "missing required accession" (a NULL accession) is re-raised as this type too,
-    so a pre-flight whose CONTENT cannot supply a roster is one exception kind.
+    or a sample with an empty or NULL barcode — the accessor's "missing required
+    identifier" is re-raised as this type too, so a pre-flight whose CONTENT
+    cannot supply a roster is one exception kind.
     `sqlite3.DatabaseError` / `ValueError` still surface for a pre-flight that
     cannot be READ (an unreadable blob, or `run_sheet_type`'s dependency-drift
     `ValueError`) — a different failure the caller maps differently.
@@ -211,7 +247,7 @@ def amplicon_samples(conn: sqlite3.Connection) -> list[AmpliconSample]:
     try:
         infos = get_amplicon_sample_info(conn)
     except ValueError as exc:
-        # The accessor refuses a NULL accession with "missing required accession".
+        # The accessor refuses an entity with no identifier.
         # run_sheet_type already confirmed a readable amplicon sheet above, so a
         # ValueError here is about the sheet's CONTENT, not its readability —
         # re-raise it as the pre-flight-content error it is (this class's contract),
@@ -230,24 +266,12 @@ def amplicon_samples(conn: sqlite3.Connection) -> list[AmpliconSample]:
                 f"prepped_sample_idx {info.sample_idx} carries no Golay barcode; a sample"
                 " cannot be demultiplexed without it"
             )
-        if not info.biosample_accession:
-            raise AmpliconPreflightError(
-                f"prepped_sample_idx {info.sample_idx} carries no biosample_accession;"
-                " populate upstream before re-submitting"
-            )
-        if not info.primary_bioproject_accession:
-            raise AmpliconPreflightError(
-                f"prepped_sample_idx {info.sample_idx} carries no primary bioproject"
-                " accession; populate upstream before re-submitting"
-            )
         samples.append(
             AmpliconSample(
                 prepped_sample_idx=info.sample_idx,
                 barcode=row.barcode,
                 barcodes_are_rc=bool(row.barcodes_are_rc),
-                biosample_accession=info.biosample_accession,
-                primary_bioproject_accession=info.primary_bioproject_accession,
-                secondary_bioproject_accessions=tuple(info.secondary_bioproject_accessions),
+                refs=sample_refs(info),
             )
         )
     return samples

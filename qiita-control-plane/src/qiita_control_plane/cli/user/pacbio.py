@@ -50,9 +50,9 @@ from qiita_common.models import (
     WorkTicketState,
 )
 
-from ...preflight import SHEET_TYPE_PACBIO_ABSQUANT
+from ...preflight import SHEET_TYPE_PACBIO_ABSQUANT, SampleRefs, sample_refs
 from .. import _common
-from ._helpers import _inspect_run_folder, _load_preflight_conn, _refuse_malformed_accessions
+from ._helpers import _inspect_run_folder, _load_preflight_conn
 from .pool import _provision_run_pool_roster
 
 # action_id + version for the per-sample read loader this command fans out to.
@@ -77,23 +77,19 @@ class _PacbioPreflightRow(NamedTuple):
     `pacbio_sample_idx` is the sample's UNIQUE identifier within the preflight —
     the PacBio parallel of `illumina_sample_idx`, and the value used as the
     `sequenced_pool_item_id`. It is the only safe unique key: `sample_name` is a
-    legacy, PII-bearing field that may be blank, and `biosample_accession` is not
-    unique within a preflight (replicates share one). `barcode` is carried only to
-    LOCATE the sample's BAM on disk — it is NOT unique across all PacBio protocols
-    and is never used as an identity/pool-item-id.
+    legacy, PII-bearing field that may be blank, and a biosample is not unique
+    within a preflight (replicates share one). `barcode` is carried only to LOCATE
+    the sample's BAM on disk — it is NOT unique across all PacBio protocols and is
+    never used as an identity/pool-item-id.
 
-    The project accessions are ENA **bioproject** accessions (what resolve-roster
-    resolves), matching the Illumina row; `secondary_project_accessions` is
-    populated for controls. The three protocol columns (`sheet_type`,
-    `twist_adaptor_id`, `syndna_is_twisted`) feed the read-mask mask-chain
-    derivation. `smrt_cell` is the SMRT-cell well (`smrt_cell_well_sample_id`, form
-    `1_A01`) when the preflight records it (else None)."""
+    `refs.secondary_projects` is populated for controls. The three protocol
+    columns (`sheet_type`, `twist_adaptor_id`, `syndna_is_twisted`) feed the
+    read-mask mask-chain derivation. `smrt_cell` is the SMRT-cell well
+    (`smrt_cell_well_sample_id`, form `1_A01`), or None when the preflight has none."""
 
     pacbio_sample_idx: int
     barcode: str
-    biosample_accession: str
-    primary_project_accession: str
-    secondary_project_accessions: list[str]
+    refs: SampleRefs
     sheet_type: str
     twist_adaptor_id: str | None
     syndna_is_twisted: bool | None
@@ -108,17 +104,16 @@ def _read_pacbio_preflight_rows(
 
     Reads via kl-run-preflight's `get_pacbio_sample_info` (the PacBio analogue of
     `get_illumina_sample_info` that `pool._read_preflight_rows` uses): per sample it
-    returns the biosample + primary/secondary **bioproject** accessions and a
-    `PacbioSampleRow` (barcode, twist, syndna, smrt_cell, movie_context). It
-    validates + raises on any missing required accession, and resolves a control's
-    project to the plate primary itself, so this wrapper adds no accession SQL.
-    The `pacbio_sample_idx` it returns is the sample's unique id (used as the
-    pool-item-id).
+    returns the biosample's and primary/secondary projects' identifiers and a
+    `PacbioSampleRow` (barcode, twist, syndna, smrt_cell, movie_context). It raises
+    on an entity with no identifier, and resolves a control's project to the plate
+    primary itself, so this wrapper adds no identifier SQL. The `pacbio_sample_idx`
+    it returns is the sample's unique id (used as the pool-item-id).
 
     Operator-actionable errors (an unloadable preflight, a non-PacBio sheet, no
-    `pacbio_sample` rows, a missing, blank or padded accession, or an impossible
-    protocol combo) raise via `parser.error` so the CLI surfaces one stderr line and
-    exits 2 before any network call — matching `_read_preflight_rows`.
+    `pacbio_sample` rows, a missing identifier, or an impossible protocol combo)
+    raise via `parser.error` so the CLI surfaces one stderr line and exits 2 before
+    any network call — matching `_read_preflight_rows`.
     """
     from run_preflight import get_pacbio_sample_info  # noqa: PLC0415
     from run_preflight.db import get_run_legacy_format, get_single_run_idx  # noqa: PLC0415
@@ -142,9 +137,9 @@ def _read_pacbio_preflight_rows(
                 (run_idx,),
             ).fetchall()
         }
-        # The accessor's ValueError is meaning-specific (a missing biosample /
-        # bioproject accession, or a control/project invariant violation) and
-        # carries a clear per-sample message, so it is caught SEPARATELY from the
+        # The accessor's ValueError is meaning-specific (an entity with no
+        # identifier, or a control/project invariant violation) and carries a
+        # clear per-sample message, so it is caught SEPARATELY from the
         # generic-preflight errors below (a multi-run blob from get_single_run_idx,
         # or a metadata-query shape drift) and surfaced verbatim.
         try:
@@ -188,7 +183,6 @@ def _read_pacbio_preflight_rows(
                 " is absent from the run_pacbio_sample view — the preflight is"
                 " internally inconsistent"
             )
-        _refuse_malformed_accessions(info, parser, preflight_blob, "pacbio_sample_idx")
         if not pbs.barcode_id:
             parser.error(
                 f"--preflight-blob {preflight_blob}: pacbio_sample_idx {info.sample_idx}"
@@ -198,9 +192,7 @@ def _read_pacbio_preflight_rows(
         row = _PacbioPreflightRow(
             pacbio_sample_idx=info.sample_idx,
             barcode=pbs.barcode_id,
-            biosample_accession=info.biosample_accession,
-            primary_project_accession=info.primary_bioproject_accession,
-            secondary_project_accessions=list(info.secondary_bioproject_accessions),
+            refs=sample_refs(info),
             # sheet_type is a RUN-level property (a run is one protocol), read once
             # from the legacy format above and stamped on every row — there is no
             # per-sample sheet_type.

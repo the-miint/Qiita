@@ -44,7 +44,6 @@ from qiita_common.models import (
     HOST_FILTER_INDEX_TYPE_MINIMAP2,
     HOST_FILTER_INDEX_TYPE_RYPE,
     AlignPlanRequest,
-    BiosampleRef,
     BlockMaskPlanRequest,
     HostFilterResolution,
     Platform,
@@ -58,13 +57,12 @@ from qiita_common.models import (
     SequencedPoolCreateRequest,
     SequencedSampleCreateRequest,
     SequencingRunCreateRequest,
-    StudyRef,
     WorkTicketCreateRequest,
 )
 
-from ...preflight import SHEET_TYPE_PACBIO_ABSQUANT
+from ...preflight import SHEET_TYPE_PACBIO_ABSQUANT, SampleRefs, sample_refs
 from .. import _common
-from ._helpers import _inspect_run_folder, _load_preflight_conn, _refuse_malformed_accessions
+from ._helpers import _inspect_run_folder, _load_preflight_conn
 
 # The bundled bcl-convert submission flow's action_id. Its version, below, is pinned
 # here so it does not drift from the workflow YAML the operator's deploy
@@ -85,18 +83,15 @@ _READ_MASK_ACTION_VERSION = "1.0.0"
 class _PreflightRow(NamedTuple):
     """One illumina_sample row pulled from the kl-run-preflight SQLite.
 
-    The fields of `run_preflight.PlatformSampleInfo` that ingest needs.
-    `secondary_project_accessions` is empty for non-control samples; controls carry
-    one entry per non-primary plate project, sorted by accession value.
+    `refs.secondary_projects` is empty for non-control samples; controls carry one
+    entry per non-primary plate project.
 
     Host filtering is NOT read from the pre-flight: a sample's host is resolved from
     its own `host_taxon_id` metadata, not from the project it was booked under.
     """
 
     illumina_sample_idx: int
-    biosample_accession: str
-    primary_project_accession: str
-    secondary_project_accessions: list[str]
+    refs: SampleRefs
 
 
 def _read_preflight_rows(
@@ -104,9 +99,9 @@ def _read_preflight_rows(
 ) -> list[_PreflightRow]:
     """Load the preflight SQLite and return one `_PreflightRow` per illumina_sample row.
 
-    Errors that the operator can fix (an unloadable preflight, a library refusal,
-    a blank or padded accession) raise via parser.error so the CLI surfaces a
-    single stderr line and exits 2 before any network call.
+    Errors that the operator can fix (an unloadable preflight, a library refusal)
+    raise via parser.error so the CLI surfaces a single stderr line and exits 2
+    before any network call.
     """
     from run_preflight import get_illumina_sample_info  # noqa: PLC0415
 
@@ -120,7 +115,8 @@ def _read_preflight_rows(
         )
     except ValueError as exc:
         # The library refuses a pre-flight without exactly one run, a control /
-        # project mismatch, or a NULL accession; its message names each offender.
+        # project mismatch, or an entity with no identifier; its message names
+        # each offender.
         parser.error(f"--preflight-blob {preflight_blob}: {exc}")
     finally:
         conn.close()
@@ -131,17 +127,10 @@ def _read_preflight_rows(
             " a bcl-convert submission needs at least one sample to demultiplex"
         )
 
-    parsed: list[_PreflightRow] = []
-    for info in illumina_samples:
-        _refuse_malformed_accessions(info, parser, preflight_blob, "illumina_sample_idx")
-        parsed.append(
-            _PreflightRow(
-                illumina_sample_idx=info.sample_idx,
-                biosample_accession=info.biosample_accession,
-                primary_project_accession=info.primary_bioproject_accession,
-                secondary_project_accessions=list(info.secondary_bioproject_accessions),
-            )
-        )
+    parsed = [
+        _PreflightRow(illumina_sample_idx=info.sample_idx, refs=sample_refs(info))
+        for info in illumina_samples
+    ]
     return parsed
 
 
@@ -163,11 +152,9 @@ def _resolve_roster(
         rows=[
             RosterResolveRow(
                 item_id=pool_item_id(row),
-                biosample=BiosampleRef(biosample_accession=row.biosample_accession),
-                primary_project=StudyRef(bioproject_accession=row.primary_project_accession),
-                secondary_projects=[
-                    StudyRef(bioproject_accession=a) for a in row.secondary_project_accessions
-                ],
+                biosample=row.refs.biosample,
+                primary_project=row.refs.primary_project,
+                secondary_projects=list(row.refs.secondary_projects),
             )
             for row in preflight_rows
         ]
@@ -480,7 +467,7 @@ def _handle_submit_bcl_convert(args: argparse.Namespace, parser: argparse.Argume
         per_sample_results = [
             {
                 "illumina_sample_idx": s.row.illumina_sample_idx,
-                "biosample_accession": s.row.biosample_accession,
+                "biosample": s.row.refs.biosample.model_dump(mode="json", exclude_none=True),
                 "biosample_idx": s.biosample_idx,
                 "primary_study_idx": s.primary_study_idx,
                 "secondary_study_idxs": s.secondary_study_idxs,
