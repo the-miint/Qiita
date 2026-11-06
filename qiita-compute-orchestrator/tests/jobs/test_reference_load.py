@@ -489,6 +489,29 @@ def test_agreeing_lineages_on_one_feature_do_not_warn(staging_inputs, tmp_path, 
     assert _load_warnings(caplog) == []
 
 
+def test_a_null_lineage_on_the_smallest_read_id_does_not_displace_a_lineage(
+    staging_inputs, tmp_path, caplog
+):
+    """A NULL taxonomy carries no lineage, so the feature takes the one its other
+    read_id carries, though the NULL's read_id sorts first."""
+    inputs = _with_twin(staging_inputs, tmp_path, twin="aaa_twin_of_seq1", of="seq1")
+    tax = _write_taxonomy_parquet(
+        tmp_path / "taxonomy.parquet",
+        [(name, _TAXONOMY_STRINGS[name]) for name in _TEST_SEQUENCES]
+        + [("aaa_twin_of_seq1", None)],
+    )
+    with caplog.at_level(logging.WARNING, logger=_REFERENCE_LOAD_LOGGER):
+        outputs = _run(_inputs(**inputs, taxonomy_path=tax), tmp_path / "ws")
+    pq = outputs["staging_dir"] / "reference_taxonomy.parquet"
+    seq1_fidx = _FEATURE_MAP[_HASHES["seq1"]]
+    with duckdb.connect(":memory:") as conn:
+        genus = conn.execute(
+            f"SELECT genus FROM '{pq}' WHERE feature_idx = {seq1_fidx}"
+        ).fetchone()[0]
+    assert genus == "Lactobacillus"
+    assert _load_warnings(caplog) == []
+
+
 @pytest.mark.parametrize(
     ("bad_taxonomy", "match"),
     [
@@ -642,8 +665,8 @@ _JPLACE_TREE = (
 @pytest.fixture
 def jplace_path(tmp_path):
     """jplace input wrapped in the CLI's chunked DoPut shape.
-    reference_load stitches chunks back to a temp `.jplace` file before
-    passing to miint's `read_jplace`."""
+    reference_load stitches chunks back to a temp `.jplace` file, which
+    `load_jplace` then reads."""
     jplace_text = (
         b'{"version": 3, "tree": "' + _JPLACE_TREE.encode() + b'",'
         b' "placements": ['
@@ -657,12 +680,12 @@ def jplace_path(tmp_path):
     return _wrap_chunked_blob_parquet(tmp_path / "jplace_upload.parquet", jplace_text)
 
 
-def _raw_jplace(path: Path, placements: list[tuple[str, int]]) -> Path:
-    """A raw jplace (the local-path shape) on `_JPLACE_TREE`, placing each
+def _raw_jplace(path: Path, placements: list[tuple[str, int]], *, tree: str = _JPLACE_TREE) -> Path:
+    """A raw jplace (the local-path shape) on `tree`, placing each
     `(fragment, edge_num)`, with likelihoods that differ per row so a test can tell
     which row landed."""
     doc = {
-        "tree": _JPLACE_TREE,
+        "tree": tree,
         "placements": [
             {"p": [[edge, -1.0 - i, 0.5, 0.01, 0.02]], "n": [name]}
             for i, (name, edge) in enumerate(placements)
@@ -765,6 +788,15 @@ def test_placement_on_an_edge_the_jplace_tree_lacks_raises(staging_inputs, tmp_p
         _run(_inputs(**staging_inputs, jplace_path=jplace), tmp_path / "ws")
 
 
+def test_a_jplace_tree_numbered_with_brackets_is_refused(staging_inputs, tmp_path):
+    """`read_newick` takes `[N]` as a comment (duckdb-miint#419), so the load says the
+    edges are unnumbered rather than that every edge_num is missing from the tree."""
+    tree = _JPLACE_TREE.replace("{", "[").replace("}", "]")
+    jplace = _raw_jplace(tmp_path / "in.jplace", [("seq1", 0)], tree=tree)
+    with pytest.raises(ValueError, match=r"8 of the 8 edges in the jplace's tree carry no \{N\}"):
+        _run(_inputs(**staging_inputs, jplace_path=jplace), tmp_path / "ws")
+
+
 @pytest.mark.parametrize(
     "tree",
     [
@@ -805,6 +837,9 @@ def test_placements_load_with_the_jplaces_own_tree(staging_inputs, tmp_path, tre
             "another topology",
         ),
         (_JPLACE_TREE.replace("seq1:0.1{0}", "seq1:0.15{0}"), "a branch length changed"),
+        # Every node of the jplace's tree, unchanged, plus one: only the node count
+        # tells the two apart.
+        (_JPLACE_TREE[: -len(");")] + ",extra:0.9{8});", "one extra tip"),
     ],
 )
 def test_a_tree_other_than_the_jplaces_is_refused(staging_inputs, tmp_path, tree, why):

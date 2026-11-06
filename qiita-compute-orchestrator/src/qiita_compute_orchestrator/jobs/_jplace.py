@@ -57,6 +57,8 @@ _PART_PREFIX = b'{"placements": ['
 _PART_SUFFIX = b"]}"
 
 _DECODER = json.JSONDecoder()
+# A character that can continue a JSON number past where `raw_decode` stopped.
+_NUMBER_CONTINUES = frozenset("0123456789.eE+-")
 
 
 class _JsonStream:
@@ -118,9 +120,16 @@ class _JsonStream:
                 if within and self._fill():
                     continue
                 raise ValueError(f"{self._source}: malformed jplace JSON: {e}") from e
-            # A number that ends exactly at the buffer's end may be cut short ("12" of
-            # "123"); an object, array or string would have failed to decode instead.
-            if end == len(self._buf) and self._fill():
+            # A number is the one value that decodes when cut short: "12" of "123" when
+            # the read stops at the buffer's end, and "3" of "3.5" or "1" of "1e5" when
+            # it stops after the "." or "e", since `raw_decode` takes the longest number
+            # it can and leaves the rest. A cut object, array or string fails instead.
+            if (
+                isinstance(obj, int | float)
+                and not isinstance(obj, bool)
+                and (end == len(self._buf) or self._buf[end] in _NUMBER_CONTINUES)
+                and self._fill()
+            ):
                 continue
             text = self._buf[self._pos : end]
             self._pos = end
@@ -164,6 +173,7 @@ def _check_placement(obj: object, source: Path, index: int) -> None:
             and isinstance(names[0], list)
             and len(names[0]) == 2
             and isinstance(names[0][0], str)
+            and type(names[0][1]) is int
             and names[0][1] == 1
         ):
             raise refuse("does not name exactly one fragment of multiplicity 1 in 'nm'")
@@ -237,7 +247,8 @@ def split_jplace(
     `tree_out` once the whole file has been read.
 
     A part is complete when yielded, and the caller may delete it before asking for the
-    next, so at most one part is on disk at a time. Every placement is checked as it
+    next, so at most two parts are on disk at a time: the one yielded, and the next one,
+    which already holds the placement that closed it. Every placement is checked as it
     passes. `fields` and `tree` may come before or after `placements` — pplacer writes
     `fields` after — so a wrong or missing one can raise after parts have been yielded:
     nothing a caller builds from the parts is final until the generator is exhausted. A
@@ -307,7 +318,8 @@ def load_jplace(
     work_dir: Path,
 ) -> None:
     """Read every placement in `jplace_path` into a new TEMP TABLE `table`, and the
-    jplace's own tree into a new TEMP TABLE `tree_table` (`read_newick`'s columns).
+    jplace's own tree into a new TEMP TABLE `tree_table` (`read_newick`'s columns),
+    refusing a tree with an edge that has no edge number.
 
     `table` has `read_jplace`'s columns minus `filepath`, one row per placement in the
     file: the split refuses every shape `read_jplace` would collapse, and each part is
@@ -342,3 +354,16 @@ def load_jplace(
         f"CREATE TEMP TABLE {tree_table} AS SELECT * FROM read_newick(?)", [str(tree_path)]
     )
     tree_path.unlink()
+    # Every edge must carry its `{N}`, or a placement on it could not name it.
+    # `read_newick` reads an edge number written `[N]`, as some jplace writers do, as a
+    # comment (duckdb-miint#419), so such a tree arrives here with none.
+    unnumbered, edges = conn.execute(
+        f"SELECT count(*) FILTER (WHERE edge_id IS NULL), count(*) FROM {tree_table}"
+        " WHERE parent_index IS NOT NULL"
+    ).fetchone()
+    if unnumbered:
+        raise ValueError(
+            f"{jplace_path}: {unnumbered} of the {edges} edges in the jplace's tree carry no "
+            "{N} edge number. A tree that numbers its edges [N] is not read: read_newick "
+            "takes [N] as a comment (duckdb-miint#419)"
+        )

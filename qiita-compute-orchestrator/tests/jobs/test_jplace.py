@@ -128,15 +128,24 @@ def test_buffer_refills_mid_value(tmp_path, monkeypatch):
     path = _write(tmp_path, None, raw=json.dumps(_doc(), indent=2))
     parts = _split(path, tmp_path / "parts")
     assert [p for _, _, part in parts for p in part["placements"]] == _PLACEMENTS
+    assert (tmp_path / "tree.nwk").read_text() == _TREE
 
 
-def test_a_number_cut_by_the_buffer_end_is_read_whole(tmp_path, monkeypatch):
-    """A bare number is the one value that decodes when cut short: the first read here
-    ends at `{"version": 1234`, which `raw_decode` takes as 1234."""
-    raw = '{"version": 1234567, "fields": ' + json.dumps(list(EXPECTED_FIELDS))
+@pytest.mark.parametrize(
+    ("number", "first_read"),
+    [
+        ("1234567", '{"version": 1234'),
+        ("3.5", '{"version": 3.'),
+        ("1e5", '{"version": 1e'),
+    ],
+)
+def test_a_number_cut_by_the_buffer_end_is_read_whole(tmp_path, monkeypatch, number, first_read):
+    """The first read ends partway through a top-level number: within its digits, or
+    just after its "." or "e"."""
+    raw = '{"version": ' + number + ', "fields": ' + json.dumps(list(EXPECTED_FIELDS))
     raw += ', "placements": ' + json.dumps(_PLACEMENTS) + ', "tree": ' + json.dumps(_TREE) + "}"
-    assert raw[:16] == '{"version": 1234'
-    monkeypatch.setattr(_jplace, "_READ_CHARS", 16)
+    assert raw.startswith(first_read)
+    monkeypatch.setattr(_jplace, "_READ_CHARS", len(first_read))
     parts = _split(_write(tmp_path, None, raw=raw), tmp_path / "parts")
     assert [p for _, _, part in parts for p in part["placements"]] == _PLACEMENTS
 
@@ -157,6 +166,8 @@ def test_empty_placements_yield_no_part(tmp_path):
         ({"p": [[5, -1.0, 0.9, 0.01, 0.02]], "n": ["a", "b"]}, "exactly one fragment in 'n'"),
         ({"p": [[5, -1.0, 0.9, 0.01, 0.02]], "nm": [["a", 1], ["b", 1]]}, "multiplicity 1"),
         ({"p": [[5, -1.0, 0.9, 0.01, 0.02]], "nm": [["a", 3]]}, "multiplicity 1"),
+        ({"p": [[5, -1.0, 0.9, 0.01, 0.02]], "nm": [["a", True]]}, "multiplicity 1"),
+        ({"p": [[5, -1.0, 0.9, 0.01, 0.02]], "nm": [["a", 1.0]]}, "multiplicity 1"),
         (
             {"p": [[5, -1.0, 0.6, 0.01, 0.02], [6, -2.0, 0.4, 0.01, 0.02]], "n": ["a"]},
             "exactly one location",
