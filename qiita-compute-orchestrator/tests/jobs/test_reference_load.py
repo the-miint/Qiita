@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 from pathlib import Path
 from uuid import UUID
@@ -364,7 +365,7 @@ def test_taxonomy_lifted_writer_keys_by_feature_idx(
     assert [r for r in caplog.records if r.name == _REFERENCE_LOAD_LOGGER] == []
 
 
-def _taxonomy_warnings(caplog) -> list[str]:
+def _load_warnings(caplog) -> list[str]:
     """Lower-cased WARNING messages emitted by the reference_load logger."""
     return [
         r.getMessage().lower()
@@ -373,13 +374,16 @@ def _taxonomy_warnings(caplog) -> list[str]:
     ]
 
 
-def test_unclassified_feature_recorded_as_null_rank_row(staging_inputs, tmp_path, caplog):
-    """A feature with no supplied taxonomy is recorded at rest as a
-    NULL-rank row (reference_taxonomy stays 1-1 with features), and the
-    coverage gap is warned — not silently dropped (the old INNER JOIN)."""
+@pytest.mark.parametrize("seq5_rows", [[], [("seq5", None)]], ids=["no row", "a NULL taxonomy"])
+def test_unclassified_feature_recorded_as_null_rank_row(
+    staging_inputs, tmp_path, caplog, seq5_rows
+):
+    """A feature with no supplied taxonomy, whether it has no row or only a NULL one, is
+    recorded at rest as a NULL-rank row (reference_taxonomy stays 1-1 with features),
+    and the coverage gap is warned — not silently dropped (the old INNER JOIN)."""
     tax = _write_taxonomy_parquet(
         tmp_path / "taxonomy.parquet",
-        [(name, _TAXONOMY_STRINGS[name]) for name in ("seq1", "seq2", "seq3", "seq4")],
+        [(name, _TAXONOMY_STRINGS[name]) for name in ("seq1", "seq2", "seq3", "seq4")] + seq5_rows,
     )
     with caplog.at_level(logging.WARNING, logger=_REFERENCE_LOAD_LOGGER):
         outputs = _run(_inputs(**staging_inputs, taxonomy_path=tax), tmp_path / "ws")
@@ -393,7 +397,10 @@ def test_unclassified_feature_recorded_as_null_rank_row(staging_inputs, tmp_path
             f" FROM '{pq}' WHERE feature_idx = {seq5_fidx}"
         ).fetchone()
         assert row == (None,) * 8
-    assert any("unclassified" in w for w in _taxonomy_warnings(caplog))
+    assert any(
+        w.startswith("1 feature(s) have no supplied taxonomy") and "seq5" in w
+        for w in _load_warnings(caplog)
+    )
 
 
 def test_stray_taxonomy_rows_warn_and_are_dropped(staging_inputs, tmp_path, caplog):
@@ -416,8 +423,10 @@ def test_stray_taxonomy_rows_warn_and_are_dropped(staging_inputs, tmp_path, capl
             0
         ]
         assert dom == "Bacteria"
-    warnings = _taxonomy_warnings(caplog)
-    assert any("stray" in w or "unmatched" in w for w in warnings)
+    warnings = _load_warnings(caplog)
+    assert any(
+        w.startswith("1 supplied taxonomy row(s)") and "nz_cp039371.1" in w for w in warnings
+    )
 
 
 def test_duplicate_supplied_taxonomy_warns_and_stays_one_to_one(staging_inputs, tmp_path, caplog):
@@ -440,7 +449,96 @@ def test_duplicate_supplied_taxonomy_warns_and_stays_one_to_one(staging_inputs, 
             == 1
         )
         assert conn.execute(f"SELECT count(*) FROM '{pq}'").fetchone()[0] == len(_FEATURE_MAP)
-    assert any("duplicate" in w for w in _taxonomy_warnings(caplog))
+    assert any(
+        w.startswith("1 feature_id(s) have duplicate") and "seq1" in w
+        for w in _load_warnings(caplog)
+    )
+
+
+def test_conflicting_lineages_on_one_feature_keep_the_smallest_read_id(
+    staging_inputs, tmp_path, caplog
+):
+    """Two read_ids of one feature with different lineages: the feature takes the
+    lexicographically smallest read_id's — not whichever row came first — and warns."""
+    inputs = _with_twins(staging_inputs, tmp_path, {"aaa_twin_of_seq1": "seq1"})
+    tax = _write_taxonomy_parquet(
+        tmp_path / "taxonomy.parquet",
+        [(name, _TAXONOMY_STRINGS[name]) for name in _TEST_SEQUENCES]
+        + [("aaa_twin_of_seq1", _TAXONOMY_STRINGS["seq2"])],
+    )
+    with caplog.at_level(logging.WARNING, logger=_REFERENCE_LOAD_LOGGER):
+        outputs = _run(_inputs(**inputs, taxonomy_path=tax), tmp_path / "ws")
+    pq = outputs["staging_dir"] / "reference_taxonomy.parquet"
+    seq1_fidx = _FEATURE_MAP[_HASHES["seq1"]]
+    with duckdb.connect(":memory:") as conn:
+        assert conn.execute(f"SELECT count(*) FROM '{pq}'").fetchone()[0] == len(_FEATURE_MAP)
+        genus = conn.execute(
+            f"SELECT genus FROM '{pq}' WHERE feature_idx = {seq1_fidx}"
+        ).fetchone()[0]
+    assert genus == "Escherichia"
+    [warning] = [w for w in _load_warnings(caplog) if "more than one distinct lineage" in w]
+    assert "['aaa_twin_of_seq1', 'seq1']" in warning
+
+
+def test_agreeing_lineages_on_one_feature_do_not_warn(staging_inputs, tmp_path, caplog):
+    inputs = _with_twins(staging_inputs, tmp_path, {"aaa_twin_of_seq1": "seq1"})
+    tax = _write_taxonomy_parquet(
+        tmp_path / "taxonomy.parquet",
+        [(name, _TAXONOMY_STRINGS[name]) for name in _TEST_SEQUENCES]
+        + [("aaa_twin_of_seq1", _TAXONOMY_STRINGS["seq1"])],
+    )
+    with caplog.at_level(logging.WARNING, logger=_REFERENCE_LOAD_LOGGER):
+        _run(_inputs(**inputs, taxonomy_path=tax), tmp_path / "ws")
+    assert _load_warnings(caplog) == []
+
+
+def test_a_null_lineage_on_the_smallest_read_id_does_not_displace_a_lineage(
+    staging_inputs, tmp_path, caplog
+):
+    """A NULL taxonomy carries no lineage, so the feature takes the lineage that its
+    other read_id carries, even though the read_id with the NULL taxonomy sorts first."""
+    inputs = _with_twins(staging_inputs, tmp_path, {"aaa_twin_of_seq1": "seq1"})
+    tax = _write_taxonomy_parquet(
+        tmp_path / "taxonomy.parquet",
+        [(name, _TAXONOMY_STRINGS[name]) for name in _TEST_SEQUENCES]
+        + [("aaa_twin_of_seq1", None)],
+    )
+    with caplog.at_level(logging.WARNING, logger=_REFERENCE_LOAD_LOGGER):
+        outputs = _run(_inputs(**inputs, taxonomy_path=tax), tmp_path / "ws")
+    pq = outputs["staging_dir"] / "reference_taxonomy.parquet"
+    seq1_fidx = _FEATURE_MAP[_HASHES["seq1"]]
+    with duckdb.connect(":memory:") as conn:
+        genus = conn.execute(
+            f"SELECT genus FROM '{pq}' WHERE feature_idx = {seq1_fidx}"
+        ).fetchone()[0]
+    assert genus == "Lactobacillus"
+    assert _load_warnings(caplog) == []
+
+
+def test_a_conflict_warning_names_only_read_ids_that_carry_a_lineage(
+    staging_inputs, tmp_path, caplog
+):
+    """The read_id with the NULL taxonomy sorts first but carries no lineage, so the
+    warning starts from seq1, whose lineage is the one kept."""
+    inputs = _with_twins(
+        staging_inputs, tmp_path, {"aaa_twin_of_seq1": "seq1", "zzz_twin_of_seq1": "seq1"}
+    )
+    tax = _write_taxonomy_parquet(
+        tmp_path / "taxonomy.parquet",
+        [(name, _TAXONOMY_STRINGS[name]) for name in _TEST_SEQUENCES]
+        + [("aaa_twin_of_seq1", None), ("zzz_twin_of_seq1", _TAXONOMY_STRINGS["seq2"])],
+    )
+    with caplog.at_level(logging.WARNING, logger=_REFERENCE_LOAD_LOGGER):
+        outputs = _run(_inputs(**inputs, taxonomy_path=tax), tmp_path / "ws")
+    pq = outputs["staging_dir"] / "reference_taxonomy.parquet"
+    seq1_fidx = _FEATURE_MAP[_HASHES["seq1"]]
+    with duckdb.connect(":memory:") as conn:
+        genus = conn.execute(
+            f"SELECT genus FROM '{pq}' WHERE feature_idx = {seq1_fidx}"
+        ).fetchone()[0]
+    assert genus == "Lactobacillus"
+    [warning] = [w for w in _load_warnings(caplog) if "more than one distinct lineage" in w]
+    assert "['seq1', 'zzz_twin_of_seq1']" in warning
 
 
 @pytest.mark.parametrize(
@@ -586,13 +684,20 @@ def test_phylogeny_leaves_a_partially_decorated_tree_partial(staging_inputs, tmp
     assert still_null == 1, "the undecorated root must keep its NULL, not be minted"
 
 
+# The tree every placement fixture is made against: the five test sequences, every
+# node but the root decorated with a jplace `{N}` edge number, 0 to 7.
+_JPLACE_TREE = (
+    "((seq1:0.1{0},seq2:0.2{1}):0.3{2},(seq3:0.4{3},(seq4:0.5{4},seq5:0.6{5}):0.7{6}):0.8{7});"
+)
+
+
 @pytest.fixture
 def jplace_path(tmp_path):
     """jplace input wrapped in the CLI's chunked DoPut shape.
-    reference_load stitches chunks back to a temp `.jplace` file before
-    passing to miint's `read_jplace`."""
+    reference_load stitches chunks back to a temp `.jplace` file, which
+    `load_jplace` then reads."""
     jplace_text = (
-        b'{"version": 3, "tree": "((seq1:0.1{0},seq2:0.2{1}):0.3{2}):0.4{3};",'
+        b'{"version": 3, "tree": "' + _JPLACE_TREE.encode() + b'",'
         b' "placements": ['
         b'   {"p": [[5, -1.0, 0.9, 0.01, 0.02]], "nm": [["seq1", 1]]},'
         b'   {"p": [[7, -2.0, 0.8, 0.03, 0.04]], "nm": [["seq2", 1]]}'
@@ -604,12 +709,54 @@ def jplace_path(tmp_path):
     return _wrap_chunked_blob_parquet(tmp_path / "jplace_upload.parquet", jplace_text)
 
 
+def _raw_jplace(path: Path, placements: list[tuple[str, int]], *, tree: str = _JPLACE_TREE) -> Path:
+    """A raw jplace (the local-path shape) on `tree`, placing each
+    `(fragment, edge_num)`, with likelihoods that differ per row so a test can tell
+    which row landed."""
+    doc = {
+        "tree": tree,
+        "placements": [
+            {"p": [[edge, -1.0 - i, 0.5, 0.01, 0.02]], "n": [name]}
+            for i, (name, edge) in enumerate(placements)
+        ],
+        "fields": [
+            "edge_num",
+            "likelihood",
+            "like_weight_ratio",
+            "distal_length",
+            "pendant_length",
+        ],
+        "version": 3,
+    }
+    path.write_text(json.dumps(doc))
+    return path
+
+
+def _with_twins(staging_inputs: dict, tmp_path: Path, twins: dict[str, str]) -> dict:
+    """`staging_inputs` with more manifest read_ids, each `twin` in `twins` sharing the
+    sequence of the read_id it maps to: several names for one feature, as a
+    reverse-complement pair or a repeated record would be."""
+    manifest = tmp_path / "manifest_with_twins.parquet"
+    _write_parquet(
+        manifest,
+        "read_id VARCHAR, sequence_hash UUID, sequence_length_bp BIGINT",
+        [(name, str(_HASHES[name]), len(_TEST_SEQUENCES[name])) for name in _TEST_SEQUENCES]
+        + [(twin, str(_HASHES[of]), len(_TEST_SEQUENCES[of])) for twin, of in twins.items()],
+    )
+    return {**staging_inputs, "manifest": manifest}
+
+
+def _placements(pq: Path) -> list[tuple]:
+    with duckdb.connect(":memory:") as conn:
+        return conn.execute(
+            f"SELECT feature_idx, edge_num, likelihood FROM '{pq}' ORDER BY feature_idx"
+        ).fetchall()
+
+
 def test_placements_lifted_writer_maps_fragment_to_feature_idx(
     staging_inputs, jplace_path, tmp_path
 ):
-    """Placements writer maps `fragment` → manifest.read_id → feature_idx;
-    rows whose fragment isn't in id_map are silently dropped (a jplace
-    may carry fragments outside the current reference's mint scope)."""
+    """Placements writer maps `fragment` → manifest.read_id → feature_idx."""
     outputs = _run(_inputs(**staging_inputs, jplace_path=jplace_path), tmp_path / "ws")
     pq = outputs["staging_dir"] / "reference_placements.parquet"
     assert pq.exists()
@@ -619,6 +766,136 @@ def test_placements_lifted_writer_maps_fragment_to_feature_idx(
         ).fetchall()
         expected = sorted([(_FEATURE_MAP[_HASHES["seq1"]], 5), (_FEATURE_MAP[_HASHES["seq2"]], 7)])
         assert rows == expected
+
+
+@pytest.mark.parametrize("part_max_bytes", [None, 100])
+def test_placements_load_as_written_however_the_file_is_split(
+    staging_inputs, tmp_path, monkeypatch, part_max_bytes
+):
+    """A jplace too big for one `read_jplace` call is split and read part by part
+    (duckdb-miint#400). Whether it fits one part or takes one part per placement (100
+    bytes), every placement lands as the file wrote it."""
+    from qiita_compute_orchestrator.jobs import _jplace
+
+    if part_max_bytes is not None:
+        monkeypatch.setattr(_jplace, "_PART_MAX_BYTES", part_max_bytes)
+    written = [(name, i) for i, name in enumerate(_CANON)]
+    jplace = _raw_jplace(tmp_path / "in.jplace", written)
+    rows = _placements(
+        _run(_inputs(**staging_inputs, jplace_path=jplace), tmp_path / "ws")["staging_dir"]
+        / "reference_placements.parquet"
+    )
+    assert rows == sorted(
+        (_FEATURE_MAP[_HASHES[name]], edge, -1.0 - edge) for name, edge in written
+    )
+
+
+def test_placement_of_an_unknown_fragment_raises(staging_inputs, tmp_path):
+    """A fragment that is no sequence's read_id cannot be keyed to a feature; dropping
+    it would publish a placement set other than the one supplied."""
+    jplace = _raw_jplace(tmp_path / "in.jplace", [("seq1", 0), ("not_a_read", 1)])
+    with pytest.raises(
+        ValueError, match=r"1 jplace fragment\(s\) match no sequence identifier.*not_a_read"
+    ):
+        _run(_inputs(**staging_inputs, jplace_path=jplace), tmp_path / "ws")
+    assert not (tmp_path / "ws" / "reference_placements.parquet").exists()
+
+
+def test_fragment_placed_twice_raises(staging_inputs, tmp_path):
+    jplace = _raw_jplace(tmp_path / "in.jplace", [("seq1", 0), ("seq2", 1), ("seq1", 2)])
+    with pytest.raises(ValueError, match=r"placed more than once.*seq1"):
+        _run(_inputs(**staging_inputs, jplace_path=jplace), tmp_path / "ws")
+
+
+def test_placement_on_an_edge_the_jplace_tree_lacks_raises(staging_inputs, tmp_path):
+    """Every edge_num must be an edge of the jplace's own tree, whether or not this
+    load carries a tree. `_JPLACE_TREE` numbers 0 to 7."""
+    jplace = _raw_jplace(tmp_path / "in.jplace", [("seq1", 3), ("seq2", 999), ("seq3", 999)])
+    with pytest.raises(
+        ValueError, match=r"1 jplace edge_num\(s\) are not an edge of.*999 \(2 placements\)"
+    ):
+        _run(_inputs(**staging_inputs, jplace_path=jplace), tmp_path / "ws")
+
+
+def test_a_jplace_tree_numbered_with_brackets_is_refused(staging_inputs, tmp_path):
+    """`read_newick` takes `[N]` as a comment (duckdb-miint#419), so the load says the
+    edges are unnumbered rather than that every edge_num is missing from the tree."""
+    tree = _JPLACE_TREE.replace("{", "[").replace("}", "]")
+    jplace = _raw_jplace(tmp_path / "in.jplace", [("seq1", 0)], tree=tree)
+    with pytest.raises(ValueError, match=r"8 of the 8 edges in the jplace's tree carry no \{N\}"):
+        _run(_inputs(**staging_inputs, jplace_path=jplace), tmp_path / "ws")
+
+
+@pytest.mark.parametrize(
+    "tree",
+    [
+        _JPLACE_TREE,
+        # The same tree with labeled internal nodes and every node's children reversed:
+        # neither changes what a placement on it means.
+        "(((seq5:0.6{5},seq4:0.5{4})x:0.7{6},seq3:0.4{3})y:0.8{7},(seq2:0.2{1},seq1:0.1{0})z:0.3{2});",
+    ],
+)
+def test_placements_load_with_the_jplaces_own_tree(staging_inputs, tmp_path, tree):
+    nwk = tmp_path / "tree.nwk"
+    nwk.write_text(tree)
+    jplace = _raw_jplace(tmp_path / "in.jplace", [("seq1", 0), ("seq2", 7)])
+    outputs = _run(_inputs(**staging_inputs, tree_path=nwk, jplace_path=jplace), tmp_path / "ws")
+    assert [r[1] for r in _placements(outputs["staging_dir"] / "reference_placements.parquet")] == [
+        0,
+        7,
+    ]
+
+
+@pytest.mark.parametrize(
+    ("tree", "why"),
+    [
+        # The same topology without its `{N}` decorations: the loader numbers it by
+        # node_index, which is not the jplace's numbering.
+        (
+            "((seq1:0.1,seq2:0.2):0.3,(seq3:0.4,(seq4:0.5,seq5:0.6):0.7):0.8);",
+            "undecorated",
+        ),
+        (
+            _JPLACE_TREE.replace("seq1:", "tmp:")
+            .replace("seq2:", "seq1:")
+            .replace("tmp:", "seq2:"),
+            "two tips swapped",
+        ),
+        (
+            "((seq1:0.1{0},seq2:0.2{1}):0.3{2},(seq3:0.4{3},seq4:0.5{4}):0.7{6},seq5:0.6{5});",
+            "another topology",
+        ),
+        (_JPLACE_TREE.replace("seq1:0.1{0}", "seq1:0.15{0}"), "a branch length changed"),
+        # Every node of the jplace's tree, unchanged, plus one: only the node count
+        # tells the two apart.
+        (_JPLACE_TREE[: -len(");")] + ",extra:0.9{8});", "one extra tip"),
+    ],
+)
+def test_a_tree_other_than_the_jplaces_is_refused(staging_inputs, tmp_path, tree, why):
+    """A load carrying a tree and a jplace must carry the jplace's own tree; each case
+    differs from it in one way a placement depends on."""
+    nwk = tmp_path / "tree.nwk"
+    nwk.write_text(tree)
+    jplace = _raw_jplace(tmp_path / "in.jplace", [("seq1", 0), ("seq2", 1)])
+    with pytest.raises(ValueError, match="not the jplace's tree"):
+        _run(_inputs(**staging_inputs, tree_path=nwk, jplace_path=jplace), tmp_path / "ws")
+
+
+def test_a_feature_placed_under_two_fragments_keeps_the_smallest(staging_inputs, tmp_path, caplog):
+    """Two read_ids of one feature, each placed: the feature takes the lexicographically
+    smallest fragment's placement — not whichever came first in the file — and warns."""
+    inputs = _with_twins(staging_inputs, tmp_path, {"aaa_twin_of_seq1": "seq1"})
+    jplace = _raw_jplace(
+        tmp_path / "in.jplace", [("seq1", 0), ("seq2", 1), ("aaa_twin_of_seq1", 2)]
+    )
+    with caplog.at_level(logging.WARNING, logger=_REFERENCE_LOAD_LOGGER):
+        outputs = _run(_inputs(**inputs, jplace_path=jplace), tmp_path / "ws")
+    rows = _placements(outputs["staging_dir"] / "reference_placements.parquet")
+    seq1_fidx = _FEATURE_MAP[_HASHES["seq1"]]
+    assert [r for r in rows if r[0] == seq1_fidx] == [(seq1_fidx, 2, -3.0)]
+    assert len(rows) == 2
+    [warning] = [w for w in _load_warnings(caplog) if "more than one fragment" in w]
+    assert "aaa_twin_of_seq1" in warning
 
 
 # =============================================================================
