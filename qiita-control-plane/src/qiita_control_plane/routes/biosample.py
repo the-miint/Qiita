@@ -317,10 +317,6 @@ async def _with_import_error_mapping[T](
             ),
         )
     except SAMPLE_METADATA_WRITE_ERRORS as exc:
-        # Every member of SAMPLE_METADATA_WRITE_ERRORS maps through the shared
-        # mapper; the owner-id and asyncpg arms below stay route-specific.
-        # SlotOccupiedError is unreachable here, since a fresh biosample cannot
-        # already occupy a slot, and the shared mapping answers it regardless.
         await raise_http_for_sample_metadata_write_error(
             conn, exc, spec=BIOSAMPLE_METADATA_SPEC, tiers=tiers
         )
