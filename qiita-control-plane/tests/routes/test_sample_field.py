@@ -11,7 +11,7 @@ from decimal import Decimal
 import asyncpg
 import pytest
 import pytest_asyncio
-from qiita_common.models import FieldDataType
+from qiita_common.models import FieldDataType, Tier
 
 from qiita_control_plane.routes import _helpers as route_helpers
 from qiita_control_plane.testing.db_seeds import seed_terminology
@@ -19,7 +19,7 @@ from qiita_control_plane.testing.db_teardown import delete_idxs, teardown_entity
 from qiita_control_plane.testing.unique_names import unique_field_name
 
 from .conftest import (
-    _STUDY_FIELD_ADMIN_FLOOR_AUTHZ,
+    _STUDY_FIELD_MEMBER_FLOOR_AUTHZ,
     SAMPLE_FIELD_SURFACES,
     STUDY_FIELD_CREATE_AUTHZ_CASES,
     _grant_study_access,
@@ -256,7 +256,7 @@ async def test_patch_study_field_authz(
     ctx, surface, case, no_biosample_write_client, no_prep_sample_write_client
 ):
     """Tests the case where each row of the access matrix reaches the edit
-    route: the gate matches the create route's, at the same ADMIN floor.
+    route: the gate matches the create route's, at the same MEMBER floor.
     """
     # Both no-scope clients are async fixtures, so neither can be materialized
     # on demand from inside the test; each is requested and the surface's own
@@ -301,7 +301,7 @@ async def test_patch_study_field_authz(
     await assert_study_field_authz(
         ctx,
         case=case,
-        cases=_STUDY_FIELD_ADMIN_FLOOR_AUTHZ,
+        cases=_STUDY_FIELD_MEMBER_FLOOR_AUTHZ,
         surface=surface,
         no_scope_client=no_scope_client,
         send=send,
@@ -1213,3 +1213,186 @@ async def test_patch_study_field_widen_admits_a_concurrent_write(ctx, surface, m
     assert seam_ran
     assert resp.status_code == 200, resp.text
     assert await _stored_values(ctx, surface, target_idx) == [("2.5", None)]
+
+
+# ---------------------------------------------------------------------------
+# A field's tier bounds who may create, link, or edit it
+# ---------------------------------------------------------------------------
+
+
+async def _study_with_grant(ctx, suffix: str, tier: Tier) -> int:
+    """Seed a study owned by the wet-lab session where the user session holds
+    `tier`; the study's own default tier is the schema's, member."""
+    study_idx = await _seed_study(ctx, owner_idx=ctx["wet_session"]["principal_idx"], suffix=suffix)
+    await _grant_study_access(
+        ctx,
+        study_idx=study_idx,
+        principal_idx=ctx["user_session"]["principal_idx"],
+        tier=tier,
+        granted_by_idx=ctx["wet_session"]["principal_idx"],
+    )
+    return study_idx
+
+
+async def _fields_named(ctx, surface, *, study_idx: int, display_name: str) -> int:
+    return await ctx["pool"].fetchval(
+        f"SELECT count(*) FROM {surface.metadata_spec.study_field_table}"
+        f" WHERE study_idx = $1 AND display_name = $2",
+        study_idx,
+        display_name,
+    )
+
+
+@pytest.mark.parametrize("surface", SAMPLE_FIELD_SURFACES, ids=_surface_id)
+@pytest.mark.parametrize(("tier", "expected"), [(Tier.MEMBER, 403), (Tier.ADMIN, 201)])
+async def test_create_field_with_tier_override_requires_admin(ctx, surface, tier, expected):
+    """Tests the case where a create sets the field's tier: only an admin may,
+    even when the tier set is below the caller's own.
+    """
+    study_idx = await _study_with_grant(ctx, f"tier-create-{tier}", tier)
+    display_name = unique_field_name("TierSet")
+
+    resp = await post_study_field(
+        surface=surface,
+        client=ctx["user"],
+        study_idx=study_idx,
+        display_name=display_name,
+        data_type="text",
+        tier_override=Tier.VIEWER,
+    )
+
+    assert resp.status_code == expected, resp.text
+    if expected == 403:
+        # Refused for the tier change, not by the route's floor.
+        assert "tier_override" in resp.json()["detail"]
+    created = await _fields_named(ctx, surface, study_idx=study_idx, display_name=display_name)
+    assert created == (1 if expected == 201 else 0)
+
+
+@pytest.mark.parametrize("surface", SAMPLE_FIELD_SURFACES, ids=_surface_id)
+async def test_create_local_field_above_caller_tier_refused(ctx, surface):
+    """Tests the case where a field with no override would inherit an admin
+    study default: a member may not create a field whose values they could not
+    read, and nothing is created.
+    """
+    study_idx = await _study_with_grant(ctx, "tier-create-admin-default", Tier.MEMBER)
+    await ctx["pool"].execute(
+        "UPDATE qiita.study SET default_tier = $2::qiita.tier WHERE idx = $1", study_idx, Tier.ADMIN
+    )
+    display_name = unique_field_name("AboveTier")
+
+    resp = await post_study_field(
+        surface=surface,
+        client=ctx["user"],
+        study_idx=study_idx,
+        display_name=display_name,
+        data_type="text",
+    )
+
+    assert resp.status_code == 403, resp.text
+    assert display_name in resp.json()["detail"]
+    assert await _fields_named(ctx, surface, study_idx=study_idx, display_name=display_name) == 0
+
+
+@pytest.mark.parametrize("surface", SAMPLE_FIELD_SURFACES, ids=_surface_id)
+async def test_link_field_to_global_above_caller_tier_refused(ctx, surface):
+    """Tests the case where a member links the study to a global field whose
+    default tier is admin: refused, and no link is created.
+    """
+    study_idx = await _study_with_grant(ctx, "tier-link-admin-global", Tier.MEMBER)
+    suffix = unique_field_name("admin_global").lower()
+    global_idx = await surface.seed_global_field(
+        ctx["pool"],
+        internal_name=suffix,
+        display_name=f"Admin Global {suffix}",
+        data_type=FieldDataType.TEXT,
+        created_by_idx=ctx["wet_session"]["principal_idx"],
+        default_tier=Tier.ADMIN,
+    )
+    ctx["created"][surface.global_created_key].append(global_idx)
+    display_name = unique_field_name("LinkAbove")
+
+    resp = await post_study_field(
+        surface=surface,
+        client=ctx["user"],
+        study_idx=study_idx,
+        display_name=display_name,
+        **{surface.global_fk_key: global_idx},
+    )
+
+    assert resp.status_code == 403, resp.text
+    assert display_name in resp.json()["detail"]
+    assert await _fields_named(ctx, surface, study_idx=study_idx, display_name=display_name) == 0
+
+
+@pytest.mark.parametrize("surface", SAMPLE_FIELD_SURFACES, ids=_surface_id)
+@pytest.mark.parametrize(("tier", "expected"), [(Tier.MEMBER, 403), (Tier.ADMIN, 200)])
+async def test_patch_field_tier_override_requires_admin(ctx, surface, tier, expected):
+    """Tests the case where an edit changes a field's tier: only an admin may,
+    and a member's attempt leaves it as it was.
+    """
+    study_idx = await _study_with_grant(ctx, f"tier-patch-{tier}", tier)
+    created = await post_study_field(
+        surface=surface,
+        client=ctx["wet"],
+        study_idx=study_idx,
+        display_name=unique_field_name("TierEdit"),
+        data_type="text",
+    )
+    assert created.status_code == 201, created.text
+    field_idx = created.json()[surface.idx_key]
+
+    resp = await patch_study_field(
+        surface=surface,
+        client=ctx["user"],
+        study_idx=study_idx,
+        study_field_idx=field_idx,
+        if_match=await _etag(ctx, surface, field_idx),
+        tier_override=Tier.PUBLIC,
+    )
+
+    assert resp.status_code == expected, resp.text
+    if expected == 403:
+        assert "tier_override" in resp.json()["detail"]
+    stored = await ctx["pool"].fetchval(
+        f"SELECT tier_override FROM {surface.metadata_spec.study_field_table} WHERE idx = $1",
+        field_idx,
+    )
+    assert stored == (None if expected == 403 else Tier.PUBLIC)
+
+
+@pytest.mark.parametrize("surface", SAMPLE_FIELD_SURFACES, ids=_surface_id)
+async def test_patch_field_above_caller_tier_refused(ctx, surface):
+    """Tests the case where a member edits a field that requires admin: a
+    member may not touch a field whose values they could not read, so even a
+    description edit is refused and nothing changes.
+    """
+    study_idx = await _study_with_grant(ctx, "tier-patch-above", Tier.MEMBER)
+    display_name = unique_field_name("AdminField")
+    created = await post_study_field(
+        surface=surface,
+        client=ctx["wet"],
+        study_idx=study_idx,
+        display_name=display_name,
+        data_type="text",
+        tier_override=Tier.ADMIN,
+    )
+    assert created.status_code == 201, created.text
+    field_idx = created.json()[surface.idx_key]
+
+    resp = await patch_study_field(
+        surface=surface,
+        client=ctx["user"],
+        study_idx=study_idx,
+        study_field_idx=field_idx,
+        if_match=await _etag(ctx, surface, field_idx),
+        description="edited by a member",
+    )
+
+    assert resp.status_code == 403, resp.text
+    assert display_name in resp.json()["detail"]
+    stored = await ctx["pool"].fetchval(
+        f"SELECT description FROM {surface.metadata_spec.study_field_table} WHERE idx = $1",
+        field_idx,
+    )
+    assert stored is None
