@@ -715,13 +715,8 @@ async def raise_http_for_sample_metadata_write_error(
     if isinstance(exc, MetadataValueTierError):
         _raise_value_above_tier(spec=spec, field_keys=exc.field_keys)
     if isinstance(exc, (ValueRewriteOnUniqueFieldError, SlotOccupiedError)):
-        occupant_idx = (
-            exc.metadata_idx
-            if isinstance(exc, ValueRewriteOnUniqueFieldError)
-            else exc.existing_metadata_idx
-        )
         if await fetch_hidden_metadata_idxs(
-            conn, spec=spec, tiers=tiers, metadata_idxs=[occupant_idx]
+            conn, spec=spec, tiers=tiers, metadata_idxs=[exc.existing_metadata_idx]
         ):
             _raise_value_above_tier(spec=spec, field_keys=[exc.display_name])
     if isinstance(exc, MetadataParseError):

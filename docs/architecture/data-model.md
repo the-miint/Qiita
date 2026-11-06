@@ -104,9 +104,10 @@ A purely-local field's `data_type` may be **widened to `text`**, and to nothing 
 This section defines the rule. It supersedes the comment on the `qiita.tier`
 type in the applied migration `20260501000006_study.sql`, which names only
 system admins as reading every value, as the study-record rule below does.
-Reads of biosample and prep_sample metadata enforce it through
+Reads and writes of biosample and prep_sample metadata enforce it through
 `qiita.biosample_metadata_visibility` / `qiita.prep_sample_metadata_visibility`,
-which take the caller's tiers from `auth.guards.caller_metadata_tiers`.
+which take the caller's tiers from `auth.guards.caller_metadata_tiers`; writes
+also check field tiers through `qiita.metadata_field_tier`.
 
 A caller may read a metadata value when their tier on **the value's study**
 reaches **the value's required tier**.
@@ -185,10 +186,34 @@ they carry. Readers that serve operators
 rather than callers — the host-filter resolver, the host-taxon backfill, and
 the system_admin owner-biosample-id export — read the tables directly.
 
-**Writes are checked separately.** Every study-scoped route that writes
-biosample or prep_sample metadata, or mints a study-local field, requires
-`admin` on the study, or a wet_lab_admin+ role, so only a caller who can read
-every value there can write.
+**Writes are bounded by the same rule.** The study-scoped routes that write
+biosample or prep_sample metadata, or create or edit a study-local field, admit
+any caller with `member` tier or above on the study, or a wet_lab_admin+ role.
+What such a caller may touch:
+
+- **Fields.** A write naming a field whose field tier is above the caller's
+  tier on the study is refused with 403, before anything is written or parsed
+  (`_sample_helpers.preflight_sample_metadata`). A global field the study has
+  not linked yet is judged on its own tier.
+- **Values.** Every value a write inserts, overwrites, or leaves unchanged must
+  be one the caller can read once written. Otherwise the write is refused with
+  403 and rolls back (`_sample_helpers.write_resolved_metadata_entries`). An
+  exception can cause this on a field the caller otherwise reaches.
+- **Values the caller cannot read already in the way.** A write that collides
+  with such a value, whether another study's value in a global slot or a value
+  stored through a `unique_in_study` field, answers the same 403. It names no
+  value and no study, and does not say whether the two values agree
+  (`routes._helpers.raise_http_for_sample_metadata_write_error`).
+- **Field definitions.** Setting `tier_override` requires `admin` on the study,
+  whatever tier it sets. A caller may create, link, or edit only a field whose
+  field tier is within their own tier on the study.
+- **Imports.** Creating a sample with its metadata requires `admin` on the
+  study, so an import writes only values its caller can read.
+
+**What a refused write can still reveal.** `unique_in_study` is enforced over
+every value, including ones the caller cannot read. A write that repeats a value
+already stored through such a field on another sample is refused for that
+collision, which shows the caller that a hidden value equals the one they sent.
 
 ### What a tier reads of a study's own record
 

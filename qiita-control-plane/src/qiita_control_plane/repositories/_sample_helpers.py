@@ -391,14 +391,14 @@ class ValueRewriteOnUniqueFieldError(Exception):
         entity_kind: SampleEntityKind,
         display_name: str,
         study_field_idx: int,
-        metadata_idx: int,
+        existing_metadata_idx: int,
         stored_value: object,
         attempted_value: object,
     ) -> None:
         self.entity_kind = entity_kind
         self.display_name = display_name
         self.study_field_idx = study_field_idx
-        self.metadata_idx = metadata_idx
+        self.existing_metadata_idx = existing_metadata_idx
         self.stored_value = stored_value
         self.attempted_value = attempted_value
         super().__init__(
@@ -2116,7 +2116,7 @@ async def _insert_metadata_or_diagnose(
                 entity_kind=spec.entity_kind,
                 display_name=display_name,
                 study_field_idx=occupant_field_idx,
-                metadata_idx=existing_metadata_idx,
+                existing_metadata_idx=existing_metadata_idx,
                 stored_value=existing_value,
                 attempted_value=value,
             )
