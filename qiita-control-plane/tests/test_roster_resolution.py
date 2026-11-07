@@ -12,6 +12,7 @@ from qiita_common.models import (
     RosterProblem,
     RosterResolvedRow,
     RosterResolveRow,
+    SequencedSampleCreateRequest,
     StudyRef,
 )
 
@@ -249,6 +250,44 @@ def test_classify_roster_secondary_not_linked():
         " with bioproject_accession 'PRJNA3'",
     )
     assert result == ([], [expected])
+
+
+def test_classify_roster_secondary_is_primary():
+    """Tests the case where a secondary project, named by a different identifier,
+    resolves to the primary's study: the row is refused rather than resolved."""
+    row = _row(secondaries=({"export_entity_id": "QS101"},))
+    result = classify_roster([row], _facts())
+    expected = RosterProblem(
+        item_id="1",
+        message="the study with export_entity_id 'QS101' is also the primary project",
+    )
+    assert result == ([], [expected])
+
+
+def test_classify_roster_resolved_rows_build_sequenced_samples():
+    """Tests the case where resolved rows become sequenced-sample requests: every
+    row the roster resolves is one the request model accepts."""
+    rows = [
+        _row("plain"),
+        _row("shared", secondaries=({"bioproject_accession": "PRJNA2"},)),
+        _row("self", secondaries=({"export_entity_id": "QS101"},)),
+    ]
+    resolved, _problems = classify_roster(rows, _facts())
+    requests = [
+        SequencedSampleCreateRequest(
+            biosample_idx=r.biosample_idx,
+            prep_protocol_idx=1,
+            owner_idx=1,
+            sequenced_pool_item_id=r.item_id,
+            primary_study_idx=r.primary_study_idx,
+            secondary_study_idxs=r.secondary_study_idxs,
+        )
+        for r in resolved
+    ]
+    built = [
+        (q.sequenced_pool_item_id, q.primary_study_idx, q.secondary_study_idxs) for q in requests
+    ]
+    assert built == [("plain", 101, []), ("shared", 101, [102])]
 
 
 def test_classify_roster_request_order():

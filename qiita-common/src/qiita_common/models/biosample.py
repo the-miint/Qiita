@@ -802,8 +802,9 @@ class StudyRef(_ExternalRef):
 class RosterResolveRow(BaseModel):
     """One pool row to resolve to a biosample and its studies.
 
-    Every identifier given for an entity must name the same one, and every study
-    must be among the biosample's active study links.
+    Every identifier given for an entity must name the same one, every study must
+    be among the biosample's active study links, and no secondary project may name
+    the primary's study.
     """
 
     model_config = ConfigDict(extra="forbid")

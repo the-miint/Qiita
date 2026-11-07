@@ -134,17 +134,24 @@ def classify_roster(
                 if study is not None and study.idx not in links:
                     row_problems.append(f"{biosample.description} is not in {study.description}")
 
+        # A secondary named by other identifiers can still be the primary's study
+        primary_study, *secondary_studies = studies
+        if primary_study is not None:
+            for study in secondary_studies:
+                if study is not None and study.idx == primary_study.idx:
+                    row_problems.append(f"{study.description} is also the primary project")
+
         if row_problems:
             problems.extend(RosterProblem(item_id=row.item_id, message=m) for m in row_problems)
             continue
-        assert biosample is not None and None not in studies
-        primary, *secondaries = studies
+        assert biosample is not None and primary_study is not None
+        assert None not in secondary_studies
         resolved.append(
             RosterResolvedRow(
                 item_id=row.item_id,
                 biosample_idx=biosample.idx,
-                primary_study_idx=primary.idx,
-                secondary_study_idxs=[s.idx for s in secondaries],
+                primary_study_idx=primary_study.idx,
+                secondary_study_idxs=[s.idx for s in secondary_studies],
             )
         )
     return resolved, problems
