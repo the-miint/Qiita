@@ -20,7 +20,7 @@ from pathlib import Path
 
 import httpx
 import pytest
-from qiita_common.models import PacbioRunIndex
+from qiita_common.models import BiosampleRef, PacbioRunIndex, StudyRef
 from qiita_common.pacbio import index_run_bams
 
 from qiita_control_plane.cli import _common
@@ -29,9 +29,18 @@ from qiita_control_plane.cli.user import (
     _resolve_sample_bams,
     main,
 )
-from qiita_control_plane.cli.user.pacbio import _validate_pacbio_protocol
+from qiita_control_plane.cli.user.pacbio import _PacbioPreflightRow, _validate_pacbio_protocol
+from qiita_control_plane.preflight import SampleRefs
 
 _CASE5_CSV = Path(__file__).parent / "data" / "good_pacbio_absquantv11.csv"
+# (barcode, twist_adaptor_id, smrt_cell) of case-5 pacbio_sample_idx 1, 2 and 3,
+# with a SMRT cell recorded on the first only
+_CASE5_PROTOCOL = (
+    ("bc3011", "16_UDI_1_A01_F--16_UDI_1_A01_R", "1_A01"),
+    ("bc0112", "16_UDI_2_B01_F--16_UDI_2_B01_R", None),
+    ("bc9992", "16_UDI_5_E01_F--16_UDI_5_E01_R", None),
+)
+_REFS = SampleRefs(BiosampleRef(biosample_accession="BIO"), StudyRef(bioproject_accession="9"), ())
 
 
 class _RaisingParser:
@@ -81,14 +90,10 @@ def test_index_run_bams_quarantines_barcode_reused_across_cells(tmp_path):
 
 
 def _row(barcode: str, idx: int = 1):
-    from qiita_control_plane.cli.user import _PacbioPreflightRow
-
     return _PacbioPreflightRow(
         pacbio_sample_idx=idx,
         barcode=barcode,
-        biosample_accession="BIO",
-        primary_project_accession="99999",
-        secondary_project_accessions=[],
+        refs=_REFS,
         sheet_type="pacbio_absquant",
         twist_adaptor_id="t",
         syndna_is_twisted=False,
@@ -155,14 +160,10 @@ def test_resolve_sample_bams_errors_on_empty_run_folder(tmp_path):
 
 
 def test_validate_protocol_rejects_twisted_without_adapter():
-    from qiita_control_plane.cli.user import _PacbioPreflightRow
-
     row = _PacbioPreflightRow(
         pacbio_sample_idx=1,
         barcode="bc",
-        biosample_accession="B",
-        primary_project_accession="9",
-        secondary_project_accessions=[],
+        refs=_REFS,
         sheet_type="pacbio_absquant",
         twist_adaptor_id=None,
         syndna_is_twisted=True,
@@ -173,14 +174,10 @@ def test_validate_protocol_rejects_twisted_without_adapter():
 
 def test_validate_protocol_allows_untwisted_without_adapter():
     """syndna_is_twisted False + empty twist is protocol 2 — valid, no error."""
-    from qiita_control_plane.cli.user import _PacbioPreflightRow
-
     row = _PacbioPreflightRow(
         pacbio_sample_idx=1,
         barcode="bc",
-        biosample_accession="B",
-        primary_project_accession="9",
-        secondary_project_accessions=[],
+        refs=_REFS,
         sheet_type="pacbio_absquant",
         twist_adaptor_id=None,
         syndna_is_twisted=False,
@@ -193,13 +190,39 @@ def test_validate_protocol_allows_untwisted_without_adapter():
 # ---------------------------------------------------------------------------
 
 
-def test_read_preflight_rows_case5(build_case5_preflight):
-    """The seam returns one row per sample for the real case-5 sheet, including
-    the control blank (sample.3, which the reader resolves to the plate primary
-    bioproject). twist filled + syndna_is_twisted False is the case-5 signature.
-    The project accession is the ENA **bioproject** (what the study lookup keys
-    on), and smrt_cell rides through from the reader when the preflight records it."""
-    db = build_case5_preflight()
+@pytest.mark.parametrize(
+    ("biosample_kind", "project_kind", "biosample_refs", "project_ref"),
+    [
+        (
+            "biosample_accession",
+            "bioproject_accession",
+            [BiosampleRef(biosample_accession=f"BIO_sample.{i}") for i in (1, 2, 3)],
+            StudyRef(bioproject_accession="PRJNA99999"),
+        ),
+        (
+            "biosample_export_entity_id",
+            "study_export_entity_id",
+            [BiosampleRef(export_entity_id=f"QB{i}") for i in (1, 2, 3)],
+            StudyRef(export_entity_id="QS1"),
+        ),
+    ],
+    ids=["accessions", "export-ids-only"],
+)
+def test_read_preflight_rows_case5(
+    build_case5_preflight,
+    set_preflight_identifiers,
+    biosample_kind,
+    project_kind,
+    biosample_refs,
+    project_ref,
+):
+    """Tests the case where the real case-5 sheet names its entities by accessions,
+    or by export IDs alone: one row per sample, including the control blank
+    (sample.3, which the reader resolves to the plate primary project), each
+    carrying the identifiers the sheet gives. twist filled + syndna_is_twisted
+    False is the case-5 signature, and smrt_cell rides through when recorded."""
+    db = build_case5_preflight(populate_accessions=False)
+    set_preflight_identifiers(db, biosample_kind=biosample_kind, project_kind=project_kind)
     conn = sqlite3.connect(db)
     # Record a SMRT cell on sample.1 only, to prove it threads onto the row.
     conn.execute(
@@ -209,18 +232,21 @@ def test_read_preflight_rows_case5(build_case5_preflight):
     conn.close()
 
     rows = _read_pacbio_preflight_rows(db, _RaisingParser())
-    # pacbio_sample_idx is the unique identity (ordered by the accessor); barcode is
-    # only the BAM-locating key.
-    assert [r.pacbio_sample_idx for r in rows] == [1, 2, 3]
-    assert [r.barcode for r in rows] == ["bc3011", "bc0112", "bc9992"]
-    assert [r.biosample_accession for r in rows] == ["BIO_sample.1", "BIO_sample.2", "BIO_sample.3"]
-    assert [r.smrt_cell for r in rows] == ["1_A01", None, None]
-    for r in rows:
-        assert r.primary_project_accession == "PRJNA99999"  # control resolves to plate primary
-        assert r.secondary_project_accessions == []
-        assert r.sheet_type == "pacbio_absquant"
-        assert r.twist_adaptor_id  # case 5: filled
-        assert r.syndna_is_twisted is False
+    expected = [
+        _PacbioPreflightRow(
+            pacbio_sample_idx=idx,
+            barcode=barcode,
+            refs=SampleRefs(biosample, project_ref, ()),
+            sheet_type="pacbio_absquant",
+            twist_adaptor_id=twist,
+            syndna_is_twisted=False,
+            smrt_cell=smrt_cell,
+        )
+        for idx, (barcode, twist, smrt_cell), biosample in zip(
+            (1, 2, 3), _CASE5_PROTOCOL, biosample_refs, strict=True
+        )
+    ]
+    assert rows == expected
 
 
 def test_read_preflight_rows_accepts_barcode_shared_across_samples(build_case5_preflight):
@@ -238,27 +264,12 @@ def test_read_preflight_rows_accepts_barcode_shared_across_samples(build_case5_p
     assert [r.barcode for r in rows].count("bc3011") == 2  # the shared barcode
 
 
-def test_read_preflight_rows_fails_on_missing_accession(build_case5_preflight):
-    """Unpopulated biosample / bioproject accessions are an operator-actionable
-    fail-fast: `get_pacbio_sample_info` raises and the CLI surfaces its message."""
+def test_read_preflight_rows_fails_on_missing_identifier(build_case5_preflight):
+    """Tests the case where no biosample or project carries an identifier: an
+    operator-actionable fail-fast, `get_pacbio_sample_info` raises and the CLI
+    surfaces its message."""
     db = build_case5_preflight(populate_accessions=False)
-    with pytest.raises(_RaisingParser.Error, match="missing required accession"):
-        _read_pacbio_preflight_rows(db, _RaisingParser())
-
-
-@pytest.mark.parametrize("bioproject", ["", "  ", " PRJNA99999 "])
-def test_read_preflight_rows_fails_on_blank_or_padded_accession(build_case5_preflight, bioproject):
-    """The library refuses a NULL accession but not a blank or padded one; the
-    reader refuses those, naming the sample."""
-    db = build_case5_preflight()
-    conn = sqlite3.connect(db)
-    conn.execute("UPDATE project SET bioproject_accession = ?", (bioproject,))
-    conn.commit()
-    conn.close()
-    with pytest.raises(
-        _RaisingParser.Error,
-        match=r"pacbio_sample_idx 1 has a blank or padded primary_bioproject_accession",
-    ):
+    with pytest.raises(_RaisingParser.Error, match="missing required identifier"):
         _read_pacbio_preflight_rows(db, _RaisingParser())
 
 
@@ -361,10 +372,10 @@ def _stub_submit_flow(
             rows = [
                 {
                     "item_id": r["item_id"],
-                    "biosample_idx": biosample_idx[r["biosample_accession"]],
-                    "primary_study_idx": study_idx[r["primary_project_accession"]],
+                    "biosample_idx": biosample_idx[r["biosample"]["biosample_accession"]],
+                    "primary_study_idx": study_idx[r["primary_project"]["bioproject_accession"]],
                     "secondary_study_idxs": [
-                        study_idx[a] for a in r["secondary_project_accessions"]
+                        study_idx[p["bioproject_accession"]] for p in r["secondary_projects"]
                     ],
                 }
                 for r in json["rows"]
@@ -825,14 +836,10 @@ def test_read_preflight_rows_rejects_non_pacbio_sheet(build_case5_preflight):
 
 
 def test_validate_protocol_rejects_twisted_on_metag():
-    from qiita_control_plane.cli.user import _PacbioPreflightRow
-
     row = _PacbioPreflightRow(
         pacbio_sample_idx=1,
         barcode="bc",
-        biosample_accession="B",
-        primary_project_accession="9",
-        secondary_project_accessions=[],
+        refs=_REFS,
         sheet_type="pacbio_metag",
         twist_adaptor_id="t",
         syndna_is_twisted=True,

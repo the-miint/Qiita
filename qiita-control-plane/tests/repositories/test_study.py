@@ -28,7 +28,7 @@ from qiita_control_plane.repositories.study import (
     create_study,
     fetch_study,
     fetch_study_exists,
-    fetch_study_idxs_by_accession,
+    fetch_study_idxs_by_natural_key,
     get_or_create_study_by_ena_accessions,
     insert_study,
     update_study,
@@ -1117,12 +1117,12 @@ async def test_get_or_create_study_by_ena_accessions_collision_refetch_resolves_
 
 
 # ---------------------------------------------------------------------------
-# fetch_study_idxs_by_accession — selectable accession column
+# fetch_study_idxs_by_natural_key — selectable lookup key
 # ---------------------------------------------------------------------------
 
 
-async def test_fetch_study_idxs_by_accession_resolves_by_bioproject_default(postgres_pool):
-    """Tests the case where accession_field is omitted: the default keys on
+async def test_fetch_study_idxs_by_natural_key_resolves_by_bioproject_default(postgres_pool):
+    """Tests the case where key is omitted: the default keys on
     bioproject_accession, so a study's bioproject value resolves and a
     bogus value lands in the unresolved set (absent from the map)."""
     async with postgres_pool.acquire() as conn:
@@ -1139,7 +1139,7 @@ async def test_fetch_study_idxs_by_accession_resolves_by_bioproject_default(post
                 bioproject_accession=bioproject,
             )
 
-            resolved = await fetch_study_idxs_by_accession(
+            resolved = await fetch_study_idxs_by_natural_key(
                 conn, values=[bioproject, "PRJNA-absent"]
             )
 
@@ -1148,8 +1148,8 @@ async def test_fetch_study_idxs_by_accession_resolves_by_bioproject_default(post
             await tr.rollback()
 
 
-async def test_fetch_study_idxs_by_accession_resolves_by_ena_when_specified(postgres_pool):
-    """Tests the case where accession_field selects ena_study_accession: a
+async def test_fetch_study_idxs_by_natural_key_resolves_by_ena_when_specified(postgres_pool):
+    """Tests the case where key selects ena_study_accession: a
     bioproject value no longer resolves, only the ena value does."""
     async with postgres_pool.acquire() as conn:
         tr = conn.transaction()
@@ -1165,8 +1165,8 @@ async def test_fetch_study_idxs_by_accession_resolves_by_ena_when_specified(post
                 ena_study_accession=ena,
             )
 
-            resolved = await fetch_study_idxs_by_accession(
-                conn, values=[ena], accession_field="ena_study_accession"
+            resolved = await fetch_study_idxs_by_natural_key(
+                conn, values=[ena], key="ena_study_accession"
             )
 
             assert resolved == {ena: row["idx"]}
@@ -1174,11 +1174,36 @@ async def test_fetch_study_idxs_by_accession_resolves_by_ena_when_specified(post
             await tr.rollback()
 
 
-async def test_fetch_study_idxs_by_accession_invalid_field_raises(postgres_pool):
-    """Tests the case where accession_field is outside StudyAccessionField:
-    the guard rejects it before any column name reaches the SQL."""
-    with pytest.raises(ValueError, match="invalid study accession field"):
-        await fetch_study_idxs_by_accession(postgres_pool, values=["x"], accession_field="title")
+async def test_fetch_study_idxs_by_natural_key_resolves_by_export_entity_id(postgres_pool):
+    """Tests the case where key selects export_entity_id: a study's own
+    export_entity_id resolves to it, and an absent one is omitted."""
+    async with postgres_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            owner = await _create_user(conn)
+            row = await create_study(
+                conn,
+                owner_idx=owner,
+                created_by_idx=owner,
+                title=_suffix("lookup-export-entity-id"),
+            )
+            handle = row["export_entity_id"]
+
+            resolved = await fetch_study_idxs_by_natural_key(
+                conn, values=[handle, "QS-absent"], key="export_entity_id"
+            )
+
+            assert resolved == {handle: row["idx"]}
+        finally:
+            await tr.rollback()
+
+
+async def test_fetch_study_idxs_by_natural_key_invalid_key_raises(postgres_pool):
+    """Tests the case where key is outside StudyLookupKey: the guard rejects
+    it before any column name reaches the SQL."""
+    with pytest.raises(ValueError, match="invalid study lookup key"):
+        await fetch_study_idxs_by_natural_key(postgres_pool, values=["x"], key="title")
 
 
 async def test_update_study_bad_pi_idx_raises_role_typed_error(postgres_pool):

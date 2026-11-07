@@ -12,10 +12,10 @@ account, hand the last step to someone who does.
 
 **Do the steps in order.** The submit reads a **pre-flight file** — the sheet
 describing your run — and for every row in it looks up a biosample and a study that
-must already be in Qiita. It matches them on accessions, and if it cannot find
-one it tells you which and stops without creating anything. So the study comes
-first, then its biosamples, then a pre-flight file naming both by accession, then
-the submit.
+must already be in Qiita. It matches them on their identifiers — accessions or
+the export IDs Qiita assigns — and if it cannot find one it tells you which and
+stops without creating anything. So the study comes first, then its biosamples,
+then a pre-flight file naming both by those identifiers, then the submit.
 
 You build the pre-flight file yourself, outside Qiita (step 4).
 
@@ -105,9 +105,8 @@ STUDY_IDX=$(qiita study create \
     --bioproject-accession PRJNA123456 | jq -r .study_idx)
 ```
 
-`--bioproject-accession` is how your pre-flight file will find this study, so
-give it one now. A study without an accession cannot be named by a pre-flight
-row at all, and no two studies may share the same one.
+`--bioproject-accession` is one way a pre-flight can name this study; step 4
+lists them all. No two studies may share an accession.
 
 Register the study with NCBI BioProject first and use the accession it issues
 (up to 50 characters). Do not invent one: an accession is a handle someone
@@ -143,11 +142,9 @@ BIOSAMPLE_IDX=$(qiita biosample create \
     --metadata "host taxon id=9606" | jq -r .biosample_idx)
 ```
 
-`--biosample-accession` does for the biosample what `--bioproject-accession` did
-for the study: it is the only thing the pre-flight file can match on. Register the
-biosample with NCBI BioSample and use the accession it issues — same rule as
-above, do not invent one. Leave it out and the biosample exists but no pre-flight row can
-reach it.
+`--biosample-accession` is one way a pre-flight row can name this biosample;
+step 4 lists them all. Register the biosample with NCBI BioSample and use the
+accession it issues — same rule as above, do not invent one.
 
 `--metadata "host taxon id=…"` is **required**. It takes an NCBI taxonomy id — the
 number, not the name — matched against the NCBI Taxonomy your site has loaded. How
@@ -163,10 +160,11 @@ value, `not applicable` included) and is marked by a `control_*` `qiita sample t
 `--owner-biosample-id-value` is your own name for the biosample, stored under the
 field named by `--owner-biosample-id-field-name` (the field is created the first
 time you use it, so there is nothing to set up). This is the name to match your
-sheet, since the accession is what the machines match on and rarely what you say
-out loud. It does not travel with the biosample: someone reading the biosample on
-its own sees only the shared metadata, but anyone with `member` access or above on
-*this study* sees it, so keep any personally identifying information out of it.
+sheet, since the identifiers are what the machines match on and rarely what you
+say out loud. It does not travel with the biosample: someone reading the
+biosample on its own sees only the shared metadata, but anyone with `member`
+access or above on *this study* sees it, so keep any personally identifying
+information out of it.
 
 You can add more `--metadata KEY=VALUE` pairs, but only for fields that already
 exist: a standard Qiita field, or one you created for this study. A key that
@@ -199,9 +197,21 @@ snippets below are short Python.
 
 | From the pre-flight file | Has to match |
 |---|---|
-| each row's `biosample_accession` | a biosample you created in step 3 |
-| each row's project `bioproject_accession` | a study you created in step 2 |
-| any extra projects on the plate (controls only) | further studies to link that row to |
+| each row's `biosample_accession`, `ena_sample_accession`, `biosample_export_entity_id` and `matrix_tube_id` | a biosample you created in step 3 |
+| each row's project `bioproject_accession`, `ena_study_accession` and `study_export_entity_id` | a study you created in step 2 |
+| any extra projects on the plate (controls only) | further studies that row's biosample is already linked to |
+
+The export IDs are assigned by Qiita: `export_entity_id` in the output of
+`qiita study create` and `qiita biosample create`. Qiita reads the two ENA
+accessions when a file carries them, but the setters below cannot set them.
+
+Every project a row names must already be among its biosample's studies. A
+biosample is linked only to the study it was created in, and Qiita has no command
+to link it to another, so a control that names several projects is refused.
+
+Each biosample and project needs at least one of its identifiers. Every one that
+is set must name something in Qiita, and they must all name the same biosample or
+study; otherwise the submission is refused before anything is created.
 
 A row's project is the one set on the row itself, or, if it has none, its plate's
 main project.
@@ -215,9 +225,9 @@ Qiita refuses the file outright — before creating anything — if:
   KatharoSeq positive control — both take their project from the plate, which is
   why neither may carry one of its own. Every other control, including any that
   belongs to one project, is a standard row with that project set. This is
-  checked before the accessions, so it is the only error you see until it is
+  checked before the identifiers, so it is the only error you see until it is
   fixed.
-- Any `biosample_accession` or `bioproject_accession` it needs is still empty.
+- A row's biosample, or a project it needs, has none of its identifiers set.
   The pre-flight format allows them to be empty, so a file that is perfectly
   valid otherwise can still be unusable here. This is the common one.
 - There are no usable rows left — rows marked `do_not_use` do not count.
@@ -226,36 +236,39 @@ Those are the checks on the file's *contents*. A file Qiita cannot read at all
 — not a regular file, empty, or not a pre-flight database — is refused before
 any of them.
 
-### Filling in the accessions
+### Filling in the identifiers
 
 Build the file from the run's samplesheet CSV — the one describing the whole
 run, with its plates, projects and per-row detail, which is what
 `migrate_legacy_csv_to_db_file` reads. It is not `SampleSheet.csv`, the narrow
-file bcl-convert consumes; run_preflight *emits* that one. Then set the two
-accessions so they match what you created in steps 2 and 3:
+file bcl-convert consumes; run_preflight *emits* that one. Then set identifiers
+that match what you created in steps 2 and 3 — here, the export IDs:
 
 ```python
 from run_preflight import (
     load_db_file,
     migrate_legacy_csv_to_db_file,
     save_db_file,
-    set_bioproject_accession,
-    set_biosample_accession,
+    set_input_sample_identifier,
+    set_project_identifier,
 )
 
 migrate_legacy_csv_to_db_file("run.csv", "preflight.db")
 conn = load_db_file("preflight.db")
-set_bioproject_accession(conn, "PRJNA123456", project_name="KnightLab_Run1")
-set_biosample_accession(conn, "SAMPLE-1", "SAMN0000001")
+set_project_identifier(conn, "study_export_entity_id", "QS1", project_name="KnightLab_Run1")
+set_input_sample_identifier(conn, "biosample_export_entity_id", "QB1", sample_name="SAMPLE-1")
 save_db_file(conn, "preflight.db")
 conn.close()
 ```
 
-Both calls find their target by **the pre-flight file's own names** — the project
-name in the sheet, and the sheet's sample name — and set the accession on it. The
-accession is the only thing the two systems share. Each call refuses rather than
-guessing if the name matches nothing or matches more than one row. `load_db_file`
-works on a copy in memory, so nothing reaches the file until `save_db_file`.
+The first argument after the connection names the identifier to set:
+`study_export_entity_id` or `bioproject_accession` for a project, and
+`biosample_export_entity_id`, `biosample_accession` or `matrix_tube_id` for a
+biosample. Both calls find their target by **the pre-flight file's own names** —
+the project name in the sheet, and the sheet's sample name. Each call refuses
+rather than guessing if the name matches nothing or matches more than one row,
+and refuses an empty value. `load_db_file` works on a copy in memory, so nothing
+reaches the file until `save_db_file`.
 
 ### Submit the same file every time
 
@@ -263,7 +276,7 @@ Qiita recognises a pool by the exact contents of the pre-flight file you submit.
 Submitting only reads the file — it never changes it, so a copy you cannot write
 to is fine — and a retry that sends the same file lands on the same pool.
 
-If you change the file after submitting it — to correct an accession, say — a
+If you change the file after submitting it — to correct an identifier, say — a
 re-submit under the same file name is refused: the run already has a pool under
 that name, with different contents. The refusal names two ways out. If it is the
 same pool, submit the file as it was the first time. Renaming the file is for a

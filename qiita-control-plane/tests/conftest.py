@@ -20,6 +20,16 @@ from pathlib import Path  # noqa: E402
 
 import pytest  # noqa: E402
 import pytest_asyncio  # noqa: E402
+from run_preflight import (  # noqa: E402
+    load_db_file,
+    save_db_file,
+    set_input_sample_identifier,
+    set_project_identifier,
+)
+from run_preflight.constants import (  # noqa: E402
+    InputSampleIdentifierKind,
+    ProjectIdentifierKind,
+)
 
 from qiita_control_plane.notify.sweeper import _OWED_SET_WHERE  # noqa: E402
 from qiita_control_plane.testing.jwks import jwks_harness  # noqa: E402, F401
@@ -126,9 +136,59 @@ async def _no_leaked_owed_tickets(request):
 
 _CASE5_CSV = Path(__file__).resolve().parent / "cli" / "data" / "good_pacbio_absquantv11.csv"
 
+_PREFLIGHT_SAMPLES_SQL = "SELECT input_sample_idx, sample_name FROM input_sample"
+_PREFLIGHT_PROJECTS_SQL = "SELECT external_project_id FROM project ORDER BY external_project_id"
+# Each identifier kind's test value, from (input_sample_idx, sample_name) or from
+# (1-based project position, external_project_id)
+_SAMPLE_IDENTIFIER_VALUES = {
+    "biosample_accession": lambda idx, name: f"BIO_{name}",
+    "biosample_export_entity_id": lambda idx, name: f"QB{idx}",
+}
+_PROJECT_IDENTIFIER_VALUES = {
+    "bioproject_accession": lambda position, external_id: f"PRJNA{external_id}",
+    "study_export_entity_id": lambda position, external_id: f"QS{position}",
+}
+
 
 @pytest.fixture
-def build_case5_preflight(tmp_path):
+def set_preflight_identifiers():
+    """Set one identifier kind on every input sample and one on every project of a
+    pre-flight file, through kl-run-preflight's own setters. A kind of None leaves
+    that side unset; each value comes from the `_*_IDENTIFIER_VALUES` maps."""
+
+    def _set(
+        db: Path,
+        *,
+        biosample_kind: InputSampleIdentifierKind | None,
+        project_kind: ProjectIdentifierKind | None,
+    ) -> None:
+        conn = load_db_file(str(db))
+        try:
+            # Every input sample gets the biosample identifier, found by its name
+            if biosample_kind is not None:
+                make_value = _SAMPLE_IDENTIFIER_VALUES[biosample_kind]
+                for idx, name in conn.execute(_PREFLIGHT_SAMPLES_SQL).fetchall():
+                    value = make_value(idx, name)
+                    set_input_sample_identifier(conn, biosample_kind, value, sample_name=name)
+
+            # Every project gets the study identifier, found by its external id
+            if project_kind is not None:
+                make_value = _PROJECT_IDENTIFIER_VALUES[project_kind]
+                external_ids = [r[0] for r in conn.execute(_PREFLIGHT_PROJECTS_SQL)]
+                for position, external_id in enumerate(external_ids, start=1):
+                    value = make_value(position, external_id)
+                    set_project_identifier(
+                        conn, project_kind, value, external_project_id=external_id
+                    )
+            save_db_file(conn, str(db))
+        finally:
+            conn.close()
+
+    return _set
+
+
+@pytest.fixture
+def build_case5_preflight(tmp_path, set_preflight_identifiers):
     """Build a real kl-run-preflight SQLite from the pinned case-5 fixture.
 
     ONE builder, shared by every tier that needs a PacBio pre-flight: the ingest
@@ -137,11 +197,10 @@ def build_case5_preflight(tmp_path):
     the SAME bytes, or the parity pin proves nothing.
 
     Uses run_preflight's own CSV loader, so the seam is exercised against the true
-    schema and the real `get_pacbio_sample_info`. The fixture leaves the biosample +
-    project **bioproject** accessions NULL (they are populated upstream in
-    production); `get_pacbio_sample_info` REQUIRES both and raises otherwise, so
-    `populate_accessions=True` sets them via plain sqlite. biosample -> BIO_<name>;
-    the single project's bioproject -> PRJNA<external_project_id>.
+    schema and the real `get_pacbio_sample_info`, which requires at least one
+    identifier on each sample's biosample and projects. The case-5 CSV sets none, so
+    `populate_accessions=True` sets the biosample and bioproject accessions through
+    `set_preflight_identifiers`.
 
     `sheet_type` overrides the run's legacy sheet type, for building a well-formed
     blob the PacBio reader must decline (it keys on that field).
@@ -153,22 +212,20 @@ def build_case5_preflight(tmp_path):
     ) -> Path:
         db = tmp_path / name
         migrate_legacy_csv_to_db_file(str(_CASE5_CSV), str(db))
-        if populate_accessions or sheet_type is not None:
+        if populate_accessions:
+            set_preflight_identifiers(
+                db, biosample_kind="biosample_accession", project_kind="bioproject_accession"
+            )
+        if sheet_type is not None:
+            # Retarget only THIS run's format row: a blanket UPDATE collides on
+            # the (legacy_sheet_type, legacy_version) unique constraint.
             conn = sqlite3.connect(db)
-            if populate_accessions:
-                conn.execute("UPDATE input_sample SET biosample_accession = 'BIO_' || sample_name")
-                conn.execute(
-                    "UPDATE project SET bioproject_accession = 'PRJNA' || external_project_id"
-                )
-            if sheet_type is not None:
-                # Retarget only THIS run's format row: a blanket UPDATE collides on
-                # the (legacy_sheet_type, legacy_version) unique constraint.
-                conn.execute(
-                    "UPDATE legacy_samplesheet_format SET legacy_sheet_type = ?"
-                    " WHERE legacy_format_idx ="
-                    " (SELECT legacy_format_idx FROM processing_run LIMIT 1)",
-                    (sheet_type,),
-                )
+            conn.execute(
+                "UPDATE legacy_samplesheet_format SET legacy_sheet_type = ?"
+                " WHERE legacy_format_idx ="
+                " (SELECT legacy_format_idx FROM processing_run LIMIT 1)",
+                (sheet_type,),
+            )
             conn.commit()
             conn.close()
         return db
@@ -182,7 +239,7 @@ _AMPLICON_V1_SQLITE_GZ = (
 
 
 @pytest.fixture
-def build_amplicon_preflight(tmp_path):
+def build_amplicon_preflight(tmp_path, set_preflight_identifiers):
     """Build a real kl-run-preflight amplicon SQLite from the committed fixture.
 
     The amplicon twin of `build_case5_preflight`: ONE builder shared by the ingest
@@ -191,11 +248,15 @@ def build_amplicon_preflight(tmp_path):
     both parse the SAME bytes.
 
     Decompresses the committed migrated preflight (the artifact Qiita-MIINT consumes —
-    it never migrates a classic prep template) and populates the biosample + project
-    **bioproject** accessions `get_amplicon_sample_info` REQUIRES (left NULL by the
-    fixture, set upstream in production): biosample -> BIO_<name>; each project's
-    bioproject -> PRJNA<external_project_id>. `barcodes_are_rc` overrides the
-    fixture's run-level orientation (it is True, the EMP 515rcbc set).
+    it never migrates a classic prep template). `get_amplicon_sample_info` requires at
+    least one identifier on each sample's biosample and projects, and the committed
+    file sets none, so `populate_accessions=True` sets the biosample and bioproject
+    accessions through `set_preflight_identifiers`, which also brings the file up to
+    the library's current schema; with `populate_accessions=False` the file keeps the
+    committed file's older schema.
+
+    `barcodes_are_rc` overrides the committed file's run-level orientation (it is
+    True, the EMP 515rcbc set).
     """
     import gzip
 
@@ -207,15 +268,16 @@ def build_amplicon_preflight(tmp_path):
     ) -> Path:
         db = tmp_path / name
         db.write_bytes(gzip.decompress(_AMPLICON_V1_SQLITE_GZ.read_bytes()))
-        conn = sqlite3.connect(db)
         if populate_accessions:
-            conn.execute("UPDATE input_sample SET biosample_accession = 'BIO_' || sample_name")
-            conn.execute("UPDATE project SET bioproject_accession = 'PRJNA' || external_project_id")
+            set_preflight_identifiers(
+                db, biosample_kind="biosample_accession", project_kind="bioproject_accession"
+            )
         if barcodes_are_rc is not None:
             # Run-level: amplicon_run carries it; run_amplicon_sample stamps it per row.
+            conn = sqlite3.connect(db)
             conn.execute("UPDATE amplicon_run SET barcodes_are_rc = ?", (int(barcodes_are_rc),))
-        conn.commit()
-        conn.close()
+            conn.commit()
+            conn.close()
         return db
 
     return _build

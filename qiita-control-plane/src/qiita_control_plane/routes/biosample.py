@@ -1302,8 +1302,8 @@ async def resolve_biosample_roster(
     _scope: Principal = Depends(require_scope(Scope.BIOSAMPLE_READ)),
     _study_scope: Principal = Depends(require_scope(Scope.STUDY_READ)),
 ) -> RosterResolveResponse:
-    """Resolve a pool roster to biosample_idx + study links, by matrix tube or
-    accession, in one round trip.
+    """Resolve a pool roster to biosample_idx + study links, by any external
+    identifier of each entity, in one round trip.
 
     The rules live in `roster_resolution`; this route gathers the facts and
     maps the outcome. Any unresolved row refuses the whole roster with a 422
