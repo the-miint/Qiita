@@ -28,7 +28,7 @@
 
 ### Added
 
-- **`qiita-admin backfill check-stored-preflights` lists each stored run pre-flight that
+- **`qiita-admin check-stored-preflights` lists each stored run pre-flight that
   the installed kl-run-preflight cannot open (#N).** Opening a stored pre-flight applies
   the library's pending schema patches, and a patch can refuse values the pre-flight
   already holds. Run from a new build before it is deployed, the command names every
@@ -39,4 +39,4 @@
 
 - **The submit commands no longer refuse a blank or padded accession themselves (#N).**
   kl-run-preflight now refuses to store an empty identifier, or one with surrounding
-  whitespace, so a pre-flight never holds one.
+  whitespace, so a pre-flight that kl-run-preflight opens never holds one.

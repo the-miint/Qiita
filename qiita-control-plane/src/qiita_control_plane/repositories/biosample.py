@@ -301,7 +301,6 @@ BiosampleLookupKey = Literal[
 
 # Each lookup key's (column expression, join) over `qiita.biosample`. Only text from
 # this closed mapping reaches the SQL, since identifiers cannot be bound.
-# same-pattern-ok: per-table lookup kept separate by design
 _BIOSAMPLE_LOOKUP_SQL: dict[BiosampleLookupKey, tuple[str, str]] = {
     "biosample_accession": ("biosample.biosample_accession", ""),
     "ena_sample_accession": ("biosample.ena_sample_accession", ""),
@@ -315,7 +314,8 @@ async def fetch_biosample_idxs_by_natural_key(
     *,
     key: BiosampleLookupKey,
     values: list[str],
-) -> dict[str, int]:
+) -> dict[str, int]:  # same-pattern-ok: biosample has a tube key and drops
+    # retired rows; study has neither
     """Return `{value: biosample_idx}` for every value in `values` that
     resolves to a non-retired qiita.biosample row via the natural key named by
     `key`.

@@ -306,7 +306,7 @@ def _handle_submit_pacbio_ingest(args: argparse.Namespace, parser: argparse.Argu
     1. Parse the preflight (`_read_pacbio_preflight_rows`) and resolve every
        sample's BAM on disk (`_resolve_sample_bams`) — both before any network
        call, so a bad preflight / run folder exits 2 with no side effects.
-    2. Resolve every biosample + study accession up front; a miss on either prints
+    2. Resolve every biosample + study identifier up front; a miss on either prints
        one combined block and exits 1 with nothing created.
     3. POST /sequencing-run (platform PACBIO_SMRT; instrument_run_id +
        instrument_model from args, since PacBio has no RunInfo.xml) and
@@ -382,7 +382,7 @@ def _handle_submit_pacbio_ingest(args: argparse.Namespace, parser: argparse.Argu
         )
 
         # Shared run → pool → roster provisioning (create-missing; fails fast on an
-        # unresolved accession). PacBio keys the pool-item-id on pacbio_sample_idx —
+        # row that does not resolve). PacBio keys the pool-item-id on pacbio_sample_idx —
         # the sample's unique preflight id (the barcode is only the BAM-locating key
         # and is not unique across protocols).
         provision = _provision_run_pool_roster(

@@ -1,4 +1,4 @@
-"""`qiita-admin backfill check-stored-preflights`: the scan is pinned against stored
+"""`qiita-admin check-stored-preflights`: the scan is pinned against stored
 pre-flights written under an older schema, and the handler against a fixed scan
 result, for what the operator sees and the exit code."""
 
@@ -136,5 +136,5 @@ def test__handle(monkeypatch, capsys, scan, exit_code, expected_out):
     monkeypatch.setattr(cli, "open_admin_pool", _open)
     monkeypatch.setattr(cli, "find_unopenable_preflights", _find)
 
-    result = main(["backfill", "check-stored-preflights"])
+    result = main(["check-stored-preflights"])
     assert (result, capsys.readouterr().out, closed) == (exit_code, expected_out, [True])

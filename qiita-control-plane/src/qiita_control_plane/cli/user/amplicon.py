@@ -9,8 +9,8 @@ barcode.
 
 The per-sample Golay roster (`barcode_map`) rides in action_context, built from
 the preflight's `get_amplicon_sample_info`, so the demux job assigns each read to
-a prep_sample without DB access. The preflight supplies only the roster and the
-sample accessions; the run identity comes from the run folder.
+a prep_sample without DB access. The preflight supplies only the roster and each
+biosample's and project's identifiers; the run identity comes from the run folder.
 """
 
 from __future__ import annotations
@@ -114,8 +114,8 @@ def _handle_submit_golay_demux(args: argparse.Namespace, parser: argparse.Argume
          action_context carries the multiplexed FASTQ paths and the barcode_map,
          plus an `on_success` follow-on when the `--then-*` flags name one.
 
-    Steps 1-3 (accession resolution, create-missing roster, fail-fast on an
-    unresolved accession) are the shared `_provision_run_pool_roster` gesture,
+    Steps 1-3 (identifier resolution, create-missing roster, fail-fast on a
+    row that does not resolve) are the shared `_provision_run_pool_roster` gesture,
     identical to submit-bcl-convert; only the roster (Golay barcode_map vs a
     bcl-convert sample_map) differs. The run folder is resolved from the run id
     server-side, exactly as submit-bcl-convert resolves its BCL folder.
@@ -154,7 +154,7 @@ def _handle_submit_golay_demux(args: argparse.Namespace, parser: argparse.Argume
         ).model_dump(exclude_unset=True, mode="json")
 
         # Shared run -> pool -> roster provisioning (create-missing; fails fast on an
-        # unresolved accession). Amplicon keys the pool-item-id on prepped_sample_idx.
+        # row that does not resolve). Amplicon keys the pool-item-id on prepped_sample_idx.
         provision = _provision_run_pool_roster(
             args.base_url,
             token,

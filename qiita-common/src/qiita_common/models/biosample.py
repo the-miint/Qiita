@@ -765,7 +765,8 @@ MAX_ROSTER_TUBE_TEXT_LENGTH = 50
 class _ExternalRef(BaseModel):
     """An entity named by one or more external identifiers.
 
-    Every field of a subclass is an identifier, so at least one must be set.
+    Every field of a subclass is an identifier; the validator requires at least
+    one to be set.
     """
 
     model_config = ConfigDict(extra="forbid")

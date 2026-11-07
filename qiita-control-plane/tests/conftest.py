@@ -20,6 +20,16 @@ from pathlib import Path  # noqa: E402
 
 import pytest  # noqa: E402
 import pytest_asyncio  # noqa: E402
+from run_preflight import (  # noqa: E402
+    load_db_file,
+    save_db_file,
+    set_input_sample_identifier,
+    set_project_identifier,
+)
+from run_preflight.constants import (  # noqa: E402
+    InputSampleIdentifierKind,
+    ProjectIdentifierKind,
+)
 
 from qiita_control_plane.notify.sweeper import _OWED_SET_WHERE  # noqa: E402
 from qiita_control_plane.testing.jwks import jwks_harness  # noqa: E402, F401
@@ -125,6 +135,56 @@ async def _no_leaked_owed_tickets(request):
 
 
 _CASE5_CSV = Path(__file__).resolve().parent / "cli" / "data" / "good_pacbio_absquantv11.csv"
+
+_PREFLIGHT_SAMPLES_SQL = "SELECT input_sample_idx, sample_name FROM input_sample"
+_PREFLIGHT_PROJECTS_SQL = "SELECT external_project_id FROM project ORDER BY external_project_id"
+# Each identifier kind's test value, from (input_sample_idx, sample_name) or from
+# (1-based project position, external_project_id)
+_SAMPLE_IDENTIFIER_VALUES = {
+    "biosample_accession": lambda idx, name: f"BIO_{name}",
+    "biosample_export_entity_id": lambda idx, name: f"QB{idx}",
+}
+_PROJECT_IDENTIFIER_VALUES = {
+    "bioproject_accession": lambda position, external_id: f"PRJNA{external_id}",
+    "study_export_entity_id": lambda position, external_id: f"QS{position}",
+}
+
+
+@pytest.fixture
+def set_preflight_identifiers():
+    """Set one identifier kind on every input sample and one on every project of a
+    pre-flight file, through kl-run-preflight's own setters. A kind of None leaves
+    that side unset; each value comes from the `_*_IDENTIFIER_VALUES` maps."""
+
+    def _set(
+        db: Path,
+        *,
+        biosample_kind: InputSampleIdentifierKind | None,
+        project_kind: ProjectIdentifierKind | None,
+    ) -> None:
+        conn = load_db_file(str(db))
+        try:
+            # Every input sample gets the biosample identifier, found by its name
+            if biosample_kind is not None:
+                make_value = _SAMPLE_IDENTIFIER_VALUES[biosample_kind]
+                for idx, name in conn.execute(_PREFLIGHT_SAMPLES_SQL).fetchall():
+                    value = make_value(idx, name)
+                    set_input_sample_identifier(conn, biosample_kind, value, sample_name=name)
+
+            # Every project gets the study identifier, found by its external id
+            if project_kind is not None:
+                make_value = _PROJECT_IDENTIFIER_VALUES[project_kind]
+                external_ids = [r[0] for r in conn.execute(_PREFLIGHT_PROJECTS_SQL)]
+                for position, external_id in enumerate(external_ids, start=1):
+                    value = make_value(position, external_id)
+                    set_project_identifier(
+                        conn, project_kind, value, external_project_id=external_id
+                    )
+            save_db_file(conn, str(db))
+        finally:
+            conn.close()
+
+    return _set
 
 
 @pytest.fixture

@@ -450,7 +450,7 @@ def _handle_submit_bcl_convert(args: argparse.Namespace, parser: argparse.Argume
         ).model_dump(exclude_unset=True, mode="json")
 
         # Shared run → pool → roster provisioning (create-missing; fails fast on an
-        # unresolved accession). Illumina keys the pool-item-id on illumina_sample_idx.
+        # row that does not resolve). Illumina keys the pool-item-id on illumina_sample_idx.
         provision = _provision_run_pool_roster(
             args.base_url,
             token,

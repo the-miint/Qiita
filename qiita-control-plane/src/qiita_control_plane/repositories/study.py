@@ -31,9 +31,8 @@ _STUDY_RETURNING_COLS = (
 # set defined once, in qiita_common.models.
 StudyLookupKey = Literal[*get_args(StudyAccessionField), "export_entity_id"]
 
-# Each lookup key's (column expression, join) over `qiita.study`. Only text from
-# this closed mapping reaches the SQL, since identifiers cannot be bound.
-# same-pattern-ok: per-table lookup kept separate by design
+# Each lookup key's (column expression, join) over `qiita.study`; see
+# `_BIOSAMPLE_LOOKUP_SQL` in repositories/biosample.py for why it is a closed mapping.
 _STUDY_LOOKUP_SQL: dict[StudyLookupKey, tuple[str, str]] = {
     "bioproject_accession": ("study.bioproject_accession", ""),
     "ena_study_accession": ("study.ena_study_accession", ""),
@@ -94,7 +93,8 @@ async def fetch_study_idxs_by_natural_key(
     *,
     values: list[str],
     key: StudyLookupKey = "bioproject_accession",
-) -> dict[str, int]:
+) -> dict[str, int]:  # same-pattern-ok: biosample has a tube key and drops
+    # retired rows; study has neither
     """Return `{value: study_idx}` for every value in `values` that resolves to
     a qiita.study row via the natural key named by `key` (default
     bioproject_accession). Values absent from the table are omitted from the

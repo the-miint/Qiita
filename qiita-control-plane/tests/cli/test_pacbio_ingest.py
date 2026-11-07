@@ -191,20 +191,17 @@ def test_validate_protocol_allows_untwisted_without_adapter():
 
 
 @pytest.mark.parametrize(
-    ("populate_accessions", "identifier_sql", "biosample_refs", "project_ref"),
+    ("biosample_kind", "project_kind", "biosample_refs", "project_ref"),
     [
         (
-            True,
-            (),
+            "biosample_accession",
+            "bioproject_accession",
             [BiosampleRef(biosample_accession=f"BIO_sample.{i}") for i in (1, 2, 3)],
             StudyRef(bioproject_accession="PRJNA99999"),
         ),
         (
-            False,
-            (
-                "UPDATE input_sample SET biosample_export_entity_id = 'QB' || input_sample_idx",
-                "UPDATE project SET study_export_entity_id = 'QS1'",
-            ),
+            "biosample_export_entity_id",
+            "study_export_entity_id",
             [BiosampleRef(export_entity_id=f"QB{i}") for i in (1, 2, 3)],
             StudyRef(export_entity_id="QS1"),
         ),
@@ -212,17 +209,21 @@ def test_validate_protocol_allows_untwisted_without_adapter():
     ids=["accessions", "export-ids-only"],
 )
 def test_read_preflight_rows_case5(
-    build_case5_preflight, populate_accessions, identifier_sql, biosample_refs, project_ref
+    build_case5_preflight,
+    set_preflight_identifiers,
+    biosample_kind,
+    project_kind,
+    biosample_refs,
+    project_ref,
 ):
     """Tests the case where the real case-5 sheet names its entities by accessions,
     or by export IDs alone: one row per sample, including the control blank
     (sample.3, which the reader resolves to the plate primary project), each
     carrying the identifiers the sheet gives. twist filled + syndna_is_twisted
     False is the case-5 signature, and smrt_cell rides through when recorded."""
-    db = build_case5_preflight(populate_accessions=populate_accessions)
+    db = build_case5_preflight(populate_accessions=False)
+    set_preflight_identifiers(db, biosample_kind=biosample_kind, project_kind=project_kind)
     conn = sqlite3.connect(db)
-    for sql in identifier_sql:
-        conn.execute(sql)
     # Record a SMRT cell on sample.1 only, to prove it threads onto the row.
     conn.execute(
         "UPDATE pacbio_sample SET smrt_cell_well_sample_id = '1_A01' WHERE barcode_id = 'bc3011'"

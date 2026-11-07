@@ -489,7 +489,6 @@ def _build_parser() -> argparse.ArgumentParser:
     p_backfill_syndna.set_defaults(handler=_handle_backfill_syndna_read_count)
 
     add_myloasm_provenance_parser(p_backfill_sub)
-    add_check_stored_preflights_parser(p_backfill_sub)
 
     p_actions = sub.add_parser("actions", help="Action registry operations")
     p_actions_sub = p_actions.add_subparsers(dest="actions_cmd", required=True)
@@ -664,6 +663,8 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_readiness.set_defaults(handler=_handle_compute_readiness)
+
+    add_check_stored_preflights_parser(sub)
 
     return parser
 

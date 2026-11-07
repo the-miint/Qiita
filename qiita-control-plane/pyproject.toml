@@ -29,10 +29,12 @@ dependencies = [
     "grpcio-health-checking>=1.66",
     # The submit-bcl-convert CLI handler imports `get_illumina_sample_info`
     # from run_preflight at handler call time to extract per-illumina_sample
-    # biosample + study accession info from the operator's preflight SQLite. SHA
+    # biosample + study identifiers from the operator's preflight SQLite. SHA
     # pin matches the orchestrator (which calls `save_bclconvert_v1_csv`
     # from the same release) so a re-vendor is a coordinated bump;
-    # an integration parity test enforces parity.
+    # an integration parity test enforces parity. A bump whose release adds a
+    # schema patch that can refuse existing values needs
+    # `qiita-admin check-stored-preflights` run from the new build before deploy.
     "run-preflight @ git+https://github.com/the-miint/kl-run-preflight@6dcda7bccd560578588c450eefde47d39af0b38b",
 ]
 

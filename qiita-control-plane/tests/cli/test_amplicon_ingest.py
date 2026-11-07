@@ -12,6 +12,8 @@ Two surfaces, pure-unit (no Postgres):
 from __future__ import annotations
 
 import json
+import sqlite3
+from contextlib import closing
 
 import httpx
 import pytest
@@ -22,6 +24,7 @@ from qiita_control_plane.cli.user.amplicon import _read_amplicon_preflight_rows
 
 _RUN_ID = "20260925_SL00377_0008_ASC2267726-SC3"
 _RESOLVED_BCL_DIR = f"/sequencing/{_RUN_ID}"
+_FIXTURE_SAMPLE_IDENTITIES_SQL = "SELECT biosample_accession, matrix_tube_id FROM input_sample"
 
 
 class _RaisingParser:
@@ -136,7 +139,6 @@ def test_submit_golay_demux_builds_barcode_map_and_one_ticket(
     monkeypatch, capsys, build_amplicon_preflight
 ):
     db = build_amplicon_preflight()
-    rows = _read_amplicon_preflight_rows(db, _RaisingParser())
 
     captured: dict = {}
     _stub_submit_flow(monkeypatch, captured)
@@ -187,10 +189,22 @@ def test_submit_golay_demux_builds_barcode_map_and_one_ticket(
     assert run_posts[0]["json"]["instrument_run_id"] == _RUN_ID
     assert run_posts[0]["json"]["instrument_model"] == "Illumina MiSeq i100"
 
-    # Each summary entry names its biosample by the identifiers the sheet gave
+    # Each summary entry names its biosample by exactly the identifiers stored
+    with closing(sqlite3.connect(db)) as conn:
+        identities = conn.execute(_FIXTURE_SAMPLE_IDENTITIES_SQL).fetchall()
+    expected_biosamples = sorted(
+        (
+            {"biosample_accession": accession, "matrix_tube_id": tube}
+            for accession, tube in identities
+        ),
+        key=lambda b: b["biosample_accession"],
+    )
     summary = json.loads(capsys.readouterr().out)
-    expected_biosamples = [r.refs.biosample.model_dump(exclude_none=True) for r in rows]
-    assert [s["biosample"] for s in summary["sequenced_samples"]] == expected_biosamples
+    actual_biosamples = sorted(
+        (s["biosample"] for s in summary["sequenced_samples"]),
+        key=lambda b: b["biosample_accession"],
+    )
+    assert actual_biosamples == expected_biosamples
 
 
 def _golay_argv(db, *extra: str) -> list[str]:

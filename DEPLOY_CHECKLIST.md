@@ -55,7 +55,7 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
   ```bash
   # [operator] in the pulled checkout; DATABASE_URL as in redeploy.md §4
   set -a; . /etc/qiita/control-plane.env; set +a
-  cd ~/qiita-miint/qiita-control-plane && /usr/local/bin/uv run --reinstall-package qiita-common qiita-admin backfill check-stored-preflights
+  cd ~/qiita-miint/qiita-control-plane && /usr/local/bin/uv run --reinstall-package qiita-common qiita-admin check-stored-preflights
   ```
 - `[admin]` (#791) On the catalog's Postgres server, as superuser: `GRANT pg_read_all_stats TO <role>;`, where `<role>` is the `user=` in `DUCKLAKE_CATALOG_CONNSTR` (`qiita_miint_lake_rw` per `first-deploy.md`). `verify-deploy`'s `catalog-connections` row fails without it ([`data-plane-scaling.md` § Catalog connections](docs/runbooks/data-plane-scaling.md#catalog-connections)).
 

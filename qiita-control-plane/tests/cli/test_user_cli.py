@@ -46,6 +46,7 @@ from qiita_common.api_paths import (
 )
 from qiita_common.auth_constants import BEARER_PREFIX, SystemRole
 from qiita_common.models import LEGACY_IDX_RESERVED_CEILING, BiosampleRef, StudyRef
+from run_preflight.constants import InputSampleIdentifierKind, ProjectIdentifierKind
 from run_preflight.db import (
     ERR_CATEGORY_MISSING_IDENTIFIER,
     InputSampleIdentifiers,
@@ -58,10 +59,6 @@ from qiita_control_plane.preflight import SampleRefs
 
 _BASE = "https://q.example.test"
 _ILLUMINA_CSV = Path(__file__).resolve().parent / "data" / "good_standard_metagv100.csv"
-_ILLUMINA_ACCESSION_SQL = (
-    "UPDATE input_sample SET biosample_accession = 'BIO_' || sample_name",
-    "UPDATE project SET bioproject_accession = 'PRJNA' || external_project_id",
-)
 
 
 def test_help_exits_cleanly(capsys):
@@ -3378,42 +3375,40 @@ def test__read_preflight_rows_round_trips_library_records(preflight_stub):
 
 
 @pytest.fixture
-def illumina_preflight(tmp_path):
+def illumina_preflight(tmp_path, set_preflight_identifiers):
     """Build a real Illumina pre-flight with run_preflight's own CSV loader (the
     sheet is kl-run-preflight's `good_standard_metagv100_wo_replicates.csv`), so
     the reader meets the true schema and the real `get_illumina_sample_info`.
 
-    `identifier_sql` is the statements that set the samples' and project's
-    identifiers; the default names each by accession.
+    The two kinds name the identifier set on every sample and every project; the
+    default names each by accession, and None leaves that side unset.
     """
     from run_preflight.legacy.api import migrate_legacy_csv_to_db_file
 
-    def _build(identifier_sql: tuple[str, ...] = _ILLUMINA_ACCESSION_SQL) -> Path:
+    def _build(
+        biosample_kind: InputSampleIdentifierKind | None = "biosample_accession",
+        project_kind: ProjectIdentifierKind | None = "bioproject_accession",
+    ) -> Path:
         db = tmp_path / "illumina.db"
         migrate_legacy_csv_to_db_file(str(_ILLUMINA_CSV), str(db))
-        conn = sqlite3.connect(db)
-        for sql in identifier_sql:
-            conn.execute(sql)
-        conn.commit()
-        conn.close()
+        set_preflight_identifiers(db, biosample_kind=biosample_kind, project_kind=project_kind)
         return db
 
     return _build
 
 
 @pytest.mark.parametrize(
-    ("identifier_sql", "biosample_refs", "project_ref"),
+    ("biosample_kind", "project_kind", "biosample_refs", "project_ref"),
     [
         (
-            _ILLUMINA_ACCESSION_SQL,
+            "biosample_accession",
+            "bioproject_accession",
             [BiosampleRef(biosample_accession=f"BIO_sample.{i}") for i in (1, 2, 3)],
             StudyRef(bioproject_accession="PRJNA99999"),
         ),
         (
-            (
-                "UPDATE input_sample SET biosample_export_entity_id = 'QB' || input_sample_idx",
-                "UPDATE project SET study_export_entity_id = 'QS1'",
-            ),
+            "biosample_export_entity_id",
+            "study_export_entity_id",
             [BiosampleRef(export_entity_id=f"QB{i}") for i in (1, 2, 3)],
             StudyRef(export_entity_id="QS1"),
         ),
@@ -3421,7 +3416,7 @@ def illumina_preflight(tmp_path):
     ids=["accessions", "export-ids-only"],
 )
 def test__read_preflight_rows_reads_a_real_preflight(
-    illumina_preflight, identifier_sql, biosample_refs, project_ref
+    illumina_preflight, biosample_kind, project_kind, biosample_refs, project_ref
 ):
     """Tests the case where a real pre-flight names its entities by accessions,
     or by export IDs alone: each row carries the identifiers the sheet gives."""
@@ -3429,7 +3424,8 @@ def test__read_preflight_rows_reads_a_real_preflight(
 
     from qiita_control_plane.cli.user import _PreflightRow, _read_preflight_rows
 
-    rows = _read_preflight_rows(illumina_preflight(identifier_sql), argparse.ArgumentParser())
+    db = illumina_preflight(biosample_kind, project_kind)
+    rows = _read_preflight_rows(db, argparse.ArgumentParser())
     expected = [
         _PreflightRow(illumina_sample_idx=idx, refs=SampleRefs(biosample, project_ref, ()))
         for idx, biosample in zip((1, 2, 3), biosample_refs, strict=True)
@@ -3444,9 +3440,9 @@ def test__read_preflight_rows_refuses_a_missing_identifier(illumina_preflight, c
 
     from qiita_control_plane.cli.user import _read_preflight_rows
 
-    project_only = (_ILLUMINA_ACCESSION_SQL[1],)
+    project_only = illumina_preflight(biosample_kind=None)
     with pytest.raises(SystemExit) as exc_info:
-        _read_preflight_rows(illumina_preflight(project_only), argparse.ArgumentParser())
+        _read_preflight_rows(project_only, argparse.ArgumentParser())
     assert exc_info.value.code == 2
     err = capsys.readouterr().err
     assert f"{ERR_CATEGORY_MISSING_IDENTIFIER}: illumina_sample_idx=1 (biosample)" in err

@@ -1,13 +1,10 @@
-"""`qiita-admin backfill check-stored-preflights`: list every stored run pre-flight
-that this build's kl-run-preflight cannot open. Writes nothing.
+"""`qiita-admin check-stored-preflights`: list every stored run pre-flight that this
+build's kl-run-preflight cannot open. Writes nothing.
 
 Opening a stored pre-flight applies the library's pending schema patches, and a
 patch may refuse a pre-flight's existing values, so running this from a new build
 before it is deployed shows which stored pre-flights the deploy would make
 unreadable.
-
-A one-off, kept in its own module so its removal touches `cli/admin/__init__.py`
-only at the two lines that register the parser.
 """
 
 from __future__ import annotations
@@ -47,8 +44,8 @@ class PreflightCheck(NamedTuple):
     unopenable: list[UnopenablePreflight]
 
 
-def add_check_stored_preflights_parser(backfill_sub: argparse._SubParsersAction) -> None:
-    p = backfill_sub.add_parser(
+def add_check_stored_preflights_parser(sub: argparse._SubParsersAction) -> None:
+    p = sub.add_parser(
         "check-stored-preflights",
         help="List stored run pre-flights this build cannot open",
         description=(
