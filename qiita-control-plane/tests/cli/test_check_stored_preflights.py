@@ -54,9 +54,11 @@ async def stored_preflights(postgres_pool, build_amplicon_preflight):
         f"pf-check-{secrets.token_hex(4)}",
         owner_idx,
     )
-    blobs = {"clean.db": build_amplicon_preflight(name="clean.db").read_bytes()}
+    # No identifiers: setting them would upgrade the file past the older schema
+    clean = build_amplicon_preflight(populate_accessions=False, name="clean.db")
+    blobs = {"clean.db": clean.read_bytes()}
     for filename, sql, _column in _DIRTY_PREFLIGHTS:
-        db = build_amplicon_preflight(name=filename)
+        db = build_amplicon_preflight(populate_accessions=False, name=filename)
         conn = sqlite3.connect(db)
         conn.execute(sql)
         conn.commit()
