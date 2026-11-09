@@ -348,7 +348,7 @@ async def import_sequenced_sample_from_run(
             )
         except SAMPLE_METADATA_WRITE_ERRORS as exc:
             await raise_http_for_sample_metadata_write_error(
-                conn, exc, spec=PREP_SAMPLE_METADATA_SPEC, tiers=tiers
+                conn, exc, spec=PREP_SAMPLE_METADATA_SPEC
             )
         except asyncpg.UniqueViolationError as exc:
             detail = _SEQUENCED_SAMPLE_UNIQUE_MESSAGES.get(

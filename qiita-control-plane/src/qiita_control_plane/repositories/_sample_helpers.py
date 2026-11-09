@@ -3124,7 +3124,7 @@ class OwnerSampleIdMetadataWriteError(Exception):
         )
 
 
-async def _fetch_owner_sample_id_study_field_idxs(
+async def fetch_owner_sample_id_study_field_idxs(
     conn: asyncpg.Connection,
     *,
     spec: EntityMetadataSpec,
@@ -3320,7 +3320,7 @@ async def preflight_sample_metadata(
     # The lookup short-circuits when the spec has no owner-sample-id flag column
     # or no local fields were resolved.
     local_field_idxs = [rf.study_field_idx for rf in resolved.values() if rf.scope == "local"]
-    owner_id_field_idxs = await _fetch_owner_sample_id_study_field_idxs(
+    owner_id_field_idxs = await fetch_owner_sample_id_study_field_idxs(
         conn, spec=spec, study_field_idxs=local_field_idxs
     )
     for curr_name, rf in resolved.items():
@@ -3482,7 +3482,9 @@ async def write_resolved_metadata_entries(
     is checked before the first write (_fetch_keys_restricted_on_entity says
     what that answer depends on). The values are checked again once written,
     which catches a tier that a concurrent transaction changed in between; the
-    caller's transaction then rolls every write back.
+    caller's transaction then rolls every write back. A collision with a value
+    that the caller cannot read, stored by a concurrent transaction, is refused
+    the same way.
     """
     require_transaction(conn)
     restricted_keys = await _fetch_keys_restricted_on_entity(
@@ -3503,33 +3505,45 @@ async def write_resolved_metadata_entries(
     results: list[SampleMetadataFieldResult] = []
     written_keys: dict[int, str] = {}
     for resolved_field, parsed_value in resolved_metadata:
-        if resolved_field.scope == "global":
-            write_result = await write_global_metadata_or_diagnose(
-                conn,
-                spec=spec,
-                entity_idx=entity_idx,
-                study_idx=study_idx,
-                global_field_idx=resolved_field.global_field_idx,
-                display_name=resolved_field.canonical_display,
-                data_type=resolved_field.data_type,
-                value=parsed_value,
-                caller_idx=caller_idx,
-                on_conflict=on_conflict,
-            )
-        else:
-            write_result = await _insert_metadata_or_diagnose(
-                conn,
-                spec=spec,
-                entity_idx=entity_idx,
-                study_idx=study_idx,
-                study_field_idx=resolved_field.study_field_idx,
-                study_field_created=False,
-                display_name=resolved_field.canonical_display,
-                data_type=resolved_field.data_type,
-                value=parsed_value,
-                caller_idx=caller_idx,
-                on_conflict=on_conflict,
-            )
+        try:
+            if resolved_field.scope == "global":
+                write_result = await write_global_metadata_or_diagnose(
+                    conn,
+                    spec=spec,
+                    entity_idx=entity_idx,
+                    study_idx=study_idx,
+                    global_field_idx=resolved_field.global_field_idx,
+                    display_name=resolved_field.canonical_display,
+                    data_type=resolved_field.data_type,
+                    value=parsed_value,
+                    caller_idx=caller_idx,
+                    on_conflict=on_conflict,
+                )
+            else:
+                write_result = await _insert_metadata_or_diagnose(
+                    conn,
+                    spec=spec,
+                    entity_idx=entity_idx,
+                    study_idx=study_idx,
+                    study_field_idx=resolved_field.study_field_idx,
+                    study_field_created=False,
+                    display_name=resolved_field.canonical_display,
+                    data_type=resolved_field.data_type,
+                    value=parsed_value,
+                    caller_idx=caller_idx,
+                    on_conflict=on_conflict,
+                )
+        except (SlotOccupiedError, ValueRewriteOnUniqueFieldError) as exc:
+            # Either error would quote the stored value or the study that wrote
+            # it. A value that the caller cannot read gets the same refusal as
+            # the check above, under the caller's own key.
+            if await fetch_hidden_metadata_idxs(
+                conn, spec=spec, tiers=tiers, metadata_idxs=[exc.existing_metadata_idx]
+            ):
+                raise MetadataValueTierError(
+                    entity_kind=spec.entity_kind, field_keys=[resolved_field.caller_key]
+                ) from exc
+            raise
         written_keys[write_result.metadata_idx] = resolved_field.caller_key
         results.append(
             SampleMetadataFieldResult(

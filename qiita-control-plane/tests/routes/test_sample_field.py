@@ -11,7 +11,9 @@ from decimal import Decimal
 import asyncpg
 import pytest
 import pytest_asyncio
+from qiita_common.api_paths import URL_BIOSAMPLE_BY_STUDY
 from qiita_common.models import FieldDataType, Tier
+from qiita_common.models.biosample import BIOSAMPLE_DISPLAY_HOST_TAXON_ID
 
 from qiita_control_plane.routes import _helpers as route_helpers
 from qiita_control_plane.testing.db_seeds import seed_terminology
@@ -1471,6 +1473,59 @@ async def test_member_policy_refusal_does_not_depend_on_the_field_values(
     )
     assert control.status_code == 409, control.text
     assert await _stored_attribute(ctx, surface, field_idx, attribute) == before
+
+
+_BIOSAMPLE_FIELD_SURFACE = next(
+    s for s in SAMPLE_FIELD_SURFACES if s.metadata_spec.owner_sample_id_flag_column is not None
+)
+
+
+@pytest.mark.parametrize(("tier", "expected"), [(Tier.MEMBER, 403), (Tier.ADMIN, 200)])
+@pytest.mark.parametrize("attribute", ["display_name", "description"])
+async def test_owner_id_field_edit_requires_admin(ctx, tier, expected, attribute):
+    """Tests the case where an edit touches the field that holds the study's
+    owner biosample ids. An import finds that field by its display_name, so
+    only an admin may edit it, and a member's attempt leaves it as it was.
+    """
+    surface = _BIOSAMPLE_FIELD_SURFACE
+    study_idx = await _seed_authz_case_study(
+        ctx, owner_key="wet", grant_tier=tier, case=f"owner-id-edit-{attribute}-{tier}"
+    )
+    owner_id_field = unique_field_name("OwnerId")
+    imported = await ctx["wet"].post(
+        URL_BIOSAMPLE_BY_STUDY.format(study_idx=study_idx),
+        json={
+            "owner_idx": ctx["wet_session"]["principal_idx"],
+            "owner_biosample_id_field_name": owner_id_field,
+            "owner_biosample_id_value": "s1",
+            "metadata": {BIOSAMPLE_DISPLAY_HOST_TAXON_ID: "not applicable"},
+        },
+    )
+    assert imported.status_code == 201, imported.text
+    ctx["created"]["biosample"].append(imported.json()["biosample_idx"])
+    field_idx = await ctx["pool"].fetchval(
+        f"SELECT idx FROM {surface.metadata_spec.study_field_table}"
+        " WHERE study_idx = $1 AND display_name = $2",
+        study_idx,
+        owner_id_field,
+    )
+    before = await _stored_attribute(ctx, surface, field_idx, attribute)
+    sent = unique_field_name("OwnerIdEdit")
+
+    resp = await patch_study_field(
+        surface=surface,
+        client=ctx["user"],
+        study_idx=study_idx,
+        study_field_idx=field_idx,
+        if_match=await _etag(ctx, surface, field_idx),
+        **{attribute: sent},
+    )
+
+    assert resp.status_code == expected, resp.text
+    if expected == 403:
+        assert "owner sample ids" in resp.json()["detail"]
+    stored = await _stored_attribute(ctx, surface, field_idx, attribute)
+    assert stored == (before if expected == 403 else sent)
 
 
 @pytest.mark.parametrize("surface", SAMPLE_FIELD_SURFACES, ids=_surface_id)

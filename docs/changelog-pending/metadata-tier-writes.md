@@ -23,6 +23,9 @@
     `prep-sample-field` twins now admit `member` instead of only `admin`. Setting
     `tier_override` still requires `admin`, as does changing `unique_in_study` or
     `data_type` on an existing field, since either is judged against values that a
-    member may not be able to read. A member cannot create, link, or edit a field whose
-    tier is above `member`.
-  - Biosample and sequenced-sample imports still require `admin` on the study.
+    member may not be able to read. Editing the field that holds a study's owner
+    biosample ids still requires `admin` too. A member cannot create, link, or edit a
+    field whose tier is above `member`.
+  - Biosample and sequenced-sample imports still require `admin` on the study. An ENA
+    import batch item whose submitter no longer holds `admin` on the study, or the
+    `wet_lab_admin` role, now fails with a reason that names the submitter's tier.

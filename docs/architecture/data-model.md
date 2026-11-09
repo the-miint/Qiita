@@ -206,13 +206,15 @@ What such a caller may touch:
   study's value in a global field, and a value stored through a
   `unique_in_study` field, whose collision answers would otherwise quote the
   value. The written values are checked again before commit, and a collision
-  with a hidden value answers the same 403
-  (`routes._helpers.raise_http_for_sample_metadata_write_error`).
+  with a hidden value answers the same 403 under the same keys, both in
+  `_sample_helpers.write_resolved_metadata_entries`.
 - **Field definitions.** Setting `tier_override`, or changing `unique_in_study`
   or `data_type` on an existing field, requires `admin` on the study, whatever
-  the body sets (`routes._helpers._ADMIN_ONLY_FIELD_ATTRIBUTES` says why). A
-  caller may create, link, or edit only a field whose field tier is within
-  their own tier on the study.
+  the body sets (`routes._helpers._ADMIN_ONLY_FIELD_ATTRIBUTES` says why). So
+  does any edit of the field that holds the study's owner biosample ids
+  (`routes._helpers._require_admin_to_edit_owner_sample_id_field`). A caller
+  may create, link, or edit only a field whose field tier is within their own
+  tier on the study.
 - **Imports.** Creating a biosample or a prep_sample with its metadata requires
   `admin` on the study or a wet_lab_admin+ role
   (`_sample_helpers.require_tiers_read_every_value`).

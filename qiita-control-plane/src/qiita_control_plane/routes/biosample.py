@@ -317,9 +317,7 @@ async def _with_import_error_mapping[T](
             ),
         )
     except SAMPLE_METADATA_WRITE_ERRORS as exc:
-        await raise_http_for_sample_metadata_write_error(
-            conn, exc, spec=BIOSAMPLE_METADATA_SPEC, tiers=tiers
-        )
+        await raise_http_for_sample_metadata_write_error(conn, exc, spec=BIOSAMPLE_METADATA_SPEC)
     except LocalWriteOnGloballyLinkedFieldError as exc:
         # The requested owner-biosample-id field name resolves to a
         # field already globally linked on this study. The owner-id

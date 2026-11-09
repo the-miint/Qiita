@@ -231,8 +231,9 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
   caller's tier is a 403 that writes nothing. Where the caller cannot read the stored
   value, that 403 replaces the 409 for another study's value in a global field and the
   422 for a change to a `unique_in_study` value, and names neither the value nor the
-  other study. Setting a field's `tier_override`, or changing an existing field's
-  `unique_in_study` or `data_type`, still requires `admin`; imports are unchanged.
+  other study. Setting a field's `tier_override`, changing an existing field's
+  `unique_in_study` or `data_type`, or editing the owner-biosample-id field still
+  requires `admin`; imports are unchanged.
 - (#824) Soft API-contract change: `DELETE /mask-definition/{mask_idx}`,
   `qiita-admin mask delete` / `mask purge-failed` and the `mask_definition:delete` scope are
   removed. A PAT mint requesting that scope now gets `422 unknown scopes`; an existing token

@@ -53,7 +53,7 @@ from qiita_control_plane.testing.db_seeds import (
     seed_sequenced_sample_subtype,
 )
 from qiita_control_plane.testing.db_teardown import delete_idxs, teardown_entity_graph
-from qiita_control_plane.testing.tiers import TIER_RANK
+from qiita_control_plane.testing.tiers import TIER_RANK, WRITE_CHECKS, apply_write_checks
 from qiita_control_plane.testing.unique_names import unique_field_name
 
 from .conftest import _grant_study_access, _seed_authz_case_study, _seed_study
@@ -818,11 +818,15 @@ async def test_member_refused_a_value_under_an_exception(ctx, surface):
     assert await _read_as_wet(ctx, s, corpus) == before
 
 
-async def test_foreign_hidden_occupant_reveals_nothing(ctx):
+@pytest.mark.parametrize("write_checks", WRITE_CHECKS)
+async def test_foreign_hidden_occupant_reveals_nothing(ctx, monkeypatch, write_checks):
     """Another study already holds the biosample's value for a global field, and
     the caller, an admin of this study only, cannot read it. The caller's write
-    of that field is refused, and the refusal names neither the value nor the
-    other study, and does not say whether the two values agree."""
+    of that field is refused under the key that the caller sent, and the
+    refusal names neither the value nor the other study, and does not say
+    whether the two values agree. Under "post-write-only" the refusal comes
+    from the write's collision with the stored value."""
+    apply_write_checks(monkeypatch, write_checks)
     study_idx = await _seed_study_for_case(ctx, "admin")
     corpus = await _seed_biosample_corpus(ctx, study_idx)
     other_study_idx = await _seed_study(
@@ -852,6 +856,7 @@ async def test_foreign_hidden_occupant_reveals_nothing(ctx):
 
     for resp in (different, same):
         assert resp.status_code == 403, resp.text
+        assert repr(foreign_key) in resp.json()["detail"]
         assert stored not in resp.text
         assert f"study {other_study_idx}" not in resp.text
         assert f"study_idx={other_study_idx}" not in resp.text
@@ -895,10 +900,13 @@ async def _seed_hidden_unique_value(ctx, corpus: _Corpus) -> tuple[str, str]:
     return unique_field, stored
 
 
-async def test_unique_rewrite_masks_a_hidden_stored_value(ctx):
+@pytest.mark.parametrize("write_checks", WRITE_CHECKS)
+async def test_unique_rewrite_masks_a_hidden_stored_value(ctx, monkeypatch, write_checks):
     """Changing a value stored through a unique_in_study field is refused
     either way; when an exception hides that value from the caller, the
-    refusal does not quote it."""
+    refusal does not quote it. Under "post-write-only" the refusal comes from
+    the write's refusal to rewrite the stored value."""
+    apply_write_checks(monkeypatch, write_checks)
     study_idx = await _seed_study_for_case(ctx, "member")
     corpus = await _seed_biosample_corpus(ctx, study_idx)
     unique_field, stored = await _seed_hidden_unique_value(ctx, corpus)
@@ -908,6 +916,7 @@ async def test_unique_rewrite_masks_a_hidden_stored_value(ctx):
     )
 
     assert resp.status_code == 403, resp.text
+    assert repr(unique_field) in resp.json()["detail"]
     assert "restricted" in resp.json()["detail"]
     assert stored not in resp.text
 

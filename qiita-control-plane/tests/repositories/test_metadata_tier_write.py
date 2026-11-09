@@ -34,6 +34,7 @@ from qiita_control_plane.testing.db_seeds import (
     seed_local_study_field,
     seed_metadata_text_value,
 )
+from qiita_control_plane.testing.tiers import WRITE_CHECKS, apply_write_checks
 from qiita_control_plane.testing.unique_names import unique_field_name
 
 from .conftest import SPECS, _create_linked_entity_for_spec, _spec_id
@@ -234,9 +235,14 @@ async def _public_value_under_exception(ctx, spec, *, exception_tier=Tier.ADMIN)
 
 
 @pytest.mark.parametrize("spec", SPECS, ids=_spec_id)
-async def test_write_refuses_value_under_exception_and_rolls_back(ctx, spec):
+@pytest.mark.parametrize("write_checks", WRITE_CHECKS)
+async def test_write_refuses_value_under_exception_and_rolls_back(
+    ctx, spec, monkeypatch, write_checks
+):
     """A member may write the field, but not this one value of it: the write is
-    refused and the stored value and its updated_at are as they were."""
+    refused and the stored value and its updated_at are as they were. Under
+    "post-write-only" the check of the written values refuses it alone."""
+    apply_write_checks(monkeypatch, write_checks)
     entity_idx, display_name, _ = await _public_value_under_exception(ctx, spec)
     before = await _metadata_rows(ctx, spec, entity_idx)
 
@@ -273,9 +279,14 @@ async def test_write_refuses_an_unchanged_value_under_exception(ctx, spec):
 
 
 @pytest.mark.parametrize("spec", SPECS, ids=_spec_id)
-async def test_write_refuses_into_empty_slot_carrying_exception(ctx, spec):
+@pytest.mark.parametrize("write_checks", WRITE_CHECKS)
+async def test_write_refuses_into_empty_slot_carrying_exception(
+    ctx, spec, monkeypatch, write_checks
+):
     """An exception set before any value exists still governs the first value
-    written into its slot."""
+    written into its slot. Under "post-write-only" the check of the written
+    values refuses it alone."""
+    apply_write_checks(monkeypatch, write_checks)
     entity_idx = await _create_linked_entity_for_spec(ctx, spec)
     global_field_idx, display_name, _ = await _global_field(
         ctx, spec, default_tier=Tier.PUBLIC, alias=True
