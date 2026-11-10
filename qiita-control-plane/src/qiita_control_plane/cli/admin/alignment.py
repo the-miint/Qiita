@@ -167,7 +167,7 @@ def add_alignment_parser(subparsers) -> None:
     sp.add_argument(
         "--allow-rearmed",
         action="store_true",
-        help="also abandon blocks rerun-blocks re-armed (purges their prep_samples' rows"
-        " from every block of the alignment)",
+        help="also abandon blocks that rerun-blocks re-armed (purges their prep_samples'"
+        " rows from every block of the alignment)",
     )
     add_rerun_parsers(sub, _with_idx)

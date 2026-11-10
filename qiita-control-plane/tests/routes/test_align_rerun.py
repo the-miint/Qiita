@@ -645,13 +645,24 @@ async def test_a_rerun_stamps_the_block_and_abandon_plan_refuses_it_until_allowe
     monkeypatch.setattr(
         "qiita_control_plane.actions.align_abandon.delete_alignment_block_data", _purge
     )
-    a, b, _c = rr.samples
+    a, b, c = rr.samples
     block, wt = await rr.make_block([(a, 1, 100)])
     untouched, _ = await rr.make_block([(b, 1, 100)])
+    # Never re-armed and unfinished: abandon-plan collects it, and must not list it.
+    never_finished, _ = await rr.make_block(
+        [(c, 1, 100)], ticket_state=WorkTicketState.FAILED, block_state="pending"
+    )
     await rr.full_steps(wt)
     await rr.set_gate(a, "completed")
     await rr.set_gate(b, "completed")
+    await rr.set_gate(c, "pending")
     assert (await _rerun(client, rr.alignment_idx, wt)).status_code == 200
+    url = URL_ALIGNMENT_DEFINITION_ABANDON_PLAN.format(alignment_idx=rr.alignment_idx)
+    # While the re-run is unfinished the in-flight refusal comes first; the override
+    # does not lift it.
+    resp = await client.post(url, json={"allow_rearmed": True})
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["detail"]["work_ticket_idx"] == [wt]
     stamps = dict(
         await rr.pool.fetch(
             "SELECT block_idx, rearmed_at IS NOT NULL FROM qiita.block"
@@ -660,6 +671,12 @@ async def test_a_rerun_stamps_the_block_and_abandon_plan_refuses_it_until_allowe
         )
     )
     assert stamps == {block: True, untouched: False}
+    assert (
+        await rr.pool.fetchval(
+            "SELECT rearmed_at IS NULL FROM qiita.block WHERE block_idx = $1", never_finished
+        )
+        is True
+    )
 
     # The re-run failed.
     await rr.pool.execute(
@@ -668,7 +685,6 @@ async def test_a_rerun_stamps_the_block_and_abandon_plan_refuses_it_until_allowe
         " failure_reason = 'x' WHERE work_ticket_idx = $1",
         wt,
     )
-    url = URL_ALIGNMENT_DEFINITION_ABANDON_PLAN.format(alignment_idx=rr.alignment_idx)
     resp = await client.post(url)
     assert resp.status_code == 409, resp.text
     assert resp.json()["detail"]["block_idx"] == [block]
@@ -677,7 +693,12 @@ async def test_a_rerun_stamps_the_block_and_abandon_plan_refuses_it_until_allowe
 
     resp = await client.post(url, json={"allow_rearmed": True})
     assert resp.status_code == 200, resp.text
-    assert resp.json()["abandoned_block_idx"] == [block]
+    body = resp.json()
+    assert body["abandoned_block_idx"] == sorted([block, never_finished])
+    assert body["cleared_prep_sample_idx"] == sorted([a, c])
+    gates = (await _snapshot(rr, wt, block))["gates"]
+    assert a not in gates and c not in gates and gates[b] == "completed"
+    assert purged
 
 
 # ---------------------------------------------------------------------------

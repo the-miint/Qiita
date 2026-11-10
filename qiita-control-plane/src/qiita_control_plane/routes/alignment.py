@@ -226,8 +226,8 @@ async def abandon_alignment_plan_route(
     alignment. Completed and invalidated prep_samples are not touched.
 
     `actions/align_abandon.py` documents the steps. 409 while a released block
-    ticket is still running, and for a block rerun-block re-armed unless the body
-    sets `allow_rearmed`. 502 if the DuckLake purge fails: the abandon itself has
+    ticket is still running, and for a block that rerun-block re-armed unless the
+    body sets `allow_rearmed`. 502 if the DuckLake purge fails: the abandon itself has
     committed. Calling this again before re-planning redoes the purge; a call after a
     re-plan would abandon that plan's unfinished blocks too, and is not needed, since
     the re-plan's blocks replace their own footprint over the whole prep_sample.

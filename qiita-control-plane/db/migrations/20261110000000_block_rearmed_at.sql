@@ -1,11 +1,9 @@
 -- migrate:up
 
 -- When a completed align block was last re-armed by
--- `POST /alignment-definition/{idx}/rerun-block`. A re-armed block that has not
--- completed again is `pending` with `pending` gates, as a block that never finished
--- is; abandon-plan reads this column to tell them apart, because abandoning a
--- re-armed block purges rows its completed siblings registered. NULL for a block
--- never re-armed, and for every block before this migration.
+-- `POST /alignment-definition/{idx}/rerun-block`; NULL for a block never re-armed,
+-- and for every block before this migration. abandon-plan reads it
+-- (actions/align_abandon.py says why).
 ALTER TABLE qiita.block ADD COLUMN rearmed_at TIMESTAMPTZ;
 
 COMMENT ON COLUMN qiita.block.rearmed_at IS
