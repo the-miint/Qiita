@@ -37,7 +37,11 @@ MASK_SAMPLE_PENDING = gate_state_literal("pending", MaskSampleState)
 MASK_SAMPLE_COMPLETED = gate_state_literal("completed", MaskSampleState)
 MASK_SAMPLE_INVALIDATED = gate_state_literal("invalidated", MaskSampleState)
 
+# The `qiita.block.state` values (a TEXT + CHECK column, `20260701000002_block.sql`
+# and `20261104000000_alignment_lifecycle.sql`).
 BLOCK_PENDING = "pending"
+BLOCK_PROCESSING = "processing"
+BLOCK_FAILED = "failed"
 BLOCK_COMPLETED = "completed"
 # Set only by the align abandon-plan route (`actions.align_abandon`). An abandoned
 # block owes no prep_sample anything: the covering-block checks skip it, and its
@@ -55,7 +59,7 @@ async def create_block(conn: asyncpg.Connection) -> int:
     """
     require_transaction(conn)
     return await conn.fetchval(
-        "INSERT INTO qiita.block (state) VALUES ('pending') RETURNING block_idx"
+        "INSERT INTO qiita.block (state) VALUES ($1) RETURNING block_idx", BLOCK_PENDING
     )
 
 

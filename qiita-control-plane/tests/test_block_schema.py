@@ -107,6 +107,27 @@ async def test_block_state_check(postgres_pool):
         assert state in joined, f"block.state CHECK is missing {state!r}: {defs}"
 
 
+async def test_every_block_state_constant_passes_the_check(postgres_pool):
+    """The names in repositories/block.py are values the CHECK admits."""
+    from qiita_control_plane.repositories import block
+
+    states = [
+        block.BLOCK_PENDING,
+        block.BLOCK_PROCESSING,
+        block.BLOCK_FAILED,
+        block.BLOCK_COMPLETED,
+        block.BLOCK_ABANDONED,
+    ]
+    async with postgres_pool.acquire() as conn:
+        for state in states:
+            tx = conn.transaction()
+            await tx.start()
+            try:
+                await conn.execute("INSERT INTO qiita.block (state) VALUES ($1)", state)
+            finally:
+                await tx.rollback()
+
+
 async def test_block_state_check_rejects_bad_state(postgres_pool):
     """The block.state CHECK actually rejects an out-of-set value at INSERT time,
     not merely present in the catalog. block has no required FK (work_ticket_idx
