@@ -1140,10 +1140,9 @@ pub fn ensure_registered_file_table(conn: &Connection) -> Result<(), Box<dyn std
 /// of the same rows left inline.
 ///
 /// A flush never failed beside registrations committing, so it is safe while
-/// other data planes serve. Lock-free registrations lost no COMMIT to it; for
-/// registrations that each also updated one shared row, a flush running back to back raised
-/// the lost COMMITs from about 22 to 27 of 40, which their retry absorbs, and a
-/// boot flushes once. (DuckDB 2.0.0, ducklake 417a9117.)
+/// other data planes serve. Registrations that only inserted lost no COMMIT to it
+/// (DuckDB 2.0.0, ducklake 417a9117); one that loses a COMMIT to it retries, and
+/// a boot flushes once.
 fn flush_registered_file(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
     conn.execute_batch(
         "CALL ducklake_flush_inlined_data('qiita_lake', table_name => 'registered_file');",

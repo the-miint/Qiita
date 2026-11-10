@@ -18,9 +18,10 @@
 ### Changed
 
 - **Lake writers no longer update `qiita_lake.registration_lock` (#TBD).** Every writer that
-  updated it now holds the global advisory lock exclusively, and in local runs it changed
-  neither the lost commits nor the copies left (DuckDB 2.0.0, ducklake 417a9117). The data
-  plane no longer creates it; the table stays in an existing catalog, unused.
+  updated it now holds the global advisory lock exclusively. In local runs the row changed
+  neither how many commits overlapping writers lost nor how many copies of a key registered
+  concurrently were left (DuckDB 2.0.0, ducklake 417a9117). The data plane no longer
+  creates it; the table stays in an existing catalog, unused.
 
 - **A data plane declares its lake lock sessions in its catalog connection name (#TBD).**
   `qiita-data-plane:<port>:pool=<n>` now counts the pool plus two lock sessions, so the
