@@ -107,7 +107,6 @@ from qiita_control_plane.repositories.biosample_metadata import (
     insert_owner_biosample_id_metadata,
 )
 from qiita_control_plane.repositories.prep_sample_metadata import PREP_SAMPLE_METADATA_SPEC
-from qiita_control_plane.repositories.study_access import CallerMetadataTiers
 from qiita_control_plane.testing.db_seeds import (
     NCBI_TAXONOMY_METAGENOME_TERM_ID,
     fetch_seeded_metagenome_term,
@@ -118,6 +117,7 @@ from qiita_control_plane.testing.db_seeds import (
     seed_prep_sample_global_field,
     seed_study,
 )
+from qiita_control_plane.testing.tiers import ADMIN_EVERYWHERE
 from qiita_control_plane.testing.unique_names import unique_field_name
 
 from .conftest import (
@@ -134,11 +134,6 @@ from .conftest import (
 )
 
 pytestmark = pytest.mark.db
-
-# The reads below are tested for what they decode, not for what they hide (that
-# is pinned against the visibility functions directly), so they read at admin
-# everywhere.
-_READ_ALL = CallerMetadataTiers(study_tiers={}, default=Tier.ADMIN)
 
 
 # ---------------------------------------------------------------------------
@@ -3183,7 +3178,7 @@ async def test_fetch_global_metadata_typed_values(ctx, spec):
     )
 
     result = await fetch_global_metadata(
-        ctx["pool"], spec=spec, entity_idx=entity_idx, tiers=_READ_ALL
+        ctx["pool"], spec=spec, entity_idx=entity_idx, tiers=ADMIN_EVERYWHERE
     )
 
     expected = {
@@ -3267,7 +3262,9 @@ async def test_fetch_global_metadata_excludes_purely_local_rows(ctx, spec):
             created_by_idx=ctx["principal_idx"],
         )
 
-    result = await fetch_global_metadata(ctx["pool"], spec=spec, entity_idx=bs_idx, tiers=_READ_ALL)
+    result = await fetch_global_metadata(
+        ctx["pool"], spec=spec, entity_idx=bs_idx, tiers=ADMIN_EVERYWHERE
+    )
 
     # Only the globally-linked row appears; both purely-local rows are filtered.
     expected = {
@@ -3334,7 +3331,11 @@ async def test_fetch_local_metadata_returns_local_excludes_global(ctx, spec):
     )
 
     result = await fetch_local_metadata(
-        ctx["pool"], spec=spec, entity_idx=entity_idx, study_idx=ctx["study_idx"], tiers=_READ_ALL
+        ctx["pool"],
+        spec=spec,
+        entity_idx=entity_idx,
+        study_idx=ctx["study_idx"],
+        tiers=ADMIN_EVERYWHERE,
     )
 
     expected = {
@@ -3391,14 +3392,14 @@ async def test_fetch_local_metadata_scopes_to_study(ctx):
         spec=BIOSAMPLE_METADATA_SPEC,
         entity_idx=bs_idx,
         study_idx=ctx["study_idx"],
-        tiers=_READ_ALL,
+        tiers=ADMIN_EVERYWHERE,
     )
     second_result = await fetch_local_metadata(
         ctx["pool"],
         spec=BIOSAMPLE_METADATA_SPEC,
         entity_idx=bs_idx,
         study_idx=second_study_idx,
-        tiers=_READ_ALL,
+        tiers=ADMIN_EVERYWHERE,
     )
 
     assert first_result == {
@@ -3438,7 +3439,7 @@ async def test_fetch_local_metadata_includes_owner_sample_id_row(ctx):
         spec=BIOSAMPLE_METADATA_SPEC,
         entity_idx=bs_idx,
         study_idx=ctx["study_idx"],
-        tiers=_READ_ALL,
+        tiers=ADMIN_EVERYWHERE,
     )
     assert result == {
         owner_field_name: MetadataRow(
@@ -3482,7 +3483,7 @@ async def test_fetch_global_metadata_preserves_link_retired_rows(ctx, spec):
     await _retire_entity_to_study_link(ctx, spec, entity_idx)
 
     result = await fetch_global_metadata(
-        ctx["pool"], spec=spec, entity_idx=entity_idx, tiers=_READ_ALL
+        ctx["pool"], spec=spec, entity_idx=entity_idx, tiers=ADMIN_EVERYWHERE
     )
 
     # The row still satisfies global_field_idx IS NOT NULL and surfaces
@@ -3513,7 +3514,7 @@ async def test_fetch_global_metadata_empty_when_none_exist(ctx, spec):
     )
 
     result = await fetch_global_metadata(
-        ctx["pool"], spec=spec, entity_idx=entity_idx, tiers=_READ_ALL
+        ctx["pool"], spec=spec, entity_idx=entity_idx, tiers=ADMIN_EVERYWHERE
     )
     assert result == {}
 
@@ -3563,7 +3564,7 @@ async def test_fetch_global_metadata_surfaces_missing_reason_rows(ctx, spec):
     )
 
     result = await fetch_global_metadata(
-        ctx["pool"], spec=spec, entity_idx=entity_idx, tiers=_READ_ALL
+        ctx["pool"], spec=spec, entity_idx=entity_idx, tiers=ADMIN_EVERYWHERE
     )
 
     expected = {
@@ -3873,7 +3874,7 @@ async def test_preflight_sample_metadata_returns_parsed_pairs(ctx, spec):
     metadata = {gf_row.display_name: "  hello  "}
     async with ctx["pool"].acquire() as conn:
         resolved = await preflight_sample_metadata(
-            conn, spec=spec, study_idx=ctx["study_idx"], metadata=metadata
+            conn, spec=spec, study_idx=ctx["study_idx"], metadata=metadata, tiers=ADMIN_EVERYWHERE
         )
 
     # parse_text_for_data_type strips outer whitespace for the TEXT arm.
@@ -3893,7 +3894,11 @@ async def test_preflight_sample_metadata_raises_unknown_with_spec_entity_kind(ct
     async with ctx["pool"].acquire() as conn:
         with pytest.raises(MetadataUnknownFieldsError) as excinfo:
             await preflight_sample_metadata(
-                conn, spec=spec, study_idx=ctx["study_idx"], metadata=metadata
+                conn,
+                spec=spec,
+                study_idx=ctx["study_idx"],
+                metadata=metadata,
+                tiers=ADMIN_EVERYWHERE,
             )
 
     # The unknown-name list is preserved verbatim, and the exception
@@ -3917,7 +3922,11 @@ async def test_preflight_sample_metadata_raises_parse_error(ctx, spec):
     async with ctx["pool"].acquire() as conn:
         with pytest.raises(MetadataParseError):
             await preflight_sample_metadata(
-                conn, spec=spec, study_idx=ctx["study_idx"], metadata=metadata
+                conn,
+                spec=spec,
+                study_idx=ctx["study_idx"],
+                metadata=metadata,
+                tiers=ADMIN_EVERYWHERE,
             )
 
 
@@ -3946,6 +3955,7 @@ async def test_preflight_sample_metadata_routes_missing_marker(ctx, spec):
             study_idx=ctx["study_idx"],
             metadata=metadata,
             known_missing_reasons={reason_name: reason_idx},
+            tiers=ADMIN_EVERYWHERE,
         )
 
     assert resolved == [
@@ -3972,6 +3982,7 @@ async def test_preflight_sample_metadata_unchanged_for_typed_values_with_empty_m
             study_idx=ctx["study_idx"],
             metadata=metadata,
             known_missing_reasons={},
+            tiers=ADMIN_EVERYWHERE,
         )
 
     # Outer whitespace is stripped from the TEXT value.
@@ -4003,6 +4014,7 @@ async def test_preflight_sample_metadata_recognizes_padded_marker(ctx, spec):
             study_idx=ctx["study_idx"],
             metadata=metadata,
             known_missing_reasons={reason_name: reason_idx},
+            tiers=ADMIN_EVERYWHERE,
         )
 
     assert resolved == [
@@ -4055,6 +4067,7 @@ async def test_write_resolved_metadata_entries_writes_each_entry(ctx, spec):
                 study_idx=ctx["study_idx"],
                 caller_idx=ctx["principal_idx"],
                 resolved_metadata=resolved_metadata,
+                tiers=ADMIN_EVERYWHERE,
             )
 
     # One global-scope INSERTED result per entry, in input order.
@@ -4108,6 +4121,7 @@ async def test_write_resolved_metadata_entries_empty_input_is_noop(ctx, spec):
                 study_idx=ctx["study_idx"],
                 caller_idx=ctx["principal_idx"],
                 resolved_metadata=[],
+                tiers=ADMIN_EVERYWHERE,
             )
 
     # Empty input yields no results and touches no rows.
@@ -4208,6 +4222,7 @@ async def test_preflight_sample_metadata_routes_terminology_term(ctx, spec):
             spec=spec,
             study_idx=ctx["study_idx"],
             metadata={global_row.display_name: NCBI_TAXONOMY_METAGENOME_TERM_ID},
+            tiers=ADMIN_EVERYWHERE,
         )
 
     expected_ref = TerminologyTermRef(
@@ -4240,6 +4255,7 @@ async def test_preflight_sample_metadata_unresolved_terminology_raises(ctx, spec
                 spec=spec,
                 study_idx=ctx["study_idx"],
                 metadata={global_row.display_name: bogus_term},
+                tiers=ADMIN_EVERYWHERE,
             )
 
     assert excinfo.value.field_key == global_row.display_name
@@ -4286,6 +4302,7 @@ async def test_preflight_sample_metadata_allow_local_partitions_global_and_local
             study_idx=study_idx,
             metadata=metadata,
             allow_local=True,
+            tiers=ADMIN_EVERYWHERE,
         )
 
     local_field_row = FieldRow(
@@ -4321,6 +4338,7 @@ async def test_preflight_sample_metadata_allow_local_raises_unknown(ctx, spec):
                 study_idx=ctx["study_idx"],
                 metadata={bogus: "v"},
                 allow_local=True,
+                tiers=ADMIN_EVERYWHERE,
             )
 
     assert excinfo.value.field_keys == [bogus]
@@ -4357,6 +4375,7 @@ async def test_preflight_sample_metadata_allow_local_writes_alias_through(ctx, s
             study_idx=study_idx,
             metadata={alias_name: "hello"},
             allow_local=True,
+            tiers=ADMIN_EVERYWHERE,
         )
 
     # The alias row carries the inherited data_type (TEXT) and its target
@@ -4404,6 +4423,7 @@ async def test_preflight_sample_metadata_allow_local_raises_on_alias_and_global_
                 study_idx=study_idx,
                 metadata={gf_row.display_name: "1", alias_name: "2"},
                 allow_local=True,
+                tiers=ADMIN_EVERYWHERE,
             )
 
     assert excinfo.value.global_field_idx == gf_row.idx
@@ -4450,6 +4470,7 @@ async def test_preflight_sample_metadata_allow_local_raises_on_two_aliases_same_
                 study_idx=study_idx,
                 metadata={alias_a: "1", alias_b: "2"},
                 allow_local=True,
+                tiers=ADMIN_EVERYWHERE,
             )
 
     assert excinfo.value.global_field_idx == gf_row.idx
@@ -4489,6 +4510,7 @@ async def test_preflight_sample_metadata_allow_local_routes_missing_marker(ctx, 
             metadata={local_name: reason_name},
             known_missing_reasons={reason_name: reason_idx},
             allow_local=True,
+            tiers=ADMIN_EVERYWHERE,
         )
 
     local_field_row = FieldRow(
@@ -4535,6 +4557,7 @@ async def test_preflight_sample_metadata_allow_local_raises_on_purely_local_shad
                 study_idx=study_idx,
                 metadata={gf_row.display_name: "v"},
                 allow_local=True,
+                tiers=ADMIN_EVERYWHERE,
             )
 
     assert excinfo.value.display_name == gf_row.display_name
@@ -4574,6 +4597,7 @@ async def test_preflight_sample_metadata_allow_local_raises_on_different_global_
                 study_idx=study_idx,
                 metadata={gf_target.display_name: "v"},
                 allow_local=True,
+                tiers=ADMIN_EVERYWHERE,
             )
 
     assert excinfo.value.expected_global_field_idx == gf_target.idx
@@ -4609,6 +4633,7 @@ async def test_preflight_sample_metadata_allow_local_same_global_puppet_resolves
             study_idx=study_idx,
             metadata={gf_row.display_name: "hello"},
             allow_local=True,
+            tiers=ADMIN_EVERYWHERE,
         )
 
     assert resolved == [(_global_resolved(gf_row), "hello")]
@@ -4641,6 +4666,7 @@ async def test_preflight_sample_metadata_global_internal_names_resolves_global(c
             study_idx=ctx["study_idx"],
             metadata={internal_name: "hello"},
             global_internal_names=True,
+            tiers=ADMIN_EVERYWHERE,
         )
 
     assert resolved == [(_global_resolved(gf_row, caller_key=internal_name), "hello")]
@@ -4682,6 +4708,7 @@ async def test_preflight_sample_metadata_global_internal_names_falls_through_to_
             metadata=metadata,
             allow_local=True,
             global_internal_names=True,
+            tiers=ADMIN_EVERYWHERE,
         )
 
     local_field_row = FieldRow(
@@ -4720,6 +4747,7 @@ async def test_preflight_sample_metadata_global_internal_names_rejects_global_di
                 study_idx=ctx["study_idx"],
                 metadata={gf_row.display_name: "v"},
                 global_internal_names=True,
+                tiers=ADMIN_EVERYWHERE,
             )
 
     assert excinfo.value.field_keys == [gf_row.display_name]
@@ -4763,6 +4791,7 @@ async def test_preflight_sample_metadata_global_internal_names_suppresses_shadow
             metadata={collide: "v"},
             allow_local=True,
             global_internal_names=True,
+            tiers=ADMIN_EVERYWHERE,
         )
     assert resolved_internal == [(_global_resolved(gf_internal, caller_key=collide), "v")]
 
@@ -4783,6 +4812,7 @@ async def test_preflight_sample_metadata_global_internal_names_suppresses_shadow
             study_idx=study_idx,
             metadata={collide: "v"},
             allow_local=True,
+            tiers=ADMIN_EVERYWHERE,
         )
     assert resolved_display == [(_global_resolved(alias_row, study_field_idx=alias_idx), "v")]
 
@@ -4822,6 +4852,7 @@ async def test_preflight_sample_metadata_global_internal_names_duplicate_target(
                 metadata={internal_name: "1", alias_name: "2"},
                 allow_local=True,
                 global_internal_names=True,
+                tiers=ADMIN_EVERYWHERE,
             )
 
     assert excinfo.value.global_field_idx == gf_row.idx
@@ -4868,6 +4899,7 @@ async def test_write_resolved_metadata_entries_persists_local(ctx):
             study_idx=ctx["study_idx"],
             caller_idx=ctx["principal_idx"],
             resolved_metadata=[(_local_resolved(field_row), "hello")],
+            tiers=ADMIN_EVERYWHERE,
         )
 
     # One local-scope INSERTED result for the single entry.
@@ -5266,7 +5298,7 @@ async def test_fetch_global_metadata_surfaces_terminology_term_rows(ctx, spec, m
     )
 
     result = await fetch_global_metadata(
-        ctx["pool"], spec=spec, entity_idx=entity_idx, tiers=_READ_ALL
+        ctx["pool"], spec=spec, entity_idx=entity_idx, tiers=ADMIN_EVERYWHERE
     )
 
     expected = {
@@ -5313,6 +5345,7 @@ async def test_write_sample_metadata_writes_global_and_local(ctx):
             metadata={gf_row.display_name: "g", local_name: "l"},
             caller_idx=ctx["principal_idx"],
             allow_local=True,
+            tiers=ADMIN_EVERYWHERE,
         )
 
     # Per-field results come back in the caller's metadata key order: the
@@ -5367,6 +5400,7 @@ async def test_write_sample_metadata_upsert_reports_outcomes(ctx):
                 caller_idx=ctx["principal_idx"],
                 allow_local=False,
                 on_conflict="upsert",
+                tiers=ADMIN_EVERYWHERE,
             )
 
     inserted = await _upsert("v1")
@@ -5442,6 +5476,7 @@ async def test_write_sample_metadata_upsert_numeric_compares_stored_form(
                 caller_idx=ctx["principal_idx"],
                 allow_local=False,
                 on_conflict="upsert",
+                tiers=ADMIN_EVERYWHERE,
             )
 
     await _upsert(first_text)
@@ -5484,6 +5519,7 @@ async def test_write_sample_metadata_global_internal_names_echoes_caller_key(ctx
             caller_idx=ctx["principal_idx"],
             allow_local=False,
             global_internal_names=True,
+            tiers=ADMIN_EVERYWHERE,
         )
 
     # The result key is the caller's internal_name, not the display_name.
@@ -5539,6 +5575,7 @@ async def test_write_sample_metadata_rejects_owner_sample_id_field(ctx):
                     caller_idx=ctx["principal_idx"],
                     allow_local=True,
                     on_conflict="upsert",
+                    tiers=ADMIN_EVERYWHERE,
                 )
     assert excinfo.value.display_name == owner_field_name
     assert excinfo.value.study_field_idx == owner_field_idx
@@ -5565,6 +5602,7 @@ async def test_write_sample_metadata_global_only_writes_entry(ctx, spec):
             metadata={gf_row.display_name: "val"},
             caller_idx=ctx["principal_idx"],
             allow_local=False,
+            tiers=ADMIN_EVERYWHERE,
         )
 
     rows = await ctx["pool"].fetch(
@@ -5603,6 +5641,7 @@ async def test_write_sample_metadata_allow_local_false_rejects_local_field(ctx):
                     metadata={local_name: "x"},
                     caller_idx=ctx["principal_idx"],
                     allow_local=False,
+                    tiers=ADMIN_EVERYWHERE,
                 )
     assert excinfo.value.field_keys == [local_name]
 
@@ -5630,6 +5669,7 @@ async def test_write_sample_metadata_raises_unknown_field(ctx, spec):
                     metadata={bogus: "v"},
                     caller_idx=ctx["principal_idx"],
                     allow_local=True,
+                    tiers=ADMIN_EVERYWHERE,
                 )
     assert excinfo.value.field_keys == [bogus]
 
@@ -5658,6 +5698,7 @@ async def test_write_sample_metadata_resolves_missing_reason(ctx, spec):
             metadata={gf_row.display_name: reason_name},
             caller_idx=ctx["principal_idx"],
             allow_local=True,
+            tiers=ADMIN_EVERYWHERE,
         )
 
     row = await ctx["pool"].fetchrow(
@@ -5690,6 +5731,7 @@ async def test_write_sample_metadata_rejects_non_transactional_connection(ctx, s
                 metadata={gf_row.display_name: "v"},
                 caller_idx=ctx["principal_idx"],
                 allow_local=True,
+                tiers=ADMIN_EVERYWHERE,
             )
 
 
@@ -7081,7 +7123,7 @@ async def test_fetch_entity_idx_by_unique_field_value(ctx, spec):
             study_field_idx=field_idx,
             data_type=FieldDataType.TEXT,
             value="Sample 1",
-            tiers=_READ_ALL,
+            tiers=ADMIN_EVERYWHERE,
         )
         missed = await fetch_entity_idx_by_unique_field_value(
             conn,
@@ -7089,7 +7131,7 @@ async def test_fetch_entity_idx_by_unique_field_value(ctx, spec):
             study_field_idx=field_idx,
             data_type=FieldDataType.TEXT,
             value="Sample 2",
-            tiers=_READ_ALL,
+            tiers=ADMIN_EVERYWHERE,
         )
 
     assert found == entity_idx
@@ -7129,7 +7171,7 @@ async def test_fetch_entity_idx_by_unique_field_value_not_unique_returns_none(ct
             study_field_idx=field_idx,
             data_type=FieldDataType.TEXT,
             value="Sample 1",
-            tiers=_READ_ALL,
+            tiers=ADMIN_EVERYWHERE,
         )
 
     assert found is None
@@ -7159,7 +7201,7 @@ async def test_fetch_entity_idx_by_unique_field_value_scoped_to_its_field(ctx, s
             study_field_idx=first_field,
             data_type=FieldDataType.TEXT,
             value="Shared",
-            tiers=_READ_ALL,
+            tiers=ADMIN_EVERYWHERE,
         )
         via_second = await fetch_entity_idx_by_unique_field_value(
             conn,
@@ -7167,7 +7209,7 @@ async def test_fetch_entity_idx_by_unique_field_value_scoped_to_its_field(ctx, s
             study_field_idx=second_field,
             data_type=FieldDataType.TEXT,
             value="Shared",
-            tiers=_READ_ALL,
+            tiers=ADMIN_EVERYWHERE,
         )
 
     assert via_first == first_entity
@@ -7234,6 +7276,7 @@ async def test_preflight_sample_metadata_bounds_latitude_however_keyed(ctx, keye
                 metadata={key: "200"},
                 allow_local=True,
                 global_internal_names=keyed_by == "internal_name",
+                tiers=ADMIN_EVERYWHERE,
             )
 
     assert excinfo.value.field_key == key

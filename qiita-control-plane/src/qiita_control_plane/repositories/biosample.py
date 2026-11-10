@@ -23,6 +23,7 @@ from ._sample_helpers import (
     fetch_missing_value_reason_idxs_by_names,
     link_entity_to_studies,
     preflight_sample_metadata,
+    require_tiers_read_every_value,
     resolve_local_study_field,
     validate_primary_secondary_studies,
     write_local_metadata_or_diagnose,
@@ -35,6 +36,7 @@ from .biosample_metadata import (
     insert_owner_biosample_id_metadata,
 )
 from .exported_entity import export_entity_id_select
+from .study_access import CallerMetadataTiers
 
 # Owners' ids for their own biosamples sometimes inadvertently contain PII, so an
 # owner-biosample-id value requires at least member, whatever the study's
@@ -171,6 +173,7 @@ async def resolve_or_import_biosample_by_ena_accession(
     metadata: dict[str, str],
     local_metadata: dict[str, str],
     metadata_checklist_idx: int,
+    tiers: CallerMetadataTiers,
 ) -> tuple[int, bool]:
     """Find a biosample by ena_sample_accession, importing it with its metadata
     when absent. Returns (idx, created).
@@ -185,6 +188,9 @@ async def resolve_or_import_biosample_by_ena_accession(
     with a global field the caller declined to map (ENA's environmental-context
     tags are spelled exactly like their ENVO-typed globals, and its values are
     submitter free text).
+
+    tiers is the caller's, and must meet `require_tiers_read_every_value` on
+    study_idx: the `local_metadata` writes check no tier.
     """
     require_transaction(conn)
 
@@ -207,6 +213,7 @@ async def resolve_or_import_biosample_by_ena_accession(
                 owner_biosample_id_field_name=owner_biosample_id_field_name,
                 owner_biosample_id_value=owner_biosample_id_value,
                 metadata=metadata,
+                tiers=tiers,
                 metadata_checklist_idx=metadata_checklist_idx,
                 ena_sample_accession=ena_sample_accession,
             )
@@ -395,6 +402,7 @@ async def import_biosample_from_owner_biosample_id(
     owner_biosample_id_value: str,
     caller_idx: int,
     metadata: dict[str, str],
+    tiers: CallerMetadataTiers,
     metadata_checklist_idx: int | None = None,
     biosample_accession: str | None = None,
     ena_sample_accession: str | None = None,
@@ -424,7 +432,9 @@ async def import_biosample_from_owner_biosample_id(
     display_name; an existing study-local alias of a global field writes
     through to that global field. No new purely-local field is ever created
     for a metadata key — only the owner-biosample-id field is created on
-    import.
+    import. tiers is the caller's, and must meet
+    `require_tiers_read_every_value` on primary_study_idx, since the
+    owner-biosample-id write checks no tier.
 
     primary_study_idx owns the globally-linked field rows and the
     owner-biosample-id local field row; secondary studies share the
@@ -487,6 +497,7 @@ async def import_biosample_from_owner_biosample_id(
     """
     # Fail-fast guard against caller forgetting to wrap in a transaction.
     require_transaction(conn)
+    require_tiers_read_every_value(tiers, study_idx=primary_study_idx)
 
     # Reject primary appearing in the secondary list at the composer boundary.
     validate_primary_secondary_studies(primary_study_idx, secondary_study_idxs)
@@ -585,6 +596,7 @@ async def import_biosample_from_owner_biosample_id(
             known_missing_reasons=known_missing_reasons,
             allow_local=True,
             global_internal_names=global_internal_names,
+            tiers=tiers,
         )
     else:
         deferred = None
@@ -598,6 +610,7 @@ async def import_biosample_from_owner_biosample_id(
             allow_local=True,
             known_missing_reasons=known_missing_reasons,
             global_internal_names=global_internal_names,
+            tiers=tiers,
         )
 
     return BiosampleImportResult(
