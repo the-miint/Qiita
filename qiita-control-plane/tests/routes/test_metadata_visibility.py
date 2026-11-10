@@ -1,5 +1,6 @@
 """DB-bound route tests: each metadata read returns exactly the values the
-caller's tier reaches.
+caller's tier reaches, and each metadata write refuses a field or value the
+caller's tier does not reach, without disclosing the value it protects.
 
 One corpus per test: a study at the default `member` tier, and on it a sample
 carrying one value per tier a value can require -- a global field at each tier
@@ -22,9 +23,11 @@ from qiita_common.api_paths import (
     URL_BIOSAMPLE_BY_STUDY,
     URL_BIOSAMPLE_BY_STUDY_AND_IDX,
     URL_BIOSAMPLE_BY_STUDY_UNIQUE_FIELD,
+    URL_BIOSAMPLE_METADATA_BY_STUDY,
     URL_BIOSAMPLE_STUDY_FIELD_BY_STUDY,
     URL_SEQUENCED_SAMPLE_BY_IDX,
     URL_SEQUENCED_SAMPLE_BY_STUDY_AND_IDX,
+    URL_SEQUENCED_SAMPLE_METADATA_BY_STUDY,
 )
 from qiita_common.models import (
     BIOSAMPLE_DISPLAY_HOST_TAXON_ID,
@@ -50,7 +53,7 @@ from qiita_control_plane.testing.db_seeds import (
     seed_sequenced_sample_subtype,
 )
 from qiita_control_plane.testing.db_teardown import delete_idxs, teardown_entity_graph
-from qiita_control_plane.testing.tiers import TIER_RANK
+from qiita_control_plane.testing.tiers import TIER_RANK, WRITE_CHECKS, apply_write_checks
 from qiita_control_plane.testing.unique_names import unique_field_name
 
 from .conftest import _grant_study_access, _seed_authz_case_study, _seed_study
@@ -664,3 +667,273 @@ async def test_patch_sequenced_sample_refuses_an_etag_a_metadata_write_made_stal
         url, json={"ena_experiment_accession": "ERX9000002"}, headers={"If-Match": fresh}
     )
     assert accepted.status_code == 200, accepted.text
+
+
+# ---------------------------------------------------------------------------
+# Writes
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _WriteSurface:
+    """One study-scoped metadata write, and the read that shows its result."""
+
+    seed: Callable[..., Awaitable[_Corpus]]
+    spec: EntityMetadataSpec
+    write_url: Callable[[_Corpus], str]
+    read_url: Callable[[_Corpus], str]
+
+
+_WRITE_SURFACES = {
+    "biosample": _WriteSurface(
+        seed=_seed_biosample_corpus,
+        spec=BIOSAMPLE_METADATA_SPEC,
+        write_url=lambda c: URL_BIOSAMPLE_METADATA_BY_STUDY.format(
+            study_idx=c.study_idx, biosample_idx=c.entity_idx
+        ),
+        read_url=lambda c: URL_BIOSAMPLE_BY_STUDY_AND_IDX.format(
+            study_idx=c.study_idx, biosample_idx=c.entity_idx
+        ),
+    ),
+    "sequenced_sample": _WriteSurface(
+        seed=_seed_sequenced_sample_corpus,
+        spec=PREP_SAMPLE_METADATA_SPEC,
+        write_url=lambda c: URL_SEQUENCED_SAMPLE_METADATA_BY_STUDY.format(
+            study_idx=c.study_idx, sequenced_sample_idx=c.entity_idx
+        ),
+        read_url=lambda c: URL_SEQUENCED_SAMPLE_BY_STUDY_AND_IDX.format(
+            study_idx=c.study_idx, sequenced_sample_idx=c.entity_idx
+        ),
+    ),
+}
+
+
+def _keys_at(keys: dict[str, Tier], tier: Tier, *, corpus: _Corpus) -> list[str]:
+    """The corpus keys requiring exactly `tier` that a metadata write may name.
+
+    The owner-biosample-id has its own write path, and host taxon id is not a
+    text field, so neither is ever in a body here.
+    """
+    unwritable = {BIOSAMPLE_FIELD_HOST_TAXON_ID, getattr(corpus, "owner_id_field", None)}
+    return sorted(k for k, needed in keys.items() if needed == tier and k not in unwritable)
+
+
+async def _patch_metadata(client, url: str, metadata: dict[str, str]):
+    # Globals are keyed on internal_name, as the corpus keys them; local fields
+    # are keyed on display_name either way.
+    return await client.patch(url, json={"metadata": metadata, "global_internal_names": True})
+
+
+async def _read_as_wet(ctx, surface: _WriteSurface, corpus: _Corpus) -> dict:
+    resp = await ctx["wet"].get(surface.read_url(corpus))
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    return {"global": body["global_metadata"], "local": body["local_metadata"]}
+
+
+async def _stored_global_text(ctx, spec: EntityMetadataSpec, *, entity_idx, internal_name) -> str:
+    value = await ctx["pool"].fetchval(
+        f"SELECT m.value_text FROM {spec.metadata_table} m"
+        f" JOIN {spec.global_field_table} gf ON gf.idx = m.global_field_idx"
+        f" WHERE m.{spec.entity_key_column} = $1 AND gf.internal_name = $2",
+        entity_idx,
+        internal_name,
+    )
+    assert value is not None
+    return value
+
+
+@pytest.mark.parametrize("surface", tuple(_WRITE_SURFACES))
+async def test_member_writes_every_field_their_tier_reaches(ctx, surface):
+    """A member writes values through public, member, and viewer fields,
+    global and study-local alike."""
+    s = _WRITE_SURFACES[surface]
+    study_idx = await _seed_study_for_case(ctx, "member")
+    corpus = await s.seed(ctx, study_idx)
+    keys = [
+        *(
+            k
+            for tier in (Tier.PUBLIC, Tier.MEMBER)
+            for k in _keys_at(corpus.global_keys, tier, corpus=corpus)
+        ),
+        *(
+            k
+            for tier in (Tier.VIEWER, Tier.MEMBER)
+            for k in _keys_at(corpus.local_keys, tier, corpus=corpus)
+        ),
+    ]
+
+    resp = await _patch_metadata(ctx["user"], s.write_url(corpus), dict.fromkeys(keys, "by-member"))
+
+    assert resp.status_code == 200, resp.text
+    assert {k: r["outcome"] for k, r in resp.json()["results"].items()} == dict.fromkeys(
+        keys, "updated"
+    )
+
+
+@pytest.mark.parametrize("surface", tuple(_WRITE_SURFACES))
+async def test_member_refused_a_field_above_their_tier_writes_nothing(ctx, surface):
+    """A body naming one field above the caller's tier is refused whole: the
+    refusal names that field and the tier it requires, and the fields beside
+    it in the body are not written."""
+    s = _WRITE_SURFACES[surface]
+    study_idx = await _seed_study_for_case(ctx, "member")
+    corpus = await s.seed(ctx, study_idx)
+    (l_admin,) = _keys_at(corpus.local_keys, Tier.ADMIN, corpus=corpus)
+    (l_viewer,) = _keys_at(corpus.local_keys, Tier.VIEWER, corpus=corpus)
+    before = await _read_as_wet(ctx, s, corpus)
+
+    resp = await _patch_metadata(
+        ctx["user"], s.write_url(corpus), {l_admin: "by-member", l_viewer: "by-member"}
+    )
+
+    assert resp.status_code == 403, resp.text
+    detail = resp.json()["detail"]
+    assert l_admin in detail
+    assert Tier.ADMIN.value in detail
+    assert l_viewer not in detail
+    assert await _read_as_wet(ctx, s, corpus) == before
+
+
+@pytest.mark.parametrize("surface", tuple(_WRITE_SURFACES))
+async def test_member_refused_a_value_under_an_exception(ctx, surface):
+    """A public field is writable by a member, but not its one value that an
+    admin-tier exception covers; the refusal names the field and says nothing
+    of the value."""
+    s = _WRITE_SURFACES[surface]
+    study_idx = await _seed_study_for_case(ctx, "member")
+    corpus = await s.seed(ctx, study_idx)
+    (g_exception,) = _keys_at(corpus.global_keys, Tier.ADMIN, corpus=corpus)
+    stored = await _stored_global_text(
+        ctx, s.spec, entity_idx=corpus.metadata_entity_idx, internal_name=g_exception
+    )
+    before = await _read_as_wet(ctx, s, corpus)
+
+    resp = await _patch_metadata(ctx["user"], s.write_url(corpus), {g_exception: "by-member"})
+
+    assert resp.status_code == 403, resp.text
+    assert g_exception in resp.json()["detail"]
+    assert "restricted" in resp.json()["detail"]
+    assert stored not in resp.text
+    assert await _read_as_wet(ctx, s, corpus) == before
+
+
+@pytest.mark.parametrize("write_checks", WRITE_CHECKS)
+async def test_foreign_hidden_occupant_reveals_nothing(ctx, monkeypatch, write_checks):
+    """Another study already holds the biosample's value for a global field, and
+    the caller, an admin of this study only, cannot read it. The caller's write
+    of that field is refused under the key that the caller sent, and the
+    refusal names neither the value nor the other study, and does not say
+    whether the two values agree. Under "post-write-only" the refusal comes
+    from the write's collision with the stored value."""
+    apply_write_checks(monkeypatch, write_checks)
+    study_idx = await _seed_study_for_case(ctx, "admin")
+    corpus = await _seed_biosample_corpus(ctx, study_idx)
+    other_study_idx = await _seed_study(
+        ctx, owner_idx=ctx["wet_session"]["principal_idx"], suffix="vis-foreign"
+    )
+    await seed_biosample_to_study_link(
+        ctx["pool"],
+        biosample_idx=corpus.entity_idx,
+        study_idx=other_study_idx,
+        created_by_idx=ctx["wet_session"]["principal_idx"],
+    )
+    # Member tier on the other study, where the caller holds nothing.
+    foreign_key = await _seed_global_value(
+        ctx,
+        BIOSAMPLE_METADATA_SPEC,
+        study_idx=other_study_idx,
+        entity_idx=corpus.entity_idx,
+        default_tier=Tier.MEMBER,
+    )
+    stored = await _stored_global_text(
+        ctx, BIOSAMPLE_METADATA_SPEC, entity_idx=corpus.entity_idx, internal_name=foreign_key
+    )
+    url = _WRITE_SURFACES["biosample"].write_url(corpus)
+
+    different = await _patch_metadata(ctx["user"], url, {foreign_key: "by-admin-elsewhere"})
+    same = await _patch_metadata(ctx["user"], url, {foreign_key: stored})
+
+    for resp in (different, same):
+        assert resp.status_code == 403, resp.text
+        assert repr(foreign_key) in resp.json()["detail"]
+        assert stored not in resp.text
+        assert f"study {other_study_idx}" not in resp.text
+        assert f"study_idx={other_study_idx}" not in resp.text
+    assert different.json()["detail"] == same.json()["detail"]
+
+
+async def _seed_hidden_unique_value(ctx, corpus: _Corpus) -> tuple[str, str]:
+    """A study-local unique_in_study field on the corpus's study, holding a value
+    on its biosample that an admin-tier exception hides from a member. Returns
+    (display_name, the stored value)."""
+    unique_field = unique_field_name("vis_unique")
+    declared = await ctx["wet"].post(
+        URL_BIOSAMPLE_STUDY_FIELD_BY_STUDY.format(study_idx=corpus.study_idx),
+        json={
+            "display_name": unique_field,
+            "data_type": FieldDataType.TEXT,
+            "unique_in_study": True,
+        },
+    )
+    assert declared.status_code == 201, declared.text
+    field_idx = declared.json()["biosample_study_field_idx"]
+    wet_idx = ctx["wet_session"]["principal_idx"]
+    metadata_idx = await seed_metadata_text_value(
+        ctx["pool"],
+        spec=BIOSAMPLE_METADATA_SPEC,
+        entity_idx=corpus.entity_idx,
+        study_field_idx=field_idx,
+        created_by_idx=wet_idx,
+    )
+    stored = await ctx["pool"].fetchval(
+        "SELECT value_text FROM qiita.biosample_metadata WHERE idx = $1", metadata_idx
+    )
+    await seed_field_exception(
+        ctx["pool"],
+        spec=BIOSAMPLE_METADATA_SPEC,
+        entity_idx=corpus.entity_idx,
+        study_field_idx=field_idx,
+        tier_override=Tier.ADMIN,
+        created_by_idx=wet_idx,
+    )
+    return unique_field, stored
+
+
+@pytest.mark.parametrize("write_checks", WRITE_CHECKS)
+async def test_unique_rewrite_masks_a_hidden_stored_value(ctx, monkeypatch, write_checks):
+    """Changing a value stored through a unique_in_study field is refused
+    either way; when an exception hides that value from the caller, the
+    refusal does not quote it. Under "post-write-only" the refusal comes from
+    the write's refusal to rewrite the stored value."""
+    apply_write_checks(monkeypatch, write_checks)
+    study_idx = await _seed_study_for_case(ctx, "member")
+    corpus = await _seed_biosample_corpus(ctx, study_idx)
+    unique_field, stored = await _seed_hidden_unique_value(ctx, corpus)
+
+    resp = await _patch_metadata(
+        ctx["user"], _WRITE_SURFACES["biosample"].write_url(corpus), {unique_field: "by-member"}
+    )
+
+    assert resp.status_code == 403, resp.text
+    assert repr(unique_field) in resp.json()["detail"]
+    assert "restricted" in resp.json()["detail"]
+    assert stored not in resp.text
+
+
+async def test_refusal_is_the_same_whether_a_guess_at_a_hidden_value_is_right(ctx):
+    """A body that guesses a hidden value, beside a second key that is also
+    refused, gets the same answer for a right guess and a wrong one."""
+    study_idx = await _seed_study_for_case(ctx, "member")
+    corpus = await _seed_biosample_corpus(ctx, study_idx)
+    unique_field, stored = await _seed_hidden_unique_value(ctx, corpus)
+    (g_exception,) = _keys_at(corpus.global_keys, Tier.ADMIN, corpus=corpus)
+    url = _WRITE_SURFACES["biosample"].write_url(corpus)
+
+    right = await _patch_metadata(ctx["user"], url, {unique_field: stored, g_exception: "x"})
+    wrong = await _patch_metadata(ctx["user"], url, {unique_field: "not-it", g_exception: "x"})
+
+    for resp in (right, wrong):
+        assert resp.status_code == 403, resp.text
+        assert stored not in resp.text
+    assert right.json()["detail"] == wrong.json()["detail"]

@@ -65,6 +65,7 @@ from qiita_control_plane.repositories._sample_helpers import (
     fetch_missing_value_reason_names,
     fetch_terminology_term_idxs_by_term_ids,
     insert_entity_to_study,
+    require_tiers_read_every_value,
     resolve_local_study_field,
     write_local_metadata_on_resolved_field,
 )
@@ -87,6 +88,7 @@ from qiita_control_plane.repositories.sequencing_run import (
     insert_sequencing_run,
     lock_sequencing_run,
 )
+from qiita_control_plane.repositories.study_access import CallerMetadataTiers
 from qiita_control_plane.repositories.terminology import fetch_terminology_idx_by_name
 
 from .harmonization import (
@@ -272,6 +274,7 @@ async def register_ena_study(
     sample_attributes: list[EnaSampleAttributes],
     owner_idx: int,
     caller_idx: int,
+    tiers: CallerMetadataTiers,
 ) -> EnaStudyRegistrationResult:
     """Register one resolved ENA study's runs and samples into `study_idx`.
 
@@ -285,7 +288,11 @@ async def register_ena_study(
     It does raise -- before any run is written -- when a study-local field at
     one of the four `library_*` display names cannot hold these values (see
     `_ensure_library_fields`), so the whole accession fails loudly rather than run by run.
+
+    tiers is the caller's, and must meet `require_tiers_read_every_value` on
+    study_idx: the per-run `library_*` writes check no tier.
     """
+    require_tiers_read_every_value(tiers, study_idx=study_idx)
     # A run whose sample has no entry here harmonizes against an empty map
     # rather than failing.
     attrs_by_sample_accession: dict[str, EnaSampleAttributes] = {
@@ -383,6 +390,7 @@ async def register_ena_study(
                     sequenced_pool_idx=target_pool_idx_by_platform[platform],
                     owner_idx=owner_idx,
                     caller_idx=caller_idx,
+                    tiers=tiers,
                     metadata_checklist_idx=metadata_checklist_idx,
                     attrs_by_sample_accession=attrs_by_sample_accession,
                     library_field_idxs=library_field_idxs,
@@ -599,6 +607,7 @@ async def _register_one_ena_run(
     sequenced_pool_idx: int | None,
     owner_idx: int,
     caller_idx: int,
+    tiers: CallerMetadataTiers,
     metadata_checklist_idx: int,
     attrs_by_sample_accession: dict[str, EnaSampleAttributes],
     library_field_idxs: dict[str, int],
@@ -644,6 +653,7 @@ async def _register_one_ena_run(
                 metadata=metadata,
                 local_metadata=local_metadata,
                 metadata_checklist_idx=metadata_checklist_idx,
+                tiers=tiers,
             )
             # The import links the study itself; a biosample this study is
             # reusing needs the link added, and must precede the composer below,
@@ -700,6 +710,7 @@ async def _register_one_ena_run(
                 metadata={},
                 primary_study_idx=study_idx,
                 caller_idx=caller_idx,
+                tiers=tiers,
                 ena_experiment_accession=ena_run.experiment_accession,
                 ena_run_accession=ena_run.run_accession,
             )

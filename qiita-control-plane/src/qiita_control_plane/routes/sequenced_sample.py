@@ -290,6 +290,7 @@ async def import_sequenced_sample_from_run(
             conn,
             caller=user,
             study_idxs=[body.primary_study_idx, *body.secondary_study_idxs],
+            bypass_role=METADATA_BYPASS_ROLE,
         )
 
         # Owner eligibility pre-flight inside the transaction; collapses
@@ -326,6 +327,7 @@ async def import_sequenced_sample_from_run(
 
         # Map known composer-side errors and DB-level violations to user-
         # friendly responses. Typed catches first so their detail wins.
+        tiers = await caller_metadata_tiers(conn, user)
         try:
             result = await import_sequenced_prep_sample(
                 conn,
@@ -338,19 +340,16 @@ async def import_sequenced_sample_from_run(
                 primary_study_idx=body.primary_study_idx,
                 secondary_study_idxs=body.secondary_study_idxs,
                 caller_idx=user.principal_idx,
+                tiers=tiers,
                 metadata_checklist_idx=metadata_checklist_idx,
                 ena_experiment_accession=body.ena_experiment_accession,
                 ena_run_accession=body.ena_run_accession,
                 global_internal_names=body.global_internal_names,
             )
         except SAMPLE_METADATA_WRITE_ERRORS as exc:
-            # Shared metadata-write arms (parse / unknown / conflict /
-            # duplicate-global-target / slot-collision / transient-race) map
-            # through one place. The asyncpg arms below stay route-specific.
-            # SlotOccupiedError is unreachable through this POST (a fresh
-            # prep_sample per call cannot pre-occupy a slot) but is handled for
-            # the shared PATCH path that reuses this composer.
-            await raise_http_for_sample_metadata_write_error(conn, exc)
+            await raise_http_for_sample_metadata_write_error(
+                conn, exc, spec=PREP_SAMPLE_METADATA_SPEC
+            )
         except asyncpg.UniqueViolationError as exc:
             detail = _SEQUENCED_SAMPLE_UNIQUE_MESSAGES.get(
                 exc.constraint_name, _GENERIC_SEQ_UNIQUE_VIOLATION
@@ -857,18 +856,17 @@ async def patch_sequenced_sample_metadata(
     _scope: Principal = Depends(require_scope(Scope.PREP_SAMPLE_WRITE)),
     _exists: None = Depends(require_study_exists),
     _access: None = Depends(
-        require_study_access(min_tier=Tier.ADMIN, bypass_role=SystemRole.WET_LAB_ADMIN)
+        require_study_access(min_tier=Tier.MEMBER, bypass_role=METADATA_BYPASS_ROLE)
     ),
 ) -> SampleMetadataWriteResponse:
     """Upsert this study's metadata values on a sequenced_sample's supertype
     prep_sample.
 
-    Access policy is interim: this route requires Tier.ADMIN on the study, or a
-    wet_lab_admin+ role, until metadata writes apply the visibility rule. 401 on
-    Anonymous, 403 on missing scope,
-    an incomplete profile, or sub-ADMIN tier, 404 on a study that does not
-    exist. require_study_exists composes alongside require_study_access so an
-    admin-bypass caller still gets 404 on a non-existent study.
+    This route requires Tier.MEMBER on the study, or a wet_lab_admin+ role. 401
+    on Anonymous, 403 on missing scope, an incomplete profile, a sub-MEMBER
+    tier, or a field or value above the caller's tier, 404 on a study that does
+    not exist. require_study_exists composes alongside require_study_access so
+    an admin-bypass caller still gets 404 on a non-existent study.
 
     The prep_sample must be linked to this study: a nonexistent
     sequenced_sample_idx and one whose prep_sample has no non-retired
@@ -884,7 +882,8 @@ async def patch_sequenced_sample_metadata(
     fields display-name-keyed. Each key resolves against the study's existing
     global or study-local prep_sample fields and is upserted (unknown fields
     -> 422, an empty body -> 422 at the wire boundary, a cross-study global slot
-    collision -> 409). The response reports per field, in input order, whether it
+    collision -> 409, or 403 when the caller cannot read the value already there).
+    The response reports per field, in input order, whether it
     resolved global or local, the write outcome (inserted / updated / unchanged),
     the value now in the slot, and the internal_name a globally linked value
     reads back under.
@@ -908,6 +907,7 @@ async def patch_sequenced_sample_metadata(
             noun="sequenced_sample",
             metadata=body.metadata,
             caller_idx=user.principal_idx,
+            tiers=await caller_metadata_tiers(conn, user),
             global_internal_names=body.global_internal_names,
         )
     return written
