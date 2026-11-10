@@ -148,7 +148,7 @@ also belongs to `qiita-pipeline` so it can descend into the per-ticket
 subdirs the CP runner creates (resolved as the bundled fix for the
 nested workspace dir perms issue described next).
 
-> **Nested workspace dir perms — both layers shipped in this PR.** The
+> **Nested workspace dir perms.** The
 > per-ticket subdirs the CP runner creates inherit `qiita-pipeline` via
 > setgid, but their *mode* depends on systemd's UMask. Default UMask
 > 0022 lands them at `0755`, where `qiita-orch` is "other" → traverse
