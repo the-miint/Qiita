@@ -21,21 +21,11 @@ import pytest
 from qiita_control_plane.cli import _common
 from qiita_control_plane.cli.user import main
 from qiita_control_plane.cli.user.amplicon import _read_amplicon_preflight_rows
+from qiita_control_plane.testing.parser import RaisingParser
 
 _RUN_ID = "20260925_SL00377_0008_ASC2267726-SC3"
 _RESOLVED_BCL_DIR = f"/sequencing/{_RUN_ID}"
 _FIXTURE_SAMPLE_IDENTITIES_SQL = "SELECT biosample_accession, matrix_tube_id FROM input_sample"
-
-
-class _RaisingParser:
-    """Stand-in for argparse.ArgumentParser whose `error` raises instead of
-    calling sys.exit, so tests can assert on the message."""
-
-    class Error(Exception):
-        pass
-
-    def error(self, message: str):
-        raise self.Error(message)
 
 
 # ---------------------------------------------------------------------------
@@ -45,7 +35,7 @@ class _RaisingParser:
 
 def test_read_amplicon_preflight_rows_v1(build_amplicon_preflight):
     db = build_amplicon_preflight()
-    rows = _read_amplicon_preflight_rows(db, _RaisingParser())
+    rows = _read_amplicon_preflight_rows(db, RaisingParser())
 
     assert len(rows) == 181
     # Every row carries a Golay barcode + its orientation flag, keyed to a resolved
@@ -62,15 +52,15 @@ def test_read_amplicon_preflight_rows_fails_on_missing_accession(build_amplicon_
     """A preflight without the required biosample/bioproject accessions fails
     fast: `get_amplicon_sample_info` raises and the CLI surfaces its message."""
     db = build_amplicon_preflight(populate_accessions=False)
-    with pytest.raises(_RaisingParser.Error):
-        _read_amplicon_preflight_rows(db, _RaisingParser())
+    with pytest.raises(RaisingParser.Error):
+        _read_amplicon_preflight_rows(db, RaisingParser())
 
 
 def test_read_amplicon_preflight_rows_rejects_non_sqlite(tmp_path):
     bad = tmp_path / "not.db"
     bad.write_bytes(b"this is not a sqlite file")
-    with pytest.raises(_RaisingParser.Error):
-        _read_amplicon_preflight_rows(bad, _RaisingParser())
+    with pytest.raises(RaisingParser.Error):
+        _read_amplicon_preflight_rows(bad, RaisingParser())
 
 
 # ---------------------------------------------------------------------------

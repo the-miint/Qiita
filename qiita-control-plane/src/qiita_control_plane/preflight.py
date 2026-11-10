@@ -31,6 +31,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, NamedTuple
 
+from pydantic import ValidationError
 from qiita_common.models import BiosampleRef, StudyRef
 
 if TYPE_CHECKING:
@@ -82,19 +83,38 @@ class SampleRefs(NamedTuple):
 
 
 def _ref_from_record[RefT: (BiosampleRef, StudyRef)](
-    record: NamedTuple, ref_model: type[RefT]
+    record: NamedTuple, ref_model: type[RefT], *, sample_idx: int, entity: str
 ) -> RefT:
-    """Build `ref_model` from a kl-run-preflight identifier record."""
+    """Build `ref_model` from a kl-run-preflight identifier record.
+
+    RAISES `ValueError` naming the sample, the entity and each refused field
+    when the record holds a value the ref refuses.
+    """
     fields = {_RECORD_FIELD_RENAMES.get(k, k): v for k, v in record._asdict().items()}
-    ref = ref_model(**fields)
+    try:
+        ref = ref_model(**fields)
+    except ValidationError as exc:
+        problems = "; ".join(
+            f"{'.'.join(map(str, error['loc']))}: {error['msg']}" for error in exc.errors()
+        )
+        raise ValueError(f"sample_idx {sample_idx}: {entity} {problems}") from exc
     return ref
 
 
 def sample_refs(info: PlatformSampleInfo) -> SampleRefs:
-    """The refs for one sample read by a kl-run-preflight platform reader."""
-    biosample = _ref_from_record(info.biosample, BiosampleRef)
-    primary_project = _ref_from_record(info.primary_project, StudyRef)
-    secondary_projects = tuple(_ref_from_record(p, StudyRef) for p in info.secondary_projects)
+    """The refs for one sample read by a kl-run-preflight platform reader.
+
+    RAISES `ValueError` when an identifier holds a value its ref refuses.
+    """
+    idx = info.sample_idx
+    biosample = _ref_from_record(info.biosample, BiosampleRef, sample_idx=idx, entity="biosample")
+    primary_project = _ref_from_record(
+        info.primary_project, StudyRef, sample_idx=idx, entity="primary_project"
+    )
+    secondary_projects = tuple(
+        _ref_from_record(p, StudyRef, sample_idx=idx, entity="secondary_projects")
+        for p in info.secondary_projects
+    )
     refs = SampleRefs(biosample, primary_project, secondary_projects)
     return refs
 
@@ -266,12 +286,16 @@ def amplicon_samples(conn: sqlite3.Connection) -> list[AmpliconSample]:
                 f"prepped_sample_idx {info.sample_idx} carries no Golay barcode; a sample"
                 " cannot be demultiplexed without it"
             )
+        try:
+            refs = sample_refs(info)
+        except ValueError as exc:
+            raise AmpliconPreflightError(str(exc)) from exc
         samples.append(
             AmpliconSample(
                 prepped_sample_idx=info.sample_idx,
                 barcode=row.barcode,
                 barcodes_are_rc=bool(row.barcodes_are_rc),
-                refs=sample_refs(info),
+                refs=refs,
             )
         )
     return samples
@@ -340,7 +364,7 @@ def control_samples(conn: sqlite3.Connection) -> ControlSamples:
       * the sample's NAME. Controls are conventionally named `BLANK.*`, and on
         the live data 650 of 652 are — but a naming convention is not a fact, and
         the two that aren't would be silently mis-depleted.
-      * a non-empty `secondary_project_accessions`. Controls carry one secondary
+      * a non-empty `secondary_projects`. Controls carry one secondary
         per non-primary plate project, so "has secondaries" implies control — but
         NOT the converse: a blank on a plate with a SINGLE project has no
         secondaries at all, and would read as a normal sample.

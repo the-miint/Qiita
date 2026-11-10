@@ -189,10 +189,14 @@ def _read_pacbio_preflight_rows(
                 " carries no barcode_id; a PacBio sample cannot be located on disk"
                 " without it"
             )
+        try:
+            refs = sample_refs(info)
+        except ValueError as exc:
+            parser.error(f"--preflight-blob {preflight_blob}: {exc}")
         row = _PacbioPreflightRow(
             pacbio_sample_idx=info.sample_idx,
             barcode=pbs.barcode_id,
-            refs=sample_refs(info),
+            refs=refs,
             # sheet_type is a RUN-level property (a run is one protocol), read once
             # from the legacy format above and stamped on every row — there is no
             # per-sample sheet_type.

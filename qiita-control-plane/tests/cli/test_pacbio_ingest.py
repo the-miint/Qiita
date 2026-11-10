@@ -21,6 +21,7 @@ from pathlib import Path
 import httpx
 import pytest
 from qiita_common.models import BiosampleRef, PacbioRunIndex, StudyRef
+from qiita_common.models.biosample import MAX_ROSTER_TUBE_TEXT_LENGTH
 from qiita_common.pacbio import index_run_bams
 
 from qiita_control_plane.cli import _common
@@ -31,6 +32,7 @@ from qiita_control_plane.cli.user import (
 )
 from qiita_control_plane.cli.user.pacbio import _PacbioPreflightRow, _validate_pacbio_protocol
 from qiita_control_plane.preflight import SampleRefs
+from qiita_control_plane.testing.parser import RaisingParser
 
 _CASE5_CSV = Path(__file__).parent / "data" / "good_pacbio_absquantv11.csv"
 # (barcode, twist_adaptor_id, smrt_cell) of case-5 pacbio_sample_idx 1, 2 and 3,
@@ -41,17 +43,6 @@ _CASE5_PROTOCOL = (
     ("bc9992", "16_UDI_5_E01_F--16_UDI_5_E01_R", None),
 )
 _REFS = SampleRefs(BiosampleRef(biosample_accession="BIO"), StudyRef(bioproject_accession="9"), ())
-
-
-class _RaisingParser:
-    """Stand-in for argparse.ArgumentParser whose `error` raises instead of
-    calling sys.exit, so tests can assert on the message."""
-
-    class Error(Exception):
-        pass
-
-    def error(self, message: str):
-        raise self.Error(message)
 
 
 # ---------------------------------------------------------------------------
@@ -117,41 +108,41 @@ def _run_index(run_folder) -> PacbioRunIndex:
 
 def test_resolve_sample_bams_happy_path(tmp_path):
     _make_bam(tmp_path, "1_A01", "m84_s1", "bc1")
-    resolved = _resolve_sample_bams([_row("bc1")], tmp_path, _run_index(tmp_path), _RaisingParser())
+    resolved = _resolve_sample_bams([_row("bc1")], tmp_path, _run_index(tmp_path), RaisingParser())
     assert set(resolved) == {"bc1"}
     assert resolved["bc1"].name == "m84_s1.hifi_reads.bc1.bam"
 
 
 def test_resolve_sample_bams_errors_on_missing(tmp_path):
     _make_bam(tmp_path, "1_A01", "m84_s1", "bc1")
-    with pytest.raises(_RaisingParser.Error, match="no HiFi BAM found"):
-        _resolve_sample_bams([_row("bcX", 5)], tmp_path, _run_index(tmp_path), _RaisingParser())
+    with pytest.raises(RaisingParser.Error, match="no HiFi BAM found"):
+        _resolve_sample_bams([_row("bcX", 5)], tmp_path, _run_index(tmp_path), RaisingParser())
 
 
 def test_resolve_sample_bams_errors_on_cross_cell_barcode(tmp_path):
     """A barcode with BAMs in two SMRT cells can't be bound without the cell."""
     _make_bam(tmp_path, "1_A01", "m84_s1", "bc1")
     _make_bam(tmp_path, "1_B01", "m84_s2", "bc1")
-    with pytest.raises(_RaisingParser.Error, match="reused across samples or SMRT cells"):
-        _resolve_sample_bams([_row("bc1", 5)], tmp_path, _run_index(tmp_path), _RaisingParser())
+    with pytest.raises(RaisingParser.Error, match="reused across samples or SMRT cells"):
+        _resolve_sample_bams([_row("bc1", 5)], tmp_path, _run_index(tmp_path), RaisingParser())
 
 
 def test_resolve_sample_bams_errors_on_two_samples_sharing_a_barcode(tmp_path):
     """Two distinct samples claiming the same barcode can't be split between the
     BAM(s) without the SMRT cell — ambiguous, not a silent shared BAM."""
     _make_bam(tmp_path, "1_A01", "m84_s1", "bc1")
-    with pytest.raises(_RaisingParser.Error, match="reused across samples or SMRT cells"):
+    with pytest.raises(RaisingParser.Error, match="reused across samples or SMRT cells"):
         _resolve_sample_bams(
             [_row("bc1", 1), _row("bc1", 2)],
             tmp_path,
             _run_index(tmp_path),
-            _RaisingParser(),
+            RaisingParser(),
         )
 
 
 def test_resolve_sample_bams_errors_on_empty_run_folder(tmp_path):
-    with pytest.raises(_RaisingParser.Error, match="no HiFi BAMs"):
-        _resolve_sample_bams([_row("bc1")], tmp_path, _run_index(tmp_path), _RaisingParser())
+    with pytest.raises(RaisingParser.Error, match="no HiFi BAMs"):
+        _resolve_sample_bams([_row("bc1")], tmp_path, _run_index(tmp_path), RaisingParser())
 
 
 # ---------------------------------------------------------------------------
@@ -168,8 +159,8 @@ def test_validate_protocol_rejects_twisted_without_adapter():
         twist_adaptor_id=None,
         syndna_is_twisted=True,
     )
-    with pytest.raises(_RaisingParser.Error, match="twisted with no twist_adaptor_id"):
-        _validate_pacbio_protocol(row, Path("pf.db"), _RaisingParser())
+    with pytest.raises(RaisingParser.Error, match="twisted with no twist_adaptor_id"):
+        _validate_pacbio_protocol(row, Path("pf.db"), RaisingParser())
 
 
 def test_validate_protocol_allows_untwisted_without_adapter():
@@ -182,7 +173,7 @@ def test_validate_protocol_allows_untwisted_without_adapter():
         twist_adaptor_id=None,
         syndna_is_twisted=False,
     )
-    _validate_pacbio_protocol(row, Path("pf.db"), _RaisingParser())  # no raise
+    _validate_pacbio_protocol(row, Path("pf.db"), RaisingParser())  # no raise
 
 
 # ---------------------------------------------------------------------------
@@ -231,7 +222,7 @@ def test_read_preflight_rows_case5(
     conn.commit()
     conn.close()
 
-    rows = _read_pacbio_preflight_rows(db, _RaisingParser())
+    rows = _read_pacbio_preflight_rows(db, RaisingParser())
     expected = [
         _PacbioPreflightRow(
             pacbio_sample_idx=idx,
@@ -259,7 +250,7 @@ def test_read_preflight_rows_accepts_barcode_shared_across_samples(build_case5_p
     conn.execute("UPDATE pacbio_sample SET barcode_id = 'bc3011' WHERE barcode_id = 'bc0112'")
     conn.commit()
     conn.close()
-    rows = _read_pacbio_preflight_rows(db, _RaisingParser())  # no raise
+    rows = _read_pacbio_preflight_rows(db, RaisingParser())  # no raise
     assert [r.pacbio_sample_idx for r in rows] == [1, 2, 3]  # distinct identities
     assert [r.barcode for r in rows].count("bc3011") == 2  # the shared barcode
 
@@ -269,15 +260,27 @@ def test_read_preflight_rows_fails_on_missing_identifier(build_case5_preflight):
     operator-actionable fail-fast, `get_pacbio_sample_info` raises and the CLI
     surfaces its message."""
     db = build_case5_preflight(populate_accessions=False)
-    with pytest.raises(_RaisingParser.Error, match="missing required identifier"):
-        _read_pacbio_preflight_rows(db, _RaisingParser())
+    with pytest.raises(RaisingParser.Error, match="missing required identifier"):
+        _read_pacbio_preflight_rows(db, RaisingParser())
+
+
+def test__read_pacbio_preflight_rows_overlong_identifier(
+    build_case5_preflight, set_overlong_matrix_tube_ids
+):
+    """Tests the case where a sample's identifier is longer than its ref allows: the
+    operator sees the sample and the field through the parser, not a traceback."""
+    db = build_case5_preflight()
+    set_overlong_matrix_tube_ids(db)
+    message = f"biosample matrix_tube_id: Value should have at most {MAX_ROSTER_TUBE_TEXT_LENGTH} items after validation, not {MAX_ROSTER_TUBE_TEXT_LENGTH + 1}"  # noqa: E501
+    with pytest.raises(RaisingParser.Error, match=message):
+        _read_pacbio_preflight_rows(db, RaisingParser())
 
 
 def test__read_pacbio_preflight_rows_rejects_a_non_sqlite_blob(tmp_path, capsys):
     """Tests the case where --preflight-blob names a file that is not a SQLite
     database at all — the operator pointed at the CSV, or at a truncated copy.
 
-    Uses a real `argparse.ArgumentParser` rather than this module's `_RaisingParser`,
+    Uses a real `argparse.ArgumentParser` rather than this module's `RaisingParser`,
     because the assertion is the argparse behaviour itself: one stderr line and exit
     2, not a traceback. Pins the message, since a load failure and a query failure
     are reported differently and the operator's next move differs."""
@@ -307,7 +310,7 @@ def test__read_pacbio_preflight_rows_leaves_the_source_unwritten(build_case5_pre
     before = db.read_bytes()
     db.chmod(0o444)
 
-    rows = _read_pacbio_preflight_rows(db, _RaisingParser())
+    rows = _read_pacbio_preflight_rows(db, RaisingParser())
 
     assert rows, "case-5 fixture produced no CLI rows"
     assert db.read_bytes() == before
@@ -831,8 +834,8 @@ def test_read_preflight_rows_rejects_non_pacbio_sheet(build_case5_preflight):
     )
     conn.commit()
     conn.close()
-    with pytest.raises(_RaisingParser.Error, match="not a.*PacBio sheet"):
-        _read_pacbio_preflight_rows(db, _RaisingParser())
+    with pytest.raises(RaisingParser.Error, match="not a.*PacBio sheet"):
+        _read_pacbio_preflight_rows(db, RaisingParser())
 
 
 def test_validate_protocol_rejects_twisted_on_metag():
@@ -844,8 +847,8 @@ def test_validate_protocol_rejects_twisted_on_metag():
         twist_adaptor_id="t",
         syndna_is_twisted=True,
     )
-    with pytest.raises(_RaisingParser.Error, match="twisted on a 'pacbio_metag'"):
-        _validate_pacbio_protocol(row, Path("pf.db"), _RaisingParser())
+    with pytest.raises(RaisingParser.Error, match="twisted on a 'pacbio_metag'"):
+        _validate_pacbio_protocol(row, Path("pf.db"), RaisingParser())
 
 
 def test_index_run_bams_skips_combined_bam_without_barcode(tmp_path):

@@ -22,7 +22,7 @@
   identifier the pre-flight holds to `POST /biosample/resolve-roster`. A biosample or
   project with no identifier is refused by the library, with the message "missing required
   identifier" in place of "missing required accession". In the `submit-bcl-convert` and
-  `submit-golay-demux` output, each sample's `biosample_accession` is replaced by
+  `submit-golay-demux` output, each pre-flight row's `biosample_accession` is replaced by
   `biosample`, which holds the biosample's identifiers from the pre-flight, absent ones
   left out.
 

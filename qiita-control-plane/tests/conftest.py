@@ -20,6 +20,7 @@ from pathlib import Path  # noqa: E402
 
 import pytest  # noqa: E402
 import pytest_asyncio  # noqa: E402
+from qiita_common.models.biosample import MAX_ROSTER_TUBE_TEXT_LENGTH  # noqa: E402
 from run_preflight import (  # noqa: E402
     load_db_file,
     save_db_file,
@@ -30,6 +31,7 @@ from run_preflight.constants import (  # noqa: E402
     InputSampleIdentifierKind,
     ProjectIdentifierKind,
 )
+from run_preflight.db import get_input_sample_project_info  # noqa: E402
 
 from qiita_control_plane.notify.sweeper import _OWED_SET_WHERE  # noqa: E402
 from qiita_control_plane.testing.jwks import jwks_harness  # noqa: E402, F401
@@ -148,6 +150,7 @@ _PROJECT_IDENTIFIER_VALUES = {
     "bioproject_accession": lambda position, external_id: f"PRJNA{external_id}",
     "study_export_entity_id": lambda position, external_id: f"QS{position}",
 }
+_OVERLONG_TUBE_LENGTH = MAX_ROSTER_TUBE_TEXT_LENGTH + 1
 
 
 @pytest.fixture
@@ -180,6 +183,28 @@ def set_preflight_identifiers():
                     set_project_identifier(
                         conn, project_kind, value, external_project_id=external_id
                     )
+            save_db_file(conn, str(db))
+        finally:
+            conn.close()
+
+    return _set
+
+
+@pytest.fixture
+def set_overlong_matrix_tube_ids():
+    """Give every input sample of a pre-flight file a matrix_tube_id one character
+    longer than a roster ref allows, through kl-run-preflight's own reader and
+    setter."""
+
+    def _set(db: Path) -> None:
+        conn = load_db_file(str(db))
+        try:
+            # Each sample gets its own value, so no two share one
+            project_info = get_input_sample_project_info(conn, include_do_not_use=True)
+            names = sorted({name for name, _, _ in project_info})
+            for position, name in enumerate(names):
+                value = str(position).zfill(_OVERLONG_TUBE_LENGTH)
+                set_input_sample_identifier(conn, "matrix_tube_id", value, sample_name=name)
             save_db_file(conn, str(db))
         finally:
             conn.close()

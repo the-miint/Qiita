@@ -197,13 +197,12 @@ snippets below are short Python.
 
 | From the pre-flight file | Has to match |
 |---|---|
-| each row's `biosample_accession`, `ena_sample_accession`, `biosample_export_entity_id` and `matrix_tube_id` | a biosample you created in step 3 |
-| each row's project `bioproject_accession`, `ena_study_accession` and `study_export_entity_id` | a study you created in step 2 |
+| each row's `biosample_accession`, `biosample_export_entity_id` and `matrix_tube_id` | a biosample you created in step 3 |
+| each row's project `bioproject_accession` and `study_export_entity_id` | a study you created in step 2 |
 | any extra projects on the plate (controls only) | further studies that row's biosample is already linked to |
 
 The export IDs are assigned by Qiita: `export_entity_id` in the output of
-`qiita study create` and `qiita biosample create`. Qiita reads the two ENA
-accessions when a file carries them, but the setters below cannot set them.
+`qiita study create` and `qiita biosample create`.
 
 Every project a row names must already be among its biosample's studies. A
 biosample is linked only to the study it was created in, and Qiita has no command

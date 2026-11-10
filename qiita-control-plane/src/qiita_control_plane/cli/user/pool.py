@@ -108,6 +108,10 @@ def _read_preflight_rows(
     conn = _load_preflight_conn(preflight_blob, parser, flag="--preflight-blob")
     try:
         illumina_samples = get_illumina_sample_info(conn)
+        parsed = [
+            _PreflightRow(illumina_sample_idx=info.sample_idx, refs=sample_refs(info))
+            for info in illumina_samples
+        ]
     except sqlite3.DatabaseError as exc:
         parser.error(
             f"--preflight-blob {preflight_blob}: preflight query failed ({exc});"
@@ -115,8 +119,9 @@ def _read_preflight_rows(
         )
     except ValueError as exc:
         # The library refuses a pre-flight without exactly one run, a control /
-        # project mismatch, or an entity with no identifier; its message names
-        # each offender.
+        # project mismatch, or an entity with no identifier. sample_refs refuses a
+        # sample whose identifier its ref does not accept. Each message names the
+        # offender.
         parser.error(f"--preflight-blob {preflight_blob}: {exc}")
     finally:
         conn.close()
@@ -126,11 +131,6 @@ def _read_preflight_rows(
             f"--preflight-blob {preflight_blob} contains no illumina_sample rows;"
             " a bcl-convert submission needs at least one sample to demultiplex"
         )
-
-    parsed = [
-        _PreflightRow(illumina_sample_idx=info.sample_idx, refs=sample_refs(info))
-        for info in illumina_samples
-    ]
     return parsed
 
 
