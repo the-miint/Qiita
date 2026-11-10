@@ -6,13 +6,14 @@
   could lose every attempt and fail with `failed to commit the registration transaction
   within 120s`, as 55 of a 1,062-ticket myloasm backfill did on qiita-miint. Now a
   registration of runs the lake does not hold yet (myloasm provenance, `amplicon_membership`,
-  `assembly_membership` and `bin_quality` alone) takes a Postgres advisory lock per run and
-  only inserts, and does not conflict with other such registrations. One that deletes —
-  any registration with a `feature_idx`-keyed table, a run the lake already holds, or a
-  reference delete — waits for a global advisory lock first and reaches COMMIT alone. The
-  waits hold no pooled connection, are bounded at 120 s each, and a registration that times
-  out moves its files back to staging and fails with a retriable status, so its step is run
-  again.
+  `assembly_membership` and `bin_quality` alone) takes a Postgres advisory lock per run,
+  holds a global advisory lock shared, and only inserts, so such registrations overlap each
+  other. One that deletes — any registration with a `feature_idx`-keyed table, a run the
+  lake already holds, or a reference delete — holds the global lock exclusively, so no
+  insert or delete into those tables commits beside it. The waits hold no pooled
+  connection and end after 120 s in all; a registration that gives up, or cannot open its
+  lock session, moves its files back to staging and fails with a retriable status, so its
+  step is run again.
 
 ### Changed
 

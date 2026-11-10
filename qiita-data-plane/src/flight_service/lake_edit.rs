@@ -24,9 +24,8 @@ impl QiitaFlightService {
             .verify_action_payload(action, auth::verify_delete_reference, |p| p.action.as_str())?;
 
         let reference_idx = payload.reference_idx;
-        // Its deletes conflict with any concurrent insert into those tables, so it
-        // takes the global lake lock first (`crate::lake_locks`), before checking
-        // out a writer, so the wait holds no pooled connection.
+        // A writer that deletes from replace-keyed tables: it holds the global lake
+        // lock exclusively (`crate::lake_locks`), taken before it checks out a writer.
         let pool = std::sync::Arc::clone(&self.pool);
         let locks = std::sync::Arc::clone(&self.lake_locks);
         let deleted = tokio::task::spawn_blocking(move || {

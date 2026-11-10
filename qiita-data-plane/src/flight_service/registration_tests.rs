@@ -3128,12 +3128,20 @@ fn amplicon_membership_payload(
     (staging, payload)
 }
 
-/// Register every payload at once, each writer on its own connection and the
-/// `locks` it is given, released together from a barrier.
+/// One `LakeLocks` per writer, as writers in separate processes have.
+#[cfg(feature = "integration")]
+fn locks_per_writer(writers: usize, make: impl Fn(String) -> LakeLocks) -> Vec<LakeLocks> {
+    (0..writers)
+        .map(|_| make(crate::test_catalog::connstr()))
+        .collect()
+}
+
+/// Register every payload at once, each writer on its own connection, writer `i`
+/// with `locks[i % locks.len()]`, released together from a barrier.
 #[cfg(feature = "integration")]
 fn register_together(
     payloads: &[(tempfile::TempDir, auth::ActionPayload)],
-    locks: impl Fn() -> LakeLocks + Sync,
+    locks: &[LakeLocks],
 ) -> Vec<Result<Registration, Status>> {
     let connstr = crate::test_catalog::connstr();
     let data_path = crate::test_catalog::data_path();
@@ -3141,15 +3149,16 @@ fn register_together(
     std::thread::scope(|scope| {
         let handles: Vec<_> = payloads
             .iter()
-            .map(|(_staging, payload)| {
-                let (connstr, data_path, start, locks) = (&connstr, &data_path, &start, &locks);
+            .enumerate()
+            .map(|(i, (_staging, payload))| {
+                let (connstr, data_path, start) = (&connstr, &data_path, &start);
+                let locks = &locks[i % locks.len()];
                 scope.spawn(move || {
                     let conn = attached_writer(connstr, data_path);
-                    let locks = locks();
                     start.wait();
                     register_files(
                         &|| Ok(&conn),
-                        &locks,
+                        locks,
                         data_path,
                         std::path::Path::new("/"),
                         payload,
@@ -3186,7 +3195,6 @@ fn prepare_amplicon_and_assembly_tables() {
 #[cfg(feature = "integration")]
 fn writers_that_delete_commit_at_the_first_attempt_under_the_global_lock() {
     prepare_amplicon_and_assembly_tables();
-    let connstr = crate::test_catalog::connstr();
     let base_ticket: i64 = 974_000_000 + std::process::id() as i64 * 100;
     let payloads =
         |base_feature: i64, ticket: i64| -> Vec<(tempfile::TempDir, auth::ActionPayload)> {
@@ -3205,9 +3213,10 @@ fn writers_that_delete_commit_at_the_first_attempt_under_the_global_lock() {
         };
     let feature_base = 974_100_000 + (std::process::id() as i64 % 1000) * 100;
 
-    let locked = register_together(&payloads(feature_base, base_ticket), || {
-        LakeLocks::new(connstr.clone())
-    });
+    let locked = register_together(
+        &payloads(feature_base, base_ticket),
+        &locks_per_writer(8, LakeLocks::new),
+    );
     let lost: u32 = locked
         .iter()
         .map(|r| {
@@ -3221,9 +3230,10 @@ fn writers_that_delete_commit_at_the_first_attempt_under_the_global_lock() {
         "writers holding the global lock lost {lost} COMMITs"
     );
 
-    let unlocked = register_together(&payloads(feature_base + 50, base_ticket + 50), || {
-        LakeLocks::without_global_lock(connstr.clone())
-    });
+    let unlocked = register_together(
+        &payloads(feature_base + 50, base_ticket + 50),
+        &locks_per_writer(8, LakeLocks::without_global_lock),
+    );
     let lost: u32 = unlocked
         .iter()
         .map(|r| {
@@ -3235,13 +3245,14 @@ fn writers_that_delete_commit_at_the_first_attempt_under_the_global_lock() {
     assert!(lost > 0, "8 overlapping writers that delete lost no COMMIT");
 }
 
-/// Registrations of runs the lake does not hold yet only insert, take no global
-/// lock, and do not conflict: they commit at the first attempt while the global
-/// lock is held elsewhere, which would time out any of them that waited for it.
+/// Registrations of runs the lake does not hold yet only insert, hold the global
+/// lock shared, and do not conflict: they commit at the first attempt while
+/// another session holds it shared, which would time out any of them that waited
+/// for it exclusively.
 #[test]
 #[serial_test::serial]
 #[cfg(feature = "integration")]
-fn new_runs_register_without_the_global_lock() {
+fn new_runs_register_beside_each_other_under_the_shared_global_lock() {
     prepare_amplicon_and_assembly_tables();
     let connstr = crate::test_catalog::connstr();
     let base = 975_000_000 + std::process::id() as i64 * 100;
@@ -3251,10 +3262,13 @@ fn new_runs_register_without_the_global_lock() {
 
     let holder = LakeLocks::new(connstr.clone());
     let mut held = holder.session("the test holder").unwrap();
-    held.lock_global().unwrap();
-    let outcomes = register_together(&payloads, || {
-        LakeLocks::with_budget(connstr.clone(), std::time::Duration::from_millis(500))
-    });
+    held.lock_global_shared().unwrap();
+    let outcomes = register_together(
+        &payloads,
+        &locks_per_writer(8, |c| {
+            LakeLocks::with_budget(c, std::time::Duration::from_millis(500))
+        }),
+    );
     drop(held);
 
     for (i, outcome) in outcomes.iter().enumerate() {
@@ -3278,7 +3292,7 @@ fn concurrent_registrations_of_one_new_run_leave_one_copy() {
         .map(|i| amplicon_membership_payload(prep, 7, prep * 10 + i))
         .collect();
 
-    let outcomes = register_together(&payloads, || LakeLocks::new(connstr.clone()));
+    let outcomes = register_together(&payloads, &locks_per_writer(4, LakeLocks::new));
     for (i, outcome) in outcomes.iter().enumerate() {
         assert!(outcome.is_ok(), "writer {i}: {:?}", outcome.as_ref().err());
     }
@@ -3380,4 +3394,114 @@ fn a_session_waiting_for_the_global_lock_gets_it_when_released() {
     drop(held);
     let waited = queued.join().unwrap().unwrap();
     assert!(waited >= Duration::from_millis(300), "waited {waited:?}");
+}
+
+/// Register `prep_sample_idx`'s amplicon run 1 once, so a later registration of
+/// it replaces.
+#[cfg(feature = "integration")]
+fn seed_amplicon_run(prep_sample_idx: i64, ticket: i64) {
+    let (_staging, payload) = amplicon_membership_payload(prep_sample_idx, 1, ticket);
+    let data_path = crate::test_catalog::data_path();
+    let conn = attached_writer(&crate::test_catalog::connstr(), &data_path);
+    register_files(
+        &|| Ok(&conn),
+        &test_locks(),
+        &data_path,
+        std::path::Path::new("/"),
+        &payload,
+    )
+    .unwrap();
+}
+
+/// Writer 0 replaces a run the lake holds while 8 others insert new runs into
+/// the same table, released together, `rounds` times; the COMMITs they lost in all.
+#[cfg(feature = "integration")]
+fn lost_beside_new_runs(base: i64, rounds: i64, locks: &[LakeLocks]) -> u32 {
+    seed_amplicon_run(base, base);
+    let mut lost = 0;
+    for round in 0..rounds {
+        let first = base + 1 + round * 10;
+        let mut payloads = vec![amplicon_membership_payload(base, 1, first)];
+        payloads.extend((1..9).map(|i| amplicon_membership_payload(first + i, 1, first + i)));
+        let outcomes = register_together(&payloads, locks);
+        for (i, outcome) in outcomes.iter().enumerate() {
+            let registration = outcome
+                .as_ref()
+                .unwrap_or_else(|e| panic!("round {round} writer {i}: {e:?}"));
+            assert_eq!(
+                registration.replaced.is_empty(),
+                i != 0,
+                "round {round} writer {i}: replaced {:?}",
+                registration.replaced
+            );
+            lost += registration.attempt;
+        }
+    }
+    lost
+}
+
+/// A registration that replaces a run holds the global lock exclusively and those
+/// inserting new runs into its table hold it shared, so none loses a COMMIT to
+/// the other kind; without the global lock, both do.
+#[test]
+#[serial_test::serial]
+#[cfg(feature = "integration")]
+fn a_replace_beside_new_runs_of_its_table_loses_no_commit() {
+    prepare_amplicon_and_assembly_tables();
+    let base = 978_000_000 + (std::process::id() as i64 % 1000) * 1000;
+
+    let lost = lost_beside_new_runs(base, 3, &locks_per_writer(9, LakeLocks::new));
+    assert_eq!(lost, 0, "writers under the global lock lost {lost} COMMITs");
+
+    let lost = lost_beside_new_runs(
+        base + 500,
+        5,
+        &locks_per_writer(9, LakeLocks::without_global_lock),
+    );
+    assert!(lost > 0, "a replace beside 8 new runs lost no COMMIT");
+}
+
+/// Writers in one process share its two lock sessions and its queue: replaces and
+/// new runs, more of them than there are sessions, all register.
+#[test]
+#[serial_test::serial]
+#[cfg(feature = "integration")]
+fn writers_sharing_one_process_lake_locks_all_register() {
+    prepare_amplicon_and_assembly_tables();
+    let base = 980_000_000 + (std::process::id() as i64 % 1000) * 1000;
+    seed_amplicon_run(base, base);
+    seed_amplicon_run(base + 1, base + 1);
+    // Two replaces, of the two seeded runs, and four new runs.
+    let payloads: Vec<_> = (0..6)
+        .map(|i| amplicon_membership_payload(base + i, 1, base + 10 + i))
+        .collect();
+    let shared = [LakeLocks::new(crate::test_catalog::connstr())];
+    let outcomes = register_together(&payloads, &shared);
+    for (i, outcome) in outcomes.iter().enumerate() {
+        let registration = outcome
+            .as_ref()
+            .unwrap_or_else(|e| panic!("writer {i}: {e:?}"));
+        assert_eq!(registration.attempt, 0, "writer {i} lost a COMMIT");
+        assert_eq!(registration.replaced.is_empty(), i >= 2, "writer {i}");
+    }
+}
+
+/// A session that holds the global lock is refused run locks, which another
+/// session could hold while it waits for the global lock.
+#[test]
+#[serial_test::serial]
+#[cfg(feature = "integration")]
+fn a_session_holding_the_global_lock_is_refused_run_locks() {
+    let locks = LakeLocks::new(crate::test_catalog::connstr());
+    let mut session = locks.session("the test session").unwrap();
+    session.lock_global_shared().unwrap();
+    let refused = session
+        .lock_keys(&[1])
+        .expect_err("run locks were taken after the global lock");
+    assert_eq!(
+        refused.code(),
+        tonic::Code::Internal,
+        "{}",
+        refused.message()
+    );
 }

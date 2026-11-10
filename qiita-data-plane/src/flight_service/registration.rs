@@ -22,9 +22,7 @@ impl QiitaFlightService {
         let payload =
             self.verify_action_payload(action, auth::verify_action, |p| p.action.as_str())?;
 
-        // Moves files, then runs one DuckLake transaction. Each phase checks out its
-        // own writer, so a wait for a lake lock between them holds no pooled
-        // connection.
+        // Each phase of `register_files` checks out a writer of its own.
         let data_path = self.pool.data_path().to_string();
         let scratch_root = self.scratch_root.clone();
         let pool = std::sync::Arc::clone(&self.pool);
@@ -87,9 +85,8 @@ impl QiitaFlightService {
 /// rule that picked per `chunk_index` from rows already in the lake could,
 /// since nothing there records which load a chunk came from.
 ///
-/// Writers of these tables also SERIALIZE against each other, on
-/// `registration_lock`. Why the replace alone does not suffice is at the site
-/// that takes it — `register_files`' transaction.
+/// Writers of these tables are also ordered against each other by
+/// `crate::lake_locks`; `register_files` says which locks each takes.
 ///
 /// `assembly_membership` / `bin_quality` are keyed on `(prep_sample_idx,
 /// processing_idx)` instead. A second `long-read-assembly` run over a prep_sample
@@ -109,16 +106,13 @@ const REPLACE_KEY_TABLES: &[ReplaceKey] = &[
     ReplaceKey::own("reference_sequence_chunks", &["feature_idx"]),
     ReplaceKey::own("assembled_sequence", &["feature_idx"]),
     ReplaceKey::own("assembled_sequence_chunks", &["feature_idx"]),
-    ReplaceKey::own(
-        "assembly_membership",
-        &["prep_sample_idx", "processing_idx"],
-    ),
+    ReplaceKey::own("assembly_membership", RUN_KEY),
     ReplaceKey::borrows("bin_quality", "assembly_membership"),
     // The myloasm provenance tables (`ducklake::ensure_myloasm_tables`), keyed
     // like assembly_membership and for the same reason. All six read their keys
     // from `myloasm_run`; why that table is never empty is at
     // `qiita_common.myloasm_constants.MYLOASM_RUN_TABLE`.
-    ReplaceKey::own("myloasm_run", &["prep_sample_idx", "processing_idx"]),
+    ReplaceKey::own("myloasm_run", RUN_KEY),
     ReplaceKey::borrows("myloasm_contig", "myloasm_run"),
     ReplaceKey::borrows("myloasm_layout", "myloasm_run"),
     ReplaceKey::borrows("myloasm_mapping", "myloasm_run"),
@@ -128,10 +122,7 @@ const REPLACE_KEY_TABLES: &[ReplaceKey] = &[
     // derives the whole run's rows from its own workspace and never reads the lake
     // back, and a re-run resolves to the same processing_idx, so a --force resubmit
     // replaces rather than doubling the counts.
-    ReplaceKey::own(
-        "amplicon_membership",
-        &["prep_sample_idx", "processing_idx"],
-    ),
+    ReplaceKey::own("amplicon_membership", RUN_KEY),
     // amplicon's ASV sequences, twins of the assembled_sequence tables: keyed on
     // feature_idx, replaced (not appended) so a re-load of the same ASV converges.
     ReplaceKey::own("amplicon_sequence", &["feature_idx"]),
@@ -177,7 +168,7 @@ impl ReplaceKey {
     const fn borrows(table: &'static str, key_source: &'static str) -> Self {
         Self {
             table,
-            key: &["prep_sample_idx", "processing_idx"],
+            key: RUN_KEY,
             key_source,
         }
     }
@@ -382,8 +373,8 @@ fn lake_commit_backoff(attempt: u32, salt: i64) -> std::time::Duration {
     base + std::time::Duration::from_millis(offset)
 }
 
-/// Take the lock that serializes writers of the replace-keyed tables. Call
-/// inside an open transaction; see `register_files` for why.
+/// Bump `registration_lock`, the one-row table every transaction that deletes
+/// from a replace-keyed table updates. Call inside an open transaction.
 pub(super) fn take_registration_lock(conn: &LakeWriter) -> Result<(), Status> {
     let locked = conn
         .execute(
@@ -391,13 +382,11 @@ pub(super) fn take_registration_lock(conn: &LakeWriter) -> Result<(), Status> {
             [],
         )
         .map_err(|e| Status::internal(format!("failed to take the registration lock: {e}")))?;
-    // An UPDATE matching no row succeeds and locks nothing, so the serialization
-    // would be silently absent and the symptom would be the duplication it exists
-    // to prevent. `ensure_registration_lock` seeds the row at boot.
+    // An UPDATE matching no row succeeds and changes nothing.
+    // `ensure_registration_lock` seeds the row at boot.
     if locked == 0 {
         return Err(Status::internal(
-            "qiita_lake.registration_lock holds no row, so concurrent lake writers \
-             would not serialize",
+            "qiita_lake.registration_lock holds no row",
         ));
     }
     Ok(())
@@ -413,8 +402,11 @@ pub(super) fn take_registration_lock(conn: &LakeWriter) -> Result<(), Status> {
 /// retry, and is surfaced immediately.
 ///
 /// `body` must therefore be idempotent across attempts — each one re-reads a
-/// fresh snapshot after DuckLake rolled the last one back. `salt` only spreads
-/// the backoff (see `lake_commit_backoff`).
+/// fresh snapshot after DuckLake rolled the last one back. It is given the
+/// attempt's number, from 0, and returns its value with a detail string. Each
+/// attempt logs one `lake-write:` line naming `what`, `subject` (the ticket or
+/// reference it writes for), the attempt, its outcome and that detail. `salt`
+/// only spreads the backoff (see `lake_commit_backoff`).
 ///
 /// A COMMIT that reports an error may still have landed: when the catalog's
 /// connection drops after Postgres committed, before its answer arrives, the
@@ -743,18 +735,16 @@ fn register_files<W: std::borrow::Borrow<LakeWriter>>(
     // doubt, so the call can be made again with the same payload.
     //
     // Registrations that touch a replace-keyed table are ordered by the lake locks
-    // taken below (`crate::lake_locks` carries what DuckLake detects as a conflict,
-    // measured), and retry when they lose a COMMIT anyway. Those that delete also
-    // bump `registration_lock`; on ducklake 417a9117 their deletes conflict
-    // without it (8 writers of one new feature left 1 copy with or without the
-    // row), and whether the row can go is open.
+    // taken below, and retry when they lose a COMMIT anyway. Those that delete also
+    // bump `registration_lock` (`take_registration_lock`).
     //
     // The loser's work is fully re-runnable — its files are already at the paths
     // `lake_dest_filename` minted and the delete+add is idempotent against whatever
     // snapshot it re-reads — so it retries here rather than failing the ticket.
     //
-    // Registrations touching none of those tables (read_mask, alignment) skip the
-    // lock and so never contend.
+    // Registrations touching none of those tables (read_mask, alignment) take no
+    // lake lock.
+    //
     // Which tables this registration replaces by key, and the files whose keys
     // each delete reads — its own, plus its `key_source`'s where the two differ
     // and that table is in this registration too. Loop-invariant, so it is built
@@ -789,13 +779,13 @@ fn register_files<W: std::borrow::Borrow<LakeWriter>>(
     // moved files go back to staging and a redrive starts over.
     let unmove = |e: Status| return_to_staging(&placed, e, Ok(Ledgered::Nothing));
     let subject = format!("work_ticket_idx={}", payload.work_ticket_idx);
-    // Writers of a replace-keyed table take `crate::lake_locks` locks, waited for
-    // with no pooled connection held. Each run's own lock serializes the writers
-    // of that run. When every table is run-keyed and the lake holds none of the
-    // runs yet, the replace would delete nothing, so the registration only
-    // inserts, and inserts do not conflict with each other; otherwise it also
-    // waits for the global lock, since a delete conflicts with every concurrent
-    // insert into its table.
+    // Writers of a replace-keyed table take `crate::lake_locks` locks (which says
+    // why, and what DuckLake counts as a conflict). Each run's own lock serializes
+    // the writers of that run. When every table is run-keyed and the lake holds
+    // none of the runs yet, the replace would delete nothing, so the registration
+    // only inserts and holds the global lock shared; otherwise it deletes and
+    // holds it exclusively. The writer that checked is returned before that wait,
+    // so the wait holds no pooled connection.
     let run_keys = if takes_lock {
         run_lock_keys(conn, &incoming).map_err(unmove)?
     } else {
@@ -812,15 +802,14 @@ fn register_files<W: std::borrow::Borrow<LakeWriter>>(
         let checked = checkout().map_err(unmove)?;
         insert_only = incoming.iter().all(|(entry, _)| entry.key == RUN_KEY)
             && incoming_keys_absent(checked.borrow(), &incoming).map_err(unmove)?;
-        let committing = if insert_only {
-            checked
+        drop(checked);
+        if insert_only {
+            held.lock_global_shared().map_err(unmove)?;
         } else {
-            drop(checked);
             held.lock_global().map_err(unmove)?;
-            checkout().map_err(unmove)?
-        };
+        }
         session = Some(held);
-        committing
+        checkout().map_err(unmove)?
     } else {
         preparing
     };

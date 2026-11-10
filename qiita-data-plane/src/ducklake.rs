@@ -79,7 +79,7 @@ pub fn setup_catalog(
     data_path: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let lock = crate::lake_locks::open_lock_connection(catalog_connstr, BOOT_SETUP_BUDGET)?;
-    crate::lake_locks::advisory_lock(&lock, CATALOG_SETUP_LOCK_KEY).map_err(|e| {
+    crate::lake_locks::advisory_lock(&lock, CATALOG_SETUP_LOCK_KEY, false).map_err(|e| {
         format!(
             "waited up to {} s for another data plane's catalog setup lock: {e}",
             BOOT_SETUP_BUDGET.as_secs()
@@ -1091,16 +1091,14 @@ pub fn ensure_amplicon_tables(conn: &Connection) -> Result<(), Box<dyn std::erro
     Ok(())
 }
 
-/// Create the one row the lake writers that take `registration_lock` serialize
-/// on, and seed it.
+/// Create the one row that the lake writers which delete from a replace-keyed
+/// table update, and seed it.
 ///
-/// Why a lock is needed at all, and what it buys, lives where it is taken —
-/// `flight_service::registration::register_files` and
-/// `flight_service::lake_edit::delete_reference`, both through `take_registration_lock`.
-/// What matters here is the shape: EXACTLY ONE
-/// row, holding a value nothing reads. `take_registration_lock` fails loudly if
-/// its UPDATE matches no row, because a lock that silently stopped locking
-/// reintroduces the duplication this table exists to prevent.
+/// They update it through `flight_service::registration::take_registration_lock`,
+/// from `register_files` and `flight_service::lake_edit::delete_reference`; what
+/// orders those writers is `crate::lake_locks`. The shape is EXACTLY ONE row,
+/// holding a value nothing reads. `take_registration_lock` fails if its UPDATE
+/// matches no row.
 ///
 /// The seeding INSERT is guarded so a restart does not add a second row. Two data
 /// planes booting together could still both insert; that degrades nothing — an
