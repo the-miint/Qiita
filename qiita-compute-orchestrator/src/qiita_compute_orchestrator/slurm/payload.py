@@ -163,8 +163,9 @@ def _build_native_script(*, module: str, python: str) -> str:
     # UMask (deploy/systemd/qiita-compute-orchestrator.service.d/umask.conf),
     # which creates $QIITA_OUTPUT_PATH itself. The umask covers everything the
     # job creates, including the per-sample reads-staging tree outside the
-    # output path, so "other" loses read on new files and directories there;
-    # every service account is in qiita-pipeline. On success the launcher sets
+    # output path, so "other" loses read on new files and directories there.
+    # No reader of that tree relies on "other": every service account that
+    # reads it is in qiita-pipeline. On success the launcher sets
     # each file under $QIITA_OUTPUT_PATH to EXPECTED_FILE_MODE (slurm/contract.py).
     cmd = (
         "umask 0007\n"
