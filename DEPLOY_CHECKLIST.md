@@ -23,7 +23,7 @@ _None yet._
 
 ### 3. Migrations
 
-- `[operator]` (#TBD) `make migrate` applies `20261110000000_block_rearmed_at.sql` (nullable `rearmed_at` on `qiita.block`, which `rerun-block` sets and abandon-plan reads; no row changes).
+- `[operator]` (#855) `make migrate` applies `20261110000000_block_rearmed_at.sql` (nullable `rearmed_at` on `qiita.block`, which `rerun-block` sets and abandon-plan reads; no row changes).
 
 ### 4. Deploy
 

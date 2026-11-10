@@ -1,7 +1,7 @@
 ### Added
 
 - **A finished align block can be re-run, and rows no gate tracks can be deleted
-  (#TBD).** `POST /api/v1/alignment-definition/{idx}/rerun-block` re-arms one
+  (#855).** `POST /api/v1/alignment-definition/{idx}/rerun-block` re-arms one
   completed align block ticket: it deletes the ticket's step rows, sets the block and
   the gates it covers back to `pending`, and dispatches it, so the align workflow
   replaces that block's rows and reconcile completes the gates again. It refuses
