@@ -1,7 +1,7 @@
 ### Fixed
 
 - **Registration removes the staged copy of a file a native job wrote into a subdirectory
-  (#TBD).** Native SLURM jobs now run with umask `0007`, so a directory a job creates
+  (#846).** Native SLURM jobs now run with umask `0007`, so a directory a job creates
   under its output path is group-writable and the data plane can unlink each file it
   moves into the lake. Before, those directories came out `2755`; the move succeeded,
   the unlink failed with `Permission denied`, and the staged copy stayed in the ticket
