@@ -12,6 +12,34 @@ use crate::flight_service::test_support::{
     attached_conn, attached_writer, catalog_that_loses_a_commit_answer, setup_full_lake,
 };
 
+/// `register_files` on one writer for both of its phases, with this test's own
+/// lake locks: the test catalog's, or none at all for a test whose payload stops
+/// before it would take one.
+fn register_files_with(
+    conn: &LakeWriter,
+    data_path: &str,
+    scratch_root: &std::path::Path,
+    payload: &auth::ActionPayload,
+) -> Result<Registration, Status> {
+    register_files(
+        &|| Ok(conn),
+        &test_locks(),
+        data_path,
+        scratch_root,
+        payload,
+    )
+}
+
+#[cfg(feature = "integration")]
+fn test_locks() -> LakeLocks {
+    LakeLocks::new(crate::test_catalog::connstr())
+}
+
+#[cfg(not(feature = "integration"))]
+fn test_locks() -> LakeLocks {
+    LakeLocks::new(String::new())
+}
+
 // Regression (data-plane lake-file placement): when `register_files`
 // moves an externally-produced Parquet into managed lake storage, it must
 // NEVER overwrite a file already present there. The reference-load job
@@ -316,7 +344,7 @@ fn register_files_rejects_filename_traversal() {
             files,
             work_ticket_idx: 1,
         };
-        let err = register_files(
+        let err = register_files_with(
             &unattached_writer(),
             "unused-data-path",
             std::path::Path::new("/"),
@@ -617,7 +645,7 @@ fn register_files_moves_and_registers_end_to_end() {
         work_ticket_idx: ticket,
     };
 
-    let outcome = register_files(
+    let outcome = register_files_with(
         &attached_writer(&connstr, &data_path),
         &data_path,
         std::path::Path::new("/"),
@@ -755,14 +783,14 @@ fn register_files_replayed_after_it_completed_registers_nothing_again() {
     prepare_membership_table(&connstr, &data_path, ref_idx);
     let (_staging, payload) = seed_membership_registration(ref_idx, ticket);
 
-    let first = register_files(
+    let first = register_files_with(
         &attached_writer(&connstr, &data_path),
         &data_path,
         std::path::Path::new("/"),
         &payload,
     )
     .expect("first register_files failed");
-    let replay = register_files(
+    let replay = register_files_with(
         &attached_writer(&connstr, &data_path),
         &data_path,
         std::path::Path::new("/"),
@@ -801,7 +829,7 @@ fn register_files_replayed_before_the_earlier_call_committed_fails_closed() {
     ));
     move_file(&staging.path().join("reference_membership.parquet"), &dest).unwrap();
 
-    let err = register_files(
+    let err = register_files_with(
         &attached_writer(&connstr, &data_path),
         &data_path,
         std::path::Path::new("/"),
@@ -830,7 +858,7 @@ fn register_files_replayed_after_its_rows_were_deleted_registers_nothing() {
         let ticket: i64 = ref_idx * 1000 + std::process::id() as i64;
         prepare_membership_table(&connstr, &data_path, ref_idx);
         let (_staging, payload) = seed_membership_registration(ref_idx, ticket);
-        let first = register_files(
+        let first = register_files_with(
             &attached_writer(&connstr, &data_path),
             &data_path,
             std::path::Path::new("/"),
@@ -844,7 +872,7 @@ fn register_files_replayed_after_its_rows_were_deleted_registers_nothing() {
         ))
         .unwrap();
 
-        let replay = register_files(
+        let replay = register_files_with(
             &attached_writer(&connstr, &data_path),
             &data_path,
             std::path::Path::new("/"),
@@ -894,7 +922,7 @@ fn register_files_replayed_after_lake_gc_removed_its_files_registers_nothing() {
         let (staging, payload) = seed_membership_registration(ref_idx, ticket);
         let staged = staging.path().join("reference_membership.parquet");
         let staged_bytes = std::fs::read(&staged).unwrap();
-        let first = register_files(
+        let first = register_files_with(
             &attached_writer(&connstr, &data_path),
             &data_path,
             std::path::Path::new("/"),
@@ -913,7 +941,7 @@ fn register_files_replayed_after_lake_gc_removed_its_files_registers_nothing() {
             std::fs::write(&staged, &staged_bytes).unwrap();
         }
 
-        let replay = register_files(
+        let replay = register_files_with(
             &attached_writer(&connstr, &data_path),
             &data_path,
             std::path::Path::new("/"),
@@ -942,7 +970,7 @@ fn register_files_replayed_after_a_registration_the_ledger_never_recorded_regist
     let ticket: i64 = 987_000_000 + std::process::id() as i64;
     prepare_membership_table(&connstr, &data_path, ref_idx);
     let (_staging, payload) = seed_membership_registration(ref_idx, ticket);
-    let first = register_files(
+    let first = register_files_with(
         &attached_writer(&connstr, &data_path),
         &data_path,
         std::path::Path::new("/"),
@@ -957,7 +985,7 @@ fn register_files_replayed_after_a_registration_the_ledger_never_recorded_regist
     )
     .unwrap();
 
-    let replay = register_files(
+    let replay = register_files_with(
         &attached_writer(&connstr, &data_path),
         &data_path,
         std::path::Path::new("/"),
@@ -996,7 +1024,7 @@ fn register_files_with_its_payload_partly_in_the_ledger_fails_closed() {
             "second.parquet".to_string(),
             "reference_membership".to_string(),
         );
-        let first = register_files(
+        let first = register_files_with(
             &attached_writer(&connstr, &data_path),
             &data_path,
             std::path::Path::new("/"),
@@ -1019,7 +1047,7 @@ fn register_files_with_its_payload_partly_in_the_ledger_fails_closed() {
             .unwrap();
         }
 
-        let err = register_files(
+        let err = register_files_with(
             &attached_writer(&connstr, &data_path),
             &data_path,
             std::path::Path::new("/"),
@@ -1126,7 +1154,7 @@ fn register_files_that_fails_after_its_moves_returns_the_files_to_staging() {
         ))
         .unwrap();
 
-    let err = register_files(
+    let err = register_files_with(
         &attached_writer(&connstr, &data_path),
         &data_path,
         std::path::Path::new("/"),
@@ -1148,7 +1176,7 @@ fn register_files_that_fails_after_its_moves_returns_the_files_to_staging() {
 
     // The same payload, with the file fixed in staging, registers.
     std::fs::write(&good, good_bytes).unwrap();
-    register_files(
+    register_files_with(
         &attached_writer(&connstr, &data_path),
         &data_path,
         std::path::Path::new("/"),
@@ -1188,7 +1216,7 @@ fn register_files_fails_closed_on_a_destination_there_before_it_moves() {
     std::fs::create_dir_all(taken.parent().unwrap()).unwrap();
     std::fs::write(&taken, b"not ours").unwrap();
 
-    let err = register_files(
+    let err = register_files_with(
         &attached_writer(&connstr, &data_path),
         &data_path,
         std::path::Path::new("/"),
@@ -1260,7 +1288,7 @@ fn register_files_whose_commit_answer_is_lost_registers_once() {
     let (_staging, payload) = seed_membership_registration(ref_idx, ticket);
     let (proxied, cut) = catalog_that_loses_a_commit_answer(&connstr);
 
-    let registration = register_files(
+    let registration = register_files_with(
         &attached_writer(&proxied, &data_path),
         &data_path,
         std::path::Path::new("/"),
@@ -1289,7 +1317,7 @@ fn a_failed_registration_the_ledger_records_whole_is_answered_as_committed() {
     prepare_membership_table(&connstr, &data_path, ref_idx);
     let (staging, payload) = seed_membership_registration(ref_idx, ticket);
     let writer = attached_writer(&connstr, &data_path);
-    let committed = register_files(&writer, &data_path, std::path::Path::new("/"), &payload)
+    let committed = register_files_with(&writer, &data_path, std::path::Path::new("/"), &payload)
         .expect("register_files failed");
     let placed: Vec<PlacedFile> = committed
         .registered
@@ -1334,7 +1362,7 @@ fn ducklake_add_data_files_accepts_a_path_it_already_holds() {
     let ticket: i64 = ref_idx;
     prepare_membership_table(&connstr, &data_path, ref_idx);
     let (_staging, payload) = seed_membership_registration(ref_idx, ticket);
-    let first = register_files(
+    let first = register_files_with(
         &attached_writer(&connstr, &data_path),
         &data_path,
         std::path::Path::new("/"),
@@ -1366,7 +1394,7 @@ fn delete_then_reregister(
 ) -> Vec<tempfile::TempDir> {
     prepare_membership_table(connstr, data_path, ref_idx);
     let (first_dir, first) = seed_membership_registration(ref_idx, ref_idx * 10);
-    register_files(
+    register_files_with(
         &attached_writer(connstr, data_path),
         data_path,
         std::path::Path::new("/"),
@@ -1382,7 +1410,7 @@ fn delete_then_reregister(
         )
         .unwrap();
     let (second_dir, second) = seed_membership_registration(ref_idx, ref_idx * 10 + 1);
-    register_files(
+    register_files_with(
         &attached_writer(connstr, data_path),
         data_path,
         std::path::Path::new("/"),
@@ -1463,7 +1491,7 @@ fn ducklake_read_after_a_failed_commit_sees_the_current_catalog() {
     let delete = "DELETE FROM qiita_lake.reference_membership WHERE reference_idx = ?";
     prepare_membership_table(&connstr, &data_path, ref_idx);
     let (_first_dir, first) = seed_membership_registration(ref_idx, ref_idx * 10);
-    register_files(
+    register_files_with(
         &attached_writer(&connstr, &data_path),
         &data_path,
         std::path::Path::new("/"),
@@ -1478,7 +1506,7 @@ fn ducklake_read_after_a_failed_commit_sees_the_current_catalog() {
         .execute(delete, [ref_idx])
         .unwrap();
     let (_second_dir, second) = seed_membership_registration(ref_idx, ref_idx * 10 + 1);
-    let committed = register_files(
+    let committed = register_files_with(
         &attached_writer(&connstr, &data_path),
         &data_path,
         std::path::Path::new("/"),
@@ -1631,7 +1659,7 @@ fn register_files_replaces_shared_contigs_across_assembly_runs() {
             &["ACGTACGT", "ACGT"],
         ),
     ]);
-    let outcome_a = register_files(
+    let outcome_a = register_files_with(
         &attached_writer(&connstr, &data_path),
         &data_path,
         std::path::Path::new("/"),
@@ -1653,7 +1681,7 @@ fn register_files_replaces_shared_contigs_across_assembly_runs() {
         ),
         (b_only, "00000000-0000-0000-0000-000000971012", &["ACGT"]),
     ]);
-    let outcome_b = register_files(
+    let outcome_b = register_files_with(
         &attached_writer(&connstr, &data_path),
         &data_path,
         std::path::Path::new("/"),
@@ -1760,7 +1788,7 @@ fn register_files_re_registering_the_same_contigs_does_not_accumulate() {
     )];
     for attempt in 0..3 {
         let staging = seed_assembly_staging(contigs);
-        register_files(
+        register_files_with(
             &attached_writer(&connstr, &data_path),
             &data_path,
             std::path::Path::new("/"),
@@ -1841,7 +1869,7 @@ fn register_parquets(
         files,
         work_ticket_idx: ticket,
     };
-    register_files(
+    register_files_with(
         &attached_writer(connstr, data_path),
         data_path,
         std::path::Path::new("/"),
@@ -1849,7 +1877,7 @@ fn register_parquets(
     )
     .unwrap_or_else(|e| {
         let names: Vec<&str> = tables.iter().map(|(table, _)| *table).collect();
-        panic!("register_files({names:?}) failed: {e}")
+        panic!("register_files_with({names:?}) failed: {e}")
     })
 }
 
@@ -2017,7 +2045,7 @@ fn register_read_files(
         files,
         work_ticket_idx: ticket,
     };
-    register_files(
+    register_files_with(
         &attached_writer(connstr, data_path),
         data_path,
         std::path::Path::new("/"),
@@ -2770,7 +2798,8 @@ fn every_content_addressed_lake_table_is_registered() {
 ///
 /// Runs against a lake that does NOT already hold the feature, because
 /// pre-seeding it would make the DELETE conflict and the test would green with
-/// the lock removed.
+/// the lock removed. Runs without the global lake lock, which would otherwise
+/// keep the writers from overlapping at all.
 #[test]
 #[serial_test::serial]
 #[cfg(feature = "integration")]
@@ -2824,8 +2853,10 @@ fn concurrent_registrations_of_one_feature_leave_one_row() {
                     start.wait();
                     // Each writer attaches for itself, as each concurrent
                     // request borrows its own instance in production.
+                    let conn = attached_writer(connstr, data_path);
                     register_files(
-                        &attached_writer(connstr, data_path),
+                        &|| Ok(&conn),
+                        &LakeLocks::without_global_lock(connstr.clone()),
                         data_path,
                         std::path::Path::new("/"),
                         payload,
@@ -2941,7 +2972,7 @@ fn register_files_replaces_sequences_shared_across_references() {
             files,
             work_ticket_idx: ticket,
         };
-        let outcome = register_files(
+        let outcome = register_files_with(
             &attached_writer(&connstr, &data_path),
             &data_path,
             std::path::Path::new("/"),
@@ -3062,4 +3093,291 @@ fn register_ducklake_add_data_files_rolls_back_within_transaction() {
         "ROLLBACK must unwind the registration — the wrap in register_files \
          is only atomic if DuckLake honors the enclosing transaction"
     );
+}
+
+/// An amplicon run's `amplicon_membership` alone, staged for registration: the
+/// one run-keyed table with no feature-keyed table beside it in the payload.
+#[cfg(feature = "integration")]
+fn amplicon_membership_payload(
+    prep_sample_idx: i64,
+    processing_idx: i64,
+    ticket: i64,
+) -> (tempfile::TempDir, auth::ActionPayload) {
+    let staging = tempfile::tempdir().unwrap();
+    Connection::open_in_memory()
+        .unwrap()
+        .execute_batch(&format!(
+            "COPY (SELECT {prep_sample_idx}::BIGINT AS prep_sample_idx, \
+                    {processing_idx}::BIGINT AS processing_idx, \
+                    range::BIGINT AS feature_idx, 1::BIGINT AS count FROM range(3)) \
+             TO '{}' (FORMAT PARQUET)",
+            staging.path().join("amplicon_membership.parquet").display()
+        ))
+        .unwrap();
+    let payload = auth::ActionPayload {
+        action: "register_files".to_string(),
+        staging_dir: staging.path().to_str().unwrap().to_string(),
+        files: [(
+            "amplicon_membership.parquet".to_string(),
+            "amplicon_membership".to_string(),
+        )]
+        .into_iter()
+        .collect(),
+        work_ticket_idx: ticket,
+    };
+    (staging, payload)
+}
+
+/// Register every payload at once, each writer on its own connection and the
+/// `locks` it is given, released together from a barrier.
+#[cfg(feature = "integration")]
+fn register_together(
+    payloads: &[(tempfile::TempDir, auth::ActionPayload)],
+    locks: impl Fn() -> LakeLocks + Sync,
+) -> Vec<Result<Registration, Status>> {
+    let connstr = crate::test_catalog::connstr();
+    let data_path = crate::test_catalog::data_path();
+    let start = std::sync::Barrier::new(payloads.len());
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = payloads
+            .iter()
+            .map(|(_staging, payload)| {
+                let (connstr, data_path, start, locks) = (&connstr, &data_path, &start, &locks);
+                scope.spawn(move || {
+                    let conn = attached_writer(connstr, data_path);
+                    let locks = locks();
+                    start.wait();
+                    register_files(
+                        &|| Ok(&conn),
+                        &locks,
+                        data_path,
+                        std::path::Path::new("/"),
+                        payload,
+                    )
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    })
+}
+
+#[cfg(feature = "integration")]
+fn prepare_amplicon_and_assembly_tables() {
+    let conn = Connection::open_in_memory().unwrap();
+    ducklake::connect_ducklake(
+        &conn,
+        &crate::test_catalog::connstr(),
+        &crate::test_catalog::data_path(),
+    )
+    .unwrap();
+    ducklake::ensure_assembly_tables(&conn).unwrap();
+    ducklake::ensure_amplicon_tables(&conn).unwrap();
+    ducklake::ensure_registration_lock(&conn).unwrap();
+    ducklake::ensure_registered_file_table(&conn).unwrap();
+}
+
+/// Writers that delete from a replace-keyed table hold the global lake lock, so
+/// none loses a COMMIT to another; without it, the same writers do.
+///
+/// Each loads a feature of its own that the lake does not hold: what they share
+/// is only the table, which is where DuckLake detects the conflict.
+#[test]
+#[serial_test::serial]
+#[cfg(feature = "integration")]
+fn writers_that_delete_commit_at_the_first_attempt_under_the_global_lock() {
+    prepare_amplicon_and_assembly_tables();
+    let connstr = crate::test_catalog::connstr();
+    let base_ticket: i64 = 974_000_000 + std::process::id() as i64 * 100;
+    let payloads =
+        |base_feature: i64, ticket: i64| -> Vec<(tempfile::TempDir, auth::ActionPayload)> {
+            (0..8)
+                .map(|i| {
+                    let feature = base_feature + i;
+                    let staging = seed_assembly_staging(&[(
+                        feature,
+                        &format!("00000000-0000-0000-0000-{feature:012}"),
+                        &["ACGTACGT", "ACGT"],
+                    )]);
+                    let payload = assembly_register_payload(&staging, 1, ticket + i);
+                    (staging, payload)
+                })
+                .collect()
+        };
+    let feature_base = 974_100_000 + (std::process::id() as i64 % 1000) * 100;
+
+    let locked = register_together(&payloads(feature_base, base_ticket), || {
+        LakeLocks::new(connstr.clone())
+    });
+    let lost: u32 = locked
+        .iter()
+        .map(|r| {
+            r.as_ref()
+                .expect("a writer under the global lock failed")
+                .attempt
+        })
+        .sum();
+    assert_eq!(
+        lost, 0,
+        "writers holding the global lock lost {lost} COMMITs"
+    );
+
+    let unlocked = register_together(&payloads(feature_base + 50, base_ticket + 50), || {
+        LakeLocks::without_global_lock(connstr.clone())
+    });
+    let lost: u32 = unlocked
+        .iter()
+        .map(|r| {
+            r.as_ref()
+                .expect("a writer without the global lock failed")
+                .attempt
+        })
+        .sum();
+    assert!(lost > 0, "8 overlapping writers that delete lost no COMMIT");
+}
+
+/// Registrations of runs the lake does not hold yet only insert, take no global
+/// lock, and do not conflict: they commit at the first attempt while the global
+/// lock is held elsewhere, which would time out any of them that waited for it.
+#[test]
+#[serial_test::serial]
+#[cfg(feature = "integration")]
+fn new_runs_register_without_the_global_lock() {
+    prepare_amplicon_and_assembly_tables();
+    let connstr = crate::test_catalog::connstr();
+    let base = 975_000_000 + std::process::id() as i64 * 100;
+    let payloads: Vec<_> = (0..8)
+        .map(|i| amplicon_membership_payload(base + i, 1, base + i))
+        .collect();
+
+    let holder = LakeLocks::new(connstr.clone());
+    let mut held = holder.session("the test holder").unwrap();
+    held.lock_global().unwrap();
+    let outcomes = register_together(&payloads, || {
+        LakeLocks::with_budget(connstr.clone(), std::time::Duration::from_millis(500))
+    });
+    drop(held);
+
+    for (i, outcome) in outcomes.iter().enumerate() {
+        let registration = outcome
+            .as_ref()
+            .unwrap_or_else(|e| panic!("writer {i}: {e:?}"));
+        assert_eq!(registration.attempt, 0, "writer {i} lost a COMMIT");
+    }
+}
+
+/// Concurrent registrations of the same new run leave one copy of it: its run
+/// lock lets one in first, and the others then find the run held and replace it.
+#[test]
+#[serial_test::serial]
+#[cfg(feature = "integration")]
+fn concurrent_registrations_of_one_new_run_leave_one_copy() {
+    prepare_amplicon_and_assembly_tables();
+    let connstr = crate::test_catalog::connstr();
+    let prep = 976_000_000 + std::process::id() as i64;
+    let payloads: Vec<_> = (0..4)
+        .map(|i| amplicon_membership_payload(prep, 7, prep * 10 + i))
+        .collect();
+
+    let outcomes = register_together(&payloads, || LakeLocks::new(connstr.clone()));
+    for (i, outcome) in outcomes.iter().enumerate() {
+        assert!(outcome.is_ok(), "writer {i}: {:?}", outcome.as_ref().err());
+    }
+    let reader = attached_conn(&connstr, &crate::test_catalog::data_path());
+    let rows: i64 = reader
+        .query_row(
+            "SELECT count(*) FROM qiita_lake.amplicon_membership \
+             WHERE prep_sample_idx = ? AND processing_idx = 7",
+            [prep],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        rows, 3,
+        "4 concurrent loads of one run, one copy of its 3 rows"
+    );
+}
+
+/// A registration that gives up waiting for its lake lock puts its moved files
+/// back in staging, so the step can be run again once the lock is free.
+#[test]
+#[serial_test::serial]
+#[cfg(feature = "integration")]
+fn a_lock_wait_that_times_out_returns_the_files_to_staging() {
+    prepare_amplicon_and_assembly_tables();
+    let connstr = crate::test_catalog::connstr();
+    let data_path = crate::test_catalog::data_path();
+    let feature = 977_000_000 + std::process::id() as i64;
+    let staging = seed_assembly_staging(&[(
+        feature,
+        &format!("00000000-0000-0000-0000-{feature:012}"),
+        &["ACGTACGT", "ACGT"],
+    )]);
+    let payload = assembly_register_payload(&staging, 1, feature);
+    let conn = attached_writer(&connstr, &data_path);
+
+    let holder = LakeLocks::new(connstr.clone());
+    let mut held = holder.session("the test holder").unwrap();
+    held.lock_global().unwrap();
+    let refused = register_files(
+        &|| Ok(&conn),
+        &LakeLocks::with_budget(connstr.clone(), std::time::Duration::from_millis(500)),
+        &data_path,
+        std::path::Path::new("/"),
+        &payload,
+    )
+    .expect_err("a registration got the global lock while it was held");
+    assert_eq!(
+        refused.code(),
+        tonic::Code::Unavailable,
+        "{}",
+        refused.message()
+    );
+    assert!(
+        refused.message().contains("moved back to staging"),
+        "{}",
+        refused.message()
+    );
+    for filename in payload.files.keys() {
+        assert!(
+            staging.path().join(filename).exists(),
+            "{filename} is not back in staging"
+        );
+    }
+
+    drop(held);
+    let registration = register_files(
+        &|| Ok(&conn),
+        &LakeLocks::new(connstr.clone()),
+        &data_path,
+        std::path::Path::new("/"),
+        &payload,
+    )
+    .expect("the run again once the lock is free");
+    assert_eq!(registration.registered.len(), payload.files.len());
+}
+
+/// A second session waiting for the global lock gets it once the first is
+/// released.
+#[test]
+#[serial_test::serial]
+#[cfg(feature = "integration")]
+fn a_session_waiting_for_the_global_lock_gets_it_when_released() {
+    use std::time::{Duration, Instant};
+    let connstr = crate::test_catalog::connstr();
+    let first = LakeLocks::new(connstr.clone());
+    let mut held = first.session("the first holder").unwrap();
+    held.lock_global().unwrap();
+
+    let queued_connstr = connstr.clone();
+    let queued = std::thread::spawn(move || {
+        let second = LakeLocks::new(queued_connstr);
+        let started = Instant::now();
+        let mut session = second.session("the queued taker").unwrap();
+        session.lock_global().map(|()| started.elapsed())
+    });
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(!queued.is_finished(), "the queued taker got a held lock");
+    drop(held);
+    let waited = queued.join().unwrap().unwrap();
+    assert!(waited >= Duration::from_millis(300), "waited {waited:?}");
 }

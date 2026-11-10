@@ -187,6 +187,12 @@ impl LakePool {
         Ok(pool)
     }
 
+    /// The catalog's Postgres connection string, for a lock session
+    /// (`crate::lake_locks`) that connects to the same database outside the pool.
+    pub fn catalog_connstr(&self) -> &str {
+        &self.catalog_connstr
+    }
+
     /// Where DuckLake keeps its Parquet files, for a handler that moves files into
     /// it as well as reading through the connection.
     pub fn data_path(&self) -> &str {

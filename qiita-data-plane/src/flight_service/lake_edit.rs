@@ -24,11 +24,20 @@ impl QiitaFlightService {
             .verify_action_payload(action, auth::verify_delete_reference, |p| p.action.as_str())?;
 
         let reference_idx = payload.reference_idx;
-        let deleted = self
-            .blocking_lake_write("delete_reference", move |conn| {
-                delete_reference(conn, reference_idx)
-            })
-            .await?;
+        // Its deletes conflict with any concurrent insert into those tables, so it
+        // takes the global lake lock first (`crate::lake_locks`), before checking
+        // out a writer, so the wait holds no pooled connection.
+        let pool = std::sync::Arc::clone(&self.pool);
+        let locks = std::sync::Arc::clone(&self.lake_locks);
+        let deleted = tokio::task::spawn_blocking(move || {
+            let mut session = locks.session(&format!(
+                "the reference delete reference_idx={reference_idx}"
+            ))?;
+            session.lock_global()?;
+            delete_reference(&pool.checkout_for_write()?, reference_idx)
+        })
+        .await
+        .map_err(|e| Status::internal(format!("delete_reference task join failed: {e}")))??;
 
         Self::action_response(&deleted)
     }
@@ -242,8 +251,9 @@ fn delete_reference(conn: &LakeWriter, reference_idx: i64) -> Result<serde_json:
     let counts = transact_with_retry(
         conn,
         "the reference delete",
+        &format!("reference_idx={reference_idx}"),
         reference_idx,
-        || {
+        |_attempt| {
             take_registration_lock(conn)?;
             let sequences_deleted = exec(
                 &format!("DELETE FROM qiita_lake.reference_sequences WHERE {orphan_filter}"),
@@ -278,15 +288,18 @@ fn delete_reference(conn: &LakeWriter, reference_idx: i64) -> Result<serde_json:
                 "DELETE FROM qiita_lake.reference_annotation WHERE reference_idx = ?",
                 &[reference_idx],
             )?;
-            Ok(serde_json::json!({
-                "sequences_deleted": sequences_deleted,
-                "chunks_deleted": chunks_deleted,
-                "membership_deleted": membership_deleted,
-                "taxonomy_deleted": taxonomy_deleted,
-                "phylogeny_deleted": phylogeny_deleted,
-                "placements_deleted": placements_deleted,
-                "annotations_deleted": annotations_deleted,
-            }))
+            Ok((
+                serde_json::json!({
+                    "sequences_deleted": sequences_deleted,
+                    "chunks_deleted": chunks_deleted,
+                    "membership_deleted": membership_deleted,
+                    "taxonomy_deleted": taxonomy_deleted,
+                    "phylogeny_deleted": phylogeny_deleted,
+                    "placements_deleted": placements_deleted,
+                    "annotations_deleted": annotations_deleted,
+                }),
+                String::new(),
+            ))
         },
         |_| {
             // The deletes commit together, so none of the reference's rows left in

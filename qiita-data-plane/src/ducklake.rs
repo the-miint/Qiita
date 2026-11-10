@@ -69,46 +69,22 @@ const BOOT_SETUP_BUDGET: std::time::Duration = std::time::Duration::from_secs(60
 /// statements), so each takes `CATALOG_SETUP_LOCK_KEY` first and the setups run
 /// one after another.
 ///
-/// The lock is transaction-scoped and taken inside an open DuckDB transaction on
-/// its own attach: measured with DuckDB 1.5.5, the postgres extension keeps one
-/// Postgres connection for the length of a DuckDB transaction, and sends
-/// `DISCARD ALL` (which drops session advisory locks) when a pooled connection is
-/// returned, so a session lock taken through it is released at once. Postgres
-/// releases the lock when the setup commits, or when the process exits and its
-/// connection closes.
+/// The lock is a transaction-scoped advisory lock on a connection of its own
+/// (`crate::lake_locks::open_lock_connection` says how it is held and released).
+/// A session lock would not do: measured with DuckDB 1.5.5, the postgres extension
+/// sends `DISCARD ALL`, which drops session advisory locks, when a pooled
+/// connection is returned, so a session lock taken through it is released at once.
 pub fn setup_catalog(
     catalog_connstr: &str,
     data_path: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    validate_sql_literal(catalog_connstr, "catalog_connstr")?;
-    let lock = Connection::open_in_memory()?;
-    lock.execute_batch(&format!(
-        "LOAD postgres;
-         ATTACH '{catalog_connstr}' AS catalog_setup_lock (TYPE postgres);
-         BEGIN;"
-    ))?;
-    let deadline = std::time::Instant::now() + BOOT_SETUP_BUDGET;
-    loop {
-        let taken: bool = lock.query_row(
-            &format!(
-                "SELECT taken FROM postgres_query('catalog_setup_lock', \
-                 'SELECT pg_try_advisory_xact_lock({CATALOG_SETUP_LOCK_KEY}) AS taken')"
-            ),
-            [],
-            |row| row.get(0),
-        )?;
-        if taken {
-            break;
-        }
-        if std::time::Instant::now() >= deadline {
-            return Err(format!(
-                "another data plane held the catalog setup lock for {}s",
-                BOOT_SETUP_BUDGET.as_secs()
-            )
-            .into());
-        }
-        std::thread::sleep(std::time::Duration::from_millis(200));
-    }
+    let lock = crate::lake_locks::open_lock_connection(catalog_connstr, BOOT_SETUP_BUDGET)?;
+    crate::lake_locks::advisory_lock(&lock, CATALOG_SETUP_LOCK_KEY).map_err(|e| {
+        format!(
+            "waited up to {} s for another data plane's catalog setup lock: {e}",
+            BOOT_SETUP_BUDGET.as_secs()
+        )
+    })?;
     setup_catalog_once(catalog_connstr, data_path)?;
     lock.execute_batch("COMMIT;")?;
     Ok(())

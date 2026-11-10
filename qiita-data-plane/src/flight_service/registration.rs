@@ -9,6 +9,7 @@ use sha2::{Digest, Sha256};
 use tonic::{Response, Status};
 
 use crate::auth;
+use crate::lake_locks::{run_key, LakeLocks};
 use crate::pool::LakeWriter;
 
 use super::QiitaFlightService;
@@ -21,14 +22,24 @@ impl QiitaFlightService {
         let payload =
             self.verify_action_payload(action, auth::verify_action, |p| p.action.as_str())?;
 
-        // Moves files, then runs one DuckLake transaction.
+        // Moves files, then runs one DuckLake transaction. Each phase checks out its
+        // own writer, so a wait for a lake lock between them holds no pooled
+        // connection.
         let data_path = self.pool.data_path().to_string();
         let scratch_root = self.scratch_root.clone();
-        let registration = self
-            .blocking_lake_write("register_files", move |conn| {
-                register_files(conn, &data_path, &scratch_root, &payload)
-            })
-            .await?;
+        let pool = std::sync::Arc::clone(&self.pool);
+        let locks = std::sync::Arc::clone(&self.lake_locks);
+        let registration = tokio::task::spawn_blocking(move || {
+            register_files(
+                &|| pool.checkout_for_write(),
+                &locks,
+                &data_path,
+                &scratch_root,
+                &payload,
+            )
+        })
+        .await
+        .map_err(|e| Status::internal(format!("register_files task join failed: {e}")))??;
 
         Self::action_response(&serde_json::json!({
             "registered": registration.registered,
@@ -223,6 +234,23 @@ impl ReplaceKey {
 /// string); the file paths are bound parameters, so a basename carrying a quote
 /// cannot reach the SQL text.
 fn replace_key_delete_sql(table: &str, keys: &[&str], n_files: usize) -> String {
+    format!(
+        "DELETE FROM qiita_lake.{table} WHERE {}",
+        incoming_key_filter(keys, n_files)
+    )
+}
+
+/// How many rows of `table` carry a key the incoming files carry: the rows
+/// `replace_key_delete_sql` would delete. Same parameters.
+fn replace_key_count_sql(table: &str, keys: &[&str], n_files: usize) -> String {
+    format!(
+        "SELECT count(*) FROM qiita_lake.{table} WHERE {}",
+        incoming_key_filter(keys, n_files)
+    )
+}
+
+/// `(keys) IN (the distinct keys of n_files read_parquet(?) sources)`.
+fn incoming_key_filter(keys: &[&str], n_files: usize) -> String {
     let key_list = keys.join(", ");
     let incoming_keys = (0..n_files)
         .map(|_| format!("SELECT {key_list} FROM read_parquet(?)"))
@@ -231,10 +259,75 @@ fn replace_key_delete_sql(table: &str, keys: &[&str], n_files: usize) -> String 
     // DISTINCT because a chunk table repeats its key once per 64 KB chunk and a
     // run-scoped table repeats its pair on every row, and that whole multiset
     // would otherwise become the semi-join's build side.
-    format!(
-        "DELETE FROM qiita_lake.{table} WHERE ({key_list}) IN \
-         (SELECT DISTINCT {key_list} FROM ({incoming_keys}))"
-    )
+    format!("({key_list}) IN (SELECT DISTINCT {key_list} FROM ({incoming_keys}))")
+}
+
+/// The key of the run-keyed `REPLACE_KEY_TABLES`: one assembly or amplicon run of
+/// one prep_sample. A registration carries one run, or a few, never thousands, so
+/// it can lock each (`crate::lake_locks::run_key`).
+const RUN_KEY: &[&str] = &["prep_sample_idx", "processing_idx"];
+
+/// The advisory-lock keys of every run the run-keyed `incoming` files carry.
+fn run_lock_keys(
+    conn: &duckdb::Connection,
+    incoming: &[(&'static ReplaceKey, Vec<&str>)],
+) -> Result<Vec<i64>, Status> {
+    let mut keys = Vec::new();
+    for (entry, dests) in incoming.iter().filter(|(entry, _)| entry.key == RUN_KEY) {
+        let sources =
+            vec!["SELECT prep_sample_idx, processing_idx FROM read_parquet(?)"; dests.len()]
+                .join(" UNION ALL ");
+        let params: Vec<&dyn duckdb::ToSql> =
+            dests.iter().map(|d| d as &dyn duckdb::ToSql).collect();
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT DISTINCT prep_sample_idx, processing_idx FROM ({sources})"
+            ))
+            .map_err(|e| {
+                Status::internal(format!("failed to read {}'s run keys: {e}", entry.table))
+            })?;
+        let runs = stmt
+            .query_map(params.as_slice(), |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+            })
+            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
+            .map_err(|e| {
+                Status::internal(format!("failed to read {}'s run keys: {e}", entry.table))
+            })?;
+        keys.extend(
+            runs.into_iter()
+                .map(|(prep, processing)| run_key(entry.key_source, prep, processing)),
+        );
+    }
+    Ok(keys)
+}
+
+/// True when no `incoming` table holds any of the keys its files carry, so the
+/// replace would delete nothing.
+fn incoming_keys_absent(
+    conn: &duckdb::Connection,
+    incoming: &[(&'static ReplaceKey, Vec<&str>)],
+) -> Result<bool, Status> {
+    for (entry, dests) in incoming {
+        let params: Vec<&dyn duckdb::ToSql> =
+            dests.iter().map(|d| d as &dyn duckdb::ToSql).collect();
+        let held: i64 = conn
+            .query_row(
+                &replace_key_count_sql(entry.table, entry.key, dests.len()),
+                params.as_slice(),
+                |r| r.get(0),
+            )
+            .map_err(|e| {
+                Status::internal(format!(
+                    "failed to count {}'s incoming keys: {e}",
+                    entry.table
+                ))
+            })?;
+        if held > 0 {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// How long a lake writer keeps re-running its transaction after a failed COMMIT
@@ -247,9 +340,9 @@ fn replace_key_delete_sql(table: &str, keys: &[&str], n_files: usize) -> String 
 /// UPDATE + replace-by-key DELETE + one `ducklake_add_data_files`, without the
 /// ledger INSERT) takes ~14 ms against a lake that already holds the incoming
 /// keys, ~7 ms when it does not.
-/// Since every writer queues behind one row, that per-transaction cost IS the
-/// queue rate, and this budget covers a queue far longer than a deploy produces.
-/// Those times were taken at the pool's threads, not at the one thread a lake
+/// Writers that delete from a replace-keyed table reach COMMIT one at a time
+/// (`crate::lake_locks`), so this budget bounds the retries of a writer that lost
+/// anyway, not a queue. Those times were taken at the pool's threads, not at the one thread a lake
 /// write runs on (`pool::LakeWriter`); a 50M-row delete transaction measured
 /// 2.00 s at one thread against 1.32 s at six, locally.
 /// The DELETE's share of it is set by the spread of the incoming key set rather
@@ -337,25 +430,40 @@ pub(super) fn take_registration_lock(conn: &LakeWriter) -> Result<(), Status> {
 pub(super) fn transact_with_retry<T>(
     conn: &LakeWriter,
     what: &str,
+    subject: &str,
     salt: i64,
-    mut body: impl FnMut() -> Result<T, Status>,
+    mut body: impl FnMut(u32) -> Result<(T, String), Status>,
     mut landed: impl FnMut(&T) -> Result<bool, Status>,
 ) -> Result<T, Status> {
     let deadline = std::time::Instant::now() + LAKE_COMMIT_BUDGET;
     let mut attempt: u32 = 0;
     loop {
+        let started = std::time::Instant::now();
         conn.execute_batch("BEGIN TRANSACTION")
             .map_err(|e| Status::internal(format!("failed to begin transaction: {e}")))?;
 
-        let value = match body() {
+        let (value, detail) = match body(attempt) {
             Ok(value) => value,
             Err(e) => {
                 let _ = conn.execute_batch("ROLLBACK");
                 return Err(e);
             }
         };
+        let body_ms = started.elapsed().as_millis();
 
-        let commit_error = match conn.execute_batch("COMMIT") {
+        let committing = std::time::Instant::now();
+        let commit = conn.execute_batch("COMMIT");
+        // One line per attempt: which part of it took the time, and how it ended.
+        let outcome = match &commit {
+            Ok(()) => "committed".to_string(),
+            Err(e) => format!("commit failed: {}", e.to_string().replace('\n', " | ")),
+        };
+        eprintln!(
+            "lake-write: {what} {subject} attempt={attempt} body_ms={body_ms} {detail} \
+             commit_ms={} outcome={outcome}",
+            committing.elapsed().as_millis()
+        );
+        let commit_error = match commit {
             Ok(()) => return Ok(value),
             Err(e) => e,
         };
@@ -398,6 +506,10 @@ struct Registration {
     /// delete nothing recorded is the one thing an operator reconciling row
     /// counts cannot reconstruct.
     replaced: BTreeMap<&'static str, usize>,
+    /// Which attempt of the transaction committed, from 0; 0 for a replay. Read by
+    /// tests that check writers did not lose COMMITs to each other.
+    #[cfg_attr(not(test), allow(dead_code))]
+    attempt: u32,
 }
 
 impl Registration {
@@ -407,6 +519,7 @@ impl Registration {
         Self {
             registered: placed.iter().map(|p| p.dest_str.clone()).collect(),
             replaced: BTreeMap::new(),
+            attempt: 0,
         }
     }
 }
@@ -430,8 +543,9 @@ impl Registration {
 /// Note: the action token is scoped to staging_dir + files, not to a specific
 /// reference_idx. The control plane is responsible for issuing tokens only for
 /// valid references in the correct state.
-fn register_files(
-    conn: &LakeWriter,
+fn register_files<W: std::borrow::Borrow<LakeWriter>>(
+    checkout: &dyn Fn() -> Result<W, Status>,
+    locks: &LakeLocks,
     data_path: &str,
     scratch_root: &std::path::Path,
     payload: &auth::ActionPayload,
@@ -519,6 +633,10 @@ fn register_files(
     //
     // A ledger recording this payload any other way than all or nothing fails the
     // call closed (`Ledgered::Inconsistent` says why).
+    // The replay checks and the moves run on one writer; the transaction checks
+    // out another once any lock it needs is held.
+    let preparing = checkout()?;
+    let conn: &LakeWriter = preparing.borrow();
     match ledgered(conn, &placed)? {
         Ledgered::All => return Ok(Registration::already_committed(&placed)),
         Ledgered::Inconsistent(inconsistency) => {
@@ -624,17 +742,12 @@ fn register_files(
     // `return_to_staging` moves the files back unless the ledger leaves that in
     // doubt, so the call can be made again with the same payload.
     //
-    // Registrations that touch a replace-keyed table SERIALIZE against each
-    // other, and retry when they lose. Both halves are needed:
-    //
-    // DuckLake detects a conflict only where two transactions touch the same
-    // EXISTING row, so the replace-by-key DELETE serializes writers of a feature
-    // the lake already holds — but NOT writers of a feature that is new, whose
-    // deletes match nothing. Measured with 4 concurrent writers of one feature:
-    // 1 row when it already existed, 4 when it did not, and 4 again for two bare
-    // `ducklake_add_data_files` with no delete at all. Bumping
-    // `registration_lock` gives every such registration a row to contend for, so
-    // the new-feature case conflicts too (measured: back to 1 row).
+    // Registrations that touch a replace-keyed table are ordered by the lake locks
+    // taken below (`crate::lake_locks` carries what DuckLake detects as a conflict,
+    // measured), and retry when they lose a COMMIT anyway. Those that delete also
+    // bump `registration_lock`; on ducklake 417a9117 their deletes conflict
+    // without it (8 writers of one new feature left 1 copy with or without the
+    // row), and whether the row can go is open.
     //
     // The loser's work is fully re-runnable — its files are already at the paths
     // `lake_dest_filename` minted and the delete+add is idempotent against whatever
@@ -671,6 +784,53 @@ fn register_files(
         })
         .collect();
     let takes_lock = !incoming.is_empty();
+
+    // Every failure from here to the transaction leaves nothing committed, so the
+    // moved files go back to staging and a redrive starts over.
+    let unmove = |e: Status| return_to_staging(&placed, e, Ok(Ledgered::Nothing));
+    let subject = format!("work_ticket_idx={}", payload.work_ticket_idx);
+    // Writers of a replace-keyed table take `crate::lake_locks` locks, waited for
+    // with no pooled connection held. Each run's own lock serializes the writers
+    // of that run. When every table is run-keyed and the lake holds none of the
+    // runs yet, the replace would delete nothing, so the registration only
+    // inserts, and inserts do not conflict with each other; otherwise it also
+    // waits for the global lock, since a delete conflicts with every concurrent
+    // insert into its table.
+    let run_keys = if takes_lock {
+        run_lock_keys(conn, &incoming).map_err(unmove)?
+    } else {
+        Vec::new()
+    };
+    let mut insert_only = false;
+    let mut session = None;
+    let committing: W = if takes_lock {
+        drop(preparing);
+        let mut held = locks
+            .session(&format!("the registration transaction {subject}"))
+            .map_err(unmove)?;
+        held.lock_keys(&run_keys).map_err(unmove)?;
+        let checked = checkout().map_err(unmove)?;
+        insert_only = incoming.iter().all(|(entry, _)| entry.key == RUN_KEY)
+            && incoming_keys_absent(checked.borrow(), &incoming).map_err(unmove)?;
+        let committing = if insert_only {
+            checked
+        } else {
+            drop(checked);
+            held.lock_global().map_err(unmove)?;
+            checkout().map_err(unmove)?
+        };
+        session = Some(held);
+        committing
+    } else {
+        preparing
+    };
+    let conn: &LakeWriter = committing.borrow();
+    let mode = match (takes_lock, insert_only) {
+        (false, _) => "unlocked".to_string(),
+        (true, true) => "insert-only".to_string(),
+        (true, false) => "replace".to_string(),
+    };
+    let waits = session.as_ref().map(|s| s.waits()).unwrap_or_default();
     // The `read` rows this ticket registered before (the lookup above the moves
     // says why). The delete names the files that lookup found rather than matching
     // a name pattern in SQL, so `lake_file_ticket` stays the one reader of a ticket
@@ -714,17 +874,20 @@ fn register_files(
     let registration = transact_with_retry(
         conn,
         "the registration transaction",
+        &subject,
         payload.work_ticket_idx,
-        || {
-            if takes_lock {
+        |attempt| {
+            let phase = std::time::Instant::now();
+            if takes_lock && !insert_only {
                 take_registration_lock(conn)?;
             }
 
             // Replace-by-key runs as its OWN pass, ahead of every add: one statement
             // per target table over all the files headed for it, so no delete can
-            // touch a row this same registration already added.
+            // touch a row this same registration already added. An insert-only
+            // registration has nothing to replace (its run locks keep it so).
             let mut replaced: BTreeMap<&'static str, usize> = BTreeMap::new();
-            for (entry, dests) in &incoming {
+            for (entry, dests) in incoming.iter().filter(|_| !insert_only) {
                 let sql = replace_key_delete_sql(entry.table, entry.key, dests.len());
                 let params: Vec<&dyn duckdb::ToSql> =
                     dests.iter().map(|d| d as &dyn duckdb::ToSql).collect();
@@ -751,6 +914,8 @@ fn register_files(
                 }
             }
 
+            let delete_ms = phase.elapsed().as_millis();
+            let phase = std::time::Instant::now();
             let mut registered = Vec::new();
             for (table, dest) in &moved {
                 conn.execute(
@@ -764,15 +929,26 @@ fn register_files(
                 })?;
                 registered.push(dest.clone());
             }
+            let add_ms = phase.elapsed().as_millis();
+            let phase = std::time::Instant::now();
             if let Some(sql) = &ledger_sql {
                 conn.execute(sql, ledger_params.as_slice()).map_err(|e| {
                     Status::internal(format!("failed to record the registration: {e}"))
                 })?;
             }
-            Ok(Registration {
-                registered,
-                replaced,
-            })
+            let detail = format!(
+                "mode={mode} files={} {waits} delete_ms={delete_ms} add_ms={add_ms} ledger_ms={}",
+                moved.len(),
+                phase.elapsed().as_millis()
+            );
+            Ok((
+                Registration {
+                    registered,
+                    replaced,
+                    attempt,
+                },
+                detail,
+            ))
         },
         |attempt| {
             last_replaced.clone_from(&attempt.replaced);
@@ -786,7 +962,7 @@ fn register_files(
         },
     );
 
-    registration.or_else(|failure| {
+    let settled = registration.or_else(|failure| {
         settle_failed_registration(
             conn,
             &placed,
@@ -794,7 +970,10 @@ fn register_files(
             last_replaced,
             failure,
         )
-    })
+    });
+    // The locks are released only after the outcome is settled.
+    drop(session);
+    settled
 }
 
 /// Answer a registration whose transaction failed after its moves.
