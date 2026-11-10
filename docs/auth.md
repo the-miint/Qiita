@@ -486,6 +486,12 @@ at all, is in the Scopes and roles section above.
 | `/api/v1/exported-identifier/mask` | POST | Mint (or recover) the `export_id` of each prep_sample in `{mask_idx, prep_sample_idx: [...]}` under that mask, for `qiita-admin masked-read-export`. system_admin + `admin:masked_read_export`, the gate of the export itself. 404 for an unknown mask; 409 for a deprecated mask unless the body sets `include_deprecated: true` (`reason` `deprecated`), and for a prep_sample not `completed` under it, minting nothing. |
 | `/api/v1/exported-processing/mask` | POST | Mint (or recover) the `export_processing_id` of `{mask_idx}`, which the masked-read export manifest cites in place of `mask_idx`. Same gate and 404 / 409 as the row above. |
 
+### Feature table
+
+| Route | Method | Notes |
+|---|---|---|
+| `/api/v1/feature-table/{sample,value,feature}` | POST | A run feature table over a cohort — one or more amplicon runs over a study's samples or a named `prep_sample` list. All three take the same `FeatureTableRequest` body and answer the table's columns (JSON: each processed sample under its public name), its values as sparse COO `(sample, feature, value)`, and its features `(feature, sequence, length)` — an ASV's md5, its sequence, its length — as Arrow IPC streams. `require_complete_profile` + `prep_sample:read`, with the **same** all-or-nothing cohort gate the other cohort reads use (`authorize_prep_sample_cohort` at `COHORT_MIN_TIER`, `wet_lab_admin`+ bypassing), checked before anything is read from the data plane — which serves exactly the cohort the signed ticket carries. POST because a cohort would exceed nginx's request-line cap in query params. No new scope. |
+
 ## CLI (`qiita-admin`)
 
 Installed as the `qiita-admin` console script via `qiita-control-plane`'s pyproject. Subcommands:
