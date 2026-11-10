@@ -35,7 +35,7 @@ _None yet._
 
 ### 6. After the deploy verifies green
 
-- `[operator]` (#remove-myloasm-provenance-recover) Disable the retired `myloasm-provenance-recover` action. The deploy removes its directory and job module, and `actions sync` does not disable an action whose directory is gone, so the row stays enabled. `action_disabled_consistent` needs `disabled_at` and `disabled_by_idx`; use your own principal's idx, from the first query. Load `DATABASE_URL` as [`redeploy.md`](docs/runbooks/redeploy.md) §4 does (`set -a; . /etc/qiita/control-plane.env; set +a`):
+- `[operator]` (#849) Disable the retired `myloasm-provenance-recover` action. The deploy removes its directory and job module, and `actions sync` does not disable an action whose directory is gone, so the row stays enabled. `action_disabled_consistent` needs `disabled_at` and `disabled_by_idx`; use your own principal's idx, from the first query. Load `DATABASE_URL` as [`redeploy.md`](docs/runbooks/redeploy.md) §4 does (`set -a; . /etc/qiita/control-plane.env; set +a`):
   ```bash
   psql "$DATABASE_URL" -c "SELECT idx, display_name FROM qiita.principal WHERE system_role = 'system_admin' AND idx <> 1 AND NOT retired;"   # idx 1 is the seeded system principal
   psql "$DATABASE_URL" -c "UPDATE qiita.action SET enabled = false, disabled_at = now(), disabled_by_idx = <your principal idx>, disabled_reason = 'one-off retired' WHERE action_id = 'myloasm-provenance-recover';"
@@ -44,7 +44,7 @@ _None yet._
 
 ### Notes (no host action)
 
-- (#remove-myloasm-provenance-recover) `qiita-admin backfill myloasm-provenance` is removed, with the `myloasm-provenance-recover` workflow and job: every myloasm run of long-read-assembly 1.0.0/1.0.1 is recovered.
+- (#849) `qiita-admin backfill myloasm-provenance` is removed, with the `myloasm-provenance-recover` workflow and job: every myloasm run of long-read-assembly 1.0.0/1.0.1 is recovered.
 
 ## Deployed history
 
