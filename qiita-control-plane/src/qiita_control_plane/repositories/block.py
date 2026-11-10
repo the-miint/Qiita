@@ -37,8 +37,7 @@ MASK_SAMPLE_PENDING = gate_state_literal("pending", MaskSampleState)
 MASK_SAMPLE_COMPLETED = gate_state_literal("completed", MaskSampleState)
 MASK_SAMPLE_INVALIDATED = gate_state_literal("invalidated", MaskSampleState)
 
-# The `qiita.block.state` values (a TEXT + CHECK column, `20260701000002_block.sql`
-# and `20261104000000_alignment_lifecycle.sql`).
+# The values the `qiita.block.state` CHECK admits (a TEXT column, not an ENUM).
 BLOCK_PENDING = "pending"
 BLOCK_PROCESSING = "processing"
 BLOCK_FAILED = "failed"

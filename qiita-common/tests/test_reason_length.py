@@ -32,8 +32,9 @@ def test_reason_takes_one_to_the_limit(model):
             reason.validate_python(bad)
 
 
-def test_every_capped_reason_uses_the_constant():
-    """A `reason` with a length cap anywhere in the models has this one."""
+def test_every_capped_exported_reason_has_the_constants_value():
+    """A `reason` with a length cap, on any model `qiita_common.models` exports,
+    is capped at MAX_REASON_LENGTH."""
     caps = {
         name: [
             m.max_length

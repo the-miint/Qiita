@@ -446,7 +446,7 @@ class ReferenceStatusUpdate(BaseModel):
 class ReferenceExclusionCreateRequest(BaseModel):
     """Block exactly one of genome_idx / feature_idx (the DB CHECK enforces the
     same invariant). `reason` is a required free-text curator note, bounded
-    1..2000 chars (matched by the DB CHECK). The block is GLOBAL — not scoped to a
+    1..MAX_REASON_LENGTH chars (matched by the DB CHECK). The block is GLOBAL — not scoped to a
     reference — so no reference_idx here."""
 
     genome_idx: Annotated[int, Field(gt=0)] | None = None
