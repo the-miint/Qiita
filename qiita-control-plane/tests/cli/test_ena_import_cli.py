@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 import re
 import zlib
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import httpx
 import pytest
@@ -991,7 +991,7 @@ def test_lost_post_response_names_the_list_command_with_a_since(
     assert "could not reach" not in err
     assert "may still have been created" in err
     since = re.search(r"ena-import-list --mine --since (\S+)`", err).group(1)
-    assert datetime.fromisoformat(since) >= before
+    assert before - timedelta(seconds=61) <= datetime.fromisoformat(since) < before
 
 
 def test_unreachable_control_plane_gives_no_batch_hint(monkeypatch, patch_async_client, capsys):

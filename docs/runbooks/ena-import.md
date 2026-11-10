@@ -295,7 +295,7 @@ is retried until the timeout instead of failing the watch; any other HTTP error 
 fatal. Exit codes: `0` every item reached `done`; `1` an item ended `failed` or
 `completed_partial`, the watch timed out (naming each still-pending item and its last
 known state), an HTTP error, no token was found, or the POST was sent but no response
-came back (printing the `qiita ena-import-list --mine --since TS` to run); `2` bad input
+came back (printing the `qiita ena-import-list --mine --since TS` command to run); `2` bad input
 (a malformed accession, a bad `--from-file` line, an out-of-range flag); `130` Ctrl-C,
 naming the batch to poll if the POST had already succeeded, or otherwise the same
 `ena-import-list` command. `qiita ena-import-status IDX` reads a batch's current state and

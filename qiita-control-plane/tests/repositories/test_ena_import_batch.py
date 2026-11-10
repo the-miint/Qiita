@@ -2,8 +2,8 @@
 
 Exercises the SQL in `repositories.ena_import_batch` directly against Postgres. Orchestration
 behaviour (the resolve/register/submit flow, the per-item state machine, the
-`fetch_batch_status` rollup) stays covered by `tests/ena_import/test_batch.py`
-unchanged -- this file only pins the query shapes these functions issue.
+`fetch_batch_status` rollup) is covered by the batch orchestration tests; this file
+pins the query shapes these functions issue.
 """
 
 import json

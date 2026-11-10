@@ -14,7 +14,7 @@ import json
 import sys
 import time
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -33,7 +33,8 @@ _FAILED_STATES = (BatchItemState.FAILED, BatchItemState.COMPLETED_PARTIAL)
 
 
 def _uncertain_batch_hint(started: datetime) -> str:
-    since = started.isoformat(timespec="seconds").replace("+00:00", "Z")
+    # Backed off so a client clock ahead of the server's still covers created_at.
+    since = (started - timedelta(minutes=1)).isoformat(timespec="seconds").replace("+00:00", "Z")
     return (
         "a batch may still have been created; list it with"
         f" `qiita ena-import-list --mine --since {since}`"
