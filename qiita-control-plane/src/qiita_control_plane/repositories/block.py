@@ -37,6 +37,7 @@ MASK_SAMPLE_PENDING = gate_state_literal("pending", MaskSampleState)
 MASK_SAMPLE_COMPLETED = gate_state_literal("completed", MaskSampleState)
 MASK_SAMPLE_INVALIDATED = gate_state_literal("invalidated", MaskSampleState)
 
+BLOCK_PENDING = "pending"
 BLOCK_COMPLETED = "completed"
 # Set only by the align abandon-plan route (`actions.align_abandon`). An abandoned
 # block owes no prep_sample anything: the covering-block checks skip it, and its
@@ -595,15 +596,36 @@ async def has_incomplete_covering_alignment_block(
     DOES carry one (a cohort is a per-workflow throttle): if a second action ever
     sets `alignment_idx`, the two diverge — it would stop throttling those tickets
     while this keeps gating on them. Revisit both together."""
-    incomplete = await conn.fetchval(
-        "SELECT 1 FROM qiita.block b"
+    return bool(
+        await list_samples_with_incomplete_covering_alignment_block(
+            conn, alignment_idx=alignment_idx, prep_sample_idxs=[prep_sample_idx]
+        )
+    )
+
+
+async def list_samples_with_incomplete_covering_alignment_block(
+    conn: asyncpg.Connection,
+    *,
+    alignment_idx: int,
+    prep_sample_idxs: Sequence[int],
+    exclude_block_idx: int | None = None,
+) -> list[int]:
+    """The prep_samples of `prep_sample_idxs` that some block under `alignment_idx`
+    covers and that is neither 'completed' nor 'abandoned' — the predicate
+    `has_incomplete_covering_alignment_block` documents, over many samples in one
+    statement. `exclude_block_idx`, when given, is not counted as a covering block,
+    whatever its state."""
+    rows = await conn.fetch(
+        "SELECT DISTINCT bm.prep_sample_idx FROM qiita.block b"
         "  JOIN qiita.block_member bm ON bm.block_idx = b.block_idx"
         "  JOIN qiita.work_ticket wt ON wt.work_ticket_idx = b.work_ticket_idx"
-        " WHERE bm.prep_sample_idx = $1 AND wt.alignment_idx = $2"
+        " WHERE bm.prep_sample_idx = ANY($1::bigint[]) AND wt.alignment_idx = $2"
         "   AND b.state <> ALL($3::text[])"
-        " LIMIT 1",
-        prep_sample_idx,
+        "   AND ($4::bigint IS NULL OR b.block_idx <> $4)"
+        " ORDER BY bm.prep_sample_idx",
+        list(prep_sample_idxs),
         alignment_idx,
         [BLOCK_COMPLETED, BLOCK_ABANDONED],
+        exclude_block_idx,
     )
-    return incomplete is not None
+    return [r["prep_sample_idx"] for r in rows]

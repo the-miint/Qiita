@@ -21,6 +21,7 @@ from qiita_common.api_paths import (
 from qiita_common.models import AlignmentDefinitionStatus
 
 from .. import _common
+from .alignment_rerun import add_rerun_parsers
 
 
 def _path(template: str, alignment_idx: int) -> str:
@@ -129,7 +130,8 @@ def _handle_abandon_plan(args: argparse.Namespace, parser: argparse.ArgumentPars
 
 
 def add_alignment_parser(subparsers) -> None:
-    """Wire `qiita-admin alignment {deprecate,activate,invalidate,restore,abandon-plan}`."""
+    """Wire `qiita-admin alignment {deprecate,activate,invalidate,restore,abandon-plan,
+    rerun-blocks,purge-sample-rows}`."""
     p = subparsers.add_parser("alignment", help="alignment lifecycle (system_admin)")
     sub = p.add_subparsers(dest="alignment_cmd", required=True)
 
@@ -161,3 +163,4 @@ def add_alignment_parser(subparsers) -> None:
         "give up on the plan's unfinished blocks so their prep_samples can be re-planned",
         _handle_abandon_plan,
     )
+    add_rerun_parsers(sub, _with_idx)

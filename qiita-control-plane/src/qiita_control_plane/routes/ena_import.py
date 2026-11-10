@@ -34,7 +34,7 @@ from ..ena_import.batch import (
     fetch_batch_status,
     schedule_ena_import_batch,
 )
-from .work_ticket import _require_compute_backend_client
+from ..work_ticket_submit import require_compute_backend_client_dependency
 
 router = APIRouter(prefix=PATH_ENA_IMPORT_BATCH_PREFIX, tags=["ena-import-batch"])
 
@@ -49,7 +49,7 @@ async def submit_ena_import_batch(
     request: Request,
     pool: asyncpg.Pool = Depends(get_db_pool),
     principal: HumanUser = Depends(require_human_with_role(METADATA_BYPASS_ROLE)),
-    _: None = Depends(_require_compute_backend_client),
+    _: None = Depends(require_compute_backend_client_dependency),
 ) -> BatchImportResponse:
     """Fail loud (422), before writing anything, on any malformed accession:
     one bad accession 422s the whole submission.

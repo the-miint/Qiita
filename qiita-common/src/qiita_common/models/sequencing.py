@@ -1412,6 +1412,62 @@ class AlignmentPlanAbandonResponse(BaseModel):
     rows_deleted: int
 
 
+class AlignmentRerunBlockRequest(BaseModel):
+    """Body for POST /api/v1/alignment-definition/{alignment_idx}/rerun-block.
+
+    One align block ticket per call. `allow_deprecated_mask` lets a ticket whose
+    mask has since been deprecated run again; the route refuses it on an active
+    mask."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    work_ticket_idx: Annotated[int, Field(gt=0)]
+    reason: Annotated[str, Field(min_length=1, max_length=2000)]
+    allow_deprecated_mask: bool = False
+
+
+class AlignmentRerunBlockResponse(BaseModel):
+    """Returned by POST /api/v1/alignment-definition/{alignment_idx}/rerun-block.
+
+    `rerun_of` is the state the ticket was re-armed from: `'completed'` (its block's
+    rows are replaced) or `'failed'` (a failed re-run, retried). `pending_prep_sample_idx`
+    are the prep_samples whose gate went from `'completed'` to `'pending'`;
+    reconcile sets them back once every block covering them is completed.
+    `step_rows_deleted` counts the ticket's `work_ticket_step` rows the call removed."""
+
+    alignment_idx: Annotated[int, Field(gt=0)]
+    work_ticket_idx: Annotated[int, Field(gt=0)]
+    block_idx: Annotated[int, Field(gt=0)]
+    rerun_of: Literal[WorkTicketState.COMPLETED, WorkTicketState.FAILED]
+    mask_override: bool
+    pending_prep_sample_idx: list[int]
+    step_rows_deleted: int
+
+
+class AlignmentPurgeSampleRowsRequest(BaseModel):
+    """Body for POST /api/v1/alignment-definition/{alignment_idx}/purge-sample-rows.
+
+    `prep_sample_idx` may be 0: rows whose prep_sample_idx was zeroed carry it, and
+    no prep_sample has it."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    prep_sample_idx: Annotated[int, Field(ge=0)]
+    reason: Annotated[str, Field(min_length=1, max_length=2000)]
+
+
+class AlignmentPurgeSampleRowsResponse(BaseModel):
+    """Returned by POST /api/v1/alignment-definition/{alignment_idx}/purge-sample-rows.
+
+    `rows_deleted` counts the `alignment` rows deleted. The pair's
+    `alignment_origin_spanning` rows are deleted too and not counted (`delete_alignment_sample`
+    in the data plane's `lake_edit.rs`)."""
+
+    alignment_idx: Annotated[int, Field(gt=0)]
+    prep_sample_idx: Annotated[int, Field(ge=0)]
+    rows_deleted: int
+
+
 class PoolAlignmentSummary(BaseModel):
     """One alignment over a pool, as the CALLER sees it.
 
