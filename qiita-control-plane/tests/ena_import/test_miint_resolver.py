@@ -497,6 +497,60 @@ def test_resolve_sample_attributes_for_samples_makes_one_seam_call_with_the_list
     assert [(a.sample_accession, a.attributes) for a in attrs] == [("SAMN1", {"tag": ["x"]})]
 
 
+def _fake_browser_xml(present: dict[str, dict[str, list[str]]], chunk: int):
+    """ENA's batched sample XML: a request omits missing samples and 404s only when every
+    sample in it is missing; miint requests `chunk` samples at a time."""
+
+    def query(accessions):
+        for start in range(0, len(accessions), chunk):
+            if not any(a in present for a in accessions[start : start + chunk]):
+                raise _http_error(404)
+        return [(a, present[a]) for a in accessions if a in present]
+
+    return query
+
+
+def test_resolve_sample_attributes_for_samples_returns_none_when_ena_has_no_sample(monkeypatch):
+    from qiita_control_plane.ena_import.miint_resolver import MiintEnaResolver
+
+    monkeypatch.setattr(_QUERY_ATTRS, _fake_browser_xml({}, chunk=2))
+
+    assert (
+        MiintEnaResolver().resolve_sample_attributes_for_samples(["SAMN1", "SAMN2", "SAMN3"]) == []
+    )
+
+
+def test_resolve_sample_attributes_for_samples_keeps_samples_beside_an_all_missing_chunk(
+    monkeypatch,
+):
+    from qiita_control_plane.ena_import.miint_resolver import MiintEnaResolver
+
+    present = {"SAMN3": {"depth": ["5"]}, "SAMN5": {"depth": ["10"]}}
+    monkeypatch.setattr(_QUERY_ATTRS, _fake_browser_xml(present, chunk=2))
+
+    attrs = MiintEnaResolver().resolve_sample_attributes_for_samples(
+        ["SAMN1", "SAMN2", "SAMN3", "SAMN4", "SAMN5"]
+    )
+
+    assert [(a.sample_accession, a.attributes) for a in attrs] == [
+        ("SAMN3", {"depth": ["5"]}),
+        ("SAMN5", {"depth": ["10"]}),
+    ]
+
+
+@pytest.mark.parametrize("status", [400, 500])
+def test_resolve_sample_attributes_for_samples_raises_any_other_http_error(monkeypatch, status):
+    from qiita_control_plane.ena_import.miint_resolver import MiintEnaResolver
+
+    def query(accessions):
+        raise _http_error(status)
+
+    monkeypatch.setattr(_QUERY_ATTRS, query)
+
+    with pytest.raises(duckdb.HTTPException):
+        MiintEnaResolver().resolve_sample_attributes_for_samples(["SAMN1", "SAMN2"])
+
+
 def test_resolve_sample_attributes_for_samples_rejects_a_non_sample_accession(monkeypatch):
     from qiita_common.ena_accession import InvalidEnaAccessionError
 

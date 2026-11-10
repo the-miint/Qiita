@@ -184,8 +184,29 @@ class MiintEnaResolver:
         _require_kind(sample_accessions, EnaAccessionKind.SAMPLE)
         return [
             EnaSampleAttributes(sample_accession=sample_accession, attributes=attributes)
-            for sample_accession, attributes in _query_ena_sample_attributes(sample_accessions)
+            for sample_accession, attributes in _query_ena_present_samples(sample_accessions)
         ]
+
+
+def _query_ena_present_samples(
+    sample_accessions: list[str],
+) -> list[tuple[str, dict[str, list[str]]]]:
+    """`_query_ena_sample_attributes`, skipping samples ENA has no record of. ENA's sample
+    XML omits a missing sample but 404s a request whose samples are all missing, which
+    fails the whole miint query; halving isolates those (e.g. NCBI samples ENA never
+    mirrored, whose runs it still serves)."""
+    try:
+        return _query_ena_sample_attributes(sample_accessions)
+    except duckdb.HTTPException as exc:
+        if getattr(exc, "status_code", None) != 404:
+            raise
+        if len(sample_accessions) == 1:
+            _log.warning("ENA has no sample record for %s", sample_accessions[0])
+            return []
+        mid = len(sample_accessions) // 2
+        return _query_ena_present_samples(sample_accessions[:mid]) + _query_ena_present_samples(
+            sample_accessions[mid:]
+        )
 
 
 def _require_kind(accessions: list[str], kind: EnaAccessionKind) -> None:
