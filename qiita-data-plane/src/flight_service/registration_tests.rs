@@ -3461,7 +3461,7 @@ fn a_replace_beside_new_runs_of_its_table_loses_no_commit() {
     assert!(lost > 0, "a replace beside 8 new runs lost no COMMIT");
 }
 
-/// Writers in one process share its two lock sessions and its queue: replaces and
+/// Writers in one process share its two lock sessions: replaces and
 /// new runs, more of them than there are sessions, all register.
 #[test]
 #[serial_test::serial]
@@ -3504,4 +3504,45 @@ fn a_session_holding_the_global_lock_is_refused_run_locks() {
         "{}",
         refused.message()
     );
+}
+
+/// A session's waits share one budget: time spent waiting for a run key leaves
+/// less for the global lock.
+#[test]
+#[serial_test::serial]
+#[cfg(feature = "integration")]
+fn a_sessions_waits_end_at_one_budget() {
+    use std::time::{Duration, Instant};
+    let connstr = crate::test_catalog::connstr();
+    let key = crate::lake_locks::run_key("a_sessions_waits_end_at_one_budget", 1, 1);
+    let key_holder = LakeLocks::new(connstr.clone());
+    let mut holding_key = key_holder.session("the key holder").unwrap();
+    holding_key.lock_keys(&[key]).unwrap();
+    let global_holder = LakeLocks::new(connstr.clone());
+    let mut holding_global = global_holder.session("the global holder").unwrap();
+    holding_global.lock_global().unwrap();
+
+    let budget = Duration::from_millis(800);
+    let release_key_after = Duration::from_millis(500);
+    let waiter = LakeLocks::with_budget(connstr, budget);
+    let started = Instant::now();
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            std::thread::sleep(release_key_after);
+            drop(holding_key);
+        });
+        let mut session = waiter.session("the waiter").unwrap();
+        session.lock_keys(&[key]).unwrap();
+        assert!(started.elapsed() >= release_key_after);
+        let refused = session
+            .lock_global()
+            .expect_err("got the global lock while it was held");
+        assert_eq!(refused.code(), tonic::Code::Unavailable);
+    });
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < budget + Duration::from_millis(250),
+        "the waits took {elapsed:?} on a budget of {budget:?}"
+    );
+    drop(holding_global);
 }

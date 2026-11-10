@@ -330,12 +330,12 @@ fn incoming_keys_absent(
 /// with a contiguous incoming key set: a whole registration transaction (lock
 /// UPDATE + replace-by-key DELETE + one `ducklake_add_data_files`, without the
 /// ledger INSERT) takes ~14 ms against a lake that already holds the incoming
-/// keys, ~7 ms when it does not.
+/// keys, ~7 ms when it does not. Those times were taken at the pool's threads, not
+/// at the one thread a lake write runs on (`pool::LakeWriter`); a 50M-row delete
+/// transaction measured 2.00 s at one thread against 1.32 s at six, locally.
 /// Writers that delete from a replace-keyed table reach COMMIT one at a time
 /// (`crate::lake_locks`), so this budget bounds the retries of a writer that lost
-/// anyway, not a queue. Those times were taken at the pool's threads, not at the one thread a lake
-/// write runs on (`pool::LakeWriter`); a 50M-row delete transaction measured
-/// 2.00 s at one thread against 1.32 s at six, locally.
+/// anyway, not a wait for the others.
 /// The DELETE's share of it is set by the spread of the incoming key set rather
 /// than by the table's size — `replace_key_delete_sql` carries what each key set
 /// scans, including the sets where it reads the whole table. Exceeding the

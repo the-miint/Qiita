@@ -37,15 +37,17 @@ use sha2::{Digest, Sha256};
 use tonic::Status;
 
 /// Lock sessions one data plane may hold open at once, each one catalog backend.
-/// Chosen, not measured: a session is held from a registration's key check
-/// through its COMMIT, a part of the 0.3 s median from step start to commit on
-/// qiita-miint (2026-11-09), which also includes the file moves.
+/// Chosen, not measured: a session is held through a registration's lock waits,
+/// its key check and its COMMIT. Without waits that is a part of the 0.3 s median
+/// from step start to commit on qiita-miint (2026-11-09), which also includes the
+/// file moves; a session waiting behind another writer's lock is held for that
+/// wait too.
 /// `ducklake::tag_catalog_connstr` declares them with the pool, so the deploy's
 /// connection budget counts them.
 pub(crate) const LOCK_SESSIONS: usize = 2;
 
-/// How long one session's waits may take in all: for the session, its keys, the
-/// queue, and `GLOBAL_KEY`. A backstop for a holder that does not finish.
+/// How long one session's waits may take in all: for the session, its keys and
+/// `GLOBAL_KEY`. A backstop for a holder that does not finish.
 pub(crate) const LOCK_BUDGET: Duration = Duration::from_secs(120);
 
 /// Advisory-lock key every writer of a replace-keyed table holds through its
@@ -162,16 +164,11 @@ impl Drop for GatePass<'_> {
     }
 }
 
-/// One process's lock sessions and its queue for holding `GLOBAL_KEY`
-/// exclusively.
+/// One process's lock sessions.
 pub(crate) struct LakeLocks {
     catalog_connstr: String,
     budget: Duration,
     sessions: Gate,
-    /// One exclusive taker of `GLOBAL_KEY` per process at a time, so the others
-    /// wait here rather than each holding a session and a backend in Postgres's
-    /// queue.
-    queue: Gate,
     global: bool,
 }
 
@@ -181,7 +178,6 @@ impl LakeLocks {
             catalog_connstr,
             budget: LOCK_BUDGET,
             sessions: Gate::new(LOCK_SESSIONS),
-            queue: Gate::new(1),
             global: true,
         }
     }
@@ -212,8 +208,8 @@ impl LakeLocks {
         let deadline = started + self.budget;
         let pass = self.sessions.enter(deadline).ok_or_else(|| {
             Status::unavailable(format!(
-                "{what}: no lake lock session came free within {} s",
-                self.budget.as_secs()
+                "{what}: waited {} ms for a lake lock session and gave up",
+                started.elapsed().as_millis()
             ))
         })?;
         let left = deadline.saturating_duration_since(Instant::now());
@@ -229,7 +225,6 @@ impl LakeLocks {
             holds_global: false,
             waited: vec![("session", started.elapsed())],
             _session: pass,
-            queued: None,
         })
     }
 }
@@ -242,9 +237,8 @@ pub(crate) struct LockSession<'a> {
     deadline: Instant,
     holds_global: bool,
     waited: Vec<(&'static str, Duration)>,
-    // Field order is drop order: the connection's transaction ends (in `drop`)
-    // before these passes let the next waiter in.
-    queued: Option<GatePass<'a>>,
+    // Dropped after `drop` ends the connection's transaction, so the next waiter
+    // gets the session once its locks are released.
     _session: GatePass<'a>,
 }
 
@@ -273,22 +267,12 @@ impl LockSession<'_> {
         Ok(())
     }
 
-    /// Wait for this process's queue, then hold `GLOBAL_KEY` exclusively: for a
-    /// writer that deletes from a replace-keyed table.
+    /// Hold `GLOBAL_KEY` exclusively: for a writer that deletes from a
+    /// replace-keyed table.
     pub(crate) fn lock_global(&mut self) -> Result<(), Status> {
         if !self.locks.global {
             return Ok(());
         }
-        let started = Instant::now();
-        let pass = self.locks.queue.enter(self.deadline).ok_or_else(|| {
-            Status::unavailable(format!(
-                "{}: the lake writer queue did not come free within {} s",
-                self.what,
-                self.locks.budget.as_secs()
-            ))
-        })?;
-        self.queued = Some(pass);
-        self.waited.push(("queue", started.elapsed()));
         self.hold_global(false)
     }
 

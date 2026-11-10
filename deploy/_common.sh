@@ -1288,9 +1288,10 @@ wait_for_data_plane_idle() {
 }
 
 # --- Catalog connection budget ------------------------------------------------
-# Every data-plane instance, on every host, holds up to its pool size plus its lake
-# lock sessions of backends on the catalog's Postgres (DEFAULT_POOL_SIZE in
-# qiita-data-plane/src/config.rs, LOCK_SESSIONS in qiita-data-plane/src/lake_locks.rs),
+# Every data-plane instance, on every host, holds up to as many backends on the
+# catalog's Postgres as its pool size plus its lake lock sessions
+# (DEFAULT_POOL_SIZE in qiita-data-plane/src/config.rs, LOCK_SESSIONS in
+# qiita-data-plane/src/lake_locks.rs),
 # and builds them as requests arrive, so the backends connected now undercount
 # what it may open. Each instance therefore names its catalog sessions
 # `qiita-data-plane:<listen port>:pool=<that sum>` (catalog_application_name in
