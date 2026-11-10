@@ -21,7 +21,12 @@ from pydantic import (
 )
 from pydantic.types import Base64Bytes
 
-from qiita_common.auth_constants import MAX_NAME_LENGTH, MAX_VERSION_LENGTH, SystemRole
+from qiita_common.auth_constants import (
+    MAX_NAME_LENGTH,
+    MAX_REASON_LENGTH,
+    MAX_VERSION_LENGTH,
+    SystemRole,
+)
 from qiita_common.models._base import (
     AccessionText,
     MetadataRequestModel,
@@ -1214,7 +1219,9 @@ class MaskDefinitionStatusUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     status: MaskDefinitionStatus
-    reason: Annotated[str | None, Field(default=None, min_length=1, max_length=2000)] = None
+    reason: Annotated[
+        str | None, Field(default=None, min_length=1, max_length=MAX_REASON_LENGTH)
+    ] = None
     superseded_by: Annotated[int | None, Field(default=None, gt=0)] = None
 
     @model_validator(mode="after")
@@ -1248,7 +1255,9 @@ class MaskSampleStatusUpdate(BaseModel):
 
     prep_sample_idx: Annotated[list[Annotated[int, Field(gt=0)]], Field(min_length=1)]
     state: Literal["completed", "invalidated"]
-    reason: Annotated[str | None, Field(default=None, min_length=1, max_length=2000)] = None
+    reason: Annotated[
+        str | None, Field(default=None, min_length=1, max_length=MAX_REASON_LENGTH)
+    ] = None
 
     @model_validator(mode="after")
     def _reason_required_to_invalidate(self) -> MaskSampleStatusUpdate:
@@ -1338,7 +1347,9 @@ class AlignmentDefinitionStatusUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     status: AlignmentDefinitionStatus
-    reason: Annotated[str | None, Field(default=None, min_length=1, max_length=2000)] = None
+    reason: Annotated[
+        str | None, Field(default=None, min_length=1, max_length=MAX_REASON_LENGTH)
+    ] = None
     superseded_by: Annotated[int | None, Field(default=None, gt=0)] = None
 
     @model_validator(mode="after")
@@ -1365,7 +1376,9 @@ class AlignmentSampleStatusUpdate(BaseModel):
 
     prep_sample_idx: Annotated[list[Annotated[int, Field(gt=0)]], Field(min_length=1)]
     state: Literal["completed", "invalidated"]
-    reason: Annotated[str | None, Field(default=None, min_length=1, max_length=2000)] = None
+    reason: Annotated[
+        str | None, Field(default=None, min_length=1, max_length=MAX_REASON_LENGTH)
+    ] = None
 
     @model_validator(mode="after")
     def _reason_required_to_invalidate(self) -> AlignmentSampleStatusUpdate:
@@ -1422,7 +1435,7 @@ class AlignmentRerunBlockRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     work_ticket_idx: Annotated[int, Field(gt=0)]
-    reason: Annotated[str, Field(min_length=1, max_length=2000)]
+    reason: Annotated[str, Field(min_length=1, max_length=MAX_REASON_LENGTH)]
     allow_deprecated_mask: bool = False
 
 
@@ -1453,7 +1466,7 @@ class AlignmentPurgeSampleRowsRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     prep_sample_idx: Annotated[int, Field(ge=0)]
-    reason: Annotated[str, Field(min_length=1, max_length=2000)]
+    reason: Annotated[str, Field(min_length=1, max_length=MAX_REASON_LENGTH)]
 
 
 class AlignmentPurgeSampleRowsResponse(BaseModel):

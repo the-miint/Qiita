@@ -8,7 +8,7 @@ from uuid import UUID
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
 
-from qiita_common.auth_constants import MAX_NAME_LENGTH, MAX_VERSION_LENGTH
+from qiita_common.auth_constants import MAX_NAME_LENGTH, MAX_REASON_LENGTH, MAX_VERSION_LENGTH
 
 
 class ReferenceStatus(StrEnum):
@@ -451,7 +451,7 @@ class ReferenceExclusionCreateRequest(BaseModel):
 
     genome_idx: Annotated[int, Field(gt=0)] | None = None
     feature_idx: Annotated[int, Field(gt=0)] | None = None
-    reason: str = Field(min_length=1, max_length=2000)
+    reason: str = Field(min_length=1, max_length=MAX_REASON_LENGTH)
 
     @model_validator(mode="after")
     def _exactly_one_target(self):
