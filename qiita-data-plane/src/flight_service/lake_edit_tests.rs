@@ -24,8 +24,6 @@ fn delete_reference_drops_orphans_keeps_shared() {
     let data_path = crate::test_catalog::data_path();
     let conn = Connection::open_in_memory().unwrap();
     ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
-    // delete_reference takes the registration lock, so the lake needs more
-    // than the reference tables.
     setup_full_lake(&conn);
 
     // Unique ids so leftover rows never collide with other tests.

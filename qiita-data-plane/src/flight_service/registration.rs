@@ -373,32 +373,13 @@ fn lake_commit_backoff(attempt: u32, salt: i64) -> std::time::Duration {
     base + std::time::Duration::from_millis(offset)
 }
 
-/// Bump `registration_lock`, the one-row table every transaction that deletes
-/// from a replace-keyed table updates. Call inside an open transaction.
-pub(super) fn take_registration_lock(conn: &LakeWriter) -> Result<(), Status> {
-    let locked = conn
-        .execute(
-            "UPDATE qiita_lake.registration_lock SET epoch = epoch + 1",
-            [],
-        )
-        .map_err(|e| Status::internal(format!("failed to take the registration lock: {e}")))?;
-    // An UPDATE matching no row succeeds and changes nothing.
-    // `ensure_registration_lock` seeds the row at boot.
-    if locked == 0 {
-        return Err(Status::internal(
-            "qiita_lake.registration_lock holds no row",
-        ));
-    }
-    Ok(())
-}
-
 /// Run `body` inside a DuckLake transaction, re-running the whole thing when the
 /// COMMIT fails, until `LAKE_COMMIT_BUDGET` is spent.
 ///
 /// Conflicts surface at COMMIT, not at the statement: measured with 16 concurrent
-/// writers contending on `registration_lock`, with the retry disabled, every
-/// failure was the COMMIT and none was the lock UPDATE or the replace-by-key
-/// DELETE. So an error out of `body` is not contention, will not resolve on a
+/// writers that each updated one shared row and replaced by key, with the retry
+/// disabled, every failure was the COMMIT and none was the UPDATE or the
+/// replace-by-key DELETE. So an error out of `body` is not contention, will not resolve on a
 /// retry, and is surfaced immediately.
 ///
 /// `body` must therefore be idempotent across attempts — each one re-reads a
@@ -735,8 +716,7 @@ fn register_files<W: std::borrow::Borrow<LakeWriter>>(
     // doubt, so the call can be made again with the same payload.
     //
     // Registrations that touch a replace-keyed table are ordered by the lake locks
-    // taken below, and retry when they lose a COMMIT anyway. Those that delete also
-    // bump `registration_lock` (`take_registration_lock`).
+    // taken below, and retry when they lose a COMMIT anyway.
     //
     // The loser's work is fully re-runnable — its files are already at the paths
     // `lake_dest_filename` minted and the delete+add is idempotent against whatever
@@ -867,9 +847,6 @@ fn register_files<W: std::borrow::Borrow<LakeWriter>>(
         payload.work_ticket_idx,
         |attempt| {
             let phase = std::time::Instant::now();
-            if takes_lock && !insert_only {
-                take_registration_lock(conn)?;
-            }
 
             // Replace-by-key runs as its OWN pass, ahead of every add: one statement
             // per target table over all the files headed for it, so no delete can

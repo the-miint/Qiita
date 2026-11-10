@@ -14,8 +14,8 @@
 //! - `doput`: the staging path an upload lands at, and staging an uploaded Arrow
 //!   stream as Parquet.
 //! - `export`: the `export_read`, `count_masked` and `mask_metrics` DoActions.
-//! - `registration`: the `register_files` DoAction, the lake commit retry and
-//!   registration lock, and placing files in lake storage.
+//! - `registration`: the `register_files` DoAction, the lake commit retry, which
+//!   lake locks a registration takes, and placing files in lake storage.
 //! - `lake_edit`: the DoActions that change the lake other than registration: the
 //!   `delete_*` actions, `sync_reference_exclusion` and `mint_phylogeny_edge_id`.
 

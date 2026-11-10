@@ -12,7 +12,7 @@ use crate::pool::LakeWriter;
 
 use super::export::validate_export_dest;
 use super::query::block_read_where_clause;
-use super::registration::{sql_i64_list, take_registration_lock, transact_with_retry};
+use super::registration::{sql_i64_list, transact_with_retry};
 use super::QiitaFlightService;
 
 impl QiitaFlightService {
@@ -253,7 +253,6 @@ fn delete_reference(conn: &LakeWriter, reference_idx: i64) -> Result<serde_json:
         &format!("reference_idx={reference_idx}"),
         reference_idx,
         |_attempt| {
-            take_registration_lock(conn)?;
             let sequences_deleted = exec(
                 &format!("DELETE FROM qiita_lake.reference_sequences WHERE {orphan_filter}"),
                 &[reference_idx, reference_idx, reference_idx, reference_idx],

@@ -606,7 +606,6 @@ fn register_files_moves_and_registers_end_to_end() {
         let conn = Connection::open_in_memory().unwrap();
         ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
         ducklake::ensure_reference_tables(&conn).unwrap();
-        ducklake::ensure_registration_lock(&conn).unwrap();
         ducklake::ensure_registered_file_table(&conn).unwrap();
         conn.execute_batch(&format!(
             "DELETE FROM qiita_lake.reference_membership WHERE reference_idx = {ref_idx};"
@@ -760,7 +759,6 @@ fn prepare_membership_table(connstr: &str, data_path: &str, ref_idx: i64) {
     let conn = Connection::open_in_memory().unwrap();
     ducklake::connect_ducklake(&conn, connstr, data_path).unwrap();
     ducklake::ensure_reference_tables(&conn).unwrap();
-    ducklake::ensure_registration_lock(&conn).unwrap();
     ducklake::ensure_registered_file_table(&conn).unwrap();
     conn.execute_batch(&format!(
         "DELETE FROM qiita_lake.reference_membership WHERE reference_idx = {ref_idx};"
@@ -1076,8 +1074,8 @@ fn register_files_with_its_payload_partly_in_the_ledger_fails_closed() {
 
 /// Why `landed` can read the ledger after a failed COMMIT: the failure has ended
 /// the transaction, so the attempt's own ledger row is gone rather than visible
-/// to it, and the connection can BEGIN again. Two writers take
-/// `registration_lock` and each record a row; the second to commit loses.
+/// to it, and the connection can BEGIN again. Two writers update the one row of a
+/// table of this test's own and each record a row; the second to commit loses.
 #[test]
 #[serial_test::serial]
 #[cfg(feature = "integration")]
@@ -1086,12 +1084,18 @@ fn ducklake_failed_commit_ends_the_transaction() {
     let data_path = crate::test_catalog::data_path();
     let setup = Connection::open_in_memory().unwrap();
     ducklake::connect_ducklake(&setup, &connstr, &data_path).unwrap();
-    ducklake::ensure_registration_lock(&setup).unwrap();
+    setup
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS qiita_lake.failed_commit_test_row (epoch BIGINT);
+             INSERT INTO qiita_lake.failed_commit_test_row
+             SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM qiita_lake.failed_commit_test_row);",
+        )
+        .unwrap();
     ducklake::ensure_registered_file_table(&setup).unwrap();
     let loser_file = format!("failed-commit-{}", std::process::id());
     let record = |conn: &Connection, file: &str| {
         conn.execute_batch("BEGIN TRANSACTION").unwrap();
-        conn.execute_batch("UPDATE qiita_lake.registration_lock SET epoch = epoch + 1")
+        conn.execute_batch("UPDATE qiita_lake.failed_commit_test_row SET epoch = epoch + 1")
             .unwrap();
         conn.execute(
             "INSERT INTO qiita_lake.registered_file VALUES (?, 'read', 0, now())",
@@ -1116,7 +1120,7 @@ fn ducklake_failed_commit_ends_the_transaction() {
 
     loser
         .execute_batch("COMMIT")
-        .expect_err("both writers of registration_lock committed");
+        .expect_err("both writers of the row committed");
 
     assert_eq!(
         recorded(&loser),
@@ -1635,7 +1639,6 @@ fn register_files_replaces_shared_contigs_across_assembly_runs() {
         let conn = Connection::open_in_memory().unwrap();
         ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
         ducklake::ensure_assembly_tables(&conn).unwrap();
-        ducklake::ensure_registration_lock(&conn).unwrap();
         ducklake::ensure_registered_file_table(&conn).unwrap();
         conn.execute_batch(&format!(
             "DELETE FROM qiita_lake.assembled_sequence \
@@ -1772,7 +1775,6 @@ fn register_files_re_registering_the_same_contigs_does_not_accumulate() {
         let conn = Connection::open_in_memory().unwrap();
         ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
         ducklake::ensure_assembly_tables(&conn).unwrap();
-        ducklake::ensure_registration_lock(&conn).unwrap();
         ducklake::ensure_registered_file_table(&conn).unwrap();
         conn.execute_batch(&format!(
             "DELETE FROM qiita_lake.assembled_sequence WHERE feature_idx = {feature};
@@ -2310,7 +2312,6 @@ fn register_files_replaces_run_scoped_tables_on_the_whole_key() {
         ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
         ducklake::ensure_assembly_tables(&conn).unwrap();
         ducklake::ensure_reference_tables(&conn).unwrap();
-        ducklake::ensure_registration_lock(&conn).unwrap();
         ducklake::ensure_registered_file_table(&conn).unwrap();
         for where_clause in [&a_p, &b_p, &a_q] {
             conn.execute_batch(&format!(
@@ -2504,7 +2505,6 @@ fn an_empty_bin_quality_still_supersedes_the_runs_rows() {
         let conn = Connection::open_in_memory().unwrap();
         ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
         ducklake::ensure_assembly_tables(&conn).unwrap();
-        ducklake::ensure_registration_lock(&conn).unwrap();
         ducklake::ensure_registered_file_table(&conn).unwrap();
         conn.execute_batch(&format!(
             "DELETE FROM qiita_lake.assembly_membership WHERE {where_clause};
@@ -2617,7 +2617,6 @@ fn an_empty_myloasm_table_still_supersedes_the_runs_rows() {
         let conn = Connection::open_in_memory().unwrap();
         ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
         ducklake::ensure_myloasm_tables(&conn).unwrap();
-        ducklake::ensure_registration_lock(&conn).unwrap();
         conn.execute_batch(&format!(
             "DELETE FROM qiita_lake.myloasm_run WHERE {where_clause};
              DELETE FROM qiita_lake.myloasm_mapping WHERE {where_clause};"
@@ -2792,14 +2791,13 @@ fn every_content_addressed_lake_table_is_registered() {
 /// Concurrent registrations of one feature leave ONE row, and every writer
 /// succeeds.
 ///
-/// This is the case the replace-by-key DELETE alone does not cover — see
-/// `register_files`' transaction for why — and so the test that `registration_lock`
-/// answers for.
-///
-/// Runs against a lake that does NOT already hold the feature, because
-/// pre-seeding it would make the DELETE conflict and the test would green with
-/// the lock removed. Runs without the global lake lock, which would otherwise
-/// keep the writers from overlapping at all.
+/// Runs without the global lake lock, which would otherwise keep the writers from
+/// overlapping at all, so what keeps one row here is DuckLake's conflict
+/// detection: each writer's replace-by-key DELETE conflicts with the others'
+/// inserts into the table (`crate::lake_locks`), so all but one lose their
+/// COMMIT, re-run, and replace the row that committed. Runs against a lake that
+/// does not already hold the feature, so every writer's first DELETE removes
+/// nothing.
 #[test]
 #[serial_test::serial]
 #[cfg(feature = "integration")]
@@ -2815,7 +2813,6 @@ fn concurrent_registrations_of_one_feature_leave_one_row() {
         let conn = Connection::open_in_memory().unwrap();
         ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
         ducklake::ensure_assembly_tables(&conn).unwrap();
-        ducklake::ensure_registration_lock(&conn).unwrap();
         ducklake::ensure_registered_file_table(&conn).unwrap();
         conn.execute_batch(&format!(
             "DELETE FROM qiita_lake.assembled_sequence WHERE feature_idx = {shared};
@@ -2827,8 +2824,7 @@ fn concurrent_registrations_of_one_feature_leave_one_row() {
     // Stage every writer's Parquet BEFORE spawning, and release them from a
     // barrier, so the only work between the threads starting and their
     // transactions is `register_files` itself. Seeding inside the threads
-    // staggers them past each other, and the test then greens with the lock
-    // removed.
+    // staggers them past each other, so they would not overlap.
     let payloads: Vec<(tempfile::TempDir, auth::ActionPayload)> = (0..WRITERS)
         .map(|i| {
             let staging = seed_assembly_staging(&[(
@@ -2931,7 +2927,6 @@ fn register_files_replaces_sequences_shared_across_references() {
         let conn = Connection::open_in_memory().unwrap();
         ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
         ducklake::ensure_reference_tables(&conn).unwrap();
-        ducklake::ensure_registration_lock(&conn).unwrap();
         ducklake::ensure_registered_file_table(&conn).unwrap();
         conn.execute_batch(&format!(
             "DELETE FROM qiita_lake.reference_sequences \
@@ -3181,7 +3176,6 @@ fn prepare_amplicon_and_assembly_tables() {
     .unwrap();
     ducklake::ensure_assembly_tables(&conn).unwrap();
     ducklake::ensure_amplicon_tables(&conn).unwrap();
-    ducklake::ensure_registration_lock(&conn).unwrap();
     ducklake::ensure_registered_file_table(&conn).unwrap();
 }
 

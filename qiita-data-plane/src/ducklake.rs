@@ -1091,31 +1091,6 @@ pub fn ensure_amplicon_tables(conn: &Connection) -> Result<(), Box<dyn std::erro
     Ok(())
 }
 
-/// Create the one row that the lake writers which delete from a replace-keyed
-/// table update, and seed it.
-///
-/// They update it through `flight_service::registration::take_registration_lock`,
-/// from `register_files` and `flight_service::lake_edit::delete_reference`; what
-/// orders those writers is `crate::lake_locks`. The shape is EXACTLY ONE row,
-/// holding a value nothing reads. `take_registration_lock` fails if its UPDATE
-/// matches no row.
-///
-/// The seeding INSERT is guarded so a restart does not add a second row. Two data
-/// planes booting together could still both insert; that degrades nothing — an
-/// extra row is one more thing every writer updates, so they still contend.
-pub fn ensure_registration_lock(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
-    conn.execute_batch(
-        "-- One row, ever. `epoch` is a bump counter, not a timestamp: it is never
-        -- read, and it is a counter rather than a constant only so the UPDATE that
-        -- takes the lock is a real mutation.
-        CREATE TABLE IF NOT EXISTS qiita_lake.registration_lock (epoch BIGINT NOT NULL);
-
-        INSERT INTO qiita_lake.registration_lock (epoch)
-        SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM qiita_lake.registration_lock);",
-    )?;
-    Ok(())
-}
-
 /// The most rows one INSERT into `registered_file` keeps inline in the catalog
 /// rather than writing to a Parquet file of its own. DuckLake applies
 /// `data_inlining_row_limit` per statement, with a default of 10. An INSERT per
@@ -1166,7 +1141,7 @@ pub fn ensure_registered_file_table(conn: &Connection) -> Result<(), Box<dyn std
 ///
 /// A flush never failed beside registrations committing, so it is safe while
 /// other data planes serve. Lock-free registrations lost no COMMIT to it; for
-/// registrations taking `registration_lock`, a flush running back to back raised
+/// registrations that each also updated one shared row, a flush running back to back raised
 /// the lost COMMITs from about 22 to 27 of 40, which their retry absorbs, and a
 /// boot flushes once. (DuckDB 2.0.0, ducklake 417a9117.)
 fn flush_registered_file(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
@@ -1186,8 +1161,6 @@ pub fn ensure_lake_tables(conn: &Connection) -> Result<(), Box<dyn std::error::E
     ensure_assembly_tables(conn)?;
     ensure_myloasm_tables(conn)?;
     ensure_amplicon_tables(conn)?;
-    // The lock row is seeded here so no request path has to create it.
-    ensure_registration_lock(conn)?;
     ensure_registered_file_table(conn)?;
     // Must run after reference + alignment tables — the `_visible` views join them.
     ensure_exclusion_tables(conn)?;
