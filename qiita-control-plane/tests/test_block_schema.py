@@ -98,6 +98,8 @@ async def test_block_table_columns(postgres_pool):
     assert cols["created_at"][1] is True
     assert cols["updated_at"][0].startswith("timestamp with time zone")
     assert cols["updated_at"][1] is True
+    # Nullable: NULL for a block never re-armed.
+    assert cols["rearmed_at"] == ("timestamp with time zone", False)
 
 
 async def test_block_state_check(postgres_pool):

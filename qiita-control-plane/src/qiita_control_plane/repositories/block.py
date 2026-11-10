@@ -144,6 +144,21 @@ async def set_block_state(
     return updated is not None
 
 
+async def rearm_block(conn: asyncpg.Connection, *, block_idx: int) -> bool:
+    """Set a `completed` block back to `pending` and stamp `rearmed_at`, in one
+    guarded UPDATE; return True iff the block was `completed`. abandon-plan reads
+    `rearmed_at` (`actions.align_abandon`)."""
+    require_transaction(conn)
+    updated = await conn.fetchval(
+        "UPDATE qiita.block SET state = $2, rearmed_at = now()"
+        " WHERE block_idx = $1 AND state = $3 RETURNING block_idx",
+        block_idx,
+        BLOCK_PENDING,
+        BLOCK_COMPLETED,
+    )
+    return updated is not None
+
+
 async def set_block_work_ticket(
     conn: asyncpg.Connection,
     *,

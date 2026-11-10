@@ -1408,6 +1408,17 @@ class AlignmentSampleStatusUpdateResponse(BaseModel):
     skipped_pending: list[int] = []
 
 
+class AlignmentPlanAbandonRequest(BaseModel):
+    """Optional body for POST /api/v1/alignment-definition/{alignment_idx}/abandon-plan.
+
+    `allow_rearmed` lets the call abandon a block that rerun-block re-armed and that
+    has not completed again; the route refuses one otherwise."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    allow_rearmed: bool = False
+
+
 class AlignmentPlanAbandonResponse(BaseModel):
     """Returned by POST /api/v1/alignment-definition/{alignment_idx}/abandon-plan.
 

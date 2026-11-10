@@ -66,7 +66,7 @@ from ..repositories.block import (
     BLOCK_PENDING,
     fetch_block_members,
     list_samples_with_incomplete_covering_alignment_block,
-    set_block_state,
+    rearm_block,
 )
 from ..repositories.mask_definition import MaskDefinitionNotFound, lock_mask
 from ..step_progress import StepProgressMismatch, check_step_progress, load_step_progress
@@ -85,7 +85,7 @@ _PRE_TXN_BUDGET_S = 10.0
 #   both:      SET LOCAL, ticket, mask lock, alignment lock, block lock, feature-table
 #              tickets, block members, gate locks, sibling blocks, producing step
 #              rows, ticket reset, gate UPDATE
-#   completed: step-row DELETE, block state
+#   completed: step-row DELETE, block re-arm
 #   failed:    dead step-row DELETE, step-progress read
 # The one filesystem call, the registered attempt directory's stat, runs in a daemon
 # thread of its own under _STAT_TIMEOUT_S (`_stat_off_loop`), so a stalled scratch
@@ -444,9 +444,7 @@ async def _rearm(
             "DELETE FROM qiita.work_ticket_step WHERE work_ticket_idx = $1", work_ticket_idx
         )
         step_rows_deleted = int(status.split()[-1])
-        await set_block_state(
-            conn, block_idx=block_idx, new_state=BLOCK_PENDING, expected_states=[BLOCK_COMPLETED]
-        )
+        await rearm_block(conn, block_idx=block_idx)
     else:
         step_rows_deleted = await drop_dead_step_rows(
             conn, work_ticket_idx=work_ticket_idx, after_cancel=False

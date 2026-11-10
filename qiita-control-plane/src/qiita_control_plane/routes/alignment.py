@@ -40,6 +40,7 @@ from qiita_common.models import (
     AlignmentDefinitionStatus,
     AlignmentDefinitionStatusUpdate,
     AlignmentDoGetTicketRequest,
+    AlignmentPlanAbandonRequest,
     AlignmentPlanAbandonResponse,
     AlignmentPurgeSampleRowsRequest,
     AlignmentPurgeSampleRowsResponse,
@@ -50,7 +51,7 @@ from qiita_common.models import (
     DoGetTicketResponse,
 )
 
-from ..actions.align_abandon import AlignPlanInFlight, abandon_align_plan
+from ..actions.align_abandon import AlignPlanInFlight, AlignPlanRearmed, abandon_align_plan
 from ..actions.align_rerun import (
     AlignRerunRefused,
     SampleGated,
@@ -213,6 +214,7 @@ async def update_alignment_sample_status_route(
 @alignment_definition_router.post(PATH_ALIGNMENT_DEFINITION_ABANDON_PLAN)
 async def abandon_alignment_plan_route(
     alignment_idx: Annotated[int, Field(gt=0)],
+    body: AlignmentPlanAbandonRequest | None = None,
     pool: asyncpg.Pool = Depends(get_db_pool),
     signing_key: bytes = Depends(get_flight_signing_key),
     data_plane_url: str = Depends(get_data_plane_url),
@@ -224,7 +226,8 @@ async def abandon_alignment_plan_route(
     alignment. Completed and invalidated prep_samples are not touched.
 
     `actions/align_abandon.py` documents the steps. 409 while a released block
-    ticket is still running. 502 if the DuckLake purge fails: the abandon itself has
+    ticket is still running, and for a block rerun-block re-armed unless the body
+    sets `allow_rearmed`. 502 if the DuckLake purge fails: the abandon itself has
     committed. Calling this again before re-planning redoes the purge; a call after a
     re-plan would abandon that plan's unfinished blocks too, and is not needed, since
     the re-plan's blocks replace their own footprint over the whole prep_sample.
@@ -237,9 +240,14 @@ async def abandon_alignment_plan_route(
             alignment_idx=alignment_idx,
             signing_key=signing_key,
             data_plane_url=data_plane_url,
+            allow_rearmed=body is not None and body.allow_rearmed,
         )
     except AlignmentDefinitionNotFound:
         raise HTTPException(status_code=404, detail=ALIGNMENT_NOT_FOUND_DETAIL)
+    except AlignPlanRearmed as exc:
+        raise HTTPException(
+            status_code=409, detail={"reason": str(exc), "block_idx": exc.block_idxs}
+        ) from exc
     except AlignPlanInFlight as exc:
         raise HTTPException(
             status_code=409,

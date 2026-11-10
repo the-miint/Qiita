@@ -124,6 +124,7 @@ def _handle_abandon_plan(args: argparse.Namespace, parser: argparse.ArgumentPars
             args.base_url,
             token,
             _path(PATH_ALIGNMENT_DEFINITION_ABANDON_PLAN, args.alignment_idx),
+            json={"allow_rearmed": True} if args.allow_rearmed else None,
         ),
         render=_render_abandon,
     )
@@ -158,9 +159,15 @@ def add_alignment_parser(subparsers) -> None:
     sp = _with_idx("restore", "restore invalidated prep_sample runs", _handle_restore)
     sp.add_argument("--prep-sample-idx", type=int, nargs="+", required=True)
 
-    _with_idx(
+    sp = _with_idx(
         "abandon-plan",
         "give up on the plan's unfinished blocks so their prep_samples can be re-planned",
         _handle_abandon_plan,
+    )
+    sp.add_argument(
+        "--allow-rearmed",
+        action="store_true",
+        help="also abandon blocks rerun-blocks re-armed (purges their prep_samples' rows"
+        " from every block of the alignment)",
     )
     add_rerun_parsers(sub, _with_idx)

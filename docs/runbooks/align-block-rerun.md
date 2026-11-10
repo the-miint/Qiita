@@ -17,9 +17,10 @@ Everything below reads the lake through `lake-shell` only.
   ticket's `updated_at`, and the CLI then refuses every remaining ticket as already
   changed.
 - **No `abandon-plan` on the alignment.** A failed re-run leaves its block
-  `pending` and its prep_samples' gates `pending`; abandon-plan would delete those
-  gates and purge the prep_samples' rows from every block of the alignment. Retry
-  the failed re-run instead (below). `AlignResubmitError`'s message suggests
+  `pending` and its prep_samples' gates `pending`. abandon-plan refuses such a block
+  (409 listing it, from `block.rearmed_at`); `--allow-rearmed` overrides that, and
+  then deletes those gates and purges the prep_samples' rows from every block of the
+  alignment. Retry the failed re-run instead (below). `AlignResubmitError`'s message suggests
   abandon-plan for pending gates; it does not apply here.
 - **No feature tables, cohort downloads or exports on the alignment.** A prep_sample
   split across blocks goes back to `completed` when one of its blocks finishes,

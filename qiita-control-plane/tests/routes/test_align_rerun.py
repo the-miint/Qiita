@@ -21,6 +21,7 @@ from qiita_common.actions import (
     ESTIMATE_FEATURE_TABLE_ACTION_ID,
 )
 from qiita_common.api_paths import (
+    URL_ALIGNMENT_DEFINITION_ABANDON_PLAN,
     URL_ALIGNMENT_DEFINITION_PURGE_SAMPLE_ROWS,
     URL_ALIGNMENT_DEFINITION_RERUN_BLOCK,
 )
@@ -622,6 +623,61 @@ async def test_a_failed_rerun_with_no_producing_row_skips_the_attempt_check(clie
     await rr.deprecate_mask()
     resp = await _rerun(client, rr.alignment_idx, wt, allow_deprecated_mask=True)
     assert resp.status_code == 200, resp.text
+
+
+# ---------------------------------------------------------------------------
+# abandon-plan and a re-armed block
+# ---------------------------------------------------------------------------
+
+
+async def test_a_rerun_stamps_the_block_and_abandon_plan_refuses_it_until_allowed(
+    client, rr, dispatched, monkeypatch
+):
+    """A failed re-run's block is pending with pending gates, like a block that never
+    finished; `rearmed_at` is what abandon-plan tells them apart by. A block never
+    re-armed is not stamped."""
+    purged: list[dict] = []
+
+    async def _purge(*, alignment_idx, members, signing_key, data_plane_url):
+        purged.append({"alignment_idx": alignment_idx, "members": members})
+        return 0
+
+    monkeypatch.setattr(
+        "qiita_control_plane.actions.align_abandon.delete_alignment_block_data", _purge
+    )
+    a, b, _c = rr.samples
+    block, wt = await rr.make_block([(a, 1, 100)])
+    untouched, _ = await rr.make_block([(b, 1, 100)])
+    await rr.full_steps(wt)
+    await rr.set_gate(a, "completed")
+    await rr.set_gate(b, "completed")
+    assert (await _rerun(client, rr.alignment_idx, wt)).status_code == 200
+    stamps = dict(
+        await rr.pool.fetch(
+            "SELECT block_idx, rearmed_at IS NOT NULL FROM qiita.block"
+            " WHERE block_idx = ANY($1::bigint[])",
+            [block, untouched],
+        )
+    )
+    assert stamps == {block: True, untouched: False}
+
+    # The re-run failed.
+    await rr.pool.execute(
+        "UPDATE qiita.work_ticket SET state = 'failed', failure_type = 'permanent',"
+        " failure_stage = 'step_run', failure_step_name = 'align_sharded',"
+        " failure_reason = 'x' WHERE work_ticket_idx = $1",
+        wt,
+    )
+    url = URL_ALIGNMENT_DEFINITION_ABANDON_PLAN.format(alignment_idx=rr.alignment_idx)
+    resp = await client.post(url)
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["detail"]["block_idx"] == [block]
+    assert purged == []
+    assert (await _snapshot(rr, wt, block))["block"] == "pending"
+
+    resp = await client.post(url, json={"allow_rearmed": True})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["abandoned_block_idx"] == [block]
 
 
 # ---------------------------------------------------------------------------
