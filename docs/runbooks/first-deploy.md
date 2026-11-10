@@ -171,6 +171,10 @@ nested workspace dir perms issue described next).
 >
 > Both halves ship in `deploy/activate.sh` and the runbook usermod
 > below; no operator-side toggle.
+>
+> Native SLURM jobs set `umask 0007` in their batch script
+> (`_build_native_script` in `slurm/payload.py`), so the directories a job
+> creates under its output path are group-writable too.
 
 Verification:
 ```bash

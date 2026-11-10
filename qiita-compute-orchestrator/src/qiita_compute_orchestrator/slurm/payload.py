@@ -161,8 +161,11 @@ def _build_native_script(*, module: str, python: str) -> str:
     # deploy, which left job-made subdirectories at 2755 and every registered
     # file in them behind in scratch. 0007 matches the orchestrator's own
     # UMask (deploy/systemd/qiita-compute-orchestrator.service.d/umask.conf),
-    # which creates $QIITA_OUTPUT_PATH itself. Files are unaffected: the
-    # launcher sets each output file to EXPECTED_FILE_MODE (slurm/contract.py).
+    # which creates $QIITA_OUTPUT_PATH itself. The umask covers everything the
+    # job creates, including the per-sample reads-staging tree outside the
+    # output path, so "other" loses read on new files and directories there;
+    # every service account is in qiita-pipeline. On success the launcher sets
+    # each file under $QIITA_OUTPUT_PATH to EXPECTED_FILE_MODE (slurm/contract.py).
     cmd = (
         "umask 0007\n"
         'export SRUN_CPUS_PER_TASK="${SLURM_CPUS_PER_TASK:-1}"\n'
