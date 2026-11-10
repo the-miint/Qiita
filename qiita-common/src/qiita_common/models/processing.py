@@ -37,6 +37,16 @@ are deliberately not the same judgement (the `assembly_lifecycle` migration
 header carries why).
 """
 
+AmpliconSampleState = Literal["pending", "completed", "no_data"]
+"""A sample's per-`(processing_idx, prep_sample)` amplicon-denoise state.
+
+Mirrors the `qiita.amplicon_sample.state` TEXT/CHECK column (NOT a Postgres
+ENUM). `'completed'` means the run denoised the sample and counted its ASVs;
+`'no_data'` means it ran and counted nothing; `'pending'` means it has not
+finished. The canonical statement of the gate contract lives on
+`qiita_control_plane.repositories.amplicon.close_amplicon_samples`.
+"""
+
 
 class ProcessingStatus(StrEnum):
     """Lifecycle of an assembly run CONFIG (`qiita.processing.status`).

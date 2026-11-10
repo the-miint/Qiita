@@ -290,9 +290,9 @@ def test_load_actions_loads_on_disk_amplicon_yaml():
     from qiita_control_plane.actions import load_actions
 
     actions = load_actions(Path(__file__).resolve().parents[2] / "workflows")
-    by_id = {a.action_id: a for a in actions}
-    assert "amplicon" in by_id, "workflows/amplicon/1.0.0.yaml must load"
-    amplicon = by_id["amplicon"]
+    by_version = {(a.action_id, a.version): a for a in actions}
+    assert ("amplicon", "1.0.0") in by_version, "workflows/amplicon/1.0.0.yaml must load"
+    amplicon = by_version[("amplicon", "1.0.0")]
 
     # sequenced_pool scope subjects a re-submit to the pool COMPLETED gate; a
     # --force re-run is safe because amplicon_membership is replace-keyed on
@@ -329,6 +329,26 @@ def test_load_actions_loads_on_disk_amplicon_yaml():
     assert load_step.params == {"processing_idx": "processing_idx"}
     # Pure native + library primitives; no container steps.
     assert not [s for s in amplicon.steps if getattr(s, "container", None)]
+
+
+def test_amplicon_1_1_0_drops_the_primer_knobs():
+    """1.1.0 is 1.0.0 without primer / orient_primer: the denoise step binds only
+    trim, and a context naming either old knob is refused."""
+    from pathlib import Path
+
+    from qiita_control_plane.actions import load_actions
+
+    actions = load_actions(Path(__file__).resolve().parents[2] / "workflows")
+    by_version = {(a.action_id, a.version): a for a in actions}
+    old, new = by_version[("amplicon", "1.0.0")], by_version[("amplicon", "1.1.0")]
+
+    assert set(new.context_schema["properties"]) == {"sortmerna_reference_idx", "trim"}
+    assert new.context_schema["required"] == ["sortmerna_reference_idx", "trim"]
+    assert new.context_schema["additionalProperties"] is False
+    denoise = next(s for s in new.steps if s.name == "denoise")
+    assert denoise.params == {"trim": "trim"}
+    # Every other 1.0.0 step is unchanged (the tail 1.1.0 adds is pinned below).
+    assert [s.name for s in new.steps][: len(old.steps)] == [s.name for s in old.steps]
 
 
 def test_every_mint_features_entry_binds_manifest():
@@ -1649,3 +1669,23 @@ def test_load_actions_orders_a_two_digit_minor_after_a_one_digit_one(tmp_path):
     versions = [a.version for a in load_actions(tmp_path)]
 
     assert versions == ["1.9.0", "1.10.0"], versions
+
+
+def test_load_actions_loads_amplicon_1_1_0_with_the_identifier_and_gate_tail():
+    """amplicon 1.1.0 ends with `mint-amplicon-identifiers` and
+    `finalize-amplicon-sample` after register-files, both reading denoise's
+    asv_counts (register-files has moved the staged membership into the lake by
+    then). Its context is pinned by test_amplicon_1_1_0_drops_the_primer_knobs."""
+    from pathlib import Path
+
+    from qiita_control_plane.actions import load_actions
+
+    actions = load_actions(Path(__file__).resolve().parents[2] / "workflows")
+    by_key = {(a.action_id, a.version): a for a in actions}
+    old, new = by_key[("amplicon", "1.0.0")], by_key[("amplicon", "1.1.0")]
+    assert [s.name for s in new.steps] == [
+        *(s.name for s in old.steps),
+        "mint-amplicon-identifiers",
+        "finalize-amplicon-sample",
+    ]
+    assert new.steps[-2].inputs == new.steps[-1].inputs == ["asv_counts"]

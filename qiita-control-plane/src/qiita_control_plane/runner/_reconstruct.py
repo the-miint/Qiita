@@ -43,6 +43,7 @@ from ..actions.library import (
     MINT_FEATURES_OUTPUT_BASENAME,
     QcProducer,
 )
+from ..repositories.alignment_definition import list_pool_prep_sample_idxs
 from ..repositories.assembly import AssemblySampleInvalidated
 from ..repositories.reference_membership import count_reference_shards
 from ..shard_orchestration import (
@@ -344,6 +345,14 @@ def _register_files_payload(attempt_dir: Path, staging_dir: Path) -> dict[str, s
     return staged
 
 
+def _closed(completed: int, no_data: int) -> None:
+    """Log and summarize how a finalize action closed its samples."""
+    _LOG.info(
+        "closed %d samples: %d completed, %d no data", completed + no_data, completed, no_data
+    )
+    summarize(completed=completed, no_data=no_data)
+
+
 async def _dispatch_action(
     ctx: RunContext,
     entry: WorkflowAction,
@@ -617,6 +626,50 @@ async def _run_action_primitive(
             data_plane_url=ctx.data_plane_url,
         )
         summarize(tables=tables)
+        return {}
+
+    if entry.name == LibraryPrimitive.MINT_AMPLICON_IDENTIFIERS:
+        # After register-files, so an identifier never names data that did not
+        # land. processing_idx from `bound`, the run identity the runner minted
+        # before the loop; created_by is the ticket's originator, the person the
+        # identifiers are minted for.
+        if set(entry.inputs) != {"asv_counts"}:
+            raise RuntimeError(
+                f"mint-amplicon-identifiers expects inputs [asv_counts]; got {entry.inputs!r}"
+            )
+        originator_idx = await ctx.pool.fetchval(
+            "SELECT originator_principal_idx FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+            ctx.work_ticket_idx,
+        )
+        if originator_idx is None:
+            raise RuntimeError(f"work_ticket {ctx.work_ticket_idx} not found")
+        samples = await LIBRARY[LibraryPrimitive.MINT_AMPLICON_IDENTIFIERS](
+            ctx.pool,
+            processing_idx=bound[PROCESSING_IDX_BINDING],
+            asv_counts_path=Path(bound["asv_counts"]),
+            created_by_idx=originator_idx,
+        )
+        _LOG.info("identifiers for %d processed samples", samples)
+        summarize(samples=samples)
+        return {}
+
+    if entry.name == LibraryPrimitive.FINALIZE_AMPLICON_SAMPLE:
+        # After register-files; processing_idx from `bound`, the run identity the
+        # runner minted (and materialized the pool's 'pending' rows under) before
+        # the loop. Closes only this pool's rows: the identity spans pools.
+        if set(entry.inputs) != {"asv_counts"}:
+            raise RuntimeError(
+                f"finalize-amplicon-sample expects inputs [asv_counts]; got {entry.inputs!r}"
+            )
+        completed, no_data = await LIBRARY[LibraryPrimitive.FINALIZE_AMPLICON_SAMPLE](
+            ctx.pool,
+            processing_idx=bound[PROCESSING_IDX_BINDING],
+            prep_sample_idxs=await list_pool_prep_sample_idxs(
+                ctx.pool, ctx.scope_target["sequenced_pool_idx"]
+            ),
+            asv_counts_path=Path(bound["asv_counts"]),
+        )
+        _closed(completed, no_data)
         return {}
 
     if entry.name == LibraryPrimitive.REGISTER_INDEX:

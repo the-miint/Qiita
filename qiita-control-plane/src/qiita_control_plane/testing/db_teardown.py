@@ -45,6 +45,7 @@ GENOME_OF_PREP_SAMPLE = "genome_of_prep_sample"
 SWEEP_TIERS = (
     (
         ("alignment_sample", (("prep_sample_idx", PREP_SAMPLE),)),
+        ("amplicon_sample", (("prep_sample_idx", PREP_SAMPLE),)),
         (
             "assembly_membership",
             (("genome_idx", GENOME_OF_PREP_SAMPLE), ("prep_sample_idx", PREP_SAMPLE)),
