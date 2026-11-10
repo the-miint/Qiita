@@ -470,6 +470,12 @@ at all, is in the Scopes and roles section above.
 |---|---|---|
 | `/api/v1/exported-identifier` | POST | Mint (or recover) the public `export_id` (`QM<n>`) for each processed sample — `(alignment_idx, prep_sample_idx)` — in a cohort, so a published table can name its samples without carrying ours. `require_human` + `prep_sample:read`, and **that read scope covers a write on purpose**: the row it creates is a name, the mint is idempotent, it exposes nothing the caller could not already see, and the authority it takes is exactly "may I read this sample" — a separate write scope would have to be granted to precisely the roles that can already read one. No complete-profile requirement, unlike the alignment mint, which hands out access to raw sequence-derived data. The **same** all-or-nothing gate as that mint (`filter_prep_samples_caller_can_read` at `Tier.VIEWER` on every study a sample is still linked to, `wet_lab_admin` bypassing), so the two cannot disagree about who may read a sample. Refusals are ordered alignment `404` → access `403` → completeness `422`, mirroring the mint exactly; the `403` is truncated and uncorrelated for the reason given there, and the `422` subsumes an unknown `prep_sample_idx` (no gate row) so a typo cannot vanish from an all-or-nothing answer. A refusal mints nothing. POST because a cohort spans pools and would exceed nginx's request-line cap in query params. No new scope. |
 
+### Feature table
+
+| Route | Method | Notes |
+|---|---|---|
+| `/api/v1/feature-table/{sample,value,feature}` | POST | A run feature table over a cohort — one or more amplicon runs over a study's samples or a named `prep_sample` list. All three take the same `FeatureTableRequest` body and answer the table's columns (JSON: each processed sample under its public name), its values as sparse COO `(sample, feature, value)`, and its features `(feature, sequence, length)` — an ASV's md5, its sequence, its length — as Arrow IPC streams. `require_complete_profile` + `prep_sample:read`, with the **same** all-or-nothing cohort gate the other cohort reads use (`authorize_prep_sample_cohort` at `COHORT_MIN_TIER`, `wet_lab_admin`+ bypassing), checked before anything is read from the data plane — which serves exactly the cohort the signed ticket carries. POST because a cohort would exceed nginx's request-line cap in query params. No new scope. |
+
 ## CLI (`qiita-admin`)
 
 Installed as the `qiita-admin` console script via `qiita-control-plane`'s pyproject. Subcommands:

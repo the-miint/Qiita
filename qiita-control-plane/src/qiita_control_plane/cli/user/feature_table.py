@@ -53,7 +53,7 @@ from qiita_common.models import (
     ExportedIdentifierRequest,
     ExportedProcessingRequest,
 )
-from qiita_common.parquet import PARQUET_MEDIA_TYPE
+from qiita_common.parquet import PARQUET_MEDIA_TYPE, PARQUET_OPTS_TRANSFER, validate_parquet_path
 from qiita_common.taxonomy import TAXONOMY_SOURCE_TABLE
 
 if TYPE_CHECKING:
@@ -63,6 +63,7 @@ from ...feature_table import (
     denovo_alignment_processing_idx,
     denovo_assembly_deprecation_error,
 )
+from ...run_feature_table import FEATURE_RELATION
 from .. import _common
 from ._helpers import _UNSET
 from .alignment import (
@@ -720,10 +721,32 @@ class _Companion(NamedTuple):
 # In write order. Each suffix is derived from the caller's name for the reason the
 # identifier map's is, and named for what it holds rather than for the reference it came
 # from: a reference name is not ours to compose into a filename either.
+class SequencesClearance(NamedTuple):
+    """Proof the amplicon sequences relation was built from the features the table
+    names, which is what makes that companion writable."""
+
+    features: int
+
+
+def _amplicon_sequences_copy_sql(path: Path, *, clearance: SequencesClearance) -> str:
+    """COPY each feature an amplicon table names, with its ASV sequence, to Parquet.
+    The feature ids are md5 hashes of the sequences, so this is the one file that
+    says what a row of the table is."""
+    del clearance  # Held, not read: holding it is the check.
+    return (
+        f"COPY (SELECT f.feature AS feature_id, f.sequence, f.length FROM {FEATURE_RELATION} f"
+        f" WHERE f.feature IN (SELECT feature_id FROM {ft.LABELLED_RELATION})"
+        f" ORDER BY f.feature) TO '{validate_parquet_path(path)}' ({PARQUET_OPTS_TRANSFER})"
+    )
+
+
 _COMPANIONS = (
     _Companion("taxonomy", ".taxonomy.parquet", ft.taxonomy_copy_sql),
     _Companion("tree", ".tree.parquet", ft.tree_copy_sql),
+    # The amplicon table's (`qiita feature-table runs`).
+    _Companion("sequences", ".sequences.parquet", _amplicon_sequences_copy_sql),
 )
+SEQUENCES_COMPANION = _COMPANIONS[-1]
 
 
 def _tool_versions(con) -> dict[str, str]:
@@ -875,7 +898,7 @@ def _requested_companions(*, taxonomy: bool, tree: bool) -> tuple[_Companion, ..
     than read off the namespace, so a renamed flag is a signature change here instead of a
     silently absent file."""
     asked = {"taxonomy": taxonomy, "tree": tree}
-    return tuple(companion for companion in _COMPANIONS if asked[companion.name])
+    return tuple(companion for companion in _COMPANIONS if asked.get(companion.name, False))
 
 
 # Written INTO the map as well as printed, because a warning that lives only in a
