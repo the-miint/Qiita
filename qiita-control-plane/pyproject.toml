@@ -35,7 +35,7 @@ dependencies = [
     # an integration parity test enforces parity. A bump whose release adds a
     # schema patch that can refuse existing values needs
     # `qiita-admin check-stored-preflights` run from the new build before deploy.
-    "run-preflight @ git+https://github.com/the-miint/kl-run-preflight@6dcda7bccd560578588c450eefde47d39af0b38b",
+    "run-preflight @ git+https://github.com/the-miint/kl-run-preflight@513611f21f0bc11f9a2ff50ee22efee5b5b06168",
 ]
 
 [project.scripts]
