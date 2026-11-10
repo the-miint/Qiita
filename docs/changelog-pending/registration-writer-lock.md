@@ -5,10 +5,10 @@
   these tables lost their commits to each other and re-ran, and under steady overlap one
   could lose every attempt and fail with `failed to commit the registration transaction
   within 120s`, as 55 of a 1,062-ticket myloasm backfill did on qiita-miint. Now a
-  registration whose tables are all run-keyed (myloasm provenance, `amplicon_membership`,
-  `assembly_membership`, `bin_quality`), of runs the lake does not hold yet, takes a Postgres advisory lock per run,
-  holds a global advisory lock shared, and only inserts, so such registrations overlap each
-  other. One that deletes — any registration with a `feature_idx`-keyed table, a run the
+  registration of runs the lake does not hold yet, whose tables are all run-keyed
+  (myloasm provenance, `amplicon_membership`, `assembly_membership`, `bin_quality`),
+  takes a Postgres advisory lock per run, holds a global advisory lock shared, and only
+  inserts, so such registrations overlap each other. One that deletes — any registration with a `feature_idx`-keyed table, a run the
   lake already holds, or a reference delete — holds the global lock exclusively, so no
   insert or delete into those tables commits beside it. The waits hold no pooled
   connection and end after 120 s in all; a registration that gives up, or cannot open its

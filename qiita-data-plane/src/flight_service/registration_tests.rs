@@ -3539,9 +3539,11 @@ fn a_sessions_waits_end_at_one_budget() {
             .expect_err("got the global lock while it was held");
         assert_eq!(refused.code(), tonic::Code::Unavailable);
     });
+    // The global wait used the rest of the budget, and no more.
     let elapsed = started.elapsed();
     assert!(
-        elapsed < budget + Duration::from_millis(250),
+        elapsed >= budget - Duration::from_millis(100)
+            && elapsed < budget + Duration::from_millis(400),
         "the waits took {elapsed:?} on a budget of {budget:?}"
     );
     drop(holding_global);

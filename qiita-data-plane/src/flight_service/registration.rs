@@ -334,8 +334,8 @@ fn incoming_keys_absent(
 /// at the one thread a lake write runs on (`pool::LakeWriter`); a 50M-row delete
 /// transaction measured 2.00 s at one thread against 1.32 s at six, locally.
 /// Writers that delete from a replace-keyed table reach COMMIT one at a time
-/// (`crate::lake_locks`), so this budget bounds the retries of a writer that lost
-/// anyway, not a wait for the others.
+/// (`crate::lake_locks`). This budget bounds a writer's retries after a lost
+/// COMMIT; it does not include time spent waiting for the lake locks.
 /// The DELETE's share of it is set by the spread of the incoming key set rather
 /// than by the table's size — `replace_key_delete_sql` carries what each key set
 /// scans, including the sets where it reads the whole table. Exceeding the

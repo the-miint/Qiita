@@ -1,5 +1,5 @@
 //! Postgres advisory locks that order writers of the lake's replace-keyed tables,
-//! and the in-process gates that keep their waiting off the connection pool.
+//! and the in-process gate that keeps their waiting off the connection pool.
 //!
 //! DuckLake detects conflicts per table: a `DELETE` conflicts with any concurrent
 //! insert into the same table, whatever keys either touches, and a writer that
