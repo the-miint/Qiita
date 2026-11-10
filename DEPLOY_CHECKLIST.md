@@ -31,7 +31,7 @@ _None yet._
 
 ### 5. Verify
 
-- `[operator]` (#TBD) `make verify-deploy`'s `catalog-connections` row now counts each data-plane instance as its pool size plus 2 lake lock sessions (`pool=<n>` in the catalog session name). If it fails on the budget, lower `DUCKLAKE_POOL_SIZE` in `/etc/qiita/data-plane.env` or raise `max_connections` on the catalog server, as its message says.
+- `[operator]` (#851) `make verify-deploy`'s `catalog-connections` row now counts each data-plane instance as its pool size plus 2 lake lock sessions (`pool=<n>` in the catalog session name). If it fails on the budget, lower `DUCKLAKE_POOL_SIZE` in `/etc/qiita/data-plane.env` or raise `max_connections` on the catalog server, as its message says.
 
 ### 6. After the deploy verifies green
 
@@ -44,7 +44,7 @@ _None yet._
 
 ### Notes (no host action)
 
-- (#TBD) The data plane no longer updates or creates `qiita_lake.registration_lock`; the existing table stays in the catalog, unused.
+- (#851) The data plane no longer updates or creates `qiita_lake.registration_lock`; the existing table stays in the catalog, unused.
 - (#849) `qiita-admin backfill myloasm-provenance` is removed, with the `myloasm-provenance-recover` workflow and job: every myloasm run of long-read-assembly 1.0.0/1.0.1 is recovered.
 
 ## Deployed history
