@@ -412,6 +412,8 @@ async def _dispatch_action_raising(
 ) -> tuple[BaseException, list]:
     """Run `_dispatch_action` with its primitive raising `exc` and the progress-row
     writes stubbed; returns what it raised and the failure kinds it recorded."""
+    import tempfile
+
     from qiita_common.actions import WorkflowAction
 
     from qiita_control_plane.runner import _reconstruct
@@ -431,6 +433,56 @@ async def _dispatch_action_raising(
     monkeypatch.setattr(_reconstruct, "_best_effort_record_failed", _record_failed)
     monkeypatch.setattr(_reconstruct, "_run_action_primitive", _raise)
     entry = WorkflowAction(kind="action", name=name, inputs=[], outputs=[])
+    # _dispatch_action writes the action's step log under the workspace, so it must
+    # be a real writable dir (not a placeholder path).
+    with tempfile.TemporaryDirectory() as workspace:
+        try:
+            await _reconstruct._dispatch_action(
+                run_context(
+                    pool=object(),
+                    scope_target={"kind": "prep_sample", "prep_sample_idx": 1},
+                    work_ticket_idx=1,
+                    signing_key=b"\x00" * 32,
+                    data_plane_url="grpc://dp:50051",
+                ),
+                entry,
+                {},
+                Path(workspace),
+                step_index=0,
+                attempt=0,
+            )
+        except BaseException as raised:
+            return raised, recorded
+    raise AssertionError("_dispatch_action did not raise")
+
+
+async def test_action_dispatch_writes_a_completed_receipt(monkeypatch, tmp_path):
+    """A successful `action:` entry writes one JSON receipt to the workspace step log
+    and names itself in the narrative (`runner/_reconstruct._dispatch_action`)."""
+    import json
+    import logging
+
+    from qiita_common.actions import WorkflowAction
+    from qiita_common.step_log import COMPLETED_KIND
+
+    from qiita_control_plane.runner import _reconstruct
+    from qiita_control_plane.workspace import step_logs_dir
+
+    async def _noop(*a, **k):
+        return None
+
+    async def _ok(*a, **k):
+        return {}
+
+    monkeypatch.setattr(_reconstruct.step_progress, "record_submitting", _noop)
+    monkeypatch.setattr(_reconstruct.step_progress, "record_completed", _noop)
+    monkeypatch.setattr(_reconstruct, "_run_action_primitive", _ok)
+    entry = WorkflowAction(kind="action", name="register-files", inputs=[], outputs=[])
+    # The narrative reaches capture_to's handler only if the root logger passes INFO,
+    # as the control plane configures it in production.
+    root = logging.getLogger()
+    prev_level = root.level
+    root.setLevel(logging.INFO)
     try:
         await _reconstruct._dispatch_action(
             run_context(
@@ -442,13 +494,19 @@ async def _dispatch_action_raising(
             ),
             entry,
             {},
-            Path("/unused"),
+            tmp_path,
             step_index=0,
             attempt=0,
         )
-    except BaseException as raised:
-        return raised, recorded
-    raise AssertionError("_dispatch_action did not raise")
+    finally:
+        root.setLevel(prev_level)
+    logs = step_logs_dir(tmp_path)
+    assert json.loads((logs / "stdout").read_text().strip()) == {
+        "kind": COMPLETED_KIND,
+        "step_name": "register-files",
+        "summary": {},
+    }
+    assert "register-files" in (logs / "stderr").read_text()
 
 
 async def test_action_entry_busy_data_plane_is_retried(monkeypatch):

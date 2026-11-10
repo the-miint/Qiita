@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import logging
+import time
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +34,7 @@ from qiita_common.models import (
     StepStatusWire,
     WorkTicketFailureStage,
 )
+from qiita_common.step_log import COMPLETED_KIND, capture_to, receipt, summarize, write_receipt
 
 from .. import step_progress
 from ..actions.library import (
@@ -65,6 +68,8 @@ from ._read_ingest import (
     SHARD_MAPPING_BINDING,
     _stage_shard_mapping,
 )
+
+_LOG = logging.getLogger(__name__)
 
 # =============================================================================
 # Restart-recovery output reconstruction
@@ -371,48 +376,70 @@ async def _dispatch_action(
         step_name=entry.name,
         compute_target=ComputeTarget.CONTROL_PLANE,
     )
-    try:
-        outputs = await _run_action_primitive(ctx, entry, bound, workspace)
-    except BackendFailure as exc:
-        await _best_effort_record_failed(
-            ctx.pool,
-            work_ticket_idx=ctx.work_ticket_idx,
-            step_index=step_index,
-            attempt=attempt,
-            failure_kind=exc.kind.value,
-            failure_reason=exc.reason[:2000],
-        )
-        raise
-    except Exception as exc:
-        if _action_failure_is_retriable(exc):
-            failure = BackendFailure(
-                kind=FailureKind.DATA_PLANE_TRANSIENT,
-                stage=WorkTicketFailureStage.STEP_RUN,
-                step_name=entry.name,
-                reason=f"{type(exc).__name__}: {exc!s}"[:2000],
+    # No scheduler captures an in-process action's output, so its step log
+    # (`qiita_common.step_log`) is written here, into the same files a SLURM
+    # step's logs land in. Every path that returns or raises an Exception writes
+    # one receipt; a BaseException (e.g. cancellation) leaves none — a cancelled
+    # step has no terminal outcome.
+    logs_dir = step_logs_dir(workspace)
+    started = time.monotonic()
+    with capture_to(logs_dir, entry.name) as scope:
+        _LOG.info("started: %s on the control plane", entry.name)
+        try:
+            outputs = await _run_action_primitive(ctx, entry, bound, workspace)
+        except BackendFailure as exc:
+            _LOG.error("failed after %.0fs: %s", time.monotonic() - started, exc.reason)
+            write_receipt(logs_dir, receipt(exc.kind.value, entry.name, reason=exc.reason))
+            await _best_effort_record_failed(
+                ctx.pool,
+                work_ticket_idx=ctx.work_ticket_idx,
+                step_index=step_index,
+                attempt=attempt,
+                failure_kind=exc.kind.value,
+                failure_reason=exc.reason[:2000],
+            )
+            raise
+        except Exception as exc:
+            if _action_failure_is_retriable(exc):
+                failure = BackendFailure(
+                    kind=FailureKind.DATA_PLANE_TRANSIENT,
+                    stage=WorkTicketFailureStage.STEP_RUN,
+                    step_name=entry.name,
+                    reason=f"{type(exc).__name__}: {exc!s}"[:2000],
+                )
+                _LOG.error("failed after %.0fs: %s", time.monotonic() - started, failure.reason)
+                write_receipt(
+                    logs_dir, receipt(failure.kind.value, entry.name, reason=failure.reason)
+                )
+                await _best_effort_record_failed(
+                    ctx.pool,
+                    work_ticket_idx=ctx.work_ticket_idx,
+                    step_index=step_index,
+                    attempt=attempt,
+                    failure_kind=failure.kind.value,
+                    failure_reason=failure.reason,
+                )
+                raise failure from exc
+            # Plain Python from a LIBRARY primitive (untyped failure / bug), or a
+            # data-plane failure this entry is not re-run on. The outer run_workflow
+            # handler classifies it UNKNOWN_PERMANENT; record the same on the progress
+            # row, then re-raise unchanged.
+            reason = f"{type(exc).__name__}: {exc!s}"
+            _LOG.error("failed after %.0fs: %s", time.monotonic() - started, reason)
+            write_receipt(
+                logs_dir, receipt(FailureKind.UNKNOWN_PERMANENT.value, entry.name, reason=reason)
             )
             await _best_effort_record_failed(
                 ctx.pool,
                 work_ticket_idx=ctx.work_ticket_idx,
                 step_index=step_index,
                 attempt=attempt,
-                failure_kind=failure.kind.value,
-                failure_reason=failure.reason,
+                failure_kind=FailureKind.UNKNOWN_PERMANENT.value,
+                failure_reason=reason[:2000],
             )
-            raise failure from exc
-        # Plain Python from a LIBRARY primitive (untyped failure / bug), or a
-        # data-plane failure this entry is not re-run on. The outer run_workflow
-        # handler classifies it UNKNOWN_PERMANENT; record the same on the progress
-        # row, then re-raise unchanged.
-        await _best_effort_record_failed(
-            ctx.pool,
-            work_ticket_idx=ctx.work_ticket_idx,
-            step_index=step_index,
-            attempt=attempt,
-            failure_kind=FailureKind.UNKNOWN_PERMANENT.value,
-            failure_reason=f"{type(exc).__name__}: {exc!s}"[:2000],
-        )
-        raise
+            raise
+        _LOG.info("completed in %.0fs", time.monotonic() - started)
+        write_receipt(logs_dir, receipt(COMPLETED_KIND, entry.name, summary=scope.summary))
     await step_progress.record_completed(
         ctx.pool, work_ticket_idx=ctx.work_ticket_idx, step_index=step_index, attempt=attempt
     )
@@ -498,13 +525,15 @@ async def _run_action_primitive(
         # from `bound` so a ticket whose action_context carries it picks up
         # genome-association writes for free.
         genome_map = bound.get("genome_map_path")
-        feature_map_path, _, _ = await LIBRARY[LibraryPrimitive.MINT_FEATURES](
+        feature_map_path, minted, reused = await LIBRARY[LibraryPrimitive.MINT_FEATURES](
             ctx.pool,
             manifest_path,
             workspace,
             genome_map_path=Path(genome_map) if genome_map else None,
             scope=f"work_ticket {ctx.work_ticket_idx}",
         )
+        _LOG.info("%d features: %d new, %d already known", minted + reused, minted, reused)
+        summarize(features_new=minted, features_known=reused)
         # YAML declares one output (typically "feature_map"); bind it.
         return {entry.outputs[0]: feature_map_path}
 
@@ -573,6 +602,13 @@ async def _run_action_primitive(
     if entry.name == LibraryPrimitive.REGISTER_FILES:
         staging_dir = Path(bound[entry.inputs[0]])
         files = _register_files_payload(workspace, staging_dir)
+        tables: dict[str, int] = {}
+        for table in files.values():
+            tables[table] = tables.get(table, 0) + 1
+        _LOG.info(
+            "registering %s",
+            ", ".join(f"{t} ({n} file{'s' if n > 1 else ''})" for t, n in tables.items()),
+        )
         await LIBRARY[LibraryPrimitive.REGISTER_FILES](
             staging_dir=str(staging_dir),
             files=files,
@@ -580,6 +616,7 @@ async def _run_action_primitive(
             signing_key=ctx.signing_key,
             data_plane_url=ctx.data_plane_url,
         )
+        summarize(tables=tables)
         return {}
 
     if entry.name == LibraryPrimitive.REGISTER_INDEX:

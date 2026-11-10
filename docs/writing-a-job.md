@@ -159,6 +159,9 @@ shape ([`qiita_common/step_log.py`](../qiita-common/src/qiita_common/step_log.py
   ends. Call `summarize(name=count, ...)` with the counts that describe the
   result, and they become the receipt's `summary`.
 
+An `action:` entry gets the same two files from the runner, so a library
+primitive logs and summarizes the same way.
+
 ## `plan` — optional resource sizing
 
 `def plan(inputs: Inputs) -> JobPlan` (sync — it runs at **submit time** in the
