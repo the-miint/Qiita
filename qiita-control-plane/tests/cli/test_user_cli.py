@@ -47,7 +47,6 @@ from qiita_common.api_paths import (
 )
 from qiita_common.auth_constants import BEARER_PREFIX, SystemRole
 from qiita_common.models import LEGACY_IDX_RESERVED_CEILING, BiosampleRef, StudyRef
-from qiita_common.models.biosample import MAX_ROSTER_TUBE_TEXT_LENGTH
 from run_preflight.constants import InputSampleIdentifierKind, ProjectIdentifierKind
 from run_preflight.db import (
     ERR_CATEGORY_MISSING_IDENTIFIER,
@@ -3451,7 +3450,7 @@ def test__read_preflight_rows_refuses_a_missing_identifier(illumina_preflight, c
 
 
 def test__read_preflight_rows_overlong_identifier(
-    illumina_preflight, set_overlong_matrix_tube_ids, capsys
+    illumina_preflight, set_overlong_matrix_tube_ids, overlong_tube_message, capsys
 ):
     """Tests the case where a sample's identifier is longer than its ref allows: the
     operator sees the sample and the field as one stderr line, not a traceback."""
@@ -3461,8 +3460,7 @@ def test__read_preflight_rows_overlong_identifier(
         _read_preflight_rows(db, argparse.ArgumentParser())
     assert exc_info.value.code == 2
     err = capsys.readouterr().err
-    message = f"sample_idx 1: biosample matrix_tube_id: Value should have at most {MAX_ROSTER_TUBE_TEXT_LENGTH} items after validation, not {MAX_ROSTER_TUBE_TEXT_LENGTH + 1}"  # noqa: E501
-    assert message in err
+    assert f"sample_idx 1: {overlong_tube_message}" in err
 
 
 def test_submit_bcl_convert_records_no_host_refs(monkeypatch, tmp_path, capsys, preflight_stub):

@@ -120,8 +120,8 @@ def _read_preflight_rows(
     except ValueError as exc:
         # The library refuses a pre-flight without exactly one run, a control /
         # project mismatch, or an entity with no identifier. sample_refs refuses a
-        # sample whose identifier its ref does not accept. Each message names the
-        # offender.
+        # sample with an identifier that its ref does not accept. Each message names
+        # the offender.
         parser.error(f"--preflight-blob {preflight_blob}: {exc}")
     finally:
         conn.close()

@@ -30,7 +30,6 @@ import sqlite3
 
 import pytest
 from qiita_common.models import BiosampleRef, StudyRef
-from qiita_common.models.biosample import MAX_ROSTER_TUBE_TEXT_LENGTH
 from run_preflight.db import InputSampleIdentifiers, PlatformSampleInfo, ProjectIdentifiers
 
 from qiita_control_plane.cli.user.amplicon import _read_amplicon_preflight_rows
@@ -58,7 +57,6 @@ _IDENTIFIER_COLUMNS = (
     ("project", "study_export_entity_id"),
 )
 _BLANK_OR_PADDED_VALUES = ("", "  ", " X1", "X1\t")
-_OVERLONG_TUBE_MESSAGE = f"biosample matrix_tube_id: Value should have at most {MAX_ROSTER_TUBE_TEXT_LENGTH} items after validation, not {MAX_ROSTER_TUBE_TEXT_LENGTH + 1}"  # noqa: E501
 
 
 @pytest.mark.parametrize(
@@ -146,10 +144,9 @@ def test_sample_refs():
     assert sample_refs(info) == expected
 
 
-def test_sample_refs_overlong_identifier():
+def test_sample_refs_overlong_identifier(overlong_tube_id, overlong_tube_message):
     """Tests the case where a library record carries an identifier longer than its
     ref allows: the refusal names the sample, the entity and the field."""
-    overlong_tube = "1" * (MAX_ROSTER_TUBE_TEXT_LENGTH + 1)
     info = PlatformSampleInfo(
         sample_idx=7,
         sample_type="standard",
@@ -157,7 +154,7 @@ def test_sample_refs_overlong_identifier():
             biosample_accession=None,
             ena_sample_accession=None,
             biosample_export_entity_id=None,
-            matrix_tube_id=overlong_tube,
+            matrix_tube_id=overlong_tube_id,
         ),
         primary_project=ProjectIdentifiers(
             bioproject_accession="PRJNA1", ena_study_accession=None, study_export_entity_id=None
@@ -167,7 +164,7 @@ def test_sample_refs_overlong_identifier():
     )
     with pytest.raises(ValueError) as exc_info:
         sample_refs(info)
-    assert str(exc_info.value) == f"sample_idx 7: {_OVERLONG_TUBE_MESSAGE}"
+    assert str(exc_info.value) == f"sample_idx 7: {overlong_tube_message}"
 
 
 @pytest.mark.parametrize("value", _BLANK_OR_PADDED_VALUES)
@@ -240,15 +237,15 @@ def test_amplicon_samples_refuse_what_the_cli_refuses(build_amplicon_preflight, 
 
 
 def test_amplicon_samples_overlong_identifier(
-    build_amplicon_preflight, set_overlong_matrix_tube_ids
+    build_amplicon_preflight, set_overlong_matrix_tube_ids, overlong_tube_message
 ):
     """Tests the case where a sample's identifier is longer than its ref allows: the
     server refuses it as pre-flight content, and the CLI with the same message."""
     db = build_amplicon_preflight()
     set_overlong_matrix_tube_ids(db)
-    with pytest.raises(AmpliconPreflightError, match=_OVERLONG_TUBE_MESSAGE):
+    with pytest.raises(AmpliconPreflightError, match=overlong_tube_message):
         amplicon_barcode_from_blob(db.read_bytes())
-    with pytest.raises(RaisingParser.Error, match=_OVERLONG_TUBE_MESSAGE):
+    with pytest.raises(RaisingParser.Error, match=overlong_tube_message):
         _read_amplicon_preflight_rows(db, RaisingParser())
 
 

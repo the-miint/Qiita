@@ -21,7 +21,6 @@ from pathlib import Path
 import httpx
 import pytest
 from qiita_common.models import BiosampleRef, PacbioRunIndex, StudyRef
-from qiita_common.models.biosample import MAX_ROSTER_TUBE_TEXT_LENGTH
 from qiita_common.pacbio import index_run_bams
 
 from qiita_control_plane.cli import _common
@@ -265,14 +264,13 @@ def test_read_preflight_rows_fails_on_missing_identifier(build_case5_preflight):
 
 
 def test__read_pacbio_preflight_rows_overlong_identifier(
-    build_case5_preflight, set_overlong_matrix_tube_ids
+    build_case5_preflight, set_overlong_matrix_tube_ids, overlong_tube_message
 ):
     """Tests the case where a sample's identifier is longer than its ref allows: the
     operator sees the sample and the field through the parser, not a traceback."""
     db = build_case5_preflight()
     set_overlong_matrix_tube_ids(db)
-    message = f"biosample matrix_tube_id: Value should have at most {MAX_ROSTER_TUBE_TEXT_LENGTH} items after validation, not {MAX_ROSTER_TUBE_TEXT_LENGTH + 1}"  # noqa: E501
-    with pytest.raises(RaisingParser.Error, match=message):
+    with pytest.raises(RaisingParser.Error, match=overlong_tube_message):
         _read_pacbio_preflight_rows(db, RaisingParser())
 
 
@@ -280,7 +278,7 @@ def test__read_pacbio_preflight_rows_rejects_a_non_sqlite_blob(tmp_path, capsys)
     """Tests the case where --preflight-blob names a file that is not a SQLite
     database at all — the operator pointed at the CSV, or at a truncated copy.
 
-    Uses a real `argparse.ArgumentParser` rather than this module's `RaisingParser`,
+    Uses a real `argparse.ArgumentParser` rather than `RaisingParser`,
     because the assertion is the argparse behaviour itself: one stderr line and exit
     2, not a traceback. Pins the message, since a load failure and a query failure
     are reported differently and the operator's next move differs."""

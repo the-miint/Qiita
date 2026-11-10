@@ -88,7 +88,7 @@ def _ref_from_record[RefT: (BiosampleRef, StudyRef)](
     """Build `ref_model` from a kl-run-preflight identifier record.
 
     RAISES `ValueError` naming the sample, the entity and each refused field
-    when the record holds a value the ref refuses.
+    when the record holds a value that the ref refuses.
     """
     fields = {_RECORD_FIELD_RENAMES.get(k, k): v for k, v in record._asdict().items()}
     try:
@@ -104,7 +104,7 @@ def _ref_from_record[RefT: (BiosampleRef, StudyRef)](
 def sample_refs(info: PlatformSampleInfo) -> SampleRefs:
     """The refs for one sample read by a kl-run-preflight platform reader.
 
-    RAISES `ValueError` when an identifier holds a value its ref refuses.
+    RAISES `ValueError` when an identifier holds a value that its ref refuses.
     """
     idx = info.sample_idx
     biosample = _ref_from_record(info.biosample, BiosampleRef, sample_idx=idx, entity="biosample")
@@ -252,9 +252,10 @@ def amplicon_samples(conn: sqlite3.Connection) -> list[AmpliconSample]:
     identified pre-flight the submission does.
 
     RAISES `AmpliconPreflightError` for a non-amplicon sheet, an empty sample set,
-    or a sample with an empty or NULL barcode — the accessor's "missing required
-    identifier" is re-raised as this type too, so a pre-flight whose CONTENT
-    cannot supply a roster is one exception kind.
+    a sample with an empty or NULL barcode, or a sample with an identifier that its
+    ref refuses — the accessor's "missing required identifier" is re-raised as
+    this type too, so a pre-flight whose CONTENT cannot supply a roster is one
+    exception kind.
     `sqlite3.DatabaseError` / `ValueError` still surface for a pre-flight that
     cannot be READ (an unreadable blob, or `run_sheet_type`'s dependency-drift
     `ValueError`) — a different failure the caller maps differently.

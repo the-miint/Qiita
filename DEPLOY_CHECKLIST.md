@@ -25,8 +25,7 @@ _None yet._
   `matrix_tube_id`), and a stored pre-flight that fails to open can no longer be read by the
   pool roster, the runner or a re-submit. Expect `unopenable: 0` and exit 0; if any are
   listed, stop before deploying and raise them. On the `redeploy.sh` fast path, pull first
-  and run this before it. Run it again after the restart: the old build keeps accepting
-  submissions and lane edits until then, and the first run does not see those. (#840)
+  and run this before it. (#840)
   ```bash
   # [operator] in the pulled checkout; DATABASE_URL as in redeploy.md §4
   set -a; . /etc/qiita/control-plane.env; set +a
@@ -43,7 +42,10 @@ _None yet._
 
 ### 5. Verify
 
-_None yet._
+- `[operator]` **Run `qiita-admin check-stored-preflights` again, as in bucket 2.** The old
+  build kept accepting submissions and lane edits until the restart, and the bucket-2 run
+  did not see those. Expect `unopenable: 0`; if any are listed, raise them with an admin,
+  who corrects the stored pre-flight by hand. (#840)
 
 ### 6. After the deploy verifies green
 

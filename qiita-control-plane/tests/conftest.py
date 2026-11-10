@@ -151,6 +151,7 @@ _PROJECT_IDENTIFIER_VALUES = {
     "study_export_entity_id": lambda position, external_id: f"QS{position}",
 }
 _OVERLONG_TUBE_LENGTH = MAX_ROSTER_TUBE_TEXT_LENGTH + 1
+_OVERLONG_TUBE_MESSAGE = f"biosample matrix_tube_id: Value should have at most {MAX_ROSTER_TUBE_TEXT_LENGTH} items after validation, not {_OVERLONG_TUBE_LENGTH}"  # noqa: E501
 
 
 @pytest.fixture
@@ -210,6 +211,18 @@ def set_overlong_matrix_tube_ids():
             conn.close()
 
     return _set
+
+
+@pytest.fixture
+def overlong_tube_id() -> str:
+    """A matrix_tube_id one character longer than a roster ref allows."""
+    return "1" * _OVERLONG_TUBE_LENGTH
+
+
+@pytest.fixture
+def overlong_tube_message() -> str:
+    """The refusal a biosample ref gives for an over-long matrix_tube_id."""
+    return _OVERLONG_TUBE_MESSAGE
 
 
 @pytest.fixture
