@@ -1,8 +1,8 @@
 """tests for the amplicon_load job.
 
 call execute() directly on synthesized asv_counts + feature_map + manifest +
-asv_chunks, and assert the three staging parquets (membership + the two ASV
-sequence tables). no miint; a plain in-memory DuckDB writes the fixtures and
+asv_chunks, and assert the two staging parquets (membership + the ASV sequence
+table, bytes inline). no miint; a plain in-memory DuckDB writes the fixtures and
 reads the results back.
 """
 
@@ -105,10 +105,10 @@ def test_shared_asv_keeps_per_sample_rows(inputs):
     assert feature_100 == [(11, 42, 100, 7), (12, 42, 100, 5)]
 
 
-def test_writes_asv_sequence_tables(inputs):
-    """The ASV bytes are stored: amplicon_sequence carries one row per feature_idx
-    (with length), and amplicon_sequence_chunks re-keys the deblur chunks from
-    sequence_hash to feature_idx so an ASV never has to be recomputed to read."""
+def test_writes_asv_sequence_table(inputs):
+    """The ASV bytes are stored inline: amplicon_sequence carries one row per
+    feature_idx with its hash, length, and the sequence itself — reassembled from the
+    deblur chunks and re-keyed hash -> feature_idx. No separate chunk table."""
     inp, ws = inputs
     out = asyncio.run(execute(inp, ws))
     staging = out["staging_dir"]
@@ -116,17 +116,13 @@ def test_writes_asv_sequence_tables(inputs):
 
     with duckdb.connect(":memory:") as conn:
         seqs = conn.execute(
-            f"SELECT feature_idx, sequence_hash, sequence_length_bp "
+            f"SELECT feature_idx, sequence_hash, sequence_length_bp, sequence "
             f"FROM read_parquet('{staging / 'amplicon_sequence.parquet'}') ORDER BY feature_idx"
         ).fetchall()
-        chunks = conn.execute(
-            f"SELECT feature_idx, chunk_index, chunk_data "
-            f"FROM read_parquet('{staging / 'amplicon_sequence_chunks' / 'part_*.parquet'}') "
-            f"ORDER BY feature_idx, chunk_index"
-        ).fetchall()
 
-    assert seqs == [(100, ha, 1), (200, hb, 1), (300, hc, 1)]
-    assert chunks == [(100, 0, "A"), (200, 0, "B"), (300, 0, "C")]
+    assert seqs == [(100, ha, 1, "A"), (200, hb, 1, "B"), (300, hc, 1, "C")]
+    # An ASV is short, so its bytes are inline — no chunk table is written.
+    assert not (staging / "amplicon_sequence_chunks").exists()
 
 
 def test_unmapped_hash_fails_loud(inputs):
