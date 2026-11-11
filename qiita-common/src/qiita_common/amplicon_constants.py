@@ -9,13 +9,11 @@ here.
 
 # One row per (prep_sample_idx, processing_idx, feature_idx) with its count.
 AMPLICON_MEMBERSHIP_TABLE = "amplicon_membership"
-# One row per ASV feature_idx: its sequence hash and length.
+# One row per ASV feature_idx: its sequence hash, length, and the sequence itself.
+# An ASV is short (a single 64 KB chunk at most), so its bytes are stored inline here
+# rather than in a separate chunk table — unlike a reference genome, which is chunked.
 AMPLICON_SEQUENCE_TABLE = "amplicon_sequence"
-# The ASV bytes, chunked, keyed by feature_idx.
-AMPLICON_SEQUENCE_CHUNKS_TABLE = "amplicon_sequence_chunks"
 
 # register-files names a staged table after its file stem.
 AMPLICON_MEMBERSHIP_BASENAME = f"{AMPLICON_MEMBERSHIP_TABLE}.parquet"
 AMPLICON_SEQUENCE_BASENAME = f"{AMPLICON_SEQUENCE_TABLE}.parquet"
-# The chunks stage as a directory of Parquet files named after the table.
-AMPLICON_SEQUENCE_CHUNKS_BASENAME = AMPLICON_SEQUENCE_CHUNKS_TABLE
