@@ -3239,8 +3239,10 @@ fn writers_that_delete_commit_at_the_first_attempt_under_the_global_lock() {
     assert!(lost > 0, "8 overlapping writers that delete lost no COMMIT");
 }
 
-/// Concurrent registrations of the same new run leave one copy of it: the global
-/// lock lets one in at a time, and each after the first replaces the run.
+/// Concurrent registrations of the same new run all succeed and leave one copy of
+/// it. One copy is also what DuckLake's conflict detection leaves without the lock
+/// (each loser re-runs and replaces the run); this pins that the locked path keeps
+/// it.
 #[test]
 #[serial_test::serial]
 #[cfg(feature = "integration")]
@@ -3269,6 +3271,80 @@ fn concurrent_registrations_of_one_new_run_leave_one_copy() {
         rows, 3,
         "4 concurrent loads of one run, one copy of its 3 rows"
     );
+}
+
+/// A registration waiting for the lake lock holds no pooled connection: the writer
+/// that ran its checks and moves is returned before the wait, and the one that
+/// commits is checked out after it.
+#[test]
+#[serial_test::serial]
+#[cfg(feature = "integration")]
+fn a_registration_waiting_for_the_lock_holds_no_pooled_writer() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct Counted<'a> {
+        writer: &'a LakeWriter,
+        out: &'a AtomicUsize,
+    }
+    impl std::borrow::Borrow<LakeWriter> for Counted<'_> {
+        fn borrow(&self) -> &LakeWriter {
+            self.writer
+        }
+    }
+    impl Drop for Counted<'_> {
+        fn drop(&mut self) {
+            self.out.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    prepare_amplicon_and_assembly_tables();
+    let connstr = crate::test_catalog::connstr();
+    let data_path = crate::test_catalog::data_path();
+    let feature = 978_000_000 + std::process::id() as i64;
+    let staging = seed_assembly_staging(&[(
+        feature,
+        &format!("00000000-0000-0000-0000-{feature:012}"),
+        &["ACGTACGT", "ACGT"],
+    )]);
+    let payload = assembly_register_payload(&staging, 1, feature);
+
+    let holder = LakeLocks::new(connstr.clone());
+    let mut held = holder.session("the test holder").unwrap();
+    held.lock_global().unwrap();
+    let out = AtomicUsize::new(0);
+    let checkouts = AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        let registering = scope.spawn(|| {
+            let conn = attached_writer(&connstr, &data_path);
+            let checkout = || {
+                out.fetch_add(1, Ordering::SeqCst);
+                checkouts.fetch_add(1, Ordering::SeqCst);
+                Ok(Counted {
+                    writer: &conn,
+                    out: &out,
+                })
+            };
+            register_files(
+                &checkout,
+                &LakeLocks::new(connstr.clone()),
+                &data_path,
+                std::path::Path::new("/"),
+                &payload,
+            )
+            .map(|registration| registration.registered.len())
+        });
+        // Long enough for the checks and moves to finish and the wait to begin.
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        assert!(!registering.is_finished(), "the registration did not wait");
+        assert_eq!(
+            out.load(Ordering::SeqCst),
+            0,
+            "a pooled writer is held during the lock wait"
+        );
+        drop(held);
+        let registered = registering.join().unwrap().expect("the registration");
+        assert_eq!(registered, payload.files.len());
+    });
+    assert_eq!(checkouts.load(Ordering::SeqCst), 2, "one writer per phase");
 }
 
 /// A registration that gives up waiting for its lake lock puts its moved files
@@ -3487,23 +3563,16 @@ fn a_sessions_waits_end_at_one_budget() {
     drop(holding_global);
 }
 
-/// A session reads as holding the global lock once it took it, and as not holding
-/// it once Postgres ended the session's backend, which released the lock.
+/// Postgres releases the lock when the session's backend ends: another session
+/// takes it at once.
 #[test]
 #[serial_test::serial]
 #[cfg(feature = "integration")]
-fn a_lock_session_whose_backend_ended_no_longer_holds_the_lock() {
+fn a_lock_is_released_when_its_session_backend_ends() {
     let connstr = crate::test_catalog::connstr();
     let locks = LakeLocks::new(connstr.clone());
     let mut session = locks.session("the test session").unwrap();
-    let not_yet = session
-        .check_held()
-        .expect_err("a session that has not taken the lock reads as holding it");
-    assert_eq!(not_yet.code(), tonic::Code::Unavailable);
     session.lock_global().unwrap();
-    session
-        .check_held()
-        .expect("the holder reads as holding it");
 
     let pid = session.backend_pid();
     let killer =
@@ -3521,81 +3590,9 @@ fn a_lock_session_whose_backend_ended_no_longer_holds_the_lock() {
         .unwrap();
     assert!(ended, "the session's backend was not ended");
 
-    let lost = session
-        .check_held()
-        .expect_err("a session whose backend ended reads as holding the lock");
-    assert_eq!(lost.code(), tonic::Code::Unavailable, "{}", lost.message());
-    // The lock was released with the backend: another session takes it at once.
     let next = LakeLocks::with_budget(connstr, std::time::Duration::from_millis(500));
     let mut taker = next.session("the next taker").unwrap();
     taker.lock_global().expect("the lock was not released");
-}
-
-/// A lake transaction whose lock session lost the lock before its COMMIT rolls
-/// back and fails UNAVAILABLE, so the step is run again, rather than committing
-/// unordered.
-#[test]
-#[serial_test::serial]
-#[cfg(feature = "integration")]
-fn a_transaction_whose_lock_was_lost_does_not_commit() {
-    let connstr = crate::test_catalog::connstr();
-    let data_path = crate::test_catalog::data_path();
-    let writer = attached_writer(&connstr, &data_path);
-    writer
-        .execute_batch("CREATE TABLE IF NOT EXISTS qiita_lake.lock_loss_probe (marker BIGINT);")
-        .unwrap();
-    let marker = 990_000_000 + std::process::id() as i64;
-
-    let locks = LakeLocks::new(connstr.clone());
-    let mut session = locks.session("the test writer").unwrap();
-    session.lock_global().unwrap();
-    let killer =
-        crate::lake_locks::open_lock_connection(&connstr, std::time::Duration::from_secs(5))
-            .unwrap();
-    killer
-        .query_row(
-            &format!(
-                "SELECT ended FROM postgres_query('lock_session', \
-                 'SELECT pg_terminate_backend({}) AS ended')",
-                session.backend_pid()
-            ),
-            [],
-            |row| row.get::<_, bool>(0),
-        )
-        .unwrap();
-
-    let refused = transact_with_retry(
-        &writer,
-        "the probe transaction",
-        "marker",
-        0,
-        Some(&session),
-        |_| {
-            writer
-                .execute(
-                    "INSERT INTO qiita_lake.lock_loss_probe VALUES (?)",
-                    [marker],
-                )
-                .map_err(|e| Status::internal(e.to_string()))?;
-            Ok(((), String::new()))
-        },
-        |_| Ok(false),
-    )
-    .expect_err("a transaction committed after its lock was lost");
-    assert_eq!(
-        refused.code(),
-        tonic::Code::Unavailable,
-        "{}",
-        refused.message()
-    );
-    let rows: i64 = writer
-        .query_row(
-            "SELECT count(*) FROM qiita_lake.lock_loss_probe WHERE marker = ?",
-            [marker],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(rows, 0, "the transaction's row was committed");
 }
 
 /// A lock session asks the catalog server for the keepalives that end it when
@@ -3623,4 +3620,53 @@ fn a_lock_session_sets_its_server_keepalives() {
     assert_eq!(setting("tcp_keepalives_idle"), "30");
     assert_eq!(setting("tcp_keepalives_interval"), "10");
     assert_eq!(setting("tcp_keepalives_count"), "3");
+}
+
+/// A lock session keeps the lock past an `idle_in_transaction_session_timeout`
+/// set on the catalog's database, while it sits idle in its transaction.
+#[test]
+#[serial_test::serial]
+#[cfg(feature = "integration")]
+fn a_lock_session_outlasts_an_idle_in_transaction_timeout() {
+    let connstr = crate::test_catalog::connstr();
+    let admin = duckdb::Connection::open_in_memory().unwrap();
+    admin
+        .execute_batch(&format!(
+            "LOAD postgres; ATTACH '{connstr}' AS admin (TYPE postgres);"
+        ))
+        .unwrap();
+    let database: String = admin
+        .query_row(
+            "SELECT db FROM postgres_query('admin', 'SELECT current_database() AS db')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let alter = |value: &str| {
+        admin
+            .execute_batch(&format!(
+                "CALL postgres_execute('admin', \
+                 'ALTER DATABASE \"{database}\" {value}');"
+            ))
+            .unwrap();
+    };
+    struct Reset<F: Fn(&str)>(F);
+    impl<F: Fn(&str)> Drop for Reset<F> {
+        fn drop(&mut self) {
+            (self.0)("RESET idle_in_transaction_session_timeout");
+        }
+    }
+    alter("SET idle_in_transaction_session_timeout = ''500ms''");
+    let _reset = Reset(alter);
+
+    let locks = LakeLocks::new(connstr.clone());
+    let mut session = locks.session("the idle holder").unwrap();
+    session.lock_global().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    let other = LakeLocks::with_budget(connstr, std::time::Duration::from_millis(300));
+    let mut taker = other.session("another writer").unwrap();
+    taker
+        .lock_global()
+        .expect_err("the idle-in-transaction timeout ended the holder's session");
+    drop(session);
 }

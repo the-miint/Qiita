@@ -1224,6 +1224,8 @@ qiita_require_lake_data_path() {
 # register_files holds a catalog session in `active` or `idle in transaction`,
 # while an idle data plane's sessions are `idle`, and a DoPut holds its
 # `upload.parquet.partial` open (all measured against a running data plane, macOS).
+# A register_files queued for a lake lock session holds no catalog session while it
+# queues, so it is not seen here; the drain lets it finish.
 # A read export writes through a `.partial` too, so it counts as well. Open files
 # are found through each unit's /proc/<pid>/fd (the match measured in a Linux
 # container). The catalog query, QIITA_CATALOG_IDLE_SQL, connects with the data

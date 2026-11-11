@@ -8,7 +8,7 @@ use arrow_flight::Action;
 use tonic::{Response, Status};
 
 use crate::auth;
-use crate::lake_locks::{LakeLocks, LockSession};
+use crate::lake_locks::LakeLocks;
 use crate::pool::LakeWriter;
 
 use super::export::validate_export_dest;
@@ -186,7 +186,8 @@ pub(super) fn locked_delete_reference<W: std::borrow::Borrow<LakeWriter>>(
         "the reference delete reference_idx={reference_idx}"
     ))?;
     session.lock_global()?;
-    delete_reference(checkout()?.borrow(), reference_idx, Some(&session))
+    // `session` holds the lock until it is dropped, after the delete returns.
+    delete_reference(checkout()?.borrow(), reference_idx)
 }
 
 /// Delete every DuckLake row belonging to a reference.
@@ -205,11 +206,7 @@ pub(super) fn locked_delete_reference<W: std::borrow::Borrow<LakeWriter>>(
 /// Order matters: the sequence deletes run *before* the membership delete so
 /// the orphan subquery can still see this reference's rows. Idempotent — a
 /// reference with no loaded data deletes zero rows and still succeeds.
-fn delete_reference(
-    conn: &LakeWriter,
-    reference_idx: i64,
-    held: Option<&LockSession<'_>>,
-) -> Result<serde_json::Value, Status> {
+fn delete_reference(conn: &LakeWriter, reference_idx: i64) -> Result<serde_json::Value, Status> {
     let exec = |sql: &str, params: &[i64]| -> Result<usize, Status> {
         // duckdb's params! wants &dyn ToSql; i64 implements it. Build the
         // slice explicitly so the same helper serves the 1- and 2-param calls.
@@ -266,7 +263,6 @@ fn delete_reference(
         "the reference delete",
         &format!("reference_idx={reference_idx}"),
         reference_idx,
-        held,
         |_attempt| {
             let sequences_deleted = exec(
                 &format!("DELETE FROM qiita_lake.reference_sequences WHERE {orphan_filter}"),

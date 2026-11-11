@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 use tonic::{Response, Status};
 
 use crate::auth;
-use crate::lake_locks::{LakeLocks, LockSession};
+use crate::lake_locks::LakeLocks;
 use crate::pool::LakeWriter;
 
 use super::QiitaFlightService;
@@ -313,11 +313,6 @@ fn lake_commit_backoff(attempt: u32, salt: i64) -> std::time::Duration {
 /// reference it writes for), the attempt, its outcome and that detail. `salt`
 /// only spreads the backoff (see `lake_commit_backoff`).
 ///
-/// `held` is the lock session a writer of a replace-keyed table holds the lake
-/// lock in. Each attempt checks it still holds the lock just before its COMMIT
-/// (`LockSession::check_held`), and when it does not, rolls back and fails with
-/// that check's UNAVAILABLE rather than committing unordered.
-///
 /// A COMMIT that reports an error may still have landed: when the catalog's
 /// connection drops after Postgres committed, before its answer arrives, the
 /// COMMIT errors and the rows are there, and a re-run of an add registers them
@@ -334,7 +329,6 @@ pub(super) fn transact_with_retry<T>(
     what: &str,
     subject: &str,
     salt: i64,
-    held: Option<&LockSession<'_>>,
     mut body: impl FnMut(u32) -> Result<(T, String), Status>,
     mut landed: impl FnMut(&T) -> Result<bool, Status>,
 ) -> Result<T, Status> {
@@ -353,15 +347,6 @@ pub(super) fn transact_with_retry<T>(
             }
         };
         let body_ms = started.elapsed().as_millis();
-        if let Some(Err(e)) = held.map(LockSession::check_held) {
-            let _ = conn.execute_batch("ROLLBACK");
-            eprintln!(
-                "lake-write: {what} {subject} attempt={attempt} body_ms={body_ms} {detail} \
-                 outcome=rolled back: {}",
-                e.message()
-            );
-            return Err(e);
-        }
 
         let committing = std::time::Instant::now();
         let commit = conn.execute_batch("COMMIT");
@@ -418,8 +403,7 @@ struct Registration {
     /// delete nothing recorded is the one thing an operator reconciling row
     /// counts cannot reconstruct.
     replaced: BTreeMap<&'static str, usize>,
-    /// Which attempt of the transaction committed, from 0; 0 for a replay. Read by
-    /// tests that check writers did not lose COMMITs to each other.
+    /// Which attempt of the transaction committed, from 0; 0 for a replay.
     #[cfg_attr(not(test), allow(dead_code))]
     attempt: u32,
 }
@@ -762,7 +746,6 @@ fn register_files<W: std::borrow::Borrow<LakeWriter>>(
         "the registration transaction",
         &subject,
         payload.work_ticket_idx,
-        session.as_ref(),
         |attempt| {
             let phase = std::time::Instant::now();
 

@@ -187,8 +187,7 @@ impl LakePool {
         Ok(pool)
     }
 
-    /// The catalog's Postgres connection string, for a lock session
-    /// (`crate::lake_locks`) that connects to the same database outside the pool.
+    /// The catalog's Postgres connection string the pool's connections attach with.
     pub fn catalog_connstr(&self) -> &str {
         &self.catalog_connstr
     }

@@ -8,11 +8,13 @@
   registration into those tables, and every reference delete, holds one Postgres advisory
   lock in the catalog's database exclusively through its COMMIT, so they commit one at a
   time. The wait holds no pooled connection and ends after 120 s; a registration that
-  gives up, cannot open its lock session, or finds before its COMMIT that the session
-  lost the lock, moves its files back to staging and fails with a retriable status, so
-  its step is run again. A lock session sets the catalog server's TCP keepalives for its
-  connection (30 s idle, then 3 probes 10 s apart), so the server can end a session whose
-  data plane it can no longer reach, releasing the lock.
+  gives up, or cannot open its lock session, moves its files back to staging and fails
+  with a retriable status, so its step is run again. A lock session sets the catalog
+  server's TCP keepalives for its connection (30 s idle, then 3 probes 10 s apart), so
+  the server ends a session whose data plane it can no longer reach and releases the
+  lock (measured: 51–56 s after the client's network was removed), and turns off
+  `idle_in_transaction_session_timeout` for itself, which would otherwise end a session
+  that sits idle in its transaction while its writer works.
 
 ### Changed
 

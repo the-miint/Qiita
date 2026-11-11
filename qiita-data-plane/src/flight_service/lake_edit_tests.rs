@@ -43,7 +43,7 @@ fn delete_reference_drops_orphans_keeps_shared() {
     ))
     .unwrap();
 
-    let counts = delete_reference(&attached_writer(&connstr, &data_path), ref_a, None)
+    let counts = delete_reference(&attached_writer(&connstr, &data_path), ref_a)
         .expect("delete_reference failed");
     assert_eq!(counts["sequences_deleted"], 1, "only the orphan sequence");
     assert_eq!(counts["membership_deleted"], 2, "both ref_a memberships");
@@ -112,7 +112,7 @@ fn delete_reference_whose_commit_answer_is_lost_reports_what_it_deleted() {
     .unwrap();
     let (proxied, cut) = catalog_that_loses_a_commit_answer(&connstr);
 
-    let counts = delete_reference(&attached_writer(&proxied, &data_path), ref_idx, None)
+    let counts = delete_reference(&attached_writer(&proxied, &data_path), ref_idx)
         .expect("a reference delete whose COMMIT answer was lost failed");
 
     assert!(cut.load(std::sync::atomic::Ordering::SeqCst));
