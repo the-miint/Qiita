@@ -86,6 +86,49 @@ def test_write_receipt_appends_one_line_per_call(tmp_path):
     ]
 
 
+def test_capture_scrubs_authorization_values(tmp_path):
+    """The step-log file is served to the ticket originator, so a `Bearer` token
+    logged inside the block is redacted — the boot-time scrubber covers only the
+    handlers present at boot, not this one."""
+    log = logging.getLogger("qiita_common.tests.step_log.scrub")
+    log.setLevel(logging.INFO)
+    with capture_to(tmp_path, "mint"):
+        log.info("calling control plane with Authorization: Bearer qk_secret12345")
+    text = (tmp_path / "stderr").read_text()
+    assert "qk_secret12345" not in text
+    assert "<redacted>" in text
+
+
+def test_write_receipt_is_best_effort(tmp_path):
+    """A receipt write that fails (the dir is gone) must not raise — the step's real
+    outcome is recorded elsewhere and must not be masked by a log-file I/O error."""
+    missing = tmp_path / "gone"  # parent dir absent → open() raises, caught
+    write_receipt(missing, receipt(COMPLETED_KIND, "denoise"))
+    assert not (missing / "stdout").exists()
+
+
+def test_capture_to_is_best_effort_when_the_log_dir_cannot_be_made(tmp_path):
+    """If the log dir cannot be created the block still runs and its scope still
+    collects counts — a step is not failed because its log could not be written."""
+    blocker = tmp_path / "blocker"
+    blocker.write_text("x")  # a file where the logs dir's parent should be
+    with capture_to(blocker / "logs", "mint") as scope:
+        summarize(rows=3)
+    assert scope.summary == {"rows": 3}
+
+
+def test_no_step_scope_detaches_from_the_surrounding_step():
+    """A block run under `no_step_scope` is outside any step: its `summarize` is inert,
+    and the surrounding step's scope is intact afterwards."""
+    from qiita_common.step_log import no_step_scope
+
+    with step_scope("plan-shards") as parent:
+        with no_step_scope():
+            summarize(child=1)
+        summarize(parent=1)
+    assert parent.summary == {"parent": 1}
+
+
 def test_listed_names_the_first_few():
     assert listed([1, 2]) == "1, 2"
     assert listed(list(range(25))).endswith(", 19, … (5 more)")
