@@ -33,7 +33,7 @@ import pyarrow.flight as flight
 from qiita_common.actions import AMPLICON_ACTION_ID
 from qiita_common.amplicon_constants import (
     AMPLICON_MEMBERSHIP_TABLE,
-    AMPLICON_SEQUENCE_CHUNKS_TABLE,
+    AMPLICON_SEQUENCE_TABLE,
 )
 from qiita_common.models.run_feature_table import (
     FeatureTableRequest,
@@ -56,7 +56,7 @@ class Source:
     values_table: str
     # The values table's column holding a cell's value.
     value_column: str
-    # The ASV-bytes table, keyed by feature_idx.
+    # The sequence table, keyed by feature_idx, carrying each feature's bytes inline.
     sequences_table: str
     # The run params whose difference makes two runs' features incomparable.
     merge_keys: tuple[str, ...]
@@ -82,7 +82,7 @@ SOURCES: dict[str, Source] = {
         value_kind="count",
         values_table=AMPLICON_MEMBERSHIP_TABLE,
         value_column="count",
-        sequences_table=AMPLICON_SEQUENCE_CHUNKS_TABLE,
+        sequences_table=AMPLICON_SEQUENCE_TABLE,
         merge_keys=("trim", "orient_primer"),
         noun="ASVs",
     ),
@@ -257,7 +257,7 @@ def cohort_scope(cohort: Cohort) -> dict[str, list[int]]:
 
 
 def cohort_tickets(cohort: Cohort, signing_key: bytes) -> tuple[bytes, bytes]:
-    """Signed DoGet tickets for the cohort's values and its ASV chunks."""
+    """Signed DoGet tickets for the cohort's values and its ASV sequences."""
     scope = cohort_scope(cohort)
     source = cohort.source
     values = sign_ticket(table=source.values_table, filter=scope, secret=signing_key)
@@ -268,13 +268,13 @@ def cohort_tickets(cohort: Cohort, signing_key: bytes) -> tuple[bytes, bytes]:
 def fetch_runs(
     *, data_plane_url: str, signing_key: bytes, cohort: Cohort, values: bool = True
 ) -> tuple[pa.Table | None, pa.Table]:
-    """Read the cohort's values (unless `values` is False) and the ASV chunks they
+    """Read the cohort's values (unless `values` is False) and the ASV sequences they
     name. Blocking (Flight is synchronous); callers run it off the event loop."""
     values_ticket, sequences_ticket = cohort_tickets(cohort, signing_key)
     with flight.FlightClient(data_plane_url) as client:
         observed = client.do_get(flight.Ticket(values_ticket)).read_all() if values else None
-        chunks = client.do_get(flight.Ticket(sequences_ticket)).read_all()
-    return observed, chunks
+        sequences = client.do_get(flight.Ticket(sequences_ticket)).read_all()
+    return observed, sequences
 
 
 # The relations `stage_values` creates on the caller's connection.
@@ -282,16 +282,15 @@ FEATURE_RELATION = "run_feature"
 VALUE_RELATION = "run_value"
 
 
-def stage_features(con, *, chunks: str) -> None:
-    """Create `FEATURE_RELATION` (feature_idx, feature, sequence, length) from the
-    ASV chunk relation `chunks`: each ASV's bytes reassembled, and its feature id,
-    the md5 of its sequence (the QIIME 2 / Greengenes2 convention)."""
+def stage_features(con, *, sequences: str) -> None:
+    """Create `FEATURE_RELATION` (feature_idx, feature, sequence, length) from the ASV
+    sequence relation `sequences` (one row per feature_idx, its bytes inline): its
+    feature id is the md5 of its sequence (the QIIME 2 / Greengenes2 convention)."""
     con.execute(
         f"CREATE TEMP TABLE {FEATURE_RELATION} AS"
-        " SELECT feature_idx, md5(seq) AS feature, seq AS sequence,"
-        "        length(seq)::INTEGER AS length"
-        " FROM (SELECT feature_idx, string_agg(chunk_data, '' ORDER BY chunk_index) AS seq"
-        f"       FROM {chunks} GROUP BY feature_idx)"
+        " SELECT feature_idx, md5(sequence) AS feature, sequence,"
+        "        length(sequence)::INTEGER AS length"
+        f" FROM {sequences}"
     )
 
 
@@ -303,15 +302,15 @@ def _refuse_unnamed(con, *, names: str, values: str) -> None:
         raise RuntimeError(f"{unnamed} value(s) of a processed sample with no QM")
 
 
-def stage_values(con, *, source: Source, names: str, values: str, chunks: str) -> None:
+def stage_values(con, *, source: Source, names: str, values: str, sequences: str) -> None:
     """Create `FEATURE_RELATION` (feature, sequence, length) and `VALUE_RELATION`
     (sample, feature, value): the values in `values` relabelled to public names,
     one row per nonzero cell. `names` maps (processing_idx, prep_sample_idx) to a
-    column name; `chunks` is the ASV chunk relation. Refuses rather than guesses: a
-    value of a processed sample `names` lacks, or of a feature with no sequence in
-    the lake, would need an internal idx as its name."""
+    column name; `sequences` is the ASV sequence relation. Refuses rather than
+    guesses: a value of a processed sample `names` lacks, or of a feature with no
+    sequence in the lake, would need an internal idx as its name."""
     _refuse_unnamed(con, names=names, values=values)
-    stage_features(con, chunks=chunks)
+    stage_features(con, sequences=sequences)
     missing = con.execute(
         f"SELECT count(DISTINCT feature_idx) FROM {values}"
         f" ANTI JOIN {FEATURE_RELATION} USING (feature_idx)"
@@ -339,14 +338,14 @@ def names_table(cohort: Cohort) -> pa.Table:
     )
 
 
-def build_values(cohort: Cohort, values: pa.Table, chunks: pa.Table) -> pa.Table:
+def build_values(cohort: Cohort, values: pa.Table, sequences: pa.Table) -> pa.Table:
     """The values `(sample, feature, value)` as Arrow, for the REST answer."""
     with duckdb.connect() as duck:
         duck.register("run_values", values)
         duck.register("names", names_table(cohort))
-        duck.register("chunks", chunks)
+        duck.register("sequences", sequences)
         stage_values(
-            duck, source=cohort.source, names="names", values="run_values", chunks="chunks"
+            duck, source=cohort.source, names="names", values="run_values", sequences="sequences"
         )
         table = duck.sql(
             f"SELECT sample, feature, value FROM {VALUE_RELATION} ORDER BY sample, feature"
@@ -354,12 +353,12 @@ def build_values(cohort: Cohort, values: pa.Table, chunks: pa.Table) -> pa.Table
     return table.cast(VALUES_SCHEMA)
 
 
-def build_features(cohort: Cohort, chunks: pa.Table) -> pa.Table:
+def build_features(cohort: Cohort, sequences: pa.Table) -> pa.Table:
     """The features `(feature, sequence, length)` as Arrow, for the REST answer. The
-    ticket already scopes the chunks to the ASVs the cohort observed."""
+    ticket already scopes the sequences to the ASVs the cohort observed."""
     with duckdb.connect() as duck:
-        duck.register("chunks", chunks)
-        stage_features(duck, chunks="chunks")
+        duck.register("sequences", sequences)
+        stage_features(duck, sequences="sequences")
         table = duck.sql(
             f"SELECT f.feature, f.sequence, f.length FROM {FEATURE_RELATION} f ORDER BY f.feature"
         ).to_arrow_table()

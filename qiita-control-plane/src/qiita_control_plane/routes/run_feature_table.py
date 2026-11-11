@@ -113,8 +113,8 @@ async def feature_table_values(
 ) -> Response:
     """The values as sparse COO `(sample, feature, value)`, an Arrow IPC stream."""
     cohort = await _authorized_cohort(pool, caller, request)
-    values, chunks = await _read(cohort, data_plane_url, signing_key, values=True)
-    table = build_values(cohort, values, chunks)
+    values, sequences = await _read(cohort, data_plane_url, signing_key, values=True)
+    table = build_values(cohort, values, sequences)
     return Response(arrow_stream_bytes(table), media_type=ARROW_STREAM_MEDIA_TYPE)
 
 
@@ -128,9 +128,9 @@ async def feature_table_features(
     _scope: Principal = Depends(require_scope(Scope.PREP_SAMPLE_READ)),
 ) -> Response:
     """Every feature the values name, `(feature, sequence, length)`, an Arrow IPC
-    stream. Reads only the ASV chunks: the ticket already scopes them to the ASVs
+    stream. Reads only the ASV sequences: the ticket already scopes them to the ASVs
     the cohort observed."""
     cohort = await _authorized_cohort(pool, caller, request)
-    _, chunks = await _read(cohort, data_plane_url, signing_key, values=False)
-    table = build_features(cohort, chunks)
+    _, sequences = await _read(cohort, data_plane_url, signing_key, values=False)
+    table = build_features(cohort, sequences)
     return Response(arrow_stream_bytes(table), media_type=ARROW_STREAM_MEDIA_TYPE)
