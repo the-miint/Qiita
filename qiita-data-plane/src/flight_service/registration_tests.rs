@@ -3332,9 +3332,26 @@ fn a_registration_waiting_for_the_lock_holds_no_pooled_writer() {
             )
             .map(|registration| registration.registered.len())
         });
-        // Long enough for the checks and moves to finish and the wait to begin.
-        std::thread::sleep(std::time::Duration::from_secs(2));
-        assert!(!registering.is_finished(), "the registration did not wait");
+        // Until the registration's lock session waits on the global lock.
+        let watcher =
+            crate::lake_locks::open_lock_connection(&connstr, std::time::Duration::from_secs(5))
+                .unwrap();
+        let waiting = || -> i64 {
+            watcher
+                .query_row(
+                    "SELECT n FROM postgres_query('lock_session', \
+                     'SELECT count(*) AS n FROM pg_locks \
+                      WHERE locktype = ''advisory'' AND NOT granted')",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        let began_by = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while waiting() == 0 && std::time::Instant::now() < began_by {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(waiting() > 0, "the registration did not wait for the lock");
         assert_eq!(
             out.load(Ordering::SeqCst),
             0,
@@ -3643,20 +3660,20 @@ fn a_lock_session_outlasts_an_idle_in_transaction_timeout() {
         )
         .unwrap();
     let alter = |value: &str| {
-        admin
-            .execute_batch(&format!(
-                "CALL postgres_execute('admin', \
-                 'ALTER DATABASE \"{database}\" {value}');"
-            ))
-            .unwrap();
+        admin.execute_batch(&format!(
+            "CALL postgres_execute('admin', \
+             'ALTER DATABASE \"{database}\" {value}');"
+        ))
     };
-    struct Reset<F: Fn(&str)>(F);
-    impl<F: Fn(&str)> Drop for Reset<F> {
+    struct Reset<F: Fn(&str) -> duckdb::Result<()>>(F);
+    impl<F: Fn(&str) -> duckdb::Result<()>> Drop for Reset<F> {
         fn drop(&mut self) {
-            (self.0)("RESET idle_in_transaction_session_timeout");
+            if let Err(e) = (self.0)("RESET idle_in_transaction_session_timeout") {
+                eprintln!("could not reset idle_in_transaction_session_timeout: {e}");
+            }
         }
     }
-    alter("SET idle_in_transaction_session_timeout = ''500ms''");
+    alter("SET idle_in_transaction_session_timeout = ''500ms''").unwrap();
     let _reset = Reset(alter);
 
     let locks = LakeLocks::new(connstr.clone());

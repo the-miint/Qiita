@@ -12,9 +12,10 @@
   with a retriable status, so its step is run again. A lock session sets the catalog
   server's TCP keepalives for its connection (30 s idle, then 3 probes 10 s apart), so
   the server ends a session whose data plane it can no longer reach and releases the
-  lock (measured: 51–56 s after the client's network was removed), and turns off
-  `idle_in_transaction_session_timeout` for itself, which would otherwise end a session
-  that sits idle in its transaction while its writer works.
+  lock (measured: 51–56 s after the client's network was removed). It also turns off
+  `idle_in_transaction_session_timeout` for itself, so a server, database or role
+  timeout shorter than its writer's work does not end it while it sits idle in its
+  transaction.
 
 ### Changed
 

@@ -187,7 +187,7 @@ impl LakePool {
         Ok(pool)
     }
 
-    /// The catalog's Postgres connection string the pool's connections attach with.
+    /// The catalog's Postgres connection string that the pool's connections attach with.
     pub fn catalog_connstr(&self) -> &str {
         &self.catalog_connstr
     }

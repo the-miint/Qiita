@@ -17,7 +17,10 @@
 //! registrations submitted 10 s apart failed that way. So every writer of a
 //! replace-keyed table holds `GLOBAL_KEY` exclusively through its COMMIT, and the
 //! writers reach COMMIT one at a time. `flight_service::registration` says which
-//! registrations take it.
+//! registrations take it. If the session's backend ends first (terminated, or
+//! ended by the keepalives below), the lock is released and the writer's COMMIT
+//! is no longer ordered: it falls back to DuckLake's conflict detection and
+//! `registration::transact_with_retry`.
 //!
 //! The waits of one session, together, end after `LakeLocks::budget`, and none
 //! holds a pooled connection: a lock session is a connection of its own to the
@@ -168,8 +171,9 @@ impl Gate {
                 return Some(GatePass { gate: self });
             }
             let Some(left) = deadline.checked_duration_since(Instant::now()) else {
+                // At the front with a pass free it would have entered above, so
+                // leaving changes no other waiter's turn.
                 state.waiting.retain(|&t| t != ticket);
-                self.changed.notify_all();
                 return None;
             };
             state = self
@@ -178,6 +182,17 @@ impl Gate {
                 .unwrap_or_else(|e| e.into_inner())
                 .0;
         }
+    }
+}
+
+#[cfg(test)]
+impl Gate {
+    fn queued(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .waiting
+            .len()
     }
 }
 
@@ -382,7 +397,11 @@ mod tests {
                 entered.send(pass.is_some()).unwrap();
                 let _ = released.recv();
             });
-            std::thread::sleep(SOON);
+            let queued_by = Instant::now() + Duration::from_secs(5);
+            while gate.queued() == 0 && Instant::now() < queued_by {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert_eq!(gate.queued(), 1, "the waiter did not queue");
             drop(held);
             assert!(
                 gate.enter(Instant::now() + SOON).is_none(),
