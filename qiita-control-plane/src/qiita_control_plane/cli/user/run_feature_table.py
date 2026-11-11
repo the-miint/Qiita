@@ -26,6 +26,7 @@ from qiita_common.api_paths import (
     PATH_FEATURE_TABLE_FEATURE,
     PATH_FEATURE_TABLE_PREFIX,
     PATH_FEATURE_TABLE_SAMPLE,
+    PATH_FEATURE_TABLE_TAXONOMY,
     PATH_FEATURE_TABLE_VALUE,
 )
 from qiita_common.duckdb_relation import registered
@@ -34,7 +35,9 @@ from qiita_common.models.run_feature_table import FeatureTableRequest
 from ...run_feature_table import ARROW_STREAM_MEDIA_TYPE, FEATURE_RELATION, SOURCES
 from .. import _common
 from .feature_table import (
+    AMPLICON_TAXONOMY_RELATION,
     IDENTIFIER_MAP_NOTE,
+    AmpliconTaxonomyClearance,
     SequencesClearance,
     _bundle_targets,
     _tool_versions,
@@ -105,6 +108,21 @@ def _build(args: argparse.Namespace, token: str, con) -> tuple[list[Path], dict[
         )
     with registered(con, "run_features", features):
         con.execute(f"CREATE TEMP TABLE {FEATURE_RELATION} AS SELECT * FROM run_features")
+    if args.taxonomy:
+        # A second request: the table is served without taxonomy, so lineage is fetched
+        # on its own, against the reference the caller names, and written as a companion
+        # keyed by the same md5 the table uses. Staged here, next to the features, so no
+        # open result is pending when the Arrow relation is registered.
+        taxonomy_request = {
+            **request,
+            "reference_name": args.taxonomy_reference_name,
+            "reference_version": args.taxonomy_reference_version,
+        }
+        taxonomy = _arrow(args, token, PATH_FEATURE_TABLE_TAXONOMY, taxonomy_request)
+        with registered(con, "run_taxonomy", taxonomy):
+            con.execute(
+                f"CREATE TEMP TABLE {AMPLICON_TAXONOMY_RELATION} AS SELECT * FROM run_taxonomy"
+            )
     unnamed = con.execute(
         f"SELECT count(DISTINCT feature_id) FROM {ft.LABELLED_RELATION}"
         f" WHERE feature_id NOT IN (SELECT feature FROM {FEATURE_RELATION})"
@@ -122,6 +140,8 @@ def _build(args: argparse.Namespace, token: str, con) -> tuple[list[Path], dict[
         )
     )
     clearances: dict[str, Any] = {"sequences": SequencesClearance(features=sizes["features"])}
+    if args.taxonomy:
+        clearances["amplicon_taxonomy"] = AmpliconTaxonomyClearance(features=sizes["features"])
 
     def manifest(targets: list[Path]) -> dict[str, Any]:
         return {
@@ -154,6 +174,10 @@ def _handle_run_feature_table(args: argparse.Namespace, parser: argparse.Argumen
 
     from ...miint import connect_with_miint  # noqa: PLC0415
 
+    if args.taxonomy and not (args.taxonomy_reference_name and args.taxonomy_reference_version):
+        parser.error(
+            "--taxonomy requires --taxonomy-reference-name and --taxonomy-reference-version"
+        )
     try:
         token = _common.read_token()
     except RuntimeError as exc:
@@ -198,6 +222,11 @@ def _handle_run_feature_table(args: argparse.Namespace, parser: argparse.Argumen
     print(f"and the map needed to read it: {map_path}")
     print(f"and the record of what produced it: {manifest_path}")
     for path in companions:
-        print(f"and each feature's sequence: {path}")
+        what = (
+            "each feature's taxonomic lineage"
+            if path.name.endswith(".taxonomy.parquet")
+            else "each feature's sequence"
+        )
+        print(f"and {what}: {path}")
     print(IDENTIFIER_MAP_NOTE)
     return 0

@@ -41,6 +41,23 @@ class FeatureTableRequest(BaseModel):
         return self
 
 
+class FeatureTableTaxonomyRequest(FeatureTableRequest):
+    """A taxonomy query: the same cohort, plus the reference to classify its features
+    against, named by its public `(name, version)` handle — what `GET /reference`
+    lists and what someone reproducing the table would cite. The internal
+    `reference_idx` never appears here; the route resolves `(name, version)` to it
+    (`resolve_reference_idx`, which keeps the opaque idx server-side).
+
+    The reference travels with the request — there is no server-wide default, the way an
+    alignment carries the reference its OGU table is built against — so one request can
+    classify one run's features against one reference release and another request against
+    a newer release without a redeploy.
+    """
+
+    reference_name: Annotated[str, Field(min_length=1)]
+    reference_version: Annotated[str, Field(min_length=1)]
+
+
 class FeatureTableSample(BaseModel):
     """One column of the table: a processed sample (one run's view of one
     prep_sample), under its public name."""

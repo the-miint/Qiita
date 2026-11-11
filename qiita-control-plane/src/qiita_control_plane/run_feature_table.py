@@ -40,6 +40,11 @@ from qiita_common.models.run_feature_table import (
     FeatureTableSample,
     FeatureTableValueKind,
 )
+from qiita_common.taxonomy import (
+    RANK_COLUMNS,
+    TAXONOMY_SOURCE_TABLE,
+    prefixed_rank_columns_sql,
+)
 
 from .auth.tickets import sign_ticket
 from .sample_names import BIOSAMPLE_NAME_JOIN, BIOSAMPLE_NAME_SQL
@@ -99,6 +104,15 @@ FEATURES_SCHEMA = pa.schema(
         ("sequence", pa.string()),
         ("length", pa.int32()),
     ]
+)
+# The taxonomy answer: a feature's md5 and its taxonomic ranks (`RANK_COLUMNS`, the
+# reference schema's own rank set), coarsest first, their source `d__/p__/…` prefixes
+# restored. A reference that does not define a rank leaves it NULL for every feature (a
+# seven-rank lineage has no strain); a rank the reference does not resolve for a feature
+# is NULL (not a bare prefix); a feature the reference does not place is a row of all-NULL
+# ranks, not a dropped feature — the query is a lookup, not a filter.
+TAXONOMY_SCHEMA = pa.schema(
+    [("feature", pa.string()), *((rank, pa.string()) for rank in RANK_COLUMNS)]
 )
 
 
@@ -250,6 +264,20 @@ async def resolve_cohort(pool: asyncpg.Pool, request: FeatureTableRequest) -> Co
     return Cohort(source=source, runs=runs, samples=samples)
 
 
+async def resolve_reference_idx(pool: asyncpg.Pool, *, name: str, version: str) -> int | None:
+    """The internal `reference_idx` of the reference the request names by its public
+    `(name, version)` handle, or None when no such reference exists.
+
+    `(name, version)` is UNIQUE, so at most one row matches. The idx stays server-side —
+    it is resolved here and signed into the data-plane ticket, never returned to the
+    caller — so the opaque identifier does not cross the boundary."""
+    return await pool.fetchval(
+        "SELECT reference_idx FROM qiita.reference WHERE name = $1 AND version = $2",
+        name,
+        version,
+    )
+
+
 def cohort_scope(cohort: Cohort) -> dict[str, list[int]]:
     """The one ticket filter every read of `cohort` signs: its runs over its
     prep_samples — the only two keys the data plane's DoGet scopes these tables by."""
@@ -363,6 +391,76 @@ def build_features(cohort: Cohort, sequences: pa.Table) -> pa.Table:
             f"SELECT f.feature, f.sequence, f.length FROM {FEATURE_RELATION} f ORDER BY f.feature"
         ).to_arrow_table()
     return table.cast(FEATURES_SCHEMA)
+
+
+def feature_idxs_of(sequences: pa.Table) -> list[int]:
+    """The distinct `feature_idx` the cohort observed, read off the sequence relation.
+
+    These are the only features a taxonomy query asks the reference about, so they
+    scope its ticket; they are internal join keys and never reach the answer (which is
+    keyed by each feature's md5)."""
+    return sorted({int(x) for x in sequences.column("feature_idx").to_pylist()})
+
+
+def _reference_has_taxonomy(client: flight.FlightClient, ticket: bytes) -> bool:
+    """Whether the reference has any taxonomy at all — one signed DoGet scoped to the
+    whole reference, read only until its first non-empty batch. This is the readiness
+    probe: it tells apart a reference whose taxonomy is not loaded yet (no rows) from
+    one that is loaded and simply does not place a given feature (rows, none matching)."""
+    for chunk in client.do_get(flight.Ticket(ticket)):
+        if chunk.data.num_rows:
+            return True
+    return False
+
+
+def fetch_taxonomy(
+    *, data_plane_url: str, signing_key: bytes, reference_idx: int, feature_idxs: list[int]
+) -> pa.Table | None:
+    """The reference's taxonomy rows for `feature_idxs`, or `None` when the reference
+    has no taxonomy loaded (the readiness probe fails). Blocking (Flight is
+    synchronous); callers run it off the event loop.
+
+    Two tickets, both scoped (an unscoped ticket would authorize a full-table dump):
+    the first to the cohort's features, the second — only when the first matched
+    nothing — to the whole reference, to tell "not loaded yet" apart from "all
+    unplaced"."""
+    roster = sign_ticket(
+        table=TAXONOMY_SOURCE_TABLE,
+        filter={"reference_idx": [reference_idx], "feature_idx": feature_idxs},
+        secret=signing_key,
+    )
+    with flight.FlightClient(data_plane_url) as client:
+        taxonomy = client.do_get(flight.Ticket(roster)).read_all()
+        if taxonomy.num_rows:
+            return taxonomy
+        whole_reference = sign_ticket(
+            table=TAXONOMY_SOURCE_TABLE,
+            filter={"reference_idx": [reference_idx]},
+            secret=signing_key,
+        )
+        if not _reference_has_taxonomy(client, whole_reference):
+            return None
+    return taxonomy
+
+
+def build_taxonomy(sequences: pa.Table, taxonomy: pa.Table) -> pa.Table:
+    """The taxonomy answer `(feature, <ranks>)` as Arrow, for the REST answer: each
+    feature the cohort observed, keyed by its md5, with the reference's ranks for it
+    (all NULL for one the reference does not place). `sequences` is the sequence
+    relation (for the md5 of each feature_idx); `taxonomy` is the reference's rows for
+    those feature_idxs."""
+    with duckdb.connect() as duck:
+        duck.register("sequences", sequences)
+        duck.register("reference_taxonomy", taxonomy)
+        stage_features(duck, sequences="sequences")
+        ranks = prefixed_rank_columns_sql(alias="t")
+        table = duck.sql(
+            f"SELECT f.feature, {ranks}"
+            f" FROM {FEATURE_RELATION} f"
+            " LEFT JOIN reference_taxonomy t ON t.feature_idx = f.feature_idx"
+            " ORDER BY f.feature"
+        ).to_arrow_table()
+    return table.cast(TAXONOMY_SCHEMA)
 
 
 def arrow_stream_bytes(table: pa.Table) -> bytes:

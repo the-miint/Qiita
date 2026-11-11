@@ -14,8 +14,11 @@ from qiita_control_plane.run_feature_table import (
     ProcessedSample,
     arrow_stream_bytes,
     build_features,
+    build_taxonomy,
     build_values,
 )
+
+_RANKS = ("domain", "phylum", "class", "order", "family", "genus", "species", "strain")
 
 
 def build_coo(cohort, values, sequences):
@@ -107,3 +110,37 @@ def test_an_asv_without_a_sequence_is_refused():
 def test_the_values_round_trip_through_an_arrow_stream():
     values, _ = build_coo(_cohort("QM1"), _membership([(1, 10, 5)]), _sequences([(10, "ACGT")]))
     assert pa.ipc.open_stream(arrow_stream_bytes(values)).read_all().equals(values)
+
+
+def _taxonomy(rows):
+    """A reference_taxonomy answer: (feature_idx, <unprefixed ranks>)."""
+    cols = {"feature_idx": pa.array([r[0] for r in rows], pa.int64())}
+    for i, rank in enumerate(_RANKS, start=1):
+        cols[rank] = pa.array([r[i] for r in rows], pa.string())
+    return pa.table(cols)
+
+
+def test_taxonomy_keys_each_asv_by_md5_and_restores_rank_prefixes():
+    table = build_taxonomy(
+        _sequences([(10, "ACGTACGT")]),
+        _taxonomy([(10, "Bacteria", "Bacillota", None, None, None, None, None, None)]),
+    )
+    assert table.column_names == ["feature", *_RANKS]
+    row = table.to_pylist()[0]
+    assert row["feature"] == md5("ACGTACGT")
+    # Prefixes restored; an unresolved rank stays NULL, not a bare "c__".
+    assert row["domain"] == "d__Bacteria"
+    assert row["phylum"] == "p__Bacillota"
+    assert row["class"] is None
+
+
+def test_taxonomy_keeps_an_asv_the_reference_does_not_place():
+    # An observed ASV (20) with no taxonomy row survives with all-NULL ranks — the
+    # query is a lookup, not a filter.
+    table = build_taxonomy(
+        _sequences([(10, "ACGT"), (20, "TTTT")]),
+        _taxonomy([(10, "Bacteria", None, None, None, None, None, None, None)]),
+    )
+    rows = {r["feature"]: r for r in table.to_pylist()}
+    assert rows[md5("TTTT")]["domain"] is None
+    assert rows[md5("ACGT")]["domain"] == "d__Bacteria"

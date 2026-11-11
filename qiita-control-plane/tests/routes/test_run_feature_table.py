@@ -19,6 +19,7 @@ import pytest
 from qiita_common.api_paths import (
     URL_FEATURE_TABLE_FEATURE,
     URL_FEATURE_TABLE_SAMPLE,
+    URL_FEATURE_TABLE_TAXONOMY,
     URL_FEATURE_TABLE_VALUE,
 )
 from qiita_common.models.run_feature_table import MAX_FEATURE_TABLE_RUNS
@@ -121,12 +122,18 @@ def _arrow(resp) -> pa.Table:
     return pa.ipc.open_stream(resp.content).read_all()
 
 
-def _body(runs, *, study_idx=None, prep_sample_idx=None):
+def _body(
+    runs, *, study_idx=None, prep_sample_idx=None, reference_name=None, reference_version=None
+):
     body = {"processing_idx": runs}
     if study_idx is not None:
         body["study_idx"] = study_idx
     if prep_sample_idx is not None:
         body["prep_sample_idx"] = prep_sample_idx
+    if reference_name is not None:
+        body["reference_name"] = reference_name
+    if reference_version is not None:
+        body["reference_version"] = reference_version
     return body
 
 
@@ -360,3 +367,177 @@ async def test_features_read_no_observations(role_keyed_clients, amplicon_run, m
     )
     assert resp.status_code == 200, resp.text
     assert calls == [False]
+
+
+# --- taxonomy -------------------------------------------------------------
+
+_RANKS = ("domain", "phylum", "class", "order", "family", "genus", "species", "strain")
+
+
+@pytest.fixture
+async def taxonomy_reference(role_keyed_clients, pool_alignment_seed):
+    """A reference the taxonomy request names by its public (name, version) handle; the
+    route resolves it to the internal reference_idx, which stays server-side."""
+    db, seed = role_keyed_clients["pool"], pool_alignment_seed
+    name, version = f"greengenes2-{uuid.uuid4().hex[:8]}", "2024.09"
+    reference_idx = await db.fetchval(
+        "INSERT INTO qiita.reference (name, version, kind, created_by_idx)"
+        " VALUES ($1, $2, 'taxonomy_authority', $3) RETURNING reference_idx",
+        name,
+        version,
+        seed["owner_idx"],
+    )
+    yield {"name": name, "version": version, "reference_idx": reference_idx}
+    await db.execute("DELETE FROM qiita.reference WHERE reference_idx = $1", reference_idx)
+
+
+def _taxonomy_table(rows):
+    """A reference_taxonomy_visible answer: (feature_idx, <unprefixed ranks>)."""
+    cols = {"feature_idx": pa.array([r[0] for r in rows], pa.int64())}
+    for i, rank in enumerate(_RANKS, start=1):
+        cols[rank] = pa.array([r[i] for r in rows], pa.string())
+    return pa.table(cols)
+
+
+async def test_taxonomy_requires_a_reference(role_keyed_clients, amplicon_run):
+    # The reference travels with the request; omitting it is a 422, not a server default.
+    resp = await role_keyed_clients["wet"].post(
+        URL_FEATURE_TABLE_TAXONOMY,
+        json=_body([amplicon_run["processing_idx"]], prep_sample_idx=[amplicon_run["ps_a"]]),
+    )
+    assert resp.status_code == 422, resp.text
+
+
+async def test_taxonomy_404s_for_an_unknown_reference(role_keyed_clients, amplicon_run):
+    # A (name, version) no reference carries is a 404 — the opaque idx never leaves the
+    # server, so the caller names the public handle and a miss is told plainly.
+    resp = await role_keyed_clients["wet"].post(
+        URL_FEATURE_TABLE_TAXONOMY,
+        json=_body(
+            [amplicon_run["processing_idx"]],
+            prep_sample_idx=[amplicon_run["ps_a"]],
+            reference_name="no-such-reference",
+            reference_version="0.0",
+        ),
+    )
+    assert resp.status_code == 404, resp.text
+
+
+async def test_taxonomy_answers_each_asvs_lineage(
+    role_keyed_clients, amplicon_run, taxonomy_reference, monkeypatch
+):
+    seen = {}
+
+    def _fetch_taxonomy(*, data_plane_url, signing_key, reference_idx, feature_idxs):
+        seen["reference_idx"] = reference_idx
+        seen["feature_idxs"] = list(feature_idxs)
+        return _taxonomy_table([(77, "Bacteria", "Bacillota", None, None, None, None, None, None)])
+
+    monkeypatch.setattr(
+        "qiita_control_plane.routes.run_feature_table.fetch_taxonomy", _fetch_taxonomy
+    )
+    resp = await role_keyed_clients["wet"].post(
+        URL_FEATURE_TABLE_TAXONOMY,
+        json=_body(
+            [amplicon_run["processing_idx"]],
+            prep_sample_idx=[amplicon_run["ps_a"]],
+            reference_name=taxonomy_reference["name"],
+            reference_version=taxonomy_reference["version"],
+        ),
+    )
+    assert resp.status_code == 200, resp.text
+    # The public (name, version) resolved to the internal idx, which scopes the ticket
+    # alongside the cohort's own features.
+    assert seen == {
+        "reference_idx": taxonomy_reference["reference_idx"],
+        "feature_idxs": [77],
+    }
+    table = _arrow(resp).to_pydict()
+    assert table["feature"] == [hashlib.md5(ASV.encode()).hexdigest()]
+    # Ranks come back with their source prefixes restored; an unresolved rank is NULL.
+    assert table["domain"] == ["d__Bacteria"]
+    assert table["phylum"] == ["p__Bacillota"]
+    assert table["class"] == [None]
+
+
+async def test_taxonomy_keeps_an_unplaced_asv_with_null_ranks(
+    role_keyed_clients, amplicon_run, taxonomy_reference, monkeypatch
+):
+
+    def _fetch_taxonomy(*, data_plane_url, signing_key, reference_idx, feature_idxs):
+        # Ready (not None), but the reference places none of the cohort's ASVs.
+        return _taxonomy_table([])
+
+    monkeypatch.setattr(
+        "qiita_control_plane.routes.run_feature_table.fetch_taxonomy", _fetch_taxonomy
+    )
+    resp = await role_keyed_clients["wet"].post(
+        URL_FEATURE_TABLE_TAXONOMY,
+        json=_body(
+            [amplicon_run["processing_idx"]],
+            prep_sample_idx=[amplicon_run["ps_a"]],
+            reference_name=taxonomy_reference["name"],
+            reference_version=taxonomy_reference["version"],
+        ),
+    )
+    assert resp.status_code == 200, resp.text
+    table = _arrow(resp).to_pydict()
+    assert table["feature"] == [hashlib.md5(ASV.encode()).hexdigest()]
+    assert table["domain"] == [None]
+
+
+async def test_taxonomy_409s_when_the_reference_has_no_taxonomy_loaded(
+    role_keyed_clients, amplicon_run, taxonomy_reference, monkeypatch
+):
+    monkeypatch.setattr(
+        "qiita_control_plane.routes.run_feature_table.fetch_taxonomy",
+        lambda **_: None,
+    )
+    resp = await role_keyed_clients["wet"].post(
+        URL_FEATURE_TABLE_TAXONOMY,
+        json=_body(
+            [amplicon_run["processing_idx"]],
+            prep_sample_idx=[amplicon_run["ps_a"]],
+            reference_name=taxonomy_reference["name"],
+            reference_version=taxonomy_reference["version"],
+        ),
+    )
+    assert resp.status_code == 409, resp.text
+    assert "carries no taxonomy" in resp.json()["detail"]
+
+
+async def test_taxonomy_is_empty_for_a_cohort_that_observed_no_asvs(
+    role_keyed_clients, amplicon_run, taxonomy_reference, monkeypatch
+):
+    empty_sequences = pa.table(
+        {
+            "feature_idx": pa.array([], pa.int64()),
+            "sequence_hash": pa.array([], pa.string()),
+            "sequence_length_bp": pa.array([], pa.int64()),
+            "sequence": pa.array([], pa.string()),
+        }
+    )
+    monkeypatch.setattr(
+        "qiita_control_plane.routes.run_feature_table.fetch_runs",
+        lambda **_: (None, empty_sequences),
+    )
+
+    def _must_not_fetch(**_):
+        raise AssertionError("fetch_taxonomy should be skipped for an empty roster")
+
+    monkeypatch.setattr(
+        "qiita_control_plane.routes.run_feature_table.fetch_taxonomy", _must_not_fetch
+    )
+    resp = await role_keyed_clients["wet"].post(
+        URL_FEATURE_TABLE_TAXONOMY,
+        json=_body(
+            [amplicon_run["processing_idx"]],
+            prep_sample_idx=[amplicon_run["ps_a"]],
+            reference_name=taxonomy_reference["name"],
+            reference_version=taxonomy_reference["version"],
+        ),
+    )
+    assert resp.status_code == 200, resp.text
+    table = _arrow(resp)
+    assert table.num_rows == 0
+    assert table.column_names == ["feature", *_RANKS]

@@ -1450,6 +1450,31 @@ def _build_parser() -> argparse.ArgumentParser:
             " <stem>.exported-identifier.json, <stem>.manifest.json and the ASV sequences."
         ),
     )
+    p_ft_runs.add_argument(
+        "--taxonomy",
+        action="store_true",
+        help=(
+            "Also write <stem>.taxonomy.parquet: each feature's taxonomic lineage"
+            " (feature_id + the reference's ranks), looked up on its own. A feature the"
+            " reference does not place appears with NULL ranks rather than being left out."
+            " Requires --taxonomy-reference-name and --taxonomy-reference-version."
+        ),
+    )
+    p_ft_runs.add_argument(
+        "--taxonomy-reference-name",
+        help=(
+            "Name of the reference whose taxonomy to classify the features against"
+            " (e.g. greengenes2 for 16S amplicon features). Required with --taxonomy."
+            " Names from `qiita reference list`."
+        ),
+    )
+    p_ft_runs.add_argument(
+        "--taxonomy-reference-version",
+        help=(
+            "Version of that reference (e.g. 2024.09). Required with --taxonomy —"
+            " a reference is a (name, version) pair. Versions from `qiita reference list`."
+        ),
+    )
     p_ft_runs.set_defaults(handler=_handle_run_feature_table)
 
     p_ticket = sub.add_parser("ticket", help="Work-ticket operations")

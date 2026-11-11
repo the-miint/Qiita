@@ -54,7 +54,7 @@ from qiita_common.models import (
     ExportedProcessingRequest,
 )
 from qiita_common.parquet import PARQUET_MEDIA_TYPE, PARQUET_OPTS_TRANSFER, validate_parquet_path
-from qiita_common.taxonomy import TAXONOMY_SOURCE_TABLE
+from qiita_common.taxonomy import QUOTED_RANK_COLUMNS, TAXONOMY_SOURCE_TABLE
 
 if TYPE_CHECKING:
     import pyarrow as pa
@@ -740,13 +740,42 @@ def _amplicon_sequences_copy_sql(path: Path, *, clearance: SequencesClearance) -
     )
 
 
+# The lineage answer (the `/feature-table/taxonomy` route) staged under this name for the
+# companion below to copy. The OGU `taxonomy` companion reduces a genome's many contig
+# features — distinct features that share one lineage where classified — to one
+# representative row per genome; here each feature is already its own taxonomic unit, so
+# there is no genome layer to reduce and the per-feature rows copy straight through. Same
+# sidecar shape (feature_id + ranks), one reduction fewer.
+AMPLICON_TAXONOMY_RELATION = "amplicon_taxonomy"
+
+
+class AmpliconTaxonomyClearance(NamedTuple):
+    """Proof the taxonomy relation was staged for the features the table names, which is
+    what makes that companion writable."""
+
+    features: int
+
+
+def _amplicon_taxonomy_copy_sql(path: Path, *, clearance: AmpliconTaxonomyClearance) -> str:
+    """COPY each feature an amplicon table names, with its taxonomic ranks, to
+    Parquet — the `feature_id` + ranks sidecar, keyed by the same md5 the table uses."""
+    del clearance  # Held, not read: holding it is the check.
+    ranks = ", ".join(f"t.{column}" for column in QUOTED_RANK_COLUMNS)
+    return (
+        f"COPY (SELECT t.feature AS feature_id, {ranks} FROM {AMPLICON_TAXONOMY_RELATION} t"
+        f" WHERE t.feature IN (SELECT feature_id FROM {ft.LABELLED_RELATION})"
+        f" ORDER BY t.feature) TO '{validate_parquet_path(path)}' ({PARQUET_OPTS_TRANSFER})"
+    )
+
+
 _COMPANIONS = (
     _Companion("taxonomy", ".taxonomy.parquet", ft.taxonomy_copy_sql),
     _Companion("tree", ".tree.parquet", ft.tree_copy_sql),
     # The amplicon table's (`qiita feature-table runs`).
     _Companion("sequences", ".sequences.parquet", _amplicon_sequences_copy_sql),
+    _Companion("amplicon_taxonomy", ".taxonomy.parquet", _amplicon_taxonomy_copy_sql),
 )
-SEQUENCES_COMPANION = _COMPANIONS[-1]
+SEQUENCES_COMPANION = _COMPANIONS[-2]
 
 
 def _tool_versions(con) -> dict[str, str]:
