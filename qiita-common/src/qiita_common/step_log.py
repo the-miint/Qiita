@@ -1,4 +1,4 @@
-"""One shape for every workflow step's two log streams, wherever the step runs.
+"""One shape for a native job's two log streams.
 
 **stderr is the step's narrative**: a handful of `<time> <LEVEL> <step>: <message>`
 lines — what came in, what each stage kept or dropped, what went out, and how long
