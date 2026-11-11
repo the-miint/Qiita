@@ -14,45 +14,39 @@
 //!
 //! Under steady overlap one writer can lose every attempt until
 //! `registration::LAKE_COMMIT_BUDGET` runs out: on qiita-miint, 55 of 1,062
-//! registrations submitted 10 s apart failed that way. So `GLOBAL_KEY` is a
-//! shared/exclusive lock: a writer that deletes holds it exclusively through its
-//! COMMIT, and one that only inserts holds it shared, so inserts overlap each
-//! other and never a delete. Postgres queues a shared request behind a waiting
-//! exclusive one (measured through DuckDB 2.0.0's postgres extension against
-//! Postgres 17: a shared request made while an exclusive one waited was granted
-//! only after the exclusive holder committed), so inserts arriving steadily do
-//! not starve a delete. `flight_service::registration` decides which a
-//! registration takes.
+//! registrations submitted 10 s apart failed that way. So every writer of a
+//! replace-keyed table holds `GLOBAL_KEY` exclusively through its COMMIT, and the
+//! writers reach COMMIT one at a time. `flight_service::registration` says which
+//! registrations take it.
 //!
 //! The waits of one session, together, end after `LakeLocks::budget`, and none
 //! holds a pooled connection: a lock session is a connection of its own to the
 //! catalog's Postgres, outside the pool, and at most `LOCK_SESSIONS` are open per
-//! process.
+//! process. A writer checks that its session still holds the lock before each
+//! COMMIT (`LockSession::check_held`).
 
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use duckdb::Connection;
-use sha2::{Digest, Sha256};
 use tonic::Status;
 
 /// Lock sessions one data plane may hold open at once, each one catalog backend.
-/// Chosen, not measured: a session is held through a registration's lock waits,
-/// its key check and its COMMIT. Without waits that is a part of the 0.3 s median
-/// from step start to commit on qiita-miint (2026-11-09), which also includes the
-/// file moves; a session waiting behind another writer's lock is held for that
-/// wait too.
+/// Chosen, not measured: a session is held through a registration's lock wait
+/// and its COMMIT. Without a wait that is a part of the 0.3 s median from step
+/// start to commit on qiita-miint (2026-11-09), which also includes the file
+/// moves; a session waiting behind another writer's lock is held for that wait
+/// too.
 /// `ducklake::tag_catalog_connstr` declares them with the pool, so the deploy's
 /// connection budget counts them.
 pub(crate) const LOCK_SESSIONS: usize = 2;
 
-/// How long one session's waits may take in all: for the session, its keys and
+/// How long one session's waits may take in all: for the session and for
 /// `GLOBAL_KEY`. A backstop for a holder that does not finish.
 pub(crate) const LOCK_BUDGET: Duration = Duration::from_secs(120);
 
-/// Advisory-lock key every writer of a replace-keyed table holds through its
-/// COMMIT: exclusively when it deletes, shared when it only inserts. Distinct
-/// from `ducklake::CATALOG_SETUP_LOCK_KEY`.
+/// Advisory-lock key every writer of a replace-keyed table holds exclusively
+/// through its COMMIT. Distinct from `ducklake::CATALOG_SETUP_LOCK_KEY`.
 const GLOBAL_KEY: i64 = 0x7169_6974_615f_7772;
 
 /// Open a connection to the catalog's Postgres for taking advisory locks, inside an
@@ -79,9 +73,29 @@ pub(crate) fn open_lock_connection(
          BEGIN;"
     ))
     .map_err(|e| format!("attach: {e}"))?;
+    for (setting, value) in [
+        ("tcp_keepalives_idle", LOCK_KEEPALIVE_IDLE.as_secs()),
+        ("tcp_keepalives_interval", LOCK_KEEPALIVE_INTERVAL.as_secs()),
+        ("tcp_keepalives_count", LOCK_KEEPALIVE_COUNT),
+    ] {
+        conn.execute_batch(&format!(
+            "CALL postgres_execute('lock_session', 'SET LOCAL {setting} = {value}');"
+        ))
+        .map_err(|e| format!("set {setting}: {e}"))?;
+    }
     set_lock_timeout(&conn, budget)?;
     Ok(conn)
 }
+
+/// TCP keepalives on the catalog server's end of a lock session, so the server
+/// ends a session whose data plane it can no longer reach, releasing its locks,
+/// rather than after the server's own keepalive settings (`tcp_keepalives_idle`
+/// was 7200 s on qiita-miint's catalog, 2026-11-11). A session that exits closes
+/// its connection, which releases its locks without this. The values are chosen,
+/// not measured. Over a Unix socket Postgres ignores them.
+const LOCK_KEEPALIVE_IDLE: Duration = Duration::from_secs(30);
+const LOCK_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+const LOCK_KEEPALIVE_COUNT: u64 = 3;
 
 /// End the lock waits that follow on `conn` after `limit`.
 fn set_lock_timeout(conn: &Connection, limit: Duration) -> Result<(), String> {
@@ -93,18 +107,13 @@ fn set_lock_timeout(conn: &Connection, limit: Duration) -> Result<(), String> {
     .map_err(|e| format!("set lock_timeout: {e}"))
 }
 
-/// Wait for advisory lock `key` on a connection from `open_lock_connection`,
-/// exclusively or shared.
-pub(crate) fn advisory_lock(conn: &Connection, key: i64, shared: bool) -> Result<(), String> {
-    let function = if shared {
-        "pg_advisory_xact_lock_shared"
-    } else {
-        "pg_advisory_xact_lock"
-    };
+/// Wait for advisory lock `key`, exclusively, on a connection from
+/// `open_lock_connection`.
+pub(crate) fn advisory_lock(conn: &Connection, key: i64) -> Result<(), String> {
     conn.query_row(
         &format!(
             "SELECT taken FROM postgres_query('lock_session', \
-             'SELECT 1 AS taken FROM (SELECT {function}({key})) s')"
+             'SELECT 1 AS taken FROM (SELECT pg_advisory_xact_lock({key})) s')"
         ),
         [],
         |row| row.get::<_, i32>(0),
@@ -113,15 +122,25 @@ pub(crate) fn advisory_lock(conn: &Connection, key: i64, shared: bool) -> Result
     .map_err(|e| e.to_string())
 }
 
-/// The advisory-lock key for one run of a run-keyed table family, named by the
-/// table its keys come from. Two runs whose hashes collide only wait for each other.
-pub(crate) fn run_key(key_source: &str, prep_sample_idx: i64, processing_idx: i64) -> i64 {
-    let digest = Sha256::digest(format!("{key_source}|{prep_sample_idx}|{processing_idx}"));
-    i64::from_be_bytes(
-        digest[..8]
-            .try_into()
-            .expect("a SHA-256 digest is 32 bytes"),
+/// Whether the session on `conn` holds advisory lock `key` exclusively. Asks
+/// Postgres's lock table about the session's own backend, so a session that was
+/// ended, and any connection opened in its place, reads as not holding it.
+fn holds_advisory_lock(conn: &Connection, key: i64) -> Result<bool, String> {
+    // A bigint key is stored as its high and low 32 bits, objsubid 1.
+    let (high, low) = ((key as u64 >> 32) as u32, key as u64 as u32);
+    conn.query_row(
+        &format!(
+            "SELECT held FROM postgres_query('lock_session', \
+             'SELECT count(*)::INT AS held FROM pg_locks \
+              WHERE locktype = ''advisory'' AND pid = pg_backend_pid() AND granted \
+              AND mode = ''ExclusiveLock'' AND classid = {high} AND objid = {low} \
+              AND objsubid = 1')"
+        ),
+        [],
+        |row| row.get::<_, i32>(0),
     )
+    .map(|held| held > 0)
+    .map_err(|e| e.to_string())
 }
 
 /// A counting gate whose waits end at a deadline.
@@ -222,7 +241,6 @@ impl LakeLocks {
             what: what.to_string(),
             conn,
             deadline,
-            holds_global: false,
             waited: vec![("session", started.elapsed())],
             _session: pass,
         })
@@ -235,7 +253,6 @@ pub(crate) struct LockSession<'a> {
     what: String,
     conn: Connection,
     deadline: Instant,
-    holds_global: bool,
     waited: Vec<(&'static str, Duration)>,
     // Dropped after `drop` ends the connection's transaction, so the next waiter
     // gets the session once its locks are released.
@@ -243,64 +260,60 @@ pub(crate) struct LockSession<'a> {
 }
 
 impl LockSession<'_> {
-    /// Wait for every key in `keys`, in ascending order so two sessions that share
-    /// keys cannot each hold one the other waits for.
-    ///
-    /// Refused once this session holds `GLOBAL_KEY`: a holder of it waiting for a
-    /// key, while that key's holder waits for `GLOBAL_KEY`, would wait forever.
-    pub(crate) fn lock_keys(&mut self, keys: &[i64]) -> Result<(), Status> {
-        if self.holds_global {
-            return Err(Status::internal(format!(
-                "{}: asked for run locks after the global lock",
-                self.what
-            )));
-        }
-        let started = Instant::now();
-        let mut sorted = keys.to_vec();
-        sorted.sort_unstable();
-        sorted.dedup();
-        for key in sorted {
-            self.wait_for(key, false)
-                .map_err(|e| self.failed("its keys' locks", started, e))?;
-        }
-        self.waited.push(("keys", started.elapsed()));
-        Ok(())
-    }
-
-    /// Hold `GLOBAL_KEY` exclusively: for a writer that deletes from a
-    /// replace-keyed table.
+    /// Hold `GLOBAL_KEY` exclusively, waiting until this session's deadline.
     pub(crate) fn lock_global(&mut self) -> Result<(), Status> {
         if !self.locks.global {
             return Ok(());
         }
-        self.hold_global(false)
-    }
-
-    /// Hold `GLOBAL_KEY` shared: for a writer that only inserts into a
-    /// replace-keyed table.
-    pub(crate) fn lock_global_shared(&mut self) -> Result<(), Status> {
-        if !self.locks.global {
-            return Ok(());
-        }
-        self.hold_global(true)
-    }
-
-    fn hold_global(&mut self, shared: bool) -> Result<(), Status> {
         let started = Instant::now();
-        self.holds_global = true;
-        self.wait_for(GLOBAL_KEY, shared)
-            .map_err(|e| self.failed("the global lock", started, e))?;
+        set_lock_timeout(
+            &self.conn,
+            self.deadline.saturating_duration_since(Instant::now()),
+        )
+        .and_then(|()| advisory_lock(&self.conn, GLOBAL_KEY))
+        .map_err(|e| {
+            Status::unavailable(format!(
+                "{}: waited {} ms for the global lock and gave up: {e}",
+                self.what,
+                started.elapsed().as_millis()
+            ))
+        })?;
         self.waited.push(("global", started.elapsed()));
         Ok(())
     }
 
-    /// Wait for `key` until this session's deadline.
-    fn wait_for(&self, key: i64, shared: bool) -> Result<(), String> {
-        set_lock_timeout(
-            &self.conn,
-            self.deadline.saturating_duration_since(Instant::now()),
-        )?;
-        advisory_lock(&self.conn, key, shared)
+    /// Fail unless this session still holds `GLOBAL_KEY`: Postgres releases it if
+    /// the session's backend ends (terminated, or its connection lost), and a
+    /// COMMIT made after that is not ordered against other writers. Called before
+    /// each COMMIT; the error is UNAVAILABLE, so the caller's step is run again.
+    pub(crate) fn check_held(&self) -> Result<(), Status> {
+        if !self.locks.global {
+            return Ok(());
+        }
+        match holds_advisory_lock(&self.conn, GLOBAL_KEY) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(Status::unavailable(format!(
+                "{}: its lake lock session no longer holds the global lock",
+                self.what
+            ))),
+            Err(e) => Err(Status::unavailable(format!(
+                "{}: its lake lock session could not be read ({e})",
+                self.what
+            ))),
+        }
+    }
+
+    /// This session's backend, for a test that ends it.
+    #[cfg(test)]
+    pub(crate) fn backend_pid(&self) -> i32 {
+        self.conn
+            .query_row(
+                "SELECT pid FROM postgres_query('lock_session', \
+                 'SELECT pg_backend_pid() AS pid')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
     }
 
     /// The waits so far, as `name_wait_ms=N` pairs for a log line.
@@ -310,14 +323,6 @@ impl LockSession<'_> {
             .map(|(name, d)| format!("{name}_wait_ms={}", d.as_millis()))
             .collect::<Vec<_>>()
             .join(" ")
-    }
-
-    fn failed(&self, which: &str, started: Instant, e: String) -> Status {
-        Status::unavailable(format!(
-            "{}: waited {} ms for {which} and gave up: {e}",
-            self.what,
-            started.elapsed().as_millis()
-        ))
     }
 }
 

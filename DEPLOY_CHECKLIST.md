@@ -27,7 +27,7 @@ _None yet._
 
 ### 4. Deploy
 
-_None yet._
+- `[operator]` (#851) Deploy every data-plane instance, peers on other hosts included, from this build in the same window. An instance from an earlier build takes no lake lock, so its registrations into the replace-keyed tables overlap the new instances' again and can lose their commits to them.
 
 ### 5. Verify
 

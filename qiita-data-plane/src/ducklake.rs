@@ -79,7 +79,7 @@ pub fn setup_catalog(
     data_path: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let lock = crate::lake_locks::open_lock_connection(catalog_connstr, BOOT_SETUP_BUDGET)?;
-    crate::lake_locks::advisory_lock(&lock, CATALOG_SETUP_LOCK_KEY, false).map_err(|e| {
+    crate::lake_locks::advisory_lock(&lock, CATALOG_SETUP_LOCK_KEY).map_err(|e| {
         format!(
             "waited up to {} s for another data plane's catalog setup lock: {e}",
             BOOT_SETUP_BUDGET.as_secs()

@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 use tonic::{Response, Status};
 
 use crate::auth;
-use crate::lake_locks::{run_key, LakeLocks};
+use crate::lake_locks::{LakeLocks, LockSession};
 use crate::pool::LakeWriter;
 
 use super::QiitaFlightService;
@@ -85,8 +85,8 @@ impl QiitaFlightService {
 /// rule that picked per `chunk_index` from rows already in the lake could,
 /// since nothing there records which load a chunk came from.
 ///
-/// Writers of these tables are also ordered against each other by
-/// `crate::lake_locks`; `register_files` says which locks each takes.
+/// Writers of these tables are also ordered against each other, by the lake
+/// lock (`crate::lake_locks`) that `register_files` takes.
 ///
 /// `assembly_membership` / `bin_quality` are keyed on `(prep_sample_idx,
 /// processing_idx)` instead. A second `long-read-assembly` run over a prep_sample
@@ -106,13 +106,16 @@ const REPLACE_KEY_TABLES: &[ReplaceKey] = &[
     ReplaceKey::own("reference_sequence_chunks", &["feature_idx"]),
     ReplaceKey::own("assembled_sequence", &["feature_idx"]),
     ReplaceKey::own("assembled_sequence_chunks", &["feature_idx"]),
-    ReplaceKey::own("assembly_membership", RUN_KEY),
+    ReplaceKey::own(
+        "assembly_membership",
+        &["prep_sample_idx", "processing_idx"],
+    ),
     ReplaceKey::borrows("bin_quality", "assembly_membership"),
     // The myloasm provenance tables (`ducklake::ensure_myloasm_tables`), keyed
     // like assembly_membership and for the same reason. All six read their keys
     // from `myloasm_run`; why that table is never empty is at
     // `qiita_common.myloasm_constants.MYLOASM_RUN_TABLE`.
-    ReplaceKey::own("myloasm_run", RUN_KEY),
+    ReplaceKey::own("myloasm_run", &["prep_sample_idx", "processing_idx"]),
     ReplaceKey::borrows("myloasm_contig", "myloasm_run"),
     ReplaceKey::borrows("myloasm_layout", "myloasm_run"),
     ReplaceKey::borrows("myloasm_mapping", "myloasm_run"),
@@ -122,7 +125,10 @@ const REPLACE_KEY_TABLES: &[ReplaceKey] = &[
     // derives the whole run's rows from its own workspace and never reads the lake
     // back, and a re-run resolves to the same processing_idx, so a --force resubmit
     // replaces rather than doubling the counts.
-    ReplaceKey::own("amplicon_membership", RUN_KEY),
+    ReplaceKey::own(
+        "amplicon_membership",
+        &["prep_sample_idx", "processing_idx"],
+    ),
     // amplicon's ASV sequences, twins of the assembled_sequence tables: keyed on
     // feature_idx, replaced (not appended) so a re-load of the same ASV converges.
     ReplaceKey::own("amplicon_sequence", &["feature_idx"]),
@@ -168,7 +174,7 @@ impl ReplaceKey {
     const fn borrows(table: &'static str, key_source: &'static str) -> Self {
         Self {
             table,
-            key: RUN_KEY,
+            key: &["prep_sample_idx", "processing_idx"],
             key_source,
         }
     }
@@ -225,23 +231,6 @@ impl ReplaceKey {
 /// string); the file paths are bound parameters, so a basename carrying a quote
 /// cannot reach the SQL text.
 fn replace_key_delete_sql(table: &str, keys: &[&str], n_files: usize) -> String {
-    format!(
-        "DELETE FROM qiita_lake.{table} WHERE {}",
-        incoming_key_filter(keys, n_files)
-    )
-}
-
-/// How many rows of `table` carry a key the incoming files carry: the rows
-/// `replace_key_delete_sql` would delete. Same parameters.
-fn replace_key_count_sql(table: &str, keys: &[&str], n_files: usize) -> String {
-    format!(
-        "SELECT count(*) FROM qiita_lake.{table} WHERE {}",
-        incoming_key_filter(keys, n_files)
-    )
-}
-
-/// `(keys) IN (the distinct keys of n_files read_parquet(?) sources)`.
-fn incoming_key_filter(keys: &[&str], n_files: usize) -> String {
     let key_list = keys.join(", ");
     let incoming_keys = (0..n_files)
         .map(|_| format!("SELECT {key_list} FROM read_parquet(?)"))
@@ -250,75 +239,10 @@ fn incoming_key_filter(keys: &[&str], n_files: usize) -> String {
     // DISTINCT because a chunk table repeats its key once per 64 KB chunk and a
     // run-scoped table repeats its pair on every row, and that whole multiset
     // would otherwise become the semi-join's build side.
-    format!("({key_list}) IN (SELECT DISTINCT {key_list} FROM ({incoming_keys}))")
-}
-
-/// The key of the run-keyed `REPLACE_KEY_TABLES`: one assembly or amplicon run of
-/// one prep_sample. A registration carries one run, or a few, never thousands, so
-/// it can lock each (`crate::lake_locks::run_key`).
-const RUN_KEY: &[&str] = &["prep_sample_idx", "processing_idx"];
-
-/// The advisory-lock keys of every run the run-keyed `incoming` files carry.
-fn run_lock_keys(
-    conn: &duckdb::Connection,
-    incoming: &[(&'static ReplaceKey, Vec<&str>)],
-) -> Result<Vec<i64>, Status> {
-    let mut keys = Vec::new();
-    for (entry, dests) in incoming.iter().filter(|(entry, _)| entry.key == RUN_KEY) {
-        let sources =
-            vec!["SELECT prep_sample_idx, processing_idx FROM read_parquet(?)"; dests.len()]
-                .join(" UNION ALL ");
-        let params: Vec<&dyn duckdb::ToSql> =
-            dests.iter().map(|d| d as &dyn duckdb::ToSql).collect();
-        let mut stmt = conn
-            .prepare(&format!(
-                "SELECT DISTINCT prep_sample_idx, processing_idx FROM ({sources})"
-            ))
-            .map_err(|e| {
-                Status::internal(format!("failed to read {}'s run keys: {e}", entry.table))
-            })?;
-        let runs = stmt
-            .query_map(params.as_slice(), |r| {
-                Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
-            })
-            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
-            .map_err(|e| {
-                Status::internal(format!("failed to read {}'s run keys: {e}", entry.table))
-            })?;
-        keys.extend(
-            runs.into_iter()
-                .map(|(prep, processing)| run_key(entry.key_source, prep, processing)),
-        );
-    }
-    Ok(keys)
-}
-
-/// True when no `incoming` table holds any of the keys its files carry, so the
-/// replace would delete nothing.
-fn incoming_keys_absent(
-    conn: &duckdb::Connection,
-    incoming: &[(&'static ReplaceKey, Vec<&str>)],
-) -> Result<bool, Status> {
-    for (entry, dests) in incoming {
-        let params: Vec<&dyn duckdb::ToSql> =
-            dests.iter().map(|d| d as &dyn duckdb::ToSql).collect();
-        let held: i64 = conn
-            .query_row(
-                &replace_key_count_sql(entry.table, entry.key, dests.len()),
-                params.as_slice(),
-                |r| r.get(0),
-            )
-            .map_err(|e| {
-                Status::internal(format!(
-                    "failed to count {}'s incoming keys: {e}",
-                    entry.table
-                ))
-            })?;
-        if held > 0 {
-            return Ok(false);
-        }
-    }
-    Ok(true)
+    format!(
+        "DELETE FROM qiita_lake.{table} WHERE ({key_list}) IN \
+         (SELECT DISTINCT {key_list} FROM ({incoming_keys}))"
+    )
 }
 
 /// How long a lake writer keeps re-running its transaction after a failed COMMIT
@@ -389,6 +313,11 @@ fn lake_commit_backoff(attempt: u32, salt: i64) -> std::time::Duration {
 /// reference it writes for), the attempt, its outcome and that detail. `salt`
 /// only spreads the backoff (see `lake_commit_backoff`).
 ///
+/// `held` is the lock session a writer of a replace-keyed table holds the lake
+/// lock in. Each attempt checks it still holds the lock just before its COMMIT
+/// (`LockSession::check_held`), and when it does not, rolls back and fails with
+/// that check's UNAVAILABLE rather than committing unordered.
+///
 /// A COMMIT that reports an error may still have landed: when the catalog's
 /// connection drops after Postgres committed, before its answer arrives, the
 /// COMMIT errors and the rows are there, and a re-run of an add registers them
@@ -405,6 +334,7 @@ pub(super) fn transact_with_retry<T>(
     what: &str,
     subject: &str,
     salt: i64,
+    held: Option<&LockSession<'_>>,
     mut body: impl FnMut(u32) -> Result<(T, String), Status>,
     mut landed: impl FnMut(&T) -> Result<bool, Status>,
 ) -> Result<T, Status> {
@@ -423,6 +353,15 @@ pub(super) fn transact_with_retry<T>(
             }
         };
         let body_ms = started.elapsed().as_millis();
+        if let Some(Err(e)) = held.map(LockSession::check_held) {
+            let _ = conn.execute_batch("ROLLBACK");
+            eprintln!(
+                "lake-write: {what} {subject} attempt={attempt} body_ms={body_ms} {detail} \
+                 outcome=rolled back: {}",
+                e.message()
+            );
+            return Err(e);
+        }
 
         let committing = std::time::Instant::now();
         let commit = conn.execute_batch("COMMIT");
@@ -759,46 +698,24 @@ fn register_files<W: std::borrow::Borrow<LakeWriter>>(
     // moved files go back to staging and a redrive starts over.
     let unmove = |e: Status| return_to_staging(&placed, e, Ok(Ledgered::Nothing));
     let subject = format!("work_ticket_idx={}", payload.work_ticket_idx);
-    // Writers of a replace-keyed table take `crate::lake_locks` locks (which says
-    // why, and what DuckLake counts as a conflict). Each run's own lock serializes
-    // the writers of that run. When every table is run-keyed and the lake holds
-    // none of the runs yet, the replace would delete nothing, so the registration
-    // only inserts and holds the global lock shared; otherwise it deletes and
-    // holds it exclusively. The writer that checked is returned before that wait,
-    // so the wait holds no pooled connection.
-    let run_keys = if takes_lock {
-        run_lock_keys(conn, &incoming).map_err(unmove)?
-    } else {
-        Vec::new()
-    };
-    let mut insert_only = false;
+    // Writers of a replace-keyed table hold the global lake lock exclusively
+    // (`crate::lake_locks` says why, and what DuckLake counts as a conflict). The
+    // writer that ran the checks and the moves is returned before the wait, so the
+    // wait holds no pooled connection.
     let mut session = None;
     let committing: W = if takes_lock {
         drop(preparing);
         let mut held = locks
             .session(&format!("the registration transaction {subject}"))
             .map_err(unmove)?;
-        held.lock_keys(&run_keys).map_err(unmove)?;
-        let checked = checkout().map_err(unmove)?;
-        insert_only = incoming.iter().all(|(entry, _)| entry.key == RUN_KEY)
-            && incoming_keys_absent(checked.borrow(), &incoming).map_err(unmove)?;
-        drop(checked);
-        if insert_only {
-            held.lock_global_shared().map_err(unmove)?;
-        } else {
-            held.lock_global().map_err(unmove)?;
-        }
+        held.lock_global().map_err(unmove)?;
         session = Some(held);
         checkout().map_err(unmove)?
     } else {
         preparing
     };
     let conn: &LakeWriter = committing.borrow();
-    let mode = match (takes_lock, insert_only) {
-        (false, _) => "unlocked".to_string(),
-        (true, true) => "insert-only".to_string(),
-        (true, false) => "replace".to_string(),
-    };
+    let mode = if takes_lock { "replace" } else { "unlocked" };
     let waits = session.as_ref().map(|s| s.waits()).unwrap_or_default();
     // The `read` rows this ticket registered before (the lookup above the moves
     // says why). The delete names the files that lookup found rather than matching
@@ -845,15 +762,15 @@ fn register_files<W: std::borrow::Borrow<LakeWriter>>(
         "the registration transaction",
         &subject,
         payload.work_ticket_idx,
+        session.as_ref(),
         |attempt| {
             let phase = std::time::Instant::now();
 
             // Replace-by-key runs as its OWN pass, ahead of every add: one statement
             // per target table over all the files headed for it, so no delete can
-            // touch a row this same registration already added. An insert-only
-            // registration has nothing to replace (its run locks keep it so).
+            // touch a row this same registration already added.
             let mut replaced: BTreeMap<&'static str, usize> = BTreeMap::new();
-            for (entry, dests) in incoming.iter().filter(|_| !insert_only) {
+            for (entry, dests) in &incoming {
                 let sql = replace_key_delete_sql(entry.table, entry.key, dests.len());
                 let params: Vec<&dyn duckdb::ToSql> =
                     dests.iter().map(|d| d as &dyn duckdb::ToSql).collect();

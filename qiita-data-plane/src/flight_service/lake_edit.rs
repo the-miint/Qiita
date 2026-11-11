@@ -8,6 +8,7 @@ use arrow_flight::Action;
 use tonic::{Response, Status};
 
 use crate::auth;
+use crate::lake_locks::{LakeLocks, LockSession};
 use crate::pool::LakeWriter;
 
 use super::export::validate_export_dest;
@@ -24,16 +25,10 @@ impl QiitaFlightService {
             .verify_action_payload(action, auth::verify_delete_reference, |p| p.action.as_str())?;
 
         let reference_idx = payload.reference_idx;
-        // A writer that deletes from replace-keyed tables: it holds the global lake
-        // lock exclusively (`crate::lake_locks`), taken before it checks out a writer.
         let pool = std::sync::Arc::clone(&self.pool);
         let locks = std::sync::Arc::clone(&self.lake_locks);
         let deleted = tokio::task::spawn_blocking(move || {
-            let mut session = locks.session(&format!(
-                "the reference delete reference_idx={reference_idx}"
-            ))?;
-            session.lock_global()?;
-            delete_reference(&pool.checkout_for_write()?, reference_idx)
+            locked_delete_reference(&locks, &|| pool.checkout_for_write(), reference_idx)
         })
         .await
         .map_err(|e| Status::internal(format!("delete_reference task join failed: {e}")))??;
@@ -179,6 +174,21 @@ impl QiitaFlightService {
     }
 }
 
+/// `delete_reference` as a writer of replace-keyed tables: it holds the global
+/// lake lock exclusively (`crate::lake_locks`), taken before it checks out a
+/// writer, so the wait holds no pooled connection.
+pub(super) fn locked_delete_reference<W: std::borrow::Borrow<LakeWriter>>(
+    locks: &LakeLocks,
+    checkout: &dyn Fn() -> Result<W, Status>,
+    reference_idx: i64,
+) -> Result<serde_json::Value, Status> {
+    let mut session = locks.session(&format!(
+        "the reference delete reference_idx={reference_idx}"
+    ))?;
+    session.lock_global()?;
+    delete_reference(checkout()?.borrow(), reference_idx, Some(&session))
+}
+
 /// Delete every DuckLake row belonging to a reference.
 ///
 /// Scoping rules mirror the identifier hierarchy:
@@ -195,7 +205,11 @@ impl QiitaFlightService {
 /// Order matters: the sequence deletes run *before* the membership delete so
 /// the orphan subquery can still see this reference's rows. Idempotent — a
 /// reference with no loaded data deletes zero rows and still succeeds.
-fn delete_reference(conn: &LakeWriter, reference_idx: i64) -> Result<serde_json::Value, Status> {
+fn delete_reference(
+    conn: &LakeWriter,
+    reference_idx: i64,
+    held: Option<&LockSession<'_>>,
+) -> Result<serde_json::Value, Status> {
     let exec = |sql: &str, params: &[i64]| -> Result<usize, Status> {
         // duckdb's params! wants &dyn ToSql; i64 implements it. Build the
         // slice explicitly so the same helper serves the 1- and 2-param calls.
@@ -252,6 +266,7 @@ fn delete_reference(conn: &LakeWriter, reference_idx: i64) -> Result<serde_json:
         "the reference delete",
         &format!("reference_idx={reference_idx}"),
         reference_idx,
+        held,
         |_attempt| {
             let sequences_deleted = exec(
                 &format!("DELETE FROM qiita_lake.reference_sequences WHERE {orphan_filter}"),
