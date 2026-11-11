@@ -71,14 +71,15 @@ async def amplicon_run(role_keyed_clients, pool_alignment_seed, monkeypatch):
                 "count": pa.array(range(1, len(rows) + 1), pa.int64()),
             }
         )
-        chunks = pa.table(
+        sequences = pa.table(
             {
                 "feature_idx": pa.array([77], pa.int64()),
-                "chunk_index": pa.array([0], pa.int32()),
-                "chunk_data": pa.array([ASV], pa.string()),
+                "sequence_hash": pa.array([hashlib.md5(ASV.encode()).hexdigest()], pa.string()),
+                "sequence_length_bp": pa.array([len(ASV)], pa.int64()),
+                "sequence": pa.array([ASV], pa.string()),
             }
         )
-        return (observed if values else None), chunks
+        return (observed if values else None), sequences
 
     monkeypatch.setattr("qiita_control_plane.routes.run_feature_table.fetch_runs", _fetch)
     yield {"processing_idx": processing_idx, "runs": runs, "fetched": fetched, **seed}
@@ -342,14 +343,15 @@ async def test_features_read_no_observations(role_keyed_clients, amplicon_run, m
 
     def _fetch(*, data_plane_url, signing_key, cohort, values=True):
         calls.append(values)
-        chunks = pa.table(
+        sequences = pa.table(
             {
                 "feature_idx": pa.array([77], pa.int64()),
-                "chunk_index": pa.array([0], pa.int32()),
-                "chunk_data": pa.array([ASV], pa.string()),
+                "sequence_hash": pa.array([hashlib.md5(ASV.encode()).hexdigest()], pa.string()),
+                "sequence_length_bp": pa.array([len(ASV)], pa.int64()),
+                "sequence": pa.array([ASV], pa.string()),
             }
         )
-        return None, chunks
+        return None, sequences
 
     monkeypatch.setattr("qiita_control_plane.routes.run_feature_table.fetch_runs", _fetch)
     resp = await role_keyed_clients["wet"].post(

@@ -18,8 +18,8 @@ from qiita_control_plane.run_feature_table import (
 )
 
 
-def build_coo(cohort, values, chunks):
-    return build_values(cohort, values, chunks), build_features(cohort, chunks)
+def build_coo(cohort, values, sequences):
+    return build_values(cohort, values, sequences), build_features(cohort, sequences)
 
 
 def _cohort(*names):
@@ -51,12 +51,14 @@ def _membership(rows):
     )
 
 
-def _chunks(rows):
+def _sequences(rows):
+    """amplicon_sequence: one row per feature_idx, its bytes stored inline."""
     return pa.table(
         {
             "feature_idx": pa.array([r[0] for r in rows], pa.int64()),
-            "chunk_index": pa.array([r[1] for r in rows], pa.int32()),
-            "chunk_data": pa.array([r[2] for r in rows], pa.string()),
+            "sequence_hash": pa.array([md5(r[1]) for r in rows], pa.string()),
+            "sequence_length_bp": pa.array([len(r[1]) for r in rows], pa.int64()),
+            "sequence": pa.array([r[1] for r in rows], pa.string()),
         }
     )
 
@@ -69,7 +71,7 @@ def test_counts_are_sparse_and_named_by_column_and_md5():
     values, features = build_coo(
         _cohort("QM1", "QM2"),
         _membership([(1, 10, 5), (2, 20, 3)]),
-        _chunks([(10, 0, "ACGT"), (10, 1, "ACGT"), (20, 0, "TTTT")]),
+        _sequences([(10, "ACGTACGT"), (20, "TTTT")]),
     )
     # One row per observation: no zero for QM1 x TTTT or QM2 x ACGTACGT.
     assert sorted(values.to_pylist(), key=lambda r: r["sample"]) == [
@@ -84,7 +86,7 @@ def test_counts_are_sparse_and_named_by_column_and_md5():
 
 def test_no_internal_identifier_reaches_the_output():
     table, features = build_coo(
-        _cohort("QM1"), _membership([(1, 10, 5)]), _chunks([(10, 0, "ACGT")])
+        _cohort("QM1"), _membership([(1, 10, 5)]), _sequences([(10, "ACGT")])
     )
     assert table.column_names == ["sample", "feature", "value"]
     assert features.column_names == ["feature", "sequence", "length"]
@@ -94,14 +96,14 @@ def test_no_internal_identifier_reaches_the_output():
 
 def test_a_value_of_an_unnamed_sample_is_refused():
     with pytest.raises(RuntimeError, match="no QM"):
-        build_coo(_cohort("QM1"), _membership([(2, 10, 5)]), _chunks([(10, 0, "ACGT")]))
+        build_coo(_cohort("QM1"), _membership([(2, 10, 5)]), _sequences([(10, "ACGT")]))
 
 
 def test_an_asv_without_a_sequence_is_refused():
     with pytest.raises(RuntimeError, match="no sequence"):
-        build_coo(_cohort("QM1"), _membership([(1, 99, 5)]), _chunks([(10, 0, "ACGT")]))
+        build_coo(_cohort("QM1"), _membership([(1, 99, 5)]), _sequences([(10, "ACGT")]))
 
 
 def test_the_values_round_trip_through_an_arrow_stream():
-    values, _ = build_coo(_cohort("QM1"), _membership([(1, 10, 5)]), _chunks([(10, 0, "ACGT")]))
+    values, _ = build_coo(_cohort("QM1"), _membership([(1, 10, 5)]), _sequences([(10, "ACGT")]))
     assert pa.ipc.open_stream(arrow_stream_bytes(values)).read_all().equals(values)
