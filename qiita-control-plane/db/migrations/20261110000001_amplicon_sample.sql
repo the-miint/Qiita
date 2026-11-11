@@ -18,9 +18,13 @@
 --   'pending'   materialized by the runner for the pool's population when it
 --               mints the run's processing_idx, before the step loop.
 --   'completed' written by the terminal `finalize-amplicon-sample` action for
---               each sample denoise counted ASVs for, with that count.
+--               each sample denoise counted ASVs for.
 --   'no_data'   written by the same action for each of the run's pending
 --               samples denoise counted nothing for.
+--
+-- How many ASVs a sample carries is NOT kept here: it is a count over the lake's
+-- `amplicon_membership`, read from the data plane when wanted, not duplicated into
+-- Postgres.
 --
 -- A failed ticket leaves its rows 'pending'; a re-run under the same params
 -- resolves to the same processing_idx and closes them.
@@ -35,22 +39,16 @@ CREATE TABLE qiita.amplicon_sample (
     prep_sample_idx  BIGINT NOT NULL REFERENCES qiita.prep_sample(idx) ON DELETE RESTRICT,
     state            TEXT NOT NULL DEFAULT 'pending'
         CHECK (state IN ('pending', 'completed', 'no_data')),
-    -- How many ASVs the run counted in this sample; set with 'completed' only.
-    asv_count        INTEGER,
     created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
-    PRIMARY KEY (processing_idx, prep_sample_idx),
-    CONSTRAINT amplicon_sample_asv_count_with_completed CHECK (
-        (state = 'completed') = (asv_count IS NOT NULL)
-    ),
-    CONSTRAINT amplicon_sample_asv_count_positive CHECK (asv_count IS NULL OR asv_count > 0)
+    PRIMARY KEY (processing_idx, prep_sample_idx)
 );
 
 COMMENT ON TABLE qiita.amplicon_sample IS
     'Per-(processing_idx, prep_sample) completion gate for amplicon denoising. '
     'Materialized ''pending'' for the pool''s population when the runner mints the '
-    'run identity, then written ''completed'' (with asv_count) or ''no_data'' by '
-    'the terminal finalize-amplicon-sample action. Twin of qiita.assembly_sample.';
+    'run identity, then written ''completed'' or ''no_data'' by the terminal '
+    'finalize-amplicon-sample action. Twin of qiita.assembly_sample.';
 
 -- The lineage reads by prep_sample; the PRIMARY KEY leads with processing_idx.
 CREATE INDEX amplicon_sample_prep_sample_idx ON qiita.amplicon_sample (prep_sample_idx);
