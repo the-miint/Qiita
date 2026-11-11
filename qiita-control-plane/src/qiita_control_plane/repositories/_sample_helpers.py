@@ -3224,8 +3224,9 @@ async def insert_entity_to_study(
     study_idx: int,
     created_by_idx: int,
     on_conflict: LinkConflictMode = "raise",
-) -> None:
-    """Insert one (entity, study) link row into spec.link_table.
+) -> datetime | None:
+    """Insert one (entity, study) link row into spec.link_table and return its
+    created_at, or None when "ignore" skipped an existing row.
 
     Retirement columns are CHECK-pinned to NULL/false on a fresh row, so
     they have no place in a create call; created_at defaults to now().
@@ -3244,14 +3245,15 @@ async def insert_entity_to_study(
         if on_conflict == "ignore"
         else ""
     )
-    await conn.execute(
+    created_at = await conn.fetchval(
         f"INSERT INTO {spec.link_table} ("
         f"    {spec.link_entity_key_column}, study_idx, created_by_idx"
-        f") VALUES ($1, $2, $3)" + conflict_clause,
+        f") VALUES ($1, $2, $3)" + conflict_clause + " RETURNING created_at",
         entity_idx,
         study_idx,
         created_by_idx,
     )
+    return created_at
 
 
 async def link_entity_to_studies(

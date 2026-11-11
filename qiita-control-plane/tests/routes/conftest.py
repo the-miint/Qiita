@@ -9,6 +9,8 @@ what a route needs seeded differs per route; teardown does not, and goes
 through the ordered sweep.
 """
 
+import asyncio
+import contextlib
 import itertools
 import secrets
 import uuid
@@ -54,6 +56,10 @@ from qiita_control_plane.testing.db_seeds import (
 )
 from qiita_control_plane.testing.db_teardown import teardown_entity_graph
 from qiita_control_plane.testing.unique_names import unique_field_name
+
+# Bounds every wait on a request task, so a request that never returns fails
+# the test instead of hanging the suite.
+_REQUEST_TIMEOUT_S = 15
 
 
 @pytest.fixture(scope="session")
@@ -340,6 +346,36 @@ async def _seed_study(ctx, *, owner_idx: int, suffix: str) -> int:
     )
     ctx["created"]["study"].append(study_idx)
     return study_idx
+
+
+async def _finish(task: asyncio.Task):
+    return await asyncio.wait_for(task, _REQUEST_TIMEOUT_S)
+
+
+async def _wait_until_blocked_by(pool, blocker, task: asyncio.Task) -> None:
+    """Return once some backend is waiting on a lock `blocker` holds (the
+    request under test is the only candidate), rather than after a fixed sleep
+    that would not show the request ever reached the lock."""
+    blocker_pid = blocker.get_server_pid()
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _REQUEST_TIMEOUT_S
+    while loop.time() < deadline:
+        assert not task.done(), "request finished without waiting on the held lock"
+        waiting = await pool.fetchval(
+            "SELECT count(*) FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))",
+            blocker_pid,
+        )
+        if waiting:
+            return
+        await asyncio.sleep(0.02)
+    raise AssertionError("request never waited on the held lock")
+
+
+async def _cancel(task: asyncio.Task | None) -> None:
+    if task is not None and not task.done():
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await asyncio.wait_for(task, _REQUEST_TIMEOUT_S)
 
 
 # ---------------------------------------------------------------------------

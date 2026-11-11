@@ -777,7 +777,8 @@ async def test_require_caller_owns_run_stranger_raises_403(run_and_pool_ctx):
             p=caller,
             pool=run_and_pool_ctx["pool"],
         )
-    assert exc.value.status_code == 403
+    expected_detail = f"caller does not own sequencing_run {run_and_pool_ctx['run_idx']}"
+    assert (exc.value.status_code, exc.value.detail) == (403, expected_detail)
 
 
 @pytest.mark.db
@@ -863,7 +864,8 @@ async def test_require_caller_owns_pool_stranger_raises_403(run_and_pool_ctx):
             p=caller,
             pool=run_and_pool_ctx["pool"],
         )
-    assert exc.value.status_code == 403
+    expected_detail = f"caller does not own sequenced_pool {run_and_pool_ctx['pool_idx']}"
+    assert (exc.value.status_code, exc.value.detail) == (403, expected_detail)
 
 
 @pytest.mark.db

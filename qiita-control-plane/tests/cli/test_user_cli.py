@@ -24,6 +24,7 @@ from qiita_common.api_paths import (
     URL_BIOSAMPLE_LIST_BY_STUDY,
     URL_BIOSAMPLE_METADATA_BY_STUDY_UNIQUE_FIELD,
     URL_BIOSAMPLE_STUDY_FIELD_BY_STUDY,
+    URL_BIOSAMPLE_STUDY_LINK,
     URL_PREP_PROTOCOL_PREFIX,
     URL_PREP_SAMPLE_GLOBAL_FIELD_LIST,
     URL_PREP_SAMPLE_STUDY_FIELD_BY_STUDY,
@@ -1014,6 +1015,44 @@ def test_biosample_create_rejects_duplicate_metadata_key(capsys):
     err = capsys.readouterr().err
     assert "--metadata" in err
     assert "repeated" in err
+
+
+# ---------------------------------------------------------------------------
+# biosample link
+# ---------------------------------------------------------------------------
+
+
+def test_biosample_link_posts_without_body(monkeypatch, capsys):
+    """Tests the case where `biosample link` names a study and a biosample: one
+    body-less POST to that pair's link route, and the response printed as JSON."""
+    link_response = {
+        "biosample_idx": 9,
+        "study_idx": 7,
+        "created_by_idx": 42,
+        "created_at": "2026-11-10T12:00:00Z",
+    }
+    captured: dict = {}
+    _stub_post(monkeypatch, captured, response_json=link_response)
+
+    rc = main(
+        [
+            "--base-url",
+            "https://q.example.test",
+            "biosample",
+            "link",
+            "--study-idx",
+            "7",
+            "--biosample-idx",
+            "9",
+        ]
+    )
+
+    sent = [(r["method"], r["url"], r["json"], r["params"]) for r in captured["requests"]]
+    expected_url = (
+        f"https://q.example.test{URL_BIOSAMPLE_STUDY_LINK.format(study_idx=7, biosample_idx=9)}"
+    )
+    assert (rc, sent) == (0, [("POST", expected_url, None, None)])
+    assert json.loads(capsys.readouterr().out) == link_response
 
 
 # ---------------------------------------------------------------------------

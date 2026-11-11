@@ -12,7 +12,7 @@ Each guard depends on `get_current_principal`, so FastAPI dedupes the
 underlying resolution per-request even when many guards compose.
 """
 
-from collections.abc import Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable
 from typing import NamedTuple
 
 import asyncpg
@@ -779,39 +779,76 @@ async def require_caller_has_admin_on_all_studies(
     )
 
 
+def resource_not_found_detail(resource_label: str, resource_idx: int) -> str:
+    """The 404 detail for a resource that is missing, or hidden as if it were."""
+    return f"{resource_label} {resource_idx} not found"
+
+
+def resource_retired_detail(resource_label: str, resource_idx: int) -> str:
+    """The 409 detail for a write refused because the resource is retired."""
+    return f"{resource_label} {resource_idx} is retired"
+
+
+def caller_bypasses_ownership(principal: Principal, bypass_role: SystemRole) -> bool:
+    """Return True when the caller's role exempts it from an ownership check.
+
+    401 on Anonymous. A caller that does not bypass must then pass
+    `require_caller_owns` against the resource's owner.
+    """
+    if isinstance(principal, Anonymous):
+        raise HTTPException(status_code=401, detail=_MSG_AUTH_REQUIRED)
+    bypasses = principal.has_role_at_least(bypass_role)
+    return bypasses
+
+
+def require_caller_owns(
+    owner_idx: int | None,
+    *,
+    caller_idx: int,
+    resource_label: str,
+    resource_idx: int,
+    hide_unowned: bool = False,
+) -> None:
+    """Pass when `owner_idx`, the resource's owning principal, is `caller_idx`.
+
+    `owner_idx` is None when no such resource exists, which answers 404. A
+    resource that someone else owns answers 403, or with `hide_unowned` the
+    same 404 that a missing one gets, so the answer does not reveal that it
+    exists.
+    """
+    if owner_idx == caller_idx:
+        return
+    if owner_idx is None or hide_unowned:
+        raise HTTPException(
+            status_code=404,
+            detail=resource_not_found_detail(resource_label, resource_idx),
+        )
+    raise HTTPException(
+        status_code=403,
+        detail=f"caller does not own {resource_label} {resource_idx}",
+    )
+
+
 async def _check_caller_owns_resource(
     *,
     pool: asyncpg.Pool,
     principal: Principal,
     bypass_role: SystemRole,
-    fetch_created_by: Callable[[asyncpg.Pool, int], asyncpg.connection.Connection],
+    fetch_owner_idx: Callable[[asyncpg.Pool, int], Awaitable[int | None]],
     resource_idx: int,
     resource_label: str,
 ) -> None:
-    """Shared body for the per-resource caller-creator guards.
-
-    Order: 401 on Anonymous; role-bypass for callers at or above
-    `bypass_role` (no DB lookup); 404 if `fetch_created_by` returns None;
-    403 if the row's `created_by_idx` is not the caller. `fetch_created_by`
-    is a narrow `SELECT created_by_idx FROM ... WHERE idx = $1` so the
-    auth check costs one round trip and one column — never the full row,
-    which (for sequenced_pool) includes a BYTEA preflight blob.
-    """
-    if isinstance(principal, Anonymous):
-        raise HTTPException(status_code=401, detail=_MSG_AUTH_REQUIRED)
-    if principal.has_role_at_least(bypass_role):
+    """Shared body for the per-resource caller-owner guards: no lookup for a
+    bypass caller, otherwise `require_caller_owns` against the owner that
+    `fetch_owner_idx` returns (None when no row exists)."""
+    if caller_bypasses_ownership(principal, bypass_role):
         return
-    created_by_idx = await fetch_created_by(pool, resource_idx)
-    if created_by_idx is None:
-        raise HTTPException(
-            status_code=404,
-            detail=f"{resource_label} {resource_idx} not found",
-        )
-    if created_by_idx == principal.principal_idx:
-        return
-    raise HTTPException(
-        status_code=403,
-        detail=f"caller did not create {resource_label} {resource_idx}",
+    owner_idx = await fetch_owner_idx(pool, resource_idx)
+    require_caller_owns(
+        owner_idx,
+        caller_idx=principal.principal_idx,
+        resource_label=resource_label,
+        resource_idx=resource_idx,
     )
 
 
@@ -834,7 +871,7 @@ def require_caller_owns_run(
             pool=pool,
             principal=p,
             bypass_role=bypass_role,
-            fetch_created_by=fetch_sequencing_run_created_by,
+            fetch_owner_idx=fetch_sequencing_run_created_by,
             resource_idx=sequencing_run_idx,
             resource_label="sequencing_run",
         )
@@ -862,7 +899,7 @@ def require_caller_owns_pool(
             pool=pool,
             principal=p,
             bypass_role=bypass_role,
-            fetch_created_by=fetch_sequenced_pool_created_by,
+            fetch_owner_idx=fetch_sequenced_pool_created_by,
             resource_idx=sequenced_pool_idx,
             resource_label="sequenced_pool",
         )

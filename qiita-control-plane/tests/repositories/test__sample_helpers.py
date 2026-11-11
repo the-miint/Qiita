@@ -3632,7 +3632,7 @@ async def test_insert_entity_to_study_links_entity(ctx, spec):
 
     # Write the (entity, study) link via the parameterised helper.
     async with ctx["pool"].acquire() as conn:
-        await insert_entity_to_study(
+        returned_created_at = await insert_entity_to_study(
             conn,
             spec=spec,
             entity_idx=entity_idx,
@@ -3640,11 +3640,11 @@ async def test_insert_entity_to_study_links_entity(ctx, spec):
             created_by_idx=ctx["principal_idx"],
         )
 
-    # Verify the link row matches the expected non-retired shape. The
-    # column list is built from the spec so the assertion stays
-    # entity-agnostic.
+    # Verify the link row matches the expected non-retired shape and carries
+    # the created_at the helper returned. The column list is built from the
+    # spec so the assertion stays entity-agnostic.
     row = await ctx["pool"].fetchrow(
-        f"SELECT {spec.link_entity_key_column}, study_idx, created_by_idx, retired"
+        f"SELECT {spec.link_entity_key_column}, study_idx, created_by_idx, created_at, retired"
         f" FROM {spec.link_table}"
         f" WHERE {spec.link_entity_key_column} = $1 AND study_idx = $2",
         entity_idx,
@@ -3654,6 +3654,7 @@ async def test_insert_entity_to_study_links_entity(ctx, spec):
         spec.link_entity_key_column: entity_idx,
         "study_idx": ctx["study_idx"],
         "created_by_idx": ctx["principal_idx"],
+        "created_at": returned_created_at,
         "retired": False,
     }
     assert dict(row) == expected
@@ -3697,12 +3698,13 @@ async def test_insert_entity_to_study_on_conflict_ignore_is_idempotent(ctx, spec
     """on_conflict="ignore" is the ENA-import registration path's building
     block: re-registering an already-linked (entity, study) pair on re-import
     is the expected case, not an error -- unlike the "raise" default pinned
-    above."""
+    above. The insert returns the new row's created_at, and the skipped one None."""
     entity_idx = await _seed_unlinked_entity_for_spec(ctx, spec)
 
+    returned_created_ats = []
     for _ in range(2):
         async with ctx["pool"].acquire() as conn:
-            await insert_entity_to_study(
+            returned_created_at = await insert_entity_to_study(
                 conn,
                 spec=spec,
                 entity_idx=entity_idx,
@@ -3710,14 +3712,18 @@ async def test_insert_entity_to_study_on_conflict_ignore_is_idempotent(ctx, spec
                 created_by_idx=ctx["principal_idx"],
                 on_conflict="ignore",
             )
+        returned_created_ats.append(returned_created_at)
 
-    count = await ctx["pool"].fetchval(
-        f"SELECT count(*) FROM {spec.link_table}"
+    rows = await ctx["pool"].fetch(
+        f"SELECT created_at FROM {spec.link_table}"
         f" WHERE {spec.link_entity_key_column} = $1 AND study_idx = $2",
         entity_idx,
         ctx["study_idx"],
     )
-    assert count == 1
+    # One stored row, whose created_at the first call returned; the second
+    # call skipped it and returned None.
+    stored_created_ats = [r["created_at"] for r in rows]
+    assert returned_created_ats == [*stored_created_ats, None]
 
 
 # ---------------------------------------------------------------------------

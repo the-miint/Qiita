@@ -923,6 +923,8 @@ PATH_BIOSAMPLE_LIST_BY_STUDY = "/{study_idx}/biosample/list-idxs"
 # anchor on the /study router (the caller is authorized on the study).
 PATH_BIOSAMPLE_BY_STUDY_AND_IDX = "/{study_idx}/biosample/{biosample_idx}"
 PATH_BIOSAMPLE_METADATA_BY_STUDY = "/{study_idx}/biosample/{biosample_idx}/metadata"
+# Link an existing biosample into the study (POST).
+PATH_BIOSAMPLE_STUDY_LINK = "/{study_idx}/biosample/{biosample_idx}/link"
 # The same study-scoped view, for a caller holding a study's own unique id for the
 # sample instead of its idx: a unique-in-study field's display_name and the
 # value it carries. POST (not GET) because the identifying value lives in the
@@ -963,6 +965,7 @@ URL_BIOSAMPLE_BULK_BY_STUDY = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_BULK_BY_STUDY}
 URL_BIOSAMPLE_LIST_BY_STUDY = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_LIST_BY_STUDY}"
 URL_BIOSAMPLE_BY_STUDY_AND_IDX = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_BY_STUDY_AND_IDX}"
 URL_BIOSAMPLE_METADATA_BY_STUDY = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_METADATA_BY_STUDY}"
+URL_BIOSAMPLE_STUDY_LINK = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_STUDY_LINK}"
 URL_BIOSAMPLE_BY_STUDY_UNIQUE_FIELD = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_BY_STUDY_UNIQUE_FIELD}"
 URL_BIOSAMPLE_METADATA_BY_STUDY_UNIQUE_FIELD = (
     f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_METADATA_BY_STUDY_UNIQUE_FIELD}"

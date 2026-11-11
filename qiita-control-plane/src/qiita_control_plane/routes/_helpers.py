@@ -35,6 +35,7 @@ from ..auth.guards import (
     COHORT_MIN_TIER,
     PrepSampleReadAccess,
     filter_prep_samples_caller_can_read,
+    resource_retired_detail,
 )
 from ..auth.principal import HumanUser, Principal
 from ..repositories._sample_helpers import (
@@ -541,7 +542,7 @@ async def resolve_and_write_study_scoped_metadata(
     entity, a supertype idx for a subtype.
     """
     reported_retired_detail = (
-        f"{noun} {entity_idx} is retired" if retired_detail is None else retired_detail
+        resource_retired_detail(noun, entity_idx) if retired_detail is None else retired_detail
     )
     reported_unlinked_detail = (
         detail_for_unlinked_entity(noun=noun, entity_idx=entity_idx, study_idx=study_idx)

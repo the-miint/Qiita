@@ -20,6 +20,7 @@ from qiita_common.api_paths import (
     PATH_BIOSAMPLE_METADATA_BY_STUDY_UNIQUE_FIELD,
     PATH_BIOSAMPLE_PREFIX,
     PATH_BIOSAMPLE_STUDY_FIELD_BY_STUDY,
+    PATH_BIOSAMPLE_STUDY_LINK,
     PATH_PREP_SAMPLE_GLOBAL_FIELD_PREFIX,
     PATH_PREP_SAMPLE_GLOBAL_FIELD_ROOT,
     PATH_PREP_SAMPLE_PREFIX,
@@ -561,6 +562,20 @@ def _build_parser() -> argparse.ArgumentParser:
         global_field_path=(
             f"{PATH_BIOSAMPLE_GLOBAL_FIELD_PREFIX}{PATH_BIOSAMPLE_GLOBAL_FIELD_ROOT}"
         ),
+    )
+
+    p_biosample_link = p_biosample_sub.add_parser(
+        "link",
+        help="Link an existing biosample into a study (POST /study/{S}/biosample/{B}/link)",
+    )
+    p_biosample_link.add_argument("--study-idx", type=int, required=True)
+    p_biosample_link.add_argument("--biosample-idx", type=int, required=True)
+    p_biosample_link.set_defaults(
+        handler=_handle_study_scoped_call,
+        study_call_method="POST",
+        study_call_path=f"{PATH_STUDY_PREFIX}{PATH_BIOSAMPLE_STUDY_LINK}",
+        study_call_model=None,
+        study_call_kv_flags=(),
     )
 
     biosample_unique_field_path = f"{PATH_STUDY_PREFIX}{PATH_BIOSAMPLE_BY_STUDY_UNIQUE_FIELD}"
