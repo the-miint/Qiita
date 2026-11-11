@@ -353,9 +353,9 @@ async def _finish(task: asyncio.Task):
 
 
 async def _wait_until_blocked_by(pool, blocker, task: asyncio.Task) -> None:
-    """Return once some backend is waiting on a lock `blocker` holds (the
+    """Return once some backend is waiting on a lock that `blocker` holds (the
     request under test is the only candidate), rather than after a fixed sleep
-    that would not show the request ever reached the lock."""
+    that would not show that the request ever reached the lock."""
     blocker_pid = blocker.get_server_pid()
     loop = asyncio.get_running_loop()
     deadline = loop.time() + _REQUEST_TIMEOUT_S
