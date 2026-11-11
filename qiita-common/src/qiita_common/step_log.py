@@ -1,4 +1,5 @@
-"""One shape for a native job's two log streams.
+"""One shape for a step's two log streams — a native job's, and a control-plane
+`action:`'s.
 
 **stderr is the step's narrative**: a handful of `<time> <LEVEL> <step>: <message>`
 lines — what came in, what each stage kept or dropped, what went out, and how long
@@ -27,6 +28,8 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+from qiita_common.log import AuthorizationScrubFilter
 
 # The `kind` of a receipt for a step that succeeded. A step that did not succeed
 # carries `no_data` or its failure kind instead.
@@ -127,21 +130,59 @@ def capture_to(logs_dir: Path, step_name: str) -> Iterator[StepScope]:
 
     For a step that runs inside a long-lived service, where no job scheduler
     captures its output. Records reach the file only from code running in this
-    block's context — tasks it starts inherit it, other tickets' do not — and
-    only at the root logger's level or above. The caller writes the receipt to
-    `logs_dir/stdout` with `write_receipt` once it knows the outcome."""
-    logs_dir.mkdir(parents=True, exist_ok=True)
+    block's context — tasks it starts inherit it, other tickets' do not — and only
+    at the emitting logger's effective level or above. The file is scrubbed of
+    `Authorization` values, because it is served to the ticket originator (the
+    boot-time scrubber covers only the handlers present at boot, not this one). The
+    caller writes the receipt to `logs_dir/stdout` with `write_receipt` once it knows
+    the outcome.
+
+    The log file is best-effort: if it cannot be opened the block still runs and its
+    outcome is still recorded — a step is not failed because its log could not be
+    written."""
     with step_scope(step_name) as scope:
-        handler = step_handler(logging.FileHandler(logs_dir / "stderr", encoding="utf-8"), scope)
-        root = logging.getLogger()
-        root.addHandler(handler)
+        handler: logging.Handler | None = None
+        try:
+            logs_dir.mkdir(parents=True, exist_ok=True)
+            handler = step_handler(
+                logging.FileHandler(logs_dir / "stderr", encoding="utf-8"), scope
+            )
+            handler.addFilter(AuthorizationScrubFilter())
+            logging.getLogger().addHandler(handler)
+        except OSError:
+            logging.getLogger(__name__).warning(
+                "step log capture unavailable for %s", step_name, exc_info=True
+            )
+            handler = None
         try:
             yield scope
         finally:
-            root.removeHandler(handler)
-            handler.close()
+            if handler is not None:
+                logging.getLogger().removeHandler(handler)
+                handler.close()
+
+
+@contextmanager
+def no_step_scope() -> Iterator[None]:
+    """Run the block outside any step scope. For a task dispatched from within a
+    step's scope that is its own unit of work — a fan-out child ticket — so its log
+    lines and `summarize()` calls are not attributed to the dispatching step:
+    `asyncio.create_task` copies the scheduling context, step scope and all."""
+    token = _SCOPE.set(None)
+    try:
+        yield
+    finally:
+        _SCOPE.reset(token)
 
 
 def write_receipt(logs_dir: Path, line: str) -> None:
-    with (logs_dir / "stdout").open("a", encoding="utf-8") as out:
-        out.write(line + "\n")
+    """Append the step's receipt line to `logs_dir/stdout`. Best-effort: a failure to
+    write the receipt file must not mask the step's real outcome, which the caller
+    records separately (the progress row)."""
+    try:
+        with (logs_dir / "stdout").open("a", encoding="utf-8") as out:
+            out.write(line + "\n")
+    except OSError:
+        logging.getLogger(__name__).warning(
+            "could not write step receipt to %s", logs_dir, exc_info=True
+        )
