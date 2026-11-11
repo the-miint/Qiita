@@ -178,7 +178,13 @@ def no_step_scope() -> Iterator[None]:
 def write_receipt(logs_dir: Path, line: str) -> None:
     """Append the step's receipt line to `logs_dir/stdout`. Best-effort: a failure to
     write the receipt file must not mask the step's real outcome, which the caller
-    records separately (the progress row)."""
+    records separately (the progress row).
+
+    The authoritative outcome is that progress row, not this file. A resume re-runs a
+    non-terminal attempt in its reused dir (a crash between this write and the progress
+    write leaves exactly that attempt), so its stdout can hold more than one receipt line;
+    the last is the latest attempt's outcome, and the file is a display convenience for the
+    ticket log, never the source of truth. A within-run retry gets a fresh attempt dir."""
     try:
         with (logs_dir / "stdout").open("a", encoding="utf-8") as out:
             out.write(line + "\n")
