@@ -40,6 +40,7 @@ from qiita_common.api_paths import (
 )
 from qiita_common.models import TERMINAL_WORK_TICKET_STATES, WorkTicketState
 
+from ...actions.align_rerun import NOT_COMMITTED_REASONS, RERUN_REQUEST_BOUND_S
 from .. import _common
 
 # At most this many tickets per batch, and so re-runs in flight. It is below the
@@ -98,8 +99,6 @@ def _local_refusal(pre: dict) -> str | None:
 
 
 def _not_committed(exc: httpx.HTTPStatusError) -> bool:
-    from ...actions.align_rerun import NOT_COMMITTED_REASONS
-
     try:
         detail = exc.response.json().get("detail")
     except ValueError, AttributeError:
@@ -127,8 +126,6 @@ def run_batch(
 ) -> tuple[dict, bool]:
     """One batch. Returns the report and whether every ticket was re-armed and
     ended COMPLETED (False also for a dry run that found a problem)."""
-    from ...actions.align_rerun import RERUN_REQUEST_BOUND_S
-
     idxs: list[int] = args.work_ticket_idx
     baseline = load_baseline(args.baseline_file)
     get = lambda idx: _common.call("GET", args.base_url, token, _ticket_path(idx))  # noqa: E731
