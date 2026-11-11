@@ -3534,19 +3534,19 @@ async def finalize_amplicon_sample(
     not land. Read from the denoise output for the reason on
     `mint_amplicon_identifiers`: after register-files no staged copy is left."""
     with duckdb_connect() as duck:
-        counts = dict(
-            duck.execute(
-                "SELECT prep_sample_idx, count(*)::INTEGER FROM read_parquet(?)"
-                " GROUP BY prep_sample_idx",
+        completed = [
+            r[0]
+            for r in duck.execute(
+                "SELECT DISTINCT prep_sample_idx FROM read_parquet(?)",
                 [str(asv_counts_path)],
             ).fetchall()
-        )
+        ]
     async with pool.acquire() as conn, conn.transaction():
         return await close_amplicon_samples(
             conn,
             processing_idx=processing_idx,
             prep_sample_idxs=prep_sample_idxs,
-            asv_counts=counts,
+            completed_prep_sample_idxs=completed,
         )
 
 
