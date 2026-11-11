@@ -171,8 +171,9 @@ impl Gate {
                 return Some(GatePass { gate: self });
             }
             let Some(left) = deadline.checked_duration_since(Instant::now()) else {
-                // At the front with a pass free it would have entered above, so
-                // leaving changes no other waiter's turn.
+                // A waiter at the front with a pass free enters above, so this
+                // waiter was not at the front or no pass was free: removing it
+                // changes no other waiter's turn.
                 state.waiting.retain(|&t| t != ticket);
                 return None;
             };

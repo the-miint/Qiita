@@ -3341,7 +3341,9 @@ fn a_registration_waiting_for_the_lock_holds_no_pooled_writer() {
                 .query_row(
                     "SELECT n FROM postgres_query('lock_session', \
                      'SELECT count(*) AS n FROM pg_locks \
-                      WHERE locktype = ''advisory'' AND NOT granted')",
+                      WHERE locktype = ''advisory'' AND NOT granted \
+                      AND database = (SELECT oid FROM pg_database \
+                                      WHERE datname = current_database())')",
                     [],
                     |row| row.get(0),
                 )
