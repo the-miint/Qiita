@@ -42,6 +42,25 @@ def _install_stub(monkeypatch, *, short_name: str, execute_fn) -> None:
     monkeypatch.setitem(sys.modules, full, mod)
 
 
+@pytest.fixture(autouse=True)
+def _restore_root_logging():
+    """`main()` calls `logging.basicConfig(force=True)`, which rebinds the root
+    logger's handlers to whatever stderr is live when it runs — under pytest, the
+    test's captured stream — and quiets httpx/httpcore, and restores none of it. A
+    later test that logs would then write to a closed stream (`ValueError: I/O
+    operation on closed file`). Snapshot the logging state and put it back."""
+    root = logging.root
+    handlers, level = root.handlers[:], root.level
+    noisy = {name: logging.getLogger(name).level for name in ("httpx", "httpcore")}
+    try:
+        yield
+    finally:
+        root.handlers[:] = handlers
+        root.setLevel(level)
+        for name, lvl in noisy.items():
+            logging.getLogger(name).setLevel(lvl)
+
+
 @pytest.fixture
 def io_dirs(tmp_path, monkeypatch):
     """Set up the env-var contract the launcher reads: an input dir
@@ -376,3 +395,51 @@ def test_main_returns_1_and_prints_structured_error_on_backend_failure(
     assert err["step_name"] == "fastq"
     assert "qiita_compute_orchestrator.jobs.skeleton" in err["reason"]
     assert "not implemented" in err["reason"]
+
+
+def test_main_writes_a_no_data_receipt(monkeypatch, io_dirs, capsys):
+    """A `StepNoData` from execute() ends the step non-zero with a `no_data` receipt
+    — not a failure — on stdout and as the last stderr line. run_native_job re-raises
+    StepNoData unchanged; main() turns it into the no-data outcome the backend parses
+    before its failure parse."""
+    from qiita_common.backend_failure import StepNoData
+
+    from qiita_compute_orchestrator.slurm.launcher_failure import NO_DATA_MARKER_KIND
+
+    input_path, _ = io_dirs
+
+    async def execute(inputs, workspace):
+        raise StepNoData(step_name="fastq", reason="FASTQ well carried no records")
+
+    _install_stub(monkeypatch, short_name="nodata", execute_fn=execute)
+    _write_params(input_path, fastq_path="/tmp/x.fa", reference_idx=1, work_ticket_idx=1)
+
+    rc = main(["--job", "nodata"])
+    assert rc == 1
+    out = _outcome(capsys.readouterr())
+    assert out["kind"] == NO_DATA_MARKER_KIND
+    assert out["step_name"] == "fastq"
+    assert out["reason"] == "FASTQ well carried no records"
+    # A no-data outcome has no summary — it is not a success.
+    assert "summary" not in out
+
+
+def test_main_writes_a_receipt_for_an_unhandled_exception(monkeypatch, io_dirs, capsys):
+    """An exception run_native_job does not classify (it maps the ones it knows to
+    BackendFailure and lets the rest propagate) still ends the step with a receipt —
+    a typed permanent failure carrying the exception — rather than an empty stdout."""
+    input_path, _ = io_dirs
+
+    async def execute(inputs, workspace):
+        raise RuntimeError("something unexpected blew up")
+
+    _install_stub(monkeypatch, short_name="boom", execute_fn=execute)
+    _write_params(input_path, fastq_path="/tmp/x.fa", reference_idx=1, work_ticket_idx=1)
+
+    rc = main(["--job", "boom"])
+    assert rc == 1
+    out = _outcome(capsys.readouterr())
+    assert out["kind"] == "unknown_permanent"
+    assert out["step_name"] == "fastq"
+    assert "RuntimeError" in out["reason"]
+    assert "something unexpected blew up" in out["reason"]

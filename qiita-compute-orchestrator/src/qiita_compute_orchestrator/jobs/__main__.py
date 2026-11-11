@@ -48,7 +48,7 @@ import time
 from pathlib import Path
 
 from qiita_common.actions import NATIVE_MODULE_PREFIX
-from qiita_common.backend_failure import BackendFailure, StepNoData
+from qiita_common.backend_failure import BackendFailure, FailureKind, StepNoData
 from qiita_common.step_log import COMPLETED_KIND, receipt, step_handler, step_scope
 
 from ..slurm.contract import (
@@ -180,13 +180,18 @@ def main(argv: list[str] | None = None) -> int:
         help="short job name (the module path with NATIVE_MODULE_PREFIX stripped)",
     )
     args = parser.parse_args(argv)
-    # The step-log shape (`qiita_common.step_log`): narrative on stderr, which is
-    # what SLURM captures and the step-log route serves, and one receipt line on
-    # stdout. A non-success outcome line also goes to stderr, where
+    # The step-log shape (`qiita_common.step_log`): narrative on stderr and one
+    # receipt line on stdout. SLURM captures both, and the step-log route serves both
+    # files. A non-success outcome line also goes to stderr, where
     # `slurm.launcher_failure` picks it out of the surrounding text.
     logging.basicConfig(
         level=logging.INFO, handlers=[step_handler(logging.StreamHandler(sys.stderr))], force=True
     )
+    # httpx/httpcore log every request at INFO ("HTTP Request: GET ... 200 OK"). The
+    # step narrative is the job's own lines, not the control-plane / data-plane calls
+    # its helpers make, so keep those out of it.
+    for noisy in ("httpx", "httpcore"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
 
     input_path = Path(os.environ["QIITA_INPUT_PATH"])
     output_path = Path(os.environ["QIITA_OUTPUT_PATH"])
@@ -212,6 +217,20 @@ def main(argv: list[str] | None = None) -> int:
             # SlurmBackend sees exit=1 and enriches its failure with this line's
             # kind / step_name / reason instead of a state-based classification.
             return _outcome(exc.kind.value, exc.step_name, exc.reason, started)
+        except Exception as exc:
+            # run_native_job maps the failures it knows to BackendFailure and lets the
+            # rest propagate, so an unexpected error from execute() would otherwise end
+            # the step with no receipt. The step-log contract is a receipt for every
+            # outcome, so write one — a typed permanent failure carrying the exception —
+            # and leave the traceback in the narrative. A SIGKILL (a true OOM) still
+            # writes nothing, so SlurmBackend's state-based fallback classifies that.
+            _LOG.exception("unhandled error in step %s", step_name)
+            return _outcome(
+                FailureKind.UNKNOWN_PERMANENT.value,
+                step_name,
+                f"unhandled {type(exc).__name__}: {exc}",
+                started,
+            )
 
         try:
             files = _collect_files(output_path)
