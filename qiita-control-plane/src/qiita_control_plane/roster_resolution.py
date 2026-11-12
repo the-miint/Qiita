@@ -20,7 +20,7 @@ from qiita_common.models import (
 
 from qiita_control_plane.repositories.biosample import (
     BiosampleLookupKey,
-    fetch_active_study_links,
+    fetch_active_study_idxs_by_biosample_idx,
     fetch_biosample_idxs_by_natural_key,
 )
 from qiita_control_plane.repositories.exported_entity import EntityKind
@@ -187,7 +187,7 @@ async def fetch_roster_facts(
     study_refs = [p for r in rows for p in (r.primary_project, *r.secondary_projects)]
     study_by_key = await _fetch_by_key(conn, _STUDY_SPEC, study_refs)
     biosample_idxs = sorted({idx for hits in biosample_by_key.values() for idx in hits.values()})
-    study_links = await fetch_active_study_links(conn, biosample_idxs)
+    study_links = await fetch_active_study_idxs_by_biosample_idx(conn, biosample_idxs)
     facts = RosterFacts(
         biosample_by_key=biosample_by_key,
         study_by_key=study_by_key,

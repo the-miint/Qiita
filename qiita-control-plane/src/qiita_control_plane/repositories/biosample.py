@@ -16,11 +16,12 @@ from typing import Literal, get_args
 import asyncpg
 from qiita_common.models import BiosampleAccessionField, FieldDataType, Tier
 
-from . import require_transaction, update_row
+from . import RowLock, require_transaction, row_lock_clause, update_row
 from ._sample_helpers import (
     ResolvedFieldValue,
     assert_required_global_fields_supplied,
     fetch_missing_value_reason_idxs_by_names,
+    fetch_study_idxs_by_entity_idx,
     link_entity_to_studies,
     preflight_sample_metadata,
     require_tiers_read_every_value,
@@ -99,7 +100,7 @@ async def fetch_biosample(
     pool_or_conn: asyncpg.Pool | asyncpg.Connection,
     biosample_idx: int,
     *,
-    for_update: bool = False,
+    lock: RowLock | None = None,
 ) -> asyncpg.Record | None:
     """Return the qiita.biosample row for the given idx, or None on miss.
 
@@ -108,15 +109,10 @@ async def fetch_biosample(
     either a pool or a connection so the helper composes inside an
     open transaction or stands alone.
 
-    `for_update=True` appends `FOR UPDATE`; concurrent callers
-    serialize on the row lock until the holder commits or rolls back.
-    Pass only inside an open transaction — with a pool the implicit
-    single-statement transaction releases the lock immediately and
-    the flag is a no-op.
+    `lock` takes that row lock on the biosample; see row_lock_clause.
     """
     sql = f"SELECT {_BIOSAMPLE_RETURNING_COLS} FROM qiita.biosample WHERE idx = $1"
-    if for_update:
-        sql += " FOR UPDATE"
+    sql += row_lock_clause(pool_or_conn, lock)
     return await pool_or_conn.fetchrow(sql, biosample_idx)
 
 
@@ -346,25 +342,30 @@ async def fetch_biosample_idxs_by_natural_key(
     return resolved
 
 
-async def fetch_active_study_links(
+async def fetch_active_study_idxs_by_biosample_idx(
     pool_or_conn: asyncpg.Pool | asyncpg.Connection,
-    biosample_idxs: list[int],
+    biosample_idxs: Sequence[int],
 ) -> dict[int, list[int]]:
-    """Return `{biosample_idx: [study_idx, ...]}` (ascending) over the active
-    (non-retired) biosample_to_study links of `biosample_idxs`. A biosample with
-    no active link is omitted."""
-    if not biosample_idxs:
-        return {}
-    rows = await pool_or_conn.fetch(
-        "SELECT biosample_idx, study_idx FROM qiita.biosample_to_study"
-        " WHERE biosample_idx = ANY($1::bigint[])"
-        "   AND retired = false"
-        " ORDER BY biosample_idx, study_idx",
-        biosample_idxs,
+    """`fetch_study_idxs_by_biosample_idx` with retired links excluded."""
+    links = await fetch_study_idxs_by_biosample_idx(
+        pool_or_conn, biosample_idxs, include_retired=False
     )
-    links: dict[int, list[int]] = {}
-    for r in rows:
-        links.setdefault(r["biosample_idx"], []).append(r["study_idx"])
+    return links
+
+
+async def fetch_study_idxs_by_biosample_idx(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
+    biosample_idxs: Sequence[int],
+    *,
+    include_retired: bool,
+) -> dict[int, list[int]]:
+    """The biosample arm of `fetch_study_idxs_by_entity_idx`."""
+    links = await fetch_study_idxs_by_entity_idx(
+        pool_or_conn,
+        spec=BIOSAMPLE_METADATA_SPEC,
+        entity_idxs=biosample_idxs,
+        include_retired=include_retired,
+    )
     return links
 
 

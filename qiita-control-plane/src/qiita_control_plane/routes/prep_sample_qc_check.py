@@ -9,7 +9,7 @@ from qiita_common.models import PrepSampleQcCheck, PrepSampleQcCheckResponse, Qc
 from ..auth.guards import COHORT_MIN_TIER, require_scope
 from ..auth.principal import Principal
 from ..deps import get_db_pool
-from ..repositories.prep_sample import fetch_prep_sample_exists
+from ..repositories import fetch_entity_exists
 from ..repositories.prep_sample_qc_check import (
     fetch_qc_checks_by_prep_sample_idx,
     fetch_qc_verdict_by_prep_sample_idx,
@@ -30,7 +30,7 @@ async def get_prep_sample_qc_check_route(
         pool, caller=caller, prep_sample_idx=[prep_sample_idx], min_tier=COHORT_MIN_TIER
     )
     async with pool.acquire() as conn, conn.transaction(isolation="repeatable_read", readonly=True):
-        if not await fetch_prep_sample_exists(conn, prep_sample_idx):
+        if not await fetch_entity_exists(conn, "prep_sample", prep_sample_idx):
             raise HTTPException(
                 status_code=404, detail=f"prep_sample_idx {prep_sample_idx} not found"
             )

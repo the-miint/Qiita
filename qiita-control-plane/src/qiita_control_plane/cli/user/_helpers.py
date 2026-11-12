@@ -262,17 +262,19 @@ def _handle_read(args: argparse.Namespace, parser: argparse.ArgumentParser) -> i
 
 
 def _handle_study_scoped_call(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
-    """Call a study-scoped route that carries a request body.
+    """Call a study-scoped route.
 
     The per-command `set_defaults` supplies the verb, the subpath template
-    filled from --study-idx, the request model the flags map to, and the
-    names of any repeatable KEY=VALUE flags. Both the fold and the body
-    construction precede the token read, so invalid flags exit 2 without a
-    request going out.
+    (its placeholders filled from the parsed args of the same names), the
+    request model the flags map to or None for a route that takes no body,
+    and the names of any repeatable KEY=VALUE flags. Both the fold and the
+    body construction precede the token read, so invalid flags exit 2
+    without a request going out.
     """
     _fold_flag_values(args, parser, args.study_call_kv_flags, _common.parse_kv_pairs)
-    body = _build_body(args.study_call_model, args, parser)
-    path = args.study_call_path.format(study_idx=args.study_idx)
+    model = args.study_call_model
+    body = None if model is None else _build_body(model, args, parser)
+    path = args.study_call_path.format(**vars(args))
     method = args.study_call_method
     return _common.run_http_subcommand(
         lambda t: _common.call(method, args.base_url, t, path, json=body)

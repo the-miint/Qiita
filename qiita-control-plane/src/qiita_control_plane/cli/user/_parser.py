@@ -20,6 +20,8 @@ from qiita_common.api_paths import (
     PATH_BIOSAMPLE_METADATA_BY_STUDY_UNIQUE_FIELD,
     PATH_BIOSAMPLE_PREFIX,
     PATH_BIOSAMPLE_STUDY_FIELD_BY_STUDY,
+    PATH_BIOSAMPLE_STUDY_LINK,
+    PATH_BIOSAMPLE_STUDY_LIST,
     PATH_PREP_SAMPLE_GLOBAL_FIELD_PREFIX,
     PATH_PREP_SAMPLE_GLOBAL_FIELD_ROOT,
     PATH_PREP_SAMPLE_PREFIX,
@@ -240,6 +242,27 @@ def _add_study_field_create_args(subparser: argparse.ArgumentParser, *, entity_n
             "the tier that the field's values require, in place of the study's default;"
             " local-mode only; needs admin on the study"
         ),
+    )
+
+
+def _add_list_studies_subcommand(entity_sub, *, entity_noun: str, read_path: str) -> None:
+    """Declare one entity's `list-studies` subcommand, which reads the studies
+    that a single sample is linked to. `entity_noun` names the entity and its idx
+    flag.
+    """
+    hyphenated = entity_noun.replace("_", "-")
+    p_list_studies = entity_sub.add_parser(
+        "list-studies",
+        help=(
+            f"List the studies a {hyphenated} is linked to, with their accessions"
+            f" (GET /{hyphenated}/{{idx}}/study/list)"
+        ),
+    )
+    p_list_studies.add_argument(f"--{hyphenated}-idx", type=int, required=True)
+    p_list_studies.set_defaults(
+        handler=_handle_read,
+        read_path=read_path,
+        read_idx_arg=f"{entity_noun}_idx",
     )
 
 
@@ -574,6 +597,20 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    p_biosample_link = p_biosample_sub.add_parser(
+        "link",
+        help="Link an existing biosample into a study (POST /study/{S}/biosample/{B}/link)",
+    )
+    p_biosample_link.add_argument("--study-idx", type=int, required=True)
+    p_biosample_link.add_argument("--biosample-idx", type=int, required=True)
+    p_biosample_link.set_defaults(
+        handler=_handle_study_scoped_call,
+        study_call_method="POST",
+        study_call_path=f"{PATH_STUDY_PREFIX}{PATH_BIOSAMPLE_STUDY_LINK}",
+        study_call_model=None,
+        study_call_kv_flags=(),
+    )
+
     biosample_unique_field_path = f"{PATH_STUDY_PREFIX}{PATH_BIOSAMPLE_BY_STUDY_UNIQUE_FIELD}"
     biosample_unique_field_metadata_path = (
         f"{PATH_STUDY_PREFIX}{PATH_BIOSAMPLE_METADATA_BY_STUDY_UNIQUE_FIELD}"
@@ -633,6 +670,12 @@ def _build_parser() -> argparse.ArgumentParser:
         handler=_handle_read,
         read_path=biosample_by_idx_path,
         read_idx_arg="biosample_idx",
+    )
+
+    _add_list_studies_subcommand(
+        p_biosample_sub,
+        entity_noun="biosample",
+        read_path=f"{PATH_BIOSAMPLE_PREFIX}{PATH_BIOSAMPLE_STUDY_LIST}",
     )
 
     p_biosample_list = p_biosample_sub.add_parser(
@@ -913,18 +956,10 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p_prepsample = sub.add_parser("prep-sample", help="Prep-sample operations")
     p_prepsample_sub = p_prepsample.add_subparsers(dest="prep_sample_cmd", required=True)
-    p_prepsample_list_studies = p_prepsample_sub.add_parser(
-        "list-studies",
-        help=(
-            "List the studies a prep-sample is linked to, with their accessions"
-            " (GET /prep-sample/{idx}/study/list)"
-        ),
-    )
-    p_prepsample_list_studies.add_argument("--prep-sample-idx", type=int, required=True)
-    p_prepsample_list_studies.set_defaults(
-        handler=_handle_read,
+    _add_list_studies_subcommand(
+        p_prepsample_sub,
+        entity_noun="prep_sample",
         read_path=f"{PATH_PREP_SAMPLE_PREFIX}{PATH_PREP_SAMPLE_STUDY_LIST}",
-        read_idx_arg="prep_sample_idx",
     )
 
     prep_sample_study_field_path = f"{PATH_STUDY_PREFIX}{PATH_PREP_SAMPLE_STUDY_FIELD_BY_STUDY}"

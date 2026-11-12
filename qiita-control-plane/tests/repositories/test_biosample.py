@@ -30,10 +30,12 @@ from qiita_control_plane.repositories._sample_helpers import (
 )
 from qiita_control_plane.repositories.biosample import (
     BiosampleImportResult,
+    fetch_active_study_idxs_by_biosample_idx,
     fetch_biosample,
     fetch_biosample_idxs_by_natural_key,
     fetch_biosample_idxs_for_study,
     fetch_caller_has_biosample_access,
+    fetch_study_idxs_by_biosample_idx,
     import_biosample_from_owner_biosample_id,
     insert_biosample,
     resolve_or_import_biosample_by_ena_accession,
@@ -49,6 +51,7 @@ from qiita_control_plane.testing.db_seeds import (
     retire_biosample,
     retire_biosample_to_study_link,
     seed_biosample_global_field,
+    seed_biosample_to_study_link,
     seed_globally_linked_study_field,
     seed_local_study_field,
     seed_study,
@@ -61,7 +64,7 @@ from qiita_control_plane.testing.unique_names import (
     unique_matrix_tube_id,
 )
 
-from .conftest import _create_biosample_with_link
+from .conftest import LOCK_PROBE_TIMEOUT, _create_biosample, _create_biosample_with_link
 
 pytestmark = pytest.mark.db
 
@@ -1324,6 +1327,121 @@ async def test_fetch_biosample_idxs_for_study_respects_limit(ctx):
 
 
 # ---------------------------------------------------------------------------
+# fetch_study_idxs_by_biosample_idx / fetch_active_study_idxs_by_biosample_idx
+# ---------------------------------------------------------------------------
+
+
+async def _seed_active_and_retired_links(ctx):
+    """Seed two biosamples and a second study, and return
+    (mixed_idx, retired_only_idx, second_study_idx).
+
+    The mixed biosample has an active link to ctx['study_idx'] and a retired
+    link to the second study; the retired-only biosample's one link, to
+    ctx['study_idx'], is retired.
+    """
+    second_study_idx = await seed_study(
+        ctx["pool"], owner_idx=ctx["principal_idx"], title=f"bs-links-{secrets.token_hex(4)}"
+    )
+    ctx["created"]["studies"].append(second_study_idx)
+
+    # Mixed: active link to the fixture study, retired link to the second
+    mixed_idx = await _create_biosample_with_link(ctx)
+    await seed_biosample_to_study_link(
+        ctx["pool"],
+        biosample_idx=mixed_idx,
+        study_idx=second_study_idx,
+        created_by_idx=ctx["principal_idx"],
+    )
+    await retire_biosample_to_study_link(
+        ctx["pool"],
+        biosample_idx=mixed_idx,
+        study_idx=second_study_idx,
+        retired_by_idx=ctx["principal_idx"],
+    )
+
+    # Retired-only: its one link, to the fixture study, is retired
+    retired_only_idx = await _create_biosample_with_link(ctx)
+    await retire_biosample_to_study_link(
+        ctx["pool"],
+        biosample_idx=retired_only_idx,
+        study_idx=ctx["study_idx"],
+        retired_by_idx=ctx["principal_idx"],
+    )
+    return mixed_idx, retired_only_idx, second_study_idx
+
+
+async def test_fetch_study_idxs_by_biosample_idx_includes_retired(ctx):
+    """Tests the case where retired links are requested: every link row of each
+    biosample is returned, so a biosample whose only link is retired is present.
+    """
+    mixed_idx, retired_only_idx, second_study_idx = await _seed_active_and_retired_links(ctx)
+
+    result = await fetch_study_idxs_by_biosample_idx(
+        ctx["pool"], [mixed_idx, retired_only_idx], include_retired=True
+    )
+
+    expected = {
+        mixed_idx: [ctx["study_idx"], second_study_idx],
+        retired_only_idx: [ctx["study_idx"]],
+    }
+    assert result == expected
+
+
+async def test_fetch_study_idxs_by_biosample_idx_excludes_retired(ctx):
+    """Tests the case where retired links are not requested: only active links
+    are returned, and a biosample whose only link is retired is omitted.
+    """
+    mixed_idx, retired_only_idx, _ = await _seed_active_and_retired_links(ctx)
+
+    result = await fetch_study_idxs_by_biosample_idx(
+        ctx["pool"], [mixed_idx, retired_only_idx], include_retired=False
+    )
+
+    expected = {mixed_idx: [ctx["study_idx"]]}
+    assert result == expected
+
+
+@pytest.mark.parametrize("include_retired", [True, False])
+async def test_fetch_study_idxs_by_biosample_idx_ignores_biosample_retirement(ctx, include_retired):
+    """Tests the case where a biosample is retired but its link is active: the
+    link is returned whether or not retired links are requested, since only the
+    link's own retired flag counts.
+    """
+    retired_biosample_idx = await _create_biosample_with_link(ctx)
+    await retire_biosample(
+        ctx["pool"], biosample_idx=retired_biosample_idx, retired_by_idx=ctx["principal_idx"]
+    )
+
+    result = await fetch_study_idxs_by_biosample_idx(
+        ctx["pool"], [retired_biosample_idx], include_retired=include_retired
+    )
+
+    expected = {retired_biosample_idx: [ctx["study_idx"]]}
+    assert result == expected
+
+
+async def test_fetch_study_idxs_by_biosample_idx_empty_input(ctx):
+    """Tests the case where no biosample_idxs are given: the result is empty."""
+    result = await fetch_study_idxs_by_biosample_idx(ctx["pool"], [], include_retired=True)
+
+    assert result == {}
+
+
+async def test_fetch_active_study_idxs_by_biosample_idx_excludes_retired(ctx):
+    """Tests the case where the active-only read is used: it returns what the
+    general read returns with retired links excluded.
+    """
+    mixed_idx, retired_only_idx, _ = await _seed_active_and_retired_links(ctx)
+
+    result = await fetch_active_study_idxs_by_biosample_idx(
+        ctx["pool"], [mixed_idx, retired_only_idx]
+    )
+
+    expected = {mixed_idx: [ctx["study_idx"]]}
+    assert result == expected
+
+
+# ---------------------------------------------------------------------------
 # fetch_biosample
 # ---------------------------------------------------------------------------
 
@@ -1380,6 +1498,57 @@ async def test_fetch_biosample_returns_none_when_missing(ctx):
     # No biosample at idx=-1; the read returns None rather than raising.
     row = await fetch_biosample(ctx["pool"], -1)
     assert row is None
+
+
+async def test_fetch_biosample_lock_share_blocks_update(ctx):
+    """Tests the case where one transaction holds the biosample under a share lock:
+    an owner change from another transaction cannot take the row, so it fails at
+    its lock timeout rather than landing under the holder.
+    """
+    biosample_idx = await _create_biosample(ctx)
+
+    async with ctx["pool"].acquire() as holder, holder.transaction():
+        await fetch_biosample(holder, biosample_idx, lock="share")
+        async with ctx["pool"].acquire() as writer, writer.transaction():
+            await writer.execute(f"SET LOCAL lock_timeout = '{LOCK_PROBE_TIMEOUT}'")
+            with pytest.raises(asyncpg.LockNotAvailableError):
+                await writer.execute(
+                    "UPDATE qiita.biosample SET owner_idx = $2 WHERE idx = $1",
+                    biosample_idx,
+                    ctx["biosample_owner_idx"],
+                )
+
+
+async def test_fetch_biosample_lock_share_admits_fk_insert(ctx):
+    """Tests the case where one transaction holds the biosample under a share lock:
+    another transaction can still insert a row that references the biosample,
+    because the lock such an insert takes on it does not conflict.
+    """
+    biosample_idx = await _create_biosample(ctx)
+
+    async with ctx["pool"].acquire() as holder, holder.transaction():
+        await fetch_biosample(holder, biosample_idx, lock="share")
+        async with ctx["pool"].acquire() as writer:
+            # Roll the insert back so the fixture's teardown has nothing extra.
+            tr = writer.transaction()
+            await tr.start()
+            try:
+                await writer.execute(f"SET LOCAL lock_timeout = '{LOCK_PROBE_TIMEOUT}'")
+                await insert_entity_to_study(
+                    writer,
+                    spec=BIOSAMPLE_METADATA_SPEC,
+                    entity_idx=biosample_idx,
+                    study_idx=ctx["study_idx"],
+                    created_by_idx=ctx["principal_idx"],
+                )
+                link_count = await writer.fetchval(
+                    "SELECT count(*) FROM qiita.biosample_to_study WHERE biosample_idx = $1",
+                    biosample_idx,
+                )
+            finally:
+                await tr.rollback()
+
+    assert link_count == 1
 
 
 # ---------------------------------------------------------------------------

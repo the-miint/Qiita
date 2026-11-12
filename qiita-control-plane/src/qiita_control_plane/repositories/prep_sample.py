@@ -19,6 +19,9 @@ from collections.abc import Sequence
 
 import asyncpg
 
+from ._sample_helpers import fetch_study_idxs_by_entity_idx
+from .prep_sample_metadata import PREP_SAMPLE_METADATA_SPEC
+
 
 async def fetch_active_study_idxs_for_prep_sample(
     pool_or_conn: asyncpg.Pool | asyncpg.Connection,
@@ -34,12 +37,12 @@ async def fetch_active_study_idxs_for_prep_sample(
     two disagreeing would put the write gate (which authorizes off this one) and
     the read gates (which authorize off the batch) on different answers.
     """
-    return (await fetch_active_study_idxs_for_prep_samples(pool_or_conn, [prep_sample_idx])).get(
+    return (await fetch_active_study_idxs_by_prep_sample_idx(pool_or_conn, [prep_sample_idx])).get(
         prep_sample_idx, []
     )
 
 
-async def fetch_active_study_idxs_for_prep_samples(
+async def fetch_active_study_idxs_by_prep_sample_idx(
     pool_or_conn: asyncpg.Pool | asyncpg.Connection,
     prep_sample_idxs: Sequence[int],
 ) -> dict[int, list[int]]:
@@ -60,46 +63,13 @@ async def fetch_active_study_idxs_for_prep_samples(
     correct. Empty input short-circuits, mirroring
     `list_incomplete_alignment_samples`.
     """
-    if not prep_sample_idxs:
-        return {}
-    rows = await pool_or_conn.fetch(
-        "SELECT prep_sample_idx, study_idx FROM qiita.prep_sample_to_study"
-        " WHERE prep_sample_idx = ANY($1::bigint[]) AND retired = false"
-        " ORDER BY prep_sample_idx, study_idx",
-        list(prep_sample_idxs),
+    links = await fetch_study_idxs_by_entity_idx(
+        pool_or_conn,
+        spec=PREP_SAMPLE_METADATA_SPEC,
+        entity_idxs=prep_sample_idxs,
+        include_retired=False,
     )
-    out: dict[int, list[int]] = {}
-    for row in rows:
-        out.setdefault(row["prep_sample_idx"], []).append(row["study_idx"])
-    return out
-
-
-async def fetch_active_studies_for_prep_sample(
-    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
-    prep_sample_idx: int,
-    *,
-    limit: int,
-) -> list[asyncpg.Record]:
-    """Return up to `limit` non-retired studies this prep_sample is linked to,
-    each with study_idx + both study accessions, ordered by study_idx.
-
-    The richer sibling of fetch_active_study_idxs_for_prep_sample, which
-    returns the bare idx membership set; this joins qiita.study for the
-    accession columns. Excludes retired prep_sample_to_study links. Callers
-    that need to detect truncation pass `limit = cap + 1`; a returned length >
-    cap means the underlying set exceeded the cap.
-    """
-    rows = await pool_or_conn.fetch(
-        "SELECT s.idx AS study_idx, s.bioproject_accession, s.ena_study_accession"
-        " FROM qiita.prep_sample_to_study pts"
-        " JOIN qiita.study s ON s.idx = pts.study_idx"
-        " WHERE pts.prep_sample_idx = $1 AND pts.retired = false"
-        " ORDER BY s.idx"
-        " LIMIT $2",
-        prep_sample_idx,
-        limit,
-    )
-    return list(rows)
+    return links
 
 
 async def fetch_biosample_idx_for_prep_sample(
@@ -115,23 +85,6 @@ async def fetch_biosample_idx_for_prep_sample(
     well, never silently benign)."""
     return await pool_or_conn.fetchval(
         "SELECT biosample_idx FROM qiita.prep_sample WHERE idx = $1",
-        prep_sample_idx,
-    )
-
-
-# same-pattern-ok: per-entity existence reader, mirrors fetch_sequencing_run_exists
-async def fetch_prep_sample_exists(
-    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
-    prep_sample_idx: int,
-) -> bool:
-    """Return True iff a qiita.prep_sample row exists at this idx.
-
-    Existence-only check, separate from the full-row reads, for a cheap
-    pre-flight. No retirement filter — a retired prep_sample still returns
-    True.
-    """
-    return await pool_or_conn.fetchval(
-        "SELECT EXISTS (SELECT 1 FROM qiita.prep_sample WHERE idx = $1)",
         prep_sample_idx,
     )
 

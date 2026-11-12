@@ -16,22 +16,32 @@ teardown) — see tests/repositories/test_biosample.py.
 
 import json
 import secrets
+from typing import get_args
 
 import asyncpg
 import pytest
 from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX, SystemRole
 from qiita_common.models import LEGACY_IDX_RESERVED_CEILING, Tier
 
+from qiita_control_plane.repositories import ExistsEntity, fetch_entity_exists
 from qiita_control_plane.repositories import study as study_module
+from qiita_control_plane.repositories.biosample import fetch_biosample
+from qiita_control_plane.repositories.sequenced_sample import (
+    fetch_sequenced_sample_with_prep_sample,
+)
 from qiita_control_plane.repositories.study import (
     EnaStudyAccessionConflictError,
     create_study,
     fetch_study,
-    fetch_study_exists,
     fetch_study_idxs_by_natural_key,
     get_or_create_study_by_ena_accessions,
     insert_study,
     update_study,
+)
+from qiita_control_plane.testing.db_seeds import (
+    seed_biosample,
+    seed_sequenced_prep_sample,
+    seed_sequenced_sample_subtype,
 )
 from qiita_control_plane.testing.db_teardown import delete_principal, teardown_entity_graph
 
@@ -504,28 +514,68 @@ async def test_legacy_idx_ceiling_matches_column_comment(postgres_pool, table):
 
 
 # ---------------------------------------------------------------------------
-# fetch_study_exists
+# fetch_entity_exists
 # ---------------------------------------------------------------------------
 
 
-async def test_fetch_study_exists_returns_true_for_existing(postgres_pool):
+async def test_fetch_entity_exists(postgres_pool):
+    """Tests the case where each entity kind is asked about a row that exists and
+    about one that cannot: True for the seeded row, False for idx -1, which an
+    IDENTITY column never issues.
+    """
     async with postgres_pool.acquire() as conn:
         tr = conn.transaction()
         await tr.start()
         try:
+            # Seed one row per entity on this connection so the reads see them
+            # uncommitted and the rollback removes them.
             owner = await _create_user(conn)
-            study_idx = await _insert_study(conn, owner_idx=owner)
+            biosample_idx = await seed_biosample(conn, owner_idx=owner, created_by_idx=owner)
+            prep_sample_idx = await seed_sequenced_prep_sample(
+                conn, biosample_idx=biosample_idx, owner_idx=owner
+            )
+            sequencing_run_idx, _, _ = await seed_sequenced_sample_subtype(
+                conn,
+                prep_sample_idx=prep_sample_idx,
+                owner_idx=owner,
+                sequenced_pool_item_id=_suffix("item"),
+            )
+            seeded = {
+                "study": await _insert_study(conn, owner_idx=owner),
+                "sequencing_run": sequencing_run_idx,
+                "prep_sample": prep_sample_idx,
+                "biosample": biosample_idx,
+            }
 
-            # Pass the same connection so the fetch sees the uncommitted row.
-            assert await fetch_study_exists(conn, study_idx) is True
+            actual = {
+                entity: (
+                    await fetch_entity_exists(conn, entity, idx),
+                    await fetch_entity_exists(conn, entity, -1),
+                )
+                for entity, idx in seeded.items()
+            }
         finally:
             await tr.rollback()
 
+    expected = {entity: (True, False) for entity in get_args(ExistsEntity)}
+    assert actual == expected
 
-async def test_fetch_study_exists_returns_false_for_missing(postgres_pool):
-    # A negative idx is guaranteed to miss because the IDENTITY column
-    # only ever issues positive values.
-    assert await fetch_study_exists(postgres_pool, -1) is False
+
+@pytest.mark.parametrize("on_pool", [False, True], ids=["bare_connection", "pool"])
+@pytest.mark.parametrize(
+    "fetch",
+    [fetch_biosample, fetch_study, fetch_sequenced_sample_with_prep_sample],
+    ids=["biosample", "study", "sequenced_sample"],
+)
+async def test_row_lock_clause_outside_transaction_raises(postgres_pool, fetch, on_pool):
+    """Tests the case where a fetch is asked for a row lock outside a transaction:
+    it raises rather than taking a lock that the ending statement releases at
+    once, which would leave the caller unprotected and unaware of it.
+    """
+    async with postgres_pool.acquire() as conn:
+        target = postgres_pool if on_pool else conn
+        with pytest.raises(RuntimeError, match="transaction"):
+            await fetch(target, -1, lock="share")
 
 
 # ---------------------------------------------------------------------------

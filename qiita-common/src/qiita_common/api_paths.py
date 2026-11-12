@@ -923,6 +923,8 @@ PATH_BIOSAMPLE_LIST_BY_STUDY = "/{study_idx}/biosample/list-idxs"
 # anchor on the /study router (the caller is authorized on the study).
 PATH_BIOSAMPLE_BY_STUDY_AND_IDX = "/{study_idx}/biosample/{biosample_idx}"
 PATH_BIOSAMPLE_METADATA_BY_STUDY = "/{study_idx}/biosample/{biosample_idx}/metadata"
+# Link an existing biosample into the study (POST).
+PATH_BIOSAMPLE_STUDY_LINK = "/{study_idx}/biosample/{biosample_idx}/link"
 # The same study-scoped view, for a caller holding a study's own unique id for the
 # sample instead of its idx: a unique-in-study field's display_name and the
 # value it carries. POST (not GET) because the identifying value lives in the
@@ -943,6 +945,8 @@ PATH_BIOSAMPLE_STUDY_FIELD_BY_IDX = "/{study_idx}/biosample-field/{study_field_i
 
 PATH_BIOSAMPLE_PREFIX = "/biosample"
 PATH_BIOSAMPLE_BY_IDX = "/{biosample_idx}"
+# The studies that a biosample is actively linked to, with their accessions.
+PATH_BIOSAMPLE_STUDY_LIST = "/{biosample_idx}/study/list"
 # Bulk lookup of biosample_idx by a selectable biosample accession column
 # (biosample_accession or ena_sample_accession; default biosample_accession).
 # POST (not GET) because the accession list lives in the body — a typical
@@ -964,6 +968,7 @@ URL_BIOSAMPLE_BULK_BY_STUDY = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_BULK_BY_STUDY}
 URL_BIOSAMPLE_LIST_BY_STUDY = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_LIST_BY_STUDY}"
 URL_BIOSAMPLE_BY_STUDY_AND_IDX = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_BY_STUDY_AND_IDX}"
 URL_BIOSAMPLE_METADATA_BY_STUDY = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_METADATA_BY_STUDY}"
+URL_BIOSAMPLE_STUDY_LINK = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_STUDY_LINK}"
 URL_BIOSAMPLE_BY_STUDY_UNIQUE_FIELD = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_BY_STUDY_UNIQUE_FIELD}"
 URL_BIOSAMPLE_METADATA_BY_STUDY_UNIQUE_FIELD = (
     f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_METADATA_BY_STUDY_UNIQUE_FIELD}"
@@ -972,6 +977,7 @@ URL_BIOSAMPLE_STUDY_FIELD_BY_STUDY = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_STUDY_F
 URL_BIOSAMPLE_STUDY_FIELD_BY_IDX = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_STUDY_FIELD_BY_IDX}"
 URL_BIOSAMPLE_PREFIX = f"{API_PREFIX}{PATH_BIOSAMPLE_PREFIX}"
 URL_BIOSAMPLE_BY_IDX = f"{URL_BIOSAMPLE_PREFIX}{PATH_BIOSAMPLE_BY_IDX}"
+URL_BIOSAMPLE_STUDY_LIST = f"{URL_BIOSAMPLE_PREFIX}{PATH_BIOSAMPLE_STUDY_LIST}"
 URL_BIOSAMPLE_LOOKUP_BY_ACCESSION = f"{URL_BIOSAMPLE_PREFIX}{PATH_BIOSAMPLE_LOOKUP_BY_ACCESSION}"
 URL_BIOSAMPLE_LOOKUP_BY_MATRIX_TUBE_ID = (
     f"{URL_BIOSAMPLE_PREFIX}{PATH_BIOSAMPLE_LOOKUP_BY_MATRIX_TUBE_ID}"
