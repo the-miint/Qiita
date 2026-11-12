@@ -33,12 +33,12 @@ _None yet._
   ```
 - `[operator]` **Before the restart, run the host-taxon backfill.** From the restart a biosample
   with no `host_taxon_id` passes through host filtering undepleted, so skipping `--execute` lets
-  residue samples (taxa the curated table does not cover) pass through undepleted. `--execute` writes
-  them `not provided`, which stays refused until patched, and leaves hostless taxa absent; it is safe
-  on the old build. (#NNN)
-  1. Dry-run and read the report. Expect `unreadable_pools == 0` and
-     `controls_without_accession == 0` (no WARNING lines), because a blank the backfill cannot
-     recognise as a control is no longer refused; if either is not 0, stop and raise it.
+  residue biosamples (taxa the curated table does not cover) pass through undepleted. `--execute`
+  writes them `not provided`, which stays refused until patched, and leaves hostless taxa absent; it
+  is safe on the old build. (#NNN)
+  1. Dry-run and read the report. Expect no `WARNING:` lines and `no taxon_id at all (not
+     backfillable)` to read 0, because a blank that the backfill cannot recognize as a control, or a
+     biosample it cannot write, is no longer refused; if not, stop and raise it.
   2. Only then run it with `--execute`.
   3. Dry-run again. Expect `Pass --execute to write 0 row(s)`; if not, stop and raise it.
   ```bash

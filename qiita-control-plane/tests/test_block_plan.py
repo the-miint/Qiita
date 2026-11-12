@@ -922,10 +922,11 @@ async def test_plan_multi_host_refuses(hf, planapp):
 
 
 async def test_plan_force_bypasses_resolution(hf, planapp):
-    """A forced decision applies pool-wide, bypassing resolution: a sample with no
-    host (which would be PASS_THROUGH under real resolution) plans cleanly
+    """A forced decision applies pool-wide, bypassing resolution: a sample with an
+    unnamed host (which would be refused under real resolution) plans cleanly
     into one host-filtered partition when forced against a ready reference."""
-    await hf["add_sample"](reads=50)  # no host_taxon_id metadata
+    ps = await hf["add_sample"](reads=50)
+    await hf["set_host_missing"](ps, MISSING_REASON_NOT_PROVIDED)
 
     summary, _ = await _plan(
         hf,

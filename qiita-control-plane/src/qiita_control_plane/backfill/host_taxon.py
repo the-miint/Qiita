@@ -2,8 +2,8 @@
 
 `host_taxon_id` (the host organism a sample was taken FROM) was added as a
 biosample global field after the biosamples we hold had been ingested, so those
-carry no value (ENA imports write it). An absent value means the sample has no
-host, so a sample with a host must have it named here before it is submitted.
+carry no value (ENA imports write it). A biosample with a host must have it named
+here before it is submitted.
 
 The organism is not derivable from the taxonomy tree. `qiita.terminology_term`
 stores only `(term_id, label)` — no parent, no lineage — and NCBI's metagenome
@@ -24,12 +24,12 @@ Two facts drive each biosample, in this order:
      came from. `human gut metagenome` implies a human host; `seawater
      metagenome` implies none.
 
-Anything the two facts do not settle is REPORTED, never guessed. A sample whose
+Anything the two facts do not settle is REPORTED, never guessed. A biosample whose
 taxon is not in the table (e.g. the bare `metagenome` root, which names no
 environment and so implies no host) is written 'not provided', and stays
 UNRESOLVED at submit — which aborts rather than silently passing an un-depleted
 sample through. The residue is the curation worklist, not a rounding error. A
-hostless taxon is left absent: that is how a sample says it has no host.
+hostless taxon is left absent.
 
 Idempotent: a biosample that already carries `host_taxon_id` is skipped, so the
 backfill can be re-run. Adding a taxon to the curated table
@@ -67,7 +67,7 @@ class ControlScan:
     """What the pre-flight sweep found — the controls, and what it could not read.
 
     The two failure counts are surfaced rather than dropped because a missed blank
-    is handled as an ordinary sample. "The pre-flight said blank but
+    is handled as an ordinary biosample. "The pre-flight said blank but
     we could not match it" is a different problem from "this sample's metadata
     needs curating", and an operator has to be able to tell them apart.
     """
@@ -88,10 +88,6 @@ class HostTaxonSource(StrEnum):
     UNRESOLVED = "unresolved"  # nothing settles it — written 'not provided', reported
 
 
-# A hostless sample is left without a host_taxon_id row, which is how it says it has no host.
-_NOT_WRITTEN = HostTaxonSource.NO_HOST
-
-
 @dataclass(frozen=True, slots=True)
 class BiosampleAssignment:
     """What the backfill would write (or refuse to write) for one biosample."""
@@ -99,7 +95,7 @@ class BiosampleAssignment:
     biosample_idx: int
     study_idx: int
     source: HostTaxonSource
-    # At most one of these is set; neither when source is NO_HOST.
+    # Exactly one is set, unless source is NO_HOST (then neither).
     host_term_id: str | None = None
     missing_reason: str | None = None
     # Carried for the report so an UNRESOLVED row says WHY.
@@ -122,7 +118,7 @@ class BackfillPlan:
     control_scan: ControlScan = field(default_factory=ControlScan)
 
     def writable(self) -> list[BiosampleAssignment]:
-        return [a for a in self.assignments if a.source is not _NOT_WRITTEN]
+        return [a for a in self.assignments if a.source is not HostTaxonSource.NO_HOST]
 
     def unresolved(self) -> list[BiosampleAssignment]:
         return [a for a in self.assignments if a.source is HostTaxonSource.UNRESOLVED]
@@ -193,7 +189,7 @@ async def fetch_control_accessions(pool: asyncpg.Pool) -> ControlScan:
     backfill, and it must not be anonymous either: the pool idx is selected so an
     unreadable one can be NAMED in the report. The pools that did parse still
     contribute their controls, and every blank in an unreadable pool is treated as
-    an ordinary sample.
+    an ordinary biosample.
 
     (Test databases hold deliberately-corrupt placeholder blobs, so this is not a
     hypothetical: without the guard, one unrelated test's `b"X"` blob would fail
@@ -373,7 +369,7 @@ async def apply_backfill(
         field_idx_by_study: dict[int, int] = {}
 
         for a in assignments:
-            if a.source is _NOT_WRITTEN:
+            if a.source is HostTaxonSource.NO_HOST:
                 continue
             async with conn.transaction():
                 field_idx = field_idx_by_study.get(a.study_idx)

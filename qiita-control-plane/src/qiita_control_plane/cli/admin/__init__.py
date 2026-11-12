@@ -737,12 +737,12 @@ def _handle_backfill_host_taxon_id(
         print(
             f"\nWARNING: {len(scan.unreadable_pools)} pool pre-flight(s) could not be read:"
             f" {scan.unreadable_pools}."
-            " Their blanks are NOT recognised as controls and are handled as ordinary samples."
+            " Their blanks are NOT recognized as controls and are handled as ordinary biosamples."
         )
     if scan.controls_without_accession:
         print(
             f"\nWARNING: {scan.controls_without_accession} control(s) carry no biosample"
-            " accession, so they cannot be matched and are handled as ordinary samples."
+            " accession, so they cannot be matched and are handled as ordinary biosamples."
         )
 
     if args.execute:

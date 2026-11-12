@@ -343,7 +343,7 @@ class ControlSamples(NamedTuple):
     `accessions` are the controls we can join to a `qiita.biosample`.
     `unusable` counts controls the pre-flight KNOWS are blanks but that carry no
     biosample accession — surfaced rather than dropped, because a missed blank
-    is handled as an ordinary sample, and "the pre-flight said blank but we
+    is handled as an ordinary biosample, and "the pre-flight said blank but we
     couldn't match it" is a very different problem from "this sample's metadata
     needs curating."
     """

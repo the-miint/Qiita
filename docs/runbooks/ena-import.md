@@ -394,7 +394,9 @@ qiita biosample patch-metadata-by-unique-field --study-idx S \
   --metadata "host taxon id=<NCBI taxon id>"
 ```
 
-The value is a loaded NCBI Taxonomy id or `not provided`.
+The value is a loaded NCBI Taxonomy id or `not provided`. Biosample metadata has no delete
+route, so to correct a `not provided` biosample that has no host, patch it to `not applicable`,
+which host filtering still reads as no host. Only operators write that value, as a correction.
 Either path takes one biosample per call and needs `member` or above on the study, or
 `wet_lab_admin`; a field or value above your tier on the study is refused with 403.
 

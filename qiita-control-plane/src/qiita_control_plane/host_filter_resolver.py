@@ -22,7 +22,7 @@ to the callers. Two seams it deliberately does not cross:
     actually built is a run-time question the runner already answers
     (`runner/_reference.py`), and duplicating it here would let the two drift.
 
-Fail-closed is the rule for anything ambiguous: an unrecognised missing-reason, or
+Fail-closed is the rule for anything ambiguous: an unrecognized missing-reason, or
 a host with no profile for the platform, resolves to UNRESOLVED rather than to
 "no filtering". Silently passing an un-depleted human
 sample through is the one outcome we cannot take back.

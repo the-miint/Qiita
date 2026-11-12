@@ -189,21 +189,9 @@ async def ctx(role_keyed_clients):
 # ---------------------------------------------------------------------------
 
 
-def _with_host_taxon(body: dict) -> dict:
-    """Return `body` carrying host_taxon_id (a marker, so no seeded term is needed)."""
-    metadata = dict(body.get("metadata") or {})
-    # The namespace this POST resolves global fields by decides the key.
-    host_key = "host_taxon_id" if body.get("global_internal_names") else "host taxon id"
-    if host_key in metadata:
-        return body
-    metadata[host_key] = "not applicable"
-    return {**body, "metadata": metadata}
-
-
 async def _post_biosample(client, ctx, study_idx: int, **body):
     """POST the route and, on 201, track the biosample for teardown."""
-    payload = _with_host_taxon(body)
-    resp = await client.post(URL_BIOSAMPLE_BY_STUDY.format(study_idx=study_idx), json=payload)
+    resp = await client.post(URL_BIOSAMPLE_BY_STUDY.format(study_idx=study_idx), json=body)
     if resp.status_code == 201:
         rj = resp.json()
         ctx["created"]["biosample"].append(rj["biosample_idx"])
@@ -5194,7 +5182,7 @@ async def test_patch_biosample_metadata_by_unique_field_authz(
 
 async def _post_biosamples_bulk(client, ctx, study_idx: int, rows: list[dict]):
     """POST the bulk route and, on 201, track every created biosample for teardown."""
-    payload = {"rows": [_with_host_taxon(row) for row in rows]}
+    payload = {"rows": rows}
     resp = await client.post(URL_BIOSAMPLE_BULK_BY_STUDY.format(study_idx=study_idx), json=payload)
     if resp.status_code == 201:
         for result in resp.json()["results"]:
@@ -5538,7 +5526,7 @@ async def test_bulk_import_writes_every_rows_metadata_in_one_batch(ctx, monkeypa
     wet_idx = ctx["wet_session"]["principal_idx"]
     rows = _bulk_rows(wet_idx, unique_field_name("BulkId"), ["A", "B", "C"])
     for i, row in enumerate(rows):
-        row["metadata"] = {field_name: f"depth {i}"}
+        row["metadata"] = {field_name: f"depth {i}", "host taxon id": "not applicable"}
 
     resp = await _post_biosamples_bulk(ctx["wet"], ctx, study_idx, rows)
     assert resp.status_code == 201, resp.text
