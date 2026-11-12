@@ -130,7 +130,8 @@ qiita/
 │       └── test_system_gg2_backbone.py  # @pytest.mark.system; real GG2 backbone
 ├── workflows/
 │   ├── amplicon/
-│   │   └── 1.0.0.yaml              # versioned amplicon denoise workflow
+│   │   ├── 1.0.0.yaml              # versioned amplicon denoise workflow
+│   │   └── 1.1.0.yaml              # minimal Rapid 16S: drops primer-orient, adds the per-sample gate
 │   ├── golay-demux/
 │   │   └── 1.0.0.yaml              # versioned bcl-convert + Golay demux workflow
 │   └── reference-add/

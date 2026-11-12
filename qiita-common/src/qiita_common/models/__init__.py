@@ -185,6 +185,7 @@ from qiita_common.models.prep_sample_qc_check import (
     QcVerdict,
 )
 from qiita_common.models.processing import (
+    AmpliconSampleState,
     AssemblyExportRosterResponse,
     AssemblySampleState,
     AssemblySampleStatusUpdate,
@@ -788,6 +789,7 @@ __all__ = [
     "MaskStateSource",
     # Processing-run identity and its lifecycle (the assembly twin of the mask
     # lifecycle names above).
+    "AmpliconSampleState",
     "AssemblyExportRosterResponse",
     "AssemblySampleState",
     "AssemblySampleStatusUpdate",

@@ -7080,13 +7080,15 @@ def test_qc_producer_follows_the_workflow_gates(steps, expected):
 
 
 def test_qc_producer_covers_every_per_sample_gate():
-    """A new finalize-*-sample gate must be mapped in `_workflow_qc_producer` before it
-    can fall through to an ungated `QcProducer.NONE`."""
+    """A new finalize-*-sample gate must be accounted for in `_workflow_qc_producer`
+    before it can fall through to an ungated `QcProducer.NONE`. Amplicon declares no QC
+    checks, so it intentionally takes the NONE fall-through."""
     gates = {p for p in LibraryPrimitive if p.startswith("finalize-") and p.endswith("-sample")}
     assert gates == {
         LibraryPrimitive.FINALIZE_ALIGNMENT_SAMPLE,
         LibraryPrimitive.FINALIZE_MASK_SAMPLE,
         LibraryPrimitive.FINALIZE_ASSEMBLY_SAMPLE,
+        LibraryPrimitive.FINALIZE_AMPLICON_SAMPLE,
     }
 
 

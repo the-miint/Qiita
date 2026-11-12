@@ -19,7 +19,8 @@ stripped (e.g. `fastq_to_parquet`). The launcher:
    writes `manifest.json` to `$QIITA_OUTPUT_PATH` matching the
    verifier's contract (see `slurm/verify.py`), and exits 0.
 5. On `BackendFailure` (raised by `run_native_job`), prints a
-   structured error line to stderr and exits 1. `SlurmBackend` reads
+   structured error line to stderr (and, as the step's receipt, to
+   stdout) and exits 1. `SlurmBackend` reads
    that line via `slurm/launcher_failure.py:parse_launcher_failure`
    after a non-zero SLURM exit and uses it to enrich the
    `BackendFailure` it propagates to the runner — so the launcher's
@@ -40,12 +41,15 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import logging
 import os
 import sys
+import time
 from pathlib import Path
 
 from qiita_common.actions import NATIVE_MODULE_PREFIX
-from qiita_common.backend_failure import BackendFailure, StepNoData
+from qiita_common.backend_failure import BackendFailure, FailureKind, StepNoData
+from qiita_common.step_log import COMPLETED_KIND, receipt, step_handler, step_scope
 
 from ..slurm.contract import (
     EXPECTED_FILE_MODE,
@@ -55,6 +59,8 @@ from ..slurm.contract import (
 )
 from ..slurm.launcher_failure import NO_DATA_MARKER_KIND
 from . import flatten_native_inputs, run_native_job
+
+_LOG = logging.getLogger(__name__)
 
 
 def _flatten_params(params: JobParams) -> dict:
@@ -151,6 +157,21 @@ def _write_manifest(
     manifest_path.chmod(EXPECTED_FILE_MODE)
 
 
+def _elapsed(started: float) -> str:
+    seconds = round(time.monotonic() - started)
+    return f"{seconds // 60}m{seconds % 60:02d}s" if seconds >= 60 else f"{seconds}s"
+
+
+def _outcome(kind: str, step_name: str | None, reason: str, started: float) -> int:
+    """End a step that did not succeed: its outcome line on stderr for the
+    backend's parser and on stdout as the receipt, then exit 1."""
+    _LOG.info("ended %s after %s", kind, _elapsed(started))
+    line = receipt(kind, step_name, reason=reason)
+    print(line, file=sys.stderr, flush=True)
+    print(line, flush=True)
+    return 1
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="qiita-job-launcher")
     parser.add_argument(
@@ -159,6 +180,18 @@ def main(argv: list[str] | None = None) -> int:
         help="short job name (the module path with NATIVE_MODULE_PREFIX stripped)",
     )
     args = parser.parse_args(argv)
+    # The step-log shape (`qiita_common.step_log`): narrative on stderr and one
+    # receipt line on stdout. SLURM captures both, and the step-log route serves both
+    # files. A non-success outcome line also goes to stderr, where
+    # `slurm.launcher_failure` picks it out of the surrounding text.
+    logging.basicConfig(
+        level=logging.INFO, handlers=[step_handler(logging.StreamHandler(sys.stderr))], force=True
+    )
+    # httpx/httpcore log every request at INFO ("HTTP Request: GET ... 200 OK"). The
+    # step narrative is the job's own lines, not the control-plane / data-plane calls
+    # its helpers make, so keep those out of it.
+    for noisy in ("httpx", "httpcore"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
 
     input_path = Path(os.environ["QIITA_INPUT_PATH"])
     output_path = Path(os.environ["QIITA_OUTPUT_PATH"])
@@ -166,56 +199,56 @@ def main(argv: list[str] | None = None) -> int:
 
     params = JobParams.model_validate_json((input_path / JOB_PARAMS_FILENAME).read_text())
     step_name = params.step_name
-    try:
-        raw_inputs = _flatten_params(params)
-        outputs = asyncio.run(
-            run_native_job(module_name, raw_inputs, output_path, step_name=step_name)
-        )
-    except StepNoData as exc:
-        # Terminal no-data outcome (an empty FASTQ well) — NOT a failure. Write a
-        # structured no-data line to stderr (a sibling of the failure line below,
-        # tagged with NO_DATA_MARKER_KIND in the `kind` slot) and exit non-zero.
-        # SlurmBackend.result_step parses this BEFORE the failure parse and
-        # reconstructs a StepNoData, which the runner turns into a NO_DATA ticket
-        # rather than a FAILED one. The job wrote no manifest and no output.
-        print(
-            json.dumps(
-                {"kind": NO_DATA_MARKER_KIND, "step_name": exc.step_name, "reason": exc.reason}
-            ),
-            file=sys.stderr,
-        )
-        return 1
-    except BackendFailure as exc:
-        # Structured error line on stderr — the orchestrator-side
-        # slurmrestd polling will see exit=1 and classify based on
-        # SLURM state. The reason text helps a human looking at the
-        # job log understand what happened.
-        print(
-            json.dumps({"kind": exc.kind.value, "step_name": exc.step_name, "reason": exc.reason}),
-            file=sys.stderr,
-        )
-        return 1
+    with step_scope(step_name) as scope:
+        started = time.monotonic()
+        _LOG.info("started: native job %s", args.job)
+        try:
+            raw_inputs = _flatten_params(params)
+            outputs = asyncio.run(
+                run_native_job(module_name, raw_inputs, output_path, step_name=step_name)
+            )
+        except StepNoData as exc:
+            # Terminal no-data outcome (an empty FASTQ well) — NOT a failure, but a
+            # non-zero exit. SlurmBackend.result_step parses the no-data line BEFORE
+            # the failure parse and reconstructs a StepNoData, which the runner turns
+            # into a NO_DATA ticket rather than a FAILED one. No manifest, no output.
+            return _outcome(NO_DATA_MARKER_KIND, exc.step_name, exc.reason, started)
+        except BackendFailure as exc:
+            # SlurmBackend sees exit=1 and enriches its failure with this line's
+            # kind / step_name / reason instead of a state-based classification.
+            return _outcome(exc.kind.value, exc.step_name, exc.reason, started)
+        except Exception as exc:
+            # run_native_job maps the failures it knows to BackendFailure and lets the
+            # rest propagate, so an unexpected error from execute() would otherwise end
+            # the step with no receipt. The step-log contract is a receipt for every
+            # outcome, so write one — a typed permanent failure carrying the exception —
+            # and leave the traceback in the narrative. A SIGKILL (a true OOM) still
+            # writes nothing, so SlurmBackend's state-based fallback classifies that.
+            _LOG.exception("unhandled error in step %s", step_name)
+            return _outcome(
+                FailureKind.UNKNOWN_PERMANENT.value,
+                step_name,
+                f"unhandled {type(exc).__name__}: {exc}",
+                started,
+            )
 
-    try:
-        files = _collect_files(output_path)
-        _chmod(files)
-        _write_manifest(output_path, outputs, files)
-    except Exception as exc:
-        # execute() succeeded but the launcher couldn't honor the
-        # output contract (chmod failed, manifest write failed, ...).
-        # Same shape the verifier uses for container-side manifest
-        # failures — typed permanent failure, not a raw traceback.
-        print(
-            json.dumps(
-                {
-                    "kind": "contract_violation",
-                    "step_name": step_name,
-                    "reason": (f"post-success manifest write failed: {type(exc).__name__}: {exc}"),
-                }
-            ),
-            file=sys.stderr,
-        )
-        return 1
+        try:
+            files = _collect_files(output_path)
+            _chmod(files)
+            _write_manifest(output_path, outputs, files)
+        except Exception as exc:
+            # execute() succeeded but the launcher couldn't honor the
+            # output contract (chmod failed, manifest write failed, ...).
+            # Same shape the verifier uses for container-side manifest
+            # failures — typed permanent failure, not a raw traceback.
+            return _outcome(
+                "contract_violation",
+                step_name,
+                f"post-success manifest write failed: {type(exc).__name__}: {exc}",
+                started,
+            )
+        _LOG.info("completed in %s", _elapsed(started))
+        print(receipt(COMPLETED_KIND, step_name, summary=scope.summary), flush=True)
     return 0
 
 
