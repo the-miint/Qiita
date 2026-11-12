@@ -125,7 +125,17 @@ def test_set_field_exception_creates_without_if_match_when_none_exists(monkeypat
 def test_set_field_exception_replaces_under_the_read_etag(monkeypatch, surface):
     requests = _serve(monkeypatch, existing=True)
 
-    rc = main(_argv(surface, "set-field-exception", "--tier-override", "member", "--reason", "PII"))
+    rc = main(
+        _argv(
+            surface,
+            "set-field-exception",
+            "--tier-override",
+            "member",
+            "--reason",
+            "PII",
+            "--replace",
+        )
+    )
 
     assert rc == 0
     assert [r["method"] for r in requests] == ["GET", "PUT"]
@@ -134,7 +144,45 @@ def test_set_field_exception_replaces_under_the_read_etag(monkeypatch, surface):
 
 
 @pytest.mark.parametrize("surface", _SURFACES, ids=_IDS)
-def test_clear_field_exception_deletes_under_the_read_etag(monkeypatch, surface):
+def test_set_field_exception_without_replace_leaves_a_stored_one(monkeypatch, capsys, surface):
+    """An exception another admin set is never overwritten unseen: without
+    --replace, set stops at the read and shows what is stored."""
+    requests = _serve(monkeypatch, existing=True)
+
+    rc = main(_argv(surface, "set-field-exception", "--tier-override", "member", "--reason", "PII"))
+
+    assert rc == 1
+    assert [r["method"] for r in requests] == ["GET"]
+    err = capsys.readouterr().err
+    assert _EXCEPTION_BODY["tier_override"] in err
+    assert _EXCEPTION_BODY["reason"] in err
+    assert "--replace" in err
+
+
+@pytest.mark.parametrize("surface", _SURFACES, ids=_IDS)
+def test_set_field_exception_with_replace_creates_when_none_exists(monkeypatch, surface):
+    requests = _serve(monkeypatch, existing=False)
+
+    rc = main(
+        _argv(
+            surface,
+            "set-field-exception",
+            "--tier-override",
+            "admin",
+            "--reason",
+            "PII",
+            "--replace",
+        )
+    )
+
+    assert rc == 0
+    assert [r["method"] for r in requests] == ["GET", "PUT"]
+    assert "If-Match" not in requests[1]["headers"]
+
+
+@pytest.mark.parametrize("surface", _SURFACES, ids=_IDS)
+def test_clear_field_exception_deletes_under_the_read_etag(monkeypatch, capsys, surface):
+    """clear prints the exception it removed, read before the delete."""
     requests = _serve(monkeypatch, existing=True)
 
     assert main(_argv(surface, "clear-field-exception")) == 0
@@ -144,6 +192,8 @@ def test_clear_field_exception_deletes_under_the_read_etag(monkeypatch, surface)
         ("DELETE", _url(surface)),
     ]
     assert requests[1]["headers"]["If-Match"] == '"etag-v1"'
+    out = capsys.readouterr().out
+    assert _EXCEPTION_BODY["reason"] in out
 
 
 @pytest.mark.parametrize("surface", _SURFACES, ids=_IDS)
@@ -166,7 +216,9 @@ def test_clear_field_exception_with_none_set_exits_1(monkeypatch, surface):
     ),
     ids=("no-reason", "no-tier", "unknown-tier", "blank-reason"),
 )
-def test_set_field_exception_refuses_a_bad_body_before_any_request(monkeypatch, surface, extra):
+def test_set_field_exception_refuses_a_bad_body_before_any_request(
+    monkeypatch, capsys, surface, extra
+):
     requests = _serve(monkeypatch, existing=False)
 
     with pytest.raises(SystemExit) as exc_info:
@@ -174,3 +226,5 @@ def test_set_field_exception_refuses_a_bad_body_before_any_request(monkeypatch, 
 
     assert exc_info.value.code == 2
     assert requests == []
+    # The refusal is the body's, not argparse failing to know the verb.
+    assert "invalid choice: 'set-field-exception'" not in capsys.readouterr().err
