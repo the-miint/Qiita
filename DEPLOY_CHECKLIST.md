@@ -58,7 +58,7 @@ _None yet._
 
 ### Notes (no host action)
 
-- (#NNN) `GET /ena-import-batch/{idx}` `ena_runs[].status` can be `unsupported` (a run whose library strategy and source have no curated protocol, previously `failed`); clients matching on the closed set of statuses must accept it.
+- (#865) `GET /ena-import-batch/{idx}` `ena_runs[].status` can be `unsupported` (a run whose library strategy and source have no curated protocol, previously `failed`); clients matching on the closed set of statuses must accept it.
 - (#849) `qiita-admin backfill myloasm-provenance` is removed, with the `myloasm-provenance-recover` workflow and job: every myloasm run of long-read-assembly 1.0.0/1.0.1 is recovered.
 - (#840) `POST /biosample/resolve-roster` takes a new, incompatible row shape (nested `biosample` / `primary_project` / `secondary_projects` refs); a `qiita` CLI installed before this deploy gets a 422 from `submit-bcl-convert`, `submit-pacbio-ingest` and `submit-golay-demux` until it is upgraded.
 - (#840) Deploy this before kl-metapool moves to the kl-run-preflight release that adds export IDs: Qiita refuses a pre-flight written against a newer schema than the one it ships, so a pre-flight from the new kl-metapool fails every submit until this is live.
