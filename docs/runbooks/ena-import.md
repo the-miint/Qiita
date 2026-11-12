@@ -394,11 +394,13 @@ qiita biosample patch-metadata-by-unique-field --study-idx S \
   --metadata "host taxon id=<NCBI taxon id>"
 ```
 
-The value is a loaded NCBI Taxonomy id or `not provided`. Biosample metadata has no delete
-route, so to correct a `not provided` biosample that has no host, patch it to `not applicable`,
-which host filtering still reads as no host. Only operators write that value, as a correction.
-Either path takes one biosample per call and needs `member` or above on the study, or
-`wet_lab_admin`; a field or value above your tier on the study is refused with 403.
+The value is a loaded NCBI Taxonomy id, `not provided`, or `not applicable`. Either path takes
+one biosample per call and needs `member` or above on the study, or `wet_lab_admin`; a field or
+value above your tier on the study is refused with 403.
+
+Write `not applicable` only to correct a `not provided` biosample that turns out to have no host:
+biosample metadata has no delete route, so the field cannot go back to absent, and host filtering
+reads `not applicable` as no host.
 
 ENA's `neg_cont_type` and `pos_cont_type` tags (also spelled `negative control type` and
 `positive control type`) are kept as study-local text and never make a biosample a control,

@@ -38,9 +38,9 @@ _None yet._
   is safe on the old build. (#NNN)
   1. Dry-run and read the report. Expect no `WARNING:` lines and `no taxon_id at all (not
      backfillable)` to read 0, because a blank that the backfill cannot recognize as a control, or a
-     biosample it cannot write, is no longer refused; if not, stop and raise it.
+     biosample with no `taxon_id`, is no longer refused; if not, stop and raise the report.
   2. Only then run it with `--execute`.
-  3. Dry-run again. Expect `Pass --execute to write 0 row(s)`; if not, stop and raise it.
+  3. Dry-run again. Expect `Pass --execute to write 0 row(s)`; if not, stop and raise the report.
   ```bash
   # [operator] in the pulled checkout; DATABASE_URL as above
   cd ~/qiita-miint/qiita-control-plane

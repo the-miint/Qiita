@@ -3,7 +3,7 @@
 Two things have to hold, and they pull in opposite directions.
 
 It must be AGGRESSIVE enough to be worth running: a sample whose taxon implies a
-host, and a blank, both get written — otherwise a host sample goes undepleted
+host, and a blank, both get written — otherwise a biosample with a host goes undepleted
 and a blank is not recognized as a control.
 
 And it must be TIMID enough to be safe: a sample nothing settles is written
