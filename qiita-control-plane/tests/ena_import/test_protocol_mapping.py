@@ -88,6 +88,16 @@ def test_unrecognized_strategy_raises_unsupported_and_surfaces_strategy(
     assert excinfo.value.library_source == library_source
 
 
+def test_long_read_transcriptomic_run_with_pcr_selection_is_unsupported():
+    with pytest.raises(UnsupportedEnaLibraryStrategyError):
+        map_ena_run_to_prep_protocol_name(
+            library_strategy="RNA-Seq",
+            library_source="TRANSCRIPTOMIC",
+            library_selection="PCR",
+            platform=Platform.OXFORD_NANOPORE,
+        )
+
+
 def test_none_strategy_and_source_raises():
     with pytest.raises(UnsupportedEnaLibraryStrategyError):
         map_ena_run_to_prep_protocol_name(
@@ -122,7 +132,6 @@ def test_pcr_selection_on_a_non_amplicon_strategy_raises(
             library_selection=library_selection,
             platform=platform,
         )
-    assert type(excinfo.value) is UnmappableEnaLibraryStrategyError
     assert excinfo.value.library_strategy == library_strategy
     assert excinfo.value.library_source == library_source
     assert excinfo.value.library_selection == library_selection

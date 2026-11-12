@@ -746,7 +746,7 @@ async def _register_one_ena_run(
         return EnaRunRegistrationOutcome(
             run_accession=ena_run.run_accession,
             status=EnaRunRegistrationStatus.UNSUPPORTED,
-            failure_reason=str(exc),
+            failure_reason=exception_reason(exc),
         )
     except Exception as exc:  # noqa: BLE001 -- per-run isolation: a failure must
         # never abort sibling runs; it is recorded (accession + reason) in the

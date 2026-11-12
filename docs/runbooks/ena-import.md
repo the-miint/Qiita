@@ -177,9 +177,9 @@ otherwise-public study, an individual **suppressed run** is `excluded` — isola
 its siblings exactly like an unmappable platform, carrying a `failure_reason` naming
 its status (`run is suppressed`), and contributing no `biosample`/`prep_sample`/`sequenced_sample`
 rows. When a pool was created (at least one run's platform mapped) but every run in
-the item still ends up `excluded` and/or `failed` — none reaches
+the item still ends up `excluded`, `unsupported` and/or `failed` — none reaches
 `registered`/`skipped_already_present` — the item fails with "every run failed to
-register", grouping the excluded and failed runs by reason (see *Metadata
+register", grouping those runs by reason (see *Metadata
 harmonization* below); if no platform ever mapped, no pool
 exists and the item instead fails with "no run mapped to a downloadable pool".
 
