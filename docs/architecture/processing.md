@@ -296,7 +296,7 @@ A gate failure after exit code 0 is a permanent failure — the container return
 - Reports results back to control plane via REST callback after all steps pass
 - Shared filesystem assumed for all data I/O
 
-**Job logging:** SLURM captures stdout/stderr to `logs/stdout` and `logs/stderr` in the step attempt's workspace, `PATH_SCRATCH/ticket/<work_ticket_idx>/<step>/attempt-<N>/`. The path is derived from the workspace, not stored on the ticket; `GET /work-ticket/{idx}/step/{step_index}/logs` (`qiita ticket logs`) serves a bounded tail.
+**Step logging:** a step's narrative and receipt land in `logs/stderr` and `logs/stdout` in the step attempt's workspace, `PATH_SCRATCH/ticket/<work_ticket_idx>/<step>/attempt-<N>/`. For a native job the launcher writes them (SLURM captures its stdout/stderr); for an in-process `action:` the runner writes them itself (`capture_to` / `write_receipt`, best-effort — a log that cannot be written does not fail the step). The path is derived from the workspace, not stored on the ticket; `GET /work-ticket/{idx}/step/{step_index}/logs` (`qiita ticket logs`) serves a bounded tail.
 
 **Workflow containerization:** Apptainer/Singularity for HPC compatibility. (Apptainer is the Linux Foundation continuation of Singularity; the `singularity` command is typically aliased to `apptainer`.)
 - Container images per workflow step, versioned (e.g., `qiita-workflow-amplicon:v1.2.0`)

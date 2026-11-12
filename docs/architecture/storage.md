@@ -33,7 +33,7 @@ PATH_PERSISTENT/                            durable, backed up
   ducklake/<table>/<filename>               DuckLake data path (flat per logical table; CRC sharding only if file count pressures the FS)
 
 /scratch/                                   recommended PATH_SCRATCH (and PATH_DERIVED = /scratch/persistent)
-  ticket/<work_ticket_idx>/<step>/attempt-<N>/  per-attempt workspace: control-plane runner files; under SLURM also input/params.json, output/ (step outputs), logs/{stdout,stderr}, tmp/; not reclaimed automatically
+  ticket/<work_ticket_idx>/<step>/attempt-<N>/  per-attempt workspace: control-plane runner files and logs/{stdout,stderr} (written by the native-job launcher under SLURM, or by an in-process action); under SLURM also input/params.json, output/ (step outputs), tmp/; not reclaimed automatically
   staging/uploads/<upload_idx>/upload.parquet   DoPut upload staging; not reclaimed automatically
   staging/uploads/<upload_idx>/upload.parquet.partial  a DoPut being written; one a killed data plane left is not reclaimed automatically
   duckdb-spill/<host>-<pid>-<random>/       one data-plane connection's DuckDB spill
