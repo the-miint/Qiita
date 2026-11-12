@@ -255,28 +255,28 @@ async def make_pat_client(postgres_pool, regular_user_session):
 
 @pytest_asyncio.fixture
 async def no_biosample_write_client(make_pat_client):
-    """A regular_user PAT with a scope set that EXCLUDES Scope.BIOSAMPLE_WRITE —
+    """A regular_user PAT with a scope set that excludes Scope.BIOSAMPLE_WRITE —
     drives the require_scope guard's missing-scope 403."""
     return await make_pat_client(label="bs-no-write", scopes=[Scope.SELF_PROFILE])
 
 
 @pytest_asyncio.fixture
 async def no_biosample_read_client(make_pat_client):
-    """A regular_user PAT with a scope set that EXCLUDES Scope.BIOSAMPLE_READ
+    """A regular_user PAT with a scope set that excludes Scope.BIOSAMPLE_READ
     so the require_scope guard's missing-scope 403 surfaces."""
     return await make_pat_client(label="bs-no-read", scopes=[Scope.SELF_PROFILE])
 
 
 @pytest_asyncio.fixture
 async def no_prep_sample_write_client(make_pat_client):
-    """A regular_user PAT with a scope set that EXCLUDES Scope.PREP_SAMPLE_WRITE
+    """A regular_user PAT with a scope set that excludes Scope.PREP_SAMPLE_WRITE
     so the require_scope guard's missing-scope 403 surfaces."""
     return await make_pat_client(label="no-prep-sample-write", scopes=[Scope.SELF_PROFILE])
 
 
 @pytest_asyncio.fixture
 async def no_prep_sample_read_client(make_pat_client):
-    """A regular_user PAT with a scope set that EXCLUDES Scope.PREP_SAMPLE_READ
+    """A regular_user PAT with a scope set that excludes Scope.PREP_SAMPLE_READ
     so the require_scope guard's missing-scope 403 surfaces on the
     sequenced-sample read endpoints."""
     return await make_pat_client(label="no-prep-sample-read", scopes=[Scope.SELF_PROFILE])
@@ -312,7 +312,7 @@ def unique_instrument_id(prefix: str) -> str:
 
 @pytest_asyncio.fixture
 async def no_study_read_client(make_pat_client):
-    """A regular_user PAT with a scope set that EXCLUDES Scope.STUDY_READ so
+    """A regular_user PAT with a scope set that excludes Scope.STUDY_READ so
     the require_scope guard's missing-scope 403 surfaces on the study-scoped
     list-idxs routes."""
     return await make_pat_client(label="no-study-read", scopes=[Scope.SELF_PROFILE])
