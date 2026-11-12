@@ -69,6 +69,7 @@ from .conftest import (
     STUDY_FIELD_CREATE_AUTHZ_CASES,
     STUDY_FIELD_CREATE_CONFLICT_CASES,
     STUDY_FIELD_LIST_AUTHZ_CASES,
+    STUDY_SCOPED_SAMPLE_LINK_AUTHZ_CASES,
     STUDY_SCOPED_SAMPLE_READ_AUTHZ_CASES,
     STUDY_SCOPED_SAMPLE_WRITE_AUTHZ_CASES,
     IneligibilityKind,
@@ -83,6 +84,7 @@ from .conftest import (
     assert_study_field_create_conflict,
     assert_study_field_get_authz,
     assert_study_field_list_authz,
+    assert_study_scoped_sample_link_authz,
     assert_study_scoped_sample_read_authz,
     assert_study_scoped_sample_write_authz,
     etag_for_row,
@@ -3577,7 +3579,7 @@ def _expected_active_link_row(
     }
 
 
-@pytest.mark.parametrize("case", STUDY_SCOPED_SAMPLE_WRITE_AUTHZ_CASES)
+@pytest.mark.parametrize("case", STUDY_SCOPED_SAMPLE_LINK_AUTHZ_CASES)
 async def test_create_biosample_study_link_authz(ctx, no_biosample_write_client, case):
     """Tests the case where each study-side access shape calls the link create on a
     biosample the regular user owns: the ADMIN minimum, the wet_lab_admin bypass,
@@ -3587,7 +3589,7 @@ async def test_create_biosample_study_link_authz(ctx, no_biosample_write_client,
     async def _seed(ctx, _study_idx):
         return await _seed_biosample_owned_by(ctx, "user")
 
-    await assert_study_scoped_sample_write_authz(
+    await assert_study_scoped_sample_link_authz(
         ctx,
         case=case,
         no_scope_client=no_biosample_write_client,

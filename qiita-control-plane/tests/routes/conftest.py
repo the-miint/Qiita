@@ -942,6 +942,14 @@ _STUDY_SCOPED_SAMPLE_WRITE_AUTHZ: dict[str, tuple[str | None, str | None, str, i
 }
 STUDY_SCOPED_SAMPLE_WRITE_AUTHZ_CASES = tuple(_STUDY_SCOPED_SAMPLE_WRITE_AUTHZ)
 
+# The write rows at the ADMIN floor instead, for linking a sample into a study:
+# a member grant is the case below it.
+_STUDY_SCOPED_SAMPLE_LINK_AUTHZ: dict[str, tuple[str | None, str | None, str, int | None]] = {
+    **{k: v for k, v in _STUDY_SCOPED_SAMPLE_WRITE_AUTHZ.items() if k != "member_grant"},
+    "below_admin_member": ("wet", "member", "user", 403),
+}
+STUDY_SCOPED_SAMPLE_LINK_AUTHZ_CASES = tuple(_STUDY_SCOPED_SAMPLE_LINK_AUTHZ)
+
 # Path idx for the case whose study does not exist: no sample is seeded, and
 # the study gate answers before anything reads this.
 _UNUSED_SAMPLE_IDX = 1
@@ -960,18 +968,17 @@ async def _assert_study_scoped_sample_authz(
 ) -> None:
     """Drive one access case of a study-scoped sample route and assert its status.
 
-    `case` names a row of `cases` (`_STUDY_SCOPED_SAMPLE_READ_AUTHZ` or
-    `_STUDY_SCOPED_SAMPLE_WRITE_AUTHZ`), which fixes the study's
-    ownership, any grant to the regular user, the calling client, and the
-    expected status; a None status means the case is allowed and
-    `success_status` is expected instead. `seed_sample(ctx, study_idx)` seeds
-    the sample the route addresses and returns its idx, and
-    `send(client, study_idx, sample_idx)` issues the request, so one driver
-    serves routes with different verbs and bodies. `no_scope_client` is a PAT
-    client lacking the route's own scope, and `required_scope` is the scope it
-    lacks: the missing-scope row asserts the refusal names it, so a route wired
-    to a different scope inside the caller's ceiling is not mistaken for a
-    correctly-wired one.
+    `case` names a row of `cases`, one of the study-scoped sample tables above,
+    which fixes the study's ownership, any grant to the regular user, the
+    calling client, and the expected status; a None status means the case is
+    allowed and `success_status` is expected instead.
+    `seed_sample(ctx, study_idx)` seeds the sample the route addresses and
+    returns its idx, and `send(client, study_idx, sample_idx)` issues the
+    request, so one driver serves routes with different verbs and bodies.
+    `no_scope_client` is a PAT client lacking the route's own scope, and
+    `required_scope` is the scope it lacks: the missing-scope row asserts the
+    refusal names it, so a route wired to a different scope inside the caller's
+    ceiling is not mistaken for a correctly-wired one.
 
     The unauthenticated case drives the ASGI app directly, since every role
     client carries a token by construction.
@@ -1015,6 +1022,13 @@ async def assert_study_scoped_sample_write_authz(ctx, *, case: str, **kwargs) ->
     """Drive one access case of a study-scoped sample write (MEMBER floor)."""
     await _assert_study_scoped_sample_authz(
         ctx, cases=_STUDY_SCOPED_SAMPLE_WRITE_AUTHZ, case=case, **kwargs
+    )
+
+
+async def assert_study_scoped_sample_link_authz(ctx, *, case: str, **kwargs) -> None:
+    """Drive one access case of linking a sample into a study (ADMIN floor)."""
+    await _assert_study_scoped_sample_authz(
+        ctx, cases=_STUDY_SCOPED_SAMPLE_LINK_AUTHZ, case=case, **kwargs
     )
 
 
