@@ -23,6 +23,7 @@ The builder supports two runtimes, selected by which of `container` or
 - Native form (`python -m`):
       #!/bin/bash
       set -euo pipefail
+      umask 0007
       export SRUN_CPUS_PER_TASK="${SLURM_CPUS_PER_TASK:-1}"
       srun --cpu-bind=none python -m qiita_compute_orchestrator.jobs --job <short_name>
   `<short_name>` is `module` with `NATIVE_MODULE_PREFIX` stripped.
@@ -151,7 +152,23 @@ def _build_native_script(*, module: str, python: str) -> str:
     # pinning (--cpu-bind=none) so the thread pool floats across the whole
     # cgroup cpuset, which already constrains the job to its allocation.
     # Container steps (apptainer exec, no srun) are unaffected.
+    #
+    # `umask 0007`: a directory the job creates under $QIITA_OUTPUT_PATH must be
+    # group-writable, because registration (the data plane, as qiita-data, a
+    # qiita-pipeline member) moves each registered file out of it and then
+    # unlinks the source, and unlinking needs write on the directory. The job's
+    # umask otherwise comes from the SLURM environment; observed at 022 on the
+    # deploy, which left job-made subdirectories at 2755 and every registered
+    # file in them behind in scratch. 0007 matches the orchestrator's own
+    # UMask (deploy/systemd/qiita-compute-orchestrator.service.d/umask.conf),
+    # which creates $QIITA_OUTPUT_PATH itself. The umask covers everything the
+    # job creates, including the per-sample reads-staging tree outside the
+    # output path, so "other" loses read on new files and directories there.
+    # No reader of that tree relies on "other": every service account that
+    # reads it is in qiita-pipeline. On success the launcher sets
+    # each file under $QIITA_OUTPUT_PATH to EXPECTED_FILE_MODE (slurm/contract.py).
     cmd = (
+        "umask 0007\n"
         'export SRUN_CPUS_PER_TASK="${SLURM_CPUS_PER_TASK:-1}"\n'
         f"srun --cpu-bind=none {python} -m qiita_compute_orchestrator.jobs --job {short}"
     )

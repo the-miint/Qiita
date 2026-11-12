@@ -26,7 +26,7 @@ from qiita_common.models import (
     BatchItemState,
 )
 
-from ..auth.guards import require_human_with_role
+from ..auth.guards import METADATA_BYPASS_ROLE, require_human_with_role
 from ..auth.principal import HumanUser
 from ..deps import get_db_pool
 from ..ena_import.batch import (
@@ -48,7 +48,7 @@ async def submit_ena_import_batch(
     body: BatchImportRequest,
     request: Request,
     pool: asyncpg.Pool = Depends(get_db_pool),
-    principal: HumanUser = Depends(require_human_with_role(SystemRole.WET_LAB_ADMIN)),
+    principal: HumanUser = Depends(require_human_with_role(METADATA_BYPASS_ROLE)),
     _: None = Depends(_require_compute_backend_client),
 ) -> BatchImportResponse:
     """Fail loud (422), before writing anything, on any malformed accession:

@@ -104,9 +104,10 @@ A purely-local field's `data_type` may be **widened to `text`**, and to nothing 
 This section defines the rule. It supersedes the comment on the `qiita.tier`
 type in the applied migration `20260501000006_study.sql`, which names only
 system admins as reading every value, as the study-record rule below does.
-Reads of biosample and prep_sample metadata enforce it through
+Reads and writes of biosample and prep_sample metadata enforce it through
 `qiita.biosample_metadata_visibility` / `qiita.prep_sample_metadata_visibility`,
-which take the caller's tiers from `auth.guards.caller_metadata_tiers`.
+which take the caller's tiers from `auth.guards.caller_metadata_tiers`; writes
+also check field tiers through `qiita.metadata_field_tier`.
 
 A caller may read a metadata value when their tier on **the value's study**
 reaches **the value's required tier**.
@@ -185,10 +186,52 @@ they carry. Readers that serve operators
 rather than callers — the host-filter resolver, the host-taxon backfill, and
 the system_admin owner-biosample-id export — read the tables directly.
 
-**Writes are checked separately.** Every study-scoped route that writes
-biosample or prep_sample metadata, or mints a study-local field, requires
-`admin` on the study, or a wet_lab_admin+ role, so only a caller who can read
-every value there can write.
+**Writes are bounded by the same rule.** The study-scoped routes that write
+biosample or prep_sample metadata, or create or edit a study-local field, admit
+any caller with `member` tier or above on the study, or a wet_lab_admin+ role.
+What such a caller may touch:
+
+- **Fields.** A write naming a field whose field tier is above the caller's
+  tier on the study is refused with 403, before anything is written or parsed
+  (`_sample_helpers.preflight_sample_metadata`). A global field that the study
+  has not linked yet is judged on its own tier.
+- **Values.** Every value that a write would touch must be one that the caller
+  can read once it is written, or the write is refused with 403 and no write
+  persists (`_sample_helpers.write_resolved_metadata_entries`). The 403 names
+  only field keys (`routes._helpers._raise_value_above_tier`). Before anything
+  is written, a key is refused when the field's value on that biosample or
+  prep_sample is hidden from the caller, or when a value-level exception on it
+  is above the caller's tier, whether or not a value is stored yet
+  (`_sample_helpers._fetch_keys_restricted_on_entity`). That covers another
+  study's value in a global field, and a value stored through a
+  `unique_in_study` field, whose collision answers would otherwise quote the
+  value. The written values are checked again before commit, and a collision
+  with a hidden value answers the same 403 under the same keys, both in
+  `_sample_helpers.write_resolved_metadata_entries`.
+- **Field definitions.** Setting `tier_override`, or changing `unique_in_study`
+  or `data_type` on an existing field, requires `admin` on the study, whatever
+  the body sets (`routes._helpers._ADMIN_ONLY_FIELD_ATTRIBUTES` says why). So
+  does any edit of the field that holds the study's owner biosample ids
+  (`routes._helpers._require_admin_to_edit_owner_sample_id_field`). A caller
+  may create, link, or edit only a field whose field tier is within their own
+  tier on the study.
+- **Imports.** Creating a biosample or a prep_sample with its metadata requires
+  `admin` on the study or a wet_lab_admin+ role
+  (`_sample_helpers.require_tiers_read_every_value`).
+
+**What a refused write can still reveal.**
+
+- `unique_in_study` is enforced over every value, including ones that the
+  caller cannot read. A write that repeats a value already stored through such
+  a field on another biosample or prep_sample is refused for that collision,
+  which shows the caller that a hidden value equals the one that they sent.
+- A global field holds one value per biosample or prep_sample, whichever linked
+  study wrote it. A write into one that holds another study's value that the
+  caller cannot read is refused rather than overwriting that value, so the
+  refusal shows that a value is there.
+- A tier that another transaction changes while a write runs, such as an admin
+  setting a field's `tier_override`, can make the 403 name different keys
+  depending on what the body sent.
 
 ### What a tier reads of a study's own record
 

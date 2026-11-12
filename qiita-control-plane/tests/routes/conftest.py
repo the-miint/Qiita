@@ -347,7 +347,7 @@ async def _seed_study(ctx, *, owner_idx: int, suffix: str) -> int:
 # ---------------------------------------------------------------------------
 # Every study-local field route carries the same gate — require_scope,
 # require_study_exists, and require_study_access with a wet_lab_admin bypass —
-# differing only in the tier floor (create at ADMIN, list at VIEWER) and, for
+# differing only in the tier floor (create and edit at MEMBER, list at VIEWER) and, for
 # create, the conflict semantics. The global-field registry read drops the two
 # study gates and keeps only the scope. Each entity supplies its bindings once
 # and drives every matrix through the shared helpers below.
@@ -589,19 +589,23 @@ async def _seed_field_global(ctx, *, surface: SampleFieldSurface, label: str) ->
 # and the driver's caller supplies the success status its route returns, which
 # is what lets the create and edit routes share this table despite answering
 # 201 and 200.
-_STUDY_FIELD_ADMIN_FLOOR_AUTHZ: dict[str, tuple[str | None, str | None, str, int | None]] = {
+# The rows sit at the MEMBER floor, so a member grant is admitted and a viewer
+# grant is the case below it. What a member may then create or edit is bounded
+# by the field's tier, which the field-rule tests pin, not this table.
+_STUDY_FIELD_MEMBER_FLOOR_AUTHZ: dict[str, tuple[str | None, str | None, str, int | None]] = {
     "owner": ("user", None, "user", None),
     "admin_grant": ("wet", "admin", "user", None),
+    "member_grant": ("wet", "member", "user", None),
     "wet_lab_admin_bypass": ("user", None, "wet", None),
     "no_access": ("wet", None, "user", 403),
-    "below_admin": ("wet", "member", "user", 403),
+    "below_member_viewer": ("wet", "viewer", "user", 403),
     "missing_scope": ("user", None, "no_scope", 403),
     "nonexistent_study": (None, None, "wet", 404),
 }
-STUDY_FIELD_ADMIN_FLOOR_AUTHZ_CASES = tuple(_STUDY_FIELD_ADMIN_FLOOR_AUTHZ)
+STUDY_FIELD_MEMBER_FLOOR_AUTHZ_CASES = tuple(_STUDY_FIELD_MEMBER_FLOOR_AUTHZ)
 # The create route's own name for the table it drives; the edit route drives
 # the same rows.
-STUDY_FIELD_CREATE_AUTHZ_CASES = STUDY_FIELD_ADMIN_FLOOR_AUTHZ_CASES
+STUDY_FIELD_CREATE_AUTHZ_CASES = STUDY_FIELD_MEMBER_FLOOR_AUTHZ_CASES
 
 
 async def _seed_authz_case_study(ctx, *, owner_key: str | None, grant_tier, case: str) -> int:
@@ -686,7 +690,7 @@ async def assert_study_field_create_authz(
     await assert_study_field_authz(
         ctx,
         case=case,
-        cases=_STUDY_FIELD_ADMIN_FLOOR_AUTHZ,
+        cases=_STUDY_FIELD_MEMBER_FLOOR_AUTHZ,
         surface=surface,
         no_scope_client=no_scope_client,
         send=_send_study_field_create,
@@ -878,16 +882,17 @@ _STUDY_SCOPED_SAMPLE_READ_AUTHZ: dict[str, tuple[str | None, str | None, str, in
 }
 STUDY_SCOPED_SAMPLE_READ_AUTHZ_CASES = tuple(_STUDY_SCOPED_SAMPLE_READ_AUTHZ)
 
-# The same shape for the study-scoped sample writes, at the ADMIN floor: viewer
-# and member are listed separately because each pins the floor from a
-# different side.
+# The same shape for the study-scoped sample writes, at the MEMBER floor: the
+# member and viewer grants pin the floor from either side. Which fields and
+# values a member may then write is not this table's subject; the metadata
+# visibility route tests pin that.
 _STUDY_SCOPED_SAMPLE_WRITE_AUTHZ: dict[str, tuple[str | None, str | None, str, int | None]] = {
     "owner": ("user", None, "user", None),
     "admin_grant": ("wet", "admin", "user", None),
+    "member_grant": ("wet", "member", "user", None),
     "wet_lab_admin_bypass": ("user", None, "wet", None),
     "no_access": ("wet", None, "user", 403),
-    "below_admin_viewer": ("wet", "viewer", "user", 403),
-    "below_admin_member": ("wet", "member", "user", 403),
+    "below_member_viewer": ("wet", "viewer", "user", 403),
     "missing_scope": ("user", None, "no_scope", 403),
     "anonymous": ("user", None, "anon", 401),
     "nonexistent_study": (None, None, "wet", 404),
@@ -964,7 +969,7 @@ async def assert_study_scoped_sample_read_authz(ctx, *, case: str, **kwargs) -> 
 
 
 async def assert_study_scoped_sample_write_authz(ctx, *, case: str, **kwargs) -> None:
-    """Drive one access case of a study-scoped sample write (ADMIN floor)."""
+    """Drive one access case of a study-scoped sample write (MEMBER floor)."""
     await _assert_study_scoped_sample_authz(
         ctx, cases=_STUDY_SCOPED_SAMPLE_WRITE_AUTHZ, case=case, **kwargs
     )

@@ -1710,6 +1710,58 @@ async def test_item_failed_after_creating_its_study_does_not_block_reimport(
     await _cleanup_study(postgres_pool, accession)
 
 
+async def test_reimport_by_a_submitter_below_admin_fails_naming_their_tier(
+    batch_app, postgres_pool, admin_principal, download_ena_study_action, batch_cleanup
+):
+    """A re-import into a study that an earlier import created, by a submitter
+    who holds neither admin on it nor the wet_lab_admin role, as when the role
+    is revoked before a re-drive. The item fails with a reason that names the
+    submitter's tier, before anything is written."""
+    accession = unique_ena_accession("PRJNA")
+    first_idx, first_items = await _drive_one_study(
+        batch_app, postgres_pool, admin_principal, accession
+    )
+    batch_cleanup.append(first_idx)
+    study_idx = await postgres_pool.fetchval(
+        "SELECT study_idx FROM qiita.ena_import_batch_item WHERE idx = $1", first_items[0].idx
+    )
+    linked_before = await postgres_pool.fetchval(
+        "SELECT count(*) FROM qiita.prep_sample_to_study WHERE study_idx = $1", study_idx
+    )
+    tickets_before = await postgres_pool.fetchval("SELECT count(*) FROM qiita.work_ticket")
+    demoted_idx = await seed_user_principal(
+        postgres_pool, prefix="ena-batch-demoted", suffix="t07", system_role=SystemRole.USER
+    )
+    demoted = HumanUser(
+        principal_idx=demoted_idx,
+        email=f"ena-batch-demoted-{demoted_idx}@test.local",
+        system_role=SystemRole.USER,
+        scopes=frozenset(),
+        profile_complete=True,
+        disabled=False,
+        retired=False,
+    )
+
+    second_idx, second_items = await _drive_one_study(batch_app, postgres_pool, demoted, accession)
+    batch_cleanup.append(second_idx)
+
+    row = await postgres_pool.fetchrow(
+        "SELECT state, failure_reason FROM qiita.ena_import_batch_item WHERE idx = $1",
+        second_items[0].idx,
+    )
+    assert row["state"] == BatchItemState.FAILED.value
+    assert f"the submitter holds 'public' on study {study_idx}" in row["failure_reason"]
+    assert (
+        await postgres_pool.fetchval(
+            "SELECT count(*) FROM qiita.prep_sample_to_study WHERE study_idx = $1", study_idx
+        )
+        == linked_before
+    )
+    assert await postgres_pool.fetchval("SELECT count(*) FROM qiita.work_ticket") == tickets_before
+
+    await _cleanup_study(postgres_pool, accession)
+
+
 async def test_import_refuses_a_study_no_import_created(
     batch_app, postgres_pool, admin_principal, download_ena_study_action, batch_cleanup
 ):
