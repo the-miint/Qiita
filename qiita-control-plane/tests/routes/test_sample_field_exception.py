@@ -425,6 +425,48 @@ async def test_put_on_a_local_field_keys_on_the_study_field(ctx, surface):
 
 
 @pytest.mark.parametrize("surface", _SURFACE_IDS)
+async def test_exception_on_an_empty_linked_slot_is_409(ctx, surface):
+    """An exception on a linked field restricts the value whichever study
+    writes it. Set before any study has, it would bind the first one that
+    does, so it waits for a value."""
+    s = _SURFACES[surface]
+    study_idx = await _member_study(ctx)
+    entity = await s.seed_entity(ctx, study_idx)
+    global_field_idx, _ = await _seed_global_field(ctx, s.spec, default_tier=Tier.PUBLIC)
+    alias_idx = await _alias_global_field(
+        ctx, s.spec, study_idx=study_idx, global_field_idx=global_field_idx
+    )
+
+    resp = await _put(ctx["wet"], s.exception_url(study_idx, entity, alias_idx), Tier.ADMIN)
+
+    assert resp.status_code == 409, resp.text
+    assert "holds no value" in resp.json()["detail"]
+    assert await _exception_rows(ctx, s.spec, entity) == []
+
+
+@pytest.mark.parametrize("surface", _SURFACE_IDS)
+async def test_exception_on_an_empty_local_slot_is_set(ctx, surface):
+    """A purely-local field's slot is this study's alone, so an exception may
+    wait there for its value."""
+    s = _SURFACES[surface]
+    study_idx = await _member_study(ctx)
+    entity = await s.seed_entity(ctx, study_idx)
+    field_idx = await seed_local_study_field(
+        ctx["pool"],
+        spec=s.spec,
+        study_idx=study_idx,
+        display_name=unique_field_name("exc_empty"),
+        created_by_idx=_wet_idx(ctx),
+        tier_override=Tier.VIEWER,
+    )
+
+    resp = await _put(ctx["wet"], s.exception_url(study_idx, entity, field_idx), Tier.ADMIN)
+
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["keyed_on"] == "local"
+
+
+@pytest.mark.parametrize("surface", _SURFACE_IDS)
 async def test_put_replaces_an_exception_under_its_if_match(ctx, surface):
     s = _SURFACES[surface]
     study_idx = await _member_study(ctx)
