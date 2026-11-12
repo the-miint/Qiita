@@ -19,6 +19,9 @@ from collections.abc import Sequence
 
 import asyncpg
 
+from ._sample_helpers import fetch_study_idxs_by_entity_idx
+from .prep_sample_metadata import PREP_SAMPLE_METADATA_SPEC
+
 
 async def fetch_active_study_idxs_for_prep_sample(
     pool_or_conn: asyncpg.Pool | asyncpg.Connection,
@@ -60,18 +63,13 @@ async def fetch_active_study_idxs_by_prep_sample_idx(
     correct. Empty input short-circuits, mirroring
     `list_incomplete_alignment_samples`.
     """
-    if not prep_sample_idxs:
-        return {}
-    rows = await pool_or_conn.fetch(
-        "SELECT prep_sample_idx, study_idx FROM qiita.prep_sample_to_study"
-        " WHERE prep_sample_idx = ANY($1::bigint[]) AND retired = false"
-        " ORDER BY prep_sample_idx, study_idx",
-        list(prep_sample_idxs),
+    links = await fetch_study_idxs_by_entity_idx(
+        pool_or_conn,
+        spec=PREP_SAMPLE_METADATA_SPEC,
+        entity_idxs=prep_sample_idxs,
+        include_retired=False,
     )
-    out: dict[int, list[int]] = {}
-    for row in rows:
-        out.setdefault(row["prep_sample_idx"], []).append(row["study_idx"])
-    return out
+    return links
 
 
 async def fetch_biosample_idx_for_prep_sample(

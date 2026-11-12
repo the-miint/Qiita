@@ -3245,6 +3245,42 @@ async def fetch_active_studies_for_entity(
     return studies
 
 
+async def fetch_study_idxs_by_entity_idx(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
+    *,
+    spec: EntityMetadataSpec,
+    entity_idxs: Sequence[int],
+    include_retired: bool,
+) -> dict[int, list[int]]:
+    """Return `{entity_idx: [study_idx, ...]}` (study_idxs ascending) over the
+    spec.link_table links of entity_idxs.
+
+    With include_retired False, only links whose own retired flag is false
+    count; the entity's own retirement is not consulted either way. An entity
+    with no counted link is absent from the mapping, not present with an empty
+    list.
+    """
+    if not entity_idxs:
+        return {}
+
+    # Pick one of two fixed predicates; f-string identifiers come from the
+    # frozen spec, never from caller input
+    retired_predicate = "" if include_retired else " AND retired = false"
+    key_column = spec.link_entity_key_column
+    rows = await pool_or_conn.fetch(
+        f"SELECT {key_column} AS entity_idx, study_idx FROM {spec.link_table}"
+        f" WHERE {key_column} = ANY($1::bigint[]){retired_predicate}"
+        f" ORDER BY {key_column}, study_idx",
+        list(entity_idxs),
+    )
+
+    # Group the ordered rows by entity, keeping study_idxs ascending
+    links: dict[int, list[int]] = {}
+    for row in rows:
+        links.setdefault(row["entity_idx"], []).append(row["study_idx"])
+    return links
+
+
 async def insert_entity_to_study(
     conn: asyncpg.Connection,
     *,

@@ -21,6 +21,7 @@ from ._sample_helpers import (
     ResolvedFieldValue,
     assert_required_global_fields_supplied,
     fetch_missing_value_reason_idxs_by_names,
+    fetch_study_idxs_by_entity_idx,
     link_entity_to_studies,
     preflight_sample_metadata,
     resolve_local_study_field,
@@ -351,18 +352,28 @@ async def fetch_active_study_idxs_by_biosample_idx(
     """Return `{biosample_idx: [study_idx, ...]}` (ascending) over the active
     (non-retired) biosample_to_study links of `biosample_idxs`. A biosample with
     no active link is omitted."""
-    if not biosample_idxs:
-        return {}
-    rows = await pool_or_conn.fetch(
-        "SELECT biosample_idx, study_idx FROM qiita.biosample_to_study"
-        " WHERE biosample_idx = ANY($1::bigint[])"
-        "   AND retired = false"
-        " ORDER BY biosample_idx, study_idx",
-        biosample_idxs,
+    links = await fetch_study_idxs_by_biosample_idx(
+        pool_or_conn, biosample_idxs, include_retired=False
     )
-    links: dict[int, list[int]] = {}
-    for r in rows:
-        links.setdefault(r["biosample_idx"], []).append(r["study_idx"])
+    return links
+
+
+async def fetch_study_idxs_by_biosample_idx(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
+    biosample_idxs: Sequence[int],
+    *,
+    include_retired: bool,
+) -> dict[int, list[int]]:
+    """Return `{biosample_idx: [study_idx, ...]}` (ascending) over the
+    biosample_to_study links of `biosample_idxs`. With include_retired False,
+    only links whose own retired flag is false count; the biosample's own
+    retirement is not consulted. A biosample with no counted link is omitted."""
+    links = await fetch_study_idxs_by_entity_idx(
+        pool_or_conn,
+        spec=BIOSAMPLE_METADATA_SPEC,
+        entity_idxs=biosample_idxs,
+        include_retired=include_retired,
+    )
     return links
 
 

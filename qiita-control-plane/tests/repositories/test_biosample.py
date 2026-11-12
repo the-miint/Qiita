@@ -30,10 +30,12 @@ from qiita_control_plane.repositories._sample_helpers import (
 )
 from qiita_control_plane.repositories.biosample import (
     BiosampleImportResult,
+    fetch_active_study_idxs_by_biosample_idx,
     fetch_biosample,
     fetch_biosample_idxs_by_natural_key,
     fetch_biosample_idxs_for_study,
     fetch_caller_has_biosample_access,
+    fetch_study_idxs_by_biosample_idx,
     import_biosample_from_owner_biosample_id,
     insert_biosample,
     resolve_or_import_biosample_by_ena_accession,
@@ -49,6 +51,7 @@ from qiita_control_plane.testing.db_seeds import (
     retire_biosample,
     retire_biosample_to_study_link,
     seed_biosample_global_field,
+    seed_biosample_to_study_link,
     seed_globally_linked_study_field,
     seed_local_study_field,
     seed_study,
@@ -1293,6 +1296,102 @@ async def test_fetch_biosample_idxs_for_study_respects_limit(ctx):
     result = await fetch_biosample_idxs_for_study(ctx["pool"], study_idx=ctx["study_idx"], limit=2)
     # The two newest are the last two appended; reversed to put newest first.
     assert result == [bs_idxs[2], bs_idxs[1]]
+
+
+# ---------------------------------------------------------------------------
+# fetch_study_idxs_by_biosample_idx / fetch_active_study_idxs_by_biosample_idx
+# ---------------------------------------------------------------------------
+
+
+async def _seed_active_and_retired_links(ctx):
+    """Seed two biosamples and a second study, and return
+    (mixed_idx, retired_only_idx, second_study_idx).
+
+    The mixed biosample has an active link to ctx['study_idx'] and a retired
+    link to the second study; the retired-only biosample's one link, to
+    ctx['study_idx'], is retired.
+    """
+    second_study_idx = await seed_study(
+        ctx["pool"], owner_idx=ctx["principal_idx"], title=f"bs-links-{secrets.token_hex(4)}"
+    )
+    ctx["created"]["studies"].append(second_study_idx)
+
+    # Mixed: active link to the fixture study, retired link to the second
+    mixed_idx = await _create_biosample_with_link(ctx)
+    await seed_biosample_to_study_link(
+        ctx["pool"],
+        biosample_idx=mixed_idx,
+        study_idx=second_study_idx,
+        created_by_idx=ctx["principal_idx"],
+    )
+    await retire_biosample_to_study_link(
+        ctx["pool"],
+        biosample_idx=mixed_idx,
+        study_idx=second_study_idx,
+        retired_by_idx=ctx["principal_idx"],
+    )
+
+    # Retired-only: its one link, to the fixture study, is retired
+    retired_only_idx = await _create_biosample_with_link(ctx)
+    await retire_biosample_to_study_link(
+        ctx["pool"],
+        biosample_idx=retired_only_idx,
+        study_idx=ctx["study_idx"],
+        retired_by_idx=ctx["principal_idx"],
+    )
+    return mixed_idx, retired_only_idx, second_study_idx
+
+
+async def test_fetch_study_idxs_by_biosample_idx_includes_retired(ctx):
+    """Tests the case where retired links are requested: every link row of each
+    biosample is returned, so a biosample whose only link is retired is present.
+    """
+    mixed_idx, retired_only_idx, second_study_idx = await _seed_active_and_retired_links(ctx)
+
+    result = await fetch_study_idxs_by_biosample_idx(
+        ctx["pool"], [mixed_idx, retired_only_idx], include_retired=True
+    )
+
+    expected = {
+        mixed_idx: [ctx["study_idx"], second_study_idx],
+        retired_only_idx: [ctx["study_idx"]],
+    }
+    assert result == expected
+
+
+async def test_fetch_study_idxs_by_biosample_idx_excludes_retired(ctx):
+    """Tests the case where retired links are not requested: only active links
+    are returned, and a biosample whose only link is retired is omitted.
+    """
+    mixed_idx, retired_only_idx, _ = await _seed_active_and_retired_links(ctx)
+
+    result = await fetch_study_idxs_by_biosample_idx(
+        ctx["pool"], [mixed_idx, retired_only_idx], include_retired=False
+    )
+
+    expected = {mixed_idx: [ctx["study_idx"]]}
+    assert result == expected
+
+
+async def test_fetch_study_idxs_by_biosample_idx_empty_input(ctx):
+    """Tests the case where no biosample_idxs are given: the result is empty."""
+    result = await fetch_study_idxs_by_biosample_idx(ctx["pool"], [], include_retired=True)
+
+    assert result == {}
+
+
+async def test_fetch_active_study_idxs_by_biosample_idx_excludes_retired(ctx):
+    """Tests the case where the active-only read is used: it returns what the
+    general read returns with retired links excluded.
+    """
+    mixed_idx, retired_only_idx, _ = await _seed_active_and_retired_links(ctx)
+
+    result = await fetch_active_study_idxs_by_biosample_idx(
+        ctx["pool"], [mixed_idx, retired_only_idx]
+    )
+
+    expected = {mixed_idx: [ctx["study_idx"]]}
+    assert result == expected
 
 
 # ---------------------------------------------------------------------------
