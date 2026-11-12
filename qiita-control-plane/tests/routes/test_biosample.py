@@ -539,8 +539,8 @@ async def test_post_biosample_owner_ineligibility_422(ctx, kind: IneligibilityKi
 
 
 async def test_post_biosample_nonexistent_study_404(ctx):
-    # Pick a study_idx well past the current MAX. require_study_exists's
-    # fetch_study_exists returns False → 404.
+    # Pick a study_idx well past the current MAX, so require_study_exists
+    # finds no row → 404.
     max_idx = await ctx["pool"].fetchval("SELECT COALESCE(MAX(idx), 0) FROM qiita.study")
     resp = await ctx["wet"].post(
         URL_BIOSAMPLE_BY_STUDY.format(study_idx=max_idx + 100_000),
@@ -3747,6 +3747,45 @@ async def test_create_biosample_study_link_waits_for_concurrent_owner_change(ctx
         {"detail": f"biosample {biosample_idx} not found"},
         None,
     )
+
+
+async def test_create_biosample_study_link_not_blocked_by_open_fk_insert(ctx):
+    """Tests the case where another transaction has an uncommitted link of the same
+    biosample into a different study: the request does not wait on it, and answers
+    201 while that transaction is still open.
+    """
+    user_idx = ctx["user_session"]["principal_idx"]
+    other_study_idx = await _seed_study(ctx, owner_idx=user_idx, suffix="link-open-other")
+    target_study_idx = await _seed_study(ctx, owner_idx=user_idx, suffix="link-open-target")
+    biosample_idx = await _seed_biosample_owned_by(ctx, "user")
+
+    task = None
+    async with ctx["pool"].acquire() as other:
+        tr = other.transaction()
+        await tr.start()
+        try:
+            await seed_biosample_to_study_link(
+                other,
+                biosample_idx=biosample_idx,
+                study_idx=other_study_idx,
+                created_by_idx=user_idx,
+            )
+            task = asyncio.create_task(
+                _post_study_link(ctx["user"], target_study_idx, biosample_idx)
+            )
+            resp = await _finish(task)
+        finally:
+            await _cancel(task)
+            await tr.rollback()
+
+    assert resp.status_code == 201, resp.text
+    link_row = await _fetch_link_row(
+        ctx["pool"], biosample_idx=biosample_idx, study_idx=target_study_idx
+    )
+    expected_row = _expected_active_link_row(
+        link_row, biosample_idx=biosample_idx, study_idx=target_study_idx, created_by_idx=user_idx
+    )
+    assert link_row == expected_row
 
 
 @pytest.mark.parametrize("retire_existing", [False, True], ids=["active", "retired"])

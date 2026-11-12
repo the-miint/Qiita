@@ -12,6 +12,7 @@ Each guard depends on `get_current_principal`, so FastAPI dedupes the
 underlying resolution per-request even when many guards compose.
 """
 
+import inspect
 from collections.abc import Awaitable, Callable, Iterable
 from typing import NamedTuple
 
@@ -21,17 +22,13 @@ from qiita_common.auth_constants import STALE_TOKEN_SCOPE_HEADER, SystemRole
 from qiita_common.models import StudyAccessVia, StudyRecordView, Tier
 
 from ..deps import get_db_pool
-from ..repositories.prep_sample import (
-    fetch_active_study_idxs_by_prep_sample_idx,
-    fetch_prep_sample_exists,
-)
+from ..repositories import ExistsEntity, fetch_entity_exists
+from ..repositories.prep_sample import fetch_active_study_idxs_by_prep_sample_idx
 from ..repositories.sequencing_run import (
     fetch_sequenced_pool,
     fetch_sequenced_pool_created_by,
     fetch_sequencing_run_created_by,
-    fetch_sequencing_run_exists,
 )
-from ..repositories.study import fetch_study_exists
 from ..repositories.study_access import (
     CallerMetadataTiers,
     CallerStudyAccessRow,
@@ -381,54 +378,42 @@ async def require_eligible_owner(
     raise HTTPException(status_code=422, detail=detail)
 
 
-async def require_study_exists(
-    study_idx: int,
-    pool: asyncpg.Pool = Depends(get_db_pool),
-) -> None:
-    """Existence-only guard: 404 if no qiita.study row matches the path's
-    study_idx. No access-tier check, no role gate. Use on routes that gate
-    write access via require_role_at_least (e.g., the biosample import
-    route, where wet_lab_admin replaces the tier comparison) but still
-    need to surface a 404 on a nonexistent study rather than letting an
-    FK violation surface as a 422 from the composer.
+def _existence_guard(entity: ExistsEntity) -> Callable[..., Awaitable[None]]:
+    """Build an existence-only guard: 404 if no `entity` row matches the path's
+    `<entity>_idx`. No access-tier check and no role gate, so a route gated by
+    role alone still answers 404 for a missing path resource.
+
+    The dependency's signature is built here so FastAPI reads the path
+    parameter under its per-entity name.
     """
-    if not await fetch_study_exists(pool, study_idx):
-        raise HTTPException(
-            status_code=404,
-            detail=f"study {study_idx} not found",
-        )
+    param_name = f"{entity}_idx"
+
+    async def guard(**kwargs: object) -> None:
+        entity_idx = kwargs[param_name]
+        exists = await fetch_entity_exists(kwargs["pool"], entity, entity_idx)
+        if not exists:
+            raise HTTPException(
+                status_code=404, detail=resource_not_found_detail(entity, entity_idx)
+            )
+
+    guard.__signature__ = inspect.Signature(
+        [
+            inspect.Parameter(param_name, inspect.Parameter.KEYWORD_ONLY, annotation=int),
+            inspect.Parameter(
+                "pool",
+                inspect.Parameter.KEYWORD_ONLY,
+                annotation=asyncpg.Pool,
+                default=Depends(get_db_pool),
+            ),
+        ]
+    )
+    return guard
 
 
-async def require_sequencing_run_exists(
-    sequencing_run_idx: int,
-    pool: asyncpg.Pool = Depends(get_db_pool),
-) -> None:
-    """Existence-only guard: 404 if no qiita.sequencing_run row matches
-    the path's sequencing_run_idx. Direct mirror of require_study_exists
-    for routes that mount on a path containing {sequencing_run_idx} and
-    need a clean 404 before opening their write transaction.
-    """
-    if not await fetch_sequencing_run_exists(pool, sequencing_run_idx):
-        raise HTTPException(
-            status_code=404,
-            detail=f"sequencing_run {sequencing_run_idx} not found",
-        )
-
-
-# same-pattern-ok: per-entity existence guard, mirrors require_sequencing_run_exists
-async def require_prep_sample_exists(
-    prep_sample_idx: int,
-    pool: asyncpg.Pool = Depends(get_db_pool),
-) -> None:
-    """Existence-only guard: 404 if no qiita.prep_sample row matches the
-    path's prep_sample_idx. Mirror of require_sequencing_run_exists for
-    routes that mount on a path containing {prep_sample_idx}.
-    """
-    if not await fetch_prep_sample_exists(pool, prep_sample_idx):
-        raise HTTPException(
-            status_code=404,
-            detail=f"prep_sample {prep_sample_idx} not found",
-        )
+require_study_exists = _existence_guard("study")
+require_sequencing_run_exists = _existence_guard("sequencing_run")
+require_prep_sample_exists = _existence_guard("prep_sample")
+require_biosample_exists = _existence_guard("biosample")
 
 
 def _access_row_allows(

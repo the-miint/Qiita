@@ -71,6 +71,7 @@ from ..auth.guards import (
     METADATA_BYPASS_ROLE,
     caller_bypasses_ownership,
     caller_metadata_tiers,
+    require_biosample_exists,
     require_caller_owns,
     require_complete_profile,
     require_eligible_owner,
@@ -947,9 +948,10 @@ async def create_biosample_study_link(
     the pair, retired or not.
     """
     async with tx() as conn:
-        # The row lock holds from the ownership check through commit, so an
-        # owner change cannot land between the check and the insert.
-        row = await fetch_biosample(conn, biosample_idx, for_update=True)
+        # The share lock holds from the ownership check through commit, so an
+        # owner change or retirement cannot land between the check and the
+        # insert; it leaves other inserts that reference the biosample unblocked.
+        row = await fetch_biosample(conn, biosample_idx, lock="share")
         if not caller_bypasses_ownership(user, _BIOSAMPLE_LINK_BYPASS_ROLE):
             owner_idx = None if row is None else row["owner_idx"]
             require_caller_owns(
@@ -1238,22 +1240,16 @@ async def list_studies_for_biosample(
     user: HumanUser = Depends(require_human),
     _scope: Principal = Depends(require_scope(Scope.BIOSAMPLE_READ)),
     _role: Principal = Depends(require_role_at_least(SystemRole.WET_LAB_ADMIN)),
+    _exists: None = Depends(require_biosample_exists),
 ) -> StudyListResponse:
     """List the studies that this biosample is actively linked to, ascending by
     study_idx, each with its BioProject and ENA study accessions.
 
     Caller must be a HumanUser with Scope.BIOSAMPLE_READ and system_role at
-    least wet_lab_admin. 404 when no such biosample exists. Retired
-    biosample_to_study links are excluded. The `truncated` flag indicates the
-    underlying set exceeded the hard cap.
+    least wet_lab_admin. require_biosample_exists fires a 404 before the read
+    runs. Retired biosample_to_study links are excluded. The `truncated` flag
+    indicates the underlying set exceeded the hard cap.
     """
-    row = await fetch_biosample(pool, biosample_idx)
-    if row is None:
-        raise HTTPException(
-            status_code=404,
-            detail=resource_not_found_detail(BIOSAMPLE_METADATA_SPEC.entity_kind, biosample_idx),
-        )
-
     # Over-fetch by one so cap_rows can tell a full page from a cut one.
     rows = await fetch_active_studies_for_entity(
         pool,
@@ -1538,11 +1534,11 @@ async def patch_biosample(
     async with tx() as conn:
         try:
             # Preflight: existence -> 404, retirement -> 409, ETag -> 412.
-            # for_update=True acquires a row-level lock for the rest of
-            # the transaction so a concurrent PATCH on the same row
-            # serializes here instead of racing through the ETag check
-            # and silently overwriting the first writer's update.
-            row = await fetch_biosample(conn, biosample_idx, for_update=True)
+            # The update lock holds for the rest of the transaction so a
+            # concurrent PATCH on the same row serializes here instead of
+            # racing through the ETag check and silently overwriting the
+            # first writer's update.
+            row = await fetch_biosample(conn, biosample_idx, lock="update")
             # Retirement is biosample-specific; absent / stale-ETag is
             # the shared post-FOR-UPDATE preflight every PATCH runs.
             if row is not None and row["retired"]:

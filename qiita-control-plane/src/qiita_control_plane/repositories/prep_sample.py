@@ -89,23 +89,6 @@ async def fetch_biosample_idx_for_prep_sample(
     )
 
 
-# same-pattern-ok: per-entity existence reader, mirrors fetch_sequencing_run_exists
-async def fetch_prep_sample_exists(
-    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
-    prep_sample_idx: int,
-) -> bool:
-    """Return True iff a qiita.prep_sample row exists at this idx.
-
-    Existence-only check, separate from the full-row reads, for a cheap
-    pre-flight. No retirement filter — a retired prep_sample still returns
-    True.
-    """
-    return await pool_or_conn.fetchval(
-        "SELECT EXISTS (SELECT 1 FROM qiita.prep_sample WHERE idx = $1)",
-        prep_sample_idx,
-    )
-
-
 async def set_prep_sample_retired(
     conn: asyncpg.Connection,
     *,

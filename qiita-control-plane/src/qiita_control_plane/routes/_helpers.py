@@ -1531,7 +1531,7 @@ def require_etag_match(
 ) -> None:
     """Run the post-FOR-UPDATE-preflight 404 / 412 checks for a PATCH route.
 
-    Called after `fetch_<entity>(conn, idx, for_update=True)` to fold
+    Called after `fetch_<entity>(conn, idx, lock="update")` to fold
     "row absent (404)" and "ETag stale (412)" into one site so every
     PATCH endpoint emits the same wording. `label` is the entity noun
     embedded in the 404 detail (e.g. "study", "biosample"). The row's ETag is

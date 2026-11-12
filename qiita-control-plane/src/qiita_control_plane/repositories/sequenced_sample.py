@@ -33,7 +33,7 @@ from qiita_common.actions import (
 )
 from qiita_common.models import NON_TERMINAL_WORK_TICKET_STATES, FailureType, WorkTicketState
 
-from . import require_transaction, validate_patch_fields
+from . import RowLock, require_transaction, row_lock_clause, validate_patch_fields
 from ._sample_helpers import (
     link_entity_to_studies,
     require_tiers_read_every_value,
@@ -74,7 +74,7 @@ async def fetch_sequenced_sample_with_prep_sample(
     pool_or_conn: asyncpg.Pool | asyncpg.Connection,
     sequenced_sample_idx: int,
     *,
-    for_update: bool = False,
+    lock: RowLock | None = None,
 ) -> asyncpg.Record | None:
     """Return the joined sequenced_sample + supertype prep_sample row, or
     None on miss.
@@ -83,16 +83,9 @@ async def fetch_sequenced_sample_with_prep_sample(
     and computes `effective_updated_at` = GREATEST(prep_sample.updated_at,
     sequenced_sample.updated_at), the latest write to either row.
 
-    `for_update=True` appends `FOR UPDATE` to the SELECT so rows from
-    both joined tables are locked for the duration of the surrounding
-    transaction; concurrent callers serialize on those locks until the
-    holder commits or rolls back. Used by PATCH to close the
-    lost-update window between the preflight ETag check and the
-    UPDATE — a second caller's preflight blocks until the first
-    commits, then sees the post-commit `effective_updated_at` and 412s
-    on its stale `If-Match`. Pass only inside an open transaction —
-    with a pool the implicit single-stmt transaction releases the
-    lock immediately and the flag is a no-op.
+    `lock` takes that row lock on the rows of both joined tables (see
+    row_lock_clause), so a conflicting lock or write waits until the holder's
+    transaction ends and then reads the post-commit `effective_updated_at`.
     """
     # Single-row fetch by sequenced_sample.idx; supertype prep_sample is
     # joined 1:1 via the subtype FK and contributes the owner / retirement
@@ -114,8 +107,7 @@ async def fetch_sequenced_sample_with_prep_sample(
         " JOIN qiita.prep_sample ps ON ps.idx = ss.prep_sample_idx"
         " WHERE ss.idx = $1"
     )
-    if for_update:
-        sql += " FOR UPDATE"
+    sql += row_lock_clause(pool_or_conn, lock)
     return await pool_or_conn.fetchrow(sql, sequenced_sample_idx)
 
 

@@ -16,7 +16,7 @@ from typing import Literal, get_args
 import asyncpg
 from qiita_common.models import BiosampleAccessionField, FieldDataType, Tier
 
-from . import require_transaction, update_row
+from . import RowLock, require_transaction, row_lock_clause, update_row
 from ._sample_helpers import (
     ResolvedFieldValue,
     assert_required_global_fields_supplied,
@@ -100,7 +100,7 @@ async def fetch_biosample(
     pool_or_conn: asyncpg.Pool | asyncpg.Connection,
     biosample_idx: int,
     *,
-    for_update: bool = False,
+    lock: RowLock | None = None,
 ) -> asyncpg.Record | None:
     """Return the qiita.biosample row for the given idx, or None on miss.
 
@@ -109,15 +109,10 @@ async def fetch_biosample(
     either a pool or a connection so the helper composes inside an
     open transaction or stands alone.
 
-    `for_update=True` appends `FOR UPDATE`; concurrent callers
-    serialize on the row lock until the holder commits or rolls back.
-    Pass only inside an open transaction — with a pool the implicit
-    single-statement transaction releases the lock immediately and
-    the flag is a no-op.
+    `lock` takes that row lock on the biosample; see row_lock_clause.
     """
     sql = f"SELECT {_BIOSAMPLE_RETURNING_COLS} FROM qiita.biosample WHERE idx = $1"
-    if for_update:
-        sql += " FOR UPDATE"
+    sql += row_lock_clause(pool_or_conn, lock)
     return await pool_or_conn.fetchrow(sql, biosample_idx)
 
 

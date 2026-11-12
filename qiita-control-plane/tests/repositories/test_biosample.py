@@ -64,7 +64,7 @@ from qiita_control_plane.testing.unique_names import (
     unique_matrix_tube_id,
 )
 
-from .conftest import _create_biosample_with_link
+from .conftest import LOCK_PROBE_TIMEOUT, _create_biosample, _create_biosample_with_link
 
 pytestmark = pytest.mark.db
 
@@ -1498,6 +1498,57 @@ async def test_fetch_biosample_returns_none_when_missing(ctx):
     # No biosample at idx=-1; the read returns None rather than raising.
     row = await fetch_biosample(ctx["pool"], -1)
     assert row is None
+
+
+async def test_fetch_biosample_lock_share_blocks_update(ctx):
+    """Tests the case where one transaction holds the biosample under a share lock:
+    an owner change from another transaction cannot take the row, so it fails at
+    its lock timeout rather than landing under the holder.
+    """
+    biosample_idx = await _create_biosample(ctx)
+
+    async with ctx["pool"].acquire() as holder, holder.transaction():
+        await fetch_biosample(holder, biosample_idx, lock="share")
+        async with ctx["pool"].acquire() as writer, writer.transaction():
+            await writer.execute(f"SET LOCAL lock_timeout = '{LOCK_PROBE_TIMEOUT}'")
+            with pytest.raises(asyncpg.LockNotAvailableError):
+                await writer.execute(
+                    "UPDATE qiita.biosample SET owner_idx = $2 WHERE idx = $1",
+                    biosample_idx,
+                    ctx["biosample_owner_idx"],
+                )
+
+
+async def test_fetch_biosample_lock_share_admits_fk_insert(ctx):
+    """Tests the case where one transaction holds the biosample under a share lock:
+    another transaction can still insert a row that references the biosample,
+    because the lock such an insert takes on it does not conflict.
+    """
+    biosample_idx = await _create_biosample(ctx)
+
+    async with ctx["pool"].acquire() as holder, holder.transaction():
+        await fetch_biosample(holder, biosample_idx, lock="share")
+        async with ctx["pool"].acquire() as writer:
+            # Roll the insert back so the fixture's teardown has nothing extra.
+            tr = writer.transaction()
+            await tr.start()
+            try:
+                await writer.execute(f"SET LOCAL lock_timeout = '{LOCK_PROBE_TIMEOUT}'")
+                await insert_entity_to_study(
+                    writer,
+                    spec=BIOSAMPLE_METADATA_SPEC,
+                    entity_idx=biosample_idx,
+                    study_idx=ctx["study_idx"],
+                    created_by_idx=ctx["principal_idx"],
+                )
+                link_count = await writer.fetchval(
+                    "SELECT count(*) FROM qiita.biosample_to_study WHERE biosample_idx = $1",
+                    biosample_idx,
+                )
+            finally:
+                await tr.rollback()
+
+    assert link_count == 1
 
 
 # ---------------------------------------------------------------------------
