@@ -35,7 +35,7 @@ from .biosample_metadata import (
     BiosampleOwnerIdMissingValueError,
     insert_owner_biosample_id_metadata,
 )
-from .exported_entity import export_entity_id_select
+from .exported_entity import export_entity_id_lookup, export_entity_id_select
 from .study_access import CallerMetadataTiers
 
 # Owners' ids for their own biosamples sometimes inadvertently contain PII, so an
@@ -91,8 +91,7 @@ _BIOSAMPLE_RETURNING_COLS = (
     " biosample_accession, ena_sample_accession, matrix_tube_id,"
     " last_submission_at, submission_error,"
     " created_by_idx, created_at, updated_at,"
-    " retired, retired_by_idx, retired_at, retire_reason, "
-    + export_entity_id_select("biosample", alias="biosample")
+    " retired, retired_by_idx, retired_at, retire_reason, " + export_entity_id_select("biosample")
 )
 
 
@@ -299,10 +298,22 @@ async def fetch_biosample_idxs_for_study(
     return [r["biosample_idx"] for r in rows]
 
 
-# The natural-key columns a biosample lookup may key on: the two wire-facing
-# accession columns plus matrix_tube_id. Deriving from BiosampleAccessionField
-# keeps the accession set defined once, in qiita_common.models.
-BiosampleLookupKey = Literal[*get_args(BiosampleAccessionField), "matrix_tube_id"]
+# The natural keys a biosample lookup may key on: the two wire-facing accession
+# columns, matrix_tube_id, and export_entity_id. Deriving from
+# BiosampleAccessionField keeps the accession set defined once, in
+# qiita_common.models.
+BiosampleLookupKey = Literal[
+    *get_args(BiosampleAccessionField), "matrix_tube_id", "export_entity_id"
+]
+
+# Each lookup key's (column expression, join) over `qiita.biosample`. Only text from
+# this closed mapping reaches the SQL, since identifiers cannot be bound.
+_BIOSAMPLE_LOOKUP_SQL: dict[BiosampleLookupKey, tuple[str, str]] = {
+    "biosample_accession": ("biosample.biosample_accession", ""),
+    "ena_sample_accession": ("biosample.ena_sample_accession", ""),
+    "matrix_tube_id": ("biosample.matrix_tube_id", ""),
+    "export_entity_id": export_entity_id_lookup("biosample"),
+}
 
 
 async def fetch_biosample_idxs_by_natural_key(
@@ -310,45 +321,29 @@ async def fetch_biosample_idxs_by_natural_key(
     *,
     key: BiosampleLookupKey,
     values: list[str],
-) -> dict[str, int]:
+) -> dict[str, int]:  # same-pattern-ok: biosample has a tube key and drops
+    # retired rows; study has neither
     """Return `{value: biosample_idx}` for every value in `values` that
-    resolves to a non-retired qiita.biosample row via the named natural-key
-    column.
+    resolves to a non-retired qiita.biosample row via the natural key named by
+    `key`.
 
     Values absent from the table or carried only by retired rows are
     omitted from the returned map, so a caller can detect misses by
     set-difference against the input `values`.
     """
-    if key not in get_args(BiosampleLookupKey):
+    if key not in _BIOSAMPLE_LOOKUP_SQL:
         raise ValueError(f"invalid biosample lookup key: {key!r}")
     if not values:
         return {}
-    # Column name is interpolated because Postgres can't parameter-bind
-    # identifiers; the guard above pins it to the BiosampleLookupKey set.
+    column_sql, join_sql = _BIOSAMPLE_LOOKUP_SQL[key]
     rows = await pool_or_conn.fetch(
-        f"SELECT idx, {key} FROM qiita.biosample"
-        f" WHERE {key} = ANY($1::text[])"
-        "   AND retired = false",
+        f"SELECT biosample.idx, {column_sql} AS lookup_value FROM qiita.biosample{join_sql}"
+        f" WHERE {column_sql} = ANY($1::text[])"
+        "   AND biosample.retired = false",
         values,
     )
-    return {r[key]: r["idx"] for r in rows}
-
-
-async def fetch_biosample_identity_by_tube(
-    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
-    tubes: list[str],
-) -> dict[str, tuple[int, str | None]]:
-    """Return `{matrix_tube_id: (biosample_idx, biosample_accession)}` for every
-    tube in `tubes` carried by a non-retired biosample. Absent tubes are omitted."""
-    if not tubes:
-        return {}
-    rows = await pool_or_conn.fetch(
-        "SELECT idx, matrix_tube_id, biosample_accession FROM qiita.biosample"
-        " WHERE matrix_tube_id = ANY($1::text[])"
-        "   AND retired = false",
-        tubes,
-    )
-    return {r["matrix_tube_id"]: (r["idx"], r["biosample_accession"]) for r in rows}
+    resolved = {r["lookup_value"]: r["idx"] for r in rows}
+    return resolved
 
 
 async def fetch_active_study_links(

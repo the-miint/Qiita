@@ -762,25 +762,57 @@ def normalize_matrix_tube_id(raw: str) -> str:
 MAX_ROSTER_TUBE_TEXT_LENGTH = 50
 
 
+class _ExternalRef(BaseModel):
+    """An entity named by one or more external identifiers.
+
+    Every field of a subclass is an identifier; the validator requires at least
+    one to be set.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    @model_validator(mode="after")
+    def _requires_an_identifier(self) -> _ExternalRef:
+        fields = type(self).model_fields
+        if all(getattr(self, name) is None for name in fields):
+            raise ValueError(f"at least one of {', '.join(fields)} is required")
+        return self
+
+
+class BiosampleRef(_ExternalRef):
+    """A biosample named by any of its external identifiers. `matrix_tube_id` is
+    free text so a malformed tube is reported as its row's problem."""
+
+    biosample_accession: AccessionText | None = None
+    ena_sample_accession: AccessionText | None = None
+    export_entity_id: NonBlankText | None = None
+    matrix_tube_id: (
+        Annotated[NonBlankText, Field(max_length=MAX_ROSTER_TUBE_TEXT_LENGTH)] | None
+    ) = None
+
+
+class StudyRef(_ExternalRef):
+    """A study named by any of its external identifiers."""
+
+    bioproject_accession: AccessionText | None = None
+    ena_study_accession: AccessionText | None = None
+    export_entity_id: NonBlankText | None = None
+
+
 class RosterResolveRow(BaseModel):
     """One pool row to resolve to a biosample and its studies.
 
-    A row with a `matrix_tube_id` resolves by the tube, and its primary study
-    comes from the biosample's study links (a project accession, when present, must
-    name one of them). A row without one resolves by `biosample_accession` and
-    the project accessions. `matrix_tube_id` is free text on the wire so a
-    malformed tube is reported as that row's problem with every other one.
+    Every identifier given for an entity must name the same one, every study must
+    be among the biosample's active study links, and no secondary project may name
+    the primary's study.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     item_id: NonBlankText
-    matrix_tube_id: (
-        Annotated[NonBlankText, Field(max_length=MAX_ROSTER_TUBE_TEXT_LENGTH)] | None
-    ) = None
-    biosample_accession: AccessionText | None = None
-    primary_project_accession: AccessionText | None = None
-    secondary_project_accessions: list[AccessionText] = Field(default_factory=list)
+    biosample: BiosampleRef
+    primary_project: StudyRef
+    secondary_projects: list[StudyRef] = Field(default_factory=list)
 
 
 class RosterResolveRequest(BaseModel):

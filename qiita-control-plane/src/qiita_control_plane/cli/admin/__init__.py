@@ -58,6 +58,7 @@ from ._helpers import _DB_CONNECT_TIMEOUT_SECONDS, open_admin_pool
 from .actions_sync import _handle_actions_sync, _sync_actions
 from .alignment import add_alignment_parser
 from .auth import _handle_login, _handle_token_revoke_all, _handle_whoami, _token_revoke_all
+from .check_stored_preflights import add_check_stored_preflights_parser
 from .compute_readiness import _DEFAULT_ORCHESTRATOR_VENV, _handle_compute_readiness
 from .fanout import add_fanout_parser
 from .force_fail import (
@@ -659,6 +660,8 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_readiness.set_defaults(handler=_handle_compute_readiness)
+
+    add_check_stored_preflights_parser(sub)
 
     return parser
 
