@@ -24,8 +24,6 @@ fn delete_reference_drops_orphans_keeps_shared() {
     let data_path = crate::test_catalog::data_path();
     let conn = Connection::open_in_memory().unwrap();
     ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
-    // delete_reference takes the registration lock, so the lake needs more
-    // than the reference tables.
     setup_full_lake(&conn);
 
     // Unique ids so leftover rows never collide with other tests.
@@ -936,4 +934,59 @@ fn mint_phylogeny_edge_id_is_all_or_nothing_and_replay_safe() {
         ))
         .unwrap();
     }
+}
+
+/// A reference delete waits for the global lake lock: while another session
+/// holds it the delete gives up UNAVAILABLE, deleting nothing, and once it is
+/// released the delete runs.
+#[test]
+#[serial_test::serial]
+#[cfg(feature = "integration")]
+fn a_reference_delete_waits_for_the_lake_lock() {
+    use crate::lake_locks::LakeLocks;
+    let connstr = crate::test_catalog::connstr();
+    let data_path = crate::test_catalog::data_path();
+    let conn = Connection::open_in_memory().unwrap();
+    ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
+    setup_full_lake(&conn);
+    let ref_idx: i64 = 912_000 + (std::process::id() as i64 % 1000);
+    conn.execute_batch(&format!(
+        "INSERT INTO qiita_lake.reference_membership VALUES ({ref_idx}, {ref_idx});"
+    ))
+    .unwrap();
+    let members = || -> i64 {
+        conn.query_row(
+            &format!(
+                "SELECT count(*) FROM qiita_lake.reference_membership \
+                 WHERE reference_idx = {ref_idx}"
+            ),
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    let checkout = || Ok(attached_writer(&connstr, &data_path));
+
+    let holder = LakeLocks::new(connstr.clone());
+    let mut held = holder.session("the test holder").unwrap();
+    held.lock_global().unwrap();
+    let refused = locked_delete_reference(
+        &LakeLocks::with_budget(connstr.clone(), std::time::Duration::from_millis(500)),
+        &checkout,
+        ref_idx,
+    )
+    .expect_err("a reference delete ran while the lake lock was held");
+    assert_eq!(
+        refused.code(),
+        tonic::Code::Unavailable,
+        "{}",
+        refused.message()
+    );
+    assert_eq!(members(), 1, "the refused delete removed rows");
+
+    drop(held);
+    let counts = locked_delete_reference(&LakeLocks::new(connstr.clone()), &checkout, ref_idx)
+        .expect("the delete once the lock is free");
+    assert_eq!(counts["membership_deleted"], 1);
+    assert_eq!(members(), 0);
 }
