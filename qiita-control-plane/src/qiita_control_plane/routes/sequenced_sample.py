@@ -549,10 +549,6 @@ async def list_sequenced_samples_in_pool(
             item["sheet_type"] = facts.sheet_type
             item["twist_adaptor_id"] = facts.twist_adaptor_id
             item["syndna_is_twisted"] = facts.syndna_is_twisted
-        # Every roster row gets a resolution — a sample with no host metadata
-        # comes back UNRESOLVED rather than absent, so "we don't know" is
-        # visible instead of silent. The resolver already returns the wire type,
-        # so there is nothing to map.
         item["host_filter"] = host_filter_by_biosample[item["biosample_idx"]]
         samples.append(SequencedSampleListItem.model_validate(item))
     return SequencedSampleListResponse(

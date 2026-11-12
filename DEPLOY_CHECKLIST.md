@@ -31,10 +31,28 @@ _None yet._
   set -a; . /etc/qiita/control-plane.env; set +a
   cd ~/qiita-miint/qiita-control-plane && /usr/local/bin/uv run --reinstall-package qiita-common qiita-admin check-stored-preflights
   ```
+- `[operator]` **Before the restart, run the host-taxon backfill.** From the restart a biosample
+  with no `host_taxon_id` passes through host filtering undepleted, so skipping `--execute` lets
+  residue samples (taxa the curated table does not cover) pass through undepleted. `--execute` writes
+  them `not provided`, which stays refused until patched, and leaves hostless taxa absent; it is safe
+  on the old build. (#NNN)
+  1. Dry-run and read the report. Expect `unreadable_pools == 0` and
+     `controls_without_accession == 0` (no WARNING lines), because a blank the backfill cannot
+     recognise as a control is no longer refused; if either is not 0, stop and raise it.
+  2. Only then run it with `--execute`.
+  3. Dry-run again. Expect `Pass --execute to write 0 row(s)`; if not, stop and raise it.
+  ```bash
+  # [operator] in the pulled checkout; DATABASE_URL as above
+  cd ~/qiita-miint/qiita-control-plane
+  /usr/local/bin/uv run --reinstall-package qiita-common qiita-admin backfill host-taxon-id --show-unresolved 50            # 1 and 3: dry run
+  /usr/local/bin/uv run --reinstall-package qiita-common qiita-admin backfill host-taxon-id --show-unresolved 0 --execute  # 2: writes
+  ```
 
 ### 3. Migrations
 
-_None yet._
+- `20261110000000_host_taxon_id_not_required` makes `host_taxon_id` optional, and from the
+  restart an absent value means no host. `dbmate` applies it; run the bucket-2 backfill
+  first. (#NNN)
 
 ### 4. Deploy
 

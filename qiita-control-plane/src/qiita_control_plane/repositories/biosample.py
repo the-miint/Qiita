@@ -19,7 +19,6 @@ from qiita_common.models import BiosampleAccessionField, FieldDataType, Tier
 from . import require_transaction, update_row
 from ._sample_helpers import (
     ResolvedFieldValue,
-    assert_required_global_fields_supplied,
     fetch_missing_value_reason_idxs_by_names,
     link_entity_to_studies,
     preflight_sample_metadata,
@@ -518,17 +517,6 @@ async def import_biosample_from_owner_biosample_id(
         raise BiosampleOwnerIdMissingValueError(
             owner_biosample_id_value, known_missing_reasons[stripped_owner_id]
         )
-
-    # Pre-flight: every REQUIRED global field must be supplied. Declining to give
-    # a value (a missing-value marker) counts as supplied; silence does not. This is
-    # what stops a sample arriving with no `host_taxon_id`, which would resolve
-    # UNRESOLVED and abort its pool at submit.
-    await assert_required_global_fields_supplied(
-        conn,
-        spec=BIOSAMPLE_METADATA_SPEC,
-        metadata=metadata,
-        global_internal_names=global_internal_names,
-    )
 
     bs_idx = await insert_biosample(
         conn,

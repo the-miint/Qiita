@@ -276,9 +276,7 @@ async def test_resolve_or_import_biosample_by_ena_accession_reuses_on_hit(ctx):
 # ---------------------------------------------------------------------------
 
 
-# host_taxon_id is now a required field the composer enforces. A missing-value
-# marker counts as supplied and needs no seeded NCBI term, so it is the cheapest
-# way to satisfy the gate; tests that mean to exercise the gate omit it explicitly.
+# A missing-value marker needs no seeded NCBI term, so it is the cheapest host value.
 _REQUIRED_METADATA = {"host taxon id": "not applicable"}
 
 
@@ -784,12 +782,7 @@ async def test_import_biosample_from_owner_biosample_id_rejects_globally_linked_
 
 
 async def test_import_biosample_from_owner_biosample_id_minimal_metadata(ctx):
-    """The smallest legal import: only the enforced required field(s). The composer
-    writes the owner-id row plus one row per required field, and nothing else.
-
-    (This used to test truly-empty metadata skipping the global block; empty is no
-    longer legal — host_taxon_id is required — so the minimal case is now
-    'exactly the required set'.)"""
+    """The smallest legal import: empty metadata writes the owner-id row and nothing else."""
     field_name = unique_field_name()
 
     async with ctx["pool"].acquire() as conn:
@@ -801,14 +794,12 @@ async def test_import_biosample_from_owner_biosample_id_minimal_metadata(ctx):
                 owner_biosample_id_field_name=field_name,
                 owner_biosample_id_value="OWNER-EM-1",
                 caller_idx=ctx["principal_idx"],
-                metadata=dict(_REQUIRED_METADATA),
+                metadata={},
                 tiers=ADMIN_EVERYWHERE,
             )
     bs_idx = result.biosample_idx
     ctx["created"]["biosample"].append(bs_idx)
 
-    # Two metadata rows: the owner-id row, and the required host_taxon_id row
-    # (written as a missing-value marker). Nothing else.
     rows = await ctx["pool"].fetch(
         "SELECT bm.is_owner_biosample_id, bgf.internal_name"
         "  FROM qiita.biosample_metadata bm"
@@ -817,10 +808,7 @@ async def test_import_biosample_from_owner_biosample_id_minimal_metadata(ctx):
         " ORDER BY bm.is_owner_biosample_id DESC",
         bs_idx,
     )
-    assert [dict(r) for r in rows] == [
-        {"is_owner_biosample_id": True, "internal_name": None},
-        {"is_owner_biosample_id": False, "internal_name": "host_taxon_id"},
-    ]
+    assert [dict(r) for r in rows] == [{"is_owner_biosample_id": True, "internal_name": None}]
 
 
 async def test_import_biosample_from_owner_biosample_id_raises_on_unknown_metadata_field(ctx):

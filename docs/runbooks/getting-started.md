@@ -146,15 +146,14 @@ BIOSAMPLE_IDX=$(qiita biosample create \
 step 4 lists them all. Register the biosample with NCBI BioSample and use the
 accession it issues — same rule as above, do not invent one.
 
-`--metadata "host taxon id=…"` is **required**. It takes an NCBI taxonomy id — the
+`--metadata "host taxon id=…"` names the host, and is left out when the biosample has none. It takes an NCBI taxonomy id — the
 number, not the name — matched against the NCBI Taxonomy your site has loaded. How
 much that covers is a per-site choice: a deploy starts with a small seeded set
 (`9606` human, `10090` mouse, a few metagenome taxa), and an operator can load a
 full NCBI release, after which the whole taxonomy is accepted. An id your site does
 not have is refused, and there is no self-service way to list or add one — ask your
-operator. For an environmental biosample with no host of its own, use
-`not applicable`. A blank or other control still needs a `host taxon id` (any accepted
-value, `not applicable` included) and is marked by a `control_*` `qiita sample type` term
+operator. For an environmental biosample with no host of its own, leave the field out.
+A blank or other control is marked by a `control_*` `qiita sample type` term
 (`--metadata "qiita sample type=…"`), which makes it a control whatever its `host taxon id`.
 
 `--owner-biosample-id-value` is your own name for the biosample, stored under the

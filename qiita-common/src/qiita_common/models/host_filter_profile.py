@@ -53,7 +53,7 @@ class HostFilterOutcome(StrEnum):
     # The sample has a host, and that host has a reference build on this
     # platform. Deplete against it.
     FILTER = "filter"
-    # The sample deliberately has no host ('not applicable' — e.g. a water or
+    # The sample has no host (no host_taxon_id — e.g. a water or
     # soil sample). Nothing to deplete; this is a decision, not a gap.
     PASS_THROUGH = "pass_through"
     # A control/blank. It has no host of its own, but it is not "pass-through"

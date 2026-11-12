@@ -1716,26 +1716,20 @@ async def _seed_pool_sample(ctx, *, run_idx, pool_idx, study_idx, protocol_idx, 
     }
 
 
-def _unresolved_host_filter(biosample_idx: int) -> dict:
-    """The host_filter block a freshly-seeded sample gets on the pool roster.
-
-    A minimal biosample carries no `host_taxon_id`, so it resolves UNRESOLVED —
-    which is not an edge case but the CURRENT STATE OF EVERY LIVE SAMPLE: the
-    field exists and nothing has been backfilled into it yet. The roster saying
-    so out loud, per sample, is the point of exposing the resolution at all.
-    """
+def _no_host_filter(biosample_idx: int) -> dict:
+    """The host_filter block a freshly-seeded sample, which has no host, gets on the pool roster."""
     return {
-        "outcome": "unresolved",
+        "outcome": "pass_through",
         "host_term_idx": None,
         "rype_reference_idx": None,
         "minimap2_reference_idx": None,
-        "reason": f"host_taxon_id is not set on biosample {biosample_idx}",
+        "reason": f"host_taxon_id is not set on biosample {biosample_idx}, so it has no host",
     }
 
 
 def _with_host_filter(items):
     """Return `items` with each one's expected pool-roster host_filter block set."""
-    return [{**i, "host_filter": _unresolved_host_filter(i["biosample_idx"])} for i in items]
+    return [{**i, "host_filter": _no_host_filter(i["biosample_idx"])} for i in items]
 
 
 async def test_list_pool_samples_happy_path(ctx):
@@ -3462,7 +3456,7 @@ async def test_roster_resolves_host_filter_per_sample(ctx):
         field_idx=field_idx,
         reason_idx=await fetch_missing_value_reason_idx(ctx["pool"], "missing: control sample"),
     )
-    # samples["ABSENT"] gets no host_taxon_id at all -> UNRESOLVED.
+    # samples["ABSENT"] gets no host_taxon_id at all -> PASS_THROUGH.
 
     by_item = await _roster_host_filter(ctx, run_idx, pool_idx)
 
@@ -3481,17 +3475,16 @@ async def test_roster_resolves_host_filter_per_sample(ctx):
     assert blank["rype_reference_idx"] is None
 
     absent = by_item[samples["ABSENT"]["sequenced_pool_item_id"]]
-    assert absent["outcome"] == "unresolved"
-    assert "not set" in absent["reason"]
+    assert absent["outcome"] == "pass_through"
+    assert "no host" in absent["reason"]
 
 
 async def test_roster_unresolved_when_host_has_no_profile_on_this_platform(ctx):
     """A known host with no build for the run's platform is UNRESOLVED — and its
     reason names the taxon, so an operator can act on it.
 
-    Distinct from the "no metadata" UNRESOLVED above: the two are different
-    problems with different fixes (seed a profile vs. backfill the sample), so
-    they must not collapse into one indistinguishable message.
+    Names the missing profile rather than the host, so the fix (seed a profile)
+    is clear.
     """
     run_idx, pool_idx = await _seed_run_and_pool(ctx, "hf-noprof")
     study_idx = await _seed_study(

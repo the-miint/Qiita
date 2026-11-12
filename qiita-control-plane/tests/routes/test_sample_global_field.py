@@ -104,6 +104,15 @@ async def test_list_global_fields_returns_every_row(ctx, surface):
     assert actual == expected
 
 
+async def test_list_global_fields_biosample_host_taxon_id_is_not_required(ctx):
+    """An absent host_taxon_id means no host, so the seeded field must not be required."""
+    resp = await ctx["user"].get(BIOSAMPLE_FIELD_SURFACE.global_field_url)
+
+    assert resp.status_code == 200, resp.text
+    host = next(row for row in resp.json() if row["internal_name"] == "host_taxon_id")
+    assert host["required"] is False
+
+
 @pytest.mark.parametrize("surface", SURFACES)
 async def test_list_global_fields_carries_description_and_terminology(ctx, surface):
     """Tests the case where a registry row fills the two columns the schema

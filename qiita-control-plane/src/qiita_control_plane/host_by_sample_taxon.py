@@ -25,7 +25,7 @@ from qiita_common.models import (
 HOST_BY_SAMPLE_TAXON: dict[str, str | None] = {
     # A human gut metagenome is, by construction, drawn from a human gut.
     "408170": NCBI_TAXONOMY_HUMAN_TERM_ID,
-    # Seawater has no host: a decision ('not applicable'), not a gap, so such
+    # Seawater has no host: a decision (no host_taxon_id), not a gap, so such
     # samples are not host-depleted.
     "1561972": None,
     "646099": NCBI_TAXONOMY_HUMAN_TERM_ID,  # human metagenome: drawn from a human

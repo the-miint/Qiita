@@ -280,36 +280,37 @@ async def test_host_with_no_profile_on_this_platform_is_unresolved(ctx):
     assert "no host_filter_profile" in res.reason
 
 
-async def test_absent_host_taxon_id_is_unresolved(ctx):
-    """No host_taxon_id row at all. 'Nobody told us' is not 'there is no host'."""
+async def test_absent_host_taxon_id_passes_through(ctx):
+    """No host_taxon_id row means the sample has no host."""
     bs_idx = await _make_biosample(ctx)
 
     res = await resolve_host_filter(ctx["pool"], biosample_idx=bs_idx, platform=Platform.ILLUMINA)
 
-    assert res.outcome is HostFilterOutcome.UNRESOLVED
+    assert res.outcome is HostFilterOutcome.PASS_THROUGH
     assert res.host_term_idx is None
-    assert "not set" in res.reason
+    assert "no host" in res.reason
 
 
-async def test_uninformative_missing_reason_is_unresolved(ctx):
-    """'not collected' is a missing-reason like 'not applicable' is, but it says
-    nothing about whether a host exists — so it fails closed. This is the case
-    that separates a deliberate no-host from an unknown one; getting it wrong
-    passes an un-depleted host sample straight through."""
+@pytest.mark.parametrize("host_reason", ["not collected", "not provided"])
+async def test_uninformative_missing_reason_is_unresolved(ctx, host_reason):
+    """A present but uninformative missing-reason says a host exists that we can't
+    name, so it fails closed. Reading it as no host passes an un-depleted host
+    sample straight through."""
     bs_idx = await _make_biosample(ctx)
-    await _set_host_missing_reason(ctx, bs_idx, "not collected")
+    await _set_host_missing_reason(ctx, bs_idx, host_reason)
 
     res = await resolve_host_filter(ctx["pool"], biosample_idx=bs_idx, platform=Platform.ILLUMINA)
 
     assert res.outcome is HostFilterOutcome.UNRESOLVED
-    assert "not collected" in res.reason
+    assert host_reason in res.reason
 
 
 async def test_unresolved_reasons_are_distinct_per_cause(ctx):
-    """An absent field and a host-without-a-build are both UNRESOLVED but are
+    """An unnamed host and a host-without-a-build are both UNRESOLVED but are
     different problems with different fixes, so their reasons must not collapse
     into one indistinguishable string."""
     absent_bs = await _make_biosample(ctx)
+    await _set_host_missing_reason(ctx, absent_bs, "not provided")
     no_profile_bs = await _make_biosample(ctx)
     await _set_host_term(ctx, no_profile_bs, ctx["human_term_idx"])
 
@@ -379,8 +380,7 @@ async def test_control_qiita_sample_type_with_a_host_taxon_resolves_control(ctx,
 
 
 async def test_control_qiita_sample_type_with_no_host_taxon_row_resolves_control(ctx):
-    """Seeded by SQL, since import requires host_taxon_id: the control check must
-    not depend on the host row existing."""
+    """The control check must not depend on the host row existing."""
     bs_idx = await _make_biosample(ctx)
     await _set_sample_type(ctx, bs_idx, "control_blank")
 
@@ -659,7 +659,6 @@ async def test_batch_agrees_with_single_sample_for_every_outcome(ctx):
     biosamples["unrecognised_reason"] = await _make_biosample(ctx)
     await _set_host_missing_reason(ctx, biosamples["unrecognised_reason"], "not collected")
 
-    # No host_taxon_id at all.
     biosamples["absent"] = await _make_biosample(ctx)
 
     biosamples["sample_type_control"] = await _make_biosample(ctx)
@@ -679,7 +678,7 @@ async def test_batch_agrees_with_single_sample_for_every_outcome(ctx):
     assert batch[biosamples["sample_type_control"]].outcome is HostFilterOutcome.CONTROL
 
     # And the fan actually covered every branch — otherwise the equality above
-    # could pass by comparing five identical UNRESOLVEDs.
+    # could pass by comparing identical outcomes.
     assert {batch[i].outcome for i in idxs} == {
         HostFilterOutcome.FILTER,
         HostFilterOutcome.PASS_THROUGH,
@@ -731,9 +730,8 @@ async def test_batch_accepts_a_raw_platform_string(ctx):
 
 async def test_batch_edge_cases(ctx):
     """Empty input is an empty dict (not a query); a repeated idx collapses rather
-    than duplicating; and an idx with no metadata row comes back UNRESOLVED rather
-    than being silently dropped from the result — a missing key would KeyError the
-    roster, which is the fail-loud direction but a worse one than reporting it."""
+    than duplicating; and an idx with no metadata row comes back PASS_THROUGH rather
+    than being silently dropped from the result, which would KeyError the roster."""
     assert (
         await resolve_host_filter_many(ctx["pool"], biosample_idxs=[], platform=Platform.ILLUMINA)
         == {}
@@ -744,4 +742,4 @@ async def test_batch_edge_cases(ctx):
         ctx["pool"], biosample_idxs=[bs_idx, bs_idx], platform=Platform.ILLUMINA
     )
     assert list(repeated) == [bs_idx]
-    assert repeated[bs_idx].outcome is HostFilterOutcome.UNRESOLVED
+    assert repeated[bs_idx].outcome is HostFilterOutcome.PASS_THROUGH

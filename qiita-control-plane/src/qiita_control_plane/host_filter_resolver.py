@@ -22,9 +22,9 @@ to the callers. Two seams it deliberately does not cross:
     actually built is a run-time question the runner already answers
     (`runner/_reference.py`), and duplicating it here would let the two drift.
 
-Fail-closed is the rule for anything ambiguous: an absent field, an unrecognised
-missing-reason, or a host with no profile for the platform all resolve to
-UNRESOLVED rather than to "no filtering". Silently passing an un-depleted human
+Fail-closed is the rule for anything ambiguous: an unrecognised missing-reason, or
+a host with no profile for the platform, resolves to UNRESOLVED rather than to
+"no filtering". Silently passing an un-depleted human
 sample through is the one outcome we cannot take back.
 """
 
@@ -112,12 +112,7 @@ def _has_control_marker(row: asyncpg.Record | None) -> bool:
 # The missing-reasons that say something DEFINITE about whether a host exists,
 # each with the outcome it means and the clause explaining it.
 #
-# This table IS the fail-closed rule. A reason listed here is a decision; every
-# reason NOT listed ('not collected', 'not provided', 'restricted access', ...)
-# falls through to UNRESOLVED, because those all mean "we don't know" — and "we
-# don't know whether this sample has a host" must never silently become "don't
-# filter it". Widening this dict is therefore the single, deliberate place a
-# missing-reason can be promoted from "abort" to "proceed".
+# A reason not listed here means a host we can't name, so it resolves UNRESOLVED.
 _RECOGNISED_MISSING_REASON: dict[str, tuple[HostFilterOutcome, str]] = {
     MISSING_REASON_NOT_APPLICABLE: (
         HostFilterOutcome.PASS_THROUGH,
@@ -216,9 +211,7 @@ async def resolve_host_filter_many(
     cheaper than an IN-list and keeps the query count fixed at two regardless of
     how many distinct hosts the pool spans.
 
-    Every requested idx appears in the result. A biosample with no host_taxon_id
-    row is not silently dropped — unless metadata marks it a control, it comes back
-    UNRESOLVED, which is the whole point of the fail-closed contract.
+    Every requested idx appears in the result.
     """
     # Coerce before anything else — see resolve_host_filter. It matters more here:
     # `profile_by_term` below is keyed on host_term_idx ALONE, which is only
@@ -272,12 +265,11 @@ def _classify(
             " has no control classification in this release",
         )
 
-    # The field was never set. Not the same as "no host" — we simply were not
-    # told, so we refuse rather than guess.
     if row is None:
         return _without_references(
-            HostFilterOutcome.UNRESOLVED,
-            f"{BIOSAMPLE_FIELD_HOST_TAXON_ID} is not set on biosample {biosample_idx}",
+            HostFilterOutcome.PASS_THROUGH,
+            f"{BIOSAMPLE_FIELD_HOST_TAXON_ID} is not set on biosample {biosample_idx},"
+            " so it has no host",
         )
 
     host_term_idx = row["value_terminology_term_idx"]

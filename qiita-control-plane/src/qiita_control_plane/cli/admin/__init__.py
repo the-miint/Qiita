@@ -372,11 +372,12 @@ def _build_parser() -> argparse.ArgumentParser:
             "Backfill the host_taxon_id biosample field, which postdates every sample"
             " we hold. A control (per the pre-flight's own is_control, or negative"
             " control metadata) gets 'missing: control sample'; otherwise the biosample's"
-            " own taxon_id is mapped to a host through a small curated table. A biosample"
-            " neither rule settles is REPORTED and left unwritten — it stays UNRESOLVED at"
-            " submit, which aborts rather than passing an un-depleted biosample through."
-            " Idempotent: a biosample that already carries the field is skipped, so this"
-            " can be re-run as curation lands. Dry-run by default; pass --execute to write."
+            " own taxon_id is mapped to a host through a small curated table, and a"
+            " hostless taxon is left absent. A biosample neither rule settles is REPORTED"
+            " and written 'not provided' — it stays UNRESOLVED at submit, which aborts"
+            " rather than passing an un-depleted biosample through."
+            " Idempotent: a biosample that already carries the field is skipped."
+            " Dry-run by default; pass --execute to write."
             " Needs DATABASE_URL."
         ),
     )
@@ -714,13 +715,13 @@ def _handle_backfill_host_taxon_id(
     print(f"candidates                           : {len(plan.assignments)}")
     print(f"  control -> missing: control sample : {by_source[HostTaxonSource.CONTROL]}")
     print(f"  taxon   -> host term               : {by_source[HostTaxonSource.TAXON]}")
-    print(f"  taxon   -> not applicable          : {by_source[HostTaxonSource.NO_HOST]}")
-    print(f"  UNRESOLVED (left unwritten)        : {len(unresolved)}")
+    print(f"  taxon   -> no host (left absent)   : {by_source[HostTaxonSource.NO_HOST]}")
+    print(f"  UNRESOLVED (written not provided)  : {len(unresolved)}")
 
     if unresolved and args.show_unresolved:
         # An unresolved sample is a curation item, so name what it is rather than
         # just counting it — the taxon it carries is the thing to fix.
-        print("\nunresolved biosamples (these stay UNRESOLVED at submit):")
+        print("\nunresolved biosamples (written 'not provided'; these abort at submit):")
         by_taxon = Counter((a.sample_taxon_term_id, a.sample_taxon_label) for a in unresolved)
         for (term_id, label), n in by_taxon.most_common():
             # NOT the same as plan.no_taxon: these biosamples HAVE a taxon_id row,
@@ -736,12 +737,12 @@ def _handle_backfill_host_taxon_id(
         print(
             f"\nWARNING: {len(scan.unreadable_pools)} pool pre-flight(s) could not be read:"
             f" {scan.unreadable_pools}."
-            " Their blanks are NOT recognised as controls and fall to UNRESOLVED."
+            " Their blanks are NOT recognised as controls and are handled as ordinary samples."
         )
     if scan.controls_without_accession:
         print(
             f"\nWARNING: {scan.controls_without_accession} control(s) carry no biosample"
-            " accession, so they cannot be matched and fall to UNRESOLVED."
+            " accession, so they cannot be matched and are handled as ordinary samples."
         )
 
     if args.execute:

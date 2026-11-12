@@ -214,8 +214,6 @@ async def test_user_authoring_smoke_via_cli(
             # The pre-flight join key for a biosample.
             "--biosample-accession",
             f"SAMN-smoke-{run_tag}",
-            # host_taxon_id is enforced at intake — supply a missing-value marker
-            # (this smoke sample has no host of its own).
             "--metadata",
             "host taxon id=not applicable",
         )
