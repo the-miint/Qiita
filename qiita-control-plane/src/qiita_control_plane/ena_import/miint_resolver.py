@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from collections.abc import Callable
 from time import monotonic
 
@@ -36,6 +37,10 @@ _RUN_FIELDS = ",".join(EnaRunRecord.model_fields)
 _STUDY_FIELDS = ",".join(EnaStudyHeader.model_fields)
 
 _log = logging.getLogger(__name__)
+
+# miint's documented Browser-XML batch size: ENA 404s a request only if all of one batch is missing.
+_MIINT_BROWSER_XML_BATCH = 200
+_ENA_NOT_FOUND_BODY = re.compile(r"<ErrorDetails>.*<message>[^<]*not found\.</message>", re.DOTALL)
 
 # Sized to outlast a multi-hour ENA Portal outage; the deadline is per call, not per item.
 _RESOLVE_DEADLINE_S = 6 * 3600
@@ -184,27 +189,32 @@ class MiintEnaResolver:
         _require_kind(sample_accessions, EnaAccessionKind.SAMPLE)
         return [
             EnaSampleAttributes(sample_accession=sample_accession, attributes=attributes)
-            for sample_accession, attributes in _query_ena_present_samples(sample_accessions)
+            for sample_accession, attributes in _present_sample_attributes(sample_accessions)
         ]
 
 
-def _query_ena_present_samples(
+def _is_ena_not_found(exc: duckdb.HTTPException) -> bool:
+    """True for ENA's missing-biosample 404, not for e.g. its JSON "No endpoint found"."""
+    body = str(getattr(exc, "body", None) or "")
+    return getattr(exc, "status_code", None) == 404 and bool(_ENA_NOT_FOUND_BODY.search(body))
+
+
+def _present_sample_attributes(
     sample_accessions: list[str],
 ) -> list[tuple[str, dict[str, list[str]]]]:
-    """`_query_ena_sample_attributes`, skipping samples ENA has no record of. ENA's sample
-    XML omits a missing sample but 404s a request whose samples are all missing, which
-    fails the whole miint query; halving isolates those (e.g. NCBI samples ENA never
-    mirrored, whose runs it still serves)."""
+    """`_query_ena_sample_attributes` minus biosamples ENA has no record of: its sample XML
+    omits a missing biosample but 404s a request whose biosamples are all missing."""
     try:
         return _query_ena_sample_attributes(sample_accessions)
     except duckdb.HTTPException as exc:
-        if getattr(exc, "status_code", None) != 404:
+        if not _is_ena_not_found(exc):
             raise
-        if len(sample_accessions) == 1:
-            _log.warning("ENA has no sample record for %s", sample_accessions[0])
+        if len(sample_accessions) <= _MIINT_BROWSER_XML_BATCH:
+            for accession in sample_accessions:
+                _log.warning("ENA has no record of biosample %s", accession)
             return []
         mid = len(sample_accessions) // 2
-        return _query_ena_present_samples(sample_accessions[:mid]) + _query_ena_present_samples(
+        return _present_sample_attributes(sample_accessions[:mid]) + _present_sample_attributes(
             sample_accessions[mid:]
         )
 
