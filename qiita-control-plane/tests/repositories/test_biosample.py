@@ -1373,6 +1373,25 @@ async def test_fetch_study_idxs_by_biosample_idx_excludes_retired(ctx):
     assert result == expected
 
 
+@pytest.mark.parametrize("include_retired", [True, False])
+async def test_fetch_study_idxs_by_biosample_idx_ignores_biosample_retirement(ctx, include_retired):
+    """Tests the case where a biosample is retired but its link is active: the
+    link is returned whether or not retired links are requested, since only the
+    link's own retired flag counts.
+    """
+    retired_biosample_idx = await _create_biosample_with_link(ctx)
+    await retire_biosample(
+        ctx["pool"], biosample_idx=retired_biosample_idx, retired_by_idx=ctx["principal_idx"]
+    )
+
+    result = await fetch_study_idxs_by_biosample_idx(
+        ctx["pool"], [retired_biosample_idx], include_retired=include_retired
+    )
+
+    expected = {retired_biosample_idx: [ctx["study_idx"]]}
+    assert result == expected
+
+
 async def test_fetch_study_idxs_by_biosample_idx_empty_input(ctx):
     """Tests the case where no biosample_idxs are given: the result is empty."""
     result = await fetch_study_idxs_by_biosample_idx(ctx["pool"], [], include_retired=True)

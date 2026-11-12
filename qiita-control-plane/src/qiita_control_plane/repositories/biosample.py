@@ -347,11 +347,9 @@ async def fetch_biosample_identity_by_tube(
 
 async def fetch_active_study_idxs_by_biosample_idx(
     pool_or_conn: asyncpg.Pool | asyncpg.Connection,
-    biosample_idxs: list[int],
+    biosample_idxs: Sequence[int],
 ) -> dict[int, list[int]]:
-    """Return `{biosample_idx: [study_idx, ...]}` (ascending) over the active
-    (non-retired) biosample_to_study links of `biosample_idxs`. A biosample with
-    no active link is omitted."""
+    """`fetch_study_idxs_by_biosample_idx` with retired links excluded."""
     links = await fetch_study_idxs_by_biosample_idx(
         pool_or_conn, biosample_idxs, include_retired=False
     )
@@ -364,10 +362,7 @@ async def fetch_study_idxs_by_biosample_idx(
     *,
     include_retired: bool,
 ) -> dict[int, list[int]]:
-    """Return `{biosample_idx: [study_idx, ...]}` (ascending) over the
-    biosample_to_study links of `biosample_idxs`. With include_retired False,
-    only links whose own retired flag is false count; the biosample's own
-    retirement is not consulted. A biosample with no counted link is omitted."""
+    """The biosample arm of `fetch_study_idxs_by_entity_idx`."""
     links = await fetch_study_idxs_by_entity_idx(
         pool_or_conn,
         spec=BIOSAMPLE_METADATA_SPEC,
