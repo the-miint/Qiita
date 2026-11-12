@@ -344,7 +344,7 @@ async def fetch_biosample_identity_by_tube(
     return {r["matrix_tube_id"]: (r["idx"], r["biosample_accession"]) for r in rows}
 
 
-async def fetch_active_study_links(
+async def fetch_active_study_idxs_by_biosample_idx(
     pool_or_conn: asyncpg.Pool | asyncpg.Connection,
     biosample_idxs: list[int],
 ) -> dict[int, list[int]]:

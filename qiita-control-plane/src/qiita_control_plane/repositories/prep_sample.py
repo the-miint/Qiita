@@ -34,12 +34,12 @@ async def fetch_active_study_idxs_for_prep_sample(
     two disagreeing would put the write gate (which authorizes off this one) and
     the read gates (which authorize off the batch) on different answers.
     """
-    return (await fetch_active_study_idxs_for_prep_samples(pool_or_conn, [prep_sample_idx])).get(
+    return (await fetch_active_study_idxs_by_prep_sample_idx(pool_or_conn, [prep_sample_idx])).get(
         prep_sample_idx, []
     )
 
 
-async def fetch_active_study_idxs_for_prep_samples(
+async def fetch_active_study_idxs_by_prep_sample_idx(
     pool_or_conn: asyncpg.Pool | asyncpg.Connection,
     prep_sample_idxs: Sequence[int],
 ) -> dict[int, list[int]]:

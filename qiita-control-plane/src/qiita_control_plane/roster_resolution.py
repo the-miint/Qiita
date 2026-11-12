@@ -23,7 +23,7 @@ from qiita_common.models import (
 )
 
 from qiita_control_plane.repositories.biosample import (
-    fetch_active_study_links,
+    fetch_active_study_idxs_by_biosample_idx,
     fetch_biosample_identity_by_tube,
     fetch_biosample_idxs_by_natural_key,
 )
@@ -191,7 +191,7 @@ async def fetch_roster_facts(
     biosample_idxs = sorted(
         {idx for idx, _ in by_tube.values()} | set(by_biosample_accession.values())
     )
-    study_links = await fetch_active_study_links(conn, biosample_idxs)
+    study_links = await fetch_active_study_idxs_by_biosample_idx(conn, biosample_idxs)
     return RosterFacts(
         by_tube=by_tube,
         by_biosample_accession=by_biosample_accession,

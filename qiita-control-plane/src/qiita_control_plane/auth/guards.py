@@ -22,7 +22,7 @@ from qiita_common.models import StudyAccessVia, StudyRecordView, Tier
 
 from ..deps import get_db_pool
 from ..repositories.prep_sample import (
-    fetch_active_study_idxs_for_prep_samples,
+    fetch_active_study_idxs_by_prep_sample_idx,
     fetch_prep_sample_exists,
 )
 from ..repositories.sequencing_run import (
@@ -675,7 +675,7 @@ async def filter_prep_samples_caller_can_read(
     if not prep_sample_idxs or caller.has_role_at_least(bypass_role):
         return PrepSampleReadAccess(readable=prep_sample_idxs, unlinked=[], blocked_by={})
 
-    links = await fetch_active_study_idxs_for_prep_samples(pool_or_conn, prep_sample_idxs)
+    links = await fetch_active_study_idxs_by_prep_sample_idx(pool_or_conn, prep_sample_idxs)
     readable_studies = await filter_studies_caller_can_read(
         pool_or_conn,
         caller=caller,
@@ -689,7 +689,7 @@ async def filter_prep_samples_caller_can_read(
     blocked_by: dict[int, list[int]] = {}
     for prep_sample_idx in prep_sample_idxs:
         # Absent from the mapping means every link is retired — see
-        # fetch_active_study_idxs_for_prep_samples, which deliberately does not
+        # fetch_active_study_idxs_by_prep_sample_idx, which deliberately does not
         # encode what that means so each gate has to say.
         studies = links.get(prep_sample_idx)
         if not studies:
