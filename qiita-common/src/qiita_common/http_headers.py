@@ -1,4 +1,5 @@
-"""HTTP header names that the control plane's routes and its clients share."""
+"""The optimistic-concurrency header names that the control plane's routes and
+its clients share."""
 
 # The optimistic-concurrency header pair: every route that emits a version
 # stamp writes ETAG_HEADER, and every write that gates on one reads
