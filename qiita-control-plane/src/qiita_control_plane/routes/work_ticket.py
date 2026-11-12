@@ -75,7 +75,6 @@ from qiita_common.models import (
     FanoutListResponse,
     FanoutOverrideRequest,
     FanoutPumpResponse,
-    MaskDefinitionStatus,
     ScopeTargetKind,
     StepProgressState,
     WorkTicket,
@@ -107,6 +106,12 @@ from ..fanout_dispatch import (
     set_override,
     top_up_dispatch,
 )
+from ..repositories.alignment_definition import (
+    AlignmentDefinitionDeprecated,
+    lock_active_alignment,
+)
+from ..repositories.block import BLOCK_ABANDONED
+from ..repositories.mask_definition import MaskDefinitionDeprecated, lock_active_mask
 from ..runner import _fetch_action
 from ..step_progress import StepProgressMismatch, check_step_progress, load_step_progress
 from ..work_ticket_cancel import WorkTicketNotFound, cancel_work_ticket
@@ -147,6 +152,9 @@ _RUN_APPLICABLE_STATES = frozenset({WorkTicketState.PENDING.value}) | (
 _RUN_NOT_APPLICABLE_STATES = tuple(
     state.value for state in WorkTicketState if state.value not in _RUN_APPLICABLE_STATES
 )
+
+# /run's guarded UPDATEs bind the state they read; a concurrent change loses the race.
+_RUN_STATE_CHANGED = "work_ticket state changed under /run; retry"
 
 router = APIRouter(prefix=PATH_WORK_TICKET_PREFIX, tags=["work-ticket"])
 
@@ -938,22 +946,58 @@ async def run_work_ticket(
         if definition is None:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=disabled)
         async with pool.acquire() as conn, conn.transaction():
-            # A redrive fast-forwards the completed mint, so the mint's own refusal
-            # of a deprecated config never runs: the ticket would mask, or build
-            # on, a filter that is void.
-            mask = await conn.fetchrow(
-                "SELECT md.mask_idx, md.status FROM qiita.work_ticket wt"
-                " JOIN qiita.mask_definition md ON md.mask_idx = wt.mask_idx"
-                " WHERE wt.work_ticket_idx = $1",
+            # A redrive fast-forwards the completed mint, so the mint's own refusal of
+            # a deprecated config never runs: the ticket would mask, align, or build on
+            # a config that is void. The definitions are held `FOR SHARE` to commit,
+            # like every other writer of their work (`lock_active_alignment`): a
+            # deprecation either commits first and is refused here, or waits for this
+            # redrive and then counts the revived ticket. Taken mask first, as the align
+            # planner takes them, and before the block lock, in the order abandon-plan
+            # takes its own (definition, then block).
+            ids = await conn.fetchrow(
+                "SELECT mask_idx, alignment_idx, block_idx FROM qiita.work_ticket"
+                " WHERE work_ticket_idx = $1",
                 work_ticket_idx,
             )
-            if mask is not None and mask["status"] == MaskDefinitionStatus.DEPRECATED.value:
+            if ids["mask_idx"] is not None:
+                try:
+                    await lock_active_mask(conn, ids["mask_idx"])
+                except MaskDefinitionDeprecated as exc:
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail=(
+                            f"work_ticket {work_ticket_idx} runs under mask_definition"
+                            f" {ids['mask_idx']}, which is deprecated; it is not redriven."
+                            " Submit the work under a current mask instead"
+                        ),
+                    ) from exc
+            if ids["alignment_idx"] is not None:
+                try:
+                    await lock_active_alignment(conn, ids["alignment_idx"])
+                except AlignmentDefinitionDeprecated as exc:
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail=(
+                            f"work_ticket {work_ticket_idx} runs under alignment"
+                            f" {ids['alignment_idx']}, which is deprecated; it is not"
+                            " redriven"
+                        ),
+                    ) from exc
+            # Locked so an abandon-plan, which locks the block too, either commits
+            # before this read or waits for this redrive to commit and then refuses it
+            # as running. An abandoned block's prep_samples have been handed to a
+            # re-plan, whose rows this block's replace step would delete.
+            block_state = await conn.fetchval(
+                "SELECT state FROM qiita.block WHERE block_idx = $1 FOR UPDATE",
+                ids["block_idx"],
+            )
+            if block_state == BLOCK_ABANDONED:
                 raise HTTPException(
                     status_code=status.HTTP_409_CONFLICT,
                     detail=(
-                        f"work_ticket {work_ticket_idx} runs under mask_definition"
-                        f" {mask['mask_idx']}, which is deprecated; it is not redriven."
-                        " Submit the work under a current mask instead"
+                        f"work_ticket {work_ticket_idx} runs block {ids['block_idx']},"
+                        " which was abandoned; its prep_samples are re-planned with"
+                        " only_missing=true instead"
                     ),
                 )
             if is_download:
@@ -975,7 +1019,11 @@ async def run_work_ticket(
                 # notified; a redrive that later reaches its TRUE terminal state
                 # must re-notify, so reset the notification lifecycle here.
                 "     notified_at = NULL,"
-                "     notify_attempts = 0"
+                "     notify_attempts = 0,"
+                # /run dispatches the ticket itself, so it is no longer held: the
+                # pump must not release it a second time, and abandon-plan must see
+                # it as running (`actions/align_abandon.py`).
+                "     dispatch_held = false"
                 " WHERE work_ticket_idx = $2"
                 "   AND state = $3::qiita.work_ticket_state"
                 " RETURNING work_ticket_idx",
@@ -986,7 +1034,7 @@ async def run_work_ticket(
             if updated is None:
                 raise HTTPException(
                     status_code=status.HTTP_409_CONFLICT,
-                    detail="work_ticket state changed under /run; retry",
+                    detail=_RUN_STATE_CHANGED,
                 )
 
             # Which prior progress rows survive the redrive. `completed` survives,
@@ -1066,7 +1114,22 @@ async def run_work_ticket(
             "manual restart of work_ticket %d (FAILED → PENDING; retry_count reset)",
             work_ticket_idx,
         )
-    # PENDING: no state change needed, just dispatch.
+    else:
+        # PENDING: no state change, but a fan-out child may still be held, and /run
+        # is about to dispatch it. Cleared under the row lock abandon-plan also takes,
+        # so an abandon either cancels it first (refused here) or sees it running.
+        released = await pool.fetchval(
+            "UPDATE qiita.work_ticket SET dispatch_held = false"
+            " WHERE work_ticket_idx = $1 AND state = $2::qiita.work_ticket_state"
+            " RETURNING work_ticket_idx",
+            work_ticket_idx,
+            WorkTicketState.PENDING.value,
+        )
+        if released is None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=_RUN_STATE_CHANGED,
+            )
 
     schedule_dispatch(request.app, work_ticket_idx)
     return WorkTicketResponse(work_ticket_idx=work_ticket_idx, state=WorkTicketState.PENDING)

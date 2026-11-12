@@ -102,10 +102,12 @@ from ..repositories.block import MASK_SAMPLE_COMPLETED, fetch_mask_sample_state
 from ..repositories.mask_definition import (
     MaskDefinitionDeprecated,
     MaskDefinitionNotFound,
+    MaskHasLiveWork,
     fetch_mask_definition_by_idx,
     fetch_mask_prep_samples,
     list_mask_definitions,
     mint_mask_definition,
+    refuse_deprecating_mask_with_live_work,
     set_mask_sample_states,
     transition_mask_definition_status,
 )
@@ -508,7 +510,7 @@ async def get_syndna_read_count_route(
 async def update_mask_definition_status_route(
     mask_idx: Annotated[int, Field(gt=0)],
     body: MaskDefinitionStatusUpdate,
-    pool: asyncpg.Pool = Depends(get_db_pool),
+    tx: TxConnFactory = Depends(get_tx_conn_factory),
     caller: HumanUser = Depends(require_human),
     _scope: Principal = Depends(require_scope(Scope.MASK_DEFINITION_LIFECYCLE)),
 ) -> MaskDefinition:
@@ -524,19 +526,30 @@ async def update_mask_definition_status_route(
     query-time macro, so dropping read_mask removes the record of the filtering
     decision while leaving the raw reads Flight-reachable.
 
+    Deprecating is refused (409, listing them) while any work ticket carrying the
+    mask is unfinished, held ones included.
+
     system_admin only (`mask_definition:lifecycle`).
     """
     try:
-        row = await transition_mask_definition_status(
-            pool,
-            mask_idx=mask_idx,
-            status=body.status,
-            reason=body.reason,
-            superseded_by=body.superseded_by,
-            principal_idx=caller.principal_idx,
-        )
+        async with tx() as conn:
+            if body.status is MaskDefinitionStatus.DEPRECATED:
+                await refuse_deprecating_mask_with_live_work(conn, mask_idx)
+            row = await transition_mask_definition_status(
+                conn,
+                mask_idx=mask_idx,
+                status=body.status,
+                reason=body.reason,
+                superseded_by=body.superseded_by,
+                principal_idx=caller.principal_idx,
+            )
     except MaskDefinitionNotFound:
         raise HTTPException(status_code=404, detail=_MSG_MASK_NOT_FOUND)
+    except MaskHasLiveWork as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"reason": str(exc), "work_ticket_idx": exc.work_ticket_idxs},
+        ) from exc
     except asyncpg.ForeignKeyViolationError as exc:
         raise HTTPException(
             status_code=422,
@@ -600,7 +613,8 @@ async def create_read_masked_doget_ticket(
     Caller must be a ServiceAccount holding `read_masked:doget`. The ticket
     filters the data plane's read_masked macro to exactly one sample under
     exactly one mask config; the macro's unconditional `reason='pass'` excludes human/host
-    reads by construction.
+    reads by construction. An optional `columns` list narrows each row to those
+    of the macro's columns; omitted, the ticket streams the full shape.
 
     Mandatory-filter invariant: both identifiers are required and positive
     (Pydantic gt=0), so the signed filter is always non-empty. The route
@@ -649,9 +663,15 @@ async def create_read_masked_doget_ticket(
             },
         )
 
-    ticket_bytes = sign_ticket(
-        table=READ_MASKED_TABLE,
-        filter=filter_,
-        secret=signing_key,
-    )
+    try:
+        ticket_bytes = sign_ticket(
+            table=READ_MASKED_TABLE,
+            filter=filter_,
+            columns=body.columns,
+            secret=signing_key,
+        )
+    except ValueError as exc:
+        # An unknown or repeated projection column; the allowlist lives at the
+        # signing boundary (`auth/tickets.py`).
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     return DoGetTicketResponse(ticket=base64.b64encode(ticket_bytes).decode())

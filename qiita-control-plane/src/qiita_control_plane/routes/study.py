@@ -54,7 +54,7 @@ from ..repositories.exported_entity import require_export_entity_id
 from ..repositories.study import (
     create_study,
     fetch_study,
-    fetch_study_idxs_by_accession,
+    fetch_study_idxs_by_natural_key,
     fetch_study_list_candidates,
     update_study,
 )
@@ -493,8 +493,8 @@ async def lookup_study_by_accession(
     _ = user
     resolved, missing = await resolve_idxs_by_natural_key(
         values=body.accessions,
-        fetcher=lambda values: fetch_study_idxs_by_accession(
-            pool, values=values, accession_field=body.accession_field
+        fetcher=lambda values: fetch_study_idxs_by_natural_key(
+            pool, values=values, key=body.accession_field
         ),
     )
     return StudyLookupByAccessionResponse(resolved=resolved, missing=missing)

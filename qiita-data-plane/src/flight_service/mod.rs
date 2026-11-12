@@ -181,7 +181,7 @@ impl QiitaFlightService {
 ///   files: it returns a committed registration without writing, and fails
 ///   closed otherwise (the replay check in `register_files` has the cases).
 /// - `delete_reference` / `delete_pool_reads` /
-///   `delete_read_mask_block` / `delete_alignment` / `delete_alignment_block` /
+///   `delete_read_mask_block` / `delete_alignment_block` /
 ///   `delete_alignment_sample` — logical DELETEs, idempotent against themselves:
 ///   a replay with no write in between deletes zero rows. Not commutative with
 ///   one. Two run as a pre-`register-files` replace —
@@ -226,7 +226,6 @@ const REPLAY_SAFE_ACTIONS: &[&str] = &[
     "delete_reference",
     "delete_pool_reads",
     "delete_read_mask_block",
-    "delete_alignment",
     "delete_alignment_block",
     "delete_alignment_sample",
     "export_read",
@@ -392,7 +391,6 @@ impl FlightService for QiitaFlightService {
             "delete_reference" => self.delete_reference_action(&action).await,
             "delete_pool_reads" => self.delete_pool_reads_action(&action).await,
             "delete_read_mask_block" => self.delete_read_mask_block_action(&action).await,
-            "delete_alignment" => self.delete_alignment_action(&action).await,
             "delete_alignment_block" => self.delete_alignment_block_action(&action).await,
             "delete_alignment_sample" => self.delete_alignment_sample_action(&action).await,
             "export_read" => self.export_read_action(&action).await,

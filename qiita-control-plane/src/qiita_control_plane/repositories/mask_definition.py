@@ -35,6 +35,7 @@ import asyncpg
 from qiita_common.actions import PER_SAMPLE_MASK_ACTION_IDS
 from qiita_common.hashing import canonical_params_hash
 from qiita_common.models import (
+    NON_TERMINAL_WORK_TICKET_STATES,
     MaskDefinitionStatus,
     WorkTicketState,
 )
@@ -527,3 +528,67 @@ async def set_mask_sample_states(
         "not_found": sorted(not_found),
         "skipped_pending": sorted(skipped_pending),
     }
+
+
+class MaskHasLiveWork(Exception):
+    """Raised when deprecating a mask that still has unfinished work tickets.
+    Deprecation is refused until they finish or are cancelled, so no masking run,
+    and no alignment reading the mask's pass-set, is still to write under it."""
+
+    def __init__(self, mask_idx: int, work_ticket_idxs: list[int]) -> None:
+        self.mask_idx = mask_idx
+        self.work_ticket_idxs = work_ticket_idxs
+        super().__init__(
+            f"mask {mask_idx} has {len(work_ticket_idxs)} unfinished work ticket(s):"
+            f" {work_ticket_idxs}. Wait for them to finish, or cancel them, then deprecate"
+        )
+
+
+async def refuse_deprecating_mask_with_live_work(conn: asyncpg.Connection, mask_idx: int) -> None:
+    """Raise MaskHasLiveWork if `mask_idx` is active and any work ticket carrying it
+    is not terminal (held tickets included: the fan-out would release them).
+
+    The mask twin of `alignment_definition.refuse_deprecating_with_live_work`, with
+    the same locking: the definition row `FOR UPDATE` here, `FOR SHARE` in
+    `lock_active_mask` at each writer of `work_ticket.mask_idx`. A ticket the runner
+    has not yet stamped with its mask is not counted; its stamp takes the share lock
+    and refuses once the mask is deprecated."""
+    require_transaction(conn)
+    status = await conn.fetchval(
+        "SELECT status FROM qiita.mask_definition WHERE mask_idx = $1 FOR UPDATE", mask_idx
+    )
+    if status is None:
+        raise MaskDefinitionNotFound(mask_idx)
+    if status != MaskDefinitionStatus.ACTIVE.value:
+        return
+    live = [
+        r["work_ticket_idx"]
+        for r in await conn.fetch(
+            "SELECT work_ticket_idx FROM qiita.work_ticket"
+            " WHERE mask_idx = $1 AND state::text = ANY($2::text[])"
+            " ORDER BY work_ticket_idx",
+            mask_idx,
+            list(NON_TERMINAL_WORK_TICKET_STATES),
+        )
+    ]
+    if live:
+        raise MaskHasLiveWork(mask_idx, live)
+
+
+async def lock_active_mask(conn: asyncpg.Connection, mask_idx: int) -> None:
+    """Hold the mask_definition row `FOR SHARE` for the caller's transaction and
+    raise MaskDefinitionDeprecated if it is deprecated. Called in the transactions
+    that write `work_ticket.mask_idx`, so a deprecation cannot commit between
+    resolving the mask and recording the work under it."""
+    require_transaction(conn)
+    row = await conn.fetchrow(
+        "SELECT status, deprecation_reason FROM qiita.mask_definition"
+        " WHERE mask_idx = $1 FOR SHARE",
+        mask_idx,
+    )
+    if row is None:
+        raise MaskDefinitionNotFound(mask_idx)
+    if row["status"] == MaskDefinitionStatus.DEPRECATED.value:
+        raise MaskDefinitionDeprecated(
+            f"mask_definition {mask_idx} is deprecated: {row['deprecation_reason']}"
+        )

@@ -490,16 +490,27 @@ URL_MASK_DEFINITION_SYNDNA_READ_COUNT = (
 # =============================================================================
 # The alignment_idx that keys the data plane's DuckLake `alignment` rows is minted
 # at plan time by the align-plan route (not a public POST here). This surface is
-# the destructive DELETE: full purge of an alignment (its DuckLake rows + the
-# Postgres alignment_definition row, cascading the alignment_sample gate) — the
-# disallow-without-delete escape hatch, system_admin-only.
+# the alignment lifecycle, system_admin-only. Mirrors /mask-definition's
+# status and sample-status routes.
 
 PATH_ALIGNMENT_DEFINITION_PREFIX = "/alignment-definition"
-PATH_ALIGNMENT_DEFINITION_BY_IDX = "/{alignment_idx}"  # DELETE an alignment (lake + Postgres)
+# PATCH the CONFIG's lifecycle (active <-> deprecated).
+PATH_ALIGNMENT_DEFINITION_STATUS = "/{alignment_idx}/status"
+# PATCH specific RUNS of the config (completed <-> invalidated).
+PATH_ALIGNMENT_DEFINITION_SAMPLE_STATUS = "/{alignment_idx}/sample-status"
+# POST: give up on the align plan's unfinished blocks and clear the pending gates
+# they covered, so the prep_samples can be re-planned with only_missing=true.
+PATH_ALIGNMENT_DEFINITION_ABANDON_PLAN = "/{alignment_idx}/abandon-plan"
 
 URL_ALIGNMENT_DEFINITION_PREFIX = f"{API_PREFIX}{PATH_ALIGNMENT_DEFINITION_PREFIX}"
-URL_ALIGNMENT_DEFINITION_BY_IDX = (
-    f"{URL_ALIGNMENT_DEFINITION_PREFIX}{PATH_ALIGNMENT_DEFINITION_BY_IDX}"
+URL_ALIGNMENT_DEFINITION_STATUS = (
+    f"{URL_ALIGNMENT_DEFINITION_PREFIX}{PATH_ALIGNMENT_DEFINITION_STATUS}"
+)
+URL_ALIGNMENT_DEFINITION_SAMPLE_STATUS = (
+    f"{URL_ALIGNMENT_DEFINITION_PREFIX}{PATH_ALIGNMENT_DEFINITION_SAMPLE_STATUS}"
+)
+URL_ALIGNMENT_DEFINITION_ABANDON_PLAN = (
+    f"{URL_ALIGNMENT_DEFINITION_PREFIX}{PATH_ALIGNMENT_DEFINITION_ABANDON_PLAN}"
 )
 
 # =============================================================================
@@ -943,8 +954,9 @@ PATH_BIOSAMPLE_LOOKUP_BY_ACCESSION = "/lookup-by-accession"
 # Bulk lookup of biosample_idx by matrix_tube_id; same body-vs-querystring
 # rationale as the accession variant.
 PATH_BIOSAMPLE_LOOKUP_BY_MATRIX_TUBE_ID = "/lookup-by-matrix-tube-id"
-# Resolve a pool roster (one row per pool sample: a matrix tube or accessions) to
-# biosample_idx + study links in one round trip; 422 lists every row's problem.
+# Resolve a pool roster (one row per pool item, naming its biosample and projects by
+# their identifiers) to biosample_idx + study links in one round trip; 422 lists
+# every row's problem.
 PATH_BIOSAMPLE_RESOLVE_ROSTER = "/resolve-roster"
 
 URL_BIOSAMPLE_BY_STUDY = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_BY_STUDY}"

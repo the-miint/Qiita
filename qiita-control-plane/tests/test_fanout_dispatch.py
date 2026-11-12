@@ -104,18 +104,18 @@ def test_cohort_for_ticket_row_read_mask_block():
     assert cohort.label == read_mask_block_cohort(9).label
 
 
-def test_cohort_for_ticket_row_purged_align_block_is_not_a_read_mask_block():
-    """A purged align block ticket must NOT route into the read-mask cohort.
+def test_cohort_for_ticket_row_detached_align_block_is_not_a_read_mask_block():
+    """A detached align block ticket must NOT route into the read-mask cohort.
 
-    `DELETE /alignment-definition` NULLs `work_ticket.alignment_idx` but leaves the
-    ticket's `mask_idx` and `block_idx`, so on the column shape alone it is
+    Deleting the alignment_definition row NULLs `work_ticket.alignment_idx` but
+    leaves the ticket's `mask_idx` and `block_idx`, so on the column shape alone it is
     indistinguishable from a read-mask block. Routing it there puts it in the wrong
-    fan-out: a `failed` one fail-stops the read-mask cohort for that mask_idx, and
-    the whole cohort then releases nothing. It routes by action instead, so a purged
+    fan-out: a `failed` one fail-stops the read-mask cohort for that mask_idx, and the
+    whole cohort then releases nothing. It routes by action instead, so a detached
     align ticket belongs to no cohort at all.
     """
-    purged = _row(block_idx=5, mask_idx=9, alignment_idx=None, action_id=ALIGN_ACTION_ID)
-    assert cohort_for_ticket_row(purged) is None
+    detached = _row(block_idx=5, mask_idx=9, alignment_idx=None, action_id=ALIGN_ACTION_ID)
+    assert cohort_for_ticket_row(detached) is None
 
 
 def test_cohort_for_ticket_row_non_fanout_is_none():
@@ -805,7 +805,7 @@ async def test_active_cohorts_covers_both_block_kinds(postgres_pool):
 
 
 # ---------------------------------------------------------------------------
-# Purged align tickets must not contaminate the read-mask cohort (DB)
+# Detached align tickets must not contaminate the read-mask cohort (DB)
 # ---------------------------------------------------------------------------
 
 
@@ -887,20 +887,20 @@ async def _insert_block_ticket(
 
 
 @pytest.mark.db
-async def test_purged_align_ticket_does_not_fail_stop_the_read_mask_cohort(postgres_pool):
-    """A failed, purged align block must not halt read-mask fan-out for its mask.
+async def test_detached_align_ticket_does_not_fail_stop_the_read_mask_cohort(postgres_pool):
+    """A failed, detached align block must not halt read-mask fan-out for its mask.
 
-    Deleting an alignment NULLs `work_ticket.alignment_idx` but leaves mask_idx and
-    block_idx, so a discriminator of `alignment_idx IS NULL` sweeps the leftover into
-    `read_mask_block_cohort(mask_idx)`. Since the pump fail-stops a cohort containing
-    any `failed` child, a timed-out align plan would then permanently stop every
-    future block-mask fan-out under that mask — a fleet-wide config hash, so any pool
-    masked the same way. Discriminating by action_id keeps the cohorts disjoint.
+    Deleting an alignment_definition row NULLs `work_ticket.alignment_idx` but leaves
+    mask_idx and block_idx, so a discriminator of `alignment_idx IS NULL` sweeps the
+    leftover into `read_mask_block_cohort(mask_idx)`. Since the pump fail-stops a cohort
+    containing any `failed` child, a timed-out align plan would then permanently stop
+    every future block-mask fan-out under that mask — a fleet-wide config hash, so any
+    pool masked the same way. Discriminating by action_id keeps the cohorts disjoint.
     """
     sc = await _seed_block_cohort_scaffold(postgres_pool)
     mask_idx = sc["mask_idx"]
     try:
-        # The wreckage of a purged, timed-out align plan.
+        # A timed-out align block whose alignment_definition row was deleted.
         await _insert_block_ticket(
             postgres_pool, sc, action_id=ALIGN_ACTION_ID, state="failed", dispatch_held=False
         )
@@ -926,12 +926,12 @@ async def test_purged_align_ticket_does_not_fail_stop_the_read_mask_cohort(postg
 
 
 @pytest.mark.db
-async def test_held_cohorts_does_not_report_a_purged_align_ticket_as_a_read_mask_cohort(
+async def test_held_cohorts_does_not_report_a_detached_align_ticket_as_a_read_mask_cohort(
     postgres_pool,
 ):
-    """The startup re-pump must not resurrect purged align tickets as mask blocks.
+    """The startup re-pump must not resurrect detached align tickets as mask blocks.
 
-    `held_cohorts` feeds `reconcile_inflight_tickets`, so a held+purged align ticket
+    `held_cohorts` feeds `reconcile_inflight_tickets`, so a held, detached align ticket
     misread as a read-mask block would be released and dispatched on the next CP
     restart — re-running the align action on a block whose plan was abandoned.
     """

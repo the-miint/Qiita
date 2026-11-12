@@ -180,9 +180,10 @@ BCL_CONVERT_SAMPLE_MAP_KEY = "sample_map"
 # **Kind is read from action_id, never from `alignment_idx IS NULL`.** An align
 # block ticket carries BOTH `mask_idx` and `alignment_idx`, so the absence of an
 # alignment reads like "this is a read-mask block" — and
-# `work_ticket.alignment_idx` is `ON DELETE SET NULL`, so purging an alignment
-# produces exactly that shape from a ticket that is not a read-mask block at all.
-# Consumers that got this wrong dropped purged align tickets into the read-mask
+# `work_ticket.alignment_idx` is `ON DELETE SET NULL`, so removing an
+# alignment_definition row produces exactly that shape from a ticket that is not a
+# read-mask block at all. No route removes one, but the FK still allows it by hand.
+# Consumers that got this wrong dropped such align tickets into the read-mask
 # cohort of the mask_idx they still carried, where one `failed` member fail-stops
 # the whole fan-out. `action_id` is NOT NULL and no FK action can clear it.
 # `block_read.resolve_block_read_scope` reaches the same conclusion from the other

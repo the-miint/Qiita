@@ -19,10 +19,15 @@ from collections.abc import Sequence
 
 import asyncpg
 from qiita_common.actions import BLOCK_MASK_ACTION_ID
+from qiita_common.api_paths import URL_ALIGNMENT_DEFINITION_SAMPLE_STATUS
 from qiita_common.models import MaskSampleState
 
 from . import gate_state_literal, require_transaction
-from .alignment_definition import list_completed_alignment_samples
+from .alignment_definition import (
+    ALIGNMENT_SAMPLE_COMPLETED,
+    ALIGNMENT_SAMPLE_INVALIDATED,
+    list_completed_alignment_samples,
+)
 
 # The `mask_sample` states, asserted against the Literal so a renamed member fails at
 # import rather than matching no rows. Every comparison against the gate uses these —
@@ -31,6 +36,12 @@ from .alignment_definition import list_completed_alignment_samples
 MASK_SAMPLE_PENDING = gate_state_literal("pending", MaskSampleState)
 MASK_SAMPLE_COMPLETED = gate_state_literal("completed", MaskSampleState)
 MASK_SAMPLE_INVALIDATED = gate_state_literal("invalidated", MaskSampleState)
+
+BLOCK_COMPLETED = "completed"
+# Set only by the align abandon-plan route (`actions.align_abandon`). An abandoned
+# block owes no prep_sample anything: the covering-block checks skip it, and its
+# ticket is not redriven.
+BLOCK_ABANDONED = "abandoned"
 
 
 async def create_block(conn: asyncpg.Connection) -> int:
@@ -395,7 +406,7 @@ async def has_incomplete_covering_block(
     Without that filter a pending/failed ALIGN block over the same (mask_idx,
     sample) would spuriously wedge this sample's read-mask finalize — align blocks
     carry BOTH mask_idx and alignment_idx. The filter is deliberately NOT
-    `wt.alignment_idx IS NULL`: purging an alignment NULLs that column
+    `wt.alignment_idx IS NULL`: deleting an alignment_definition NULLs that column
     (`ON DELETE SET NULL`), which would hand this query exactly the align blocks it
     exists to exclude. See `qiita_common.actions`."""
     incomplete = await conn.fetchval(
@@ -403,11 +414,12 @@ async def has_incomplete_covering_block(
         "  JOIN qiita.block_member bm ON bm.block_idx = b.block_idx"
         "  JOIN qiita.work_ticket wt ON wt.work_ticket_idx = b.work_ticket_idx"
         " WHERE bm.prep_sample_idx = $1 AND wt.mask_idx = $2"
-        "   AND wt.action_id = $3 AND b.state <> 'completed'"
+        "   AND wt.action_id = $3 AND b.state <> $4"
         " LIMIT 1",
         prep_sample_idx,
         mask_idx,
         BLOCK_MASK_ACTION_ID,
+        BLOCK_COMPLETED,
     )
     return incomplete is not None
 
@@ -471,6 +483,22 @@ async def lock_alignment_sample(
     )
 
 
+class AlignmentSampleInvalidated(Exception):
+    """Raised when an align run tries to complete an `(alignment_idx, prep_sample)`
+    pair whose previous run was withdrawn. The twin of `MaskSampleInvalidated`: a
+    redrive does not quietly overturn a withdrawal, and the pair stays refused until
+    someone restores it (the message names the route)."""
+
+    def __init__(self, *, alignment_idx: int, prep_sample_idx: int) -> None:
+        self.alignment_idx = alignment_idx
+        self.prep_sample_idx = prep_sample_idx
+        super().__init__(
+            f"alignment_sample ({alignment_idx}, {prep_sample_idx}) was invalidated; an "
+            f"align run cannot complete it. Restore it via PATCH "
+            f"{URL_ALIGNMENT_DEFINITION_SAMPLE_STATUS} once the output is trusted."
+        )
+
+
 async def finalize_alignment_sample(
     conn: asyncpg.Connection,
     *,
@@ -484,15 +512,32 @@ async def finalize_alignment_sample(
     caller holds the row's FOR UPDATE lock (`lock_alignment_sample`) across the
     check-and-flip, but the guard is belt-and-suspenders against a double
     finalize. A False return means the row was already completed. Twin of
-    `finalize_mask_sample`."""
+    `finalize_mask_sample`.
+
+    Raises `AlignmentSampleInvalidated` when the row was withdrawn, for the reason
+    that exception gives."""
     require_transaction(conn)
     updated = await conn.fetchval(
-        "UPDATE qiita.alignment_sample SET state = 'completed'"
-        " WHERE alignment_idx = $1 AND prep_sample_idx = $2 AND state <> 'completed'"
+        "UPDATE qiita.alignment_sample SET state = $3"
+        " WHERE alignment_idx = $1 AND prep_sample_idx = $2"
+        "   AND state NOT IN ($3, $4)"
         " RETURNING prep_sample_idx",
         alignment_idx,
         prep_sample_idx,
+        ALIGNMENT_SAMPLE_COMPLETED,
+        ALIGNMENT_SAMPLE_INVALIDATED,
     )
+    if updated is None:
+        state = await conn.fetchval(
+            "SELECT state FROM qiita.alignment_sample"
+            " WHERE alignment_idx = $1 AND prep_sample_idx = $2",
+            alignment_idx,
+            prep_sample_idx,
+        )
+        if state == ALIGNMENT_SAMPLE_INVALIDATED:
+            raise AlignmentSampleInvalidated(
+                alignment_idx=alignment_idx, prep_sample_idx=prep_sample_idx
+            )
     return updated is not None
 
 
@@ -537,7 +582,9 @@ async def has_incomplete_covering_alignment_block(
     when EVERY covering block has reached 'completed'; a still-running or failed
     sibling block leaves the sample's alignment partial, so it must not finalize.
     Checking `state <> 'completed'` (not "non-terminal") means a failed block
-    correctly blocks finalize until re-driven — the strict, fail-closed reading.
+    correctly blocks finalize until re-driven — the strict, fail-closed reading. An
+    'abandoned' block is the exception: abandon-plan purged its rows and cleared the
+    pending gates it covered, so it no longer owes any prep_sample anything.
     Twin of `has_incomplete_covering_block` (joins on alignment_idx not mask_idx).
 
     Needs no `action_id` filter, unlike that twin: `alignment_idx` is set only by
@@ -552,9 +599,11 @@ async def has_incomplete_covering_alignment_block(
         "SELECT 1 FROM qiita.block b"
         "  JOIN qiita.block_member bm ON bm.block_idx = b.block_idx"
         "  JOIN qiita.work_ticket wt ON wt.work_ticket_idx = b.work_ticket_idx"
-        " WHERE bm.prep_sample_idx = $1 AND wt.alignment_idx = $2 AND b.state <> 'completed'"
+        " WHERE bm.prep_sample_idx = $1 AND wt.alignment_idx = $2"
+        "   AND b.state <> ALL($3::text[])"
         " LIMIT 1",
         prep_sample_idx,
         alignment_idx,
+        [BLOCK_COMPLETED, BLOCK_ABANDONED],
     )
     return incomplete is not None

@@ -182,14 +182,20 @@ jobs:
       - uses: actions/cache@v5
         with:
           path: ~/.apptainer/cache
-          key: apptainer-${{ runner.os }}-ubuntu-24.04
+          key: apptainer-${{ runner.os }}
       - name: Install Apptainer
         run: |
           APPTAINER_VERSION=1.4.5
-          sudo apt-get install -y fuse2fs uidmap
-          wget -q https://github.com/apptainer/apptainer/releases/download/v${APPTAINER_VERSION}/apptainer_${APPTAINER_VERSION}_amd64.deb
-          sudo dpkg -i apptainer_${APPTAINER_VERSION}_amd64.deb
-          rm apptainer_${APPTAINER_VERSION}_amd64.deb
+          # Two .deb builds per release: the plain one links libfuse3-3 (Ubuntu
+          # 24.04), the -trixie+ one libfuse3-4 (Ubuntu 26.04, whose archive has
+          # no libfuse3-3). ubuntu-latest can land on either image.
+          sudo apt-get update -qq
+          if apt-cache show libfuse3-4 >/dev/null 2>&1; then DEB_SUFFIX=-trixie+; else DEB_SUFFIX=; fi
+          DEB=apptainer_${APPTAINER_VERSION}${DEB_SUFFIX}_amd64.deb
+          wget -q https://github.com/apptainer/apptainer/releases/download/v${APPTAINER_VERSION}/${DEB}
+          # apt-get, not dpkg -i, so the .deb's own dependencies are installed.
+          sudo apt-get install -y fuse2fs uidmap ./${DEB}
+          rm ${DEB}
       - run: make test-workflows
 
   # Enforces the DEPLOY_CHECKLIST.md "## Pending deploy" fold (CLAUDE.md "Operator-facing

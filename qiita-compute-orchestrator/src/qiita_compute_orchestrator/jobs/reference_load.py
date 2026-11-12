@@ -75,6 +75,7 @@ from ._feature_load import (
     write_feature_sequence_chunks,
     write_feature_sequences,
 )
+from ._jplace import load_jplace
 
 _LOG = logging.getLogger(__name__)
 
@@ -242,7 +243,14 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                     path=inputs.jplace_path,
                     out_path=duckdb_tmp / "placement.jplace",
                 )
-                _write_placements(conn, jplace_path, inputs.reference_idx, placements_out)
+                _write_placements(
+                    conn,
+                    jplace_path,
+                    inputs.reference_idx,
+                    placements_out,
+                    work_dir=duckdb_tmp / "jplace_parts",
+                    phylogeny=phylogeny_out if inputs.tree_path is not None else None,
+                )
                 written.append(placements_out_path)
 
             if inputs.annotation_manifest is not None and inputs.annotation_map is not None:
@@ -421,28 +429,34 @@ def _write_annotation(
     return True
 
 
-def _warn_taxonomy_anomaly(
-    conn: duckdb.DuckDBPyConnection,
-    *,
-    count_sql: str,
-    sample_sql: str,
-    params: list,
-    describe: str,
-) -> None:
-    """Emit a loud WARNING (never a raise) with a LIMIT-5 sample when a
-    taxonomy-coverage anomaly is present.
+def _anomaly(
+    conn: duckdb.DuckDBPyConnection, sql: str, params: list | None = None
+) -> tuple[int, list]:
+    """How many rows `sql` returns, and its first five (each row's first column), for a
+    refusal or warning that says both how many and which."""
+    params = params or []
+    (n,) = conn.execute(f"SELECT count(*) FROM ({sql})", params).fetchone()
+    if not n:
+        return 0, []
+    return n, [r[0] for r in conn.execute(f"{sql} LIMIT 5", params).fetchall()]
 
-    Coverage gaps and namespace mismatches are expected on real corpora —
-    GG2's 2024.09 backbone has ~29 features with no taxonomy row, and a
-    supplied taxonomy keyed in a different ID namespace than the FASTA is
-    the exact class that already bit the genome map — so they must NOT
-    fail the ingest. They must be visible, though: an unconfigured WARNING
-    reaches stderr via Python's last-resort handler and lands in the SLURM
-    job log, the loudest channel this architecture offers today."""
-    n = conn.execute(count_sql, params).fetchone()[0]
+
+def _warn_anomaly(
+    conn: duckdb.DuckDBPyConnection,
+    sql: str,
+    describe: str,
+    params: list | None = None,
+) -> None:
+    """Emit a loud WARNING (never a raise) with the count and first five rows of
+    `sql`, when it returns any.
+
+    For anomalies that real corpora carry and that the load must survive. An
+    unconfigured WARNING reaches stderr via Python's last-resort handler and
+    lands in the SLURM job log, the loudest channel this architecture offers
+    today."""
+    n, first = _anomaly(conn, sql, params)
     if n:
-        sample = [r[0] for r in conn.execute(sample_sql, params).fetchall()]
-        _LOG.warning("%d %s (sample: %s)", n, describe, sample)
+        _LOG.warning("%d %s (e.g. %s)", n, describe, first)
 
 
 def _write_taxonomy(
@@ -466,6 +480,7 @@ def _write_taxonomy(
         "CREATE TEMP TABLE parsed_taxonomy AS "
         "SELECT "
         "  m.feature_idx,"
+        "  m.read_id,"
         "  string_split_regex(t.taxonomy, ';\\s*') AS ranks,"
         "  len(string_split_regex(t.taxonomy, ';\\s*')) AS nranks "
         "FROM read_parquet(?) t "
@@ -501,58 +516,55 @@ def _write_taxonomy(
         ids = [r[0] for r in bad]
         raise ValueError(f"Taxonomy has wrong rank prefix order for feature_idx: {ids}")
 
-    # Warn (don't raise) on coverage anomalies. Distinct-feature counts so
-    # a canonical-hash collision (two read_ids → one feature) isn't
-    # double-counted.
-    _warn_taxonomy_anomaly(
+    # Coverage anomalies warn rather than fail the load, because real corpora have
+    # them: GG2's 2024.09 backbone has ~29 features with no taxonomy row. The count
+    # in each warning is what shows a taxonomy keyed by identifiers other than the
+    # FASTA's, which leaves nearly every feature unclassified. Each check counts
+    # features, not read_ids, so a feature known by several read_ids counts once.
+    _warn_anomaly(
         conn,
-        count_sql=(
-            "SELECT count(*) FROM (SELECT DISTINCT feature_idx FROM id_map) x "
-            "ANTI JOIN parsed_taxonomy p ON x.feature_idx = p.feature_idx"
-        ),
-        sample_sql=(
-            "SELECT DISTINCT x.read_id FROM id_map x "
-            "ANTI JOIN parsed_taxonomy p ON x.feature_idx = p.feature_idx LIMIT 5"
-        ),
-        params=[],
-        describe="feature(s) have no supplied taxonomy; recording as unclassified (NULL ranks)",
+        "SELECT min(x.read_id) FROM id_map x "
+        "ANTI JOIN (SELECT feature_idx FROM parsed_taxonomy WHERE ranks IS NOT NULL) p"
+        " ON x.feature_idx = p.feature_idx "
+        "GROUP BY x.feature_idx ORDER BY 1",
+        "feature(s) have no supplied taxonomy; recording as unclassified (NULL ranks)",
     )
-    _warn_taxonomy_anomaly(
+    _warn_anomaly(
         conn,
-        count_sql=(
-            "SELECT count(*) FROM read_parquet(?) t ANTI JOIN id_map m ON t.feature_id = m.read_id"
-        ),
-        sample_sql=(
-            "SELECT t.feature_id FROM read_parquet(?) t "
-            "ANTI JOIN id_map m ON t.feature_id = m.read_id LIMIT 5"
-        ),
-        params=[str(taxonomy_path)],
-        describe=(
-            "supplied taxonomy row(s) reference a feature_id that is not a sequence read_id "
-            "(stray / unmatched — ID-namespace mismatch); dropping them"
-        ),
+        "SELECT t.feature_id FROM read_parquet(?) t "
+        "ANTI JOIN id_map m ON t.feature_id = m.read_id ORDER BY 1",
+        "supplied taxonomy row(s) reference a feature_id that is not a sequence read_id "
+        "(stray / unmatched — ID-namespace mismatch); dropping them",
+        [str(taxonomy_path)],
     )
-    _warn_taxonomy_anomaly(
+    _warn_anomaly(
         conn,
-        count_sql=(
-            "SELECT count(*) FROM "
-            "(SELECT feature_id FROM read_parquet(?) GROUP BY feature_id HAVING count(*) > 1)"
-        ),
-        sample_sql=(
-            "SELECT feature_id FROM read_parquet(?) GROUP BY feature_id HAVING count(*) > 1 LIMIT 5"
-        ),
-        params=[str(taxonomy_path)],
-        describe=(
-            "feature_id(s) have duplicate supplied taxonomy rows; collapsing to one per feature"
-        ),
+        "SELECT feature_id FROM read_parquet(?) GROUP BY feature_id HAVING count(*) > 1 ORDER BY 1",
+        "feature_id(s) have duplicate supplied taxonomy rows; collapsing to one per feature",
+        [str(taxonomy_path)],
+    )
+
+    # Read_ids whose sequences canonicalize to one feature can carry different
+    # lineages, and so can duplicate rows for one read_id. Of the feature's
+    # read_ids that carry a lineage, the lexicographically smallest one's wins,
+    # the lineage itself breaking a tie between duplicate rows. The feature's
+    # accession is its smallest read_id overall, so when that read_id carries a
+    # lineage, the lineage kept is the accession's.
+    _warn_anomaly(
+        conn,
+        "SELECT list(DISTINCT read_id ORDER BY read_id) FROM parsed_taxonomy"
+        " WHERE ranks IS NOT NULL"
+        " GROUP BY feature_idx HAVING count(DISTINCT ranks) > 1 ORDER BY min(read_id)",
+        "feature(s) carry more than one distinct lineage; keeping the lineage of the "
+        "lexicographically smallest read_id that carries one",
     )
 
     # LEFT JOIN off the distinct reference feature set (same features
     # reference_sequences / reference_membership emit) so every feature
     # gets exactly one row; features with no supplied taxonomy get NULL
     # ranks (the existing NULLIF(substr(ranks[i], 4), '') yields NULL for
-    # a NULL `ranks`). Dedupe supplied taxonomy to one row per feature_idx
-    # first so a duplicate read_id can't multiply the LEFT JOIN.
+    # a NULL `ranks`). Supplied taxonomy is reduced to one row per
+    # feature_idx first, by the rule above, so it can't multiply the join.
     conn.execute(
         "COPY ("
         "  SELECT "
@@ -572,8 +584,9 @@ def _write_taxonomy(
         + "    NULL::BIGINT AS ncbi_taxon_id"
         "  FROM (SELECT DISTINCT feature_idx FROM id_map) m"
         "  LEFT JOIN ("
-        "    SELECT feature_idx, any_value(ranks) AS ranks"
-        "    FROM parsed_taxonomy GROUP BY feature_idx"
+        "    SELECT feature_idx, ranks FROM parsed_taxonomy"
+        "    QUALIFY row_number() OVER ("
+        "      PARTITION BY feature_idx ORDER BY ranks IS NULL, read_id, ranks) = 1"
         "  ) p ON m.feature_idx = p.feature_idx"
         "  ORDER BY m.feature_idx"
         f") TO '{out}' ({PARQUET_OPTS_AT_REST})"
@@ -621,19 +634,125 @@ def _write_placements(
     jplace_path: Path,
     reference_idx: int,
     out: str,
+    *,
+    work_dir: Path,
+    phylogeny: str | None,
 ) -> None:
-    """Parse a jplace file and emit one row per (fragment, edge_num).
-    Fragments not in id_map are dropped (jplace may carry rows for
-    fragments outside this reference's mint scope)."""
+    """Parse a jplace file and emit one DuckLake row per placed feature.
+
+    Every placed sequence lands, or the load fails. Each of these is refused with a
+    count and examples, because dropping or keeping it would publish a placement set
+    other than the one supplied, and nothing downstream could tell:
+
+      * a fragment placed twice;
+      * a fragment that matches no sequence identifier in this load;
+      * an edge_num the jplace's own tree does not number;
+      * when this load also carries a tree (`phylogeny` is its staged Parquet), a tree
+        other than the jplace's, as `_refuse_a_tree_other_than_the_jplaces` defines
+        it.
+
+    Fragments that are one feature (identical bytes, or reverse complements, under
+    different names) are placements of the same sequence. The feature keeps the
+    placement of its lexicographically smallest placed fragment, the rule
+    `_write_taxonomy` applies to lineages, and the load warns how many features had
+    more than one. That is a choice among placements of one sequence rather than the
+    loss of a sequence's placement, which is why it warns where the checks above
+    raise."""
+    load_jplace(conn, jplace_path, table="jplace_rows", tree_table="jplace_tree", work_dir=work_dir)
+    conn.execute(
+        "CREATE TEMP TABLE placed AS "
+        "SELECT j.*, m.feature_idx FROM jplace_rows j LEFT JOIN id_map m ON j.fragment = m.read_id"
+    )
+    conn.execute("DROP TABLE jplace_rows")
+
+    n, first = _anomaly(
+        conn, "SELECT fragment FROM placed GROUP BY fragment HAVING count(*) > 1 ORDER BY fragment"
+    )
+    if n:
+        raise ValueError(f"{n} jplace fragment(s) are placed more than once (e.g. {first})")
+    n, first = _anomaly(
+        conn, "SELECT fragment FROM placed WHERE feature_idx IS NULL ORDER BY fragment"
+    )
+    if n:
+        raise ValueError(
+            f"{n} jplace fragment(s) match no sequence identifier in this load (e.g. {first})"
+        )
+    n, first = _anomaly(
+        conn,
+        "SELECT e.edge_num || ' (' || e.placements || ' placements)'"
+        " FROM (SELECT edge_num, count(*) AS placements FROM placed GROUP BY edge_num) e"
+        " ANTI JOIN jplace_tree t ON e.edge_num = t.edge_id"
+        " ORDER BY e.edge_num",
+    )
+    if n:
+        raise ValueError(
+            f"{n} jplace edge_num(s) are not an edge of the jplace's own tree (e.g. {first})"
+        )
+    if phylogeny is not None:
+        _refuse_a_tree_other_than_the_jplaces(conn, phylogeny)
+    conn.execute("DROP TABLE jplace_tree")
+
+    _warn_anomaly(
+        conn,
+        "SELECT list(fragment ORDER BY fragment) FROM placed"
+        " GROUP BY feature_idx HAVING count(*) > 1 ORDER BY min(fragment)",
+        "feature(s) have placements from more than one fragment; keeping the "
+        "lexicographically smallest fragment's",
+    )
+
     conn.execute(
         "COPY ("
         f"  SELECT CAST({reference_idx} AS BIGINT) AS reference_idx,"
-        "    m.feature_idx, j.edge_num,"
-        "    j.likelihood, j.like_weight_ratio,"
-        "    j.distal_length, j.pendant_length"
-        "  FROM read_jplace(?) j"
-        "  INNER JOIN id_map m ON j.fragment = m.read_id"
-        "  ORDER BY m.feature_idx, j.edge_num"
+        "    feature_idx, edge_num,"
+        "    likelihood, like_weight_ratio,"
+        "    distal_length, pendant_length"
+        "  FROM placed"
+        "  QUALIFY row_number() OVER (PARTITION BY feature_idx ORDER BY fragment) = 1"
+        "  ORDER BY feature_idx"
         f") TO '{out}' ({PARQUET_OPTS_AT_REST})",
-        [str(jplace_path)],
     )
+    conn.execute("DROP TABLE placed")
+
+
+def _refuse_a_tree_other_than_the_jplaces(conn: duckdb.DuckDBPyConnection, phylogeny: str) -> None:
+    """Raise unless the tree staged at `phylogeny` is the TEMP TABLE `jplace_tree`, as
+    far as a placement can tell: every node's edge number, its parent's edge number,
+    its branch length, and, at a tip, its name. Edge numbers count because a jplace's
+    edge_nums name edges of its own tree, so the same topology numbered another way
+    joins placements to the wrong edges. Branch lengths count because a
+    placement's `distal_length` is a position along its edge, and its likelihoods were
+    computed on those lengths. Internal labels and the order of a node's children are
+    not compared; a placement's meaning does not depend on them."""
+    conn.execute(
+        "CREATE TEMP TABLE load_tree AS"
+        " SELECT node_index, parent_index, edge_id, branch_length, is_tip, name"
+        " FROM read_parquet(?)",
+        [phylogeny],
+    )
+    shape = (
+        "SELECT c.edge_id, p.edge_id AS parent_edge_id, c.branch_length,"
+        " CASE WHEN c.is_tip THEN c.name END AS tip"
+        " FROM {t} c LEFT JOIN {t} p ON c.parent_index = p.node_index"
+    )
+    jplace_nodes, load_nodes = conn.execute(
+        "SELECT (SELECT count(*) FROM jplace_tree), (SELECT count(*) FROM load_tree)"
+    ).fetchone()
+    n, first = _anomaly(
+        conn,
+        "SELECT 'edge ' || coalesce(CAST(edge_id AS VARCHAR), 'none')"
+        " || ' under edge ' || coalesce(CAST(parent_edge_id AS VARCHAR), 'none')"
+        " || ', length ' || coalesce(CAST(branch_length AS VARCHAR), 'none')"
+        " || coalesce(', tip ' || tip, '') FROM ("
+        f"{shape.format(t='jplace_tree')} EXCEPT ALL {shape.format(t='load_tree')}"
+        ") ORDER BY edge_id NULLS FIRST, parent_edge_id NULLS FIRST, tip NULLS FIRST",
+    )
+    conn.execute("DROP TABLE load_tree")
+    if n or jplace_nodes != load_nodes:
+        raise ValueError(
+            f"the tree in this load is not the jplace's tree: it has {load_nodes} nodes to the "
+            f"jplace tree's {jplace_nodes}, and {n} of the jplace tree's nodes have no node in "
+            f"it with the same edge number, parent edge number, branch length and tip name "
+            f"(e.g. {first}). "
+            "A jplace's edge_nums name edges of its own tree, so load that tree, `{N}` "
+            "decorations included"
+        )

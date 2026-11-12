@@ -9,10 +9,10 @@ cannot reach and a future migration could quietly drop:
   publication.
 * Exactly one processing identifier on a live row (`num_nonnulls`), which is the
   constraint a new processing type must extend.
-* An identifier OUTLIVES the processing it names: purging an alignment detaches
-  and retires it instead of deleting it. The trigger that does this is what makes
-  the FK's `ON DELETE SET NULL` satisfy the check at all, so without it an
-  alignment purge fails outright.
+* An identifier OUTLIVES the processing it names: deleting an alignment_definition
+  row detaches and retires it instead of deleting it. The trigger that does this
+  is what makes the FK's `ON DELETE SET NULL` satisfy the check at all, so without
+  it that delete fails outright.
 * Retirement columns cannot disagree with each other.
 """
 
@@ -147,13 +147,13 @@ async def test_a_live_row_needs_exactly_one_processing(postgres_pool, probe):
         )
 
 
-async def test_purging_the_alignment_retires_the_identifier_rather_than_deleting_it(
+async def test_deleting_the_alignment_retires_the_identifier_rather_than_deleting_it(
     postgres_pool, probe
 ):
     """The whole reason retirement exists. A published citation must keep resolving
-    after the data behind it is purged, and must say what happened.
+    after the alignment behind it is deleted, and must say what happened.
 
-    This also proves the purge SUCCEEDS: without the retire-on-detach trigger the
+    This also proves the delete SUCCEEDS: without the retire-on-detach trigger the
     FK's SET NULL would leave a live row with no processing, the one_processing
     check would reject it, and DELETEing the alignment would fail.
     """
@@ -175,12 +175,15 @@ async def test_purging_the_alignment_retires_the_identifier_rather_than_deleting
     assert row["retired"] is True
     assert row["retired_at"] is not None
     # The reason keeps the alignment_idx the column no longer can.
-    assert str(probe["alignment_idx"]) in row["retire_reason"]
+    assert row["retire_reason"] == (
+        f"alignment_definition {probe['alignment_idx']} was deleted; the processing"
+        " this identifier named no longer exists"
+    )
 
 
 async def test_a_retired_tuple_can_be_reminted(postgres_pool, probe):
-    """The unique index is partial on `NOT retired` precisely so a purged-then-
-    realigned sample gets a FRESH identifier instead of colliding with its own
+    """The unique index is partial on `NOT retired` precisely so a retired-then-
+    re-exported sample gets a FRESH identifier instead of colliding with its own
     history. Re-pointing the old one would silently change what a citation means."""
     first = await _mint(postgres_pool, probe)
     await postgres_pool.execute(
@@ -214,13 +217,13 @@ async def test_a_sample_with_a_published_identifier_cannot_be_hard_deleted(postg
         )
 
 
-async def test_a_purge_does_not_give_the_alignment_idx_back(postgres_pool, probe):
-    """Pins WHY a purge is permanent for an identifier, since the reasoning is easy
-    to get backwards: `mint_alignment_definition` dedups on params_hash, so one
-    might expect re-minting the same config to recover the same alignment_idx. It
-    does not — alignment_idx is GENERATED ALWAYS AS IDENTITY and the purge
-    hard-DELETEs the row, so Postgres issues a fresh value and the re-aligned data
-    is a genuinely new processed sample.
+async def test_deleting_the_alignment_does_not_give_the_alignment_idx_back(postgres_pool, probe):
+    """Pins WHY a deleted alignment_definition is gone for good as far as an
+    identifier is concerned, since the reasoning is easy to get backwards:
+    `mint_alignment_definition` dedups on params_hash, so one might expect re-minting
+    the same config to recover the same alignment_idx. It does not — alignment_idx
+    is GENERATED ALWAYS AS IDENTITY and the row is gone, so Postgres issues a fresh
+    value and the re-aligned data is a genuinely new processed sample.
     """
     params_hash = await postgres_pool.fetchval(
         "SELECT params_hash FROM qiita.alignment_definition WHERE alignment_idx = $1",
@@ -244,10 +247,10 @@ async def test_a_purge_does_not_give_the_alignment_idx_back(postgres_pool, probe
 
 def test_missing_from_reports_the_gap():
     """The mint's all-or-nothing guard. Exercised directly because the only thing
-    that makes it fire in production — an alignment purged between the INSERT and
-    the SELECT of one READ COMMITTED transaction — cannot be staged deterministically
-    without racing two connections, and the promise it protects (every requested
-    sample is present or the request fails) is the response's headline claim."""
+    that makes it fire — an alignment_definition row deleted between the INSERT and the
+    SELECT of one READ COMMITTED transaction — cannot be staged deterministically
+    without racing two connections, and the promise it protects (every requested sample
+    is present or the request fails) is the response's headline claim."""
     from qiita_control_plane.repositories.exported_identifier import _missing_from
 
     rows = [{"prep_sample_idx": 4}, {"prep_sample_idx": 9}]

@@ -545,7 +545,7 @@ class AlignPlanRequest(BaseModel):
     `only_missing` drops samples already carrying a completion gate for their
     resolved alignment, so an interrupted plan re-runs only the gap; off by default
     so a deliberate re-plan still tiles pool-wide (and is refused, 409, if any
-    sample is already gated — DELETE the alignment first or pass only_missing)."""
+    prep_sample is already gated; the 409 names the way out)."""
 
     reference_idx: Annotated[int, Field(gt=0)]
     mask_idx: Annotated[int, Field(gt=0)]

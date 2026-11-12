@@ -458,8 +458,8 @@ async def _ticket_alignment_idx(
     scope on the same thing: the delete clears an identity's rows, the register writes
     under the identity a step's `params:` stamped, and the gate records that the two
     agree. NULL means neither writer ran — the runner's de novo resolver
-    (`_alignment._persist_alignment_idx`) or `align_planner` — or a
-    `DELETE /alignment-definition/{idx}` detached it mid-flight (ON DELETE SET NULL).
+    (`_alignment._persist_alignment_idx`) or `align_planner` — or the
+    alignment_definition row was removed mid-flight (ON DELETE SET NULL).
     """
     _require_scope(entry, scope_target, ScopeTargetKind.PREP_SAMPLE)
     alignment_idx = await pool.fetchval(
@@ -469,8 +469,8 @@ async def _ticket_alignment_idx(
     if alignment_idx is None:
         raise RuntimeError(
             f"{entry} requires work_ticket {work_ticket_idx} to carry an alignment_idx; "
-            "the column is NULL (nothing set it, or the alignment definition was "
-            "deleted mid-flight)"
+            "the column is NULL (nothing set it, or the alignment_definition row was "
+            "removed by hand mid-flight)"
         )
     return alignment_idx
 

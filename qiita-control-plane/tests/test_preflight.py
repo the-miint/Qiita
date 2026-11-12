@@ -29,17 +29,157 @@ import argparse
 import sqlite3
 
 import pytest
+from qiita_common.models import BiosampleRef, StudyRef
+from run_preflight.db import InputSampleIdentifiers, PlatformSampleInfo, ProjectIdentifiers
 
 from qiita_control_plane.cli.user.amplicon import _read_amplicon_preflight_rows
 from qiita_control_plane.cli.user.pacbio import _read_pacbio_preflight_rows
 from qiita_control_plane.preflight import (
+    _RECORD_FIELD_RENAMES,
     SHEET_TYPE_PACBIO_ABSQUANT,
     AmpliconBarcode,
     AmpliconPreflightError,
+    SampleRefs,
+    _ref_from_record,
     amplicon_barcode_from_blob,
     is_pacbio_sheet_type,
     pacbio_protocol_from_blob,
+    sample_refs,
 )
+from qiita_control_plane.testing.parser import RaisingParser
+
+# The pre-flight identifier columns whose values become ref fields
+_IDENTIFIER_COLUMNS = (
+    ("input_sample", "biosample_accession"),
+    ("input_sample", "biosample_export_entity_id"),
+    ("input_sample", "matrix_tube_id"),
+    ("project", "bioproject_accession"),
+    ("project", "study_export_entity_id"),
+)
+_BLANK_OR_PADDED_VALUES = ("", "  ", " X1", "X1\t")
+
+
+@pytest.mark.parametrize(
+    ("record_type", "ref_model"),
+    [(InputSampleIdentifiers, BiosampleRef), (ProjectIdentifiers, StudyRef)],
+)
+def test__ref_from_record_fields_match_ref_fields(record_type, ref_model):
+    """Tests the case where a library identifier record's fields, renamed, are
+    compared to its ref's: every record field has a ref field and vice versa."""
+    renamed = {_RECORD_FIELD_RENAMES.get(f, f) for f in record_type._fields}
+    assert renamed == set(ref_model.model_fields)
+
+
+@pytest.mark.parametrize(
+    ("record", "entity", "expected"),
+    [
+        (
+            InputSampleIdentifiers(
+                biosample_accession="SAMN1",
+                ena_sample_accession="ERS1",
+                biosample_export_entity_id="QB1",
+                matrix_tube_id="0363157924",
+            ),
+            "biosample",
+            BiosampleRef(
+                biosample_accession="SAMN1",
+                ena_sample_accession="ERS1",
+                export_entity_id="QB1",
+                matrix_tube_id="0363157924",
+            ),
+        ),
+        (
+            ProjectIdentifiers(
+                bioproject_accession="PRJNA1",
+                ena_study_accession="PRJEB1",
+                study_export_entity_id="QS1",
+            ),
+            "primary_project",
+            StudyRef(
+                bioproject_accession="PRJNA1", ena_study_accession="PRJEB1", export_entity_id="QS1"
+            ),
+        ),
+    ],
+)
+def test__ref_from_record(record, entity, expected):
+    """Tests the case where every field of a record is set: each value lands on
+    the ref field of the same meaning."""
+    ref = _ref_from_record(record, type(expected), sample_idx=1, entity=entity)
+    assert ref == expected
+
+
+def test_sample_refs():
+    """Tests the case where a sample's biosample is named only by export ID and
+    its projects by one or two identifiers: absent identifiers stay unset."""
+    info = PlatformSampleInfo(
+        sample_idx=1,
+        sample_type="control blank",
+        biosample=InputSampleIdentifiers(
+            biosample_accession=None,
+            ena_sample_accession=None,
+            biosample_export_entity_id="QB1",
+            matrix_tube_id=None,
+        ),
+        primary_project=ProjectIdentifiers(
+            bioproject_accession="PRJNA1", ena_study_accession=None, study_export_entity_id="QS1"
+        ),
+        secondary_projects=(
+            ProjectIdentifiers(
+                bioproject_accession=None, ena_study_accession=None, study_export_entity_id="QS2"
+            ),
+            ProjectIdentifiers(
+                bioproject_accession="PRJNA3", ena_study_accession=None, study_export_entity_id=None
+            ),
+        ),
+        kind_row=None,
+    )
+    expected = SampleRefs(
+        biosample=BiosampleRef(export_entity_id="QB1"),
+        primary_project=StudyRef(bioproject_accession="PRJNA1", export_entity_id="QS1"),
+        secondary_projects=(
+            StudyRef(export_entity_id="QS2"),
+            StudyRef(bioproject_accession="PRJNA3"),
+        ),
+    )
+    assert sample_refs(info) == expected
+
+
+def test_sample_refs_overlong_identifier(overlong_tube_id, overlong_tube_message):
+    """Tests the case where a library record carries an identifier longer than its
+    ref allows: the refusal names the sample, the entity and the field."""
+    info = PlatformSampleInfo(
+        sample_idx=7,
+        sample_type="standard",
+        biosample=InputSampleIdentifiers(
+            biosample_accession=None,
+            ena_sample_accession=None,
+            biosample_export_entity_id=None,
+            matrix_tube_id=overlong_tube_id,
+        ),
+        primary_project=ProjectIdentifiers(
+            bioproject_accession="PRJNA1", ena_study_accession=None, study_export_entity_id=None
+        ),
+        secondary_projects=(),
+        kind_row=None,
+    )
+    with pytest.raises(ValueError) as exc_info:
+        sample_refs(info)
+    assert str(exc_info.value) == f"sample_idx 7: {overlong_tube_message}"
+
+
+@pytest.mark.parametrize("value", _BLANK_OR_PADDED_VALUES)
+@pytest.mark.parametrize(("table", "column"), _IDENTIFIER_COLUMNS)
+def test_sample_refs_never_reads_a_blank_or_padded_identifier(
+    build_case5_preflight, table, column, value
+):
+    """Tests the case where a blank or padded value is written to an identifier
+    column: the pre-flight refuses to store it, so no ref is built from one."""
+    conn = sqlite3.connect(build_case5_preflight())
+    try:
+        with pytest.raises(sqlite3.IntegrityError, match="CHECK constraint failed"):
+            conn.execute(f"UPDATE {table} SET {column} = ?", (value,))
+    finally:
+        conn.close()
 
 
 def test_amplicon_barcode_keys_on_prepped_sample_idx(build_amplicon_preflight):
@@ -79,15 +219,6 @@ def test_cli_and_server_amplicon_readers_agree(build_amplicon_preflight, barcode
             " WHERE rowid = (SELECT min(rowid) FROM amplicon_sample)",
             "carries no Golay barcode",
         ),
-        (
-            "UPDATE input_sample SET biosample_accession = ''"
-            " WHERE rowid = (SELECT min(rowid) FROM input_sample)",
-            "carries no biosample_accession",
-        ),
-        (
-            "UPDATE project SET bioproject_accession = ''",
-            "no primary bioproject",
-        ),
         ("DELETE FROM amplicon_sample", "no amplicon_sample rows"),
     ],
 )
@@ -101,13 +232,21 @@ def test_amplicon_samples_refuse_what_the_cli_refuses(build_amplicon_preflight, 
     conn.close()
     with pytest.raises(AmpliconPreflightError, match=message):
         amplicon_barcode_from_blob(db.read_bytes())
+    with pytest.raises(RaisingParser.Error, match=message):
+        _read_amplicon_preflight_rows(db, RaisingParser())
 
-    class _Parser:
-        def error(self, msg):
-            raise RuntimeError(msg)
 
-    with pytest.raises(RuntimeError, match=message):
-        _read_amplicon_preflight_rows(db, _Parser())
+def test_amplicon_samples_overlong_identifier(
+    build_amplicon_preflight, set_overlong_matrix_tube_ids, overlong_tube_message
+):
+    """Tests the case where a sample's identifier is longer than its ref allows: the
+    server refuses it as pre-flight content, and the CLI with the same message."""
+    db = build_amplicon_preflight()
+    set_overlong_matrix_tube_ids(db)
+    with pytest.raises(AmpliconPreflightError, match=overlong_tube_message):
+        amplicon_barcode_from_blob(db.read_bytes())
+    with pytest.raises(RaisingParser.Error, match=overlong_tube_message):
+        _read_amplicon_preflight_rows(db, RaisingParser())
 
 
 def test_amplicon_samples_refuse_a_non_amplicon_preflight(build_case5_preflight):
@@ -116,13 +255,12 @@ def test_amplicon_samples_refuse_a_non_amplicon_preflight(build_case5_preflight)
         amplicon_barcode_from_blob(build_case5_preflight().read_bytes())
 
 
-def test_amplicon_barcode_raises_on_missing_accession(build_amplicon_preflight):
-    """`get_amplicon_sample_info` REQUIRES the accessioned state, so the barcode
-    lookup asks for the same pre-flight the submission does. The accessor's
-    "missing required accession" is surfaced as `AmpliconPreflightError` (bad
-    pre-flight content), not a bare `ValueError` that "not a SQLite file" also is."""
+def test_amplicon_barcode_raises_on_missing_identifier(build_amplicon_preflight):
+    """Tests the case where no biosample or project carries an identifier: the
+    accessor's "missing required identifier" is surfaced as `AmpliconPreflightError`
+    (bad pre-flight content), not a bare `ValueError` that "not a SQLite file" also is."""
     blob = build_amplicon_preflight(populate_accessions=False).read_bytes()
-    with pytest.raises(AmpliconPreflightError, match="missing required accession"):
+    with pytest.raises(AmpliconPreflightError, match="missing required identifier"):
         amplicon_barcode_from_blob(blob)
 
 

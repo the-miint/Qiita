@@ -6,13 +6,11 @@ reader, verbatim, under `genomes_dir/<MYLOASM_RAW_DIR>/<table>.parquet`
 (`workflows/long-read-assembly/myloasm_provenance.py`). The tables, the lake shape
 and why `contig_num` is a per-run key are `qiita_common.myloasm_constants`.
 
-Two lookups the caller supplies, as TEMP TABLEs, because they come from different
-places depending on how the run was made:
+Two lookups the caller supplies, as TEMP TABLEs:
 
 - `READ_NAME_TABLE (read_id VARCHAR, sequence_idx BIGINT)`: every read name the
-  dump uses -> its `sequence_idx`. A run whose assembler input was named by
-  `sequence_idx` builds it with `read_names_from_sequence_idx`; an earlier run's
-  tree, named by the sequencer's `read_id`, needs a lookup against the lake.
+  dump uses -> its `sequence_idx`. The assembler input names each read by its
+  `sequence_idx`, so the caller builds it with `read_names_from_sequence_idx`.
 - `CONTIG_FEATURE_TABLE (contig_id VARCHAR, feature_idx BIGINT)`: each primary
   contig's minted `feature_idx`, keyed on myloasm's `u<N>ctg` name. A repeated
   identical pair is allowed (the transform deduplicates); two different
@@ -81,8 +79,8 @@ def staging_paths(staging_dir: Path) -> dict[str, Path]:
 
 def register_raw_tables(conn: duckdb.DuckDBPyConnection, raw_dir: Path) -> None:
     """Register the dump's six Parquets as `raw_<table>` views, and every read name
-    they use as one distinct list. All six are required: the dump writes all six
-    for every myloasm run, so a missing one is a broken dump."""
+    they use as one distinct list, `_RAW_READ_NAMES`. All six are required: the dump
+    writes all six for every myloasm run, so a missing one is a broken dump."""
     for table in MYLOASM_TABLES:
         path = raw_dir / f"{table}.parquet"
         if not path.is_file():
@@ -122,6 +120,8 @@ def read_names_from_sequence_idx(conn: duckdb.DuckDBPyConnection) -> None:
 
 
 def _require_none(conn: duckdb.DuckDBPyConnection, sql: str, message: str) -> None:
+    """Raise `ValueError(message: <rows>)` if `sql` returns any row, quoting the
+    first few."""
     rows = conn.execute(f"{sql} LIMIT {_SHOWN}").fetchall()
     if rows:
         shown = [r[0] if len(r) == 1 else r for r in rows]

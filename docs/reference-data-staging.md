@@ -64,6 +64,8 @@ Newick format. Tip names must match identifiers in the sequences file.
 ### placements
 jplace format (Matsen et al. 2012). Placement edges reference the backbone phylogeny.
 
+The loader takes one name and one location per placement, with `fields` in the order `edge_num, likelihood, like_weight_ratio, distal_length, pendant_length`, and refuses any other shape, since the jplace reader would otherwise drop or misread the rest. Every placed fragment must be a sequence identifier from the sequences file and be placed once, and every `edge_num` must be an edge of the jplace's own tree. That tree must number every edge as `{N}`; a tree that writes them `[N]` is refused. A backbone phylogeny loaded alongside must be the jplace's own tree, with the same `{N}` edge numbers, tip names and branch lengths, so extract the jplace's `tree` string unchanged rather than rounding or rescaling it. Anything else fails the load.
+
 ### genome_mapping
 Tab-separated, three columns: `feature_id<TAB>genome_source<TAB>genome_source_id`. Maps sequence identifiers to external genome accessions. `genome_source` is one of: `genbank`, `refseq`, `collaborator`, `qiita`. `genome_source_id` is the external accession.
 
