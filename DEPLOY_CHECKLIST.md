@@ -35,6 +35,7 @@ _None yet._
 ### 3. Migrations
 
 - `[operator]` (#855) `make migrate` applies `20261110000000_block_rearmed_at.sql` (nullable `rearmed_at` on `qiita.block`, which `rerun-block` sets and abandon-plan reads; no row changes).
+- `[operator]` (#feat/sample-field-exception) `make migrate` applies `20261112000000_field_exception_excludes_unique_in_study.sql` (triggers that keep a value-level exception off `unique_in_study` fields; no row changes).
 
 ### 4. Deploy
 
@@ -60,6 +61,7 @@ _None yet._
 ### Notes (no host action)
 
 - (#851) The data plane no longer updates or creates `qiita_lake.registration_lock`; the existing table stays in the catalog, unused.
+- (#feat/sample-field-exception) New study-admin routes `GET`/`PUT`/`DELETE /study/{S}/biosample/{B}/field-exception/{F}` and `.../sequenced-sample/{SS}/field-exception/{F}` (CLI `qiita biosample|sequenced-sample get-/set-/clear-field-exception`). Soft contract change: a field `PATCH` declaring `unique_in_study` now answers 409 when value-level exceptions are set on the field.
 - (#849) `qiita-admin backfill myloasm-provenance` is removed, with the `myloasm-provenance-recover` workflow and job: every myloasm run of long-read-assembly 1.0.0/1.0.1 is recovered.
 - (#840) `POST /biosample/resolve-roster` takes a new, incompatible row shape (nested `biosample` / `primary_project` / `secondary_projects` refs); a `qiita` CLI installed before this deploy gets a 422 from `submit-bcl-convert`, `submit-pacbio-ingest` and `submit-golay-demux` until it is upgraded.
 - (#840) Deploy this before kl-metapool moves to the kl-run-preflight release that adds export IDs: Qiita refuses a pre-flight written against a newer schema than the one it ships, so a pre-flight from the new kl-metapool fails every submit until this is live.

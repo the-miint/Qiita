@@ -1581,10 +1581,20 @@ async def _resolve_field_exception_target(
     return _FieldExceptionTarget(slot=slot, field=field, linked_slot_empty=value_study_idx is None)
 
 
-def _no_field_exception(noun: str, entity_idx: int, display_name: str) -> HTTPException:
-    return HTTPException(
+def _raise_no_field_exception(noun: str, entity_idx: int, display_name: str) -> NoReturn:
+    raise HTTPException(
         status_code=404,
         detail=f"no exception is set on {noun} field {display_name!r} of {noun} {entity_idx}",
+    )
+
+
+def _raise_field_exception_already_set(noun: str, display_name: str) -> NoReturn:
+    raise HTTPException(
+        status_code=428,
+        detail=(
+            f"{noun} field {display_name!r} already carries an exception on this {noun};"
+            " replacing it needs If-Match"
+        ),
     )
 
 
@@ -1633,7 +1643,7 @@ async def read_and_map_field_exception(
     )
     row = await fetch_field_exception(conn, spec=spec, slot=target.slot)
     if row is None:
-        raise _no_field_exception(noun, entity_idx, target.field["display_name"])
+        _raise_no_field_exception(noun, entity_idx, target.field["display_name"])
     return _map_field_exception(row, slot=target.slot)
 
 
@@ -1701,16 +1711,9 @@ async def put_and_map_field_exception(
         )
 
     existing = await fetch_field_exception(conn, spec=spec, slot=target.slot, for_update=True)
-    already_set = HTTPException(
-        status_code=428,
-        detail=(
-            f"{noun} field {display_name!r} already carries an exception on this {noun};"
-            " replacing it needs If-Match"
-        ),
-    )
     if if_match is None:
         if existing is not None:
-            raise already_set
+            _raise_field_exception_already_set(noun, display_name)
         try:
             row = await insert_field_exception(
                 conn,
@@ -1726,12 +1729,13 @@ async def put_and_map_field_exception(
                 _raise_exception_on_unique_field(noun, display_name)
             raise
         if row is None:
-            raise already_set
+            # A concurrent create committed first.
+            _raise_field_exception_already_set(noun, display_name)
         response, etag = _map_field_exception(row, slot=target.slot)
         return response, etag, True
 
     if existing is None:
-        raise _no_field_exception(noun, entity_idx, display_name)
+        _raise_no_field_exception(noun, entity_idx, display_name)
     require_etag_match(
         existing, if_match=if_match, label=f"{noun} field exception", row_idx=study_field_idx
     )
@@ -1784,7 +1788,7 @@ async def delete_field_exception_or_raise(
     )
     existing = await fetch_field_exception(conn, spec=spec, slot=target.slot, for_update=True)
     if existing is None:
-        raise _no_field_exception(noun, entity_idx, target.field["display_name"])
+        _raise_no_field_exception(noun, entity_idx, target.field["display_name"])
     require_etag_match(
         existing, if_match=if_match, label=f"{noun} field exception", row_idx=study_field_idx
     )
