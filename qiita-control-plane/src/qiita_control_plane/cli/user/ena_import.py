@@ -1,9 +1,9 @@
-"""`qiita submit-ena-import` / `qiita ena-import-status` — batch ENA import.
+"""`qiita submit-ena-import` / `ena-import-status` / `ena-import-list` — batch ENA import.
 
 `submit-ena-import` POSTs a list of INSDC study or run accessions (positional, or one
 per line via `--from-file`) and by default watches the batch to terminal;
-`ena-import-status` reads a batch's current per-item status. Both require
-wet_lab_admin or system_admin (the route's own gate).
+`ena-import-status` reads a batch's current per-item status; `ena-import-list` lists
+batches. All require wet_lab_admin or system_admin.
 """
 
 from __future__ import annotations
@@ -14,6 +14,7 @@ import json
 import sys
 import time
 from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +30,17 @@ from qiita_common.models.ena_import import TERMINAL_BATCH_ITEM_STATES, BatchItem
 from .. import _common
 
 _FAILED_STATES = (BatchItemState.FAILED, BatchItemState.COMPLETED_PARTIAL)
+# A proxy answering in place of the control plane, which may have committed the batch.
+_GATEWAY_STATUSES = frozenset({502, 503, 504})
+
+
+def _uncertain_batch_hint(started: datetime) -> str:
+    # Backed off so a client clock ahead of the server's still covers created_at.
+    since = (started - timedelta(minutes=1)).isoformat(timespec="seconds").replace("+00:00", "Z")
+    return (
+        "a batch may still have been created; list it with"
+        f" `qiita ena-import-list --mine --since {since}`"
+    )
 
 
 def _read_accessions_from_file(path: Path) -> list[str]:
@@ -251,6 +263,7 @@ def _handle_submit_ena_import(args: argparse.Namespace, parser: argparse.Argumen
         submitted_idx.append(batch_idx)
         _announce(batch_idx)
 
+    started = datetime.now(UTC)
     try:
         result = asyncio.run(
             _run_submit_ena_import(
@@ -271,12 +284,21 @@ def _handle_submit_ena_import(args: argparse.Namespace, parser: argparse.Argumen
             )
         else:
             print(
-                "interrupted before the server answered; a batch may still have been created",
+                f"interrupted before the server answered; {_uncertain_batch_hint(started)}",
                 file=sys.stderr,
             )
         return 130
+    except (_httpx.ReadTimeout, _httpx.ReadError, _httpx.RemoteProtocolError) as exc:
+        print(
+            f"error: the submit was sent but no response came back ({exc!r});"
+            f" {_uncertain_batch_hint(started)}",
+            file=sys.stderr,
+        )
+        return 1
     except _httpx.HTTPStatusError as exc:
         _common.print_http_status_error(exc.response)
+        if not submitted_idx and exc.response.status_code in _GATEWAY_STATUSES:
+            print(_uncertain_batch_hint(started), file=sys.stderr)
         return 1
     except _httpx.RequestError as exc:
         _common.print_request_error(exc)
@@ -304,4 +326,14 @@ def _handle_ena_import_status(args: argparse.Namespace, parser: argparse.Argumen
     read succeeded; the caller inspects each item's `state`."""
     return _common.run_http_subcommand(
         lambda t: _get_ena_import_batch(args.base_url, t, args.ena_import_batch_idx)
+    )
+
+
+def _handle_ena_import_list(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    """List batches, newest first."""
+    params = _common.filter_params(
+        submitted_by="me" if args.mine else None, since=args.since, limit=args.limit
+    )
+    return _common.run_http_subcommand(
+        lambda t: _common.call("GET", args.base_url, t, PATH_ENA_IMPORT_BATCH_PREFIX, params=params)
     )

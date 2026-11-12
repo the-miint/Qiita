@@ -8,11 +8,12 @@ use arrow_flight::Action;
 use tonic::{Response, Status};
 
 use crate::auth;
+use crate::lake_locks::LakeLocks;
 use crate::pool::LakeWriter;
 
 use super::export::validate_export_dest;
 use super::query::block_read_where_clause;
-use super::registration::{sql_i64_list, take_registration_lock, transact_with_retry};
+use super::registration::{sql_i64_list, transact_with_retry};
 use super::QiitaFlightService;
 
 impl QiitaFlightService {
@@ -24,11 +25,13 @@ impl QiitaFlightService {
             .verify_action_payload(action, auth::verify_delete_reference, |p| p.action.as_str())?;
 
         let reference_idx = payload.reference_idx;
-        let deleted = self
-            .blocking_lake_write("delete_reference", move |conn| {
-                delete_reference(conn, reference_idx)
-            })
-            .await?;
+        let pool = std::sync::Arc::clone(&self.pool);
+        let locks = std::sync::Arc::clone(&self.lake_locks);
+        let deleted = tokio::task::spawn_blocking(move || {
+            locked_delete_reference(&locks, &|| pool.checkout_for_write(), reference_idx)
+        })
+        .await
+        .map_err(|e| Status::internal(format!("delete_reference task join failed: {e}")))??;
 
         Self::action_response(&deleted)
     }
@@ -171,6 +174,22 @@ impl QiitaFlightService {
     }
 }
 
+/// `delete_reference` as a writer of replace-keyed tables: it holds the global
+/// lake lock exclusively (`crate::lake_locks`), taken before it checks out a
+/// writer, so the wait holds no pooled connection.
+pub(super) fn locked_delete_reference<W: std::borrow::Borrow<LakeWriter>>(
+    locks: &LakeLocks,
+    checkout: &dyn Fn() -> Result<W, Status>,
+    reference_idx: i64,
+) -> Result<serde_json::Value, Status> {
+    let mut session = locks.session(&format!(
+        "the reference delete reference_idx={reference_idx}"
+    ))?;
+    session.lock_global()?;
+    // `session` holds the lock until it is dropped, after the delete returns.
+    delete_reference(checkout()?.borrow(), reference_idx)
+}
+
 /// Delete every DuckLake row belonging to a reference.
 ///
 /// Scoping rules mirror the identifier hierarchy:
@@ -242,9 +261,9 @@ fn delete_reference(conn: &LakeWriter, reference_idx: i64) -> Result<serde_json:
     let counts = transact_with_retry(
         conn,
         "the reference delete",
+        &format!("reference_idx={reference_idx}"),
         reference_idx,
-        || {
-            take_registration_lock(conn)?;
+        |_attempt| {
             let sequences_deleted = exec(
                 &format!("DELETE FROM qiita_lake.reference_sequences WHERE {orphan_filter}"),
                 &[reference_idx, reference_idx, reference_idx, reference_idx],
@@ -278,15 +297,18 @@ fn delete_reference(conn: &LakeWriter, reference_idx: i64) -> Result<serde_json:
                 "DELETE FROM qiita_lake.reference_annotation WHERE reference_idx = ?",
                 &[reference_idx],
             )?;
-            Ok(serde_json::json!({
-                "sequences_deleted": sequences_deleted,
-                "chunks_deleted": chunks_deleted,
-                "membership_deleted": membership_deleted,
-                "taxonomy_deleted": taxonomy_deleted,
-                "phylogeny_deleted": phylogeny_deleted,
-                "placements_deleted": placements_deleted,
-                "annotations_deleted": annotations_deleted,
-            }))
+            Ok((
+                serde_json::json!({
+                    "sequences_deleted": sequences_deleted,
+                    "chunks_deleted": chunks_deleted,
+                    "membership_deleted": membership_deleted,
+                    "taxonomy_deleted": taxonomy_deleted,
+                    "phylogeny_deleted": phylogeny_deleted,
+                    "placements_deleted": placements_deleted,
+                    "annotations_deleted": annotations_deleted,
+                }),
+                String::new(),
+            ))
         },
         |_| {
             // The deletes commit together, so none of the reference's rows left in

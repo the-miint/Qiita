@@ -362,14 +362,14 @@ URL_UPLOAD_DONE = f"{URL_UPLOAD_PREFIX}{PATH_UPLOAD_DONE}"
 # =============================================================================
 # /ena-import-batch/* — batch multi-study ENA import driver
 # =============================================================================
-# POST accepts a list of INSDC study accessions and returns a batch handle
+# POST accepts a list of INSDC study or run accessions and returns a batch handle
 # immediately (202); the resolve+register+download-submit work runs in a
 # background task (qiita_control_plane.ena_import.batch). GET polls the
-# per-item rolled-up state. ADMIN-only (wet_lab_admin / system_admin) — see
-# routes/ena_import.py.
+# per-item rolled-up state; GET on the prefix lists batches. ADMIN-only
+# (wet_lab_admin / system_admin) — see routes/ena_import.py.
 
 PATH_ENA_IMPORT_BATCH_PREFIX = "/ena-import-batch"
-PATH_ENA_IMPORT_BATCH_ROOT = ""  # POST (submit) against the prefix itself
+PATH_ENA_IMPORT_BATCH_ROOT = ""  # POST (submit) and GET (list) against the prefix itself
 PATH_ENA_IMPORT_BATCH_BY_IDX = "/{ena_import_batch_idx}"
 
 URL_ENA_IMPORT_BATCH_PREFIX = f"{API_PREFIX}{PATH_ENA_IMPORT_BATCH_PREFIX}"
@@ -966,8 +966,9 @@ PATH_BIOSAMPLE_LOOKUP_BY_ACCESSION = "/lookup-by-accession"
 # Bulk lookup of biosample_idx by matrix_tube_id; same body-vs-querystring
 # rationale as the accession variant.
 PATH_BIOSAMPLE_LOOKUP_BY_MATRIX_TUBE_ID = "/lookup-by-matrix-tube-id"
-# Resolve a pool roster (one row per pool sample: a matrix tube or accessions) to
-# biosample_idx + study links in one round trip; 422 lists every row's problem.
+# Resolve a pool roster (one row per pool item, naming its biosample and projects by
+# their identifiers) to biosample_idx + study links in one round trip; 422 lists
+# every row's problem.
 PATH_BIOSAMPLE_RESOLVE_ROSTER = "/resolve-roster"
 
 URL_BIOSAMPLE_BY_STUDY = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_BY_STUDY}"

@@ -1,132 +1,111 @@
-"""Resolve a pool roster to biosamples and studies, by matrix tube or accession.
-
-A row carrying a matrix tube resolves by the tube: tubes are unique across
-Qiita (`qiita.biosample.matrix_tube_id` is UNIQUE), so the tube alone names the
-biosample, and its study comes from the biosample's active study links. A
-project accession on such a row is a cross-check, not the key. A row without a
-tube resolves by biosample and project accession, through the same repository
-reads the accession lookup routes use.
+"""Resolve a pool roster to biosamples and studies by their external identifiers.
 
 Every problem across the roster is collected before anything is refused, so
 one response names them all. `classify_roster` holds the rules and is pure;
 `fetch_roster_facts` gathers what it needs in a fixed number of queries.
 """
 
-from dataclasses import dataclass
+from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass, field
 
 import asyncpg
 from qiita_common.models import (
+    BiosampleRef,
     RosterProblem,
     RosterResolvedRow,
     RosterResolveRow,
+    StudyRef,
     normalize_matrix_tube_id,
 )
 
 from qiita_control_plane.repositories.biosample import (
+    BiosampleLookupKey,
     fetch_active_study_links,
-    fetch_biosample_identity_by_tube,
     fetch_biosample_idxs_by_natural_key,
 )
-from qiita_control_plane.repositories.study import fetch_study_idxs_by_accession
+from qiita_control_plane.repositories.exported_entity import EntityKind
+from qiita_control_plane.repositories.study import StudyLookupKey, fetch_study_idxs_by_natural_key
+
+
+@dataclass(frozen=True)
+class _RefSpec:
+    """How one kind of entity is resolved from a ref whose fields are lookup keys."""
+
+    noun: EntityKind
+    ref_model: type[BiosampleRef] | type[StudyRef]
+    fetch: Callable[..., Awaitable[dict[str, int]]]
+    normalizers: Mapping[str, Callable[[str], str]] = field(default_factory=dict)
+    miss_messages: Mapping[str, str] = field(default_factory=dict)
+
+
+_BIOSAMPLE_SPEC = _RefSpec(
+    noun="biosample",
+    ref_model=BiosampleRef,
+    fetch=fetch_biosample_idxs_by_natural_key,
+    normalizers={"matrix_tube_id": normalize_matrix_tube_id},
+    miss_messages={"matrix_tube_id": "no {noun} has {label}; register it before submitting"},
+)
+_STUDY_SPEC = _RefSpec(noun="study", ref_model=StudyRef, fetch=fetch_study_idxs_by_natural_key)
 
 
 @dataclass(frozen=True)
 class RosterFacts:
     """What the database knows about a roster's identifiers.
 
-    `by_tube` maps a normalized tube to (biosample_idx, biosample_accession);
-    `study_links` maps a biosample_idx to its active study_idxs, ascending.
-    Only non-retired biosamples appear.
+    Each `*_by_key` maps a lookup key to {normalized value: idx}; `study_links`
+    maps a biosample_idx to its active study_idxs, ascending. Only non-retired
+    biosamples appear.
     """
 
-    by_tube: dict[str, tuple[int, str | None]]
-    by_biosample_accession: dict[str, int]
-    by_study_accession: dict[str, int]
+    biosample_by_key: dict[BiosampleLookupKey, dict[str, int]]
+    study_by_key: dict[StudyLookupKey, dict[str, int]]
     study_links: dict[int, list[int]]
 
 
-def _normalized_tube(row: RosterResolveRow) -> str | None:
-    """The row's tube in stored form, or None if absent or malformed."""
-    if row.matrix_tube_id is None:
-        return None
-    try:
-        return normalize_matrix_tube_id(row.matrix_tube_id)
-    except ValueError:
-        return None
+@dataclass(frozen=True)
+class _Resolved:
+    idx: int
+    description: str
 
 
-def _resolve_biosample(
-    row: RosterResolveRow, facts: RosterFacts, problems: list[str]
-) -> int | None:
-    """The row's biosample_idx, or None after appending why to `problems`."""
-    if row.matrix_tube_id is None:
-        if row.biosample_accession is None:
-            problems.append("row carries neither a matrix tube nor a biosample accession")
-            return None
-        biosample_idx = facts.by_biosample_accession.get(row.biosample_accession)
-        if biosample_idx is None:
-            problems.append(f"no biosample has accession {row.biosample_accession!r}")
-        return biosample_idx
-
-    try:
-        tube = normalize_matrix_tube_id(row.matrix_tube_id)
-    except ValueError as exc:
-        problems.append(str(exc))
-        return None
-    # A tube may repeat across rows: each is a technical replicate — a second
-    # prep_sample of the one biosample the tube names — and resolves to the same
-    # biosample_idx, exactly as a repeated biosample accession does. The rows
-    # stay distinct downstream by their sequenced_pool_item_id, not the tube.
-    if tube not in facts.by_tube:
-        problems.append(f"no biosample has matrix tube {tube}; register it before submitting")
-        return None
-    biosample_idx, registered = facts.by_tube[tube]
-    if row.biosample_accession is not None and row.biosample_accession != registered:
-        held = "no accession" if registered is None else f"accession {registered!r}"
-        problems.append(
-            f"matrix tube {tube} belongs to a biosample with {held},"
-            f" not {row.biosample_accession!r}"
-        )
-        return None
-    return biosample_idx
+def _normalize(spec: _RefSpec, key: str, raw: str) -> str:
+    normalizer = spec.normalizers.get(key)
+    return raw if normalizer is None else normalizer(raw)
 
 
-def _resolve_primary_study(
-    row: RosterResolveRow, biosample_idx: int | None, facts: RosterFacts, problems: list[str]
-) -> int | None:
-    """The row's primary study_idx, or None after appending why to `problems`.
-
-    A named project accession must exist, and on a tube row must name one of the
-    biosample's studies. With none named, the biosample's one active study is used.
-    """
-    biosample = (
-        f"the biosample with matrix tube {_normalized_tube(row)}"
-        if row.matrix_tube_id is not None
-        else f"biosample {row.biosample_accession}"
-    )
-    links = facts.study_links.get(biosample_idx, []) if biosample_idx is not None else []
-    accession = row.primary_project_accession
-    if accession is not None:
-        study_idx = facts.by_study_accession.get(accession)
-        if study_idx is None:
-            problems.append(f"no study has accession {accession!r}")
-            return None
-        if row.matrix_tube_id is not None and biosample_idx is not None and study_idx not in links:
-            problems.append(f"{biosample} is not in study {accession}")
-            return None
-        return study_idx
-    if biosample_idx is None:
+def _resolve_ref(
+    ref: BiosampleRef | StudyRef,
+    spec: _RefSpec,
+    by_key: Mapping[str, dict[str, int]],
+    problems: list[str],
+) -> _Resolved | None:
+    """The entity every identifier on `ref` names, or None after appending why
+    to `problems`."""
+    problem_count = len(problems)
+    hits: dict[str, int] = {}
+    for key in spec.ref_model.model_fields:
+        raw = getattr(ref, key)
+        if raw is None:
+            continue
+        try:
+            value = _normalize(spec, key, raw)
+        except ValueError as exc:
+            problems.append(str(exc))
+            continue
+        label = f"{key} {value!r}"
+        idx = by_key.get(key, {}).get(value)
+        if idx is not None:
+            hits[label] = idx
+        elif key in spec.miss_messages:
+            problems.append(spec.miss_messages[key].format(noun=spec.noun, label=label))
+        else:
+            problems.append(f"no {spec.noun} has {label}")
+    if len(set(hits.values())) > 1:
+        problems.append(f"the identifiers name more than one {spec.noun}: {', '.join(hits)}")
+    if len(problems) > problem_count:
         return None
-    if len(links) == 1:
-        return links[0]
-    if not links:
-        problems.append(f"{biosample} belongs to no active study")
-    else:
-        problems.append(
-            f"{biosample} belongs to {len(links)} studies; name the project's bioproject"
-            " accession to choose one"
-        )
-    return None
+    (idx,) = set(hits.values())
+    return _Resolved(idx=idx, description=f"the {spec.noun} with {' and '.join(hits)}")
 
 
 def classify_roster(
@@ -142,59 +121,76 @@ def classify_roster(
     problems: list[RosterProblem] = []
     for row in rows:
         row_problems: list[str] = []
-        biosample_idx = _resolve_biosample(row, facts, row_problems)
-        primary_study_idx = _resolve_primary_study(row, biosample_idx, facts, row_problems)
-        # Secondary studies are not checked against the biosample's links, on a
-        # tube row as on an accession row: they name the other projects sharing a
-        # control's plate, which the control need not belong to.
-        secondary_study_idxs = []
-        for accession in row.secondary_project_accessions:
-            study_idx = facts.by_study_accession.get(accession)
-            if study_idx is None:
-                row_problems.append(f"no study has accession {accession!r}")
-            else:
-                secondary_study_idxs.append(study_idx)
+        biosample = _resolve_ref(
+            row.biosample, _BIOSAMPLE_SPEC, facts.biosample_by_key, row_problems
+        )
+        studies = [
+            _resolve_ref(project, _STUDY_SPEC, facts.study_by_key, row_problems)
+            for project in (row.primary_project, *row.secondary_projects)
+        ]
+        if biosample is not None:
+            links = facts.study_links.get(biosample.idx, [])
+            for study in studies:
+                if study is not None and study.idx not in links:
+                    row_problems.append(f"{biosample.description} is not in {study.description}")
+
+        # A secondary named by other identifiers can still be the primary's study
+        primary_study, *secondary_studies = studies
+        if primary_study is not None:
+            for study in secondary_studies:
+                if study is not None and study.idx == primary_study.idx:
+                    row_problems.append(f"{study.description} is also the primary project")
 
         if row_problems:
             problems.extend(RosterProblem(item_id=row.item_id, message=m) for m in row_problems)
-        else:
-            assert biosample_idx is not None and primary_study_idx is not None
-            resolved.append(
-                RosterResolvedRow(
-                    item_id=row.item_id,
-                    biosample_idx=biosample_idx,
-                    primary_study_idx=primary_study_idx,
-                    secondary_study_idxs=secondary_study_idxs,
-                )
+            continue
+        assert biosample is not None and primary_study is not None
+        assert None not in secondary_studies
+        resolved.append(
+            RosterResolvedRow(
+                item_id=row.item_id,
+                biosample_idx=biosample.idx,
+                primary_study_idx=primary_study.idx,
+                secondary_study_idxs=[s.idx for s in secondary_studies],
             )
+        )
     return resolved, problems
+
+
+async def _fetch_by_key(
+    conn: asyncpg.Pool | asyncpg.Connection,
+    spec: _RefSpec,
+    refs: list[BiosampleRef] | list[StudyRef],
+) -> dict[str, dict[str, int]]:
+    """{lookup key: {normalized value: idx}} over every identifier on `refs`."""
+    by_key: dict[str, dict[str, int]] = {}
+    for key in spec.ref_model.model_fields:
+        values: set[str] = set()
+        for ref in refs:
+            raw = getattr(ref, key)
+            if raw is None:
+                continue
+            try:
+                values.add(_normalize(spec, key, raw))
+            except ValueError:
+                continue  # classify_roster reports it
+        by_key[key] = await spec.fetch(conn, key=key, values=sorted(values))
+    return by_key
 
 
 async def fetch_roster_facts(
     conn: asyncpg.Pool | asyncpg.Connection, rows: list[RosterResolveRow]
 ) -> RosterFacts:
-    """Gather every fact `classify_roster` needs: one query per identifier
-    kind, then one for the study links of every biosample found."""
-    tubes = sorted({t for t in map(_normalized_tube, rows) if t is not None})
-    biosample_accessions = sorted(
-        {r.biosample_accession for r in rows if r.matrix_tube_id is None and r.biosample_accession}
-    )
-    study_accessions = sorted(
-        {r.primary_project_accession for r in rows if r.primary_project_accession}
-        | {a for r in rows for a in r.secondary_project_accessions}
-    )
-    by_tube = await fetch_biosample_identity_by_tube(conn, tubes)
-    by_biosample_accession = await fetch_biosample_idxs_by_natural_key(
-        conn, key="biosample_accession", values=biosample_accessions
-    )
-    by_study_accession = await fetch_study_idxs_by_accession(conn, values=study_accessions)
-    biosample_idxs = sorted(
-        {idx for idx, _ in by_tube.values()} | set(by_biosample_accession.values())
-    )
+    """Gather every fact `classify_roster` needs: one query per lookup key
+    present, then one for the study links of every biosample found."""
+    biosample_by_key = await _fetch_by_key(conn, _BIOSAMPLE_SPEC, [r.biosample for r in rows])
+    study_refs = [p for r in rows for p in (r.primary_project, *r.secondary_projects)]
+    study_by_key = await _fetch_by_key(conn, _STUDY_SPEC, study_refs)
+    biosample_idxs = sorted({idx for hits in biosample_by_key.values() for idx in hits.values()})
     study_links = await fetch_active_study_links(conn, biosample_idxs)
-    return RosterFacts(
-        by_tube=by_tube,
-        by_biosample_accession=by_biosample_accession,
-        by_study_accession=by_study_accession,
+    facts = RosterFacts(
+        biosample_by_key=biosample_by_key,
+        study_by_key=study_by_key,
         study_links=study_links,
     )
+    return facts

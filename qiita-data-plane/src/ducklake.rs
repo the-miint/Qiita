@@ -69,46 +69,22 @@ const BOOT_SETUP_BUDGET: std::time::Duration = std::time::Duration::from_secs(60
 /// statements), so each takes `CATALOG_SETUP_LOCK_KEY` first and the setups run
 /// one after another.
 ///
-/// The lock is transaction-scoped and taken inside an open DuckDB transaction on
-/// its own attach: measured with DuckDB 1.5.5, the postgres extension keeps one
-/// Postgres connection for the length of a DuckDB transaction, and sends
-/// `DISCARD ALL` (which drops session advisory locks) when a pooled connection is
-/// returned, so a session lock taken through it is released at once. Postgres
-/// releases the lock when the setup commits, or when the process exits and its
-/// connection closes.
+/// The lock is a transaction-scoped advisory lock on a connection of its own
+/// (`crate::lake_locks::open_lock_connection` says how it is held and released).
+/// A session lock would not do: measured with DuckDB 1.5.5, the postgres extension
+/// sends `DISCARD ALL`, which drops session advisory locks, when a pooled
+/// connection is returned, so a session lock taken through it is released at once.
 pub fn setup_catalog(
     catalog_connstr: &str,
     data_path: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    validate_sql_literal(catalog_connstr, "catalog_connstr")?;
-    let lock = Connection::open_in_memory()?;
-    lock.execute_batch(&format!(
-        "LOAD postgres;
-         ATTACH '{catalog_connstr}' AS catalog_setup_lock (TYPE postgres);
-         BEGIN;"
-    ))?;
-    let deadline = std::time::Instant::now() + BOOT_SETUP_BUDGET;
-    loop {
-        let taken: bool = lock.query_row(
-            &format!(
-                "SELECT taken FROM postgres_query('catalog_setup_lock', \
-                 'SELECT pg_try_advisory_xact_lock({CATALOG_SETUP_LOCK_KEY}) AS taken')"
-            ),
-            [],
-            |row| row.get(0),
-        )?;
-        if taken {
-            break;
-        }
-        if std::time::Instant::now() >= deadline {
-            return Err(format!(
-                "another data plane held the catalog setup lock for {}s",
-                BOOT_SETUP_BUDGET.as_secs()
-            )
-            .into());
-        }
-        std::thread::sleep(std::time::Duration::from_millis(200));
-    }
+    let lock = crate::lake_locks::open_lock_connection(catalog_connstr, BOOT_SETUP_BUDGET)?;
+    crate::lake_locks::advisory_lock(&lock, CATALOG_SETUP_LOCK_KEY).map_err(|e| {
+        format!(
+            "waited up to {} s for another data plane's catalog setup lock: {e}",
+            BOOT_SETUP_BUDGET.as_secs()
+        )
+    })?;
     setup_catalog_once(catalog_connstr, data_path)?;
     lock.execute_batch("COMMIT;")?;
     Ok(())
@@ -1115,33 +1091,6 @@ pub fn ensure_amplicon_tables(conn: &Connection) -> Result<(), Box<dyn std::erro
     Ok(())
 }
 
-/// Create the one row the lake writers that take `registration_lock` serialize
-/// on, and seed it.
-///
-/// Why a lock is needed at all, and what it buys, lives where it is taken —
-/// `flight_service::registration::register_files` and
-/// `flight_service::lake_edit::delete_reference`, both through `take_registration_lock`.
-/// What matters here is the shape: EXACTLY ONE
-/// row, holding a value nothing reads. `take_registration_lock` fails loudly if
-/// its UPDATE matches no row, because a lock that silently stopped locking
-/// reintroduces the duplication this table exists to prevent.
-///
-/// The seeding INSERT is guarded so a restart does not add a second row. Two data
-/// planes booting together could still both insert; that degrades nothing — an
-/// extra row is one more thing every writer updates, so they still contend.
-pub fn ensure_registration_lock(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
-    conn.execute_batch(
-        "-- One row, ever. `epoch` is a bump counter, not a timestamp: it is never
-        -- read, and it is a counter rather than a constant only so the UPDATE that
-        -- takes the lock is a real mutation.
-        CREATE TABLE IF NOT EXISTS qiita_lake.registration_lock (epoch BIGINT NOT NULL);
-
-        INSERT INTO qiita_lake.registration_lock (epoch)
-        SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM qiita_lake.registration_lock);",
-    )?;
-    Ok(())
-}
-
 /// The most rows one INSERT into `registered_file` keeps inline in the catalog
 /// rather than writing to a Parquet file of its own. DuckLake applies
 /// `data_inlining_row_limit` per statement, with a default of 10. An INSERT per
@@ -1191,10 +1140,9 @@ pub fn ensure_registered_file_table(conn: &Connection) -> Result<(), Box<dyn std
 /// of the same rows left inline.
 ///
 /// A flush never failed beside registrations committing, so it is safe while
-/// other data planes serve. Lock-free registrations lost no COMMIT to it; for
-/// registrations taking `registration_lock`, a flush running back to back raised
-/// the lost COMMITs from about 22 to 27 of 40, which their retry absorbs, and a
-/// boot flushes once. (DuckDB 2.0.0, ducklake 417a9117.)
+/// other data planes serve. Registrations that only inserted lost no COMMIT to it
+/// (DuckDB 2.0.0, ducklake 417a9117); one that loses a COMMIT to it retries, and
+/// a boot flushes once.
 fn flush_registered_file(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
     conn.execute_batch(
         "CALL ducklake_flush_inlined_data('qiita_lake', table_name => 'registered_file');",
@@ -1212,8 +1160,6 @@ pub fn ensure_lake_tables(conn: &Connection) -> Result<(), Box<dyn std::error::E
     ensure_assembly_tables(conn)?;
     ensure_myloasm_tables(conn)?;
     ensure_amplicon_tables(conn)?;
-    // The lock row is seeded here so no request path has to create it.
-    ensure_registration_lock(conn)?;
     ensure_registered_file_table(conn)?;
     // Must run after reference + alignment tables — the `_visible` views join them.
     ensure_exclusion_tables(conn)?;

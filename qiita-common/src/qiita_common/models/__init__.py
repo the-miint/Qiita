@@ -110,6 +110,7 @@ from qiita_common.models.biosample import (
     BiosampleLookupByMatrixTubeIdResponse,
     BiosampleMetadataWriteByUniqueFieldResponse,
     BiosamplePatchRequest,
+    BiosampleRef,
     BiosampleResponse,
     BiosampleStudyFieldCreateRequest,
     BiosampleStudyFieldResponse,
@@ -140,6 +141,7 @@ from qiita_common.models.biosample import (
     StudyListResponse,
     StudyLookupByAccessionRequest,
     StudyLookupByAccessionResponse,
+    StudyRef,
     StudyScopedBiosampleResponse,
     TerminologyTermRef,
     derive_metadata_field_scope,
@@ -153,9 +155,11 @@ from qiita_common.models.ena import (
 from qiita_common.models.ena_import import (
     TERMINAL_BATCH_ITEM_STATES,
     BatchImportItem,
+    BatchImportListResponse,
     BatchImportRequest,
     BatchImportResponse,
     BatchImportStatus,
+    BatchImportSummary,
     BatchItemState,
 )
 from qiita_common.models.health import HealthResponse, HealthStatus
@@ -617,6 +621,8 @@ __all__ = [
     "BiosampleLookupByAccessionResponse",
     "BiosampleLookupByMatrixTubeIdRequest",
     "BiosampleLookupByMatrixTubeIdResponse",
+    "BiosampleRef",
+    "StudyRef",
     "RosterResolveRow",
     "RosterResolvedRow",
     "RosterResolveResponse",
@@ -667,9 +673,11 @@ __all__ = [
     # Batch ENA import.
     "TERMINAL_BATCH_ITEM_STATES",
     "BatchImportItem",
+    "BatchImportListResponse",
     "BatchImportRequest",
     "BatchImportResponse",
     "BatchImportStatus",
+    "BatchImportSummary",
     "BatchItemState",
     # Study.
     "StudyCreate",

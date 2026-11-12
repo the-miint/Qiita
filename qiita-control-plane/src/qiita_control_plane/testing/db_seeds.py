@@ -40,7 +40,7 @@ from qiita_common.models import NCBI_TAXONOMY_METAGENOME_TERM_ID as NCBI_TAXONOM
 from qiita_common.models import NCBI_TAXONOMY_NAME as NCBI_TAXONOMY_NAME
 
 from qiita_control_plane.miint import connect_with_miint
-from qiita_control_plane.repositories.exported_entity import ENTITY_COLUMN, EntityKind
+from qiita_control_plane.repositories.exported_entity import EntityKind, entity_idx_column
 from qiita_control_plane.repositories.host_filter_profile import insert_host_filter_profile
 
 from ..repositories._sample_helpers import (
@@ -92,7 +92,7 @@ async def fetch_export_entity_id(
 ) -> str | None:
     """Return the export_entity_id qiita.exported_entity holds for one study or
     biosample, or None when it holds none."""
-    column = ENTITY_COLUMN[kind]
+    column = entity_idx_column(kind)
     export_entity_id = await pool.fetchval(
         f"SELECT export_entity_id FROM qiita.exported_entity WHERE {column} = $1", entity_idx
     )
