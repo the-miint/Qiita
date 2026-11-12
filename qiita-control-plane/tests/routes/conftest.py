@@ -261,6 +261,13 @@ async def no_biosample_write_client(make_pat_client):
 
 
 @pytest_asyncio.fixture
+async def no_biosample_read_client(make_pat_client):
+    """A regular_user PAT with a scope set that EXCLUDES Scope.BIOSAMPLE_READ
+    so the require_scope guard's missing-scope 403 surfaces."""
+    return await make_pat_client(label="bs-no-read", scopes=[Scope.SELF_PROFILE])
+
+
+@pytest_asyncio.fixture
 async def no_prep_sample_write_client(make_pat_client):
     """A regular_user PAT with a scope set that EXCLUDES Scope.PREP_SAMPLE_WRITE
     so the require_scope guard's missing-scope 403 surfaces."""
@@ -942,13 +949,12 @@ _STUDY_SCOPED_SAMPLE_WRITE_AUTHZ: dict[str, tuple[str | None, str | None, str, i
 }
 STUDY_SCOPED_SAMPLE_WRITE_AUTHZ_CASES = tuple(_STUDY_SCOPED_SAMPLE_WRITE_AUTHZ)
 
-# The write rows at the ADMIN floor instead, for linking a sample into a study:
-# a member grant is the case below it.
-_STUDY_SCOPED_SAMPLE_LINK_AUTHZ: dict[str, tuple[str | None, str | None, str, int | None]] = {
+# The write rows at the ADMIN floor instead: a member grant is the case below it.
+_STUDY_SCOPED_SAMPLE_ADMIN_AUTHZ: dict[str, tuple[str | None, str | None, str, int | None]] = {
     **{k: v for k, v in _STUDY_SCOPED_SAMPLE_WRITE_AUTHZ.items() if k != "member_grant"},
     "below_admin_member": ("wet", "member", "user", 403),
 }
-STUDY_SCOPED_SAMPLE_LINK_AUTHZ_CASES = tuple(_STUDY_SCOPED_SAMPLE_LINK_AUTHZ)
+STUDY_SCOPED_SAMPLE_ADMIN_AUTHZ_CASES = tuple(_STUDY_SCOPED_SAMPLE_ADMIN_AUTHZ)
 
 # Path idx for the case whose study does not exist: no sample is seeded, and
 # the study gate answers before anything reads this.
@@ -1025,10 +1031,10 @@ async def assert_study_scoped_sample_write_authz(ctx, *, case: str, **kwargs) ->
     )
 
 
-async def assert_study_scoped_sample_link_authz(ctx, *, case: str, **kwargs) -> None:
-    """Drive one access case of linking a sample into a study (ADMIN floor)."""
+async def assert_study_scoped_sample_admin_authz(ctx, *, case: str, **kwargs) -> None:
+    """Drive one access case of a study-scoped sample route at the ADMIN floor."""
     await _assert_study_scoped_sample_authz(
-        ctx, cases=_STUDY_SCOPED_SAMPLE_LINK_AUTHZ, case=case, **kwargs
+        ctx, cases=_STUDY_SCOPED_SAMPLE_ADMIN_AUTHZ, case=case, **kwargs
     )
 
 

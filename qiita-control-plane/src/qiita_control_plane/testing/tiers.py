@@ -36,3 +36,15 @@ def apply_write_checks(monkeypatch: pytest.MonkeyPatch, write_checks: str) -> No
         monkeypatch.setattr(
             _sample_helpers, "_fetch_keys_restricted_on_entity", _nothing_restricted
         )
+
+
+def skip_field_tier_check(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Switch off the field-tier check that runs before a metadata write,
+    standing in for an admin who raises a field's tier after that check passed:
+    a test cannot place that commit there. A value the caller may not read then
+    reaches the checks that compare stored values."""
+
+    async def _nothing_above(*_args, **_kwargs) -> dict:
+        return {}
+
+    monkeypatch.setattr(_sample_helpers, "fetch_fields_above_tier", _nothing_above)

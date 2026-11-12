@@ -53,7 +53,12 @@ from qiita_control_plane.testing.db_seeds import (
     seed_sequenced_sample_subtype,
 )
 from qiita_control_plane.testing.db_teardown import delete_idxs, teardown_entity_graph
-from qiita_control_plane.testing.tiers import TIER_RANK, WRITE_CHECKS, apply_write_checks
+from qiita_control_plane.testing.tiers import (
+    TIER_RANK,
+    WRITE_CHECKS,
+    apply_write_checks,
+    skip_field_tier_check,
+)
 from qiita_control_plane.testing.unique_names import unique_field_name
 
 from .conftest import _grant_study_access, _seed_authz_case_study, _seed_study
@@ -863,10 +868,17 @@ async def test_foreign_hidden_occupant_reveals_nothing(ctx, monkeypatch, write_c
     assert different.json()["detail"] == same.json()["detail"]
 
 
-async def _seed_hidden_unique_value(ctx, corpus: _Corpus) -> tuple[str, str]:
-    """A study-local unique_in_study field on the corpus's study, holding a value
-    on its biosample that an admin-tier exception hides from a member. Returns
-    (display_name, the stored value)."""
+async def _seed_hidden_unique_value(ctx, monkeypatch, corpus: _Corpus) -> tuple[str, str]:
+    """A study-local unique_in_study field at admin on the corpus's study,
+    holding a value on its biosample, which a member therefore cannot read.
+    Returns (display_name, the stored value).
+
+    No exception can sit on a unique_in_study field, so a member who may write
+    the field reads every value through it, and a value hidden from them can
+    only be one whose field an admin raised after the member's field check.
+    The check is switched off to stand in for that.
+    """
+    skip_field_tier_check(monkeypatch)
     unique_field = unique_field_name("vis_unique")
     declared = await ctx["wet"].post(
         URL_BIOSAMPLE_STUDY_FIELD_BY_STUDY.format(study_idx=corpus.study_idx),
@@ -874,28 +886,20 @@ async def _seed_hidden_unique_value(ctx, corpus: _Corpus) -> tuple[str, str]:
             "display_name": unique_field,
             "data_type": FieldDataType.TEXT,
             "unique_in_study": True,
+            "tier_override": Tier.ADMIN,
         },
     )
     assert declared.status_code == 201, declared.text
     field_idx = declared.json()["biosample_study_field_idx"]
-    wet_idx = ctx["wet_session"]["principal_idx"]
     metadata_idx = await seed_metadata_text_value(
         ctx["pool"],
         spec=BIOSAMPLE_METADATA_SPEC,
         entity_idx=corpus.entity_idx,
         study_field_idx=field_idx,
-        created_by_idx=wet_idx,
+        created_by_idx=ctx["wet_session"]["principal_idx"],
     )
     stored = await ctx["pool"].fetchval(
         "SELECT value_text FROM qiita.biosample_metadata WHERE idx = $1", metadata_idx
-    )
-    await seed_field_exception(
-        ctx["pool"],
-        spec=BIOSAMPLE_METADATA_SPEC,
-        entity_idx=corpus.entity_idx,
-        study_field_idx=field_idx,
-        tier_override=Tier.ADMIN,
-        created_by_idx=wet_idx,
     )
     return unique_field, stored
 
@@ -903,13 +907,13 @@ async def _seed_hidden_unique_value(ctx, corpus: _Corpus) -> tuple[str, str]:
 @pytest.mark.parametrize("write_checks", WRITE_CHECKS)
 async def test_unique_rewrite_masks_a_hidden_stored_value(ctx, monkeypatch, write_checks):
     """Changing a value stored through a unique_in_study field is refused
-    either way; when an exception hides that value from the caller, the
-    refusal does not quote it. Under "post-write-only" the refusal comes from
-    the write's refusal to rewrite the stored value."""
+    either way; when the caller cannot read that value, the refusal does not
+    quote it. Under "post-write-only" the refusal comes from the write's
+    refusal to rewrite the stored value."""
     apply_write_checks(monkeypatch, write_checks)
     study_idx = await _seed_study_for_case(ctx, "member")
     corpus = await _seed_biosample_corpus(ctx, study_idx)
-    unique_field, stored = await _seed_hidden_unique_value(ctx, corpus)
+    unique_field, stored = await _seed_hidden_unique_value(ctx, monkeypatch, corpus)
 
     resp = await _patch_metadata(
         ctx["user"], _WRITE_SURFACES["biosample"].write_url(corpus), {unique_field: "by-member"}
@@ -921,12 +925,12 @@ async def test_unique_rewrite_masks_a_hidden_stored_value(ctx, monkeypatch, writ
     assert stored not in resp.text
 
 
-async def test_refusal_is_the_same_whether_a_guess_at_a_hidden_value_is_right(ctx):
+async def test_refusal_is_the_same_whether_a_guess_at_a_hidden_value_is_right(ctx, monkeypatch):
     """A body that guesses a hidden value, beside a second key that is also
     refused, gets the same answer for a right guess and a wrong one."""
     study_idx = await _seed_study_for_case(ctx, "member")
     corpus = await _seed_biosample_corpus(ctx, study_idx)
-    unique_field, stored = await _seed_hidden_unique_value(ctx, corpus)
+    unique_field, stored = await _seed_hidden_unique_value(ctx, monkeypatch, corpus)
     (g_exception,) = _keys_at(corpus.global_keys, Tier.ADMIN, corpus=corpus)
     url = _WRITE_SURFACES["biosample"].write_url(corpus)
 
