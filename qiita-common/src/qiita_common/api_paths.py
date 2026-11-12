@@ -501,6 +501,12 @@ PATH_ALIGNMENT_DEFINITION_SAMPLE_STATUS = "/{alignment_idx}/sample-status"
 # POST: give up on the align plan's unfinished blocks and clear the pending gates
 # they covered, so the prep_samples can be re-planned with only_missing=true.
 PATH_ALIGNMENT_DEFINITION_ABANDON_PLAN = "/{alignment_idx}/abandon-plan"
+# POST: re-arm one COMPLETED align block ticket (or retry a FAILED re-run under a
+# deprecated mask) so the align workflow replaces the block's rows.
+PATH_ALIGNMENT_DEFINITION_RERUN_BLOCK = "/{alignment_idx}/rerun-block"
+# POST: delete the alignment rows of one prep_sample that has no gate under the
+# alignment (rows a block wrote under a prep_sample_idx nothing tracks).
+PATH_ALIGNMENT_DEFINITION_PURGE_SAMPLE_ROWS = "/{alignment_idx}/purge-sample-rows"
 
 URL_ALIGNMENT_DEFINITION_PREFIX = f"{API_PREFIX}{PATH_ALIGNMENT_DEFINITION_PREFIX}"
 URL_ALIGNMENT_DEFINITION_STATUS = (
@@ -511,6 +517,12 @@ URL_ALIGNMENT_DEFINITION_SAMPLE_STATUS = (
 )
 URL_ALIGNMENT_DEFINITION_ABANDON_PLAN = (
     f"{URL_ALIGNMENT_DEFINITION_PREFIX}{PATH_ALIGNMENT_DEFINITION_ABANDON_PLAN}"
+)
+URL_ALIGNMENT_DEFINITION_RERUN_BLOCK = (
+    f"{URL_ALIGNMENT_DEFINITION_PREFIX}{PATH_ALIGNMENT_DEFINITION_RERUN_BLOCK}"
+)
+URL_ALIGNMENT_DEFINITION_PURGE_SAMPLE_ROWS = (
+    f"{URL_ALIGNMENT_DEFINITION_PREFIX}{PATH_ALIGNMENT_DEFINITION_PURGE_SAMPLE_ROWS}"
 )
 
 # =============================================================================

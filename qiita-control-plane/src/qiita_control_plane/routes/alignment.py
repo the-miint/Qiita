@@ -8,9 +8,10 @@ that already exists.
 
 The /alignment-definition routes are the alignment lifecycle, system_admin-only
 (`alignment_definition:lifecycle`): deprecate a config, withdraw or restore
-individual runs, and abandon a plan's unfinished blocks. None of them deletes an
-alignment; the record of what aligned published data outlives the judgment that
-it was wrong.
+individual runs, abandon a plan's unfinished blocks, re-run a finished block (which
+replaces that block's rows), and delete the rows of a prep_sample no gate tracks. None
+of them deletes an alignment config or its gates; the record of what aligned published
+data outlives the judgment that it was wrong.
 """
 
 import base64
@@ -19,12 +20,14 @@ from typing import Annotated
 
 import asyncpg
 import pyarrow.flight as _flight
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import Field
 from qiita_common.api_paths import (
     PATH_ALIGNMENT_COHORT_DOGET,
     PATH_ALIGNMENT_DEFINITION_ABANDON_PLAN,
     PATH_ALIGNMENT_DEFINITION_PREFIX,
+    PATH_ALIGNMENT_DEFINITION_PURGE_SAMPLE_ROWS,
+    PATH_ALIGNMENT_DEFINITION_RERUN_BLOCK,
     PATH_ALIGNMENT_DEFINITION_SAMPLE_STATUS,
     PATH_ALIGNMENT_DEFINITION_STATUS,
     PATH_ALIGNMENT_DOGET,
@@ -37,13 +40,25 @@ from qiita_common.models import (
     AlignmentDefinitionStatus,
     AlignmentDefinitionStatusUpdate,
     AlignmentDoGetTicketRequest,
+    AlignmentPlanAbandonRequest,
     AlignmentPlanAbandonResponse,
+    AlignmentPurgeSampleRowsRequest,
+    AlignmentPurgeSampleRowsResponse,
+    AlignmentRerunBlockRequest,
+    AlignmentRerunBlockResponse,
     AlignmentSampleStatusUpdate,
     AlignmentSampleStatusUpdateResponse,
     DoGetTicketResponse,
 )
 
-from ..actions.align_abandon import AlignPlanInFlight, abandon_align_plan
+from ..actions.align_abandon import AlignPlanInFlight, AlignPlanRearmed, abandon_align_plan
+from ..actions.align_rerun import (
+    AlignRerunRefused,
+    SampleGated,
+    pre_txn_deadline,
+    purge_alignment_sample_rows,
+    rerun_align_block,
+)
 from ..auth.guards import (
     require_complete_profile,
     require_human,
@@ -59,6 +74,7 @@ from ..deps import (
     get_flight_signing_key,
     get_tx_conn_factory,
 )
+from ..dispatch import schedule_dispatch
 from ..feature_table import (
     denovo_alignment_processing_idx,
     denovo_assembly_deprecation_error,
@@ -77,6 +93,11 @@ from ..repositories.alignment_definition import (
 from ..repositories.assembly import classify_denovo_arm_cohort
 from ..repositories.block import list_incomplete_alignment_samples
 from ..repositories.processing import fetch_processing_by_idx
+from ..runner import _fetch_action
+from ..work_ticket_submit import (
+    authorize_redrive_action,
+    require_compute_backend_client_dependency,
+)
 from ._helpers import ALIGNMENT_NOT_FOUND_DETAIL, authorize_completed_alignment_cohort, first_few
 
 # The DuckLake relation this route signs DoGet tickets for: the exclusion-aware
@@ -193,6 +214,7 @@ async def update_alignment_sample_status_route(
 @alignment_definition_router.post(PATH_ALIGNMENT_DEFINITION_ABANDON_PLAN)
 async def abandon_alignment_plan_route(
     alignment_idx: Annotated[int, Field(gt=0)],
+    body: AlignmentPlanAbandonRequest | None = None,
     pool: asyncpg.Pool = Depends(get_db_pool),
     signing_key: bytes = Depends(get_flight_signing_key),
     data_plane_url: str = Depends(get_data_plane_url),
@@ -204,7 +226,8 @@ async def abandon_alignment_plan_route(
     alignment. Completed and invalidated prep_samples are not touched.
 
     `actions/align_abandon.py` documents the steps. 409 while a released block
-    ticket is still running. 502 if the DuckLake purge fails: the abandon itself has
+    ticket is still running, and for a block that rerun-block re-armed unless the
+    body sets `allow_rearmed`. 502 if the DuckLake purge fails: the abandon itself has
     committed. Calling this again before re-planning redoes the purge; a call after a
     re-plan would abandon that plan's unfinished blocks too, and is not needed, since
     the re-plan's blocks replace their own footprint over the whole prep_sample.
@@ -217,9 +240,14 @@ async def abandon_alignment_plan_route(
             alignment_idx=alignment_idx,
             signing_key=signing_key,
             data_plane_url=data_plane_url,
+            allow_rearmed=body is not None and body.allow_rearmed,
         )
     except AlignmentDefinitionNotFound:
         raise HTTPException(status_code=404, detail=ALIGNMENT_NOT_FOUND_DETAIL)
+    except AlignPlanRearmed as exc:
+        raise HTTPException(
+            status_code=409, detail={"reason": str(exc), "block_idx": exc.block_idxs}
+        ) from exc
     except AlignPlanInFlight as exc:
         raise HTTPException(
             status_code=409,
@@ -235,6 +263,124 @@ async def abandon_alignment_plan_route(
             ),
         ) from exc
     return AlignmentPlanAbandonResponse(**outcome)
+
+
+@alignment_definition_router.post(PATH_ALIGNMENT_DEFINITION_RERUN_BLOCK)
+async def rerun_alignment_block_route(
+    alignment_idx: Annotated[int, Field(gt=0)],
+    body: AlignmentRerunBlockRequest,
+    request: Request,
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    caller: HumanUser = Depends(require_human),
+    _scope: Principal = Depends(require_scope(Scope.ALIGNMENT_DEFINITION_LIFECYCLE)),
+    _backend: None = Depends(require_compute_backend_client_dependency),
+) -> AlignmentRerunBlockResponse:
+    """Re-arm one align block ticket so the align workflow replaces its block's rows,
+    and dispatch it.
+
+    A COMPLETED ticket runs every step again; its block and the `completed` gates it
+    covers go back to `pending` until reconcile completes them. A FAILED re-run under
+    a deprecated mask is retried with `allow_deprecated_mask` (`/run` refuses a
+    deprecated mask). `actions/align_rerun.py` documents the checks; each refusal is
+    a 409 (404 for an unknown ticket, alignment or mask; 503 for the reasons in
+    `NOT_COMMITTED_REASONS`) whose detail carries a `reason` code and changes
+    nothing.
+
+    system_admin only (`alignment_definition:lifecycle`), plus the align action's own
+    audience and scopes, as `/run` checks them.
+    """
+    deadline = pre_txn_deadline()
+    ticket = await pool.fetchrow(
+        "SELECT action_id, action_version FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+        body.work_ticket_idx,
+    )
+    if ticket is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "reason": "not_found",
+                "detail": f"work_ticket {body.work_ticket_idx} not found",
+            },
+        )
+    disabled = f"action {ticket['action_id']!r}/{ticket['action_version']!r} is not enabled"
+    if not await authorize_redrive_action(
+        pool, caller, ticket["action_id"], ticket["action_version"]
+    ):
+        raise HTTPException(
+            status_code=409, detail={"reason": "action_disabled", "detail": disabled}
+        )
+    definition = await _fetch_action(pool, ticket["action_id"], ticket["action_version"])
+    if definition is None:
+        raise HTTPException(
+            status_code=409, detail={"reason": "action_disabled", "detail": disabled}
+        )
+    ticket_root = request.app.state.settings.path_scratch_ticket
+    if ticket_root is None:
+        raise HTTPException(
+            status_code=500, detail="path_scratch_ticket is not configured on this control plane"
+        )
+    try:
+        outcome = await rerun_align_block(
+            pool,
+            deadline=deadline,
+            alignment_idx=alignment_idx,
+            work_ticket_idx=body.work_ticket_idx,
+            allow_deprecated_mask=body.allow_deprecated_mask,
+            reason=body.reason,
+            principal_idx=caller.principal_idx,
+            ticket_root=ticket_root,
+            action_steps=definition.steps,
+        )
+    except AlignRerunRefused as exc:
+        raise HTTPException(
+            status_code=exc.status,
+            detail={"reason": exc.reason, "detail": exc.detail, **exc.extra},
+        ) from exc
+    schedule_dispatch(request.app, body.work_ticket_idx)
+    return AlignmentRerunBlockResponse(**outcome)
+
+
+@alignment_definition_router.post(PATH_ALIGNMENT_DEFINITION_PURGE_SAMPLE_ROWS)
+async def purge_alignment_sample_rows_route(
+    alignment_idx: Annotated[int, Field(gt=0)],
+    body: AlignmentPurgeSampleRowsRequest,
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    signing_key: bytes = Depends(get_flight_signing_key),
+    data_plane_url: str = Depends(get_data_plane_url),
+    caller: HumanUser = Depends(require_human),
+    _scope: Principal = Depends(require_scope(Scope.ALIGNMENT_DEFINITION_LIFECYCLE)),
+) -> AlignmentPurgeSampleRowsResponse:
+    """Delete every DuckLake `alignment` row of one prep_sample under this alignment,
+    for rows no gate tracks (e.g. rows whose prep_sample_idx was zeroed, which is
+    why `prep_sample_idx` may be 0).
+
+    409 when the pair has a gate row: consumers trust the gate, and a gated sample's
+    rows are replaced by `rerun-block`, not deleted. 502 if the data plane delete
+    fails; the delete is idempotent, so calling again is safe.
+
+    system_admin only (`alignment_definition:lifecycle`).
+    """
+    try:
+        rows_deleted = await purge_alignment_sample_rows(
+            pool,
+            alignment_idx=alignment_idx,
+            prep_sample_idx=body.prep_sample_idx,
+            reason=body.reason,
+            principal_idx=caller.principal_idx,
+            signing_key=signing_key,
+            data_plane_url=data_plane_url,
+        )
+    except AlignmentDefinitionNotFound:
+        raise HTTPException(status_code=404, detail=ALIGNMENT_NOT_FOUND_DETAIL)
+    except SampleGated as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except _flight.FlightError as exc:
+        raise HTTPException(
+            status_code=502, detail=f"the data plane delete failed; call again to retry: {exc}"
+        ) from exc
+    return AlignmentPurgeSampleRowsResponse(
+        alignment_idx=alignment_idx, prep_sample_idx=body.prep_sample_idx, rows_deleted=rows_deleted
+    )
 
 
 @alignment_router.post(PATH_ALIGNMENT_DOGET, status_code=201)
