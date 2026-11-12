@@ -3,15 +3,18 @@
 import argparse
 import math
 import sqlite3
+import sys
 from collections.abc import Callable, Iterable
 from pathlib import Path
 
+import httpx
 from pydantic import BaseModel, ValidationError
 from qiita_common.api_paths import PATH_RUN_FOLDER_INSPECT, PATH_RUN_FOLDER_PREFIX
 from qiita_common.models import (
     Platform,
     RunFolderInspectRequest,
     RunFolderInspectResponse,
+    SampleFieldExceptionPutRequest,
     WorkTicketFollowOn,
 )
 
@@ -279,6 +282,78 @@ def _handle_study_scoped_call(args: argparse.Namespace, parser: argparse.Argumen
     return _common.run_http_subcommand(
         lambda t: _common.call(method, args.base_url, t, path, json=body)
     )
+
+
+class _FieldExceptionAlreadySet(Exception):
+    """`set-field-exception` found an exception stored and was not told to
+    replace it."""
+
+    def __init__(self, stored: dict) -> None:
+        super().__init__("a value-level exception is already set")
+        self.stored = stored
+
+
+def _handle_field_exception_set(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    """Set the value-level exception on one sample's value of one study field.
+
+    The body is validated before any request goes out (exit 2). The route
+    creates only without If-Match and replaces only with it, so this reads
+    first. With nothing stored it sends a bare PUT. With one stored it sends
+    the ETag it read under --replace, and otherwise stops (exit 1) and shows
+    what is stored, so an exception another admin set is never overwritten
+    unseen. A read that fails for any reason other than "none set" is reported
+    as the HTTP error it is.
+    """
+    body = _build_body(SampleFieldExceptionPutRequest, args, parser)
+    path = args.field_exception_path.format(**vars(args))
+
+    def _set(token: str) -> dict:
+        headers = None
+        try:
+            current = _common._request("GET", args.base_url, token, path)
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code != 404:
+                raise
+        else:
+            if not args.replace:
+                raise _FieldExceptionAlreadySet(current.json())
+            headers = {"If-Match": current.headers["ETag"]}
+        return _common._request(
+            "PUT", args.base_url, token, path, json=body, extra_headers=headers
+        ).json()
+
+    try:
+        return _common.run_http_subcommand(_set)
+    except _FieldExceptionAlreadySet as exc:
+        print(
+            "error: an exception is already set here"
+            f" (tier_override={exc.stored['tier_override']},"
+            f" reason={exc.stored['reason']!r}); pass --replace to replace it",
+            file=sys.stderr,
+        )
+        return 1
+
+
+def _handle_field_exception_clear(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    """Clear the value-level exception on one sample's value of one study field.
+
+    Reads it first for the ETag the route requires as If-Match, and prints what
+    it read: the exception it cleared.
+    """
+    path = args.field_exception_path.format(**vars(args))
+
+    def _clear(token: str) -> dict:
+        current = _common._request("GET", args.base_url, token, path)
+        _common._request(
+            "DELETE",
+            args.base_url,
+            token,
+            path,
+            extra_headers={"If-Match": current.headers["ETag"]},
+        )
+        return {"cleared": current.json()}
+
+    return _common.run_http_subcommand(_clear)
 
 
 def _handle_patch(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:

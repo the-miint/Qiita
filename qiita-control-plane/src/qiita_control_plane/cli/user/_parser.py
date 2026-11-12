@@ -14,6 +14,7 @@ from qiita_common.analytic import (
 from qiita_common.api_paths import (
     PATH_BIOSAMPLE_BY_IDX,
     PATH_BIOSAMPLE_BY_STUDY_UNIQUE_FIELD,
+    PATH_BIOSAMPLE_FIELD_EXCEPTION,
     PATH_BIOSAMPLE_GLOBAL_FIELD_PREFIX,
     PATH_BIOSAMPLE_GLOBAL_FIELD_ROOT,
     PATH_BIOSAMPLE_LIST_BY_STUDY,
@@ -28,6 +29,7 @@ from qiita_common.api_paths import (
     PATH_PREP_SAMPLE_STUDY_FIELD_BY_STUDY,
     PATH_PREP_SAMPLE_STUDY_LIST,
     PATH_SEQUENCED_SAMPLE_BY_IDX,
+    PATH_SEQUENCED_SAMPLE_FIELD_EXCEPTION,
     PATH_SEQUENCED_SAMPLE_LIST_BY_RUN_FULL,
     PATH_SEQUENCED_SAMPLE_PREFIX,
     PATH_SEQUENCING_RUN_BY_IDX,
@@ -68,6 +70,8 @@ from .. import _common
 from .._reference_exclusion import add_user_exclusion_subparsers
 from ._helpers import (
     _UNSET,
+    _handle_field_exception_clear,
+    _handle_field_exception_set,
     _handle_patch,
     _handle_read,
     _handle_study_scoped_call,
@@ -299,6 +303,62 @@ def _add_field_list_subcommands(
         read_path=global_field_path,
         read_idx_arg=None,
     )
+
+
+def _add_field_exception_subcommands(entity_sub, *, entity_noun: str, path: str) -> None:
+    """Declare one entity's `get-`, `set-` and `clear-field-exception`
+    subcommands, over the value-level exception on one of its values of one
+    study field. `entity_noun` names the entity and its idx flag; `path` is the
+    route's path under /study, its placeholders filled from the parsed args.
+    """
+    hyphenated = entity_noun.replace("_", "-")
+
+    def _add_target_args(subparser: argparse.ArgumentParser) -> None:
+        subparser.add_argument("--study-idx", type=int, required=True)
+        subparser.add_argument(f"--{hyphenated}-idx", type=int, required=True)
+        subparser.add_argument("--study-field-idx", type=int, required=True)
+
+    p_get = entity_sub.add_parser(
+        "get-field-exception",
+        help=f"Read the exception on a {hyphenated}'s value of one study field (needs admin)",
+    )
+    _add_target_args(p_get)
+    p_get.set_defaults(
+        handler=_handle_study_scoped_call,
+        study_call_method="GET",
+        study_call_path=path,
+        study_call_model=None,
+        study_call_kv_flags=(),
+    )
+
+    p_set = entity_sub.add_parser(
+        "set-field-exception",
+        help=(
+            f"Restrict a {hyphenated}'s value of one study field to a tier above the"
+            " field's (needs admin)"
+        ),
+    )
+    _add_target_args(p_set)
+    p_set.add_argument(
+        "--tier-override",
+        choices=tuple(t.value for t in Tier),
+        required=True,
+        help="the tier the value then requires; must be above the field's own",
+    )
+    p_set.add_argument("--reason", required=True, help="why the value is restricted")
+    p_set.add_argument(
+        "--replace",
+        action="store_true",
+        help="replace an exception already set; without it, set stops and shows the stored one",
+    )
+    p_set.set_defaults(handler=_handle_field_exception_set, field_exception_path=path)
+
+    p_clear = entity_sub.add_parser(
+        "clear-field-exception",
+        help=f"Remove the exception on a {hyphenated}'s value of one study field (needs admin)",
+    )
+    _add_target_args(p_clear)
+    p_clear.set_defaults(handler=_handle_field_exception_clear, field_exception_path=path)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -677,6 +737,11 @@ def _build_parser() -> argparse.ArgumentParser:
         entity_noun="biosample",
         read_path=f"{PATH_BIOSAMPLE_PREFIX}{PATH_BIOSAMPLE_STUDY_LIST}",
     )
+    _add_field_exception_subcommands(
+        p_biosample_sub,
+        entity_noun="biosample",
+        path=f"{PATH_STUDY_PREFIX}{PATH_BIOSAMPLE_FIELD_EXCEPTION}",
+    )
 
     p_biosample_list = p_biosample_sub.add_parser(
         "list-idxs",
@@ -952,6 +1017,11 @@ def _build_parser() -> argparse.ArgumentParser:
         handler=_handle_read,
         read_path=f"{PATH_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCED_SAMPLE_LIST_BY_RUN_FULL}",
         read_idx_arg="sequencing_run_idx",
+    )
+    _add_field_exception_subcommands(
+        p_seqsample_sub,
+        entity_noun="sequenced_sample",
+        path=f"{PATH_STUDY_PREFIX}{PATH_SEQUENCED_SAMPLE_FIELD_EXCEPTION}",
     )
 
     p_prepsample = sub.add_parser("prep-sample", help="Prep-sample operations")

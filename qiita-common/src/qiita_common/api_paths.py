@@ -937,6 +937,11 @@ PATH_BIOSAMPLE_BY_STUDY_AND_IDX = "/{study_idx}/biosample/{biosample_idx}"
 PATH_BIOSAMPLE_METADATA_BY_STUDY = "/{study_idx}/biosample/{biosample_idx}/metadata"
 # Link an existing biosample into the study (POST).
 PATH_BIOSAMPLE_STUDY_LINK = "/{study_idx}/biosample/{biosample_idx}/link"
+# The value-level exception on one biosample's value of one of the study's
+# fields: read (GET), set (PUT), clear (DELETE).
+PATH_BIOSAMPLE_FIELD_EXCEPTION = (
+    "/{study_idx}/biosample/{biosample_idx}/field-exception/{study_field_idx}"
+)
 # The same study-scoped view, for a caller holding a study's own unique id for the
 # sample instead of its idx: a unique-in-study field's display_name and the
 # value it carries. POST (not GET) because the identifying value lives in the
@@ -981,6 +986,7 @@ URL_BIOSAMPLE_LIST_BY_STUDY = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_LIST_BY_STUDY}
 URL_BIOSAMPLE_BY_STUDY_AND_IDX = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_BY_STUDY_AND_IDX}"
 URL_BIOSAMPLE_METADATA_BY_STUDY = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_METADATA_BY_STUDY}"
 URL_BIOSAMPLE_STUDY_LINK = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_STUDY_LINK}"
+URL_BIOSAMPLE_FIELD_EXCEPTION = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_FIELD_EXCEPTION}"
 URL_BIOSAMPLE_BY_STUDY_UNIQUE_FIELD = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_BY_STUDY_UNIQUE_FIELD}"
 URL_BIOSAMPLE_METADATA_BY_STUDY_UNIQUE_FIELD = (
     f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_METADATA_BY_STUDY_UNIQUE_FIELD}"
@@ -1019,6 +1025,11 @@ PATH_SEQUENCED_SAMPLE_BY_STUDY_AND_IDX = "/{study_idx}/sequenced-sample/{sequenc
 PATH_SEQUENCED_SAMPLE_METADATA_BY_STUDY = (
     "/{study_idx}/sequenced-sample/{sequenced_sample_idx}/metadata"
 )
+# The value-level exception on one sequenced sample's (its prep_sample's) value
+# of one of the study's fields: read (GET), set (PUT), clear (DELETE).
+PATH_SEQUENCED_SAMPLE_FIELD_EXCEPTION = (
+    "/{study_idx}/sequenced-sample/{sequenced_sample_idx}/field-exception/{study_field_idx}"
+)
 # The distinct sequenced_pools a study's samples sit in — the study-first join
 # the run-centric pool routes never expose. Composes under PATH_STUDY_PREFIX.
 PATH_SEQUENCED_POOL_BY_STUDY = "/{study_idx}/sequenced-pool"
@@ -1046,6 +1057,7 @@ URL_SEQUENCED_SAMPLE_BY_STUDY_AND_IDX = (
 URL_SEQUENCED_SAMPLE_METADATA_BY_STUDY = (
     f"{URL_STUDY_PREFIX}{PATH_SEQUENCED_SAMPLE_METADATA_BY_STUDY}"
 )
+URL_SEQUENCED_SAMPLE_FIELD_EXCEPTION = f"{URL_STUDY_PREFIX}{PATH_SEQUENCED_SAMPLE_FIELD_EXCEPTION}"
 URL_SEQUENCED_SAMPLE_LIST_BY_POOL = (
     f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCED_SAMPLE_LIST_BY_POOL}"
 )

@@ -208,3 +208,35 @@ class SampleStudyFieldPatchRequest(PatchRequestModel):
     tier_override: Tier | None = None
     unique_in_study: bool | None = None
     data_type: Literal[FieldDataType.TEXT] | None = None
+
+
+class SampleFieldExceptionPutRequest(BaseModel):
+    """Body for setting the exception on one sample's value of one field: the
+    tier the value then requires, and why.
+
+    A full replacement: both attributes are required, on a create and on a
+    replace alike. The route says when If-Match is needed and what tier an
+    exception must exceed.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    tier_override: Tier
+    reason: NonBlankText
+
+
+class SampleFieldExceptionResponse(BaseModel):
+    """One value-level exception.
+
+    keyed_on says what it follows: "global" for a field linked to a global
+    field, where it restricts the value in every study that links that field,
+    and "local" for a purely-local field. reason is None only on a row written
+    before the route required one.
+    """
+
+    tier_override: Tier
+    reason: str | None
+    keyed_on: Literal["global", "local"]
+    created_by_idx: Annotated[int, Field(gt=0)]
+    created_at: AwareDatetime
+    updated_at: AwareDatetime
