@@ -20,25 +20,34 @@ Outputs, in `gene_calls/`:
     (contig names and strand as read, not canonical), laid out as CheckM's
     `bins/<bin_id>/` so it can reuse them instead of calling Prodigal. A subject
     without genes gets no files, and CheckM calls Prodigal on it as it does today.
+    This is a file handed to a later step, not streamed: CheckM reads only files.
 
 **The `prodigal_checkm` rules** are CheckM 1.2.5's `ProdigalRunner.run`
 (`checkm/prodigal.py`): metagenomic mode for a subject under 100,000 bp, else single
 mode with tables 4 and 11; `-m` (regions of N masked) throughout; a single-mode call
 that fails or finds no genes is rerun in metagenomic mode; table 4 is kept only when
 its coding density exceeds table 11's by more than 0.05 and is above 0.7, density
-being the bases inside at least one gene over the subject's total length. Prodigal
-2.6.5 refuses `-p meta -g 4`, and metagenomic mode chooses a model per contig, so a
-metagenomic call is made once and stands for both tables.
+being the bases inside at least one gene over the subject's total length.
+`predict_genes` takes table 11 only in metagenomic mode, whose models choose table 11
+or 4 per contig, so a metagenomic call is made once and stands for both tables.
+
+The subjects are long-read-assembly's; nothing else runs this job.
 """
 
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 
 from pydantic import BaseModel
 from qiita_common.assembly_constants import KIND_MAG, KIND_UNBINNED
 from qiita_common.chunking import canonical_sequence_hash_expr, normalized_sequence_expr
-from qiita_common.gene_call_constants import CALL_SET_CHECKM, CALL_SET_META_CLOSED
+from qiita_common.gene_call_constants import (
+    CALL_SET_CHECKM,
+    CALL_SET_META_CLOSED,
+    GENE_CALL_STATUSES,
+    STATUS_OK,
+)
 from qiita_common.parquet import validate_parquet_path
 
 from ..miint import (
@@ -62,6 +71,9 @@ MIN_RESIDUE_LENGTH_BP = 300_000
 # CheckM's switch from single to metagenomic mode, on the subject's total length.
 _CHECKM_META_BELOW_BP = 100_000
 
+# Starting values, taken from `assembly_hash`; not measured for this job. Prodigal runs
+# out of process, beside DuckDB. The workflow's `baseline_resources` for this step is
+# where they get measured.
 _DUCKDB_MEMORY_GB = 6
 _DUCKDB_THREADS = 4
 
@@ -128,6 +140,10 @@ def _load_subjects(conn, genomes_dir: Path, refined_bins_dir: Path) -> None:
     """`contig`: every contig of every subject, with its subject (`genome_id`), its
     order in the subject's FASTA, its canonical hash, and whether it was read on the
     other strand. `subject`: one row per subject with its total length."""
+    # An absent bins directory is refused, as `residue_split.py` refuses it: read as no
+    # bins, it would make every long noLCG contig an UNBINNED subject.
+    if not refined_bins_dir.is_dir():
+        raise FileNotFoundError(f"refined_bins_dir {refined_bins_dir} is not a directory")
     conn.execute("CREATE TEMP TABLE file_meta (filepath VARCHAR, kind VARCHAR, bin_id VARCHAR)")
     meta = _file_meta(genomes_dir, refined_bins_dir)
     if meta:
@@ -335,7 +351,11 @@ def _gene_rows_sql(calls: str, call_set: str) -> str:
 def _contig_rows_sql(calls: str, call_set: str, closed_ends: bool, mask_regions: bool) -> str:
     """One row per contig of each subject: its settings, its outcome, and the model
     Prodigal used on it. A subject whose training failed has no per-contig rows from
-    `predict_genes`, only its own, and each of its contigs takes that status."""
+    `predict_genes`, only its own, and each of its contigs takes that status. The
+    `any_value`s read values `predict_genes` repeats on every row of a contig (its
+    model) or of a subject (its mode). A status outside `GENE_CALL_STATUSES`, or a
+    contig with none, fails the step."""
+    known = ", ".join(f"'{s}'" for s in GENE_CALL_STATUSES)
     return f"""
         WITH per_contig AS (
             SELECT genome_id, read_id, any_value(meta_mode) AS meta_mode,
@@ -353,7 +373,12 @@ def _contig_rows_sql(calls: str, call_set: str, closed_ends: bool, mask_regions:
                coalesce(p.meta_mode, s.meta_mode) AS meta_mode,
                {str(closed_ends).lower()} AS closed_ends,
                {str(mask_regions).lower()} AS mask_regions,
-               CASE WHEN p.has_genes THEN 'ok' ELSE coalesce(p.status, s.status) END AS status,
+               CASE WHEN p.has_genes THEN '{STATUS_OK}'
+                    WHEN coalesce(p.status, s.status) IN ({known})
+                        THEN coalesce(p.status, s.status)
+                    ELSE error('gene_call: contig ' || c.contig_id || ' of ' || c.bin_id
+                               || ' has status ' || coalesce(p.status, s.status, 'NULL'))
+               END AS status,
                p.translation_table, p.uses_sd, p.meta_bin, p.model_desc, p.model_gc_content
         FROM contig c
         LEFT JOIN per_contig p ON p.genome_id = c.genome_id AND p.read_id = c.contig_id
@@ -397,7 +422,21 @@ def _write_checkm_files(conn, out: Path) -> int:
 async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     out = workspace / OUTPUT_DIR
     (out / CHECKM_DIR).mkdir(parents=True)
+    try:
+        n_subjects, n_checkm = _call_and_write(inputs, workspace, out)
+    except BaseException:
+        # A partial output is never left where the next step would read it.
+        shutil.rmtree(out, ignore_errors=True)
+        raise
+    print(
+        f"gene_call: {n_subjects} subject(s), {n_checkm} with prodigal_checkm genes, "
+        f"prep_sample_idx={inputs.prep_sample_idx}",
+        flush=True,
+    )
+    return {"gene_calls": out}
 
+
+def _call_and_write(inputs: Inputs, workspace: Path, out: Path) -> tuple[int, int]:
     with duckdb_tmp_dir(workspace) as duckdb_tmp, open_miint_conn() as conn:
         apply_duckdb_settings(
             conn,
@@ -421,10 +460,4 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
         )
         n_checkm = _write_checkm_files(conn, out / CHECKM_DIR)
         n_subjects = conn.execute("SELECT count(*) FROM subject").fetchone()[0]
-
-    print(
-        f"gene_call: {n_subjects} subject(s), {n_checkm} with prodigal_checkm genes, "
-        f"prep_sample_idx={inputs.prep_sample_idx}",
-        flush=True,
-    )
-    return {"gene_calls": out}
+    return n_subjects, n_checkm

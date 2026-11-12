@@ -391,9 +391,7 @@ fn myloasm_tables_are_replaced_per_run_on_the_run_tables_keys() {
 }
 
 /// Both gene-call tables are replaced per assembly run, and both read their delete
-/// keys from `gene_call_contig`, the one that is never empty for a run that called
-/// any subject. `gene_call` keyed on its own file would leave a previous run's genes
-/// behind whenever the re-run found none.
+/// keys from `gene_call_contig` (why: `qiita_common.gene_call_constants.GENE_CALL_RUN_KEY`).
 #[test]
 fn gene_call_tables_are_replaced_per_run_on_the_contig_tables_keys() {
     for table in crate::ducklake::GENE_CALL_TABLES {

@@ -105,7 +105,8 @@ The files qiita consumes:
 | Upstream file                          | What lives there                                                                                             |
 | -------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
 | `docs/reading.md`                      | `read_fastx`, `read_alignments`, `read_sequences_sam`, `read_sequences_sff`, `read_biom`, `read_gff`, mzML/jplace/Newick |
-| `docs/writing.md`                      | `COPY ... TO ... (FORMAT FASTQ\|FASTA\|SAM\|BAM\|UBAM\|BIOM\|NEWICK)` writers                                 |
+| `docs/writing.md`                      | `COPY ... TO ... (FORMAT FASTQ\|FASTA\|SAM\|BAM\|UBAM\|BIOM\|NEWICK\|GFF)` writers; GFF has a `prodigal` dialect |
+| `docs/gene_prediction.md`              | `predict_genes` (Prodigal through gpl-boundary); qiita-side the `gene_call` job |
 | `docs/alignment_reference.md`          | `align_minimap2`/`align_bowtie2` + both `_sharded` twins, `save_*_index`, SortMeRNA                           |
 | `docs/alignment_analysis.md`           | `alignment_is_*`, the CIGAR scorers, `alignment_slice`, `compute_coverage_depth`, `genome_coverage`           |
 | `docs/qc.md`                           | fastp-port read QC (`filter_read`, `trim_adapters*`, `trim_polyg`/`polyx`) **and** `infer_trim`               |
@@ -373,7 +374,7 @@ HDF5 1.14.6 │ zlib 1.3.1.zlib-ng │ libdeflate 1.24 │ libcurl 8.16.0-DEV
 ```
 
 Two things it does **not** cover, because they are not compiled in — they are ordinary executables found on `PATH` at runtime, so they can differ per host even on one miint build:
-- **`gpl-boundary`** — the bowtie2 + FastTree host (see the [GPL boundary bullet](#internals-worth-knowing-before-extending-qiita-usage)). Version-gated: `align_bowtie2*` need ≥ 0.4.2, `save_bowtie2_index` ≥ 0.2.0.
+- **`gpl-boundary`** — the bowtie2, FastTree and Prodigal host (see the [GPL boundary bullet](#internals-worth-knowing-before-extending-qiita-usage)). Version-gated: `predict_genes` needs ≥ 0.5.0, `align_bowtie2*` ≥ 0.4.2, `save_bowtie2_index` ≥ 0.2.0.
 - **IBM Aspera `ascp`** — ENA transfers.
 
 **When a result looks tool-version-dependent, run `miint_versions()` on each host first.** That is usually faster than debugging qiita, and it is the one question this file cannot answer for you.

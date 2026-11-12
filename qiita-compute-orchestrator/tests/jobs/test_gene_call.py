@@ -3,9 +3,7 @@ canonical-strand coordinates, the CheckM files, and the column contract with the
 
 Runs `predict_genes` against the team-mirror miint build and the GPL-boundary the
 conftest installs. The fixture sequences are random DNA from a fixed seed: Prodigal
-calls genes on them in both modes, which is all these tests need. That the calls match
-CheckM's own (`checkm/prodigal.py` with Prodigal 2.6.3) was measured outside this
-suite, on E. coli K-12 and M. genitalium bins.
+calls genes on them in both modes, which is all these tests need.
 """
 
 from __future__ import annotations
@@ -50,7 +48,9 @@ def _layout(root: Path) -> dict[str, dict[str, str]]:
     bin1 = {"c1": _dna(rng, 60_000), "c2": _dna(rng, 50_000), "c3": _dna(rng, 40_000)}
     files = {
         "refined/bin.1.fa": bin1,
-        "refined/bin.2.fa": {"s1": _dna(rng, 30_000)},
+        # Lowercase, as a soft-masked contig arrives: the canonical strand and the hash
+        # are taken over the upper-cased bases.
+        "refined/bin.2.fa": {"s1": _dna(rng, 30_000).lower()},
         "genomes/circular.fa": {"lcg1": _dna(rng, 120_000)},
         "genomes/noLCG.fa": {
             **bin1,
@@ -255,3 +255,20 @@ def test_no_subjects_writes_empty_outputs(tmp_path):
     assert _rows(out / gene_call.GENE_FILE, "SELECT count(*) FROM t") == [(0,)]
     assert _rows(out / gene_call.CONTIG_FILE, "SELECT count(*) FROM t") == [(0,)]
     assert not any((out / gene_call.CHECKM_DIR).iterdir())
+
+
+def test_an_absent_bins_directory_is_refused(tmp_path):
+    """Read as no bins, it would make every long noLCG contig an UNBINNED subject."""
+    _layout(tmp_path)
+    for f in (tmp_path / "refined").iterdir():
+        f.unlink()
+    (tmp_path / "refined").rmdir()
+    with pytest.raises(FileNotFoundError, match="refined_bins_dir"):
+        _run(tmp_path)
+    assert not (tmp_path / "ws" / gene_call.OUTPUT_DIR).exists()
+
+
+@pytest.mark.parametrize("bin_id", ["", ".", "..", "a/b", "a\0b"])
+def test_a_bin_id_that_is_not_a_plain_name_is_refused(bin_id):
+    with pytest.raises(ValueError, match="cannot name a directory"):
+        gene_call._dir_name(bin_id)

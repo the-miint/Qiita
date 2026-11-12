@@ -84,7 +84,8 @@ GENE_CALL_ATTRIBUTE_KEYS = (
 # `predict_genes`' `status` values (the gene prediction docs linked above), as
 # `gene_call_contig.status` records them. A subject whose training failed gives each
 # of its contigs `training_failed`.
-GENE_CALL_STATUSES = ("ok", "no_genes", "training_failed")
+STATUS_OK = "ok"
+GENE_CALL_STATUSES = (STATUS_OK, "no_genes", "training_failed")
 
 # Both lists in DDL ORDER with DDL TYPES: the staging Parquet is registered into the
 # table as it is, and one ordered or typed differently is a load error.
