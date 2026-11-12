@@ -51,7 +51,7 @@ from .study_access import CallerMetadataTiers
 # via GENERATED ALWAYS AS so no caller passes it there.
 _PROCESSING_KIND_SEQUENCED = "sequenced"
 
-# Rows a download roster read counts: active and not ENA-flagged (aliases `ss`, `ps`).
+# Rows that a download roster read includes: active and not ENA-flagged (aliases `ss`, `ps`).
 ACTIVE_ROSTER_ROW = "ps.retired = false AND ss.ena_status IS NULL"
 
 # The SequencedSampleListItem projection, shared verbatim by the pool- and

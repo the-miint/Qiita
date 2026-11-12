@@ -25,6 +25,7 @@ from qiita_common.models import (
     WorkTicketState,
 )
 from qiita_common.models.ena_import import MAX_ENA_DOWNLOAD_RUN_CONCURRENCY, BatchItemState
+from qiita_common.work_ticket_constants import ENA_RUN_ACCESSIONS_KEY
 
 from qiita_control_plane.auth.principal import HumanUser
 from qiita_control_plane.dispatch import build_dispatch_semaphore
@@ -1937,7 +1938,7 @@ async def _ticket_restriction(postgres_pool, ticket_idx: int) -> list[str] | Non
         "SELECT action_context::text FROM qiita.work_ticket WHERE work_ticket_idx = $1",
         ticket_idx,
     )
-    return json.loads(context).get("ena_run_accessions")
+    return json.loads(context).get(ENA_RUN_ACCESSIONS_KEY)
 
 
 async def _ticket_pool_run_accessions(postgres_pool, ticket_idx: int) -> set[str]:
@@ -3872,7 +3873,7 @@ async def test_fetch_runs_needing_download_excludes_every_run_a_roster_read_woul
 
 
 def test_reusable_download_ticket_rejects_an_unknown_state():
-    ticket = {"work_ticket_idx": 9, "work_ticket_state": "bogus", "ena_run_accessions": None}
+    ticket = {"work_ticket_idx": 9, "work_ticket_state": "bogus", ENA_RUN_ACCESSIONS_KEY: None}
     with pytest.raises(ValueError, match="bogus"):
         _reusable_download_ticket(ticket, ["a"], sequenced_pool_idx=4)
 
@@ -3898,7 +3899,7 @@ def test_reusable_download_ticket_rejects_an_unknown_state():
     ],
 )
 def test_reusable_download_ticket_rule(state, restriction, needed, expected):
-    ticket = {"work_ticket_idx": 9, "work_ticket_state": state, "ena_run_accessions": restriction}
+    ticket = {"work_ticket_idx": 9, "work_ticket_state": state, ENA_RUN_ACCESSIONS_KEY: restriction}
     if expected is RuntimeError:
         with pytest.raises(RuntimeError, match="sequenced_pool 4 is held by download ticket 9"):
             _reusable_download_ticket(ticket, needed, sequenced_pool_idx=4)
@@ -3990,7 +3991,7 @@ async def test_submit_conflict_with_a_restricted_ticket_reuses_it_only_if_it_cov
                     **r,
                     "work_ticket_idx": None,
                     "work_ticket_state": None,
-                    "ena_run_accessions": None,
+                    ENA_RUN_ACCESSIONS_KEY: None,
                 }
                 for r in rows
             ]
@@ -4071,6 +4072,6 @@ async def test_run_list_with_nothing_left_to_download_fails_with_its_own_reason(
 
     (row,) = await _batch_items(postgres_pool, batch_idx)
     assert row["state"] == BatchItemState.FAILED.value
-    assert row["failure_reason"].startswith("nothing to download: no run in the pool")
+    assert row["failure_reason"].startswith("nothing to download: every run this import names")
 
     await _cleanup_study(postgres_pool, study)

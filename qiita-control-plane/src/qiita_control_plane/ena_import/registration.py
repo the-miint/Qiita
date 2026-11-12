@@ -173,7 +173,7 @@ class EnaRunRegistrationOutcome:
 
 # A pool whose latest download ticket ended in one of these is downloaded
 # afresh: a new ticket re-reads its roster, so it may still take new runs.
-_RESUBMITTABLE_DOWNLOAD_TICKET_STATES = frozenset(
+RESUBMITTABLE_DOWNLOAD_TICKET_STATES = frozenset(
     {WorkTicketState.FAILED.value, WorkTicketState.CANCELLED.value}
 )
 
@@ -184,7 +184,7 @@ def download_ticket_covers_pool(work_ticket_state: str | None) -> bool:
     added after it would never be downloaded)."""
     return (
         work_ticket_state is not None
-        and work_ticket_state not in _RESUBMITTABLE_DOWNLOAD_TICKET_STATES
+        and work_ticket_state not in RESUBMITTABLE_DOWNLOAD_TICKET_STATES
     )
 
 

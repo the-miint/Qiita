@@ -196,8 +196,8 @@ accessions and returns immediately with a batch handle, while a background task
 an ENA sample accession across studies), and submits one `download-ena-study`
 work ticket per `sequenced_pool` holding the study's runs, or a run-list item's
 listed runs (a re-import's new runs
-get a new pool once an earlier pool's download is under way; runs a completed
-download left unread get a second, forced ticket on that pool). That ticket then
+get a new pool once an earlier pool's download is under way; runs that a completed
+download did not read get a new, forced ticket on that pool). That ticket then
 runs like any other workflow: a native `ingest_ena_reads` step (`read_ena_sequences`
 + the same mint-then-sort-and-assign pipeline `ingest_reads` uses), the standard
 `register-files` action into DuckLake, and `persist-ena-run-outcomes`, which records

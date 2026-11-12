@@ -2,7 +2,7 @@
 
 Builds the `WorkTicketCreateRequest` body for ONE `sequenced_pool`-scoped
 `download-ena-study` ticket, `action_context` carrying `{ena_study_accession}`
-and, to download only some of the pool's runs, `ENA_RUN_ACCESSIONS_KEY`.
+and, to download only some of the pool's runs, `ena_run_accessions`.
 The transport is the job's to choose, not the ticket's. By the time this is
 called, the pool and its
 `sequenced_sample` rows already exist (from `register_ena_study`).

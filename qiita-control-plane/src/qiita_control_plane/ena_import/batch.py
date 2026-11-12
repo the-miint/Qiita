@@ -81,6 +81,7 @@ from ..repositories.study import (
 from .availability import EnaAvailabilityClient
 from .miint_resolver import MiintEnaResolver, call_with_ena_retry
 from .registration import (
+    RESUBMITTABLE_DOWNLOAD_TICKET_STATES,
     EnaRunRegistrationOutcome,
     EnaRunRegistrationStatus,
     exception_reason,
@@ -703,7 +704,8 @@ async def _process_one_study(
                 item.idx,
                 BatchItemState.FAILED,
                 failure_reason=(
-                    "nothing to download: no run in the pool still needs reads"
+                    "nothing to download: every run this import names has stored reads, a recorded"
+                    " download failure, or is retired or ENA-flagged"
                     if any_skipped
                     else "study registered but no pool holds an active sequenced_sample"
                 ),
@@ -843,7 +845,7 @@ def _reusable_download_ticket(
         return True
     if state == WorkTicketState.COMPLETED.value:
         return not needed
-    if state is None or state in _TERMINAL_UNSUCCESSFUL_STATES:
+    if state is None or state in RESUBMITTABLE_DOWNLOAD_TICKET_STATES:
         return False
     if state not in _LIVE_DOWNLOAD_STATES:
         raise ValueError(f"unknown download ticket state {state!r}")

@@ -5,7 +5,7 @@
   runs, where it used to download every unread run in the pool. A manually submitted ticket can
   carry it too. A whole-study import fails the item, naming the ticket, when another import's
   restricted ticket still holds a pool it needs; re-importing once that ticket ends tickets the
-  rest. An item with no run left to download (all stored, failed, retired or ENA-flagged) now
+  rest. An item with no run left to download (each stored or failed, with another active run still in the pool) now
   fails with "nothing to download" instead of "no pool holds an active sequenced_sample".
 - **A re-import tickets the runs a completed download left behind (#743).** A held run with no
   reads whose pool's download completed without it gets a new ticket for the pool, restricted to
