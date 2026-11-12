@@ -43,6 +43,7 @@ from qiita_common.api_paths import (
     PATH_STUDY_PREFIX,
 )
 from qiita_common.auth_constants import Scope, SystemRole
+from qiita_common.http_headers import ETAG_HEADER, IF_MATCH_HEADER
 from qiita_common.models import (
     IdxsListResponse,
     MetadataChecklistRef,
@@ -115,9 +116,7 @@ from ..repositories.sequencing_run import (
     lock_sequencing_run,
 )
 from ._helpers import (
-    ETAG_HEADER,
     GENERIC_FK_VIOLATION,
-    IF_MATCH_HEADER,
     SAMPLE_METADATA_WRITE_ERRORS,
     build_idxs_list_response,
     cap_rows,

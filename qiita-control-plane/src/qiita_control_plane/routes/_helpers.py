@@ -338,13 +338,6 @@ GENERIC_FK_VIOLATION = "references a row that does not exist"
 # write surfaces fall back to it, so the wording lives here rather than at each.
 GENERIC_CHECK_VIOLATION = "violates a database constraint on"
 
-# The optimistic-concurrency header pair: every route that emits a version
-# stamp writes ETAG_HEADER, and every PATCH that gates on one reads
-# IF_MATCH_HEADER. A caller round-trips the first into the second, so the two
-# spellings are a contract rather than incidental strings.
-ETAG_HEADER = "ETag"
-IF_MATCH_HEADER = "If-Match"
-
 
 def metadata_entries_from_rows(rows: Mapping[str, MetadataRow]) -> dict[str, MetadataEntry]:
     """Map a metadata-row dict to MetadataEntry, preserving the input keys.

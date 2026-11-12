@@ -35,6 +35,7 @@ from qiita_common.api_paths import (
     PATH_STUDY_PREFIX,
 )
 from qiita_common.auth_constants import Scope, SystemRole
+from qiita_common.http_headers import ETAG_HEADER, IF_MATCH_HEADER
 from qiita_common.models import (
     BiosampleBulkImportRequest,
     BiosampleBulkImportResponse,
@@ -123,10 +124,8 @@ from ..repositories.exported_entity import fetch_exported_entities, require_expo
 from ..repositories.study_access import CallerMetadataTiers
 from ..roster_resolution import classify_roster, fetch_roster_facts
 from ._helpers import (
-    ETAG_HEADER,
     GENERIC_CHECK_VIOLATION,
     GENERIC_FK_VIOLATION,
-    IF_MATCH_HEADER,
     SAMPLE_METADATA_WRITE_ERRORS,
     SAMPLE_STUDIES_HARD_CAP,
     build_idxs_list_response,

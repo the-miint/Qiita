@@ -66,6 +66,7 @@ from qiita_common.auth_constants import (
     BEARER_PREFIX,
     STALE_TOKEN_SCOPE_HEADER,
 )
+from qiita_common.http_headers import ETAG_HEADER, IF_MATCH_HEADER
 from qiita_common.models import PrincipalLookupRequest, PrincipalLookupResponse
 
 # Environment-variable names and CLI defaults are CLI conventions (not part of
@@ -502,8 +503,10 @@ def patch_with_if_match(base_url: str, token: str, path: str, body: dict) -> dic
     only way to mint a valid If-Match; pairing them here also keeps the
     lost-update window small.
     """
-    etag = _request("GET", base_url, token, path).headers["ETag"]
-    resp = _request("PATCH", base_url, token, path, json=body, extra_headers={"If-Match": etag})
+    etag = _request("GET", base_url, token, path).headers[ETAG_HEADER]
+    resp = _request(
+        "PATCH", base_url, token, path, json=body, extra_headers={IF_MATCH_HEADER: etag}
+    )
     return resp.json()
 
 
