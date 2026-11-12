@@ -3,7 +3,7 @@
 > **Status: OUTLINE.** Headings and the intended shape are here; the step-by-step
 > detail is filled in once the workflow has run end-to-end on a real deploy. The
 > workflow *contracts* live in the YAML `description:` blocks
-> (`workflows/golay-demux/1.0.0.yaml`, `workflows/amplicon/1.0.0.yaml`) — this
+> (`workflows/golay-demux/1.0.0.yaml`, `workflows/amplicon/1.1.0.yaml`) — this
 > runbook is the operator/analyst playbook, not the contract.
 
 **For:** whoever processes an EMP-style 16S run — Golay-barcoded, with no
@@ -44,7 +44,7 @@ see [`getting-started.md`](getting-started.md).
   orchestrator has no DB access). Loads per-sample reads into `read`.
 
 - To take the run straight on to ASV counts, chain the amplicon run:
-  `--then-action-id amplicon --then-action-version 1.0.0 --then-context-json
+  `--then-action-id amplicon --then-action-version 1.1.0 --then-context-json
   '{"trim": 150, "sortmerna_reference_idx": <idx>}'`. The control plane submits
   it, as you, on the same pool once demux completes. It is checked against the
   amplicon action when golay-demux is submitted; `GET /work-ticket/{idx}` on the
@@ -53,8 +53,8 @@ see [`getting-started.md`](getting-started.md).
 
 ## Submit amplicon (denoise)
 
-- _(TODO)_ context: `sortmerna_reference_idx`, `trim`, optional `primer` /
-  `orient_primer`. The pool's reads STREAM from the data plane at runtime (the runner
+- _(TODO)_ context: `sortmerna_reference_idx`, `trim`. The pool's reads stream
+  from the data plane at runtime (the runner
   stages nothing; the stream spills transiently to the job workspace). Writes
   `amplicon_membership` + the ASV sequence tables (reference-agnostic ASV counts).
 

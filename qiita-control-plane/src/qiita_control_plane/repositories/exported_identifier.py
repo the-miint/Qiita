@@ -6,6 +6,7 @@ from collections.abc import Sequence
 
 import asyncpg
 
+
 # Every caller-visible column, plus the accessions that ride along for
 # information. Both accessions are LEFT-joined and nullable: an unaccessioned
 # sample still gets an export_id, which is the point of having one.
@@ -16,18 +17,29 @@ import asyncpg
 # `sequenced_sample` is LEFT because a prep_sample of a future non-sequenced
 # processing kind has no subtype row at all; it cannot duplicate a row either,
 # since its `prep_sample_idx` is UNIQUE.
-_SELECT_LIVE = (
-    "SELECT ei.prep_sample_idx, ei.export_id,"
-    "       bs.biosample_accession, ss.ena_run_accession"
-    "  FROM qiita.exported_identifier ei"
-    "  JOIN qiita.prep_sample ps ON ps.idx = ei.prep_sample_idx"
-    "  JOIN qiita.biosample bs ON bs.idx = ps.biosample_idx"
-    "  LEFT JOIN qiita.sequenced_sample ss ON ss.prep_sample_idx = ps.idx"
-    " WHERE ei.alignment_idx = $1"
-    "   AND ei.prep_sample_idx = ANY($2::bigint[])"
-    "   AND NOT ei.retired"
-    " ORDER BY ei.prep_sample_idx"
-)
+#
+# Keyed on one processing column — `alignment_idx` or `processing_idx`, the two
+# kinds a live row names exactly one of.
+def _select_live(processing_column: str) -> str:
+    # The column name is interpolated into the SQL, so allowlist it — only the
+    # two live processing kinds, never caller-supplied input.
+    assert processing_column in {"alignment_idx", "processing_idx"}
+    return (
+        "SELECT ei.prep_sample_idx, ei.export_id,"
+        "       bs.biosample_accession, ss.ena_run_accession"
+        "  FROM qiita.exported_identifier ei"
+        "  JOIN qiita.prep_sample ps ON ps.idx = ei.prep_sample_idx"
+        "  JOIN qiita.biosample bs ON bs.idx = ps.biosample_idx"
+        "  LEFT JOIN qiita.sequenced_sample ss ON ss.prep_sample_idx = ps.idx"
+        f" WHERE ei.{processing_column} = $1"
+        "   AND ei.prep_sample_idx = ANY($2::bigint[])"
+        "   AND NOT ei.retired"
+        " ORDER BY ei.prep_sample_idx"
+    )
+
+
+_SELECT_LIVE = _select_live("alignment_idx")
+_SELECT_LIVE_PROCESSING = _select_live("processing_idx")
 
 
 class IncompleteMintError(RuntimeError):
@@ -98,6 +110,36 @@ async def mint_exported_identifiers(
         )
         rows = await conn.fetch(_SELECT_LIVE, alignment_idx, prep_sample_idxs)
 
+    missing = _missing_from(rows, prep_sample_idxs)
+    if missing:
+        raise IncompleteMintError(missing)
+    return rows
+
+
+async def mint_processing_exported_identifiers(
+    conn: asyncpg.Connection,
+    *,
+    processing_idx: int,
+    prep_sample_idxs: list[int],
+    created_by_idx: int,
+) -> list[asyncpg.Record]:
+    """`mint_exported_identifiers` for a `qiita.processing` run (amplicon): ensure a
+    live `export_id` for every `(processing_idx, prep_sample)` pair and return them
+    all ascending. Idempotent and all-or-nothing for the reasons given there.
+
+    Takes a connection rather than a pool so a caller can mint inside its own
+    transaction."""
+    await conn.execute(
+        "INSERT INTO qiita.exported_identifier"
+        "       (processing_idx, prep_sample_idx, created_by_idx)"
+        " SELECT $1, prep_sample_idx, $3"
+        "   FROM unnest($2::bigint[]) AS prep_sample_idx"
+        " ON CONFLICT (processing_idx, prep_sample_idx) WHERE NOT retired DO NOTHING",
+        processing_idx,
+        prep_sample_idxs,
+        created_by_idx,
+    )
+    rows = await conn.fetch(_SELECT_LIVE_PROCESSING, processing_idx, prep_sample_idxs)
     missing = _missing_from(rows, prep_sample_idxs)
     if missing:
         raise IncompleteMintError(missing)

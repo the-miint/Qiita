@@ -1074,12 +1074,13 @@ pub fn ensure_myloasm_tables(conn: &Connection) -> Result<(), Box<dyn std::error
 
 /// per-sample ASV feature counts from a deblur run: feature membership plus
 /// abundance, keyed by `processing_idx` (the run) and `feature_idx` (the ASV);
-/// plus the ASV sequences themselves (`amplicon_sequence` +
-/// `amplicon_sequence_chunks`, keyed by feature_idx, mirroring the assembly
-/// tables) so an ASV never has to be recomputed to read back. the derived
-/// closed-reference feature table aggregates membership; it is never itself
-/// stored. membership is replace-keyed on `(prep_sample_idx, processing_idx)`
-/// and the sequence tables on `feature_idx` in
+/// plus the ASV sequences themselves (`amplicon_sequence`, keyed by feature_idx)
+/// so an ASV never has to be recomputed to read back. An ASV is short (a single
+/// 64 KB chunk at most), so its bytes are stored INLINE in `amplicon_sequence`
+/// rather than in a chunk table — unlike the assembly tables, whose genome
+/// contigs are chunked. the derived closed-reference feature table aggregates
+/// membership; it is never itself stored. membership is replace-keyed on
+/// `(prep_sample_idx, processing_idx)` and the sequence table on `feature_idx` in
 /// `flight_service::registration::REPLACE_KEY_TABLES`, so a re-run replaces its own rows.
 pub fn ensure_amplicon_tables(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
     conn.execute_batch(
@@ -1090,28 +1091,17 @@ pub fn ensure_amplicon_tables(conn: &Connection) -> Result<(), Box<dyn std::erro
             count BIGINT NOT NULL
         );
 
-        -- One row per UNIQUE ASV (content-hash deduped), keyed by feature_idx.
-        -- Mirrors assembled_sequence: length here, bytes in the chunks table.
+        -- One row per UNIQUE ASV (content-hash deduped), keyed by feature_idx,
+        -- with its bytes stored inline. An ASV is short, so there is no separate
+        -- chunk table (the chunking the reference/assembly tails need for genomes
+        -- is pure overhead here).
         CREATE TABLE IF NOT EXISTS qiita_lake.amplicon_sequence (
             feature_idx BIGINT NOT NULL,
             sequence_hash UUID NOT NULL,
-            sequence_length_bp BIGINT NOT NULL
-        );
-
-        -- The ASV bytes in 64 KB chunks (reassemble with
-        -- string_agg(chunk_data, '' ORDER BY chunk_index)). Mirrors
-        -- assembled_sequence_chunks; loaded multi-file (a <table>/ subdir of parts).
-        CREATE TABLE IF NOT EXISTS qiita_lake.amplicon_sequence_chunks (
-            feature_idx BIGINT NOT NULL,
-            chunk_index INTEGER NOT NULL,
-            chunk_data VARCHAR NOT NULL
+            sequence_length_bp BIGINT NOT NULL,
+            sequence VARCHAR NOT NULL
         );",
     )?;
-    // Pin DuckLake's own rewrites of the chunk table (see CHUNK_ROW_GROUP_SIZE).
-    conn.execute_batch(&format!(
-        "CALL qiita_lake.set_option('parquet_row_group_size', {CHUNK_ROW_GROUP_SIZE}, \
-         table_name => 'amplicon_sequence_chunks');"
-    ))?;
     Ok(())
 }
 

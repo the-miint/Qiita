@@ -25,6 +25,8 @@ from qiita_common.actions import (
 )
 from qiita_common.api_paths import LibraryPrimitive
 
+from ..repositories.alignment_definition import list_pool_prep_sample_idxs
+from ..repositories.amplicon import create_amplicon_samples_pending
 from ..repositories.assembly import (
     create_assembly_sample_pending,
     upsert_assembly_sample_no_data,
@@ -190,6 +192,26 @@ async def _create_assembly_gate_pending(
     async with pool.acquire() as conn, conn.transaction():
         await create_assembly_sample_pending(
             conn, processing_idx=processing_idx, prep_sample_idx=prep_sample_idx
+        )
+
+
+def _workflow_writes_amplicon_gate(steps: list[Any]) -> bool:
+    """True iff some entry is the `finalize-amplicon-sample` action — the signal
+    for the runner's 'pending' write of the pool's qiita.amplicon_sample rows, so
+    a workflow gets that write exactly when it declares the closing one."""
+    return _workflow_declares_action(steps, LibraryPrimitive.FINALIZE_AMPLICON_SAMPLE)
+
+
+async def _create_amplicon_gate_pending(
+    pool: asyncpg.Pool, *, processing_idx: int, sequenced_pool_idx: int
+) -> None:
+    """Materialize this run's amplicon_sample rows at 'pending' for the pool's
+    population (`list_pool_prep_sample_idxs`, the set the pool's other rollups
+    count), right after the processing_idx mint gives the rows their key."""
+    async with pool.acquire() as conn, conn.transaction():
+        population = await list_pool_prep_sample_idxs(conn, sequenced_pool_idx)
+        await create_amplicon_samples_pending(
+            conn, processing_idx=processing_idx, prep_sample_idxs=population
         )
 
 

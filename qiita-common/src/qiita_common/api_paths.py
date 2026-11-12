@@ -238,6 +238,16 @@ class LibraryPrimitive(StrEnum):
     # runner keys its de novo alignment resolver off. See
     # qiita_control_plane.actions.library.finalize_alignment_sample_gate.
     FINALIZE_ALIGNMENT_SAMPLE = "finalize-alignment-sample"
+    # Amplicon: mint the public QM identifier of every processed sample the run's
+    # denoise step counted, as the ticket's originator. Runs after
+    # register-files, so an identifier never names data that did not land. See
+    # qiita_control_plane.actions.library.mint_amplicon_identifiers.
+    MINT_AMPLICON_IDENTIFIERS = "mint-amplicon-identifiers"
+    # Amplicon: close the run's qiita.amplicon_sample gate — 'completed' with an
+    # ASV count for each sample denoise counted, 'no_data' for the rest of the
+    # pool. The runner materializes the 'pending' rows for any workflow that
+    # declares it. See qiita_control_plane.actions.library.finalize_amplicon_sample.
+    FINALIZE_AMPLICON_SAMPLE = "finalize-amplicon-sample"
 
 
 # =============================================================================
@@ -1126,3 +1136,17 @@ URL_PREP_SAMPLE_GLOBAL_FIELD_PREFIX = f"{API_PREFIX}{PATH_PREP_SAMPLE_GLOBAL_FIE
 URL_PREP_SAMPLE_GLOBAL_FIELD_LIST = (
     f"{URL_PREP_SAMPLE_GLOBAL_FIELD_PREFIX}{PATH_PREP_SAMPLE_GLOBAL_FIELD_ROOT}"
 )
+
+# =============================================================================
+# /feature-table/* — a run feature table, as a query over a cohort
+# =============================================================================
+PATH_FEATURE_TABLE_PREFIX = "/feature-table"
+PATH_FEATURE_TABLE_SAMPLE = "/sample"
+PATH_FEATURE_TABLE_VALUE = "/value"
+PATH_FEATURE_TABLE_FEATURE = "/feature"
+PATH_FEATURE_TABLE_TAXONOMY = "/taxonomy"
+URL_FEATURE_TABLE_PREFIX = f"{API_PREFIX}{PATH_FEATURE_TABLE_PREFIX}"
+URL_FEATURE_TABLE_SAMPLE = f"{URL_FEATURE_TABLE_PREFIX}{PATH_FEATURE_TABLE_SAMPLE}"
+URL_FEATURE_TABLE_VALUE = f"{URL_FEATURE_TABLE_PREFIX}{PATH_FEATURE_TABLE_VALUE}"
+URL_FEATURE_TABLE_FEATURE = f"{URL_FEATURE_TABLE_PREFIX}{PATH_FEATURE_TABLE_FEATURE}"
+URL_FEATURE_TABLE_TAXONOMY = f"{URL_FEATURE_TABLE_PREFIX}{PATH_FEATURE_TABLE_TAXONOMY}"

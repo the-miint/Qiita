@@ -24,6 +24,7 @@ from .processing import processing_router
 from .read import read_router
 from .read_masked import mask_definition_router, read_masked_router
 from .reference import router as reference_router
+from .run_feature_table import router as run_feature_table_router
 from .run_folder import router as run_folder_router
 from .sequence_range import router as sequence_range_router
 from .sequenced_sample import router as sequenced_sample_run_router
@@ -68,6 +69,7 @@ api_router.include_router(exported_processing_router)
 api_router.include_router(exported_identifier_router)
 api_router.include_router(study_router)
 api_router.include_router(study_access_router)
+api_router.include_router(run_feature_table_router)
 api_router.include_router(run_folder_router)
 api_router.include_router(upload_router)
 api_router.include_router(user_router)

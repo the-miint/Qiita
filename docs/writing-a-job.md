@@ -142,6 +142,26 @@ terminal *no-data* outcome, distinct from a failure. Follow the repo ethos:
 **fail fast, fail loud** — validate at boundaries and raise with context rather
 than silently returning a default.
 
+### Step logs
+
+A native job's two log files are what someone reads — with `qiita ticket logs` or
+over the step-logs route — when it goes wrong, so a native job writes them in one
+shape ([`qiita_common/step_log.py`](../qiita-common/src/qiita_common/step_log.py)):
+
+- **stderr** holds the narrative. Log through a module logger
+  (`logging.getLogger(__name__)`) at INFO; the launcher stamps each line it logs
+  with the time, level, and step name (a line a job writes to stderr directly,
+  rather than logging it, is not stamped). Write a handful of lines: the settings
+  the step runs with, what each stage kept or dropped (counts, not rows), and how
+  long the slow parts took. Use WARNING for something a person should look at, such
+  as samples that dropped out, and name them with `listed()`.
+- **stdout** holds the receipt: one JSON line the launcher writes when the step
+  ends. Call `summarize(name=count, ...)` with the counts that describe the
+  result, and they become the receipt's `summary`.
+
+An `action:` entry gets the same two files from the runner, so a library
+primitive logs and summarizes the same way.
+
 ## `plan` — optional resource sizing
 
 `def plan(inputs: Inputs) -> JobPlan` (sync — it runs at **submit time** in the
