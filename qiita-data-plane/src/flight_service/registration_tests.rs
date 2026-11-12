@@ -390,6 +390,22 @@ fn myloasm_tables_are_replaced_per_run_on_the_run_tables_keys() {
     }
 }
 
+/// Both gene-call tables are replaced per assembly run, and both read their delete
+/// keys from `gene_call_contig`, the one that is never empty for a run that called
+/// any subject. `gene_call` keyed on its own file would leave a previous run's genes
+/// behind whenever the re-run found none.
+#[test]
+fn gene_call_tables_are_replaced_per_run_on_the_contig_tables_keys() {
+    for table in crate::ducklake::GENE_CALL_TABLES {
+        let entry = REPLACE_KEY_TABLES
+            .iter()
+            .find(|entry| entry.table == *table)
+            .unwrap_or_else(|| panic!("{table} is not replace-keyed"));
+        assert_eq!(entry.key, &["prep_sample_idx", "processing_idx"], "{table}");
+        assert_eq!(entry.key_source, "gene_call_contig", "{table}");
+    }
+}
+
 /// Every `key_source` is itself a registered table carrying the same key.
 /// The borrowing delete SELECTs this entry's key columns out of the source's
 /// Parquet, so a source keyed on anything else would name a column that file

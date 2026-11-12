@@ -113,6 +113,12 @@ const REPLACE_KEY_TABLES: &[ReplaceKey] = &[
     ReplaceKey::borrows("myloasm_mapping", "myloasm_run"),
     ReplaceKey::borrows("myloasm_link", "myloasm_run"),
     ReplaceKey::borrows("myloasm_split", "myloasm_run"),
+    // The gene-call tables (`ducklake::ensure_gene_call_tables`), keyed like
+    // assembly_membership and for the same reason. Both read their keys from
+    // `gene_call_contig`; why that table is never empty is at
+    // `qiita_common.gene_call_constants.GENE_CALL_RUN_KEY`.
+    ReplaceKey::own("gene_call_contig", &["prep_sample_idx", "processing_idx"]),
+    ReplaceKey::borrows("gene_call", "gene_call_contig"),
     // amplicon's twin of assembly_membership: same key, same argument. amplicon_load
     // derives the whole run's rows from its own workspace and never reads the lake
     // back, and a re-run resolves to the same processing_idx, so a --force resubmit

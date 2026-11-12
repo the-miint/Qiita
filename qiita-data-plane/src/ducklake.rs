@@ -1072,6 +1072,65 @@ pub fn ensure_myloasm_tables(conn: &Connection) -> Result<(), Box<dyn std::error
     Ok(())
 }
 
+/// The gene-call tables, in the order `ensure_gene_call_tables` creates them.
+/// Test-only, as `MYLOASM_TABLES`.
+#[cfg(test)]
+pub(crate) const GENE_CALL_TABLES: &[&str] = &["gene_call", "gene_call_contig"];
+
+/// Create the gene-call tables: Prodigal's genes for each assembly subject CheckM
+/// scores, once per call set, with one row per contig of each called subject for its
+/// settings, outcome and model. What each column means, the call sets, and why the
+/// coordinates are on the contig's canonical strand are stated once in
+/// `qiita_common.gene_call_constants`, which also holds the column lists the writer
+/// uses; a qiita-common test pins those, and this table list, against the DDL below.
+///
+/// Both tables are replaced per run at register time, keyed on
+/// `(prep_sample_idx, processing_idx)` read from `gene_call_contig`
+/// (`flight_service::registration::REPLACE_KEY_TABLES`). Neither is Flight-readable.
+pub fn ensure_gene_call_tables(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS qiita_lake.gene_call (
+            prep_sample_idx BIGINT NOT NULL,
+            processing_idx BIGINT NOT NULL,
+            kind VARCHAR NOT NULL,
+            bin_id VARCHAR NOT NULL,
+            call_set VARCHAR NOT NULL,
+            parent_feature_idx BIGINT NOT NULL,
+            feature_idx BIGINT NOT NULL,
+            position BIGINT NOT NULL,
+            stop_position BIGINT NOT NULL,
+            strand VARCHAR NOT NULL,
+            score DOUBLE NOT NULL,
+            partial_left BOOLEAN NOT NULL,
+            partial_right BOOLEAN NOT NULL,
+            start_type VARCHAR NOT NULL,
+            confidence DOUBLE NOT NULL,
+            attributes MAP(VARCHAR, VARCHAR) NOT NULL,
+            protein VARCHAR NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS qiita_lake.gene_call_contig (
+            prep_sample_idx BIGINT NOT NULL,
+            processing_idx BIGINT NOT NULL,
+            kind VARCHAR NOT NULL,
+            bin_id VARCHAR NOT NULL,
+            call_set VARCHAR NOT NULL,
+            parent_feature_idx BIGINT NOT NULL,
+            contig_order INTEGER NOT NULL,
+            meta_mode BOOLEAN NOT NULL,
+            closed_ends BOOLEAN NOT NULL,
+            mask_regions BOOLEAN NOT NULL,
+            status VARCHAR NOT NULL,
+            translation_table INTEGER,
+            uses_sd BOOLEAN,
+            meta_bin INTEGER,
+            model_desc VARCHAR,
+            model_gc_content DOUBLE
+        );",
+    )?;
+    Ok(())
+}
+
 /// per-sample ASV feature counts from a deblur run: feature membership plus
 /// abundance, keyed by `processing_idx` (the run) and `feature_idx` (the ASV);
 /// plus the ASV sequences themselves (`amplicon_sequence` +
@@ -1211,6 +1270,7 @@ pub fn ensure_lake_tables(conn: &Connection) -> Result<(), Box<dyn std::error::E
     ensure_alignment_tables(conn)?;
     ensure_assembly_tables(conn)?;
     ensure_myloasm_tables(conn)?;
+    ensure_gene_call_tables(conn)?;
     ensure_amplicon_tables(conn)?;
     // The lock row is seeded here so no request path has to create it.
     ensure_registration_lock(conn)?;
@@ -2160,6 +2220,34 @@ mod tests {
         ensure_myloasm_tables(&conn).expect("second ensure_myloasm_tables (idempotent)");
 
         for table in MYLOASM_TABLES {
+            let cols = table_schema(&conn, table);
+            let lead: Vec<(&str, &str, &str)> = cols
+                .iter()
+                .take(2)
+                .map(|(n, t, null)| (n.as_str(), t.as_str(), null.as_str()))
+                .collect();
+            assert_eq!(
+                lead,
+                [
+                    ("prep_sample_idx", "BIGINT", "NO"),
+                    ("processing_idx", "BIGINT", "NO")
+                ],
+                "{table} must lead with the run key"
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    #[cfg(feature = "integration")]
+    fn ensure_gene_call_tables_is_idempotent() {
+        // Re-running on every DP restart must be a no-op, and both tables must exist
+        // afterwards, keyed on the assembly run.
+        let conn = setup_conn();
+        ensure_gene_call_tables(&conn).expect("first ensure_gene_call_tables");
+        ensure_gene_call_tables(&conn).expect("second ensure_gene_call_tables (idempotent)");
+
+        for table in GENE_CALL_TABLES {
             let cols = table_schema(&conn, table);
             let lead: Vec<(&str, &str, &str)> = cols
                 .iter()
