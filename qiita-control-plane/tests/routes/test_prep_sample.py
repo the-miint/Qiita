@@ -385,9 +385,9 @@ async def test_create_prep_sample_field_terminology_coupling_422(ctx):
 @pytest.mark.parametrize("case", STUDY_FIELD_CREATE_AUTHZ_CASES)
 async def test_create_prep_sample_field_authz(ctx, case, no_prep_sample_write_client):
     """Tests the case where each row of the shared access matrix calls the
-    create-field route: owner, admin grant, and wet_lab_admin bypass are
-    admitted; no access, sub-ADMIN tier, and a missing scope are refused; a
-    nonexistent study is 404 even for a role-bypass caller.
+    create-field route: owner, admin and member grants, and wet_lab_admin
+    bypass are admitted; no access, a viewer grant, and a missing scope are
+    refused; a nonexistent study is 404 even for a role-bypass caller.
     """
     await assert_study_field_create_authz(
         ctx,

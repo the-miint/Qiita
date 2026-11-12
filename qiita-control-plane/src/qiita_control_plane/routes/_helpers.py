@@ -36,6 +36,7 @@ from ..auth.guards import (
     PrepSampleReadAccess,
     filter_prep_samples_caller_can_read,
     resource_retired_detail,
+    tier_at_least,
 )
 from ..auth.principal import HumanUser, Principal
 from ..repositories._sample_helpers import (
@@ -46,9 +47,11 @@ from ..repositories._sample_helpers import (
     DuplicateValueSameStudyError,
     EntityMetadataSpec,
     MetadataChecklistUnknownError,
+    MetadataFieldTierError,
     MetadataParseError,
     MetadataRow,
     MetadataUnknownFieldsError,
+    MetadataValueTierError,
     MissingValueOnUniqueFieldError,
     OwnerSampleIdMetadataWriteError,
     SampleEntityKind,
@@ -68,7 +71,9 @@ from ..repositories._sample_helpers import (
     fetch_global_metadata,
     fetch_local_metadata,
     fetch_metadata_checklist_idx_by_name,
+    fetch_owner_sample_id_study_field_idxs,
     fetch_study_field,
+    fetch_study_field_tier,
     fetch_study_fields_by_display_names,
     parse_text_for_data_type,
     update_study_field,
@@ -526,6 +531,7 @@ async def resolve_and_write_study_scoped_metadata(
     noun: str,
     metadata: Mapping[str, str],
     caller_idx: int,
+    tiers: CallerMetadataTiers,
     global_internal_names: bool = False,
     unlinked_detail: str | None = None,
     retired_detail: str | None = None,
@@ -574,6 +580,7 @@ async def resolve_and_write_study_scoped_metadata(
         study_idx=study_idx,
         metadata=metadata,
         caller_idx=caller_idx,
+        tiers=tiers,
         unlinked_detail=reported_unlinked_detail,
         global_internal_names=global_internal_names,
     )
@@ -650,6 +657,8 @@ async def resolve_study_entity_by_unique_field(
 # excluded — they are mapped per entity, not here.
 SAMPLE_METADATA_WRITE_ERRORS = (
     MetadataUnknownFieldsError,
+    MetadataFieldTierError,
+    MetadataValueTierError,
     MetadataParseError,
     StudyFieldConflictError,
     DuplicateGlobalFieldTargetError,
@@ -662,23 +671,51 @@ SAMPLE_METADATA_WRITE_ERRORS = (
 )
 
 
+def _raise_value_above_tier(*, spec: EntityMetadataSpec, field_keys: list[str]) -> NoReturn:
+    """The 403 for a write that would touch a value that the caller may not
+    read. It names field keys only: no value, no missing reason, no study, and
+    nothing that differs with what the hidden value holds."""
+    raise HTTPException(
+        status_code=403,
+        detail=(
+            f"{spec.entity_kind} metadata {', '.join(repr(k) for k in field_keys)}:"
+            " restricted to a tier above yours"
+        ),
+    )
+
+
 async def raise_http_for_sample_metadata_write_error(
-    conn: asyncpg.Connection, exc: Exception
+    conn: asyncpg.Connection,
+    exc: Exception,
+    *,
+    spec: EntityMetadataSpec,
 ) -> NoReturn:
     """Map a sample-family metadata-write exception to its HTTPException.
 
-    One exception maps to exactly one response, so the mapping cannot drift.
+    Each exception type has one branch here, so the mapping cannot drift.
     Parse, unknown-field, study-field-conflict, duplicate-global-target,
     owner-sample-id, missing-value-on-a-unique-field, and
     value-rewrite-on-a-unique-field errors map to 422; a slot collision and a
     study-local uniqueness collision to 409 (the former diagnosed against
-    conn); a transient write race to 503. Always raises.
+    conn); a transient write race to 503; a field or a value above the
+    caller's tier to 403. Always raises.
     """
     if isinstance(exc, MetadataUnknownFieldsError):
         raise HTTPException(
             status_code=422,
             detail=f"unknown metadata fields: {', '.join(exc.field_keys)}",
         )
+    if isinstance(exc, MetadataFieldTierError):
+        refused = ", ".join(f"{key!r} requires {tier.value!r}" for key, tier in exc.refused.items())
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"metadata fields above your tier {exc.caller_tier.value!r}"
+                f" on study {exc.study_idx}: {refused}"
+            ),
+        )
+    if isinstance(exc, MetadataValueTierError):
+        _raise_value_above_tier(spec=spec, field_keys=exc.field_keys)
     if isinstance(exc, MetadataParseError):
         raise HTTPException(
             status_code=422,
@@ -761,6 +798,7 @@ async def write_and_map_sample_metadata(
     study_idx: int,
     metadata: Mapping[str, str],
     caller_idx: int,
+    tiers: CallerMetadataTiers,
     unlinked_detail: str,
     global_internal_names: bool = False,
 ) -> SampleMetadataWriteResponse:
@@ -774,10 +812,12 @@ async def write_and_map_sample_metadata(
     which is the key a globally-linked value reads back under; it equals the key
     the caller sent only when that key was the global's own internal_name, so a
     value resolved through a study-local alias reads back under a different key
-    whatever the flag says. A cross-study slot collision still 409s; a
-    same-study, same-field, different-value rewrite is a last-writer-wins
-    overwrite -- there is no If-Match on this path, so the caller accepts
-    lost-update semantics.
+    whatever the flag says. A cross-study slot collision still 409s, unless
+    its stored value is one a caller at `tiers` may not read; a same-study,
+    same-field, different-value rewrite is a last-writer-wins overwrite --
+    there is no If-Match on this path, so the caller accepts lost-update
+    semantics. tiers bounds the fields and values written (see
+    `write_sample_metadata`), and every refusal it causes is a 403.
 
     unlinked_detail is the 404 body for a study link the database refuses at
     write time; the caller supplies it because only the caller knows which idx
@@ -797,11 +837,12 @@ async def write_and_map_sample_metadata(
             metadata=metadata,
             caller_idx=caller_idx,
             allow_local=True,
+            tiers=tiers,
             on_conflict="upsert",
             global_internal_names=global_internal_names,
         )
     except SAMPLE_METADATA_WRITE_ERRORS as exc:
-        await raise_http_for_sample_metadata_write_error(conn, exc)
+        await raise_http_for_sample_metadata_write_error(conn, exc, spec=spec)
     except asyncpg.RaiseError as exc:
         # The retired-link trigger tags its error DETAIL with a `trigger` key
         # naming the raising DB function. Dispatch on that key (never on message
@@ -845,6 +886,88 @@ async def write_and_map_sample_metadata(
     )
 
 
+# The field attributes that only an admin on the study may set, in the order in
+# which a refusal names them. tier_override decides which tier the field's
+# values require, which is a study admin's decision whatever tier it sets.
+# unique_in_study and data_type are judged against every value that the field
+# holds: values that already repeat, a missing-value marker, a value on a
+# published sample. Each answer would tell a caller below admin about values
+# hidden from them, and an admin on the study can read every value. The
+# refusal turns on the keys that a body names, never on what the field holds,
+# so it says nothing about the field's values either.
+_ADMIN_ONLY_FIELD_ATTRIBUTES = ("tier_override", "unique_in_study", "data_type")
+
+
+def _require_admin_to_set_field_attributes(
+    *, tiers: CallerMetadataTiers, study_idx: int, noun: str, attributes: list[str]
+) -> None:
+    """403 unless the caller is admin on the study, naming the attributes that
+    require it (see _ADMIN_ONLY_FIELD_ATTRIBUTES)."""
+    caller_tier = tiers.tier_on(study_idx)
+    if not tier_at_least(caller_tier, Tier.ADMIN):
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"setting {', '.join(attributes)} on a {noun} field requires"
+                f" {Tier.ADMIN.value!r} on study {study_idx}; you hold {caller_tier.value!r}"
+            ),
+        )
+
+
+async def _require_field_within_caller_tier(
+    conn: asyncpg.Connection,
+    *,
+    spec: EntityMetadataSpec,
+    study_idx: int,
+    study_field_idx: int,
+    display_name: str,
+    tiers: CallerMetadataTiers,
+) -> None:
+    """403 unless the field's tier is within the caller's tier on the study. A
+    caller may create, link, or edit only a field whose values they could read,
+    so that a field's definition cannot reach values above their tier."""
+    caller_tier = tiers.tier_on(study_idx)
+    field_tier = await fetch_study_field_tier(conn, spec=spec, study_field_idx=study_field_idx)
+    if not tier_at_least(caller_tier, field_tier):
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"{spec.entity_kind} field {display_name!r} requires {field_tier.value!r} on"
+                f" study {study_idx}, above your tier {caller_tier.value!r}"
+            ),
+        )
+
+
+async def _require_admin_to_edit_owner_sample_id_field(
+    conn: asyncpg.Connection,
+    *,
+    spec: EntityMetadataSpec,
+    study_idx: int,
+    study_field_idx: int,
+    display_name: str,
+    tiers: CallerMetadataTiers,
+) -> None:
+    """403 unless the caller is admin on the study, when the field holds the
+    study's owner sample ids. An import finds that field by its display_name,
+    and the field keeps one owner id per sample. Renaming it, or loosening it,
+    lets a later import mint a second owner-id field, so that two samples hold
+    the same owner id. Editing it stays with a study admin."""
+    caller_tier = tiers.tier_on(study_idx)
+    if tier_at_least(caller_tier, Tier.ADMIN):
+        return
+    if await fetch_owner_sample_id_study_field_idxs(
+        conn, spec=spec, study_field_idxs=[study_field_idx]
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"{spec.entity_kind} field {display_name!r} holds owner sample ids;"
+                f" editing it requires {Tier.ADMIN.value!r} on study {study_idx};"
+                f" you hold {caller_tier.value!r}"
+            ),
+        )
+
+
 async def create_and_map_study_field(
     conn: asyncpg.Connection,
     *,
@@ -852,16 +975,28 @@ async def create_and_map_study_field(
     study_idx: int,
     body: SampleStudyFieldCreateRequest,
     caller_idx: int,
+    tiers: CallerMetadataTiers,
     response_model: type[SampleStudyFieldResponse],
 ) -> SampleStudyFieldResponse:
     """Create one study-local field for a sample-family entity and shape the
     stored row into response_model.
 
     Create-side conflicts map to 409 and DB-level violations to 422 (the
-    Pydantic body should preempt the CHECK, but it is the last defense). The
-    caller owns the transaction.
+    Pydantic body should preempt the CHECK, but it is the last defense). A body
+    that sets tier_override is 403 before anything is written unless the caller
+    is admin on the study. A field whose tier is above the caller's at `tiers`
+    is 403 as well; that is checked once the row exists, so the caller's
+    transaction rolls the row back. The caller owns the transaction.
+
+    unique_in_study and data_type need no admin here, unlike on an edit. A
+    local field is new, so it holds no values for either to be judged against;
+    a linked field cannot carry either one (NOT_SETTABLE_ON_LINKED_FIELD).
     """
     noun = spec.entity_kind
+    if body.tier_override is not None:
+        _require_admin_to_set_field_attributes(
+            tiers=tiers, study_idx=study_idx, noun=noun, attributes=["tier_override"]
+        )
     try:
         row = await create_study_field_and_read_back(
             conn,
@@ -897,6 +1032,14 @@ async def create_and_map_study_field(
     except asyncpg.CheckViolationError:
         raise_generic_check_violation(noun)
 
+    await _require_field_within_caller_tier(
+        conn,
+        spec=spec,
+        study_idx=study_idx,
+        study_field_idx=row["idx"],
+        display_name=body.display_name,
+        tiers=tiers,
+    )
     return map_study_field_row(row, spec=spec, response_model=response_model)
 
 
@@ -1049,6 +1192,7 @@ async def patch_and_map_study_field(
     study_field_idx: int,
     body: SampleStudyFieldPatchRequest,
     if_match: str | None,
+    tiers: CallerMetadataTiers,
     response_model: type[SampleStudyFieldResponse],
 ) -> SampleStudyFieldResponse:
     """Edit one study-local field and shape the stored row into response_model.
@@ -1058,6 +1202,14 @@ async def patch_and_map_study_field(
     past the ETag check: absent is 404, a field belonging to another study is
     also 404 (it exists, but not where this path addresses, and saying so
     differently would confirm it), and a stale tag is 412.
+
+    Three tier rules, all 403. Only an admin on the study may name
+    tier_override, unique_in_study or data_type (_ADMIN_ONLY_FIELD_ATTRIBUTES
+    says why); that turns on the body alone, so it is checked before the row
+    is read or locked. Once the row is read, a field whose tier is above the
+    caller's at `tiers` cannot be edited at all, and neither can a field that
+    holds the study's owner sample ids unless the caller is admin
+    (_require_admin_to_edit_owner_sample_id_field says why).
 
     Then the two shape rules, both 422. A linked row refuses the attributes it
     inherits, judged against the stored row because the body carries no link to
@@ -1092,6 +1244,11 @@ async def patch_and_map_study_field(
     noun = spec.entity_kind
     if_match = require_if_match(if_match)
     named = body.model_fields_set
+    admin_only = [name for name in _ADMIN_ONLY_FIELD_ATTRIBUTES if name in named]
+    if admin_only:
+        _require_admin_to_set_field_attributes(
+            tiers=tiers, study_idx=study_idx, noun=noun, attributes=admin_only
+        )
 
     # Bound the waits before taking the first of the locks these keys cause.
     if named & _METADATA_LOCKING_PATCH_FIELDS:
@@ -1111,6 +1268,23 @@ async def patch_and_map_study_field(
             " another edit of it is in flight; re-issue the request to retry"
         )
     require_etag_match(row, if_match=if_match, label=f"{noun} field", row_idx=study_field_idx)
+
+    await _require_field_within_caller_tier(
+        conn,
+        spec=spec,
+        study_idx=study_idx,
+        study_field_idx=study_field_idx,
+        display_name=row["display_name"],
+        tiers=tiers,
+    )
+    await _require_admin_to_edit_owner_sample_id_field(
+        conn,
+        spec=spec,
+        study_idx=study_idx,
+        study_field_idx=study_field_idx,
+        display_name=row["display_name"],
+        tiers=tiers,
+    )
 
     if row[spec.study_field_global_fk_column] is not None:
         inherited = [name for name in NOT_SETTABLE_ON_LINKED_FIELD if name in named]

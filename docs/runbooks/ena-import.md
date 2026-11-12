@@ -396,7 +396,8 @@ qiita biosample patch-metadata-by-unique-field --study-idx S \
 ```
 
 The value is a loaded NCBI Taxonomy id or a missing-value reason such as `not applicable`.
-Either path takes one biosample per call and needs ADMIN on the study or `wet_lab_admin`.
+Either path takes one biosample per call and needs `member` or above on the study, or
+`wet_lab_admin`; a field or value above your tier on the study is refused with 403.
 
 ENA's `neg_cont_type` and `pos_cont_type` tags (also spelled `negative control type` and
 `positive control type`) are kept as study-local text and never make a biosample a control,

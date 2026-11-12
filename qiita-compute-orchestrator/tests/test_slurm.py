@@ -17,6 +17,9 @@ test_slurm_backend.py.
 from __future__ import annotations
 
 import json
+import os
+import stat
+import subprocess
 from datetime import timedelta
 from pathlib import Path
 
@@ -306,6 +309,36 @@ def test_native_payload_script_does_not_pin_to_one_cpu(native_kwargs):
     # bare `srun python` / `srun <python>` without the guard is the bug.
     assert "srun python -m" not in script
     assert script.index("SRUN_CPUS_PER_TASK") < script.index("srun --cpu-bind=none")
+
+
+def test_native_payload_script_makes_job_created_dirs_group_writable(native_kwargs, tmp_path):
+    """A directory the native job creates must come out group-writable even when
+    the job inherits umask 022, so registration can unlink the files it moves out
+    of it (see `_build_native_script`). Runs the generated script under bash with
+    a stand-in `srun` that creates a directory the way a job does."""
+    payload = build_job_submit_payload(**native_kwargs)
+    script_path = tmp_path / "job.sh"
+    script_path.write_text(payload["script"])
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    fake_srun = bin_dir / "srun"
+    fake_srun.write_text('#!/bin/bash\nmkdir "$JOB_MADE_DIR"\n')
+    fake_srun.chmod(0o755)
+    job_made_dir = tmp_path / "output" / "staging"
+    job_made_dir.parent.mkdir()
+
+    subprocess.run(
+        ["bash", str(script_path)],
+        env={
+            **os.environ,
+            "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            "JOB_MADE_DIR": str(job_made_dir),
+        },
+        umask=0o022,
+        check=True,
+    )
+
+    assert stat.S_IMODE(job_made_dir.stat().st_mode) & 0o777 == 0o770
 
 
 def test_native_payload_has_no_bind_mounts(native_kwargs):

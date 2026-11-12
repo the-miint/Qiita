@@ -32,6 +32,8 @@ from qiita_common.models import (
 )
 
 from ..auth.guards import (
+    METADATA_BYPASS_ROLE,
+    caller_metadata_tiers,
     require_complete_profile,
     require_human,
     require_prep_sample_exists,
@@ -158,23 +160,20 @@ async def create_prep_sample_field(
     _scope: Principal = Depends(require_scope(Scope.PREP_SAMPLE_WRITE)),
     _exists: None = Depends(require_study_exists),
     _access: None = Depends(
-        require_study_access(min_tier=Tier.ADMIN, bypass_role=SystemRole.WET_LAB_ADMIN)
+        require_study_access(min_tier=Tier.MEMBER, bypass_role=METADATA_BYPASS_ROLE)
     ),
 ) -> PrepSampleStudyFieldResponse:
     """Create a study-local prep_sample field definition (no metadata value).
 
     The caller must be a HumanUser with profile_complete=True, hold the
-    prep_sample:write scope, and have `Tier.ADMIN` access (or higher) to the
-    path's study — study owner, an ADMIN study_access row, or wet_lab_admin /
-    system_admin (role bypass). `require_study_exists` composes alongside
-    `require_study_access` so role-bypass callers still get 404 on a
+    prep_sample:write scope, and have `Tier.MEMBER` access (or higher) to the
+    path's study — study owner, a MEMBER or ADMIN study_access row, or
+    wet_lab_admin / system_admin (role bypass). `require_study_exists` composes
+    alongside `require_study_access` so role-bypass callers still get 404 on a
     non-existent study_idx. A field of that name already on the study is a 409;
-    the response body is the created field.
-
-    Access policy is interim: this route requires `Tier.ADMIN`, as the
-    study-scoped prep_sample metadata writes do, until those writes apply the
-    visibility rule. It then requires `Tier.MEMBER`, since minting a
-    study-local field is work a study member is meant to do.
+    the response body is the created field. Setting tier_override, or creating
+    a field whose tier is above the caller's, is a 403
+    (create_and_map_study_field).
 
     prep_sample_global_field_idx discriminates two mutually-exclusive modes.
     Purely-local (omitted): data_type is required, plus optional required /
@@ -199,6 +198,7 @@ async def create_prep_sample_field(
             study_idx=study_idx,
             body=body,
             caller_idx=user.principal_idx,
+            tiers=await caller_metadata_tiers(conn, user),
             response_model=PrepSampleStudyFieldResponse,
         )
 
@@ -320,15 +320,16 @@ async def patch_prep_sample_field(
     _scope: Principal = Depends(require_scope(Scope.PREP_SAMPLE_WRITE)),
     _exists: None = Depends(require_study_exists),
     _access: None = Depends(
-        require_study_access(min_tier=Tier.ADMIN, bypass_role=SystemRole.WET_LAB_ADMIN)
+        require_study_access(min_tier=Tier.MEMBER, bypass_role=METADATA_BYPASS_ROLE)
     ),
 ) -> PrepSampleStudyFieldResponse:
     """Edit a study-local prep_sample field definition.
 
     Same access bar as the create route on this study. If-Match is required;
     patch_and_map_study_field carries the rest of the contract, including which
-    attributes a globally-linked field refuses and what happens when a field's
-    existing values cannot satisfy a uniqueness policy being switched on.
+    attributes only an admin on the study may change, which attributes a
+    globally-linked field refuses, and what happens when a field's existing
+    values cannot satisfy a uniqueness policy being switched on.
 
     The response carries an `ETag` header derived from the new row's
     `updated_at`, matching the create and read endpoints' contract.
@@ -341,6 +342,7 @@ async def patch_prep_sample_field(
             study_field_idx=study_field_idx,
             body=body,
             if_match=if_match,
+            tiers=await caller_metadata_tiers(conn, user),
             response_model=PrepSampleStudyFieldResponse,
         )
 

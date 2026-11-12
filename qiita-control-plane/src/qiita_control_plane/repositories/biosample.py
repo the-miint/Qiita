@@ -24,6 +24,7 @@ from ._sample_helpers import (
     fetch_study_idxs_by_entity_idx,
     link_entity_to_studies,
     preflight_sample_metadata,
+    require_tiers_read_every_value,
     resolve_local_study_field,
     validate_primary_secondary_studies,
     write_local_metadata_or_diagnose,
@@ -35,7 +36,8 @@ from .biosample_metadata import (
     BiosampleOwnerIdMissingValueError,
     insert_owner_biosample_id_metadata,
 )
-from .exported_entity import export_entity_id_select
+from .exported_entity import export_entity_id_lookup, export_entity_id_select
+from .study_access import CallerMetadataTiers
 
 # Owners' ids for their own biosamples sometimes inadvertently contain PII, so an
 # owner-biosample-id value requires at least member, whatever the study's
@@ -90,8 +92,7 @@ _BIOSAMPLE_RETURNING_COLS = (
     " biosample_accession, ena_sample_accession, matrix_tube_id,"
     " last_submission_at, submission_error,"
     " created_by_idx, created_at, updated_at,"
-    " retired, retired_by_idx, retired_at, retire_reason, "
-    + export_entity_id_select("biosample", alias="biosample")
+    " retired, retired_by_idx, retired_at, retire_reason, " + export_entity_id_select("biosample")
 )
 
 
@@ -172,6 +173,7 @@ async def resolve_or_import_biosample_by_ena_accession(
     metadata: dict[str, str],
     local_metadata: dict[str, str],
     metadata_checklist_idx: int,
+    tiers: CallerMetadataTiers,
 ) -> tuple[int, bool]:
     """Find a biosample by ena_sample_accession, importing it with its metadata
     when absent. Returns (idx, created).
@@ -186,6 +188,9 @@ async def resolve_or_import_biosample_by_ena_accession(
     with a global field the caller declined to map (ENA's environmental-context
     tags are spelled exactly like their ENVO-typed globals, and its values are
     submitter free text).
+
+    tiers is the caller's, and must meet `require_tiers_read_every_value` on
+    study_idx: the `local_metadata` writes check no tier.
     """
     require_transaction(conn)
 
@@ -208,6 +213,7 @@ async def resolve_or_import_biosample_by_ena_accession(
                 owner_biosample_id_field_name=owner_biosample_id_field_name,
                 owner_biosample_id_value=owner_biosample_id_value,
                 metadata=metadata,
+                tiers=tiers,
                 metadata_checklist_idx=metadata_checklist_idx,
                 ena_sample_accession=ena_sample_accession,
             )
@@ -293,10 +299,22 @@ async def fetch_biosample_idxs_for_study(
     return [r["biosample_idx"] for r in rows]
 
 
-# The natural-key columns a biosample lookup may key on: the two wire-facing
-# accession columns plus matrix_tube_id. Deriving from BiosampleAccessionField
-# keeps the accession set defined once, in qiita_common.models.
-BiosampleLookupKey = Literal[*get_args(BiosampleAccessionField), "matrix_tube_id"]
+# The natural keys a biosample lookup may key on: the two wire-facing accession
+# columns, matrix_tube_id, and export_entity_id. Deriving from
+# BiosampleAccessionField keeps the accession set defined once, in
+# qiita_common.models.
+BiosampleLookupKey = Literal[
+    *get_args(BiosampleAccessionField), "matrix_tube_id", "export_entity_id"
+]
+
+# Each lookup key's (column expression, join) over `qiita.biosample`. Only text from
+# this closed mapping reaches the SQL, since identifiers cannot be bound.
+_BIOSAMPLE_LOOKUP_SQL: dict[BiosampleLookupKey, tuple[str, str]] = {
+    "biosample_accession": ("biosample.biosample_accession", ""),
+    "ena_sample_accession": ("biosample.ena_sample_accession", ""),
+    "matrix_tube_id": ("biosample.matrix_tube_id", ""),
+    "export_entity_id": export_entity_id_lookup("biosample"),
+}
 
 
 async def fetch_biosample_idxs_by_natural_key(
@@ -304,45 +322,29 @@ async def fetch_biosample_idxs_by_natural_key(
     *,
     key: BiosampleLookupKey,
     values: list[str],
-) -> dict[str, int]:
+) -> dict[str, int]:  # same-pattern-ok: biosample has a tube key and drops
+    # retired rows; study has neither
     """Return `{value: biosample_idx}` for every value in `values` that
-    resolves to a non-retired qiita.biosample row via the named natural-key
-    column.
+    resolves to a non-retired qiita.biosample row via the natural key named by
+    `key`.
 
     Values absent from the table or carried only by retired rows are
     omitted from the returned map, so a caller can detect misses by
     set-difference against the input `values`.
     """
-    if key not in get_args(BiosampleLookupKey):
+    if key not in _BIOSAMPLE_LOOKUP_SQL:
         raise ValueError(f"invalid biosample lookup key: {key!r}")
     if not values:
         return {}
-    # Column name is interpolated because Postgres can't parameter-bind
-    # identifiers; the guard above pins it to the BiosampleLookupKey set.
+    column_sql, join_sql = _BIOSAMPLE_LOOKUP_SQL[key]
     rows = await pool_or_conn.fetch(
-        f"SELECT idx, {key} FROM qiita.biosample"
-        f" WHERE {key} = ANY($1::text[])"
-        "   AND retired = false",
+        f"SELECT biosample.idx, {column_sql} AS lookup_value FROM qiita.biosample{join_sql}"
+        f" WHERE {column_sql} = ANY($1::text[])"
+        "   AND biosample.retired = false",
         values,
     )
-    return {r[key]: r["idx"] for r in rows}
-
-
-async def fetch_biosample_identity_by_tube(
-    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
-    tubes: list[str],
-) -> dict[str, tuple[int, str | None]]:
-    """Return `{matrix_tube_id: (biosample_idx, biosample_accession)}` for every
-    tube in `tubes` carried by a non-retired biosample. Absent tubes are omitted."""
-    if not tubes:
-        return {}
-    rows = await pool_or_conn.fetch(
-        "SELECT idx, matrix_tube_id, biosample_accession FROM qiita.biosample"
-        " WHERE matrix_tube_id = ANY($1::text[])"
-        "   AND retired = false",
-        tubes,
-    )
-    return {r["matrix_tube_id"]: (r["idx"], r["biosample_accession"]) for r in rows}
+    resolved = {r["lookup_value"]: r["idx"] for r in rows}
+    return resolved
 
 
 async def fetch_active_study_idxs_by_biosample_idx(
@@ -401,6 +403,7 @@ async def import_biosample_from_owner_biosample_id(
     owner_biosample_id_value: str,
     caller_idx: int,
     metadata: dict[str, str],
+    tiers: CallerMetadataTiers,
     metadata_checklist_idx: int | None = None,
     biosample_accession: str | None = None,
     ena_sample_accession: str | None = None,
@@ -430,7 +433,9 @@ async def import_biosample_from_owner_biosample_id(
     display_name; an existing study-local alias of a global field writes
     through to that global field. No new purely-local field is ever created
     for a metadata key — only the owner-biosample-id field is created on
-    import.
+    import. tiers is the caller's, and must meet
+    `require_tiers_read_every_value` on primary_study_idx, since the
+    owner-biosample-id write checks no tier.
 
     primary_study_idx owns the globally-linked field rows and the
     owner-biosample-id local field row; secondary studies share the
@@ -493,6 +498,7 @@ async def import_biosample_from_owner_biosample_id(
     """
     # Fail-fast guard against caller forgetting to wrap in a transaction.
     require_transaction(conn)
+    require_tiers_read_every_value(tiers, study_idx=primary_study_idx)
 
     # Reject primary appearing in the secondary list at the composer boundary.
     validate_primary_secondary_studies(primary_study_idx, secondary_study_idxs)
@@ -591,6 +597,7 @@ async def import_biosample_from_owner_biosample_id(
             known_missing_reasons=known_missing_reasons,
             allow_local=True,
             global_internal_names=global_internal_names,
+            tiers=tiers,
         )
     else:
         deferred = None
@@ -604,6 +611,7 @@ async def import_biosample_from_owner_biosample_id(
             allow_local=True,
             known_missing_reasons=known_missing_reasons,
             global_internal_names=global_internal_names,
+            tiers=tiers,
         )
 
     return BiosampleImportResult(

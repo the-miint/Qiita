@@ -283,6 +283,12 @@ Beyond the kind / role / scope guards above, `auth.guards` carries resource-acce
 | `filter_studies_caller_can_read(min_tier, ...)` | the **narrowing** counterpart: returns the subset of a study list the caller may read, rather than raising. One query for the whole set. Anonymous narrows to nothing. |
 | `filter_prep_samples_caller_can_read(min_tier, ...)` | resolves a **prep_sample** cohort: readable / unlinked / blocked-by-study. A sample survives only if the caller holds `min_tier` on *every* study it is still linked to. |
 
+`require_study_access` admits a caller to a study-scoped route. On a route
+that reads or writes metadata, which fields and values that caller may then
+read or write is decided by
+[Metadata visibility tiers](architecture/data-model.md#metadata-visibility-tiers),
+from the tiers that `caller_metadata_tiers` returns.
+
 **Narrowing vs raising is a deliberate split, not two ways of doing one thing.** The discovery reads narrow — a pool spans studies, so 403ing the whole pool would make it undiscoverable to someone who legitimately owns part of it, and no scientific result depends on a listing. The alignment mint raises, because a quietly narrowed *cohort* is a different scientific result under the name of the one that was asked for (coverage filtering makes a feature table cohort-dependent). Both go through `filter_prep_samples_caller_can_read`, which is the single definition of "may this caller read this sample" — two copies is how discovery comes to advertise a cohort the mint then refuses.
 
 That function also decides the **orphan** case, and decides it differently from the authoring gates: a prep_sample whose every `prep_sample_to_study` link is retired has no study to authorize against, so it is **denied**. `_check_prep_sample_study_access` (work-ticket submit) lets an orphan pass, on the reasoning that a *write* whose downstream lookups fail anyway is not worth blocking there. That reasoning does not carry to a *read* gate, where failing open on a data-integrity anomaly means anyone may read the sample. A caller at or above the bypass role sees orphans, deliberately, since they are the ones who can act on the anomaly.

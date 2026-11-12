@@ -4202,23 +4202,43 @@ async def test_patch_sequenced_sample_metadata_missing_scope_403(ctx, no_prep_sa
     assert "prep_sample:write" in resp.json()["detail"]
 
 
-@pytest.mark.parametrize("tier", ["viewer", "member"])
-async def test_patch_sequenced_sample_metadata_below_admin_tier_403(ctx, tier):
-    """Tests the case where a regular user's study access is below the ADMIN
-    minimum (viewer or member): the write is 403.
+async def test_patch_sequenced_sample_metadata_viewer_tier_403(ctx):
+    """Tests the case where a regular user's study access is viewer, below the
+    MEMBER minimum: the write is 403.
     """
-    seeded = await _seed_one_sequenced_sample(ctx, f"patch-{tier}")
+    seeded = await _seed_one_sequenced_sample(ctx, "patch-viewer")
     await _grant_study_access(
         ctx,
         study_idx=seeded["study_idx"],
         principal_idx=ctx["user_session"]["principal_idx"],
-        tier=tier,
+        tier="viewer",
         granted_by_idx=ctx["wet_session"]["principal_idx"],
     )
     resp = await _patch_sequenced_metadata(
         ctx["user"], seeded["study_idx"], seeded["sequenced_sample_idx"], {"F": "x"}
     )
     assert resp.status_code == 403, resp.text
+
+
+async def test_patch_sequenced_sample_metadata_member_tier_writes(ctx):
+    """Tests the case where a regular user with MEMBER study access writes a
+    public-tier global field: the MEMBER minimum is satisfied and the value is
+    INSERTED.
+    """
+    seeded = await _seed_one_sequenced_sample(ctx, "patch-member")
+    _global_idx, name, internal_name = await _seed_prep_global_field(ctx)
+    await _grant_study_access(
+        ctx,
+        study_idx=seeded["study_idx"],
+        principal_idx=ctx["user_session"]["principal_idx"],
+        tier="member",
+        granted_by_idx=ctx["wet_session"]["principal_idx"],
+    )
+    resp = await _patch_sequenced_metadata(
+        ctx["user"], seeded["study_idx"], seeded["sequenced_sample_idx"], {name: "MVAL"}
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["results"][name]["outcome"] == "inserted"
 
 
 async def test_patch_sequenced_sample_metadata_no_access_403(ctx):
@@ -4234,8 +4254,7 @@ async def test_patch_sequenced_sample_metadata_no_access_403(ctx):
 
 async def test_patch_sequenced_sample_metadata_admin_tier_writes(ctx):
     """Tests the case where a regular user with ADMIN study access (not the role
-    bypass) writes metadata: the ADMIN minimum is satisfied and the value is
-    INSERTED.
+    bypass) writes metadata: the value is INSERTED.
     """
     seeded = await _seed_one_sequenced_sample(ctx, "patch-admin")
     _global_idx, name, internal_name = await _seed_prep_global_field(ctx)

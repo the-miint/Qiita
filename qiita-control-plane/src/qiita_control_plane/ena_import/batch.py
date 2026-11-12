@@ -38,7 +38,7 @@ import asyncpg
 from fastapi import FastAPI, HTTPException, status
 from pydantic import TypeAdapter
 from qiita_common.ena_accession import EnaAccessionKind, validate_import_accession
-from qiita_common.models import WorkTicketState
+from qiita_common.models import Tier, WorkTicketState
 from qiita_common.models.ena import EnaStatus
 from qiita_common.models.ena_import import (
     BatchImportItem,
@@ -47,6 +47,7 @@ from qiita_common.models.ena_import import (
     EnaRunImportOutcome,
 )
 
+from ..auth.guards import METADATA_BYPASS_ROLE, caller_metadata_tiers, tier_at_least
 from ..auth.principal import HumanUser, PrincipalUnusableError, load_human_user
 from ..repositories.ena_import_batch import (
     FailedDownload,
@@ -587,6 +588,25 @@ async def _process_one_study(
             )
             return
 
+        # The role that admitted the submission may have been revoked since,
+        # most often before a re-drive at startup. A submitter who no longer
+        # holds admin on the study is refused here, with a reason that an
+        # operator can read, before anything is written.
+        tiers = await caller_metadata_tiers(pool, principal)
+        held = tiers.tier_on(study_idx)
+        if not tier_at_least(held, Tier.ADMIN):
+            await _set_item_state(
+                pool,
+                item.idx,
+                BatchItemState.FAILED,
+                failure_reason=(
+                    f"the submitter holds {held.value!r} on study {study_idx}; an ENA import"
+                    f" needs {Tier.ADMIN.value!r} there or the {METADATA_BYPASS_ROLE.value}"
+                    " role"
+                ),
+            )
+            return
+
         # A re-import: runs this study already holds that the Portal's fresh
         # response above no longer names are candidates for the ENA
         # availability flag; a held run the Portal DOES still return has any
@@ -612,6 +632,7 @@ async def _process_one_study(
             sample_attributes=sample_attributes,
             owner_idx=principal.principal_idx,
             caller_idx=principal.principal_idx,
+            tiers=tiers,
         )
         run_outcomes = await _mark_runs_held_not_downloaded(pool, result.ena_runs)
         await _set_item_registered(
