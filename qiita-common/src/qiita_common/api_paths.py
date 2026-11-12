@@ -945,6 +945,8 @@ PATH_BIOSAMPLE_STUDY_FIELD_BY_IDX = "/{study_idx}/biosample-field/{study_field_i
 
 PATH_BIOSAMPLE_PREFIX = "/biosample"
 PATH_BIOSAMPLE_BY_IDX = "/{biosample_idx}"
+# The studies that a biosample is actively linked to, with their accessions.
+PATH_BIOSAMPLE_STUDY_LIST = "/{biosample_idx}/study/list"
 # Bulk lookup of biosample_idx by a selectable biosample accession column
 # (biosample_accession or ena_sample_accession; default biosample_accession).
 # POST (not GET) because the accession list lives in the body — a typical
@@ -974,6 +976,7 @@ URL_BIOSAMPLE_STUDY_FIELD_BY_STUDY = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_STUDY_F
 URL_BIOSAMPLE_STUDY_FIELD_BY_IDX = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_STUDY_FIELD_BY_IDX}"
 URL_BIOSAMPLE_PREFIX = f"{API_PREFIX}{PATH_BIOSAMPLE_PREFIX}"
 URL_BIOSAMPLE_BY_IDX = f"{URL_BIOSAMPLE_PREFIX}{PATH_BIOSAMPLE_BY_IDX}"
+URL_BIOSAMPLE_STUDY_LIST = f"{URL_BIOSAMPLE_PREFIX}{PATH_BIOSAMPLE_STUDY_LIST}"
 URL_BIOSAMPLE_LOOKUP_BY_ACCESSION = f"{URL_BIOSAMPLE_PREFIX}{PATH_BIOSAMPLE_LOOKUP_BY_ACCESSION}"
 URL_BIOSAMPLE_LOOKUP_BY_MATRIX_TUBE_ID = (
     f"{URL_BIOSAMPLE_PREFIX}{PATH_BIOSAMPLE_LOOKUP_BY_MATRIX_TUBE_ID}"

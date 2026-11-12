@@ -30,6 +30,7 @@ from qiita_common.api_paths import (
     PATH_BIOSAMPLE_STUDY_FIELD_BY_IDX,
     PATH_BIOSAMPLE_STUDY_FIELD_BY_STUDY,
     PATH_BIOSAMPLE_STUDY_LINK,
+    PATH_BIOSAMPLE_STUDY_LIST,
     PATH_STUDY_PREFIX,
 )
 from qiita_common.auth_constants import Scope, SystemRole
@@ -60,6 +61,8 @@ from qiita_common.models import (
     SampleMetadataWriteResponse,
     SampleStudyFieldPatchRequest,
     SampleUniqueFieldRef,
+    StudyListItem,
+    StudyListResponse,
     StudyScopedBiosampleResponse,
     Tier,
 )
@@ -89,6 +92,7 @@ from ..repositories._sample_helpers import (
     StudyFieldNotUniqueInStudyError,
     UniqueInStudyViolation,
     classify_unique_in_study_violation,
+    fetch_active_studies_for_entity,
     fetch_global_fields,
     fetch_global_metadata,
     fetch_study_fields_for_study,
@@ -120,7 +124,9 @@ from ._helpers import (
     GENERIC_FK_VIOLATION,
     IF_MATCH_HEADER,
     SAMPLE_METADATA_WRITE_ERRORS,
+    SAMPLE_STUDIES_HARD_CAP,
     build_idxs_list_response,
+    cap_rows,
     create_and_map_study_field,
     detail_for_retired_unique_field_entity,
     detail_for_unique_field_miss,
@@ -1217,6 +1223,47 @@ def _study_scoped_response_from_row(
         "caller_system_role": caller_system_role,
     }
     return StudyScopedBiosampleResponse.model_validate(payload)
+
+
+# same-pattern-ok: cross-entity twin of list_studies_for_prep_sample.
+@biosample_router.get(PATH_BIOSAMPLE_STUDY_LIST)
+async def list_studies_for_biosample(
+    biosample_idx: Annotated[int, Field(gt=0)],
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    user: HumanUser = Depends(require_human),
+    _scope: Principal = Depends(require_scope(Scope.BIOSAMPLE_READ)),
+    _role: Principal = Depends(require_role_at_least(SystemRole.WET_LAB_ADMIN)),
+) -> StudyListResponse:
+    """List the studies that this biosample is actively linked to, ascending by
+    study_idx, each with its BioProject and ENA study accessions.
+
+    Caller must be a HumanUser with Scope.BIOSAMPLE_READ and system_role at
+    least wet_lab_admin. 404 when no such biosample exists. Retired
+    biosample_to_study links are excluded. The `truncated` flag indicates the
+    underlying set exceeded the hard cap.
+    """
+    row = await fetch_biosample(pool, biosample_idx)
+    if row is None:
+        raise HTTPException(
+            status_code=404,
+            detail=resource_not_found_detail(BIOSAMPLE_METADATA_SPEC.entity_kind, biosample_idx),
+        )
+
+    # Over-fetch by one so cap_rows can tell a full page from a cut one.
+    rows = await fetch_active_studies_for_entity(
+        pool,
+        spec=BIOSAMPLE_METADATA_SPEC,
+        entity_idx=biosample_idx,
+        limit=SAMPLE_STUDIES_HARD_CAP + 1,
+    )
+    rows, truncated = cap_rows(rows, SAMPLE_STUDIES_HARD_CAP)
+    study_list = StudyListResponse(
+        studies=[StudyListItem.model_validate(dict(r)) for r in rows],
+        count=len(rows),
+        truncated=truncated,
+        caller_system_role=user.system_role,
+    )
+    return study_list
 
 
 @biosample_router.get(PATH_BIOSAMPLE_BY_IDX)

@@ -25,30 +25,37 @@ from qiita_common.api_paths import (
     URL_BIOSAMPLE_GLOBAL_FIELD_LIST,
     URL_BIOSAMPLE_STUDY_FIELD_BY_IDX,
     URL_BIOSAMPLE_STUDY_FIELD_BY_STUDY,
+    URL_BIOSAMPLE_STUDY_LIST,
     URL_PREP_SAMPLE_GLOBAL_FIELD_LIST,
     URL_PREP_SAMPLE_STUDY_FIELD_BY_IDX,
     URL_PREP_SAMPLE_STUDY_FIELD_BY_STUDY,
+    URL_PREP_SAMPLE_STUDY_LIST,
 )
-from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX, Scope
+from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX, Scope, SystemRole
 from qiita_common.models import FieldDataType
 from qiita_common.models.reference import Tier
 
+from qiita_control_plane.auth.guards import resource_not_found_detail
 from qiita_control_plane.repositories import UpdatableTable
 from qiita_control_plane.repositories._sample_helpers import EntityMetadataSpec, SampleEntityKind
 from qiita_control_plane.repositories.alignment_definition import mint_alignment_definition
 from qiita_control_plane.repositories.biosample_metadata import BIOSAMPLE_METADATA_SPEC
+from qiita_control_plane.repositories.prep_sample import set_prep_sample_retired
 from qiita_control_plane.repositories.prep_sample_metadata import PREP_SAMPLE_METADATA_SPEC
 from qiita_control_plane.routes import _helpers as route_helpers
 from qiita_control_plane.testing.db_seeds import (
     disable_principal,
+    retire_biosample,
     retire_biosample_to_study_link,
     retire_prep_sample_to_study_link,
     retire_principal,
+    seed_biosample,
     seed_biosample_global_field,
     seed_biosample_to_study_link,
     seed_biosample_with_sequenced_prep_sample,
     seed_prep_sample_global_field,
     seed_prep_sample_to_study_link,
+    seed_sequenced_prep_sample,
     seed_sequenced_sample_subtype,
     seed_service_principal,
     seed_study,
@@ -1004,6 +1011,213 @@ async def assert_study_scoped_sample_write_authz(ctx, *, case: str, **kwargs) ->
     await _assert_study_scoped_sample_authz(
         ctx, cases=_STUDY_SCOPED_SAMPLE_WRITE_AUTHZ, case=case, **kwargs
     )
+
+
+# ---------------------------------------------------------------------------
+# One sample's study roster: shared driver for the biosample and prep_sample reads
+# ---------------------------------------------------------------------------
+
+
+class SampleStudyListSurface(NamedTuple):
+    """One entity's bindings for the read of the studies that a single sample
+    of it is linked to."""
+
+    url_template: str
+    idx_param: str  # the path placeholder naming the sample
+    metadata_spec: EntityMetadataSpec
+    read_scope: Scope  # what the read requires
+
+
+BIOSAMPLE_STUDY_LIST_SURFACE = SampleStudyListSurface(
+    url_template=URL_BIOSAMPLE_STUDY_LIST,
+    idx_param="biosample_idx",
+    metadata_spec=BIOSAMPLE_METADATA_SPEC,
+    read_scope=Scope.BIOSAMPLE_READ,
+)
+PREP_SAMPLE_STUDY_LIST_SURFACE = SampleStudyListSurface(
+    url_template=URL_PREP_SAMPLE_STUDY_LIST,
+    idx_param="prep_sample_idx",
+    metadata_spec=PREP_SAMPLE_METADATA_SPEC,
+    read_scope=Scope.PREP_SAMPLE_READ,
+)
+
+# How many studies each roster case links its sample to; the remaining cases
+# need one study only so that the refusal is made on a real, linked sample.
+_SAMPLE_STUDY_LIST_LINK_COUNTS = {
+    "two_links": 2,
+    "accessions": 1,
+    "retired_link": 2,
+    "retired_sample": 1,
+    "no_links": 0,
+    "regular_user": 1,
+    "anonymous": 1,
+    "missing_scope": 1,
+}
+SAMPLE_STUDY_LIST_CASES = (*_SAMPLE_STUDY_LIST_LINK_COUNTS, "missing_sample")
+
+
+async def seed_sample_linked_to_studies(
+    ctx, *, spec: EntityMetadataSpec, owner_idx: int, study_idxs: list[int]
+) -> int:
+    """Seed one biosample, plus a sequenced prep_sample of it for the
+    prep_sample spec, link what was seeded (non-retired) to each study, track
+    every row, and return the idx of the spec's entity.
+
+    The biosample link goes first: a prep_sample_to_study link is rejected
+    unless its biosample is already linked to the study.
+    """
+    pool = ctx["pool"]
+    biosample_idx = await seed_biosample(pool, owner_idx=owner_idx, created_by_idx=owner_idx)
+    ctx["created"]["biosample"].append(biosample_idx)
+    is_prep_sample = spec.entity_kind == SampleEntityKind.PREP_SAMPLE
+    prep_sample_idx = None
+    if is_prep_sample:
+        prep_sample_idx = await seed_sequenced_prep_sample(
+            pool, biosample_idx=biosample_idx, owner_idx=owner_idx
+        )
+        ctx["created"]["prep_sample"].append(prep_sample_idx)
+
+    # Biosample link first, then the prep link that depends on it.
+    for study_idx in study_idxs:
+        await seed_biosample_to_study_link(
+            pool, biosample_idx=biosample_idx, study_idx=study_idx, created_by_idx=owner_idx
+        )
+        if is_prep_sample:
+            await seed_prep_sample_to_study_link(
+                pool,
+                prep_sample_idx=prep_sample_idx,
+                study_idx=study_idx,
+                created_by_idx=owner_idx,
+            )
+    sample_idx = prep_sample_idx if is_prep_sample else biosample_idx
+    return sample_idx
+
+
+def _study_list_item(study_idx: int, *, bioproject=None, ena_study=None) -> dict:
+    """The StudyListItem dict that a study roster carries for one linked study."""
+    return {
+        "study_idx": study_idx,
+        "bioproject_accession": bioproject,
+        "ena_study_accession": ena_study,
+    }
+
+
+async def assert_sample_study_list(
+    ctx, *, case: str, surface: SampleStudyListSurface, no_scope_client
+) -> None:
+    """Drive one case of a sample's study-roster read and assert its response.
+
+    `case` names one of SAMPLE_STUDY_LIST_CASES. A read that succeeds is
+    compared whole against the expected StudyListResponse. A refusal is compared
+    by status and detail, so that it shows which gate refused. `no_scope_client`
+    is a PAT client lacking the route's read scope.
+    """
+    spec = surface.metadata_spec
+    owner_idx = ctx["wet_session"]["principal_idx"]
+
+    # A missing sample answers 404 before anything is read.
+    if case == "missing_sample":
+        missing_idx = 2_000_000_000
+        resp = await ctx["wet"].get(surface.url_template.format(**{surface.idx_param: missing_idx}))
+        assert (resp.status_code, resp.json()) == (
+            404,
+            {"detail": resource_not_found_detail(spec.entity_kind, missing_idx)},
+        )
+        return
+
+    # Seed the sample linked to the case's studies.
+    study_idxs = [
+        await _seed_study(ctx, owner_idx=owner_idx, suffix=f"roster-{case}-{i}")
+        for i in range(_SAMPLE_STUDY_LIST_LINK_COUNTS[case])
+    ]
+    sample_idx = await seed_sample_linked_to_studies(
+        ctx, spec=spec, owner_idx=owner_idx, study_idxs=study_idxs
+    )
+    url = surface.url_template.format(**{surface.idx_param: sample_idx})
+    expected_studies = [_study_list_item(s) for s in sorted(study_idxs)]
+
+    # Adjust the seeded state, and what the read should then return, per case.
+    if case == "accessions":
+        # idx-derived accessions keep the study UNIQUE constraints collision-free.
+        study_idx = study_idxs[0]
+        await ctx["pool"].execute(
+            "UPDATE qiita.study SET bioproject_accession = $2, ena_study_accession = $3"
+            " WHERE idx = $1",
+            study_idx,
+            f"PRJ-{study_idx}",
+            f"ERP-{study_idx}",
+        )
+        expected_studies = [
+            _study_list_item(study_idx, bioproject=f"PRJ-{study_idx}", ena_study=f"ERP-{study_idx}")
+        ]
+    elif case == "retired_link":
+        retired_study_idx = study_idxs[1]
+        if spec.entity_kind == SampleEntityKind.PREP_SAMPLE:
+            await retire_prep_sample_to_study_link(
+                ctx["pool"],
+                prep_sample_idx=sample_idx,
+                study_idx=retired_study_idx,
+                retired_by_idx=owner_idx,
+            )
+        else:
+            await retire_biosample_to_study_link(
+                ctx["pool"],
+                biosample_idx=sample_idx,
+                study_idx=retired_study_idx,
+                retired_by_idx=owner_idx,
+            )
+        expected_studies = [_study_list_item(study_idxs[0])]
+    elif case == "retired_sample":
+        # Retiring the sample itself does not hide its roster.
+        if spec.entity_kind == SampleEntityKind.PREP_SAMPLE:
+            async with ctx["pool"].acquire() as conn:
+                await set_prep_sample_retired(
+                    conn,
+                    prep_sample_idx=sample_idx,
+                    retired=True,
+                    retired_by_idx=owner_idx,
+                    reason=None,
+                )
+        else:
+            await retire_biosample(ctx["pool"], biosample_idx=sample_idx, retired_by_idx=owner_idx)
+
+    # Issue the read as the case's caller.
+    if case == "anonymous":
+        # Deferred like every other reference to the app in this file: importing
+        # it constructs the FastAPI application.
+        from qiita_control_plane.main import app
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as anon:
+            resp = await anon.get(url)
+    else:
+        client = {"regular_user": ctx["user"], "missing_scope": no_scope_client}.get(
+            case, ctx["wet"]
+        )
+        resp = await client.get(url)
+
+    # A token lacking a scope that its role grants also gets a re-login hint
+    # appended to the detail, so the scope refusal is matched on its prefix.
+    if case == "missing_scope":
+        scope_refused = resp.json()["detail"].startswith(
+            f"missing required scope {str(surface.read_scope)!r}"
+        )
+        assert (resp.status_code, scope_refused) == (403, True), resp.text
+        return
+    refusals = {
+        "regular_user": (403, f"requires system_role at least {str(SystemRole.WET_LAB_ADMIN)!r}"),
+        "anonymous": (401, "authentication required"),
+    }
+    if case in refusals:
+        refused_status, refused_detail = refusals[case]
+        assert (resp.status_code, resp.json()) == (refused_status, {"detail": refused_detail})
+        return
+    expected = {
+        "studies": expected_studies,
+        "count": len(expected_studies),
+        "truncated": False,
+        "caller_system_role": "wet_lab_admin",
+    }
+    assert (resp.status_code, resp.json()) == (200, expected)
 
 
 # ---------------------------------------------------------------------------

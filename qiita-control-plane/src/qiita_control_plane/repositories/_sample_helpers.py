@@ -3216,6 +3216,35 @@ async def fetch_entity_is_linked_to_study(
     )
 
 
+async def fetch_active_studies_for_entity(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
+    *,
+    spec: EntityMetadataSpec,
+    entity_idx: int,
+    limit: int,
+) -> list[asyncpg.Record]:
+    """Return up to `limit` studies that entity_idx has a non-retired link to,
+    each with study_idx and both study accessions, ordered by study_idx.
+
+    Callers that need to detect truncation pass `limit = cap + 1`; a returned
+    length > cap means the underlying set exceeded the cap.
+    """
+    # f-string interpolation of identifiers is safe: spec fields are frozen
+    # module-level constants, never reached by caller input.
+    rows = await pool_or_conn.fetch(
+        f"SELECT s.idx AS study_idx, s.bioproject_accession, s.ena_study_accession"
+        f" FROM {spec.link_table} link"
+        f" JOIN qiita.study s ON s.idx = link.study_idx"
+        f" WHERE link.{spec.link_entity_key_column} = $1 AND link.retired = false"
+        f" ORDER BY s.idx"
+        f" LIMIT $2",
+        entity_idx,
+        limit,
+    )
+    studies = list(rows)
+    return studies
+
+
 async def insert_entity_to_study(
     conn: asyncpg.Connection,
     *,

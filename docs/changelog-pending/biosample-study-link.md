@@ -9,6 +9,11 @@
   same 404. A retired biosample, or a pair that already has a link (active or
   retired), answers 409. No owner-biosample-id is recorded on the new study. The CLI
   equivalent is `qiita biosample link --study-idx S --biosample-idx B`.
+- **A biosample's studies can be listed (#N).**
+  `GET /api/v1/biosample/{biosample_idx}/study/list` returns the studies that a
+  biosample is actively linked to, with their BioProject and ENA study accessions, for
+  a wet-lab admin or higher; retired links are left out. The CLI equivalent is
+  `qiita biosample list-studies --biosample-idx B`.
 
 ### Changed
 

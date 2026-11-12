@@ -143,6 +143,12 @@ ALIGNMENT_NOT_FOUND_DETAIL = "alignment not found"
 # serves for no reason a caller could see.
 GENOME_MAP_HARD_CAP = 250_000
 
+# Hard cap on a study roster (the studies that a biosample or a prep_sample
+# is actively linked to) for one bio-or-prep sample. Sized to comfortably cover
+# any single sample's roster while bounding per-response payload size; both
+# entities' rosters are the same kind of list, so they share it.
+SAMPLE_STUDIES_HARD_CAP = 500_000
+
 
 def refuse_deprecated_alignment(alignment: asyncpg.Record) -> None:
     """409 when `alignment` (an `alignment_definition` row) is deprecated: a

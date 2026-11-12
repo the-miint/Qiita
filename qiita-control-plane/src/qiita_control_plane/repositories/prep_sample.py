@@ -74,34 +74,6 @@ async def fetch_active_study_idxs_for_prep_samples(
     return out
 
 
-async def fetch_active_studies_for_prep_sample(
-    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
-    prep_sample_idx: int,
-    *,
-    limit: int,
-) -> list[asyncpg.Record]:
-    """Return up to `limit` non-retired studies this prep_sample is linked to,
-    each with study_idx + both study accessions, ordered by study_idx.
-
-    The richer sibling of fetch_active_study_idxs_for_prep_sample, which
-    returns the bare idx membership set; this joins qiita.study for the
-    accession columns. Excludes retired prep_sample_to_study links. Callers
-    that need to detect truncation pass `limit = cap + 1`; a returned length >
-    cap means the underlying set exceeded the cap.
-    """
-    rows = await pool_or_conn.fetch(
-        "SELECT s.idx AS study_idx, s.bioproject_accession, s.ena_study_accession"
-        " FROM qiita.prep_sample_to_study pts"
-        " JOIN qiita.study s ON s.idx = pts.study_idx"
-        " WHERE pts.prep_sample_idx = $1 AND pts.retired = false"
-        " ORDER BY s.idx"
-        " LIMIT $2",
-        prep_sample_idx,
-        limit,
-    )
-    return list(rows)
-
-
 async def fetch_biosample_idx_for_prep_sample(
     pool_or_conn: asyncpg.Pool | asyncpg.Connection,
     prep_sample_idx: int,

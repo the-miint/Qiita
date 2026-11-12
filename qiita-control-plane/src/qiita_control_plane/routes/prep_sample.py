@@ -42,15 +42,17 @@ from ..auth.guards import (
 )
 from ..auth.principal import HumanUser, Principal
 from ..deps import TxConnFactory, get_db_pool, get_tx_conn_factory
-from ..repositories._sample_helpers import fetch_global_fields, fetch_study_fields_for_study
-from ..repositories.prep_sample import (
-    fetch_active_studies_for_prep_sample,
-    set_prep_sample_retired,
+from ..repositories._sample_helpers import (
+    fetch_active_studies_for_entity,
+    fetch_global_fields,
+    fetch_study_fields_for_study,
 )
+from ..repositories.prep_sample import set_prep_sample_retired
 from ..repositories.prep_sample_metadata import PREP_SAMPLE_METADATA_SPEC
 from ._helpers import (
     ETAG_HEADER,
     IF_MATCH_HEADER,
+    SAMPLE_STUDIES_HARD_CAP,
     cap_rows,
     create_and_map_study_field,
     etag_for_updated_at,
@@ -63,13 +65,6 @@ from ._helpers import (
 router = APIRouter(prefix=PATH_PREP_SAMPLE_PREFIX, tags=["prep-sample"])
 study_scoped_router = APIRouter(prefix=PATH_STUDY_PREFIX, tags=["prep-sample"])
 global_field_router = APIRouter(prefix=PATH_PREP_SAMPLE_GLOBAL_FIELD_PREFIX, tags=["prep-sample"])
-
-# Hard cap on the study-roster read. Sized to comfortably cover any single
-# prep_sample's linked-study roster while bounding per-response payload size.
-# The biosample and sequenced-sample roster caps happen to share this numeric
-# value, but the three bound conceptually distinct rosters and are sized
-# independently; they are intentionally not factored into a shared constant.
-_PREP_SAMPLE_STUDIES_HARD_CAP = 500_000
 
 
 @router.get(PATH_PREP_SAMPLE_STUDY_LIST)
@@ -92,10 +87,13 @@ async def list_studies_for_prep_sample(
     underlying set exceeded the hard cap.
     """
     # Over-fetch by one so cap_rows can tell a full page from a cut one.
-    rows = await fetch_active_studies_for_prep_sample(
-        pool, prep_sample_idx, limit=_PREP_SAMPLE_STUDIES_HARD_CAP + 1
+    rows = await fetch_active_studies_for_entity(
+        pool,
+        spec=PREP_SAMPLE_METADATA_SPEC,
+        entity_idx=prep_sample_idx,
+        limit=SAMPLE_STUDIES_HARD_CAP + 1,
     )
-    rows, truncated = cap_rows(rows, _PREP_SAMPLE_STUDIES_HARD_CAP)
+    rows, truncated = cap_rows(rows, SAMPLE_STUDIES_HARD_CAP)
     return StudyListResponse(
         studies=[StudyListItem.model_validate(dict(r)) for r in rows],
         count=len(rows),

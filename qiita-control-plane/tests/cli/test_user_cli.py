@@ -25,6 +25,7 @@ from qiita_common.api_paths import (
     URL_BIOSAMPLE_METADATA_BY_STUDY_UNIQUE_FIELD,
     URL_BIOSAMPLE_STUDY_FIELD_BY_STUDY,
     URL_BIOSAMPLE_STUDY_LINK,
+    URL_BIOSAMPLE_STUDY_LIST,
     URL_PREP_PROTOCOL_PREFIX,
     URL_PREP_SAMPLE_GLOBAL_FIELD_LIST,
     URL_PREP_SAMPLE_STUDY_FIELD_BY_STUDY,
@@ -1289,13 +1290,33 @@ def test_sequencing_run_lookup_requires_at_least_one_id(capsys):
 
 
 # ---------------------------------------------------------------------------
-# prep-sample list-studies
+# <entity> list-studies
 # ---------------------------------------------------------------------------
 
+# (subcommand group, idx flag, URL template, URL placeholder) per entity whose
+# single-sample study roster the CLI reads.
+_LIST_STUDIES_CLI_SURFACES = [
+    pytest.param(
+        "biosample", "--biosample-idx", URL_BIOSAMPLE_STUDY_LIST, "biosample_idx", id="biosample"
+    ),
+    pytest.param(
+        "prep-sample",
+        "--prep-sample-idx",
+        URL_PREP_SAMPLE_STUDY_LIST,
+        "prep_sample_idx",
+        id="prep_sample",
+    ),
+]
 
-def test_prep_sample_list_studies_issues_get_against_the_idx(monkeypatch):
-    """`prep-sample list-studies --prep-sample-idx N` GETs the study-list path
-    and issues no body."""
+
+@pytest.mark.parametrize(
+    ("group", "idx_flag", "url_template", "idx_param"), _LIST_STUDIES_CLI_SURFACES
+)
+def test_list_studies_issues_get_against_the_idx(
+    monkeypatch, group, idx_flag, url_template, idx_param
+):
+    """Tests the case where `<entity> list-studies` names a sample: one GET of
+    that sample's study-list path, with no body."""
     from qiita_control_plane.cli.user import main
 
     captured: dict = {}
@@ -1311,32 +1332,25 @@ def test_prep_sample_list_studies_issues_get_against_the_idx(monkeypatch):
         status=200,
     )
 
-    rc = main(
-        [
-            "--base-url",
-            "https://q.example.test",
-            "prep-sample",
-            "list-studies",
-            "--prep-sample-idx",
-            "9",
-        ]
-    )
-    assert rc == 0
-    assert captured["method"] == "GET"
-    assert captured["url"] == (
-        f"https://q.example.test{URL_PREP_SAMPLE_STUDY_LIST.format(prep_sample_idx=9)}"
-    )
-    assert captured["json"] is None
+    rc = main(["--base-url", "https://q.example.test", group, "list-studies", idx_flag, "9"])
+
+    sent = [(r["method"], r["url"], r["json"]) for r in captured["requests"]]
+    expected_url = f"https://q.example.test{url_template.format(**{idx_param: 9})}"
+    assert (rc, sent) == (0, [("GET", expected_url, None)])
 
 
-def test_prep_sample_list_studies_requires_idx(capsys):
-    """Omitting --prep-sample-idx exits 2 via argparse."""
+@pytest.mark.parametrize(
+    ("group", "idx_flag", "url_template", "idx_param"), _LIST_STUDIES_CLI_SURFACES
+)
+def test_list_studies_requires_idx(capsys, group, idx_flag, url_template, idx_param):
+    """Tests the case where `<entity> list-studies` omits the idx flag: argparse
+    exits 2 and names the flag."""
     from qiita_control_plane.cli.user import main
 
     with pytest.raises(SystemExit) as exc_info:
-        main(["prep-sample", "list-studies"])
+        main([group, "list-studies"])
     assert exc_info.value.code == 2
-    assert "--prep-sample-idx" in capsys.readouterr().err
+    assert idx_flag in capsys.readouterr().err
 
 
 # ---------------------------------------------------------------------------

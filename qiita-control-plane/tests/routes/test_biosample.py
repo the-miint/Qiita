@@ -63,7 +63,9 @@ from qiita_control_plane.testing.unique_names import (
 
 from .conftest import (
     BIOSAMPLE_FIELD_SURFACE,
+    BIOSAMPLE_STUDY_LIST_SURFACE,
     OWNER_INELIGIBILITY_KINDS,
+    SAMPLE_STUDY_LIST_CASES,
     STUDY_FIELD_CREATE_AUTHZ_CASES,
     STUDY_FIELD_CREATE_CONFLICT_CASES,
     STUDY_FIELD_LIST_AUTHZ_CASES,
@@ -76,6 +78,7 @@ from .conftest import (
     _seed_study,
     _wait_until_blocked_by,
     assert_owner_ineligibility_422,
+    assert_sample_study_list,
     assert_study_field_create_authz,
     assert_study_field_create_conflict,
     assert_study_field_get_authz,
@@ -2103,6 +2106,26 @@ async def test_get_biosample_returns_only_global_metadata(ctx):
     }
     rj["global_metadata"].pop("host_taxon_id", None)
     assert rj["global_metadata"] == expected_metadata
+
+
+# ===========================================================================
+# GET /api/v1/biosample/{biosample_idx}/study/list
+# ===========================================================================
+
+
+@pytest.mark.parametrize("case", SAMPLE_STUDY_LIST_CASES)
+async def test_list_studies_for_biosample(ctx, case, no_biosample_read_client):
+    """Tests the case where a caller reads a biosample's studies, for each
+    shared study-roster case: active links sorted with their accessions, retired
+    links left out, a retired biosample still listed, the missing-sample 404,
+    and the role, anonymous, and scope refusals.
+    """
+    await assert_sample_study_list(
+        ctx,
+        case=case,
+        surface=BIOSAMPLE_STUDY_LIST_SURFACE,
+        no_scope_client=no_biosample_read_client,
+    )
 
 
 # ===========================================================================
