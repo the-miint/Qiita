@@ -660,10 +660,11 @@ async def _process_one_study(
 
         if not any(o.status in _SUCCESSFUL_RUN_REGISTRATION_STATUSES for o in result.ena_runs):
             # Pools exist (a platform mapped), but every run then failed, was
-            # unsupported or was excluded (non-public) inside register_ena_study, so the pools hold
-            # no sequenced_sample rows. Submitting downloads against them would
-            # report success over an all-failed study. Terminal `failed`; the
-            # per-run reasons are already persisted on `ena_run_outcomes`.
+            # unsupported or was excluded (non-public) inside register_ena_study,
+            # so the pools hold no sequenced_sample rows. Submitting downloads
+            # against them would report success over an all-failed study.
+            # Terminal `failed`; the per-run reasons are already persisted on
+            # `ena_run_outcomes`.
             reasons = _summarize_run_failures(
                 o for o in result.ena_runs if o.status not in _SUCCESSFUL_RUN_REGISTRATION_STATUSES
             )

@@ -38,7 +38,7 @@ class UnmappableEnaLibraryStrategyError(ValueError):
         self,
         library_strategy: str | None,
         library_source: str | None,
-        library_selection: str,
+        library_selection: str | None,
     ) -> None:
         self.library_strategy = library_strategy
         self.library_source = library_source
