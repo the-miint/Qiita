@@ -66,9 +66,9 @@ class EnaRunImportOutcome(BaseModel):
     `GET /api/v1/ena-import-batch/{idx}`.
 
     `status` is the `EnaRunRegistrationStatus` value (`registered` /
-    `skipped_already_present` / `excluded` / `failed` / `flagged_unavailable` /
-    `held_not_downloaded` / `download_failed`). `failure_reason` is set on every
-    status but the first two; `failure_type` only on `download_failed`.
+    `skipped_already_present` / `excluded` / `failed` / `unsupported` /
+    `flagged_unavailable` / `held_not_downloaded` / `download_failed`). `failure_reason` is set
+    on every status but the first two; `failure_type` only on `download_failed`.
     `metadata_warnings`: harmonization gaps on the biosample this run created.
     """
 

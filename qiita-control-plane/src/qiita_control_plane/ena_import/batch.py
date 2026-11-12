@@ -131,7 +131,7 @@ _TERMINAL_UNSUCCESSFUL_STATES = frozenset(
 )
 
 # A run counts toward "this study registered something downloadable" only in
-# these two states -- EXCLUDED (non-public) and FAILED do not.
+# these states; every other status does not.
 _SUCCESSFUL_RUN_REGISTRATION_STATUSES = frozenset(
     {
         EnaRunRegistrationStatus.REGISTERED,

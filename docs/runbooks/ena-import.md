@@ -307,11 +307,13 @@ Every ENA-imported biosample is bound to the **ERC000011** checklist (the ENA de
 sample checklist) — the same shared checklist model every other metadata path in
 Qiita uses. `GET /api/v1/ena-import-batch/{idx}` returns an `ena_runs` array per item,
 one entry per ENA run carrying its `status` (`registered` / `skipped_already_present` /
-`excluded` / `failed` / `flagged_unavailable` / `held_not_downloaded` /
-`download_failed` — `flagged_unavailable` and `held_not_downloaded` come from a
-re-import's ENA availability re-check, see above) and a `failure_reason` on every
-status but `registered` and `skipped_already_present`. `download_failed` also carries
-a `failure_type`. A mapped value its global field's type cannot hold (a latitude of
+`excluded` / `failed` / `unsupported` / `flagged_unavailable` /
+`held_not_downloaded` / `download_failed` — `flagged_unavailable` and
+`held_not_downloaded` come from a re-import's ENA availability re-check, see above) and
+a `failure_reason` on every status but `registered` and `skipped_already_present`.
+`unsupported` marks a run whose library strategy and source have no curated protocol,
+so there is nothing to retry until one is added. `download_failed` also carries a
+`failure_type`. A mapped value its global field's type cannot hold (a latitude of
 `39 deg`) does not fail the run: the global field stores `not provided`, the submitted
 text is kept study-local as `<field> (as submitted)`, and the run's harmonization
 warnings name it (unless a raw ENA attribute already carries that `(as submitted)`
@@ -430,8 +432,9 @@ gaps expected to close soon (except where noted):
   per-run failure model above) rather than importing correctly. Filling out DDBJ
   coverage is deferred to the backlog.
 - **A non-amplicon run deposited with `library_selection` PCR is refused.** PCR selection
-  marks an amplicon library, so a run whose `library_strategy` is anything but `AMPLICON`
-  (including `RNA-Seq`/transcriptomic) contradicts it. That run fails alone with a
+  marks an amplicon library, so a run whose `library_strategy` is not `AMPLICON` but whose
+  strategy and source would otherwise map to metagenomics or transcriptomics (including
+  `RNA-Seq`/transcriptomic) contradicts it. That run fails alone with a
   `failure_reason` naming the selection; its siblings import. Deposited metadata is not
   rewritten and the import has no override. Once the depositor corrects the ENA record,
   a re-import picks the run up. An operator who knows the run is amplicon can instead

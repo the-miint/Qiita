@@ -97,7 +97,10 @@ from .harmonization import (
     retain_unparseable_as_submitted,
 )
 from .platform_mapping import UnmappableEnaPlatformError, map_ena_platform
-from .protocol_mapping import map_ena_run_to_prep_protocol_name
+from .protocol_mapping import (
+    UnsupportedEnaLibraryStrategyError,
+    map_ena_run_to_prep_protocol_name,
+)
 from .submit import DOWNLOAD_ENA_STUDY_ACTION_ID, DOWNLOAD_ENA_STUDY_ACTION_VERSION
 
 # The ENA default sample checklist (seeded by db/migrations). Every ENA-imported
@@ -134,6 +137,8 @@ class EnaRunRegistrationStatus(StrEnum):
     SKIPPED_ALREADY_PRESENT = "skipped_already_present"
     EXCLUDED = "excluded"
     FAILED = "failed"
+    # No curated prep_protocol exists for the run's library strategy/source; not retriable.
+    UNSUPPORTED = "unsupported"
     # A run this study already holds, that a re-import found ENA no longer
     # reports as public -- distinct from EXCLUDED (never registered) so a
     # batch report separates "never imported" from "imported, now
@@ -156,8 +161,8 @@ class EnaRunRegistrationOutcome:
 
     `prep_sample_idx` is set only on `REGISTERED`; `sequenced_sample_idx` on
     `REGISTERED`, `SKIPPED_ALREADY_PRESENT` and `HELD_NOT_DOWNLOADED`;
-    `failure_reason` on `FAILED`, `EXCLUDED`, `FLAGGED_UNAVAILABLE` and
-    `HELD_NOT_DOWNLOADED`. `harmonization` is set (non-`FAILED`,
+    `failure_reason` on `FAILED`, `UNSUPPORTED`, `EXCLUDED`, `FLAGGED_UNAVAILABLE` and
+    `HELD_NOT_DOWNLOADED`. `harmonization` is set (non-`FAILED`, non-`UNSUPPORTED`,
     non-`EXCLUDED`) only when this call newly created the biosample --
     write-once: a reused/re-imported biosample carries `None` because no
     harmonization write ran.
@@ -619,10 +624,10 @@ async def _register_one_ena_run(
 ) -> EnaRunRegistrationOutcome:
     """Register one ENA run in its own savepoint within the registration transaction
     (per-run atomicity: a partial failure rolls back only this run). Never raises:
-    every failure becomes a `failed` outcome -- platform/protocol-mapping,
-    harmonization, a value no global field can hold that
+    every failure becomes a `failed` outcome -- platform mapping, a protocol-mapping
+    refusal, harmonization, a value no global field can hold that
     `retain_unparseable_as_submitted` cannot keep, or a collision inside the biosample
-    import."""
+    import; a run with no curated protocol becomes `unsupported`."""
     try:
         async with conn.transaction():
             sample_attrs = attrs_by_sample_accession.get(ena_run.sample_accession)
@@ -737,6 +742,12 @@ async def _register_one_ena_run(
                 sequenced_sample_idx=result.sequenced_sample_idx,
                 harmonization=harmonization_result,
             )
+    except UnsupportedEnaLibraryStrategyError as exc:
+        return EnaRunRegistrationOutcome(
+            run_accession=ena_run.run_accession,
+            status=EnaRunRegistrationStatus.UNSUPPORTED,
+            failure_reason=str(exc),
+        )
     except Exception as exc:  # noqa: BLE001 -- per-run isolation: a failure must
         # never abort sibling runs; it is recorded (accession + reason) in the
         # returned result, not swallowed.

@@ -32,10 +32,8 @@ _LONG_READ = "long_read"
 
 
 class UnmappableEnaLibraryStrategyError(ValueError):
-    """Raised when an ENA run's (library_strategy, library_source, mapped platform) has
-    no curated prep_protocol name -- including when the category is recognized but no
-    protocol exists for its read-length bucket (there is no `long_read_transcriptomics`)
-    -- or when its library_selection contradicts its strategy."""
+    """Raised when an ENA run's library_selection contradicts its strategy, or (via the
+    subclass) when no curated prep_protocol exists for it."""
 
     def __init__(
         self,
@@ -61,6 +59,10 @@ class UnmappableEnaLibraryStrategyError(ValueError):
         super().__init__(message)
 
 
+class UnsupportedEnaLibraryStrategyError(UnmappableEnaLibraryStrategyError):
+    """No curated prep_protocol exists for this strategy/source on this platform."""
+
+
 def _read_length_bucket(platform: Platform) -> str:
     """Return "short_read" / "long_read" for a mapped qiita.platform. The two frozensets
     partition every current Platform member; one absent from both raises
@@ -81,18 +83,10 @@ def map_ena_run_to_prep_protocol_name(
     library_selection: str | None,
     platform: Platform,
 ) -> str:
-    """Map one ENA run's (library_strategy, library_source, mapped platform) to a
-    curated prep_protocol name.
+    """Map one ENA run to a curated prep_protocol name.
 
-    Category dispatch (case-insensitive, stripped):
-      - strategy == "AMPLICON" -> {read_length}_amplicon
-      - strategy == "WGS" or source == "METAGENOMIC" -> {read_length}_metagenomics
-      - strategy == "RNA-SEQ" or source in {"TRANSCRIPTOMIC", "METATRANSCRIPTOMIC"}
-        -> short_read_transcriptomics (long-read raises -- no such protocol curated)
-
-    Raises `UnmappableEnaLibraryStrategyError` when the pair matches no category, the
-    matched category has no protocol for the read-length bucket, or a non-AMPLICON run's
-    selection is "PCR", which marks an amplicon library. Never silently buckets.
+    Raises `UnsupportedEnaLibraryStrategyError` when no protocol exists for it, and the
+    parent class when a non-AMPLICON run with a mappable category has selection "PCR".
     """
     read_length = _read_length_bucket(platform)
     strategy = (library_strategy or "").strip().upper()
@@ -102,16 +96,16 @@ def map_ena_run_to_prep_protocol_name(
     if strategy == "AMPLICON":
         return f"{read_length}_amplicon"
 
+    if strategy == "WGS" or source == "METAGENOMIC":
+        category = "metagenomics"
+    elif strategy == "RNA-SEQ" or source in {"TRANSCRIPTOMIC", "METATRANSCRIPTOMIC"}:
+        category = "transcriptomics"
+    else:
+        raise UnsupportedEnaLibraryStrategyError(library_strategy, library_source)
+
     if selection == "PCR":
         raise UnmappableEnaLibraryStrategyError(library_strategy, library_source, library_selection)
 
-    if strategy == "WGS" or source == "METAGENOMIC":
-        return f"{read_length}_metagenomics"
-
-    if strategy == "RNA-SEQ" or source in {"TRANSCRIPTOMIC", "METATRANSCRIPTOMIC"}:
-        if read_length == _LONG_READ:
-            # No long_read_transcriptomics protocol is curated -- fail loud.
-            raise UnmappableEnaLibraryStrategyError(library_strategy, library_source)
-        return "short_read_transcriptomics"
-
-    raise UnmappableEnaLibraryStrategyError(library_strategy, library_source)
+    if category == "transcriptomics" and read_length == _LONG_READ:
+        raise UnsupportedEnaLibraryStrategyError(library_strategy, library_source)
+    return f"{read_length}_{category}"

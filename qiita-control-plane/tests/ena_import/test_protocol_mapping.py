@@ -7,6 +7,7 @@ from qiita_common.models import Platform
 
 from qiita_control_plane.ena_import.protocol_mapping import (
     UnmappableEnaLibraryStrategyError,
+    UnsupportedEnaLibraryStrategyError,
     map_ena_run_to_prep_protocol_name,
 )
 
@@ -53,7 +54,7 @@ def test_map_ena_run_to_prep_protocol_name(
 def test_long_read_transcriptomic_run_raises_no_curated_protocol():
     """RNA-Seq/transcriptomic on long-read has no curated protocol (only
     short_read_transcriptomics is seeded) -- must raise, not fall into another bucket."""
-    with pytest.raises(UnmappableEnaLibraryStrategyError) as excinfo:
+    with pytest.raises(UnsupportedEnaLibraryStrategyError) as excinfo:
         map_ena_run_to_prep_protocol_name(
             library_strategy="RNA-Seq",
             library_source="TRANSCRIPTOMIC",
@@ -64,20 +65,31 @@ def test_long_read_transcriptomic_run_raises_no_curated_protocol():
     assert excinfo.value.library_source == "TRANSCRIPTOMIC"
 
 
-def test_unrecognized_strategy_raises_and_surfaces_strategy():
-    with pytest.raises(UnmappableEnaLibraryStrategyError, match="ChIP-Seq") as excinfo:
+@pytest.mark.parametrize(
+    ("library_strategy", "library_source", "library_selection"),
+    [
+        ("ChIP-Seq", "GENOMIC", None),
+        ("Targeted-Capture", "GENOMIC", "PCR"),
+        ("OTHER", "GENOMIC", "other"),
+    ],
+    ids=["chip-seq", "PRJNA810087", "PRJNA533024"],
+)
+def test_unrecognized_strategy_raises_unsupported_and_surfaces_strategy(
+    library_strategy, library_source, library_selection
+):
+    with pytest.raises(UnsupportedEnaLibraryStrategyError, match=library_strategy) as excinfo:
         map_ena_run_to_prep_protocol_name(
-            library_strategy="ChIP-Seq",
-            library_source="GENOMIC",
-            library_selection=None,
+            library_strategy=library_strategy,
+            library_source=library_source,
+            library_selection=library_selection,
             platform=Platform.ILLUMINA,
         )
-    assert excinfo.value.library_strategy == "ChIP-Seq"
-    assert excinfo.value.library_source == "GENOMIC"
+    assert excinfo.value.library_strategy == library_strategy
+    assert excinfo.value.library_source == library_source
 
 
 def test_none_strategy_and_source_raises():
-    with pytest.raises(UnmappableEnaLibraryStrategyError):
+    with pytest.raises(UnsupportedEnaLibraryStrategyError):
         map_ena_run_to_prep_protocol_name(
             library_strategy=None,
             library_source=None,
@@ -110,6 +122,7 @@ def test_pcr_selection_on_a_non_amplicon_strategy_raises(
             library_selection=library_selection,
             platform=platform,
         )
+    assert type(excinfo.value) is UnmappableEnaLibraryStrategyError
     assert excinfo.value.library_strategy == library_strategy
     assert excinfo.value.library_source == library_source
     assert excinfo.value.library_selection == library_selection

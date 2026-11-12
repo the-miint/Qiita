@@ -1830,9 +1830,10 @@ async def test_partial_failure_run_leaves_no_orphan_rows_and_rerun_completes(reg
         experiment_accession=unique_accession("SRX"),
         sample_accession=bad_sample_accession,
         study_accession=study_accession,
-        # ChIP-Seq has no curated-protocol mapping -- this run fails in its own txn.
-        library_strategy="ChIP-Seq",
+        # No curated protocol for this pair -- the run rolls back in its own txn.
+        library_strategy="Targeted-Capture",
         library_source="GENOMIC",
+        library_selection="PCR",
     )
 
     result = await _register(reg, study_header=header, ena_runs=[ok_run, bad_run])
@@ -1840,9 +1841,10 @@ async def test_partial_failure_run_leaves_no_orphan_rows_and_rerun_completes(reg
     outcomes_by_accession = {o.run_accession: o for o in result.ena_runs}
     assert outcomes_by_accession[ok_run.run_accession].status == EnaRunRegistrationStatus.REGISTERED
     bad_outcome = outcomes_by_accession[bad_run.run_accession]
-    assert bad_outcome.status == EnaRunRegistrationStatus.FAILED
+    assert bad_outcome.status == EnaRunRegistrationStatus.UNSUPPORTED
     assert bad_outcome.failure_reason is not None
-    assert "ChIP-Seq" in bad_outcome.failure_reason
+    assert "Targeted-Capture" in bad_outcome.failure_reason
+    assert "GENOMIC" in bad_outcome.failure_reason
 
     # No orphan sequenced_sample / prep_sample for the failed run.
     orphan_count = await reg["pool"].fetchval(

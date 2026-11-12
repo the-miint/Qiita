@@ -31,6 +31,7 @@ from .miint_resolver import MiintEnaResolver
 from .platform_mapping import UnmappableEnaPlatformError, map_ena_platform
 from .protocol_mapping import (
     UnmappableEnaLibraryStrategyError,
+    UnsupportedEnaLibraryStrategyError,
     map_ena_run_to_prep_protocol_name,
 )
 from .registration import (
@@ -64,6 +65,7 @@ __all__ = [
     "MiintEnaResolver",
     "UnmappableEnaLibraryStrategyError",
     "UnmappableEnaPlatformError",
+    "UnsupportedEnaLibraryStrategyError",
     "build_download_ena_study_ticket",
     "create_ena_import_batch",
     "detect_accession_kind",
