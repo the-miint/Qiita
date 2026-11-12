@@ -145,10 +145,6 @@ class EnaRunRegistrationStatus(StrEnum):
     # unavailable". Set by ena_import.batch, not this module: this file only
     # registers runs the Portal returns.
     FLAGGED_UNAVAILABLE = "flagged_unavailable"
-    # A held run with no stored reads whose pool's download already completed
-    # without it (it was flagged when that download read its roster). Nothing
-    # schedules its download; set by ena_import.batch.
-    HELD_NOT_DOWNLOADED = "held_not_downloaded"
     # A run its pool's download fetched and could not store, while the pool's
     # other runs landed. Read from the run's sequenced_sample by the status read;
     # never stored on the item.
@@ -160,12 +156,11 @@ class EnaRunRegistrationOutcome:
     """One ENA run's registration outcome.
 
     `prep_sample_idx` is set only on `REGISTERED`; `sequenced_sample_idx` on
-    `REGISTERED`, `SKIPPED_ALREADY_PRESENT` and `HELD_NOT_DOWNLOADED`;
-    `failure_reason` on `FAILED`, `UNSUPPORTED`, `EXCLUDED`, `FLAGGED_UNAVAILABLE` and
-    `HELD_NOT_DOWNLOADED`. `harmonization` is set (non-`FAILED`, non-`UNSUPPORTED`,
-    non-`EXCLUDED`) only when this call newly created the biosample --
-    write-once: a reused/re-imported biosample carries `None` because no
-    harmonization write ran.
+    `REGISTERED` and `SKIPPED_ALREADY_PRESENT`; `failure_reason` on `FAILED`,
+    `UNSUPPORTED`, `EXCLUDED` and `FLAGGED_UNAVAILABLE`. `harmonization` is set
+    (non-`FAILED`, non-`UNSUPPORTED`, non-`EXCLUDED`) only when this call newly
+    created the biosample -- write-once: a reused/re-imported biosample carries
+    `None` because no harmonization write ran.
     """
 
     run_accession: str
@@ -185,8 +180,8 @@ _RESUBMITTABLE_DOWNLOAD_TICKET_STATES = frozenset(
 
 def download_ticket_covers_pool(work_ticket_state: str | None) -> bool:
     """Whether a pool's latest download ticket has downloaded, or is downloading,
-    the pool: reuse it, and put no new runs in that pool (its roster is read once
-    at dispatch, so runs added after it would never be downloaded)."""
+    the pool: put no new runs in it (its roster is read once at dispatch, so runs
+    added after it would never be downloaded)."""
     return (
         work_ticket_state is not None
         and work_ticket_state not in _RESUBMITTABLE_DOWNLOAD_TICKET_STATES

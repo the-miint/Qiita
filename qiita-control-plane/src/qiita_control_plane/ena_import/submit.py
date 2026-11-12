@@ -1,7 +1,8 @@
 """Submit helper for the `download-ena-study` work ticket.
 
 Builds the `WorkTicketCreateRequest` body for ONE `sequenced_pool`-scoped
-`download-ena-study` ticket, `action_context` carrying `{ena_study_accession}`.
+`download-ena-study` ticket, `action_context` carrying `{ena_study_accession}`
+and, to download only some of the pool's runs, `ENA_RUN_ACCESSIONS_KEY`.
 The transport is the job's to choose, not the ticket's. By the time this is
 called, the pool and its
 `sequenced_sample` rows already exist (from `register_ena_study`).
@@ -15,6 +16,7 @@ disallow-without-delete checks are never duplicated here.
 from __future__ import annotations
 
 from qiita_common.models import ScopeTargetKind, WorkTicketCreateRequest
+from qiita_common.work_ticket_constants import ENA_RUN_ACCESSIONS_KEY
 
 # action_id + version for the download-ena-study workflow. Pinned here so a
 # caller can't drift from the workflow YAML the deploy syncs into qiita.action.
@@ -28,6 +30,8 @@ def build_download_ena_study_ticket(
     sequencing_run_idx: int,
     ena_study_accession: str,
     run_concurrency: int | None = None,
+    ena_run_accessions: list[str] | None = None,
+    force: bool = False,
 ) -> WorkTicketCreateRequest:
     """Compose ONE `sequenced_pool`-scoped `download-ena-study`
     `WorkTicketCreateRequest`. `sequenced_pool_idx` / `sequencing_run_idx`
@@ -36,6 +40,8 @@ def build_download_ena_study_ticket(
     action_context: dict[str, object] = {"ena_study_accession": ena_study_accession}
     if run_concurrency is not None:
         action_context["run_concurrency"] = run_concurrency
+    if ena_run_accessions is not None:
+        action_context[ENA_RUN_ACCESSIONS_KEY] = sorted(ena_run_accessions)
     return WorkTicketCreateRequest(
         action_id=DOWNLOAD_ENA_STUDY_ACTION_ID,
         action_version=DOWNLOAD_ENA_STUDY_ACTION_VERSION,
@@ -45,4 +51,5 @@ def build_download_ena_study_ticket(
             "sequencing_run_idx": sequencing_run_idx,
         },
         action_context=action_context,
+        force=force,
     )

@@ -1265,10 +1265,21 @@ def test_load_actions_loads_on_disk_download_ena_study_yaml():
 
 
 @pytest.mark.parametrize(
-    ("run_concurrency", "accepted"),
-    [(1, True), (8, True), (0, False), (9, False), ("8", False)],
+    ("key", "value", "accepted"),
+    [
+        ("run_concurrency", 1, True),
+        ("run_concurrency", 8, True),
+        ("run_concurrency", 0, False),
+        ("run_concurrency", 9, False),
+        ("run_concurrency", "8", False),
+        ("ena_run_accessions", ["ERR1", "ERR2"], True),
+        ("ena_run_accessions", [], False),
+        ("ena_run_accessions", ["ERR1", "ERR1"], False),
+        ("ena_run_accessions", [""], False),
+        ("ena_run_accessions", [1], False),
+    ],
 )
-def test_download_ena_study_run_concurrency_is_bounded(run_concurrency, accepted):
+def test_download_ena_study_optional_context_keys_are_validated(key, value, accepted):
     from pathlib import Path
 
     from qiita_control_plane.actions import load_actions
@@ -1276,7 +1287,7 @@ def test_download_ena_study_run_concurrency_is_bounded(run_concurrency, accepted
 
     actions = load_actions(Path(__file__).resolve().parents[2] / "workflows")
     schema = next(a for a in actions if a.action_id == "download-ena-study").context_schema
-    context = {"ena_study_accession": "PRJEB1", "run_concurrency": run_concurrency}
+    context = {"ena_study_accession": "PRJEB1", key: value}
     assert (not validate_context(schema, context)) is accepted
 
 

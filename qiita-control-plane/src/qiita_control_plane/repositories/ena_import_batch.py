@@ -16,12 +16,20 @@ import asyncpg
 from pydantic import BaseModel
 from qiita_common.models import FailureType, WorkTicketState
 from qiita_common.models.ena_import import BatchItemState
+from qiita_common.work_ticket_constants import ENA_RUN_ACCESSIONS_KEY
 
 from . import require_transaction
+from .sequenced_sample import ACTIVE_ROSTER_ROW
 
 _NO_STORED_READS = (
     "NOT EXISTS (SELECT 1 FROM qiita.sequence_range sr"
     " WHERE sr.prep_sample_idx = ss.prep_sample_idx)"
+)
+
+# NULL (not empty) when the ticket carries no run restriction.
+_RUN_RESTRICTION = (
+    "(SELECT array_agg(r ORDER BY r)"
+    f" FROM jsonb_array_elements_text(wt.action_context -> '{ENA_RUN_ACCESSIONS_KEY}') AS r)"
 )
 
 
@@ -206,19 +214,27 @@ async def fetch_sequenced_pool_download_states(
     """Every sequenced_pool on `sequencing_run_idx`, oldest first, with
     `has_sequenced_sample` (any active, non-ENA-flagged one) and its latest
     ticket for the action (`work_ticket_idx` / `work_ticket_state`, NULL when
-    it has none). A pool whose only runs are ENA-flagged reads as having none,
-    so a re-import does not submit or reuse a download ticket against it."""
+    it has none; `ena_run_accessions` is its run restriction, NULL when
+    unrestricted) and `has_completed_ticket` (any ticket of the action ever
+    completed, not just the latest). A pool whose only runs are ENA-flagged
+    reads as having none, so a re-import does not submit or reuse a download ticket against it."""
     return await pool_or_conn.fetch(
         "SELECT sp.idx AS sequenced_pool_idx,"
         "       EXISTS (SELECT 1 FROM qiita.sequenced_sample ss"
         "               JOIN qiita.prep_sample ps ON ps.idx = ss.prep_sample_idx"
-        "               WHERE ss.sequenced_pool_idx = sp.idx AND ps.retired = false"
-        "                 AND ss.ena_status IS NULL)"
+        "               WHERE ss.sequenced_pool_idx = sp.idx"
+        f"                 AND {ACTIVE_ROSTER_ROW})"
         "         AS has_sequenced_sample,"
-        "       wt.work_ticket_idx, wt.state::text AS work_ticket_state"
+        "       EXISTS (SELECT 1 FROM qiita.work_ticket c"
+        "               WHERE c.action_id = $2 AND c.action_version = $3"
+        "                 AND c.sequenced_pool_idx = sp.idx"
+        "                 AND c.state = $4::qiita.work_ticket_state)"
+        "         AS has_completed_ticket,"
+        "       wt.work_ticket_idx, wt.state::text AS work_ticket_state,"
+        f"       {_RUN_RESTRICTION} AS {ENA_RUN_ACCESSIONS_KEY}"
         " FROM qiita.sequenced_pool sp"
         " LEFT JOIN LATERAL ("
-        "   SELECT work_ticket_idx, state FROM qiita.work_ticket"
+        "   SELECT work_ticket_idx, state, action_context FROM qiita.work_ticket"
         "   WHERE action_id = $2 AND action_version = $3 AND sequenced_pool_idx = sp.idx"
         "   ORDER BY work_ticket_idx DESC LIMIT 1"
         " ) wt ON true"
@@ -227,35 +243,31 @@ async def fetch_sequenced_pool_download_states(
         sequencing_run_idx,
         action_id,
         action_version,
-    )
-
-
-async def fetch_sequenced_samples_missed_by_completed_download(
-    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
-    *,
-    sequenced_sample_idxs: list[int],
-    action_id: str,
-    action_version: str,
-) -> set[int]:
-    """The `sequenced_sample_idxs` with no stored reads and no recorded download
-    failure whose pool's latest ticket for the action completed. A completed
-    download stored or failed every run on the roster it read, so such a run was
-    off that roster and nothing will fetch it."""
-    rows = await pool_or_conn.fetch(
-        "SELECT ss.idx FROM qiita.sequenced_sample ss"
-        " WHERE ss.idx = ANY($1::bigint[])"
-        "   AND ss.download_failure_type IS NULL"
-        f"   AND {_NO_STORED_READS}"
-        "   AND (SELECT wt.state FROM qiita.work_ticket wt"
-        "        WHERE wt.action_id = $2 AND wt.action_version = $3"
-        "          AND wt.sequenced_pool_idx = ss.sequenced_pool_idx"
-        "        ORDER BY wt.work_ticket_idx DESC LIMIT 1) = $4::qiita.work_ticket_state",
-        sequenced_sample_idxs,
-        action_id,
-        action_version,
         WorkTicketState.COMPLETED.value,
     )
-    return {r["idx"] for r in rows}
+
+
+async def fetch_runs_needing_download(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection, *, sequenced_sample_idxs: list[int]
+) -> dict[int, list[str]]:
+    """`sequenced_pool_idx -> run accessions` for the `sequenced_sample_idxs` that no
+    download has stored or failed and that a roster read would still include
+    (active, not ENA-flagged), sorted."""
+    rows = await pool_or_conn.fetch(
+        "SELECT ss.sequenced_pool_idx, ss.ena_run_accession"
+        " FROM qiita.sequenced_sample ss"
+        " JOIN qiita.prep_sample ps ON ps.idx = ss.prep_sample_idx"
+        " WHERE ss.idx = ANY($1::bigint[])"
+        f"   AND {ACTIVE_ROSTER_ROW}"
+        "   AND ss.download_failure_type IS NULL"
+        f"   AND {_NO_STORED_READS}"
+        " ORDER BY ss.ena_run_accession",
+        sequenced_sample_idxs,
+    )
+    needed: dict[int, list[str]] = {}
+    for r in rows:
+        needed.setdefault(r["sequenced_pool_idx"], []).append(r["ena_run_accession"])
+    return needed
 
 
 class FailedDownload(BaseModel):
@@ -316,13 +328,14 @@ async def fetch_pool_latest_download_ticket(
     action_version: str,
 ) -> asyncpg.Record | None:
     """One pool's newest ticket for the action (`work_ticket_idx` /
-    `work_ticket_state`), or None if it has none -- the single-pool sibling
-    of `fetch_sequenced_pool_download_states`'s run-wide LATERAL join."""
+    `work_ticket_state` / `ena_run_accessions`), or None if it has none -- the
+    single-pool sibling of `fetch_sequenced_pool_download_states`'s run-wide LATERAL join."""
     return await pool_or_conn.fetchrow(
-        "SELECT work_ticket_idx, state::text AS work_ticket_state"
-        " FROM qiita.work_ticket"
-        " WHERE action_id = $2 AND action_version = $3 AND sequenced_pool_idx = $1"
-        " ORDER BY work_ticket_idx DESC LIMIT 1",
+        "SELECT wt.work_ticket_idx, wt.state::text AS work_ticket_state,"
+        f"      {_RUN_RESTRICTION} AS {ENA_RUN_ACCESSIONS_KEY}"
+        " FROM qiita.work_ticket wt"
+        " WHERE wt.action_id = $2 AND wt.action_version = $3 AND wt.sequenced_pool_idx = $1"
+        " ORDER BY wt.work_ticket_idx DESC LIMIT 1",
         sequenced_pool_idx,
         action_id,
         action_version,

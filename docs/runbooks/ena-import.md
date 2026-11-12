@@ -65,7 +65,8 @@ weighed against.
 A download ticket fetches **4** runs at once by default. `ENA_DOWNLOAD_RUN_CONCURRENCY`
 (1-8, control-plane env, restart to change) sets it for every ticket an import batch
 submits; a manually submitted `download-ena-study` ticket can carry `run_concurrency` in
-its `action_context` instead; the job's start-up line on stderr shows the value in effect.
+its `action_context` instead, as can `ena_run_accessions` to download only those runs of the
+pool; the job's start-up line on stderr shows the value in effect.
 The batch stores the value in the ticket's `action_context`, so a changed value reaches
 only tickets built after the restart: a `/run` redrive, an automatic retry, and a batch
 reusing a pool's existing ticket keep the value the ticket was built with (4 if none). The
@@ -119,10 +120,9 @@ whole-study import, so the same import-created-study guard applies.
 - **Only its own pools are ticketed.** A per-study run-list item submits or reuses a
   download ticket only for pools holding its runs; re-import the whole study to retry
   other failed pools.
-- **A failed pool's other runs download too.** New runs go into the newest pool without a
-  covering ticket. If that pool's earlier ticket failed, the item's new ticket reads the
-  pool's whole roster, so its unread runs are downloaded along with the listed ones.
-  Registration still covers exactly the listed runs.
+- **Only its own runs download.** New runs go into the newest pool without a covering
+  ticket. The item's ticket is restricted to the listed runs, so a failed pool's other
+  unread runs wait for a re-import of the whole study.
 
 ### Re-importing, and studies we created ourselves
 
@@ -133,12 +133,15 @@ it starts, so new runs never join a pool whose download is in flight or finished
 go into a new pool with its own ticket, and the accession reports `done` only once every
 pool's download has. A re-import is also how to retry a failed or cancelled download,
 as is `POST /work-ticket/{idx}/run` on the pool's latest such ticket, which picks up runs
-added since. `/run` is refused with a 409 on an older ticket (the error names the newer
+added since (a restricted ticket re-downloads only its listed runs). `/run` is refused with a 409 on an older ticket (the error names the newer
 one and its state), and on a failed ticket that still has a live download job from before
 the failure, which holds the old roster: cancel it by idx (`work_ticket_idxs`) to reap the
 job, then re-import the study. The ticket stays FAILED and keeps refusing `/run`.
 A re-import does not retry the failed runs of a `completed_partial` pool: its ticket is
-COMPLETED and is reused, and the runs keep reporting `download_failed`.
+COMPLETED and is reused, and the runs keep reporting `download_failed`. It does ticket the
+runs a completed download never read (no reads, no recorded failure): a new ticket for the
+same pool, restricted to them. If another import's restricted ticket is still live on a pool
+the re-import needs, the item fails naming that ticket; re-import once it ends.
 Nothing schedules a re-import or a redrive; each is an operator gesture. A native
 `POST .../sequenced-sample` add to a pool whose download has already read (or is reading) its
 roster is refused the same way, 409: create a new `sequenced_pool` on the run and submit
@@ -236,11 +239,10 @@ non-public runs, so "every run suppressed" arrives this way. If Qiita holds a
 study created by an earlier import, its held runs are checked and flagged or
 cleared, and the item fails naming any it flagged.
 
-**A held run nothing will download.** A run flagged before its pool's download
+**A held run left off its pool's download.** A run flagged before its pool's download
 read the roster is left off that download. If ENA later releases it again, the
-flag clears, but the pool's download has already completed. The re-import reports
-such a run `held_not_downloaded` instead of `skipped_already_present`. There is no
-automatic retry for it yet.
+flag clears, but the pool's download has already completed. The re-import tickets
+such a run: a new download ticket for the pool, restricted to the runs it left behind.
 
 **The exclusion rule: a flagged run is skipped wherever a sample-selecting query
 already filters out a retired prep_sample.** That includes the download roster,
@@ -321,13 +323,12 @@ Every ENA-imported biosample is bound to the **ERC000011** checklist (the ENA de
 sample checklist) — the same shared checklist model every other metadata path in
 Qiita uses. `GET /api/v1/ena-import-batch/{idx}` returns an `ena_runs` array per item,
 one entry per ENA run carrying its `status` (`registered` / `skipped_already_present` /
-`excluded` / `failed` / `unsupported` / `flagged_unavailable` /
-`held_not_downloaded` / `download_failed` — `flagged_unavailable` and
-`held_not_downloaded` come from a re-import's ENA availability re-check, see above) and
+`excluded` / `failed` / `unsupported` / `flagged_unavailable` / `download_failed` —
+`flagged_unavailable` comes from a re-import's ENA availability re-check, see above) and
 a `failure_reason` on every status but `registered` and `skipped_already_present`.
 `unsupported` marks a run whose library strategy and source have no curated protocol,
-so there is nothing to retry until one is added. `download_failed` also carries a
-`failure_type`. A mapped value its global field's type cannot hold (a latitude of
+so there is nothing to retry until one is added. `download_failed` also carries
+a `failure_type`. A mapped value its global field's type cannot hold (a latitude of
 `39 deg`) does not fail the run: the global field stores `not provided`, the submitted
 text is kept study-local as `<field> (as submitted)`, and the run's harmonization
 warnings name it (unless a raw ENA attribute already carries that `(as submitted)`

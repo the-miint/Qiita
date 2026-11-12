@@ -51,6 +51,9 @@ from .study_access import CallerMetadataTiers
 # via GENERATED ALWAYS AS so no caller passes it there.
 _PROCESSING_KIND_SEQUENCED = "sequenced"
 
+# Rows a download roster read counts: active and not ENA-flagged (aliases `ss`, `ps`).
+ACTIVE_ROSTER_ROW = "ps.retired = false AND ss.ena_status IS NULL"
+
 # The SequencedSampleListItem projection, shared verbatim by the pool- and
 # run-scoped roster reads (they differ only in their join and WHERE). Every
 # column is named exactly as the model field it fills — ss.idx is aliased —
@@ -575,8 +578,7 @@ async def fetch_sequenced_pool_ena_run_roster(
         " FROM qiita.sequenced_sample ss"
         " JOIN qiita.prep_sample ps ON ps.idx = ss.prep_sample_idx"
         " WHERE ss.sequenced_pool_idx = $1"
-        "   AND ps.retired = false"
-        "   AND ss.ena_status IS NULL"
+        f"   AND {ACTIVE_ROSTER_ROW}"
         " ORDER BY ss.prep_sample_idx",
         sequenced_pool_idx,
     )
