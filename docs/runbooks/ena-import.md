@@ -165,7 +165,8 @@ sibling items. Listed runs share one item until they are grouped by study, so on
 unresolved run fails them all (see [Importing chosen runs](#importing-chosen-runs)).
 Poll with `qiita ena-import-status IDX` to see each item's state and, on failure, the
 reason. If a submit was interrupted or lost its response before you got the batch idx,
-run the `qiita ena-import-list --mine --since TS` it prints; `TS` is when the submit started.
+run the `qiita ena-import-list --mine --since TS` it prints; `TS` is a minute before the submit
+started, to cover clock skew.
 
 ### Non-public studies and runs
 
@@ -267,7 +268,7 @@ did.
   end user submits, mirroring bcl-convert's own admin-only submission.
 - `GET /api/v1/ena-import-batch` — the newest batches first (`submitted_by=me` for your
   own, `since` an ISO-8601 timestamp with timezone, `limit` default 20, max 100), each with
-  its idx, submitter, `created_at` and a count of items per state, rolled up as below.
+  its idx, `created_at` and a count of items per state, rolled up as below.
   Admin-only.
 - `GET /api/v1/ena-import-batch/{idx}` — the batch's current, rolled-up per-item
   status (the run item is split into one item per study once its runs resolve):
@@ -295,7 +296,8 @@ is retried until the timeout instead of failing the watch; any other HTTP error 
 fatal. Exit codes: `0` every item reached `done`; `1` an item ended `failed` or
 `completed_partial`, the watch timed out (naming each still-pending item and its last
 known state), an HTTP error, no token was found, or the POST was sent but no response
-came back (printing the `qiita ena-import-list --mine --since TS` command to run); `2` bad input
+came back or a gateway answered 502/503/504 (printing the `qiita ena-import-list --mine
+--since TS` command to run); `2` bad input
 (a malformed accession, a bad `--from-file` line, an out-of-range flag); `130` Ctrl-C,
 naming the batch to poll if the POST had already succeeded, or otherwise the same
 `ena-import-list` command. `qiita ena-import-status IDX` reads a batch's current state and

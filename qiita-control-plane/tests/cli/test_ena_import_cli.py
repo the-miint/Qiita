@@ -994,6 +994,30 @@ def test_lost_post_response_names_the_list_command_with_a_since(
     assert before - timedelta(seconds=61) <= datetime.fromisoformat(since) < before
 
 
+@pytest.mark.parametrize(
+    ("status", "hinted"), [(502, True), (503, True), (504, True), (422, False)]
+)
+def test_gateway_error_on_post_names_the_list_command(
+    status, hinted, monkeypatch, patch_async_client, capsys
+):
+    from qiita_control_plane.cli.user._parser import _build_parser
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status, json={"detail": "upstream"})
+
+    patch_async_client(httpx.MockTransport(handler))
+    monkeypatch.setenv("QIITA_TOKEN", "qk_test")
+
+    parser = _build_parser()
+    ns = parser.parse_args(
+        ["--base-url", "https://q.example.test", "submit-ena-import", "PRJEB11419"]
+    )
+    assert ns.handler(ns, parser) == 1
+    err = capsys.readouterr().err
+    assert str(status) in err
+    assert ("ena-import-list --mine --since" in err) is hinted
+
+
 def test_unreachable_control_plane_gives_no_batch_hint(monkeypatch, patch_async_client, capsys):
     from qiita_control_plane.cli.user._parser import _build_parser
 

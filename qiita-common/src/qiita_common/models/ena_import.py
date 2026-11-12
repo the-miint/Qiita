@@ -134,7 +134,6 @@ class BatchImportSummary(BaseModel):
     """One batch in the list view: how many of its items are in each rolled-up state."""
 
     ena_import_batch_idx: int
-    submitted_by_principal_idx: int
     created_at: AwareDatetime
     item_state_counts: dict[BatchItemState, Annotated[int, Field(ge=0)]]
 

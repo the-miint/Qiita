@@ -4,4 +4,5 @@
   newest first, each with its idx and a count of items per state, so a batch whose submit
   response was lost can be found. `--mine` limits to your own, `--since` takes a timestamp
   with timezone. `qiita submit-ena-import` prints the exact list command to run after a
-  Ctrl-C before the server answered, or when the submit was sent but no response came back.
+  Ctrl-C before the server answered, when the submit was sent but no response came back, or
+  when a gateway answered 502/503/504.

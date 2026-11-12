@@ -665,7 +665,7 @@ async def test_list_returns_newest_first_with_zero_filled_state_counts(
     assert body["count"] == 2
     assert body["truncated"] is False
     newer_summary, older_summary = body["batches"]
-    assert newer_summary["submitted_by_principal_idx"] == pidx
+    assert set(newer_summary) == {"ena_import_batch_idx", "created_at", "item_state_counts"}
     assert newer_summary["created_at"]
     assert set(newer_summary["item_state_counts"]) == {s.value for s in BatchItemState}
     assert newer_summary["item_state_counts"][BatchItemState.REGISTERED] == 1

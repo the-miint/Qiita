@@ -30,6 +30,8 @@ from qiita_common.models.ena_import import TERMINAL_BATCH_ITEM_STATES, BatchItem
 from .. import _common
 
 _FAILED_STATES = (BatchItemState.FAILED, BatchItemState.COMPLETED_PARTIAL)
+# A proxy answering in place of the control plane, which may have committed the batch.
+_GATEWAY_STATUSES = frozenset({502, 503, 504})
 
 
 def _uncertain_batch_hint(started: datetime) -> str:
@@ -295,6 +297,8 @@ def _handle_submit_ena_import(args: argparse.Namespace, parser: argparse.Argumen
         return 1
     except _httpx.HTTPStatusError as exc:
         _common.print_http_status_error(exc.response)
+        if not submitted_idx and exc.response.status_code in _GATEWAY_STATUSES:
+            print(_uncertain_batch_hint(started), file=sys.stderr)
         return 1
     except _httpx.RequestError as exc:
         _common.print_request_error(exc)

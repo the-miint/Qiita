@@ -381,7 +381,7 @@ async def fetch_ena_import_batches(
     where = (" WHERE " + " AND ".join(conditions)) if conditions else ""
     args.append(limit)
     return await pool_or_conn.fetch(
-        "SELECT idx AS ena_import_batch_idx, submitted_by_principal_idx, created_at"
+        "SELECT idx AS ena_import_batch_idx, created_at"
         " FROM qiita.ena_import_batch"
         f"{where} ORDER BY idx DESC LIMIT ${len(args)}",
         *args,
