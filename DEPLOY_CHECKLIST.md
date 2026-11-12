@@ -35,7 +35,7 @@ _None yet._
   with no `host_taxon_id` passes through host filtering undepleted, so skipping `--execute` lets
   residue biosamples (taxa the curated table does not cover) pass through undepleted. `--execute`
   writes them `not provided`, which stays refused until patched, and leaves hostless taxa absent; it
-  is safe on the old build. (#NNN)
+  is safe on the old build. (#864)
   1. Dry-run and read the report. Expect no `WARNING:` lines and `no taxon_id at all (not
      backfillable)` to read 0, because a blank that the backfill cannot recognize as a control, or a
      biosample with no `taxon_id`, is no longer refused; if not, stop and raise the report.
@@ -52,7 +52,7 @@ _None yet._
 
 - `20261110000000_host_taxon_id_not_required` makes `host_taxon_id` optional, and from the
   restart an absent value means no host. `dbmate` applies it; run the bucket-2 backfill
-  first. (#NNN)
+  first. (#864)
 
 ### 4. Deploy
 

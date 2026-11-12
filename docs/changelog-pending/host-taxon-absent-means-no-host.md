@@ -1,6 +1,6 @@
 ### Changed
 
-- **A biosample with no `host_taxon_id` now has no host (#NNN).** The host-filter
+- **A biosample with no `host_taxon_id` now has no host (#864).** The host-filter
   resolver returns `pass_through` for it instead of `unresolved`, so its pool is no longer
   refused at submit. `host_taxon_id` is no longer a required field
   (`GET /biosample-global-field` reports `required: false`) and a biosample import no longer
@@ -14,5 +14,5 @@
 
 ### Removed
 
-- **The 422 `missing required metadata field(s)` from `POST /study/{study_idx}/biosample` (#NNN).**
+- **The 422 `missing required metadata field(s)` from `POST /study/{study_idx}/biosample` (#864).**
   No metadata field is enforced as required on import.
