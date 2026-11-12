@@ -34,11 +34,11 @@ _None yet._
 
 ### 3. Migrations
 
-_None yet._
+- `[operator]` Run `make migrate` — adds `qiita.amplicon_sample` (the amplicon per-sample completion gate) and `qiita.exported_identifier.processing_idx` (the second processing kind, for amplicon public identifiers). No out-of-band setup; applies with the standard migrate step.
 
 ### 4. Deploy
 
-_None yet._
+- `[operator]` The amplicon workflow gains version 1.1.0 (drops the primer-orient knobs; adds a per-sample completion gate and public sample identifiers). `actions sync` loads it on deploy and supersedes 1.0.0 for new runs; runs already recorded against 1.0.0 keep binding it.
 
 ### 5. Verify
 

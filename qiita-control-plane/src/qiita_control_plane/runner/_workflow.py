@@ -95,10 +95,12 @@ from ._mask import (
 )
 from ._processing import (
     ASSEMBLER_BINDING,
+    _create_amplicon_gate_pending,
     _create_assembly_gate_pending,
     _mint_processing_idx,
     _record_assembly_gate_no_data,
     _workflow_needs_processing,
+    _workflow_writes_amplicon_gate,
     _workflow_writes_assembly_gate,
 )
 from ._read_ingest import (
@@ -665,6 +667,29 @@ async def run_workflow(
                 pool,
                 processing_idx=minted_processing_idx,
                 prep_sample_idx=scope_target["prep_sample_idx"],
+            )
+
+        # Amplicon completion gate: a workflow declaring the terminal
+        # `finalize-amplicon-sample` action gets the pool's qiita.amplicon_sample
+        # rows materialized 'pending' here (see `_create_amplicon_gate_pending`).
+        if _workflow_writes_amplicon_gate(action.steps):
+            if scope_target["kind"] != ScopeTargetKind.SEQUENCED_POOL.value:
+                raise _submission_bad_input(
+                    "a workflow that gates amplicon completion (declares "
+                    f"{LibraryPrimitive.FINALIZE_AMPLICON_SAMPLE}) must be "
+                    f"sequenced_pool-scoped; got {scope_target['kind']!r}"
+                )
+            if minted_processing_idx is None:
+                raise _submission_bad_input(
+                    "a workflow that gates amplicon completion (declares "
+                    f"{LibraryPrimitive.FINALIZE_AMPLICON_SAMPLE}) must thread "
+                    f"{PROCESSING_IDX_BINDING} through a step's params so the run "
+                    "identity the gate rows are keyed on is minted"
+                )
+            await _create_amplicon_gate_pending(
+                pool,
+                processing_idx=minted_processing_idx,
+                sequenced_pool_idx=scope_target["sequenced_pool_idx"],
             )
 
         # De novo alignment identity + completion gate: a workflow declaring the

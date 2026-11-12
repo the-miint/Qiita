@@ -72,6 +72,7 @@ from ..repositories.alignment_definition import (
     ALIGNMENT_SAMPLE_COMPLETED,
     ALIGNMENT_SAMPLE_INVALIDATED,
 )
+from ..repositories.amplicon import close_amplicon_samples
 from ..repositories.assembly import (
     ASSEMBLY_GENOME_MAP_PAIRS_SQL,
     ASSEMBLY_GENOME_MAP_ROWS_SQL,
@@ -97,6 +98,7 @@ from ..repositories.block import (
     set_block_state,
     upsert_mask_sample_completed,
 )
+from ..repositories.exported_identifier import mint_processing_exported_identifiers
 from ..repositories.prep_sample_qc_check import upsert_qc_checks
 from ..repositories.reference_exclusion import resolve_excluded_features
 from ..repositories.reference_membership import (
@@ -3480,6 +3482,74 @@ async def reconcile_alignment_block(
 # at dispatch time. Adding a primitive here is a contract change visible
 # to every workflow YAML; do it deliberately.
 
+
+async def mint_amplicon_identifiers(
+    pool: asyncpg.Pool,
+    *,
+    processing_idx: int,
+    asv_counts_path: Path,
+    created_by_idx: int,
+) -> int:
+    """Mint the QM identifier of every processed sample in an amplicon run, and
+    return how many samples it covers.
+
+    The samples are the ones denoise counted ASVs for (`asv_counts`), which is the
+    sample set amplicon_load wrote to `amplicon_membership`: membership is that
+    file joined to the feature map, and the join drops no row. Read from the
+    denoise output rather than the staged membership because register-files moves
+    staged files into the lake, so after it runs there is no staged copy left."""
+    with duckdb_connect() as duck:
+        prep_sample_idxs = [
+            row[0]
+            for row in duck.execute(
+                "SELECT DISTINCT prep_sample_idx FROM read_parquet(?) ORDER BY 1",
+                [str(asv_counts_path)],
+            ).fetchall()
+        ]
+    if not prep_sample_idxs:
+        return 0
+    async with pool.acquire() as conn, conn.transaction():
+        await mint_processing_exported_identifiers(
+            conn,
+            processing_idx=processing_idx,
+            prep_sample_idxs=prep_sample_idxs,
+            created_by_idx=created_by_idx,
+        )
+    return len(prep_sample_idxs)
+
+
+async def finalize_amplicon_sample(
+    pool: asyncpg.Pool,
+    *,
+    processing_idx: int,
+    prep_sample_idxs: list[int],
+    asv_counts_path: Path,
+) -> tuple[int, int]:
+    """Close an amplicon ticket's share of the qiita.amplicon_sample gate from
+    denoise's `asv_counts` (one row per counted (prep_sample, ASV)), and return how
+    many samples were written (completed, no_data). `prep_sample_idxs` is the
+    ticket's pool population, the rows `close_amplicon_samples` may close.
+
+    Runs after register-files, so 'completed' never names a sample whose ASVs did
+    not land. Read from the denoise output for the reason on
+    `mint_amplicon_identifiers`: after register-files no staged copy is left."""
+    with duckdb_connect() as duck:
+        completed = [
+            r[0]
+            for r in duck.execute(
+                "SELECT DISTINCT prep_sample_idx FROM read_parquet(?)",
+                [str(asv_counts_path)],
+            ).fetchall()
+        ]
+    async with pool.acquire() as conn, conn.transaction():
+        return await close_amplicon_samples(
+            conn,
+            processing_idx=processing_idx,
+            prep_sample_idxs=prep_sample_idxs,
+            completed_prep_sample_idxs=completed,
+        )
+
+
 LIBRARY: dict[str, Callable[..., Awaitable[Any]]] = {
     LibraryPrimitive.MINT_FEATURES: mint_features,
     LibraryPrimitive.MINT_ANNOTATION_FEATURES: mint_annotation_features,
@@ -3503,4 +3573,6 @@ LIBRARY: dict[str, Callable[..., Awaitable[Any]]] = {
     LibraryPrimitive.DELETE_ALIGNMENT_SAMPLE: delete_alignment_sample,
     LibraryPrimitive.RECONCILE_ALIGNMENT_BLOCK: reconcile_alignment_block,
     LibraryPrimitive.SYNC_REFERENCE_EXCLUSION: sync_reference_exclusion,
+    LibraryPrimitive.MINT_AMPLICON_IDENTIFIERS: mint_amplicon_identifiers,
+    LibraryPrimitive.FINALIZE_AMPLICON_SAMPLE: finalize_amplicon_sample,
 }
