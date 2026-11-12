@@ -70,8 +70,6 @@ from .. import _common
 from .._reference_exclusion import add_user_exclusion_subparsers
 from ._helpers import (
     _UNSET,
-    _handle_field_exception_clear,
-    _handle_field_exception_set,
     _handle_patch,
     _handle_read,
     _handle_study_scoped_call,
@@ -92,6 +90,7 @@ from .ena_import import (
     _handle_submit_ena_import,
 )
 from .feature_table import DEFAULT_TABLE_FORMAT, TABLE_FORMATS, _handle_feature_table_build
+from .field_exception import _handle_field_exception_clear, _handle_field_exception_set
 from .mask import (
     DEFAULT_FEATURE_NAME_SOURCE,
     DEFAULT_SYNDNA_TABLE_FORMAT,
@@ -305,22 +304,33 @@ def _add_field_list_subcommands(
     )
 
 
-def _add_field_exception_subcommands(entity_sub, *, entity_noun: str, path: str) -> None:
+def _add_field_exception_subcommands(
+    entity_sub, *, entity_noun: str, field_noun: str, path: str
+) -> None:
     """Declare one entity's `get-`, `set-` and `clear-field-exception`
-    subcommands, over the value-level exception on one of its values of one
-    study field. `entity_noun` names the entity and its idx flag; `path` is the
-    route's path under /study, its placeholders filled from the parsed args.
+    subcommands, over the field exception on one of its values of one study
+    field. `entity_noun` names the entity and its idx flag, and `field_noun`
+    the kind of study field that holds its metadata; `path` is the route's path
+    under /study, its placeholders filled from the parsed args.
     """
     hyphenated = entity_noun.replace("_", "-")
 
     def _add_target_args(subparser: argparse.ArgumentParser) -> None:
         subparser.add_argument("--study-idx", type=int, required=True)
         subparser.add_argument(f"--{hyphenated}-idx", type=int, required=True)
-        subparser.add_argument("--study-field-idx", type=int, required=True)
+        subparser.add_argument(
+            "--study-field-idx",
+            type=int,
+            required=True,
+            help=f"the idx of one of the study's {field_noun} fields",
+        )
 
     p_get = entity_sub.add_parser(
         "get-field-exception",
-        help=f"Read the exception on a {hyphenated}'s value of one study field (needs admin)",
+        help=(
+            f"Read the field exception on a {hyphenated}'s value of one study field"
+            " (needs admin on the study)"
+        ),
     )
     _add_target_args(p_get)
     p_get.set_defaults(
@@ -335,7 +345,7 @@ def _add_field_exception_subcommands(entity_sub, *, entity_noun: str, path: str)
         "set-field-exception",
         help=(
             f"Restrict a {hyphenated}'s value of one study field to a tier above the"
-            " field's (needs admin)"
+            " field's own (needs admin on the study)"
         ),
     )
     _add_target_args(p_set)
@@ -343,19 +353,22 @@ def _add_field_exception_subcommands(entity_sub, *, entity_noun: str, path: str)
         "--tier-override",
         choices=tuple(t.value for t in Tier),
         required=True,
-        help="the tier the value then requires; must be above the field's own",
+        help="the tier that the value then requires; it must be above the field's own",
     )
     p_set.add_argument("--reason", required=True, help="why the value is restricted")
     p_set.add_argument(
         "--replace",
         action="store_true",
-        help="replace an exception already set; without it, set stops and shows the stored one",
+        help="replace a field exception already set; without it, set stops and shows it",
     )
     p_set.set_defaults(handler=_handle_field_exception_set, field_exception_path=path)
 
     p_clear = entity_sub.add_parser(
         "clear-field-exception",
-        help=f"Remove the exception on a {hyphenated}'s value of one study field (needs admin)",
+        help=(
+            f"Remove the field exception on a {hyphenated}'s value of one study field"
+            " (needs admin on the study)"
+        ),
     )
     _add_target_args(p_clear)
     p_clear.set_defaults(handler=_handle_field_exception_clear, field_exception_path=path)
@@ -740,6 +753,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_field_exception_subcommands(
         p_biosample_sub,
         entity_noun="biosample",
+        field_noun="biosample",
         path=f"{PATH_STUDY_PREFIX}{PATH_BIOSAMPLE_FIELD_EXCEPTION}",
     )
 
@@ -1021,6 +1035,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_field_exception_subcommands(
         p_seqsample_sub,
         entity_noun="sequenced_sample",
+        field_noun="prep_sample",
         path=f"{PATH_STUDY_PREFIX}{PATH_SEQUENCED_SAMPLE_FIELD_EXCEPTION}",
     )
 

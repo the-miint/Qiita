@@ -1,10 +1,7 @@
-"""DB-bound tests: the database refuses a value-level exception on a
-unique_in_study field, and refuses declaring unique_in_study over values that
-carry exceptions, whichever of the two commits first.
-
-A refused write still answers for a duplicate of a value it may not read only
-when that value sits under an exception, so the rule is enforced here, below
-every writer, rather than by the routes alone.
+"""DB-bound tests: the database refuses a field exception on a
+unique_in_study field, and refuses declaring unique_in_study over a field that
+exceptions key on, whichever of the two commits first. The migration that adds
+the two triggers says why.
 """
 
 import asyncio
@@ -47,9 +44,10 @@ async def _insert_exception(conn, spec, *, entity_idx, field_idx, created_by_idx
         f"INSERT INTO {spec.field_exception_table} ("
         f"    {spec.entity_key_column}, {spec.study_field_idx_column},"
         f"    tier_override, created_by_idx"
-        f") VALUES ($1, $2, 'admin'::qiita.tier, $3)",
+        f") VALUES ($1, $2, $3::qiita.tier, $4)",
         entity_idx,
         field_idx,
+        Tier.ADMIN,
         created_by_idx,
     )
 
@@ -113,6 +111,23 @@ async def test_unique_in_study_refused_while_an_exception_keys_on_the_field(ctx,
             f"SELECT unique_in_study FROM {spec.study_field_table} WHERE idx = $1", field_idx
         )
         is False
+    )
+
+
+@pytest.mark.parametrize("spec", SPECS, ids=_spec_id)
+async def test_an_exception_on_another_field_does_not_block_unique_in_study(ctx, spec):
+    entity_idx = await _create_linked_entity_for_spec(ctx, spec)
+    excepted_field_idx = await _create_plain_field(ctx, spec, suffix="exc_other")
+    await _seed_exception(ctx, spec, entity_idx=entity_idx, field_idx=excepted_field_idx)
+    field_idx = await _create_plain_field(ctx, spec, suffix="exc_unique_other")
+
+    await _set_unique_in_study(ctx, spec, field_idx, True)
+
+    assert (
+        await ctx["pool"].fetchval(
+            f"SELECT unique_in_study FROM {spec.study_field_table} WHERE idx = $1", field_idx
+        )
+        is True
     )
 
 

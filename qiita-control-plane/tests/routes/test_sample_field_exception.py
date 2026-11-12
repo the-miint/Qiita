@@ -10,6 +10,7 @@ unique_in_study field exclude each other. Replacing or clearing an exception
 needs the If-Match its read returned.
 """
 
+import asyncio
 import secrets
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -22,7 +23,7 @@ from qiita_common.api_paths import (
     URL_SEQUENCED_SAMPLE_BY_STUDY_AND_IDX,
     URL_SEQUENCED_SAMPLE_FIELD_EXCEPTION,
 )
-from qiita_common.auth_constants import Scope
+from qiita_common.auth_constants import MAX_REASON_LENGTH, Scope
 from qiita_common.models import FieldDataType, Tier
 
 from qiita_control_plane.repositories._sample_helpers import EntityMetadataSpec
@@ -49,9 +50,11 @@ from .conftest import (
     PREP_SAMPLE_FIELD_SURFACE,
     STUDY_SCOPED_SAMPLE_ADMIN_AUTHZ_CASES,
     SampleFieldSurface,
+    _finish,
     _grant_study_access,
     _seed_authz_case_study,
     _seed_study,
+    _wait_until_blocked_by,
     assert_study_scoped_sample_admin_authz,
     get_study_field,
     patch_study_field,
@@ -324,7 +327,7 @@ async def _visible_keys(client, url: str) -> set[str]:
 async def _exception_rows(ctx, spec, entity: _Entity) -> list:
     return await ctx["pool"].fetch(
         f"SELECT {spec.study_field_idx_column} AS study_field_idx, global_field_idx,"
-        f"       tier_override::text AS tier_override, reason"
+        f"       tier_override, reason"
         f" FROM {spec.field_exception_table} WHERE {spec.entity_key_column} = $1",
         entity.metadata_idx,
     )
@@ -353,6 +356,7 @@ async def test_put_exception_hides_the_value_below_its_tier(ctx, surface):
     assert body["tier_override"] == Tier.ADMIN
     assert body["reason"] == "accidental PII"
     assert body["created_by_idx"] == _wet_idx(ctx)
+    assert body["updated_by_idx"] == _wet_idx(ctx)
     assert resp.headers["ETag"]
     assert value.internal_name not in await _visible_keys(ctx["user"], read_url)
     assert value.internal_name in await _visible_keys(ctx["wet"], read_url)
@@ -550,8 +554,9 @@ async def test_delete_without_if_match_is_428(ctx, surface):
     (("global", Tier.PUBLIC), ("local", Tier.MEMBER)),
 )
 async def test_exception_at_or_below_the_field_tier_is_422(ctx, surface, field_shape, field_tier):
-    """An exception can only raise the tier a value needs; one at the field's
-    own tier, or below it, would restrict nothing."""
+    """An exception can only increase the tier that a value needs; one at the
+    field's own tier, or below it, would restrict nothing, and one a tier above
+    it is set."""
     s = _SURFACES[surface]
     study_idx = await _member_study(ctx)
     entity = await s.seed_entity(ctx, study_idx)
@@ -566,6 +571,7 @@ async def test_exception_at_or_below_the_field_tier_is_422(ctx, surface, field_s
         )
     url = s.exception_url(study_idx, entity, field_idx)
     below = Tier.PUBLIC if field_tier is Tier.PUBLIC else Tier.VIEWER
+    above = Tier.VIEWER if field_tier is Tier.PUBLIC else Tier.ADMIN
 
     for tier in {field_tier, below}:
         resp = await _put(ctx["wet"], url, tier)
@@ -573,14 +579,30 @@ async def test_exception_at_or_below_the_field_tier_is_422(ctx, surface, field_s
         assert resp.status_code == 422, resp.text
         assert "restricts nothing" in resp.json()["detail"]
     assert await _exception_rows(ctx, s.spec, entity) == []
+    assert (await _put(ctx["wet"], url, above)).status_code == 201
+
+
+@pytest.mark.parametrize("surface", _SURFACE_IDS)
+async def test_reason_longer_than_its_cap_is_422(ctx, surface):
+    s = _SURFACES[surface]
+    study_idx = await _member_study(ctx)
+    entity = await s.seed_entity(ctx, study_idx)
+    value = await _seed_global_value(ctx, s.spec, study_idx=study_idx, entity=entity)
+    url = s.exception_url(study_idx, entity, value.study_field_idx)
+
+    too_long = await _put(ctx["wet"], url, Tier.ADMIN, reason="x" * (MAX_REASON_LENGTH + 1))
+    at_cap = await _put(ctx["wet"], url, Tier.ADMIN, reason="x" * MAX_REASON_LENGTH)
+
+    assert too_long.status_code == 422, too_long.text
+    assert at_cap.status_code == 201, at_cap.text
 
 
 @pytest.mark.parametrize("surface", _SURFACE_IDS)
 async def test_value_another_study_wrote_needs_admin_there(ctx, surface):
     """An admin of this study may not read, set, or clear the exception on a
-    value that another study wrote, without admin on that study: it decides who
-    reads that study's value, and its reason may describe it. The refusal names
-    neither the other study nor the value."""
+    value that another study wrote, without admin on that study. The refusal is
+    the same on every verb and whether or not an exception is set, and names
+    neither the other study, nor the value, nor the exception's reason."""
     s = _SURFACES[surface]
     study_idx = await _seed_authz_case_study(
         ctx, owner_key="wet", grant_tier=Tier.ADMIN, case="exc-here"
@@ -589,9 +611,25 @@ async def test_value_another_study_wrote_needs_admin_there(ctx, surface):
     other_study_idx = await _seed_study(ctx, owner_idx=_wet_idx(ctx), suffix="exc-other")
     await s.link_entity(ctx, entity, other_study_idx)
     value = await _seed_global_value(ctx, s.spec, study_idx=other_study_idx, entity=entity)
+    stored = await ctx["pool"].fetchval(
+        f"SELECT value_text FROM {s.spec.metadata_table}"
+        f" WHERE {s.spec.entity_key_column} = $1 AND global_field_idx = $2",
+        entity.metadata_idx,
+        value.global_field_idx,
+    )
     here_alias_idx = await _alias_global_field(
         ctx, s.spec, study_idx=study_idx, global_field_idx=value.global_field_idx
     )
+    url = s.exception_url(study_idx, entity, here_alias_idx)
+
+    async def _every_verb(etag: str) -> list:
+        return [
+            await ctx["user"].get(url),
+            await _put(ctx["user"], url, Tier.ADMIN, if_match=etag),
+            await ctx["user"].delete(url, headers={"If-Match": etag}),
+        ]
+
+    unset = await _every_verb('"2026-01-01T00:00:00+00:00"')
     await seed_field_exception(
         ctx["pool"],
         spec=s.spec,
@@ -601,21 +639,16 @@ async def test_value_another_study_wrote_needs_admin_there(ctx, surface):
         created_by_idx=_wet_idx(ctx),
         reason="names the participant",
     )
-    url = s.exception_url(study_idx, entity, here_alias_idx)
     etag = await _etag(ctx["wet"], url)
+    set_ = await _every_verb(etag)
 
-    refused = [
-        await ctx["user"].get(url),
-        await _put(ctx["user"], url, Tier.ADMIN, if_match=etag),
-        await ctx["user"].delete(url, headers={"If-Match": etag}),
-    ]
-
-    for resp in refused:
+    for resp in (*unset, *set_):
         assert resp.status_code == 403, resp.text
+        assert stored not in resp.text
         assert "names the participant" not in resp.text
         assert f"study {other_study_idx}" not in resp.text
         assert f"study_idx={other_study_idx}" not in resp.text
-    assert refused[0].json()["detail"] == refused[1].json()["detail"]
+    assert len({resp.json()["detail"] for resp in (*unset, *set_)}) == 1
 
     await _grant_study_access(
         ctx,
@@ -627,6 +660,8 @@ async def test_value_another_study_wrote_needs_admin_there(ctx, surface):
     resp = await _put(ctx["user"], url, Tier.ADMIN, if_match=etag)
 
     assert resp.status_code == 200, resp.text
+    assert resp.json()["created_by_idx"] == _wet_idx(ctx)
+    assert resp.json()["updated_by_idx"] == _user_idx(ctx)
 
 
 # ---------------------------------------------------------------------------
@@ -729,9 +764,7 @@ async def _seed_unique_local_value(ctx, s: _Surface, *, study_idx: int, entity: 
 
 @pytest.mark.parametrize("surface", _SURFACE_IDS)
 async def test_exception_on_a_unique_in_study_field_is_409(ctx, surface):
-    """A unique_in_study field refuses a duplicate of any of its values, so an
-    exception on one would let that refusal show who may not read it that the
-    value equals the one they sent."""
+    """A field exception cannot be set on a unique_in_study field."""
     s = _SURFACES[surface]
     study_idx = await _member_study(ctx)
     entity = await s.seed_entity(ctx, study_idx)
@@ -775,15 +808,85 @@ async def test_declaring_unique_in_study_over_an_exception_is_409(ctx, surface):
     assert after.json()["unique_in_study"] is False
 
 
+@pytest.mark.parametrize("surface", _SURFACE_IDS)
+async def test_an_exception_on_another_field_does_not_block_unique_in_study(ctx, surface):
+    s = _SURFACES[surface]
+    study_idx = await _member_study(ctx)
+    entity = await s.seed_entity(ctx, study_idx)
+    excepted_field_idx, _ = await _seed_local_value(
+        ctx, s.spec, study_idx=study_idx, entity=entity, tier_override=Tier.VIEWER
+    )
+    put = await _put(ctx["wet"], s.exception_url(study_idx, entity, excepted_field_idx), Tier.ADMIN)
+    assert put.status_code == 201, put.text
+    field_idx = await seed_local_study_field(
+        ctx["pool"],
+        spec=s.spec,
+        study_idx=study_idx,
+        display_name=unique_field_name("exc_unique_beside"),
+        created_by_idx=_wet_idx(ctx),
+    )
+    field = await get_study_field(
+        surface=s.fields, client=ctx["wet"], study_idx=study_idx, study_field_idx=field_idx
+    )
+
+    resp = await patch_study_field(
+        surface=s.fields,
+        client=ctx["wet"],
+        study_idx=study_idx,
+        study_field_idx=field_idx,
+        if_match=field.headers["ETag"],
+        unique_in_study=True,
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["unique_in_study"] is True
+
+
+@pytest.mark.parametrize("surface", _SURFACE_IDS)
+async def test_put_racing_a_unique_declaration_is_409(ctx, surface):
+    """A PUT that read the field before an uncommitted unique_in_study
+    declaration waits for it in the database, and is then refused with the same
+    409 as one that read it after."""
+    s = _SURFACES[surface]
+    pool = ctx["pool"]
+    study_idx = await _member_study(ctx)
+    entity = await s.seed_entity(ctx, study_idx)
+    field_idx, _ = await _seed_local_value(
+        ctx, s.spec, study_idx=study_idx, entity=entity, tier_override=Tier.VIEWER
+    )
+    url = s.exception_url(study_idx, entity, field_idx)
+
+    async with pool.acquire() as declarer:
+        tx = declarer.transaction()
+        await tx.start()
+        try:
+            # The unique_in_study propagation refuses to run without a bound.
+            await declarer.execute("SET LOCAL lock_timeout = '3s'")
+            await declarer.execute(
+                f"UPDATE {s.spec.study_field_table} SET unique_in_study = true WHERE idx = $1",
+                field_idx,
+            )
+            task = asyncio.create_task(_put(ctx["wet"], url, Tier.ADMIN))
+            await _wait_until_blocked_by(pool, declarer, task)
+        finally:
+            await tx.commit()
+    resp = await _finish(task)
+
+    assert resp.status_code == 409, resp.text
+    assert "unique_in_study" in resp.json()["detail"]
+    assert await _exception_rows(ctx, s.spec, entity) == []
+
+
 # ---------------------------------------------------------------------------
 # Access
 # ---------------------------------------------------------------------------
 
 
 def _authz_driver(ctx, s: _Surface, *, with_exception: bool):
-    """(seed_sample, send-builder) for the shared access matrix: the sample
-    carries a public global value, and an exception on it when with_exception.
-    The field the path names is recorded as the seed runs."""
+    """(seed_sample, url, current_etag) for the shared access matrix: the
+    sample carries a public global value, and an exception on it when
+    with_exception. The field that the path names is recorded as the seed
+    runs."""
     seeded: dict[str, int] = {}
 
     async def seed_sample(ctx, study_idx: int) -> int:

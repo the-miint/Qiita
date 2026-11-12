@@ -5,23 +5,56 @@
 -- =============================================================================
 --
 -- A unique_in_study field refuses a duplicate of any value stored through it,
--- including one the writer may not read. With an exception on that value, the
--- refusal would tell a writer below the exception's tier that the hidden value
--- equals the one they sent. Without one, every value through the field
--- requires the field's own tier, which anyone allowed to write the field
--- reaches, so the refusal tells them nothing they could not read.
+-- including one that the writer may not read. With an exception on that value,
+-- the refusal would tell a writer below the exception's tier that the hidden
+-- value equals the one that they sent. Without one, every value through the
+-- field requires the field's own tier, which anyone who may write the field
+-- reaches, so the refusal tells them nothing that they could not read.
 --
 -- Refused both ways: an exception keyed on a unique_in_study field, and
 -- declaring unique_in_study over a field that exceptions key on. An exception
 -- keyed on a global field never meets the flag, which only a purely-local
 -- field carries.
 --
--- The two serialize on the study field's row: the exception side reads it
--- FOR SHARE, which waits behind an uncommitted declaration and then reads its
--- outcome, and the declaration's UPDATE waits behind that share lock and then,
--- at READ COMMITTED, sees the committed exception. Each raises check_violation
--- naming the rule as its constraint, which the routes map to a 409.
--- docs/architecture/data-model.md, "Metadata visibility tiers", states the rule.
+-- An exception insert and a unique_in_study declaration serialize on the study
+-- field's row: the insert's trigger reads the row FOR SHARE, which waits behind
+-- an uncommitted declaration and then reads its outcome, and the declaration's
+-- UPDATE waits behind that share lock and then, at READ COMMITTED, sees the
+-- committed exception. Each raises check_violation naming the rule as its
+-- constraint. docs/architecture/data-model.md, "Metadata visibility tiers",
+-- states the rule.
+
+-- The triggers judge only later writes, so the rows already stored must obey
+-- the rule before they arm.
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM qiita.biosample_field_exception e
+          JOIN qiita.biosample_study_field sf ON sf.idx = e.biosample_study_field_idx
+         WHERE sf.unique_in_study
+    ) OR EXISTS (
+        SELECT 1 FROM qiita.prep_sample_field_exception e
+          JOIN qiita.prep_sample_study_field sf ON sf.idx = e.prep_sample_study_field_idx
+         WHERE sf.unique_in_study
+    ) THEN
+        RAISE EXCEPTION 'a value-level exception already keys on a unique_in_study field'
+          USING HINT = 'clear those exceptions, or the flag, before applying this migration';
+    END IF;
+END
+$$;
+
+-- Who set an exception's current tier and reason; created_by_idx keeps who
+-- first set it.
+ALTER TABLE qiita.biosample_field_exception
+    ADD COLUMN updated_by_idx BIGINT REFERENCES qiita.principal(idx) ON DELETE RESTRICT;
+ALTER TABLE qiita.prep_sample_field_exception
+    ADD COLUMN updated_by_idx BIGINT REFERENCES qiita.principal(idx) ON DELETE RESTRICT;
+COMMENT ON COLUMN qiita.biosample_field_exception.updated_by_idx IS
+    'The principal who set the current tier_override and reason: the creator until '
+    'a replace. NULL on a row written other than through the exception route.';
+COMMENT ON COLUMN qiita.prep_sample_field_exception.updated_by_idx IS
+    'The principal who set the current tier_override and reason: the creator until '
+    'a replace. NULL on a row written other than through the exception route.';
 
 CREATE FUNCTION qiita.tg_field_exception_not_on_unique_field() RETURNS trigger AS $$
 DECLARE
@@ -102,6 +135,8 @@ CREATE TRIGGER prep_sample_study_field_unique_without_exceptions
 
 -- migrate:down
 
+ALTER TABLE qiita.prep_sample_field_exception DROP COLUMN IF EXISTS updated_by_idx;
+ALTER TABLE qiita.biosample_field_exception DROP COLUMN IF EXISTS updated_by_idx;
 DROP TRIGGER IF EXISTS prep_sample_study_field_unique_without_exceptions
     ON qiita.prep_sample_study_field;
 DROP TRIGGER IF EXISTS biosample_study_field_unique_without_exceptions

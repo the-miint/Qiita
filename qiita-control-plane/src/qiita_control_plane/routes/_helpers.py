@@ -6,7 +6,7 @@ endpoints — same input shape, same on-the-wire output.
 
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from datetime import datetime
-from typing import NamedTuple, NoReturn
+from typing import NoReturn
 
 import asyncpg
 from fastapi import HTTPException
@@ -20,8 +20,6 @@ from qiita_common.models import (
     MetadataEntry,
     MetadataFieldWriteResult,
     MissingReasonRef,
-    SampleFieldExceptionPutRequest,
-    SampleFieldExceptionResponse,
     SampleGlobalFieldResponse,
     SampleMetadataWriteResponse,
     SampleStudyFieldCreateRequest,
@@ -48,7 +46,6 @@ from ..repositories._sample_helpers import (
     DuplicateValueDifferentStudyError,
     DuplicateValueSameStudyError,
     EntityMetadataSpec,
-    FieldExceptionSlot,
     MetadataChecklistUnknownError,
     MetadataFieldTierError,
     MetadataParseError,
@@ -69,12 +66,9 @@ from ..repositories._sample_helpers import (
     ValueRewriteOnUniqueFieldError,
     classify_unique_in_study_violation,
     create_study_field_and_read_back,
-    delete_field_exception,
     fetch_entity_idx_by_unique_field_value,
     fetch_entity_is_linked_to_study,
-    fetch_field_exception,
     fetch_global_metadata,
-    fetch_global_value_study_idx,
     fetch_local_metadata,
     fetch_metadata_checklist_idx_by_name,
     fetch_owner_sample_id_study_field_idxs,
@@ -82,9 +76,7 @@ from ..repositories._sample_helpers import (
     fetch_study_field_has_exceptions,
     fetch_study_field_tier,
     fetch_study_fields_by_display_names,
-    insert_field_exception,
     parse_text_for_data_type,
-    update_field_exception,
     update_study_field,
     widen_study_field_to_text,
     write_sample_metadata,
@@ -1299,6 +1291,24 @@ async def patch_and_map_study_field(
                 ),
             )
 
+    # A field that exceptions key on cannot become unique_in_study; the
+    # migration that enforces it says why. The field row is held FOR NO KEY
+    # UPDATE from the read above, which the exception trigger's FOR SHARE waits
+    # behind, so no exception can land between this check and the write. It
+    # depends on no type, so it runs ahead of the widen and its table lock.
+    if (
+        body.unique_in_study
+        and not row["unique_in_study"]
+        and await fetch_study_field_has_exceptions(conn, spec=spec, study_field_idx=study_field_idx)
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"{noun} field {row['display_name']!r} cannot be made unique within this"
+                " study: field exceptions are set on its values"
+            ),
+        )
+
     # The widen runs ahead of the uniqueness rule below so that rule is judged
     # against the type the field ends at. Anything raised past this point
     # unwinds it with the rest of the caller's transaction.
@@ -1333,10 +1343,6 @@ async def patch_and_map_study_field(
         )
         if reason is not None:
             raise HTTPException(status_code=422, detail=reason)
-        if not row["unique_in_study"] and await fetch_study_field_has_exceptions(
-            conn, spec=spec, study_field_idx=study_field_idx
-        ):
-            _raise_unique_over_exceptions(noun, row["display_name"])
 
     # data_type is carried by the widen above, never by the column write: the
     # study-field update allowlist omits it.
@@ -1371,9 +1377,6 @@ async def patch_and_map_study_field(
             generic=f"violates a uniqueness constraint on {noun} field",
         )
     except asyncpg.CheckViolationError as exc:
-        # An exception committed after the check above, before this write.
-        if exc.constraint_name == spec.unique_over_exceptions_constraint:
-            _raise_unique_over_exceptions(noun, row["display_name"])
         if classify_unique_in_study_violation(exc, spec=spec) is (
             UniqueInStudyViolation.MISSING_VALUE_MARKER
         ):
@@ -1457,338 +1460,6 @@ def map_global_field_row[T: SampleGlobalFieldResponse](
     payload[field_wire_name(response_model, GLOBAL_FIELD_IDX_ATTR)] = payload.pop("idx")
     validated = response_model.model_validate(payload)
     return validated
-
-
-# ---------------------------------------------------------------------------
-# Value-level field exceptions
-# ---------------------------------------------------------------------------
-# An exception and unique_in_study exclude each other; the migration that
-# enforces it (20261112000000_field_exception_excludes_unique_in_study.sql)
-# says why. The two 409s below are the routes' answers to its two refusals.
-
-
-def _raise_exception_on_unique_field(noun: str, display_name: str) -> NoReturn:
-    raise HTTPException(
-        status_code=409,
-        detail=(
-            f"{noun} field {display_name!r} declares unique_in_study;"
-            " a value-level exception cannot be set on it"
-        ),
-    )
-
-
-def _raise_unique_over_exceptions(noun: str, display_name: str) -> NoReturn:
-    raise HTTPException(
-        status_code=409,
-        detail=(
-            f"{noun} field {display_name!r} cannot be made unique within this study:"
-            f" value-level exceptions are set on its values"
-        ),
-    )
-
-
-class _FieldExceptionTarget(NamedTuple):
-    slot: FieldExceptionSlot
-    field: asyncpg.Record
-    # A field linked to a global field whose value on the entity no study has
-    # written yet.
-    linked_slot_empty: bool
-
-
-async def _resolve_field_exception_target(
-    conn: asyncpg.Connection,
-    *,
-    spec: EntityMetadataSpec,
-    fetch_row: Callable[[asyncpg.Connection, int], Awaitable[asyncpg.Record | None]],
-    entity_idx: int,
-    metadata_idx_column: str,
-    study_idx: int,
-    study_field_idx: int,
-    noun: str,
-    tiers: CallerMetadataTiers,
-    write: bool,
-) -> _FieldExceptionTarget:
-    """Resolve the (entity, field) slot an exception route addresses, and
-    refuse a caller who may not act on it.
-
-    The field must be one of the study's (else 404, as a field read answers)
-    and the entity linked to the study (404; a retired entity is 404 to a read
-    and 409 to a write). A linked field's exception keys on the global field
-    and follows the value into every study that links it, so when another
-    study wrote that value, the caller also needs admin there: the exception
-    decides who reads that study's value, and its reason may describe it.
-    That 403 is the same for every verb and names neither the study nor the
-    reason. A write holds the value row to commit, so the study the check read
-    stays the value's.
-    """
-    field = await fetch_study_field_in_study(
-        conn, spec=spec, study_idx=study_idx, study_field_idx=study_field_idx
-    )
-    if field is None:
-        raise HTTPException(
-            status_code=404, detail=f"{spec.entity_kind} field {study_field_idx} not found"
-        )
-    _row, metadata_entity_idx = await resolve_linked_study_entity(
-        conn,
-        spec=spec,
-        fetch_row=fetch_row,
-        entity_idx=entity_idx,
-        metadata_idx_column=metadata_idx_column,
-        study_idx=study_idx,
-        noun=noun,
-        retired_status=409 if write else 404,
-        retired_detail=(
-            resource_retired_detail(noun, entity_idx) if write else f"{noun} {entity_idx} not found"
-        ),
-        unlinked_detail=detail_for_unlinked_entity(
-            noun=noun, entity_idx=entity_idx, study_idx=study_idx
-        ),
-    )
-    global_field_idx = field[spec.study_field_global_fk_column]
-    if global_field_idx is None:
-        slot = FieldExceptionSlot(
-            entity_idx=metadata_entity_idx, global_field_idx=None, study_field_idx=study_field_idx
-        )
-        return _FieldExceptionTarget(slot=slot, field=field, linked_slot_empty=False)
-
-    value_study_idx = await fetch_global_value_study_idx(
-        conn,
-        spec=spec,
-        entity_idx=metadata_entity_idx,
-        global_field_idx=global_field_idx,
-        for_share=write,
-    )
-    if value_study_idx is not None and not tier_at_least(
-        tiers.tier_on(value_study_idx), Tier.ADMIN
-    ):
-        raise HTTPException(
-            status_code=403,
-            detail=(
-                f"{noun} field {field['display_name']!r}: another study wrote the value"
-                f" on this {noun}, so its exception needs admin on that study"
-            ),
-        )
-    slot = FieldExceptionSlot(
-        entity_idx=metadata_entity_idx, global_field_idx=global_field_idx, study_field_idx=None
-    )
-    return _FieldExceptionTarget(slot=slot, field=field, linked_slot_empty=value_study_idx is None)
-
-
-def _raise_no_field_exception(noun: str, entity_idx: int, display_name: str) -> NoReturn:
-    raise HTTPException(
-        status_code=404,
-        detail=f"no exception is set on {noun} field {display_name!r} of {noun} {entity_idx}",
-    )
-
-
-def _raise_field_exception_already_set(noun: str, display_name: str) -> NoReturn:
-    raise HTTPException(
-        status_code=428,
-        detail=(
-            f"{noun} field {display_name!r} already carries an exception on this {noun};"
-            " replacing it needs If-Match"
-        ),
-    )
-
-
-def _map_field_exception(
-    row: asyncpg.Record, *, slot: FieldExceptionSlot
-) -> tuple[SampleFieldExceptionResponse, str]:
-    """Shape one exception row, and return it with its ETag."""
-    response = SampleFieldExceptionResponse(
-        tier_override=row["tier_override"],
-        reason=row["reason"],
-        keyed_on=slot.keyed_on,
-        created_by_idx=row["created_by_idx"],
-        created_at=row["created_at"],
-        updated_at=row["updated_at"],
-    )
-    return response, etag_for_updated_at(row["updated_at"])
-
-
-async def read_and_map_field_exception(
-    conn: asyncpg.Connection,
-    *,
-    spec: EntityMetadataSpec,
-    fetch_row: Callable[[asyncpg.Connection, int], Awaitable[asyncpg.Record | None]],
-    entity_idx: int,
-    metadata_idx_column: str,
-    study_idx: int,
-    study_field_idx: int,
-    noun: str,
-    tiers: CallerMetadataTiers,
-) -> tuple[SampleFieldExceptionResponse, str]:
-    """Read the exception on one entity's value of one study field, with the
-    ETag a replace or clear must send as If-Match. The gates are
-    `_resolve_field_exception_target`'s; no exception is 404.
-    """
-    target = await _resolve_field_exception_target(
-        conn,
-        spec=spec,
-        fetch_row=fetch_row,
-        entity_idx=entity_idx,
-        metadata_idx_column=metadata_idx_column,
-        study_idx=study_idx,
-        study_field_idx=study_field_idx,
-        noun=noun,
-        tiers=tiers,
-        write=False,
-    )
-    row = await fetch_field_exception(conn, spec=spec, slot=target.slot)
-    if row is None:
-        _raise_no_field_exception(noun, entity_idx, target.field["display_name"])
-    return _map_field_exception(row, slot=target.slot)
-
-
-async def put_and_map_field_exception(
-    conn: asyncpg.Connection,
-    *,
-    spec: EntityMetadataSpec,
-    fetch_row: Callable[[asyncpg.Connection, int], Awaitable[asyncpg.Record | None]],
-    entity_idx: int,
-    metadata_idx_column: str,
-    study_idx: int,
-    study_field_idx: int,
-    noun: str,
-    body: SampleFieldExceptionPutRequest,
-    if_match: str | None,
-    caller_idx: int,
-    tiers: CallerMetadataTiers,
-) -> tuple[SampleFieldExceptionResponse, str, bool]:
-    """Set the exception on one entity's value of one study field; return it,
-    its ETag, and whether it was created.
-
-    After `_resolve_field_exception_target`'s gates, in order:
-    - a linked field with no value on the entity yet is 409: the exception
-      would bind whichever study writes first;
-    - a field declaring unique_in_study is 409;
-    - a tier_override at or below the field's tier is 422, restricting nothing.
-
-    Without If-Match the PUT only creates: an exception already there, or one a
-    concurrent request created first, is 428, so a stale caller cannot undo
-    another admin's exception unseen. With If-Match it only replaces: none
-    there is 404, a stale tag 412. The caller owns the transaction.
-    """
-    target = await _resolve_field_exception_target(
-        conn,
-        spec=spec,
-        fetch_row=fetch_row,
-        entity_idx=entity_idx,
-        metadata_idx_column=metadata_idx_column,
-        study_idx=study_idx,
-        study_field_idx=study_field_idx,
-        noun=noun,
-        tiers=tiers,
-        write=True,
-    )
-    display_name = target.field["display_name"]
-    if target.linked_slot_empty:
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                f"{noun} field {display_name!r} holds no value on this {noun}; an exception on"
-                " a field linked to a global field restricts the value whichever study writes"
-                " it, so it can be set once a value is there"
-            ),
-        )
-    if target.field["unique_in_study"]:
-        _raise_exception_on_unique_field(noun, display_name)
-    field_tier = await fetch_study_field_tier(conn, spec=spec, study_field_idx=study_field_idx)
-    if tier_at_least(field_tier, body.tier_override):
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                f"{noun} field {display_name!r} already requires {field_tier.value}; an exception"
-                " at or below the field's tier restricts nothing"
-            ),
-        )
-
-    existing = await fetch_field_exception(conn, spec=spec, slot=target.slot, for_update=True)
-    if if_match is None:
-        if existing is not None:
-            _raise_field_exception_already_set(noun, display_name)
-        try:
-            row = await insert_field_exception(
-                conn,
-                spec=spec,
-                slot=target.slot,
-                tier_override=body.tier_override,
-                reason=body.reason,
-                created_by_idx=caller_idx,
-            )
-        except asyncpg.CheckViolationError as exc:
-            # The field was declared unique_in_study after the check above.
-            if exc.constraint_name == spec.exception_on_unique_field_constraint:
-                _raise_exception_on_unique_field(noun, display_name)
-            raise
-        if row is None:
-            # A concurrent create committed first.
-            _raise_field_exception_already_set(noun, display_name)
-        response, etag = _map_field_exception(row, slot=target.slot)
-        return response, etag, True
-
-    if existing is None:
-        _raise_no_field_exception(noun, entity_idx, display_name)
-    require_etag_match(
-        existing, if_match=if_match, label=f"{noun} field exception", row_idx=study_field_idx
-    )
-    row = await update_field_exception(
-        conn,
-        spec=spec,
-        slot=target.slot,
-        tier_override=body.tier_override,
-        reason=body.reason,
-    )
-    if row is None:
-        raise RuntimeError(
-            f"{spec.field_exception_table} row for {target.slot} vanished under its row lock"
-        )
-    response, etag = _map_field_exception(row, slot=target.slot)
-    return response, etag, False
-
-
-async def delete_field_exception_or_raise(
-    conn: asyncpg.Connection,
-    *,
-    spec: EntityMetadataSpec,
-    fetch_row: Callable[[asyncpg.Connection, int], Awaitable[asyncpg.Record | None]],
-    entity_idx: int,
-    metadata_idx_column: str,
-    study_idx: int,
-    study_field_idx: int,
-    noun: str,
-    if_match: str | None,
-    tiers: CallerMetadataTiers,
-) -> None:
-    """Clear the exception on one entity's value of one study field.
-
-    If-Match is required (428 without), then `_resolve_field_exception_target`'s
-    gates; no exception is 404, a stale tag 412. The caller owns the
-    transaction.
-    """
-    if_match = require_if_match(if_match)
-    target = await _resolve_field_exception_target(
-        conn,
-        spec=spec,
-        fetch_row=fetch_row,
-        entity_idx=entity_idx,
-        metadata_idx_column=metadata_idx_column,
-        study_idx=study_idx,
-        study_field_idx=study_field_idx,
-        noun=noun,
-        tiers=tiers,
-        write=True,
-    )
-    existing = await fetch_field_exception(conn, spec=spec, slot=target.slot, for_update=True)
-    if existing is None:
-        _raise_no_field_exception(noun, entity_idx, target.field["display_name"])
-    require_etag_match(
-        existing, if_match=if_match, label=f"{noun} field exception", row_idx=study_field_idx
-    )
-    if not await delete_field_exception(conn, spec=spec, slot=target.slot):
-        raise RuntimeError(
-            f"{spec.field_exception_table} row for {target.slot} vanished under its row lock"
-        )
 
 
 def raise_for_unique_violation(

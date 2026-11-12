@@ -874,7 +874,7 @@ async def _seed_hidden_unique_value(ctx, monkeypatch, corpus: _Corpus) -> tuple[
     Returns (display_name, the stored value).
 
     No exception can sit on a unique_in_study field, so a member who may write
-    the field reads every value through it, and a value hidden from them can
+    the field can read every value through it, and a value hidden from them can
     only be one whose field an admin raised after the member's field check.
     The check is switched off to stand in for that.
     """

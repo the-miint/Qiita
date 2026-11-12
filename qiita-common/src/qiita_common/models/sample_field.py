@@ -10,6 +10,7 @@ from typing import Annotated, ClassVar, Literal
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
 
+from qiita_common.auth_constants import MAX_REASON_LENGTH
 from qiita_common.models._base import NonBlankName, NonBlankText, PatchRequestModel
 from qiita_common.models.reference import FieldDataType, Tier
 
@@ -35,6 +36,22 @@ NOT_SETTABLE_ON_LINKED_FIELD = (
     "tier_override",
     "unique_in_study",
 )
+
+
+# Defined here so the wire models and the repository layer share one definition.
+type MetadataFieldScope = Literal["global", "local"]
+
+
+def derive_metadata_field_scope(global_link: object) -> MetadataFieldScope:
+    """Map a nullable global-linkage marker to the scope it implies.
+
+    A global-linkage marker is a value that is populated when the field is
+    globally linked and null when it is purely local: a row's FK to a global
+    field, or the linked global field's internal_name carried alongside it.
+    Callers pass whichever one their own type holds. A global field's own idx is
+    not such a marker -- it is never null, so it distinguishes nothing.
+    """
+    return "global" if global_link is not None else "local"
 
 
 def field_wire_name(model: type[BaseModel], attr: str) -> str:
@@ -211,8 +228,8 @@ class SampleStudyFieldPatchRequest(PatchRequestModel):
 
 
 class SampleFieldExceptionPutRequest(BaseModel):
-    """Body for setting the exception on one sample's value of one field: the
-    tier the value then requires, and why.
+    """Body for setting the field exception on one biosample's or prep_sample's
+    value of one field: the tier that the value then requires, and why.
 
     A full replacement: both attributes are required, on a create and on a
     replace alike. The route says when If-Match is needed and what tier an
@@ -222,21 +239,24 @@ class SampleFieldExceptionPutRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     tier_override: Tier
-    reason: NonBlankText
+    reason: Annotated[NonBlankText, Field(max_length=MAX_REASON_LENGTH)]
 
 
 class SampleFieldExceptionResponse(BaseModel):
-    """One value-level exception.
+    """One field exception.
 
     keyed_on says what it follows: "global" for a field linked to a global
     field, where it restricts the value in every study that links that field,
-    and "local" for a purely-local field. reason is None only on a row written
-    before the route required one.
+    and "local" for a purely-local field. The table admits a NULL reason, and
+    updated_by_idx is NULL, on a row that something other than the route wrote.
+    created_by_idx names who first set the exception, and updated_by_idx who set
+    its current tier and reason.
     """
 
     tier_override: Tier
     reason: str | None
-    keyed_on: Literal["global", "local"]
+    keyed_on: MetadataFieldScope
     created_by_idx: Annotated[int, Field(gt=0)]
+    updated_by_idx: Annotated[int, Field(gt=0)] | None
     created_at: AwareDatetime
     updated_at: AwareDatetime

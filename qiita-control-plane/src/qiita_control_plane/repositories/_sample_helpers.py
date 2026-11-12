@@ -848,10 +848,10 @@ class EntityMetadataSpec:
     # prep_sample_field_exception), keyed on the entity, on
     # `study_field_idx_column`, or on global_field_idx.
     field_exception_table: str
-    # The rule names the database raises (as a check_violation's constraint) when
-    # an exception would key on a unique_in_study field, and when unique_in_study
-    # would be declared over a field that exceptions key on. Named in the
-    # migration that creates the two triggers and kept in lockstep with it.
+    # The names of the two rules that the database raises as a check_violation's
+    # constraint: one when an exception would key on a unique_in_study field, one
+    # when unique_in_study would be declared over a field that exceptions key on.
+    # The migration that creates the two triggers names them; kept in lockstep.
     exception_on_unique_field_constraint: str
     unique_over_exceptions_constraint: str
     # The boolean *_metadata column marking an owner-sample-id row, for
@@ -2458,8 +2458,8 @@ class FieldExceptionSlot:
             )
 
     @property
-    def keyed_on(self) -> Literal["global", "local"]:
-        return "global" if self.global_field_idx is not None else "local"
+    def keyed_on(self) -> MetadataFieldScope:
+        return derive_metadata_field_scope(self.global_field_idx)
 
     def key_column(self, spec: EntityMetadataSpec) -> tuple[str, int]:
         """The exception table's key column for this slot, and its value."""
@@ -2470,9 +2470,8 @@ class FieldExceptionSlot:
         raise RuntimeError("FieldExceptionSlot holds no key, which __post_init__ refuses")
 
 
-# tier_override binds out as text so a caller reads the enum label.
 _FIELD_EXCEPTION_COLUMNS = (
-    "tier_override::text AS tier_override, reason, created_by_idx, created_at, updated_at"
+    "tier_override, reason, created_by_idx, updated_by_idx, created_at, updated_at"
 )
 
 
@@ -2511,14 +2510,18 @@ async def insert_field_exception(
     A study field that declares unique_in_study refuses the row: the database
     raises check_violation naming `spec.exception_on_unique_field_constraint`.
     """
+    column, _ = slot.key_column(spec)
     # f-string interpolation of identifiers is safe: spec fields are frozen
-    # module-level constants, never reached by caller input.
+    # module-level constants, never reached by caller input. The conflict target
+    # names the slot's own partial unique index, so no other constraint is
+    # answered as "already set".
     return await conn.fetchrow(
         f"INSERT INTO {spec.field_exception_table} ("
         f"    {spec.entity_key_column}, {spec.study_field_idx_column}, global_field_idx,"
-        f"    tier_override, reason, created_by_idx"
-        f") VALUES ($1, $2, $3, $4::qiita.tier, $5, $6)"
-        f" ON CONFLICT DO NOTHING"
+        f"    tier_override, reason, created_by_idx, updated_by_idx"
+        f") VALUES ($1, $2, $3, $4::qiita.tier, $5, $6, $6)"
+        f" ON CONFLICT ({spec.entity_key_column}, {column}) WHERE {column} IS NOT NULL"
+        f" DO NOTHING"
         f" RETURNING {_FIELD_EXCEPTION_COLUMNS}",
         slot.entity_idx,
         slot.study_field_idx,
@@ -2536,21 +2539,23 @@ async def update_field_exception(
     slot: FieldExceptionSlot,
     tier_override: Tier,
     reason: str,
+    updated_by_idx: int,
 ) -> asyncpg.Record | None:
-    """Replace the tier and reason of the exception on slot and return it, or
-    None when the slot holds none."""
+    """Replace the tier and reason of the exception on slot, recording who set
+    them, and return it, or None when the slot holds none."""
     column, key = slot.key_column(spec)
     # f-string interpolation of identifiers is safe: spec fields are frozen
     # module-level constants, never reached by caller input.
     return await conn.fetchrow(
         f"UPDATE {spec.field_exception_table}"
-        f"   SET tier_override = $3::qiita.tier, reason = $4"
+        f"   SET tier_override = $3::qiita.tier, reason = $4, updated_by_idx = $5"
         f" WHERE {spec.entity_key_column} = $1 AND {column} = $2"
         f" RETURNING {_FIELD_EXCEPTION_COLUMNS}",
         slot.entity_idx,
         key,
         tier_override,
         reason,
+        updated_by_idx,
     )
 
 
@@ -2576,22 +2581,17 @@ async def fetch_global_value_study_idx(
     spec: EntityMetadataSpec,
     entity_idx: int,
     global_field_idx: int,
-    for_share: bool = False,
 ) -> int | None:
     """The study whose field wrote entity_idx's value of global_field_idx, or
-    None when no value is stored there.
-
-    That study is fixed once the value is written: no other study may
-    overwrite it. for_share holds the value row to commit, so it cannot be
-    deleted under the caller.
+    None when no value is stored there. That study is fixed once the value is
+    written: no other study may overwrite it.
     """
-    lock = " FOR SHARE OF m" if for_share else ""
     # f-string interpolation of identifiers is safe: spec fields are frozen
     # module-level constants, never reached by caller input.
     return await conn.fetchval(
         f"SELECT sf.study_idx FROM {spec.metadata_table} m"
         f"  JOIN {spec.study_field_table} sf ON sf.idx = m.{spec.study_field_idx_column}"
-        f" WHERE m.{spec.entity_key_column} = $1 AND m.global_field_idx = $2{lock}",
+        f" WHERE m.{spec.entity_key_column} = $1 AND m.global_field_idx = $2",
         entity_idx,
         global_field_idx,
     )

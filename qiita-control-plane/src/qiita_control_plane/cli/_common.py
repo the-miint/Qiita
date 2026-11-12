@@ -493,21 +493,33 @@ def call_with_status(
     return resp.json(), resp.status_code
 
 
-def patch_with_if_match(base_url: str, token: str, path: str, body: dict) -> dict:
-    """GET `path` to read its current ETag, then PATCH it with that ETag as
-    the If-Match header and `body` as the update; return the decoded PATCH
-    body.
+def write_with_read_etag(
+    method: str, base_url: str, token: str, path: str, *, json: dict | None = None
+) -> tuple[httpx.Response, httpx.Response]:
+    """GET `path` to read its current ETag, then send `method` to it with that
+    ETag as the If-Match header and `json` as the body; return both responses.
 
-    The server requires If-Match on every PATCH and exposes the matching
-    value as the GET response's ETag header, so reading then writing is the
-    only way to mint a valid If-Match; pairing them here also keeps the
-    lost-update window small.
+    A route that requires If-Match exposes the matching value as its GET's
+    ETag header, so reading then writing is the only way to mint a valid
+    If-Match; pairing them here also keeps the lost-update window small.
     """
-    etag = _request("GET", base_url, token, path).headers[ETAG_HEADER]
-    resp = _request(
-        "PATCH", base_url, token, path, json=body, extra_headers={IF_MATCH_HEADER: etag}
+    read = _request("GET", base_url, token, path)
+    written = _request(
+        method,
+        base_url,
+        token,
+        path,
+        json=json,
+        extra_headers={IF_MATCH_HEADER: read.headers[ETAG_HEADER]},
     )
-    return resp.json()
+    return read, written
+
+
+def patch_with_if_match(base_url: str, token: str, path: str, body: dict) -> dict:
+    """PATCH `path` with `body` under the ETag a GET of it returns
+    (`write_with_read_etag`); return the decoded PATCH body."""
+    _read, written = write_with_read_etag("PATCH", base_url, token, path, json=body)
+    return written.json()
 
 
 def whoami(base_url: str, token: str) -> dict:

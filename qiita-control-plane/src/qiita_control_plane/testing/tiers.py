@@ -1,6 +1,6 @@
 """Tier fixtures for tests: a ranking of `Tier` to compute expected visibility
-from, a caller who may read every metadata value, and a switch for the check
-that runs before a metadata write.
+from, a caller who may read every metadata value, and switches for two of the
+checks that run before a metadata write.
 
 The ranking is written here rather than imported from `auth.guards`: a test that
 borrowed the production ordering could not catch that ordering being wrong.
@@ -41,8 +41,9 @@ def apply_write_checks(monkeypatch: pytest.MonkeyPatch, write_checks: str) -> No
 def skip_field_tier_check(monkeypatch: pytest.MonkeyPatch) -> None:
     """Switch off the field-tier check that runs before a metadata write,
     standing in for an admin who raises a field's tier after that check passed:
-    a test cannot place that commit there. A value the caller may not read then
-    reaches the checks that compare stored values."""
+    a test cannot place that commit there. A field above the caller's tier then
+    reaches the value checks, the one before the write included unless
+    `apply_write_checks` switches it off too."""
 
     async def _nothing_above(*_args, **_kwargs) -> dict:
         return {}

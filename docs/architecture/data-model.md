@@ -130,13 +130,14 @@ reaches **the value's required tier**.
   field that it was written through, so one keyed on the local field still applies
   after that field is linked; one keyed on another study's alias of the same
   global field does not. `qiita.metadata_required_tier` combines these two.
-  An admin on the study sets, reads and clears an exception through
-  `/study/{S}/biosample/{B}/field-exception/{F}` and its sequenced-sample twin
-  (`routes._helpers.put_and_map_field_exception` and the helpers beside it).
+  An admin on the study, or a wet_lab_admin+ role, sets, reads and clears an
+  exception through `/study/{S}/biosample/{B}/field-exception/{F}` and its
+  sequenced-sample twin (`routes._field_exception`).
   - On a value that another study wrote into a global field, the caller also
     needs admin on that study.
   - An exception is refused on a globally-linked field that holds no value on
-    that sample yet, and at or below the field's tier, where it restricts nothing.
+    that biosample or prep_sample yet, and at or below the field's tier, where
+    it restricts nothing.
   - Replacing or clearing one needs the If-Match that its read returned.
   - An exception cannot sit on a `unique_in_study` field, and `unique_in_study`
     cannot be declared over a field that exceptions key on; the database refuses
@@ -239,8 +240,8 @@ What such a caller may touch:
   refusal shows that a value is there.
 - A tier that another transaction changes while a write runs, such as an admin
   setting a field's `tier_override`, can make the 403 name different keys
-  depending on what the body sent. That is also the one way left for a
-  `unique_in_study` collision to meet a value the caller cannot read.
+  depending on what the body sent. That is also the only way for a
+  `unique_in_study` collision to meet a value that the caller cannot read.
 - The exception routes answer 403 on a globally-linked value that another
   study wrote, which shows a study admin that some other study wrote a value
   there.
