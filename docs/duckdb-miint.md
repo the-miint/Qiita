@@ -106,7 +106,7 @@ The files qiita consumes:
 | -------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
 | `docs/reading.md`                      | `read_fastx`, `read_alignments`, `read_sequences_sam`, `read_sequences_sff`, `read_biom`, `read_gff`, mzML/jplace/Newick |
 | `docs/writing.md`                      | `COPY ... TO ... (FORMAT FASTQ\|FASTA\|SAM\|BAM\|UBAM\|BIOM\|NEWICK\|GFF)` writers; GFF has a `prodigal` dialect |
-| `docs/gene_prediction.md`              | `predict_genes` (Prodigal through gpl-boundary); qiita-side the `gene_call` job |
+| `docs/gene_prediction.md`              | `predict_genes` (Prodigal through gpl-boundary) |
 | `docs/alignment_reference.md`          | `align_minimap2`/`align_bowtie2` + both `_sharded` twins, `save_*_index`, SortMeRNA                           |
 | `docs/alignment_analysis.md`           | `alignment_is_*`, the CIGAR scorers, `alignment_slice`, `compute_coverage_depth`, `genome_coverage`           |
 | `docs/qc.md`                           | fastp-port read QC (`filter_read`, `trim_adapters*`, `trim_polyg`/`polyx`) **and** `infer_trim`               |

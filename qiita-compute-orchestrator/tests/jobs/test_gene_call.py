@@ -185,6 +185,19 @@ def test_coordinates_cut_the_gene_from_the_canonical_strand(called):
     assert genes == _rows(out / gene_call.GENE_FILE, "SELECT count(*) FROM t")[0][0]
     assert (wrong_hash, bad_start) == (0, 0)
     assert on_flipped > 0
+    # The lowercase contig is read on its canonical strand and carries genes, so a
+    # strand test that skipped normalization would flip it and fail the counts above.
+    s1 = files["refined/bin.2.fa"]["s1"]
+    with open_miint_conn() as conn:
+        conn.execute("CREATE TABLE s1 AS SELECT ? AS s", [s1])
+        flipped, genes_on_s1 = conn.execute(
+            f"""SELECT md5({normalized_sequence_expr("s")})::uuid
+                           <> {canonical_sequence_hash_expr("s")},
+                       (SELECT count(*) FROM '{out / gene_call.GENE_FILE}' g
+                        WHERE g.parent_sequence_hash = {canonical_sequence_hash_expr("s1.s")})
+                FROM s1"""
+        ).fetchone()
+    assert (flipped, genes_on_s1 > 0) == (False, True)
 
 
 def test_checkm_files_are_written_per_subject_with_contig_names_as_read(called):
@@ -272,3 +285,35 @@ def test_an_absent_bins_directory_is_refused(tmp_path):
 def test_a_bin_id_that_is_not_a_plain_name_is_refused(bin_id):
     with pytest.raises(ValueError, match="cannot name a directory"):
         gene_call._dir_name(bin_id)
+
+
+@pytest.mark.parametrize("status", ["unheard_of", None])
+def test_a_contig_status_outside_the_contract_fails(status):
+    """A status `predict_genes`' docs do not list, or a contig with no status at all,
+    stops the step rather than reaching the lake. The control row passes."""
+    with open_miint_conn() as conn:
+        conn.execute(
+            """CREATE TEMP TABLE contig AS SELECT * FROM (VALUES
+                   (1::BIGINT, 'MAG', 'b', 'good', 'h1'::VARCHAR, 1),
+                   (1::BIGINT, 'MAG', 'b', 'bad', 'h2'::VARCHAR, 2))
+               t(genome_id, kind, bin_id, contig_id, sequence_hash, contig_order)"""
+        )
+        conn.execute(
+            """CREATE TEMP TABLE calls (genome_id BIGINT, read_id VARCHAR, meta_mode BOOLEAN,
+                   gene_index INTEGER, status VARCHAR, translation_table INTEGER,
+                   uses_sd BOOLEAN, meta_bin INTEGER, model_desc VARCHAR,
+                   model_gc_content DOUBLE)"""
+        )
+        conn.execute(
+            "INSERT INTO calls VALUES (1, 'good', true, NULL, 'no_genes', 11, true, 0, 'm', 0.5)"
+        )
+        if status is not None:
+            conn.execute(
+                "INSERT INTO calls VALUES (1, 'bad', true, NULL, ?, 11, true, 0, 'm', 0.5)",
+                [status],
+            )
+        sql = gene_call._contig_rows_sql("calls", CALL_SET_META_CLOSED, True, False)
+        with pytest.raises(duckdb.Error, match="has status"):
+            conn.execute(sql).fetchall()
+        conn.execute("DELETE FROM contig WHERE contig_id = 'bad'")
+        assert conn.execute(f"SELECT status FROM ({sql})").fetchall() == [("no_genes",)]
