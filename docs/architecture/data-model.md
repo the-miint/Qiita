@@ -119,7 +119,7 @@ reaches **the value's required tier**.
   `*_study_field.tier_override`, or the study's `default_tier` when that is
   NULL. A linked study-local row always leaves `tier_override` NULL, so the
   global field's tier is the one that applies.
-- **Value-level exception** — a `*_field_exception` row increases the required
+- **Field exception** — a `*_field_exception` row increases the required
   tier of one `(entity, field)` value, for a field that is broadly visible
   where one entity's value must not be, e.g. a free-text field into which one
   submitter entered PII. The required tier is the greater of the field tier and
@@ -213,7 +213,7 @@ What such a caller may touch:
   persists (`_sample_helpers.write_resolved_metadata_entries`). The 403 names
   only field keys (`routes._helpers._raise_value_above_tier`). Before anything
   is written, a key is refused when the field's value on that biosample or
-  prep_sample is hidden from the caller, or when a value-level exception on it
+  prep_sample is hidden from the caller, or when a field exception on it
   is above the caller's tier, whether or not a value is stored yet
   (`_sample_helpers._fetch_keys_restricted_on_entity`). That covers another
   study's value in a global field, and a value stored through a

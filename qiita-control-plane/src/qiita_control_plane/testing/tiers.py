@@ -42,8 +42,8 @@ def skip_field_tier_check(monkeypatch: pytest.MonkeyPatch) -> None:
     """Switch off the field-tier check that runs before a metadata write,
     standing in for an admin who raises a field's tier after that check passed:
     a test cannot place that commit there. A field above the caller's tier then
-    reaches the value checks, the one before the write included unless
-    `apply_write_checks` switches it off too."""
+    reaches the value checks, including the one before the write, unless
+    `apply_write_checks` also switches that one off."""
 
     async def _nothing_above(*_args, **_kwargs) -> dict:
         return {}

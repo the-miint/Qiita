@@ -17,7 +17,7 @@
     characters.
   - A `PUT` without `If-Match` only creates, answering 428 when an exception is already
     set; with `If-Match` it only replaces. `DELETE` needs `If-Match`. The `GET` returns
-    the `ETag` that they send.
+    the `ETag` that a replace or clear sends as `If-Match`.
   - The CLI equivalents are `qiita biosample get-field-exception`,
     `set-field-exception` and `clear-field-exception`, with `--study-idx`,
     `--biosample-idx` and `--study-field-idx`, and the same under `qiita
@@ -27,7 +27,7 @@
 
 ### Changed
 
-- **A value-level exception and `unique_in_study` exclude each other (#TBD).** An
+- **A field exception and `unique_in_study` exclude each other (#TBD).** An
   exception on a `unique_in_study` field is refused, and so is declaring
   `unique_in_study` on a field that exceptions are set on (409 from the field `PATCH`).
   A write refused as a duplicate on a `unique_in_study` field therefore no longer

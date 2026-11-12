@@ -29,7 +29,7 @@ from qiita_common.models import FieldDataType, Tier
 from qiita_control_plane.repositories._sample_helpers import EntityMetadataSpec
 from qiita_control_plane.repositories.biosample_metadata import BIOSAMPLE_METADATA_SPEC
 from qiita_control_plane.repositories.prep_sample_metadata import PREP_SAMPLE_METADATA_SPEC
-from qiita_control_plane.routes._helpers import etag_for_updated_at
+from qiita_control_plane.routes._helpers import METADATA_LOCK_TIMEOUT_MS, etag_for_updated_at
 from qiita_control_plane.testing.db_seeds import (
     seed_biosample,
     seed_biosample_to_study_link,
@@ -625,6 +625,7 @@ async def test_value_another_study_wrote_needs_admin_there(ctx, surface):
     async def _every_verb(etag: str) -> list:
         return [
             await ctx["user"].get(url),
+            await _put(ctx["user"], url, Tier.ADMIN),
             await _put(ctx["user"], url, Tier.ADMIN, if_match=etag),
             await ctx["user"].delete(url, headers={"If-Match": etag}),
         ]
@@ -861,7 +862,7 @@ async def test_put_racing_a_unique_declaration_is_409(ctx, surface):
         await tx.start()
         try:
             # The unique_in_study propagation refuses to run without a bound.
-            await declarer.execute("SET LOCAL lock_timeout = '3s'")
+            await declarer.execute(f"SET LOCAL lock_timeout = '{METADATA_LOCK_TIMEOUT_MS}ms'")
             await declarer.execute(
                 f"UPDATE {s.spec.study_field_table} SET unique_in_study = true WHERE idx = $1",
                 field_idx,
@@ -875,6 +876,57 @@ async def test_put_racing_a_unique_declaration_is_409(ctx, surface):
     assert resp.status_code == 409, resp.text
     assert "unique_in_study" in resp.json()["detail"]
     assert await _exception_rows(ctx, s.spec, entity) == []
+
+
+@pytest.mark.parametrize("surface", _SURFACE_IDS)
+async def test_unique_declaration_racing_an_exception_is_409(ctx, surface):
+    """A field PATCH declaring unique_in_study while an exception on the field
+    is uncommitted waits for it at the field's row lock, and is then refused
+    with the same 409 as one that read the field after it committed."""
+    s = _SURFACES[surface]
+    pool = ctx["pool"]
+    study_idx = await _member_study(ctx)
+    entity = await s.seed_entity(ctx, study_idx)
+    field_idx, _ = await _seed_local_value(
+        ctx, s.spec, study_idx=study_idx, entity=entity, tier_override=Tier.VIEWER
+    )
+    field = await get_study_field(
+        surface=s.fields, client=ctx["wet"], study_idx=study_idx, study_field_idx=field_idx
+    )
+
+    async with pool.acquire() as setter:
+        tx = setter.transaction()
+        await tx.start()
+        try:
+            await seed_field_exception(
+                setter,
+                spec=s.spec,
+                entity_idx=entity.metadata_idx,
+                study_field_idx=field_idx,
+                tier_override=Tier.ADMIN,
+                created_by_idx=_wet_idx(ctx),
+            )
+            task = asyncio.create_task(
+                patch_study_field(
+                    surface=s.fields,
+                    client=ctx["wet"],
+                    study_idx=study_idx,
+                    study_field_idx=field_idx,
+                    if_match=field.headers["ETag"],
+                    unique_in_study=True,
+                )
+            )
+            await _wait_until_blocked_by(pool, setter, task)
+        finally:
+            await tx.commit()
+    resp = await _finish(task)
+
+    assert resp.status_code == 409, resp.text
+    assert "field exceptions are set" in resp.json()["detail"]
+    after = await get_study_field(
+        surface=s.fields, client=ctx["wet"], study_idx=study_idx, study_field_idx=field_idx
+    )
+    assert after.json()["unique_in_study"] is False
 
 
 # ---------------------------------------------------------------------------

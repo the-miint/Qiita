@@ -4,7 +4,7 @@ field (docs/architecture/data-model.md, "Metadata visibility tiers").
 
 Each entity's routes are thin bindings over these; the contract is stated here.
 In every detail the field is named by its own entity kind (`spec.entity_kind`)
-and the sample by the noun its route addresses it by, since a sequenced_sample's
+and the sample by the noun that its route uses for it, since a sequenced_sample's
 metadata lives on its prep_sample.
 """
 
@@ -287,9 +287,6 @@ async def put_and_map_field_exception(
         )
 
     if if_match is None:
-        existing = await fetch_field_exception(conn, spec=spec, slot=target.slot, for_update=True)
-        if existing is not None:
-            _raise_already_set(spec, field, noun=noun)
         try:
             row = await insert_field_exception(
                 conn,
@@ -305,7 +302,7 @@ async def put_and_map_field_exception(
                 _raise_on_unique_field(spec, field)
             raise
         if row is None:
-            # A concurrent create committed first.
+            # One is already set, or a concurrent create committed first.
             _raise_already_set(spec, field, noun=noun)
         response, etag = _map(row, slot=target.slot)
         return response, etag, True

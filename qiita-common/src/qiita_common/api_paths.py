@@ -937,7 +937,7 @@ PATH_BIOSAMPLE_BY_STUDY_AND_IDX = "/{study_idx}/biosample/{biosample_idx}"
 PATH_BIOSAMPLE_METADATA_BY_STUDY = "/{study_idx}/biosample/{biosample_idx}/metadata"
 # Link an existing biosample into the study (POST).
 PATH_BIOSAMPLE_STUDY_LINK = "/{study_idx}/biosample/{biosample_idx}/link"
-# The value-level exception on one biosample's value of one of the study's
+# The field exception on one biosample's value of one of the study's
 # fields: read (GET), set (PUT), clear (DELETE).
 PATH_BIOSAMPLE_FIELD_EXCEPTION = (
     "/{study_idx}/biosample/{biosample_idx}/field-exception/{study_field_idx}"
@@ -1025,7 +1025,7 @@ PATH_SEQUENCED_SAMPLE_BY_STUDY_AND_IDX = "/{study_idx}/sequenced-sample/{sequenc
 PATH_SEQUENCED_SAMPLE_METADATA_BY_STUDY = (
     "/{study_idx}/sequenced-sample/{sequenced_sample_idx}/metadata"
 )
-# The value-level exception on one sequenced sample's (its prep_sample's) value
+# The field exception on one sequenced sample's (its prep_sample's) value
 # of one of the study's fields: read (GET), set (PUT), clear (DELETE).
 PATH_SEQUENCED_SAMPLE_FIELD_EXCEPTION = (
     "/{study_idx}/sequenced-sample/{sequenced_sample_idx}/field-exception/{study_field_idx}"

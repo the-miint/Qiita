@@ -516,7 +516,7 @@ def write_with_read_etag(
 
 
 def patch_with_if_match(base_url: str, token: str, path: str, body: dict) -> dict:
-    """PATCH `path` with `body` under the ETag a GET of it returns
+    """PATCH `path` with `body` under the ETag that a GET of it returns
     (`write_with_read_etag`); return the decoded PATCH body."""
     _read, written = write_with_read_etag("PATCH", base_url, token, path, json=body)
     return written.json()

@@ -2432,13 +2432,13 @@ async def fetch_study_field_tier(
 
 
 # ---------------------------------------------------------------------------
-# Value-level field exceptions
+# Field exceptions
 # ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True, kw_only=True)
 class FieldExceptionSlot:
-    """The (entity, field) one value-level exception keys on.
+    """The (entity, field) that one field exception keys on.
 
     A field linked to a global field keys on global_field_idx, so the exception
     follows the value into every study that links the global field; a
@@ -2600,7 +2600,7 @@ async def fetch_global_value_study_idx(
 async def fetch_study_field_has_exceptions(
     conn: asyncpg.Connection, *, spec: EntityMetadataSpec, study_field_idx: int
 ) -> bool:
-    """Whether any value-level exception keys on this study field."""
+    """Whether any field exception keys on this study field."""
     # f-string interpolation of identifiers is safe: spec fields are frozen
     # module-level constants, never reached by caller input.
     return await conn.fetchval(
@@ -3902,7 +3902,7 @@ async def insert_new_entities_metadata_batch(
 
     Every entry must have passed `preflight_sample_metadata` under the caller's
     tiers. No value is checked here: an entity created in this transaction has
-    no value-level exception row that could hide one of its values.
+    no field exception row that could hide one of its values.
 
     `write_resolved_metadata_entries` wraps every value in its own SAVEPOINT so
     a rejected INSERT can be diagnosed field by field; that is ~1.4 ms per value,

@@ -937,7 +937,7 @@ async def get_sequenced_sample_field_exception(
         require_study_access(min_tier=Tier.ADMIN, bypass_role=METADATA_BYPASS_ROLE)
     ),
 ) -> SampleFieldExceptionResponse:
-    """Read the value-level exception on this sequenced_sample's value of one
+    """Read the field exception on this sequenced_sample's value of one
     of the study's fields (its metadata lives on its prep_sample).
 
     Requires Tier.ADMIN on the study, or a wet_lab_admin+ role;
@@ -976,7 +976,7 @@ async def put_sequenced_sample_field_exception(
         require_study_access(min_tier=Tier.ADMIN, bypass_role=METADATA_BYPASS_ROLE)
     ),
 ) -> SampleFieldExceptionResponse:
-    """Set the value-level exception on this sequenced_sample's value of one
+    """Set the field exception on this sequenced_sample's value of one
     of the study's fields (its metadata lives on its prep_sample).
 
     Requires Tier.ADMIN on the study, or a wet_lab_admin+ role. 201 when it
@@ -1018,7 +1018,7 @@ async def delete_sequenced_sample_field_exception(
         require_study_access(min_tier=Tier.ADMIN, bypass_role=METADATA_BYPASS_ROLE)
     ),
 ) -> None:
-    """Clear the value-level exception on this sequenced_sample's value of one
+    """Clear the field exception on this sequenced_sample's value of one
     of the study's fields (its metadata lives on its prep_sample).
 
     Requires Tier.ADMIN on the study, or a wet_lab_admin+ role, and If-Match;

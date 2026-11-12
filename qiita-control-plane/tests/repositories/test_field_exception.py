@@ -11,6 +11,7 @@ import pytest
 from qiita_common.models import Tier
 
 from qiita_control_plane.testing.db_seeds import seed_field_exception
+from qiita_control_plane.testing.locks import wait_until_blocked_by
 
 from .conftest import (
     METADATA_WRITE_LOCK_TIMEOUT,
@@ -28,9 +29,11 @@ pytestmark = pytest.mark.db
 _WAIT_S = 10
 
 
-async def _seed_exception(ctx, spec, *, entity_idx, field_idx) -> int:
+async def _seed_exception(ctx, spec, *, entity_idx, field_idx, on=None) -> int:
+    """Seed an exception on the local field; on a connection, it rides that
+    connection's transaction."""
     return await seed_field_exception(
-        ctx["pool"],
+        ctx["pool"] if on is None else on,
         spec=spec,
         entity_idx=entity_idx,
         study_field_idx=field_idx,
@@ -39,40 +42,11 @@ async def _seed_exception(ctx, spec, *, entity_idx, field_idx) -> int:
     )
 
 
-async def _insert_exception(conn, spec, *, entity_idx, field_idx, created_by_idx) -> None:
-    await conn.execute(
-        f"INSERT INTO {spec.field_exception_table} ("
-        f"    {spec.entity_key_column}, {spec.study_field_idx_column},"
-        f"    tier_override, created_by_idx"
-        f") VALUES ($1, $2, $3::qiita.tier, $4)",
-        entity_idx,
-        field_idx,
-        Tier.ADMIN,
-        created_by_idx,
-    )
-
-
 async def _declare_unique(conn, spec, field_idx) -> None:
     await conn.execute(f"SET LOCAL lock_timeout = '{METADATA_WRITE_LOCK_TIMEOUT}'")
     await conn.execute(
         f"UPDATE {spec.study_field_table} SET unique_in_study = true WHERE idx = $1", field_idx
     )
-
-
-async def _until_blocked_by(pool, blocker: asyncpg.Connection, task: asyncio.Task) -> None:
-    """Return once some backend waits on a lock that `blocker` holds."""
-    blocker_pid = blocker.get_server_pid()
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + _WAIT_S
-    while loop.time() < deadline:
-        assert not task.done(), "the write finished without waiting on the held lock"
-        if await pool.fetchval(
-            "SELECT count(*) FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))",
-            blocker_pid,
-        ):
-            return
-        await asyncio.sleep(0.02)
-    raise AssertionError("the write never waited on the held lock")
 
 
 async def _exception_count(ctx, spec, field_idx) -> int:
@@ -160,13 +134,7 @@ async def test_exception_waits_behind_an_uncommitted_unique_declaration(ctx, spe
 
     async def _insert() -> None:
         async with pool.acquire() as conn, conn.transaction():
-            await _insert_exception(
-                conn,
-                spec,
-                entity_idx=entity_idx,
-                field_idx=field_idx,
-                created_by_idx=ctx["principal_idx"],
-            )
+            await _seed_exception(ctx, spec, entity_idx=entity_idx, field_idx=field_idx, on=conn)
 
     async with pool.acquire() as declarer:
         tx = declarer.transaction()
@@ -174,7 +142,7 @@ async def test_exception_waits_behind_an_uncommitted_unique_declaration(ctx, spe
         try:
             await _declare_unique(declarer, spec, field_idx)
             task = asyncio.create_task(_insert())
-            await _until_blocked_by(pool, declarer, task)
+            await wait_until_blocked_by(pool, declarer, task, timeout_s=_WAIT_S)
         finally:
             await tx.commit()
 
@@ -200,15 +168,9 @@ async def test_unique_declaration_waits_behind_an_uncommitted_exception(ctx, spe
         tx = setter.transaction()
         await tx.start()
         try:
-            await _insert_exception(
-                setter,
-                spec,
-                entity_idx=entity_idx,
-                field_idx=field_idx,
-                created_by_idx=ctx["principal_idx"],
-            )
+            await _seed_exception(ctx, spec, entity_idx=entity_idx, field_idx=field_idx, on=setter)
             task = asyncio.create_task(_declare())
-            await _until_blocked_by(pool, setter, task)
+            await wait_until_blocked_by(pool, setter, task, timeout_s=_WAIT_S)
         finally:
             await tx.commit()
 

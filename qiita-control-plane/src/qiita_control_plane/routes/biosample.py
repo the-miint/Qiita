@@ -1178,7 +1178,7 @@ async def get_biosample_field_exception(
         require_study_access(min_tier=Tier.ADMIN, bypass_role=METADATA_BYPASS_ROLE)
     ),
 ) -> SampleFieldExceptionResponse:
-    """Read the value-level exception on this biosample's value of one of
+    """Read the field exception on this biosample's value of one of
     the study's fields.
 
     Requires Tier.ADMIN on the study, or a wet_lab_admin+ role;
@@ -1217,7 +1217,7 @@ async def put_biosample_field_exception(
         require_study_access(min_tier=Tier.ADMIN, bypass_role=METADATA_BYPASS_ROLE)
     ),
 ) -> SampleFieldExceptionResponse:
-    """Set the value-level exception on this biosample's value of one of
+    """Set the field exception on this biosample's value of one of
     the study's fields.
 
     Requires Tier.ADMIN on the study, or a wet_lab_admin+ role. 201 when it
@@ -1259,7 +1259,7 @@ async def delete_biosample_field_exception(
         require_study_access(min_tier=Tier.ADMIN, bypass_role=METADATA_BYPASS_ROLE)
     ),
 ) -> None:
-    """Clear the value-level exception on this biosample's value of one of
+    """Clear the field exception on this biosample's value of one of
     the study's fields.
 
     Requires Tier.ADMIN on the study, or a wet_lab_admin+ role, and If-Match;

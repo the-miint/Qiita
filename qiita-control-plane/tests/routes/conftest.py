@@ -62,6 +62,7 @@ from qiita_control_plane.testing.db_seeds import (
     seed_user_principal,
 )
 from qiita_control_plane.testing.db_teardown import teardown_entity_graph
+from qiita_control_plane.testing.locks import wait_until_blocked_by
 from qiita_control_plane.testing.unique_names import unique_field_name
 
 # Bounds every wait on a request task, so a request that never returns fails
@@ -367,22 +368,7 @@ async def _finish(task: asyncio.Task):
 
 
 async def _wait_until_blocked_by(pool, blocker, task: asyncio.Task) -> None:
-    """Return once some backend is waiting on a lock that `blocker` holds (the
-    request under test is the only candidate), rather than after a fixed sleep
-    that would not show that the request ever reached the lock."""
-    blocker_pid = blocker.get_server_pid()
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + _REQUEST_TIMEOUT_S
-    while loop.time() < deadline:
-        assert not task.done(), "request finished without waiting on the held lock"
-        waiting = await pool.fetchval(
-            "SELECT count(*) FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))",
-            blocker_pid,
-        )
-        if waiting:
-            return
-        await asyncio.sleep(0.02)
-    raise AssertionError("request never waited on the held lock")
+    await wait_until_blocked_by(pool, blocker, task, timeout_s=_REQUEST_TIMEOUT_S)
 
 
 async def _cancel(task: asyncio.Task | None) -> None:

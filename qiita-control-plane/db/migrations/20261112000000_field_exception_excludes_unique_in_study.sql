@@ -1,7 +1,7 @@
 -- migrate:up
 
 -- =============================================================================
--- A VALUE-LEVEL EXCEPTION AND unique_in_study EXCLUDE EACH OTHER
+-- A FIELD EXCEPTION AND unique_in_study EXCLUDE EACH OTHER
 -- =============================================================================
 --
 -- A unique_in_study field refuses a duplicate of any value stored through it,
@@ -24,8 +24,8 @@
 -- constraint. docs/architecture/data-model.md, "Metadata visibility tiers",
 -- states the rule.
 
--- The triggers judge only later writes, so the rows already stored must obey
--- the rule before they arm.
+-- The triggers below judge only later writes, so the rows already stored must
+-- obey the rule before the triggers are created.
 DO $$
 BEGIN
     IF EXISTS (
@@ -37,8 +37,10 @@ BEGIN
           JOIN qiita.prep_sample_study_field sf ON sf.idx = e.prep_sample_study_field_idx
          WHERE sf.unique_in_study
     ) THEN
-        RAISE EXCEPTION 'a value-level exception already keys on a unique_in_study field'
-          USING HINT = 'clear those exceptions, or the flag, before applying this migration';
+        RAISE EXCEPTION 'a field exception already keys on a unique_in_study field'
+          USING HINT = 'no route wrote field exceptions before this migration, so the row was'
+                       ' written by hand: ask who wrote it and why before changing it, since'
+                       ' clearing it exposes the value that it restricts';
     END IF;
 END
 $$;
@@ -74,7 +76,7 @@ BEGIN
     ) INTO is_unique USING keyed_field_idx;
 
     IF is_unique THEN
-        RAISE EXCEPTION 'a value-level exception cannot key on a unique_in_study field'
+        RAISE EXCEPTION 'a field exception cannot key on a unique_in_study field'
           USING ERRCODE = 'check_violation',
                 CONSTRAINT = rule_name,
                 DETAIL = format('%s %s', study_field_table, keyed_field_idx);
@@ -100,7 +102,7 @@ BEGIN
     ) INTO has_exception USING NEW.idx;
 
     IF has_exception THEN
-        RAISE EXCEPTION 'unique_in_study cannot be declared on a field that value-level exceptions key on'
+        RAISE EXCEPTION 'unique_in_study cannot be declared on a field that field exceptions key on'
           USING ERRCODE = 'check_violation',
                 CONSTRAINT = rule_name,
                 DETAIL = format('%s %s', TG_TABLE_NAME, NEW.idx);

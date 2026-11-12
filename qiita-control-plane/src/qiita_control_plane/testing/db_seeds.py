@@ -825,7 +825,7 @@ async def seed_local_study_field(
 
 
 async def seed_field_exception(
-    pool: asyncpg.Pool,
+    executor: asyncpg.Pool | asyncpg.Connection,
     *,
     spec: EntityMetadataSpec,
     entity_idx: int,
@@ -839,11 +839,11 @@ async def seed_field_exception(
 
     Pass exactly one of global_field_idx / study_field_idx; the table's CHECK
     refuses both or neither. The row hangs off its entity, so the sweep
-    takes it.
+    takes it. On a connection, the insert rides that connection's transaction.
     """
     # f-string interpolation of identifiers is safe: spec fields are frozen
     # module-level constants, never reached by caller input.
-    return await pool.fetchval(
+    return await executor.fetchval(
         f"INSERT INTO {spec.field_exception_table} ("
         f"    {spec.entity_key_column}, {spec.study_field_idx_column}, global_field_idx,"
         f"    tier_override, reason, created_by_idx"
