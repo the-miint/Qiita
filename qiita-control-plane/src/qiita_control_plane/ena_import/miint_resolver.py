@@ -38,7 +38,8 @@ _STUDY_FIELDS = ",".join(EnaStudyHeader.model_fields)
 
 _log = logging.getLogger(__name__)
 
-# miint's documented Browser-XML batch size: ENA 404s a request only if all of one batch is missing.
+# miint's Browser-XML batch size (https://the-miint.github.io/duckdb-miint/insdc_ena/):
+# ENA 404s a request only if all of one batch is missing.
 _MIINT_BROWSER_XML_BATCH = 200
 _ENA_NOT_FOUND_BODY = re.compile(r"<ErrorDetails>.*<message>[^<]*not found\.</message>", re.DOTALL)
 

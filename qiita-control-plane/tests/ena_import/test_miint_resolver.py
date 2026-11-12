@@ -497,12 +497,16 @@ def test_resolve_sample_attributes_for_samples_makes_one_seam_call_with_the_list
     assert [(a.sample_accession, a.attributes) for a in attrs] == [("SAMN1", {"tag": ["x"]})]
 
 
-_ENA_NOT_FOUND_BODY = (
-    '<?xml version="1.0" encoding="UTF-8"?><ErrorDetails><timestamp>2026-11-12</timestamp>'
-    "<status>404</status><error>Not Found</error>"
-    "<message>SAMN42375043 not found.</message>"
-    "<path>/ena/browser/api/xml/SAMN42375043</path></ErrorDetails>"
-)
+# ENA's body for an all-missing three-biosample request, captured 2026-11-12.
+_ENA_NOT_FOUND_BODY = """<?xml version="1.0" encoding="UTF-8"?>
+<ErrorDetails>
+  <timestamp>1794513496573</timestamp>
+  <status>404</status>
+  <error>Not Found</error>
+  <message>SAMN42375043,SAMN42375086,SAMN42375062 not found.</message>
+  <path>/ena/browser/api/xml/SAMN42375043,SAMN42375086,SAMN42375062</path>
+</ErrorDetails>
+"""
 _NO_ENDPOINT_BODY = (
     '{"timestamp":"2026-11-12","status":404,"error":"Not Found",'
     '"message":"No endpoint found for /ena/browser/api/xmlX/SAMN1","path":"/x"}'
@@ -554,8 +558,9 @@ def test_all_missing_request_within_a_miint_batch_is_one_query_and_drops_every_b
         assert MiintEnaResolver().resolve_sample_attributes_for_samples(accessions) == []
 
     assert fake.calls == 1
-    for accession in accessions:
-        assert f"ENA has no record of biosample {accession}" in caplog.text
+    assert sorted(caplog.messages) == sorted(
+        f"ENA has no record of biosample {accession}" for accession in accessions
+    )
 
 
 def test_resolve_sample_attributes_for_samples_keeps_biosamples_beside_an_all_missing_batch(
