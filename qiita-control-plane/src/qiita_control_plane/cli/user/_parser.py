@@ -53,6 +53,10 @@ from qiita_common.models import (
     Tier,
     WorkTicketState,
 )
+from qiita_common.models.ena_import import (
+    ENA_IMPORT_BATCH_LIST_DEFAULT_LIMIT,
+    ENA_IMPORT_BATCH_LIST_MAX_LIMIT,
+)
 from qiita_common.work_ticket_constants import (
     FORCE_RESUBMIT_EXPLANATION,
 )
@@ -76,7 +80,11 @@ from .amplicon import _handle_submit_golay_demux
 from .assembly import DEFAULT_EXPORT_KINDS, EXPORT_KINDS, _handle_assembly_export
 from .auth import _handle_login, _handle_profile_set, _handle_whoami
 from .biosample import _handle_biosample_create
-from .ena_import import _handle_ena_import_status, _handle_submit_ena_import
+from .ena_import import (
+    _handle_ena_import_list,
+    _handle_ena_import_status,
+    _handle_submit_ena_import,
+)
 from .feature_table import DEFAULT_TABLE_FORMAT, TABLE_FORMATS, _handle_feature_table_build
 from .mask import (
     DEFAULT_FEATURE_NAME_SOURCE,
@@ -2078,6 +2086,27 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Batch idx returned by `qiita submit-ena-import`.",
     )
     p_ena_import_status.set_defaults(handler=_handle_ena_import_status)
+
+    p_ena_import_list = sub.add_parser(
+        "ena-import-list",
+        help="List batch ENA imports, newest first (GET /ena-import-batch). Use it to find"
+        " a batch whose submit response was lost.",
+    )
+    p_ena_import_list.add_argument(
+        "--mine", action="store_true", help="Only batches you submitted."
+    )
+    p_ena_import_list.add_argument(
+        "--since",
+        help="Only batches created at or after TS (ISO-8601 with timezone,"
+        " e.g. 2026-11-04T10:00:00Z).",
+    )
+    p_ena_import_list.add_argument(
+        "--limit",
+        type=int,
+        help=f"Max batches to return (server default {ENA_IMPORT_BATCH_LIST_DEFAULT_LIMIT},"
+        f" max {ENA_IMPORT_BATCH_LIST_MAX_LIMIT}).",
+    )
+    p_ena_import_list.set_defaults(handler=_handle_ena_import_list)
 
     p_submit_pacbio = sub.add_parser(
         "submit-pacbio-ingest",

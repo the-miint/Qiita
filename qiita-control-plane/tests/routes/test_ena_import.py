@@ -15,6 +15,14 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 from qiita_common.api_paths import URL_ENA_IMPORT_BATCH_BY_IDX, URL_ENA_IMPORT_BATCH_PREFIX
 from qiita_common.auth_constants import Scope, SystemRole
+from qiita_common.models import (
+    BatchItemState,
+    FailureType,
+    ScopeTargetKind,
+    WorkTicketFailureStage,
+    WorkTicketState,
+)
+from qiita_common.models.ena_import import ENA_IMPORT_BATCH_LIST_MAX_LIMIT
 
 from qiita_control_plane.dispatch import build_dispatch_semaphore
 from qiita_control_plane.ena_import import (
@@ -564,3 +572,250 @@ async def test_get_unknown_batch_404(eib_client, admin_token):
         headers={"Authorization": f"Bearer {token}"},
     )
     assert resp.status_code == 404, resp.text
+
+
+# ---------------------------------------------------------------------------
+# GET /api/v1/ena-import-batch (list)
+# ---------------------------------------------------------------------------
+
+
+def _auth(token: str) -> dict[str, str]:
+    return {"Authorization": f"Bearer {token}"}
+
+
+async def _insert_batch(
+    postgres_pool,
+    eib_client,
+    principal_idx: int,
+    item_states: tuple[BatchItemState, ...] = (BatchItemState.PENDING,),
+) -> int:
+    batch_idx = await postgres_pool.fetchval(
+        "INSERT INTO qiita.ena_import_batch (submitted_by_principal_idx) VALUES ($1) RETURNING idx",
+        principal_idx,
+    )
+    eib_client._created_batches.append(batch_idx)
+    for state in item_states:
+        await postgres_pool.execute(
+            "INSERT INTO qiita.ena_import_batch_item (batch_idx, ena_study_accession, state)"
+            " VALUES ($1, $2, $3)",
+            batch_idx,
+            unique_ena_accession("PRJNA"),
+            state,
+        )
+    return batch_idx
+
+
+@pytest.fixture
+async def other_admin_pidx(postgres_pool, eib_client):
+    email = f"eib-other-{uuid.uuid4()}@example.com"
+    pidx = await postgres_pool.fetchval(
+        "INSERT INTO qiita.principal (display_name, system_role, created_by_idx)"
+        " VALUES ($1, $2, 1) RETURNING idx",
+        email,
+        SystemRole.WET_LAB_ADMIN,
+    )
+    await postgres_pool.execute(
+        "INSERT INTO qiita.user (principal_idx, email, affiliation, address, phone)"
+        " VALUES ($1, $2, 'X', 'Y', 'Z')",
+        pidx,
+        email,
+    )
+    eib_client._created_principals.append(pidx)
+    return pidx
+
+
+@pytest.fixture
+async def ticket_reference_idx(postgres_pool):
+    idx = await postgres_pool.fetchval(
+        "INSERT INTO qiita.reference (name, version, kind, status, created_by_idx)"
+        " VALUES ($1, '1.0', 'sequence_reference', 'pending', 1)"
+        " RETURNING reference_idx",
+        f"ena-batch-list-{uuid.uuid4()}",
+    )
+    yield idx
+    await postgres_pool.execute("DELETE FROM qiita.work_ticket WHERE reference_idx = $1", idx)
+    await postgres_pool.execute("DELETE FROM qiita.reference WHERE reference_idx = $1", idx)
+
+
+async def _list_mine(eib_client, token: str, **params) -> dict:
+    resp = await eib_client.get(
+        URL_ENA_IMPORT_BATCH_PREFIX,
+        params={"submitted_by": "me", **params},
+        headers=_auth(token),
+    )
+    assert resp.status_code == 200, resp.text
+    return resp.json()
+
+
+async def test_list_returns_newest_first_with_zero_filled_state_counts(
+    eib_client, postgres_pool, admin_token
+):
+    token, pidx = admin_token
+    older = await _insert_batch(
+        postgres_pool,
+        eib_client,
+        pidx,
+        (BatchItemState.PENDING, BatchItemState.PENDING, BatchItemState.FAILED),
+    )
+    newer = await _insert_batch(postgres_pool, eib_client, pidx, (BatchItemState.REGISTERED,))
+
+    body = await _list_mine(eib_client, token)
+
+    assert [b["ena_import_batch_idx"] for b in body["batches"]] == [newer, older]
+    assert body["count"] == 2
+    assert body["truncated"] is False
+    newer_summary, older_summary = body["batches"]
+    assert set(newer_summary) == {"ena_import_batch_idx", "created_at", "item_state_counts"}
+    assert newer_summary["created_at"]
+    assert set(newer_summary["item_state_counts"]) == {s.value for s in BatchItemState}
+    assert newer_summary["item_state_counts"][BatchItemState.REGISTERED] == 1
+    assert sum(newer_summary["item_state_counts"].values()) == 1
+    assert older_summary["item_state_counts"][BatchItemState.PENDING] == 2
+    assert older_summary["item_state_counts"][BatchItemState.FAILED] == 1
+    assert older_summary["item_state_counts"][BatchItemState.DONE] == 0
+
+
+@pytest.mark.parametrize(
+    ("ticket_state", "expected"),
+    [
+        (WorkTicketState.COMPLETED, BatchItemState.DONE),
+        (WorkTicketState.FAILED, BatchItemState.FAILED),
+    ],
+)
+async def test_list_counts_the_rolled_up_state_not_the_stored_one(
+    eib_client,
+    postgres_pool,
+    admin_token,
+    download_ena_study_action,
+    ticket_reference_idx,
+    ticket_state,
+    expected,
+):
+    token, pidx = admin_token
+    batch_idx = await _insert_batch(postgres_pool, eib_client, pidx, (BatchItemState.DOWNLOADING,))
+    action_id, version = download_ena_study_action
+    failed = ticket_state is WorkTicketState.FAILED
+    failure_cols = ", failure_type, failure_stage, failure_reason" if failed else ""
+    failure_vals = (
+        ", $7::qiita.failure_type, $8::qiita.work_ticket_failure_stage, 'boom'" if failed else ""
+    )
+    ticket_idx = await postgres_pool.fetchval(
+        "INSERT INTO qiita.work_ticket"
+        " (action_id, action_version, originator_principal_idx,"
+        f"  scope_target_kind, reference_idx, action_context, state{failure_cols})"
+        " VALUES ($1, $2, $3, $6::qiita.scope_target_kind, $4, '{}'::jsonb,"
+        f"         $5::qiita.work_ticket_state{failure_vals})"
+        " RETURNING work_ticket_idx",
+        action_id,
+        version,
+        pidx,
+        ticket_reference_idx,
+        ticket_state,
+        ScopeTargetKind.REFERENCE,
+        *((FailureType.PERMANENT, WorkTicketFailureStage.SUBMISSION) if failed else ()),
+    )
+    await postgres_pool.execute(
+        "UPDATE qiita.ena_import_batch_item SET download_work_ticket_idxs = $2"
+        " WHERE batch_idx = $1",
+        batch_idx,
+        [ticket_idx],
+    )
+
+    (summary,) = (await _list_mine(eib_client, token))["batches"]
+
+    assert summary["ena_import_batch_idx"] == batch_idx
+    assert summary["item_state_counts"][expected] == 1
+    assert summary["item_state_counts"][BatchItemState.DOWNLOADING] == 0
+
+
+async def test_list_submitted_by_me_binds_the_caller(
+    eib_client, postgres_pool, admin_token, other_admin_pidx
+):
+    token, pidx = admin_token
+    theirs = await _insert_batch(postgres_pool, eib_client, other_admin_pidx)
+    mine = await _insert_batch(postgres_pool, eib_client, pidx)
+
+    mine_only = await _list_mine(eib_client, token)
+    everyone = await eib_client.get(
+        URL_ENA_IMPORT_BATCH_PREFIX,
+        params={"limit": ENA_IMPORT_BATCH_LIST_MAX_LIMIT},
+        headers=_auth(token),
+    )
+
+    assert everyone.status_code == 200, everyone.text
+    assert [b["ena_import_batch_idx"] for b in mine_only["batches"]] == [mine]
+    assert {mine, theirs} <= {b["ena_import_batch_idx"] for b in everyone.json()["batches"]}
+
+
+async def test_list_limit_truncates(eib_client, postgres_pool, admin_token):
+    token, pidx = admin_token
+    await _insert_batch(postgres_pool, eib_client, pidx)
+    newest = await _insert_batch(postgres_pool, eib_client, pidx)
+
+    body = await _list_mine(eib_client, token, limit=1)
+
+    assert body["truncated"] is True
+    assert body["count"] == 1
+    assert [b["ena_import_batch_idx"] for b in body["batches"]] == [newest]
+
+
+async def test_list_with_no_batches_is_200_and_empty(eib_client, admin_token):
+    token, _ = admin_token
+
+    body = await _list_mine(eib_client, token)
+
+    assert body == {"batches": [], "count": 0, "truncated": False}
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        {"limit": 0},
+        {"limit": ENA_IMPORT_BATCH_LIST_MAX_LIMIT + 1},
+        {"submitted_by": 42},
+        {"submitted_by": "everyone"},
+        {"since": "2026-11-04T10:00:00"},
+    ],
+)
+async def test_list_rejects_bad_params(eib_client, admin_token, params):
+    token, _ = admin_token
+    resp = await eib_client.get(URL_ENA_IMPORT_BATCH_PREFIX, params=params, headers=_auth(token))
+    assert resp.status_code == 422, resp.text
+
+
+@pytest.mark.parametrize("since", ["2020-01-01T00:00:00Z", "2020-01-01T00:00:00+00:00"])
+async def test_list_accepts_timezone_aware_since(eib_client, postgres_pool, admin_token, since):
+    token, pidx = admin_token
+    batch_idx = await _insert_batch(postgres_pool, eib_client, pidx)
+
+    body = await _list_mine(eib_client, token, since=since)
+
+    assert [b["ena_import_batch_idx"] for b in body["batches"]] == [batch_idx]
+
+
+async def test_list_since_in_the_future_excludes_batches(eib_client, postgres_pool, admin_token):
+    token, pidx = admin_token
+    await _insert_batch(postgres_pool, eib_client, pidx)
+
+    body = await _list_mine(eib_client, token, since="2999-01-01T00:00:00Z")
+
+    assert body["batches"] == []
+
+
+async def test_list_requires_admin_role(eib_client, regular_token):
+    token, _ = regular_token
+    resp = await eib_client.get(URL_ENA_IMPORT_BATCH_PREFIX, headers=_auth(token))
+    assert resp.status_code == 403, resp.text
+
+
+async def test_list_works_without_a_compute_backend(eib_client, admin_token):
+    from qiita_control_plane.main import app
+
+    app.state.compute_backend_client = None
+    token, _ = admin_token
+
+    resp = await eib_client.get(
+        URL_ENA_IMPORT_BATCH_PREFIX, params={"submitted_by": "me"}, headers=_auth(token)
+    )
+
+    assert resp.status_code == 200, resp.text

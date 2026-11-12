@@ -158,3 +158,29 @@ def test_run_outcome_carries_failure_type_when_set():
     )
     assert outcome.failure_type == FailureType.PERMANENT
     assert EnaRunImportOutcome(run_accession="ERR002", status="registered").failure_type is None
+
+
+def test_batch_import_list_response_round_trips():
+    from qiita_common.models import BatchImportListResponse, BatchItemState
+    from qiita_common.models.ena_import import BatchImportSummary
+
+    summary = BatchImportSummary(
+        ena_import_batch_idx=3,
+        submitted_by_principal_idx=7,
+        created_at="2026-11-04T10:00:00Z",
+        item_state_counts={state: 0 for state in BatchItemState},
+    )
+    resp = BatchImportListResponse(batches=[summary], count=1, truncated=False)
+    assert BatchImportListResponse.model_validate_json(resp.model_dump_json()) == resp
+
+
+def test_batch_import_summary_rejects_unknown_state_key():
+    from qiita_common.models.ena_import import BatchImportSummary
+
+    with pytest.raises(ValidationError):
+        BatchImportSummary(
+            ena_import_batch_idx=3,
+            submitted_by_principal_idx=7,
+            created_at="2026-11-04T10:00:00Z",
+            item_state_counts={"bogus": 1},
+        )

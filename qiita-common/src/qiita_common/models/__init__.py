@@ -155,9 +155,11 @@ from qiita_common.models.ena import (
 from qiita_common.models.ena_import import (
     TERMINAL_BATCH_ITEM_STATES,
     BatchImportItem,
+    BatchImportListResponse,
     BatchImportRequest,
     BatchImportResponse,
     BatchImportStatus,
+    BatchImportSummary,
     BatchItemState,
 )
 from qiita_common.models.health import HealthResponse, HealthStatus
@@ -666,9 +668,11 @@ __all__ = [
     # Batch ENA import.
     "TERMINAL_BATCH_ITEM_STATES",
     "BatchImportItem",
+    "BatchImportListResponse",
     "BatchImportRequest",
     "BatchImportResponse",
     "BatchImportStatus",
+    "BatchImportSummary",
     "BatchItemState",
     # Study.
     "StudyCreate",
