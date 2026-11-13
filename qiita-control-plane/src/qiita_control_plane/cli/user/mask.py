@@ -343,4 +343,18 @@ def _handle_mask_syndna_read_count(
         f"wrote {len(samples)} sample(s) x {len(features)} insert(s) to {args.output}"
         f" ({args.format})"
     )
+    print_left_out(response)
     return 0
+
+
+def print_left_out(response: SyndnaReadCountResponse) -> None:
+    """List on stderr each selected prep_sample the table leaves out, and why."""
+    if not response.left_out:
+        return
+    print(
+        f"left out {len(response.left_out)} prep_sample(s) not processed in mask"
+        f" {response.mask_idx}'s group:",
+        file=sys.stderr,
+    )
+    for r in response.left_out:
+        print(f"  {_common.describe_resolution(r)}", file=sys.stderr)

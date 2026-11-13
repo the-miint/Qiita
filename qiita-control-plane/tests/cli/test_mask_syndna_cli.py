@@ -12,7 +12,7 @@ from qiita_control_plane.miint import connect_with_miint
 _H1, _H2 = "synDNA_16SrRNA_seq_1_gc=0.26", "synDNA_16SrRNA_seq_2_gc=0.36"
 
 
-def _response(samples, inserts=((11, _H1), (12, _H2))) -> SyndnaReadCountResponse:
+def _response(samples, inserts=((11, _H1), (12, _H2)), left_out=()) -> SyndnaReadCountResponse:
     return SyndnaReadCountResponse.model_validate(
         {
             "mask_idx": 3,
@@ -21,12 +21,14 @@ def _response(samples, inserts=((11, _H1), (12, _H2))) -> SyndnaReadCountRespons
             "samples": [
                 {
                     "prep_sample_idx": ps,
+                    "mask_idx": 3,
                     "biosample_accession": acc,
                     "sequenced_pool_idx": pool,
                     "read_counts": counts,
                 }
                 for ps, acc, pool, counts in samples
             ],
+            "left_out": list(left_out),
         }
     )
 
@@ -138,6 +140,42 @@ def test_main_writes_a_biom_named_by_species_by_default(monkeypatch, tmp_path, c
     assert {r[0] for r in cells} == {"SAMEA1", "SAMEA2"}
     assert {r[1] for r in cells} == {"s1", "s2"}
     assert "2 sample(s) x 2 insert(s)" in capsys.readouterr().out
+
+
+def test_main_lists_the_samples_the_table_leaves_out(monkeypatch, tmp_path, capsys):
+    """The route leaves out a sample that is not processed in the mask's group; the
+    table is still written, and each left-out sample is one stderr line with its
+    reason."""
+    _fake_species(monkeypatch)
+    out = tmp_path / "syndna.biom"
+    partial = _response(
+        [(1, "SAMEA1", 40, [5, 0])],
+        left_out=[
+            {
+                "prep_sample_idx": 2,
+                "state": "incomplete",
+                "definition_kind": "mask",
+                "definition_idx": 9,
+                "reason": "in_progress",
+                "work_ticket_idx": 77,
+            },
+            {
+                "prep_sample_idx": 4,
+                "state": "not_processed",
+                "definition_kind": "mask",
+                "reason": "no_run",
+            },
+        ],
+    )
+    rc = _run(
+        monkeypatch, tmp_path, "--study-idx", "1", "--output", str(out), *_DP, response=partial
+    )
+    assert rc == 0
+    assert {r[0] for r in _cells(out, "biom")} == {"SAMEA1"}
+    err = capsys.readouterr().err
+    assert "left out 2 prep_sample(s)" in err
+    assert "prep_sample 2: incomplete (in_progress), mask 9, work_ticket 77" in err
+    assert "prep_sample 4: not_processed (no_run)" in err
 
 
 def test_accession_names_need_no_data_plane(monkeypatch, tmp_path):
