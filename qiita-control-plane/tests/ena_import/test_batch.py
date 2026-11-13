@@ -1349,7 +1349,7 @@ async def test_process_one_study_all_runs_failed_reaches_terminal_failed(
     # The failed run's detail is on the endpoint, not only the item-level reason.
     status = await fetch_batch_status(postgres_pool, batch_idx=batch_idx)
     failed_run = status.items[0].ena_runs[0]
-    assert failed_run.status == EnaRunRegistrationStatus.FAILED.value
+    assert failed_run.status == EnaRunRegistrationStatus.UNSUPPORTED.value
     assert failed_run.failure_reason is not None
 
     await _cleanup_study(postgres_pool, accession)

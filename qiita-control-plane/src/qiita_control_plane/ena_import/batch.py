@@ -131,7 +131,7 @@ _TERMINAL_UNSUCCESSFUL_STATES = frozenset(
 )
 
 # A run counts toward "this study registered something downloadable" only in
-# these two states -- EXCLUDED (non-public) and FAILED do not.
+# these states.
 _SUCCESSFUL_RUN_REGISTRATION_STATUSES = frozenset(
     {
         EnaRunRegistrationStatus.REGISTERED,
@@ -659,11 +659,12 @@ async def _process_one_study(
             return
 
         if not any(o.status in _SUCCESSFUL_RUN_REGISTRATION_STATUSES for o in result.ena_runs):
-            # Pools exist (a platform mapped), but every run then failed or was
-            # excluded (non-public) inside register_ena_study, so the pools hold
-            # no sequenced_sample rows. Submitting downloads against them would
-            # report success over an all-failed study. Terminal `failed`; the
-            # per-run reasons are already persisted on `ena_run_outcomes`.
+            # Pools exist (a platform mapped), but every run then failed, was
+            # unsupported or was excluded (non-public) inside register_ena_study,
+            # so the pools hold no sequenced_sample rows. Submitting downloads
+            # against them would report success over an all-failed study.
+            # Terminal `failed`; the per-run reasons are already persisted on
+            # `ena_run_outcomes`.
             reasons = _summarize_run_failures(
                 o for o in result.ena_runs if o.status not in _SUCCESSFUL_RUN_REGISTRATION_STATUSES
             )

@@ -59,6 +59,7 @@ _None yet._
 
 ### Notes (no host action)
 
+- (#865) `GET /ena-import-batch/{idx}` `ena_runs[].status` can be `unsupported` (a run whose library strategy and source have no curated protocol, previously `failed`); clients matching on the closed set of statuses must accept it.
 - (#851) The data plane no longer updates or creates `qiita_lake.registration_lock`; the existing table stays in the catalog, unused.
 - (#849) `qiita-admin backfill myloasm-provenance` is removed, with the `myloasm-provenance-recover` workflow and job: every myloasm run of long-read-assembly 1.0.0/1.0.1 is recovered.
 - (#840) `POST /biosample/resolve-roster` takes a new, incompatible row shape (nested `biosample` / `primary_project` / `secondary_projects` refs); a `qiita` CLI installed before this deploy gets a 422 from `submit-bcl-convert`, `submit-pacbio-ingest` and `submit-golay-demux` until it is upgraded.
