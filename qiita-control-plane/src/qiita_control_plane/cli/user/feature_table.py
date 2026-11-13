@@ -1563,7 +1563,7 @@ def _run_build(
                 is not None
             },
         )
-        # **The de novo arm's cohort is the samples the MAP named, not the build's.**
+        # **The de novo arm's cohort is the prep_samples the MAP named, not the build's.**
         # Every de novo surface is asked for exactly these: the run-scoped lengths 404
         # for a prep_sample with no run, and the alignment mint refuses a cohort member with
         # no `alignment_sample` row — which is precisely a prep_sample that assembled
@@ -1654,7 +1654,7 @@ def _run_build(
         if denovo_parts and filtering:
             # N run-scoped streams, appended into one relation before the roll-up
             # reads it — the assembly read-back has no whole-cohort form. Only the
-            # samples the map named: a sample with no contigs has no run to read.
+            # prep_samples the map named: a prep_sample with no contigs has no run to read.
             run_of = {s: part.processing_idx for part in denovo_parts for s in part.samples}
             con.execute(ft.denovo_contig_lengths_table_sql())
             for prep_sample_idx in sorted(run_of):
