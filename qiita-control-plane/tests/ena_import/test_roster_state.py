@@ -10,7 +10,7 @@ the roster live).
 from qiita_common.models import WorkTicketState
 
 from qiita_control_plane.ena_import.registration import (
-    _RESUBMITTABLE_DOWNLOAD_TICKET_STATES,
+    RESUBMITTABLE_DOWNLOAD_TICKET_STATES,
     download_ticket_read_roster,
 )
 
@@ -44,7 +44,7 @@ def test_every_work_ticket_state_classified() -> None:
     all_states = {state.value for state in WorkTicketState}
     read_states = {state for state in all_states if download_ticket_read_roster(state)}
     not_yet_read_states = {WorkTicketState.PENDING.value}
-    assert read_states | not_yet_read_states | _RESUBMITTABLE_DOWNLOAD_TICKET_STATES == all_states
+    assert read_states | not_yet_read_states | RESUBMITTABLE_DOWNLOAD_TICKET_STATES == all_states
     assert read_states.isdisjoint(not_yet_read_states)
-    assert read_states.isdisjoint(_RESUBMITTABLE_DOWNLOAD_TICKET_STATES)
-    assert not_yet_read_states.isdisjoint(_RESUBMITTABLE_DOWNLOAD_TICKET_STATES)
+    assert read_states.isdisjoint(RESUBMITTABLE_DOWNLOAD_TICKET_STATES)
+    assert not_yet_read_states.isdisjoint(RESUBMITTABLE_DOWNLOAD_TICKET_STATES)

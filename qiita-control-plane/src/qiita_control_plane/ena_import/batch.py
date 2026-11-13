@@ -14,7 +14,7 @@ The task (`_run_batch`) processes every item under the process-wide bound
 (`_expand_run_list_item`). Each study item (`_process_one_study`): resolve
 (blocking calls under `asyncio.to_thread`) -> `_reconcile_held_run_availability`
 -> `register_ena_study` -> one `download-ena-study` ticket per pool holding
-the item's runs, reused when one already covers the pool and otherwise
+the item's runs, reused when one already covers its runs there and otherwise
 submitted in-process through `submit_work_ticket_core` with the BATCH's
 submitting principal (so the ticket's audience gate is enforced against a
 real principal). One item's failure marks only that item `failed`.
@@ -30,8 +30,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Iterable
-from dataclasses import dataclass, replace
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
 from typing import Any
 
 import asyncpg
@@ -46,6 +46,7 @@ from qiita_common.models.ena_import import (
     BatchItemState,
     EnaRunImportOutcome,
 )
+from qiita_common.work_ticket_constants import ENA_RUN_ACCESSIONS_KEY
 
 from ..auth.guards import METADATA_BYPASS_ROLE, caller_metadata_tiers, tier_at_least
 from ..auth.principal import HumanUser, PrincipalUnusableError, load_human_user
@@ -57,7 +58,7 @@ from ..repositories.ena_import_batch import (
     fetch_ena_import_batch_items,
     fetch_failed_downloads,
     fetch_inflight_ena_import_batch_items,
-    fetch_sequenced_samples_missed_by_completed_download,
+    fetch_runs_needing_download,
     fetch_work_ticket_states_for_idxs,
     insert_ena_import_batch,
     insert_ena_import_batch_item,
@@ -80,20 +81,16 @@ from ..repositories.study import (
 from .availability import EnaAvailabilityClient
 from .miint_resolver import MiintEnaResolver, call_with_ena_retry
 from .registration import (
+    RESUBMITTABLE_DOWNLOAD_TICKET_STATES,
     EnaRunRegistrationOutcome,
     EnaRunRegistrationStatus,
-    download_ticket_covers_pool,
     exception_reason,
     fetch_download_pool_states,
     fetch_pool_download_ticket,
     register_ena_study,
 )
 from .resolver import EnaAccessionNotFoundError
-from .submit import (
-    DOWNLOAD_ENA_STUDY_ACTION_ID,
-    DOWNLOAD_ENA_STUDY_ACTION_VERSION,
-    build_download_ena_study_ticket,
-)
+from .submit import build_download_ena_study_ticket
 
 _log = logging.getLogger(__name__)
 
@@ -136,7 +133,6 @@ _SUCCESSFUL_RUN_REGISTRATION_STATUSES = frozenset(
     {
         EnaRunRegistrationStatus.REGISTERED,
         EnaRunRegistrationStatus.SKIPPED_ALREADY_PRESENT,
-        EnaRunRegistrationStatus.HELD_NOT_DOWNLOADED,
     }
 )
 
@@ -447,37 +443,6 @@ async def _fail_after_held_run_check(
     await _set_item_state(pool, item.idx, BatchItemState.FAILED, failure_reason=failure_reason)
 
 
-async def _mark_runs_held_not_downloaded(
-    pool: asyncpg.Pool, outcomes: list[EnaRunRegistrationOutcome]
-) -> list[EnaRunRegistrationOutcome]:
-    """Report a held run its pool's completed download never fetched as
-    `HELD_NOT_DOWNLOADED` rather than `SKIPPED_ALREADY_PRESENT`."""
-    held = [
-        o.sequenced_sample_idx
-        for o in outcomes
-        if o.status is EnaRunRegistrationStatus.SKIPPED_ALREADY_PRESENT
-        and o.sequenced_sample_idx is not None
-    ]
-    if not held:
-        return outcomes
-    missed = await fetch_sequenced_samples_missed_by_completed_download(
-        pool,
-        sequenced_sample_idxs=held,
-        action_id=DOWNLOAD_ENA_STUDY_ACTION_ID,
-        action_version=DOWNLOAD_ENA_STUDY_ACTION_VERSION,
-    )
-    return [
-        replace(
-            o,
-            status=EnaRunRegistrationStatus.HELD_NOT_DOWNLOADED,
-            failure_reason="held with no reads; its pool's download completed without it",
-        )
-        if o.sequenced_sample_idx in missed
-        else o
-        for o in outcomes
-    ]
-
-
 async def _process_one_study(
     app: FastAPI,
     pool: asyncpg.Pool,
@@ -634,12 +599,11 @@ async def _process_one_study(
             caller_idx=principal.principal_idx,
             tiers=tiers,
         )
-        run_outcomes = await _mark_runs_held_not_downloaded(pool, result.ena_runs)
         await _set_item_registered(
             pool,
             item.idx,
             study_idx=result.study_idx,
-            ena_run_outcomes=_ena_run_outcomes(flagged) + _ena_run_outcomes(run_outcomes),
+            ena_run_outcomes=_ena_run_outcomes(flagged) + _ena_run_outcomes(result.ena_runs),
         )
 
         if not result.created_pools:
@@ -682,38 +646,45 @@ async def _process_one_study(
         from ..work_ticket_submit import submit_work_ticket_core
 
         # Each idx is persisted as it lands so a crash mid-loop orphans nothing.
+        sample_idxs = [
+            o.sequenced_sample_idx for o in result.ena_runs if o.sequenced_sample_idx is not None
+        ]
         own_pool_idxs = None
         if requested is not None:
-            own_pool_idxs = await fetch_sequenced_pool_idxs_for_sequenced_samples(
-                pool,
-                [
-                    o.sequenced_sample_idx
-                    for o in result.ena_runs
-                    if o.sequenced_sample_idx is not None
-                ],
-            )
+            own_pool_idxs = await fetch_sequenced_pool_idxs_for_sequenced_samples(pool, sample_idxs)
         any_ticket = False
+        any_skipped = False
         for sequencing_run_idx in dict.fromkeys(p.sequencing_run_idx for p in result.created_pools):
-            for pool_state in await fetch_download_pool_states(pool, sequencing_run_idx):
+            # One snapshot, so a ticket completing between the two reads cannot show
+            # its runs as still needed.
+            async with pool.acquire() as conn, conn.transaction(isolation="repeatable_read"):
+                pool_states = await fetch_download_pool_states(conn, sequencing_run_idx)
+                needed_by_pool = await fetch_runs_needing_download(
+                    conn, sequenced_sample_idxs=sample_idxs
+                )
+            for pool_state in pool_states:
+                pool_idx = pool_state["sequenced_pool_idx"]
                 if not pool_state["has_sequenced_sample"]:
                     continue
-                if (
-                    own_pool_idxs is not None
-                    and pool_state["sequenced_pool_idx"] not in own_pool_idxs
-                ):
+                if own_pool_idxs is not None and pool_idx not in own_pool_idxs:
                     continue
-                if download_ticket_covers_pool(pool_state["work_ticket_state"]):
-                    # Safe to reuse either way: a pool already covered when we
-                    # resolved excluded our runs from it entirely, and one
-                    # covered after our resolve read under the same lock and
-                    # therefore sees every run we registered.
+                needed = needed_by_pool.get(pool_idx, [])
+                if _reusable_download_ticket(pool_state, needed, sequenced_pool_idx=pool_idx):
                     ticket_idx = pool_state["work_ticket_idx"]
+                elif not needed:
+                    any_skipped = True
+                    continue
                 else:
+                    # A forced ticket may only fetch runs with no reads, or it would
+                    # store a completed download's runs twice.
+                    forced = pool_state["has_completed_ticket"]
                     body = build_download_ena_study_ticket(
-                        sequenced_pool_idx=pool_state["sequenced_pool_idx"],
+                        sequenced_pool_idx=pool_idx,
                         sequencing_run_idx=sequencing_run_idx,
                         ena_study_accession=study_header.study_accession,
                         run_concurrency=app.state.settings.ena_download_run_concurrency,
+                        ena_run_accessions=needed if forced or requested is not None else None,
+                        force=forced,
                     )
                     try:
                         response = await submit_work_ticket_core(
@@ -724,11 +695,12 @@ async def _process_one_study(
                         if exc.status_code != status.HTTP_409_CONFLICT:
                             raise
                         # A concurrent batch submitted this pool's ticket after our read.
-                        ticket_idx = await _covering_download_ticket_idx(
-                            pool, pool_state["sequenced_pool_idx"]
-                        )
-                        if ticket_idx is None:
+                        latest = await fetch_pool_download_ticket(pool, sequenced_pool_idx=pool_idx)
+                        if latest is None or not _reusable_download_ticket(
+                            latest, needed, sequenced_pool_idx=pool_idx
+                        ):
                             raise
+                        ticket_idx = latest["work_ticket_idx"]
                 await _append_item_download_ticket(pool, item.idx, ticket_idx)
                 any_ticket = True
 
@@ -737,7 +709,12 @@ async def _process_one_study(
                 pool,
                 item.idx,
                 BatchItemState.FAILED,
-                failure_reason="study registered but no pool holds an active sequenced_sample",
+                failure_reason=(
+                    "nothing to download: every run this import names has stored reads, a recorded"
+                    " download failure, or is retired or ENA-flagged"
+                    if any_skipped
+                    else "study registered but no pool holds an active sequenced_sample"
+                ),
             )
             return
         await _mark_item_downloading(pool, item.idx)
@@ -854,11 +831,37 @@ async def _follow_absorbing_items(
         await _set_item_state(pool, item.idx, BatchItemState.FAILED, failure_reason=str(exc))
 
 
-async def _covering_download_ticket_idx(pool: asyncpg.Pool, sequenced_pool_idx: int) -> int | None:
-    ticket = await fetch_pool_download_ticket(pool, sequenced_pool_idx=sequenced_pool_idx)
-    if ticket is not None and download_ticket_covers_pool(ticket["work_ticket_state"]):
-        return ticket["work_ticket_idx"]
-    return None
+_LIVE_DOWNLOAD_STATES = frozenset(
+    {
+        WorkTicketState.PENDING.value,
+        WorkTicketState.QUEUED.value,
+        WorkTicketState.PROCESSING.value,
+    }
+)
+
+
+def _reusable_download_ticket(
+    ticket: Mapping[str, Any], needed: list[str], *, sequenced_pool_idx: int
+) -> bool:
+    """Whether the pool's latest download ticket already downloads, or has downloaded,
+    every run in `needed`. Raises when a live ticket is restricted to other runs, since
+    a new one cannot be submitted beside it."""
+    state = ticket["work_ticket_state"]
+    if state == WorkTicketState.NO_DATA.value:
+        return True
+    if state == WorkTicketState.COMPLETED.value:
+        return not needed
+    if state is None or state in RESUBMITTABLE_DOWNLOAD_TICKET_STATES:
+        return False
+    if state not in _LIVE_DOWNLOAD_STATES:
+        raise ValueError(f"unknown download ticket state {state!r}")
+    restriction = ticket[ENA_RUN_ACCESSIONS_KEY]
+    if restriction is None or set(needed) <= set(restriction):
+        return True
+    raise RuntimeError(
+        f"sequenced_pool {sequenced_pool_idx} is held by download ticket "
+        f"{ticket['work_ticket_idx']}, restricted to other runs; re-import once it ends"
+    )
 
 
 async def _run_batch(

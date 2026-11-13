@@ -232,7 +232,11 @@ def test_stage_ena_run_roster_binding_stages_for_declared_workflow(tmp_path):
     }
     bound = asyncio.run(
         _stage_ena_run_roster_binding(
-            pool, action_steps=steps, scope_target=scope_target, workspace=tmp_path / "ws"
+            pool,
+            action_steps=steps,
+            scope_target=scope_target,
+            action_context={},
+            workspace=tmp_path / "ws",
         )
     )
     assert bound is not None
@@ -244,6 +248,86 @@ def test_stage_ena_run_roster_binding_stages_for_declared_workflow(tmp_path):
         POOL_RESOLVE_LOCK_CLASS,
         7 & INT4_MASK,
     )
+
+
+def _staged_runs(out) -> list[str]:
+    with duckdb.connect(":memory:") as conn:
+        return [
+            r[0]
+            for r in conn.execute(
+                f"SELECT ena_run_accession FROM read_parquet('{out}') ORDER BY prep_sample_idx"
+            ).fetchall()
+        ]
+
+
+def test_stage_ena_run_roster_restricted_stages_only_the_listed_runs(tmp_path):
+    pool = _FakeRosterPool([(81, "ERR001"), (82, "ERR002"), (83, "ERR003")])
+    bound = asyncio.run(
+        _stage_ena_run_roster(
+            pool,
+            5,
+            sequencing_run_idx=7,
+            workspace=tmp_path / "ws",
+            ena_run_accessions=["ERR003", "ERR001"],
+        )
+    )
+    assert _staged_runs(bound[ENA_RUN_MAP_BINDING]) == ["ERR001", "ERR003"]
+
+
+def test_stage_ena_run_roster_restricted_drops_listed_runs_off_the_roster_and_warns(
+    tmp_path, caplog
+):
+    """A listed run flagged or retired since submit is off the active roster; the rest
+    still download, as an unrestricted ticket's would."""
+    pool = _FakeRosterPool([(81, "ERR001"), (82, "ERR002")])
+    with caplog.at_level(logging.WARNING):
+        bound = asyncio.run(
+            _stage_ena_run_roster(
+                pool,
+                5,
+                sequencing_run_idx=7,
+                workspace=tmp_path / "ws",
+                ena_run_accessions=["ERR001", "ERR009"],
+            )
+        )
+    assert _staged_runs(bound[ENA_RUN_MAP_BINDING]) == ["ERR001"]
+    (record,) = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert "ERR009" in record.getMessage()
+    assert "ERR001" not in record.getMessage()
+
+
+def test_stage_ena_run_roster_restricted_fails_loud_when_no_listed_run_remains(tmp_path):
+    pool = _FakeRosterPool([(81, "ERR001")])
+    with pytest.raises(BackendFailure) as exc:
+        asyncio.run(
+            _stage_ena_run_roster(
+                pool,
+                5,
+                sequencing_run_idx=7,
+                workspace=tmp_path / "ws",
+                ena_run_accessions=["ERR008", "ERR009"],
+            )
+        )
+    assert exc.value.kind == FailureKind.BAD_INPUT
+    assert "ERR008" in exc.value.reason
+    assert "ERR009" in exc.value.reason
+    assert not (tmp_path / "ws" / "ena_run_map.parquet").exists()
+
+
+def test_stage_ena_run_roster_binding_passes_the_ticket_restriction_through(tmp_path):
+    pool = _FakeRosterPool([(81, "ERR001"), (82, "ERR002")])
+    steps = [_step(inputs=["ena_run_map"], outputs=["read_staging_dir"])]
+    scope_target = {"kind": "sequenced_pool", "sequenced_pool_idx": 5, "sequencing_run_idx": 7}
+    bound = asyncio.run(
+        _stage_ena_run_roster_binding(
+            pool,
+            action_steps=steps,
+            scope_target=scope_target,
+            action_context={"ena_run_accessions": ["ERR002"]},
+            workspace=tmp_path / "ws",
+        )
+    )
+    assert _staged_runs(bound[ENA_RUN_MAP_BINDING]) == ["ERR002"]
 
 
 def test_stage_ena_run_roster_binding_skips_undeclared_workflow(tmp_path):
@@ -258,7 +342,11 @@ def test_stage_ena_run_roster_binding_skips_undeclared_workflow(tmp_path):
     }
     bound = asyncio.run(
         _stage_ena_run_roster_binding(
-            pool, action_steps=steps, scope_target=scope_target, workspace=tmp_path / "ws"
+            pool,
+            action_steps=steps,
+            scope_target=scope_target,
+            action_context={},
+            workspace=tmp_path / "ws",
         )
     )
     assert bound is None

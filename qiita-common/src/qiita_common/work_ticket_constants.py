@@ -6,6 +6,9 @@ model cannot import from it. Mirrors `assembly_constants` — the contract layer
 both Python services depend on.
 """
 
+# `download-ena-study` action_context key restricting the ticket to some of its pool's runs.
+ENA_RUN_ACCESSIONS_KEY = "ena_run_accessions"
+
 # The command that clears a prep_sample's read numbering, named wherever a step
 # refuses because that numbering is already spent. A noun phrase: each site
 # supplies its own lead, because the pool is "this pool" to a pool-scoped 409
