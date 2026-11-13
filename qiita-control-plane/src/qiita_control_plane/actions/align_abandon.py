@@ -15,7 +15,11 @@ The first is one Postgres transaction:
    'abandoned', locking them and their tickets. A ticket is held when it is flagged
    `dispatch_held` and still 'pending'. Refuse (`AlignPlanInFlight`) if any other
    ticket is non-terminal: it may have a job, and a running block would register
-   rows and reconcile after its gates were cleared.
+   rows and reconcile after its gates were cleared. Refuse (`AlignPlanRearmed`) if
+   any collected block was re-armed by rerun-block (`block.rearmed_at`), unless the
+   caller passes `allow_rearmed`: its prep_samples' gates were completed, and the
+   purge below deletes their rows from every block of the alignment, including the
+   completed siblings that hold good rows.
 3. Cancel the held tickets (never released, so there is no SLURM job to reap),
    set every collected block 'abandoned', and delete the 'pending' gates those blocks
    covered.
@@ -50,6 +54,20 @@ from ..repositories.block import BLOCK_ABANDONED, BLOCK_COMPLETED
 from .library import delete_alignment_block_data
 
 
+class AlignPlanRearmed(Exception):
+    """A block abandon-plan would abandon was re-armed by rerun-block."""
+
+    def __init__(self, alignment_idx: int, block_idxs: list[int]) -> None:
+        self.alignment_idx = alignment_idx
+        self.block_idxs = block_idxs
+        super().__init__(
+            f"alignment {alignment_idx} has {len(block_idxs)} re-armed block(s) that have"
+            f" not completed again: {block_idxs}. Retry their re-run; abandoning them"
+            " deletes their prep_samples' rows from every block of the alignment. Pass"
+            " allow_rearmed to abandon them anyway"
+        )
+
+
 class AlignPlanInFlight(Exception):
     """A block of the plan is running, so its gates cannot be cleared under it."""
 
@@ -69,11 +87,13 @@ async def abandon_align_plan(
     alignment_idx: int,
     signing_key: bytes,
     data_plane_url: str,
+    allow_rearmed: bool = False,
 ) -> dict:
     """See the module docstring. Returns the fields of `AlignmentPlanAbandonResponse`.
 
-    Raises AlignmentDefinitionNotFound, AlignPlanInFlight, or pyarrow.flight.FlightError (the
-    purge failed after the abandon committed; re-running this redoes the purge)."""
+    Raises AlignmentDefinitionNotFound, AlignPlanInFlight, AlignPlanRearmed, or
+    pyarrow.flight.FlightError (the purge failed after the abandon committed;
+    re-running this redoes the purge)."""
     cohort = align_block_cohort(alignment_idx)
     in_flight = NON_TERMINAL_WORK_TICKET_STATES
     async with pool.acquire() as conn, conn.transaction():
@@ -88,7 +108,7 @@ async def abandon_align_plan(
         )
 
         blocks = await conn.fetch(
-            "SELECT b.block_idx, wt.work_ticket_idx, wt.state::text AS state,"
+            "SELECT b.block_idx, b.rearmed_at, wt.work_ticket_idx, wt.state::text AS state,"
             "       wt.dispatch_held"
             "  FROM qiita.block b"
             "  JOIN qiita.work_ticket wt ON wt.work_ticket_idx = b.work_ticket_idx"
@@ -112,6 +132,9 @@ async def abandon_align_plan(
         ]
         if running:
             raise AlignPlanInFlight(alignment_idx, running)
+        rearmed = [r["block_idx"] for r in blocks if r["rearmed_at"] is not None]
+        if rearmed and not allow_rearmed:
+            raise AlignPlanRearmed(alignment_idx, rearmed)
 
         block_idxs = [r["block_idx"] for r in blocks]
         if held:

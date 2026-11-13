@@ -138,8 +138,9 @@ class Scope(StrEnum):
     # in ROLE_IMPLIED_SCOPES.
     PROCESSING_LIFECYCLE = "processing:lifecycle"
     # Alignment LIFECYCLE: deprecate an alignment config, withdraw individual
-    # (alignment, prep_sample) runs of a sound one, and abandon an align plan
-    # whose blocks failed so its prep_samples can be re-planned. Separate from
+    # (alignment, prep_sample) runs of a sound one, abandon an align plan whose
+    # blocks failed so its prep_samples can be re-planned, re-run a finished align
+    # block, and delete the rows of a prep_sample with no gate. Separate from
     # MASK_DEFINITION_LIFECYCLE and PROCESSING_LIFECYCLE because each names a
     # different identity: an alignment can be wrong while the mask under it is
     # sound. system_admin only, in ROLE_IMPLIED_SCOPES.
@@ -280,11 +281,14 @@ STALE_TOKEN_SCOPE_HEADER = "X-Qiita-Stale-Token-Scope"
 # default that lines up with VARCHAR(255) in DB columns; 100 covers reference
 # version strings; 64 caps DuckLake / DB table names per Postgres identifier
 # limits; 50 tracks the VARCHAR(50) accession columns, so an over-long
-# accession fails at the wire rather than in the database.
+# accession fails at the wire rather than in the database. 2000 caps the free-text
+# `reason` an operator gives a lifecycle change or an exclusion, and matches
+# `qiita.reference_exclusion.reason`'s CHECK.
 MAX_NAME_LENGTH = 255
 MAX_VERSION_LENGTH = 100
 MAX_TABLE_NAME_LENGTH = 64
 MAX_ACCESSION_LENGTH = 50
+MAX_REASON_LENGTH = 2000
 
 
 # TTL maxima enforced at the API boundary. Human PATs cap at 1 year so a

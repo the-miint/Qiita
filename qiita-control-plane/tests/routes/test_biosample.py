@@ -1,5 +1,6 @@
 """Integration tests for the biosample routes."""
 
+import asyncio
 import secrets
 from collections.abc import Awaitable, Callable
 from datetime import date
@@ -23,9 +24,15 @@ from qiita_common.api_paths import (
     URL_BIOSAMPLE_METADATA_BY_STUDY_UNIQUE_FIELD,
     URL_BIOSAMPLE_RESOLVE_ROSTER,
     URL_BIOSAMPLE_STUDY_FIELD_BY_STUDY,
+    URL_BIOSAMPLE_STUDY_LINK,
 )
 from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX, Scope, SystemRole
-from qiita_common.models import BiosampleAccessionField, FieldDataType, Tier
+from qiita_common.models import (
+    BiosampleAccessionField,
+    BiosampleStudyLinkResponse,
+    FieldDataType,
+    Tier,
+)
 
 from qiita_control_plane.repositories import _sample_helpers as sample_helpers
 from qiita_control_plane.repositories.biosample_metadata import BIOSAMPLE_METADATA_SPEC
@@ -56,20 +63,28 @@ from qiita_control_plane.testing.unique_names import (
 
 from .conftest import (
     BIOSAMPLE_FIELD_SURFACE,
+    BIOSAMPLE_STUDY_LIST_SURFACE,
     OWNER_INELIGIBILITY_KINDS,
+    SAMPLE_STUDY_LIST_CASES,
     STUDY_FIELD_CREATE_AUTHZ_CASES,
     STUDY_FIELD_CREATE_CONFLICT_CASES,
     STUDY_FIELD_LIST_AUTHZ_CASES,
+    STUDY_SCOPED_SAMPLE_LINK_AUTHZ_CASES,
     STUDY_SCOPED_SAMPLE_READ_AUTHZ_CASES,
     STUDY_SCOPED_SAMPLE_WRITE_AUTHZ_CASES,
     IneligibilityKind,
+    _cancel,
+    _finish,
     _grant_study_access,
     _seed_study,
+    _wait_until_blocked_by,
     assert_owner_ineligibility_422,
+    assert_sample_study_list,
     assert_study_field_create_authz,
     assert_study_field_create_conflict,
     assert_study_field_get_authz,
     assert_study_field_list_authz,
+    assert_study_scoped_sample_link_authz,
     assert_study_scoped_sample_read_authz,
     assert_study_scoped_sample_write_authz,
     etag_for_row,
@@ -505,8 +520,8 @@ async def test_post_biosample_owner_ineligibility_422(ctx, kind: IneligibilityKi
 
 
 async def test_post_biosample_nonexistent_study_404(ctx):
-    # Pick a study_idx well past the current MAX. require_study_exists's
-    # fetch_study_exists returns False → 404.
+    # Pick a study_idx well past the current MAX, so require_study_exists
+    # finds no row → 404.
     max_idx = await ctx["pool"].fetchval("SELECT COALESCE(MAX(idx), 0) FROM qiita.study")
     resp = await ctx["wet"].post(
         URL_BIOSAMPLE_BY_STUDY.format(study_idx=max_idx + 100_000),
@@ -2085,6 +2100,26 @@ async def test_get_biosample_returns_only_global_metadata(ctx):
 
 
 # ===========================================================================
+# GET /api/v1/biosample/{biosample_idx}/study/list
+# ===========================================================================
+
+
+@pytest.mark.parametrize("case", SAMPLE_STUDY_LIST_CASES)
+async def test_list_studies_for_biosample(ctx, case, no_biosample_read_client):
+    """Tests the case where a caller reads a biosample's studies, for each
+    shared study-roster case: active links sorted with their accessions, retired
+    links left out, a retired biosample still listed, the missing-sample 404,
+    and the role, anonymous, and scope refusals.
+    """
+    await assert_sample_study_list(
+        ctx,
+        case=case,
+        surface=BIOSAMPLE_STUDY_LIST_SURFACE,
+        no_scope_client=no_biosample_read_client,
+    )
+
+
+# ===========================================================================
 # GET /api/v1/study/{study_idx}/biosample/{biosample_idx}
 # ===========================================================================
 
@@ -3476,6 +3511,289 @@ async def test_create_biosample_field_linked_with_data_type_422(ctx):
         },
     )
     assert resp.status_code == 422
+
+
+# ===========================================================================
+# POST /api/v1/study/{study_idx}/biosample/{biosample_idx}/link
+# ===========================================================================
+
+
+async def _post_study_link(client, study_idx: int, biosample_idx: int):
+    url = URL_BIOSAMPLE_STUDY_LINK.format(study_idx=study_idx, biosample_idx=biosample_idx)
+    resp = await client.post(url)
+    return resp
+
+
+async def _seed_biosample_owned_by(ctx, owner_key: str) -> int:
+    """Seed a biosample owned by ctx[f'{owner_key}_session'] and track it."""
+    owner_idx = ctx[f"{owner_key}_session"]["principal_idx"]
+    biosample_idx = await seed_biosample(ctx["pool"], owner_idx=owner_idx, created_by_idx=owner_idx)
+    ctx["created"]["biosample"].append(biosample_idx)
+    return biosample_idx
+
+
+async def _fetch_link_row(pool, *, biosample_idx: int, study_idx: int) -> dict | None:
+    row = await pool.fetchrow(
+        "SELECT * FROM qiita.biosample_to_study WHERE biosample_idx = $1 AND study_idx = $2",
+        biosample_idx,
+        study_idx,
+    )
+    link_row = None if row is None else dict(row)
+    return link_row
+
+
+def _expected_active_link_row(
+    actual: dict | None, *, biosample_idx: int, study_idx: int, created_by_idx: int
+) -> dict:
+    """Build the row that a freshly created link should be, copying the
+    table-defaulted created_at from `actual`."""
+    return {
+        "biosample_idx": biosample_idx,
+        "study_idx": study_idx,
+        "created_by_idx": created_by_idx,
+        "created_at": None if actual is None else actual["created_at"],
+        "retired": False,
+        "retired_by_idx": None,
+        "retired_at": None,
+        "retire_reason": None,
+    }
+
+
+@pytest.mark.parametrize("case", STUDY_SCOPED_SAMPLE_LINK_AUTHZ_CASES)
+async def test_create_biosample_study_link_authz(ctx, no_biosample_write_client, case):
+    """Tests the case where each study-side access shape calls the link create on a
+    biosample the regular user owns: the ADMIN minimum, the wet_lab_admin bypass,
+    the scope check, the unauthenticated refusal, and the missing-study 404.
+    """
+
+    async def _seed(ctx, _study_idx):
+        return await _seed_biosample_owned_by(ctx, "user")
+
+    await assert_study_scoped_sample_link_authz(
+        ctx,
+        case=case,
+        no_scope_client=no_biosample_write_client,
+        seed_sample=_seed,
+        send=_post_study_link,
+        success_status=201,
+        required_scope="biosample:write",
+    )
+
+
+async def test_create_biosample_study_link(ctx):
+    """Tests the case where the biosample's owner, already linked elsewhere, links
+    it into a study they own: 201 with the new row, which the table now holds.
+    """
+    user_idx = ctx["user_session"]["principal_idx"]
+    other_study_idx = await _seed_study(ctx, owner_idx=user_idx, suffix="link-other")
+    target_study_idx = await _seed_study(ctx, owner_idx=user_idx, suffix="link-target")
+    biosample_idx = await _seed_biosample_owned_by(ctx, "user")
+    await seed_biosample_to_study_link(
+        ctx["pool"],
+        biosample_idx=biosample_idx,
+        study_idx=other_study_idx,
+        created_by_idx=user_idx,
+    )
+
+    resp = await _post_study_link(ctx["user"], target_study_idx, biosample_idx)
+
+    assert resp.status_code == 201, resp.text
+    link_row = await _fetch_link_row(
+        ctx["pool"], biosample_idx=biosample_idx, study_idx=target_study_idx
+    )
+    expected_row = _expected_active_link_row(
+        link_row, biosample_idx=biosample_idx, study_idx=target_study_idx, created_by_idx=user_idx
+    )
+    assert link_row == expected_row
+    expected_response = BiosampleStudyLinkResponse(
+        biosample_idx=biosample_idx,
+        study_idx=target_study_idx,
+        created_by_idx=user_idx,
+        created_at=expected_row["created_at"],
+    )
+    assert BiosampleStudyLinkResponse.model_validate(resp.json()) == expected_response
+
+
+@pytest.mark.parametrize(
+    ("caller_key", "study_owner_key", "biosample_owner_key", "expected_status"),
+    [
+        pytest.param("admin", "user", "user", 201, id="system_admin_owns_neither"),
+        pytest.param("wet", "user", "user", 201, id="wet_lab_admin_owns_neither"),
+        pytest.param("user", "user", "wet", 404, id="study_owner_not_biosample_owner"),
+    ],
+)
+async def test_create_biosample_study_link_biosample_owner_rule(
+    ctx, caller_key, study_owner_key, biosample_owner_key, expected_status
+):
+    """Tests the case where the caller passes the study gate but may or may not own
+    the biosample: only its owner or a wet_lab_admin+ links it, and a refused
+    caller gets the missing-biosample 404 and no link row.
+    """
+    study_idx = await _seed_study(
+        ctx, owner_idx=ctx[f"{study_owner_key}_session"]["principal_idx"], suffix="link-owner"
+    )
+    biosample_idx = await _seed_biosample_owned_by(ctx, biosample_owner_key)
+
+    resp = await _post_study_link(ctx[caller_key], study_idx, biosample_idx)
+
+    assert resp.status_code == expected_status, resp.text
+    link_row = await _fetch_link_row(ctx["pool"], biosample_idx=biosample_idx, study_idx=study_idx)
+    if expected_status == 404:
+        assert resp.json() == {"detail": f"biosample {biosample_idx} not found"}
+        assert link_row is None
+    else:
+        expected_row = _expected_active_link_row(
+            link_row,
+            biosample_idx=biosample_idx,
+            study_idx=study_idx,
+            created_by_idx=ctx[f"{caller_key}_session"]["principal_idx"],
+        )
+        assert link_row == expected_row
+
+
+# The biosample-state refusals hold for the role-bypass callers, who skip the
+# ownership lookup, as well as for the biosample's owner, who passes it.
+_BIOSAMPLE_STATE_CALLERS = pytest.mark.parametrize("caller_key", ["user", "wet", "admin"])
+
+
+@_BIOSAMPLE_STATE_CALLERS
+async def test_create_biosample_study_link_nonexistent_biosample(ctx, caller_key):
+    """Tests the case where the biosample idx names no row: the same 404 that a
+    caller who does not own the biosample gets.
+    """
+    study_idx = await _seed_study(
+        ctx, owner_idx=ctx["user_session"]["principal_idx"], suffix="link-missing"
+    )
+    missing_idx = await ctx["pool"].fetchval(
+        "SELECT COALESCE(MAX(idx), 0) + 100000 FROM qiita.biosample"
+    )
+
+    resp = await _post_study_link(ctx[caller_key], study_idx, missing_idx)
+
+    assert resp.status_code == 404, resp.text
+    assert resp.json() == {"detail": f"biosample {missing_idx} not found"}
+
+
+@_BIOSAMPLE_STATE_CALLERS
+async def test_create_biosample_study_link_retired_biosample(ctx, caller_key):
+    """Tests the case where a caller tries to link a retired biosample: 409 and
+    no link row.
+    """
+    user_idx = ctx["user_session"]["principal_idx"]
+    study_idx = await _seed_study(ctx, owner_idx=user_idx, suffix="link-retired-bs")
+    biosample_idx = await _seed_biosample_owned_by(ctx, "user")
+    await retire_biosample(ctx["pool"], biosample_idx=biosample_idx, retired_by_idx=user_idx)
+
+    resp = await _post_study_link(ctx[caller_key], study_idx, biosample_idx)
+
+    assert resp.status_code == 409, resp.text
+    assert resp.json() == {"detail": f"biosample {biosample_idx} is retired"}
+    link_row = await _fetch_link_row(ctx["pool"], biosample_idx=biosample_idx, study_idx=study_idx)
+    assert link_row is None
+
+
+async def test_create_biosample_study_link_waits_for_concurrent_owner_change(ctx):
+    """Tests the case where a transaction that moves the biosample to another owner
+    is still open when the owner's link request arrives: the request waits on the
+    row lock, then sees the committed owner and answers the not-owner 404.
+    """
+    user_idx = ctx["user_session"]["principal_idx"]
+    study_idx = await _seed_study(ctx, owner_idx=user_idx, suffix="link-race")
+    biosample_idx = await _seed_biosample_owned_by(ctx, "user")
+
+    task, committed = None, False
+    async with ctx["pool"].acquire() as other:
+        tr = other.transaction()
+        await tr.start()
+        try:
+            await other.execute(
+                "UPDATE qiita.biosample SET owner_idx = $2 WHERE idx = $1",
+                biosample_idx,
+                ctx["wet_session"]["principal_idx"],
+            )
+            task = asyncio.create_task(_post_study_link(ctx["user"], study_idx, biosample_idx))
+            await _wait_until_blocked_by(ctx["pool"], other, task)
+            await tr.commit()
+            committed = True
+            resp = await _finish(task)
+        finally:
+            await _cancel(task)
+            if not committed:
+                await tr.rollback()
+
+    link_row = await _fetch_link_row(ctx["pool"], biosample_idx=biosample_idx, study_idx=study_idx)
+    assert (resp.status_code, resp.json(), link_row) == (
+        404,
+        {"detail": f"biosample {biosample_idx} not found"},
+        None,
+    )
+
+
+async def test_create_biosample_study_link_not_blocked_by_open_fk_insert(ctx):
+    """Tests the case where another transaction has an uncommitted link of the same
+    biosample into a different study: the request does not wait on it, and answers
+    201 while that transaction is still open.
+    """
+    user_idx = ctx["user_session"]["principal_idx"]
+    other_study_idx = await _seed_study(ctx, owner_idx=user_idx, suffix="link-open-other")
+    target_study_idx = await _seed_study(ctx, owner_idx=user_idx, suffix="link-open-target")
+    biosample_idx = await _seed_biosample_owned_by(ctx, "user")
+
+    task = None
+    async with ctx["pool"].acquire() as other:
+        tr = other.transaction()
+        await tr.start()
+        try:
+            await seed_biosample_to_study_link(
+                other,
+                biosample_idx=biosample_idx,
+                study_idx=other_study_idx,
+                created_by_idx=user_idx,
+            )
+            task = asyncio.create_task(
+                _post_study_link(ctx["user"], target_study_idx, biosample_idx)
+            )
+            resp = await _finish(task)
+        finally:
+            await _cancel(task)
+            await tr.rollback()
+
+    assert resp.status_code == 201, resp.text
+    link_row = await _fetch_link_row(
+        ctx["pool"], biosample_idx=biosample_idx, study_idx=target_study_idx
+    )
+    expected_row = _expected_active_link_row(
+        link_row, biosample_idx=biosample_idx, study_idx=target_study_idx, created_by_idx=user_idx
+    )
+    assert link_row == expected_row
+
+
+@pytest.mark.parametrize("retire_existing", [False, True], ids=["active", "retired"])
+async def test_create_biosample_study_link_already_linked(ctx, retire_existing):
+    """Tests the case where a link for the pair already exists, active or retired:
+    one 409 for both, and the existing row is left as it was.
+    """
+    user_idx = ctx["user_session"]["principal_idx"]
+    study_idx = await _seed_study(ctx, owner_idx=user_idx, suffix="link-dup")
+    biosample_idx = await _seed_biosample_owned_by(ctx, "user")
+    await seed_biosample_to_study_link(
+        ctx["pool"], biosample_idx=biosample_idx, study_idx=study_idx, created_by_idx=user_idx
+    )
+    if retire_existing:
+        await retire_biosample_to_study_link(
+            ctx["pool"], biosample_idx=biosample_idx, study_idx=study_idx, retired_by_idx=user_idx
+        )
+    row_before = await _fetch_link_row(
+        ctx["pool"], biosample_idx=biosample_idx, study_idx=study_idx
+    )
+
+    resp = await _post_study_link(ctx["user"], study_idx, biosample_idx)
+
+    assert resp.status_code == 409, resp.text
+    expected_detail = f"biosample {biosample_idx} is already linked to study {study_idx} (the link may be retired)"  # noqa: E501
+    assert resp.json() == {"detail": expected_detail}
+    row_after = await _fetch_link_row(ctx["pool"], biosample_idx=biosample_idx, study_idx=study_idx)
+    assert row_after == row_before
 
 
 # ===========================================================================

@@ -50,16 +50,18 @@ _None yet._
 
 ### 3. Migrations
 
+- `[operator]` (#855) `make migrate` applies `20261110000000_block_rearmed_at.sql` (nullable `rearmed_at` on `qiita.block`, which `rerun-block` sets and abandon-plan reads; no row changes).
 - `20261110000000_host_taxon_id_not_required` makes `host_taxon_id` optional, and from the
   restart an absent value means no host. `dbmate` applies it; run the bucket-2 backfill
   first. (#864)
 
 ### 4. Deploy
 
-_None yet._
+- `[operator]` (#851) Deploy every data-plane instance, peers on other hosts included, from this build in the same window. An instance from an earlier build takes no lake lock, so its registrations into the replace-keyed tables overlap the new instances' again and can lose their commits to them.
 
 ### 5. Verify
 
+- `[operator]` (#851) `make verify-deploy`'s `catalog-connections` row now counts each data-plane instance as its pool size plus 2 lake lock sessions (`pool=<n>` in the catalog session name). If it fails on the budget, lower `DUCKLAKE_POOL_SIZE` in `/etc/qiita/data-plane.env` or raise `max_connections` on the catalog server, as its message says.
 - `[operator]` **Run `qiita-admin check-stored-preflights` again, as in bucket 2.** The old
   build kept accepting submissions and lane edits until the restart, and the bucket-2 run
   did not see those. Expect `unopenable: 0`; if any are listed, raise them with an admin,
@@ -76,6 +78,7 @@ _None yet._
 
 ### Notes (no host action)
 
+- (#851) The data plane no longer updates or creates `qiita_lake.registration_lock`; the existing table stays in the catalog, unused.
 - (#849) `qiita-admin backfill myloasm-provenance` is removed, with the `myloasm-provenance-recover` workflow and job: every myloasm run of long-read-assembly 1.0.0/1.0.1 is recovered.
 - (#840) `POST /biosample/resolve-roster` takes a new, incompatible row shape (nested `biosample` / `primary_project` / `secondary_projects` refs); a `qiita` CLI installed before this deploy gets a 422 from `submit-bcl-convert`, `submit-pacbio-ingest` and `submit-golay-demux` until it is upgraded.
 - (#840) Deploy this before kl-metapool moves to the kl-run-preflight release that adds export IDs: Qiita refuses a pre-flight written against a newer schema than the one it ships, so a pre-flight from the new kl-metapool fails every submit until this is live.

@@ -29,6 +29,8 @@ from qiita_common.api_paths import (
     PATH_BIOSAMPLE_RESOLVE_ROSTER,
     PATH_BIOSAMPLE_STUDY_FIELD_BY_IDX,
     PATH_BIOSAMPLE_STUDY_FIELD_BY_STUDY,
+    PATH_BIOSAMPLE_STUDY_LINK,
+    PATH_BIOSAMPLE_STUDY_LIST,
     PATH_STUDY_PREFIX,
 )
 from qiita_common.auth_constants import Scope, SystemRole
@@ -47,6 +49,7 @@ from qiita_common.models import (
     BiosampleResponse,
     BiosampleStudyFieldCreateRequest,
     BiosampleStudyFieldResponse,
+    BiosampleStudyLinkResponse,
     IdxsListResponse,
     MetadataChecklistRef,
     MetadataEntry,
@@ -58,13 +61,18 @@ from qiita_common.models import (
     SampleMetadataWriteResponse,
     SampleStudyFieldPatchRequest,
     SampleUniqueFieldRef,
+    StudyListItem,
+    StudyListResponse,
     StudyScopedBiosampleResponse,
     Tier,
 )
 
 from ..auth.guards import (
     METADATA_BYPASS_ROLE,
+    caller_bypasses_ownership,
     caller_metadata_tiers,
+    require_biosample_exists,
+    require_caller_owns,
     require_complete_profile,
     require_eligible_owner,
     require_human,
@@ -72,6 +80,8 @@ from ..auth.guards import (
     require_scope,
     require_study_access,
     require_study_exists,
+    resource_not_found_detail,
+    resource_retired_detail,
 )
 from ..auth.principal import HumanUser, Principal
 from ..deps import TxConnFactory, get_db_pool, get_snapshot_conn_factory, get_tx_conn_factory
@@ -82,10 +92,12 @@ from ..repositories._sample_helpers import (
     StudyFieldNotUniqueInStudyError,
     UniqueInStudyViolation,
     classify_unique_in_study_violation,
+    fetch_active_studies_for_entity,
     fetch_global_fields,
     fetch_global_metadata,
     fetch_study_fields_for_study,
     fetch_visible_metadata_last_change,
+    insert_entity_to_study,
     insert_new_entities_metadata_batch,
     write_resolved_metadata_entries,
 )
@@ -112,7 +124,9 @@ from ._helpers import (
     GENERIC_FK_VIOLATION,
     IF_MATCH_HEADER,
     SAMPLE_METADATA_WRITE_ERRORS,
+    SAMPLE_STUDIES_HARD_CAP,
     build_idxs_list_response,
+    cap_rows,
     create_and_map_study_field,
     detail_for_retired_unique_field_entity,
     detail_for_unique_field_miss,
@@ -141,6 +155,10 @@ global_field_router = APIRouter(prefix=PATH_BIOSAMPLE_GLOBAL_FIELD_PREFIX, tags=
 
 
 _MSG_OWNER_NOT_ELIGIBLE = "owner is not eligible to own biosamples"
+# The role that both the study gate and the ownership check of a biosample-study
+# link let through, so the wet lab can link a plate's controls into every study
+# that shared the plate.
+_BIOSAMPLE_LINK_BYPASS_ROLE = SystemRole.WET_LAB_ADMIN
 
 # Map of biosample-level constraint names import_biosample_from_owner_biosample_id
 # can trip. The owner-id field's own uniqueness index is the same exception class
@@ -761,7 +779,7 @@ async def _read_study_scoped_biosample(
         entity_idx=biosample_idx,
         metadata_idx_column="idx",
         study_idx=study_idx,
-        noun="biosample",
+        noun=BIOSAMPLE_METADATA_SPEC.entity_kind,
         tiers=tiers,
         not_found_detail=not_found_detail,
     )
@@ -826,7 +844,7 @@ async def lookup_biosample_in_study_by_unique_field(
             study_idx=study_idx,
             display_name=body.unique_field_display_name,
             value=body.unique_field_value,
-            noun="biosample",
+            noun=BIOSAMPLE_METADATA_SPEC.entity_kind,
             tiers=tiers,
         )
         return await _read_study_scoped_biosample(
@@ -837,7 +855,7 @@ async def lookup_biosample_in_study_by_unique_field(
             caller_system_role=user.system_role,
             tiers=tiers,
             not_found_detail=detail_for_unique_field_miss(
-                noun="biosample",
+                noun=BIOSAMPLE_METADATA_SPEC.entity_kind,
                 study_idx=study_idx,
                 display_name=body.unique_field_display_name,
                 value=body.unique_field_value,
@@ -897,6 +915,81 @@ async def get_biosample_in_study(
         )
 
 
+@router.post(PATH_BIOSAMPLE_STUDY_LINK, status_code=201)
+async def create_biosample_study_link(
+    study_idx: Annotated[int, Field(gt=0)],
+    biosample_idx: Annotated[int, Field(gt=0)],
+    tx: TxConnFactory = Depends(get_tx_conn_factory),
+    user: HumanUser = Depends(require_complete_profile),
+    _scope: Principal = Depends(require_scope(Scope.BIOSAMPLE_WRITE)),
+    _exists: None = Depends(require_study_exists),
+    _access: None = Depends(
+        require_study_access(min_tier=Tier.ADMIN, bypass_role=_BIOSAMPLE_LINK_BYPASS_ROLE)
+    ),
+) -> BiosampleStudyLinkResponse:
+    """Link an existing biosample into the path's study.
+
+    The caller needs Tier.ADMIN on the study (study owner included) and must own
+    the biosample; a wet_lab_admin+ needs neither. 403 below the tier; 404 on a
+    missing study, and the same 404 for a missing biosample and for one that the
+    caller does not own; 409 on a retired biosample or on any existing link for
+    the pair, retired or not.
+    """
+    async with tx() as conn:
+        # The share lock holds from the ownership check through commit, so an
+        # owner change or retirement cannot land between the check and the
+        # insert; it leaves other inserts that reference the biosample unblocked.
+        row = await fetch_biosample(conn, biosample_idx, lock="share")
+        if not caller_bypasses_ownership(user, _BIOSAMPLE_LINK_BYPASS_ROLE):
+            owner_idx = None if row is None else row["owner_idx"]
+            require_caller_owns(
+                owner_idx,
+                caller_idx=user.principal_idx,
+                resource_label=BIOSAMPLE_METADATA_SPEC.entity_kind,
+                resource_idx=biosample_idx,
+                hide_unowned=True,
+            )
+
+        # A bypass caller skipped the ownership check, so existence is checked
+        # here too.
+        if row is None:
+            raise HTTPException(
+                status_code=404,
+                detail=resource_not_found_detail(
+                    BIOSAMPLE_METADATA_SPEC.entity_kind, biosample_idx
+                ),
+            )
+        if row["retired"]:
+            raise HTTPException(
+                status_code=409,
+                detail=resource_retired_detail(BIOSAMPLE_METADATA_SPEC.entity_kind, biosample_idx),
+            )
+
+        # The primary key is the link table's only unique constraint.
+        try:
+            created_at = await insert_entity_to_study(
+                conn,
+                spec=BIOSAMPLE_METADATA_SPEC,
+                entity_idx=biosample_idx,
+                study_idx=study_idx,
+                created_by_idx=user.principal_idx,
+            )
+        except asyncpg.UniqueViolationError as exc:
+            raise_for_unique_violation(
+                exc,
+                constraint_messages={},
+                generic=f"{BIOSAMPLE_METADATA_SPEC.entity_kind} {biosample_idx} is already linked to study {study_idx} (the link may be retired)",  # noqa: E501
+            )
+
+    link_response = BiosampleStudyLinkResponse(
+        biosample_idx=biosample_idx,
+        study_idx=study_idx,
+        created_by_idx=user.principal_idx,
+        created_at=created_at,
+    )
+    return link_response
+
+
 # Keep this ahead of the {biosample_idx} form below: both are PATCH on the same
 # path shape, and the literal segment is unreachable once the parameterized one
 # is registered first.
@@ -952,7 +1045,7 @@ async def patch_biosample_metadata_by_unique_field(
             study_idx=study_idx,
             display_name=body.unique_field_display_name,
             value=body.unique_field_value,
-            noun="biosample",
+            noun=BIOSAMPLE_METADATA_SPEC.entity_kind,
             tiers=tiers,
         )
         written = await resolve_and_write_study_scoped_metadata(
@@ -962,19 +1055,19 @@ async def patch_biosample_metadata_by_unique_field(
             entity_idx=biosample_idx,
             metadata_idx_column="idx",
             study_idx=study_idx,
-            noun="biosample",
+            noun=BIOSAMPLE_METADATA_SPEC.entity_kind,
             metadata=body.metadata,
             caller_idx=user.principal_idx,
             tiers=tiers,
             global_internal_names=body.global_internal_names,
             unlinked_detail=detail_for_unique_field_miss(
-                noun="biosample",
+                noun=BIOSAMPLE_METADATA_SPEC.entity_kind,
                 study_idx=study_idx,
                 display_name=body.unique_field_display_name,
                 value=body.unique_field_value,
             ),
             retired_detail=detail_for_retired_unique_field_entity(
-                noun="biosample",
+                noun=BIOSAMPLE_METADATA_SPEC.entity_kind,
                 study_idx=study_idx,
                 display_name=body.unique_field_display_name,
                 value=body.unique_field_value,
@@ -1040,7 +1133,7 @@ async def patch_biosample_metadata(
             entity_idx=biosample_idx,
             metadata_idx_column="idx",
             study_idx=study_idx,
-            noun="biosample",
+            noun=BIOSAMPLE_METADATA_SPEC.entity_kind,
             metadata=body.metadata,
             caller_idx=user.principal_idx,
             tiers=await caller_metadata_tiers(conn, user),
@@ -1125,6 +1218,41 @@ def _study_scoped_response_from_row(
         "caller_system_role": caller_system_role,
     }
     return StudyScopedBiosampleResponse.model_validate(payload)
+
+
+# same-pattern-ok: cross-entity twin of list_studies_for_prep_sample.
+@biosample_router.get(PATH_BIOSAMPLE_STUDY_LIST)
+async def list_studies_for_biosample(
+    biosample_idx: Annotated[int, Field(gt=0)],
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    user: HumanUser = Depends(require_human),
+    _scope: Principal = Depends(require_scope(Scope.BIOSAMPLE_READ)),
+    _role: Principal = Depends(require_role_at_least(SystemRole.WET_LAB_ADMIN)),
+    _exists: None = Depends(require_biosample_exists),
+) -> StudyListResponse:
+    """List the studies that this biosample is actively linked to, ascending by
+    study_idx, each with its BioProject and ENA study accessions.
+
+    Caller must be a HumanUser with Scope.BIOSAMPLE_READ and system_role at
+    least wet_lab_admin. require_biosample_exists fires a 404 before the read
+    runs. Retired biosample_to_study links are excluded. The `truncated` flag
+    indicates the underlying set exceeded the hard cap.
+    """
+    # Over-fetch by one so cap_rows can tell a full page from a cut one.
+    rows = await fetch_active_studies_for_entity(
+        pool,
+        spec=BIOSAMPLE_METADATA_SPEC,
+        entity_idx=biosample_idx,
+        limit=SAMPLE_STUDIES_HARD_CAP + 1,
+    )
+    rows, truncated = cap_rows(rows, SAMPLE_STUDIES_HARD_CAP)
+    study_list = StudyListResponse(
+        studies=[StudyListItem.model_validate(dict(r)) for r in rows],
+        count=len(rows),
+        truncated=truncated,
+        caller_system_role=user.system_role,
+    )
+    return study_list
 
 
 @biosample_router.get(PATH_BIOSAMPLE_BY_IDX)
@@ -1394,22 +1522,27 @@ async def patch_biosample(
     async with tx() as conn:
         try:
             # Preflight: existence -> 404, retirement -> 409, ETag -> 412.
-            # for_update=True acquires a row-level lock for the rest of
-            # the transaction so a concurrent PATCH on the same row
-            # serializes here instead of racing through the ETag check
-            # and silently overwriting the first writer's update.
-            row = await fetch_biosample(conn, biosample_idx, for_update=True)
+            # The update lock holds for the rest of the transaction so a
+            # concurrent PATCH on the same row serializes here instead of
+            # racing through the ETag check and silently overwriting the
+            # first writer's update.
+            row = await fetch_biosample(conn, biosample_idx, lock="update")
             # Retirement is biosample-specific; absent / stale-ETag is
             # the shared post-FOR-UPDATE preflight every PATCH runs.
             if row is not None and row["retired"]:
-                raise HTTPException(status_code=409, detail=f"biosample {biosample_idx} is retired")
+                raise HTTPException(
+                    status_code=409,
+                    detail=resource_retired_detail(
+                        BIOSAMPLE_METADATA_SPEC.entity_kind, biosample_idx
+                    ),
+                )
             # If-Match carries the ETag of GET /biosample/{idx}, which also
             # covers that GET's global metadata.
             tiers = await caller_metadata_tiers(conn, caller)
             require_etag_match(
                 row,
                 if_match=if_match,
-                label="biosample",
+                label=BIOSAMPLE_METADATA_SPEC.entity_kind,
                 row_idx=biosample_idx,
                 metadata_last_change=await fetch_visible_metadata_last_change(
                     conn, spec=BIOSAMPLE_METADATA_SPEC, entity_idx=biosample_idx, tiers=tiers

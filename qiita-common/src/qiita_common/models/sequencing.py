@@ -21,7 +21,12 @@ from pydantic import (
 )
 from pydantic.types import Base64Bytes
 
-from qiita_common.auth_constants import MAX_NAME_LENGTH, MAX_VERSION_LENGTH, SystemRole
+from qiita_common.auth_constants import (
+    MAX_NAME_LENGTH,
+    MAX_REASON_LENGTH,
+    MAX_VERSION_LENGTH,
+    SystemRole,
+)
 from qiita_common.models._base import (
     AccessionText,
     MetadataRequestModel,
@@ -1214,7 +1219,9 @@ class MaskDefinitionStatusUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     status: MaskDefinitionStatus
-    reason: Annotated[str | None, Field(default=None, min_length=1, max_length=2000)] = None
+    reason: Annotated[
+        str | None, Field(default=None, min_length=1, max_length=MAX_REASON_LENGTH)
+    ] = None
     superseded_by: Annotated[int | None, Field(default=None, gt=0)] = None
 
     @model_validator(mode="after")
@@ -1248,7 +1255,9 @@ class MaskSampleStatusUpdate(BaseModel):
 
     prep_sample_idx: Annotated[list[Annotated[int, Field(gt=0)]], Field(min_length=1)]
     state: Literal["completed", "invalidated"]
-    reason: Annotated[str | None, Field(default=None, min_length=1, max_length=2000)] = None
+    reason: Annotated[
+        str | None, Field(default=None, min_length=1, max_length=MAX_REASON_LENGTH)
+    ] = None
 
     @model_validator(mode="after")
     def _reason_required_to_invalidate(self) -> MaskSampleStatusUpdate:
@@ -1338,7 +1347,9 @@ class AlignmentDefinitionStatusUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     status: AlignmentDefinitionStatus
-    reason: Annotated[str | None, Field(default=None, min_length=1, max_length=2000)] = None
+    reason: Annotated[
+        str | None, Field(default=None, min_length=1, max_length=MAX_REASON_LENGTH)
+    ] = None
     superseded_by: Annotated[int | None, Field(default=None, gt=0)] = None
 
     @model_validator(mode="after")
@@ -1365,7 +1376,9 @@ class AlignmentSampleStatusUpdate(BaseModel):
 
     prep_sample_idx: Annotated[list[Annotated[int, Field(gt=0)]], Field(min_length=1)]
     state: Literal["completed", "invalidated"]
-    reason: Annotated[str | None, Field(default=None, min_length=1, max_length=2000)] = None
+    reason: Annotated[
+        str | None, Field(default=None, min_length=1, max_length=MAX_REASON_LENGTH)
+    ] = None
 
     @model_validator(mode="after")
     def _reason_required_to_invalidate(self) -> AlignmentSampleStatusUpdate:
@@ -1395,6 +1408,17 @@ class AlignmentSampleStatusUpdateResponse(BaseModel):
     skipped_pending: list[int] = []
 
 
+class AlignmentPlanAbandonRequest(BaseModel):
+    """Optional body for POST /api/v1/alignment-definition/{alignment_idx}/abandon-plan.
+
+    `allow_rearmed` lets the call abandon a block that rerun-block re-armed and that
+    has not completed again; the route refuses one otherwise."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    allow_rearmed: bool = False
+
+
 class AlignmentPlanAbandonResponse(BaseModel):
     """Returned by POST /api/v1/alignment-definition/{alignment_idx}/abandon-plan.
 
@@ -1409,6 +1433,62 @@ class AlignmentPlanAbandonResponse(BaseModel):
     abandoned_block_idx: list[int]
     cancelled_work_ticket_idx: list[int]
     cleared_prep_sample_idx: list[int]
+    rows_deleted: int
+
+
+class AlignmentRerunBlockRequest(BaseModel):
+    """Body for POST /api/v1/alignment-definition/{alignment_idx}/rerun-block.
+
+    One align block ticket per call. `allow_deprecated_mask` lets a ticket whose
+    mask has since been deprecated run again; the route refuses it on an active
+    mask."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    work_ticket_idx: Annotated[int, Field(gt=0)]
+    reason: Annotated[str, Field(min_length=1, max_length=MAX_REASON_LENGTH)]
+    allow_deprecated_mask: bool = False
+
+
+class AlignmentRerunBlockResponse(BaseModel):
+    """Returned by POST /api/v1/alignment-definition/{alignment_idx}/rerun-block.
+
+    `rerun_of` is the state the ticket was re-armed from: `'completed'` (its block's
+    rows are replaced) or `'failed'` (a failed re-run, retried). `pending_prep_sample_idx`
+    are the prep_samples whose gate went from `'completed'` to `'pending'`;
+    reconcile sets them back once every block covering them is completed.
+    `step_rows_deleted` counts the ticket's `work_ticket_step` rows the call removed."""
+
+    alignment_idx: Annotated[int, Field(gt=0)]
+    work_ticket_idx: Annotated[int, Field(gt=0)]
+    block_idx: Annotated[int, Field(gt=0)]
+    rerun_of: Literal[WorkTicketState.COMPLETED, WorkTicketState.FAILED]
+    mask_override: bool
+    pending_prep_sample_idx: list[int]
+    step_rows_deleted: int
+
+
+class AlignmentPurgeSampleRowsRequest(BaseModel):
+    """Body for POST /api/v1/alignment-definition/{alignment_idx}/purge-sample-rows.
+
+    `prep_sample_idx` may be 0: rows whose prep_sample_idx was zeroed carry it, and
+    no prep_sample has it."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    prep_sample_idx: Annotated[int, Field(ge=0)]
+    reason: Annotated[str, Field(min_length=1, max_length=MAX_REASON_LENGTH)]
+
+
+class AlignmentPurgeSampleRowsResponse(BaseModel):
+    """Returned by POST /api/v1/alignment-definition/{alignment_idx}/purge-sample-rows.
+
+    `rows_deleted` counts the `alignment` rows deleted. The pair's
+    `alignment_origin_spanning` rows are deleted too and not counted (`delete_alignment_sample`
+    in the data plane's `lake_edit.rs`)."""
+
+    alignment_idx: Annotated[int, Field(gt=0)]
+    prep_sample_idx: Annotated[int, Field(ge=0)]
     rows_deleted: int
 
 
