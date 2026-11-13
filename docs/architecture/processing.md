@@ -327,3 +327,34 @@ Each service exposes a health check endpoint for monitoring and deployment verif
 ## Work Ticket Queue
 
 Postgres-based (`SELECT ... FOR UPDATE SKIP LOCKED`). Work tickets created by qiita-control-plane. Work ticket state transitions driven by callbacks from data plane and compute orchestrator.
+
+## Similar definitions
+
+A mask, an alignment or a processing is a definition minted from its params, so a
+changed setting mints a new one and its samples split across the two. A system_admin
+records whether two definitions of one kind are `similar` (`qiita.definition_pair`,
+with its history in `qiita.definition_pair_event`; migration
+`20261113000000_definition_pair.sql`). The procedure is
+[`runbooks/deciding-similar-definitions.md`](../runbooks/deciding-similar-definitions.md).
+
+- **Groups are computed on read.** Nothing stores a group: `definition_similarity`
+  derives them from the definitions' params and the live pairs on each call (masks over
+  `similar` pairs; processings and alignments from grouped upstream references plus
+  explicit pairs). Its module docstring holds the rules and every refusal.
+- **The resolver** (`definition_resolver`) answers, for each prep_sample, which member of
+  a group its results are read from: `processed` under that member, `incomplete`, or
+  `not_processed`, with a reason. `POST /definition-group/resolve` exposes it to any
+  caller with `Tier.VIEWER` on every study of every sample. Its consumers are the
+  masked-read export (`GET /admin/sequenced-pool/{idx}/masked-read-export`), the SynDNA
+  count export, `qiita feature-table build` (one part per resolved alignment; see
+  [flight.md](flight.md)) and the human alignment cohort DoGet, which refuses a sample
+  that does not resolve to the alignment it names.
+- **The group lock** is one Postgres advisory lock over every kind's groups
+  (`repositories/definition_pair.py`). A decide or revoke takes it exclusive, by
+  try-lock with a bounded retry and a 503 when it stays busy; a resolution and the three
+  deprecation routes take it shared, before any definition row lock, so no decision
+  changes a group while a reader or a deprecation acts on it.
+- **Deprecation is refused while a `similar` pair names the definition**, and a revoke
+  while a downstream `similar` pair relies on it (`similar_pairs`, `relied_on`).
+  Deprecating does not take a definition out of its group; a sample resolving to it is
+  `not_processed`.

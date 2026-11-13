@@ -58,7 +58,7 @@ DoGet/DoPut/DoAction, compression, column projection, which mints are REST rathe
 
 ### [Processing and Work Tickets](architecture/processing.md)
 
-Auth and data-access flow, upload and processing, work ticket lifecycle, the orchestrator, health.
+Auth and data-access flow, upload and processing, work ticket lifecycle, the orchestrator, health, similar definitions.
 
 - [Auth & Data Access Flow](architecture/processing.md#auth--data-access-flow)
 - [Data Upload & Processing Workflow](architecture/processing.md#data-upload--processing-workflow)
@@ -67,6 +67,7 @@ Auth and data-access flow, upload and processing, work ticket lifecycle, the orc
 - [Compute Orchestrator](architecture/processing.md#compute-orchestrator)
 - [Health Checks](architecture/processing.md#health-checks)
 - [Work Ticket Queue](architecture/processing.md#work-ticket-queue)
+- [Similar definitions](architecture/processing.md#similar-definitions)
 
 ### [Storage and Topology](architecture/storage.md)
 
