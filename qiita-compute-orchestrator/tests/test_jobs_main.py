@@ -14,6 +14,7 @@ behavior per test.
 from __future__ import annotations
 
 import json
+import logging
 import stat
 import sys
 import types
@@ -21,6 +22,7 @@ from pathlib import Path
 
 import pytest
 from pydantic import BaseModel
+from qiita_common.step_log import summarize
 
 from qiita_compute_orchestrator.jobs import RESERVED_INPUT_KEYS
 from qiita_compute_orchestrator.jobs.__main__ import _flatten_params, main
@@ -65,6 +67,14 @@ def _write_params(input_path: Path, *, fastq_path: str, reference_idx: int, work
             output_path=str(input_path.parent / "output"),
         ).model_dump_json()
     )
+
+
+def _outcome(captured) -> dict:
+    """The outcome line: the last line of stderr, among the step's log lines, and
+    the whole of stdout, as the step's receipt."""
+    line = captured.err.strip().splitlines()[-1]
+    assert captured.out.strip() == line
+    return json.loads(line)
 
 
 def test_main_writes_manifest_and_chmods_on_success(monkeypatch, io_dirs):
@@ -114,6 +124,32 @@ def test_main_writes_manifest_and_chmods_on_success(monkeypatch, io_dirs):
     for p in (output_path / "manifest.parquet", output_path / "manifest.json"):
         mode = stat.S_IMODE(p.stat().st_mode)
         assert mode == 0o440, f"{p.name}: expected 0o440, got {mode:#o}"
+
+
+def test_main_logs_the_step_and_prints_its_receipt(monkeypatch, io_dirs, capsys):
+    """A successful job's log lines carry its step name on stderr, and stdout is
+    one receipt line holding what it summarized."""
+    input_path, _ = io_dirs
+
+    async def execute(inputs, workspace):
+        logging.getLogger("qiita_compute_orchestrator.jobs.receipt").info("counted 3 things")
+        summarize(things=3)
+        out = workspace / "manifest.parquet"
+        out.write_bytes(b"P")
+        return {"manifest": out}
+
+    _install_stub(monkeypatch, short_name="receipt", execute_fn=execute)
+    _write_params(input_path, fastq_path="/tmp/x.fa", reference_idx=7, work_ticket_idx=99)
+
+    assert main(["--job", "receipt"]) == 0
+    captured = capsys.readouterr()
+    step = "fastq"
+    assert f"INFO {step}: counted 3 things" in captured.err
+    assert json.loads(captured.out) == {
+        "kind": "completed",
+        "step_name": step,
+        "summary": {"things": 3},
+    }
 
 
 def test_main_handles_directory_output(monkeypatch, io_dirs):
@@ -236,8 +272,7 @@ def test_main_returns_1_on_reserved_key_collision(reserved_key, monkeypatch, io_
     rc = main(["--job", "collision"])
     assert rc == 1
 
-    captured = capsys.readouterr()
-    err = json.loads(captured.err)
+    err = _outcome(capsys.readouterr())
     assert err["kind"] == "contract_violation"
     # Stderr carries the YAML step name from params.json, not the module path.
     assert err["step_name"] == "fastq"
@@ -274,7 +309,7 @@ def test_main_returns_1_on_post_success_manifest_failure(monkeypatch, io_dirs, c
 
     rc = main(["--job", "post_fail"])
     assert rc == 1
-    err = json.loads(capsys.readouterr().err)
+    err = _outcome(capsys.readouterr())
     assert err["kind"] == "contract_violation"
     # YAML step name from params.json, not the module path.
     assert err["step_name"] == "fastq"
@@ -304,7 +339,7 @@ def test_main_rejects_out_of_tree_output(monkeypatch, io_dirs, capsys):
 
     rc = main(["--job", "escapes"])
     assert rc == 1
-    err = json.loads(capsys.readouterr().err)
+    err = _outcome(capsys.readouterr())
     assert err["kind"] == "contract_violation"
     assert err["step_name"] == "fastq"
     assert "post-success manifest write failed" in err["reason"]
@@ -334,8 +369,7 @@ def test_main_returns_1_and_prints_structured_error_on_backend_failure(
     rc = main(["--job", "skeleton"])
     assert rc == 1
 
-    captured = capsys.readouterr()
-    err = json.loads(captured.err)
+    err = _outcome(capsys.readouterr())
     assert err["kind"] == "unknown_permanent"
     # YAML step name from params.json, not the module path; module path
     # stays in the reason text for operator-side debugging.
