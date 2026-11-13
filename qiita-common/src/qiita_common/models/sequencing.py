@@ -1717,6 +1717,53 @@ class ExportedProcessingResponse(BaseModel):
     export_processing_id: str
 
 
+class ExportedMaskProcessingRequest(BaseModel):
+    """Body for POST /api/v1/exported-processing/mask — mint (or recover) the public
+    handle for a mask, so a masked-read export can cite which mask produced each file
+    without carrying ``mask_idx``. system_admin + admin:masked_read_export only.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    mask_idx: Annotated[int, Field(gt=0)]
+
+
+class ExportedMaskProcessingResponse(BaseModel):
+    """Returned by POST /api/v1/exported-processing/mask.
+
+    ``export_processing_id`` (``QP<idx>``) shares its namespace with the alignment
+    kind's handles. ``mask_idx`` is echoed back from the request and goes in this
+    response only, never in the exported files.
+    """
+
+    mask_idx: Annotated[int, Field(gt=0)]
+    export_processing_id: str
+
+
+class ExportedMaskIdentifierRequest(BaseModel):
+    """Body for POST /api/v1/exported-identifier/mask — mint (or recover) the public
+    handle for each prep_sample masked under ``mask_idx``. Each
+    ``(mask_idx, prep_sample_idx)`` is one processed sample, which is what an
+    ``export_id`` stands for. system_admin + admin:masked_read_export only.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    mask_idx: Annotated[int, Field(gt=0)]
+    prep_sample_idx: PrepSampleCohort
+
+
+class ExportedMaskIdentifierResponse(BaseModel):
+    """Returned by POST /api/v1/exported-identifier/mask: one entry per distinct
+    requested prep_sample, ascending by prep_sample_idx. Every requested sample is
+    present or the request failed.
+    """
+
+    mask_idx: Annotated[int, Field(gt=0)]
+    identifiers: list[ExportedIdentifier]
+    count: Annotated[int, Field(ge=0)]
+
+
 class MaskedReadExportManifest(BaseModel):
     """Returned by GET /admin/sequenced-pool/{sequenced_pool_idx}/masked-read-export.
 

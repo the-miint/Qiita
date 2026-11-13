@@ -18,16 +18,27 @@ this manifest would describe.
 import asyncpg
 from fastapi import APIRouter, Depends, HTTPException
 from qiita_common.api_paths import (
+    PATH_EXPORTED_PROCESSING_MASK,
     PATH_EXPORTED_PROCESSING_PREFIX,
     PATH_EXPORTED_PROCESSING_ROOT,
 )
-from qiita_common.auth_constants import Scope
-from qiita_common.models import ExportedProcessingRequest, ExportedProcessingResponse
+from qiita_common.auth_constants import Scope, SystemRole
+from qiita_common.models import (
+    ExportedMaskProcessingRequest,
+    ExportedMaskProcessingResponse,
+    ExportedProcessingRequest,
+    ExportedProcessingResponse,
+)
 
-from ..auth.guards import require_human, require_scope
+from ..auth.guards import require_human, require_human_with_role, require_scope
 from ..auth.principal import HumanUser, Principal
 from ..deps import get_db_pool
-from ..repositories.exported_processing import ProcessingVanishedError, mint_exported_processing
+from ..repositories.exported_processing import (
+    ProcessingVanishedError,
+    mint_exported_mask_processing,
+    mint_exported_processing,
+)
+from ..repositories.mask_definition import MaskDefinitionDeprecated, MaskDefinitionNotFound
 from ._helpers import authorize_completed_alignment_cohort
 
 router = APIRouter(prefix=PATH_EXPORTED_PROCESSING_PREFIX, tags=["exported-processing"])
@@ -90,5 +101,36 @@ async def mint_exported_processing_handle(
 
     return ExportedProcessingResponse(
         alignment_idx=row["alignment_idx"],
+        export_processing_id=row["export_processing_id"],
+    )
+
+
+@router.post(PATH_EXPORTED_PROCESSING_MASK, status_code=201)
+async def mint_exported_mask_processing_handle(
+    body: ExportedMaskProcessingRequest,
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    caller: HumanUser = Depends(require_human_with_role(SystemRole.SYSTEM_ADMIN)),
+    _scope: Principal = Depends(require_scope(Scope.ADMIN_MASKED_READ_EXPORT)),
+) -> ExportedMaskProcessingResponse:
+    """Mint the public handle for a mask, so a masked-read export can cite which mask
+    produced each file without naming our `mask_idx`.
+
+    Gated as the masked-read export routes in routes/admin.py are (system_admin plus
+    admin:masked_read_export): that export is the only reader of a mask handle.
+
+    **Idempotent.** Re-requesting a mask returns the handle it already has. 404 for
+    an unknown mask; 409 for a deprecated one, whose config is void.
+    """
+    try:
+        row = await mint_exported_mask_processing(
+            pool, mask_idx=body.mask_idx, created_by_idx=caller.principal_idx
+        )
+    except MaskDefinitionNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except MaskDefinitionDeprecated as exc:
+        raise HTTPException(status_code=409, detail=exc.detail) from exc
+
+    return ExportedMaskProcessingResponse(
+        mask_idx=row["mask_idx"],
         export_processing_id=row["export_processing_id"],
     )

@@ -6,6 +6,9 @@ from collections.abc import Sequence
 
 import asyncpg
 
+from .block import MASK_SAMPLE_COMPLETED
+from .mask_definition import lock_active_mask
+
 # Every caller-visible column, plus the accessions that ride along for
 # information. Both accessions are LEFT-joined and nullable: an unaccessioned
 # sample still gets an export_id, which is the point of having one.
@@ -16,18 +19,23 @@ import asyncpg
 # `sequenced_sample` is LEFT because a prep_sample of a future non-sequenced
 # processing kind has no subtype row at all; it cannot duplicate a row either,
 # since its `prep_sample_idx` is UNIQUE.
-_SELECT_LIVE = (
+#
+# `{kind_column}` is the processing column of the kind being read: `alignment_idx`
+# or `mask_idx`.
+_SELECT_LIVE_TEMPLATE = (
     "SELECT ei.prep_sample_idx, ei.export_id,"
     "       bs.biosample_accession, ss.ena_run_accession"
     "  FROM qiita.exported_identifier ei"
     "  JOIN qiita.prep_sample ps ON ps.idx = ei.prep_sample_idx"
     "  JOIN qiita.biosample bs ON bs.idx = ps.biosample_idx"
     "  LEFT JOIN qiita.sequenced_sample ss ON ss.prep_sample_idx = ps.idx"
-    " WHERE ei.alignment_idx = $1"
+    " WHERE ei.{kind_column} = $1"
     "   AND ei.prep_sample_idx = ANY($2::bigint[])"
     "   AND NOT ei.retired"
     " ORDER BY ei.prep_sample_idx"
 )
+_SELECT_LIVE = _SELECT_LIVE_TEMPLATE.format(kind_column="alignment_idx")
+_SELECT_LIVE_MASK = _SELECT_LIVE_TEMPLATE.format(kind_column="mask_idx")
 
 
 class IncompleteMintError(RuntimeError):
@@ -99,6 +107,73 @@ async def mint_exported_identifiers(
         rows = await conn.fetch(_SELECT_LIVE, alignment_idx, prep_sample_idxs)
 
     missing = _missing_from(rows, prep_sample_idxs)
+    if missing:
+        raise IncompleteMintError(missing)
+    return rows
+
+
+class MaskSampleNotCompleteError(RuntimeError):
+    """Cohort members that are not masked-complete under the mask, ascending.
+
+    An identifier names a processed sample, and a prep_sample whose `mask_sample`
+    state is not `'completed'` (or that has no gate row) has no masked read set yet.
+    """
+
+    def __init__(self, mask_idx: int, not_complete: list[int]) -> None:
+        self.mask_idx = mask_idx
+        self.not_complete = not_complete
+        super().__init__(
+            f"{len(not_complete)} prep_sample(s) are not masked-complete under mask"
+            f" {mask_idx}: {not_complete}"
+        )
+
+
+async def mint_exported_mask_identifiers(
+    pool: asyncpg.Pool,
+    *,
+    mask_idx: int,
+    prep_sample_idxs: list[int],
+    created_by_idx: int,
+) -> list[asyncpg.Record]:
+    """Ensure a live `export_id` exists for every `(mask_idx, prep_sample)` pair,
+    and return them ascending by prep_sample_idx.
+
+    The mask kind of `mint_exported_identifiers`, idempotent on the partial unique
+    index over live `(mask_idx, prep_sample_idx)` rows. In one transaction:
+
+    * `lock_active_mask` holds the mask row `FOR SHARE`, raising
+      `MaskDefinitionNotFound` or `MaskDefinitionDeprecated`;
+    * every cohort member must have `mask_sample.state = 'completed'` under the mask,
+      else `MaskSampleNotCompleteError` and nothing is minted;
+    * the INSERT and SELECT, then the same all-or-nothing check as the alignment
+      kind (`IncompleteMintError`).
+    """
+    cohort = sorted(set(prep_sample_idxs))
+    async with pool.acquire() as conn, conn.transaction():
+        await lock_active_mask(conn, mask_idx)
+        completed = await conn.fetch(
+            "SELECT prep_sample_idx FROM qiita.mask_sample"
+            " WHERE mask_idx = $1 AND prep_sample_idx = ANY($2::bigint[]) AND state = $3",
+            mask_idx,
+            cohort,
+            MASK_SAMPLE_COMPLETED,
+        )
+        not_complete = _missing_from(completed, cohort)
+        if not_complete:
+            raise MaskSampleNotCompleteError(mask_idx, not_complete)
+        await conn.execute(
+            "INSERT INTO qiita.exported_identifier"
+            "       (mask_idx, prep_sample_idx, created_by_idx)"
+            " SELECT $1, prep_sample_idx, $3"
+            "   FROM unnest($2::bigint[]) AS prep_sample_idx"
+            " ON CONFLICT (mask_idx, prep_sample_idx) WHERE NOT retired DO NOTHING",
+            mask_idx,
+            cohort,
+            created_by_idx,
+        )
+        rows = await conn.fetch(_SELECT_LIVE_MASK, mask_idx, cohort)
+
+    missing = _missing_from(rows, cohort)
     if missing:
         raise IncompleteMintError(missing)
     return rows

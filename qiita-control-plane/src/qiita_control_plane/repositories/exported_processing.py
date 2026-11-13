@@ -1,12 +1,16 @@
 """The idempotent mint for `qiita.exported_processing` — the public handle a
-published bundle's manifest cites in place of our `alignment_idx`.
+published bundle's manifest cites in place of our `alignment_idx` or `mask_idx`.
 
 Simpler than its two siblings: one row, no accession to prefer, no collision to
-arbitrate. See the migration `db/migrations/20260813000001_exported_processing.sql`
-for why the namespace is entirely minted.
+arbitrate. Two kinds: an alignment (`mint_exported_processing`) and a mask
+(`mint_exported_mask_processing`). See the migration
+`db/migrations/20260813000001_exported_processing.sql` for why the namespace is
+entirely minted.
 """
 
 import asyncpg
+
+from .mask_definition import lock_active_mask
 
 _SELECT_LIVE = (
     "SELECT alignment_idx, export_processing_id"
@@ -60,4 +64,40 @@ async def mint_exported_processing(
 
     if row is None:
         raise ProcessingVanishedError(alignment_idx)
+    return row
+
+
+async def mint_exported_mask_processing(
+    pool: asyncpg.Pool, *, mask_idx: int, created_by_idx: int
+) -> asyncpg.Record:
+    """Ensure a live `export_processing_id` exists for this mask, and return it as
+    `(mask_idx, export_processing_id)`.
+
+    Idempotent on the partial unique index over live mask rows, as
+    `mint_exported_processing` is on the alignment one.
+
+    The mask row is held `FOR SHARE` for the transaction (`lock_active_mask`), so a
+    deprecation or a delete cannot commit between the check and the INSERT. Raises
+    `MaskDefinitionNotFound` for an unknown mask and `MaskDefinitionDeprecated` for a
+    deprecated one: a deprecated config is void, and a new export must not cite it.
+    """
+    async with pool.acquire() as conn, conn.transaction():
+        await lock_active_mask(conn, mask_idx)
+        await conn.execute(
+            "INSERT INTO qiita.exported_processing (mask_idx, created_by_idx)"
+            " VALUES ($1, $2)"
+            " ON CONFLICT (mask_idx) WHERE NOT retired DO NOTHING",
+            mask_idx,
+            created_by_idx,
+        )
+        row = await conn.fetchrow(
+            "SELECT mask_idx, export_processing_id"
+            "  FROM qiita.exported_processing"
+            " WHERE mask_idx = $1 AND NOT retired",
+            mask_idx,
+        )
+    if row is None:
+        raise RuntimeError(
+            f"mask {mask_idx} has no live exported processing identifier after minting"
+        )
     return row
