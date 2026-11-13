@@ -1,16 +1,15 @@
 """The public exported-identifier map.
 
 `POST /exported-identifier` mints (or recovers) an `export_id` for every
-processed sample in a cohort, so a published feature table can name its samples
-without carrying ours. A control-plane route rather than anything the data plane
+processed prep_sample in a cohort, so a published feature table can name its
+prep_samples without carrying our ids. A control-plane route rather than anything the data plane
 can serve: the identifiers live only in Postgres, and minting one is a write.
 
 The alignment kind's cohort authorization is `authorize_completed_alignment_cohort`,
 shared with the human alignment mint: minting a ticket for a cohort and minting the
 public handles for that same cohort is one workflow, and two answers to "may I read
-this prep_sample" is how one surface comes to advertise what the other refuses. The
-mask kind
-(`POST /exported-identifier/mask`) is gated on system_admin and
+this prep_sample" is how one surface comes to advertise what the other refuses.
+The mask kind (`POST /exported-identifier/mask`) is gated on system_admin and
 `admin:masked_read_export`, as the masked-read export routes are.
 """
 

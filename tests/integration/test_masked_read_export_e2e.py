@@ -50,6 +50,8 @@ from qiita_common.models import (
     ExportedMaskProcessingRequest,
     MaskedReadExportTicketRequest,
     ReadMaskReason,
+    SampleResolutionReason,
+    SampleResolutionState,
 )
 from qiita_control_plane.repositories.block import MASK_SAMPLE_COMPLETED
 from qiita_control_plane.testing.db_teardown import teardown_entity_graph
@@ -105,7 +107,7 @@ async def _real_bridge(postgres_pool, secret: bytes, *, pool_idx: int, mask_idx:
     tickets: dict[tuple[int, int], str] = {}
     by_mask: dict[int, list[int]] = {}
     for sample in roster["samples"]:
-        if sample["resolution"]["state"] != "processed":
+        if sample["resolution"]["state"] != SampleResolutionState.PROCESSED:
             continue
         key = (sample["prep_sample_idx"], sample["resolution"]["definition_idx"])
         resp = await create_masked_read_export_ticket(
@@ -603,9 +605,18 @@ async def test_masked_read_export_e2e_across_a_mask_group(
     )
     by_prep = {s["prep_sample_idx"]: s["resolution"] for s in roster["samples"]}
     assert roster["group"] == [mask_1, mask_2]
-    assert (by_prep[ps_1]["state"], by_prep[ps_1]["definition_idx"]) == ("processed", mask_1)
-    assert (by_prep[ps_2]["state"], by_prep[ps_2]["definition_idx"]) == ("processed", mask_2)
-    assert (by_prep[ps_3]["state"], by_prep[ps_3]["reason"]) == ("not_processed", "no_run")
+    assert (by_prep[ps_1]["state"], by_prep[ps_1]["definition_idx"]) == (
+        SampleResolutionState.PROCESSED,
+        mask_1,
+    )
+    assert (by_prep[ps_2]["state"], by_prep[ps_2]["definition_idx"]) == (
+        SampleResolutionState.PROCESSED,
+        mask_2,
+    )
+    assert (by_prep[ps_3]["state"], by_prep[ps_3]["reason"]) == (
+        SampleResolutionState.NOT_PROCESSED,
+        SampleResolutionReason.NO_RUN,
+    )
 
     monkeypatch.setenv("QIITA_TOKEN", "qk_admin")
     monkeypatch.setattr(_common.httpx, "request", bridge)

@@ -2,23 +2,23 @@
 of a mask, alignment or processing group whose results are used, or why none is.
 The rules are stated here and nowhere else.
 
-**A run** of a definition for a sample is read from the definition's gate row
+**A run** of a definition for a prep_sample is read from the definition's gate row
 (`mask_sample`, `alignment_sample`, `assembly_sample`) and from the tickets that
 produce it:
-  - a prep_sample-scoped ticket that names the definition: the sample's newest such
+  - a prep_sample-scoped ticket that names the definition: the prep_sample's newest such
     ticket that is not cancelled (an older failed ticket that a later one
     superseded does not count);
-  - every block ticket whose block covers the sample and is not abandoned;
+  - every block ticket whose block covers the prep_sample and is not abandoned;
   - a long-read-assembly ticket, which records no processing_idx: it counts for the
     processing whose params equal the params that the runner mints for it,
     recomputed from the ticket with the runner's own builder.
   Cancelled tickets are ignored. A ticket counts only once the runner has written
   its definition on it (a per-sample ticket not yet started names none, so it does
-  not make a sample incomplete). A ticket is *unfinished* when it is waiting,
+  not make a prep_sample incomplete). A ticket is *unfinished* when it is waiting,
   running or failed.
 
 **Which member.** Of the anchor's group (`Groups.group_of`), the highest-id member
-under which the sample has a gate `completed`, `no_data` (assembly) or
+under which the prep_sample has a gate `completed`, `no_data` (assembly) or
 `invalidated`, or an unfinished ticket. A `pending` gate with no unfinished ticket
 (its tickets were cancelled) is not a run. No member → `not_processed` / `no_run`.
 
@@ -31,9 +31,9 @@ under which the sample has a gate `completed`, `no_data` (assembly) or
   4. an upstream definition deprecated → `not_processed` / `upstream_deprecated`.
      Upstreams: an alignment's and a processing's `mask_idx`, and a de novo
      alignment's `processing_idx` (`definition_similarity.upstream_leaves`).
-  5. each upstream, in that order, resolved for the sample in the upstream's group:
+  5. each upstream, in that order, resolved for the prep_sample in the upstream's group:
        - processed under another member → `incomplete` / `upstream_moved` (the
-         sample needs re-running on that other member);
+         prep_sample needs re-running on that other member);
        - incomplete → `incomplete` / `upstream_incomplete`;
        - not processed → `not_processed` / `upstream_withdrawn`,
          `upstream_deprecated` or `upstream_no_run`.
@@ -42,13 +42,12 @@ A not-processed member is not replaced by an older one.
 
 **Public API**:
   - `async resolve_group(conn, *, kind, definition_idx, prep_sample_idxs, groups=None)
-    -> GroupResolution`, in the caller's REPEATABLE READ transaction (the reads
-    span several statements); loads the groups when not given them. Raises
-    `DefinitionNotFound`.
+    -> GroupResolution`, in the caller's transaction, which must be REPEATABLE READ;
+    loads the groups when not given them. Raises `DefinitionNotFound`.
   - `GroupResolution.samples[prep_sample_idx] -> SampleResolution` (the
     qiita-common wire model) and `GroupResolution.not_resolved_to(idx)`.
   - `cohort_refusal(resolution, definition_idx)`: the `DefinitionGroupRefusal` for
-    a sample that is not processed under exactly `definition_idx`, or None.
+    a prep_sample that is not processed under exactly `definition_idx`, or None.
   - Pure core: `build_observations`, `match_assembly_tickets`, `resolve_sample`,
     `needed_definitions`.
 """
@@ -107,7 +106,7 @@ from .repositories.definition_run import (
     fetch_run_rows,
 )
 from .runner._mask import MASK_IDX_BINDING
-from .runner._processing import ASSEMBLER_BINDING, build_processing_params
+from .runner._processing import ASSEMBLER_BINDING, _build_processing_params
 
 __all__ = [
     "GroupResolution",
@@ -187,7 +186,7 @@ def _gate_role(kind: DefinitionKind, gate: str | None) -> _GateRole:
         raise ValueError(f"unknown {kind.value} gate state {gate!r}") from None
 
 
-# How an upstream's not-processed reason reads on the downstream sample.
+# How an upstream's not-processed reason reads on the downstream prep_sample.
 _UPSTREAM_NOT_PROCESSED = {
     SampleResolutionReason.NO_RUN: SampleResolutionReason.UPSTREAM_NO_RUN,
     SampleResolutionReason.UPSTREAM_NO_RUN: SampleResolutionReason.UPSTREAM_NO_RUN,
@@ -218,7 +217,7 @@ Observations = Mapping[DefinitionKind, Mapping[tuple[int, int], RunObservation]]
 def build_observations(rows: Iterable[RunRow]) -> dict[tuple[int, int], RunObservation]:
     """One kind's observations, keyed `(definition_idx, prep_sample_idx)`, from its
     gate rows and producing tickets (cancelled ones already excluded). Of a
-    sample's per-sample tickets only the newest counts; every block ticket counts."""
+    prep_sample's per-sample tickets only the newest counts; every block ticket counts."""
     gates: dict[tuple[int, int], str] = {}
     newest_sample_ticket: dict[tuple[int, int], tuple[int, WorkTicketState]] = {}
     block_tickets: dict[tuple[int, int], set[tuple[int, WorkTicketState]]] = {}
@@ -265,7 +264,7 @@ def match_assembly_tickets(
     out: list[RunRow] = []
     for c in candidates:
         bound = {**c.action_context, MASK_IDX_BINDING: c.mask_idx}
-        params = build_processing_params(
+        params = _build_processing_params(
             c.action_id,
             c.action_version,
             bound,
@@ -441,7 +440,7 @@ def cohort_refusal(
     resolution: SampleResolution, definition_idx: int
 ) -> DefinitionGroupRefusal | None:
     """None when `resolution` is `processed` under exactly `definition_idx`; else
-    why a cohort naming `definition_idx` may not include the sample."""
+    why a cohort naming `definition_idx` may not include the prep_sample."""
     if resolution.state is SampleResolutionState.PROCESSED:
         if resolution.definition_idx == definition_idx:
             return None
@@ -467,7 +466,7 @@ class GroupResolution:
     samples: Mapping[int, SampleResolution]
 
     def not_resolved_to(self, definition_idx: int) -> list[SampleResolution]:
-        """The samples not `processed` under exactly `definition_idx`, ascending."""
+        """The prep_samples not `processed` under exactly `definition_idx`, ascending."""
         return [r for r in self.samples.values() if cohort_refusal(r, definition_idx) is not None]
 
 
@@ -504,6 +503,14 @@ async def resolve_group(
     passing its own must have loaded it in this transaction. Raises
     DefinitionNotFound when `definition_idx` is not a `kind` definition."""
     require_transaction(conn)
+    # The gates, tickets and groups are read in several statements; below REPEATABLE
+    # READ each takes its own snapshot, and a gate read `pending` before its ticket
+    # completed would read as no run at all.
+    isolation = await conn.fetchval("SELECT current_setting('transaction_isolation')")
+    if isolation not in ("repeatable read", "serializable"):
+        raise RuntimeError(
+            f"resolve_group needs a REPEATABLE READ transaction; this one is {isolation!r}"
+        )
     if groups is None:
         groups = await load_groups(conn)
     if (kind, definition_idx) not in groups.definitions:

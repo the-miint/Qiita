@@ -347,8 +347,8 @@ migration `20261113000000_definition_pair.sql`). The procedure is
   the masked-read export roster and ticket routes, the SynDNA count export, `qiita
   feature-table build` (one part per resolved alignment; see [flight.md](flight.md))
   and the human alignment cohort DoGet; the ticket routes refuse a prep_sample that
-  does not resolve to the definition they name. A resolution spans several
-  statements, so its callers read in one REPEATABLE READ transaction.
+  does not resolve to the definition they name. `resolve_group` runs only in a
+  REPEATABLE READ transaction, and says why.
 - **The group lock** is one Postgres advisory lock over every kind's groups
   (`repositories/definition_pair.py`). A decide or revoke takes it exclusive, by
   try-lock with a bounded retry and a 503 when it stays busy; readers of the groups

@@ -704,17 +704,17 @@ async def export_masked_read_manifest(
     parts the qiita-admin masked-read-export CLI needs and its resolution across
     `mask_idx`'s group (`definition_resolver`): `processed` under which member, or
     `incomplete` / `not_processed` and why. The caller then mints a per-sample DoGet
-    ticket under each processed sample's member and streams its read_masked rows
+    ticket under each processed prep_sample's member and streams its read_masked rows
     from the data plane.
 
     Gated by system_admin PLUS admin:masked_read_export — the first human
     masked-read pull. `mask_idx` is mandatory (the data plane keys read_masked
     on (prep_sample_idx, mask_idx)). 404 if the pool or mask does not exist — an
     empty roster for a real pool is a valid answer, but a typo'd idx fails loudly
-    rather than masquerading as "no samples". 409 if the mask is deprecated.
+    rather than masquerading as "no prep_samples". 409 if the mask is deprecated.
     Entity-level prep_sample retirement is excluded (ps.retired = false);
     biosample_accession is surfaced even when NULL so the CLI fails loudly on an
-    unsubmitted sample rather than the route silently dropping it.
+    unsubmitted prep_sample rather than the route silently dropping it.
 
     One read-only snapshot, so the roster and its resolution see one state of the
     gates, tickets and pair decisions.

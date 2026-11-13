@@ -1608,7 +1608,7 @@ class MaskedReadExportSample(BaseModel):
     Only a `processed` prep_sample is exported, from `resolution.definition_idx`; the
     others are listed with their reason.
 
-    `mask_state` is the sample's completion gate under the manifest's own `mask_idx`
+    `mask_state` is the prep_sample's completion gate under the manifest's own `mask_idx`
     (`qiita.mask_sample.state`, see `MaskSampleState`), or `None` when no gate row
     exists there. It says nothing about the other members of the group.
     """
@@ -1759,7 +1759,7 @@ class ExportedMaskProcessingResponse(BaseModel):
 class ExportedMaskIdentifierRequest(BaseModel):
     """Body for POST /api/v1/exported-identifier/mask — mint (or recover) the public
     handle for each prep_sample masked under ``mask_idx``. Each
-    ``(mask_idx, prep_sample_idx)`` is one processed sample, which is what an
+    ``(mask_idx, prep_sample_idx)`` is one processed prep_sample, which is what an
     ``export_id`` stands for. system_admin + admin:masked_read_export only.
     """
 
@@ -1771,7 +1771,7 @@ class ExportedMaskIdentifierRequest(BaseModel):
 
 class ExportedMaskIdentifierResponse(BaseModel):
     """Returned by POST /api/v1/exported-identifier/mask: one entry per distinct
-    requested prep_sample, ascending by prep_sample_idx. Every requested sample is
+    requested prep_sample, ascending by prep_sample_idx. Every requested prep_sample is
     present or the request failed.
     """
 

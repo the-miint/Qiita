@@ -2,7 +2,7 @@
 rows (`mask_sample`, `alignment_sample`, `assembly_sample`) and the work tickets that
 produce them.
 
-Nothing here decides a sample's state; `qiita_control_plane.definition_resolver`
+Nothing here decides a prep_sample's state; `qiita_control_plane.definition_resolver`
 does, from these rows.
 """
 
@@ -24,7 +24,7 @@ from qiita_common.models import DefinitionKind, WorkTicketState
 from .block import BLOCK_ABANDONED
 
 # Where a row came from: a gate row, a prep_sample-scoped ticket, or the ticket of a
-# block that covers the sample.
+# block that covers the prep_sample.
 SOURCE_GATE = "gate"
 SOURCE_SAMPLE_TICKET = "sample_ticket"
 SOURCE_BLOCK_TICKET = "block_ticket"
@@ -48,7 +48,7 @@ class _KindTables:
     gate_table: str
     gate_column: str
     # The work_ticket column naming the definition a producing ticket writes, and the
-    # actions that produce this kind's runs per sample and per block. A mask's column
+    # actions that produce this kind's runs per prep_sample and per block. A mask's column
     # is also written by tickets that consume a mask (assembly, align, align-denovo),
     # so the action filter is what keeps those out.
     ticket_column: str
@@ -85,14 +85,14 @@ async def fetch_run_rows(
     definition_idxs: Sequence[int],
     prep_sample_idxs: Sequence[int],
 ) -> list[RunRow]:
-    """Every gate row of `kind` for these definitions and samples, and every
+    """Every gate row of `kind` for these definitions and prep_samples, and every
     producing ticket that is not cancelled: prep_sample-scoped tickets naming the
-    definition, and the tickets of blocks that cover the sample and are not
+    definition, and the tickets of blocks that cover the prep_sample and are not
     abandoned. One statement, so gates and tickets are read from one snapshot.
 
     For `processing`, gate rows only; the tickets come from
-    `fetch_assembly_ticket_candidates`, a second statement, so a caller reading
-    both runs them in one REPEATABLE READ transaction."""
+    `fetch_assembly_ticket_candidates`, a second statement (`resolve_group` says
+    which isolation that needs)."""
     definitions = sorted(set(definition_idxs))
     samples = sorted(set(prep_sample_idxs))
     if not definitions or not samples:

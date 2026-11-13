@@ -398,9 +398,9 @@ async def get_syndna_read_count_route(
     404 when the mask does not exist or nothing matches; 409 when the named mask, or
     a member that a prep_sample resolved to, ran without SynDNA or with a different
     SynDNA reference than the named mask, when no selected prep_sample is processed,
-    or when a processed prep_sample has no counts; 413 above the roster cap. Every read is one
-    read-only snapshot holding the group lock SHARED, so neither a re-mask nor a
-    pair decision landing mid-request can mix two states into one table.
+    or when a processed prep_sample has no counts; 413 above the roster cap. Every
+    read is one read-only snapshot, so neither a re-mask nor a pair decision landing
+    mid-request can mix two states into one table.
     """
     if study_idx is None and sequenced_pool_idx is None and not prep_sample_idx:
         raise HTTPException(

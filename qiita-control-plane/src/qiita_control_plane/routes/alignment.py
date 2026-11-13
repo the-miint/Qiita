@@ -568,9 +568,9 @@ async def create_alignment_cohort_doget_ticket(
 
 
 def _not_resolved_http(alignment_idx: int, refused: list[SampleResolution]) -> HTTPException:
-    """409 for cohort samples that do not resolve to `alignment_idx`: a message, the
-    first refused sample's `DefinitionGroupRefusal` code, the count, and the first
-    few samples' resolutions. The caller passed the access check for every one of
+    """409 for cohort prep_samples that do not resolve to `alignment_idx`: a message, the
+    first refused prep_sample's `DefinitionGroupRefusal` code, the count, and the first
+    few prep_samples' resolutions. The caller passed the access check for every one of
     them, so naming what each resolves to discloses nothing it may not read; the
     list is truncated like every refusal built from a caller-named cohort."""
     shown = refused[:5]

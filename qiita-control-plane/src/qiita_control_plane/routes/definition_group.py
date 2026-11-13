@@ -35,7 +35,7 @@ async def resolve_definition_group_route(
     """Each requested prep_sample's state in the named definition's group:
     `processed` (and under which member), `incomplete` or `not_processed`, with the
     reason. 404 when the definition does not exist, before anything about the
-    cohort is said; 403 when the caller may not read every sample."""
+    cohort is said; 403 when the caller may not read every prep_sample."""
     async with pool.acquire() as conn, conn.transaction(isolation="repeatable_read", readonly=True):
         groups = await load_groups(conn)
         if (body.definition_kind, body.definition_idx) not in groups.definitions:

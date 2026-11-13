@@ -29,6 +29,19 @@ from qiita_control_plane.definition_similarity import (
     param_diff,
 )
 from qiita_control_plane.feature_table import denovo_alignment_processing_idx
+from qiita_control_plane.repositories.alignment_definition import (
+    ALIGNMENT_SAMPLE_COMPLETED,
+    ALIGNMENT_SAMPLE_PENDING,
+)
+from qiita_control_plane.repositories.assembly import (
+    ASSEMBLY_SAMPLE_COMPLETED,
+    ASSEMBLY_SAMPLE_NO_DATA,
+)
+from qiita_control_plane.repositories.block import (
+    MASK_SAMPLE_COMPLETED,
+    MASK_SAMPLE_INVALIDATED,
+    MASK_SAMPLE_PENDING,
+)
 from qiita_control_plane.repositories.definition_pair import DefinitionRow
 from qiita_control_plane.repositories.definition_run import (
     SOURCE_BLOCK_TICKET,
@@ -119,7 +132,7 @@ def similar(definitions, kind, a, b):
 
 
 def done():
-    return RunObservation(gate="completed")
+    return RunObservation(gate=MASK_SAMPLE_COMPLETED)
 
 
 def gate(state, *tickets):
@@ -174,7 +187,7 @@ def test_a_definition_outside_any_group_resolves_alone():
     "ticket_state", [WorkTicketState.PENDING, WorkTicketState.QUEUED, WorkTicketState.PROCESSING]
 )
 def test_a_waiting_or_running_ticket_under_the_newest_member_is_in_progress(ticket_state):
-    obs = {MASK: {(5, S): done(), (12, S): gate("pending", (77, ticket_state))}}
+    obs = {MASK: {(5, S): done(), (12, S): gate(MASK_SAMPLE_PENDING, (77, ticket_state))}}
     r = resolve(DEFS, PAIRS, MASK, 5, obs)
     assert (r.state, r.definition_idx, r.reason, r.work_ticket_idx) == (
         INCOMPLETE,
@@ -217,14 +230,14 @@ def test_a_block_ticket_in_each_state_over_a_pending_gate(ticket_state):
             source=SOURCE_GATE,
             definition_idx=5,
             prep_sample_idx=S,
-            state="completed",
+            state=MASK_SAMPLE_COMPLETED,
             work_ticket_idx=None,
         ),
         RunRow(
             source=SOURCE_GATE,
             definition_idx=12,
             prep_sample_idx=S,
-            state="pending",
+            state=MASK_SAMPLE_PENDING,
             work_ticket_idx=None,
         ),
         RunRow(
@@ -247,7 +260,9 @@ def test_an_unknown_gate_state_is_refused():
 def test_running_wins_over_failed_when_naming_the_ticket():
     obs = {
         MASK: {
-            (12, S): gate("pending", (70, WorkTicketState.PROCESSING), (90, WorkTicketState.FAILED))
+            (12, S): gate(
+                MASK_SAMPLE_PENDING, (70, WorkTicketState.PROCESSING), (90, WorkTicketState.FAILED)
+            )
         }
     }
     r = resolve(DEFS, PAIRS, MASK, 12, obs)
@@ -255,7 +270,9 @@ def test_running_wins_over_failed_when_naming_the_ticket():
 
 
 def test_a_same_version_rerun_over_a_completed_gate_is_incomplete():
-    obs = {ALIGNMENT: {(120, S): gate("completed", (80, WorkTicketState.PROCESSING))}}
+    obs = {
+        ALIGNMENT: {(120, S): gate(ALIGNMENT_SAMPLE_COMPLETED, (80, WorkTicketState.PROCESSING))}
+    }
     obs[MASK] = {(12, S): done()}
     r = resolve(DEFS, PAIRS, ALIGNMENT, 50, obs)
     assert (r.state, r.definition_idx, r.reason) == (INCOMPLETE, 120, R.IN_PROGRESS)
@@ -265,8 +282,8 @@ def test_a_rearmed_block_reads_as_incomplete():
     """rerun-block sets the completed gates back to pending and re-arms the block's
     ticket in place."""
     rows = [
-        RunRow(SOURCE_GATE, 120, S, "pending", None),
-        RunRow(SOURCE_BLOCK_TICKET, 120, S, "pending", 81),
+        RunRow(SOURCE_GATE, 120, S, ALIGNMENT_SAMPLE_PENDING, None),
+        RunRow(SOURCE_BLOCK_TICKET, 120, S, WorkTicketState.PENDING.value, 81),
     ]
     obs = {ALIGNMENT: build_observations(rows), MASK: {(12, S): done()}}
     r = resolve(DEFS, PAIRS, ALIGNMENT, 120, obs)
@@ -277,7 +294,10 @@ def test_a_pending_gate_whose_tickets_were_cancelled_is_not_a_run():
     """Cancelled tickets never reach the observations (the SQL drops them), so the
     gate they left pending has no unfinished ticket and is ignored."""
     obs = {
-        MASK: {(5, S): done(), **build_observations([RunRow(SOURCE_GATE, 12, S, "pending", None)])}
+        MASK: {
+            (5, S): done(),
+            **build_observations([RunRow(SOURCE_GATE, 12, S, MASK_SAMPLE_PENDING, None)]),
+        }
     }
     r = resolve(DEFS, PAIRS, MASK, 12, obs)
     assert (r.state, r.definition_idx) == (PROCESSED, 5)
@@ -289,7 +309,7 @@ def test_a_pending_gate_whose_tickets_were_cancelled_is_not_a_run():
 
 
 def test_a_withdrawn_run_is_not_processed_with_no_fallback():
-    obs = {MASK: {(5, S): done(), (12, S): gate("invalidated")}}
+    obs = {MASK: {(5, S): done(), (12, S): gate(MASK_SAMPLE_INVALIDATED)}}
     r = resolve(DEFS, PAIRS, MASK, 5, obs)
     assert (r.state, r.definition_idx, r.reason) == (NOT_PROCESSED, 12, R.WITHDRAWN)
 
@@ -310,7 +330,7 @@ def test_a_deprecated_upstream_mask_is_upstream_deprecated():
 
 def test_a_withdrawn_upstream_run_is_upstream_withdrawn():
     defs = [mask(5), block(50, 5)]
-    obs = {MASK: {(5, S): gate("invalidated")}, ALIGNMENT: {(50, S): done()}}
+    obs = {MASK: {(5, S): gate(MASK_SAMPLE_INVALIDATED)}, ALIGNMENT: {(50, S): done()}}
     r = resolve(defs, [], ALIGNMENT, 50, obs)
     assert (r.state, r.reason, r.upstream_definition_idx) == (
         NOT_PROCESSED,
@@ -352,7 +372,7 @@ def test_an_alignment_on_the_resolved_mask_is_processed_and_names_its_mask():
 
 def test_an_incomplete_upstream_makes_the_alignment_incomplete():
     obs = {
-        MASK: {(5, S): done(), (12, S): gate("pending", (60, WorkTicketState.QUEUED))},
+        MASK: {(5, S): done(), (12, S): gate(MASK_SAMPLE_PENDING, (60, WorkTicketState.QUEUED))},
         ALIGNMENT: {(50, S): done()},
     }
     r = resolve(DEFS, PAIRS, ALIGNMENT, 50, obs)
@@ -371,7 +391,7 @@ def test_an_incomplete_upstream_makes_the_alignment_incomplete():
 
 def test_assembly_no_data_counts_as_completed():
     defs = [mask(5), assembly(30, 5)]
-    obs = {MASK: {(5, S): done()}, PROCESSING: {(30, S): gate("no_data")}}
+    obs = {MASK: {(5, S): done()}, PROCESSING: {(30, S): gate(ASSEMBLY_SAMPLE_NO_DATA)}}
     r = resolve(defs, [], PROCESSING, 30, obs)
     assert (r.state, r.definition_idx, r.mask_idx) == (PROCESSED, 30, 5)
 
@@ -404,7 +424,7 @@ def test_a_denovo_alignment_on_a_deprecated_assembly_is_upstream_deprecated():
 
 def test_a_denovo_alignment_whose_assembly_is_rerunning_is_upstream_incomplete():
     defs, obs = _denovo_world()
-    obs[PROCESSING] = {(30, S): gate("completed", (44, WorkTicketState.FAILED))}
+    obs[PROCESSING] = {(30, S): gate(ASSEMBLY_SAMPLE_COMPLETED, (44, WorkTicketState.FAILED))}
     r = resolve(defs, [], ALIGNMENT, 60, obs)
     assert (r.state, r.reason, r.work_ticket_idx) == (INCOMPLETE, R.UPSTREAM_INCOMPLETE, 44)
 
@@ -430,16 +450,16 @@ def test_only_the_newest_per_sample_ticket_counts():
     incomplete; a failed re-run after a completed one does."""
     superseded = build_observations(
         [
-            RunRow(SOURCE_GATE, 12, S, "completed", None),
-            RunRow(SOURCE_SAMPLE_TICKET, 12, S, "failed", 10),
-            RunRow(SOURCE_SAMPLE_TICKET, 12, S, "completed", 11),
+            RunRow(SOURCE_GATE, 12, S, MASK_SAMPLE_COMPLETED, None),
+            RunRow(SOURCE_SAMPLE_TICKET, 12, S, WorkTicketState.FAILED.value, 10),
+            RunRow(SOURCE_SAMPLE_TICKET, 12, S, WorkTicketState.COMPLETED.value, 11),
         ]
     )
     assert superseded[(12, S)].unfinished == ()
     rerun_failed = build_observations(
         [
-            RunRow(SOURCE_SAMPLE_TICKET, 12, S, "completed", 10),
-            RunRow(SOURCE_SAMPLE_TICKET, 12, S, "failed", 11),
+            RunRow(SOURCE_SAMPLE_TICKET, 12, S, WorkTicketState.COMPLETED.value, 10),
+            RunRow(SOURCE_SAMPLE_TICKET, 12, S, WorkTicketState.FAILED.value, 11),
         ]
     )
     assert rerun_failed[(12, S)].unfinished == ((11, WorkTicketState.FAILED),)
@@ -448,9 +468,9 @@ def test_only_the_newest_per_sample_ticket_counts():
 def test_every_covering_block_ticket_counts():
     obs = build_observations(
         [
-            RunRow(SOURCE_BLOCK_TICKET, 12, S, "completed", 10),
-            RunRow(SOURCE_BLOCK_TICKET, 12, S, "failed", 11),
-            RunRow(SOURCE_BLOCK_TICKET, 12, S, "processing", 12),
+            RunRow(SOURCE_BLOCK_TICKET, 12, S, WorkTicketState.COMPLETED.value, 10),
+            RunRow(SOURCE_BLOCK_TICKET, 12, S, WorkTicketState.FAILED.value, 11),
+            RunRow(SOURCE_BLOCK_TICKET, 12, S, WorkTicketState.PROCESSING.value, 12),
         ]
     )
     assert obs[(12, S)].unfinished == (
@@ -461,14 +481,16 @@ def test_every_covering_block_ticket_counts():
 
 def test_a_ticket_row_without_a_ticket_id_is_refused():
     with pytest.raises(ValueError, match="no work_ticket_idx"):
-        build_observations([RunRow(SOURCE_SAMPLE_TICKET, 12, S, "failed", None)])
+        build_observations(
+            [RunRow(SOURCE_SAMPLE_TICKET, 12, S, WorkTicketState.FAILED.value, None)]
+        )
 
 
 def _candidate(**context):
     return AssemblyTicketCandidate(
         work_ticket_idx=99,
         prep_sample_idx=S,
-        state="processing",
+        state=WorkTicketState.PROCESSING.value,
         action_id="long-read-assembly",
         action_version="1.0.0",
         action_context=context,
@@ -502,7 +524,11 @@ def test_cohort_refusal_codes():
     no_run = resolve(DEFS, PAIRS, MASK, 5, {})
     assert cohort_refusal(no_run, 5) is DefinitionGroupRefusal.NOT_PROCESSED
     running = resolve(
-        DEFS, PAIRS, MASK, 5, {MASK: {(5, S): gate("pending", (1, WorkTicketState.QUEUED))}}
+        DEFS,
+        PAIRS,
+        MASK,
+        5,
+        {MASK: {(5, S): gate(MASK_SAMPLE_PENDING, (1, WorkTicketState.QUEUED))}},
     )
     assert cohort_refusal(running, 5) is DefinitionGroupRefusal.INCOMPLETE
 

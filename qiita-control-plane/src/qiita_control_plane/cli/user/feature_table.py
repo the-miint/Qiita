@@ -185,7 +185,7 @@ def _resolve_definition_group(
     definition_idx: int,
     prep_sample_idx: list[int],
 ) -> DefinitionGroupResolveResponse:
-    """POST /definition-group/resolve: the named definition's group and, per sample,
+    """POST /definition-group/resolve: the named definition's group and, per prep_sample,
     which member it is processed under or why it is not. The body goes through the
     route's request model, so the cohort cap is checked here rather than after a round
     trip, and the answer through its response model."""
@@ -854,7 +854,7 @@ def _manifest_parts(
     parts: Sequence[_Part], handles: dict[int, str], identifiers: list[dict[str, Any]]
 ) -> dict[str, Any]:
     """One arm's processing record: `parts`, one entry per part (its minted handle, its
-    verified `params_hash` and its aligner), and `sample_part`, each sample's `export_id`
+    verified `params_hash` and its aligner), and `sample_part`, each prep_sample's `export_id`
     mapped to the handle of the part it was read from.
 
     Parts are in `alignment_idx` order, so two builds over the same inputs write the
@@ -889,8 +889,8 @@ def _manifest_denovo(*, requested: bool, record: dict[str, Any] | None) -> dict[
     reference-only. Without this block a combined request and a reference-only request
     write byte-identical manifests.
 
-    `record` is `_manifest_parts` over the de novo parts, or None when no sample had an
-    arm. Its `sample_part` names only the samples with an arm, so their count is
+    `record` is `_manifest_parts` over the de novo parts, or None when no prep_sample had an
+    arm. Its `sample_part` names only the prep_samples with an arm, so their count is
     `prep_samples_with_a_de_novo_arm`.
     """
     if not requested:
@@ -1286,11 +1286,11 @@ def _resolve_cohort(
     *,
     per_pool: dict[tuple[int, int], set[int]],
 ) -> list[int]:
-    """The cohort to build over, ascending: the samples named on the command line, or
-    else every sample of the named pools that the caller may read and that is completed
+    """The cohort to build over, ascending: the prep_samples named on the command line, or
+    else every prep_sample of the named pools that the caller may read and that is completed
     for an alignment in `--alignment-idx`'s group.
 
-    The group comes from a resolve over the anchor's own completed samples, so the
+    The group comes from a resolve over the anchor's own completed prep_samples, so the
     anchor must have at least one in the named pools. An empty cohort is refused here:
     it is a legitimate answer from the cohort route, but it is not a table — both mints
     reject an empty cohort, so left alone this becomes a 422 naming a request body the
@@ -1338,8 +1338,8 @@ def _resolve_cohort(
 
 
 def _refuse_unprocessed(refused: list[SampleResolution], *, anchor: str) -> None:
-    """Refuse a cohort with samples that are not processed in `anchor`'s group, listing
-    each with its state. A feature table is built over processed samples only, and the
+    """Refuse a cohort with prep_samples that are not processed in `anchor`'s group, listing
+    each with its state. A feature table is built over processed prep_samples only, and the
     cohort is not narrowed: coverage is measured over the whole cohort, so a narrowed
     cohort is a different table."""
     if not refused:
@@ -1355,8 +1355,8 @@ def _refuse_unprocessed(refused: list[SampleResolution], *, anchor: str) -> None
 def _parts(
     resolution: DefinitionGroupResolveResponse, *, listing: dict[str, Any], reference_idx: int
 ) -> list[_Part]:
-    """The cohort's samples grouped into parts by the alignment each resolved to, in
-    `alignment_idx` order. Refuses an incomplete or not-processed sample
+    """The cohort's prep_samples grouped into parts by the alignment each resolved to, in
+    `alignment_idx` order. Refuses an incomplete or not-processed prep_sample
     (`_refuse_unprocessed`), a part whose alignment is over none of the named pools
     (`_member_summary`), and a part aligned against a different reference: the table is
     relabeled through one reference's genome map."""
@@ -1393,18 +1393,18 @@ def _plan_denovo(
     parts: list[_Part],
     cohort: list[int],
 ) -> list[_DenovoPart]:
-    """The de novo arm's parts: each cohort sample's de novo alignment, resolved in
+    """The de novo arm's parts: each cohort prep_sample's de novo alignment, resolved in
     `--denovo-alignment-idx`'s group, grouped by alignment in `alignment_idx` order.
 
-    A sample with no run in that group (`not_processed` / `no_run`) has no de novo arm
-    and stays reference-only, as a sample whose assembly produced no contigs does. Any
+    A prep_sample with no run in that group (`not_processed` / `no_run`) has no de novo arm
+    and stays reference-only, as a prep_sample whose assembly produced no contigs does. Any
     other unprocessed state is refused (`_refuse_unprocessed`).
 
-    Each de novo alignment is checked against the reference part of every sample that
+    Each de novo alignment is checked against the reference part of every prep_sample that
     resolved to it, and the named one against `--alignment-idx`, by
     `denovo_alignment_processing_idx` with the reference arm's mask group (from a resolve
     of its mask) as the admissible masks. The assembly runs that those alignments name are
-    then checked for deprecation, before the refusal of unprocessed samples, so a
+    then checked for deprecation, before the refusal of unprocessed prep_samples, so a
     deprecated run is named by the rule that owns its wording.
     """
     anchor = args.denovo_alignment_idx
@@ -1479,8 +1479,8 @@ def _run_build(
     """The recipe, on an open connection: discover, resolve, stage, compute, relabel,
     write. Returns the files written and the published table's row count.
 
-    **Parts.** The cohort may span pools, and each sample is resolved
-    (`/definition-group/resolve`) in `--alignment-idx`'s group; the samples are read
+    **Parts.** The cohort may span pools, and each prep_sample is resolved
+    (`/definition-group/resolve`) in `--alignment-idx`'s group; the prep_samples are read
     per resolved alignment, one part each, and the parts' streams are unioned before
     staging (`staged_streams`), so the analytic runs once over the whole cohort.
     Identifiers and the manifest's processing handles are minted per part.
@@ -1525,10 +1525,8 @@ def _run_build(
     )
 
     # The de novo arm, from the same merged listing that the reference arm came from,
-    # checked with `denovo_alignment_processing_idx` given the reference arm's mask
-    # group, so a de novo arm on any mask of that group is accepted. The feature-table
-    # runner and the service-account alignment DoGet call it without a group and still
-    # require the same mask_idx.
+    # checked with `denovo_alignment_processing_idx`, passing the reference arm's mask
+    # group so that a de novo arm on any mask of that group is accepted.
     requested_denovo = args.denovo_alignment_idx is not None
     denovo_parts: list[_DenovoPart] = []
     if requested_denovo:
@@ -1545,7 +1543,7 @@ def _run_build(
     _stage_genome_map(con, _fetch_genome_map(args.base_url, token, reference_idx=reference_idx))
     if requested_denovo:
         # One map per sample with a de novo alignment, folded into one relation with the
-        # sample key re-attached. A sample that assembled nothing 404s, and that is the
+        # prep_sample key re-attached. A prep_sample that assembled nothing 404s, and that is the
         # design's graceful path rather than an error: it simply has no de novo arm, so it
         # is skipped here and stays reference-only downstream.
         _stage_denovo_genome_map(
@@ -1568,7 +1566,7 @@ def _run_build(
         # **The de novo arm's cohort is the samples the MAP named, not the build's.**
         # Every de novo surface is asked for exactly these: the run-scoped lengths 404
         # for a sample with no run, and the alignment mint refuses a cohort member with
-        # no `alignment_sample` row — which is precisely a sample that assembled
+        # no `alignment_sample` row — which is precisely a prep_sample that assembled
         # nothing, since `align-denovo` ends NO_DATA for it and never opens a gate row.
         staged = set(_staged_denovo_samples(con))
         denovo_parts = [
@@ -1739,7 +1737,7 @@ def _run_build(
         coverage_threshold=args.coverage_threshold,
         combined=bool(denovo_parts),
     )
-    # The row labels are minted here rather than beside the sample labels above,
+    # The row labels are minted here rather than beside the prep_sample labels above,
     # because only now is the published genome set known — see `_published_genome_idxs`.
     _stage_exported_features(
         con,

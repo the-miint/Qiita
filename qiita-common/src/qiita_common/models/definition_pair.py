@@ -21,8 +21,7 @@ from qiita_common.auth_constants import MAX_REASON_LENGTH
 class DefinitionKind(StrEnum):
     """Which definition table a pair names (`qiita.definition_pair.definition_kind`).
 
-    Twin of a TEXT + CHECK column (`20261113000000_definition_pair.sql`), not a
-    Postgres ENUM.
+    Twin of that column's TEXT + CHECK, not a Postgres ENUM.
     """
 
     MASK = "mask"
@@ -34,8 +33,7 @@ class DefinitionPairVerdict(StrEnum):
     """A pair's decision (`qiita.definition_pair.verdict` and
     `qiita.definition_pair_event.verdict`).
 
-    Twin of a TEXT + CHECK column (`20261113000000_definition_pair.sql`), not a
-    Postgres ENUM.
+    Twin of that column's TEXT + CHECK, not a Postgres ENUM.
     """
 
     PENDING = "pending"
@@ -46,8 +44,7 @@ class DefinitionPairVerdict(StrEnum):
 class DefinitionPairEventType(StrEnum):
     """What a `qiita.definition_pair_event` row records.
 
-    Twin of a TEXT + CHECK column (`20261113000000_definition_pair.sql`), not a
-    Postgres ENUM.
+    Twin of that column's TEXT + CHECK, not a Postgres ENUM.
     """
 
     OPENED = "opened"

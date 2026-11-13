@@ -19,7 +19,9 @@ from qiita_common.actions import (
 )
 from qiita_common.api_paths import URL_DEFINITION_GROUP_RESOLVE
 from qiita_common.auth_constants import Scope
+from qiita_common.models import DefinitionKind
 
+from qiita_control_plane.definition_resolver import resolve_group
 from qiita_control_plane.repositories.assembly import ASSEMBLY_SAMPLE_COMPLETED
 from qiita_control_plane.repositories.block import add_block_members, create_block
 from qiita_control_plane.repositories.processing import mint_processing
@@ -449,3 +451,13 @@ async def test_resolve_rejects_an_empty_cohort_422(ctx, alignment_group_world):
         json=_body("alignment", alignment_group_world["align_1"], []),
     )
     assert resp.status_code == 422, resp.text
+
+
+async def test_resolve_group_refuses_a_read_committed_transaction(postgres_pool):
+    """The resolver reads gates, tickets and groups in several statements, so it
+    refuses a transaction in which each statement takes its own snapshot."""
+    async with postgres_pool.acquire() as conn, conn.transaction():
+        with pytest.raises(RuntimeError, match="REPEATABLE READ"):
+            await resolve_group(
+                conn, kind=DefinitionKind.MASK, definition_idx=1, prep_sample_idxs=[1]
+            )

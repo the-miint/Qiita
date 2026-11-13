@@ -432,8 +432,9 @@ def compute_groups(definitions: Iterable[DefinitionRow], pairs: Iterable[PairSta
 
 
 async def load_groups(conn: asyncpg.Connection) -> Groups:
-    """Groups as of now. Takes the group lock SHARED for the caller's transaction,
-    so no decision changes them before it ends."""
+    """Groups as of the caller's transaction (its snapshot, at REPEATABLE READ). Takes
+    the group lock SHARED until the transaction ends; `lock_groups_shared` says what
+    that holds off."""
     require_transaction(conn)
     await lock_groups_shared(conn)
     definitions = await fetch_definitions(conn)

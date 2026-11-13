@@ -196,7 +196,7 @@ async def test_the_runner_mint_reports_a_deprecated_config_as_bad_input(postgres
     turns it into a SUBMISSION/BAD_INPUT failure naming the reason.
 
     Mints through `_mint_processing_idx` rather than reusing the fixture's row:
-    the runner hashes exactly `build_processing_params`' four keys, so an
+    the runner hashes exactly `_build_processing_params`' four keys, so an
     identity minted any other way is a different row and the deprecation would be
     aimed at the wrong one.
     """

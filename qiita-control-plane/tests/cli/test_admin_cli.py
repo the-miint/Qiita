@@ -24,11 +24,13 @@ from qiita_common.api_paths import (
     URL_AUTH_WHOAMI,
 )
 from qiita_common.auth_constants import BEARER_PREFIX
+from qiita_common.models import DefinitionKind, SampleResolutionReason, SampleResolutionState
 
 from qiita_control_plane.cli.admin._helpers import (
     EXIT_PRECONDITION_FAILED,
     requires_database_url,
 )
+from qiita_control_plane.repositories.block import MASK_SAMPLE_COMPLETED
 
 # The return code the stub handler hands back, distinct from every code the
 # decorator itself can produce, so a passed-through code is unambiguous.
@@ -856,21 +858,23 @@ def _sample_handle(prep_sample_idx: int) -> str:
     return f"QM{500 + prep_sample_idx}"
 
 
-def _served_sample(sample: dict, mask_idx: int) -> dict:
-    """A roster row as the route serves it, from a terse fixture row: the
-    resolution keys (`state`, `reason`, `resolved_mask_idx`, `work_ticket_idx`) a
-    fixture may give are moved into `resolution`, defaulting to processed under the
-    named mask."""
-    row = dict(sample)
-    resolution = {
-        "prep_sample_idx": row["prep_sample_idx"],
-        "definition_kind": "mask",
-        "state": row.pop("state", "processed"),
-        "definition_idx": row.pop("resolved_mask_idx", mask_idx),
-        "reason": row.pop("reason", None),
-        "work_ticket_idx": row.pop("work_ticket_idx", None),
+def _resolution(prep_sample_idx: int, state, definition_idx, reason=None, ticket=None) -> dict:
+    """A roster row's `resolution`, as the route serves it."""
+    return {
+        "prep_sample_idx": prep_sample_idx,
+        "definition_kind": DefinitionKind.MASK.value,
+        "state": state.value,
+        "definition_idx": definition_idx,
+        "reason": None if reason is None else reason.value,
+        "work_ticket_idx": ticket,
     }
-    return {"mask_state": "completed", **row, "resolution": resolution}
+
+
+def _served_sample(sample: dict, mask_idx: int) -> dict:
+    """A roster row as the route serves it: a fixture row without a `resolution` is
+    processed under the named mask, with its gate there `completed`."""
+    resolution = _resolution(sample["prep_sample_idx"], SampleResolutionState.PROCESSED, mask_idx)
+    return {"mask_state": MASK_SAMPLE_COMPLETED, "resolution": resolution, **sample}
 
 
 def _fake_masked_export_http(manifest, mints=None):
@@ -1614,24 +1618,27 @@ _GROUP_ROSTER = {
             "prep_sample_idx": 43,
             "biosample_accession": "SAMN_B",
             "mask_state": None,
-            "resolved_mask_idx": 12,
+            "resolution": _resolution(43, SampleResolutionState.PROCESSED, 12),
         },
         {
             "prep_sample_idx": 44,
             "biosample_accession": "SAMN_C",
             "mask_state": None,
-            "state": "incomplete",
-            "reason": "in_progress",
-            "resolved_mask_idx": 12,
-            "work_ticket_idx": 99,
+            "resolution": _resolution(
+                44,
+                SampleResolutionState.INCOMPLETE,
+                12,
+                SampleResolutionReason.IN_PROGRESS,
+                ticket=99,
+            ),
         },
         {
             "prep_sample_idx": 45,
             "biosample_accession": None,
             "mask_state": None,
-            "state": "not_processed",
-            "reason": "no_run",
-            "resolved_mask_idx": None,
+            "resolution": _resolution(
+                45, SampleResolutionState.NOT_PROCESSED, None, SampleResolutionReason.NO_RUN
+            ),
         },
     ],
 }

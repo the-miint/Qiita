@@ -24,6 +24,8 @@ from qiita_common.models import (
     DefinitionKind,
     DefinitionPairVerdict,
     MaskDefinitionStatus,
+    SampleResolutionReason,
+    SampleResolutionState,
 )
 
 from qiita_control_plane.definition_similarity import decide_pair, open_pair
@@ -164,10 +166,16 @@ async def test_roster_resolves_each_sample_across_the_group(ctx, group, anchor):
         r = by_prep[group[ps]]["resolution"]
         return (r["state"], r["reason"], r["definition_idx"], r["work_ticket_idx"])
 
-    assert resolved("on_low") == ("processed", None, group["low"], None)
-    assert resolved("on_both") == ("processed", None, group["high"], None)
-    assert resolved("running") == ("incomplete", "in_progress", group["high"], group["ticket"])
-    assert resolved("none") == ("not_processed", "no_run", None, None)
+    state, reason = SampleResolutionState, SampleResolutionReason
+    assert resolved("on_low") == (state.PROCESSED, None, group["low"], None)
+    assert resolved("on_both") == (state.PROCESSED, None, group["high"], None)
+    assert resolved("running") == (
+        state.INCOMPLETE,
+        reason.IN_PROGRESS,
+        group["high"],
+        group["ticket"],
+    )
+    assert resolved("none") == (state.NOT_PROCESSED, reason.NO_RUN, None, None)
     # mask_state stays the gate under the mask the request named.
     expected_gate = {
         "low": {"on_low": "completed", "on_both": "completed", "running": "completed"},

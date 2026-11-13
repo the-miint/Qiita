@@ -301,7 +301,7 @@ def _count_masked(flight_client, ticket_bytes: bytes) -> int:
     return json.loads(results[0].body.to_pybytes())["count"]
 
 
-# The output directory's record of which sample and which mask each exported file
+# The output directory's record of which prep_sample and which mask each exported file
 # holds, by public handle: `{"files": {<file name>: {"export_id": "QM…",
 # "biosample_accession": …, "export_processing_id": "QP…"}}}`. Rewritten after each
 # prep_sample's files are committed. The overwrite check reads it: a file it names
@@ -352,7 +352,7 @@ def _candidate_names(stem: str, fmt: str) -> list[str]:
 def _mint_mask_handles(
     base_url: str, token: str, samples_by_mask: dict[int, list[int]]
 ) -> tuple[dict[int, str], dict[int, str]]:
-    """Mint (or recover) each mask's public handle and each sample's under its mask
+    """Mint (or recover) each mask's public handle and each prep_sample's under its mask
     (POST /exported-processing/mask, /exported-identifier/mask). Returns
     `({mask_idx: export_processing_id}, {prep_sample_idx: export_id})`."""
     processing_path = f"{PATH_EXPORTED_PROCESSING_PREFIX}{PATH_EXPORTED_PROCESSING_MASK}"
@@ -383,40 +383,40 @@ def _left_out_lines(samples: list[MaskedReadExportSample]) -> list[str]:
 
 
 def _handle_masked_read_export(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
-    """Export the masked reads of every (non-retired) sample on a sequenced_pool
+    """Export the masked reads of every (non-retired) prep_sample on a sequenced_pool
     that is processed in `--mask-idx`'s similarity group, each from the mask it
     resolved to, to per-sample files. system_admin only (admin:masked_read_export).
 
-    GETs the roster manifest, which resolves each sample across the group (409 when
-    `--mask-idx` is deprecated). A sample that is `incomplete` or `not_processed`
+    GETs the roster manifest, which resolves each prep_sample across the group (409 when
+    `--mask-idx` is deprecated). A prep_sample that is `incomplete` or `not_processed`
     is not exported; the run lists them, with the reason, on stderr after the
-    summary, and still exits 0 when every processed sample was exported. For each
-    processed sample it mints a just-in-time DoGet ticket under the sample's mask
+    summary, and still exits 0 when every processed prep_sample was exported. For each
+    processed prep_sample it mints a just-in-time DoGet ticket under the prep_sample's mask
     and streams its read_masked rows from the data plane straight to disk (parquet
     via a pyarrow ParquetWriter; fastq.gz via one shared miint DuckDB connection
-    reused across every sample) — so a large pool never buffers in memory or on an
+    reused across every prep_sample) — so a large pool never buffers in memory or on an
     intermediate disk hop. Per-sample writes are atomic and 0600.
 
     Before any download it mints the public handle of each mask exported from and
-    of each sample under its mask, and after each sample's files are committed it
-    records them in the output directory's manifest (`MANIFEST_NAME`): file name →
-    sample handle, biosample accession, mask handle.
+    of each prep_sample under its mask, and after each prep_sample's files are
+    committed it records them in the output directory's manifest (`MANIFEST_NAME`):
+    file name → prep_sample handle, biosample accession, mask handle.
 
     Fails loudly (exit 1, nothing written) when:
-      - a processed sample lacks a usable biosample_accession (missing — not yet
+      - a processed prep_sample lacks a usable biosample_accession (missing — not yet
         NCBI-submitted — or outside the safe charset), since the filename needs it;
       - an existing output file is recorded in the manifest under a different mask's
         handle: re-exporting it would replace one mask's reads with another's
         under the same name;
       - fastq output: any target file already exists (below).
 
-    Re-export of a file the manifest records under the same mask, or does not
-    record at all: idempotent for parquet — skipped when its
-    record count matches the data plane's (nothing changed), overwritten when the
-    counts differ — while fastq has no cheap on-disk count, so an existing fastq
-    target is refused up front rather than re-exported or overwritten.
+    A file that the manifest records under the same mask, or does not record, is
+    re-exported idempotently for parquet: skipped when its record count matches the
+    data plane's (nothing changed), overwritten when the counts differ. fastq has no
+    cheap on-disk count, so an existing fastq target is refused up front rather
+    than re-exported or overwritten.
 
-    A sample whose export fails because the data plane or the control plane is
+    A prep_sample whose export fails because the data plane or the control plane is
     unreachable is exported again from the start, for up to `--retry-seconds`
     (`_with_retry`).
 
@@ -483,8 +483,8 @@ def _handle_masked_read_export(args: argparse.Namespace, parser: argparse.Argume
         for line in _left_out_lines(left_out):
             print(f"  {line}", file=sys.stderr)
 
-    # Validate every exported sample's accession up front so an unsubmitted/odd
-    # sample fails the whole export before any download — never a partial output set.
+    # Validate every exported prep_sample's accession up front so an unsubmitted/odd
+    # prep_sample fails the whole export before any download — never a partial output set.
     bad = sorted(
         s.prep_sample_idx
         for s in processed
