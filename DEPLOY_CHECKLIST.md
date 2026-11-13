@@ -42,7 +42,7 @@ _None yet._
 - `20261112000000_host_taxon_id_not_required` makes `host_taxon_id` optional, and from the
   restart an absent value means no host. `dbmate` applies it; run the bucket-2 backfill
   first. (#864)
-- `20261113000000_definition_pair` adds `qiita.definition_pair` and `qiita.definition_pair_event`, empty, and `20261113000001_exported_processing_mask` adds a nullable `mask_idx` to `qiita.exported_processing` and `qiita.exported_identifier`, widening their one-processing CHECKs to it; no row changes. `dbmate` applies both. (#TBD)
+- `20261113000000_definition_pair` adds `qiita.definition_pair` and `qiita.definition_pair_event`, empty, and `20261113000001_exported_processing_mask` adds a nullable `mask_idx` to `qiita.exported_processing` and `qiita.exported_identifier`, widening their one-processing CHECKs to it; no row changes. `dbmate` applies both. (#874)
 
 ### 4. Deploy
 
@@ -50,7 +50,7 @@ _None yet._
 
 ### 5. Verify
 
-- `[operator]` (#TBD) As a system_admin with a PAT carrying `mask_definition:lifecycle`, `qiita-admin pair list` exits 0 and prints `0 pair(s)` on stderr (the definition-pair routes are mounted and the new table is readable).
+- `[operator]` (#874) As a system_admin with a PAT carrying `mask_definition:lifecycle`, `qiita-admin pair list` exits 0 and prints `0 pair(s)` on stderr (the definition-pair routes are mounted and the new table is readable).
 
 ### 6. After the deploy verifies green
 
@@ -59,12 +59,12 @@ _None yet._
 ### Notes (no host action)
 
 - (#863) `download-ena-study` 1.0.0 gains an optional `ena_run_accessions` through the normal `qiita-admin actions sync`, and the `held_not_downloaded` run status is no longer reported.
-- (#TBD) New: `/api/v1/admin/definition-pair` routes and `qiita-admin pair list|show|open|decide|revoke` (each pair gated on its kind's lifecycle scope; procedure in `docs/runbooks/deciding-similar-definitions.md`); `POST /api/v1/definition-group/resolve` (`prep_sample:read`); `POST /api/v1/exported-processing/mask` and `POST /api/v1/exported-identifier/mask` (system_admin, `admin:masked_read_export`).
-- (#TBD) `GET /admin/sequenced-pool/{idx}/masked-read-export` gains `group` and a per-row `resolution`; it and `POST /admin/masked-read-export/ticket` return 409 for a deprecated mask, and the ticket route returns 409 for a prep_sample that does not resolve to the mask it names. `qiita-admin masked-read-export` skips incomplete and not-processed prep_samples (listed on stderr, exit 0) and writes `masked-read-export.manifest.json` into the output directory.
-- (#TBD) `GET /mask-definition/{idx}/syndna-read-count` gains `samples[].mask_idx` and `left_out`, returns a partial table when some selected prep_samples are incomplete or not processed (previously a 409), and adds 409s for a group member with another SynDNA reference and for a selection with no processed prep_sample.
-- (#TBD) `POST /alignment/{idx}/ticket/doget` (human cohort DoGet) returns 409 (`reason` `resolved_elsewhere`, `incomplete` or `not_processed`) for a prep_sample that does not resolve to the named alignment, including one whose mask run is withdrawn or deprecated.
-- (#TBD) `PATCH /mask-definition/{idx}/status`, `/alignment-definition/{idx}/status` and `/processing/{idx}/status` return 409 (`similar_pairs`) when deprecating a definition that is a side of a `similar` pair.
-- (#TBD) `qiita feature-table build` manifest: `processing.parts` / `processing.sample_part` (and the same under `table.denovo`) replace `processing.export_processing_id` / `params_hash` / `aligner` and `denovo.requested_alignment_idx` / `processing_idx`; a script reading the old keys must be updated.
+- (#874) New: `/api/v1/admin/definition-pair` routes and `qiita-admin pair list|show|open|decide|revoke` (each pair gated on its kind's lifecycle scope; procedure in `docs/runbooks/deciding-similar-definitions.md`); `POST /api/v1/definition-group/resolve` (`prep_sample:read`); `POST /api/v1/exported-processing/mask` and `POST /api/v1/exported-identifier/mask` (system_admin, `admin:masked_read_export`).
+- (#874) `GET /admin/sequenced-pool/{idx}/masked-read-export` gains `group` and a per-row `resolution`; it and `POST /admin/masked-read-export/ticket` return 409 for a deprecated mask, and the ticket route returns 409 for a prep_sample that does not resolve to the mask it names. `qiita-admin masked-read-export` skips incomplete and not-processed prep_samples (listed on stderr, exit 0) and writes `masked-read-export.manifest.json` into the output directory.
+- (#874) `GET /mask-definition/{idx}/syndna-read-count` gains `samples[].mask_idx` and `left_out`, returns a partial table when some selected prep_samples are incomplete or not processed (previously a 409), and adds 409s for a group member with another SynDNA reference and for a selection with no processed prep_sample.
+- (#874) `POST /alignment/{idx}/ticket/doget` (human cohort DoGet) returns 409 (`reason` `resolved_elsewhere`, `incomplete` or `not_processed`) for a prep_sample that does not resolve to the named alignment, including one whose mask run is withdrawn or deprecated.
+- (#874) `PATCH /mask-definition/{idx}/status`, `/alignment-definition/{idx}/status` and `/processing/{idx}/status` return 409 (`similar_pairs`) when deprecating a definition that is a side of a `similar` pair.
+- (#874) `qiita feature-table build` manifest: `processing.parts` / `processing.sample_part` (and the same under `table.denovo`) replace `processing.export_processing_id` / `params_hash` / `aligner` and `denovo.requested_alignment_idx` / `processing_idx`; a script reading the old keys must be updated.
 
 ## Deployed history
 
