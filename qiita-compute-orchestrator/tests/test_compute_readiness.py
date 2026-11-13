@@ -373,10 +373,11 @@ def test_probe_script_checks_gpl_boundary():
     only via that var). Registration alone wouldn't prove the out-of-process
     binary works, so it builds a tiny index rather than checking duckdb_functions().
     `predict_genes` is called too: it refuses a boundary older than the one it needs,
-    which bowtie2 accepts."""
+    which bowtie2 accepts, and `prodigal_proteins` reads its output."""
     script = cr.build_probe_script(path_scratch="/scratch/qiita")
     assert "save_bowtie2_index" in script
     assert "predict_genes" in script
+    assert "prodigal_proteins" in script
     assert "miint-gpl-boundary=ok" in script
     assert "miint-gpl-boundary=fail" in script
 

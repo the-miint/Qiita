@@ -15,8 +15,7 @@
   set. It writes the rows for both tables, keyed by canonical sequence hashes for
   minting, and each subject's `prodigal_checkm` genes as `genes.faa` and `genes.gff`
   in the layout CheckM reads. No workflow runs it yet. It needs gpl-boundary 0.5.0 or
-  later. It builds Prodigal's protein FASTA headers itself until miint can write them
-  (duckdb-miint#446).
+  later, and a miint build with `prodigal_proteins`.
 
 ### Changed
 

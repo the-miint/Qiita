@@ -454,9 +454,11 @@ rm -f "$MIINT_INFERTRIM_PROBE"
 # nothing about whether the binary runs. The probe runs two of them:
 # `save_bowtie2_index` builds a tiny index, and `predict_genes` predicts genes on a
 # short sequence; it refuses a gpl-boundary older than it needs and names the
-# version it found. The probe runs in the job env: native jobs get an ephemeral
-# HOME, so the boundary is reachable only through MIINT_GPL_BOUNDARY_PATH as
-# miint_job_env forwards it, and an unset or wrong path fails here, at deploy.
+# version it found. `prodigal_proteins`, which the gene_call job writes CheckM's
+# protein FASTA with, then reads that output. The probe runs in the job env: native
+# jobs get an ephemeral HOME, so the boundary is reachable only through
+# MIINT_GPL_BOUNDARY_PATH as miint_job_env forwards it, and an unset or wrong path
+# fails here, at deploy.
 MIINT_BOUNDARY_PROBE="$(mktemp)"
 cat > "$MIINT_BOUNDARY_PROBE" <<'PYEOF'
 import sys
@@ -481,12 +483,14 @@ try:
         "0::BIGINT AS sequence_index, "
         "'ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT' AS sequence1"
     )
-    rows = conn.execute(
-        "SELECT count(*) FROM predict_genes('pg_subject', genome_id := 'genome_id', "
-        "meta_mode := true)"
-    ).fetchone()
+    conn.execute(
+        "CREATE TABLE pg_genes AS SELECT * FROM predict_genes('pg_subject', "
+        "genome_id := 'genome_id', meta_mode := true)"
+    )
+    rows = conn.execute("SELECT count(*) FROM pg_genes").fetchone()
     if rows is None or not rows[0]:
         raise RuntimeError("predict_genes returned no rows")
+    conn.execute("SELECT count(*) FROM prodigal_proteins('pg_genes')").fetchall()
 except Exception as exc:
     msg = (type(exc).__name__ + ": " + str(exc)).replace(chr(10), " ").replace(chr(13), " ")
     print(msg[:{MAX_DETAIL}])

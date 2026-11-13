@@ -214,8 +214,12 @@ def test_checkm_files_are_written_per_subject_with_contig_names_as_read(called):
         )
         for ext in ("faa", "gff")
     )
-    headers = re.findall(r"^>(\S+)", (checkm / "MAG/bin.1/genes.faa").read_text(), re.M)
+    faa = (checkm / "MAG/bin.1/genes.faa").read_text()
+    headers = re.findall(r"^>(\S+)", faa, re.M)
     assert {h.rsplit("_", 1)[0] for h in headers} <= set(files["refined/bin.1.fa"])
+    # In contig order, as the CLI writes them.
+    ids = [(int(n), int(g)) for n, g in re.findall(r" # ID=(\d+)_(\d+);", faa)]
+    assert len(ids) == len(headers) and ids == sorted(ids) and len({n for n, _ in ids}) > 1
     n_genes = _rows(
         out / gene_call.GENE_FILE,
         f"SELECT count(*) FROM t WHERE call_set = '{CALL_SET_CHECKM}' AND bin_id = 'bin.1'",

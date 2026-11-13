@@ -96,22 +96,6 @@ ATTRIBUTE_EXPR = {
     "tscore": "printf('%.2f', g.tscore)",
 }
 
-# Prodigal's FASTA record for a gene, as its CLI writes `-a`:
-# `<contig>_<n> # start # end # strand # ID=<contig number>_<n>;partial=..;...`.
-# Built here because no miint writer emits it (duckdb-miint#446).
-_FAA_RECORD = """
-    read_id::VARCHAR || '_' || gene_index AS read_id,
-    '# ' || position || ' # ' || (stop_position - 1)
-        || ' # ' || CASE strand WHEN '+' THEN '1' ELSE '-1' END
-        || ' # ID=' || contig_order || '_' || gene_index
-        || ';partial=' || partial_left::INT || partial_right::INT
-        || ';start_type=' || start_type
-        || ';rbs_motif=' || coalesce(rbs_motif, 'None')
-        || ';rbs_spacer=' || coalesce(rbs_spacer, 'None')
-        || ';gc_cont=' || printf('%.3f', gene_gc_content) AS comment,
-    protein AS sequence1
-"""
-
 
 class Inputs(BaseModel):
     """`genomes_dir` (`circular.fa`, `noLCG.fa`) and `refined_bins_dir` (one FASTA per
@@ -387,11 +371,24 @@ def _contig_rows_sql(calls: str, call_set: str, closed_ends: bool, mask_regions:
 def _write_checkm_files(conn, out: Path) -> int:
     """`<out>/<kind>/<bin_id>/genes.{faa,gff}` for each subject with `prodigal_checkm`
     genes. Returns how many subjects got them."""
+    # In contig order, the order `prodigal_proteins` numbers contigs in.
     conn.execute(
         """
         CREATE TEMP TABLE checkm_rows AS
         SELECT g.* EXCLUDE (meta_mode), c.contig_order
         FROM calls_checkm g JOIN contig c ON c.genome_id = g.genome_id AND c.contig_id = g.read_id
+        ORDER BY g.genome_id, c.contig_order, g.gene_index NULLS FIRST
+        """
+    )
+    # `prodigal_proteins` returns its records in no set order; the CLI writes them in
+    # contig order, so each record takes its gene's place back from `checkm_rows`.
+    conn.execute(
+        """
+        CREATE TEMP TABLE checkm_faa AS
+        SELECT p.*, r.contig_order, r.gene_index
+        FROM prodigal_proteins('checkm_rows', per_genome := true) p
+        JOIN checkm_rows r
+          ON r.genome_id = p.genome_id AND r.read_id || '_' || r.gene_index = p.read_id
         """
     )
     subjects = conn.execute(
@@ -411,8 +408,10 @@ def _write_checkm_files(conn, out: Path) -> int:
                 TO {_sql_path(d / "genes.gff")} (FORMAT GFF, DIALECT 'prodigal')"""
         )
         conn.execute(
-            f"""COPY (SELECT {_FAA_RECORD} FROM {rows} WHERE gene_index IS NOT NULL)
-                TO {_sql_path(d / "genes.faa")} (FORMAT FASTA, INCLUDE_COMMENT true)"""
+            f"""COPY (SELECT read_id, comment, sequence1 FROM checkm_faa
+                      WHERE genome_id = {int(genome_id)} ORDER BY contig_order, gene_index)
+                TO {_sql_path(d / "genes.faa")}
+                (FORMAT FASTA, INCLUDE_COMMENT true, LINE_WIDTH 60)"""
         )
     return len(subjects)
 
