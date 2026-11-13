@@ -52,6 +52,7 @@ from qiita_control_plane.repositories.block import (
     create_alignment_sample_pending,
     finalize_alignment_sample,
 )
+from qiita_control_plane.repositories.mask_definition import mint_mask_definition
 from qiita_control_plane.testing.db_seeds import (
     seed_biosample_to_study_link,
     seed_biosample_with_sequenced_prep_sample,
@@ -119,6 +120,28 @@ _LINEAGE_C_BLOCKED = (
 _BRANCH_A, _BRANCH_B, _BRANCH_C = 0.25, 0.5, 0.75
 _BRANCH_C_BLOCKED, _BRANCH_INNER, _BRANCH_CNODE = 0.0625, 0.125, 0.03125
 _EDGE_A, _EDGE_C = 11, 15
+
+
+async def _masked(db, *, owner: int, tag: str, prep_sample_idxs: list[int]) -> int:
+    """Mint a mask and record each sample `completed` under it. An alignment's samples
+    resolve to it only when their mask resolves to the mask its params name
+    (`definition_resolver`), and the build refuses any that do not."""
+    async with db.acquire() as conn:
+        mask_idx = (
+            await mint_mask_definition(
+                conn,
+                filter_workflow="read-mask",
+                filter_version="1.0.0",
+                params={"filter_workflow": "read-mask", "t": tag},
+                principal_idx=owner,
+            )
+        )["mask_idx"]
+    await db.executemany(
+        "INSERT INTO qiita.mask_sample (mask_idx, prep_sample_idx, state)"
+        " VALUES ($1, $2, 'completed')",
+        [(mask_idx, prep_sample_idx) for prep_sample_idx in prep_sample_idxs],
+    )
+    return mask_idx
 
 
 def _rank_literals(lineage: tuple[str, ...]) -> str:
@@ -239,6 +262,7 @@ async def publishable_cohort(postgres_pool, human_admin_session, regular_user_se
         )
     prep_sample_idxs = [ps for _, ps, _ in samples]
     ps0, ps1 = prep_sample_idxs
+    mask_idx = await _masked(db, owner=owner, tag=tag, prep_sample_idxs=prep_sample_idxs)
 
     async with db.acquire() as conn:
         alignment_idx = (
@@ -247,7 +271,7 @@ async def publishable_cohort(postgres_pool, human_admin_session, regular_user_se
                 params={
                     "reference_idx": reference_idx,
                     "aligner": "minimap2",
-                    "mask_idx": 1,
+                    "mask_idx": mask_idx,
                     "shard_ids": [0],
                 },
                 principal_idx=owner,
@@ -352,6 +376,7 @@ async def publishable_cohort(postgres_pool, human_admin_session, regular_user_se
     await db.execute(
         "DELETE FROM qiita.alignment_definition WHERE alignment_idx = $1", alignment_idx
     )
+    await db.execute("DELETE FROM qiita.mask_definition WHERE mask_idx = $1", mask_idx)
     await db.execute("DELETE FROM qiita.sequenced_pool WHERE idx = $1", pool_idx)
     await db.execute("DELETE FROM qiita.sequencing_run WHERE idx = $1", run_idx)
     # These genomes are refseq rather than qiita-derived, so they carry no
@@ -563,19 +588,21 @@ async def test_a_user_builds_a_publishable_feature_table(
     ]
     for manifest in manifests:
         # Public handle, resolved reference, and the digest the client verified before
-        # reading anything off `params` — none of it an identifier of ours.
-        assert manifest["processing"]["export_processing_id"].startswith("QP")
+        # reading anything off `params` — none of it an identifier of ours. One part:
+        # every sample resolved to the alignment named.
+        (part,) = manifest["processing"]["parts"]
+        assert part["export_processing_id"].startswith("QP")
         assert manifest["processing"]["reference"]["name"]
-        assert len(manifest["processing"]["params_hash"]) == 64
+        assert len(part["params_hash"]) == 64
+        assert manifest["processing"]["sample_part"] == {
+            handle: part["export_processing_id"] for handle in handles.values()
+        }
         assert sorted(manifest["table"]["cohort"]) == sorted(handles.values())
         assert "idx" not in json.dumps(manifest)
     # The processing handle is a property of the PROCESSING, not of the cohort or the
     # scope — so two bundles built from one alignment cite the same one, which is how a
     # reader sees they share it. The scopes differ, and must.
-    assert (
-        manifests[0]["processing"]["export_processing_id"]
-        == manifests[1]["processing"]["export_processing_id"]
-    )
+    assert manifests[0]["processing"]["parts"] == manifests[1]["processing"]["parts"]
     assert [m["table"]["coverage_scope"] for m in manifests] == ["pooled", "per-sample"]
     # Each manifest lists the bundle it belongs to, itself included — the members a
     # reader needs to have received, in the order they were written.
@@ -591,3 +618,269 @@ async def test_a_user_builds_a_publishable_feature_table(
         "per-sample.exported-identifier.json",
         "per-sample.manifest.json",
     ]
+
+
+# ---------------------------------------------------------------------------
+# A cohort across two pools and a similarity group.
+#
+# Masks M1 and M2 are decided similar, so alignments A (on M1) and B (on M2), whose
+# params differ only in the mask, are one alignment group. Sample 0 is on pool 1,
+# masked under M1 and aligned by A; sample 1 is on pool 2, masked under M2 and aligned
+# by B. Genome G (10 kb) is covered 0.6% by each sample in extending regions, so it
+# clears a 1% threshold only with coverage pooled over BOTH parts. Sample 2 is on pool
+# 1, masked under M1 and aligned by nothing: not processed in the group.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+async def cross_pool_cohort(postgres_pool, human_admin_session, regular_user_session, data_plane):
+    from qiita_common.models import DefinitionKind, DefinitionPairVerdict
+    from qiita_control_plane.definition_similarity import decide_pair, open_pair
+
+    db = postgres_pool
+    owner = human_admin_session["principal_idx"]
+    reader = regular_user_session["principal_idx"]
+    tag = uuid.uuid4().hex[:8]
+
+    study_idx = await db.fetchval(
+        "INSERT INTO qiita.study (owner_idx, title, created_by_idx)"
+        " VALUES ($1, $2, $1) RETURNING idx",
+        owner,
+        f"ft-cross-pool-{tag}",
+    )
+    await db.execute(
+        "INSERT INTO qiita.study_access (study_idx, principal_idx, access_tier, granted_by_idx)"
+        " VALUES ($1, $2, $3::qiita.tier, $4)",
+        study_idx,
+        reader,
+        Tier.VIEWER,
+        owner,
+    )
+    reference_idx = await db.fetchval(
+        "INSERT INTO qiita.reference (name, version, kind, is_host, status, created_by_idx)"
+        " VALUES ($1, '1.0', 'sequence_reference', false, 'active', $2) RETURNING reference_idx",
+        f"ft-cross-pool-{tag}",
+        owner,
+    )
+    source_id = f"GCF_{tag}_G"
+    genome_idx = await db.fetchval(
+        "INSERT INTO qiita.genome (source, source_id) VALUES ('refseq', $1) RETURNING genome_idx",
+        source_id,
+    )
+    feature_idx = await db.fetchval(
+        "INSERT INTO qiita.feature (sequence_hash) VALUES (gen_random_uuid()) RETURNING feature_idx"
+    )
+    await db.execute(
+        "INSERT INTO qiita.feature_genome (feature_idx, genome_idx) VALUES ($1, $2)",
+        feature_idx,
+        genome_idx,
+    )
+    await db.execute(
+        "INSERT INTO qiita.reference_membership (reference_idx, feature_idx) VALUES ($1, $2)",
+        reference_idx,
+        feature_idx,
+    )
+
+    # Samples 0 and 2 on pool 1, sample 1 on pool 2.
+    samples: list[tuple[int, int]] = []
+    pools: list[tuple[int, int]] = []
+    for i, pool_of in enumerate((None, None, 0)):
+        biosample_idx, prep_sample_idx = await seed_biosample_with_sequenced_prep_sample(
+            db, owner_idx=owner
+        )
+        existing = (
+            {}
+            if pool_of is None
+            else dict(
+                zip(("sequencing_run_idx", "sequenced_pool_idx"), pools[pool_of], strict=True)
+            )
+        )
+        run_idx, pool_idx, _ = await seed_sequenced_sample_subtype(
+            db,
+            prep_sample_idx=prep_sample_idx,
+            owner_idx=owner,
+            sequenced_pool_item_id=f"ft-cross-{tag}-{i}",
+            **existing,
+        )
+        if pool_of is None:
+            pools.append((run_idx, pool_idx))
+        samples.append((biosample_idx, prep_sample_idx))
+        await seed_biosample_to_study_link(
+            db, biosample_idx=biosample_idx, study_idx=study_idx, created_by_idx=owner
+        )
+        await seed_prep_sample_to_study_link(
+            db, prep_sample_idx=prep_sample_idx, study_idx=study_idx, created_by_idx=owner
+        )
+    ps0, ps1, ps2 = (ps for _, ps in samples)
+
+    mask_1 = await _masked(db, owner=owner, tag=f"{tag}-1", prep_sample_idxs=[ps0, ps2])
+    mask_2 = await _masked(db, owner=owner, tag=f"{tag}-2", prep_sample_idxs=[ps1])
+    async with db.acquire() as conn, conn.transaction():
+        pair, _ = await open_pair(
+            conn, kind=DefinitionKind.MASK, definition_idxs=[mask_1, mask_2], principal_idx=owner
+        )
+        await decide_pair(
+            conn,
+            definition_pair_idx=pair["definition_pair_idx"],
+            verdict=DefinitionPairVerdict.SIMILAR,
+            reason="same filter, seeded by the cross-pool feature-table test",
+            principal_idx=owner,
+        )
+
+    alignments: dict[str, int] = {}
+    for name, mask_idx, prep_sample_idx in (("A", mask_1, ps0), ("B", mask_2, ps1)):
+        async with db.acquire() as conn:
+            alignments[name] = (
+                await mint_alignment_definition(
+                    conn,
+                    params={
+                        "reference_idx": reference_idx,
+                        "aligner": "minimap2",
+                        "mask_idx": mask_idx,
+                        "shard_ids": [0],
+                    },
+                    principal_idx=owner,
+                )
+            )["alignment_idx"]
+        async with db.acquire() as conn, conn.transaction():
+            await create_alignment_sample_pending(
+                conn, alignment_idx=alignments[name], prep_sample_idxs=[prep_sample_idx]
+            )
+            await finalize_alignment_sample(
+                conn, alignment_idx=alignments[name], prep_sample_idx=prep_sample_idx
+            )
+
+    lake = ducklake_connect(data_plane["data_path"])
+    try:
+        lake.execute(
+            "INSERT INTO qiita_lake.reference_sequences"
+            f" (feature_idx, sequence_hash, sequence_length_bp) VALUES"
+            f" ({feature_idx}, gen_random_uuid(), 10000)"
+        )
+        lake.execute(
+            f"INSERT INTO qiita_lake.reference_membership VALUES ({reference_idx}, {feature_idx})"
+        )
+        lake.execute(
+            "INSERT INTO qiita_lake.alignment"
+            " (alignment_idx, prep_sample_idx, sequence_idx, feature_idx, flags,"
+            " position, stop_position) VALUES"
+            f" ({alignments['A']}, {ps0}, 101, {feature_idx}, 0, 0, 60),"
+            f" ({alignments['B']}, {ps1}, 102, {feature_idx}, 0, 60, 120)"
+        )
+    finally:
+        lake.close()
+
+    yield {
+        "pools": pools,
+        "alignments": alignments,
+        "samples": (ps0, ps1, ps2),
+        "source_id": source_id,
+    }
+
+    await teardown_entity_graph(
+        db,
+        study_idxs=[study_idx],
+        biosample_idxs=[bs for bs, _ in samples],
+        prep_sample_idxs=[ps for _, ps in samples],
+    )
+    await db.execute(
+        "DELETE FROM qiita.definition_pair WHERE definition_pair_idx = $1",
+        pair["definition_pair_idx"],
+    )
+    await db.execute(
+        "DELETE FROM qiita.alignment_definition WHERE alignment_idx = ANY($1::bigint[])",
+        list(alignments.values()),
+    )
+    await db.execute(
+        "DELETE FROM qiita.mask_definition WHERE mask_idx = ANY($1::bigint[])", [mask_1, mask_2]
+    )
+    for run_idx, pool_idx in pools:
+        await db.execute("DELETE FROM qiita.sequenced_pool WHERE idx = $1", pool_idx)
+        await db.execute("DELETE FROM qiita.sequencing_run WHERE idx = $1", run_idx)
+    await db.execute(
+        "DELETE FROM qiita.reference_membership WHERE reference_idx = $1", reference_idx
+    )
+    await db.execute("DELETE FROM qiita.feature_genome WHERE feature_idx = $1", feature_idx)
+    await db.execute("DELETE FROM qiita.feature WHERE feature_idx = $1", feature_idx)
+    await db.execute("DELETE FROM qiita.genome WHERE genome_idx = $1", genome_idx)
+    await db.execute("DELETE FROM qiita.reference WHERE reference_idx = $1", reference_idx)
+
+
+async def test_a_cohort_across_pools_builds_one_table_in_parts(
+    cp_server, data_plane, regular_user_session, cross_pool_cohort, tmp_path, monkeypatch, capsys
+):
+    """Two pools, two alignments of one group, one table: each sample read from the
+    alignment it resolves to (the cohort DoGet refuses any other), coverage pooled over
+    both, and a manifest naming each part by its own handle."""
+    from qiita_control_plane.cli import user as cli
+
+    seed = cross_pool_cohort
+    ps0, ps1, ps2 = seed["samples"]
+    dp_url = f"grpc://{LOOPBACK_HOST}:{data_plane['port']}"
+    monkeypatch.setenv("QIITA_TOKEN", regular_user_session["token"])
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+
+    def pool_flags(*pools) -> list[str]:
+        return [
+            flag
+            for run_idx, pool_idx in pools
+            for flag in (
+                "--sequencing-run-idx",
+                str(run_idx),
+                "--sequenced-pool-idx",
+                str(pool_idx),
+            )
+        ]
+
+    def build(*extra: str, pools, output) -> int:
+        return cli.main(
+            [
+                "--base-url",
+                cp_server,
+                "feature-table",
+                "build",
+                *pool_flags(*pools),
+                "--alignment-idx",
+                str(seed["alignments"]["A"]),
+                "--coverage-threshold",
+                "0.01",
+                "--output",
+                str(output),
+                "--data-plane-url",
+                dp_url,
+                *extra,
+            ]
+        )
+
+    # --- Default cohort: A's samples on pool 1, then B's on pool 2 (B is in A's group). ---
+    table = out_dir / "cross.parquet"
+    assert build(pools=seed["pools"], output=table) == 0, capsys.readouterr().err
+    identifiers = json.loads((out_dir / "cross.exported-identifier.json").read_text())
+    handles = {e["prep_sample_idx"]: e["export_id"] for e in identifiers["identifiers"]}
+    assert sorted(handles) == [ps0, ps1]
+    # G survives only because its 0.6% + 0.6% are pooled across the two parts.
+    assert _read_artifact(table) == sorted(
+        [(handles[ps0], seed["source_id"], 1.0), (handles[ps1], seed["source_id"], 1.0)]
+    )
+    manifest = json.loads((out_dir / "cross.manifest.json").read_text())
+    parts = manifest["processing"]["parts"]
+    assert len(parts) == 2
+    part_a, part_b = (part["export_processing_id"] for part in parts)
+    assert part_a != part_b and all(h.startswith("QP") for h in (part_a, part_b))
+    assert manifest["processing"]["sample_part"] == {handles[ps0]: part_a, handles[ps1]: part_b}
+    assert "idx" not in json.dumps(manifest)
+
+    # --- A cohort with a sample not processed in the group is refused, not narrowed. ---
+    refused = out_dir / "refused.parquet"
+    explicit = [f for ps in (ps0, ps1, ps2) for f in ("--prep-sample-idx", str(ps))]
+    capsys.readouterr()
+    assert build(*explicit, pools=seed["pools"], output=refused) == 1
+    err = capsys.readouterr().err
+    assert f"prep_sample {ps2}: not_processed (no_run)" in err
+    assert not refused.exists()
+
+    # --- A part over no named pool is refused with the flags to add. ---
+    assert build(*explicit[:4], pools=seed["pools"][:1], output=refused) == 1
+    assert "not over any pool named" in capsys.readouterr().err
+    assert not refused.exists()

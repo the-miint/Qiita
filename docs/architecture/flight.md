@@ -392,6 +392,15 @@ Two consequences worth stating here, because neither is visible from any single 
   is a table nobody can read and a bundle missing the manifest is one nobody can
   reproduce — coverage filtering makes the table a function of the whole cohort, not
   only of the samples in it, which is why the manifest is a member rather than a flag.
+- **A cohort can span pools and a similarity group, and is then read in parts.** Each
+  sample is resolved (`POST /definition-group/resolve`) in `--alignment-idx`'s group; a
+  sample that is incomplete or not processed stops the build, since the cohort is never
+  narrowed. The samples are read per resolved alignment, one part each, and the parts'
+  DoGet streams are chained into one staged relation (`staged_streams`), so the analytic
+  runs once over the whole cohort. The manifest carries one `export_processing_id` per
+  part and maps each sample's `export_id` to its part's handle; the de novo arm's parts
+  are recorded the same way, each paired with a reference part whose mask is in the same
+  mask group.
 
 Client half: `qiita_control_plane.cli.user.feature_table`, with `cli.user.alignment` for
 the discovery reads that yield an `alignment_idx`. The reference is read out of the

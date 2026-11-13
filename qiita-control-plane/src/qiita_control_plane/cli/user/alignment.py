@@ -147,10 +147,10 @@ def _handle_alignment_list(args: argparse.Namespace, parser: argparse.ArgumentPa
 
 
 def _handle_alignment_cohort(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
-    """Print the cohort a table would be built over. `feature-table build` resolves the
-    same list itself when no `--prep-sample-idx` is given; this verb is for seeing it
-    first, since the cohort is what coverage is measured over and therefore part of the
-    scientific question."""
+    """Print the cohort a table would be built over. `feature-table build` reads the
+    same list itself, for each alignment of `--alignment-idx`'s similarity group, when no
+    `--prep-sample-idx` is given; this verb is for seeing it first, since the cohort is
+    what coverage is measured over and therefore part of the scientific question."""
     return _common.run_http_subcommand(
         lambda t: _fetch_alignment_cohort(
             args.base_url,
