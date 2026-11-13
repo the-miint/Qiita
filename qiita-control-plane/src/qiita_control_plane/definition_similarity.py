@@ -70,7 +70,7 @@ from typing import Any
 import asyncpg
 from qiita_common.models import DefinitionKind, DefinitionPairRefusal, DefinitionPairVerdict
 
-from .repositories import require_transaction
+from .repositories import SNAPSHOT_ISOLATION_LEVELS, require_transaction, transaction_isolation
 from .repositories.definition_pair import (
     DefinitionRow,
     GroupLockBusy,
@@ -439,10 +439,8 @@ async def load_groups(conn: asyncpg.Connection) -> Groups:
     tickets read beside them, and a shared group lock would add nothing, since a
     reader that waited on it would still read the snapshot taken before the wait."""
     require_transaction(conn)
-    isolation = await conn.fetchval("SELECT current_setting('transaction_isolation')")
-    if isolation not in ("repeatable read", "serializable") and not (
-        await holds_group_lock_exclusive(conn)
-    ):
+    isolation = await transaction_isolation(conn)
+    if isolation not in SNAPSHOT_ISOLATION_LEVELS and not (await holds_group_lock_exclusive(conn)):
         raise RuntimeError(
             "load_groups needs the group lock EXCLUSIVE or a REPEATABLE READ transaction;"
             f" this one is {isolation!r} without the lock"

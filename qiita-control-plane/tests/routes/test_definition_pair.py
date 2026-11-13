@@ -25,7 +25,12 @@ from qiita_common.api_paths import (
     URL_PROCESSING_STATUS,
 )
 from qiita_common.auth_constants import Scope
-from qiita_common.models import DefinitionPairVerdict
+from qiita_common.models import (
+    DefinitionKind,
+    DefinitionPairEventType,
+    DefinitionPairRefusal,
+    DefinitionPairVerdict,
+)
 
 from qiita_control_plane.definition_similarity import decide_pair, load_groups
 from qiita_control_plane.repositories import definition_pair as pair_repo
@@ -186,24 +191,26 @@ def _refusal(resp, reason):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("kind", ["mask", "alignment", "processing"])
+@pytest.mark.parametrize("kind", list(DefinitionKind))
 async def test_a_hand_delete_detaches_the_pair_and_keeps_its_refs(
     postgres_pool, clients, defs, kind
 ):
     m1 = await defs["mask"](rype=0.05)
     m2 = await defs["mask"](rype=0.1)
-    if kind == "mask":
+    if kind == DefinitionKind.MASK:
         low, high = m1, m2
         table, col = "qiita.mask_definition", "mask_idx"
-    elif kind == "alignment":
+    elif kind == DefinitionKind.ALIGNMENT:
         low, high = await defs["block"](m1), await defs["block"](m1, shard_ids=(0, 1))
         table, col = "qiita.alignment_definition", "alignment_idx"
     else:
         low, high = await defs["assembly"](m1), await defs["assembly"](m1, assembler="hifiasm")
         table, col = "qiita.processing", "processing_idx"
     pair_idx = await _opened(clients["admin"], kind, low, high)
-    if kind != "alignment":
-        assert (await _decide(clients["admin"], pair_idx, "not_similar")).status_code == 200
+    if kind != DefinitionKind.ALIGNMENT:
+        assert (
+            await _decide(clients["admin"], pair_idx, DefinitionPairVerdict.NOT_SIMILAR)
+        ).status_code == 200
 
     await postgres_pool.execute(f"DELETE FROM {table} WHERE {col} = $1", high)
 
@@ -216,19 +223,26 @@ async def test_a_hand_delete_detaches_the_pair_and_keeps_its_refs(
     assert (row["lo"], row["hi"]) == (low, None)
     assert (row["low_definition_ref"], row["high_definition_ref"]) == (low, high)
     assert row["detached_at"] is not None
-    assert row["verdict"] == ("pending" if kind == "alignment" else "not_similar")
+    assert row["verdict"] == (
+        DefinitionPairVerdict.PENDING
+        if kind == DefinitionKind.ALIGNMENT
+        else DefinitionPairVerdict.NOT_SIMILAR
+    )
 
     resp = await clients["admin"].get(
         URL_ADMIN_DEFINITION_PAIR_BY_IDX.format(definition_pair_idx=pair_idx)
     )
     assert resp.status_code == 200
     assert resp.json()["detached_at"] is not None
-    _refusal(await _decide(clients["admin"], pair_idx, "not_similar"), "detached")
+    _refusal(
+        await _decide(clients["admin"], pair_idx, DefinitionPairVerdict.NOT_SIMILAR),
+        DefinitionPairRefusal.DETACHED,
+    )
 
 
 async def test_a_second_delete_keeps_the_first_detach_stamp(postgres_pool, clients, defs):
     m1, m2 = await defs["mask"](rype=0.05), await defs["mask"](rype=0.1)
-    pair_idx = await _opened(clients["admin"], "mask", m1, m2)
+    pair_idx = await _opened(clients["admin"], DefinitionKind.MASK, m1, m2)
     await postgres_pool.execute("DELETE FROM qiita.mask_definition WHERE mask_idx = $1", m1)
     first = await postgres_pool.fetchval(
         "SELECT detached_at FROM qiita.definition_pair WHERE definition_pair_idx = $1", pair_idx
@@ -251,20 +265,22 @@ async def test_typed_columns_must_match_the_refs_and_the_kind(postgres_pool, def
         " opened_by_idx) VALUES ($1, $2, $3, $4, $5, $6, '{}', false, $7)"
     )
     cases = [
-        ("mask", m1, m2, None, m1, m2 + 1000),  # high ref differs from the FK
-        ("alignment", m1, m2, None, m1, m2),  # another kind's columns set
-        ("mask", m1, None, None, m1, m2),  # a NULL FK on a live row
+        (DefinitionKind.MASK, m1, m2, None, m1, m2 + 1000),  # high ref differs from the FK
+        (DefinitionKind.ALIGNMENT, m1, m2, None, m1, m2),  # another kind's columns set
+        (DefinitionKind.MASK, m1, None, None, m1, m2),  # a NULL FK on a live row
     ]
     for kind, lo, hi, al, lo_ref, hi_ref in cases:
         with pytest.raises(asyncpg.CheckViolationError, match="definition_pair_typed_refs"):
             await postgres_pool.execute(insert, kind, lo, hi, al, lo_ref, hi_ref, defs["owner"])
     with pytest.raises(asyncpg.CheckViolationError, match="definition_pair_ordered"):
-        await postgres_pool.execute(insert, "mask", m2, m1, None, m2, m1, defs["owner"])
+        await postgres_pool.execute(
+            insert, DefinitionKind.MASK, m2, m1, None, m2, m1, defs["owner"]
+        )
 
 
 async def test_decision_fields_move_with_the_verdict(postgres_pool, clients, defs):
     m1, m2 = await defs["mask"](rype=0.05), await defs["mask"](rype=0.1)
-    pair_idx = await _opened(clients["admin"], "mask", m1, m2)
+    pair_idx = await _opened(clients["admin"], DefinitionKind.MASK, m1, m2)
     with pytest.raises(asyncpg.CheckViolationError, match="definition_pair_decision_fields"):
         await postgres_pool.execute(
             "UPDATE qiita.definition_pair SET verdict = 'similar' WHERE definition_pair_idx = $1",
@@ -274,7 +290,7 @@ async def test_decision_fields_move_with_the_verdict(postgres_pool, clients, def
 
 async def test_history_rows_are_not_updated(postgres_pool, clients, defs):
     m1, m2 = await defs["mask"](rype=0.05), await defs["mask"](rype=0.1)
-    pair_idx = await _opened(clients["admin"], "mask", m1, m2)
+    pair_idx = await _opened(clients["admin"], DefinitionKind.MASK, m1, m2)
     with pytest.raises(asyncpg.RaiseError, match="not updated"):
         await postgres_pool.execute(
             "UPDATE qiita.definition_pair_event SET reason = 'x' WHERE definition_pair_idx = $1",
@@ -289,64 +305,70 @@ async def test_history_rows_are_not_updated(postgres_pool, clients, defs):
 
 async def test_open_records_the_change_and_an_opened_event(clients, defs):
     m1, m2 = await defs["mask"](rype=0.05), await defs["mask"](rype=0.1)
-    resp = await _open(clients["admin"], "mask", m2, m1)
+    resp = await _open(clients["admin"], DefinitionKind.MASK, m2, m1)
     assert resp.status_code == 201, resp.text
     body = resp.json()
     assert (body["low_definition_idx"], body["high_definition_idx"]) == (m1, m2)
     assert body["change"] == {"rype": [0.05, 0.1]}
-    assert body["derived_only"] is False
-    assert body["verdict"] == "pending"
+    assert body[DefinitionPairRefusal.DERIVED_ONLY] is False
+    assert body["verdict"] == DefinitionPairVerdict.PENDING
     assert body["opened_by_idx"] == defs["owner"]
 
-    again = await _open(clients["admin"], "mask", m1, m2)
+    again = await _open(clients["admin"], DefinitionKind.MASK, m1, m2)
     assert again.status_code == 200
     assert again.json()["definition_pair_idx"] == body["definition_pair_idx"]
 
     shown = await clients["admin"].get(
         URL_ADMIN_DEFINITION_PAIR_BY_IDX.format(definition_pair_idx=body["definition_pair_idx"])
     )
-    assert [e["event"] for e in shown.json()["events"]] == ["opened"]
+    assert [e["event"] for e in shown.json()["events"]] == [DefinitionPairEventType.OPENED]
 
 
 async def test_open_marks_an_upstream_only_change_derived_only(clients, defs):
     m1, m2 = await defs["mask"](rype=0.05), await defs["mask"](rype=0.1)
     p1, p2 = await defs["assembly"](m1), await defs["assembly"](m2)
-    body = (await _open(clients["admin"], "processing", p1, p2)).json()
+    body = (await _open(clients["admin"], DefinitionKind.PROCESSING, p1, p2)).json()
     assert body["change"] == {"mask_idx": [m1, m2]}
-    assert body["derived_only"] is True
+    assert body[DefinitionPairRefusal.DERIVED_ONLY] is True
     _refusal(
-        await _decide(clients["admin"], body["definition_pair_idx"], "similar"), "derived_only"
+        await _decide(clients["admin"], body["definition_pair_idx"], DefinitionPairVerdict.SIMILAR),
+        DefinitionPairRefusal.DERIVED_ONLY,
     )
     assert (
-        await _decide(clients["admin"], body["definition_pair_idx"], "not_similar")
+        await _decide(
+            clients["admin"], body["definition_pair_idx"], DefinitionPairVerdict.NOT_SIMILAR
+        )
     ).status_code == 200
 
 
 async def test_open_refuses_an_unknown_definition_and_a_cross_scope_pair(clients, defs):
     m1 = await defs["mask"](rype=0.05)
     other = await defs["mask"](workflow="fastq-to-parquet")
-    assert (await _open(clients["admin"], "mask", m1, 2**40)).status_code == 404
-    _refusal(await _open(clients["admin"], "mask", m1, other), "cross_scope")
-    assert (await _open(clients["admin"], "mask", m1, m1)).status_code == 422
+    assert (await _open(clients["admin"], DefinitionKind.MASK, m1, 2**40)).status_code == 404
+    _refusal(
+        await _open(clients["admin"], DefinitionKind.MASK, m1, other),
+        DefinitionPairRefusal.CROSS_SCOPE,
+    )
+    assert (await _open(clients["admin"], DefinitionKind.MASK, m1, m1)).status_code == 422
 
 
 async def test_decide_then_revoke_returns_to_pending_and_keeps_the_history(clients, defs):
     m1, m2 = await defs["mask"](rype=0.05), await defs["mask"](rype=0.1)
-    pair_idx = await _opened(clients["admin"], "mask", m1, m2)
+    pair_idx = await _opened(clients["admin"], DefinitionKind.MASK, m1, m2)
 
-    decided = await _decide(clients["admin"], pair_idx, "similar")
+    decided = await _decide(clients["admin"], pair_idx, DefinitionPairVerdict.SIMILAR)
     assert decided.status_code == 200, decided.text
-    assert decided.json()["verdict"] == "similar"
+    assert decided.json()["verdict"] == DefinitionPairVerdict.SIMILAR
     assert decided.json()["decision_reason"] == _REASON
     assert decided.json()["decided_by_idx"] == defs["owner"]
 
     revoked = await _revoke(clients["admin"], pair_idx)
     assert revoked.status_code == 200, revoked.text
     body = revoked.json()
-    assert body["verdict"] == "pending"
+    assert body["verdict"] == DefinitionPairVerdict.PENDING
     assert body["decided_by_idx"] is None and body["decision_reason"] is None
 
-    _refusal(await _revoke(clients["admin"], pair_idx), "not_decided")
+    _refusal(await _revoke(clients["admin"], pair_idx), DefinitionPairRefusal.NOT_DECIDED)
 
     events = (
         await clients["admin"].get(
@@ -354,33 +376,47 @@ async def test_decide_then_revoke_returns_to_pending_and_keeps_the_history(clien
         )
     ).json()["events"]
     assert [(e["event"], e["verdict"]) for e in events] == [
-        ("opened", "pending"),
-        ("decided", "similar"),
-        ("revoked", "pending"),
+        (DefinitionPairEventType.OPENED, DefinitionPairVerdict.PENDING),
+        (DefinitionPairEventType.DECIDED, DefinitionPairVerdict.SIMILAR),
+        (DefinitionPairEventType.REVOKED, DefinitionPairVerdict.PENDING),
     ]
     assert events[1]["reason"] == _REASON
 
 
 async def test_a_decision_rejects_pending_and_a_blank_reason(clients, defs):
     m1, m2 = await defs["mask"](rype=0.05), await defs["mask"](rype=0.1)
-    pair_idx = await _opened(clients["admin"], "mask", m1, m2)
-    assert (await _decide(clients["admin"], pair_idx, "pending")).status_code == 422
-    assert (await _decide(clients["admin"], pair_idx, "similar", reason="  ")).status_code == 422
+    pair_idx = await _opened(clients["admin"], DefinitionKind.MASK, m1, m2)
+    assert (
+        await _decide(clients["admin"], pair_idx, DefinitionPairVerdict.PENDING)
+    ).status_code == 422
+    assert (
+        await _decide(clients["admin"], pair_idx, DefinitionPairVerdict.SIMILAR, reason="  ")
+    ).status_code == 422
 
 
 async def test_revoking_a_mask_pair_a_processing_similar_relies_on_is_refused(clients, defs):
     m1, m2 = await defs["mask"](rype=0.05), await defs["mask"](rype=0.1)
     p1, p2 = await defs["assembly"](m1), await defs["assembly"](m2, assembler="hifiasm")
-    mask_pair = await _opened(clients["admin"], "mask", m1, m2)
-    proc_pair = await _opened(clients["admin"], "processing", p1, p2)
+    mask_pair = await _opened(clients["admin"], DefinitionKind.MASK, m1, m2)
+    proc_pair = await _opened(clients["admin"], DefinitionKind.PROCESSING, p1, p2)
 
-    _refusal(await _decide(clients["admin"], proc_pair, "similar"), "upstream_not_grouped")
-    assert (await _decide(clients["admin"], mask_pair, "similar")).status_code == 200
-    assert (await _decide(clients["admin"], proc_pair, "similar")).status_code == 200
+    _refusal(
+        await _decide(clients["admin"], proc_pair, DefinitionPairVerdict.SIMILAR),
+        DefinitionPairRefusal.UPSTREAM_NOT_GROUPED,
+    )
+    assert (
+        await _decide(clients["admin"], mask_pair, DefinitionPairVerdict.SIMILAR)
+    ).status_code == 200
+    assert (
+        await _decide(clients["admin"], proc_pair, DefinitionPairVerdict.SIMILAR)
+    ).status_code == 200
 
-    detail = _refusal(await _revoke(clients["admin"], mask_pair), "relied_on")
+    detail = _refusal(await _revoke(clients["admin"], mask_pair), DefinitionPairRefusal.RELIED_ON)
     assert detail["definition_pair_idx"] == [proc_pair]
-    _refusal(await _decide(clients["admin"], mask_pair, "not_similar"), "relied_on")
+    _refusal(
+        await _decide(clients["admin"], mask_pair, DefinitionPairVerdict.NOT_SIMILAR),
+        DefinitionPairRefusal.RELIED_ON,
+    )
 
     assert (await _revoke(clients["admin"], proc_pair)).status_code == 200
     assert (await _revoke(clients["admin"], mask_pair)).status_code == 200
@@ -389,10 +425,12 @@ async def test_revoking_a_mask_pair_a_processing_similar_relies_on_is_refused(cl
 async def test_list_filters_by_verdict_and_kind(clients, defs):
     m1, m2, m3 = [await defs["mask"](rype=r) for r in (0.05, 0.1, 0.2)]
     a1, a2 = await defs["block"](m1), await defs["block"](m1, shard_ids=(0, 1))
-    mask_similar = await _opened(clients["admin"], "mask", m1, m2)
-    mask_pending = await _opened(clients["admin"], "mask", m1, m3)
-    alignment_pending = await _opened(clients["admin"], "alignment", a1, a2)
-    assert (await _decide(clients["admin"], mask_similar, "similar")).status_code == 200
+    mask_similar = await _opened(clients["admin"], DefinitionKind.MASK, m1, m2)
+    mask_pending = await _opened(clients["admin"], DefinitionKind.MASK, m1, m3)
+    alignment_pending = await _opened(clients["admin"], DefinitionKind.ALIGNMENT, a1, a2)
+    assert (
+        await _decide(clients["admin"], mask_similar, DefinitionPairVerdict.SIMILAR)
+    ).status_code == 200
 
     async def listed(**params):
         resp = await clients["admin"].get(URL_ADMIN_DEFINITION_PAIR, params=params)
@@ -401,9 +439,17 @@ async def test_list_filters_by_verdict_and_kind(clients, defs):
 
     mine = {mask_similar, mask_pending, alignment_pending}
     assert mine <= await listed()
-    assert (await listed(verdict="pending")) & mine == {mask_pending, alignment_pending}
-    assert (await listed(definition_kind="mask")) & mine == {mask_similar, mask_pending}
-    assert (await listed(definition_kind="mask", verdict="similar")) & mine == {mask_similar}
+    assert (await listed(verdict=DefinitionPairVerdict.PENDING)) & mine == {
+        mask_pending,
+        alignment_pending,
+    }
+    assert (await listed(definition_kind=DefinitionKind.MASK)) & mine == {
+        mask_similar,
+        mask_pending,
+    }
+    assert (
+        await listed(definition_kind=DefinitionKind.MASK, verdict=DefinitionPairVerdict.SIMILAR)
+    ) & mine == {mask_similar}
 
 
 # ---------------------------------------------------------------------------
@@ -413,30 +459,32 @@ async def test_list_filters_by_verdict_and_kind(clients, defs):
 
 async def test_a_regular_user_is_refused_every_route(clients, defs):
     m1, m2 = await defs["mask"](rype=0.05), await defs["mask"](rype=0.1)
-    pair_idx = await _opened(clients["admin"], "mask", m1, m2)
+    pair_idx = await _opened(clients["admin"], DefinitionKind.MASK, m1, m2)
     user = clients["user"]
     assert (await user.get(URL_ADMIN_DEFINITION_PAIR)).status_code == 403
-    assert (await _open(user, "mask", m1, m2)).status_code == 403
+    assert (await _open(user, DefinitionKind.MASK, m1, m2)).status_code == 403
     assert (
         await user.get(URL_ADMIN_DEFINITION_PAIR_BY_IDX.format(definition_pair_idx=pair_idx))
     ).status_code == 403
-    assert (await _decide(user, pair_idx, "similar")).status_code == 403
+    assert (await _decide(user, pair_idx, DefinitionPairVerdict.SIMILAR)).status_code == 403
     assert (await _revoke(user, pair_idx)).status_code == 403
 
 
 async def test_each_pair_is_gated_on_its_own_kinds_lifecycle_scope(clients, defs):
     m1, m2 = await defs["mask"](rype=0.05), await defs["mask"](rype=0.1)
     a1, a2 = await defs["block"](m1), await defs["block"](m1, shard_ids=(0, 1))
-    mask_pair = await _opened(clients["admin"], "mask", m1, m2)
-    alignment_pair = await _opened(clients["admin"], "alignment", a1, a2)
+    mask_pair = await _opened(clients["admin"], DefinitionKind.MASK, m1, m2)
+    alignment_pair = await _opened(clients["admin"], DefinitionKind.ALIGNMENT, a1, a2)
     narrow = clients["mask_only"]
 
     listed = await narrow.get(URL_ADMIN_DEFINITION_PAIR)
     assert listed.status_code == 200
     kinds = {p["definition_kind"] for p in listed.json()["pairs"]}
-    assert kinds == {"mask"}
+    assert kinds == {DefinitionKind.MASK}
     assert (
-        await narrow.get(URL_ADMIN_DEFINITION_PAIR, params={"definition_kind": "alignment"})
+        await narrow.get(
+            URL_ADMIN_DEFINITION_PAIR, params={"definition_kind": DefinitionKind.ALIGNMENT}
+        )
     ).status_code == 403
 
     for path in (URL_ADMIN_DEFINITION_PAIR_BY_IDX,):
@@ -444,9 +492,11 @@ async def test_each_pair_is_gated_on_its_own_kinds_lifecycle_scope(clients, defs
             await narrow.get(path.format(definition_pair_idx=alignment_pair))
         ).status_code == 403
         assert (await narrow.get(path.format(definition_pair_idx=mask_pair))).status_code == 200
-    assert (await _open(narrow, "alignment", a1, a2)).status_code == 403
-    assert (await _decide(narrow, alignment_pair, "not_similar")).status_code == 403
-    assert (await _decide(narrow, mask_pair, "similar")).status_code == 200
+    assert (await _open(narrow, DefinitionKind.ALIGNMENT, a1, a2)).status_code == 403
+    assert (
+        await _decide(narrow, alignment_pair, DefinitionPairVerdict.NOT_SIMILAR)
+    ).status_code == 403
+    assert (await _decide(narrow, mask_pair, DefinitionPairVerdict.SIMILAR)).status_code == 200
     assert (await _revoke(narrow, mask_pair)).status_code == 200
 
 
@@ -461,26 +511,35 @@ async def _deprecate(client, url):
 
 async def test_deprecating_a_mask_with_a_similar_pair_is_refused(clients, defs):
     m1, m2 = await defs["mask"](rype=0.05), await defs["mask"](rype=0.1)
-    pair_idx = await _opened(clients["admin"], "mask", m1, m2)
-    assert (await _decide(clients["admin"], pair_idx, "similar")).status_code == 200
+    pair_idx = await _opened(clients["admin"], DefinitionKind.MASK, m1, m2)
+    assert (
+        await _decide(clients["admin"], pair_idx, DefinitionPairVerdict.SIMILAR)
+    ).status_code == 200
 
     url = URL_MASK_DEFINITION_STATUS.format(mask_idx=m2)
-    detail = _refusal(await _deprecate(clients["admin"], url), "similar_pairs")
+    detail = _refusal(await _deprecate(clients["admin"], url), DefinitionPairRefusal.SIMILAR_PAIRS)
     assert detail["definition_pair_idx"] == [pair_idx]
 
-    assert (await _decide(clients["admin"], pair_idx, "not_similar")).status_code == 200
+    assert (
+        await _decide(clients["admin"], pair_idx, DefinitionPairVerdict.NOT_SIMILAR)
+    ).status_code == 200
     assert (await _deprecate(clients["admin"], url)).status_code == 200
-    _refusal(await _decide(clients["admin"], pair_idx, "similar"), "deprecated_side")
+    _refusal(
+        await _decide(clients["admin"], pair_idx, DefinitionPairVerdict.SIMILAR),
+        DefinitionPairRefusal.DEPRECATED_SIDE,
+    )
 
 
 async def test_deprecating_an_alignment_with_a_similar_pair_is_refused(clients, defs):
     m1 = await defs["mask"](rype=0.05)
     a1, a2 = await defs["block"](m1), await defs["block"](m1, aligner="minimap2", preset="sr")
-    pair_idx = await _opened(clients["admin"], "alignment", a1, a2)
-    assert (await _decide(clients["admin"], pair_idx, "similar")).status_code == 200
+    pair_idx = await _opened(clients["admin"], DefinitionKind.ALIGNMENT, a1, a2)
+    assert (
+        await _decide(clients["admin"], pair_idx, DefinitionPairVerdict.SIMILAR)
+    ).status_code == 200
 
     url = URL_ALIGNMENT_DEFINITION_STATUS.format(alignment_idx=a1)
-    _refusal(await _deprecate(clients["admin"], url), "similar_pairs")
+    _refusal(await _deprecate(clients["admin"], url), DefinitionPairRefusal.SIMILAR_PAIRS)
     assert (await _revoke(clients["admin"], pair_idx)).status_code == 200
     assert (await _deprecate(clients["admin"], url)).status_code == 200
 
@@ -488,11 +547,13 @@ async def test_deprecating_an_alignment_with_a_similar_pair_is_refused(clients, 
 async def test_deprecating_a_processing_with_a_similar_pair_is_refused(clients, defs):
     m1 = await defs["mask"](rype=0.05)
     p1, p2 = await defs["assembly"](m1), await defs["assembly"](m1, assembler="hifiasm")
-    pair_idx = await _opened(clients["admin"], "processing", p1, p2)
-    assert (await _decide(clients["admin"], pair_idx, "similar")).status_code == 200
+    pair_idx = await _opened(clients["admin"], DefinitionKind.PROCESSING, p1, p2)
+    assert (
+        await _decide(clients["admin"], pair_idx, DefinitionPairVerdict.SIMILAR)
+    ).status_code == 200
 
     url = URL_PROCESSING_STATUS.format(processing_idx=p2)
-    _refusal(await _deprecate(clients["admin"], url), "similar_pairs")
+    _refusal(await _deprecate(clients["admin"], url), DefinitionPairRefusal.SIMILAR_PAIRS)
     assert (await _revoke(clients["admin"], pair_idx)).status_code == 200
     resp = await _deprecate(clients["admin"], url)
     assert resp.status_code == 200, resp.text
@@ -510,8 +571,10 @@ async def test_a_definition_grouped_only_by_derivation_can_be_deprecated(clients
     m1, m2 = await defs["mask"](rype=0.05), await defs["mask"](rype=0.1)
     p1 = await defs["assembly"](m1)
     await defs["assembly"](m2)
-    mask_pair = await _opened(clients["admin"], "mask", m1, m2)
-    assert (await _decide(clients["admin"], mask_pair, "similar")).status_code == 200
+    mask_pair = await _opened(clients["admin"], DefinitionKind.MASK, m1, m2)
+    assert (
+        await _decide(clients["admin"], mask_pair, DefinitionPairVerdict.SIMILAR)
+    ).status_code == 200
     url = URL_PROCESSING_STATUS.format(processing_idx=p1)
     assert (await _deprecate(clients["admin"], url)).status_code == 200
 
@@ -530,12 +593,14 @@ async def test_a_decision_does_not_queue_behind_a_shared_holder(
     monkeypatch.setattr(pair_repo, "GROUP_LOCK_EXCLUSIVE_ATTEMPTS", 3)
     monkeypatch.setattr(pair_repo, "GROUP_LOCK_EXCLUSIVE_INTERVAL_S", 0.05)
     m1, m2 = await defs["mask"](rype=0.05), await defs["mask"](rype=0.1)
-    pair_idx = await _opened(clients["admin"], "mask", m1, m2)
+    pair_idx = await _opened(clients["admin"], DefinitionKind.MASK, m1, m2)
 
     async with postgres_pool.acquire() as deprecation, deprecation.transaction():
         await pair_repo.lock_groups_shared(deprecation)
         started = time.monotonic()
-        resp = await asyncio.wait_for(_decide(clients["admin"], pair_idx, "similar"), timeout=10)
+        resp = await asyncio.wait_for(
+            _decide(clients["admin"], pair_idx, DefinitionPairVerdict.SIMILAR), timeout=10
+        )
         elapsed = time.monotonic() - started
         assert resp.status_code == 503, resp.text
         assert resp.headers["Retry-After"]
@@ -548,17 +613,19 @@ async def test_a_decision_does_not_queue_behind_a_shared_holder(
             pair_repo.DEFINITION_GROUP_LOCK_CLASS,
         )
 
-    assert (await _decide(clients["admin"], pair_idx, "similar")).status_code == 200
+    assert (
+        await _decide(clients["admin"], pair_idx, DefinitionPairVerdict.SIMILAR)
+    ).status_code == 200
 
 
-async def _similar_candidates(defs, kind: str) -> tuple[int, int, str]:
+async def _similar_candidates(defs, kind: DefinitionKind) -> tuple[int, int, str]:
     """Two definitions of `kind` that can be decided similar, and the status URL that
     deprecates the second."""
-    if kind == "mask":
+    if kind == DefinitionKind.MASK:
         m1, m2 = await defs["mask"](rype=0.05), await defs["mask"](rype=0.1)
         return m1, m2, URL_MASK_DEFINITION_STATUS.format(mask_idx=m2)
     m1 = await defs["mask"](rype=0.05)
-    if kind == "alignment":
+    if kind == DefinitionKind.ALIGNMENT:
         a1 = await defs["block"](m1)
         a2 = await defs["block"](m1, aligner="minimap2", preset="sr")
         return a1, a2, URL_ALIGNMENT_DEFINITION_STATUS.format(alignment_idx=a2)
@@ -566,7 +633,7 @@ async def _similar_candidates(defs, kind: str) -> tuple[int, int, str]:
     return p1, p2, URL_PROCESSING_STATUS.format(processing_idx=p2)
 
 
-@pytest.mark.parametrize("kind", ["mask", "alignment", "processing"])
+@pytest.mark.parametrize("kind", list(DefinitionKind))
 async def test_a_deprecation_waits_for_a_decision_in_progress_and_sees_it(
     postgres_pool, clients, defs, kind
 ):
@@ -604,7 +671,9 @@ async def test_a_deprecation_waits_for_a_decision_in_progress_and_sees_it(
             raise
         await tx.commit()
 
-    detail = _refusal(await asyncio.wait_for(patch, timeout=10), "similar_pairs")
+    detail = _refusal(
+        await asyncio.wait_for(patch, timeout=10), DefinitionPairRefusal.SIMILAR_PAIRS
+    )
     assert detail["definition_pair_idx"] == [pair_idx]
 
 
@@ -623,5 +692,11 @@ async def test_load_groups_refuses_read_committed_without_the_exclusive_lock(pos
     async with postgres_pool.acquire() as conn, conn.transaction():
         with pytest.raises(RuntimeError, match="EXCLUSIVE or a REPEATABLE READ"):
             await load_groups(conn)
+    # The shared lock is not enough: it is the deprecations' side.
+    async with postgres_pool.acquire() as conn, conn.transaction():
+        await pair_repo.lock_groups_shared(conn)
+        with pytest.raises(RuntimeError, match="EXCLUSIVE or a REPEATABLE READ"):
+            await load_groups(conn)
+    async with postgres_pool.acquire() as conn, conn.transaction():
         await pair_repo.lock_groups_exclusive(conn)
         await load_groups(conn)

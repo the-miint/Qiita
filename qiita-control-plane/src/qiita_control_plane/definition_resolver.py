@@ -79,7 +79,7 @@ from .definition_similarity import (
     load_groups,
     upstream_leaves,
 )
-from .repositories import require_transaction
+from .repositories import SNAPSHOT_ISOLATION_LEVELS, require_transaction, transaction_isolation
 from .repositories.alignment_definition import (
     ALIGNMENT_SAMPLE_COMPLETED,
     ALIGNMENT_SAMPLE_INVALIDATED,
@@ -506,8 +506,8 @@ async def resolve_group(
     # The gates, tickets and groups are read in several statements; below REPEATABLE
     # READ each takes its own snapshot, and a gate read `pending` before its ticket
     # completed would read as no run at all.
-    isolation = await conn.fetchval("SELECT current_setting('transaction_isolation')")
-    if isolation not in ("repeatable read", "serializable"):
+    isolation = await transaction_isolation(conn)
+    if isolation not in SNAPSHOT_ISOLATION_LEVELS:
         raise RuntimeError(
             f"resolve_group needs a REPEATABLE READ transaction; this one is {isolation!r}"
         )

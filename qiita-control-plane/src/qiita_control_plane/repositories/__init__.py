@@ -63,6 +63,17 @@ INT4_MASK = 0x7FFF_FFFF
 #                                  triggers)
 
 
+# The isolation levels at which a transaction reads every statement from one
+# snapshot, as `transaction_isolation` spells them.
+SNAPSHOT_ISOLATION_LEVELS = frozenset({"repeatable read", "serializable"})
+READ_COMMITTED = "read committed"
+
+
+async def transaction_isolation(conn: asyncpg.Connection) -> str:
+    """The isolation level of the transaction that `conn` is in."""
+    return await conn.fetchval("SELECT current_setting('transaction_isolation')")
+
+
 def require_transaction(conn: asyncpg.Connection) -> None:
     """Raise RuntimeError if conn is not currently inside a transaction.
 

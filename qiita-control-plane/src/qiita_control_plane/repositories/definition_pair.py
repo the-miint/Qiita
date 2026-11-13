@@ -21,7 +21,7 @@ from qiita_common.models import (
     ProcessingStatus,
 )
 
-from . import require_transaction
+from . import READ_COMMITTED, require_transaction, transaction_isolation
 
 # pg_advisory_xact_lock(class, key) class for the group lock; allocated in
 # repositories/__init__'s registry, distinct from sequencing_run's, sequence_range's
@@ -42,7 +42,9 @@ class GroupLockBusy(Exception):
     request can be retried."""
 
     def __init__(self) -> None:
-        super().__init__("another pair decision or a deprecation is in progress; retry shortly")
+        super().__init__(
+            "another pair decision, revoke or deprecation is in progress; retry shortly"
+        )
 
 
 async def lock_groups_shared(conn: asyncpg.Connection) -> None:
@@ -53,11 +55,12 @@ async def lock_groups_shared(conn: asyncpg.Connection) -> None:
     held, so a `similar` decision and the deprecation of one of its sides cannot
     both commit. It waits for a decision in progress. The caller's transaction must
     be READ COMMITTED, so that the statement after the wait sees that decision; at
-    REPEATABLE READ the waiting statement takes the snapshot, which predates it.
+    REPEATABLE READ the waiting statement takes a snapshot from before that decision
+    commits.
     Decisions never queue behind it (`lock_groups_exclusive`)."""
     require_transaction(conn)
-    isolation = await conn.fetchval("SELECT current_setting('transaction_isolation')")
-    if isolation != "read committed":
+    isolation = await transaction_isolation(conn)
+    if isolation != READ_COMMITTED:
         raise RuntimeError(
             f"lock_groups_shared needs a READ COMMITTED transaction; this one is {isolation!r}"
         )
