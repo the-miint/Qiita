@@ -33,7 +33,7 @@ class DefinitionPairVerdict(StrEnum):
     """A pair's decision (`qiita.definition_pair.verdict` and
     `qiita.definition_pair_event.verdict`).
 
-    Twin of that column's TEXT + CHECK, not a Postgres ENUM.
+    Twin of the TEXT + CHECK on those two columns, not a Postgres ENUM.
     """
 
     PENDING = "pending"
@@ -44,7 +44,8 @@ class DefinitionPairVerdict(StrEnum):
 class DefinitionPairEventType(StrEnum):
     """What a `qiita.definition_pair_event` row records.
 
-    Twin of that column's TEXT + CHECK, not a Postgres ENUM.
+    Twin of the TEXT + CHECK on `qiita.definition_pair_event.event`, not a Postgres
+    ENUM.
     """
 
     OPENED = "opened"

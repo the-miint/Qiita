@@ -26,10 +26,12 @@ from qiita_common.models import (
     MaskDefinitionStatus,
     SampleResolutionReason,
     SampleResolutionState,
+    WorkTicketState,
 )
 
 from qiita_control_plane.definition_similarity import decide_pair, open_pair
 from qiita_control_plane.main import app
+from qiita_control_plane.repositories.block import MASK_SAMPLE_COMPLETED
 from qiita_control_plane.repositories.mask_definition import transition_mask_definition_status
 from qiita_control_plane.testing.db_seeds import seed_biosample_with_sequenced_prep_sample
 
@@ -126,10 +128,10 @@ async def group(ctx):
     running = await _add_to_pool(ctx, pool_idx=pool_idx)
     none = await _add_to_pool(ctx, pool_idx=pool_idx)
     for ps in (first, on_both, running):
-        await _seed_gate_row(ctx, mask_idx=low, prep_sample_idx=ps, state="completed")
-    await _seed_gate_row(ctx, mask_idx=high, prep_sample_idx=on_both, state="completed")
+        await _seed_gate_row(ctx, mask_idx=low, prep_sample_idx=ps, state=MASK_SAMPLE_COMPLETED)
+    await _seed_gate_row(ctx, mask_idx=high, prep_sample_idx=on_both, state=MASK_SAMPLE_COMPLETED)
     ticket = await _seed_mask_ticket(
-        ctx, mask_idx=high, prep_sample_idx=running, state="processing"
+        ctx, mask_idx=high, prep_sample_idx=running, state=WorkTicketState.PROCESSING
     )
 
     yield {
@@ -178,8 +180,8 @@ async def test_roster_resolves_each_sample_across_the_group(ctx, group, anchor):
     assert resolved("none") == (state.NOT_PROCESSED, reason.NO_RUN, None, None)
     # mask_state stays the gate under the mask the request named.
     expected_gate = {
-        "low": {"on_low": "completed", "on_both": "completed", "running": "completed"},
-        "high": {"on_both": "completed"},
+        "low": dict.fromkeys(("on_low", "on_both", "running"), MASK_SAMPLE_COMPLETED),
+        "high": {"on_both": MASK_SAMPLE_COMPLETED},
     }[anchor]
     for name in ("on_low", "on_both", "running", "none"):
         assert by_prep[group[name]]["mask_state"] == expected_gate.get(name), name
@@ -209,7 +211,7 @@ async def test_ticket_refuses_a_deprecated_mask_even_when_completed(ctx, group):
     """A completed gate does not make a deprecated mask exportable by name."""
     mask_idx = await _deprecated_mask(ctx)
     ps = group["on_low"]
-    await _seed_gate_row(ctx, mask_idx=mask_idx, prep_sample_idx=ps, state="completed")
+    await _seed_gate_row(ctx, mask_idx=mask_idx, prep_sample_idx=ps, state=MASK_SAMPLE_COMPLETED)
 
     resp = await ctx["admin"].post(
         URL_ADMIN_MASKED_READ_EXPORT_TICKET, json={"prep_sample_idx": ps, "mask_idx": mask_idx}

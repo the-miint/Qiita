@@ -524,7 +524,7 @@ async def test_a_definition_grouped_only_by_derivation_can_be_deprecated(clients
 async def test_a_decision_does_not_queue_behind_a_shared_holder(
     postgres_pool, clients, defs, monkeypatch
 ):
-    """A reader holding the group lock SHARED makes a decision answer 503 within its
+    """A deprecation holding the group lock SHARED makes a decision answer 503 within its
     bounded retry, instead of waiting in the lock queue (where it would block every
     later shared request). Once the reader ends, the same decision goes through."""
     monkeypatch.setattr(pair_repo, "GROUP_LOCK_EXCLUSIVE_ATTEMPTS", 3)

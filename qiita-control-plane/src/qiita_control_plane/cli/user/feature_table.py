@@ -1542,10 +1542,10 @@ def _run_build(
 
     _stage_genome_map(con, _fetch_genome_map(args.base_url, token, reference_idx=reference_idx))
     if requested_denovo:
-        # One map per sample with a de novo alignment, folded into one relation with the
-        # prep_sample key re-attached. A prep_sample that assembled nothing 404s, and that is the
-        # design's graceful path rather than an error: it simply has no de novo arm, so it
-        # is skipped here and stays reference-only downstream.
+        # One map per prep_sample with a de novo alignment, folded into one relation with
+        # the prep_sample key re-attached. A prep_sample that assembled nothing 404s, and
+        # that is the design's graceful path rather than an error: it simply has no de
+        # novo arm, so it is skipped here and stays reference-only downstream.
         _stage_denovo_genome_map(
             con,
             {
@@ -1565,7 +1565,7 @@ def _run_build(
         )
         # **The de novo arm's cohort is the samples the MAP named, not the build's.**
         # Every de novo surface is asked for exactly these: the run-scoped lengths 404
-        # for a sample with no run, and the alignment mint refuses a cohort member with
+        # for a prep_sample with no run, and the alignment mint refuses a cohort member with
         # no `alignment_sample` row — which is precisely a prep_sample that assembled
         # nothing, since `align-denovo` ends NO_DATA for it and never opens a gate row.
         staged = set(_staged_denovo_samples(con))

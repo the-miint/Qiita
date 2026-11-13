@@ -48,13 +48,12 @@ class GroupLockBusy(Exception):
 async def lock_groups_shared(conn: asyncpg.Connection) -> None:
     """Take the group lock SHARED until the transaction ends.
 
-    Every transaction whose outcome depends on group membership, or on a
-    definition's status staying as read while a pair is decided, takes this before
-    any definition row lock. No decision commits while it is held, so once a
-    decision has returned, no transaction is still acting on the groups from before
-    it. It waits for a decision in progress; at REPEATABLE READ the waiting
-    statement takes the snapshot, which then predates that decision. Decisions
-    never queue behind it (`lock_groups_exclusive`)."""
+    A deprecation takes this before reading the `similar` pairs that name its
+    definition and before any definition row lock: no decision commits while it is
+    held, so a `similar` decision and the deprecation of one of its sides cannot
+    both commit. It waits for a decision in progress, in a READ COMMITTED
+    transaction whose next statement then sees that decision. Decisions never queue
+    behind it (`lock_groups_exclusive`)."""
     require_transaction(conn)
     await conn.execute(
         "SELECT pg_advisory_xact_lock_shared($1, $2)",

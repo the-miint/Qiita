@@ -19,11 +19,26 @@ from qiita_common.actions import (
 )
 from qiita_common.api_paths import URL_DEFINITION_GROUP_RESOLVE
 from qiita_common.auth_constants import Scope
-from qiita_common.models import DefinitionKind
+from qiita_common.models import (
+    DefinitionKind,
+    SampleResolutionReason,
+    SampleResolutionState,
+    WorkTicketState,
+)
 
 from qiita_control_plane.definition_resolver import resolve_group
+from qiita_control_plane.repositories.alignment_definition import (
+    ALIGNMENT_SAMPLE_COMPLETED,
+    ALIGNMENT_SAMPLE_PENDING,
+)
 from qiita_control_plane.repositories.assembly import ASSEMBLY_SAMPLE_COMPLETED
-from qiita_control_plane.repositories.block import add_block_members, create_block
+from qiita_control_plane.repositories.block import (
+    BLOCK_ABANDONED,
+    BLOCK_PENDING,
+    MASK_SAMPLE_COMPLETED,
+    add_block_members,
+    create_block,
+)
 from qiita_control_plane.repositories.processing import mint_processing
 from qiita_control_plane.testing.db_seeds import (
     delete_action_if_created,
@@ -36,6 +51,11 @@ from qiita_control_plane.testing.db_seeds import (
 from qiita_control_plane.testing.db_teardown import teardown_entity_graph
 
 pytestmark = pytest.mark.db
+
+PROCESSED = SampleResolutionState.PROCESSED
+INCOMPLETE = SampleResolutionState.INCOMPLETE
+NOT_PROCESSED = SampleResolutionState.NOT_PROCESSED
+R = SampleResolutionReason
 
 # A version no workflow ships, so the action rows these tests seed never collide with a
 # synced one (whose context_schema would change the assembly params).
@@ -73,8 +93,8 @@ async def other_pool_sample(ctx, alignment_group_world):
     await seed_prep_sample_to_study_link(
         db, prep_sample_idx=ps_x, study_idx=w["study_1"], created_by_idx=owner
     )
-    await w["gate"]("mask_sample", w["mask_2"], ps_x, "completed")
-    await w["gate"]("alignment_sample", w["align_3"], ps_x, "completed")
+    await w["gate"]("mask_sample", w["mask_2"], ps_x, MASK_SAMPLE_COMPLETED)
+    await w["gate"]("alignment_sample", w["align_3"], ps_x, ALIGNMENT_SAMPLE_COMPLETED)
     yield ps_x
     await teardown_entity_graph(db, study_idxs=[], biosample_idxs=[bs_x], prep_sample_idxs=[ps_x])
     await db.execute("DELETE FROM qiita.sequenced_pool WHERE idx = $1", pool_idx)
@@ -97,7 +117,7 @@ async def tickets(ctx):
             )
 
     def _failure(state: str) -> tuple:
-        if state != "failed":
+        if state != WorkTicketState.FAILED:
             return (None, None, None, None)
         return ("permanent", "step_run", "align_sharded", "step failed in a test")
 
@@ -108,7 +128,7 @@ async def tickets(ctx):
         state: str,
         mask_idx: int,
         alignment_idx: int | None = None,
-        block_state: str = "pending",
+        block_state: str = BLOCK_PENDING,
     ) -> int:
         await _action(action_id, "block")
         async with db.acquire() as conn, conn.transaction():
@@ -207,19 +227,19 @@ async def test_resolve_across_pools_names_each_samples_member(
     )
     samples = _by_sample(resp)
     assert (samples[w["ps_a"]]["state"], samples[w["ps_a"]]["definition_idx"]) == (
-        "processed",
+        PROCESSED,
         w["align_1"],
     )
     assert samples[w["ps_a"]]["mask_idx"] == w["mask_idx"]
     x = samples[other_pool_sample]
     assert (x["state"], x["definition_idx"], x["mask_idx"]) == (
-        "processed",
+        PROCESSED,
         w["align_3"],
         w["mask_2"],
     )
     assert (samples[w["ps_c"]]["state"], samples[w["ps_c"]]["reason"]) == (
-        "not_processed",
-        "no_run",
+        NOT_PROCESSED,
+        R.NO_RUN,
     )
 
 
@@ -250,7 +270,7 @@ async def test_a_covering_align_block_that_is_running_makes_the_sample_incomplet
     ticket = await tickets["block"](
         ALIGN_ACTION_ID,
         samples=[w["ps_a"]],
-        state="pending",
+        state=WorkTicketState.PENDING,
         mask_idx=w["mask_idx"],
         alignment_idx=w["align_1"],
     )
@@ -260,15 +280,16 @@ async def test_a_covering_align_block_that_is_running_makes_the_sample_incomplet
     assert resp.status_code == 200, resp.text
     s = _by_sample(resp)[w["ps_a"]]
     assert (s["state"], s["reason"], s["work_ticket_idx"], s["definition_idx"]) == (
-        "incomplete",
-        "in_progress",
+        INCOMPLETE,
+        R.IN_PROGRESS,
         ticket,
         w["align_1"],
     )
 
 
 @pytest.mark.parametrize(
-    ("ticket_state", "block_state"), [("cancelled", "pending"), ("failed", "abandoned")]
+    ("ticket_state", "block_state"),
+    [(WorkTicketState.CANCELLED, BLOCK_PENDING), (WorkTicketState.FAILED, BLOCK_ABANDONED)],
 )
 async def test_cancelled_tickets_and_abandoned_blocks_are_ignored(
     ctx, alignment_group_world, tickets, ticket_state, block_state
@@ -277,7 +298,7 @@ async def test_cancelled_tickets_and_abandoned_blocks_are_ignored(
     leaves a pending gate nothing will finish: not a run, so ps_a resolves to
     align_1."""
     w = alignment_group_world
-    await w["gate"]("alignment_sample", w["align_3"], w["ps_a"], "pending")
+    await w["gate"]("alignment_sample", w["align_3"], w["ps_a"], ALIGNMENT_SAMPLE_PENDING)
     await tickets["block"](
         ALIGN_ACTION_ID,
         samples=[w["ps_a"]],
@@ -291,7 +312,7 @@ async def test_cancelled_tickets_and_abandoned_blocks_are_ignored(
     )
     assert resp.status_code == 200, resp.text
     s = _by_sample(resp)[w["ps_a"]]
-    assert (s["state"], s["definition_idx"]) == ("processed", w["align_1"])
+    assert (s["state"], s["definition_idx"]) == (PROCESSED, w["align_1"])
 
 
 async def test_a_failed_per_sample_mask_ticket_under_the_newer_mask_is_incomplete(
@@ -301,25 +322,31 @@ async def test_a_failed_per_sample_mask_ticket_under_the_newer_mask_is_incomplet
     completed one superseded does not."""
     w = alignment_group_world
     newer = await tickets["sample"](
-        READ_MASK_ACTION_ID, prep_sample_idx=w["ps_a"], state="failed", mask_idx=w["mask_2"]
+        READ_MASK_ACTION_ID,
+        prep_sample_idx=w["ps_a"],
+        state=WorkTicketState.FAILED,
+        mask_idx=w["mask_2"],
     )
     body = _body("mask", w["mask_idx"], [w["ps_a"]])
     resp = await ctx["user"].post(URL_DEFINITION_GROUP_RESOLVE, json=body)
     assert resp.status_code == 200, resp.text
     s = _by_sample(resp)[w["ps_a"]]
     assert (s["state"], s["reason"], s["work_ticket_idx"], s["definition_idx"]) == (
-        "incomplete",
-        "failed",
+        INCOMPLETE,
+        R.FAILED,
         newer,
         w["mask_2"],
     )
 
     await tickets["sample"](
-        READ_MASK_ACTION_ID, prep_sample_idx=w["ps_a"], state="completed", mask_idx=w["mask_2"]
+        READ_MASK_ACTION_ID,
+        prep_sample_idx=w["ps_a"],
+        state=WorkTicketState.COMPLETED,
+        mask_idx=w["mask_2"],
     )
-    await w["gate"]("mask_sample", w["mask_2"], w["ps_a"], "completed")
+    await w["gate"]("mask_sample", w["mask_2"], w["ps_a"], MASK_SAMPLE_COMPLETED)
     s = _by_sample(await ctx["user"].post(URL_DEFINITION_GROUP_RESOLVE, json=body))[w["ps_a"]]
-    assert (s["state"], s["definition_idx"]) == ("processed", w["mask_2"])
+    assert (s["state"], s["definition_idx"]) == (PROCESSED, w["mask_2"])
 
 
 async def test_an_assembly_ticket_is_matched_to_the_processing_it_mints(
@@ -352,7 +379,7 @@ async def test_an_assembly_ticket_is_matched_to_the_processing_it_mints(
         body = _body("processing", processing_idx, [w["ps_a"]])
         s = _by_sample(await ctx["user"].post(URL_DEFINITION_GROUP_RESOLVE, json=body))[w["ps_a"]]
         assert (s["state"], s["definition_idx"], s["mask_idx"]) == (
-            "processed",
+            PROCESSED,
             processing_idx,
             w["mask_idx"],
         )
@@ -362,19 +389,19 @@ async def test_an_assembly_ticket_is_matched_to_the_processing_it_mints(
         await tickets["sample"](
             LONG_READ_ASSEMBLY_ACTION_ID,
             prep_sample_idx=w["ps_a"],
-            state="processing",
+            state=WorkTicketState.PROCESSING,
             mask_idx=w["mask_idx"],
             action_context={"mask_idx": w["mask_idx"]},
         )
         s = _by_sample(await ctx["user"].post(URL_DEFINITION_GROUP_RESOLVE, json=body))[w["ps_a"]]
-        assert s["state"] == "processed"
+        assert s["state"] == PROCESSED
 
         await db.execute(
             "UPDATE qiita.processing SET params = params - 'probe' WHERE processing_idx = $1",
             processing_idx,
         )
         s = _by_sample(await ctx["user"].post(URL_DEFINITION_GROUP_RESOLVE, json=body))[w["ps_a"]]
-        assert (s["state"], s["reason"]) == ("incomplete", "in_progress")
+        assert (s["state"], s["reason"]) == (INCOMPLETE, R.IN_PROGRESS)
     finally:
         # Ahead of the entity sweep: assembly_sample references this processing with
         # no ON DELETE action, so the processing row cannot go while it exists.

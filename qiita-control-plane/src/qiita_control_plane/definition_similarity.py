@@ -26,8 +26,8 @@ upstreams are, so it can be decided `not_similar` only.
 Deprecation does not change membership.
 
 **Public API** for other modules:
-  - `async load_groups(conn) -> Groups` (takes the group lock SHARED in the
-    caller's transaction), then `Groups.group_of(kind, idx) -> frozenset[int]` and
+  - `async load_groups(conn) -> Groups` (in the caller's transaction; its docstring
+    says which), then `Groups.group_of(kind, idx) -> frozenset[int]` and
     `Groups.same_group(kind, a, b) -> bool`. A definition that no pair or derivation
     joins is a group of one, including an id that the snapshot does not know.
   - `compute_groups(definitions, pairs) -> Groups`, the pure core.
@@ -432,11 +432,12 @@ def compute_groups(definitions: Iterable[DefinitionRow], pairs: Iterable[PairSta
 
 
 async def load_groups(conn: asyncpg.Connection) -> Groups:
-    """Groups as of the caller's transaction (its snapshot, at REPEATABLE READ). Takes
-    the group lock SHARED until the transaction ends; `lock_groups_shared` says what
-    that holds off."""
+    """Groups as of the caller's transaction. The caller either holds the group lock
+    EXCLUSIVE (a decision or revoke), or reads at REPEATABLE READ: there the
+    transaction's one snapshot keeps the groups consistent with the gates and
+    tickets read beside them, and a shared group lock would add nothing, since a
+    reader that waited on it would still read the snapshot taken before the wait."""
     require_transaction(conn)
-    await lock_groups_shared(conn)
     definitions = await fetch_definitions(conn)
     pairs = [pair_state(r) for r in await fetch_live_pairs(conn)]
     return compute_groups(definitions, pairs)

@@ -50,7 +50,7 @@ INT4_MASK = 0x7FFF_FFFF
 #   repositories.sequence_range    2-arg class PREP_SAMPLE_RANGE_LOCK_CLASS (range
 #                                  mint vs the empty-completion writer)
 #   repositories.definition_pair   2-arg class DEFINITION_GROUP_LOCK_CLASS, key 0 (the
-#                                  group lock: pair decisions vs group readers)
+#                                  group lock: pair decisions vs deprecations)
 #   fanout_dispatch                2-arg classes 0x0FA0_0001-3 (cohort kinds)
 #   actions.library                1-arg key 4_310_290_149 (exclusion sync)
 #   notify.sweeper                 1-arg key 4_310_290_147

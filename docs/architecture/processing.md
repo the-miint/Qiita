@@ -351,7 +351,7 @@ migration `20261113000000_definition_pair.sql`). The procedure is
   REPEATABLE READ transaction, and says why.
 - **The group lock** is one Postgres advisory lock over every kind's groups
   (`repositories/definition_pair.py`). A decide or revoke takes it exclusive, by
-  try-lock with a bounded retry and a 503 when it stays busy; readers of the groups
-  and the three deprecation routes take it shared, the deprecation routes before
-  reading the pairs that name the definition, so a `similar` decision and the
-  deprecation of one of its sides cannot both commit.
+  try-lock with a bounded retry and a 503 when it stays busy; the three deprecation
+  routes take it shared before reading the pairs that name the definition, so a
+  `similar` decision and the deprecation of one of its sides cannot both commit.
+  Readers of the groups take no lock: they read one REPEATABLE READ snapshot.
