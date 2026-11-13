@@ -19,7 +19,11 @@ _None yet._
 
 ### 2. One-time host setup
 
-_None yet._
+```bash
+# gpl-boundary must report >= 0.5.0, or compute-readiness's miint-gpl-boundary probe fails the deploy.
+# If it is older, replace the binary at that path by hand (the deploy does not upgrade it: #859).   (#gene-call-schema)
+sudo -u qiita-orch "$(sudo grep -oP '^MIINT_GPL_BOUNDARY_PATH=\K.*' /etc/qiita/compute-orchestrator.env)" --version | grep gpl_boundary
+```
 
 ### 3. Migrations
 
@@ -39,7 +43,8 @@ _None yet._
 
 ### Notes (no host action)
 
-_None yet._
+- `.env.compute-orchestrator.example`'s `MIINT_GPL_BOUNDARY_PATH` comment now names the tools behind the boundary (bowtie2, FastTree, Prodigal) and the 0.5.0 minimum; no live env change. (#gene-call-schema)
+- New DuckLake tables `gene_call` / `gene_call_contig`, created empty by the data plane at start; nothing writes them yet. (#gene-call-schema)
 
 ## Deployed history
 

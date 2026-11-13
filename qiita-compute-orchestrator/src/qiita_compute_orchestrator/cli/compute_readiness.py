@@ -456,10 +456,12 @@ rm -f "$MIINT_INFERTRIM_PROBE"
 # `build_bowtie2_index` step died `gpl-boundary not installed`, silently, through
 # a green deploy. Registration alone proves nothing (the boundary is out-of-process),
 # so INVOKE it: build a tiny bowtie2 index via `save_bowtie2_index`, which shells to
-# the boundary. This runs IN THE JOB ENV — so it also verifies the fix that made
-# it fail before: native jobs get an ephemeral HOME, so the boundary is reachable
-# ONLY when MIINT_GPL_BOUNDARY_PATH is forwarded into the job (miint_job_env);
-# unset/wrong → this fails here, at deploy, not at the first real shard build.
+# the boundary, then call genes with `predict_genes`, which needs a newer boundary
+# than bowtie2 does and refuses an older binary with the version it found. This runs
+# IN THE JOB ENV — so it also verifies the fix that made it fail before: native jobs
+# get an ephemeral HOME, so the boundary is reachable ONLY when
+# MIINT_GPL_BOUNDARY_PATH is forwarded into the job (miint_job_env); unset/wrong →
+# this fails here, at deploy, not at the first real shard build.
 MIINT_BOUNDARY_PROBE="$(mktemp)"
 cat > "$MIINT_BOUNDARY_PROBE" <<'PYEOF'
 import sys
@@ -479,6 +481,17 @@ try:
         ).fetchone()
         if row is None or not row[0]:
             raise RuntimeError("save_bowtie2_index did not report success")
+    conn.execute(
+        "CREATE TABLE pg_subject AS SELECT 'g' AS genome_id, 'c' AS read_id, "
+        "0::BIGINT AS sequence_index, "
+        "'ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT' AS sequence1"
+    )
+    rows = conn.execute(
+        "SELECT count(*) FROM predict_genes('pg_subject', genome_id := 'genome_id', "
+        "meta_mode := true)"
+    ).fetchone()
+    if rows is None or not rows[0]:
+        raise RuntimeError("predict_genes returned no rows")
 except Exception as exc:
     msg = (type(exc).__name__ + ": " + str(exc)).replace(chr(10), " ").replace(chr(13), " ")
     print(msg[:{MAX_DETAIL}])

@@ -7,7 +7,7 @@
   contig (kind and bin_id, as in `bin_quality`), and its call set: `prodigal_checkm` (CheckM's own rules) or
   `prodigal_meta_closed` (metagenomic mode, no gene running off a contig's edge).
   Coordinates are on the contig's canonical strand. Each registration replaces the
-  run's rows. Nothing writes them yet; `qiita_common.gene_call_constants` holds the
+  run's rows, including when a re-run has nothing to call. Nothing writes them yet; `qiita_common.gene_call_constants` holds the
   columns.
 - **A `gene_call` job that calls those genes (#gene-call-schema).** A native job that
   runs Prodigal through miint's `predict_genes` on every bin or contig CheckM scores (each
@@ -15,9 +15,17 @@
   set. It writes the rows for both tables, keyed by canonical sequence hashes for
   minting, and each subject's `prodigal_checkm` genes as `genes.faa` and `genes.gff`
   in the layout CheckM reads. No workflow runs it yet. It needs gpl-boundary 0.5.0 or
-  later.
+  later. It builds Prodigal's protein FASTA headers itself until miint can write them
+  (duckdb-miint#446).
 
 ### Changed
+
+- **compute-readiness fails on a gpl-boundary older than 0.5.0
+  (#gene-call-schema).** The `miint-gpl-boundary` probe now calls `predict_genes` as
+  well as `save_bowtie2_index`; `predict_genes` refuses an older binary.
+- **`assembly_hash` refuses an absent `refined_bins_dir` (#gene-call-schema).** It
+  read one as no bins, which would count every binned contig as unbinned; bin_refine
+  always creates the directory.
 
 - **`docs/duckdb-miint.md` lists Prodigal among the GPL-boundary tools
   (#gene-call-schema).** It said miint did not route to the boundary's Prodigal; since

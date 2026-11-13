@@ -371,9 +371,12 @@ def test_probe_script_checks_gpl_boundary():
     green deploy. Running in the job env, it also verifies MIINT_GPL_BOUNDARY_PATH
     is forwarded (native jobs get an ephemeral HOME, so the boundary is reachable
     only via that var). Registration alone wouldn't prove the out-of-process
-    binary works, so it builds a tiny index rather than checking duckdb_functions()."""
+    binary works, so it builds a tiny index rather than checking duckdb_functions().
+    `predict_genes` is called too: it refuses a boundary older than the one it needs,
+    which bowtie2 accepts."""
     script = cr.build_probe_script(path_scratch="/scratch/qiita")
     assert "save_bowtie2_index" in script
+    assert "predict_genes" in script
     assert "miint-gpl-boundary=ok" in script
     assert "miint-gpl-boundary=fail" in script
 

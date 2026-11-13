@@ -114,11 +114,11 @@ const REPLACE_KEY_TABLES: &[ReplaceKey] = &[
     ReplaceKey::borrows("myloasm_link", "myloasm_run"),
     ReplaceKey::borrows("myloasm_split", "myloasm_run"),
     // The gene-call tables (`ducklake::ensure_gene_call_tables`), keyed like
-    // assembly_membership and for the same reason. Both read their keys from
-    // `gene_call_contig`; why that table is never empty is at
-    // `qiita_common.gene_call_constants.GENE_CALL_RUN_KEY`.
-    ReplaceKey::own("gene_call_contig", &["prep_sample_idx", "processing_idx"]),
-    ReplaceKey::borrows("gene_call", "gene_call_contig"),
+    // assembly_membership and for the same reason. Both borrow its keys, as
+    // bin_quality does: a run with no subject to call writes both empty
+    // (`qiita_common.gene_call_constants.GENE_CALL_RUN_KEY`).
+    ReplaceKey::borrows("gene_call_contig", "assembly_membership"),
+    ReplaceKey::borrows("gene_call", "assembly_membership"),
     // amplicon's twin of assembly_membership: same key, same argument. amplicon_load
     // derives the whole run's rows from its own workspace and never reads the lake
     // back, and a re-run resolves to the same processing_idx, so a --force resubmit
@@ -152,8 +152,9 @@ struct ReplaceKey {
     /// was replaced out from under them. `assembly_membership` carries the run's
     /// key on every row and is never empty where the load runs at all
     /// (`assembly_hash` raises `StepNoData` at zero contigs of any kind). The
-    /// myloasm tables borrow `myloasm_run`'s for the same reason; the argument is
-    /// at their entries. Every other entry is its own source.
+    /// gene-call tables borrow `assembly_membership`'s too, and the myloasm tables
+    /// borrow `myloasm_run`'s, for the same reason; the argument is at their
+    /// entries. Every other entry is its own source.
     key_source: &'static str,
 }
 

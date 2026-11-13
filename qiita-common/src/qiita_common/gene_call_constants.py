@@ -48,10 +48,12 @@ CALL_SET_CHECKM = "prodigal_checkm"
 CALL_SET_META_CLOSED = "prodigal_meta_closed"
 CALL_SETS = (CALL_SET_CHECKM, CALL_SET_META_CLOSED)
 
-# Both tables are replaced per assembly run at registration, on the run key read from
-# `gene_call_contig`. That table is never empty for a run that called any subject: a
-# subject has at least one contig, and every contig of a called subject gets a row
-# whatever the outcome, so a re-run that finds fewer genes still names the run.
+# Both tables are replaced per assembly run at registration, on the run keys that
+# registration's `assembly_membership` files name, as `bin_quality` is. A run with no
+# subject to call (no refined bin, nothing circular, no unbinned contig over the
+# residue cut) writes both tables empty, and an empty file names no run, so its own
+# keys would leave the previous run's rows in place. The load therefore registers
+# both files, empty or not, in the same registration as `assembly_membership`.
 GENE_CALL_RUN_KEY = ("prep_sample_idx", "processing_idx")
 
 # The subject a row belongs to, as `bin_quality` names it, then the call set.

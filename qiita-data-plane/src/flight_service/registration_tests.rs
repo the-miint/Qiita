@@ -391,16 +391,16 @@ fn myloasm_tables_are_replaced_per_run_on_the_run_tables_keys() {
 }
 
 /// Both gene-call tables are replaced per assembly run, and both read their delete
-/// keys from `gene_call_contig` (why: `qiita_common.gene_call_constants.GENE_CALL_RUN_KEY`).
+/// keys from `assembly_membership` (why: `qiita_common.gene_call_constants.GENE_CALL_RUN_KEY`).
 #[test]
-fn gene_call_tables_are_replaced_per_run_on_the_contig_tables_keys() {
+fn gene_call_tables_are_replaced_per_run_on_assembly_membership_keys() {
     for table in crate::ducklake::GENE_CALL_TABLES {
         let entry = REPLACE_KEY_TABLES
             .iter()
             .find(|entry| entry.table == *table)
             .unwrap_or_else(|| panic!("{table} is not replace-keyed"));
         assert_eq!(entry.key, &["prep_sample_idx", "processing_idx"], "{table}");
-        assert_eq!(entry.key_source, "gene_call_contig", "{table}");
+        assert_eq!(entry.key_source, "assembly_membership", "{table}");
     }
 }
 
@@ -2580,6 +2580,128 @@ fn an_empty_bin_quality_still_supersedes_the_runs_rows() {
         "DELETE FROM qiita_lake.assembly_membership WHERE {where_clause};
          DELETE FROM qiita_lake.bin_quality WHERE {where_clause};"
     ));
+}
+
+/// A re-run with no subject to call clears the previous run's gene-call rows:
+/// both tables arrive empty, and their delete reads the keys the same
+/// registration's `assembly_membership` names
+/// (`qiita_common.gene_call_constants.GENE_CALL_RUN_KEY`).
+///
+/// The control is the second registration's membership row, superseded in the
+/// same call.
+#[test]
+#[serial_test::serial]
+#[cfg(feature = "integration")]
+fn empty_gene_call_tables_still_supersede_the_runs_rows() {
+    let connstr = crate::test_catalog::connstr();
+    let data_path = crate::test_catalog::data_path();
+
+    let prep_sample: i64 = 976_010;
+    let run: i64 = 976_020;
+    let contig: i64 = 976_030;
+    let gene: i64 = 976_040;
+    let base_ticket: i64 = 976_000_000 + std::process::id() as i64;
+    let where_clause = format!("prep_sample_idx = {prep_sample} AND processing_idx = {run}");
+    let cleanup = format!(
+        "DELETE FROM qiita_lake.assembly_membership WHERE {where_clause};
+         DELETE FROM qiita_lake.gene_call_contig WHERE {where_clause};
+         DELETE FROM qiita_lake.gene_call WHERE {where_clause};"
+    );
+
+    {
+        let conn = Connection::open_in_memory().unwrap();
+        ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
+        ducklake::ensure_assembly_tables(&conn).unwrap();
+        ducklake::ensure_gene_call_tables(&conn).unwrap();
+        ducklake::ensure_registration_lock(&conn).unwrap();
+        ducklake::ensure_registered_file_table(&conn).unwrap();
+        conn.execute_batch(&cleanup).unwrap();
+    }
+
+    let membership_values = |kind: &str, bin_id: &str| {
+        format!(
+            "SELECT * FROM (VALUES \
+                 ({prep_sample}::BIGINT, {run}::BIGINT, '{kind}', '{bin_id}', {contig}::BIGINT, \
+                  NULL::VARCHAR, NULL::VARCHAR, NULL::DOUBLE, NULL::DOUBLE)) \
+                 t(prep_sample_idx, processing_idx, kind, bin_id, feature_idx, \
+                   raw_name, circularity, depth, mult)"
+        )
+    };
+    let contig_values = |suffix: &str| {
+        format!(
+            "SELECT * FROM (VALUES \
+                 ({prep_sample}::BIGINT, {run}::BIGINT, 'MAG', 'bin.1', 'prodigal_checkm', \
+                  {contig}::BIGINT, 1::INTEGER, FALSE, FALSE, TRUE, 'ok', 11::INTEGER, \
+                  TRUE, NULL::INTEGER, NULL::VARCHAR, NULL::DOUBLE)) \
+                 t(prep_sample_idx, processing_idx, kind, bin_id, call_set, \
+                   parent_feature_idx, contig_order, meta_mode, closed_ends, mask_regions, \
+                   status, translation_table, uses_sd, meta_bin, model_desc, \
+                   model_gc_content){suffix}"
+        )
+    };
+    let gene_values = |suffix: &str| {
+        format!(
+            "SELECT * FROM (VALUES \
+                 ({prep_sample}::BIGINT, {run}::BIGINT, 'MAG', 'bin.1', 'prodigal_checkm', \
+                  {contig}::BIGINT, {gene}::BIGINT, 1::BIGINT, 301::BIGINT, '+', 10.5::DOUBLE, \
+                  FALSE, FALSE, 'ATG', 99.9::DOUBLE, MAP {{'rbs_motif': 'None'}}, 'M*')) \
+                 t(prep_sample_idx, processing_idx, kind, bin_id, call_set, \
+                   parent_feature_idx, feature_idx, position, stop_position, strand, score, \
+                   partial_left, partial_right, start_type, confidence, attributes, \
+                   protein){suffix}"
+        )
+    };
+
+    let reader = Connection::open_in_memory().unwrap();
+    ducklake::connect_ducklake(&reader, &connstr, &data_path).unwrap();
+    let count = |table: &str| {
+        lake_count(
+            &reader,
+            &format!("SELECT count(*) FROM qiita_lake.{table} WHERE {where_clause}"),
+        )
+    };
+
+    // The first run: one refined MAG with one gene.
+    register_parquets(
+        &connstr,
+        &data_path,
+        &[
+            ("assembly_membership", &membership_values("MAG", "bin.1")),
+            ("gene_call_contig", &contig_values("")),
+            ("gene_call", &gene_values("")),
+        ],
+        base_ticket,
+    );
+    assert_eq!(count("gene_call_contig"), 1, "first run loaded");
+    assert_eq!(count("gene_call"), 1, "first run loaded");
+
+    // The re-run: contigs, but none called, so both gene-call files are empty.
+    let replaced = register_parquets(
+        &connstr,
+        &data_path,
+        &[
+            (
+                "assembly_membership",
+                &membership_values("UNBINNED", "contig_1"),
+            ),
+            ("gene_call_contig", &contig_values(" WHERE FALSE")),
+            ("gene_call", &gene_values(" WHERE FALSE")),
+        ],
+        base_ticket + 1,
+    )
+    .replaced;
+
+    assert_eq!(
+        replaced.get("assembly_membership").copied(),
+        Some(1),
+        "control: the re-run supersedes the first run's membership row",
+    );
+    assert_eq!(replaced.get("gene_call_contig").copied(), Some(1));
+    assert_eq!(replaced.get("gene_call").copied(), Some(1));
+    assert_eq!(count("gene_call_contig"), 0, "no contig row left behind");
+    assert_eq!(count("gene_call"), 0, "no gene row left behind");
+
+    let _ = reader.execute_batch(&cleanup);
 }
 
 /// A re-registered myloasm run supersedes every one of its tables, including one

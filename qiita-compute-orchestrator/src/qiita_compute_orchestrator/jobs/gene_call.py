@@ -97,6 +97,7 @@ ATTRIBUTE_EXPR = {
 
 # Prodigal's FASTA record for a gene, as its CLI writes `-a`:
 # `<contig>_<n> # start # end # strand # ID=<contig number>_<n>;partial=..;...`.
+# Built here because no miint writer emits it (duckdb-miint#446).
 _FAA_RECORD = """
     read_id::VARCHAR || '_' || gene_index AS read_id,
     '# ' || position || ' # ' || (stop_position - 1)

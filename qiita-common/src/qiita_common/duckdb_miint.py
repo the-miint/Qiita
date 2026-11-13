@@ -46,6 +46,7 @@ the cluster, after the tool has already done its work.
 from __future__ import annotations
 
 import gzip
+import json
 import os
 import tempfile
 from pathlib import Path
@@ -124,9 +125,9 @@ def miint_load_sql() -> str:
 # miint is a CORE, non-optional dependency (see CLAUDE.md "miint is a core
 # dependency"). Every native SLURM job needs BOTH of these to function:
 #   * MIINT_EXTENSION_DIRECTORY — the deploy-staged extension the job LOADs;
-#   * MIINT_GPL_BOUNDARY_PATH   — the GPL-boundary host binary (bowtie2 index/
-#                                 align, vsearch, MAFFT, … run inside it; miint
-#                                 streams sequences to it as Arrow over shm).
+#   * MIINT_GPL_BOUNDARY_PATH   — the GPL-boundary host binary (bowtie2, FastTree
+#                                 and Prodigal run inside it; miint streams
+#                                 sequences to it as Arrow over shm).
 # The compute node receives ONLY what we explicitly forward (the slurmrestd
 # `environment` is an allowlist, not an inherited copy — see SlurmBackend and
 # payload.build_job_submit_payload), so an unforwarded var is simply absent at
@@ -183,6 +184,19 @@ def require_staged_extension_directory(*, service: str) -> str:
             "components, readable by this service account."
         )
     return ext_dir
+
+
+# The oldest gpl-boundary the miint functions Qiita calls accept: `predict_genes`
+# refuses an older binary with the version it found
+# (https://the-miint.github.io/duckdb-miint/gene_prediction/).
+GPL_BOUNDARY_MIN_VERSION = (0, 5, 0)
+
+
+def gpl_boundary_is_outdated(version_report: str) -> bool:
+    """Whether the binary `install_gpl_boundary()` reports (its `version` field, the
+    binary's `--version` JSON) is older than `GPL_BOUNDARY_MIN_VERSION`."""
+    version = json.loads(version_report)["gpl_boundary"]
+    return tuple(int(part) for part in version.split(".")) < GPL_BOUNDARY_MIN_VERSION
 
 
 def miint_job_env() -> dict[str, str]:
