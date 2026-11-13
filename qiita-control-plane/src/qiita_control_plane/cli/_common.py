@@ -69,7 +69,6 @@ from qiita_common.auth_constants import (
 from qiita_common.models import (
     PrincipalLookupRequest,
     PrincipalLookupResponse,
-    SampleResolution,
 )
 
 # Environment-variable names and CLI defaults are CLI conventions (not part of
@@ -639,21 +638,6 @@ def print_validation_error(exc: ValidationError) -> None:
     """Print a model's refusal of a body to stderr as one line naming the
     model, in the `invalid <Model>: ...` form `parser.error` callers use."""
     print(f"error: invalid {exc.title}: {validation_messages(exc)}", file=sys.stderr)
-
-
-def describe_resolution(resolution: SampleResolution) -> str:
-    """One line naming a prep_sample an export leaves out: its state and reason, the
-    group member they are about, the ticket it waits on and the upstream a reason
-    names, each when known."""
-    reason = resolution.reason.value if resolution.reason is not None else "no reason given"
-    line = f"prep_sample {resolution.prep_sample_idx}: {resolution.state.value} ({reason})"
-    if resolution.definition_idx is not None:
-        line += f", {resolution.definition_kind.value} {resolution.definition_idx}"
-    if resolution.work_ticket_idx is not None:
-        line += f", work_ticket {resolution.work_ticket_idx}"
-    if resolution.upstream_kind is not None:
-        line += f", upstream {resolution.upstream_kind.value} {resolution.upstream_definition_idx}"
-    return line
 
 
 def print_request_error(exc: httpx.RequestError) -> None:

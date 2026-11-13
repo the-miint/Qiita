@@ -6,12 +6,12 @@ The rules are stated here and nowhere else.
 (`mask_sample`, `alignment_sample`, `assembly_sample`) and from the tickets that
 produce it:
   - a prep_sample-scoped ticket that names the definition: the sample's newest such
-    ticket that is not cancelled (an older failed ticket a later one superseded
-    does not count);
+    ticket that is not cancelled (an older failed ticket that a later one
+    superseded does not count);
   - every block ticket whose block covers the sample and is not abandoned;
   - a long-read-assembly ticket, which records no processing_idx: it counts for the
-    processing whose params equal the ones it mints
-    (`runner._processing._build_processing_params`).
+    processing whose params equal the params that the runner mints for it,
+    recomputed from the ticket with the runner's own builder.
   Cancelled tickets are ignored. A ticket counts only once the runner has written
   its definition on it (a per-sample ticket not yet started names none, so it does
   not make a sample incomplete). A ticket is *unfinished* when it is waiting,
@@ -33,7 +33,7 @@ under which the sample has a gate `completed`, `no_data` (assembly) or
      alignment's `processing_idx` (`definition_similarity.upstream_leaves`).
   5. each upstream, in that order, resolved for the sample in the upstream's group:
        - processed under another member → `incomplete` / `upstream_moved` (the
-         sample needs re-running on the member it now resolves to);
+         sample needs re-running on that other member);
        - incomplete → `incomplete` / `upstream_incomplete`;
        - not processed → `not_processed` / `upstream_withdrawn`,
          `upstream_deprecated` or `upstream_no_run`.
@@ -42,8 +42,9 @@ A not-processed member is not replaced by an older one.
 
 **Public API**:
   - `async resolve_group(conn, *, kind, definition_idx, prep_sample_idxs, groups=None)
-    -> GroupResolution`, in the caller's transaction; loads the groups (taking the
-    group lock SHARED) when not given them. Raises `DefinitionNotFound`.
+    -> GroupResolution`, in the caller's REPEATABLE READ transaction (the reads
+    span several statements); loads the groups when not given them. Raises
+    `DefinitionNotFound`.
   - `GroupResolution.samples[prep_sample_idx] -> SampleResolution` (the
     qiita-common wire model) and `GroupResolution.not_resolved_to(idx)`.
   - `cohort_refusal(resolution, definition_idx)`: the `DefinitionGroupRefusal` for
@@ -54,13 +55,17 @@ A not-processed member is not replaced by an older one.
 
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any
+from enum import Enum
+from typing import Any, get_args
 
 import asyncpg
 from qiita_common.actions import context_schema_default
 from qiita_common.models import (
+    AlignmentSampleState,
+    AssemblySampleState,
     DefinitionGroupRefusal,
     DefinitionKind,
+    MaskSampleState,
     SampleResolution,
     SampleResolutionReason,
     SampleResolutionState,
@@ -70,8 +75,8 @@ from qiita_common.models import (
 from .definition_similarity import (
     DefinitionNotFound,
     Groups,
-    _canon,
-    _is_ref,
+    canonical_json,
+    is_definition_ref,
     load_groups,
     upstream_leaves,
 )
@@ -79,13 +84,19 @@ from .repositories import require_transaction
 from .repositories.alignment_definition import (
     ALIGNMENT_SAMPLE_COMPLETED,
     ALIGNMENT_SAMPLE_INVALIDATED,
+    ALIGNMENT_SAMPLE_PENDING,
 )
 from .repositories.assembly import (
     ASSEMBLY_SAMPLE_COMPLETED,
     ASSEMBLY_SAMPLE_INVALIDATED,
     ASSEMBLY_SAMPLE_NO_DATA,
+    ASSEMBLY_SAMPLE_PENDING,
 )
-from .repositories.block import MASK_SAMPLE_COMPLETED, MASK_SAMPLE_INVALIDATED
+from .repositories.block import (
+    MASK_SAMPLE_COMPLETED,
+    MASK_SAMPLE_INVALIDATED,
+    MASK_SAMPLE_PENDING,
+)
 from .repositories.definition_run import (
     SOURCE_BLOCK_TICKET,
     SOURCE_GATE,
@@ -96,7 +107,7 @@ from .repositories.definition_run import (
     fetch_run_rows,
 )
 from .runner._mask import MASK_IDX_BINDING
-from .runner._processing import ASSEMBLER_BINDING, _build_processing_params
+from .runner._processing import ASSEMBLER_BINDING, build_processing_params
 
 __all__ = [
     "GroupResolution",
@@ -110,23 +121,71 @@ __all__ = [
     "upstreams",
 ]
 
-# Gate states that are a finished run, per kind. Assembly's `no_data` is finished:
-# the run ended with nothing to assemble.
-_GATE_DONE: dict[DefinitionKind, frozenset[str]] = {
-    DefinitionKind.MASK: frozenset({MASK_SAMPLE_COMPLETED}),
-    DefinitionKind.ALIGNMENT: frozenset({ALIGNMENT_SAMPLE_COMPLETED}),
-    DefinitionKind.PROCESSING: frozenset({ASSEMBLY_SAMPLE_COMPLETED, ASSEMBLY_SAMPLE_NO_DATA}),
-}
-_GATE_WITHDRAWN: dict[DefinitionKind, str] = {
-    DefinitionKind.MASK: MASK_SAMPLE_INVALIDATED,
-    DefinitionKind.ALIGNMENT: ALIGNMENT_SAMPLE_INVALIDATED,
-    DefinitionKind.PROCESSING: ASSEMBLY_SAMPLE_INVALIDATED,
-}
 
-_RUNNING_TICKET_STATES = frozenset(
-    {WorkTicketState.PENDING, WorkTicketState.QUEUED, WorkTicketState.PROCESSING}
-)
-_UNFINISHED_TICKET_STATES = _RUNNING_TICKET_STATES | {WorkTicketState.FAILED}
+class _GateRole(Enum):
+    NONE = "none"  # a gate row with no run behind it (its tickets were cancelled)
+    DONE = "done"
+    WITHDRAWN = "withdrawn"
+
+
+class _TicketRole(Enum):
+    RUNNING = "running"
+    FAILED = "failed"
+    FINISHED = "finished"
+    IGNORED = "ignored"
+
+
+# Every gate state of each kind, mapped; checked against the gate's declared states
+# at import, so a state added there fails here instead of reading as no run.
+# Assembly's `no_data` is done: the run ended with nothing to assemble.
+_GATE_ROLE: dict[DefinitionKind, dict[str, _GateRole]] = {
+    DefinitionKind.MASK: {
+        MASK_SAMPLE_PENDING: _GateRole.NONE,
+        MASK_SAMPLE_COMPLETED: _GateRole.DONE,
+        MASK_SAMPLE_INVALIDATED: _GateRole.WITHDRAWN,
+    },
+    DefinitionKind.ALIGNMENT: {
+        ALIGNMENT_SAMPLE_PENDING: _GateRole.NONE,
+        ALIGNMENT_SAMPLE_COMPLETED: _GateRole.DONE,
+        ALIGNMENT_SAMPLE_INVALIDATED: _GateRole.WITHDRAWN,
+    },
+    DefinitionKind.PROCESSING: {
+        ASSEMBLY_SAMPLE_PENDING: _GateRole.NONE,
+        ASSEMBLY_SAMPLE_COMPLETED: _GateRole.DONE,
+        ASSEMBLY_SAMPLE_NO_DATA: _GateRole.DONE,
+        ASSEMBLY_SAMPLE_INVALIDATED: _GateRole.WITHDRAWN,
+    },
+}
+for _kind, _declared in (
+    (DefinitionKind.MASK, MaskSampleState),
+    (DefinitionKind.ALIGNMENT, AlignmentSampleState),
+    (DefinitionKind.PROCESSING, AssemblySampleState),
+):
+    if set(_GATE_ROLE[_kind]) != set(get_args(_declared)):
+        raise RuntimeError(f"_GATE_ROLE[{_kind.value}] does not map every declared gate state")
+
+# Every ticket state, mapped; checked against WorkTicketState at import.
+_TICKET_ROLE: dict[WorkTicketState, _TicketRole] = {
+    WorkTicketState.PENDING: _TicketRole.RUNNING,
+    WorkTicketState.QUEUED: _TicketRole.RUNNING,
+    WorkTicketState.PROCESSING: _TicketRole.RUNNING,
+    WorkTicketState.FAILED: _TicketRole.FAILED,
+    WorkTicketState.COMPLETED: _TicketRole.FINISHED,
+    WorkTicketState.NO_DATA: _TicketRole.FINISHED,
+    WorkTicketState.CANCELLED: _TicketRole.IGNORED,
+}
+if set(_TICKET_ROLE) != set(WorkTicketState):
+    raise RuntimeError("_TICKET_ROLE does not map every WorkTicketState")
+
+
+def _gate_role(kind: DefinitionKind, gate: str | None) -> _GateRole:
+    if gate is None:
+        return _GateRole.NONE
+    try:
+        return _GATE_ROLE[kind][gate]
+    except KeyError:
+        raise ValueError(f"unknown {kind.value} gate state {gate!r}") from None
+
 
 # How an upstream's not-processed reason reads on the downstream sample.
 _UPSTREAM_NOT_PROCESSED = {
@@ -185,7 +244,13 @@ def build_observations(rows: Iterable[RunRow]) -> dict[tuple[int, int], RunObser
             tickets.add(newest_sample_ticket[key])
         out[key] = RunObservation(
             gate=gates.get(key),
-            unfinished=tuple(sorted(t for t in tickets if t[1] in _UNFINISHED_TICKET_STATES)),
+            unfinished=tuple(
+                sorted(
+                    t
+                    for t in tickets
+                    if _TICKET_ROLE[t[1]] in (_TicketRole.RUNNING, _TicketRole.FAILED)
+                )
+            ),
         )
     return out
 
@@ -196,17 +261,17 @@ def match_assembly_tickets(
 ) -> list[RunRow]:
     """The candidates whose minted params equal one of `processing_params`
     (`{processing_idx: params}`), as per-sample ticket rows of that processing."""
-    by_params = {_canon(dict(params)): idx for idx, params in processing_params.items()}
+    by_params = {canonical_json(dict(params)): idx for idx, params in processing_params.items()}
     out: list[RunRow] = []
     for c in candidates:
         bound = {**c.action_context, MASK_IDX_BINDING: c.mask_idx}
-        params = _build_processing_params(
+        params = build_processing_params(
             c.action_id,
             c.action_version,
             bound,
             assembler_default=context_schema_default(c.context_schema, ASSEMBLER_BINDING),
         )
-        idx = by_params.get(_canon(params))
+        idx = by_params.get(canonical_json(params))
         if idx is not None:
             out.append(
                 RunRow(
@@ -231,14 +296,14 @@ def upstreams(groups: Groups, kind: DefinitionKind, idx: int) -> list[tuple[Defi
     return [
         (up_kind, params[path])
         for path, up_kind in upstream_leaves(kind, params).items()
-        if _is_ref(params.get(path))
+        if is_definition_ref(params.get(path))
     ]
 
 
 def needed_definitions(
     groups: Groups, kind: DefinitionKind, definition_idx: int
 ) -> dict[DefinitionKind, set[int]]:
-    """Every definition whose runs resolving `kind` `definition_idx`'s group can read:
+    """Every definition that resolving `kind` `definition_idx`'s group reads runs of:
     the group's members and, recursively, the groups of their upstreams."""
     out: dict[DefinitionKind, set[int]] = {}
     stack = [(kind, definition_idx)]
@@ -254,7 +319,7 @@ def needed_definitions(
 
 
 def _has_run(kind: DefinitionKind, obs: RunObservation) -> bool:
-    return bool(obs.unfinished) or obs.gate in _GATE_DONE[kind] or obs.gate == _GATE_WITHDRAWN[kind]
+    return bool(obs.unfinished) or _gate_role(kind, obs.gate) is not _GateRole.NONE
 
 
 def _resolution(
@@ -271,7 +336,7 @@ def _resolution(
     mask_idx = None
     if definition_idx is not None and kind is not DefinitionKind.MASK:
         value = groups.params_of(kind, definition_idx).get("mask_idx")
-        mask_idx = value if _is_ref(value) else None
+        mask_idx = value if is_definition_ref(value) else None
     return SampleResolution(
         prep_sample_idx=prep_sample_idx,
         state=state,
@@ -313,15 +378,15 @@ def resolve_sample(
     obs = kind_obs.get((member, prep_sample_idx), empty)
 
     if obs.unfinished:
-        running = [t for t, s in obs.unfinished if s in _RUNNING_TICKET_STATES]
-        failed = [t for t, s in obs.unfinished if s is WorkTicketState.FAILED]
+        running = [t for t, s in obs.unfinished if _TICKET_ROLE[s] is _TicketRole.RUNNING]
+        failed = [t for t, s in obs.unfinished if _TICKET_ROLE[s] is _TicketRole.FAILED]
         return result(
             SampleResolutionState.INCOMPLETE,
             definition_idx=member,
             reason=SampleResolutionReason.IN_PROGRESS if running else SampleResolutionReason.FAILED,
             work_ticket_idx=max(running or failed),
         )
-    if obs.gate == _GATE_WITHDRAWN[kind]:
+    if _gate_role(kind, obs.gate) is _GateRole.WITHDRAWN:
         return result(
             SampleResolutionState.NOT_PROCESSED,
             definition_idx=member,
@@ -435,8 +500,8 @@ async def resolve_group(
     groups: Groups | None = None,
 ) -> GroupResolution:
     """Resolve each of `prep_sample_idxs` in `kind` `definition_idx`'s group, in the
-    caller's transaction. `groups` is loaded (taking the group lock SHARED) when not
-    given; a caller passing its own must have loaded it in this transaction. Raises
+    caller's REPEATABLE READ transaction. `groups` is loaded when not given; a caller
+    passing its own must have loaded it in this transaction. Raises
     DefinitionNotFound when `definition_idx` is not a `kind` definition."""
     require_transaction(conn)
     if groups is None:

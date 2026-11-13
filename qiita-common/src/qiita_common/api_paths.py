@@ -560,9 +560,9 @@ URL_ALIGNMENT_COHORT_DOGET = f"{URL_ALIGNMENT_PREFIX}{PATH_ALIGNMENT_COHORT_DOGE
 # =============================================================================
 # /definition-group/* — per-sample resolution across a definition group
 # =============================================================================
-# POST .../resolve: which member of a mask, alignment or processing group each
+# POST .../resolve: the member of a mask, alignment or processing group that each
 # named prep_sample resolves to (human, prep_sample:read, VIEWER on every study of
-# every sample).
+# every prep_sample).
 
 PATH_DEFINITION_GROUP_PREFIX = "/definition-group"
 PATH_DEFINITION_GROUP_RESOLVE = "/resolve"

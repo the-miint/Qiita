@@ -51,6 +51,7 @@ from qiita_common.models import (
     MaskedReadExportTicketRequest,
     ReadMaskReason,
 )
+from qiita_control_plane.repositories.block import MASK_SAMPLE_COMPLETED
 from qiita_control_plane.testing.db_teardown import teardown_entity_graph
 
 from conftest import ducklake_connect
@@ -104,9 +105,9 @@ async def _real_bridge(postgres_pool, secret: bytes, *, pool_idx: int, mask_idx:
     tickets: dict[tuple[int, int], str] = {}
     by_mask: dict[int, list[int]] = {}
     for sample in roster["samples"]:
-        if sample["state"] != "processed":
+        if sample["resolution"]["state"] != "processed":
             continue
-        key = (sample["prep_sample_idx"], sample["resolved_mask_idx"])
+        key = (sample["prep_sample_idx"], sample["resolution"]["definition_idx"])
         resp = await create_masked_read_export_ticket(
             body=MaskedReadExportTicketRequest(prep_sample_idx=key[0], mask_idx=key[1]),
             pool=postgres_pool,
@@ -226,10 +227,10 @@ async def seeded(postgres_pool, human_admin_session):
     # read-mask workflow the finalize-mask-sample terminal step writes it. Seed it
     # directly so the fully-masked e2e sample is not 409'd as masking-incomplete.
     await postgres_pool.execute(
-        "INSERT INTO qiita.mask_sample (mask_idx, prep_sample_idx, state)"
-        " VALUES ($1, $2, 'completed')",
+        "INSERT INTO qiita.mask_sample (mask_idx, prep_sample_idx, state) VALUES ($1, $2, $3)",
         mask_idx,
         ps,
+        MASK_SAMPLE_COMPLETED,
     )
 
     yield {
@@ -527,9 +528,8 @@ async def group_seeded(seeded, postgres_pool):
         accessions.append(accession)
     ps_2, ps_3 = preps
     await postgres_pool.executemany(
-        "INSERT INTO qiita.mask_sample (mask_idx, prep_sample_idx, state)"
-        " VALUES ($1, $2, 'completed')",
-        [(seeded["mask_idx"], ps_2), (mask_2, ps_2)],
+        "INSERT INTO qiita.mask_sample (mask_idx, prep_sample_idx, state) VALUES ($1, $2, $3)",
+        [(seeded["mask_idx"], ps_2, MASK_SAMPLE_COMPLETED), (mask_2, ps_2, MASK_SAMPLE_COMPLETED)],
     )
 
     yield {
@@ -601,10 +601,10 @@ async def test_masked_read_export_e2e_across_a_mask_group(
         mask_idx=mask_1,
         owner=g["owner"],
     )
-    by_prep = {s["prep_sample_idx"]: s for s in roster["samples"]}
+    by_prep = {s["prep_sample_idx"]: s["resolution"] for s in roster["samples"]}
     assert roster["group"] == [mask_1, mask_2]
-    assert (by_prep[ps_1]["state"], by_prep[ps_1]["resolved_mask_idx"]) == ("processed", mask_1)
-    assert (by_prep[ps_2]["state"], by_prep[ps_2]["resolved_mask_idx"]) == ("processed", mask_2)
+    assert (by_prep[ps_1]["state"], by_prep[ps_1]["definition_idx"]) == ("processed", mask_1)
+    assert (by_prep[ps_2]["state"], by_prep[ps_2]["definition_idx"]) == ("processed", mask_2)
     assert (by_prep[ps_3]["state"], by_prep[ps_3]["reason"]) == ("not_processed", "no_run")
 
     monkeypatch.setenv("QIITA_TOKEN", "qk_admin")

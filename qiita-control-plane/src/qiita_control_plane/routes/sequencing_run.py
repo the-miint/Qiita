@@ -808,9 +808,9 @@ async def get_sequenced_pool_alignment_cohort(
     prep_samples that are both readable by the caller and `'completed'` for this
     alignment.
 
-    Two filters, and both are load-bearing. Readability makes the result a valid
-    mint body by construction — the mint is all-or-nothing, so a cohort this
-    route hands back can never 403 there. Completion is a first-class state:
+    Two filters. Readability means a cohort this route hands back never 403s at
+    the all-or-nothing mint; the mint can still 409 a prep_sample that resolves to
+    another alignment of the group (`definition_resolver`). Completion is a first-class state:
     alignment rows are NOT 1:1 with reads (cross-shard routing and paired-end
     mates both multiply rows per read), so the presence of rows says nothing
     about whether a sample is done.

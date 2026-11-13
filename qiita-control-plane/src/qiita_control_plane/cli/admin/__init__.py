@@ -616,8 +616,8 @@ def _build_parser() -> argparse.ArgumentParser:
         dest="mask_idx",
         help=(
             "mask_idx naming the similarity group of masks to export from (required)."
-            " Each prep_sample is exported from the mask of the group it resolves to;"
-            " one that is incomplete or not processed there is skipped and listed."
+            " Each prep_sample is exported from the mask of the group that it resolves"
+            " to; one that is incomplete or not processed there is skipped and listed."
             " Refused when this mask is deprecated."
         ),
     )
@@ -639,8 +639,8 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "Directory to write each prep_sample's files into (created, with"
             " parents, if missing; files are mode 0600), plus"
-            " masked-read-export.manifest.json mapping each file to the sample's"
-            " and the mask's public handles. A file the manifest records under a"
+            " masked-read-export.manifest.json mapping each file to the prep_sample's"
+            " and the mask's public handles. A file that the manifest records under a"
             " different mask is never overwritten. Otherwise, on re-export, an"
             " existing parquet file is skipped when its count matches the data"
             " plane and overwritten when it differs; an existing fastq target"

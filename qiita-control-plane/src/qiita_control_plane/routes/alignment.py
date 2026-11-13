@@ -504,7 +504,6 @@ async def create_alignment_cohort_doget_ticket(
     alignment_idx: Annotated[int, Field(gt=0)],
     body: AlignmentCohortDoGetTicketRequest,
     pool: asyncpg.Pool = Depends(get_db_pool),
-    tx: TxConnFactory = Depends(get_tx_conn_factory),
     signing_key: bytes = Depends(get_flight_signing_key),
     caller: HumanUser = Depends(require_complete_profile),
     _scope: Principal = Depends(require_scope(Scope.ALIGNMENT_DOGET)),
@@ -531,10 +530,10 @@ async def create_alignment_cohort_doget_ticket(
     filtering makes a feature table cohort-dependent, so trimming the request would
     answer a different scientific question under the name of the one asked.
 
-    After that gate, every sample must resolve to this alignment in its group
-    (`definition_resolver`): a sample processed under another member, incomplete,
-    or not processed (a withdrawn or deprecated upstream included) is a 409 naming
-    what it resolves to.
+    After that gate, every prep_sample must resolve to this alignment in its group
+    (`definition_resolver`): a prep_sample processed under another member,
+    incomplete, or not processed (a withdrawn or deprecated upstream included) is a
+    409 naming its resolution.
     """
     cohort = await authorize_completed_alignment_cohort(
         pool,
@@ -544,7 +543,10 @@ async def create_alignment_cohort_doget_ticket(
         nothing_to="",
     )
     try:
-        async with tx() as conn:
+        async with (
+            pool.acquire() as conn,
+            conn.transaction(isolation="repeatable_read", readonly=True),
+        ):
             resolution = await resolve_group(
                 conn,
                 kind=DefinitionKind.ALIGNMENT,
@@ -565,15 +567,6 @@ async def create_alignment_cohort_doget_ticket(
     )
 
 
-def _describe_resolution(resolution: SampleResolution) -> str:
-    if resolution.reason is None:
-        return f"processed under alignment {resolution.definition_idx}"
-    where = (
-        "" if resolution.definition_idx is None else f" under alignment {resolution.definition_idx}"
-    )
-    return f"{resolution.state.value} ({resolution.reason.value}){where}"
-
-
 def _not_resolved_http(alignment_idx: int, refused: list[SampleResolution]) -> HTTPException:
     """409 for cohort samples that do not resolve to `alignment_idx`: a message, the
     first refused sample's `DefinitionGroupRefusal` code, the count, and the first
@@ -581,9 +574,7 @@ def _not_resolved_http(alignment_idx: int, refused: list[SampleResolution]) -> H
     them, so naming what each resolves to discloses nothing it may not read; the
     list is truncated like every refusal built from a caller-named cohort."""
     shown = refused[:5]
-    examples = "; ".join(
-        f"prep_sample {r.prep_sample_idx}: {_describe_resolution(r)}" for r in shown
-    )
+    examples = "; ".join(r.describe() for r in shown)
     more = ", …" if len(refused) > len(shown) else ""
     return HTTPException(
         status_code=409,

@@ -5,10 +5,13 @@ processed sample in a cohort, so a published feature table can name its samples
 without carrying ours. A control-plane route rather than anything the data plane
 can serve: the identifiers live only in Postgres, and minting one is a write.
 
-Cohort authorization is `authorize_completed_alignment_cohort`, shared with the
-human alignment mint: minting a ticket for a cohort and minting the public handles for
-that same cohort is one workflow, and two answers to "may I read this sample" is
-how one surface comes to advertise what the other refuses.
+The alignment kind's cohort authorization is `authorize_completed_alignment_cohort`,
+shared with the human alignment mint: minting a ticket for a cohort and minting the
+public handles for that same cohort is one workflow, and two answers to "may I read
+this prep_sample" is how one surface comes to advertise what the other refuses. The
+mask kind
+(`POST /exported-identifier/mask`) is gated on system_admin and
+`admin:masked_read_export`, as the masked-read export routes are.
 """
 
 import asyncpg
@@ -133,12 +136,9 @@ async def mint_exported_mask_identifier_map(
     by prep_sample_idx, so a masked-read export can name its files without carrying
     `prep_sample_idx`.
 
-    Gated as the masked-read export routes in routes/admin.py are (system_admin plus
-    admin:masked_read_export): that export is the only reader of these handles.
-
     **Idempotent.** 404 for an unknown mask; 409 for a deprecated mask, and for a
-    cohort with any member not masked-complete under it (the gate the export ticket
-    route applies), in which case nothing is minted.
+    cohort with any member not masked-complete under it (the gate that the export
+    ticket route applies), in which case nothing is minted.
     """
     try:
         rows = await mint_exported_mask_identifiers(

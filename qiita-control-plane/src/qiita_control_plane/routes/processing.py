@@ -65,7 +65,6 @@ from ..repositories.processing import (
     fetch_processing_by_idx,
     fetch_processing_prep_samples,
     list_processing,
-    lock_processing_row,
     set_assembly_sample_states,
     transition_processing_status,
 )
@@ -283,7 +282,6 @@ async def update_processing_status_route(
                 await refuse_deprecating_with_similar_pairs(
                     conn, DefinitionKind.PROCESSING, processing_idx
                 )
-            await lock_processing_row(conn, processing_idx)
             row = await transition_processing_status(
                 conn,
                 processing_idx=processing_idx,

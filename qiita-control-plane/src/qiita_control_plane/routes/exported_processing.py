@@ -1,18 +1,21 @@
 """The public exported-processing handle.
 
-`POST /exported-processing` mints (or recovers) the name a published bundle's
-manifest cites for the processing it was built from. A control-plane route for the
+`POST /exported-processing` mints (or recovers) the name that a published bundle's
+manifest cites for the alignment it was built from, and `POST
+/exported-processing/mask` the name that a masked-read export manifest cites for a
+mask. A control-plane route for the
 same reason as its two siblings: the handle lives only in Postgres and minting one
 is a write.
 
-Authorization is `/exported-identifier`'s, step for step, over the same
-`(alignment_idx, cohort)` pair — and that is the point rather than convenience. A
+The alignment kind's authorization is `/exported-identifier`'s, step for step, over
+the same `(alignment_idx, cohort)` pair — and that is the point rather than convenience. A
 processing is not study-scoped, so it is tempting to conclude there is nothing here
 to authorize; but minting is a **write**, and a route that wrote on behalf of data
 the caller cannot read would hand any human a handle for every processing in the
 system, one `alignment_idx` at a time. The cohort is what closes that: it is not part
 of the handle's identity, it is how a caller shows they could have built the table
-this manifest would describe.
+this manifest would describe. The mask kind is gated on system_admin and
+`admin:masked_read_export`, as the masked-read export routes are.
 """
 
 import asyncpg
@@ -115,9 +118,6 @@ async def mint_exported_mask_processing_handle(
     """Mint the public handle for a mask, so a masked-read export can cite which mask
     produced each file without naming our `mask_idx`.
 
-    Gated as the masked-read export routes in routes/admin.py are (system_admin plus
-    admin:masked_read_export): that export is the only reader of a mask handle.
-
     **Idempotent.** Re-requesting a mask returns the handle it already has. 404 for
     an unknown mask; 409 for a deprecated one, whose config is void.
     """
@@ -130,7 +130,4 @@ async def mint_exported_mask_processing_handle(
     except MaskDefinitionDeprecated as exc:
         raise HTTPException(status_code=409, detail=exc.detail) from exc
 
-    return ExportedMaskProcessingResponse(
-        mask_idx=row["mask_idx"],
-        export_processing_id=row["export_processing_id"],
-    )
+    return ExportedMaskProcessingResponse.model_validate(dict(row))

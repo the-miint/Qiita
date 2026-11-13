@@ -6,9 +6,10 @@ were run over their pool and which of the pool's samples they may build a table
 from. Both are one GET printed verbatim, so a new server-side field reaches the
 user without a CLI change.
 
-Both routes scope their answer to what the CALLER may read, which is what makes
-them agree with the ticket mint: an alignment no sample of which is readable is
-absent from the list entirely, and the cohort is a valid mint body by construction.
+Both routes scope their answer to what the CALLER may read, as the ticket mint
+does: an alignment none of whose prep_samples is readable is absent from the list,
+and a cohort never 403s at the mint (the mint can still 409 a prep_sample that
+resolves to another alignment of the group).
 
 `_alignment_reference_idx` is the one piece of interpretation here, and it belongs
 beside the response whose shape it reads.
@@ -45,9 +46,9 @@ def _fetch_alignment_cohort(
     sequenced_pool_idx: int,
     alignment_idx: int,
 ) -> dict:
-    """GET the pool's samples that are BOTH readable by the caller and completed for
-    this alignment — a valid mint body by construction, sorted so the same pool always
-    produces the same request bytes.
+    """GET the pool's prep_samples that are BOTH readable by the caller and completed
+    for this alignment, sorted so the same pool always produces the same request
+    bytes.
 
     The whole body, not just its sample list: printed on its own a bare list says
     nothing about which alignment it belongs to.

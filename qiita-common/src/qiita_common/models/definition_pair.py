@@ -21,9 +21,8 @@ from qiita_common.auth_constants import MAX_REASON_LENGTH
 class DefinitionKind(StrEnum):
     """Which definition table a pair names (`qiita.definition_pair.definition_kind`).
 
-    Mirrors a TEXT + CHECK column, NOT a Postgres ENUM, so it has no `ENUM_PAIRS`
-    entry. Keep this set and the CHECK in the `definition_pair` migration in sync by
-    hand.
+    Twin of a TEXT + CHECK column (`20261113000000_definition_pair.sql`), not a
+    Postgres ENUM.
     """
 
     MASK = "mask"
@@ -35,9 +34,8 @@ class DefinitionPairVerdict(StrEnum):
     """A pair's decision (`qiita.definition_pair.verdict` and
     `qiita.definition_pair_event.verdict`).
 
-    Mirrors a TEXT + CHECK column, NOT a Postgres ENUM, so it has no `ENUM_PAIRS`
-    entry. Keep this set and the CHECKs in the `definition_pair` migration in sync
-    by hand.
+    Twin of a TEXT + CHECK column (`20261113000000_definition_pair.sql`), not a
+    Postgres ENUM.
     """
 
     PENDING = "pending"
@@ -48,9 +46,8 @@ class DefinitionPairVerdict(StrEnum):
 class DefinitionPairEventType(StrEnum):
     """What a `qiita.definition_pair_event` row records.
 
-    Mirrors a TEXT + CHECK column, NOT a Postgres ENUM, so it has no `ENUM_PAIRS`
-    entry. Keep this set and the CHECK in the `definition_pair` migration in sync by
-    hand.
+    Twin of a TEXT + CHECK column (`20261113000000_definition_pair.sql`), not a
+    Postgres ENUM.
     """
 
     OPENED = "opened"

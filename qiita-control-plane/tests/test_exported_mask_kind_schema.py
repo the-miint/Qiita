@@ -54,9 +54,6 @@ async def probe(postgres_pool):
         "principal_idx": principal_idx,
     }
     await postgres_pool.execute(
-        "DELETE FROM qiita.exported_identifier WHERE created_by_idx = $1", principal_idx
-    )
-    await postgres_pool.execute(
         "DELETE FROM qiita.exported_processing WHERE created_by_idx = $1", principal_idx
     )
     await teardown_entity_graph(

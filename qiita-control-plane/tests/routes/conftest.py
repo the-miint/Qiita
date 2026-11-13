@@ -41,6 +41,7 @@ from qiita_control_plane.repositories import UpdatableTable
 from qiita_control_plane.repositories._sample_helpers import EntityMetadataSpec, SampleEntityKind
 from qiita_control_plane.repositories.alignment_definition import mint_alignment_definition
 from qiita_control_plane.repositories.biosample_metadata import BIOSAMPLE_METADATA_SPEC
+from qiita_control_plane.repositories.block import MASK_SAMPLE_COMPLETED
 from qiita_control_plane.repositories.mask_definition import mint_mask_definition
 from qiita_control_plane.repositories.prep_sample import set_prep_sample_retired
 from qiita_control_plane.repositories.prep_sample_metadata import PREP_SAMPLE_METADATA_SPEC
@@ -1560,9 +1561,8 @@ async def pool_alignment_seed(role_keyed_clients):
 
     mask_idx = await _mint_mask(db, owner_idx=owner, tag=f"mask-{uuid.uuid4()}")
     await db.executemany(
-        "INSERT INTO qiita.mask_sample (mask_idx, prep_sample_idx, state)"
-        " VALUES ($1, $2, 'completed')",
-        [(mask_idx, ps) for _, ps, _ in samples],
+        "INSERT INTO qiita.mask_sample (mask_idx, prep_sample_idx, state) VALUES ($1, $2, $3)",
+        [(mask_idx, ps, MASK_SAMPLE_COMPLETED) for _, ps, _ in samples],
     )
     align_1 = await _mint_alignment(
         db, owner_idx=owner, tag=f"one-{uuid.uuid4()}", mask_idx=mask_idx
@@ -1675,6 +1675,8 @@ async def alignment_group_world(pool_alignment_seed, role_keyed_clients):
         "DELETE FROM qiita.definition_pair WHERE definition_pair_idx = $1",
         pair["definition_pair_idx"],
     )
+    # These two are this fixture's own parents; deleting them clears their swept
+    # alignment_sample / mask_sample rows (ON DELETE CASCADE) ahead of the seed's sweep.
     await pool.execute("DELETE FROM qiita.alignment_definition WHERE alignment_idx = $1", align_3)
     await pool.execute("DELETE FROM qiita.mask_definition WHERE mask_idx = $1", mask_2)
 

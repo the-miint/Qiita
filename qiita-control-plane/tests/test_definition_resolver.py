@@ -195,6 +195,55 @@ def test_a_failed_ticket_is_incomplete_failed_and_does_not_fall_back():
     )
 
 
+_EXPECTED_BY_TICKET_STATE = {
+    WorkTicketState.PENDING: (INCOMPLETE, 12, R.IN_PROGRESS),
+    WorkTicketState.QUEUED: (INCOMPLETE, 12, R.IN_PROGRESS),
+    WorkTicketState.PROCESSING: (INCOMPLETE, 12, R.IN_PROGRESS),
+    WorkTicketState.FAILED: (INCOMPLETE, 12, R.FAILED),
+    WorkTicketState.COMPLETED: (PROCESSED, 5, None),
+    WorkTicketState.NO_DATA: (PROCESSED, 5, None),
+    WorkTicketState.CANCELLED: (PROCESSED, 5, None),
+}
+
+
+def test_every_ticket_state_has_an_expected_resolution():
+    assert set(_EXPECTED_BY_TICKET_STATE) == set(WorkTicketState)
+
+
+@pytest.mark.parametrize("ticket_state", list(WorkTicketState))
+def test_a_block_ticket_in_each_state_over_a_pending_gate(ticket_state):
+    rows = [
+        RunRow(
+            source=SOURCE_GATE,
+            definition_idx=5,
+            prep_sample_idx=S,
+            state="completed",
+            work_ticket_idx=None,
+        ),
+        RunRow(
+            source=SOURCE_GATE,
+            definition_idx=12,
+            prep_sample_idx=S,
+            state="pending",
+            work_ticket_idx=None,
+        ),
+        RunRow(
+            source=SOURCE_BLOCK_TICKET,
+            definition_idx=12,
+            prep_sample_idx=S,
+            state=ticket_state.value,
+            work_ticket_idx=77,
+        ),
+    ]
+    r = resolve(DEFS, PAIRS, MASK, 5, {MASK: build_observations(rows)})
+    assert (r.state, r.definition_idx, r.reason) == _EXPECTED_BY_TICKET_STATE[ticket_state]
+
+
+def test_an_unknown_gate_state_is_refused():
+    with pytest.raises(ValueError, match="unknown mask gate state"):
+        resolve(DEFS, PAIRS, MASK, 5, {MASK: {(12, S): gate("archived")}})
+
+
 def test_running_wins_over_failed_when_naming_the_ticket():
     obs = {
         MASK: {

@@ -12,26 +12,51 @@ import asyncpg
 
 from .mask_definition import lock_active_mask
 
-_SELECT_LIVE = (
-    "SELECT alignment_idx, export_processing_id"
-    "  FROM qiita.exported_processing"
-    " WHERE alignment_idx = $1 AND NOT retired"
-)
+# The kind columns, each with its own partial unique index on live rows.
+# Interpolated into SQL, so the set is closed.
+_KIND_COLUMNS = frozenset({"alignment_idx", "mask_idx"})
 
 
 class ProcessingVanishedError(RuntimeError):
     """The processing had no live handle after minting one for it.
 
-    Reachable only if the alignment_definition row is removed concurrently, which
-    retires the handles it named. `qiita_common.actions`, at `BLOCK_MASK_ACTION_ID`,
-    says how one can be removed.
+    Reachable for an alignment only if its alignment_definition row is removed
+    concurrently, which retires the handles it named. `qiita_common.actions`, at
+    `BLOCK_MASK_ACTION_ID`, says how one can be removed. A mask's mint holds the mask
+    row `FOR SHARE`, so a mask handle does not vanish this way.
     """
 
-    def __init__(self, alignment_idx: int) -> None:
-        self.alignment_idx = alignment_idx
-        super().__init__(
-            f"alignment {alignment_idx} has no live exported processing identifier after minting"
-        )
+    def __init__(self, column: str, idx: int) -> None:
+        self.column = column
+        self.idx = idx
+        super().__init__(f"{column}={idx} has no live exported processing identifier after minting")
+
+
+async def _mint_live(
+    conn: asyncpg.Connection, *, column: str, idx: int, created_by_idx: int
+) -> asyncpg.Record:
+    """INSERT a handle for `column = idx` unless a live one exists, then return the
+    live row as `(column, export_processing_id)`. The INSERT conflicts against the
+    kind's partial unique index on live rows and does nothing, so two concurrent
+    callers both get the winner's row."""
+    if column not in _KIND_COLUMNS:
+        raise ValueError(f"not an exported_processing kind column: {column!r}")
+    await conn.execute(
+        f"INSERT INTO qiita.exported_processing ({column}, created_by_idx)"
+        " VALUES ($1, $2)"
+        f" ON CONFLICT ({column}) WHERE NOT retired DO NOTHING",
+        idx,
+        created_by_idx,
+    )
+    row = await conn.fetchrow(
+        f"SELECT {column}, export_processing_id"
+        "  FROM qiita.exported_processing"
+        f" WHERE {column} = $1 AND NOT retired",
+        idx,
+    )
+    if row is None:
+        raise ProcessingVanishedError(column, idx)
+    return row
 
 
 async def mint_exported_processing(
@@ -44,8 +69,7 @@ async def mint_exported_processing(
     or nobody can tell they share it. The INSERT conflicts against the partial unique
     index on live rows and does nothing.
 
-    Two concurrent callers are safe without a lock: both INSERT, the index lets one
-    row win, `DO NOTHING` swallows the loser, and the SELECT hands the winner to both.
+    Two concurrent callers are safe without a lock (`_mint_live`).
 
     Raises `ProcessingVanishedError` rather than returning None. The INSERT
     guarantees a live row at the moment it runs, but READ COMMITTED means the SELECT
@@ -53,18 +77,9 @@ async def mint_exported_processing(
     drops out — and a manifest citing nothing is worse than a failed build.
     """
     async with pool.acquire() as conn, conn.transaction():
-        await conn.execute(
-            "INSERT INTO qiita.exported_processing (alignment_idx, created_by_idx)"
-            " VALUES ($1, $2)"
-            " ON CONFLICT (alignment_idx) WHERE NOT retired DO NOTHING",
-            alignment_idx,
-            created_by_idx,
+        return await _mint_live(
+            conn, column="alignment_idx", idx=alignment_idx, created_by_idx=created_by_idx
         )
-        row = await conn.fetchrow(_SELECT_LIVE, alignment_idx)
-
-    if row is None:
-        raise ProcessingVanishedError(alignment_idx)
-    return row
 
 
 async def mint_exported_mask_processing(
@@ -83,21 +98,6 @@ async def mint_exported_mask_processing(
     """
     async with pool.acquire() as conn, conn.transaction():
         await lock_active_mask(conn, mask_idx)
-        await conn.execute(
-            "INSERT INTO qiita.exported_processing (mask_idx, created_by_idx)"
-            " VALUES ($1, $2)"
-            " ON CONFLICT (mask_idx) WHERE NOT retired DO NOTHING",
-            mask_idx,
-            created_by_idx,
+        return await _mint_live(
+            conn, column="mask_idx", idx=mask_idx, created_by_idx=created_by_idx
         )
-        row = await conn.fetchrow(
-            "SELECT mask_idx, export_processing_id"
-            "  FROM qiita.exported_processing"
-            " WHERE mask_idx = $1 AND NOT retired",
-            mask_idx,
-        )
-    if row is None:
-        raise RuntimeError(
-            f"mask {mask_idx} has no live exported processing identifier after minting"
-        )
-    return row

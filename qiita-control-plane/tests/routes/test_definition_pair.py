@@ -25,11 +25,14 @@ from qiita_common.api_paths import (
     URL_PROCESSING_STATUS,
 )
 from qiita_common.auth_constants import Scope
+from qiita_common.models import DefinitionPairVerdict
 
+from qiita_control_plane.definition_similarity import decide_pair
 from qiita_control_plane.repositories import definition_pair as pair_repo
 from qiita_control_plane.repositories.alignment_definition import mint_alignment_definition
 from qiita_control_plane.repositories.mask_definition import mint_mask_definition
 from qiita_control_plane.repositories.processing import mint_processing
+from qiita_control_plane.testing.postgres import until_advisory_lock_awaited
 
 pytestmark = pytest.mark.db
 
@@ -546,3 +549,45 @@ async def test_a_decision_does_not_queue_behind_a_shared_holder(
         )
 
     assert (await _decide(clients["admin"], pair_idx, "similar")).status_code == 200
+
+
+async def test_a_deprecation_waits_for_a_decision_in_progress_and_sees_it(
+    postgres_pool, clients, defs
+):
+    """A deprecation PATCH arriving while a `similar` decision on its definition holds
+    the group lock EXCLUSIVE waits for it to commit, then refuses with
+    `similar_pairs`. Without its SHARED group lock the PATCH would read no similar
+    pair (the decision is uncommitted) and deprecate the mask."""
+    m1, m2 = await defs["mask"](rype=0.05), await defs["mask"](rype=0.1)
+    pair_idx = await _opened(clients["admin"], "mask", m1, m2)
+    url = URL_MASK_DEFINITION_STATUS.format(mask_idx=m2)
+
+    async with postgres_pool.acquire() as decider:
+        tx = decider.transaction()
+        await tx.start()
+        try:
+            await decide_pair(
+                decider,
+                definition_pair_idx=pair_idx,
+                verdict=DefinitionPairVerdict.SIMILAR,
+                reason="same filter, reviewed",
+                principal_idx=defs["owner"],
+            )
+            patch = asyncio.create_task(_deprecate(clients["admin"], url))
+            await asyncio.wait_for(
+                until_advisory_lock_awaited(
+                    postgres_pool,
+                    lock_class=pair_repo.DEFINITION_GROUP_LOCK_CLASS,
+                    key=pair_repo.DEFINITION_GROUP_LOCK_KEY,
+                    task=patch,
+                ),
+                timeout=10,
+            )
+            assert not patch.done()
+        except BaseException:
+            await tx.rollback()
+            raise
+        await tx.commit()
+
+    detail = _refusal(await asyncio.wait_for(patch, timeout=10), "similar_pairs")
+    assert detail["definition_pair_idx"] == [pair_idx]

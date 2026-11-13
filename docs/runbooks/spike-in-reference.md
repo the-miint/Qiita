@@ -122,7 +122,7 @@ qiita mask syndna-read-count --mask-idx M --study-idx S --output syndna.biom \
 
 Select by `--study-idx`, `--sequenced-pool-idx` or `--prep-sample-idx` (repeatable;
 the filters intersect). Each selected prep_sample is read under the mask of `M`'s
-similarity group it resolves to; one that is incomplete or not processed there is left
+similarity group that it resolves to; one that is incomplete or not processed there is left
 out of the table and listed on stderr, and masks of the group with a different SynDNA
 reference are refused. `--format parquet` writes the same values with the zero cells
 kept. Each prep_sample's `sample_id` is its biosample accession; `--prefix-pool` makes it

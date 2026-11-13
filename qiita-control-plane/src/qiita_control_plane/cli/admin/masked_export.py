@@ -1,10 +1,10 @@
 """qiita-admin CLI — masked-read-export subcommand.
 
 Each prep_sample on the pool is resolved across the named mask's similarity group
-by the roster route; a `processed` one is exported from the member it resolved to,
-and the others are listed and skipped. The output directory carries a manifest
-(`MANIFEST_NAME`) naming, per exported file, the sample's and the mask's public
-handles.
+by the roster route; a `processed` one is exported from the mask named in its
+resolution, and the others are listed and skipped. The output directory carries a
+manifest (`MANIFEST_NAME`) naming, per exported file, the prep_sample's and the
+mask's public handles.
 """
 
 import argparse
@@ -19,6 +19,7 @@ import time
 from pathlib import Path
 
 import httpx
+from pydantic import ValidationError
 from qiita_common.api_paths import (
     PATH_ADMIN_MASKED_READ_EXPORT_TICKET,
     PATH_ADMIN_PREFIX,
@@ -31,9 +32,7 @@ from qiita_common.api_paths import (
 from qiita_common.data_plane_errors import is_data_plane_transient
 from qiita_common.flight_constants import ipc_compression_headers
 from qiita_common.models import (
-    DefinitionKind,
     MaskedReadExportSample,
-    SampleResolution,
     SampleResolutionState,
 )
 from qiita_common.models._base import MAX_COHORT_PREP_SAMPLE_IDX
@@ -379,20 +378,8 @@ def _mint_mask_handles(
 
 
 def _left_out_lines(samples: list[MaskedReadExportSample]) -> list[str]:
-    """One line per roster sample that is not exported, and why."""
-    return [
-        _common.describe_resolution(
-            SampleResolution(
-                prep_sample_idx=s.prep_sample_idx,
-                state=s.state,
-                definition_kind=DefinitionKind.MASK,
-                definition_idx=s.resolved_mask_idx,
-                reason=s.reason,
-                work_ticket_idx=s.work_ticket_idx,
-            )
-        )
-        for s in samples
-    ]
+    """One line per roster prep_sample that is not exported, and why."""
+    return [s.resolution.describe() for s in samples]
 
 
 def _handle_masked_read_export(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
@@ -424,7 +411,7 @@ def _handle_masked_read_export(args: argparse.Namespace, parser: argparse.Argume
       - fastq output: any target file already exists (below).
 
     Re-export of a file the manifest records under the same mask, or does not
-    record at all, keeps the older rule: idempotent for parquet — skipped when its
+    record at all: idempotent for parquet — skipped when its
     record count matches the data plane's (nothing changed), overwritten when the
     counts differ — while fastq has no cheap on-disk count, so an existing fastq
     target is refused up front rather than re-exported or overwritten.
@@ -469,7 +456,11 @@ def _handle_masked_read_export(args: argparse.Namespace, parser: argparse.Argume
         _common.print_request_error(exc)
         return 1
 
-    samples = [MaskedReadExportSample.model_validate(s) for s in roster["samples"]]
+    try:
+        samples = [MaskedReadExportSample.model_validate(s) for s in roster["samples"]]
+    except ValidationError as exc:
+        _common.print_validation_error(exc)
+        return 1
     run_idx = roster["sequencing_run_idx"]
     pool_idx = roster["sequenced_pool_idx"]
     if not samples:
@@ -478,8 +469,8 @@ def _handle_masked_read_export(args: argparse.Namespace, parser: argparse.Argume
             "nothing to export"
         )
         return 0
-    processed = [s for s in samples if s.state is SampleResolutionState.PROCESSED]
-    left_out = [s for s in samples if s.state is not SampleResolutionState.PROCESSED]
+    processed = [s for s in samples if s.resolution.state is SampleResolutionState.PROCESSED]
+    left_out = [s for s in samples if s.resolution.state is not SampleResolutionState.PROCESSED]
 
     def print_left_out() -> None:
         if not left_out:
@@ -515,7 +506,7 @@ def _handle_masked_read_export(args: argparse.Namespace, parser: argparse.Argume
     stems = {s.prep_sample_idx: _export_stem(s.model_dump(), run_idx, pool_idx) for s in processed}
     samples_by_mask: dict[int, list[int]] = {}
     for s in processed:
-        samples_by_mask.setdefault(s.resolved_mask_idx, []).append(s.prep_sample_idx)
+        samples_by_mask.setdefault(s.resolution.definition_idx, []).append(s.prep_sample_idx)
     try:
         recorded = _read_export_manifest(output_dir)
         mask_handles, sample_handles = _mint_mask_handles(args.base_url, token, samples_by_mask)
@@ -533,12 +524,12 @@ def _handle_masked_read_export(args: argparse.Namespace, parser: argparse.Argume
     # reads; refuse the whole export before any download rather than replace them.
     conflicts = sorted(
         f"{name} (recorded under {recorded[name]['export_processing_id']},"
-        f" now {mask_handles[s.resolved_mask_idx]})"
+        f" now {mask_handles[s.resolution.definition_idx]})"
         for s in processed
         for name in _candidate_names(stems[s.prep_sample_idx], args.format)
         if name in recorded
         and (output_dir / name).exists()
-        and recorded[name]["export_processing_id"] != mask_handles[s.resolved_mask_idx]
+        and recorded[name]["export_processing_id"] != mask_handles[s.resolution.definition_idx]
     )
     if conflicts:
         print(
@@ -609,7 +600,7 @@ def _handle_masked_read_export(args: argparse.Namespace, parser: argparse.Argume
         for s in processed:
             prep = s.prep_sample_idx
             stem = stems[prep]
-            mask_idx = s.resolved_mask_idx
+            mask_idx = s.resolution.definition_idx
 
             def export_one(prep=prep, stem=stem, mask_idx=mask_idx) -> list[str] | None:
                 """Export one prep_sample and return the names written; None when it

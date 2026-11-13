@@ -91,7 +91,8 @@ async def fetch_run_rows(
     abandoned. One statement, so gates and tickets are read from one snapshot.
 
     For `processing`, gate rows only; the tickets come from
-    `fetch_assembly_ticket_candidates`."""
+    `fetch_assembly_ticket_candidates`, a second statement, so a caller reading
+    both runs them in one REPEATABLE READ transaction."""
     definitions = sorted(set(definition_idxs))
     samples = sorted(set(prep_sample_idxs))
     if not definitions or not samples:
@@ -147,8 +148,9 @@ async def fetch_run_rows(
 
 @dataclass(frozen=True)
 class AssemblyTicketCandidate:
-    """A long-read-assembly ticket the runner has started (its consumed `mask_idx`
-    is recorded), with what is needed to compute the processing params it mints."""
+    """A long-read-assembly ticket that the runner has started (its consumed
+    `mask_idx` is recorded), with what is needed to compute the processing params
+    that it mints."""
 
     work_ticket_idx: int
     prep_sample_idx: int
@@ -167,15 +169,15 @@ def _decode(value: Any) -> Any:
 async def fetch_assembly_ticket_candidates(
     conn: asyncpg.Connection, prep_sample_idxs: Sequence[int]
 ) -> list[AssemblyTicketCandidate]:
-    """The long-read-assembly tickets of these samples that are not cancelled and
-    that the runner has started. A started ticket has `mask_idx` recorded
-    (`runner._workflow`, before the processing mint); one not started yet is not
+    """The long-read-assembly tickets of these prep_samples that are not cancelled and
+    that the runner has started: the runner records a ticket's `mask_idx` before it
+    mints the processing, so a ticket with none is not started and is not
     returned."""
     samples = sorted(set(prep_sample_idxs))
     if not samples:
         return []
     rows = await conn.fetch(
-        "SELECT wt.work_ticket_idx, wt.prep_sample_idx, wt.state::text AS state,"
+        "SELECT wt.work_ticket_idx, wt.prep_sample_idx, wt.state,"
         "       wt.action_id, wt.action_version, wt.action_context, wt.mask_idx,"
         "       a.context_schema"
         "  FROM qiita.work_ticket wt"
@@ -188,14 +190,11 @@ async def fetch_assembly_ticket_candidates(
     )
     return [
         AssemblyTicketCandidate(
-            work_ticket_idx=r["work_ticket_idx"],
-            prep_sample_idx=r["prep_sample_idx"],
-            state=r["state"],
-            action_id=r["action_id"],
-            action_version=r["action_version"],
-            action_context=_decode(r["action_context"]) or {},
-            mask_idx=r["mask_idx"],
-            context_schema=_decode(r["context_schema"]) or {},
+            **{
+                **dict(r),
+                "action_context": _decode(r["action_context"]) or {},
+                "context_schema": _decode(r["context_schema"]) or {},
+            }
         )
         for r in rows
     ]

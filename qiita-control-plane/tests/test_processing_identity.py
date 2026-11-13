@@ -9,9 +9,9 @@ from __future__ import annotations
 from qiita_common.actions import WorkflowAction, WorkflowStep
 
 from qiita_control_plane.runner._processing import (
-    _build_processing_params,
     _workflow_needs_processing,
     _workflow_writes_assembly_gate,
+    build_processing_params,
 )
 
 
@@ -47,7 +47,7 @@ def test_build_processing_params_shape_and_assembler_default():
     """The canonical params carry workflow+version+mask_idx+assembler; an omitted
     assembler collapses to the passed context_schema default (so omitted ==
     explicit-default)."""
-    explicit = _build_processing_params(
+    explicit = build_processing_params(
         "long-read-assembly",
         "1.0.0",
         {"mask_idx": 7, "assembler": "myloasm"},
@@ -60,12 +60,12 @@ def test_build_processing_params_shape_and_assembler_default():
         "assembler": "myloasm",
     }
 
-    omitted = _build_processing_params(
+    omitted = build_processing_params(
         "long-read-assembly", "1.0.0", {"mask_idx": 7}, assembler_default="hifiasm_meta"
     )
     assert omitted["assembler"] == "hifiasm_meta"
     # Omitted and explicit-default hash-collapse (same dict -> same processing_idx).
-    assert omitted == _build_processing_params(
+    assert omitted == build_processing_params(
         "long-read-assembly",
         "1.0.0",
         {"mask_idx": 7, "assembler": "hifiasm_meta"},
@@ -77,7 +77,7 @@ def test_amplicon_params_carry_only_amplicon_knobs():
     """An amplicon run hashes trim/sortmerna_reference_idx/orient_primer and NOT the
     assembly knobs. primer is dropped when orient_primer is off (a no-op knob then),
     so the two families never pollute each other's identity."""
-    amplicon = _build_processing_params(
+    amplicon = build_processing_params(
         "amplicon",
         "1.0.0",
         {
@@ -103,10 +103,10 @@ def test_amplicon_omitted_and_defaulted_knobs_hash_identically():
     """The idempotency fix: omitting the optional knobs and passing their defaults
     describe the same analysis, so they must produce the same params. primer is a
     no-op when orient is off; orient defaults off."""
-    required_only = _build_processing_params(
+    required_only = build_processing_params(
         "amplicon", "1.0.0", {"trim": 150, "sortmerna_reference_idx": 3}
     )
-    with_defaults = _build_processing_params(
+    with_defaults = build_processing_params(
         "amplicon",
         "1.0.0",
         {
@@ -121,8 +121,8 @@ def test_amplicon_omitted_and_defaulted_knobs_hash_identically():
 
 def test_amplicon_orient_on_hashes_the_primer():
     """When orient_primer is on, primer IS result-affecting and enters the hash."""
-    off = _build_processing_params("amplicon", "1.0.0", {"trim": 150, "sortmerna_reference_idx": 3})
-    on = _build_processing_params(
+    off = build_processing_params("amplicon", "1.0.0", {"trim": 150, "sortmerna_reference_idx": 3})
+    on = build_processing_params(
         "amplicon",
         "1.0.0",
         {
@@ -140,10 +140,10 @@ def test_amplicon_trim_and_reference_are_part_of_the_identity():
     """Different truncation length OR different SortMeRNA reference -> distinct
     params (distinct processing_idx): both change the denoised result."""
     base = {"trim": 150, "primer": "GTGYCAGCMGCCGCGGTAA", "sortmerna_reference_idx": 3}
-    trim_a = _build_processing_params("amplicon", "1.0.0", {**base, "trim": 150})
-    trim_b = _build_processing_params("amplicon", "1.0.0", {**base, "trim": 100})
+    trim_a = build_processing_params("amplicon", "1.0.0", {**base, "trim": 150})
+    trim_b = build_processing_params("amplicon", "1.0.0", {**base, "trim": 100})
     assert trim_a != trim_b
-    ref_b = _build_processing_params("amplicon", "1.0.0", {**base, "sortmerna_reference_idx": 4})
+    ref_b = build_processing_params("amplicon", "1.0.0", {**base, "sortmerna_reference_idx": 4})
     assert trim_a != ref_b
 
 
@@ -151,10 +151,10 @@ def test_mask_idx_is_part_of_the_identity():
     """mask_idx is the gating input predicate: the same sample+assembler assembled
     from two different masks must yield DISTINCT params (distinct processing_idx),
     never a false duplicate that disallow-without-delete would block."""
-    mask_a = _build_processing_params(
+    mask_a = build_processing_params(
         "long-read-assembly", "1.0.0", {"mask_idx": 1}, assembler_default="hifiasm_meta"
     )
-    mask_b = _build_processing_params(
+    mask_b = build_processing_params(
         "long-read-assembly", "1.0.0", {"mask_idx": 2}, assembler_default="hifiasm_meta"
     )
     assert mask_a != mask_b

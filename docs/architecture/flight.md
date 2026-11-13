@@ -170,7 +170,7 @@ authorization models:
 | Route | Caller | Cohort source | Authorization |
 |---|---|---|---|
 | `POST /alignment/ticket/doget` | service account, `ticket:doget` | the work ticket's `action_context` | scope, then a re-check of what the runner resolver validated at submit: 409 if the alignment was deprecated or a prep_sample is no longer `completed` (for the de novo arm: only the prep_samples whose assembly completed, plus a 409 if the assembly run was deprecated or a prep_sample's assembly gate left `completed` / `no_data`) |
-| `POST /alignment/{alignment_idx}/ticket/doget` | human, `alignment:doget` | the request body | `Tier.VIEWER` on every study each `prep_sample_idx` links to, all-or-nothing, plus a completeness re-check; then 409 for any sample that does not resolve to this alignment in its group (`definition_resolver`) |
+| `POST /alignment/{alignment_idx}/ticket/doget` | human, `alignment:doget` | the request body | `Tier.VIEWER` on every study each `prep_sample_idx` links to, all-or-nothing, plus a completeness re-check; then 409 for any prep_sample that does not resolve to this alignment in its group (`definition_resolver`) |
 
 The second exists because a scientist pulling their own data has no runner
 upstream to have validated anything. It is also the only place that validation
@@ -393,14 +393,14 @@ Two consequences worth stating here, because neither is visible from any single 
   reproduce — coverage filtering makes the table a function of the whole cohort, not
   only of the samples in it, which is why the manifest is a member rather than a flag.
 - **A cohort can span pools and a similarity group, and is then read in parts.** Each
-  sample is resolved (`POST /definition-group/resolve`) in `--alignment-idx`'s group; a
-  sample that is incomplete or not processed stops the build, since the cohort is never
-  narrowed. The samples are read per resolved alignment, one part each, and the parts'
-  DoGet streams are chained into one staged relation (`staged_streams`), so the analytic
-  runs once over the whole cohort. The manifest carries one `export_processing_id` per
-  part and maps each sample's `export_id` to its part's handle; the de novo arm's parts
-  are recorded the same way, each paired with a reference part whose mask is in the same
-  mask group.
+  prep_sample is resolved (`POST /definition-group/resolve`) in `--alignment-idx`'s
+  group; a prep_sample that is incomplete or not processed stops the build, since the
+  cohort is never narrowed. The prep_samples are read per resolved alignment, one part
+  each, and the parts' DoGet streams are chained into one staged relation
+  (`staged_streams`), so the analytic runs once over the whole cohort. The manifest
+  carries one `export_processing_id` per part and maps each prep_sample's `export_id`
+  to its part's handle; the de novo arm's parts are recorded the same way, each paired
+  with a reference part whose mask is in the same mask group.
 
 Client half: `qiita_control_plane.cli.user.feature_table`, with `cli.user.alignment` for
 the discovery reads that yield an `alignment_idx`. The reference is read out of the

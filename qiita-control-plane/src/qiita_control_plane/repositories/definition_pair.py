@@ -1,5 +1,6 @@
-"""SQL for `qiita.definition_pair` / `qiita.definition_pair_event`, the definition
-reads the group rules run on, and the group lock.
+"""SQL for `qiita.definition_pair` / `qiita.definition_pair_event`, the reads of
+masks, alignments and processings that the group rules take as input, and the group
+lock.
 
 The rules themselves (what a change is, how groups form, what is refused) are in
 `qiita_control_plane.definition_similarity`; nothing here decides anything.
@@ -12,9 +13,12 @@ from typing import Any
 
 import asyncpg
 from qiita_common.models import (
+    AlignmentDefinitionStatus,
     DefinitionKind,
     DefinitionPairEventType,
     DefinitionPairVerdict,
+    MaskDefinitionStatus,
+    ProcessingStatus,
 )
 
 from . import require_transaction
@@ -95,12 +99,28 @@ class DefinitionRow:
     workflow: str | None
 
 
-# Per kind: the table, its id column, and the column the comparison scope reads.
-# Interpolated into SQL, so the map is closed.
-_DEFINITION_TABLES: dict[DefinitionKind, tuple[str, str, str]] = {
-    DefinitionKind.MASK: ("qiita.mask_definition", "mask_idx", "filter_workflow"),
-    DefinitionKind.ALIGNMENT: ("qiita.alignment_definition", "alignment_idx", "NULL::text"),
-    DefinitionKind.PROCESSING: ("qiita.processing", "processing_idx", "workflow"),
+# Per kind: the table, its id column, the column the comparison scope reads, and
+# the kind's deprecated status. The first three are interpolated into SQL, so the
+# map is closed.
+_DEFINITION_TABLES: dict[DefinitionKind, tuple[str, str, str, str]] = {
+    DefinitionKind.MASK: (
+        "qiita.mask_definition",
+        "mask_idx",
+        "filter_workflow",
+        MaskDefinitionStatus.DEPRECATED.value,
+    ),
+    DefinitionKind.ALIGNMENT: (
+        "qiita.alignment_definition",
+        "alignment_idx",
+        "NULL::text",
+        AlignmentDefinitionStatus.DEPRECATED.value,
+    ),
+    DefinitionKind.PROCESSING: (
+        "qiita.processing",
+        "processing_idx",
+        "workflow",
+        ProcessingStatus.DEPRECATED.value,
+    ),
 }
 
 
@@ -115,7 +135,7 @@ def _definition_row(kind: DefinitionKind, row: asyncpg.Record) -> DefinitionRow:
         kind=kind,
         idx=row["idx"],
         params=_decode(row["params"]),
-        deprecated=row["status"] == "deprecated",
+        deprecated=row["status"] == _DEFINITION_TABLES[kind][3],
         workflow=row["workflow"],
     )
 
@@ -123,10 +143,9 @@ def _definition_row(kind: DefinitionKind, row: asyncpg.Record) -> DefinitionRow:
 async def fetch_definitions(conn: asyncpg.Connection) -> list[DefinitionRow]:
     """Every mask, alignment and processing definition, deprecated ones included."""
     out: list[DefinitionRow] = []
-    for kind, (table, id_col, workflow_col) in _DEFINITION_TABLES.items():
+    for kind, (table, id_col, workflow_col, _) in _DEFINITION_TABLES.items():
         rows = await conn.fetch(
-            f"SELECT {id_col} AS idx, params, status, {workflow_col} AS workflow"
-            f" FROM {table} ORDER BY {id_col}"
+            f"SELECT {id_col} AS idx, params, status, {workflow_col} AS workflow FROM {table}"
         )
         out.extend(_definition_row(kind, r) for r in rows)
     return out
@@ -136,7 +155,7 @@ async def fetch_definition(
     conn: asyncpg.Connection, kind: DefinitionKind, idx: int
 ) -> DefinitionRow | None:
     """One definition of `kind`, or None when no row has `idx`."""
-    table, id_col, workflow_col = _DEFINITION_TABLES[kind]
+    table, id_col, workflow_col, _ = _DEFINITION_TABLES[kind]
     row = await conn.fetchrow(
         f"SELECT {id_col} AS idx, params, status, {workflow_col} AS workflow"
         f" FROM {table} WHERE {id_col} = $1",
@@ -204,11 +223,6 @@ async def insert_pair(
             low_idx,
             high_idx,
         )
-        if existing is None:
-            raise RuntimeError(
-                f"{kind.value} pair ({low_idx}, {high_idx}) conflicted on insert but is not"
-                " readable; the conflicting transaction rolled back, retry"
-            )
         return existing, False
     await _insert_event(
         conn,
@@ -261,8 +275,7 @@ async def fetch_live_pairs(conn: asyncpg.Connection) -> list[asyncpg.Record]:
     """Every pair that is not detached, of every kind and verdict."""
     return list(
         await conn.fetch(
-            f"SELECT {_PAIR_COLUMNS} FROM qiita.definition_pair"
-            " WHERE detached_at IS NULL ORDER BY definition_pair_idx"
+            f"SELECT {_PAIR_COLUMNS} FROM qiita.definition_pair WHERE detached_at IS NULL"
         )
     )
 
@@ -289,11 +302,12 @@ async def fetch_similar_pairs_naming(
         r["definition_pair_idx"]
         for r in await conn.fetch(
             "SELECT definition_pair_idx FROM qiita.definition_pair"
-            " WHERE definition_kind = $1 AND verdict = 'similar' AND detached_at IS NULL"
+            " WHERE definition_kind = $1 AND verdict = $3 AND detached_at IS NULL"
             "   AND $2 IN (low_definition_ref, high_definition_ref)"
             " ORDER BY definition_pair_idx",
             kind.value,
             idx,
+            DefinitionPairVerdict.SIMILAR.value,
         )
     ]
 
@@ -337,11 +351,12 @@ async def record_revoke(
     require_transaction(conn)
     row = await conn.fetchrow(
         "UPDATE qiita.definition_pair"
-        "   SET verdict = 'pending', decided_by_idx = NULL, decided_at = NULL,"
+        "   SET verdict = $2, decided_by_idx = NULL, decided_at = NULL,"
         "       decision_reason = NULL"
         " WHERE definition_pair_idx = $1"
         f" RETURNING {_PAIR_COLUMNS}",
         definition_pair_idx,
+        DefinitionPairVerdict.PENDING.value,
     )
     await _insert_event(
         conn,

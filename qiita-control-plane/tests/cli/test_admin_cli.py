@@ -856,6 +856,23 @@ def _sample_handle(prep_sample_idx: int) -> str:
     return f"QM{500 + prep_sample_idx}"
 
 
+def _served_sample(sample: dict, mask_idx: int) -> dict:
+    """A roster row as the route serves it, from a terse fixture row: the
+    resolution keys (`state`, `reason`, `resolved_mask_idx`, `work_ticket_idx`) a
+    fixture may give are moved into `resolution`, defaulting to processed under the
+    named mask."""
+    row = dict(sample)
+    resolution = {
+        "prep_sample_idx": row["prep_sample_idx"],
+        "definition_kind": "mask",
+        "state": row.pop("state", "processed"),
+        "definition_idx": row.pop("resolved_mask_idx", mask_idx),
+        "reason": row.pop("reason", None),
+        "work_ticket_idx": row.pop("work_ticket_idx", None),
+    }
+    return {"mask_state": "completed", **row, "resolution": resolution}
+
+
 def _fake_masked_export_http(manifest, mints=None):
     """A fake httpx.request that serves the roster GET, the ticket POST (encoding
     prep_sample_idx and mask_idx into the returned ticket bytes) and the two mask
@@ -879,15 +896,7 @@ def _fake_masked_export_http(manifest, mints=None):
     # sample that omits its resolution to processed under the named mask, so terse
     # manifests keep exercising the happy path; a test about resolution sets it.
     served = {"group": [manifest["mask_idx"]], **manifest}
-    served["samples"] = [
-        {
-            "mask_state": "completed",
-            "state": "processed",
-            "resolved_mask_idx": manifest["mask_idx"],
-            **s,
-        }
-        for s in manifest["samples"]
-    ]
+    served["samples"] = [_served_sample(s, manifest["mask_idx"]) for s in manifest["samples"]]
 
     def fake_request(method, url, headers=None, json=None, params=None, timeout=None):
         request = httpx.Request(method, url)

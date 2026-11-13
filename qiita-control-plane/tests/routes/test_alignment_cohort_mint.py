@@ -28,6 +28,7 @@ import struct
 import pytest
 from qiita_common.api_paths import URL_ALIGNMENT_COHORT_DOGET, URL_SEQUENCED_POOL_ALIGNMENT_COHORT
 from qiita_common.auth_constants import Scope
+from qiita_common.models import DefinitionGroupRefusal, MaskDefinitionStatus
 
 pytestmark = pytest.mark.db
 
@@ -400,7 +401,7 @@ async def test_human_mint_refuses_a_sample_resolved_to_another_alignment_409(
     )
     assert resp.status_code == 409, resp.text
     detail = resp.json()["detail"]
-    assert detail["reason"] == "resolved_elsewhere"
+    assert detail["reason"] == DefinitionGroupRefusal.RESOLVED_ELSEWHERE
     assert detail["alignment_idx"] == w["align_1"]
     [sample] = detail["samples"]
     assert (sample["prep_sample_idx"], sample["state"], sample["definition_idx"]) == (
@@ -408,7 +409,7 @@ async def test_human_mint_refuses_a_sample_resolved_to_another_alignment_409(
         "processed",
         w["align_3"],
     )
-    assert f"processed under alignment {w['align_3']}" in detail["detail"]
+    assert f"processed, alignment {w['align_3']}" in detail["detail"]
 
     resp = await ctx["user"].post(
         _mint_url(w["align_3"]), json={"prep_sample_idx": [w["ps_a"]], "columns": _COLUMNS}
@@ -457,11 +458,12 @@ async def test_human_mint_refuses_an_alignment_on_a_deprecated_mask_409(ctx, poo
     seed = pool_alignment_seed
     pool = ctx["pool"]
     await pool.execute(
-        "UPDATE qiita.mask_definition SET status = 'deprecated', deprecated_at = now(),"
+        "UPDATE qiita.mask_definition SET status = $3, deprecated_at = now(),"
         " deprecated_by_idx = $2, deprecation_reason = 'host reference was wrong'"
         " WHERE mask_idx = $1",
         seed["mask_idx"],
         seed["owner_idx"],
+        MaskDefinitionStatus.DEPRECATED.value,
     )
     resp = await ctx["user"].post(
         _mint_url(seed["align_1"]), json={"prep_sample_idx": [seed["ps_a"]], "columns": _COLUMNS}

@@ -11,7 +11,7 @@ from __future__ import annotations
 from enum import StrEnum
 from typing import Annotated
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from qiita_common.models._base import PrepSampleCohort
 from qiita_common.models.definition_pair import DefinitionKind
@@ -44,8 +44,8 @@ class SampleResolutionReason(StrEnum):
 
 
 class DefinitionGroupRefusal(StrEnum):
-    """The `reason` code of a 409 refusing a cohort because a sample does not resolve
-    to the definition the caller named."""
+    """The `reason` code of a 409 refusing a cohort because a prep_sample does not
+    resolve to the definition that the caller named."""
 
     RESOLVED_ELSEWHERE = "resolved_elsewhere"
     INCOMPLETE = "incomplete"
@@ -67,14 +67,15 @@ class DefinitionGroupResolveRequest(BaseModel):
 class SampleResolution(BaseModel):
     """One prep_sample's resolution.
 
-    `definition_idx` is the group member the state is about: the one whose results
-    are used when `processed`, the one with the unfinished or unusable run
-    otherwise, and None when no member has a run for the sample (`no_run`).
+    `definition_idx` is the group member that the state is about: the one whose
+    results are used when `processed`, the one with the unfinished or unusable run
+    otherwise, and None when no member has a run for the prep_sample (`no_run`).
     `mask_idx` is that member's mask, for an alignment or a processing.
-    `work_ticket_idx` is the ticket an `incomplete` sample waits on, when one is
-    known. `upstream_kind` / `upstream_definition_idx` name the upstream definition
-    an `upstream_*` reason is about: for `upstream_moved`, the one the sample now
-    resolves to."""
+    `work_ticket_idx` is the ticket that an `incomplete` prep_sample waits on, when
+    one is known. `upstream_kind` / `upstream_definition_idx` name the upstream
+    definition that an `upstream_*` reason is about: for `upstream_moved`, the one
+    that the prep_sample now resolves to. A `processed` resolution names its member
+    and carries no reason; any other carries a reason."""
 
     prep_sample_idx: Annotated[int, Field(gt=0)]
     state: SampleResolutionState
@@ -85,6 +86,30 @@ class SampleResolution(BaseModel):
     work_ticket_idx: Annotated[int | None, Field(default=None, gt=0)] = None
     upstream_kind: DefinitionKind | None = None
     upstream_definition_idx: Annotated[int | None, Field(default=None, gt=0)] = None
+
+    @model_validator(mode="after")
+    def _state_fields_agree(self) -> SampleResolution:
+        processed = self.state is SampleResolutionState.PROCESSED
+        if processed and (self.definition_idx is None or self.reason is not None):
+            raise ValueError("a processed prep_sample names its member and carries no reason")
+        if not processed and self.reason is None:
+            raise ValueError(f"a {self.state.value} prep_sample carries a reason")
+        return self
+
+    def describe(self) -> str:
+        """One line for a person: the prep_sample, its state and reason, the member
+        they are about, the ticket it waits on and the upstream a reason names, each
+        when known."""
+        line = f"prep_sample {self.prep_sample_idx}: {self.state.value}"
+        if self.reason is not None:
+            line += f" ({self.reason.value})"
+        if self.definition_idx is not None:
+            line += f", {self.definition_kind.value} {self.definition_idx}"
+        if self.work_ticket_idx is not None:
+            line += f", work_ticket {self.work_ticket_idx}"
+        if self.upstream_kind is not None:
+            line += f", upstream {self.upstream_kind.value} {self.upstream_definition_idx}"
+        return line
 
 
 class DefinitionGroupResolveResponse(BaseModel):

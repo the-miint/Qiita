@@ -1312,9 +1312,9 @@ def _build_parser() -> argparse.ArgumentParser:
         required=True,
         help=(
             "From `qiita alignment list`; its params say which reference it used. Each"
-            " sample is read from the alignment it resolves to in this alignment's"
-            " similarity group (one part per alignment), and a sample that is not"
-            " processed in the group, or is incomplete, stops the build."
+            " prep_sample is read from the alignment that it resolves to in this"
+            " alignment's similarity group (one part per alignment), and a prep_sample"
+            " that is not processed in the group, or is incomplete, stops the build."
         ),
     )
     p_ft_build.add_argument(
@@ -1326,9 +1326,10 @@ def _build_parser() -> argparse.ArgumentParser:
             " once: against its own contig where the de novo arm placed it, against the"
             " reference otherwise. Reference genomes therefore lose the reads the de novo"
             " arm wins, so one that clears --coverage-threshold without this flag can drop"
-            " out with it. From `qiita alignment list`. Each sample is read from the de"
-            " novo alignment it resolves to in this one's group, which must be aligned at"
-            " a mask in the same mask group as the sample's reference arm. Cannot be"
+            " out with it. From `qiita alignment list`. Each prep_sample is read from the"
+            " de novo alignment that it resolves to in this one's group, which must be"
+            " aligned at a mask in the same mask group as the prep_sample's reference"
+            " arm. Cannot be"
             " combined with --circular-gate. A prep_sample with no de novo alignment in"
             " the group, or whose assembly produced no contigs, has no de novo arm and"
             " stays reference-only; it is not an error."

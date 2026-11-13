@@ -48,8 +48,7 @@ CREATE TABLE qiita.definition_pair (
     -- not recomputed.
     change              JSONB   NOT NULL CHECK (jsonb_typeof(change) = 'object'),
     -- True when every changed path is an upstream reference (a mask_idx, or a de novo
-    -- alignment's processing_idx). Such a pair groups by derivation already; it can
-    -- be decided only `not_similar`.
+    -- alignment's processing_idx); definition_similarity says what that allows.
     derived_only        BOOLEAN NOT NULL,
 
     verdict             TEXT    NOT NULL DEFAULT 'pending'
@@ -140,8 +139,8 @@ COMMENT ON COLUMN qiita.definition_pair.change IS
     'values differ between the two definitions'' stored params. Absent and null are '
     'the same value; lists compare whole.';
 COMMENT ON COLUMN qiita.definition_pair.derived_only IS
-    'True when every path in change is an upstream reference. Decidable '
-    '''not_similar'' only.';
+    'True when every path in change is an upstream reference '
+    '(qiita_control_plane.definition_similarity says what that allows).';
 COMMENT ON COLUMN qiita.definition_pair.verdict IS
     '''pending'' | ''similar'' | ''not_similar'' (TEXT + CHECK). Python twin: '
     'qiita_common.models.DefinitionPairVerdict. decided_by_idx, decided_at and '

@@ -52,7 +52,7 @@ def _workflow_needs_processing(steps: list[Any]) -> bool:
     return action_threads_processing_idx(steps)
 
 
-def _build_processing_params(
+def build_processing_params(
     action_id: str,
     action_version: str,
     bound: dict[str, Any],
@@ -140,7 +140,7 @@ async def _mint_processing_idx(
     context_schema default while the container fell back to the native job's own
     Inputs default — a silent hash≠reality drift the moment those two defaults
     diverge."""
-    params = _build_processing_params(
+    params = build_processing_params(
         action_id, action_version, bound, assembler_default=assembler_default
     )
     try:

@@ -925,7 +925,8 @@ def _manifest_payload(
     carries `reference_idx`, `mask_idx` and `shard_ids` — so `aligner` is lifted out of it
     and the rest is represented by the digest, which is what identifies the config anyway.
     `processing` is `_manifest_parts` over the reference arm's parts: one part per
-    alignment the cohort's samples resolved to, and the map from each sample to its part.
+    alignment that the cohort's prep_samples resolved to, and the map from each
+    prep_sample to its part.
 
     `files` are basenames: the bundle's members relative to wherever it lands, since an
     absolute path describes the machine that built it.
@@ -1212,9 +1213,9 @@ def _gate_from_args(args: argparse.Namespace) -> ft.AlignmentGate | None:
 
 @dataclasses.dataclass(frozen=True)
 class _Part:
-    """One part of a build: an alignment some of the cohort's samples resolved to, its
-    verified summary, and those samples, ascending. A build over samples that all
-    resolve to one alignment has one part."""
+    """One part of a build: an alignment that some of the cohort's prep_samples resolved
+    to, its verified summary, and those prep_samples, ascending. A build over
+    prep_samples that all resolve to one alignment has one part."""
 
     alignment_idx: int
     summary: dict[str, Any]
@@ -1266,13 +1267,13 @@ def _pool_listings(
 
 
 def _member_summary(listing: dict[str, Any], alignment_idx: int, *, samples: int) -> dict:
-    """`_alignment_summary` for an alignment the resolver named rather than the caller,
+    """`_alignment_summary` for an alignment that the resolver named, not the caller,
     refusing with the flags to add when it is over none of the named pools."""
     if all(summary["alignment_idx"] != alignment_idx for summary in listing["alignments"]):
         raise ValueError(
             f"{samples} prep_sample(s) of the cohort resolve to alignment {alignment_idx},"
             f" which is not over any pool named, so its params cannot be read and checked."
-            f" Add the pool those samples are on as another --sequencing-run-idx /"
+            f" Add the pool that those prep_samples are on as another --sequencing-run-idx /"
             f" --sequenced-pool-idx pair."
         )
     return _alignment_summary(listing, alignment_idx=alignment_idx)
@@ -1343,10 +1344,10 @@ def _refuse_unprocessed(refused: list[SampleResolution], *, anchor: str) -> None
     cohort is a different table."""
     if not refused:
         return
-    lines = "\n".join(f"  {_common.describe_resolution(entry)}" for entry in refused)
+    lines = "\n".join(f"  {entry.describe()}" for entry in refused)
     raise ValueError(
         f"{len(refused)} prep_sample(s) of the cohort are not processed in the group of"
-        f" {anchor}:\n{lines}\nA feature table is built only over processed samples. Wait"
+        f" {anchor}:\n{lines}\nA feature table is built only over processed prep_samples. Wait"
         f" for or re-run these, or name the cohort to build over with --prep-sample-idx."
     )
 
@@ -1358,7 +1359,7 @@ def _parts(
     `alignment_idx` order. Refuses an incomplete or not-processed sample
     (`_refuse_unprocessed`), a part whose alignment is over none of the named pools
     (`_member_summary`), and a part aligned against a different reference: the table is
-    relabelled through one reference's genome map."""
+    relabeled through one reference's genome map."""
     _refuse_unprocessed(
         [e for e in resolution.samples if e.state is not SampleResolutionState.PROCESSED],
         anchor=f"alignment {resolution.definition_idx}",
@@ -1375,7 +1376,7 @@ def _parts(
                 f"{len(samples)} prep_sample(s) resolve to alignment {alignment_idx}, which"
                 f" ran against reference {part_reference}; alignment"
                 f" {resolution.definition_idx} ran against reference {reference_idx}. A"
-                f" table is relabelled through one reference's genome map, so these cannot"
+                f" table is relabeled through one reference's genome map, so these cannot"
                 f" be built into one table."
             )
         parts.append(_Part(alignment_idx, summary, tuple(sorted(samples))))
@@ -1402,7 +1403,7 @@ def _plan_denovo(
     Each de novo alignment is checked against the reference part of every sample that
     resolved to it, and the named one against `--alignment-idx`, by
     `denovo_alignment_processing_idx` with the reference arm's mask group (from a resolve
-    of its mask) as the admissible masks. The assembly runs those alignments name are
+    of its mask) as the admissible masks. The assembly runs that those alignments name are
     then checked for deprecation, before the refusal of unprocessed samples, so a
     deprecated run is named by the rule that owns its wording.
     """
@@ -1523,10 +1524,11 @@ def _run_build(
         reference_idx=reference_idx,
     )
 
-    # The de novo arm, from the same merged listing the reference arm came from; the
-    # pairing rule is the shared one the server-side resolver applies too, so a swapped
-    # or mask-mismatched pair is refused here rather than after a cohort has crossed the
-    # wire.
+    # The de novo arm, from the same merged listing that the reference arm came from,
+    # checked with `denovo_alignment_processing_idx` given the reference arm's mask
+    # group, so a de novo arm on any mask of that group is accepted. The feature-table
+    # runner and the service-account alignment DoGet call it without a group and still
+    # require the same mask_idx.
     requested_denovo = args.denovo_alignment_idx is not None
     denovo_parts: list[_DenovoPart] = []
     if requested_denovo:

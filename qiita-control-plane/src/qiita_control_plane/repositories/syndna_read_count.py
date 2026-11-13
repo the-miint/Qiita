@@ -103,15 +103,12 @@ async def fetch_syndna_export_roster(
     prep_sample_idxs: Sequence[int] | None,
     limit: int,
 ) -> list[asyncpg.Record]:
-    """Up to `limit` non-retired samples with a mask_sample row under any of
-    `mask_idxs`, matching every given filter, ascending by prep_sample_idx, one row
-    each. Each row carries the biosample accession and the sample's
-    sequenced_pool_idx (NULL when it was never pooled).
-
-    A gate row in any state selects the sample: which member's counts are read, if
-    any, is the resolver's answer (`definition_resolver`), and the export lists the
-    samples it leaves out. No caller-visibility narrowing — the route authorizes the
-    whole roster. Callers that need to detect truncation pass `limit = cap + 1`.
+    """Up to `limit` non-retired prep_samples with a mask_sample row in any state
+    under any of `mask_idxs`, matching every given filter, ascending by
+    prep_sample_idx, one row each. Each row carries the biosample accession and the
+    prep_sample's sequenced_pool_idx (NULL when it was never pooled). No
+    caller-visibility narrowing. A caller that needs to detect truncation passes
+    `limit = cap + 1`.
     """
     args: list = [list(mask_idxs)]
     scope, _narrowed = sample_scope_sql(

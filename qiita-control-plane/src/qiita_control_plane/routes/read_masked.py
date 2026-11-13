@@ -381,9 +381,10 @@ async def get_syndna_read_count_route(
     The filters intersect, and at least one is required. The selection is every
     non-retired prep_sample with a gate row under any member of the mask's group
     that matches them. Each is resolved across the group (`definition_resolver`):
-    a `processed` sample's counts are read under the member it resolved to; an
-    `incomplete` or `not_processed` one is left out of the table and listed in
-    `left_out` with the reason.
+    a `processed` prep_sample's counts are read under the member that it resolved
+    to; an `incomplete` or `not_processed` one is left out of the table and listed
+    in `left_out` with the reason. A deprecated named mask is not refused: it names
+    its group, and a prep_sample that resolves to it is left out as `deprecated`.
 
     **Authorization is all-or-nothing, never narrowed**, because the response is a
     table: the caller needs ``Tier.VIEWER`` on every study each selected prep_sample
@@ -391,13 +392,13 @@ async def get_syndna_read_count_route(
     named prep_samples are authorized before any lookup, so a 403 rather than a 404
     or 409 answers a selector the caller cannot read (a study that does not exist
     selects nothing: 404, or 409 when prep_samples are also named). A pool-only
-    selection is authorized on the prep_samples it resolves to, so its 404 / 413 say
+    selection is authorized on the prep_samples that it selects, so its 404 / 413 say
     whether the pool has any under the group.
 
     404 when the mask does not exist or nothing matches; 409 when the named mask, or
-    a member a sample resolved to, ran without SynDNA or with a different SynDNA
-    reference than the named mask, when no selected sample is processed, or when a
-    processed sample has no counts; 413 above the roster cap. Every read is one
+    a member that a prep_sample resolved to, ran without SynDNA or with a different
+    SynDNA reference than the named mask, when no selected prep_sample is processed,
+    or when a processed prep_sample has no counts; 413 above the roster cap. Every read is one
     read-only snapshot holding the group lock SHARED, so neither a re-mask nor a
     pair decision landing mid-request can mix two states into one table.
     """
@@ -542,12 +543,12 @@ async def get_syndna_read_count_route(
         reference_idx=reference_idx,
         inserts=[SyndnaInsert.model_validate(dict(r)) for r in inserts],
         samples=[
-            SyndnaReadCountSample(
-                prep_sample_idx=r["prep_sample_idx"],
-                mask_idx=mask_by_sample[r["prep_sample_idx"]],
-                biosample_accession=r["biosample_accession"],
-                sequenced_pool_idx=r["sequenced_pool_idx"],
-                read_counts=counts[r["prep_sample_idx"]],
+            SyndnaReadCountSample.model_validate(
+                {
+                    **dict(r),
+                    "mask_idx": mask_by_sample[r["prep_sample_idx"]],
+                    "read_counts": counts[r["prep_sample_idx"]],
+                }
             )
             for r in rows
             if r["prep_sample_idx"] in mask_by_sample

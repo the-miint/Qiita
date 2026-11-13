@@ -49,6 +49,7 @@ from qiita_common.models.reference import Tier
 from qiita_common.taxonomy import RANK_COLUMNS
 from qiita_control_plane.repositories.alignment_definition import mint_alignment_definition
 from qiita_control_plane.repositories.block import (
+    MASK_SAMPLE_COMPLETED,
     create_alignment_sample_pending,
     finalize_alignment_sample,
 )
@@ -137,9 +138,11 @@ async def _masked(db, *, owner: int, tag: str, prep_sample_idxs: list[int]) -> i
             )
         )["mask_idx"]
     await db.executemany(
-        "INSERT INTO qiita.mask_sample (mask_idx, prep_sample_idx, state)"
-        " VALUES ($1, $2, 'completed')",
-        [(mask_idx, prep_sample_idx) for prep_sample_idx in prep_sample_idxs],
+        "INSERT INTO qiita.mask_sample (mask_idx, prep_sample_idx, state) VALUES ($1, $2, $3)",
+        [
+            (mask_idx, prep_sample_idx, MASK_SAMPLE_COMPLETED)
+            for prep_sample_idx in prep_sample_idxs
+        ],
     )
     return mask_idx
 

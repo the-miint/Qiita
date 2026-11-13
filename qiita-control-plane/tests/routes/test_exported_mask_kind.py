@@ -16,9 +16,11 @@ import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 from qiita_common.api_paths import URL_EXPORTED_IDENTIFIER_MASK, URL_EXPORTED_PROCESSING_MASK
 from qiita_common.auth_constants import Scope
+from qiita_common.models import MaskDefinitionStatus
 
 from qiita_control_plane.auth.token import mint_api_token
 from qiita_control_plane.main import app
+from qiita_control_plane.repositories.block import MASK_SAMPLE_COMPLETED, MASK_SAMPLE_PENDING
 from qiita_control_plane.repositories.mask_definition import mint_mask_definition
 from qiita_control_plane.testing.db_seeds import seed_biosample_with_sequenced_prep_sample
 from qiita_control_plane.testing.db_teardown import teardown_entity_graph
@@ -45,10 +47,12 @@ async def seeded(role_keyed_clients):
     bs_pending, ps_pending = await seed_biosample_with_sequenced_prep_sample(pool, owner_idx=owner)
     await pool.execute(
         "INSERT INTO qiita.mask_sample (mask_idx, prep_sample_idx, state)"
-        " VALUES ($1, $2, 'completed'), ($1, $3, 'pending')",
+        " VALUES ($1, $2, $4), ($1, $3, $5)",
         mask_idx,
         ps_done,
         ps_pending,
+        MASK_SAMPLE_COMPLETED,
+        MASK_SAMPLE_PENDING,
     )
     yield {
         "pool": pool,
@@ -57,7 +61,6 @@ async def seeded(role_keyed_clients):
         "ps_done": ps_done,
         "ps_pending": ps_pending,
     }
-    await pool.execute("DELETE FROM qiita.exported_identifier WHERE mask_idx = $1", mask_idx)
     await pool.execute("DELETE FROM qiita.exported_processing WHERE mask_idx = $1", mask_idx)
     await teardown_entity_graph(
         pool,
@@ -71,11 +74,12 @@ async def seeded(role_keyed_clients):
 async def _deprecate(pool, mask_idx, principal_idx):
     await pool.execute(
         "UPDATE qiita.mask_definition"
-        "   SET status = 'deprecated', deprecated_at = now(), deprecated_by_idx = $2,"
+        "   SET status = $3, deprecated_at = now(), deprecated_by_idx = $2,"
         "       deprecation_reason = 'probe: config void'"
         " WHERE mask_idx = $1",
         mask_idx,
         principal_idx,
+        MaskDefinitionStatus.DEPRECATED.value,
     )
 
 

@@ -20,6 +20,7 @@ from qiita_common.actions import (
 from qiita_common.api_paths import URL_DEFINITION_GROUP_RESOLVE
 from qiita_common.auth_constants import Scope
 
+from qiita_control_plane.repositories.assembly import ASSEMBLY_SAMPLE_COMPLETED
 from qiita_control_plane.repositories.block import add_block_members, create_block
 from qiita_control_plane.repositories.processing import mint_processing
 from qiita_control_plane.testing.db_seeds import (
@@ -341,9 +342,10 @@ async def test_an_assembly_ticket_is_matched_to_the_processing_it_mints(
     try:
         await db.execute(
             "INSERT INTO qiita.assembly_sample (processing_idx, prep_sample_idx, state)"
-            " VALUES ($1, $2, 'completed')",
+            " VALUES ($1, $2, $3)",
             processing_idx,
             w["ps_a"],
+            ASSEMBLY_SAMPLE_COMPLETED,
         )
         body = _body("processing", processing_idx, [w["ps_a"]])
         s = _by_sample(await ctx["user"].post(URL_DEFINITION_GROUP_RESOLVE, json=body))[w["ps_a"]]
@@ -372,6 +374,8 @@ async def test_an_assembly_ticket_is_matched_to_the_processing_it_mints(
         s = _by_sample(await ctx["user"].post(URL_DEFINITION_GROUP_RESOLVE, json=body))[w["ps_a"]]
         assert (s["state"], s["reason"]) == ("incomplete", "in_progress")
     finally:
+        # Ahead of the entity sweep: assembly_sample references this processing with
+        # no ON DELETE action, so the processing row cannot go while it exists.
         await db.execute(
             "DELETE FROM qiita.assembly_sample WHERE processing_idx = $1", processing_idx
         )

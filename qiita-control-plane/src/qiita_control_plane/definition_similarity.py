@@ -1,5 +1,5 @@
 """Similarity between definitions of one kind (masks, alignments, processings):
-the change between two definitions, the groups pair decisions form, and every
+the change between two definitions, the groups that pair decisions form, and every
 refusal. The rules are stated here and nowhere else.
 
 **Change.** `param_diff` compares two definitions' stored params. Nested objects are
@@ -8,11 +8,13 @@ key and a JSON null are the same value; values compare as canonical JSON, so `1`
 `1.0` and `true` differ, as they do in the params hash.
 
 **Upstream references.** A processing's `mask_idx`, an alignment's `mask_idx`, and a
-de novo alignment's `processing_idx` (its params carry `subject`, see
-`runner/_alignment._build_denovo_alignment_params`) name the definition the run
-consumed. A pair whose change touches only such paths is `derived_only`.
+de novo alignment's `processing_idx` (a de novo alignment is the one whose params
+carry `subject`) name the definition that the run consumed. A pair whose change
+touches only such paths is `derived_only`: it is grouped by derivation once its
+upstreams are, so it can be decided `not_similar` only.
 
-**Groups**, computed on read from the definitions and the live (not detached) pairs:
+**Groups**, computed on read from the definitions and the live (not detached) pairs
+(that is, the groups that pair decisions form):
   - masks: connected components over `similar` pairs;
   - processings, then alignments: a derived edge joins two definitions whose params
     differ only in upstream references whose referents are in one group (mask
@@ -26,13 +28,13 @@ Deprecation does not change membership.
 **Public API** for other modules:
   - `async load_groups(conn) -> Groups` (takes the group lock SHARED in the
     caller's transaction), then `Groups.group_of(kind, idx) -> frozenset[int]` and
-    `Groups.same_group(kind, a, b) -> bool`. A definition no pair or derivation
-    joins is a group of one, including an id the snapshot does not know.
+    `Groups.same_group(kind, a, b) -> bool`. A definition that no pair or derivation
+    joins is a group of one, including an id that the snapshot does not know.
   - `compute_groups(definitions, pairs) -> Groups`, the pure core.
   - `param_diff(low_params, high_params)`, `upstream_changes(...)`,
     `is_derived_only(...)`.
-  - `async open_pair`, `decide_pair`, `revoke_pair` (the admin routes), and
-    `refuse_deprecating_with_similar_pairs` (the three status PATCH routes).
+  - `async open_pair`, `decide_pair`, `revoke_pair`, and
+    `refuse_deprecating_with_similar_pairs` (call it before deprecating a definition).
   - Errors: `PairRefused` (409, with a `DefinitionPairRefusal` code and the pairs it
     names), `PairNotFound`, `DefinitionNotFound`, and the repository's
     `GroupLockBusy` (retryable).
@@ -54,6 +56,10 @@ Deprecation does not change membership.
     different groups. This covers chains (mask -> processing -> de novo alignment).
   - `not_decided`: revoking a pending pair.
   - `similar_pairs`: deprecating a definition named by a `similar` pair.
+Each refusal names, in `definition_pair_idx`, the pair acted on; `contradiction`
+names the `not_similar` pairs, `relied_on` the downstream `similar` pairs and
+`similar_pairs` the `similar` pairs naming the definition instead, and
+`cross_scope` / `no_difference` name none.
 """
 
 import json
@@ -87,8 +93,10 @@ __all__ = [
     "PairNotFound",
     "PairRefused",
     "PairState",
+    "canonical_json",
     "compute_groups",
     "decide_pair",
+    "is_definition_ref",
     "is_derived_only",
     "load_groups",
     "open_pair",
@@ -110,9 +118,9 @@ _KIND_ORDER = (DefinitionKind.MASK, DefinitionKind.PROCESSING, DefinitionKind.AL
 
 
 class PairRefused(Exception):
-    """A pair operation or a deprecation the rules refuse. `reason` is the wire code;
-    `definition_pair_idx` names the pairs the refusal is about (the module docstring
-    lists which ones each code names)."""
+    """A pair operation or a deprecation that the rules refuse. `reason` is the wire
+    code; `definition_pair_idx` names the pairs that the refusal is about (the module
+    docstring's Refusals list says which, per code)."""
 
     def __init__(
         self,
@@ -144,7 +152,7 @@ class DefinitionNotFound(Exception):
 # ---------------------------------------------------------------------------
 
 
-def _canon(value: Any) -> str:
+def canonical_json(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"))
 
 
@@ -173,7 +181,7 @@ def param_diff(low_params: Mapping[str, Any], high_params: Mapping[str, Any]) ->
     return {
         path: [low.get(path), high.get(path)]
         for path in sorted(low.keys() | high.keys())
-        if _canon(low.get(path)) != _canon(high.get(path))
+        if canonical_json(low.get(path)) != canonical_json(high.get(path))
     }
 
 
@@ -190,7 +198,7 @@ def upstream_leaves(kind: DefinitionKind, params: Mapping[str, Any]) -> dict[str
     return {}
 
 
-def _is_ref(value: Any) -> bool:
+def is_definition_ref(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
 
 
@@ -210,7 +218,7 @@ def upstream_changes(
         up_kind = low_leaves.get(path)
         if up_kind is None or high_leaves.get(path) is not up_kind:
             continue
-        if _is_ref(low_value) and _is_ref(high_value):
+        if is_definition_ref(low_value) and is_definition_ref(high_value):
             out[path] = (up_kind, low_value, high_value)
     return out
 
@@ -234,16 +242,16 @@ def comparison_scope(definition: DefinitionRow) -> tuple[str, ...]:
         if params.get(_DENOVO_SUBJECT_KEY) is not None:
             return (
                 "alignment-denovo",
-                _canon(params.get("workflow")),
-                _canon(params.get("aligner")),
-                _canon(params.get(_DENOVO_SUBJECT_KEY)),
+                canonical_json(params.get("workflow")),
+                canonical_json(params.get("aligner")),
+                canonical_json(params.get(_DENOVO_SUBJECT_KEY)),
             )
         return (
             "alignment-block",
-            _canon(params.get("reference_idx")),
-            _canon(params.get("aligner")),
+            canonical_json(params.get("reference_idx")),
+            canonical_json(params.get("aligner")),
         )
-    return (definition.kind.value, _canon(definition.workflow))
+    return (definition.kind.value, canonical_json(definition.workflow))
 
 
 # ---------------------------------------------------------------------------
@@ -348,14 +356,14 @@ def _derived_key(definition: DefinitionRow, members: Mapping[DefinitionKind, Map
     items: dict[str, Any] = {}
     for path, value in _flatten(definition.params).items():
         up_kind = leaves.get(path)
-        if up_kind is not None and _is_ref(value):
+        if up_kind is not None and is_definition_ref(value):
             group = members[up_kind].get(value, frozenset({value}))
             # An object never appears as a flattened leaf, so it cannot collide
             # with a plain value at the same path.
             items[path] = {"upstream_group": min(group)}
         else:
             items[path] = value
-    return _canon(items)
+    return canonical_json(items)
 
 
 def _compute_kind(

@@ -357,4 +357,4 @@ def print_left_out(response: SyndnaReadCountResponse) -> None:
         file=sys.stderr,
     )
     for r in response.left_out:
-        print(f"  {_common.describe_resolution(r)}", file=sys.stderr)
+        print(f"  {r.describe()}", file=sys.stderr)

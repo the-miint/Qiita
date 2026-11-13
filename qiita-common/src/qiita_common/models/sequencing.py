@@ -40,11 +40,8 @@ from qiita_common.models.biosample import (
     MetadataChecklistRef,
     MetadataEntry,
 )
-from qiita_common.models.definition_group import (
-    SampleResolution,
-    SampleResolutionReason,
-    SampleResolutionState,
-)
+from qiita_common.models.definition_group import SampleResolution
+from qiita_common.models.definition_pair import DefinitionKind
 from qiita_common.models.reference import Platform
 from qiita_common.models.step import ProjectionColumns
 from qiita_common.models.work_ticket import WorkTicketState
@@ -1178,8 +1175,8 @@ class SyndnaInsert(BaseModel):
 
 class SyndnaReadCountSample(BaseModel):
     """One prep_sample's per-insert read counts, in `SyndnaReadCountResponse.inserts`
-    order. `mask_idx` is the member of the named mask's group the sample resolved
-    to, whose counts these are. `sequenced_pool_idx` is None for a prep_sample that
+    order. `mask_idx` is the member of the named mask's group that the prep_sample
+    resolved to, whose counts these are. `sequenced_pool_idx` is None for a prep_sample that
     was never pooled."""
 
     prep_sample_idx: Annotated[int, Field(gt=0)]
@@ -1194,8 +1191,8 @@ class SyndnaReadCountResponse(BaseModel):
 
     `mask_idx` is the mask the caller named; each selected prep_sample is resolved
     across that mask's group (`SampleResolution`). `samples` holds the ones
-    `processed`, with their counts under the member they resolved to; every member
-    they resolved to shares `reference_idx`. `left_out` holds the selected
+    `processed`, with their counts under the member that each resolved to; every
+    such member shares `reference_idx`. `left_out` holds the selected
     prep_samples that are `incomplete` or `not_processed`, with the reason, ascending
     by prep_sample_idx. The counts are reads with a mapped primary alignment to each
     insert, ungated (see qiita.syndna_read_count).
@@ -1596,21 +1593,20 @@ class ReadMaskedDoGetTicketRequest(BaseModel):
 
 
 class MaskedReadExportSample(BaseModel):
-    """One sample in a sequenced_pool's masked-read export manifest.
+    """One prep_sample in a sequenced_pool's masked-read export manifest.
 
     `biosample_accession` is None until the biosample is submitted to NCBI. The
-    per-sample output filename
+    per-prep_sample output filename
     `<biosample_accession>.<sequencing_run_idx>.<sequenced_pool_idx>.<prep_sample_idx>`
-    requires it, so the export refuses a sample whose accession is still None —
-    the manifest surfaces the None rather than silently dropping the sample, and
+    requires it, so the export refuses a prep_sample whose accession is still None —
+    the manifest surfaces the None rather than silently dropping the prep_sample, and
     the export route/CLI fails loudly on it. The pool-wide
     `sequencing_run_idx`/`sequenced_pool_idx` live on the manifest, not repeated
     per row.
 
-    `state`, `reason`, `resolved_mask_idx` and `work_ticket_idx` are the sample's
-    resolution across the manifest's mask group (`SampleResolution`, whose
-    `definition_idx` is `resolved_mask_idx`). Only a `processed` sample is exported,
-    from `resolved_mask_idx`; the others are listed with their reason.
+    `resolution` is the prep_sample's resolution across the manifest's mask group.
+    Only a `processed` prep_sample is exported, from `resolution.definition_idx`; the
+    others are listed with their reason.
 
     `mask_state` is the sample's completion gate under the manifest's own `mask_idx`
     (`qiita.mask_sample.state`, see `MaskSampleState`), or `None` when no gate row
@@ -1620,10 +1616,16 @@ class MaskedReadExportSample(BaseModel):
     prep_sample_idx: Annotated[int, Field(gt=0)]
     biosample_accession: str | None
     mask_state: MaskSampleState | None = None
-    state: SampleResolutionState
-    reason: SampleResolutionReason | None = None
-    resolved_mask_idx: Annotated[int | None, Field(default=None, gt=0)] = None
-    work_ticket_idx: Annotated[int | None, Field(default=None, gt=0)] = None
+    resolution: SampleResolution
+
+    @model_validator(mode="after")
+    def _resolution_is_this_mask_sample(self) -> MaskedReadExportSample:
+        if (
+            self.resolution.prep_sample_idx != self.prep_sample_idx
+            or self.resolution.definition_kind is not DefinitionKind.MASK
+        ):
+            raise ValueError("resolution must be this prep_sample's, across a mask group")
+        return self
 
 
 class ExportedIdentifierRequest(BaseModel):
@@ -1781,11 +1783,11 @@ class ExportedMaskIdentifierResponse(BaseModel):
 class MaskedReadExportManifest(BaseModel):
     """Returned by GET /admin/sequenced-pool/{sequenced_pool_idx}/masked-read-export.
 
-    The roster of a sequenced_pool's non-retired samples, each resolved across the
-    group of masks `mask_idx` belongs to (`group`, ascending), with each sample's
-    filename parts. The caller then mints a per-sample DoGet ticket (POST
-    /admin/masked-read-export/ticket) under each processed sample's
-    `resolved_mask_idx` and streams its read_masked rows from the data plane,
+    The roster of a sequenced_pool's non-retired prep_samples, each resolved across
+    the group of masks that `mask_idx` belongs to (`group`, ascending), with each
+    prep_sample's filename parts. The caller then mints a per-prep_sample DoGet ticket
+    (POST /admin/masked-read-export/ticket) under each processed prep_sample's
+    `resolution.definition_idx` and streams its read_masked rows from the data plane,
     writing parquet/fastq locally. system_admin + admin:masked_read_export only.
     """
 

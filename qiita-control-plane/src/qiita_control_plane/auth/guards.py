@@ -219,8 +219,8 @@ def require_scope(scope: str) -> Callable[..., Principal]:
 
 
 def check_scope(p: Principal, scope: str) -> None:
-    """The check `require_scope` makes, for a route that learns which scope it
-    needs only after reading the row it acts on. 401s on Anonymous, 403s when the
+    """The check that `require_scope` makes, for a route that learns which scope it
+    needs only after reading the row that it acts on. 401s on Anonymous, 403s when the
     principal's token lacks `scope`, with the same detail and re-login hint."""
     scope_str = str(scope)
     if isinstance(p, Anonymous):

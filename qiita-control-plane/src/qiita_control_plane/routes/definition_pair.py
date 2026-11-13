@@ -82,10 +82,10 @@ def _pair_response(row: asyncpg.Record) -> DefinitionPair:
 
 
 async def _fetch_pair_for_caller(
-    pool: asyncpg.Pool, definition_pair_idx: int, caller: Principal
+    conn: asyncpg.Pool | asyncpg.Connection, definition_pair_idx: int, caller: Principal
 ) -> asyncpg.Record:
     """The pair, 404 when absent, 403 when the caller lacks its kind's scope."""
-    row = await fetch_pair(pool, definition_pair_idx)
+    row = await fetch_pair(conn, definition_pair_idx)
     if row is None:
         raise HTTPException(status_code=404, detail=_MSG_PAIR_NOT_FOUND)
     check_scope(caller, _KIND_SCOPE[DefinitionKind(row["definition_kind"])])
@@ -151,12 +151,14 @@ async def get_definition_pair_route(
     caller: HumanUser = Depends(require_human),
     _scope: Principal = Depends(_require_any_lifecycle),
 ) -> DefinitionPairDetail:
-    """One pair and its history, oldest event first."""
-    row = await _fetch_pair_for_caller(pool, definition_pair_idx, caller)
-    events = [
-        DefinitionPairEvent.model_validate(dict(e))
-        for e in await fetch_pair_events(pool, definition_pair_idx)
-    ]
+    """One pair and its history, oldest event first, read from one snapshot so the
+    verdict agrees with the last event."""
+    async with pool.acquire() as conn, conn.transaction(isolation="repeatable_read", readonly=True):
+        row = await _fetch_pair_for_caller(conn, definition_pair_idx, caller)
+        events = [
+            DefinitionPairEvent.model_validate(dict(e))
+            for e in await fetch_pair_events(conn, definition_pair_idx)
+        ]
     return DefinitionPairDetail.model_validate({**pair_record_fields(row), "events": events})
 
 

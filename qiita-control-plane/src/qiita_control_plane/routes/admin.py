@@ -64,7 +64,7 @@ from ..auth.scopes import (
 from ..auth.tickets import sign_ticket
 from ..auth.token import mint_api_token
 from ..block_read import READ_MASKED_TABLE
-from ..definition_resolver import resolve_group
+from ..definition_resolver import cohort_refusal, resolve_group
 from ..definition_similarity import load_groups
 from ..deps import TxConnFactory, get_db_pool, get_flight_signing_key, get_tx_conn_factory
 from ..repositories.block import MASK_SAMPLE_COMPLETED
@@ -665,9 +665,8 @@ _EXPORT_TICKET_TTL_SECONDS = 3600
 # filename's leading part; NULL until NCBI submission, surfaced so the export
 # fails loudly rather than silently dropping the sample) + the per-(mask_idx,
 # prep_sample) completion gate state under the named mask (LEFT JOIN mask_sample —
-# NULL when no gate row exists there). Which member of the mask's group each
-# sample is exported from is `definition_resolver`'s answer, not this query's.
-# The pool-wide run/pool idxs live on the manifest. `$2` is the named mask_idx.
+# NULL when no gate row exists there). The pool-wide run/pool idxs live on the
+# manifest. `$2` is the named mask_idx.
 _MASKED_EXPORT_ROSTER_SQL = (
     "SELECT ss.prep_sample_idx, bs.biosample_accession, msamp.state AS mask_state"
     "  FROM qiita.sequenced_sample ss"
@@ -717,10 +716,10 @@ async def export_masked_read_manifest(
     biosample_accession is surfaced even when NULL so the CLI fails loudly on an
     unsubmitted sample rather than the route silently dropping it.
 
-    One transaction holding the group lock SHARED, so no pair decision changes the
-    group while the roster is resolved.
+    One read-only snapshot, so the roster and its resolution see one state of the
+    gates, tickets and pair decisions.
     """
-    async with pool.acquire() as conn, conn.transaction():
+    async with pool.acquire() as conn, conn.transaction(isolation="repeatable_read", readonly=True):
         run_idx = await conn.fetchval(
             "SELECT sequencing_run_idx FROM qiita.sequenced_pool WHERE idx = $1",
             sequenced_pool_idx,
@@ -746,18 +745,10 @@ async def export_masked_read_manifest(
             groups=groups,
         )
 
-    samples = []
-    for row in db_rows:
-        resolved = resolution.samples[row["prep_sample_idx"]]
-        samples.append(
-            MaskedReadExportSample(
-                **dict(row),
-                state=resolved.state,
-                reason=resolved.reason,
-                resolved_mask_idx=resolved.definition_idx,
-                work_ticket_idx=resolved.work_ticket_idx,
-            )
-        )
+    samples = [
+        MaskedReadExportSample(**dict(row), resolution=resolution.samples[row["prep_sample_idx"]])
+        for row in db_rows
+    ]
     return MaskedReadExportManifest(
         sequenced_pool_idx=sequenced_pool_idx,
         sequencing_run_idx=run_idx,
@@ -794,6 +785,10 @@ async def create_masked_read_export_ticket(
     'completed' under this `mask_idx`, else 409 — a 'pending' row (a covering block
     still in flight) or NO row (absence is not exempt) both mean the read_masked
     pass-set would be absent or partial, and a pull would silently truncate.
+
+    Then the prep_sample must resolve to this mask in its group
+    (`definition_resolver`), else 409 with the `DefinitionGroupRefusal` code and
+    the resolution, as the alignment cohort DoGet refuses.
     """
     filter_ = {
         "prep_sample_idx": [body.prep_sample_idx],
@@ -833,6 +828,27 @@ async def create_masked_read_export_ticket(
                 "prep_sample_idx": body.prep_sample_idx,
                 "mask_idx": body.mask_idx,
                 "mask_state": mask_state,
+            },
+        )
+
+    async with pool.acquire() as conn, conn.transaction(isolation="repeatable_read", readonly=True):
+        resolution = await resolve_group(
+            conn,
+            kind=DefinitionKind.MASK,
+            definition_idx=body.mask_idx,
+            prep_sample_idxs=[body.prep_sample_idx],
+        )
+    resolved = resolution.samples[body.prep_sample_idx]
+    refusal = cohort_refusal(resolved, body.mask_idx)
+    if refusal is not None:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "detail": f"{resolved.describe()}; it does not resolve to mask {body.mask_idx}",
+                "reason": refusal.value,
+                "prep_sample_idx": body.prep_sample_idx,
+                "mask_idx": body.mask_idx,
+                "resolution": resolved.model_dump(mode="json"),
             },
         )
 

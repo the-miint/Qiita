@@ -19,7 +19,12 @@ from qiita_common.api_paths import (
     URL_ADMIN_MASKED_READ_EXPORT_TICKET,
     URL_ADMIN_SEQUENCED_POOL_MASKED_READ_EXPORT,
 )
-from qiita_common.models import DefinitionKind, DefinitionPairVerdict, MaskDefinitionStatus
+from qiita_common.models import (
+    DefinitionGroupRefusal,
+    DefinitionKind,
+    DefinitionPairVerdict,
+    MaskDefinitionStatus,
+)
 
 from qiita_control_plane.definition_similarity import decide_pair, open_pair
 from qiita_control_plane.main import app
@@ -156,8 +161,8 @@ async def test_roster_resolves_each_sample_across_the_group(ctx, group, anchor):
     assert set(by_prep) == {group["on_low"], group["on_both"], group["running"], group["none"]}
 
     def resolved(ps):
-        s = by_prep[group[ps]]
-        return (s["state"], s["reason"], s["resolved_mask_idx"], s["work_ticket_idx"])
+        r = by_prep[group[ps]]["resolution"]
+        return (r["state"], r["reason"], r["definition_idx"], r["work_ticket_idx"])
 
     assert resolved("on_low") == ("processed", None, group["low"], None)
     assert resolved("on_both") == ("processed", None, group["high"], None)
@@ -220,3 +225,27 @@ async def test_ticket_under_each_resolved_member(ctx, group):
     )
     assert ok_high.status_code == 201, ok_high.text
     assert refused.status_code == 409, refused.text
+
+
+@pytest.mark.parametrize(
+    ("sample", "mask", "refusal"),
+    [
+        # Completed under `low`, but resolves to `high`, the newer member.
+        ("on_both", "low", DefinitionGroupRefusal.RESOLVED_ELSEWHERE),
+        # Completed under `low`, with a ticket still running under `high`.
+        ("running", "low", DefinitionGroupRefusal.INCOMPLETE),
+    ],
+)
+async def test_ticket_refuses_a_completed_gate_that_is_not_the_resolution(
+    ctx, group, sample, mask, refusal
+):
+    """A completed gate under the named mask is not enough: the prep_sample must
+    resolve to that mask in its group, as the cohort DoGet requires."""
+    resp = await ctx["admin"].post(
+        URL_ADMIN_MASKED_READ_EXPORT_TICKET,
+        json={"prep_sample_idx": group[sample], "mask_idx": group[mask]},
+    )
+    assert resp.status_code == 409, resp.text
+    detail = resp.json()["detail"]
+    assert detail["reason"] == refusal
+    assert detail["resolution"]["prep_sample_idx"] == group[sample]
