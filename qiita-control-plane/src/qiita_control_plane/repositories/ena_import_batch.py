@@ -26,6 +26,15 @@ _NO_STORED_READS = (
     " WHERE sr.prep_sample_idx = ss.prep_sample_idx)"
 )
 
+# A range counts only once its minting ticket completed (registering the reads) or is
+# unknown: a failed or cancelled minter minted before registering, and a live one may yet.
+_NO_REGISTERED_READS = (
+    "NOT EXISTS (SELECT 1 FROM qiita.sequence_range sr"
+    " LEFT JOIN qiita.work_ticket mt ON mt.work_ticket_idx = sr.minted_by_work_ticket_idx"
+    " WHERE sr.prep_sample_idx = ss.prep_sample_idx"
+    f" AND (mt.state IS NULL OR mt.state = '{WorkTicketState.COMPLETED.value}'))"
+)
+
 # NULL (not empty) when the ticket carries no run restriction.
 _RUN_RESTRICTION = (
     "(SELECT array_agg(r ORDER BY r)"
@@ -250,9 +259,8 @@ async def fetch_sequenced_pool_download_states(
 async def fetch_runs_needing_download(
     pool_or_conn: asyncpg.Pool | asyncpg.Connection, *, sequenced_sample_idxs: list[int]
 ) -> dict[int, list[str]]:
-    """`sequenced_pool_idx -> run accessions` for the `sequenced_sample_idxs` that no
-    download has stored or failed and that a roster read would still include
-    (active, not ENA-flagged), sorted."""
+    """`sequenced_pool_idx -> run accessions` for the active, non-ENA-flagged
+    `sequenced_sample_idxs` with no registered reads and no recorded download failure, sorted."""
     rows = await pool_or_conn.fetch(
         "SELECT ss.sequenced_pool_idx, ss.ena_run_accession"
         " FROM qiita.sequenced_sample ss"
@@ -260,7 +268,7 @@ async def fetch_runs_needing_download(
         " WHERE ss.idx = ANY($1::bigint[])"
         f"   AND {ACTIVE_ROSTER_ROW}"
         "   AND ss.download_failure_type IS NULL"
-        f"   AND {_NO_STORED_READS}"
+        f"   AND {_NO_REGISTERED_READS}"
         " ORDER BY ss.ena_run_accession",
         sequenced_sample_idxs,
     )

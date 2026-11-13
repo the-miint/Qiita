@@ -274,12 +274,14 @@ def test_stage_ena_run_roster_restricted_stages_only_the_listed_runs(tmp_path):
     assert _staged_runs(bound[ENA_RUN_MAP_BINDING]) == ["ERR001", "ERR003"]
 
 
-def test_stage_ena_run_roster_restricted_fails_loud_on_a_listed_run_off_the_roster(tmp_path):
-    """A listed run flagged or retired since submit is off the active roster; staging the
-    rest would silently shrink the ticket."""
-    pool = _FakeRosterPool([(81, "ERR001")])
-    with pytest.raises(BackendFailure) as exc:
-        asyncio.run(
+def test_stage_ena_run_roster_restricted_drops_listed_runs_off_the_roster_and_warns(
+    tmp_path, caplog
+):
+    """A listed run flagged or retired since submit is off the active roster; the rest
+    still download, as an unrestricted ticket's would."""
+    pool = _FakeRosterPool([(81, "ERR001"), (82, "ERR002")])
+    with caplog.at_level(logging.WARNING):
+        bound = asyncio.run(
             _stage_ena_run_roster(
                 pool,
                 5,
@@ -288,9 +290,28 @@ def test_stage_ena_run_roster_restricted_fails_loud_on_a_listed_run_off_the_rost
                 ena_run_accessions=["ERR001", "ERR009"],
             )
         )
+    assert _staged_runs(bound[ENA_RUN_MAP_BINDING]) == ["ERR001"]
+    (record,) = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert "ERR009" in record.getMessage()
+    assert "ERR001" not in record.getMessage()
+
+
+def test_stage_ena_run_roster_restricted_fails_loud_when_no_listed_run_remains(tmp_path):
+    pool = _FakeRosterPool([(81, "ERR001")])
+    with pytest.raises(BackendFailure) as exc:
+        asyncio.run(
+            _stage_ena_run_roster(
+                pool,
+                5,
+                sequencing_run_idx=7,
+                workspace=tmp_path / "ws",
+                ena_run_accessions=["ERR008", "ERR009"],
+            )
+        )
     assert exc.value.kind == FailureKind.BAD_INPUT
+    assert "ERR008" in exc.value.reason
     assert "ERR009" in exc.value.reason
-    assert "ERR001" not in exc.value.reason
+    assert not (tmp_path / "ws" / "ena_run_map.parquet").exists()
 
 
 def test_stage_ena_run_roster_binding_passes_the_ticket_restriction_through(tmp_path):

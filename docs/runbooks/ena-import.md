@@ -133,14 +133,18 @@ it starts, so new runs never join a pool whose download is in flight or finished
 go into a new pool with its own ticket, and the accession reports `done` only once every
 pool's download has. A re-import is also how to retry a failed or cancelled download,
 as is `POST /work-ticket/{idx}/run` on the pool's latest such ticket, which picks up runs
-added since (a restricted ticket re-downloads only its listed runs). `/run` is refused with
+added since (a restricted ticket re-downloads only its listed runs, and skips, with a runner
+warning, listed runs flagged or retired since; it fails only if none remain). `/run` is refused with
 a 409 on an older ticket (the error names the newer one and its state), and on a failed
 ticket that still has a live download job from before the failure, which holds the old
 roster: cancel it by idx (`work_ticket_idxs`) to reap the job, then re-import the study. The ticket stays FAILED and keeps refusing `/run`.
 A re-import does not retry the failed runs of a `completed_partial` pool: its ticket is
 COMPLETED and is reused, and the runs keep reporting `download_failed`. It does ticket the
 runs a completed download never read (no reads, no recorded failure): a new ticket for the
-same pool, restricted to them. If another import's restricted ticket is still live on a pool
+same pool, restricted to them. A run counts as downloaded once its minting ticket completed, so
+a failed ticket that had already reserved a run's read numbering does not hide it from a
+re-import; the new ticket stops at that run, naming the failed ticket, which `/run` re-drives.
+If another import's restricted ticket is still live on a pool
 the re-import needs, the item fails naming that ticket; re-import once it ends.
 Nothing schedules a re-import or a redrive; each is an operator gesture. A native
 `POST .../sequenced-sample` add to a pool whose download has already read (or is reading) its

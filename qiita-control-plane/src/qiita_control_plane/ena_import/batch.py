@@ -652,11 +652,17 @@ async def _process_one_study(
         own_pool_idxs = None
         if requested is not None:
             own_pool_idxs = await fetch_sequenced_pool_idxs_for_sequenced_samples(pool, sample_idxs)
-        needed_by_pool = await fetch_runs_needing_download(pool, sequenced_sample_idxs=sample_idxs)
         any_ticket = False
         any_skipped = False
         for sequencing_run_idx in dict.fromkeys(p.sequencing_run_idx for p in result.created_pools):
-            for pool_state in await fetch_download_pool_states(pool, sequencing_run_idx):
+            # One snapshot, so a ticket completing between the two reads cannot show
+            # its runs as still needed.
+            async with pool.acquire() as conn, conn.transaction(isolation="repeatable_read"):
+                pool_states = await fetch_download_pool_states(conn, sequencing_run_idx)
+                needed_by_pool = await fetch_runs_needing_download(
+                    conn, sequenced_sample_idxs=sample_idxs
+                )
+            for pool_state in pool_states:
                 pool_idx = pool_state["sequenced_pool_idx"]
                 if not pool_state["has_sequenced_sample"]:
                     continue

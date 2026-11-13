@@ -520,10 +520,10 @@ async def _stage_ena_run_roster(
     for an in-flight registration or native insert that already picked this
     pool to commit first (see the helper for the race that closes). This
     resolver also re-runs on a resume or a `/run` redrive, not only at first
-    dispatch, and a re-read may add runs or pick up a PATCHed run accession.
+    dispatch, and an unrestricted re-read may add runs or pick up a PATCHed accession.
 
-    `ena_run_accessions` restricts the roster to those runs; one no longer on the
-    active roster fails loud rather than shrinking the ticket."""
+    `ena_run_accessions` restricts the roster to those runs. Listed runs no longer on the
+    active roster are dropped with a warning; it fails loud only when none remain."""
     async with pool.acquire() as conn, conn.transaction():
         await lock_sequencing_run(conn, sequencing_run_idx=sequencing_run_idx)
         rows = await fetch_sequenced_pool_ena_run_roster(
@@ -541,13 +541,20 @@ async def _stage_ena_run_roster(
             f"ena_run_accession, so no ENA run to download: {sorted(missing)}"
         )
     if ena_run_accessions is not None:
+        rows = [r for r in rows if r["ena_run_accession"] in ena_run_accessions]
         absent = sorted(set(ena_run_accessions) - {r["ena_run_accession"] for r in rows})
-        if absent:
+        if not rows:
             raise _submission_bad_input(
-                f"sequenced_pool {sequenced_pool_idx} no longer holds the restricted "
+                f"sequenced_pool {sequenced_pool_idx} no longer holds any of the restricted "
                 f"run(s) as active sequenced_samples: {absent}"
             )
-        rows = [r for r in rows if r["ena_run_accession"] in ena_run_accessions]
+        if absent:
+            _log.warning(
+                "sequenced_pool %d: restricted run(s) no longer on the active roster, "
+                "not downloaded: %s",
+                sequenced_pool_idx,
+                absent,
+            )
     roster = [(r["prep_sample_idx"], r["ena_run_accession"]) for r in rows]
     workspace.mkdir(parents=True, exist_ok=True)
     out = workspace / "ena_run_map.parquet"
