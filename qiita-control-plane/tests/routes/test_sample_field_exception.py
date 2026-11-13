@@ -50,6 +50,7 @@ from .conftest import (
     PREP_SAMPLE_FIELD_SURFACE,
     STUDY_SCOPED_SAMPLE_ADMIN_AUTHZ_CASES,
     SampleFieldSurface,
+    _cancel,
     _finish,
     _grant_study_access,
     _seed_authz_case_study,
@@ -295,6 +296,24 @@ async def _seed_local_value(
     return field_idx, display_name
 
 
+_SLOT_SHAPES = ("global", "local")
+
+
+async def _seed_value_in_slot(
+    ctx, s: _Surface, *, study_idx: int, entity: _Entity, shape: str
+) -> tuple[int, dict]:
+    """A value on entity in a field linked to a global field ("global") or a
+    purely-local one ("local"). Returns the study field idx that the path
+    names, and the key that an exception on that value takes."""
+    if shape == "global":
+        value = await _seed_global_value(ctx, s.spec, study_idx=study_idx, entity=entity)
+        return value.study_field_idx, {"global_field_idx": value.global_field_idx}
+    field_idx, _ = await _seed_local_value(
+        ctx, s.spec, study_idx=study_idx, entity=entity, tier_override=Tier.VIEWER
+    )
+    return field_idx, {"study_field_idx": field_idx}
+
+
 async def _member_study(ctx) -> int:
     """A study at the default (member) tier, owned by the wet-lab admin, on
     which the regular user holds member."""
@@ -493,14 +512,17 @@ async def test_put_replaces_an_exception_under_its_if_match(ctx, surface):
 
 
 @pytest.mark.parametrize("surface", _SURFACE_IDS)
-async def test_put_over_an_existing_exception_without_if_match_is_428(ctx, surface):
+@pytest.mark.parametrize("shape", _SLOT_SHAPES)
+async def test_put_over_an_existing_exception_without_if_match_is_428(ctx, surface, shape):
     """A PUT with no If-Match only creates, so it cannot silently undo an
     exception that another admin set in the meantime."""
     s = _SURFACES[surface]
     study_idx = await _member_study(ctx)
     entity = await s.seed_entity(ctx, study_idx)
-    value = await _seed_global_value(ctx, s.spec, study_idx=study_idx, entity=entity)
-    url = s.exception_url(study_idx, entity, value.study_field_idx)
+    field_idx, _ = await _seed_value_in_slot(
+        ctx, s, study_idx=study_idx, entity=entity, shape=shape
+    )
+    url = s.exception_url(study_idx, entity, field_idx)
     assert (await _put(ctx["wet"], url, Tier.ADMIN)).status_code == 201
 
     resp = await _put(ctx["wet"], url, Tier.MEMBER)
@@ -508,6 +530,50 @@ async def test_put_over_an_existing_exception_without_if_match_is_428(ctx, surfa
     assert resp.status_code == 428, resp.text
     (row,) = await _exception_rows(ctx, s.spec, entity)
     assert row["tier_override"] == "admin"
+
+
+@pytest.mark.parametrize("surface", _SURFACE_IDS)
+@pytest.mark.parametrize("shape", _SLOT_SHAPES)
+async def test_put_racing_a_concurrent_create_is_428(ctx, surface, shape):
+    """A PUT with no If-Match that meets an uncommitted exception on the same
+    slot waits for it, and once that commits is refused with the same 428 as
+    one that came after."""
+    s = _SURFACES[surface]
+    pool = ctx["pool"]
+    study_idx = await _member_study(ctx)
+    entity = await s.seed_entity(ctx, study_idx)
+    field_idx, key = await _seed_value_in_slot(
+        ctx, s, study_idx=study_idx, entity=entity, shape=shape
+    )
+    url = s.exception_url(study_idx, entity, field_idx)
+
+    task, committed = None, False
+    async with pool.acquire() as setter:
+        tx = setter.transaction()
+        await tx.start()
+        try:
+            await seed_field_exception(
+                setter,
+                spec=s.spec,
+                entity_idx=entity.metadata_idx,
+                tier_override=Tier.MEMBER,
+                created_by_idx=_wet_idx(ctx),
+                reason="set first",
+                **key,
+            )
+            task = asyncio.create_task(_put(ctx["wet"], url, Tier.ADMIN))
+            await _wait_until_blocked_by(pool, setter, task)
+            await tx.commit()
+            committed = True
+            resp = await _finish(task)
+        finally:
+            await _cancel(task)
+            if not committed:
+                await tx.rollback()
+
+    assert resp.status_code == 428, resp.text
+    (row,) = await _exception_rows(ctx, s.spec, entity)
+    assert (row["tier_override"], row["reason"]) == ("member", "set first")
 
 
 @pytest.mark.parametrize("surface", _SURFACE_IDS)
@@ -857,6 +923,7 @@ async def test_put_racing_a_unique_declaration_is_409(ctx, surface):
     )
     url = s.exception_url(study_idx, entity, field_idx)
 
+    task, committed = None, False
     async with pool.acquire() as declarer:
         tx = declarer.transaction()
         await tx.start()
@@ -869,9 +936,13 @@ async def test_put_racing_a_unique_declaration_is_409(ctx, surface):
             )
             task = asyncio.create_task(_put(ctx["wet"], url, Tier.ADMIN))
             await _wait_until_blocked_by(pool, declarer, task)
-        finally:
             await tx.commit()
-    resp = await _finish(task)
+            committed = True
+            resp = await _finish(task)
+        finally:
+            await _cancel(task)
+            if not committed:
+                await tx.rollback()
 
     assert resp.status_code == 409, resp.text
     assert "unique_in_study" in resp.json()["detail"]
@@ -894,6 +965,7 @@ async def test_unique_declaration_racing_an_exception_is_409(ctx, surface):
         surface=s.fields, client=ctx["wet"], study_idx=study_idx, study_field_idx=field_idx
     )
 
+    task, committed = None, False
     async with pool.acquire() as setter:
         tx = setter.transaction()
         await tx.start()
@@ -917,9 +989,13 @@ async def test_unique_declaration_racing_an_exception_is_409(ctx, surface):
                 )
             )
             await _wait_until_blocked_by(pool, setter, task)
-        finally:
             await tx.commit()
-    resp = await _finish(task)
+            committed = True
+            resp = await _finish(task)
+        finally:
+            await _cancel(task)
+            if not committed:
+                await tx.rollback()
 
     assert resp.status_code == 409, resp.text
     assert "field exceptions are set" in resp.json()["detail"]

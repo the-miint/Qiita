@@ -9,10 +9,13 @@ import asyncpg
 async def wait_until_blocked_by(
     pool: asyncpg.Pool, blocker: asyncpg.Connection, task: asyncio.Task, *, timeout_s: float
 ) -> None:
-    """Return once some backend waits on a lock that `blocker` holds, while
-    `task` (the only candidate) is still running, rather than after a fixed
-    sleep that would not show that the task ever reached the lock. Fails when
-    the task finishes first or nothing waits within timeout_s."""
+    """Return once some backend waits on a lock that `blocker` holds while
+    `task` is still running. The caller makes `task` the only work that can
+    wait on those locks.
+
+    Polling for the wait, rather than sleeping a fixed time, shows that the
+    task reached the lock. Fails when the task finishes first, or when nothing
+    waits within timeout_s."""
     blocker_pid = blocker.get_server_pid()
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout_s

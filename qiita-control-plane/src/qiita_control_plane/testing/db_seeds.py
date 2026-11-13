@@ -839,7 +839,7 @@ async def seed_field_exception(
 
     Pass exactly one of global_field_idx / study_field_idx; the table's CHECK
     refuses both or neither. The row hangs off its entity, so the sweep
-    takes it. On a connection, the insert rides that connection's transaction.
+    takes it. On a connection, the insert runs in that connection's open transaction.
     """
     # f-string interpolation of identifiers is safe: spec fields are frozen
     # module-level constants, never reached by caller input.

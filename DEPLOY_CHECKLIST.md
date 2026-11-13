@@ -35,7 +35,7 @@ _None yet._
 ### 3. Migrations
 
 - `[operator]` (#855) `make migrate` applies `20261110000000_block_rearmed_at.sql` (nullable `rearmed_at` on `qiita.block`, which `rerun-block` sets and abandon-plan reads; no row changes).
-- `[operator]` (#feat/sample-field-exception) `make migrate` applies `20261112000000_field_exception_excludes_unique_in_study.sql` (triggers that keep a field exception off `unique_in_study` fields, and a nullable `updated_by_idx` on both `*_field_exception` tables; no row changes). It refuses to apply, naming the rule, if an existing exception row already keys on a `unique_in_study` field; nothing has written one, so none should. If it does refuse, stop and find who wrote the row before changing it: clearing it exposes the value that it restricts.
+- `[operator]` (#feat/sample-field-exception) `make migrate` applies `20261112000000_field_exception_excludes_unique_in_study.sql` (triggers that keep a field exception off `unique_in_study` fields, and a nullable `updated_by_idx` on both `*_field_exception` tables; no row changes). It refuses to apply, naming the rule, if an existing exception row already keys on a `unique_in_study` field; nothing has written one, so none should. If it does refuse, stop and follow its HINT.
 
 ### 4. Deploy
 

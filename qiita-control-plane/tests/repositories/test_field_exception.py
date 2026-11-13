@@ -30,8 +30,6 @@ _WAIT_S = 10
 
 
 async def _seed_exception(ctx, spec, *, entity_idx, field_idx, on=None) -> int:
-    """Seed an exception on the local field; on a connection, it rides that
-    connection's transaction."""
     return await seed_field_exception(
         ctx["pool"] if on is None else on,
         spec=spec,
