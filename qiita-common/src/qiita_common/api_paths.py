@@ -558,6 +558,19 @@ URL_ALIGNMENT_DOGET = f"{URL_ALIGNMENT_PREFIX}{PATH_ALIGNMENT_DOGET}"
 URL_ALIGNMENT_COHORT_DOGET = f"{URL_ALIGNMENT_PREFIX}{PATH_ALIGNMENT_COHORT_DOGET}"
 
 # =============================================================================
+# /definition-group/* — per-sample resolution across a definition group
+# =============================================================================
+# POST .../resolve: which member of a mask, alignment or processing group each
+# named prep_sample resolves to (human, prep_sample:read, VIEWER on every study of
+# every sample).
+
+PATH_DEFINITION_GROUP_PREFIX = "/definition-group"
+PATH_DEFINITION_GROUP_RESOLVE = "/resolve"
+
+URL_DEFINITION_GROUP_PREFIX = f"{API_PREFIX}{PATH_DEFINITION_GROUP_PREFIX}"
+URL_DEFINITION_GROUP_RESOLVE = f"{URL_DEFINITION_GROUP_PREFIX}{PATH_DEFINITION_GROUP_RESOLVE}"
+
+# =============================================================================
 # /read-masked/* — Flight DoGet ticket for the masked-read surface
 # =============================================================================
 # Signs an HMAC DoGet ticket scoped to a single (prep_sample_idx, mask_idx) on
@@ -1124,6 +1137,19 @@ PATH_EXPORTED_PROCESSING_ROOT = ""  # POST against the prefix itself
 
 URL_EXPORTED_PROCESSING_PREFIX = f"{API_PREFIX}{PATH_EXPORTED_PROCESSING_PREFIX}"
 URL_EXPORTED_PROCESSING = f"{URL_EXPORTED_PROCESSING_PREFIX}{PATH_EXPORTED_PROCESSING_ROOT}"
+
+
+# =============================================================================
+# Mask kind of /exported-processing and /exported-identifier
+# =============================================================================
+# The public handles for a mask and for a prep_sample masked under it, which a
+# masked-read export cites. system_admin + admin:masked_read_export.
+
+PATH_EXPORTED_PROCESSING_MASK = "/mask"
+PATH_EXPORTED_IDENTIFIER_MASK = "/mask"
+
+URL_EXPORTED_PROCESSING_MASK = f"{URL_EXPORTED_PROCESSING_PREFIX}{PATH_EXPORTED_PROCESSING_MASK}"
+URL_EXPORTED_IDENTIFIER_MASK = f"{URL_EXPORTED_IDENTIFIER_PREFIX}{PATH_EXPORTED_IDENTIFIER_MASK}"
 
 
 URL_PREP_SAMPLE_PREFIX = f"{API_PREFIX}{PATH_PREP_SAMPLE_PREFIX}"

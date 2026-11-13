@@ -418,6 +418,17 @@ _TRIPLES: list[tuple[str, str, str]] = [
         "PATH_EXPORTED_PROCESSING_PREFIX",
         "PATH_EXPORTED_PROCESSING_ROOT",
     ),
+    # mask kind of /exported-processing and /exported-identifier
+    (
+        "URL_EXPORTED_PROCESSING_MASK",
+        "PATH_EXPORTED_PROCESSING_PREFIX",
+        "PATH_EXPORTED_PROCESSING_MASK",
+    ),
+    (
+        "URL_EXPORTED_IDENTIFIER_MASK",
+        "PATH_EXPORTED_IDENTIFIER_PREFIX",
+        "PATH_EXPORTED_IDENTIFIER_MASK",
+    ),
     # /prep-sample
     (
         "URL_PREP_SAMPLE_STUDY_LIST",
@@ -547,6 +558,12 @@ _TRIPLES: list[tuple[str, str, str]] = [
     # /alignment (Flight DoGet ticket for the alignment sink)
     ("URL_ALIGNMENT_DOGET", "PATH_ALIGNMENT_PREFIX", "PATH_ALIGNMENT_DOGET"),
     ("URL_ALIGNMENT_COHORT_DOGET", "PATH_ALIGNMENT_PREFIX", "PATH_ALIGNMENT_COHORT_DOGET"),
+    # /definition-group
+    (
+        "URL_DEFINITION_GROUP_RESOLVE",
+        "PATH_DEFINITION_GROUP_PREFIX",
+        "PATH_DEFINITION_GROUP_RESOLVE",
+    ),
 ]
 
 

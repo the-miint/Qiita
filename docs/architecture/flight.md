@@ -170,7 +170,7 @@ authorization models:
 | Route | Caller | Cohort source | Authorization |
 |---|---|---|---|
 | `POST /alignment/ticket/doget` | service account, `ticket:doget` | the work ticket's `action_context` | scope, then a re-check of what the runner resolver validated at submit: 409 if the alignment was deprecated or a prep_sample is no longer `completed` (for the de novo arm: only the prep_samples whose assembly completed, plus a 409 if the assembly run was deprecated or a prep_sample's assembly gate left `completed` / `no_data`) |
-| `POST /alignment/{alignment_idx}/ticket/doget` | human, `alignment:doget` | the request body | `Tier.VIEWER` on every study each `prep_sample_idx` links to, all-or-nothing, plus a completeness re-check |
+| `POST /alignment/{alignment_idx}/ticket/doget` | human, `alignment:doget` | the request body | `Tier.VIEWER` on every study each `prep_sample_idx` links to, all-or-nothing, plus a completeness re-check; then 409 for any sample that does not resolve to this alignment in its group (`definition_resolver`) |
 
 The second exists because a scientist pulling their own data has no runner
 upstream to have validated anything. It is also the only place that validation
@@ -208,6 +208,7 @@ the one place bulk-shaped analytic data does not come off the data plane:
 | `POST /exported-identifier` | `(alignment_idx, prep_sample_idx)` → `export_id` | the identifier is *minted* here; it exists in Postgres only, and creating one is a write |
 | `POST /exported-feature` | `genome_idx` \| `feature_idx` → `export_feature_id` | same — a mint, and a write |
 | `POST /exported-processing` | `alignment_idx` → `export_processing_id` | same |
+| `POST /exported-identifier/mask`, `POST /exported-processing/mask` | `(mask_idx, prep_sample_idx)` → `export_id`; `mask_idx` → `export_processing_id` (system_admin + `admin:masked_read_export`, for the masked-read export) | same |
 
 That is the whole criterion: **a signed ticket can only name identifiers the
 data plane can resolve**, and no call's columns exist out there. It is not a
@@ -226,6 +227,8 @@ shape, the rejected alternatives, and what a new *kind* must update are in the
 three migrations (`20260810000000_exported_identifier.sql`,
 `20260813000000_exported_feature.sql`, `20260813000001_exported_processing.sql`);
 the FORWARD PLAN comment in each is the copy to read before adding one.
+`20261113000001_exported_processing_mask.sql` adds the mask kind to
+`exported_identifier` and `exported_processing` that way.
 
 **The exported identifier is the boundary where our identifiers stop.** A
 published table names its samples `QM<n>`, never `prep_sample_idx` — see the

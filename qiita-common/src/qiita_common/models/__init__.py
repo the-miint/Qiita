@@ -148,6 +148,14 @@ from qiita_common.models.biosample import (
     derive_metadata_field_scope,
     normalize_matrix_tube_id,
 )
+from qiita_common.models.definition_group import (
+    DefinitionGroupRefusal,
+    DefinitionGroupResolveRequest,
+    DefinitionGroupResolveResponse,
+    SampleResolution,
+    SampleResolutionReason,
+    SampleResolutionState,
+)
 from qiita_common.models.definition_pair import (
     DefinitionKind,
     DefinitionPair,
@@ -288,6 +296,10 @@ from qiita_common.models.sequencing import (
     ExportedIdentifier,
     ExportedIdentifierRequest,
     ExportedIdentifierResponse,
+    ExportedMaskIdentifierRequest,
+    ExportedMaskIdentifierResponse,
+    ExportedMaskProcessingRequest,
+    ExportedMaskProcessingResponse,
     ExportedProcessingRequest,
     ExportedProcessingResponse,
     MaskDefinition,
@@ -598,6 +610,13 @@ __all__ = [
     "DefinitionPairRefusal",
     "DefinitionPairRevokeRequest",
     "DefinitionPairVerdict",
+    # Definition groups.
+    "DefinitionGroupRefusal",
+    "DefinitionGroupResolveRequest",
+    "DefinitionGroupResolveResponse",
+    "SampleResolution",
+    "SampleResolutionReason",
+    "SampleResolutionState",
     # Step wire contract.
     "AlignmentCohortDoGetTicketRequest",
     "AlignmentDoGetTicketRequest",
@@ -849,6 +868,10 @@ __all__ = [
     "ExportedIdentifier",
     "ExportedIdentifierRequest",
     "ExportedIdentifierResponse",
+    "ExportedMaskIdentifierRequest",
+    "ExportedMaskIdentifierResponse",
+    "ExportedMaskProcessingRequest",
+    "ExportedMaskProcessingResponse",
     "ExportedProcessingRequest",
     "ExportedProcessingResponse",
     "SampleQCReport",
