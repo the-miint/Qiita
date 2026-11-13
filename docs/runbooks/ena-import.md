@@ -392,13 +392,14 @@ taxon, is not a host and is ignored, with a warning.
 With no usable `host_tax_id`, a free-text `host` that is not a missing-value term such as
 `missing` gives `not provided` and a warning quoting the text. Otherwise the host comes
 from the table: the listed human and mouse metagenomes give that host, and the listed
-hostless environments such as seawater or soil give `not applicable`, meaning the
+hostless environments such as seawater or soil leave `host taxon id` out, meaning the
 sequenced sample is submitted with no host depletion. A taxon the table does not cover
 gives `not provided`, and host-filter resolution then returns unresolved and submit
-refuses. `qiita-admin backfill host-taxon-id` reads the same table. An attribute tag
+refuses. `qiita-admin backfill host-taxon-id` reads the same table; it is run once, in the
+deploy that made an absent value mean no host (bucket 2, before the restart), and never
+after, because from the restart an absent value is deliberate. An attribute tag
 named `taxon id` or `host taxon id` is dropped with a warning, since those fields are
-filled from the run's taxon ids (falling back to the table, `not applicable`, or
-`not provided`).
+filled from the run's taxon ids (falling back to the table, or to `not provided`).
 
 A warning appears only on the run that created the biosample, so after a re-import or for
 a later run on the same sample, check the creating batch.
@@ -416,9 +417,13 @@ qiita biosample patch-metadata-by-unique-field --study-idx S \
   --metadata "host taxon id=<NCBI taxon id>"
 ```
 
-The value is a loaded NCBI Taxonomy id or a missing-value reason such as `not applicable`.
-Either path takes one biosample per call and needs `member` or above on the study, or
-`wet_lab_admin`; a field or value above your tier on the study is refused with 403.
+The value is a loaded NCBI Taxonomy id, `not provided`, or `not applicable`. Either path takes
+one biosample per call and needs `member` or above on the study, or `wet_lab_admin`; a field or
+value above your tier on the study is refused with 403.
+
+Write `not applicable` only to correct a `not provided` biosample that turns out to have no host:
+biosample metadata has no delete route, so the field cannot go back to absent, and host filtering
+reads `not applicable` as no host.
 
 ENA's `neg_cont_type` and `pos_cont_type` tags (also spelled `negative control type` and
 `positive control type`) are kept as study-local text and never make a biosample a control,

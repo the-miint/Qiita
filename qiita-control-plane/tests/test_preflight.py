@@ -391,7 +391,7 @@ def test_control_samples_reads_is_control_off_the_input_sample_row(build_case5_p
     `input_sample.sample_name`, the second matches the `prepped_sample_name` view
     (the prep-level EFFECTIVE name, `COALESCE(prepped, input)`). A control whose
     prep overrides its name resolves to zero matches and is silently skipped — and
-    a missed blank resolves UNRESOLVED, which aborts its entire pool. Hence the
+    a missed blank is handled as an ordinary sample. Hence the
     single-row read; this test is the pin on it.
     """
     from qiita_control_plane.preflight import control_samples, open_blob
@@ -423,7 +423,7 @@ def test_control_samples_counts_a_control_with_no_accession_rather_than_dropping
 ):
     """A blank the pre-flight KNOWS about but that carries no biosample accession
     cannot be joined to a qiita.biosample — but it must be COUNTED, not silently
-    dropped, because it will fall to UNRESOLVED and abort its pool, and the
+    dropped, because it is handled as an ordinary sample, and the
     operator needs to know that was an accession problem and not a curation one."""
     import sqlite3 as _sqlite3
 

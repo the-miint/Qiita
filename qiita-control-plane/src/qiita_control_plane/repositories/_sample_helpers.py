@@ -302,20 +302,6 @@ class MetadataValueTierError(Exception):
         )
 
 
-class MetadataMissingRequiredFieldsError(Exception):
-    """Raised when an import omits a global field marked `required`.
-
-    Carries every missing display_name in one list, so the caller fixes the whole
-    set at once rather than discovering them one 422 at a time.
-    """
-
-    def __init__(self, entity_kind: SampleEntityKind, missing_display_names: list[str]) -> None:
-        self.missing_display_names = missing_display_names
-        super().__init__(
-            f"missing required {entity_kind} global field(s): {missing_display_names!r}"
-        )
-
-
 class UniqueInStudyViolation(StrEnum):
     """Which study-local uniqueness rule a database error broke."""
 
@@ -2947,70 +2933,6 @@ def validate_primary_secondary_studies(
         raise ValueError(
             f"primary_study_idx ({primary_study_idx}) must not appear in secondary_study_idxs"
         )
-
-
-# The `internal_name`s whose `required` flag this import path actually enforces.
-# Narrow ON PURPOSE — see assert_required_global_fields_supplied. Adding an entry
-# here is the whole change needed to start enforcing another field.
-_ENFORCED_REQUIRED_FIELDS = frozenset({"host_taxon_id"})
-
-
-# Slated for removal: the premise behind this gate is a misunderstanding, so it is
-# deliberately not being extended to cover the cases it gets wrong. Notably, a required
-# field whose value is supplied through a study-local alias of that field is not
-# recognized as supplied, and the import is rejected as missing.
-async def assert_required_global_fields_supplied(
-    conn: asyncpg.Connection,
-    *,
-    spec: EntityMetadataSpec,
-    metadata: Mapping[str, str],
-    global_internal_names: bool = False,
-) -> None:
-    """Reject an import that omits an ENFORCED required global field.
-
-    `biosample_global_field.required` has been in the schema since the first
-    migration and was never enforced anywhere — a field could be declared required
-    and simply not supplied. That is how `host_taxon_id` came to be marked required
-    and yet be absent from every one of the samples we hold.
-
-    It matters now because host filtering is resolved FROM that field: a sample
-    without it resolves UNRESOLVED and aborts its pool at submit. Unenforced, every
-    newly-ingested pool would arrive broken and the backfill would be a treadmill
-    rather than a one-off.
-
-    DELIBERATELY NARROW. This enforces only `_ENFORCED_REQUIRED_FIELDS`, not every
-    field the schema marks `required` — because the other required fields
-    (collection_date, the geo/ENVO set, taxon_id) were ALSO never enforced, and
-    turning them all on at once would reject historical-shaped imports this arc has
-    no reason to touch. `host_taxon_id` is enforced because this is the PR that makes
-    its absence a hard failure downstream; the rest is a separate decision about
-    intake strictness, made when someone owns it. Widening the set is the whole
-    change required to enforce another field.
-
-    A missing-value marker ('not applicable', 'missing: control sample', …) COUNTS
-    as supplied — declining to give a value is a decision, and it is one the
-    resolver understands. What is rejected is silence.
-
-    global_internal_names matches the caller's key namespace: the supplied
-    metadata keys are compared against the required fields' internal_names when
-    set, and their display_names otherwise, so the check stays accurate under
-    either resolution mode.
-
-    Raises before any DB write, with the whole missing set at once.
-    """
-    rows = await conn.fetch(
-        f"SELECT internal_name, display_name FROM {spec.global_field_table}"  # noqa: S608
-        " WHERE required AND internal_name = ANY($1::text[])",
-        sorted(_ENFORCED_REQUIRED_FIELDS),
-    )
-    # Compare against whichever name the caller keyed on, so a required field
-    # supplied by internal_name is not falsely reported missing under the flag.
-    key_column = "internal_name" if global_internal_names else "display_name"
-    required = {r[key_column] for r in rows}
-    supplied = set(metadata)
-    missing = sorted(required - supplied)
-    if missing:
-        raise MetadataMissingRequiredFieldsError(spec.entity_kind, missing)
 
 
 async def _resolve_and_parse_metadata_values(

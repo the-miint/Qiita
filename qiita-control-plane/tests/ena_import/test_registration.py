@@ -748,7 +748,7 @@ async def test_human_gut_run_stores_host_and_taxon_as_term_references(reg):
     }
 
 
-async def test_hostless_environment_stores_not_applicable(reg):
+async def test_hostless_environment_stores_no_host(reg):
     study_accession = unique_ena_accession("PRJEB")
     run = _fixture_run("ena_runs_seawater.json", study_accession=study_accession)
 
@@ -758,10 +758,7 @@ async def test_hostless_environment_stores_not_applicable(reg):
 
     assert result.ena_runs[0].status == EnaRunRegistrationStatus.REGISTERED
     assert result.ena_runs[0].harmonization.warnings == []
-    assert await _taxon_fields(reg["pool"], run.sample_accession) == {
-        "host taxon id": "not applicable",
-        "taxon id": "1561972",
-    }
+    assert await _taxon_fields(reg["pool"], run.sample_accession) == {"taxon id": "1561972"}
 
 
 async def test_host_tax_id_outside_the_seeded_terminology_registers_as_not_provided(reg):
@@ -801,8 +798,9 @@ async def test_every_fixture_study_registers_with_only_seeded_terms_or_missing_r
     assert [o.status for o in result.ena_runs] == [EnaRunRegistrationStatus.REGISTERED] * 5
     for run in runs:
         stored = await _taxon_fields(reg["pool"], run.sample_accession)
-        assert set(stored) == {"host taxon id", "taxon id"}
-        assert all(v.isdigit() or v in {"not provided", "not applicable"} for v in stored.values())
+        assert set(stored) <= {"host taxon id", "taxon id"}
+        assert "taxon id" in stored
+        assert all(v.isdigit() or v == "not provided" for v in stored.values())
 
 
 @pytest.mark.parametrize("tag", ["taxon id", "host taxon id"])

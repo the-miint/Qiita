@@ -22,6 +22,7 @@ from qiita_common.control_types import ControlKind, load_control_types
 from qiita_common.models import (
     BIOSAMPLE_FIELD_QIITA_SAMPLE_TYPE,
     MISSING_REASON_CONTROL_SAMPLE,
+    NCBI_TAXONOMY_METAGENOME_TERM_ID,
     Platform,
 )
 
@@ -96,6 +97,19 @@ async def ctx(postgres_pool):
         pool, name=f"hfr-mm2-{suffix}", created_by_idx=principal_idx
     )
 
+    taxon_gf_idx = await pool.fetchval(
+        "SELECT idx FROM qiita.biosample_global_field WHERE internal_name = 'taxon_id'"
+    )
+    async with pool.acquire() as conn, conn.transaction():
+        taxon_field_idx, _ = await _get_or_create_globally_linked_study_field(
+            conn,
+            spec=BIOSAMPLE_METADATA_SPEC,
+            study_idx=study_idx,
+            global_field_idx=taxon_gf_idx,
+            display_name="taxon id",
+            created_by_idx=principal_idx,
+        )
+
     human_term = await fetch_ncbi_taxonomy_term(pool, NCBI_TAXONOMY_HUMAN_TERM_ID)
     human_term_idx = human_term["idx"] if human_term else None
     assert human_term_idx is not None, "NCBI 9606 should be seeded by migration"
@@ -136,6 +150,7 @@ async def ctx(postgres_pool):
         "study_idx": study_idx,
         "host_gf_idx": host_gf_idx,
         "field_idx": field_idx,
+        "taxon_field_idx": taxon_field_idx,
         "rype_idx": rype_idx,
         "minimap2_idx": minimap2_idx,
         "human_term_idx": human_term_idx,
@@ -204,6 +219,22 @@ async def _set_host_missing_reason(ctx, biosample_idx, reason_name):
         biosample_idx,
         ctx["field_idx"],
         reason_idx,
+        ctx["principal_idx"],
+    )
+
+
+async def _set_taxon(ctx, biosample_idx, term_id):
+    """Write the biosample's own taxon_id as the NCBI term `term_id`."""
+    term = await fetch_ncbi_taxonomy_term(ctx["pool"], term_id)
+    assert term is not None, f"NCBI {term_id} should be seeded"
+    await ctx["pool"].execute(
+        "INSERT INTO qiita.biosample_metadata"
+        " (biosample_idx, biosample_study_field_idx, value_terminology_term_idx,"
+        "  created_by_idx)"
+        " VALUES ($1, $2, $3, $4)",
+        biosample_idx,
+        ctx["taxon_field_idx"],
+        term["idx"],
         ctx["principal_idx"],
     )
 
@@ -280,36 +311,91 @@ async def test_host_with_no_profile_on_this_platform_is_unresolved(ctx):
     assert "no host_filter_profile" in res.reason
 
 
-async def test_absent_host_taxon_id_is_unresolved(ctx):
-    """No host_taxon_id row at all. 'Nobody told us' is not 'there is no host'."""
+async def test_absent_host_taxon_id_passes_through(ctx):
+    """No host_taxon_id row means the sample has no host."""
     bs_idx = await _make_biosample(ctx)
 
     res = await resolve_host_filter(ctx["pool"], biosample_idx=bs_idx, platform=Platform.ILLUMINA)
 
-    assert res.outcome is HostFilterOutcome.UNRESOLVED
+    assert res.outcome is HostFilterOutcome.PASS_THROUGH
     assert res.host_term_idx is None
-    assert "not set" in res.reason
+    assert "no host" in res.reason
 
 
-async def test_uninformative_missing_reason_is_unresolved(ctx):
-    """'not collected' is a missing-reason like 'not applicable' is, but it says
-    nothing about whether a host exists — so it fails closed. This is the case
-    that separates a deliberate no-host from an unknown one; getting it wrong
-    passes an un-depleted host sample straight through."""
+_HUMAN_GUT_METAGENOME = "408170"
+_SEAWATER_METAGENOME = "1561972"
+
+
+async def test_absent_host_with_a_host_implying_taxon_is_unresolved(ctx):
+    """An absent host means no host unless the sample's own taxon implies one: a
+    hand-created human gut sample must not slip through undepleted."""
     bs_idx = await _make_biosample(ctx)
-    await _set_host_missing_reason(ctx, bs_idx, "not collected")
+    await _set_taxon(ctx, bs_idx, _HUMAN_GUT_METAGENOME)
+
+    res = await _resolve(ctx, bs_idx)
+
+    assert res.outcome is HostFilterOutcome.UNRESOLVED
+    assert _HUMAN_GUT_METAGENOME in res.reason
+    assert "host_taxon_id" in res.reason
+
+
+@pytest.mark.parametrize("taxon", [_SEAWATER_METAGENOME, NCBI_TAXONOMY_METAGENOME_TERM_ID, None])
+async def test_absent_host_with_a_hostless_unmapped_or_absent_taxon_passes_through(ctx, taxon):
+    bs_idx = await _make_biosample(ctx)
+    if taxon is not None:
+        await _set_taxon(ctx, bs_idx, taxon)
+
+    res = await _resolve(ctx, bs_idx)
+
+    assert res.outcome is HostFilterOutcome.PASS_THROUGH
+    assert res.host_absent is True
+
+
+async def test_a_host_implying_taxon_does_not_refuse_a_control(ctx):
+    bs_idx = await _make_biosample(ctx)
+    await _set_taxon(ctx, bs_idx, _HUMAN_GUT_METAGENOME)
+    await _set_sample_type(ctx, bs_idx, "control_blank")
+
+    res = await _resolve(ctx, bs_idx)
+
+    assert res.outcome is HostFilterOutcome.CONTROL
+
+
+async def test_batch_refuses_an_absent_host_with_a_host_implying_taxon(ctx):
+    implied = await _make_biosample(ctx)
+    await _set_taxon(ctx, implied, _HUMAN_GUT_METAGENOME)
+    hostless = await _make_biosample(ctx)
+    await _set_taxon(ctx, hostless, _SEAWATER_METAGENOME)
+
+    batch = await resolve_host_filter_many(
+        ctx["pool"], biosample_idxs=[implied, hostless], platform=Platform.ILLUMINA
+    )
+
+    assert batch[implied] == await _resolve(ctx, implied)
+    assert batch[implied].outcome is HostFilterOutcome.UNRESOLVED
+    assert batch[hostless].outcome is HostFilterOutcome.PASS_THROUGH
+
+
+@pytest.mark.parametrize("host_reason", ["not collected", "not provided"])
+async def test_uninformative_missing_reason_is_unresolved(ctx, host_reason):
+    """A present but uninformative missing-reason says a host exists that we can't
+    name, so it fails closed. Reading it as no host passes an un-depleted host
+    sample straight through."""
+    bs_idx = await _make_biosample(ctx)
+    await _set_host_missing_reason(ctx, bs_idx, host_reason)
 
     res = await resolve_host_filter(ctx["pool"], biosample_idx=bs_idx, platform=Platform.ILLUMINA)
 
     assert res.outcome is HostFilterOutcome.UNRESOLVED
-    assert "not collected" in res.reason
+    assert host_reason in res.reason
 
 
 async def test_unresolved_reasons_are_distinct_per_cause(ctx):
-    """An absent field and a host-without-a-build are both UNRESOLVED but are
+    """An unnamed host and a host-without-a-build are both UNRESOLVED but are
     different problems with different fixes, so their reasons must not collapse
     into one indistinguishable string."""
     absent_bs = await _make_biosample(ctx)
+    await _set_host_missing_reason(ctx, absent_bs, "not provided")
     no_profile_bs = await _make_biosample(ctx)
     await _set_host_term(ctx, no_profile_bs, ctx["human_term_idx"])
 
@@ -379,8 +465,7 @@ async def test_control_qiita_sample_type_with_a_host_taxon_resolves_control(ctx,
 
 
 async def test_control_qiita_sample_type_with_no_host_taxon_row_resolves_control(ctx):
-    """Seeded by SQL, since import requires host_taxon_id: the control check must
-    not depend on the host row existing."""
+    """The control check must not depend on the host row existing."""
     bs_idx = await _make_biosample(ctx)
     await _set_sample_type(ctx, bs_idx, "control_blank")
 
@@ -659,7 +744,6 @@ async def test_batch_agrees_with_single_sample_for_every_outcome(ctx):
     biosamples["unrecognised_reason"] = await _make_biosample(ctx)
     await _set_host_missing_reason(ctx, biosamples["unrecognised_reason"], "not collected")
 
-    # No host_taxon_id at all.
     biosamples["absent"] = await _make_biosample(ctx)
 
     biosamples["sample_type_control"] = await _make_biosample(ctx)
@@ -679,7 +763,7 @@ async def test_batch_agrees_with_single_sample_for_every_outcome(ctx):
     assert batch[biosamples["sample_type_control"]].outcome is HostFilterOutcome.CONTROL
 
     # And the fan actually covered every branch — otherwise the equality above
-    # could pass by comparing five identical UNRESOLVEDs.
+    # could pass by comparing identical outcomes.
     assert {batch[i].outcome for i in idxs} == {
         HostFilterOutcome.FILTER,
         HostFilterOutcome.PASS_THROUGH,
@@ -731,9 +815,8 @@ async def test_batch_accepts_a_raw_platform_string(ctx):
 
 async def test_batch_edge_cases(ctx):
     """Empty input is an empty dict (not a query); a repeated idx collapses rather
-    than duplicating; and an idx with no metadata row comes back UNRESOLVED rather
-    than being silently dropped from the result — a missing key would KeyError the
-    roster, which is the fail-loud direction but a worse one than reporting it."""
+    than duplicating; and an idx with no metadata row comes back PASS_THROUGH rather
+    than being silently dropped from the result, which would KeyError the roster."""
     assert (
         await resolve_host_filter_many(ctx["pool"], biosample_idxs=[], platform=Platform.ILLUMINA)
         == {}
@@ -744,4 +827,4 @@ async def test_batch_edge_cases(ctx):
         ctx["pool"], biosample_idxs=[bs_idx, bs_idx], platform=Platform.ILLUMINA
     )
     assert list(repeated) == [bs_idx]
-    assert repeated[bs_idx].outcome is HostFilterOutcome.UNRESOLVED
+    assert repeated[bs_idx].outcome is HostFilterOutcome.PASS_THROUGH

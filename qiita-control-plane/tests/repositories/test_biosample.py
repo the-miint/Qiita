@@ -173,7 +173,7 @@ async def test_resolve_or_import_biosample_by_ena_accession_imports_on_miss(ctx)
                 caller_idx=ctx["principal_idx"],
                 owner_biosample_id_field_name=field_name,
                 owner_biosample_id_value="ENA-ALIAS-1",
-                metadata=dict(_REQUIRED_METADATA),
+                metadata=dict(_BASE_METADATA),
                 local_metadata={"env_broad_scale": "marine biome"},
                 metadata_checklist_idx=None,
                 tiers=ADMIN_EVERYWHERE,
@@ -226,7 +226,7 @@ async def test_resolve_or_import_biosample_by_ena_accession_reuses_on_hit(ctx):
                 caller_idx=ctx["principal_idx"],
                 owner_biosample_id_field_name=field_name,
                 owner_biosample_id_value="ENA-ALIAS-1",
-                metadata=dict(_REQUIRED_METADATA),
+                metadata=dict(_BASE_METADATA),
                 local_metadata={},
                 metadata_checklist_idx=None,
                 tiers=ADMIN_EVERYWHERE,
@@ -248,7 +248,7 @@ async def test_resolve_or_import_biosample_by_ena_accession_reuses_on_hit(ctx):
                 caller_idx=ctx["principal_idx"],
                 owner_biosample_id_field_name=unique_field_name(),
                 owner_biosample_id_value="ENA-ALIAS-2",
-                metadata=dict(_REQUIRED_METADATA),
+                metadata=dict(_BASE_METADATA),
                 local_metadata={"env_broad_scale": "would overwrite"},
                 metadata_checklist_idx=None,
                 tiers=ADMIN_EVERYWHERE,
@@ -279,10 +279,8 @@ async def test_resolve_or_import_biosample_by_ena_accession_reuses_on_hit(ctx):
 # ---------------------------------------------------------------------------
 
 
-# host_taxon_id is now a required field the composer enforces. A missing-value
-# marker counts as supplied and needs no seeded NCBI term, so it is the cheapest
-# way to satisfy the gate; tests that mean to exercise the gate omit it explicitly.
-_REQUIRED_METADATA = {"host taxon id": "not applicable"}
+# A missing-value marker needs no seeded NCBI term, so it is the cheapest host value.
+_BASE_METADATA = {"host taxon id": "not applicable"}
 
 
 async def test_import_biosample_from_owner_biosample_id_creates_full_chain(ctx):
@@ -301,7 +299,7 @@ async def test_import_biosample_from_owner_biosample_id_creates_full_chain(ctx):
                 owner_biosample_id_field_name=field_name,
                 owner_biosample_id_value="OWNER-XYZ-1",
                 caller_idx=ctx["principal_idx"],
-                metadata=dict(_REQUIRED_METADATA),
+                metadata=dict(_BASE_METADATA),
                 tiers=ADMIN_EVERYWHERE,
             )
     bs_idx = result.biosample_idx
@@ -395,7 +393,7 @@ async def test_import_biosample_from_owner_biosample_id_with_explicit_checklist(
                 owner_biosample_id_field_name=field_name,
                 owner_biosample_id_value="OWNER-CL-1",
                 caller_idx=ctx["principal_idx"],
-                metadata=dict(_REQUIRED_METADATA),
+                metadata=dict(_BASE_METADATA),
                 metadata_checklist_idx=ctx["checklist_idx"],
                 biosample_accession=bs_acc,
                 tiers=ADMIN_EVERYWHERE,
@@ -429,7 +427,7 @@ async def test_import_biosample_from_owner_biosample_id_reuses_local_field_for_s
                 owner_biosample_id_field_name=field_name,
                 owner_biosample_id_value="A",
                 caller_idx=ctx["principal_idx"],
-                metadata=dict(_REQUIRED_METADATA),
+                metadata=dict(_BASE_METADATA),
                 tiers=ADMIN_EVERYWHERE,
             )
             result2 = await import_biosample_from_owner_biosample_id(
@@ -439,7 +437,7 @@ async def test_import_biosample_from_owner_biosample_id_reuses_local_field_for_s
                 owner_biosample_id_field_name=field_name,
                 owner_biosample_id_value="B",
                 caller_idx=ctx["principal_idx"],
-                metadata=dict(_REQUIRED_METADATA),
+                metadata=dict(_BASE_METADATA),
                 tiers=ADMIN_EVERYWHERE,
             )
     bs1 = result1.biosample_idx
@@ -493,7 +491,7 @@ async def test_import_biosample_from_owner_biosample_id_creates_distinct_fields_
                 owner_biosample_id_field_name=name_a,
                 owner_biosample_id_value="A",
                 caller_idx=ctx["principal_idx"],
-                metadata=dict(_REQUIRED_METADATA),
+                metadata=dict(_BASE_METADATA),
                 tiers=ADMIN_EVERYWHERE,
             )
             result2 = await import_biosample_from_owner_biosample_id(
@@ -503,7 +501,7 @@ async def test_import_biosample_from_owner_biosample_id_creates_distinct_fields_
                 owner_biosample_id_field_name=name_b,
                 owner_biosample_id_value="B",
                 caller_idx=ctx["principal_idx"],
-                metadata=dict(_REQUIRED_METADATA),
+                metadata=dict(_BASE_METADATA),
                 tiers=ADMIN_EVERYWHERE,
             )
     ctx["created"]["biosample"].append(result1.biosample_idx)
@@ -541,7 +539,7 @@ async def test_import_biosample_from_owner_biosample_id_rolls_back_on_failed_ste
                     owner_biosample_id_field_name=unique_field_name(),
                     owner_biosample_id_value="DOOMED",
                     caller_idx=ctx["principal_idx"],
-                    metadata=dict(_REQUIRED_METADATA),
+                    metadata=dict(_BASE_METADATA),
                     biosample_accession=bs_acc,
                     tiers=ADMIN_EVERYWHERE,
                 )
@@ -574,7 +572,7 @@ async def test_import_biosample_from_owner_biosample_id_uses_independent_field_p
                 owner_biosample_id_field_name=field_name,
                 owner_biosample_id_value="STUDY1-1",
                 caller_idx=ctx["principal_idx"],
-                metadata=dict(_REQUIRED_METADATA),
+                metadata=dict(_BASE_METADATA),
                 tiers=ADMIN_EVERYWHERE,
             )
             result2 = await import_biosample_from_owner_biosample_id(
@@ -584,7 +582,7 @@ async def test_import_biosample_from_owner_biosample_id_uses_independent_field_p
                 owner_biosample_id_field_name=field_name,
                 owner_biosample_id_value="STUDY2-1",
                 caller_idx=ctx["principal_idx"],
-                metadata=dict(_REQUIRED_METADATA),
+                metadata=dict(_BASE_METADATA),
                 tiers=ADMIN_EVERYWHERE,
             )
     ctx["created"]["biosample"].append(result1.biosample_idx)
@@ -622,7 +620,7 @@ async def test_import_biosample_from_owner_biosample_id_rejects_non_transactiona
                 owner_biosample_id_field_name=unique_field_name(),
                 owner_biosample_id_value="GUARD-CHECK",
                 caller_idx=ctx["principal_idx"],
-                metadata=dict(_REQUIRED_METADATA),
+                metadata=dict(_BASE_METADATA),
                 tiers=ADMIN_EVERYWHERE,
             )
 
@@ -649,7 +647,7 @@ async def test_import_biosample_from_owner_biosample_id_writes_global_metadata(c
 
     field_name = unique_field_name()
     metadata_payload = {
-        **_REQUIRED_METADATA,
+        **_BASE_METADATA,
         f"Collection Date {suffix}": "2026-05-06",
         f"Latitude {suffix}": "32.7",
     }
@@ -751,7 +749,7 @@ async def test_import_biosample_from_owner_biosample_id_rejects_globally_linked_
                 owner_biosample_id_field_name=seed_owner_field,
                 owner_biosample_id_value="SEED-OWNER",
                 caller_idx=ctx["principal_idx"],
-                metadata={**_REQUIRED_METADATA, linked_name: "seed-value"},
+                metadata={**_BASE_METADATA, linked_name: "seed-value"},
                 tiers=ADMIN_EVERYWHERE,
             )
     ctx["created"]["biosample"].append(seed_result.biosample_idx)
@@ -772,7 +770,7 @@ async def test_import_biosample_from_owner_biosample_id_rejects_globally_linked_
                     owner_biosample_id_field_name=linked_name,
                     owner_biosample_id_value="DOOMED",
                     caller_idx=ctx["principal_idx"],
-                    metadata=dict(_REQUIRED_METADATA),
+                    metadata=dict(_BASE_METADATA),
                     biosample_accession=bs_acc,
                     tiers=ADMIN_EVERYWHERE,
                 )
@@ -787,12 +785,7 @@ async def test_import_biosample_from_owner_biosample_id_rejects_globally_linked_
 
 
 async def test_import_biosample_from_owner_biosample_id_minimal_metadata(ctx):
-    """The smallest legal import: only the enforced required field(s). The composer
-    writes the owner-id row plus one row per required field, and nothing else.
-
-    (This used to test truly-empty metadata skipping the global block; empty is no
-    longer legal — host_taxon_id is required — so the minimal case is now
-    'exactly the required set'.)"""
+    """The smallest legal import: empty metadata writes the owner-id row and nothing else."""
     field_name = unique_field_name()
 
     async with ctx["pool"].acquire() as conn:
@@ -804,14 +797,12 @@ async def test_import_biosample_from_owner_biosample_id_minimal_metadata(ctx):
                 owner_biosample_id_field_name=field_name,
                 owner_biosample_id_value="OWNER-EM-1",
                 caller_idx=ctx["principal_idx"],
-                metadata=dict(_REQUIRED_METADATA),
+                metadata={},
                 tiers=ADMIN_EVERYWHERE,
             )
     bs_idx = result.biosample_idx
     ctx["created"]["biosample"].append(bs_idx)
 
-    # Two metadata rows: the owner-id row, and the required host_taxon_id row
-    # (written as a missing-value marker). Nothing else.
     rows = await ctx["pool"].fetch(
         "SELECT bm.is_owner_biosample_id, bgf.internal_name"
         "  FROM qiita.biosample_metadata bm"
@@ -820,10 +811,7 @@ async def test_import_biosample_from_owner_biosample_id_minimal_metadata(ctx):
         " ORDER BY bm.is_owner_biosample_id DESC",
         bs_idx,
     )
-    assert [dict(r) for r in rows] == [
-        {"is_owner_biosample_id": True, "internal_name": None},
-        {"is_owner_biosample_id": False, "internal_name": "host_taxon_id"},
-    ]
+    assert [dict(r) for r in rows] == [{"is_owner_biosample_id": True, "internal_name": None}]
 
 
 async def test_import_biosample_from_owner_biosample_id_raises_on_unknown_metadata_field(ctx):
@@ -845,7 +833,7 @@ async def test_import_biosample_from_owner_biosample_id_raises_on_unknown_metada
                     owner_biosample_id_field_name=field_name,
                     owner_biosample_id_value="UNKNOWN",
                     caller_idx=ctx["principal_idx"],
-                    metadata={**_REQUIRED_METADATA, unknown_a: "x", unknown_b: "y"},
+                    metadata={**_BASE_METADATA, unknown_a: "x", unknown_b: "y"},
                     tiers=ADMIN_EVERYWHERE,
                 )
     assert sorted(excinfo.value.field_keys) == sorted([unknown_a, unknown_b])
@@ -876,7 +864,7 @@ async def test_import_biosample_from_owner_biosample_id_raises_on_metadata_parse
                     owner_biosample_id_field_name=field_name,
                     owner_biosample_id_value="PARSE-FAIL",
                     caller_idx=ctx["principal_idx"],
-                    metadata={**_REQUIRED_METADATA, numeric_field_name: "not-a-number"},
+                    metadata={**_BASE_METADATA, numeric_field_name: "not-a-number"},
                     tiers=ADMIN_EVERYWHERE,
                 )
     assert excinfo.value.field_key == numeric_field_name
@@ -930,7 +918,7 @@ async def test_import_biosample_from_owner_biosample_id_owner_id_missing_value_r
                     owner_biosample_id_field_name=field_name,
                     owner_biosample_id_value=reason_name,
                     caller_idx=ctx["principal_idx"],
-                    metadata=dict(_REQUIRED_METADATA),
+                    metadata=dict(_BASE_METADATA),
                     tiers=ADMIN_EVERYWHERE,
                 )
     assert excinfo.value.owner_biosample_id_value == reason_name
@@ -970,7 +958,7 @@ async def test_import_biosample_from_owner_biosample_id_owner_id_padded_marker_r
                     owner_biosample_id_field_name=field_name,
                     owner_biosample_id_value=padded_value,
                     caller_idx=ctx["principal_idx"],
-                    metadata=dict(_REQUIRED_METADATA),
+                    metadata=dict(_BASE_METADATA),
                     tiers=ADMIN_EVERYWHERE,
                 )
     # The raw padded value is preserved on the error so the user sees what they sent.
@@ -1021,7 +1009,7 @@ async def test_import_biosample_from_owner_biosample_id_metadata_missing_value_p
                 owner_biosample_id_field_name=field_name,
                 owner_biosample_id_value="OWNER-MV-1",
                 caller_idx=ctx["principal_idx"],
-                metadata={**_REQUIRED_METADATA, f"Latitude {suffix}": reason_name},
+                metadata={**_BASE_METADATA, f"Latitude {suffix}": reason_name},
                 tiers=ADMIN_EVERYWHERE,
             )
     bs_idx = result.biosample_idx
@@ -1072,7 +1060,7 @@ async def test_import_biosample_from_owner_biosample_id_writes_existing_local_fi
                 owner_biosample_id_field_name=field_name,
                 owner_biosample_id_value="OWNER-LOCAL-1",
                 caller_idx=ctx["principal_idx"],
-                metadata={**_REQUIRED_METADATA, local_name: "local-value"},
+                metadata={**_BASE_METADATA, local_name: "local-value"},
                 tiers=ADMIN_EVERYWHERE,
             )
     bs_idx = result.biosample_idx
@@ -1135,7 +1123,7 @@ async def test_import_biosample_from_owner_biosample_id_writes_alias_through_to_
                 owner_biosample_id_field_name=field_name,
                 owner_biosample_id_value="OWNER-ALIAS-1",
                 caller_idx=ctx["principal_idx"],
-                metadata={**_REQUIRED_METADATA, alias_name: "alias-value"},
+                metadata={**_BASE_METADATA, alias_name: "alias-value"},
                 tiers=ADMIN_EVERYWHERE,
             )
     bs_idx = result.biosample_idx
@@ -1196,7 +1184,7 @@ async def test_import_biosample_from_owner_biosample_id_raises_on_cross_field_co
                     owner_biosample_id_field_name=field_name,
                     owner_biosample_id_value="OWNER-CONFLICT-1",
                     caller_idx=ctx["principal_idx"],
-                    metadata={**_REQUIRED_METADATA, shared_name: "x"},
+                    metadata={**_BASE_METADATA, shared_name: "x"},
                     tiers=ADMIN_EVERYWHERE,
                 )
     assert excinfo.value.display_name == shared_name
@@ -1238,7 +1226,7 @@ async def test_import_biosample_from_owner_biosample_id_raises_on_duplicate_glob
                     owner_biosample_id_field_name=field_name,
                     owner_biosample_id_value="OWNER-DUP-1",
                     caller_idx=ctx["principal_idx"],
-                    metadata={**_REQUIRED_METADATA, global_label: "a", alias_name: "b"},
+                    metadata={**_BASE_METADATA, global_label: "a", alias_name: "b"},
                     tiers=ADMIN_EVERYWHERE,
                 )
     assert excinfo.value.global_field_idx == global_idx

@@ -3,11 +3,11 @@
 Two things have to hold, and they pull in opposite directions.
 
 It must be AGGRESSIVE enough to be worth running: a sample whose taxon implies a
-host, and a blank, both get written — otherwise the submit path stays blocked on
-every pool, since every pool contains blanks.
+host, and a blank, both get written — otherwise a biosample with a host goes undepleted
+and a blank is not recognized as a control.
 
-And it must be TIMID enough to be safe: a sample nothing settles is left
-unwritten, so it stays UNRESOLVED at submit and aborts, rather than being
+And it must be TIMID enough to be safe: a sample nothing settles is written
+'not provided', so it stays UNRESOLVED at submit and aborts, rather than being
 guessed at and silently under-depleted. The residue is a worklist, not a
 rounding error.
 
@@ -22,6 +22,7 @@ import pytest
 import pytest_asyncio
 from qiita_common.models import (
     MISSING_REASON_CONTROL_SAMPLE,
+    MISSING_REASON_NOT_PROVIDED,
     NCBI_TAXONOMY_HUMAN_TERM_ID,
     NCBI_TAXONOMY_METAGENOME_TERM_ID,
     NCBI_TAXONOMY_MOUSE_TERM_ID,
@@ -29,6 +30,7 @@ from qiita_common.models import (
 )
 
 from qiita_control_plane.backfill.host_taxon import (
+    BackfillPlan,
     HostTaxonSource,
     apply_backfill,
     classify,
@@ -82,11 +84,10 @@ def test_human_gut_metagenome_implies_a_human_host():
 
 
 def test_seawater_metagenome_implies_no_host():
-    """'not applicable' is a DECISION — the sample deliberately has no host — and
-    it resolves PASS_THROUGH, i.e. no depletion. Distinct from UNRESOLVED."""
+    """No host is a DECISION, carried by leaving the field out. Distinct from UNRESOLVED."""
     a = _classify(sample_taxon_term_id=_SEAWATER_METAGENOME)
     assert a.source is HostTaxonSource.NO_HOST
-    assert a.missing_reason == "not applicable"
+    assert a.missing_reason is None
     assert a.host_term_id is None
 
 
@@ -122,7 +123,7 @@ def test_host_associated_metagenome_implies_its_host(sample_taxon, host):
 def test_hostless_environment_implies_no_host(sample_taxon):
     a = _classify(sample_taxon_term_id=sample_taxon)
     assert a.source is HostTaxonSource.NO_HOST
-    assert a.missing_reason == "not applicable"
+    assert a.missing_reason is None
 
 
 @pytest.mark.parametrize("sample_taxon", ["942017", "1076179", "1768876"])
@@ -159,12 +160,28 @@ def test_a_control_carrying_a_host_taxon_is_still_a_control():
 def test_generic_metagenome_is_unresolved_not_hostless():
     """The bare `metagenome` root names no environment, so it implies no host —
     but "we can't tell" is NOT the same claim as "it has no host". Mapping it to
-    'not applicable' would silently stop depleting a sample that may well be
-    human. It must fail closed."""
+    no host would silently stop depleting a sample that may well be human.
+    It must fail closed, as 'not provided'."""
     a = _classify(sample_taxon_term_id=_GENERIC_METAGENOME)
     assert a.source is HostTaxonSource.UNRESOLVED
     assert a.host_term_id is None
-    assert a.missing_reason is None
+    assert a.missing_reason == MISSING_REASON_NOT_PROVIDED
+
+
+def test_writable_excludes_only_no_host():
+    plan = BackfillPlan(
+        assignments=[
+            _classify(is_control=True),
+            _classify(sample_taxon_term_id=_HUMAN_GUT_METAGENOME),
+            _classify(sample_taxon_term_id=_SEAWATER_METAGENOME),
+            _classify(sample_taxon_term_id=_GENERIC_METAGENOME),
+        ]
+    )
+    assert [a.source for a in plan.writable()] == [
+        HostTaxonSource.CONTROL,
+        HostTaxonSource.TAXON,
+        HostTaxonSource.UNRESOLVED,
+    ]
 
 
 def test_absent_taxon_is_unresolved():
@@ -284,8 +301,8 @@ async def _host_taxon_of(ctx, biosample_idx):
 
 @pytest.mark.db
 async def test_plan_then_apply_writes_the_resolvable_and_skips_the_rest(ctx):
-    """End to end: a human-gut sample gets a host, a seawater sample gets
-    'not applicable', and a generic-metagenome sample gets NOTHING — it stays
+    """End to end: a human-gut sample gets a host, a seawater sample gets nothing
+    (no host), and a generic-metagenome sample gets 'not provided' — it stays
     UNRESOLVED at submit, which is the fail-closed outcome."""
     human = await _seed_biosample_with_taxon(ctx, _HUMAN_GUT_METAGENOME)
     water = await _seed_biosample_with_taxon(ctx, _SEAWATER_METAGENOME)
@@ -304,15 +321,15 @@ async def test_plan_then_apply_writes_the_resolvable_and_skips_the_rest(ctx):
         [a for a in plan.assignments if a.biosample_idx in (human, water, generic)],
         principal_idx=ctx["principal_idx"],
     )
-    assert written == 2  # the generic one is not written
+    assert written == 2  # the hostless one is not written
 
     assert (await _host_taxon_of(ctx, human))["term_id"] == NCBI_TAXONOMY_HUMAN_TERM_ID
-    assert (await _host_taxon_of(ctx, water))["reason"] == "not applicable"
-    assert await _host_taxon_of(ctx, generic) is None
+    assert await _host_taxon_of(ctx, water) is None
+    assert (await _host_taxon_of(ctx, generic))["reason"] == MISSING_REASON_NOT_PROVIDED
 
 
 @pytest.mark.db
-async def test_backfill_writes_not_applicable_for_a_hostless_taxon_added_to_the_table(ctx):
+async def test_backfill_leaves_a_hostless_taxon_unwritten(ctx):
     soil = await _seed_biosample_with_taxon(ctx, _SOIL_METAGENOME)
 
     plan = await plan_backfill(ctx["pool"])
@@ -320,8 +337,8 @@ async def test_backfill_writes_not_applicable_for_a_hostless_taxon_added_to_the_
     written = await apply_backfill(ctx["pool"], mine, principal_idx=ctx["principal_idx"])
 
     assert [a.source for a in mine] == [HostTaxonSource.NO_HOST]
-    assert written == 1
-    assert (await _host_taxon_of(ctx, soil))["reason"] == "not applicable"
+    assert written == 0
+    assert await _host_taxon_of(ctx, soil) is None
 
 
 @pytest.mark.db
@@ -355,10 +372,10 @@ async def test_backfill_is_idempotent(ctx):
 
 @pytest.mark.db
 async def test_written_value_is_visible_to_the_host_filter_resolver(ctx):
-    """The backfill's whole purpose is to make the resolver stop saying
-    UNRESOLVED. Writing a row that the resolver cannot see (e.g. bound to a
-    study-LOCAL field, leaving global_field_idx NULL) would look like success and
-    change nothing — so assert against the resolver itself, not against the row."""
+    """The backfill's whole purpose is to name the host for the resolver. Writing
+    a row that the resolver cannot see (e.g. bound to a study-LOCAL field,
+    leaving global_field_idx NULL) would look like success and change nothing —
+    so assert against the resolver itself, not against the row."""
     from qiita_common.models import Platform
 
     from qiita_control_plane.host_filter_resolver import (
@@ -380,7 +397,7 @@ async def test_written_value_is_visible_to_the_host_filter_resolver(ctx):
 
     after = await resolve_host_filter(ctx["pool"], biosample_idx=human, platform=Platform.ILLUMINA)
     # The host is now KNOWN — that is this backfill's whole claim, and it is what
-    # moves the sample off "host_taxon_id is not set".
+    # moves the sample off "no host".
     #
     # Deliberately NOT asserting on the outcome or the reason string: whether the
     # resolver can go on to FILTER depends on a host_filter_profile existing for
