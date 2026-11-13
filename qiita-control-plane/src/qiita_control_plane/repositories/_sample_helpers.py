@@ -2411,7 +2411,7 @@ def _study_field_read_sql(spec: EntityMetadataSpec) -> str:
 async def fetch_study_field_tier(
     conn: asyncpg.Connection, *, spec: EntityMetadataSpec, study_field_idx: int
 ) -> Tier:
-    """The tier a {entity}_study_field requires before any per-value exception,
+    """The tier a {entity}_study_field requires before any field exception,
     as `qiita.metadata_field_tier` computes it. Raises LookupError when the row
     does not exist.
     """
