@@ -171,8 +171,8 @@ included:
 - Fixed: <count>
   - <what, `path`> — outside the PR's subject, <its commit shas>
 - Declined:
-  - [strong] <rule id> <rule's short name>: <what, `path`> — <why>
-  - [soft] <rule id> <rule's short name>: <what, `path`> — <why>
+  - [strong] <rule id> <bullet's short name>: <what, `path`> — <why>
+  - [soft] <rule id> <bullet's short name>: <what, `path`> — <why>
 - Deferred:
   - <what, `path`> — #<issue>
 - Not probed:
@@ -187,12 +187,12 @@ included:
   there.
 - Under `Fixed:`, list only the `[outside-subject]` fixes; the count includes them.
   With none, the line is the count alone.
-- Under `Declined:`, each entry starts with the strength and the rule it sets aside —
-  the heading the reviewer reported it under (`[strong] R9 copy-pasted parallel
-  handler`), so a reader sees which rule was set aside without opening the reviewer
-  file. List the `[strong]` entries first: those are the ones a human reviewer
-  is asked to re-decide. A finding from outside the rule set says `outside the rule
-  set` in place of the rule.
+- Under `Declined:`, each entry starts with the heading the reviewer reported its
+  finding under (`[strong] R9 copy-pasted parallel handler`), so a reader sees which
+  rule was set aside, and how strongly, without opening the reviewer file. List the
+  `[strong]` entries first: they set aside a rule meant to be applied without asking.
+  A finding from outside the rule set starts with `outside the rule set` and no
+  strength.
 - Write `none` under any other heading with no entries; do not drop the heading.
 - A deferred item names its issue by number. Every deferred issue is opened before
   the PR is, so the description carries `#N` from its first version; `issue to file`
