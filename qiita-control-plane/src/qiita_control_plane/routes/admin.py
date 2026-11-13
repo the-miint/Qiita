@@ -35,7 +35,9 @@ from qiita_common.auth_constants import (
 )
 from qiita_common.models import (
     AuthEventResponse,
+    DefinitionKind,
     DoGetTicketResponse,
+    MaskDefinitionStatus,
     MaskedReadExportManifest,
     MaskedReadExportSample,
     MaskedReadExportTicketRequest,
@@ -62,6 +64,8 @@ from ..auth.scopes import (
 from ..auth.tickets import sign_ticket
 from ..auth.token import mint_api_token
 from ..block_read import READ_MASKED_TABLE
+from ..definition_resolver import cohort_refusal, resolve_group
+from ..definition_similarity import load_groups
 from ..deps import TxConnFactory, get_db_pool, get_flight_signing_key, get_tx_conn_factory
 from ..repositories.block import MASK_SAMPLE_COMPLETED
 from ..repositories.study_access import fetch_grantee_by_email
@@ -660,11 +664,9 @@ _EXPORT_TICKET_TTL_SECONDS = 3600
 # the prep_sample_idx (the read_masked join key) + biosample_accession (the
 # filename's leading part; NULL until NCBI submission, surfaced so the export
 # fails loudly rather than silently dropping the sample) + the per-(mask_idx,
-# prep_sample) completion gate state (LEFT JOIN mask_sample — NULL when no gate
-# row exists for this (mask_idx, prep_sample); NULL means "not masked-complete
-# under this mask", NOT an exempt sample — gate contract in
-# `fetch_mask_sample_state`). The pool-wide run/pool idxs live on the manifest.
-# `$2` is the mask_idx the manifest is scoped to.
+# prep_sample) completion gate state under the named mask (LEFT JOIN mask_sample —
+# NULL when no gate row exists there). The pool-wide run/pool idxs live on the
+# manifest. `$2` is the named mask_idx.
 _MASKED_EXPORT_ROSTER_SQL = (
     "SELECT ss.prep_sample_idx, bs.biosample_accession, msamp.state AS mask_state"
     "  FROM qiita.sequenced_sample ss"
@@ -678,6 +680,17 @@ _MASKED_EXPORT_ROSTER_SQL = (
 )
 
 
+def _refuse_deprecated_mask(mask_idx: int) -> HTTPException:
+    """The 409 for a masked-read export that names a deprecated mask."""
+    return HTTPException(
+        status_code=409,
+        detail=(
+            f"mask_definition {mask_idx} is deprecated; a masked-read export may not name it."
+            " Name an active mask of its group instead"
+        ),
+    )
+
+
 @router.get(PATH_ADMIN_SEQUENCED_POOL_MASKED_READ_EXPORT)
 async def export_masked_read_manifest(
     sequenced_pool_idx: int,
@@ -688,38 +701,60 @@ async def export_masked_read_manifest(
 ) -> MaskedReadExportManifest:
     """Roster manifest for a per-pool masked-read export: one row per
     non-retired, non-ENA-flagged sample on the pool, each with the filename
-    parts the qiita-admin masked-read-export CLI needs. The caller then mints a
-    per-sample DoGet ticket and streams that sample's read_masked rows from the
-    data plane.
+    parts the qiita-admin masked-read-export CLI needs and its resolution across
+    `mask_idx`'s group (`definition_resolver`): `processed` under which member, or
+    `incomplete` / `not_processed` and why. The caller then mints a per-sample DoGet
+    ticket under each processed prep_sample's member and streams its read_masked rows
+    from the data plane.
 
     Gated by system_admin PLUS admin:masked_read_export — the first human
     masked-read pull. `mask_idx` is mandatory (the data plane keys read_masked
     on (prep_sample_idx, mask_idx)). 404 if the pool or mask does not exist — an
     empty roster for a real pool is a valid answer, but a typo'd idx fails loudly
-    rather than masquerading as "no samples". Entity-level prep_sample retirement
-    is excluded (ps.retired = false); biosample_accession is surfaced even when
-    NULL so the CLI fails loudly on an unsubmitted sample rather than the route
-    silently dropping it.
-    """
-    run_idx = await pool.fetchval(
-        "SELECT sequencing_run_idx FROM qiita.sequenced_pool WHERE idx = $1", sequenced_pool_idx
-    )
-    if run_idx is None:
-        raise HTTPException(
-            status_code=404, detail=f"no sequenced_pool with idx={sequenced_pool_idx}"
-        )
-    mask_exists = await pool.fetchval(
-        "SELECT 1 FROM qiita.mask_definition WHERE mask_idx = $1", mask_idx
-    )
-    if mask_exists is None:
-        raise HTTPException(status_code=404, detail=f"no mask_definition with mask_idx={mask_idx}")
+    rather than masquerading as "no prep_samples". 409 if the mask is deprecated.
+    Entity-level prep_sample retirement is excluded (ps.retired = false);
+    biosample_accession is surfaced even when NULL so the CLI fails loudly on an
+    unsubmitted prep_sample rather than the route silently dropping it.
 
-    db_rows = await pool.fetch(_MASKED_EXPORT_ROSTER_SQL, sequenced_pool_idx, mask_idx)
+    One read-only snapshot, so the roster and its resolution see one state of the
+    gates, tickets and pair decisions.
+    """
+    async with pool.acquire() as conn, conn.transaction(isolation="repeatable_read", readonly=True):
+        run_idx = await conn.fetchval(
+            "SELECT sequencing_run_idx FROM qiita.sequenced_pool WHERE idx = $1",
+            sequenced_pool_idx,
+        )
+        if run_idx is None:
+            raise HTTPException(
+                status_code=404, detail=f"no sequenced_pool with idx={sequenced_pool_idx}"
+            )
+        groups = await load_groups(conn)
+        mask = groups.definitions.get((DefinitionKind.MASK, mask_idx))
+        if mask is None:
+            raise HTTPException(
+                status_code=404, detail=f"no mask_definition with mask_idx={mask_idx}"
+            )
+        if mask.deprecated:
+            raise _refuse_deprecated_mask(mask_idx)
+        db_rows = await conn.fetch(_MASKED_EXPORT_ROSTER_SQL, sequenced_pool_idx, mask_idx)
+        resolution = await resolve_group(
+            conn,
+            kind=DefinitionKind.MASK,
+            definition_idx=mask_idx,
+            prep_sample_idxs=[r["prep_sample_idx"] for r in db_rows],
+            groups=groups,
+        )
+
+    samples = [
+        MaskedReadExportSample(**dict(row), resolution=resolution.samples[row["prep_sample_idx"]])
+        for row in db_rows
+    ]
     return MaskedReadExportManifest(
         sequenced_pool_idx=sequenced_pool_idx,
         sequencing_run_idx=run_idx,
         mask_idx=mask_idx,
-        samples=[MaskedReadExportSample.model_validate(dict(r)) for r in db_rows],
+        group=list(resolution.group),
+        samples=samples,
     )
 
 
@@ -743,10 +778,17 @@ async def create_masked_read_export_ticket(
     the 3600 s max (the data plane's ceiling; expiry is checked only at DoGet
     initiation, so it never bounds the download).
 
+    409 when the mask is deprecated: its config is void, so its reads are not
+    exported by naming it directly.
+
     Completion gate (contract: see `fetch_mask_sample_state`): the sample must be
     'completed' under this `mask_idx`, else 409 — a 'pending' row (a covering block
     still in flight) or NO row (absence is not exempt) both mean the read_masked
     pass-set would be absent or partial, and a pull would silently truncate.
+
+    Then the prep_sample must resolve to this mask in its group
+    (`definition_resolver`), else 409 with the `DefinitionGroupRefusal` code and
+    the resolution, as the alignment cohort DoGet refuses.
     """
     filter_ = {
         "prep_sample_idx": [body.prep_sample_idx],
@@ -758,11 +800,18 @@ async def create_masked_read_export_ticket(
             detail="masked-read export ticket requires a non-empty prep_sample_idx and mask_idx",
         )
 
-    mask_state = await pool.fetchval(
-        "SELECT state FROM qiita.mask_sample WHERE mask_idx = $1 AND prep_sample_idx = $2",
+    row = await pool.fetchrow(
+        "SELECT md.status, msamp.state AS mask_state"
+        "  FROM qiita.mask_definition md"
+        "  LEFT JOIN qiita.mask_sample msamp"
+        "    ON msamp.mask_idx = md.mask_idx AND msamp.prep_sample_idx = $2"
+        " WHERE md.mask_idx = $1",
         body.mask_idx,
         body.prep_sample_idx,
     )
+    if row is not None and row["status"] == MaskDefinitionStatus.DEPRECATED.value:
+        raise _refuse_deprecated_mask(body.mask_idx)
+    mask_state = None if row is None else row["mask_state"]
     if mask_state != MASK_SAMPLE_COMPLETED:
         raise HTTPException(
             status_code=409,
@@ -779,6 +828,27 @@ async def create_masked_read_export_ticket(
                 "prep_sample_idx": body.prep_sample_idx,
                 "mask_idx": body.mask_idx,
                 "mask_state": mask_state,
+            },
+        )
+
+    async with pool.acquire() as conn, conn.transaction(isolation="repeatable_read", readonly=True):
+        resolution = await resolve_group(
+            conn,
+            kind=DefinitionKind.MASK,
+            definition_idx=body.mask_idx,
+            prep_sample_idxs=[body.prep_sample_idx],
+        )
+    resolved = resolution.samples[body.prep_sample_idx]
+    refusal = cohort_refusal(resolved, body.mask_idx)
+    if refusal is not None:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "detail": f"{resolved.describe()}; it does not resolve to mask {body.mask_idx}",
+                "reason": refusal.value,
+                "prep_sample_idx": body.prep_sample_idx,
+                "mask_idx": body.mask_idx,
+                "resolution": resolved.model_dump(mode="json"),
             },
         )
 

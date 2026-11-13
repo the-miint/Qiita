@@ -39,6 +39,7 @@ from ..auth.guards import (
     tier_at_least,
 )
 from ..auth.principal import HumanUser, Principal
+from ..definition_similarity import PairRefused
 from ..repositories._sample_helpers import (
     ConflictingValueDifferentStudyError,
     ConflictingValueSameStudyError,
@@ -1761,6 +1762,19 @@ def raise_transient_retry(detail: str) -> None:
         status_code=503,
         detail=detail,
         headers={"Retry-After": _TRANSIENT_RETRY_AFTER},
+    )
+
+
+def pair_refused_http(exc: PairRefused) -> HTTPException:
+    """409 for a refusal by the definition-similarity rules: the message, the
+    `DefinitionPairRefusal` code, and the pairs the refusal names."""
+    return HTTPException(
+        status_code=409,
+        detail={
+            "detail": str(exc),
+            "reason": exc.reason.value,
+            "definition_pair_idx": exc.definition_pair_idx,
+        },
     )
 
 

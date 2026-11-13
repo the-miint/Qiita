@@ -48,7 +48,9 @@ from qiita_common.models import (
     AlignmentRerunBlockResponse,
     AlignmentSampleStatusUpdate,
     AlignmentSampleStatusUpdateResponse,
+    DefinitionKind,
     DoGetTicketResponse,
+    SampleResolution,
 )
 
 from ..actions.align_abandon import AlignPlanInFlight, AlignPlanRearmed, abandon_align_plan
@@ -67,6 +69,12 @@ from ..auth.guards import (
 )
 from ..auth.principal import HumanUser, Principal, ServiceAccount
 from ..auth.tickets import sign_ticket
+from ..definition_resolver import cohort_refusal, resolve_group
+from ..definition_similarity import (
+    DefinitionNotFound,
+    PairRefused,
+    refuse_deprecating_with_similar_pairs,
+)
 from ..deps import (
     TxConnFactory,
     get_data_plane_url,
@@ -98,7 +106,12 @@ from ..work_ticket_submit import (
     authorize_redrive_action,
     require_compute_backend_client_dependency,
 )
-from ._helpers import ALIGNMENT_NOT_FOUND_DETAIL, authorize_completed_alignment_cohort, first_few
+from ._helpers import (
+    ALIGNMENT_NOT_FOUND_DETAIL,
+    authorize_completed_alignment_cohort,
+    first_few,
+    pair_refused_http,
+)
 
 # The DuckLake relation this route signs DoGet tickets for: the exclusion-aware
 # VIEW (`alignment` ANTI JOIN the resolved blocklist), never the raw base table —
@@ -141,13 +154,17 @@ async def update_alignment_definition_status_route(
 
     Deprecating is refused (409, listing them) while any work ticket under the
     alignment is unfinished, held ones included: they would still write rows under
-    a void config.
+    a void config. It is refused too while the alignment is a side of a `similar`
+    pair decision (`definition_similarity`).
 
     system_admin only (`alignment_definition:lifecycle`).
     """
     try:
         async with tx() as conn:
             if body.status is AlignmentDefinitionStatus.DEPRECATED:
+                await refuse_deprecating_with_similar_pairs(
+                    conn, DefinitionKind.ALIGNMENT, alignment_idx
+                )
                 await refuse_deprecating_with_live_work(conn, alignment_idx)
             row = await transition_alignment_definition_status(
                 conn,
@@ -164,6 +181,8 @@ async def update_alignment_definition_status_route(
             status_code=409,
             detail={"reason": str(exc), "work_ticket_idx": exc.work_ticket_idxs},
         ) from exc
+    except PairRefused as exc:
+        raise pair_refused_http(exc) from exc
     except asyncpg.ForeignKeyViolationError as exc:
         raise HTTPException(
             status_code=422,
@@ -510,6 +529,11 @@ async def create_alignment_cohort_doget_ticket(
     this route and not to that gate: the cohort is never narrowed because coverage
     filtering makes a feature table cohort-dependent, so trimming the request would
     answer a different scientific question under the name of the one asked.
+
+    After that gate, every prep_sample must resolve to this alignment in its group
+    (`definition_resolver`): a prep_sample processed under another member,
+    incomplete, or not processed (a withdrawn or deprecated upstream included) is a
+    409 naming its resolution.
     """
     cohort = await authorize_completed_alignment_cohort(
         pool,
@@ -518,12 +542,52 @@ async def create_alignment_cohort_doget_ticket(
         prep_sample_idx=body.prep_sample_idx,
         nothing_to="",
     )
+    try:
+        async with (
+            pool.acquire() as conn,
+            conn.transaction(isolation="repeatable_read", readonly=True),
+        ):
+            resolution = await resolve_group(
+                conn,
+                kind=DefinitionKind.ALIGNMENT,
+                definition_idx=alignment_idx,
+                prep_sample_idxs=cohort,
+            )
+    except DefinitionNotFound as exc:
+        raise HTTPException(status_code=404, detail=ALIGNMENT_NOT_FOUND_DETAIL) from exc
+    refused = resolution.not_resolved_to(alignment_idx)
+    if refused:
+        raise _not_resolved_http(alignment_idx, refused)
 
     return _sign_alignment_ticket(
         alignment_idx=alignment_idx,
         prep_sample_idx=cohort,
         columns=body.columns,
         signing_key=signing_key,
+    )
+
+
+def _not_resolved_http(alignment_idx: int, refused: list[SampleResolution]) -> HTTPException:
+    """409 for cohort prep_samples that do not resolve to `alignment_idx`: a message, the
+    first refused prep_sample's `DefinitionGroupRefusal` code, the count, and the first
+    few prep_samples' resolutions. The caller passed the access check for every one of
+    them, so naming what each resolves to discloses nothing it may not read; the
+    list is truncated like every refusal built from a caller-named cohort."""
+    shown = refused[:5]
+    examples = "; ".join(r.describe() for r in shown)
+    more = ", …" if len(refused) > len(shown) else ""
+    return HTTPException(
+        status_code=409,
+        detail={
+            "detail": (
+                f"{len(refused)} prep_sample(s) do not resolve to alignment {alignment_idx}"
+                f" in its group ({examples}{more})"
+            ),
+            "reason": cohort_refusal(refused[0], alignment_idx).value,
+            "alignment_idx": alignment_idx,
+            "count": len(refused),
+            "samples": [r.model_dump(mode="json") for r in shown],
+        },
     )
 
 

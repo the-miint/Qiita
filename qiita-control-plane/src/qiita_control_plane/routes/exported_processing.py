@@ -1,33 +1,46 @@
 """The public exported-processing handle.
 
-`POST /exported-processing` mints (or recovers) the name a published bundle's
-manifest cites for the processing it was built from. A control-plane route for the
-same reason as its two siblings: the handle lives only in Postgres and minting one
-is a write.
+`POST /exported-processing` mints (or recovers) the name that a published bundle's
+manifest cites for the alignment that it was built from, and
+`POST /exported-processing/mask` the name that a masked-read export manifest cites
+for a mask. A control-plane route for the same reason as its two siblings: the
+handle lives only in Postgres and minting one is a write.
 
-Authorization is `/exported-identifier`'s, step for step, over the same
-`(alignment_idx, cohort)` pair — and that is the point rather than convenience. A
-processing is not study-scoped, so it is tempting to conclude there is nothing here
+The alignment kind's authorization is `/exported-identifier`'s, step for step, over
+the same `(alignment_idx, cohort)` pair — and that is the point rather than
+convenience. A processing is not study-scoped, so it is tempting to conclude there is nothing here
 to authorize; but minting is a **write**, and a route that wrote on behalf of data
 the caller cannot read would hand any human a handle for every processing in the
 system, one `alignment_idx` at a time. The cohort is what closes that: it is not part
 of the handle's identity, it is how a caller shows they could have built the table
-this manifest would describe.
+this manifest would describe. The mask kind is gated on system_admin and
+`admin:masked_read_export`, as the masked-read export routes are.
 """
 
 import asyncpg
 from fastapi import APIRouter, Depends, HTTPException
 from qiita_common.api_paths import (
+    PATH_EXPORTED_PROCESSING_MASK,
     PATH_EXPORTED_PROCESSING_PREFIX,
     PATH_EXPORTED_PROCESSING_ROOT,
 )
-from qiita_common.auth_constants import Scope
-from qiita_common.models import ExportedProcessingRequest, ExportedProcessingResponse
+from qiita_common.auth_constants import Scope, SystemRole
+from qiita_common.models import (
+    ExportedMaskProcessingRequest,
+    ExportedMaskProcessingResponse,
+    ExportedProcessingRequest,
+    ExportedProcessingResponse,
+)
 
-from ..auth.guards import require_human, require_scope
+from ..auth.guards import require_human, require_human_with_role, require_scope
 from ..auth.principal import HumanUser, Principal
 from ..deps import get_db_pool
-from ..repositories.exported_processing import ProcessingVanishedError, mint_exported_processing
+from ..repositories.exported_processing import (
+    ProcessingVanishedError,
+    mint_exported_mask_processing,
+    mint_exported_processing,
+)
+from ..repositories.mask_definition import MaskDefinitionDeprecated, MaskDefinitionNotFound
 from ._helpers import authorize_completed_alignment_cohort
 
 router = APIRouter(prefix=PATH_EXPORTED_PROCESSING_PREFIX, tags=["exported-processing"])
@@ -88,7 +101,29 @@ async def mint_exported_processing_handle(
             ),
         ) from exc
 
-    return ExportedProcessingResponse(
-        alignment_idx=row["alignment_idx"],
-        export_processing_id=row["export_processing_id"],
-    )
+    return ExportedProcessingResponse.model_validate(dict(row))
+
+
+@router.post(PATH_EXPORTED_PROCESSING_MASK, status_code=201)
+async def mint_exported_mask_processing_handle(
+    body: ExportedMaskProcessingRequest,
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    caller: HumanUser = Depends(require_human_with_role(SystemRole.SYSTEM_ADMIN)),
+    _scope: Principal = Depends(require_scope(Scope.ADMIN_MASKED_READ_EXPORT)),
+) -> ExportedMaskProcessingResponse:
+    """Mint the public handle for a mask, so a masked-read export can cite which mask
+    produced each file without naming our `mask_idx`.
+
+    **Idempotent.** Re-requesting a mask returns the handle it already has. 404 for
+    an unknown mask; 409 for a deprecated one, whose config is void.
+    """
+    try:
+        row = await mint_exported_mask_processing(
+            pool, mask_idx=body.mask_idx, created_by_idx=caller.principal_idx
+        )
+    except MaskDefinitionNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except MaskDefinitionDeprecated as exc:
+        raise HTTPException(status_code=409, detail=exc.detail) from exc
+
+    return ExportedMaskProcessingResponse.model_validate(dict(row))

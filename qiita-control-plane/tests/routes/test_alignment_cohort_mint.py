@@ -28,6 +28,10 @@ import struct
 import pytest
 from qiita_common.api_paths import URL_ALIGNMENT_COHORT_DOGET, URL_SEQUENCED_POOL_ALIGNMENT_COHORT
 from qiita_common.auth_constants import Scope
+from qiita_common.models import DefinitionGroupRefusal, MaskDefinitionStatus
+
+from qiita_control_plane.repositories.alignment_definition import ALIGNMENT_SAMPLE_COMPLETED
+from qiita_control_plane.repositories.block import MASK_SAMPLE_COMPLETED
 
 pytestmark = pytest.mark.db
 
@@ -377,4 +381,114 @@ async def test_human_mint_rejects_a_service_account(
             _mint_url(pool_alignment_seed["align_1"]),
             json={"prep_sample_idx": [pool_alignment_seed["ps_a"]], "columns": _COLUMNS},
         )
+    assert resp.status_code == 403, resp.text
+
+
+# ---------------------------------------------------------------------------
+# Group resolution (`definition_resolver`)
+# ---------------------------------------------------------------------------
+
+
+async def test_human_mint_refuses_a_sample_resolved_to_another_alignment_409(
+    ctx, alignment_group_world
+):
+    """ps_a is masked under both similar masks and aligned under both group members,
+    so it resolves to the newer alignment, align_3. Naming align_1 is refused, naming
+    the alignment it resolves to; naming align_3 is signed."""
+    w = alignment_group_world
+    await w["gate"]("mask_sample", w["mask_2"], w["ps_a"], MASK_SAMPLE_COMPLETED)
+    await w["gate"]("alignment_sample", w["align_3"], w["ps_a"], ALIGNMENT_SAMPLE_COMPLETED)
+
+    resp = await ctx["user"].post(
+        _mint_url(w["align_1"]), json={"prep_sample_idx": [w["ps_a"]], "columns": _COLUMNS}
+    )
+    assert resp.status_code == 409, resp.text
+    detail = resp.json()["detail"]
+    assert detail["reason"] == DefinitionGroupRefusal.RESOLVED_ELSEWHERE
+    assert detail["alignment_idx"] == w["align_1"]
+    [sample] = detail["samples"]
+    assert (sample["prep_sample_idx"], sample["state"], sample["definition_idx"]) == (
+        w["ps_a"],
+        "processed",
+        w["align_3"],
+    )
+    assert f"processed, alignment {w['align_3']}" in detail["detail"]
+
+    resp = await ctx["user"].post(
+        _mint_url(w["align_3"]), json={"prep_sample_idx": [w["ps_a"]], "columns": _COLUMNS}
+    )
+    assert resp.status_code == 201, resp.text
+
+
+async def test_human_mint_refuses_a_sample_whose_mask_moved_on_409(ctx, alignment_group_world):
+    """ps_a's mask resolves to mask_2, but it is aligned only on the seed's mask: it
+    is incomplete until aligned on mask_2."""
+    w = alignment_group_world
+    await w["gate"]("mask_sample", w["mask_2"], w["ps_a"], MASK_SAMPLE_COMPLETED)
+
+    resp = await ctx["user"].post(
+        _mint_url(w["align_1"]), json={"prep_sample_idx": [w["ps_a"]], "columns": _COLUMNS}
+    )
+    assert resp.status_code == 409, resp.text
+    detail = resp.json()["detail"]
+    assert detail["reason"] == "incomplete"
+    [sample] = detail["samples"]
+    assert (sample["reason"], sample["upstream_kind"], sample["upstream_definition_idx"]) == (
+        "upstream_moved",
+        "mask",
+        w["mask_2"],
+    )
+
+
+async def test_human_mint_refuses_a_sample_whose_mask_run_was_withdrawn_409(
+    ctx, alignment_group_world
+):
+    w = alignment_group_world
+    await w["gate"]("mask_sample", w["mask_idx"], w["ps_a"], "invalidated")
+
+    resp = await ctx["user"].post(
+        _mint_url(w["align_1"]), json={"prep_sample_idx": [w["ps_a"]], "columns": _COLUMNS}
+    )
+    assert resp.status_code == 409, resp.text
+    detail = resp.json()["detail"]
+    assert detail["reason"] == "not_processed"
+    assert detail["samples"][0]["reason"] == "upstream_withdrawn"
+
+
+async def test_human_mint_refuses_an_alignment_on_a_deprecated_mask_409(ctx, pool_alignment_seed):
+    """The mask the alignment read is deprecated (the alignment itself is not), so
+    no sample of it is processed."""
+    seed = pool_alignment_seed
+    pool = ctx["pool"]
+    await pool.execute(
+        "UPDATE qiita.mask_definition SET status = $3, deprecated_at = now(),"
+        " deprecated_by_idx = $2, deprecation_reason = 'host reference was wrong'"
+        " WHERE mask_idx = $1",
+        seed["mask_idx"],
+        seed["owner_idx"],
+        MaskDefinitionStatus.DEPRECATED.value,
+    )
+    resp = await ctx["user"].post(
+        _mint_url(seed["align_1"]), json={"prep_sample_idx": [seed["ps_a"]], "columns": _COLUMNS}
+    )
+    assert resp.status_code == 409, resp.text
+    detail = resp.json()["detail"]
+    assert detail["reason"] == "not_processed"
+    [sample] = detail["samples"]
+    assert (sample["reason"], sample["upstream_definition_idx"]) == (
+        "upstream_deprecated",
+        seed["mask_idx"],
+    )
+
+
+async def test_human_mint_checks_access_before_group_resolution(ctx, alignment_group_world):
+    """ps_b is unreadable and resolves elsewhere: 403, so the 409's resolution of a
+    sample the caller cannot read is never shown."""
+    w = alignment_group_world
+    await w["gate"]("mask_sample", w["mask_2"], w["ps_b"], MASK_SAMPLE_COMPLETED)
+    await w["gate"]("alignment_sample", w["align_3"], w["ps_b"], ALIGNMENT_SAMPLE_COMPLETED)
+    resp = await ctx["user"].post(
+        _mint_url(w["align_1"]),
+        json={"prep_sample_idx": [w["ps_a"], w["ps_b"]], "columns": _COLUMNS},
+    )
     assert resp.status_code == 403, resp.text

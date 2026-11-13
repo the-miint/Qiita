@@ -46,6 +46,7 @@ from qiita_common.auth_constants import Scope
 from qiita_common.models import (
     AssemblySampleStatusUpdate,
     AssemblySampleStatusUpdateResponse,
+    DefinitionKind,
     Processing,
     ProcessingListResponse,
     ProcessingPrepSample,
@@ -57,6 +58,7 @@ from qiita_common.models import (
 
 from ..auth.guards import require_human, require_scope
 from ..auth.principal import HumanUser, Principal
+from ..definition_similarity import PairRefused, refuse_deprecating_with_similar_pairs
 from ..deps import TxConnFactory, get_db_pool, get_tx_conn_factory
 from ..repositories.processing import (
     ProcessingNotFound,
@@ -66,7 +68,12 @@ from ..repositories.processing import (
     set_assembly_sample_states,
     transition_processing_status,
 )
-from ._helpers import GATE_ROSTER_HARD_CAP, cap_rows, gate_roster_narrowing_idx
+from ._helpers import (
+    GATE_ROSTER_HARD_CAP,
+    cap_rows,
+    gate_roster_narrowing_idx,
+    pair_refused_http,
+)
 
 _MSG_PROCESSING_NOT_FOUND = "Processing run not found"
 
@@ -248,7 +255,7 @@ async def list_processing_prep_samples_route(
 async def update_processing_status_route(
     processing_idx: Annotated[int, Field(gt=0)],
     body: ProcessingStatusUpdate,
-    pool: asyncpg.Pool = Depends(get_db_pool),
+    tx: TxConnFactory = Depends(get_tx_conn_factory),
     caller: HumanUser = Depends(require_human),
     _scope: Principal = Depends(require_scope(Scope.PROCESSING_LIFECYCLE)),
 ) -> Processing:
@@ -264,19 +271,29 @@ async def update_processing_status_route(
     whole block, `superseded_by` included, so correcting a reason without
     re-supplying the replacement clears it.
 
+    Deprecating is refused (409) while the run is a side of a `similar` pair
+    decision (`definition_similarity`).
+
     system_admin only (`processing:lifecycle`).
     """
     try:
-        row = await transition_processing_status(
-            pool,
-            processing_idx=processing_idx,
-            status=body.status,
-            reason=body.reason,
-            superseded_by=body.superseded_by,
-            principal_idx=caller.principal_idx,
-        )
+        async with tx() as conn:
+            if body.status is ProcessingStatus.DEPRECATED:
+                await refuse_deprecating_with_similar_pairs(
+                    conn, DefinitionKind.PROCESSING, processing_idx
+                )
+            row = await transition_processing_status(
+                conn,
+                processing_idx=processing_idx,
+                status=body.status,
+                reason=body.reason,
+                superseded_by=body.superseded_by,
+                principal_idx=caller.principal_idx,
+            )
     except ProcessingNotFound:
         raise HTTPException(status_code=404, detail=_MSG_PROCESSING_NOT_FOUND)
+    except PairRefused as exc:
+        raise pair_refused_http(exc) from exc
     except asyncpg.ForeignKeyViolationError as exc:
         raise HTTPException(
             status_code=422,

@@ -24,11 +24,13 @@ from qiita_common.api_paths import (
     URL_AUTH_WHOAMI,
 )
 from qiita_common.auth_constants import BEARER_PREFIX
+from qiita_common.models import DefinitionKind, SampleResolutionReason, SampleResolutionState
 
 from qiita_control_plane.cli.admin._helpers import (
     EXIT_PRECONDITION_FAILED,
     requires_database_url,
 )
+from qiita_control_plane.repositories.block import MASK_SAMPLE_COMPLETED
 
 # The return code the stub handler hands back, distinct from every code the
 # decorator itself can produce, so a passed-through code is unambiguous.
@@ -846,37 +848,93 @@ def _fake_flight_client_class(tables_by_prep, counts_by_prep=None):
     return _FakeFlightClient
 
 
-def _fake_masked_export_http(manifest):
-    """A fake httpx.request that serves the manifest GET and the ticket POST
-    (encoding prep_sample_idx into the returned ticket bytes)."""
+def _mask_handle(mask_idx: int) -> str:
+    """The fake mask mint's handle for `mask_idx`."""
+    return f"QP{900 + mask_idx}"
+
+
+def _sample_handle(prep_sample_idx: int) -> str:
+    """The fake per-sample mint's handle for `prep_sample_idx`."""
+    return f"QM{500 + prep_sample_idx}"
+
+
+def _resolution(prep_sample_idx: int, state, definition_idx, reason=None, ticket=None) -> dict:
+    """A roster row's `resolution`, as the route serves it."""
+    return {
+        "prep_sample_idx": prep_sample_idx,
+        "definition_kind": DefinitionKind.MASK.value,
+        "state": state.value,
+        "definition_idx": definition_idx,
+        "reason": None if reason is None else reason.value,
+        "work_ticket_idx": ticket,
+    }
+
+
+def _served_sample(sample: dict, mask_idx: int) -> dict:
+    """A roster row as the route serves it: a fixture row without a `resolution` is
+    processed under the named mask, with its gate there `completed`."""
+    resolution = _resolution(sample["prep_sample_idx"], SampleResolutionState.PROCESSED, mask_idx)
+    return {"mask_state": MASK_SAMPLE_COMPLETED, "resolution": resolution, **sample}
+
+
+def _fake_masked_export_http(manifest, mints=None):
+    """A fake httpx.request that serves the roster GET, the ticket POST (encoding
+    prep_sample_idx and mask_idx into the returned ticket bytes) and the two mask
+    handle mints (`_mask_handle`, `_sample_handle`), recording each mint body in
+    `mints` when given."""
     import base64 as _b64
     import json as _json
 
     from qiita_common.api_paths import (
         PATH_ADMIN_MASKED_READ_EXPORT_TICKET,
         PATH_ADMIN_SEQUENCED_POOL_MASKED_READ_EXPORT,
+        URL_EXPORTED_IDENTIFIER_MASK,
+        URL_EXPORTED_PROCESSING_MASK,
     )
 
     pool_idx = manifest["sequenced_pool_idx"]
     manifest_suffix = PATH_ADMIN_SEQUENCED_POOL_MASKED_READ_EXPORT.format(
         sequenced_pool_idx=pool_idx
     )
-    # The real route always populates `mask_state` (MaskedReadExportSample default),
-    # and the CLI now pre-filters on it. Default any sample that omits it to
-    # 'completed' so terse legacy manifests keep exercising the happy path; a test
-    # asserting the not-complete pre-filter sets mask_state explicitly per sample.
-    served = dict(manifest)
-    served["samples"] = [{"mask_state": "completed", **s} for s in manifest["samples"]]
+    # The real route resolves every sample across the mask's group. Default any
+    # sample that omits its resolution to processed under the named mask, so terse
+    # manifests keep exercising the happy path; a test about resolution sets it.
+    served = {"group": [manifest["mask_idx"]], **manifest}
+    served["samples"] = [_served_sample(s, manifest["mask_idx"]) for s in manifest["samples"]]
 
     def fake_request(method, url, headers=None, json=None, params=None, timeout=None):
+        request = httpx.Request(method, url)
         if method == "GET" and url.endswith(manifest_suffix):
-            return httpx.Response(200, json=served, request=httpx.Request(method, url))
+            return httpx.Response(200, json=served, request=request)
         if method == "POST" and url.endswith(PATH_ADMIN_MASKED_READ_EXPORT_TICKET):
             tok = _b64.b64encode(
-                _json.dumps({"prep_sample_idx": json["prep_sample_idx"]}).encode()
+                _json.dumps(
+                    {"prep_sample_idx": json["prep_sample_idx"], "mask_idx": json["mask_idx"]}
+                ).encode()
             ).decode()
-            return httpx.Response(201, json={"ticket": tok}, request=httpx.Request(method, url))
-        return httpx.Response(404, request=httpx.Request(method, url))
+            return httpx.Response(201, json={"ticket": tok}, request=request)
+        if method == "POST" and url.endswith(URL_EXPORTED_PROCESSING_MASK):
+            if mints is not None:
+                mints.append(("processing", json))
+            body = {
+                "mask_idx": json["mask_idx"],
+                "export_processing_id": _mask_handle(json["mask_idx"]),
+            }
+            return httpx.Response(201, json=body, request=request)
+        if method == "POST" and url.endswith(URL_EXPORTED_IDENTIFIER_MASK):
+            if mints is not None:
+                mints.append(("identifier", json))
+            identifiers = [
+                {"prep_sample_idx": ps, "export_id": _sample_handle(ps)}
+                for ps in sorted(json["prep_sample_idx"])
+            ]
+            body = {
+                "mask_idx": json["mask_idx"],
+                "identifiers": identifiers,
+                "count": len(identifiers),
+            }
+            return httpx.Response(201, json=body, request=request)
+        return httpx.Response(404, request=request)
 
     return fake_request
 
@@ -956,7 +1014,7 @@ def test_masked_read_export_writes_parquet_per_sample(monkeypatch, tmp_path):
     )
     assert n_b == 1
     # No .partial temp files left behind.
-    assert sorted(p.suffix for p in out_dir.iterdir()) == [".parquet", ".parquet"]
+    assert sorted(p.suffix for p in out_dir.iterdir()) == [".json", ".parquet", ".parquet"]
 
 
 # The text pyarrow gives a parquet export whose data plane went away mid-stream
@@ -1021,6 +1079,7 @@ def _run_parquet_export(cli, out_dir, *extra):
 
 def _two_sample_export(monkeypatch, tickets):
     import pyarrow as pa
+    from qiita_common.api_paths import PATH_ADMIN_MASKED_READ_EXPORT_TICKET
 
     from qiita_control_plane.cli import _common
 
@@ -1037,7 +1096,7 @@ def _two_sample_export(monkeypatch, tickets):
     served = _fake_masked_export_http(manifest)
 
     def counting_request(method, url, **kw):
-        if method == "POST":
+        if method == "POST" and url.endswith(PATH_ADMIN_MASKED_READ_EXPORT_TICKET):
             tickets.append(kw["json"]["prep_sample_idx"])
         return served(method, url, **kw)
 
@@ -1073,6 +1132,7 @@ def test_masked_read_export_retries_a_sample_whose_stream_dropped(monkeypatch, t
     assert sorted(p.name for p in out_dir.iterdir()) == [
         "SAMN_A.5.7.42.parquet",
         "SAMN_B.5.7.43.parquet",
+        "masked-read-export.manifest.json",
     ]
 
 
@@ -1203,7 +1263,10 @@ def test_masked_read_export_empty_sample_parquet(monkeypatch, tmp_path):
     assert f.is_file()
     assert (f.stat().st_mode & 0o777) == 0o600
     assert duckdb.connect(":memory:").execute(f"SELECT count(*) FROM '{f}'").fetchone()[0] == 0
-    assert sorted(p.name for p in out_dir.iterdir()) == ["SAMN_A.5.7.42.parquet"]
+    assert sorted(p.name for p in out_dir.iterdir()) == [
+        "SAMN_A.5.7.42.parquet",
+        "masked-read-export.manifest.json",
+    ]
 
 
 def test_masked_read_export_parquet_coalesces_row_groups(monkeypatch, tmp_path):
@@ -1525,64 +1588,301 @@ def test_masked_read_export_aborts_on_unsafe_accession(monkeypatch, tmp_path, ca
     assert list(out_dir.iterdir()) == []
 
 
-def test_masked_read_export_aborts_on_not_masked_complete(monkeypatch, tmp_path, capsys):
-    """A heterogeneous pool — one 'completed' sample, one 'pending', one with no
-    gate row (None) — fails the WHOLE export up front (before minting any ticket
-    or writing any file). Regression: the ticket route 409s a non-'completed'
-    sample, and minting inside the download loop used to abort mid-run after
-    earlier samples' files were already written — a partial output set. The
-    manifest's mask_state pre-filter now fails loud before the loop."""
+def _export_argv(out_dir, fmt="parquet"):
+    return [
+        "masked-read-export",
+        "--sequenced-pool-idx",
+        "7",
+        "--mask-idx",
+        "3",
+        "--format",
+        fmt,
+        "--output-dir",
+        str(out_dir),
+        "--data-plane-url",
+        "grpc://dp:50051",
+    ]
+
+
+# A roster resolved across mask 3's group {3, 12}: 42 processed under 3, 43 under
+# 12, 44 incomplete (a ticket under 12 still running), 45 not processed anywhere
+# (and unsubmitted, which does not matter for a sample that is not exported).
+_GROUP_ROSTER = {
+    "sequenced_pool_idx": 7,
+    "sequencing_run_idx": 5,
+    "mask_idx": 3,
+    "group": [3, 12],
+    "samples": [
+        {"prep_sample_idx": 42, "biosample_accession": "SAMN_A"},
+        {
+            "prep_sample_idx": 43,
+            "biosample_accession": "SAMN_B",
+            "mask_state": None,
+            "resolution": _resolution(43, SampleResolutionState.PROCESSED, 12),
+        },
+        {
+            "prep_sample_idx": 44,
+            "biosample_accession": "SAMN_C",
+            "mask_state": None,
+            "resolution": _resolution(
+                44,
+                SampleResolutionState.INCOMPLETE,
+                12,
+                SampleResolutionReason.IN_PROGRESS,
+                ticket=99,
+            ),
+        },
+        {
+            "prep_sample_idx": 45,
+            "biosample_accession": None,
+            "mask_state": None,
+            "resolution": _resolution(
+                45, SampleResolutionState.NOT_PROCESSED, None, SampleResolutionReason.NO_RUN
+            ),
+        },
+    ],
+}
+
+
+def _group_tables():
+    import pyarrow as pa
+
+    return {
+        42: pa.table({"read_id": ["rA0", "rA1"], "sequence1": ["ACGT", "TTGG"]}),
+        43: pa.table({"read_id": ["rB0"], "sequence1": ["CCAA"]}),
+    }
+
+
+def _ticket_masks(monkeypatch, served):
+    """Wrap `served` to record `(prep_sample_idx, mask_idx)` of each ticket POST."""
+    from qiita_common.api_paths import PATH_ADMIN_MASKED_READ_EXPORT_TICKET
+
+    tickets: list[tuple[int, int]] = []
+
+    def recording(method, url, **kw):
+        if method == "POST" and url.endswith(PATH_ADMIN_MASKED_READ_EXPORT_TICKET):
+            tickets.append((kw["json"]["prep_sample_idx"], kw["json"]["mask_idx"]))
+        return served(method, url, **kw)
+
+    return tickets, recording
+
+
+def test_masked_read_export_exports_each_processed_sample_from_its_mask(
+    monkeypatch, tmp_path, capsys
+):
+    """Across a group: each processed sample is exported under the mask it resolved
+    to, the rest are listed on stderr with their reason and skipped, the run exits 0,
+    and the manifest names each file by public handles only."""
+    import json as _json
+
+    from qiita_control_plane.cli import _common
+    from qiita_control_plane.cli import admin as cli
+    from qiita_control_plane.cli.admin.masked_export import MANIFEST_NAME
+
+    monkeypatch.setenv("QIITA_TOKEN", "qk_admin")
+    mints: list = []
+    tickets, recording = _ticket_masks(monkeypatch, _fake_masked_export_http(_GROUP_ROSTER, mints))
+    monkeypatch.setattr(_common.httpx, "request", recording)
+    fake_cls = _fake_flight_client_class(_group_tables())
+    monkeypatch.setattr("pyarrow.flight.FlightClient", fake_cls)
+
+    out_dir = tmp_path / "exp"
+    assert cli.main(_export_argv(out_dir)) == 0
+
+    assert tickets == [(42, 3), (43, 12)]
+    assert fake_cls.instances[0].do_get_calls == [42, 43]
+    assert sorted(mints, key=lambda m: (m[0], m[1]["mask_idx"])) == [
+        ("identifier", {"mask_idx": 3, "prep_sample_idx": [42]}),
+        ("identifier", {"mask_idx": 12, "prep_sample_idx": [43]}),
+        ("processing", {"mask_idx": 3}),
+        ("processing", {"mask_idx": 12}),
+    ]
+    assert sorted(p.name for p in out_dir.iterdir()) == [
+        "SAMN_A.5.7.42.parquet",
+        "SAMN_B.5.7.43.parquet",
+        MANIFEST_NAME,
+    ]
+    text = (out_dir / MANIFEST_NAME).read_text()
+    assert _json.loads(text) == {
+        "files": {
+            "SAMN_A.5.7.42.parquet": {
+                "export_id": _sample_handle(42),
+                "biosample_accession": "SAMN_A",
+                "export_processing_id": _mask_handle(3),
+            },
+            "SAMN_B.5.7.43.parquet": {
+                "export_id": _sample_handle(43),
+                "biosample_accession": "SAMN_B",
+                "export_processing_id": _mask_handle(12),
+            },
+        }
+    }
+    assert "_idx" not in text
+    captured = capsys.readouterr()
+    assert "exported 2 prep_sample(s)" in captured.out
+    assert "not exported: 2 prep_sample(s)" in captured.err
+    assert "prep_sample 44: incomplete (in_progress), mask 12, work_ticket 99" in captured.err
+    assert "prep_sample 45: not_processed (no_run)" in captured.err
+
+
+def test_masked_read_export_with_nothing_processed_writes_nothing(monkeypatch, tmp_path, capsys):
+    """No processed sample: nothing is minted or streamed, the samples are listed,
+    and the run exits 0."""
     from qiita_control_plane.cli import _common
     from qiita_control_plane.cli import admin as cli
 
     monkeypatch.setenv("QIITA_TOKEN", "qk_admin")
-    manifest = {
-        "sequenced_pool_idx": 7,
-        "sequencing_run_idx": 5,
-        "mask_idx": 3,
-        "samples": [
-            {"prep_sample_idx": 42, "biosample_accession": "SAMN_A", "mask_state": "completed"},
-            {"prep_sample_idx": 43, "biosample_accession": "SAMN_B", "mask_state": "pending"},
-            {"prep_sample_idx": 44, "biosample_accession": "SAMN_C", "mask_state": None},
-        ],
-    }
-    monkeypatch.setattr(_common.httpx, "request", _fake_masked_export_http(manifest))
-
-    class _BoomFlightClient:
-        def __init__(self, url):
-            pass
-
-        def do_get(self, ticket, options=None):
-            raise AssertionError("must not DoGet when a sample is not masked-complete")
-
-        def close(self):
-            pass
-
-    monkeypatch.setattr("pyarrow.flight.FlightClient", _BoomFlightClient)
+    roster = {**_GROUP_ROSTER, "samples": _GROUP_ROSTER["samples"][2:]}
+    mints: list = []
+    monkeypatch.setattr(_common.httpx, "request", _fake_masked_export_http(roster, mints))
+    fake_cls = _fake_flight_client_class({})
+    monkeypatch.setattr("pyarrow.flight.FlightClient", fake_cls)
 
     out_dir = tmp_path / "exp"
-    out_dir.mkdir()
-    rc = cli.main(
-        [
-            "masked-read-export",
-            "--sequenced-pool-idx",
-            "7",
-            "--mask-idx",
-            "3",
-            "--format",
-            "parquet",
-            "--output-dir",
-            str(out_dir),
-            "--data-plane-url",
-            "grpc://dp:50051",
-        ]
+    assert cli.main(_export_argv(out_dir)) == 0
+    assert mints == [] and fake_cls.instances == []
+    assert list(out_dir.iterdir()) == []
+    captured = capsys.readouterr()
+    assert "exported 0 prep_sample(s)" in captured.out
+    assert "prep_sample 44" in captured.err and "prep_sample 45" in captured.err
+
+
+def test_masked_read_export_refused_roster_is_one_error(monkeypatch, tmp_path, capsys):
+    """The roster route's 409 for a deprecated mask ends the run before anything
+    is written."""
+    from qiita_control_plane.cli import _common
+    from qiita_control_plane.cli import admin as cli
+
+    monkeypatch.setenv("QIITA_TOKEN", "qk_admin")
+
+    def refusing(method, url, **kw):
+        return httpx.Response(
+            409,
+            json={"detail": "mask_definition 3 is deprecated"},
+            request=httpx.Request(method, url),
+        )
+
+    monkeypatch.setattr(_common.httpx, "request", refusing)
+    out_dir = tmp_path / "exp"
+    assert cli.main(_export_argv(out_dir)) == 1
+    assert "http error 409" in capsys.readouterr().err
+    assert list(out_dir.iterdir()) == []
+
+
+def _record(out_dir, name, export_processing_id):
+    import json as _json
+
+    from qiita_control_plane.cli.admin.masked_export import MANIFEST_NAME
+
+    (out_dir / MANIFEST_NAME).write_text(
+        _json.dumps(
+            {
+                "files": {
+                    name: {
+                        "export_id": "QM1",
+                        "biosample_accession": "SAMN_A",
+                        "export_processing_id": export_processing_id,
+                    }
+                }
+            }
+        )
     )
-    assert rc == 1
+
+
+@pytest.mark.parametrize(
+    ("fmt", "name"),
+    [("parquet", "SAMN_A.5.7.42.parquet"), ("fastq", "SAMN_A.5.7.42.R1.fastq.gz")],
+)
+def test_masked_read_export_refuses_a_file_recorded_under_another_mask(
+    monkeypatch, tmp_path, capsys, fmt, name
+):
+    """An existing file the manifest records under another mask's handle is never
+    replaced: the whole run is refused before any stream, and nothing changes."""
+    from qiita_control_plane.cli import _common
+    from qiita_control_plane.cli import admin as cli
+    from qiita_control_plane.cli.admin.masked_export import MANIFEST_NAME
+
+    monkeypatch.setenv("QIITA_TOKEN", "qk_admin")
+    monkeypatch.setattr(_common.httpx, "request", _fake_masked_export_http(_GROUP_ROSTER))
+    fake_cls = _fake_flight_client_class(_group_tables())
+    monkeypatch.setattr("pyarrow.flight.FlightClient", fake_cls)
+    out_dir = tmp_path / "exp"
+    out_dir.mkdir()
+    (out_dir / name).write_bytes(b"from mask 5")
+    _record(out_dir, name, "QP5")
+    before = (out_dir / MANIFEST_NAME).read_text()
+
+    assert cli.main(_export_argv(out_dir, fmt)) == 1
+
     err = capsys.readouterr().err
-    assert "masked-complete" in err
-    assert "43" in err and "44" in err  # both non-'completed' preps named
-    assert "42" not in err  # the completed one is not flagged
-    assert list(out_dir.iterdir()) == []  # nothing written — no partial output
+    assert "exported from a different mask" in err
+    assert f"{name} (recorded under QP5, now {_mask_handle(3)})" in err
+    assert fake_cls.instances == []
+    assert (out_dir / name).read_bytes() == b"from mask 5"
+    assert (out_dir / MANIFEST_NAME).read_text() == before
+    assert sorted(p.name for p in out_dir.iterdir()) == [name, MANIFEST_NAME]
+
+
+def test_masked_read_export_a_recorded_file_gone_from_disk_is_no_conflict(monkeypatch, tmp_path):
+    """A manifest entry under another mask whose file no longer exists guards
+    nothing: the sample is exported and the entry rewritten."""
+    import json as _json
+
+    from qiita_control_plane.cli import _common
+    from qiita_control_plane.cli import admin as cli
+    from qiita_control_plane.cli.admin.masked_export import MANIFEST_NAME
+
+    monkeypatch.setenv("QIITA_TOKEN", "qk_admin")
+    monkeypatch.setattr(_common.httpx, "request", _fake_masked_export_http(_GROUP_ROSTER))
+    monkeypatch.setattr("pyarrow.flight.FlightClient", _fake_flight_client_class(_group_tables()))
+    out_dir = tmp_path / "exp"
+    out_dir.mkdir()
+    _record(out_dir, "SAMN_A.5.7.42.parquet", "QP5")
+
+    assert cli.main(_export_argv(out_dir)) == 0
+    files = _json.loads((out_dir / MANIFEST_NAME).read_text())["files"]
+    assert files["SAMN_A.5.7.42.parquet"]["export_processing_id"] == _mask_handle(3)
+
+
+def test_masked_read_export_same_mask_keeps_the_count_rule(monkeypatch, tmp_path, capsys):
+    """A file recorded under the same mask's handle follows the parquet count rule:
+    unchanged counts skip it."""
+    import pyarrow.parquet as pq
+
+    from qiita_control_plane.cli import _common
+    from qiita_control_plane.cli import admin as cli
+
+    monkeypatch.setenv("QIITA_TOKEN", "qk_admin")
+    monkeypatch.setattr(_common.httpx, "request", _fake_masked_export_http(_GROUP_ROSTER))
+    tables = _group_tables()
+    fake_cls = _fake_flight_client_class(tables)
+    monkeypatch.setattr("pyarrow.flight.FlightClient", fake_cls)
+    out_dir = tmp_path / "exp"
+    out_dir.mkdir()
+    pq.write_table(tables[42], out_dir / "SAMN_A.5.7.42.parquet")
+    _record(out_dir, "SAMN_A.5.7.42.parquet", _mask_handle(3))
+
+    assert cli.main(_export_argv(out_dir)) == 0
+    assert fake_cls.instances[0].do_get_calls == [43]
+    assert "exported 1 prep_sample(s) (skipped 1 already up to date)" in capsys.readouterr().out
+
+
+def test_masked_read_export_refuses_an_unreadable_manifest(monkeypatch, tmp_path, capsys):
+    from qiita_control_plane.cli import _common
+    from qiita_control_plane.cli import admin as cli
+    from qiita_control_plane.cli.admin.masked_export import MANIFEST_NAME
+
+    monkeypatch.setenv("QIITA_TOKEN", "qk_admin")
+    monkeypatch.setattr(_common.httpx, "request", _fake_masked_export_http(_GROUP_ROSTER))
+    fake_cls = _fake_flight_client_class(_group_tables())
+    monkeypatch.setattr("pyarrow.flight.FlightClient", fake_cls)
+    out_dir = tmp_path / "exp"
+    out_dir.mkdir()
+    (out_dir / MANIFEST_NAME).write_text('{"files": [1]}')
+
+    assert cli.main(_export_argv(out_dir)) == 1
+    assert "is not a masked-read-export manifest" in capsys.readouterr().err
+    assert fake_cls.instances == []
 
 
 def test_masked_read_export_creates_missing_output_dir(monkeypatch, tmp_path):
@@ -1885,7 +2185,10 @@ def test_masked_read_export_single_end_fastq(monkeypatch, tmp_path):
     assert lines[:4] == ["@rS0", "GGGGCCCC", "+", "IIIIIIII"]
     assert len(lines) == 8  # two single-end records, 4 lines each
     # No paired split, no leftover .partial.
-    assert sorted(p.name for p in out_dir.iterdir()) == ["SAMN_A.5.7.42.fastq.gz"]
+    assert sorted(p.name for p in out_dir.iterdir()) == [
+        "SAMN_A.5.7.42.fastq.gz",
+        "masked-read-export.manifest.json",
+    ]
 
 
 def test_masked_read_export_paired_fastq_r1_r2(monkeypatch, tmp_path):
@@ -1919,6 +2222,7 @@ def test_masked_read_export_paired_fastq_r1_r2(monkeypatch, tmp_path):
     assert sorted(p.name for p in out_dir.iterdir()) == [
         "SAMN_A.5.7.42.R1.fastq.gz",
         "SAMN_A.5.7.42.R2.fastq.gz",
+        "masked-read-export.manifest.json",
     ]
 
 
@@ -1977,7 +2281,10 @@ def test_masked_read_export_empty_sample_fastq(monkeypatch, tmp_path):
     assert f.is_file()
     assert (f.stat().st_mode & 0o777) == 0o600
     assert _read_gz_text(f) == ""  # zero records
-    assert sorted(p.name for p in out_dir.iterdir()) == ["SAMN_A.5.7.42.fastq.gz"]
+    assert sorted(p.name for p in out_dir.iterdir()) == [
+        "SAMN_A.5.7.42.fastq.gz",
+        "masked-read-export.manifest.json",
+    ]
 
 
 # Any one of the names a prep_sample's export could commit blocks the run: the

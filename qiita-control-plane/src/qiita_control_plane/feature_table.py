@@ -13,6 +13,7 @@ from a REST listing rather than from Postgres, and the rule about which pairings
 are admissible must not have a server copy and a client copy.
 """
 
+from collections.abc import Set
 from typing import Any
 
 from qiita_common.models.processing import ProcessingStatus
@@ -82,6 +83,7 @@ def denovo_alignment_processing_idx(
     denovo_alignment_idx: int,
     denovo_params: Any,
     reference_params: Any,
+    reference_mask_group: Set[int] | None = None,
 ) -> int:
     """Validate that `denovo_params` is a de novo alignment pairable with the
     reference arm's `reference_params`, and return the assembly run it aligned
@@ -102,7 +104,10 @@ def denovo_alignment_processing_idx(
     * **Both arms must have been aligned at the same `mask_idx`.** Different masks
       filtered different reads, so the reads one arm could place are not the reads
       the other could, and precedence would be deciding between two populations
-      rather than between two placements of one read.
+      rather than between two placements of one read. When `reference_mask_group`
+      is given (the mask group of the reference arm's mask, from
+      `definition_similarity.Groups.group_of`), the de novo arm's mask must be in it
+      instead: masks decided similar are one pass-set for this purpose.
 
     `processing_idx` is returned rather than taken as a parameter because it is IN
     the de novo alignment's hashed params: the assembly run and the alignment against
@@ -125,7 +130,20 @@ def denovo_alignment_processing_idx(
     reference_mask_idx = (
         reference_params.get("mask_idx") if isinstance(reference_params, dict) else None
     )
-    if denovo_params.get("mask_idx") != reference_mask_idx:
+    denovo_mask_idx = denovo_params.get("mask_idx")
+    if reference_mask_group is not None:
+        if reference_mask_idx not in reference_mask_group:
+            raise ValueError(
+                f"reference_mask_group {sorted(reference_mask_group)} does not contain the"
+                f" reference arm's mask_idx {reference_mask_idx}"
+            )
+        if denovo_mask_idx not in reference_mask_group:
+            raise ValueError(
+                f"de novo alignment {denovo_alignment_idx} was aligned at mask_idx "
+                f"{denovo_mask_idx}, which is not in the mask group of the reference "
+                f"arm's mask_idx {reference_mask_idx} ({sorted(reference_mask_group)})"
+            )
+    elif denovo_mask_idx != reference_mask_idx:
         raise ValueError(
             f"de novo alignment {denovo_alignment_idx} was aligned at mask_idx "
             f"{denovo_params.get('mask_idx')}, but the reference arm was aligned at "

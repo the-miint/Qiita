@@ -194,6 +194,14 @@ _TRIPLES: list[tuple[str, str, str]] = [
         "PATH_ADMIN_PREFIX",
         "PATH_ADMIN_MASKED_READ_EXPORT_TICKET",
     ),
+    ("URL_ADMIN_DEFINITION_PAIR", "PATH_ADMIN_PREFIX", "PATH_ADMIN_DEFINITION_PAIR"),
+    ("URL_ADMIN_DEFINITION_PAIR_BY_IDX", "PATH_ADMIN_PREFIX", "PATH_ADMIN_DEFINITION_PAIR_BY_IDX"),
+    (
+        "URL_ADMIN_DEFINITION_PAIR_DECISION",
+        "PATH_ADMIN_PREFIX",
+        "PATH_ADMIN_DEFINITION_PAIR_DECISION",
+    ),
+    ("URL_ADMIN_DEFINITION_PAIR_REVOKE", "PATH_ADMIN_PREFIX", "PATH_ADMIN_DEFINITION_PAIR_REVOKE"),
     # /user
     ("URL_USER_ME", "PATH_USER_PREFIX", "PATH_USER_ME"),
     # /study
@@ -410,6 +418,17 @@ _TRIPLES: list[tuple[str, str, str]] = [
         "PATH_EXPORTED_PROCESSING_PREFIX",
         "PATH_EXPORTED_PROCESSING_ROOT",
     ),
+    # mask kind of /exported-processing and /exported-identifier
+    (
+        "URL_EXPORTED_PROCESSING_MASK",
+        "PATH_EXPORTED_PROCESSING_PREFIX",
+        "PATH_EXPORTED_PROCESSING_MASK",
+    ),
+    (
+        "URL_EXPORTED_IDENTIFIER_MASK",
+        "PATH_EXPORTED_IDENTIFIER_PREFIX",
+        "PATH_EXPORTED_IDENTIFIER_MASK",
+    ),
     # /prep-sample
     (
         "URL_PREP_SAMPLE_STUDY_LIST",
@@ -539,6 +558,12 @@ _TRIPLES: list[tuple[str, str, str]] = [
     # /alignment (Flight DoGet ticket for the alignment sink)
     ("URL_ALIGNMENT_DOGET", "PATH_ALIGNMENT_PREFIX", "PATH_ALIGNMENT_DOGET"),
     ("URL_ALIGNMENT_COHORT_DOGET", "PATH_ALIGNMENT_PREFIX", "PATH_ALIGNMENT_COHORT_DOGET"),
+    # /definition-group
+    (
+        "URL_DEFINITION_GROUP_RESOLVE",
+        "PATH_DEFINITION_GROUP_PREFIX",
+        "PATH_DEFINITION_GROUP_RESOLVE",
+    ),
 ]
 
 

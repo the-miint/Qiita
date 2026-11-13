@@ -66,7 +66,10 @@ from qiita_common.auth_constants import (
     BEARER_PREFIX,
     STALE_TOKEN_SCOPE_HEADER,
 )
-from qiita_common.models import PrincipalLookupRequest, PrincipalLookupResponse
+from qiita_common.models import (
+    PrincipalLookupRequest,
+    PrincipalLookupResponse,
+)
 
 # Environment-variable names and CLI defaults are CLI conventions (not part of
 # the wire protocol — those live in qiita_common.auth_constants). Keep them

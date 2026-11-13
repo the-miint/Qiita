@@ -1,33 +1,44 @@
 """The public exported-identifier map.
 
 `POST /exported-identifier` mints (or recovers) an `export_id` for every
-processed sample in a cohort, so a published feature table can name its samples
-without carrying ours. A control-plane route rather than anything the data plane
+processed prep_sample in a cohort, so a published feature table can name its
+prep_samples without carrying our ids. A control-plane route rather than anything the data plane
 can serve: the identifiers live only in Postgres, and minting one is a write.
 
-Cohort authorization is `authorize_completed_alignment_cohort`, shared with the
-human alignment mint: minting a ticket for a cohort and minting the public handles for
-that same cohort is one workflow, and two answers to "may I read this sample" is
-how one surface comes to advertise what the other refuses.
+The alignment kind's cohort authorization is `authorize_completed_alignment_cohort`,
+shared with the human alignment mint: minting a ticket for a cohort and minting the
+public handles for that same cohort is one workflow, and two answers to "may I read
+this prep_sample" is how one surface comes to advertise what the other refuses.
+The mask kind (`POST /exported-identifier/mask`) is gated on system_admin and
+`admin:masked_read_export`, as the masked-read export routes are.
 """
 
 import asyncpg
 from fastapi import APIRouter, Depends, HTTPException
 from qiita_common.api_paths import (
+    PATH_EXPORTED_IDENTIFIER_MASK,
     PATH_EXPORTED_IDENTIFIER_PREFIX,
     PATH_EXPORTED_IDENTIFIER_ROOT,
 )
-from qiita_common.auth_constants import Scope
+from qiita_common.auth_constants import Scope, SystemRole
 from qiita_common.models import (
     ExportedIdentifier,
     ExportedIdentifierRequest,
     ExportedIdentifierResponse,
+    ExportedMaskIdentifierRequest,
+    ExportedMaskIdentifierResponse,
 )
 
-from ..auth.guards import require_human, require_scope
+from ..auth.guards import require_human, require_human_with_role, require_scope
 from ..auth.principal import HumanUser, Principal
 from ..deps import get_db_pool
-from ..repositories.exported_identifier import IncompleteMintError, mint_exported_identifiers
+from ..repositories.exported_identifier import (
+    IncompleteMintError,
+    MaskSampleNotCompleteError,
+    mint_exported_identifiers,
+    mint_exported_mask_identifiers,
+)
+from ..repositories.mask_definition import MaskDefinitionDeprecated, MaskDefinitionNotFound
 from ._helpers import authorize_completed_alignment_cohort, first_few
 
 router = APIRouter(prefix=PATH_EXPORTED_IDENTIFIER_PREFIX, tags=["exported-identifier"])
@@ -108,6 +119,49 @@ async def mint_exported_identifier_map(
     identifiers = [ExportedIdentifier.model_validate(dict(row)) for row in rows]
     return ExportedIdentifierResponse(
         alignment_idx=body.alignment_idx,
+        identifiers=identifiers,
+        count=len(identifiers),
+    )
+
+
+@router.post(PATH_EXPORTED_IDENTIFIER_MASK, status_code=201)
+async def mint_exported_mask_identifier_map(
+    body: ExportedMaskIdentifierRequest,
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    caller: HumanUser = Depends(require_human_with_role(SystemRole.SYSTEM_ADMIN)),
+    _scope: Principal = Depends(require_scope(Scope.ADMIN_MASKED_READ_EXPORT)),
+) -> ExportedMaskIdentifierResponse:
+    """Mint the public handle for each prep_sample masked under `mask_idx`, ascending
+    by prep_sample_idx, so a masked-read export can name its files without carrying
+    `prep_sample_idx`.
+
+    **Idempotent.** 404 for an unknown mask; 409 for a deprecated mask, and for a
+    cohort with any member not masked-complete under it (the gate that the export
+    ticket route applies), in which case nothing is minted.
+    """
+    try:
+        rows = await mint_exported_mask_identifiers(
+            pool,
+            mask_idx=body.mask_idx,
+            prep_sample_idxs=body.prep_sample_idx,
+            created_by_idx=caller.principal_idx,
+        )
+    except MaskDefinitionNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except MaskDefinitionDeprecated as exc:
+        raise HTTPException(status_code=409, detail=exc.detail) from exc
+    except MaskSampleNotCompleteError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"{len(exc.not_complete)} prep_sample(s) are not masked-complete under"
+                f" mask {body.mask_idx} (e.g. {first_few(exc.not_complete)}); an"
+                " identifier names processed data, so there is nothing yet to name"
+            ),
+        ) from exc
+    identifiers = [ExportedIdentifier.model_validate(dict(row)) for row in rows]
+    return ExportedMaskIdentifierResponse(
+        mask_idx=body.mask_idx,
         identifiers=identifiers,
         count=len(identifiers),
     )

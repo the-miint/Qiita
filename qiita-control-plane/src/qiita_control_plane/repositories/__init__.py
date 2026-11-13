@@ -49,6 +49,8 @@ INT4_MASK = 0x7FFF_FFFF
 #                                  writes vs the download-roster read)
 #   repositories.sequence_range    2-arg class PREP_SAMPLE_RANGE_LOCK_CLASS (range
 #                                  mint vs the empty-completion writer)
+#   repositories.definition_pair   2-arg class DEFINITION_GROUP_LOCK_CLASS, key 0 (the
+#                                  group lock: pair decisions vs deprecations)
 #   fanout_dispatch                2-arg classes 0x0FA0_0001-3 (cohort kinds)
 #   actions.library                1-arg key 4_310_290_149 (exclusion sync)
 #   notify.sweeper                 1-arg key 4_310_290_147
@@ -59,6 +61,17 @@ INT4_MASK = 0x7FFF_FFFF
 #                                  global range-allocation lock)
 #   principal role triggers        1-arg, principal_idx (the auth and role-typed FK
 #                                  triggers)
+
+
+# The isolation levels at which a transaction reads every statement from one
+# snapshot, as `transaction_isolation` spells them.
+SNAPSHOT_ISOLATION_LEVELS = frozenset({"repeatable read", "serializable"})
+READ_COMMITTED = "read committed"
+
+
+async def transaction_isolation(conn: asyncpg.Connection) -> str:
+    """The isolation level of the transaction that `conn` is in."""
+    return await conn.fetchval("SELECT current_setting('transaction_isolation')")
 
 
 def require_transaction(conn: asyncpg.Connection) -> None:

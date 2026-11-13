@@ -40,6 +40,8 @@ from qiita_common.models.biosample import (
     MetadataChecklistRef,
     MetadataEntry,
 )
+from qiita_common.models.definition_group import SampleResolution
+from qiita_common.models.definition_pair import DefinitionKind
 from qiita_common.models.reference import Platform
 from qiita_common.models.step import ProjectionColumns
 from qiita_common.models.work_ticket import WorkTicketState
@@ -1173,9 +1175,12 @@ class SyndnaInsert(BaseModel):
 
 class SyndnaReadCountSample(BaseModel):
     """One prep_sample's per-insert read counts, in `SyndnaReadCountResponse.inserts`
-    order. `sequenced_pool_idx` is None for a prep_sample that was never pooled."""
+    order. `mask_idx` is the member of the named mask's group that the prep_sample
+    resolved to, whose counts these are. `sequenced_pool_idx` is None for a prep_sample that
+    was never pooled."""
 
     prep_sample_idx: Annotated[int, Field(gt=0)]
+    mask_idx: Annotated[int, Field(gt=0)]
     biosample_accession: str | None = None
     sequenced_pool_idx: Annotated[int | None, Field(default=None, gt=0)] = None
     read_counts: list[Annotated[int, Field(ge=0)]]
@@ -1184,15 +1189,20 @@ class SyndnaReadCountSample(BaseModel):
 class SyndnaReadCountResponse(BaseModel):
     """Returned by GET /api/v1/mask-definition/{mask_idx}/syndna-read-count.
 
-    Every selected prep_sample is 'completed' under the mask and counted; the route
-    refuses rather than returning a partial table. The counts are reads with a
-    mapped primary alignment to each insert, ungated (see qiita.syndna_read_count).
+    `mask_idx` is the mask the caller named; each selected prep_sample is resolved
+    across that mask's group (`SampleResolution`). `samples` holds the ones
+    `processed`, with their counts under the member that each resolved to; every
+    such member shares `reference_idx`. `left_out` holds the selected
+    prep_samples that are `incomplete` or `not_processed`, with the reason, ascending
+    by prep_sample_idx. The counts are reads with a mapped primary alignment to each
+    insert, ungated (see qiita.syndna_read_count).
     """
 
     mask_idx: Annotated[int, Field(gt=0)]
     reference_idx: Annotated[int, Field(gt=0)]
     inserts: list[SyndnaInsert]
     samples: list[SyndnaReadCountSample]
+    left_out: list[SampleResolution] = []
 
     @model_validator(mode="after")
     def _counts_follow_inserts(self) -> SyndnaReadCountResponse:
@@ -1583,33 +1593,39 @@ class ReadMaskedDoGetTicketRequest(BaseModel):
 
 
 class MaskedReadExportSample(BaseModel):
-    """One sample in a sequenced_pool's masked-read export manifest.
+    """One prep_sample in a sequenced_pool's masked-read export manifest.
 
     `biosample_accession` is None until the biosample is submitted to NCBI. The
-    per-sample output filename
+    per-prep_sample output filename
     `<biosample_accession>.<sequencing_run_idx>.<sequenced_pool_idx>.<prep_sample_idx>`
-    requires it, so the export refuses a sample whose accession is still None —
-    the manifest surfaces the None rather than silently dropping the sample, and
+    requires it, so the export refuses a prep_sample whose accession is still None —
+    the manifest surfaces the None rather than silently dropping the prep_sample, and
     the export route/CLI fails loudly on it. The pool-wide
     `sequencing_run_idx`/`sequenced_pool_idx` live on the manifest, not repeated
     per row.
 
-    `mask_state` is the sample's per-`(mask_idx, prep_sample)` completion gate
-    (`qiita.mask_sample.state`, see `MaskSampleState`), or `None` when no gate row
-    exists. Only `'completed'` is exportable: `None` means "not masked-complete
-    under this mask", NOT exempt, so the ticket route 409s it the same as
-    `'pending'`. The CLI reads it to fail the whole export up front (before minting
-    any per-sample ticket) when a sample is not `'completed'`, rather than abort the
-    download loop mid-run on the ticket route's 409 and leave a partial output set.
+    `resolution` is the prep_sample's resolution across the manifest's mask group.
+    Only a `processed` prep_sample is exported, from `resolution.definition_idx`; the
+    others are listed with their reason.
 
-    This roster LEFT JOINs the gate table alone, so a sample whose per-sample mask
-    has not completed comes back `None` rather than showing why. `MaskPrepSample`
-    is the mask-side roster that also reads the ticket.
+    `mask_state` is the prep_sample's completion gate under the manifest's own `mask_idx`
+    (`qiita.mask_sample.state`, see `MaskSampleState`), or `None` when no gate row
+    exists there. It says nothing about the other members of the group.
     """
 
     prep_sample_idx: Annotated[int, Field(gt=0)]
     biosample_accession: str | None
     mask_state: MaskSampleState | None = None
+    resolution: SampleResolution
+
+    @model_validator(mode="after")
+    def _resolution_is_this_mask_sample(self) -> MaskedReadExportSample:
+        if (
+            self.resolution.prep_sample_idx != self.prep_sample_idx
+            or self.resolution.definition_kind is not DefinitionKind.MASK
+        ):
+            raise ValueError("resolution must be this prep_sample's, across a mask group")
+        return self
 
 
 class ExportedIdentifierRequest(BaseModel):
@@ -1717,19 +1733,68 @@ class ExportedProcessingResponse(BaseModel):
     export_processing_id: str
 
 
+class ExportedMaskProcessingRequest(BaseModel):
+    """Body for POST /api/v1/exported-processing/mask — mint (or recover) the public
+    handle for a mask, so a masked-read export can cite which mask produced each file
+    without carrying ``mask_idx``. system_admin + admin:masked_read_export only.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    mask_idx: Annotated[int, Field(gt=0)]
+
+
+class ExportedMaskProcessingResponse(BaseModel):
+    """Returned by POST /api/v1/exported-processing/mask.
+
+    ``export_processing_id`` (``QP<idx>``) shares its namespace with the alignment
+    kind's handles. ``mask_idx`` is echoed back from the request and goes in this
+    response only, never in the exported files.
+    """
+
+    mask_idx: Annotated[int, Field(gt=0)]
+    export_processing_id: str
+
+
+class ExportedMaskIdentifierRequest(BaseModel):
+    """Body for POST /api/v1/exported-identifier/mask — mint (or recover) the public
+    handle for each prep_sample masked under ``mask_idx``. Each
+    ``(mask_idx, prep_sample_idx)`` is one processed prep_sample, which is what an
+    ``export_id`` stands for. system_admin + admin:masked_read_export only.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    mask_idx: Annotated[int, Field(gt=0)]
+    prep_sample_idx: PrepSampleCohort
+
+
+class ExportedMaskIdentifierResponse(BaseModel):
+    """Returned by POST /api/v1/exported-identifier/mask: one entry per distinct
+    requested prep_sample, ascending by prep_sample_idx. Every requested prep_sample is
+    present or the request failed.
+    """
+
+    mask_idx: Annotated[int, Field(gt=0)]
+    identifiers: list[ExportedIdentifier]
+    count: Annotated[int, Field(ge=0)]
+
+
 class MaskedReadExportManifest(BaseModel):
     """Returned by GET /admin/sequenced-pool/{sequenced_pool_idx}/masked-read-export.
 
-    The roster of a sequenced_pool's non-retired samples to export under a given
-    `mask_idx`, with each sample's filename parts. The caller then mints a
-    per-sample DoGet ticket (POST /admin/masked-read-export/ticket) and streams
-    each sample's read_masked rows from the data plane, writing parquet/fastq
-    locally. system_admin + admin:masked_read_export only.
+    The roster of a sequenced_pool's non-retired prep_samples, each resolved across
+    the group of masks that `mask_idx` belongs to (`group`, ascending), with each
+    prep_sample's filename parts. The caller then mints a per-prep_sample DoGet ticket
+    (POST /admin/masked-read-export/ticket) under each processed prep_sample's
+    `resolution.definition_idx` and streams its read_masked rows from the data plane,
+    writing parquet/fastq locally. system_admin + admin:masked_read_export only.
     """
 
     sequenced_pool_idx: Annotated[int, Field(gt=0)]
     sequencing_run_idx: Annotated[int, Field(gt=0)]
     mask_idx: Annotated[int, Field(gt=0)]
+    group: list[Annotated[int, Field(gt=0)]]
     samples: list[MaskedReadExportSample]
 
 

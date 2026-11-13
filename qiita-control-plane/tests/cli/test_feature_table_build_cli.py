@@ -24,6 +24,7 @@ import pyarrow as pa
 import pytest
 from qiita_common import analytic as ft
 from qiita_common.hashing import canonical_params_hash
+from qiita_common.models import DefinitionGroupResolveResponse, DefinitionKind
 
 from qiita_control_plane.cli.user import feature_table as ftc
 from qiita_control_plane.cli.user._helpers import _UNSET
@@ -224,8 +225,9 @@ def _namespace(tmp_path, **overrides) -> argparse.Namespace:
     fields = {
         "base_url": "http://cp",
         "data_plane_url": "grpc://dp:50051",
-        "sequencing_run_idx": 4,
-        "sequenced_pool_idx": 5,
+        # Lists, as the repeatable flags parse: one pool unless a test names more.
+        "sequencing_run_idx": [4],
+        "sequenced_pool_idx": [5],
         "alignment_idx": 3,
         # Reference-only by default: the combined arm is opt-in, and every existing
         # test here is about the analytic the reference arm alone produces.
@@ -247,6 +249,49 @@ def _namespace(tmp_path, **overrides) -> argparse.Namespace:
     return argparse.Namespace(**(fields | overrides))
 
 
+_UNRESOLVED = {
+    "mask_idx": None,
+    "reason": None,
+    "work_ticket_idx": None,
+    "upstream_kind": None,
+    "upstream_definition_idx": None,
+}
+
+
+def _fake_resolve(rec, *, members=None, groups=None, unprocessed=None):
+    """Stands in for POST /definition-group/resolve, keyed `(kind, definition_idx)`.
+
+    By default every requested sample is processed under the definition named and the
+    group is that definition alone — the state of a deploy with no pair decisions, which
+    is what every single-part test here runs under. `members` moves a sample to another
+    member, `unprocessed` gives it another state (a partial `SampleResolution`), and
+    `groups` sets the `group` answered. Every call is recorded in `resolve_calls`."""
+    members, groups, unprocessed = members or {}, groups or {}, unprocessed or {}
+    rec["resolve_calls"] = []
+
+    def resolve(base_url, token, *, kind, definition_idx, prep_sample_idx):
+        key = (DefinitionKind(kind).value, definition_idx)
+        rec["resolve_calls"].append((*key, list(prep_sample_idx)))
+        samples = []
+        for sample in sorted(set(prep_sample_idx)):
+            base = {**_UNRESOLVED, "prep_sample_idx": sample, "definition_kind": key[0]}
+            if sample in unprocessed.get(key, {}):
+                samples.append(base | unprocessed[key][sample])
+            else:
+                member = members.get(key, {}).get(sample, definition_idx)
+                samples.append(base | {"state": "processed", "definition_idx": member})
+        return DefinitionGroupResolveResponse.model_validate(
+            {
+                "definition_kind": key[0],
+                "definition_idx": definition_idx,
+                "group": groups.get(key, [definition_idx]),
+                "samples": samples,
+            }
+        )
+
+    return resolve
+
+
 def _patched(
     monkeypatch,
     *,
@@ -257,11 +302,15 @@ def _patched(
     taxonomy_rows=None,
     phylogeny_rows=None,
     blocked_features=(),
+    resolve=None,
 ):
     """Patch the REST seams, both ticket mints, and the Flight client; return the
     recorder every assertion below reads. A test that wants a seam to RAISE re-patches
-    it itself afterwards, rather than this growing a parameter per failure mode."""
+    it itself afterwards, rather than this growing a parameter per failure mode.
+
+    `resolve` is `_fake_resolve`'s keyword arguments."""
     rec: dict = {"lengths_minted": 0, "taxonomy_minted": 0, "phylogeny_minted": 0}
+    monkeypatch.setattr(ftc, "_resolve_definition_group", _fake_resolve(rec, **(resolve or {})))
     _FakeFlightClient.instances = []
 
     monkeypatch.setattr(ftc._common, "read_token", lambda *a, **k: "qk_tok")
@@ -325,10 +374,12 @@ def _patched(
     monkeypatch.setattr(ftc, "_mint_exported_features", _mint_features)
 
     def _mint_processing(base_url, token, *, alignment_idx, prep_sample_idx):
-        """The processing mint. `prep_sample_idx` authorizes and is not part of the
+        """The processing mint, answering `QP<alignment_idx + 4>` (QP7 for the
+        reference alignment). `prep_sample_idx` authorizes and is not part of the
         handle, so the fake records it to prove the cohort is what gets sent."""
         rec["processing_cohort"] = list(prep_sample_idx)
-        return "QP7"
+        rec.setdefault("processing_minted", {})[alignment_idx] = list(prep_sample_idx)
+        return f"QP{alignment_idx + 4}"
 
     monkeypatch.setattr(ftc, "_mint_exported_processing", _mint_processing)
     monkeypatch.setattr(
@@ -1246,9 +1297,15 @@ def test_the_manifest_records_the_processing_by_its_public_handle(monkeypatch, t
     assert ftc._handle_feature_table_build(args, parser=None) == 0
     manifest = _manifest(tmp_path)
 
-    assert manifest["processing"]["export_processing_id"] == "QP7"
-    assert manifest["processing"]["params_hash"] == canonical_params_hash(_PARAMS).hex()
-    assert manifest["processing"]["aligner"] == "minimap2"
+    # One part, since every sample resolved to the alignment named.
+    assert manifest["processing"]["parts"] == [
+        {
+            "export_processing_id": "QP7",
+            "params_hash": canonical_params_hash(_PARAMS).hex(),
+            "aligner": "minimap2",
+        }
+    ]
+    assert manifest["processing"]["sample_part"] == {"QM1": "QP7", "QM2": "QP7"}
     # The reference by name and version, resolved rather than carried as an idx.
     assert manifest["processing"]["reference"] == {
         "name": "gg2",
@@ -1469,7 +1526,7 @@ _DENOVO_ALIGNMENT = [
 _DENOVO_LENGTHS = [(50, 1000)]
 
 
-def _patched_combined(monkeypatch, *, denovo_map=None, denovo_alignment=None):
+def _patched_combined(monkeypatch, *, denovo_map=None, denovo_alignment=None, resolve=None):
     """`_patched`, plus the three de novo seams. Returns the same recorder, with
     `denovo_map_samples`, `denovo_lengths_samples` and `arm_tickets` added."""
     # The exported-feature mint has to answer for BOTH arms' genomes: a qiita genome
@@ -1478,6 +1535,7 @@ def _patched_combined(monkeypatch, *, denovo_map=None, denovo_alignment=None):
     rec = _patched(
         monkeypatch,
         feature_handles={100: "GCF_100", 200: "GCF_200", 900: "qiita-900", 901: "qiita-901"},
+        resolve=resolve,
     )
     rec["denovo_map_samples"] = []
     rec["denovo_lengths_samples"] = []
@@ -1753,9 +1811,12 @@ def test_a_cohort_where_nothing_assembled_degrades_to_a_reference_only_build(
     # reference-only ask leave no distinguishable trace, and the caller has no way to
     # tell a degraded build from the one they asked for.
     denovo = json.loads((tmp_path / "table.manifest.json").read_text())["table"]["denovo"]
-    assert denovo["requested_alignment_idx"] == 4
-    assert denovo["applied"] is False
-    assert denovo["prep_samples_with_a_de_novo_arm"] == 0
+    assert denovo == {
+        "applied": False,
+        "parts": [],
+        "sample_part": {},
+        "prep_samples_with_a_de_novo_arm": 0,
+    }
     assert "reference-only table" in capsys.readouterr().err
 
 
@@ -1767,10 +1828,12 @@ def test_a_partly_assembled_cohort_says_how_many_samples_had_no_arm(monkeypatch,
     args = _namespace(tmp_path, denovo_alignment_idx=4)
 
     assert ftc._handle_feature_table_build(args, parser=None) == 0
-    assert "1 of 2 prep_sample(s) have no contigs" in capsys.readouterr().err
+    assert "1 of 2 prep_sample(s) have no de novo arm" in capsys.readouterr().err
     denovo = json.loads((tmp_path / "table.manifest.json").read_text())["table"]["denovo"]
     assert denovo["applied"] is True
-    assert denovo["processing_idx"] == 11
+    # The de novo alignment by its own minted handle, never by an internal id.
+    assert [part["export_processing_id"] for part in denovo["parts"]] == ["QP8"]
+    assert denovo["sample_part"] == {"QM1": "QP8"}
     assert denovo["prep_samples_with_a_de_novo_arm"] == 1
 
 
@@ -1782,3 +1845,397 @@ def test_a_reference_only_build_records_no_denovo_block(monkeypatch, tmp_path):
 
     assert ftc._handle_feature_table_build(args, parser=None) == 0
     assert "denovo" not in json.loads((tmp_path / "table.manifest.json").read_text())["table"]
+
+
+# ---------------------------------------------------------------------------
+# A cohort across pools and a similarity group: one part per resolved alignment.
+#
+# Pool (4, 5) carries alignment 3 at mask 2; pool (6, 8) carries alignment 13 at
+# mask 12, in alignment 3's group. Sample 1 resolves to 3 and sample 2 to 13, so the
+# build reads each from its own alignment and unions the two before the analytic.
+# The fixture's G200 is the discriminator: 0.6% in each sample, so it clears the 1%
+# threshold only when coverage is pooled over BOTH parts.
+# ---------------------------------------------------------------------------
+
+_PARAMS_B = {**_PARAMS, "mask_idx": 12}
+_DENOVO_PARAMS_B = {**_DENOVO_PARAMS, "mask_idx": 12, "processing_idx": 21}
+_POOL_A, _POOL_B = (4, 5), (6, 8)
+
+
+def _listed(alignment_idx: int, params: dict) -> dict:
+    return {
+        "alignment_idx": alignment_idx,
+        "params": params,
+        "params_hash": canonical_params_hash(params).hex(),
+        "samples_completed": 1,
+        "samples_total": 1,
+    }
+
+
+_TWO_POOL_RESOLVE = {
+    "members": {("alignment", 3): {2: 13}},
+    "groups": {("alignment", 3): [3, 13]},
+}
+
+
+def _patched_two_pools(monkeypatch, *, resolve=None, listings=None, denovo_map=None):
+    """`_patched` over the two pools above, with an alignment ticket per alignment and
+    the de novo seams keyed by `(prep_sample_idx, processing_idx)`. Records each
+    alignment ticket's cohort in `tickets`, the cohort reads in `cohort_reads`, and the
+    de novo maps fetched in `denovo_maps`."""
+    rec = _patched(
+        monkeypatch,
+        feature_handles={100: "GCF_100", 200: "GCF_200", 900: "qiita-900", 901: "qiita-901"},
+        resolve=_TWO_POOL_RESOLVE if resolve is None else resolve,
+    )
+    listings = (
+        {
+            _POOL_A: {"alignments": [_listed(3, _PARAMS), _listed(4, _DENOVO_PARAMS)]},
+            _POOL_B: {"alignments": [_listed(13, _PARAMS_B), _listed(14, _DENOVO_PARAMS_B)]},
+        }
+        if listings is None
+        else listings
+    )
+    monkeypatch.setattr(
+        ftc,
+        "_fetch_pool_alignments",
+        lambda b, t, *, sequencing_run_idx, sequenced_pool_idx: listings[
+            (sequencing_run_idx, sequenced_pool_idx)
+        ],
+    )
+    completed = {(_POOL_A, 3): [1], (_POOL_B, 13): [2]}
+    rec["cohort_reads"] = []
+
+    def _cohort(b, t, *, sequencing_run_idx, sequenced_pool_idx, alignment_idx):
+        pool = (sequencing_run_idx, sequenced_pool_idx)
+        rec["cohort_reads"].append((pool, alignment_idx))
+        return {"prep_sample_idx": completed.get((pool, alignment_idx), [])}
+
+    monkeypatch.setattr(ftc, "_fetch_alignment_cohort", _cohort)
+
+    rec["tickets"] = {}
+    columns_of: dict[int, list[str]] = {}
+
+    def _ticket(b, t, *, alignment_idx, prep_sample_idx, columns):
+        rec["tickets"][alignment_idx] = list(prep_sample_idx)
+        columns_of[alignment_idx] = list(columns)
+        return f"alignment-{alignment_idx}".encode()
+
+    monkeypatch.setattr(ftc, "_create_alignment_doget_ticket", _ticket)
+
+    the_map = (
+        {(1, 11): _DENOVO_MAP[1], (2, 21): _DENOVO_MAP[2]} if denovo_map is None else denovo_map
+    )
+    rec["denovo_maps"] = []
+
+    def _assembly_map(base_url, token, *, prep_sample_idx, processing_idx):
+        rec["denovo_maps"].append((prep_sample_idx, processing_idx))
+        if (prep_sample_idx, processing_idx) not in the_map:
+            raise httpx.HTTPStatusError(
+                "no contigs",
+                request=httpx.Request("GET", "http://cp"),
+                response=httpx.Response(404),
+            )
+        return genome_map_table(the_map[(prep_sample_idx, processing_idx)])
+
+    monkeypatch.setattr(ftc, "_fetch_assembly_genome_map", _assembly_map)
+    rec["denovo_lengths"] = []
+
+    def _assembly_ticket(base_url, token, *, prep_sample_idx, processing_idx, table):
+        rec["denovo_lengths"].append((prep_sample_idx, processing_idx))
+        return _DENOVO_LENGTHS_TICKET
+
+    monkeypatch.setattr(ftc, "_create_assembly_run_doget_ticket", _assembly_ticket)
+
+    def _slice(alignment_idx, rows):
+        return lambda: _alignment_reader(
+            columns_of[alignment_idx],
+            [r for r in rows if r[0] in rec["tickets"][alignment_idx]],
+        )
+
+    readers = {
+        b"alignment-3": _slice(3, _ALIGNMENT),
+        b"alignment-13": _slice(13, _ALIGNMENT),
+        b"alignment-4": _slice(4, _DENOVO_ALIGNMENT),
+        b"alignment-14": _slice(14, _DENOVO_ALIGNMENT),
+        _LENGTHS_TICKET: _lengths_reader,
+        _DENOVO_LENGTHS_TICKET: lambda: _lengths_reader_rows(_DENOVO_LENGTHS),
+    }
+    monkeypatch.setattr("pyarrow.flight.FlightClient", lambda url: _FakeFlightClient(url, readers))
+    return rec
+
+
+def _two_pool_args(tmp_path, **overrides) -> argparse.Namespace:
+    return _namespace(
+        tmp_path,
+        sequencing_run_idx=[_POOL_A[0], _POOL_B[0]],
+        sequenced_pool_idx=[_POOL_A[1], _POOL_B[1]],
+        **overrides,
+    )
+
+
+def test_a_cohort_across_pools_is_read_per_part_and_pooled_once(monkeypatch, tmp_path):
+    """Each sample is read from the alignment it resolved to, and the two parts are one
+    cohort to the analytic: G200 (0.6% per sample) survives the 1% threshold only
+    because coverage is pooled over both parts."""
+    rec = _patched_two_pools(monkeypatch)
+    args = _two_pool_args(tmp_path, prep_sample_idx=[1, 2])
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    assert rec["tickets"] == {3: [1], 13: [2]}
+    assert _table_rows(args.output) == [
+        ("QM1", "GCF_100", 1.0),
+        ("QM1", "GCF_200", 1.0),
+        ("QM2", "GCF_200", 1.0),
+    ]
+    # Resolved against the alignment named, over the whole cohort.
+    assert ("alignment", 3, [1, 2]) in rec["resolve_calls"]
+    # Each part's processing handle is minted with that part's own samples.
+    assert rec["processing_minted"] == {3: [1], 13: [2]}
+    assert all(client.closed for client in _FakeFlightClient.instances)
+
+
+def test_an_omitted_cohort_spans_every_alignment_of_the_group_in_every_pool(monkeypatch, tmp_path):
+    """Without --prep-sample-idx the cohort is the named pools' samples completed for
+    any member of the anchor's group: the anchor's own first (to learn the group), then
+    each other member listed over a pool."""
+    rec = _patched_two_pools(monkeypatch)
+    args = _two_pool_args(tmp_path)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    assert rec["cohort_reads"] == [(_POOL_A, 3), (_POOL_B, 13)]
+    assert rec["tickets"] == {3: [1], 13: [2]}
+
+
+def test_a_single_pool_build_is_one_part(monkeypatch, tmp_path):
+    """No pair decisions: the group is the alignment alone, so the build is the one it
+    was before parts existed — one cohort read, one ticket, one processing handle."""
+    rec = _patched(monkeypatch)
+    args = _namespace(tmp_path)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    assert rec["ticket_cohort"] == [1, 2]
+    assert rec["processing_minted"] == {3: [1, 2]}
+    assert [call[:2] for call in rec["resolve_calls"]] == [("alignment", 3), ("alignment", 3)]
+    assert len([t for t in _FakeFlightClient.instances[0].tickets if t == _ALIGNMENT_TICKET]) == 1
+
+
+def test_the_manifest_has_a_handle_per_part_and_maps_each_sample_to_its_part(monkeypatch, tmp_path):
+    _patched_two_pools(monkeypatch)
+    args = _two_pool_args(tmp_path, prep_sample_idx=[1, 2])
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    processing = _manifest(tmp_path)["processing"]
+    assert processing["parts"] == [
+        {
+            "export_processing_id": "QP7",
+            "params_hash": canonical_params_hash(_PARAMS).hex(),
+            "aligner": "minimap2",
+        },
+        {
+            "export_processing_id": "QP17",
+            "params_hash": canonical_params_hash(_PARAMS_B).hex(),
+            "aligner": "minimap2",
+        },
+    ]
+    assert processing["sample_part"] == {"QM1": "QP7", "QM2": "QP17"}
+    assert processing["reference"]["name"] == "gg2"
+
+
+@pytest.mark.parametrize(
+    ("entry", "expected"),
+    [
+        (
+            {
+                "state": "incomplete",
+                "reason": "in_progress",
+                "definition_idx": 13,
+                "work_ticket_idx": 55,
+            },
+            "prep_sample 2: incomplete (in_progress), alignment 13, work_ticket 55",
+        ),
+        (
+            {"state": "not_processed", "reason": "no_run"},
+            "prep_sample 2: not_processed (no_run)",
+        ),
+        (
+            {
+                "state": "incomplete",
+                "reason": "upstream_moved",
+                "definition_idx": 3,
+                "upstream_kind": "mask",
+                "upstream_definition_idx": 12,
+            },
+            "prep_sample 2: incomplete (upstream_moved), alignment 3, upstream mask 12",
+        ),
+    ],
+    ids=["incomplete", "not-processed", "upstream-moved"],
+)
+def test_a_sample_not_processed_in_the_group_stops_the_build(
+    monkeypatch, tmp_path, capsys, entry, expected
+):
+    """Feature tables refuse such samples rather than narrowing the cohort, and say
+    which and why, before anything streams or is minted."""
+    rec = _patched_two_pools(
+        monkeypatch,
+        resolve={**_TWO_POOL_RESOLVE, "unprocessed": {("alignment", 3): {2: entry}}},
+    )
+    args = _two_pool_args(tmp_path, prep_sample_idx=[1, 2])
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 1
+    err = capsys.readouterr().err
+    assert "1 prep_sample(s) of the cohort are not processed in the group of alignment 3" in err
+    assert expected in err
+    assert "--prep-sample-idx" in err
+    assert not _FakeFlightClient.instances
+    assert "minted_cohort" not in rec and "processing_cohort" not in rec
+    assert not list(tmp_path.iterdir())
+
+
+def test_a_part_over_no_named_pool_is_refused_with_the_flags_to_add(monkeypatch, tmp_path, capsys):
+    """The part's params come from a pool listing; an alignment over none of the named
+    pools cannot be checked, so the build says which pool flags are missing."""
+    _patched_two_pools(monkeypatch)
+    args = _namespace(tmp_path, prep_sample_idx=[1, 2])  # pool (4, 5) only
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 1
+    err = capsys.readouterr().err
+    assert "resolve to alignment 13, which is not over any pool named" in err
+    assert not _FakeFlightClient.instances
+
+
+def test_a_part_against_another_reference_is_refused(monkeypatch, tmp_path, capsys):
+    other = {**_PARAMS_B, "reference_idx": 10}
+    _patched_two_pools(
+        monkeypatch,
+        listings={
+            _POOL_A: {"alignments": [_listed(3, _PARAMS)]},
+            _POOL_B: {"alignments": [_listed(13, other)]},
+        },
+    )
+    args = _two_pool_args(tmp_path, prep_sample_idx=[1, 2])
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 1
+    assert "ran against reference 10" in capsys.readouterr().err
+    assert not _FakeFlightClient.instances
+
+
+def test_unpaired_pool_flags_are_refused(monkeypatch, tmp_path, capsys):
+    _patched(monkeypatch)
+    args = _namespace(tmp_path, sequencing_run_idx=[4, 6], sequenced_pool_idx=[5])
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 1
+    assert "paired in the order given" in capsys.readouterr().err
+
+
+def test_parser_pairs_repeated_pool_flags():
+    from qiita_control_plane.cli.user._parser import _build_parser
+
+    args = _build_parser().parse_args(
+        _build_argv(sequencing_run_idx=["4", "6"], sequenced_pool_idx=["5", "8"])
+    )
+    assert ftc._pools(args) == [(4, 5), (6, 8)]
+    single = _build_parser().parse_args(_build_argv())
+    assert ftc._pools(single) == [(4, 5)]
+
+
+# The de novo arm across parts: sample 1's de novo alignment is 4 (mask 2, assembly
+# run 11) and sample 2's is 14 (mask 12, assembly run 21), each read with its own run.
+_TWO_POOL_DENOVO_RESOLVE = {
+    "members": {("alignment", 3): {2: 13}, ("alignment", 4): {2: 14}},
+    "groups": {("alignment", 3): [3, 13], ("alignment", 4): [4, 14]},
+}
+
+
+def test_a_combined_build_across_parts_reads_each_sample_from_its_own_arm(monkeypatch, tmp_path):
+    rec = _patched_two_pools(monkeypatch, resolve=_TWO_POOL_DENOVO_RESOLVE)
+    args = _two_pool_args(tmp_path, prep_sample_idx=[1, 2], denovo_alignment_idx=4)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    assert rec["denovo_maps"] == [(1, 11), (2, 21)]
+    assert rec["denovo_lengths"] == [(1, 11), (2, 21)]
+    assert rec["tickets"] == {3: [1], 13: [2], 4: [1], 14: [2]}
+    rows = _table_rows(args.output)
+    assert ("QM1", "qiita-900", 1.0) in rows
+    assert ("QM2", "qiita-901", 1.0) in rows
+    denovo = _manifest(tmp_path)["table"]["denovo"]
+    assert [p["export_processing_id"] for p in denovo["parts"]] == ["QP8", "QP18"]
+    assert denovo["sample_part"] == {"QM1": "QP8", "QM2": "QP18"}
+    assert denovo["applied"] is True
+
+
+@pytest.mark.parametrize(("mask_group", "accepted"), [([2, 12], True), ([12], False)])
+def test_a_de_novo_arm_on_a_similar_mask_is_accepted_only_within_the_mask_group(
+    monkeypatch, tmp_path, capsys, mask_group, accepted
+):
+    """Sample 2's reference part is at mask 12 and its de novo alignment (4) at mask 2.
+    The pairing is admissible exactly when mask 2 is in mask 12's group, which the build
+    reads with a resolve of kind mask."""
+    rec = _patched_two_pools(
+        monkeypatch,
+        resolve={
+            "members": {("alignment", 3): {2: 13}},
+            "groups": {("alignment", 3): [3, 13], ("mask", 12): mask_group, ("mask", 2): [2, 12]},
+        },
+        denovo_map={(1, 11): _DENOVO_MAP[1], (2, 11): _DENOVO_MAP[2]},
+    )
+    args = _two_pool_args(tmp_path, prep_sample_idx=[1, 2], denovo_alignment_idx=4)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == (0 if accepted else 1)
+    assert ("mask", 12, [1, 2]) in rec["resolve_calls"]
+    if accepted:
+        assert rec["tickets"][4] == [1, 2]
+    else:
+        assert "not in the mask group" in capsys.readouterr().err
+        assert not _FakeFlightClient.instances
+
+
+def test_an_incomplete_de_novo_sample_stops_the_build(monkeypatch, tmp_path, capsys):
+    """An unfinished de novo run is refused like an unfinished reference one; only a
+    sample with no de novo run at all is reference-only."""
+    _patched_two_pools(
+        monkeypatch,
+        resolve={
+            **_TWO_POOL_DENOVO_RESOLVE,
+            "unprocessed": {
+                ("alignment", 4): {
+                    2: {"state": "incomplete", "reason": "failed", "definition_idx": 14}
+                }
+            },
+        },
+    )
+    args = _two_pool_args(tmp_path, prep_sample_idx=[1, 2], denovo_alignment_idx=4)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 1
+    err = capsys.readouterr().err
+    assert "not processed in the group of de novo alignment 4" in err
+    assert "prep_sample 2: incomplete (failed), alignment 14" in err
+
+
+def test_a_sample_with_no_de_novo_run_is_reference_only(monkeypatch, tmp_path, capsys):
+    rec = _patched_two_pools(
+        monkeypatch,
+        resolve={
+            **_TWO_POOL_DENOVO_RESOLVE,
+            "unprocessed": {("alignment", 4): {2: {"state": "not_processed", "reason": "no_run"}}},
+        },
+    )
+    args = _two_pool_args(tmp_path, prep_sample_idx=[1, 2], denovo_alignment_idx=4)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    assert rec["denovo_maps"] == [(1, 11)]
+    assert rec["tickets"][4] == [1] and 14 not in rec["tickets"]
+    assert "1 of 2 prep_sample(s) have no de novo arm" in capsys.readouterr().err
+
+
+def test_no_internal_identifier_appears_in_a_multi_part_combined_manifest(monkeypatch, tmp_path):
+    _patched_two_pools(monkeypatch, resolve=_TWO_POOL_DENOVO_RESOLVE)
+    args = _two_pool_args(tmp_path, prep_sample_idx=[1, 2], denovo_alignment_idx=4)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    keys: set[str] = set()
+    strings: set[str] = set()
+    _walk(_manifest(tmp_path), keys=keys, strings=strings)
+    assert not [key for key in keys if "idx" in key]
+    assert not [value for value in strings if "idx" in value]
+    assert "params" not in keys and "mask" not in json.dumps(_manifest(tmp_path))

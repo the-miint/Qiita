@@ -17,9 +17,10 @@ from __future__ import annotations
 import argparse
 import base64
 import contextlib
+import dataclasses
 import json
 import sys
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from importlib import metadata
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple
@@ -31,6 +32,8 @@ from qiita_common.api_paths import (
     PATH_ASSEMBLY_GENOME_MAP_PARQUET,
     PATH_ASSEMBLY_PREFIX,
     PATH_ASSEMBLY_RUN_DOGET,
+    PATH_DEFINITION_GROUP_PREFIX,
+    PATH_DEFINITION_GROUP_RESOLVE,
     PATH_EXPORTED_FEATURE_PREFIX,
     PATH_EXPORTED_FEATURE_ROOT,
     PATH_EXPORTED_IDENTIFIER_PREFIX,
@@ -49,9 +52,15 @@ from qiita_common.assembly_constants import ASSEMBLED_SEQUENCE_TABLE
 from qiita_common.duckdb_relation import registered
 from qiita_common.models import (
     MAX_EXPORTED_FEATURE_ENTITIES,
+    DefinitionGroupResolveRequest,
+    DefinitionGroupResolveResponse,
+    DefinitionKind,
     ExportedFeatureRequest,
     ExportedIdentifierRequest,
     ExportedProcessingRequest,
+    SampleResolution,
+    SampleResolutionReason,
+    SampleResolutionState,
 )
 from qiita_common.parquet import PARQUET_MEDIA_TYPE
 from qiita_common.taxonomy import TAXONOMY_SOURCE_TABLE
@@ -166,6 +175,27 @@ def _refuse_deprecated_denovo_run(base_url: str, token: str, *, processing_idx: 
     )
     if message is not None:
         raise ValueError(message)
+
+
+def _resolve_definition_group(
+    base_url: str,
+    token: str,
+    *,
+    kind: DefinitionKind,
+    definition_idx: int,
+    prep_sample_idx: list[int],
+) -> DefinitionGroupResolveResponse:
+    """POST /definition-group/resolve: the named definition's group and, per prep_sample,
+    which member it is processed under or why it is not. The body goes through the
+    route's request model, so the cohort cap is checked here rather than after a round
+    trip, and the answer through its response model."""
+    body = DefinitionGroupResolveRequest(
+        definition_kind=kind, definition_idx=definition_idx, prep_sample_idx=prep_sample_idx
+    ).model_dump(mode="json")
+    path = f"{PATH_DEFINITION_GROUP_PREFIX}{PATH_DEFINITION_GROUP_RESOLVE}"
+    return DefinitionGroupResolveResponse.model_validate(
+        _common.call("POST", base_url, token, path, json=body)
+    )
 
 
 def _fetch_map_parquet(base_url: str, token: str, path: str) -> pa.Table:
@@ -547,6 +577,43 @@ def staged_stream(con, flight_client, ticket: bytes, *, relation: str) -> Iterat
         yield relation
 
 
+@contextlib.contextmanager
+def staged_streams(con, flight_client, tickets: Sequence[bytes], *, relation: str) -> Iterator[str]:
+    """`staged_stream` over several DoGet tickets of one surface, registered as ONE
+    relation that yields every stream's batches in ticket order.
+
+    This is where a multi-part build's parts are unioned: before anything is staged, so
+    the gate's diagnostics, precedence and the coverage filter each run once over the
+    whole cohort, through the same builders a single-part build uses. Each stream is
+    opened only when the one before it is drained, so one gRPC stream is open at a time.
+    A stream whose schema differs from the first is refused rather than cast.
+    """
+    if len(tickets) == 1:
+        with staged_stream(con, flight_client, tickets[0], relation=relation) as source:
+            yield source
+        return
+    if not tickets:
+        raise ValueError(f"no DoGet ticket to stage {relation} from")
+    import pyarrow as pa  # noqa: PLC0415
+    import pyarrow.flight as flight  # noqa: PLC0415
+
+    first = flight_client.do_get(flight.Ticket(tickets[0])).to_reader()
+
+    def batches():
+        yield from first
+        for position, ticket in enumerate(tickets[1:], start=2):
+            reader = flight_client.do_get(flight.Ticket(ticket)).to_reader()
+            if not reader.schema.equals(first.schema):
+                raise ValueError(
+                    f"{relation}: stream {position} of {len(tickets)} has schema "
+                    f"{reader.schema} where the first has {first.schema}"
+                )
+            yield from reader
+
+    with registered(con, relation, pa.RecordBatchReader.from_batches(first.schema, batches())):
+        yield relation
+
+
 def _stage_from_stream(con, flight_client, ticket: bytes, *, relation: str, table_sql) -> None:
     """Drain a Flight DoGet into the relation `table_sql` builds from it.
 
@@ -600,16 +667,18 @@ def _cleared(con, diagnostics_sql: str, check, *args):
     return check(*args, **dict(zip(names, cursor.fetchone(), strict=True)))
 
 
-def _stage_alignment(con, flight_client, ticket: bytes, *, gate: ft.AlignmentGate | None) -> None:
-    """Stream the alignment slice into `ALIGNMENT_TABLE`, applying `gate` if there is
-    one. Everything downstream reads that one relation either way, so a gate cannot be
-    half-applied.
+def _stage_alignment(
+    con, flight_client, tickets: Sequence[bytes], *, gate: ft.AlignmentGate | None
+) -> None:
+    """Stream the alignment slice — one ticket per part, unioned by `staged_streams` —
+    into `ALIGNMENT_TABLE`, applying `gate` if there is one. Everything downstream reads
+    that one relation either way, so a gate cannot be half-applied.
 
     The gated path materializes the UNGATED slice first: the checks have to see the rows
     the gate would drop, and a Flight stream cannot be scanned twice. The diagnostics
     therefore run after the stream is released, off the materialized copy.
     """
-    with staged_stream(con, flight_client, ticket, relation=_ALIGNMENT_STREAM) as source:
+    with staged_streams(con, flight_client, tickets, relation=_ALIGNMENT_STREAM) as source:
         con.execute(
             ft.alignment_table_sql(source)
             if gate is None
@@ -781,28 +850,56 @@ def _manifest_gate(gate: ft.AlignmentGate | None) -> dict[str, Any] | None:
     }
 
 
-def _manifest_denovo(
-    *, requested: int | None, applied_processing_idx: int | None, cohort: list[int]
-) -> dict[str, Any] | None:
+def _manifest_parts(
+    parts: Sequence[_Part], handles: dict[int, str], identifiers: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """One arm's processing record: `parts`, one entry per part (its minted handle, its
+    verified `params_hash` and its aligner), and `sample_part`, each prep_sample's `export_id`
+    mapped to the handle of the part it was read from.
+
+    Parts are in `alignment_idx` order, so two builds over the same inputs write the
+    same bytes; the order is all of that id the manifest keeps. `sample_part` is sorted
+    by `export_id` for the same reason.
+    """
+    export_id_of = {entry["prep_sample_idx"]: entry["export_id"] for entry in identifiers}
+    return {
+        "parts": [
+            {
+                "export_processing_id": handles[part.alignment_idx],
+                "params_hash": part.summary["params_hash"],
+                "aligner": part.summary.get("params", {}).get("aligner"),
+            }
+            for part in parts
+        ],
+        "sample_part": dict(
+            sorted(
+                (export_id_of[sample], handles[part.alignment_idx])
+                for part in parts
+                for sample in part.samples
+            )
+        ),
+    }
+
+
+def _manifest_denovo(*, requested: bool, record: dict[str, Any] | None) -> dict[str, Any] | None:
     """The de novo arm's record, or None when the build never asked for one.
 
-    **`applied` is separate from `requested` because the two come apart**, and the
-    manifest is what makes that legible: a caller can name an alignment whose whole
-    cohort assembled nothing, and the build then degrades to reference-only. Without
-    this block a combined request and a reference-only request write byte-identical
-    manifests, which is the one thing this file exists not to do.
+    **`applied` is separate from the ask because the two come apart**: a caller can name
+    a de novo alignment none of whose cohort has an arm, and the build then degrades to
+    reference-only. Without this block a combined request and a reference-only request
+    write byte-identical manifests.
 
-    The internal cohort is deliberately absent — the identifier map beside the table
-    is the artifact that carries prep_sample_idx, and this file is meant to be
-    publishable. The COUNT is what a reader needs.
+    `record` is `_manifest_parts` over the de novo parts, or None when no prep_sample had an
+    arm. Its `sample_part` names only the prep_samples with an arm, so their count is
+    `prep_samples_with_a_de_novo_arm`.
     """
-    if requested is None:
+    if not requested:
         return None
+    record = record or {"parts": [], "sample_part": {}}
     return {
-        "requested_alignment_idx": requested,
-        "applied": applied_processing_idx is not None,
-        "processing_idx": applied_processing_idx,
-        "prep_samples_with_a_de_novo_arm": len(cohort),
+        "applied": bool(record["parts"]),
+        **record,
+        "prep_samples_with_a_de_novo_arm": len(record["sample_part"]),
     }
 
 
@@ -810,9 +907,8 @@ def _manifest_payload(
     *,
     args: argparse.Namespace,
     gate: ft.AlignmentGate | None,
-    summary: dict[str, Any],
     reference: dict[str, Any],
-    export_processing_id: str,
+    processing: dict[str, Any],
     identifiers: list[dict[str, Any]],
     rows: int,
     files: list[Path],
@@ -822,12 +918,15 @@ def _manifest_payload(
     """The bundle's record of what produced the table — the one artifact here that is
     always written, because without it the table is not reproducible.
 
-    **Every identifier in it is public.** The processing is its minted handle and its
-    content-derived `params_hash`, never `alignment_idx`; the reference is its name and
-    version, never `reference_idx`; the cohort is `export_id`s, never `prep_sample_idx`.
-    `params` is not copied verbatim for exactly that reason — the blob carries
-    `reference_idx`, `mask_idx` and `shard_ids` — so `aligner` is lifted out of it and the
-    rest is represented by the digest, which is what identifies the config anyway.
+    **Every identifier in it is public.** Each part's processing is its minted handle
+    and its content-derived `params_hash`, never `alignment_idx`; the reference is its
+    name and version, never `reference_idx`; the cohort is `export_id`s, never
+    `prep_sample_idx`. `params` is not copied verbatim for exactly that reason — the blob
+    carries `reference_idx`, `mask_idx` and `shard_ids` — so `aligner` is lifted out of it
+    and the rest is represented by the digest, which is what identifies the config anyway.
+    `processing` is `_manifest_parts` over the reference arm's parts: one part per
+    alignment that the cohort's prep_samples resolved to, and the map from each
+    prep_sample to its part.
 
     `files` are basenames: the bundle's members relative to wherever it lands, since an
     absolute path describes the machine that built it.
@@ -844,14 +943,12 @@ def _manifest_payload(
     return {
         "note": MANIFEST_NOTE,
         "processing": {
-            "export_processing_id": export_processing_id,
-            "params_hash": summary["params_hash"],
-            "aligner": summary.get("params", {}).get("aligner"),
             "reference": {
                 "name": reference["name"],
                 "version": reference["version"],
                 "kind": reference["kind"],
             },
+            **processing,
         },
         "table": {
             "format": args.format,
@@ -1114,45 +1211,285 @@ def _gate_from_args(args: argparse.Namespace) -> ft.AlignmentGate | None:
     )
 
 
-def _resolve_cohort(base_url: str, token: str, args: argparse.Namespace) -> list[int]:
-    """The cohort to build over: the samples named on the command line, or the pool's
-    own mintable set for this alignment.
+@dataclasses.dataclass(frozen=True)
+class _Part:
+    """One part of a build: an alignment that some of the cohort's prep_samples resolved
+    to, its verified summary, and those prep_samples, ascending. A build over
+    prep_samples that all resolve to one alignment has one part."""
 
-    An empty resolved cohort is refused here. It is a legitimate answer from that route
-    — "nothing here you may mint" — but it is not a table: both mints reject an empty
-    cohort, so left alone this becomes a 422 naming a request body the user never wrote.
+    alignment_idx: int
+    summary: dict[str, Any]
+    samples: tuple[int, ...]
+
+
+@dataclasses.dataclass(frozen=True)
+class _DenovoPart(_Part):
+    """A de novo arm's part: a de novo alignment, and the assembly run its params name
+    (`denovo_alignment_processing_idx`), which every per-sample de novo read uses."""
+
+    processing_idx: int
+
+
+def _pools(args: argparse.Namespace) -> list[tuple[int, int]]:
+    """The `(sequencing_run_idx, sequenced_pool_idx)` pairs the flags name, the Nth
+    `--sequencing-run-idx` with the Nth `--sequenced-pool-idx`. Refuses unequal counts
+    and a pair named twice."""
+    runs, pools = list(args.sequencing_run_idx), list(args.sequenced_pool_idx)
+    if len(runs) != len(pools):
+        raise ValueError(
+            f"{len(runs)} --sequencing-run-idx and {len(pools)} --sequenced-pool-idx were "
+            f"given; each pool is named by one of each, paired in the order given."
+        )
+    pairs = list(zip(runs, pools, strict=True))
+    repeated = sorted({pair for pair in pairs if pairs.count(pair) > 1})
+    if repeated:
+        raise ValueError(f"sequencing run / sequenced pool named more than once: {repeated}")
+    return pairs
+
+
+def _pool_listings(
+    base_url: str, token: str, pools: list[tuple[int, int]]
+) -> tuple[dict[str, Any], dict[tuple[int, int], set[int]]]:
+    """The alignments over every named pool, merged into one listing shaped like a
+    single pool's (each alignment once, ascending) for `_alignment_summary`, and the set
+    of alignment_idxs listed per pool for the cohort reads."""
+    merged: dict[int, dict[str, Any]] = {}
+    per_pool: dict[tuple[int, int], set[int]] = {}
+    for run_idx, pool_idx in pools:
+        body = _fetch_pool_alignments(
+            base_url, token, sequencing_run_idx=run_idx, sequenced_pool_idx=pool_idx
+        )
+        listed = body.get("alignments", [])
+        per_pool[(run_idx, pool_idx)] = {summary["alignment_idx"] for summary in listed}
+        for summary in listed:
+            merged.setdefault(summary["alignment_idx"], summary)
+    return {"alignments": [merged[idx] for idx in sorted(merged)]}, per_pool
+
+
+def _member_summary(listing: dict[str, Any], alignment_idx: int, *, samples: int) -> dict:
+    """`_alignment_summary` for an alignment that the resolver named, not the caller,
+    refusing with the flags to add when it is over none of the named pools."""
+    if all(summary["alignment_idx"] != alignment_idx for summary in listing["alignments"]):
+        raise ValueError(
+            f"{samples} prep_sample(s) of the cohort resolve to alignment {alignment_idx},"
+            f" which is not over any pool named, so its params cannot be read and checked."
+            f" Add the pool that those prep_samples are on as another --sequencing-run-idx /"
+            f" --sequenced-pool-idx pair."
+        )
+    return _alignment_summary(listing, alignment_idx=alignment_idx)
+
+
+def _resolve_cohort(
+    base_url: str,
+    token: str,
+    args: argparse.Namespace,
+    *,
+    per_pool: dict[tuple[int, int], set[int]],
+) -> list[int]:
+    """The cohort to build over, ascending: the prep_samples named on the command line, or
+    else every prep_sample of the named pools that the caller may read and that is completed
+    for an alignment in `--alignment-idx`'s group.
+
+    The group comes from a resolve over the anchor's own completed prep_samples, so the
+    anchor must have at least one in the named pools. An empty cohort is refused here:
+    it is a legitimate answer from the cohort route, but it is not a table — both mints
+    reject an empty cohort, so left alone this becomes a 422 naming a request body the
+    user never wrote.
     """
     if args.prep_sample_idx is not None:
-        return list(args.prep_sample_idx)
-    body = _fetch_alignment_cohort(
-        base_url,
-        token,
-        sequencing_run_idx=args.sequencing_run_idx,
-        sequenced_pool_idx=args.sequenced_pool_idx,
-        alignment_idx=args.alignment_idx,
-    )
-    cohort = body["prep_sample_idx"]
+        return sorted(set(args.prep_sample_idx))
+
+    def completed(pool: tuple[int, int], alignment_idx: int) -> list[int]:
+        return _fetch_alignment_cohort(
+            base_url,
+            token,
+            sequencing_run_idx=pool[0],
+            sequenced_pool_idx=pool[1],
+            alignment_idx=alignment_idx,
+        )["prep_sample_idx"]
+
+    anchor = args.alignment_idx
+    cohort = {
+        sample
+        for pool, listed in per_pool.items()
+        if anchor in listed
+        for sample in completed(pool, anchor)
+    }
     if not cohort:
         raise ValueError(
-            f"no prep_sample of sequenced_pool {args.sequenced_pool_idx} is both readable "
-            f"by you and completed for alignment {args.alignment_idx}, so there is no "
-            f"cohort to build a table over. `qiita alignment list` shows each alignment's "
-            f"completed count."
+            f"no prep_sample of the named sequenced_pool(s) {sorted(p for _, p in per_pool)}"
+            f" is both readable by you and completed for alignment {anchor}, so there is no"
+            f" cohort to build a table over. `qiita alignment list` shows each alignment's"
+            f" completed count."
         )
-    return cohort
+    group = set(
+        _resolve_definition_group(
+            base_url,
+            token,
+            kind=DefinitionKind.ALIGNMENT,
+            definition_idx=anchor,
+            prep_sample_idx=sorted(cohort),
+        ).group
+    )
+    for pool, listed in per_pool.items():
+        for alignment_idx in sorted((listed & group) - {anchor}):
+            cohort.update(completed(pool, alignment_idx))
+    return sorted(cohort)
+
+
+def _refuse_unprocessed(refused: list[SampleResolution], *, anchor: str) -> None:
+    """Refuse a cohort with prep_samples that are not processed in `anchor`'s group, listing
+    each with its state. A feature table is built over processed prep_samples only, and the
+    cohort is not narrowed: coverage is measured over the whole cohort, so a narrowed
+    cohort is a different table."""
+    if not refused:
+        return
+    lines = "\n".join(f"  {entry.describe()}" for entry in refused)
+    raise ValueError(
+        f"{len(refused)} prep_sample(s) of the cohort are not processed in the group of"
+        f" {anchor}:\n{lines}\nA feature table is built only over processed prep_samples. Wait"
+        f" for or re-run these, or name the cohort to build over with --prep-sample-idx."
+    )
+
+
+def _parts(
+    resolution: DefinitionGroupResolveResponse, *, listing: dict[str, Any], reference_idx: int
+) -> list[_Part]:
+    """The cohort's prep_samples grouped into parts by the alignment each resolved to, in
+    `alignment_idx` order. Refuses an incomplete or not-processed prep_sample
+    (`_refuse_unprocessed`), a part whose alignment is over none of the named pools
+    (`_member_summary`), and a part aligned against a different reference: the table is
+    relabeled through one reference's genome map."""
+    _refuse_unprocessed(
+        [e for e in resolution.samples if e.state is not SampleResolutionState.PROCESSED],
+        anchor=f"alignment {resolution.definition_idx}",
+    )
+    members: dict[int, list[int]] = {}
+    for entry in resolution.samples:
+        members.setdefault(entry.definition_idx, []).append(entry.prep_sample_idx)
+    parts = []
+    for alignment_idx, samples in sorted(members.items()):
+        summary = _member_summary(listing, alignment_idx, samples=len(samples))
+        part_reference = _alignment_reference_idx(summary)
+        if part_reference != reference_idx:
+            raise ValueError(
+                f"{len(samples)} prep_sample(s) resolve to alignment {alignment_idx}, which"
+                f" ran against reference {part_reference}; alignment"
+                f" {resolution.definition_idx} ran against reference {reference_idx}. A"
+                f" table is relabeled through one reference's genome map, so these cannot"
+                f" be built into one table."
+            )
+        parts.append(_Part(alignment_idx, summary, tuple(sorted(samples))))
+    return parts
+
+
+def _plan_denovo(
+    base_url: str,
+    token: str,
+    *,
+    args: argparse.Namespace,
+    listing: dict[str, Any],
+    anchor_summary: dict[str, Any],
+    parts: list[_Part],
+    cohort: list[int],
+) -> list[_DenovoPart]:
+    """The de novo arm's parts: each cohort prep_sample's de novo alignment, resolved in
+    `--denovo-alignment-idx`'s group, grouped by alignment in `alignment_idx` order.
+
+    A prep_sample with no run in that group (`not_processed` / `no_run`) has no de novo arm
+    and stays reference-only, as a prep_sample whose assembly produced no contigs does. Any
+    other unprocessed state is refused (`_refuse_unprocessed`).
+
+    Each de novo alignment is checked against the reference part of every prep_sample that
+    resolved to it, and the named one against `--alignment-idx`, by
+    `denovo_alignment_processing_idx` with the reference arm's mask group (from a resolve
+    of its mask) as the admissible masks. The assembly runs that those alignments name are
+    then checked for deprecation, before the refusal of unprocessed prep_samples, so a
+    deprecated run is named by the rule that owns its wording.
+    """
+    anchor = args.denovo_alignment_idx
+    summaries = {anchor: _alignment_summary(listing, alignment_idx=anchor)}
+    resolution = _resolve_definition_group(
+        base_url,
+        token,
+        kind=DefinitionKind.ALIGNMENT,
+        definition_idx=anchor,
+        prep_sample_idx=cohort,
+    )
+    resolved: dict[int, int] = {}
+    refused: list[SampleResolution] = []
+    for entry in resolution.samples:
+        if entry.state is SampleResolutionState.PROCESSED:
+            resolved[entry.prep_sample_idx] = entry.definition_idx
+        elif entry.reason is not SampleResolutionReason.NO_RUN:
+            refused.append(entry)
+
+    mask_groups: dict[int, frozenset[int]] = {}
+
+    def mask_group(reference_params: Any) -> frozenset[int] | None:
+        mask_idx = reference_params.get("mask_idx") if isinstance(reference_params, dict) else None
+        if not isinstance(mask_idx, int):
+            return None
+        if mask_idx not in mask_groups:
+            mask_groups[mask_idx] = frozenset(
+                _resolve_definition_group(
+                    base_url,
+                    token,
+                    kind=DefinitionKind.MASK,
+                    definition_idx=mask_idx,
+                    prep_sample_idx=cohort,
+                ).group
+            )
+        return mask_groups[mask_idx]
+
+    part_of = {sample: part for part in parts for sample in part.samples}
+    pairings = {(anchor, args.alignment_idx): anchor_summary}
+    for sample, denovo_idx in resolved.items():
+        pairings[(denovo_idx, part_of[sample].alignment_idx)] = part_of[sample].summary
+    processing_of: dict[int, int] = {}
+    for (denovo_idx, _), reference_summary in sorted(pairings.items()):
+        if denovo_idx not in summaries:
+            summaries[denovo_idx] = _member_summary(
+                listing,
+                denovo_idx,
+                samples=sum(1 for d in resolved.values() if d == denovo_idx),
+            )
+        processing_of[denovo_idx] = denovo_alignment_processing_idx(
+            denovo_alignment_idx=denovo_idx,
+            denovo_params=summaries[denovo_idx].get("params"),
+            reference_params=reference_summary.get("params"),
+            reference_mask_group=mask_group(reference_summary.get("params")),
+        )
+    for processing_idx in sorted(set(processing_of.values())):
+        _refuse_deprecated_denovo_run(base_url, token, processing_idx=processing_idx)
+    _refuse_unprocessed(refused, anchor=f"de novo alignment {anchor}")
+
+    members: dict[int, list[int]] = {}
+    for sample, denovo_idx in sorted(resolved.items()):
+        members.setdefault(denovo_idx, []).append(sample)
+    return [
+        _DenovoPart(idx, summaries[idx], tuple(samples), processing_of[idx])
+        for idx, samples in sorted(members.items())
+    ]
 
 
 def _run_build(
     args: argparse.Namespace, token: str, con, *, gate: ft.AlignmentGate | None
 ) -> tuple[list[Path], int]:
-    """The recipe, on an open connection: discover, stage, compute, relabel, write.
-    Returns the files written and the published table's row count.
+    """The recipe, on an open connection: discover, resolve, stage, compute, relabel,
+    write. Returns the files written and the published table's row count.
+
+    **Parts.** The cohort may span pools, and each prep_sample is resolved
+    (`/definition-group/resolve`) in `--alignment-idx`'s group; the prep_samples are read
+    per resolved alignment, one part each, and the parts' streams are unioned before
+    staging (`staged_streams`), so the analytic runs once over the whole cohort.
+    Identifiers and the manifest's processing handles are minted per part.
 
     Ordered so that everything cheap and refusable happens first: a wrong
-    `--alignment-idx`, an empty cohort, or an over-cap genome map each stop the run before
-    a byte of alignment data moves. The two refusals that need nothing but the flags — the
-    gate's own coherence and an occupied output — are made by the handler, before this is
-    called at all, so neither costs a connection.
+    `--alignment-idx`, an empty or unprocessed cohort, or an over-cap genome map each
+    stop the run before a byte of alignment data moves. The two refusals that need
+    nothing but the flags — the gate's own coherence and an occupied output — are made by
+    the handler, before this is called at all, so neither costs a connection.
 
     The Flight client lives only for the streams and the tickets that authorize them:
     each stream is drained by the one CREATE that materializes it, so nothing holds a gRPC
@@ -1161,104 +1498,118 @@ def _run_build(
     """
     import pyarrow.flight as flight  # noqa: PLC0415
 
-    # One verified summary, read several times: the reference the table is relabelled
-    # through, the digest the manifest cites, the aligner it names. Verifying it once and
-    # reading it is what keeps those three from being three separate acts of trust.
-    summary = _alignment_summary(
-        _fetch_pool_alignments(
-            args.base_url,
-            token,
-            sequencing_run_idx=args.sequencing_run_idx,
-            sequenced_pool_idx=args.sequenced_pool_idx,
-        ),
-        alignment_idx=args.alignment_idx,
-    )
-    reference_idx = _alignment_reference_idx(summary)
+    pools = _pools(args)
+    listing, per_pool = _pool_listings(args.base_url, token, pools)
+    # One verified summary per alignment, read several times: the reference the table is
+    # relabelled through, the digest the manifest cites, the aligner it names. Verifying
+    # it once and reading it is what keeps those three from being three separate acts of
+    # trust.
+    anchor_summary = _alignment_summary(listing, alignment_idx=args.alignment_idx)
+    reference_idx = _alignment_reference_idx(anchor_summary)
     # Read the reference BEFORE anything bulk, though only the manifest consumes it. It
     # is the cheapest thing here that can refuse — it 404s on a reference this alignment
     # names but the caller cannot read, which is exactly what every reference DoGet ticket
-    # below would then fail on. Fetching it last meant discovering that after a whole
-    # cohort had crossed the wire.
+    # below would then fail on.
     reference = _fetch_reference(args.base_url, token, reference_idx=reference_idx)
-    cohort = _resolve_cohort(args.base_url, token, args)
+    cohort = _resolve_cohort(args.base_url, token, args, per_pool=per_pool)
+    parts = _parts(
+        _resolve_definition_group(
+            args.base_url,
+            token,
+            kind=DefinitionKind.ALIGNMENT,
+            definition_idx=args.alignment_idx,
+            prep_sample_idx=cohort,
+        ),
+        listing=listing,
+        reference_idx=reference_idx,
+    )
 
-    # The de novo arm, resolved from the SAME verified pool listing the reference arm
-    # came from — one blob, so the two summaries cannot come from lookups that
-    # disagree. `denovo_alignment_processing_idx` is the shared rule the server-side
-    # resolver applies too; a swapped or mask-mismatched pair is refused here rather
-    # than after a cohort has crossed the wire.
-    denovo_processing_idx: int | None = None
-    denovo_summary: dict | None = None
-    if args.denovo_alignment_idx is not None:
-        denovo_summary = _alignment_summary(
-            _fetch_pool_alignments(
-                args.base_url,
-                token,
-                sequencing_run_idx=args.sequencing_run_idx,
-                sequenced_pool_idx=args.sequenced_pool_idx,
-            ),
-            alignment_idx=args.denovo_alignment_idx,
+    # The de novo arm, from the same merged listing that the reference arm came from,
+    # checked with `denovo_alignment_processing_idx`, passing the reference arm's mask
+    # group so that a de novo arm on any mask of that group is accepted.
+    requested_denovo = args.denovo_alignment_idx is not None
+    denovo_parts: list[_DenovoPart] = []
+    if requested_denovo:
+        denovo_parts = _plan_denovo(
+            args.base_url,
+            token,
+            args=args,
+            listing=listing,
+            anchor_summary=anchor_summary,
+            parts=parts,
+            cohort=cohort,
         )
-        denovo_processing_idx = denovo_alignment_processing_idx(
-            denovo_alignment_idx=args.denovo_alignment_idx,
-            denovo_params=denovo_summary.get("params"),
-            reference_params=summary.get("params"),
-        )
-        _refuse_deprecated_denovo_run(args.base_url, token, processing_idx=denovo_processing_idx)
 
     _stage_genome_map(con, _fetch_genome_map(args.base_url, token, reference_idx=reference_idx))
-    denovo_cohort: list[int] = []
-    if denovo_processing_idx is not None:
-        # One map per cohort sample, folded into one relation with the sample key
-        # re-attached. A sample that assembled nothing 404s, and that is the design's
-        # graceful path rather than an error: it simply has no de novo arm, so it is
-        # skipped here and stays reference-only downstream.
+    if requested_denovo:
+        # One map per prep_sample with a de novo alignment, folded into one relation with
+        # the prep_sample key re-attached. A prep_sample that assembled nothing 404s, and
+        # that is the design's graceful path rather than an error: it simply has no de
+        # novo arm, so it is skipped here and stays reference-only downstream.
         _stage_denovo_genome_map(
             con,
             {
                 prep_sample_idx: entries
-                for prep_sample_idx in cohort
+                for part in denovo_parts
+                for prep_sample_idx in part.samples
                 if (
                     entries := _assembly_genome_map_or_none(
                         args.base_url,
                         token,
                         prep_sample_idx=prep_sample_idx,
-                        processing_idx=denovo_processing_idx,
+                        processing_idx=part.processing_idx,
                     )
                 )
                 is not None
             },
         )
-        # **The de novo arm's cohort is the samples the MAP named, not the build's.**
-        # Every de novo surface is asked for exactly these: the run-scoped lengths
-        # 404 for a sample with no run, and the alignment mint refuses a cohort
-        # member with no `alignment_sample` row — which is precisely a sample that
-        # assembled nothing, since `align-denovo` ends NO_DATA for it and never
-        # opens a gate row. Passing the whole cohort would turn the design's
-        # graceful degradation into a 422 for the entire build.
-        denovo_cohort = _staged_denovo_samples(con)
-        if denovo_cohort and len(denovo_cohort) < len(cohort):
+        # **The de novo arm's cohort is the prep_samples the MAP named, not the build's.**
+        # Every de novo surface is asked for exactly these: the run-scoped lengths 404
+        # for a prep_sample with no run, and the alignment mint refuses a cohort member with
+        # no `alignment_sample` row — which is precisely a prep_sample that assembled
+        # nothing, since `align-denovo` ends NO_DATA for it and never opens a gate row.
+        staged = set(_staged_denovo_samples(con))
+        denovo_parts = [
+            narrowed
+            for part in denovo_parts
+            if (
+                narrowed := dataclasses.replace(
+                    part, samples=tuple(s for s in part.samples if s in staged)
+                )
+            ).samples
+        ]
+        if staged and len(staged) < len(cohort):
             print(
-                f"note: {len(cohort) - len(denovo_cohort)} of {len(cohort)} "
-                f"prep_sample(s) have no contigs from assembly run "
-                f"{denovo_processing_idx} and are reference-only in this table.",
+                f"note: {len(cohort) - len(staged)} of {len(cohort)} prep_sample(s) have no"
+                f" de novo arm (no de novo alignment in the group of"
+                f" {args.denovo_alignment_idx}, or no contigs) and are reference-only in"
+                f" this table.",
                 file=sys.stderr,
             )
-        if not denovo_cohort:
-            # Nothing in the cohort assembled: there is no second arm to reconcile
-            # against, so this is a reference-only build rather than an empty one.
-            # Left as a combined build it would sign an unscoped ticket, which the
-            # mint refuses, and bind against a de novo slice nothing staged.
+        if not staged:
+            # Nothing in the cohort has a second arm to reconcile against, so this is a
+            # reference-only build rather than an empty one. Left as a combined build it
+            # would sign an unscoped ticket, which the mint refuses, and bind against a
+            # de novo slice nothing staged.
             print(
-                "note: no prep_sample in this cohort has contigs from assembly run "
-                f"{denovo_processing_idx}, so --denovo-alignment-idx "
-                f"{args.denovo_alignment_idx} contributed nothing and this is a "
-                "reference-only table. The manifest records that it was requested.",
+                f"note: no prep_sample in this cohort has a de novo arm, so"
+                f" --denovo-alignment-idx {args.denovo_alignment_idx} contributed nothing"
+                f" and this is a reference-only table. The manifest records that it was"
+                f" requested.",
                 file=sys.stderr,
             )
-            denovo_processing_idx = None
-    identifiers = _mint_exported_identifiers(
-        args.base_url, token, alignment_idx=args.alignment_idx, prep_sample_idx=cohort
+    identifiers = sorted(
+        (
+            entry
+            for part in parts
+            for entry in _mint_exported_identifiers(
+                args.base_url,
+                token,
+                alignment_idx=part.alignment_idx,
+                prep_sample_idx=list(part.samples),
+            )
+        ),
+        key=lambda entry: entry["prep_sample_idx"],
     )
     _stage_exported_identifiers(con, identifiers)
 
@@ -1300,12 +1651,13 @@ def _run_build(
                 relation=_TAXONOMY_STREAM,
                 table_sql=ft.taxonomy_table_sql,
             )
-        if denovo_processing_idx is not None and filtering:
+        if denovo_parts and filtering:
             # N run-scoped streams, appended into one relation before the roll-up
             # reads it — the assembly read-back has no whole-cohort form. Only the
-            # samples the map named: a sample with no contigs has no run to read.
+            # prep_samples the map named: a prep_sample with no contigs has no run to read.
+            run_of = {s: part.processing_idx for part in denovo_parts for s in part.samples}
             con.execute(ft.denovo_contig_lengths_table_sql())
-            for prep_sample_idx in denovo_cohort:
+            for prep_sample_idx in sorted(run_of):
                 _stage_from_stream(
                     con,
                     flight_client,
@@ -1313,7 +1665,7 @@ def _run_build(
                         args.base_url,
                         token,
                         prep_sample_idx=prep_sample_idx,
-                        processing_idx=denovo_processing_idx,
+                        processing_idx=run_of[prep_sample_idx],
                         # One row per contig — hash and length, no bytes. The
                         # chunks table beside it is what carries sequence, and
                         # this recipe never reads it.
@@ -1323,34 +1675,39 @@ def _run_build(
                     table_sql=ft.denovo_contig_lengths_insert_sql,
                 )
             con.execute(ft.denovo_genome_lengths_insert_sql())
+        columns = ft.gate_alignment_columns(gate)
         _stage_alignment(
             con,
             flight_client,
-            _create_alignment_doget_ticket(
-                args.base_url,
-                token,
-                alignment_idx=args.alignment_idx,
-                prep_sample_idx=cohort,
-                columns=ft.gate_alignment_columns(gate),
-            ),
+            [
+                _create_alignment_doget_ticket(
+                    args.base_url,
+                    token,
+                    alignment_idx=part.alignment_idx,
+                    prep_sample_idx=list(part.samples),
+                    columns=columns,
+                )
+                for part in parts
+            ],
             gate=gate,
         )
-        if denovo_processing_idx is not None:
+        if denovo_parts:
             # The second arm and precedence over the first, in one sequence — see
             # `analytic.reconcile.denovo_alignment_statements`. The de novo slice takes
             # no gate: `--circular-gate` is refused alongside this flag, and the CIGAR
             # gate would judge it on a rule align_denovo already applied.
-            with staged_stream(
-                con,
-                flight_client,
+            denovo_tickets = [
                 _create_alignment_doget_ticket(
                     args.base_url,
                     token,
-                    alignment_idx=args.denovo_alignment_idx,
-                    prep_sample_idx=denovo_cohort,
+                    alignment_idx=part.alignment_idx,
+                    prep_sample_idx=list(part.samples),
                     columns=ft.ALIGNMENT_COLUMNS,
-                ),
-                relation=_DENOVO_ALIGNMENT_STREAM,
+                )
+                for part in denovo_parts
+            ]
+            with staged_streams(
+                con, flight_client, denovo_tickets, relation=_DENOVO_ALIGNMENT_STREAM
             ) as source:
                 for sql in ft.denovo_alignment_statements(source):
                     con.execute(sql)
@@ -1378,9 +1735,9 @@ def _run_build(
         con,
         scope=ft.CoverageScope(args.coverage_scope),
         coverage_threshold=args.coverage_threshold,
-        combined=denovo_processing_idx is not None,
+        combined=bool(denovo_parts),
     )
-    # The row labels are minted here rather than beside the sample labels above,
+    # The row labels are minted here rather than beside the prep_sample labels above,
     # because only now is the published genome set known — see `_published_genome_idxs`.
     _stage_exported_features(
         con,
@@ -1393,12 +1750,23 @@ def _run_build(
     if args.tree:
         clearances["tree"] = _shear_tree(con)
 
-    # LAST of the round trips, after everything that could refuse, because it is a WRITE:
-    # minting a public handle for a build that then fails would leave a permanent name for
-    # a bundle nobody has. The manifest's other input, the reference, is a read and is
-    # fetched up front instead — see there.
-    export_processing_id = _mint_exported_processing(
-        args.base_url, token, alignment_idx=args.alignment_idx, prep_sample_idx=cohort
+    # LAST of the round trips, after everything that could refuse, because they are
+    # WRITES: minting a public handle for a build that then fails would leave a permanent
+    # name for a bundle nobody has. One per part of each arm.
+    def handles(arm: Sequence[_Part]) -> dict[int, str]:
+        return {
+            part.alignment_idx: _mint_exported_processing(
+                args.base_url,
+                token,
+                alignment_idx=part.alignment_idx,
+                prep_sample_idx=list(part.samples),
+            )
+            for part in arm
+        }
+
+    processing = _manifest_parts(parts, handles(parts), identifiers)
+    denovo_record = (
+        _manifest_parts(denovo_parts, handles(denovo_parts), identifiers) if denovo_parts else None
     )
     tools = _tool_versions(con)
     written = _write_bundle(
@@ -1409,18 +1777,13 @@ def _run_build(
         manifest=lambda files: _manifest_payload(
             args=args,
             gate=gate,
-            summary=summary,
             reference=reference,
-            export_processing_id=export_processing_id,
+            processing=processing,
             identifiers=identifiers,
             rows=clearance.rows,
             files=files,
             tools=tools,
-            denovo=_manifest_denovo(
-                requested=args.denovo_alignment_idx,
-                applied_processing_idx=denovo_processing_idx,
-                cohort=denovo_cohort,
-            ),
+            denovo=_manifest_denovo(requested=requested_denovo, record=denovo_record),
         ),
         clearances=clearances,
     )

@@ -65,6 +65,7 @@ from qiita_common.api_paths import (
 )
 from qiita_common.auth_constants import Scope
 from qiita_common.models import (
+    DefinitionKind,
     DoGetTicketResponse,
     MaskDefinition,
     MaskDefinitionListResponse,
@@ -77,6 +78,8 @@ from qiita_common.models import (
     MaskSampleStatusUpdate,
     MaskSampleStatusUpdateResponse,
     ReadMaskedDoGetTicketRequest,
+    SampleResolution,
+    SampleResolutionState,
     SyndnaInsert,
     SyndnaReadCountResponse,
     SyndnaReadCountSample,
@@ -92,6 +95,12 @@ from ..auth.guards import (
 from ..auth.principal import HumanUser, Principal, ServiceAccount
 from ..auth.tickets import sign_ticket
 from ..block_read import READ_MASKED_TABLE
+from ..definition_resolver import resolve_group
+from ..definition_similarity import (
+    PairRefused,
+    load_groups,
+    refuse_deprecating_with_similar_pairs,
+)
 from ..deps import (
     TxConnFactory,
     get_db_pool,
@@ -112,7 +121,7 @@ from ..repositories.mask_definition import (
     transition_mask_definition_status,
 )
 from ..repositories.syndna_read_count import (
-    fetch_mask_syndna_reference,
+    fetch_mask_syndna_references,
     fetch_syndna_export_roster,
     fetch_syndna_inserts,
     fetch_syndna_read_counts,
@@ -123,6 +132,7 @@ from ._helpers import (
     cap_rows,
     first_few,
     gate_roster_narrowing_idx,
+    pair_refused_http,
 )
 
 _MSG_MASK_NOT_FOUND = "Mask definition not found"
@@ -365,25 +375,32 @@ async def get_syndna_read_count_route(
         default=None, description="These prep_samples (repeatable)."
     ),
 ) -> SyndnaReadCountResponse:
-    """The per-insert SynDNA read counts of the selected prep_samples under one mask —
-    what `qiita mask syndna-read-count` writes as BIOM or Parquet.
+    """The per-insert SynDNA read counts of the selected prep_samples across one
+    mask's group — what `qiita mask syndna-read-count` writes as BIOM or Parquet.
 
     The filters intersect, and at least one is required. The selection is every
-    non-retired prep_sample with a gate row under the mask that matches them.
+    non-retired prep_sample with a gate row under any member of the mask's group
+    that matches them. Each is resolved across the group (`definition_resolver`):
+    a `processed` prep_sample's counts are read under the member that it resolved
+    to; an `incomplete` or `not_processed` one is left out of the table and listed
+    in `left_out` with the reason. A deprecated named mask is not refused: it names
+    its group, and a prep_sample that resolves to it is left out as `deprecated`.
 
-    **All-or-nothing, never narrowed**, because the response is a table: the caller
-    needs ``Tier.VIEWER`` on every study each selected prep_sample is linked to (403
-    otherwise; wet_lab_admin and above bypass), and every selected prep_sample must be
-    'completed' under the mask and counted (409 otherwise). A named study and named
-    prep_samples are authorized before any lookup, so a 403 rather than a 404 or 409
-    answers a selector the caller cannot read (a study that does not exist selects
-    nothing: 404, or 409 when prep_samples are also named). A pool-only selection is authorized on
-    the prep_samples it resolves to, so its 404 / 413 say whether the pool has any
-    under the mask.
+    **Authorization is all-or-nothing, never narrowed**, because the response is a
+    table: the caller needs ``Tier.VIEWER`` on every study each selected prep_sample
+    is linked to (403 otherwise; wet_lab_admin and above bypass). A named study and
+    named prep_samples are authorized before any lookup, so a 403 rather than a 404
+    or 409 answers a selector the caller cannot read (a study that does not exist
+    selects nothing: 404, or 409 when prep_samples are also named). A pool-only
+    selection is authorized on the prep_samples that it selects, so its 404 / 413 say
+    whether the pool has any under the group.
 
-    404 when the mask does not exist or nothing matches; 409 when the mask ran without
-    SynDNA; 413 above the roster cap. Every read is one read-only snapshot, so a
-    re-mask landing mid-request cannot mix two states into one table.
+    404 when the mask does not exist or nothing matches; 409 when the named mask, or
+    a member that a prep_sample resolved to, ran without SynDNA or with a different
+    SynDNA reference than the named mask, when no selected prep_sample is processed,
+    or when a processed prep_sample has no counts; 413 above the roster cap. Every
+    read is one read-only snapshot, so neither a re-mask nor a pair decision landing
+    mid-request can mix two states into one table.
     """
     if study_idx is None and sequenced_pool_idx is None and not prep_sample_idx:
         raise HTTPException(
@@ -400,17 +417,19 @@ async def get_syndna_read_count_route(
             await authorize_prep_sample_cohort(
                 conn, caller=caller, prep_sample_idx=named, min_tier=COHORT_MIN_TIER
             )
-        mask = await fetch_mask_syndna_reference(conn, mask_idx)
-        if mask is None:
+        groups = await load_groups(conn)
+        if (DefinitionKind.MASK, mask_idx) not in groups.definitions:
             raise HTTPException(status_code=404, detail=_MSG_MASK_NOT_FOUND)
-        reference_idx = mask["reference_idx"]
+        group = sorted(groups.group_of(DefinitionKind.MASK, mask_idx))
+        references = await fetch_mask_syndna_references(conn, group)
+        reference_idx = references[mask_idx]
         if reference_idx is None:
             raise HTTPException(
                 status_code=409, detail=f"mask {mask_idx} ran without SynDNA; it counted nothing"
             )
         rows = await fetch_syndna_export_roster(
             conn,
-            mask_idx,
+            group,
             study_idx=study_idx,
             sequenced_pool_idx=sequenced_pool_idx,
             prep_sample_idxs=named or None,
@@ -420,8 +439,8 @@ async def get_syndna_read_count_route(
             raise HTTPException(
                 status_code=413,
                 detail=(
-                    f"more than {GATE_ROSTER_HARD_CAP} prep_samples under mask {mask_idx}"
-                    " match; narrow with study_idx, sequenced_pool_idx or prep_sample_idx"
+                    f"more than {GATE_ROSTER_HARD_CAP} prep_samples under mask {mask_idx}'s"
+                    " group match; narrow with study_idx, sequenced_pool_idx or prep_sample_idx"
                 ),
             )
         unmasked = sorted(set(named) - {r["prep_sample_idx"] for r in rows})
@@ -430,7 +449,7 @@ async def get_syndna_read_count_route(
                 status_code=409,
                 detail=(
                     f"{len(unmasked)} named prep_sample(s) are not masked under mask"
-                    f" {mask_idx} or do not match the other filters"
+                    f" {mask_idx} or a mask of its group, or do not match the other filters"
                     f" (e.g. {first_few(unmasked)})"
                 ),
             )
@@ -445,26 +464,55 @@ async def get_syndna_read_count_route(
             )
             raise HTTPException(
                 status_code=404,
-                detail=f"no prep_sample is masked under mask {mask_idx} with {filters}",
+                detail=f"no prep_sample is masked under mask {mask_idx}'s group with {filters}",
             )
         selected = [r["prep_sample_idx"] for r in rows]
         await authorize_prep_sample_cohort(
             conn, caller=caller, prep_sample_idx=selected, min_tier=COHORT_MIN_TIER
         )
-        incomplete = [r["prep_sample_idx"] for r in rows if r["state"] != MASK_SAMPLE_COMPLETED]
-        if incomplete:
+        resolution = await resolve_group(
+            conn,
+            kind=DefinitionKind.MASK,
+            definition_idx=mask_idx,
+            prep_sample_idxs=selected,
+            groups=groups,
+        )
+        left_out = [
+            r for r in resolution.samples.values() if r.state is not SampleResolutionState.PROCESSED
+        ]
+        mask_by_sample = {
+            ps: r.definition_idx
+            for ps, r in resolution.samples.items()
+            if r.state is SampleResolutionState.PROCESSED
+        }
+        if not mask_by_sample:
             raise HTTPException(
                 status_code=409,
                 detail=(
-                    f"{len(incomplete)} selected prep_sample(s) are not completed under mask"
-                    f" {mask_idx} (e.g. {first_few(incomplete)})"
+                    f"none of the {len(selected)} selected prep_sample(s) is processed in"
+                    f" mask {mask_idx}'s group: {_describe_left_out(left_out)}"
+                ),
+            )
+        differing = {
+            m: references[m]
+            for m in sorted(set(mask_by_sample.values()))
+            if references[m] != reference_idx
+        }
+        if differing:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"selected prep_samples resolve to masks whose SynDNA reference differs"
+                    f" from mask {mask_idx}'s ({reference_idx}):"
+                    f" {', '.join(f'mask {m}: {r}' for m, r in differing.items())}."
+                    " A table holds counts against one reference; narrow the selection"
                 ),
             )
         inserts = await fetch_syndna_inserts(conn, reference_idx)
-        stored = await fetch_syndna_read_counts(conn, mask_idx, selected)
+        stored = await fetch_syndna_read_counts(conn, mask_by_sample)
 
     order = {r["feature_idx"]: i for i, r in enumerate(inserts)}
-    counts: dict[int, list[int | None]] = {ps: [None] * len(inserts) for ps in selected}
+    counts: dict[int, list[int | None]] = {ps: [None] * len(inserts) for ps in mask_by_sample}
     for c in stored:
         position = order.get(c["feature_idx"])
         if position is None:
@@ -476,13 +524,13 @@ async def get_syndna_read_count_route(
                 ),
             )
         counts[c["prep_sample_idx"]][position] = c["read_count"]
-    uncounted = [ps for ps in selected if None in counts[ps]]
+    uncounted = [ps for ps in sorted(mask_by_sample) if None in counts[ps]]
     if uncounted:
         raise HTTPException(
             status_code=409,
             detail=(
-                f"{len(uncounted)} selected prep_sample(s) have no SynDNA read counts under"
-                f" mask {mask_idx} (e.g. {first_few(uncounted)}). Either the masking"
+                f"{len(uncounted)} processed prep_sample(s) have no SynDNA read counts under"
+                f" the mask they resolve to (e.g. {first_few(uncounted)}). Either the masking"
                 " ticket has not yet written them (retry once it completes, or ask an"
                 " operator to redrive it if it failed), or the prep_sample was masked"
                 " before counts were"
@@ -495,14 +543,27 @@ async def get_syndna_read_count_route(
         reference_idx=reference_idx,
         inserts=[SyndnaInsert.model_validate(dict(r)) for r in inserts],
         samples=[
-            SyndnaReadCountSample(
-                prep_sample_idx=r["prep_sample_idx"],
-                biosample_accession=r["biosample_accession"],
-                sequenced_pool_idx=r["sequenced_pool_idx"],
-                read_counts=counts[r["prep_sample_idx"]],
+            SyndnaReadCountSample.model_validate(
+                {
+                    **dict(r),
+                    "mask_idx": mask_by_sample[r["prep_sample_idx"]],
+                    "read_counts": counts[r["prep_sample_idx"]],
+                }
             )
             for r in rows
+            if r["prep_sample_idx"] in mask_by_sample
         ],
+        left_out=left_out,
+    )
+
+
+def _describe_left_out(left_out: list[SampleResolution]) -> str:
+    """`<state>/<reason>: N (e.g. [...])` per reason, for a refusal's detail."""
+    by_reason: dict[str, list[int]] = {}
+    for r in left_out:
+        by_reason.setdefault(f"{r.state.value}/{r.reason.value}", []).append(r.prep_sample_idx)
+    return "; ".join(
+        f"{key}: {len(idxs)} (e.g. {first_few(idxs)})" for key, idxs in sorted(by_reason.items())
     )
 
 
@@ -527,13 +588,15 @@ async def update_mask_definition_status_route(
     decision while leaving the raw reads Flight-reachable.
 
     Deprecating is refused (409, listing them) while any work ticket carrying the
-    mask is unfinished, held ones included.
+    mask is unfinished, held ones included, and while the mask is a side of a
+    `similar` pair decision (`definition_similarity`).
 
     system_admin only (`mask_definition:lifecycle`).
     """
     try:
         async with tx() as conn:
             if body.status is MaskDefinitionStatus.DEPRECATED:
+                await refuse_deprecating_with_similar_pairs(conn, DefinitionKind.MASK, mask_idx)
                 await refuse_deprecating_mask_with_live_work(conn, mask_idx)
             row = await transition_mask_definition_status(
                 conn,
@@ -550,6 +613,8 @@ async def update_mask_definition_status_route(
             status_code=409,
             detail={"reason": str(exc), "work_ticket_idx": exc.work_ticket_idxs},
         ) from exc
+    except PairRefused as exc:
+        raise pair_refused_http(exc) from exc
     except asyncpg.ForeignKeyViolationError as exc:
         raise HTTPException(
             status_code=422,

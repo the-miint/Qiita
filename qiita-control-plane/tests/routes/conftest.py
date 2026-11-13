@@ -12,6 +12,7 @@ through the ordered sweep.
 import asyncio
 import contextlib
 import itertools
+import json
 import secrets
 import uuid
 from collections.abc import Awaitable, Callable
@@ -40,6 +41,8 @@ from qiita_control_plane.repositories import UpdatableTable
 from qiita_control_plane.repositories._sample_helpers import EntityMetadataSpec, SampleEntityKind
 from qiita_control_plane.repositories.alignment_definition import mint_alignment_definition
 from qiita_control_plane.repositories.biosample_metadata import BIOSAMPLE_METADATA_SPEC
+from qiita_control_plane.repositories.block import MASK_SAMPLE_COMPLETED
+from qiita_control_plane.repositories.mask_definition import mint_mask_definition
 from qiita_control_plane.repositories.prep_sample import set_prep_sample_retired
 from qiita_control_plane.repositories.prep_sample_metadata import PREP_SAMPLE_METADATA_SPEC
 from qiita_control_plane.routes import _helpers as route_helpers
@@ -1442,8 +1445,26 @@ async def fail_safe_client(postgres_pool):
 # ticket for exactly it. Seeding them separately is how those two drift apart.
 
 
-async def _mint_alignment(pool, *, owner_idx: int, tag: str) -> int:
-    params = {"reference_idx": 1, "aligner": "minimap2", "mask_idx": 1, "shard_ids": [0], "t": tag}
+async def _mint_mask(pool, *, owner_idx: int, tag: str) -> int:
+    async with pool.acquire() as conn:
+        row = await mint_mask_definition(
+            conn,
+            filter_workflow="read-mask",
+            filter_version="1.0.0",
+            params={"filter_workflow": "read-mask", "t": tag},
+            principal_idx=owner_idx,
+        )
+    return row["mask_idx"]
+
+
+async def _mint_alignment(pool, *, owner_idx: int, tag: str, mask_idx: int) -> int:
+    params = {
+        "reference_idx": 1,
+        "aligner": "minimap2",
+        "mask_idx": mask_idx,
+        "shard_ids": [0],
+        "t": tag,
+    }
     async with pool.acquire() as conn:
         row = await mint_alignment_definition(conn, params=params, principal_idx=owner_idx)
     return row["alignment_idx"]
@@ -1468,6 +1489,10 @@ async def pool_alignment_seed(role_keyed_clients):
         ps_c → study_1            alignment_1: pending
         ps_d → study_1 (retired)  alignment_1: completed   ← orphaned by retirement
         ps_e → study_1 + study_2  alignment_1: completed   ← shared across both
+
+    Every sample is masked ('completed') under the one mask both alignments read, so
+    each completed alignment gate resolves to its own alignment
+    (`definition_resolver`).
 
     `regular_user_session` holds Tier.VIEWER on study_1 only, so that caller may
     read ps_a and ps_c and nothing else. That single shape exercises every
@@ -1534,8 +1559,17 @@ async def pool_alignment_seed(role_keyed_clients):
     await link(bs_e, ps_e, study_1)
     await link(bs_e, ps_e, study_2)
 
-    align_1 = await _mint_alignment(db, owner_idx=owner, tag=f"one-{uuid.uuid4()}")
-    align_2 = await _mint_alignment(db, owner_idx=owner, tag=f"two-{uuid.uuid4()}")
+    mask_idx = await _mint_mask(db, owner_idx=owner, tag=f"mask-{uuid.uuid4()}")
+    await db.executemany(
+        "INSERT INTO qiita.mask_sample (mask_idx, prep_sample_idx, state) VALUES ($1, $2, $3)",
+        [(mask_idx, ps, MASK_SAMPLE_COMPLETED) for _, ps, _ in samples],
+    )
+    align_1 = await _mint_alignment(
+        db, owner_idx=owner, tag=f"one-{uuid.uuid4()}", mask_idx=mask_idx
+    )
+    align_2 = await _mint_alignment(
+        db, owner_idx=owner, tag=f"two-{uuid.uuid4()}", mask_idx=mask_idx
+    )
     await _gate(db, alignment_idx=align_1, prep_sample_idx=ps_a, state="completed")
     await _gate(db, alignment_idx=align_1, prep_sample_idx=ps_b, state="completed")
     await _gate(db, alignment_idx=align_1, prep_sample_idx=ps_c, state="pending")
@@ -1548,6 +1582,7 @@ async def pool_alignment_seed(role_keyed_clients):
         "pool_idx": pool_idx,
         "align_1": align_1,
         "align_2": align_2,
+        "mask_idx": mask_idx,
         "ps_a": ps_a,
         "ps_b": ps_b,
         "ps_c": ps_c,
@@ -1569,8 +1604,81 @@ async def pool_alignment_seed(role_keyed_clients):
         "DELETE FROM qiita.alignment_definition WHERE alignment_idx = ANY($1::bigint[])",
         [align_1, align_2],
     )
+    await db.execute("DELETE FROM qiita.mask_definition WHERE mask_idx = $1", mask_idx)
     await db.execute("DELETE FROM qiita.sequenced_pool WHERE idx = $1", pool_idx)
     await db.execute("DELETE FROM qiita.sequencing_run WHERE idx = $1", run_idx)
+
+
+@pytest_asyncio.fixture
+async def alignment_group_world(pool_alignment_seed, role_keyed_clients):
+    """`pool_alignment_seed` plus a group: `mask_2`, decided similar to the seed's mask,
+    and `align_3`, `align_1`'s params on `mask_2`, so `align_1` and `align_3` are one
+    alignment group by derivation (`align_2` stays apart: its params differ). No gate
+    row is written under `mask_2` or `align_3`; each test writes the ones it needs.
+
+    `gate(table, definition_idx, prep_sample_idx, state)` upserts a gate row, with
+    the invalidation provenance an 'invalidated' row requires."""
+    from qiita_common.models import DefinitionKind, DefinitionPairVerdict
+
+    from qiita_control_plane.definition_similarity import decide_pair, open_pair
+
+    seed = pool_alignment_seed
+    pool = role_keyed_clients["pool"]
+    owner = seed["owner_idx"]
+    mask_2 = await _mint_mask(pool, owner_idx=owner, tag=f"mask-2-{uuid.uuid4()}")
+    async with pool.acquire() as conn, conn.transaction():
+        pair, _ = await open_pair(
+            conn,
+            kind=DefinitionKind.MASK,
+            definition_idxs=[seed["mask_idx"], mask_2],
+            principal_idx=owner,
+        )
+        await decide_pair(
+            conn,
+            definition_pair_idx=pair["definition_pair_idx"],
+            verdict=DefinitionPairVerdict.SIMILAR,
+            reason="same filter, reviewed against the mock community",
+            principal_idx=owner,
+        )
+    params_1 = await pool.fetchval(
+        "SELECT params FROM qiita.alignment_definition WHERE alignment_idx = $1", seed["align_1"]
+    )
+    params_1 = json.loads(params_1) if isinstance(params_1, str) else params_1
+    async with pool.acquire() as conn:
+        row = await mint_alignment_definition(
+            conn, params={**params_1, "mask_idx": mask_2}, principal_idx=owner
+        )
+    align_3 = row["alignment_idx"]
+
+    async def gate(table: str, definition_idx: int, prep_sample_idx: int, state: str) -> None:
+        column = {"mask_sample": "mask_idx", "alignment_sample": "alignment_idx"}[table]
+        invalidated = state == "invalidated"
+        await pool.execute(
+            f"INSERT INTO qiita.{table} ({column}, prep_sample_idx, state,"
+            "   invalidated_at, invalidated_by_idx, invalidation_reason)"
+            " VALUES ($1, $2, $3, CASE WHEN $4 THEN now() END, CASE WHEN $4 THEN $5::bigint END,"
+            "         CASE WHEN $4 THEN 'withdrawn by a test' END)"
+            f" ON CONFLICT ({column}, prep_sample_idx) DO UPDATE"
+            "   SET state = EXCLUDED.state, invalidated_at = EXCLUDED.invalidated_at,"
+            "       invalidated_by_idx = EXCLUDED.invalidated_by_idx,"
+            "       invalidation_reason = EXCLUDED.invalidation_reason",
+            definition_idx,
+            prep_sample_idx,
+            state,
+            invalidated,
+            owner,
+        )
+
+    yield {**seed, "mask_2": mask_2, "align_3": align_3, "gate": gate}
+
+    await pool.execute(
+        "DELETE FROM qiita.definition_pair WHERE definition_pair_idx = $1",
+        pair["definition_pair_idx"],
+    )
+    # These two are this fixture's own parents; deleting them clears their swept
+    # alignment_sample / mask_sample rows (ON DELETE CASCADE) ahead of the seed's sweep.
+    await pool.execute("DELETE FROM qiita.alignment_definition WHERE alignment_idx = $1", align_3)
+    await pool.execute("DELETE FROM qiita.mask_definition WHERE mask_idx = $1", mask_2)
 
 
 # Every one- and two-field subset of a lifecycle row's three provenance fields.

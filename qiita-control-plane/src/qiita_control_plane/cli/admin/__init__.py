@@ -101,6 +101,7 @@ from .owner_id import (
     _handle_owner_biosample_id,
     _write_owner_biosample_id_tsv,
 )
+from .pair import add_pair_parser
 from .role import (
     _VALID_ROLE_VALUES,
     _handle_principal_set_role,
@@ -247,6 +248,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     add_fanout_parser(sub)
     add_alignment_parser(sub)
+    add_pair_parser(sub)
 
     p_terminology = sub.add_parser("terminology", help="Terminology release operations")
     p_terminology_sub = p_terminology.add_subparsers(dest="terminology_cmd", required=True)
@@ -612,7 +614,12 @@ def _build_parser() -> argparse.ArgumentParser:
         required=True,
         type=int,
         dest="mask_idx",
-        help="mask_idx identifying which masked reads to export (required).",
+        help=(
+            "mask_idx naming the similarity group of masks to export from (required)."
+            " Each prep_sample is exported from the mask of the group that it resolves"
+            " to; one that is incomplete or not processed there is skipped and listed."
+            " Refused when this mask is deprecated."
+        ),
     )
     p_export.add_argument(
         "--format",
@@ -631,7 +638,10 @@ def _build_parser() -> argparse.ArgumentParser:
         dest="output_dir",
         help=(
             "Directory to write each prep_sample's files into (created, with"
-            " parents, if missing; files are mode 0600). On re-export, an"
+            " parents, if missing; files are mode 0600), plus"
+            " masked-read-export.manifest.json mapping each file to the prep_sample's"
+            " and the mask's public handles. A file that the manifest records under a"
+            " different mask is never overwritten. Otherwise, on re-export, an"
             " existing parquet file is skipped when its count matches the data"
             " plane and overwritten when it differs; an existing fastq target"
             " is refused."

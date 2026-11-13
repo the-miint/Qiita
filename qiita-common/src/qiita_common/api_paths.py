@@ -558,6 +558,19 @@ URL_ALIGNMENT_DOGET = f"{URL_ALIGNMENT_PREFIX}{PATH_ALIGNMENT_DOGET}"
 URL_ALIGNMENT_COHORT_DOGET = f"{URL_ALIGNMENT_PREFIX}{PATH_ALIGNMENT_COHORT_DOGET}"
 
 # =============================================================================
+# /definition-group/* — per-sample resolution across a definition group
+# =============================================================================
+# POST .../resolve: the member of a mask, alignment or processing group that each
+# named prep_sample resolves to (human, prep_sample:read, VIEWER on every study of
+# every prep_sample).
+
+PATH_DEFINITION_GROUP_PREFIX = "/definition-group"
+PATH_DEFINITION_GROUP_RESOLVE = "/resolve"
+
+URL_DEFINITION_GROUP_PREFIX = f"{API_PREFIX}{PATH_DEFINITION_GROUP_PREFIX}"
+URL_DEFINITION_GROUP_RESOLVE = f"{URL_DEFINITION_GROUP_PREFIX}{PATH_DEFINITION_GROUP_RESOLVE}"
+
+# =============================================================================
 # /read-masked/* — Flight DoGet ticket for the masked-read surface
 # =============================================================================
 # Signs an HMAC DoGet ticket scoped to a single (prep_sample_idx, mask_idx) on
@@ -727,6 +740,12 @@ PATH_ADMIN_SEQUENCED_POOL_MASKED_READ_EXPORT = (
     "/sequenced-pool/{sequenced_pool_idx}/masked-read-export"
 )
 PATH_ADMIN_MASKED_READ_EXPORT_TICKET = "/masked-read-export/ticket"
+# Pair decisions between two definitions of one kind (system_admin, the kind's
+# lifecycle scope): list (GET) and open (POST) on the root, show one, decide, revoke.
+PATH_ADMIN_DEFINITION_PAIR = "/definition-pair"
+PATH_ADMIN_DEFINITION_PAIR_BY_IDX = "/definition-pair/{definition_pair_idx}"
+PATH_ADMIN_DEFINITION_PAIR_DECISION = "/definition-pair/{definition_pair_idx}/decision"
+PATH_ADMIN_DEFINITION_PAIR_REVOKE = "/definition-pair/{definition_pair_idx}/revoke"
 
 URL_ADMIN_PREFIX = f"{API_PREFIX}{PATH_ADMIN_PREFIX}"
 URL_ADMIN_SERVICE_ACCOUNT = f"{URL_ADMIN_PREFIX}{PATH_ADMIN_SERVICE_ACCOUNT}"
@@ -743,6 +762,10 @@ URL_ADMIN_SEQUENCED_POOL_MASKED_READ_EXPORT = (
     f"{URL_ADMIN_PREFIX}{PATH_ADMIN_SEQUENCED_POOL_MASKED_READ_EXPORT}"
 )
 URL_ADMIN_MASKED_READ_EXPORT_TICKET = f"{URL_ADMIN_PREFIX}{PATH_ADMIN_MASKED_READ_EXPORT_TICKET}"
+URL_ADMIN_DEFINITION_PAIR = f"{URL_ADMIN_PREFIX}{PATH_ADMIN_DEFINITION_PAIR}"
+URL_ADMIN_DEFINITION_PAIR_BY_IDX = f"{URL_ADMIN_PREFIX}{PATH_ADMIN_DEFINITION_PAIR_BY_IDX}"
+URL_ADMIN_DEFINITION_PAIR_DECISION = f"{URL_ADMIN_PREFIX}{PATH_ADMIN_DEFINITION_PAIR_DECISION}"
+URL_ADMIN_DEFINITION_PAIR_REVOKE = f"{URL_ADMIN_PREFIX}{PATH_ADMIN_DEFINITION_PAIR_REVOKE}"
 
 
 # =============================================================================
@@ -1114,6 +1137,19 @@ PATH_EXPORTED_PROCESSING_ROOT = ""  # POST against the prefix itself
 
 URL_EXPORTED_PROCESSING_PREFIX = f"{API_PREFIX}{PATH_EXPORTED_PROCESSING_PREFIX}"
 URL_EXPORTED_PROCESSING = f"{URL_EXPORTED_PROCESSING_PREFIX}{PATH_EXPORTED_PROCESSING_ROOT}"
+
+
+# =============================================================================
+# Mask kind of /exported-processing and /exported-identifier
+# =============================================================================
+# The public handles for a mask and for a prep_sample masked under it, which a
+# masked-read export cites. system_admin + admin:masked_read_export.
+
+PATH_EXPORTED_PROCESSING_MASK = "/mask"
+PATH_EXPORTED_IDENTIFIER_MASK = "/mask"
+
+URL_EXPORTED_PROCESSING_MASK = f"{URL_EXPORTED_PROCESSING_PREFIX}{PATH_EXPORTED_PROCESSING_MASK}"
+URL_EXPORTED_IDENTIFIER_MASK = f"{URL_EXPORTED_IDENTIFIER_PREFIX}{PATH_EXPORTED_IDENTIFIER_MASK}"
 
 
 URL_PREP_SAMPLE_PREFIX = f"{API_PREFIX}{PATH_PREP_SAMPLE_PREFIX}"
