@@ -18,6 +18,7 @@ from qiita_common.api_paths import (
     PATH_BIOSAMPLE_BY_STUDY,
     PATH_BIOSAMPLE_BY_STUDY_AND_IDX,
     PATH_BIOSAMPLE_BY_STUDY_UNIQUE_FIELD,
+    PATH_BIOSAMPLE_FIELD_EXCEPTION,
     PATH_BIOSAMPLE_GLOBAL_FIELD_PREFIX,
     PATH_BIOSAMPLE_GLOBAL_FIELD_ROOT,
     PATH_BIOSAMPLE_LIST_BY_STUDY,
@@ -34,6 +35,7 @@ from qiita_common.api_paths import (
     PATH_STUDY_PREFIX,
 )
 from qiita_common.auth_constants import Scope, SystemRole
+from qiita_common.http_headers import ETAG_HEADER, IF_MATCH_HEADER
 from qiita_common.models import (
     BiosampleBulkImportRequest,
     BiosampleBulkImportResponse,
@@ -56,6 +58,8 @@ from qiita_common.models import (
     RosterResolveFailure,
     RosterResolveRequest,
     RosterResolveResponse,
+    SampleFieldExceptionPutRequest,
+    SampleFieldExceptionResponse,
     SampleMetadataWriteByUniqueFieldRequest,
     SampleMetadataWriteRequest,
     SampleMetadataWriteResponse,
@@ -119,11 +123,14 @@ from ..repositories.biosample_metadata import (
 from ..repositories.exported_entity import fetch_exported_entities, require_export_entity_id
 from ..repositories.study_access import CallerMetadataTiers
 from ..roster_resolution import classify_roster, fetch_roster_facts
+from ._field_exception import (
+    delete_field_exception_or_raise,
+    put_and_map_field_exception,
+    read_and_map_field_exception,
+)
 from ._helpers import (
-    ETAG_HEADER,
     GENERIC_CHECK_VIOLATION,
     GENERIC_FK_VIOLATION,
-    IF_MATCH_HEADER,
     SAMPLE_METADATA_WRITE_ERRORS,
     SAMPLE_STUDIES_HARD_CAP,
     build_idxs_list_response,
@@ -1152,6 +1159,125 @@ async def patch_biosample_metadata(
             global_internal_names=body.global_internal_names,
         )
     return written
+
+
+# same-pattern-ok: cross-entity twins of the sequenced_sample field-exception routes.
+# The decorators, path, scopes, spec and entity binding are the whole per-entity
+# declaration; the contract lives in the shared helpers they call.
+@router.get(PATH_BIOSAMPLE_FIELD_EXCEPTION)
+async def get_biosample_field_exception(
+    study_idx: Annotated[int, Field(gt=0)],
+    biosample_idx: Annotated[int, Field(gt=0)],
+    study_field_idx: Annotated[int, Field(gt=0)],
+    response: Response,
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    user: HumanUser = Depends(require_human),
+    _scope: Principal = Depends(require_scope(Scope.BIOSAMPLE_READ)),
+    _exists: None = Depends(require_study_exists),
+    _access: None = Depends(
+        require_study_access(min_tier=Tier.ADMIN, bypass_role=METADATA_BYPASS_ROLE)
+    ),
+) -> SampleFieldExceptionResponse:
+    """Read the field exception on this biosample's value of one of
+    the study's fields.
+
+    Requires Tier.ADMIN on the study, or a wet_lab_admin+ role;
+    read_and_map_field_exception carries the rest of the contract. The response
+    carries the `ETag` that a replace or clear sends as If-Match.
+    """
+    async with pool.acquire() as conn:
+        exception, etag = await read_and_map_field_exception(
+            conn,
+            spec=BIOSAMPLE_METADATA_SPEC,
+            fetch_row=fetch_biosample,
+            entity_idx=biosample_idx,
+            metadata_idx_column="idx",
+            study_idx=study_idx,
+            noun=BIOSAMPLE_METADATA_SPEC.entity_kind,
+            study_field_idx=study_field_idx,
+            tiers=await caller_metadata_tiers(conn, user),
+        )
+    response.headers[ETAG_HEADER] = etag
+    return exception
+
+
+@router.put(PATH_BIOSAMPLE_FIELD_EXCEPTION)
+async def put_biosample_field_exception(
+    study_idx: Annotated[int, Field(gt=0)],
+    biosample_idx: Annotated[int, Field(gt=0)],
+    study_field_idx: Annotated[int, Field(gt=0)],
+    body: SampleFieldExceptionPutRequest,
+    response: Response,
+    if_match: Annotated[str | None, Header(alias=IF_MATCH_HEADER)] = None,
+    tx: TxConnFactory = Depends(get_tx_conn_factory),
+    user: HumanUser = Depends(require_complete_profile),
+    _scope: Principal = Depends(require_scope(Scope.BIOSAMPLE_WRITE)),
+    _exists: None = Depends(require_study_exists),
+    _access: None = Depends(
+        require_study_access(min_tier=Tier.ADMIN, bypass_role=METADATA_BYPASS_ROLE)
+    ),
+) -> SampleFieldExceptionResponse:
+    """Set the field exception on this biosample's value of one of
+    the study's fields.
+
+    Requires Tier.ADMIN on the study, or a wet_lab_admin+ role. 201 when it
+    creates the exception, 200 when it replaces one; put_and_map_field_exception
+    carries the rest of the contract, including when If-Match is needed. The
+    response carries the new `ETag`.
+    """
+    async with tx() as conn:
+        exception, etag, created = await put_and_map_field_exception(
+            conn,
+            spec=BIOSAMPLE_METADATA_SPEC,
+            fetch_row=fetch_biosample,
+            entity_idx=biosample_idx,
+            metadata_idx_column="idx",
+            study_idx=study_idx,
+            noun=BIOSAMPLE_METADATA_SPEC.entity_kind,
+            study_field_idx=study_field_idx,
+            body=body,
+            if_match=if_match,
+            caller_idx=user.principal_idx,
+            tiers=await caller_metadata_tiers(conn, user),
+        )
+    response.status_code = 201 if created else 200
+    response.headers[ETAG_HEADER] = etag
+    return exception
+
+
+@router.delete(PATH_BIOSAMPLE_FIELD_EXCEPTION, status_code=204)
+async def delete_biosample_field_exception(
+    study_idx: Annotated[int, Field(gt=0)],
+    biosample_idx: Annotated[int, Field(gt=0)],
+    study_field_idx: Annotated[int, Field(gt=0)],
+    if_match: Annotated[str | None, Header(alias=IF_MATCH_HEADER)] = None,
+    tx: TxConnFactory = Depends(get_tx_conn_factory),
+    user: HumanUser = Depends(require_complete_profile),
+    _scope: Principal = Depends(require_scope(Scope.BIOSAMPLE_WRITE)),
+    _exists: None = Depends(require_study_exists),
+    _access: None = Depends(
+        require_study_access(min_tier=Tier.ADMIN, bypass_role=METADATA_BYPASS_ROLE)
+    ),
+) -> None:
+    """Clear the field exception on this biosample's value of one of
+    the study's fields.
+
+    Requires Tier.ADMIN on the study, or a wet_lab_admin+ role, and If-Match;
+    delete_field_exception_or_raise carries the rest of the contract.
+    """
+    async with tx() as conn:
+        await delete_field_exception_or_raise(
+            conn,
+            spec=BIOSAMPLE_METADATA_SPEC,
+            fetch_row=fetch_biosample,
+            entity_idx=biosample_idx,
+            metadata_idx_column="idx",
+            study_idx=study_idx,
+            noun=BIOSAMPLE_METADATA_SPEC.entity_kind,
+            study_field_idx=study_field_idx,
+            if_match=if_match,
+            tiers=await caller_metadata_tiers(conn, user),
+        )
 
 
 def _biosample_core_row_dict(

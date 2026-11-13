@@ -30,9 +30,11 @@ from qiita_common.models._base import (
 from qiita_common.models.host_filter_profile import HostFilterResolution
 from qiita_common.models.reference import FieldDataType
 from qiita_common.models.sample_field import (
+    MetadataFieldScope,
     SampleGlobalFieldResponse,
     SampleStudyFieldCreateRequest,
     SampleStudyFieldResponse,
+    derive_metadata_field_scope,
 )
 
 # matrix_tube_id values are digit-only (per local convention) and may carry
@@ -53,21 +55,6 @@ MATRIX_TUBE_ID_PATTERN = (
 # those payload keys resolves it here instead of retyping it.
 BIOSAMPLE_STUDY_FIELD_IDX_WIRE = "biosample_study_field_idx"
 BIOSAMPLE_GLOBAL_FIELD_IDX_WIRE = "biosample_global_field_idx"
-
-# Defined here so the wire models and the repository layer share one definition.
-type MetadataFieldScope = Literal["global", "local"]
-
-
-def derive_metadata_field_scope(global_link: object) -> MetadataFieldScope:
-    """Map a nullable global-linkage marker to the scope it implies.
-
-    A global-linkage marker is a value that is populated when the field is
-    globally linked and null when it is purely local: a row's FK to a global
-    field, or the linked global field's internal_name carried alongside it.
-    Callers pass whichever one their own type holds. A global field's own idx is
-    not such a marker -- it is never null, so it distinguishes nothing.
-    """
-    return "global" if global_link is not None else "local"
 
 
 class FieldWriteOutcome(StrEnum):

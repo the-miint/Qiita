@@ -23,6 +23,7 @@ from qiita_common.api_paths import (
     PATH_STUDY_ROOT,
 )
 from qiita_common.auth_constants import Scope, SystemRole
+from qiita_common.http_headers import ETAG_HEADER, IF_MATCH_HEADER
 from qiita_common.models import (
     StudyCreate,
     StudyLookupByAccessionRequest,
@@ -60,9 +61,7 @@ from ..repositories.study import (
 )
 from ..repositories.study_access import CallerStudyAccessRow, fetch_caller_study_access
 from ._helpers import (
-    ETAG_HEADER,
     GENERIC_FK_VIOLATION,
-    IF_MATCH_HEADER,
     etag_for_updated_at,
     raise_for_unique_violation,
     require_etag_match,

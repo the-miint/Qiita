@@ -73,6 +73,7 @@ from ..repositories._sample_helpers import (
     fetch_metadata_checklist_idx_by_name,
     fetch_owner_sample_id_study_field_idxs,
     fetch_study_field,
+    fetch_study_field_has_exceptions,
     fetch_study_field_tier,
     fetch_study_fields_by_display_names,
     parse_text_for_data_type,
@@ -328,13 +329,6 @@ GENERIC_FK_VIOLATION = "references a row that does not exist"
 # Fallback for a CHECK the wire models should have preempted. Both study-field
 # write surfaces fall back to it, so the wording lives here rather than at each.
 GENERIC_CHECK_VIOLATION = "violates a database constraint on"
-
-# The optimistic-concurrency header pair: every route that emits a version
-# stamp writes ETAG_HEADER, and every PATCH that gates on one reads
-# IF_MATCH_HEADER. A caller round-trips the first into the second, so the two
-# spellings are a contract rather than incidental strings.
-ETAG_HEADER = "ETag"
-IF_MATCH_HEADER = "If-Match"
 
 
 def metadata_entries_from_rows(rows: Mapping[str, MetadataRow]) -> dict[str, MetadataEntry]:
@@ -1296,6 +1290,24 @@ async def patch_and_map_study_field(
                     f" {', '.join(inherited)} cannot be set on it"
                 ),
             )
+
+    # A field that exceptions key on cannot become unique_in_study; the
+    # migration that enforces it says why. The field row is held FOR NO KEY
+    # UPDATE from the read above, which the exception trigger's FOR SHARE waits
+    # behind, so no exception can land between this check and the write. It
+    # depends on no type, so it runs ahead of the widen and its table lock.
+    if (
+        body.unique_in_study
+        and not row["unique_in_study"]
+        and await fetch_study_field_has_exceptions(conn, spec=spec, study_field_idx=study_field_idx)
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"{noun} field {row['display_name']!r} cannot be made unique within this"
+                " study: field exceptions are set on its values"
+            ),
+        )
 
     # The widen runs ahead of the uniqueness rule below so that rule is judged
     # against the type the field ends at. Anything raised past this point

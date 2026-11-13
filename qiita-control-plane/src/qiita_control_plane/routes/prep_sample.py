@@ -20,6 +20,7 @@ from qiita_common.api_paths import (
     PATH_STUDY_PREFIX,
 )
 from qiita_common.auth_constants import Scope, SystemRole
+from qiita_common.http_headers import ETAG_HEADER, IF_MATCH_HEADER
 from qiita_common.models import (
     PrepSampleGlobalFieldResponse,
     PrepSampleRetiredUpdate,
@@ -52,8 +53,6 @@ from ..repositories._sample_helpers import (
 from ..repositories.prep_sample import set_prep_sample_retired
 from ..repositories.prep_sample_metadata import PREP_SAMPLE_METADATA_SPEC
 from ._helpers import (
-    ETAG_HEADER,
-    IF_MATCH_HEADER,
     SAMPLE_STUDIES_HARD_CAP,
     cap_rows,
     create_and_map_study_field,

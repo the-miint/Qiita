@@ -62,6 +62,7 @@ from qiita_control_plane.testing.db_seeds import (
     seed_user_principal,
 )
 from qiita_control_plane.testing.db_teardown import teardown_entity_graph
+from qiita_control_plane.testing.locks import wait_until_blocked_by
 from qiita_control_plane.testing.unique_names import unique_field_name
 
 # Bounds every wait on a request task, so a request that never returns fails
@@ -255,21 +256,28 @@ async def make_pat_client(postgres_pool, regular_user_session):
 
 @pytest_asyncio.fixture
 async def no_biosample_write_client(make_pat_client):
-    """A regular_user PAT with a scope set that EXCLUDES Scope.BIOSAMPLE_WRITE —
+    """A regular_user PAT with a scope set that excludes Scope.BIOSAMPLE_WRITE —
     drives the require_scope guard's missing-scope 403."""
     return await make_pat_client(label="bs-no-write", scopes=[Scope.SELF_PROFILE])
 
 
 @pytest_asyncio.fixture
+async def no_biosample_read_client(make_pat_client):
+    """A regular_user PAT with a scope set that excludes Scope.BIOSAMPLE_READ
+    so the require_scope guard's missing-scope 403 surfaces."""
+    return await make_pat_client(label="bs-no-read", scopes=[Scope.SELF_PROFILE])
+
+
+@pytest_asyncio.fixture
 async def no_prep_sample_write_client(make_pat_client):
-    """A regular_user PAT with a scope set that EXCLUDES Scope.PREP_SAMPLE_WRITE
+    """A regular_user PAT with a scope set that excludes Scope.PREP_SAMPLE_WRITE
     so the require_scope guard's missing-scope 403 surfaces."""
     return await make_pat_client(label="no-prep-sample-write", scopes=[Scope.SELF_PROFILE])
 
 
 @pytest_asyncio.fixture
 async def no_prep_sample_read_client(make_pat_client):
-    """A regular_user PAT with a scope set that EXCLUDES Scope.PREP_SAMPLE_READ
+    """A regular_user PAT with a scope set that excludes Scope.PREP_SAMPLE_READ
     so the require_scope guard's missing-scope 403 surfaces on the
     sequenced-sample read endpoints."""
     return await make_pat_client(label="no-prep-sample-read", scopes=[Scope.SELF_PROFILE])
@@ -305,7 +313,7 @@ def unique_instrument_id(prefix: str) -> str:
 
 @pytest_asyncio.fixture
 async def no_study_read_client(make_pat_client):
-    """A regular_user PAT with a scope set that EXCLUDES Scope.STUDY_READ so
+    """A regular_user PAT with a scope set that excludes Scope.STUDY_READ so
     the require_scope guard's missing-scope 403 surfaces on the study-scoped
     list-idxs routes."""
     return await make_pat_client(label="no-study-read", scopes=[Scope.SELF_PROFILE])
@@ -360,22 +368,7 @@ async def _finish(task: asyncio.Task):
 
 
 async def _wait_until_blocked_by(pool, blocker, task: asyncio.Task) -> None:
-    """Return once some backend is waiting on a lock that `blocker` holds (the
-    request under test is the only candidate), rather than after a fixed sleep
-    that would not show that the request ever reached the lock."""
-    blocker_pid = blocker.get_server_pid()
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + _REQUEST_TIMEOUT_S
-    while loop.time() < deadline:
-        assert not task.done(), "request finished without waiting on the held lock"
-        waiting = await pool.fetchval(
-            "SELECT count(*) FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))",
-            blocker_pid,
-        )
-        if waiting:
-            return
-        await asyncio.sleep(0.02)
-    raise AssertionError("request never waited on the held lock")
+    await wait_until_blocked_by(pool, blocker, task, timeout_s=_REQUEST_TIMEOUT_S)
 
 
 async def _cancel(task: asyncio.Task | None) -> None:
@@ -942,13 +935,12 @@ _STUDY_SCOPED_SAMPLE_WRITE_AUTHZ: dict[str, tuple[str | None, str | None, str, i
 }
 STUDY_SCOPED_SAMPLE_WRITE_AUTHZ_CASES = tuple(_STUDY_SCOPED_SAMPLE_WRITE_AUTHZ)
 
-# The write rows at the ADMIN floor instead, for linking a sample into a study:
-# a member grant is the case below it.
-_STUDY_SCOPED_SAMPLE_LINK_AUTHZ: dict[str, tuple[str | None, str | None, str, int | None]] = {
+# The write rows at the ADMIN floor instead: a member grant is the case below it.
+_STUDY_SCOPED_SAMPLE_ADMIN_AUTHZ: dict[str, tuple[str | None, str | None, str, int | None]] = {
     **{k: v for k, v in _STUDY_SCOPED_SAMPLE_WRITE_AUTHZ.items() if k != "member_grant"},
     "below_admin_member": ("wet", "member", "user", 403),
 }
-STUDY_SCOPED_SAMPLE_LINK_AUTHZ_CASES = tuple(_STUDY_SCOPED_SAMPLE_LINK_AUTHZ)
+STUDY_SCOPED_SAMPLE_ADMIN_AUTHZ_CASES = tuple(_STUDY_SCOPED_SAMPLE_ADMIN_AUTHZ)
 
 # Path idx for the case whose study does not exist: no sample is seeded, and
 # the study gate answers before anything reads this.
@@ -1025,10 +1017,10 @@ async def assert_study_scoped_sample_write_authz(ctx, *, case: str, **kwargs) ->
     )
 
 
-async def assert_study_scoped_sample_link_authz(ctx, *, case: str, **kwargs) -> None:
-    """Drive one access case of linking a sample into a study (ADMIN floor)."""
+async def assert_study_scoped_sample_admin_authz(ctx, *, case: str, **kwargs) -> None:
+    """Drive one access case of a study-scoped sample route at the ADMIN floor."""
     await _assert_study_scoped_sample_authz(
-        ctx, cases=_STUDY_SCOPED_SAMPLE_LINK_AUTHZ, case=case, **kwargs
+        ctx, cases=_STUDY_SCOPED_SAMPLE_ADMIN_AUTHZ, case=case, **kwargs
     )
 
 

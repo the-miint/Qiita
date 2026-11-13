@@ -119,7 +119,7 @@ reaches **the value's required tier**.
   `*_study_field.tier_override`, or the study's `default_tier` when that is
   NULL. A linked study-local row always leaves `tier_override` NULL, so the
   global field's tier is the one that applies.
-- **Value-level exception** — a `*_field_exception` row increases the required
+- **Field exception** — a `*_field_exception` row increases the required
   tier of one `(entity, field)` value, for a field that is broadly visible
   where one entity's value must not be, e.g. a free-text field into which one
   submitter entered PII. The required tier is the greater of the field tier and
@@ -130,6 +130,19 @@ reaches **the value's required tier**.
   field that it was written through, so one keyed on the local field still applies
   after that field is linked; one keyed on another study's alias of the same
   global field does not. `qiita.metadata_required_tier` combines these two.
+  An admin on the study, or a wet_lab_admin+ role, sets, reads and clears an
+  exception through `/study/{S}/biosample/{B}/field-exception/{F}` and its
+  sequenced-sample twin (`routes._field_exception`).
+  - On a value that another study wrote into a global field, the caller also
+    needs admin on that study.
+  - An exception is refused on a globally-linked field that holds no value on
+    that biosample or prep_sample yet, and at or below the field's tier, where
+    it restricts nothing.
+  - Replacing or clearing one needs the If-Match that its read returned.
+  - An exception cannot sit on a `unique_in_study` field, and `unique_in_study`
+    cannot be declared over a field that exceptions key on; the database refuses
+    both (migration `20261112000000_field_exception_excludes_unique_in_study.sql`
+    says why).
 - **Owner-biosample-id floor** — an owner-biosample-id value requires at least
   `member` (`repositories.biosample.OWNER_BIOSAMPLE_ID_TIER_OVERRIDE`), whatever
   its field's tier, so a study that declared the field lower before its first
@@ -200,7 +213,7 @@ What such a caller may touch:
   persists (`_sample_helpers.write_resolved_metadata_entries`). The 403 names
   only field keys (`routes._helpers._raise_value_above_tier`). Before anything
   is written, a key is refused when the field's value on that biosample or
-  prep_sample is hidden from the caller, or when a value-level exception on it
+  prep_sample is hidden from the caller, or when a field exception on it
   is above the caller's tier, whether or not a value is stored yet
   (`_sample_helpers._fetch_keys_restricted_on_entity`). That covers another
   study's value in a global field, and a value stored through a
@@ -221,17 +234,17 @@ What such a caller may touch:
 
 **What a refused write can still reveal.**
 
-- `unique_in_study` is enforced over every value, including ones that the
-  caller cannot read. A write that repeats a value already stored through such
-  a field on another biosample or prep_sample is refused for that collision,
-  which shows the caller that a hidden value equals the one that they sent.
 - A global field holds one value per biosample or prep_sample, whichever linked
   study wrote it. A write into one that holds another study's value that the
   caller cannot read is refused rather than overwriting that value, so the
   refusal shows that a value is there.
 - A tier that another transaction changes while a write runs, such as an admin
   setting a field's `tier_override`, can make the 403 name different keys
-  depending on what the body sent.
+  depending on what the body sent. That is also the only way for a
+  `unique_in_study` collision to meet a value that the caller cannot read.
+- The exception routes answer 403 on a globally-linked value that another
+  study wrote, which shows a study admin that some other study wrote a value
+  there.
 
 ### What a tier reads of a study's own record
 
