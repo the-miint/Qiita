@@ -99,6 +99,12 @@ background and splits into one item per study they belong to; each item then reg
 only its own listed runs. The study is created or reused exactly as for a
 whole-study import, so the same import-created-study guard applies.
 
+- **Biosamples ENA has no record of.** A run whose biosample ENA never mirrored (some NCBI
+  biosamples) still registers, with only its run-derived fields and no ENA sample attributes;
+  each biosample for which ENA returned no sample attributes is logged as a warning.
+  Attributes are harmonized only when a biosample is first created, so a later re-import does
+  not fill them in if ENA mirrors them afterwards.
+
 - **One unavailable run fails the whole item.** A run ENA does not return, or returns
   non-public, fails the ungrouped item with `run(s) unavailable at ENA: …` naming every
   such run, and nothing is registered or flagged. Fix the list and resubmit.

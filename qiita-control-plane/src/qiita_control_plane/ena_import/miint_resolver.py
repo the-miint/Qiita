@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from collections.abc import Callable
 from time import monotonic
 
@@ -36,6 +37,10 @@ _RUN_FIELDS = ",".join(EnaRunRecord.model_fields)
 _STUDY_FIELDS = ",".join(EnaStudyHeader.model_fields)
 
 _log = logging.getLogger(__name__)
+
+_ENA_NOT_FOUND_BODY = re.compile(
+    r"<ErrorDetails>.*<message>([^<]*) not found\.</message>", re.DOTALL
+)
 
 # Sized to outlast a multi-hour ENA Portal outage; the deadline is per call, not per item.
 _RESOLVE_DEADLINE_S = 6 * 3600
@@ -181,11 +186,44 @@ class MiintEnaResolver:
     def resolve_sample_attributes_for_samples(
         self, sample_accessions: list[str]
     ) -> list[EnaSampleAttributes]:
+        """Attributes for the listed biosamples. ENA omits a biosample it has no record of, so
+        each one with no attributes returned is logged as a warning, not raised."""
         _require_kind(sample_accessions, EnaAccessionKind.SAMPLE)
+        rows = _present_sample_attributes(sample_accessions)
+        returned = {sample_accession for sample_accession, _ in rows}
+        for accession in dict.fromkeys(sample_accessions):
+            if accession not in returned:
+                _log.warning("ENA returned no sample attributes for biosample %s", accession)
         return [
             EnaSampleAttributes(sample_accession=sample_accession, attributes=attributes)
-            for sample_accession, attributes in _query_ena_sample_attributes(sample_accessions)
+            for sample_accession, attributes in rows
         ]
+
+
+def _ena_not_found_accessions(exc: duckdb.HTTPException) -> list[str] | None:
+    """The accessions in ENA's missing-biosample 404, or None for any other error (e.g. its
+    JSON "No endpoint found")."""
+    if getattr(exc, "status_code", None) != 404:
+        return None
+    match = _ENA_NOT_FOUND_BODY.search(str(getattr(exc, "body", None) or ""))
+    return match[1].split(",") if match else None
+
+
+def _present_sample_attributes(
+    sample_accessions: list[str],
+) -> list[tuple[str, dict[str, list[str]]]]:
+    """`_query_ena_sample_attributes`, retried without the accessions ENA's not-found 404
+    names: its sample XML omits a missing biosample but 404s a batch that is all missing."""
+    remaining = list(sample_accessions)
+    while remaining:
+        try:
+            return _query_ena_sample_attributes(remaining)
+        except duckdb.HTTPException as exc:
+            named = _ena_not_found_accessions(exc)
+            if named is None or not set(named) & set(remaining):
+                raise
+            remaining = [a for a in remaining if a not in named]
+    return []
 
 
 def _require_kind(accessions: list[str], kind: EnaAccessionKind) -> None:
