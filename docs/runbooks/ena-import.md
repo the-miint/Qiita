@@ -164,7 +164,9 @@ conflict — is recorded on that item alone; it never aborts the batch or its
 sibling items. Listed runs share one item until they are grouped by study, so one
 unresolved run fails them all (see [Importing chosen runs](#importing-chosen-runs)).
 Poll with `qiita ena-import-status IDX` to see each item's state and, on failure, the
-reason.
+reason. If a submit was interrupted or lost its response before you got the batch idx,
+run the `qiita ena-import-list --mine --since TS` it prints; `TS` is a minute before the submit
+started, to cover clock skew.
 
 ### Non-public studies and runs
 
@@ -264,6 +266,10 @@ did.
   submit work for the whole batch runs in the background. **Admin-only**
   (wet_lab_admin or system_admin) — this is an operator gesture, not something an
   end user submits, mirroring bcl-convert's own admin-only submission.
+- `GET /api/v1/ena-import-batch` — the newest batches first (`submitted_by=me` for your
+  own, `since` an ISO-8601 timestamp with timezone, `limit` default 20, max 100), each with
+  its idx, `created_at` and a count of items per state, rolled up as below.
+  Admin-only.
 - `GET /api/v1/ena-import-batch/{idx}` — the batch's current, rolled-up per-item
   status (the run item is split into one item per study once its runs resolve):
   `pending` / `resolving` / `registered` / `downloading` / `done` / `completed_partial` /
@@ -289,10 +295,12 @@ right after submit. A transient failure while polling — a dropped connection o
 is retried until the timeout instead of failing the watch; any other HTTP error is
 fatal. Exit codes: `0` every item reached `done`; `1` an item ended `failed` or
 `completed_partial`, the watch timed out (naming each still-pending item and its last
-known state), an HTTP error, or no token was found; `2` bad input (a malformed
-accession, a bad `--from-file` line, an out-of-range flag); `130` Ctrl-C, naming the
-batch to poll if the POST had already succeeded. `qiita ena-import-status IDX` reads a
-batch's current state and
+known state), an HTTP error, no token was found, or the POST was sent but no response
+came back or a gateway answered 502/503/504 (printing the `qiita ena-import-list --mine
+--since TS` command to run); `2` bad input
+(a malformed accession, a bad `--from-file` line, an out-of-range flag); `130` Ctrl-C,
+naming the batch to poll if the POST had already succeeded, or otherwise the same
+`ena-import-list` command. `qiita ena-import-status IDX` reads a batch's current state and
 always exits `0` once the read itself succeeds. See the REST bullets above for the
 state set and what each field means.
 

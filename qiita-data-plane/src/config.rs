@@ -60,7 +60,8 @@ pub struct Settings {
 /// each attached connection holds one lake-Postgres backend for as long as it
 /// lives (8 attached connections held 8 idle backends), against a
 /// `max_connections` of 100 with 3 superuser-reserved. Eight leaves that budget
-/// room for other data-plane processes; raise it with `DUCKLAKE_POOL_SIZE` where
+/// room for other data-plane processes and each one's lake lock sessions
+/// (`crate::lake_locks::LOCK_SESSIONS`); raise it with `DUCKLAKE_POOL_SIZE` where
 /// the budget allows. `make verify-deploy` adds up every instance's pool on every
 /// host against the catalog server's limit (`qiita_catalog_connection_budget` in
 /// `deploy/_common.sh`).
@@ -390,10 +391,12 @@ impl Settings {
         let thread_budget = resources::detect_thread_budget();
 
         let size = parse_positive::<usize>("DUCKLAKE_POOL_SIZE")?.unwrap_or(DEFAULT_POOL_SIZE);
+        // The tag declares every catalog backend the instance may open: the pool's,
+        // plus its lake lock sessions (`crate::lake_locks::LOCK_SESSIONS`).
         let ducklake_catalog_connstr = crate::ducklake::tag_catalog_connstr(
             &ducklake_catalog_connstr,
             listen_addr.port(),
-            size,
+            size + crate::lake_locks::LOCK_SESSIONS,
         )?;
 
         // Parsed whether or not threads or the spill cap is derived, so a

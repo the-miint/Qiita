@@ -3386,6 +3386,71 @@ async def fetch_entity_is_linked_to_study(
     )
 
 
+async def fetch_active_studies_for_entity(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
+    *,
+    spec: EntityMetadataSpec,
+    entity_idx: int,
+    limit: int,
+) -> list[asyncpg.Record]:
+    """Return up to `limit` studies that entity_idx has a non-retired link to,
+    each with study_idx and both study accessions, ordered by study_idx.
+
+    Callers that need to detect truncation pass `limit = cap + 1`; a returned
+    length > cap means the underlying set exceeded the cap.
+    """
+    # f-string interpolation of identifiers is safe: spec fields are frozen
+    # module-level constants, never reached by caller input.
+    rows = await pool_or_conn.fetch(
+        f"SELECT s.idx AS study_idx, s.bioproject_accession, s.ena_study_accession"
+        f" FROM {spec.link_table} link"
+        f" JOIN qiita.study s ON s.idx = link.study_idx"
+        f" WHERE link.{spec.link_entity_key_column} = $1 AND link.retired = false"
+        f" ORDER BY s.idx"
+        f" LIMIT $2",
+        entity_idx,
+        limit,
+    )
+    studies = list(rows)
+    return studies
+
+
+async def fetch_study_idxs_by_entity_idx(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
+    *,
+    spec: EntityMetadataSpec,
+    entity_idxs: Sequence[int],
+    include_retired: bool,
+) -> dict[int, list[int]]:
+    """Return `{entity_idx: [study_idx, ...]}` (study_idxs ascending) over the
+    spec.link_table links of entity_idxs.
+
+    With include_retired False, only links whose own retired flag is false
+    count; the entity's own retirement is not consulted either way. An entity
+    with no counted link is absent from the mapping, not present with an empty
+    list.
+    """
+    if not entity_idxs:
+        return {}
+
+    # Pick one of two fixed predicates; f-string identifiers come from the
+    # frozen spec, never from caller input
+    retired_predicate = "" if include_retired else " AND retired = false"
+    key_column = spec.link_entity_key_column
+    rows = await pool_or_conn.fetch(
+        f"SELECT {key_column} AS entity_idx, study_idx FROM {spec.link_table}"
+        f" WHERE {key_column} = ANY($1::bigint[]){retired_predicate}"
+        f" ORDER BY {key_column}, study_idx",
+        list(entity_idxs),
+    )
+
+    # Group the ordered rows by entity, keeping study_idxs ascending
+    links: dict[int, list[int]] = {}
+    for row in rows:
+        links.setdefault(row["entity_idx"], []).append(row["study_idx"])
+    return links
+
+
 async def insert_entity_to_study(
     conn: asyncpg.Connection,
     *,
@@ -3394,8 +3459,9 @@ async def insert_entity_to_study(
     study_idx: int,
     created_by_idx: int,
     on_conflict: LinkConflictMode = "raise",
-) -> None:
-    """Insert one (entity, study) link row into spec.link_table.
+) -> datetime | None:
+    """Insert one (entity, study) link row into spec.link_table and return its
+    created_at, or None when "ignore" skipped an existing row.
 
     Retirement columns are CHECK-pinned to NULL/false on a fresh row, so
     they have no place in a create call; created_at defaults to now().
@@ -3414,14 +3480,15 @@ async def insert_entity_to_study(
         if on_conflict == "ignore"
         else ""
     )
-    await conn.execute(
+    created_at = await conn.fetchval(
         f"INSERT INTO {spec.link_table} ("
         f"    {spec.link_entity_key_column}, study_idx, created_by_idx"
-        f") VALUES ($1, $2, $3)" + conflict_clause,
+        f") VALUES ($1, $2, $3)" + conflict_clause + " RETURNING created_at",
         entity_idx,
         study_idx,
         created_by_idx,
     )
+    return created_at
 
 
 async def link_entity_to_studies(

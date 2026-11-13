@@ -14,7 +14,7 @@ from typing import Literal, get_args
 import asyncpg
 from qiita_common.models import LEGACY_IDX_RESERVED_CEILING, StudyAccessionField, Tier
 
-from . import require_transaction, update_row
+from . import RowLock, require_transaction, row_lock_clause, update_row
 from .exported_entity import export_entity_id_lookup, export_entity_id_select
 from .study_access import insert_study_access
 
@@ -44,7 +44,7 @@ async def fetch_study(
     pool_or_conn: asyncpg.Pool | asyncpg.Connection,
     study_idx: int,
     *,
-    for_update: bool = False,
+    lock: RowLock | None = None,
 ) -> asyncpg.Record | None:
     """Return the qiita.study row for the given idx, or None if no match.
 
@@ -54,38 +54,11 @@ async def fetch_study(
     a pool or a connection so the helper composes inside an open
     transaction or stands alone.
 
-    `for_update=True` appends `FOR UPDATE`; concurrent callers
-    serialize on the row lock until the holder commits or rolls back.
-    Pass only inside an open transaction — with a pool the implicit
-    single-statement transaction releases the lock immediately and
-    the flag is a no-op.
+    `lock` takes that row lock on the study; see row_lock_clause.
     """
     sql = f"SELECT {_STUDY_RETURNING_COLS} FROM qiita.study WHERE idx = $1"
-    if for_update:
-        sql += " FOR UPDATE"
+    sql += row_lock_clause(pool_or_conn, lock)
     return await pool_or_conn.fetchrow(sql, study_idx)
-
-
-async def fetch_study_exists(
-    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
-    study_idx: int,
-) -> bool:
-    """Return True iff qiita.study has a row with the given idx.
-
-    Sibling of fetch_caller_study_access for the case where a route only
-    needs to know whether the study exists (e.g., to raise 404 on a
-    nonexistent path resource) and does not need the caller's access tier.
-    Accepts either a pool or a connection so the helper composes inside an
-    open transaction or stands alone.
-    """
-    # Existence-only fetch; the SELECT 1 form keeps the row payload minimal.
-    return (
-        await pool_or_conn.fetchval(
-            "SELECT 1 FROM qiita.study WHERE idx = $1",
-            study_idx,
-        )
-        is not None
-    )
 
 
 async def fetch_study_idxs_by_natural_key(

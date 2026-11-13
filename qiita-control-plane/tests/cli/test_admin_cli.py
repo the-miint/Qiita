@@ -2669,8 +2669,12 @@ def test_alignment_abandon_plan_posts_and_summarises(monkeypatch, capsys):
         },
     )
     assert cli.main(["alignment", "abandon-plan", "7"]) == 0
+    assert captured["json"] is None
     assert captured["method"] == "POST"
     assert captured["url"].endswith(URL_ALIGNMENT_DEFINITION_ABANDON_PLAN.format(alignment_idx=7))
     err = capsys.readouterr().err
     assert "2 block(s) abandoned" in err
     assert "only_missing=true" in err
+
+    assert cli.main(["alignment", "abandon-plan", "7", "--allow-rearmed"]) == 0
+    assert captured["json"] == {"allow_rearmed": True}

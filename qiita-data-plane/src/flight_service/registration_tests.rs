@@ -12,6 +12,34 @@ use crate::flight_service::test_support::{
     attached_conn, attached_writer, catalog_that_loses_a_commit_answer, setup_full_lake,
 };
 
+/// `register_files` on one writer for both of its phases, with this test's own
+/// lake locks: the test catalog's, or none at all for a test whose payload stops
+/// before it would take one.
+fn register_files_with(
+    conn: &LakeWriter,
+    data_path: &str,
+    scratch_root: &std::path::Path,
+    payload: &auth::ActionPayload,
+) -> Result<Registration, Status> {
+    register_files(
+        &|| Ok(conn),
+        &test_locks(),
+        data_path,
+        scratch_root,
+        payload,
+    )
+}
+
+#[cfg(feature = "integration")]
+fn test_locks() -> LakeLocks {
+    LakeLocks::new(crate::test_catalog::connstr())
+}
+
+#[cfg(not(feature = "integration"))]
+fn test_locks() -> LakeLocks {
+    LakeLocks::new(String::new())
+}
+
 // Regression (data-plane lake-file placement): when `register_files`
 // moves an externally-produced Parquet into managed lake storage, it must
 // NEVER overwrite a file already present there. The reference-load job
@@ -316,7 +344,7 @@ fn register_files_rejects_filename_traversal() {
             files,
             work_ticket_idx: 1,
         };
-        let err = register_files(
+        let err = register_files_with(
             &unattached_writer(),
             "unused-data-path",
             std::path::Path::new("/"),
@@ -578,7 +606,6 @@ fn register_files_moves_and_registers_end_to_end() {
         let conn = Connection::open_in_memory().unwrap();
         ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
         ducklake::ensure_reference_tables(&conn).unwrap();
-        ducklake::ensure_registration_lock(&conn).unwrap();
         ducklake::ensure_registered_file_table(&conn).unwrap();
         conn.execute_batch(&format!(
             "DELETE FROM qiita_lake.reference_membership WHERE reference_idx = {ref_idx};"
@@ -617,7 +644,7 @@ fn register_files_moves_and_registers_end_to_end() {
         work_ticket_idx: ticket,
     };
 
-    let outcome = register_files(
+    let outcome = register_files_with(
         &attached_writer(&connstr, &data_path),
         &data_path,
         std::path::Path::new("/"),
@@ -732,7 +759,6 @@ fn prepare_membership_table(connstr: &str, data_path: &str, ref_idx: i64) {
     let conn = Connection::open_in_memory().unwrap();
     ducklake::connect_ducklake(&conn, connstr, data_path).unwrap();
     ducklake::ensure_reference_tables(&conn).unwrap();
-    ducklake::ensure_registration_lock(&conn).unwrap();
     ducklake::ensure_registered_file_table(&conn).unwrap();
     conn.execute_batch(&format!(
         "DELETE FROM qiita_lake.reference_membership WHERE reference_idx = {ref_idx};"
@@ -755,14 +781,14 @@ fn register_files_replayed_after_it_completed_registers_nothing_again() {
     prepare_membership_table(&connstr, &data_path, ref_idx);
     let (_staging, payload) = seed_membership_registration(ref_idx, ticket);
 
-    let first = register_files(
+    let first = register_files_with(
         &attached_writer(&connstr, &data_path),
         &data_path,
         std::path::Path::new("/"),
         &payload,
     )
     .expect("first register_files failed");
-    let replay = register_files(
+    let replay = register_files_with(
         &attached_writer(&connstr, &data_path),
         &data_path,
         std::path::Path::new("/"),
@@ -801,7 +827,7 @@ fn register_files_replayed_before_the_earlier_call_committed_fails_closed() {
     ));
     move_file(&staging.path().join("reference_membership.parquet"), &dest).unwrap();
 
-    let err = register_files(
+    let err = register_files_with(
         &attached_writer(&connstr, &data_path),
         &data_path,
         std::path::Path::new("/"),
@@ -830,7 +856,7 @@ fn register_files_replayed_after_its_rows_were_deleted_registers_nothing() {
         let ticket: i64 = ref_idx * 1000 + std::process::id() as i64;
         prepare_membership_table(&connstr, &data_path, ref_idx);
         let (_staging, payload) = seed_membership_registration(ref_idx, ticket);
-        let first = register_files(
+        let first = register_files_with(
             &attached_writer(&connstr, &data_path),
             &data_path,
             std::path::Path::new("/"),
@@ -844,7 +870,7 @@ fn register_files_replayed_after_its_rows_were_deleted_registers_nothing() {
         ))
         .unwrap();
 
-        let replay = register_files(
+        let replay = register_files_with(
             &attached_writer(&connstr, &data_path),
             &data_path,
             std::path::Path::new("/"),
@@ -894,7 +920,7 @@ fn register_files_replayed_after_lake_gc_removed_its_files_registers_nothing() {
         let (staging, payload) = seed_membership_registration(ref_idx, ticket);
         let staged = staging.path().join("reference_membership.parquet");
         let staged_bytes = std::fs::read(&staged).unwrap();
-        let first = register_files(
+        let first = register_files_with(
             &attached_writer(&connstr, &data_path),
             &data_path,
             std::path::Path::new("/"),
@@ -913,7 +939,7 @@ fn register_files_replayed_after_lake_gc_removed_its_files_registers_nothing() {
             std::fs::write(&staged, &staged_bytes).unwrap();
         }
 
-        let replay = register_files(
+        let replay = register_files_with(
             &attached_writer(&connstr, &data_path),
             &data_path,
             std::path::Path::new("/"),
@@ -942,7 +968,7 @@ fn register_files_replayed_after_a_registration_the_ledger_never_recorded_regist
     let ticket: i64 = 987_000_000 + std::process::id() as i64;
     prepare_membership_table(&connstr, &data_path, ref_idx);
     let (_staging, payload) = seed_membership_registration(ref_idx, ticket);
-    let first = register_files(
+    let first = register_files_with(
         &attached_writer(&connstr, &data_path),
         &data_path,
         std::path::Path::new("/"),
@@ -957,7 +983,7 @@ fn register_files_replayed_after_a_registration_the_ledger_never_recorded_regist
     )
     .unwrap();
 
-    let replay = register_files(
+    let replay = register_files_with(
         &attached_writer(&connstr, &data_path),
         &data_path,
         std::path::Path::new("/"),
@@ -996,7 +1022,7 @@ fn register_files_with_its_payload_partly_in_the_ledger_fails_closed() {
             "second.parquet".to_string(),
             "reference_membership".to_string(),
         );
-        let first = register_files(
+        let first = register_files_with(
             &attached_writer(&connstr, &data_path),
             &data_path,
             std::path::Path::new("/"),
@@ -1019,7 +1045,7 @@ fn register_files_with_its_payload_partly_in_the_ledger_fails_closed() {
             .unwrap();
         }
 
-        let err = register_files(
+        let err = register_files_with(
             &attached_writer(&connstr, &data_path),
             &data_path,
             std::path::Path::new("/"),
@@ -1048,8 +1074,8 @@ fn register_files_with_its_payload_partly_in_the_ledger_fails_closed() {
 
 /// Why `landed` can read the ledger after a failed COMMIT: the failure has ended
 /// the transaction, so the attempt's own ledger row is gone rather than visible
-/// to it, and the connection can BEGIN again. Two writers take
-/// `registration_lock` and each record a row; the second to commit loses.
+/// to it, and the connection can BEGIN again. Two writers update the one row of a
+/// table of this test's own and each record a row; the second to commit loses.
 #[test]
 #[serial_test::serial]
 #[cfg(feature = "integration")]
@@ -1058,12 +1084,18 @@ fn ducklake_failed_commit_ends_the_transaction() {
     let data_path = crate::test_catalog::data_path();
     let setup = Connection::open_in_memory().unwrap();
     ducklake::connect_ducklake(&setup, &connstr, &data_path).unwrap();
-    ducklake::ensure_registration_lock(&setup).unwrap();
+    setup
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS qiita_lake.failed_commit_test_row (epoch BIGINT);
+             INSERT INTO qiita_lake.failed_commit_test_row
+             SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM qiita_lake.failed_commit_test_row);",
+        )
+        .unwrap();
     ducklake::ensure_registered_file_table(&setup).unwrap();
     let loser_file = format!("failed-commit-{}", std::process::id());
     let record = |conn: &Connection, file: &str| {
         conn.execute_batch("BEGIN TRANSACTION").unwrap();
-        conn.execute_batch("UPDATE qiita_lake.registration_lock SET epoch = epoch + 1")
+        conn.execute_batch("UPDATE qiita_lake.failed_commit_test_row SET epoch = epoch + 1")
             .unwrap();
         conn.execute(
             "INSERT INTO qiita_lake.registered_file VALUES (?, 'read', 0, now())",
@@ -1088,7 +1120,7 @@ fn ducklake_failed_commit_ends_the_transaction() {
 
     loser
         .execute_batch("COMMIT")
-        .expect_err("both writers of registration_lock committed");
+        .expect_err("both writers of the row committed");
 
     assert_eq!(
         recorded(&loser),
@@ -1126,7 +1158,7 @@ fn register_files_that_fails_after_its_moves_returns_the_files_to_staging() {
         ))
         .unwrap();
 
-    let err = register_files(
+    let err = register_files_with(
         &attached_writer(&connstr, &data_path),
         &data_path,
         std::path::Path::new("/"),
@@ -1148,7 +1180,7 @@ fn register_files_that_fails_after_its_moves_returns_the_files_to_staging() {
 
     // The same payload, with the file fixed in staging, registers.
     std::fs::write(&good, good_bytes).unwrap();
-    register_files(
+    register_files_with(
         &attached_writer(&connstr, &data_path),
         &data_path,
         std::path::Path::new("/"),
@@ -1188,7 +1220,7 @@ fn register_files_fails_closed_on_a_destination_there_before_it_moves() {
     std::fs::create_dir_all(taken.parent().unwrap()).unwrap();
     std::fs::write(&taken, b"not ours").unwrap();
 
-    let err = register_files(
+    let err = register_files_with(
         &attached_writer(&connstr, &data_path),
         &data_path,
         std::path::Path::new("/"),
@@ -1260,7 +1292,7 @@ fn register_files_whose_commit_answer_is_lost_registers_once() {
     let (_staging, payload) = seed_membership_registration(ref_idx, ticket);
     let (proxied, cut) = catalog_that_loses_a_commit_answer(&connstr);
 
-    let registration = register_files(
+    let registration = register_files_with(
         &attached_writer(&proxied, &data_path),
         &data_path,
         std::path::Path::new("/"),
@@ -1289,7 +1321,7 @@ fn a_failed_registration_the_ledger_records_whole_is_answered_as_committed() {
     prepare_membership_table(&connstr, &data_path, ref_idx);
     let (staging, payload) = seed_membership_registration(ref_idx, ticket);
     let writer = attached_writer(&connstr, &data_path);
-    let committed = register_files(&writer, &data_path, std::path::Path::new("/"), &payload)
+    let committed = register_files_with(&writer, &data_path, std::path::Path::new("/"), &payload)
         .expect("register_files failed");
     let placed: Vec<PlacedFile> = committed
         .registered
@@ -1334,7 +1366,7 @@ fn ducklake_add_data_files_accepts_a_path_it_already_holds() {
     let ticket: i64 = ref_idx;
     prepare_membership_table(&connstr, &data_path, ref_idx);
     let (_staging, payload) = seed_membership_registration(ref_idx, ticket);
-    let first = register_files(
+    let first = register_files_with(
         &attached_writer(&connstr, &data_path),
         &data_path,
         std::path::Path::new("/"),
@@ -1366,7 +1398,7 @@ fn delete_then_reregister(
 ) -> Vec<tempfile::TempDir> {
     prepare_membership_table(connstr, data_path, ref_idx);
     let (first_dir, first) = seed_membership_registration(ref_idx, ref_idx * 10);
-    register_files(
+    register_files_with(
         &attached_writer(connstr, data_path),
         data_path,
         std::path::Path::new("/"),
@@ -1382,7 +1414,7 @@ fn delete_then_reregister(
         )
         .unwrap();
     let (second_dir, second) = seed_membership_registration(ref_idx, ref_idx * 10 + 1);
-    register_files(
+    register_files_with(
         &attached_writer(connstr, data_path),
         data_path,
         std::path::Path::new("/"),
@@ -1463,7 +1495,7 @@ fn ducklake_read_after_a_failed_commit_sees_the_current_catalog() {
     let delete = "DELETE FROM qiita_lake.reference_membership WHERE reference_idx = ?";
     prepare_membership_table(&connstr, &data_path, ref_idx);
     let (_first_dir, first) = seed_membership_registration(ref_idx, ref_idx * 10);
-    register_files(
+    register_files_with(
         &attached_writer(&connstr, &data_path),
         &data_path,
         std::path::Path::new("/"),
@@ -1478,7 +1510,7 @@ fn ducklake_read_after_a_failed_commit_sees_the_current_catalog() {
         .execute(delete, [ref_idx])
         .unwrap();
     let (_second_dir, second) = seed_membership_registration(ref_idx, ref_idx * 10 + 1);
-    let committed = register_files(
+    let committed = register_files_with(
         &attached_writer(&connstr, &data_path),
         &data_path,
         std::path::Path::new("/"),
@@ -1607,7 +1639,6 @@ fn register_files_replaces_shared_contigs_across_assembly_runs() {
         let conn = Connection::open_in_memory().unwrap();
         ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
         ducklake::ensure_assembly_tables(&conn).unwrap();
-        ducklake::ensure_registration_lock(&conn).unwrap();
         ducklake::ensure_registered_file_table(&conn).unwrap();
         conn.execute_batch(&format!(
             "DELETE FROM qiita_lake.assembled_sequence \
@@ -1631,7 +1662,7 @@ fn register_files_replaces_shared_contigs_across_assembly_runs() {
             &["ACGTACGT", "ACGT"],
         ),
     ]);
-    let outcome_a = register_files(
+    let outcome_a = register_files_with(
         &attached_writer(&connstr, &data_path),
         &data_path,
         std::path::Path::new("/"),
@@ -1653,7 +1684,7 @@ fn register_files_replaces_shared_contigs_across_assembly_runs() {
         ),
         (b_only, "00000000-0000-0000-0000-000000971012", &["ACGT"]),
     ]);
-    let outcome_b = register_files(
+    let outcome_b = register_files_with(
         &attached_writer(&connstr, &data_path),
         &data_path,
         std::path::Path::new("/"),
@@ -1744,7 +1775,6 @@ fn register_files_re_registering_the_same_contigs_does_not_accumulate() {
         let conn = Connection::open_in_memory().unwrap();
         ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
         ducklake::ensure_assembly_tables(&conn).unwrap();
-        ducklake::ensure_registration_lock(&conn).unwrap();
         ducklake::ensure_registered_file_table(&conn).unwrap();
         conn.execute_batch(&format!(
             "DELETE FROM qiita_lake.assembled_sequence WHERE feature_idx = {feature};
@@ -1760,7 +1790,7 @@ fn register_files_re_registering_the_same_contigs_does_not_accumulate() {
     )];
     for attempt in 0..3 {
         let staging = seed_assembly_staging(contigs);
-        register_files(
+        register_files_with(
             &attached_writer(&connstr, &data_path),
             &data_path,
             std::path::Path::new("/"),
@@ -1841,7 +1871,7 @@ fn register_parquets(
         files,
         work_ticket_idx: ticket,
     };
-    register_files(
+    register_files_with(
         &attached_writer(connstr, data_path),
         data_path,
         std::path::Path::new("/"),
@@ -1849,7 +1879,7 @@ fn register_parquets(
     )
     .unwrap_or_else(|e| {
         let names: Vec<&str> = tables.iter().map(|(table, _)| *table).collect();
-        panic!("register_files({names:?}) failed: {e}")
+        panic!("register_files_with({names:?}) failed: {e}")
     })
 }
 
@@ -2017,7 +2047,7 @@ fn register_read_files(
         files,
         work_ticket_idx: ticket,
     };
-    register_files(
+    register_files_with(
         &attached_writer(connstr, data_path),
         data_path,
         std::path::Path::new("/"),
@@ -2282,7 +2312,6 @@ fn register_files_replaces_run_scoped_tables_on_the_whole_key() {
         ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
         ducklake::ensure_assembly_tables(&conn).unwrap();
         ducklake::ensure_reference_tables(&conn).unwrap();
-        ducklake::ensure_registration_lock(&conn).unwrap();
         ducklake::ensure_registered_file_table(&conn).unwrap();
         for where_clause in [&a_p, &b_p, &a_q] {
             conn.execute_batch(&format!(
@@ -2476,7 +2505,6 @@ fn an_empty_bin_quality_still_supersedes_the_runs_rows() {
         let conn = Connection::open_in_memory().unwrap();
         ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
         ducklake::ensure_assembly_tables(&conn).unwrap();
-        ducklake::ensure_registration_lock(&conn).unwrap();
         ducklake::ensure_registered_file_table(&conn).unwrap();
         conn.execute_batch(&format!(
             "DELETE FROM qiita_lake.assembly_membership WHERE {where_clause};
@@ -2589,7 +2617,6 @@ fn an_empty_myloasm_table_still_supersedes_the_runs_rows() {
         let conn = Connection::open_in_memory().unwrap();
         ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
         ducklake::ensure_myloasm_tables(&conn).unwrap();
-        ducklake::ensure_registration_lock(&conn).unwrap();
         conn.execute_batch(&format!(
             "DELETE FROM qiita_lake.myloasm_run WHERE {where_clause};
              DELETE FROM qiita_lake.myloasm_mapping WHERE {where_clause};"
@@ -2764,13 +2791,13 @@ fn every_content_addressed_lake_table_is_registered() {
 /// Concurrent registrations of one feature leave ONE row, and every writer
 /// succeeds.
 ///
-/// This is the case the replace-by-key DELETE alone does not cover — see
-/// `register_files`' transaction for why — and so the test that `registration_lock`
-/// answers for.
-///
-/// Runs against a lake that does NOT already hold the feature, because
-/// pre-seeding it would make the DELETE conflict and the test would green with
-/// the lock removed.
+/// Runs without the global lake lock, which would otherwise keep the writers from
+/// overlapping at all, so what keeps one row here is DuckLake's conflict
+/// detection: each writer's replace-by-key DELETE conflicts with the others'
+/// inserts into the table (`crate::lake_locks`), so all but one lose their
+/// COMMIT, re-run, and replace the row that committed. Runs against a lake that
+/// does not already hold the feature, so every writer's first DELETE removes
+/// nothing.
 #[test]
 #[serial_test::serial]
 #[cfg(feature = "integration")]
@@ -2786,7 +2813,6 @@ fn concurrent_registrations_of_one_feature_leave_one_row() {
         let conn = Connection::open_in_memory().unwrap();
         ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
         ducklake::ensure_assembly_tables(&conn).unwrap();
-        ducklake::ensure_registration_lock(&conn).unwrap();
         ducklake::ensure_registered_file_table(&conn).unwrap();
         conn.execute_batch(&format!(
             "DELETE FROM qiita_lake.assembled_sequence WHERE feature_idx = {shared};
@@ -2798,8 +2824,7 @@ fn concurrent_registrations_of_one_feature_leave_one_row() {
     // Stage every writer's Parquet BEFORE spawning, and release them from a
     // barrier, so the only work between the threads starting and their
     // transactions is `register_files` itself. Seeding inside the threads
-    // staggers them past each other, and the test then greens with the lock
-    // removed.
+    // staggers them past each other, so they would not overlap.
     let payloads: Vec<(tempfile::TempDir, auth::ActionPayload)> = (0..WRITERS)
         .map(|i| {
             let staging = seed_assembly_staging(&[(
@@ -2824,8 +2849,10 @@ fn concurrent_registrations_of_one_feature_leave_one_row() {
                     start.wait();
                     // Each writer attaches for itself, as each concurrent
                     // request borrows its own instance in production.
+                    let conn = attached_writer(connstr, data_path);
                     register_files(
-                        &attached_writer(connstr, data_path),
+                        &|| Ok(&conn),
+                        &LakeLocks::without_global_lock(connstr.clone()),
                         data_path,
                         std::path::Path::new("/"),
                         payload,
@@ -2900,7 +2927,6 @@ fn register_files_replaces_sequences_shared_across_references() {
         let conn = Connection::open_in_memory().unwrap();
         ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
         ducklake::ensure_reference_tables(&conn).unwrap();
-        ducklake::ensure_registration_lock(&conn).unwrap();
         ducklake::ensure_registered_file_table(&conn).unwrap();
         conn.execute_batch(&format!(
             "DELETE FROM qiita_lake.reference_sequences \
@@ -2941,7 +2967,7 @@ fn register_files_replaces_sequences_shared_across_references() {
             files,
             work_ticket_idx: ticket,
         };
-        let outcome = register_files(
+        let outcome = register_files_with(
             &attached_writer(&connstr, &data_path),
             &data_path,
             std::path::Path::new("/"),
@@ -3062,4 +3088,604 @@ fn register_ducklake_add_data_files_rolls_back_within_transaction() {
         "ROLLBACK must unwind the registration — the wrap in register_files \
          is only atomic if DuckLake honors the enclosing transaction"
     );
+}
+
+/// An amplicon run's `amplicon_membership` alone, staged for registration: the
+/// one run-keyed table with no feature-keyed table beside it in the payload.
+#[cfg(feature = "integration")]
+fn amplicon_membership_payload(
+    prep_sample_idx: i64,
+    processing_idx: i64,
+    ticket: i64,
+) -> (tempfile::TempDir, auth::ActionPayload) {
+    let staging = tempfile::tempdir().unwrap();
+    Connection::open_in_memory()
+        .unwrap()
+        .execute_batch(&format!(
+            "COPY (SELECT {prep_sample_idx}::BIGINT AS prep_sample_idx, \
+                    {processing_idx}::BIGINT AS processing_idx, \
+                    range::BIGINT AS feature_idx, 1::BIGINT AS count FROM range(3)) \
+             TO '{}' (FORMAT PARQUET)",
+            staging.path().join("amplicon_membership.parquet").display()
+        ))
+        .unwrap();
+    let payload = auth::ActionPayload {
+        action: "register_files".to_string(),
+        staging_dir: staging.path().to_str().unwrap().to_string(),
+        files: [(
+            "amplicon_membership.parquet".to_string(),
+            "amplicon_membership".to_string(),
+        )]
+        .into_iter()
+        .collect(),
+        work_ticket_idx: ticket,
+    };
+    (staging, payload)
+}
+
+/// One `LakeLocks` per writer, as writers in separate processes have.
+#[cfg(feature = "integration")]
+fn locks_per_writer(writers: usize, make: impl Fn(String) -> LakeLocks) -> Vec<LakeLocks> {
+    (0..writers)
+        .map(|_| make(crate::test_catalog::connstr()))
+        .collect()
+}
+
+/// Register every payload at once, each writer on its own connection, writer `i`
+/// with `locks[i % locks.len()]`, released together from a barrier.
+#[cfg(feature = "integration")]
+fn register_together(
+    payloads: &[(tempfile::TempDir, auth::ActionPayload)],
+    locks: &[LakeLocks],
+) -> Vec<Result<Registration, Status>> {
+    let connstr = crate::test_catalog::connstr();
+    let data_path = crate::test_catalog::data_path();
+    let start = std::sync::Barrier::new(payloads.len());
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = payloads
+            .iter()
+            .enumerate()
+            .map(|(i, (_staging, payload))| {
+                let (connstr, data_path, start) = (&connstr, &data_path, &start);
+                let locks = &locks[i % locks.len()];
+                scope.spawn(move || {
+                    let conn = attached_writer(connstr, data_path);
+                    start.wait();
+                    register_files(
+                        &|| Ok(&conn),
+                        locks,
+                        data_path,
+                        std::path::Path::new("/"),
+                        payload,
+                    )
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    })
+}
+
+#[cfg(feature = "integration")]
+fn prepare_amplicon_and_assembly_tables() {
+    let conn = Connection::open_in_memory().unwrap();
+    ducklake::connect_ducklake(
+        &conn,
+        &crate::test_catalog::connstr(),
+        &crate::test_catalog::data_path(),
+    )
+    .unwrap();
+    ducklake::ensure_assembly_tables(&conn).unwrap();
+    ducklake::ensure_amplicon_tables(&conn).unwrap();
+    ducklake::ensure_registered_file_table(&conn).unwrap();
+}
+
+/// Writers that delete from a replace-keyed table hold the global lake lock, so
+/// none loses a COMMIT to another; without it, the same writers do.
+///
+/// Each loads a feature of its own that the lake does not hold: what they share
+/// is only the table, which is where DuckLake detects the conflict.
+#[test]
+#[serial_test::serial]
+#[cfg(feature = "integration")]
+fn writers_that_delete_commit_at_the_first_attempt_under_the_global_lock() {
+    prepare_amplicon_and_assembly_tables();
+    let base_ticket: i64 = 974_000_000 + std::process::id() as i64 * 100;
+    let payloads =
+        |base_feature: i64, ticket: i64| -> Vec<(tempfile::TempDir, auth::ActionPayload)> {
+            (0..8)
+                .map(|i| {
+                    let feature = base_feature + i;
+                    let staging = seed_assembly_staging(&[(
+                        feature,
+                        &format!("00000000-0000-0000-0000-{feature:012}"),
+                        &["ACGTACGT", "ACGT"],
+                    )]);
+                    let payload = assembly_register_payload(&staging, 1, ticket + i);
+                    (staging, payload)
+                })
+                .collect()
+        };
+    let feature_base = 974_100_000 + (std::process::id() as i64 % 1000) * 100;
+
+    let locked = register_together(
+        &payloads(feature_base, base_ticket),
+        &locks_per_writer(8, LakeLocks::new),
+    );
+    let lost: u32 = locked
+        .iter()
+        .map(|r| {
+            r.as_ref()
+                .expect("a writer under the global lock failed")
+                .attempt
+        })
+        .sum();
+    assert_eq!(
+        lost, 0,
+        "writers holding the global lock lost {lost} COMMITs"
+    );
+
+    let unlocked = register_together(
+        &payloads(feature_base + 50, base_ticket + 50),
+        &locks_per_writer(8, LakeLocks::without_global_lock),
+    );
+    let lost: u32 = unlocked
+        .iter()
+        .map(|r| {
+            r.as_ref()
+                .expect("a writer without the global lock failed")
+                .attempt
+        })
+        .sum();
+    assert!(lost > 0, "8 overlapping writers that delete lost no COMMIT");
+}
+
+/// Concurrent registrations of the same new run all succeed and leave one copy of
+/// it. One copy is also what DuckLake's conflict detection leaves without the lock
+/// (each loser re-runs and replaces the run); this pins that the locked path keeps
+/// it.
+#[test]
+#[serial_test::serial]
+#[cfg(feature = "integration")]
+fn concurrent_registrations_of_one_new_run_leave_one_copy() {
+    prepare_amplicon_and_assembly_tables();
+    let connstr = crate::test_catalog::connstr();
+    let prep = 976_000_000 + std::process::id() as i64;
+    let payloads: Vec<_> = (0..4)
+        .map(|i| amplicon_membership_payload(prep, 7, prep * 10 + i))
+        .collect();
+
+    let outcomes = register_together(&payloads, &locks_per_writer(4, LakeLocks::new));
+    for (i, outcome) in outcomes.iter().enumerate() {
+        assert!(outcome.is_ok(), "writer {i}: {:?}", outcome.as_ref().err());
+    }
+    let reader = attached_conn(&connstr, &crate::test_catalog::data_path());
+    let rows: i64 = reader
+        .query_row(
+            "SELECT count(*) FROM qiita_lake.amplicon_membership \
+             WHERE prep_sample_idx = ? AND processing_idx = 7",
+            [prep],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        rows, 3,
+        "4 concurrent loads of one run, one copy of its 3 rows"
+    );
+}
+
+/// A registration waiting for the lake lock holds no pooled connection: the writer
+/// that ran its checks and moves is returned before the wait, and the one that
+/// commits is checked out after it.
+#[test]
+#[serial_test::serial]
+#[cfg(feature = "integration")]
+fn a_registration_waiting_for_the_lock_holds_no_pooled_writer() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct Counted<'a> {
+        writer: &'a LakeWriter,
+        out: &'a AtomicUsize,
+    }
+    impl std::borrow::Borrow<LakeWriter> for Counted<'_> {
+        fn borrow(&self) -> &LakeWriter {
+            self.writer
+        }
+    }
+    impl Drop for Counted<'_> {
+        fn drop(&mut self) {
+            self.out.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    prepare_amplicon_and_assembly_tables();
+    let connstr = crate::test_catalog::connstr();
+    let data_path = crate::test_catalog::data_path();
+    let feature = 978_000_000 + std::process::id() as i64;
+    let staging = seed_assembly_staging(&[(
+        feature,
+        &format!("00000000-0000-0000-0000-{feature:012}"),
+        &["ACGTACGT", "ACGT"],
+    )]);
+    let payload = assembly_register_payload(&staging, 1, feature);
+
+    let holder = LakeLocks::new(connstr.clone());
+    let mut held = holder.session("the test holder").unwrap();
+    held.lock_global().unwrap();
+    let out = AtomicUsize::new(0);
+    let checkouts = AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        let registering = scope.spawn(|| {
+            let conn = attached_writer(&connstr, &data_path);
+            let checkout = || {
+                out.fetch_add(1, Ordering::SeqCst);
+                checkouts.fetch_add(1, Ordering::SeqCst);
+                Ok(Counted {
+                    writer: &conn,
+                    out: &out,
+                })
+            };
+            register_files(
+                &checkout,
+                &LakeLocks::new(connstr.clone()),
+                &data_path,
+                std::path::Path::new("/"),
+                &payload,
+            )
+            .map(|registration| registration.registered.len())
+        });
+        // Until the registration's lock session waits on the global lock.
+        let watcher =
+            crate::lake_locks::open_lock_connection(&connstr, std::time::Duration::from_secs(5))
+                .unwrap();
+        let waiting = || -> i64 {
+            watcher
+                .query_row(
+                    "SELECT n FROM postgres_query('lock_session', \
+                     'SELECT count(*) AS n FROM pg_locks \
+                      WHERE locktype = ''advisory'' AND NOT granted \
+                      AND database = (SELECT oid FROM pg_database \
+                                      WHERE datname = current_database())')",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        let began_by = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while waiting() == 0 && std::time::Instant::now() < began_by {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(waiting() > 0, "the registration did not wait for the lock");
+        assert_eq!(
+            out.load(Ordering::SeqCst),
+            0,
+            "a pooled writer is held during the lock wait"
+        );
+        drop(held);
+        let registered = registering.join().unwrap().expect("the registration");
+        assert_eq!(registered, payload.files.len());
+    });
+    assert_eq!(checkouts.load(Ordering::SeqCst), 2, "one writer per phase");
+}
+
+/// A registration that gives up waiting for its lake lock puts its moved files
+/// back in staging, so the step can be run again once the lock is free.
+#[test]
+#[serial_test::serial]
+#[cfg(feature = "integration")]
+fn a_lock_wait_that_times_out_returns_the_files_to_staging() {
+    prepare_amplicon_and_assembly_tables();
+    let connstr = crate::test_catalog::connstr();
+    let data_path = crate::test_catalog::data_path();
+    let feature = 977_000_000 + std::process::id() as i64;
+    let staging = seed_assembly_staging(&[(
+        feature,
+        &format!("00000000-0000-0000-0000-{feature:012}"),
+        &["ACGTACGT", "ACGT"],
+    )]);
+    let payload = assembly_register_payload(&staging, 1, feature);
+    let conn = attached_writer(&connstr, &data_path);
+
+    let holder = LakeLocks::new(connstr.clone());
+    let mut held = holder.session("the test holder").unwrap();
+    held.lock_global().unwrap();
+    let refused = register_files(
+        &|| Ok(&conn),
+        &LakeLocks::with_budget(connstr.clone(), std::time::Duration::from_millis(500)),
+        &data_path,
+        std::path::Path::new("/"),
+        &payload,
+    )
+    .expect_err("a registration got the global lock while it was held");
+    assert_eq!(
+        refused.code(),
+        tonic::Code::Unavailable,
+        "{}",
+        refused.message()
+    );
+    assert!(
+        refused.message().contains("moved back to staging"),
+        "{}",
+        refused.message()
+    );
+    for filename in payload.files.keys() {
+        assert!(
+            staging.path().join(filename).exists(),
+            "{filename} is not back in staging"
+        );
+    }
+
+    drop(held);
+    let registration = register_files(
+        &|| Ok(&conn),
+        &LakeLocks::new(connstr.clone()),
+        &data_path,
+        std::path::Path::new("/"),
+        &payload,
+    )
+    .expect("the run again once the lock is free");
+    assert_eq!(registration.registered.len(), payload.files.len());
+}
+
+/// A second session waiting for the global lock gets it once the first is
+/// released.
+#[test]
+#[serial_test::serial]
+#[cfg(feature = "integration")]
+fn a_session_waiting_for_the_global_lock_gets_it_when_released() {
+    use std::time::{Duration, Instant};
+    let connstr = crate::test_catalog::connstr();
+    let first = LakeLocks::new(connstr.clone());
+    let mut held = first.session("the first holder").unwrap();
+    held.lock_global().unwrap();
+
+    let queued_connstr = connstr.clone();
+    let queued = std::thread::spawn(move || {
+        let second = LakeLocks::new(queued_connstr);
+        let started = Instant::now();
+        let mut session = second.session("the queued taker").unwrap();
+        session.lock_global().map(|()| started.elapsed())
+    });
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(!queued.is_finished(), "the queued taker got a held lock");
+    drop(held);
+    let waited = queued.join().unwrap().unwrap();
+    assert!(waited >= Duration::from_millis(300), "waited {waited:?}");
+}
+
+/// Register `prep_sample_idx`'s amplicon run 1 once, so a later registration of
+/// it replaces.
+#[cfg(feature = "integration")]
+fn seed_amplicon_run(prep_sample_idx: i64, ticket: i64) {
+    let (_staging, payload) = amplicon_membership_payload(prep_sample_idx, 1, ticket);
+    let data_path = crate::test_catalog::data_path();
+    let conn = attached_writer(&crate::test_catalog::connstr(), &data_path);
+    register_files(
+        &|| Ok(&conn),
+        &test_locks(),
+        &data_path,
+        std::path::Path::new("/"),
+        &payload,
+    )
+    .unwrap();
+}
+
+/// Writer 0 replaces a run the lake holds while 8 others insert new runs into
+/// the same table, released together, `rounds` times; the COMMITs they lost in all.
+#[cfg(feature = "integration")]
+fn lost_beside_new_runs(base: i64, rounds: i64, locks: &[LakeLocks]) -> u32 {
+    seed_amplicon_run(base, base);
+    let mut lost = 0;
+    for round in 0..rounds {
+        let first = base + 1 + round * 10;
+        let mut payloads = vec![amplicon_membership_payload(base, 1, first)];
+        payloads.extend((1..9).map(|i| amplicon_membership_payload(first + i, 1, first + i)));
+        let outcomes = register_together(&payloads, locks);
+        for (i, outcome) in outcomes.iter().enumerate() {
+            let registration = outcome
+                .as_ref()
+                .unwrap_or_else(|e| panic!("round {round} writer {i}: {e:?}"));
+            assert_eq!(
+                registration.replaced.is_empty(),
+                i != 0,
+                "round {round} writer {i}: replaced {:?}",
+                registration.replaced
+            );
+            lost += registration.attempt;
+        }
+    }
+    lost
+}
+
+/// A registration that replaces a run and those inserting new runs into its table
+/// all hold the global lock, so none loses a COMMIT; without it, they do.
+#[test]
+#[serial_test::serial]
+#[cfg(feature = "integration")]
+fn a_replace_beside_new_runs_of_its_table_loses_no_commit() {
+    prepare_amplicon_and_assembly_tables();
+    let base = 978_000_000 + (std::process::id() as i64 % 1000) * 1000;
+
+    let lost = lost_beside_new_runs(base, 3, &locks_per_writer(9, LakeLocks::new));
+    assert_eq!(lost, 0, "writers under the global lock lost {lost} COMMITs");
+
+    let lost = lost_beside_new_runs(
+        base + 500,
+        5,
+        &locks_per_writer(9, LakeLocks::without_global_lock),
+    );
+    assert!(lost > 0, "a replace beside 8 new runs lost no COMMIT");
+}
+
+/// Writers in one process share its two lock sessions: replaces and
+/// new runs, more of them than there are sessions, all register.
+#[test]
+#[serial_test::serial]
+#[cfg(feature = "integration")]
+fn writers_sharing_one_process_lake_locks_all_register() {
+    prepare_amplicon_and_assembly_tables();
+    let base = 980_000_000 + (std::process::id() as i64 % 1000) * 1000;
+    seed_amplicon_run(base, base);
+    seed_amplicon_run(base + 1, base + 1);
+    // Two replaces, of the two seeded runs, and four new runs.
+    let payloads: Vec<_> = (0..6)
+        .map(|i| amplicon_membership_payload(base + i, 1, base + 10 + i))
+        .collect();
+    let shared = [LakeLocks::new(crate::test_catalog::connstr())];
+    let outcomes = register_together(&payloads, &shared);
+    for (i, outcome) in outcomes.iter().enumerate() {
+        let registration = outcome
+            .as_ref()
+            .unwrap_or_else(|e| panic!("writer {i}: {e:?}"));
+        assert_eq!(registration.attempt, 0, "writer {i} lost a COMMIT");
+        assert_eq!(registration.replaced.is_empty(), i >= 2, "writer {i}");
+    }
+}
+
+/// A session's waits share one budget: time spent waiting for a lock session
+/// leaves less for the global lock.
+#[test]
+#[serial_test::serial]
+#[cfg(feature = "integration")]
+fn a_sessions_waits_end_at_one_budget() {
+    use std::time::{Duration, Instant};
+    let connstr = crate::test_catalog::connstr();
+    let global_holder = LakeLocks::new(connstr.clone());
+    let mut holding_global = global_holder.session("the global holder").unwrap();
+    holding_global.lock_global().unwrap();
+
+    let budget = Duration::from_millis(800);
+    let release_sessions_after = Duration::from_millis(500);
+    let waiter = LakeLocks::with_budget(connstr, budget);
+    // Every lock session of the waiter's process is taken.
+    let taken: Vec<_> = (0..crate::lake_locks::LOCK_SESSIONS)
+        .map(|_| waiter.session("a session holder").unwrap())
+        .collect();
+    let started = Instant::now();
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            std::thread::sleep(release_sessions_after);
+            drop(taken);
+        });
+        let mut session = waiter.session("the waiter").unwrap();
+        assert!(started.elapsed() >= release_sessions_after);
+        let refused = session
+            .lock_global()
+            .expect_err("got the global lock while it was held");
+        assert_eq!(refused.code(), tonic::Code::Unavailable);
+    });
+    // The global wait used the rest of the budget, and no more.
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= budget - Duration::from_millis(100)
+            && elapsed < budget + Duration::from_millis(400),
+        "the waits took {elapsed:?} on a budget of {budget:?}"
+    );
+    drop(holding_global);
+}
+
+/// Postgres releases the lock when the session's backend ends: another session
+/// takes it at once.
+#[test]
+#[serial_test::serial]
+#[cfg(feature = "integration")]
+fn a_lock_is_released_when_its_session_backend_ends() {
+    let connstr = crate::test_catalog::connstr();
+    let locks = LakeLocks::new(connstr.clone());
+    let mut session = locks.session("the test session").unwrap();
+    session.lock_global().unwrap();
+
+    let pid = session.backend_pid();
+    let killer =
+        crate::lake_locks::open_lock_connection(&connstr, std::time::Duration::from_secs(5))
+            .unwrap();
+    let ended: bool = killer
+        .query_row(
+            &format!(
+                "SELECT ended FROM postgres_query('lock_session', \
+                 'SELECT pg_terminate_backend({pid}) AS ended')"
+            ),
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(ended, "the session's backend was not ended");
+
+    let next = LakeLocks::with_budget(connstr, std::time::Duration::from_millis(500));
+    let mut taker = next.session("the next taker").unwrap();
+    taker.lock_global().expect("the lock was not released");
+}
+
+/// A lock session asks the catalog server for the keepalives that end it when
+/// its data plane can no longer be reached.
+#[test]
+#[serial_test::serial]
+#[cfg(feature = "integration")]
+fn a_lock_session_sets_its_server_keepalives() {
+    let conn = crate::lake_locks::open_lock_connection(
+        &crate::test_catalog::connstr(),
+        std::time::Duration::from_secs(5),
+    )
+    .unwrap();
+    let setting = |name: &str| -> String {
+        conn.query_row(
+            &format!(
+                "SELECT v FROM postgres_query('lock_session', \
+                 'SELECT current_setting(''{name}'') AS v')"
+            ),
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(setting("tcp_keepalives_idle"), "30");
+    assert_eq!(setting("tcp_keepalives_interval"), "10");
+    assert_eq!(setting("tcp_keepalives_count"), "3");
+}
+
+/// A lock session keeps the lock past an `idle_in_transaction_session_timeout`
+/// set on the catalog's database, while it sits idle in its transaction.
+#[test]
+#[serial_test::serial]
+#[cfg(feature = "integration")]
+fn a_lock_session_outlasts_an_idle_in_transaction_timeout() {
+    let connstr = crate::test_catalog::connstr();
+    let admin = duckdb::Connection::open_in_memory().unwrap();
+    admin
+        .execute_batch(&format!(
+            "LOAD postgres; ATTACH '{connstr}' AS admin (TYPE postgres);"
+        ))
+        .unwrap();
+    let database: String = admin
+        .query_row(
+            "SELECT db FROM postgres_query('admin', 'SELECT current_database() AS db')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let alter = |value: &str| {
+        admin.execute_batch(&format!(
+            "CALL postgres_execute('admin', \
+             'ALTER DATABASE \"{database}\" {value}');"
+        ))
+    };
+    struct Reset<F: Fn(&str) -> duckdb::Result<()>>(F);
+    impl<F: Fn(&str) -> duckdb::Result<()>> Drop for Reset<F> {
+        fn drop(&mut self) {
+            if let Err(e) = (self.0)("RESET idle_in_transaction_session_timeout") {
+                eprintln!("could not reset idle_in_transaction_session_timeout: {e}");
+            }
+        }
+    }
+    alter("SET idle_in_transaction_session_timeout = ''500ms''").unwrap();
+    let _reset = Reset(alter);
+
+    let locks = LakeLocks::new(connstr.clone());
+    let mut session = locks.session("the idle holder").unwrap();
+    session.lock_global().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    let other = LakeLocks::with_budget(connstr, std::time::Duration::from_millis(300));
+    let mut taker = other.session("another writer").unwrap();
+    taker
+        .lock_global()
+        .expect_err("the idle-in-transaction timeout ended the holder's session");
+    drop(session);
 }

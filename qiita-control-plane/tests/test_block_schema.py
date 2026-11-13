@@ -98,6 +98,8 @@ async def test_block_table_columns(postgres_pool):
     assert cols["created_at"][1] is True
     assert cols["updated_at"][0].startswith("timestamp with time zone")
     assert cols["updated_at"][1] is True
+    # Nullable: NULL for a block never re-armed.
+    assert cols["rearmed_at"] == ("timestamp with time zone", False)
 
 
 async def test_block_state_check(postgres_pool):
@@ -105,6 +107,27 @@ async def test_block_state_check(postgres_pool):
     joined = " ".join(defs.values())
     for state in ("pending", "processing", "completed", "failed"):
         assert state in joined, f"block.state CHECK is missing {state!r}: {defs}"
+
+
+async def test_every_block_state_constant_passes_the_check(postgres_pool):
+    """The names in repositories/block.py are values the CHECK admits."""
+    from qiita_control_plane.repositories import block
+
+    states = [
+        block.BLOCK_PENDING,
+        block.BLOCK_PROCESSING,
+        block.BLOCK_FAILED,
+        block.BLOCK_COMPLETED,
+        block.BLOCK_ABANDONED,
+    ]
+    async with postgres_pool.acquire() as conn:
+        for state in states:
+            tx = conn.transaction()
+            await tx.start()
+            try:
+                await conn.execute("INSERT INTO qiita.block (state) VALUES ($1)", state)
+            finally:
+                await tx.rollback()
 
 
 async def test_block_state_check_rejects_bad_state(postgres_pool):

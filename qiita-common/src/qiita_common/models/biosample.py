@@ -127,6 +127,16 @@ class BiosampleImportResponse(BaseModel):
     owner_id_biosample_study_field_created: bool
 
 
+class BiosampleStudyLinkResponse(BaseModel):
+    """One qiita.biosample_to_study row, as created by POST
+    /api/v1/study/{study_idx}/biosample/{biosample_idx}/link."""
+
+    biosample_idx: Annotated[int, Field(gt=0)]
+    study_idx: Annotated[int, Field(gt=0)]
+    created_by_idx: Annotated[int, Field(gt=0)]
+    created_at: AwareDatetime
+
+
 # Size caps for one bulk biosample import. A batch runs in one request and one
 # transaction, so it must fit nginx's default 1 MiB request body on the REST
 # location, finish well inside the gateway's 60 s read timeout, and not hold the

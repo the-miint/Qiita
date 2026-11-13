@@ -362,14 +362,14 @@ URL_UPLOAD_DONE = f"{URL_UPLOAD_PREFIX}{PATH_UPLOAD_DONE}"
 # =============================================================================
 # /ena-import-batch/* — batch multi-study ENA import driver
 # =============================================================================
-# POST accepts a list of INSDC study accessions and returns a batch handle
+# POST accepts a list of INSDC study or run accessions and returns a batch handle
 # immediately (202); the resolve+register+download-submit work runs in a
 # background task (qiita_control_plane.ena_import.batch). GET polls the
-# per-item rolled-up state. ADMIN-only (wet_lab_admin / system_admin) — see
-# routes/ena_import.py.
+# per-item rolled-up state; GET on the prefix lists batches. ADMIN-only
+# (wet_lab_admin / system_admin) — see routes/ena_import.py.
 
 PATH_ENA_IMPORT_BATCH_PREFIX = "/ena-import-batch"
-PATH_ENA_IMPORT_BATCH_ROOT = ""  # POST (submit) against the prefix itself
+PATH_ENA_IMPORT_BATCH_ROOT = ""  # POST (submit) and GET (list) against the prefix itself
 PATH_ENA_IMPORT_BATCH_BY_IDX = "/{ena_import_batch_idx}"
 
 URL_ENA_IMPORT_BATCH_PREFIX = f"{API_PREFIX}{PATH_ENA_IMPORT_BATCH_PREFIX}"
@@ -501,6 +501,12 @@ PATH_ALIGNMENT_DEFINITION_SAMPLE_STATUS = "/{alignment_idx}/sample-status"
 # POST: give up on the align plan's unfinished blocks and clear the pending gates
 # they covered, so the prep_samples can be re-planned with only_missing=true.
 PATH_ALIGNMENT_DEFINITION_ABANDON_PLAN = "/{alignment_idx}/abandon-plan"
+# POST: re-arm one COMPLETED align block ticket (or retry a FAILED re-run under a
+# deprecated mask) so the align workflow replaces the block's rows.
+PATH_ALIGNMENT_DEFINITION_RERUN_BLOCK = "/{alignment_idx}/rerun-block"
+# POST: delete the alignment rows of one prep_sample that has no gate under the
+# alignment (rows a block wrote under a prep_sample_idx nothing tracks).
+PATH_ALIGNMENT_DEFINITION_PURGE_SAMPLE_ROWS = "/{alignment_idx}/purge-sample-rows"
 
 URL_ALIGNMENT_DEFINITION_PREFIX = f"{API_PREFIX}{PATH_ALIGNMENT_DEFINITION_PREFIX}"
 URL_ALIGNMENT_DEFINITION_STATUS = (
@@ -511,6 +517,12 @@ URL_ALIGNMENT_DEFINITION_SAMPLE_STATUS = (
 )
 URL_ALIGNMENT_DEFINITION_ABANDON_PLAN = (
     f"{URL_ALIGNMENT_DEFINITION_PREFIX}{PATH_ALIGNMENT_DEFINITION_ABANDON_PLAN}"
+)
+URL_ALIGNMENT_DEFINITION_RERUN_BLOCK = (
+    f"{URL_ALIGNMENT_DEFINITION_PREFIX}{PATH_ALIGNMENT_DEFINITION_RERUN_BLOCK}"
+)
+URL_ALIGNMENT_DEFINITION_PURGE_SAMPLE_ROWS = (
+    f"{URL_ALIGNMENT_DEFINITION_PREFIX}{PATH_ALIGNMENT_DEFINITION_PURGE_SAMPLE_ROWS}"
 )
 
 # =============================================================================
@@ -923,6 +935,8 @@ PATH_BIOSAMPLE_LIST_BY_STUDY = "/{study_idx}/biosample/list-idxs"
 # anchor on the /study router (the caller is authorized on the study).
 PATH_BIOSAMPLE_BY_STUDY_AND_IDX = "/{study_idx}/biosample/{biosample_idx}"
 PATH_BIOSAMPLE_METADATA_BY_STUDY = "/{study_idx}/biosample/{biosample_idx}/metadata"
+# Link an existing biosample into the study (POST).
+PATH_BIOSAMPLE_STUDY_LINK = "/{study_idx}/biosample/{biosample_idx}/link"
 # The same study-scoped view, for a caller holding a study's own unique id for the
 # sample instead of its idx: a unique-in-study field's display_name and the
 # value it carries. POST (not GET) because the identifying value lives in the
@@ -943,6 +957,8 @@ PATH_BIOSAMPLE_STUDY_FIELD_BY_IDX = "/{study_idx}/biosample-field/{study_field_i
 
 PATH_BIOSAMPLE_PREFIX = "/biosample"
 PATH_BIOSAMPLE_BY_IDX = "/{biosample_idx}"
+# The studies that a biosample is actively linked to, with their accessions.
+PATH_BIOSAMPLE_STUDY_LIST = "/{biosample_idx}/study/list"
 # Bulk lookup of biosample_idx by a selectable biosample accession column
 # (biosample_accession or ena_sample_accession; default biosample_accession).
 # POST (not GET) because the accession list lives in the body — a typical
@@ -964,6 +980,7 @@ URL_BIOSAMPLE_BULK_BY_STUDY = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_BULK_BY_STUDY}
 URL_BIOSAMPLE_LIST_BY_STUDY = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_LIST_BY_STUDY}"
 URL_BIOSAMPLE_BY_STUDY_AND_IDX = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_BY_STUDY_AND_IDX}"
 URL_BIOSAMPLE_METADATA_BY_STUDY = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_METADATA_BY_STUDY}"
+URL_BIOSAMPLE_STUDY_LINK = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_STUDY_LINK}"
 URL_BIOSAMPLE_BY_STUDY_UNIQUE_FIELD = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_BY_STUDY_UNIQUE_FIELD}"
 URL_BIOSAMPLE_METADATA_BY_STUDY_UNIQUE_FIELD = (
     f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_METADATA_BY_STUDY_UNIQUE_FIELD}"
@@ -972,6 +989,7 @@ URL_BIOSAMPLE_STUDY_FIELD_BY_STUDY = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_STUDY_F
 URL_BIOSAMPLE_STUDY_FIELD_BY_IDX = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_STUDY_FIELD_BY_IDX}"
 URL_BIOSAMPLE_PREFIX = f"{API_PREFIX}{PATH_BIOSAMPLE_PREFIX}"
 URL_BIOSAMPLE_BY_IDX = f"{URL_BIOSAMPLE_PREFIX}{PATH_BIOSAMPLE_BY_IDX}"
+URL_BIOSAMPLE_STUDY_LIST = f"{URL_BIOSAMPLE_PREFIX}{PATH_BIOSAMPLE_STUDY_LIST}"
 URL_BIOSAMPLE_LOOKUP_BY_ACCESSION = f"{URL_BIOSAMPLE_PREFIX}{PATH_BIOSAMPLE_LOOKUP_BY_ACCESSION}"
 URL_BIOSAMPLE_LOOKUP_BY_MATRIX_TUBE_ID = (
     f"{URL_BIOSAMPLE_PREFIX}{PATH_BIOSAMPLE_LOOKUP_BY_MATRIX_TUBE_ID}"

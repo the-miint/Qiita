@@ -1,8 +1,6 @@
 """Repository modules holding the SQL for each resource.
 
-Repo-wide helpers used by every kind of repository module — guards,
-input validators, and the parameterized UPDATE composer shared across
-study, biosample, prep_sample, and the rest — live in this package init.
+Helpers that are not specific to one resource live in this package init.
 """
 
 import json
@@ -22,6 +20,22 @@ UpdatableTable = Literal[
     "qiita.prep_sample_study_field",
     "qiita.study",
 ]
+
+RowLock = Literal["update", "share"]
+
+_ROW_LOCK_CLAUSES: dict[RowLock, str] = {
+    "update": " FOR UPDATE",
+    "share": " FOR SHARE",
+}
+
+ExistsEntity = Literal["study", "sequencing_run", "prep_sample", "biosample"]
+
+_EXISTS_ENTITY_TABLES: dict[ExistsEntity, str] = {
+    "study": "qiita.study",
+    "sequencing_run": "qiita.sequencing_run",
+    "prep_sample": "qiita.prep_sample",
+    "biosample": "qiita.biosample",
+}
 
 # pg advisory-lock keys are int4; mask a bigint (idx, cohort id) into positive
 # int4 before pairing it with a lock class. A wrap collision only serialises
@@ -60,6 +74,40 @@ def require_transaction(conn: asyncpg.Connection) -> None:
             " wrap the call in `async with conn.transaction(): ...`"
             " — its writes must roll back atomically on partial failure."
         )
+
+
+def row_lock_clause(pool_or_conn: asyncpg.Pool | asyncpg.Connection, lock: RowLock | None) -> str:
+    """The suffix that takes `lock` on the rows that a SELECT on `pool_or_conn`
+    returns, or "" for none.
+
+    A lock holds until its transaction ends, so one asked for on a pool or on a
+    connection outside a transaction raises RuntimeError: the statement's own
+    implicit transaction would release it at once.
+    """
+    if lock is None:
+        return ""
+    if isinstance(pool_or_conn, asyncpg.Pool) or not pool_or_conn.is_in_transaction():
+        raise RuntimeError("a row lock needs a connection inside a transaction")
+    clause = _ROW_LOCK_CLAUSES[lock]
+    return clause
+
+
+async def fetch_entity_exists(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
+    entity: ExistsEntity,
+    idx: int,
+) -> bool:
+    """Return True iff `entity`'s table has a row at `idx`; a retired row counts.
+
+    Existence only, for a cheap 404 pre-flight without the full row.
+    """
+    # The table name is interpolated, so it comes only from the closed map.
+    table = _EXISTS_ENTITY_TABLES[entity]
+    exists = await pool_or_conn.fetchval(
+        f"SELECT EXISTS (SELECT 1 FROM {table} WHERE idx = $1)",
+        idx,
+    )
+    return exists
 
 
 def validate_patch_fields(

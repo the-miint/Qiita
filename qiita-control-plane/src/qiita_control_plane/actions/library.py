@@ -82,6 +82,10 @@ from ..repositories.assembly import (
 )
 from ..repositories.block import (
     BLOCK_ABANDONED,
+    BLOCK_COMPLETED,
+    BLOCK_FAILED,
+    BLOCK_PENDING,
+    BLOCK_PROCESSING,
     MASK_SAMPLE_COMPLETED,
     MASK_SAMPLE_INVALIDATED,
     AlignmentSampleInvalidated,
@@ -3012,8 +3016,8 @@ async def reconcile_block(
         await set_block_state(
             conn,
             block_idx=block_idx,
-            new_state="completed",
-            expected_states=["pending", "processing", "failed"],
+            new_state=BLOCK_COMPLETED,
+            expected_states=[BLOCK_PENDING, BLOCK_PROCESSING, BLOCK_FAILED],
         )
         for prep_sample_idx, _min_seq, _max_seq in await fetch_block_members(conn, block_idx):
             state = await lock_mask_sample(conn, mask_idx=mask_idx, prep_sample_idx=prep_sample_idx)
@@ -3435,8 +3439,8 @@ async def reconcile_alignment_block(
         await set_block_state(
             conn,
             block_idx=block_idx,
-            new_state="completed",
-            expected_states=["pending", "processing", "failed"],
+            new_state=BLOCK_COMPLETED,
+            expected_states=[BLOCK_PENDING, BLOCK_PROCESSING, BLOCK_FAILED],
         )
         for prep_sample_idx, _min_seq, _max_seq in await fetch_block_members(conn, block_idx):
             state = await lock_alignment_sample(
