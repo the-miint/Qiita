@@ -140,10 +140,6 @@ def _load_subjects(conn, genomes_dir: Path, refined_bins_dir: Path) -> None:
     """`contig`: every contig of every subject, with its subject (`genome_id`), its
     order in the subject's FASTA, its canonical hash, and whether it was read on the
     other strand. `subject`: one row per subject with its total length."""
-    # An absent bins directory is refused, as `residue_split.py` refuses it: read as no
-    # bins, it would make every long noLCG contig an UNBINNED subject.
-    if not refined_bins_dir.is_dir():
-        raise FileNotFoundError(f"refined_bins_dir {refined_bins_dir} is not a directory")
     conn.execute("CREATE TEMP TABLE file_meta (filepath VARCHAR, kind VARCHAR, bin_id VARCHAR)")
     meta = _file_meta(genomes_dir, refined_bins_dir)
     if meta:
