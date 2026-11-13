@@ -404,6 +404,33 @@ fn gene_call_tables_are_replaced_per_run_on_assembly_membership_keys() {
     }
 }
 
+/// A table that borrows its replace keys is refused without its `key_source`
+/// (an empty one would delete nothing), and passes with it; a table that is its
+/// own source, or one not replace-keyed, needs nothing else.
+#[test]
+fn a_borrowing_table_is_refused_without_its_key_source() {
+    for entry in REPLACE_KEY_TABLES {
+        if entry.key_source == entry.table {
+            assert!(refuse_borrow_without_key_source([entry.table].into_iter()).is_ok());
+            continue;
+        }
+        let err =
+            refuse_borrow_without_key_source([entry.table].into_iter()).expect_err(entry.table);
+        assert_eq!(err.code(), tonic::Code::InvalidArgument, "{}", entry.table);
+        assert!(
+            err.message().contains(entry.key_source),
+            "{}",
+            err.message()
+        );
+        assert!(
+            refuse_borrow_without_key_source([entry.table, entry.key_source].into_iter()).is_ok(),
+            "{}",
+            entry.table
+        );
+    }
+    assert!(refuse_borrow_without_key_source(["read", "alignment"].into_iter()).is_ok());
+}
+
 /// Every `key_source` is itself a registered table carrying the same key.
 /// The borrowing delete SELECTs this entry's key columns out of the source's
 /// Parquet, so a source keyed on anything else would name a column that file
@@ -2378,35 +2405,37 @@ fn register_files_replaces_run_scoped_tables_on_the_whole_key() {
     // A fresh ticket per registration: the lake gets a distinct file
     // carrying the same keys, which is what makes the second load a real
     // re-registration rather than a no-op.
+    // A run's two tables are registered together, as assembly_load stages them:
+    // bin_quality borrows assembly_membership's keys and is refused without it.
     let mut ticket = base_ticket;
-    let mut register = |table: &str, values: &str| {
+    let mut register_run = |prep_sample: i64, run: i64| {
         ticket += 1;
-        register_one_parquet(&connstr, &data_path, table, values, ticket)
+        register_parquets(
+            &connstr,
+            &data_path,
+            &[
+                ("assembly_membership", &membership_values(prep_sample, run)),
+                ("bin_quality", &quality_values(prep_sample, run)),
+            ],
+            ticket,
+        )
     };
 
-    let m1 = register(
-        "assembly_membership",
-        &membership_values(prep_sample_a, run_p),
+    let r1 = register_run(prep_sample_a, run_p);
+    let c1 = register_one_parquet(
+        &connstr,
+        &data_path,
+        "reference_sequences",
+        &control_values,
+        base_ticket + 100,
     );
-    let q1 = register("bin_quality", &quality_values(prep_sample_a, run_p));
-    let c1 = register("reference_sequences", &control_values);
-    register(
-        "assembly_membership",
-        &membership_values(prep_sample_b, run_p),
-    );
-    register("bin_quality", &quality_values(prep_sample_b, run_p));
-    register(
-        "assembly_membership",
-        &membership_values(prep_sample_a, run_q),
-    );
-    register("bin_quality", &quality_values(prep_sample_a, run_q));
+    register_run(prep_sample_b, run_p);
+    register_run(prep_sample_a, run_q);
 
     assert!(
-        m1.replaced.is_empty() && q1.replaced.is_empty() && c1.replaced.is_empty(),
-        "a key the lake does not hold replaces nothing: membership={:?} \
-         bin_quality={:?} control={:?}",
-        m1.replaced,
-        q1.replaced,
+        r1.replaced.is_empty() && c1.replaced.is_empty(),
+        "a key the lake does not hold replaces nothing: run={:?} control={:?}",
+        r1.replaced,
         c1.replaced,
     );
     assert_run_rows(&a_p, 2, 1, "after the first load");
@@ -2418,20 +2447,22 @@ fn register_files_replaces_run_scoped_tables_on_the_whole_key() {
         "control loaded once"
     );
 
-    let m2 = register(
-        "assembly_membership",
-        &membership_values(prep_sample_a, run_p),
+    let r2 = register_run(prep_sample_a, run_p);
+    let c2 = register_one_parquet(
+        &connstr,
+        &data_path,
+        "reference_sequences",
+        &control_values,
+        base_ticket + 101,
     );
-    let q2 = register("bin_quality", &quality_values(prep_sample_a, run_p));
-    let c2 = register("reference_sequences", &control_values);
 
     assert_eq!(
-        m2.replaced.get("assembly_membership").copied(),
+        r2.replaced.get("assembly_membership").copied(),
         Some(2),
         "the re-run supersedes A/P's two membership rows, and only those",
     );
     assert_eq!(
-        q2.replaced.get("bin_quality").copied(),
+        r2.replaced.get("bin_quality").copied(),
         Some(1),
         "the re-run supersedes A/P's one bin_quality row, and only that",
     );

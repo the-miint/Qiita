@@ -140,7 +140,8 @@ struct ReplaceKey {
     /// Columns compared together as one key.
     key: &'static [&'static str],
     /// Table in the same registration whose incoming files name the key set to
-    /// delete on, unioned with this table's own files.
+    /// delete on, unioned with this table's own files. A registration carrying this
+    /// table without that one is refused (`refuse_borrow_without_key_source`).
     ///
     /// `bin_quality` borrows `assembly_membership`'s, because it can be EMPTY
     /// where the load still runs: CheckM scores MAG, LCG and the unbinned residue
@@ -177,6 +178,30 @@ impl ReplaceKey {
             key_source,
         }
     }
+}
+
+/// Refuse a registration that carries a table whose `REPLACE_KEY_TABLES` entry
+/// borrows its delete keys, without the `key_source` table it borrows from. Without
+/// the source, the delete reads only the table's own files, so an empty file deletes
+/// nothing and the run's previous rows stay beside the new ones. Checked before any
+/// file is moved.
+fn refuse_borrow_without_key_source<'a>(
+    tables: impl Iterator<Item = &'a str>,
+) -> Result<(), Status> {
+    let tables: std::collections::BTreeSet<&str> = tables.collect();
+    for entry in REPLACE_KEY_TABLES {
+        if entry.key_source != entry.table
+            && tables.contains(entry.table)
+            && !tables.contains(entry.key_source)
+        {
+            return Err(Status::invalid_argument(format!(
+                "{} takes its replace keys from {}, which this registration does not carry; \
+                 register them together",
+                entry.table, entry.key_source
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// The replace-by-key DELETE for one `REPLACE_KEY_TABLES` entry: drop every lake
@@ -469,6 +494,8 @@ fn register_files(
             )));
         }
     }
+
+    refuse_borrow_without_key_source(payload.files.values().map(String::as_str))?;
 
     // One scope key for the whole registration; it does not vary per file.
     let scope = staging_scope(&payload.staging_dir, scratch_root);

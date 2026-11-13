@@ -23,6 +23,11 @@
 - **compute-readiness fails on a gpl-boundary older than 0.5.0
   (#gene-call-schema).** The `miint-gpl-boundary` probe now calls `predict_genes` as
   well as `save_bowtie2_index`; `predict_genes` refuses an older binary.
+- **Registration refuses a table that borrows its replace keys without the table it
+  borrows them from (#gene-call-schema).** `bin_quality`, the myloasm tables and the
+  gene-call tables delete a run's earlier rows on the keys of `assembly_membership` or
+  `myloasm_run` in the same registration; registered without it, an empty file deleted
+  nothing. Every load already registers them together.
 - **`assembly_hash` refuses an absent `refined_bins_dir` (#gene-call-schema).** It
   read one as no bins, which would count every binned contig as unbinned; bin_refine
   always creates the directory.
