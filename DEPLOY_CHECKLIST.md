@@ -51,7 +51,7 @@ _None yet._
 ### 3. Migrations
 
 - `[operator]` (#855) `make migrate` applies `20261110000000_block_rearmed_at.sql` (nullable `rearmed_at` on `qiita.block`, which `rerun-block` sets and abandon-plan reads; no row changes).
-- `20261110000000_host_taxon_id_not_required` makes `host_taxon_id` optional, and from the
+- `20261112000000_host_taxon_id_not_required` makes `host_taxon_id` optional, and from the
   restart an absent value means no host. `dbmate` applies it; run the bucket-2 backfill
   first. (#864)
 
