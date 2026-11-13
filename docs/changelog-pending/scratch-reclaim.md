@@ -1,6 +1,6 @@
 ### Added
 
-- **`qiita-admin scratch reclaim` frees finished tickets' scratch space (Refs #610).**
+- **`qiita-admin scratch reclaim` frees finished tickets' scratch space (#703).**
   For tickets that are `completed` or `no_data`, or failed/cancelled
   `download-ena-study` tickets a newer download ticket has superseded, last updated
   more than `--older-than` days ago and with no step still submitting or running, it
