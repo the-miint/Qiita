@@ -102,10 +102,7 @@ async def mint_exported_processing_handle(
             ),
         ) from exc
 
-    return ExportedProcessingResponse(
-        alignment_idx=row["alignment_idx"],
-        export_processing_id=row["export_processing_id"],
-    )
+    return ExportedProcessingResponse.model_validate(dict(row))
 
 
 @router.post(PATH_EXPORTED_PROCESSING_MASK, status_code=201)
