@@ -27,7 +27,9 @@
   borrows them from (#gene-call-schema).** `bin_quality`, the myloasm tables and the
   gene-call tables delete a run's earlier rows on the keys of `assembly_membership` or
   `myloasm_run` in the same registration; registered without it, an empty file deleted
-  nothing. Every load already registers them together.
+  nothing. The assembly and myloasm loads already register each set together; the
+  gene-call load, not written yet, must register its tables with
+  `assembly_membership`.
 - **`assembly_hash` refuses an absent `refined_bins_dir` (#gene-call-schema).** It
   read one as no bins, which would count every binned contig as unbinned; bin_refine
   always creates the directory.

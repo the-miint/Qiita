@@ -451,12 +451,12 @@ rm -f "$MIINT_INFERTRIM_PROBE"
 
 # GPL boundary. bowtie2, FastTree and Prodigal run in the gpl-boundary binary, a
 # separate process miint starts, so checking that the functions are registered says
-# nothing about whether the binary runs. The probe calls two of them:
-# `save_bowtie2_index` builds a tiny index, and `predict_genes` calls genes, which
-# refuses a binary older than it needs and names the version it found. It runs in
-# the job env: native jobs get an ephemeral HOME, so the boundary is reachable only
-# through MIINT_GPL_BOUNDARY_PATH as miint_job_env forwards it, and an unset or
-# wrong path fails here, at deploy.
+# nothing about whether the binary runs. The probe runs two of them:
+# `save_bowtie2_index` builds a tiny index, and `predict_genes` predicts genes on a
+# short sequence; it refuses a gpl-boundary older than it needs and names the
+# version it found. The probe runs in the job env: native jobs get an ephemeral
+# HOME, so the boundary is reachable only through MIINT_GPL_BOUNDARY_PATH as
+# miint_job_env forwards it, and an unset or wrong path fails here, at deploy.
 MIINT_BOUNDARY_PROBE="$(mktemp)"
 cat > "$MIINT_BOUNDARY_PROBE" <<'PYEOF'
 import sys
