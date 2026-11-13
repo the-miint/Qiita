@@ -727,6 +727,12 @@ PATH_ADMIN_SEQUENCED_POOL_MASKED_READ_EXPORT = (
     "/sequenced-pool/{sequenced_pool_idx}/masked-read-export"
 )
 PATH_ADMIN_MASKED_READ_EXPORT_TICKET = "/masked-read-export/ticket"
+# Pair decisions between two definitions of one kind (system_admin, the kind's
+# lifecycle scope): list (GET) and open (POST) on the root, show one, decide, revoke.
+PATH_ADMIN_DEFINITION_PAIR = "/definition-pair"
+PATH_ADMIN_DEFINITION_PAIR_BY_IDX = "/definition-pair/{definition_pair_idx}"
+PATH_ADMIN_DEFINITION_PAIR_DECISION = "/definition-pair/{definition_pair_idx}/decision"
+PATH_ADMIN_DEFINITION_PAIR_REVOKE = "/definition-pair/{definition_pair_idx}/revoke"
 
 URL_ADMIN_PREFIX = f"{API_PREFIX}{PATH_ADMIN_PREFIX}"
 URL_ADMIN_SERVICE_ACCOUNT = f"{URL_ADMIN_PREFIX}{PATH_ADMIN_SERVICE_ACCOUNT}"
@@ -743,6 +749,10 @@ URL_ADMIN_SEQUENCED_POOL_MASKED_READ_EXPORT = (
     f"{URL_ADMIN_PREFIX}{PATH_ADMIN_SEQUENCED_POOL_MASKED_READ_EXPORT}"
 )
 URL_ADMIN_MASKED_READ_EXPORT_TICKET = f"{URL_ADMIN_PREFIX}{PATH_ADMIN_MASKED_READ_EXPORT_TICKET}"
+URL_ADMIN_DEFINITION_PAIR = f"{URL_ADMIN_PREFIX}{PATH_ADMIN_DEFINITION_PAIR}"
+URL_ADMIN_DEFINITION_PAIR_BY_IDX = f"{URL_ADMIN_PREFIX}{PATH_ADMIN_DEFINITION_PAIR_BY_IDX}"
+URL_ADMIN_DEFINITION_PAIR_DECISION = f"{URL_ADMIN_PREFIX}{PATH_ADMIN_DEFINITION_PAIR_DECISION}"
+URL_ADMIN_DEFINITION_PAIR_REVOKE = f"{URL_ADMIN_PREFIX}{PATH_ADMIN_DEFINITION_PAIR_REVOKE}"
 
 
 # =============================================================================

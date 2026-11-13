@@ -48,6 +48,7 @@ from qiita_common.models import (
     AlignmentRerunBlockResponse,
     AlignmentSampleStatusUpdate,
     AlignmentSampleStatusUpdateResponse,
+    DefinitionKind,
     DoGetTicketResponse,
 )
 
@@ -67,6 +68,7 @@ from ..auth.guards import (
 )
 from ..auth.principal import HumanUser, Principal, ServiceAccount
 from ..auth.tickets import sign_ticket
+from ..definition_similarity import PairRefused, refuse_deprecating_with_similar_pairs
 from ..deps import (
     TxConnFactory,
     get_data_plane_url,
@@ -98,7 +100,12 @@ from ..work_ticket_submit import (
     authorize_redrive_action,
     require_compute_backend_client_dependency,
 )
-from ._helpers import ALIGNMENT_NOT_FOUND_DETAIL, authorize_completed_alignment_cohort, first_few
+from ._helpers import (
+    ALIGNMENT_NOT_FOUND_DETAIL,
+    authorize_completed_alignment_cohort,
+    first_few,
+    pair_refused_http,
+)
 
 # The DuckLake relation this route signs DoGet tickets for: the exclusion-aware
 # VIEW (`alignment` ANTI JOIN the resolved blocklist), never the raw base table —
@@ -141,13 +148,17 @@ async def update_alignment_definition_status_route(
 
     Deprecating is refused (409, listing them) while any work ticket under the
     alignment is unfinished, held ones included: they would still write rows under
-    a void config.
+    a void config. It is refused too while the alignment is a side of a `similar`
+    pair decision (`definition_similarity`).
 
     system_admin only (`alignment_definition:lifecycle`).
     """
     try:
         async with tx() as conn:
             if body.status is AlignmentDefinitionStatus.DEPRECATED:
+                await refuse_deprecating_with_similar_pairs(
+                    conn, DefinitionKind.ALIGNMENT, alignment_idx
+                )
                 await refuse_deprecating_with_live_work(conn, alignment_idx)
             row = await transition_alignment_definition_status(
                 conn,
@@ -164,6 +175,8 @@ async def update_alignment_definition_status_route(
             status_code=409,
             detail={"reason": str(exc), "work_ticket_idx": exc.work_ticket_idxs},
         ) from exc
+    except PairRefused as exc:
+        raise pair_refused_http(exc) from exc
     except asyncpg.ForeignKeyViolationError as exc:
         raise HTTPException(
             status_code=422,

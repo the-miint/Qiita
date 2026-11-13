@@ -101,6 +101,7 @@ from .owner_id import (
     _handle_owner_biosample_id,
     _write_owner_biosample_id_tsv,
 )
+from .pair import add_pair_parser
 from .role import (
     _VALID_ROLE_VALUES,
     _handle_principal_set_role,
@@ -247,6 +248,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     add_fanout_parser(sub)
     add_alignment_parser(sub)
+    add_pair_parser(sub)
 
     p_terminology = sub.add_parser("terminology", help="Terminology release operations")
     p_terminology_sub = p_terminology.add_subparsers(dest="terminology_cmd", required=True)

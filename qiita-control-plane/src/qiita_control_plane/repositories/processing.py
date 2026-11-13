@@ -280,6 +280,18 @@ async def fetch_processing_prep_samples(
     return list(await pool_or_conn.fetch(query, *args))
 
 
+async def lock_processing_row(conn: asyncpg.Connection, processing_idx: int) -> None:
+    """Hold the processing row `FOR UPDATE` for the caller's transaction. Raises
+    ProcessingNotFound."""
+    require_transaction(conn)
+    found = await conn.fetchval(
+        "SELECT true FROM qiita.processing WHERE processing_idx = $1 FOR UPDATE",
+        processing_idx,
+    )
+    if not found:
+        raise ProcessingNotFound(processing_idx)
+
+
 async def transition_processing_status(
     conn: asyncpg.Pool | asyncpg.Connection,
     *,

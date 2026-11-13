@@ -65,6 +65,7 @@ from qiita_common.api_paths import (
 )
 from qiita_common.auth_constants import Scope
 from qiita_common.models import (
+    DefinitionKind,
     DoGetTicketResponse,
     MaskDefinition,
     MaskDefinitionListResponse,
@@ -92,6 +93,7 @@ from ..auth.guards import (
 from ..auth.principal import HumanUser, Principal, ServiceAccount
 from ..auth.tickets import sign_ticket
 from ..block_read import READ_MASKED_TABLE
+from ..definition_similarity import PairRefused, refuse_deprecating_with_similar_pairs
 from ..deps import (
     TxConnFactory,
     get_db_pool,
@@ -123,6 +125,7 @@ from ._helpers import (
     cap_rows,
     first_few,
     gate_roster_narrowing_idx,
+    pair_refused_http,
 )
 
 _MSG_MASK_NOT_FOUND = "Mask definition not found"
@@ -527,13 +530,15 @@ async def update_mask_definition_status_route(
     decision while leaving the raw reads Flight-reachable.
 
     Deprecating is refused (409, listing them) while any work ticket carrying the
-    mask is unfinished, held ones included.
+    mask is unfinished, held ones included, and while the mask is a side of a
+    `similar` pair decision (`definition_similarity`).
 
     system_admin only (`mask_definition:lifecycle`).
     """
     try:
         async with tx() as conn:
             if body.status is MaskDefinitionStatus.DEPRECATED:
+                await refuse_deprecating_with_similar_pairs(conn, DefinitionKind.MASK, mask_idx)
                 await refuse_deprecating_mask_with_live_work(conn, mask_idx)
             row = await transition_mask_definition_status(
                 conn,
@@ -550,6 +555,8 @@ async def update_mask_definition_status_route(
             status_code=409,
             detail={"reason": str(exc), "work_ticket_idx": exc.work_ticket_idxs},
         ) from exc
+    except PairRefused as exc:
+        raise pair_refused_http(exc) from exc
     except asyncpg.ForeignKeyViolationError as exc:
         raise HTTPException(
             status_code=422,

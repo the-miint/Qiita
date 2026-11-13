@@ -148,6 +148,19 @@ from qiita_common.models.biosample import (
     derive_metadata_field_scope,
     normalize_matrix_tube_id,
 )
+from qiita_common.models.definition_pair import (
+    DefinitionKind,
+    DefinitionPair,
+    DefinitionPairDecisionRequest,
+    DefinitionPairDetail,
+    DefinitionPairEvent,
+    DefinitionPairEventType,
+    DefinitionPairListResponse,
+    DefinitionPairOpenRequest,
+    DefinitionPairRefusal,
+    DefinitionPairRevokeRequest,
+    DefinitionPairVerdict,
+)
 from qiita_common.models.ena import (
     EnaRunRecord,
     EnaSampleAttributes,
@@ -573,6 +586,18 @@ __all__ = [
     "TerminologyStatus",
     "TerminologyTermObsoletionKind",
     "TerminologyVersion",
+    # Definition pairs.
+    "DefinitionKind",
+    "DefinitionPair",
+    "DefinitionPairDecisionRequest",
+    "DefinitionPairDetail",
+    "DefinitionPairEvent",
+    "DefinitionPairEventType",
+    "DefinitionPairListResponse",
+    "DefinitionPairOpenRequest",
+    "DefinitionPairRefusal",
+    "DefinitionPairRevokeRequest",
+    "DefinitionPairVerdict",
     # Step wire contract.
     "AlignmentCohortDoGetTicketRequest",
     "AlignmentDoGetTicketRequest",
