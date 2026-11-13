@@ -26,8 +26,8 @@ upstreams are, so it can be decided `not_similar` only.
 Deprecation does not change membership.
 
 **Public API** for other modules:
-  - `async load_groups(conn) -> Groups` (in the caller's transaction; its docstring
-    says which), then `Groups.group_of(kind, idx) -> frozenset[int]` and
+  - `async load_groups(conn) -> Groups` (the caller holds the group lock exclusive
+    or reads at REPEATABLE READ), then `Groups.group_of(kind, idx) -> frozenset[int]` and
     `Groups.same_group(kind, a, b) -> bool`. A definition that no pair or derivation
     joins is a group of one, including an id that the snapshot does not know.
   - `compute_groups(definitions, pairs) -> Groups`, the pure core.
@@ -79,6 +79,7 @@ from .repositories.definition_pair import (
     fetch_live_pairs,
     fetch_pair,
     fetch_similar_pairs_naming,
+    holds_group_lock_exclusive,
     insert_pair,
     lock_groups_exclusive,
     lock_groups_shared,
@@ -438,6 +439,14 @@ async def load_groups(conn: asyncpg.Connection) -> Groups:
     tickets read beside them, and a shared group lock would add nothing, since a
     reader that waited on it would still read the snapshot taken before the wait."""
     require_transaction(conn)
+    isolation = await conn.fetchval("SELECT current_setting('transaction_isolation')")
+    if isolation not in ("repeatable read", "serializable") and not (
+        await holds_group_lock_exclusive(conn)
+    ):
+        raise RuntimeError(
+            "load_groups needs the group lock EXCLUSIVE or a REPEATABLE READ transaction;"
+            f" this one is {isolation!r} without the lock"
+        )
     definitions = await fetch_definitions(conn)
     pairs = [pair_state(r) for r in await fetch_live_pairs(conn)]
     return compute_groups(definitions, pairs)

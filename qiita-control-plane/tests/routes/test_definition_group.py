@@ -21,8 +21,11 @@ from qiita_common.api_paths import URL_DEFINITION_GROUP_RESOLVE
 from qiita_common.auth_constants import Scope
 from qiita_common.models import (
     DefinitionKind,
+    FailureType,
     SampleResolutionReason,
     SampleResolutionState,
+    ScopeTargetKind,
+    WorkTicketFailureStage,
     WorkTicketState,
 )
 
@@ -67,7 +70,7 @@ def ctx(role_keyed_clients):
     return dict(role_keyed_clients)
 
 
-def _body(kind: str, idx: int, samples: list[int]) -> dict:
+def _body(kind: DefinitionKind, idx: int, samples: list[int]) -> dict:
     return {"definition_kind": kind, "definition_idx": idx, "prep_sample_idx": samples}
 
 
@@ -119,7 +122,12 @@ async def tickets(ctx):
     def _failure(state: str) -> tuple:
         if state != WorkTicketState.FAILED:
             return (None, None, None, None)
-        return ("permanent", "step_run", "align_sharded", "step failed in a test")
+        return (
+            FailureType.PERMANENT.value,
+            WorkTicketFailureStage.STEP_RUN.value,
+            "align_sharded",
+            "step failed in a test",
+        )
 
     async def block(
         action_id: str,
@@ -130,7 +138,7 @@ async def tickets(ctx):
         alignment_idx: int | None = None,
         block_state: str = BLOCK_PENDING,
     ) -> int:
-        await _action(action_id, "block")
+        await _action(action_id, ScopeTargetKind.BLOCK.value)
         async with db.acquire() as conn, conn.transaction():
             block_idx = await create_block(conn)
             await add_block_members(
@@ -141,7 +149,8 @@ async def tickets(ctx):
             "  action_id, action_version, originator_principal_idx, scope_target_kind,"
             "  block_idx, mask_idx, alignment_idx, state,"
             "  failure_type, failure_stage, failure_step_name, failure_reason"
-            ") VALUES ($1, $2, $3, 'block', $4, $5, $6, $7::qiita.work_ticket_state,"
+            ") VALUES ($1, $2, $3, $12::qiita.scope_target_kind, $4, $5, $6,"
+            "          $7::qiita.work_ticket_state,"
             "          $8::qiita.failure_type, $9::qiita.work_ticket_failure_stage, $10, $11)"
             " RETURNING work_ticket_idx",
             action_id,
@@ -152,6 +161,7 @@ async def tickets(ctx):
             alignment_idx,
             state,
             *_failure(state),
+            ScopeTargetKind.BLOCK.value,
         )
         await db.execute(
             "UPDATE qiita.block SET work_ticket_idx = $2, state = $3 WHERE block_idx = $1",
@@ -170,13 +180,14 @@ async def tickets(ctx):
         mask_idx: int,
         action_context: dict | None = None,
     ) -> int:
-        await _action(action_id, "prep_sample")
+        await _action(action_id, ScopeTargetKind.PREP_SAMPLE.value)
         ticket = await db.fetchval(
             "INSERT INTO qiita.work_ticket ("
             "  action_id, action_version, originator_principal_idx, scope_target_kind,"
             "  prep_sample_idx, mask_idx, state, action_context,"
             "  failure_type, failure_stage, failure_step_name, failure_reason"
-            ") VALUES ($1, $2, $3, 'prep_sample', $4, $5, $6::qiita.work_ticket_state,"
+            ") VALUES ($1, $2, $3, $12::qiita.scope_target_kind, $4, $5,"
+            "          $6::qiita.work_ticket_state,"
             "          $7::jsonb, $8::qiita.failure_type,"
             "          $9::qiita.work_ticket_failure_stage, $10, $11)"
             " RETURNING work_ticket_idx",
@@ -188,6 +199,7 @@ async def tickets(ctx):
             state,
             json.dumps(action_context or {}),
             *_failure(state),
+            ScopeTargetKind.PREP_SAMPLE.value,
         )
         made.append(ticket)
         return ticket
@@ -217,7 +229,9 @@ async def test_resolve_across_pools_names_each_samples_member(
     w = alignment_group_world
     resp = await ctx["user"].post(
         URL_DEFINITION_GROUP_RESOLVE,
-        json=_body("alignment", w["align_1"], [other_pool_sample, w["ps_c"], w["ps_a"]]),
+        json=_body(
+            DefinitionKind.ALIGNMENT, w["align_1"], [other_pool_sample, w["ps_c"], w["ps_a"]]
+        ),
     )
     assert resp.status_code == 200, resp.text
     body = resp.json()
@@ -247,7 +261,7 @@ async def test_resolve_a_mask_group(ctx, alignment_group_world, other_pool_sampl
     w = alignment_group_world
     resp = await ctx["user"].post(
         URL_DEFINITION_GROUP_RESOLVE,
-        json=_body("mask", w["mask_idx"], [w["ps_a"], other_pool_sample]),
+        json=_body(DefinitionKind.MASK, w["mask_idx"], [w["ps_a"], other_pool_sample]),
     )
     assert resp.status_code == 200, resp.text
     assert resp.json()["group"] == sorted([w["mask_idx"], w["mask_2"]])
@@ -275,7 +289,8 @@ async def test_a_covering_align_block_that_is_running_makes_the_sample_incomplet
         alignment_idx=w["align_1"],
     )
     resp = await ctx["user"].post(
-        URL_DEFINITION_GROUP_RESOLVE, json=_body("alignment", w["align_1"], [w["ps_a"]])
+        URL_DEFINITION_GROUP_RESOLVE,
+        json=_body(DefinitionKind.ALIGNMENT, w["align_1"], [w["ps_a"]]),
     )
     assert resp.status_code == 200, resp.text
     s = _by_sample(resp)[w["ps_a"]]
@@ -308,7 +323,8 @@ async def test_cancelled_tickets_and_abandoned_blocks_are_ignored(
         block_state=block_state,
     )
     resp = await ctx["user"].post(
-        URL_DEFINITION_GROUP_RESOLVE, json=_body("alignment", w["align_1"], [w["ps_a"]])
+        URL_DEFINITION_GROUP_RESOLVE,
+        json=_body(DefinitionKind.ALIGNMENT, w["align_1"], [w["ps_a"]]),
     )
     assert resp.status_code == 200, resp.text
     s = _by_sample(resp)[w["ps_a"]]
@@ -327,7 +343,7 @@ async def test_a_failed_per_sample_mask_ticket_under_the_newer_mask_is_incomplet
         state=WorkTicketState.FAILED,
         mask_idx=w["mask_2"],
     )
-    body = _body("mask", w["mask_idx"], [w["ps_a"]])
+    body = _body(DefinitionKind.MASK, w["mask_idx"], [w["ps_a"]])
     resp = await ctx["user"].post(URL_DEFINITION_GROUP_RESOLVE, json=body)
     assert resp.status_code == 200, resp.text
     s = _by_sample(resp)[w["ps_a"]]
@@ -376,7 +392,7 @@ async def test_an_assembly_ticket_is_matched_to_the_processing_it_mints(
             w["ps_a"],
             ASSEMBLY_SAMPLE_COMPLETED,
         )
-        body = _body("processing", processing_idx, [w["ps_a"]])
+        body = _body(DefinitionKind.PROCESSING, processing_idx, [w["ps_a"]])
         s = _by_sample(await ctx["user"].post(URL_DEFINITION_GROUP_RESOLVE, json=body))[w["ps_a"]]
         assert (s["state"], s["definition_idx"], s["mask_idx"]) == (
             PROCESSED,
@@ -422,7 +438,8 @@ async def test_resolve_refuses_a_cohort_with_an_unreadable_study_403(ctx, alignm
     w = alignment_group_world
     for samples in ([w["ps_a"], w["ps_b"]], [w["ps_e"]]):
         resp = await ctx["user"].post(
-            URL_DEFINITION_GROUP_RESOLVE, json=_body("alignment", w["align_1"], samples)
+            URL_DEFINITION_GROUP_RESOLVE,
+            json=_body(DefinitionKind.ALIGNMENT, w["align_1"], samples),
         )
         assert resp.status_code == 403, resp.text
         assert str(w["study_2"]) in resp.json()["detail"]
@@ -431,7 +448,8 @@ async def test_resolve_refuses_a_cohort_with_an_unreadable_study_403(ctx, alignm
 async def test_resolve_refuses_an_orphaned_sample_403(ctx, alignment_group_world):
     w = alignment_group_world
     resp = await ctx["user"].post(
-        URL_DEFINITION_GROUP_RESOLVE, json=_body("alignment", w["align_1"], [w["ps_d"]])
+        URL_DEFINITION_GROUP_RESOLVE,
+        json=_body(DefinitionKind.ALIGNMENT, w["align_1"], [w["ps_d"]]),
     )
     assert resp.status_code == 403, resp.text
 
@@ -439,7 +457,7 @@ async def test_resolve_refuses_an_orphaned_sample_403(ctx, alignment_group_world
 async def test_resolve_unknown_definition_404_before_access(ctx, alignment_group_world):
     w = alignment_group_world
     resp = await ctx["user"].post(
-        URL_DEFINITION_GROUP_RESOLVE, json=_body("alignment", 999_999_999, [w["ps_b"]])
+        URL_DEFINITION_GROUP_RESOLVE, json=_body(DefinitionKind.ALIGNMENT, 999_999_999, [w["ps_b"]])
     )
     assert resp.status_code == 404, resp.text
 
@@ -450,7 +468,8 @@ async def test_resolve_without_prep_sample_read_403(ctx, alignment_group_world, 
         label="no-prep-sample-read", scopes=[Scope.SELF_PROFILE, Scope.ALIGNMENT_DOGET]
     )
     resp = await client.post(
-        URL_DEFINITION_GROUP_RESOLVE, json=_body("alignment", w["align_1"], [w["ps_a"]])
+        URL_DEFINITION_GROUP_RESOLVE,
+        json=_body(DefinitionKind.ALIGNMENT, w["align_1"], [w["ps_a"]]),
     )
     assert resp.status_code == 403, resp.text
 
@@ -467,7 +486,8 @@ async def test_resolve_refuses_a_service_account(
         headers={"Authorization": f"Bearer {compute_worker_service_account['token']}"},
     ) as sa:
         resp = await sa.post(
-            URL_DEFINITION_GROUP_RESOLVE, json=_body("alignment", w["align_1"], [w["ps_a"]])
+            URL_DEFINITION_GROUP_RESOLVE,
+            json=_body(DefinitionKind.ALIGNMENT, w["align_1"], [w["ps_a"]]),
         )
     assert resp.status_code == 403, resp.text
 
@@ -475,7 +495,7 @@ async def test_resolve_refuses_a_service_account(
 async def test_resolve_rejects_an_empty_cohort_422(ctx, alignment_group_world):
     resp = await ctx["user"].post(
         URL_DEFINITION_GROUP_RESOLVE,
-        json=_body("alignment", alignment_group_world["align_1"], []),
+        json=_body(DefinitionKind.ALIGNMENT, alignment_group_world["align_1"], []),
     )
     assert resp.status_code == 422, resp.text
 

@@ -27,7 +27,7 @@ from qiita_common.api_paths import (
 from qiita_common.auth_constants import Scope
 from qiita_common.models import DefinitionPairVerdict
 
-from qiita_control_plane.definition_similarity import decide_pair
+from qiita_control_plane.definition_similarity import decide_pair, load_groups
 from qiita_control_plane.repositories import definition_pair as pair_repo
 from qiita_control_plane.repositories.alignment_definition import mint_alignment_definition
 from qiita_control_plane.repositories.mask_definition import mint_mask_definition
@@ -526,14 +526,14 @@ async def test_a_decision_does_not_queue_behind_a_shared_holder(
 ):
     """A deprecation holding the group lock SHARED makes a decision answer 503 within its
     bounded retry, instead of waiting in the lock queue (where it would block every
-    later shared request). Once the reader ends, the same decision goes through."""
+    later shared request). Once the deprecation ends, the same decision goes through."""
     monkeypatch.setattr(pair_repo, "GROUP_LOCK_EXCLUSIVE_ATTEMPTS", 3)
     monkeypatch.setattr(pair_repo, "GROUP_LOCK_EXCLUSIVE_INTERVAL_S", 0.05)
     m1, m2 = await defs["mask"](rype=0.05), await defs["mask"](rype=0.1)
     pair_idx = await _opened(clients["admin"], "mask", m1, m2)
 
-    async with postgres_pool.acquire() as reader, reader.transaction():
-        await pair_repo.lock_groups_shared(reader)
+    async with postgres_pool.acquire() as deprecation, deprecation.transaction():
+        await pair_repo.lock_groups_shared(deprecation)
         started = time.monotonic()
         resp = await asyncio.wait_for(_decide(clients["admin"], pair_idx, "similar"), timeout=10)
         elapsed = time.monotonic() - started
@@ -551,16 +551,31 @@ async def test_a_decision_does_not_queue_behind_a_shared_holder(
     assert (await _decide(clients["admin"], pair_idx, "similar")).status_code == 200
 
 
+async def _similar_candidates(defs, kind: str) -> tuple[int, int, str]:
+    """Two definitions of `kind` that can be decided similar, and the status URL that
+    deprecates the second."""
+    if kind == "mask":
+        m1, m2 = await defs["mask"](rype=0.05), await defs["mask"](rype=0.1)
+        return m1, m2, URL_MASK_DEFINITION_STATUS.format(mask_idx=m2)
+    m1 = await defs["mask"](rype=0.05)
+    if kind == "alignment":
+        a1 = await defs["block"](m1)
+        a2 = await defs["block"](m1, aligner="minimap2", preset="sr")
+        return a1, a2, URL_ALIGNMENT_DEFINITION_STATUS.format(alignment_idx=a2)
+    p1, p2 = await defs["assembly"](m1), await defs["assembly"](m1, assembler="hifiasm")
+    return p1, p2, URL_PROCESSING_STATUS.format(processing_idx=p2)
+
+
+@pytest.mark.parametrize("kind", ["mask", "alignment", "processing"])
 async def test_a_deprecation_waits_for_a_decision_in_progress_and_sees_it(
-    postgres_pool, clients, defs
+    postgres_pool, clients, defs, kind
 ):
     """A deprecation PATCH arriving while a `similar` decision on its definition holds
     the group lock EXCLUSIVE waits for it to commit, then refuses with
     `similar_pairs`. Without its SHARED group lock the PATCH would read no similar
-    pair (the decision is uncommitted) and deprecate the mask."""
-    m1, m2 = await defs["mask"](rype=0.05), await defs["mask"](rype=0.1)
-    pair_idx = await _opened(clients["admin"], "mask", m1, m2)
-    url = URL_MASK_DEFINITION_STATUS.format(mask_idx=m2)
+    pair (the decision is uncommitted) and deprecate the definition."""
+    low, high, url = await _similar_candidates(defs, kind)
+    pair_idx = await _opened(clients["admin"], kind, low, high)
 
     async with postgres_pool.acquire() as decider:
         tx = decider.transaction()
@@ -591,3 +606,22 @@ async def test_a_deprecation_waits_for_a_decision_in_progress_and_sees_it(
 
     detail = _refusal(await asyncio.wait_for(patch, timeout=10), "similar_pairs")
     assert detail["definition_pair_idx"] == [pair_idx]
+
+
+async def test_the_shared_group_lock_refuses_a_repeatable_read_transaction(postgres_pool):
+    """At REPEATABLE READ the lock statement takes the snapshot, so a deprecation
+    would not see a decision that it waited for."""
+    async with (
+        postgres_pool.acquire() as conn,
+        conn.transaction(isolation="repeatable_read"),
+    ):
+        with pytest.raises(RuntimeError, match="READ COMMITTED"):
+            await pair_repo.lock_groups_shared(conn)
+
+
+async def test_load_groups_refuses_read_committed_without_the_exclusive_lock(postgres_pool):
+    async with postgres_pool.acquire() as conn, conn.transaction():
+        with pytest.raises(RuntimeError, match="EXCLUSIVE or a REPEATABLE READ"):
+            await load_groups(conn)
+        await pair_repo.lock_groups_exclusive(conn)
+        await load_groups(conn)

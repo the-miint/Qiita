@@ -31,7 +31,7 @@ DEFINITION_GROUP_LOCK_KEY = 0
 
 # The exclusive side is taken by try-lock in a loop and never queued: a queued
 # exclusive request blocks every shared request made after it, so one decision
-# waiting behind a long reader would stall every other reader too. 20 tries 50 ms
+# waiting behind a deprecation would stall every later deprecation too. 20 tries 50 ms
 # apart give up after about one second, under the CLI's HTTP timeout.
 GROUP_LOCK_EXCLUSIVE_ATTEMPTS = 20
 GROUP_LOCK_EXCLUSIVE_INTERVAL_S = 0.05
@@ -42,7 +42,7 @@ class GroupLockBusy(Exception):
     request can be retried."""
 
     def __init__(self) -> None:
-        super().__init__("definition groups are being read by another transaction; retry shortly")
+        super().__init__("another pair decision or a deprecation is in progress; retry shortly")
 
 
 async def lock_groups_shared(conn: asyncpg.Connection) -> None:
@@ -51,10 +51,16 @@ async def lock_groups_shared(conn: asyncpg.Connection) -> None:
     A deprecation takes this before reading the `similar` pairs that name its
     definition and before any definition row lock: no decision commits while it is
     held, so a `similar` decision and the deprecation of one of its sides cannot
-    both commit. It waits for a decision in progress, in a READ COMMITTED
-    transaction whose next statement then sees that decision. Decisions never queue
-    behind it (`lock_groups_exclusive`)."""
+    both commit. It waits for a decision in progress. The caller's transaction must
+    be READ COMMITTED, so that the statement after the wait sees that decision; at
+    REPEATABLE READ the waiting statement takes the snapshot, which predates it.
+    Decisions never queue behind it (`lock_groups_exclusive`)."""
     require_transaction(conn)
+    isolation = await conn.fetchval("SELECT current_setting('transaction_isolation')")
+    if isolation != "read committed":
+        raise RuntimeError(
+            f"lock_groups_shared needs a READ COMMITTED transaction; this one is {isolation!r}"
+        )
     await conn.execute(
         "SELECT pg_advisory_xact_lock_shared($1, $2)",
         DEFINITION_GROUP_LOCK_CLASS,
@@ -81,6 +87,17 @@ async def lock_groups_exclusive(conn: asyncpg.Connection) -> None:
         if attempt + 1 < GROUP_LOCK_EXCLUSIVE_ATTEMPTS:
             await asyncio.sleep(GROUP_LOCK_EXCLUSIVE_INTERVAL_S)
     raise GroupLockBusy()
+
+
+async def holds_group_lock_exclusive(conn: asyncpg.Connection) -> bool:
+    """True when this session holds the group lock EXCLUSIVE."""
+    return await conn.fetchval(
+        "SELECT EXISTS (SELECT 1 FROM pg_locks"
+        " WHERE locktype = 'advisory' AND pid = pg_backend_pid() AND granted"
+        "   AND mode = 'ExclusiveLock' AND classid = $1 AND objid = $2 AND objsubid = 2)",
+        DEFINITION_GROUP_LOCK_CLASS,
+        DEFINITION_GROUP_LOCK_KEY,
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -30,6 +30,9 @@ from qiita_common.api_paths import URL_ALIGNMENT_COHORT_DOGET, URL_SEQUENCED_POO
 from qiita_common.auth_constants import Scope
 from qiita_common.models import DefinitionGroupRefusal, MaskDefinitionStatus
 
+from qiita_control_plane.repositories.alignment_definition import ALIGNMENT_SAMPLE_COMPLETED
+from qiita_control_plane.repositories.block import MASK_SAMPLE_COMPLETED
+
 pytestmark = pytest.mark.db
 
 _COLUMNS = ["prep_sample_idx", "feature_idx", "mapq"]
@@ -393,8 +396,8 @@ async def test_human_mint_refuses_a_sample_resolved_to_another_alignment_409(
     so it resolves to the newer alignment, align_3. Naming align_1 is refused, naming
     the alignment it resolves to; naming align_3 is signed."""
     w = alignment_group_world
-    await w["gate"]("mask_sample", w["mask_2"], w["ps_a"], "completed")
-    await w["gate"]("alignment_sample", w["align_3"], w["ps_a"], "completed")
+    await w["gate"]("mask_sample", w["mask_2"], w["ps_a"], MASK_SAMPLE_COMPLETED)
+    await w["gate"]("alignment_sample", w["align_3"], w["ps_a"], ALIGNMENT_SAMPLE_COMPLETED)
 
     resp = await ctx["user"].post(
         _mint_url(w["align_1"]), json={"prep_sample_idx": [w["ps_a"]], "columns": _COLUMNS}
@@ -421,7 +424,7 @@ async def test_human_mint_refuses_a_sample_whose_mask_moved_on_409(ctx, alignmen
     """ps_a's mask resolves to mask_2, but it is aligned only on the seed's mask: it
     is incomplete until aligned on mask_2."""
     w = alignment_group_world
-    await w["gate"]("mask_sample", w["mask_2"], w["ps_a"], "completed")
+    await w["gate"]("mask_sample", w["mask_2"], w["ps_a"], MASK_SAMPLE_COMPLETED)
 
     resp = await ctx["user"].post(
         _mint_url(w["align_1"]), json={"prep_sample_idx": [w["ps_a"]], "columns": _COLUMNS}
@@ -482,8 +485,8 @@ async def test_human_mint_checks_access_before_group_resolution(ctx, alignment_g
     """ps_b is unreadable and resolves elsewhere: 403, so the 409's resolution of a
     sample the caller cannot read is never shown."""
     w = alignment_group_world
-    await w["gate"]("mask_sample", w["mask_2"], w["ps_b"], "completed")
-    await w["gate"]("alignment_sample", w["align_3"], w["ps_b"], "completed")
+    await w["gate"]("mask_sample", w["mask_2"], w["ps_b"], MASK_SAMPLE_COMPLETED)
+    await w["gate"]("alignment_sample", w["align_3"], w["ps_b"], ALIGNMENT_SAMPLE_COMPLETED)
     resp = await ctx["user"].post(
         _mint_url(w["align_1"]),
         json={"prep_sample_idx": [w["ps_a"], w["ps_b"]], "columns": _COLUMNS},

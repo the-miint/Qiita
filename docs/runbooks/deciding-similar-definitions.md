@@ -47,9 +47,8 @@ For an alignment or processing pair whose change swaps upstream definitions, dec
 the upstream pair first: `similar` is refused until those upstreams are in one group
 (`upstream_not_grouped`).
 
-A 503 with `Retry-After` means another decision, or a read of the groups (an export,
-a resolve, a deprecation), was in progress; nothing changed, so run the same command
-again.
+A 503 with `Retry-After` means another decision or a deprecation was in progress;
+nothing changed, so run the same command again.
 
 ## 3. What a group contains
 
