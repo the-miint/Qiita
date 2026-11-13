@@ -1,6 +1,6 @@
 ### Added
 
-- **A study admin can restrict one biosample's or prep_sample's value of one field (#TBD).**
+- **A study admin can restrict one biosample's or prep_sample's value of one field (#872).**
   `GET`, `PUT` and `DELETE /api/v1/study/{study_idx}/biosample/{biosample_idx}/field-exception/{study_field_idx}`,
   and the same under `sequenced-sample/{sequenced_sample_idx}`, read, set and clear the
   exception that increases the tier that the value requires above its field's own,
@@ -27,7 +27,7 @@
 
 ### Changed
 
-- **A field exception and `unique_in_study` exclude each other (#TBD).** An
+- **A field exception and `unique_in_study` exclude each other (#872).** An
   exception on a `unique_in_study` field is refused, and so is declaring
   `unique_in_study` on a field that exceptions are set on (409 from the field `PATCH`).
   A write refused as a duplicate on a `unique_in_study` field therefore no longer
