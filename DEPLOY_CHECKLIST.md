@@ -65,6 +65,7 @@ _None yet._
 - (#840) `POST /biosample/resolve-roster` takes a new, incompatible row shape (nested `biosample` / `primary_project` / `secondary_projects` refs); a `qiita` CLI installed before this deploy gets a 422 from `submit-bcl-convert`, `submit-pacbio-ingest` and `submit-golay-demux` until it is upgraded.
 - (#840) Deploy this before kl-metapool moves to the kl-run-preflight release that adds export IDs: Qiita refuses a pre-flight written against a newer schema than the one it ships, so a pre-flight from the new kl-metapool fails every submit until this is live.
 - (#840) Soft output change: in the `submit-bcl-convert` and `submit-golay-demux` JSON, each pre-flight row's `biosample_accession` is replaced by `biosample`, an object holding the identifiers the pre-flight gave for it.
+- (#703) New `qiita-admin scratch reclaim --older-than DAYS` (dry-run by default; `--execute` deletes). Run it as the user that owns the job output dirs (the SLURM job user): it restores owner write on 0550 container output dirs before deleting; it needs `DATABASE_URL` and an absolute `PATH_SCRATCH`.
 
 ## Deployed history
 

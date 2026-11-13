@@ -101,6 +101,7 @@ async def world(postgres_pool, tmp_path):
         "mask_idx": mask_idx,
         "inserts": inserts,
         "ticket_root": tmp_path,
+        "tickets": tickets,
         "masked_sample": masked_sample,
     }
 
@@ -154,6 +155,7 @@ async def test_plans_each_pair_to_its_file_or_a_reason_and_applies(world):
     mine = _mine(plan, mask_idx)
 
     assert mine[ok].alignment_path == attempt_dir / "output" / "syndna_alignment.parquet"
+    assert mine[ok].work_ticket_idx == world["tickets"][0]
     assert "no completed read-mask ticket" in mine[no_ticket].reason
     assert "no completed 'syndna' step" in mine[no_step].reason
     assert "no manifest" in mine[gone].reason
