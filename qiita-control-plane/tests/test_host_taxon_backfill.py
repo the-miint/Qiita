@@ -386,7 +386,7 @@ async def test_written_value_is_visible_to_the_host_filter_resolver(ctx):
     human = await _seed_biosample_with_taxon(ctx, _HUMAN_GUT_METAGENOME)
 
     before = await resolve_host_filter(ctx["pool"], biosample_idx=human, platform=Platform.ILLUMINA)
-    assert before.outcome is HostFilterOutcome.PASS_THROUGH
+    assert before.outcome is HostFilterOutcome.UNRESOLVED
 
     plan = await plan_backfill(ctx["pool"])
     await apply_backfill(

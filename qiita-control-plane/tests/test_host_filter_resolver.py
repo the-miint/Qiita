@@ -22,6 +22,7 @@ from qiita_common.control_types import ControlKind, load_control_types
 from qiita_common.models import (
     BIOSAMPLE_FIELD_QIITA_SAMPLE_TYPE,
     MISSING_REASON_CONTROL_SAMPLE,
+    NCBI_TAXONOMY_METAGENOME_TERM_ID,
     Platform,
 )
 
@@ -96,6 +97,19 @@ async def ctx(postgres_pool):
         pool, name=f"hfr-mm2-{suffix}", created_by_idx=principal_idx
     )
 
+    taxon_gf_idx = await pool.fetchval(
+        "SELECT idx FROM qiita.biosample_global_field WHERE internal_name = 'taxon_id'"
+    )
+    async with pool.acquire() as conn, conn.transaction():
+        taxon_field_idx, _ = await _get_or_create_globally_linked_study_field(
+            conn,
+            spec=BIOSAMPLE_METADATA_SPEC,
+            study_idx=study_idx,
+            global_field_idx=taxon_gf_idx,
+            display_name="taxon id",
+            created_by_idx=principal_idx,
+        )
+
     human_term = await fetch_ncbi_taxonomy_term(pool, NCBI_TAXONOMY_HUMAN_TERM_ID)
     human_term_idx = human_term["idx"] if human_term else None
     assert human_term_idx is not None, "NCBI 9606 should be seeded by migration"
@@ -136,6 +150,7 @@ async def ctx(postgres_pool):
         "study_idx": study_idx,
         "host_gf_idx": host_gf_idx,
         "field_idx": field_idx,
+        "taxon_field_idx": taxon_field_idx,
         "rype_idx": rype_idx,
         "minimap2_idx": minimap2_idx,
         "human_term_idx": human_term_idx,
@@ -204,6 +219,22 @@ async def _set_host_missing_reason(ctx, biosample_idx, reason_name):
         biosample_idx,
         ctx["field_idx"],
         reason_idx,
+        ctx["principal_idx"],
+    )
+
+
+async def _set_taxon(ctx, biosample_idx, term_id):
+    """Write the biosample's own taxon_id as the NCBI term `term_id`."""
+    term = await fetch_ncbi_taxonomy_term(ctx["pool"], term_id)
+    assert term is not None, f"NCBI {term_id} should be seeded"
+    await ctx["pool"].execute(
+        "INSERT INTO qiita.biosample_metadata"
+        " (biosample_idx, biosample_study_field_idx, value_terminology_term_idx,"
+        "  created_by_idx)"
+        " VALUES ($1, $2, $3, $4)",
+        biosample_idx,
+        ctx["taxon_field_idx"],
+        term["idx"],
         ctx["principal_idx"],
     )
 
@@ -289,6 +320,60 @@ async def test_absent_host_taxon_id_passes_through(ctx):
     assert res.outcome is HostFilterOutcome.PASS_THROUGH
     assert res.host_term_idx is None
     assert "no host" in res.reason
+
+
+_HUMAN_GUT_METAGENOME = "408170"
+_SEAWATER_METAGENOME = "1561972"
+
+
+async def test_absent_host_with_a_host_implying_taxon_is_unresolved(ctx):
+    """An absent host means no host unless the sample's own taxon implies one: a
+    hand-created human gut sample must not slip through undepleted."""
+    bs_idx = await _make_biosample(ctx)
+    await _set_taxon(ctx, bs_idx, _HUMAN_GUT_METAGENOME)
+
+    res = await _resolve(ctx, bs_idx)
+
+    assert res.outcome is HostFilterOutcome.UNRESOLVED
+    assert _HUMAN_GUT_METAGENOME in res.reason
+    assert "host_taxon_id" in res.reason
+
+
+@pytest.mark.parametrize("taxon", [_SEAWATER_METAGENOME, NCBI_TAXONOMY_METAGENOME_TERM_ID, None])
+async def test_absent_host_with_a_hostless_unmapped_or_absent_taxon_passes_through(ctx, taxon):
+    bs_idx = await _make_biosample(ctx)
+    if taxon is not None:
+        await _set_taxon(ctx, bs_idx, taxon)
+
+    res = await _resolve(ctx, bs_idx)
+
+    assert res.outcome is HostFilterOutcome.PASS_THROUGH
+    assert res.host_absent is True
+
+
+async def test_a_host_implying_taxon_does_not_refuse_a_control(ctx):
+    bs_idx = await _make_biosample(ctx)
+    await _set_taxon(ctx, bs_idx, _HUMAN_GUT_METAGENOME)
+    await _set_sample_type(ctx, bs_idx, "control_blank")
+
+    res = await _resolve(ctx, bs_idx)
+
+    assert res.outcome is HostFilterOutcome.CONTROL
+
+
+async def test_batch_refuses_an_absent_host_with_a_host_implying_taxon(ctx):
+    implied = await _make_biosample(ctx)
+    await _set_taxon(ctx, implied, _HUMAN_GUT_METAGENOME)
+    hostless = await _make_biosample(ctx)
+    await _set_taxon(ctx, hostless, _SEAWATER_METAGENOME)
+
+    batch = await resolve_host_filter_many(
+        ctx["pool"], biosample_idxs=[implied, hostless], platform=Platform.ILLUMINA
+    )
+
+    assert batch[implied] == await _resolve(ctx, implied)
+    assert batch[implied].outcome is HostFilterOutcome.UNRESOLVED
+    assert batch[hostless].outcome is HostFilterOutcome.PASS_THROUGH
 
 
 @pytest.mark.parametrize("host_reason", ["not collected", "not provided"])

@@ -1724,6 +1724,7 @@ def _no_host_filter(biosample_idx: int) -> dict:
         "rype_reference_idx": None,
         "minimap2_reference_idx": None,
         "reason": f"host_taxon_id is not set on biosample {biosample_idx}, so it has no host",
+        "host_absent": True,
     }
 
 

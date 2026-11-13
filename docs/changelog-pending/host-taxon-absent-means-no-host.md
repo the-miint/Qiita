@@ -11,6 +11,10 @@
   the backfill writes `not provided` for a taxon the curated table does not cover. The
   `qiita submit-host-filter-pool` refusal for an unresolved host points at
   `qiita biosample patch-metadata-by-unique-field` rather than the backfill.
+  An absent `host_taxon_id` is still `unresolved` when the biosample's own `taxon_id` implies a
+  host (e.g. `human gut metagenome`), and a pool that mixes host-filtered biosamples with
+  absent-host ones logs a warning. `qiita-admin backfill host-taxon-id` is no longer
+  re-runnable: run it once in this deploy's bucket 2 before the restart, and never after.
 
 ### Removed
 

@@ -10,6 +10,8 @@ answer cannot come from itself. Getting it wrong is not symmetric:
 So the cases below pin both directions — what it submits AND what it refuses.
 """
 
+import logging
+
 import pytest
 
 from qiita_common.host_filter_plan import (
@@ -45,6 +47,9 @@ def _resolution(outcome):
 _CONTROL = _resolution(HostFilterOutcome.CONTROL)
 _PASS_THROUGH = _resolution(HostFilterOutcome.PASS_THROUGH)
 _UNRESOLVED = _resolution(HostFilterOutcome.UNRESOLVED)
+_HOST_ABSENT = HostFilterResolution(
+    outcome=HostFilterOutcome.PASS_THROUGH, reason="host_taxon_id is not set", host_absent=True
+)
 
 
 # ---------------------------------------------------------------------------
@@ -98,6 +103,34 @@ def test_a_pool_with_no_host_at_all_passes_its_blanks_through():
     assert plan.pool_host_term_idx is None
     assert plan.decisions["BLANK.1"] == SampleHostFilter(enabled=False)
     assert plan.decisions["W1"] == SampleHostFilter(enabled=False)
+
+
+def test_a_pool_mixing_filter_with_an_absent_host_warns(caplog):
+    """An absent host is read as no host, so one forgotten host_taxon_id in a
+    human pool is undepleted: say so, naming the samples."""
+    with caplog.at_level(logging.WARNING, logger="qiita_common.host_filter_plan"):
+        plan = plan_pool_host_filter({"H1": _filter(), "A1": _HOST_ABSENT, "A2": _HOST_ABSENT})
+
+    assert plan.refusal is None
+    assert plan.decisions["A1"] == SampleHostFilter(enabled=False)
+    [record] = caplog.records
+    assert "A1" in record.getMessage() and "A2" in record.getMessage()
+
+
+@pytest.mark.parametrize(
+    "resolutions",
+    [
+        {"W1": _HOST_ABSENT, "W2": _HOST_ABSENT, "BLANK.1": _CONTROL},
+        {"H1": _filter(), "H2": _filter(), "BLANK.1": _CONTROL},
+        {"H1": _filter(), "N1": _PASS_THROUGH},
+    ],
+    ids=["all-absent", "all-filter", "explicit-no-host"],
+)
+def test_a_pool_without_both_filter_and_an_absent_host_does_not_warn(caplog, resolutions):
+    with caplog.at_level(logging.WARNING, logger="qiita_common.host_filter_plan"):
+        plan_pool_host_filter(resolutions)
+
+    assert caplog.records == []
 
 
 def test_a_pool_of_only_blanks_passes_through():

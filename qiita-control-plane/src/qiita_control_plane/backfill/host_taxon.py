@@ -31,8 +31,10 @@ UNRESOLVED at submit — which aborts rather than silently passing an un-deplete
 sample through. The residue is the curation worklist, not a rounding error. A
 hostless taxon is left absent.
 
-Idempotent: a biosample that already carries `host_taxon_id` is skipped, so the
-backfill can be re-run. Adding a taxon to the curated table
+Run ONCE, in the deploy that made an absent `host_taxon_id` mean "no host" (DEPLOY_CHECKLIST
+bucket 2, before the restart), and never after: from the restart an absent value is deliberate,
+and a later run would write over it. A biosample that already carries `host_taxon_id` is
+skipped. Adding a taxon to the curated table
 (`host_by_sample_taxon`) is a code change plus a deploy; a residue row already
 written 'not provided' is then fixed with `qiita biosample patch-metadata-by-unique-field`.
 """

@@ -95,3 +95,5 @@ class HostFilterResolution(BaseModel):
     rype_reference_idx: int | None = None
     minimap2_reference_idx: int | None = None
     reason: str
+    # PASS_THROUGH only because host_taxon_id is unset, not a stated 'not applicable'.
+    host_absent: bool = False

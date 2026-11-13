@@ -382,7 +382,9 @@ from the table: the listed human and mouse metagenomes give that host, and the l
 hostless environments such as seawater or soil leave `host taxon id` out, meaning the
 sequenced sample is submitted with no host depletion. A taxon the table does not cover
 gives `not provided`, and host-filter resolution then returns unresolved and submit
-refuses. `qiita-admin backfill host-taxon-id` reads the same table. An attribute tag
+refuses. `qiita-admin backfill host-taxon-id` reads the same table; it is run once, in the
+deploy that made an absent value mean no host (bucket 2, before the restart), and never
+after, because from the restart an absent value is deliberate. An attribute tag
 named `taxon id` or `host taxon id` is dropped with a warning, since those fields are
 filled from the run's taxon ids (falling back to the table, or to `not provided`).
 

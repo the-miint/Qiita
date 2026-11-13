@@ -376,7 +376,9 @@ def _build_parser() -> argparse.ArgumentParser:
             " hostless taxon is left absent. A biosample neither rule settles is REPORTED"
             " and written 'not provided' — it stays UNRESOLVED at submit, which aborts"
             " rather than passing an un-depleted biosample through."
-            " Idempotent: a biosample that already carries the field is skipped."
+            " Run once, in the deploy that made an absent host_taxon_id mean no host (before"
+            " the restart), and never after: later an absent value is deliberate and this"
+            " would overwrite it. A biosample that already carries the field is skipped."
             " Dry-run by default; pass --execute to write."
             " Needs DATABASE_URL."
         ),

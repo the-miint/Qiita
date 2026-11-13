@@ -22,10 +22,9 @@ to the callers. Two seams it deliberately does not cross:
     actually built is a run-time question the runner already answers
     (`runner/_reference.py`), and duplicating it here would let the two drift.
 
-Fail-closed is the rule for anything ambiguous: an unrecognized missing-reason, or
-a host with no profile for the platform, resolves to UNRESOLVED rather than to
-"no filtering". Silently passing an un-depleted human
-sample through is the one outcome we cannot take back.
+Fail closed on anything ambiguous: an unrecognized missing-reason, or a host with no
+profile for the platform, is UNRESOLVED. An absent host_taxon_id means no host, unless
+the biosample's own taxon implies one.
 """
 
 from collections.abc import Sequence
@@ -36,6 +35,7 @@ from qiita_common.control_types import ControlKind, load_control_types
 from qiita_common.models import (
     BIOSAMPLE_FIELD_HOST_TAXON_ID,
     BIOSAMPLE_FIELD_QIITA_SAMPLE_TYPE,
+    BIOSAMPLE_FIELD_TAXON_ID,
     MISSING_REASON_CONTROL_SAMPLE,
     MISSING_REASON_NOT_APPLICABLE,
     HostFilterOutcome,
@@ -44,6 +44,7 @@ from qiita_common.models import (
     Platform,
 )
 
+from .host_by_sample_taxon import HOST_BY_SAMPLE_TAXON
 from .repositories.host_filter_profile import (
     get_host_filter_profile,
     list_host_filter_profiles,
@@ -67,7 +68,11 @@ _METADATA_FROM = (
     " LEFT JOIN qiita.terminology_term tt"
     "   ON tt.idx = bm.value_terminology_term_idx"
 )
-_METADATA_FIELDS = [BIOSAMPLE_FIELD_HOST_TAXON_ID, BIOSAMPLE_FIELD_QIITA_SAMPLE_TYPE]
+_METADATA_FIELDS = [
+    BIOSAMPLE_FIELD_HOST_TAXON_ID,
+    BIOSAMPLE_FIELD_QIITA_SAMPLE_TYPE,
+    BIOSAMPLE_FIELD_TAXON_ID,
+]
 
 
 @dataclass
@@ -76,6 +81,7 @@ class _Signals:
 
     host_rows: dict[int, asyncpg.Record] = field(default_factory=dict)
     sample_types: dict[int, str] = field(default_factory=dict)
+    taxon_ids: dict[int, str] = field(default_factory=dict)
 
     def kind(self, biosample_idx: int) -> ControlKind | None:
         """None when the biosample has no sample type or control_types.yml does not list it."""
@@ -99,6 +105,8 @@ async def _read_signals(
             signals.host_rows[idx] = row
         elif row["internal_name"] == BIOSAMPLE_FIELD_QIITA_SAMPLE_TYPE and row["term_id"]:
             signals.sample_types[idx] = row["term_id"]
+        elif row["internal_name"] == BIOSAMPLE_FIELD_TAXON_ID and row["term_id"]:
+            signals.taxon_ids[idx] = row["term_id"]
     return signals
 
 
@@ -266,11 +274,20 @@ def _classify(
         )
 
     if row is None:
-        return _without_references(
+        taxon = signals.taxon_ids.get(biosample_idx)
+        if HOST_BY_SAMPLE_TAXON.get(taxon) is not None:
+            return _without_references(
+                HostFilterOutcome.UNRESOLVED,
+                f"{BIOSAMPLE_FIELD_HOST_TAXON_ID} is not set on biosample {biosample_idx}, but its"
+                f" {BIOSAMPLE_FIELD_TAXON_ID} {taxon} implies a host; set"
+                f" {BIOSAMPLE_FIELD_HOST_TAXON_ID}",
+            )
+        res = _without_references(
             HostFilterOutcome.PASS_THROUGH,
             f"{BIOSAMPLE_FIELD_HOST_TAXON_ID} is not set on biosample {biosample_idx},"
             " so it has no host",
         )
+        return res.model_copy(update={"host_absent": True})
 
     host_term_idx = row["value_terminology_term_idx"]
 
