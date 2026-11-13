@@ -42,7 +42,7 @@ import pytest
 from fastapi import HTTPException
 from qiita_common.actions import BLOCK_MASK_ACTION_ID
 from qiita_common.api_paths import LOOPBACK_HOST
-from qiita_common.models import MaskedReadExportTicketRequest, ReadMaskReason
+from qiita_common.models import MaskedReadExportTicketRequest, ReadMaskReason, WorkTicketState
 from qiita_control_plane.block_planner import BLOCK_MASK_ACTION_VERSION
 from qiita_control_plane.testing.db_seeds import (
     delete_action_if_created,
@@ -336,6 +336,17 @@ async def _mask_sample_state(pool, mask_idx, prep_sample_idx):
     )
 
 
+async def _complete_block_ticket(pool, block_idx):
+    """Mark the block's work ticket completed, as the runner does once reconcile, its
+    last step, has run. The export ticket route counts a ticket that is still open
+    as an unfinished run of the prep_samples its block covers."""
+    await pool.execute(
+        "UPDATE qiita.work_ticket SET state = $2 WHERE block_idx = $1",
+        block_idx,
+        WorkTicketState.COMPLETED.value,
+    )
+
+
 async def _export_ticket_or_status(pool, data_plane, *, prep_sample_idx, mask_idx):
     """Call the real create_masked_read_export_ticket in-process; return the HTTP
     status (201 on a minted ticket, or the HTTPException status_code on a gate
@@ -422,6 +433,8 @@ async def test_block_split_sample_reconciles_and_gates_export(block_pool, data_p
         workspace=stage1,
     )
 
+    await _complete_block_ticket(pool, block1)
+
     # prep_a's only covering block completed -> finalized; prep_b still owes block 2.
     assert await _mask_sample_state(pool, mask_idx, prep_a) == "completed"
     assert await _mask_sample_state(pool, mask_idx, prep_b) == "pending"
@@ -472,6 +485,8 @@ async def test_block_split_sample_reconciles_and_gates_export(block_pool, data_p
         bound=bound,
         workspace=stage2,
     )
+
+    await _complete_block_ticket(pool, block2)
 
     # prep_b now complete: all 4 reads registered (count assertion held inside
     # reconcile), gate flipped, metrics rolled up from the DuckLake aggregate.
