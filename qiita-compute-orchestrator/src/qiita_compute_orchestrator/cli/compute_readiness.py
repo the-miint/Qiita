@@ -449,19 +449,14 @@ else
 fi
 rm -f "$MIINT_INFERTRIM_PROBE"
 
-# GPL boundary. miint is a CORE dependency, and the GPL-boundary host (a runtime
-# binary behind which bowtie2, FastTree and Prodigal run) is the ONE miint
-# surface no prior probe exercised — which is exactly why a whole WOL3 sharded
-# build got to the compute nodes with the boundary unreachable and every
-# `build_bowtie2_index` step died `gpl-boundary not installed`, silently, through
-# a green deploy. Registration alone proves nothing (the boundary is out-of-process),
-# so INVOKE it: build a tiny bowtie2 index via `save_bowtie2_index`, which shells to
-# the boundary, then call genes with `predict_genes`, which needs a newer boundary
-# than bowtie2 does and refuses an older binary with the version it found. This runs
-# IN THE JOB ENV — so it also verifies the fix that made it fail before: native jobs
-# get an ephemeral HOME, so the boundary is reachable ONLY when
-# MIINT_GPL_BOUNDARY_PATH is forwarded into the job (miint_job_env); unset/wrong →
-# this fails here, at deploy, not at the first real shard build.
+# GPL boundary. bowtie2, FastTree and Prodigal run in the gpl-boundary binary, a
+# separate process miint starts, so checking that the functions are registered says
+# nothing about whether the binary runs. The probe calls two of them:
+# `save_bowtie2_index` builds a tiny index, and `predict_genes` calls genes, which
+# refuses a binary older than it needs and names the version it found. It runs in
+# the job env: native jobs get an ephemeral HOME, so the boundary is reachable only
+# through MIINT_GPL_BOUNDARY_PATH as miint_job_env forwards it, and an unset or
+# wrong path fails here, at deploy.
 MIINT_BOUNDARY_PROBE="$(mktemp)"
 cat > "$MIINT_BOUNDARY_PROBE" <<'PYEOF'
 import sys
