@@ -141,8 +141,7 @@ diff:
 - **One line each: what it is, where, and why it is still open.** Name the file, not
   the finding number — `R9-3` means nothing tomorrow. (A rule named by id *and* the
   bullet's short name, as the `Declined:` entries below do, is not a finding number.)
-  "Wider than this PR" and
-  "needs the deploy host" are reasons; "deferred" is not.
+  "Wider than this PR" and "needs the deploy host" are reasons; "deferred" is not.
 - **Say what a probe would settle**, not just that it is unrun.
 - **Separate what is pre-existing from what this branch introduced.** A reviewer
   inheriting the list needs to know which items the PR is answerable for.
@@ -189,10 +188,9 @@ included:
 - Under `Fixed:`, list only the `[outside-subject]` fixes; the count includes them.
   With none, the line is the count alone.
 - Under `Declined:`, each entry starts with the strength and the rule it sets aside —
-  the rule's id and its bullet's short name (`[strong] R9 re-implementation of a
-  helper another module owns`), so a reader sees which rule was set aside without
-  opening the reviewer file, and the entry still reads correctly if the rules are
-  renumbered. List the `[strong]` entries first: those are the ones a human reviewer
+  the heading the reviewer reported it under (`[strong] R9 copy-pasted parallel
+  handler`), so a reader sees which rule was set aside without opening the reviewer
+  file. List the `[strong]` entries first: those are the ones a human reviewer
   is asked to re-decide. A finding from outside the rule set says `outside the rule
   set` in place of the rule.
 - Write `none` under any other heading with no entries; do not drop the heading.

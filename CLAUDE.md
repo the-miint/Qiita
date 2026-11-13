@@ -185,7 +185,8 @@ diff, and the next pass reads what the fixes wrote.
 
 The loop ends by printing a `## Reviewer loop` block for the PR description: the commit
 it reviewed, each fix it made outside the PR's subject, and each finding it declined
-(with the reason), deferred (with its issue number), or left unprobed.
+(with the rule it sets aside and the reason), deferred (with its issue number), or left
+unprobed.
 `.github/pull_request_template.md` carries the heading. The `review-loop-check` CI job
 fails a PR whose description lacks the block, whose "Reviewed at" is not one of the
 PR's own commits, or whose "Reviewed at" line does not name, by sha, every commit the
