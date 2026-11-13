@@ -52,8 +52,9 @@ CALL_SETS = (CALL_SET_CHECKM, CALL_SET_META_CLOSED)
 # registration's `assembly_membership` files name, as `bin_quality` is. A run with no
 # subject to call (no refined bin, nothing circular, no unbinned contig over the
 # residue cut) writes both tables empty, and an empty file names no run, so its own
-# keys would leave the previous run's rows in place. The load therefore registers
-# both files, empty or not, in the same registration as `assembly_membership`.
+# keys would leave the previous run's rows in place. This holds only when the load
+# that writes these tables registers both files, empty or not, in the same
+# registration as `assembly_membership`; registration does not check it.
 GENE_CALL_RUN_KEY = ("prep_sample_idx", "processing_idx")
 
 # The subject a row belongs to, as `bin_quality` names it, then the call set.

@@ -186,9 +186,10 @@ def require_staged_extension_directory(*, service: str) -> str:
     return ext_dir
 
 
-# The oldest gpl-boundary the miint functions Qiita calls accept: `predict_genes`
-# refuses an older binary with the version it found
-# (https://the-miint.github.io/duckdb-miint/gene_prediction/).
+# The oldest gpl-boundary the miint functions Qiita calls accept
+# (https://the-miint.github.io/duckdb-miint/gene_prediction/). The test setups use
+# it to replace a cached binary that is older; on the cluster, compute-readiness's
+# `miint-gpl-boundary` probe calls `predict_genes`, which refuses one.
 GPL_BOUNDARY_MIN_VERSION = (0, 5, 0)
 
 

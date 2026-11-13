@@ -28,8 +28,9 @@ mode with tables 4 and 11; `-m` (regions of N masked) throughout; a single-mode 
 that fails or finds no genes is rerun in metagenomic mode; table 4 is kept only when
 its coding density exceeds table 11's by more than 0.05 and is above 0.7, density
 being the bases inside at least one gene over the subject's total length.
-`predict_genes` takes table 11 only in metagenomic mode (gene prediction docs, linked
-above), so a metagenomic call is made once and stands for both tables.
+In metagenomic mode `predict_genes` takes table 11 only, and its models choose table
+11 or 4 per contig (gene prediction docs, linked above), so a metagenomic call is made
+once and stands for both tables.
 
 The inputs are laid out as long-read-assembly's assemble and bin_refine steps write
 them.

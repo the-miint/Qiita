@@ -48,12 +48,6 @@ def test_every_table_leads_with_the_subject_key(table):
     assert GENE_CALL_SUBJECT_KEY[: len(GENE_CALL_RUN_KEY)] == GENE_CALL_RUN_KEY
 
 
-def test_the_run_key_is_assembly_memberships():
-    """Registration borrows `assembly_membership`'s run keys for both tables
-    (`registration.rs`), so the key is that table's."""
-    assert GENE_CALL_RUN_KEY == ("prep_sample_idx", "processing_idx")
-
-
 def test_no_attribute_key_duplicates_a_column():
     """A value is stored once: in its column or in `attributes`, not both."""
     for table, columns in GENE_CALL_TABLES.items():
