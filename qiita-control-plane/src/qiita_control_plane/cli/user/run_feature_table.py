@@ -31,7 +31,7 @@ from qiita_common.api_paths import (
 from qiita_common.duckdb_relation import registered
 from qiita_common.models.run_feature_table import FeatureTableRequest
 
-from ...run_feature_table import ARROW_STREAM_MEDIA_TYPE, FEATURE_RELATION, SOURCES
+from ...run_feature_table import ARROW_STREAM_MEDIA_TYPE, FEATURE_RELATION
 from .. import _common
 from .feature_table import (
     IDENTIFIER_MAP_NOTE,
@@ -94,7 +94,7 @@ def _build(args: argparse.Namespace, token: str, con) -> tuple[list[Path], dict[
         f"{PATH_FEATURE_TABLE_PREFIX}{PATH_FEATURE_TABLE_SAMPLE}",
         json=request,
     )
-    source = SOURCES[columns["method"]]
+    method = columns["method"]
     values = _arrow(args, token, PATH_FEATURE_TABLE_VALUE, request)
     features = _arrow(args, token, PATH_FEATURE_TABLE_FEATURE, request)
     with registered(con, "run_values", values):
@@ -106,8 +106,8 @@ def _build(args: argparse.Namespace, token: str, con) -> tuple[list[Path], dict[
     with registered(con, "run_features", features):
         con.execute(f"CREATE TEMP TABLE {FEATURE_RELATION} AS SELECT * FROM run_features")
     unnamed = con.execute(
-        f"SELECT count(DISTINCT feature_id) FROM {ft.LABELLED_RELATION}"
-        f" WHERE feature_id NOT IN (SELECT feature FROM {FEATURE_RELATION})"
+        f"SELECT count(DISTINCT feature_id) FROM {ft.LABELLED_RELATION} l"
+        f" ANTI JOIN {FEATURE_RELATION} f ON f.feature = l.feature_id"
     ).fetchone()[0]
     if unnamed:
         raise RuntimeError(f"{unnamed} feature(s) of the table are missing from its features")
@@ -126,10 +126,10 @@ def _build(args: argparse.Namespace, token: str, con) -> tuple[list[Path], dict[
     def manifest(targets: list[Path]) -> dict[str, Any]:
         return {
             "note": MANIFEST_NOTE,
-            "kind": source.method,
-            "value_kind": source.value_kind,
+            "kind": method,
+            "value_kind": columns["value_kind"],
             "request": request,
-            "feature_id": _FEATURE_ID[source.method],
+            "feature_id": _FEATURE_ID[method],
             **sizes,
             "files": [p.name for p in targets],
             "versions": _tool_versions(con),

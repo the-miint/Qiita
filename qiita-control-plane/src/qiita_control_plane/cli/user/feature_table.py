@@ -963,14 +963,14 @@ class SequencesClearance(NamedTuple):
 
 
 def _amplicon_sequences_copy_sql(path: Path, *, clearance: SequencesClearance) -> str:
-    """COPY each feature an amplicon table names, with its ASV sequence, to Parquet.
-    The feature ids are md5 hashes of the sequences, so this is the one file that
-    says what a row of the table is."""
+    """COPY each published feature's md5 and ASV sequence to Parquet — the uniform
+    "a feature id, its sequence" resolver. SEMI JOIN to the published set (not `IN`) and
+    unordered, like `write.taxonomy_copy_sql`: the reader joins on the id."""
     del clearance  # Held, not read: holding it is the check.
     return (
         f"COPY (SELECT f.feature AS feature_id, f.sequence, f.length FROM {FEATURE_RELATION} f"
-        f" WHERE f.feature IN (SELECT feature_id FROM {ft.LABELLED_RELATION})"
-        f" ORDER BY f.feature) TO '{validate_parquet_path(path)}' ({PARQUET_OPTS_TRANSFER})"
+        f" SEMI JOIN {ft.LABELLED_RELATION} l ON l.feature_id = f.feature)"
+        f" TO '{validate_parquet_path(path)}' ({PARQUET_OPTS_TRANSFER})"
     )
 
 
@@ -980,7 +980,6 @@ _COMPANIONS = (
     # The amplicon table's (`qiita feature-table runs`).
     _Companion("sequences", ".sequences.parquet", _amplicon_sequences_copy_sql),
 )
-SEQUENCES_COMPANION = _COMPANIONS[-1]
 
 
 def _tool_versions(con) -> dict[str, str]:
