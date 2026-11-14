@@ -1611,7 +1611,7 @@ class ExportedIdentifierRequest(BaseModel):
     ``alignment_idx`` names the processing; together with each ``prep_sample_idx``
     it identifies one processed sample, which is what an ``export_id`` stands for.
     The pair is the request's shape rather than the URL's because the cohort has to
-    ride a body: it is a pool's or a study's worth of samples, past nginx's 8 KB
+    ride a body: it is a pool's or a study's worth of prep_samples, past nginx's 8 KB
     request-line cap in query params, and it routinely SPANS pools.
 
     ``PrepSampleCohort`` is shared with the alignment ticket mint, cap included:

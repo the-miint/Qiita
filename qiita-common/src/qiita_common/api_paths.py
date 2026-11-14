@@ -1077,7 +1077,7 @@ PATH_PREP_SAMPLE_STUDY_FIELD_BY_IDX = "/{study_idx}/prep-sample-field/{study_fie
 # =============================================================================
 # POST, and not only because it writes: the cohort has to ride the body, like
 # /study/lookup, because a feature table's cohort is a pool's or a study's worth
-# of samples and routinely spans pools, neither of which a query string can carry.
+# of prep_samples and routinely spans pools, neither of which a query string can carry.
 
 PATH_EXPORTED_IDENTIFIER_PREFIX = "/exported-identifier"
 PATH_EXPORTED_IDENTIFIER_ROOT = ""  # POST against the prefix itself
