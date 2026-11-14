@@ -35,9 +35,7 @@ from qiita_common.models.run_feature_table import FeatureTableRequest
 from ...run_feature_table import ARROW_STREAM_MEDIA_TYPE, FEATURE_RELATION
 from .. import _common
 from .feature_table import (
-    AMPLICON_TAXONOMY_RELATION,
     IDENTIFIER_MAP_NOTE,
-    AmpliconTaxonomyClearance,
     SequencesClearance,
     _bundle_targets,
     _tool_versions,
@@ -120,8 +118,13 @@ def _build(args: argparse.Namespace, token: str, con) -> tuple[list[Path], dict[
         }
         taxonomy = _arrow(args, token, PATH_FEATURE_TABLE_TAXONOMY, taxonomy_request)
         with registered(con, "run_taxonomy", taxonomy):
+            # The lineage answer already IS the `feature_id` + ranks sidecar; stage it under
+            # the sidecar relation, scoped to the published features, for the shared writer.
             con.execute(
-                f"CREATE TEMP TABLE {AMPLICON_TAXONOMY_RELATION} AS SELECT * FROM run_taxonomy"
+                f"CREATE TEMP TABLE {ft.TAXONOMY_SIDECAR_RELATION} AS"
+                " SELECT a.feature AS feature_id, a.* EXCLUDE (feature)"
+                " FROM run_taxonomy a"
+                f" SEMI JOIN {ft.LABELLED_RELATION} l ON l.feature_id = a.feature"
             )
     unnamed = con.execute(
         f"SELECT count(DISTINCT feature_id) FROM {ft.LABELLED_RELATION} l"
@@ -141,7 +144,10 @@ def _build(args: argparse.Namespace, token: str, con) -> tuple[list[Path], dict[
     )
     clearances: dict[str, Any] = {"sequences": SequencesClearance(features=sizes["features"])}
     if args.taxonomy:
-        clearances["amplicon_taxonomy"] = AmpliconTaxonomyClearance(features=sizes["features"])
+        # The SEMI JOIN above scoped the sidecar to the published features, so it is as wide
+        # as the table by construction; the clearance just carries the size (the client has
+        # no raw taxonomy table to run the full check against).
+        clearances["taxonomy"] = ft.TaxonomyClearance(rows=sizes["features"])
 
     def manifest(targets: list[Path]) -> dict[str, Any]:
         return {

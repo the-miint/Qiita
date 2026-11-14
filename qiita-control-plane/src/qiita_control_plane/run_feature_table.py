@@ -48,7 +48,7 @@ from qiita_common.models.run_feature_table import (
 from qiita_common.taxonomy import (
     RANK_COLUMNS,
     TAXONOMY_SOURCE_TABLE,
-    prefixed_rank_columns_sql,
+    rank_columns_sql,
 )
 
 from .auth.tickets import sign_ticket
@@ -508,17 +508,19 @@ def build_taxonomy(sequences: pa.Table, taxonomy: pa.Table) -> pa.Table:
     feature the cohort observed, keyed by its md5, with the reference's ranks for it
     (all NULL for one the reference does not place). `sequences` is the sequence
     relation (for the md5 of each feature_idx); `taxonomy` is the reference's rows for
-    those feature_idxs."""
+    those feature_idxs.
+
+    The join is the shared feature-axis sidecar, so serving and the client-written sidecar
+    are one definition rather than two."""
     with duckdb.connect() as duck:
         duck.register("sequences", sequences)
-        duck.register("reference_taxonomy", taxonomy)
-        stage_features(duck, sequences="sequences")
-        ranks = prefixed_rank_columns_sql(alias="t")
+        duck.register("tax_stream", taxonomy)
+        duck.execute(ft.feature_label_table_sql("sequences"))
+        duck.execute(ft.taxonomy_table_sql("tax_stream"))
+        duck.execute(ft.feature_taxonomy_sidecar_sql())
         table = duck.sql(
-            f"SELECT f.feature, {ranks}"
-            f" FROM {FEATURE_RELATION} f"
-            " LEFT JOIN reference_taxonomy t ON t.feature_idx = f.feature_idx"
-            " ORDER BY f.feature"
+            f"SELECT feature_id AS feature, {rank_columns_sql()} "
+            f"FROM {ft.TAXONOMY_SIDECAR_RELATION}"
         ).to_arrow_table()
     return table.cast(TAXONOMY_SCHEMA)
 

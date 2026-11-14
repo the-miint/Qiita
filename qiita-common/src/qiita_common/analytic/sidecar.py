@@ -19,6 +19,7 @@ from ..taxonomy import (
 from .label import published_membership_sql
 from .relations import (
     BLOCKED_FEATURE_TABLE,
+    FEATURE_LABEL_TABLE,
     GENOME_LABEL_TABLE,
     PHYLOGENY_TABLE,
     SHEAR_INPUT_RELATION,
@@ -109,6 +110,23 @@ def taxonomy_sidecar_sql() -> str:
         f"SELECT g.feature_id, {prefixed_rank_columns_sql(alias='r')} "
         f"FROM ({reduction}) r "
         f"JOIN {GENOME_LABEL_TABLE} g ON g.genome_idx = r.genome_idx"
+    )
+
+
+def feature_taxonomy_sidecar_sql() -> str:
+    """The feature-axis twin of `taxonomy_sidecar_sql`: one row per published feature,
+    carrying its own ranks.
+
+    **No genome-representative reduction** — the whole difference. A feature of this kind IS
+    the taxonomic unit, so its lineage is its own `reference_taxonomy` row; the label joins
+    straight to the taxonomy. LEFT, so a feature the reference does not place stays present
+    with NULL ranks (keeping the sidecar as wide as the table) rather than vanishing.
+    """
+    return (
+        f"CREATE VIEW {TAXONOMY_SIDECAR_RELATION} AS "
+        f"SELECT l.feature_id, {prefixed_rank_columns_sql(alias='t')} "
+        f"FROM {FEATURE_LABEL_TABLE} l "
+        f"LEFT JOIN {TAXONOMY_TABLE} t ON t.feature_idx = l.feature_idx"
     )
 
 
