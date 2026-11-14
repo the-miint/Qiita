@@ -95,12 +95,14 @@ def test_no_internal_identifier_reaches_the_output():
 
 
 def test_a_value_of_an_unnamed_sample_is_refused():
-    with pytest.raises(RuntimeError, match="no QM"):
+    # The shared relabel refuses it: the value's sample has no label, so it would carry a
+    # NULL sample_id — the same check the OGU table runs, not a second one.
+    with pytest.raises(ValueError, match="NULL sample_id"):
         build_coo(_cohort("QM1"), _membership([(2, 10, 5)]), _sequences([(10, "ACGT")]))
 
 
 def test_an_asv_without_a_sequence_is_refused():
-    with pytest.raises(RuntimeError, match="no sequence"):
+    with pytest.raises(ValueError, match="NULL feature_id"):
         build_coo(_cohort("QM1"), _membership([(1, 99, 5)]), _sequences([(10, "ACGT")]))
 
 

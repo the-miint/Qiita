@@ -94,6 +94,13 @@ OGU_OUTPUT_TABLE = "ogu_output"
 GENOME_LABEL_TABLE = "genome_label"
 SAMPLE_LABEL_TABLE = "sample_label"
 
+# The feature-axis label source — `feature_idx -> feature_id`, the row-keyed flavour the
+# note above anticipates. The handle is the md5 of the sequence: a feature of this kind IS
+# its content, so it arbitrates its own name and needs no mint and no `QF`. That is the one
+# difference from `GENOME_LABEL_TABLE` — same one-row-per-key shape, so both feed one
+# `labelled_relation_sql`.
+FEATURE_LABEL_TABLE = "feature_label"
+
 # The published shape — a VIEW, not a table, and the second exception to the
 # non-temp-TABLE rule above (`COVERAGE_ALIGNMENTS_VIEW` is the first, for the same
 # reason): only the caller's own connection reads it, and its one reader is a COPY.

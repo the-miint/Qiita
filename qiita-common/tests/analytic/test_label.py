@@ -13,25 +13,27 @@ def _relabel_check(
     *,
     output_rows=100,
     labelled_rows=100,
-    unlabelled_genome_rows=0,
+    unlabelled_feature_rows=0,
     unlabelled_sample_rows=0,
-    genomes=10,
+    features=10,
     feature_ids=10,
     samples=5,
     sample_ids=5,
+    axis=ft.OGU_AXIS,
 ) -> ft.LabelClearance:
     """`check_relabel_diagnostics` over a clean row, with one field overridable per
-    test — the defaults describe 100 rows of 10 genomes across 5 samples, all
+    test — the defaults describe 100 rows of 10 features across 5 samples, all
     labelled and all labels distinct."""
     return ft.check_relabel_diagnostics(
         output_rows=output_rows,
         labelled_rows=labelled_rows,
-        unlabelled_genome_rows=unlabelled_genome_rows,
+        unlabelled_feature_rows=unlabelled_feature_rows,
         unlabelled_sample_rows=unlabelled_sample_rows,
-        genomes=genomes,
+        features=features,
         feature_ids=feature_ids,
         samples=samples,
         sample_ids=sample_ids,
+        axis=axis,
     )
 
 
@@ -130,7 +132,7 @@ def test_check_refuses_an_unlabelled_genome():
     """Matched on the column that would go NULL, so the two unlabelled messages cannot
     stand in for each other."""
     with pytest.raises(ValueError, match="NULL feature_id"):
-        _relabel_check(unlabelled_genome_rows=3)
+        _relabel_check(unlabelled_feature_rows=3)
 
 
 def test_check_refuses_an_unlabelled_sample():
@@ -145,7 +147,7 @@ def test_check_refuses_a_feature_id_collision():
     `(feature_id, sample_id)` pairs, so two organisms would quietly become one row.
     """
     with pytest.raises(ValueError, match="export_feature_id"):
-        _relabel_check(genomes=10, feature_ids=9)
+        _relabel_check(features=10, feature_ids=9)
 
 
 def test_check_refuses_an_export_id_collision():
@@ -161,7 +163,7 @@ def test_check_refuses_an_export_id_collision():
 @pytest.mark.parametrize(
     ("unlabelled", "distinct"),
     [
-        ({"unlabelled_genome_rows": 1}, {"genomes": 10, "feature_ids": 9}),
+        ({"unlabelled_feature_rows": 1}, {"features": 10, "feature_ids": 9}),
         ({"unlabelled_sample_rows": 1}, {"samples": 5, "sample_ids": 4}),
     ],
 )
@@ -191,7 +193,7 @@ def test_check_passes_an_empty_table():
     an all-16S reference — and has nothing to collide or go unlabelled."""
     assert (
         _relabel_check(
-            output_rows=0, labelled_rows=0, genomes=0, feature_ids=0, samples=0, sample_ids=0
+            output_rows=0, labelled_rows=0, features=0, feature_ids=0, samples=0, sample_ids=0
         ).rows
         == 0
     )
@@ -203,3 +205,110 @@ def test_the_relabel_sql_is_unreachable_without_a_clearance():
     """
     with pytest.raises(TypeError):
         ft.labelled_relation_sql()
+
+
+# --- The feature axis ------------------------------------------------------------------
+# The feature-keyed flavour over one `RelabelAxis`; the genome tests above are the
+# regression guard that the default axis stays byte-identical.
+
+AMPLICON_COUNT = "amplicon_count"
+
+
+def _feature_axis() -> ft.RelabelAxis:
+    """The amplicon axis: feature-keyed rows, and the composite `(processing_idx,
+    prep_sample_idx)` sample key — both generalizations exercised at once."""
+    return ft.RelabelAxis(
+        output=AMPLICON_COUNT,
+        feature_key="feature_idx",
+        feature_label=ft.FEATURE_LABEL_TABLE,
+        sample_key=("processing_idx", "prep_sample_idx"),
+        sample_label=ft.SAMPLE_LABEL_TABLE,
+        feature_noun="feature",
+        handle_noun="sequence hash",
+        unlabelled_feature_hint="stage the sequence relation for every observed feature",
+    )
+
+
+def test_the_default_axis_reproduces_the_ogu_spine_exactly():
+    """The generalization is only safe if the metagenomic path is byte-identical. A
+    no-arg call and the explicit OGU axis must produce the same join, and it must still
+    be the genome-keyed one over `ogu_output`.
+    """
+    assert label._labelled_select_sql() == label._labelled_select_sql(ft.OGU_AXIS)
+    joined = label._labelled_select_sql()
+    assert "o.genome_idx" in joined
+    assert f"FROM {ft.OGU_OUTPUT_TABLE} o" in joined
+    assert f"LEFT JOIN {ft.GENOME_LABEL_TABLE} g" in joined
+
+
+def test_the_feature_label_table_names_a_feature_by_its_sequence_hash():
+    """The one place the published amplicon handle is defined: md5 of the sequence,
+    computed from the per-feature sequence relation — no mint, no DISTINCT (one sequence
+    row per feature already)."""
+    sql = ft.feature_label_table_sql("seq_src")
+    assert "DISTINCT" not in sql
+    assert "md5(sequence) AS feature_id" in sql
+    assert "SELECT feature_idx," in sql
+    assert "FROM seq_src" in sql
+    assert ft.FEATURE_LABEL_TABLE in sql
+
+
+def test_the_feature_axis_join_keys_on_feature_idx():
+    """Same LEFT-JOIN spine, keyed on the feature axis: the counts relation and the
+    feature label both carry `feature_idx`."""
+    joined = label._labelled_select_sql(_feature_axis())
+    assert f"FROM {AMPLICON_COUNT} o" in joined
+    assert f"LEFT JOIN {ft.FEATURE_LABEL_TABLE} g ON o.feature_idx = g.feature_idx" in joined
+    assert joined.count("LEFT JOIN") == 2
+    assert "genome_idx" not in joined
+
+
+def test_the_composite_sample_key_joins_on_every_column():
+    """A pooled amplicon sample is `(processing_idx, prep_sample_idx)`, so both columns
+    are carried and the sample join is ANDed over both — the same prep_sample in two runs
+    stays two samples instead of collapsing."""
+    joined = label._labelled_select_sql(_feature_axis())
+    assert "o.processing_idx, o.prep_sample_idx" in joined
+    assert (
+        f"LEFT JOIN {ft.SAMPLE_LABEL_TABLE} s "
+        "ON o.processing_idx = s.processing_idx AND o.prep_sample_idx = s.prep_sample_idx"
+    ) in joined
+    # The distinct-sample count is over the pair, not one column.
+    assert (
+        "count(DISTINCT (processing_idx, prep_sample_idx)) AS samples"
+        in ft.relabel_diagnostics_sql(_feature_axis())
+    )
+
+
+def test_the_feature_axis_still_drops_the_internal_key_from_the_published_columns():
+    """The projection enforcement holds on either axis: `feature_idx` is joined ON and
+    then dropped, so it cannot reach a published file."""
+    sql = ft.labelled_relation_sql(clearance=_relabel_check(), axis=_feature_axis())
+    projection = sql.split(" FROM ", 1)[0]
+    assert projection.endswith(", ".join(ft.LABELLED_COLUMNS))
+    assert "feature_idx" not in projection
+
+
+def test_the_feature_axis_diagnostics_measure_the_feature_key_and_its_counts():
+    sql = ft.relabel_diagnostics_sql(_feature_axis())
+    assert "count(DISTINCT feature_idx) AS features" in sql
+    assert f"(SELECT count(*) FROM {AMPLICON_COUNT})" in sql
+
+
+def test_the_feature_axis_diagnostics_and_relabel_read_the_same_join():
+    """The same one-join invariant the genome axis has, per axis: what is measured is
+    what is written."""
+    axis = _feature_axis()
+    joined = label._labelled_select_sql(axis)
+    assert joined in ft.relabel_diagnostics_sql(axis)
+    assert joined in ft.labelled_relation_sql(clearance=_relabel_check(), axis=axis)
+
+
+def test_the_feature_axis_refusals_name_a_feature_not_a_genome():
+    """A wrong amplicon table must not be refused in genome vocabulary. The unlabelled
+    message names a feature, and the collision message names the sequence hash."""
+    axis = _feature_axis()
+    with pytest.raises(ValueError, match="rows name a feature with no public handle"):
+        _relabel_check(unlabelled_feature_rows=3, axis=axis)
+    with pytest.raises(ValueError, match="sequence hash"):
+        _relabel_check(features=10, feature_ids=9, axis=axis)

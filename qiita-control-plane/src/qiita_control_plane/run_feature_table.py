@@ -30,6 +30,7 @@ import asyncpg
 import duckdb
 import pyarrow as pa
 import pyarrow.flight as flight
+from qiita_common import analytic as ft
 from qiita_common.actions import AMPLICON_ACTION_ID
 from qiita_common.amplicon_constants import (
     AMPLICON_MEMBERSHIP_TABLE,
@@ -134,7 +135,7 @@ def _params(row: asyncpg.Record) -> dict:
     return json.loads(params) if isinstance(params, str) else (params or {})
 
 
-def _source_of(runs: list[int], found: dict[int, asyncpg.Record]) -> tuple[Source, dict]:
+def _source_of(runs: list[int], found: dict[int, asyncpg.Record]) -> Source:
     """The one method the runs share, or a refusal naming what is wrong."""
     missing = sorted(p for p in runs if p not in found)
     foreign = {
@@ -170,7 +171,7 @@ def _source_of(runs: list[int], found: dict[int, asyncpg.Record]) -> tuple[Sourc
             f"these runs' {source.noun} are not comparable"
             f" ({', '.join(source.merge_keys)} differ): {detail}",
         )
-    return source, _params(found[runs[0]])
+    return source
 
 
 async def resolve_cohort(pool: asyncpg.Pool, request: FeatureTableRequest) -> Cohort:
@@ -188,7 +189,7 @@ async def resolve_cohort(pool: asyncpg.Pool, request: FeatureTableRequest) -> Co
         " WHERE processing_idx = ANY($1::bigint[])",
         runs,
     )
-    source, _params_row = _source_of(runs, {r["processing_idx"]: r for r in rows})
+    source = _source_of(runs, {r["processing_idx"]: r for r in rows})
 
     processed = await pool.fetch(
         "SELECT ei.processing_idx, ei.prep_sample_idx, ei.export_id,"
@@ -280,50 +281,68 @@ def fetch_runs(
 # The relations `stage_values` creates on the caller's connection.
 FEATURE_RELATION = "run_feature"
 VALUE_RELATION = "run_value"
+COUNT_RELATION = "run_count"
+
+# The amplicon flavour of the shared relabel: features named by sequence md5, samples by
+# the pooled (processing_idx, prep_sample_idx). Only this value differs from the OGU default.
+AMPLICON_AXIS = ft.RelabelAxis(
+    output=COUNT_RELATION,
+    feature_key="feature_idx",
+    feature_label=ft.FEATURE_LABEL_TABLE,
+    sample_key=("processing_idx", "prep_sample_idx"),
+    sample_label=ft.SAMPLE_LABEL_TABLE,
+    feature_noun="feature",
+    handle_noun="sequence hash",
+    unlabelled_feature_hint="the lake must hold a sequence for every feature its counts name",
+)
 
 
 def stage_features(con, *, sequences: str) -> None:
     """Create `FEATURE_RELATION` (feature_idx, feature, sequence, length) from the ASV
-    sequence relation `sequences` (one row per feature_idx, its bytes inline): its
-    feature id is the md5 of its sequence (the QIIME 2 / Greengenes2 convention)."""
+    sequence relation.
+
+    The feature id is read from `feature_label`, not recomputed, so serving and relabelling
+    cannot drift to two ids for one feature — see `analytic.feature_label_table_sql`."""
+    con.execute(ft.feature_label_table_sql(sequences))
     con.execute(
         f"CREATE TEMP TABLE {FEATURE_RELATION} AS"
-        " SELECT feature_idx, md5(sequence) AS feature, sequence,"
-        "        length(sequence)::INTEGER AS length"
-        f" FROM {sequences}"
+        " SELECT s.feature_idx, l.feature_id AS feature, s.sequence,"
+        "        length(s.sequence)::INTEGER AS length"
+        f" FROM {sequences} s JOIN {ft.FEATURE_LABEL_TABLE} l USING (feature_idx)"
     )
 
 
-def _refuse_unnamed(con, *, names: str, values: str) -> None:
-    unnamed = con.execute(
-        f"SELECT count(*) FROM {values} ANTI JOIN {names} USING (processing_idx, prep_sample_idx)"
-    ).fetchone()[0]
-    if unnamed:
-        raise RuntimeError(f"{unnamed} value(s) of a processed sample with no QM")
+def _clear_relabel(con) -> ft.LabelClearance:
+    """The shared relabel diagnostics, returning the clearance `labelled_relation_sql`
+    requires — the check that refuses a value whose sample has no QM or feature no sequence."""
+    cur = con.execute(ft.relabel_diagnostics_sql(AMPLICON_AXIS))
+    row = dict(zip((column[0] for column in cur.description), cur.fetchone(), strict=True))
+    return ft.check_relabel_diagnostics(**row, axis=AMPLICON_AXIS)
 
 
 def stage_values(con, *, source: Source, names: str, values: str, sequences: str) -> None:
-    """Create `FEATURE_RELATION` (feature, sequence, length) and `VALUE_RELATION`
-    (sample, feature, value): the values in `values` relabelled to public names,
-    one row per nonzero cell. `names` maps (processing_idx, prep_sample_idx) to a
-    column name; `sequences` is the ASV sequence relation. Refuses rather than
-    guesses: a value of a processed sample `names` lacks, or of a feature with no
-    sequence in the lake, would need an internal idx as its name."""
-    _refuse_unnamed(con, names=names, values=values)
-    stage_features(con, sequences=sequences)
-    missing = con.execute(
-        f"SELECT count(DISTINCT feature_idx) FROM {values}"
-        f" ANTI JOIN {FEATURE_RELATION} USING (feature_idx)"
-    ).fetchone()[0]
-    if missing:
-        raise RuntimeError(f"{missing} observed ASV(s) have no sequence in the lake")
+    """Relabel `values` to public names into `VALUE_RELATION` (sample, feature, value)
+    through the shared `analytic/label.py` relabel.
+
+    The three label inputs — feature label, sample label (`names`), and counts — feed
+    `labelled_relation_sql`, held to the same `check_relabel_diagnostics` invariants as the
+    OGU table rather than a hand-written set. The trailing COO sum is a wire concern (a
+    sparse cell is one `(sample, feature)` pair), not part of the relabel."""
+    con.execute(ft.feature_label_table_sql(sequences))
+    con.execute(
+        f"CREATE TABLE {ft.SAMPLE_LABEL_TABLE} AS "
+        f"SELECT processing_idx, prep_sample_idx, sample AS sample_id FROM {names}"
+    )
+    con.execute(
+        f"CREATE TABLE {COUNT_RELATION} AS "
+        f"SELECT processing_idx, prep_sample_idx, feature_idx, {source.value_column} AS value "
+        f"FROM {values}"
+    )
+    con.execute(ft.labelled_relation_sql(clearance=_clear_relabel(con), axis=AMPLICON_AXIS))
     con.execute(
         f"CREATE TEMP TABLE {VALUE_RELATION} AS"
-        f" SELECT n.sample, f.feature, sum(m.{source.value_column})::DOUBLE AS value"
-        f" FROM {values} m"
-        f" JOIN {names} n USING (processing_idx, prep_sample_idx)"
-        f" JOIN {FEATURE_RELATION} f USING (feature_idx)"
-        " GROUP BY n.sample, f.feature"
+        " SELECT sample_id AS sample, feature_id AS feature, sum(value)::DOUBLE AS value"
+        f" FROM {ft.LABELLED_RELATION} GROUP BY sample_id, feature_id"
     )
 
 
