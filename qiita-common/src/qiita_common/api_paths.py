@@ -768,9 +768,10 @@ URL_USER_ME = f"{URL_USER_PREFIX}{PATH_USER_ME}"
 PATH_STUDY_PREFIX = "/study"
 PATH_STUDY_ROOT = ""  # POST (create) and GET (list) against the prefix itself
 PATH_STUDY_BY_IDX = "/{study_idx}"
-# Bulk lookup of study_idx by a selectable study accession column
-# (ena_study_accession or bioproject_accession; default bioproject); same
-# body-vs-querystring rationale as the biosample lookup variants.
+# Bulk lookup of study_idx by the natural key the body names. POST (not GET) so
+# the value list rides in the body, which has no URL-line cap.
+PATH_STUDY_LOOKUP = "/lookup"
+# Deprecated in favor of PATH_STUDY_LOOKUP.
 PATH_STUDY_LOOKUP_BY_ACCESSION = "/lookup-by-accession"
 # Per-study access rows (qiita.study_access): list/grant against the study,
 # change-tier/revoke against one grantee's row.
@@ -779,6 +780,7 @@ PATH_STUDY_ACCESS_BY_PRINCIPAL = "/{study_idx}/access/{principal_idx}"
 
 URL_STUDY_PREFIX = f"{API_PREFIX}{PATH_STUDY_PREFIX}"
 URL_STUDY_BY_IDX = f"{URL_STUDY_PREFIX}{PATH_STUDY_BY_IDX}"
+URL_STUDY_LOOKUP = f"{URL_STUDY_PREFIX}{PATH_STUDY_LOOKUP}"
 URL_STUDY_LOOKUP_BY_ACCESSION = f"{URL_STUDY_PREFIX}{PATH_STUDY_LOOKUP_BY_ACCESSION}"
 URL_STUDY_ACCESS = f"{URL_STUDY_PREFIX}{PATH_STUDY_ACCESS}"
 URL_STUDY_ACCESS_BY_PRINCIPAL = f"{URL_STUDY_PREFIX}{PATH_STUDY_ACCESS_BY_PRINCIPAL}"
@@ -813,8 +815,8 @@ PATH_SEQUENCING_RUN_PREFIX = "/sequencing-run"
 PATH_SEQUENCING_RUN_ROOT = ""  # POST against the prefix itself
 # GET one sequencing_run by idx (run metadata incl. instrument_model).
 PATH_SEQUENCING_RUN_BY_IDX = "/{sequencing_run_idx}"
-# Bulk lookup of sequencing_run_idx by instrument_run_id; same body-vs-
-# querystring rationale as the study / biosample accession lookups.
+# Bulk lookup of sequencing_run_idx by instrument_run_id; POST for the reason
+# PATH_STUDY_LOOKUP gives.
 PATH_SEQUENCING_RUN_LOOKUP_BY_INSTRUMENT_RUN_ID = "/lookup-by-instrument-run-id"
 PATH_SEQUENCING_RUN_SEQUENCED_POOL = "/{sequencing_run_idx}/sequenced-pool"
 PATH_SEQUENCED_POOL_PREFLIGHT = (
@@ -959,16 +961,12 @@ PATH_BIOSAMPLE_PREFIX = "/biosample"
 PATH_BIOSAMPLE_BY_IDX = "/{biosample_idx}"
 # The studies that a biosample is actively linked to, with their accessions.
 PATH_BIOSAMPLE_STUDY_LIST = "/{biosample_idx}/study/list"
-# Bulk lookup of biosample_idx by a selectable biosample accession column
-# (biosample_accession or ena_sample_accession; default biosample_accession).
-# POST (not GET) because the accession list lives in the body — a typical
-# bcl-convert pool carries ~384 accessions, which exceeds nginx's default
-# URL-line cap when threaded through query-params. The response shape carries
-# the resolved {accession: idx} map plus a missing[] list so the CLI can
-# fail-fast naming every miss without N round trips.
+# Bulk lookup of biosample_idx by the natural key the body names; POST for the
+# reason PATH_STUDY_LOOKUP gives.
+PATH_BIOSAMPLE_LOOKUP = "/lookup"
+# Deprecated in favor of PATH_BIOSAMPLE_LOOKUP.
 PATH_BIOSAMPLE_LOOKUP_BY_ACCESSION = "/lookup-by-accession"
-# Bulk lookup of biosample_idx by matrix_tube_id; same body-vs-querystring
-# rationale as the accession variant.
+# Deprecated in favor of PATH_BIOSAMPLE_LOOKUP.
 PATH_BIOSAMPLE_LOOKUP_BY_MATRIX_TUBE_ID = "/lookup-by-matrix-tube-id"
 # Resolve a pool roster (one row per pool item, naming its biosample and projects by
 # their identifiers) to biosample_idx + study links in one round trip; 422 lists
@@ -990,6 +988,7 @@ URL_BIOSAMPLE_STUDY_FIELD_BY_IDX = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_STUDY_FIE
 URL_BIOSAMPLE_PREFIX = f"{API_PREFIX}{PATH_BIOSAMPLE_PREFIX}"
 URL_BIOSAMPLE_BY_IDX = f"{URL_BIOSAMPLE_PREFIX}{PATH_BIOSAMPLE_BY_IDX}"
 URL_BIOSAMPLE_STUDY_LIST = f"{URL_BIOSAMPLE_PREFIX}{PATH_BIOSAMPLE_STUDY_LIST}"
+URL_BIOSAMPLE_LOOKUP = f"{URL_BIOSAMPLE_PREFIX}{PATH_BIOSAMPLE_LOOKUP}"
 URL_BIOSAMPLE_LOOKUP_BY_ACCESSION = f"{URL_BIOSAMPLE_PREFIX}{PATH_BIOSAMPLE_LOOKUP_BY_ACCESSION}"
 URL_BIOSAMPLE_LOOKUP_BY_MATRIX_TUBE_ID = (
     f"{URL_BIOSAMPLE_PREFIX}{PATH_BIOSAMPLE_LOOKUP_BY_MATRIX_TUBE_ID}"
@@ -1077,9 +1076,8 @@ PATH_PREP_SAMPLE_STUDY_FIELD_BY_IDX = "/{study_idx}/prep-sample-field/{study_fie
 # /exported-identifier — the public handle a published table carries per sample
 # =============================================================================
 # POST, and not only because it writes: the cohort has to ride the body, like
-# /biosample/lookup-by-accession, because a feature table's cohort is a pool's or
-# a study's worth of samples and routinely spans pools, neither of which a query
-# string can carry.
+# /study/lookup, because a feature table's cohort is a pool's or a study's worth
+# of samples and routinely spans pools, neither of which a query string can carry.
 
 PATH_EXPORTED_IDENTIFIER_PREFIX = "/exported-identifier"
 PATH_EXPORTED_IDENTIFIER_ROOT = ""  # POST against the prefix itself

@@ -28,8 +28,10 @@ from qiita_common.auth_constants import (
     SystemRole,
 )
 from qiita_common.models._base import (
+    MAX_NATURAL_KEY_LOOKUP_VALUES,
     AccessionText,
     MetadataRequestModel,
+    NaturalKeyLookupResponse,
     NonBlankText,
     PatchRequestModel,
     PrepSampleCohort,
@@ -106,27 +108,17 @@ class SequencingRunResponse(BaseModel):
 # same-pattern-ok: per-key wire shape; parallels StudyLookupByAccessionRequest
 class SequencingRunLookupByInstrumentRunIdRequest(BaseModel):
     """Resolves a list of instrument_run_id values to sequencing_run idxs in
-    one round trip. Body-shaped (not query-params) so a long id list cannot
-    exceed nginx's default URL-line cap.
+    one round trip.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     instrument_run_ids: list[Annotated[str, Field(min_length=1)]] = Field(
-        min_length=1, max_length=10_000
+        min_length=1, max_length=MAX_NATURAL_KEY_LOOKUP_VALUES
     )
 
 
-# same-pattern-ok: per-key wire shape; parallels StudyLookupByAccessionResponse
-class SequencingRunLookupByInstrumentRunIdResponse(BaseModel):
-    """`resolved` maps each found instrument_run_id to its sequencing_run_idx.
-    `missing` lists ids that did not resolve, in input order (deduped).
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    resolved: dict[str, Annotated[int, Field(gt=0)]]
-    missing: list[str]
+SequencingRunLookupByInstrumentRunIdResponse = NaturalKeyLookupResponse
 
 
 class SequencedPoolCreateRequest(BaseModel):

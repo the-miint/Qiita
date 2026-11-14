@@ -9,9 +9,41 @@ from pydantic import ValidationError
 
 import qiita_common.models as models_module
 from qiita_common.auth_constants import MAX_ACCESSION_LENGTH
-from qiita_common.models import FieldDataType, TerminologyManifestFile
+from qiita_common.models import (
+    MATRIX_TUBE_ID_PATTERN,
+    BiosampleLookupByAccessionRequest,
+    BiosampleLookupByMatrixTubeIdRequest,
+    BiosampleLookupRequest,
+    FieldDataType,
+    SequencingRunLookupByInstrumentRunIdRequest,
+    StudyLookupByAccessionRequest,
+    StudyLookupRequest,
+    TerminologyManifestFile,
+)
+from qiita_common.models._base import MAX_NATURAL_KEY_LOOKUP_VALUES
 from qiita_common.testing.containers import REFERENCE_HASH_CONTAINER
 from qiita_common.testing.native_steps import FASTQ_TO_PARQUET_MODULE
+
+# Each natural-key lookup request model, as (model, its fixed body fields, its
+# list field, and a builder for the i-th distinct valid value).
+_LOOKUP_REQUEST_CAP_CASES = [
+    (StudyLookupRequest, {"key": "bioproject_accession"}, "values", lambda i: f"PRJ{i}"),
+    (BiosampleLookupRequest, {"key": "matrix_tube_id"}, "values", lambda i: f"{i:010d}"),
+    (
+        StudyLookupByAccessionRequest,
+        {"accession_field": "bioproject_accession"},
+        "accessions",
+        lambda i: f"PRJ{i}",
+    ),
+    (
+        BiosampleLookupByAccessionRequest,
+        {"accession_field": "biosample_accession"},
+        "accessions",
+        lambda i: f"SAMN{i}",
+    ),
+    (BiosampleLookupByMatrixTubeIdRequest, {}, "matrix_tube_ids", lambda i: f"{i:010d}"),
+    (SequencingRunLookupByInstrumentRunIdRequest, {}, "instrument_run_ids", lambda i: f"RUN{i}"),
+]
 
 
 def test_reference_status_enum():
@@ -1755,3 +1787,48 @@ def test_bulk_import_request_is_one_owner_and_one_id_field(second, message):
 
     with pytest.raises(ValidationError, match=message):
         BiosampleBulkImportRequest(rows=[_bulk_row("a"), _bulk_row("b", **second)])
+
+
+@pytest.mark.parametrize(
+    ("model", "fixed_fields", "list_field", "make_value"),
+    _LOOKUP_REQUEST_CAP_CASES,
+    ids=[case[0].__name__ for case in _LOOKUP_REQUEST_CAP_CASES],
+)
+def test_max_natural_key_lookup_values_bounds_lookup_requests(
+    model, fixed_fields, list_field, make_value
+):
+    """Tests the case where a lookup request carries exactly
+    MAX_NATURAL_KEY_LOOKUP_VALUES values (accepted) and one more (refused)."""
+    at_cap = [make_value(i) for i in range(MAX_NATURAL_KEY_LOOKUP_VALUES)]
+    at_cap_body = {**fixed_fields, list_field: at_cap}
+    accepted = model.model_validate(at_cap_body)
+    assert accepted.model_dump() == at_cap_body
+
+    over_cap_body = {**fixed_fields, list_field: [*at_cap, make_value(len(at_cap))]}
+    with pytest.raises(ValidationError):
+        model.model_validate(over_cap_body)
+
+
+def test_biosample_lookup_request_names_malformed_tube_ids():
+    """Tests the case where values under key matrix_tube_id include malformed
+    tube ids: the refusal names each malformed value and only those."""
+    with pytest.raises(ValidationError) as exc_info:
+        BiosampleLookupRequest.model_validate(
+            {"key": "matrix_tube_id", "values": ["0123456789", "abc", "12"]}
+        )
+    messages = [error["msg"] for error in exc_info.value.errors()]
+    expected = [
+        f"Value error, matrix_tube_id values must match {MATRIX_TUBE_ID_PATTERN}: ['abc', '12']"
+    ]
+    assert messages == expected
+
+
+def test_biosample_lookup_request_strips_padded_tube_ids():
+    """Tests the case where values under key matrix_tube_id carry stray outer
+    whitespace: they are stripped before the tube-id check, so a padded tube id
+    is accepted as its unpadded spelling."""
+    request = BiosampleLookupRequest.model_validate(
+        {"key": "matrix_tube_id", "values": [" 0123456789", "0123456780 "]}
+    )
+    expected = BiosampleLookupRequest(key="matrix_tube_id", values=["0123456789", "0123456780"])
+    assert request == expected

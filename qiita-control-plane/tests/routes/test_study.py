@@ -33,6 +33,7 @@ import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 from qiita_common.api_paths import (
     URL_STUDY_BY_IDX,
+    URL_STUDY_LOOKUP,
     URL_STUDY_LOOKUP_BY_ACCESSION,
     URL_STUDY_PREFIX,
 )
@@ -1419,6 +1420,77 @@ async def test_lookup_study_by_accession_rejects_extra_field_422(ctx):
         json={"accessions": ["ERP000001"], "unknown": "x"},
     )
     assert resp.status_code == 422
+
+
+# ===========================================================================
+# POST /api/v1/study/lookup — bulk natural-key → idx resolver
+# ===========================================================================
+
+
+# same-pattern-ok: per-entity twin of the POST /biosample/lookup tests; the overlap with the
+# deprecated lookup route's tests ends when that route is removed
+async def test_lookup_study_resolves_by_export_entity_id(ctx):
+    """Tests the case where the body keys on export_entity_id: a study's minted
+    id resolves to its idx and an unknown id lands in `missing`."""
+    study_idx = await _create_study_with_accession(
+        ctx, accession=unique_accession("PRJ-LOOKUP-EXP")
+    )
+    export_id = await fetch_export_entity_id(ctx["pool"], kind="study", entity_idx=study_idx)
+    unknown_id = unique_accession("EXPORT-LOOKUP-MISS")
+
+    resp = await ctx["user"].post(
+        URL_STUDY_LOOKUP,
+        json={"key": "export_entity_id", "values": [export_id, unknown_id]},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"resolved": {export_id: study_idx}, "missing": [unknown_id]}
+
+
+async def test_lookup_study_resolves_by_bioproject_accession(ctx):
+    """Tests the case where the body keys on bioproject_accession: a seeded
+    accession resolves and an absent one lands in `missing`."""
+    acc = unique_accession("PRJ-LOOKUP-NEW")
+    acc_missing = unique_accession("PRJ-LOOKUP-NEW-MISS")
+    study_idx = await _create_study_with_accession(ctx, accession=acc)
+
+    resp = await ctx["user"].post(
+        URL_STUDY_LOOKUP,
+        json={"key": "bioproject_accession", "values": [acc, acc_missing]},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"resolved": {acc: study_idx}, "missing": [acc_missing]}
+
+
+# same-pattern-ok: per-entity twin of the POST /biosample/lookup tests; the overlap with the
+# deprecated lookup route's tests ends when that route is removed
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"values": ["PRJ000001"]},
+        {"key": "title", "values": ["PRJ000001"]},
+        {"key": "bioproject_accession", "values": []},
+    ],
+    ids=["key-absent", "key-invalid", "values-empty"],
+)
+async def test_lookup_study_rejects_bad_body_422(ctx, body):
+    """Tests the case where the body omits `key`, names a key outside
+    StudyLookupKey, or carries no values: the request model rejects it with 422
+    before any DB work runs."""
+    resp = await ctx["user"].post(URL_STUDY_LOOKUP, json=body)
+    assert resp.status_code == 422
+
+
+# same-pattern-ok: per-entity twin of the POST /biosample/lookup tests; the overlap with the
+# deprecated lookup route's tests ends when that route is removed
+async def test_lookup_study_missing_scope_403(ctx, no_study_read_client):
+    """Tests the case where the caller's PAT scope set excludes
+    Scope.STUDY_READ: require_scope raises 403 before any DB work."""
+    resp = await no_study_read_client.post(
+        URL_STUDY_LOOKUP,
+        json={"key": "export_entity_id", "values": ["anything"]},
+    )
+    assert resp.status_code == 403
+    assert "study:read" in resp.json()["detail"]
 
 
 # ===========================================================================

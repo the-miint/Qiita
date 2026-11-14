@@ -10,21 +10,22 @@ from dataclasses import dataclass, field
 
 import asyncpg
 from qiita_common.models import (
+    BiosampleLookupKey,
     BiosampleRef,
     RosterProblem,
     RosterResolvedRow,
     RosterResolveRow,
+    StudyLookupKey,
     StudyRef,
     normalize_matrix_tube_id,
 )
 
 from qiita_control_plane.repositories.biosample import (
-    BiosampleLookupKey,
     fetch_active_study_idxs_by_biosample_idx,
     fetch_biosample_idxs_by_natural_key,
 )
 from qiita_control_plane.repositories.exported_entity import EntityKind
-from qiita_control_plane.repositories.study import StudyLookupKey, fetch_study_idxs_by_natural_key
+from qiita_control_plane.repositories.study import fetch_study_idxs_by_natural_key
 
 
 @dataclass(frozen=True)

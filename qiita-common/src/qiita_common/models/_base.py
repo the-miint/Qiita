@@ -55,6 +55,9 @@ PrepSampleCohort = Annotated[
     Field(min_length=1, max_length=MAX_COHORT_PREP_SAMPLE_IDX),
 ]
 
+# Upper bound on the values one natural-key lookup request may resolve.
+MAX_NATURAL_KEY_LOOKUP_VALUES = 10_000
+
 
 def _strip_text(value: Any) -> Any:
     """Strip outer whitespace from text, passing anything else through so the
@@ -466,3 +469,14 @@ class PatchRequestModel(BaseModel):
             if field_name in self.model_fields_set and getattr(self, field_name) is None:
                 raise ValueError(f"{field_name} may not be null")
         return self
+
+
+class NaturalKeyLookupResponse(BaseModel):
+    """`resolved` maps each found natural-key value to its idx. `missing` lists
+    the values that did not resolve, in input order (deduped).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    resolved: dict[str, Annotated[int, Field(gt=0)]]
+    missing: list[str]

@@ -1,18 +1,19 @@
-"""Biosample import models, metadata value shapes, accession/matrix-tube
-lookups, the shared bulk-idx / list response envelopes, and the biosample
-PATCH body."""
+"""Biosample import models, metadata value shapes, natural-key lookups, the
+shared bulk-idx / list response envelopes, and the biosample PATCH body."""
 
 from collections import Counter
 from datetime import date
 from decimal import Decimal
 from enum import StrEnum
-from typing import Annotated, ClassVar, Literal
+from typing import Annotated, ClassVar, Literal, get_args
 
 from pydantic import (
     AwareDatetime,
     BaseModel,
     ConfigDict,
     Field,
+    TypeAdapter,
+    ValidationError,
     computed_field,
     field_validator,
     model_validator,
@@ -20,8 +21,10 @@ from pydantic import (
 
 from qiita_common.auth_constants import SystemRole
 from qiita_common.models._base import (
+    MAX_NATURAL_KEY_LOOKUP_VALUES,
     AccessionText,
     MetadataRequestModel,
+    NaturalKeyLookupResponse,
     NonBlankName,
     NonBlankText,
     PatchRequestModel,
@@ -47,6 +50,8 @@ MATRIX_TUBE_ID_WIDTH = 10
 MATRIX_TUBE_ID_PATTERN = (
     rf"^[0-9]{{{MATRIX_TUBE_ID_WIDTH}}}$"  # same-pattern-ok: DB CHECK parity (see above)
 )
+MatrixTubeIdText = Annotated[str, Field(pattern=MATRIX_TUBE_ID_PATTERN)]
+_MATRIX_TUBE_ID_LIST_ADAPTER = TypeAdapter(list[MatrixTubeIdText])
 
 # The wire spellings of the idx fields the biosample field shapes re-declare
 # with an entity-qualified alias. Named so a caller writing or reading one of
@@ -106,10 +111,7 @@ class BiosampleImportRequest(MetadataRequestModel):
     metadata_checklist_name: NonBlankText | None = None
     biosample_accession: AccessionText | None = None
     ena_sample_accession: AccessionText | None = None
-    matrix_tube_id: Annotated[
-        str | None,
-        Field(pattern=MATRIX_TUBE_ID_PATTERN),
-    ] = None
+    matrix_tube_id: MatrixTubeIdText | None = None
 
 
 class BiosampleImportResponse(BaseModel):
@@ -655,101 +657,101 @@ class BiosampleMetadataWriteByUniqueFieldResponse(SampleMetadataWriteResponse):
 BiosampleAccessionField = Literal["biosample_accession", "ena_sample_accession"]
 
 
+# The natural keys a biosample lookup may key on: the accession columns,
+# matrix_tube_id, and export_entity_id.
+BiosampleLookupKey = Literal[
+    *get_args(BiosampleAccessionField), "matrix_tube_id", "export_entity_id"
+]
+
+
+# same-pattern-ok: per-entity key set; parallels StudyLookupRequest
+class BiosampleLookupRequest(BaseModel):
+    """Resolves a list of values of the natural key named by `key` to
+    biosample_idxs in one round trip. Under `matrix_tube_id`, every value must
+    match MATRIX_TUBE_ID_PATTERN.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    key: BiosampleLookupKey
+    values: list[NonBlankText] = Field(min_length=1, max_length=MAX_NATURAL_KEY_LOOKUP_VALUES)
+
+    @model_validator(mode="after")
+    def _check_matrix_tube_ids(self) -> BiosampleLookupRequest:
+        if self.key != "matrix_tube_id":
+            return self
+        try:
+            _MATRIX_TUBE_ID_LIST_ADAPTER.validate_python(self.values)
+        except ValidationError as exc:
+            malformed = [self.values[error["loc"][0]] for error in exc.errors()]
+            raise ValueError(
+                f"matrix_tube_id values must match {MATRIX_TUBE_ID_PATTERN}: {malformed}"
+            ) from exc
+        return self
+
+
 class BiosampleLookupByAccessionRequest(BaseModel):
-    """Body for POST /api/v1/biosample/lookup-by-accession.
-
-    Resolves a list of biosample accession strings to their qiita.biosample
-    idxs in one round trip, keyed on the column named by `accession_field`
-    (default biosample_accession). Used by qiita submit-bcl-convert to
-    translate the preflight rows' biosample_accession values into the
-    biosample_idx the sequenced-sample composer route requires.
-
-    The request body is the natural place for the list because a typical
-    bcl-convert pool carries 384 accessions, which exceeds nginx's
-    default URL-line cap when threaded through repeated query
-    parameters; the body has no such cap.
+    """Body for the deprecated POST /api/v1/biosample/lookup-by-accession, which
+    BiosampleLookupRequest supersedes: resolves biosample accession values keyed
+    on the column named by `accession_field` (default biosample_accession).
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    accessions: list[NonBlankText] = Field(min_length=1, max_length=10_000)
+    accessions: list[NonBlankText] = Field(min_length=1, max_length=MAX_NATURAL_KEY_LOOKUP_VALUES)
     accession_field: BiosampleAccessionField = "biosample_accession"
-
-
-class BiosampleLookupByAccessionResponse(BaseModel):
-    """Returned by POST /api/v1/biosample/lookup-by-accession.
-
-    `resolved` maps each found accession to its biosample_idx. `missing`
-    lists accessions that did not resolve, in input order (deduped). The
-    CLI surfaces `missing` to the operator with no side effects when it
-    is non-empty so a missing biosample can be imported before re-running.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    resolved: dict[str, Annotated[int, Field(gt=0)]]
-    missing: list[str]
 
 
 # same-pattern-ok: per-key wire shape; parallels BiosampleLookupByAccessionRequest
 class BiosampleLookupByMatrixTubeIdRequest(BaseModel):
-    """Body for POST /api/v1/biosample/lookup-by-matrix-tube-id.
-
-    Bulk-resolves a list of matrix_tube_id values to biosample_idx. Same
-    body-vs-querystring rationale as the accession variant.
+    """Body for the deprecated POST /api/v1/biosample/lookup-by-matrix-tube-id,
+    which BiosampleLookupRequest supersedes.
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    matrix_tube_ids: list[Annotated[str, Field(pattern=MATRIX_TUBE_ID_PATTERN)]] = Field(
-        min_length=1, max_length=10_000
+    matrix_tube_ids: list[MatrixTubeIdText] = Field(
+        min_length=1, max_length=MAX_NATURAL_KEY_LOOKUP_VALUES
     )
-
-
-# same-pattern-ok: per-key wire shape; parallels BiosampleLookupByAccessionResponse
-class BiosampleLookupByMatrixTubeIdResponse(BaseModel):
-    """Returned by POST /api/v1/biosample/lookup-by-matrix-tube-id.
-
-    `resolved` maps each found matrix_tube_id to its biosample_idx.
-    `missing` lists matrix_tube_id values that did not resolve, in input
-    order (deduped).
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    resolved: dict[str, Annotated[int, Field(gt=0)]]
-    missing: list[str]
 
 
 # The two qiita.study accession columns a lookup may key on; each value is the
 # literal Postgres column name it selects.
 StudyAccessionField = Literal["ena_study_accession", "bioproject_accession"]
 
+# The natural keys a study lookup may key on: the accession columns plus
+# export_entity_id.
+StudyLookupKey = Literal[*get_args(StudyAccessionField), "export_entity_id"]
+
+
+class StudyLookupRequest(BaseModel):
+    """Resolves a list of values of the natural key named by `key` to
+    study_idxs in one round trip.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    key: StudyLookupKey
+    values: list[NonBlankText] = Field(min_length=1, max_length=MAX_NATURAL_KEY_LOOKUP_VALUES)
+
 
 # same-pattern-ok: per-key wire shape; parallels BiosampleLookupByAccessionRequest
 class StudyLookupByAccessionRequest(BaseModel):
-    """Resolves a list of study accession values to study_idxs in one round
-    trip, keyed on the column named by `accession_field` (default
-    bioproject_accession). Body-shaped (not query-params) so a long accession
-    list cannot exceed nginx's default URL-line cap.
+    """Body for the deprecated POST /api/v1/study/lookup-by-accession, which
+    StudyLookupRequest supersedes: resolves study accession values keyed on
+    the column named by `accession_field` (default bioproject_accession).
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    accessions: list[NonBlankText] = Field(min_length=1, max_length=10_000)
+    accessions: list[NonBlankText] = Field(min_length=1, max_length=MAX_NATURAL_KEY_LOOKUP_VALUES)
     accession_field: StudyAccessionField = "bioproject_accession"
 
 
-# same-pattern-ok: per-key wire shape; parallels BiosampleLookupByAccessionResponse
-class StudyLookupByAccessionResponse(BaseModel):
-    """`resolved` maps each found accession to its study_idx. `missing`
-    lists accessions that did not resolve, in input order (deduped).
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    resolved: dict[str, Annotated[int, Field(gt=0)]]
-    missing: list[str]
+# The deprecated lookups' former response names; each is NaturalKeyLookupResponse.
+BiosampleLookupByAccessionResponse = NaturalKeyLookupResponse
+BiosampleLookupByMatrixTubeIdResponse = NaturalKeyLookupResponse
+StudyLookupByAccessionResponse = NaturalKeyLookupResponse
 
 
 def normalize_matrix_tube_id(raw: str) -> str:
@@ -895,10 +897,7 @@ class BiosamplePatchRequest(PatchRequestModel):
     owner_idx: Annotated[int, Field(gt=0)] | None = None
     biosample_accession: AccessionText | None = None
     ena_sample_accession: AccessionText | None = None
-    matrix_tube_id: Annotated[
-        str | None,
-        Field(pattern=MATRIX_TUBE_ID_PATTERN),
-    ] = None
+    matrix_tube_id: MatrixTubeIdText | None = None
     last_submission_at: AwareDatetime | None = None
     submission_error: str | None = None
 
