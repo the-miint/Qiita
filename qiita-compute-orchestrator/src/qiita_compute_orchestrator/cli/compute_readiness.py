@@ -454,9 +454,9 @@ rm -f "$MIINT_INFERTRIM_PROBE"
 # nothing about whether the binary runs. The probe runs two of them:
 # `save_bowtie2_index` builds a tiny index, and `predict_genes` predicts genes on a
 # short sequence; it refuses a gpl-boundary older than it needs and names the
-# version it found. `prodigal_proteins`, which the gene_call job writes CheckM's
-# protein FASTA with, then reads that output. The probe runs in the job env: native
-# jobs get an ephemeral HOME, so the boundary is reachable only through
+# version it found. The probe then runs `prodigal_proteins` on that output; the
+# gene_call job writes CheckM's protein FASTA with it. The probe runs in the job
+# env: native jobs get an ephemeral HOME, so the boundary is reachable only through
 # MIINT_GPL_BOUNDARY_PATH as miint_job_env forwards it, and an unset or wrong path
 # fails here, at deploy.
 MIINT_BOUNDARY_PROBE="$(mktemp)"

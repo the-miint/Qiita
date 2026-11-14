@@ -391,6 +391,14 @@ def _write_checkm_files(conn, out: Path) -> int:
           ON r.genome_id = p.genome_id AND r.read_id || '_' || r.gene_index = p.read_id
         """
     )
+    genes, records = conn.execute(
+        """SELECT (SELECT count(*) FROM checkm_rows WHERE gene_index IS NOT NULL),
+                  (SELECT count(*) FROM checkm_faa)"""
+    ).fetchone()
+    if genes != records:
+        raise RuntimeError(
+            f"prodigal_proteins: {records} record(s) matched {genes} prodigal_checkm gene(s)"
+        )
     subjects = conn.execute(
         """
         SELECT DISTINCT s.genome_id, s.kind, s.bin_id
