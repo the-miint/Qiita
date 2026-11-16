@@ -64,7 +64,7 @@ from qiita_control_plane.testing.db_seeds import (
     seed_study,
     seed_user_principal,
 )
-from qiita_control_plane.testing.db_teardown import teardown_entity_graph
+from qiita_control_plane.testing.db_teardown import delete_definition_pairs, teardown_entity_graph
 from qiita_control_plane.testing.unique_names import unique_field_name
 
 # Bounds every wait on a request task, so a request that never returns fails
@@ -1671,10 +1671,7 @@ async def alignment_group_world(pool_alignment_seed, role_keyed_clients):
 
     yield {**seed, "mask_2": mask_2, "align_3": align_3, "gate": gate}
 
-    await pool.execute(
-        "DELETE FROM qiita.definition_pair WHERE definition_pair_idx = $1",
-        pair["definition_pair_idx"],
-    )
+    await delete_definition_pairs(pool, [pair["definition_pair_idx"]])
     # These two are this fixture's own parents; deleting them clears their swept
     # alignment_sample / mask_sample rows (ON DELETE CASCADE) ahead of the seed's sweep.
     await pool.execute("DELETE FROM qiita.alignment_definition WHERE alignment_idx = $1", align_3)

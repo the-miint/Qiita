@@ -187,8 +187,10 @@ CREATE TRIGGER definition_pair_detach
 -- ---------------------------------------------------------------------------
 CREATE TABLE qiita.definition_pair_event (
     definition_pair_event_idx BIGINT PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
+    -- RESTRICT: a pair keeps its history, so a pair with events (every pair has its
+    -- 'opened' one) cannot be deleted.
     definition_pair_idx       BIGINT NOT NULL
-        REFERENCES qiita.definition_pair(definition_pair_idx) ON DELETE CASCADE,
+        REFERENCES qiita.definition_pair(definition_pair_idx) ON DELETE RESTRICT,
     event                     TEXT   NOT NULL CHECK (event IN ('opened', 'decided', 'revoked')),
     -- The pair's verdict after the event.
     verdict                   TEXT   NOT NULL
@@ -212,7 +214,10 @@ CREATE INDEX definition_pair_event_pair
 
 COMMENT ON TABLE qiita.definition_pair_event IS
     'History of a definition_pair: opened, each decision and each revoke, with the '
-    'actor and reason. Rows are never updated; they go only with their pair.';
+    'actor and reason. Append-only: UPDATE and DELETE are refused by triggers, and '
+    'the FK to the pair is ON DELETE RESTRICT, so the pair cannot be deleted either. '
+    'A revoke nulls the pair''s decision columns; these rows are what keeps who '
+    'decided what.';
 COMMENT ON COLUMN qiita.definition_pair_event.event IS
     '''opened'' | ''decided'' | ''revoked'' (TEXT + CHECK). Python twin: '
     'qiita_common.models.DefinitionPairEventType.';
@@ -223,17 +228,21 @@ COMMENT ON COLUMN qiita.definition_pair_event.verdict IS
 CREATE FUNCTION qiita.tg_definition_pair_event_immutable() RETURNS trigger
 LANGUAGE plpgsql AS $$
 BEGIN
-    RAISE EXCEPTION 'qiita.definition_pair_event rows are not updated';
+    RAISE EXCEPTION 'qiita.definition_pair_event is append-only (% refused)', TG_OP;
 END;
 $$;
 
 CREATE TRIGGER definition_pair_event_no_update
     BEFORE UPDATE ON qiita.definition_pair_event
     FOR EACH ROW EXECUTE FUNCTION qiita.tg_definition_pair_event_immutable();
+CREATE TRIGGER definition_pair_event_no_delete
+    BEFORE DELETE ON qiita.definition_pair_event
+    FOR EACH ROW EXECUTE FUNCTION qiita.tg_definition_pair_event_immutable();
 
 
 -- migrate:down
 
+DROP TRIGGER IF EXISTS definition_pair_event_no_delete ON qiita.definition_pair_event;
 DROP TRIGGER IF EXISTS definition_pair_event_no_update ON qiita.definition_pair_event;
 DROP FUNCTION IF EXISTS qiita.tg_definition_pair_event_immutable();
 DROP TABLE IF EXISTS qiita.definition_pair_event;

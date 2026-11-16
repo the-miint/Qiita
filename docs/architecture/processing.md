@@ -333,7 +333,8 @@ Postgres-based (`SELECT ... FOR UPDATE SKIP LOCKED`). Work tickets created by qi
 A mask, an alignment or a processing is a definition minted from its params, so a
 changed setting mints a new one and the prep_samples run under each are split across
 the two. A system_admin records whether two definitions of one kind are `similar`
-(`qiita.definition_pair`, with its history in `qiita.definition_pair_event`;
+(`qiita.definition_pair`, with its history in `qiita.definition_pair_event`, which
+refuses UPDATE and DELETE and keeps its pair from being deleted;
 migration `20261113000000_definition_pair.sql`). The procedure is
 [`runbooks/deciding-similar-definitions.md`](../runbooks/deciding-similar-definitions.md).
 

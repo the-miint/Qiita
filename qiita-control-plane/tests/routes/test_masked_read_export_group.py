@@ -34,6 +34,7 @@ from qiita_control_plane.main import app
 from qiita_control_plane.repositories.block import MASK_SAMPLE_COMPLETED
 from qiita_control_plane.repositories.mask_definition import transition_mask_definition_status
 from qiita_control_plane.testing.db_seeds import seed_biosample_with_sequenced_prep_sample
+from qiita_control_plane.testing.db_teardown import delete_definition_pairs
 
 from . import test_mask_definition_read as mask_read
 from .conftest import role_keyed_clients  # noqa: F401
@@ -145,10 +146,7 @@ async def group(ctx):
         "ticket": ticket,
     }
 
-    await pool.execute(
-        "DELETE FROM qiita.definition_pair WHERE definition_pair_idx = $1",
-        pair["definition_pair_idx"],
-    )
+    await delete_definition_pairs(pool, [pair["definition_pair_idx"]])
 
 
 @pytest.mark.parametrize("anchor", ["low", "high"])

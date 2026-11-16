@@ -60,7 +60,7 @@ from qiita_control_plane.testing.db_seeds import (
     seed_prep_sample_to_study_link,
     seed_sequenced_sample_subtype,
 )
-from qiita_control_plane.testing.db_teardown import teardown_entity_graph
+from qiita_control_plane.testing.db_teardown import delete_definition_pairs, teardown_entity_graph
 
 from conftest import ducklake_connect
 
@@ -786,10 +786,7 @@ async def cross_pool_cohort(postgres_pool, human_admin_session, regular_user_ses
         biosample_idxs=[bs for bs, _ in samples],
         prep_sample_idxs=[ps for _, ps in samples],
     )
-    await db.execute(
-        "DELETE FROM qiita.definition_pair WHERE definition_pair_idx = $1",
-        pair["definition_pair_idx"],
-    )
+    await delete_definition_pairs(db, [pair["definition_pair_idx"]])
     await db.execute(
         "DELETE FROM qiita.alignment_definition WHERE alignment_idx = ANY($1::bigint[])",
         list(alignments.values()),

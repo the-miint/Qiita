@@ -37,6 +37,7 @@ from qiita_control_plane.repositories import definition_pair as pair_repo
 from qiita_control_plane.repositories.alignment_definition import mint_alignment_definition
 from qiita_control_plane.repositories.mask_definition import mint_mask_definition
 from qiita_control_plane.repositories.processing import mint_processing
+from qiita_control_plane.testing.db_teardown import delete_definition_pairs
 from qiita_control_plane.testing.postgres import until_advisory_lock_awaited
 
 pytestmark = pytest.mark.db
@@ -133,12 +134,15 @@ async def defs(postgres_pool, human_admin_session):
     }
 
     for kind, idxs in made.items():
-        await postgres_pool.execute(
-            "DELETE FROM qiita.definition_pair WHERE definition_kind = $1"
-            " AND (low_definition_ref = ANY($2::bigint[])"
-            "      OR high_definition_ref = ANY($2::bigint[]))",
-            kind,
-            idxs,
+        await delete_definition_pairs(
+            postgres_pool,
+            await postgres_pool.fetchval(
+                "SELECT coalesce(array_agg(definition_pair_idx), '{}') FROM qiita.definition_pair"
+                " WHERE definition_kind = $1 AND (low_definition_ref = ANY($2::bigint[])"
+                "      OR high_definition_ref = ANY($2::bigint[]))",
+                kind,
+                idxs,
+            ),
         )
     await postgres_pool.execute(
         "DELETE FROM qiita.alignment_definition WHERE alignment_idx = ANY($1::bigint[])",
@@ -288,14 +292,31 @@ async def test_decision_fields_move_with_the_verdict(postgres_pool, clients, def
         )
 
 
-async def test_history_rows_are_not_updated(postgres_pool, clients, defs):
+async def test_history_rows_are_not_updated_or_deleted_and_keep_their_pair(
+    postgres_pool, clients, defs
+):
+    """A revoke nulls the pair's decision columns, so the history is the record of
+    who decided what: its rows are neither updated nor deleted, and the pair they
+    belong to cannot be deleted from under them."""
     m1, m2 = await defs["mask"](rype=0.05), await defs["mask"](rype=0.1)
     pair_idx = await _opened(clients["admin"], DefinitionKind.MASK, m1, m2)
-    with pytest.raises(asyncpg.RaiseError, match="not updated"):
+    for statement, op in (
+        ("UPDATE qiita.definition_pair_event SET reason = 'x'", "UPDATE"),
+        ("DELETE FROM qiita.definition_pair_event", "DELETE"),
+    ):
+        with pytest.raises(asyncpg.RaiseError, match=f"append-only \\({op} refused\\)"):
+            await postgres_pool.execute(f"{statement} WHERE definition_pair_idx = $1", pair_idx)
+    with pytest.raises(asyncpg.ForeignKeyViolationError, match="definition_pair_event"):
         await postgres_pool.execute(
-            "UPDATE qiita.definition_pair_event SET reason = 'x' WHERE definition_pair_idx = $1",
+            "DELETE FROM qiita.definition_pair WHERE definition_pair_idx = $1", pair_idx
+        )
+    assert (
+        await postgres_pool.fetchval(
+            "SELECT count(*) FROM qiita.definition_pair_event WHERE definition_pair_idx = $1",
             pair_idx,
         )
+        == 1
+    )
 
 
 # ---------------------------------------------------------------------------

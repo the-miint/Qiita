@@ -22,6 +22,7 @@ from qiita_control_plane.testing.db_seeds import (
     seed_bare_reference,
     seed_reference_membership,
 )
+from qiita_control_plane.testing.db_teardown import delete_definition_pairs
 
 from . import test_mask_definition_read as mask_read
 from .conftest import (  # noqa: F401
@@ -269,9 +270,7 @@ async def similar(ctx):
         pairs.append(pair["definition_pair_idx"])
 
     yield _similar
-    await pool.execute(
-        "DELETE FROM qiita.definition_pair WHERE definition_pair_idx = ANY($1::bigint[])", pairs
-    )
+    await delete_definition_pairs(pool, pairs)
 
 
 async def test_each_sample_is_counted_under_the_mask_it_resolves_to(ctx, similar):

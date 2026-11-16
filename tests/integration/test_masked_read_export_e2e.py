@@ -54,7 +54,7 @@ from qiita_common.models import (
     SampleResolutionState,
 )
 from qiita_control_plane.repositories.block import MASK_SAMPLE_COMPLETED
-from qiita_control_plane.testing.db_teardown import teardown_entity_graph
+from qiita_control_plane.testing.db_teardown import delete_definition_pairs, teardown_entity_graph
 
 from conftest import ducklake_connect
 
@@ -542,10 +542,7 @@ async def group_seeded(seeded, postgres_pool):
         "ps_3": ps_3,
     }
 
-    await postgres_pool.execute(
-        "DELETE FROM qiita.definition_pair WHERE definition_pair_idx = $1",
-        pair["definition_pair_idx"],
-    )
+    await delete_definition_pairs(postgres_pool, [pair["definition_pair_idx"]])
     await teardown_entity_graph(
         postgres_pool, study_idxs=[], biosample_idxs=biosamples, prep_sample_idxs=preps
     )

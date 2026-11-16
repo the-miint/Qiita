@@ -328,6 +328,32 @@ async def delete_principal(pool: asyncpg.Pool, principal_idxs: int | Iterable[in
     await delete_idxs(pool, "principal", named)
 
 
+_PAIR_EVENT = "qiita.definition_pair_event"
+_PAIR_EVENT_NO_DELETE = "definition_pair_event_no_delete"
+
+
+async def delete_definition_pairs(pool: asyncpg.Pool, definition_pair_idxs: Iterable[int]) -> None:
+    """Delete these definition pairs and their history.
+
+    `qiita.definition_pair_event` refuses DELETE by trigger and RESTRICTs the delete of
+    its pair, so nothing but a test removes a pair. This disables the trigger for one
+    transaction, as the `auth_event` cleanups do; ALTER TABLE is transactional, so the
+    trigger is back however the transaction ends."""
+    idxs = _as_idx_list(definition_pair_idxs)
+    if not idxs:
+        return
+    async with pool.acquire() as conn, conn.transaction():
+        await conn.execute(f"ALTER TABLE {_PAIR_EVENT} DISABLE TRIGGER {_PAIR_EVENT_NO_DELETE}")
+        await conn.execute(
+            f"DELETE FROM {_PAIR_EVENT} WHERE definition_pair_idx = ANY($1::bigint[])",
+            idxs,
+        )
+        await conn.execute(
+            "DELETE FROM qiita.definition_pair WHERE definition_pair_idx = ANY($1::bigint[])", idxs
+        )
+        await conn.execute(f"ALTER TABLE {_PAIR_EVENT} ENABLE TRIGGER {_PAIR_EVENT_NO_DELETE}")
+
+
 async def cleanup_exported_entity_probe(
     pool: asyncpg.Pool,
     *,
