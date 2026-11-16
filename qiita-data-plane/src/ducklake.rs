@@ -740,11 +740,13 @@ pub fn ensure_alignment_tables(conn: &Connection) -> Result<(), Box<dyn std::err
 /// plane recomputes and ships it WHOLESALE via the `sync_reference_exclusion`
 /// DoAction; here it is just a one-column table the views anti-join against.
 ///
-/// `alignment_visible` / `reference_taxonomy_visible` are the ONLY
-/// exclusion-aware read surfaces: each is its base table minus every row whose
-/// `feature_idx` is blocked (an `ANTI JOIN` — cheap in DuckDB; the build side is
-/// a tiny curated list). A blocked genome/feature therefore never reaches an OGU
-/// feature table or a taxonomy lineage, even though it stays in the base table:
+/// `alignment_visible` / `reference_taxonomy_visible` / `amplicon_membership_visible`
+/// are the ONLY exclusion-aware read surfaces: each is its base table minus every
+/// row whose `feature_idx` is blocked (an `ANTI JOIN` — cheap in DuckDB; the build
+/// side is a tiny curated list). An ASV shares the one `feature_idx` space, so a
+/// direct ASV block (or a reference-intersected ASV of a blocked genome) is anti-joined
+/// by the same list. A blocked genome/feature therefore never reaches an OGU or
+/// amplicon feature table or a taxonomy lineage, even though it stays in the base table:
 /// exclusion is read-time only, so no aligner index is rebuilt. Phylogeny is
 /// deliberately NOT viewed here — `reference_phylogeny` is not row-independent
 /// (a node carries parent/child structure; `feature_idx` is on tips only), so a
@@ -763,8 +765,8 @@ pub fn ensure_alignment_tables(conn: &Connection) -> Result<(), Box<dyn std::err
 /// anti-join predicate IS the enforcement surface, so a definition change must
 /// reconcile on every DP startup rather than silently keep a stale view on an
 /// already-attached catalog. Must run AFTER `ensure_reference_tables` +
-/// `ensure_alignment_tables` (the views reference `reference_taxonomy` +
-/// `alignment`).
+/// `ensure_alignment_tables` + `ensure_amplicon_tables` (the views reference
+/// `reference_taxonomy`, `alignment` and `amplicon_membership`).
 pub fn ensure_exclusion_tables(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
     conn.execute_batch(
         "-- Resolved excluded feature_idx set, mirrored wholesale from the CP
@@ -782,6 +784,11 @@ pub fn ensure_exclusion_tables(conn: &Connection) -> Result<(), Box<dyn std::err
         CREATE OR REPLACE VIEW qiita_lake.reference_taxonomy_visible AS
         SELECT t.*
         FROM qiita_lake.reference_taxonomy t
+        ANTI JOIN qiita_lake.reference_exclusion x USING (feature_idx);
+
+        CREATE OR REPLACE VIEW qiita_lake.amplicon_membership_visible AS
+        SELECT m.*
+        FROM qiita_lake.amplicon_membership m
         ANTI JOIN qiita_lake.reference_exclusion x USING (feature_idx);",
     )?;
     Ok(())
@@ -1838,6 +1845,7 @@ mod tests {
         let conn = setup_conn();
         ensure_reference_tables(&conn).unwrap();
         ensure_alignment_tables(&conn).unwrap();
+        ensure_amplicon_tables(&conn).unwrap();
         ensure_exclusion_tables(&conn).expect("first ensure_exclusion_tables");
         ensure_exclusion_tables(&conn).expect("second ensure_exclusion_tables (idempotent)");
 
@@ -1845,6 +1853,7 @@ mod tests {
             "reference_exclusion",
             "alignment_visible",
             "reference_taxonomy_visible",
+            "amplicon_membership_visible",
         ] {
             let mut stmt = conn
                 .prepare(&format!(
@@ -1868,10 +1877,12 @@ mod tests {
         let conn = setup_conn();
         ensure_reference_tables(&conn).unwrap();
         ensure_alignment_tables(&conn).unwrap();
+        ensure_amplicon_tables(&conn).unwrap();
         ensure_exclusion_tables(&conn).unwrap();
 
         let alignment_idx = next_test_id();
         let reference_idx = next_test_id();
+        let processing_idx = next_test_id();
         let feat_kept = next_test_id();
         let feat_blocked = next_test_id();
 
@@ -1893,6 +1904,12 @@ mod tests {
             column: "feature_idx",
             id: feat_blocked,
         };
+        let _c_amp = Cleanup {
+            conn: &conn,
+            table: "amplicon_membership",
+            column: "processing_idx",
+            id: processing_idx,
+        };
 
         conn.execute_batch(&format!(
             "INSERT INTO qiita_lake.alignment
@@ -1901,6 +1918,10 @@ mod tests {
                       ({alignment_idx}, 1, 2, {feat_blocked});
              INSERT INTO qiita_lake.reference_taxonomy (reference_idx, feature_idx)
                VALUES ({reference_idx}, {feat_kept}), ({reference_idx}, {feat_blocked});
+             INSERT INTO qiita_lake.amplicon_membership
+                 (prep_sample_idx, processing_idx, feature_idx, count)
+               VALUES (1, {processing_idx}, {feat_kept}, 5),
+                      (1, {processing_idx}, {feat_blocked}, 7);
              INSERT INTO qiita_lake.reference_exclusion (feature_idx)
                VALUES ({feat_blocked});"
         ))
@@ -1951,6 +1972,24 @@ mod tests {
             vec![feat_kept],
             "reference_taxonomy_visible excludes the blocked feature"
         );
+
+        let vis_amp: Vec<i64> = {
+            let mut stmt = conn
+                .prepare(&format!(
+                    "SELECT feature_idx FROM qiita_lake.amplicon_membership_visible \
+                     WHERE processing_idx = {processing_idx} ORDER BY feature_idx"
+                ))
+                .unwrap();
+            stmt.query_map([], |r| r.get(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        assert_eq!(
+            vis_amp,
+            vec![feat_kept],
+            "amplicon_membership_visible excludes the blocked ASV"
+        );
     }
 
     /// The `_visible` views are catalog-stored, not session-local: a fresh ATTACH
@@ -1970,6 +2009,7 @@ mod tests {
             let conn1 = setup_conn();
             ensure_reference_tables(&conn1).unwrap();
             ensure_alignment_tables(&conn1).unwrap();
+            ensure_amplicon_tables(&conn1).unwrap();
             ensure_exclusion_tables(&conn1).unwrap();
             conn1
                 .execute_batch(&format!(

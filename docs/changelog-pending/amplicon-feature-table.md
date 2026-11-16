@@ -8,3 +8,9 @@
   features are Arrow IPC streams; access is all-or-nothing over the cohort, checked
   before the data plane is read. `qiita feature-table runs` writes the three as a
   bundle with the map needed to read it.
+- **Exclusion-aware amplicon read surfaces on the data plane.** The counts are served
+  through a new `amplicon_membership_visible` view (`amplicon_membership` anti-joined
+  with the resolved blocklist on `feature_idx`), and the ASV sequences resolve the
+  cohort through that same view — so a blocked ASV reaches neither a feature table nor
+  a published sequence, mirroring `alignment_visible` / `reference_taxonomy_visible`.
+  The raw `amplicon_membership` stays off the Flight allowlist.

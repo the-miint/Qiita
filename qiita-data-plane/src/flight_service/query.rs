@@ -89,6 +89,16 @@ pub(super) const ALLOWED_TABLES: &[&str] = &[
     // the MINTED namespace, which is the join into the shared feature space this
     // table cannot make.
     "bin_quality",
+    // The amplicon feature-table surfaces, scoped by a cohort of runs over
+    // prep_samples (processing_idx + prep_sample_idx lists). `amplicon_membership`
+    // is served ONLY as the exclusion-aware VIEW — like `alignment_visible`, the
+    // raw table is deliberately absent so a blocked ASV can't reach a feature
+    // table. The counts view carries both cohort columns, so the generic filter
+    // path scopes it. `amplicon_sequence` has neither column (a sequence is stored
+    // once, content-deduped by feature_idx), so `build_amplicon_sequence_query`
+    // resolves the cohort through the same view — which also applies the exclusion.
+    "amplicon_membership_visible",
+    "amplicon_sequence",
 ];
 
 /// Allowed column names for filter clauses. All identifier columns that can
@@ -501,6 +511,13 @@ pub(super) fn ticket_query(payload: &auth::TicketPayload) -> Result<(String, Str
     )
 }
 
+/// The amplicon ASV-sequence surface. Like `assembled_sequence` it carries no
+/// cohort column (one row per `feature_idx`), so its cohort scope is read off
+/// `amplicon_membership_visible` by `build_amplicon_sequence_query`.
+fn is_amplicon_sequence_surface(table: &str) -> bool {
+    table == "amplicon_sequence"
+}
+
 /// Build a SQL query for the given table and filter.
 ///
 /// SQL injection defense model:
@@ -554,6 +571,13 @@ pub(super) fn build_query(
     // Scoped by a run it carries itself, and refused outright without one.
     if is_bin_quality_surface(table) {
         return build_bin_quality_query(filter);
+    }
+
+    // The ASV sequences carry no cohort column, so the cohort (its runs over its
+    // prep_samples) is resolved through `amplicon_membership_visible` — also not a
+    // generic WHERE clause, and the view is what applies the exclusion anti-join.
+    if is_amplicon_sequence_surface(table) {
+        return build_amplicon_sequence_query(filter);
     }
 
     if filter.is_empty() {
@@ -754,6 +778,50 @@ fn build_assembly_run_query(
             "SELECT * FROM {full_table} WHERE feature_idx IN (\
              SELECT feature_idx FROM qiita_lake.assembly_membership \
              WHERE prep_sample_idx = {prep_sample_idx} AND processing_idx = {processing_idx})"
+        ),
+        full_table,
+    ))
+}
+
+/// Build the amplicon ASV-sequence DoGet: the cohort's sequences, selected by a
+/// semi join against `amplicon_membership_visible` rather than a roster the ticket
+/// carries.
+///
+/// `amplicon_sequence` has no cohort column — a sequence is stored once,
+/// content-deduped by `feature_idx` — so the cohort (its `processing_idx` runs over
+/// its `prep_sample_idx`s) is resolved through the membership VIEW, which also
+/// anti-joins the blocklist, so a blocked ASV's bytes are never streamed. The ticket
+/// names the cohort by those two list columns and nothing else; `feature_idx` is
+/// refused, so no ticket names sequences directly.
+///
+/// `IN (subquery)`, not a literal roster, for the SEMI-join dynamic-filter plan
+/// `build_assembly_run_query` documents — the cohort here pools many runs, so the
+/// resolved key set is larger still.
+fn build_amplicon_sequence_query(filter: &auth::TicketFilter) -> Result<(String, String), Status> {
+    let processing = i64_list_filter(filter, "processing_idx")?;
+    let preps = i64_list_filter(filter, "prep_sample_idx")?;
+    if filter.len() != 2 {
+        return Err(Status::invalid_argument(format!(
+            "amplicon_sequence accepts only processing_idx and prep_sample_idx, got {} columns",
+            filter.len()
+        )));
+    }
+    let processing_csv = processing
+        .iter()
+        .map(|v| v.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let preps_csv = preps
+        .iter()
+        .map(|v| v.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let full_table = "qiita_lake.amplicon_sequence".to_string();
+    Ok((
+        format!(
+            "SELECT * FROM {full_table} WHERE feature_idx IN (\
+             SELECT feature_idx FROM qiita_lake.amplicon_membership_visible \
+             WHERE processing_idx IN ({processing_csv}) AND prep_sample_idx IN ({preps_csv}))"
         ),
         full_table,
     ))
