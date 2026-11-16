@@ -24,7 +24,13 @@ import pyarrow as pa
 import pytest
 from qiita_common import analytic as ft
 from qiita_common.hashing import canonical_params_hash
-from qiita_common.models import AS_OF_SCOPE, DefinitionGroupResolveResponse, DefinitionKind
+from qiita_common.models import (
+    AS_OF_SCOPE,
+    INCLUDE_DEPRECATED_FLAG,
+    DefinitionGroupResolveResponse,
+    DefinitionKind,
+    deprecated_read_refusal,
+)
 
 from qiita_control_plane.cli.user import feature_table as ftc
 from qiita_control_plane.cli.user._helpers import _UNSET
@@ -2603,7 +2609,9 @@ def test_a_deprecated_alignment_is_refused_without_the_flag(monkeypatch, tmp_pat
 
     assert ftc._handle_feature_table_build(_namespace(tmp_path), parser=None) == 1
     err = capsys.readouterr().err
-    assert "aligner build was wrong" in err and "--include-deprecated" in err
+    # The same message as the routes' 409 (`deprecated_read`), so both name one flag.
+    assert deprecated_read_refusal("alignment", 3, "aligner build was wrong") in err
+    assert INCLUDE_DEPRECATED_FLAG in err
     assert rec["resolve_calls"] == []
 
 

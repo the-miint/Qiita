@@ -38,6 +38,7 @@ from qiita_common.api_paths import (
 from qiita_common.models import (
     HOST_FILTER_INDEX_TYPE_MINIMAP2,
     HOST_FILTER_INDEX_TYPE_RYPE,
+    INCLUDE_DEPRECATED_FLAG,
     LEGACY_IDX_RESERVED_CEILING,
     REDRIVABLE_WORK_TICKET_STATES,
     STORABLE_ACCESS_TIERS,
@@ -1103,7 +1104,7 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_mask_syndna.add_argument(
-        "--include-deprecated",
+        INCLUDE_DEPRECATED_FLAG,
         action="store_true",
         help=(
             "Read a deprecated --mask-idx's own counts, without its group (refused"
@@ -1353,7 +1354,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     _common.add_as_of_event_argument(p_ft_build)
     p_ft_build.add_argument(
-        "--include-deprecated",
+        INCLUDE_DEPRECATED_FLAG,
         action="store_true",
         help=(
             "Read a deprecated --alignment-idx or --denovo-alignment-idx alone, its own"

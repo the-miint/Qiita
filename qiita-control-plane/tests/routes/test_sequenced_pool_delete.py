@@ -300,6 +300,7 @@ async def test_delete_pool_retires_its_published_identifiers(
             (None, mask_idx),
         ]
     finally:
+        # The retired row's prep_sample_idx is NULL, so the prep_sample-keyed sweep cannot reach it.
         await postgres_pool.execute(
             "DELETE FROM qiita.exported_identifier WHERE idx = ANY($1::bigint[])",
             [h["idx"] for h in handles],

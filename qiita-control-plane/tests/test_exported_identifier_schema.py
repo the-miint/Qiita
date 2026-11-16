@@ -252,6 +252,7 @@ async def test_deleting_the_prep_sample_retires_the_identifier_and_keeps_what_it
             entity,
         )
     finally:
+        # The retired row's prep_sample_idx is NULL, so the prep_sample-keyed sweep cannot reach it.
         await postgres_pool.execute(
             "DELETE FROM qiita.exported_identifier WHERE idx = $1", minted["idx"]
         )

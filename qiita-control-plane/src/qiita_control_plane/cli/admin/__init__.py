@@ -37,6 +37,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX
+from qiita_common.models import INCLUDE_DEPRECATED_FLAG
 
 from ...backfill.assembly_genome import BackfillPlan as GenomeBackfillPlan
 from ...backfill.assembly_genome import apply_backfill as apply_assembly_genome_backfill
@@ -655,7 +656,7 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_export.add_argument(
-        "--include-deprecated",
+        INCLUDE_DEPRECATED_FLAG,
         action="store_true",
         dest="include_deprecated",
         help=(

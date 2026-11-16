@@ -415,16 +415,6 @@ def _candidate_names(stem: str, fmt: str) -> list[str]:
     return [name for paired in (False, True) for name in _fastq_names(stem, paired=paired)]
 
 
-def _as_of_field(as_of_event: str | None) -> dict[str, str]:
-    """The `as_of_event` parameter, sent only when given."""
-    return {} if as_of_event is None else {"as_of_event": as_of_event}
-
-
-def _deprecated_field(include_deprecated: bool) -> dict[str, bool]:
-    """The `include_deprecated` body field, sent only when set."""
-    return {"include_deprecated": True} if include_deprecated else {}
-
-
 def _mint_mask_handles(
     base_url: str, token: str, mask_idxs: list[int], *, include_deprecated: bool = False
 ) -> dict[int, str]:
@@ -437,7 +427,10 @@ def _mint_mask_handles(
             base_url,
             token,
             path,
-            json={"mask_idx": mask_idx, **_deprecated_field(include_deprecated)},
+            json={
+                "mask_idx": mask_idx,
+                **_common.optional_body_fields(include_deprecated=include_deprecated),
+            },
         )["export_processing_id"]
         for mask_idx in sorted(mask_idxs)
     }
@@ -465,7 +458,7 @@ def _mint_sample_handles(
                 json={
                     "mask_idx": mask_idx,
                     "prep_sample_idx": chunk,
-                    **_deprecated_field(include_deprecated),
+                    **_common.optional_body_fields(include_deprecated=include_deprecated),
                 },
             )
             handles.update({i["prep_sample_idx"]: i["export_id"] for i in body["identifiers"]})
@@ -592,8 +585,9 @@ def _handle_masked_read_export(args: argparse.Namespace, parser: argparse.Argume
             manifest_path,
             params={
                 "mask_idx": args.mask_idx,
-                **({"include_deprecated": "true"} if args.include_deprecated else {}),
-                **_as_of_field(args.as_of_event),
+                **_common.optional_query_params(
+                    include_deprecated=args.include_deprecated, as_of_event=args.as_of_event
+                ),
             },
         )
     except httpx.HTTPStatusError as exc:
@@ -821,8 +815,9 @@ def _handle_masked_read_export(args: argparse.Namespace, parser: argparse.Argume
                     json={
                         "prep_sample_idx": prep,
                         "mask_idx": mask_idx,
-                        **_deprecated_field(deprecated),
-                        **_as_of_field(args.as_of_event),
+                        **_common.optional_body_fields(
+                            include_deprecated=deprecated, as_of_event=args.as_of_event
+                        ),
                     },
                 )
                 ticket_bytes = base64.b64decode(ticket_resp["ticket"])

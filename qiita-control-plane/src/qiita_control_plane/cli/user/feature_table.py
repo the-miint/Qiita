@@ -63,6 +63,7 @@ from qiita_common.models import (
     SampleResolution,
     SampleResolutionReason,
     SampleResolutionState,
+    deprecated_read_refusal,
 )
 from qiita_common.models._base import MAX_COHORT_PREP_SAMPLE_IDX
 from qiita_common.parquet import PARQUET_MEDIA_TYPE
@@ -444,8 +445,9 @@ def _create_alignment_doget_ticket(
         json={
             "prep_sample_idx": prep_sample_idx,
             "columns": list(columns),
-            "include_deprecated": include_deprecated,
-            **({} if as_of_event is None else {"as_of_event": as_of_event}),
+            **_common.optional_body_fields(
+                include_deprecated=include_deprecated, as_of_event=as_of_event
+            ),
         },
     )
     return base64.b64decode(resp["ticket"])
@@ -1391,10 +1393,7 @@ def _reads_exactly(summary: dict[str, Any], *, flag: bool, role: str) -> bool:
         return False
     idx, reason = summary["alignment_idx"], summary.get("deprecation_reason")
     if not flag:
-        raise ValueError(
-            f"{role} {idx} is deprecated: {reason}. To read its own results, pass"
-            f" --include-deprecated"
-        )
+        raise ValueError(deprecated_read_refusal(role, idx, reason))
     _common.print_deprecated_read("alignment", idx, reason)
     return True
 

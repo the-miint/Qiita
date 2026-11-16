@@ -1,19 +1,25 @@
 -- migrate:up
 
 -- Deleting a prep_sample (a sequenced-pool delete, or any other path) retires the
--- `exported_identifier` rows naming it instead of being refused by their FK. A
--- published `QM<n>` keeps resolving, as retired, with what it named.
+-- `exported_identifier` rows naming it instead of being refused by their FK. The
+-- retired row stays, with its `export_id`, its kind, and the accession and `QB<n>`
+-- handle of the deleted prep_sample's biosample. No route resolves a `QM<n>` today;
+-- these columns are the record of what a published handle named.
 --
 --   * `prep_sample_idx` becomes nullable and its FK ON DELETE SET NULL, as
 --     `alignment_idx` and `mask_idx` already are. A live row still names its
 --     prep_sample (`exported_identifier_live_names_prep_sample`).
 --   * `named_biosample_accession` / `named_biosample_export_entity_id` keep a
---     public description of the sample once `prep_sample_idx` is gone. A BEFORE
+--     public description of the deleted prep_sample's biosample. A BEFORE
 --     DELETE trigger on prep_sample writes them, since the FK action runs after the
 --     prep_sample row (and the join to its biosample) is gone. The kind stays on
 --     the row: `alignment_idx` or `mask_idx` is untouched by a prep_sample delete.
 --   * `retire_detached_exported_identifier` also retires a row whose
 --     `prep_sample_idx` the FK action nulls.
+--
+-- The trigger writes the two columns while `prep_sample_idx` is still set (the FK
+-- action nulls it afterwards, in the same statement), so a CHECK tying them to a
+-- NULL `prep_sample_idx` would refuse the trigger's own UPDATE.
 
 ALTER TABLE qiita.exported_identifier
     ALTER COLUMN prep_sample_idx DROP NOT NULL,

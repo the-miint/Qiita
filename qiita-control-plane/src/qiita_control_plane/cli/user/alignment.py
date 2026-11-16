@@ -59,7 +59,7 @@ def _fetch_alignment_cohort(
         sequenced_pool_idx=sequenced_pool_idx,
         alignment_idx=alignment_idx,
     )
-    params = {"include_deprecated": "true"} if include_deprecated else None
+    params = _common.optional_query_params(include_deprecated=include_deprecated) or None
     return _common.call(
         "GET", base_url, token, f"{PATH_SEQUENCING_RUN_PREFIX}{sub_path}", params=params
     )

@@ -32,6 +32,7 @@ from qiita_common.models import (
     SampleStudyFieldResponse,
     TerminologyTermRef,
     Tier,
+    deprecated_read_refusal,
     field_wire_name,
     unique_in_study_rejection_reason,
 )
@@ -191,11 +192,6 @@ def mask_exact_read(mask: asyncpg.Record, *, include_deprecated: bool) -> bool:
     )
 
 
-# The CLI spelling of the flag every explicit read of a deprecated definition takes;
-# the API field and query parameter are `include_deprecated`.
-INCLUDE_DEPRECATED_FLAG = "--include-deprecated"
-
-
 def deprecated_read(
     *,
     kind: DefinitionKind,
@@ -217,10 +213,7 @@ def deprecated_read(
     raise HTTPException(
         status_code=409,
         detail={
-            "detail": (
-                f"{kind.value} {idx} is deprecated: {deprecation_reason}. To read its own"
-                f" results, pass {INCLUDE_DEPRECATED_FLAG} (API: include_deprecated=true)"
-            ),
+            "detail": deprecated_read_refusal(kind.value, idx, deprecation_reason),
             "reason": DefinitionGroupRefusal.DEPRECATED.value,
             "deprecation_reason": deprecation_reason,
         },
@@ -1980,7 +1973,7 @@ def build_idxs_list_response(
 def sees_resolution_tickets(caller: HumanUser) -> bool:
     """Whether a route returns `SampleResolution.work_ticket_idx` to this caller: a
     system_admin only. The ticket a prep_sample waits on may be another principal's
-    block ticket, covering other studies' samples, so it is not the caller's to see
+    block ticket, covering other studies' prep_samples, so it is not the caller's to see
     even when every prep_sample it names is."""
     return caller.has_role(SystemRole.SYSTEM_ADMIN)
 

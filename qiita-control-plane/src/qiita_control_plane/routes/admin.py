@@ -806,37 +806,38 @@ async def create_masked_read_export_ticket(
             detail="masked-read export ticket requires a non-empty prep_sample_idx and mask_idx",
         )
 
-    row = await pool.fetchrow(
-        "SELECT md.mask_idx, md.status, md.deprecation_reason, msamp.state AS mask_state"
-        "  FROM qiita.mask_definition md"
-        "  LEFT JOIN qiita.mask_sample msamp"
-        "    ON msamp.mask_idx = md.mask_idx AND msamp.prep_sample_idx = $2"
-        " WHERE md.mask_idx = $1",
-        body.mask_idx,
-        body.prep_sample_idx,
-    )
-    exact = row is not None and mask_exact_read(row, include_deprecated=body.include_deprecated)
-    mask_state = None if row is None else row["mask_state"]
-    if mask_state != MASK_SAMPLE_COMPLETED:
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "reason": (
-                    "the sample is not masked-complete under this mask_idx "
-                    f"(mask_sample.state={mask_state!r}). Either no read-mask has "
-                    "completed for this (prep_sample, mask_idx), a covering block is "
-                    "still in flight, or the run was withdrawn as untrustworthy "
-                    "('invalidated'). The read_masked pass-set would be absent, "
-                    "partial, or unfit. Refusing to export; a withdrawn run is not "
-                    "retryable — re-mask under a corrected config."
-                ),
-                "prep_sample_idx": body.prep_sample_idx,
-                "mask_idx": body.mask_idx,
-                "mask_state": mask_state,
-            },
-        )
-
+    # One snapshot for the mask's status, its gate and the resolution, so the mode
+    # picked (exact or group) matches the status the resolution reads.
     async with pool.acquire() as conn, conn.transaction(isolation="repeatable_read", readonly=True):
+        row = await conn.fetchrow(
+            "SELECT md.mask_idx, md.status, md.deprecation_reason, msamp.state AS mask_state"
+            "  FROM qiita.mask_definition md"
+            "  LEFT JOIN qiita.mask_sample msamp"
+            "    ON msamp.mask_idx = md.mask_idx AND msamp.prep_sample_idx = $2"
+            " WHERE md.mask_idx = $1",
+            body.mask_idx,
+            body.prep_sample_idx,
+        )
+        exact = row is not None and mask_exact_read(row, include_deprecated=body.include_deprecated)
+        mask_state = None if row is None else row["mask_state"]
+        if mask_state != MASK_SAMPLE_COMPLETED:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "reason": (
+                        "the sample is not masked-complete under this mask_idx "
+                        f"(mask_sample.state={mask_state!r}). Either no read-mask has "
+                        "completed for this (prep_sample, mask_idx), a covering block is "
+                        "still in flight, or the run was withdrawn as untrustworthy "
+                        "('invalidated'). The read_masked pass-set would be absent, "
+                        "partial, or unfit. Refusing to export; a withdrawn run is not "
+                        "retryable — re-mask under a corrected config."
+                    ),
+                    "prep_sample_idx": body.prep_sample_idx,
+                    "mask_idx": body.mask_idx,
+                    "mask_state": mask_state,
+                },
+            )
         resolution = await (resolve_exact if exact else resolve_group)(
             conn,
             kind=DefinitionKind.MASK,

@@ -34,9 +34,11 @@ from qiita_common.api_paths import (
 )
 from qiita_common.auth_constants import Scope
 from qiita_common.models import (
+    INCLUDE_DEPRECATED_FLAG,
     AlignmentDefinitionStatus,
     DefinitionGroupRefusal,
     MaskDefinitionStatus,
+    deprecated_read_refusal,
 )
 
 from qiita_control_plane.repositories.alignment_definition import ALIGNMENT_SAMPLE_COMPLETED
@@ -536,7 +538,11 @@ def _refused_naming_the_flag(resp) -> None:
     detail = resp.json()["detail"]
     assert detail["reason"] == "deprecated"
     assert detail["deprecation_reason"] == "aligner build was wrong"
-    assert "--include-deprecated" in detail["detail"]
+    assert INCLUDE_DEPRECATED_FLAG in detail["detail"]
+    # The same message the feature-table client refuses with.
+    assert detail["detail"] == deprecated_read_refusal(
+        "alignment", detail["detail"].split()[1], "aligner build was wrong"
+    )
 
 
 async def test_a_deprecated_alignment_is_refused_without_the_flag_and_read_with_it(
@@ -618,9 +624,8 @@ async def test_the_alignment_mints_take_the_flag(ctx, pool_alignment_seed, route
         assert flagged.status_code == 201, flagged.text
         assert flagged.json() == plain.json()
     finally:
-        await ctx["pool"].execute(
-            "DELETE FROM qiita.exported_identifier WHERE alignment_idx = $1", seed["align_1"]
-        )
+        # The exported_identifier rows go with the seed's entity sweep (prep_sample-keyed);
+        # exported_processing names no prep_sample, so it is deleted here.
         await ctx["pool"].execute(
             "DELETE FROM qiita.exported_processing WHERE alignment_idx = $1", seed["align_1"]
         )

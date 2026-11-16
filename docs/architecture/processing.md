@@ -336,8 +336,8 @@ the two. A system_admin records whether two definitions of one kind are `similar
 (`qiita.definition_pair`, with its history in `qiita.definition_pair_event`, which
 refuses UPDATE and DELETE and keeps its pair from being deleted;
 migration `20261113000000_definition_pair.sql`). A hand DELETE of a definition
-detaches its pairs, and is refused while a `similar` pair names it, since detaching
-that pair would split a group that other `similar` pairs may rely on. The procedure is
+detaches its pairs, and is refused while a `similar` pair names it (the trigger
+`refuse_definition_delete_under_similar_pair` in that migration says why). The procedure is
 [`runbooks/deciding-similar-definitions.md`](../runbooks/deciding-similar-definitions.md).
 
 - **Groups are computed on read.** Nothing stores a group: `definition_similarity`
@@ -355,8 +355,7 @@ that pair would split a group that other `similar` pairs may rely on. The proced
   does not resolve to the definition they name. `resolve_group` runs only in a
   REPEATABLE READ transaction, and says why. Its module docstring holds the rules,
   among them which failed tickets it ignores as stale.
-- **A deprecated definition read on purpose.** Deprecation stops new processing; it
-  does not forbid reading existing results. A route that names a deprecated mask
+- **A deprecated definition read on purpose.** A route that names a deprecated mask
   refuses (409) unless the caller sets `include_deprecated`
   (`routes/_helpers.deprecated_read`); with it, the resolver's exact mode
   (`resolve_exact`) reads that definition's own runs, without its group, and the

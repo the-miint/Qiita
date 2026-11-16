@@ -331,6 +331,12 @@ async def test_as_of_a_decision_set_rebuilds_the_group_after_a_revoke(
     assert unknown.status_code == 422, unknown.text
     assert "names no decision set" in unknown.text
 
+    malformed = await ctx["user"].post(
+        URL_DEFINITION_GROUP_RESOLVE, json={**body, "as_of_event": "sha256:" + "A" * 64}
+    )
+    assert malformed.status_code == 422, malformed.text
+    assert "names no decision set" not in malformed.text
+
 
 # ---------------------------------------------------------------------------
 # Tickets

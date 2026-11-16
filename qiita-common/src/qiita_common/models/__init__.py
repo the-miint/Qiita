@@ -150,6 +150,7 @@ from qiita_common.models.biosample import (
 )
 from qiita_common.models.definition_group import (
     AS_OF_SCOPE,
+    INCLUDE_DEPRECATED_FLAG,
     DecisionProvenance,
     DecisionSetToken,
     DefinitionGroupRefusal,
@@ -158,6 +159,7 @@ from qiita_common.models.definition_group import (
     SampleResolution,
     SampleResolutionReason,
     SampleResolutionState,
+    deprecated_read_refusal,
 )
 from qiita_common.models.definition_pair import (
     DefinitionKind,
@@ -618,6 +620,8 @@ __all__ = [
     # Definition groups.
     "DefinitionGroupRefusal",
     "AS_OF_SCOPE",
+    "INCLUDE_DEPRECATED_FLAG",
+    "deprecated_read_refusal",
     "DecisionProvenance",
     "DecisionSetToken",
     "DefinitionGroupResolveRequest",

@@ -12,8 +12,8 @@
 --     the ids, and a trigger stamps `detached_at`. A detached pair links nothing and
 --     can no longer be decided or revoked. A live `similar` pair is the exception: a
 --     BEFORE DELETE trigger on each definition table refuses the delete while one
---     names the row, since detaching it would split a group that other `similar`
---     pairs may rely on (the check a revoke runs). Revoke the pair first.
+--     names the row (refuse_definition_delete_under_similar_pair says why). Revoke
+--     the pair first.
 --
 --   * `qiita.definition_pair_event` is the pair's history: opened, each decision,
 --     each revoke, with who and why. A revoke returns the pair to `pending` and clears

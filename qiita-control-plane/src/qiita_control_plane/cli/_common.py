@@ -67,6 +67,7 @@ from qiita_common.auth_constants import (
     STALE_TOKEN_SCOPE_HEADER,
 )
 from qiita_common.models import (
+    INCLUDE_DEPRECATED_FLAG,
     PrincipalLookupRequest,
     PrincipalLookupResponse,
 )
@@ -896,9 +897,34 @@ def print_deprecated_read(kind: str, idx: int, reason: str | None) -> None:
     --include-deprecated."""
     print(
         f"warning: {kind} {idx} is deprecated ({reason}); its own results were read"
-        " under --include-deprecated",
+        f" under {INCLUDE_DEPRECATED_FLAG}",
         file=sys.stderr,
     )
+
+
+def optional_body_fields(
+    *, include_deprecated: bool = False, as_of_event: str | None = None
+) -> dict[str, bool | str]:
+    """`include_deprecated` and `as_of_event` as JSON body fields, each sent only when
+    set, so a request without either flag is unchanged."""
+    fields: dict[str, bool | str] = {}
+    if include_deprecated:
+        fields["include_deprecated"] = True
+    if as_of_event is not None:
+        fields["as_of_event"] = as_of_event
+    return fields
+
+
+def optional_query_params(
+    *, include_deprecated: bool = False, as_of_event: str | None = None
+) -> dict[str, str]:
+    """`optional_body_fields` in query-parameter form."""
+    return {
+        key: "true" if value is True else str(value)
+        for key, value in optional_body_fields(
+            include_deprecated=include_deprecated, as_of_event=as_of_event
+        ).items()
+    }
 
 
 def add_as_of_event_argument(parser: argparse.ArgumentParser) -> None:

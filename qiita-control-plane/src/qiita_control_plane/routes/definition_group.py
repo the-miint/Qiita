@@ -8,7 +8,7 @@ than narrowed, as on every cohort route (`authorize_prep_sample_cohort`). The
 resolution reads one read-only snapshot, so the groups, gates and tickets it reads
 are of one moment.
 
-Each sample's `work_ticket_idx` is returned to a system_admin only
+Each prep_sample's `work_ticket_idx` is returned to a system_admin only
 (`sees_resolution_tickets` says why).
 """
 
@@ -45,7 +45,7 @@ async def resolve_definition_group_route(
     reason. 404 when the definition does not exist and 422 when its group's runs are
     not read per prep_sample (`require_observable`), both before anything about the
     cohort is said; 403 when the caller may not read every prep_sample. Each
-    sample's `work_ticket_idx` is omitted unless the caller is a system_admin.
+    prep_sample's `work_ticket_idx` is omitted unless the caller is a system_admin.
 
     `decisions` records the pair decisions the group was computed under; passing its
     `decision_set` back as `as_of_event` computes the group from those decisions again,

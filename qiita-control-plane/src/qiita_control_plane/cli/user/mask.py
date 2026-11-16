@@ -143,10 +143,11 @@ def _get_syndna_read_count(
 ) -> SyndnaReadCountResponse:
     """GET /api/v1/mask-definition/{mask_idx}/syndna-read-count."""
     params: dict = _common.filter_params(study_idx=study_idx, sequenced_pool_idx=sequenced_pool_idx)
-    if include_deprecated:
-        params["include_deprecated"] = "true"
-    if as_of_event is not None:
-        params["as_of_event"] = as_of_event
+    params.update(
+        _common.optional_query_params(
+            include_deprecated=include_deprecated, as_of_event=as_of_event
+        )
+    )
     if prep_sample_idx:
         params["prep_sample_idx"] = [str(i) for i in prep_sample_idx]
     body = _common.call(
@@ -242,9 +243,11 @@ def _fetch_species(
     return {int(feature_idx): species for feature_idx, species in rows}
 
 
-# The sidecar written next to every table. miint's BIOM writer carries no sample
-# metadata (duckdb-miint#303), so what the table cannot hold about its samples goes
-# here, for both formats.
+# The sidecar written next to every table, in both formats: each sample_id's mask
+# handle, the left-out prep_samples, the deprecated mark and the decisions block. It
+# is the output's record of these, not a stand-in: the BIOM table carries none of
+# them, since miint's BIOM writer has no sample metadata (duckdb-miint#303), and the
+# left-out record and the decisions are not per-sample values in either format.
 SYNDNA_SIDECAR_SUFFIX = ".metadata.json"
 SYNDNA_SIDECAR_SCHEMA_VERSION = 1
 
