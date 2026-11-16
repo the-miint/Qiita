@@ -21,7 +21,7 @@ _None yet._
 
 ```bash
 # [admin] gpl-boundary must report >= 0.5.0, or compute-readiness's miint-gpl-boundary probe fails the deploy.
-# If it is older, replace the binary at that path by hand (the deploy does not upgrade it: #859).   (#gene-call-schema)
+# If it is older, replace the binary at that path by hand (the deploy does not upgrade it: #859).   (#888)
 sudo -u qiita-orch "$(sudo grep -oP '^MIINT_GPL_BOUNDARY_PATH=\K.*' /etc/qiita/compute-orchestrator.env)" --version | grep gpl_boundary
 ```
 
@@ -43,9 +43,9 @@ _None yet._
 
 ### Notes (no host action)
 
-- `.env.compute-orchestrator.example`'s `MIINT_GPL_BOUNDARY_PATH` comment now names the tools behind the boundary (bowtie2, FastTree, Prodigal) and the 0.5.0 minimum; no live env change. (#gene-call-schema)
-- New DuckLake tables `gene_call` / `gene_call_contig`, created empty by the data plane at start; nothing writes them yet. (#gene-call-schema)
-- The staged miint must have `prodigal_proteins` (duckdb-miint `2b215901` or later); the miint stage step restages when the mirror's build changes, and compute-readiness's `miint-gpl-boundary` probe fails on a build without it. (#gene-call-schema)
+- `.env.compute-orchestrator.example`'s `MIINT_GPL_BOUNDARY_PATH` comment now names the tools behind the boundary (bowtie2, FastTree, Prodigal) and the 0.5.0 minimum; no live env change. (#888)
+- New DuckLake tables `gene_call` / `gene_call_contig`, created empty by the data plane at start; nothing writes them yet. (#888)
+- The staged miint must have `prodigal_proteins` (duckdb-miint `2b215901` or later); the miint stage step restages when the mirror's build changes, and compute-readiness's `miint-gpl-boundary` probe fails on a build without it. (#888)
 
 ## Deployed history
 
