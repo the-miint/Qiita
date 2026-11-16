@@ -428,8 +428,8 @@ def test_md5_mismatch_fetch_error_is_retriable(fake_mint, monkeypatch, tmp_path)
 
 @pytest.mark.parametrize("prefix", ["duckdb_seq_read", "aspera_seq_read"])
 def test_truncated_gzip_fetch_error_is_retriable(prefix, fake_mint, monkeypatch, tmp_path):
-    """A gzip that ends before its end marker is a cut transfer, or a file ENA does
-    not serve at all; miint reports both alike, so it retries, bounded."""
+    """A gzip that ends before its end marker classifies retriable, with a reason
+    naming the run and the missing-file case."""
 
     def _fake(run_accession, download_method, intermediate_path, duckdb_tmp, memory_gb, threads):
         raise duckdb.IOException(

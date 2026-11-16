@@ -95,7 +95,8 @@ _PERMANENT_ERROR_MARKERS = ("malformed", "invalid fastq", "no sequence data")
 _ENA_INCOMPLETE_ANSWER_MARKER = "not all results may have been written"
 # miint's error for a scan of one run that failed mid-stream.
 _EVERY_RUN_FAILED_MARKER = "every run failed"
-# miint's wording for a gzip that ends early, whichever transport read it.
+# miint's wording for a gzip that ends early, whichever transport read it; it also covers a
+# response that isn't gzip at all (duckdb-miint#460).
 _GZIP_TRUNCATED_MARKER = "gzip stream truncated before end marker"
 # The reason for a run whose data is partial (`_classify_ena_fetch_error`).
 _PARTIAL_RUN_TEXT = "its data is partial; refusing to register an incomplete read set"
