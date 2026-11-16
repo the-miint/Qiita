@@ -1344,6 +1344,16 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_ft_build.add_argument(
+        "--include-deprecated",
+        action="store_true",
+        help=(
+            "Read a deprecated --alignment-idx or --denovo-alignment-idx alone, its own"
+            " completed, non-withdrawn prep_samples, without its group (refused without"
+            " this flag). The manifest marks each part read this way. An alignment that"
+            " is not deprecated reads its group either way."
+        ),
+    )
+    p_ft_build.add_argument(
         "--prep-sample-idx",
         type=int,
         action="append",

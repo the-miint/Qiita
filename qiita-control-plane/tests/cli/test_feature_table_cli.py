@@ -197,8 +197,16 @@ def test_mint_exported_identifiers_posts_the_alignment_and_the_cohort(monkeypatc
     )
     assert captured["method"] == "POST"
     assert captured["url"] == f"http://cp{URL_EXPORTED_IDENTIFIER}"
-    assert captured["json"] == {"alignment_idx": 3, "prep_sample_idx": [2, 1]}
+    assert captured["json"] == {
+        "alignment_idx": 3,
+        "prep_sample_idx": [2, 1],
+        "include_deprecated": False,
+    }
     assert identifiers == _IDENTIFIERS
+    ftc._mint_exported_identifiers(
+        "http://cp", "qk_tok", alignment_idx=3, prep_sample_idx=[1], include_deprecated=True
+    )
+    assert captured["json"]["include_deprecated"] is True
 
 
 def test_an_invalid_cohort_is_refused_before_the_round_trip(monkeypatch):

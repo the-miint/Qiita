@@ -51,6 +51,19 @@
   deprecated the flag changes nothing. Before this change the SynDNA export did not
   refuse a deprecated mask: it read its group, leaving out each prep_sample that
   resolved to the deprecated mask.
+- **A deprecated alignment named by the alignment cohort DoGet, the pool alignment
+  cohort listing, `POST /api/v1/exported-identifier`, `POST
+  /api/v1/exported-processing` or `qiita feature-table build` (`--alignment-idx` or
+  `--denovo-alignment-idx`) is refused (409, `reason` `deprecated`, naming the flag)
+  unless the caller passes `--include-deprecated` (API `include_deprecated`) (#874).**
+  With it, the cohort DoGet reads that alignment's own completed, non-withdrawn rows,
+  never another member of its group, and still refuses a prep_sample whose mask run
+  is withdrawn; the build reads it as one part (or one de novo part: the prep_samples
+  completed under it have the arm, the others stay reference-only), marks the part
+  `deprecated` with the `deprecation_reason` in the manifest and says so on stderr.
+  The 409's `detail` is now an object (`detail`, `reason`, `deprecation_reason`)
+  where it was the message. For an alignment that is not deprecated the flag changes
+  nothing.
 - **`qiita feature-table build` takes repeated `--sequencing-run-idx` /
   `--sequenced-pool-idx` pairs and builds one table across the alignment's group
   (#874).** It reads each prep_sample from the alignment that it resolves to. Over the

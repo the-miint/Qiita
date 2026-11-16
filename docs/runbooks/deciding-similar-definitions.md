@@ -96,7 +96,10 @@ for that prep_sample. Its state is one of:
 A deprecated mask named by the masked-read export or the SynDNA count export is
 refused unless `--include-deprecated` is passed; with it, each prep_sample is read
 from that mask alone (its own runs, never another member's; a withdrawn run stays
-unreadable), and the output is marked deprecated.
+unreadable), and the output is marked deprecated. The same holds for a deprecated
+alignment named by `qiita feature-table build` (`--alignment-idx` or
+`--denovo-alignment-idx`) or the alignment cohort DoGet: with the flag it is read
+alone, and a prep_sample whose mask run is withdrawn is still refused.
 
 The exports list incomplete and not-processed prep_samples and leave them out, and
 so does `qiita feature-table build` over its default cohort (it also records them in

@@ -361,7 +361,11 @@ that pair would split a group that other `similar` pairs may rely on. The proced
   (`routes/_helpers.deprecated_read`); with it, the resolver's exact mode
   (`resolve_exact`) reads that definition's own runs, without its group, and the
   output is marked deprecated. The masked-read export routes, the mask-handle mints
-  and the SynDNA count export take the flag.
+  and the SynDNA count export take the flag for a mask; the alignment cohort DoGet,
+  the pool alignment cohort listing and the alignment-kind identifier and processing
+  mints take it for an alignment (`alignment_exact_read`, at step 2a of
+  `authorize_completed_alignment_cohort`), and `qiita feature-table build` passes it
+  to each.
 - **The group lock** is one Postgres advisory lock over every kind's groups
   (`repositories/definition_pair.py`). A decide or revoke takes it exclusive, by
   try-lock with a bounded retry and a 503 when it stays busy; the three deprecation

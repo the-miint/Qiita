@@ -45,10 +45,11 @@ def _fetch_alignment_cohort(
     sequencing_run_idx: int,
     sequenced_pool_idx: int,
     alignment_idx: int,
+    include_deprecated: bool = False,
 ) -> dict:
     """GET the pool's prep_samples that are BOTH readable by the caller and completed
     for this alignment, sorted so the same pool always produces the same request
-    bytes.
+    bytes. A deprecated alignment's cohort is listed only with `include_deprecated`.
 
     The whole body, not just its sample list: printed on its own a bare list says
     nothing about which alignment it belongs to.
@@ -58,7 +59,10 @@ def _fetch_alignment_cohort(
         sequenced_pool_idx=sequenced_pool_idx,
         alignment_idx=alignment_idx,
     )
-    return _common.call("GET", base_url, token, f"{PATH_SEQUENCING_RUN_PREFIX}{sub_path}")
+    params = {"include_deprecated": "true"} if include_deprecated else None
+    return _common.call(
+        "GET", base_url, token, f"{PATH_SEQUENCING_RUN_PREFIX}{sub_path}", params=params
+    )
 
 
 def _alignment_summary(alignments: dict, *, alignment_idx: int) -> dict:

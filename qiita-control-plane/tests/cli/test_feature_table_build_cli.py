@@ -244,6 +244,7 @@ def _namespace(tmp_path, **overrides) -> argparse.Namespace:
         "format": ftc.DEFAULT_TABLE_FORMAT,
         "taxonomy": False,
         "tree": False,
+        "include_deprecated": False,
         "output": tmp_path / "table.parquet",
     }
     return argparse.Namespace(**(fields | overrides))
@@ -344,7 +345,8 @@ def _patched(
 
     monkeypatch.setattr(ftc, "_fetch_reference_exclusion", _exclusion)
 
-    def _mint_ids(base_url, token, *, alignment_idx, prep_sample_idx):
+    def _mint_ids(base_url, token, *, alignment_idx, prep_sample_idx, include_deprecated=False):
+        rec.setdefault("flags", []).append(("identifier", alignment_idx, include_deprecated))
         rec["minted_cohort"] = prep_sample_idx
         return [i for i in _IDENTIFIERS if i["prep_sample_idx"] in prep_sample_idx]
 
@@ -373,11 +375,14 @@ def _patched(
 
     monkeypatch.setattr(ftc, "_mint_exported_features", _mint_features)
 
-    def _mint_processing(base_url, token, *, alignment_idx, prep_sample_idx):
+    def _mint_processing(
+        base_url, token, *, alignment_idx, prep_sample_idx, include_deprecated=False
+    ):
         """The processing mint, answering `QP<alignment_idx + 4>` (QP7 for the
         reference alignment). `prep_sample_idx` authorizes and is not part of the
         handle, so the fake records it to prove the cohort is what gets sent."""
         rec["processing_cohort"] = list(prep_sample_idx)
+        rec.setdefault("flags", []).append(("processing", alignment_idx, include_deprecated))
         rec.setdefault("processing_minted", {})[alignment_idx] = list(prep_sample_idx)
         return f"QP{alignment_idx + 4}"
 
@@ -397,7 +402,10 @@ def _patched(
         },
     )
 
-    def _alignment_ticket(base_url, token, *, alignment_idx, prep_sample_idx, columns):
+    def _alignment_ticket(
+        base_url, token, *, alignment_idx, prep_sample_idx, columns, include_deprecated=False
+    ):
+        rec.setdefault("flags", []).append(("doget", alignment_idx, include_deprecated))
         rec["columns"] = list(columns)
         rec["ticket_cohort"] = list(prep_sample_idx)
         return _ALIGNMENT_TICKET
@@ -1589,7 +1597,9 @@ def _patched_combined(monkeypatch, *, denovo_map=None, denovo_alignment=None, re
     # before a gate row exists. A fake that signed any cohort would let the driver
     # ask for the whole build's samples and still go green, which is exactly the
     # difference between the two drivers this module exists to catch.
-    def _alignment_ticket(base_url, token, *, alignment_idx, prep_sample_idx, columns):
+    def _alignment_ticket(
+        base_url, token, *, alignment_idx, prep_sample_idx, columns, include_deprecated=False
+    ):
         rec["arm_tickets"].append(alignment_idx)
         rec["columns"] = list(columns)
         rec["ticket_cohort"] = list(prep_sample_idx)
@@ -1908,7 +1918,9 @@ def _patched_two_pools(
     completed = {(_POOL_A, 3): [1], (_POOL_B, 13): [2]}
     rec["cohort_reads"] = []
 
-    def _cohort(b, t, *, sequencing_run_idx, sequenced_pool_idx, alignment_idx):
+    def _cohort(
+        b, t, *, sequencing_run_idx, sequenced_pool_idx, alignment_idx, include_deprecated=False
+    ):
         pool = (sequencing_run_idx, sequenced_pool_idx)
         rec["cohort_reads"].append((pool, alignment_idx))
         return {"prep_sample_idx": completed.get((pool, alignment_idx), [])}
@@ -1919,7 +1931,7 @@ def _patched_two_pools(
     rec["events"] = []
     columns_of: dict[int, list[str]] = {}
 
-    def _ticket(b, t, *, alignment_idx, prep_sample_idx, columns):
+    def _ticket(b, t, *, alignment_idx, prep_sample_idx, columns, include_deprecated=False):
         rec["tickets"][alignment_idx] = list(prep_sample_idx)
         rec["events"].append(("minted", alignment_idx))
         columns_of[alignment_idx] = list(columns)
@@ -2490,3 +2502,115 @@ def test_no_internal_identifier_appears_in_a_multi_part_combined_manifest(monkey
     assert not [key for key in keys if "idx" in key]
     assert not [value for value in strings if "idx" in value]
     assert "params" not in keys and "mask" not in json.dumps(_manifest(tmp_path))
+
+
+# ---------------------------------------------------------------------------
+# A deprecated --alignment-idx: refused without --include-deprecated, read alone with it
+# ---------------------------------------------------------------------------
+
+
+def _deprecated_listing(monkeypatch, rec) -> None:
+    body = {
+        "alignments": [
+            {
+                **_ALIGNMENTS_BODY["alignments"][0],
+                "status": "deprecated",
+                "deprecation_reason": "aligner build was wrong",
+            }
+        ]
+    }
+
+    def _alignments(*args, **kwargs):
+        rec["alignments_fetched"] = True
+        return body
+
+    monkeypatch.setattr(ftc, "_fetch_pool_alignments", _alignments)
+
+
+def test_a_deprecated_alignment_is_refused_without_the_flag(monkeypatch, tmp_path, capsys):
+    rec = _patched(monkeypatch)
+    _deprecated_listing(monkeypatch, rec)
+
+    assert ftc._handle_feature_table_build(_namespace(tmp_path), parser=None) == 1
+    err = capsys.readouterr().err
+    assert "aligner build was wrong" in err and "--include-deprecated" in err
+    assert rec["resolve_calls"] == []
+
+
+def test_a_deprecated_alignment_is_read_alone_and_marked_with_the_flag(
+    monkeypatch, tmp_path, capsys
+):
+    """No group resolve for the anchor: one part over the cohort the cohort route lists,
+    every request carries the flag, and the manifest marks the part."""
+    rec = _patched(monkeypatch)
+    _deprecated_listing(monkeypatch, rec)
+
+    args = _namespace(tmp_path, include_deprecated=True)
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    assert rec["resolve_calls"] == []
+    assert rec["ticket_cohort"] == [1, 2]
+    assert rec["processing_minted"] == {3: [1, 2]}
+    assert {flag for _, _, flag in rec["flags"]} == {True}
+    [part] = _manifest(tmp_path)["processing"]["parts"]
+    assert (part["deprecated"], part["deprecation_reason"]) == (True, "aligner build was wrong")
+    assert "alignment 3 is deprecated (aligner build was wrong)" in capsys.readouterr().err
+
+
+def test_the_flag_changes_nothing_for_an_active_alignment(monkeypatch, tmp_path):
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    plain_rec = _patched(monkeypatch)
+    assert ftc._handle_feature_table_build(_namespace(tmp_path / "a"), parser=None) == 0
+    plain = _manifest(tmp_path / "a")
+    flagged_rec = _patched(monkeypatch)
+    args = _namespace(tmp_path / "b", include_deprecated=True)
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    assert [c[:2] for c in flagged_rec["resolve_calls"]] == [
+        c[:2] for c in plain_rec["resolve_calls"]
+    ]
+    assert _manifest(tmp_path / "b")["processing"] == plain["processing"]
+    assert "deprecated" not in _manifest(tmp_path / "b")["processing"]["parts"][0]
+
+
+def test_a_deprecated_denovo_alignment_is_read_alone_with_the_flag(monkeypatch, tmp_path, capsys):
+    """The de novo arm is alignment 4 alone: the prep_samples the cohort route lists
+    completed under it have its arm (here 1), the rest stay reference-only, and its
+    manifest part is marked."""
+    deprecated_4 = {
+        **_listed(4, _DENOVO_PARAMS),
+        "status": "deprecated",
+        "deprecation_reason": "contigs were misassembled",
+    }
+    rec = _patched_two_pools(
+        monkeypatch,
+        resolve=_TWO_POOL_DENOVO_RESOLVE,
+        listings={
+            _POOL_A: {"alignments": [_listed(3, _PARAMS), deprecated_4]},
+            _POOL_B: {"alignments": [_listed(13, _PARAMS_B), _listed(14, _DENOVO_PARAMS_B)]},
+        },
+    )
+    completed = {(_POOL_A, 3): [1], (_POOL_B, 13): [2], (_POOL_A, 4): [1]}
+    flags = []
+
+    def _cohort(
+        b, t, *, sequencing_run_idx, sequenced_pool_idx, alignment_idx, include_deprecated=False
+    ):
+        flags.append((alignment_idx, include_deprecated))
+        return {
+            "prep_sample_idx": completed.get(
+                ((sequencing_run_idx, sequenced_pool_idx), alignment_idx), []
+            )
+        }
+
+    monkeypatch.setattr(ftc, "_fetch_alignment_cohort", _cohort)
+    args = _two_pool_args(
+        tmp_path, prep_sample_idx=[1, 2], denovo_alignment_idx=4, include_deprecated=True
+    )
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    assert ("alignment", 4) not in {c[:2] for c in rec["resolve_calls"]}
+    assert (4, True) in flags
+    assert rec["tickets"][4] == [1] and 14 not in rec["tickets"]
+    [part] = _manifest(tmp_path)["table"]["denovo"]["parts"]
+    assert (part["deprecated"], part["deprecation_reason"]) == (True, "contigs were misassembled")
+    assert "alignment 4 is deprecated (contigs were misassembled)" in capsys.readouterr().err

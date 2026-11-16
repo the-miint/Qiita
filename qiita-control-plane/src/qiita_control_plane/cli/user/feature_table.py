@@ -53,6 +53,7 @@ from qiita_common.assembly_constants import ASSEMBLED_SEQUENCE_TABLE
 from qiita_common.duckdb_relation import registered
 from qiita_common.models import (
     MAX_EXPORTED_FEATURE_ENTITIES,
+    AlignmentDefinitionStatus,
     DefinitionGroupResolveRequest,
     DefinitionGroupResolveResponse,
     DefinitionKind,
@@ -317,7 +318,12 @@ def _fetch_reference_exclusion(
 
 
 def _mint_exported_identifiers(
-    base_url: str, token: str, *, alignment_idx: int, prep_sample_idx: list[int]
+    base_url: str,
+    token: str,
+    *,
+    alignment_idx: int,
+    prep_sample_idx: list[int],
+    include_deprecated: bool = False,
 ) -> list[dict[str, Any]]:
     """Mint (or recover) the public `export_id` of each processed sample in the cohort.
 
@@ -326,7 +332,9 @@ def _mint_exported_identifiers(
     cap locally rather than after a round trip.
     """
     body = ExportedIdentifierRequest(
-        alignment_idx=alignment_idx, prep_sample_idx=prep_sample_idx
+        alignment_idx=alignment_idx,
+        prep_sample_idx=prep_sample_idx,
+        include_deprecated=include_deprecated,
     ).model_dump()
     path = f"{PATH_EXPORTED_IDENTIFIER_PREFIX}{PATH_EXPORTED_IDENTIFIER_ROOT}"
     return _common.call("POST", base_url, token, path, json=body)["identifiers"]
@@ -358,7 +366,12 @@ def _mint_exported_features(
 
 
 def _mint_exported_processing(
-    base_url: str, token: str, *, alignment_idx: int, prep_sample_idx: list[int]
+    base_url: str,
+    token: str,
+    *,
+    alignment_idx: int,
+    prep_sample_idx: list[int],
+    include_deprecated: bool = False,
 ) -> str:
     """Mint (or recover) the public handle for the processing this table was built from —
     what the manifest cites instead of an `alignment_idx`.
@@ -368,7 +381,9 @@ def _mint_exported_processing(
     see two bundles share a processing.
     """
     body = ExportedProcessingRequest(
-        alignment_idx=alignment_idx, prep_sample_idx=prep_sample_idx
+        alignment_idx=alignment_idx,
+        prep_sample_idx=prep_sample_idx,
+        include_deprecated=include_deprecated,
     ).model_dump()
     path = f"{PATH_EXPORTED_PROCESSING_PREFIX}{PATH_EXPORTED_PROCESSING_ROOT}"
     return _common.call("POST", base_url, token, path, json=body)["export_processing_id"]
@@ -392,6 +407,7 @@ def _create_alignment_doget_ticket(
     alignment_idx: int,
     prep_sample_idx: list[int],
     columns: tuple[str, ...],
+    include_deprecated: bool = False,
 ) -> bytes:
     """Mint the signed DoGet ticket for this alignment slice, returning the decoded
     ticket bytes.
@@ -411,7 +427,11 @@ def _create_alignment_doget_ticket(
         base_url,
         token,
         path,
-        json={"prep_sample_idx": prep_sample_idx, "columns": list(columns)},
+        json={
+            "prep_sample_idx": prep_sample_idx,
+            "columns": list(columns),
+            "include_deprecated": include_deprecated,
+        },
     )
     return base64.b64decode(resp["ticket"])
 
@@ -950,8 +970,9 @@ def _manifest_parts(
     parts: Sequence[_Part], handles: dict[int, str], identifiers: list[dict[str, Any]]
 ) -> dict[str, Any]:
     """One arm's processing record: `parts`, one entry per part (its minted handle, its
-    verified `params_hash` and its aligner), and `sample_part`, each prep_sample's `export_id`
-    mapped to the handle of the part it was read from.
+    verified `params_hash`, its aligner, and `deprecated` with the reason for a
+    deprecated alignment read under --include-deprecated), and `sample_part`, each
+    prep_sample's `export_id` mapped to the handle of the part it was read from.
 
     Parts are in `alignment_idx` order, so two builds over the same inputs write the
     same bytes; the order is all of that id the manifest keeps. `sample_part` is sorted
@@ -964,6 +985,11 @@ def _manifest_parts(
                 "export_processing_id": handles[part.alignment_idx],
                 "params_hash": part.summary["params_hash"],
                 "aligner": part.summary.get("params", {}).get("aligner"),
+                **(
+                    {"deprecated": True, "deprecation_reason": part.summary["deprecation_reason"]}
+                    if _is_deprecated(part.summary)
+                    else {}
+                ),
             }
             for part in parts
         ],
@@ -1331,6 +1357,52 @@ class _DenovoPart(_Part):
     processing_idx: int
 
 
+def _is_deprecated(summary: dict[str, Any]) -> bool:
+    return summary.get("status") == AlignmentDefinitionStatus.DEPRECATED.value
+
+
+def _reads_exactly(summary: dict[str, Any], *, flag: bool, role: str) -> bool:
+    """Whether the build reads this named alignment's own results rather than its group:
+    it is deprecated and --include-deprecated is set (the routes' `deprecated_read`
+    rule). Refuses a deprecated alignment named without the flag, naming it, and prints
+    the stderr line for one read with it."""
+    if not _is_deprecated(summary):
+        return False
+    idx, reason = summary["alignment_idx"], summary.get("deprecation_reason")
+    if not flag:
+        raise ValueError(
+            f"{role} {idx} is deprecated: {reason}. To read its own results, pass"
+            f" --include-deprecated"
+        )
+    _common.print_deprecated_read("alignment", idx, reason)
+    return True
+
+
+def _exact_resolution(
+    summary: dict[str, Any], samples: list[int]
+) -> DefinitionGroupResolveResponse:
+    """The plan for an exact read of a deprecated alignment: every prep_sample on it
+    alone. The cohort DoGet resolves the cohort exactly under `include_deprecated` and
+    refuses a prep_sample that its own run does not cover."""
+    idx = summary["alignment_idx"]
+    mask_idx = summary.get("params", {}).get("mask_idx")
+    return DefinitionGroupResolveResponse(
+        definition_kind=DefinitionKind.ALIGNMENT,
+        definition_idx=idx,
+        group=[idx],
+        samples=[
+            SampleResolution(
+                prep_sample_idx=sample,
+                state=SampleResolutionState.PROCESSED,
+                definition_kind=DefinitionKind.ALIGNMENT,
+                definition_idx=idx,
+                mask_idx=mask_idx if isinstance(mask_idx, int) else None,
+            )
+            for sample in sorted(set(samples))
+        ],
+    )
+
+
 def _pools(args: argparse.Namespace) -> list[tuple[int, int]]:
     """The `(sequencing_run_idx, sequenced_pool_idx)` pairs the flags name, the Nth
     `--sequencing-run-idx` with the Nth `--sequenced-pool-idx`. Refuses unequal counts
@@ -1396,6 +1468,7 @@ def _resolve_cohort(
     args: argparse.Namespace,
     *,
     per_pool: dict[tuple[int, int], set[int]],
+    exact: bool = False,
 ) -> _Cohort:
     """The cohort to resolve: the prep_samples named on the command line, or else every
     prep_sample of the named pools that the caller may read and that is completed for an
@@ -1406,6 +1479,9 @@ def _resolve_cohort(
     it is a legitimate answer from the cohort route, but it is not a table — both mints
     reject an empty cohort, so left alone this becomes a 422 naming a request body the
     user never wrote.
+
+    `exact` (a deprecated `--alignment-idx` read under --include-deprecated): the
+    default cohort is the anchor's own completed prep_samples, with no group.
     """
     if args.prep_sample_idx is not None:
         return _Cohort(sorted(set(args.prep_sample_idx)), None)
@@ -1417,6 +1493,7 @@ def _resolve_cohort(
             sequencing_run_idx=pool[0],
             sequenced_pool_idx=pool[1],
             alignment_idx=alignment_idx,
+            include_deprecated=args.include_deprecated,
         )["prep_sample_idx"]
 
     anchor = args.alignment_idx
@@ -1432,6 +1509,8 @@ def _resolve_cohort(
             f" cohort to build a table over. `qiita alignment list` shows each alignment's"
             f" completed count."
         )
+    if exact:
+        return _Cohort(sorted(listed_under), listed_under)
     group = set(
         _resolve_definition_group(
             base_url,
@@ -1480,7 +1559,12 @@ def _skip_unprocessed(
 
 
 def _left_out_identifiers(
-    base_url: str, token: str, left_out: list[SampleResolution], cohort: _Cohort
+    base_url: str,
+    token: str,
+    left_out: list[SampleResolution],
+    cohort: _Cohort,
+    *,
+    include_deprecated: bool = False,
 ) -> list[dict[str, Any]]:
     """The manifest's record of the left-out prep_samples: each one's `export_id`, state
     and reason, sorted by `export_id`. The `export_id` is minted under the highest-idx
@@ -1505,6 +1589,7 @@ def _left_out_identifiers(
                 token,
                 alignment_idx=alignment_idx,
                 prep_sample_idx=[entry.prep_sample_idx for entry in entries],
+                include_deprecated=include_deprecated,
             )
         }
         out.extend(
@@ -1578,6 +1663,7 @@ def _plan_denovo(
     anchor_summary: dict[str, Any],
     parts: list[_Part],
     cohort: list[int],
+    per_pool: dict[tuple[int, int], set[int]],
 ) -> list[_DenovoPart]:
     """The de novo arm's parts: each cohort prep_sample's de novo alignment, resolved in
     `--denovo-alignment-idx`'s group, grouped by alignment in `alignment_idx` order.
@@ -1596,16 +1682,39 @@ def _plan_denovo(
     runs of the de novo alignments that some prep_sample resolved to are then checked for
     deprecation, before the refusal of unprocessed prep_samples, so a deprecated run is
     named by the rule that owns its wording.
+
+    A deprecated `--denovo-alignment-idx` read under --include-deprecated is read alone:
+    the cohort's prep_samples that the pool cohort route lists completed under it have
+    its arm, every other one stays reference-only, and the cohort DoGet resolves the
+    arm's prep_samples exactly.
     """
     anchor = args.denovo_alignment_idx
     summaries = {anchor: _alignment_summary(listing, alignment_idx=anchor)}
-    resolution = _resolve_definition_group(
-        base_url,
-        token,
-        kind=DefinitionKind.ALIGNMENT,
-        definition_idx=anchor,
-        prep_sample_idx=cohort,
-    )
+    if _reads_exactly(summaries[anchor], flag=args.include_deprecated, role="de novo alignment"):
+        on_anchor = {
+            sample
+            for (run_idx, pool_idx), listed in per_pool.items()
+            if anchor in listed
+            for sample in _fetch_alignment_cohort(
+                base_url,
+                token,
+                sequencing_run_idx=run_idx,
+                sequenced_pool_idx=pool_idx,
+                alignment_idx=anchor,
+                include_deprecated=True,
+            )["prep_sample_idx"]
+        }
+        resolution = _exact_resolution(
+            summaries[anchor], [sample for sample in cohort if sample in on_anchor]
+        )
+    else:
+        resolution = _resolve_definition_group(
+            base_url,
+            token,
+            kind=DefinitionKind.ALIGNMENT,
+            definition_idx=anchor,
+            prep_sample_idx=cohort,
+        )
     resolved: dict[int, int] = {}
     refused: list[SampleResolution] = []
     for entry in resolution.samples:
@@ -1705,9 +1814,12 @@ def _run_build(
     # names but the caller cannot read, which is exactly what every reference DoGet ticket
     # below would then fail on.
     reference = _fetch_reference(args.base_url, token, reference_idx=reference_idx)
-    resolved_cohort = _resolve_cohort(args.base_url, token, args, per_pool=per_pool)
+    exact = _reads_exactly(anchor_summary, flag=args.include_deprecated, role="alignment")
+    resolved_cohort = _resolve_cohort(args.base_url, token, args, per_pool=per_pool, exact=exact)
     resolution, left_out = _skip_unprocessed(
-        _resolve_definition_group(
+        _exact_resolution(anchor_summary, resolved_cohort.samples)
+        if exact
+        else _resolve_definition_group(
             args.base_url,
             token,
             kind=DefinitionKind.ALIGNMENT,
@@ -1733,6 +1845,7 @@ def _run_build(
             anchor_summary=anchor_summary,
             parts=parts,
             cohort=cohort,
+            per_pool=per_pool,
         )
 
     _stage_genome_map(con, _fetch_genome_map(args.base_url, token, reference_idx=reference_idx))
@@ -1793,7 +1906,9 @@ def _run_build(
                 f" requested.",
                 file=sys.stderr,
             )
-    left_out_records = _left_out_identifiers(args.base_url, token, left_out, resolved_cohort)
+    left_out_records = _left_out_identifiers(
+        args.base_url, token, left_out, resolved_cohort, include_deprecated=args.include_deprecated
+    )
     identifiers = sorted(
         (
             entry
@@ -1803,6 +1918,7 @@ def _run_build(
                 token,
                 alignment_idx=part.alignment_idx,
                 prep_sample_idx=list(part.samples),
+                include_deprecated=args.include_deprecated,
             )
         ),
         key=lambda entry: entry["prep_sample_idx"],
@@ -1882,6 +1998,7 @@ def _run_build(
                 alignment_idx=part.alignment_idx,
                 prep_sample_idx=list(part.samples),
                 columns=columns,
+                include_deprecated=args.include_deprecated,
             ),
             gate=gate,
         )
@@ -1898,6 +2015,7 @@ def _run_build(
                     alignment_idx=part.alignment_idx,
                     prep_sample_idx=list(part.samples),
                     columns=ft.ALIGNMENT_COLUMNS,
+                    include_deprecated=args.include_deprecated,
                 )
                 for part in denovo_parts
             ]
@@ -1955,6 +2073,7 @@ def _run_build(
                 token,
                 alignment_idx=part.alignment_idx,
                 prep_sample_idx=list(part.samples),
+                include_deprecated=args.include_deprecated,
             )
             for part in arm
         }
