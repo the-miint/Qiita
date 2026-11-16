@@ -287,17 +287,21 @@ async def list_pairs(
     *,
     kinds: list[DefinitionKind],
     verdict: DefinitionPairVerdict | None,
+    before_definition_pair_idx: int | None,
     limit: int,
 ) -> list[asyncpg.Record]:
-    """Pairs of the given kinds, optionally of one verdict, oldest first."""
+    """Up to `limit` pairs of the given kinds, optionally of one verdict, newest
+    first, with an id below `before_definition_pair_idx` when it is given."""
     return list(
         await conn.fetch(
             f"SELECT {_PAIR_COLUMNS} FROM qiita.definition_pair"
             " WHERE definition_kind = ANY($1::text[])"
             "   AND ($2::text IS NULL OR verdict = $2)"
-            " ORDER BY definition_pair_idx LIMIT $3",
+            "   AND ($3::bigint IS NULL OR definition_pair_idx < $3)"
+            " ORDER BY definition_pair_idx DESC LIMIT $4",
             [k.value for k in kinds],
             None if verdict is None else verdict.value,
+            before_definition_pair_idx,
             limit,
         )
     )

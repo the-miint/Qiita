@@ -59,22 +59,37 @@ def _render_list(body: dict | list) -> None:
     for pair in body.get("pairs", []):
         print(_pair_line(pair), file=sys.stderr)
     tail = f"{body.get('count')} pair(s)"
-    if body.get("truncated"):
-        tail += " (truncated; narrow with --verdict or --kind)"
+    cursor = body.get("next_after_definition_pair_idx")
+    if cursor is not None:
+        tail += f" (more: --after {cursor}, or --all)"
     print(tail, file=sys.stderr)
 
 
-def _handle_list(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
-    params = {}
+def _list_pairs(base_url: str, token: str, args: argparse.Namespace) -> dict:
+    """GET /admin/definition-pair, following `next_after_definition_pair_idx` across
+    pages with --all. One page otherwise, cursor included."""
+    params: dict = {"limit": args.limit}
     if args.verdict is not None:
         params["verdict"] = args.verdict
     if args.kind is not None:
         params["definition_kind"] = args.kind
+    if args.after is not None:
+        params["after_definition_pair_idx"] = args.after
+    pairs: list = []
+    while True:
+        page = _common.call(
+            "GET", base_url, token, _path(PATH_ADMIN_DEFINITION_PAIR), params=params
+        )
+        pairs.extend(page["pairs"])
+        cursor = page["next_after_definition_pair_idx"]
+        if not args.all_pages or cursor is None:
+            return {"pairs": pairs, "count": len(pairs), "next_after_definition_pair_idx": cursor}
+        params["after_definition_pair_idx"] = cursor
+
+
+def _handle_list(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
     return _common.run_http_subcommand(
-        lambda token: _common.call(
-            "GET", args.base_url, token, _path(PATH_ADMIN_DEFINITION_PAIR), params=params or None
-        ),
-        render=_render_list,
+        lambda token: _list_pairs(args.base_url, token, args), render=_render_list
     )
 
 
@@ -139,9 +154,16 @@ def add_pair_parser(subparsers) -> None:
     sub = p.add_subparsers(dest="pair_cmd", required=True)
     kinds = [k.value for k in DefinitionKind]
 
-    sp = sub.add_parser("list", help="list pairs, oldest first")
+    sp = sub.add_parser("list", help="list pairs, newest first, one page at a time")
     sp.add_argument("--verdict", choices=[v.value for v in DefinitionPairVerdict], default=None)
     sp.add_argument("--kind", choices=kinds, default=None)
+    sp.add_argument("--limit", type=int, default=100, help="page size (max 1000)")
+    sp.add_argument(
+        "--after", type=int, default=None, help="cursor: a page's next_after_definition_pair_idx"
+    )
+    sp.add_argument(
+        "--all", dest="all_pages", action="store_true", help="follow the cursor to the end"
+    )
     sp.set_defaults(handler=_handle_list)
 
     sp = sub.add_parser("show", help="show one pair and its history")

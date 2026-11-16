@@ -69,10 +69,9 @@ _KIND_SCOPE: dict[DefinitionKind, Scope] = {
 
 _require_any_lifecycle = require_any_scope(*_KIND_SCOPE.values())
 
-# Hard cap on the list. Pairs are opened by hand, one per decision an admin is asked
-# to make, so the table is expected to stay far below it; a caller that hits it
-# narrows with `verdict` or `definition_kind`.
-_PAIR_LIST_HARD_CAP = 1_000
+# The list's page size: the default, and the most one request may ask for.
+_PAIR_LIST_DEFAULT_LIMIT = 100
+_PAIR_LIST_MAX_LIMIT = 1_000
 
 _MSG_PAIR_NOT_FOUND = "Definition pair not found"
 
@@ -96,23 +95,40 @@ async def _fetch_pair_for_caller(
 async def list_definition_pair_route(
     verdict: Annotated[DefinitionPairVerdict | None, Query()] = None,
     definition_kind: Annotated[DefinitionKind | None, Query()] = None,
+    after_definition_pair_idx: Annotated[
+        int | None,
+        Query(gt=0, description="Cursor: the previous page's next_after_definition_pair_idx."),
+    ] = None,
+    limit: Annotated[int, Query(ge=1, le=_PAIR_LIST_MAX_LIMIT)] = _PAIR_LIST_DEFAULT_LIMIT,
     pool: asyncpg.Pool = Depends(get_db_pool),
     _caller: HumanUser = Depends(require_human),
     principal: Principal = Depends(_require_any_lifecycle),
 ) -> DefinitionPairListResponse:
-    """Pairs, oldest first, optionally of one verdict and one kind. Without
-    `definition_kind`, only the kinds whose lifecycle scope the caller holds."""
+    """One page of pairs, newest first, optionally of one verdict and one kind.
+    Without `definition_kind`, only the kinds whose lifecycle scope the caller
+    holds. `next_after_definition_pair_idx` is the cursor for the next page, None on
+    the last."""
     if definition_kind is not None:
         check_scope(principal, _KIND_SCOPE[definition_kind])
         kinds = [definition_kind]
     else:
         kinds = [k for k, scope in _KIND_SCOPE.items() if principal.has_scope(scope)]
-    rows, truncated = cap_rows(
-        await list_pairs(pool, kinds=kinds, verdict=verdict, limit=_PAIR_LIST_HARD_CAP + 1),
-        _PAIR_LIST_HARD_CAP,
+    rows, more = cap_rows(
+        await list_pairs(
+            pool,
+            kinds=kinds,
+            verdict=verdict,
+            before_definition_pair_idx=after_definition_pair_idx,
+            limit=limit + 1,
+        ),
+        limit,
     )
     pairs = [_pair_response(r) for r in rows]
-    return DefinitionPairListResponse(pairs=pairs, count=len(pairs), truncated=truncated)
+    return DefinitionPairListResponse(
+        pairs=pairs,
+        count=len(pairs),
+        next_after_definition_pair_idx=pairs[-1].definition_pair_idx if more else None,
+    )
 
 
 @router.post(PATH_ADMIN_DEFINITION_PAIR, status_code=201)

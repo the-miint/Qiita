@@ -47,16 +47,52 @@ def test_open_posts_the_kind_and_both_ids(monkeypatch, capsys):
 
 
 def test_list_sends_only_the_filters_given(monkeypatch, capsys):
-    captured = _capture(monkeypatch, {"pairs": [_PAIR], "count": 1, "truncated": False})
+    captured = _capture(
+        monkeypatch, {"pairs": [_PAIR], "count": 1, "next_after_definition_pair_idx": None}
+    )
     assert cli.main(["pair", "list", "--verdict", "pending", "--kind", "mask"]) == 0
     assert captured["method"] == "GET"
     assert captured["url"].endswith(URL_ADMIN_DEFINITION_PAIR)
-    assert captured["params"] == {"verdict": "pending", "definition_kind": "mask"}
+    assert captured["params"] == {"verdict": "pending", "definition_kind": "mask", "limit": 100}
     assert "1 pair(s)" in capsys.readouterr().err
 
-    captured = _capture(monkeypatch, {"pairs": [], "count": 0, "truncated": False})
+    captured = _capture(
+        monkeypatch, {"pairs": [], "count": 0, "next_after_definition_pair_idx": None}
+    )
+    assert cli.main(["pair", "list", "--limit", "5", "--after", "9"]) == 0
+    assert captured["params"] == {"limit": 5, "after_definition_pair_idx": 9}
+
+
+def test_list_follows_the_cursor_with_all(monkeypatch, capsys):
+    """--all follows next_after_definition_pair_idx to the last page; without it one
+    page is printed and the cursor named."""
+    from qiita_control_plane.cli import _common
+
+    monkeypatch.setenv("QIITA_TOKEN", "qk_admin")
+    pages = {
+        None: {
+            "pairs": [{**_PAIR, "definition_pair_idx": 9}],
+            "count": 1,
+            "next_after_definition_pair_idx": 9,
+        },
+        9: {"pairs": [_PAIR], "count": 1, "next_after_definition_pair_idx": None},
+    }
+    calls: list = []
+
+    def fake_request(method, url, headers=None, json=None, params=None, timeout=None):
+        calls.append(dict(params))
+        body = pages[params.get("after_definition_pair_idx")]
+        return httpx.Response(200, json=body, request=httpx.Request(method, url))
+
+    monkeypatch.setattr(_common.httpx, "request", fake_request)
+    assert cli.main(["pair", "list", "--all"]) == 0
+    assert [c.get("after_definition_pair_idx") for c in calls] == [None, 9]
+    assert "2 pair(s)" in capsys.readouterr().err
+
+    calls.clear()
     assert cli.main(["pair", "list"]) == 0
-    assert captured["params"] is None
+    assert len(calls) == 1
+    assert "1 pair(s) (more: --after 9, or --all)" in capsys.readouterr().err
 
 
 def test_show_gets_the_pair(monkeypatch):

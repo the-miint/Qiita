@@ -171,9 +171,10 @@ class DefinitionPairDetail(DefinitionPair):
 
 
 class DefinitionPairListResponse(BaseModel):
-    """Returned by GET /api/v1/admin/definition-pair. `truncated` is true when the
-    list hit the route's cap; narrow with `verdict` or `definition_kind`."""
+    """Returned by GET /api/v1/admin/definition-pair: one page of pairs, newest first.
+    `next_after_definition_pair_idx` is the cursor for the next page (pass it back as
+    `after_definition_pair_idx`), or None on the last page."""
 
     pairs: list[DefinitionPair]
     count: int
-    truncated: bool
+    next_after_definition_pair_idx: Annotated[int | None, Field(default=None, gt=0)] = None

@@ -443,6 +443,32 @@ async def test_revoking_a_mask_pair_a_processing_similar_relies_on_is_refused(cl
     assert (await _revoke(clients["admin"], mask_pair)).status_code == 200
 
 
+async def test_list_pages_newest_first_and_follows_the_cursor(clients, defs):
+    """Pages of `limit`, newest first; the cursor reaches every pair, the oldest
+    included, and the last page carries none."""
+    m1, m2, m3 = [await defs["mask"](rype=r) for r in (0.05, 0.1, 0.2)]
+    mine = [
+        await _opened(clients["admin"], DefinitionKind.MASK, a, b)
+        for a, b in ((m1, m2), (m1, m3), (m2, m3))
+    ]
+    seen: list[int] = []
+    params: dict = {"definition_kind": DefinitionKind.MASK, "limit": 2}
+    while True:
+        resp = await clients["admin"].get(URL_ADMIN_DEFINITION_PAIR, params=params)
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert len(body["pairs"]) <= 2 and body["count"] == len(body["pairs"])
+        seen.extend(p["definition_pair_idx"] for p in body["pairs"])
+        if body["next_after_definition_pair_idx"] is None:
+            break
+        assert body["next_after_definition_pair_idx"] == seen[-1]
+        params["after_definition_pair_idx"] = body["next_after_definition_pair_idx"]
+    assert seen == sorted(seen, reverse=True)
+    assert set(mine) <= set(seen)
+    over = await clients["admin"].get(URL_ADMIN_DEFINITION_PAIR, params={"limit": 1001})
+    assert over.status_code == 422, over.text
+
+
 async def test_list_filters_by_verdict_and_kind(clients, defs):
     m1, m2, m3 = [await defs["mask"](rype=r) for r in (0.05, 0.1, 0.2)]
     a1, a2 = await defs["block"](m1), await defs["block"](m1, shard_ids=(0, 1))

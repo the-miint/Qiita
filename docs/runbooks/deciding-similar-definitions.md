@@ -36,7 +36,7 @@ A pair with `derived_only: true` changes only upstream references; it can be dec
 ## 2. Decide
 
 ```bash
-qiita-admin pair list --verdict pending          # oldest first; --kind to narrow
+qiita-admin pair list --verdict pending --all    # newest first; --kind to narrow
 qiita-admin pair decide 7 --verdict similar --reason "rype 0.05 vs 0.06; same host filter otherwise"
 ```
 
