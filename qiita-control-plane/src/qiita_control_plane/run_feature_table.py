@@ -33,7 +33,7 @@ import pyarrow.flight as flight
 from qiita_common import analytic as ft
 from qiita_common.actions import AMPLICON_ACTION_ID
 from qiita_common.amplicon_constants import (
-    AMPLICON_MEMBERSHIP_TABLE,
+    AMPLICON_MEMBERSHIP_VISIBLE_TABLE,
     AMPLICON_SEQUENCE_TABLE,
 )
 from qiita_common.models.run_feature_table import (
@@ -81,7 +81,7 @@ SOURCES: dict[str, Source] = {
     AMPLICON_ACTION_ID: Source(
         method=AMPLICON_ACTION_ID,
         value_kind="count",
-        values_table=AMPLICON_MEMBERSHIP_TABLE,
+        values_table=AMPLICON_MEMBERSHIP_VISIBLE_TABLE,
         value_column="count",
         sequences_table=AMPLICON_SEQUENCE_TABLE,
         merge_keys=("trim", "orient_primer"),
