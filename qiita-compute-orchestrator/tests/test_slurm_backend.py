@@ -1141,6 +1141,115 @@ async def test_result_step_completed_missing_manifest_is_contract_violation(jwt_
     assert "manifest" in ei.value.reason.lower()
 
 
+_TIME_LIMIT_LINE = (
+    "[2026-11-14T10:44:12.003] error: *** JOB 2305427 ON b-cn-03 "
+    "CANCELLED AT 2026-11-14T10:44:12 DUE TO TIME LIMIT ***\n"
+)
+_SCANCEL_LINE = (
+    "[2026-11-15T22:54:35.603] error: *** JOB 2314384 ON b-cn-03 "
+    "CANCELLED AT 2026-11-15T22:54:35 DUE to SIGNAL Terminated ***\n"
+)
+
+
+async def _purged_result(jwt_path, tmp_path, stderr, *, manifest=None):
+    """result_step on a job slurmrestd purged, so the runner synthesized COMPLETED."""
+    backend = _make_backend(httpx.MockTransport(lambda r: httpx.Response(500)), jwt_path)
+    (tmp_path / "output").mkdir(parents=True)
+    (tmp_path / "logs").mkdir(parents=True)
+    if stderr is not None:
+        (tmp_path / "logs" / "stderr").write_text(stderr)
+    if manifest is not None:
+        (tmp_path / "output" / "manifest.json").write_text(manifest)
+    with pytest.raises((BackendFailure, StepNoData)) as ei:
+        await backend.result_step(
+            _slurm_handle(tmp_path),
+            StepStatusInfo(status=StepStatus.COMPLETED, raw_state="PURGED"),
+        )
+    return ei.value
+
+
+@pytest.mark.asyncio
+async def test_result_step_purged_transient_launcher_line_keeps_its_kind(jwt_path, tmp_path):
+    line = json.dumps(
+        {"kind": "external_fetch_transient", "step_name": "hash", "reason": "ENA reset"}
+    )
+    exc = await _purged_result(jwt_path, tmp_path, line + "\n")
+    assert exc.kind is FailureKind.EXTERNAL_FETCH_TRANSIENT
+    assert exc.transient is True
+    assert "ENA reset" in exc.reason
+
+
+@pytest.mark.asyncio
+async def test_result_step_purged_permanent_launcher_line_stays_permanent(jwt_path, tmp_path):
+    line = json.dumps({"kind": "bad_input", "step_name": "hash", "reason": "bad fastq"})
+    exc = await _purged_result(jwt_path, tmp_path, line + "\n")
+    assert exc.kind is FailureKind.BAD_INPUT
+    assert exc.transient is False
+
+
+@pytest.mark.asyncio
+async def test_result_step_purged_time_limit_kill_is_timeout(jwt_path, tmp_path):
+    exc = await _purged_result(jwt_path, tmp_path, "working...\n" + _TIME_LIMIT_LINE)
+    assert exc.kind is FailureKind.TIMEOUT_BEFORE_START
+    assert exc.transient is True
+
+
+@pytest.mark.asyncio
+async def test_result_step_purged_scancel_is_exit_nonzero(jwt_path, tmp_path):
+    exc = await _purged_result(jwt_path, tmp_path, _SCANCEL_LINE)
+    assert exc.kind is FailureKind.EXIT_NONZERO
+    assert exc.transient is False
+
+
+@pytest.mark.asyncio
+async def test_result_step_purged_no_data_line_raises_step_no_data(jwt_path, tmp_path):
+    line = json.dumps({"kind": "no_data", "step_name": "fastq", "reason": "no records"})
+    exc = await _purged_result(jwt_path, tmp_path, line + "\n")
+    assert isinstance(exc, StepNoData)
+    assert exc.reason == "no records"
+
+
+@pytest.mark.asyncio
+async def test_result_step_purged_oom_signature_is_oom_killed(jwt_path, tmp_path):
+    exc = await _purged_result(
+        jwt_path,
+        tmp_path,
+        "slurmstepd: error: Detected 1 oom_kill event in StepId=141763.0. "
+        "Some of the step tasks have been OOM Killed.\n",
+    )
+    assert exc.kind is FailureKind.OOM_KILLED
+    assert exc.transient is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stderr", [None, "", "no recognizable line\n"])
+async def test_result_step_purged_without_signal_is_retriable(jwt_path, tmp_path, stderr):
+    exc = await _purged_result(jwt_path, tmp_path, stderr)
+    assert exc.kind is FailureKind.JOB_PURGED
+    assert exc.transient is True
+    assert "purged" in exc.reason.lower()
+
+
+@pytest.mark.asyncio
+async def test_result_step_purged_with_broken_manifest_is_contract_violation(jwt_path, tmp_path):
+    exc = await _purged_result(jwt_path, tmp_path, _TIME_LIMIT_LINE, manifest="not json")
+    assert exc.kind is FailureKind.CONTRACT_VIOLATION
+
+
+@pytest.mark.asyncio
+async def test_result_step_completed_not_purged_missing_manifest_ignores_stderr(jwt_path, tmp_path):
+    backend = _make_backend(httpx.MockTransport(lambda r: httpx.Response(500)), jwt_path)
+    (tmp_path / "output").mkdir(parents=True)
+    (tmp_path / "logs").mkdir(parents=True)
+    (tmp_path / "logs" / "stderr").write_text(_TIME_LIMIT_LINE)
+    with pytest.raises(BackendFailure) as ei:
+        await backend.result_step(
+            _slurm_handle(tmp_path),
+            StepStatusInfo(status=StepStatus.COMPLETED, raw_state="COMPLETED", exit_code=0),
+        )
+    assert ei.value.kind == FailureKind.CONTRACT_VIOLATION
+
+
 @pytest.mark.asyncio
 async def test_result_step_failed_maps_state_to_kind(jwt_path, tmp_path):
     """On a FAILED status, result_step maps the SLURM state to a

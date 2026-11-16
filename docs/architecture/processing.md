@@ -141,7 +141,7 @@ Work ticket fields (per `qiita.work_ticket` migration `20260504000001_work_ticke
 
 The schema does not carry per-step provenance fields (slurm_job_id, log paths, current_step / total_steps, provenance JSONB, completed_at). The runner is synchronous and waits inline for each step; SLURM-side log retrieval is on the orchestrator and not surfaced on the work_ticket row.
 
-Failure classification is finer-grained at the backend layer: `BackendFailure.kind` is one of the values in `qiita_common.backend_failure.FailureKind` (NODE_FAIL, OOM_KILLED, PREEMPTED, TIMEOUT_BEFORE_START, TRANSIENT_FS_ERROR, SLURMRESTD_UNREACHABLE, ORCHESTRATOR_UNREACHABLE, CONTROL_PLANE_UNREACHABLE, PROCESS_RESTARTED, DATA_PLANE_TRANSIENT, EXTERNAL_FETCH_TRANSIENT, SEGFAULT for retriable; BAD_INPUT, EXIT_NONZERO, CONTRACT_VIOLATION, UNKNOWN_PERMANENT, and the runner-raised RESOURCE_CEILING_EXHAUSTED and RETRIES_EXHAUSTED for permanent). The runner collapses these to the two-valued `failure_type` for storage; `work_ticket` has no kind column (the per-attempt kind is stored in `work_ticket_step.failure_kind`), so a `RETRIES_EXHAUSTED` failure is identified by the `retries_exhausted` prefix of its `failure_reason` (`retries_exhausted (3/3); last failure [node_fail]: ...`); other reasons carry per-failure detail for triage.
+Failure classification is finer-grained at the backend layer: `BackendFailure.kind` is one of the values in `qiita_common.backend_failure.FailureKind` (NODE_FAIL, OOM_KILLED, PREEMPTED, TIMEOUT_BEFORE_START, TRANSIENT_FS_ERROR, SLURMRESTD_UNREACHABLE, ORCHESTRATOR_UNREACHABLE, CONTROL_PLANE_UNREACHABLE, PROCESS_RESTARTED, DATA_PLANE_TRANSIENT, EXTERNAL_FETCH_TRANSIENT, SEGFAULT, JOB_PURGED for retriable; BAD_INPUT, EXIT_NONZERO, CONTRACT_VIOLATION, UNKNOWN_PERMANENT, and the runner-raised RESOURCE_CEILING_EXHAUSTED and RETRIES_EXHAUSTED for permanent). The runner collapses these to the two-valued `failure_type` for storage; `work_ticket` has no kind column (the per-attempt kind is stored in `work_ticket_step.failure_kind`), so a `RETRIES_EXHAUSTED` failure is identified by the `retries_exhausted` prefix of its `failure_reason` (`retries_exhausted (3/3); last failure [node_fail]: ...`); other reasons carry per-failure detail for triage.
 
 Retry semantics (implemented in `qiita_control_plane.runner._run_entry_with_retry`):
 - On `BackendFailure(transient=True)` and `retry_count < max_retries`: bump `retry_count`, atomically transition `PROCESSING → QUEUED → PROCESSING`, retry the same entry. Earlier successful entries are not re-run — `bound` outputs carry forward.
@@ -168,7 +168,7 @@ completed (rebuilding their `bound` outputs from the shared workspace),
 re-attaches a still-running SLURM job by its persisted `slurm_job_id` (or
 adopts an orphan by its deterministic name via `find-by-name`), finalizes a
 job that succeeded during the outage, and decides a purged job from its
-on-disk output manifest. The startup hook then calls `reconcile_follow_ons`,
+on-disk output manifest, or from its stderr when there is none. The startup hook then calls `reconcile_follow_ons`,
 which submits the follow-on of every completed ticket that records no outcome
 (one that completed while no process ran its completion hook, or whose
 submission failed with anything but a refusal). The same reconcile then runs on

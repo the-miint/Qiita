@@ -28,6 +28,7 @@ from qiita_common.models import (
     StepStatusWire,
     WorkTicketFailureStage,
 )
+from qiita_common.models.step import PURGED_RAW_STATE
 
 import qiita_control_plane.runner as _runner_pkg
 
@@ -1004,8 +1005,9 @@ async def _poll_until_terminal(
     then lives only on the shared filesystem, so we hand back a synthesized
     COMPLETED status: the caller's `result_step` runs verify + parse against
     the output manifest, which decides it — a valid manifest yields the
-    outputs (completed), a missing / broken one raises CONTRACT_VIOLATION
-    (failed). This is the filesystem tiebreaker. Records the running
+    outputs (completed), a broken one raises CONTRACT_VIOLATION (failed), and
+    a missing one is classified from the job's stderr. This is the filesystem
+    tiebreaker. Records the running
     transition once, the first time the job is observed on a node."""
     recorded_running = False
     n = 0
@@ -1033,7 +1035,7 @@ async def _poll_until_terminal(
             )
             return StepStatusWire(
                 status=StepStatus.COMPLETED,
-                raw_state="PURGED",
+                raw_state=PURGED_RAW_STATE,
                 reason=f"slurmrestd no longer has the job ({exc.kind.value}); "
                 "deciding from filesystem",
             )

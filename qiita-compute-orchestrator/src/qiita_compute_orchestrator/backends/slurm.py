@@ -37,6 +37,7 @@ from qiita_common.models import (
     WorkTicketFailureStage,
     check_derived_inputs,
 )
+from qiita_common.models.step import PURGED_RAW_STATE
 
 from ..backend import (
     ComputeBackend,
@@ -74,7 +75,7 @@ _log = logging.getLogger(__name__)
 # exceeds walltime, which usually indicates a too-tight allocation —
 # a retry on a less-loaded node may finish in time, and operators can
 # raise the action's walltime ceiling if the pattern persists.
-_STATE_TO_FAILURE_KIND: dict[TerminalSlurmState, FailureKind] = {
+_STATE_TO_FAILURE_KIND: dict[str, FailureKind] = {
     TerminalSlurmState.FAILED: FailureKind.EXIT_NONZERO,
     TerminalSlurmState.CANCELLED: FailureKind.EXIT_NONZERO,
     TerminalSlurmState.DEADLINE: FailureKind.EXIT_NONZERO,
@@ -84,6 +85,7 @@ _STATE_TO_FAILURE_KIND: dict[TerminalSlurmState, FailureKind] = {
     TerminalSlurmState.OUT_OF_MEMORY: FailureKind.OOM_KILLED,
     TerminalSlurmState.PREEMPTED: FailureKind.PREEMPTED,
     TerminalSlurmState.TIMEOUT: FailureKind.TIMEOUT_BEFORE_START,
+    PURGED_RAW_STATE: FailureKind.JOB_PURGED,
 }
 
 # Generic failure kinds an OOM stderr signature is allowed to upgrade to
@@ -93,7 +95,7 @@ _STATE_TO_FAILURE_KIND: dict[TerminalSlurmState, FailureKind] = {
 # kind (NODE_FAIL / TIMEOUT / PREEMPTED) — those are already correct from the
 # SLURM state and must not be downgraded.
 _OOM_UPGRADABLE_KINDS: frozenset[FailureKind] = frozenset(
-    {FailureKind.EXIT_NONZERO, FailureKind.UNKNOWN_PERMANENT}
+    {FailureKind.EXIT_NONZERO, FailureKind.UNKNOWN_PERMANENT, FailureKind.JOB_PURGED}
 )
 
 # The job's exit status when its child process is killed by SIGSEGV.
@@ -105,6 +107,15 @@ _SEGFAULT_EXIT_CODE = 128 + signal.SIGSEGV
 # `qiita ticket status`; the fuller tail is available via `qiita ticket logs`.
 _FAILURE_REASON_TAIL_LINES = 15
 _FAILURE_REASON_TAIL_BYTES = 2048
+
+
+def _scan_slurm_kill_state(stderr_tail: str) -> TerminalSlurmState | None:
+    """The state a slurmstepd kill line in `stderr_tail` names, else None."""
+    if "DUE TO TIME LIMIT" in stderr_tail:
+        return TerminalSlurmState.TIMEOUT
+    if "CANCELLED AT" in stderr_tail:
+        return TerminalSlurmState.CANCELLED
+    return None
 
 
 class SlurmBackend(ComputeBackend):
@@ -577,6 +588,21 @@ class SlurmBackend(ComputeBackend):
         single home for the post-poll terminal logic, called by the runner
         once `status_step` reports the job terminal."""
         self._require_slurm_handle(handle)
+        if (
+            status.status == StepStatus.COMPLETED
+            and status.raw_state == PURGED_RAW_STATE
+            and not (handle.output_path / "manifest.json").exists()
+        ):
+            stderr_tail, _ = read_text_tail(
+                handle.logs_path / "stderr",
+                max_lines=_FAILURE_REASON_TAIL_LINES,
+                max_bytes=_FAILURE_REASON_TAIL_BYTES,
+            )
+            status = StepStatusInfo(
+                status=StepStatus.FAILED,
+                raw_state=_scan_slurm_kill_state(stderr_tail) or PURGED_RAW_STATE,
+                reason=status.reason,
+            )
         if status.status == StepStatus.COMPLETED:
             failures = verify_container_output(handle.output_path, recovered=status.recovered)
             if failures:
