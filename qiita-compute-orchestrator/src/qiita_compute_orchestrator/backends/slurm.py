@@ -111,7 +111,7 @@ _FAILURE_REASON_TAIL_BYTES = 2048
 
 
 _KILL_LINE_RE = re.compile(
-    r"^(?:\[[^\]]+\]|slurmstepd:) error: \*\*\* JOB \d+ ON \S+ CANCELLED AT \S+ "
+    r"^\[[^\]]+\] error: \*\*\* JOB \d+ ON \S+ CANCELLED AT \S+ "
     r"DUE (?P<cause>TO TIME LIMIT|to SIGNAL \w+) \*\*\*\s*$",
     re.MULTILINE,
 )
