@@ -68,6 +68,8 @@ _KEY_CP = "cp"
 _KEY_CO = "co"
 _KEY_DP = "dp"
 
+_DP_WAIT_LOG_EVERY_SECONDS = 30.0
+
 
 _logger = logging.getLogger(__name__)
 
@@ -247,7 +249,7 @@ async def _probe_co(url: str | None) -> HealthStatus:
     return HealthStatus.DEGRADED
 
 
-async def _probe_dp(url: str) -> HealthStatus:
+async def _probe_dp(url: str, *, log_failures: bool = True) -> HealthStatus:
     """gRPC `grpc.health.v1.Health/Check` against the data plane.
 
     `data_plane_url` is non-Optional in `Settings` with a default of
@@ -261,6 +263,7 @@ async def _probe_dp(url: str) -> HealthStatus:
     Rejects `grpcs://` explicitly rather than silently downgrading
     to plaintext. TLS for the DP is terminated at nginx in the
     production deploy; a direct TLS dial isn't a supported path here.
+    `log_failures=False` silences the per-probe warning for polling callers.
     """
     if url.startswith("grpcs://"):
         raise ValueError(
@@ -277,8 +280,24 @@ async def _probe_dp(url: str) -> HealthStatus:
                 timeout=_PROBE_TIMEOUT_SECONDS,
             )
     except Exception:
-        _logger.warning("CP /health probe (dp) failed", exc_info=True)
+        if log_failures:
+            _logger.warning("CP /health probe (dp) failed", exc_info=True)
         return HealthStatus.UNREACHABLE
     if response.status == health_pb2.HealthCheckResponse.SERVING:
         return HealthStatus.OK
     return HealthStatus.DEGRADED
+
+
+async def wait_for_data_plane(url: str, *, interval_seconds: float) -> None:
+    """Poll the data plane until it reports SERVING; DEGRADED counts as not ready.
+
+    No deadline: the caller cancels it. Logs one warning per
+    `_DP_WAIT_LOG_EVERY_SECONDS` while waiting.
+    """
+    last_logged = time.monotonic()
+    while (status := await _probe_dp(url, log_failures=False)) != HealthStatus.OK:
+        if time.monotonic() - last_logged >= _DP_WAIT_LOG_EVERY_SECONDS:
+            _logger.warning("waiting for the data plane at %s (last status: %s)", url, status.value)
+            last_logged = time.monotonic()
+        await asyncio.sleep(interval_seconds)
+    _logger.info("data plane at %s is ready", url)

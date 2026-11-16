@@ -9,6 +9,7 @@ without actually executing a workflow.
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import json
 import logging
@@ -3173,10 +3174,21 @@ async def test_reconcile_schedules_resume_for_non_terminal_only(
             "schedule_dispatch",
             lambda app, idx, **kw: scheduled.append((idx, kw)),
         )
+
+        async def _dp_ready(*_a, **_kw):
+            return None
+
+        monkeypatch.setattr(dispatch, "wait_for_data_plane", _dp_ready)
         app = SimpleNamespace(
-            state=SimpleNamespace(pool=postgres_pool, compute_backend_client=object())
+            state=SimpleNamespace(
+                pool=postgres_pool,
+                compute_backend_client=object(),
+                settings=SimpleNamespace(data_plane_url="grpc://unused"),
+                running_dispatches=set(),
+            )
         )
         count = await dispatch.reconcile_inflight_tickets(app)
+        await asyncio.gather(*app.state.running_dispatches)
 
         scheduled_idxs = {idx for idx, _ in scheduled}
         # Every non-terminal ticket scheduled for resume.

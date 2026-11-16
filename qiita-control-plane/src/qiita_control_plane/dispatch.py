@@ -38,6 +38,7 @@ from qiita_common.models import NON_TERMINAL_WORK_TICKET_STATES
 
 from .fanout_dispatch import cohort_for_work_ticket, held_cohorts, top_up_dispatch
 from .follow_on import submit_follow_on
+from .health import wait_for_data_plane
 from .runner import run_workflow
 
 if TYPE_CHECKING:
@@ -61,6 +62,8 @@ _log = logging.getLogger(__name__)
 # — its children queue for these same shared slots. What a slot covers, and the
 # workflow cap that follows from it, is documented on `schedule_dispatch`.
 _DISPATCH_CONCURRENCY = 8
+
+_DP_WAIT_INTERVAL_SECONDS = 2.0
 
 
 def build_dispatch_semaphore() -> asyncio.Semaphore:
@@ -313,6 +316,9 @@ async def reconcile_inflight_tickets(app: FastAPI) -> int:
     needs fencing (owner column or advisory lock) before that assumption can be
     lifted; see docs/architecture/processing.md "Work Ticket Lifecycle".
 
+    The resume runs in a background task that first waits for the data plane to
+    answer, so a CP that starts before it doesn't fail every ticket at submission.
+
     Returns the number of tickets scheduled for resume, for logging.
     """
     idxs = await _inflight_ticket_idxs(app.state.pool)
@@ -335,28 +341,40 @@ async def reconcile_inflight_tickets(app: FastAPI) -> int:
             len(cohorts),
         )
         return 0
-    if idxs:
-        _log.warning(
-            "resuming %d in-flight work_ticket(s) at startup: %s",
-            len(idxs),
-            idxs,
-        )
-        for idx in idxs:
-            schedule_dispatch(app, idx, resume=True)
-    if cohorts:
-        # Fail-stop + slot counting apply inside the pump, so this re-pump never
-        # over-releases past the cap; it just refills freed slots.
-        _log.warning("re-pumping %d held fan-out cohort(s) at startup", len(cohorts))
-        for cohort in cohorts:
-            try:
-                await top_up_dispatch(
-                    app.state.pool,
-                    cohort,
-                    max_inflight=app.state.settings.fanout_max_inflight,
-                    dispatch_cb=lambda idx: schedule_dispatch(app, idx),
+
+    async def _resume_once_data_plane_is_up() -> None:
+        try:
+            await wait_for_data_plane(
+                app.state.settings.data_plane_url, interval_seconds=_DP_WAIT_INTERVAL_SECONDS
+            )
+            if idxs:
+                _log.warning(
+                    "resuming %d in-flight work_ticket(s) at startup: %s",
+                    len(idxs),
+                    idxs,
                 )
-            except Exception:
-                _log.exception("startup fan-out pump for cohort %s failed", cohort.label)
+                for idx in idxs:
+                    schedule_dispatch(app, idx, resume=True)
+            if cohorts:
+                # Fail-stop + slot counting apply inside the pump, so this re-pump never
+                # over-releases past the cap; it just refills freed slots.
+                _log.warning("re-pumping %d held fan-out cohort(s) at startup", len(cohorts))
+                for cohort in cohorts:
+                    try:
+                        await top_up_dispatch(
+                            app.state.pool,
+                            cohort,
+                            max_inflight=app.state.settings.fanout_max_inflight,
+                            dispatch_cb=lambda idx: schedule_dispatch(app, idx),
+                        )
+                    except Exception:
+                        _log.exception("startup fan-out pump for cohort %s failed", cohort.label)
+        except Exception:
+            _log.exception("startup resume of in-flight work_ticket(s) failed")
+
+    task = asyncio.create_task(_resume_once_data_plane_is_up(), name="reconcile_inflight_tickets")
+    app.state.running_dispatches.add(task)
+    task.add_done_callback(app.state.running_dispatches.discard)
     return len(idxs)
 
 
