@@ -1351,6 +1351,7 @@ def _build_parser() -> argparse.ArgumentParser:
             " stays reference-only; it is not an error."
         ),
     )
+    _common.add_as_of_event_argument(p_ft_build)
     p_ft_build.add_argument(
         "--include-deprecated",
         action="store_true",

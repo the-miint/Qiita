@@ -197,9 +197,12 @@ def _resolve_definition_group(
     kind: DefinitionKind,
     definition_idx: int,
     prep_sample_idx: list[int],
+    as_of_event: str | None = None,
 ) -> DefinitionGroupResolveResponse:
     """POST /definition-group/resolve: the named definition's group and, per prep_sample,
-    which member it is processed under or why it is not.
+    which member it is processed under or why it is not, under `as_of_event`'s decision
+    set when given. The first chunk's `decisions.decision_set` is sent as `as_of_event`
+    with every later chunk, so all chunks are resolved under one decision set.
 
     The cohort is sent in chunks of at most `_RESOLVE_CHUNK` prep_samples, the route's
     cap, so a cohort over the cap resolves. Only the resolve is chunked: each part's
@@ -215,16 +218,20 @@ def _resolve_definition_group(
     chunks = [
         samples[start : start + _RESOLVE_CHUNK] for start in range(0, len(samples), _RESOLVE_CHUNK)
     ] or [samples]
-    answers = []
+    answers: list[DefinitionGroupResolveResponse] = []
     for chunk in chunks:
         body = DefinitionGroupResolveRequest(
-            definition_kind=kind, definition_idx=definition_idx, prep_sample_idx=chunk
-        ).model_dump(mode="json")
-        answers.append(
-            DefinitionGroupResolveResponse.model_validate(
-                _common.call("POST", base_url, token, path, json=body)
-            )
+            definition_kind=kind,
+            definition_idx=definition_idx,
+            prep_sample_idx=chunk,
+            as_of_event=answers[0].decisions.decision_set if answers else as_of_event,
+        ).model_dump(mode="json", exclude_none=True)
+        answer = DefinitionGroupResolveResponse.model_validate(
+            _common.call("POST", base_url, token, path, json=body)
         )
+        if answer.decisions is None:
+            raise RuntimeError(f"the resolve of {kind.value} {definition_idx} carries no decisions")
+        answers.append(answer)
     groups = {tuple(answer.group) for answer in answers}
     if len(groups) > 1:
         raise RuntimeError(
@@ -235,6 +242,12 @@ def _resolve_definition_group(
     return answers[0].model_copy(
         update={"samples": [entry for answer in answers for entry in answer.samples]}
     )
+
+
+def _pinned(resolution: DefinitionGroupResolveResponse, as_of_event: str | None) -> str | None:
+    """The decision set a build's later resolves and DoGets are sent: the one the anchor
+    resolved under, or `--as-of-event` when the anchor was read exactly (no resolve)."""
+    return as_of_event if resolution.decisions is None else resolution.decisions.decision_set
 
 
 def _fetch_map_parquet(base_url: str, token: str, path: str) -> pa.Table:
@@ -408,9 +421,10 @@ def _create_alignment_doget_ticket(
     prep_sample_idx: list[int],
     columns: tuple[str, ...],
     include_deprecated: bool = False,
+    as_of_event: str | None = None,
 ) -> bytes:
     """Mint the signed DoGet ticket for this alignment slice, returning the decoded
-    ticket bytes.
+    ticket bytes. `as_of_event` is the decision set the route resolves the cohort under.
 
     The human-callable mint: the caller names the alignment and the cohort, and the
     route authorizes every sample per-study before signing — all-or-nothing, never
@@ -431,6 +445,7 @@ def _create_alignment_doget_ticket(
             "prep_sample_idx": prep_sample_idx,
             "columns": list(columns),
             "include_deprecated": include_deprecated,
+            **({} if as_of_event is None else {"as_of_event": as_of_event}),
         },
     )
     return base64.b64decode(resp["ticket"])
@@ -1037,6 +1052,7 @@ def _manifest_payload(
     tools: dict[str, str],
     denovo: dict[str, Any] | None = None,
     left_out: list[dict[str, Any]] | None = None,
+    decisions: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """The bundle's record of what produced the table — the one artifact here that is
     always written, because without it the table is not reproducible.
@@ -1064,10 +1080,15 @@ def _manifest_payload(
     today — `_gate_from_args` is pure and nothing mutates the namespace — but a record of
     which rows were kept has to be the gate that kept them, and "two derivations that
     happen to agree" is the shape that has already produced defects on this branch.
+
+    `decisions` is the reference arm's `DecisionProvenance`, the pair decisions its
+    group was resolved under (the de novo arm is resolved under the same decision set);
+    None when the reference arm was read exactly, without a group.
     """
     return {
         "schema_version": MANIFEST_SCHEMA_VERSION,
         "note": MANIFEST_NOTE,
+        "decisions": decisions,
         "processing": {
             "reference": {
                 "name": reference["name"],
@@ -1518,6 +1539,7 @@ def _resolve_cohort(
             kind=DefinitionKind.ALIGNMENT,
             definition_idx=anchor,
             prep_sample_idx=sorted(listed_under),
+            as_of_event=args.as_of_event,
         ).group
     )
     for pool, listed in per_pool.items():
@@ -1664,6 +1686,7 @@ def _plan_denovo(
     parts: list[_Part],
     cohort: list[int],
     per_pool: dict[tuple[int, int], set[int]],
+    as_of_event: str | None = None,
 ) -> list[_DenovoPart]:
     """The de novo arm's parts: each cohort prep_sample's de novo alignment, resolved in
     `--denovo-alignment-idx`'s group, grouped by alignment in `alignment_idx` order.
@@ -1714,6 +1737,7 @@ def _plan_denovo(
             kind=DefinitionKind.ALIGNMENT,
             definition_idx=anchor,
             prep_sample_idx=cohort,
+            as_of_event=as_of_event,
         )
     resolved: dict[int, int] = {}
     refused: list[SampleResolution] = []
@@ -1737,6 +1761,7 @@ def _plan_denovo(
                     kind=DefinitionKind.MASK,
                     definition_idx=anchor_mask,
                     prep_sample_idx=cohort,
+                    as_of_event=as_of_event,
                 ).group
             )
             if isinstance(anchor_mask, int)
@@ -1825,9 +1850,12 @@ def _run_build(
             kind=DefinitionKind.ALIGNMENT,
             definition_idx=args.alignment_idx,
             prep_sample_idx=resolved_cohort.samples,
+            as_of_event=args.as_of_event,
         ),
         resolved_cohort,
     )
+    # Every later resolve and DoGet of this build reads the anchor's decision set.
+    pinned = _pinned(resolution, args.as_of_event)
     parts = _parts(resolution, listing=listing, reference_idx=reference_idx)
     cohort = [entry.prep_sample_idx for entry in resolution.samples]
 
@@ -1846,6 +1874,7 @@ def _run_build(
             parts=parts,
             cohort=cohort,
             per_pool=per_pool,
+            as_of_event=pinned,
         )
 
     _stage_genome_map(con, _fetch_genome_map(args.base_url, token, reference_idx=reference_idx))
@@ -1999,6 +2028,7 @@ def _run_build(
                 prep_sample_idx=list(part.samples),
                 columns=columns,
                 include_deprecated=args.include_deprecated,
+                as_of_event=pinned,
             ),
             gate=gate,
         )
@@ -2016,6 +2046,7 @@ def _run_build(
                     prep_sample_idx=list(part.samples),
                     columns=ft.ALIGNMENT_COLUMNS,
                     include_deprecated=args.include_deprecated,
+                    as_of_event=pinned,
                 )
                 for part in denovo_parts
             ]
@@ -2099,6 +2130,11 @@ def _run_build(
             files=files,
             tools=tools,
             denovo=_manifest_denovo(requested=requested_denovo, record=denovo_record),
+            decisions=(
+                None
+                if resolution.decisions is None
+                else resolution.decisions.model_dump(mode="json")
+            ),
         ),
         clearances=clearances,
     )

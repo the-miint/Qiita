@@ -24,7 +24,7 @@ import pyarrow as pa
 import pytest
 from qiita_common import analytic as ft
 from qiita_common.hashing import canonical_params_hash
-from qiita_common.models import DefinitionGroupResolveResponse, DefinitionKind
+from qiita_common.models import AS_OF_SCOPE, DefinitionGroupResolveResponse, DefinitionKind
 
 from qiita_control_plane.cli.user import feature_table as ftc
 from qiita_control_plane.cli.user._helpers import _UNSET
@@ -245,6 +245,7 @@ def _namespace(tmp_path, **overrides) -> argparse.Namespace:
         "taxonomy": False,
         "tree": False,
         "include_deprecated": False,
+        "as_of_event": None,
         "output": tmp_path / "table.parquet",
     }
     return argparse.Namespace(**(fields | overrides))
@@ -259,6 +260,17 @@ _UNRESOLVED = {
 }
 
 
+# The decisions block every fake resolve answers with.
+DECISIONS = {
+    "decision_set": "sha256:" + "6" * 64,
+    "newest_event_at": None,
+    "as_of": False,
+    "as_of_scope": AS_OF_SCOPE,
+    "pairs_used": 0,
+    "pairs_used_set": "sha256:" + "7" * 64,
+}
+
+
 def _fake_resolve(rec, *, members=None, groups=None, unprocessed=None):
     """Stands in for POST /definition-group/resolve, keyed `(kind, definition_idx)`.
 
@@ -270,9 +282,10 @@ def _fake_resolve(rec, *, members=None, groups=None, unprocessed=None):
     members, groups, unprocessed = members or {}, groups or {}, unprocessed or {}
     rec["resolve_calls"] = []
 
-    def resolve(base_url, token, *, kind, definition_idx, prep_sample_idx):
+    def resolve(base_url, token, *, kind, definition_idx, prep_sample_idx, as_of_event=None):
         key = (DefinitionKind(kind).value, definition_idx)
         rec["resolve_calls"].append((*key, list(prep_sample_idx)))
+        rec.setdefault("resolve_as_of", []).append(as_of_event)
         samples = []
         for sample in sorted(set(prep_sample_idx)):
             base = {**_UNRESOLVED, "prep_sample_idx": sample, "definition_kind": key[0]}
@@ -287,6 +300,7 @@ def _fake_resolve(rec, *, members=None, groups=None, unprocessed=None):
                 "definition_idx": definition_idx,
                 "group": groups.get(key, [definition_idx]),
                 "samples": samples,
+                "decisions": {**DECISIONS, "as_of": as_of_event is not None},
             }
         )
 
@@ -403,9 +417,17 @@ def _patched(
     )
 
     def _alignment_ticket(
-        base_url, token, *, alignment_idx, prep_sample_idx, columns, include_deprecated=False
+        base_url,
+        token,
+        *,
+        alignment_idx,
+        prep_sample_idx,
+        columns,
+        include_deprecated=False,
+        as_of_event=None,
     ):
         rec.setdefault("flags", []).append(("doget", alignment_idx, include_deprecated))
+        rec.setdefault("doget_as_of", []).append(as_of_event)
         rec["columns"] = list(columns)
         rec["ticket_cohort"] = list(prep_sample_idx)
         return _ALIGNMENT_TICKET
@@ -1598,7 +1620,14 @@ def _patched_combined(monkeypatch, *, denovo_map=None, denovo_alignment=None, re
     # ask for the whole build's samples and still go green, which is exactly the
     # difference between the two drivers this module exists to catch.
     def _alignment_ticket(
-        base_url, token, *, alignment_idx, prep_sample_idx, columns, include_deprecated=False
+        base_url,
+        token,
+        *,
+        alignment_idx,
+        prep_sample_idx,
+        columns,
+        include_deprecated=False,
+        as_of_event=None,
     ):
         rec["arm_tickets"].append(alignment_idx)
         rec["columns"] = list(columns)
@@ -1931,7 +1960,9 @@ def _patched_two_pools(
     rec["events"] = []
     columns_of: dict[int, list[str]] = {}
 
-    def _ticket(b, t, *, alignment_idx, prep_sample_idx, columns, include_deprecated=False):
+    def _ticket(
+        b, t, *, alignment_idx, prep_sample_idx, columns, include_deprecated=False, as_of_event=None
+    ):
         rec["tickets"][alignment_idx] = list(prep_sample_idx)
         rec["events"].append(("minted", alignment_idx))
         columns_of[alignment_idx] = list(columns)
@@ -2089,6 +2120,7 @@ def _resolve_answer(definition_idx, group, samples):
         "definition_kind": "alignment",
         "definition_idx": definition_idx,
         "group": group,
+        "decisions": DECISIONS,
         "samples": [
             {
                 **_UNRESOLVED,
@@ -2141,6 +2173,44 @@ def test_a_group_that_changes_between_resolve_chunks_is_refused(monkeypatch):
             definition_idx=3,
             prep_sample_idx=[1, 2, 3],
         )
+
+
+def test_the_manifest_records_the_decisions_and_the_build_reads_one_decision_set(
+    monkeypatch, tmp_path
+):
+    """Without --as-of-event the anchor resolves under the current decisions, and its
+    decision set is sent with the DoGet; the manifest records the anchor's block."""
+    rec = _patched(monkeypatch)
+    assert ftc._handle_feature_table_build(_namespace(tmp_path), parser=None) == 0
+    assert rec["resolve_as_of"][-1] is None
+    assert set(rec["doget_as_of"]) == {DECISIONS["decision_set"]}
+    assert _manifest(tmp_path)["decisions"] == DECISIONS
+
+
+def test_as_of_event_reaches_every_resolve_and_doget_and_the_manifest(monkeypatch, tmp_path):
+    token = "sha256:" + "8" * 64
+    rec = _patched(monkeypatch)
+    args = _namespace(tmp_path)
+    args.as_of_event = token
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    assert set(rec["resolve_as_of"]) == {token}
+    assert set(rec["doget_as_of"]) == {DECISIONS["decision_set"]}
+    assert _manifest(tmp_path)["decisions"] == {**DECISIONS, "as_of": True}
+
+
+def test_later_resolve_chunks_are_pinned_to_the_first_chunks_decision_set(monkeypatch):
+    monkeypatch.setattr(ftc, "_RESOLVE_CHUNK", 2)
+    sent: list = []
+
+    def call(method, base_url, token, path, json):
+        sent.append(json.get("as_of_event"))
+        return _resolve_answer(3, [3], json["prep_sample_idx"])
+
+    monkeypatch.setattr(ftc._common, "call", call)
+    ftc._resolve_definition_group(
+        "http://cp", "t", kind=DefinitionKind.ALIGNMENT, definition_idx=3, prep_sample_idx=[1, 2, 3]
+    )
+    assert sent == [None, DECISIONS["decision_set"]]
 
 
 def test_the_manifest_records_its_schema_version(monkeypatch, tmp_path):
