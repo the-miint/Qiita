@@ -56,8 +56,6 @@ class DefinitionGroupRefusal(StrEnum):
     DEPRECATED = "deprecated"
 
 
-# A decision-set token: `sha256:` and 64 lowercase hex digits. The canonical form it
-# hashes is stated in `qiita_control_plane.decision_set`.
 # The CLI spelling of the flag every explicit read of a deprecated definition takes;
 # the API field and query parameter are `include_deprecated`.
 INCLUDE_DEPRECATED_FLAG = "--include-deprecated"
@@ -72,6 +70,8 @@ def deprecated_read_refusal(kind: str, idx: int, deprecation_reason: str | None)
     )
 
 
+# A decision-set token: `sha256:` and 64 lowercase hex digits. The canonical form it
+# hashes is stated in `qiita_control_plane.decision_set`.
 DecisionSetToken = Annotated[str, StringConstraints(pattern=r"^sha256:[0-9a-f]{64}$")]
 
 # What `as_of_event` rewinds, stated on every response and manifest that carries it.

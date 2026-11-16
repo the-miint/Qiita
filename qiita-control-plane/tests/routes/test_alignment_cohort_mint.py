@@ -533,7 +533,7 @@ async def _deprecate_alignment(ctx, alignment_idx: int) -> None:
     )
 
 
-def _refused_naming_the_flag(resp) -> None:
+def _refused_naming_the_flag(resp, alignment_idx: int) -> None:
     assert resp.status_code == 409, resp.text
     detail = resp.json()["detail"]
     assert detail["reason"] == "deprecated"
@@ -541,7 +541,7 @@ def _refused_naming_the_flag(resp) -> None:
     assert INCLUDE_DEPRECATED_FLAG in detail["detail"]
     # The same message the feature-table client refuses with.
     assert detail["detail"] == deprecated_read_refusal(
-        "alignment", detail["detail"].split()[1], "aligner build was wrong"
+        "alignment", alignment_idx, "aligner build was wrong"
     )
 
 
@@ -552,7 +552,9 @@ async def test_a_deprecated_alignment_is_refused_without_the_flag_and_read_with_
     await _deprecate_alignment(ctx, seed["align_1"])
     body = {"prep_sample_idx": [seed["ps_a"]], "columns": _COLUMNS}
 
-    _refused_naming_the_flag(await ctx["user"].post(_mint_url(seed["align_1"]), json=body))
+    _refused_naming_the_flag(
+        await ctx["user"].post(_mint_url(seed["align_1"]), json=body), seed["align_1"]
+    )
 
     resp = await ctx["user"].post(
         _mint_url(seed["align_1"]), json={**body, "include_deprecated": True}
@@ -619,7 +621,7 @@ async def test_the_alignment_mints_take_the_flag(ctx, pool_alignment_seed, route
             await ctx["user"].post(route, json={**body, "include_deprecated": True})
         ).json() == (plain.json())
         await _deprecate_alignment(ctx, seed["align_1"])
-        _refused_naming_the_flag(await ctx["user"].post(route, json=body))
+        _refused_naming_the_flag(await ctx["user"].post(route, json=body), seed["align_1"])
         flagged = await ctx["user"].post(route, json={**body, "include_deprecated": True})
         assert flagged.status_code == 201, flagged.text
         assert flagged.json() == plain.json()

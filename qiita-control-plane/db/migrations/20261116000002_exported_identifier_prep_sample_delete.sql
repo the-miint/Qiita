@@ -3,7 +3,7 @@
 -- Deleting a prep_sample (a sequenced-pool delete, or any other path) retires the
 -- `exported_identifier` rows naming it instead of being refused by their FK. The
 -- retired row stays, with its `export_id`, its kind, and the accession and `QB<n>`
--- handle of the deleted prep_sample's biosample. No route resolves a `QM<n>` today;
+-- handle of the deleted prep_sample's biosample. No route resolves a `QM<n>`;
 -- these columns are the record of what a published handle named.
 --
 --   * `prep_sample_idx` becomes nullable and its FK ON DELETE SET NULL, as

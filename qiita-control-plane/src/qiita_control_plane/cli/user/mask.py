@@ -244,10 +244,11 @@ def _fetch_species(
 
 
 # The sidecar written next to every table, in both formats: each sample_id's mask
-# handle, the left-out prep_samples, the deprecated mark and the decisions block. It
-# is the output's record of these, not a stand-in: the BIOM table carries none of
-# them, since miint's BIOM writer has no sample metadata (duckdb-miint#303), and the
-# left-out record and the decisions are not per-sample values in either format.
+# handle, the left-out prep_samples, the deprecated mark and the decisions block. The
+# sidecar is where the output records these values in both formats. miint's BIOM
+# writer writes no sample metadata
+# (https://the-miint.github.io/duckdb-miint/writing/#biom), and the left-out list and
+# the decisions are not per-sample values in either format.
 SYNDNA_SIDECAR_SUFFIX = ".metadata.json"
 SYNDNA_SIDECAR_SCHEMA_VERSION = 1
 
