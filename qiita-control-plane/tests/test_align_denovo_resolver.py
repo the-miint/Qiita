@@ -315,7 +315,7 @@ async def test_a_resume_re_attaches_to_the_ticket_column_instead_of_re_deriving(
 async def test_an_integer_and_a_float_threshold_are_one_identity(sample):
     """The action's `type: number` admits both `1` and `1.0`, and the hash is over
     canonical JSON, which renders them as different strings. Without the coercion the
-    same configuration mints two alignment_idx — and `_assert_params_survive_storage`
+    same configuration mints two alignment_idx — and `assert_params_survive_storage`
     cannot catch it, because an integer round-trips jsonb unchanged."""
     as_int = await _resolve(sample, **{MIN_IDENTITY_BINDING: 1})
     as_float = await _resolve(sample, **{MIN_IDENTITY_BINDING: 1.0})

@@ -73,6 +73,7 @@ from .alignment import add_alignment_parser
 from .auth import _handle_login, _handle_token_revoke_all, _handle_whoami, _token_revoke_all
 from .check_stored_preflights import add_check_stored_preflights_parser
 from .compute_readiness import _DEFAULT_ORCHESTRATOR_VENV, _handle_compute_readiness
+from .definition import add_definition_parser
 from .fanout import add_fanout_parser
 from .force_fail import (
     _FAILURE_STAGE_CHOICES,
@@ -255,6 +256,7 @@ def _build_parser() -> argparse.ArgumentParser:
     add_fanout_parser(sub)
     add_alignment_parser(sub)
     add_pair_parser(sub)
+    add_definition_parser(sub)
 
     p_terminology = sub.add_parser("terminology", help="Terminology release operations")
     p_terminology_sub = p_terminology.add_subparsers(dest="terminology_cmd", required=True)

@@ -371,6 +371,12 @@ detaches its pairs, and is refused while a `similar` pair names it (the trigger
   routes take it shared before reading the pairs that name the definition, so a
   `similar` decision and the deprecation of one of its sides cannot both commit.
   Readers of the groups take no lock: they read one REPEATABLE READ snapshot.
+- **Settings are locked after the mint.** A definition's params, params_hash and
+  workflow / version columns change only through the audited edit
+  (`definition_settings`; migration `20261116000004_definition_settings_lock.sql` lists
+  the columns and the one exception, the mask adapter-hash re-key). The edit takes the
+  group lock exclusive, as a decision does, since the groups are computed from those
+  params.
 - **Decision provenance.** Every resolution records the decision set it was computed
   under (`decision_set`): a content hash of every decided pair's verdict, replayed from
   `qiita.definition_pair_event` in the resolution's snapshot, so no pair or event idx

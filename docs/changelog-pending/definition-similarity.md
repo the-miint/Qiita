@@ -116,6 +116,17 @@
   deprecation 409 for unfinished work tickets now has the same shape: `reason` is the
   code `live_work` (it was the message), the message moved to `detail`, and
   `work_ticket_idx` is unchanged.
+- **A mask's, alignment's or processing's settings are locked after its mint
+  (#874).** A hand `UPDATE` of its params, params_hash or (for a mask or a processing)
+  workflow and version columns is refused (SQLSTATE 55000); status and deprecation stay
+  editable. `qiita-admin definition edit-settings` (`PATCH
+  /api/v1/admin/definition-settings/{kind}/{idx}`, system_admin with the kind's
+  lifecycle scope) is the one way to change them: it records who, when, the old and new
+  values and a required reason in the append-only `qiita.definition_settings_edit`, is
+  refused while a `similar` pair names the definition, and recomputes the `change` of
+  its pending and not_similar pairs. The mask adapter-hash re-key (the mint's legacy
+  path and `qiita-admin backfill mask-adapter-hash`) passes and is recorded with no
+  actor.
 - **A hand `DELETE` of a mask, alignment or processing is refused (SQLSTATE 55006)
   while a `similar` pair names it (#874);** revoke the pair first. A `pending` or
   `not_similar` pair is detached by the delete. No route deletes these

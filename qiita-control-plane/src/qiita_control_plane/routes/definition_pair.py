@@ -60,14 +60,14 @@ from ._helpers import cap_rows, pair_refused_http, raise_transient_retry
 
 router = APIRouter(prefix=PATH_ADMIN_PREFIX, tags=["definition-pair"])
 
-# The lifecycle scope that governs each kind's pairs.
-_KIND_SCOPE: dict[DefinitionKind, Scope] = {
+# The lifecycle scope that governs each kind's pairs and settings edits.
+KIND_LIFECYCLE_SCOPE: dict[DefinitionKind, Scope] = {
     DefinitionKind.MASK: Scope.MASK_DEFINITION_LIFECYCLE,
     DefinitionKind.ALIGNMENT: Scope.ALIGNMENT_DEFINITION_LIFECYCLE,
     DefinitionKind.PROCESSING: Scope.PROCESSING_LIFECYCLE,
 }
 
-_require_any_lifecycle = require_any_scope(*_KIND_SCOPE.values())
+_require_any_lifecycle = require_any_scope(*KIND_LIFECYCLE_SCOPE.values())
 
 # The list's page size: the default, and the most one request may ask for.
 _PAIR_LIST_DEFAULT_LIMIT = 100
@@ -87,7 +87,7 @@ async def _fetch_pair_for_caller(
     row = await fetch_pair(conn, definition_pair_idx)
     if row is None:
         raise HTTPException(status_code=404, detail=_MSG_PAIR_NOT_FOUND)
-    check_scope(caller, _KIND_SCOPE[DefinitionKind(row["definition_kind"])])
+    check_scope(caller, KIND_LIFECYCLE_SCOPE[DefinitionKind(row["definition_kind"])])
     return row
 
 
@@ -109,10 +109,10 @@ async def list_definition_pair_route(
     holds. `next_after_definition_pair_idx` is the cursor for the next page, None on
     the last."""
     if definition_kind is not None:
-        check_scope(principal, _KIND_SCOPE[definition_kind])
+        check_scope(principal, KIND_LIFECYCLE_SCOPE[definition_kind])
         kinds = [definition_kind]
     else:
-        kinds = [k for k, scope in _KIND_SCOPE.items() if principal.has_scope(scope)]
+        kinds = [k for k, scope in KIND_LIFECYCLE_SCOPE.items() if principal.has_scope(scope)]
     rows, more = cap_rows(
         await list_pairs(
             pool,
@@ -142,7 +142,7 @@ async def open_definition_pair_route(
     """Open a pending pair of two definitions of one kind (201), or return the pair
     already recorded for them (200). Refused (409) across comparison scopes and when
     the two have the same params; 404 when a definition does not exist."""
-    check_scope(caller, _KIND_SCOPE[body.definition_kind])
+    check_scope(caller, KIND_LIFECYCLE_SCOPE[body.definition_kind])
     try:
         async with tx() as conn:
             row, created = await open_pair(

@@ -47,8 +47,8 @@ CREATE TABLE qiita.definition_pair (
     detached_at         TIMESTAMPTZ,
 
     -- {JSON Pointer param path: [low value, high value]} over the two stored params,
-    -- computed when the pair is opened. Params never change after a mint, so it is
-    -- not recomputed.
+    -- computed when the pair is opened, and recomputed by an audited edit of either
+    -- definition's settings (qiita_control_plane.definition_settings).
     change              JSONB   NOT NULL CHECK (jsonb_typeof(change) = 'object'),
     -- True when every changed path is an upstream reference (a mask_idx, or a de novo
     -- alignment's processing_idx); definition_similarity says what that allows.

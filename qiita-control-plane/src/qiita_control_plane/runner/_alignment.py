@@ -139,7 +139,7 @@ def _build_denovo_alignment_params(
     admits both `1` and `1.0`, and `type: integer` admits `42.0` as well — it matches
     any number with a zero fractional part, so `{"minimum": 1, "type": "integer"}`
     validates a float. `json.dumps` renders each pair as two different strings, so one
-    config would take two alignment_idx. `_assert_params_survive_storage` cannot catch
+    config would take two alignment_idx. `assert_params_survive_storage` cannot catch
     it: `42.0` round-trips jsonb unchanged, hashing the same before and after.
 
     **This key set is disjoint from the block path's** (`align_planner` hashes

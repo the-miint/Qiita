@@ -96,7 +96,7 @@ class ParamsDoNotSurviveStorageError(RuntimeError):
     """
 
 
-async def _assert_params_survive_storage(
+async def assert_params_survive_storage(
     conn: asyncpg.Connection, params: dict, params_hash: bytes
 ) -> None:
     """Refuse `params` whose canonical hash changes across a jsonb round trip.
@@ -109,7 +109,7 @@ async def _assert_params_survive_storage(
     stored = await conn.fetchval("SELECT ($1::jsonb)::text", json.dumps(params))
     if canonical_params_hash(json.loads(stored)) != params_hash:
         raise ParamsDoNotSurviveStorageError(
-            f"these alignment params do not survive jsonb storage unchanged: stored as "
+            f"these params do not survive jsonb storage unchanged: stored as "
             f"{stored!r}, which no longer hashes to the digest computed for them. See "
             f"ParamsDoNotSurviveStorageError."
         )
@@ -145,7 +145,7 @@ async def mint_alignment_definition(
     statement, so Postgres wraps it in one transaction either way.
     """
     params_hash = canonical_params_hash(params)
-    await _assert_params_survive_storage(conn, params, params_hash)
+    await assert_params_survive_storage(conn, params, params_hash)
     # asyncpg encodes a dict bound to a jsonb parameter via the JSON codec; pass
     # the serialized string explicitly so the behaviour is independent of
     # whether a JSON codec is registered on the connection.

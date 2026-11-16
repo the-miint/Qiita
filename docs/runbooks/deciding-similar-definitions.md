@@ -145,3 +145,23 @@ refused (SQLSTATE 55006, naming the pair idxs) while a `similar` pair names the
 definition: revoke the pair first. Its other pairs (`pending`, `not_similar`, or
 revoked to `pending`) are left `detached`: they keep their ids and history, link
 nothing, and can no longer be decided or revoked.
+
+## 6. Correct a definition's settings
+
+A mask's, alignment's or processing's params (and params_hash, and a mask's or a
+processing's workflow and version columns) are locked once it is minted: a hand
+`UPDATE` of them is refused (SQLSTATE 55000). A system_admin with the kind's lifecycle
+scope corrects them with:
+
+```bash
+qiita-admin definition edit-settings mask 12 --params-file mask-12.json \
+    --reason "rype threshold was minted as 0.5, the run used 0.05"
+```
+
+`mask-12.json` holds the whole new params; params_hash is recomputed from it. The edit
+is recorded in `qiita.definition_settings_edit` with the old and new values, who made it
+and the reason. It is refused while a `similar` pair names the definition (revoke it
+first), when another definition already has those params, and when it changes nothing.
+The `change` of each `pending` or `not_similar` pair naming the definition is recomputed
+from the new params; their verdicts stay. A manifest or export built before the edit
+cites the old params_hash.

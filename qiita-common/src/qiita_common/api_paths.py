@@ -746,6 +746,9 @@ PATH_ADMIN_DEFINITION_PAIR = "/definition-pair"
 PATH_ADMIN_DEFINITION_PAIR_BY_IDX = "/definition-pair/{definition_pair_idx}"
 PATH_ADMIN_DEFINITION_PAIR_DECISION = "/definition-pair/{definition_pair_idx}/decision"
 PATH_ADMIN_DEFINITION_PAIR_REVOKE = "/definition-pair/{definition_pair_idx}/revoke"
+# The audited edit of a definition's locked settings (system_admin, the kind's
+# lifecycle scope): PATCH.
+PATH_ADMIN_DEFINITION_SETTINGS = "/definition-settings/{definition_kind}/{definition_idx}"
 
 URL_ADMIN_PREFIX = f"{API_PREFIX}{PATH_ADMIN_PREFIX}"
 URL_ADMIN_SERVICE_ACCOUNT = f"{URL_ADMIN_PREFIX}{PATH_ADMIN_SERVICE_ACCOUNT}"
@@ -766,6 +769,7 @@ URL_ADMIN_DEFINITION_PAIR = f"{URL_ADMIN_PREFIX}{PATH_ADMIN_DEFINITION_PAIR}"
 URL_ADMIN_DEFINITION_PAIR_BY_IDX = f"{URL_ADMIN_PREFIX}{PATH_ADMIN_DEFINITION_PAIR_BY_IDX}"
 URL_ADMIN_DEFINITION_PAIR_DECISION = f"{URL_ADMIN_PREFIX}{PATH_ADMIN_DEFINITION_PAIR_DECISION}"
 URL_ADMIN_DEFINITION_PAIR_REVOKE = f"{URL_ADMIN_PREFIX}{PATH_ADMIN_DEFINITION_PAIR_REVOKE}"
+URL_ADMIN_DEFINITION_SETTINGS = f"{URL_ADMIN_PREFIX}{PATH_ADMIN_DEFINITION_SETTINGS}"
 
 
 # =============================================================================

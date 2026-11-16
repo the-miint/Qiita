@@ -173,6 +173,9 @@ from qiita_common.models.definition_pair import (
     DefinitionPairRefusal,
     DefinitionPairRevokeRequest,
     DefinitionPairVerdict,
+    DefinitionSettingsEdit,
+    DefinitionSettingsEditRequest,
+    DefinitionSettingsRefusal,
     DeprecationRefusal,
 )
 from qiita_common.models.ena import (
@@ -617,6 +620,9 @@ __all__ = [
     "DeprecationRefusal",
     "DefinitionPairRevokeRequest",
     "DefinitionPairVerdict",
+    "DefinitionSettingsEdit",
+    "DefinitionSettingsEditRequest",
+    "DefinitionSettingsRefusal",
     # Definition groups.
     "DefinitionGroupRefusal",
     "AS_OF_SCOPE",

@@ -188,3 +188,46 @@ class DefinitionPairListResponse(BaseModel):
     pairs: list[DefinitionPair]
     count: int
     next_after_definition_pair_idx: Annotated[int | None, Field(default=None, gt=0)] = None
+
+
+class DefinitionSettingsRefusal(StrEnum):
+    """The `reason` code of a 409 refusing an edit of a definition's settings that is
+    not a pair rule's (those carry a `DefinitionPairRefusal`). Raised in
+    `qiita_control_plane.definition_settings`."""
+
+    # Another definition of the kind already has the edited params (its params_hash).
+    PARAMS_TAKEN = "params_taken"
+    # The edit changes no locked column.
+    NO_CHANGE = "no_change"
+
+
+class DefinitionSettingsEditRequest(BaseModel):
+    """Body for PATCH /api/v1/admin/definition-settings/{definition_kind}/{definition_idx}:
+    the definition's new `params` (stored whole, params_hash recomputed from it), and for
+    a mask or a processing its workflow and version columns when they change (unchanged
+    when omitted; an alignment has none). `reason` is recorded with the edit."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    params: dict[str, Any]
+    workflow: Annotated[str, Field(min_length=1)] | None = None
+    version: Annotated[str, Field(min_length=1)] | None = None
+    reason: _Reason
+
+
+class DefinitionSettingsEdit(BaseModel):
+    """One recorded edit of a definition's locked settings (`qiita.definition_settings_edit`).
+
+    `old_settings` / `new_settings` map each locked column to its value, params_hash as
+    `\\x<hex>`. `repaired_pair_idx` names the pending and not_similar pairs whose
+    `change` and `derived_only` were recomputed from the new params."""
+
+    definition_settings_edit_idx: int
+    definition_kind: DefinitionKind
+    definition_idx: int
+    actor_principal_idx: int
+    old_settings: dict[str, Any]
+    new_settings: dict[str, Any]
+    reason: str
+    occurred_at: AwareDatetime
+    repaired_pair_idx: list[int]
