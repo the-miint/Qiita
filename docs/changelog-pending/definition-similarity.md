@@ -18,8 +18,9 @@
   `POST /api/v1/exported-processing/mask` and `POST /api/v1/exported-identifier/mask`
   (system_admin, `admin:masked_read_export`).
 - **`qiita-admin masked-read-export` writes `masked-read-export.manifest.json` (#874)**
-  mapping each file to the prep_sample's and the mask's public handles, and refuses to
-  overwrite a file that the manifest records under another mask.
+  mapping each file that it writes, or finds up to date, to the prep_sample's and the
+  mask's public handles, and refuses to overwrite a file that the manifest records
+  under another mask. Runs into one directory merge their entries under a lock.
 
 ### Changed
 

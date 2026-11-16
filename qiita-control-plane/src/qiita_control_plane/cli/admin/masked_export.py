@@ -9,12 +9,15 @@ mask's public handles.
 
 import argparse
 import base64
+import contextlib
+import fcntl
 import itertools
 import json
 import math
 import os
 import re
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -303,9 +306,10 @@ def _count_masked(flight_client, ticket_bytes: bytes) -> int:
 
 # The output directory's record of which prep_sample and which mask each exported file
 # holds, by public handle: `{"files": {<file name>: {"export_id": "QM…",
-# "biosample_accession": …, "export_processing_id": "QP…"}}}`. Rewritten after each
-# prep_sample's files are committed. The overwrite check reads it: a file it names
-# under another mask's handle is never overwritten.
+# "biosample_accession": …, "export_processing_id": "QP…"}}}`. Each prep_sample's entries
+# are merged in after its files are committed, or after its parquet is found up to date,
+# under a lock (`_record_in_export_manifest`). The overwrite check reads it: a file it names under
+# another mask's handle is never overwritten.
 MANIFEST_NAME = "masked-read-export.manifest.json"
 
 
@@ -313,10 +317,12 @@ def _read_export_manifest(output_dir: Path) -> dict[str, dict]:
     """The `files` map of `output_dir`'s manifest, or `{}` when there is none.
     Raises ValueError when the file is not a manifest this command wrote."""
     path = output_dir / MANIFEST_NAME
-    if not path.exists():
+    try:
+        text = path.read_text()
+    except FileNotFoundError:
         return {}
     try:
-        document = json.loads(path.read_text())
+        document = json.loads(text)
     except json.JSONDecodeError as exc:
         raise ValueError(f"{path} is not valid JSON: {exc}") from exc
     files = document.get("files") if isinstance(document, dict) else None
@@ -332,14 +338,37 @@ def _read_export_manifest(output_dir: Path) -> dict[str, dict]:
 
 
 def _write_export_manifest(output_dir: Path, files: dict[str, dict]) -> None:
-    """Replace `output_dir`'s manifest with `files`, through a `.partial` sibling so a
-    reader never sees a half-written one."""
+    """Replace `output_dir`'s manifest with `files`: written to a temporary file of its
+    own in the same directory, flushed to disk, then renamed over the manifest, so a
+    reader sees the old manifest or the new one and never part of one."""
     path = output_dir / MANIFEST_NAME
-    partial = path.with_name(path.name + ".partial")
-    with partial.open("w") as handle:
-        json.dump({"files": dict(sorted(files.items()))}, handle, indent=2, sort_keys=True)
-        handle.write("\n")
-    os.replace(partial, path)
+    fd, partial = tempfile.mkstemp(dir=output_dir, prefix=f".{MANIFEST_NAME}.", suffix=".partial")
+    try:
+        with os.fdopen(fd, "w") as handle:
+            json.dump({"files": dict(sorted(files.items()))}, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(partial, path)
+    except BaseException:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(partial)
+        raise
+
+
+def _record_in_export_manifest(output_dir: Path, entries: dict[str, dict]) -> None:
+    """Merge `entries` into `output_dir`'s manifest. Under an exclusive `flock` on the
+    directory itself, the manifest is re-read, so the entries another run recorded
+    since this one read it are kept, and then replaced (`_write_export_manifest`).
+    The manifest cannot carry the lock: each write replaces it with a new file."""
+    fd = os.open(output_dir, os.O_RDONLY)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        files = _read_export_manifest(output_dir)
+        files.update(entries)
+        _write_export_manifest(output_dir, files)
+    finally:
+        os.close(fd)
 
 
 def _candidate_names(stem: str, fmt: str) -> list[str]:
@@ -349,32 +378,33 @@ def _candidate_names(stem: str, fmt: str) -> list[str]:
     return [name for paired in (False, True) for name in _fastq_names(stem, paired=paired)]
 
 
-def _mint_mask_handles(
+def _mint_mask_handles(base_url: str, token: str, mask_idxs: list[int]) -> dict[int, str]:
+    """Mint (or recover) each mask's public handle (POST /exported-processing/mask).
+    Returns `{mask_idx: export_processing_id}`."""
+    path = f"{PATH_EXPORTED_PROCESSING_PREFIX}{PATH_EXPORTED_PROCESSING_MASK}"
+    return {
+        mask_idx: _common.call("POST", base_url, token, path, json={"mask_idx": mask_idx})[
+            "export_processing_id"
+        ]
+        for mask_idx in sorted(mask_idxs)
+    }
+
+
+def _mint_sample_handles(
     base_url: str, token: str, samples_by_mask: dict[int, list[int]]
-) -> tuple[dict[int, str], dict[int, str]]:
-    """Mint (or recover) each mask's public handle and each prep_sample's under its mask
-    (POST /exported-processing/mask, /exported-identifier/mask). Returns
-    `({mask_idx: export_processing_id}, {prep_sample_idx: export_id})`."""
-    processing_path = f"{PATH_EXPORTED_PROCESSING_PREFIX}{PATH_EXPORTED_PROCESSING_MASK}"
-    identifier_path = f"{PATH_EXPORTED_IDENTIFIER_PREFIX}{PATH_EXPORTED_IDENTIFIER_MASK}"
-    mask_handles: dict[int, str] = {}
-    sample_handles: dict[int, str] = {}
+) -> dict[int, str]:
+    """Mint (or recover) each prep_sample's public handle under its mask
+    (POST /exported-identifier/mask). Returns `{prep_sample_idx: export_id}`."""
+    path = f"{PATH_EXPORTED_IDENTIFIER_PREFIX}{PATH_EXPORTED_IDENTIFIER_MASK}"
+    handles: dict[int, str] = {}
     for mask_idx, preps in sorted(samples_by_mask.items()):
-        body = _common.call("POST", base_url, token, processing_path, json={"mask_idx": mask_idx})
-        mask_handles[mask_idx] = body["export_processing_id"]
         for start in range(0, len(preps), MAX_COHORT_PREP_SAMPLE_IDX):
             chunk = preps[start : start + MAX_COHORT_PREP_SAMPLE_IDX]
             body = _common.call(
-                "POST",
-                base_url,
-                token,
-                identifier_path,
-                json={"mask_idx": mask_idx, "prep_sample_idx": chunk},
+                "POST", base_url, token, path, json={"mask_idx": mask_idx, "prep_sample_idx": chunk}
             )
-            sample_handles.update(
-                {i["prep_sample_idx"]: i["export_id"] for i in body["identifiers"]}
-            )
-    return mask_handles, sample_handles
+            handles.update({i["prep_sample_idx"]: i["export_id"] for i in body["identifiers"]})
+    return handles
 
 
 def _left_out_lines(samples: list[MaskedReadExportSample]) -> list[str]:
@@ -397,18 +427,20 @@ def _handle_masked_read_export(args: argparse.Namespace, parser: argparse.Argume
     reused across every prep_sample) — so a large pool never buffers in memory or on an
     intermediate disk hop. Per-sample writes are atomic and 0600.
 
-    Before any download it mints the public handle of each mask exported from and
-    of each prep_sample under its mask, and after each prep_sample's files are
-    committed it records them in the output directory's manifest (`MANIFEST_NAME`):
-    file name → prep_sample handle, biosample accession, mask handle.
+    Before any download it mints the public handle of each mask exported from and,
+    once past every refusal below, of each prep_sample under its mask. After each
+    prep_sample's files are committed, or its parquet is found up to date, it records
+    them in the output directory's manifest (`MANIFEST_NAME`): file name → prep_sample
+    handle, biosample accession, mask handle.
 
-    Fails loudly (exit 1, nothing written) when:
+    Fails loudly (exit 1, nothing written), in this order, when:
       - a processed prep_sample lacks a usable biosample_accession (missing — not yet
         NCBI-submitted — or outside the safe charset), since the filename needs it;
+      - fastq output: any target file already exists (below);
       - an existing output file is recorded in the manifest under a different mask's
         handle: re-exporting it would replace one mask's reads with another's
-        under the same name;
-      - fastq output: any target file already exists (below).
+        under the same name. This check needs the masks' handles, so a run it
+        refuses has minted those, and no prep_sample handle.
 
     A file that the manifest records under the same mask, or does not record, is
     re-exported idempotently for parquet: skipped when its record count matches the
@@ -509,35 +541,8 @@ def _handle_masked_read_export(args: argparse.Namespace, parser: argparse.Argume
         samples_by_mask.setdefault(s.resolution.definition_idx, []).append(s.prep_sample_idx)
     try:
         recorded = _read_export_manifest(output_dir)
-        mask_handles, sample_handles = _mint_mask_handles(args.base_url, token, samples_by_mask)
-    except httpx.HTTPStatusError as exc:
-        _common.print_http_status_error(exc.response)
-        return 1
-    except httpx.RequestError as exc:
-        _common.print_request_error(exc)
-        return 1
     except (ValueError, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)
-        return 1
-
-    # A file the manifest records under another mask's handle holds that mask's
-    # reads; refuse the whole export before any download rather than replace them.
-    conflicts = sorted(
-        f"{name} (recorded under {recorded[name]['export_processing_id']},"
-        f" now {mask_handles[s.resolution.definition_idx]})"
-        for s in processed
-        for name in _candidate_names(stems[s.prep_sample_idx], args.format)
-        if name in recorded
-        and (output_dir / name).exists()
-        and recorded[name]["export_processing_id"] != mask_handles[s.resolution.definition_idx]
-    )
-    if conflicts:
-        print(
-            f"error: refusing to overwrite {len(conflicts)} file(s) in {output_dir} exported"
-            f" from a different mask: {conflicts}. Export to another --output-dir, or move"
-            " them aside first.",
-            file=sys.stderr,
-        )
         return 1
 
     # fastq output is never overwritten: a gzipped fastq has no cheap footer to
@@ -560,6 +565,47 @@ def _handle_masked_read_export(args: argparse.Namespace, parser: argparse.Argume
                 file=sys.stderr,
             )
             return 1
+
+    # The mask handles come first: the conflict check compares each recorded file's
+    # handle with its mask's. The prep_sample handles, which name prep_samples, are
+    # minted only once the run is past every refusal.
+    try:
+        mask_handles = _mint_mask_handles(args.base_url, token, list(samples_by_mask))
+    except httpx.HTTPStatusError as exc:
+        _common.print_http_status_error(exc.response)
+        return 1
+    except httpx.RequestError as exc:
+        _common.print_request_error(exc)
+        return 1
+
+    # A file the manifest records under another mask's handle holds that mask's
+    # reads; refuse the whole export before any download rather than replace them.
+    conflicts = sorted(
+        f"{name} (recorded under {recorded[name]['export_processing_id']},"
+        f" now {mask_handles[s.resolution.definition_idx]})"
+        for s in processed
+        for name in _candidate_names(stems[s.prep_sample_idx], args.format)
+        if name in recorded
+        and (output_dir / name).exists()
+        and recorded[name]["export_processing_id"] != mask_handles[s.resolution.definition_idx]
+    )
+    if conflicts:
+        print(
+            f"error: refusing to overwrite {len(conflicts)} file(s) in {output_dir} exported"
+            f" from a different mask: {conflicts}. Export to another --output-dir, or move"
+            " them aside first.",
+            file=sys.stderr,
+        )
+        return 1
+
+    try:
+        sample_handles = _mint_sample_handles(args.base_url, token, samples_by_mask)
+    except httpx.HTTPStatusError as exc:
+        _common.print_http_status_error(exc.response)
+        return 1
+    except httpx.RequestError as exc:
+        _common.print_request_error(exc)
+        return 1
 
     # Only the fastq path feeds Flight batches into DuckDB (the miint FORMAT FASTQ
     # writer), which routes a registered pyarrow reader through pyarrow.dataset →
@@ -602,9 +648,9 @@ def _handle_masked_read_export(args: argparse.Namespace, parser: argparse.Argume
             stem = stems[prep]
             mask_idx = s.resolution.definition_idx
 
-            def export_one(prep=prep, stem=stem, mask_idx=mask_idx) -> list[str] | None:
-                """Export one prep_sample and return the names written; None when it
-                was already up to date."""
+            def export_one(prep=prep, stem=stem, mask_idx=mask_idx) -> tuple[list[str], bool]:
+                """Export one prep_sample. Returns its file names and whether they were
+                written (False when its parquet was already up to date)."""
                 # A fresh ticket per attempt: one minted before a long outage may
                 # have expired by the time the data plane is back.
                 ticket_resp = _common.call(
@@ -625,22 +671,21 @@ def _handle_masked_read_export(args: argparse.Namespace, parser: argparse.Argume
                     if target.exists() and _parquet_row_count(target) == _count_masked(
                         flight_client, ticket_bytes
                     ):
-                        return None
+                        return [target.name], False
                 reader = flight_client.do_get(flight.Ticket(ticket_bytes), read_opts).to_reader()
-                return _write_masked_sample(reader, stem, output_dir, args.format, con)
+                return _write_masked_sample(reader, stem, output_dir, args.format, con), True
 
-            written = _with_retry(export_one, prep, args.retry_seconds)
-            if written is None:
+            names, written = _with_retry(export_one, prep, args.retry_seconds)
+            if written:
+                exported += 1
+            else:
                 skipped += 1
-                continue
-            exported += 1
-            for name in written:
-                recorded[name] = {
-                    "export_id": sample_handles[prep],
-                    "biosample_accession": s.biosample_accession,
-                    "export_processing_id": mask_handles[mask_idx],
-                }
-            _write_export_manifest(output_dir, recorded)
+            entry = {
+                "export_id": sample_handles[prep],
+                "biosample_accession": s.biosample_accession,
+                "export_processing_id": mask_handles[mask_idx],
+            }
+            _record_in_export_manifest(output_dir, {name: entry for name in names})
     except httpx.HTTPStatusError as exc:
         _common.print_http_status_error(exc.response)
         return 1

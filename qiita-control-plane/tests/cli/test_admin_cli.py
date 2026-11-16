@@ -1790,20 +1790,30 @@ def _record(out_dir, name, export_processing_id):
 
 
 @pytest.mark.parametrize(
-    ("fmt", "name"),
-    [("parquet", "SAMN_A.5.7.42.parquet"), ("fastq", "SAMN_A.5.7.42.R1.fastq.gz")],
+    ("fmt", "name", "refusal"),
+    [
+        (
+            "parquet",
+            "SAMN_A.5.7.42.parquet",
+            f"SAMN_A.5.7.42.parquet (recorded under QP5, now {_mask_handle(3)})",
+        ),
+        ("fastq", "SAMN_A.5.7.42.R1.fastq.gz", "refusing to overwrite 1 existing fastq file(s)"),
+    ],
 )
 def test_masked_read_export_refuses_a_file_recorded_under_another_mask(
-    monkeypatch, tmp_path, capsys, fmt, name
+    monkeypatch, tmp_path, capsys, fmt, name, refusal
 ):
     """An existing file the manifest records under another mask's handle is never
-    replaced: the whole run is refused before any stream, and nothing changes."""
+    replaced: the whole run is refused before any stream, and nothing changes. No
+    prep_sample handle is minted; parquet mints the masks' handles, which the check
+    compares, and fastq, whose existing file is refused first, mints none."""
     from qiita_control_plane.cli import _common
     from qiita_control_plane.cli import admin as cli
     from qiita_control_plane.cli.admin.masked_export import MANIFEST_NAME
 
     monkeypatch.setenv("QIITA_TOKEN", "qk_admin")
-    monkeypatch.setattr(_common.httpx, "request", _fake_masked_export_http(_GROUP_ROSTER))
+    mints: list = []
+    monkeypatch.setattr(_common.httpx, "request", _fake_masked_export_http(_GROUP_ROSTER, mints))
     fake_cls = _fake_flight_client_class(_group_tables())
     monkeypatch.setattr("pyarrow.flight.FlightClient", fake_cls)
     out_dir = tmp_path / "exp"
@@ -1815,8 +1825,8 @@ def test_masked_read_export_refuses_a_file_recorded_under_another_mask(
     assert cli.main(_export_argv(out_dir, fmt)) == 1
 
     err = capsys.readouterr().err
-    assert "exported from a different mask" in err
-    assert f"{name} (recorded under QP5, now {_mask_handle(3)})" in err
+    assert refusal in err
+    assert [kind for kind, _ in mints] == (["processing", "processing"] if fmt == "parquet" else [])
     assert fake_cls.instances == []
     assert (out_dir / name).read_bytes() == b"from mask 5"
     assert (out_dir / MANIFEST_NAME).read_text() == before
@@ -1865,6 +1875,88 @@ def test_masked_read_export_same_mask_keeps_the_count_rule(monkeypatch, tmp_path
     assert cli.main(_export_argv(out_dir)) == 0
     assert fake_cls.instances[0].do_get_calls == [43]
     assert "exported 1 prep_sample(s) (skipped 1 already up to date)" in capsys.readouterr().out
+
+
+def test_masked_read_export_records_an_up_to_date_file_it_skipped(monkeypatch, tmp_path, capsys):
+    """A parquet that the manifest does not record (one exported before the manifest
+    existed, or before a crash) and whose count matches is skipped, and recorded."""
+    import json as _json
+
+    import pyarrow.parquet as pq
+
+    from qiita_control_plane.cli import _common
+    from qiita_control_plane.cli import admin as cli
+    from qiita_control_plane.cli.admin.masked_export import MANIFEST_NAME
+
+    monkeypatch.setenv("QIITA_TOKEN", "qk_admin")
+    monkeypatch.setattr(_common.httpx, "request", _fake_masked_export_http(_GROUP_ROSTER))
+    tables = _group_tables()
+    fake_cls = _fake_flight_client_class(tables)
+    monkeypatch.setattr("pyarrow.flight.FlightClient", fake_cls)
+    out_dir = tmp_path / "exp"
+    out_dir.mkdir()
+    pq.write_table(tables[42], out_dir / "SAMN_A.5.7.42.parquet")
+
+    assert cli.main(_export_argv(out_dir)) == 0
+    assert fake_cls.instances[0].do_get_calls == [43]
+    assert "(skipped 1 already up to date)" in capsys.readouterr().out
+    files = _json.loads((out_dir / MANIFEST_NAME).read_text())["files"]
+    assert files["SAMN_A.5.7.42.parquet"] == {
+        "export_id": _sample_handle(42),
+        "biosample_accession": "SAMN_A",
+        "export_processing_id": _mask_handle(3),
+    }
+
+
+def test_masked_read_export_manifest_keeps_entries_another_run_recorded(tmp_path):
+    """Each record re-reads the manifest, so an entry that another run wrote after
+    this one started is kept rather than overwritten by this run's copy."""
+    import json as _json
+
+    from qiita_control_plane.cli.admin.masked_export import (
+        MANIFEST_NAME,
+        _read_export_manifest,
+        _record_in_export_manifest,
+    )
+
+    entry = {"export_id": "QM1", "biosample_accession": "SAMN_A", "export_processing_id": "QP3"}
+    _record_in_export_manifest(tmp_path, {"a.parquet": entry})
+    assert _read_export_manifest(tmp_path) == {"a.parquet": entry}
+    # Another run records b; this one, which read the manifest before, then records c.
+    _record_in_export_manifest(tmp_path, {"b.parquet": entry})
+    _record_in_export_manifest(tmp_path, {"c.parquet": entry})
+    files = _json.loads((tmp_path / MANIFEST_NAME).read_text())["files"]
+    assert sorted(files) == ["a.parquet", "b.parquet", "c.parquet"]
+    assert sorted(p.name for p in tmp_path.iterdir()) == [MANIFEST_NAME]
+
+
+def test_masked_read_export_manifest_waits_for_another_runs_lock(tmp_path):
+    """A record waits while another run holds the directory's lock, then merges."""
+    import fcntl
+    import os
+    import threading
+
+    from qiita_control_plane.cli.admin.masked_export import (
+        _read_export_manifest,
+        _record_in_export_manifest,
+    )
+
+    entry = {"export_id": "QM1", "biosample_accession": "SAMN_A", "export_processing_id": "QP3"}
+    held = os.open(tmp_path, os.O_RDONLY)
+    fcntl.flock(held, fcntl.LOCK_EX)
+    try:
+        writer = threading.Thread(
+            target=_record_in_export_manifest, args=(tmp_path, {"a.parquet": entry})
+        )
+        writer.start()
+        writer.join(timeout=0.5)
+        assert writer.is_alive()
+        assert _read_export_manifest(tmp_path) == {}
+    finally:
+        os.close(held)
+    writer.join(timeout=10)
+    assert not writer.is_alive()
+    assert _read_export_manifest(tmp_path) == {"a.parquet": entry}
 
 
 def test_masked_read_export_refuses_an_unreadable_manifest(monkeypatch, tmp_path, capsys):
