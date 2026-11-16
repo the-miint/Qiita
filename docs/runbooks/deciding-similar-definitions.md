@@ -31,7 +31,9 @@ you are deciding on. Two definitions in different comparison scopes (`cross_scop
 or with the same params (`no_difference`) cannot be paired.
 
 A pair with `derived_only: true` changes only upstream references; it can be decided
-`not_similar` only.
+`not_similar` only. So can two masks that count SynDNA against different references,
+or of which only one counts it (`syndna_reference_change`): a group's SynDNA count
+table holds counts against one reference.
 
 ## 2. Decide
 

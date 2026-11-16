@@ -9,6 +9,12 @@
   processings) are grouped without a decision. Every decision and revoke is kept in
   the pair's history. `docs/runbooks/deciding-similar-definitions.md` is the
   procedure.
+- **Two masks that count SynDNA against different references, or of which only one
+  counts it, cannot be decided `similar` (#874)** (409, `syndna_reference_change`);
+  `not_similar` is allowed. The SynDNA count export's 409 for masks of different
+  references now compares the masks that the prep_samples resolved to, whichever
+  member was named, and its 409 for a mask without SynDNA comes after the
+  resolution.
 - **`POST /api/v1/definition-group/resolve` (#874)** reports, per prep_sample, the
   group member that its results are read from (the newest one with a run), or that it
   is `incomplete` or `not_processed`, with the reason. A processing whose runs it

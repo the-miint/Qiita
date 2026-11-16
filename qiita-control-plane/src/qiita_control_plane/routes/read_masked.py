@@ -47,6 +47,7 @@ the data plane's query construction.
 
 import base64
 import json
+from collections.abc import Mapping
 from typing import Annotated
 
 import asyncpg
@@ -396,10 +397,10 @@ async def get_syndna_read_count_route(
     selection is authorized on the prep_samples that it selects, so its 404 / 413 say
     whether the pool has any under the group.
 
-    404 when the mask does not exist or nothing matches; 409 when the named mask, or
-    a member that a prep_sample resolved to, ran without SynDNA or with a different
-    SynDNA reference than the named mask, when no selected prep_sample is processed,
-    or when a processed prep_sample has no counts; 413 above the roster cap. Every
+    404 when the mask does not exist or nothing matches; 409 when no selected
+    prep_sample is processed, when the masks that they resolved to ran without SynDNA
+    or against different references (`syndna_reference_of_resolved`), or when a
+    processed prep_sample has no counts; 413 above the roster cap. Every
     read is one read-only snapshot, so neither a re-mask nor a pair decision landing
     mid-request can mix two states into one table.
     """
@@ -423,11 +424,6 @@ async def get_syndna_read_count_route(
             raise HTTPException(status_code=404, detail=_MSG_MASK_NOT_FOUND)
         group = sorted(groups.group_of(DefinitionKind.MASK, mask_idx))
         references = await fetch_mask_syndna_references(conn, group)
-        reference_idx = references[mask_idx]
-        if reference_idx is None:
-            raise HTTPException(
-                status_code=409, detail=f"mask {mask_idx} ran without SynDNA; it counted nothing"
-            )
         rows = await fetch_syndna_export_roster(
             conn,
             group,
@@ -494,21 +490,7 @@ async def get_syndna_read_count_route(
                     f" mask {mask_idx}'s group: {_describe_left_out(left_out)}"
                 ),
             )
-        differing = {
-            m: references[m]
-            for m in sorted(set(mask_by_sample.values()))
-            if references[m] != reference_idx
-        }
-        if differing:
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    f"selected prep_samples resolve to masks whose SynDNA reference differs"
-                    f" from mask {mask_idx}'s ({reference_idx}):"
-                    f" {', '.join(f'mask {m}: {r}' for m, r in differing.items())}."
-                    " A table holds counts against one reference; narrow the selection"
-                ),
-            )
+        reference_idx = syndna_reference_of_resolved(references, mask_by_sample)
         inserts = await fetch_syndna_inserts(conn, reference_idx)
         stored = await fetch_syndna_read_counts(conn, mask_by_sample)
 
@@ -556,6 +538,40 @@ async def get_syndna_read_count_route(
         ],
         left_out=left_out,
     )
+
+
+def syndna_reference_of_resolved(
+    references: Mapping[int, int | None], mask_by_sample: Mapping[int, int]
+) -> int:
+    """The one SynDNA reference of the masks that the prep_samples resolved to. 409 when
+    they ran without SynDNA, or counted against different references. Masks that differ
+    in SynDNA reference cannot be decided similar (`definition_similarity`), so the
+    second 409 is a guard that a group of one reference never reaches."""
+    by_reference: dict[int | None, list[int]] = {}
+    for m in sorted(set(mask_by_sample.values())):
+        by_reference.setdefault(references[m], []).append(m)
+    if len(by_reference) > 1:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "selected prep_samples resolve to masks that count SynDNA against"
+                " different references: "
+                + ", ".join(
+                    f"masks {masks}: {reference}" for reference, masks in by_reference.items()
+                )
+                + ". A table holds counts against one reference; narrow the selection"
+            ),
+        )
+    (reference_idx,) = by_reference
+    if reference_idx is None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"masks {by_reference[None]}, which the selected prep_samples resolve to, ran"
+                " without SynDNA; they counted nothing"
+            ),
+        )
+    return reference_idx
 
 
 def _describe_left_out(left_out: list[SampleResolution]) -> str:

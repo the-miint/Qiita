@@ -13,9 +13,9 @@ import uuid
 
 import pytest
 from qiita_common.api_paths import URL_MASK_DEFINITION_SYNDNA_READ_COUNT
-from qiita_common.models import DefinitionKind, DefinitionPairVerdict, Tier
+from qiita_common.models import DefinitionKind, DefinitionPairRefusal, DefinitionPairVerdict, Tier
 
-from qiita_control_plane.definition_similarity import decide_pair, open_pair
+from qiita_control_plane.definition_similarity import PairRefused, decide_pair, open_pair
 from qiita_control_plane.testing.db_seeds import (
     cleanup_reference_graph,
     seed_bare_feature,
@@ -250,12 +250,15 @@ async def test_nothing_processed_is_refused_with_the_reasons(ctx):
 
 @pytest.fixture
 async def similar(ctx):
-    """`similar(a, b)` decides two masks similar; the pairs are deleted afterwards."""
+    """`similar(a, b)` decides two masks similar (or `verdict`); the pairs are deleted
+    afterwards."""
     pool = ctx["pool"]
     owner = ctx["admin_session"]["principal_idx"]
     pairs: list[int] = []
 
-    async def _similar(a: int, b: int) -> None:
+    async def _similar(
+        a: int, b: int, verdict: DefinitionPairVerdict = DefinitionPairVerdict.SIMILAR
+    ) -> None:
         async with pool.acquire() as conn, conn.transaction():
             pair, _ = await open_pair(
                 conn, kind=DefinitionKind.MASK, definition_idxs=[a, b], principal_idx=owner
@@ -263,7 +266,7 @@ async def similar(ctx):
             await decide_pair(
                 conn,
                 definition_pair_idx=pair["definition_pair_idx"],
-                verdict=DefinitionPairVerdict.SIMILAR,
+                verdict=verdict,
                 reason="same filter, checked against a mock community",
                 principal_idx=owner,
             )
@@ -303,7 +306,11 @@ async def test_each_sample_is_counted_under_the_mask_it_resolves_to(ctx, similar
 
 
 @pytest.mark.parametrize("other", ["no_syndna", "other_reference"])
-async def test_resolved_masks_with_a_different_syndna_reference_are_refused(ctx, similar, other):
+async def test_masks_with_a_different_syndna_reference_cannot_be_decided_similar(
+    ctx, similar, other
+):
+    """Through the repository's decide, against the masks' stored params; not_similar
+    is still allowed. The export's own reference guard is unit-tested beside the route."""
     if other == "no_syndna":
         other_reference = None
         high = await _seed_syndna_mask(ctx, syndna=False)
@@ -312,15 +319,10 @@ async def test_resolved_masks_with_a_different_syndna_reference_are_refused(ctx,
         high = await _seed_syndna_mask(ctx, reference_idx=other_reference)
     try:
         low = await _seed_syndna_mask(ctx)
-        await similar(low, high)
-        study_idx = await _viewer_study(ctx)
-        await _counted_sample(ctx, mask_idx=low, study_idx=study_idx)
-        await _counted_sample(ctx, mask_idx=high, study_idx=study_idx, counts=None)
-
-        resp = await ctx["user"].get(_url(low), params={"study_idx": study_idx})
-
-        assert resp.status_code == 409, resp.text
-        assert f"mask {high}: {other_reference}" in resp.json()["detail"]
+        with pytest.raises(PairRefused) as ei:
+            await similar(low, high)
+        assert ei.value.reason is DefinitionPairRefusal.SYNDNA_REFERENCE_CHANGE
+        await similar(low, high, DefinitionPairVerdict.NOT_SIMILAR)
     finally:
         if other_reference is not None:
             await cleanup_reference_graph(
@@ -354,8 +356,11 @@ async def test_a_named_sample_not_masked_under_the_mask_is_refused(ctx):
 
 async def test_a_mask_without_syndna_is_refused(ctx):
     mask_idx = await _seed_syndna_mask(ctx, syndna=False)
-    resp = await ctx["wet"].get(_url(mask_idx), params={"study_idx": 1})
+    study_idx = await _viewer_study(ctx)
+    await _counted_sample(ctx, mask_idx=mask_idx, study_idx=study_idx, counts=None)
+    resp = await ctx["user"].get(_url(mask_idx), params={"study_idx": study_idx})
     assert resp.status_code == 409, resp.text
+    assert "without SynDNA" in resp.json()["detail"]
 
 
 async def test_absent_mask_and_empty_selection_404(ctx):

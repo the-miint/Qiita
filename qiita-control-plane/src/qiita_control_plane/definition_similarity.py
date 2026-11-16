@@ -47,10 +47,14 @@ Deprecation does not change membership.
     de novo alignment: workflow, aligner and subject), or between definitions whose
     params do not differ.
   - `detached`: deciding or revoking a pair one of whose definitions was deleted.
-  - `deprecated_side`, `shard_ids_change`, `derived_only`, `upstream_not_grouped`:
-    deciding `similar` when either side is deprecated, when the change includes
-    the reference's shard set, when the pair is derived_only, or (alignment,
-    processing) when its changed upstream references are not already grouped.
+  - `deprecated_side`, `shard_ids_change`, `syndna_reference_change`, `derived_only`,
+    `upstream_not_grouped`: deciding `similar` when either side is deprecated, when
+    the change includes the reference's shard set, when two masks count SynDNA
+    against different references (or one counts it and the other does not: a
+    group's SynDNA table holds counts against one reference), when the pair is
+    derived_only, or (alignment, processing) when its changed upstream references
+    are not already grouped. Alignment and processing params carry no SynDNA
+    reference.
   - `contradiction`: a decide or revoke after which a `not_similar` pair would sit in
     one group that does not today.
   - `relied_on`: a decide or revoke after which an alignment or processing
@@ -93,6 +97,7 @@ from .repositories.definition_pair import (
     record_decision,
     record_revoke,
 )
+from .repositories.mask_definition import RESOLVED_SYNDNA_KEY, SYNDNA_REFERENCE_IDX_KEY
 
 __all__ = [
     "DefinitionNotFound",
@@ -505,6 +510,12 @@ def _refuse_transition(current: Groups, proposed: Groups, *, pair: PairState, ac
         )
 
 
+def _syndna_reference(params: Mapping[str, Any]) -> int | None:
+    """A mask's SynDNA reference_idx, or None when it ran without SynDNA."""
+    resolved = params.get(RESOLVED_SYNDNA_KEY)
+    return resolved.get(SYNDNA_REFERENCE_IDX_KEY) if isinstance(resolved, dict) else None
+
+
 def _refuse_similar(groups: Groups, pair: PairState) -> None:
     deprecated = [
         idx
@@ -525,6 +536,20 @@ def _refuse_similar(groups: Groups, pair: PairState) -> None:
             " never similar",
             definition_pair_idx=[pair.idx],
         )
+    if pair.kind is DefinitionKind.MASK:
+        references = [
+            _syndna_reference(groups.params_of(DefinitionKind.MASK, idx))
+            for idx in (pair.low, pair.high)
+        ]
+        if references[0] != references[1]:
+            raise PairRefused(
+                DefinitionPairRefusal.SYNDNA_REFERENCE_CHANGE,
+                f"pair {pair.idx} counts SynDNA against different references"
+                f" ({references[0]} and {references[1]}; None is no SynDNA); a group's"
+                " SynDNA counts are against one reference, so it can be decided"
+                " not_similar only",
+                definition_pair_idx=[pair.idx],
+            )
     if pair.derived_only:
         raise PairRefused(
             DefinitionPairRefusal.DERIVED_ONLY,

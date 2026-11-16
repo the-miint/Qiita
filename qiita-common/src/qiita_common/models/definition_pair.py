@@ -65,6 +65,7 @@ class DefinitionPairRefusal(StrEnum):
     NO_DIFFERENCE = "no_difference"
     DEPRECATED_SIDE = "deprecated_side"
     SHARD_IDS_CHANGE = "shard_ids_change"
+    SYNDNA_REFERENCE_CHANGE = "syndna_reference_change"
     DERIVED_ONLY = "derived_only"
     UPSTREAM_NOT_GROUPED = "upstream_not_grouped"
     CONTRADICTION = "contradiction"

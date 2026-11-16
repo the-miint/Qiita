@@ -340,7 +340,9 @@ migration `20261113000000_definition_pair.sql`). The procedure is
 
 - **Groups are computed on read.** Nothing stores a group: `definition_similarity`
   derives them from the definitions' params and the live pairs on each call. Its
-  module docstring holds the rules and every refusal.
+  module docstring holds the rules and every refusal, among them that two masks
+  differing in SynDNA reference are never `similar`, so every mask of a group counts
+  SynDNA against one reference.
 - **The resolver** (`definition_resolver`) answers, for each prep_sample, which member
   of a group its results are read from: `processed` under that member, `incomplete`,
   or `not_processed`, with a reason. `POST /definition-group/resolve` exposes it to any

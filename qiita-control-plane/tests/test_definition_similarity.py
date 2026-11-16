@@ -361,6 +361,32 @@ def test_similar_on_a_shard_set_change_is_refused():
     )
 
 
+@pytest.mark.parametrize(
+    ("low_syndna", "high_syndna"),
+    [
+        ({"reference_idx": 7}, {"reference_idx": 8}),
+        ({"reference_idx": 7}, None),
+        (None, {"reference_idx": 8}),
+    ],
+    ids=["two-references", "low-only", "high-only"],
+)
+def test_masks_differing_in_syndna_reference_are_never_similar(low_syndna, high_syndna):
+    defs = [mask(1, resolved_syndna=low_syndna), mask(2, resolved_syndna=high_syndna)]
+    p = pair(defs, MASK, 1, 2)
+    groups = compute_groups(defs, [p])
+    refused(DefinitionPairRefusal.SYNDNA_REFERENCE_CHANGE, check_decision, groups, p, SIMILAR)
+    check_decision(groups, p, NOT_SIMILAR)
+
+
+def test_masks_with_one_syndna_reference_may_be_similar():
+    defs = [
+        mask(1, resolved_syndna={"reference_idx": 7}),
+        mask(2, rype=0.1, resolved_syndna={"reference_idx": 7}),
+    ]
+    p = pair(defs, MASK, 1, 2)
+    check_decision(compute_groups(defs, [p]), p, SIMILAR)
+
+
 def test_a_derived_only_pair_is_decidable_not_similar_only():
     defs = [mask(1), mask(2, rype=0.1), assembly(10, 1), assembly(11, 2)]
     pm = pair(defs, MASK, 1, 2, SIMILAR)
