@@ -18,8 +18,8 @@ ALTER TABLE qiita.work_ticket
     );
 
 COMMENT ON COLUMN qiita.work_ticket.reap_pending_since IS
-    'When the cancel whose reap of this ticket''s SLURM jobs has not succeeded '
-    'started it: set before the scancel, kept when the reap fails or is interrupted, '
+    'When a cancel set this mark, before its scancel of the ticket''s SLURM jobs:'
+    ' set before the scancel, kept when the reap fails or is interrupted, '
     'NULL once a reap succeeds. Each cancel writes its own value, and its outcome '
     'applies only while the value is still its own. A redrive is refused while set.';
 COMMENT ON COLUMN qiita.work_ticket.reap_note IS

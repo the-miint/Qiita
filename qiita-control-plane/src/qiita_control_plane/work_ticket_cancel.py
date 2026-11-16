@@ -92,10 +92,12 @@ async def cancel_work_ticket(
     Raises `WorkTicketNotFound` if the idx does not exist. The flip is a single
     `FOR UPDATE` transaction so a concurrent CP write can't interleave a half-state;
     it also writes this cancel's reap mark (`REAP_IN_FLIGHT`, stamped with
-    `clock_timestamp()`, so two cancels' marks differ even within one transaction's
-    clock). The scancel runs only after that transaction commits (terminal-first), and
-    the reap's outcome is written only while the mark is still this cancel's: a later
-    concurrent cancel's mark is left for its own reap to settle."""
+    `clock_timestamp()`: `now()` returns the transaction's start time,
+    `clock_timestamp()` the statement's, so each cancel's mark is a distinct value
+    that its own outcome write can match). The scancel runs only after that
+    transaction commits (terminal-first), and the reap's outcome is written only while
+    the mark is still this cancel's: a later concurrent cancel's mark is left for its
+    own reap to settle."""
     async with pool.acquire() as conn, conn.transaction():
         row = await conn.fetchrow(
             "SELECT state, failure_type, failure_stage, failure_step_name, failure_reason"

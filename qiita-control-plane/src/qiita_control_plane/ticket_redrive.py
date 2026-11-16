@@ -46,7 +46,7 @@ async def reset_ticket_to_pending(
     """Set the ticket PENDING and clear what its last outcome left on it. Guarded on
     `from_state`, so a ticket that changed state since the caller read it is left
     alone: returns False then, True when the row was updated. Raises `ReapPending`
-    `ReapPending` while a cancel's reap of the ticket has not succeeded, so every
+    while a cancel's reap of the ticket has not succeeded, so every
     redrive path refuses it."""
     require_transaction(conn)
     updated = await conn.fetchval(
