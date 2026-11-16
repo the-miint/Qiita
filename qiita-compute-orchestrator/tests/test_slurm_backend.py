@@ -28,6 +28,7 @@ from qiita_common.models import (
     StepStatus,
     WorkTicketFailureStage,
 )
+from qiita_common.models.step import PURGED_RAW_STATE
 from qiita_common.testing.native_steps import FASTQ_TO_PARQUET_MODULE
 
 from qiita_compute_orchestrator.backend import (
@@ -1163,7 +1164,7 @@ async def _purged_result(jwt_path, tmp_path, stderr, *, manifest=None):
     with pytest.raises((BackendFailure, StepNoData)) as ei:
         await backend.result_step(
             _slurm_handle(tmp_path),
-            StepStatusInfo(status=StepStatus.COMPLETED, raw_state="PURGED"),
+            StepStatusInfo(status=StepStatus.COMPLETED, raw_state=PURGED_RAW_STATE),
         )
     return ei.value
 
@@ -1188,17 +1189,52 @@ async def test_result_step_purged_permanent_launcher_line_stays_permanent(jwt_pa
 
 
 @pytest.mark.asyncio
-async def test_result_step_purged_time_limit_kill_is_timeout(jwt_path, tmp_path):
-    exc = await _purged_result(jwt_path, tmp_path, "working...\n" + _TIME_LIMIT_LINE)
-    assert exc.kind is FailureKind.TIMEOUT_BEFORE_START
-    assert exc.transient is True
+@pytest.mark.parametrize(
+    ("stderr", "kind"),
+    [
+        ("working...\n" + _TIME_LIMIT_LINE, FailureKind.TIMEOUT_BEFORE_START),
+        (_SCANCEL_LINE, FailureKind.EXIT_NONZERO),
+        (
+            "[2026-11-14T10:44:12.003] error: *** JOB 1 ON n CANCELLED AT 2026-11-14T10:44:12 "
+            "DUE TO PREEMPTION ***\n",
+            FailureKind.JOB_PURGED,
+        ),
+        (
+            "[2026-11-14T10:44:12.004] error: *** STEP 2305427.0 ON b-cn-03 CANCELLED AT "
+            "2026-11-14T10:44:12 DUE TO TIME LIMIT ***\n",
+            FailureKind.JOB_PURGED,
+        ),
+        (
+            'echo "*** JOB 1 ON n CANCELLED AT 2026-11-14T10:44:12 DUE TO TIME LIMIT ***"\n',
+            FailureKind.JOB_PURGED,
+        ),
+    ],
+    ids=["time-limit", "scancel", "unknown-cause", "step-line-only", "echoed-output"],
+)
+async def test_result_step_purged_classifies_slurmstepd_kill_line(jwt_path, tmp_path, stderr, kind):
+    exc = await _purged_result(jwt_path, tmp_path, stderr)
+    assert exc.kind is kind
 
 
 @pytest.mark.asyncio
-async def test_result_step_purged_scancel_is_exit_nonzero(jwt_path, tmp_path):
-    exc = await _purged_result(jwt_path, tmp_path, _SCANCEL_LINE)
-    assert exc.kind is FailureKind.EXIT_NONZERO
-    assert exc.transient is False
+async def test_result_step_purged_manifest_stat_error_is_not_absent(
+    jwt_path, tmp_path, monkeypatch
+):
+    real_stat = Path.stat
+
+    def stat(self, *args, **kwargs):
+        if self.name == "manifest.json":
+            raise PermissionError(13, "denied")
+        return real_stat(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", stat)
+    backend = _make_backend(httpx.MockTransport(lambda r: httpx.Response(500)), jwt_path)
+    (tmp_path / "output").mkdir(parents=True)
+    with pytest.raises(PermissionError):
+        await backend.result_step(
+            _slurm_handle(tmp_path),
+            StepStatusInfo(status=StepStatus.COMPLETED, raw_state=PURGED_RAW_STATE),
+        )
 
 
 @pytest.mark.asyncio

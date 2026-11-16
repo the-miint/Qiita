@@ -108,7 +108,7 @@ class FailureKind(StrEnum):
     EXTERNAL_FETCH_TRANSIENT = "external_fetch_transient"
     # A step died on SIGSEGV; it is re-run on the same resources.
     SEGFAULT = "segfault"
-    # slurmrestd purged the job and its stderr names no cause (Python-only).
+    # slurmrestd purged the job and its stderr names no cause.
     JOB_PURGED = "job_purged"
 
     # ---- Permanent: workflow / input / contract issues -------------------

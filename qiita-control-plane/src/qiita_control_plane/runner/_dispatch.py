@@ -1007,8 +1007,8 @@ async def _poll_until_terminal(
     the output manifest, which decides it — a valid manifest yields the
     outputs (completed), a broken one raises CONTRACT_VIOLATION (failed), and
     a missing one is classified from the job's stderr. This is the filesystem
-    tiebreaker. Records the running
-    transition once, the first time the job is observed on a node."""
+    tiebreaker. Records the
+    running transition once, the first time the job is observed on a node."""
     recorded_running = False
     n = 0
     while True:
@@ -1025,10 +1025,10 @@ async def _poll_until_terminal(
                     base=poll_interval_seconds,
                 )
                 continue
-            # Purged job → defer to the on-disk manifest via result_step.
+            # Purged job → defer to the manifest, else the stderr, via result_step.
             _log.warning(
                 "work_ticket %d step %d job unreadable (%s); deciding outcome"
-                " from the output manifest on shared scratch",
+                " from the output manifest or stderr on shared scratch",
                 work_ticket_idx,
                 step_index,
                 exc.kind.value,
