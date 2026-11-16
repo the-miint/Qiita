@@ -7437,7 +7437,9 @@ async def test_a_dispatch_reusing_work_from_before_a_settings_edit_fails_the_tic
     the earlier settings, so the ticket fails as bad submission input before any
     step. An edit before the ticket's creation, a dispatch with no step row (a first
     run, or a rerun-block re-arm, which deletes every row), and a mask adapter-hash
-    re-key each leave it to run."""
+    re-key each pass this `run_workflow` check. This ticket's workflow mints no
+    processing, so a processing ticket's own refusal at the mint is not reached here
+    (`test_a_resume_after_its_processing_was_edited_fails_the_ticket` covers it)."""
     edit_kind, after, kept_step, refused = _EDIT_CASES[case]
     if edit_kind is not DefinitionSettingsEditKind.ADMIN_EDIT and kind is not DefinitionKind.MASK:
         pytest.skip("a re-key is a mask's only")

@@ -155,9 +155,7 @@ async def _mint_processing_idx(
     the processing it recorded on its first attempt. When the mint now resolves to
     another row, the ticket is failed as bad submission input rather than re-recorded,
     whether or not it kept step rows, so no ticket names two processings. Two causes
-    reach it: the recorded processing's settings were edited (which `run_workflow`
-    refuses first when earlier step rows would be reused; without them, this is where
-    an edited processing is refused, unlike a mask or alignment), or the ticket's
+    reach it: the recorded processing's settings were edited, or the ticket's
     params now build differently, e.g. a changed `assembler_default` filling an
     omitted assembler. A new ticket is recorded under the processing
     minted for its own params; the edited row keeps the edited settings. The recorded

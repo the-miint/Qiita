@@ -191,9 +191,8 @@ class DefinitionPairListResponse(BaseModel):
 
 
 class DefinitionSettingsEditKind(StrEnum):
-    """`qiita.definition_settings_edit.edit_kind` (TEXT + CHECK, migration
-    `20261116000004_definition_settings_lock.sql`; out of scope for the enum-parity
-    test)."""
+    """`qiita.definition_settings_edit.edit_kind`. Twin of that column's TEXT + CHECK,
+    not a Postgres ENUM."""
 
     # Written by `qiita.edit_definition_settings`, the system_admin's audited edit.
     ADMIN_EDIT = "admin_edit"

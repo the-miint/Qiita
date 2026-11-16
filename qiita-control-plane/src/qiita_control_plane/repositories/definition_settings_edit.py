@@ -4,12 +4,6 @@ edits (`definition_settings` writes it)."""
 import asyncpg
 from qiita_common.models import DefinitionKind, DefinitionSettingsEditKind
 
-# Only an admin edit counts. A mask re-key (`ADAPTER_HASH_REKEY`) moves
-# `adapter_set_hash` onto another derivation of the same adapter set
-# (`backfill/mask_adapter_hash.py`): the adapters a run filtered with are unchanged,
-# so a re-key does not fail a resume.
-ADMIN_EDIT = DefinitionSettingsEditKind.ADMIN_EDIT
-
 
 async def fetch_settings_edit_since_ticket(
     conn: asyncpg.Pool | asyncpg.Connection, work_ticket_idx: int
@@ -29,7 +23,11 @@ async def fetch_settings_edit_since_ticket(
         " ORDER BY e.occurred_at, e.definition_settings_edit_idx"
         " LIMIT 1",
         work_ticket_idx,
-        ADMIN_EDIT.value,
+        # Only an admin edit counts. A mask re-key (`ADAPTER_HASH_REKEY`) moves
+        # `adapter_set_hash` onto another derivation of the same adapter set
+        # (`backfill/mask_adapter_hash.py`): the adapters a run filtered with are
+        # unchanged, so a re-key does not fail a resume.
+        DefinitionSettingsEditKind.ADMIN_EDIT.value,
         DefinitionKind.MASK.value,
         DefinitionKind.ALIGNMENT.value,
         DefinitionKind.PROCESSING.value,
