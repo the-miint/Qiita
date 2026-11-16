@@ -155,7 +155,10 @@ async def cancel_work_ticket(
     # The reap's outcome replaces this cancel's mark: a failure keeps it with the error,
     # so a redrive refuses it until a reap succeeds (`ticket_redrive.ReapPending`); a
     # reap without error clears it. Guarded on the mark, so it does nothing once a later
-    # cancel has written its own.
+    # cancel has written its own. However the ticket was selected (by idx, or by an
+    # `action_id` filter), the flip above wrote a fresh mark over any earlier one, so a
+    # clean reap here clears a mark an earlier failed cancel left: the reap just run
+    # covers every attempt of the ticket.
     await pool.execute(
         "UPDATE qiita.work_ticket"
         " SET reap_pending_since = CASE WHEN $2::text IS NULL THEN NULL"

@@ -169,7 +169,10 @@
   keeps it with the error, and a cancel interrupted mid-reap leaves it until the next
   cancel's reap clears it. While marked, `/run` and `rerun-block` refuse the ticket
   (409, `reap_pending`, saying whether the reap failed or has not finished, and naming
-  `qiita-admin ticket cancel <idx>` to reap it again).
+  `qiita-admin ticket cancel <idx>` to reap it again). The ticket reads (`GET
+  /api/v1/work-ticket/{idx}`, `GET /api/v1/work-ticket`) return the mark:
+  `reap_pending_since` to every caller who may read the ticket, `reap_note` to a
+  system_admin only.
 - **The definition-group resolver ignores a stale failed ticket (#874):** one created
   before the last change of the prep_sample's gate under that definition, when the
   gate is `completed`, `no_data` or `invalidated`. Withdrawing a run, re-running it

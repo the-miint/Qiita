@@ -14,7 +14,11 @@ import uuid
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
-from qiita_common.api_paths import URL_WORK_TICKET_CANCEL
+from qiita_common.api_paths import (
+    URL_WORK_TICKET_BY_IDX,
+    URL_WORK_TICKET_CANCEL,
+    URL_WORK_TICKET_LIST,
+)
 from qiita_common.auth_constants import Scope, SystemRole
 from qiita_common.models import WorkTicketState
 
@@ -147,6 +151,7 @@ async def ctx(postgres_pool):
         "backend": backend,
         "admin_tok": admin_tok,
         "user_tok": user_tok,
+        "user_idx": user_idx,
         "seed_ticket": seed_ticket,
         "action_id": action_id,
     }
@@ -483,3 +488,39 @@ async def test_a_cancel_whose_reap_succeeds_leaves_no_mark(ctx):
         )
     assert resp.status_code == 200, resp.text
     assert await _reap_mark(ctx["pool"], idx) == (None, None)
+
+
+async def test_the_ticket_reads_show_the_reap_mark_and_its_note_to_a_system_admin_only(ctx):
+    """Every caller who may read the ticket sees `reap_pending_since`; `reap_note`
+    (the orchestrator client's error text) is returned to a system_admin only."""
+    idx = await ctx["seed_ticket"]("processing")
+    ctx["backend"].raise_on = idx
+    admin = {"Authorization": f"Bearer {ctx['admin_tok']}"}
+    user = {"Authorization": f"Bearer {ctx['user_tok']}"}
+    async with _client() as c:
+        resp = await c.post(URL_WORK_TICKET_CANCEL, json={"work_ticket_idxs": [idx]}, headers=admin)
+        assert resp.status_code == 200, resp.text
+        # The originator reads its own ticket; make the regular user the originator.
+        await ctx["pool"].execute(
+            "UPDATE qiita.work_ticket SET originator_principal_idx = $2 WHERE work_ticket_idx = $1",
+            idx,
+            ctx["user_idx"],
+        )
+        url = URL_WORK_TICKET_BY_IDX.format(work_ticket_idx=idx)
+
+        by_admin = (await c.get(url, headers=admin)).json()
+        assert by_admin["reap_pending_since"] is not None
+        assert by_admin["reap_note"] == "RuntimeError: orchestrator unreachable"
+
+        by_user = await c.get(url, headers=user)
+        assert by_user.status_code == 200, by_user.text
+        assert by_user.json()["reap_pending_since"] == by_admin["reap_pending_since"]
+        assert by_user.json()["reap_note"] is None
+
+        listed = await c.get(URL_WORK_TICKET_LIST, headers=user)
+        assert listed.status_code == 200, listed.text
+        [row] = [t for t in listed.json()["tickets"] if t["work_ticket_idx"] == idx]
+        assert (row["reap_pending_since"] is not None, row["reap_note"]) == (True, None)
+        listed = await c.get(URL_WORK_TICKET_LIST, headers=admin, params={"all": "true"})
+        [row] = [t for t in listed.json()["tickets"] if t["work_ticket_idx"] == idx]
+        assert row["reap_note"] == "RuntimeError: orchestrator unreachable"

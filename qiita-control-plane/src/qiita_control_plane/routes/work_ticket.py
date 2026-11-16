@@ -230,7 +230,7 @@ _WORK_TICKET_COLUMNS = (
     " sp.sequencing_run_idx, wt.shard_id, wt.mask_idx,"
     " wt.action_context, wt.state, wt.retry_count, wt.max_retries,"
     " wt.failure_type, wt.failure_stage, wt.failure_step_name, wt.failure_reason,"
-    " wt.transient_reason, wt.transient_since,"
+    " wt.transient_reason, wt.transient_since, wt.reap_pending_since, wt.reap_note,"
     " wt.on_success, wt.follow_on_work_ticket_idx, wt.follow_on_error,"
     " wt.created_at, wt.updated_at"
 )
@@ -344,6 +344,16 @@ def _row_to_work_ticket(row: asyncpg.Record) -> WorkTicket:
     sequenced_pool row — selected upstream so the assembly stays a pure
     transformation."""
     return WorkTicket.model_validate(_shape_work_ticket_columns(dict(row)))
+
+
+def visible_reap_note(ticket: WorkTicket, principal: Principal) -> WorkTicket:
+    """`ticket` with `reap_note` cleared unless `principal` is a system_admin. A failed
+    reap's note is the orchestrator client's exception text, which can name the
+    orchestrator's address and the SLURM error; `reap_pending_since` shows every caller
+    who may read the ticket that a reap is pending."""
+    if ticket.reap_note is None or principal.has_role(SystemRole.SYSTEM_ADMIN):
+        return ticket
+    return ticket.model_copy(update={"reap_note": None})
 
 
 async def fetch_work_ticket(pool: asyncpg.Pool, work_ticket_idx: int) -> WorkTicket | None:
@@ -580,7 +590,7 @@ async def get_work_ticket(
     is_bypass = principal.has_role_at_least(SystemRole.WET_LAB_ADMIN)
     if not (is_originator or is_bypass):
         raise not_found
-    return ticket
+    return visible_reap_note(ticket, principal)
 
 
 @router.get(
@@ -727,7 +737,7 @@ async def list_work_tickets(
     )
     rows, truncated = cap_rows(rows, limit)
     return WorkTicketListResponse(
-        tickets=[_row_to_work_ticket_summary(row) for row in rows],
+        tickets=[visible_reap_note(_row_to_work_ticket_summary(row), principal) for row in rows],
         count=len(rows),
         truncated=truncated,
     )

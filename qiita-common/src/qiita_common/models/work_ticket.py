@@ -331,6 +331,13 @@ class WorkTicket(BaseModel):
     # explainable instead of silent.
     transient_reason: str | None = None
     transient_since: AwareDatetime | None = None
+    # A cancel's reap mark: set while a cancel's reap of the ticket's SLURM jobs has not
+    # succeeded, which blocks a redrive (`qiita.work_ticket.reap_pending_since` says
+    # when it is set and cleared). `reap_note` is the in-flight marker or the reap's
+    # error; the ticket GETs return it to a system_admin only and None to every other
+    # caller (`routes/work_ticket.py`, `visible_reap_note`).
+    reap_pending_since: AwareDatetime | None = None
+    reap_note: str | None = None
     # The follow-on this ticket submits once it COMPLETES, and what became of
     # it: the ticket it created, or why it was refused. Mirrors the
     # qiita.work_ticket columns of the same names.
