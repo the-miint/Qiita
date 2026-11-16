@@ -73,9 +73,10 @@ class SampleResolution(BaseModel):
     otherwise, and None when no member has a run for the prep_sample (`no_run`).
     `mask_idx` is that member's mask, for an alignment or a processing.
     `work_ticket_idx` is the ticket that an `incomplete` prep_sample waits on, when
-    one is known. `upstream_kind` / `upstream_definition_idx` name the upstream
-    definition that an `upstream_*` reason is about: for `upstream_moved`, the one
-    that the prep_sample now resolves to. A `processed` resolution names its member
+    one is known; the resolve route returns it to a system_admin only.
+    `upstream_kind` / `upstream_definition_idx` name the upstream definition that an
+    `upstream_*` reason is about: for `upstream_moved`, the one that the prep_sample
+    now resolves to. A `processed` resolution names its member
     and carries no reason; any other carries a reason."""
 
     prep_sample_idx: Annotated[int, Field(gt=0)]

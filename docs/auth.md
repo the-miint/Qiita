@@ -473,7 +473,7 @@ at all, is in the Scopes and roles section above.
 
 | Route | Method | Notes |
 |---|---|---|
-| `/api/v1/definition-group/resolve` | POST | Body `{definition_kind, definition_idx, prep_sample_idx: [...]}`: the named definition's similarity group and, per prep_sample, `processed` under a member, `incomplete` or `not_processed`, with the reason (`definition_resolver`). `require_human` + `prep_sample:read`, all-or-nothing `Tier.VIEWER` on every study each prep_sample is linked to (`authorize_prep_sample_cohort`); 404 for an unknown definition and 422 for one whose group reads a processing of a workflow whose runs are not read per prep_sample (only `long-read-assembly`'s are), both before the cohort is checked. The response carries internal ids (`definition_idx`, `mask_idx`, `work_ticket_idx`). |
+| `/api/v1/definition-group/resolve` | POST | Body `{definition_kind, definition_idx, prep_sample_idx: [...]}`: the named definition's similarity group and, per prep_sample, `processed` under a member, `incomplete` or `not_processed`, with the reason (`definition_resolver`). `require_human` + `prep_sample:read`, all-or-nothing `Tier.VIEWER` on every study each prep_sample is linked to (`authorize_prep_sample_cohort`); 404 for an unknown definition and 422 for one whose group reads a processing of a workflow whose runs are not read per prep_sample (only `long-read-assembly`'s are), both before the cohort is checked. The response carries internal ids (`definition_idx`, `mask_idx`); each sample's `work_ticket_idx` (the ticket an `incomplete` prep_sample waits on, which may be another principal's block ticket) is returned to a system_admin only and omitted for every other caller. |
 
 ### Exported identifier
 

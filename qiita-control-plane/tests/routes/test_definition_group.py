@@ -295,7 +295,7 @@ async def test_a_covering_align_block_that_is_running_makes_the_sample_incomplet
         mask_idx=w["mask_idx"],
         alignment_idx=w["align_1"],
     )
-    resp = await ctx["user"].post(
+    resp = await ctx["admin"].post(
         URL_DEFINITION_GROUP_RESOLVE,
         json=_body(DefinitionKind.ALIGNMENT, w["align_1"], [w["ps_a"]]),
     )
@@ -305,6 +305,21 @@ async def test_a_covering_align_block_that_is_running_makes_the_sample_incomplet
         INCOMPLETE,
         R.IN_PROGRESS,
         ticket,
+        w["align_1"],
+    )
+
+    # Only a system_admin is told which ticket: it may be another principal's block
+    # ticket covering other studies' samples.
+    resp = await ctx["user"].post(
+        URL_DEFINITION_GROUP_RESOLVE,
+        json=_body(DefinitionKind.ALIGNMENT, w["align_1"], [w["ps_a"]]),
+    )
+    assert resp.status_code == 200, resp.text
+    s = _by_sample(resp)[w["ps_a"]]
+    assert "work_ticket_idx" not in s
+    assert (s["state"], s["reason"], s["definition_idx"]) == (
+        INCOMPLETE,
+        R.IN_PROGRESS,
         w["align_1"],
     )
 
@@ -351,7 +366,7 @@ async def test_a_failed_per_sample_mask_ticket_under_the_newer_mask_is_incomplet
         mask_idx=w["mask_2"],
     )
     body = _body(DefinitionKind.MASK, w["mask_idx"], [w["ps_a"]])
-    resp = await ctx["user"].post(URL_DEFINITION_GROUP_RESOLVE, json=body)
+    resp = await ctx["admin"].post(URL_DEFINITION_GROUP_RESOLVE, json=body)
     assert resp.status_code == 200, resp.text
     s = _by_sample(resp)[w["ps_a"]]
     assert (s["state"], s["reason"], s["work_ticket_idx"], s["definition_idx"]) == (
@@ -403,7 +418,7 @@ async def test_cancelling_a_failed_newest_ticket_over_a_completed_gate_makes_it_
         mask_idx=w["mask_2"],
     )
     body = _body(DefinitionKind.MASK, w["mask_idx"], [w["ps_a"]])
-    s = _by_sample(await ctx["user"].post(URL_DEFINITION_GROUP_RESOLVE, json=body))[w["ps_a"]]
+    s = _by_sample(await ctx["admin"].post(URL_DEFINITION_GROUP_RESOLVE, json=body))[w["ps_a"]]
     assert (s["state"], s["reason"], s["work_ticket_idx"], s["definition_idx"]) == (
         INCOMPLETE,
         R.FAILED,
@@ -456,7 +471,7 @@ async def test_the_redo_sequence_leaves_the_restored_run_processed(
         mask_idx=w["mask_2"],
     )
     body = _body(DefinitionKind.MASK, w["mask_idx"], [w["ps_a"]])
-    s = _by_sample(await ctx["user"].post(URL_DEFINITION_GROUP_RESOLVE, json=body))[w["ps_a"]]
+    s = _by_sample(await ctx["admin"].post(URL_DEFINITION_GROUP_RESOLVE, json=body))[w["ps_a"]]
     assert (s["state"], s["reason"], s["work_ticket_idx"]) == (INCOMPLETE, R.FAILED, rerun)
 
     await _set_mask_sample(ctx, w, MASK_SAMPLE_COMPLETED)
@@ -469,7 +484,7 @@ async def test_the_redo_sequence_leaves_the_restored_run_processed(
         state=WorkTicketState.FAILED,
         mask_idx=w["mask_2"],
     )
-    s = _by_sample(await ctx["user"].post(URL_DEFINITION_GROUP_RESOLVE, json=body))[w["ps_a"]]
+    s = _by_sample(await ctx["admin"].post(URL_DEFINITION_GROUP_RESOLVE, json=body))[w["ps_a"]]
     assert (s["state"], s["reason"], s["work_ticket_idx"]) == (INCOMPLETE, R.FAILED, later)
 
 
@@ -500,7 +515,7 @@ async def test_a_failed_block_ticket_older_than_the_restore_is_stale(
     )
     await _set_mask_sample(ctx, w, MASK_SAMPLE_INVALIDATED)
     await _set_mask_sample(ctx, w, MASK_SAMPLE_COMPLETED)
-    s = _by_sample(await ctx["user"].post(URL_DEFINITION_GROUP_RESOLVE, json=body))[w["ps_a"]]
+    s = _by_sample(await ctx["admin"].post(URL_DEFINITION_GROUP_RESOLVE, json=body))[w["ps_a"]]
     assert (s["state"], s["reason"], s["work_ticket_idx"]) == (INCOMPLETE, R.IN_PROGRESS, running)
 
 
@@ -557,7 +572,7 @@ async def test_an_assembly_ticket_counts_for_the_processing_it_records(
             action_context={"mask_idx": w["mask_idx"]},
             processing_idx=processing_idx,
         )
-        s = _by_sample(await ctx["user"].post(URL_DEFINITION_GROUP_RESOLVE, json=body))[w["ps_a"]]
+        s = _by_sample(await ctx["admin"].post(URL_DEFINITION_GROUP_RESOLVE, json=body))[w["ps_a"]]
         assert (s["state"], s["reason"], s["work_ticket_idx"]) == (
             INCOMPLETE,
             R.IN_PROGRESS,
