@@ -389,3 +389,103 @@ async def test_the_adapter_hash_rekey_passes_and_is_recorded(postgres_pool, defs
         idx,
     )
     assert (row["edit_kind"], row["actor_principal_idx"]) == ("adapter_hash_rekey", None)
+
+
+_TICKET_ACTION = "settings-edit-live-work-probe"
+_TICKET_VERSION = "0.0.0-settings-edit"
+
+
+@pytest.mark.parametrize("kind", list(DefinitionKind))
+async def test_an_edit_is_refused_while_work_runs_under_the_definition(
+    postgres_pool, clients, defs, kind
+):
+    """A pending ticket under the definition refuses the edit (`live_work`); once it
+    is terminal the edit goes through."""
+    from qiita_common.models import ScopeTargetKind, WorkTicketState
+
+    from qiita_control_plane.repositories.block import create_block
+    from qiita_control_plane.testing.db_seeds import (
+        delete_action_if_created,
+        seed_action_if_absent,
+    )
+
+    idx = await defs["make"](kind, threshold=1)
+    created = await seed_action_if_absent(
+        postgres_pool,
+        action_id=_TICKET_ACTION,
+        version=_TICKET_VERSION,
+        target_kind=ScopeTargetKind.BLOCK.value,
+    )
+    async with postgres_pool.acquire() as conn, conn.transaction():
+        block_idx = await create_block(conn)
+    _, col = _TABLE[kind]
+    ticket = await postgres_pool.fetchval(
+        "INSERT INTO qiita.work_ticket (action_id, action_version, originator_principal_idx,"
+        "  scope_target_kind, block_idx, state, " + col + ")"
+        " VALUES ($1, $2, $3, 'block', $4, $5::qiita.work_ticket_state, $6)"
+        " RETURNING work_ticket_idx",
+        _TICKET_ACTION,
+        _TICKET_VERSION,
+        defs["owner"],
+        block_idx,
+        WorkTicketState.PENDING.value,
+        idx,
+    )
+    try:
+        new_params = {**await _params(postgres_pool, kind, idx), "threshold": 2}
+        body = {"params": new_params, "reason": _REASON}
+        resp = await clients["admin"].patch(_url(kind, idx), json=body)
+        assert resp.status_code == 409, resp.text
+        detail = resp.json()["detail"]
+        assert detail["reason"] == DefinitionSettingsRefusal.LIVE_WORK
+        assert str(ticket) in detail["detail"]
+        assert (await _params(postgres_pool, kind, idx))["threshold"] == 1
+
+        await postgres_pool.execute(
+            "UPDATE qiita.work_ticket SET state = 'cancelled' WHERE work_ticket_idx = $1",
+            ticket,
+        )
+        resp = await clients["admin"].patch(_url(kind, idx), json=body)
+        assert resp.status_code == 200, resp.text
+    finally:
+        await postgres_pool.execute(
+            "DELETE FROM qiita.work_ticket WHERE work_ticket_idx = $1", ticket
+        )
+        await postgres_pool.execute("DELETE FROM qiita.block WHERE block_idx = $1", block_idx)
+        await delete_action_if_created(
+            postgres_pool, action_id=_TICKET_ACTION, version=_TICKET_VERSION, created=created
+        )
+
+
+@pytest.mark.parametrize("kind", [DefinitionKind.MASK, DefinitionKind.ALIGNMENT])
+async def test_an_edit_is_refused_while_a_public_handle_cites_the_definition(
+    postgres_pool, clients, defs, kind
+):
+    """A live `QP<n>` naming the definition refuses the edit (`published`); once the
+    handle is retired the edit goes through."""
+    idx = await defs["make"](kind, threshold=1)
+    _, col = _TABLE[kind]
+    handle = await postgres_pool.fetchval(
+        f"INSERT INTO qiita.exported_processing ({col}, created_by_idx) VALUES ($1, $2)"
+        " RETURNING idx",
+        idx,
+        defs["owner"],
+    )
+    try:
+        new_params = {**await _params(postgres_pool, kind, idx), "threshold": 2}
+        body = {"params": new_params, "reason": _REASON}
+        resp = await clients["admin"].patch(_url(kind, idx), json=body)
+        assert resp.status_code == 409, resp.text
+        detail = resp.json()["detail"]
+        assert detail["reason"] == DefinitionSettingsRefusal.PUBLISHED
+        assert "exported_processing" in detail["detail"]
+
+        await postgres_pool.execute(
+            "UPDATE qiita.exported_processing SET retired = true, retired_at = now(),"
+            " retire_reason = 'withdrawn in a test' WHERE idx = $1",
+            handle,
+        )
+        resp = await clients["admin"].patch(_url(kind, idx), json=body)
+        assert resp.status_code == 200, resp.text
+    finally:
+        await postgres_pool.execute("DELETE FROM qiita.exported_processing WHERE idx = $1", handle)

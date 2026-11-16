@@ -139,7 +139,10 @@
   /api/v1/admin/definition-settings/{kind}/{idx}`, system_admin with the kind's
   lifecycle scope) is the one way to change them: it records who, when, the old and new
   values and a required reason in the append-only `qiita.definition_settings_edit`, is
-  refused while a `similar` pair names the definition, and recomputes the `change` of
+  refused (409) while a `similar` pair names the definition (`similar_pairs`), while
+  unfinished work tickets run under it (`live_work`), and while a public handle that is
+  not retired cites it (`published`: a `QP<n>` naming it or a `QM<n>` minted under
+  it), and recomputes the `change` of
   its pending and not_similar pairs. The mask adapter-hash re-key (the mint's legacy
   path and `qiita-admin backfill mask-adapter-hash`) passes and is recorded with no
   actor.

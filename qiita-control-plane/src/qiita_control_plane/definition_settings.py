@@ -9,6 +9,17 @@ groups are computed from):
   2. no live `similar` pair names it (`PairRefused`, `similar_pairs`): the groups that
      pair joins were decided over the old settings, so it is revoked first, as for a
      deprecation or a delete;
+  2a. no unfinished work ticket runs under it (`live_work`): its output would be
+     recorded under settings it did not run with. The definition row is held
+     `FOR UPDATE`, which the writers of `work_ticket.mask_idx` / `alignment_idx` wait
+     on (`lock_active_mask`, `lock_active_alignment`); no writer of
+     `work_ticket.processing_idx` takes it, so a processing's check is a read. The
+     deprecation lookups (`refuse_deprecating_*_with_live_work`) are not reused:
+     they skip a deprecated definition, and a deprecated one's settings are locked too;
+  2b. no public handle that is not retired cites it (`published`): an
+     `exported_processing` row naming it or an `exported_identifier` minted under it.
+     A published manifest cites the settings it was built under. Only masks and
+     alignments have handles; a processing has none;
   3. the edit changes something, and no other definition of the kind has the new
      params (`SettingsEditRefused`, `no_change` / `params_taken`; a concurrent mint
      of the same params that the check misses hits the `params_hash` UNIQUE
@@ -20,6 +31,10 @@ groups are computed from):
      decision joins nothing, so a stale one cannot merge groups;
   5. `qiita.edit_definition_settings` records the edit (actor, old and new values,
      reason) and makes it.
+
+The database itself enforces only that a locked change is audited and that no live
+`similar` pair names the row (the lock trigger); steps 2a, 2b, 3 and 4 are checks of
+this path, as deprecation's live-work check is of its route.
 
 Before any of these, the request itself is checked (`SettingsEditInvalid`): an
 alignment has no workflow or version column, and a mask's or processing's workflow and
@@ -36,6 +51,7 @@ from typing import Any
 import asyncpg
 from qiita_common.hashing import canonical_params_hash
 from qiita_common.models import (
+    NON_TERMINAL_WORK_TICKET_STATES,
     DefinitionKind,
     DefinitionPairRefusal,
     DefinitionPairVerdict,
@@ -133,6 +149,8 @@ async def edit_definition_settings(
             f"{kind.value} {idx} is a side of similar pair(s) {similar}; revoke them first",
             definition_pair_idx=similar,
         )
+    await _refuse_live_work(conn, t, kind, idx)
+    await _refuse_published(conn, t, kind, idx)
 
     params_hash = canonical_params_hash(params)
     await assert_params_survive_storage(conn, params, params_hash)
@@ -179,6 +197,58 @@ async def edit_definition_settings(
         edit_idx,
     )
     return SettingsEditResult(edit=edit, repaired_pair_idx=repaired)
+
+
+# The tables whose live rows cite a definition by the kind's id column.
+_HANDLE_TABLES = {
+    DefinitionKind.MASK: ("exported_processing", "exported_identifier"),
+    DefinitionKind.ALIGNMENT: ("exported_processing", "exported_identifier"),
+    DefinitionKind.PROCESSING: (),
+}
+
+
+async def _refuse_live_work(
+    conn: asyncpg.Connection, t: DefinitionTable, kind: DefinitionKind, idx: int
+) -> None:
+    """Step 2a of the module docstring."""
+    await conn.execute(f"SELECT 1 FROM {t.table} WHERE {t.id_column} = $1 FOR UPDATE", idx)
+    live = [
+        r["work_ticket_idx"]
+        for r in await conn.fetch(
+            "SELECT work_ticket_idx FROM qiita.work_ticket"
+            f" WHERE {t.id_column} = $1 AND state::text = ANY($2::text[])"
+            " ORDER BY work_ticket_idx",
+            idx,
+            list(NON_TERMINAL_WORK_TICKET_STATES),
+        )
+    ]
+    if live:
+        raise SettingsEditRefused(
+            DefinitionSettingsRefusal.LIVE_WORK,
+            f"{kind.value} {idx} has {len(live)} unfinished work ticket(s): {live}. Wait"
+            " for them to finish, or cancel them, then edit its settings",
+        )
+
+
+async def _refuse_published(
+    conn: asyncpg.Connection, t: DefinitionTable, kind: DefinitionKind, idx: int
+) -> None:
+    """Step 2b of the module docstring."""
+    cited: list[str] = []
+    for table in _HANDLE_TABLES[kind]:
+        n = await conn.fetchval(
+            f"SELECT count(*) FROM qiita.{table} WHERE {t.id_column} = $1 AND NOT retired",
+            idx,
+        )
+        if n:
+            cited.append(f"{n} {table} row(s)")
+    if cited:
+        raise SettingsEditRefused(
+            DefinitionSettingsRefusal.PUBLISHED,
+            f"{kind.value} {idx} is cited by public handles that are not retired"
+            f" ({', '.join(cited)}); a published output names the settings it was built"
+            " under, so they are not edited",
+        )
 
 
 async def _columns_after_edit(

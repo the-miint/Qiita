@@ -381,7 +381,8 @@ detaches its pairs, and is refused while a `similar` pair names it (the trigger
   (`definition_settings`; `qiita.definition_settings_columns` lists the columns, and
   `qiita.lock_definition_settings` the one exception, the mask adapter-hash re-key). The edit takes the
   group lock exclusive, as a decision does, since the groups are computed from those
-  params.
+  params, and is refused under live work or a published handle (`definition_settings`
+  states the refusals).
 - **Decision provenance.** Every resolution records the decision set it was computed
   under (`decision_set`): a content hash of every decided pair's verdict, replayed from
   `qiita.definition_pair_event` in the resolution's snapshot, so no pair or event idx

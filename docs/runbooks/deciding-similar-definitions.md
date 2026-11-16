@@ -172,7 +172,9 @@ qiita-admin definition edit-settings mask 12 --params-file mask-12.json \
 `mask-12.json` holds the whole new params; params_hash is recomputed from it. The edit
 is recorded in `qiita.definition_settings_edit` with the old and new values, who made it
 and the reason. It is refused while a `similar` pair names the definition (revoke it
-first), when another definition already has those params, and when it changes nothing.
+first), while unfinished work tickets run under it (wait, or cancel them), while a
+public handle that is not retired cites it (a `QP<n>` naming it, or a `QM<n>` minted
+under it: a published output names the settings it was built under), when another
+definition already has those params, and when it changes nothing.
 The `change` of each `pending` or `not_similar` pair naming the definition is recomputed
-from the new params; their verdicts stay. A manifest or export built before the edit
-cites the old params_hash.
+from the new params; their verdicts stay.

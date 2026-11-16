@@ -199,6 +199,11 @@ class DefinitionSettingsRefusal(StrEnum):
     PARAMS_TAKEN = "params_taken"
     # The edit changes no locked column.
     NO_CHANGE = "no_change"
+    # Unfinished work tickets (pending, queued, processing, held) run under it.
+    LIVE_WORK = "live_work"
+    # A public handle not retired cites it: an exported_processing (`QP<n>`) row
+    # naming it, or an exported_identifier (`QM<n>`) minted under it.
+    PUBLISHED = "published"
 
 
 class DefinitionSettingsEditRequest(BaseModel):
