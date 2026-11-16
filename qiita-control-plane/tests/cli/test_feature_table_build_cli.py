@@ -2193,8 +2193,8 @@ def test_the_manifest_has_a_handle_per_part_and_maps_each_sample_to_its_part(mon
 def test_a_sample_not_processed_in_the_group_stops_the_build(
     monkeypatch, tmp_path, capsys, entry, expected
 ):
-    """Feature tables refuse such samples rather than narrowing the cohort, and say
-    which and why, before anything streams or is minted."""
+    """A cohort named with --prep-sample-idx is refused rather than narrowed, saying
+    which samples and why, before anything streams or is minted."""
     rec = _patched_two_pools(
         monkeypatch,
         resolve={**_TWO_POOL_RESOLVE, "unprocessed": {("alignment", 3): {2: entry}}},
@@ -2209,6 +2209,59 @@ def test_a_sample_not_processed_in_the_group_stops_the_build(
     assert not _FakeFlightClient.instances
     assert "minted_cohort" not in rec and "processing_cohort" not in rec
     assert not list(tmp_path.iterdir())
+
+
+_FAILED = {"state": "incomplete", "reason": "failed", "definition_idx": 3, "work_ticket_idx": 55}
+
+
+def test_an_omitted_cohort_leaves_out_unprocessed_samples_and_records_them(
+    monkeypatch, tmp_path, capsys
+):
+    """Without --prep-sample-idx, a prep_sample that is not processed is left out: listed
+    on stderr with its state and reason, and recorded in the manifest by its export_id."""
+    rec = _patched(monkeypatch, resolve={"unprocessed": {("alignment", 3): {2: _FAILED}}})
+    args = _namespace(tmp_path)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    assert rec["ticket_cohort"] == [1]
+    assert _table_rows(args.output) == [("QM1", "GCF_100", 1.0)]
+    err = capsys.readouterr().err
+    assert "1 of 2 prep_sample(s) are left out" in err
+    assert "prep_sample 2: incomplete (failed), alignment 3, work_ticket 55" in err
+    table = _manifest(tmp_path)["table"]
+    assert table["cohort"] == ["QM1"]
+    assert table["left_out"] == [{"export_id": "QM2", "state": "incomplete", "reason": "failed"}]
+
+
+def test_an_omitted_cohort_with_nothing_processed_is_refused(monkeypatch, tmp_path, capsys):
+    rec = _patched(
+        monkeypatch,
+        resolve={
+            "unprocessed": {
+                ("alignment", 3): {
+                    1: {"state": "not_processed", "reason": "withdrawn", "definition_idx": 3},
+                    2: _FAILED,
+                }
+            }
+        },
+    )
+    args = _namespace(tmp_path)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 1
+    err = capsys.readouterr().err
+    assert "none of the 2 prep_sample(s) of the cohort is processed" in err
+    assert "prep_sample 1: not_processed (withdrawn), alignment 3" in err
+    assert "minted_cohort" not in rec and "processing_cohort" not in rec
+    assert not _FakeFlightClient.instances
+    assert not list(tmp_path.iterdir())
+
+
+def test_a_named_cohort_records_nothing_left_out(monkeypatch, tmp_path):
+    _patched(monkeypatch)
+    args = _namespace(tmp_path, prep_sample_idx=[1, 2])
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    assert _manifest(tmp_path)["table"]["left_out"] == []
 
 
 def test_a_part_over_no_named_pool_is_refused_with_the_flags_to_add(monkeypatch, tmp_path, capsys):

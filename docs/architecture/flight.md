@@ -394,8 +394,10 @@ Two consequences worth stating here, because neither is visible from any single 
   only of the samples in it, which is why the manifest is a member rather than a flag.
 - **A cohort can span pools and a similarity group, and is then read in parts.** Each
   prep_sample is resolved (`POST /definition-group/resolve`) in `--alignment-idx`'s
-  group; a prep_sample that is incomplete or not processed stops the build, since the
-  cohort is never narrowed. The prep_samples are read per resolved alignment, one part
+  group. A prep_sample that is incomplete or not processed stops a build over a cohort
+  named with `--prep-sample-idx`, which is never narrowed; the default cohort leaves it
+  out, lists it on stderr and records its `export_id`, state and reason under the
+  manifest's `table.left_out`, and a default cohort with nothing processed is refused. The prep_samples are read per resolved alignment, one part
   each, and the parts' DoGet streams are chained into one staged relation
   (`staged_streams`), so the analytic runs once over the whole cohort. The manifest
   carries one `export_processing_id` per part and maps each prep_sample's `export_id`

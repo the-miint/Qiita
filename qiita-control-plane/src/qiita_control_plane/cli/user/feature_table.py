@@ -1010,6 +1010,7 @@ def _manifest_payload(
     files: list[Path],
     tools: dict[str, str],
     denovo: dict[str, Any] | None = None,
+    left_out: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """The bundle's record of what produced the table — the one artifact here that is
     always written, because without it the table is not reproducible.
@@ -1022,7 +1023,9 @@ def _manifest_payload(
     and the rest is represented by the digest, which is what identifies the config anyway.
     `processing` is `_manifest_parts` over the reference arm's parts: one part per
     alignment that the cohort's prep_samples resolved to, and the map from each
-    prep_sample to its part.
+    prep_sample to its part. `table.left_out` is `_left_out_identifiers`: the default
+    cohort's prep_samples that the table leaves out, by `export_id`; empty for a named
+    cohort, which is refused instead.
 
     `files` are basenames: the bundle's members relative to wherever it lands, since an
     absolute path describes the machine that built it.
@@ -1058,6 +1061,7 @@ def _manifest_payload(
             **({"denovo": denovo} if denovo is not None else {}),
             # Sorted, so the record does not depend on the order the mint answered in.
             "cohort": sorted(identifier["export_id"] for identifier in identifiers),
+            "left_out": left_out or [],
         },
         "tools": tools,
         "files": [path.name for path in files],
@@ -1376,16 +1380,26 @@ def _member_summary(listing: dict[str, Any], alignment_idx: int, *, samples: int
     return _alignment_summary(listing, alignment_idx=alignment_idx)
 
 
+@dataclasses.dataclass(frozen=True)
+class _Cohort:
+    """The prep_samples a build resolves, ascending. `listed_under` is None for a cohort
+    named with `--prep-sample-idx`; for the default cohort it maps each prep_sample to
+    the alignments of the group that the cohort route listed it completed under."""
+
+    samples: list[int]
+    listed_under: dict[int, set[int]] | None
+
+
 def _resolve_cohort(
     base_url: str,
     token: str,
     args: argparse.Namespace,
     *,
     per_pool: dict[tuple[int, int], set[int]],
-) -> list[int]:
-    """The cohort to build over, ascending: the prep_samples named on the command line, or
-    else every prep_sample of the named pools that the caller may read and that is completed
-    for an alignment in `--alignment-idx`'s group.
+) -> _Cohort:
+    """The cohort to resolve: the prep_samples named on the command line, or else every
+    prep_sample of the named pools that the caller may read and that is completed for an
+    alignment in `--alignment-idx`'s group.
 
     The group comes from a resolve over the anchor's own completed prep_samples, so the
     anchor must have at least one in the named pools. An empty cohort is refused here:
@@ -1394,7 +1408,7 @@ def _resolve_cohort(
     user never wrote.
     """
     if args.prep_sample_idx is not None:
-        return sorted(set(args.prep_sample_idx))
+        return _Cohort(sorted(set(args.prep_sample_idx)), None)
 
     def completed(pool: tuple[int, int], alignment_idx: int) -> list[int]:
         return _fetch_alignment_cohort(
@@ -1406,13 +1420,12 @@ def _resolve_cohort(
         )["prep_sample_idx"]
 
     anchor = args.alignment_idx
-    cohort = {
-        sample
-        for pool, listed in per_pool.items()
-        if anchor in listed
-        for sample in completed(pool, anchor)
-    }
-    if not cohort:
+    listed_under: dict[int, set[int]] = {}
+    for pool, listed in per_pool.items():
+        if anchor in listed:
+            for sample in completed(pool, anchor):
+                listed_under.setdefault(sample, set()).add(anchor)
+    if not listed_under:
         raise ValueError(
             f"no prep_sample of the named sequenced_pool(s) {sorted(p for _, p in per_pool)}"
             f" is both readable by you and completed for alignment {anchor}, so there is no"
@@ -1425,27 +1438,95 @@ def _resolve_cohort(
             token,
             kind=DefinitionKind.ALIGNMENT,
             definition_idx=anchor,
-            prep_sample_idx=sorted(cohort),
+            prep_sample_idx=sorted(listed_under),
         ).group
     )
     for pool, listed in per_pool.items():
         for alignment_idx in sorted((listed & group) - {anchor}):
-            cohort.update(completed(pool, alignment_idx))
-    return sorted(cohort)
+            for sample in completed(pool, alignment_idx):
+                listed_under.setdefault(sample, set()).add(alignment_idx)
+    return _Cohort(sorted(listed_under), listed_under)
+
+
+def _skip_unprocessed(
+    resolution: DefinitionGroupResolveResponse, cohort: _Cohort
+) -> tuple[DefinitionGroupResolveResponse, list[SampleResolution]]:
+    """For the default cohort, the resolution narrowed to its processed prep_samples, and
+    the prep_samples left out, each listed on stderr with its state and reason. A named
+    cohort is returned whole, for `_parts` to refuse. Refuses a default cohort with no
+    processed prep_sample: there is no table to build."""
+    if cohort.listed_under is None:
+        return resolution, []
+    processed = [e for e in resolution.samples if e.state is SampleResolutionState.PROCESSED]
+    left_out = [e for e in resolution.samples if e.state is not SampleResolutionState.PROCESSED]
+    if not processed:
+        lines = "\n".join(f"  {entry.describe()}" for entry in left_out)
+        raise ValueError(
+            f"none of the {len(left_out)} prep_sample(s) of the cohort is processed in the"
+            f" group of alignment {resolution.definition_idx}:\n{lines}\nThere is no table"
+            f" to build."
+        )
+    if left_out:
+        print(
+            f"note: {len(left_out)} of {len(resolution.samples)} prep_sample(s) are left out"
+            f" of the table, not processed in the group of alignment"
+            f" {resolution.definition_idx}; the manifest records them under"
+            f" table.left_out:",
+            file=sys.stderr,
+        )
+        for entry in left_out:
+            print(f"  {entry.describe()}", file=sys.stderr)
+    return resolution.model_copy(update={"samples": processed}), left_out
+
+
+def _left_out_identifiers(
+    base_url: str, token: str, left_out: list[SampleResolution], cohort: _Cohort
+) -> list[dict[str, Any]]:
+    """The manifest's record of the left-out prep_samples: each one's `export_id`, state
+    and reason, sorted by `export_id`. The `export_id` is minted under the highest-idx
+    alignment that the cohort route listed the prep_sample completed under, which the
+    identifier mint admits."""
+    if not left_out:
+        return []
+    assert cohort.listed_under is not None  # a named cohort leaves nothing out
+    by_alignment: dict[int, list[SampleResolution]] = {}
+    for entry in left_out:
+        by_alignment.setdefault(max(cohort.listed_under[entry.prep_sample_idx]), []).append(entry)
+    out = []
+    for alignment_idx, entries in sorted(by_alignment.items()):
+        export_id_of = {
+            minted["prep_sample_idx"]: minted["export_id"]
+            for minted in _mint_exported_identifiers(
+                base_url,
+                token,
+                alignment_idx=alignment_idx,
+                prep_sample_idx=[entry.prep_sample_idx for entry in entries],
+            )
+        }
+        out.extend(
+            {
+                "export_id": export_id_of[entry.prep_sample_idx],
+                "state": entry.state.value,
+                "reason": entry.reason.value if entry.reason is not None else None,
+            }
+            for entry in entries
+        )
+    return sorted(out, key=lambda record: record["export_id"])
 
 
 def _refuse_unprocessed(refused: list[SampleResolution], *, anchor: str) -> None:
     """Refuse a cohort with prep_samples that are not processed in `anchor`'s group, listing
-    each with its state. A feature table is built over processed prep_samples only, and the
-    cohort is not narrowed: coverage is measured over the whole cohort, so a narrowed
-    cohort is a different table."""
+    each with its state. A feature table is built over processed prep_samples only, and a
+    cohort named with `--prep-sample-idx` is not narrowed: coverage is measured over the
+    whole cohort, so a narrowed cohort is a different table from the one named. The
+    default cohort is narrowed before this (`_skip_unprocessed`)."""
     if not refused:
         return
     lines = "\n".join(f"  {entry.describe()}" for entry in refused)
     raise ValueError(
         f"{len(refused)} prep_sample(s) of the cohort are not processed in the group of"
         f" {anchor}:\n{lines}\nA feature table is built only over processed prep_samples. Wait"
-        f" for or re-run these, or name the cohort to build over with --prep-sample-idx."
+        f" for or re-run these, or leave them out of --prep-sample-idx."
     )
 
 
@@ -1620,18 +1701,19 @@ def _run_build(
     # names but the caller cannot read, which is exactly what every reference DoGet ticket
     # below would then fail on.
     reference = _fetch_reference(args.base_url, token, reference_idx=reference_idx)
-    cohort = _resolve_cohort(args.base_url, token, args, per_pool=per_pool)
-    parts = _parts(
+    resolved_cohort = _resolve_cohort(args.base_url, token, args, per_pool=per_pool)
+    resolution, left_out = _skip_unprocessed(
         _resolve_definition_group(
             args.base_url,
             token,
             kind=DefinitionKind.ALIGNMENT,
             definition_idx=args.alignment_idx,
-            prep_sample_idx=cohort,
+            prep_sample_idx=resolved_cohort.samples,
         ),
-        listing=listing,
-        reference_idx=reference_idx,
+        resolved_cohort,
     )
+    parts = _parts(resolution, listing=listing, reference_idx=reference_idx)
+    cohort = [entry.prep_sample_idx for entry in resolution.samples]
 
     # The de novo arm, from the same merged listing that the reference arm came from,
     # checked with `denovo_alignment_processing_idx`, passing the reference arm's mask
@@ -1707,6 +1789,7 @@ def _run_build(
                 f" requested.",
                 file=sys.stderr,
             )
+    left_out_records = _left_out_identifiers(args.base_url, token, left_out, resolved_cohort)
     identifiers = sorted(
         (
             entry
@@ -1888,6 +1971,7 @@ def _run_build(
             reference=reference,
             processing=processing,
             identifiers=identifiers,
+            left_out=left_out_records,
             rows=clearance.rows,
             files=files,
             tools=tools,

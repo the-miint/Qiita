@@ -91,8 +91,10 @@ for that prep_sample. Its state is one of:
   definition or an upstream is deprecated or withdrawn. An older member's run is not
   used instead.
 
-The exports list incomplete and not-processed prep_samples and leave them out;
-`qiita feature-table build` and the cohort DoGet refuse them.
+The exports list incomplete and not-processed prep_samples and leave them out, and
+so does `qiita feature-table build` over its default cohort (it also records them in
+the manifest under `table.left_out`); a build over prep_samples named with
+`--prep-sample-idx`, and the cohort DoGet, refuse them.
 
 ## 5. Revoke, or deprecate a decided definition
 

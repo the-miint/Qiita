@@ -35,8 +35,11 @@
   refused.
 - **`qiita feature-table build` takes repeated `--sequencing-run-idx` /
   `--sequenced-pool-idx` pairs and builds one table across the alignment's group
-  (#874).** It reads each prep_sample from the alignment that it resolves to and
-  refuses a prep_sample that is incomplete or not processed. The manifest's
+  (#874).** It reads each prep_sample from the alignment that it resolves to. Over the
+  default cohort it leaves out a prep_sample that is incomplete or not processed,
+  lists it on stderr with its state and reason, and records it in the manifest's
+  `table.left_out` by `export_id`; it fails when nothing is left. Over prep_samples
+  named with `--prep-sample-idx` it refuses such a prep_sample. The manifest's
   `processing` now holds `parts` (one handle, `params_hash` and aligner per alignment
   read) and `sample_part` (each `export_id` to its part's handle), and `table.denovo`
   the same for the de novo arm, in place of the single `export_processing_id`,
