@@ -60,6 +60,11 @@ async def _syndna_reference(ctx):
         "DELETE FROM qiita.syndna_read_count WHERE mask_idx = ANY($1::bigint[])",
         ctx["created"]["mask"],
     )
+    # The route mints each counted mask's public handle; they name these masks.
+    await pool.execute(
+        "DELETE FROM qiita.exported_processing WHERE mask_idx = ANY($1::bigint[])",
+        ctx["created"]["mask"],
+    )
     await cleanup_reference_graph(pool, reference_idx=reference_idx, feature_idxs=inserts)
 
 
@@ -228,6 +233,18 @@ async def test_a_sample_not_processed_is_left_out_and_listed(ctx):
         (stale, "not_processed", "no_run"),
         (running, "incomplete", "in_progress"),
     ]
+    accessions = dict(
+        await ctx["pool"].fetch(
+            "SELECT ps.idx, bs.biosample_accession FROM qiita.prep_sample ps"
+            " JOIN qiita.biosample bs ON bs.idx = ps.biosample_idx"
+            " WHERE ps.idx = ANY($1::bigint[])",
+            [stale, running],
+        )
+    )
+    assert body["left_out_biosample_accession"] == {
+        str(stale): accessions[stale],
+        str(running): accessions[running],
+    }
     # The ticket a sample waits on is a system_admin's to see only.
     assert all("work_ticket_idx" not in r for r in body["left_out"])
     admin = await ctx["admin"].get(_url(mask_idx), params={"study_idx": study_idx})
@@ -304,6 +321,20 @@ async def test_each_sample_is_counted_under_the_mask_it_resolves_to(ctx, similar
             (only_low, low, [5, 0]),
             (both, high, [2, 8]),
             (only_high, high, [3, 4]),
+        ]
+        # Each sample cites the mask its counts came from by that mask's public handle.
+        handles = dict(
+            await ctx["pool"].fetch(
+                "SELECT mask_idx, export_processing_id FROM qiita.exported_processing"
+                " WHERE mask_idx = ANY($1::bigint[]) AND NOT retired",
+                [low, high],
+            )
+        )
+        assert set(handles) == {low, high}
+        assert [s["mask_export_processing_id"] for s in body["samples"]] == [
+            handles[low],
+            handles[high],
+            handles[high],
         ]
 
 

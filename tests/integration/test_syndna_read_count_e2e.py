@@ -123,6 +123,8 @@ async def seeded(postgres_pool, human_admin_session, regular_user_session, data_
         biosample_idxs=[biosample_idx],
         prep_sample_idxs=[prep_sample_idx],
     )
+    # The export mints the mask's public handle, created by the exporting user.
+    await db.execute("DELETE FROM qiita.exported_processing WHERE mask_idx = $1", mask_idx)
     await db.execute("DELETE FROM qiita.mask_definition WHERE mask_idx = $1", mask_idx)
     await db.execute(
         "DELETE FROM qiita.reference_membership WHERE reference_idx = $1", reference_idx
@@ -144,7 +146,14 @@ def _cells(path, source: str) -> list[tuple]:
 
 
 async def test_a_viewer_exports_the_table_in_both_formats_and_namings(
-    cp_server, data_plane, regular_user_session, seeded, tmp_path, monkeypatch, capsys
+    cp_server,
+    data_plane,
+    postgres_pool,
+    regular_user_session,
+    seeded,
+    tmp_path,
+    monkeypatch,
+    capsys,
 ):
     from qiita_control_plane.cli import user as cli
 
@@ -181,3 +190,18 @@ async def test_a_viewer_exports_the_table_in_both_formats_and_namings(
         (acc, "synDNA_16SrRNA_seq_1_gc=0.26", 12.0),
         (acc, "synDNA_16SrRNA_seq_2_gc=0.36", 0.0),
     ]
+
+    # Each table has a sidecar citing the mask by its public handle.
+    from qiita_control_plane.cli.user.mask import syndna_sidecar_path
+
+    handle = await postgres_pool.fetchval(
+        "SELECT export_processing_id FROM qiita.exported_processing"
+        " WHERE mask_idx = $1 AND NOT retired",
+        seeded["mask_idx"],
+    )
+    for table in (biom, parquet):
+        sidecar = json.loads(syndna_sidecar_path(table).read_text())
+        assert sidecar["samples"] == {
+            acc: {"biosample_accession": acc, "mask_export_processing_id": handle}
+        }
+        assert (sidecar["left_out"], sidecar["deprecated"]) == ([], False)

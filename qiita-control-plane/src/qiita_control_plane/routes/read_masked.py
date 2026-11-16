@@ -110,6 +110,7 @@ from ..deps import (
     get_tx_conn_factory,
 )
 from ..repositories.block import MASK_SAMPLE_COMPLETED, fetch_mask_sample_state
+from ..repositories.exported_processing import mint_exported_mask_processing
 from ..repositories.mask_definition import (
     MaskDefinitionDeprecated,
     MaskDefinitionNotFound,
@@ -414,6 +415,11 @@ async def get_syndna_read_count_route(
     processed prep_sample has no counts; 413 above the roster cap. Every
     read is one read-only snapshot, so neither a re-mask nor a pair decision landing
     mid-request can mix two states into one table.
+
+    After every refusal, each mask the counts came from gets its public handle
+    (`samples[].mask_export_processing_id`, minted idempotently by
+    `_mint_syndna_mask_handles`), so the written table can cite it; `left_out`'s
+    biosample accessions are in `left_out_biosample_accession`.
     """
     if study_idx is None and sequenced_pool_idx is None and not prep_sample_idx:
         raise HTTPException(
@@ -540,6 +546,10 @@ async def get_syndna_read_count_route(
                 " syndna-read-count`)"
             ),
         )
+    handles = await _mint_syndna_mask_handles(
+        pool, sorted(set(mask_by_sample.values())), caller=caller, include_deprecated=exact
+    )
+    accession = {r["prep_sample_idx"]: r["biosample_accession"] for r in rows}
     response = SyndnaReadCountResponse(
         mask_idx=mask_idx,
         reference_idx=reference_idx,
@@ -549,6 +559,7 @@ async def get_syndna_read_count_route(
                 {
                     **dict(r),
                     "mask_idx": mask_by_sample[r["prep_sample_idx"]],
+                    "mask_export_processing_id": handles[mask_by_sample[r["prep_sample_idx"]]],
                     "read_counts": counts[r["prep_sample_idx"]],
                 }
             )
@@ -556,6 +567,9 @@ async def get_syndna_read_count_route(
             if r["prep_sample_idx"] in mask_by_sample
         ],
         left_out=left_out,
+        left_out_biosample_accession={
+            r.prep_sample_idx: accession[r.prep_sample_idx] for r in left_out
+        },
         deprecated=exact,
         deprecation_reason=mask["deprecation_reason"] if exact else None,
     )
@@ -567,6 +581,31 @@ async def get_syndna_read_count_route(
             "left_out": [resolution_body(r, caller) for r in left_out],
         }
     )
+
+
+async def _mint_syndna_mask_handles(
+    pool: asyncpg.Pool, mask_idxs: list[int], *, caller: HumanUser, include_deprecated: bool
+) -> dict[int, str]:
+    """mask_idx -> its public handle (`QP<n>`), minted (idempotently) for each mask the
+    counts came from, after every refusal, so a refused request mints nothing. Each mint
+    is its own short transaction (`mint_exported_mask_processing`); a mask deprecated or
+    deleted since the snapshot is a 409."""
+    handles: dict[int, str] = {}
+    for m in mask_idxs:
+        try:
+            row = await mint_exported_mask_processing(
+                pool,
+                mask_idx=m,
+                created_by_idx=caller.principal_idx,
+                include_deprecated=include_deprecated,
+            )
+        except (MaskDefinitionNotFound, MaskDefinitionDeprecated) as exc:
+            raise HTTPException(
+                status_code=409,
+                detail=f"mask {m} changed while its counts were read; retry: {exc}",
+            ) from exc
+        handles[m] = row["export_processing_id"]
+    return handles
 
 
 def syndna_reference_of_resolved(

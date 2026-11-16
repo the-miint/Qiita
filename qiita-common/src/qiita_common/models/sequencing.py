@@ -1176,11 +1176,13 @@ class SyndnaInsert(BaseModel):
 class SyndnaReadCountSample(BaseModel):
     """One prep_sample's per-insert read counts, in `SyndnaReadCountResponse.inserts`
     order. `mask_idx` is the member of the named mask's group that the prep_sample
-    resolved to, whose counts these are. `sequenced_pool_idx` is None for a prep_sample that
-    was never pooled."""
+    resolved to, whose counts these are, and `mask_export_processing_id` is that mask's
+    public handle (`QP<n>`, `qiita.exported_processing`), which the written table cites.
+    `sequenced_pool_idx` is None for a prep_sample that was never pooled."""
 
     prep_sample_idx: Annotated[int, Field(gt=0)]
     mask_idx: Annotated[int, Field(gt=0)]
+    mask_export_processing_id: Annotated[str, Field(min_length=1)]
     biosample_accession: str | None = None
     sequenced_pool_idx: Annotated[int | None, Field(default=None, gt=0)] = None
     read_counts: list[Annotated[int, Field(ge=0)]]
@@ -1197,6 +1199,10 @@ class SyndnaReadCountResponse(BaseModel):
     by prep_sample_idx. The counts are reads with a mapped primary alignment to each
     insert, ungated (see qiita.syndna_read_count).
 
+    `left_out_biosample_accession` maps each `left_out` prep_sample to its biosample
+    accession (None when it has none), so a written table can record what it left
+    out without our identifiers.
+
     `deprecated` is true for a read of a deprecated mask under `include_deprecated`:
     each prep_sample was then resolved to that mask alone (`definition_resolver`,
     exact mode), and `deprecation_reason` is the mask's.
@@ -1207,6 +1213,7 @@ class SyndnaReadCountResponse(BaseModel):
     inserts: list[SyndnaInsert]
     samples: list[SyndnaReadCountSample]
     left_out: list[SampleResolution] = []
+    left_out_biosample_accession: dict[int, str | None] = {}
     deprecated: bool = False
     deprecation_reason: str | None = None
 
@@ -1219,6 +1226,11 @@ class SyndnaReadCountResponse(BaseModel):
                     f"prep_sample {sample.prep_sample_idx} carries"
                     f" {len(sample.read_counts)} counts for {width} inserts"
                 )
+        left_out = {r.prep_sample_idx for r in self.left_out}
+        if left_out != set(self.left_out_biosample_accession):
+            raise ValueError(
+                "left_out_biosample_accession must name exactly the left_out prep_samples"
+            )
         return self
 
 

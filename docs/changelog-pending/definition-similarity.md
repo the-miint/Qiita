@@ -40,6 +40,15 @@
   SynDNA response gains `samples[].mask_idx` and `left_out`, and returns the
   processed prep_samples instead of refusing the request when some are not; masks
   of the group with another SynDNA reference are refused.
+- **The SynDNA count export records where each count came from (#874).** The route
+  mints each counted mask's public handle (`QP<n>`) and returns it as
+  `samples[].mask_export_processing_id`, with `left_out_biosample_accession`.
+  `qiita mask syndna-read-count` writes `<output>.metadata.json` beside the table:
+  each sample_id's biosample accession and mask handle, the left-out prep_samples by
+  biosample accession with state and reason, and whether the read was of a
+  deprecated mask (`deprecated`, `deprecation_reason`). The Parquet table also gains
+  a `mask_export_processing_id` column. The CLI refuses an existing sidecar as it
+  refuses an existing `--output`.
 - **A deprecated mask named by the masked-read export, the SynDNA count export or
   the two mask-handle mints is refused (409, `reason` `deprecated`) unless the caller
   passes `--include-deprecated` (API `include_deprecated`) (#874).** With it, each

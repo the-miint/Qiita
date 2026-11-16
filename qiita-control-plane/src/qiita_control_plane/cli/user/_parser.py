@@ -1069,7 +1069,11 @@ def _build_parser() -> argparse.ArgumentParser:
             " it resolves to; one that is incomplete or not processed there is left"
             " out of the table and listed on stderr. Each prep_sample's sample_id is"
             " its biosample accession; the export refuses two prep_samples that would"
-            " share one."
+            " share one. Beside the table, <output>.metadata.json records each"
+            " sample_id's mask handle (QP<n>), the left-out prep_samples by biosample"
+            " accession with state and reason, and whether the mask read was deprecated"
+            " (BIOM output cannot carry sample metadata). The Parquet table also has a"
+            " mask_export_processing_id column."
         ),
     )
     p_mask_syndna.add_argument("--mask-idx", type=int, required=True)
@@ -1084,7 +1088,10 @@ def _build_parser() -> argparse.ArgumentParser:
         help="This prep_sample (repeatable)",
     )
     p_mask_syndna.add_argument(
-        "--output", type=Path, required=True, help="Table file to write; must not exist"
+        "--output",
+        type=Path,
+        required=True,
+        help="Table file to write; it and <output>.metadata.json must not exist",
     )
     p_mask_syndna.add_argument(
         "--format",
