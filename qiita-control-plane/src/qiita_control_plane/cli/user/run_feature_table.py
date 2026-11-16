@@ -128,8 +128,13 @@ def _build(args: argparse.Namespace, token: str, con) -> tuple[list[Path], dict[
             "note": MANIFEST_NOTE,
             "kind": method,
             "value_kind": columns["value_kind"],
-            "request": request,
             "feature_id": _FEATURE_ID[method],
+            # The cohort as public handles — each column's QM, sorted so the record
+            # does not depend on the order the samples came back in. The request names
+            # internal idxs (processing_idx, prep_sample_idx); a published manifest
+            # carries only handles a reader can resolve. The identifier map beside the
+            # table is the one artifact that carries prep_sample_idx, and it says so.
+            "cohort": sorted(s["export_id"] for s in columns["samples"]),
             **sizes,
             "files": [p.name for p in targets],
             "versions": _tool_versions(con),
