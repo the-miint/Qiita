@@ -321,6 +321,21 @@ def test_settings_contact_email_set_from_env(monkeypatch):
     assert settings.contact_email == "qiita.help@gmail.com"
 
 
+@pytest.mark.parametrize(
+    "bad_value", ["grpcs://dp.example.org:443", "grpc+tls://dp:443", "dp:50051"]
+)
+def test_settings_rejects_a_data_plane_url_the_health_probe_cannot_dial(monkeypatch, bad_value):
+    """The startup reconcile polls the data plane with a `grpc://` health probe, so any
+    other scheme would leave in-flight tickets waiting forever; refuse it at boot."""
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@localhost:5432/db")
+    monkeypatch.setenv("DATA_PLANE_URL", bad_value)
+
+    from qiita_control_plane.config import Settings
+
+    with pytest.raises(RuntimeError, match="DATA_PLANE_URL"):
+        Settings.from_env()
+
+
 def test_settings_build_sha_defaults_to_none(monkeypatch):
     """BUILD_SHA is optional — set only by the deploy scripts. A boot
     without it (dev / tests / first deploy) must leave build_sha None so

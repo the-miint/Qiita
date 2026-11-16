@@ -33,6 +33,9 @@ Aggregation rule (kept strict for v1):
     overall = OK iff every configured service is OK,
               else DEGRADED.
 Anything else lives in `services` for richer consumers.
+
+`wait_for_data_plane` reuses the dp probe as a startup readiness gate: it polls
+until the data plane reports SERVING, for callers that must not dial it earlier.
 """
 
 from __future__ import annotations
@@ -68,6 +71,7 @@ _KEY_CP = "cp"
 _KEY_CO = "co"
 _KEY_DP = "dp"
 
+_DP_WAIT_INTERVAL_SECONDS = 2.0
 _DP_WAIT_LOG_EVERY_SECONDS = 30.0
 
 
@@ -288,7 +292,7 @@ async def _probe_dp(url: str, *, log_failures: bool = True) -> HealthStatus:
     return HealthStatus.DEGRADED
 
 
-async def wait_for_data_plane(url: str, *, interval_seconds: float) -> None:
+async def wait_for_data_plane(url: str) -> None:
     """Poll the data plane until it reports SERVING; DEGRADED counts as not ready.
 
     No deadline: the caller cancels it. Logs one warning per
@@ -299,5 +303,5 @@ async def wait_for_data_plane(url: str, *, interval_seconds: float) -> None:
         if time.monotonic() - last_logged >= _DP_WAIT_LOG_EVERY_SECONDS:
             _logger.warning("waiting for the data plane at %s (last status: %s)", url, status.value)
             last_logged = time.monotonic()
-        await asyncio.sleep(interval_seconds)
+        await asyncio.sleep(_DP_WAIT_INTERVAL_SECONDS)
     _logger.info("data plane at %s is ready", url)

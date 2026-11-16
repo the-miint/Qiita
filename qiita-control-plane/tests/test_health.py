@@ -461,8 +461,9 @@ async def test_wait_for_data_plane_returns_only_once_the_probe_is_ok(monkeypatch
         monkeypatch,
         [HealthStatus.UNREACHABLE, HealthStatus.DEGRADED, HealthStatus.OK],
     )
+    monkeypatch.setattr(health_module, "_DP_WAIT_INTERVAL_SECONDS", 0)
     with caplog.at_level(logging.INFO, logger=health_module.__name__):
-        await health_module.wait_for_data_plane("grpc://dp.invalid:1", interval_seconds=0)
+        await health_module.wait_for_data_plane("grpc://dp.invalid:1")
     assert len(calls) == 3
     assert all(c["log_failures"] is False for c in calls)
     assert "ready" in caplog.text
@@ -470,9 +471,10 @@ async def test_wait_for_data_plane_returns_only_once_the_probe_is_ok(monkeypatch
 
 async def test_wait_for_data_plane_warns_with_url_and_status_while_waiting(monkeypatch, caplog):
     _scripted_probe(monkeypatch, [HealthStatus.UNREACHABLE, HealthStatus.OK])
+    monkeypatch.setattr(health_module, "_DP_WAIT_INTERVAL_SECONDS", 0)
     monkeypatch.setattr(health_module, "_DP_WAIT_LOG_EVERY_SECONDS", 0)
     with caplog.at_level(logging.WARNING, logger=health_module.__name__):
-        await health_module.wait_for_data_plane("grpc://dp.invalid:1", interval_seconds=0)
+        await health_module.wait_for_data_plane("grpc://dp.invalid:1")
     assert "grpc://dp.invalid:1" in caplog.text
     assert HealthStatus.UNREACHABLE.value in caplog.text
 
@@ -483,3 +485,11 @@ async def test_probe_dp_log_failures_false_suppresses_the_warning(monkeypatch, c
         status = await health_module._probe_dp("grpc://dp.invalid:1", log_failures=False)
     assert status == HealthStatus.UNREACHABLE
     assert caplog.text == ""
+
+
+async def test_probe_dp_logs_the_failure_by_default(monkeypatch, caplog):
+    _patch_grpc_channel(monkeypatch, check_raises=ConnectionError("down"))
+    with caplog.at_level(logging.WARNING, logger=health_module.__name__):
+        status = await health_module._probe_dp("grpc://dp.invalid:1")
+    assert status == HealthStatus.UNREACHABLE
+    assert "CP /health probe (dp) failed" in caplog.text

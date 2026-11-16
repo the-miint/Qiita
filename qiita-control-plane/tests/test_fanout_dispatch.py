@@ -15,7 +15,6 @@ work_tickets that were INSERTed `dispatch_held` a capped number at a time:
 The pure-column-routing tests need no DB; the release-semantics tests do.
 """
 
-import asyncio
 import logging
 import secrets
 
@@ -417,10 +416,11 @@ async def test_a_restart_drops_overrides_asymmetrically(
                     fanout_max_inflight=default, data_plane_url="grpc://unused"
                 ),
                 running_dispatches=set(),
+                reconcile_resume_task=None,
             )
         )
         await dispatch_mod.reconcile_inflight_tickets(app)
-        await asyncio.gather(*app.state.running_dispatches)
+        await app.state.reconcile_resume_task
 
         assert await _running_count(postgres_pool, ref) == after_restart
     finally:

@@ -47,6 +47,7 @@ def _fake_app(*, compute_backend_client=object(), pool=object()) -> SimpleNamesp
     state = SimpleNamespace(
         compute_backend_client=compute_backend_client,
         running_dispatches=set(),
+        reconcile_resume_task=None,
         dispatch_semaphore=build_dispatch_semaphore(),
         pool=pool,
         settings=SimpleNamespace(
@@ -319,12 +320,6 @@ async def test_pump_ticket_cohort_is_a_no_op_for_a_non_fanout_ticket(monkeypatch
     await dispatch_mod._pump_ticket_cohort(app, 42)
 
 
-def _reconcile_app():
-    app = _fake_app()
-    app.state.settings.data_plane_url = "grpc://dp.invalid:1"
-    return app
-
-
 @pytest.fixture
 def reconcile_events(monkeypatch):
     """Record the order of wait / schedule / top-up calls made by a reconcile."""
@@ -333,7 +328,7 @@ def reconcile_events(monkeypatch):
     events: list[str] = []
     release = asyncio.Event()
 
-    async def wait(url, *, interval_seconds):
+    async def wait(url):
         events.append("wait")
         await release.wait()
         events.append("ready")
@@ -352,18 +347,20 @@ def reconcile_events(monkeypatch):
 def _stub_work(monkeypatch, *, idxs, cohorts):
     from qiita_control_plane import dispatch as dispatch_mod
 
-    monkeypatch.setattr(dispatch_mod, "_inflight_ticket_idxs", _async_return(list(idxs)))
+    monkeypatch.setattr(
+        dispatch_mod, "_inflight_ticket_versions", _async_return({i: 0 for i in idxs})
+    )
     monkeypatch.setattr(dispatch_mod, "held_cohorts", _async_return(list(cohorts)))
 
 
 async def _settle(app):
-    await asyncio.gather(*app.state.running_dispatches)
+    await app.state.reconcile_resume_task
 
 
 async def test_reconcile_schedules_nothing_before_the_data_plane_answers(
     monkeypatch, reconcile_events
 ):
-    app = _reconcile_app()
+    app = _fake_app()
     _stub_work(monkeypatch, idxs=[1, 2], cohorts=[])
 
     count = await reconcile_inflight_tickets(app)
@@ -377,12 +374,12 @@ async def test_reconcile_schedules_nothing_before_the_data_plane_answers(
 
 
 async def test_reconcile_returns_while_the_wait_is_still_pending(monkeypatch, reconcile_events):
-    app = _reconcile_app()
+    app = _fake_app()
     _stub_work(monkeypatch, idxs=[1], cohorts=[])
 
     await asyncio.wait_for(reconcile_inflight_tickets(app), timeout=1)
-    (task,) = app.state.running_dispatches
-    assert not task.done()
+    assert not app.state.reconcile_resume_task.done()
+    assert not app.state.running_dispatches
 
     reconcile_events.release.set()
     await _settle(app)
@@ -397,16 +394,16 @@ async def test_reconcile_schedules_nothing_while_the_data_plane_stays_down(monke
 
     scheduled: list[int] = []
     monkeypatch.setattr(health_module, "_probe_dp", never_ok)
-    monkeypatch.setattr(dispatch_mod, "_DP_WAIT_INTERVAL_SECONDS", 0.001)
+    monkeypatch.setattr(health_module, "_DP_WAIT_INTERVAL_SECONDS", 0.001)
     monkeypatch.setattr(
         dispatch_mod, "schedule_dispatch", lambda _a, idx, **_k: scheduled.append(idx)
     )
     _stub_work(monkeypatch, idxs=[1], cohorts=[])
 
-    app = _reconcile_app()
+    app = _fake_app()
     await reconcile_inflight_tickets(app)
     await asyncio.sleep(0.05)
-    (task,) = app.state.running_dispatches
+    task = app.state.reconcile_resume_task
     assert not task.done()
     assert scheduled == []
 
@@ -416,18 +413,18 @@ async def test_reconcile_schedules_nothing_while_the_data_plane_stays_down(monke
 
 
 async def test_reconcile_never_waits_without_in_flight_work(monkeypatch, reconcile_events):
-    app = _reconcile_app()
+    app = _fake_app()
     _stub_work(monkeypatch, idxs=[], cohorts=[])
 
     assert await reconcile_inflight_tickets(app) == 0
     assert reconcile_events.events == []
-    assert not app.state.running_dispatches
+    assert app.state.reconcile_resume_task is None
 
 
 async def test_reconcile_waits_before_pumping_held_cohorts_with_no_tickets(
     monkeypatch, reconcile_events
 ):
-    app = _reconcile_app()
+    app = _fake_app()
     _stub_work(monkeypatch, idxs=[], cohorts=[shard_cohort(7)])
 
     await reconcile_inflight_tickets(app)
@@ -448,7 +445,7 @@ async def test_reconcile_logs_and_schedules_nothing_when_the_wait_raises(
         raise ValueError("grpcs:// not supported")
 
     monkeypatch.setattr(dispatch_mod, "wait_for_data_plane", broken_wait)
-    app = _reconcile_app()
+    app = _fake_app()
     _stub_work(monkeypatch, idxs=[1], cohorts=[])
 
     with caplog.at_level(logging.ERROR):

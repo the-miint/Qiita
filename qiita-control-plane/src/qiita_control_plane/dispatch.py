@@ -31,6 +31,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from datetime import datetime
 from typing import TYPE_CHECKING
 
 from qiita_common.compute_backend_client import ComputeBackendClient
@@ -62,8 +63,6 @@ _log = logging.getLogger(__name__)
 # — its children queue for these same shared slots. What a slot covers, and the
 # workflow cap that follows from it, is documented on `schedule_dispatch`.
 _DISPATCH_CONCURRENCY = 8
-
-_DP_WAIT_INTERVAL_SECONDS = 2.0
 
 
 def build_dispatch_semaphore() -> asyncio.Semaphore:
@@ -275,21 +274,25 @@ def schedule_dispatch(app: FastAPI, work_ticket_idx: int, *, resume: bool = Fals
     return task
 
 
-async def _inflight_ticket_idxs(pool: asyncpg.Pool) -> list[int]:
+async def _inflight_ticket_versions(pool: asyncpg.Pool) -> dict[int, datetime]:
     """Every non-terminal (PENDING / QUEUED / PROCESSING) ticket id that is NOT
-    fan-out-held, ascending. These are the tickets a startup reconcile re-drives
-    — at startup nothing else holds them. Held fan-out children (`dispatch_held`)
-    are deliberately excluded: the pump owns their release (see
-    `reconcile_inflight_tickets`), so re-dispatching them here would blow the
-    throttle open on every restart."""
+    fan-out-held, ascending, mapped to its `updated_at`. These are the tickets a
+    startup reconcile re-drives — at startup nothing else holds them. Held
+    fan-out children (`dispatch_held`) are deliberately excluded: the pump owns
+    their release (see `reconcile_inflight_tickets`), so re-dispatching them here
+    would blow the throttle open on every restart."""
     rows = await pool.fetch(
-        "SELECT work_ticket_idx FROM qiita.work_ticket"
+        "SELECT work_ticket_idx, updated_at FROM qiita.work_ticket"
         " WHERE state = ANY($1::qiita.work_ticket_state[])"
         "   AND NOT dispatch_held"
         " ORDER BY work_ticket_idx",
         list(NON_TERMINAL_WORK_TICKET_STATES),
     )
-    return [r["work_ticket_idx"] for r in rows]
+    return {r["work_ticket_idx"]: r["updated_at"] for r in rows}
+
+
+async def _inflight_ticket_idxs(pool: asyncpg.Pool) -> list[int]:
+    return list(await _inflight_ticket_versions(pool))
 
 
 async def reconcile_inflight_tickets(app: FastAPI) -> int:
@@ -316,12 +319,16 @@ async def reconcile_inflight_tickets(app: FastAPI) -> int:
     needs fencing (owner column or advisory lock) before that assumption can be
     lifted; see docs/architecture/processing.md "Work Ticket Lifecycle".
 
-    The resume runs in a background task that first waits for the data plane to
-    answer, so a CP that starts before it doesn't fail every ticket at submission.
+    The resume runs in `app.state.reconcile_resume_task`, which first waits for the
+    data plane to report SERVING so a CP that starts before it doesn't fail every
+    ticket at submission. A ticket whose row changed meanwhile (a `/run` dispatched
+    it) is skipped, not resumed on top of that run.
 
-    Returns the number of tickets scheduled for resume, for logging.
+    Returns the number of in-flight tickets found; they are resumed once the data
+    plane is ready.
     """
-    idxs = await _inflight_ticket_idxs(app.state.pool)
+    snapshot = await _inflight_ticket_versions(app.state.pool)
+    idxs = list(snapshot)
     # Cohorts with held (undispatched) fan-out children. Re-pumped below so the
     # throttled backlog resumes after a restart, even when every non-held ticket
     # already drained (so `idxs` is empty but held tickets remain).
@@ -344,16 +351,21 @@ async def reconcile_inflight_tickets(app: FastAPI) -> int:
 
     async def _resume_once_data_plane_is_up() -> None:
         try:
-            await wait_for_data_plane(
-                app.state.settings.data_plane_url, interval_seconds=_DP_WAIT_INTERVAL_SECONDS
-            )
-            if idxs:
+            await wait_for_data_plane(app.state.settings.data_plane_url)
+            current = await _inflight_ticket_versions(app.state.pool)
+            resumable = [i for i in idxs if current.get(i) == snapshot[i]]
+            if len(resumable) < len(idxs):
+                _log.warning(
+                    "not resuming work_ticket(s) that changed while waiting for the data plane: %s",
+                    sorted(set(idxs) - set(resumable)),
+                )
+            if resumable:
                 _log.warning(
                     "resuming %d in-flight work_ticket(s) at startup: %s",
-                    len(idxs),
-                    idxs,
+                    len(resumable),
+                    resumable,
                 )
-                for idx in idxs:
+                for idx in resumable:
                     schedule_dispatch(app, idx, resume=True)
             if cohorts:
                 # Fail-stop + slot counting apply inside the pump, so this re-pump never
@@ -372,9 +384,9 @@ async def reconcile_inflight_tickets(app: FastAPI) -> int:
         except Exception:
             _log.exception("startup resume of in-flight work_ticket(s) failed")
 
-    task = asyncio.create_task(_resume_once_data_plane_is_up(), name="reconcile_inflight_tickets")
-    app.state.running_dispatches.add(task)
-    task.add_done_callback(app.state.running_dispatches.discard)
+    app.state.reconcile_resume_task = asyncio.create_task(
+        _resume_once_data_plane_is_up(), name="reconcile_inflight_tickets"
+    )
     return len(idxs)
 
 

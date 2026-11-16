@@ -99,9 +99,12 @@ async def lifespan(app: FastAPI):
     # process — they have no live owner. Resumed in-place (re-attach to a
     # live SLURM job, finalize one that finished while we were down, or fail
     # cleanly from the filesystem) rather than blanket-failed, so a deploy
-    # that stops/starts the CP undrained doesn't nuke running work.
+    # that stops/starts the CP undrained doesn't nuke running work. The resume
+    # itself runs in a background task once the data plane is up; cancelled first
+    # at shutdown so it can't add dispatches behind the drain.
+    app.state.reconcile_resume_task = None
     await reconcile_inflight_tickets(app)
-    # After the re-attach: see reconcile_follow_ons.
+    # After the re-attach is scheduled: see reconcile_follow_ons.
     await reconcile_follow_ons(app)
 
     # ena_import_batch's OWN tracked task set (see ena_import.batch's module
@@ -157,6 +160,10 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        if app.state.reconcile_resume_task is not None:
+            app.state.reconcile_resume_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await app.state.reconcile_resume_task
         app.state.follow_on_sweeper_task.cancel()
         with suppress(asyncio.CancelledError):
             await app.state.follow_on_sweeper_task
