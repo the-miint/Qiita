@@ -102,6 +102,8 @@ async def _real_bridge(postgres_pool, secret: bytes, *, pool_idx: int, mask_idx:
             _role=None,
             _scope=None,
             mask_idx=mask_idx,
+            include_deprecated=False,
+            as_of_event=None,
         )
     ).model_dump(mode="json")
     tickets: dict[tuple[int, int], str] = {}
