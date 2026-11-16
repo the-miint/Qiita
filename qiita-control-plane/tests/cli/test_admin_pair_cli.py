@@ -17,7 +17,7 @@ _PAIR = {
     "definition_kind": "mask",
     "low_definition_idx": 5,
     "high_definition_idx": 12,
-    "change": {"rype": [0.05, 0.1]},
+    "change": {"/rype": [0.05, 0.1]},
     "derived_only": False,
     "verdict": "pending",
 }

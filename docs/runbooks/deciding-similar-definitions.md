@@ -25,7 +25,8 @@ qiita-admin pair open mask 5 12        # or: alignment A B, processing P Q
 ```
 
 Order does not matter. Opening a pair that already exists returns it. The response's
-`change` maps each param path that differs to `[low value, high value]`; that is what
+`change` maps each param path that differs (a JSON Pointer, such as `/rype` or
+`/qc/min_length`) to `[low value, high value]`; that is what
 you are deciding on. Two definitions in different comparison scopes (`cross_scope`)
 or with the same params (`no_difference`) cannot be paired.
 

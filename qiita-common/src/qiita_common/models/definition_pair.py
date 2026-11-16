@@ -133,7 +133,8 @@ class DefinitionPair(BaseModel):
 
     `low_definition_idx` / `high_definition_idx` are the two definition ids, kept
     when a definition is deleted by hand (`detached_at` is then set). `change` maps
-    each differing dotted param path to `[low value, high value]`. The decision
+    each differing param path, a JSON Pointer (`/qc/min_length`), to
+    `[low value, high value]`. The decision
     fields are set exactly when `verdict` is not `pending`."""
 
     definition_pair_idx: Annotated[int, Field(gt=0)]

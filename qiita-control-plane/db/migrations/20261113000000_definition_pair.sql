@@ -43,7 +43,7 @@ CREATE TABLE qiita.definition_pair (
     high_definition_ref BIGINT NOT NULL,
     detached_at         TIMESTAMPTZ,
 
-    -- {dotted.param.path: [low value, high value]} over the two stored params,
+    -- {JSON Pointer param path: [low value, high value]} over the two stored params,
     -- computed when the pair is opened. Params never change after a mint, so it is
     -- not recomputed.
     change              JSONB   NOT NULL CHECK (jsonb_typeof(change) = 'object'),
@@ -135,7 +135,8 @@ COMMENT ON COLUMN qiita.definition_pair.detached_at IS
     'Set by qiita.detach_definition_pair when an ON DELETE SET NULL nulls one of the '
     'kind''s typed FKs. A detached pair links nothing and is not decided or revoked.';
 COMMENT ON COLUMN qiita.definition_pair.change IS
-    'JSON object {dotted.param.path: [low value, high value]} of the paths whose '
+    'JSON object {param path as a JSON Pointer (RFC 6901): [low value, high value]} '
+    'of the paths whose '
     'values differ between the two definitions'' stored params. Absent and null are '
     'the same value; lists compare whole.';
 COMMENT ON COLUMN qiita.definition_pair.derived_only IS

@@ -330,7 +330,7 @@ async def test_open_records_the_change_and_an_opened_event(clients, defs):
     assert resp.status_code == 201, resp.text
     body = resp.json()
     assert (body["low_definition_idx"], body["high_definition_idx"]) == (m1, m2)
-    assert body["change"] == {"rype": [0.05, 0.1]}
+    assert body["change"] == {"/rype": [0.05, 0.1]}
     assert body[DefinitionPairRefusal.DERIVED_ONLY] is False
     assert body["verdict"] == DefinitionPairVerdict.PENDING
     assert body["opened_by_idx"] == defs["owner"]
@@ -349,7 +349,7 @@ async def test_open_marks_an_upstream_only_change_derived_only(clients, defs):
     m1, m2 = await defs["mask"](rype=0.05), await defs["mask"](rype=0.1)
     p1, p2 = await defs["assembly"](m1), await defs["assembly"](m2)
     body = (await _open(clients["admin"], DefinitionKind.PROCESSING, p1, p2)).json()
-    assert body["change"] == {"mask_idx": [m1, m2]}
+    assert body["change"] == {"/mask_idx": [m1, m2]}
     assert body[DefinitionPairRefusal.DERIVED_ONLY] is True
     _refusal(
         await _decide(clients["admin"], body["definition_pair_idx"], DefinitionPairVerdict.SIMILAR),

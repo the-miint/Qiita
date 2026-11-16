@@ -3,9 +3,11 @@ the change between two definitions, the groups that pair decisions form, and eve
 refusal. The rules are stated here and nowhere else.
 
 **Change.** `param_diff` compares two definitions' stored params. Nested objects are
-walked into dotted paths (`resolved_qc.min_length`); lists compare whole; an absent
-key and a JSON null are the same value; values compare as canonical JSON, so `1`,
-`1.0` and `true` differ, as they do in the params hash.
+walked into paths of keys, written as JSON Pointers (RFC 6901:
+`/resolved_qc/min_length`, with `~` and `/` in a key escaped as `~0` and `~1`), so
+any key, a `.` included, has one path; lists compare whole; an absent key and a JSON
+null are the same value; values compare as canonical JSON, so `1`, `1.0` and `true`
+differ, as they do in the params hash.
 
 **Upstream references.** A processing's `mask_idx`, an alignment's `mask_idx`, and a
 de novo alignment's `processing_idx` (a de novo alignment is the one whose params
@@ -107,6 +109,7 @@ __all__ = [
     "load_groups",
     "open_pair",
     "param_diff",
+    "param_path",
     "refuse_deprecating_with_similar_pairs",
     "revoke_pair",
     "upstream_changes",
@@ -115,7 +118,7 @@ __all__ = [
 
 # The block alignment's reference shard set (`align_planner` hashes it). A change in
 # it is reference growth, which is never `similar`.
-_SHARD_IDS_PATH = "shard_ids"
+_SHARD_IDS_KEY = "shard_ids"
 # Present only in a de novo alignment's params.
 _DENOVO_SUBJECT_KEY = "subject"
 # Kinds in dependency order: each kind's derived edges read the groups of the kinds
@@ -162,38 +165,38 @@ def canonical_json(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"))
 
 
-def _flatten(params: Mapping[str, Any], prefix: str = "") -> dict[str, Any]:
-    """Leaf values by dotted path. Nulls are dropped, so absent and null are one value;
+def _flatten(params: Mapping[str, Any], prefix: tuple[str, ...] = ()) -> dict[tuple[str, ...], Any]:
+    """Leaf values by key path. Nulls are dropped, so absent and null are one value;
     an empty object contributes nothing."""
-    out: dict[str, Any] = {}
+    out: dict[tuple[str, ...], Any] = {}
     for key, value in params.items():
-        if "." in key:
-            raise ValueError(
-                f"param key {prefix}{key!r} contains '.', which the dotted change paths"
-                " cannot represent unambiguously"
-            )
-        path = f"{prefix}{key}"
+        path = (*prefix, key)
         if isinstance(value, dict):
-            out.update(_flatten(value, f"{path}."))
+            out.update(_flatten(value, path))
         elif value is not None:
             out[path] = value
     return out
 
 
+def param_path(path: Sequence[str]) -> str:
+    """`path` as a JSON Pointer (RFC 6901), the form that `change` is keyed by."""
+    return "".join("/" + key.replace("~", "~0").replace("/", "~1") for key in path)
+
+
 def param_diff(low_params: Mapping[str, Any], high_params: Mapping[str, Any]) -> dict[str, list]:
-    """`{dotted path: [low value, high value]}` for every path whose values differ,
-    sorted by path. A missing side is `None`."""
+    """`{param_path(path): [low value, high value]}` for every path whose values
+    differ, in path order. A missing side is `None`."""
     low, high = _flatten(low_params), _flatten(high_params)
     return {
-        path: [low.get(path), high.get(path)]
+        param_path(path): [low.get(path), high.get(path)]
         for path in sorted(low.keys() | high.keys())
         if canonical_json(low.get(path)) != canonical_json(high.get(path))
     }
 
 
 def upstream_leaves(kind: DefinitionKind, params: Mapping[str, Any]) -> dict[str, DefinitionKind]:
-    """The param paths of a `kind` definition that name an upstream definition, and
-    that definition's kind."""
+    """The top-level param keys of a `kind` definition that name an upstream
+    definition, and that definition's kind."""
     if kind is DefinitionKind.PROCESSING:
         return {"mask_idx": DefinitionKind.MASK}
     if kind is DefinitionKind.ALIGNMENT:
@@ -217,8 +220,8 @@ def upstream_changes(
     """The entries of `change` that swap one upstream definition for another:
     `{path: (upstream kind, low ref, high ref)}`. A path counts when both sides
     treat it as an upstream reference and both values are ids."""
-    low_leaves = upstream_leaves(kind, low_params)
-    high_leaves = upstream_leaves(kind, high_params)
+    low_leaves = {param_path((k,)): v for k, v in upstream_leaves(kind, low_params).items()}
+    high_leaves = {param_path((k,)): v for k, v in upstream_leaves(kind, high_params).items()}
     out: dict[str, tuple[DefinitionKind, int, int]] = {}
     for path, (low_value, high_value) in change.items():
         up_kind = low_leaves.get(path)
@@ -359,16 +362,16 @@ def _derived_key(definition: DefinitionRow, members: Mapping[DefinitionKind, Map
     """Equal for two definitions exactly when their params differ only in upstream
     references whose referents share a group."""
     leaves = upstream_leaves(definition.kind, definition.params)
-    items: dict[str, Any] = {}
-    for path, value in _flatten(definition.params).items():
-        up_kind = leaves.get(path)
+    items: list[list[Any]] = []
+    for path, value in sorted(_flatten(definition.params).items()):
+        up_kind = leaves.get(path[0]) if len(path) == 1 else None
         if up_kind is not None and is_definition_ref(value):
             group = members[up_kind].get(value, frozenset({value}))
             # An object never appears as a flattened leaf, so it cannot collide
             # with a plain value at the same path.
-            items[path] = {"upstream_group": min(group)}
+            items.append([list(path), {"upstream_group": min(group)}])
         else:
-            items[path] = value
+            items.append([list(path), value])
     return canonical_json(items)
 
 
@@ -515,7 +518,7 @@ def _refuse_similar(groups: Groups, pair: PairState) -> None:
             " can be decided not_similar only",
             definition_pair_idx=[pair.idx],
         )
-    if _SHARD_IDS_PATH in pair.change:
+    if param_path((_SHARD_IDS_KEY,)) in pair.change:
         raise PairRefused(
             DefinitionPairRefusal.SHARD_IDS_CHANGE,
             f"pair {pair.idx} differs in the reference shard set; reference growth is"

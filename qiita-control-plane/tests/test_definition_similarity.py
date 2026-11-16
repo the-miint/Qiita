@@ -119,38 +119,61 @@ def refused(reason, fn, *args):
 # ---------------------------------------------------------------------------
 
 
-def test_param_diff_walks_nested_objects_into_dotted_paths():
+def test_param_diff_walks_nested_objects_into_json_pointer_paths():
     low = {"a": 1, "qc": {"min_length": 100, "tail": True}, "same": "x"}
     high = {"a": 1, "qc": {"min_length": 200, "tail": True}, "same": "x"}
-    assert param_diff(low, high) == {"qc.min_length": [100, 200]}
+    assert param_diff(low, high) == {"/qc/min_length": [100, 200]}
 
 
 def test_param_diff_compares_lists_whole():
     assert param_diff({"shard_ids": [0, 1]}, {"shard_ids": [0, 1, 2]}) == {
-        "shard_ids": [[0, 1], [0, 1, 2]]
+        "/shard_ids": [[0, 1], [0, 1, 2]]
     }
 
 
 def test_param_diff_treats_absent_and_null_as_one_value():
     assert param_diff({"a": None, "b": {"c": None}}, {}) == {}
-    assert param_diff({"a": None}, {"a": 3}) == {"a": [None, 3]}
+    assert param_diff({"a": None}, {"a": 3}) == {"/a": [None, 3]}
 
 
 def test_param_diff_compares_as_canonical_json():
     """1, 1.0 and true hash differently, so they are different values here too."""
-    assert param_diff({"a": 1}, {"a": 1.0}) == {"a": [1, 1.0]}
-    assert param_diff({"a": 1}, {"a": True}) == {"a": [1, True]}
+    assert param_diff({"a": 1}, {"a": 1.0}) == {"/a": [1, 1.0]}
+    assert param_diff({"a": 1}, {"a": True}) == {"/a": [1, True]}
 
 
 def test_param_diff_compares_a_null_object_against_its_leaves():
     assert param_diff({"lima": None}, {"lima": {"version": "2.13.0"}}) == {
-        "lima.version": [None, "2.13.0"]
+        "/lima/version": [None, "2.13.0"]
     }
 
 
-def test_param_diff_refuses_a_key_containing_a_dot():
-    with pytest.raises(ValueError, match="contains '.'"):
-        param_diff({"a.b": 1}, {})
+def test_param_diff_gives_every_key_its_own_path():
+    """A key holding `.`, `/` or `~` cannot collide with a nested path: `a.b` and
+    `a: {b}` are two paths, and a `/` in a key is escaped."""
+    assert param_diff({"a.b": 1, "a": {"b": 1}}, {"a.b": 2, "a": {"b": 3}}) == {
+        "/a/b": [1, 3],
+        "/a.b": [1, 2],
+    }
+    assert param_diff({"x/y": 1, "x": {"y": 1}, "t~": 1}, {"x/y": 2, "x": {"y": 1}, "t~": 2}) == {
+        "/t~0": [1, 2],
+        "/x~1y": [1, 2],
+    }
+
+
+def test_groups_form_over_a_param_key_holding_a_dot():
+    """A dotted key is an ordinary key to the derived grouping: two assemblies whose
+    params differ only in grouped masks are grouped, and a dotted key that differs
+    keeps them apart."""
+    defs = [mask(1), mask(2, rype=0.1)]
+    p1, p2 = assembly(10, mask_idx=1), assembly(11, mask_idx=2)
+    p1 = replace(p1, params={**p1.params, "knob.v": 1})
+    p2 = replace(p2, params={**p2.params, "knob.v": 1})
+    p3 = replace(assembly(12, mask_idx=2), params={**p2.params, "knob.v": 2})
+    pairs = [pair(defs, MASK, 1, 2)]
+    groups = compute_groups([*defs, p1, p2, p3], [replace(pairs[0], verdict=SIMILAR)])
+    assert groups.group_of(PROCESSING, 10) == {10, 11}
+    assert groups.group_of(PROCESSING, 12) == {12}
 
 
 def test_derived_only_is_a_change_of_upstream_references_alone():
@@ -328,7 +351,7 @@ def test_similar_with_a_deprecated_side_is_refused_and_not_similar_is_not():
 def test_similar_on_a_shard_set_change_is_refused():
     defs = [mask(1), block(31, 1, alpha=1), block(32, 1, shard_ids=(0, 1, 2), alpha=2)]
     p = pair(defs, ALIGNMENT, 31, 32)
-    assert "shard_ids" in p.change
+    assert "/shard_ids" in p.change
     refused(
         DefinitionPairRefusal.SHARD_IDS_CHANGE,
         check_decision,
@@ -507,4 +530,4 @@ def test_open_refuses_two_definitions_with_the_same_params():
 
 
 def test_open_returns_the_change():
-    assert check_open(mask(1), mask(2, rype=0.1)) == {"rype": [0.05, 0.1]}
+    assert check_open(mask(1), mask(2, rype=0.1)) == {"/rype": [0.05, 0.1]}
