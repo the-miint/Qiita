@@ -1061,15 +1061,15 @@ pub(crate) const GENE_CALL_TABLES: &[&str] = &["gene_call", "gene_call_contig"];
 /// uses; a qiita-common test pins those, and this table list, against the DDL below.
 ///
 /// Both tables are replaced per run at register time, keyed on
-/// `(prep_sample_idx, processing_idx)` read from `gene_call_contig`
-/// (`flight_service::registration::REPLACE_KEY_TABLES`). Neither is Flight-readable.
+/// `(prep_sample_idx, processing_idx)` read from the same registration's
+/// `assembly_membership` (`flight_service::registration::REPLACE_KEY_TABLES`).
+/// Neither is Flight-readable.
 pub fn ensure_gene_call_tables(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS qiita_lake.gene_call (
             prep_sample_idx BIGINT NOT NULL,
             processing_idx BIGINT NOT NULL,
-            kind VARCHAR NOT NULL,
-            bin_id VARCHAR NOT NULL,
+            genome_idx BIGINT NOT NULL,
             call_set VARCHAR NOT NULL,
             parent_feature_idx BIGINT NOT NULL,
             feature_idx BIGINT NOT NULL,
@@ -1088,10 +1088,9 @@ pub fn ensure_gene_call_tables(conn: &Connection) -> Result<(), Box<dyn std::err
         CREATE TABLE IF NOT EXISTS qiita_lake.gene_call_contig (
             prep_sample_idx BIGINT NOT NULL,
             processing_idx BIGINT NOT NULL,
-            kind VARCHAR NOT NULL,
-            bin_id VARCHAR NOT NULL,
+            genome_idx BIGINT NOT NULL,
             call_set VARCHAR NOT NULL,
-            parent_feature_idx BIGINT NOT NULL,
+            feature_idx BIGINT NOT NULL,
             contig_order INTEGER NOT NULL,
             meta_mode BOOLEAN NOT NULL,
             closed_ends BOOLEAN NOT NULL,

@@ -2659,6 +2659,7 @@ fn empty_gene_call_tables_still_supersede_the_runs_rows() {
     let run: i64 = 976_020;
     let contig: i64 = 976_030;
     let gene: i64 = 976_040;
+    let genome: i64 = 976_050;
     let base_ticket: i64 = 976_000_000 + std::process::id() as i64;
     let where_clause = format!("prep_sample_idx = {prep_sample} AND processing_idx = {run}");
     let cleanup = format!(
@@ -2688,11 +2689,11 @@ fn empty_gene_call_tables_still_supersede_the_runs_rows() {
     let contig_values = |suffix: &str| {
         format!(
             "SELECT * FROM (VALUES \
-                 ({prep_sample}::BIGINT, {run}::BIGINT, 'MAG', 'bin.1', 'prodigal_checkm', \
+                 ({prep_sample}::BIGINT, {run}::BIGINT, {genome}::BIGINT, 'prodigal_checkm', \
                   {contig}::BIGINT, 1::INTEGER, FALSE, FALSE, TRUE, 'ok', 11::INTEGER, \
                   TRUE, NULL::INTEGER, NULL::VARCHAR, NULL::DOUBLE)) \
-                 t(prep_sample_idx, processing_idx, kind, bin_id, call_set, \
-                   parent_feature_idx, contig_order, meta_mode, closed_ends, mask_regions, \
+                 t(prep_sample_idx, processing_idx, genome_idx, call_set, \
+                   feature_idx, contig_order, meta_mode, closed_ends, mask_regions, \
                    status, translation_table, uses_sd, meta_bin, model_desc, \
                    model_gc_content){suffix}"
         )
@@ -2700,10 +2701,10 @@ fn empty_gene_call_tables_still_supersede_the_runs_rows() {
     let gene_values = |suffix: &str| {
         format!(
             "SELECT * FROM (VALUES \
-                 ({prep_sample}::BIGINT, {run}::BIGINT, 'MAG', 'bin.1', 'prodigal_checkm', \
+                 ({prep_sample}::BIGINT, {run}::BIGINT, {genome}::BIGINT, 'prodigal_checkm', \
                   {contig}::BIGINT, {gene}::BIGINT, 1::BIGINT, 301::BIGINT, '+', 10.5::DOUBLE, \
                   FALSE, FALSE, 'ATG', 99.9::DOUBLE, MAP {{'rbs_motif': 'None'}}, 'M*')) \
-                 t(prep_sample_idx, processing_idx, kind, bin_id, call_set, \
+                 t(prep_sample_idx, processing_idx, genome_idx, call_set, \
                    parent_feature_idx, feature_idx, position, stop_position, strand, score, \
                    partial_left, partial_right, start_type, confidence, attributes, \
                    protein){suffix}"

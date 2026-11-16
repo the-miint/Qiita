@@ -10,11 +10,13 @@ canonical strand are `qiita_common.gene_call_constants`.
 Outputs, in `gene_calls/`:
 
   - `gene.parquet`: one row per gene, the `gene_call` columns without the run key,
-    the contig named by `parent_sequence_hash` and the gene by its own canonical
-    `sequence_hash` and `sequence_length_bp`, for minting.
+    with the identifiers the load resolves in their place: the subject named by
+    `kind` and `bin_id` (for `genome_idx`), the contig by `parent_sequence_hash`, and
+    the gene by its own canonical `sequence_hash` and `sequence_length_bp`, for
+    minting.
   - `contig.parquet`: one row per contig of each called subject, the
-    `gene_call_contig` columns without the run key, the contig named by
-    `parent_sequence_hash`.
+    `gene_call_contig` columns without the run key, the subject named by `kind` and
+    `bin_id` and the contig by `sequence_hash`.
   - `checkm/<kind>/<bin_id>/genes.faa` and `genes.gff`: the `prodigal_checkm` genes of
     each subject that has any, as Prodigal's CLI writes them for that subject's FASTA
     (contig names and strand as read, not canonical), laid out as CheckM's
@@ -123,70 +125,61 @@ def _dir_name(bin_id: str) -> str:
 
 
 def _load_subjects(conn, genomes_dir: Path, refined_bins_dir: Path) -> None:
-    """`contig`: every contig of every subject, with its subject (`genome_id`), its
-    order in the subject's FASTA, its canonical hash, and whether it was read on the
-    other strand. `subject`: one row per subject with its total length."""
+    """`contig`: every contig of every subject, with its subject (`genome_id`, the
+    column `predict_genes` groups by; local to this job), its order in the subject's
+    FASTA, its canonical hash, and `reverse_complemented`: whether the contig as read
+    is the reverse complement of its canonical strand, the one whose md5 is the hash.
+    `subject`: one row per subject with its total length."""
     conn.execute("CREATE TEMP TABLE file_meta (filepath VARCHAR, kind VARCHAR, bin_id VARCHAR)")
     meta = _file_meta(genomes_dir, refined_bins_dir)
+    params: dict[str, object] = {
+        "mag": KIND_MAG,
+        "unbinned": KIND_UNBINNED,
+        "min_residue": MIN_RESIDUE_LENGTH_BP,
+    }
     if meta:
         conn.executemany("INSERT INTO file_meta VALUES (?, ?, ?)", meta)
         source = (
-            f"read_fastx(?, max_batch_bytes := '{READ_FASTX_MAX_BATCH_BYTES}', "
+            f"read_fastx($files, max_batch_bytes := '{READ_FASTX_MAX_BATCH_BYTES}', "
             "include_filepath := true)"
         )
-        params = [[row[0] for row in meta]]
+        params["files"] = [row[0] for row in meta]
     else:
         source = """(SELECT NULL::VARCHAR AS filepath, NULL::VARCHAR AS read_id,
                             NULL::VARCHAR AS sequence1, NULL::BIGINT AS sequence_index
                      WHERE false)"""
-        params = []
-    conn.execute(
-        f"""
-        CREATE TEMP TABLE contig_all AS
-        SELECT *, md5({normalized_sequence_expr("sequence1")})::uuid <> sequence_hash AS flipped
-        FROM (
-            SELECT fm.kind, COALESCE(fm.bin_id, rf.read_id) AS bin_id,
-                   rf.read_id AS contig_id, rf.sequence_index, rf.sequence1,
-                   {canonical_sequence_hash_expr("rf.sequence1")} AS sequence_hash
-            FROM {source} rf JOIN file_meta fm ON rf.filepath = fm.filepath)
-        """,
-        params,
-    )
     # The unbinned subjects are the residue above the cut: the noLCG contigs no refined
     # bin claims, matched on the canonical hash as `assembly_hash` and `residue_split.py`
     # match them, at or above `MIN_RESIDUE_LENGTH_BP`.
     conn.execute(
-        "CREATE TEMP TABLE binned_hash AS "
-        "SELECT DISTINCT sequence_hash FROM contig_all WHERE kind = ?",
-        [KIND_MAG],
-    )
-    conn.execute(
-        """
-        DELETE FROM contig_all
-        WHERE kind = ?
-          AND (length(sequence1) < ? OR sequence_hash IN (SELECT sequence_hash FROM binned_hash))
+        f"""
+        CREATE TEMP TABLE contig AS
+        WITH read AS MATERIALIZED (
+            SELECT fm.kind, COALESCE(fm.bin_id, rf.read_id) AS bin_id,
+                   rf.read_id AS contig_id, rf.sequence_index, rf.sequence1,
+                   {canonical_sequence_hash_expr("rf.sequence1")} AS sequence_hash,
+                   md5({normalized_sequence_expr("rf.sequence1")})::uuid <> sequence_hash
+                       AS reverse_complemented
+            FROM {source} rf JOIN file_meta fm ON rf.filepath = fm.filepath),
+        kept AS (
+            SELECT r.* FROM read r
+            ANTI JOIN (SELECT sequence_hash FROM read WHERE kind = $mag) b
+                ON r.kind = $unbinned AND r.sequence_hash = b.sequence_hash
+            WHERE r.kind <> $unbinned OR length(r.sequence1) >= $min_residue)
+        SELECT dense_rank() OVER (ORDER BY kind, bin_id)::BIGINT AS genome_id, *,
+               row_number() OVER (PARTITION BY kind, bin_id ORDER BY sequence_index)::INTEGER
+                   AS contig_order
+        FROM kept
         """,
-        [KIND_UNBINNED, MIN_RESIDUE_LENGTH_BP],
+        params,
     )
     conn.execute(
         """
         CREATE TEMP TABLE subject AS
-        SELECT kind, bin_id,
-               row_number() OVER (ORDER BY kind, bin_id)::BIGINT AS genome_id,
-               sum(length(sequence1))::BIGINT AS total_bases
-        FROM contig_all GROUP BY kind, bin_id
+        SELECT genome_id, kind, bin_id, sum(length(sequence1))::BIGINT AS total_bases
+        FROM contig GROUP BY ALL
         """
     )
-    conn.execute(
-        """
-        CREATE TEMP TABLE contig AS
-        SELECT s.genome_id, c.*,
-               row_number() OVER (PARTITION BY s.genome_id ORDER BY c.sequence_index)::INTEGER
-                   AS contig_order
-        FROM contig_all c JOIN subject s USING (kind, bin_id)
-        """
-    )
-    conn.execute("DROP TABLE contig_all")
 
 
 def _predict(conn, table: str, where: str, settings: str) -> None:
@@ -313,15 +306,17 @@ def _gene_rows_sql(calls: str, call_set: str) -> str:
                c.sequence_hash AS parent_sequence_hash,
                {canonical_sequence_hash_expr(gene_bases)} AS sequence_hash,
                (g.stop_position - g.position)::BIGINT AS sequence_length_bp,
-               (CASE WHEN c.flipped THEN {length} - g.stop_position + 2
+               (CASE WHEN c.reverse_complemented THEN {length} - g.stop_position + 2
                      ELSE g.position END)::BIGINT AS position,
-               (CASE WHEN c.flipped THEN {length} - g.position + 2
+               (CASE WHEN c.reverse_complemented THEN {length} - g.position + 2
                      ELSE g.stop_position END)::BIGINT AS stop_position,
-               CASE WHEN NOT c.flipped THEN g.strand
+               CASE WHEN NOT c.reverse_complemented THEN g.strand
                     WHEN g.strand = '+' THEN '-' ELSE '+' END AS strand,
                g.score,
-               CASE WHEN c.flipped THEN g.partial_right ELSE g.partial_left END AS partial_left,
-               CASE WHEN c.flipped THEN g.partial_left ELSE g.partial_right END AS partial_right,
+               CASE WHEN c.reverse_complemented THEN g.partial_right
+                    ELSE g.partial_left END AS partial_left,
+               CASE WHEN c.reverse_complemented THEN g.partial_left
+                    ELSE g.partial_right END AS partial_right,
                g.start_type, g.confidence,
                MAP {{{attributes}}}::MAP(VARCHAR, VARCHAR) AS attributes,
                g.protein
@@ -350,8 +345,7 @@ def _contig_rows_sql(calls: str, call_set: str, closed_ends: bool, mask_regions:
         per_subject AS (
             SELECT genome_id, any_value(meta_mode) AS meta_mode, any_value(status) AS status
             FROM {calls} WHERE read_id IS NULL GROUP BY genome_id)
-        SELECT c.kind, c.bin_id, '{call_set}' AS call_set,
-               c.sequence_hash AS parent_sequence_hash, c.contig_order,
+        SELECT c.kind, c.bin_id, '{call_set}' AS call_set, c.sequence_hash, c.contig_order,
                coalesce(p.meta_mode, s.meta_mode) AS meta_mode,
                {str(closed_ends).lower()} AS closed_ends,
                {str(mask_regions).lower()} AS mask_regions,
@@ -371,11 +365,13 @@ def _contig_rows_sql(calls: str, call_set: str, closed_ends: bool, mask_regions:
 def _write_checkm_files(conn, out: Path) -> int:
     """`<out>/<kind>/<bin_id>/genes.{faa,gff}` for each subject with `prodigal_checkm`
     genes. Returns how many subjects got them."""
-    # In contig order, the order `prodigal_proteins` numbers contigs in.
+    # In contig order, the order `prodigal_proteins` numbers contigs in. `record_id` is
+    # the id `prodigal_proteins` gives a gene's record, `<contig>_<gene>`.
     conn.execute(
         """
         CREATE TEMP TABLE checkm_rows AS
-        SELECT g.* EXCLUDE (meta_mode), c.contig_order
+        SELECT g.* EXCLUDE (meta_mode), c.contig_order,
+               g.read_id || '_' || g.gene_index AS record_id
         FROM calls_checkm g JOIN contig c ON c.genome_id = g.genome_id AND c.contig_id = g.read_id
         ORDER BY g.genome_id, c.contig_order, g.gene_index NULLS FIRST
         """
@@ -387,8 +383,7 @@ def _write_checkm_files(conn, out: Path) -> int:
         CREATE TEMP TABLE checkm_faa AS
         SELECT p.*, r.contig_order, r.gene_index
         FROM prodigal_proteins('checkm_rows', per_genome := true) p
-        JOIN checkm_rows r
-          ON r.genome_id = p.genome_id AND r.read_id || '_' || r.gene_index = p.read_id
+        JOIN checkm_rows r ON r.genome_id = p.genome_id AND r.record_id = p.read_id
         """
     )
     genes, records = conn.execute(
@@ -412,7 +407,7 @@ def _write_checkm_files(conn, out: Path) -> int:
         rows = f"""(SELECT * FROM checkm_rows WHERE genome_id = {int(genome_id)}
                     ORDER BY contig_order, gene_index NULLS FIRST)"""
         conn.execute(
-            f"""COPY (SELECT * EXCLUDE (contig_order) FROM {rows})
+            f"""COPY (SELECT * EXCLUDE (contig_order, record_id) FROM {rows})
                 TO {_sql_path(d / "genes.gff")} (FORMAT GFF, DIALECT 'prodigal')"""
         )
         conn.execute(

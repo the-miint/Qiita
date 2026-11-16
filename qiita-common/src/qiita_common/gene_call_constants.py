@@ -57,14 +57,17 @@ CALL_SETS = (CALL_SET_CHECKM, CALL_SET_META_CLOSED)
 # `assembly_membership`; registration refuses them without it.
 GENE_CALL_RUN_KEY = ("prep_sample_idx", "processing_idx")
 
-# The subject a row belongs to, as `bin_quality` names it, then the call set.
-GENE_CALL_SUBJECT_KEY = ("prep_sample_idx", "processing_idx", "kind", "bin_id", "call_set")
+# The subject a row belongs to, by its `qiita.genome` (one per assembled subject,
+# minted from the run, kind and bin_id by
+# `qiita_control_plane.repositories.assembly.assembly_genome_source_id`), then the
+# call set. The gene-calling step does not know the genome; its staging Parquet
+# carries `kind` and `bin_id` in place of `genome_idx`, for the load to resolve.
+GENE_CALL_SUBJECT_KEY = ("prep_sample_idx", "processing_idx", "genome_idx", "call_set")
 
 _SUBJECT_COLUMNS: tuple[tuple[str, str], ...] = (
     ("prep_sample_idx", "BIGINT"),
     ("processing_idx", "BIGINT"),
-    ("kind", "VARCHAR"),
-    ("bin_id", "VARCHAR"),
+    ("genome_idx", "BIGINT"),
     ("call_set", "VARCHAR"),
 )
 
@@ -110,7 +113,7 @@ GENE_CALL_COLUMNS: tuple[tuple[str, str], ...] = (
 
 GENE_CALL_CONTIG_COLUMNS: tuple[tuple[str, str], ...] = (
     *_SUBJECT_COLUMNS,
-    ("parent_feature_idx", "BIGINT"),
+    ("feature_idx", "BIGINT"),
     ("contig_order", "INTEGER"),
     ("meta_mode", "BOOLEAN"),
     ("closed_ends", "BOOLEAN"),

@@ -7,7 +7,6 @@ from pathlib import Path
 
 import pytest
 
-from qiita_common.assembly_constants import BIN_QUALITY_SUBJECT_KEY
 from qiita_common.gene_call_constants import (
     GENE_CALL_ATTRIBUTE_KEYS,
     GENE_CALL_RUN_KEY,
@@ -39,12 +38,10 @@ def test_gene_call_columns_match_the_lake_ddl_exactly(table, lake_table_ddl):
 
 @pytest.mark.parametrize("table", sorted(GENE_CALL_TABLES))
 def test_every_table_leads_with_the_subject_key(table):
-    """Each row carries the run, the subject as `bin_quality` names it, and the call
-    set, so the two join without a rename; the run key leads, as the replace reads
-    it."""
+    """Each row carries the run, the subject's genome and the call set; the run key
+    leads, as the replace reads it."""
     names = tuple(name for name, _ in GENE_CALL_TABLES[table])
     assert names[: len(GENE_CALL_SUBJECT_KEY)] == GENE_CALL_SUBJECT_KEY
-    assert set(BIN_QUALITY_SUBJECT_KEY) <= set(GENE_CALL_SUBJECT_KEY)
     assert GENE_CALL_SUBJECT_KEY[: len(GENE_CALL_RUN_KEY)] == GENE_CALL_RUN_KEY
 
 
@@ -56,7 +53,7 @@ def test_no_attribute_key_duplicates_a_column():
 
 
 def test_no_table_carries_a_contig_name():
-    """A contig is named by `parent_feature_idx`; the FASTA header stops at the
+    """A contig is named by its `feature_idx`; the FASTA header stops at the
     writer."""
     for columns in GENE_CALL_TABLES.values():
         names = {name for name, _ in columns}

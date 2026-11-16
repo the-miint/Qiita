@@ -162,7 +162,8 @@ def test_coordinates_cut_the_gene_from_the_canonical_strand(called):
         conn.execute(
             f"""CREATE TABLE canon AS SELECT DISTINCT
                     {canonical_sequence_hash_expr("sequence1")} AS h,
-                    md5({norm})::uuid <> {canonical_sequence_hash_expr("sequence1")} AS flipped,
+                    md5({norm})::uuid <> {canonical_sequence_hash_expr("sequence1")}
+                        AS reverse_complemented,
                     CASE WHEN md5({norm})::uuid = {canonical_sequence_hash_expr("sequence1")}
                          THEN {norm} ELSE sequence_dna_reverse_complement({norm}) END AS seq
                 FROM contig"""
@@ -173,31 +174,31 @@ def test_coordinates_cut_the_gene_from_the_canonical_strand(called):
             f"CASE g.strand WHEN '+' THEN {window} "
             f"ELSE sequence_dna_reverse_complement({window}) END"
         )
-        genes, wrong_hash, bad_start, on_flipped = conn.execute(
+        genes, wrong_hash, bad_start, on_reverse = conn.execute(
             f"""SELECT count(*),
                        count(*) FILTER (WHERE {canonical_sequence_hash_expr(window)}
                                         <> g.sequence_hash),
                        count(*) FILTER (WHERE NOT g.partial_left AND NOT g.partial_right
                                         AND left({on_strand}, 3) NOT IN ('ATG', 'GTG', 'TTG')),
-                       count(*) FILTER (WHERE c.flipped)
+                       count(*) FILTER (WHERE c.reverse_complemented)
                 FROM g JOIN canon c ON c.h = g.parent_sequence_hash"""
         ).fetchone()
     assert genes == _rows(out / gene_call.GENE_FILE, "SELECT count(*) FROM t")[0][0]
     assert (wrong_hash, bad_start) == (0, 0)
-    assert on_flipped > 0
+    assert on_reverse > 0
     # The lowercase contig is read on its canonical strand and carries genes, so a
     # strand test that skipped normalization would flip it and fail the counts above.
     s1 = files["refined/bin.2.fa"]["s1"]
     with open_miint_conn() as conn:
         conn.execute("CREATE TABLE s1 AS SELECT ? AS s", [s1])
-        flipped, genes_on_s1 = conn.execute(
+        reverse_complemented, genes_on_s1 = conn.execute(
             f"""SELECT md5({normalized_sequence_expr("s")})::uuid
                            <> {canonical_sequence_hash_expr("s")},
                        (SELECT count(*) FROM '{out / gene_call.GENE_FILE}' g
                         WHERE g.parent_sequence_hash = {canonical_sequence_hash_expr("s1.s")})
                 FROM s1"""
         ).fetchone()
-    assert (flipped, genes_on_s1 > 0) == (False, True)
+    assert (reverse_complemented, genes_on_s1 > 0) == (False, True)
 
 
 def test_checkm_files_are_written_per_subject_with_contig_names_as_read(called):
@@ -228,15 +229,18 @@ def test_checkm_files_are_written_per_subject_with_contig_names_as_read(called):
 
 
 def test_outputs_are_the_lake_columns_with_hashes_for_the_identifiers(called):
-    """What the load needs: every lake column but the run key, with each `feature_idx`
-    still a canonical hash, to be minted."""
+    """What the load needs: every lake column but the run key, with the subject's
+    `kind` and `bin_id` in place of its `genome_idx` and each `feature_idx` still a
+    canonical hash, to be resolved or minted."""
     out, _ = called
-    swap = {
+    subject = {"genome_idx": ["kind", "bin_id"]}
+    gene_swap = subject | {
         "parent_feature_idx": ["parent_sequence_hash"],
         "feature_idx": ["sequence_hash", "sequence_length_bp"],
     }
+    contig_swap = subject | {"feature_idx": ["sequence_hash"]}
 
-    def expected(columns):
+    def expected(columns, swap):
         names = []
         for name, _ in columns:
             if name not in GENE_CALL_RUN_KEY:
@@ -244,12 +248,12 @@ def test_outputs_are_the_lake_columns_with_hashes_for_the_identifiers(called):
         return names
 
     conn = duckdb.connect()
-    for file, columns in (
-        (gene_call.GENE_FILE, GENE_CALL_COLUMNS),
-        (gene_call.CONTIG_FILE, GENE_CALL_CONTIG_COLUMNS),
+    for file, columns, swap in (
+        (gene_call.GENE_FILE, GENE_CALL_COLUMNS, gene_swap),
+        (gene_call.CONTIG_FILE, GENE_CALL_CONTIG_COLUMNS, contig_swap),
     ):
         got = [r[0] for r in conn.execute(f"DESCRIBE FROM '{out / file}'").fetchall()]
-        assert got == expected(columns), file
+        assert got == expected(columns, swap), file
 
 
 def test_attribute_keys_are_the_contracts():
