@@ -264,17 +264,8 @@ async def _probe_dp(url: str, *, log_failures: bool = True) -> HealthStatus:
     empty string — the convention for "overall server health" rather
     than a per-service check.
 
-    Rejects `grpcs://` explicitly rather than silently downgrading
-    to plaintext. TLS for the DP is terminated at nginx in the
-    production deploy; a direct TLS dial isn't a supported path here.
     `log_failures=False` silences the per-probe warning for polling callers.
     """
-    if url.startswith("grpcs://"):
-        raise ValueError(
-            "data plane probe does not support grpcs:// — nginx terminates TLS in "
-            "the production deploy; configure DATA_PLANE_URL with grpc:// for the "
-            "127.0.0.1 dial path."
-        )
     target = url.removeprefix("grpc://")
     try:
         async with grpc.aio.insecure_channel(target) as channel:

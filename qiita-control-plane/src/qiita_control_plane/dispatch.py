@@ -291,10 +291,6 @@ async def _inflight_ticket_versions(pool: asyncpg.Pool) -> dict[int, datetime]:
     return {r["work_ticket_idx"]: r["updated_at"] for r in rows}
 
 
-async def _inflight_ticket_idxs(pool: asyncpg.Pool) -> list[int]:
-    return list(await _inflight_ticket_versions(pool))
-
-
 async def reconcile_inflight_tickets(app: FastAPI) -> int:
     """Re-attach every in-flight ticket at startup instead of failing it.
 

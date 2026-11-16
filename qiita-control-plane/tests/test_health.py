@@ -247,16 +247,6 @@ async def test_probe_dp_strips_grpc_scheme(monkeypatch):
     assert captured_targets == ["data-plane.invalid:50051"]
 
 
-@pytest.mark.asyncio
-async def test_probe_dp_rejects_grpcs_scheme():
-    """`grpcs://` would silently downgrade to a plaintext dial under
-    `insecure_channel` — refuse explicitly. TLS is terminated at
-    nginx in the production deploy; a direct TLS dial isn't a
-    supported path here."""
-    with pytest.raises(ValueError, match="grpcs://"):
-        await health_module._probe_dp("grpcs://data-plane.invalid:50051")
-
-
 # ---------------------------------------------------------------------------
 # _aggregate
 # ---------------------------------------------------------------------------

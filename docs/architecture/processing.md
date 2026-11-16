@@ -165,7 +165,7 @@ those tasks. To recover, the lifespan startup hook calls
 in a background task, once the data plane reports SERVING (so a CP that starts first
 doesn't fail every ticket at submission), it schedules `run_workflow(resume=True)`
 for every non-terminal (PENDING / QUEUED / PROCESSING) ticket not changed in the
-meantime (a `/run` that dispatched one is not doubled), which fast-forwards entries a prior run already
+meantime (a `/run` that dispatched one is not doubled). The resume fast-forwards entries a prior run already
 completed (rebuilding their `bound` outputs from the shared workspace),
 re-attaches a still-running SLURM job by its persisted `slurm_job_id` (or
 adopts an orphan by its deterministic name via `find-by-name`), finalizes a

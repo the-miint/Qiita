@@ -104,7 +104,7 @@ async def lifespan(app: FastAPI):
     # at shutdown so it can't add dispatches behind the drain.
     app.state.reconcile_resume_task = None
     await reconcile_inflight_tickets(app)
-    # After the re-attach is scheduled: see reconcile_follow_ons.
+    # After the in-flight snapshot: see reconcile_follow_ons.
     await reconcile_follow_ons(app)
 
     # ena_import_batch's OWN tracked task set (see ena_import.batch's module
