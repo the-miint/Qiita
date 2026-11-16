@@ -1655,6 +1655,8 @@ class ExportedIdentifierRequest(BaseModel):
 
     alignment_idx: Annotated[int, Field(gt=0)]
     prep_sample_idx: PrepSampleCohort
+    # Admits a deprecated alignment (refused without it), as on the cohort DoGet.
+    include_deprecated: bool = False
 
 
 class ExportedIdentifier(BaseModel):
@@ -1720,6 +1722,8 @@ class ExportedProcessingRequest(BaseModel):
 
     alignment_idx: Annotated[int, Field(gt=0)]
     prep_sample_idx: PrepSampleCohort
+    # Admits a deprecated alignment (refused without it), as on the cohort DoGet.
+    include_deprecated: bool = False
 
 
 class ExportedProcessingResponse(BaseModel):

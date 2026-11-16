@@ -26,9 +26,18 @@ import json
 import struct
 
 import pytest
-from qiita_common.api_paths import URL_ALIGNMENT_COHORT_DOGET, URL_SEQUENCED_POOL_ALIGNMENT_COHORT
+from qiita_common.api_paths import (
+    URL_ALIGNMENT_COHORT_DOGET,
+    URL_EXPORTED_IDENTIFIER,
+    URL_EXPORTED_PROCESSING,
+    URL_SEQUENCED_POOL_ALIGNMENT_COHORT,
+)
 from qiita_common.auth_constants import Scope
-from qiita_common.models import DefinitionGroupRefusal, MaskDefinitionStatus
+from qiita_common.models import (
+    AlignmentDefinitionStatus,
+    DefinitionGroupRefusal,
+    MaskDefinitionStatus,
+)
 
 from qiita_control_plane.repositories.alignment_definition import ALIGNMENT_SAMPLE_COMPLETED
 from qiita_control_plane.repositories.block import MASK_SAMPLE_COMPLETED
@@ -492,3 +501,114 @@ async def test_human_mint_checks_access_before_group_resolution(ctx, alignment_g
         json={"prep_sample_idx": [w["ps_a"], w["ps_b"]], "columns": _COLUMNS},
     )
     assert resp.status_code == 403, resp.text
+
+
+# ---------------------------------------------------------------------------
+# A deprecated alignment: refused without include_deprecated, read exactly with it
+# ---------------------------------------------------------------------------
+
+
+async def _deprecate_alignment(ctx, alignment_idx: int) -> None:
+    await ctx["pool"].execute(
+        "UPDATE qiita.alignment_definition SET status = $2, deprecated_at = now(),"
+        "       deprecated_by_idx = (SELECT MIN(idx) FROM qiita.principal),"
+        "       deprecation_reason = 'aligner build was wrong'"
+        " WHERE alignment_idx = $1",
+        alignment_idx,
+        AlignmentDefinitionStatus.DEPRECATED.value,
+    )
+
+
+def _refused_naming_the_flag(resp) -> None:
+    assert resp.status_code == 409, resp.text
+    detail = resp.json()["detail"]
+    assert detail["reason"] == "deprecated"
+    assert detail["deprecation_reason"] == "aligner build was wrong"
+    assert "--include-deprecated" in detail["detail"]
+
+
+async def test_a_deprecated_alignment_is_refused_without_the_flag_and_read_with_it(
+    ctx, pool_alignment_seed
+):
+    seed = pool_alignment_seed
+    await _deprecate_alignment(ctx, seed["align_1"])
+    body = {"prep_sample_idx": [seed["ps_a"]], "columns": _COLUMNS}
+
+    _refused_naming_the_flag(await ctx["user"].post(_mint_url(seed["align_1"]), json=body))
+
+    resp = await ctx["user"].post(
+        _mint_url(seed["align_1"]), json={**body, "include_deprecated": True}
+    )
+    assert resp.status_code == 201, resp.text
+    assert _decode_ticket_payload(resp.json()["ticket"])["filter"] == {
+        "alignment_idx": [seed["align_1"]],
+        "prep_sample_idx": [seed["ps_a"]],
+    }
+
+
+async def test_the_flag_changes_nothing_for_an_active_alignment(ctx, pool_alignment_seed):
+    seed = pool_alignment_seed
+    body = {"prep_sample_idx": [seed["ps_a"]], "columns": _COLUMNS}
+    plain = await ctx["user"].post(_mint_url(seed["align_1"]), json=body)
+    flagged = await ctx["user"].post(
+        _mint_url(seed["align_1"]), json={**body, "include_deprecated": True}
+    )
+    assert (plain.status_code, flagged.status_code) == (201, 201)
+    assert (
+        _decode_ticket_payload(plain.json()["ticket"])["filter"]
+        == _decode_ticket_payload(flagged.json()["ticket"])["filter"]
+    )
+
+
+async def test_an_exact_read_refuses_a_sample_whose_mask_run_is_withdrawn(
+    ctx, alignment_group_world
+):
+    w = alignment_group_world
+    await _deprecate_alignment(ctx, w["align_1"])
+    await w["gate"]("mask_sample", w["mask_idx"], w["ps_a"], "invalidated")
+    resp = await ctx["user"].post(
+        _mint_url(w["align_1"]),
+        json={"prep_sample_idx": [w["ps_a"]], "columns": _COLUMNS, "include_deprecated": True},
+    )
+    assert resp.status_code == 409, resp.text
+    detail = resp.json()["detail"]
+    assert detail["reason"] == "not_processed"
+    assert detail["samples"][0]["reason"] == "upstream_withdrawn"
+
+
+async def test_an_exact_read_ignores_a_newer_member_of_the_group(ctx, alignment_group_world):
+    """ps_a is aligned under both members; the group reads align_3, the newer one. An
+    exact read of the deprecated align_1 reads align_1's own rows."""
+    w = alignment_group_world
+    await w["gate"]("mask_sample", w["mask_2"], w["ps_a"], MASK_SAMPLE_COMPLETED)
+    await w["gate"]("alignment_sample", w["align_3"], w["ps_a"], ALIGNMENT_SAMPLE_COMPLETED)
+    await _deprecate_alignment(ctx, w["align_1"])
+    resp = await ctx["user"].post(
+        _mint_url(w["align_1"]),
+        json={"prep_sample_idx": [w["ps_a"]], "columns": _COLUMNS, "include_deprecated": True},
+    )
+    assert resp.status_code == 201, resp.text
+
+
+@pytest.mark.parametrize("route", [URL_EXPORTED_IDENTIFIER, URL_EXPORTED_PROCESSING])
+async def test_the_alignment_mints_take_the_flag(ctx, pool_alignment_seed, route):
+    seed = pool_alignment_seed
+    body = {"alignment_idx": seed["align_1"], "prep_sample_idx": [seed["ps_a"]]}
+    try:
+        plain = await ctx["user"].post(route, json=body)
+        assert plain.status_code == 201, plain.text
+        assert (
+            await ctx["user"].post(route, json={**body, "include_deprecated": True})
+        ).json() == (plain.json())
+        await _deprecate_alignment(ctx, seed["align_1"])
+        _refused_naming_the_flag(await ctx["user"].post(route, json=body))
+        flagged = await ctx["user"].post(route, json={**body, "include_deprecated": True})
+        assert flagged.status_code == 201, flagged.text
+        assert flagged.json() == plain.json()
+    finally:
+        await ctx["pool"].execute(
+            "DELETE FROM qiita.exported_identifier WHERE alignment_idx = $1", seed["align_1"]
+        )
+        await ctx["pool"].execute(
+            "DELETE FROM qiita.exported_processing WHERE alignment_idx = $1", seed["align_1"]
+        )

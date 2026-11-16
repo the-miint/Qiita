@@ -176,8 +176,8 @@ from ..repositories.sequencing_run import (
 )
 from ._helpers import (
     GENERIC_FK_VIOLATION,
+    alignment_exact_read,
     cap_rows,
-    refuse_deprecated_alignment,
     resolve_idxs_by_natural_key,
 )
 
@@ -803,6 +803,9 @@ async def get_sequenced_pool_alignment_cohort(
     caller: HumanUser = Depends(require_human),
     _scope: Principal = Depends(require_scope(Scope.PREP_SAMPLE_READ)),
     _pool_in_run: None = Depends(require_sequenced_pool_in_run),
+    include_deprecated: bool = Query(
+        default=False, description="List the cohort of a deprecated alignment."
+    ),
 ) -> PoolAlignmentCohort:
     """Resolve the cohort to mint an alignment DoGet ticket for: this pool's
     prep_samples that are both readable by the caller and `'completed'` for this
@@ -819,9 +822,10 @@ async def get_sequenced_pool_alignment_cohort(
     "nothing here you may mint", and unlike a rejection it does not confirm
     which of the pool's alignments touch data the caller lacks.
 
-    A deprecated alignment with a non-empty cohort is 409: no mint accepts it, so
-    the cohort is not a valid mint body. Checked after the cohort is resolved, so
-    the status is told only to a caller who may read some of it, as in
+    A deprecated alignment with a non-empty cohort is 409 unless
+    `include_deprecated` (`alignment_exact_read`): no mint accepts it without the
+    flag, so the cohort is not a valid mint body. Checked after the cohort is
+    resolved, so the status is told only to a caller who may read some of it, as in
     `authorize_completed_alignment_cohort`.
     """
     prep_sample_idxs = await _readable_pool_prep_samples(
@@ -829,7 +833,10 @@ async def get_sequenced_pool_alignment_cohort(
     )
     cohort = await list_completed_alignment_samples(pool, alignment_idx, prep_sample_idxs)
     if cohort:
-        refuse_deprecated_alignment(await fetch_alignment_definition_by_idx(pool, alignment_idx))
+        alignment_exact_read(
+            await fetch_alignment_definition_by_idx(pool, alignment_idx),
+            include_deprecated=include_deprecated,
+        )
     return PoolAlignmentCohort(
         sequencing_run_idx=sequencing_run_idx,
         sequenced_pool_idx=sequenced_pool_idx,

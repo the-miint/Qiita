@@ -69,7 +69,7 @@ from ..auth.guards import (
 )
 from ..auth.principal import HumanUser, Principal, ServiceAccount
 from ..auth.tickets import sign_ticket
-from ..definition_resolver import cohort_refusal, resolve_group
+from ..definition_resolver import cohort_refusal, resolve_exact, resolve_group
 from ..definition_similarity import (
     DefinitionNotFound,
     PairRefused,
@@ -533,21 +533,24 @@ async def create_alignment_cohort_doget_ticket(
     After that gate, every prep_sample must resolve to this alignment in its group
     (`definition_resolver`): a prep_sample processed under another member,
     incomplete, or not processed (a withdrawn or deprecated upstream included) is a
-    409 naming its resolution.
+    409 naming its resolution. A deprecated alignment is read only under
+    `include_deprecated`, and then exactly (`resolve_exact`): its own completed,
+    non-withdrawn rows, still refusing a prep_sample whose mask run is withdrawn.
     """
-    cohort = await authorize_completed_alignment_cohort(
+    cohort, exact = await authorize_completed_alignment_cohort(
         pool,
         caller=caller,
         alignment_idx=alignment_idx,
         prep_sample_idx=body.prep_sample_idx,
         nothing_to="",
+        include_deprecated=body.include_deprecated,
     )
     try:
         async with (
             pool.acquire() as conn,
             conn.transaction(isolation="repeatable_read", readonly=True),
         ):
-            resolution = await resolve_group(
+            resolution = await (resolve_exact if exact else resolve_group)(
                 conn,
                 kind=DefinitionKind.ALIGNMENT,
                 definition_idx=alignment_idx,

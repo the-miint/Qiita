@@ -82,6 +82,7 @@ async def mint_exported_processing_handle(
         alignment_idx=body.alignment_idx,
         prep_sample_idx=body.prep_sample_idx,
         nothing_to="; a manifest describes processed data, so there is nothing yet to describe",
+        include_deprecated=body.include_deprecated,
     )
 
     try:

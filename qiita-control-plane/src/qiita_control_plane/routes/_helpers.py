@@ -163,17 +163,17 @@ GENOME_MAP_HARD_CAP = 250_000
 SAMPLE_STUDIES_HARD_CAP = 500_000
 
 
-def refuse_deprecated_alignment(alignment: asyncpg.Record) -> None:
-    """409 when `alignment` (an `alignment_definition` row) is deprecated: a
-    deprecated config is void for every consumer that names a cohort of it."""
-    if alignment["status"] == AlignmentDefinitionStatus.DEPRECATED.value:
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                f"alignment {alignment['alignment_idx']} is deprecated:"
-                f" {alignment['deprecation_reason']}"
-            ),
-        )
+def alignment_exact_read(alignment: asyncpg.Record, *, include_deprecated: bool) -> bool:
+    """`deprecated_read` for an `alignment_definition` row: True when a read naming it
+    reads its own results in exact mode, 409 naming the flag when it is deprecated and
+    `include_deprecated` is not set."""
+    return deprecated_read(
+        kind=DefinitionKind.ALIGNMENT,
+        idx=alignment["alignment_idx"],
+        deprecated=alignment["status"] == AlignmentDefinitionStatus.DEPRECATED.value,
+        deprecation_reason=alignment["deprecation_reason"],
+        include_deprecated=include_deprecated,
+    )
 
 
 # The CLI spelling of the flag every explicit read of a deprecated definition takes;
@@ -235,17 +235,21 @@ async def authorize_completed_alignment_cohort(
     alignment_idx: int,
     prep_sample_idx: list[int],
     nothing_to: str,
-) -> list[int]:
+    include_deprecated: bool = False,
+) -> tuple[list[int], bool]:
     """The gate every route that names a cohort of one alignment runs, and the single
-    copy of the order it runs in. Returns the authorized cohort.
+    copy of the order it runs in. Returns the authorized cohort, and whether the read
+    is exact (`alignment_exact_read`: a deprecated alignment under
+    `include_deprecated`).
 
     **The order is a disclosure decision, not a style.** Four checks:
 
     1. **The alignment exists** → 404, before anything discloses cohort state.
     2. **Access** → 403, all-or-nothing. A partially-served cohort would answer for some
        of a caller's samples and silently omit the rest.
-    2a. **The alignment is active** → 409. A deprecated config is void for every
-       consumer; after access so its status is told only to a caller who may read it.
+    2a. **The alignment is active, or `include_deprecated` names it** → 409 naming
+       the flag otherwise (`alignment_exact_read`); after access so its status is told
+       only to a caller who may read it.
     3. **Completeness** → 422, only once access has passed. Reversed, the 422's sample
        list would tell a caller which samples are in an alignment they have no right to
        read at all. It also subsumes an unknown identifier: a prep_sample that is not
@@ -268,7 +272,7 @@ async def authorize_completed_alignment_cohort(
         pool, caller=caller, prep_sample_idx=prep_sample_idx, min_tier=COHORT_MIN_TIER
     )
 
-    refuse_deprecated_alignment(alignment)
+    exact = alignment_exact_read(alignment, include_deprecated=include_deprecated)
 
     incomplete = await list_incomplete_alignment_samples(pool, alignment_idx, cohort)
     if incomplete:
@@ -277,7 +281,7 @@ async def authorize_completed_alignment_cohort(
             f" {alignment_idx} (e.g. {first_few(incomplete)})"
         )
         raise HTTPException(status_code=422, detail=f"{detail}{nothing_to}")
-    return cohort
+    return cohort, exact
 
 
 def first_few(idxs: list[int], limit: int = 5) -> str:

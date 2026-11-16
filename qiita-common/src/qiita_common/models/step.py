@@ -345,6 +345,9 @@ class AlignmentCohortDoGetTicketRequest(BaseModel):
     prep_sample_idx: PrepSampleCohort
     # Required here, unlike its optional twin above — see the class docstring.
     columns: ProjectionColumns
+    # Reads a deprecated alignment's own rows (refused without it): the route's
+    # `deprecated_read`.
+    include_deprecated: bool = False
 
 
 class AssemblyDoGetTicketRequest(BaseModel):

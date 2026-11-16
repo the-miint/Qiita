@@ -887,7 +887,9 @@ async def test_cohort_doget_refuses_a_deprecated_alignment(client, lc):
         json={"prep_sample_idx": [a], "columns": ["alignment_idx"]},
     )
     assert resp.status_code == 409, resp.text
-    assert _REASON in resp.json()["detail"]
+    detail = resp.json()["detail"]
+    assert detail["reason"] == "deprecated"
+    assert _REASON in detail["detail"] and "--include-deprecated" in detail["detail"]
 
 
 async def test_cohort_doget_refuses_an_invalidated_sample(client, lc):
