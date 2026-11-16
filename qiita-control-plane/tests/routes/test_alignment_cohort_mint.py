@@ -778,9 +778,10 @@ async def test_a_deprecated_alignments_listing_leaves_out_a_withdrawn_mask_run(
         seed["ps_a"],
         seed["owner_idx"],
     )
-    accession = await ctx["pool"].fetchval(
-        "SELECT bs.biosample_accession FROM qiita.prep_sample ps"
-        "  JOIN qiita.biosample bs ON bs.idx = ps.biosample_idx WHERE ps.idx = $1",
+    accession, entity = await ctx["pool"].fetchrow(
+        "SELECT bs.biosample_accession, ee.export_entity_id FROM qiita.prep_sample ps"
+        "  JOIN qiita.biosample bs ON bs.idx = ps.biosample_idx"
+        "  JOIN qiita.exported_entity ee ON ee.biosample_idx = bs.idx WHERE ps.idx = $1",
         seed["ps_a"],
     )
     after = await ctx["user"].get(url, params={"include_deprecated": True})
@@ -791,6 +792,7 @@ async def test_a_deprecated_alignments_listing_leaves_out_a_withdrawn_mask_run(
         {
             "prep_sample_idx": seed["ps_a"],
             "biosample_accession": accession,
+            "biosample_export_entity_id": entity,
             "state": "not_processed",
             "reason": "upstream_withdrawn",
         }

@@ -1108,7 +1108,6 @@ def _manifest_payload(
     tools: dict[str, str],
     denovo: dict[str, Any] | None = None,
     left_out: list[dict[str, Any]] | None = None,
-    left_out_by_accession: list[dict[str, Any]] | None = None,
     decisions: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """The bundle's record of what produced the table — the one artifact here that is
@@ -1122,11 +1121,12 @@ def _manifest_payload(
     and the rest is represented by the digest, which is what identifies the config anyway.
     `processing` is `_manifest_parts` over the reference arm's parts: one part per
     alignment that the cohort's prep_samples resolved to, and the map from each
-    prep_sample to its part. `table.left_out` is `_left_out_identifiers`: the default
-    cohort's prep_samples that the table leaves out, by `export_id`; empty for a named
-    cohort, which is refused instead. `table.left_out_by_accession` (`_exact_left_out`),
-    present only for a deprecated `--alignment-idx` read under --include-deprecated,
-    lists the prep_samples that the pool cohort route left out of its default cohort.
+    prep_sample to its part. `table.left_out` is the default cohort's prep_samples that the
+    table leaves out, as `_left_out_record`s: from the group resolution
+    (`_left_out_identifiers`, named by `export_id`), or, for a deprecated
+    `--alignment-idx` read under --include-deprecated, from the pool cohort route
+    (`_exact_left_out`, named by biosample handles); empty for a named cohort, which is
+    refused instead.
 
     `files` are basenames: the bundle's members relative to wherever it lands, since an
     absolute path describes the machine that built it.
@@ -1167,12 +1167,7 @@ def _manifest_payload(
             **({"denovo": denovo} if denovo is not None else {}),
             # Sorted, so the record does not depend on the order the mint answered in.
             "cohort": sorted(identifier["export_id"] for identifier in identifiers),
-            "left_out": left_out or [],
-            **(
-                {"left_out_by_accession": left_out_by_accession}
-                if left_out_by_accession is not None
-                else {}
-            ),
+            "left_out": sorted(left_out or [], key=_left_out_sort_key),
         },
         "tools": tools,
         "files": [path.name for path in files],
@@ -1592,7 +1587,6 @@ def _resolve_cohort(
         if anchor in listed:
             for sample in completed(pool, anchor):
                 listed_under.setdefault(sample, set()).add(anchor)
-    exact_left_out = _exact_left_out(left_out, f"alignment {anchor}") if exact else None
     if not listed_under:
         raise ValueError(
             f"no prep_sample of the named sequenced_pool(s) {sorted(p for _, p in per_pool)}"
@@ -1601,7 +1595,11 @@ def _resolve_cohort(
             f" completed count."
         )
     if exact:
-        return _Cohort(sorted(listed_under), listed_under, exact_left_out)
+        return _Cohort(
+            sorted(listed_under),
+            listed_under,
+            _exact_left_out(left_out, f"alignment {anchor}", denovo=False),
+        )
     group = set(
         _resolve_definition_group(
             base_url,
@@ -1620,25 +1618,76 @@ def _resolve_cohort(
     return _Cohort(sorted(listed_under), listed_under)
 
 
-def _exact_left_out(entries: list[dict[str, Any]], read: str) -> list[dict[str, Any]]:
+# The de novo arm's left-out `state` for a run that failed or has not finished
+# (`_exact_left_out`); the reference arm keeps the resolution state.
+DENOVO_LEFT_OUT_FAILED = "failed"
+DENOVO_LEFT_OUT_RUNNING = "running"
+_DENOVO_LEFT_OUT_STATE = {
+    SampleResolutionReason.FAILED.value: DENOVO_LEFT_OUT_FAILED,
+    SampleResolutionReason.IN_PROGRESS.value: DENOVO_LEFT_OUT_RUNNING,
+}
+
+
+def _left_out_record(
+    *,
+    export_id: str | None,
+    biosample_accession: str | None,
+    biosample_export_entity_id: str | None,
+    state: str,
+    reason: str | None,
+) -> dict[str, Any]:
+    """One manifest `left_out` entry. It names its prep_sample by `export_id` when one
+    was minted, else by its biosample's accession and `QB<n>` handle; a prep_sample with
+    no completed run has no public handle of its own, so two prep_samples of one
+    biosample can share an entry's handles. No `_idx`."""
+    return {
+        "export_id": export_id,
+        "biosample_accession": biosample_accession,
+        "biosample_export_entity_id": biosample_export_entity_id,
+        "state": state,
+        "reason": reason,
+    }
+
+
+def _left_out_sort_key(record: dict[str, Any]) -> tuple[str, str, str]:
+    return (
+        record["export_id"] or "",
+        record["biosample_accession"] or "",
+        record["biosample_export_entity_id"] or "",
+    )
+
+
+def _left_out_name(record: dict[str, Any]) -> str:
+    return (
+        record["export_id"]
+        or record["biosample_accession"]
+        or record["biosample_export_entity_id"]
+        or "(no public handle)"
+    )
+
+
+def _exact_left_out(
+    entries: list[dict[str, Any]], read: str, *, denovo: bool
+) -> list[dict[str, Any]]:
     """The manifest's record of what an exact read of a deprecated alignment left out,
-    from the pool cohort route's `left_out` entries: each prep_sample's biosample
-    accession, `state` (`failed` or `running` for a run that failed or has not finished,
-    else the resolution state) and reason, sorted by accession, with no `_idx`. Each is
-    listed on stderr."""
+    from the pool cohort route's `left_out` entries (the rule is the route's
+    `_NO_RUN_TO_READ`), as `_left_out_record`s. `state` is the resolution state, or, on
+    the de novo arm, `DENOVO_LEFT_OUT_FAILED` / `DENOVO_LEFT_OUT_RUNNING` for a run that
+    failed or has not finished. Each is listed on stderr."""
     records = sorted(
         (
-            {
-                "biosample_accession": e.get("biosample_accession"),
-                "state": {
-                    SampleResolutionReason.FAILED.value: "failed",
-                    SampleResolutionReason.IN_PROGRESS.value: "running",
-                }.get(e["reason"], e["state"]),
-                "reason": e["reason"],
-            }
+            _left_out_record(
+                export_id=None,
+                biosample_accession=e.get("biosample_accession"),
+                biosample_export_entity_id=e.get("biosample_export_entity_id"),
+                state=(
+                    _DENOVO_LEFT_OUT_STATE.get(e["reason"], e["state"]) if denovo else e["state"]
+                ),
+                reason=e["reason"],
+            )
             for e in entries
         ),
-        key=lambda r: (r["biosample_accession"] is None, r["biosample_accession"] or ""),
+        key=_left_out_sort_key,
     )
     if records:
         print(
@@ -1647,7 +1696,7 @@ def _exact_left_out(entries: list[dict[str, Any]], read: str) -> list[dict[str, 
             file=sys.stderr,
         )
         for r in records:
-            print(f"  {r['biosample_accession']}: {r['state']} ({r['reason']})", file=sys.stderr)
+            print(f"  {_left_out_name(r)}: {r['state']} ({r['reason']})", file=sys.stderr)
     return records
 
 
@@ -1691,8 +1740,8 @@ def _left_out_identifiers(
     include_deprecated: bool = False,
     include_deprecated_upstream: bool = False,
 ) -> list[dict[str, Any]]:
-    """The manifest's record of the left-out prep_samples: each one's `export_id`, state
-    and reason, sorted by `export_id`. The `export_id` is minted under the highest-idx
+    """The manifest's record of the left-out prep_samples, as `_left_out_record`s named by
+    `export_id`, sorted. The `export_id` is minted under the highest-idx
     alignment that the cohort route listed the prep_sample completed under, which the
     identifier mint admits."""
     if not left_out:
@@ -1707,8 +1756,8 @@ def _left_out_identifiers(
         by_alignment.setdefault(max(cohort.listed_under[entry.prep_sample_idx]), []).append(entry)
     out = []
     for alignment_idx, entries in sorted(by_alignment.items()):
-        export_id_of = {
-            minted["prep_sample_idx"]: minted["export_id"]
+        minted_by_sample = {
+            minted["prep_sample_idx"]: minted
             for minted in _mint_exported_identifiers(
                 base_url,
                 token,
@@ -1719,14 +1768,18 @@ def _left_out_identifiers(
             )
         }
         out.extend(
-            {
-                "export_id": export_id_of[entry.prep_sample_idx],
-                "state": entry.state.value,
-                "reason": entry.reason.value if entry.reason is not None else None,
-            }
+            _left_out_record(
+                export_id=minted_by_sample[entry.prep_sample_idx]["export_id"],
+                biosample_accession=minted_by_sample[entry.prep_sample_idx].get(
+                    "biosample_accession"
+                ),
+                biosample_export_entity_id=None,
+                state=entry.state.value,
+                reason=entry.reason.value if entry.reason is not None else None,
+            )
             for entry in entries
         )
-    return sorted(out, key=lambda record: record["export_id"])
+    return sorted(out, key=_left_out_sort_key)
 
 
 def _refuse_unprocessed(refused: list[SampleResolution], *, anchor: str) -> None:
@@ -1815,9 +1868,8 @@ def _plan_denovo(
     the cohort's prep_samples that the pool cohort route lists completed under it have
     its arm, every other one stays reference-only, and the cohort DoGet resolves the
     arm's prep_samples exactly. The cohort's prep_samples that the route leaves out of
-    that cohort although they have a run on it (failed, running, withdrawn, or on a
-    withdrawn mask run) stay reference-only too, and are listed on stderr and returned
-    for the manifest's `denovo.left_out`.
+    that cohort (its `left_out`, whose rule the route states) stay reference-only too,
+    and are listed on stderr and returned for the manifest's `denovo.left_out`.
 
     The resolve of the de novo group carries both flags, so it reads past exactly the
     deprecated upstreams they admit (`admitted_deprecated_upstream_kinds`): a deprecated
@@ -1848,6 +1900,7 @@ def _plan_denovo(
         left_out = _exact_left_out(
             [e for e in listed_left_out if e["prep_sample_idx"] in in_cohort],
             f"de novo alignment {anchor}",
+            denovo=True,
         )
         resolution = _exact_resolution(
             summaries[anchor], [sample for sample in cohort if sample in on_anchor]
@@ -2275,8 +2328,7 @@ def _run_build(
             reference=reference,
             processing=processing,
             identifiers=identifiers,
-            left_out=left_out_records,
-            left_out_by_accession=resolved_cohort.exact_left_out,
+            left_out=left_out_records + (resolved_cohort.exact_left_out or []),
             rows=clearance.rows,
             files=files,
             tools=tools,

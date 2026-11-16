@@ -1578,12 +1578,14 @@ class PoolAlignmentList(BaseModel):
 
 
 class PoolAlignmentCohortLeftOut(BaseModel):
-    """A readable prep_sample with a run under a deprecated alignment that its exact
-    read (`definition_resolver.resolve_exact`) does not resolve `processed`: its run
-    there failed or is running, is withdrawn, or reads a withdrawn mask run."""
+    """A readable prep_sample that the exact read of a deprecated alignment
+    (`definition_resolver.resolve_exact`) leaves out; the rule is
+    `routes/sequencing_run._NO_RUN_TO_READ`. `biosample_export_entity_id` is the
+    biosample's `QB<n>`, which names it when it has no accession."""
 
     prep_sample_idx: Annotated[int, Field(gt=0)]
     biosample_accession: str | None = None
+    biosample_export_entity_id: str | None = None
     state: SampleResolutionState
     reason: SampleResolutionReason
 

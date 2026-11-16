@@ -605,15 +605,16 @@ async def import_biosample_from_owner_biosample_id(
     )
 
 
-async def fetch_biosample_accessions(
+async def fetch_biosample_handles(
     conn: asyncpg.Pool | asyncpg.Connection, prep_sample_idxs: Sequence[int]
-) -> dict[int, str | None]:
-    """Each prep_sample's biosample accession (None when it has none), keyed by
-    prep_sample_idx."""
+) -> dict[int, tuple[str | None, str | None]]:
+    """Each prep_sample's biosample accession and the biosample's `export_entity_id`
+    (`QB<n>`), each None when there is none, keyed by prep_sample_idx."""
     rows = await conn.fetch(
-        "SELECT ps.idx AS prep_sample_idx, bs.biosample_accession"
+        "SELECT ps.idx AS prep_sample_idx, bs.biosample_accession, ee.export_entity_id"
         "  FROM qiita.prep_sample ps JOIN qiita.biosample bs ON bs.idx = ps.biosample_idx"
+        "  LEFT JOIN qiita.exported_entity ee ON ee.biosample_idx = bs.idx"
         " WHERE ps.idx = ANY($1::bigint[])",
         list(prep_sample_idxs),
     )
-    return {r["prep_sample_idx"]: r["biosample_accession"] for r in rows}
+    return {r["prep_sample_idx"]: (r["biosample_accession"], r["export_entity_id"]) for r in rows}

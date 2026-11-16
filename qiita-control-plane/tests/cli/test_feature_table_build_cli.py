@@ -2369,7 +2369,15 @@ def test_an_omitted_cohort_leaves_out_unprocessed_samples_and_records_them(
     assert "prep_sample 2: incomplete (failed), alignment 3, work_ticket 55" in err
     table = _manifest(tmp_path)["table"]
     assert table["cohort"] == ["QM1"]
-    assert table["left_out"] == [{"export_id": "QM2", "state": "incomplete", "reason": "failed"}]
+    assert table["left_out"] == [
+        {
+            "export_id": "QM2",
+            "biosample_accession": None,
+            "biosample_export_entity_id": None,
+            "state": "incomplete",
+            "reason": "failed",
+        }
+    ]
 
 
 def test_an_omitted_cohort_with_nothing_processed_is_refused(monkeypatch, tmp_path, capsys):
@@ -2832,7 +2840,8 @@ def test_a_deprecated_alignments_default_cohort_records_what_it_left_out(
 ):
     """The cohort route leaves a prep_sample whose mask run is withdrawn out of a
     deprecated alignment's exact cohort; the build succeeds over the rest and records it
-    by biosample accession, with no `_idx`."""
+    in `table.left_out` by its biosample's accession and QB handle, with no `_idx`; an
+    unaccessioned biosample is named on stderr by its QB handle."""
     rec = _patched(monkeypatch)
     _deprecated_listing(monkeypatch, rec)
     monkeypatch.setattr(
@@ -2844,9 +2853,17 @@ def test_a_deprecated_alignments_default_cohort_records_what_it_left_out(
                 {
                     "prep_sample_idx": 5,
                     "biosample_accession": "SAMEA5",
+                    "biosample_export_entity_id": "QB5",
                     "state": "not_processed",
                     "reason": "upstream_withdrawn",
-                }
+                },
+                {
+                    "prep_sample_idx": 6,
+                    "biosample_accession": None,
+                    "biosample_export_entity_id": "QB6",
+                    "state": "incomplete",
+                    "reason": "failed",
+                },
             ],
         },
     )
@@ -2854,10 +2871,27 @@ def test_a_deprecated_alignments_default_cohort_records_what_it_left_out(
 
     assert ftc._handle_feature_table_build(args, parser=None) == 0
     table = _manifest(tmp_path)["table"]
-    assert table["left_out_by_accession"] == [
-        {"biosample_accession": "SAMEA5", "state": "not_processed", "reason": "upstream_withdrawn"}
+    assert "left_out_by_accession" not in table
+    assert table["left_out"] == [
+        {
+            "export_id": None,
+            "biosample_accession": None,
+            "biosample_export_entity_id": "QB6",
+            "state": "incomplete",
+            "reason": "failed",
+        },
+        {
+            "export_id": None,
+            "biosample_accession": "SAMEA5",
+            "biosample_export_entity_id": "QB5",
+            "state": "not_processed",
+            "reason": "upstream_withdrawn",
+        },
     ]
-    assert "SAMEA5: not_processed (upstream_withdrawn)" in capsys.readouterr().err
+    assert "idx" not in json.dumps(table["left_out"])
+    err = capsys.readouterr().err
+    assert "SAMEA5: not_processed (upstream_withdrawn)" in err
+    assert "QB6: incomplete (failed)" in err and "None:" not in err
 
 
 def test_a_deprecated_denovo_alignment_records_its_failed_and_running_runs(
@@ -2910,7 +2944,13 @@ def test_a_deprecated_denovo_alignment_records_its_failed_and_running_runs(
     denovo = _manifest(tmp_path)["table"]["denovo"]
     # Prep_sample 9 is not in the cohort, so it is not recorded.
     assert denovo["left_out"] == [
-        {"biosample_accession": "SAMEA2", "state": "failed", "reason": "failed"}
+        {
+            "export_id": None,
+            "biosample_accession": "SAMEA2",
+            "biosample_export_entity_id": None,
+            "state": ftc.DENOVO_LEFT_OUT_FAILED,
+            "reason": "failed",
+        }
     ]
     assert "SAMEA2: failed (failed)" in capsys.readouterr().err
     assert "idx" not in json.dumps(denovo["left_out"])

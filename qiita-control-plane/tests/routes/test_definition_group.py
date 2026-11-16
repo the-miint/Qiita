@@ -827,9 +827,10 @@ async def test_a_deprecated_alignments_cohort_listing_leaves_out_a_failed_run(
         " WHERE alignment_idx = $1",
         w["align_1"],
     )
-    accession = await ctx["pool"].fetchval(
-        "SELECT bs.biosample_accession FROM qiita.prep_sample ps"
-        "  JOIN qiita.biosample bs ON bs.idx = ps.biosample_idx WHERE ps.idx = $1",
+    accession, entity = await ctx["pool"].fetchrow(
+        "SELECT bs.biosample_accession, ee.export_entity_id FROM qiita.prep_sample ps"
+        "  JOIN qiita.biosample bs ON bs.idx = ps.biosample_idx"
+        "  JOIN qiita.exported_entity ee ON ee.biosample_idx = bs.idx WHERE ps.idx = $1",
         w["ps_c"],
     )
     resp = await ctx["user"].get(url, params={"include_deprecated": True})
@@ -838,6 +839,7 @@ async def test_a_deprecated_alignments_cohort_listing_leaves_out_a_failed_run(
         {
             "prep_sample_idx": w["ps_c"],
             "biosample_accession": accession,
+            "biosample_export_entity_id": entity,
             "state": INCOMPLETE,
             "reason": R.FAILED,
         }

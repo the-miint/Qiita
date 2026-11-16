@@ -53,7 +53,7 @@ the sibling sequenced_sample route module.
 
 import base64
 import json
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -98,6 +98,7 @@ from qiita_common.models import (
     PoolReadMetrics,
     PoolWorkTicketSummary,
     SampleQCReport,
+    SampleResolution,
     SampleResolutionReason,
     SampleResolutionState,
     SequencedPoolCreateRequest,
@@ -161,7 +162,7 @@ from ..repositories.alignment_definition import (
     list_completed_alignment_samples,
     list_pool_prep_sample_idxs,
 )
-from ..repositories.biosample import fetch_biosample_accessions
+from ..repositories.biosample import fetch_biosample_handles
 from ..repositories.mask_definition import MaskDefinitionDeprecated
 from ..repositories.sequencing_run import (
     PayloadMismatch,
@@ -844,11 +845,9 @@ async def get_sequenced_pool_alignment_cohort(
 
     For a deprecated alignment under `include_deprecated`, the cohort is the readable
     prep_samples that its exact read (`resolve_exact`) resolves `processed`, and
-    `left_out` lists, with their biosample accessions, the readable prep_samples with
-    a run under it that the exact read does not: a failed or running run, a withdrawn
-    one, or one whose mask run is withdrawn (an assembly that produced no contigs is
-    not listed). A build reading that alignment leaves
-    them out and records them.
+    `left_out` lists the readable prep_samples the exact read leaves out
+    (`_NO_RUN_TO_READ` states the rule), with their biosample handles. A build reading
+    that alignment leaves them out and records them.
     """
     prep_sample_idxs = await _readable_pool_prep_samples(
         pool, sequenced_pool_idx=sequenced_pool_idx, caller=caller
@@ -877,17 +876,30 @@ async def get_sequenced_pool_alignment_cohort(
     )
 
 
-# Not processed, and nothing to leave out: no run under the alignment, or (de novo) an
-# assembly that produced no contigs.
+# The exact read's left-out rule: every prep_sample it does not resolve `processed` is
+# left out and reported, except one with nothing to read there: no run under the
+# alignment, or (de novo) an assembly that produced no contigs.
 _NO_RUN_TO_READ = frozenset({SampleResolutionReason.NO_RUN, SampleResolutionReason.NO_DATA})
+
+
+def exact_read_left_out(samples: Iterable[SampleResolution]) -> list[SampleResolution]:
+    """The prep_samples an exact read leaves out (`_NO_RUN_TO_READ`), ascending."""
+    return sorted(
+        (
+            r
+            for r in samples
+            if r.state is not SampleResolutionState.PROCESSED and r.reason not in _NO_RUN_TO_READ
+        ),
+        key=lambda r: r.prep_sample_idx,
+    )
 
 
 async def _exact_cohort(
     pool: asyncpg.Pool, alignment_idx: int, prep_sample_idxs: list[int]
 ) -> tuple[list[int], list[PoolAlignmentCohortLeftOut]]:
     """`prep_sample_idxs` read under `alignment_idx` alone (`resolve_exact`): those it
-    resolves `processed`, and those with a run under it that it does not, each with its
-    biosample accession; both ascending."""
+    resolves `processed`, and those it leaves out (`_NO_RUN_TO_READ` states the rule),
+    each with its biosample's accession and `QB<n>` handle; both ascending."""
     async with pool.acquire() as conn, conn.transaction(isolation="repeatable_read", readonly=True):
         resolution = await resolve_exact(
             conn,
@@ -898,20 +910,17 @@ async def _exact_cohort(
         processed = [
             ps for ps, r in resolution.samples.items() if r.state is SampleResolutionState.PROCESSED
         ]
-        left = [
-            r
-            for r in resolution.samples.values()
-            if r.state is not SampleResolutionState.PROCESSED and r.reason not in _NO_RUN_TO_READ
-        ]
-        accessions = await fetch_biosample_accessions(conn, [r.prep_sample_idx for r in left])
+        left = exact_read_left_out(resolution.samples.values())
+        handles = await fetch_biosample_handles(conn, [r.prep_sample_idx for r in left])
     return sorted(processed), [
         PoolAlignmentCohortLeftOut(
             prep_sample_idx=r.prep_sample_idx,
-            biosample_accession=accessions.get(r.prep_sample_idx),
+            biosample_accession=handles[r.prep_sample_idx][0],
+            biosample_export_entity_id=handles[r.prep_sample_idx][1],
             state=r.state,
             reason=r.reason,
         )
-        for r in sorted(left, key=lambda r: r.prep_sample_idx)
+        for r in left
     ]
 
 

@@ -91,9 +91,9 @@
   The 409's `detail` is now an object (`detail`, `reason`, `deprecation_reason`)
   where it was the message. For an alignment that is not deprecated the flag changes
   nothing. With the flag, the pool cohort listing leaves out the prep_samples that the
-  exact read does not resolve processed (a failed or running run, a withdrawn one, or
-  a withdrawn mask run) and lists them in `left_out`; the build records them by
-  biosample accession (`table.left_out_by_accession`, `table.denovo.left_out`) instead
+  exact read does not resolve processed, for any reason but `no_run` / `no_data`, and
+  lists them in `left_out`; the build records them by their biosample's accession and
+  `QB<n>` handle (`table.left_out`, `table.denovo.left_out`) instead
   of failing a default-cohort build on them. A prep_sample named with
   `--prep-sample-idx` is still refused. The flag also reads a de novo arm whose
   assembly run is deprecated.
