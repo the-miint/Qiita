@@ -167,15 +167,19 @@ async def _persist_processing_idx(
     """Write the minted `processing_idx` onto the ticket row. Run right after the mint;
     a re-mint on resume resolves the same processing_idx and writes the same value.
 
-    Unlike the mask_idx and alignment_idx writes, it takes no `FOR SHARE` lock on the
-    definition: those close a race with a deprecation that refuses while unfinished
-    tickets name the definition, and deprecating a processing makes no such check.
-    The mint itself refuses a deprecated processing."""
-    await pool.execute(
-        "UPDATE qiita.work_ticket SET processing_idx = $1 WHERE work_ticket_idx = $2",
-        processing_idx,
-        work_ticket_idx,
-    )
+    The processing row is held `FOR SHARE` in the same transaction, as the mask_idx and
+    alignment_idx writes hold theirs: a settings edit holds it `FOR UPDATE` while it
+    checks for unfinished tickets (`definition_settings`, step 2a), so the edit and
+    this write cannot both commit with neither seeing the other."""
+    async with pool.acquire() as conn, conn.transaction():
+        await conn.execute(
+            "SELECT 1 FROM qiita.processing WHERE processing_idx = $1 FOR SHARE", processing_idx
+        )
+        await conn.execute(
+            "UPDATE qiita.work_ticket SET processing_idx = $1 WHERE work_ticket_idx = $2",
+            processing_idx,
+            work_ticket_idx,
+        )
 
 
 def _workflow_writes_assembly_gate(steps: list[Any]) -> bool:

@@ -457,6 +457,77 @@ async def test_an_edit_is_refused_while_work_runs_under_the_definition(
         )
 
 
+@pytest.mark.parametrize("kind", list(DefinitionKind))
+async def test_an_edit_waits_for_a_ticket_write_holding_the_definition_and_then_sees_it(
+    postgres_pool, clients, defs, kind
+):
+    """A transaction that holds the definition `FOR SHARE` (as the ticket writers do)
+    and writes a ticket under it blocks the edit until it commits; the edit then sees
+    the ticket and refuses (`live_work`)."""
+    import asyncio
+
+    from qiita_common.models import ScopeTargetKind, WorkTicketState
+
+    from qiita_control_plane.repositories.block import create_block
+    from qiita_control_plane.testing.db_seeds import (
+        delete_action_if_created,
+        seed_action_if_absent,
+    )
+
+    idx = await defs["make"](kind, threshold=1)
+    created = await seed_action_if_absent(
+        postgres_pool,
+        action_id=_TICKET_ACTION,
+        version=_TICKET_VERSION,
+        target_kind=ScopeTargetKind.BLOCK.value,
+    )
+    async with postgres_pool.acquire() as conn, conn.transaction():
+        block_idx = await create_block(conn)
+    table, col = _TABLE[kind]
+    ticket = None
+    try:
+        body = {
+            "params": {**await _params(postgres_pool, kind, idx), "threshold": 2},
+            "reason": _REASON,
+        }
+        writer = await postgres_pool.acquire()
+        try:
+            tx = writer.transaction()
+            await tx.start()
+            await writer.execute(f"SELECT 1 FROM {table} WHERE {col} = $1 FOR SHARE", idx)
+            ticket = await writer.fetchval(
+                "INSERT INTO qiita.work_ticket (action_id, action_version,"
+                "  originator_principal_idx, scope_target_kind, block_idx, state, " + col + ")"
+                " VALUES ($1, $2, $3, 'block', $4, $5::qiita.work_ticket_state, $6)"
+                " RETURNING work_ticket_idx",
+                _TICKET_ACTION,
+                _TICKET_VERSION,
+                defs["owner"],
+                block_idx,
+                WorkTicketState.PENDING.value,
+                idx,
+            )
+            edit = asyncio.create_task(clients["admin"].patch(_url(kind, idx), json=body))
+            await asyncio.sleep(0.5)
+            assert not edit.done()
+            await tx.commit()
+        finally:
+            await postgres_pool.release(writer)
+        resp = await edit
+        assert resp.status_code == 409, resp.text
+        assert resp.json()["detail"]["reason"] == DefinitionSettingsRefusal.LIVE_WORK
+        assert (await _params(postgres_pool, kind, idx))["threshold"] == 1
+    finally:
+        if ticket is not None:
+            await postgres_pool.execute(
+                "DELETE FROM qiita.work_ticket WHERE work_ticket_idx = $1", ticket
+            )
+        await postgres_pool.execute("DELETE FROM qiita.block WHERE block_idx = $1", block_idx)
+        await delete_action_if_created(
+            postgres_pool, action_id=_TICKET_ACTION, version=_TICKET_VERSION, created=created
+        )
+
+
 @pytest.mark.parametrize("kind", [DefinitionKind.MASK, DefinitionKind.ALIGNMENT])
 async def test_an_edit_is_refused_while_a_public_handle_cites_the_definition(
     postgres_pool, clients, defs, kind
