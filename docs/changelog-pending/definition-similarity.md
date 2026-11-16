@@ -30,6 +30,19 @@
   mask's public handles, and refuses to overwrite a file that the manifest records
   under another mask. Two exports into one directory merge their entries under a lock.
 
+- **Outputs record the pair decisions they were built under, and can be rebuilt under
+  earlier ones (#874).** The resolve route, the masked-read export roster and ticket,
+  the SynDNA count export and the alignment cohort DoGet return `decisions`: a
+  `sha256:` token of every decided pair's verdict (`decision_set`), when its newest
+  decision was recorded, and the count and token of the decided pairs naming a
+  definition the resolution read. The feature-table manifest, each masked-read export
+  manifest entry and the SynDNA sidecar record it. Passing the token back as
+  `as_of_event` (`--as-of-event` on `qiita feature-table build`, `qiita-admin
+  masked-read-export` and `qiita mask syndna-read-count`) groups the definitions as
+  those decisions did; runs, gates, tickets and deprecation are read as they are now.
+  A token that names no decision set is refused (422). A feature-table build sends
+  the decision set its anchor resolved under with every later resolve and DoGet.
+
 ### Changed
 
 - **The masked-read export and the SynDNA count export read each prep_sample from the

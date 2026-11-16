@@ -678,6 +678,9 @@ async def test_masked_read_export_e2e_across_a_mask_group(
     }
     assert files[name_1]["export_processing_id"] == handles[mask_1]
     assert files[name_2]["export_processing_id"] == handles[mask_2]
+    # Both files were exported under the one decision set that grouped the masks.
+    assert files[name_1]["decisions"] == files[name_2]["decisions"]
+    assert files[name_1]["decisions"]["pairs_used"] == 1
     assert handles[mask_1] != handles[mask_2]
     for name, (ps, mask) in {name_1: (ps_1, mask_1), name_2: (ps_2, mask_2)}.items():
         assert files[name]["export_id"] == await postgres_pool.fetchval(

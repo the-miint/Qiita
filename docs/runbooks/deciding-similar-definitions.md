@@ -106,6 +106,19 @@ so does `qiita feature-table build` over its default cohort (it also records the
 the manifest under `table.left_out`); a build over prep_samples named with
 `--prep-sample-idx`, and the cohort DoGet, refuse them.
 
+Each output records the decisions it was grouped under (`decisions` in the
+feature-table manifest, in each masked-read export manifest entry and in the SynDNA
+`<output>.metadata.json`). To rebuild it after a decision has changed, pass its
+`decisions.decision_set` back:
+
+```bash
+qiita feature-table build ... --as-of-event sha256:<hex>
+```
+
+Only the pair decisions are taken from then: runs, gates, tickets and deprecation are
+read as they are now, so a run withdrawn since is still left out. A token that names no
+decision set is refused (422). `decision_set.py` states what the token hashes.
+
 ## 5. Revoke, or deprecate a decided definition
 
 ```bash

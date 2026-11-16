@@ -869,6 +869,8 @@ async def test_a_cohort_across_pools_builds_one_table_in_parts(
     part_a, part_b = (part["export_processing_id"] for part in parts)
     assert part_a != part_b and all(h.startswith("QP") for h in (part_a, part_b))
     assert manifest["processing"]["sample_part"] == {handles[ps0]: part_a, handles[ps1]: part_b}
+    # The mask pair the two alignments are grouped through is the decision recorded.
+    assert (manifest["decisions"]["as_of"], manifest["decisions"]["pairs_used"]) == (False, 1)
     assert "idx" not in json.dumps(manifest)
 
     # --- A cohort with a sample not processed in the group is refused, not narrowed. ---

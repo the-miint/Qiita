@@ -372,3 +372,9 @@ that pair would split a group that other `similar` pairs may rely on. The proced
   routes take it shared before reading the pairs that name the definition, so a
   `similar` decision and the deprecation of one of its sides cannot both commit.
   Readers of the groups take no lock: they read one REPEATABLE READ snapshot.
+- **Decision provenance.** Every resolution records the decision set it was computed
+  under (`decision_set`): a content hash of every decided pair's verdict, replayed from
+  `qiita.definition_pair_event` in the resolution's snapshot, so no pair or event idx
+  leaves the system. Passed back as `as_of_event`, it makes `load_groups` read the
+  pairs' verdicts at that point and everything else as it is now; the guards never use
+  it.
