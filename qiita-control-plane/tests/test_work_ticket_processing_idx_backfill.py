@@ -18,8 +18,9 @@ from pathlib import Path
 import pytest
 import pytest_asyncio
 from qiita_common.actions import LONG_READ_ASSEMBLY_ACTION_ID, context_schema_default
-from qiita_common.models import WorkTicketState
+from qiita_common.models import ScopeTargetKind, WorkTicketState
 
+from qiita_control_plane.repositories.assembly import ASSEMBLY_SAMPLE_COMPLETED
 from qiita_control_plane.repositories.mask_definition import mint_mask_definition
 from qiita_control_plane.repositories.processing import mint_processing
 from qiita_control_plane.runner._mask import MASK_IDX_BINDING
@@ -67,12 +68,13 @@ async def bf(postgres_pool):
         "INSERT INTO qiita.action"
         " (action_id, version, target_kind, scopes, audience, context_schema, steps,"
         "  cpu_ceiling, mem_ceiling_gb, walltime_ceiling, success_status, failure_status)"
-        " VALUES ($1, $2, 'prep_sample', '{}'::text[], $3::jsonb,"
+        " VALUES ($1, $2, $5::qiita.scope_target_kind, '{}'::text[], $3::jsonb,"
         "         $4::jsonb, '[]'::jsonb, 1, 1, '1 minute', 'active', 'failed')",
         LONG_READ_ASSEMBLY_ACTION_ID,
         version,
         '{"service": false, "human_roles": ["system_admin"]}',
         json.dumps(_CONTEXT_SCHEMA),
+        ScopeTargetKind.PREP_SAMPLE.value,
     )
 
     async def _processing(action_context: dict) -> int:
@@ -91,6 +93,16 @@ async def bf(postgres_pool):
 
     default_run = await _processing({})
     flye_run = await _processing({"assembler": "flye"})
+    # Minted for another prep_sample: no gate row for this one.
+    other_sample_run = await _processing({"assembler": "hifiasm"})
+    for run in (default_run, flye_run):
+        await postgres_pool.execute(
+            "INSERT INTO qiita.assembly_sample (processing_idx, prep_sample_idx, state)"
+            " VALUES ($1, $2, $3)",
+            run,
+            prep_sample_idx,
+            ASSEMBLY_SAMPLE_COMPLETED,
+        )
 
     async def _ticket(
         action_context: dict, *, mask: int | None = mask_idx, processing: int | None = None
@@ -99,7 +111,7 @@ async def bf(postgres_pool):
             "INSERT INTO qiita.work_ticket"
             " (action_id, action_version, originator_principal_idx, scope_target_kind,"
             "  prep_sample_idx, action_context, mask_idx, processing_idx, state)"
-            " VALUES ($1, $2, $3, 'prep_sample', $4, $5::jsonb, $6, $7,"
+            " VALUES ($1, $2, $3, $9::qiita.scope_target_kind, $4, $5::jsonb, $6, $7,"
             "         $8::qiita.work_ticket_state) RETURNING work_ticket_idx",
             LONG_READ_ASSEMBLY_ACTION_ID,
             version,
@@ -109,14 +121,17 @@ async def bf(postgres_pool):
             mask,
             processing,
             WorkTicketState.COMPLETED.value,
+            ScopeTargetKind.PREP_SAMPLE.value,
         )
 
     tickets = {
         "default": await _ticket({"mask_idx": mask_idx}),
         "empty_assembler": await _ticket({"mask_idx": mask_idx, "assembler": ""}),
         "flye": await _ticket({"mask_idx": mask_idx, "assembler": "flye"}),
+        # Its params' row was minted for another prep_sample only.
+        "other_sample": await _ticket({"mask_idx": mask_idx, "assembler": "hifiasm"}),
         # Params no processing row holds: a ticket that ended before its mint.
-        "never_minted": await _ticket({"mask_idx": mask_idx, "assembler": "hifiasm"}),
+        "never_minted": await _ticket({"mask_idx": mask_idx, "assembler": "verkko"}),
         # Not started: the runner had not recorded the consumed mask.
         "not_started": await _ticket({"mask_idx": mask_idx}, mask=None),
         # Set to another run than its params name, so "left alone" is distinguishable.
@@ -135,9 +150,12 @@ async def bf(postgres_pool):
         LONG_READ_ASSEMBLY_ACTION_ID,
         version,
     )
+    runs = [default_run, flye_run, other_sample_run]
     await postgres_pool.execute(
-        "DELETE FROM qiita.processing WHERE processing_idx = ANY($1::bigint[])",
-        [default_run, flye_run],
+        "DELETE FROM qiita.assembly_sample WHERE processing_idx = ANY($1::bigint[])", runs
+    )
+    await postgres_pool.execute(
+        "DELETE FROM qiita.processing WHERE processing_idx = ANY($1::bigint[])", runs
     )
     await postgres_pool.execute(
         "DELETE FROM qiita.action WHERE action_id = $1 AND version = $2",
@@ -165,14 +183,16 @@ async def _processing_of(bf) -> dict[str, int | None]:
 
 async def test_backfill_sets_the_processing_the_runner_minted(bf):
     """An omitted or empty assembler is the action's default, as the runner hashes it;
-    a ticket whose params no row holds, or that was not started, stays NULL; a set
-    column is left alone. Re-running changes nothing."""
+    a ticket whose params no row holds, or whose row was minted for another
+    prep_sample, or that was not started, stays NULL; a set column is left alone.
+    Re-running changes nothing."""
     before = await _processing_of(bf)
     assert before["default"] is None and before["already_set"] == bf["flye_run"]
     expected = {
         "default": bf["default_run"],
         "empty_assembler": bf["default_run"],
         "flye": bf["flye_run"],
+        "other_sample": None,
         "never_minted": None,
         "not_started": None,
         "already_set": bf["flye_run"],

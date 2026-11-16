@@ -54,9 +54,9 @@ _None yet._
 
 ### 6. After the deploy verifies green
 
-- `[operator]` **Re-run the idempotent `work_ticket.processing_idx` backfill**, for a `long-read-assembly` ticket that the old build started between `make migrate` (bucket 3) and the restart: its `processing_idx` is NULL, so the definition-group resolver does not count it as a run of its processing. dbmate does not re-apply a migration, so run its `migrate:up` block by hand. It only fills a NULL column, so it does not burn the rollback path. (#874)
+- `[operator]` **Re-run the idempotent `work_ticket.processing_idx` backfill**, for a `long-read-assembly` ticket that the old build started between `make migrate` (bucket 3) and the restart: its `processing_idx` is NULL, so the definition-group resolver does not count it as a run of its processing. dbmate does not re-apply a migration, so run its `migrate:up` block by hand. It only fills a NULL column, so it does not burn the rollback path. Run it right after the restart: a ticket that the new build ends before its mint is left NULL, and a later run could match it as the migration does. (#874)
   ```bash
-  # [operator] in the pulled checkout; DATABASE_URL as above
+  # [operator] in the pulled checkout; DATABASE_URL set as in docs/runbooks/redeploy.md (migrate step)
   cd ~/qiita-miint/qiita-control-plane
   sed -n '/^-- migrate:up/,/^-- migrate:down/p' db/migrations/20261116000001_backfill_work_ticket_processing_idx.sql | psql "$DATABASE_URL" -v ON_ERROR_STOP=1
   ```

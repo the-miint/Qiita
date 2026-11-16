@@ -20,7 +20,7 @@
 - **`qiita-admin masked-read-export` writes `masked-read-export.manifest.json` (#874)**
   mapping each file that it writes, or finds up to date, to the prep_sample's and the
   mask's public handles, and refuses to overwrite a file that the manifest records
-  under another mask. Runs into one directory merge their entries under a lock.
+  under another mask. Two exports into one directory merge their entries under a lock.
 
 ### Changed
 

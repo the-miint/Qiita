@@ -107,13 +107,11 @@ def denovo_alignment_processing_idx(
       rather than between two placements of one read. When `reference_mask_group`
       is given (the mask group of the reference arm's mask, from
       `definition_similarity.Groups.group_of`), the de novo arm's mask must be in it
-      instead: masks decided similar are one pass-set for this purpose. Only the
-      client recipe passes it, and only for the two alignments the caller named
-      (`cli/user/feature_table._plan_denovo`); it pairs each prep_sample's two
-      resolved arms exactly. The server-side callers (the runner's
-      `_validate_denovo_arm`, the service-account alignment DoGet's
-      `_denovo_arm_covered`) pass no group and do not resolve groups, so they still
-      require the two arms' `mask_idx` to be equal.
+      instead: masks decided similar are one pass-set for this purpose. A caller that
+      does not resolve groups passes none, so the runner's feature-table submit and
+      the service-account alignment DoGet still require the two arms' `mask_idx` to
+      be equal; the client build passes one only for the two alignments the caller
+      named, and pairs each prep_sample's two resolved arms exactly.
 
     `processing_idx` is returned rather than taken as a parameter because it is IN
     the de novo alignment's hashed params: the assembly run and the alignment against

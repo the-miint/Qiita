@@ -168,8 +168,10 @@ def _fetch_processing(base_url: str, token: str, *, processing_idx: int) -> dict
 
 
 def _refuse_deprecated_denovo_run(base_url: str, token: str, *, processing_idx: int) -> None:
-    """Refuse a deprecated assembly run as a de novo arm, the client-side half of the
-    rule `runner/_feature_table.py` applies server-side.
+    """Refuse a deprecated assembly run as a de novo arm, with the wording that
+    `runner/_feature_table.py` uses server-side. The client asks this of each run that
+    a prep_sample reads (`_plan_denovo`); the runner, which does not resolve groups,
+    of the named de novo alignment's run.
 
     `denovo_alignment_processing_idx` states why neither driver may be the only one
     that checks, and `denovo_assembly_deprecation_error` owns the wording so the two
@@ -199,7 +201,9 @@ def _resolve_definition_group(
     which member it is processed under or why it is not.
 
     The cohort is sent in chunks of at most `_RESOLVE_CHUNK` prep_samples, the route's
-    cap, so a cohort over the cap resolves when each chunk is under it. Each prep_sample
+    cap, so a cohort over the cap resolves. Only the resolve is chunked: each part's
+    DoGet and handle mints carry the part's whole cohort, so a part over the cap is
+    refused by those routes. Each prep_sample
     resolves on its own, so the chunks' samples are joined; a group that differs
     between chunks (a pair decision committed between two requests) is refused rather
     than joined. Each body goes through the route's request model and each answer
@@ -852,7 +856,7 @@ _UNKNOWN_VERSION = "unknown"
 # The manifest's shape, recorded as its `schema_version`. 2 is `processing.parts` /
 # `processing.sample_part` (and the same under `table.denovo`); a manifest with no
 # `schema_version` is the earlier shape, with one `processing.export_processing_id`,
-# `params_hash` and `aligner`. Raised whenever a key is renamed, moved or removed.
+# `params_hash` and `aligner`. Incremented whenever a key is renamed, moved or removed.
 MANIFEST_SCHEMA_VERSION = 2
 
 MANIFEST_NOTE = (
@@ -1586,7 +1590,8 @@ def _run_build(
     **Parts.** The cohort may span pools, and each prep_sample is resolved
     (`/definition-group/resolve`) in `--alignment-idx`'s group; the prep_samples are read
     per resolved alignment, one part each, and the parts' streams are unioned before
-    staging (`staged_streams`), so the analytic runs once over the whole cohort.
+    staging (`staged_streams`), so the analytic runs once over the whole cohort; the
+    gate's diagnostics run per part (`_gate_clearance`).
     Identifiers and the manifest's processing handles are minted per part.
 
     Ordered so that everything cheap and refusable happens first: a wrong

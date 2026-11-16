@@ -399,8 +399,9 @@ Two consequences worth stating here, because neither is visible from any single 
   each, and the parts' DoGet streams are chained into one staged relation
   (`staged_streams`), so the analytic runs once over the whole cohort. The manifest
   carries one `export_processing_id` per part and maps each prep_sample's `export_id`
-  to its part's handle; the de novo arm's parts are recorded the same way, each paired
-  with a reference part whose mask is in the same mask group.
+  to its part's handle; the de novo arm's parts are recorded the same way. Each
+  prep_sample's two arms are on one mask; the two alignments the caller names may be
+  on two masks of one group.
 
 Client half: `qiita_control_plane.cli.user.feature_table`, with `cli.user.alignment` for
 the discovery reads that yield an `alignment_idx`. The reference is read out of the

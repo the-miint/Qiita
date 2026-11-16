@@ -164,11 +164,13 @@ async def _mint_processing_idx(
 async def _persist_processing_idx(
     pool: asyncpg.Pool, work_ticket_idx: int, processing_idx: int
 ) -> None:
-    """Write the minted `processing_idx` onto the ticket row.
+    """Write the minted `processing_idx` onto the ticket row. Run right after the mint;
+    a re-mint on resume resolves the same processing_idx and writes the same value.
 
-    The definition resolver reads this column to tell which processing a ticket's run
-    belongs to (`repositories.definition_run`). Run right after the mint; a re-mint on
-    resume resolves the same processing_idx and writes the same value."""
+    Unlike the mask_idx and alignment_idx writes, it takes no `FOR SHARE` lock on the
+    definition: those close a race with a deprecation that refuses while unfinished
+    tickets name the definition, and deprecating a processing makes no such check.
+    The mint itself refuses a deprecated processing."""
     await pool.execute(
         "UPDATE qiita.work_ticket SET processing_idx = $1 WHERE work_ticket_idx = $2",
         processing_idx,

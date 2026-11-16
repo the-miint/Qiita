@@ -24,7 +24,12 @@ from qiita_common.api_paths import (
     URL_AUTH_WHOAMI,
 )
 from qiita_common.auth_constants import BEARER_PREFIX
-from qiita_common.models import DefinitionKind, SampleResolutionReason, SampleResolutionState
+from qiita_common.models import (
+    DefinitionKind,
+    DeprecationRefusal,
+    SampleResolutionReason,
+    SampleResolutionState,
+)
 
 from qiita_control_plane.cli.admin._helpers import (
     EXIT_PRECONDITION_FAILED,
@@ -2990,7 +2995,7 @@ def test_alignment_deprecate_surfaces_the_unfinished_tickets_409(monkeypatch, ca
         {
             "detail": {
                 "detail": "alignment 7 has 1 unfinished work ticket(s): [42]",
-                "reason": "live_work",
+                "reason": DeprecationRefusal.LIVE_WORK.value,
                 "work_ticket_idx": [42],
             }
         },

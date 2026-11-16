@@ -499,9 +499,9 @@ def _circular_gated_sql(clearance: GateClearance) -> str:
 
 
 def gate_diagnostics_sql(gate: AlignmentGate, *, source: str = STREAMED_ALIGNMENT_TABLE) -> str:
-    """One row for `check_gate_diagnostics`, over `source` (by default
-    `STREAMED_ALIGNMENT_TABLE`, or a relation with its columns that holds a subset of
-    its rows):
+    """One row for `check_gate_diagnostics`, over `source`: by default
+    `STREAMED_ALIGNMENT_TABLE`, or a view that holds some of that table's rows with
+    all of its columns.
     `(total_rows, scorable_rows, unpoolable_partitions, unpoolable_rows, secondary_rows,
     scorable_secondary_rows, unscorable_groups, paired_rows)`.
 

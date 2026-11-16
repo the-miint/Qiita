@@ -54,9 +54,10 @@ class _KindTables:
     block_actions: tuple[str, ...]
 
 
-# The workflows whose processing runs this module reads: their tickets record
-# `processing_idx` and their prep_samples get an `assembly_sample` gate row. A
-# processing of any other workflow has runs that nothing here can see.
+# The workflows whose processing runs this module reads: a prep_sample's run of one of
+# them has an `assembly_sample` gate row. Another workflow that mints a processing
+# (amplicon) records `processing_idx` on its tickets too, but writes no gate row, so
+# nothing here can tell its prep_samples' runs apart.
 PROCESSING_RUN_WORKFLOWS: tuple[str, ...] = (LONG_READ_ASSEMBLY_ACTION_ID,)
 
 # Interpolated into SQL, so the map is closed.

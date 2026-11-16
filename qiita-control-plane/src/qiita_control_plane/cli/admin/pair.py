@@ -159,11 +159,13 @@ def add_pair_parser(subparsers) -> None:
     sp.add_argument("--kind", choices=kinds, default=None)
     sp.add_argument("--limit", type=int, default=100, help="page size (max 1000)")
     sp.add_argument(
-        "--after", type=int, default=None, help="cursor: a page's next_after_definition_pair_idx"
+        "--after",
+        type=int,
+        default=None,
+        help="list the next page: the pairs older than this one (a page's"
+        " next_after_definition_pair_idx)",
     )
-    sp.add_argument(
-        "--all", dest="all_pages", action="store_true", help="follow the cursor to the end"
-    )
+    sp.add_argument("--all", dest="all_pages", action="store_true", help="fetch every page")
     sp.set_defaults(handler=_handle_list)
 
     sp = sub.add_parser("show", help="show one pair and its history")
