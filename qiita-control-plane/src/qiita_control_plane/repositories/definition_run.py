@@ -6,10 +6,8 @@ Nothing here decides a prep_sample's state; `qiita_control_plane.definition_reso
 does, from these rows.
 """
 
-import json
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any
 
 import asyncpg
 from qiita_common.actions import (
@@ -56,9 +54,7 @@ class _KindTables:
     block_actions: tuple[str, ...]
 
 
-# Interpolated into SQL, so the map is closed. A processing's runs are produced by
-# tickets that record no processing_idx; `fetch_assembly_ticket_candidates` reads
-# those.
+# Interpolated into SQL, so the map is closed.
 _KIND_TABLES: dict[DefinitionKind, _KindTables] = {
     DefinitionKind.MASK: _KindTables(
         gate_table="qiita.mask_sample",
@@ -74,9 +70,14 @@ _KIND_TABLES: dict[DefinitionKind, _KindTables] = {
         sample_actions=(ALIGN_DENOVO_ACTION_ID,),
         block_actions=(ALIGN_ACTION_ID,),
     ),
+    DefinitionKind.PROCESSING: _KindTables(
+        gate_table="qiita.assembly_sample",
+        gate_column="processing_idx",
+        ticket_column="processing_idx",
+        sample_actions=(LONG_READ_ASSEMBLY_ACTION_ID,),
+        block_actions=(),
+    ),
 }
-
-_PROCESSING_GATE_TABLE = "qiita.assembly_sample"
 
 
 async def fetch_run_rows(
@@ -88,26 +89,11 @@ async def fetch_run_rows(
     """Every gate row of `kind` for these definitions and prep_samples, and every
     producing ticket that is not cancelled: prep_sample-scoped tickets naming the
     definition, and the tickets of blocks that cover the prep_sample and are not
-    abandoned. One statement, so gates and tickets are read from one snapshot.
-
-    For `processing`, gate rows only; the tickets come from
-    `fetch_assembly_ticket_candidates`, a second statement (`resolve_group` says
-    which isolation that needs)."""
+    abandoned. One statement, so gates and tickets are read from one snapshot."""
     definitions = sorted(set(definition_idxs))
     samples = sorted(set(prep_sample_idxs))
     if not definitions or not samples:
         return []
-    if kind is DefinitionKind.PROCESSING:
-        rows = await conn.fetch(
-            f"SELECT $3::text AS source, processing_idx AS definition_idx, prep_sample_idx,"
-            f"       state, NULL::bigint AS work_ticket_idx"
-            f"  FROM {_PROCESSING_GATE_TABLE}"
-            f" WHERE processing_idx = ANY($1::bigint[]) AND prep_sample_idx = ANY($2::bigint[])",
-            definitions,
-            samples,
-            SOURCE_GATE,
-        )
-        return [RunRow(**dict(r)) for r in rows]
     t = _KIND_TABLES[kind]
     rows = await conn.fetch(
         f"SELECT $5::text AS source, g.{t.gate_column} AS definition_idx, g.prep_sample_idx,"
@@ -144,57 +130,3 @@ async def fetch_run_rows(
         BLOCK_ABANDONED,
     )
     return [RunRow(**dict(r)) for r in rows]
-
-
-@dataclass(frozen=True)
-class AssemblyTicketCandidate:
-    """A long-read-assembly ticket that the runner has started (its consumed
-    `mask_idx` is recorded), with what is needed to compute the processing params
-    that it mints."""
-
-    work_ticket_idx: int
-    prep_sample_idx: int
-    state: str
-    action_id: str
-    action_version: str
-    action_context: dict[str, Any]
-    mask_idx: int
-    context_schema: dict[str, Any]
-
-
-def _decode(value: Any) -> Any:
-    return json.loads(value) if isinstance(value, str) else value
-
-
-async def fetch_assembly_ticket_candidates(
-    conn: asyncpg.Connection, prep_sample_idxs: Sequence[int]
-) -> list[AssemblyTicketCandidate]:
-    """The long-read-assembly tickets of these prep_samples that are not cancelled and
-    that the runner has started: the runner records a ticket's `mask_idx` before it
-    mints the processing, so a ticket with none is not started and is not
-    returned."""
-    samples = sorted(set(prep_sample_idxs))
-    if not samples:
-        return []
-    rows = await conn.fetch(
-        "SELECT wt.work_ticket_idx, wt.prep_sample_idx, wt.state,"
-        "       wt.action_id, wt.action_version, wt.action_context, wt.mask_idx,"
-        "       a.context_schema"
-        "  FROM qiita.work_ticket wt"
-        "  JOIN qiita.action a ON a.action_id = wt.action_id AND a.version = wt.action_version"
-        " WHERE wt.action_id = $1 AND wt.prep_sample_idx = ANY($2::bigint[])"
-        "   AND wt.mask_idx IS NOT NULL AND wt.state <> $3::qiita.work_ticket_state",
-        LONG_READ_ASSEMBLY_ACTION_ID,
-        samples,
-        WorkTicketState.CANCELLED.value,
-    )
-    return [
-        AssemblyTicketCandidate(
-            **{
-                **dict(r),
-                "action_context": _decode(r["action_context"]) or {},
-                "context_schema": _decode(r["context_schema"]) or {},
-            }
-        )
-        for r in rows
-    ]

@@ -18,7 +18,6 @@ from qiita_control_plane.definition_resolver import (
     RunObservation,
     build_observations,
     cohort_refusal,
-    match_assembly_tickets,
     needed_definitions,
     resolve_sample,
 )
@@ -47,7 +46,6 @@ from qiita_control_plane.repositories.definition_run import (
     SOURCE_BLOCK_TICKET,
     SOURCE_GATE,
     SOURCE_SAMPLE_TICKET,
-    AssemblyTicketCandidate,
     RunRow,
 )
 
@@ -484,31 +482,6 @@ def test_a_ticket_row_without_a_ticket_id_is_refused():
         build_observations(
             [RunRow(SOURCE_SAMPLE_TICKET, 12, S, WorkTicketState.FAILED.value, None)]
         )
-
-
-def _candidate(**context):
-    return AssemblyTicketCandidate(
-        work_ticket_idx=99,
-        prep_sample_idx=S,
-        state=WorkTicketState.PROCESSING.value,
-        action_id="long-read-assembly",
-        action_version="1.0.0",
-        action_context=context,
-        mask_idx=5,
-        context_schema={"properties": {"assembler": {"default": "myloasm"}}},
-    )
-
-
-def test_an_assembly_ticket_matches_the_processing_its_params_mint():
-    """An omitted assembler is the action's default, as the runner hashes it."""
-    params = {30: assembly(30, 5).params, 31: {**assembly(31, 5).params, "assembler": "flye"}}
-    rows = match_assembly_tickets([_candidate(mask_idx=5)], params)
-    assert [(r.definition_idx, r.work_ticket_idx, r.source) for r in rows] == [
-        (30, 99, SOURCE_SAMPLE_TICKET)
-    ]
-    rows = match_assembly_tickets([_candidate(mask_idx=5, assembler="flye")], params)
-    assert [r.definition_idx for r in rows] == [31]
-    assert match_assembly_tickets([_candidate(mask_idx=5, assembler="hifiasm")], params) == []
 
 
 # ---------------------------------------------------------------------------

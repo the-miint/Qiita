@@ -1,7 +1,7 @@
 """DB tests for POST /definition-group/resolve: authorization (VIEWER on every study
 of every sample, refused whole), a cohort spanning pools, and the run reads the
 resolver makes against Postgres (gate rows, block and per-sample tickets, cancelled
-and abandoned ones, assembly tickets matched by params).
+and abandoned ones, assembly tickets by the processing they record).
 
 The rules are unit-tested in tests/test_definition_resolver.py.
 """
@@ -179,17 +179,18 @@ async def tickets(ctx):
         state: str,
         mask_idx: int,
         action_context: dict | None = None,
+        processing_idx: int | None = None,
     ) -> int:
         await _action(action_id, ScopeTargetKind.PREP_SAMPLE.value)
         ticket = await db.fetchval(
             "INSERT INTO qiita.work_ticket ("
             "  action_id, action_version, originator_principal_idx, scope_target_kind,"
             "  prep_sample_idx, mask_idx, state, action_context,"
-            "  failure_type, failure_stage, failure_step_name, failure_reason"
+            "  failure_type, failure_stage, failure_step_name, failure_reason, processing_idx"
             ") VALUES ($1, $2, $3, $12::qiita.scope_target_kind, $4, $5,"
             "          $6::qiita.work_ticket_state,"
             "          $7::jsonb, $8::qiita.failure_type,"
-            "          $9::qiita.work_ticket_failure_stage, $10, $11)"
+            "          $9::qiita.work_ticket_failure_stage, $10, $11, $13)"
             " RETURNING work_ticket_idx",
             action_id,
             _TEST_VERSION,
@@ -200,6 +201,7 @@ async def tickets(ctx):
             json.dumps(action_context or {}),
             *_failure(state),
             ScopeTargetKind.PREP_SAMPLE.value,
+            processing_idx,
         )
         made.append(ticket)
         return ticket
@@ -365,12 +367,12 @@ async def test_a_failed_per_sample_mask_ticket_under_the_newer_mask_is_incomplet
     assert (s["state"], s["definition_idx"]) == (PROCESSED, w["mask_2"])
 
 
-async def test_an_assembly_ticket_is_matched_to_the_processing_it_mints(
+async def test_an_assembly_ticket_counts_for_the_processing_it_records(
     ctx, alignment_group_world, tickets
 ):
-    """A long-read-assembly ticket records no processing_idx; it counts for the
-    processing whose params it mints, here over a completed gate (a same-version
-    re-run)."""
+    """A long-read-assembly ticket counts for the processing written on it, here over a
+    completed gate (a same-version re-run). A failed one that records no processing
+    (it ended before its mint) is not a run, though it names the same mask."""
     w = alignment_group_world
     db = ctx["pool"]
     params = {
@@ -400,24 +402,30 @@ async def test_an_assembly_ticket_is_matched_to_the_processing_it_mints(
             w["mask_idx"],
         )
 
-        # The minted params carry no `probe`, so this ticket mints a different
-        # processing and leaves the sample processed.
         await tickets["sample"](
             LONG_READ_ASSEMBLY_ACTION_ID,
             prep_sample_idx=w["ps_a"],
-            state=WorkTicketState.PROCESSING,
+            state=WorkTicketState.FAILED,
             mask_idx=w["mask_idx"],
             action_context={"mask_idx": w["mask_idx"]},
         )
         s = _by_sample(await ctx["user"].post(URL_DEFINITION_GROUP_RESOLVE, json=body))[w["ps_a"]]
         assert s["state"] == PROCESSED
 
-        await db.execute(
-            "UPDATE qiita.processing SET params = params - 'probe' WHERE processing_idx = $1",
-            processing_idx,
+        ticket = await tickets["sample"](
+            LONG_READ_ASSEMBLY_ACTION_ID,
+            prep_sample_idx=w["ps_a"],
+            state=WorkTicketState.PROCESSING,
+            mask_idx=w["mask_idx"],
+            action_context={"mask_idx": w["mask_idx"]},
+            processing_idx=processing_idx,
         )
         s = _by_sample(await ctx["user"].post(URL_DEFINITION_GROUP_RESOLVE, json=body))[w["ps_a"]]
-        assert (s["state"], s["reason"]) == (INCOMPLETE, R.IN_PROGRESS)
+        assert (s["state"], s["reason"], s["work_ticket_idx"]) == (
+            INCOMPLETE,
+            R.IN_PROGRESS,
+            ticket,
+        )
     finally:
         # Ahead of the entity sweep: assembly_sample references this processing with
         # no ON DELETE action, so the processing row cannot go while it exists.

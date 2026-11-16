@@ -42,7 +42,7 @@ _None yet._
 - `20261112000000_host_taxon_id_not_required` makes `host_taxon_id` optional, and from the
   restart an absent value means no host. `dbmate` applies it; run the bucket-2 backfill
   first. (#864)
-- `20261113000000_definition_pair` adds `qiita.definition_pair` and `qiita.definition_pair_event`, empty, and `20261113000001_exported_processing_mask` adds a nullable `mask_idx` to `qiita.exported_processing` and `qiita.exported_identifier`, widening their one-processing CHECKs to it; no row changes. `dbmate` applies both. (#874)
+- `20261113000000_definition_pair` adds `qiita.definition_pair` and `qiita.definition_pair_event`, empty, and `20261113000001_exported_processing_mask` adds a nullable `mask_idx` to `qiita.exported_processing` and `qiita.exported_identifier`, widening their one-processing CHECKs to it; no row changes. `dbmate` applies both. `20261116000000_work_ticket_processing_idx` adds a nullable `processing_idx` to `qiita.work_ticket`, and `20261116000001_backfill_work_ticket_processing_idx` sets it on the started `long-read-assembly` tickets to the processing each one minted; idempotent, and a no-op on a fresh DB. A ticket that the old build starts between `make migrate` and the restart is not covered; the bucket-6 re-run closes that. (#874)
 
 ### 4. Deploy
 
@@ -54,7 +54,12 @@ _None yet._
 
 ### 6. After the deploy verifies green
 
-_None yet._
+- `[operator]` **Re-run the idempotent `work_ticket.processing_idx` backfill**, for a `long-read-assembly` ticket that the old build started between `make migrate` (bucket 3) and the restart: its `processing_idx` is NULL, so the definition-group resolver does not count it as a run of its processing. dbmate does not re-apply a migration, so run its `migrate:up` block by hand. It only fills a NULL column, so it does not burn the rollback path. (#874)
+  ```bash
+  # [operator] in the pulled checkout; DATABASE_URL as above
+  cd ~/qiita-miint/qiita-control-plane
+  sed -n '/^-- migrate:up/,/^-- migrate:down/p' db/migrations/20261116000001_backfill_work_ticket_processing_idx.sql | psql "$DATABASE_URL" -v ON_ERROR_STOP=1
+  ```
 
 ### Notes (no host action)
 

@@ -97,6 +97,7 @@ from ._processing import (
     ASSEMBLER_BINDING,
     _create_assembly_gate_pending,
     _mint_processing_idx,
+    _persist_processing_idx,
     _record_assembly_gate_no_data,
     _workflow_needs_processing,
     _workflow_writes_assembly_gate,
@@ -636,6 +637,7 @@ async def run_workflow(
             )
             bound.update(processing_bindings)
             minted_processing_idx = processing_bindings[PROCESSING_IDX_BINDING]
+            await _persist_processing_idx(pool, work_ticket_idx, minted_processing_idx)
 
         # Completion gate: a workflow declaring the terminal
         # `finalize-assembly-sample` action gets its qiita.assembly_sample row

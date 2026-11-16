@@ -161,6 +161,21 @@ async def _mint_processing_idx(
     return bindings
 
 
+async def _persist_processing_idx(
+    pool: asyncpg.Pool, work_ticket_idx: int, processing_idx: int
+) -> None:
+    """Write the minted `processing_idx` onto the ticket row.
+
+    The definition resolver reads this column to tell which processing a ticket's run
+    belongs to (`repositories.definition_run`). Run right after the mint; a re-mint on
+    resume resolves the same processing_idx and writes the same value."""
+    await pool.execute(
+        "UPDATE qiita.work_ticket SET processing_idx = $1 WHERE work_ticket_idx = $2",
+        processing_idx,
+        work_ticket_idx,
+    )
+
+
 def _workflow_writes_assembly_gate(steps: list[Any]) -> bool:
     """True iff some entry is the `finalize-assembly-sample` action.
 

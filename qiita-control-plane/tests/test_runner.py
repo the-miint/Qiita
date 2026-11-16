@@ -6896,6 +6896,13 @@ async def test_assembly_gate_reopens_a_no_data_row_for_a_re_run_of_the_same_iden
         )
         assert second_gate["processing_idx"] == first_gate["processing_idx"]
         assert second_gate["state"] == "pending"
+        # Each ticket records the processing it minted, the failed one included.
+        recorded = await postgres_pool.fetch(
+            "SELECT processing_idx FROM qiita.work_ticket"
+            " WHERE work_ticket_idx = ANY($1::bigint[])",
+            [first_ticket_idx, second_ticket_idx],
+        )
+        assert [r["processing_idx"] for r in recorded] == [first_gate["processing_idx"]] * 2
         assert (
             await postgres_pool.fetchval(
                 "SELECT state FROM qiita.work_ticket WHERE work_ticket_idx = $1",

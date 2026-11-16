@@ -8,10 +8,7 @@ produce it:
   - a prep_sample-scoped ticket that names the definition: the prep_sample's newest such
     ticket that is not cancelled (an older failed ticket that a later one
     superseded does not count);
-  - every block ticket whose block covers the prep_sample and is not abandoned;
-  - a long-read-assembly ticket, which records no processing_idx: it counts for the
-    processing whose params equal the params that the runner mints for it,
-    recomputed from the ticket with the runner's own builder.
+  - every block ticket whose block covers the prep_sample and is not abandoned.
   Cancelled tickets are ignored. A ticket counts only once the runner has written
   its definition on it (a per-sample ticket not yet started names none, so it does
   not make a prep_sample incomplete). A ticket is *unfinished* when it is waiting,
@@ -48,17 +45,15 @@ A not-processed member is not replaced by an older one.
     qiita-common wire model) and `GroupResolution.not_resolved_to(idx)`.
   - `cohort_refusal(resolution, definition_idx)`: the `DefinitionGroupRefusal` for
     a prep_sample that is not processed under exactly `definition_idx`, or None.
-  - Pure core: `build_observations`, `match_assembly_tickets`, `resolve_sample`,
-    `needed_definitions`.
+  - Pure core: `build_observations`, `resolve_sample`, `needed_definitions`.
 """
 
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, get_args
+from typing import get_args
 
 import asyncpg
-from qiita_common.actions import context_schema_default
 from qiita_common.models import (
     AlignmentSampleState,
     AssemblySampleState,
@@ -74,7 +69,6 @@ from qiita_common.models import (
 from .definition_similarity import (
     DefinitionNotFound,
     Groups,
-    canonical_json,
     is_definition_ref,
     load_groups,
     upstream_leaves,
@@ -100,20 +94,15 @@ from .repositories.definition_run import (
     SOURCE_BLOCK_TICKET,
     SOURCE_GATE,
     SOURCE_SAMPLE_TICKET,
-    AssemblyTicketCandidate,
     RunRow,
-    fetch_assembly_ticket_candidates,
     fetch_run_rows,
 )
-from .runner._mask import MASK_IDX_BINDING
-from .runner._processing import ASSEMBLER_BINDING, _build_processing_params
 
 __all__ = [
     "GroupResolution",
     "RunObservation",
     "build_observations",
     "cohort_refusal",
-    "match_assembly_tickets",
     "needed_definitions",
     "resolve_group",
     "resolve_sample",
@@ -251,36 +240,6 @@ def build_observations(rows: Iterable[RunRow]) -> dict[tuple[int, int], RunObser
                 )
             ),
         )
-    return out
-
-
-def match_assembly_tickets(
-    candidates: Iterable[AssemblyTicketCandidate],
-    processing_params: Mapping[int, Mapping[str, Any]],
-) -> list[RunRow]:
-    """The candidates whose minted params equal one of `processing_params`
-    (`{processing_idx: params}`), as per-sample ticket rows of that processing."""
-    by_params = {canonical_json(dict(params)): idx for idx, params in processing_params.items()}
-    out: list[RunRow] = []
-    for c in candidates:
-        bound = {**c.action_context, MASK_IDX_BINDING: c.mask_idx}
-        params = _build_processing_params(
-            c.action_id,
-            c.action_version,
-            bound,
-            assembler_default=context_schema_default(c.context_schema, ASSEMBLER_BINDING),
-        )
-        idx = by_params.get(canonical_json(params))
-        if idx is not None:
-            out.append(
-                RunRow(
-                    source=SOURCE_SAMPLE_TICKET,
-                    definition_idx=idx,
-                    prep_sample_idx=c.prep_sample_idx,
-                    state=c.state,
-                    work_ticket_idx=c.work_ticket_idx,
-                )
-            )
     return out
 
 
@@ -472,21 +431,14 @@ class GroupResolution:
 
 async def _load_observations(
     conn: asyncpg.Connection,
-    groups: Groups,
     needed: Mapping[DefinitionKind, set[int]],
     prep_sample_idxs: Sequence[int],
 ) -> dict[DefinitionKind, dict[tuple[int, int], RunObservation]]:
     out: dict[DefinitionKind, dict[tuple[int, int], RunObservation]] = {}
     for kind, idxs in needed.items():
-        rows = await fetch_run_rows(conn, kind, sorted(idxs), prep_sample_idxs)
-        if kind is DefinitionKind.PROCESSING:
-            candidates = await fetch_assembly_ticket_candidates(conn, prep_sample_idxs)
-            rows.extend(
-                match_assembly_tickets(
-                    candidates, {idx: groups.params_of(kind, idx) for idx in idxs}
-                )
-            )
-        out[kind] = build_observations(rows)
+        out[kind] = build_observations(
+            await fetch_run_rows(conn, kind, sorted(idxs), prep_sample_idxs)
+        )
     return out
 
 
@@ -517,7 +469,7 @@ async def resolve_group(
         raise DefinitionNotFound(kind, definition_idx)
     samples = sorted(set(prep_sample_idxs))
     needed = needed_definitions(groups, kind, definition_idx)
-    observations = await _load_observations(conn, groups, needed, samples)
+    observations = await _load_observations(conn, needed, samples)
     return GroupResolution(
         kind=kind,
         definition_idx=definition_idx,
