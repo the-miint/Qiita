@@ -537,27 +537,43 @@ async def create_alignment_cohort_doget_ticket(
     409 naming its resolution. A deprecated alignment is read only under
     `include_deprecated`, and then exactly (`resolve_exact`): its own completed,
     non-withdrawn rows, still refusing a prep_sample whose mask run is withdrawn.
+    An active alignment whose upstream is deprecated is read only under
+    `include_deprecated_upstream` (`deprecated_upstream_read`); the ticket response
+    names the deprecated upstreams read.
     """
-    cohort, exact = await authorize_completed_alignment_cohort(
+    read = await authorize_completed_alignment_cohort(
         pool,
         caller=caller,
         alignment_idx=alignment_idx,
         prep_sample_idx=body.prep_sample_idx,
         nothing_to="",
         include_deprecated=body.include_deprecated,
+        include_deprecated_upstream=body.include_deprecated_upstream,
     )
+    cohort = read.cohort
     try:
         async with (
             pool.acquire() as conn,
             conn.transaction(isolation="repeatable_read", readonly=True),
         ):
-            resolution = await (resolve_exact if exact else resolve_group)(
-                conn,
-                kind=DefinitionKind.ALIGNMENT,
-                definition_idx=alignment_idx,
-                prep_sample_idxs=cohort,
-                groups=await load_groups_as_of(conn, body.as_of_event),
-            )
+            groups = await load_groups_as_of(conn, body.as_of_event)
+            if read.exact:
+                resolution = await resolve_exact(
+                    conn,
+                    kind=DefinitionKind.ALIGNMENT,
+                    definition_idx=alignment_idx,
+                    prep_sample_idxs=cohort,
+                    groups=groups,
+                )
+            else:
+                resolution = await resolve_group(
+                    conn,
+                    kind=DefinitionKind.ALIGNMENT,
+                    definition_idx=alignment_idx,
+                    prep_sample_idxs=cohort,
+                    groups=groups,
+                    include_deprecated_upstream=read.past_upstream,
+                )
     except DefinitionNotFound as exc:
         raise HTTPException(status_code=404, detail=ALIGNMENT_NOT_FOUND_DETAIL) from exc
     refused = resolution.not_resolved_to(alignment_idx)
@@ -570,7 +586,12 @@ async def create_alignment_cohort_doget_ticket(
         columns=body.columns,
         signing_key=signing_key,
     )
-    return signed.model_copy(update={"decisions": resolution.decisions})
+    return signed.model_copy(
+        update={
+            "decisions": resolution.decisions,
+            "deprecated_upstreams": read.deprecated_upstreams,
+        }
+    )
 
 
 def _not_resolved_http(

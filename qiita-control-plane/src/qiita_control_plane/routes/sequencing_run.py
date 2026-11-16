@@ -86,7 +86,9 @@ from qiita_common.models import (
     AlignPlanResponse,
     BlockMaskPlanRequest,
     BlockMaskPlanResponse,
+    DefinitionKind,
     PoolAlignmentCohort,
+    PoolAlignmentCohortLeftOut,
     PoolAlignmentList,
     PoolAlignmentSummary,
     PoolCompletionStatus,
@@ -96,6 +98,8 @@ from qiita_common.models import (
     PoolReadMetrics,
     PoolWorkTicketSummary,
     SampleQCReport,
+    SampleResolutionReason,
+    SampleResolutionState,
     SequencedPoolCreateRequest,
     SequencedPoolCreateResponse,
     SequencedPoolDeleteResponse,
@@ -140,6 +144,7 @@ from ..auth.guards import (
     require_service_with_scope,
 )
 from ..auth.principal import HumanUser, Principal, ServiceAccount
+from ..definition_resolver import resolve_exact
 from ..deps import (
     TxConnFactory,
     get_data_plane_url,
@@ -155,6 +160,7 @@ from ..repositories.alignment_definition import (
     list_completed_alignment_samples,
     list_pool_prep_sample_idxs,
 )
+from ..repositories.biosample import fetch_biosample_accessions
 from ..repositories.mask_definition import MaskDefinitionDeprecated
 from ..repositories.sequencing_run import (
     PayloadMismatch,
@@ -178,6 +184,8 @@ from ._helpers import (
     GENERIC_FK_VIOLATION,
     alignment_exact_read,
     cap_rows,
+    deprecated_upstream_read,
+    deprecated_upstreams,
     resolve_idxs_by_natural_key,
 )
 
@@ -806,6 +814,10 @@ async def get_sequenced_pool_alignment_cohort(
     include_deprecated: bool = Query(
         default=False, description="List the cohort of a deprecated alignment."
     ),
+    include_deprecated_upstream: bool = Query(
+        default=False,
+        description="List the cohort of an active alignment whose upstream is deprecated.",
+    ),
 ) -> PoolAlignmentCohort:
     """Resolve the cohort to mint an alignment DoGet ticket for: this pool's
     prep_samples that are both readable by the caller and `'completed'` for this
@@ -826,23 +838,81 @@ async def get_sequenced_pool_alignment_cohort(
     `include_deprecated` (`alignment_exact_read`): no mint accepts it without the
     flag, so the cohort is not a valid mint body. Checked after the cohort is
     resolved, so the status is told only to a caller who may read some of it, as in
-    `authorize_completed_alignment_cohort`.
+    `authorize_completed_alignment_cohort`. An active alignment whose upstream is
+    deprecated is likewise 409 unless `include_deprecated_upstream`
+    (`deprecated_upstream_read`).
+
+    For a deprecated alignment under `include_deprecated`, the cohort is the readable
+    prep_samples that its exact read (`resolve_exact`) resolves `processed`, and
+    `left_out` lists, with their biosample accessions, the readable prep_samples with
+    a run under it that the exact read does not: a failed or running run, a withdrawn
+    one, or one whose mask run is withdrawn (an assembly that produced no contigs is
+    not listed). A build reading that alignment leaves
+    them out and records them.
     """
     prep_sample_idxs = await _readable_pool_prep_samples(
         pool, sequenced_pool_idx=sequenced_pool_idx, caller=caller
     )
     cohort = await list_completed_alignment_samples(pool, alignment_idx, prep_sample_idxs)
-    if cohort:
-        alignment_exact_read(
-            await fetch_alignment_definition_by_idx(pool, alignment_idx),
-            include_deprecated=include_deprecated,
-        )
+    left_out: list[PoolAlignmentCohortLeftOut] = []
+    alignment = await fetch_alignment_definition_by_idx(pool, alignment_idx)
+    if alignment is not None and (cohort or include_deprecated):
+        exact = alignment_exact_read(alignment, include_deprecated=include_deprecated)
+        if cohort and not exact:
+            deprecated_upstream_read(
+                kind=DefinitionKind.ALIGNMENT,
+                idx=alignment_idx,
+                upstreams=await deprecated_upstreams(pool, alignment),
+                include_deprecated=include_deprecated,
+                include_deprecated_upstream=include_deprecated_upstream,
+            )
+        if exact and prep_sample_idxs:
+            cohort, left_out = await _exact_cohort(pool, alignment_idx, prep_sample_idxs)
     return PoolAlignmentCohort(
         sequencing_run_idx=sequencing_run_idx,
         sequenced_pool_idx=sequenced_pool_idx,
         alignment_idx=alignment_idx,
         prep_sample_idx=cohort,
+        left_out=left_out,
     )
+
+
+# Not processed, and nothing to leave out: no run under the alignment, or (de novo) an
+# assembly that produced no contigs.
+_NO_RUN_TO_READ = frozenset({SampleResolutionReason.NO_RUN, SampleResolutionReason.NO_DATA})
+
+
+async def _exact_cohort(
+    pool: asyncpg.Pool, alignment_idx: int, prep_sample_idxs: list[int]
+) -> tuple[list[int], list[PoolAlignmentCohortLeftOut]]:
+    """`prep_sample_idxs` read under `alignment_idx` alone (`resolve_exact`): those it
+    resolves `processed`, and those with a run under it that it does not, each with its
+    biosample accession; both ascending."""
+    async with pool.acquire() as conn, conn.transaction(isolation="repeatable_read", readonly=True):
+        resolution = await resolve_exact(
+            conn,
+            kind=DefinitionKind.ALIGNMENT,
+            definition_idx=alignment_idx,
+            prep_sample_idxs=prep_sample_idxs,
+        )
+        processed = [
+            ps for ps, r in resolution.samples.items() if r.state is SampleResolutionState.PROCESSED
+        ]
+        left = [
+            r
+            for r in resolution.samples.values()
+            if r.state is not SampleResolutionState.PROCESSED and r.reason not in _NO_RUN_TO_READ
+        ]
+        accessions = await fetch_biosample_accessions(conn, [r.prep_sample_idx for r in left])
+    return sorted(processed), [
+        PoolAlignmentCohortLeftOut(
+            prep_sample_idx=r.prep_sample_idx,
+            biosample_accession=accessions.get(r.prep_sample_idx),
+            state=r.state,
+            reason=r.reason,
+        )
+        for r in sorted(left, key=lambda r: r.prep_sample_idx)
+    ]
 
 
 @router.get(PATH_SEQUENCED_POOL_COMPLETION)

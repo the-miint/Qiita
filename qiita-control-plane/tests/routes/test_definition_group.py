@@ -19,7 +19,11 @@ from qiita_common.actions import (
     LONG_READ_ASSEMBLY_ACTION_ID,
     READ_MASK_ACTION_ID,
 )
-from qiita_common.api_paths import URL_ALIGNMENT_COHORT_DOGET, URL_DEFINITION_GROUP_RESOLVE
+from qiita_common.api_paths import (
+    URL_ALIGNMENT_COHORT_DOGET,
+    URL_DEFINITION_GROUP_RESOLVE,
+    URL_SEQUENCED_POOL_ALIGNMENT_COHORT,
+)
 from qiita_common.auth_constants import Scope
 from qiita_common.models import (
     AS_OF_SCOPE,
@@ -791,3 +795,50 @@ async def test_resolve_group_refuses_a_read_committed_transaction(postgres_pool)
             await resolve_group(
                 conn, kind=DefinitionKind.MASK, definition_idx=1, prep_sample_idxs=[1]
             )
+
+
+async def test_a_deprecated_alignments_cohort_listing_leaves_out_a_failed_run(
+    ctx, alignment_group_world, tickets
+):
+    """Under include_deprecated, the listing names each readable prep_sample whose run
+    under the deprecated alignment failed or is running, with its biosample accession;
+    an active alignment's listing names none."""
+    w = alignment_group_world
+    url = URL_SEQUENCED_POOL_ALIGNMENT_COHORT.format(
+        sequencing_run_idx=w["run_idx"],
+        sequenced_pool_idx=w["pool_idx"],
+        alignment_idx=w["align_1"],
+    )
+    await tickets["block"](
+        ALIGN_ACTION_ID,
+        samples=[w["ps_c"]],
+        state=WorkTicketState.FAILED,
+        mask_idx=w["mask_idx"],
+        alignment_idx=w["align_1"],
+    )
+    active = await ctx["user"].get(url, params={"include_deprecated": True})
+    assert active.status_code == 200, active.text
+    assert active.json()["left_out"] == []
+
+    await ctx["pool"].execute(
+        "UPDATE qiita.alignment_definition SET status = 'deprecated', deprecated_at = now(),"
+        "       deprecated_by_idx = (SELECT MIN(idx) FROM qiita.principal),"
+        "       deprecation_reason = 'aligner build was wrong'"
+        " WHERE alignment_idx = $1",
+        w["align_1"],
+    )
+    accession = await ctx["pool"].fetchval(
+        "SELECT bs.biosample_accession FROM qiita.prep_sample ps"
+        "  JOIN qiita.biosample bs ON bs.idx = ps.biosample_idx WHERE ps.idx = $1",
+        w["ps_c"],
+    )
+    resp = await ctx["user"].get(url, params={"include_deprecated": True})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["left_out"] == [
+        {
+            "prep_sample_idx": w["ps_c"],
+            "biosample_accession": accession,
+            "state": INCOMPLETE,
+            "reason": R.FAILED,
+        }
+    ]

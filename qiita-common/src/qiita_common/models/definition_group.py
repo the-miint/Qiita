@@ -52,12 +52,15 @@ class SampleResolutionReason(StrEnum):
 class DefinitionGroupRefusal(StrEnum):
     """The `reason` code of a 409 refusing a cohort because a prep_sample does not
     resolve to the definition that the caller named, or because that definition is
-    deprecated and the caller did not set `include_deprecated` (`DEPRECATED`)."""
+    deprecated and the caller did not set `include_deprecated` (`DEPRECATED`), or
+    because an upstream of it is deprecated and the caller did not set
+    `include_deprecated_upstream` (`DEPRECATED_UPSTREAM`)."""
 
     RESOLVED_ELSEWHERE = "resolved_elsewhere"
     INCOMPLETE = "incomplete"
     NOT_PROCESSED = "not_processed"
     DEPRECATED = "deprecated"
+    DEPRECATED_UPSTREAM = "deprecated_upstream"
 
 
 # The CLI spelling of the flag every explicit read of a deprecated definition takes;
@@ -71,6 +74,40 @@ def deprecated_read_refusal(kind: str, idx: int, deprecation_reason: str | None)
     return (
         f"{kind} {idx} is deprecated: {deprecation_reason}. To read its own results, pass"
         f" {INCLUDE_DEPRECATED_FLAG} (API: include_deprecated=true)"
+    )
+
+
+# The CLI spelling of the flag that reads an active definition whose upstream (a mask,
+# or a de novo alignment's assembly) is deprecated; the API field and query parameter
+# are `include_deprecated_upstream`.
+INCLUDE_DEPRECATED_UPSTREAM_FLAG = "--include-deprecated-upstream"
+
+
+class DeprecatedUpstream(BaseModel):
+    """A deprecated upstream of a definition that a read names: its kind, id,
+    `params_hash` (hex; what a published manifest cites in place of the id) and
+    deprecation reason."""
+
+    definition_kind: DefinitionKind
+    definition_idx: Annotated[int, Field(gt=0)]
+    params_hash: str
+    deprecation_reason: str | None = None
+
+    def describe(self) -> str:
+        return f"{self.definition_kind.value} {self.definition_idx} ({self.deprecation_reason})"
+
+
+def deprecated_upstream_read_refusal(
+    kind: str, idx: int, upstreams: list[DeprecatedUpstream]
+) -> str:
+    """The message refusing an active definition whose upstream is deprecated, named
+    without `include_deprecated_upstream`; shared by the routes' 409 and the CLI's own
+    refusal so both name the same flag."""
+    named = "; ".join(u.describe() for u in upstreams)
+    return (
+        f"{kind} {idx} reads deprecated upstream definition(s): {named}. To read its"
+        f" results, pass {INCLUDE_DEPRECATED_UPSTREAM_FLAG}"
+        f" (API: include_deprecated_upstream=true)"
     )
 
 
@@ -114,6 +151,8 @@ class DefinitionGroupResolveRequest(BaseModel):
     definition_idx: Annotated[int, Field(gt=0)]
     prep_sample_idx: PrepSampleCohort
     as_of_event: DecisionSetToken | None = None
+    # Resolve as if no upstream were deprecated (`definition_resolver`, rule 4).
+    include_deprecated_upstream: bool = False
 
 
 class SampleResolution(BaseModel):

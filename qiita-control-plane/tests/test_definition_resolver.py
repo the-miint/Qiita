@@ -360,6 +360,41 @@ def resolve_exact_sample(definitions, pairs, kind, idx, observations):
     return resolve_sample(groups, kind, idx, S, observations, exact=True)
 
 
+def resolve_past_upstream(definitions, pairs, kind, idx, observations):
+    groups = compute_groups(definitions, pairs)
+    return resolve_sample(groups, kind, idx, S, observations, deprecated_upstream=True)
+
+
+def test_deprecated_upstreams_mode_reads_an_alignment_on_a_deprecated_mask():
+    defs = [mask(5, deprecated=True), block(50, 5)]
+    obs = {MASK: {(5, S): done()}, ALIGNMENT: {(50, S): done()}}
+    assert (resolve(defs, [], ALIGNMENT, 50, obs).reason) == R.UPSTREAM_DEPRECATED
+    r = resolve_past_upstream(defs, [], ALIGNMENT, 50, obs)
+    assert (r.state, r.definition_idx) == (PROCESSED, 50)
+
+
+def test_deprecated_upstreams_mode_reads_a_denovo_alignment_on_a_deprecated_assembly():
+    defs = [mask(5, deprecated=True), assembly(7, 5, deprecated=True), denovo(70, 5, 7)]
+    obs = {
+        MASK: {(5, S): done()},
+        PROCESSING: {(7, S): done()},
+        ALIGNMENT: {(70, S): done()},
+    }
+    r = resolve_past_upstream(defs, [], ALIGNMENT, 70, obs)
+    assert (r.state, r.definition_idx) == (PROCESSED, 70)
+
+
+def test_deprecated_upstreams_mode_keeps_a_deprecated_member_and_a_withdrawn_upstream():
+    deprecated_member = [mask(5), block(50, 5, deprecated=True)]
+    obs = {MASK: {(5, S): done()}, ALIGNMENT: {(50, S): done()}}
+    assert resolve_past_upstream(deprecated_member, [], ALIGNMENT, 50, obs).reason == R.DEPRECATED
+    withdrawn = {MASK: {(5, S): gate(MASK_SAMPLE_INVALIDATED)}, ALIGNMENT: {(50, S): done()}}
+    r = resolve_past_upstream(
+        [mask(5, deprecated=True), block(50, 5)], [], ALIGNMENT, 50, withdrawn
+    )
+    assert r.reason == R.UPSTREAM_WITHDRAWN
+
+
 def test_exact_mode_reads_a_deprecated_definition():
     defs = [mask(5, deprecated=True)]
     r = resolve_exact_sample(defs, [], MASK, 5, {MASK: {(5, S): done()}})

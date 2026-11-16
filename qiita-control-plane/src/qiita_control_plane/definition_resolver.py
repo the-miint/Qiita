@@ -60,6 +60,13 @@ definition or an upstream deprecated) are not checked; and each upstream is
 resolved in exact mode too (its own definition, no group), so rule 5's
 `upstream_moved` cannot arise.
 
+**Deprecated upstreams** (`include_deprecated_upstream`, for a caller that names an
+active definition whose upstream is deprecated on purpose): the group is resolved as
+above, except that rule 4 is not checked, and each upstream is resolved without
+rule 3 for itself and without rule 4 for its own upstreams. A deprecated member of
+the named group is still `deprecated` (rule 3), and withdrawn runs stay
+unreadable.
+
 **Public API**:
   - `async resolve_group(conn, *, kind, definition_idx, prep_sample_idxs, groups=None)
     -> GroupResolution`, in the caller's transaction, which must be REPEATABLE READ;
@@ -390,9 +397,13 @@ def resolve_sample(
     observations: Observations,
     *,
     exact: bool = False,
+    deprecated_upstream: bool = False,
+    self_deprecation_ok: bool = False,
 ) -> SampleResolution:
     """`prep_sample_idx`'s resolution in `kind` `definition_idx`'s group, by the
-    rules in the module docstring (in exact mode with `exact`). `observations` must
+    rules in the module docstring (in exact mode with `exact`; without rule 4 with
+    `deprecated_upstream`, and without rule 3 with `self_deprecation_ok`, which the
+    upstream recursion sets under `deprecated_upstream`). `observations` must
     cover `needed_definitions(groups, kind, definition_idx, exact=exact)`; a missing
     entry reads as no gate row and no ticket."""
     kind_obs = observations.get(kind, {})
@@ -429,7 +440,7 @@ def resolve_sample(
             reason=SampleResolutionReason.WITHDRAWN,
         )
     definition = groups.definitions.get((kind, member))
-    if not exact and definition is not None and definition.deprecated:
+    if not (exact or self_deprecation_ok) and definition is not None and definition.deprecated:
         return result(
             SampleResolutionState.NOT_PROCESSED,
             definition_idx=member,
@@ -438,7 +449,11 @@ def resolve_sample(
     ups = upstreams(groups, kind, member)
     for up_kind, up_idx in ups:
         up_definition = groups.definitions.get((up_kind, up_idx))
-        if not exact and up_definition is not None and up_definition.deprecated:
+        if (
+            not (exact or deprecated_upstream)
+            and up_definition is not None
+            and up_definition.deprecated
+        ):
             return result(
                 SampleResolutionState.NOT_PROCESSED,
                 definition_idx=member,
@@ -446,7 +461,16 @@ def resolve_sample(
                 upstream=(up_kind, up_idx),
             )
     for up_kind, up_idx in ups:
-        up = resolve_sample(groups, up_kind, up_idx, prep_sample_idx, observations, exact=exact)
+        up = resolve_sample(
+            groups,
+            up_kind,
+            up_idx,
+            prep_sample_idx,
+            observations,
+            exact=exact,
+            deprecated_upstream=deprecated_upstream,
+            self_deprecation_ok=deprecated_upstream,
+        )
         if up.state is SampleResolutionState.PROCESSED:
             if up.definition_idx == up_idx:
                 continue
@@ -568,6 +592,7 @@ async def resolve_group(
     prep_sample_idxs: Iterable[int],
     groups: Groups | None = None,
     as_of_event: str | None = None,
+    include_deprecated_upstream: bool = False,
 ) -> GroupResolution:
     """Resolve each of `prep_sample_idxs` in `kind` `definition_idx`'s group, in the
     caller's REPEATABLE READ transaction. `groups` is loaded when not given; a caller
@@ -575,7 +600,8 @@ async def resolve_group(
     `as_of_event`, which is then not passed here). `as_of_event` computes the group from
     an earlier decision set (`decision_set`). Raises DefinitionNotFound when
     `definition_idx` is not a `kind` definition, DefinitionNotObservable
-    (`require_observable`), and DecisionSetUnknown."""
+    (`require_observable`), and DecisionSetUnknown. `include_deprecated_upstream`
+    resolves without the upstream deprecation checks (module docstring)."""
     return await _resolve(
         conn,
         kind=kind,
@@ -584,6 +610,7 @@ async def resolve_group(
         groups=groups,
         exact=False,
         as_of_event=as_of_event,
+        deprecated_upstream=include_deprecated_upstream,
     )
 
 
@@ -618,6 +645,7 @@ async def _resolve(
     groups: Groups | None,
     exact: bool,
     as_of_event: str | None = None,
+    deprecated_upstream: bool = False,
 ) -> GroupResolution:
     require_transaction(conn)
     # The gates, tickets and groups are read in several statements; below REPEATABLE
@@ -643,7 +671,15 @@ async def _resolve(
         definition_idx=definition_idx,
         group=tuple(sorted(_members(groups, kind, definition_idx, exact=exact))),
         samples={
-            s: resolve_sample(groups, kind, definition_idx, s, observations, exact=exact)
+            s: resolve_sample(
+                groups,
+                kind,
+                definition_idx,
+                s,
+                observations,
+                exact=exact,
+                deprecated_upstream=deprecated_upstream,
+            )
             for s in samples
         },
         exact=exact,

@@ -603,3 +603,17 @@ async def import_biosample_from_owner_biosample_id(
         owner_id_biosample_study_field_created=field_created,
         deferred_metadata=deferred,
     )
+
+
+async def fetch_biosample_accessions(
+    conn: asyncpg.Pool | asyncpg.Connection, prep_sample_idxs: Sequence[int]
+) -> dict[int, str | None]:
+    """Each prep_sample's biosample accession (None when it has none), keyed by
+    prep_sample_idx."""
+    rows = await conn.fetch(
+        "SELECT ps.idx AS prep_sample_idx, bs.biosample_accession"
+        "  FROM qiita.prep_sample ps JOIN qiita.biosample bs ON bs.idx = ps.biosample_idx"
+        " WHERE ps.idx = ANY($1::bigint[])",
+        list(prep_sample_idxs),
+    )
+    return {r["prep_sample_idx"]: r["biosample_accession"] for r in rows}

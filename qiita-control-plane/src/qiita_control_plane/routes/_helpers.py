@@ -5,6 +5,7 @@ endpoints — same input shape, same on-the-wire output.
 """
 
 from collections.abc import Awaitable, Callable, Iterable, Mapping
+from dataclasses import dataclass
 from datetime import datetime
 from typing import NoReturn
 
@@ -18,6 +19,7 @@ from qiita_common.models import (
     AlignmentDefinitionStatus,
     DefinitionGroupRefusal,
     DefinitionKind,
+    DeprecatedUpstream,
     DeprecationRefusal,
     IdxsListResponse,
     MaskDefinitionStatus,
@@ -33,6 +35,7 @@ from qiita_common.models import (
     TerminologyTermRef,
     Tier,
     deprecated_read_refusal,
+    deprecated_upstream_read_refusal,
     field_wire_name,
     unique_in_study_rejection_reason,
 )
@@ -46,7 +49,13 @@ from ..auth.guards import (
 )
 from ..auth.principal import HumanUser, Principal
 from ..decision_set import DecisionSetUnknown
-from ..definition_similarity import Groups, PairRefused, load_groups
+from ..definition_similarity import (
+    Groups,
+    PairRefused,
+    is_definition_ref,
+    load_groups,
+    upstream_leaves,
+)
 from ..repositories._sample_helpers import (
     ConflictingValueDifferentStudyError,
     ConflictingValueSameStudyError,
@@ -93,6 +102,7 @@ from ..repositories.alignment_definition import (
     fetch_alignment_definition_by_idx,
 )
 from ..repositories.block import list_incomplete_alignment_samples
+from ..repositories.definition_pair import DEFINITION_TABLES, decode_jsonb
 from ..repositories.mask_definition import MaskHasLiveWork, fetch_mask_definition_by_idx
 from ..repositories.study_access import CallerMetadataTiers
 
@@ -220,6 +230,72 @@ def deprecated_read(
     )
 
 
+async def deprecated_upstreams(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection, alignment: asyncpg.Record
+) -> list[DeprecatedUpstream]:
+    """The deprecated definitions `alignment` read: its mask and, for a de novo
+    alignment, its assembly run and that run's mask, in that order, each once."""
+    out: list[DeprecatedUpstream] = []
+    seen: set[tuple[DefinitionKind, int]] = set()
+    stack = [(DefinitionKind.ALIGNMENT, decode_jsonb(alignment["params"]))]
+    while stack:
+        kind, params = stack.pop(0)
+        for path, up_kind in upstream_leaves(kind, params).items():
+            idx = params.get(path)
+            if not is_definition_ref(idx) or (up_kind, idx) in seen:
+                continue
+            seen.add((up_kind, idx))
+            table = DEFINITION_TABLES[up_kind]
+            row = await pool_or_conn.fetchrow(
+                f"SELECT status, deprecation_reason, params, params_hash FROM {table.table}"
+                f" WHERE {table.id_column} = $1",
+                idx,
+            )
+            if row is None:
+                continue
+            if row["status"] == table.deprecated_status:
+                out.append(
+                    DeprecatedUpstream(
+                        definition_kind=up_kind,
+                        definition_idx=idx,
+                        params_hash=bytes(row["params_hash"]).hex(),
+                        deprecation_reason=row["deprecation_reason"],
+                    )
+                )
+            stack.append((up_kind, decode_jsonb(row["params"])))
+    return out
+
+
+def deprecated_upstream_read(
+    *,
+    kind: DefinitionKind,
+    idx: int,
+    upstreams: list[DeprecatedUpstream],
+    include_deprecated: bool,
+    include_deprecated_upstream: bool,
+) -> bool:
+    """Whether a read naming active `kind` `idx` reads past deprecated upstreams
+    (`definition_resolver`, "Deprecated upstreams"): True when `upstreams` is non-empty
+    and every one is admitted, 409 naming `include_deprecated_upstream` otherwise.
+    `include_deprecated_upstream` admits any; `include_deprecated` admits a de novo
+    alignment's assembly run, whose genome map a build reads as a version of its own."""
+    if not upstreams:
+        return False
+    admitted = include_deprecated_upstream or all(
+        include_deprecated and u.definition_kind is DefinitionKind.PROCESSING for u in upstreams
+    )
+    if admitted:
+        return True
+    raise HTTPException(
+        status_code=409,
+        detail={
+            "detail": deprecated_upstream_read_refusal(kind.value, idx, upstreams),
+            "reason": DefinitionGroupRefusal.DEPRECATED_UPSTREAM.value,
+            "deprecated_upstreams": [u.model_dump(mode="json") for u in upstreams],
+        },
+    )
+
+
 async def refuse_deprecated_mask_read(
     pool_or_conn: asyncpg.Pool | asyncpg.Connection, mask_idx: int
 ) -> NoReturn:
@@ -236,6 +312,19 @@ async def refuse_deprecated_mask_read(
     raise AssertionError("deprecated_read returned for a deprecated mask without the flag")
 
 
+@dataclass(frozen=True)
+class AlignmentCohortRead:
+    """What `authorize_completed_alignment_cohort` admitted: the cohort; `exact`, a
+    deprecated alignment read alone; `past_upstream`, an active alignment read past
+    deprecated upstreams (`resolve_group(include_deprecated_upstream=True)`); and the
+    deprecated upstreams it reads, for the response."""
+
+    cohort: list[int]
+    exact: bool
+    past_upstream: bool
+    deprecated_upstreams: list[DeprecatedUpstream]
+
+
 async def authorize_completed_alignment_cohort(
     pool: asyncpg.Pool,
     *,
@@ -244,11 +333,12 @@ async def authorize_completed_alignment_cohort(
     prep_sample_idx: list[int],
     nothing_to: str,
     include_deprecated: bool = False,
-) -> tuple[list[int], bool]:
+    include_deprecated_upstream: bool = False,
+) -> AlignmentCohortRead:
     """The gate every route that names a cohort of one alignment runs, and the single
-    copy of the order it runs in. Returns the authorized cohort, and whether the read
+    copy of the order it runs in. Returns the authorized cohort, whether the read
     is exact (`alignment_exact_read`: a deprecated alignment under
-    `include_deprecated`).
+    `include_deprecated`), and the deprecated upstreams it reads.
 
     **The order is a disclosure decision, not a style.** Four checks:
 
@@ -257,7 +347,8 @@ async def authorize_completed_alignment_cohort(
        of a caller's samples and silently omit the rest.
     2a. **The alignment is active, or `include_deprecated` names it** → 409 naming
        the flag otherwise (`alignment_exact_read`); after access so its status is told
-       only to a caller who may read it.
+       only to a caller who may read it. An active alignment whose upstream is
+       deprecated is admitted by `deprecated_upstream_read`, 409 otherwise.
     3. **Completeness** → 422, only once access has passed. Reversed, the 422's sample
        list would tell a caller which samples are in an alignment they have no right to
        read at all. It also subsumes an unknown identifier: a prep_sample that is not
@@ -281,6 +372,14 @@ async def authorize_completed_alignment_cohort(
     )
 
     exact = alignment_exact_read(alignment, include_deprecated=include_deprecated)
+    upstreams = await deprecated_upstreams(pool, alignment)
+    past_upstream = not exact and deprecated_upstream_read(
+        kind=DefinitionKind.ALIGNMENT,
+        idx=alignment_idx,
+        upstreams=upstreams,
+        include_deprecated=include_deprecated,
+        include_deprecated_upstream=include_deprecated_upstream,
+    )
 
     incomplete = await list_incomplete_alignment_samples(pool, alignment_idx, cohort)
     if incomplete:
@@ -289,7 +388,7 @@ async def authorize_completed_alignment_cohort(
             f" {alignment_idx} (e.g. {first_few(incomplete)})"
         )
         raise HTTPException(status_code=422, detail=f"{detail}{nothing_to}")
-    return cohort, exact
+    return AlignmentCohortRead(cohort, exact, past_upstream, upstreams)
 
 
 def first_few(idxs: list[int], limit: int = 5) -> str:

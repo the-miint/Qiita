@@ -44,6 +44,8 @@ from qiita_common.models.definition_group import (
     DecisionProvenance,
     DecisionSetToken,
     SampleResolution,
+    SampleResolutionReason,
+    SampleResolutionState,
 )
 from qiita_common.models.definition_pair import DefinitionKind
 from qiita_common.models.reference import Platform
@@ -1575,6 +1577,17 @@ class PoolAlignmentList(BaseModel):
     alignments: list[PoolAlignmentSummary]
 
 
+class PoolAlignmentCohortLeftOut(BaseModel):
+    """A readable prep_sample with a run under a deprecated alignment that its exact
+    read (`definition_resolver.resolve_exact`) does not resolve `processed`: its run
+    there failed or is running, is withdrawn, or reads a withdrawn mask run."""
+
+    prep_sample_idx: Annotated[int, Field(gt=0)]
+    biosample_accession: str | None = None
+    state: SampleResolutionState
+    reason: SampleResolutionReason
+
+
 class PoolAlignmentCohort(BaseModel):
     """Returned by GET .../sequenced-pool/{pool}/alignment/{alignment_idx}/cohort.
 
@@ -1593,6 +1606,9 @@ class PoolAlignmentCohort(BaseModel):
     sequenced_pool_idx: Annotated[int, Field(gt=0)]
     alignment_idx: Annotated[int, Field(gt=0)]
     prep_sample_idx: list[Annotated[int, Field(gt=0)]]
+    # For a deprecated alignment listed under `include_deprecated` only: the readable
+    # prep_samples with a run under it that its exact read leaves out of the cohort.
+    left_out: list[PoolAlignmentCohortLeftOut] = []
 
 
 class ReadMaskedDoGetTicketRequest(BaseModel):
@@ -1675,6 +1691,8 @@ class ExportedIdentifierRequest(BaseModel):
     prep_sample_idx: PrepSampleCohort
     # Admits a deprecated alignment (refused without it), as on the cohort DoGet.
     include_deprecated: bool = False
+    # Admits an active alignment whose upstream is deprecated, as on the cohort DoGet.
+    include_deprecated_upstream: bool = False
 
 
 class ExportedIdentifier(BaseModel):
@@ -1742,6 +1760,8 @@ class ExportedProcessingRequest(BaseModel):
     prep_sample_idx: PrepSampleCohort
     # Admits a deprecated alignment (refused without it), as on the cohort DoGet.
     include_deprecated: bool = False
+    # Admits an active alignment whose upstream is deprecated, as on the cohort DoGet.
+    include_deprecated_upstream: bool = False
 
 
 class ExportedProcessingResponse(BaseModel):

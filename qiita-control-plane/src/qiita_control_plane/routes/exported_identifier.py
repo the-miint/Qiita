@@ -87,14 +87,17 @@ async def mint_exported_identifier_map(
     label this route replaced could not be composed without one; an `export_id`
     always can, so an unaccessioned sample is now labellable rather than a 422.
     """
-    cohort, _ = await authorize_completed_alignment_cohort(
-        pool,
-        caller=caller,
-        alignment_idx=body.alignment_idx,
-        prep_sample_idx=body.prep_sample_idx,
-        nothing_to="; an identifier names processed data, so there is nothing yet to name",
-        include_deprecated=body.include_deprecated,
-    )
+    cohort = (
+        await authorize_completed_alignment_cohort(
+            pool,
+            caller=caller,
+            alignment_idx=body.alignment_idx,
+            prep_sample_idx=body.prep_sample_idx,
+            nothing_to="; an identifier names processed data, so there is nothing yet to name",
+            include_deprecated=body.include_deprecated,
+            include_deprecated_upstream=body.include_deprecated_upstream,
+        )
+    ).cohort
 
     try:
         rows = await mint_exported_identifiers(

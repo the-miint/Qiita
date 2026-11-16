@@ -35,10 +35,13 @@ from qiita_common.api_paths import (
 from qiita_common.auth_constants import Scope
 from qiita_common.models import (
     INCLUDE_DEPRECATED_FLAG,
+    INCLUDE_DEPRECATED_UPSTREAM_FLAG,
     AlignmentDefinitionStatus,
     DefinitionGroupRefusal,
+    DeprecatedUpstream,
     MaskDefinitionStatus,
     deprecated_read_refusal,
+    deprecated_upstream_read_refusal,
 )
 
 from qiita_control_plane.repositories.alignment_definition import ALIGNMENT_SAMPLE_COMPLETED
@@ -478,12 +481,8 @@ async def test_human_mint_refuses_a_sample_whose_mask_run_was_withdrawn_409(
     assert detail["samples"][0]["reason"] == "upstream_withdrawn"
 
 
-async def test_human_mint_refuses_an_alignment_on_a_deprecated_mask_409(ctx, pool_alignment_seed):
-    """The mask the alignment read is deprecated (the alignment itself is not), so
-    no sample of it is processed."""
-    seed = pool_alignment_seed
-    pool = ctx["pool"]
-    await pool.execute(
+async def _deprecate_mask(ctx, seed) -> None:
+    await ctx["pool"].execute(
         "UPDATE qiita.mask_definition SET status = $3, deprecated_at = now(),"
         " deprecated_by_idx = $2, deprecation_reason = 'host reference was wrong'"
         " WHERE mask_idx = $1",
@@ -491,17 +490,138 @@ async def test_human_mint_refuses_an_alignment_on_a_deprecated_mask_409(ctx, poo
         seed["owner_idx"],
         MaskDefinitionStatus.DEPRECATED.value,
     )
+
+
+async def _deprecated_mask(ctx, mask_idx: int) -> DeprecatedUpstream:
+    params_hash = await ctx["pool"].fetchval(
+        "SELECT params_hash FROM qiita.mask_definition WHERE mask_idx = $1", mask_idx
+    )
+    return DeprecatedUpstream(
+        definition_kind="mask",
+        definition_idx=mask_idx,
+        params_hash=bytes(params_hash).hex(),
+        deprecation_reason="host reference was wrong",
+    )
+
+
+async def _refused_naming_the_upstream_flag(ctx, resp, alignment_idx: int, mask_idx: int) -> None:
+    assert resp.status_code == 409, resp.text
+    detail = resp.json()["detail"]
+    assert detail["reason"] == DefinitionGroupRefusal.DEPRECATED_UPSTREAM
+    upstream = await _deprecated_mask(ctx, mask_idx)
+    assert detail["deprecated_upstreams"] == [upstream.model_dump(mode="json")]
+    assert detail["detail"] == deprecated_upstream_read_refusal(
+        "alignment", alignment_idx, [upstream]
+    )
+    assert INCLUDE_DEPRECATED_UPSTREAM_FLAG in detail["detail"]
+
+
+async def test_an_alignment_on_a_deprecated_mask_is_refused_without_the_upstream_flag(
+    ctx, pool_alignment_seed
+):
+    """The mask the alignment read is deprecated (the alignment itself is not):
+    refused naming --include-deprecated-upstream, which --include-deprecated does not
+    stand in for; read, and the ticket names the deprecated mask, with it."""
+    seed = pool_alignment_seed
+    await _deprecate_mask(ctx, seed)
+    body = {"prep_sample_idx": [seed["ps_a"]], "columns": _COLUMNS}
+    url = _mint_url(seed["align_1"])
+
+    await _refused_naming_the_upstream_flag(
+        ctx, await ctx["user"].post(url, json=body), seed["align_1"], seed["mask_idx"]
+    )
+    await _refused_naming_the_upstream_flag(
+        ctx,
+        await ctx["user"].post(url, json={**body, "include_deprecated": True}),
+        seed["align_1"],
+        seed["mask_idx"],
+    )
+    resp = await ctx["user"].post(url, json={**body, "include_deprecated_upstream": True})
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["deprecated_upstreams"] == [
+        (await _deprecated_mask(ctx, seed["mask_idx"])).model_dump(mode="json")
+    ]
+
+
+async def test_the_upstream_flag_does_not_read_a_withdrawn_mask_run(ctx, pool_alignment_seed):
+    seed = pool_alignment_seed
+    await _deprecate_mask(ctx, seed)
+    await ctx["pool"].execute(
+        "UPDATE qiita.mask_sample SET state = 'invalidated', invalidated_at = now(),"
+        " invalidated_by_idx = $3, invalidation_reason = 'withdrawn by a test'"
+        " WHERE mask_idx = $1 AND prep_sample_idx = $2",
+        seed["mask_idx"],
+        seed["ps_a"],
+        seed["owner_idx"],
+    )
     resp = await ctx["user"].post(
-        _mint_url(seed["align_1"]), json={"prep_sample_idx": [seed["ps_a"]], "columns": _COLUMNS}
+        _mint_url(seed["align_1"]),
+        json={
+            "prep_sample_idx": [seed["ps_a"]],
+            "columns": _COLUMNS,
+            "include_deprecated_upstream": True,
+        },
     )
     assert resp.status_code == 409, resp.text
     detail = resp.json()["detail"]
-    assert detail["reason"] == "not_processed"
-    [sample] = detail["samples"]
-    assert (sample["reason"], sample["upstream_definition_idx"]) == (
-        "upstream_deprecated",
-        seed["mask_idx"],
+    assert (detail["reason"], detail["samples"][0]["reason"]) == (
+        "not_processed",
+        "upstream_withdrawn",
     )
+
+
+async def test_the_upstream_flag_changes_nothing_without_a_deprecated_upstream(
+    ctx, pool_alignment_seed
+):
+    seed = pool_alignment_seed
+    resp = await ctx["user"].post(
+        _mint_url(seed["align_1"]),
+        json={
+            "prep_sample_idx": [seed["ps_a"]],
+            "columns": _COLUMNS,
+            "include_deprecated_upstream": True,
+        },
+    )
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["deprecated_upstreams"] == []
+
+
+@pytest.mark.parametrize("route", [URL_EXPORTED_IDENTIFIER, URL_EXPORTED_PROCESSING])
+async def test_the_alignment_mints_take_the_upstream_flag(ctx, pool_alignment_seed, route):
+    seed = pool_alignment_seed
+    body = {"alignment_idx": seed["align_1"], "prep_sample_idx": [seed["ps_a"]]}
+    try:
+        plain = await ctx["user"].post(route, json={**body, "include_deprecated_upstream": True})
+        assert plain.status_code == 201, plain.text
+        await _deprecate_mask(ctx, seed)
+        await _refused_naming_the_upstream_flag(
+            ctx, await ctx["user"].post(route, json=body), seed["align_1"], seed["mask_idx"]
+        )
+        flagged = await ctx["user"].post(route, json={**body, "include_deprecated_upstream": True})
+        assert flagged.status_code == 201, flagged.text
+        assert flagged.json() == plain.json()
+    finally:
+        await ctx["pool"].execute(
+            "DELETE FROM qiita.exported_processing WHERE alignment_idx = $1", seed["align_1"]
+        )
+
+
+async def test_the_cohort_listing_takes_the_upstream_flag(ctx, pool_alignment_seed):
+    seed = pool_alignment_seed
+    url = URL_SEQUENCED_POOL_ALIGNMENT_COHORT.format(
+        sequencing_run_idx=seed["run_idx"],
+        sequenced_pool_idx=seed["pool_idx"],
+        alignment_idx=seed["align_1"],
+    )
+    plain = await ctx["user"].get(url)
+    assert plain.status_code == 200, plain.text
+    await _deprecate_mask(ctx, seed)
+    await _refused_naming_the_upstream_flag(
+        ctx, await ctx["user"].get(url), seed["align_1"], seed["mask_idx"]
+    )
+    flagged = await ctx["user"].get(url, params={"include_deprecated_upstream": True})
+    assert flagged.status_code == 200, flagged.text
+    assert flagged.json() == plain.json()
 
 
 async def test_human_mint_checks_access_before_group_resolution(ctx, alignment_group_world):
@@ -631,3 +751,52 @@ async def test_the_alignment_mints_take_the_flag(ctx, pool_alignment_seed, route
         await ctx["pool"].execute(
             "DELETE FROM qiita.exported_processing WHERE alignment_idx = $1", seed["align_1"]
         )
+
+
+async def test_a_deprecated_alignments_listing_leaves_out_a_withdrawn_mask_run(
+    ctx, pool_alignment_seed
+):
+    """Under include_deprecated the listing reads the alignment exactly: a prep_sample
+    whose mask run is withdrawn is not in the cohort and is listed in `left_out`; the
+    DoGet naming it is still refused."""
+    seed = pool_alignment_seed
+    url = URL_SEQUENCED_POOL_ALIGNMENT_COHORT.format(
+        sequencing_run_idx=seed["run_idx"],
+        sequenced_pool_idx=seed["pool_idx"],
+        alignment_idx=seed["align_1"],
+    )
+    await _deprecate_alignment(ctx, seed["align_1"])
+    before = await ctx["user"].get(url, params={"include_deprecated": True})
+    assert before.status_code == 200, before.text
+    assert seed["ps_a"] in before.json()["prep_sample_idx"]
+
+    await ctx["pool"].execute(
+        "UPDATE qiita.mask_sample SET state = 'invalidated', invalidated_at = now(),"
+        " invalidated_by_idx = $3, invalidation_reason = 'withdrawn by a test'"
+        " WHERE mask_idx = $1 AND prep_sample_idx = $2",
+        seed["mask_idx"],
+        seed["ps_a"],
+        seed["owner_idx"],
+    )
+    accession = await ctx["pool"].fetchval(
+        "SELECT bs.biosample_accession FROM qiita.prep_sample ps"
+        "  JOIN qiita.biosample bs ON bs.idx = ps.biosample_idx WHERE ps.idx = $1",
+        seed["ps_a"],
+    )
+    after = await ctx["user"].get(url, params={"include_deprecated": True})
+    assert after.status_code == 200, after.text
+    body = after.json()
+    assert seed["ps_a"] not in body["prep_sample_idx"]
+    assert body["left_out"] == [
+        {
+            "prep_sample_idx": seed["ps_a"],
+            "biosample_accession": accession,
+            "state": "not_processed",
+            "reason": "upstream_withdrawn",
+        }
+    ]
+    named = await ctx["user"].post(
+        _mint_url(seed["align_1"]),
+        json={"prep_sample_idx": [seed["ps_a"]], "columns": _COLUMNS, "include_deprecated": True},
+    )
+    assert named.status_code == 409, named.text

@@ -14,7 +14,11 @@ from qiita_common.models._base import (
     check_derived_inputs,
     check_exactly_one_runtime,
 )
-from qiita_common.models.definition_group import DecisionProvenance, DecisionSetToken
+from qiita_common.models.definition_group import (
+    DecisionProvenance,
+    DecisionSetToken,
+    DeprecatedUpstream,
+)
 
 
 class StepBaselineResources(BaseModel):
@@ -274,6 +278,10 @@ class DoGetTicketResponse(BaseModel):
     # The pair decisions a route that resolves a group before signing resolved under
     # (the alignment cohort DoGet, the masked-read export ticket); None elsewhere.
     decisions: DecisionProvenance | None = None
+    # The deprecated upstreams the alignment cohort DoGet read under
+    # `include_deprecated_upstream` (or, for a de novo alignment's assembly,
+    # `include_deprecated`); empty elsewhere.
+    deprecated_upstreams: list[DeprecatedUpstream] = []
 
 
 # Columns a DoGet ticket asks to be projected, in this order.
@@ -352,6 +360,8 @@ class AlignmentCohortDoGetTicketRequest(BaseModel):
     # Reads a deprecated alignment's own rows (refused without it): the route's
     # `deprecated_read`.
     include_deprecated: bool = False
+    # Reads an active alignment whose upstream is deprecated (refused without it).
+    include_deprecated_upstream: bool = False
     # Resolve the cohort's groups under this earlier decision set
     # (`DecisionProvenance.decision_set`); only the pair decisions are as of it.
     as_of_event: DecisionSetToken | None = None
