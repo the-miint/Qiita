@@ -185,6 +185,46 @@ async def test_roster_resolves_each_sample_across_the_group(ctx, group, anchor):
         assert by_prep[group[name]]["mask_state"] == expected_gate.get(name), name
 
 
+async def test_roster_and_ticket_record_and_take_the_decision_set(ctx, group):
+    """The roster and the ticket each record the decisions they resolved under, and
+    both refuse a token that names no decision set."""
+    roster = await ctx["admin"].get(
+        _roster_url(group["pool_idx"]), params={"mask_idx": group["low"]}
+    )
+    assert roster.status_code == 200, roster.text
+    decisions = roster.json()["decisions"]
+    assert (decisions["as_of"], decisions["pairs_used"]) == (False, 1)
+
+    ticket = await ctx["admin"].post(
+        URL_ADMIN_MASKED_READ_EXPORT_TICKET,
+        json={
+            "prep_sample_idx": group["on_both"],
+            "mask_idx": group["high"],
+            "as_of_event": decisions["decision_set"],
+        },
+    )
+    assert ticket.status_code == 201, ticket.text
+    assert ticket.json()["decisions"] == {**decisions, "as_of": True}
+
+    unknown = "sha256:" + "f" * 64
+    assert (
+        await ctx["admin"].get(
+            _roster_url(group["pool_idx"]),
+            params={"mask_idx": group["low"], "as_of_event": unknown},
+        )
+    ).status_code == 422
+    assert (
+        await ctx["admin"].post(
+            URL_ADMIN_MASKED_READ_EXPORT_TICKET,
+            json={
+                "prep_sample_idx": group["on_both"],
+                "mask_idx": group["high"],
+                "as_of_event": unknown,
+            },
+        )
+    ).status_code == 422
+
+
 async def _deprecated_mask(ctx) -> int:
     mask_idx = await _seed_mask(ctx, params=json.dumps({"t": f"dep-{secrets.token_hex(4)}"}))
     await transition_mask_definition_status(

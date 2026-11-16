@@ -22,6 +22,7 @@ from qiita_common.actions import (
 from qiita_common.api_paths import URL_ALIGNMENT_COHORT_DOGET, URL_DEFINITION_GROUP_RESOLVE
 from qiita_common.auth_constants import Scope
 from qiita_common.models import (
+    AS_OF_SCOPE,
     DefinitionKind,
     FailureType,
     SampleResolutionReason,
@@ -32,6 +33,7 @@ from qiita_common.models import (
 )
 
 from qiita_control_plane.definition_resolver import resolve_group
+from qiita_control_plane.definition_similarity import revoke_pair
 from qiita_control_plane.repositories.alignment_definition import (
     ALIGNMENT_SAMPLE_COMPLETED,
     ALIGNMENT_SAMPLE_PENDING,
@@ -276,6 +278,58 @@ async def test_resolve_a_mask_group(ctx, alignment_group_world, other_pool_sampl
     assert samples[w["ps_a"]]["definition_idx"] == w["mask_idx"]
     assert samples[other_pool_sample]["definition_idx"] == w["mask_2"]
     assert samples[other_pool_sample]["mask_idx"] is None
+
+
+async def test_as_of_a_decision_set_rebuilds_the_group_after_a_revoke(
+    ctx, alignment_group_world, other_pool_sample
+):
+    """The response records the decision set; after the pair is revoked, the current
+    resolution has no group, and the recorded decision set rebuilds the grouped one.
+    A token that names no decision set is a 422."""
+    w = alignment_group_world
+    body = _body(DefinitionKind.MASK, w["mask_idx"], [w["ps_a"], other_pool_sample])
+    grouped = await ctx["user"].post(URL_DEFINITION_GROUP_RESOLVE, json=body)
+    assert grouped.status_code == 200, grouped.text
+    decisions = grouped.json()["decisions"]
+    assert decisions["as_of"] is False
+    assert decisions["pairs_used"] == 1
+    assert decisions["newest_event_at"] is not None
+    assert decisions["as_of_scope"] == AS_OF_SCOPE
+    token = decisions["decision_set"]
+
+    pair_idx = await ctx["pool"].fetchval(
+        "SELECT definition_pair_idx FROM qiita.definition_pair"
+        " WHERE definition_kind = 'mask' AND low_definition_ref = $1 AND high_definition_ref = $2",
+        *sorted([w["mask_idx"], w["mask_2"]]),
+    )
+    async with ctx["pool"].acquire() as conn, conn.transaction():
+        await revoke_pair(
+            conn,
+            definition_pair_idx=pair_idx,
+            reason="re-checked against the mock community",
+            principal_idx=ctx["admin_session"]["principal_idx"],
+        )
+
+    current = await ctx["user"].post(URL_DEFINITION_GROUP_RESOLVE, json=body)
+    assert current.status_code == 200, current.text
+    assert current.json()["group"] == [w["mask_idx"]]
+    assert current.json()["decisions"]["decision_set"] != token
+    assert current.json()["decisions"]["pairs_used"] == 0
+    assert _by_sample(current)[other_pool_sample]["state"] == NOT_PROCESSED
+
+    as_of = await ctx["user"].post(
+        URL_DEFINITION_GROUP_RESOLVE, json={**body, "as_of_event": token}
+    )
+    assert as_of.status_code == 200, as_of.text
+    assert as_of.json()["group"] == grouped.json()["group"]
+    assert as_of.json()["samples"] == grouped.json()["samples"]
+    assert as_of.json()["decisions"] == {**decisions, "as_of": True}
+
+    unknown = await ctx["user"].post(
+        URL_DEFINITION_GROUP_RESOLVE, json={**body, "as_of_event": "sha256:" + "0" * 64}
+    )
+    assert unknown.status_code == 422, unknown.text
+    assert "names no decision set" in unknown.text
 
 
 # ---------------------------------------------------------------------------

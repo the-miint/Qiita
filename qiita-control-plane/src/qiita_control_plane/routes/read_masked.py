@@ -67,6 +67,8 @@ from qiita_common.api_paths import (
 )
 from qiita_common.auth_constants import Scope
 from qiita_common.models import (
+    AS_OF_SCOPE,
+    DecisionSetToken,
     DefinitionKind,
     DoGetTicketResponse,
     MaskDefinition,
@@ -100,7 +102,6 @@ from ..block_read import READ_MASKED_TABLE
 from ..definition_resolver import resolve_exact, resolve_group
 from ..definition_similarity import (
     PairRefused,
-    load_groups,
     refuse_deprecating_with_similar_pairs,
 )
 from ..deps import (
@@ -137,6 +138,7 @@ from ._helpers import (
     first_few,
     gate_roster_narrowing_idx,
     live_work_http,
+    load_groups_as_of,
     pair_refused_http,
     resolution_body,
     sees_resolution_tickets,
@@ -386,6 +388,13 @@ async def get_syndna_read_count_route(
     include_deprecated: bool = Query(
         default=False, description="Read a deprecated mask's own counts (refused without it)."
     ),
+    as_of_event: DecisionSetToken | None = Query(
+        default=None,
+        description=(
+            "Group the masks under this earlier decision set (a `decisions.decision_set`);"
+            f" {AS_OF_SCOPE}."
+        ),
+    ),
 ) -> SyndnaReadCountResponse | JSONResponse:
     """The per-insert SynDNA read counts of the selected prep_samples across one
     mask's group — what `qiita mask syndna-read-count` writes as BIOM or Parquet.
@@ -436,7 +445,7 @@ async def get_syndna_read_count_route(
             await authorize_prep_sample_cohort(
                 conn, caller=caller, prep_sample_idx=named, min_tier=COHORT_MIN_TIER
             )
-        groups = await load_groups(conn)
+        groups = await load_groups_as_of(conn, as_of_event)
         if (DefinitionKind.MASK, mask_idx) not in groups.definitions:
             raise HTTPException(status_code=404, detail=_MSG_MASK_NOT_FOUND)
         mask = await fetch_mask_definition_by_idx(conn, mask_idx)
@@ -572,6 +581,7 @@ async def get_syndna_read_count_route(
         },
         deprecated=exact,
         deprecation_reason=mask["deprecation_reason"] if exact else None,
+        decisions=resolution.decisions,
     )
     if sees_resolution_tickets(caller):
         return response

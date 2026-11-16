@@ -111,6 +111,7 @@ from ._helpers import (
     authorize_completed_alignment_cohort,
     first_few,
     live_work_http,
+    load_groups_as_of,
     pair_refused_http,
     resolution_body,
     sees_resolution_tickets,
@@ -555,6 +556,7 @@ async def create_alignment_cohort_doget_ticket(
                 kind=DefinitionKind.ALIGNMENT,
                 definition_idx=alignment_idx,
                 prep_sample_idxs=cohort,
+                groups=await load_groups_as_of(conn, body.as_of_event),
             )
     except DefinitionNotFound as exc:
         raise HTTPException(status_code=404, detail=ALIGNMENT_NOT_FOUND_DETAIL) from exc
@@ -562,12 +564,13 @@ async def create_alignment_cohort_doget_ticket(
     if refused:
         raise _not_resolved_http(alignment_idx, refused, caller)
 
-    return _sign_alignment_ticket(
+    signed = _sign_alignment_ticket(
         alignment_idx=alignment_idx,
         prep_sample_idx=cohort,
         columns=body.columns,
         signing_key=signing_key,
     )
+    return signed.model_copy(update={"decisions": resolution.decisions})
 
 
 def _not_resolved_http(

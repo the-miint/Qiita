@@ -28,8 +28,10 @@ upstreams are, so it can be decided `not_similar` only.
 Deprecation does not change membership.
 
 **Public API** for other modules:
-  - `async load_groups(conn) -> Groups` (the caller holds the group lock exclusive
-    or reads at REPEATABLE READ), then `Groups.group_of(kind, idx) -> frozenset[int]` and
+  - `async load_groups(conn, *, as_of_event=None) -> Groups` (the caller holds the
+    group lock exclusive or reads at REPEATABLE READ; `as_of_event` takes the pairs'
+    verdicts from an earlier decision set, `decision_set`), then
+    `Groups.group_of(kind, idx) -> frozenset[int]` and
     `Groups.same_group(kind, a, b) -> bool`. A definition that no pair or derivation
     joins is a group of one, including an id that the snapshot does not know.
   - `compute_groups(definitions, pairs) -> Groups`, the pure core.
@@ -76,6 +78,7 @@ from typing import Any
 import asyncpg
 from qiita_common.models import DefinitionKind, DefinitionPairRefusal, DefinitionPairVerdict
 
+from .decision_set import DecisionSet, load_decision_set
 from .repositories import (
     READ_COMMITTED,
     SNAPSHOT_ISOLATION_LEVELS,
@@ -335,6 +338,8 @@ class Groups:
     pairs: tuple[PairState, ...]
     _members: Mapping[DefinitionKind, Mapping[int, frozenset[int]]] = field(repr=False)
     contradictions: frozenset[int]
+    # The decision set the pairs' verdicts were read under; set by `load_groups`.
+    decisions: DecisionSet | None = None
 
     def group_of(self, kind: DefinitionKind, idx: int) -> frozenset[int]:
         return self._members[kind].get(idx, frozenset({idx}))
@@ -445,8 +450,11 @@ def compute_groups(definitions: Iterable[DefinitionRow], pairs: Iterable[PairSta
     )
 
 
-async def load_groups(conn: asyncpg.Connection) -> Groups:
-    """Groups as of the caller's transaction. The caller either holds the group lock
+async def load_groups(conn: asyncpg.Connection, *, as_of_event: str | None = None) -> Groups:
+    """Groups as of the caller's transaction, or, with `as_of_event`, from the pairs'
+    verdicts at that decision set (`decision_set`; raises `DecisionSetUnknown`) with
+    everything else current. `Groups.decisions` records which. The guards never pass
+    `as_of_event`. The caller either holds the group lock
     EXCLUSIVE (a decision or revoke) at READ COMMITTED, so that it reads every
     decision committed before it took the lock (`lock_groups_exclusive`), or reads at
     REPEATABLE READ without it: there the transaction's one snapshot keeps the groups
@@ -468,8 +476,11 @@ async def load_groups(conn: asyncpg.Connection) -> Groups:
             f" this one is {isolation!r} without the lock"
         )
     definitions = await fetch_definitions(conn)
+    decisions = await load_decision_set(conn, as_of_event)
     pairs = [pair_state(r) for r in await fetch_live_pairs(conn)]
-    return compute_groups(definitions, pairs)
+    if decisions.as_of:
+        pairs = [replace(p, verdict=decisions.verdict_of(p.idx)) for p in pairs]
+    return replace(compute_groups(definitions, pairs), decisions=decisions)
 
 
 # ---------------------------------------------------------------------------

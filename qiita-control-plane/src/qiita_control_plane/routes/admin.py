@@ -34,7 +34,9 @@ from qiita_common.auth_constants import (
     SystemRole,
 )
 from qiita_common.models import (
+    AS_OF_SCOPE,
     AuthEventResponse,
+    DecisionSetToken,
     DefinitionKind,
     DoGetTicketResponse,
     MaskDefinitionStatus,
@@ -65,12 +67,11 @@ from ..auth.tickets import sign_ticket
 from ..auth.token import mint_api_token
 from ..block_read import READ_MASKED_TABLE
 from ..definition_resolver import cohort_refusal, resolve_exact, resolve_group
-from ..definition_similarity import load_groups
 from ..deps import TxConnFactory, get_db_pool, get_flight_signing_key, get_tx_conn_factory
 from ..repositories.block import MASK_SAMPLE_COMPLETED
 from ..repositories.mask_definition import fetch_mask_definition_by_idx
 from ..repositories.study_access import fetch_grantee_by_email
-from ._helpers import deprecated_read
+from ._helpers import deprecated_read, load_groups_as_of
 
 router = APIRouter(prefix=PATH_ADMIN_PREFIX, tags=["admin"])
 
@@ -692,6 +693,13 @@ async def export_masked_read_manifest(
     include_deprecated: bool = Query(
         default=False, description="Read a deprecated mask's own runs (refused without it)."
     ),
+    as_of_event: DecisionSetToken | None = Query(
+        default=None,
+        description=(
+            "Group the masks under this earlier decision set (a `decisions.decision_set`);"
+            f" {AS_OF_SCOPE}."
+        ),
+    ),
 ) -> MaskedReadExportManifest:
     """Roster manifest for a per-pool masked-read export: one row per
     non-retired, non-ENA-flagged sample on the pool, each with the filename
@@ -724,7 +732,7 @@ async def export_masked_read_manifest(
             raise HTTPException(
                 status_code=404, detail=f"no sequenced_pool with idx={sequenced_pool_idx}"
             )
-        groups = await load_groups(conn)
+        groups = await load_groups_as_of(conn, as_of_event)
         mask = groups.definitions.get((DefinitionKind.MASK, mask_idx))
         if mask is None:
             raise HTTPException(
@@ -759,6 +767,7 @@ async def export_masked_read_manifest(
         samples=samples,
         deprecated=exact,
         deprecation_reason=row["deprecation_reason"] if exact else None,
+        decisions=resolution.decisions,
     )
 
 
@@ -846,6 +855,7 @@ async def create_masked_read_export_ticket(
             kind=DefinitionKind.MASK,
             definition_idx=body.mask_idx,
             prep_sample_idxs=[body.prep_sample_idx],
+            groups=await load_groups_as_of(conn, body.as_of_event),
         )
     resolved = resolution.samples[body.prep_sample_idx]
     refusal = cohort_refusal(resolved, body.mask_idx)
@@ -867,4 +877,6 @@ async def create_masked_read_export_ticket(
         secret=signing_key,
         ttl_seconds=_EXPORT_TICKET_TTL_SECONDS,
     )
-    return DoGetTicketResponse(ticket=base64.b64encode(ticket_bytes).decode())
+    return DoGetTicketResponse(
+        ticket=base64.b64encode(ticket_bytes).decode(), decisions=resolution.decisions
+    )

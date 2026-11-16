@@ -208,6 +208,16 @@ async def test_wet_lab_and_system_admins_need_no_study_role(ctx, client):
     assert resp.status_code == 200, resp.text
 
 
+async def test_an_unknown_decision_set_is_refused(ctx):
+    mask_idx = await _seed_syndna_mask(ctx)
+    study_idx = await _viewer_study(ctx)
+    await _counted_sample(ctx, mask_idx=mask_idx, study_idx=study_idx)
+    resp = await ctx["user"].get(
+        _url(mask_idx), params={"study_idx": study_idx, "as_of_event": "sha256:" + "a" * 64}
+    )
+    assert resp.status_code == 422, resp.text
+
+
 async def test_a_sample_not_processed_is_left_out_and_listed(ctx):
     """A pending gate with no live ticket is no run; a running ticket makes the
     sample incomplete. Both are left out of the table and listed with the reason."""
@@ -315,6 +325,7 @@ async def test_each_sample_is_counted_under_the_mask_it_resolves_to(ctx, similar
         body = resp.json()
         assert body["mask_idx"] == anchor
         assert body["left_out"] == []
+        assert (body["decisions"]["as_of"], body["decisions"]["pairs_used"]) == (False, 1)
         assert [
             (s["prep_sample_idx"], s["mask_idx"], s["read_counts"]) for s in body["samples"]
         ] == [

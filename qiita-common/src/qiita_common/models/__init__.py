@@ -149,6 +149,9 @@ from qiita_common.models.biosample import (
     normalize_matrix_tube_id,
 )
 from qiita_common.models.definition_group import (
+    AS_OF_SCOPE,
+    DecisionProvenance,
+    DecisionSetToken,
     DefinitionGroupRefusal,
     DefinitionGroupResolveRequest,
     DefinitionGroupResolveResponse,
@@ -614,6 +617,9 @@ __all__ = [
     "DefinitionPairVerdict",
     # Definition groups.
     "DefinitionGroupRefusal",
+    "AS_OF_SCOPE",
+    "DecisionProvenance",
+    "DecisionSetToken",
     "DefinitionGroupResolveRequest",
     "DefinitionGroupResolveResponse",
     "SampleResolution",

@@ -81,6 +81,7 @@ import asyncpg
 from qiita_common.models import (
     AlignmentSampleState,
     AssemblySampleState,
+    DecisionProvenance,
     DefinitionGroupRefusal,
     DefinitionKind,
     MaskSampleState,
@@ -533,6 +534,9 @@ class GroupResolution:
     group: tuple[int, ...]
     samples: Mapping[int, SampleResolution]
     exact: bool = False
+    # The decisions the group was computed under (`decision_set`); None only for groups
+    # that `load_groups` did not load.
+    decisions: DecisionProvenance | None = None
 
     def not_resolved_to(self, definition_idx: int) -> list[SampleResolution]:
         """The prep_samples not `processed` under exactly `definition_idx`, ascending."""
@@ -559,12 +563,15 @@ async def resolve_group(
     definition_idx: int,
     prep_sample_idxs: Iterable[int],
     groups: Groups | None = None,
+    as_of_event: str | None = None,
 ) -> GroupResolution:
     """Resolve each of `prep_sample_idxs` in `kind` `definition_idx`'s group, in the
     caller's REPEATABLE READ transaction. `groups` is loaded when not given; a caller
-    passing its own must have loaded it in this transaction. Raises
-    DefinitionNotFound when `definition_idx` is not a `kind` definition, and
-    DefinitionNotObservable (`require_observable`)."""
+    passing its own must have loaded it in this transaction (with the same
+    `as_of_event`, which is then not passed here). `as_of_event` computes the group from
+    an earlier decision set (`decision_set`). Raises DefinitionNotFound when
+    `definition_idx` is not a `kind` definition, DefinitionNotObservable
+    (`require_observable`), and DecisionSetUnknown."""
     return await _resolve(
         conn,
         kind=kind,
@@ -572,6 +579,7 @@ async def resolve_group(
         prep_sample_idxs=prep_sample_idxs,
         groups=groups,
         exact=False,
+        as_of_event=as_of_event,
     )
 
 
@@ -582,6 +590,7 @@ async def resolve_exact(
     definition_idx: int,
     prep_sample_idxs: Iterable[int],
     groups: Groups | None = None,
+    as_of_event: str | None = None,
 ) -> GroupResolution:
     """`resolve_group` in exact mode (module docstring): `definition_idx`'s own runs,
     its deprecation and its upstreams' not checked."""
@@ -592,6 +601,7 @@ async def resolve_exact(
         prep_sample_idxs=prep_sample_idxs,
         groups=groups,
         exact=True,
+        as_of_event=as_of_event,
     )
 
 
@@ -603,6 +613,7 @@ async def _resolve(
     prep_sample_idxs: Iterable[int],
     groups: Groups | None,
     exact: bool,
+    as_of_event: str | None = None,
 ) -> GroupResolution:
     require_transaction(conn)
     # The gates, tickets and groups are read in several statements; below REPEATABLE
@@ -614,7 +625,9 @@ async def _resolve(
             f"resolve_group needs a REPEATABLE READ transaction; this one is {isolation!r}"
         )
     if groups is None:
-        groups = await load_groups(conn)
+        groups = await load_groups(conn, as_of_event=as_of_event)
+    elif as_of_event is not None:
+        raise ValueError("pass as_of_event to load_groups when passing groups")
     if (kind, definition_idx) not in groups.definitions:
         raise DefinitionNotFound(kind, definition_idx)
     require_observable(groups, kind, definition_idx, exact=exact)
@@ -630,4 +643,9 @@ async def _resolve(
             for s in samples
         },
         exact=exact,
+        decisions=(
+            None
+            if groups.decisions is None
+            else groups.decisions.provenance(None if exact else needed)
+        ),
     )

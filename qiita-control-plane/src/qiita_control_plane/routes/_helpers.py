@@ -42,7 +42,8 @@ from ..auth.guards import (
     tier_at_least,
 )
 from ..auth.principal import HumanUser, Principal
-from ..definition_similarity import PairRefused
+from ..decision_set import DecisionSetUnknown
+from ..definition_similarity import Groups, PairRefused, load_groups
 from ..repositories._sample_helpers import (
     ConflictingValueDifferentStudyError,
     ConflictingValueSameStudyError,
@@ -1975,3 +1976,12 @@ def resolution_body(resolution: SampleResolution, caller: HumanUser) -> dict:
     `sees_resolution_tickets`."""
     exclude = None if sees_resolution_tickets(caller) else {"work_ticket_idx"}
     return resolution.model_dump(mode="json", exclude=exclude)
+
+
+async def load_groups_as_of(conn: asyncpg.Connection, as_of_event: str | None) -> Groups:
+    """`load_groups` for a route that takes `as_of_event`: 422 when the token names no
+    decision set (`decision_set.DecisionSetUnknown`)."""
+    try:
+        return await load_groups(conn, as_of_event=as_of_event)
+    except DecisionSetUnknown as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc

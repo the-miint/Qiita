@@ -427,6 +427,18 @@ async def test_human_mint_refuses_a_sample_resolved_to_another_alignment_409(
         _mint_url(w["align_3"]), json={"prep_sample_idx": [w["ps_a"]], "columns": _COLUMNS}
     )
     assert resp.status_code == 201, resp.text
+    # The mask pair the alignment group derives from is the decision it was signed under.
+    decisions = resp.json()["decisions"]
+    assert (decisions["as_of"], decisions["pairs_used"]) == (False, 1)
+    unknown = await ctx["user"].post(
+        _mint_url(w["align_3"]),
+        json={
+            "prep_sample_idx": [w["ps_a"]],
+            "columns": _COLUMNS,
+            "as_of_event": "sha256:" + "b" * 64,
+        },
+    )
+    assert unknown.status_code == 422, unknown.text
 
 
 async def test_human_mint_refuses_a_sample_whose_mask_moved_on_409(ctx, alignment_group_world):

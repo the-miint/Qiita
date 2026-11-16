@@ -14,6 +14,7 @@ from qiita_common.models._base import (
     check_derived_inputs,
     check_exactly_one_runtime,
 )
+from qiita_common.models.definition_group import DecisionProvenance, DecisionSetToken
 
 
 class StepBaselineResources(BaseModel):
@@ -270,6 +271,9 @@ class DoGetTicketRequest(BaseModel):
 
 class DoGetTicketResponse(BaseModel):
     ticket: str  # base64-encoded signed ticket bytes
+    # The pair decisions a route that resolves a group before signing resolved under
+    # (the alignment cohort DoGet, the masked-read export ticket); None elsewhere.
+    decisions: DecisionProvenance | None = None
 
 
 # Columns a DoGet ticket asks to be projected, in this order.
@@ -348,6 +352,9 @@ class AlignmentCohortDoGetTicketRequest(BaseModel):
     # Reads a deprecated alignment's own rows (refused without it): the route's
     # `deprecated_read`.
     include_deprecated: bool = False
+    # Resolve the cohort's groups under this earlier decision set
+    # (`DecisionProvenance.decision_set`); only the pair decisions are as of it.
+    as_of_event: DecisionSetToken | None = None
 
 
 class AssemblyDoGetTicketRequest(BaseModel):

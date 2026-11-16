@@ -22,9 +22,13 @@ from qiita_common.models import DefinitionGroupResolveRequest, DefinitionGroupRe
 from ..auth.guards import COHORT_MIN_TIER, require_human, require_scope
 from ..auth.principal import HumanUser, Principal
 from ..definition_resolver import DefinitionNotObservable, require_observable, resolve_group
-from ..definition_similarity import load_groups
 from ..deps import get_db_pool
-from ._helpers import authorize_prep_sample_cohort, resolution_body, sees_resolution_tickets
+from ._helpers import (
+    authorize_prep_sample_cohort,
+    load_groups_as_of,
+    resolution_body,
+    sees_resolution_tickets,
+)
 
 router = APIRouter(prefix=PATH_DEFINITION_GROUP_PREFIX, tags=["definition-group"])
 
@@ -41,9 +45,14 @@ async def resolve_definition_group_route(
     reason. 404 when the definition does not exist and 422 when its group's runs are
     not read per prep_sample (`require_observable`), both before anything about the
     cohort is said; 403 when the caller may not read every prep_sample. Each
-    sample's `work_ticket_idx` is omitted unless the caller is a system_admin."""
+    sample's `work_ticket_idx` is omitted unless the caller is a system_admin.
+
+    `decisions` records the pair decisions the group was computed under; passing its
+    `decision_set` back as `as_of_event` computes the group from those decisions again,
+    with runs, gates, tickets and deprecation read as they are now (422 for a token
+    that names no decision set)."""
     async with pool.acquire() as conn, conn.transaction(isolation="repeatable_read", readonly=True):
-        groups = await load_groups(conn)
+        groups = await load_groups_as_of(conn, body.as_of_event)
         if (body.definition_kind, body.definition_idx) not in groups.definitions:
             raise HTTPException(
                 status_code=404,
@@ -68,6 +77,7 @@ async def resolve_definition_group_route(
         definition_idx=resolution.definition_idx,
         group=list(resolution.group),
         samples=list(resolution.samples.values()),
+        decisions=resolution.decisions,
     )
     if sees_resolution_tickets(caller):
         return response

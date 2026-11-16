@@ -40,7 +40,11 @@ from qiita_common.models.biosample import (
     MetadataChecklistRef,
     MetadataEntry,
 )
-from qiita_common.models.definition_group import SampleResolution
+from qiita_common.models.definition_group import (
+    DecisionProvenance,
+    DecisionSetToken,
+    SampleResolution,
+)
 from qiita_common.models.definition_pair import DefinitionKind
 from qiita_common.models.reference import Platform
 from qiita_common.models.step import ProjectionColumns
@@ -1216,6 +1220,8 @@ class SyndnaReadCountResponse(BaseModel):
     left_out_biosample_accession: dict[int, str | None] = {}
     deprecated: bool = False
     deprecation_reason: str | None = None
+    # The pair decisions the selection was resolved under (`DecisionProvenance`).
+    decisions: DecisionProvenance | None = None
 
     @model_validator(mode="after")
     def _counts_follow_inserts(self) -> SyndnaReadCountResponse:
@@ -1828,6 +1834,8 @@ class MaskedReadExportManifest(BaseModel):
     samples: list[MaskedReadExportSample]
     deprecated: bool = False
     deprecation_reason: str | None = None
+    # The pair decisions the roster was resolved under.
+    decisions: DecisionProvenance | None = None
 
 
 class MaskedReadExportTicketRequest(BaseModel):
@@ -1848,3 +1856,6 @@ class MaskedReadExportTicketRequest(BaseModel):
     # A deprecated mask is refused unless set; then the prep_sample must resolve to
     # it exactly (`definition_resolver`, exact mode).
     include_deprecated: bool = False
+    # Resolve the mask's group under this earlier decision set
+    # (`DecisionProvenance.decision_set`); only the pair decisions are as of it.
+    as_of_event: DecisionSetToken | None = None

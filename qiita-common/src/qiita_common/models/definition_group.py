@@ -8,10 +8,11 @@ member of it, or to none. The rules are in
 
 from __future__ import annotations
 
+from datetime import datetime
 from enum import StrEnum
-from typing import Annotated
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
 from qiita_common.models._base import PrepSampleCohort
 from qiita_common.models.definition_pair import DefinitionKind
@@ -53,6 +54,35 @@ class DefinitionGroupRefusal(StrEnum):
     NOT_PROCESSED = "not_processed"
 
 
+# A decision-set token: `sha256:` and 64 lowercase hex digits. The canonical form it
+# hashes is stated in `qiita_control_plane.decision_set`.
+DecisionSetToken = Annotated[str, StringConstraints(pattern=r"^sha256:[0-9a-f]{64}$")]
+
+# What `as_of_event` rewinds, stated on every response and manifest that carries it.
+AS_OF_SCOPE = "pair decisions only; runs, gates, tickets and deprecation are current"
+
+
+class DecisionProvenance(BaseModel):
+    """The pair decisions a resolution was computed under, without internal ids.
+
+    `decision_set` is the token of every decided pair's verdict as of the resolution
+    (`qiita_control_plane.decision_set` states the canonical form); passing it back as
+    `as_of_event` rebuilds the groups from those decisions. `newest_event_at` is when the
+    newest decision event in that state was recorded (None before any). `as_of` is true
+    when the caller asked for an earlier decision set. `pairs_used` / `pairs_used_set`
+    count and hash, in the same canonical form, the decided pairs that name a definition
+    the resolution read (none when it read one definition exactly, without a group)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    decision_set: DecisionSetToken
+    newest_event_at: datetime | None
+    as_of: bool
+    as_of_scope: Literal[AS_OF_SCOPE] = AS_OF_SCOPE  # type: ignore[valid-type]
+    pairs_used: Annotated[int, Field(ge=0)]
+    pairs_used_set: DecisionSetToken
+
+
 class DefinitionGroupResolveRequest(BaseModel):
     """Body for POST /api/v1/definition-group/resolve: a definition of the group to
     resolve (any member names the whole group) and the prep_samples to resolve,
@@ -63,6 +93,7 @@ class DefinitionGroupResolveRequest(BaseModel):
     definition_kind: DefinitionKind
     definition_idx: Annotated[int, Field(gt=0)]
     prep_sample_idx: PrepSampleCohort
+    as_of_event: DecisionSetToken | None = None
 
 
 class SampleResolution(BaseModel):
@@ -123,3 +154,6 @@ class DefinitionGroupResolveResponse(BaseModel):
     definition_idx: Annotated[int, Field(gt=0)]
     group: list[int]
     samples: list[SampleResolution]
+    # Set by the route; None only on a plan that a client built without resolving (an
+    # exact read of a deprecated definition).
+    decisions: DecisionProvenance | None = None
