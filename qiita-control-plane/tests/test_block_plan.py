@@ -24,7 +24,7 @@ from qiita_common.host_filter_plan import PoolPlanRefusal
 from qiita_common.models import (
     HOST_FILTER_INDEX_TYPE_RYPE,
     MISSING_REASON_CONTROL_SAMPLE,
-    MISSING_REASON_NOT_APPLICABLE,
+    MISSING_REASON_NOT_PROVIDED,
 )
 
 from qiita_control_plane import block_planner
@@ -852,14 +852,13 @@ async def test_plan_resolves_single_host_sample_from_metadata(hf, planapp):
 
 
 async def test_plan_heterogeneous_pool_partitions_by_decision(hf, planapp):
-    """A human-host sample (FILTER) + a not_applicable sample (PASS_THROUGH) share
+    """A human-host sample (FILTER) + a hostless sample (PASS_THROUGH) share
     a prep_protocol but resolve to DIFFERENT decisions → two partitions with
     different mask_idx: the FILTER partition carries host refs, the PASS_THROUGH
     partition has host filtering disabled."""
     ps_human = await hf["add_sample"](reads=50)
-    ps_na = await hf["add_sample"](reads=50)
+    await hf["add_sample"](reads=50)  # no host_taxon_id: no host
     await hf["set_host_term"](ps_human, hf["human_term_idx"])
-    await hf["set_host_missing"](ps_na, MISSING_REASON_NOT_APPLICABLE)
 
     summary, _ = await _plan(hf, planapp, force_decision=None)
 
@@ -895,10 +894,11 @@ async def test_plan_blank_inherits_pool_host(hf, planapp):
 
 
 async def test_plan_unresolved_sample_refuses(hf, planapp):
-    """A sample with no host_taxon_id at all resolves UNRESOLVED, so the whole plan
+    """A sample with an unnamed host resolves UNRESOLVED, so the whole plan
     is refused with PoolHostFilterRefusal(UNRESOLVED_SAMPLES) before any mask is
     minted (fail-closed: we will not mask a sample against the wrong thing)."""
-    ps = await hf["add_sample"](reads=50)  # no host_taxon_id metadata
+    ps = await hf["add_sample"](reads=50)
+    await hf["set_host_missing"](ps, MISSING_REASON_NOT_PROVIDED)
 
     with pytest.raises(block_planner.PoolHostFilterRefusal) as ei:
         await _plan(hf, planapp, force_decision=None)
@@ -922,10 +922,11 @@ async def test_plan_multi_host_refuses(hf, planapp):
 
 
 async def test_plan_force_bypasses_resolution(hf, planapp):
-    """A forced decision applies pool-wide, bypassing resolution: a sample with NO
-    host_taxon_id (which would be UNRESOLVED under real resolution) plans cleanly
+    """A forced decision applies pool-wide, bypassing resolution: a sample with an
+    unnamed host (which would be refused under real resolution) plans cleanly
     into one host-filtered partition when forced against a ready reference."""
-    await hf["add_sample"](reads=50)  # no host_taxon_id metadata
+    ps = await hf["add_sample"](reads=50)
+    await hf["set_host_missing"](ps, MISSING_REASON_NOT_PROVIDED)
 
     summary, _ = await _plan(
         hf,

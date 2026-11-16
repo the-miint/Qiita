@@ -14,8 +14,8 @@
 //! - `doput`: the staging path an upload lands at, and staging an uploaded Arrow
 //!   stream as Parquet.
 //! - `export`: the `export_read`, `count_masked` and `mask_metrics` DoActions.
-//! - `registration`: the `register_files` DoAction, the lake commit retry and
-//!   registration lock, and placing files in lake storage.
+//! - `registration`: the `register_files` DoAction, the lake commit retry, which
+//!   lake locks a registration takes, and placing files in lake storage.
 //! - `lake_edit`: the DoActions that change the lake other than registration: the
 //!   `delete_*` actions, `sync_reference_exclusion` and `mint_phylogeny_edge_id`.
 
@@ -77,6 +77,8 @@ pub struct QiitaFlightService {
     /// control-plane ticket workspace path under `{PATH_SCRATCH}/ticket/...` —
     /// resolves under this root before writing.
     scratch_root: PathBuf,
+    /// The locks writers of the replace-keyed tables wait for, outside the pool.
+    lake_locks: Arc<crate::lake_locks::LakeLocks>,
 }
 
 impl QiitaFlightService {
@@ -87,9 +89,13 @@ impl QiitaFlightService {
         upload_staging_root: PathBuf,
         scratch_root: PathBuf,
     ) -> Self {
+        let lake_locks = Arc::new(crate::lake_locks::LakeLocks::new(
+            pool.catalog_connstr().to_string(),
+        ));
         Self {
             flight_public_key,
             pool,
+            lake_locks,
             doput_permits: Arc::new(tokio::sync::Semaphore::new(max_concurrent_doput)),
             max_concurrent_doput,
             upload_staging_root,

@@ -3,7 +3,7 @@
 `POST /api/v1/ena-import-batch` accepts a list of accessions
 (`BatchImportRequest`) and returns a handle immediately (`BatchImportResponse`);
 `GET /api/v1/ena-import-batch/{idx}` (`BatchImportStatus`) polls per-item
-progress.
+progress and `GET /api/v1/ena-import-batch` (`BatchImportListResponse`) lists batches.
 
 The persisted `BatchItemState` values mirror the `qiita.ena_import_batch_item.state`
 CHECK constraint — TEXT/CHECK, not a Postgres ENUM, same carve-out as `UploadStatus` /
@@ -13,8 +13,9 @@ CHECK constraint — TEXT/CHECK, not a Postgres ENUM, same carve-out as `UploadS
 from __future__ import annotations
 
 from enum import StrEnum
+from typing import Annotated
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
 
 from qiita_common.models.work_ticket import FailureType
 
@@ -66,8 +67,8 @@ class EnaRunImportOutcome(BaseModel):
     `GET /api/v1/ena-import-batch/{idx}`.
 
     `status` is the `EnaRunRegistrationStatus` value (`registered` /
-    `skipped_already_present` / `excluded` / `failed` / `flagged_unavailable` /
-    `held_not_downloaded` / `download_failed`). `failure_reason` is set on every
+    `skipped_already_present` / `excluded` / `failed` / `unsupported` /
+    `flagged_unavailable` / `download_failed`). `failure_reason` is set on every
     status but the first two; `failure_type` only on `download_failed`.
     `metadata_warnings`: harmonization gaps on the biosample this run created.
     """
@@ -123,3 +124,24 @@ class BatchImportStatus(BaseModel):
 
     ena_import_batch_idx: int
     items: list[BatchImportItem]
+
+
+ENA_IMPORT_BATCH_LIST_DEFAULT_LIMIT = 20
+ENA_IMPORT_BATCH_LIST_MAX_LIMIT = 100
+
+
+class BatchImportSummary(BaseModel):
+    """One batch in the list view: how many of its items are in each rolled-up state."""
+
+    ena_import_batch_idx: int
+    created_at: AwareDatetime
+    item_state_counts: dict[BatchItemState, Annotated[int, Field(ge=0)]]
+
+
+class BatchImportListResponse(BaseModel):
+    """Returned by `GET /api/v1/ena-import-batch`, newest first. `truncated` is
+    True when more batches matched than `limit`."""
+
+    batches: list[BatchImportSummary]
+    count: Annotated[int, Field(ge=0)]
+    truncated: bool

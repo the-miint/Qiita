@@ -420,6 +420,7 @@ async def run_workflow(
             pool,
             action_steps=action.steps,
             scope_target=scope_target,
+            action_context=bound,
             workspace=workspace,
         )
         if staged_roster is not None:

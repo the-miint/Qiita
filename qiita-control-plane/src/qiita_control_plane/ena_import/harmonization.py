@@ -82,7 +82,7 @@ def _host_taxon_id(
     run: EnaRunRecord,
     implied_hosts: Mapping[str, str | None],
     loaded_term_ids: Collection[str],
-) -> tuple[str, list[str]]:
+) -> tuple[str | None, list[str]]:
     who = run.sample_accession
     warnings: list[str] = []
     implied = run.tax_id in implied_hosts
@@ -116,7 +116,7 @@ def _host_taxon_id(
         return MISSING_REASON_NOT_PROVIDED, warnings
 
     if implied and implied_host is None:
-        return MISSING_REASON_NOT_APPLICABLE, warnings
+        return None, warnings
     if implied_host is not None:
         if implied_host in loaded_term_ids:
             return implied_host, warnings
@@ -182,11 +182,9 @@ def build_biosample_metadata(
     ]
     host, host_warnings = _host_taxon_id(ena_run, implied_hosts, loaded_term_ids)
     taxon, taxon_warnings = _taxon_id(ena_run, loaded_term_ids)
-    global_metadata = {
-        **mapped,
-        BIOSAMPLE_DISPLAY_HOST_TAXON_ID: host,
-        BIOSAMPLE_DISPLAY_TAXON_ID: taxon,
-    }
+    global_metadata = {**mapped, BIOSAMPLE_DISPLAY_TAXON_ID: taxon}
+    if host is not None:
+        global_metadata[BIOSAMPLE_DISPLAY_HOST_TAXON_ID] = host
     return (
         global_metadata,
         dict(unmapped),

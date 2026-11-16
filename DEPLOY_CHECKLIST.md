@@ -19,15 +19,35 @@ _None yet._
 
 ### 2. One-time host setup
 
-```bash
-# [admin] gpl-boundary must report >= 0.5.0, or compute-readiness's miint-gpl-boundary probe fails the deploy.
-# If it is older, replace the binary at that path by hand (the deploy does not upgrade it: #859).   (#888)
-sudo -u qiita-orch "$(sudo grep -oP '^MIINT_GPL_BOUNDARY_PATH=\K.*' /etc/qiita/compute-orchestrator.env)" --version | grep gpl_boundary
-```
+- `[operator]` **Before the restart, run the host-taxon backfill.** From the restart a biosample
+  with no `host_taxon_id` passes through host filtering undepleted, so skipping `--execute` lets
+  residue biosamples (taxa the curated table does not cover) pass through undepleted. `--execute`
+  writes them `not provided`, which stays refused until patched, and leaves hostless taxa absent; it
+  is safe on the old build. This is the backfill's only run: after the restart an absent value is
+  deliberate, so never run it again. (#864)
+  1. Dry-run and read the report. Expect no `WARNING:` lines and `no taxon_id at all (not
+     backfillable)` to read 0, because a blank that the backfill cannot recognize as a control, or a
+     biosample with no `taxon_id`, is no longer refused; if not, stop and raise the report.
+  2. Only then run it with `--execute`.
+  3. Dry-run again. Expect `Pass --execute to write 0 row(s)`; if not, stop and raise the report.
+  ```bash
+  # [operator] in the pulled checkout; DATABASE_URL as above
+  cd ~/qiita-miint/qiita-control-plane
+  /usr/local/bin/uv run --reinstall-package qiita-common qiita-admin backfill host-taxon-id --show-unresolved 50            # 1 and 3: dry run
+  /usr/local/bin/uv run --reinstall-package qiita-common qiita-admin backfill host-taxon-id --show-unresolved 0 --execute  # 2: writes
+  ```
+- `[admin]` **gpl-boundary must report 0.5.0 or later**, or compute-readiness's
+  `miint-gpl-boundary` probe fails the deploy. If it is older, replace the binary at that path by
+  hand (the deploy does not upgrade it: #859). (#888)
+  ```bash
+  sudo -u qiita-orch "$(sudo grep -oP '^MIINT_GPL_BOUNDARY_PATH=\K.*' /etc/qiita/compute-orchestrator.env)" --version | grep gpl_boundary
+  ```
 
 ### 3. Migrations
 
-_None yet._
+- `20261112000000_host_taxon_id_not_required` makes `host_taxon_id` optional, and from the
+  restart an absent value means no host. `dbmate` applies it; run the bucket-2 backfill
+  first. (#864)
 
 ### 4. Deploy
 
@@ -43,6 +63,7 @@ _None yet._
 
 ### Notes (no host action)
 
+- (#863) `download-ena-study` 1.0.0 gains an optional `ena_run_accessions` through the normal `qiita-admin actions sync`, and the `held_not_downloaded` run status is no longer reported.
 - `.env.compute-orchestrator.example`'s `MIINT_GPL_BOUNDARY_PATH` comment now names the tools behind the boundary (bowtie2, FastTree, Prodigal) and the 0.5.0 minimum; no live env change. (#888)
 - New DuckLake tables `gene_call` / `gene_call_contig`, created empty by the data plane at start; nothing writes them yet. (#888)
 - The staged miint must have `prodigal_proteins` (duckdb-miint `2b215901` or later); the miint stage step restages when the mirror's build changes, and compute-readiness's `miint-gpl-boundary` probe fails on a build without it. (#888)

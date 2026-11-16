@@ -497,6 +497,194 @@ def test_resolve_sample_attributes_for_samples_makes_one_seam_call_with_the_list
     assert [(a.sample_accession, a.attributes) for a in attrs] == [("SAMN1", {"tag": ["x"]})]
 
 
+# ENA's body for an all-missing three-biosample request, captured 2026-11-12.
+_ENA_NOT_FOUND_BODY = """<?xml version="1.0" encoding="UTF-8"?>
+<ErrorDetails>
+  <timestamp>1794513496573</timestamp>
+  <status>404</status>
+  <error>Not Found</error>
+  <message>SAMN42375043,SAMN42375086,SAMN42375062 not found.</message>
+  <path>/ena/browser/api/xml/SAMN42375043,SAMN42375086,SAMN42375062</path>
+</ErrorDetails>
+"""
+_NO_ENDPOINT_BODY = (
+    '{"timestamp":"2026-11-12","status":404,"error":"Not Found",'
+    '"message":"No endpoint found for /ena/browser/api/xmlX/SAMN1","path":"/x"}'
+)
+
+
+def _not_found_body(names: list[str]) -> str:
+    joined = ",".join(names)
+    return _ENA_NOT_FOUND_BODY.replace("SAMN42375043,SAMN42375086,SAMN42375062", joined)
+
+
+class _FakeBrowserXml:
+    """ENA's batched sample XML: a request omits missing biosamples and 404s, naming them,
+    when every biosample in one batch of `chunk` is missing. Counts the queries it serves."""
+
+    def __init__(self, present: dict[str, dict[str, list[str]]], chunk: int = 200):
+        self.present = present
+        self.chunk = chunk
+        self.calls = 0
+
+    def __call__(self, accessions):
+        self.calls += 1
+        for start in range(0, len(accessions), self.chunk):
+            batch = accessions[start : start + self.chunk]
+            if not any(a in self.present for a in batch):
+                raise _http_error(404, _not_found_body(batch))
+        return [(a, self.present[a]) for a in accessions if a in self.present]
+
+
+def test_resolve_sample_attributes_for_samples_returns_empty_when_ena_has_no_biosample(
+    monkeypatch,
+):
+    from qiita_control_plane.ena_import.miint_resolver import MiintEnaResolver
+
+    monkeypatch.setattr(_QUERY_ATTRS, _FakeBrowserXml({}))
+
+    assert (
+        MiintEnaResolver().resolve_sample_attributes_for_samples(["SAMN1", "SAMN2", "SAMN3"]) == []
+    )
+
+
+def test_all_missing_request_is_one_query_per_not_found_and_logs_every_biosample(
+    monkeypatch, caplog
+):
+    from qiita_control_plane.ena_import.miint_resolver import MiintEnaResolver
+
+    accessions = [f"SAMN{i}" for i in range(200)]
+    fake = _FakeBrowserXml({})
+    monkeypatch.setattr(_QUERY_ATTRS, fake)
+
+    with caplog.at_level("WARNING"):
+        assert MiintEnaResolver().resolve_sample_attributes_for_samples(accessions) == []
+
+    assert fake.calls == 1
+    assert set(caplog.messages) == {
+        f"ENA returned no sample attributes for biosample {a}" for a in accessions
+    }
+    assert len(caplog.messages) == len(accessions)
+
+
+@pytest.mark.parametrize("present_first", [True, False])
+def test_a_present_biosample_beside_many_missing_returns_it_and_logs_each_missing_once(
+    monkeypatch, caplog, present_first
+):
+    from qiita_control_plane.ena_import.miint_resolver import MiintEnaResolver
+
+    missing = [f"SAMN{i}" for i in range(1, 250)]
+    accessions = ["SAMN0", *missing] if present_first else [*missing, "SAMN0"]
+    monkeypatch.setattr(_QUERY_ATTRS, _FakeBrowserXml({"SAMN0": {"depth": ["5"]}}))
+
+    with caplog.at_level("WARNING"):
+        attrs = MiintEnaResolver().resolve_sample_attributes_for_samples(accessions)
+
+    assert [(a.sample_accession, a.attributes) for a in attrs] == [("SAMN0", {"depth": ["5"]})]
+    assert len(caplog.messages) == len(missing)
+    assert set(caplog.messages) == {
+        f"ENA returned no sample attributes for biosample {a}" for a in missing
+    }
+
+
+def test_200_missing_beside_one_present_logs_each_missing_once(monkeypatch, caplog):
+    from qiita_control_plane.ena_import.miint_resolver import MiintEnaResolver
+
+    missing = [f"SAMN{i}" for i in range(1, 201)]
+    monkeypatch.setattr(_QUERY_ATTRS, _FakeBrowserXml({"SAMN0": {"depth": ["5"]}}))
+
+    with caplog.at_level("WARNING"):
+        attrs = MiintEnaResolver().resolve_sample_attributes_for_samples([*missing, "SAMN0"])
+
+    assert [a.sample_accession for a in attrs] == ["SAMN0"]
+    assert len(caplog.messages) == len(missing)
+    assert set(caplog.messages) == {
+        f"ENA returned no sample attributes for biosample {a}" for a in missing
+    }
+
+
+def test_resolve_sample_attributes_for_samples_keeps_biosamples_beside_all_missing_batches(
+    monkeypatch,
+):
+    from qiita_control_plane.ena_import.miint_resolver import MiintEnaResolver
+
+    accessions = [f"SAMN{i}" for i in range(800)]
+    present = {"SAMN250": {"depth": ["5"]}, "SAMN640": {"depth": ["10"]}}
+    fake = _FakeBrowserXml(present)
+    monkeypatch.setattr(_QUERY_ATTRS, fake)
+
+    attrs = MiintEnaResolver().resolve_sample_attributes_for_samples(accessions)
+
+    assert [(a.sample_accession, a.attributes) for a in attrs] == [
+        ("SAMN250", {"depth": ["5"]}),
+        ("SAMN640", {"depth": ["10"]}),
+    ]
+    assert fake.calls == 3
+
+
+def test_a_not_found_404_naming_no_requested_accession_raises(monkeypatch):
+    from qiita_control_plane.ena_import.miint_resolver import MiintEnaResolver
+
+    calls = []
+
+    def query(accessions):
+        calls.append(accessions)
+        raise _http_error(404, _not_found_body(["SAMN999"]))
+
+    monkeypatch.setattr(_QUERY_ATTRS, query)
+
+    with pytest.raises(duckdb.HTTPException):
+        MiintEnaResolver().resolve_sample_attributes_for_samples(["SAMN1", "SAMN2"])
+    assert len(calls) == 1
+
+
+def test_the_captured_ena_404_body_names_the_accessions_to_drop(monkeypatch):
+    from qiita_control_plane.ena_import.miint_resolver import MiintEnaResolver
+
+    calls = []
+
+    def query(accessions):
+        calls.append(list(accessions))
+        if len(calls) == 1:
+            raise _http_error(404, _ENA_NOT_FOUND_BODY)
+        return [("SAMN1", {"tag": ["x"]})]
+
+    monkeypatch.setattr(_QUERY_ATTRS, query)
+
+    attrs = MiintEnaResolver().resolve_sample_attributes_for_samples(
+        ["SAMN42375043", "SAMN1", "SAMN42375086", "SAMN42375062"]
+    )
+
+    assert calls == [["SAMN42375043", "SAMN1", "SAMN42375086", "SAMN42375062"], ["SAMN1"]]
+    assert [a.sample_accession for a in attrs] == ["SAMN1"]
+
+
+@pytest.mark.parametrize("body", [_NO_ENDPOINT_BODY, None, "", "<html>Not Found</html>"])
+def test_a_404_that_is_not_enas_missing_biosample_error_raises(monkeypatch, body):
+    from qiita_control_plane.ena_import.miint_resolver import MiintEnaResolver
+
+    def query(accessions):
+        raise _http_error(404, body)
+
+    monkeypatch.setattr(_QUERY_ATTRS, query)
+
+    with pytest.raises(duckdb.HTTPException):
+        MiintEnaResolver().resolve_sample_attributes_for_samples(["SAMN1", "SAMN2"])
+
+
+@pytest.mark.parametrize("status", [400, 500])
+def test_resolve_sample_attributes_for_samples_raises_any_other_http_error(monkeypatch, status):
+    from qiita_control_plane.ena_import.miint_resolver import MiintEnaResolver
+
+    def query(accessions):
+        raise _http_error(status, _ENA_NOT_FOUND_BODY)
+
+    monkeypatch.setattr(_QUERY_ATTRS, query)
+
+    with pytest.raises(duckdb.HTTPException):
+        MiintEnaResolver().resolve_sample_attributes_for_samples(["SAMN1", "SAMN2"])
+
+
 def test_resolve_sample_attributes_for_samples_rejects_a_non_sample_accession(monkeypatch):
     from qiita_common.ena_accession import InvalidEnaAccessionError
 

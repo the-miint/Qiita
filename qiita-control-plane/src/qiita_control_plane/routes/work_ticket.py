@@ -114,13 +114,12 @@ from ..repositories.block import BLOCK_ABANDONED
 from ..repositories.mask_definition import MaskDefinitionDeprecated, lock_active_mask
 from ..runner import _fetch_action
 from ..step_progress import StepProgressMismatch, check_step_progress, load_step_progress
+from ..ticket_redrive import drop_dead_step_rows, reset_ticket_to_pending
 from ..work_ticket_cancel import WorkTicketNotFound, cancel_work_ticket
 from ..work_ticket_submit import (
-    _check_audience,
-    _check_scopes,
-    _fetch_action_for_submission,
     _reset_failed_reference_scope_for_dispatch,
-    require_compute_backend_client,
+    authorize_redrive_action,
+    require_compute_backend_client_dependency,
     submit_work_ticket_core,
 )
 from ..workspace import step_attempt_dir, step_logs_dir, ticket_workspace
@@ -169,10 +168,6 @@ _WORK_TICKET_LIST_MAX_LIMIT = 500
 # =============================================================================
 # Helpers
 # =============================================================================
-
-
-def _require_compute_backend_client(request: Request) -> None:
-    require_compute_backend_client(request.app)
 
 
 async def _resolve_cancel_filter(pool: asyncpg.Pool, body: WorkTicketCancelRequest) -> list[int]:
@@ -495,7 +490,7 @@ async def set_fanout_cohort_override(
     # per-ticket guard swallows it, and the release is already committed — so
     # without this the route would answer 200 with a `released` list whose tickets
     # are un-held, undispatched, and unreachable by any later pump.
-    _: None = Depends(_require_compute_backend_client),
+    _: None = Depends(require_compute_backend_client_dependency),
 ) -> FanoutPumpResponse:
     """Retune one cohort's in-flight cap and pump it in the same call.
 
@@ -537,7 +532,7 @@ async def pump_fanout_cohort(
     _scope: Principal = Depends(require_scope(Scope.WORK_TICKET_CANCEL)),
     # Same reason as the PATCH above: pumping without a dispatch path strands
     # everything it releases.
-    _: None = Depends(_require_compute_backend_client),
+    _: None = Depends(require_compute_backend_client_dependency),
 ) -> FanoutPumpResponse:
     """Re-trigger a cohort's pump without changing its cap.
 
@@ -887,7 +882,7 @@ async def run_work_ticket(
     request: Request,
     pool: asyncpg.Pool = Depends(get_db_pool),
     principal: Principal = Depends(get_current_principal),
-    _: None = Depends(_require_compute_backend_client),
+    _: None = Depends(require_compute_backend_client_dependency),
 ) -> WorkTicketResponse:
     """Operator override — restart a FAILED ticket or resume a PENDING
     one whose original create-time dispatch was lost. State-aware (see
@@ -904,19 +899,13 @@ async def run_work_ticket(
             detail=f"work_ticket {work_ticket_idx} not found",
         )
 
-    # Re-apply the action's audience+scopes gate. Without this, anyone
-    # who guesses a ticket idx could redrive arbitrary work. Treat
-    # "row missing" and "row exists but disabled" the same for redrive:
-    # both mean the action is unreachable from this ticket. Submission
-    # cares about the distinction (404 vs 410); redrive doesn't.
+    # Submission tells a missing action (404) from a disabled one (410); a
+    # redrive answers both with 409.
     disabled = (
         f"action {row['action_id']!r}/{row['action_version']!r} no longer enabled — cannot redrive"
     )
-    action = await _fetch_action_for_submission(pool, row["action_id"], row["action_version"])
-    if action is None or not action["enabled"]:
+    if not await authorize_redrive_action(pool, principal, row["action_id"], row["action_version"]):
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=disabled)
-    _check_audience(principal, action["audience"])
-    _check_scopes(principal, action["scopes"])
 
     current_state = row["state"]
     if current_state in _RUN_NOT_APPLICABLE_STATES:
@@ -1007,81 +996,18 @@ async def run_work_ticket(
                     sequenced_pool_idx=row["sequenced_pool_idx"],
                     current_state=current_state,
                 )
-            updated = await conn.fetchval(
-                "UPDATE qiita.work_ticket"
-                " SET state = $1::qiita.work_ticket_state,"
-                "     retry_count = 0,"
-                "     failure_type = NULL,"
-                "     failure_stage = NULL,"
-                "     failure_step_name = NULL,"
-                "     failure_reason = NULL,"
-                # A prior FAILED/CANCELLED outcome may already have been
-                # notified; a redrive that later reaches its TRUE terminal state
-                # must re-notify, so reset the notification lifecycle here.
-                "     notified_at = NULL,"
-                "     notify_attempts = 0,"
-                # /run dispatches the ticket itself, so it is no longer held: the
-                # pump must not release it a second time, and abandon-plan must see
-                # it as running (`actions/align_abandon.py`).
-                "     dispatch_held = false"
-                " WHERE work_ticket_idx = $2"
-                "   AND state = $3::qiita.work_ticket_state"
-                " RETURNING work_ticket_idx",
-                WorkTicketState.PENDING.value,
-                work_ticket_idx,
-                current_state,
-            )
-            if updated is None:
+            if not await reset_ticket_to_pending(
+                conn, work_ticket_idx=work_ticket_idx, from_state=current_state
+            ):
                 raise HTTPException(
                     status_code=status.HTTP_409_CONFLICT,
                     detail=_RUN_STATE_CHANGED,
                 )
-
-            # Which prior progress rows survive the redrive. `completed` survives,
-            # so the runner still fast-forwards finished entries (a download
-            # ticket drops them in the second DELETE below).
-            #
-            # Of the rest, the question is whether the row still names a job
-            # worth adopting — `_adopt_or_submit` re-attaches by the persisted
-            # `slurm_job_id`, and the runner may only adopt a LIVE attempt.
-            #
-            #   * `failed` — always dropped. Re-using that attempt number would
-            #     collide (record_submitted rejects anything but submitting→,
-            #     and record_failed refuses failed→failed), wedging the redrive
-            #     on the dead row. Dropped, the runner re-enters the entry,
-            #     finds the orphaned on-disk attempt dir and advances past it to
-            #     a fresh one (it can neither reuse the stale read-only output
-            #     nor delete the SLURM-job-owned dir — see `_attempt_is_unowned`).
-            #   * in-flight WITH a job id — kept when redriving a FAILED ticket.
-            #     A FAILED ticket CAN have a live job: when a step OOM-kills, the
-            #     runner escalates and submits attempt N+1, so a ticket that then
-            #     fails leaves that attempt live with a real id. Dropping it
-            #     would strand the job outright — the CP forgets the id, nothing
-            #     polls it, and no later redrive can reclaim it.
-            #   * in-flight WITHOUT a job id (a `submitting` write-ahead row) —
-            #     dropped. Its only handle is the deterministic `job_name`, and
-            #     the find-by-name orphan closer that would use it runs solely
-            #     under `resume=True`; /run dispatches with resume=False, so a
-            #     kept row would fall through to a fresh submit writing into the
-            #     same attempt dir a possibly-live orphan is already using.
-            #     Dropping it restores the advance-to-a-fresh-dir guard.
-            #
-            # CANCELLED is the carve-out: cancel is terminal-flip-then-scancel,
-            # and the runner's abort path stops without recording the step row
-            # terminal — so a cancelled ticket keeps an in-flight row naming a
-            # job the reap already killed. Adopting that is the very bug this
-            # commit fixes, reached through a live row instead of a dead one, so
-            # a post-cancel redrive drops every non-completed row.
-            redrive_after_cancel = current_state == WorkTicketState.CANCELLED.value
-            await conn.execute(
-                "DELETE FROM qiita.work_ticket_step"
-                " WHERE work_ticket_idx = $1"
-                "   AND state <> $2"
-                "   AND ($3::boolean OR state = $4 OR slurm_job_id IS NULL)",
-                work_ticket_idx,
-                StepProgressState.COMPLETED.value,
-                redrive_after_cancel,
-                StepProgressState.FAILED.value,
+            # Which prior progress rows survive: `drop_dead_step_rows` says why.
+            await drop_dead_step_rows(
+                conn,
+                work_ticket_idx=work_ticket_idx,
+                after_cancel=current_state == WorkTicketState.CANCELLED.value,
             )
             if is_download:
                 # The roster is re-read on dispatch, so a kept completed ingest would be stale.
@@ -1141,7 +1067,7 @@ async def cancel_work_tickets(
     request: Request,
     pool: asyncpg.Pool = Depends(get_db_pool),
     _scope: Principal = Depends(require_scope(Scope.WORK_TICKET_CANCEL)),
-    _: None = Depends(_require_compute_backend_client),
+    _: None = Depends(require_compute_backend_client_dependency),
 ) -> WorkTicketCancelResponse:
     """Operator-cancel of in-flight compute (system_admin, `work_ticket:cancel`):
     for each selected ticket, flip it terminal (`cancelled`) so the runner's poll

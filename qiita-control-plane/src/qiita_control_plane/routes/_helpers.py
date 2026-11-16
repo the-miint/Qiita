@@ -35,6 +35,7 @@ from ..auth.guards import (
     COHORT_MIN_TIER,
     PrepSampleReadAccess,
     filter_prep_samples_caller_can_read,
+    resource_retired_detail,
     tier_at_least,
 )
 from ..auth.principal import HumanUser, Principal
@@ -146,6 +147,12 @@ ALIGNMENT_NOT_FOUND_DETAIL = "alignment not found"
 # two feature spaces: two numbers here would let one route refuse what the other
 # serves for no reason a caller could see.
 GENOME_MAP_HARD_CAP = 250_000
+
+# Hard cap on a study roster (the studies that a biosample or a prep_sample
+# is actively linked to) for one bio-or-prep sample. Sized to comfortably cover
+# any single sample's roster while bounding per-response payload size; both
+# entities' rosters are the same kind of list, so they share it.
+SAMPLE_STUDIES_HARD_CAP = 500_000
 
 
 def refuse_deprecated_alignment(alignment: asyncpg.Record) -> None:
@@ -547,7 +554,7 @@ async def resolve_and_write_study_scoped_metadata(
     entity, a supertype idx for a subtype.
     """
     reported_retired_detail = (
-        f"{noun} {entity_idx} is retired" if retired_detail is None else retired_detail
+        resource_retired_detail(noun, entity_idx) if retired_detail is None else retired_detail
     )
     reported_unlinked_detail = (
         detail_for_unlinked_entity(noun=noun, entity_idx=entity_idx, study_idx=study_idx)
@@ -1524,7 +1531,7 @@ def require_etag_match(
 ) -> None:
     """Run the post-FOR-UPDATE-preflight 404 / 412 checks for a PATCH route.
 
-    Called after `fetch_<entity>(conn, idx, for_update=True)` to fold
+    Called after `fetch_<entity>(conn, idx, lock="update")` to fold
     "row absent (404)" and "ETag stale (412)" into one site so every
     PATCH endpoint emits the same wording. `label` is the entity noun
     embedded in the 404 detail (e.g. "study", "biosample"). The row's ETag is

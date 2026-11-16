@@ -1,5 +1,6 @@
 """Integration tests for the biosample routes."""
 
+import asyncio
 import secrets
 from collections.abc import Awaitable, Callable
 from datetime import date
@@ -23,9 +24,15 @@ from qiita_common.api_paths import (
     URL_BIOSAMPLE_METADATA_BY_STUDY_UNIQUE_FIELD,
     URL_BIOSAMPLE_RESOLVE_ROSTER,
     URL_BIOSAMPLE_STUDY_FIELD_BY_STUDY,
+    URL_BIOSAMPLE_STUDY_LINK,
 )
 from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX, Scope, SystemRole
-from qiita_common.models import BiosampleAccessionField, FieldDataType, Tier
+from qiita_common.models import (
+    BiosampleAccessionField,
+    BiosampleStudyLinkResponse,
+    FieldDataType,
+    Tier,
+)
 
 from qiita_control_plane.repositories import _sample_helpers as sample_helpers
 from qiita_control_plane.repositories.biosample_metadata import BIOSAMPLE_METADATA_SPEC
@@ -56,20 +63,28 @@ from qiita_control_plane.testing.unique_names import (
 
 from .conftest import (
     BIOSAMPLE_FIELD_SURFACE,
+    BIOSAMPLE_STUDY_LIST_SURFACE,
     OWNER_INELIGIBILITY_KINDS,
+    SAMPLE_STUDY_LIST_CASES,
     STUDY_FIELD_CREATE_AUTHZ_CASES,
     STUDY_FIELD_CREATE_CONFLICT_CASES,
     STUDY_FIELD_LIST_AUTHZ_CASES,
+    STUDY_SCOPED_SAMPLE_LINK_AUTHZ_CASES,
     STUDY_SCOPED_SAMPLE_READ_AUTHZ_CASES,
     STUDY_SCOPED_SAMPLE_WRITE_AUTHZ_CASES,
     IneligibilityKind,
+    _cancel,
+    _finish,
     _grant_study_access,
     _seed_study,
+    _wait_until_blocked_by,
     assert_owner_ineligibility_422,
+    assert_sample_study_list,
     assert_study_field_create_authz,
     assert_study_field_create_conflict,
     assert_study_field_get_authz,
     assert_study_field_list_authz,
+    assert_study_scoped_sample_link_authz,
     assert_study_scoped_sample_read_authz,
     assert_study_scoped_sample_write_authz,
     etag_for_row,
@@ -87,6 +102,15 @@ _ELIGIBILITY_DETAIL = "owner is not eligible to own biosamples"
 # builder name the field without threading it through the driver.
 _AUTHZ_FIELD_NAME = "Authz Unique Id"
 _AUTHZ_FIELD_VALUE = "Sample 1"
+_MINIMAL_ROSTER_BODY = {
+    "rows": [
+        {
+            "item_id": "1",
+            "biosample": {"matrix_tube_id": "1"},
+            "primary_project": {"export_entity_id": "QS1"},
+        }
+    ]
+}
 
 # What a by-unique-field resolution case stages: the study it seeded, and the
 # (field name, value) pair its route should be sent.
@@ -180,28 +204,9 @@ async def ctx(role_keyed_clients):
 # ---------------------------------------------------------------------------
 
 
-def _with_host_taxon(body: dict) -> dict:
-    """Return `body` carrying host_taxon_id, unchanged when it already does.
-
-    `host_taxon_id` is a REQUIRED field the import enforces, so it is injected as
-    'not applicable' — a missing-value marker, which counts as supplied and needs no
-    seeded NCBI term. A caller that means to exercise the gate passes `metadata`
-    WITHOUT it.
-    """
-    metadata = dict(body.get("metadata") or {})
-    # The namespace this POST resolves global fields by decides the key, so the
-    # required-field gate sees it either way.
-    host_key = "host_taxon_id" if body.get("global_internal_names") else "host taxon id"
-    if host_key in metadata:
-        return body
-    metadata[host_key] = "not applicable"
-    return {**body, "metadata": metadata}
-
-
 async def _post_biosample(client, ctx, study_idx: int, **body):
     """POST the route and, on 201, track the biosample for teardown."""
-    payload = _with_host_taxon(body)
-    resp = await client.post(URL_BIOSAMPLE_BY_STUDY.format(study_idx=study_idx), json=payload)
+    resp = await client.post(URL_BIOSAMPLE_BY_STUDY.format(study_idx=study_idx), json=body)
     if resp.status_code == 201:
         rj = resp.json()
         ctx["created"]["biosample"].append(rj["biosample_idx"])
@@ -515,8 +520,8 @@ async def test_post_biosample_owner_ineligibility_422(ctx, kind: IneligibilityKi
 
 
 async def test_post_biosample_nonexistent_study_404(ctx):
-    # Pick a study_idx well past the current MAX. require_study_exists's
-    # fetch_study_exists returns False → 404.
+    # Pick a study_idx well past the current MAX, so require_study_exists
+    # finds no row → 404.
     max_idx = await ctx["pool"].fetchval("SELECT COALESCE(MAX(idx), 0) FROM qiita.study")
     resp = await ctx["wet"].post(
         URL_BIOSAMPLE_BY_STUDY.format(study_idx=max_idx + 100_000),
@@ -833,8 +838,7 @@ async def test_post_biosample_metadata_writes_global_fields(ctx):
 
 async def test_post_biosample_metadata_global_internal_names_resolves(ctx):
     # With global_internal_names, a metadata KEY equal to a global field's
-    # internal_name resolves to that field (its display_name would not), and
-    # the required-field gate accepts host_taxon_id supplied by internal_name.
+    # internal_name resolves to that field (its display_name would not).
     suffix = secrets.token_hex(4)
     num_global = await seed_biosample_global_field(
         ctx["pool"],
@@ -2096,6 +2100,26 @@ async def test_get_biosample_returns_only_global_metadata(ctx):
 
 
 # ===========================================================================
+# GET /api/v1/biosample/{biosample_idx}/study/list
+# ===========================================================================
+
+
+@pytest.mark.parametrize("case", SAMPLE_STUDY_LIST_CASES)
+async def test_list_studies_for_biosample(ctx, case, no_biosample_read_client):
+    """Tests the case where a caller reads a biosample's studies, for each
+    shared study-roster case: active links sorted with their accessions, retired
+    links left out, a retired biosample still listed, the missing-sample 404,
+    and the role, anonymous, and scope refusals.
+    """
+    await assert_sample_study_list(
+        ctx,
+        case=case,
+        surface=BIOSAMPLE_STUDY_LIST_SURFACE,
+        no_scope_client=no_biosample_read_client,
+    )
+
+
+# ===========================================================================
 # GET /api/v1/study/{study_idx}/biosample/{biosample_idx}
 # ===========================================================================
 
@@ -3025,7 +3049,7 @@ async def test_lookup_by_matrix_tube_id_rejects_bad_format_422(ctx):
 
 
 # ---------------------------------------------------------------------------
-# POST /biosample/resolve-roster — tube- or accession-keyed roster resolution
+# POST /biosample/resolve-roster — roster resolution by external identifiers
 # ---------------------------------------------------------------------------
 # The route: the facts it gathers from Postgres, the 200 shape, the 422 detail
 # that names every problem, the retired-row exclusions, and its scopes.
@@ -3043,16 +3067,30 @@ async def _seed_tube_in_study(ctx, *, study_idx: int, tube: str) -> int:
     return biosample_idx
 
 
+async def _study_handle(ctx, study_idx: int) -> str:
+    return await fetch_export_entity_id(ctx["pool"], kind="study", entity_idx=study_idx)
+
+
 async def test_resolve_roster_by_tube_returns_biosample_and_study(ctx):
+    """Tests the case where the biosample is named by a tube that lost its
+    leading zero: the route resolves the stored form."""
     owner_idx = ctx["wet_session"]["principal_idx"]
     study_idx = await _seed_study(ctx, owner_idx=owner_idx, suffix="roster-ok")
     tube = unique_matrix_tube_id()
     biosample_idx = await _seed_tube_in_study(ctx, study_idx=study_idx, tube=tube)
+    primary = {"export_entity_id": await _study_handle(ctx, study_idx)}
 
-    # The sheet lost the leading zero; the route resolves the stored form.
     resp = await ctx["wet"].post(
         URL_BIOSAMPLE_RESOLVE_ROSTER,
-        json={"rows": [{"item_id": "7", "matrix_tube_id": tube.lstrip("0") or "0"}]},
+        json={
+            "rows": [
+                {
+                    "item_id": "7",
+                    "biosample": {"matrix_tube_id": tube.lstrip("0") or "0"},
+                    "primary_project": primary,
+                }
+            ]
+        },
     )
     assert resp.status_code == 200, resp.text
     assert resp.json() == {
@@ -3068,40 +3106,62 @@ async def test_resolve_roster_by_tube_returns_biosample_and_study(ctx):
 
 
 async def test_resolve_roster_422_names_every_problem(ctx):
+    """Tests the case where several rows fail for different reasons: the 422
+    names each problem against its row."""
     owner_idx = ctx["wet_session"]["principal_idx"]
     study_idx = await _seed_study(ctx, owner_idx=owner_idx, suffix="roster-bad")
+    handle = await _study_handle(ctx, study_idx)
     linked = unique_matrix_tube_id()
     await _seed_tube_in_study(ctx, study_idx=study_idx, tube=linked)
     unlinked = unique_matrix_tube_id()
     await _seed_biosample_with_matrix_tube_id(ctx, matrix_tube_id=unlinked, owner_idx=owner_idx)
     unknown = unique_matrix_tube_id()
 
+    def row(item_id: str, tube: str) -> dict:
+        return {
+            "item_id": item_id,
+            "biosample": {"matrix_tube_id": tube},
+            "primary_project": {"export_entity_id": handle},
+        }
+
     resp = await ctx["wet"].post(
         URL_BIOSAMPLE_RESOLVE_ROSTER,
         json={
             "rows": [
-                {"item_id": "ok", "matrix_tube_id": linked},
-                {"item_id": "nolink", "matrix_tube_id": unlinked},
-                {"item_id": "gone", "matrix_tube_id": unknown},
-                {"item_id": "plasma", "matrix_tube_id": "800805.001.V1.Plasma"},
-                {"item_id": "blank"},
+                row("ok", linked),
+                row("nolink", unlinked),
+                row("gone", unknown),
+                row("plasma", "800805.001.V1.Plasma"),
             ]
         },
     )
     assert resp.status_code == 422, resp.text
-    detail = resp.json()["detail"]
-    assert detail["message"] == "4 of 5 roster rows did not resolve"
-    assert [(p["item_id"], p["message"]) for p in detail["problems"]] == [
-        ("nolink", f"the biosample with matrix tube {unlinked} belongs to no active study"),
-        ("gone", f"no biosample has matrix tube {unknown}; register it before submitting"),
-        ("plasma", "'800805.001.V1.Plasma' is not a matrix tube id (1 to 10 digits)"),
-        ("blank", "row carries neither a matrix tube nor a biosample accession"),
-    ]
+    assert resp.json()["detail"] == {
+        "message": "3 of 4 roster rows did not resolve",
+        "problems": [
+            {
+                "item_id": "nolink",
+                "message": f"the biosample with matrix_tube_id '{unlinked}' is not in the"
+                f" study with export_entity_id '{handle}'",
+            },
+            {
+                "item_id": "gone",
+                "message": f"no biosample has matrix_tube_id '{unknown}'; register it before submitting",  # noqa: E501
+            },
+            {
+                "item_id": "plasma",
+                "message": "'800805.001.V1.Plasma' is not a matrix tube id (1 to 10 digits)",
+            },
+        ],
+    }
 
 
 async def test_resolve_roster_skips_retired_biosample_and_link(ctx):
+    """Tests the case where a biosample is retired, and where a biosample's only
+    study link is retired: neither resolves."""
     owner_idx = ctx["wet_session"]["principal_idx"]
     study_idx = await _seed_study(ctx, owner_idx=owner_idx, suffix="roster-retired")
+    handle = await _study_handle(ctx, study_idx)
     retired_tube = unique_matrix_tube_id()
     retired_bs = await _seed_tube_in_study(ctx, study_idx=study_idx, tube=retired_tube)
     await retire_biosample(ctx["pool"], biosample_idx=retired_bs, retired_by_idx=owner_idx)
@@ -3115,19 +3175,31 @@ async def test_resolve_roster_skips_retired_biosample_and_link(ctx):
         URL_BIOSAMPLE_RESOLVE_ROSTER,
         json={
             "rows": [
-                {"item_id": "r", "matrix_tube_id": retired_tube},
-                {"item_id": "u", "matrix_tube_id": unlinked_tube},
+                {
+                    "item_id": item_id,
+                    "biosample": {"matrix_tube_id": tube},
+                    "primary_project": {"export_entity_id": handle},
+                }
+                for item_id, tube in (("r", retired_tube), ("u", unlinked_tube))
             ]
         },
     )
     assert resp.status_code == 422, resp.text
-    assert [(p["item_id"], p["message"]) for p in resp.json()["detail"]["problems"]] == [
-        ("r", f"no biosample has matrix tube {retired_tube}; register it before submitting"),
-        ("u", f"the biosample with matrix tube {unlinked_tube} belongs to no active study"),
+    assert resp.json()["detail"]["problems"] == [
+        {
+            "item_id": "r",
+            "message": f"no biosample has matrix_tube_id '{retired_tube}'; register it before submitting",  # noqa: E501
+        },
+        {
+            "item_id": "u",
+            "message": f"the biosample with matrix_tube_id '{unlinked_tube}' is not in the"
+            f" study with export_entity_id '{handle}'",
+        },
     ]
 
 
 async def test_resolve_roster_by_accession(ctx):
+    """Tests the case where the biosample and study are named by accession."""
     owner_idx = ctx["wet_session"]["principal_idx"]
     study_idx = await _seed_study(ctx, owner_idx=owner_idx, suffix="roster-acc")
     project = unique_accession("PRJNA")
@@ -3142,6 +3214,9 @@ async def test_resolve_roster_by_accession(ctx):
         accession,
     )
     ctx["created"]["biosample"].append(biosample_idx)
+    await seed_biosample_to_study_link(
+        ctx["pool"], biosample_idx=biosample_idx, study_idx=study_idx, created_by_idx=owner_idx
+    )
 
     resp = await ctx["wet"].post(
         URL_BIOSAMPLE_RESOLVE_ROSTER,
@@ -3149,15 +3224,109 @@ async def test_resolve_roster_by_accession(ctx):
             "rows": [
                 {
                     "item_id": "1",
-                    "biosample_accession": accession,
-                    "primary_project_accession": project,
+                    "biosample": {"biosample_accession": accession},
+                    "primary_project": {"bioproject_accession": project},
                 }
             ]
         },
     )
     assert resp.status_code == 200, resp.text
-    assert resp.json()["rows"][0]["biosample_idx"] == biosample_idx
-    assert resp.json()["rows"][0]["primary_study_idx"] == study_idx
+    assert resp.json() == {
+        "rows": [
+            {
+                "item_id": "1",
+                "biosample_idx": biosample_idx,
+                "primary_study_idx": study_idx,
+                "secondary_study_idxs": [],
+            }
+        ]
+    }
+
+
+async def _seed_biosample_in_studies(ctx, *, study_idxs: list[int]) -> int:
+    """A biosample with a tube, actively linked to each of `study_idxs`."""
+    owner_idx = ctx["wet_session"]["principal_idx"]
+    biosample_idx = await _seed_biosample_with_matrix_tube_id(
+        ctx, matrix_tube_id=unique_matrix_tube_id(), owner_idx=owner_idx
+    )
+    for study_idx in study_idxs:
+        await seed_biosample_to_study_link(
+            ctx["pool"], biosample_idx=biosample_idx, study_idx=study_idx, created_by_idx=owner_idx
+        )
+    return biosample_idx
+
+
+async def test_resolve_roster_by_export_entity_id(ctx):
+    """Tests the case where the biosample and both of its studies are named only
+    by export_entity_id."""
+    owner_idx = ctx["wet_session"]["principal_idx"]
+    primary_idx = await _seed_study(ctx, owner_idx=owner_idx, suffix="roster-ee-1")
+    secondary_idx = await _seed_study(ctx, owner_idx=owner_idx, suffix="roster-ee-2")
+    biosample_idx = await _seed_biosample_in_studies(ctx, study_idxs=[primary_idx, secondary_idx])
+    biosample_handle = await fetch_export_entity_id(
+        ctx["pool"], kind="biosample", entity_idx=biosample_idx
+    )
+
+    resp = await ctx["wet"].post(
+        URL_BIOSAMPLE_RESOLVE_ROSTER,
+        json={
+            "rows": [
+                {
+                    "item_id": "1",
+                    "biosample": {"export_entity_id": biosample_handle},
+                    "primary_project": {"export_entity_id": await _study_handle(ctx, primary_idx)},
+                    "secondary_projects": [
+                        {"export_entity_id": await _study_handle(ctx, secondary_idx)}
+                    ],
+                }
+            ]
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {
+        "rows": [
+            {
+                "item_id": "1",
+                "biosample_idx": biosample_idx,
+                "primary_study_idx": primary_idx,
+                "secondary_study_idxs": [secondary_idx],
+            }
+        ]
+    }
+
+
+async def test_resolve_roster_secondary_not_linked(ctx):
+    """Tests the case where a secondary study is not among the biosample's links."""
+    owner_idx = ctx["wet_session"]["principal_idx"]
+    primary_idx = await _seed_study(ctx, owner_idx=owner_idx, suffix="roster-sec-1")
+    other_idx = await _seed_study(ctx, owner_idx=owner_idx, suffix="roster-sec-2")
+    biosample_idx = await _seed_biosample_in_studies(ctx, study_idxs=[primary_idx])
+    biosample_handle = await fetch_export_entity_id(
+        ctx["pool"], kind="biosample", entity_idx=biosample_idx
+    )
+    other_handle = await _study_handle(ctx, other_idx)
+
+    resp = await ctx["wet"].post(
+        URL_BIOSAMPLE_RESOLVE_ROSTER,
+        json={
+            "rows": [
+                {
+                    "item_id": "1",
+                    "biosample": {"export_entity_id": biosample_handle},
+                    "primary_project": {"export_entity_id": await _study_handle(ctx, primary_idx)},
+                    "secondary_projects": [{"export_entity_id": other_handle}],
+                }
+            ]
+        },
+    )
+    assert resp.status_code == 422, resp.text
+    assert resp.json()["detail"]["problems"] == [
+        {
+            "item_id": "1",
+            "message": f"the biosample with export_entity_id '{biosample_handle}' is not in"
+            f" the study with export_entity_id '{other_handle}'",
+        }
+    ]
 
 
 @pytest.mark.parametrize(
@@ -3167,10 +3336,7 @@ async def test_resolve_roster_by_accession(ctx):
 )
 async def test_resolve_roster_needs_both_read_scopes(make_pat_client, scopes):
     client = await make_pat_client(label="roster-scope", scopes=scopes)
-    resp = await client.post(
-        URL_BIOSAMPLE_RESOLVE_ROSTER,
-        json={"rows": [{"item_id": "1", "matrix_tube_id": "1"}]},
-    )
+    resp = await client.post(URL_BIOSAMPLE_RESOLVE_ROSTER, json=_MINIMAL_ROSTER_BODY)
     assert resp.status_code == 403, resp.text
 
 
@@ -3179,10 +3345,7 @@ async def test_resolve_roster_anonymous_401(ctx):
 
     app.state.pool = ctx["pool"]
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as anon:
-        resp = await anon.post(
-            URL_BIOSAMPLE_RESOLVE_ROSTER,
-            json={"rows": [{"item_id": "1", "matrix_tube_id": "1"}]},
-        )
+        resp = await anon.post(URL_BIOSAMPLE_RESOLVE_ROSTER, json=_MINIMAL_ROSTER_BODY)
     assert resp.status_code == 401
 
 
@@ -3348,6 +3511,289 @@ async def test_create_biosample_field_linked_with_data_type_422(ctx):
         },
     )
     assert resp.status_code == 422
+
+
+# ===========================================================================
+# POST /api/v1/study/{study_idx}/biosample/{biosample_idx}/link
+# ===========================================================================
+
+
+async def _post_study_link(client, study_idx: int, biosample_idx: int):
+    url = URL_BIOSAMPLE_STUDY_LINK.format(study_idx=study_idx, biosample_idx=biosample_idx)
+    resp = await client.post(url)
+    return resp
+
+
+async def _seed_biosample_owned_by(ctx, owner_key: str) -> int:
+    """Seed a biosample owned by ctx[f'{owner_key}_session'] and track it."""
+    owner_idx = ctx[f"{owner_key}_session"]["principal_idx"]
+    biosample_idx = await seed_biosample(ctx["pool"], owner_idx=owner_idx, created_by_idx=owner_idx)
+    ctx["created"]["biosample"].append(biosample_idx)
+    return biosample_idx
+
+
+async def _fetch_link_row(pool, *, biosample_idx: int, study_idx: int) -> dict | None:
+    row = await pool.fetchrow(
+        "SELECT * FROM qiita.biosample_to_study WHERE biosample_idx = $1 AND study_idx = $2",
+        biosample_idx,
+        study_idx,
+    )
+    link_row = None if row is None else dict(row)
+    return link_row
+
+
+def _expected_active_link_row(
+    actual: dict | None, *, biosample_idx: int, study_idx: int, created_by_idx: int
+) -> dict:
+    """Build the row that a freshly created link should be, copying the
+    table-defaulted created_at from `actual`."""
+    return {
+        "biosample_idx": biosample_idx,
+        "study_idx": study_idx,
+        "created_by_idx": created_by_idx,
+        "created_at": None if actual is None else actual["created_at"],
+        "retired": False,
+        "retired_by_idx": None,
+        "retired_at": None,
+        "retire_reason": None,
+    }
+
+
+@pytest.mark.parametrize("case", STUDY_SCOPED_SAMPLE_LINK_AUTHZ_CASES)
+async def test_create_biosample_study_link_authz(ctx, no_biosample_write_client, case):
+    """Tests the case where each study-side access shape calls the link create on a
+    biosample the regular user owns: the ADMIN minimum, the wet_lab_admin bypass,
+    the scope check, the unauthenticated refusal, and the missing-study 404.
+    """
+
+    async def _seed(ctx, _study_idx):
+        return await _seed_biosample_owned_by(ctx, "user")
+
+    await assert_study_scoped_sample_link_authz(
+        ctx,
+        case=case,
+        no_scope_client=no_biosample_write_client,
+        seed_sample=_seed,
+        send=_post_study_link,
+        success_status=201,
+        required_scope="biosample:write",
+    )
+
+
+async def test_create_biosample_study_link(ctx):
+    """Tests the case where the biosample's owner, already linked elsewhere, links
+    it into a study they own: 201 with the new row, which the table now holds.
+    """
+    user_idx = ctx["user_session"]["principal_idx"]
+    other_study_idx = await _seed_study(ctx, owner_idx=user_idx, suffix="link-other")
+    target_study_idx = await _seed_study(ctx, owner_idx=user_idx, suffix="link-target")
+    biosample_idx = await _seed_biosample_owned_by(ctx, "user")
+    await seed_biosample_to_study_link(
+        ctx["pool"],
+        biosample_idx=biosample_idx,
+        study_idx=other_study_idx,
+        created_by_idx=user_idx,
+    )
+
+    resp = await _post_study_link(ctx["user"], target_study_idx, biosample_idx)
+
+    assert resp.status_code == 201, resp.text
+    link_row = await _fetch_link_row(
+        ctx["pool"], biosample_idx=biosample_idx, study_idx=target_study_idx
+    )
+    expected_row = _expected_active_link_row(
+        link_row, biosample_idx=biosample_idx, study_idx=target_study_idx, created_by_idx=user_idx
+    )
+    assert link_row == expected_row
+    expected_response = BiosampleStudyLinkResponse(
+        biosample_idx=biosample_idx,
+        study_idx=target_study_idx,
+        created_by_idx=user_idx,
+        created_at=expected_row["created_at"],
+    )
+    assert BiosampleStudyLinkResponse.model_validate(resp.json()) == expected_response
+
+
+@pytest.mark.parametrize(
+    ("caller_key", "study_owner_key", "biosample_owner_key", "expected_status"),
+    [
+        pytest.param("admin", "user", "user", 201, id="system_admin_owns_neither"),
+        pytest.param("wet", "user", "user", 201, id="wet_lab_admin_owns_neither"),
+        pytest.param("user", "user", "wet", 404, id="study_owner_not_biosample_owner"),
+    ],
+)
+async def test_create_biosample_study_link_biosample_owner_rule(
+    ctx, caller_key, study_owner_key, biosample_owner_key, expected_status
+):
+    """Tests the case where the caller passes the study gate but may or may not own
+    the biosample: only its owner or a wet_lab_admin+ links it, and a refused
+    caller gets the missing-biosample 404 and no link row.
+    """
+    study_idx = await _seed_study(
+        ctx, owner_idx=ctx[f"{study_owner_key}_session"]["principal_idx"], suffix="link-owner"
+    )
+    biosample_idx = await _seed_biosample_owned_by(ctx, biosample_owner_key)
+
+    resp = await _post_study_link(ctx[caller_key], study_idx, biosample_idx)
+
+    assert resp.status_code == expected_status, resp.text
+    link_row = await _fetch_link_row(ctx["pool"], biosample_idx=biosample_idx, study_idx=study_idx)
+    if expected_status == 404:
+        assert resp.json() == {"detail": f"biosample {biosample_idx} not found"}
+        assert link_row is None
+    else:
+        expected_row = _expected_active_link_row(
+            link_row,
+            biosample_idx=biosample_idx,
+            study_idx=study_idx,
+            created_by_idx=ctx[f"{caller_key}_session"]["principal_idx"],
+        )
+        assert link_row == expected_row
+
+
+# The biosample-state refusals hold for the role-bypass callers, who skip the
+# ownership lookup, as well as for the biosample's owner, who passes it.
+_BIOSAMPLE_STATE_CALLERS = pytest.mark.parametrize("caller_key", ["user", "wet", "admin"])
+
+
+@_BIOSAMPLE_STATE_CALLERS
+async def test_create_biosample_study_link_nonexistent_biosample(ctx, caller_key):
+    """Tests the case where the biosample idx names no row: the same 404 that a
+    caller who does not own the biosample gets.
+    """
+    study_idx = await _seed_study(
+        ctx, owner_idx=ctx["user_session"]["principal_idx"], suffix="link-missing"
+    )
+    missing_idx = await ctx["pool"].fetchval(
+        "SELECT COALESCE(MAX(idx), 0) + 100000 FROM qiita.biosample"
+    )
+
+    resp = await _post_study_link(ctx[caller_key], study_idx, missing_idx)
+
+    assert resp.status_code == 404, resp.text
+    assert resp.json() == {"detail": f"biosample {missing_idx} not found"}
+
+
+@_BIOSAMPLE_STATE_CALLERS
+async def test_create_biosample_study_link_retired_biosample(ctx, caller_key):
+    """Tests the case where a caller tries to link a retired biosample: 409 and
+    no link row.
+    """
+    user_idx = ctx["user_session"]["principal_idx"]
+    study_idx = await _seed_study(ctx, owner_idx=user_idx, suffix="link-retired-bs")
+    biosample_idx = await _seed_biosample_owned_by(ctx, "user")
+    await retire_biosample(ctx["pool"], biosample_idx=biosample_idx, retired_by_idx=user_idx)
+
+    resp = await _post_study_link(ctx[caller_key], study_idx, biosample_idx)
+
+    assert resp.status_code == 409, resp.text
+    assert resp.json() == {"detail": f"biosample {biosample_idx} is retired"}
+    link_row = await _fetch_link_row(ctx["pool"], biosample_idx=biosample_idx, study_idx=study_idx)
+    assert link_row is None
+
+
+async def test_create_biosample_study_link_waits_for_concurrent_owner_change(ctx):
+    """Tests the case where a transaction that moves the biosample to another owner
+    is still open when the owner's link request arrives: the request waits on the
+    row lock, then sees the committed owner and answers the not-owner 404.
+    """
+    user_idx = ctx["user_session"]["principal_idx"]
+    study_idx = await _seed_study(ctx, owner_idx=user_idx, suffix="link-race")
+    biosample_idx = await _seed_biosample_owned_by(ctx, "user")
+
+    task, committed = None, False
+    async with ctx["pool"].acquire() as other:
+        tr = other.transaction()
+        await tr.start()
+        try:
+            await other.execute(
+                "UPDATE qiita.biosample SET owner_idx = $2 WHERE idx = $1",
+                biosample_idx,
+                ctx["wet_session"]["principal_idx"],
+            )
+            task = asyncio.create_task(_post_study_link(ctx["user"], study_idx, biosample_idx))
+            await _wait_until_blocked_by(ctx["pool"], other, task)
+            await tr.commit()
+            committed = True
+            resp = await _finish(task)
+        finally:
+            await _cancel(task)
+            if not committed:
+                await tr.rollback()
+
+    link_row = await _fetch_link_row(ctx["pool"], biosample_idx=biosample_idx, study_idx=study_idx)
+    assert (resp.status_code, resp.json(), link_row) == (
+        404,
+        {"detail": f"biosample {biosample_idx} not found"},
+        None,
+    )
+
+
+async def test_create_biosample_study_link_not_blocked_by_open_fk_insert(ctx):
+    """Tests the case where another transaction has an uncommitted link of the same
+    biosample into a different study: the request does not wait on it, and answers
+    201 while that transaction is still open.
+    """
+    user_idx = ctx["user_session"]["principal_idx"]
+    other_study_idx = await _seed_study(ctx, owner_idx=user_idx, suffix="link-open-other")
+    target_study_idx = await _seed_study(ctx, owner_idx=user_idx, suffix="link-open-target")
+    biosample_idx = await _seed_biosample_owned_by(ctx, "user")
+
+    task = None
+    async with ctx["pool"].acquire() as other:
+        tr = other.transaction()
+        await tr.start()
+        try:
+            await seed_biosample_to_study_link(
+                other,
+                biosample_idx=biosample_idx,
+                study_idx=other_study_idx,
+                created_by_idx=user_idx,
+            )
+            task = asyncio.create_task(
+                _post_study_link(ctx["user"], target_study_idx, biosample_idx)
+            )
+            resp = await _finish(task)
+        finally:
+            await _cancel(task)
+            await tr.rollback()
+
+    assert resp.status_code == 201, resp.text
+    link_row = await _fetch_link_row(
+        ctx["pool"], biosample_idx=biosample_idx, study_idx=target_study_idx
+    )
+    expected_row = _expected_active_link_row(
+        link_row, biosample_idx=biosample_idx, study_idx=target_study_idx, created_by_idx=user_idx
+    )
+    assert link_row == expected_row
+
+
+@pytest.mark.parametrize("retire_existing", [False, True], ids=["active", "retired"])
+async def test_create_biosample_study_link_already_linked(ctx, retire_existing):
+    """Tests the case where a link for the pair already exists, active or retired:
+    one 409 for both, and the existing row is left as it was.
+    """
+    user_idx = ctx["user_session"]["principal_idx"]
+    study_idx = await _seed_study(ctx, owner_idx=user_idx, suffix="link-dup")
+    biosample_idx = await _seed_biosample_owned_by(ctx, "user")
+    await seed_biosample_to_study_link(
+        ctx["pool"], biosample_idx=biosample_idx, study_idx=study_idx, created_by_idx=user_idx
+    )
+    if retire_existing:
+        await retire_biosample_to_study_link(
+            ctx["pool"], biosample_idx=biosample_idx, study_idx=study_idx, retired_by_idx=user_idx
+        )
+    row_before = await _fetch_link_row(
+        ctx["pool"], biosample_idx=biosample_idx, study_idx=study_idx
+    )
+
+    resp = await _post_study_link(ctx["user"], study_idx, biosample_idx)
+
+    assert resp.status_code == 409, resp.text
+    expected_detail = f"biosample {biosample_idx} is already linked to study {study_idx} (the link may be retired)"  # noqa: E501
+    assert resp.json() == {"detail": expected_detail}
+    row_after = await _fetch_link_row(ctx["pool"], biosample_idx=biosample_idx, study_idx=study_idx)
+    assert row_after == row_before
 
 
 # ===========================================================================
@@ -5054,7 +5500,7 @@ async def test_patch_biosample_metadata_by_unique_field_authz(
 
 async def _post_biosamples_bulk(client, ctx, study_idx: int, rows: list[dict]):
     """POST the bulk route and, on 201, track every created biosample for teardown."""
-    payload = {"rows": [_with_host_taxon(row) for row in rows]}
+    payload = {"rows": rows}
     resp = await client.post(URL_BIOSAMPLE_BULK_BY_STUDY.format(study_idx=study_idx), json=payload)
     if resp.status_code == 201:
         for result in resp.json()["results"]:
@@ -5398,7 +5844,7 @@ async def test_bulk_import_writes_every_rows_metadata_in_one_batch(ctx, monkeypa
     wet_idx = ctx["wet_session"]["principal_idx"]
     rows = _bulk_rows(wet_idx, unique_field_name("BulkId"), ["A", "B", "C"])
     for i, row in enumerate(rows):
-        row["metadata"] = {field_name: f"depth {i}"}
+        row["metadata"] = {field_name: f"depth {i}", "host taxon id": "not applicable"}
 
     resp = await _post_biosamples_bulk(ctx["wet"], ctx, study_idx, rows)
     assert resp.status_code == 201, resp.text

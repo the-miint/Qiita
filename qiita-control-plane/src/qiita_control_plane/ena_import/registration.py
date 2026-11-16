@@ -97,7 +97,10 @@ from .harmonization import (
     retain_unparseable_as_submitted,
 )
 from .platform_mapping import UnmappableEnaPlatformError, map_ena_platform
-from .protocol_mapping import map_ena_run_to_prep_protocol_name
+from .protocol_mapping import (
+    UnsupportedEnaLibraryStrategyError,
+    map_ena_run_to_prep_protocol_name,
+)
 from .submit import DOWNLOAD_ENA_STUDY_ACTION_ID, DOWNLOAD_ENA_STUDY_ACTION_VERSION
 
 # The ENA default sample checklist (seeded by db/migrations). Every ENA-imported
@@ -134,16 +137,14 @@ class EnaRunRegistrationStatus(StrEnum):
     SKIPPED_ALREADY_PRESENT = "skipped_already_present"
     EXCLUDED = "excluded"
     FAILED = "failed"
+    # No curated prep_protocol exists for the run's library strategy/source; not retriable.
+    UNSUPPORTED = "unsupported"
     # A run this study already holds, that a re-import found ENA no longer
     # reports as public -- distinct from EXCLUDED (never registered) so a
     # batch report separates "never imported" from "imported, now
     # unavailable". Set by ena_import.batch, not this module: this file only
     # registers runs the Portal returns.
     FLAGGED_UNAVAILABLE = "flagged_unavailable"
-    # A held run with no stored reads whose pool's download already completed
-    # without it (it was flagged when that download read its roster). Nothing
-    # schedules its download; set by ena_import.batch.
-    HELD_NOT_DOWNLOADED = "held_not_downloaded"
     # A run its pool's download fetched and could not store, while the pool's
     # other runs landed. Read from the run's sequenced_sample by the status read;
     # never stored on the item.
@@ -155,12 +156,11 @@ class EnaRunRegistrationOutcome:
     """One ENA run's registration outcome.
 
     `prep_sample_idx` is set only on `REGISTERED`; `sequenced_sample_idx` on
-    `REGISTERED`, `SKIPPED_ALREADY_PRESENT` and `HELD_NOT_DOWNLOADED`;
-    `failure_reason` on `FAILED`, `EXCLUDED`, `FLAGGED_UNAVAILABLE` and
-    `HELD_NOT_DOWNLOADED`. `harmonization` is set (non-`FAILED`,
-    non-`EXCLUDED`) only when this call newly created the biosample --
-    write-once: a reused/re-imported biosample carries `None` because no
-    harmonization write ran.
+    `REGISTERED` and `SKIPPED_ALREADY_PRESENT`; `failure_reason` on `FAILED`,
+    `UNSUPPORTED`, `EXCLUDED` and `FLAGGED_UNAVAILABLE`. `harmonization` is set
+    (non-`FAILED`, non-`UNSUPPORTED`, non-`EXCLUDED`) only when this call newly
+    created the biosample -- write-once: a reused/re-imported biosample carries
+    `None` because no harmonization write ran.
     """
 
     run_accession: str
@@ -173,18 +173,18 @@ class EnaRunRegistrationOutcome:
 
 # A pool whose latest download ticket ended in one of these is downloaded
 # afresh: a new ticket re-reads its roster, so it may still take new runs.
-_RESUBMITTABLE_DOWNLOAD_TICKET_STATES = frozenset(
+RESUBMITTABLE_DOWNLOAD_TICKET_STATES = frozenset(
     {WorkTicketState.FAILED.value, WorkTicketState.CANCELLED.value}
 )
 
 
 def download_ticket_covers_pool(work_ticket_state: str | None) -> bool:
     """Whether a pool's latest download ticket has downloaded, or is downloading,
-    the pool: reuse it, and put no new runs in that pool (its roster is read once
-    at dispatch, so runs added after it would never be downloaded)."""
+    the pool: put no new runs in it (its roster is read once at dispatch, so runs
+    added after it would never be downloaded)."""
     return (
         work_ticket_state is not None
-        and work_ticket_state not in _RESUBMITTABLE_DOWNLOAD_TICKET_STATES
+        and work_ticket_state not in RESUBMITTABLE_DOWNLOAD_TICKET_STATES
     )
 
 
@@ -619,10 +619,10 @@ async def _register_one_ena_run(
 ) -> EnaRunRegistrationOutcome:
     """Register one ENA run in its own savepoint within the registration transaction
     (per-run atomicity: a partial failure rolls back only this run). Never raises:
-    every failure becomes a `failed` outcome -- platform/protocol-mapping,
-    harmonization, a value no global field can hold that
+    every failure becomes a `failed` outcome -- platform mapping, a protocol-mapping
+    refusal, harmonization, a value no global field can hold that
     `retain_unparseable_as_submitted` cannot keep, or a collision inside the biosample
-    import."""
+    import; a run with no curated protocol becomes `unsupported`."""
     try:
         async with conn.transaction():
             sample_attrs = attrs_by_sample_accession.get(ena_run.sample_accession)
@@ -737,6 +737,12 @@ async def _register_one_ena_run(
                 sequenced_sample_idx=result.sequenced_sample_idx,
                 harmonization=harmonization_result,
             )
+    except UnsupportedEnaLibraryStrategyError as exc:
+        return EnaRunRegistrationOutcome(
+            run_accession=ena_run.run_accession,
+            status=EnaRunRegistrationStatus.UNSUPPORTED,
+            failure_reason=exception_reason(exc),
+        )
     except Exception as exc:  # noqa: BLE001 -- per-run isolation: a failure must
         # never abort sibling runs; it is recorded (accession + reason) in the
         # returned result, not swallowed.

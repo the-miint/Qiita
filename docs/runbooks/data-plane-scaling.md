@@ -73,7 +73,8 @@ Each pooled connection also holds a backend on the catalog's Postgres; see
 ## Catalog connections
 
 Every instance, on every host, names its catalog sessions
-`qiita-data-plane:<port>:pool=<pool size>`, and `verify-deploy`'s
+`qiita-data-plane:<port>:pool=<n>`, where `<n>` is the pool size plus the instance's lake
+lock sessions (`LOCK_SESSIONS` in `qiita-data-plane/src/lake_locks.rs`), and `verify-deploy`'s
 `catalog-connections` row reads those names back from the catalog server: the pools of
 every connected instance plus the other client sessions open now, against
 `max_connections` less the reserved slots. It passes with the numbers and one

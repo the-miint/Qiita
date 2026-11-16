@@ -54,7 +54,7 @@ Give every finding exactly one disposition, and write it into the ledger:
 | Disposition | Means | Next |
 |---|---|---|
 | `fixed` | You changed the code | Name the commit or `path:line`. An `[outside-subject]` fix (the reviewer's Scope discipline) is a commit of its own, whose message says why it is outside the subject; one that would warrant a changelog entry on its own (`CHANGELOG.md`, "Adding an entry") also gets a bullet in the PR's changelog file. The PR-body block lists each |
-| `declined` | Correct rule, wrong here | Record the **reason** — it goes into the next prompt |
+| `declined` | Correct rule, wrong here | Record the **rule** it sets aside (its id, the bullet's short name, and `[strong]` or `[soft]`, as the reviewer reported it) and the **reason** — both go into the next prompt |
 | `deferred` | Real, but wider than this PR (the reviewer's Scope discipline), or an `[outside-subject]` fix you did not take | Record the issue's number, or its draft title and body until it is opened (see the PR-body block), then drop it from the loop |
 | `probed` | Was `[needs-probe]`; you ran it | Record the result — confirmed or refuted |
 
@@ -70,7 +70,7 @@ nothing else:
    already settled. This is what keeps a fresh spawn from costing a full-branch read.
    Name the commits of `[outside-subject]` fixes, and any later commit that corrects
    one, so the reviewer can tell which lines they wrote.
-2. **The standing ledger** — every `declined` and `deferred` finding with its reason.
+2. **The standing ledger** — every `declined` finding with its rule and reason, and every `deferred` finding with its reason.
    This is what stops round 3 from re-raising what round 2 settled, and it is a token
    cut as much as a convergence one.
 3. **The ask** — review the current state of the named paths, confirm each `fixed`
@@ -139,8 +139,9 @@ diff:
   PR, probes that need an environment you lacked, and things only they can settle (an
   assay call, a product decision, filing an issue you have no access to file).
 - **One line each: what it is, where, and why it is still open.** Name the file, not
-  the finding number — `R9-3` means nothing tomorrow. "Wider than this PR" and
-  "needs the deploy host" are reasons; "deferred" is not.
+  the finding number — `R9-3` means nothing tomorrow. (A rule named by id *and* the
+  bullet's short name, as the `Declined:` entries below do, is not a finding number.)
+  "Wider than this PR" and "needs the deploy host" are reasons; "deferred" is not.
 - **Say what a probe would settle**, not just that it is unrun.
 - **Separate what is pre-existing from what this branch introduced.** A reviewer
   inheriting the list needs to know which items the PR is answerable for.
@@ -170,7 +171,8 @@ included:
 - Fixed: <count>
   - <what, `path`> — outside the PR's subject, <its commit shas>
 - Declined:
-  - <what, `path`> — <why>
+  - [strong] <rule id> <bullet's short name>: <what, `path`> — <why>
+  - [soft] <rule id> <bullet's short name>: <what, `path`> — <why>
 - Deferred:
   - <what, `path`> — #<issue>
 - Not probed:
@@ -185,6 +187,12 @@ included:
   there.
 - Under `Fixed:`, list only the `[outside-subject]` fixes; the count includes them.
   With none, the line is the count alone.
+- Under `Declined:`, each entry starts with the heading the reviewer reported its
+  finding under (`[strong] R9 copy-pasted parallel handler`), so a reader sees which
+  rule was set aside, and how strongly, without opening the reviewer file. List the
+  `[strong]` entries first: they set aside a rule meant to be applied without asking.
+  A finding from outside the rule set starts with `outside the rule set` and no
+  strength.
 - Write `none` under any other heading with no entries; do not drop the heading.
 - A deferred item names its issue by number. Every deferred issue is opened before
   the PR is, so the description carries `#N` from its first version; `issue to file`

@@ -16,6 +16,8 @@ on the "Reviewed at" line by sha, except one that only writes this PR's number i
 changelog and checklist tags. A PR that cannot run the loop carries the
 `no-agent-review` label and says why in this section.
 Open the issue for each deferred finding before opening the PR, and name it here as #N.
+Start each declined entry with the strength and the rule it sets aside, [strong] first:
+"[strong] R9 copy-pasted parallel handler: <what, path> — <why>".
 -->
 
 - Reviewed at: <sha> · rounds: <N> · stopped: <stop rule>

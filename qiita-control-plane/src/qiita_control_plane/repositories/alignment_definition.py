@@ -206,7 +206,7 @@ async def alignment_definition_exists(
 ) -> bool:
     """Does this alignment_idx exist? Same round trip as
     `fetch_alignment_definition_by_idx` without dragging the `params` JSONB back
-    for a caller that only wants to 404. Twin of `fetch_prep_sample_exists`.
+    for a caller that only wants to 404.
     """
     return (
         await pool_or_conn.fetchval(

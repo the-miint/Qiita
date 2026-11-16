@@ -6,6 +6,7 @@ mod auth;
 mod config;
 mod ducklake;
 mod flight_service;
+mod lake_locks;
 mod miint;
 mod pool;
 mod resources;
@@ -263,9 +264,13 @@ mod tests {
                 .decode(&pubkey)
                 .unwrap()
         );
+        // The name declares the pool plus the lake lock sessions.
         assert_eq!(
             cfg.ducklake_catalog_connstr,
-            "dbname=test host=localhost application_name=qiita-data-plane:50051:pool=8"
+            format!(
+                "dbname=test host=localhost application_name=qiita-data-plane:50051:pool={}",
+                crate::config::DEFAULT_POOL_SIZE + crate::lake_locks::LOCK_SESSIONS
+            )
         );
         // Leaf paths are derived from the base roots with fixed suffixes.
         assert_eq!(

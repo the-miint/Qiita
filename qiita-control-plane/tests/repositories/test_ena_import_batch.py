@@ -1,14 +1,14 @@
 """Repository-layer tests for qiita.ena_import_batch / qiita.ena_import_batch_item.
 
-Exercises the SQL moved out of `ena_import.batch` (into
-`repositories.ena_import_batch`) directly against Postgres. Orchestration
+Exercises the SQL in `repositories.ena_import_batch` directly against Postgres. Orchestration
 behaviour (the resolve/register/submit flow, the per-item state machine, the
-`fetch_batch_status` rollup) stays covered by `tests/ena_import/test_batch.py`
-unchanged -- this file only pins the query shapes these functions issue.
+`fetch_batch_status` rollup) is covered by the batch orchestration tests; this file
+pins the query shapes these functions issue.
 """
 
 import json
 import secrets
+from datetime import UTC, datetime, timedelta
 
 import asyncpg
 import pytest
@@ -21,6 +21,7 @@ from qiita_control_plane.repositories.ena_import_batch import (
     ena_import_batch_exists,
     ena_import_created_study,
     fetch_ena_import_batch_items,
+    fetch_ena_import_batches,
     fetch_inflight_ena_import_batch_items,
     fetch_partial_download_counts,
     fetch_pool_latest_download_ticket,
@@ -803,3 +804,78 @@ async def test_inflight_items_carry_the_run_list(eib):
     assert [
         (r["idx"], r["ena_study_accession"], list(r["requested_run_accessions"])) for r in rows
     ] == [(item_idx, None, ["ERR1"])]
+
+
+# ---------------------------------------------------------------------------
+# fetch_ena_import_batches
+# ---------------------------------------------------------------------------
+
+
+async def _new_batch(eib, *, principal_idx: int | None = None, created_at=None) -> int:
+    batch_idx = await eib["pool"].fetchval(
+        "INSERT INTO qiita.ena_import_batch (submitted_by_principal_idx, created_at)"
+        " VALUES ($1, COALESCE($2, now())) RETURNING idx",
+        principal_idx or eib["principal_idx"],
+        created_at,
+    )
+    eib["created_batches"].append(batch_idx)
+    return batch_idx
+
+
+async def test_fetch_ena_import_batches_orders_by_idx_desc_not_created_at(eib):
+    older_created = datetime(2020, 1, 1, tzinfo=UTC)
+    first = await _new_batch(eib, created_at=datetime(2030, 1, 1, tzinfo=UTC))
+    second = await _new_batch(eib, created_at=older_created)
+
+    rows = await fetch_ena_import_batches(
+        eib["pool"],
+        submitted_by_principal_idx=eib["principal_idx"],
+        since=None,
+        limit=10,
+    )
+
+    assert [r["ena_import_batch_idx"] for r in rows] == [second, first]
+
+
+async def test_fetch_ena_import_batches_filters_by_principal(eib):
+    other = await seed_user_principal(eib["pool"], prefix="eib-other", suffix=secrets.token_hex(4))
+    try:
+        mine = await _new_batch(eib)
+        theirs = await _new_batch(eib, principal_idx=other)
+
+        only_mine = await fetch_ena_import_batches(
+            eib["pool"], submitted_by_principal_idx=eib["principal_idx"], since=None, limit=100
+        )
+        everyone = await fetch_ena_import_batches(
+            eib["pool"], submitted_by_principal_idx=None, since=None, limit=100
+        )
+        await delete_idxs(eib["pool"], "ena_import_batch", [theirs])
+        eib["created_batches"].remove(theirs)
+    finally:
+        await delete_principal(eib["pool"], [other])
+
+    assert [r["ena_import_batch_idx"] for r in only_mine] == [mine]
+    assert {mine, theirs} <= {r["ena_import_batch_idx"] for r in everyone}
+
+
+async def test_fetch_ena_import_batches_since_is_inclusive(eib):
+    cutoff = datetime(2026, 6, 1, tzinfo=UTC)
+    await _new_batch(eib, created_at=cutoff - timedelta(seconds=1))
+    at = await _new_batch(eib, created_at=cutoff)
+    after = await _new_batch(eib, created_at=cutoff + timedelta(seconds=1))
+
+    rows = await fetch_ena_import_batches(
+        eib["pool"], submitted_by_principal_idx=eib["principal_idx"], since=cutoff, limit=10
+    )
+
+    assert [r["ena_import_batch_idx"] for r in rows] == [after, at]
+
+
+async def test_fetch_ena_import_batches_honours_limit(eib):
+    batches = [await _new_batch(eib) for _ in range(3)]
+
+    rows = await fetch_ena_import_batches(
+        eib["pool"], submitted_by_principal_idx=eib["principal_idx"], since=None, limit=2
+    )
+
+    assert [r["ena_import_batch_idx"] for r in rows] == batches[:0:-1]

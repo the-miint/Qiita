@@ -16,22 +16,32 @@ teardown) — see tests/repositories/test_biosample.py.
 
 import json
 import secrets
+from typing import get_args
 
 import asyncpg
 import pytest
 from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX, SystemRole
 from qiita_common.models import LEGACY_IDX_RESERVED_CEILING, Tier
 
+from qiita_control_plane.repositories import ExistsEntity, fetch_entity_exists
 from qiita_control_plane.repositories import study as study_module
+from qiita_control_plane.repositories.biosample import fetch_biosample
+from qiita_control_plane.repositories.sequenced_sample import (
+    fetch_sequenced_sample_with_prep_sample,
+)
 from qiita_control_plane.repositories.study import (
     EnaStudyAccessionConflictError,
     create_study,
     fetch_study,
-    fetch_study_exists,
-    fetch_study_idxs_by_accession,
+    fetch_study_idxs_by_natural_key,
     get_or_create_study_by_ena_accessions,
     insert_study,
     update_study,
+)
+from qiita_control_plane.testing.db_seeds import (
+    seed_biosample,
+    seed_sequenced_prep_sample,
+    seed_sequenced_sample_subtype,
 )
 from qiita_control_plane.testing.db_teardown import delete_principal, teardown_entity_graph
 
@@ -504,28 +514,68 @@ async def test_legacy_idx_ceiling_matches_column_comment(postgres_pool, table):
 
 
 # ---------------------------------------------------------------------------
-# fetch_study_exists
+# fetch_entity_exists
 # ---------------------------------------------------------------------------
 
 
-async def test_fetch_study_exists_returns_true_for_existing(postgres_pool):
+async def test_fetch_entity_exists(postgres_pool):
+    """Tests the case where each entity kind is asked about a row that exists and
+    about one that cannot: True for the seeded row, False for idx -1, which an
+    IDENTITY column never issues.
+    """
     async with postgres_pool.acquire() as conn:
         tr = conn.transaction()
         await tr.start()
         try:
+            # Seed one row per entity on this connection so the reads see them
+            # uncommitted and the rollback removes them.
             owner = await _create_user(conn)
-            study_idx = await _insert_study(conn, owner_idx=owner)
+            biosample_idx = await seed_biosample(conn, owner_idx=owner, created_by_idx=owner)
+            prep_sample_idx = await seed_sequenced_prep_sample(
+                conn, biosample_idx=biosample_idx, owner_idx=owner
+            )
+            sequencing_run_idx, _, _ = await seed_sequenced_sample_subtype(
+                conn,
+                prep_sample_idx=prep_sample_idx,
+                owner_idx=owner,
+                sequenced_pool_item_id=_suffix("item"),
+            )
+            seeded = {
+                "study": await _insert_study(conn, owner_idx=owner),
+                "sequencing_run": sequencing_run_idx,
+                "prep_sample": prep_sample_idx,
+                "biosample": biosample_idx,
+            }
 
-            # Pass the same connection so the fetch sees the uncommitted row.
-            assert await fetch_study_exists(conn, study_idx) is True
+            actual = {
+                entity: (
+                    await fetch_entity_exists(conn, entity, idx),
+                    await fetch_entity_exists(conn, entity, -1),
+                )
+                for entity, idx in seeded.items()
+            }
         finally:
             await tr.rollback()
 
+    expected = {entity: (True, False) for entity in get_args(ExistsEntity)}
+    assert actual == expected
 
-async def test_fetch_study_exists_returns_false_for_missing(postgres_pool):
-    # A negative idx is guaranteed to miss because the IDENTITY column
-    # only ever issues positive values.
-    assert await fetch_study_exists(postgres_pool, -1) is False
+
+@pytest.mark.parametrize("on_pool", [False, True], ids=["bare_connection", "pool"])
+@pytest.mark.parametrize(
+    "fetch",
+    [fetch_biosample, fetch_study, fetch_sequenced_sample_with_prep_sample],
+    ids=["biosample", "study", "sequenced_sample"],
+)
+async def test_row_lock_clause_outside_transaction_raises(postgres_pool, fetch, on_pool):
+    """Tests the case where a fetch is asked for a row lock outside a transaction:
+    it raises rather than taking a lock that the ending statement releases at
+    once, which would leave the caller unprotected and unaware of it.
+    """
+    async with postgres_pool.acquire() as conn:
+        target = postgres_pool if on_pool else conn
+        with pytest.raises(RuntimeError, match="transaction"):
+            await fetch(target, -1, lock="share")
 
 
 # ---------------------------------------------------------------------------
@@ -1117,12 +1167,12 @@ async def test_get_or_create_study_by_ena_accessions_collision_refetch_resolves_
 
 
 # ---------------------------------------------------------------------------
-# fetch_study_idxs_by_accession — selectable accession column
+# fetch_study_idxs_by_natural_key — selectable lookup key
 # ---------------------------------------------------------------------------
 
 
-async def test_fetch_study_idxs_by_accession_resolves_by_bioproject_default(postgres_pool):
-    """Tests the case where accession_field is omitted: the default keys on
+async def test_fetch_study_idxs_by_natural_key_resolves_by_bioproject_default(postgres_pool):
+    """Tests the case where key is omitted: the default keys on
     bioproject_accession, so a study's bioproject value resolves and a
     bogus value lands in the unresolved set (absent from the map)."""
     async with postgres_pool.acquire() as conn:
@@ -1139,7 +1189,7 @@ async def test_fetch_study_idxs_by_accession_resolves_by_bioproject_default(post
                 bioproject_accession=bioproject,
             )
 
-            resolved = await fetch_study_idxs_by_accession(
+            resolved = await fetch_study_idxs_by_natural_key(
                 conn, values=[bioproject, "PRJNA-absent"]
             )
 
@@ -1148,8 +1198,8 @@ async def test_fetch_study_idxs_by_accession_resolves_by_bioproject_default(post
             await tr.rollback()
 
 
-async def test_fetch_study_idxs_by_accession_resolves_by_ena_when_specified(postgres_pool):
-    """Tests the case where accession_field selects ena_study_accession: a
+async def test_fetch_study_idxs_by_natural_key_resolves_by_ena_when_specified(postgres_pool):
+    """Tests the case where key selects ena_study_accession: a
     bioproject value no longer resolves, only the ena value does."""
     async with postgres_pool.acquire() as conn:
         tr = conn.transaction()
@@ -1165,8 +1215,8 @@ async def test_fetch_study_idxs_by_accession_resolves_by_ena_when_specified(post
                 ena_study_accession=ena,
             )
 
-            resolved = await fetch_study_idxs_by_accession(
-                conn, values=[ena], accession_field="ena_study_accession"
+            resolved = await fetch_study_idxs_by_natural_key(
+                conn, values=[ena], key="ena_study_accession"
             )
 
             assert resolved == {ena: row["idx"]}
@@ -1174,11 +1224,36 @@ async def test_fetch_study_idxs_by_accession_resolves_by_ena_when_specified(post
             await tr.rollback()
 
 
-async def test_fetch_study_idxs_by_accession_invalid_field_raises(postgres_pool):
-    """Tests the case where accession_field is outside StudyAccessionField:
-    the guard rejects it before any column name reaches the SQL."""
-    with pytest.raises(ValueError, match="invalid study accession field"):
-        await fetch_study_idxs_by_accession(postgres_pool, values=["x"], accession_field="title")
+async def test_fetch_study_idxs_by_natural_key_resolves_by_export_entity_id(postgres_pool):
+    """Tests the case where key selects export_entity_id: a study's own
+    export_entity_id resolves to it, and an absent one is omitted."""
+    async with postgres_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            owner = await _create_user(conn)
+            row = await create_study(
+                conn,
+                owner_idx=owner,
+                created_by_idx=owner,
+                title=_suffix("lookup-export-entity-id"),
+            )
+            handle = row["export_entity_id"]
+
+            resolved = await fetch_study_idxs_by_natural_key(
+                conn, values=[handle, "QS-absent"], key="export_entity_id"
+            )
+
+            assert resolved == {handle: row["idx"]}
+        finally:
+            await tr.rollback()
+
+
+async def test_fetch_study_idxs_by_natural_key_invalid_key_raises(postgres_pool):
+    """Tests the case where key is outside StudyLookupKey: the guard rejects
+    it before any column name reaches the SQL."""
+    with pytest.raises(ValueError, match="invalid study lookup key"):
+        await fetch_study_idxs_by_natural_key(postgres_pool, values=["x"], key="title")
 
 
 async def test_update_study_bad_pi_idx_raises_role_typed_error(postgres_pool):

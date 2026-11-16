@@ -1224,6 +1224,8 @@ qiita_require_lake_data_path() {
 # register_files holds a catalog session in `active` or `idle in transaction`,
 # while an idle data plane's sessions are `idle`, and a DoPut holds its
 # `upload.parquet.partial` open (all measured against a running data plane, macOS).
+# A register_files queued for a lake lock session holds no catalog session while it
+# queues, so it is not seen here; the drain lets it finish.
 # A read export writes through a `.partial` too, so it counts as well. Open files
 # are found through each unit's /proc/<pid>/fd (the match measured in a Linux
 # container). The catalog query, QIITA_CATALOG_IDLE_SQL, connects with the data
@@ -1288,15 +1290,17 @@ wait_for_data_plane_idle() {
 }
 
 # --- Catalog connection budget ------------------------------------------------
-# Every data-plane instance, on every host, holds up to its pool size of backends
-# on the catalog's Postgres (DEFAULT_POOL_SIZE in qiita-data-plane/src/config.rs),
+# Every data-plane instance, on every host, holds up to as many backends on the
+# catalog's Postgres as its pool size plus its lake lock sessions
+# (DEFAULT_POOL_SIZE in qiita-data-plane/src/config.rs, LOCK_SESSIONS in
+# qiita-data-plane/src/lake_locks.rs),
 # and builds them as requests arrive, so the backends connected now undercount
-# what the pools may open. Each instance therefore names its catalog sessions
-# `qiita-data-plane:<listen port>:pool=<pool size>` (catalog_application_name in
-# qiita-data-plane/src/ducklake.rs), and this check reads the pool sizes back from
+# what it may open. Each instance therefore names its catalog sessions
+# `qiita-data-plane:<listen port>:pool=<that sum>` (catalog_application_name in
+# qiita-data-plane/src/ducklake.rs), and this check reads those sums back from
 # the catalog server's pg_stat_activity: an instance is one (client address,
 # application_name) pair, however many of its backends are open. It fails when
-#   Σ pool sizes + the other client backends connected now
+#   Σ those sums + the other client backends connected now
 #     > max_connections − superuser_reserved_connections − reserved_connections,
 # the slots a role without those privileges can take. Other backends — lake-gc,
 # lake-shell, a data plane still on a build without the name — count as they are

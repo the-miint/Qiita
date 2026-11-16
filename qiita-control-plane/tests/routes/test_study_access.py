@@ -10,7 +10,6 @@ set by making it the owner or by inserting its row directly.
 """
 
 import asyncio
-import contextlib
 import json
 import secrets
 
@@ -24,7 +23,14 @@ from qiita_control_plane.routes.study_access import _MSG_ACCOUNT_INACTIVE, _MSG_
 from qiita_control_plane.testing.db_seeds import seed_user_principal
 from qiita_control_plane.testing.db_teardown import delete_principal, teardown_entity_graph
 
-from .conftest import _grant_study_access, _seed_study
+from .conftest import (
+    _REQUEST_TIMEOUT_S,
+    _cancel,
+    _finish,
+    _grant_study_access,
+    _seed_study,
+    _wait_until_blocked_by,
+)
 
 pytestmark = pytest.mark.db
 
@@ -453,41 +459,6 @@ async def test_two_grants_to_the_same_account_yield_one_201_and_one_409(ctx):
     loser = first if first.status_code == 409 else second
     assert "'member'" in loser.json()["detail"]
     assert await _tier(ctx, study_idx, grantee) == Tier.MEMBER
-
-
-# Bounds every wait below, so a request that never returns fails the test
-# instead of hanging the suite.
-_REQUEST_TIMEOUT_S = 15
-
-
-async def _finish(task: asyncio.Task):
-    return await asyncio.wait_for(task, _REQUEST_TIMEOUT_S)
-
-
-async def _wait_until_blocked_by(pool, blocker, task: asyncio.Task) -> None:
-    """Return once some backend is waiting on a lock `blocker` holds (the
-    request under test is the only candidate), rather than after a fixed sleep
-    that would not show the request ever reached the lock."""
-    blocker_pid = blocker.get_server_pid()
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + _REQUEST_TIMEOUT_S
-    while loop.time() < deadline:
-        assert not task.done(), "request finished without waiting on the held lock"
-        waiting = await pool.fetchval(
-            "SELECT count(*) FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))",
-            blocker_pid,
-        )
-        if waiting:
-            return
-        await asyncio.sleep(0.02)
-    raise AssertionError("request never waited on the held lock")
-
-
-async def _cancel(task: asyncio.Task | None) -> None:
-    if task is not None and not task.done():
-        task.cancel()
-        with contextlib.suppress(asyncio.CancelledError, Exception):
-            await asyncio.wait_for(task, _REQUEST_TIMEOUT_S)
 
 
 async def test_change_waits_for_a_concurrent_change_and_checks_the_committed_tier(ctx):

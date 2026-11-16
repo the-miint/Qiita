@@ -47,7 +47,7 @@ _HUMAN_GUT = _run("ena_runs_human_gut.json")
 
 def _fields(run: EnaRunRecord):
     global_metadata, _, result = _build(run)
-    return global_metadata["host taxon id"], global_metadata["taxon id"], result.warnings
+    return global_metadata.get("host taxon id"), global_metadata["taxon id"], result.warnings
 
 
 def test_human_gut_run_takes_host_and_taxon_from_ena():
@@ -59,8 +59,8 @@ def test_blank_host_tax_id_falls_back_to_the_table_without_a_warning():
     assert _fields(run) == ("9606", "408170", [])
 
 
-def test_hostless_environment_is_not_applicable_and_not_reported():
-    assert _fields(_run("ena_runs_seawater.json")) == ("not applicable", "1561972", [])
+def test_hostless_environment_leaves_the_host_out_and_is_not_reported():
+    assert _fields(_run("ena_runs_seawater.json")) == (None, "1561972", [])
 
 
 def test_unloaded_host_tax_id_is_not_provided_and_does_not_fall_back_to_the_table():
@@ -122,7 +122,7 @@ def test_host_tax_id_naming_an_environment_is_not_a_host(host_tax_id):
 
     host, _, warnings = _fields(run)
 
-    assert host == "not applicable"
+    assert host is None
     assert any(host_tax_id in w and "not a host" in w for w in warnings)
 
 

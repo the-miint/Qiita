@@ -17,6 +17,7 @@ from typing import Annotated, Any, Literal
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
 
+from qiita_common.auth_constants import MAX_REASON_LENGTH
 from qiita_common.models._base import check_withdrawal_reason
 
 AssemblySampleState = Literal["pending", "completed", "no_data", "invalidated"]
@@ -191,7 +192,9 @@ class ProcessingStatusUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     status: ProcessingStatus
-    reason: Annotated[str | None, Field(default=None, min_length=1, max_length=2000)] = None
+    reason: Annotated[
+        str | None, Field(default=None, min_length=1, max_length=MAX_REASON_LENGTH)
+    ] = None
     superseded_by: Annotated[int | None, Field(default=None, gt=0)] = None
 
     @model_validator(mode="after")
@@ -225,7 +228,9 @@ class AssemblySampleStatusUpdate(BaseModel):
 
     prep_sample_idx: Annotated[list[Annotated[int, Field(gt=0)]], Field(min_length=1)]
     state: Literal["completed", "invalidated"]
-    reason: Annotated[str | None, Field(default=None, min_length=1, max_length=2000)] = None
+    reason: Annotated[
+        str | None, Field(default=None, min_length=1, max_length=MAX_REASON_LENGTH)
+    ] = None
 
     @model_validator(mode="after")
     def _reason_required_to_invalidate(self) -> AssemblySampleStatusUpdate:

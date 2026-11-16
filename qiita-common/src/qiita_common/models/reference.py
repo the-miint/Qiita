@@ -8,7 +8,7 @@ from uuid import UUID
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
 
-from qiita_common.auth_constants import MAX_NAME_LENGTH, MAX_VERSION_LENGTH
+from qiita_common.auth_constants import MAX_NAME_LENGTH, MAX_REASON_LENGTH, MAX_VERSION_LENGTH
 
 
 class ReferenceStatus(StrEnum):
@@ -446,12 +446,12 @@ class ReferenceStatusUpdate(BaseModel):
 class ReferenceExclusionCreateRequest(BaseModel):
     """Block exactly one of genome_idx / feature_idx (the DB CHECK enforces the
     same invariant). `reason` is a required free-text curator note, bounded
-    1..2000 chars (matched by the DB CHECK). The block is GLOBAL — not scoped to a
+    1..MAX_REASON_LENGTH chars (matched by the DB CHECK). The block is GLOBAL — not scoped to a
     reference — so no reference_idx here."""
 
     genome_idx: Annotated[int, Field(gt=0)] | None = None
     feature_idx: Annotated[int, Field(gt=0)] | None = None
-    reason: str = Field(min_length=1, max_length=2000)
+    reason: str = Field(min_length=1, max_length=MAX_REASON_LENGTH)
 
     @model_validator(mode="after")
     def _exactly_one_target(self):

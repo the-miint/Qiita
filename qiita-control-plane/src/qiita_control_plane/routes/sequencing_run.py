@@ -202,7 +202,7 @@ def _host_filter_refusal_http(exc: block_planner.PoolHostFilterRefusal) -> HTTPE
             f" (e.g. {list(exc.offending[:5])}); refusing to submit — a sample whose"
             " host we cannot determine would be masked against the wrong thing, or"
             f" against nothing. {reasons}. Fix the samples' host_taxon_id metadata"
-            " (qiita-admin backfill host-taxon-id), or force an explicit reference."
+            " (qiita biosample patch-metadata-by-unique-field), or force an explicit reference."
         )
     else:  # MULTI_HOST
         detail = (

@@ -59,6 +59,10 @@ SPECS = [BIOSAMPLE_METADATA_SPEC, PREP_SAMPLE_METADATA_SPEC]
 # production.
 METADATA_WRITE_LOCK_TIMEOUT = "3s"
 
+# Short enough that a write that the held lock blocks fails fast, long enough that
+# an unblocked write never reaches it.
+LOCK_PROBE_TIMEOUT = "200ms"
+
 
 def _spec_id(spec):
     """Pytest id for the parametrize decorator: spec.entity_kind value."""

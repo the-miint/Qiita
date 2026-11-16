@@ -693,3 +693,170 @@ async def test_abandon_purge_payload_deletes_a_split_sample_across_blocks(data_p
         _count_alignment_rows(data_plane, alignment_idx=alignment_idx, prep_sample_idx=split) == 0
     )
     assert _count_alignment_rows(data_plane, alignment_idx=alignment_idx, prep_sample_idx=kept) == 1
+
+
+async def test_rerun_block_replaces_a_completed_block_under_a_new_lake_name(
+    align_block_pool, data_plane
+):
+    """A completed block whose rows were damaged is re-armed by `rerun_align_block`,
+    then the workflow tail runs again from the next attempt directory: the old file
+    ends with no live rows, the new file under a different lake name holds the exact
+    footprint, and reconcile completes the gate again. Rows the block wrote under a
+    zeroed prep_sample_idx are outside the footprint, so they survive the re-run and
+    `purge_alignment_sample_rows` removes them.
+
+    The staging dirs sit under the data plane's PATH_SCRATCH/ticket, as
+    align_sharded's do, so the lake name derives from `ticket/<wt>/align_sharded/
+    attempt-<n>` and the re-run's attempt-1 gets a name of its own."""
+    from qiita_common.actions import ALIGN_ACTION_ID
+    from qiita_control_plane.actions.align_rerun import (
+        pre_txn_deadline,
+        purge_alignment_sample_rows,
+        rerun_align_block,
+    )
+    from qiita_control_plane.align_planner import ALIGN_ACTION_VERSION
+    from qiita_control_plane.repositories.block import (
+        add_block_members,
+        create_block,
+        set_block_state,
+        set_block_work_ticket,
+    )
+    from qiita_control_plane.testing.db_seeds import (
+        delete_action_if_created,
+        seed_action_if_absent,
+    )
+
+    pool = align_block_pool["pool"]
+    prep_a = align_block_pool["prep_a"]
+    alignment_idx = align_block_pool["alignment_idx"]
+    start = align_block_pool["starts"][prep_a]
+    n = _READS_PER_SAMPLE
+    members = [(prep_a, start, start + n - 1)]
+    footprint = n * _ROWS_PER_READ
+    ticket_root = Path(data_plane["workspace_root"])
+
+    created = await seed_action_if_absent(
+        pool, action_id=ALIGN_ACTION_ID, version=ALIGN_ACTION_VERSION
+    )
+    async with pool.acquire() as conn, conn.transaction():
+        block = await create_block(conn)
+        await add_block_members(conn, block_idx=block, members=members)
+    wt = await pool.fetchval(
+        "INSERT INTO qiita.work_ticket (action_id, action_version, originator_principal_idx,"
+        "  scope_target_kind, block_idx, alignment_idx, action_context, state)"
+        " VALUES ($1, $2, $3, 'block', $4, $5, $6::jsonb, 'completed')"
+        " RETURNING work_ticket_idx",
+        ALIGN_ACTION_ID,
+        ALIGN_ACTION_VERSION,
+        align_block_pool["owner"],
+        block,
+        alignment_idx,
+        f'{{"alignment_idx": {alignment_idx}}}',
+    )
+    try:
+        async with pool.acquire() as conn, conn.transaction():
+            await set_block_work_ticket(conn, block_idx=block, work_ticket_idx=wt)
+        bound = {"alignment_idx": alignment_idx}
+
+        async def tail(attempt: int, rows_members):
+            staging = ticket_root / str(wt) / "align_sharded" / f"attempt-{attempt}"
+            _write_alignment_parquet(staging, alignment_idx=alignment_idx, members=rows_members)
+            for name, extra in (
+                ("delete-alignment-block", {}),
+                ("register-files", {"alignment_staging_dir": str(staging)}),
+                ("reconcile-alignment-block", {}),
+            ):
+                await _run_align_action(
+                    pool,
+                    data_plane,
+                    name=name,
+                    block_idx=block,
+                    alignment_idx=alignment_idx,
+                    bound={**bound, **extra},
+                    workspace=staging,
+                    work_ticket_idx=wt,
+                )
+
+        def files() -> dict[str, int]:
+            conn = ducklake_connect(data_plane["data_path"])
+            try:
+                return dict(
+                    conn.execute(
+                        "SELECT filename, count(*) FROM qiita_lake.alignment"
+                        " WHERE alignment_idx = ? GROUP BY filename",
+                        [alignment_idx],
+                    ).fetchall()
+                )
+            finally:
+                conn.close()
+
+        # The original run: the block's reads, plus the same reads again under a
+        # zeroed prep_sample_idx, all in one file.
+        await tail(0, [*members, (0, start, start + n - 1)])
+        original = files()
+        assert list(original.values()) == [2 * footprint]
+        assert await _alignment_sample_state(pool, alignment_idx, prep_a) == "completed"
+        async with pool.acquire() as conn:
+            await set_block_state(conn, block_idx=block, new_state="completed")
+        await pool.execute(
+            "INSERT INTO qiita.work_ticket_step (work_ticket_idx, step_index, attempt,"
+            "  step_name, compute_target, state, slurm_job_id, job_name)"
+            " VALUES ($1, 0, 0, 'align_sharded', 'slurm', 'completed', 1, 'j')",
+            wt,
+        )
+
+        definition = _align_steps()
+        outcome = await rerun_align_block(
+            pool,
+            deadline=pre_txn_deadline(),
+            alignment_idx=alignment_idx,
+            work_ticket_idx=wt,
+            allow_deprecated_mask=False,
+            reason="e2e",
+            principal_idx=align_block_pool["owner"],
+            ticket_root=ticket_root,
+            action_steps=definition,
+        )
+        assert outcome["pending_prep_sample_idx"] == [prep_a]
+        assert await _alignment_sample_state(pool, alignment_idx, prep_a) == "pending"
+
+        # The runner would take attempt-1: attempt-0 exists and nothing owns it.
+        await tail(1, members)
+        after = files()
+        (old_name,) = original
+        new_names = set(after) - {old_name}
+        assert len(new_names) == 1
+        assert after[new_names.pop()] == footprint
+        # Only the rows under the zeroed prep_sample_idx are left in the old file.
+        assert after[old_name] == footprint
+        assert await _alignment_sample_state(pool, alignment_idx, prep_a) == "completed"
+
+        deleted = await purge_alignment_sample_rows(
+            pool,
+            alignment_idx=alignment_idx,
+            prep_sample_idx=0,
+            reason="e2e",
+            principal_idx=align_block_pool["owner"],
+            signing_key=data_plane["secret"],
+            data_plane_url=_data_plane_url(data_plane),
+        )
+        assert deleted == footprint
+        assert old_name not in files()
+        assert (
+            _count_alignment_rows(data_plane, alignment_idx=alignment_idx, prep_sample_idx=prep_a)
+            == footprint
+        )
+    finally:
+        await pool.execute("DELETE FROM qiita.work_ticket WHERE work_ticket_idx = $1", wt)
+        await pool.execute("DELETE FROM qiita.block WHERE block_idx = $1", block)
+        await delete_action_if_created(
+            pool, action_id=ALIGN_ACTION_ID, version=ALIGN_ACTION_VERSION, created=created
+        )
+
+
+def _align_steps():
+    """The shipped align YAML's step list, as the route passes it."""
+    import yaml
+    from qiita_common.actions import ActionDefinition
+
+    return ActionDefinition.model_validate(yaml.safe_load(_ALIGN_YAML_PATH.read_text())).steps

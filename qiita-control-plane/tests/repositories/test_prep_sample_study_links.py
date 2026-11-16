@@ -1,6 +1,6 @@
 """Repository-layer tests for the batched prep_sample → study lookup.
 
-`fetch_active_study_idxs_for_prep_samples` is the many-sample sibling of
+`fetch_active_study_idxs_by_prep_sample_idx` is the many-sample sibling of
 `fetch_active_study_idxs_for_prep_sample`. It exists so the alignment mint's
 per-study access check costs one query plus one lookup per DISTINCT study,
 rather than one round trip per sample — a cohort can carry thousands.
@@ -18,8 +18,8 @@ import pytest
 import pytest_asyncio
 
 from qiita_control_plane.repositories.prep_sample import (
+    fetch_active_study_idxs_by_prep_sample_idx,
     fetch_active_study_idxs_for_prep_sample,
-    fetch_active_study_idxs_for_prep_samples,
 )
 from qiita_control_plane.testing.db_seeds import (
     retire_prep_sample_to_study_link,
@@ -112,7 +112,7 @@ async def test_batched_lookup_matches_the_per_sample_one(links):
     pool = links["pool"]
     prep_idxs = [links["ps_a"], links["ps_b"], links["ps_c"]]
 
-    batched = await fetch_active_study_idxs_for_prep_samples(pool, prep_idxs)
+    batched = await fetch_active_study_idxs_by_prep_sample_idx(pool, prep_idxs)
     for ps in prep_idxs:
         expected = await fetch_active_study_idxs_for_prep_sample(pool, ps)
         assert sorted(batched.get(ps, [])) == sorted(expected), f"drifted on prep_sample {ps}"
@@ -125,7 +125,7 @@ async def test_batched_lookup_returns_every_study_a_sample_spans(links):
     caller must hold the tier on EVERY study a sample touches, so dropping one
     would silently authorize a read the caller has no right to.
     """
-    batched = await fetch_active_study_idxs_for_prep_samples(links["pool"], [links["ps_b"]])
+    batched = await fetch_active_study_idxs_by_prep_sample_idx(links["pool"], [links["ps_b"]])
     assert sorted(batched[links["ps_b"]]) == sorted([links["study_1"], links["study_2"]])
 
 
@@ -133,7 +133,7 @@ async def test_batched_lookup_omits_retired_links(links):
     """A retired link is not a link. `ps_c`'s only link is retired, so it comes
     back with no studies at all — which the access gate must be able to see, to
     tell 'no studies' apart from 'studies you can read'."""
-    batched = await fetch_active_study_idxs_for_prep_samples(
+    batched = await fetch_active_study_idxs_by_prep_sample_idx(
         links["pool"], [links["ps_a"], links["ps_c"]]
     )
     assert batched.get(links["ps_c"], []) == []
@@ -142,4 +142,4 @@ async def test_batched_lookup_omits_retired_links(links):
 
 async def test_batched_lookup_empty_input_returns_empty(links):
     """No query, no round trip — mirrors list_incomplete_alignment_samples."""
-    assert await fetch_active_study_idxs_for_prep_samples(links["pool"], []) == {}
+    assert await fetch_active_study_idxs_by_prep_sample_idx(links["pool"], []) == {}

@@ -5,7 +5,6 @@ import math
 import sqlite3
 from collections.abc import Callable, Iterable
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, ValidationError
 from qiita_common.api_paths import PATH_RUN_FOLDER_INSPECT, PATH_RUN_FOLDER_PREFIX
@@ -17,9 +16,6 @@ from qiita_common.models import (
 )
 
 from .. import _common
-
-if TYPE_CHECKING:
-    from run_preflight.db import PlatformSampleInfo
 
 
 def _inspect_run_folder(
@@ -90,34 +86,6 @@ def _load_preflight_conn(
     except (sqlite3.DatabaseError, ValueError) as exc:
         parser.error(f"{flag} {preflight_blob}: cannot load preflight SQLite: {exc}")
     return conn
-
-
-def _refuse_malformed_accessions(
-    info: PlatformSampleInfo, parser: argparse.ArgumentParser, preflight_blob: Path, idx_label: str
-) -> None:
-    """Refuse a pre-flight platform-sample row whose accessions are blank or padded.
-
-    The library refuses a NULL accession but not a blank or whitespace-padded one.
-    The accession lookup's request strips each value (`NonBlankText`), so a blank
-    one fails its validation with a traceback, and a padded one comes back keyed
-    on the stripped value and misses. `idx_label` names the sample-idx column in
-    the message.
-    """
-    accessions = {
-        "biosample_accession": [info.biosample_accession],
-        "primary_bioproject_accession": [info.primary_bioproject_accession],
-        "secondary_bioproject_accessions": info.secondary_bioproject_accessions,
-    }
-    bad = [
-        field
-        for field, values in accessions.items()
-        if any(not v.strip() or v != v.strip() for v in values)
-    ]
-    if bad:
-        parser.error(
-            f"--preflight-blob {preflight_blob}: {idx_label} {info.sample_idx} has a"
-            f" blank or padded {', '.join(bad)}; fix the pre-flight before re-submitting"
-        )
 
 
 def _build_body(
@@ -294,17 +262,19 @@ def _handle_read(args: argparse.Namespace, parser: argparse.ArgumentParser) -> i
 
 
 def _handle_study_scoped_call(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
-    """Call a study-scoped route that carries a request body.
+    """Call a study-scoped route.
 
     The per-command `set_defaults` supplies the verb, the subpath template
-    filled from --study-idx, the request model the flags map to, and the
-    names of any repeatable KEY=VALUE flags. Both the fold and the body
-    construction precede the token read, so invalid flags exit 2 without a
-    request going out.
+    (its placeholders filled from the parsed args of the same names), the
+    request model the flags map to or None for a route that takes no body,
+    and the names of any repeatable KEY=VALUE flags. Both the fold and the
+    body construction precede the token read, so invalid flags exit 2
+    without a request going out.
     """
     _fold_flag_values(args, parser, args.study_call_kv_flags, _common.parse_kv_pairs)
-    body = _build_body(args.study_call_model, args, parser)
-    path = args.study_call_path.format(study_idx=args.study_idx)
+    model = args.study_call_model
+    body = None if model is None else _build_body(model, args, parser)
+    path = args.study_call_path.format(**vars(args))
     method = args.study_call_method
     return _common.run_http_subcommand(
         lambda t: _common.call(method, args.base_url, t, path, json=body)

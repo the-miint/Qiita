@@ -319,6 +319,7 @@ def _request(
     json: dict | None = None,
     params: dict | None = None,
     extra_headers: dict[str, str] | None = None,
+    timeout: float = CLI_HTTP_TIMEOUT_SECONDS,
 ) -> httpx.Response:
     """Issue an authenticated control-plane request and raise on non-2xx.
 
@@ -336,7 +337,7 @@ def _request(
         headers=headers,
         json=json,
         params=params,
-        timeout=CLI_HTTP_TIMEOUT_SECONDS,
+        timeout=timeout,
     )
     resp.raise_for_status()
     return resp
@@ -459,15 +460,17 @@ def call(
     *,
     json: dict | None = None,
     params: dict | None = None,
+    timeout: float = CLI_HTTP_TIMEOUT_SECONDS,
 ) -> dict | list:
     """Authenticated control-plane call returning the decoded JSON body.
 
     `params` are URL query parameters (e.g. list-endpoint filters). The
     body is usually a JSON object, but list endpoints return a JSON array
     — hence the `dict | list` return; raises httpx.HTTPStatusError on a
-    non-2xx status.
+    non-2xx status. `timeout` is for a route whose own work is bounded above
+    the default.
     """
-    return _request(method, base_url, token, path, json=json, params=params).json()
+    return _request(method, base_url, token, path, json=json, params=params, timeout=timeout).json()
 
 
 def call_with_status(

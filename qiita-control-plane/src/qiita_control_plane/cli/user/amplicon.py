@@ -9,8 +9,8 @@ barcode.
 
 The per-sample Golay roster (`barcode_map`) rides in action_context, built from
 the preflight's `get_amplicon_sample_info`, so the demux job assigns each read to
-a prep_sample without DB access. The preflight supplies only the roster and the
-sample accessions; the run identity comes from the run folder.
+a prep_sample without DB access. The preflight supplies only the roster and each
+biosample's and project's identifiers; the run identity comes from the run folder.
 """
 
 from __future__ import annotations
@@ -30,7 +30,7 @@ from qiita_common.models import (
     WorkTicketCreateRequest,
 )
 
-from ...preflight import AmpliconPreflightError, amplicon_samples
+from ...preflight import AmpliconPreflightError, SampleRefs, amplicon_samples
 from .. import _common
 from ._helpers import _follow_on_from_args, _resolve_run_folder
 from .pool import _provision_run_pool_roster
@@ -49,17 +49,13 @@ class _AmpliconPreflightRow(NamedTuple):
     `sequenced_pool_item_id`. `barcode` + `barcodes_are_rc` are the Golay roster the
     demux job matches each read's index against; `barcodes_are_rc` is per-sample
     provenance (whether the stored barcode is the reverse complement of the read
-    index). The project accessions are ENA **bioproject** accessions that
-    resolve-roster resolves, matching the Illumina/PacBio rows;
-    `secondary_project_accessions` is populated for controls.
+    index). `refs.secondary_projects` is populated for controls.
     """
 
     prepped_sample_idx: int
     barcode: str
     barcodes_are_rc: bool
-    biosample_accession: str
-    primary_project_accession: str
-    secondary_project_accessions: list[str]
+    refs: SampleRefs
 
 
 def _read_amplicon_preflight_rows(
@@ -70,7 +66,7 @@ def _read_amplicon_preflight_rows(
     Validation is `preflight.amplicon_samples`, the same check the runner applies
     to the pool's stored blob, so a sheet the CLI accepts is one the runner
     accepts. Every refusal (not a SQLite, not an amplicon sheet, no samples, a
-    missing barcode or accession) raises via parser.error so the CLI surfaces one
+    missing barcode or identifier) raises via parser.error so the CLI surfaces one
     stderr line and exits 2 before any network call — matching
     `pool.py::_read_preflight_rows`.
     """
@@ -100,9 +96,7 @@ def _read_amplicon_preflight_rows(
             prepped_sample_idx=sample.prepped_sample_idx,
             barcode=sample.barcode,
             barcodes_are_rc=sample.barcodes_are_rc,
-            biosample_accession=sample.biosample_accession,
-            primary_project_accession=sample.primary_bioproject_accession,
-            secondary_project_accessions=list(sample.secondary_bioproject_accessions),
+            refs=sample.refs,
         )
         for sample in samples
     ]
@@ -120,8 +114,8 @@ def _handle_submit_golay_demux(args: argparse.Namespace, parser: argparse.Argume
          action_context carries the multiplexed FASTQ paths and the barcode_map,
          plus an `on_success` follow-on when the `--then-*` flags name one.
 
-    Steps 1-3 (accession resolution, create-missing roster, fail-fast on an
-    unresolved accession) are the shared `_provision_run_pool_roster` gesture,
+    Steps 1-3 (identifier resolution, create-missing roster, fail-fast on a
+    row that does not resolve) are the shared `_provision_run_pool_roster` gesture,
     identical to submit-bcl-convert; only the roster (Golay barcode_map vs a
     bcl-convert sample_map) differs. The run folder is resolved from the run id
     server-side, exactly as submit-bcl-convert resolves its BCL folder.
@@ -160,7 +154,7 @@ def _handle_submit_golay_demux(args: argparse.Namespace, parser: argparse.Argume
         ).model_dump(exclude_unset=True, mode="json")
 
         # Shared run -> pool -> roster provisioning (create-missing; fails fast on an
-        # unresolved accession). Amplicon keys the pool-item-id on prepped_sample_idx.
+        # row that does not resolve). Amplicon keys the pool-item-id on prepped_sample_idx.
         provision = _provision_run_pool_roster(
             args.base_url,
             token,
@@ -187,7 +181,7 @@ def _handle_submit_golay_demux(args: argparse.Namespace, parser: argparse.Argume
         per_sample_results = [
             {
                 "prepped_sample_idx": s.row.prepped_sample_idx,
-                "biosample_accession": s.row.biosample_accession,
+                "biosample": s.row.refs.biosample.model_dump(mode="json", exclude_none=True),
                 "biosample_idx": s.biosample_idx,
                 "primary_study_idx": s.primary_study_idx,
                 "secondary_study_idxs": s.secondary_study_idxs,

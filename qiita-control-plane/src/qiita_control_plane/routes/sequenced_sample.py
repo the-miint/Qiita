@@ -549,10 +549,6 @@ async def list_sequenced_samples_in_pool(
             item["sheet_type"] = facts.sheet_type
             item["twist_adaptor_id"] = facts.twist_adaptor_id
             item["syndna_is_twisted"] = facts.syndna_is_twisted
-        # Every roster row gets a resolution — a sample with no host metadata
-        # comes back UNRESOLVED rather than absent, so "we don't know" is
-        # visible instead of silent. The resolver already returns the wire type,
-        # so there is nothing to map.
         item["host_filter"] = host_filter_by_biosample[item["biosample_idx"]]
         samples.append(SequencedSampleListItem.model_validate(item))
     return SequencedSampleListResponse(
@@ -1062,13 +1058,12 @@ async def patch_sequenced_sample(
             await _lock_run_or_503(conn, sequencing_run_idx)
         try:
             # Preflight: existence -> 404, retirement -> 409, ETag -> 412.
-            # for_update=True acquires row-level locks on both joined
-            # tables for the rest of the transaction so a concurrent PATCH
-            # on the same sequenced_sample serializes here instead of
-            # racing through the ETag check and silently overwriting the
-            # first writer's update.
+            # The update lock on both joined tables holds for the rest of the
+            # transaction so a concurrent PATCH on the same sequenced_sample
+            # serializes here instead of racing through the ETag check and
+            # silently overwriting the first writer's update.
             row = await fetch_sequenced_sample_with_prep_sample(
-                conn, sequenced_sample_idx, for_update=True
+                conn, sequenced_sample_idx, lock="update"
             )
             if row is None:
                 raise HTTPException(

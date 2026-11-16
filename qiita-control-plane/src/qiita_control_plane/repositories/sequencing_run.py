@@ -310,23 +310,6 @@ async def fetch_sequencing_run_platform(
     return Platform(platform) if platform is not None else None
 
 
-async def fetch_sequencing_run_exists(
-    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
-    sequencing_run_idx: int,
-) -> bool:
-    """Return True iff a qiita.sequencing_run row exists at this idx.
-
-    Exposed separately from fetch_sequencing_run so route handlers can run
-    a cheap pre-flight 404 check without pulling the full row across the
-    wire. Retired runs still return True — the read surface decides what
-    to do with the retirement flag once the row is in hand.
-    """
-    return await pool_or_conn.fetchval(
-        "SELECT EXISTS (SELECT 1 FROM qiita.sequencing_run WHERE idx = $1)",
-        sequencing_run_idx,
-    )
-
-
 async def insert_sequenced_pool(
     conn: asyncpg.Connection,
     *,

@@ -65,7 +65,8 @@ weighed against.
 A download ticket fetches **4** runs at once by default. `ENA_DOWNLOAD_RUN_CONCURRENCY`
 (1-8, control-plane env, restart to change) sets it for every ticket an import batch
 submits; a manually submitted `download-ena-study` ticket can carry `run_concurrency` in
-its `action_context` instead; the job's start-up line on stderr shows the value in effect.
+its `action_context` instead, as can `ena_run_accessions` to download only those runs of the
+pool; the job's start-up line on stderr shows the value in effect.
 The batch stores the value in the ticket's `action_context`, so a changed value reaches
 only tickets built after the restart: a `/run` redrive, an automatic retry, and a batch
 reusing a pool's existing ticket keep the value the ticket was built with (4 if none). The
@@ -99,6 +100,12 @@ background and splits into one item per study they belong to; each item then reg
 only its own listed runs. The study is created or reused exactly as for a
 whole-study import, so the same import-created-study guard applies.
 
+- **Biosamples ENA has no record of.** A run whose biosample ENA never mirrored (some NCBI
+  biosamples) still registers, with only its run-derived fields and no ENA sample attributes;
+  each biosample for which ENA returned no sample attributes is logged as a warning.
+  Attributes are harmonized only when a biosample is first created, so a later re-import does
+  not fill them in if ENA mirrors them afterwards.
+
 - **One unavailable run fails the whole item.** A run ENA does not return, or returns
   non-public, fails the ungrouped item with `run(s) unavailable at ENA: …` naming every
   such run, and nothing is registered or flagged. Fix the list and resubmit.
@@ -113,10 +120,9 @@ whole-study import, so the same import-created-study guard applies.
 - **Only its own pools are ticketed.** A per-study run-list item submits or reuses a
   download ticket only for pools holding its runs; re-import the whole study to retry
   other failed pools.
-- **A failed pool's other runs download too.** New runs go into the newest pool without a
-  covering ticket. If that pool's earlier ticket failed, the item's new ticket reads the
-  pool's whole roster, so its unread runs are downloaded along with the listed ones.
-  Registration still covers exactly the listed runs.
+- **Only its own runs download.** New runs go into the newest pool without a covering
+  ticket. The item's ticket is restricted to the listed runs, so a failed pool's other
+  unread runs wait for a re-import of the whole study.
 
 ### Re-importing, and studies we created ourselves
 
@@ -127,12 +133,19 @@ it starts, so new runs never join a pool whose download is in flight or finished
 go into a new pool with its own ticket, and the accession reports `done` only once every
 pool's download has. A re-import is also how to retry a failed or cancelled download,
 as is `POST /work-ticket/{idx}/run` on the pool's latest such ticket, which picks up runs
-added since. `/run` is refused with a 409 on an older ticket (the error names the newer
-one and its state), and on a failed ticket that still has a live download job from before
-the failure, which holds the old roster: cancel it by idx (`work_ticket_idxs`) to reap the
-job, then re-import the study. The ticket stays FAILED and keeps refusing `/run`.
+added since (a restricted ticket re-downloads only its listed runs, and skips, with a runner
+warning, listed runs flagged or retired since; it fails only if none remain). `/run` is refused with
+a 409 on an older ticket (the error names the newer one and its state), and on a failed
+ticket that still has a live download job from before the failure, which holds the old
+roster: cancel it by idx (`work_ticket_idxs`) to reap the job, then re-import the study. The ticket stays FAILED and keeps refusing `/run`.
 A re-import does not retry the failed runs of a `completed_partial` pool: its ticket is
-COMPLETED and is reused, and the runs keep reporting `download_failed`.
+COMPLETED and is reused, and the runs keep reporting `download_failed`. It does ticket the
+runs a completed download never read (no reads, no recorded failure): a new ticket for the
+same pool, restricted to them. A run counts as downloaded once its minting ticket completed, so
+a failed ticket that had already reserved a run's read numbering does not hide it from a
+re-import; the new ticket stops at that run, naming the failed ticket, which `/run` re-drives.
+If another import's restricted ticket is still live on a pool
+the re-import needs, the item fails naming that ticket; re-import once it ends.
 Nothing schedules a re-import or a redrive; each is an operator gesture. A native
 `POST .../sequenced-sample` add to a pool whose download has already read (or is reading) its
 roster is refused the same way, 409: create a new `sequenced_pool` on the run and submit
@@ -164,7 +177,9 @@ conflict — is recorded on that item alone; it never aborts the batch or its
 sibling items. Listed runs share one item until they are grouped by study, so one
 unresolved run fails them all (see [Importing chosen runs](#importing-chosen-runs)).
 Poll with `qiita ena-import-status IDX` to see each item's state and, on failure, the
-reason.
+reason. If a submit was interrupted or lost its response before you got the batch idx,
+run the `qiita ena-import-list --mine --since TS` it prints; `TS` is a minute before the submit
+started, to cover clock skew.
 
 ### Non-public studies and runs
 
@@ -177,9 +192,9 @@ otherwise-public study, an individual **suppressed run** is `excluded` — isola
 its siblings exactly like an unmappable platform, carrying a `failure_reason` naming
 its status (`run is suppressed`), and contributing no `biosample`/`prep_sample`/`sequenced_sample`
 rows. When a pool was created (at least one run's platform mapped) but every run in
-the item still ends up `excluded` and/or `failed` — none reaches
+the item still ends up `excluded`, `unsupported` and/or `failed` — none reaches
 `registered`/`skipped_already_present` — the item fails with "every run failed to
-register", grouping the excluded and failed runs by reason (see *Metadata
+register", grouping those runs by reason (see *Metadata
 harmonization* below); if no platform ever mapped, no pool
 exists and the item instead fails with "no run mapped to a downloadable pool".
 
@@ -228,11 +243,10 @@ non-public runs, so "every run suppressed" arrives this way. If Qiita holds a
 study created by an earlier import, its held runs are checked and flagged or
 cleared, and the item fails naming any it flagged.
 
-**A held run nothing will download.** A run flagged before its pool's download
+**A held run left off its pool's download.** A run flagged before its pool's download
 read the roster is left off that download. If ENA later releases it again, the
-flag clears, but the pool's download has already completed. The re-import reports
-such a run `held_not_downloaded` instead of `skipped_already_present`. There is no
-automatic retry for it yet.
+flag clears, but the pool's download has already completed. The re-import tickets
+such a run: a new download ticket for the pool, restricted to the runs it left behind.
 
 **The exclusion rule: a flagged run is skipped wherever a sample-selecting query
 already filters out a retired prep_sample.** That includes the download roster,
@@ -264,6 +278,10 @@ did.
   submit work for the whole batch runs in the background. **Admin-only**
   (wet_lab_admin or system_admin) — this is an operator gesture, not something an
   end user submits, mirroring bcl-convert's own admin-only submission.
+- `GET /api/v1/ena-import-batch` — the newest batches first (`submitted_by=me` for your
+  own, `since` an ISO-8601 timestamp with timezone, `limit` default 20, max 100), each with
+  its idx, `created_at` and a count of items per state, rolled up as below.
+  Admin-only.
 - `GET /api/v1/ena-import-batch/{idx}` — the batch's current, rolled-up per-item
   status (the run item is split into one item per study once its runs resolve):
   `pending` / `resolving` / `registered` / `downloading` / `done` / `completed_partial` /
@@ -289,10 +307,12 @@ right after submit. A transient failure while polling — a dropped connection o
 is retried until the timeout instead of failing the watch; any other HTTP error is
 fatal. Exit codes: `0` every item reached `done`; `1` an item ended `failed` or
 `completed_partial`, the watch timed out (naming each still-pending item and its last
-known state), an HTTP error, or no token was found; `2` bad input (a malformed
-accession, a bad `--from-file` line, an out-of-range flag); `130` Ctrl-C, naming the
-batch to poll if the POST had already succeeded. `qiita ena-import-status IDX` reads a
-batch's current state and
+known state), an HTTP error, no token was found, or the POST was sent but no response
+came back or a gateway answered 502/503/504 (printing the `qiita ena-import-list --mine
+--since TS` command to run); `2` bad input
+(a malformed accession, a bad `--from-file` line, an out-of-range flag); `130` Ctrl-C,
+naming the batch to poll if the POST had already succeeded, or otherwise the same
+`ena-import-list` command. `qiita ena-import-status IDX` reads a batch's current state and
 always exits `0` once the read itself succeeds. See the REST bullets above for the
 state set and what each field means.
 
@@ -307,10 +327,11 @@ Every ENA-imported biosample is bound to the **ERC000011** checklist (the ENA de
 sample checklist) — the same shared checklist model every other metadata path in
 Qiita uses. `GET /api/v1/ena-import-batch/{idx}` returns an `ena_runs` array per item,
 one entry per ENA run carrying its `status` (`registered` / `skipped_already_present` /
-`excluded` / `failed` / `flagged_unavailable` / `held_not_downloaded` /
-`download_failed` — `flagged_unavailable` and `held_not_downloaded` come from a
-re-import's ENA availability re-check, see above) and a `failure_reason` on every
-status but `registered` and `skipped_already_present`. `download_failed` also carries
+`excluded` / `failed` / `unsupported` / `flagged_unavailable` / `download_failed` —
+`flagged_unavailable` comes from a re-import's ENA availability re-check, see above) and
+a `failure_reason` on every status but `registered` and `skipped_already_present`.
+`unsupported` marks a run whose library strategy and source have no curated protocol,
+so there is nothing to retry until one is added. `download_failed` also carries
 a `failure_type`. A mapped value its global field's type cannot hold (a latitude of
 `39 deg`) does not fail the run: the global field stores `not provided`, the submitted
 text is kept study-local as `<field> (as submitted)`, and the run's harmonization
@@ -371,13 +392,14 @@ taxon, is not a host and is ignored, with a warning.
 With no usable `host_tax_id`, a free-text `host` that is not a missing-value term such as
 `missing` gives `not provided` and a warning quoting the text. Otherwise the host comes
 from the table: the listed human and mouse metagenomes give that host, and the listed
-hostless environments such as seawater or soil give `not applicable`, meaning the
+hostless environments such as seawater or soil leave `host taxon id` out, meaning the
 sequenced sample is submitted with no host depletion. A taxon the table does not cover
 gives `not provided`, and host-filter resolution then returns unresolved and submit
-refuses. `qiita-admin backfill host-taxon-id` reads the same table. An attribute tag
+refuses. `qiita-admin backfill host-taxon-id` reads the same table; it is run once, in the
+deploy that made an absent value mean no host (bucket 2, before the restart), and never
+after, because from the restart an absent value is deliberate. An attribute tag
 named `taxon id` or `host taxon id` is dropped with a warning, since those fields are
-filled from the run's taxon ids (falling back to the table, `not applicable`, or
-`not provided`).
+filled from the run's taxon ids (falling back to the table, or to `not provided`).
 
 A warning appears only on the run that created the biosample, so after a re-import or for
 a later run on the same sample, check the creating batch.
@@ -395,9 +417,13 @@ qiita biosample patch-metadata-by-unique-field --study-idx S \
   --metadata "host taxon id=<NCBI taxon id>"
 ```
 
-The value is a loaded NCBI Taxonomy id or a missing-value reason such as `not applicable`.
-Either path takes one biosample per call and needs `member` or above on the study, or
-`wet_lab_admin`; a field or value above your tier on the study is refused with 403.
+The value is a loaded NCBI Taxonomy id, `not provided`, or `not applicable`. Either path takes
+one biosample per call and needs `member` or above on the study, or `wet_lab_admin`; a field or
+value above your tier on the study is refused with 403.
+
+Write `not applicable` only to correct a `not provided` biosample that turns out to have no host:
+biosample metadata has no delete route, so the field cannot go back to absent, and host filtering
+reads `not applicable` as no host.
 
 ENA's `neg_cont_type` and `pos_cont_type` tags (also spelled `negative control type` and
 `positive control type`) are kept as study-local text and never make a biosample a control,
@@ -430,8 +456,9 @@ gaps expected to close soon (except where noted):
   per-run failure model above) rather than importing correctly. Filling out DDBJ
   coverage is deferred to the backlog.
 - **A non-amplicon run deposited with `library_selection` PCR is refused.** PCR selection
-  marks an amplicon library, so a run whose `library_strategy` is anything but `AMPLICON`
-  (including `RNA-Seq`/transcriptomic) contradicts it. That run fails alone with a
+  marks an amplicon library, so a run whose `library_strategy` is not `AMPLICON` but whose
+  strategy and source would otherwise map to metagenomics or transcriptomics (including
+  `RNA-Seq`/transcriptomic) contradicts it. That run fails alone with a
   `failure_reason` naming the selection; its siblings import. Deposited metadata is not
   rewritten and the import has no override. Once the depositor corrects the ENA record,
   a re-import picks the run up. An operator who knows the run is amplicon can instead

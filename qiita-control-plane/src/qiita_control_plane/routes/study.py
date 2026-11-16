@@ -54,7 +54,7 @@ from ..repositories.exported_entity import require_export_entity_id
 from ..repositories.study import (
     create_study,
     fetch_study,
-    fetch_study_idxs_by_accession,
+    fetch_study_idxs_by_natural_key,
     fetch_study_list_candidates,
     update_study,
 )
@@ -424,12 +424,11 @@ async def patch_study(
 
     async with tx() as conn:
         try:
-            # Preflight: existence -> 404, ETag -> 412. for_update=True
-            # acquires a row-level lock for the rest of the transaction
-            # so a concurrent PATCH on the same row serializes here
-            # instead of racing through the ETag check and silently
-            # overwriting the first writer's update.
-            row = await fetch_study(conn, study_idx, for_update=True)
+            # Preflight: existence -> 404, ETag -> 412. The update lock holds
+            # for the rest of the transaction so a concurrent PATCH on the same
+            # row serializes here instead of racing through the ETag check and
+            # silently overwriting the first writer's update.
+            row = await fetch_study(conn, study_idx, lock="update")
             require_etag_match(row, if_match=if_match, label="study", row_idx=study_idx)
 
             # Apply the UPDATE; the repo function returns the post-UPDATE
@@ -493,8 +492,8 @@ async def lookup_study_by_accession(
     _ = user
     resolved, missing = await resolve_idxs_by_natural_key(
         values=body.accessions,
-        fetcher=lambda values: fetch_study_idxs_by_accession(
-            pool, values=values, accession_field=body.accession_field
+        fetcher=lambda values: fetch_study_idxs_by_natural_key(
+            pool, values=values, key=body.accession_field
         ),
     )
     return StudyLookupByAccessionResponse(resolved=resolved, missing=missing)

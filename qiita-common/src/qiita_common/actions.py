@@ -199,6 +199,12 @@ ALIGN_ACTION_ID = "align"
 # they did not create" keys on it.
 LONG_READ_ASSEMBLY_ACTION_ID = "long-read-assembly"
 
+# The feature-table action's bare id (workflows/estimate-feature-table/<version>.yaml).
+# Its action_context names the alignment(s) it reads (`alignment_idx`, and
+# `denovo_alignment_idx` for a combined table), so a reader asking "which unfinished
+# tickets read this alignment" keys on it.
+ESTIMATE_FEATURE_TABLE_ACTION_ID = "estimate-feature-table"
+
 # The de novo alignment action's bare id (workflows/align-denovo/<version>.yaml).
 # The second action that CONSUMES a read mask rather than minting one — it aligns the
 # `read_masked` pass-set named by its action_context `align_mask_idx` — so the same

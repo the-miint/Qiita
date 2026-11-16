@@ -59,6 +59,7 @@ from qiita_control_plane.testing.tiers import TIER_RANK
 from qiita_control_plane.testing.unique_names import unique_field_name
 
 from .conftest import (
+    LOCK_PROBE_TIMEOUT,
     SPECS,
     _create_linked_entity_for_spec,
     _seed_global_field_for_spec,
@@ -701,7 +702,7 @@ async def test_metadata_write_waits_behind_a_patch_holding_the_parent(ctx, spec)
     update_sql = f"UPDATE {spec.metadata_table} SET value_text = $2 WHERE idx = $1"
 
     async def write(conn):
-        await conn.execute("SET LOCAL lock_timeout = '200ms'")
+        await conn.execute(f"SET LOCAL lock_timeout = '{LOCK_PROBE_TIMEOUT}'")
         await conn.execute(update_sql, metadata_idx, f"v-{secrets.token_hex(3)}")
 
     # Each kind's preflight is the fetch its PATCH runs: a biosample's own row,
@@ -710,7 +711,7 @@ async def test_metadata_write_waits_behind_a_patch_holding_the_parent(ctx, spec)
     if spec.entity_kind is SampleEntityKind.BIOSAMPLE:
 
         async def preflight(conn):
-            await fetch_biosample(conn, entity_idx, for_update=True)
+            await fetch_biosample(conn, entity_idx, lock="update")
 
     else:
         subtype = await seed_sequenced_sample_subtype(
@@ -721,7 +722,7 @@ async def test_metadata_write_waits_behind_a_patch_holding_the_parent(ctx, spec)
         )
 
         async def preflight(conn):
-            await fetch_sequenced_sample_with_prep_sample(conn, subtype[2], for_update=True)
+            await fetch_sequenced_sample_with_prep_sample(conn, subtype[2], lock="update")
 
     try:
         async with pool.acquire() as holder, holder.transaction():

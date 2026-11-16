@@ -187,6 +187,11 @@ impl LakePool {
         Ok(pool)
     }
 
+    /// The catalog's Postgres connection string that the pool's connections attach with.
+    pub fn catalog_connstr(&self) -> &str {
+        &self.catalog_connstr
+    }
+
     /// Where DuckLake keeps its Parquet files, for a handler that moves files into
     /// it as well as reading through the connection.
     pub fn data_path(&self) -> &str {

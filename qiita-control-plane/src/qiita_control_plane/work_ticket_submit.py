@@ -15,7 +15,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 import asyncpg
-from fastapi import FastAPI, HTTPException, status
+from fastapi import FastAPI, HTTPException, Request, status
 from qiita_common.actions import (
     FASTQ_PATH_CONTEXT_KEYS,
     PATH_SUFFIX,
@@ -590,6 +590,25 @@ def require_compute_backend_client(app: FastAPI) -> None:
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="compute orchestrator not configured (COMPUTE_ORCHESTRATOR_URL unset)",
         )
+
+
+def require_compute_backend_client_dependency(request: Request) -> None:
+    """`require_compute_backend_client` as a route dependency."""
+    require_compute_backend_client(request.app)
+
+
+async def authorize_redrive_action(
+    pool: asyncpg.Pool, principal: Principal, action_id: str, action_version: str
+) -> bool:
+    """Apply the action's audience and scopes to a caller who runs an existing ticket
+    again, so knowing a ticket idx is not enough to run its work. Returns False when
+    the action is missing or disabled: both leave the ticket unreachable."""
+    action = await _fetch_action_for_submission(pool, action_id, action_version)
+    if action is None or not action["enabled"]:
+        return False
+    _check_audience(principal, action["audience"])
+    _check_scopes(principal, action["scopes"])
+    return True
 
 
 async def _gate_submission(

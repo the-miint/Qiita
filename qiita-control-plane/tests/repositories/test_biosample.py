@@ -30,10 +30,12 @@ from qiita_control_plane.repositories._sample_helpers import (
 )
 from qiita_control_plane.repositories.biosample import (
     BiosampleImportResult,
+    fetch_active_study_idxs_by_biosample_idx,
     fetch_biosample,
     fetch_biosample_idxs_by_natural_key,
     fetch_biosample_idxs_for_study,
     fetch_caller_has_biosample_access,
+    fetch_study_idxs_by_biosample_idx,
     import_biosample_from_owner_biosample_id,
     insert_biosample,
     resolve_or_import_biosample_by_ena_accession,
@@ -49,6 +51,7 @@ from qiita_control_plane.testing.db_seeds import (
     retire_biosample,
     retire_biosample_to_study_link,
     seed_biosample_global_field,
+    seed_biosample_to_study_link,
     seed_globally_linked_study_field,
     seed_local_study_field,
     seed_study,
@@ -61,7 +64,7 @@ from qiita_control_plane.testing.unique_names import (
     unique_matrix_tube_id,
 )
 
-from .conftest import _create_biosample_with_link
+from .conftest import LOCK_PROBE_TIMEOUT, _create_biosample, _create_biosample_with_link
 
 pytestmark = pytest.mark.db
 
@@ -170,7 +173,7 @@ async def test_resolve_or_import_biosample_by_ena_accession_imports_on_miss(ctx)
                 caller_idx=ctx["principal_idx"],
                 owner_biosample_id_field_name=field_name,
                 owner_biosample_id_value="ENA-ALIAS-1",
-                metadata=dict(_REQUIRED_METADATA),
+                metadata=dict(_BASE_METADATA),
                 local_metadata={"env_broad_scale": "marine biome"},
                 metadata_checklist_idx=None,
                 tiers=ADMIN_EVERYWHERE,
@@ -223,7 +226,7 @@ async def test_resolve_or_import_biosample_by_ena_accession_reuses_on_hit(ctx):
                 caller_idx=ctx["principal_idx"],
                 owner_biosample_id_field_name=field_name,
                 owner_biosample_id_value="ENA-ALIAS-1",
-                metadata=dict(_REQUIRED_METADATA),
+                metadata=dict(_BASE_METADATA),
                 local_metadata={},
                 metadata_checklist_idx=None,
                 tiers=ADMIN_EVERYWHERE,
@@ -245,7 +248,7 @@ async def test_resolve_or_import_biosample_by_ena_accession_reuses_on_hit(ctx):
                 caller_idx=ctx["principal_idx"],
                 owner_biosample_id_field_name=unique_field_name(),
                 owner_biosample_id_value="ENA-ALIAS-2",
-                metadata=dict(_REQUIRED_METADATA),
+                metadata=dict(_BASE_METADATA),
                 local_metadata={"env_broad_scale": "would overwrite"},
                 metadata_checklist_idx=None,
                 tiers=ADMIN_EVERYWHERE,
@@ -276,10 +279,8 @@ async def test_resolve_or_import_biosample_by_ena_accession_reuses_on_hit(ctx):
 # ---------------------------------------------------------------------------
 
 
-# host_taxon_id is now a required field the composer enforces. A missing-value
-# marker counts as supplied and needs no seeded NCBI term, so it is the cheapest
-# way to satisfy the gate; tests that mean to exercise the gate omit it explicitly.
-_REQUIRED_METADATA = {"host taxon id": "not applicable"}
+# A missing-value marker needs no seeded NCBI term, so it is the cheapest host value.
+_BASE_METADATA = {"host taxon id": "not applicable"}
 
 
 async def test_import_biosample_from_owner_biosample_id_creates_full_chain(ctx):
@@ -298,7 +299,7 @@ async def test_import_biosample_from_owner_biosample_id_creates_full_chain(ctx):
                 owner_biosample_id_field_name=field_name,
                 owner_biosample_id_value="OWNER-XYZ-1",
                 caller_idx=ctx["principal_idx"],
-                metadata=dict(_REQUIRED_METADATA),
+                metadata=dict(_BASE_METADATA),
                 tiers=ADMIN_EVERYWHERE,
             )
     bs_idx = result.biosample_idx
@@ -392,7 +393,7 @@ async def test_import_biosample_from_owner_biosample_id_with_explicit_checklist(
                 owner_biosample_id_field_name=field_name,
                 owner_biosample_id_value="OWNER-CL-1",
                 caller_idx=ctx["principal_idx"],
-                metadata=dict(_REQUIRED_METADATA),
+                metadata=dict(_BASE_METADATA),
                 metadata_checklist_idx=ctx["checklist_idx"],
                 biosample_accession=bs_acc,
                 tiers=ADMIN_EVERYWHERE,
@@ -426,7 +427,7 @@ async def test_import_biosample_from_owner_biosample_id_reuses_local_field_for_s
                 owner_biosample_id_field_name=field_name,
                 owner_biosample_id_value="A",
                 caller_idx=ctx["principal_idx"],
-                metadata=dict(_REQUIRED_METADATA),
+                metadata=dict(_BASE_METADATA),
                 tiers=ADMIN_EVERYWHERE,
             )
             result2 = await import_biosample_from_owner_biosample_id(
@@ -436,7 +437,7 @@ async def test_import_biosample_from_owner_biosample_id_reuses_local_field_for_s
                 owner_biosample_id_field_name=field_name,
                 owner_biosample_id_value="B",
                 caller_idx=ctx["principal_idx"],
-                metadata=dict(_REQUIRED_METADATA),
+                metadata=dict(_BASE_METADATA),
                 tiers=ADMIN_EVERYWHERE,
             )
     bs1 = result1.biosample_idx
@@ -490,7 +491,7 @@ async def test_import_biosample_from_owner_biosample_id_creates_distinct_fields_
                 owner_biosample_id_field_name=name_a,
                 owner_biosample_id_value="A",
                 caller_idx=ctx["principal_idx"],
-                metadata=dict(_REQUIRED_METADATA),
+                metadata=dict(_BASE_METADATA),
                 tiers=ADMIN_EVERYWHERE,
             )
             result2 = await import_biosample_from_owner_biosample_id(
@@ -500,7 +501,7 @@ async def test_import_biosample_from_owner_biosample_id_creates_distinct_fields_
                 owner_biosample_id_field_name=name_b,
                 owner_biosample_id_value="B",
                 caller_idx=ctx["principal_idx"],
-                metadata=dict(_REQUIRED_METADATA),
+                metadata=dict(_BASE_METADATA),
                 tiers=ADMIN_EVERYWHERE,
             )
     ctx["created"]["biosample"].append(result1.biosample_idx)
@@ -538,7 +539,7 @@ async def test_import_biosample_from_owner_biosample_id_rolls_back_on_failed_ste
                     owner_biosample_id_field_name=unique_field_name(),
                     owner_biosample_id_value="DOOMED",
                     caller_idx=ctx["principal_idx"],
-                    metadata=dict(_REQUIRED_METADATA),
+                    metadata=dict(_BASE_METADATA),
                     biosample_accession=bs_acc,
                     tiers=ADMIN_EVERYWHERE,
                 )
@@ -571,7 +572,7 @@ async def test_import_biosample_from_owner_biosample_id_uses_independent_field_p
                 owner_biosample_id_field_name=field_name,
                 owner_biosample_id_value="STUDY1-1",
                 caller_idx=ctx["principal_idx"],
-                metadata=dict(_REQUIRED_METADATA),
+                metadata=dict(_BASE_METADATA),
                 tiers=ADMIN_EVERYWHERE,
             )
             result2 = await import_biosample_from_owner_biosample_id(
@@ -581,7 +582,7 @@ async def test_import_biosample_from_owner_biosample_id_uses_independent_field_p
                 owner_biosample_id_field_name=field_name,
                 owner_biosample_id_value="STUDY2-1",
                 caller_idx=ctx["principal_idx"],
-                metadata=dict(_REQUIRED_METADATA),
+                metadata=dict(_BASE_METADATA),
                 tiers=ADMIN_EVERYWHERE,
             )
     ctx["created"]["biosample"].append(result1.biosample_idx)
@@ -619,7 +620,7 @@ async def test_import_biosample_from_owner_biosample_id_rejects_non_transactiona
                 owner_biosample_id_field_name=unique_field_name(),
                 owner_biosample_id_value="GUARD-CHECK",
                 caller_idx=ctx["principal_idx"],
-                metadata=dict(_REQUIRED_METADATA),
+                metadata=dict(_BASE_METADATA),
                 tiers=ADMIN_EVERYWHERE,
             )
 
@@ -646,7 +647,7 @@ async def test_import_biosample_from_owner_biosample_id_writes_global_metadata(c
 
     field_name = unique_field_name()
     metadata_payload = {
-        **_REQUIRED_METADATA,
+        **_BASE_METADATA,
         f"Collection Date {suffix}": "2026-05-06",
         f"Latitude {suffix}": "32.7",
     }
@@ -748,7 +749,7 @@ async def test_import_biosample_from_owner_biosample_id_rejects_globally_linked_
                 owner_biosample_id_field_name=seed_owner_field,
                 owner_biosample_id_value="SEED-OWNER",
                 caller_idx=ctx["principal_idx"],
-                metadata={**_REQUIRED_METADATA, linked_name: "seed-value"},
+                metadata={**_BASE_METADATA, linked_name: "seed-value"},
                 tiers=ADMIN_EVERYWHERE,
             )
     ctx["created"]["biosample"].append(seed_result.biosample_idx)
@@ -769,7 +770,7 @@ async def test_import_biosample_from_owner_biosample_id_rejects_globally_linked_
                     owner_biosample_id_field_name=linked_name,
                     owner_biosample_id_value="DOOMED",
                     caller_idx=ctx["principal_idx"],
-                    metadata=dict(_REQUIRED_METADATA),
+                    metadata=dict(_BASE_METADATA),
                     biosample_accession=bs_acc,
                     tiers=ADMIN_EVERYWHERE,
                 )
@@ -784,12 +785,7 @@ async def test_import_biosample_from_owner_biosample_id_rejects_globally_linked_
 
 
 async def test_import_biosample_from_owner_biosample_id_minimal_metadata(ctx):
-    """The smallest legal import: only the enforced required field(s). The composer
-    writes the owner-id row plus one row per required field, and nothing else.
-
-    (This used to test truly-empty metadata skipping the global block; empty is no
-    longer legal — host_taxon_id is required — so the minimal case is now
-    'exactly the required set'.)"""
+    """The smallest legal import: empty metadata writes the owner-id row and nothing else."""
     field_name = unique_field_name()
 
     async with ctx["pool"].acquire() as conn:
@@ -801,14 +797,12 @@ async def test_import_biosample_from_owner_biosample_id_minimal_metadata(ctx):
                 owner_biosample_id_field_name=field_name,
                 owner_biosample_id_value="OWNER-EM-1",
                 caller_idx=ctx["principal_idx"],
-                metadata=dict(_REQUIRED_METADATA),
+                metadata={},
                 tiers=ADMIN_EVERYWHERE,
             )
     bs_idx = result.biosample_idx
     ctx["created"]["biosample"].append(bs_idx)
 
-    # Two metadata rows: the owner-id row, and the required host_taxon_id row
-    # (written as a missing-value marker). Nothing else.
     rows = await ctx["pool"].fetch(
         "SELECT bm.is_owner_biosample_id, bgf.internal_name"
         "  FROM qiita.biosample_metadata bm"
@@ -817,10 +811,7 @@ async def test_import_biosample_from_owner_biosample_id_minimal_metadata(ctx):
         " ORDER BY bm.is_owner_biosample_id DESC",
         bs_idx,
     )
-    assert [dict(r) for r in rows] == [
-        {"is_owner_biosample_id": True, "internal_name": None},
-        {"is_owner_biosample_id": False, "internal_name": "host_taxon_id"},
-    ]
+    assert [dict(r) for r in rows] == [{"is_owner_biosample_id": True, "internal_name": None}]
 
 
 async def test_import_biosample_from_owner_biosample_id_raises_on_unknown_metadata_field(ctx):
@@ -842,7 +833,7 @@ async def test_import_biosample_from_owner_biosample_id_raises_on_unknown_metada
                     owner_biosample_id_field_name=field_name,
                     owner_biosample_id_value="UNKNOWN",
                     caller_idx=ctx["principal_idx"],
-                    metadata={**_REQUIRED_METADATA, unknown_a: "x", unknown_b: "y"},
+                    metadata={**_BASE_METADATA, unknown_a: "x", unknown_b: "y"},
                     tiers=ADMIN_EVERYWHERE,
                 )
     assert sorted(excinfo.value.field_keys) == sorted([unknown_a, unknown_b])
@@ -873,7 +864,7 @@ async def test_import_biosample_from_owner_biosample_id_raises_on_metadata_parse
                     owner_biosample_id_field_name=field_name,
                     owner_biosample_id_value="PARSE-FAIL",
                     caller_idx=ctx["principal_idx"],
-                    metadata={**_REQUIRED_METADATA, numeric_field_name: "not-a-number"},
+                    metadata={**_BASE_METADATA, numeric_field_name: "not-a-number"},
                     tiers=ADMIN_EVERYWHERE,
                 )
     assert excinfo.value.field_key == numeric_field_name
@@ -927,7 +918,7 @@ async def test_import_biosample_from_owner_biosample_id_owner_id_missing_value_r
                     owner_biosample_id_field_name=field_name,
                     owner_biosample_id_value=reason_name,
                     caller_idx=ctx["principal_idx"],
-                    metadata=dict(_REQUIRED_METADATA),
+                    metadata=dict(_BASE_METADATA),
                     tiers=ADMIN_EVERYWHERE,
                 )
     assert excinfo.value.owner_biosample_id_value == reason_name
@@ -967,7 +958,7 @@ async def test_import_biosample_from_owner_biosample_id_owner_id_padded_marker_r
                     owner_biosample_id_field_name=field_name,
                     owner_biosample_id_value=padded_value,
                     caller_idx=ctx["principal_idx"],
-                    metadata=dict(_REQUIRED_METADATA),
+                    metadata=dict(_BASE_METADATA),
                     tiers=ADMIN_EVERYWHERE,
                 )
     # The raw padded value is preserved on the error so the user sees what they sent.
@@ -1018,7 +1009,7 @@ async def test_import_biosample_from_owner_biosample_id_metadata_missing_value_p
                 owner_biosample_id_field_name=field_name,
                 owner_biosample_id_value="OWNER-MV-1",
                 caller_idx=ctx["principal_idx"],
-                metadata={**_REQUIRED_METADATA, f"Latitude {suffix}": reason_name},
+                metadata={**_BASE_METADATA, f"Latitude {suffix}": reason_name},
                 tiers=ADMIN_EVERYWHERE,
             )
     bs_idx = result.biosample_idx
@@ -1069,7 +1060,7 @@ async def test_import_biosample_from_owner_biosample_id_writes_existing_local_fi
                 owner_biosample_id_field_name=field_name,
                 owner_biosample_id_value="OWNER-LOCAL-1",
                 caller_idx=ctx["principal_idx"],
-                metadata={**_REQUIRED_METADATA, local_name: "local-value"},
+                metadata={**_BASE_METADATA, local_name: "local-value"},
                 tiers=ADMIN_EVERYWHERE,
             )
     bs_idx = result.biosample_idx
@@ -1132,7 +1123,7 @@ async def test_import_biosample_from_owner_biosample_id_writes_alias_through_to_
                 owner_biosample_id_field_name=field_name,
                 owner_biosample_id_value="OWNER-ALIAS-1",
                 caller_idx=ctx["principal_idx"],
-                metadata={**_REQUIRED_METADATA, alias_name: "alias-value"},
+                metadata={**_BASE_METADATA, alias_name: "alias-value"},
                 tiers=ADMIN_EVERYWHERE,
             )
     bs_idx = result.biosample_idx
@@ -1193,7 +1184,7 @@ async def test_import_biosample_from_owner_biosample_id_raises_on_cross_field_co
                     owner_biosample_id_field_name=field_name,
                     owner_biosample_id_value="OWNER-CONFLICT-1",
                     caller_idx=ctx["principal_idx"],
-                    metadata={**_REQUIRED_METADATA, shared_name: "x"},
+                    metadata={**_BASE_METADATA, shared_name: "x"},
                     tiers=ADMIN_EVERYWHERE,
                 )
     assert excinfo.value.display_name == shared_name
@@ -1235,7 +1226,7 @@ async def test_import_biosample_from_owner_biosample_id_raises_on_duplicate_glob
                     owner_biosample_id_field_name=field_name,
                     owner_biosample_id_value="OWNER-DUP-1",
                     caller_idx=ctx["principal_idx"],
-                    metadata={**_REQUIRED_METADATA, global_label: "a", alias_name: "b"},
+                    metadata={**_BASE_METADATA, global_label: "a", alias_name: "b"},
                     tiers=ADMIN_EVERYWHERE,
                 )
     assert excinfo.value.global_field_idx == global_idx
@@ -1324,6 +1315,121 @@ async def test_fetch_biosample_idxs_for_study_respects_limit(ctx):
 
 
 # ---------------------------------------------------------------------------
+# fetch_study_idxs_by_biosample_idx / fetch_active_study_idxs_by_biosample_idx
+# ---------------------------------------------------------------------------
+
+
+async def _seed_active_and_retired_links(ctx):
+    """Seed two biosamples and a second study, and return
+    (mixed_idx, retired_only_idx, second_study_idx).
+
+    The mixed biosample has an active link to ctx['study_idx'] and a retired
+    link to the second study; the retired-only biosample's one link, to
+    ctx['study_idx'], is retired.
+    """
+    second_study_idx = await seed_study(
+        ctx["pool"], owner_idx=ctx["principal_idx"], title=f"bs-links-{secrets.token_hex(4)}"
+    )
+    ctx["created"]["studies"].append(second_study_idx)
+
+    # Mixed: active link to the fixture study, retired link to the second
+    mixed_idx = await _create_biosample_with_link(ctx)
+    await seed_biosample_to_study_link(
+        ctx["pool"],
+        biosample_idx=mixed_idx,
+        study_idx=second_study_idx,
+        created_by_idx=ctx["principal_idx"],
+    )
+    await retire_biosample_to_study_link(
+        ctx["pool"],
+        biosample_idx=mixed_idx,
+        study_idx=second_study_idx,
+        retired_by_idx=ctx["principal_idx"],
+    )
+
+    # Retired-only: its one link, to the fixture study, is retired
+    retired_only_idx = await _create_biosample_with_link(ctx)
+    await retire_biosample_to_study_link(
+        ctx["pool"],
+        biosample_idx=retired_only_idx,
+        study_idx=ctx["study_idx"],
+        retired_by_idx=ctx["principal_idx"],
+    )
+    return mixed_idx, retired_only_idx, second_study_idx
+
+
+async def test_fetch_study_idxs_by_biosample_idx_includes_retired(ctx):
+    """Tests the case where retired links are requested: every link row of each
+    biosample is returned, so a biosample whose only link is retired is present.
+    """
+    mixed_idx, retired_only_idx, second_study_idx = await _seed_active_and_retired_links(ctx)
+
+    result = await fetch_study_idxs_by_biosample_idx(
+        ctx["pool"], [mixed_idx, retired_only_idx], include_retired=True
+    )
+
+    expected = {
+        mixed_idx: [ctx["study_idx"], second_study_idx],
+        retired_only_idx: [ctx["study_idx"]],
+    }
+    assert result == expected
+
+
+async def test_fetch_study_idxs_by_biosample_idx_excludes_retired(ctx):
+    """Tests the case where retired links are not requested: only active links
+    are returned, and a biosample whose only link is retired is omitted.
+    """
+    mixed_idx, retired_only_idx, _ = await _seed_active_and_retired_links(ctx)
+
+    result = await fetch_study_idxs_by_biosample_idx(
+        ctx["pool"], [mixed_idx, retired_only_idx], include_retired=False
+    )
+
+    expected = {mixed_idx: [ctx["study_idx"]]}
+    assert result == expected
+
+
+@pytest.mark.parametrize("include_retired", [True, False])
+async def test_fetch_study_idxs_by_biosample_idx_ignores_biosample_retirement(ctx, include_retired):
+    """Tests the case where a biosample is retired but its link is active: the
+    link is returned whether or not retired links are requested, since only the
+    link's own retired flag counts.
+    """
+    retired_biosample_idx = await _create_biosample_with_link(ctx)
+    await retire_biosample(
+        ctx["pool"], biosample_idx=retired_biosample_idx, retired_by_idx=ctx["principal_idx"]
+    )
+
+    result = await fetch_study_idxs_by_biosample_idx(
+        ctx["pool"], [retired_biosample_idx], include_retired=include_retired
+    )
+
+    expected = {retired_biosample_idx: [ctx["study_idx"]]}
+    assert result == expected
+
+
+async def test_fetch_study_idxs_by_biosample_idx_empty_input(ctx):
+    """Tests the case where no biosample_idxs are given: the result is empty."""
+    result = await fetch_study_idxs_by_biosample_idx(ctx["pool"], [], include_retired=True)
+
+    assert result == {}
+
+
+async def test_fetch_active_study_idxs_by_biosample_idx_excludes_retired(ctx):
+    """Tests the case where the active-only read is used: it returns what the
+    general read returns with retired links excluded.
+    """
+    mixed_idx, retired_only_idx, _ = await _seed_active_and_retired_links(ctx)
+
+    result = await fetch_active_study_idxs_by_biosample_idx(
+        ctx["pool"], [mixed_idx, retired_only_idx]
+    )
+
+    expected = {mixed_idx: [ctx["study_idx"]]}
+    assert result == expected
+
+
+# ---------------------------------------------------------------------------
 # fetch_biosample
 # ---------------------------------------------------------------------------
 
@@ -1380,6 +1486,57 @@ async def test_fetch_biosample_returns_none_when_missing(ctx):
     # No biosample at idx=-1; the read returns None rather than raising.
     row = await fetch_biosample(ctx["pool"], -1)
     assert row is None
+
+
+async def test_fetch_biosample_lock_share_blocks_update(ctx):
+    """Tests the case where one transaction holds the biosample under a share lock:
+    an owner change from another transaction cannot take the row, so it fails at
+    its lock timeout rather than landing under the holder.
+    """
+    biosample_idx = await _create_biosample(ctx)
+
+    async with ctx["pool"].acquire() as holder, holder.transaction():
+        await fetch_biosample(holder, biosample_idx, lock="share")
+        async with ctx["pool"].acquire() as writer, writer.transaction():
+            await writer.execute(f"SET LOCAL lock_timeout = '{LOCK_PROBE_TIMEOUT}'")
+            with pytest.raises(asyncpg.LockNotAvailableError):
+                await writer.execute(
+                    "UPDATE qiita.biosample SET owner_idx = $2 WHERE idx = $1",
+                    biosample_idx,
+                    ctx["biosample_owner_idx"],
+                )
+
+
+async def test_fetch_biosample_lock_share_admits_fk_insert(ctx):
+    """Tests the case where one transaction holds the biosample under a share lock:
+    another transaction can still insert a row that references the biosample,
+    because the lock such an insert takes on it does not conflict.
+    """
+    biosample_idx = await _create_biosample(ctx)
+
+    async with ctx["pool"].acquire() as holder, holder.transaction():
+        await fetch_biosample(holder, biosample_idx, lock="share")
+        async with ctx["pool"].acquire() as writer:
+            # Roll the insert back so the fixture's teardown has nothing extra.
+            tr = writer.transaction()
+            await tr.start()
+            try:
+                await writer.execute(f"SET LOCAL lock_timeout = '{LOCK_PROBE_TIMEOUT}'")
+                await insert_entity_to_study(
+                    writer,
+                    spec=BIOSAMPLE_METADATA_SPEC,
+                    entity_idx=biosample_idx,
+                    study_idx=ctx["study_idx"],
+                    created_by_idx=ctx["principal_idx"],
+                )
+                link_count = await writer.fetchval(
+                    "SELECT count(*) FROM qiita.biosample_to_study WHERE biosample_idx = $1",
+                    biosample_idx,
+                )
+            finally:
+                await tr.rollback()
+
+    assert link_count == 1
 
 
 # ---------------------------------------------------------------------------
@@ -1844,6 +2001,47 @@ async def test_fetch_biosample_idxs_by_natural_key_returns_resolved(ctx, key, ma
         ctx["pool"], key=key, values=[hit_value, miss_value]
     )
     assert result == {hit_value: bs_idx}
+
+
+async def test_fetch_biosample_idxs_by_natural_key_export_entity_id(ctx):
+    """Tests the case where the key is export_entity_id: a biosample's own
+    export_entity_id resolves to it, and a study's export_entity_id does not
+    resolve as a biosample.
+    """
+    bs_idx = await _seed_full_biosample(
+        ctx,
+        owner_idx=ctx["biosample_owner_idx"],
+        bs_acc=unique_accession("LK-EE"),
+        ena_acc=unique_accession("LK-EE-ENA"),
+    )
+    bs_handle = await fetch_export_entity_id(ctx["pool"], kind="biosample", entity_idx=bs_idx)
+    study_handle = await fetch_export_entity_id(
+        ctx["pool"], kind="study", entity_idx=ctx["study_idx"]
+    )
+
+    result = await fetch_biosample_idxs_by_natural_key(
+        ctx["pool"], key="export_entity_id", values=[bs_handle, study_handle]
+    )
+    assert result == {bs_handle: bs_idx}
+
+
+async def test_fetch_biosample_idxs_by_natural_key_export_entity_id_excludes_retired(ctx):
+    """Tests the case where the key is export_entity_id and the biosample is
+    retired: its export_entity_id does not resolve.
+    """
+    bs_idx = await _seed_full_biosample(
+        ctx,
+        owner_idx=ctx["biosample_owner_idx"],
+        bs_acc=unique_accession("LK-EE-RET"),
+        ena_acc=unique_accession("LK-EE-RET-ENA"),
+    )
+    bs_handle = await fetch_export_entity_id(ctx["pool"], kind="biosample", entity_idx=bs_idx)
+    await retire_biosample(ctx["pool"], biosample_idx=bs_idx, retired_by_idx=ctx["principal_idx"])
+
+    result = await fetch_biosample_idxs_by_natural_key(
+        ctx["pool"], key="export_entity_id", values=[bs_handle]
+    )
+    assert result == {}
 
 
 async def test_fetch_biosample_idxs_by_natural_key_empty_values_short_circuits(ctx):

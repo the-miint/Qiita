@@ -4,6 +4,8 @@ import pytest
 
 from qiita_control_plane.repositories.exported_entity import (
     MissingExportedEntityError,
+    entity_idx_column,
+    export_entity_id_lookup,
     export_entity_id_select,
     fetch_exported_entities,
     require_export_entity_id,
@@ -147,11 +149,30 @@ def test_require_export_entity_id_raise_missing():
     assert actual == expected
 
 
-def test_export_entity_id_select_raise_bad_alias():
-    """Tests the case where the table alias is not a plain identifier.
+def test_entity_idx_column_raise_bad_kind():
+    """Tests the case where the kind is outside EntityKind.
 
-    The alias is interpolated into SQL text, so anything else is refused before it
-    reaches a query.
+    The kind reaches SQL text as a table and column name, so it is refused first.
     """
-    with pytest.raises(ValueError, match="plain SQL identifier"):
-        export_entity_id_select("study", alias="s; DROP TABLE qiita.study")
+    with pytest.raises(ValueError, match="invalid entity kind"):
+        entity_idx_column("study; DROP TABLE qiita.study")
+
+
+def test_export_entity_id_select():
+    """Tests the case where a study query selects its export_entity_id."""
+    actual = export_entity_id_select("study")
+    expected = (
+        "(SELECT export_entity_id FROM qiita.exported_entity ee"
+        " WHERE ee.study_idx = study.idx) AS export_entity_id"
+    )
+    assert actual == expected
+
+
+def test_export_entity_id_lookup():
+    """Tests the case where a biosample query keys a lookup on export_entity_id."""
+    actual = export_entity_id_lookup("biosample")
+    expected = (
+        "ee.export_entity_id",
+        " JOIN qiita.exported_entity ee ON ee.biosample_idx = biosample.idx",
+    )
+    assert actual == expected

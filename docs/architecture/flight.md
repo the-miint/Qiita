@@ -60,8 +60,9 @@ orders them itself. A DoAction that writes to the lake runs instead on one
 thread with order on, so what it writes keeps its source's order (`LakeWriter`
 in `qiita-data-plane/src/pool.rs` says why one thread). The size is a catalog budget
 too: each attached connection holds one lake-Postgres backend for as long as it
-lives, and every data-plane process on every host draws on the same
-`max_connections`.
+lives, each of up to `LOCK_SESSIONS` lake lock sessions (`qiita-data-plane/src/lake_locks.rs`)
+holds one more while it is open, and every data-plane process on every host draws on
+the same `max_connections`.
 
 ### DoGet stream compression
 

@@ -44,6 +44,18 @@ def test_run_concurrency_is_carried_only_when_set():
     assert set_.action_context == {"ena_study_accession": "PRJEB1234", "run_concurrency": 8}
 
 
+def test_restriction_and_force_are_carried_only_when_set():
+    base = {"sequenced_pool_idx": 7, "sequencing_run_idx": 3, "ena_study_accession": "PRJEB1"}
+    plain = build_download_ena_study_ticket(**base)
+    restricted = build_download_ena_study_ticket(
+        **base, ena_run_accessions=["ERR2", "ERR1"], force=True
+    )
+    assert "ena_run_accessions" not in plain.action_context
+    assert plain.force is False
+    assert restricted.action_context["ena_run_accessions"] == ["ERR1", "ERR2"]
+    assert restricted.force is True
+
+
 def test_action_id_version_pinned_against_the_synced_workflow():
     """The pinned constants must match the on-disk workflow YAML synced into
     qiita.action -- a drift would submit tickets against a non-existent action."""

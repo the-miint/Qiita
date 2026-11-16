@@ -4,8 +4,7 @@ The input is the raw dump the assemble step writes (one Parquet per miint reader
 myloasm's own names), built here from the committed myloasm 0.6.0 and 0.7.0 fixture.
 The output is the six staging Parquets register-files loads into the `myloasm_*`
 lake tables. Both read-name resolutions are covered: names that already are
-`sequence_idx` (a run whose assembler input was named that way), and names looked
-up through a `(read_id, sequence_idx)` table (an earlier run's tree).
+`sequence_idx`, and names looked up through a `(read_id, sequence_idx)` table.
 """
 
 from __future__ import annotations
@@ -128,8 +127,8 @@ def test_reads_become_sequence_idx_everywhere_they_appear(tmp_path: Path) -> Non
 
 
 def test_a_looked_up_name_lands_on_the_same_sequence_idx(tmp_path: Path) -> None:
-    """An earlier run's tree names reads by read_id; resolved through a lookup it
-    stages exactly what the same run named by sequence_idx stages."""
+    """A run whose reads are named by read_id, resolved through a lookup, stages
+    exactly what the same run named by sequence_idx stages."""
     named = myloasm_raw_dir(tmp_path / "a", "0.7.0", sequence_idx_names=True)
     by_id = myloasm_raw_dir(tmp_path / "b", "0.7.0", sequence_idx_names=False)
     expected = _stage(tmp_path / "x", named)
