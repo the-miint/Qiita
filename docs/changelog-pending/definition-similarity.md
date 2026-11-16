@@ -71,6 +71,12 @@
   while a `similar` pair names it (#874);** revoke the pair first. A `pending` or
   `not_similar` pair is detached by the delete. No route deletes these
   rows.
+- **Deleting a sequenced pool whose prep_samples have public `QM<n>` handles
+  (`exported_identifier`, either kind) succeeds and retires those handles (#874)**
+  instead of failing with a 500 on their foreign key. A retired handle keeps its
+  kind and records the biosample's accession and public `QB<n>` handle
+  (`named_biosample_accession`, `named_biosample_export_entity_id`). The same holds
+  for any other delete of a prep_sample.
 - **`qiita-admin ticket cancel` (`POST /api/v1/work-ticket/cancel`) also cancels a
   failed ticket named by idx (#874)**, clearing its `failure_*` columns (the control
   plane logs them) and reaping its SLURM jobs as for any cancel. The `--action-id`

@@ -13,6 +13,8 @@ cannot reach and a future migration could quietly drop:
   row detaches and retires it instead of deleting it. The trigger that does this
   is what makes the FK's `ON DELETE SET NULL` satisfy the check at all, so without
   it that delete fails outright.
+* So does it outlive its prep_sample: deleting the prep_sample retires it and
+  leaves the biosample's public description on it.
 * Retirement columns cannot disagree with each other.
 """
 
@@ -207,13 +209,60 @@ async def test_retirement_columns_cannot_disagree(postgres_pool, probe):
         )
 
 
-async def test_a_sample_with_a_published_identifier_cannot_be_hard_deleted(postgres_pool, probe):
-    """RESTRICT, not CASCADE: a published handle must not disappear because someone
-    removed the sample row underneath it."""
-    await _mint(postgres_pool, probe)
-    with pytest.raises(asyncpg.ForeignKeyViolationError):
+async def test_deleting_the_prep_sample_retires_the_identifier_and_keeps_what_it_named(
+    postgres_pool, probe
+):
+    """A published handle outlives its prep_sample: the delete nulls
+    `prep_sample_idx`, retires the row, and leaves the biosample's accession and
+    public handle on it."""
+    minted = await _mint(postgres_pool, probe)
+    biosample_idx = await postgres_pool.fetchval(
+        "SELECT biosample_idx FROM qiita.prep_sample WHERE idx = $1", probe["prep_sample_idx"]
+    )
+    accession = f"SAMEA{uuid.uuid4().int % 10**9}"
+    await postgres_pool.execute(
+        "UPDATE qiita.biosample SET biosample_accession = $2 WHERE idx = $1",
+        biosample_idx,
+        accession,
+    )
+    entity = await postgres_pool.fetchval(
+        "SELECT export_entity_id FROM qiita.exported_entity WHERE biosample_idx = $1",
+        biosample_idx,
+    )
+    assert entity is not None
+    try:
+        for table in ("alignment_sample", "sequenced_sample"):
+            await postgres_pool.execute(
+                f"DELETE FROM qiita.{table} WHERE prep_sample_idx = $1", probe["prep_sample_idx"]
+            )
         await postgres_pool.execute(
             "DELETE FROM qiita.prep_sample WHERE idx = $1", probe["prep_sample_idx"]
+        )
+
+        row = await postgres_pool.fetchrow(
+            "SELECT * FROM qiita.exported_identifier WHERE export_id = $1", minted["export_id"]
+        )
+        assert row["retired"] and row["retired_at"] is not None
+        assert row["retired_by_idx"] is None
+        assert "prep_sample this identifier named was deleted" in row["retire_reason"]
+        assert row["prep_sample_idx"] is None
+        assert row["alignment_idx"] == probe["alignment_idx"]
+        assert (row["named_biosample_accession"], row["named_biosample_export_entity_id"]) == (
+            accession,
+            entity,
+        )
+    finally:
+        await postgres_pool.execute(
+            "DELETE FROM qiita.exported_identifier WHERE idx = $1", minted["idx"]
+        )
+
+
+async def test_a_live_row_names_a_prep_sample(postgres_pool, probe):
+    with pytest.raises(asyncpg.CheckViolationError):
+        await postgres_pool.execute(
+            "INSERT INTO qiita.exported_identifier (alignment_idx, created_by_idx) VALUES ($1, $2)",
+            probe["alignment_idx"],
+            probe["principal_idx"],
         )
 
 

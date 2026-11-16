@@ -1301,7 +1301,8 @@ async def delete_sequenced_pool(
     study link they hold — not only the run/pool the operator is thinking of. It also
     deletes the qiita-origin genomes this pool's assemblies minted, which retires any
     published `QF<n>` handle naming one (`exported_feature.genome_idx` is ON DELETE SET
-    NULL behind a retire trigger).
+    NULL behind a retire trigger), and it retires every published `QM<n>` handle
+    naming one of the prep_samples (`delete_sequenced_pool_cascade` says how).
 
     Gating: in-flight work tickets (pending/queued/processing) block the delete
     unconditionally (409), as does a qiita-origin genome from one of these

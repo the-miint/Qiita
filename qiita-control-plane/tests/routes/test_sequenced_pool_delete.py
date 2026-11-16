@@ -13,6 +13,7 @@ data-plane failure leaves Postgres intact), and that the staged read copies are
 reaped. The DuckLake delete itself is covered by the Rust tests.
 """
 
+import hashlib
 import secrets
 import uuid
 
@@ -23,6 +24,7 @@ from qiita_common.api_paths import URL_SEQUENCED_POOL_BY_IDX, compute_reads_stag
 from qiita_common.assembly_constants import KIND_MAG
 from qiita_common.models import GenomeSource
 
+from qiita_control_plane.repositories.mask_definition import mint_mask_definition
 from qiita_control_plane.routes import sequencing_run as _sr_routes
 from qiita_control_plane.testing.db_seeds import (
     seed_bare_feature,
@@ -235,6 +237,80 @@ async def test_delete_pool_happy_path(admin_client, postgres_pool, human_admin_s
         )
     finally:
         await _cleanup(postgres_pool, ids)
+
+
+async def test_delete_pool_retires_its_published_identifiers(
+    admin_client, postgres_pool, human_admin_session
+):
+    """A prep_sample with public handles (both kinds) is deleted with its pool, and
+    each handle stays, retired, with the biosample's accession and its kind."""
+    owner = human_admin_session["principal_idx"]
+    ids = await _seed_pool_with_sample(postgres_pool, owner)
+    accession = f"SAMEA{secrets.randbelow(10**9)}"
+    await postgres_pool.execute(
+        "UPDATE qiita.biosample SET biosample_accession = $2 WHERE idx = $1",
+        ids["biosample_idx"],
+        accession,
+    )
+    alignment_idx = await postgres_pool.fetchval(
+        "SELECT (qiita.mint_alignment_definition($1, $2, $3)).alignment_idx",
+        hashlib.sha256(f"pool-delete-handles-{uuid.uuid4()}".encode()).digest(),
+        '{"probe": "pool-delete-handles"}',
+        owner,
+    )
+    async with postgres_pool.acquire() as conn:
+        mask_idx = (
+            await mint_mask_definition(
+                conn,
+                filter_workflow="read-mask",
+                filter_version="1.0.0",
+                params={"filter_workflow": "read-mask", "probe": str(uuid.uuid4())},
+                principal_idx=owner,
+            )
+        )["mask_idx"]
+    handles = await postgres_pool.fetch(
+        "INSERT INTO qiita.exported_identifier"
+        "       (alignment_idx, mask_idx, prep_sample_idx, created_by_idx)"
+        " VALUES ($1, NULL, $3, $4), (NULL, $2, $3, $4)"
+        " RETURNING idx, export_id",
+        alignment_idx,
+        mask_idx,
+        ids["prep_sample_idx"],
+        owner,
+    )
+    try:
+        resp = await admin_client.delete(_url(ids))
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["prep_sample_deleted"] == 1
+
+        rows = await postgres_pool.fetch(
+            "SELECT export_id, retired, retire_reason, prep_sample_idx, alignment_idx,"
+            "       mask_idx, named_biosample_accession"
+            "  FROM qiita.exported_identifier WHERE export_id = ANY($1::text[])"
+            " ORDER BY idx",
+            [h["export_id"] for h in handles],
+        )
+        assert [r["export_id"] for r in rows] == [h["export_id"] for h in handles]
+        for r in rows:
+            assert r["retired"] and r["prep_sample_idx"] is None
+            assert "prep_sample this identifier named was deleted" in r["retire_reason"]
+            assert r["named_biosample_accession"] == accession
+        assert [(r["alignment_idx"], r["mask_idx"]) for r in rows] == [
+            (alignment_idx, None),
+            (None, mask_idx),
+        ]
+    finally:
+        await postgres_pool.execute(
+            "DELETE FROM qiita.exported_identifier WHERE idx = ANY($1::bigint[])",
+            [h["idx"] for h in handles],
+        )
+        await _cleanup(postgres_pool, ids)
+        await postgres_pool.execute(
+            "DELETE FROM qiita.alignment_definition WHERE alignment_idx = $1", alignment_idx
+        )
+        await postgres_pool.execute(
+            "DELETE FROM qiita.mask_definition WHERE mask_idx = $1", mask_idx
+        )
 
 
 async def test_delete_pool_clears_completion_gate_rows(

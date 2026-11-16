@@ -13,9 +13,10 @@ from .mask_definition import lock_active_mask
 # information. Both accessions are LEFT-joined and nullable: an unaccessioned
 # sample still gets an export_id, which is the point of having one.
 #
-# `prep_sample` and `biosample` are INNER joins and cannot drop a row:
-# `exported_identifier.prep_sample_idx` is RESTRICT and `prep_sample.biosample_idx`
-# is NOT NULL + RESTRICT, so neither parent can vanish under a live identifier.
+# `prep_sample` and `biosample` are INNER joins and cannot drop a live row: a live
+# identifier names its prep_sample (`exported_identifier_live_names_prep_sample`;
+# deleting the prep_sample retires the row and nulls the column), and
+# `prep_sample.biosample_idx` is NOT NULL + RESTRICT.
 # `sequenced_sample` is LEFT because a prep_sample of a future non-sequenced
 # processing kind has no subtype row at all; it cannot duplicate a row either,
 # since its `prep_sample_idx` is UNIQUE.

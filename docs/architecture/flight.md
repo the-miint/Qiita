@@ -229,6 +229,9 @@ three migrations (`20260810000000_exported_identifier.sql`,
 the FORWARD PLAN comment in each is the copy to read before adding one.
 `20261113000001_exported_processing_mask.sql` adds the mask kind to
 `exported_identifier` and `exported_processing` that way.
+`20261116000002_exported_identifier_prep_sample_delete.sql` lets a prep_sample
+delete (a sequenced-pool delete) retire the `QM<n>` handles naming it, keeping the
+biosample's accession and public handle on the row.
 
 **The exported identifier is the boundary where our identifiers stop.** A
 published table names its samples `QM<n>`, never `prep_sample_idx` — see the
