@@ -334,8 +334,8 @@ class WorkTicket(BaseModel):
     # A cancel's reap mark: set while a cancel's reap of the ticket's SLURM jobs has not
     # succeeded, which blocks a redrive (`qiita.work_ticket.reap_pending_since` says
     # when it is set and cleared). `reap_note` is the in-flight marker or the reap's
-    # error; the ticket GETs return it to a system_admin only and None to every other
-    # caller (`routes/work_ticket.py`, `visible_reap_note`).
+    # error; the ticket GETs and `/run`'s 409 show it to a system_admin only
+    # (`routes/work_ticket.py`, `sees_reap_note`).
     reap_pending_since: AwareDatetime | None = None
     reap_note: str | None = None
     # The follow-on this ticket submits once it COMPLETES, and what became of

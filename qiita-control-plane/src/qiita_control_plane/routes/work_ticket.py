@@ -346,12 +346,17 @@ def _row_to_work_ticket(row: asyncpg.Record) -> WorkTicket:
     return WorkTicket.model_validate(_shape_work_ticket_columns(dict(row)))
 
 
+def sees_reap_note(principal: Principal) -> bool:
+    """Whether a route shows `principal` a failed reap's note: a system_admin only. The
+    note is the orchestrator client's exception text, which can name the orchestrator's
+    address and the SLURM error; `reap_pending_since` shows every caller who may read
+    the ticket that a reap is pending."""
+    return principal.has_role(SystemRole.SYSTEM_ADMIN)
+
+
 def visible_reap_note(ticket: WorkTicket, principal: Principal) -> WorkTicket:
-    """`ticket` with `reap_note` cleared unless `principal` is a system_admin. A failed
-    reap's note is the orchestrator client's exception text, which can name the
-    orchestrator's address and the SLURM error; `reap_pending_since` shows every caller
-    who may read the ticket that a reap is pending."""
-    if ticket.reap_note is None or principal.has_role(SystemRole.SYSTEM_ADMIN):
+    """`ticket` with `reap_note` cleared unless `sees_reap_note(principal)`."""
+    if ticket.reap_note is None or sees_reap_note(principal):
         return ticket
     return ticket.model_copy(update={"reap_note": None})
 
@@ -1014,7 +1019,10 @@ async def run_work_ticket(
             except ReapPending as exc:
                 raise HTTPException(
                     status_code=status.HTTP_409_CONFLICT,
-                    detail={"reason": exc.REASON, "detail": str(exc)},
+                    detail={
+                        "reason": exc.REASON,
+                        "detail": exc.message(with_note=sees_reap_note(principal)),
+                    },
                 ) from exc
             if not reset:
                 raise HTTPException(

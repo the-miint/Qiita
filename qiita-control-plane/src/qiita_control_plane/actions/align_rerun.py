@@ -442,7 +442,8 @@ async def _rearm(
             conn, work_ticket_idx=work_ticket_idx, from_state=state
         )
     except ReapPending as exc:
-        raise _refuse(exc.REASON, str(exc)) from exc
+        # rerun-block is system_admin only (its route), so the note is shown.
+        raise _refuse(exc.REASON, exc.message(with_note=True)) from exc
     if not reset:
         raise _refuse("state_changed", f"work_ticket {work_ticket_idx} changed state; retry")
     if rerun_of == WorkTicketState.COMPLETED:

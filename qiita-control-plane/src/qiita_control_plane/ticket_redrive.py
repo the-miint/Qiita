@@ -24,19 +24,28 @@ class ReapPending(Exception):
 
     def __init__(self, work_ticket_idx: int, pending_since: object, note: str) -> None:
         self.work_ticket_idx = work_ticket_idx
-        if note == REAP_IN_FLIGHT:
+        self.pending_since = pending_since
+        self.note = note
+        super().__init__(self.message(with_note=False))
+
+    def message(self, *, with_note: bool) -> str:
+        """The refusal text. A failed reap's note (the orchestrator client's error) is
+        included only when `with_note`; who may see it is the routes' call
+        (`routes/work_ticket.sees_reap_note`)."""
+        idx, since = self.work_ticket_idx, self.pending_since
+        if self.note == REAP_IN_FLIGHT:
             what = (
-                f"the reap of its SLURM jobs by a cancel started at {pending_since} has not"
+                f"the reap of its SLURM jobs by a cancel started at {since} has not"
                 " finished: it is running, or the cancel was interrupted"
             )
         else:
-            what = (
-                f"the reap of its SLURM jobs by a cancel started at {pending_since} failed: {note}"
-            )
-        super().__init__(
-            f"work_ticket {work_ticket_idx}: {what}. It is not redriven until a reap"
-            f" succeeds; reap it with `qiita-admin ticket cancel {work_ticket_idx}`"
-            f" (POST /work-ticket/cancel with work_ticket_idxs [{work_ticket_idx}])"
+            what = f"the reap of its SLURM jobs by a cancel started at {since} failed"
+            if with_note:
+                what += f": {self.note}"
+        return (
+            f"work_ticket {idx}: {what}. It is not redriven until a reap"
+            f" succeeds; reap it with `qiita-admin ticket cancel {idx}`"
+            f" (POST /work-ticket/cancel with work_ticket_idxs [{idx}])"
         )
 
 

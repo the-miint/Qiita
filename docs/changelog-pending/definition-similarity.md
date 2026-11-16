@@ -172,6 +172,7 @@
   `qiita-admin ticket cancel <idx>` to reap it again). The ticket reads (`GET
   /api/v1/work-ticket/{idx}`, `GET /api/v1/work-ticket`) return the mark:
   `reap_pending_since` to every caller who may read the ticket, `reap_note` to a
+  system_admin only; `/run`'s 409 includes the failed reap's error for a
   system_admin only.
 - **The definition-group resolver ignores a stale failed ticket (#874):** one created
   before the last change of the prep_sample's gate under that definition, when the
