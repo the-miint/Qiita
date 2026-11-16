@@ -154,7 +154,7 @@ def _load_subjects(conn, genomes_dir: Path, refined_bins_dir: Path) -> None:
     conn.execute(
         f"""
         CREATE TEMP TABLE contig AS
-        WITH read AS MATERIALIZED (
+        WITH fasta_record AS MATERIALIZED (
             SELECT fm.kind, COALESCE(fm.bin_id, rf.read_id) AS bin_id,
                    rf.read_id AS contig_id, rf.sequence_index, rf.sequence1,
                    {canonical_sequence_hash_expr("rf.sequence1")} AS sequence_hash,
@@ -162,8 +162,8 @@ def _load_subjects(conn, genomes_dir: Path, refined_bins_dir: Path) -> None:
                        AS reverse_complemented
             FROM {source} rf JOIN file_meta fm ON rf.filepath = fm.filepath),
         kept AS (
-            SELECT r.* FROM read r
-            ANTI JOIN (SELECT sequence_hash FROM read WHERE kind = $mag) b
+            SELECT r.* FROM fasta_record r
+            ANTI JOIN (SELECT sequence_hash FROM fasta_record WHERE kind = $mag) b
                 ON r.kind = $unbinned AND r.sequence_hash = b.sequence_hash
             WHERE r.kind <> $unbinned OR length(r.sequence1) >= $min_residue)
         SELECT dense_rank() OVER (ORDER BY kind, bin_id)::BIGINT AS genome_id, *,
@@ -366,7 +366,7 @@ def _write_checkm_files(conn, out: Path) -> int:
     """`<out>/<kind>/<bin_id>/genes.{faa,gff}` for each subject with `prodigal_checkm`
     genes. Returns how many subjects got them."""
     # In contig order, the order `prodigal_proteins` numbers contigs in. `record_id` is
-    # the id `prodigal_proteins` gives a gene's record, `<contig>_<gene>`.
+    # the record id `prodigal_proteins` gives a gene (the module docstring's link).
     conn.execute(
         """
         CREATE TEMP TABLE checkm_rows AS

@@ -116,7 +116,8 @@ Only rules whose trigger appears in the diff can fire.
 | A path that either creates an object or reuses an existing one (get-or-create, resolve-or-create, `INSERT … ON CONFLICT` followed by a read) | R4 |
 | A read that hides rows or values by the caller's permission; a timestamp, count, ETag or error detail returned beside them | R4 |
 | A Pydantic `Field(...)` constraint or a validation regex | R5 |
-| A table or staging file naming an entity by text columns (`kind`, a label, a name) where the system mints an id; a column named `parent_*`, or otherwise unlike its siblings' name for the same id | R5 |
+| A table or staging file naming an entity by text columns (a type, a label, a name) where the system mints an id | R8 |
+| A column named `parent_*`, or otherwise unlike its siblings' name for the same id | R5 |
 | Several values stored in one column with a non-empty separator; a hash, UUID or id cast to text | R5 |
 | A filename, digest, or identity input built from an absolute path or another host-specific value | R5 |
 | A new table storing sequence or per-entity result data | R5, R8, R9 |
@@ -129,7 +130,7 @@ Only rules whose trigger appears in the diff can fire.
 | Inline SQL against another component's tables | R7 |
 | An `_idx` composed into anything that leaves the system (an external alias, an exported filename or column, a submission payload) | R7 |
 | A `CAST` in a JOIN predicate or a projection, a producer `ORDER BY`, a new `DISTINCT`, an alias that renames nothing, `any_value`, a literal `IN (…)` list on a lake table, a repeated function call | R8 |
-| `IN (SELECT …)` / `NOT IN (SELECT …)`; a DELETE on a table built earlier in the same job; a temp table read once; a join predicate built by concatenation, a split or a parse | R8 |
+| `IN (SELECT …)` / `NOT IN (SELECT …)`; a DELETE trimming a table the previous statement built; a temp table read once; a join predicate built by concatenation, a split or a parse | R8 |
 | A row → Pydantic-model shaper; a wire column order derived from tool output (`a.* EXCLUDE …`) | R8 |
 | A new native job in `jobs/**`; `workflows/**`; a container def or workflow shell script | R9, R6, R1, R10 |
 | Two structurally similar code paths; an endpoint reading from two or more sources; a multi-statement mutation | R9 |
@@ -248,7 +249,6 @@ Safety must not rest on convention or a comment; and a guard must be real, so do
 - **Natural types.** Integer ids are `BIGINT`, not text. Never stringify a hash or a UUID; ask which path forces the text form.
 - **One value per cell.** Several values joined with a separator become a list type or rows. (`string_agg(chunk, '')` reassembling one sequence is not this.) Never a composite string key (`id:start-stop`): store the parts.
 - **An identity, dedup or join key is provably unique and stable**: never a nullable, legacy or free-text field; never an absolute path or another host-specific value (key on the path relative to the configured root, or on the logical id); and it carries every axis that selects the data.
-- **An entity the system mints an id for is named by that id.** A row naming a genome, contig or other minted entity by the text columns the id was minted from (`kind`, a bin name, a label) is the finding, even when the producer cannot know the id: its staging output carries the text, and the load resolves it.
 - **Referential integrity is enforced by the database where cheap.** A table keyed on another's ids has a foreign key.
 - Free-text vocabulary versus an enum: name the trade-off.
 - Default-empty collections: what does the empty case mean?
@@ -292,7 +292,7 @@ Safety must not rest on convention or a comment; and a guard must be real, so do
 - **A literal `IN (…)` list against a lake table**: ask for the plan. [soft]
 - **Winnow early**, within a query and across pipeline stages: filter before the expensive step. [soft]
 - **A wire column order derived from tool output needs a test pinning the column list.** [soft]
-- **A result table carries a join key to its sibling**: the minted idx, not a local id. [strong]
+- **A result table carries a join key to its sibling**: the minted idx, not a local id. [strong] This holds for the entity a row is about, too: when the system mints an id for an entity, a row that names it by the text columns its id was minted from (a type and a name) is the finding, even when the producer cannot know the id; its staging output carries the text, and the load resolves it.
 - **Build models from rows with `Model.model_validate(dict(row))`**, naming a column only when it needs a transform. [strong]
 
 ### R9 — Sibling convergence, storage patterns and job hygiene [strong]
@@ -333,7 +333,7 @@ When two similar code paths solve the same problem differently, factor out the s
 - **Never a bare "sample" where it reaches a human**: docs, `--help`, error bodies, failure reasons, test assertions, comments. `biosample` and `prep_sample` are different objects. Carve-out: control-plane code that handles both identically may say "sample". When this fires, sweep every prose surface the PR touches; cited sites are examples.
 - **Established field terms keep their field meaning.** A new behaviour gets its own name instead of borrowing one that means something else.
 - **A verb that collides with a programming term in the same sentence.** When a domain noun is also a programming word (a `*_field_exception` row, a work ticket), do not pair it with that word's programming verb: an exception that "raises" a tier reads as error handling, so say it "increases" the tier.
-- **A boolean is named for the condition it records.** A name stating an outcome that holds only in some cases (`flipped` for "read on the strand opposite the canonical one") is the finding; name the condition, and say in one line what it is true under.
+- **A boolean is named for the condition it records.** A name stating an outcome that holds only in some cases (a name saying something was done to the data, when the value only records that two forms of it differ) is the finding; name the condition, and say in one line what it is true under.
 - **Insider nouns in user-facing prose** are replaced with what the reader would call the thing.
 - **A provenance string in an exported artifact** (`generated_by`) names the product `qiita-miint`. [soft]
 

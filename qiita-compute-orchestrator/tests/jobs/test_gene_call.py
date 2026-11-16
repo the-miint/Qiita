@@ -174,7 +174,7 @@ def test_coordinates_cut_the_gene_from_the_canonical_strand(called):
             f"CASE g.strand WHEN '+' THEN {window} "
             f"ELSE sequence_dna_reverse_complement({window}) END"
         )
-        genes, wrong_hash, bad_start, on_reverse = conn.execute(
+        genes, wrong_hash, bad_start, on_reverse_complemented = conn.execute(
             f"""SELECT count(*),
                        count(*) FILTER (WHERE {canonical_sequence_hash_expr(window)}
                                         <> g.sequence_hash),
@@ -185,7 +185,7 @@ def test_coordinates_cut_the_gene_from_the_canonical_strand(called):
         ).fetchone()
     assert genes == _rows(out / gene_call.GENE_FILE, "SELECT count(*) FROM t")[0][0]
     assert (wrong_hash, bad_start) == (0, 0)
-    assert on_reverse > 0
+    assert on_reverse_complemented > 0
     # The lowercase contig is read on its canonical strand and carries genes, so a
     # strand test that skipped normalization would flip it and fail the counts above.
     s1 = files["refined/bin.2.fa"]["s1"]

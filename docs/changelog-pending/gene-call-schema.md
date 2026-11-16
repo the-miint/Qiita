@@ -12,9 +12,10 @@
 - **A `gene_call` job that calls those genes (#888).** A native job that
   runs Prodigal through miint's `predict_genes` on every bin or contig CheckM scores (each
   refined bin, circular contig and unbinned contig of 300 kb or more), once per call
-  set. It writes the rows for both tables, keyed by canonical sequence hashes for
-  minting, and each subject's `prodigal_checkm` genes as `genes.faa` and `genes.gff`
-  in the layout CheckM reads. No workflow runs it yet. It needs gpl-boundary 0.5.0 or
+  set. It writes the rows for both tables, naming contigs and genes by canonical
+  sequence hashes for minting, and each subject by its kind and bin for the load to
+  resolve to its `genome_idx`. It also writes each subject's `prodigal_checkm` genes as
+  `genes.faa` and `genes.gff` in the layout CheckM reads. No workflow runs it yet. It needs gpl-boundary 0.5.0 or
   later, and a miint build with `prodigal_proteins`.
 
 ### Changed
