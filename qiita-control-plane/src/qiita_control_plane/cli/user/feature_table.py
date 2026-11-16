@@ -1489,7 +1489,10 @@ def _left_out_identifiers(
     if not left_out:
         return []
     if cohort.listed_under is None:
-        raise RuntimeError("a cohort named with --prep-sample-idx leaves nothing out")
+        raise RuntimeError(
+            f"{len(left_out)} prep_sample(s) were left out of a cohort named with"
+            " --prep-sample-idx, which _skip_unprocessed returns whole"
+        )
     by_alignment: dict[int, list[SampleResolution]] = {}
     for entry in left_out:
         by_alignment.setdefault(max(cohort.listed_under[entry.prep_sample_idx]), []).append(entry)
