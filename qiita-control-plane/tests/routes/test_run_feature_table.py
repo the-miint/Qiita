@@ -177,7 +177,6 @@ async def test_samples_join_each_column_to_its_biosample(role_keyed_clients, amp
             "sample": qm,
             "export_id": qm,
             "biosample": await _qb(db, run["ps_a"]),
-            "processing_idx": run["processing_idx"],
         }
     ]
 

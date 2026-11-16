@@ -56,8 +56,6 @@ class FeatureTableSample(BaseModel):
     # The biosample's public name as the study's sample listing shows it
     # (accession, else QB): the key for joining the column to its metadata.
     biosample: str
-    # Which of the requested runs this column is from (echoed from the request).
-    processing_idx: int
 
 
 class FeatureTableSamples(BaseModel):

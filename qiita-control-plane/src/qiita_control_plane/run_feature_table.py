@@ -243,7 +243,6 @@ async def resolve_cohort(pool: asyncpg.Pool, request: FeatureTableRequest) -> Co
                 ),
                 export_id=r["export_id"],
                 biosample=r["biosample"],
-                processing_idx=r["processing_idx"],
             ),
         )
         for r in processed
