@@ -63,6 +63,7 @@ from qiita_common.models import (
     SampleResolutionReason,
     SampleResolutionState,
 )
+from qiita_common.models._base import MAX_COHORT_PREP_SAMPLE_IDX
 from qiita_common.parquet import PARQUET_MEDIA_TYPE
 from qiita_common.taxonomy import TAXONOMY_SOURCE_TABLE
 
@@ -81,6 +82,9 @@ from .alignment import (
     _fetch_alignment_cohort,
     _fetch_pool_alignments,
 )
+
+# The most prep_samples one /definition-group/resolve request carries: the route's cap.
+_RESOLVE_CHUNK = MAX_COHORT_PREP_SAMPLE_IDX
 
 # The registered arrow relations each REST response is staged through. Local to
 # this module: the shared builders read them once to CREATE the contract's
@@ -192,15 +196,39 @@ def _resolve_definition_group(
     prep_sample_idx: list[int],
 ) -> DefinitionGroupResolveResponse:
     """POST /definition-group/resolve: the named definition's group and, per prep_sample,
-    which member it is processed under or why it is not. The body goes through the
-    route's request model, so the cohort cap is checked here rather than after a round
-    trip, and the answer through its response model."""
-    body = DefinitionGroupResolveRequest(
-        definition_kind=kind, definition_idx=definition_idx, prep_sample_idx=prep_sample_idx
-    ).model_dump(mode="json")
+    which member it is processed under or why it is not.
+
+    The cohort is sent in chunks of at most `_RESOLVE_CHUNK` prep_samples, the route's
+    cap, so a cohort over the cap resolves when each chunk is under it. Each prep_sample
+    resolves on its own, so the chunks' samples are joined; a group that differs
+    between chunks (a pair decision committed between two requests) is refused rather
+    than joined. Each body goes through the route's request model and each answer
+    through its response model."""
+    samples = sorted(set(prep_sample_idx))
     path = f"{PATH_DEFINITION_GROUP_PREFIX}{PATH_DEFINITION_GROUP_RESOLVE}"
-    return DefinitionGroupResolveResponse.model_validate(
-        _common.call("POST", base_url, token, path, json=body)
+    # An empty cohort is still one request, which the request model refuses.
+    chunks = [
+        samples[start : start + _RESOLVE_CHUNK] for start in range(0, len(samples), _RESOLVE_CHUNK)
+    ] or [samples]
+    answers = []
+    for chunk in chunks:
+        body = DefinitionGroupResolveRequest(
+            definition_kind=kind, definition_idx=definition_idx, prep_sample_idx=chunk
+        ).model_dump(mode="json")
+        answers.append(
+            DefinitionGroupResolveResponse.model_validate(
+                _common.call("POST", base_url, token, path, json=body)
+            )
+        )
+    groups = {tuple(answer.group) for answer in answers}
+    if len(groups) > 1:
+        raise RuntimeError(
+            f"the group of {kind.value} {definition_idx} changed while its"
+            f" {len(samples)} prep_samples were resolved in {len(answers)} requests"
+            f" ({sorted(groups)}); a pair decision landed meanwhile. Run the build again."
+        )
+    return answers[0].model_copy(
+        update={"samples": [entry for answer in answers for entry in answer.samples]}
     )
 
 

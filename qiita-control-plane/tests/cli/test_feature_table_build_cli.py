@@ -2072,6 +2072,65 @@ def test_a_single_pool_build_is_one_part(monkeypatch, tmp_path):
     assert len([t for t in _FakeFlightClient.instances[0].tickets if t == _ALIGNMENT_TICKET]) == 1
 
 
+def _resolve_answer(definition_idx, group, samples):
+    return {
+        "definition_kind": "alignment",
+        "definition_idx": definition_idx,
+        "group": group,
+        "samples": [
+            {
+                **_UNRESOLVED,
+                "prep_sample_idx": s,
+                "definition_kind": "alignment",
+                "state": "processed",
+                "definition_idx": definition_idx,
+            }
+            for s in samples
+        ],
+    }
+
+
+def test_a_cohort_over_the_resolve_cap_is_resolved_in_chunks(monkeypatch):
+    """Each request carries at most the route's cap; the answers' samples are joined
+    in order, under the one group they all name."""
+    monkeypatch.setattr(ftc, "_RESOLVE_CHUNK", 2)
+    sent: list[list[int]] = []
+
+    def call(method, base_url, token, path, json):
+        sent.append(json["prep_sample_idx"])
+        return _resolve_answer(3, [3, 13], json["prep_sample_idx"])
+
+    monkeypatch.setattr(ftc._common, "call", call)
+    answer = ftc._resolve_definition_group(
+        "http://cp",
+        "t",
+        kind=DefinitionKind.ALIGNMENT,
+        definition_idx=3,
+        prep_sample_idx=[5, 1, 4, 2, 3],
+    )
+    assert sent == [[1, 2], [3, 4], [5]]
+    assert [s.prep_sample_idx for s in answer.samples] == [1, 2, 3, 4, 5]
+    assert answer.group == [3, 13]
+
+
+def test_a_group_that_changes_between_resolve_chunks_is_refused(monkeypatch):
+    monkeypatch.setattr(ftc, "_RESOLVE_CHUNK", 2)
+    groups = iter([[3, 13], [3]])
+
+    def call(method, base_url, token, path, json):
+        return _resolve_answer(3, next(groups), json["prep_sample_idx"])
+
+    monkeypatch.setattr(ftc._common, "call", call)
+    with pytest.raises(RuntimeError, match="changed while its 3 prep_samples were resolved"):
+        ftc._resolve_definition_group(
+            "http://cp",
+            "t",
+            kind=DefinitionKind.ALIGNMENT,
+            definition_idx=3,
+            prep_sample_idx=[1, 2, 3],
+        )
+
+
 def test_the_manifest_records_its_schema_version(monkeypatch, tmp_path):
     _patched(monkeypatch)
     assert ftc._handle_feature_table_build(_namespace(tmp_path), parser=None) == 0
