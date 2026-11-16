@@ -2,9 +2,10 @@
 
 Each prep_sample on the pool is resolved across the named mask's similarity group
 by the roster route; a `processed` one is exported from the mask named in its
-resolution, and the others are listed and skipped. The output directory carries a
-manifest (`MANIFEST_NAME`) naming, per exported file, the prep_sample's and the
-mask's public handles.
+resolution, and the others are listed and skipped. Each file is named by public
+identifiers only (`_export_stem`). The output directory carries a manifest
+(`MANIFEST_NAME`) naming, per exported file, the prep_sample's and the mask's public
+handles.
 """
 
 import argparse
@@ -36,6 +37,7 @@ from qiita_common.data_plane_errors import is_data_plane_transient
 from qiita_common.flight_constants import ipc_compression_headers
 from qiita_common.models import (
     MaskedReadExportSample,
+    SampleResolution,
     SampleResolutionState,
 )
 from qiita_common.models._base import MAX_COHORT_PREP_SAMPLE_IDX
@@ -266,18 +268,45 @@ def _fastq_names(stem: str, *, paired: bool) -> list[str]:
     return [f"{stem}.fastq.gz"]
 
 
-def _export_stem(sample: dict, run_idx, pool_idx) -> str:
+def _export_stem(biosample_accession: str, export_id: str) -> str:
     """Per-sample output filename stem, single-sourced so the export loop and the
-    fastq overwrite pre-scan can't drift: ``<accession>.<run>.<pool>.<prep_sample>``.
+    pre-scans can't drift: ``<biosample_accession>.<export_id>``, where `export_id` is
+    the prep_sample's handle under the mask it is exported from
+    (`POST /exported-identifier/mask`). Both are public; no `_idx` is in the name."""
+    return f"{biosample_accession}.{export_id}"
 
-    **This composite embeds our internal identifiers and predates the rule against
-    letting them leave Qiita** (see CLAUDE.md). It survives because this command is
-    system_admin-only and changing the stem would silently rename every existing
-    export and route around the `_SAFE_ACCESSION` charset check above. Do not copy
-    the shape to a new surface: a published artifact names its samples with
-    `qiita.exported_identifier.export_id`.
-    """
-    return f"{sample['biosample_accession']}.{run_idx}.{pool_idx}.{sample['prep_sample_idx']}"
+
+def _legacy_stem(
+    biosample_accession: str, run_idx: int, pool_idx: int, prep_sample_idx: int
+) -> str:
+    """The stem that exports written before `_export_stem` carried:
+    ``<biosample_accession>.<run>.<pool>.<prep_sample>``. Read only to find and replace
+    such files under `--adopt-unrecorded`; nothing is written under it."""
+    return f"{biosample_accession}.{run_idx}.{pool_idx}.{prep_sample_idx}"
+
+
+# The data files this command writes, by name: `_export_stem` (the export_id is
+# 'QM' || idx, `qiita.exported_identifier`) and `_legacy_stem`, each followed by a
+# suffix `_candidate_names` produces. A name matching neither is not an export data
+# file and is never counted, rewritten or removed.
+_DATA_SUFFIX = r"\.(?:parquet|fastq\.gz|R[12]\.fastq\.gz)$"
+_EXPORT_NAME = re.compile(r"^[A-Za-z0-9._-]+\.QM[0-9]+" + _DATA_SUFFIX)
+_LEGACY_NAME = re.compile(r"^[A-Za-z0-9._-]+\.[0-9]+\.[0-9]+\.[0-9]+" + _DATA_SUFFIX)
+
+
+def _unrecorded_files(output_dir: Path, recorded: dict[str, dict]) -> list[str]:
+    """The export data files in `output_dir` that its manifest does not record, sorted:
+    a file named by `_EXPORT_NAME` with no manifest entry, and every file named by
+    `_LEGACY_NAME`, which no manifest of the current naming records."""
+    return sorted(
+        entry.name
+        for entry in output_dir.iterdir()
+        if entry.is_file()
+        and (
+            _LEGACY_NAME.match(entry.name)
+            or (_EXPORT_NAME.match(entry.name) and entry.name not in recorded)
+        )
+    )
 
 
 def _parquet_row_count(path: Path) -> int:
@@ -356,15 +385,20 @@ def _write_export_manifest(output_dir: Path, files: dict[str, dict]) -> None:
         raise
 
 
-def _record_in_export_manifest(output_dir: Path, entries: dict[str, dict]) -> None:
-    """Merge `entries` into `output_dir`'s manifest. Under an exclusive `flock` on the
-    directory itself, the manifest is re-read, so the entries another run recorded
-    since this one read it are kept, and then replaced (`_write_export_manifest`).
-    The manifest cannot carry the lock: each write replaces it with a new file."""
+def _record_in_export_manifest(
+    output_dir: Path, entries: dict[str, dict], *, drop: list[str] = ()
+) -> None:
+    """Merge `entries` into `output_dir`'s manifest and drop the entries named in
+    `drop`. Under an exclusive `flock` on the directory itself, the manifest is re-read,
+    so the entries another run recorded since this one read it are kept, and then
+    replaced (`_write_export_manifest`). The manifest cannot carry the lock: each write
+    replaces it with a new file."""
     fd = os.open(output_dir, os.O_RDONLY)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
         files = _read_export_manifest(output_dir)
+        for name in drop:
+            files.pop(name, None)
         files.update(entries)
         _write_export_manifest(output_dir, files)
     finally:
@@ -412,41 +446,81 @@ def _left_out_lines(samples: list[MaskedReadExportSample]) -> list[str]:
     return [s.resolution.describe() for s in samples]
 
 
+def _refusal_line(prep_sample_idx: int, response: httpx.Response) -> str:
+    """One line for a prep_sample whose export ticket was refused (409) partway through
+    the run: the resolution and refusal code when the route names them, else the gate
+    state, else the route's detail."""
+    try:
+        detail = response.json().get("detail")
+    except ValueError:
+        detail = response.text
+    if isinstance(detail, dict) and isinstance(detail.get("resolution"), dict):
+        resolution = SampleResolution.model_validate(detail["resolution"])
+        return f"{resolution.describe()}; refused: {detail.get('reason')}"
+    if isinstance(detail, dict) and "mask_state" in detail:
+        return (
+            f"prep_sample {prep_sample_idx}: refused, mask_sample.state="
+            f"{detail['mask_state']!r} under mask {detail.get('mask_idx')}"
+        )
+    return f"prep_sample {prep_sample_idx}: refused: {str(detail)[:200]}"
+
+
+def _few(names: list[str], limit: int = 5) -> str:
+    shown = ", ".join(names[:limit])
+    return shown if len(names) <= limit else f"{shown}, …"
+
+
 def _handle_masked_read_export(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
     """Export the masked reads of every (non-retired) prep_sample on a sequenced_pool
     that is processed in `--mask-idx`'s similarity group, each from the mask it
-    resolved to, to per-sample files. system_admin only (admin:masked_read_export).
+    resolved to, to per-sample files named `<biosample_accession>.<export_id>`
+    (`_export_stem`). system_admin only (admin:masked_read_export).
 
     GETs the roster manifest, which resolves each prep_sample across the group (409 when
     `--mask-idx` is deprecated). A prep_sample that is `incomplete` or `not_processed`
-    is not exported; the run lists them, with the reason, on stderr after the
-    summary, and still exits 0 when every processed prep_sample was exported. For each
-    processed prep_sample it mints a just-in-time DoGet ticket under the prep_sample's mask
-    and streams its read_masked rows from the data plane straight to disk (parquet
-    via a pyarrow ParquetWriter; fastq.gz via one shared miint DuckDB connection
-    reused across every prep_sample) — so a large pool never buffers in memory or on an
+    is not exported, and neither is one whose export ticket is refused (409) partway
+    through the run because its resolution changed since the roster was read; the run
+    lists them, with the reason, on stderr after the summary. For each processed
+    prep_sample it mints a just-in-time DoGet ticket under the prep_sample's mask and
+    streams its read_masked rows from the data plane straight to disk (parquet via a
+    pyarrow ParquetWriter; fastq.gz via one shared miint DuckDB connection reused
+    across every prep_sample) — so a large pool never buffers in memory or on an
     intermediate disk hop. Per-sample writes are atomic and 0600.
 
-    Before any download it mints the public handle of each mask exported from and,
-    once past every refusal below, of each prep_sample under its mask. After each
-    prep_sample's files are committed, or its parquet is found up to date, it records
-    them in the output directory's manifest (`MANIFEST_NAME`): file name → prep_sample
-    handle, biosample accession, mask handle.
+    **Exit status.** 0 when every roster prep_sample was exported or found up to
+    date. 1 when any was left out, unless `--allow-partial`; 1 when none was exported
+    or up to date, with or without `--allow-partial`. The files written are kept and
+    recorded either way.
 
-    Fails loudly (exit 1, nothing written), in this order, when:
+    Fails loudly (exit 1), in this order, before any mint or download when:
       - a processed prep_sample lacks a usable biosample_accession (missing — not yet
         NCBI-submitted — or outside the safe charset), since the filename needs it;
-      - fastq output: any target file already exists (below);
+      - no roster prep_sample is processed;
+      - the output directory holds an export data file that its manifest does not
+        record (`_unrecorded_files`, which counts every file of the earlier
+        `_legacy_stem` naming), unless `--adopt-unrecorded`.
+    It then mints the public handle of each mask exported from and of each prep_sample
+    under its mask, which the file names need, and fails (exit 1), before any download,
+    when:
+      - fastq output: a target file that the manifest records already exists;
       - an existing output file is recorded in the manifest under a different mask's
-        handle: re-exporting it would replace one mask's reads with another's
-        under the same name. This check needs the masks' handles, so a run it
-        refuses has minted those, and no prep_sample handle.
+        handle: re-exporting it would replace one mask's reads with another's under
+        the same name.
 
-    A file that the manifest records under the same mask, or does not record, is
-    re-exported idempotently for parquet: skipped when its record count matches the
-    data plane's (nothing changed), overwritten when the counts differ. fastq has no
-    cheap on-disk count, so an existing fastq target is refused up front rather
-    than re-exported or overwritten.
+    A recorded parquet file under the same mask is re-exported idempotently: skipped
+    when its record count matches the data plane's, overwritten when the counts differ.
+    fastq has no cheap on-disk count, so an existing recorded fastq target is refused.
+
+    **`--adopt-unrecorded`.** An unrecorded file that this run writes is rewritten from
+    the current resolution (never skipped as up to date) and recorded. A file of the
+    earlier naming for a prep_sample this run exports in the same format is replaced:
+    the new-named file is written and recorded first, then the old one is removed. An
+    unrecorded file that this run does not write (another pool's, another format's, or a
+    prep_sample left out) is left in place and listed.
+
+    After each prep_sample's files are committed, or its parquet is found up to date,
+    it records them in the output directory's manifest (`MANIFEST_NAME`): file name →
+    prep_sample handle, biosample accession, mask handle.
 
     A prep_sample whose export fails because the data plane or the control plane is
     unreachable is exported again from the start, for up to `--retry-seconds`
@@ -497,22 +571,25 @@ def _handle_masked_read_export(args: argparse.Namespace, parser: argparse.Argume
     pool_idx = roster["sequenced_pool_idx"]
     if not samples:
         print(
-            f"no prep_samples on sequenced_pool {pool_idx} for mask_idx {args.mask_idx}; "
-            "nothing to export"
-        )
-        return 0
-    processed = [s for s in samples if s.resolution.state is SampleResolutionState.PROCESSED]
-    left_out = [s for s in samples if s.resolution.state is not SampleResolutionState.PROCESSED]
-
-    def print_left_out() -> None:
-        if not left_out:
-            return
-        print(
-            f"not exported: {len(left_out)} prep_sample(s) on sequenced_pool {pool_idx} are"
-            f" not processed in mask_idx {args.mask_idx}'s group:",
+            f"error: no prep_samples on sequenced_pool {pool_idx} for mask_idx"
+            f" {args.mask_idx}; nothing to export",
             file=sys.stderr,
         )
-        for line in _left_out_lines(left_out):
+        return 1
+    processed = [s for s in samples if s.resolution.state is SampleResolutionState.PROCESSED]
+    left_out_lines = _left_out_lines(
+        [s for s in samples if s.resolution.state is not SampleResolutionState.PROCESSED]
+    )
+
+    def print_left_out() -> None:
+        if not left_out_lines:
+            return
+        print(
+            f"not exported: {len(left_out_lines)} prep_sample(s) on sequenced_pool {pool_idx}"
+            f" are not processed in mask_idx {args.mask_idx}'s group, or were refused:",
+            file=sys.stderr,
+        )
+        for line in left_out_lines:
             print(f"  {line}", file=sys.stderr)
 
     # Validate every exported prep_sample's accession up front so an unsubmitted/odd
@@ -531,32 +608,78 @@ def _handle_masked_read_export(args: argparse.Namespace, parser: argparse.Argume
         )
         return 1
     if not processed:
-        print(f"exported 0 prep_sample(s) from sequenced_pool {pool_idx} to {output_dir}")
+        print(
+            f"error: exported 0 prep_sample(s) from sequenced_pool {pool_idx} to {output_dir}",
+            file=sys.stderr,
+        )
         print_left_out()
-        return 0
+        return 1
 
-    stems = {s.prep_sample_idx: _export_stem(s.model_dump(), run_idx, pool_idx) for s in processed}
-    samples_by_mask: dict[int, list[int]] = {}
-    for s in processed:
-        samples_by_mask.setdefault(s.resolution.definition_idx, []).append(s.prep_sample_idx)
     try:
         recorded = _read_export_manifest(output_dir)
+        unrecorded = _unrecorded_files(output_dir, recorded)
     except (ValueError, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
+    if unrecorded and not args.adopt_unrecorded:
+        print(
+            f"error: {output_dir} holds {len(unrecorded)} export file(s) that"
+            f" {MANIFEST_NAME} does not record ({_few(unrecorded)}). Re-run with"
+            " --adopt-unrecorded to rewrite this run's from the current resolution and"
+            " record them, replacing files of the earlier <accession>.<run>.<pool>."
+            "<prep_sample> naming.",
+            file=sys.stderr,
+        )
+        return 1
+
+    samples_by_mask: dict[int, list[int]] = {}
+    for s in processed:
+        samples_by_mask.setdefault(s.resolution.definition_idx, []).append(s.prep_sample_idx)
+    # Every refusal that does not need a file name is behind us. The names carry each
+    # prep_sample's handle, so the handles are minted before the checks that read names.
+    try:
+        mask_handles = _mint_mask_handles(args.base_url, token, list(samples_by_mask))
+        sample_handles = _mint_sample_handles(args.base_url, token, samples_by_mask)
+    except httpx.HTTPStatusError as exc:
+        _common.print_http_status_error(exc.response)
+        return 1
+    except httpx.RequestError as exc:
+        _common.print_request_error(exc)
+        return 1
+
+    stems = {
+        s.prep_sample_idx: _export_stem(s.biosample_accession, sample_handles[s.prep_sample_idx])
+        for s in processed
+    }
+    legacy = {
+        s.prep_sample_idx: [
+            name
+            for name in _candidate_names(
+                _legacy_stem(s.biosample_accession, run_idx, pool_idx, s.prep_sample_idx),
+                args.format,
+            )
+            if name in unrecorded
+        ]
+        for s in processed
+    }
+    targets = {prep: _candidate_names(stem, args.format) for prep, stem in stems.items()}
+    adopted = {name for names in targets.values() for name in names if name in unrecorded}
+    left_in_place = sorted(
+        set(unrecorded) - adopted - {name for names in legacy.values() for name in names}
+    )
 
     # fastq output is never overwritten: a gzipped fastq has no cheap footer to
     # count (unlike parquet), and a paired sample's two files make a count-vs-disk
-    # compare ambiguous. So for fastq, refuse up front if any target name already
-    # exists — fail loudly before streaming rather than clobber a prior export.
+    # compare ambiguous. So for fastq, refuse up front if any recorded target name
+    # already exists — fail loudly before streaming rather than clobber a prior export.
     # (parquet re-export is decided per-sample by the count probe in the loop.)
     if args.format == "fastq":
-        existing = [
-            str(p)
-            for s in processed
-            for name in _candidate_names(stems[s.prep_sample_idx], "fastq")
-            if (p := output_dir / name).exists()
-        ]
+        existing = sorted(
+            str(output_dir / name)
+            for names in targets.values()
+            for name in names
+            if name not in adopted and (output_dir / name).exists()
+        )
         if existing:
             print(
                 f"error: refusing to overwrite {len(existing)} existing fastq file(s) in "
@@ -566,25 +689,13 @@ def _handle_masked_read_export(args: argparse.Namespace, parser: argparse.Argume
             )
             return 1
 
-    # The mask handles come first: the conflict check compares each recorded file's
-    # handle with its mask's. The prep_sample handles, which name prep_samples, are
-    # minted only once the run is past every refusal.
-    try:
-        mask_handles = _mint_mask_handles(args.base_url, token, list(samples_by_mask))
-    except httpx.HTTPStatusError as exc:
-        _common.print_http_status_error(exc.response)
-        return 1
-    except httpx.RequestError as exc:
-        _common.print_request_error(exc)
-        return 1
-
     # A file the manifest records under another mask's handle holds that mask's
     # reads; refuse the whole export before any download rather than replace them.
     conflicts = sorted(
         f"{name} (recorded under {recorded[name]['export_processing_id']},"
         f" now {mask_handles[s.resolution.definition_idx]})"
         for s in processed
-        for name in _candidate_names(stems[s.prep_sample_idx], args.format)
+        for name in targets[s.prep_sample_idx]
         if name in recorded
         and (output_dir / name).exists()
         and recorded[name]["export_processing_id"] != mask_handles[s.resolution.definition_idx]
@@ -596,15 +707,6 @@ def _handle_masked_read_export(args: argparse.Namespace, parser: argparse.Argume
             " them aside first.",
             file=sys.stderr,
         )
-        return 1
-
-    try:
-        sample_handles = _mint_sample_handles(args.base_url, token, samples_by_mask)
-    except httpx.HTTPStatusError as exc:
-        _common.print_http_status_error(exc.response)
-        return 1
-    except httpx.RequestError as exc:
-        _common.print_request_error(exc)
         return 1
 
     # Only the fastq path feeds Flight batches into DuckDB (the miint FORMAT FASTQ
@@ -636,6 +738,8 @@ def _handle_masked_read_export(args: argparse.Namespace, parser: argparse.Argume
     flight_client = None
     exported = 0
     skipped = 0
+    replaced = 0
+    removed = 0
     try:
         # The fastq writer needs a miint DuckDB connection; open it once and reuse
         # it across all samples (each sample re-registers the `masked` view) rather
@@ -647,8 +751,11 @@ def _handle_masked_read_export(args: argparse.Namespace, parser: argparse.Argume
             prep = s.prep_sample_idx
             stem = stems[prep]
             mask_idx = s.resolution.definition_idx
+            rewrite = any(name in adopted for name in targets[prep])
 
-            def export_one(prep=prep, stem=stem, mask_idx=mask_idx) -> tuple[list[str], bool]:
+            def export_one(
+                prep=prep, stem=stem, mask_idx=mask_idx, rewrite=rewrite
+            ) -> tuple[list[str], bool]:
                 """Export one prep_sample. Returns its file names and whether they were
                 written (False when its parquet was already up to date)."""
                 # A fresh ticket per attempt: one minted before a long outage may
@@ -662,11 +769,11 @@ def _handle_masked_read_export(args: argparse.Namespace, parser: argparse.Argume
                 )
                 ticket_bytes = base64.b64decode(ticket_resp["ticket"])
                 # Idempotent parquet re-export: only probe the data plane's count
-                # when the output file already exists (a first export pays
+                # when a recorded output file already exists (a first export pays
                 # nothing), then skip on a match (nothing changed) and fall through
-                # to overwrite on a mismatch. fastq took the all-or-nothing
-                # existence check above, so it always exports here.
-                if args.format == "parquet":
+                # to overwrite on a mismatch. An adopted file is always rewritten, and
+                # fastq took the all-or-nothing existence check above, so both export.
+                if args.format == "parquet" and not rewrite:
                     target = output_dir / f"{stem}.parquet"
                     if target.exists() and _parquet_row_count(target) == _count_masked(
                         flight_client, ticket_bytes
@@ -675,7 +782,14 @@ def _handle_masked_read_export(args: argparse.Namespace, parser: argparse.Argume
                 reader = flight_client.do_get(flight.Ticket(ticket_bytes), read_opts).to_reader()
                 return _write_masked_sample(reader, stem, output_dir, args.format, con), True
 
-            names, written = _with_retry(export_one, prep, args.retry_seconds)
+            try:
+                names, written = _with_retry(export_one, prep, args.retry_seconds)
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code != 409:
+                    raise
+                left_out_lines.append(_refusal_line(prep, exc.response))
+                left_in_place.extend(legacy[prep])
+                continue
             if written:
                 exported += 1
             else:
@@ -685,7 +799,16 @@ def _handle_masked_read_export(args: argparse.Namespace, parser: argparse.Argume
                 "biosample_accession": s.biosample_accession,
                 "export_processing_id": mask_handles[mask_idx],
             }
-            _record_in_export_manifest(output_dir, {name: entry for name in names})
+            _record_in_export_manifest(
+                output_dir, {name: entry for name in names}, drop=legacy[prep]
+            )
+            # The new-named files are written and recorded; only now is the file of the
+            # earlier naming that they replace removed.
+            if legacy[prep]:
+                replaced += 1
+                for name in legacy[prep]:
+                    (output_dir / name).unlink()
+                    removed += 1
     except httpx.HTTPStatusError as exc:
         _common.print_http_status_error(exc.response)
         return 1
@@ -714,6 +837,30 @@ def _handle_masked_read_export(args: argparse.Namespace, parser: argparse.Argume
     summary = f"exported {exported} prep_sample(s)"
     if skipped:
         summary += f" (skipped {skipped} already up to date)"
+    if replaced:
+        summary += (
+            f"; replaced the earlier-named files of {replaced} prep_sample(s),"
+            f" removing {removed} file(s)"
+        )
     print(f"{summary} from sequenced_pool {pool_idx} to {output_dir}")
+    left_in_place.sort()
+    if left_in_place:
+        print(
+            f"note: left {len(left_in_place)} unrecorded export file(s) in place that this"
+            f" run does not write ({_few(left_in_place)}); export the pool, format or"
+            " prep_sample they belong to with --adopt-unrecorded",
+            file=sys.stderr,
+        )
     print_left_out()
+    if exported + skipped == 0:
+        print("error: no prep_sample was exported", file=sys.stderr)
+        return 1
+    if left_out_lines and not args.allow_partial:
+        print(
+            f"error: {len(left_out_lines)} prep_sample(s) were not exported; the files"
+            " written are kept and recorded. Pass --allow-partial to accept a partial"
+            " export.",
+            file=sys.stderr,
+        )
+        return 1
     return 0

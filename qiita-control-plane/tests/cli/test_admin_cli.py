@@ -1002,8 +1002,8 @@ def test_masked_read_export_writes_parquet_per_sample(monkeypatch, tmp_path):
         assert opt.read_options.ensure_alignment == _ipc.Alignment.Any
         assert opt.headers == []
 
-    f_a = out_dir / "SAMN_A.5.7.42.parquet"
-    f_b = out_dir / "SAMN_B.5.7.43.parquet"
+    f_a = out_dir / "SAMN_A.QM542.parquet"
+    f_b = out_dir / "SAMN_B.QM543.parquet"
     assert f_a.is_file() and f_b.is_file()
     assert (f_a.stat().st_mode & 0o777) == 0o600
     rows_a = (
@@ -1131,12 +1131,12 @@ def test_masked_read_export_retries_a_sample_whose_stream_dropped(monkeypatch, t
     assert _run_parquet_export(cli, out_dir) == 0
     assert client.instances[0].do_get_calls == [42, 42, 42, 43]
     assert tickets == [42, 42, 42, 43]
-    f_a = out_dir / "SAMN_A.5.7.42.parquet"
+    f_a = out_dir / "SAMN_A.QM542.parquet"
     n = duckdb.connect(":memory:").execute(f"SELECT count(*) FROM read_parquet('{f_a}')")
     assert n.fetchone()[0] == 2
     assert sorted(p.name for p in out_dir.iterdir()) == [
-        "SAMN_A.5.7.42.parquet",
-        "SAMN_B.5.7.43.parquet",
+        "SAMN_A.QM542.parquet",
+        "SAMN_B.QM543.parquet",
         "masked-read-export.manifest.json",
     ]
 
@@ -1264,12 +1264,12 @@ def test_masked_read_export_empty_sample_parquet(monkeypatch, tmp_path):
         ]
     )
     assert rc == 0
-    f = out_dir / "SAMN_A.5.7.42.parquet"
+    f = out_dir / "SAMN_A.QM542.parquet"
     assert f.is_file()
     assert (f.stat().st_mode & 0o777) == 0o600
     assert duckdb.connect(":memory:").execute(f"SELECT count(*) FROM '{f}'").fetchone()[0] == 0
     assert sorted(p.name for p in out_dir.iterdir()) == [
-        "SAMN_A.5.7.42.parquet",
+        "SAMN_A.QM542.parquet",
         "masked-read-export.manifest.json",
     ]
 
@@ -1320,7 +1320,7 @@ def test_masked_read_export_parquet_coalesces_row_groups(monkeypatch, tmp_path):
         ]
     )
     assert rc == 0
-    f = out_dir / "SAMN_A.5.7.42.parquet"
+    f = out_dir / "SAMN_A.QM542.parquet"
     md = pq.ParquetFile(f).metadata
     assert md.num_rows == 12
     assert md.num_row_groups == 1  # coalesced, not one row group per input batch
@@ -1593,9 +1593,10 @@ def test_masked_read_export_aborts_on_unsafe_accession(monkeypatch, tmp_path, ca
     assert list(out_dir.iterdir()) == []
 
 
-def _export_argv(out_dir, fmt="parquet"):
+def _export_argv(out_dir, fmt="parquet", *extra):
     return [
         "masked-read-export",
+        *extra,
         "--sequenced-pool-idx",
         "7",
         "--mask-idx",
@@ -1676,8 +1677,8 @@ def test_masked_read_export_exports_each_processed_sample_from_its_mask(
     monkeypatch, tmp_path, capsys
 ):
     """Across a group: each processed sample is exported under the mask it resolved
-    to, the rest are listed on stderr with their reason and skipped, the run exits 0,
-    and the manifest names each file by public handles only."""
+    to, the rest are listed on stderr with their reason and skipped, the run exits 0
+    under --allow-partial, and the manifest names each file by public handles only."""
     import json as _json
 
     from qiita_control_plane.cli import _common
@@ -1692,7 +1693,7 @@ def test_masked_read_export_exports_each_processed_sample_from_its_mask(
     monkeypatch.setattr("pyarrow.flight.FlightClient", fake_cls)
 
     out_dir = tmp_path / "exp"
-    assert cli.main(_export_argv(out_dir)) == 0
+    assert cli.main(_export_argv(out_dir, "parquet", "--allow-partial")) == 0
 
     assert tickets == [(42, 3), (43, 12)]
     assert fake_cls.instances[0].do_get_calls == [42, 43]
@@ -1703,19 +1704,19 @@ def test_masked_read_export_exports_each_processed_sample_from_its_mask(
         ("processing", {"mask_idx": 12}),
     ]
     assert sorted(p.name for p in out_dir.iterdir()) == [
-        "SAMN_A.5.7.42.parquet",
-        "SAMN_B.5.7.43.parquet",
+        "SAMN_A.QM542.parquet",
+        "SAMN_B.QM543.parquet",
         MANIFEST_NAME,
     ]
     text = (out_dir / MANIFEST_NAME).read_text()
     assert _json.loads(text) == {
         "files": {
-            "SAMN_A.5.7.42.parquet": {
+            "SAMN_A.QM542.parquet": {
                 "export_id": _sample_handle(42),
                 "biosample_accession": "SAMN_A",
                 "export_processing_id": _mask_handle(3),
             },
-            "SAMN_B.5.7.43.parquet": {
+            "SAMN_B.QM543.parquet": {
                 "export_id": _sample_handle(43),
                 "biosample_accession": "SAMN_B",
                 "export_processing_id": _mask_handle(12),
@@ -1730,9 +1731,76 @@ def test_masked_read_export_exports_each_processed_sample_from_its_mask(
     assert "prep_sample 45: not_processed (no_run)" in captured.err
 
 
-def test_masked_read_export_with_nothing_processed_writes_nothing(monkeypatch, tmp_path, capsys):
+def test_masked_read_export_partial_without_the_flag_exits_1_and_keeps_its_files(
+    monkeypatch, tmp_path, capsys
+):
+    """Without --allow-partial, a run that leaves prep_samples out exits 1; the files
+    it wrote stay, recorded in the manifest."""
+    from qiita_control_plane.cli import _common
+    from qiita_control_plane.cli import admin as cli
+    from qiita_control_plane.cli.admin.masked_export import _read_export_manifest
+
+    monkeypatch.setenv("QIITA_TOKEN", "qk_admin")
+    monkeypatch.setattr(_common.httpx, "request", _fake_masked_export_http(_GROUP_ROSTER))
+    monkeypatch.setattr("pyarrow.flight.FlightClient", _fake_flight_client_class(_group_tables()))
+
+    out_dir = tmp_path / "exp"
+    assert cli.main(_export_argv(out_dir)) == 1
+    assert sorted(_read_export_manifest(out_dir)) == [
+        "SAMN_A.QM542.parquet",
+        "SAMN_B.QM543.parquet",
+    ]
+    assert (out_dir / "SAMN_A.QM542.parquet").is_file()
+    err = capsys.readouterr().err
+    assert "2 prep_sample(s) were not exported" in err and "--allow-partial" in err
+
+
+def test_masked_read_export_a_ticket_refused_partway_is_left_out(monkeypatch, tmp_path, capsys):
+    """A 409 from the ticket route for one prep_sample (its resolution changed after the
+    roster was read) lists it with the refusal and the run goes on to the next."""
+    from qiita_common.api_paths import PATH_ADMIN_MASKED_READ_EXPORT_TICKET
+
+    from qiita_control_plane.cli import _common
+    from qiita_control_plane.cli import admin as cli
+    from qiita_control_plane.cli.admin.masked_export import _read_export_manifest
+
+    monkeypatch.setenv("QIITA_TOKEN", "qk_admin")
+    roster = {**_GROUP_ROSTER, "samples": _GROUP_ROSTER["samples"][:2]}
+    served = _fake_masked_export_http(roster)
+    resolution = _resolution(
+        42, SampleResolutionState.INCOMPLETE, 12, SampleResolutionReason.IN_PROGRESS, ticket=77
+    )
+
+    def refusing(method, url, **kw):
+        if (
+            method == "POST"
+            and url.endswith(PATH_ADMIN_MASKED_READ_EXPORT_TICKET)
+            and kw["json"]["prep_sample_idx"] == 42
+        ):
+            body = {"detail": {"reason": "incomplete", "resolution": resolution}}
+            return httpx.Response(409, json=body, request=httpx.Request(method, url))
+        return served(method, url, **kw)
+
+    monkeypatch.setattr(_common.httpx, "request", refusing)
+    fake_cls = _fake_flight_client_class(_group_tables())
+    monkeypatch.setattr("pyarrow.flight.FlightClient", fake_cls)
+
+    out_dir = tmp_path / "exp"
+    assert cli.main(_export_argv(out_dir)) == 1
+    assert fake_cls.instances[0].do_get_calls == [43]
+    assert sorted(_read_export_manifest(out_dir)) == ["SAMN_B.QM543.parquet"]
+    err = capsys.readouterr().err
+    assert "prep_sample 42: incomplete (in_progress), mask 12, work_ticket 77" in err
+    assert "refused: incomplete" in err
+    assert cli.main(_export_argv(out_dir, "parquet", "--allow-partial")) == 0
+
+
+@pytest.mark.parametrize("extra", [(), ("--allow-partial",)])
+def test_masked_read_export_with_nothing_processed_writes_nothing(
+    monkeypatch, tmp_path, capsys, extra
+):
     """No processed sample: nothing is minted or streamed, the samples are listed,
-    and the run exits 0."""
+    and the run exits 1, with or without --allow-partial."""
     from qiita_control_plane.cli import _common
     from qiita_control_plane.cli import admin as cli
 
@@ -1744,11 +1812,11 @@ def test_masked_read_export_with_nothing_processed_writes_nothing(monkeypatch, t
     monkeypatch.setattr("pyarrow.flight.FlightClient", fake_cls)
 
     out_dir = tmp_path / "exp"
-    assert cli.main(_export_argv(out_dir)) == 0
+    assert cli.main(_export_argv(out_dir, "parquet", *extra)) == 1
     assert mints == [] and fake_cls.instances == []
     assert list(out_dir.iterdir()) == []
     captured = capsys.readouterr()
-    assert "exported 0 prep_sample(s)" in captured.out
+    assert "exported 0 prep_sample(s)" in captured.err
     assert "prep_sample 44" in captured.err and "prep_sample 45" in captured.err
 
 
@@ -1799,19 +1867,17 @@ def _record(out_dir, name, export_processing_id):
     [
         (
             "parquet",
-            "SAMN_A.5.7.42.parquet",
-            f"SAMN_A.5.7.42.parquet (recorded under QP5, now {_mask_handle(3)})",
+            "SAMN_A.QM542.parquet",
+            f"SAMN_A.QM542.parquet (recorded under QP5, now {_mask_handle(3)})",
         ),
-        ("fastq", "SAMN_A.5.7.42.R1.fastq.gz", "refusing to overwrite 1 existing fastq file(s)"),
+        ("fastq", "SAMN_A.QM542.R1.fastq.gz", "refusing to overwrite 1 existing fastq file(s)"),
     ],
 )
 def test_masked_read_export_refuses_a_file_recorded_under_another_mask(
     monkeypatch, tmp_path, capsys, fmt, name, refusal
 ):
     """An existing file the manifest records under another mask's handle is never
-    replaced: the whole run is refused before any stream, and nothing changes. No
-    prep_sample handle is minted; parquet mints the masks' handles, which the check
-    compares, and fastq, whose existing file is refused first, mints none."""
+    replaced: the whole run is refused before any stream, and nothing changes."""
     from qiita_control_plane.cli import _common
     from qiita_control_plane.cli import admin as cli
     from qiita_control_plane.cli.admin.masked_export import MANIFEST_NAME
@@ -1831,7 +1897,14 @@ def test_masked_read_export_refuses_a_file_recorded_under_another_mask(
 
     err = capsys.readouterr().err
     assert refusal in err
-    assert [kind for kind, _ in mints] == (["processing", "processing"] if fmt == "parquet" else [])
+    # The file names carry the prep_sample handles, so both kinds are minted before
+    # either name check.
+    assert sorted(kind for kind, _ in mints) == [
+        "identifier",
+        "identifier",
+        "processing",
+        "processing",
+    ]
     assert fake_cls.instances == []
     assert (out_dir / name).read_bytes() == b"from mask 5"
     assert (out_dir / MANIFEST_NAME).read_text() == before
@@ -1852,11 +1925,11 @@ def test_masked_read_export_a_recorded_file_gone_from_disk_is_no_conflict(monkey
     monkeypatch.setattr("pyarrow.flight.FlightClient", _fake_flight_client_class(_group_tables()))
     out_dir = tmp_path / "exp"
     out_dir.mkdir()
-    _record(out_dir, "SAMN_A.5.7.42.parquet", "QP5")
+    _record(out_dir, "SAMN_A.QM542.parquet", "QP5")
 
-    assert cli.main(_export_argv(out_dir)) == 0
+    assert cli.main(_export_argv(out_dir, "parquet", "--allow-partial")) == 0
     files = _json.loads((out_dir / MANIFEST_NAME).read_text())["files"]
-    assert files["SAMN_A.5.7.42.parquet"]["export_processing_id"] == _mask_handle(3)
+    assert files["SAMN_A.QM542.parquet"]["export_processing_id"] == _mask_handle(3)
 
 
 def test_masked_read_export_same_mask_keeps_the_count_rule(monkeypatch, tmp_path, capsys):
@@ -1874,43 +1947,162 @@ def test_masked_read_export_same_mask_keeps_the_count_rule(monkeypatch, tmp_path
     monkeypatch.setattr("pyarrow.flight.FlightClient", fake_cls)
     out_dir = tmp_path / "exp"
     out_dir.mkdir()
-    pq.write_table(tables[42], out_dir / "SAMN_A.5.7.42.parquet")
-    _record(out_dir, "SAMN_A.5.7.42.parquet", _mask_handle(3))
+    pq.write_table(tables[42], out_dir / "SAMN_A.QM542.parquet")
+    _record(out_dir, "SAMN_A.QM542.parquet", _mask_handle(3))
 
-    assert cli.main(_export_argv(out_dir)) == 0
+    assert cli.main(_export_argv(out_dir, "parquet", "--allow-partial")) == 0
     assert fake_cls.instances[0].do_get_calls == [43]
     assert "exported 1 prep_sample(s) (skipped 1 already up to date)" in capsys.readouterr().out
 
 
-def test_masked_read_export_records_an_up_to_date_file_it_skipped(monkeypatch, tmp_path, capsys):
-    """A parquet that the manifest does not record (one exported before the manifest
-    existed, or before a crash) and whose count matches is skipped, and recorded."""
-    import json as _json
+_ONE_SAMPLE_ROSTER = {
+    "sequenced_pool_idx": 7,
+    "sequencing_run_idx": 5,
+    "mask_idx": 3,
+    "samples": [{"prep_sample_idx": 42, "biosample_accession": "SAMN_A"}],
+}
 
-    import pyarrow.parquet as pq
+
+def _patch_one_sample(monkeypatch, mints=None):
+    import pyarrow as pa
 
     from qiita_control_plane.cli import _common
+
+    monkeypatch.setenv("QIITA_TOKEN", "qk_admin")
+    monkeypatch.setattr(
+        _common.httpx, "request", _fake_masked_export_http(_ONE_SAMPLE_ROSTER, mints)
+    )
+    fake_cls = _fake_flight_client_class(
+        {42: pa.table({"read_id": ["rA0", "rA1"], "sequence1": ["ACGT", "TTGG"]})}
+    )
+    monkeypatch.setattr("pyarrow.flight.FlightClient", fake_cls)
+    return fake_cls
+
+
+@pytest.mark.parametrize("name", ["SAMN_A.QM542.parquet", "SAMN_A.5.7.42.parquet"])
+def test_masked_read_export_refuses_an_unrecorded_file(monkeypatch, tmp_path, capsys, name):
+    """An export file that the manifest does not record, of the current naming or of the
+    earlier one, refuses the run before anything is minted or streamed."""
+    from qiita_control_plane.cli import admin as cli
+
+    mints: list = []
+    fake_cls = _patch_one_sample(monkeypatch, mints)
+    out_dir = tmp_path / "exp"
+    out_dir.mkdir()
+    (out_dir / name).write_bytes(b"old")
+    (out_dir / "notes.txt").write_text("not an export file")
+
+    assert cli.main(_export_argv(out_dir)) == 1
+    err = capsys.readouterr().err
+    assert (
+        f"holds 1 export file(s) that masked-read-export.manifest.json does not record ({name})"
+        in err
+    )
+    assert "--adopt-unrecorded" in err
+    assert mints == [] and fake_cls.instances == []
+    assert sorted(p.name for p in out_dir.iterdir()) == [name, "notes.txt"]
+
+
+def test_masked_read_export_adopt_rewrites_an_unrecorded_file_and_records_it(
+    monkeypatch, tmp_path, capsys
+):
+    """Under --adopt-unrecorded an unrecorded file this run writes is rewritten from the
+    data plane, never skipped as up to date, and recorded; the next run needs no flag."""
+    import json as _json
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
     from qiita_control_plane.cli import admin as cli
     from qiita_control_plane.cli.admin.masked_export import MANIFEST_NAME
 
-    monkeypatch.setenv("QIITA_TOKEN", "qk_admin")
-    monkeypatch.setattr(_common.httpx, "request", _fake_masked_export_http(_GROUP_ROSTER))
-    tables = _group_tables()
-    fake_cls = _fake_flight_client_class(tables)
-    monkeypatch.setattr("pyarrow.flight.FlightClient", fake_cls)
+    fake_cls = _patch_one_sample(monkeypatch)
     out_dir = tmp_path / "exp"
     out_dir.mkdir()
-    pq.write_table(tables[42], out_dir / "SAMN_A.5.7.42.parquet")
+    # Same count as the data plane's, so only adoption makes this a rewrite.
+    pq.write_table(
+        pa.table({"read_id": ["x", "y"], "sequence1": ["AAAA", "CCCC"]}),
+        out_dir / "SAMN_A.QM542.parquet",
+    )
+
+    assert cli.main(_export_argv(out_dir, "parquet", "--adopt-unrecorded")) == 0
+    assert fake_cls.instances[0].do_get_calls == [42]
+    assert pq.read_table(out_dir / "SAMN_A.QM542.parquet").column("read_id").to_pylist() == [
+        "rA0",
+        "rA1",
+    ]
+    files = _json.loads((out_dir / MANIFEST_NAME).read_text())["files"]
+    assert files == {
+        "SAMN_A.QM542.parquet": {
+            "export_id": _sample_handle(42),
+            "biosample_accession": "SAMN_A",
+            "export_processing_id": _mask_handle(3),
+        }
+    }
+    capsys.readouterr()
 
     assert cli.main(_export_argv(out_dir)) == 0
-    assert fake_cls.instances[0].do_get_calls == [43]
     assert "(skipped 1 already up to date)" in capsys.readouterr().out
-    files = _json.loads((out_dir / MANIFEST_NAME).read_text())["files"]
-    assert files["SAMN_A.5.7.42.parquet"] == {
-        "export_id": _sample_handle(42),
-        "biosample_accession": "SAMN_A",
-        "export_processing_id": _mask_handle(3),
+
+
+@pytest.mark.parametrize("fmt", ["parquet", "fastq"])
+def test_masked_read_export_adopt_replaces_a_file_of_the_earlier_naming(
+    monkeypatch, tmp_path, capsys, fmt
+):
+    """A file named <accession>.<run>.<pool>.<prep_sample> is replaced: the new-named
+    file is written and recorded, then the old one is removed. Other files, including
+    another pool's old-named file, stay; the next run needs no flag for this pool's."""
+    import pyarrow as pa
+
+    from qiita_control_plane.cli import _common
+    from qiita_control_plane.cli import admin as cli
+    from qiita_control_plane.cli.admin.masked_export import _read_export_manifest
+
+    monkeypatch.setenv("QIITA_TOKEN", "qk_admin")
+    monkeypatch.setattr(_common.httpx, "request", _fake_masked_export_http(_ONE_SAMPLE_ROSTER))
+    se = {
+        "qual1": _qual([[40] * 4]),
+        "sequence2": pa.array([None], type=pa.string()),
+        "qual2": _qual([None]),
     }
+    monkeypatch.setattr(
+        "pyarrow.flight.FlightClient",
+        _fake_flight_client_class(
+            {42: pa.table({"read_id": ["rA0"], "sequence1": ["ACGT"], **se})}
+        ),
+    )
+    out_dir = tmp_path / "exp"
+    out_dir.mkdir()
+    suffix = "parquet" if fmt == "parquet" else "fastq.gz"
+    old = out_dir / f"SAMN_A.5.7.42.{suffix}"
+    old.write_bytes(b"old")
+    other_pool = out_dir / f"SAMN_Z.5.9.77.{suffix}"
+    other_pool.write_bytes(b"other pool")
+    (out_dir / "notes.txt").write_text("kept")
+
+    assert cli.main(_export_argv(out_dir, fmt, "--adopt-unrecorded")) == 0
+    captured = capsys.readouterr()
+    assert (
+        "replaced the earlier-named files of 1 prep_sample(s), removing 1 file(s)" in captured.out
+    )
+    assert "left 1 unrecorded export file(s) in place" in captured.err
+    new = f"SAMN_A.QM542.{suffix}"
+    assert sorted(p.name for p in out_dir.iterdir()) == sorted(
+        [new, other_pool.name, "notes.txt", "masked-read-export.manifest.json"]
+    )
+    assert sorted(_read_export_manifest(out_dir)) == [new]
+    # Every dot-separated part of the new name is public: no run, pool or prep_sample idx.
+    assert not {"5", "7", "42", "3"} & set(new.split("."))
+
+
+def test_masked_read_export_an_empty_or_new_directory_needs_no_flag(monkeypatch, tmp_path):
+    from qiita_control_plane.cli import admin as cli
+
+    _patch_one_sample(monkeypatch)
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    assert cli.main(_export_argv(empty)) == 0
+    assert cli.main(_export_argv(tmp_path / "new")) == 0
 
 
 def test_masked_read_export_manifest_keeps_entries_another_run_recorded(tmp_path):
@@ -2021,7 +2213,7 @@ def test_masked_read_export_creates_missing_output_dir(monkeypatch, tmp_path):
         ]
     )
     assert rc == 0
-    assert (out_dir / "SAMN_A.5.7.42.parquet").is_file()
+    assert (out_dir / "SAMN_A.QM542.parquet").is_file()
 
 
 def test_masked_read_export_skips_unchanged_parquet(monkeypatch, tmp_path, capsys):
@@ -2100,8 +2292,9 @@ def test_masked_read_export_overwrites_changed_parquet(monkeypatch, tmp_path):
     # A stale on-disk export with 1 row; the data plane now reports 2.
     pq.write_table(
         pa.table({"read_id": ["old"], "sequence1": ["AAAA"]}),
-        out_dir / "SAMN_A.5.7.42.parquet",
+        out_dir / "SAMN_A.QM542.parquet",
     )
+    _record(out_dir, "SAMN_A.QM542.parquet", _mask_handle(3))
     fake_cls = _fake_flight_client_class(  # count_masked defaults to the table's 2 rows
         {42: pa.table({"read_id": ["rA0", "rA1"], "sequence1": ["ACGT", "TTGG"]})}
     )
@@ -2126,7 +2319,7 @@ def test_masked_read_export_overwrites_changed_parquet(monkeypatch, tmp_path):
     # On-disk (1) != remote (2) → counted, then re-streamed and overwritten.
     assert fake_cls.instances[-1].do_action_calls == [42]
     assert fake_cls.instances[-1].do_get_calls == [42]
-    assert pq.ParquetFile(out_dir / "SAMN_A.5.7.42.parquet").metadata.num_rows == 2
+    assert pq.ParquetFile(out_dir / "SAMN_A.QM542.parquet").metadata.num_rows == 2
 
 
 # The manifest GET runs before the loop over prep_samples and the ticket POST
@@ -2275,7 +2468,7 @@ def test_masked_read_export_single_end_fastq(monkeypatch, tmp_path):
     rc, out_dir = _run_masked_export(monkeypatch, tmp_path, table)
     assert rc == 0
 
-    f = out_dir / "SAMN_A.5.7.42.fastq.gz"
+    f = out_dir / "SAMN_A.QM542.fastq.gz"
     assert f.is_file()
     assert (f.stat().st_mode & 0o777) == 0o600
     lines = _read_gz_text(f).splitlines()
@@ -2283,7 +2476,7 @@ def test_masked_read_export_single_end_fastq(monkeypatch, tmp_path):
     assert len(lines) == 8  # two single-end records, 4 lines each
     # No paired split, no leftover .partial.
     assert sorted(p.name for p in out_dir.iterdir()) == [
-        "SAMN_A.5.7.42.fastq.gz",
+        "SAMN_A.QM542.fastq.gz",
         "masked-read-export.manifest.json",
     ]
 
@@ -2306,8 +2499,8 @@ def test_masked_read_export_paired_fastq_r1_r2(monkeypatch, tmp_path):
     rc, out_dir = _run_masked_export(monkeypatch, tmp_path, table)
     assert rc == 0
 
-    r1 = out_dir / "SAMN_A.5.7.42.R1.fastq.gz"
-    r2 = out_dir / "SAMN_A.5.7.42.R2.fastq.gz"
+    r1 = out_dir / "SAMN_A.QM542.R1.fastq.gz"
+    r2 = out_dir / "SAMN_A.QM542.R2.fastq.gz"
     assert r1.is_file() and r2.is_file()
     assert (r1.stat().st_mode & 0o777) == 0o600
     assert (r2.stat().st_mode & 0o777) == 0o600
@@ -2317,8 +2510,8 @@ def test_masked_read_export_paired_fastq_r1_r2(monkeypatch, tmp_path):
     assert len(_read_gz_text(r2).splitlines()) == 8
     # Split output only — no single-file form, no leftover .partial.
     assert sorted(p.name for p in out_dir.iterdir()) == [
-        "SAMN_A.5.7.42.R1.fastq.gz",
-        "SAMN_A.5.7.42.R2.fastq.gz",
+        "SAMN_A.QM542.R1.fastq.gz",
+        "SAMN_A.QM542.R2.fastq.gz",
         "masked-read-export.manifest.json",
     ]
 
@@ -2350,8 +2543,8 @@ def test_masked_read_export_paired_fastq_streams_all_batches(monkeypatch, tmp_pa
     rc, out_dir = _run_masked_export(monkeypatch, tmp_path, pa.Table.from_batches([b1, b2]))
     assert rc == 0
 
-    r1 = _read_gz_text(out_dir / "SAMN_A.5.7.42.R1.fastq.gz").splitlines()
-    r2 = _read_gz_text(out_dir / "SAMN_A.5.7.42.R2.fastq.gz").splitlines()
+    r1 = _read_gz_text(out_dir / "SAMN_A.QM542.R1.fastq.gz").splitlines()
+    r2 = _read_gz_text(out_dir / "SAMN_A.QM542.R2.fastq.gz").splitlines()
     assert "@p1" in r1 and "@p2" in r1  # both reads, not only the peeked first batch
     assert "@p1" in r2 and "@p2" in r2
 
@@ -2374,12 +2567,12 @@ def test_masked_read_export_empty_sample_fastq(monkeypatch, tmp_path):
     rc, out_dir = _run_masked_export(monkeypatch, tmp_path, table)
     assert rc == 0
 
-    f = out_dir / "SAMN_A.5.7.42.fastq.gz"
+    f = out_dir / "SAMN_A.QM542.fastq.gz"
     assert f.is_file()
     assert (f.stat().st_mode & 0o777) == 0o600
     assert _read_gz_text(f) == ""  # zero records
     assert sorted(p.name for p in out_dir.iterdir()) == [
-        "SAMN_A.5.7.42.fastq.gz",
+        "SAMN_A.QM542.fastq.gz",
         "masked-read-export.manifest.json",
     ]
 
@@ -2422,8 +2615,9 @@ def test_masked_read_export_fastq_refuses_existing_file(monkeypatch, tmp_path, c
 
     out_dir = tmp_path / "exp"
     out_dir.mkdir()
-    preexisting = out_dir / f"SAMN_B.5.7.43.{suffix}"
+    preexisting = out_dir / f"SAMN_B.QM543.{suffix}"
     preexisting.write_bytes(b"stale")
+    _record(out_dir, preexisting.name, _mask_handle(3))
 
     rc = cli.main(
         [
@@ -2447,7 +2641,9 @@ def test_masked_read_export_fastq_refuses_existing_file(monkeypatch, tmp_path, c
     # Failed before any Flight work; the stale file is the only thing on disk.
     assert fake_cls.instances == []
     assert preexisting.read_bytes() == b"stale"
-    assert sorted(p.name for p in out_dir.iterdir()) == [preexisting.name]
+    assert sorted(p.name for p in out_dir.iterdir()) == sorted(
+        [preexisting.name, "masked-read-export.manifest.json"]
+    )
 
 
 # A refused DoGet and a stream cut after its first batch reach different except
@@ -2585,7 +2781,7 @@ def test_masked_read_export_unreadable_parquet_target_is_an_error(monkeypatch, t
 
     out_dir = tmp_path / "exp"
     out_dir.mkdir()
-    target = out_dir / "SAMN_A.5.7.42.parquet"
+    target = out_dir / "SAMN_A.QM542.parquet"
     target.write_bytes(b"not parquet")
     table = pa.table({"read_id": ["r"], "sequence1": ["A"]})
     rc, _ = _run_masked_export(monkeypatch, tmp_path, table, fmt="parquet")
@@ -2906,28 +3102,31 @@ def test_requires_database_url_empty(monkeypatch, capsys):
     assert "DATABASE_URL" in capsys.readouterr().err
 
 
-def test_export_stem_is_the_pooled_composite():
-    """Pins the stem's exact shape. It embeds internal identifiers and predates the
-    rule against those leaving Qiita; this test is what makes an accidental change
-    to a system_admin-only filename convention visible."""
+def test_export_stem_is_the_accession_and_the_export_id():
+    """Pins the stem's exact shape: the biosample accession and the prep_sample's public
+    handle, nothing else."""
     from qiita_control_plane.cli.admin.masked_export import _export_stem
 
-    sample = {"biosample_accession": "SAMN_A", "prep_sample_idx": 42}
-    assert _export_stem(sample, 5, 7) == "SAMN_A.5.7.42"
+    assert _export_stem("SAMN_A", "QM542") == "SAMN_A.QM542"
 
 
-def test_export_stem_ignores_an_ena_run_accession():
-    """The stem is the composite ALWAYS, never the run accession: preferring the
-    accession would silently rename every submitted sample's export file and route
-    around the `_SAFE_ACCESSION` charset check."""
-    from qiita_control_plane.cli.admin.masked_export import _export_stem
+@pytest.mark.parametrize(
+    ("name", "export", "legacy"),
+    [
+        ("SAMN_A.QM542.parquet", True, False),
+        ("SAMN_A.QM542.R1.fastq.gz", True, False),
+        ("SAMN_A.5.7.42.parquet", False, True),
+        ("SAMN_A.5.7.42.R2.fastq.gz", False, True),
+        ("SAMN_A.QM542.parquet.partial", False, False),
+        ("notes.txt", False, False),
+        ("SAMN_A.5.7.parquet", False, False),
+    ],
+)
+def test_export_file_name_patterns(name, export, legacy):
+    from qiita_control_plane.cli.admin.masked_export import _EXPORT_NAME, _LEGACY_NAME
 
-    sample = {
-        "biosample_accession": "SAMN_A",
-        "prep_sample_idx": 42,
-        "ena_run_accession": "ERR1234567",
-    }
-    assert _export_stem(sample, 5, 7) == "SAMN_A.5.7.42"
+    assert bool(_EXPORT_NAME.match(name)) is export
+    assert bool(_LEGACY_NAME.match(name)) is legacy
 
 
 def test_backfill_mask_adapter_hash_execute_reports_skipped_rows(monkeypatch, capsys):

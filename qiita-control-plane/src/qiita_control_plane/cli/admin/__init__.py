@@ -601,9 +601,11 @@ def _build_parser() -> argparse.ArgumentParser:
             "Export masked sequence data for every prep_sample on a"
             " sequenced_pool (system_admin only). Streams each prep_sample's"
             " masked reads from the data plane and writes them to"
-            " <biosample_accession>.<run>.<pool>.<prep_sample> plus .parquet,"
-            " or .fastq.gz (single-end) / .R1.fastq.gz and .R2.fastq.gz"
-            " (paired)."
+            " <biosample_accession>.<export_id> plus .parquet, or .fastq.gz"
+            " (single-end) / .R1.fastq.gz and .R2.fastq.gz (paired), where"
+            " <export_id> is the prep_sample's public handle under its mask. Exits 1"
+            " when any prep_sample is left out, unless --allow-partial, and when"
+            " none is exported."
         ),
     )
     p_export.add_argument(
@@ -648,7 +650,33 @@ def _build_parser() -> argparse.ArgumentParser:
             " different mask is never overwritten. Otherwise, on re-export, an"
             " existing parquet file is skipped when its count matches the data"
             " plane and overwritten when it differs; an existing fastq target"
-            " is refused."
+            " is refused. A directory holding an export file that the manifest does"
+            " not record is refused; see --adopt-unrecorded."
+        ),
+    )
+    p_export.add_argument(
+        "--allow-partial",
+        action="store_true",
+        dest="allow_partial",
+        help=(
+            "Exit 0 when some prep_samples were left out (not processed in the"
+            " group, or refused partway) and the rest were exported. Without it such"
+            " a run exits 1; its files are kept and recorded either way. A run that"
+            " exports nothing exits 1 regardless."
+        ),
+    )
+    p_export.add_argument(
+        "--adopt-unrecorded",
+        action="store_true",
+        dest="adopt_unrecorded",
+        help=(
+            "Accept an output directory holding export files that its manifest does"
+            " not record, such as one written before the manifest or before files"
+            " were named <biosample_accession>.<export_id>. Each such file that this"
+            " run writes is rewritten from the current resolution and recorded; a"
+            " file of the earlier <accession>.<run>.<pool>.<prep_sample> naming is"
+            " removed once its replacement is written and recorded. Unrecorded files"
+            " this run does not write are left in place and listed."
         ),
     )
     p_export.add_argument(

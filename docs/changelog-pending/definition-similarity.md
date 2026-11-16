@@ -72,6 +72,20 @@
   and restoring the gate now leaves the prep_sample `processed` instead of
   `incomplete`. A failed ticket under a `pending` gate or with no gate row, and a
   waiting or running ticket, count as before.
+- **`qiita-admin masked-read-export` names each file `<biosample_accession>.<export_id>`
+  (#874)**, where `export_id` is the prep_sample's public handle under the mask it is
+  exported from, in place of `<biosample_accession>.<run>.<pool>.<prep_sample>`.
+- **`qiita-admin masked-read-export` exits 1 when a prep_sample is left out (#874)**
+  (not processed in the group, or its ticket refused with a 409 partway through the
+  run, which is now listed and skipped instead of ending the run), unless
+  `--allow-partial`, and exits 1 when nothing is exported, including an empty roster.
+  The files written are kept and recorded either way.
+- **`qiita-admin masked-read-export` refuses an output directory holding an export file
+  that its manifest does not record (#874)**, before minting anything, unless
+  `--adopt-unrecorded`. Every file of the earlier naming counts. With the flag, each
+  such file that the run writes is rewritten from the current resolution and
+  recorded, and an earlier-named file is removed once its replacement is written and
+  recorded; the run reports how many it replaced and removed.
 - **A work ticket records the processing that it minted (`work_ticket.processing_idx`,
   #874)**, and the definition-group resolver reads it to tell which processing a
   `long-read-assembly` ticket ran. A migration sets it on the tickets started before

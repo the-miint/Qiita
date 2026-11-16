@@ -158,6 +158,17 @@ async def _real_bridge(postgres_pool, secret: bytes, *, pool_idx: int, mask_idx:
     return roster, fake_request
 
 
+async def _export_id(postgres_pool, mask_idx: int, prep_sample_idx: int) -> str:
+    """The prep_sample's live public handle under the mask, which `_real_bridge` minted
+    and the export names its files with."""
+    return await postgres_pool.fetchval(
+        "SELECT export_id FROM qiita.exported_identifier"
+        " WHERE mask_idx = $1 AND prep_sample_idx = $2 AND NOT retired",
+        mask_idx,
+        prep_sample_idx,
+    )
+
+
 def _seed_lake(data_path, *, prep: int, mask_idx: int, reads: list[tuple]) -> None:
     """Write `reads` — `(sequence_idx, read_id, sequence1, sequence2, reason)` — into
     `read` and `read_mask` under `mask_idx`, with zero trims."""
@@ -269,7 +280,6 @@ async def test_masked_read_export_e2e_parquet_and_fastq(
     prep = seeded["prep_sample_idx"]
     mask_idx = seeded["mask_idx"]
     pool_idx = seeded["pool_idx"]
-    run_idx = seeded["run_idx"]
     accession = seeded["accession"]
     secret = data_plane["secret"]
 
@@ -310,7 +320,7 @@ async def test_masked_read_export_e2e_parquet_and_fastq(
     monkeypatch.setenv("QIITA_TOKEN", "qk_admin")
     monkeypatch.setattr(_common.httpx, "request", bridge)
     dp_url = f"grpc://{LOOPBACK_HOST}:{data_plane['port']}"
-    stem = f"{accession}.{run_idx}.{pool_idx}.{prep}"
+    stem = f"{accession}.{await _export_id(postgres_pool, mask_idx, prep)}"
 
     def _run_export(fmt: str, out_dir: Path) -> int:
         out_dir.mkdir()
@@ -376,7 +386,6 @@ async def test_masked_read_export_e2e_parquet_idempotent_recount(
     prep = seeded["prep_sample_idx"]
     mask_idx = seeded["mask_idx"]
     pool_idx = seeded["pool_idx"]
-    run_idx = seeded["run_idx"]
     accession = seeded["accession"]
     secret = data_plane["secret"]
 
@@ -409,7 +418,7 @@ async def test_masked_read_export_e2e_parquet_idempotent_recount(
     monkeypatch.setenv("QIITA_TOKEN", "qk_admin")
     monkeypatch.setattr(_common.httpx, "request", bridge)
     dp_url = f"grpc://{LOOPBACK_HOST}:{data_plane['port']}"
-    stem = f"{accession}.{run_idx}.{pool_idx}.{prep}"
+    stem = f"{accession}.{await _export_id(postgres_pool, mask_idx, prep)}"
 
     # One out_dir reused across runs; the CLI creates it on the first run.
     out_dir = tmp_path / "exp"
@@ -631,6 +640,7 @@ async def test_masked_read_export_e2e_across_a_mask_group(
             str(out_dir),
             "--data-plane-url",
             f"grpc://{LOOPBACK_HOST}:{data_plane['port']}",
+            "--allow-partial",
         ]
     )
     assert rc == 0
@@ -638,8 +648,11 @@ async def test_masked_read_export_e2e_across_a_mask_group(
     assert "exported 2 prep_sample(s)" in captured.out
     assert f"prep_sample {ps_3}: not_processed (no_run)" in captured.err
 
-    name_1 = f"{g['accession']}.{g['run_idx']}.{g['pool_idx']}.{ps_1}.parquet"
-    name_2 = f"{g['accession_2']}.{g['run_idx']}.{g['pool_idx']}.{ps_2}.parquet"
+    name_1 = f"{g['accession']}.{await _export_id(postgres_pool, mask_1, ps_1)}.parquet"
+    name_2 = f"{g['accession_2']}.{await _export_id(postgres_pool, mask_2, ps_2)}.parquet"
+    idxs = {str(i) for i in (g["run_idx"], g["pool_idx"], ps_1, ps_2, ps_3, mask_1, mask_2)}
+    for name in (name_1, name_2):
+        assert not idxs & set(name.split(".")), name
 
     def read_ids(name):
         rows = duckdb.connect(":memory:").execute(
