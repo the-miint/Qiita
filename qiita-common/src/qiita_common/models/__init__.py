@@ -168,6 +168,7 @@ from qiita_common.models.definition_pair import (
     DefinitionPairRefusal,
     DefinitionPairRevokeRequest,
     DefinitionPairVerdict,
+    DeprecationRefusal,
 )
 from qiita_common.models.ena import (
     EnaRunRecord,
@@ -608,6 +609,7 @@ __all__ = [
     "DefinitionPairListResponse",
     "DefinitionPairOpenRequest",
     "DefinitionPairRefusal",
+    "DeprecationRefusal",
     "DefinitionPairRevokeRequest",
     "DefinitionPairVerdict",
     # Definition groups.

@@ -46,7 +46,10 @@
   alignment it names (#874)** (409, `reason` `resolved_elsewhere`, `incomplete` or
   `not_processed`), including one whose mask run is withdrawn or deprecated.
 - **Deprecating a mask, alignment or processing is refused (409, `similar_pairs`)
-  while it is a side of a `similar` pair (#874).**
+  while it is a side of a `similar` pair (#874).** The mask and alignment
+  deprecation 409 for unfinished work tickets now has the same shape: `reason` is the
+  code `live_work` (it was the message), the message moved to `detail`, and
+  `work_ticket_idx` is unchanged.
 - **A work ticket records the processing that it minted (`work_ticket.processing_idx`,
   #874)**, and the definition-group resolver reads it to tell which processing a
   `long-read-assembly` ticket ran. A migration sets it on the tickets started before

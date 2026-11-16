@@ -23,7 +23,7 @@ from qiita_common.api_paths import (
     URL_ALIGNMENT_DEFINITION_STATUS,
     URL_WORK_TICKET_RUN,
 )
-from qiita_common.models import AlignmentDefinitionStatus, WorkTicketState
+from qiita_common.models import AlignmentDefinitionStatus, DeprecationRefusal, WorkTicketState
 
 from qiita_control_plane.align_planner import ALIGN_ACTION_VERSION
 from qiita_control_plane.fanout_dispatch import align_block_cohort, top_up_dispatch
@@ -282,7 +282,9 @@ async def test_deprecation_waits_for_unfinished_tickets(client, lc):
     )
     resp = await _deprecate(client, lc["alignment_idx"])
     assert resp.status_code == 409, resp.text
-    assert resp.json()["detail"]["work_ticket_idx"] == [held]
+    detail = resp.json()["detail"]
+    assert (detail["reason"], detail["work_ticket_idx"]) == (DeprecationRefusal.LIVE_WORK, [held])
+    assert "unfinished work ticket" in detail["detail"]
     status = await lc["pool"].fetchval(
         "SELECT status FROM qiita.alignment_definition WHERE alignment_idx = $1",
         lc["alignment_idx"],

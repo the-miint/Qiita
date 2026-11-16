@@ -16,6 +16,7 @@ from qiita_common.models import (
     NOT_SETTABLE_ON_LINKED_FIELD,
     STUDY_FIELD_IDX_ATTR,
     AlignmentDefinitionStatus,
+    DeprecationRefusal,
     IdxsListResponse,
     MetadataEntry,
     MetadataFieldWriteResult,
@@ -81,8 +82,12 @@ from ..repositories._sample_helpers import (
     widen_study_field_to_text,
     write_sample_metadata,
 )
-from ..repositories.alignment_definition import fetch_alignment_definition_by_idx
+from ..repositories.alignment_definition import (
+    AlignmentHasLiveWork,
+    fetch_alignment_definition_by_idx,
+)
 from ..repositories.block import list_incomplete_alignment_samples
+from ..repositories.mask_definition import MaskHasLiveWork
 from ..repositories.study_access import CallerMetadataTiers
 
 REFERENCE_NOT_FOUND_DETAIL = "Reference not found"
@@ -1774,6 +1779,20 @@ def pair_refused_http(exc: PairRefused) -> HTTPException:
             "detail": str(exc),
             "reason": exc.reason.value,
             "definition_pair_idx": exc.definition_pair_idx,
+        },
+    )
+
+
+def live_work_http(exc: AlignmentHasLiveWork | MaskHasLiveWork) -> HTTPException:
+    """409 for a deprecation refused while work tickets under the definition are
+    unfinished, shaped as `pair_refused_http`'s is: the message, the
+    `DeprecationRefusal` code, and the tickets."""
+    return HTTPException(
+        status_code=409,
+        detail={
+            "detail": str(exc),
+            "reason": DeprecationRefusal.LIVE_WORK.value,
+            "work_ticket_idx": exc.work_ticket_idxs,
         },
     )
 

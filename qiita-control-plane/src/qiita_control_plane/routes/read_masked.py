@@ -132,6 +132,7 @@ from ._helpers import (
     cap_rows,
     first_few,
     gate_roster_narrowing_idx,
+    live_work_http,
     pair_refused_http,
 )
 
@@ -609,10 +610,7 @@ async def update_mask_definition_status_route(
     except MaskDefinitionNotFound:
         raise HTTPException(status_code=404, detail=_MSG_MASK_NOT_FOUND)
     except MaskHasLiveWork as exc:
-        raise HTTPException(
-            status_code=409,
-            detail={"reason": str(exc), "work_ticket_idx": exc.work_ticket_idxs},
-        ) from exc
+        raise live_work_http(exc) from exc
     except PairRefused as exc:
         raise pair_refused_http(exc) from exc
     except asyncpg.ForeignKeyViolationError as exc:

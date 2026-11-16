@@ -2987,7 +2987,13 @@ def test_alignment_deprecate_surfaces_the_unfinished_tickets_409(monkeypatch, ca
 
     _capture_alignment_call(
         monkeypatch,
-        {"detail": {"reason": "alignment 7 has 1 unfinished work ticket(s): [42]"}},
+        {
+            "detail": {
+                "detail": "alignment 7 has 1 unfinished work ticket(s): [42]",
+                "reason": "live_work",
+                "work_ticket_idx": [42],
+            }
+        },
         status=409,
     )
     rc = cli.main(["alignment", "deprecate", "7", "--reason", "bad build"])

@@ -73,6 +73,15 @@ class DefinitionPairRefusal(StrEnum):
     SIMILAR_PAIRS = "similar_pairs"
 
 
+class DeprecationRefusal(StrEnum):
+    """The `reason` code of a deprecation `PATCH .../status` 409 that is not a pair
+    rule's. A deprecation's 409 carries `detail` (prose) and `reason` (a code): this
+    one, or `DefinitionPairRefusal.SIMILAR_PAIRS`."""
+
+    # Unfinished work tickets under the definition, named in `work_ticket_idx`.
+    LIVE_WORK = "live_work"
+
+
 def _nonblank(value: str) -> str:
     if not value.strip():
         raise ValueError("reason must not be blank")
