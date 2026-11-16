@@ -508,6 +508,41 @@ async def test_resolve_rejects_an_empty_cohort_422(ctx, alignment_group_world):
     assert resp.status_code == 422, resp.text
 
 
+async def test_resolve_refuses_a_processing_whose_runs_it_cannot_read_422(
+    ctx, alignment_group_world
+):
+    """An amplicon processing records no `assembly_sample` gate, so every prep_sample
+    would read `no_run`; the route refuses it instead, before the cohort is checked
+    (ps_b is not readable by this caller). A long-read-assembly one resolves."""
+    w = alignment_group_world
+    db = ctx["pool"]
+    made = []
+    async with db.acquire() as conn:
+        for workflow in ("amplicon", LONG_READ_ASSEMBLY_ACTION_ID):
+            params = {"workflow": workflow, "version": _TEST_VERSION, "probe": str(uuid.uuid4())}
+            row = await mint_processing(
+                conn, workflow=workflow, version=_TEST_VERSION, params=params
+            )
+            made.append(row["processing_idx"])
+    amplicon, assembly = made
+    try:
+        resp = await ctx["user"].post(
+            URL_DEFINITION_GROUP_RESOLVE,
+            json=_body(DefinitionKind.PROCESSING, amplicon, [w["ps_b"]]),
+        )
+        assert resp.status_code == 422, resp.text
+        assert "'amplicon' run" in resp.json()["detail"]
+        resp = await ctx["user"].post(
+            URL_DEFINITION_GROUP_RESOLVE,
+            json=_body(DefinitionKind.PROCESSING, assembly, [w["ps_a"]]),
+        )
+        assert resp.status_code == 200, resp.text
+    finally:
+        await db.execute(
+            "DELETE FROM qiita.processing WHERE processing_idx = ANY($1::bigint[])", made
+        )
+
+
 async def test_resolve_group_refuses_a_read_committed_transaction(postgres_pool):
     """The resolver reads gates, tickets and groups in several statements, so it
     refuses a transaction in which each statement takes its own snapshot."""

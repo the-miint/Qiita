@@ -47,6 +47,10 @@ A not-processed member is not replaced by an older one.
     loads the groups when not given them. Raises `DefinitionNotFound`.
   - `GroupResolution.samples[prep_sample_idx] -> SampleResolution` (the
     qiita-common wire model) and `GroupResolution.not_resolved_to(idx)`.
+  - `require_observable(groups, kind, definition_idx)`: raises
+    `DefinitionNotObservable` for a group whose resolution would read a processing of
+    a workflow whose runs are not read here (`PROCESSING_RUN_WORKFLOWS`); every
+    prep_sample would read `no_run`. `resolve_group` calls it.
   - `cohort_refusal(resolution, definition_idx)`: the `DefinitionGroupRefusal` for
     a prep_sample that is not processed under exactly `definition_idx`, or None.
   - Pure core: `build_observations`, `resolve_sample`, `needed_definitions`.
@@ -95,6 +99,7 @@ from .repositories.block import (
     MASK_SAMPLE_PENDING,
 )
 from .repositories.definition_run import (
+    PROCESSING_RUN_WORKFLOWS,
     SOURCE_BLOCK_TICKET,
     SOURCE_GATE,
     SOURCE_SAMPLE_TICKET,
@@ -103,11 +108,13 @@ from .repositories.definition_run import (
 )
 
 __all__ = [
+    "DefinitionNotObservable",
     "GroupResolution",
     "RunObservation",
     "build_observations",
     "cohort_refusal",
     "needed_definitions",
+    "require_observable",
     "resolve_group",
     "resolve_sample",
     "upstreams",
@@ -444,6 +451,33 @@ def cohort_refusal(
 # ---------------------------------------------------------------------------
 
 
+class DefinitionNotObservable(Exception):
+    """A group's resolution would read a processing whose runs the resolver does not
+    read (`PROCESSING_RUN_WORKFLOWS`)."""
+
+    def __init__(self, kind: DefinitionKind, idx: int, processing_idx: int, workflow: str | None):
+        super().__init__(
+            f"{kind.value} {idx}: resolving it reads processing {processing_idx}, a"
+            f" {workflow!r} run; only runs of {', '.join(PROCESSING_RUN_WORKFLOWS)} are"
+            f" read per prep_sample, so every prep_sample would read as having no run"
+        )
+        self.kind = kind
+        self.idx = idx
+        self.processing_idx = processing_idx
+        self.workflow = workflow
+
+
+def require_observable(groups: Groups, kind: DefinitionKind, definition_idx: int) -> None:
+    """Raise DefinitionNotObservable when resolving `kind` `definition_idx` would read a
+    processing (a member, or an upstream of one) of a workflow outside
+    `PROCESSING_RUN_WORKFLOWS`."""
+    needed = needed_definitions(groups, kind, definition_idx)
+    for processing_idx in sorted(needed.get(DefinitionKind.PROCESSING, ())):
+        workflow = groups.definitions[(DefinitionKind.PROCESSING, processing_idx)].workflow
+        if workflow not in PROCESSING_RUN_WORKFLOWS:
+            raise DefinitionNotObservable(kind, definition_idx, processing_idx, workflow)
+
+
 @dataclass(frozen=True)
 class GroupResolution:
     """The resolution of `prep_sample_idxs` in one group. `group` is the members,
@@ -483,7 +517,8 @@ async def resolve_group(
     """Resolve each of `prep_sample_idxs` in `kind` `definition_idx`'s group, in the
     caller's REPEATABLE READ transaction. `groups` is loaded when not given; a caller
     passing its own must have loaded it in this transaction. Raises
-    DefinitionNotFound when `definition_idx` is not a `kind` definition."""
+    DefinitionNotFound when `definition_idx` is not a `kind` definition, and
+    DefinitionNotObservable (`require_observable`)."""
     require_transaction(conn)
     # The gates, tickets and groups are read in several statements; below REPEATABLE
     # READ each takes its own snapshot, and a gate read `pending` before its ticket
@@ -497,6 +532,7 @@ async def resolve_group(
         groups = await load_groups(conn)
     if (kind, definition_idx) not in groups.definitions:
         raise DefinitionNotFound(kind, definition_idx)
+    require_observable(groups, kind, definition_idx)
     samples = sorted(set(prep_sample_idxs))
     needed = needed_definitions(groups, kind, definition_idx)
     observations = await _load_observations(conn, needed, samples)

@@ -15,10 +15,12 @@ from qiita_common.models import (
 )
 
 from qiita_control_plane.definition_resolver import (
+    DefinitionNotObservable,
     RunObservation,
     build_observations,
     cohort_refusal,
     needed_definitions,
+    require_observable,
     resolve_sample,
 )
 from qiita_control_plane.definition_similarity import (
@@ -477,6 +479,23 @@ def test_an_empty_assembly_that_is_rerunning_is_not_nothing_to_read():
     obs[PROCESSING][(31, S)] = gate(ASSEMBLY_SAMPLE_NO_DATA, (44, WorkTicketState.PROCESSING))
     r = resolve(defs, pairs, ALIGNMENT, 60, obs)
     assert (r.state, r.reason, r.definition_idx) == (INCOMPLETE, R.UPSTREAM_MOVED, 60)
+
+
+def test_a_group_reading_a_processing_of_another_workflow_is_refused():
+    """An amplicon processing has no gate the resolver reads, named directly or as the
+    upstream of a de novo alignment; an assembly one passes."""
+    amplicon = DefinitionRow(
+        kind=PROCESSING,
+        idx=40,
+        params={"workflow": "amplicon", "version": "1.0.0", "trim": 150},
+        deprecated=False,
+        workflow="amplicon",
+    )
+    groups = compute_groups([mask(5), assembly(30, 5), amplicon, denovo(61, 5, 40)], [])
+    for kind, idx in ((PROCESSING, 40), (ALIGNMENT, 61)):
+        with pytest.raises(DefinitionNotObservable, match="'amplicon' run"):
+            require_observable(groups, kind, idx)
+    require_observable(groups, PROCESSING, 30)
 
 
 def test_needed_definitions_follows_upstream_groups():

@@ -54,6 +54,11 @@ class _KindTables:
     block_actions: tuple[str, ...]
 
 
+# The workflows whose processing runs this module reads: their tickets record
+# `processing_idx` and their prep_samples get an `assembly_sample` gate row. A
+# processing of any other workflow has runs that nothing here can see.
+PROCESSING_RUN_WORKFLOWS: tuple[str, ...] = (LONG_READ_ASSEMBLY_ACTION_ID,)
+
 # Interpolated into SQL, so the map is closed.
 _KIND_TABLES: dict[DefinitionKind, _KindTables] = {
     DefinitionKind.MASK: _KindTables(
@@ -74,7 +79,7 @@ _KIND_TABLES: dict[DefinitionKind, _KindTables] = {
         gate_table="qiita.assembly_sample",
         gate_column="processing_idx",
         ticket_column="processing_idx",
-        sample_actions=(LONG_READ_ASSEMBLY_ACTION_ID,),
+        sample_actions=PROCESSING_RUN_WORKFLOWS,
         block_actions=(),
     ),
 }

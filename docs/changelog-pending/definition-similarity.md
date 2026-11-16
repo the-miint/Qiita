@@ -11,7 +11,9 @@
   procedure.
 - **`POST /api/v1/definition-group/resolve` (#874)** reports, per prep_sample, the
   group member that its results are read from (the newest one with a run), or that it
-  is `incomplete` or `not_processed`, with the reason.
+  is `incomplete` or `not_processed`, with the reason. A processing whose runs it
+  does not read per prep_sample (any workflow but `long-read-assembly`) is refused
+  (422).
 - **Public handles for a mask and for a prep_sample under a mask (#874):**
   `POST /api/v1/exported-processing/mask` and `POST /api/v1/exported-identifier/mask`
   (system_admin, `admin:masked_read_export`).

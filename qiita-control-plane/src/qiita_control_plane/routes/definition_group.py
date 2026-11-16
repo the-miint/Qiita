@@ -17,7 +17,7 @@ from qiita_common.models import DefinitionGroupResolveRequest, DefinitionGroupRe
 
 from ..auth.guards import COHORT_MIN_TIER, require_human, require_scope
 from ..auth.principal import HumanUser, Principal
-from ..definition_resolver import resolve_group
+from ..definition_resolver import DefinitionNotObservable, require_observable, resolve_group
 from ..definition_similarity import load_groups
 from ..deps import get_db_pool
 from ._helpers import authorize_prep_sample_cohort
@@ -34,7 +34,8 @@ async def resolve_definition_group_route(
 ) -> DefinitionGroupResolveResponse:
     """Each requested prep_sample's state in the named definition's group:
     `processed` (and under which member), `incomplete` or `not_processed`, with the
-    reason. 404 when the definition does not exist, before anything about the
+    reason. 404 when the definition does not exist and 422 when its group's runs are
+    not read per prep_sample (`require_observable`), both before anything about the
     cohort is said; 403 when the caller may not read every prep_sample."""
     async with pool.acquire() as conn, conn.transaction(isolation="repeatable_read", readonly=True):
         groups = await load_groups(conn)
@@ -43,6 +44,10 @@ async def resolve_definition_group_route(
                 status_code=404,
                 detail=f"{body.definition_kind.value} {body.definition_idx} not found",
             )
+        try:
+            require_observable(groups, body.definition_kind, body.definition_idx)
+        except DefinitionNotObservable as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         cohort = await authorize_prep_sample_cohort(
             conn, caller=caller, prep_sample_idx=body.prep_sample_idx, min_tier=COHORT_MIN_TIER
         )
