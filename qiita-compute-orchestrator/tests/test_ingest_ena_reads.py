@@ -426,6 +426,36 @@ def test_md5_mismatch_fetch_error_is_retriable(fake_mint, monkeypatch, tmp_path)
     assert "retried" not in exc.value.reason
 
 
+@pytest.mark.parametrize("prefix", ["duckdb_seq_read", "aspera_seq_read"])
+def test_truncated_gzip_fetch_error_is_retriable(prefix, fake_mint, monkeypatch, tmp_path):
+    """A gzip that ends before its end marker is a cut transfer, or a file ENA does
+    not serve at all; miint reports both alike, so it retries, bounded."""
+
+    def _fake(run_accession, download_method, intermediate_path, duckdb_tmp, memory_gb, threads):
+        raise duckdb.IOException(
+            f"{prefix}: gzip stream truncated before end marker (download likely incomplete)"
+        )
+
+    monkeypatch.setattr(ingest_module, "_stage_run_reads", _fake)
+    inputs = _inputs(tmp_path, [(10, "ERR001")])
+
+    with pytest.raises(BackendFailure) as exc:
+        _run(inputs, tmp_path / "ws")
+    assert exc.value.kind == FailureKind.EXTERNAL_FETCH_TRANSIENT
+    assert exc.value.transient is True
+    assert "ERR001" in exc.value.reason
+    assert "no file" in exc.value.reason
+
+
+def test_gzip_decompression_error_classifies_bad_input():
+    """Damaged gzip data fails the same way each time. `_run` re-raises an error
+    `_is_permanent_fetch_error` does not name, so the classifier is called directly."""
+    exc = duckdb.IOException("duckdb_seq_read: gzip decompression error")
+
+    failure = ingest_module._classify_ena_fetch_error("ERR001", exc, step_name="ingest_ena_reads")
+    assert failure.kind == FailureKind.BAD_INPUT
+
+
 def test_md5_error_with_transient_marker_still_classifies_transient(
     fake_mint, monkeypatch, tmp_path
 ):

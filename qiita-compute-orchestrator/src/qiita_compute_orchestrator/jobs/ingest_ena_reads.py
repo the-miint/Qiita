@@ -95,6 +95,8 @@ _PERMANENT_ERROR_MARKERS = ("malformed", "invalid fastq", "no sequence data")
 _ENA_INCOMPLETE_ANSWER_MARKER = "not all results may have been written"
 # miint's error for a scan of one run that failed mid-stream.
 _EVERY_RUN_FAILED_MARKER = "every run failed"
+# miint's wording for a gzip that ends early, whichever transport read it.
+_GZIP_TRUNCATED_MARKER = "gzip stream truncated before end marker"
 # The reason for a run whose data is partial (`_classify_ena_fetch_error`).
 _PARTIAL_RUN_TEXT = "its data is partial; refusing to register an incomplete read set"
 _MID_STREAM_RERUN_HINT = (
@@ -164,7 +166,7 @@ def _classify_ena_fetch_error(
 ) -> BackendFailure:
     """Classify a raised `duckdb.Error` from `_stage_run_reads`. Retriable: a
     network-shaped error, a transient or zero HTTP status, ENA's incomplete answer,
-    a mid-stream failure, an md5 mismatch. Anything else is BAD_INPUT, which
+    a mid-stream failure, an md5 mismatch, a truncated gzip. Anything else is BAD_INPUT, which
     `_is_permanent_fetch_error` then narrows to the recognised bad runs."""
     text = str(exc).lower()
     # A run that broke mid-download: its data is partial, which is not the same
@@ -213,6 +215,17 @@ def _classify_ena_fetch_error(
                 f"bad digest. If it keeps failing, "
                 f"compare the run's fastq_md5 in the ENA Portal API against the "
                 f"value reported here ({type(exc).__name__}): {exc}"
+            ),
+        )
+    if _GZIP_TRUNCATED_MARKER in text:
+        return BackendFailure(
+            kind=FailureKind.EXTERNAL_FETCH_TRANSIENT,
+            stage=WorkTicketFailureStage.STEP_RUN,
+            step_name=step_name,
+            reason=(
+                f"ENA run {run_accession}: gzip ended before its end marker (download "
+                f"incomplete, or ENA serves no file at that URL). If it keeps failing, "
+                f"check the run's file on ENA ({type(exc).__name__}): {exc}"
             ),
         )
     return BackendFailure(
