@@ -83,6 +83,7 @@ from qiita_common.models import (
     MaskSampleStatusUpdateResponse,
     ReadMaskedDoGetTicketRequest,
     SampleResolution,
+    SampleResolutionReason,
     SampleResolutionState,
     SyndnaInsert,
     SyndnaReadCountResponse,
@@ -404,7 +405,9 @@ async def get_syndna_read_count_route(
     that matches them. Each is resolved across the group (`definition_resolver`):
     a `processed` prep_sample's counts are read under the member that it resolved
     to; an `incomplete` or `not_processed` one is left out of the table and listed
-    in `left_out` with the reason. A deprecated named mask is 409 unless
+    in `left_out` with the reason, and so is a `processed` one with no stored counts,
+    as `not_processed` / `no_syndna_counts` (the `definition_resolver` docstring says
+    how a run reaches that state). A deprecated named mask is 409 unless
     `include_deprecated` (`deprecated_read`); with it, each prep_sample is resolved
     to that mask alone (`resolve_exact`), its counts are the mask's own, and the
     response is marked `deprecated`.
@@ -420,8 +423,8 @@ async def get_syndna_read_count_route(
 
     404 when the mask does not exist or nothing matches; 409 when no selected
     prep_sample is processed, when the masks that they resolved to ran without SynDNA
-    or against different references (`syndna_reference_of_resolved`), or when a
-    processed prep_sample has no counts; 413 above the roster cap. Every
+    or against different references (`syndna_reference_of_resolved`), or when no
+    processed prep_sample has counts; 413 above the roster cap. Every
     read is one read-only snapshot, so neither a re-mask nor a pair decision landing
     mid-request can mix two states into one table.
 
@@ -536,12 +539,23 @@ async def get_syndna_read_count_route(
             )
         counts[c["prep_sample_idx"]][position] = c["read_count"]
     uncounted = [ps for ps in sorted(mask_by_sample) if None in counts[ps]]
-    if uncounted:
+    for ps in uncounted:
+        left_out.append(
+            resolution.samples[ps].model_copy(
+                update={
+                    "state": SampleResolutionState.NOT_PROCESSED,
+                    "reason": SampleResolutionReason.NO_SYNDNA_COUNTS,
+                }
+            )
+        )
+        del mask_by_sample[ps]
+    left_out.sort(key=lambda r: r.prep_sample_idx)
+    if not mask_by_sample:
         raise HTTPException(
             status_code=409,
             detail=(
-                f"{len(uncounted)} processed prep_sample(s) have no SynDNA read counts under"
-                f" the mask they resolve to (e.g. {first_few(uncounted)}). Either the masking"
+                f"none of the {len(uncounted)} processed prep_sample(s) has SynDNA read counts"
+                f" under the mask it resolves to (e.g. {first_few(uncounted)}). Either the masking"
                 " ticket has not yet written them (retry once it completes, or ask an"
                 " operator to redrive it if it failed), or the prep_sample was masked"
                 " before counts were"

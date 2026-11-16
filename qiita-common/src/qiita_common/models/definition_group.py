@@ -27,8 +27,11 @@ class SampleResolutionState(StrEnum):
 
 
 class SampleResolutionReason(StrEnum):
-    """Why a prep_sample is `incomplete` or `not_processed`. Each code is set at one
-    site in `qiita_control_plane.definition_resolver`, whose docstring says when."""
+    """Why a prep_sample is `incomplete` or `not_processed`. Each code but
+    `no_syndna_counts` is set at one site in `qiita_control_plane.definition_resolver`,
+    whose docstring says when. `no_syndna_counts` is set by the SynDNA count export
+    alone, on a prep_sample the resolver found `processed` that has no stored counts:
+    the export lists it as `not_processed` with this reason."""
 
     # incomplete
     IN_PROGRESS = "in_progress"
@@ -43,6 +46,7 @@ class SampleResolutionReason(StrEnum):
     UPSTREAM_WITHDRAWN = "upstream_withdrawn"
     UPSTREAM_NO_RUN = "upstream_no_run"
     NO_DATA = "no_data"
+    NO_SYNDNA_COUNTS = "no_syndna_counts"
 
 
 class DefinitionGroupRefusal(StrEnum):

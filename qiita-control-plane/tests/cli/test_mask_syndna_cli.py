@@ -185,8 +185,15 @@ def test_main_lists_the_samples_the_table_leaves_out(monkeypatch, tmp_path, caps
                 "definition_kind": "mask",
                 "reason": "no_run",
             },
+            {
+                "prep_sample_idx": 6,
+                "state": "not_processed",
+                "definition_kind": "mask",
+                "definition_idx": 9,
+                "reason": "no_syndna_counts",
+            },
         ],
-        left_out_accession={2: "SAMEA2", 4: None},
+        left_out_accession={2: "SAMEA2", 4: None, 6: "SAMEA6"},
     )
     rc = _run(
         monkeypatch, tmp_path, "--study-idx", "1", "--output", str(out), *_DP, response=partial
@@ -194,12 +201,14 @@ def test_main_lists_the_samples_the_table_leaves_out(monkeypatch, tmp_path, caps
     assert rc == 0
     assert {r[0] for r in _cells(out, "biom")} == {"SAMEA1"}
     err = capsys.readouterr().err
-    assert "left out 2 prep_sample(s)" in err
+    assert "left out 3 prep_sample(s)" in err
     assert "prep_sample 2: incomplete (in_progress), mask 9, work_ticket 77" in err
     assert "prep_sample 4: not_processed (no_run)" in err
+    assert "prep_sample 6: not_processed (no_syndna_counts), mask 9" in err
     sidecar = json.loads(mx.syndna_sidecar_path(out).read_text())
     assert sidecar["left_out"] == [
         {"biosample_accession": "SAMEA2", "state": "incomplete", "reason": "in_progress"},
+        {"biosample_accession": "SAMEA6", "state": "not_processed", "reason": "no_syndna_counts"},
         {"biosample_accession": None, "state": "not_processed", "reason": "no_run"},
     ]
     assert sidecar["samples"] == {

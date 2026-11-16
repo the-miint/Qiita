@@ -52,7 +52,11 @@
   route refuses (409) a prep_sample that does not resolve to the mask it names. The
   SynDNA response gains `samples[].mask_idx` and `left_out`, and returns the
   processed prep_samples instead of refusing the request when some are not; masks
-  of the group with another SynDNA reference are refused.
+  of the group with another SynDNA reference are refused. A processed prep_sample
+  with no stored counts is left out too, as `not_processed` / `no_syndna_counts`
+  (previously the whole request was refused with a 409 naming `qiita-admin backfill
+  syndna-read-count`); that 409 now comes only when no processed prep_sample has
+  counts.
 - **The SynDNA count export records where each count came from (#874).** The route
   mints each counted mask's public handle (`QP<n>`) and returns it as
   `samples[].mask_export_processing_id`, with `left_out_biosample_accession`.

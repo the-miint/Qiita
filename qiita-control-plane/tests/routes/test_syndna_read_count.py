@@ -374,7 +374,34 @@ async def test_masks_with_a_different_syndna_reference_cannot_be_decided_similar
             )
 
 
+@pytest.mark.parametrize("deprecated", [False, True])
+async def test_a_processed_sample_without_counts_is_left_out(ctx, deprecated):
+    """A completed gate with no stored counts (persist-syndna-read-count failed after
+    finalize-mask-sample) is left out as `no_syndna_counts`; the rest are read. The
+    same holds under the exact read of a deprecated mask, and for a named sample."""
+    mask_idx = await _seed_syndna_mask(ctx)
+    study_idx = await _viewer_study(ctx)
+    counted, _ = await _counted_sample(ctx, mask_idx=mask_idx, study_idx=study_idx)
+    uncounted, _ = await _counted_sample(ctx, mask_idx=mask_idx, study_idx=study_idx, counts=None)
+    params = {"study_idx": study_idx, "prep_sample_idx": [counted, uncounted]}
+    if deprecated:
+        await _deprecate_mask(ctx, mask_idx)
+        params["include_deprecated"] = "true"
+
+    resp = await ctx["user"].get(_url(mask_idx), params=params)
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert [s["prep_sample_idx"] for s in body["samples"]] == [counted]
+    assert [
+        (r["prep_sample_idx"], r["state"], r["reason"], r["definition_idx"])
+        for r in body["left_out"]
+    ] == [(uncounted, "not_processed", "no_syndna_counts", mask_idx)]
+    assert set(body["left_out_biosample_accession"]) == {str(uncounted)}
+
+
 async def test_a_completed_sample_without_counts_names_the_backfill(ctx):
+    """Every processed prep_sample without counts: nothing to write, so refused."""
     mask_idx = await _seed_syndna_mask(ctx)
     study_idx = await _viewer_study(ctx)
     await _counted_sample(ctx, mask_idx=mask_idx, study_idx=study_idx, counts=None)
