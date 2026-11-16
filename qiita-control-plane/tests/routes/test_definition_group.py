@@ -1,7 +1,8 @@
 """DB tests for POST /definition-group/resolve: authorization (VIEWER on every study
 of every sample, refused whole), a cohort spanning pools, and the run reads the
 resolver makes against Postgres (gate rows, block and per-sample tickets, cancelled
-and abandoned ones, assembly tickets by the processing they record).
+and abandoned ones, a failed ticket cancelled after the fact, assembly tickets by the
+processing they record).
 
 The rules are unit-tested in tests/test_definition_resolver.py.
 """
@@ -14,6 +15,7 @@ import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 from qiita_common.actions import (
     ALIGN_ACTION_ID,
+    BLOCK_MASK_ACTION_ID,
     LONG_READ_ASSEMBLY_ACTION_ID,
     READ_MASK_ACTION_ID,
 )
@@ -39,9 +41,11 @@ from qiita_control_plane.repositories.block import (
     BLOCK_ABANDONED,
     BLOCK_PENDING,
     MASK_SAMPLE_COMPLETED,
+    MASK_SAMPLE_INVALIDATED,
     add_block_members,
     create_block,
 )
+from qiita_control_plane.repositories.mask_definition import set_mask_sample_states
 from qiita_control_plane.repositories.processing import mint_processing
 from qiita_control_plane.testing.db_seeds import (
     delete_action_if_created,
@@ -52,6 +56,7 @@ from qiita_control_plane.testing.db_seeds import (
     seed_sequenced_sample_subtype,
 )
 from qiita_control_plane.testing.db_teardown import teardown_entity_graph
+from qiita_control_plane.work_ticket_cancel import cancel_work_ticket
 
 pytestmark = pytest.mark.db
 
@@ -365,6 +370,138 @@ async def test_a_failed_per_sample_mask_ticket_under_the_newer_mask_is_incomplet
     await w["gate"]("mask_sample", w["mask_2"], w["ps_a"], MASK_SAMPLE_COMPLETED)
     s = _by_sample(await ctx["user"].post(URL_DEFINITION_GROUP_RESOLVE, json=body))[w["ps_a"]]
     assert (s["state"], s["definition_idx"]) == (PROCESSED, w["mask_2"])
+
+
+class _ReapRecorder:
+    """Stands in for the compute backend client: records each reap, reaps nothing."""
+
+    def __init__(self) -> None:
+        self.calls: list[int] = []
+
+    async def cancel(self, work_ticket_idx: int) -> list[int]:
+        self.calls.append(work_ticket_idx)
+        return []
+
+
+async def test_cancelling_a_failed_newest_ticket_over_a_completed_gate_makes_it_processed(
+    ctx, alignment_group_world, tickets
+):
+    """A completed gate with a failed newest per-sample ticket reads as incomplete;
+    once that ticket is cancelled it is ignored, and the completed run counts."""
+    w = alignment_group_world
+    await tickets["sample"](
+        READ_MASK_ACTION_ID,
+        prep_sample_idx=w["ps_a"],
+        state=WorkTicketState.COMPLETED,
+        mask_idx=w["mask_2"],
+    )
+    await w["gate"]("mask_sample", w["mask_2"], w["ps_a"], MASK_SAMPLE_COMPLETED)
+    failed = await tickets["sample"](
+        READ_MASK_ACTION_ID,
+        prep_sample_idx=w["ps_a"],
+        state=WorkTicketState.FAILED,
+        mask_idx=w["mask_2"],
+    )
+    body = _body(DefinitionKind.MASK, w["mask_idx"], [w["ps_a"]])
+    s = _by_sample(await ctx["user"].post(URL_DEFINITION_GROUP_RESOLVE, json=body))[w["ps_a"]]
+    assert (s["state"], s["reason"], s["work_ticket_idx"], s["definition_idx"]) == (
+        INCOMPLETE,
+        R.FAILED,
+        failed,
+        w["mask_2"],
+    )
+
+    backend = _ReapRecorder()
+    outcome = await cancel_work_ticket(ctx["pool"], backend, failed)
+    assert (outcome["previous_state"], outcome["cancelled"]) == (WorkTicketState.FAILED, True)
+    assert backend.calls == [failed]
+
+    s = _by_sample(await ctx["user"].post(URL_DEFINITION_GROUP_RESOLVE, json=body))[w["ps_a"]]
+    assert (s["state"], s["definition_idx"]) == (PROCESSED, w["mask_2"])
+
+
+async def _set_mask_sample(ctx, w, state: str) -> None:
+    """Withdraw or restore ps_a's run of mask_2 the way the sample-status PATCH does."""
+    async with ctx["pool"].acquire() as conn, conn.transaction():
+        result = await set_mask_sample_states(
+            conn,
+            mask_idx=w["mask_2"],
+            prep_sample_idxs=[w["ps_a"]],
+            state=state,
+            reason="redo in a test" if state == MASK_SAMPLE_INVALIDATED else None,
+            principal_idx=w["owner_idx"],
+        )
+    assert result["updated"] == [w["ps_a"]]
+
+
+async def test_the_redo_sequence_leaves_the_restored_run_processed(
+    ctx, alignment_group_world, tickets
+):
+    """Completed, withdrawn, a re-run that failed (the withdrawn gate does not reopen),
+    restored: the failed ticket is older than the restore, so it is stale. A newer
+    failed ticket after the restore counts again."""
+    w = alignment_group_world
+    await tickets["sample"](
+        READ_MASK_ACTION_ID,
+        prep_sample_idx=w["ps_a"],
+        state=WorkTicketState.COMPLETED,
+        mask_idx=w["mask_2"],
+    )
+    await w["gate"]("mask_sample", w["mask_2"], w["ps_a"], MASK_SAMPLE_COMPLETED)
+    await _set_mask_sample(ctx, w, MASK_SAMPLE_INVALIDATED)
+    rerun = await tickets["sample"](
+        READ_MASK_ACTION_ID,
+        prep_sample_idx=w["ps_a"],
+        state=WorkTicketState.FAILED,
+        mask_idx=w["mask_2"],
+    )
+    body = _body(DefinitionKind.MASK, w["mask_idx"], [w["ps_a"]])
+    s = _by_sample(await ctx["user"].post(URL_DEFINITION_GROUP_RESOLVE, json=body))[w["ps_a"]]
+    assert (s["state"], s["reason"], s["work_ticket_idx"]) == (INCOMPLETE, R.FAILED, rerun)
+
+    await _set_mask_sample(ctx, w, MASK_SAMPLE_COMPLETED)
+    s = _by_sample(await ctx["user"].post(URL_DEFINITION_GROUP_RESOLVE, json=body))[w["ps_a"]]
+    assert (s["state"], s["definition_idx"]) == (PROCESSED, w["mask_2"])
+
+    later = await tickets["sample"](
+        READ_MASK_ACTION_ID,
+        prep_sample_idx=w["ps_a"],
+        state=WorkTicketState.FAILED,
+        mask_idx=w["mask_2"],
+    )
+    s = _by_sample(await ctx["user"].post(URL_DEFINITION_GROUP_RESOLVE, json=body))[w["ps_a"]]
+    assert (s["state"], s["reason"], s["work_ticket_idx"]) == (INCOMPLETE, R.FAILED, later)
+
+
+async def test_a_failed_block_ticket_older_than_the_restore_is_stale(
+    ctx, alignment_group_world, tickets
+):
+    """The block-ticket form of the redo sequence; a running block ticket older than
+    the restore still makes the prep_sample incomplete."""
+    w = alignment_group_world
+    await w["gate"]("mask_sample", w["mask_2"], w["ps_a"], MASK_SAMPLE_COMPLETED)
+    await _set_mask_sample(ctx, w, MASK_SAMPLE_INVALIDATED)
+    await tickets["block"](
+        BLOCK_MASK_ACTION_ID,
+        samples=[w["ps_a"]],
+        state=WorkTicketState.FAILED,
+        mask_idx=w["mask_2"],
+    )
+    await _set_mask_sample(ctx, w, MASK_SAMPLE_COMPLETED)
+    body = _body(DefinitionKind.MASK, w["mask_idx"], [w["ps_a"]])
+    s = _by_sample(await ctx["user"].post(URL_DEFINITION_GROUP_RESOLVE, json=body))[w["ps_a"]]
+    assert (s["state"], s["definition_idx"]) == (PROCESSED, w["mask_2"])
+
+    running = await tickets["block"](
+        BLOCK_MASK_ACTION_ID,
+        samples=[w["ps_a"]],
+        state=WorkTicketState.PROCESSING,
+        mask_idx=w["mask_2"],
+    )
+    await _set_mask_sample(ctx, w, MASK_SAMPLE_INVALIDATED)
+    await _set_mask_sample(ctx, w, MASK_SAMPLE_COMPLETED)
+    s = _by_sample(await ctx["user"].post(URL_DEFINITION_GROUP_RESOLVE, json=body))[w["ps_a"]]
+    assert (s["state"], s["reason"], s["work_ticket_idx"]) == (INCOMPLETE, R.IN_PROGRESS, running)
 
 
 async def test_an_assembly_ticket_counts_for_the_processing_it_records(

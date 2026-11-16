@@ -208,7 +208,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_cancel = p_ticket_sub.add_parser(
         "cancel",
         help=(
-            "Cancel in-flight work_ticket(s): flip terminal (cancelled) so the CP"
+            "Cancel in-flight or failed work_ticket(s): flip them to cancelled so the CP"
             " stops driving them AND scancel their SLURM job(s), via the CP route"
             " (work_ticket:cancel scope). One ticket or a whole fan-out — no raw"
             " scancel across the compute account. Idempotent; redrive later with"
@@ -219,14 +219,18 @@ def _build_parser() -> argparse.ArgumentParser:
         "work_ticket_idx",
         nargs="*",
         type=int,
-        help="explicit work_ticket idx(s) to cancel (reaped regardless of state)",
+        help=(
+            "explicit work_ticket idx(s) to cancel: a pending, queued, processing or"
+            " failed one is flipped to cancelled; each is reaped whatever its state"
+        ),
     )
     p_cancel.add_argument(
         "--action-id",
         dest="action_id",
         default=None,
         help=(
-            "cancel all NON-terminal tickets for this action_id (e.g. read-mask);"
+            "cancel all NON-terminal tickets for this action_id (e.g. read-mask; a"
+            " failed ticket is cancelled only by idx);"
             " combine with --sequencing-run-idx / --sequenced-pool-idx to narrow"
         ),
     )

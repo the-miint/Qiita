@@ -1,10 +1,11 @@
 """Route + reap-helper tests for POST /api/v1/work-ticket/cancel and
 `work_ticket_cancel.cancel_work_ticket`.
 
-Covers: the terminal-first flip (non-terminal → cancelled) + scancel reap, the
-already-terminal no-op (still reaps), the not-found path, the action_id (+pool)
-filter, the missing-scope 403, and the reap_error surface (flip lands, scancel
-fails). A fake backend client records the reap and scripts its result / failure.
+Covers: the terminal-first flip (non-terminal or failed → cancelled) + scancel
+reap, the completed / no_data / cancelled no-op (still reaps), the not-found path,
+the action_id (+pool) filter, the missing-scope 403, and the reap_error surface
+(flip lands, scancel fails). A fake backend client records the reap and scripts
+its result / failure.
 """
 
 import uuid
@@ -14,6 +15,7 @@ import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 from qiita_common.api_paths import URL_WORK_TICKET_CANCEL
 from qiita_common.auth_constants import Scope, SystemRole
+from qiita_common.models import WorkTicketState
 
 pytestmark = pytest.mark.db
 
@@ -196,10 +198,14 @@ async def test_cancel_flips_terminal_then_reaps(ctx):
     assert ctx["backend"].cancel_calls == [idx]
 
 
-async def test_cancel_already_terminal_is_no_op_but_still_reaps(ctx):
-    """An already-terminal ticket is not re-flipped (cancelled=False) but its jobs
-    are still reaped — the defensive orphan-reap property."""
-    idx = await ctx["seed_ticket"]("failed")
+@pytest.mark.parametrize(
+    "state",
+    [WorkTicketState.COMPLETED, WorkTicketState.NO_DATA, WorkTicketState.CANCELLED],
+)
+async def test_cancel_completed_no_data_or_cancelled_is_no_op_but_still_reaps(ctx, state):
+    """A completed, no_data or cancelled ticket is not flipped (cancelled=False) but
+    its jobs are still reaped — the defensive orphan-reap property."""
+    idx = await ctx["seed_ticket"](state.value)
     async with _client() as c:
         resp = await c.post(
             URL_WORK_TICKET_CANCEL,
@@ -209,10 +215,75 @@ async def test_cancel_already_terminal_is_no_op_but_still_reaps(ctx):
     assert resp.status_code == 200, resp.text
     (r,) = resp.json()["results"]
     assert r["cancelled"] is False
-    assert r["previous_state"] == "failed"
-    assert r["state"] == "failed"  # unchanged
-    assert await _state(ctx["pool"], idx) == "failed"
+    assert r["previous_state"] == state.value
+    assert r["state"] == state.value  # unchanged
+    assert await _state(ctx["pool"], idx) == state.value
     assert ctx["backend"].cancel_calls == [idx]  # reap still ran
+
+
+async def test_cancel_failed_ticket_flips_clears_failure_and_reaps(ctx):
+    """A failed ticket named by idx is flipped to cancelled, its failure_* columns
+    are cleared (work_ticket_failure_consistent allows them only on failed), and the
+    reap runs after the flip."""
+    idx = await ctx["seed_ticket"](WorkTicketState.FAILED.value)
+    async with _client() as c:
+        resp = await c.post(
+            URL_WORK_TICKET_CANCEL,
+            json={"work_ticket_idxs": [idx]},
+            headers={"Authorization": f"Bearer {ctx['admin_tok']}"},
+        )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["cancelled"] == 1
+    (r,) = body["results"]
+    assert (r["previous_state"], r["state"], r["cancelled"]) == (
+        WorkTicketState.FAILED.value,
+        WorkTicketState.CANCELLED.value,
+        True,
+    )
+    assert r["cancelled_job_ids"] == [518235]
+    assert r["reap_error"] is None
+    row = await ctx["pool"].fetchrow(
+        "SELECT state, failure_type, failure_stage, failure_step_name, failure_reason"
+        " FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+        idx,
+    )
+    assert dict(row) == {
+        "state": WorkTicketState.CANCELLED.value,
+        "failure_type": None,
+        "failure_stage": None,
+        "failure_step_name": None,
+        "failure_reason": None,
+    }
+    assert ctx["backend"].cancel_calls == [idx]
+
+    # A second cancel is a no-op on the now-cancelled ticket and reaps again.
+    async with _client() as c:
+        resp = await c.post(
+            URL_WORK_TICKET_CANCEL,
+            json={"work_ticket_idxs": [idx]},
+            headers={"Authorization": f"Bearer {ctx['admin_tok']}"},
+        )
+    (r,) = resp.json()["results"]
+    assert (r["previous_state"], r["cancelled"]) == (WorkTicketState.CANCELLED.value, False)
+    assert ctx["backend"].cancel_calls == [idx, idx]
+
+
+async def test_cancel_failed_ticket_reap_error_keeps_the_flip(ctx):
+    """A failed ticket whose reap fails is still cancelled; reap_error says so."""
+    idx = await ctx["seed_ticket"](WorkTicketState.FAILED.value)
+    ctx["backend"].raise_on = idx
+    async with _client() as c:
+        resp = await c.post(
+            URL_WORK_TICKET_CANCEL,
+            json={"work_ticket_idxs": [idx]},
+            headers={"Authorization": f"Bearer {ctx['admin_tok']}"},
+        )
+    assert resp.status_code == 200, resp.text
+    (r,) = resp.json()["results"]
+    assert r["cancelled"] is True
+    assert r["reap_error"] is not None
+    assert await _state(ctx["pool"], idx) == WorkTicketState.CANCELLED.value
 
 
 async def test_cancel_not_found_idx(ctx):
@@ -231,10 +302,12 @@ async def test_cancel_not_found_idx(ctx):
 
 async def test_cancel_filter_by_action_id(ctx):
     """The action_id filter selects the non-terminal tickets for that action; a
-    terminal ticket for the same action is excluded from the filter."""
+    terminal ticket for the same action, failed included, is excluded from the
+    filter."""
     a = await ctx["seed_ticket"]("processing")
     b = await ctx["seed_ticket"]("queued")
     done = await ctx["seed_ticket"]("completed")  # terminal → excluded from filter
+    failed = await ctx["seed_ticket"](WorkTicketState.FAILED.value)
     async with _client() as c:
         resp = await c.post(
             URL_WORK_TICKET_CANCEL,
@@ -246,6 +319,8 @@ async def test_cancel_filter_by_action_id(ctx):
     got = {r["work_ticket_idx"] for r in body["results"]}
     assert {a, b} <= got
     assert done not in got
+    assert failed not in got
+    assert await _state(ctx["pool"], failed) == WorkTicketState.FAILED.value
     assert await _state(ctx["pool"], a) == "cancelled"
     assert await _state(ctx["pool"], b) == "cancelled"
 

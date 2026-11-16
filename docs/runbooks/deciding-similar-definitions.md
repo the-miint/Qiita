@@ -73,7 +73,20 @@ for that prep_sample. Its state is one of:
   group. Its results are used, labeled with that member.
 - **incomplete**: a ticket for that member is waiting, running or failed, or the
   prep_sample's upstream now resolves to another member or is itself incomplete.
-  Cancelled tickets are ignored. Nothing re-runs a prep_sample automatically.
+  Cancelled tickets are ignored. A failed ticket is also ignored when the
+  prep_sample's gate under that member is completed (for an assembly, also
+  `no_data`) or withdrawn and was changed
+  after the ticket was created: withdrawing a run, re-running it (which fails,
+  because a withdrawn gate does not reopen) and restoring the gate leaves the
+  restored run processed. Nothing re-runs a prep_sample automatically.
+
+  A failed ticket that still makes a prep_sample incomplete, over a run you have
+  checked and want used, can be cancelled by a system_admin; the resolver then
+  ignores it:
+
+  ```bash
+  qiita-admin ticket cancel <work_ticket_idx>
+  ```
 - **not processed**: no member has a run, or the run was withdrawn, or the
   definition or an upstream is deprecated or withdrawn. An older member's run is not
   used instead.

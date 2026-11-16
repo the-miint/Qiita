@@ -2,6 +2,7 @@
 and each incomplete / not-processed reason. No database: definitions, pairs and run
 observations are built in memory and handed to the pure core."""
 
+from datetime import UTC, datetime, timedelta
 from itertools import count
 
 import pytest
@@ -59,6 +60,7 @@ INCOMPLETE = SampleResolutionState.INCOMPLETE
 NOT_PROCESSED = SampleResolutionState.NOT_PROCESSED
 R = SampleResolutionReason
 S = 900  # the prep_sample every test resolves
+T0 = datetime(2026, 1, 1, tzinfo=UTC)  # a row's `at` where the order of changes is moot
 
 _pair_ids = count(1000)
 
@@ -232,6 +234,7 @@ def test_a_block_ticket_in_each_state_over_a_pending_gate(ticket_state):
             prep_sample_idx=S,
             state=MASK_SAMPLE_COMPLETED,
             work_ticket_idx=None,
+            at=T0,
         ),
         RunRow(
             source=SOURCE_GATE,
@@ -239,6 +242,7 @@ def test_a_block_ticket_in_each_state_over_a_pending_gate(ticket_state):
             prep_sample_idx=S,
             state=MASK_SAMPLE_PENDING,
             work_ticket_idx=None,
+            at=T0,
         ),
         RunRow(
             source=SOURCE_BLOCK_TICKET,
@@ -246,9 +250,10 @@ def test_a_block_ticket_in_each_state_over_a_pending_gate(ticket_state):
             prep_sample_idx=S,
             state=ticket_state.value,
             work_ticket_idx=77,
+            at=T0,
         ),
     ]
-    r = resolve(DEFS, PAIRS, MASK, 5, {MASK: build_observations(rows)})
+    r = resolve(DEFS, PAIRS, MASK, 5, {MASK: build_observations(MASK, rows)})
     assert (r.state, r.definition_idx, r.reason) == _EXPECTED_BY_TICKET_STATE[ticket_state]
 
 
@@ -282,10 +287,10 @@ def test_a_rearmed_block_reads_as_incomplete():
     """rerun-block sets the completed gates back to pending and re-arms the block's
     ticket in place."""
     rows = [
-        RunRow(SOURCE_GATE, 120, S, ALIGNMENT_SAMPLE_PENDING, None),
-        RunRow(SOURCE_BLOCK_TICKET, 120, S, WorkTicketState.PENDING.value, 81),
+        RunRow(SOURCE_GATE, 120, S, ALIGNMENT_SAMPLE_PENDING, None, T0),
+        RunRow(SOURCE_BLOCK_TICKET, 120, S, WorkTicketState.PENDING.value, 81, T0),
     ]
-    obs = {ALIGNMENT: build_observations(rows), MASK: {(12, S): done()}}
+    obs = {ALIGNMENT: build_observations(ALIGNMENT, rows), MASK: {(12, S): done()}}
     r = resolve(DEFS, PAIRS, ALIGNMENT, 120, obs)
     assert (r.state, r.reason, r.work_ticket_idx) == (INCOMPLETE, R.IN_PROGRESS, 81)
 
@@ -296,7 +301,7 @@ def test_a_pending_gate_whose_tickets_were_cancelled_is_not_a_run():
     obs = {
         MASK: {
             (5, S): done(),
-            **build_observations([RunRow(SOURCE_GATE, 12, S, MASK_SAMPLE_PENDING, None)]),
+            **build_observations(MASK, [RunRow(SOURCE_GATE, 12, S, MASK_SAMPLE_PENDING, None, T0)]),
         }
     }
     r = resolve(DEFS, PAIRS, MASK, 12, obs)
@@ -518,29 +523,32 @@ def test_only_the_newest_per_sample_ticket_counts():
     """A failed ticket a later completed one superseded does not leave the sample
     incomplete; a failed re-run after a completed one does."""
     superseded = build_observations(
+        MASK,
         [
-            RunRow(SOURCE_GATE, 12, S, MASK_SAMPLE_COMPLETED, None),
-            RunRow(SOURCE_SAMPLE_TICKET, 12, S, WorkTicketState.FAILED.value, 10),
-            RunRow(SOURCE_SAMPLE_TICKET, 12, S, WorkTicketState.COMPLETED.value, 11),
-        ]
+            RunRow(SOURCE_GATE, 12, S, MASK_SAMPLE_COMPLETED, None, T0),
+            RunRow(SOURCE_SAMPLE_TICKET, 12, S, WorkTicketState.FAILED.value, 10, T0),
+            RunRow(SOURCE_SAMPLE_TICKET, 12, S, WorkTicketState.COMPLETED.value, 11, T0),
+        ],
     )
     assert superseded[(12, S)].unfinished == ()
     rerun_failed = build_observations(
+        MASK,
         [
-            RunRow(SOURCE_SAMPLE_TICKET, 12, S, WorkTicketState.COMPLETED.value, 10),
-            RunRow(SOURCE_SAMPLE_TICKET, 12, S, WorkTicketState.FAILED.value, 11),
-        ]
+            RunRow(SOURCE_SAMPLE_TICKET, 12, S, WorkTicketState.COMPLETED.value, 10, T0),
+            RunRow(SOURCE_SAMPLE_TICKET, 12, S, WorkTicketState.FAILED.value, 11, T0),
+        ],
     )
     assert rerun_failed[(12, S)].unfinished == ((11, WorkTicketState.FAILED),)
 
 
 def test_every_covering_block_ticket_counts():
     obs = build_observations(
+        MASK,
         [
-            RunRow(SOURCE_BLOCK_TICKET, 12, S, WorkTicketState.COMPLETED.value, 10),
-            RunRow(SOURCE_BLOCK_TICKET, 12, S, WorkTicketState.FAILED.value, 11),
-            RunRow(SOURCE_BLOCK_TICKET, 12, S, WorkTicketState.PROCESSING.value, 12),
-        ]
+            RunRow(SOURCE_BLOCK_TICKET, 12, S, WorkTicketState.COMPLETED.value, 10, T0),
+            RunRow(SOURCE_BLOCK_TICKET, 12, S, WorkTicketState.FAILED.value, 11, T0),
+            RunRow(SOURCE_BLOCK_TICKET, 12, S, WorkTicketState.PROCESSING.value, 12, T0),
+        ],
     )
     assert obs[(12, S)].unfinished == (
         (11, WorkTicketState.FAILED),
@@ -548,10 +556,82 @@ def test_every_covering_block_ticket_counts():
     )
 
 
+T1, T2, T3 = (T0 + timedelta(hours=h) for h in (1, 2, 3))
+
+
+def _rows(gate_state, gate_at, *tickets):
+    """A gate row under mask 12 changed at `gate_at`, and `(source, state, idx, created_at)`
+    tickets."""
+    return [
+        RunRow(SOURCE_GATE, 12, S, gate_state, None, gate_at),
+        *(RunRow(src, 12, S, st.value, idx, at) for src, st, idx, at in tickets),
+    ]
+
+
+def _resolve_rows(rows):
+    obs = {MASK: {(5, S): done(), **build_observations(MASK, rows)}}
+    r = resolve(DEFS, PAIRS, MASK, 12, obs)
+    return r.state, r.definition_idx, r.reason, r.work_ticket_idx
+
+
+@pytest.mark.parametrize("source", [SOURCE_SAMPLE_TICKET, SOURCE_BLOCK_TICKET])
+def test_a_failed_ticket_created_before_the_gate_was_restored_is_stale(source):
+    """Withdraw (T1), a re-run that fails at finalize (created T2), restore (T3): the
+    failed ticket is older than the gate's last change, so the restored run counts."""
+    rows = _rows(MASK_SAMPLE_COMPLETED, T3, (source, WorkTicketState.FAILED, 11, T2))
+    assert _resolve_rows(rows) == (PROCESSED, 12, None, None)
+
+
+@pytest.mark.parametrize("source", [SOURCE_SAMPLE_TICKET, SOURCE_BLOCK_TICKET])
+def test_a_failed_ticket_created_after_the_gate_completed_counts(source):
+    rows = _rows(MASK_SAMPLE_COMPLETED, T1, (source, WorkTicketState.FAILED, 11, T2))
+    assert _resolve_rows(rows) == (INCOMPLETE, 12, R.FAILED, 11)
+
+
+def test_a_failed_ticket_created_with_the_gate_counts():
+    """Same timestamp: the ticket and the gate row were written in one transaction."""
+    rows = _rows(MASK_SAMPLE_COMPLETED, T1, (SOURCE_BLOCK_TICKET, WorkTicketState.FAILED, 11, T1))
+    assert _resolve_rows(rows) == (INCOMPLETE, 12, R.FAILED, 11)
+
+
+@pytest.mark.parametrize("state", [WorkTicketState.PENDING, WorkTicketState.PROCESSING])
+@pytest.mark.parametrize("source", [SOURCE_SAMPLE_TICKET, SOURCE_BLOCK_TICKET])
+def test_a_running_ticket_created_before_the_gate_change_still_counts(source, state):
+    rows = _rows(MASK_SAMPLE_COMPLETED, T3, (source, state, 11, T2))
+    assert _resolve_rows(rows) == (INCOMPLETE, 12, R.IN_PROGRESS, 11)
+
+
+def test_a_failed_ticket_under_a_pending_gate_that_changed_later_counts():
+    """rerun-block sets the gate pending after the block ticket's creation and re-arms
+    that ticket in place; when it fails again, it is the run that explains the gate."""
+    rows = _rows(MASK_SAMPLE_PENDING, T3, (SOURCE_BLOCK_TICKET, WorkTicketState.FAILED, 11, T2))
+    assert _resolve_rows(rows) == (INCOMPLETE, 12, R.FAILED, 11)
+
+
+def test_a_failed_ticket_older_than_a_withdrawal_is_stale():
+    rows = _rows(
+        MASK_SAMPLE_INVALIDATED, T3, (SOURCE_SAMPLE_TICKET, WorkTicketState.FAILED, 11, T2)
+    )
+    assert _resolve_rows(rows)[:3] == (NOT_PROCESSED, 12, R.WITHDRAWN)
+
+
+def test_a_failed_ticket_with_no_gate_row_counts():
+    obs = {
+        MASK: {
+            (5, S): done(),
+            **build_observations(
+                MASK, [RunRow(SOURCE_SAMPLE_TICKET, 12, S, WorkTicketState.FAILED.value, 11, T2)]
+            ),
+        }
+    }
+    r = resolve(DEFS, PAIRS, MASK, 12, obs)
+    assert (r.state, r.reason, r.work_ticket_idx) == (INCOMPLETE, R.FAILED, 11)
+
+
 def test_a_ticket_row_without_a_ticket_id_is_refused():
     with pytest.raises(ValueError, match="no work_ticket_idx"):
         build_observations(
-            [RunRow(SOURCE_SAMPLE_TICKET, 12, S, WorkTicketState.FAILED.value, None)]
+            MASK, [RunRow(SOURCE_SAMPLE_TICKET, 12, S, WorkTicketState.FAILED.value, None, T0)]
         )
 
 

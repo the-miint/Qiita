@@ -13,6 +13,14 @@ produce it:
   its definition on it (a per-sample ticket not yet started names none, so it does
   not make a prep_sample incomplete). A ticket is *unfinished* when it is waiting,
   running or failed.
+  A failed ticket is *stale*, and ignored, when the gate row is `completed`,
+  `no_data` or `invalidated` and changed after the ticket was created (the gate's
+  `updated_at` is later than the ticket's `created_at`). Withdrawing a run, re-running
+  it, which fails because the withdrawn gate does not reopen, and then restoring the
+  gate leaves such a ticket behind the restored run. A failed ticket under a
+  `pending` gate, or with no gate row, is never stale: rerun-block re-arms a block
+  ticket in place, keeping its `created_at`, after setting its gates `pending`.
+  Waiting and running tickets are never stale.
 
 **Which member.** Of the anchor's group (`Groups.group_of`), the highest-id member
 under which the prep_sample has a gate `completed`, `no_data` (assembly) or
@@ -205,7 +213,8 @@ _UPSTREAM_NOT_PROCESSED = {
 @dataclass(frozen=True)
 class RunObservation:
     """What is known of one `(definition, prep_sample)`: its gate state (None when no
-    row) and its unfinished tickets as `(work_ticket_idx, state)`."""
+    row) and its unfinished tickets as `(work_ticket_idx, state)`, stale failed
+    tickets left out."""
 
     gate: str | None = None
     unfinished: tuple[tuple[int, WorkTicketState], ...] = ()
@@ -214,44 +223,59 @@ class RunObservation:
 Observations = Mapping[DefinitionKind, Mapping[tuple[int, int], RunObservation]]
 
 
-def build_observations(rows: Iterable[RunRow]) -> dict[tuple[int, int], RunObservation]:
+def build_observations(
+    kind: DefinitionKind, rows: Iterable[RunRow]
+) -> dict[tuple[int, int], RunObservation]:
     """One kind's observations, keyed `(definition_idx, prep_sample_idx)`, from its
     gate rows and producing tickets (cancelled ones already excluded). Of a
-    prep_sample's per-sample tickets only the newest counts; every block ticket counts."""
-    gates: dict[tuple[int, int], str] = {}
-    newest_sample_ticket: dict[tuple[int, int], tuple[int, WorkTicketState]] = {}
-    block_tickets: dict[tuple[int, int], set[tuple[int, WorkTicketState]]] = {}
+    prep_sample's per-sample tickets only the newest counts; every block ticket counts.
+    A stale failed ticket (module docstring) is then dropped."""
+    gates: dict[tuple[int, int], RunRow] = {}
+    newest_sample_ticket: dict[tuple[int, int], RunRow] = {}
+    block_tickets: dict[tuple[int, int], list[RunRow]] = {}
     for row in rows:
         key = (row.definition_idx, row.prep_sample_idx)
         if row.source == SOURCE_GATE:
-            gates[key] = row.state
+            gates[key] = row
             continue
         if row.work_ticket_idx is None:
             raise ValueError(f"a {row.source} row carries no work_ticket_idx: {row}")
-        ticket = (row.work_ticket_idx, WorkTicketState(row.state))
         if row.source == SOURCE_SAMPLE_TICKET:
-            if key not in newest_sample_ticket or ticket[0] > newest_sample_ticket[key][0]:
-                newest_sample_ticket[key] = ticket
+            newest = newest_sample_ticket.get(key)
+            if newest is None or row.work_ticket_idx > newest.work_ticket_idx:
+                newest_sample_ticket[key] = row
         elif row.source == SOURCE_BLOCK_TICKET:
-            block_tickets.setdefault(key, set()).add(ticket)
+            block_tickets.setdefault(key, []).append(row)
         else:
             raise ValueError(f"unknown run row source {row.source!r}")
     out: dict[tuple[int, int], RunObservation] = {}
     for key in gates.keys() | newest_sample_ticket.keys() | block_tickets.keys():
-        tickets = set(block_tickets.get(key, ()))
+        gate = gates.get(key)
+        tickets = list(block_tickets.get(key, ()))
         if key in newest_sample_ticket:
-            tickets.add(newest_sample_ticket[key])
+            tickets.append(newest_sample_ticket[key])
+        unfinished: set[tuple[int, WorkTicketState]] = set()
+        for t in tickets:
+            state = WorkTicketState(t.state)
+            role = _TICKET_ROLE[state]
+            if role is _TicketRole.RUNNING or (
+                role is _TicketRole.FAILED and not _stale(kind, t, gate)
+            ):
+                unfinished.add((t.work_ticket_idx, state))
         out[key] = RunObservation(
-            gate=gates.get(key),
-            unfinished=tuple(
-                sorted(
-                    t
-                    for t in tickets
-                    if _TICKET_ROLE[t[1]] in (_TicketRole.RUNNING, _TicketRole.FAILED)
-                )
-            ),
+            gate=None if gate is None else gate.state, unfinished=tuple(sorted(unfinished))
         )
     return out
+
+
+def _stale(kind: DefinitionKind, failed: RunRow, gate: RunRow | None) -> bool:
+    """Whether a failed ticket is stale: its gate row is not `pending` and changed
+    after the ticket was created (module docstring, **A run**)."""
+    return (
+        gate is not None
+        and _gate_role(kind, gate.state) is not _GateRole.NONE
+        and gate.at > failed.at
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -501,7 +525,7 @@ async def _load_observations(
     out: dict[DefinitionKind, dict[tuple[int, int], RunObservation]] = {}
     for kind, idxs in needed.items():
         out[kind] = build_observations(
-            await fetch_run_rows(conn, kind, sorted(idxs), prep_sample_idxs)
+            kind, await fetch_run_rows(conn, kind, sorted(idxs), prep_sample_idxs)
         )
     return out
 

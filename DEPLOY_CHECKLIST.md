@@ -60,6 +60,70 @@ _None yet._
   cd ~/qiita-miint/qiita-control-plane
   sed -n '/^-- migrate:up/,/^-- migrate:down/p' db/migrations/20261116000001_backfill_work_ticket_processing_idx.sql | psql "$DATABASE_URL" -v ON_ERROR_STOP=1
   ```
+- `[operator]` **Find the failed tickets that still hide a completed gate, check each, and cancel
+  the ones whose completed run should be used.** The definition-group resolver reads a
+  prep_sample as `incomplete` when its newest ticket under a definition, or a covering block
+  ticket, is `failed`, unless that ticket is older than the gate's last change; the query below
+  lists the failed tickets it still counts over a `completed` (or assembly `no_data`) gate.
+  The live read-mask tickets left `failed` by the withdraw / re-run / restore redo predate
+  their gates' restore, so the resolver already ignores them and they are not listed. For each listed
+  ticket, read its failure (`qiita ticket status`) and decide whether the completed run is
+  the one to use; if so, cancel it, as a system_admin with a PAT carrying `work_ticket:cancel`, with
+  `qiita-admin ticket cancel <work_ticket_idx>`. Read-only query; it does not burn the rollback path. (#874)
+  ```bash
+  # [operator] DATABASE_URL set as in docs/runbooks/redeploy.md (migrate step)
+  psql "$DATABASE_URL" -v ON_ERROR_STOP=1 <<'SQL'
+  BEGIN READ ONLY;
+  WITH gate AS (
+      SELECT 'mask' AS kind, mask_idx AS definition_idx, prep_sample_idx, state, updated_at
+        FROM qiita.mask_sample WHERE state = 'completed'
+      UNION ALL
+      SELECT 'alignment', alignment_idx, prep_sample_idx, state, updated_at
+        FROM qiita.alignment_sample WHERE state = 'completed'
+      UNION ALL
+      SELECT 'processing', processing_idx, prep_sample_idx, state, updated_at
+        FROM qiita.assembly_sample WHERE state IN ('completed', 'no_data')
+  ), sample_ticket AS (
+      -- each prep_sample's newest non-cancelled per-sample ticket under a definition
+      SELECT DISTINCT ON (kind, definition_idx, prep_sample_idx) *
+        FROM (
+          SELECT 'mask' AS kind, mask_idx AS definition_idx, prep_sample_idx,
+                 work_ticket_idx, state, created_at
+            FROM qiita.work_ticket
+           WHERE action_id IN ('read-mask', 'fastq-to-parquet') AND mask_idx IS NOT NULL
+          UNION ALL
+          SELECT 'alignment', alignment_idx, prep_sample_idx, work_ticket_idx, state, created_at
+            FROM qiita.work_ticket
+           WHERE action_id = 'align-denovo' AND alignment_idx IS NOT NULL
+          UNION ALL
+          SELECT 'processing', processing_idx, prep_sample_idx, work_ticket_idx, state, created_at
+            FROM qiita.work_ticket
+           WHERE action_id = 'long-read-assembly' AND processing_idx IS NOT NULL
+        ) t
+       WHERE prep_sample_idx IS NOT NULL AND state <> 'cancelled'
+       ORDER BY kind, definition_idx, prep_sample_idx, work_ticket_idx DESC
+  ), block_ticket AS (
+      -- every non-cancelled ticket of a non-abandoned block covering the prep_sample
+      SELECT CASE wt.action_id WHEN 'read-mask-block' THEN 'mask' ELSE 'alignment' END AS kind,
+             CASE wt.action_id WHEN 'read-mask-block' THEN wt.mask_idx ELSE wt.alignment_idx END
+               AS definition_idx,
+             bm.prep_sample_idx, wt.work_ticket_idx, wt.state, wt.created_at
+        FROM qiita.work_ticket wt
+        JOIN qiita.block b ON b.work_ticket_idx = wt.work_ticket_idx
+        JOIN qiita.block_member bm ON bm.block_idx = b.block_idx
+       WHERE wt.action_id IN ('read-mask-block', 'align')
+         AND wt.state <> 'cancelled' AND b.state <> 'abandoned'
+  )
+  SELECT g.kind, g.definition_idx, g.prep_sample_idx, g.state AS gate_state,
+         g.updated_at AS gate_changed_at, t.work_ticket_idx, t.created_at AS ticket_created_at
+    FROM gate g
+    JOIN (SELECT * FROM sample_ticket UNION ALL SELECT * FROM block_ticket) t
+      USING (kind, definition_idx, prep_sample_idx)
+   WHERE t.state = 'failed' AND t.created_at >= g.updated_at
+   ORDER BY g.kind, g.definition_idx, g.prep_sample_idx, t.work_ticket_idx;
+  ROLLBACK;
+  SQL
+  ```
 
 ### Notes (no host action)
 

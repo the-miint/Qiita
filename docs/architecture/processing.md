@@ -349,7 +349,10 @@ migration `20261113000000_definition_pair.sql`). The procedure is
   feature-table build` (one part per resolved alignment; see [flight.md](flight.md))
   and the human alignment cohort DoGet; the ticket routes refuse a prep_sample that
   does not resolve to the definition they name. `resolve_group` runs only in a
-  REPEATABLE READ transaction, and says why.
+  REPEATABLE READ transaction, and says why. It reads each gate row's `updated_at`
+  and each ticket's `created_at` in the same statement: a failed ticket older than
+  the last change of a gate that is not `pending` is stale and does not make the
+  prep_sample incomplete. Its module docstring holds the rules.
 - **The group lock** is one Postgres advisory lock over every kind's groups
   (`repositories/definition_pair.py`). A decide or revoke takes it exclusive, by
   try-lock with a bounded retry and a 503 when it stays busy; the three deprecation

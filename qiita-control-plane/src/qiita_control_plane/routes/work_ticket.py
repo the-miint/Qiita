@@ -176,8 +176,9 @@ async def _resolve_cancel_filter(pool: asyncpg.Pool, body: WorkTicketCancelReque
     (`sequenced_pool`-scoped, e.g. bcl-convert) or its prep_sample's
     (`prep_sample`-scoped, e.g. read-mask) — COALESCE bridges both so a
     `sequenced_pool_idx` / `sequencing_run_idx` narrowing covers either shape. Only
-    non-terminal tickets: the filter targets in-flight work (cancelling a terminal
-    ticket is a no-op), whereas an explicit idx is reaped regardless."""
+    non-terminal tickets: the filter targets in-flight work, so a failed ticket is
+    cancelled only when named by idx, and an explicit idx is reaped whatever its
+    state."""
     rows = await pool.fetch(
         "SELECT DISTINCT wt.work_ticket_idx"
         " FROM qiita.work_ticket wt"
@@ -866,8 +867,8 @@ async def _refuse_unsafe_download_redrive(
             status_code=status.HTTP_409_CONFLICT,
             detail=(
                 f"work_ticket {work_ticket_idx} still has a live download job that may hold "
-                "an outdated run roster; cancel it by idx (work_ticket_idxs) to reap the job, "
-                "then re-import the study; the ticket stays FAILED"
+                "an outdated run roster; cancel it by idx (work_ticket_idxs), which reaps the "
+                "job and sets the ticket cancelled, then run it again or re-import the study"
             ),
         )
 
@@ -1069,17 +1070,20 @@ async def cancel_work_tickets(
     _scope: Principal = Depends(require_scope(Scope.WORK_TICKET_CANCEL)),
     _: None = Depends(require_compute_backend_client_dependency),
 ) -> WorkTicketCancelResponse:
-    """Operator-cancel of in-flight compute (system_admin, `work_ticket:cancel`):
-    for each selected ticket, flip it terminal (`cancelled`) so the runner's poll
-    loop aborts and no new attempt is submitted, THEN scancel its SLURM job(s) — the
+    """Operator-cancel of in-flight or failed work (system_admin, `work_ticket:cancel`):
+    for each selected ticket, flip it to `cancelled` so the runner's poll loop aborts
+    and no new attempt is submitted, THEN scancel its SLURM job(s) — the
     terminal-first ordering that avoids re-submitting the job we just reaped.
+    `work_ticket_cancel.CANCELLABLE_WORK_TICKET_STATES` names the states that flip.
 
     Selection is the explicit `work_ticket_idxs` (reaped regardless of state — a
-    defensive orphan-reap) UNION the `action_id` (+ optional run/pool) filter
-    matches (non-terminal only). Idempotent per ticket: an already-terminal ticket
-    is not re-flipped (`cancelled=False`) but its jobs are still reaped. A missing
-    explicit idx comes back `not_found`; a reap that fails after the flip lands
-    comes back with `reap_error` (the flip stands — re-run cancel to retry)."""
+    defensive orphan-reap; a failed one is flipped too) UNION the `action_id`
+    (+ optional run/pool) filter matches (non-terminal only, so the filter never
+    cancels a failed ticket). Idempotent per ticket: a `completed`, `no_data` or
+    `cancelled` ticket is not flipped (`cancelled=False`) but its jobs are still
+    reaped. A missing explicit idx comes back `not_found`; a reap that fails after
+    the flip lands comes back with `reap_error` (the flip stands — re-run cancel to
+    retry)."""
     backend_client = request.app.state.compute_backend_client
     # Explicit idxs first (stable, deduped), then filter matches not already listed.
     selected = list(dict.fromkeys(body.work_ticket_idxs))

@@ -8,6 +8,7 @@ does, from these rows.
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import datetime
 
 import asyncpg
 from qiita_common.actions import (
@@ -32,13 +33,15 @@ SOURCE_BLOCK_TICKET = "block_ticket"
 class RunRow:
     """One gate row or one producing ticket of a `(definition, prep_sample)`.
     `state` is the gate's state for a gate row and the ticket's otherwise;
-    `work_ticket_idx` is None for a gate row."""
+    `work_ticket_idx` is None for a gate row. `at` is the gate row's `updated_at`
+    (its last change) or the ticket's `created_at`."""
 
     source: str
     definition_idx: int
     prep_sample_idx: int
     state: str
     work_ticket_idx: int | None
+    at: datetime
 
 
 @dataclass(frozen=True)
@@ -95,7 +98,8 @@ async def fetch_run_rows(
     """Every gate row of `kind` for these definitions and prep_samples, and every
     producing ticket that is not cancelled: prep_sample-scoped tickets naming the
     definition, and the tickets of blocks that cover the prep_sample and are not
-    abandoned. One statement, so gates and tickets are read from one snapshot."""
+    abandoned. One statement, so gates, tickets and their timestamps are read from
+    one snapshot."""
     definitions = sorted(set(definition_idxs))
     samples = sorted(set(prep_sample_idxs))
     if not definitions or not samples:
@@ -103,12 +107,12 @@ async def fetch_run_rows(
     t = _KIND_TABLES[kind]
     rows = await conn.fetch(
         f"SELECT $5::text AS source, g.{t.gate_column} AS definition_idx, g.prep_sample_idx,"
-        f"       g.state, NULL::bigint AS work_ticket_idx"
+        f"       g.state, NULL::bigint AS work_ticket_idx, g.updated_at AS at"
         f"  FROM {t.gate_table} g"
         f" WHERE g.{t.gate_column} = ANY($1::bigint[]) AND g.prep_sample_idx = ANY($2::bigint[])"
         f" UNION ALL"
         f" SELECT $6::text, wt.{t.ticket_column}, wt.prep_sample_idx, wt.state::text,"
-        f"        wt.work_ticket_idx"
+        f"        wt.work_ticket_idx, wt.created_at"
         f"   FROM qiita.work_ticket wt"
         f"  WHERE wt.action_id = ANY($3::text[])"
         f"    AND wt.{t.ticket_column} = ANY($1::bigint[])"
@@ -116,7 +120,7 @@ async def fetch_run_rows(
         f"    AND wt.state <> $8::qiita.work_ticket_state"
         f" UNION ALL"
         f" SELECT $7::text, wt.{t.ticket_column}, bm.prep_sample_idx, wt.state::text,"
-        f"        wt.work_ticket_idx"
+        f"        wt.work_ticket_idx, wt.created_at"
         f"   FROM qiita.work_ticket wt"
         f"   JOIN qiita.block b ON b.work_ticket_idx = wt.work_ticket_idx"
         f"   JOIN qiita.block_member bm ON bm.block_idx = b.block_idx"

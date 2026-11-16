@@ -56,6 +56,19 @@
   deprecation 409 for unfinished work tickets now has the same shape: `reason` is the
   code `live_work` (it was the message), the message moved to `detail`, and
   `work_ticket_idx` is unchanged.
+- **`qiita-admin ticket cancel` (`POST /api/v1/work-ticket/cancel`) also cancels a
+  failed ticket named by idx (#874)**, clearing its `failure_*` columns (the control
+  plane logs them) and reaping its SLURM jobs as for any cancel. The `--action-id`
+  filter still selects only pending, queued and processing tickets. A failed
+  `download-ena-study` ticket with a live job, cancelled to reap the job, is now
+  `cancelled`, and `/run` on it is admitted.
+- **The definition-group resolver ignores a stale failed ticket (#874):** one created
+  before the last change of the prep_sample's gate under that definition, when the
+  gate is `completed`, `no_data` or `invalidated`. Withdrawing a run, re-running it
+  (which fails at `finalize-mask-sample` because the withdrawn gate does not reopen)
+  and restoring the gate now leaves the prep_sample `processed` instead of
+  `incomplete`. A failed ticket under a `pending` gate or with no gate row, and a
+  waiting or running ticket, count as before.
 - **A work ticket records the processing that it minted (`work_ticket.processing_idx`,
   #874)**, and the definition-group resolver reads it to tell which processing a
   `long-read-assembly` ticket ran. A migration sets it on the tickets started before
