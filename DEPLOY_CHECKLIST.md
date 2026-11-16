@@ -31,7 +31,7 @@ _None yet._
   2. Only then run it with `--execute`.
   3. Dry-run again. Expect `Pass --execute to write 0 row(s)`; if not, stop and raise the report.
   ```bash
-  # [operator] in the pulled checkout; DATABASE_URL as above
+  # [operator] in the pulled checkout; DATABASE_URL set as in docs/runbooks/redeploy.md (migrate step)
   cd ~/qiita-miint/qiita-control-plane
   /usr/local/bin/uv run --reinstall-package qiita-common qiita-admin backfill host-taxon-id --show-unresolved 50            # 1 and 3: dry run
   /usr/local/bin/uv run --reinstall-package qiita-common qiita-admin backfill host-taxon-id --show-unresolved 0 --execute  # 2: writes
