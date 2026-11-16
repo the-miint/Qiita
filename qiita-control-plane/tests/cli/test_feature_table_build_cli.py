@@ -2283,30 +2283,101 @@ def test_a_combined_build_across_parts_reads_each_sample_from_its_own_arm(monkey
     assert denovo["applied"] is True
 
 
-@pytest.mark.parametrize(("mask_group", "accepted"), [([2, 12], True), ([12], False)])
-def test_a_de_novo_arm_on_a_similar_mask_is_accepted_only_within_the_mask_group(
+@pytest.mark.parametrize(("mask_group", "accepted"), [([2, 12], True), ([2], False)])
+def test_named_arms_on_masks_of_one_group_are_accepted_only_within_it(
     monkeypatch, tmp_path, capsys, mask_group, accepted
 ):
-    """Sample 2's reference part is at mask 12 and its de novo alignment (4) at mask 2.
-    The pairing is admissible exactly when mask 2 is in mask 12's group, which the build
-    reads with a resolve of kind mask."""
+    """The caller names reference alignment 3 (mask 2) and de novo alignment 14 (mask
+    12). Each prep_sample resolves to a pair on one mask: 1 to 3 and 4 (mask 2), 2 to
+    13 and 14 (mask 12). The named pair is admissible exactly when mask 12 is in mask
+    2's group, which the build reads with a resolve of kind mask."""
     rec = _patched_two_pools(
         monkeypatch,
         resolve={
+            "members": {("alignment", 3): {2: 13}, ("alignment", 14): {1: 4}},
+            "groups": {
+                ("alignment", 3): [3, 13],
+                ("alignment", 14): [4, 14],
+                ("mask", 2): mask_group,
+            },
+        },
+    )
+    args = _two_pool_args(tmp_path, prep_sample_idx=[1, 2], denovo_alignment_idx=14)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == (0 if accepted else 1)
+    assert ("mask", 2, [1, 2]) in rec["resolve_calls"]
+    if accepted:
+        assert (rec["tickets"][4], rec["tickets"][14]) == ([1], [2])
+    else:
+        assert "not in the mask group" in capsys.readouterr().err
+        assert not _FakeFlightClient.instances
+
+
+def test_a_prep_samples_two_arms_on_different_masks_are_refused(monkeypatch, tmp_path, capsys):
+    """Prep_sample 2 resolves to reference alignment 13 (mask 12) but de novo alignment 4
+    (mask 2). One snapshot cannot answer that, since both arms' masks are where the
+    prep_sample's mask resolves; two resolves can, when a mask run lands between them.
+    The pair is compared exactly, so the build refuses it, though masks 2 and 12 are
+    one group."""
+    _patched_two_pools(
+        monkeypatch,
+        resolve={
             "members": {("alignment", 3): {2: 13}},
-            "groups": {("alignment", 3): [3, 13], ("mask", 12): mask_group, ("mask", 2): [2, 12]},
+            "groups": {("alignment", 3): [3, 13], ("alignment", 4): [4, 14], ("mask", 2): [2, 12]},
         },
         denovo_map={(1, 11): _DENOVO_MAP[1], (2, 11): _DENOVO_MAP[2]},
     )
     args = _two_pool_args(tmp_path, prep_sample_idx=[1, 2], denovo_alignment_idx=4)
 
-    assert ftc._handle_feature_table_build(args, parser=None) == (0 if accepted else 1)
-    assert ("mask", 12, [1, 2]) in rec["resolve_calls"]
-    if accepted:
-        assert rec["tickets"][4] == [1, 2]
-    else:
-        assert "not in the mask group" in capsys.readouterr().err
-        assert not _FakeFlightClient.instances
+    assert ftc._handle_feature_table_build(args, parser=None) == 1
+    assert "both arms must read the same masked pass-set" in capsys.readouterr().err
+    assert not _FakeFlightClient.instances
+
+
+def test_only_assembly_runs_a_prep_sample_reads_are_checked_for_deprecation(
+    monkeypatch, tmp_path, capsys
+):
+    """De novo alignments 4 (assembly run 11) and 14 (run 21) are on mask 2, grouped by
+    derivation, and every prep_sample reads its reference arm from alignment 3. Run 11
+    is deprecated, which a run grouped only by derivation can be. When every
+    prep_sample resolves to 14, nothing reads run 11 and the build goes through though
+    4 is the one named; once a prep_sample resolves to 4, the build refuses."""
+    deprecated = {11}
+
+    def processing(base_url, token, *, processing_idx):
+        status = "deprecated" if processing_idx in deprecated else "active"
+        return {"status": status, "superseded_by": None}
+
+    for members, refused in (({1: 14, 2: 14}, False), ({2: 14}, True)):
+        _patched_two_pools(
+            monkeypatch,
+            resolve={
+                "members": {("alignment", 4): members},
+                "groups": {
+                    ("alignment", 3): [3, 13],
+                    ("alignment", 4): [4, 14],
+                    ("mask", 2): [2, 12],
+                },
+            },
+            denovo_map={(1, 21): _DENOVO_MAP[1], (1, 11): _DENOVO_MAP[1], (2, 21): _DENOVO_MAP[2]},
+            listings={
+                _POOL_A: {"alignments": [_listed(3, _PARAMS), _listed(4, _DENOVO_PARAMS)]},
+                _POOL_B: {
+                    "alignments": [
+                        _listed(13, _PARAMS_B),
+                        _listed(14, {**_DENOVO_PARAMS_B, "mask_idx": 2}),
+                    ]
+                },
+            },
+        )
+        monkeypatch.setattr(ftc, "_fetch_processing", processing)
+        output = tmp_path / f"refused-{refused}.parquet"
+        args = _two_pool_args(
+            tmp_path, prep_sample_idx=[1, 2], denovo_alignment_idx=4, output=output
+        )
+        assert ftc._handle_feature_table_build(args, parser=None) == (1 if refused else 0)
+        err = capsys.readouterr().err
+        assert ("assembly run 11" in err) is refused, err
 
 
 def test_an_incomplete_de_novo_sample_stops_the_build(monkeypatch, tmp_path, capsys):

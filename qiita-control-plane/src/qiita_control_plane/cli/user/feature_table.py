@@ -1497,12 +1497,16 @@ def _plan_denovo(
     produced no contigs (`not_processed` / `no_data`), has no de novo arm and stays
     reference-only. Any other unprocessed state is refused (`_refuse_unprocessed`).
 
-    Each de novo alignment is checked against the reference part of every prep_sample that
-    resolved to it, and the named one against `--alignment-idx`, by
-    `denovo_alignment_processing_idx` with the reference arm's mask group (from a resolve
-    of its mask) as the admissible masks. The assembly runs that those alignments name are
-    then checked for deprecation, before the refusal of unprocessed prep_samples, so a
-    deprecated run is named by the rule that owns its wording.
+    `denovo_alignment_processing_idx` checks each de novo alignment against the reference
+    part of every prep_sample that resolved to it, with the masks compared exactly: both
+    resolutions put the prep_sample on the mask it resolves to, so within one snapshot the
+    two arms' masks are equal, and two that differ were read across a change between the
+    two requests. It checks the named de novo alignment against `--alignment-idx` too,
+    there with the reference anchor's mask group (from a resolve of its mask) as the
+    admissible masks, since a caller may name any member of either group. The assembly
+    runs of the de novo alignments that some prep_sample resolved to are then checked for
+    deprecation, before the refusal of unprocessed prep_samples, so a deprecated run is
+    named by the rule that owns its wording.
     """
     anchor = args.denovo_alignment_idx
     summaries = {anchor: _alignment_summary(listing, alignment_idx=anchor)}
@@ -1521,28 +1525,32 @@ def _plan_denovo(
         elif entry.reason not in _NO_DENOVO_ARM:
             refused.append(entry)
 
-    mask_groups: dict[int, frozenset[int]] = {}
-
-    def mask_group(reference_params: Any) -> frozenset[int] | None:
-        mask_idx = reference_params.get("mask_idx") if isinstance(reference_params, dict) else None
-        if not isinstance(mask_idx, int):
-            return None
-        if mask_idx not in mask_groups:
-            mask_groups[mask_idx] = frozenset(
+    anchor_params = anchor_summary.get("params")
+    anchor_mask = anchor_params.get("mask_idx") if isinstance(anchor_params, dict) else None
+    denovo_alignment_processing_idx(
+        denovo_alignment_idx=anchor,
+        denovo_params=summaries[anchor].get("params"),
+        reference_params=anchor_params,
+        reference_mask_group=(
+            frozenset(
                 _resolve_definition_group(
                     base_url,
                     token,
                     kind=DefinitionKind.MASK,
-                    definition_idx=mask_idx,
+                    definition_idx=anchor_mask,
                     prep_sample_idx=cohort,
                 ).group
             )
-        return mask_groups[mask_idx]
+            if isinstance(anchor_mask, int)
+            else None
+        ),
+    )
 
     part_of = {sample: part for part in parts for sample in part.samples}
-    pairings = {(anchor, args.alignment_idx): anchor_summary}
-    for sample, denovo_idx in resolved.items():
-        pairings[(denovo_idx, part_of[sample].alignment_idx)] = part_of[sample].summary
+    pairings = {
+        (denovo_idx, part_of[sample].alignment_idx): part_of[sample].summary
+        for sample, denovo_idx in resolved.items()
+    }
     processing_of: dict[int, int] = {}
     for (denovo_idx, _), reference_summary in sorted(pairings.items()):
         if denovo_idx not in summaries:
@@ -1555,7 +1563,6 @@ def _plan_denovo(
             denovo_alignment_idx=denovo_idx,
             denovo_params=summaries[denovo_idx].get("params"),
             reference_params=reference_summary.get("params"),
-            reference_mask_group=mask_group(reference_summary.get("params")),
         )
     for processing_idx in sorted(set(processing_of.values())):
         _refuse_deprecated_denovo_run(base_url, token, processing_idx=processing_idx)
