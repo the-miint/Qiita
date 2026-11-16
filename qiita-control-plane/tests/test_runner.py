@@ -7361,3 +7361,115 @@ async def test_fastq_to_parquet_records_its_own_empty_input_as_masked(
         assert counts == (0, 0)
     finally:
         await teardown()
+
+
+async def _mint_definition(pool, kind: str, principal_idx: int) -> int:
+    """A fresh mask, alignment or processing to record on a ticket."""
+    from qiita_control_plane.repositories.alignment_definition import mint_alignment_definition
+    from qiita_control_plane.repositories.mask_definition import mint_mask_definition
+    from qiita_control_plane.repositories.processing import mint_processing
+
+    probe = str(uuid.uuid4())
+    async with pool.acquire() as conn:
+        if kind == "mask":
+            return (
+                await mint_mask_definition(
+                    conn,
+                    filter_workflow="read-mask",
+                    filter_version="1.0.0",
+                    params={"filter_workflow": "read-mask", "probe": probe},
+                    principal_idx=principal_idx,
+                )
+            )["mask_idx"]
+        if kind == "alignment":
+            return (
+                await mint_alignment_definition(
+                    conn,
+                    params={"reference_idx": 1, "aligner": "minimap2", "probe": probe},
+                    principal_idx=principal_idx,
+                )
+            )["alignment_idx"]
+        return (
+            await mint_processing(
+                conn,
+                workflow="long-read-assembly",
+                version="1.0.0",
+                params={"workflow": "long-read-assembly", "version": "1.0.0", "probe": probe},
+            )
+        )["processing_idx"]
+
+
+_DEFINITION_TABLE = {
+    "mask": ("qiita.mask_definition", "mask_idx"),
+    "alignment": ("qiita.alignment_definition", "alignment_idx"),
+    "processing": ("qiita.processing", "processing_idx"),
+}
+
+
+@pytest.mark.parametrize("kind", ["mask", "alignment", "processing"])
+@pytest.mark.parametrize("edited_after_creation", [True, False])
+async def test_a_resume_after_a_recorded_definitions_settings_edit_fails_the_ticket(
+    postgres_pool, slurm_ticket, human_admin_session, tmp_path, kind, edited_after_creation
+):
+    """A ticket records a definition whose settings an admin edited after the ticket
+    was created: its earlier attempt ran under the earlier settings, so the resume
+    fails it as bad submission input before any step. An edit made before the ticket
+    was created does not stop it."""
+    table, column = _DEFINITION_TABLE[kind]
+    admin = human_admin_session["principal_idx"]
+    definition_idx = await _mint_definition(postgres_pool, kind, admin)
+    try:
+        await postgres_pool.execute(
+            f"UPDATE qiita.work_ticket SET {column} = $1 WHERE work_ticket_idx = $2",
+            definition_idx,
+            slurm_ticket,
+        )
+        created_at = await postgres_pool.fetchval(
+            "SELECT created_at FROM qiita.work_ticket WHERE work_ticket_idx = $1", slurm_ticket
+        )
+        occurred_at = created_at + timedelta(minutes=1 if edited_after_creation else -1)
+        await postgres_pool.execute(
+            "INSERT INTO qiita.definition_settings_edit (definition_kind, definition_ref,"
+            "  edit_kind, actor_principal_idx, old_settings, new_settings, reason,"
+            "  occurred_at)"
+            " VALUES ($1, $2, 'admin_edit', $3, '{\"params\": 1}', '{\"params\": 2}',"
+            "         'corrected in a test', $4)",
+            kind,
+            definition_idx,
+            admin,
+            occurred_at,
+        )
+        await _mark_processing(postgres_pool, slurm_ticket)
+        await _seed_submitted_step(
+            postgres_pool, slurm_ticket, step_name="compute", slurm_job_id=990
+        )
+        backend = FakeSlurmBackendClient(
+            status_script=[StepStatus.COMPLETED],
+            result_script=[{"result": "result.parquet"}],
+        )
+        if edited_after_creation:
+            with pytest.raises(BackendFailure, match="cannot resume"):
+                await _run(slurm_ticket, postgres_pool, backend, tmp_path / "ws", resume=True)
+            assert backend.submit_calls == 0
+        else:
+            await _run(slurm_ticket, postgres_pool, backend, tmp_path / "ws", resume=True)
+
+        row = await postgres_pool.fetchrow(
+            "SELECT state, failure_reason FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+            slurm_ticket,
+        )
+        if edited_after_creation:
+            assert row["state"] == "failed"
+            assert f"records {kind} {definition_idx}" in row["failure_reason"]
+            assert "cannot resume" in row["failure_reason"]
+        else:
+            assert row["state"] == "completed", row["failure_reason"]
+    finally:
+        await postgres_pool.execute(
+            "DELETE FROM qiita.work_ticket_step WHERE work_ticket_idx = $1", slurm_ticket
+        )
+        await postgres_pool.execute(
+            f"UPDATE qiita.work_ticket SET {column} = NULL WHERE work_ticket_idx = $1",
+            slurm_ticket,
+        )
+        await postgres_pool.execute(f"DELETE FROM {table} WHERE {column} = $1", definition_idx)

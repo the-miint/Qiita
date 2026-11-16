@@ -40,6 +40,7 @@ from qiita_control_plane.repositories.block import (
     has_incomplete_covering_alignment_block,
     set_block_work_ticket,
 )
+from qiita_control_plane.repositories.mask_definition import mint_mask_definition
 from qiita_control_plane.testing.db_seeds import (
     delete_action_if_created,
     seed_action_if_absent,
@@ -125,13 +126,23 @@ async def lc(postgres_pool, human_admin_session):
         f"align-lifecycle-{suffix}",
         owner,
     )
+    # A real mask: the cohort routes read the alignment's upstream mask row.
     async with postgres_pool.acquire() as conn:
+        mask_idx = (
+            await mint_mask_definition(
+                conn,
+                filter_workflow="read-mask",
+                filter_version="1.0.0",
+                params={"filter_workflow": "read-mask", "s": suffix},
+                principal_idx=owner,
+            )
+        )["mask_idx"]
         row = await mint_alignment_definition(
             conn,
             params={
                 "reference_idx": reference_idx,
                 "aligner": "minimap2",
-                "mask_idx": 1,
+                "mask_idx": mask_idx,
                 "shard_ids": [0],
                 "s": suffix,
             },
@@ -217,6 +228,7 @@ async def lc(postgres_pool, human_admin_session):
     await postgres_pool.execute(
         "DELETE FROM qiita.reference WHERE reference_idx = $1", reference_idx
     )
+    await postgres_pool.execute("DELETE FROM qiita.mask_definition WHERE mask_idx = $1", mask_idx)
     await delete_action_if_created(
         postgres_pool,
         action_id=ALIGN_ACTION_ID,

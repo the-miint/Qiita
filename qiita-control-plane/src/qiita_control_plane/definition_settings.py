@@ -19,7 +19,9 @@ groups are computed from):
      transaction and recorded in a later one (`_persist_mask_idx`,
      `_persist_alignment_idx`, holding `lock_active_mask` / `lock_active_alignment`),
      so an edit that commits between the two is not refused, and the ticket is then
-     recorded under the edited row. The
+     recorded under the edited row. A later resume of a ticket recording a definition
+     edited after the ticket was created fails it (`runner._workflow`), so a redrive
+     does not continue under the edited settings. The
      deprecation lookups (`refuse_deprecating_*_with_live_work`) are not reused:
      they skip a deprecated definition, and a deprecated one's settings are locked too;
   2b. no public handle that is not retired cites it (`published`): an

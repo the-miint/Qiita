@@ -29,6 +29,7 @@ from qiita_common.models import (
 
 from .. import step_progress
 from ..fanout_dispatch import DEFAULT_FANOUT_MAX_INFLIGHT
+from ..repositories.definition_settings_edit import fetch_settings_edit_since_ticket
 from ..repositories.mask_definition import fetch_mask_definition_by_idx
 from ..workspace import step_attempt_dir, ticket_workspace
 from ._alignment import (
@@ -285,6 +286,23 @@ async def run_workflow(
                 stage=WorkTicketFailureStage.SUBMISSION,
                 reason=str(exc),
             ) from exc
+
+        # A definition this ticket records whose settings were edited after the
+        # ticket was created: an earlier attempt ran (and its completed steps, gates
+        # and outputs are keyed) under the earlier settings, so the ticket is failed
+        # rather than resumed under the edited ones. A settings edit is refused while
+        # the ticket is unfinished (`definition_settings`), so this is reached by a
+        # redrive of a failed or cancelled ticket.
+        edit = await fetch_settings_edit_since_ticket(pool, work_ticket_idx)
+        if edit is not None:
+            raise _submission_bad_input(
+                f"work ticket {work_ticket_idx} records {edit['definition_kind']}"
+                f" {edit['definition_ref']}, whose settings were edited at"
+                f" {edit['occurred_at'].isoformat()}, after the ticket was created; its"
+                " earlier attempts ran under the earlier settings, so it cannot resume."
+                " Submit a new ticket, which runs under the definition its own params"
+                " resolve to"
+            )
 
         # Per-step resource floors a PRIOR run's retry ladder escalated to and
         # persisted. Empty on a first dispatch. This is what makes the ladder

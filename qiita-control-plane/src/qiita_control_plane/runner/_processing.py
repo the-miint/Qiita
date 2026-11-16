@@ -155,7 +155,10 @@ async def _mint_processing_idx(
     gate row, both keyed on the processing it recorded on its first attempt. When that
     processing's settings were edited since, the mint resolves to another row; the
     ticket is then failed as bad submission input rather than re-recorded, so no run
-    mixes outputs of two processings. A new ticket runs under the edited settings."""
+    mixes outputs of two processings. A new ticket is recorded under the processing
+    minted for its own params; the edited row keeps the edited settings. The recorded
+    idx is read without a row lock: the dispatch state guard keeps one ticket from
+    running twice at once (`dispatch.py`)."""
     params = _build_processing_params(
         action_id, action_version, bound, assembler_default=assembler_default
     )
@@ -166,8 +169,7 @@ async def _mint_processing_idx(
             )
             if work_ticket_idx is not None:
                 recorded = await conn.fetchval(
-                    "SELECT processing_idx FROM qiita.work_ticket"
-                    " WHERE work_ticket_idx = $1 FOR UPDATE",
+                    "SELECT processing_idx FROM qiita.work_ticket WHERE work_ticket_idx = $1",
                     work_ticket_idx,
                 )
                 if recorded is not None and recorded != row["processing_idx"]:
@@ -176,7 +178,8 @@ async def _mint_processing_idx(
                         f" {recorded}, whose settings were edited since; its params now"
                         f" resolve to processing {row['processing_idx']}. Its completed"
                         " steps and assembly gate are keyed on the first, so it cannot"
-                        " resume; submit a new ticket"
+                        " resume; submit a new ticket, which is recorded under the"
+                        " processing minted for its own params"
                     )
                 await conn.execute(
                     "UPDATE qiita.work_ticket SET processing_idx = $1 WHERE work_ticket_idx = $2",

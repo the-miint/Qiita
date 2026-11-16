@@ -84,7 +84,7 @@ def require_transaction(conn: asyncpg.Connection) -> None:
     """
     if not conn.is_in_transaction():
         raise RuntimeError(
-            "repository function called outside a transaction;"
+            "called outside a transaction;"
             " wrap the call in `async with conn.transaction(): ...`"
             " — its writes must roll back atomically on partial failure."
         )
