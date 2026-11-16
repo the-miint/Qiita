@@ -116,5 +116,8 @@ Deprecating a mask, alignment or processing (`qiita-admin alignment deprecate`,
 (`similar_pairs`) while it is a side of a `similar` pair. Revoke the pair or
 re-decide it `not_similar`, then deprecate.
 
-A definition deleted by hand in the database leaves its pairs `detached`: they keep
-their ids and history, link nothing, and can no longer be decided or revoked.
+No route deletes a mask, alignment or processing. A hand `DELETE` in the database is
+refused (SQLSTATE 55006, naming the pair idxs) while a `similar` pair names the
+definition: revoke the pair first. Its other pairs (`pending`, `not_similar`, or
+revoked to `pending`) are left `detached`: they keep their ids and history, link
+nothing, and can no longer be decided or revoked.

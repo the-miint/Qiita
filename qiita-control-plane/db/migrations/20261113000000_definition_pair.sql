@@ -10,7 +10,10 @@
 --     definition id. A decision survives a hand DELETE of either definition: the
 --     typed FK goes to NULL (ON DELETE SET NULL), the `*_definition_ref` columns keep
 --     the ids, and a trigger stamps `detached_at`. A detached pair links nothing and
---     can no longer be decided or revoked.
+--     can no longer be decided or revoked. A live `similar` pair is the exception: a
+--     BEFORE DELETE trigger on each definition table refuses the delete while one
+--     names the row, since detaching it would split a group that other `similar`
+--     pairs may rely on (the check a revoke runs). Revoke the pair first.
 --
 --   * `qiita.definition_pair_event` is the pair's history: opened, each decision,
 --     each revoke, with who and why. A revoke returns the pair to `pending` and clears
@@ -184,6 +187,57 @@ CREATE TRIGGER definition_pair_detach
     FOR EACH ROW EXECUTE FUNCTION qiita.detach_definition_pair();
 
 -- ---------------------------------------------------------------------------
+-- refuse_definition_delete_under_similar_pair
+-- ---------------------------------------------------------------------------
+-- A revoke refuses while another `similar` pair relies on the one revoked
+-- (qiita_control_plane.definition_similarity); detaching a `similar` pair by deleting
+-- one of its definitions would skip that check. So a definition named by a live
+-- (not detached) `similar` pair cannot be deleted: SQLSTATE 55006 (object_in_use),
+-- the message names the pair idxs. A pending or not_similar pair still detaches.
+-- TG_ARGV[0] is the pair kind, TG_ARGV[1] the deleted row's id column.
+CREATE FUNCTION qiita.refuse_definition_delete_under_similar_pair()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+DECLARE
+    kind  TEXT   := TG_ARGV[0];
+    ref   BIGINT := (to_jsonb(OLD) ->> TG_ARGV[1])::bigint;
+    pairs TEXT;
+BEGIN
+    SELECT string_agg(definition_pair_idx::text, ', ' ORDER BY definition_pair_idx)
+      INTO pairs
+      FROM qiita.definition_pair
+     WHERE definition_kind = kind
+       AND verdict = 'similar'
+       AND detached_at IS NULL
+       AND ref IN (low_definition_ref, high_definition_ref);
+    IF pairs IS NOT NULL THEN
+        RAISE EXCEPTION
+            '% % is named by similar definition pair(s) %; revoke first',
+            TG_TABLE_NAME, ref, pairs
+            USING ERRCODE = '55006';
+    END IF;
+    RETURN OLD;
+END;
+$$;
+
+COMMENT ON FUNCTION qiita.refuse_definition_delete_under_similar_pair() IS
+    'BEFORE DELETE on mask_definition, alignment_definition and processing: refuses '
+    '(SQLSTATE 55006) while a not-detached definition_pair with verdict ''similar'' '
+    'names the row. Revoke the pair first; a pending or not_similar pair detaches.';
+
+CREATE TRIGGER mask_definition_similar_pair_delete
+    BEFORE DELETE ON qiita.mask_definition
+    FOR EACH ROW EXECUTE FUNCTION
+        qiita.refuse_definition_delete_under_similar_pair('mask', 'mask_idx');
+CREATE TRIGGER alignment_definition_similar_pair_delete
+    BEFORE DELETE ON qiita.alignment_definition
+    FOR EACH ROW EXECUTE FUNCTION
+        qiita.refuse_definition_delete_under_similar_pair('alignment', 'alignment_idx');
+CREATE TRIGGER processing_similar_pair_delete
+    BEFORE DELETE ON qiita.processing
+    FOR EACH ROW EXECUTE FUNCTION
+        qiita.refuse_definition_delete_under_similar_pair('processing', 'processing_idx');
+
+-- ---------------------------------------------------------------------------
 -- definition_pair_event
 -- ---------------------------------------------------------------------------
 CREATE TABLE qiita.definition_pair_event (
@@ -247,6 +301,10 @@ DROP TRIGGER IF EXISTS definition_pair_event_no_delete ON qiita.definition_pair_
 DROP TRIGGER IF EXISTS definition_pair_event_no_update ON qiita.definition_pair_event;
 DROP FUNCTION IF EXISTS qiita.tg_definition_pair_event_immutable();
 DROP TABLE IF EXISTS qiita.definition_pair_event;
+DROP TRIGGER IF EXISTS processing_similar_pair_delete ON qiita.processing;
+DROP TRIGGER IF EXISTS alignment_definition_similar_pair_delete ON qiita.alignment_definition;
+DROP TRIGGER IF EXISTS mask_definition_similar_pair_delete ON qiita.mask_definition;
+DROP FUNCTION IF EXISTS qiita.refuse_definition_delete_under_similar_pair();
 DROP TRIGGER IF EXISTS definition_pair_detach ON qiita.definition_pair;
 DROP FUNCTION IF EXISTS qiita.detach_definition_pair();
 DROP TABLE IF EXISTS qiita.definition_pair;

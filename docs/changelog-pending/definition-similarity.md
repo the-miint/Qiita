@@ -65,6 +65,10 @@
   deprecation 409 for unfinished work tickets now has the same shape: `reason` is the
   code `live_work` (it was the message), the message moved to `detail`, and
   `work_ticket_idx` is unchanged.
+- **A hand `DELETE` of a mask, alignment or processing is refused (SQLSTATE 55006)
+  while a `similar` pair names it (#874);** revoke the pair first. A `pending` or
+  `not_similar` pair is detached by the delete. No route deletes these
+  rows.
 - **`qiita-admin ticket cancel` (`POST /api/v1/work-ticket/cancel`) also cancels a
   failed ticket named by idx (#874)**, clearing its `failure_*` columns (the control
   plane logs them) and reaping its SLURM jobs as for any cancel. The `--action-id`

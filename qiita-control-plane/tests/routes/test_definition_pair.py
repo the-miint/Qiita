@@ -195,26 +195,32 @@ def _refusal(resp, reason):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("kind", list(DefinitionKind))
-async def test_a_hand_delete_detaches_the_pair_and_keeps_its_refs(
-    postgres_pool, clients, defs, kind
-):
+async def _pair_of_kind(defs, kind):
+    """(low, high, table, id column) for two definitions of `kind` that a `similar`
+    decision accepts."""
     m1 = await defs["mask"](rype=0.05)
-    m2 = await defs["mask"](rype=0.1)
     if kind == DefinitionKind.MASK:
-        low, high = m1, m2
-        table, col = "qiita.mask_definition", "mask_idx"
-    elif kind == DefinitionKind.ALIGNMENT:
-        low, high = await defs["block"](m1), await defs["block"](m1, shard_ids=(0, 1))
-        table, col = "qiita.alignment_definition", "alignment_idx"
-    else:
-        low, high = await defs["assembly"](m1), await defs["assembly"](m1, assembler="hifiasm")
-        table, col = "qiita.processing", "processing_idx"
+        return m1, await defs["mask"](rype=0.1), "qiita.mask_definition", "mask_idx"
+    if kind == DefinitionKind.ALIGNMENT:
+        low = await defs["block"](m1)
+        high = await defs["block"](m1, aligner="minimap2", preset="sr")
+        return low, high, "qiita.alignment_definition", "alignment_idx"
+    low = await defs["assembly"](m1)
+    high = await defs["assembly"](m1, assembler="hifiasm")
+    return low, high, "qiita.processing", "processing_idx"
+
+
+@pytest.mark.parametrize("kind", list(DefinitionKind))
+@pytest.mark.parametrize(
+    "verdict", [DefinitionPairVerdict.PENDING, DefinitionPairVerdict.NOT_SIMILAR]
+)
+async def test_a_hand_delete_detaches_the_pair_and_keeps_its_refs(
+    postgres_pool, clients, defs, kind, verdict
+):
+    low, high, table, col = await _pair_of_kind(defs, kind)
     pair_idx = await _opened(clients["admin"], kind, low, high)
-    if kind != DefinitionKind.ALIGNMENT:
-        assert (
-            await _decide(clients["admin"], pair_idx, DefinitionPairVerdict.NOT_SIMILAR)
-        ).status_code == 200
+    if verdict != DefinitionPairVerdict.PENDING:
+        assert (await _decide(clients["admin"], pair_idx, verdict)).status_code == 200
 
     await postgres_pool.execute(f"DELETE FROM {table} WHERE {col} = $1", high)
 
@@ -227,11 +233,7 @@ async def test_a_hand_delete_detaches_the_pair_and_keeps_its_refs(
     assert (row["lo"], row["hi"]) == (low, None)
     assert (row["low_definition_ref"], row["high_definition_ref"]) == (low, high)
     assert row["detached_at"] is not None
-    assert row["verdict"] == (
-        DefinitionPairVerdict.PENDING
-        if kind == DefinitionKind.ALIGNMENT
-        else DefinitionPairVerdict.NOT_SIMILAR
-    )
+    assert row["verdict"] == verdict
 
     resp = await clients["admin"].get(
         URL_ADMIN_DEFINITION_PAIR_BY_IDX.format(definition_pair_idx=pair_idx)
@@ -241,6 +243,41 @@ async def test_a_hand_delete_detaches_the_pair_and_keeps_its_refs(
     _refusal(
         await _decide(clients["admin"], pair_idx, DefinitionPairVerdict.NOT_SIMILAR),
         DefinitionPairRefusal.DETACHED,
+    )
+
+
+@pytest.mark.parametrize("kind", list(DefinitionKind))
+async def test_a_hand_delete_is_refused_while_a_similar_pair_names_the_definition(
+    postgres_pool, clients, defs, kind
+):
+    low, high, table, col = await _pair_of_kind(defs, kind)
+    pair_idx = await _opened(clients["admin"], kind, low, high)
+    assert (
+        await _decide(clients["admin"], pair_idx, DefinitionPairVerdict.SIMILAR)
+    ).status_code == 200
+
+    for idx in (low, high):
+        with pytest.raises(asyncpg.ObjectInUseError) as exc:
+            await postgres_pool.execute(f"DELETE FROM {table} WHERE {col} = $1", idx)
+        assert exc.value.sqlstate == "55006"
+        assert f"definition pair(s) {pair_idx};" in str(exc.value)
+        assert "revoke first" in str(exc.value)
+    assert (
+        await postgres_pool.fetchval(
+            "SELECT detached_at FROM qiita.definition_pair WHERE definition_pair_idx = $1",
+            pair_idx,
+        )
+        is None
+    )
+
+    assert (await _revoke(clients["admin"], pair_idx)).status_code == 200
+    await postgres_pool.execute(f"DELETE FROM {table} WHERE {col} = $1", high)
+    assert (
+        await postgres_pool.fetchval(
+            "SELECT detached_at FROM qiita.definition_pair WHERE definition_pair_idx = $1",
+            pair_idx,
+        )
+        is not None
     )
 
 

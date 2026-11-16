@@ -335,7 +335,9 @@ changed setting mints a new one and the prep_samples run under each are split ac
 the two. A system_admin records whether two definitions of one kind are `similar`
 (`qiita.definition_pair`, with its history in `qiita.definition_pair_event`, which
 refuses UPDATE and DELETE and keeps its pair from being deleted;
-migration `20261113000000_definition_pair.sql`). The procedure is
+migration `20261113000000_definition_pair.sql`). A hand DELETE of a definition
+detaches its pairs, and is refused while a `similar` pair names it, since detaching
+that pair would split a group that other `similar` pairs may rely on. The procedure is
 [`runbooks/deciding-similar-definitions.md`](../runbooks/deciding-similar-definitions.md).
 
 - **Groups are computed on read.** Nothing stores a group: `definition_similarity`
