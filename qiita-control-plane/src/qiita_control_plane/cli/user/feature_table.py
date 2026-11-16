@@ -52,6 +52,7 @@ from qiita_common.api_paths import (
 from qiita_common.assembly_constants import ASSEMBLED_SEQUENCE_TABLE
 from qiita_common.duckdb_relation import registered
 from qiita_common.models import (
+    INCLUDE_DEPRECATED_FLAG,
     MAX_EXPORTED_FEATURE_ENTITIES,
     AlignmentDefinitionStatus,
     DefinitionGroupResolveRequest,
@@ -169,7 +170,9 @@ def _fetch_processing(base_url: str, token: str, *, processing_idx: int) -> dict
     return _common.call("GET", base_url, token, f"{PATH_PROCESSING_PREFIX}{sub_path}")
 
 
-def _refuse_deprecated_denovo_run(base_url: str, token: str, *, processing_idx: int) -> None:
+def _refuse_deprecated_denovo_run(
+    base_url: str, token: str, *, processing_idx: int, admitted: bool = False
+) -> None:
     """Refuse a deprecated assembly run as a de novo arm, with the wording that
     `runner/_feature_table.py` uses server-side. The client asks this of each run that
     a prep_sample reads (`_plan_denovo`); the runner, which does not resolve groups,
@@ -180,6 +183,10 @@ def _refuse_deprecated_denovo_run(base_url: str, token: str, *, processing_idx: 
     cannot word it differently. The read is one GET per build, not per cohort sample:
     the assembly run is in the de novo alignment's hashed params, so one value covers
     the whole cohort.
+
+    `admitted` (--include-deprecated or --include-deprecated-upstream) reads a deprecated
+    run; the cohort DoGet admits it on the same flags and names it in the ticket
+    response, which the manifest records (`_mint_ticket`).
     """
     row = _fetch_processing(base_url, token, processing_idx=processing_idx)
     message = denovo_assembly_deprecation_error(
@@ -187,8 +194,8 @@ def _refuse_deprecated_denovo_run(base_url: str, token: str, *, processing_idx: 
         status=row.get("status"),
         superseded_by=row.get("superseded_by"),
     )
-    if message is not None:
-        raise ValueError(message)
+    if message is not None and not admitted:
+        raise ValueError(f"{message}. To read it, pass {INCLUDE_DEPRECATED_FLAG}")
 
 
 def _resolve_definition_group(
@@ -199,6 +206,7 @@ def _resolve_definition_group(
     definition_idx: int,
     prep_sample_idx: list[int],
     as_of_event: str | None = None,
+    include_deprecated_upstream: bool = False,
 ) -> DefinitionGroupResolveResponse:
     """POST /definition-group/resolve: the named definition's group and, per prep_sample,
     which member it is processed under or why it is not, under `as_of_event`'s decision
@@ -226,7 +234,8 @@ def _resolve_definition_group(
             definition_idx=definition_idx,
             prep_sample_idx=chunk,
             as_of_event=answers[0].decisions.decision_set if answers else as_of_event,
-        ).model_dump(mode="json", exclude_none=True)
+            include_deprecated_upstream=include_deprecated_upstream,
+        ).model_dump(mode="json", exclude_none=True, exclude_defaults=True)
         answer = DefinitionGroupResolveResponse.model_validate(
             _common.call("POST", base_url, token, path, json=body)
         )
@@ -338,6 +347,7 @@ def _mint_exported_identifiers(
     alignment_idx: int,
     prep_sample_idx: list[int],
     include_deprecated: bool = False,
+    include_deprecated_upstream: bool = False,
 ) -> list[dict[str, Any]]:
     """Mint (or recover) the public `export_id` of each processed sample in the cohort.
 
@@ -349,6 +359,7 @@ def _mint_exported_identifiers(
         alignment_idx=alignment_idx,
         prep_sample_idx=prep_sample_idx,
         include_deprecated=include_deprecated,
+        include_deprecated_upstream=include_deprecated_upstream,
     ).model_dump()
     path = f"{PATH_EXPORTED_IDENTIFIER_PREFIX}{PATH_EXPORTED_IDENTIFIER_ROOT}"
     return _common.call("POST", base_url, token, path, json=body)["identifiers"]
@@ -386,6 +397,7 @@ def _mint_exported_processing(
     alignment_idx: int,
     prep_sample_idx: list[int],
     include_deprecated: bool = False,
+    include_deprecated_upstream: bool = False,
 ) -> str:
     """Mint (or recover) the public handle for the processing this table was built from —
     what the manifest cites instead of an `alignment_idx`.
@@ -398,6 +410,7 @@ def _mint_exported_processing(
         alignment_idx=alignment_idx,
         prep_sample_idx=prep_sample_idx,
         include_deprecated=include_deprecated,
+        include_deprecated_upstream=include_deprecated_upstream,
     ).model_dump()
     path = f"{PATH_EXPORTED_PROCESSING_PREFIX}{PATH_EXPORTED_PROCESSING_ROOT}"
     return _common.call("POST", base_url, token, path, json=body)["export_processing_id"]
@@ -422,10 +435,14 @@ def _create_alignment_doget_ticket(
     prep_sample_idx: list[int],
     columns: tuple[str, ...],
     include_deprecated: bool = False,
+    include_deprecated_upstream: bool = False,
     as_of_event: str | None = None,
+    upstreams_read: dict[int, list[dict[str, Any]]] | None = None,
 ) -> bytes:
     """Mint the signed DoGet ticket for this alignment slice, returning the decoded
     ticket bytes. `as_of_event` is the decision set the route resolves the cohort under.
+    The deprecated upstreams the route reports reading are printed on stderr, once per
+    alignment, and recorded in `upstreams_read` under the alignment for the manifest.
 
     The human-callable mint: the caller names the alignment and the cohort, and the
     route authorizes every sample per-study before signing — all-or-nothing, never
@@ -446,10 +463,17 @@ def _create_alignment_doget_ticket(
             "prep_sample_idx": prep_sample_idx,
             "columns": list(columns),
             **_common.optional_body_fields(
-                include_deprecated=include_deprecated, as_of_event=as_of_event
+                include_deprecated=include_deprecated,
+                include_deprecated_upstream=include_deprecated_upstream,
+                as_of_event=as_of_event,
             ),
         },
     )
+    upstreams = resp.get("deprecated_upstreams") or []
+    if upstreams and upstreams_read is not None and alignment_idx not in upstreams_read:
+        upstreams_read[alignment_idx] = upstreams
+        for upstream in upstreams:
+            _common.print_deprecated_upstream_read("alignment", alignment_idx, upstream)
     return base64.b64decode(resp["ticket"])
 
 
@@ -984,11 +1008,16 @@ def _manifest_gate(gate: ft.AlignmentGate | None) -> dict[str, Any] | None:
 
 
 def _manifest_parts(
-    parts: Sequence[_Part], handles: dict[int, str], identifiers: list[dict[str, Any]]
+    parts: Sequence[_Part],
+    handles: dict[int, str],
+    identifiers: list[dict[str, Any]],
+    upstreams_read: dict[int, list[dict[str, Any]]] | None = None,
 ) -> dict[str, Any]:
     """One arm's processing record: `parts`, one entry per part (its minted handle, its
     verified `params_hash`, its aligner, and `deprecated` with the reason for a
-    deprecated alignment read under --include-deprecated), and `sample_part`, each
+    deprecated alignment read under --include-deprecated, and `deprecated_upstreams`,
+    each deprecated upstream the cohort DoGet read it past by kind, `params_hash` and
+    reason), and `sample_part`, each
     prep_sample's `export_id` mapped to the handle of the part it was read from.
 
     Parts are in `alignment_idx` order, so two builds over the same inputs write the
@@ -1007,6 +1036,20 @@ def _manifest_parts(
                     if _is_deprecated(part.summary)
                     else {}
                 ),
+                **(
+                    {
+                        "deprecated_upstreams": [
+                            {
+                                "kind": u["definition_kind"],
+                                "params_hash": u["params_hash"],
+                                "deprecation_reason": u.get("deprecation_reason"),
+                            }
+                            for u in upstreams_read[part.alignment_idx]
+                        ]
+                    }
+                    if upstreams_read and part.alignment_idx in upstreams_read
+                    else {}
+                ),
             }
             for part in parts
         ],
@@ -1020,7 +1063,12 @@ def _manifest_parts(
     }
 
 
-def _manifest_denovo(*, requested: bool, record: dict[str, Any] | None) -> dict[str, Any] | None:
+def _manifest_denovo(
+    *,
+    requested: bool,
+    record: dict[str, Any] | None,
+    left_out: list[dict[str, Any]] | None = None,
+) -> dict[str, Any] | None:
     """The de novo arm's record, or None when the build never asked for one.
 
     **`applied` is separate from the ask because the two come apart**: a caller can name
@@ -1030,7 +1078,9 @@ def _manifest_denovo(*, requested: bool, record: dict[str, Any] | None) -> dict[
 
     `record` is `_manifest_parts` over the de novo parts, or None when no prep_sample had an
     arm. Its `sample_part` names only the prep_samples with an arm, so their count is
-    `prep_samples_with_a_de_novo_arm`.
+    `prep_samples_with_a_de_novo_arm`. `left_out` (`_exact_left_out`), present only
+    for a deprecated de novo alignment read under --include-deprecated, lists the
+    cohort's prep_samples that read left reference-only although they have a run on it.
     """
     if not requested:
         return None
@@ -1039,6 +1089,7 @@ def _manifest_denovo(*, requested: bool, record: dict[str, Any] | None) -> dict[
         "applied": bool(record["parts"]),
         **record,
         "prep_samples_with_a_de_novo_arm": len(record["sample_part"]),
+        **({"left_out": left_out} if left_out is not None else {}),
     }
 
 
@@ -1054,6 +1105,7 @@ def _manifest_payload(
     tools: dict[str, str],
     denovo: dict[str, Any] | None = None,
     left_out: list[dict[str, Any]] | None = None,
+    left_out_by_accession: list[dict[str, Any]] | None = None,
     decisions: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """The bundle's record of what produced the table — the one artifact here that is
@@ -1069,7 +1121,9 @@ def _manifest_payload(
     alignment that the cohort's prep_samples resolved to, and the map from each
     prep_sample to its part. `table.left_out` is `_left_out_identifiers`: the default
     cohort's prep_samples that the table leaves out, by `export_id`; empty for a named
-    cohort, which is refused instead.
+    cohort, which is refused instead. `table.left_out_by_accession` (`_exact_left_out`),
+    present only for a deprecated `--alignment-idx` read under --include-deprecated,
+    lists the prep_samples that the pool cohort route left out of its default cohort.
 
     `files` are basenames: the bundle's members relative to wherever it lands, since an
     absolute path describes the machine that built it.
@@ -1111,6 +1165,11 @@ def _manifest_payload(
             # Sorted, so the record does not depend on the order the mint answered in.
             "cohort": sorted(identifier["export_id"] for identifier in identifiers),
             "left_out": left_out or [],
+            **(
+                {"left_out_by_accession": left_out_by_accession}
+                if left_out_by_accession is not None
+                else {}
+            ),
         },
         "tools": tools,
         "files": [path.name for path in files],
@@ -1480,6 +1539,9 @@ class _Cohort:
 
     samples: list[int]
     listed_under: dict[int, set[int]] | None
+    # An exact read's default cohort: the cohort route's `left_out` entries
+    # (`_exact_left_out`); None otherwise.
+    exact_left_out: list[dict[str, Any]] | None = None
 
 
 def _resolve_cohort(
@@ -1501,20 +1563,25 @@ def _resolve_cohort(
     user never wrote.
 
     `exact` (a deprecated `--alignment-idx` read under --include-deprecated): the
-    default cohort is the anchor's own completed prep_samples, with no group.
+    default cohort is the prep_samples that the cohort route lists for the anchor read
+    exactly, with no group; the ones it leaves out are kept for the manifest.
     """
     if args.prep_sample_idx is not None:
         return _Cohort(sorted(set(args.prep_sample_idx)), None)
+    left_out: list[dict[str, Any]] = []
 
     def completed(pool: tuple[int, int], alignment_idx: int) -> list[int]:
-        return _fetch_alignment_cohort(
+        body = _fetch_alignment_cohort(
             base_url,
             token,
             sequencing_run_idx=pool[0],
             sequenced_pool_idx=pool[1],
             alignment_idx=alignment_idx,
             include_deprecated=args.include_deprecated,
-        )["prep_sample_idx"]
+            include_deprecated_upstream=args.include_deprecated_upstream,
+        )
+        left_out.extend(body.get("left_out") or [])
+        return body["prep_sample_idx"]
 
     anchor = args.alignment_idx
     listed_under: dict[int, set[int]] = {}
@@ -1522,6 +1589,7 @@ def _resolve_cohort(
         if anchor in listed:
             for sample in completed(pool, anchor):
                 listed_under.setdefault(sample, set()).add(anchor)
+    exact_left_out = _exact_left_out(left_out, f"alignment {anchor}") if exact else None
     if not listed_under:
         raise ValueError(
             f"no prep_sample of the named sequenced_pool(s) {sorted(p for _, p in per_pool)}"
@@ -1530,7 +1598,7 @@ def _resolve_cohort(
             f" completed count."
         )
     if exact:
-        return _Cohort(sorted(listed_under), listed_under)
+        return _Cohort(sorted(listed_under), listed_under, exact_left_out)
     group = set(
         _resolve_definition_group(
             base_url,
@@ -1539,6 +1607,7 @@ def _resolve_cohort(
             definition_idx=anchor,
             prep_sample_idx=sorted(listed_under),
             as_of_event=args.as_of_event,
+            include_deprecated_upstream=args.include_deprecated_upstream,
         ).group
     )
     for pool, listed in per_pool.items():
@@ -1546,6 +1615,37 @@ def _resolve_cohort(
             for sample in completed(pool, alignment_idx):
                 listed_under.setdefault(sample, set()).add(alignment_idx)
     return _Cohort(sorted(listed_under), listed_under)
+
+
+def _exact_left_out(entries: list[dict[str, Any]], read: str) -> list[dict[str, Any]]:
+    """The manifest's record of what an exact read of a deprecated alignment left out,
+    from the pool cohort route's `left_out` entries: each prep_sample's biosample
+    accession, `state` (`failed` or `running` for a run that failed or has not finished,
+    else the resolution state) and reason, sorted by accession, with no `_idx`. Each is
+    listed on stderr."""
+    records = sorted(
+        (
+            {
+                "biosample_accession": e.get("biosample_accession"),
+                "state": {
+                    SampleResolutionReason.FAILED.value: "failed",
+                    SampleResolutionReason.IN_PROGRESS.value: "running",
+                }.get(e["reason"], e["state"]),
+                "reason": e["reason"],
+            }
+            for e in entries
+        ),
+        key=lambda r: (r["biosample_accession"] is None, r["biosample_accession"] or ""),
+    )
+    if records:
+        print(
+            f"note: {len(records)} prep_sample(s) with a run on {read} are left out of"
+            f" this read of it; the manifest records them:",
+            file=sys.stderr,
+        )
+        for r in records:
+            print(f"  {r['biosample_accession']}: {r['state']} ({r['reason']})", file=sys.stderr)
+    return records
 
 
 def _skip_unprocessed(
@@ -1586,6 +1686,7 @@ def _left_out_identifiers(
     cohort: _Cohort,
     *,
     include_deprecated: bool = False,
+    include_deprecated_upstream: bool = False,
 ) -> list[dict[str, Any]]:
     """The manifest's record of the left-out prep_samples: each one's `export_id`, state
     and reason, sorted by `export_id`. The `export_id` is minted under the highest-idx
@@ -1611,6 +1712,7 @@ def _left_out_identifiers(
                 alignment_idx=alignment_idx,
                 prep_sample_idx=[entry.prep_sample_idx for entry in entries],
                 include_deprecated=include_deprecated,
+                include_deprecated_upstream=include_deprecated_upstream,
             )
         }
         out.extend(
@@ -1686,9 +1788,10 @@ def _plan_denovo(
     cohort: list[int],
     per_pool: dict[tuple[int, int], set[int]],
     as_of_event: str | None = None,
-) -> list[_DenovoPart]:
+) -> tuple[list[_DenovoPart], list[dict[str, Any]] | None]:
     """The de novo arm's parts: each cohort prep_sample's de novo alignment, resolved in
-    `--denovo-alignment-idx`'s group, grouped by alignment in `alignment_idx` order.
+    `--denovo-alignment-idx`'s group, grouped by alignment in `alignment_idx` order; and,
+    for an exact read, what it left out (`_exact_left_out`), else None.
 
     A prep_sample with no run in that group (`not_processed` / `no_run`), or whose assembly
     produced no contigs (`not_processed` / `no_data`), has no de novo arm and stays
@@ -1708,24 +1811,42 @@ def _plan_denovo(
     A deprecated `--denovo-alignment-idx` read under --include-deprecated is read alone:
     the cohort's prep_samples that the pool cohort route lists completed under it have
     its arm, every other one stays reference-only, and the cohort DoGet resolves the
-    arm's prep_samples exactly.
+    arm's prep_samples exactly. The cohort's prep_samples that the route leaves out of
+    that cohort although they have a run on it (failed, running, withdrawn, or on a
+    withdrawn mask run) stay reference-only too, and are listed on stderr and returned
+    for the manifest's `denovo.left_out`.
+
+    A deprecated assembly run of a de novo alignment is read under --include-deprecated
+    or --include-deprecated-upstream; the resolve of the de novo group is then made with
+    `include_deprecated_upstream`, so the run's deprecation does not leave every
+    prep_sample `upstream_deprecated`.
     """
     anchor = args.denovo_alignment_idx
     summaries = {anchor: _alignment_summary(listing, alignment_idx=anchor)}
+    admit_assembly = args.include_deprecated or args.include_deprecated_upstream
+    left_out: list[dict[str, Any]] | None = None
     if _reads_exactly(summaries[anchor], flag=args.include_deprecated, role="de novo alignment"):
-        on_anchor = {
-            sample
-            for (run_idx, pool_idx), listed in per_pool.items()
-            if anchor in listed
-            for sample in _fetch_alignment_cohort(
+        on_anchor: set[int] = set()
+        listed_left_out: list[dict[str, Any]] = []
+        for (run_idx, pool_idx), listed in per_pool.items():
+            if anchor not in listed:
+                continue
+            body = _fetch_alignment_cohort(
                 base_url,
                 token,
                 sequencing_run_idx=run_idx,
                 sequenced_pool_idx=pool_idx,
                 alignment_idx=anchor,
                 include_deprecated=True,
-            )["prep_sample_idx"]
-        }
+                include_deprecated_upstream=args.include_deprecated_upstream,
+            )
+            on_anchor.update(body["prep_sample_idx"])
+            listed_left_out.extend(body.get("left_out") or [])
+        in_cohort = set(cohort)
+        left_out = _exact_left_out(
+            [e for e in listed_left_out if e["prep_sample_idx"] in in_cohort],
+            f"de novo alignment {anchor}",
+        )
         resolution = _exact_resolution(
             summaries[anchor], [sample for sample in cohort if sample in on_anchor]
         )
@@ -1737,6 +1858,7 @@ def _plan_denovo(
             definition_idx=anchor,
             prep_sample_idx=cohort,
             as_of_event=as_of_event,
+            include_deprecated_upstream=admit_assembly,
         )
     resolved: dict[int, int] = {}
     refused: list[SampleResolution] = []
@@ -1787,7 +1909,9 @@ def _plan_denovo(
             reference_params=reference_summary.get("params"),
         )
     for processing_idx in sorted(set(processing_of.values())):
-        _refuse_deprecated_denovo_run(base_url, token, processing_idx=processing_idx)
+        _refuse_deprecated_denovo_run(
+            base_url, token, processing_idx=processing_idx, admitted=admit_assembly
+        )
     _refuse_unprocessed(refused, anchor=f"de novo alignment {anchor}")
 
     members: dict[int, list[int]] = {}
@@ -1796,7 +1920,7 @@ def _plan_denovo(
     return [
         _DenovoPart(idx, summaries[idx], tuple(samples), processing_of[idx])
         for idx, samples in sorted(members.items())
-    ]
+    ], left_out
 
 
 def _run_build(
@@ -1850,6 +1974,7 @@ def _run_build(
             definition_idx=args.alignment_idx,
             prep_sample_idx=resolved_cohort.samples,
             as_of_event=args.as_of_event,
+            include_deprecated_upstream=args.include_deprecated_upstream,
         ),
         resolved_cohort,
     )
@@ -1863,8 +1988,9 @@ def _run_build(
     # group so that a de novo arm on any mask of that group is accepted.
     requested_denovo = args.denovo_alignment_idx is not None
     denovo_parts: list[_DenovoPart] = []
+    denovo_left_out: list[dict[str, Any]] | None = None
     if requested_denovo:
-        denovo_parts = _plan_denovo(
+        denovo_parts, denovo_left_out = _plan_denovo(
             args.base_url,
             token,
             args=args,
@@ -1935,7 +2061,12 @@ def _run_build(
                 file=sys.stderr,
             )
     left_out_records = _left_out_identifiers(
-        args.base_url, token, left_out, resolved_cohort, include_deprecated=args.include_deprecated
+        args.base_url,
+        token,
+        left_out,
+        resolved_cohort,
+        include_deprecated=args.include_deprecated,
+        include_deprecated_upstream=args.include_deprecated_upstream,
     )
     identifiers = sorted(
         (
@@ -1947,12 +2078,15 @@ def _run_build(
                 alignment_idx=part.alignment_idx,
                 prep_sample_idx=list(part.samples),
                 include_deprecated=args.include_deprecated,
+                include_deprecated_upstream=args.include_deprecated_upstream,
             )
         ),
         key=lambda entry: entry["prep_sample_idx"],
     )
     _stage_exported_identifiers(con, identifiers)
 
+    # Each alignment's deprecated upstreams, as its cohort DoGet reported reading them.
+    upstreams_read: dict[int, list[dict[str, Any]]] = {}
     with flight.FlightClient(args.data_plane_url) as flight_client:
         # Lengths first, though the alignment is the interesting stream: this one is a
         # whole-reference read that costs a ticket mint and a small aggregate, so a
@@ -2027,7 +2161,9 @@ def _run_build(
                 prep_sample_idx=list(part.samples),
                 columns=columns,
                 include_deprecated=args.include_deprecated,
+                include_deprecated_upstream=args.include_deprecated_upstream,
                 as_of_event=pinned,
+                upstreams_read=upstreams_read,
             ),
             gate=gate,
         )
@@ -2045,7 +2181,9 @@ def _run_build(
                     prep_sample_idx=list(part.samples),
                     columns=ft.ALIGNMENT_COLUMNS,
                     include_deprecated=args.include_deprecated,
+                    include_deprecated_upstream=args.include_deprecated_upstream,
                     as_of_event=pinned,
+                    upstreams_read=upstreams_read,
                 )
                 for part in denovo_parts
             ]
@@ -2104,13 +2242,16 @@ def _run_build(
                 alignment_idx=part.alignment_idx,
                 prep_sample_idx=list(part.samples),
                 include_deprecated=args.include_deprecated,
+                include_deprecated_upstream=args.include_deprecated_upstream,
             )
             for part in arm
         }
 
-    processing = _manifest_parts(parts, handles(parts), identifiers)
+    processing = _manifest_parts(parts, handles(parts), identifiers, upstreams_read)
     denovo_record = (
-        _manifest_parts(denovo_parts, handles(denovo_parts), identifiers) if denovo_parts else None
+        _manifest_parts(denovo_parts, handles(denovo_parts), identifiers, upstreams_read)
+        if denovo_parts
+        else None
     )
     tools = _tool_versions(con)
     written = _write_bundle(
@@ -2125,10 +2266,13 @@ def _run_build(
             processing=processing,
             identifiers=identifiers,
             left_out=left_out_records,
+            left_out_by_accession=resolved_cohort.exact_left_out,
             rows=clearance.rows,
             files=files,
             tools=tools,
-            denovo=_manifest_denovo(requested=requested_denovo, record=denovo_record),
+            denovo=_manifest_denovo(
+                requested=requested_denovo, record=denovo_record, left_out=denovo_left_out
+            ),
             decisions=(
                 None
                 if resolution.decisions is None

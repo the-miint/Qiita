@@ -68,6 +68,7 @@ from qiita_common.auth_constants import (
 )
 from qiita_common.models import (
     INCLUDE_DEPRECATED_FLAG,
+    INCLUDE_DEPRECATED_UPSTREAM_FLAG,
     PrincipalLookupRequest,
     PrincipalLookupResponse,
 )
@@ -902,27 +903,55 @@ def print_deprecated_read(kind: str, idx: int, reason: str | None) -> None:
     )
 
 
+def print_deprecated_upstream_read(kind: str, idx: int, upstream: dict) -> None:
+    """The stderr line for a read of an active definition past a deprecated upstream
+    (a `DeprecatedUpstream` body), made under --include-deprecated-upstream or, for a
+    de novo alignment's assembly run, --include-deprecated."""
+    flags = (
+        INCLUDE_DEPRECATED_UPSTREAM_FLAG
+        if upstream["definition_kind"] == "mask"
+        else f"{INCLUDE_DEPRECATED_FLAG} or {INCLUDE_DEPRECATED_UPSTREAM_FLAG}"
+    )
+    print(
+        f"warning: {kind} {idx} reads {upstream['definition_kind']}"
+        f" {upstream['definition_idx']}, which is deprecated"
+        f" ({upstream.get('deprecation_reason')}); read under {flags}",
+        file=sys.stderr,
+    )
+
+
 def optional_body_fields(
-    *, include_deprecated: bool = False, as_of_event: str | None = None
+    *,
+    include_deprecated: bool = False,
+    include_deprecated_upstream: bool = False,
+    as_of_event: str | None = None,
 ) -> dict[str, bool | str]:
-    """`include_deprecated` and `as_of_event` as JSON body fields, each sent only when
-    set, so a request without either flag is unchanged."""
+    """`include_deprecated`, `include_deprecated_upstream` and `as_of_event` as JSON
+    body fields, each sent only when set, so a request without the flags is
+    unchanged."""
     fields: dict[str, bool | str] = {}
     if include_deprecated:
         fields["include_deprecated"] = True
+    if include_deprecated_upstream:
+        fields["include_deprecated_upstream"] = True
     if as_of_event is not None:
         fields["as_of_event"] = as_of_event
     return fields
 
 
 def optional_query_params(
-    *, include_deprecated: bool = False, as_of_event: str | None = None
+    *,
+    include_deprecated: bool = False,
+    include_deprecated_upstream: bool = False,
+    as_of_event: str | None = None,
 ) -> dict[str, str]:
     """`optional_body_fields` in query-parameter form."""
     return {
         key: "true" if value is True else str(value)
         for key, value in optional_body_fields(
-            include_deprecated=include_deprecated, as_of_event=as_of_event
+            include_deprecated=include_deprecated,
+            include_deprecated_upstream=include_deprecated_upstream,
+            as_of_event=as_of_event,
         ).items()
     }
 

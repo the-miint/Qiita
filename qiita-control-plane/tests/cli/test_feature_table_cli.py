@@ -201,6 +201,7 @@ def test_mint_exported_identifiers_posts_the_alignment_and_the_cohort(monkeypatc
         "alignment_idx": 3,
         "prep_sample_idx": [2, 1],
         "include_deprecated": False,
+        "include_deprecated_upstream": False,
     }
     assert identifiers == _IDENTIFIERS
     ftc._mint_exported_identifiers(

@@ -39,6 +39,7 @@ from qiita_common.models import (
     HOST_FILTER_INDEX_TYPE_MINIMAP2,
     HOST_FILTER_INDEX_TYPE_RYPE,
     INCLUDE_DEPRECATED_FLAG,
+    INCLUDE_DEPRECATED_UPSTREAM_FLAG,
     LEGACY_IDX_RESERVED_CEILING,
     REDRIVABLE_WORK_TICKET_STATES,
     STORABLE_ACCESS_TIERS,
@@ -1359,8 +1360,20 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "Read a deprecated --alignment-idx or --denovo-alignment-idx alone, its own"
             " completed, non-withdrawn prep_samples, without its group (refused without"
-            " this flag). The manifest marks each part read this way. An alignment that"
-            " is not deprecated reads its group either way."
+            " this flag). The manifest marks each part read this way, and records the"
+            " prep_samples such a read leaves out (a failed or running run, a withdrawn"
+            " one, or a withdrawn mask run) by biosample accession. Also reads a de novo"
+            " arm whose assembly run is deprecated. An alignment that is not deprecated"
+            " reads its group either way."
+        ),
+    )
+    p_ft_build.add_argument(
+        INCLUDE_DEPRECATED_UPSTREAM_FLAG,
+        action="store_true",
+        help=(
+            "Read an active alignment (reference or de novo) whose mask, or whose"
+            " assembly run, is deprecated (refused without this flag). The manifest names"
+            " each deprecated upstream read, by params_hash and reason."
         ),
     )
     p_ft_build.add_argument(

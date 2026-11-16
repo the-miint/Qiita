@@ -27,6 +27,7 @@ from qiita_common.hashing import canonical_params_hash
 from qiita_common.models import (
     AS_OF_SCOPE,
     INCLUDE_DEPRECATED_FLAG,
+    INCLUDE_DEPRECATED_UPSTREAM_FLAG,
     DefinitionGroupResolveResponse,
     DefinitionKind,
     deprecated_read_refusal,
@@ -251,6 +252,7 @@ def _namespace(tmp_path, **overrides) -> argparse.Namespace:
         "taxonomy": False,
         "tree": False,
         "include_deprecated": False,
+        "include_deprecated_upstream": False,
         "as_of_event": None,
         "output": tmp_path / "table.parquet",
     }
@@ -288,7 +290,17 @@ def _fake_resolve(rec, *, members=None, groups=None, unprocessed=None):
     members, groups, unprocessed = members or {}, groups or {}, unprocessed or {}
     rec["resolve_calls"] = []
 
-    def resolve(base_url, token, *, kind, definition_idx, prep_sample_idx, as_of_event=None):
+    def resolve(
+        base_url,
+        token,
+        *,
+        kind,
+        definition_idx,
+        prep_sample_idx,
+        as_of_event=None,
+        include_deprecated_upstream=False,
+    ):
+        rec.setdefault("resolve_upstream", []).append((definition_idx, include_deprecated_upstream))
         key = (DefinitionKind(kind).value, definition_idx)
         rec["resolve_calls"].append((*key, list(prep_sample_idx)))
         rec.setdefault("resolve_as_of", []).append(as_of_event)
@@ -365,7 +377,15 @@ def _patched(
 
     monkeypatch.setattr(ftc, "_fetch_reference_exclusion", _exclusion)
 
-    def _mint_ids(base_url, token, *, alignment_idx, prep_sample_idx, include_deprecated=False):
+    def _mint_ids(
+        base_url,
+        token,
+        *,
+        alignment_idx,
+        prep_sample_idx,
+        include_deprecated=False,
+        include_deprecated_upstream=False,
+    ):
         rec.setdefault("flags", []).append(("identifier", alignment_idx, include_deprecated))
         rec["minted_cohort"] = prep_sample_idx
         return [i for i in _IDENTIFIERS if i["prep_sample_idx"] in prep_sample_idx]
@@ -396,7 +416,13 @@ def _patched(
     monkeypatch.setattr(ftc, "_mint_exported_features", _mint_features)
 
     def _mint_processing(
-        base_url, token, *, alignment_idx, prep_sample_idx, include_deprecated=False
+        base_url,
+        token,
+        *,
+        alignment_idx,
+        prep_sample_idx,
+        include_deprecated=False,
+        include_deprecated_upstream=False,
     ):
         """The processing mint, answering `QP<alignment_idx + 4>` (QP7 for the
         reference alignment). `prep_sample_idx` authorizes and is not part of the
@@ -430,7 +456,9 @@ def _patched(
         prep_sample_idx,
         columns,
         include_deprecated=False,
+        include_deprecated_upstream=False,
         as_of_event=None,
+        upstreams_read=None,
     ):
         rec.setdefault("flags", []).append(("doget", alignment_idx, include_deprecated))
         rec.setdefault("doget_as_of", []).append(as_of_event)
@@ -1633,7 +1661,9 @@ def _patched_combined(monkeypatch, *, denovo_map=None, denovo_alignment=None, re
         prep_sample_idx,
         columns,
         include_deprecated=False,
+        include_deprecated_upstream=False,
         as_of_event=None,
+        upstreams_read=None,
     ):
         rec["arm_tickets"].append(alignment_idx)
         rec["columns"] = list(columns)
@@ -1691,6 +1721,7 @@ def test_the_client_refuses_a_deprecated_denovo_run(monkeypatch, tmp_path, capsy
     assert "deprecated" in err
     # The replacement is named, which is the whole point of reading the row.
     assert "assembly run 3 replaces it" in err
+    assert f"pass {INCLUDE_DEPRECATED_FLAG}" in err
     # Nothing is written: the refusal is before any staging.
     assert not args.output.exists()
 
@@ -1954,7 +1985,14 @@ def _patched_two_pools(
     rec["cohort_reads"] = []
 
     def _cohort(
-        b, t, *, sequencing_run_idx, sequenced_pool_idx, alignment_idx, include_deprecated=False
+        b,
+        t,
+        *,
+        sequencing_run_idx,
+        sequenced_pool_idx,
+        alignment_idx,
+        include_deprecated=False,
+        include_deprecated_upstream=False,
     ):
         pool = (sequencing_run_idx, sequenced_pool_idx)
         rec["cohort_reads"].append((pool, alignment_idx))
@@ -1967,7 +2005,16 @@ def _patched_two_pools(
     columns_of: dict[int, list[str]] = {}
 
     def _ticket(
-        b, t, *, alignment_idx, prep_sample_idx, columns, include_deprecated=False, as_of_event=None
+        b,
+        t,
+        *,
+        alignment_idx,
+        prep_sample_idx,
+        columns,
+        include_deprecated=False,
+        include_deprecated_upstream=False,
+        as_of_event=None,
+        upstreams_read=None,
     ):
         rec["tickets"][alignment_idx] = list(prep_sample_idx)
         rec["events"].append(("minted", alignment_idx))
@@ -2671,7 +2718,14 @@ def test_a_deprecated_denovo_alignment_is_read_alone_with_the_flag(monkeypatch, 
     flags = []
 
     def _cohort(
-        b, t, *, sequencing_run_idx, sequenced_pool_idx, alignment_idx, include_deprecated=False
+        b,
+        t,
+        *,
+        sequencing_run_idx,
+        sequenced_pool_idx,
+        alignment_idx,
+        include_deprecated=False,
+        include_deprecated_upstream=False,
     ):
         flags.append((alignment_idx, include_deprecated))
         return {
@@ -2692,3 +2746,164 @@ def test_a_deprecated_denovo_alignment_is_read_alone_with_the_flag(monkeypatch, 
     [part] = _manifest(tmp_path)["table"]["denovo"]["parts"]
     assert (part["deprecated"], part["deprecation_reason"]) == (True, "contigs were misassembled")
     assert "alignment 4 is deprecated (contigs were misassembled)" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# A deprecated assembly run, and deprecated upstreams
+# ---------------------------------------------------------------------------
+
+
+def test_a_deprecated_denovo_run_is_read_with_the_flag(monkeypatch, tmp_path):
+    """--include-deprecated reads an active de novo alignment's deprecated assembly
+    run: the de novo resolve lifts the upstream deprecation check."""
+    rec = _patched_combined(monkeypatch)
+    monkeypatch.setattr(
+        ftc,
+        "_fetch_processing",
+        lambda *a, **k: {"status": "deprecated", "superseded_by": 3},
+    )
+    args = _namespace(tmp_path, denovo_alignment_idx=4, include_deprecated=True)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    assert (4, True) in rec["resolve_upstream"]
+    assert (3, False) in rec["resolve_upstream"]
+
+
+def test_the_upstream_flag_reaches_every_request(monkeypatch, tmp_path):
+    rec = _patched(monkeypatch)
+    args = _namespace(tmp_path, include_deprecated_upstream=True)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    assert {flag for _, flag in rec["resolve_upstream"]} == {True}
+
+
+_UPSTREAM = {
+    "definition_kind": "mask",
+    "definition_idx": 6,
+    "params_hash": "ab" * 32,
+    "deprecation_reason": "host reference was wrong",
+}
+
+
+def test_the_doget_records_and_reports_the_deprecated_upstreams_it_read(monkeypatch, capsys):
+    sent = {}
+
+    def _call(method, base_url, token, path, json=None, **kwargs):
+        sent["json"] = json
+        return {"ticket": "dGlja2V0", "deprecated_upstreams": [_UPSTREAM]}
+
+    monkeypatch.setattr(ftc._common, "call", _call)
+    seen: dict[int, list] = {}
+    for _ in range(2):
+        ftc._create_alignment_doget_ticket(
+            "http://cp",
+            "tok",
+            alignment_idx=3,
+            prep_sample_idx=[1],
+            columns=("prep_sample_idx",),
+            include_deprecated_upstream=True,
+            upstreams_read=seen,
+        )
+    assert sent["json"]["include_deprecated_upstream"] is True
+    assert seen == {3: [_UPSTREAM]}
+    err = capsys.readouterr().err
+    assert err.count("alignment 3 reads mask 6, which is deprecated") == 1
+    assert INCLUDE_DEPRECATED_UPSTREAM_FLAG in err
+
+    part = ftc._Part(3, {"params_hash": "cd" * 32, "params": {"aligner": "minimap2"}}, (1,))
+    record = ftc._manifest_parts(
+        [part], {3: "QP7"}, [{"prep_sample_idx": 1, "export_id": "QM1"}], seen
+    )
+    assert record["parts"][0]["deprecated_upstreams"] == [
+        {"kind": "mask", "params_hash": "ab" * 32, "deprecation_reason": "host reference was wrong"}
+    ]
+    assert "idx" not in json.dumps(record["parts"])
+
+
+def test_a_deprecated_alignments_default_cohort_records_what_it_left_out(
+    monkeypatch, tmp_path, capsys
+):
+    """The cohort route leaves a prep_sample whose mask run is withdrawn out of a
+    deprecated alignment's exact cohort; the build succeeds over the rest and records it
+    by biosample accession, with no `_idx`."""
+    rec = _patched(monkeypatch)
+    _deprecated_listing(monkeypatch, rec)
+    monkeypatch.setattr(
+        ftc,
+        "_fetch_alignment_cohort",
+        lambda *a, **k: {
+            "prep_sample_idx": [1, 2],
+            "left_out": [
+                {
+                    "prep_sample_idx": 5,
+                    "biosample_accession": "SAMEA5",
+                    "state": "not_processed",
+                    "reason": "upstream_withdrawn",
+                }
+            ],
+        },
+    )
+    args = _namespace(tmp_path, include_deprecated=True)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    table = _manifest(tmp_path)["table"]
+    assert table["left_out_by_accession"] == [
+        {"biosample_accession": "SAMEA5", "state": "not_processed", "reason": "upstream_withdrawn"}
+    ]
+    assert "SAMEA5: not_processed (upstream_withdrawn)" in capsys.readouterr().err
+
+
+def test_a_deprecated_denovo_alignment_records_its_failed_and_running_runs(
+    monkeypatch, tmp_path, capsys
+):
+    """Under --include-deprecated on a deprecated de novo alignment, a prep_sample whose
+    run there failed or is running stays reference-only and is recorded under
+    `denovo.left_out` by biosample accession, state and reason."""
+    deprecated_4 = {
+        **_listed(4, _DENOVO_PARAMS),
+        "status": "deprecated",
+        "deprecation_reason": "contigs were misassembled",
+    }
+    _patched_two_pools(
+        monkeypatch,
+        resolve=_TWO_POOL_DENOVO_RESOLVE,
+        listings={
+            _POOL_A: {"alignments": [_listed(3, _PARAMS), deprecated_4]},
+            _POOL_B: {"alignments": [_listed(13, _PARAMS_B), _listed(14, _DENOVO_PARAMS_B)]},
+        },
+    )
+    completed = {(_POOL_A, 3): [1], (_POOL_B, 13): [2], (_POOL_A, 4): [1]}
+    left = {
+        (_POOL_A, 4): [
+            {
+                "prep_sample_idx": 2,
+                "biosample_accession": "SAMEA2",
+                "state": "incomplete",
+                "reason": "failed",
+            },
+            {
+                "prep_sample_idx": 9,
+                "biosample_accession": "SAMEA9",
+                "state": "incomplete",
+                "reason": "in_progress",
+            },
+        ]
+    }
+
+    def _cohort(b, t, *, sequencing_run_idx, sequenced_pool_idx, alignment_idx, **flags):
+        key = ((sequencing_run_idx, sequenced_pool_idx), alignment_idx)
+        return {"prep_sample_idx": completed.get(key, []), "left_out": left.get(key, [])}
+
+    monkeypatch.setattr(ftc, "_fetch_alignment_cohort", _cohort)
+    args = _two_pool_args(
+        tmp_path, prep_sample_idx=[1, 2], denovo_alignment_idx=4, include_deprecated=True
+    )
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    denovo = _manifest(tmp_path)["table"]["denovo"]
+    # Prep_sample 9 is not in the cohort, so it is not recorded.
+    assert denovo["left_out"] == [
+        {"biosample_accession": "SAMEA2", "state": "failed", "reason": "failed"}
+    ]
+    assert "SAMEA2: failed (failed)" in capsys.readouterr().err
+    assert "idx" not in json.dumps(denovo["left_out"])
