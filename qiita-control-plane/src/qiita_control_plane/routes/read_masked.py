@@ -52,6 +52,7 @@ from typing import Annotated
 
 import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import JSONResponse
 from pydantic import Field
 from qiita_common.api_paths import (
     PATH_MASK_DEFINITION_BY_IDX,
@@ -135,6 +136,8 @@ from ._helpers import (
     gate_roster_narrowing_idx,
     live_work_http,
     pair_refused_http,
+    resolution_body,
+    sees_resolution_tickets,
 )
 
 _MSG_MASK_NOT_FOUND = "Mask definition not found"
@@ -361,7 +364,9 @@ async def list_mask_prep_samples_route(
     )
 
 
-@mask_definition_router.get(PATH_MASK_DEFINITION_SYNDNA_READ_COUNT)
+@mask_definition_router.get(
+    PATH_MASK_DEFINITION_SYNDNA_READ_COUNT, response_model=SyndnaReadCountResponse
+)
 async def get_syndna_read_count_route(
     mask_idx: Annotated[int, Field(gt=0)],
     pool: asyncpg.Pool = Depends(get_db_pool),
@@ -376,7 +381,7 @@ async def get_syndna_read_count_route(
     prep_sample_idx: list[int] | None = Query(
         default=None, description="These prep_samples (repeatable)."
     ),
-) -> SyndnaReadCountResponse:
+) -> SyndnaReadCountResponse | JSONResponse:
     """The per-insert SynDNA read counts of the selected prep_samples across one
     mask's group — what `qiita mask syndna-read-count` writes as BIOM or Parquet.
 
@@ -521,7 +526,7 @@ async def get_syndna_read_count_route(
                 " syndna-read-count`)"
             ),
         )
-    return SyndnaReadCountResponse(
+    response = SyndnaReadCountResponse(
         mask_idx=mask_idx,
         reference_idx=reference_idx,
         inserts=[SyndnaInsert.model_validate(dict(r)) for r in inserts],
@@ -537,6 +542,14 @@ async def get_syndna_read_count_route(
             if r["prep_sample_idx"] in mask_by_sample
         ],
         left_out=left_out,
+    )
+    if sees_resolution_tickets(caller):
+        return response
+    return JSONResponse(
+        {
+            **response.model_dump(mode="json", exclude={"left_out"}),
+            "left_out": [resolution_body(r, caller) for r in left_out],
+        }
     )
 
 

@@ -8,15 +8,15 @@ than narrowed, as on every cohort route (`authorize_prep_sample_cohort`). The
 resolution reads one read-only snapshot, so the groups, gates and tickets it reads
 are of one moment.
 
-A `work_ticket_idx` is returned to a system_admin only: the ticket a prep_sample
-waits on may be another principal's block ticket covering other studies' samples.
+Each sample's `work_ticket_idx` is returned to a system_admin only
+(`sees_resolution_tickets` says why).
 """
 
 import asyncpg
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import JSONResponse
 from qiita_common.api_paths import PATH_DEFINITION_GROUP_PREFIX, PATH_DEFINITION_GROUP_RESOLVE
-from qiita_common.auth_constants import Scope, SystemRole
+from qiita_common.auth_constants import Scope
 from qiita_common.models import DefinitionGroupResolveRequest, DefinitionGroupResolveResponse
 
 from ..auth.guards import COHORT_MIN_TIER, require_human, require_scope
@@ -24,7 +24,7 @@ from ..auth.principal import HumanUser, Principal
 from ..definition_resolver import DefinitionNotObservable, require_observable, resolve_group
 from ..definition_similarity import load_groups
 from ..deps import get_db_pool
-from ._helpers import authorize_prep_sample_cohort
+from ._helpers import authorize_prep_sample_cohort, resolution_body, sees_resolution_tickets
 
 router = APIRouter(prefix=PATH_DEFINITION_GROUP_PREFIX, tags=["definition-group"])
 
@@ -69,8 +69,11 @@ async def resolve_definition_group_route(
         group=list(resolution.group),
         samples=list(resolution.samples.values()),
     )
-    if caller.has_role(SystemRole.SYSTEM_ADMIN):
+    if sees_resolution_tickets(caller):
         return response
     return JSONResponse(
-        response.model_dump(mode="json", exclude={"samples": {"__all__": {"work_ticket_idx"}}})
+        {
+            **response.model_dump(mode="json", exclude={"samples"}),
+            "samples": [resolution_body(r, caller) for r in response.samples],
+        }
     )

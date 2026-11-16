@@ -19,7 +19,7 @@ from qiita_common.actions import (
     LONG_READ_ASSEMBLY_ACTION_ID,
     READ_MASK_ACTION_ID,
 )
-from qiita_common.api_paths import URL_DEFINITION_GROUP_RESOLVE
+from qiita_common.api_paths import URL_ALIGNMENT_COHORT_DOGET, URL_DEFINITION_GROUP_RESOLVE
 from qiita_common.auth_constants import Scope
 from qiita_common.models import (
     DefinitionKind,
@@ -322,6 +322,34 @@ async def test_a_covering_align_block_that_is_running_makes_the_sample_incomplet
         R.IN_PROGRESS,
         w["align_1"],
     )
+
+
+async def test_the_cohort_doget_refusal_names_the_ticket_to_a_system_admin_only(
+    ctx, alignment_group_world, tickets
+):
+    w = alignment_group_world
+    ticket = await tickets["block"](
+        ALIGN_ACTION_ID,
+        samples=[w["ps_a"]],
+        state=WorkTicketState.PENDING,
+        mask_idx=w["mask_idx"],
+        alignment_idx=w["align_1"],
+    )
+    url = URL_ALIGNMENT_COHORT_DOGET.format(alignment_idx=w["align_1"])
+    body = {"prep_sample_idx": [w["ps_a"]], "columns": ["prep_sample_idx", "feature_idx"]}
+
+    user = await ctx["user"].post(url, json=body)
+    assert user.status_code == 409, user.text
+    detail = user.json()["detail"]
+    [sample] = detail["samples"]
+    assert (sample["reason"], "work_ticket_idx" in sample) == (R.IN_PROGRESS, False)
+    assert "work_ticket" not in detail["detail"]
+
+    admin = await ctx["admin"].post(url, json=body)
+    assert admin.status_code == 409, admin.text
+    detail = admin.json()["detail"]
+    assert detail["samples"][0]["work_ticket_idx"] == ticket
+    assert f"work_ticket {ticket}" in detail["detail"]
 
 
 @pytest.mark.parametrize(

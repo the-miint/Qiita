@@ -23,6 +23,7 @@ from qiita_common.models import (
     MissingReasonRef,
     SampleGlobalFieldResponse,
     SampleMetadataWriteResponse,
+    SampleResolution,
     SampleStudyFieldCreateRequest,
     SampleStudyFieldPatchRequest,
     SampleStudyFieldResponse,
@@ -1902,3 +1903,18 @@ def build_idxs_list_response(
         truncated=truncated,
         caller_system_role=caller_system_role,
     )
+
+
+def sees_resolution_tickets(caller: HumanUser) -> bool:
+    """Whether a route returns `SampleResolution.work_ticket_idx` to this caller: a
+    system_admin only. The ticket a prep_sample waits on may be another principal's
+    block ticket, covering other studies' samples, so it is not the caller's to see
+    even when every prep_sample it names is."""
+    return caller.has_role(SystemRole.SYSTEM_ADMIN)
+
+
+def resolution_body(resolution: SampleResolution, caller: HumanUser) -> dict:
+    """A resolution's JSON body for this caller: without `work_ticket_idx` unless
+    `sees_resolution_tickets`."""
+    exclude = None if sees_resolution_tickets(caller) else {"work_ticket_idx"}
+    return resolution.model_dump(mode="json", exclude=exclude)

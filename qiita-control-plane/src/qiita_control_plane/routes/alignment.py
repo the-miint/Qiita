@@ -112,6 +112,8 @@ from ._helpers import (
     first_few,
     live_work_http,
     pair_refused_http,
+    resolution_body,
+    sees_resolution_tickets,
 )
 
 # The DuckLake relation this route signs DoGet tickets for: the exclusion-aware
@@ -555,7 +557,7 @@ async def create_alignment_cohort_doget_ticket(
         raise HTTPException(status_code=404, detail=ALIGNMENT_NOT_FOUND_DETAIL) from exc
     refused = resolution.not_resolved_to(alignment_idx)
     if refused:
-        raise _not_resolved_http(alignment_idx, refused)
+        raise _not_resolved_http(alignment_idx, refused, caller)
 
     return _sign_alignment_ticket(
         alignment_idx=alignment_idx,
@@ -565,14 +567,18 @@ async def create_alignment_cohort_doget_ticket(
     )
 
 
-def _not_resolved_http(alignment_idx: int, refused: list[SampleResolution]) -> HTTPException:
+def _not_resolved_http(
+    alignment_idx: int, refused: list[SampleResolution], caller: HumanUser
+) -> HTTPException:
     """409 for cohort prep_samples that do not resolve to `alignment_idx`: a message, the
     first refused prep_sample's `DefinitionGroupRefusal` code, the count, and the first
     few prep_samples' resolutions. The caller passed the access check for every one of
     them, so naming what each resolves to discloses nothing it may not read; the
-    list is truncated like every refusal built from a caller-named cohort."""
+    ticket each waits on is shown per `sees_resolution_tickets`. The list is truncated
+    like every refusal built from a caller-named cohort."""
     shown = refused[:5]
-    examples = "; ".join(r.describe() for r in shown)
+    tickets = sees_resolution_tickets(caller)
+    examples = "; ".join(r.describe(ticket=tickets) for r in shown)
     more = ", …" if len(refused) > len(shown) else ""
     return HTTPException(
         status_code=409,
@@ -584,7 +590,7 @@ def _not_resolved_http(alignment_idx: int, refused: list[SampleResolution]) -> H
             "reason": cohort_refusal(refused[0], alignment_idx).value,
             "alignment_idx": alignment_idx,
             "count": len(refused),
-            "samples": [r.model_dump(mode="json") for r in shown],
+            "samples": [resolution_body(r, caller) for r in shown],
         },
     )
 

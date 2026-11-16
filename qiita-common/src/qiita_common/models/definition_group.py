@@ -98,16 +98,16 @@ class SampleResolution(BaseModel):
             raise ValueError(f"a {self.state.value} prep_sample carries a reason")
         return self
 
-    def describe(self) -> str:
+    def describe(self, *, ticket: bool = True) -> str:
         """One line for a person: the prep_sample, its state and reason, the member
-        they are about, the ticket it waits on and the upstream a reason names, each
-        when known."""
+        they are about, the ticket it waits on (unless `ticket` is false) and the
+        upstream a reason names, each when known."""
         line = f"prep_sample {self.prep_sample_idx}: {self.state.value}"
         if self.reason is not None:
             line += f" ({self.reason.value})"
         if self.definition_idx is not None:
             line += f", {self.definition_kind.value} {self.definition_idx}"
-        if self.work_ticket_idx is not None:
+        if ticket and self.work_ticket_idx is not None:
             line += f", work_ticket {self.work_ticket_idx}"
         if self.upstream_kind is not None:
             line += f", upstream {self.upstream_kind.value} {self.upstream_definition_idx}"

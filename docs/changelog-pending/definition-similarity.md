@@ -20,7 +20,8 @@
   is `incomplete` or `not_processed`, with the reason. A processing whose runs it
   does not read per prep_sample (any workflow but `long-read-assembly`) is refused
   (422). The `work_ticket_idx` an `incomplete` prep_sample waits on is returned to a
-  system_admin only.
+  system_admin only, here, in the SynDNA count export's `left_out` and in the
+  alignment cohort DoGet's 409 `samples`.
 - **Public handles for a mask and for a prep_sample under a mask (#874):**
   `POST /api/v1/exported-processing/mask` and `POST /api/v1/exported-identifier/mask`
   (system_admin, `admin:masked_read_export`).

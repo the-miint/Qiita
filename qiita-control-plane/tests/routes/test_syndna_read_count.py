@@ -224,13 +224,15 @@ async def test_a_sample_not_processed_is_left_out_and_listed(ctx):
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert [(s["prep_sample_idx"], s["mask_idx"]) for s in body["samples"]] == [(counted, mask_idx)]
-    assert [
-        (r["prep_sample_idx"], r["state"], r["reason"], r["work_ticket_idx"])
-        for r in body["left_out"]
-    ] == [
-        (stale, "not_processed", "no_run", None),
-        (running, "incomplete", "in_progress", ticket),
+    assert [(r["prep_sample_idx"], r["state"], r["reason"]) for r in body["left_out"]] == [
+        (stale, "not_processed", "no_run"),
+        (running, "incomplete", "in_progress"),
     ]
+    # The ticket a sample waits on is a system_admin's to see only.
+    assert all("work_ticket_idx" not in r for r in body["left_out"])
+    admin = await ctx["admin"].get(_url(mask_idx), params={"study_idx": study_idx})
+    assert admin.status_code == 200, admin.text
+    assert [r["work_ticket_idx"] for r in admin.json()["left_out"]] == [None, ticket]
 
 
 async def test_nothing_processed_is_refused_with_the_reasons(ctx):
