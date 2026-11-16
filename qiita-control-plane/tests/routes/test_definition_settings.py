@@ -461,9 +461,11 @@ async def test_an_edit_is_refused_while_work_runs_under_the_definition(
 async def test_an_edit_waits_for_a_ticket_write_holding_the_definition_and_then_sees_it(
     postgres_pool, clients, defs, kind
 ):
-    """A transaction that holds the definition `FOR SHARE` (as the ticket writers do)
-    and writes a ticket under it blocks the edit until it commits; the edit then sees
-    the ticket and refuses (`live_work`)."""
+    """A transaction that writes a ticket under the definition blocks the edit until it
+    commits; the edit then sees the ticket and refuses (`live_work`). The write holds
+    no explicit lock: setting the column's FK takes a key-share lock on the definition
+    row, which conflicts with the edit's `FOR UPDATE`. That lock is what every ticket
+    writer's recording relies on."""
     import asyncio
 
     from qiita_common.models import ScopeTargetKind, WorkTicketState
@@ -483,7 +485,7 @@ async def test_an_edit_waits_for_a_ticket_write_holding_the_definition_and_then_
     )
     async with postgres_pool.acquire() as conn, conn.transaction():
         block_idx = await create_block(conn)
-    table, col = _TABLE[kind]
+    _, col = _TABLE[kind]
     ticket = None
     try:
         body = {
@@ -494,7 +496,6 @@ async def test_an_edit_waits_for_a_ticket_write_holding_the_definition_and_then_
         try:
             tx = writer.transaction()
             await tx.start()
-            await writer.execute(f"SELECT 1 FROM {table} WHERE {col} = $1 FOR SHARE", idx)
             ticket = await writer.fetchval(
                 "INSERT INTO qiita.work_ticket (action_id, action_version,"
                 "  originator_principal_idx, scope_target_kind, block_idx, state, " + col + ")"
@@ -523,6 +524,100 @@ async def test_an_edit_waits_for_a_ticket_write_holding_the_definition_and_then_
                 "DELETE FROM qiita.work_ticket WHERE work_ticket_idx = $1", ticket
             )
         await postgres_pool.execute("DELETE FROM qiita.block WHERE block_idx = $1", block_idx)
+        await delete_action_if_created(
+            postgres_pool, action_id=_TICKET_ACTION, version=_TICKET_VERSION, created=created
+        )
+
+
+async def test_an_edit_between_a_processing_mint_and_its_hold_re_mints(
+    postgres_pool, clients, monkeypatch
+):
+    """An edit that commits between the runner's mint of a processing and its hold of
+    the row re-keys the row the mint resolved. The runner re-mints, so the ticket is
+    recorded under a processing whose settings are the ones it hashed, and the edited
+    row keeps the edit."""
+    from qiita_common.models import ScopeTargetKind, WorkTicketState
+
+    from qiita_control_plane.repositories.block import create_block
+    from qiita_control_plane.runner import _processing
+    from qiita_control_plane.testing.db_seeds import (
+        delete_action_if_created,
+        seed_action_if_absent,
+    )
+
+    bound = {"mask_idx": secrets.randbelow(10**9) + 10**9}
+
+    async def mint(work_ticket_idx=None):
+        return (
+            await _processing._mint_processing_idx(
+                postgres_pool,
+                action_id="long-read-assembly",
+                action_version="1.0.0",
+                bound=bound,
+                assembler_default="hifiasm_meta",
+                work_ticket_idx=work_ticket_idx,
+            )
+        )["processing_idx"]
+
+    edited = await mint()
+    minted = [edited]
+    created = await seed_action_if_absent(
+        postgres_pool,
+        action_id=_TICKET_ACTION,
+        version=_TICKET_VERSION,
+        target_kind=ScopeTargetKind.BLOCK.value,
+    )
+    async with postgres_pool.acquire() as conn, conn.transaction():
+        block_idx = await create_block(conn)
+    ticket = await postgres_pool.fetchval(
+        "INSERT INTO qiita.work_ticket (action_id, action_version,"
+        "  originator_principal_idx, scope_target_kind, block_idx, state)"
+        " VALUES ($1, $2, (SELECT MIN(idx) FROM qiita.principal), 'block', $3,"
+        "         $4::qiita.work_ticket_state)"
+        " RETURNING work_ticket_idx",
+        _TICKET_ACTION,
+        _TICKET_VERSION,
+        block_idx,
+        WorkTicketState.COMPLETED.value,
+    )
+    params = await _params(postgres_pool, DefinitionKind.PROCESSING, edited)
+    real_mint = _processing.mint_processing
+    edits = []
+
+    async def mint_then_edit(conn, **kw):
+        row = await real_mint(conn, **kw)
+        if not edits:
+            resp = await clients["admin"].patch(
+                _url(DefinitionKind.PROCESSING, edited),
+                json={"params": {**params, "assembler": "edited"}, "reason": _REASON},
+            )
+            edits.append(resp)
+        return row
+
+    monkeypatch.setattr(_processing, "mint_processing", mint_then_edit)
+    try:
+        recorded = await mint(work_ticket_idx=ticket)
+        minted.append(recorded)
+        assert edits[0].status_code == 200, edits[0].text
+        assert recorded != edited
+        assert (
+            await postgres_pool.fetchval(
+                "SELECT processing_idx FROM qiita.work_ticket WHERE work_ticket_idx = $1", ticket
+            )
+            == recorded
+        )
+        assert await _params(postgres_pool, DefinitionKind.PROCESSING, recorded) == params
+        assert (await _params(postgres_pool, DefinitionKind.PROCESSING, edited))[
+            "assembler"
+        ] == "edited"
+    finally:
+        await postgres_pool.execute(
+            "DELETE FROM qiita.work_ticket WHERE work_ticket_idx = $1", ticket
+        )
+        await postgres_pool.execute("DELETE FROM qiita.block WHERE block_idx = $1", block_idx)
+        await postgres_pool.execute(
+            "DELETE FROM qiita.processing WHERE processing_idx = ANY($1::bigint[])", minted
+        )
         await delete_action_if_created(
             postgres_pool, action_id=_TICKET_ACTION, version=_TICKET_VERSION, created=created
         )

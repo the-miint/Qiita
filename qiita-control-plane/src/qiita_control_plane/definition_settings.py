@@ -11,10 +11,15 @@ groups are computed from):
      deprecation or a delete;
   2a. no unfinished work ticket runs under it (`live_work`): its output would be
      recorded under settings it did not run with. The definition row is held
-     `FOR UPDATE`, which the writers of `work_ticket.mask_idx` / `alignment_idx` /
-     `processing_idx` wait on (`lock_active_mask`, `lock_active_alignment`,
-     `runner._processing._persist_processing_idx`), so an edit and a ticket's write
-     of the definition cannot both commit unseen by the other. The
+     `FOR UPDATE`; a ticket's write of the definition column waits on it (the
+     column's FK takes a key-share lock on the row, and the writers also hold it
+     `FOR SHARE`), and the edit then sees the ticket. A processing is minted and
+     recorded in one transaction that holds the row from the mint on
+     (`runner._processing._mint_and_hold`). A mask or an alignment is minted in one
+     transaction and recorded in a later one (`_persist_mask_idx`,
+     `_persist_alignment_idx`, holding `lock_active_mask` / `lock_active_alignment`),
+     so an edit that commits between the two is not refused, and the ticket is then
+     recorded under the edited row. The
      deprecation lookups (`refuse_deprecating_*_with_live_work`) are not reused:
      they skip a deprecated definition, and a deprecated one's settings are locked too;
   2b. no public handle that is not retired cites it (`published`): an
