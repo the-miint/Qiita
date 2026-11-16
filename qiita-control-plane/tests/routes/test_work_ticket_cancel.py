@@ -449,8 +449,11 @@ async def test_a_redrive_during_the_reap_is_refused(ctx, fail):
         backend.release.set()
         assert (await cancel).status_code == 200
     if fail:
-        with pytest.raises(ReapPending, match="failed: RuntimeError: orchestrator unreachable"):
+        with pytest.raises(ReapPending) as exc:
             await _redrive(ctx["pool"], idx)
+        # The note rides on the exception, outside its str (`sees_reap_note`).
+        assert "orchestrator unreachable" not in str(exc.value)
+        assert "failed: RuntimeError: orchestrator unreachable" in exc.value.message(with_note=True)
     else:
         assert await _reap_mark(ctx["pool"], idx) == (None, None)
         assert await _redrive(ctx["pool"], idx) is True

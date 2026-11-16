@@ -278,13 +278,13 @@ async def refuse_deprecated_mask_read(
 @dataclass(frozen=True)
 class AlignmentCohortRead:
     """What `authorize_completed_alignment_cohort` admitted: the cohort; `exact`, a
-    deprecated alignment read alone; `include_deprecated_upstream`, the deprecated
+    deprecated alignment read alone; `admitted_upstream_kinds`, the deprecated
     upstream kinds an active alignment is read past (`deprecated_upstream_read`, for
     `resolve_group`); and the deprecated upstreams it reads, for the response."""
 
     cohort: list[int]
     exact: bool
-    include_deprecated_upstream: frozenset[DefinitionKind]
+    admitted_upstream_kinds: frozenset[DefinitionKind]
     deprecated_upstreams: list[DeprecatedUpstream]
 
 

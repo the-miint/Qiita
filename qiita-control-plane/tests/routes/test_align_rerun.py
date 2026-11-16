@@ -759,6 +759,7 @@ class _CountingPool:
 async def _rerun_direct(rr, wt, pool=None, **kw):
     kw.setdefault("deadline", align_rerun.pre_txn_deadline())
     kw.setdefault("allow_deprecated_mask", False)
+    kw.setdefault("show_reap_note", True)
     return await align_rerun.rerun_align_block(
         pool or rr.pool,
         alignment_idx=rr.alignment_idx,

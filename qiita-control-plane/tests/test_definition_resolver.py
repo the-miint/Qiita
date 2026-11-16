@@ -368,9 +368,7 @@ def resolve_past_upstream(definitions, pairs, kind, idx, observations, admitted=
         idx,
         S,
         observations,
-        include_deprecated_upstream=(
-            frozenset({MASK, PROCESSING}) if admitted is None else admitted
-        ),
+        admitted_upstream_kinds=(frozenset({MASK, PROCESSING}) if admitted is None else admitted),
     )
 
 

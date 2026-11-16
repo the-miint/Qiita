@@ -60,9 +60,9 @@ definition or an upstream deprecated) are not checked; and each upstream is
 resolved in exact mode too (its own definition, no group), so rule 5's
 `upstream_moved` cannot arise.
 
-**Deprecated upstreams** (`include_deprecated_upstream`, the deprecated upstream kinds
-a caller that names an active definition reads past on purpose,
-`qiita_common.models.admitted_deprecated_upstream_kinds`): the group is resolved as
+**Deprecated upstreams** (`admitted_upstream_kinds`): a caller naming an active
+definition can read past deprecated upstreams of some kinds; which kinds each flag
+admits is `qiita_common.models.admitted_deprecated_upstream_kinds`. The group is resolved as
 above, except that rule 4 is not checked for an upstream of an admitted kind, and
 each upstream of an admitted kind is resolved without rule 3 for itself and with the
 same admitted kinds for its own upstreams. A deprecated member of the named group is
@@ -144,6 +144,8 @@ __all__ = [
     "cohort_refusal",
     "needed_definitions",
     "require_observable",
+    "NO_RUN_TO_READ",
+    "exact_read_left_out",
     "resolve_exact",
     "resolve_group",
     "resolve_sample",
@@ -398,12 +400,12 @@ def resolve_sample(
     observations: Observations,
     *,
     exact: bool = False,
-    include_deprecated_upstream: frozenset[DefinitionKind] = frozenset(),
+    admitted_upstream_kinds: frozenset[DefinitionKind] = frozenset(),
     self_deprecation_ok: bool = False,
 ) -> SampleResolution:
     """`prep_sample_idx`'s resolution in `kind` `definition_idx`'s group, by the
     rules in the module docstring (in exact mode with `exact`; without rule 4 for an
-    upstream whose kind is in `include_deprecated_upstream`, and without rule 3 with
+    upstream whose kind is in `admitted_upstream_kinds`, and without rule 3 with
     `self_deprecation_ok`, which the upstream recursion sets for such an upstream).
     `observations` must cover `needed_definitions(groups, kind, definition_idx,
     exact=exact)`; a missing entry reads as no gate row and no ticket."""
@@ -451,7 +453,7 @@ def resolve_sample(
     for up_kind, up_idx in ups:
         up_definition = groups.definitions.get((up_kind, up_idx))
         if (
-            not (exact or up_kind in include_deprecated_upstream)
+            not (exact or up_kind in admitted_upstream_kinds)
             and up_definition is not None
             and up_definition.deprecated
         ):
@@ -469,8 +471,8 @@ def resolve_sample(
             prep_sample_idx,
             observations,
             exact=exact,
-            include_deprecated_upstream=include_deprecated_upstream,
-            self_deprecation_ok=up_kind in include_deprecated_upstream,
+            admitted_upstream_kinds=admitted_upstream_kinds,
+            self_deprecation_ok=up_kind in admitted_upstream_kinds,
         )
         if up.state is SampleResolutionState.PROCESSED:
             if up.definition_idx == up_idx:
@@ -593,7 +595,7 @@ async def resolve_group(
     prep_sample_idxs: Iterable[int],
     groups: Groups | None = None,
     as_of_event: str | None = None,
-    include_deprecated_upstream: frozenset[DefinitionKind] = frozenset(),
+    admitted_upstream_kinds: frozenset[DefinitionKind] = frozenset(),
 ) -> GroupResolution:
     """Resolve each of `prep_sample_idxs` in `kind` `definition_idx`'s group, in the
     caller's REPEATABLE READ transaction. `groups` is loaded when not given; a caller
@@ -601,7 +603,7 @@ async def resolve_group(
     `as_of_event`, which is then not passed here). `as_of_event` computes the group from
     an earlier decision set (`decision_set`). Raises DefinitionNotFound when
     `definition_idx` is not a `kind` definition, DefinitionNotObservable
-    (`require_observable`), and DecisionSetUnknown. `include_deprecated_upstream` is
+    (`require_observable`), and DecisionSetUnknown. `admitted_upstream_kinds` is
     the deprecated upstream kinds read past (module docstring, "Deprecated
     upstreams")."""
     return await _resolve(
@@ -612,7 +614,25 @@ async def resolve_group(
         groups=groups,
         exact=False,
         as_of_event=as_of_event,
-        include_deprecated_upstream=include_deprecated_upstream,
+        admitted_upstream_kinds=admitted_upstream_kinds,
+    )
+
+
+# The exact read's left-out rule: every prep_sample it does not resolve `processed` is
+# left out and reported, except one with nothing to read there: no run under the
+# definition, or (de novo) an assembly that produced no contigs.
+NO_RUN_TO_READ = frozenset({SampleResolutionReason.NO_RUN, SampleResolutionReason.NO_DATA})
+
+
+def exact_read_left_out(samples: Iterable[SampleResolution]) -> list[SampleResolution]:
+    """The prep_samples an exact read leaves out (`NO_RUN_TO_READ`), ascending."""
+    return sorted(
+        (
+            r
+            for r in samples
+            if r.state is not SampleResolutionState.PROCESSED and r.reason not in NO_RUN_TO_READ
+        ),
+        key=lambda r: r.prep_sample_idx,
     )
 
 
@@ -647,7 +667,7 @@ async def _resolve(
     groups: Groups | None,
     exact: bool,
     as_of_event: str | None = None,
-    include_deprecated_upstream: frozenset[DefinitionKind] = frozenset(),
+    admitted_upstream_kinds: frozenset[DefinitionKind] = frozenset(),
 ) -> GroupResolution:
     require_transaction(conn)
     # The gates, tickets and groups are read in several statements; below REPEATABLE
@@ -680,7 +700,7 @@ async def _resolve(
                 s,
                 observations,
                 exact=exact,
-                include_deprecated_upstream=include_deprecated_upstream,
+                admitted_upstream_kinds=admitted_upstream_kinds,
             )
             for s in samples
         },

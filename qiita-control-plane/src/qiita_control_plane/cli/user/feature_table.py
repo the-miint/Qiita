@@ -1670,10 +1670,11 @@ def _exact_left_out(
     entries: list[dict[str, Any]], read: str, *, denovo: bool
 ) -> list[dict[str, Any]]:
     """The manifest's record of what an exact read of a deprecated alignment left out,
-    from the pool cohort route's `left_out` entries (the rule is the route's
-    `_NO_RUN_TO_READ`), as `_left_out_record`s. `state` is the resolution state, or, on
-    the de novo arm, `DENOVO_LEFT_OUT_FAILED` / `DENOVO_LEFT_OUT_RUNNING` for a run that
-    failed or has not finished. Each is listed on stderr."""
+    from the pool cohort route's `left_out` entries (the rule is
+    `definition_resolver.NO_RUN_TO_READ`), as `_left_out_record`s. `state` is the
+    resolution state, or, on the de novo arm, `DENOVO_LEFT_OUT_FAILED` /
+    `DENOVO_LEFT_OUT_RUNNING` for a run that failed or has not finished. Each is listed
+    on stderr."""
     records = sorted(
         (
             _left_out_record(
@@ -1872,9 +1873,7 @@ def _plan_denovo(
     and are listed on stderr and returned for the manifest's `denovo.left_out`.
 
     The resolve of the de novo group carries both flags, so it reads past exactly the
-    deprecated upstreams they admit (`admitted_deprecated_upstream_kinds`): a deprecated
-    assembly run under either flag, a deprecated mask only under
-    --include-deprecated-upstream.
+    deprecated upstreams they admit (`admitted_deprecated_upstream_kinds`).
     """
     anchor = args.denovo_alignment_idx
     summaries = {anchor: _alignment_summary(listing, alignment_idx=anchor)}

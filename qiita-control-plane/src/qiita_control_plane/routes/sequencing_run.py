@@ -53,7 +53,7 @@ the sibling sequenced_sample route module.
 
 import base64
 import json
-from collections.abc import Iterable, Mapping
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -98,8 +98,6 @@ from qiita_common.models import (
     PoolReadMetrics,
     PoolWorkTicketSummary,
     SampleQCReport,
-    SampleResolution,
-    SampleResolutionReason,
     SampleResolutionState,
     SequencedPoolCreateRequest,
     SequencedPoolCreateResponse,
@@ -145,7 +143,7 @@ from ..auth.guards import (
     require_service_with_scope,
 )
 from ..auth.principal import HumanUser, Principal, ServiceAccount
-from ..definition_resolver import resolve_exact
+from ..definition_resolver import exact_read_left_out, resolve_exact
 from ..definition_similarity import deprecated_upstreams
 from ..deps import (
     TxConnFactory,
@@ -846,8 +844,8 @@ async def get_sequenced_pool_alignment_cohort(
     For a deprecated alignment under `include_deprecated`, the cohort is the readable
     prep_samples that its exact read (`resolve_exact`) resolves `processed`, and
     `left_out` lists the readable prep_samples the exact read leaves out
-    (`_NO_RUN_TO_READ` states the rule), with their biosample handles. A build reading
-    that alignment leaves them out and records them.
+    (`definition_resolver.NO_RUN_TO_READ` states the rule), with their biosample
+    handles. A build reading that alignment leaves them out and records them.
     """
     prep_sample_idxs = await _readable_pool_prep_samples(
         pool, sequenced_pool_idx=sequenced_pool_idx, caller=caller
@@ -876,30 +874,12 @@ async def get_sequenced_pool_alignment_cohort(
     )
 
 
-# The exact read's left-out rule: every prep_sample it does not resolve `processed` is
-# left out and reported, except one with nothing to read there: no run under the
-# alignment, or (de novo) an assembly that produced no contigs.
-_NO_RUN_TO_READ = frozenset({SampleResolutionReason.NO_RUN, SampleResolutionReason.NO_DATA})
-
-
-def exact_read_left_out(samples: Iterable[SampleResolution]) -> list[SampleResolution]:
-    """The prep_samples an exact read leaves out (`_NO_RUN_TO_READ`), ascending."""
-    return sorted(
-        (
-            r
-            for r in samples
-            if r.state is not SampleResolutionState.PROCESSED and r.reason not in _NO_RUN_TO_READ
-        ),
-        key=lambda r: r.prep_sample_idx,
-    )
-
-
 async def _exact_cohort(
     pool: asyncpg.Pool, alignment_idx: int, prep_sample_idxs: list[int]
 ) -> tuple[list[int], list[PoolAlignmentCohortLeftOut]]:
     """`prep_sample_idxs` read under `alignment_idx` alone (`resolve_exact`): those it
-    resolves `processed`, and those it leaves out (`_NO_RUN_TO_READ` states the rule),
-    each with its biosample's accession and `QB<n>` handle; both ascending."""
+    resolves `processed`, and those it leaves out (`definition_resolver.NO_RUN_TO_READ`
+    states the rule), each with its biosample's accession and `QB<n>` handle; both ascending."""
     async with pool.acquire() as conn, conn.transaction(isolation="repeatable_read", readonly=True):
         resolution = await resolve_exact(
             conn,

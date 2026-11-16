@@ -114,7 +114,12 @@ from ..repositories.block import BLOCK_ABANDONED
 from ..repositories.mask_definition import MaskDefinitionDeprecated, lock_active_mask
 from ..runner import _fetch_action
 from ..step_progress import StepProgressMismatch, check_step_progress, load_step_progress
-from ..ticket_redrive import ReapPending, drop_dead_step_rows, reset_ticket_to_pending
+from ..ticket_redrive import (
+    ReapPending,
+    drop_dead_step_rows,
+    reset_ticket_to_pending,
+    sees_reap_note,
+)
 from ..work_ticket_cancel import WorkTicketNotFound, cancel_work_ticket
 from ..work_ticket_submit import (
     _reset_failed_reference_scope_for_dispatch,
@@ -344,14 +349,6 @@ def _row_to_work_ticket(row: asyncpg.Record) -> WorkTicket:
     sequenced_pool row — selected upstream so the assembly stays a pure
     transformation."""
     return WorkTicket.model_validate(_shape_work_ticket_columns(dict(row)))
-
-
-def sees_reap_note(principal: Principal) -> bool:
-    """Whether a route shows `principal` a failed reap's note: a system_admin only. The
-    note is the orchestrator client's exception text, which can name the orchestrator's
-    address and the SLURM error; `reap_pending_since` shows every caller who may read
-    the ticket that a reap is pending."""
-    return principal.has_role(SystemRole.SYSTEM_ADMIN)
 
 
 def visible_reap_note(ticket: WorkTicket, principal: Principal) -> WorkTicket:

@@ -1,5 +1,5 @@
 """Which prep_samples the exact read of a deprecated alignment leaves out of the pool
-cohort listing (`routes/sequencing_run._NO_RUN_TO_READ`), over every resolution the
+cohort listing (`definition_resolver.NO_RUN_TO_READ`), over every resolution the
 exact resolver can return."""
 
 import pytest
@@ -10,7 +10,7 @@ from qiita_common.models import (
     SampleResolutionState,
 )
 
-from qiita_control_plane.routes.sequencing_run import exact_read_left_out
+from qiita_control_plane.definition_resolver import exact_read_left_out
 
 R = SampleResolutionReason
 INCOMPLETE = SampleResolutionState.INCOMPLETE

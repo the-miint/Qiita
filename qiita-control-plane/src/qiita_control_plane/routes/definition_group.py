@@ -78,7 +78,7 @@ async def resolve_definition_group_route(
             definition_idx=body.definition_idx,
             prep_sample_idxs=cohort,
             groups=groups,
-            include_deprecated_upstream=admitted_deprecated_upstream_kinds(
+            admitted_upstream_kinds=admitted_deprecated_upstream_kinds(
                 include_deprecated=body.include_deprecated,
                 include_deprecated_upstream=body.include_deprecated_upstream,
             ),

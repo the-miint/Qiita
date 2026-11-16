@@ -102,6 +102,7 @@ from ..repositories.assembly import classify_denovo_arm_cohort
 from ..repositories.block import list_incomplete_alignment_samples
 from ..repositories.processing import fetch_processing_by_idx
 from ..runner import _fetch_action
+from ..ticket_redrive import sees_reap_note
 from ..work_ticket_submit import (
     authorize_redrive_action,
     require_compute_backend_client_dependency,
@@ -348,6 +349,7 @@ async def rerun_alignment_block_route(
             allow_deprecated_mask=body.allow_deprecated_mask,
             reason=body.reason,
             principal_idx=caller.principal_idx,
+            show_reap_note=sees_reap_note(caller),
             ticket_root=ticket_root,
             action_steps=definition.steps,
         )
@@ -572,7 +574,7 @@ async def create_alignment_cohort_doget_ticket(
                     definition_idx=alignment_idx,
                     prep_sample_idxs=cohort,
                     groups=groups,
-                    include_deprecated_upstream=read.include_deprecated_upstream,
+                    admitted_upstream_kinds=read.admitted_upstream_kinds,
                 )
     except DefinitionNotFound as exc:
         raise HTTPException(status_code=404, detail=ALIGNMENT_NOT_FOUND_DETAIL) from exc

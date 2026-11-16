@@ -1361,8 +1361,9 @@ def _build_parser() -> argparse.ArgumentParser:
             "Read a deprecated --alignment-idx or --denovo-alignment-idx alone, its own"
             " completed, non-withdrawn prep_samples, without its group (refused without"
             " this flag). The manifest marks each part read this way, and records the"
-            " prep_samples such a read leaves out (every one it does not resolve processed,"
-            " for any reason but no_run / no_data) by biosample handle. Also reads a de novo"
+            " prep_samples such a read leaves out (every one not read, except one with no"
+            " run under the alignment, or, de novo, whose assembly produced no contigs) by"
+            " biosample accession and QB handle. Also reads a de novo"
             " arm whose assembly run is deprecated. An alignment that is not deprecated"
             " reads its group either way."
         ),

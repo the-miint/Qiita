@@ -906,8 +906,8 @@ def print_deprecated_read(kind: str, idx: int, reason: str | None) -> None:
 
 def print_deprecated_upstream_read(kind: str, idx: int, upstream: dict) -> None:
     """The stderr line for a read of an active definition past a deprecated upstream
-    (a `DeprecatedUpstream` body), made under --include-deprecated-upstream or, for a
-    de novo alignment's assembly run, --include-deprecated."""
+    (a `DeprecatedUpstream` body), naming the flags that admit its kind
+    (`flags_admitting_deprecated_upstream`)."""
     flags = " or ".join(
         flags_admitting_deprecated_upstream(DefinitionKind(upstream["definition_kind"]))
     )

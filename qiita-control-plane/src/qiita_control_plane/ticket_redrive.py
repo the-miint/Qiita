@@ -7,10 +7,20 @@ dispatches: the caller dispatches after commit.
 from __future__ import annotations
 
 import asyncpg
+from qiita_common.auth_constants import SystemRole
 from qiita_common.models import StepProgressState, WorkTicketState
 
+from .auth.principal import Principal
 from .repositories import require_transaction
 from .work_ticket_cancel import REAP_IN_FLIGHT
+
+
+def sees_reap_note(principal: Principal) -> bool:
+    """Whether `principal` is shown a failed reap's note: a system_admin only. The
+    note is the orchestrator client's exception text, which can name the orchestrator's
+    address and the SLURM error; `reap_pending_since` shows every caller who may read
+    the ticket that a reap is pending."""
+    return principal.has_role(SystemRole.SYSTEM_ADMIN)
 
 
 class ReapPending(Exception):
@@ -30,8 +40,7 @@ class ReapPending(Exception):
 
     def message(self, *, with_note: bool) -> str:
         """The refusal text. A failed reap's note (the orchestrator client's error) is
-        included only when `with_note`; who may see it is the routes' call
-        (`routes/work_ticket.sees_reap_note`)."""
+        included only when `with_note` (`sees_reap_note`)."""
         idx, since = self.work_ticket_idx, self.pending_since
         if self.note == REAP_IN_FLIGHT:
             what = (
