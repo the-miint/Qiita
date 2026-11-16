@@ -664,6 +664,7 @@ def _build_parser() -> argparse.ArgumentParser:
             " itself. A mask that is not deprecated exports its group either way"
         ),
     )
+    _common.add_as_of_event_argument(p_export)
     p_export.add_argument(
         "--allow-partial",
         action="store_true",

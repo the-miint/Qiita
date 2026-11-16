@@ -5,13 +5,23 @@ import json
 
 import pyarrow as pa
 import pytest
-from qiita_common.models import SyndnaReadCountResponse
+from qiita_common.models import AS_OF_SCOPE, SyndnaReadCountResponse
 
 from qiita_control_plane.cli import user as cli
 from qiita_control_plane.cli.user import mask as mx
 from qiita_control_plane.miint import connect_with_miint
 
 _H1, _H2 = "synDNA_16SrRNA_seq_1_gc=0.26", "synDNA_16SrRNA_seq_2_gc=0.36"
+
+
+_DECISIONS = {
+    "decision_set": "sha256:" + "1" * 64,
+    "newest_event_at": "2026-11-16T10:00:00Z",
+    "as_of": True,
+    "as_of_scope": AS_OF_SCOPE,
+    "pairs_used": 1,
+    "pairs_used_set": "sha256:" + "2" * 64,
+}
 
 
 def _response(
@@ -38,6 +48,7 @@ def _response(
             ],
             "left_out": left_out,
             "left_out_biosample_accession": left_out_accession,
+            "decisions": _DECISIONS,
         }
     )
 
@@ -295,6 +306,26 @@ def test_include_deprecated_reaches_the_route_and_the_read_is_marked(monkeypatch
     assert "--include-deprecated" in err
 
 
+def test_as_of_event_reaches_the_route_and_the_sidecar_records_the_decisions(monkeypatch, tmp_path):
+    seen: list[dict] = []
+
+    def fake_call(method, base_url, token, path, **kw):
+        seen.append(kw.get("params"))
+        return _TWO.model_dump(mode="json")
+
+    monkeypatch.setenv("QIITA_TOKEN", "t")
+    monkeypatch.setattr(mx._common, "call", fake_call)
+    out = tmp_path / "syndna.parquet"
+    argv = ["--base-url", "https://cp", "mask", "syndna-read-count", "--mask-idx", "3"]
+    argv += ["--study-idx", "1", "--output", str(out), "--format", "parquet"]
+    argv += ["--feature-names", "accession", "--as-of-event", _DECISIONS["decision_set"]]
+    assert cli.main(argv) == 0
+    assert seen == [{"study_idx": "1", "as_of_event": _DECISIONS["decision_set"]}]
+    sidecar = json.loads(mx.syndna_sidecar_path(out).read_text())
+    assert sidecar["decisions"]["decision_set"] == _DECISIONS["decision_set"]
+    assert sidecar["decisions"]["as_of_scope"] == AS_OF_SCOPE
+
+
 def _idx_free(value) -> None:
     """No key or string anywhere in `value` names one of our `_idx` identifiers."""
     if isinstance(value, dict):
@@ -370,6 +401,7 @@ def test_the_table_and_its_sidecar_cite_the_mask_handle_and_carry_no_idx(tmp_pat
         ],
         "deprecated": True,
         "deprecation_reason": "host reference was wrong",
+        "decisions": {**_DECISIONS, "newest_event_at": "2026-11-16T10:00:00Z"},
     }
     if fmt == "parquet":
         assert handles == {"SAMEA1": "QP31", "SAMEA2": "QP40"}

@@ -25,6 +25,7 @@ from qiita_common.api_paths import (
 )
 from qiita_common.auth_constants import BEARER_PREFIX
 from qiita_common.models import (
+    AS_OF_SCOPE,
     DefinitionKind,
     DeprecationRefusal,
     SampleResolutionReason,
@@ -904,7 +905,7 @@ def _fake_masked_export_http(manifest, mints=None):
     # The real route resolves every sample across the mask's group. Default any
     # sample that omits its resolution to processed under the named mask, so terse
     # manifests keep exercising the happy path; a test about resolution sets it.
-    served = {"group": [manifest["mask_idx"]], **manifest}
+    served = {"group": [manifest["mask_idx"]], "decisions": ROSTER_DECISIONS, **manifest}
     served["samples"] = [_served_sample(s, manifest["mask_idx"]) for s in manifest["samples"]]
 
     def fake_request(method, url, headers=None, json=None, params=None, timeout=None):
@@ -1610,6 +1611,17 @@ def _export_argv(out_dir, fmt="parquet", *extra):
     ]
 
 
+# The `decisions` block every fake roster carries unless a test sets its own.
+ROSTER_DECISIONS = {
+    "decision_set": "sha256:" + "3" * 64,
+    "newest_event_at": None,
+    "as_of": False,
+    "as_of_scope": AS_OF_SCOPE,
+    "pairs_used": 0,
+    "pairs_used_set": "sha256:" + "4" * 64,
+}
+
+
 # A roster resolved across mask 3's group {3, 12}: 42 processed under 3, 43 under
 # 12, 44 incomplete (a ticket under 12 still running), 45 not processed anywhere
 # (and unsubmitted, which does not matter for a sample that is not exported).
@@ -1671,6 +1683,45 @@ def _ticket_masks(monkeypatch, served):
         return served(method, url, **kw)
 
     return tickets, recording
+
+
+def test_masked_read_export_as_of_reaches_the_roster_and_each_ticket(monkeypatch, tmp_path):
+    """--as-of-event is sent to the roster GET and on every ticket POST, and each
+    manifest entry records the roster's decisions."""
+    import json as _json
+
+    from qiita_common.api_paths import PATH_ADMIN_MASKED_READ_EXPORT_TICKET
+
+    from qiita_control_plane.cli import _common
+    from qiita_control_plane.cli import admin as cli
+    from qiita_control_plane.cli.admin.masked_export import MANIFEST_NAME
+
+    token = "sha256:" + "5" * 64
+    decisions = {**ROSTER_DECISIONS, "decision_set": token, "as_of": True}
+    served = _fake_masked_export_http({**_GROUP_ROSTER, "decisions": decisions}, [])
+    roster_params: list = []
+    ticket_as_of: list = []
+
+    def recording(method, url, **kw):
+        if method == "GET":
+            roster_params.append(kw.get("params"))
+        if method == "POST" and url.endswith(PATH_ADMIN_MASKED_READ_EXPORT_TICKET):
+            ticket_as_of.append(kw["json"].get("as_of_event"))
+        return served(method, url, **kw)
+
+    monkeypatch.setenv("QIITA_TOKEN", "qk_admin")
+    monkeypatch.setattr(_common.httpx, "request", recording)
+    monkeypatch.setattr("pyarrow.flight.FlightClient", _fake_flight_client_class(_group_tables()))
+    out_dir = tmp_path / "exp"
+    argv = _export_argv(out_dir, "parquet", "--allow-partial", "--as-of-event", token)
+    assert cli.main(argv) == 0
+
+    assert roster_params == [{"mask_idx": 3, "as_of_event": token}]
+    assert ticket_as_of == [token, token]
+    files = _json.loads((out_dir / MANIFEST_NAME).read_text())["files"]
+    assert {name: entry["decisions"] for name, entry in files.items()} == dict.fromkeys(
+        files, decisions
+    )
 
 
 def test_masked_read_export_of_a_deprecated_mask_passes_the_flag_and_marks_the_read(
@@ -1764,11 +1815,13 @@ def test_masked_read_export_exports_each_processed_sample_from_its_mask(
                 "export_id": _sample_handle(42),
                 "biosample_accession": "SAMN_A",
                 "export_processing_id": _mask_handle(3),
+                "decisions": ROSTER_DECISIONS,
             },
             "SAMN_B.QM543.parquet": {
                 "export_id": _sample_handle(43),
                 "biosample_accession": "SAMN_B",
                 "export_processing_id": _mask_handle(12),
+                "decisions": ROSTER_DECISIONS,
             },
         }
     }
@@ -2086,6 +2139,7 @@ def test_masked_read_export_adopt_rewrites_an_unrecorded_file_and_records_it(
             "export_id": _sample_handle(42),
             "biosample_accession": "SAMN_A",
             "export_processing_id": _mask_handle(3),
+            "decisions": ROSTER_DECISIONS,
         }
     }
     capsys.readouterr()

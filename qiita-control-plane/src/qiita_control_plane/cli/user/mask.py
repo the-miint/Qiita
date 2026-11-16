@@ -139,11 +139,14 @@ def _get_syndna_read_count(
     sequenced_pool_idx: int | None,
     prep_sample_idx: Sequence[int] | None,
     include_deprecated: bool = False,
+    as_of_event: str | None = None,
 ) -> SyndnaReadCountResponse:
     """GET /api/v1/mask-definition/{mask_idx}/syndna-read-count."""
     params: dict = _common.filter_params(study_idx=study_idx, sequenced_pool_idx=sequenced_pool_idx)
     if include_deprecated:
         params["include_deprecated"] = "true"
+    if as_of_event is not None:
+        params["as_of_event"] = as_of_event
     if prep_sample_idx:
         params["prep_sample_idx"] = [str(i) for i in prep_sample_idx]
     body = _common.call(
@@ -282,7 +285,15 @@ def syndna_sidecar(response: SyndnaReadCountResponse, *, sample_names: list[str]
         "left_out": left_out,
         "deprecated": response.deprecated,
         "deprecation_reason": response.deprecation_reason,
+        "decisions": _decisions(response),
     }
+
+
+def _decisions(response: SyndnaReadCountResponse) -> dict:
+    """The response's decision provenance, which the route always sets."""
+    if response.decisions is None:
+        raise ValueError("the SynDNA count response carries no `decisions`")
+    return response.decisions.model_dump(mode="json")
 
 
 def write_syndna_table(
@@ -371,6 +382,7 @@ def _handle_mask_syndna_read_count(
             sequenced_pool_idx=args.sequenced_pool_idx,
             prep_sample_idx=args.prep_sample_idx,
             include_deprecated=args.include_deprecated,
+            as_of_event=args.as_of_event,
         )
         samples = syndna_sample_names(response, prefix_pool=args.prefix_pool)
         with contextlib.closing(connect_with_miint()) as con:

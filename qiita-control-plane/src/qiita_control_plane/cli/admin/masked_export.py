@@ -335,7 +335,9 @@ def _count_masked(flight_client, ticket_bytes: bytes) -> int:
 
 # The output directory's record of which prep_sample and which mask each exported file
 # holds, by public handle: `{"files": {<file name>: {"export_id": "QM…",
-# "biosample_accession": …, "export_processing_id": "QP…"}}}`, plus `"deprecated": true`
+# "biosample_accession": …, "export_processing_id": "QP…", "decisions": {…}}}}`, where
+# `decisions` is the roster's `DecisionProvenance` (the pair decisions the run grouped
+# the masks under), plus `"deprecated": true`
 # on a file exported from a deprecated mask under --include-deprecated. Each prep_sample's entries
 # are merged in after its files are committed, or after its parquet is found up to date,
 # under a lock (`_record_in_export_manifest`). The overwrite check reads it: a file it names under
@@ -411,6 +413,11 @@ def _candidate_names(stem: str, fmt: str) -> list[str]:
     if fmt == "parquet":
         return [f"{stem}.parquet"]
     return [name for paired in (False, True) for name in _fastq_names(stem, paired=paired)]
+
+
+def _as_of_field(as_of_event: str | None) -> dict[str, str]:
+    """The `as_of_event` parameter, sent only when given."""
+    return {} if as_of_event is None else {"as_of_event": as_of_event}
 
 
 def _deprecated_field(include_deprecated: bool) -> dict[str, bool]:
@@ -586,6 +593,7 @@ def _handle_masked_read_export(args: argparse.Namespace, parser: argparse.Argume
             params={
                 "mask_idx": args.mask_idx,
                 **({"include_deprecated": "true"} if args.include_deprecated else {}),
+                **_as_of_field(args.as_of_event),
             },
         )
     except httpx.HTTPStatusError as exc:
@@ -603,6 +611,10 @@ def _handle_masked_read_export(args: argparse.Namespace, parser: argparse.Argume
     run_idx = roster["sequencing_run_idx"]
     pool_idx = roster["sequenced_pool_idx"]
     deprecated = bool(roster.get("deprecated"))
+    if roster.get("decisions") is None:
+        print("error: the roster carries no `decisions`", file=sys.stderr)
+        return 1
+    decisions = roster["decisions"]
     if deprecated:
         _common.print_deprecated_read("mask", args.mask_idx, roster.get("deprecation_reason"))
     if not samples:
@@ -810,6 +822,7 @@ def _handle_masked_read_export(args: argparse.Namespace, parser: argparse.Argume
                         "prep_sample_idx": prep,
                         "mask_idx": mask_idx,
                         **_deprecated_field(deprecated),
+                        **_as_of_field(args.as_of_event),
                     },
                 )
                 ticket_bytes = base64.b64decode(ticket_resp["ticket"])
@@ -845,6 +858,7 @@ def _handle_masked_read_export(args: argparse.Namespace, parser: argparse.Argume
                 "biosample_accession": s.biosample_accession,
                 "export_processing_id": mask_handles[mask_idx],
                 **({"deprecated": True} if deprecated else {}),
+                "decisions": decisions,
             }
             _record_in_export_manifest(
                 output_dir, {name: entry for name in names}, drop=legacy[prep]

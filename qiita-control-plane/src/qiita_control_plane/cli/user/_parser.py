@@ -1110,6 +1110,7 @@ def _build_parser() -> argparse.ArgumentParser:
             " without this flag); a mask that is not deprecated reads its group either way"
         ),
     )
+    _common.add_as_of_event_argument(p_mask_syndna)
     p_mask_syndna.add_argument(
         "--prefix-pool",
         action="store_true",

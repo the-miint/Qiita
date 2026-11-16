@@ -899,3 +899,17 @@ def print_deprecated_read(kind: str, idx: int, reason: str | None) -> None:
         " under --include-deprecated",
         file=sys.stderr,
     )
+
+
+def add_as_of_event_argument(parser: argparse.ArgumentParser) -> None:
+    """`--as-of-event TOKEN` on a CLI that resolves definition groups."""
+    parser.add_argument(
+        "--as-of-event",
+        metavar="TOKEN",
+        help=(
+            "Group the definitions under an earlier decision set: the"
+            " `decisions.decision_set` an earlier output recorded (sha256:...). Only the"
+            " pair decisions are as of it; runs, gates, tickets and deprecation are read"
+            " as they are now"
+        ),
+    )
