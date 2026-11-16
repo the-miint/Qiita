@@ -17,14 +17,14 @@
 --
 -- One transition passes without an admin edit: the adapter-hash re-key of a mask
 -- (`adapter_hash_scheme` NULL -> 'sequence_hash_v1', with params and params_hash
--- rewritten and filter_workflow / filter_version unchanged). The mint's legacy
--- path and `qiita-admin backfill mask-adapter-hash` make it; it rewrites how the
+-- rewritten and filter_workflow / filter_version unchanged); it rewrites how the
 -- adapter set is hashed, not what the mask does. The trigger records it in the
 -- audit table with no actor.
 --
--- Any other change to a definition that a live `similar` pair names is refused
--- (SQLSTATE 55006), as its delete is (`refuse_definition_delete_under_similar_pair`): the
--- groups that pair joins were decided over the old settings. Revoke it first.
+-- Any other change to the locked settings of a definition that a live `similar`
+-- pair names is refused (SQLSTATE 55006), as its delete is
+-- (`refuse_definition_delete_under_similar_pair`): the groups that pair joins were
+-- decided over the old settings. Revoke it first.
 --
 -- Residual: the database role the services use can INSERT an audit row itself and
 -- then UPDATE. The row must name a system_admin and carry the exact old and new
@@ -120,10 +120,9 @@ $$;
 -- edit_definition_settings: the one path for an admin edit
 -- ---------------------------------------------------------------------------
 -- `p_patch` names locked columns only, with their new values as to_jsonb writes
--- them (params_hash as '\x<hex>'). The caller computes params_hash from params
--- (`qiita_common.hashing.canonical_params_hash`); `qiita-admin definition
--- edit-settings` does. Records the edit, then makes it, in the caller's
--- transaction. Returns the audit row's id.
+-- them (params_hash as '\x<hex>'), and the caller computes params_hash from params
+-- (`qiita_common.hashing.canonical_params_hash`). Records the edit, then makes it, in
+-- the caller's transaction. Returns the audit row's id.
 CREATE FUNCTION qiita.edit_definition_settings(
     p_kind TEXT, p_ref BIGINT, p_patch JSONB, p_actor BIGINT, p_reason TEXT
 ) RETURNS BIGINT
@@ -177,8 +176,7 @@ $$;
 COMMENT ON FUNCTION qiita.edit_definition_settings(TEXT, BIGINT, JSONB, BIGINT, TEXT) IS
     'The admin edit of a definition''s locked settings: records it in '
     'qiita.definition_settings_edit (actor must be a system_admin, reason required), '
-    'then updates the row. The route PATCH /admin/definition-settings/{kind}/{idx} '
-    'calls it after computing params_hash and checking the pairs.';
+    'then updates the row. The caller supplies params_hash, computed from params.';
 
 -- ---------------------------------------------------------------------------
 -- The lock
@@ -240,8 +238,9 @@ COMMENT ON FUNCTION qiita.lock_definition_settings() IS
     'BEFORE UPDATE on mask_definition, alignment_definition and processing: refuses a '
     'change to the locked settings (qiita.definition_settings_columns) unless this '
     'transaction recorded the same change in qiita.definition_settings_edit '
-    '(SQLSTATE 55000), and refuses any change while a live similar pair names the row '
-    '(55006). Passes the mask adapter-hash re-key, recording it.';
+    '(SQLSTATE 55000), and refuses such a change while a live similar pair names the '
+    'row (55006). Passes the mask adapter-hash re-key, recording it, before either '
+    'check.';
 
 CREATE TRIGGER mask_definition_lock_settings
     BEFORE UPDATE ON qiita.mask_definition

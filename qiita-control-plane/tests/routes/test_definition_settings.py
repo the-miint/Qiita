@@ -249,6 +249,70 @@ async def test_an_edit_onto_another_definitions_params_is_refused(clients, defs,
     assert resp.json()["detail"]["reason"] == DefinitionSettingsRefusal.PARAMS_TAKEN
 
 
+@pytest.mark.parametrize(
+    ("kind", "columns"),
+    [
+        (DefinitionKind.MASK, {"workflow": "other-mask"}),
+        (DefinitionKind.PROCESSING, {"version": "1.1.0"}),
+        (DefinitionKind.ALIGNMENT, {"version": "1.1.0"}),
+    ],
+)
+async def test_a_column_that_disagrees_with_params_is_refused(
+    clients, defs, postgres_pool, kind, columns
+):
+    """A mask's filter_workflow / filter_version and a processing's workflow / version
+    are written with the same-named params keys at the mint, so an edit that would set
+    the column to a value other than the params key is refused; an alignment has no
+    such columns."""
+    idx = await defs["make"](kind, threshold=1)
+    params = {**await _params(postgres_pool, kind, idx), "threshold": 2}
+    resp = await clients["admin"].patch(
+        _url(kind, idx), json={"params": params, "reason": _REASON, **columns}
+    )
+    assert resp.status_code == 422, resp.text
+    assert (await _params(postgres_pool, kind, idx))["threshold"] == 1
+
+
+async def test_a_processing_version_edit_with_matching_params_is_accepted(
+    clients, defs, postgres_pool
+):
+    idx = await defs["make"](DefinitionKind.PROCESSING, threshold=1)
+    params = {**await _params(postgres_pool, DefinitionKind.PROCESSING, idx), "version": "1.1.0"}
+    resp = await clients["admin"].patch(
+        _url(DefinitionKind.PROCESSING, idx),
+        json={"params": params, "reason": _REASON, "version": "1.1.0"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert (
+        await postgres_pool.fetchval(
+            "SELECT version FROM qiita.processing WHERE processing_idx = $1", idx
+        )
+        == "1.1.0"
+    )
+
+
+async def test_a_params_hash_taken_after_the_check_is_params_taken(
+    clients, defs, postgres_pool, monkeypatch
+):
+    """A mint of the same params that lands between the check and the UPDATE hits the
+    params_hash UNIQUE constraint; the check is skipped here to stand in for that
+    mint, and the violation is refused as `params_taken`, not a 500."""
+    from qiita_control_plane import definition_settings
+
+    async def _missed(*_args):
+        return None
+
+    monkeypatch.setattr(definition_settings, "_params_taken_by", _missed)
+    a = await defs["make"](DefinitionKind.MASK, threshold=1)
+    b = await defs["make"](DefinitionKind.MASK, threshold=2)
+    resp = await clients["admin"].patch(
+        _url(DefinitionKind.MASK, a),
+        json={"params": await _params(postgres_pool, DefinitionKind.MASK, b), "reason": _REASON},
+    )
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["detail"]["reason"] == DefinitionSettingsRefusal.PARAMS_TAKEN
+
+
 async def test_an_edit_that_changes_nothing_is_refused(clients, defs, postgres_pool):
     a = await defs["make"](DefinitionKind.MASK, threshold=1)
     resp = await clients["admin"].patch(

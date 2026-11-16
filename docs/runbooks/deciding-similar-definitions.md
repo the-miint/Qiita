@@ -5,12 +5,14 @@ be read as one. A `similar` decision puts the two definitions in one group. The
 masked-read export, the SynDNA count export, `qiita feature-table build` and the
 alignment cohort DoGet then read each prep_sample from the group member that it
 resolves to (section 4). A `not_similar` decision keeps them apart. Nothing is re-run
-or copied.
+or copied. Section 6 covers a separate task on the same definitions: correcting a
+definition's settings after its mint.
 
 Requires a PAT carrying the lifecycle scope of the kind you decide:
 `mask_definition:lifecycle`, `alignment_definition:lifecycle` or
-`processing:lifecycle` (system_admin). Every command below is `qiita-admin pair …`;
-each prints the pair as JSON on stdout and a one-line summary on stderr.
+`processing:lifecycle` (system_admin). Every command in sections 1 to 5 is
+`qiita-admin pair …`; each prints the pair as JSON on stdout and a one-line summary on
+stderr.
 
 The group rules and every refusal code, with what each one means, are in the module
 docstring of `qiita_control_plane/definition_similarity.py`; the per-prep_sample

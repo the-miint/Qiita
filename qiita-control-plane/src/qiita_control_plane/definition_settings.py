@@ -1,16 +1,18 @@
 """The audited edit of a mask's, alignment's or processing's locked settings.
 
-The settings are locked after the mint by triggers (migration
-`20261116000004_definition_settings_lock.sql` lists the columns); this module is the
-one path that changes them. In the caller's READ COMMITTED transaction, holding the
-group lock exclusive (an edit changes what the groups are computed from):
+The settings are locked after the mint by triggers (`qiita.definition_settings_columns`
+lists the columns); this module is the one path that changes them. In the caller's
+READ COMMITTED transaction, holding the group lock exclusive (an edit changes what the
+groups are computed from):
 
   1. the definition exists (`DefinitionNotFound`);
   2. no live `similar` pair names it (`PairRefused`, `similar_pairs`): the groups that
      pair joins were decided over the old settings, so it is revoked first, as for a
      deprecation or a delete;
   3. the edit changes something, and no other definition of the kind has the new
-     params (`SettingsEditRefused`, `no_change` / `params_taken`);
+     params (`SettingsEditRefused`, `no_change` / `params_taken`; a concurrent mint
+     of the same params that the check misses hits the `params_hash` UNIQUE
+     constraint, which is refused the same way);
   4. each live pending or not_similar pair naming it gets its `change` and
      `derived_only` recomputed from the new params, by the rule a pair is opened
      with (`check_open`), which refuses an edit that would leave such a pair across
@@ -19,8 +21,12 @@ group lock exclusive (an edit changes what the groups are computed from):
   5. `qiita.edit_definition_settings` records the edit (actor, old and new values,
      reason) and makes it.
 
-params_hash is recomputed from `params` with `canonical_params_hash`, as the mint does,
-after checking the params survive jsonb storage unchanged.
+Before any of these, the request itself is checked (`SettingsEditInvalid`): an
+alignment has no workflow or version column, and a mask's or processing's workflow and
+version columns must equal the same-named keys in `params` when `params` carries them,
+as the mint writes both. params_hash is recomputed from `params` with
+`canonical_params_hash`, as the mint does, after checking the params survive jsonb
+storage unchanged.
 """
 
 import json
@@ -43,23 +49,27 @@ from .definition_similarity import (
     is_derived_only,
 )
 from .repositories import require_transaction
-from .repositories.alignment_definition import assert_params_survive_storage
 from .repositories.definition_pair import (
+    DEFINITION_TABLES,
     DefinitionRow,
+    DefinitionTable,
     fetch_definition,
     fetch_similar_pairs_naming,
     lock_groups_exclusive,
 )
+from .repositories.params_storage import assert_params_survive_storage
 
-__all__ = ["SettingsEditRefused", "SettingsEditResult", "edit_definition_settings"]
+__all__ = [
+    "SettingsEditInvalid",
+    "SettingsEditRefused",
+    "SettingsEditResult",
+    "edit_definition_settings",
+]
 
-# Per kind: the table, its id column, and its workflow / version columns (None for
-# an alignment, which keeps both inside its params). Interpolated into SQL.
-_KIND_COLUMNS: dict[DefinitionKind, tuple[str, str, str | None, str | None]] = {
-    DefinitionKind.MASK: ("qiita.mask_definition", "mask_idx", "filter_workflow", "filter_version"),
-    DefinitionKind.ALIGNMENT: ("qiita.alignment_definition", "alignment_idx", None, None),
-    DefinitionKind.PROCESSING: ("qiita.processing", "processing_idx", "workflow", "version"),
-}
+
+class SettingsEditInvalid(Exception):
+    """A request that cannot describe the definition: a workflow or version for an
+    alignment, or a workflow / version column that disagrees with `params`."""
 
 
 class SettingsEditRefused(Exception):
@@ -88,17 +98,34 @@ async def edit_definition_settings(
     principal_idx: int,
 ) -> SettingsEditResult:
     """Edit `kind` `idx`'s settings by the steps in the module docstring. Raises
-    DefinitionNotFound, PairRefused, SettingsEditRefused, GroupLockBusy, ValueError
-    (a workflow or version given for an alignment) or
-    ParamsDoNotSurviveStorageError."""
+    DefinitionNotFound, SettingsEditInvalid, PairRefused, SettingsEditRefused,
+    GroupLockBusy or ParamsDoNotSurviveStorageError."""
     require_transaction(conn)
-    table, id_col, workflow_col, version_col = _KIND_COLUMNS[kind]
-    if workflow_col is None and (workflow is not None or version is not None):
-        raise ValueError(f"an {kind.value} has no workflow or version column; edit its params")
+    t = DEFINITION_TABLES[kind]
+    if t.workflow_column is None and (workflow is not None or version is not None):
+        raise SettingsEditInvalid(
+            f"an {kind.value} has no workflow or version column; edit its params"
+        )
     await lock_groups_exclusive(conn)
     current = await fetch_definition(conn, kind, idx)
     if current is None:
         raise DefinitionNotFound(kind, idx)
+    columns = await _columns_after_edit(conn, t, idx, workflow=workflow, version=version)
+    disagree = {
+        col: (value, params[col])
+        for col, value in columns.items()
+        if col in params and params[col] != value
+    }
+    if disagree:
+        raise SettingsEditInvalid(
+            f"{kind.value} {idx}: "
+            + "; ".join(
+                f"{col} would be {value!r} but params[{col!r}] is {in_params!r}"
+                for col, (value, in_params) in sorted(disagree.items())
+            )
+            + ". The column and the params key are written together at the mint; give"
+            " both the same value"
+        )
     similar = await fetch_similar_pairs_naming(conn, kind, idx)
     if similar:
         raise PairRefused(
@@ -111,19 +138,12 @@ async def edit_definition_settings(
     await assert_params_survive_storage(conn, params, params_hash)
     patch: dict[str, Any] = {"params": params, "params_hash": "\\x" + params_hash.hex()}
     if workflow is not None:
-        patch[workflow_col] = workflow
+        patch[t.workflow_column] = workflow
     if version is not None:
-        patch[version_col] = version
-    taken = await conn.fetchval(
-        f"SELECT {id_col} FROM {table} WHERE params_hash = $1 AND {id_col} <> $2",
-        params_hash,
-        idx,
-    )
+        patch[t.version_column] = version
+    taken = await _params_taken_by(conn, t, params_hash, idx)
     if taken is not None:
-        raise SettingsEditRefused(
-            DefinitionSettingsRefusal.PARAMS_TAKEN,
-            f"{kind.value} {taken} already has these params; {kind.value} {idx} cannot take them",
-        )
+        raise _params_taken(kind, idx, f"{kind.value} {taken}")
 
     edited = DefinitionRow(
         kind=kind,
@@ -143,6 +163,10 @@ async def edit_definition_settings(
             principal_idx,
             reason,
         )
+    except asyncpg.UniqueViolationError as exc:
+        if exc.constraint_name != f"{t.table.removeprefix('qiita.')}_params_hash_key":
+            raise
+        raise _params_taken(kind, idx, f"another {kind.value}") from exc
     except asyncpg.CheckViolationError as exc:
         if exc.constraint_name != "definition_settings_edit_changes":
             raise
@@ -155,6 +179,47 @@ async def edit_definition_settings(
         edit_idx,
     )
     return SettingsEditResult(edit=edit, repaired_pair_idx=repaired)
+
+
+async def _columns_after_edit(
+    conn: asyncpg.Connection,
+    t: DefinitionTable,
+    idx: int,
+    *,
+    workflow: str | None,
+    version: str | None,
+) -> dict[str, str]:
+    """The workflow and version columns as the edit would leave them: the value given,
+    else the stored one. Empty for an alignment."""
+    if t.workflow_column is None or t.version_column is None:
+        return {}
+    row = await conn.fetchrow(
+        f"SELECT {t.workflow_column} AS workflow, {t.version_column} AS version"
+        f" FROM {t.table} WHERE {t.id_column} = $1",
+        idx,
+    )
+    return {
+        t.workflow_column: workflow if workflow is not None else row["workflow"],
+        t.version_column: version if version is not None else row["version"],
+    }
+
+
+async def _params_taken_by(
+    conn: asyncpg.Connection, t: DefinitionTable, params_hash: bytes, idx: int
+) -> int | None:
+    """Another definition of the table whose params_hash is `params_hash`, or None."""
+    return await conn.fetchval(
+        f"SELECT {t.id_column} FROM {t.table} WHERE params_hash = $1 AND {t.id_column} <> $2",
+        params_hash,
+        idx,
+    )
+
+
+def _params_taken(kind: DefinitionKind, idx: int, holder: str) -> SettingsEditRefused:
+    return SettingsEditRefused(
+        DefinitionSettingsRefusal.PARAMS_TAKEN,
+        f"{holder} already has these params; {kind.value} {idx} cannot take them",
+    )
 
 
 async def _recompute_pairs(conn: asyncpg.Connection, edited: DefinitionRow) -> list[int]:

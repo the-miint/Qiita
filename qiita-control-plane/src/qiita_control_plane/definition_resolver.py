@@ -24,8 +24,7 @@ produce it:
   A ticket that fails after the step that completes its gate is stale by this rule
   too: a read-mask ticket whose `persist-syndna-read-count` fails after
   `finalize-mask-sample` completed the gate leaves the prep_sample `processed` with
-  no SynDNA counts. The SynDNA count export leaves such a prep_sample out
-  (`no_syndna_counts`).
+  no SynDNA counts.
 
 **Which member.** Of the anchor's group (`Groups.group_of`), the highest-id member
 under which the prep_sample has a gate `completed`, `no_data` (assembly) or

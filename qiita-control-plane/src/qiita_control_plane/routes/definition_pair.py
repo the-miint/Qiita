@@ -25,7 +25,6 @@ from qiita_common.api_paths import (
     PATH_ADMIN_DEFINITION_PAIR_REVOKE,
     PATH_ADMIN_PREFIX,
 )
-from qiita_common.auth_constants import Scope
 from qiita_common.models import (
     DefinitionKind,
     DefinitionPair,
@@ -40,6 +39,7 @@ from qiita_common.models import (
 
 from ..auth.guards import check_scope, require_any_scope, require_human
 from ..auth.principal import HumanUser, Principal
+from ..auth.scopes import KIND_LIFECYCLE_SCOPE
 from ..definition_similarity import (
     DefinitionNotFound,
     GroupLockBusy,
@@ -59,13 +59,6 @@ from ..repositories.definition_pair import (
 from ._helpers import cap_rows, pair_refused_http, raise_transient_retry
 
 router = APIRouter(prefix=PATH_ADMIN_PREFIX, tags=["definition-pair"])
-
-# The lifecycle scope that governs each kind's pairs and settings edits.
-KIND_LIFECYCLE_SCOPE: dict[DefinitionKind, Scope] = {
-    DefinitionKind.MASK: Scope.MASK_DEFINITION_LIFECYCLE,
-    DefinitionKind.ALIGNMENT: Scope.ALIGNMENT_DEFINITION_LIFECYCLE,
-    DefinitionKind.PROCESSING: Scope.PROCESSING_LIFECYCLE,
-}
 
 _require_any_lifecycle = require_any_scope(*KIND_LIFECYCLE_SCOPE.values())
 

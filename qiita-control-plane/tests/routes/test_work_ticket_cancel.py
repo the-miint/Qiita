@@ -8,6 +8,7 @@ the action_id (+pool) filter, the missing-scope 403, and the reap_error surface
 its result / failure.
 """
 
+import asyncio
 import uuid
 
 import pytest
@@ -16,6 +17,8 @@ from httpx import ASGITransport, AsyncClient
 from qiita_common.api_paths import URL_WORK_TICKET_CANCEL
 from qiita_common.auth_constants import Scope, SystemRole
 from qiita_common.models import WorkTicketState
+
+from qiita_control_plane.ticket_redrive import ReapFailed, reset_ticket_to_pending
 
 pytestmark = pytest.mark.db
 
@@ -390,6 +393,60 @@ async def test_a_failed_reap_is_recorded_and_a_later_reap_clears_it(ctx, state):
         assert resp.status_code == 200, resp.text
         assert resp.json()["results"][0]["reap_error"] is None
     assert await _reap_mark(ctx["pool"], idx) == (None, None)
+
+
+class _BlockingBackendClient(_FakeBackendClient):
+    """A reap that waits on `release` before returning or raising."""
+
+    def __init__(self, *, fail: bool) -> None:
+        super().__init__()
+        self.reaping = asyncio.Event()
+        self.release = asyncio.Event()
+        self.fail = fail
+
+    async def cancel(self, work_ticket_idx: int) -> list[int]:
+        self.cancel_calls.append(work_ticket_idx)
+        self.reaping.set()
+        await self.release.wait()
+        if self.fail:
+            raise RuntimeError("orchestrator unreachable")
+        return list(self.result_ids)
+
+
+async def _redrive(pool, idx) -> bool:
+    async with pool.acquire() as conn, conn.transaction():
+        return await reset_ticket_to_pending(
+            conn, work_ticket_idx=idx, from_state=WorkTicketState.CANCELLED.value
+        )
+
+
+@pytest.mark.parametrize("fail", [True, False])
+async def test_a_redrive_during_the_reap_is_refused(ctx, fail):
+    """The flip commits with the reap mark set, so a redrive that lands while the reap
+    is still running is refused rather than dispatching a ticket whose jobs the reap
+    has yet to reach. A failed reap keeps the ticket refused; a clean one clears it."""
+    from qiita_control_plane.main import app
+
+    idx = await ctx["seed_ticket"]("processing")
+    backend = _BlockingBackendClient(fail=fail)
+    app.state.compute_backend_client = backend
+    h = {"Authorization": f"Bearer {ctx['admin_tok']}"}
+    async with _client() as c:
+        cancel = asyncio.create_task(
+            c.post(URL_WORK_TICKET_CANCEL, json={"work_ticket_idxs": [idx]}, headers=h)
+        )
+        await asyncio.wait_for(backend.reaping.wait(), timeout=10)
+        assert await _state(ctx["pool"], idx) == "cancelled"
+        with pytest.raises(ReapFailed):
+            await _redrive(ctx["pool"], idx)
+        backend.release.set()
+        assert (await cancel).status_code == 200
+    if fail:
+        with pytest.raises(ReapFailed):
+            await _redrive(ctx["pool"], idx)
+    else:
+        assert await _reap_mark(ctx["pool"], idx) == (None, None)
+        assert await _redrive(ctx["pool"], idx) is True
 
 
 async def test_a_cancel_whose_reap_succeeds_leaves_no_mark(ctx):

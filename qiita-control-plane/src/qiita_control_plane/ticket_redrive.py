@@ -18,6 +18,9 @@ class ReapFailed(Exception):
     running under the ticket, so it is not redriven until a cancel reaps without
     error."""
 
+    # The `reason` code of the 409 every redrive route answers it with.
+    REASON = "reap_failed"
+
     def __init__(self, work_ticket_idx: int, failed_at: object, failure: str) -> None:
         self.work_ticket_idx = work_ticket_idx
         super().__init__(

@@ -131,32 +131,50 @@ class DefinitionRow:
     workflow: str | None
 
 
-# Per kind: the table, its id column, the column the comparison scope reads, and
-# the kind's deprecated status. The first three are interpolated into SQL, so the
-# map is closed.
-_DEFINITION_TABLES: dict[DefinitionKind, tuple[str, str, str, str]] = {
-    DefinitionKind.MASK: (
+@dataclass(frozen=True)
+class DefinitionTable:
+    """One kind's table: its name, id column, workflow and version columns (None for
+    an alignment, which keeps both inside its params; the workflow column is what the
+    comparison scope reads), and its deprecated status value. The names are
+    interpolated into SQL, so `DEFINITION_TABLES` is closed."""
+
+    table: str
+    id_column: str
+    workflow_column: str | None
+    version_column: str | None
+    deprecated_status: str
+
+    @property
+    def workflow_expr(self) -> str:
+        return self.workflow_column or "NULL::text"
+
+
+DEFINITION_TABLES: dict[DefinitionKind, DefinitionTable] = {
+    DefinitionKind.MASK: DefinitionTable(
         "qiita.mask_definition",
         "mask_idx",
         "filter_workflow",
+        "filter_version",
         MaskDefinitionStatus.DEPRECATED.value,
     ),
-    DefinitionKind.ALIGNMENT: (
+    DefinitionKind.ALIGNMENT: DefinitionTable(
         "qiita.alignment_definition",
         "alignment_idx",
-        "NULL::text",
+        None,
+        None,
         AlignmentDefinitionStatus.DEPRECATED.value,
     ),
-    DefinitionKind.PROCESSING: (
+    DefinitionKind.PROCESSING: DefinitionTable(
         "qiita.processing",
         "processing_idx",
         "workflow",
+        "version",
         ProcessingStatus.DEPRECATED.value,
     ),
 }
 
 
-def _decode(value: Any) -> Any:
+def decode_jsonb(value: Any) -> Any:
     """A JSONB column, decoded: asyncpg returns it as str under the default codec,
     or already decoded when a codec is registered."""
     return json.loads(value) if isinstance(value, str) else value
@@ -166,8 +184,8 @@ def _definition_row(kind: DefinitionKind, row: asyncpg.Record) -> DefinitionRow:
     return DefinitionRow(
         kind=kind,
         idx=row["idx"],
-        params=_decode(row["params"]),
-        deprecated=row["status"] == _DEFINITION_TABLES[kind][3],
+        params=decode_jsonb(row["params"]),
+        deprecated=row["status"] == DEFINITION_TABLES[kind].deprecated_status,
         workflow=row["workflow"],
     )
 
@@ -175,9 +193,10 @@ def _definition_row(kind: DefinitionKind, row: asyncpg.Record) -> DefinitionRow:
 async def fetch_definitions(conn: asyncpg.Connection) -> list[DefinitionRow]:
     """Every mask, alignment and processing definition, deprecated ones included."""
     out: list[DefinitionRow] = []
-    for kind, (table, id_col, workflow_col, _) in _DEFINITION_TABLES.items():
+    for kind, t in DEFINITION_TABLES.items():
         rows = await conn.fetch(
-            f"SELECT {id_col} AS idx, params, status, {workflow_col} AS workflow FROM {table}"
+            f"SELECT {t.id_column} AS idx, params, status, {t.workflow_expr} AS workflow"
+            f" FROM {t.table}"
         )
         out.extend(_definition_row(kind, r) for r in rows)
     return out
@@ -187,10 +206,10 @@ async def fetch_definition(
     conn: asyncpg.Connection, kind: DefinitionKind, idx: int
 ) -> DefinitionRow | None:
     """One definition of `kind`, or None when no row has `idx`."""
-    table, id_col, workflow_col, _ = _DEFINITION_TABLES[kind]
+    t = DEFINITION_TABLES[kind]
     row = await conn.fetchrow(
-        f"SELECT {id_col} AS idx, params, status, {workflow_col} AS workflow"
-        f" FROM {table} WHERE {id_col} = $1",
+        f"SELECT {t.id_column} AS idx, params, status, {t.workflow_expr} AS workflow"
+        f" FROM {t.table} WHERE {t.id_column} = $1",
         idx,
     )
     return None if row is None else _definition_row(kind, row)
@@ -216,7 +235,7 @@ _TYPED_COLUMNS: dict[DefinitionKind, tuple[str, str]] = {
 
 def pair_record_fields(row: asyncpg.Record) -> dict[str, Any]:
     """A pair row as the `DefinitionPair` wire model's fields."""
-    return {**dict(row), "change": _decode(row["change"])}
+    return {**dict(row), "change": decode_jsonb(row["change"])}
 
 
 async def insert_pair(

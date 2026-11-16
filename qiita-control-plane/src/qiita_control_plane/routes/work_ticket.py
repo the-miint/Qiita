@@ -1004,7 +1004,7 @@ async def run_work_ticket(
             except ReapFailed as exc:
                 raise HTTPException(
                     status_code=status.HTTP_409_CONFLICT,
-                    detail={"reason": "reap_failed", "detail": str(exc)},
+                    detail={"reason": exc.REASON, "detail": str(exc)},
                 ) from exc
             if not reset:
                 raise HTTPException(

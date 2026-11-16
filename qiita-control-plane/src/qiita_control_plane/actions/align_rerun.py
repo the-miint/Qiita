@@ -442,7 +442,7 @@ async def _rearm(
             conn, work_ticket_idx=work_ticket_idx, from_state=state
         )
     except ReapFailed as exc:
-        raise _refuse("reap_failed", str(exc)) from exc
+        raise _refuse(exc.REASON, str(exc)) from exc
     if not reset:
         raise _refuse("state_changed", f"work_ticket {work_ticket_idx} changed state; retry")
     if rerun_of == WorkTicketState.COMPLETED:

@@ -53,6 +53,14 @@ CANCELLABLE_WORK_TICKET_STATES: tuple[str, ...] = (
 )
 
 
+# The reap mark a cancel writes in its flip transaction, before the scancel: a redrive
+# that lands between the flip's commit and the reap's outcome is refused
+# (`ticket_redrive.ReapFailed`) rather than racing a job the reap has yet to reach. The
+# reap's outcome replaces it; a cancel interrupted mid-reap leaves it, and the next
+# cancel's reap clears it.
+REAP_IN_FLIGHT = "the reap had not finished (in progress, or interrupted)"
+
+
 class WorkTicketNotFound(Exception):
     """No work_ticket exists at the given idx."""
 
@@ -84,7 +92,8 @@ async def cancel_work_ticket(
 
     Raises `WorkTicketNotFound` if the idx does not exist. The flip is a single
     `FOR UPDATE` transaction so a concurrent CP write can't interleave a half-state;
-    the scancel runs only after that transaction commits (terminal-first)."""
+    it also writes the in-flight reap mark (`REAP_IN_FLIGHT`). The scancel runs only
+    after that transaction commits (terminal-first)."""
     async with pool.acquire() as conn, conn.transaction():
         row = await conn.fetchrow(
             "SELECT state, failure_type, failure_stage, failure_step_name, failure_reason"
@@ -95,6 +104,12 @@ async def cancel_work_ticket(
             raise WorkTicketNotFound(work_ticket_idx)
         previous_state = row["state"]
         flipped = previous_state in CANCELLABLE_WORK_TICKET_STATES
+        await conn.execute(
+            "UPDATE qiita.work_ticket SET reap_failed_at = now(), reap_failure = $2"
+            " WHERE work_ticket_idx = $1",
+            work_ticket_idx,
+            REAP_IN_FLIGHT,
+        )
         if flipped:
             if previous_state == WorkTicketState.FAILED.value:
                 # work_ticket_failure_consistent requires NULL failure_* on every
@@ -131,8 +146,9 @@ async def cancel_work_ticket(
         cancelled_job_ids = await backend_client.cancel(work_ticket_idx)
     except Exception as exc:  # noqa: BLE001 — record any reap failure, don't lose the flip
         reap_error = f"{type(exc).__name__}: {exc}"
-    # Recorded on the ticket so a redrive refuses it until a reap succeeds
-    # (`ticket_redrive.ReapFailed`); a reap without error clears it.
+    # The reap's outcome replaces the in-flight mark: a failure stays on the ticket, so
+    # a redrive refuses it until a reap succeeds (`ticket_redrive.ReapFailed`); a reap
+    # without error clears it.
     await pool.execute(
         "UPDATE qiita.work_ticket"
         " SET reap_failed_at = CASE WHEN $2::text IS NULL THEN NULL ELSE now() END,"

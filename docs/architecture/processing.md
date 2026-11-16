@@ -126,6 +126,8 @@ Work ticket fields (per `qiita.work_ticket` migration `20260504000001_work_ticke
 - `scope_target_kind` plus one of `(study_idx, prep_idx)` or `reference_idx` — tagged-union scope target, governed by the `work_ticket_scope_target_consistent` CHECK
 - `shard_id` — the sharded-index fan-out discriminant; non-NULL only on a reference-scope ticket, NULL on every other kind (CHECK enforced)
 - `mask_idx` — the read-mask ticket's minted mask (FK to `qiita.mask_definition`); NULL on a ticket that mints no mask
+- `processing_idx` — the processing the ticket minted (FK to `qiita.processing`, ON DELETE SET NULL); NULL on a ticket that mints none or ended before its mint
+- `reap_failed_at` / `reap_failure` — set together while a cancel's reap of the ticket's SLURM jobs is running or has failed (`work_ticket_cancel`); every redrive refuses the ticket until a cancel reaps it without error
 - `action_context` — JSONB validated at submission against `action.context_schema`
 - `state` — `pending` / `queued` / `processing` / `completed` / `failed`
 - `retry_count` — number of retry attempts so far (incremented on each PROCESSING → QUEUED retry)
@@ -152,7 +154,7 @@ Retry semantics (implemented in `qiita_control_plane.runner._run_entry_with_retr
 Manual restart (`POST /api/v1/work-ticket/{idx}/run` on a `FAILED` ticket):
 - Atomic UPDATE: state ← PENDING, `retry_count = 0`, all `failure_*` columns ← NULL (the DB CHECK requires `failure_*` all-NULL when state ≠ failed; the route clears them in one statement).
 - Triggers a fresh in-process dispatch via `schedule_dispatch`, which queues behind the process-wide dispatch cap below when all slots are held. The original FAILED-row state is not preserved on the row itself; ops dashboards that want post-mortem retention should snapshot the `failure_*` fields before triggering /run.
-- Entries with a `completed` step row are fast-forwarded, not re-run. A step row is read for the entry at its `step_index` only while that entry still has the row's `step_name` and kind (`step:` or `action:`), because workflow YAMLs are edited in place and re-synced (`step_progress.check_step_progress`). A ticket with a row that no longer matches — a step was inserted, removed, renamed or reordered ahead of it — is refused by `/run` with a 409 naming those rows, and fails permanently at `submission` when startup recovery resumes it; a new ticket is submitted in its place (a terminal ticket does not block one), or, for `read-mask-block`, its prep_samples are re-masked under a new mask version. `/run` also refuses a ticket whose `mask_idx` names a deprecated mask.
+- Entries with a `completed` step row are fast-forwarded, not re-run. A step row is read for the entry at its `step_index` only while that entry still has the row's `step_name` and kind (`step:` or `action:`), because workflow YAMLs are edited in place and re-synced (`step_progress.check_step_progress`). A ticket with a row that no longer matches — a step was inserted, removed, renamed or reordered ahead of it — is refused by `/run` with a 409 naming those rows, and fails permanently at `submission` when startup recovery resumes it; a new ticket is submitted in its place (a terminal ticket does not block one), or, for `read-mask-block`, its prep_samples are re-masked under a new mask version. `/run` also refuses a ticket whose `mask_idx` names a deprecated mask, and (409, `reason` `reap_failed`) one that carries a reap mark, naming the failure and `qiita-admin ticket cancel <idx>` as the retry.
 - A `download-ena-study` redrive also drops completed step rows so the roster is re-read, and is refused (409) when a newer download ticket exists for the pool or a FAILED ticket still has a live job; see the [ENA import runbook](../runbooks/ena-import.md).
 
 **Dispatch concurrency.** Every dispatch path (route submit, ENA batch submit, startup reconcile, fan-out pump release) goes through `schedule_dispatch`, whose task holds one slot of the process-wide `_DISPATCH_CONCURRENCY` cap (8) for its whole workflow — an hours-long download poll included. Tasks past the cap queue FIFO and start as slots free, logging `queued behind the dispatch cap` when they start waiting and `dispatched after waiting` when they get one; nothing fails while it waits. Bounding in-flight workflows, not just connections, is the deliberate consequence: it is what keeps a burst of submits from pressuring the connection pool after `_STUDY_CONCURRENCY`'s permit has already been released at submit. Two behaviours follow that an operator should expect: a restart with more than 8 tickets in flight re-attaches the first 8 and queues the rest, and `/run` queues behind the same slots as ordinary submits. The cap is sized against the pool and `FANOUT_MAX_INFLIGHT` together — see the note on the constant.
@@ -373,8 +375,8 @@ detaches its pairs, and is refused while a `similar` pair names it (the trigger
   Readers of the groups take no lock: they read one REPEATABLE READ snapshot.
 - **Settings are locked after the mint.** A definition's params, params_hash and
   workflow / version columns change only through the audited edit
-  (`definition_settings`; migration `20261116000004_definition_settings_lock.sql` lists
-  the columns and the one exception, the mask adapter-hash re-key). The edit takes the
+  (`definition_settings`; `qiita.definition_settings_columns` lists the columns, and
+  `qiita.lock_definition_settings` the one exception, the mask adapter-hash re-key). The edit takes the
   group lock exclusive, as a decision does, since the groups are computed from those
   params.
 - **Decision provenance.** Every resolution records the decision set it was computed

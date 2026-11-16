@@ -375,10 +375,10 @@ async def test_masks_with_a_different_syndna_reference_cannot_be_decided_similar
 
 
 @pytest.mark.parametrize("deprecated", [False, True])
-async def test_a_processed_sample_without_counts_is_left_out(ctx, deprecated):
+async def test_a_processed_prep_sample_without_counts_is_left_out(ctx, deprecated):
     """A completed gate with no stored counts (persist-syndna-read-count failed after
     finalize-mask-sample) is left out as `no_syndna_counts`; the rest are read. The
-    same holds under the exact read of a deprecated mask, and for a named sample."""
+    same holds under the exact read of a deprecated mask, and for a named prep_sample."""
     mask_idx = await _seed_syndna_mask(ctx)
     study_idx = await _viewer_study(ctx)
     counted, _ = await _counted_sample(ctx, mask_idx=mask_idx, study_idx=study_idx)

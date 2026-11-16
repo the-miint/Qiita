@@ -37,7 +37,6 @@ from ..feature_table import SUBJECT_ASSEMBLY
 from ..repositories.alignment_definition import (
     ALIGNMENT_SAMPLE_INVALIDATED,
     AlignmentDefinitionDeprecated,
-    ParamsDoNotSurviveStorageError,
     fetch_alignment_definition_by_idx,
     lock_active_alignment,
     mint_alignment_definition,
@@ -53,6 +52,7 @@ from ..repositories.block import (
     create_alignment_sample_pending,
     fetch_mask_sample_state,
 )
+from ..repositories.params_storage import ParamsDoNotSurviveStorageError
 from ._base import _workflow_declares_action
 from ._upload import _submission_bad_input
 

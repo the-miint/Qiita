@@ -39,7 +39,9 @@ def test_edit_settings_sends_the_params_file_and_only_the_columns_given(
     monkeypatch, capsys, tmp_path
 ):
     params = tmp_path / "params.json"
-    params.write_text(json.dumps({"workflow": "long-read-assembly", "assembler": "hifiasm"}))
+    params.write_text(
+        json.dumps({"workflow": "long-read-assembly", "version": "1.1.0", "assembler": "hifiasm"})
+    )
     captured = _capture(monkeypatch)
 
     argv = ["definition", "edit-settings", "processing", "7", "--params-file", str(params)]
@@ -50,7 +52,7 @@ def test_edit_settings_sends_the_params_file_and_only_the_columns_given(
         URL_ADMIN_DEFINITION_SETTINGS.format(definition_kind="processing", definition_idx=7)
     )
     assert captured["json"] == {
-        "params": {"workflow": "long-read-assembly", "assembler": "hifiasm"},
+        "params": {"workflow": "long-read-assembly", "version": "1.1.0", "assembler": "hifiasm"},
         "reason": "typo",
         "version": "1.1.0",
     }
