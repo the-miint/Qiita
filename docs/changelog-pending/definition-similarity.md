@@ -89,7 +89,22 @@
   `deprecated` with the `deprecation_reason` in the manifest and says so on stderr.
   The 409's `detail` is now an object (`detail`, `reason`, `deprecation_reason`)
   where it was the message. For an alignment that is not deprecated the flag changes
-  nothing.
+  nothing. With the flag, the pool cohort listing leaves out the prep_samples that the
+  exact read does not resolve processed (a failed or running run, a withdrawn one, or
+  a withdrawn mask run) and lists them in `left_out`; the build records them by
+  biosample accession (`table.left_out_by_accession`, `table.denovo.left_out`) instead
+  of failing a default-cohort build on them. A prep_sample named with
+  `--prep-sample-idx` is still refused. The flag also reads a de novo arm whose
+  assembly run is deprecated.
+- **An active alignment whose mask, or (de novo) whose assembly run, is deprecated is
+  refused up front (409, `reason` `deprecated_upstream`) by the alignment cohort DoGet,
+  the pool alignment cohort listing and both alignment mints unless the caller passes
+  `--include-deprecated-upstream` (API `include_deprecated_upstream`) (#874).** With
+  it the group is resolved without the upstream deprecation checks (withdrawn runs
+  stay unreadable); `POST /api/v1/definition-group/resolve` takes the flag too, the
+  cohort DoGet response names the deprecated upstreams read (`deprecated_upstreams`),
+  and `qiita feature-table build` says so on stderr and records each on the manifest
+  part by `params_hash` and reason.
 - **`qiita feature-table build` takes repeated `--sequencing-run-idx` /
   `--sequenced-pool-idx` pairs and builds one table across the alignment's group
   (#874).** It reads each prep_sample from the alignment that it resolves to. Over the

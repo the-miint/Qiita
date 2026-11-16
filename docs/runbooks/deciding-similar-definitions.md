@@ -105,7 +105,13 @@ from that mask alone (its own runs, never another member's; a withdrawn run stay
 unreadable), and the output is marked deprecated. The same holds for a deprecated
 alignment named by `qiita feature-table build` (`--alignment-idx` or
 `--denovo-alignment-idx`) or the alignment cohort DoGet: with the flag it is read
-alone, and a prep_sample whose mask run is withdrawn is still refused.
+alone, and a prep_sample whose mask run is withdrawn is still refused when named; over
+the build's default cohort it is left out instead, with any whose run there failed or
+is running, and the manifest records each by biosample accession. The flag also reads
+a de novo arm whose assembly run is deprecated. An active alignment whose mask (or
+assembly run) is deprecated is refused unless `--include-deprecated-upstream` is
+passed; with it the alignment's group is read as usual, and the manifest names each
+deprecated upstream by `params_hash` and reason.
 
 The exports list incomplete and not-processed prep_samples and leave them out, and
 so does `qiita feature-table build` over its default cohort (it also records them in

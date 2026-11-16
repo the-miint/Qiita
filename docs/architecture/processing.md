@@ -366,7 +366,10 @@ detaches its pairs, and is refused while a `similar` pair names it (the trigger
   the pool alignment cohort listing and the alignment-kind identifier and processing
   mints take it for an alignment (`alignment_exact_read`, at step 2a of
   `authorize_completed_alignment_cohort`), and `qiita feature-table build` passes it
-  to each.
+  to each. An active alignment whose upstream (its mask, or a de novo alignment's
+  assembly run) is deprecated is read only under `include_deprecated_upstream`
+  (`deprecated_upstream_read`, at the same step): the group is resolved without the
+  upstream deprecation checks (the resolver's "Deprecated upstreams" paragraph).
 - **The group lock** is one Postgres advisory lock over every kind's groups
   (`repositories/definition_pair.py`). A decide or revoke takes it exclusive, by
   try-lock with a bounded retry and a 503 when it stays busy; the three deprecation
