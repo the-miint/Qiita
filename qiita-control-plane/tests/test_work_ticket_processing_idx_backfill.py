@@ -150,13 +150,6 @@ async def bf(postgres_pool):
         LONG_READ_ASSEMBLY_ACTION_ID,
         version,
     )
-    runs = [default_run, flye_run, other_sample_run]
-    await postgres_pool.execute(
-        "DELETE FROM qiita.assembly_sample WHERE processing_idx = ANY($1::bigint[])", runs
-    )
-    await postgres_pool.execute(
-        "DELETE FROM qiita.processing WHERE processing_idx = ANY($1::bigint[])", runs
-    )
     await postgres_pool.execute(
         "DELETE FROM qiita.action WHERE action_id = $1 AND version = $2",
         LONG_READ_ASSEMBLY_ACTION_ID,
@@ -167,6 +160,11 @@ async def bf(postgres_pool):
         study_idxs=[],
         biosample_idxs=[biosample_idx],
         prep_sample_idxs=[prep_sample_idx],
+    )
+    # After the sweep, which removes the assembly_sample rows that reference these.
+    await postgres_pool.execute(
+        "DELETE FROM qiita.processing WHERE processing_idx = ANY($1::bigint[])",
+        [default_run, flye_run, other_sample_run],
     )
     await postgres_pool.execute("DELETE FROM qiita.mask_definition WHERE mask_idx = $1", mask_idx)
     await delete_principal(postgres_pool, [principal_idx])

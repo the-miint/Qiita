@@ -171,7 +171,7 @@ def _refuse_deprecated_denovo_run(base_url: str, token: str, *, processing_idx: 
     """Refuse a deprecated assembly run as a de novo arm, with the wording that
     `runner/_feature_table.py` uses server-side. The client asks this of each run that
     a prep_sample reads (`_plan_denovo`); the runner, which does not resolve groups,
-    of the named de novo alignment's run.
+    asks it only of the named de novo alignment's run.
 
     `denovo_alignment_processing_idx` states why neither driver may be the only one
     that checks, and `denovo_assembly_deprecation_error` owns the wording so the two

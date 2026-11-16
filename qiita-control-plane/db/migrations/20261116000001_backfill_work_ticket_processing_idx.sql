@@ -15,8 +15,8 @@
 -- that the runner writes for (processing, prep_sample) right after the mint, so a
 -- ticket is matched only to a processing that was minted for its own prep_sample. A
 -- ticket of that prep_sample that ended between recording the mask and the mint
--- (its masked reads failed to stage) still matches, as it did when the resolver
--- recomputed params at read time. A ticket that matches nothing stays NULL.
+-- (its masked reads failed to stage) still matches when another ticket of the same
+-- prep_sample minted those params. A ticket that matches nothing stays NULL.
 --
 -- jsonb equality ignores key order, and jsonb_strip_nulls drops an unset assembler
 -- as the builder does. params_hash is unique, so at most one row matches.

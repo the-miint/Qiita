@@ -1,10 +1,11 @@
 -- migrate:up
 
 -- The processing (assembly run config) a ticket minted. The runner writes it right
--- after it mints the processing, as it writes mask_idx and alignment_idx, so what a
--- ticket produced is read from the ticket rather than recomputed from its context. NULL for every ticket that mints
--- no processing, and for one that ended before its mint. ON DELETE SET NULL mirrors
--- work_ticket.mask_idx and work_ticket.alignment_idx.
+-- after it mints the processing, as it writes mask_idx and alignment_idx, so what
+-- a ticket produced is read from the ticket rather than recomputed from its
+-- context. NULL for every ticket that mints no processing, and for one that ended
+-- before its mint. ON DELETE SET NULL mirrors work_ticket.mask_idx and
+-- work_ticket.alignment_idx.
 ALTER TABLE qiita.work_ticket
     ADD COLUMN processing_idx BIGINT
         REFERENCES qiita.processing(processing_idx) ON DELETE SET NULL;
