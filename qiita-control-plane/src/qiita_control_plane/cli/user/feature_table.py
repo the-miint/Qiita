@@ -64,6 +64,7 @@ from qiita_common.models import (
     SampleResolution,
     SampleResolutionReason,
     SampleResolutionState,
+    admitted_deprecated_upstream_kinds,
     deprecated_read_refusal,
 )
 from qiita_common.models._base import MAX_COHORT_PREP_SAMPLE_IDX
@@ -206,6 +207,7 @@ def _resolve_definition_group(
     definition_idx: int,
     prep_sample_idx: list[int],
     as_of_event: str | None = None,
+    include_deprecated: bool = False,
     include_deprecated_upstream: bool = False,
 ) -> DefinitionGroupResolveResponse:
     """POST /definition-group/resolve: the named definition's group and, per prep_sample,
@@ -234,6 +236,7 @@ def _resolve_definition_group(
             definition_idx=definition_idx,
             prep_sample_idx=chunk,
             as_of_event=answers[0].decisions.decision_set if answers else as_of_event,
+            include_deprecated=include_deprecated,
             include_deprecated_upstream=include_deprecated_upstream,
         ).model_dump(mode="json", exclude_none=True, exclude_defaults=True)
         answer = DefinitionGroupResolveResponse.model_validate(
@@ -1816,14 +1819,13 @@ def _plan_denovo(
     withdrawn mask run) stay reference-only too, and are listed on stderr and returned
     for the manifest's `denovo.left_out`.
 
-    A deprecated assembly run of a de novo alignment is read under --include-deprecated
-    or --include-deprecated-upstream; the resolve of the de novo group is then made with
-    `include_deprecated_upstream`, so the run's deprecation does not leave every
-    prep_sample `upstream_deprecated`.
+    The resolve of the de novo group carries both flags, so it reads past exactly the
+    deprecated upstreams they admit (`admitted_deprecated_upstream_kinds`): a deprecated
+    assembly run under either flag, a deprecated mask only under
+    --include-deprecated-upstream.
     """
     anchor = args.denovo_alignment_idx
     summaries = {anchor: _alignment_summary(listing, alignment_idx=anchor)}
-    admit_assembly = args.include_deprecated or args.include_deprecated_upstream
     left_out: list[dict[str, Any]] | None = None
     if _reads_exactly(summaries[anchor], flag=args.include_deprecated, role="de novo alignment"):
         on_anchor: set[int] = set()
@@ -1858,7 +1860,8 @@ def _plan_denovo(
             definition_idx=anchor,
             prep_sample_idx=cohort,
             as_of_event=as_of_event,
-            include_deprecated_upstream=admit_assembly,
+            include_deprecated=args.include_deprecated,
+            include_deprecated_upstream=args.include_deprecated_upstream,
         )
     resolved: dict[int, int] = {}
     refused: list[SampleResolution] = []
@@ -1910,7 +1913,14 @@ def _plan_denovo(
         )
     for processing_idx in sorted(set(processing_of.values())):
         _refuse_deprecated_denovo_run(
-            base_url, token, processing_idx=processing_idx, admitted=admit_assembly
+            base_url,
+            token,
+            processing_idx=processing_idx,
+            admitted=DefinitionKind.PROCESSING
+            in admitted_deprecated_upstream_kinds(
+                include_deprecated=args.include_deprecated,
+                include_deprecated_upstream=args.include_deprecated_upstream,
+            ),
         )
     _refuse_unprocessed(refused, anchor=f"de novo alignment {anchor}")
 

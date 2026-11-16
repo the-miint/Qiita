@@ -76,7 +76,12 @@ from dataclasses import dataclass, field, replace
 from typing import Any
 
 import asyncpg
-from qiita_common.models import DefinitionKind, DefinitionPairRefusal, DefinitionPairVerdict
+from qiita_common.models import (
+    DefinitionKind,
+    DefinitionPairRefusal,
+    DefinitionPairVerdict,
+    DeprecatedUpstream,
+)
 
 from .decision_set import DecisionSet, load_decision_set
 from .repositories import (
@@ -86,6 +91,7 @@ from .repositories import (
     transaction_isolation,
 )
 from .repositories.definition_pair import (
+    DEFINITION_TABLES,
     DefinitionRow,
     GroupLockBusy,
     fetch_definition,
@@ -100,6 +106,7 @@ from .repositories.definition_pair import (
     record_decision,
     record_revoke,
 )
+from .repositories.definition_pair import decode_jsonb as _decode_jsonb
 from .repositories.mask_definition import RESOLVED_SYNDNA_KEY, SYNDNA_REFERENCE_IDX_KEY
 
 __all__ = [
@@ -112,6 +119,7 @@ __all__ = [
     "canonical_json",
     "compute_groups",
     "decide_pair",
+    "deprecated_upstreams",
     "is_definition_ref",
     "is_derived_only",
     "load_groups",
@@ -739,3 +747,41 @@ async def refuse_deprecating_with_similar_pairs(
             " re-decide them not_similar before deprecating it",
             definition_pair_idx=pairs,
         )
+
+
+async def deprecated_upstreams(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection, alignment: asyncpg.Record
+) -> list[DeprecatedUpstream]:
+    """The deprecated definitions `alignment` read: its mask and, for a de novo
+    alignment, its assembly run and that run's mask, in that order, each once."""
+    out: list[DeprecatedUpstream] = []
+    seen: set[tuple[DefinitionKind, int]] = set()
+    stack = [(DefinitionKind.ALIGNMENT, _decode_jsonb(alignment["params"]))]
+    while stack:
+        kind, params = stack.pop(0)
+        for path, up_kind in upstream_leaves(kind, params).items():
+            idx = params.get(path)
+            if not is_definition_ref(idx) or (up_kind, idx) in seen:
+                continue
+            seen.add((up_kind, idx))
+            table = DEFINITION_TABLES[up_kind]
+            row = await pool_or_conn.fetchrow(
+                f"SELECT status, deprecation_reason, params, params_hash FROM {table.table}"
+                f" WHERE {table.id_column} = $1",
+                idx,
+            )
+            if row is None:
+                # `params` names its upstream by id, and a definition named by
+                # another's params is not deleted by any route.
+                raise DefinitionNotFound(up_kind, idx)
+            if row["status"] == table.deprecated_status:
+                out.append(
+                    DeprecatedUpstream(
+                        definition_kind=up_kind,
+                        definition_idx=idx,
+                        params_hash=bytes(row["params_hash"]).hex(),
+                        deprecation_reason=row["deprecation_reason"],
+                    )
+                )
+            stack.append((up_kind, _decode_jsonb(row["params"])))
+    return out

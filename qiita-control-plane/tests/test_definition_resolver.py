@@ -360,9 +360,18 @@ def resolve_exact_sample(definitions, pairs, kind, idx, observations):
     return resolve_sample(groups, kind, idx, S, observations, exact=True)
 
 
-def resolve_past_upstream(definitions, pairs, kind, idx, observations):
+def resolve_past_upstream(definitions, pairs, kind, idx, observations, admitted=None):
     groups = compute_groups(definitions, pairs)
-    return resolve_sample(groups, kind, idx, S, observations, deprecated_upstream=True)
+    return resolve_sample(
+        groups,
+        kind,
+        idx,
+        S,
+        observations,
+        include_deprecated_upstream=(
+            frozenset({MASK, PROCESSING}) if admitted is None else admitted
+        ),
+    )
 
 
 def test_deprecated_upstreams_mode_reads_an_alignment_on_a_deprecated_mask():
@@ -381,6 +390,22 @@ def test_deprecated_upstreams_mode_reads_a_denovo_alignment_on_a_deprecated_asse
         ALIGNMENT: {(70, S): done()},
     }
     r = resolve_past_upstream(defs, [], ALIGNMENT, 70, obs)
+    assert (r.state, r.definition_idx) == (PROCESSED, 70)
+
+
+def test_an_admitted_assembly_does_not_admit_its_deprecated_mask():
+    """`include_deprecated` alone admits a deprecated assembly run, not a deprecated
+    mask under it (`admitted_deprecated_upstream_kinds`)."""
+    defs = [mask(5, deprecated=True), assembly(7, 5, deprecated=True), denovo(70, 5, 7)]
+    obs = {
+        MASK: {(5, S): done()},
+        PROCESSING: {(7, S): done()},
+        ALIGNMENT: {(70, S): done()},
+    }
+    r = resolve_past_upstream(defs, [], ALIGNMENT, 70, obs, admitted=frozenset({PROCESSING}))
+    assert (r.state, r.reason) == (NOT_PROCESSED, R.UPSTREAM_DEPRECATED)
+    alone = [mask(5), assembly(7, 5, deprecated=True), denovo(70, 5, 7)]
+    r = resolve_past_upstream(alone, [], ALIGNMENT, 70, obs, admitted=frozenset({PROCESSING}))
     assert (r.state, r.definition_idx) == (PROCESSED, 70)
 
 

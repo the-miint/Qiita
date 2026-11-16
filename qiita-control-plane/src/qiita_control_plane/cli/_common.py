@@ -68,9 +68,10 @@ from qiita_common.auth_constants import (
 )
 from qiita_common.models import (
     INCLUDE_DEPRECATED_FLAG,
-    INCLUDE_DEPRECATED_UPSTREAM_FLAG,
+    DefinitionKind,
     PrincipalLookupRequest,
     PrincipalLookupResponse,
+    flags_admitting_deprecated_upstream,
 )
 
 # Environment-variable names and CLI defaults are CLI conventions (not part of
@@ -907,10 +908,8 @@ def print_deprecated_upstream_read(kind: str, idx: int, upstream: dict) -> None:
     """The stderr line for a read of an active definition past a deprecated upstream
     (a `DeprecatedUpstream` body), made under --include-deprecated-upstream or, for a
     de novo alignment's assembly run, --include-deprecated."""
-    flags = (
-        INCLUDE_DEPRECATED_UPSTREAM_FLAG
-        if upstream["definition_kind"] == "mask"
-        else f"{INCLUDE_DEPRECATED_FLAG} or {INCLUDE_DEPRECATED_UPSTREAM_FLAG}"
+    flags = " or ".join(
+        flags_admitting_deprecated_upstream(DefinitionKind(upstream["definition_kind"]))
     )
     print(
         f"warning: {kind} {idx} reads {upstream['definition_kind']}"

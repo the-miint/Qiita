@@ -34,6 +34,7 @@ from qiita_common.models import (
     SampleStudyFieldResponse,
     TerminologyTermRef,
     Tier,
+    admitted_deprecated_upstream_kinds,
     deprecated_read_refusal,
     deprecated_upstream_read_refusal,
     field_wire_name,
@@ -52,9 +53,8 @@ from ..decision_set import DecisionSetUnknown
 from ..definition_similarity import (
     Groups,
     PairRefused,
-    is_definition_ref,
+    deprecated_upstreams,
     load_groups,
-    upstream_leaves,
 )
 from ..repositories._sample_helpers import (
     ConflictingValueDifferentStudyError,
@@ -102,7 +102,6 @@ from ..repositories.alignment_definition import (
     fetch_alignment_definition_by_idx,
 )
 from ..repositories.block import list_incomplete_alignment_samples
-from ..repositories.definition_pair import DEFINITION_TABLES, decode_jsonb
 from ..repositories.mask_definition import MaskHasLiveWork, fetch_mask_definition_by_idx
 from ..repositories.study_access import CallerMetadataTiers
 
@@ -230,42 +229,6 @@ def deprecated_read(
     )
 
 
-async def deprecated_upstreams(
-    pool_or_conn: asyncpg.Pool | asyncpg.Connection, alignment: asyncpg.Record
-) -> list[DeprecatedUpstream]:
-    """The deprecated definitions `alignment` read: its mask and, for a de novo
-    alignment, its assembly run and that run's mask, in that order, each once."""
-    out: list[DeprecatedUpstream] = []
-    seen: set[tuple[DefinitionKind, int]] = set()
-    stack = [(DefinitionKind.ALIGNMENT, decode_jsonb(alignment["params"]))]
-    while stack:
-        kind, params = stack.pop(0)
-        for path, up_kind in upstream_leaves(kind, params).items():
-            idx = params.get(path)
-            if not is_definition_ref(idx) or (up_kind, idx) in seen:
-                continue
-            seen.add((up_kind, idx))
-            table = DEFINITION_TABLES[up_kind]
-            row = await pool_or_conn.fetchrow(
-                f"SELECT status, deprecation_reason, params, params_hash FROM {table.table}"
-                f" WHERE {table.id_column} = $1",
-                idx,
-            )
-            if row is None:
-                continue
-            if row["status"] == table.deprecated_status:
-                out.append(
-                    DeprecatedUpstream(
-                        definition_kind=up_kind,
-                        definition_idx=idx,
-                        params_hash=bytes(row["params_hash"]).hex(),
-                        deprecation_reason=row["deprecation_reason"],
-                    )
-                )
-            stack.append((up_kind, decode_jsonb(row["params"])))
-    return out
-
-
 def deprecated_upstream_read(
     *,
     kind: DefinitionKind,
@@ -273,19 +236,19 @@ def deprecated_upstream_read(
     upstreams: list[DeprecatedUpstream],
     include_deprecated: bool,
     include_deprecated_upstream: bool,
-) -> bool:
-    """Whether a read naming active `kind` `idx` reads past deprecated upstreams
-    (`definition_resolver`, "Deprecated upstreams"): True when `upstreams` is non-empty
-    and every one is admitted, 409 naming `include_deprecated_upstream` otherwise.
-    `include_deprecated_upstream` admits any; `include_deprecated` admits a de novo
-    alignment's assembly run, whose genome map a build reads as a version of its own."""
+) -> frozenset[DefinitionKind]:
+    """The deprecated upstream kinds a read naming active `kind` `idx` reads past
+    (`definition_resolver`, "Deprecated upstreams"): empty when `upstreams` is empty,
+    the flags' `admitted_deprecated_upstream_kinds` when they admit every one, 409
+    naming `include_deprecated_upstream` otherwise."""
     if not upstreams:
-        return False
-    admitted = include_deprecated_upstream or all(
-        include_deprecated and u.definition_kind is DefinitionKind.PROCESSING for u in upstreams
+        return frozenset()
+    admitted = admitted_deprecated_upstream_kinds(
+        include_deprecated=include_deprecated,
+        include_deprecated_upstream=include_deprecated_upstream,
     )
-    if admitted:
-        return True
+    if all(u.definition_kind in admitted for u in upstreams):
+        return admitted
     raise HTTPException(
         status_code=409,
         detail={
@@ -315,13 +278,13 @@ async def refuse_deprecated_mask_read(
 @dataclass(frozen=True)
 class AlignmentCohortRead:
     """What `authorize_completed_alignment_cohort` admitted: the cohort; `exact`, a
-    deprecated alignment read alone; `past_upstream`, an active alignment read past
-    deprecated upstreams (`resolve_group(include_deprecated_upstream=True)`); and the
-    deprecated upstreams it reads, for the response."""
+    deprecated alignment read alone; `include_deprecated_upstream`, the deprecated
+    upstream kinds an active alignment is read past (`deprecated_upstream_read`, for
+    `resolve_group`); and the deprecated upstreams it reads, for the response."""
 
     cohort: list[int]
     exact: bool
-    past_upstream: bool
+    include_deprecated_upstream: frozenset[DefinitionKind]
     deprecated_upstreams: list[DeprecatedUpstream]
 
 
@@ -373,12 +336,16 @@ async def authorize_completed_alignment_cohort(
 
     exact = alignment_exact_read(alignment, include_deprecated=include_deprecated)
     upstreams = await deprecated_upstreams(pool, alignment)
-    past_upstream = not exact and deprecated_upstream_read(
-        kind=DefinitionKind.ALIGNMENT,
-        idx=alignment_idx,
-        upstreams=upstreams,
-        include_deprecated=include_deprecated,
-        include_deprecated_upstream=include_deprecated_upstream,
+    past = (
+        frozenset()
+        if exact
+        else deprecated_upstream_read(
+            kind=DefinitionKind.ALIGNMENT,
+            idx=alignment_idx,
+            upstreams=upstreams,
+            include_deprecated=include_deprecated,
+            include_deprecated_upstream=include_deprecated_upstream,
+        )
     )
 
     incomplete = await list_incomplete_alignment_samples(pool, alignment_idx, cohort)
@@ -388,7 +355,7 @@ async def authorize_completed_alignment_cohort(
             f" {alignment_idx} (e.g. {first_few(incomplete)})"
         )
         raise HTTPException(status_code=422, detail=f"{detail}{nothing_to}")
-    return AlignmentCohortRead(cohort, exact, past_upstream, upstreams)
+    return AlignmentCohortRead(cohort, exact, past, upstreams)
 
 
 def first_few(idxs: list[int], limit: int = 5) -> str:

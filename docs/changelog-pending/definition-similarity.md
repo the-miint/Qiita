@@ -100,9 +100,11 @@
 - **An active alignment whose mask, or (de novo) whose assembly run, is deprecated is
   refused up front (409, `reason` `deprecated_upstream`) by the alignment cohort DoGet,
   the pool alignment cohort listing and both alignment mints unless the caller passes
-  `--include-deprecated-upstream` (API `include_deprecated_upstream`) (#874).** With
-  it the group is resolved without the upstream deprecation checks (withdrawn runs
-  stay unreadable); `POST /api/v1/definition-group/resolve` takes the flag too, the
+  `--include-deprecated-upstream` (API `include_deprecated_upstream`), or, for a
+  deprecated assembly run, `--include-deprecated` (#874).** With an admitting flag the
+  group is resolved without the upstream deprecation checks for the kinds it admits
+  (withdrawn runs stay unreadable); `POST /api/v1/definition-group/resolve` takes both
+  flags too, the
   cohort DoGet response names the deprecated upstreams read (`deprecated_upstreams`),
   and `qiita feature-table build` says so on stderr and records each on the manifest
   part by `params_hash` and reason.

@@ -83,6 +83,36 @@ def deprecated_read_refusal(kind: str, idx: int, deprecation_reason: str | None)
 INCLUDE_DEPRECATED_UPSTREAM_FLAG = "--include-deprecated-upstream"
 
 
+def admitted_deprecated_upstream_kinds(
+    *, include_deprecated: bool, include_deprecated_upstream: bool
+) -> frozenset[DefinitionKind]:
+    """The kinds of deprecated upstream a read of an active definition may read past.
+    `include_deprecated_upstream` admits a deprecated mask or assembly run (processing);
+    `include_deprecated` alone admits a de novo alignment's deprecated assembly run,
+    whose genome map a build reads as a version of its own, and not a mask."""
+    if include_deprecated_upstream:
+        return frozenset({DefinitionKind.MASK, DefinitionKind.PROCESSING})
+    if include_deprecated:
+        return frozenset({DefinitionKind.PROCESSING})
+    return frozenset()
+
+
+def flags_admitting_deprecated_upstream(kind: DefinitionKind) -> list[str]:
+    """The CLI flags that admit a deprecated upstream of `kind`, per
+    `admitted_deprecated_upstream_kinds`."""
+    return [
+        flag
+        for flag, upstream_flag in (
+            (INCLUDE_DEPRECATED_FLAG, False),
+            (INCLUDE_DEPRECATED_UPSTREAM_FLAG, True),
+        )
+        if kind
+        in admitted_deprecated_upstream_kinds(
+            include_deprecated=not upstream_flag, include_deprecated_upstream=upstream_flag
+        )
+    ]
+
+
 class DeprecatedUpstream(BaseModel):
     """A deprecated upstream of a definition that a read names: its kind, id,
     `params_hash` (hex; what a published manifest cites in place of the id) and
@@ -151,7 +181,10 @@ class DefinitionGroupResolveRequest(BaseModel):
     definition_idx: Annotated[int, Field(gt=0)]
     prep_sample_idx: PrepSampleCohort
     as_of_event: DecisionSetToken | None = None
-    # Resolve as if no upstream were deprecated (`definition_resolver`, rule 4).
+    # Read past deprecated upstreams of the kinds these admit
+    # (`admitted_deprecated_upstream_kinds`; `definition_resolver`, "Deprecated
+    # upstreams").
+    include_deprecated: bool = False
     include_deprecated_upstream: bool = False
 
 

@@ -842,3 +842,33 @@ async def test_a_deprecated_alignments_cohort_listing_leaves_out_a_failed_run(
             "reason": R.FAILED,
         }
     ]
+
+
+@pytest.mark.parametrize(
+    ("flags", "processed"),
+    [
+        ({}, False),
+        ({"include_deprecated": True}, False),
+        ({"include_deprecated_upstream": True}, True),
+    ],
+)
+async def test_resolve_reads_past_a_deprecated_mask_under_the_upstream_flag_only(
+    ctx, alignment_group_world, flags, processed
+):
+    """A deprecated mask under an active alignment is read past only under
+    `include_deprecated_upstream`; `include_deprecated` alone admits a deprecated
+    assembly run, not a mask (`admitted_deprecated_upstream_kinds`)."""
+    w = alignment_group_world
+    await ctx["pool"].execute(
+        "UPDATE qiita.mask_definition SET status = 'deprecated', deprecated_at = now(),"
+        " deprecated_by_idx = $2, deprecation_reason = 'host reference was wrong'"
+        " WHERE mask_idx = $1",
+        w["mask_idx"],
+        ctx["admin_session"]["principal_idx"],
+    )
+    body = {**_body(DefinitionKind.ALIGNMENT, w["align_1"], [w["ps_a"]]), **flags}
+    s = _by_sample(await ctx["user"].post(URL_DEFINITION_GROUP_RESOLVE, json=body))[w["ps_a"]]
+    if processed:
+        assert (s["state"], s["definition_idx"]) == (PROCESSED, w["align_1"])
+    else:
+        assert (s["state"], s["reason"]) == (NOT_PROCESSED, R.UPSTREAM_DEPRECATED)

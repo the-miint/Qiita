@@ -298,9 +298,13 @@ def _fake_resolve(rec, *, members=None, groups=None, unprocessed=None):
         definition_idx,
         prep_sample_idx,
         as_of_event=None,
+        include_deprecated=False,
         include_deprecated_upstream=False,
     ):
         rec.setdefault("resolve_upstream", []).append((definition_idx, include_deprecated_upstream))
+        rec.setdefault("resolve_flags", []).append(
+            (definition_idx, include_deprecated, include_deprecated_upstream)
+        )
         key = (DefinitionKind(kind).value, definition_idx)
         rec["resolve_calls"].append((*key, list(prep_sample_idx)))
         rec.setdefault("resolve_as_of", []).append(as_of_event)
@@ -2755,7 +2759,10 @@ def test_a_deprecated_denovo_alignment_is_read_alone_with_the_flag(monkeypatch, 
 
 def test_a_deprecated_denovo_run_is_read_with_the_flag(monkeypatch, tmp_path):
     """--include-deprecated reads an active de novo alignment's deprecated assembly
-    run: the de novo resolve lifts the upstream deprecation check."""
+    run: the de novo resolve carries `include_deprecated` alone, which admits a
+    deprecated assembly run and not a deprecated mask
+    (`admitted_deprecated_upstream_kinds`), so a de novo alignment whose mask is also
+    deprecated is resolved `upstream_deprecated` and refused before any read."""
     rec = _patched_combined(monkeypatch)
     monkeypatch.setattr(
         ftc,
@@ -2765,8 +2772,8 @@ def test_a_deprecated_denovo_run_is_read_with_the_flag(monkeypatch, tmp_path):
     args = _namespace(tmp_path, denovo_alignment_idx=4, include_deprecated=True)
 
     assert ftc._handle_feature_table_build(args, parser=None) == 0
-    assert (4, True) in rec["resolve_upstream"]
-    assert (3, False) in rec["resolve_upstream"]
+    assert (4, True, False) in rec["resolve_flags"]
+    assert (3, False, False) in rec["resolve_flags"]
 
 
 def test_the_upstream_flag_reaches_every_request(monkeypatch, tmp_path):

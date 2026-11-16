@@ -17,7 +17,11 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import JSONResponse
 from qiita_common.api_paths import PATH_DEFINITION_GROUP_PREFIX, PATH_DEFINITION_GROUP_RESOLVE
 from qiita_common.auth_constants import Scope
-from qiita_common.models import DefinitionGroupResolveRequest, DefinitionGroupResolveResponse
+from qiita_common.models import (
+    DefinitionGroupResolveRequest,
+    DefinitionGroupResolveResponse,
+    admitted_deprecated_upstream_kinds,
+)
 
 from ..auth.guards import COHORT_MIN_TIER, require_human, require_scope
 from ..auth.principal import HumanUser, Principal
@@ -50,8 +54,10 @@ async def resolve_definition_group_route(
     `decisions` records the pair decisions the group was computed under; passing its
     `decision_set` back as `as_of_event` computes the group from those decisions again,
     with runs, gates, tickets and deprecation read as they are now (422 for a token
-    that names no decision set). `include_deprecated_upstream` resolves without the
-    upstream deprecation checks (`definition_resolver`, "Deprecated upstreams")."""
+    that names no decision set). `include_deprecated` and `include_deprecated_upstream`
+    resolve past deprecated upstreams of the kinds they admit
+    (`admitted_deprecated_upstream_kinds`; `definition_resolver`, "Deprecated
+    upstreams")."""
     async with pool.acquire() as conn, conn.transaction(isolation="repeatable_read", readonly=True):
         groups = await load_groups_as_of(conn, body.as_of_event)
         if (body.definition_kind, body.definition_idx) not in groups.definitions:
@@ -72,7 +78,10 @@ async def resolve_definition_group_route(
             definition_idx=body.definition_idx,
             prep_sample_idxs=cohort,
             groups=groups,
-            include_deprecated_upstream=body.include_deprecated_upstream,
+            include_deprecated_upstream=admitted_deprecated_upstream_kinds(
+                include_deprecated=body.include_deprecated,
+                include_deprecated_upstream=body.include_deprecated_upstream,
+            ),
         )
     response = DefinitionGroupResolveResponse(
         definition_kind=resolution.kind,

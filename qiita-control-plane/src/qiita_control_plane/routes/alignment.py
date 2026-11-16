@@ -572,7 +572,7 @@ async def create_alignment_cohort_doget_ticket(
                     definition_idx=alignment_idx,
                     prep_sample_idxs=cohort,
                     groups=groups,
-                    include_deprecated_upstream=read.past_upstream,
+                    include_deprecated_upstream=read.include_deprecated_upstream,
                 )
     except DefinitionNotFound as exc:
         raise HTTPException(status_code=404, detail=ALIGNMENT_NOT_FOUND_DETAIL) from exc

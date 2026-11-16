@@ -145,6 +145,7 @@ from ..auth.guards import (
 )
 from ..auth.principal import HumanUser, Principal, ServiceAccount
 from ..definition_resolver import resolve_exact
+from ..definition_similarity import deprecated_upstreams
 from ..deps import (
     TxConnFactory,
     get_data_plane_url,
@@ -185,7 +186,6 @@ from ._helpers import (
     alignment_exact_read,
     cap_rows,
     deprecated_upstream_read,
-    deprecated_upstreams,
     resolve_idxs_by_natural_key,
 )
 

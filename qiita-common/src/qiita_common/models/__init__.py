@@ -161,8 +161,10 @@ from qiita_common.models.definition_group import (
     SampleResolution,
     SampleResolutionReason,
     SampleResolutionState,
+    admitted_deprecated_upstream_kinds,
     deprecated_read_refusal,
     deprecated_upstream_read_refusal,
+    flags_admitting_deprecated_upstream,
 )
 from qiita_common.models.definition_pair import (
     DefinitionKind,
@@ -633,6 +635,8 @@ __all__ = [
     "INCLUDE_DEPRECATED_FLAG",
     "INCLUDE_DEPRECATED_UPSTREAM_FLAG",
     "DeprecatedUpstream",
+    "admitted_deprecated_upstream_kinds",
+    "flags_admitting_deprecated_upstream",
     "deprecated_read_refusal",
     "deprecated_upstream_read_refusal",
     "DecisionProvenance",
