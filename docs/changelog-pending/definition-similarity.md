@@ -45,7 +45,12 @@
   earlier shape.
 - **The alignment cohort DoGet refuses a prep_sample that does not resolve to the
   alignment it names (#874)** (409, `reason` `resolved_elsewhere`, `incomplete` or
-  `not_processed`), including one whose mask run is withdrawn or deprecated.
+  `not_processed`), including one whose mask run is withdrawn or deprecated. Two of
+  these refusals apply with no pair decided: `incomplete` for a prep_sample whose
+  gate is completed but whose newest ticket under the alignment, or a block ticket
+  covering it, failed or is waiting or running; and `incomplete` / `upstream_moved`
+  for one whose mask now resolves to another mask of its group, which a newer
+  member's run causes once masks are decided similar.
 - **Deprecating a mask, alignment or processing is refused (409, `similar_pairs`)
   while it is a side of a `similar` pair (#874).** The mask and alignment
   deprecation 409 for unfinished work tickets now has the same shape: `reason` is the
