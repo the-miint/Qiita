@@ -134,11 +134,11 @@ from ._helpers import (
     GATE_ROSTER_HARD_CAP,
     authorize_prep_sample_cohort,
     cap_rows,
-    deprecated_read,
     first_few,
     gate_roster_narrowing_idx,
     live_work_http,
     load_groups_as_of,
+    mask_exact_read,
     pair_refused_http,
     resolution_body,
     sees_resolution_tickets,
@@ -449,13 +449,7 @@ async def get_syndna_read_count_route(
         if (DefinitionKind.MASK, mask_idx) not in groups.definitions:
             raise HTTPException(status_code=404, detail=_MSG_MASK_NOT_FOUND)
         mask = await fetch_mask_definition_by_idx(conn, mask_idx)
-        exact = deprecated_read(
-            kind=DefinitionKind.MASK,
-            idx=mask_idx,
-            deprecated=groups.definitions[(DefinitionKind.MASK, mask_idx)].deprecated,
-            deprecation_reason=mask["deprecation_reason"],
-            include_deprecated=include_deprecated,
-        )
+        exact = mask_exact_read(mask, include_deprecated=include_deprecated)
         group = [mask_idx] if exact else sorted(groups.group_of(DefinitionKind.MASK, mask_idx))
         references = await fetch_mask_syndna_references(conn, group)
         rows = await fetch_syndna_export_roster(

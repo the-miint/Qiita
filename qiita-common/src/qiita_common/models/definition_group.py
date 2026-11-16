@@ -47,11 +47,13 @@ class SampleResolutionReason(StrEnum):
 
 class DefinitionGroupRefusal(StrEnum):
     """The `reason` code of a 409 refusing a cohort because a prep_sample does not
-    resolve to the definition that the caller named."""
+    resolve to the definition that the caller named, or because that definition is
+    deprecated and the caller did not set `include_deprecated` (`DEPRECATED`)."""
 
     RESOLVED_ELSEWHERE = "resolved_elsewhere"
     INCOMPLETE = "incomplete"
     NOT_PROCESSED = "not_processed"
+    DEPRECATED = "deprecated"
 
 
 # A decision-set token: `sha256:` and 64 lowercase hex digits. The canonical form it

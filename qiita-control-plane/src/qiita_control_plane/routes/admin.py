@@ -39,7 +39,6 @@ from qiita_common.models import (
     DecisionSetToken,
     DefinitionKind,
     DoGetTicketResponse,
-    MaskDefinitionStatus,
     MaskedReadExportManifest,
     MaskedReadExportSample,
     MaskedReadExportTicketRequest,
@@ -71,7 +70,7 @@ from ..deps import TxConnFactory, get_db_pool, get_flight_signing_key, get_tx_co
 from ..repositories.block import MASK_SAMPLE_COMPLETED
 from ..repositories.mask_definition import fetch_mask_definition_by_idx
 from ..repositories.study_access import fetch_grantee_by_email
-from ._helpers import deprecated_read, load_groups_as_of
+from ._helpers import load_groups_as_of, mask_exact_read
 
 router = APIRouter(prefix=PATH_ADMIN_PREFIX, tags=["admin"])
 
@@ -739,13 +738,7 @@ async def export_masked_read_manifest(
                 status_code=404, detail=f"no mask_definition with mask_idx={mask_idx}"
             )
         row = await fetch_mask_definition_by_idx(conn, mask_idx)
-        exact = deprecated_read(
-            kind=DefinitionKind.MASK,
-            idx=mask_idx,
-            deprecated=mask.deprecated,
-            deprecation_reason=row["deprecation_reason"],
-            include_deprecated=include_deprecated,
-        )
+        exact = mask_exact_read(row, include_deprecated=include_deprecated)
         db_rows = await conn.fetch(_MASKED_EXPORT_ROSTER_SQL, sequenced_pool_idx, mask_idx)
         resolution = await (resolve_exact if exact else resolve_group)(
             conn,
@@ -814,7 +807,7 @@ async def create_masked_read_export_ticket(
         )
 
     row = await pool.fetchrow(
-        "SELECT md.status, md.deprecation_reason, msamp.state AS mask_state"
+        "SELECT md.mask_idx, md.status, md.deprecation_reason, msamp.state AS mask_state"
         "  FROM qiita.mask_definition md"
         "  LEFT JOIN qiita.mask_sample msamp"
         "    ON msamp.mask_idx = md.mask_idx AND msamp.prep_sample_idx = $2"
@@ -822,13 +815,7 @@ async def create_masked_read_export_ticket(
         body.mask_idx,
         body.prep_sample_idx,
     )
-    exact = row is not None and deprecated_read(
-        kind=DefinitionKind.MASK,
-        idx=body.mask_idx,
-        deprecated=row["status"] == MaskDefinitionStatus.DEPRECATED.value,
-        deprecation_reason=row["deprecation_reason"],
-        include_deprecated=body.include_deprecated,
-    )
+    exact = row is not None and mask_exact_read(row, include_deprecated=body.include_deprecated)
     mask_state = None if row is None else row["mask_state"]
     if mask_state != MASK_SAMPLE_COMPLETED:
         raise HTTPException(

@@ -16,9 +16,11 @@ from qiita_common.models import (
     NOT_SETTABLE_ON_LINKED_FIELD,
     STUDY_FIELD_IDX_ATTR,
     AlignmentDefinitionStatus,
+    DefinitionGroupRefusal,
     DefinitionKind,
     DeprecationRefusal,
     IdxsListResponse,
+    MaskDefinitionStatus,
     MetadataEntry,
     MetadataFieldWriteResult,
     MissingReasonRef,
@@ -177,6 +179,18 @@ def alignment_exact_read(alignment: asyncpg.Record, *, include_deprecated: bool)
     )
 
 
+def mask_exact_read(mask: asyncpg.Record, *, include_deprecated: bool) -> bool:
+    """`deprecated_read` for a `mask_definition` row: `alignment_exact_read`'s mask
+    twin."""
+    return deprecated_read(
+        kind=DefinitionKind.MASK,
+        idx=mask["mask_idx"],
+        deprecated=mask["status"] == MaskDefinitionStatus.DEPRECATED.value,
+        deprecation_reason=mask["deprecation_reason"],
+        include_deprecated=include_deprecated,
+    )
+
+
 # The CLI spelling of the flag every explicit read of a deprecated definition takes;
 # the API field and query parameter are `include_deprecated`.
 INCLUDE_DEPRECATED_FLAG = "--include-deprecated"
@@ -207,7 +221,7 @@ def deprecated_read(
                 f"{kind.value} {idx} is deprecated: {deprecation_reason}. To read its own"
                 f" results, pass {INCLUDE_DEPRECATED_FLAG} (API: include_deprecated=true)"
             ),
-            "reason": "deprecated",
+            "reason": DefinitionGroupRefusal.DEPRECATED.value,
             "deprecation_reason": deprecation_reason,
         },
     )
