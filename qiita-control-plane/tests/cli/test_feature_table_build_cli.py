@@ -2072,6 +2072,14 @@ def test_a_single_pool_build_is_one_part(monkeypatch, tmp_path):
     assert len([t for t in _FakeFlightClient.instances[0].tickets if t == _ALIGNMENT_TICKET]) == 1
 
 
+def test_the_manifest_records_its_schema_version(monkeypatch, tmp_path):
+    _patched(monkeypatch)
+    assert ftc._handle_feature_table_build(_namespace(tmp_path), parser=None) == 0
+    manifest = _manifest(tmp_path)
+    assert manifest["schema_version"] == ftc.MANIFEST_SCHEMA_VERSION == 2
+    assert "parts" in manifest["processing"]
+
+
 def test_the_manifest_has_a_handle_per_part_and_maps_each_sample_to_its_part(monkeypatch, tmp_path):
     _patched_two_pools(monkeypatch)
     args = _two_pool_args(tmp_path, prep_sample_idx=[1, 2])

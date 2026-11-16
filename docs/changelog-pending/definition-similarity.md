@@ -41,7 +41,8 @@
   read) and `sample_part` (each `export_id` to its part's handle), and `table.denovo`
   the same for the de novo arm, in place of the single `export_processing_id`,
   `params_hash` and `aligner`, and of `denovo.requested_alignment_idx` /
-  `processing_idx`.
+  `processing_idx`. The manifest gains `schema_version` (2); one without it has the
+  earlier shape.
 - **The alignment cohort DoGet refuses a prep_sample that does not resolve to the
   alignment it names (#874)** (409, `reason` `resolved_elsewhere`, `incomplete` or
   `not_processed`), including one whose mask run is withdrawn or deprecated.

@@ -69,7 +69,7 @@ _None yet._
 - (#874) `GET /mask-definition/{idx}/syndna-read-count` gains `samples[].mask_idx` and `left_out`, returns a partial table when some selected prep_samples are incomplete or not processed (previously a 409), and adds 409s for a group member with another SynDNA reference and for a selection with no processed prep_sample.
 - (#874) `POST /alignment/{idx}/ticket/doget` (human cohort DoGet) returns 409 (`reason` `resolved_elsewhere`, `incomplete` or `not_processed`) for a prep_sample that does not resolve to the named alignment, including one whose mask run is withdrawn or deprecated.
 - (#874) `PATCH /mask-definition/{idx}/status`, `/alignment-definition/{idx}/status` and `/processing/{idx}/status` return 409 (`similar_pairs`) when deprecating a definition that is a side of a `similar` pair. The mask and alignment routes' existing 409 for unfinished work tickets now carries `reason` `live_work` (a code; it was the message) with the message in `detail`; `work_ticket_idx` is unchanged.
-- (#874) `qiita feature-table build` manifest: `processing.parts` / `processing.sample_part` (and the same under `table.denovo`) replace `processing.export_processing_id` / `params_hash` / `aligner` and `denovo.requested_alignment_idx` / `processing_idx`; a script reading the old keys must be updated.
+- (#874) `qiita feature-table build` manifest: `processing.parts` / `processing.sample_part` (and the same under `table.denovo`) replace `processing.export_processing_id` / `params_hash` / `aligner` and `denovo.requested_alignment_idx` / `processing_idx`, and the manifest gains `schema_version` (2); a script reading the old keys must be updated.
 
 ## Deployed history
 

@@ -821,6 +821,12 @@ _MANIFEST_SUFFIX = ".manifest.json"
 # that can fall back cannot disagree about the word.
 _UNKNOWN_VERSION = "unknown"
 
+# The manifest's shape, recorded as its `schema_version`. 2 is `processing.parts` /
+# `processing.sample_part` (and the same under `table.denovo`); a manifest with no
+# `schema_version` is the earlier shape, with one `processing.export_processing_id`,
+# `params_hash` and `aligner`. Raised whenever a key is renamed, moved or removed.
+MANIFEST_SCHEMA_VERSION = 2
+
 MANIFEST_NOTE = (
     "This file records what produced the table beside it. Coverage filtering makes a"
     " feature table a function of the whole cohort it was built over, not only of the"
@@ -999,6 +1005,7 @@ def _manifest_payload(
     happen to agree" is the shape that has already produced defects on this branch.
     """
     return {
+        "schema_version": MANIFEST_SCHEMA_VERSION,
         "note": MANIFEST_NOTE,
         "processing": {
             "reference": {
