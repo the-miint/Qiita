@@ -70,7 +70,12 @@ from typing import Any
 import asyncpg
 from qiita_common.models import DefinitionKind, DefinitionPairRefusal, DefinitionPairVerdict
 
-from .repositories import SNAPSHOT_ISOLATION_LEVELS, require_transaction, transaction_isolation
+from .repositories import (
+    READ_COMMITTED,
+    SNAPSHOT_ISOLATION_LEVELS,
+    require_transaction,
+    transaction_isolation,
+)
 from .repositories.definition_pair import (
     DefinitionRow,
     GroupLockBusy,
@@ -434,13 +439,22 @@ def compute_groups(definitions: Iterable[DefinitionRow], pairs: Iterable[PairSta
 
 async def load_groups(conn: asyncpg.Connection) -> Groups:
     """Groups as of the caller's transaction. The caller either holds the group lock
-    EXCLUSIVE (a decision or revoke), or reads at REPEATABLE READ: there the
-    transaction's one snapshot keeps the groups consistent with the gates and
-    tickets read beside them, and a shared group lock would add nothing, since a
-    reader that waited on it would still read the snapshot taken before the wait."""
+    EXCLUSIVE (a decision or revoke) at READ COMMITTED, so that it reads every
+    decision committed before it took the lock (`lock_groups_exclusive`), or reads at
+    REPEATABLE READ without it: there the transaction's one snapshot keeps the groups
+    consistent with the gates and tickets read beside them, and a shared group lock
+    would add nothing, since a reader that waited on it would still read the snapshot
+    taken before the wait."""
     require_transaction(conn)
     isolation = await transaction_isolation(conn)
-    if isolation not in SNAPSHOT_ISOLATION_LEVELS and not (await holds_group_lock_exclusive(conn)):
+    if await holds_group_lock_exclusive(conn):
+        if isolation != READ_COMMITTED:
+            raise RuntimeError(
+                "load_groups under the group lock EXCLUSIVE needs a READ COMMITTED"
+                f" transaction; this one is {isolation!r}, whose snapshot can predate"
+                " a decision that committed before the lock was taken"
+            )
+    elif isolation not in SNAPSHOT_ISOLATION_LEVELS:
         raise RuntimeError(
             "load_groups needs the group lock EXCLUSIVE or a REPEATABLE READ transaction;"
             f" this one is {isolation!r} without the lock"

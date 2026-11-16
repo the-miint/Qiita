@@ -78,8 +78,18 @@ async def lock_groups_exclusive(conn: asyncpg.Connection) -> None:
     Tries `GROUP_LOCK_EXCLUSIVE_ATTEMPTS` times, `GROUP_LOCK_EXCLUSIVE_INTERVAL_S`
     apart, with `pg_try_advisory_xact_lock`; the reason it never waits in the
     lock queue is on those constants. Read at call time, so a test can shorten
-    them."""
+    them.
+
+    The caller's transaction must be READ COMMITTED, so that the statements after
+    the lock see a decision that committed while this one retried; at REPEATABLE
+    READ the first try-lock fixes the snapshot, and the caller would check its
+    decision against the groups as they were before that one."""
     require_transaction(conn)
+    isolation = await transaction_isolation(conn)
+    if isolation != READ_COMMITTED:
+        raise RuntimeError(
+            f"lock_groups_exclusive needs a READ COMMITTED transaction; this one is {isolation!r}"
+        )
     for attempt in range(GROUP_LOCK_EXCLUSIVE_ATTEMPTS):
         if await conn.fetchval(
             "SELECT pg_try_advisory_xact_lock($1, $2)",

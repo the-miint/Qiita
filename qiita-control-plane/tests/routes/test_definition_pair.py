@@ -688,6 +688,72 @@ async def test_the_shared_group_lock_refuses_a_repeatable_read_transaction(postg
             await pair_repo.lock_groups_shared(conn)
 
 
+async def test_the_exclusive_group_lock_refuses_a_repeatable_read_transaction(postgres_pool):
+    """At REPEATABLE READ the first try-lock fixes the snapshot, so a decision that
+    retried while another committed would be checked against the groups before it.
+    load_groups refuses the pair too, for a lock taken by other means."""
+    async with (
+        postgres_pool.acquire() as conn,
+        conn.transaction(isolation="repeatable_read"),
+    ):
+        with pytest.raises(RuntimeError, match="READ COMMITTED"):
+            await pair_repo.lock_groups_exclusive(conn)
+    async with (
+        postgres_pool.acquire() as conn,
+        conn.transaction(isolation="repeatable_read"),
+    ):
+        await conn.execute(
+            "SELECT pg_advisory_xact_lock($1, $2)",
+            pair_repo.DEFINITION_GROUP_LOCK_CLASS,
+            pair_repo.DEFINITION_GROUP_LOCK_KEY,
+        )
+        with pytest.raises(RuntimeError, match="needs a READ COMMITTED"):
+            await load_groups(conn)
+
+
+async def test_a_decision_that_waited_out_another_sees_it_and_is_refused(
+    postgres_pool, clients, defs, monkeypatch
+):
+    """not_similar(M1, M3) stands. Decision A (M1 ~ M2) holds the group lock; decision
+    B (M2 ~ M3) retries the try-lock meanwhile. Once A commits, B takes the lock, reads
+    A, and is refused: with A, it would put M1 and M3 in one group."""
+    monkeypatch.setattr(pair_repo, "GROUP_LOCK_EXCLUSIVE_ATTEMPTS", 200)
+    monkeypatch.setattr(pair_repo, "GROUP_LOCK_EXCLUSIVE_INTERVAL_S", 0.05)
+    m1, m2, m3 = [await defs["mask"](rype=r) for r in (0.05, 0.1, 0.2)]
+    p13 = await _opened(clients["admin"], DefinitionKind.MASK, m1, m3)
+    p12 = await _opened(clients["admin"], DefinitionKind.MASK, m1, m2)
+    p23 = await _opened(clients["admin"], DefinitionKind.MASK, m2, m3)
+    assert (
+        await _decide(clients["admin"], p13, DefinitionPairVerdict.NOT_SIMILAR)
+    ).status_code == 200
+
+    async with postgres_pool.acquire() as decider:
+        tx = decider.transaction()
+        await tx.start()
+        try:
+            await decide_pair(
+                decider,
+                definition_pair_idx=p12,
+                verdict=DefinitionPairVerdict.SIMILAR,
+                reason="same filter, reviewed",
+                principal_idx=defs["owner"],
+            )
+            second = asyncio.create_task(
+                _decide(clients["admin"], p23, DefinitionPairVerdict.SIMILAR)
+            )
+            await asyncio.sleep(0.5)
+            assert not second.done()
+        except BaseException:
+            await tx.rollback()
+            raise
+        await tx.commit()
+
+    detail = _refusal(
+        await asyncio.wait_for(second, timeout=20), DefinitionPairRefusal.CONTRADICTION
+    )
+    assert detail["definition_pair_idx"] == [p13]
+
+
 async def test_load_groups_refuses_read_committed_without_the_exclusive_lock(postgres_pool):
     async with postgres_pool.acquire() as conn, conn.transaction():
         with pytest.raises(RuntimeError, match="EXCLUSIVE or a REPEATABLE READ"):
