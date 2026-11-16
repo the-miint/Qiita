@@ -114,7 +114,7 @@ from ..repositories.block import BLOCK_ABANDONED
 from ..repositories.mask_definition import MaskDefinitionDeprecated, lock_active_mask
 from ..runner import _fetch_action
 from ..step_progress import StepProgressMismatch, check_step_progress, load_step_progress
-from ..ticket_redrive import ReapFailed, drop_dead_step_rows, reset_ticket_to_pending
+from ..ticket_redrive import ReapPending, drop_dead_step_rows, reset_ticket_to_pending
 from ..work_ticket_cancel import WorkTicketNotFound, cancel_work_ticket
 from ..work_ticket_submit import (
     _reset_failed_reference_scope_for_dispatch,
@@ -1001,7 +1001,7 @@ async def run_work_ticket(
                 reset = await reset_ticket_to_pending(
                     conn, work_ticket_idx=work_ticket_idx, from_state=current_state
                 )
-            except ReapFailed as exc:
+            except ReapPending as exc:
                 raise HTTPException(
                     status_code=status.HTTP_409_CONFLICT,
                     detail={"reason": exc.REASON, "detail": str(exc)},
@@ -1091,7 +1091,7 @@ async def cancel_work_tickets(
     are still reaped. A missing explicit idx comes back `not_found`; a reap that fails after
     the flip lands comes back with `reap_error` (the flip stands — re-run cancel to
     retry) and is recorded on the ticket, where it blocks a redrive
-    (`ticket_redrive.ReapFailed`) until a reap succeeds."""
+    (`ticket_redrive.ReapPending`) until a reap succeeds."""
     backend_client = request.app.state.compute_backend_client
     # Explicit idxs first (stable, deduped), then filter matches not already listed.
     selected = list(dict.fromkeys(body.work_ticket_idxs))

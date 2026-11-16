@@ -18,7 +18,8 @@ from qiita_common.api_paths import URL_WORK_TICKET_CANCEL
 from qiita_common.auth_constants import Scope, SystemRole
 from qiita_common.models import WorkTicketState
 
-from qiita_control_plane.ticket_redrive import ReapFailed, reset_ticket_to_pending
+from qiita_control_plane.ticket_redrive import ReapPending, reset_ticket_to_pending
+from qiita_control_plane.work_ticket_cancel import cancel_work_ticket
 
 pytestmark = pytest.mark.db
 
@@ -368,10 +369,10 @@ async def test_cancel_anonymous_401(ctx):
 
 async def _reap_mark(pool, idx):
     row = await pool.fetchrow(
-        "SELECT reap_failed_at, reap_failure FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+        "SELECT reap_pending_since, reap_note FROM qiita.work_ticket WHERE work_ticket_idx = $1",
         idx,
     )
-    return row["reap_failed_at"], row["reap_failure"]
+    return row["reap_pending_since"], row["reap_note"]
 
 
 @pytest.mark.parametrize("state", ["processing", "failed", "completed"])
@@ -384,8 +385,8 @@ async def test_a_failed_reap_is_recorded_and_a_later_reap_clears_it(ctx, state):
     async with _client() as c:
         resp = await c.post(URL_WORK_TICKET_CANCEL, json={"work_ticket_idxs": [idx]}, headers=h)
         assert resp.status_code == 200, resp.text
-        failed_at, failure = await _reap_mark(ctx["pool"], idx)
-        assert failed_at is not None
+        pending_since, failure = await _reap_mark(ctx["pool"], idx)
+        assert pending_since is not None
         assert failure == "RuntimeError: orchestrator unreachable"
 
         ctx["backend"].raise_on = None
@@ -437,16 +438,39 @@ async def test_a_redrive_during_the_reap_is_refused(ctx, fail):
         )
         await asyncio.wait_for(backend.reaping.wait(), timeout=10)
         assert await _state(ctx["pool"], idx) == "cancelled"
-        with pytest.raises(ReapFailed):
+        with pytest.raises(ReapPending, match="has not finished") as refused:
             await _redrive(ctx["pool"], idx)
+        assert "failed" not in str(refused.value)
         backend.release.set()
         assert (await cancel).status_code == 200
     if fail:
-        with pytest.raises(ReapFailed):
+        with pytest.raises(ReapPending, match="failed: RuntimeError: orchestrator unreachable"):
             await _redrive(ctx["pool"], idx)
     else:
         assert await _reap_mark(ctx["pool"], idx) == (None, None)
         assert await _redrive(ctx["pool"], idx) is True
+
+
+async def test_an_earlier_cancels_clean_reap_leaves_a_later_cancels_mark(ctx):
+    """Two cancels of one ticket overlap: A's reap finishing cleanly does not clear B's
+    mark while B's reap still runs, so a redrive stays refused until B's reap ends."""
+    idx = await ctx["seed_ticket"]("processing")
+    first = _BlockingBackendClient(fail=False)
+    second = _BlockingBackendClient(fail=False)
+    a = asyncio.create_task(cancel_work_ticket(ctx["pool"], first, idx))
+    await asyncio.wait_for(first.reaping.wait(), timeout=10)
+    b = asyncio.create_task(cancel_work_ticket(ctx["pool"], second, idx))
+    await asyncio.wait_for(second.reaping.wait(), timeout=10)
+
+    first.release.set()
+    assert (await a)["reap_error"] is None
+    with pytest.raises(ReapPending, match="has not finished"):
+        await _redrive(ctx["pool"], idx)
+
+    second.release.set()
+    assert (await b)["reap_error"] is None
+    assert await _reap_mark(ctx["pool"], idx) == (None, None)
+    assert await _redrive(ctx["pool"], idx) is True
 
 
 async def test_a_cancel_whose_reap_succeeds_leaves_no_mark(ctx):

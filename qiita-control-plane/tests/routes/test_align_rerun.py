@@ -545,17 +545,17 @@ async def test_rerun_waits_for_an_unfinished_feature_table(client, rr, dispatche
     assert resp.json()["detail"]["work_ticket_idx"] == [ft]
 
 
-async def test_rerun_refuses_a_ticket_whose_cancel_reap_failed(client, rr, dispatched):
+async def test_rerun_refuses_a_ticket_whose_cancel_reap_is_pending(client, rr, dispatched):
     a = rr.samples[0]
     block, wt = await rr.make_block([(a, 1, 100)])
     await rr.full_steps(wt)
     await rr.set_gate(a, "completed")
     await rr.pool.execute(
-        "UPDATE qiita.work_ticket SET reap_failed_at = now(), reap_failure = 'boom'"
+        "UPDATE qiita.work_ticket SET reap_pending_since = now(), reap_note = 'boom'"
         " WHERE work_ticket_idx = $1",
         wt,
     )
-    resp = await _assert_refused(client, rr, wt, block, "reap_failed")
+    resp = await _assert_refused(client, rr, wt, block, "reap_pending")
     assert f"qiita-admin ticket cancel {wt}" in resp.json()["detail"]["detail"]
     assert dispatched == []
 

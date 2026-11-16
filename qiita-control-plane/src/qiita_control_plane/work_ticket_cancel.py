@@ -53,12 +53,11 @@ CANCELLABLE_WORK_TICKET_STATES: tuple[str, ...] = (
 )
 
 
-# The reap mark a cancel writes in its flip transaction, before the scancel: a redrive
-# that lands between the flip's commit and the reap's outcome is refused
-# (`ticket_redrive.ReapFailed`) rather than racing a job the reap has yet to reach. The
-# reap's outcome replaces it; a cancel interrupted mid-reap leaves it, and the next
-# cancel's reap clears it.
-REAP_IN_FLIGHT = "the reap had not finished (in progress, or interrupted)"
+# The `reap_note` a cancel writes in its flip transaction, before the scancel: a
+# redrive that lands between the flip's commit and the reap's outcome is refused
+# (`ticket_redrive.ReapPending`) rather than racing a job the reap has yet to reach.
+# The column semantics are on `work_ticket.reap_pending_since` (its migration).
+REAP_IN_FLIGHT = "the reap has not finished (in progress, or interrupted)"
 
 
 class WorkTicketNotFound(Exception):
@@ -86,14 +85,17 @@ async def cancel_work_ticket(
       * `cancelled_job_ids`— the SLURM job ids the reap scancelled (may be [])
       * `reap_error`       — a message iff the scancel failed AFTER the flip (the flip
                              stands; the operator can re-run cancel to retry the reap).
-                             Also recorded on the ticket (`reap_failed_at`,
-                             `reap_failure`), where it blocks a redrive until a later
+                             Also recorded on the ticket (`reap_pending_since`,
+                             `reap_note`), where it blocks a redrive until a later
                              cancel reaps without error and clears it.
 
     Raises `WorkTicketNotFound` if the idx does not exist. The flip is a single
     `FOR UPDATE` transaction so a concurrent CP write can't interleave a half-state;
-    it also writes the in-flight reap mark (`REAP_IN_FLIGHT`). The scancel runs only
-    after that transaction commits (terminal-first)."""
+    it also writes this cancel's reap mark (`REAP_IN_FLIGHT`, stamped with
+    `clock_timestamp()`, so two cancels' marks differ even within one transaction's
+    clock). The scancel runs only after that transaction commits (terminal-first), and
+    the reap's outcome is written only while the mark is still this cancel's: a later
+    concurrent cancel's mark is left for its own reap to settle."""
     async with pool.acquire() as conn, conn.transaction():
         row = await conn.fetchrow(
             "SELECT state, failure_type, failure_stage, failure_step_name, failure_reason"
@@ -104,9 +106,11 @@ async def cancel_work_ticket(
             raise WorkTicketNotFound(work_ticket_idx)
         previous_state = row["state"]
         flipped = previous_state in CANCELLABLE_WORK_TICKET_STATES
-        await conn.execute(
-            "UPDATE qiita.work_ticket SET reap_failed_at = now(), reap_failure = $2"
-            " WHERE work_ticket_idx = $1",
+        marked_at = await conn.fetchval(
+            "UPDATE qiita.work_ticket"
+            " SET reap_pending_since = clock_timestamp(), reap_note = $2"
+            " WHERE work_ticket_idx = $1"
+            " RETURNING reap_pending_since",
             work_ticket_idx,
             REAP_IN_FLIGHT,
         )
@@ -146,16 +150,19 @@ async def cancel_work_ticket(
         cancelled_job_ids = await backend_client.cancel(work_ticket_idx)
     except Exception as exc:  # noqa: BLE001 — record any reap failure, don't lose the flip
         reap_error = f"{type(exc).__name__}: {exc}"
-    # The reap's outcome replaces the in-flight mark: a failure stays on the ticket, so
-    # a redrive refuses it until a reap succeeds (`ticket_redrive.ReapFailed`); a reap
-    # without error clears it.
+    # The reap's outcome replaces this cancel's mark: a failure keeps it with the error,
+    # so a redrive refuses it until a reap succeeds (`ticket_redrive.ReapPending`); a
+    # reap without error clears it. Guarded on the mark, so it does nothing once a later
+    # cancel has written its own.
     await pool.execute(
         "UPDATE qiita.work_ticket"
-        " SET reap_failed_at = CASE WHEN $2::text IS NULL THEN NULL ELSE now() END,"
-        "     reap_failure = $2::text"
-        " WHERE work_ticket_idx = $1",
+        " SET reap_pending_since = CASE WHEN $2::text IS NULL THEN NULL"
+        "                               ELSE reap_pending_since END,"
+        "     reap_note = $2::text"
+        " WHERE work_ticket_idx = $1 AND reap_pending_since = $3",
         work_ticket_idx,
         reap_error,
+        marked_at,
     )
 
     return {

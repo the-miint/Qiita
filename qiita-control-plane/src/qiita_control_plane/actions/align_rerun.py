@@ -70,7 +70,7 @@ from ..repositories.block import (
 )
 from ..repositories.mask_definition import MaskDefinitionNotFound, lock_mask
 from ..step_progress import StepProgressMismatch, check_step_progress, load_step_progress
-from ..ticket_redrive import ReapFailed, drop_dead_step_rows, reset_ticket_to_pending
+from ..ticket_redrive import ReapPending, drop_dead_step_rows, reset_ticket_to_pending
 from ..workspace import step_attempt_dir, ticket_workspace
 from .library import delete_alignment_sample_data
 
@@ -441,7 +441,7 @@ async def _rearm(
         reset = await reset_ticket_to_pending(
             conn, work_ticket_idx=work_ticket_idx, from_state=state
         )
-    except ReapFailed as exc:
+    except ReapPending as exc:
         raise _refuse(exc.REASON, str(exc)) from exc
     if not reset:
         raise _refuse("state_changed", f"work_ticket {work_ticket_idx} changed state; retry")

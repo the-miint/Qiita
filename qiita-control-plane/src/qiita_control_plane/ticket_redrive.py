@@ -10,23 +10,32 @@ import asyncpg
 from qiita_common.models import StepProgressState, WorkTicketState
 
 from .repositories import require_transaction
+from .work_ticket_cancel import REAP_IN_FLIGHT
 
 
-class ReapFailed(Exception):
-    """A cancel's reap of the ticket's SLURM jobs failed and no later cancel has reaped
-    it (`work_ticket.reap_failed_at`). A job the failed reap missed may still be
-    running under the ticket, so it is not redriven until a cancel reaps without
-    error."""
+class ReapPending(Exception):
+    """A cancel's reap of the ticket's SLURM jobs has not succeeded: it is running, was
+    interrupted, or failed (`work_ticket.reap_pending_since`, `reap_note`). A job it has
+    not reached may still be running under the ticket, so the ticket is not redriven
+    until a cancel reaps without error."""
 
     # The `reason` code of the 409 every redrive route answers it with.
-    REASON = "reap_failed"
+    REASON = "reap_pending"
 
-    def __init__(self, work_ticket_idx: int, failed_at: object, failure: str) -> None:
+    def __init__(self, work_ticket_idx: int, pending_since: object, note: str) -> None:
         self.work_ticket_idx = work_ticket_idx
+        if note == REAP_IN_FLIGHT:
+            what = (
+                f"the reap of its SLURM jobs by a cancel started at {pending_since} has not"
+                " finished: it is running, or the cancel was interrupted"
+            )
+        else:
+            what = (
+                f"the reap of its SLURM jobs by a cancel started at {pending_since} failed: {note}"
+            )
         super().__init__(
-            f"work_ticket {work_ticket_idx}: the reap of its SLURM jobs after a cancel"
-            f" failed at {failed_at}: {failure}. It is not redriven until a reap succeeds;"
-            f" retry the reap with `qiita-admin ticket cancel {work_ticket_idx}`"
+            f"work_ticket {work_ticket_idx}: {what}. It is not redriven until a reap"
+            f" succeeds; reap it with `qiita-admin ticket cancel {work_ticket_idx}`"
             f" (POST /work-ticket/cancel with work_ticket_idxs [{work_ticket_idx}])"
         )
 
@@ -36,8 +45,9 @@ async def reset_ticket_to_pending(
 ) -> bool:
     """Set the ticket PENDING and clear what its last outcome left on it. Guarded on
     `from_state`, so a ticket that changed state since the caller read it is left
-    alone: returns False then, True when the row was updated. Raises `ReapFailed`
-    while the ticket carries a failed reap, so every redrive path refuses it."""
+    alone: returns False then, True when the row was updated. Raises `ReapPending`
+    `ReapPending` while a cancel's reap of the ticket has not succeeded, so every
+    redrive path refuses it."""
     require_transaction(conn)
     updated = await conn.fetchval(
         "UPDATE qiita.work_ticket"
@@ -57,7 +67,7 @@ async def reset_ticket_to_pending(
         "     dispatch_held = false"
         " WHERE work_ticket_idx = $2"
         "   AND state = $3::qiita.work_ticket_state"
-        "   AND reap_failed_at IS NULL"
+        "   AND reap_pending_since IS NULL"
         " RETURNING work_ticket_idx",
         WorkTicketState.PENDING.value,
         work_ticket_idx,
@@ -67,11 +77,11 @@ async def reset_ticket_to_pending(
         return True
     # Read only on refusal, so a redrive that goes through runs one statement here.
     reap = await conn.fetchrow(
-        "SELECT reap_failed_at, reap_failure FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+        "SELECT reap_pending_since, reap_note FROM qiita.work_ticket WHERE work_ticket_idx = $1",
         work_ticket_idx,
     )
-    if reap is not None and reap["reap_failed_at"] is not None:
-        raise ReapFailed(work_ticket_idx, reap["reap_failed_at"], reap["reap_failure"])
+    if reap is not None and reap["reap_pending_since"] is not None:
+        raise ReapPending(work_ticket_idx, reap["reap_pending_since"], reap["reap_note"])
     return False
 
 
