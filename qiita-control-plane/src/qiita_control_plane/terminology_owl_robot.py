@@ -11,8 +11,8 @@ from __future__ import annotations
 from collections.abc import Sequence
 from pathlib import Path
 
+from .delimited_text import read_tsv
 from .terminology import (
-    read_tsv,
     stripped_cell,
     stripped_key,
 )

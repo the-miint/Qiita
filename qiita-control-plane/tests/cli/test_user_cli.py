@@ -60,6 +60,8 @@ from run_preflight.db import (
 from qiita_control_plane.cli.user import _read_preflight_rows, main
 from qiita_control_plane.preflight import SampleRefs
 
+from .conftest import _stub_post
+
 _BASE = "https://q.example.test"
 _ILLUMINA_CSV = Path(__file__).resolve().parent / "data" / "good_standard_metagv100.csv"
 
@@ -701,69 +703,6 @@ def test_profile_set_pydantic_validation_error_exits_2(capsys):
     err = capsys.readouterr().err
     assert "invalid UserUpdate" in err
     assert "orcid" in err
-
-
-# ---------------------------------------------------------------------------
-# Shared request-stub helper (used by every HTTP subcommand test below)
-# ---------------------------------------------------------------------------
-
-
-def _stub_post(
-    monkeypatch,
-    captured: dict,
-    *,
-    response_json: dict,
-    status: int = 201,
-    whoami_idx: int | None = None,
-    response_headers: dict | None = None,
-):
-    """Patch `_common.httpx.request` to capture every call and return canned
-    responses. Each call appends to `captured['requests']` (full list); the
-    last call's fields also land flat on `captured` (method/url/json/auth)
-    so single-call tests can assert on `captured['url']` etc. without
-    indexing.
-
-    When `whoami_idx` is supplied, a GET to `/auth/whoami` returns
-    `{"kind": "human", "principal_idx": whoami_idx}` (used by handlers
-    that auto-default --owner-idx). Every other request returns
-    `response_json` with HTTP `status`.
-    """
-    import httpx as _httpx
-
-    from qiita_control_plane.cli import _common
-
-    captured.setdefault("requests", [])
-
-    def fake_request(method, url, headers=None, json=None, params=None, timeout=None):
-        record = {
-            "method": method,
-            "url": url,
-            "auth": headers["Authorization"],
-            "json": json,
-            "params": params,
-        }
-        captured["requests"].append(record)
-        # Flat-shape mirror — last-wins so single-POST tests read the POST,
-        # whoami-then-POST tests still see the POST as the "current" record.
-        captured.update(record)
-        if url.endswith("/auth/whoami"):
-            assert whoami_idx is not None, (
-                "test triggered whoami without supplying whoami_idx in the stub"
-            )
-            return _httpx.Response(
-                200,
-                json={"kind": "human", "principal_idx": whoami_idx},
-                request=_httpx.Request(method, url),
-            )
-        return _httpx.Response(
-            status,
-            json=response_json,
-            headers=response_headers,
-            request=_httpx.Request(method, url),
-        )
-
-    monkeypatch.setattr(_common.httpx, "request", fake_request)
-    monkeypatch.setenv("QIITA_TOKEN", "qk_test")
 
 
 def _run(monkeypatch, argv, *, response_json, status=200) -> dict:

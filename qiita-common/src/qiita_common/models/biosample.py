@@ -53,6 +53,15 @@ MATRIX_TUBE_ID_PATTERN = (
 MatrixTubeIdText = Annotated[str, Field(pattern=MATRIX_TUBE_ID_PATTERN)]
 _MATRIX_TUBE_ID_LIST_ADAPTER = TypeAdapter(list[MatrixTubeIdText])
 
+# The qiita.biosample columns a caller may set directly, named as
+# BiosampleImportRequest names them; every other sample value is metadata.
+BIOSAMPLE_ATTRIBUTE_FIELDS = (
+    "biosample_accession",
+    "ena_sample_accession",
+    "matrix_tube_id",
+    "metadata_checklist_name",
+)
+
 # The wire spellings of the idx fields the biosample field shapes re-declare
 # with an entity-qualified alias. Named so a caller writing or reading one of
 # those payload keys resolves it here instead of retyping it.

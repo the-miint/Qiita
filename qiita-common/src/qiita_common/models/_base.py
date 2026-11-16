@@ -8,6 +8,7 @@ import cycle. No submodule imports back from `models/__init__`.
 """
 
 import re
+from collections.abc import Iterable
 from enum import StrEnum
 from typing import Annotated, Any, ClassVar, Literal
 
@@ -64,6 +65,15 @@ def _strip_text(value: Any) -> Any:
     type check still owns the type error.
     """
     return value.strip() if isinstance(value, str) else value
+
+
+def names_colliding_on_strip(names: Iterable[str]) -> list[str]:
+    """Return, sorted, the stripped forms shared by two or more of `names`."""
+    names_by_stripped: dict[str, list[str]] = {}
+    for name in names:
+        names_by_stripped.setdefault(name.strip(), []).append(name)
+    collisions = sorted(stripped for stripped, raw in names_by_stripped.items() if len(raw) > 1)
+    return collisions
 
 
 def _reject_nul(value: str) -> str:
@@ -412,15 +422,8 @@ class MetadataRequestModel(BaseModel):
         metadata = data.get("metadata")
         if not isinstance(metadata, dict):
             return data
-        # Group the raw keys by the form each will carry once stripped; a
-        # stripped form claimed by more than one raw key is ambiguous.
-        raw_keys_by_stripped: dict[str, list[str]] = {}
-        for raw_key in metadata:
-            if isinstance(raw_key, str):
-                raw_keys_by_stripped.setdefault(raw_key.strip(), []).append(raw_key)
-        collisions = sorted(
-            stripped for stripped, raw_keys in raw_keys_by_stripped.items() if len(raw_keys) > 1
-        )
+        # A stripped form claimed by more than one raw key is ambiguous.
+        collisions = names_colliding_on_strip(key for key in metadata if isinstance(key, str))
         if collisions:
             raise ValueError(
                 "metadata keys differing only in surrounding whitespace:"

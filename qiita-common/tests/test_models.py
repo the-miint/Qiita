@@ -1832,3 +1832,34 @@ def test_biosample_lookup_request_strips_padded_tube_ids():
     )
     expected = BiosampleLookupRequest(key="matrix_tube_id", values=["0123456789", "0123456780"])
     assert request == expected
+
+
+@pytest.mark.parametrize(
+    ("names", "expected"),
+    [
+        (["a", "b"], []),
+        (["a", " a", "b", "b "], ["a", "b"]),
+        (["a", "a"], ["a"]),
+    ],
+    ids=["distinct", "padding", "exact-repeat"],
+)
+def test_names_colliding_on_strip(names, expected):
+    """Tests the case where names are distinct, differ only in padding, or
+    repeat exactly: each stripped form claimed more than once is returned,
+    sorted."""
+    assert models_module.names_colliding_on_strip(names) == expected
+
+
+def test_biosample_attribute_fields_are_import_request_fields():
+    """Tests the case where the model's fields are compared with the constant:
+    every field the caller may set directly is in the constant, and nothing
+    else is."""
+    non_attribute_fields = {
+        "owner_idx",
+        "owner_biosample_id_field_name",
+        "owner_biosample_id_value",
+        "metadata",
+        "global_internal_names",
+    }
+    attribute_fields = set(models_module.BiosampleImportRequest.model_fields) - non_attribute_fields
+    assert set(models_module.BIOSAMPLE_ATTRIBUTE_FIELDS) == attribute_fields
