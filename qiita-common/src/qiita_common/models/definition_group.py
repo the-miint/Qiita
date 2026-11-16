@@ -41,6 +41,7 @@ class SampleResolutionReason(StrEnum):
     UPSTREAM_DEPRECATED = "upstream_deprecated"
     UPSTREAM_WITHDRAWN = "upstream_withdrawn"
     UPSTREAM_NO_RUN = "upstream_no_run"
+    NO_DATA = "no_data"
 
 
 class DefinitionGroupRefusal(StrEnum):

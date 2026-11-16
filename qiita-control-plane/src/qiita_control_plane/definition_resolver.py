@@ -17,7 +17,10 @@ produce it:
 **Which member.** Of the anchor's group (`Groups.group_of`), the highest-id member
 under which the prep_sample has a gate `completed`, `no_data` (assembly) or
 `invalidated`, or an unfinished ticket. A `pending` gate with no unfinished ticket
-(its tickets were cancelled) is not a run. No member → `not_processed` / `no_run`.
+(its tickets were cancelled) is not a run. A de novo alignment with none of these
+whose assembly (its `processing_idx`) has gate `no_data` for the prep_sample, and no
+unfinished ticket, is a candidate too: the assembly produced no contigs, so there is
+nothing to align. No member → `not_processed` / `no_run`.
 
 **That member's state**, first match wins:
   1. an unfinished ticket → `incomplete`: `in_progress` when one is waiting or
@@ -34,7 +37,8 @@ under which the prep_sample has a gate `completed`, `no_data` (assembly) or
        - incomplete → `incomplete` / `upstream_incomplete`;
        - not processed → `not_processed` / `upstream_withdrawn`,
          `upstream_deprecated` or `upstream_no_run`.
-  6. otherwise `processed`.
+  6. otherwise `processed`, or, for a de novo alignment chosen because its assembly
+     produced no contigs, `not_processed` / `no_data`: there is nothing to read.
 A not-processed member is not replaced by an older one.
 
 **Public API**:
@@ -280,6 +284,24 @@ def _has_run(kind: DefinitionKind, obs: RunObservation) -> bool:
     return bool(obs.unfinished) or _gate_role(kind, obs.gate) is not _GateRole.NONE
 
 
+def _assembled_nothing(
+    groups: Groups,
+    kind: DefinitionKind,
+    idx: int,
+    prep_sample_idx: int,
+    observations: Observations,
+) -> bool:
+    """True for a de novo alignment whose assembly has gate `no_data` and no unfinished
+    ticket for the prep_sample."""
+    if kind is not DefinitionKind.ALIGNMENT:
+        return False
+    for up_kind, up_idx in upstreams(groups, kind, idx):
+        if up_kind is DefinitionKind.PROCESSING:
+            obs = observations.get(up_kind, {}).get((up_idx, prep_sample_idx))
+            return obs is not None and obs.gate == ASSEMBLY_SAMPLE_NO_DATA and not obs.unfinished
+    return False
+
+
 def _resolution(
     kind: DefinitionKind,
     prep_sample_idx: int,
@@ -321,18 +343,20 @@ def resolve_sample(
     no gate row and no ticket."""
     kind_obs = observations.get(kind, {})
     empty = RunObservation()
-    with_run = [
-        m
-        for m in groups.group_of(kind, definition_idx)
-        if _has_run(kind, kind_obs.get((m, prep_sample_idx), empty))
-    ]
+    with_run: list[int] = []
+    nothing_to_align: list[int] = []
+    for m in groups.group_of(kind, definition_idx):
+        if _has_run(kind, kind_obs.get((m, prep_sample_idx), empty)):
+            with_run.append(m)
+        elif _assembled_nothing(groups, kind, m, prep_sample_idx, observations):
+            nothing_to_align.append(m)
 
     def result(state, **kw) -> SampleResolution:
         return _resolution(kind, prep_sample_idx, state, groups=groups, **kw)
 
-    if not with_run:
+    if not with_run and not nothing_to_align:
         return result(SampleResolutionState.NOT_PROCESSED, reason=SampleResolutionReason.NO_RUN)
-    member = max(with_run)
+    member = max(with_run + nothing_to_align)
     obs = kind_obs.get((member, prep_sample_idx), empty)
 
     if obs.unfinished:
@@ -391,6 +415,12 @@ def resolve_sample(
             definition_idx=member,
             reason=_UPSTREAM_NOT_PROCESSED[up.reason],
             upstream=(up_kind, up.definition_idx if up.definition_idx is not None else up_idx),
+        )
+    if member in nothing_to_align:
+        return result(
+            SampleResolutionState.NOT_PROCESSED,
+            definition_idx=member,
+            reason=SampleResolutionReason.NO_DATA,
         )
     return result(SampleResolutionState.PROCESSED, definition_idx=member)
 

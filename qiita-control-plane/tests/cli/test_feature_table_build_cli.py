@@ -2264,12 +2264,20 @@ def test_an_incomplete_de_novo_sample_stops_the_build(monkeypatch, tmp_path, cap
     assert "prep_sample 2: incomplete (failed), alignment 14" in err
 
 
-def test_a_sample_with_no_de_novo_run_is_reference_only(monkeypatch, tmp_path, capsys):
+@pytest.mark.parametrize(
+    "entry",
+    [
+        {"state": "not_processed", "reason": "no_run"},
+        {"state": "not_processed", "reason": "no_data", "definition_idx": 14},
+    ],
+    ids=["no-run", "assembled-nothing"],
+)
+def test_a_sample_with_no_de_novo_run_is_reference_only(monkeypatch, tmp_path, capsys, entry):
     rec = _patched_two_pools(
         monkeypatch,
         resolve={
             **_TWO_POOL_DENOVO_RESOLVE,
-            "unprocessed": {("alignment", 4): {2: {"state": "not_processed", "reason": "no_run"}}},
+            "unprocessed": {("alignment", 4): {2: entry}},
         },
     )
     args = _two_pool_args(tmp_path, prep_sample_idx=[1, 2], denovo_alignment_idx=4)

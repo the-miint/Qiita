@@ -1441,6 +1441,10 @@ def _parts(
     return parts
 
 
+# The de novo resolutions that leave a prep_sample reference-only (see `_plan_denovo`).
+_NO_DENOVO_ARM = frozenset({SampleResolutionReason.NO_RUN, SampleResolutionReason.NO_DATA})
+
+
 def _plan_denovo(
     base_url: str,
     token: str,
@@ -1454,9 +1458,9 @@ def _plan_denovo(
     """The de novo arm's parts: each cohort prep_sample's de novo alignment, resolved in
     `--denovo-alignment-idx`'s group, grouped by alignment in `alignment_idx` order.
 
-    A prep_sample with no run in that group (`not_processed` / `no_run`) has no de novo arm
-    and stays reference-only, as a prep_sample whose assembly produced no contigs does. Any
-    other unprocessed state is refused (`_refuse_unprocessed`).
+    A prep_sample with no run in that group (`not_processed` / `no_run`), or whose assembly
+    produced no contigs (`not_processed` / `no_data`), has no de novo arm and stays
+    reference-only. Any other unprocessed state is refused (`_refuse_unprocessed`).
 
     Each de novo alignment is checked against the reference part of every prep_sample that
     resolved to it, and the named one against `--alignment-idx`, by
@@ -1479,7 +1483,7 @@ def _plan_denovo(
     for entry in resolution.samples:
         if entry.state is SampleResolutionState.PROCESSED:
             resolved[entry.prep_sample_idx] = entry.definition_idx
-        elif entry.reason is not SampleResolutionReason.NO_RUN:
+        elif entry.reason not in _NO_DENOVO_ARM:
             refused.append(entry)
 
     mask_groups: dict[int, frozenset[int]] = {}

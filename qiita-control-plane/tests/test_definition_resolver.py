@@ -427,6 +427,58 @@ def test_a_denovo_alignment_whose_assembly_is_rerunning_is_upstream_incomplete()
     assert (r.state, r.reason, r.work_ticket_idx) == (INCOMPLETE, R.UPSTREAM_INCOMPLETE, 44)
 
 
+def _remasked_world(p2_gate):
+    """Masks 5 < 12 decided similar, so assemblies 30 (on 5) and 31 (on 12) and de novo
+    alignments 60 (on 30) and 61 (on 31) group by derivation. The prep_sample was
+    assembled and aligned under mask 5, then re-masked under 12 and assembled again
+    (31, gate `p2_gate`); 61 has no run for it."""
+    defs = [mask(5), mask(12), assembly(30, 5), assembly(31, 12), denovo(60, 5, 30)]
+    defs.append(denovo(61, 12, 31))
+    pairs = [similar(defs, MASK, 5, 12)]
+    obs = {
+        MASK: {(5, S): done(), (12, S): done()},
+        PROCESSING: {(30, S): done(), (31, S): gate(p2_gate)},
+        ALIGNMENT: {(60, S): done()},
+    }
+    return defs, pairs, obs
+
+
+def test_a_denovo_alignment_whose_assembly_produced_no_contigs_has_nothing_to_read():
+    """Align-denovo ends NO_DATA without a gate row when its assembly is empty, so 61
+    has no run; it is still the member that the prep_sample resolves to, with nothing
+    to read, rather than 60 with its mask moved."""
+    defs, pairs, obs = _remasked_world(ASSEMBLY_SAMPLE_NO_DATA)
+    for anchor in (60, 61):
+        r = resolve(defs, pairs, ALIGNMENT, anchor, obs)
+        assert (r.state, r.reason, r.definition_idx, r.mask_idx) == (
+            NOT_PROCESSED,
+            R.NO_DATA,
+            61,
+            12,
+        )
+        assert cohort_refusal(r, 61) is DefinitionGroupRefusal.NOT_PROCESSED
+
+
+def test_a_denovo_alignment_whose_assembly_has_contigs_and_no_run_still_needs_one():
+    """The same world with contigs under 31: 61 has yet to be aligned, so the prep_sample
+    reads as 60 with its mask moved, as before."""
+    defs, pairs, obs = _remasked_world(ASSEMBLY_SAMPLE_COMPLETED)
+    r = resolve(defs, pairs, ALIGNMENT, 60, obs)
+    assert (r.state, r.reason, r.definition_idx, r.upstream_definition_idx) == (
+        INCOMPLETE,
+        R.UPSTREAM_MOVED,
+        60,
+        12,
+    )
+
+
+def test_an_empty_assembly_that_is_rerunning_is_not_nothing_to_read():
+    defs, pairs, obs = _remasked_world(ASSEMBLY_SAMPLE_NO_DATA)
+    obs[PROCESSING][(31, S)] = gate(ASSEMBLY_SAMPLE_NO_DATA, (44, WorkTicketState.PROCESSING))
+    r = resolve(defs, pairs, ALIGNMENT, 60, obs)
+    assert (r.state, r.reason, r.definition_idx) == (INCOMPLETE, R.UPSTREAM_MOVED, 60)
+
+
 def test_needed_definitions_follows_upstream_groups():
     defs = [*DEFS, assembly(30, 5), denovo(60, 5, 30)]
     groups = compute_groups(defs, PAIRS)
