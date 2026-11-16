@@ -287,13 +287,18 @@ async def run_workflow(
                 reason=str(exc),
             ) from exc
 
-        # A definition this ticket records whose settings were edited after the
-        # ticket was created: an earlier attempt ran (and its completed steps, gates
-        # and outputs are keyed) under the earlier settings, so the ticket is failed
-        # rather than resumed under the edited ones. A settings edit is refused while
-        # the ticket is unfinished (`definition_settings`), so this is reached by a
-        # redrive of a failed or cancelled ticket.
-        edit = await fetch_settings_edit_since_ticket(pool, work_ticket_idx)
+        # A dispatch that keeps step rows from an earlier attempt reuses that
+        # attempt's work: a completed row is fast-forwarded, a submitted one is
+        # re-attached to its live job. When a definition the ticket records had its
+        # settings edited after the ticket was created, that work was done under the
+        # earlier settings and the remaining steps would run under the edited ones, so
+        # the ticket is failed instead. A dispatch with no step row (a first run, or a
+        # rerun-block re-arm, which deletes every step row) runs wholly under the
+        # current settings and is not refused. A settings edit is refused
+        # while the ticket is unfinished (`definition_settings`), so this is reached
+        # by a redrive of a failed or cancelled ticket. `_mint_processing_idx` also
+        # refuses a processing ticket whose params now resolve to another row.
+        edit = await fetch_settings_edit_since_ticket(pool, work_ticket_idx) if progress else None
         if edit is not None:
             raise _submission_bad_input(
                 f"work ticket {work_ticket_idx} records {edit['definition_kind']}"

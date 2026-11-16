@@ -148,9 +148,11 @@
   its pending and not_similar pairs. The mask adapter-hash re-key (the mint's legacy
   path and `qiita-admin backfill mask-adapter-hash`) passes and is recorded with no
   actor. A failed or cancelled ticket that records a definition edited after the
-  ticket was created can no longer be redriven: its resume fails it as bad submission
-  input before any step, since its earlier attempt ran under the earlier settings;
-  submit a new ticket.
+  ticket was created, and whose redrive keeps step rows from an earlier attempt,
+  fails as bad submission input before any step, since that work ran under the
+  earlier settings; submit a new ticket. A dispatch with no step row (a rerun-block
+  re-arm, which deletes them) runs under the current settings. A mask adapter-hash
+  re-key does not count as an edit here.
 - **A hand `DELETE` of a mask, alignment or processing is refused (SQLSTATE 55006)
   while a `similar` pair names it (#874);** revoke the pair first. A `pending` or
   `not_similar` pair is detached by the delete. No route deletes these

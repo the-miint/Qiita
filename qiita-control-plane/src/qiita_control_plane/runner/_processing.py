@@ -152,10 +152,13 @@ async def _mint_processing_idx(
     ticket is never recorded under settings it did not hash.
 
     A redrive resumes a ticket keeping its completed steps' outputs and its assembly
-    gate row, both keyed on the processing it recorded on its first attempt. When that
-    processing's settings were edited since, the mint resolves to another row; the
-    ticket is then failed as bad submission input rather than re-recorded, so no run
-    mixes outputs of two processings. A new ticket is recorded under the processing
+    gate row, both keyed on the processing it recorded on its first attempt. When the
+    mint now resolves to another row, the ticket is failed as bad submission input
+    rather than re-recorded, so no run mixes outputs of two processings. Two causes
+    reach it: the recorded processing's settings were edited (which `run_workflow`
+    refuses first when earlier step rows would be reused), or the ticket's params now
+    build differently, e.g. a changed `assembler_default` filling an omitted
+    assembler. A new ticket is recorded under the processing
     minted for its own params; the edited row keeps the edited settings. The recorded
     idx is read without a row lock: the dispatch state guard keeps one ticket from
     running twice at once (`dispatch.py`)."""
@@ -175,8 +178,9 @@ async def _mint_processing_idx(
                 if recorded is not None and recorded != row["processing_idx"]:
                     raise _submission_bad_input(
                         f"work ticket {work_ticket_idx} first ran under processing"
-                        f" {recorded}, whose settings were edited since; its params now"
-                        f" resolve to processing {row['processing_idx']}. Its completed"
+                        f" {recorded}; its params now resolve to processing"
+                        f" {row['processing_idx']} (the first's settings were edited, or"
+                        " the params now build differently). Its completed"
                         " steps and assembly gate are keyed on the first, so it cannot"
                         " resume; submit a new ticket, which is recorded under the"
                         " processing minted for its own params"
