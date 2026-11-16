@@ -545,6 +545,21 @@ async def test_rerun_waits_for_an_unfinished_feature_table(client, rr, dispatche
     assert resp.json()["detail"]["work_ticket_idx"] == [ft]
 
 
+async def test_rerun_refuses_a_ticket_whose_cancel_reap_failed(client, rr, dispatched):
+    a = rr.samples[0]
+    block, wt = await rr.make_block([(a, 1, 100)])
+    await rr.full_steps(wt)
+    await rr.set_gate(a, "completed")
+    await rr.pool.execute(
+        "UPDATE qiita.work_ticket SET reap_failed_at = now(), reap_failure = 'boom'"
+        " WHERE work_ticket_idx = $1",
+        wt,
+    )
+    resp = await _assert_refused(client, rr, wt, block, "reap_failed")
+    assert f"qiita-admin ticket cancel {wt}" in resp.json()["detail"]["detail"]
+    assert dispatched == []
+
+
 @pytest.mark.parametrize("count", [0, 2])
 async def test_rerun_needs_exactly_one_completed_producing_row(client, rr, dispatched, count):
     a = rr.samples[0]

@@ -2487,6 +2487,52 @@ async def test_run_on_cancelled_resets_to_pending(
     assert row["retry_count"] == 0
 
 
+async def test_run_is_refused_while_a_cancels_reap_failed_and_allowed_once_cleared(
+    wt_client, postgres_pool, admin_token, reference_action, reference_idx
+):
+    """A cancelled ticket whose reap failed may still have a job running under it:
+    /run is refused, naming the failure and the retry, until a reap clears the mark."""
+    token, admin_idx = admin_token
+    action_id, version = reference_action
+    idx = await postgres_pool.fetchval(
+        "INSERT INTO qiita.work_ticket"
+        " (action_id, action_version, originator_principal_idx,"
+        "  scope_target_kind, reference_idx, state, reap_failed_at, reap_failure)"
+        " VALUES ($1, $2, $3, 'reference', $4, $5::qiita.work_ticket_state, now(),"
+        "         'RuntimeError: orchestrator unreachable')"
+        " RETURNING work_ticket_idx",
+        action_id,
+        version,
+        admin_idx,
+        reference_idx,
+        WorkTicketState.CANCELLED.value,
+    )
+    wt_client._created_tickets.append(idx)
+    url = URL_WORK_TICKET_RUN.format(work_ticket_idx=idx)
+    headers = {"Authorization": f"Bearer {token}"}
+
+    resp = await wt_client.post(url, headers=headers)
+    assert resp.status_code == 409, resp.text
+    detail = resp.json()["detail"]
+    assert detail["reason"] == "reap_failed"
+    assert "orchestrator unreachable" in detail["detail"]
+    assert f"qiita-admin ticket cancel {idx}" in detail["detail"]
+    assert (
+        await postgres_pool.fetchval(
+            "SELECT state FROM qiita.work_ticket WHERE work_ticket_idx = $1", idx
+        )
+        == WorkTicketState.CANCELLED.value
+    )
+
+    await postgres_pool.execute(
+        "UPDATE qiita.work_ticket SET reap_failed_at = NULL, reap_failure = NULL"
+        " WHERE work_ticket_idx = $1",
+        idx,
+    )
+    resp = await wt_client.post(url, headers=headers)
+    assert resp.status_code == 202, resp.text
+
+
 async def test_run_on_failed_resets_reference_scope_target_to_pending(
     wt_client, postgres_pool, admin_token, reference_action, reference_idx
 ):

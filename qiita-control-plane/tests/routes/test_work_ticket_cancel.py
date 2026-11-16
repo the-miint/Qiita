@@ -361,3 +361,44 @@ async def test_cancel_anonymous_401(ctx):
     async with _client() as c:
         resp = await c.post(URL_WORK_TICKET_CANCEL, json={"work_ticket_idxs": [idx]})
     assert resp.status_code == 401
+
+
+async def _reap_mark(pool, idx):
+    row = await pool.fetchrow(
+        "SELECT reap_failed_at, reap_failure FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+        idx,
+    )
+    return row["reap_failed_at"], row["reap_failure"]
+
+
+@pytest.mark.parametrize("state", ["processing", "failed", "completed"])
+async def test_a_failed_reap_is_recorded_and_a_later_reap_clears_it(ctx, state):
+    """Any cancel whose reap fails marks the ticket, whatever its state; re-running the
+    cancel is the retry, and a reap without error clears the mark."""
+    idx = await ctx["seed_ticket"](state)
+    ctx["backend"].raise_on = idx
+    h = {"Authorization": f"Bearer {ctx['admin_tok']}"}
+    async with _client() as c:
+        resp = await c.post(URL_WORK_TICKET_CANCEL, json={"work_ticket_idxs": [idx]}, headers=h)
+        assert resp.status_code == 200, resp.text
+        failed_at, failure = await _reap_mark(ctx["pool"], idx)
+        assert failed_at is not None
+        assert failure == "RuntimeError: orchestrator unreachable"
+
+        ctx["backend"].raise_on = None
+        resp = await c.post(URL_WORK_TICKET_CANCEL, json={"work_ticket_idxs": [idx]}, headers=h)
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["results"][0]["reap_error"] is None
+    assert await _reap_mark(ctx["pool"], idx) == (None, None)
+
+
+async def test_a_cancel_whose_reap_succeeds_leaves_no_mark(ctx):
+    idx = await ctx["seed_ticket"]("processing")
+    async with _client() as c:
+        resp = await c.post(
+            URL_WORK_TICKET_CANCEL,
+            json={"work_ticket_idxs": [idx]},
+            headers={"Authorization": f"Bearer {ctx['admin_tok']}"},
+        )
+    assert resp.status_code == 200, resp.text
+    assert await _reap_mark(ctx["pool"], idx) == (None, None)

@@ -213,7 +213,8 @@ def _build_parser() -> argparse.ArgumentParser:
             " stops driving them AND scancel their SLURM job(s), via the CP route"
             " (work_ticket:cancel scope). One ticket or a whole fan-out — no raw"
             " scancel across the compute account. Idempotent; redrive later with"
-            " `qiita ticket run`."
+            " `qiita ticket run`. A failed scancel blocks the redrive until this command,"
+            " run again on the ticket, reaps without error."
         ),
     )
     p_cancel.add_argument(

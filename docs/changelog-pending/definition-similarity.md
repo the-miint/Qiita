@@ -132,6 +132,12 @@
   filter still selects only pending, queued and processing tickets. A failed
   `download-ena-study` ticket with a live job, cancelled to reap the job, is now
   `cancelled`, and `/run` on it is admitted.
+- **A cancel whose reap of the SLURM jobs fails now blocks a redrive (#874).** The
+  failure was returned as `reap_error` and not kept; it is now recorded on the ticket
+  (`work_ticket.reap_failed_at`, `reap_failure`), for any cancel, whatever the
+  ticket's state. `/run` and `rerun-block` refuse the ticket (409, `reap_failed`,
+  naming the failure and the retry) until a later `qiita-admin ticket cancel <idx>`
+  reaps without error, which clears the record.
 - **The definition-group resolver ignores a stale failed ticket (#874):** one created
   before the last change of the prep_sample's gate under that definition, when the
   gate is `completed`, `no_data` or `invalidated`. Withdrawing a run, re-running it

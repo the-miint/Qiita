@@ -77,7 +77,10 @@ async def cancel_work_ticket(
                              in `CANCELLABLE_WORK_TICKET_STATES`)
       * `cancelled_job_ids`— the SLURM job ids the reap scancelled (may be [])
       * `reap_error`       — a message iff the scancel failed AFTER the flip (the flip
-                             stands; the operator can re-run cancel to retry the reap)
+                             stands; the operator can re-run cancel to retry the reap).
+                             Also recorded on the ticket (`reap_failed_at`,
+                             `reap_failure`), where it blocks a redrive until a later
+                             cancel reaps without error and clears it.
 
     Raises `WorkTicketNotFound` if the idx does not exist. The flip is a single
     `FOR UPDATE` transaction so a concurrent CP write can't interleave a half-state;
@@ -128,6 +131,16 @@ async def cancel_work_ticket(
         cancelled_job_ids = await backend_client.cancel(work_ticket_idx)
     except Exception as exc:  # noqa: BLE001 — record any reap failure, don't lose the flip
         reap_error = f"{type(exc).__name__}: {exc}"
+    # Recorded on the ticket so a redrive refuses it until a reap succeeds
+    # (`ticket_redrive.ReapFailed`); a reap without error clears it.
+    await pool.execute(
+        "UPDATE qiita.work_ticket"
+        " SET reap_failed_at = CASE WHEN $2::text IS NULL THEN NULL ELSE now() END,"
+        "     reap_failure = $2::text"
+        " WHERE work_ticket_idx = $1",
+        work_ticket_idx,
+        reap_error,
+    )
 
     return {
         "work_ticket_idx": work_ticket_idx,

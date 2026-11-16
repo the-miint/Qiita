@@ -89,6 +89,9 @@ for that prep_sample. Its state is one of:
   ```bash
   qiita-admin ticket cancel <work_ticket_idx>
   ```
+
+  If its output shows a `reap_error`, the scancel failed and the ticket records it:
+  `/run` refuses the ticket until the same command, run again, reaps without error.
 - **not processed**: no member has a run, or the run was withdrawn, or the
   definition or an upstream is deprecated or withdrawn. An older member's run is not
   used instead.

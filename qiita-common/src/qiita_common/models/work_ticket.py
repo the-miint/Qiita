@@ -739,7 +739,7 @@ class WorkTicketCancelResult(BaseModel):
     not cancel from its state); the scancel reap runs either way. `not_found` marks an
     explicit idx that does not exist. `reap_error` is set when the terminal flip
     landed but the scancel failed (the flip stands — re-run cancel to retry the
-    reap)."""
+    reap); the ticket records it until a reap succeeds (`work_ticket_cancel`)."""
 
     work_ticket_idx: Annotated[int, Field(gt=0)]
     previous_state: str | None = None

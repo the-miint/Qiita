@@ -70,7 +70,7 @@ from ..repositories.block import (
 )
 from ..repositories.mask_definition import MaskDefinitionNotFound, lock_mask
 from ..step_progress import StepProgressMismatch, check_step_progress, load_step_progress
-from ..ticket_redrive import drop_dead_step_rows, reset_ticket_to_pending
+from ..ticket_redrive import ReapFailed, drop_dead_step_rows, reset_ticket_to_pending
 from ..workspace import step_attempt_dir, ticket_workspace
 from .library import delete_alignment_sample_data
 
@@ -437,7 +437,13 @@ async def _rearm(
                 f"cannot tell whether {attempt_dir} exists: {exc}; nothing was changed",
             ) from exc
 
-    if not await reset_ticket_to_pending(conn, work_ticket_idx=work_ticket_idx, from_state=state):
+    try:
+        reset = await reset_ticket_to_pending(
+            conn, work_ticket_idx=work_ticket_idx, from_state=state
+        )
+    except ReapFailed as exc:
+        raise _refuse("reap_failed", str(exc)) from exc
+    if not reset:
         raise _refuse("state_changed", f"work_ticket {work_ticket_idx} changed state; retry")
     if rerun_of == WorkTicketState.COMPLETED:
         status = await conn.execute(
