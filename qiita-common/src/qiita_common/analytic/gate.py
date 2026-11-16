@@ -498,8 +498,10 @@ def _circular_gated_sql(clearance: GateClearance) -> str:
     )
 
 
-def gate_diagnostics_sql(gate: AlignmentGate) -> str:
-    """One row for `check_gate_diagnostics`, over `STREAMED_ALIGNMENT_TABLE`:
+def gate_diagnostics_sql(gate: AlignmentGate, *, source: str = STREAMED_ALIGNMENT_TABLE) -> str:
+    """One row for `check_gate_diagnostics`, over `source` (by default
+    `STREAMED_ALIGNMENT_TABLE`, or a relation with its columns that holds a subset of
+    its rows):
     `(total_rows, scorable_rows, unpoolable_partitions, unpoolable_rows, secondary_rows,
     scorable_secondary_rows, unscorable_groups, paired_rows)`.
 
@@ -552,7 +554,7 @@ def gate_diagnostics_sql(gate: AlignmentGate) -> str:
                 f"{secondary_rows} AS secondary_rows, "
                 f"{scorable_secondary} AS scorable_secondary_rows, "
                 f"0 AS unscorable_groups, {paired_rows} AS paired_rows "
-                f"FROM {STREAMED_ALIGNMENT_TABLE}"
+                f"FROM {source}"
             )
         # Grouped by what the macro groups by, so a group here is a read the gate will
         # judge as one. The per-row counts are additive over those groups, so the pass
@@ -572,7 +574,7 @@ def gate_diagnostics_sql(gate: AlignmentGate) -> str:
             f"count(*) FILTER (WHERE {POOLABLE_ROW}) AS poolable, "
             f"{paired_rows} AS paired, "
             f"cigar_pooled_identity(cigar) FILTER (WHERE {POOLABLE_ROW}) AS identity "
-            f"FROM {STREAMED_ALIGNMENT_TABLE} "
+            f"FROM {source} "
             f"GROUP BY {CIRCULAR_READ_PARTITION}) "
             f"SELECT coalesce(sum(rows_in_group), 0) AS total_rows, "
             f"NULL AS scorable_rows, 0 AS unpoolable_partitions, "
@@ -589,7 +591,7 @@ def gate_diagnostics_sql(gate: AlignmentGate) -> str:
             f"0 AS unpoolable_partitions, 0 AS unpoolable_rows, "
             f"0 AS secondary_rows, NULL AS scorable_secondary_rows, "
             f"0 AS unscorable_groups, {paired_rows} AS paired_rows "
-            f"FROM {STREAMED_ALIGNMENT_TABLE}"
+            f"FROM {source}"
         )
     # A partition that cannot be a single placement's mates, in the three ways it
     # can fail. `count(col)` skips NULLs, which is what makes each detectable:
@@ -602,7 +604,7 @@ def gate_diagnostics_sql(gate: AlignmentGate) -> str:
         f"WITH placement AS (SELECT count(*) AS rows_in_partition, "
         f"count(cigar) AS with_cigar, count(mate_position) AS with_mate, "
         f"{scorable} AS scorable, {paired_rows} AS paired "
-        f"FROM {STREAMED_ALIGNMENT_TABLE} GROUP BY {PAIRED_PLACEMENT_PARTITION}) "
+        f"FROM {source} GROUP BY {PAIRED_PLACEMENT_PARTITION}) "
         f"SELECT coalesce(sum(rows_in_partition), 0) AS total_rows, "
         f"sum(scorable) AS scorable_rows, "
         f"count(*) FILTER (WHERE rows_in_partition <> with_cigar "

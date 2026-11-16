@@ -18,6 +18,7 @@ import argparse
 import base64
 import contextlib
 import dataclasses
+import functools
 import json
 import sys
 from collections.abc import Callable, Iterator, Sequence
@@ -102,6 +103,11 @@ _DENOVO_ALIGNMENT_STREAM = "denovo_alignment_stream"
 _DENOVO_LENGTHS_STREAM = "denovo_lengths_stream"
 _TAXONOMY_STREAM = "reference_taxonomy_stream"
 _PHYLOGENY_STREAM = "reference_phylogeny_stream"
+
+# One part's prep_samples, and the view of that part's rows of the streamed slice that
+# the gate's diagnostics read (see `_gate_clearance`).
+_PART_SAMPLES = "gate_part_samples"
+_PART_SLICE = "gate_part_slice"
 
 # The data-plane table the per-feature lengths come from. Whole-reference, for the
 # reason `ft.genome_lengths_table_sql` gives: the coverage denominator is the FULL
@@ -578,34 +584,41 @@ def staged_stream(con, flight_client, ticket: bytes, *, relation: str) -> Iterat
 
 
 @contextlib.contextmanager
-def staged_streams(con, flight_client, tickets: Sequence[bytes], *, relation: str) -> Iterator[str]:
+def staged_streams(
+    con, flight_client, mints: Sequence[Callable[[], bytes]], *, relation: str
+) -> Iterator[str]:
     """`staged_stream` over several DoGet tickets of one surface, registered as ONE
-    relation that yields every stream's batches in ticket order.
+    relation that yields every stream's batches in order.
 
     This is where a multi-part build's parts are unioned: before anything is staged, so
-    the gate's diagnostics, precedence and the coverage filter each run once over the
-    whole cohort, through the same builders a single-part build uses. Each stream is
-    opened only when the one before it is drained, so one gRPC stream is open at a time.
-    A stream whose schema differs from the first is refused rather than cast.
+    the coverage filter and precedence each run once over the whole cohort, through the
+    same builders a single-part build uses. Each stream is opened only when the one
+    before it is drained, so one gRPC stream is open at a time. A stream whose schema
+    differs from the first is refused rather than cast.
+
+    `mints` holds one callable per stream, each returning a freshly signed ticket. A
+    ticket is minted just before its DoGet, after the streams before it have drained:
+    a signed ticket expires (`auth/tickets.py`), and one minted when the build started
+    could expire while an earlier part streams.
     """
-    if len(tickets) == 1:
-        with staged_stream(con, flight_client, tickets[0], relation=relation) as source:
+    if not mints:
+        raise ValueError(f"no DoGet ticket to stage {relation} from")
+    if len(mints) == 1:
+        with staged_stream(con, flight_client, mints[0](), relation=relation) as source:
             yield source
         return
-    if not tickets:
-        raise ValueError(f"no DoGet ticket to stage {relation} from")
     import pyarrow as pa  # noqa: PLC0415
     import pyarrow.flight as flight  # noqa: PLC0415
 
-    first = flight_client.do_get(flight.Ticket(tickets[0])).to_reader()
+    first = flight_client.do_get(flight.Ticket(mints[0]())).to_reader()
 
     def batches():
         yield from first
-        for position, ticket in enumerate(tickets[1:], start=2):
-            reader = flight_client.do_get(flight.Ticket(ticket)).to_reader()
+        for position, mint in enumerate(mints[1:], start=2):
+            reader = flight_client.do_get(flight.Ticket(mint())).to_reader()
             if not reader.schema.equals(first.schema):
                 raise ValueError(
-                    f"{relation}: stream {position} of {len(tickets)} has schema "
+                    f"{relation}: stream {position} of {len(mints)} has schema "
                     f"{reader.schema} where the first has {first.schema}"
                 )
             yield from reader
@@ -668,17 +681,25 @@ def _cleared(con, diagnostics_sql: str, check, *args):
 
 
 def _stage_alignment(
-    con, flight_client, tickets: Sequence[bytes], *, gate: ft.AlignmentGate | None
+    con,
+    flight_client,
+    parts: Sequence[_Part],
+    *,
+    mint: Callable[[_Part], bytes],
+    gate: ft.AlignmentGate | None,
 ) -> None:
-    """Stream the alignment slice — one ticket per part, unioned by `staged_streams` —
-    into `ALIGNMENT_TABLE`, applying `gate` if there is one. Everything downstream reads
-    that one relation either way, so a gate cannot be half-applied.
+    """Stream the alignment slice — one ticket per part, `mint(part)` minted just before
+    its stream, unioned by `staged_streams` — into `ALIGNMENT_TABLE`, applying `gate` if
+    there is one. Everything downstream reads that one relation either way, so a gate
+    cannot be half-applied.
 
     The gated path materializes the UNGATED slice first: the checks have to see the rows
     the gate would drop, and a Flight stream cannot be scanned twice. The diagnostics
-    therefore run after the stream is released, off the materialized copy.
+    therefore run after the stream is released, off the materialized copy, once per part
+    (`_gate_clearance`).
     """
-    with staged_streams(con, flight_client, tickets, relation=_ALIGNMENT_STREAM) as source:
+    mints = [functools.partial(mint, part) for part in parts]
+    with staged_streams(con, flight_client, mints, relation=_ALIGNMENT_STREAM) as source:
         con.execute(
             ft.alignment_table_sql(source)
             if gate is None
@@ -686,11 +707,48 @@ def _stage_alignment(
         )
     if gate is None:
         return
-    clearance = _cleared(con, ft.gate_diagnostics_sql(gate), ft.check_gate_diagnostics, gate)
+    clearance = _gate_clearance(con, parts, gate=gate)
     # The clearance carries the rest of the protocol in order — apply the gate, then
     # release what the gated path put up, the streamed copy holding `cigar` included.
     for sql, parameters in clearance.statements:
         con.execute(sql, parameters)
+
+
+def _gate_clearance(con, parts: Sequence[_Part], *, gate: ft.AlignmentGate) -> ft.GateClearance:
+    """`check_gate_diagnostics` over each part's rows of the streamed slice.
+
+    Per part, because each part is a different alignment: `check_gate_diagnostics`
+    refuses only when no row of the slice it is given can be scored, so over the union
+    a part whose CIGARs the gate can score would let the gate drop every row of a part
+    whose CIGARs it cannot. A refusal names the part.
+    """
+    if len(parts) == 1:
+        return _cleared(con, ft.gate_diagnostics_sql(gate), ft.check_gate_diagnostics, gate)
+    import pyarrow as pa  # noqa: PLC0415
+
+    clearance = None
+    for part in parts:
+        samples = pa.table({"prep_sample_idx": pa.array(part.samples, type=pa.int64())})
+        with registered(con, _PART_SAMPLES, samples):
+            con.execute(
+                f"CREATE TEMP VIEW {_PART_SLICE} AS SELECT * FROM {ft.STREAMED_ALIGNMENT_TABLE}"
+                f" SEMI JOIN {_PART_SAMPLES} USING (prep_sample_idx)"
+            )
+            try:
+                clearance = _cleared(
+                    con,
+                    ft.gate_diagnostics_sql(gate, source=_PART_SLICE),
+                    ft.check_gate_diagnostics,
+                    gate,
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    f"alignment {part.alignment_idx} ({len(part.samples)} prep_sample(s)"
+                    f" of the cohort): {exc}"
+                ) from exc
+            finally:
+                con.execute(f"DROP VIEW {_PART_SLICE}")
+    return clearance
 
 
 def _build_ogu_output(
@@ -1679,16 +1737,14 @@ def _run_build(
         _stage_alignment(
             con,
             flight_client,
-            [
-                _create_alignment_doget_ticket(
-                    args.base_url,
-                    token,
-                    alignment_idx=part.alignment_idx,
-                    prep_sample_idx=list(part.samples),
-                    columns=columns,
-                )
-                for part in parts
-            ],
+            parts,
+            mint=lambda part: _create_alignment_doget_ticket(
+                args.base_url,
+                token,
+                alignment_idx=part.alignment_idx,
+                prep_sample_idx=list(part.samples),
+                columns=columns,
+            ),
             gate=gate,
         )
         if denovo_parts:
@@ -1696,8 +1752,9 @@ def _run_build(
             # `analytic.reconcile.denovo_alignment_statements`. The de novo slice takes
             # no gate: `--circular-gate` is refused alongside this flag, and the CIGAR
             # gate would judge it on a rule align_denovo already applied.
-            denovo_tickets = [
-                _create_alignment_doget_ticket(
+            denovo_mints = [
+                functools.partial(
+                    _create_alignment_doget_ticket,
                     args.base_url,
                     token,
                     alignment_idx=part.alignment_idx,
@@ -1707,7 +1764,7 @@ def _run_build(
                 for part in denovo_parts
             ]
             with staged_streams(
-                con, flight_client, denovo_tickets, relation=_DENOVO_ALIGNMENT_STREAM
+                con, flight_client, denovo_mints, relation=_DENOVO_ALIGNMENT_STREAM
             ) as source:
                 for sql in ft.denovo_alignment_statements(source):
                     con.execute(sql)

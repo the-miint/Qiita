@@ -1878,7 +1878,9 @@ _TWO_POOL_RESOLVE = {
 }
 
 
-def _patched_two_pools(monkeypatch, *, resolve=None, listings=None, denovo_map=None):
+def _patched_two_pools(
+    monkeypatch, *, resolve=None, listings=None, denovo_map=None, alignment=None
+):
     """`_patched` over the two pools above, with an alignment ticket per alignment and
     the de novo seams keyed by `(prep_sample_idx, processing_idx)`. Records each
     alignment ticket's cohort in `tickets`, the cohort reads in `cohort_reads`, and the
@@ -1914,10 +1916,12 @@ def _patched_two_pools(monkeypatch, *, resolve=None, listings=None, denovo_map=N
     monkeypatch.setattr(ftc, "_fetch_alignment_cohort", _cohort)
 
     rec["tickets"] = {}
+    rec["events"] = []
     columns_of: dict[int, list[str]] = {}
 
     def _ticket(b, t, *, alignment_idx, prep_sample_idx, columns):
         rec["tickets"][alignment_idx] = list(prep_sample_idx)
+        rec["events"].append(("minted", alignment_idx))
         columns_of[alignment_idx] = list(columns)
         return f"alignment-{alignment_idx}".encode()
 
@@ -1948,14 +1952,24 @@ def _patched_two_pools(monkeypatch, *, resolve=None, listings=None, denovo_map=N
     monkeypatch.setattr(ftc, "_create_assembly_run_doget_ticket", _assembly_ticket)
 
     def _slice(alignment_idx, rows):
-        return lambda: _alignment_reader(
-            columns_of[alignment_idx],
-            [r for r in rows if r[0] in rec["tickets"][alignment_idx]],
-        )
+        def reader():
+            inner = _alignment_reader(
+                columns_of[alignment_idx],
+                [r for r in rows if r[0] in rec["tickets"][alignment_idx]],
+            )
 
+            def batches():
+                yield from inner
+                rec["events"].append(("drained", alignment_idx))
+
+            return pa.RecordBatchReader.from_batches(inner.schema, batches())
+
+        return reader
+
+    rows = _ALIGNMENT if alignment is None else alignment
     readers = {
-        b"alignment-3": _slice(3, _ALIGNMENT),
-        b"alignment-13": _slice(13, _ALIGNMENT),
+        b"alignment-3": _slice(3, rows),
+        b"alignment-13": _slice(13, rows),
         b"alignment-4": _slice(4, _DENOVO_ALIGNMENT),
         b"alignment-14": _slice(14, _DENOVO_ALIGNMENT),
         _LENGTHS_TICKET: _lengths_reader,
@@ -1993,6 +2007,44 @@ def test_a_cohort_across_pools_is_read_per_part_and_pooled_once(monkeypatch, tmp
     # Each part's processing handle is minted with that part's own samples.
     assert rec["processing_minted"] == {3: [1], 13: [2]}
     assert all(client.closed for client in _FakeFlightClient.instances)
+
+
+def test_each_parts_ticket_is_minted_after_the_part_before_it_drained(monkeypatch, tmp_path):
+    """A signed ticket expires, so part 2's is minted only once part 1's stream has
+    drained, not when the build starts; the same for the de novo arm's parts."""
+    rec = _patched_two_pools(monkeypatch, resolve=_TWO_POOL_DENOVO_RESOLVE)
+    args = _two_pool_args(tmp_path, prep_sample_idx=[1, 2], denovo_alignment_idx=4)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    assert rec["events"] == [
+        ("minted", 3),
+        ("drained", 3),
+        ("minted", 13),
+        ("drained", 13),
+        ("minted", 4),
+        ("drained", 4),
+        ("minted", 14),
+        ("drained", 14),
+    ]
+
+
+@pytest.mark.parametrize(("cigar", "refused"), [("60=", False), ("60M", True)])
+def test_the_gate_diagnostics_run_per_part(monkeypatch, tmp_path, capsys, cigar, refused):
+    """Part 13's only row carries a legacy `M` CIGAR, which no identity gate can score.
+    Over the union of parts, part 3's scorable rows would clear the gate and part 13's
+    row would be dropped without a refusal; per part, part 13 is refused by name."""
+    alignment = [*_ALIGNMENT[:2], (2, 3, 20, 0, 60, 120, cigar)]
+    _patched_two_pools(monkeypatch, alignment=alignment)
+    args = _two_pool_args(tmp_path, prep_sample_idx=[1, 2], min_identity=0.9)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == (1 if refused else 0)
+    err = capsys.readouterr().err
+    if refused:
+        assert "alignment 13 (1 prep_sample(s) of the cohort)" in err
+        assert "can be scored for sequence identity" in err
+        assert not args.output.exists()
+    else:
+        assert "alignment 13" not in err
 
 
 def test_an_omitted_cohort_spans_every_alignment_of_the_group_in_every_pool(monkeypatch, tmp_path):
