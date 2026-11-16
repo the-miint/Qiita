@@ -34,6 +34,7 @@ from qiita_common.backend_failure import BackendFailure, FailureKind, StepNoData
 from qiita_common.models import (
     ComputeTarget,
     DefinitionKind,
+    DefinitionSettingsEditKind,
     FoundJobWire,
     ScopeTargetKind,
     StepHandleWire,
@@ -48,7 +49,6 @@ from qiita_common.testing.containers import REFERENCE_HASH_CONTAINER, REFERENCE_
 
 from qiita_control_plane import step_progress
 from qiita_control_plane.actions.library import QcProducer
-from qiita_control_plane.repositories.definition_settings_edit import ADMIN_EDIT
 from qiita_control_plane.testing.db_teardown import delete_principal, teardown_entity_graph
 from qiita_control_plane.testing.run_context import run_context
 
@@ -7410,10 +7410,20 @@ _DEFINITION_TABLE = {
 
 # Each case: (edit kind, edit after the ticket's creation, a kept step row, refused).
 _EDIT_CASES = {
-    "admin-edit-after-with-a-kept-step": (ADMIN_EDIT, True, True, True),
-    "admin-edit-before": (ADMIN_EDIT, False, True, False),
-    "admin-edit-after-with-no-step-row": (ADMIN_EDIT, True, False, False),
-    "rekey-after-with-a-kept-step": ("adapter_hash_rekey", True, True, False),
+    "admin-edit-after-with-a-kept-step": (DefinitionSettingsEditKind.ADMIN_EDIT, True, True, True),
+    "admin-edit-before": (DefinitionSettingsEditKind.ADMIN_EDIT, False, True, False),
+    "admin-edit-after-with-no-step-row": (
+        DefinitionSettingsEditKind.ADMIN_EDIT,
+        True,
+        False,
+        False,
+    ),
+    "rekey-after-with-a-kept-step": (
+        DefinitionSettingsEditKind.ADAPTER_HASH_REKEY,
+        True,
+        True,
+        False,
+    ),
 }
 
 
@@ -7429,7 +7439,7 @@ async def test_a_dispatch_reusing_work_from_before_a_settings_edit_fails_the_tic
     run, or a rerun-block re-arm, which deletes every row), and a mask adapter-hash
     re-key each leave it to run."""
     edit_kind, after, kept_step, refused = _EDIT_CASES[case]
-    if edit_kind != ADMIN_EDIT and kind is not DefinitionKind.MASK:
+    if edit_kind is not DefinitionSettingsEditKind.ADMIN_EDIT and kind is not DefinitionKind.MASK:
         pytest.skip("a re-key is a mask's only")
     table, column = _DEFINITION_TABLE[kind]
     admin = human_admin_session["principal_idx"]
@@ -7452,7 +7462,7 @@ async def test_a_dispatch_reusing_work_from_before_a_settings_edit_fails_the_tic
             kind.value,
             definition_idx,
             edit_kind,
-            admin if edit_kind == ADMIN_EDIT else None,
+            admin if edit_kind is DefinitionSettingsEditKind.ADMIN_EDIT else None,
             created_at + timedelta(minutes=1 if after else -1),
         )
         backend = FakeSlurmBackendClient(

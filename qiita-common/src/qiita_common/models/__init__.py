@@ -179,6 +179,7 @@ from qiita_common.models.definition_pair import (
     DefinitionPairRevokeRequest,
     DefinitionPairVerdict,
     DefinitionSettingsEdit,
+    DefinitionSettingsEditKind,
     DefinitionSettingsEditRequest,
     DefinitionSettingsRefusal,
     DeprecationRefusal,
@@ -628,6 +629,7 @@ __all__ = [
     "DefinitionPairVerdict",
     "DefinitionSettingsEdit",
     "DefinitionSettingsEditRequest",
+    "DefinitionSettingsEditKind",
     "DefinitionSettingsRefusal",
     # Definition groups.
     "DefinitionGroupRefusal",

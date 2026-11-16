@@ -150,8 +150,10 @@
   actor. A failed or cancelled ticket that records a definition edited after the
   ticket was created, and whose redrive keeps step rows from an earlier attempt,
   fails as bad submission input before any step, since that work ran under the
-  earlier settings; submit a new ticket. A dispatch with no step row (a rerun-block
-  re-arm, which deletes them) runs under the current settings. A mask adapter-hash
+  earlier settings; submit a new ticket. A mask or alignment ticket dispatched with no
+  step row (a rerun-block re-arm, which deletes them) runs under the current
+  settings; a processing ticket that records an edited processing fails either way,
+  since its params resolve to another processing. A mask adapter-hash
   re-key does not count as an edit here.
 - **A hand `DELETE` of a mask, alignment or processing is refused (SQLSTATE 55006)
   while a `similar` pair names it (#874);** revoke the pair first. A `pending` or

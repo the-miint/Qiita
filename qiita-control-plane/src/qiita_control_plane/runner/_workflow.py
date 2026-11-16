@@ -292,12 +292,14 @@ async def run_workflow(
         # re-attached to its live job. When a definition the ticket records had its
         # settings edited after the ticket was created, that work was done under the
         # earlier settings and the remaining steps would run under the edited ones, so
-        # the ticket is failed instead. A dispatch with no step row (a first run, or a
-        # rerun-block re-arm, which deletes every step row) runs wholly under the
-        # current settings and is not refused. A settings edit is refused
-        # while the ticket is unfinished (`definition_settings`), so this is reached
-        # by a redrive of a failed or cancelled ticket. `_mint_processing_idx` also
-        # refuses a processing ticket whose params now resolve to another row.
+        # the ticket is failed instead. A mask or alignment ticket dispatched with no
+        # step row (a first run, or a rerun-block re-arm, which deletes every step
+        # row) runs wholly under the current settings and is not refused here. A
+        # processing ticket that records an edited processing is refused at
+        # `_mint_processing_idx` either way: its params resolve to another row. A
+        # settings edit is refused while the ticket is unfinished
+        # (`definition_settings`), so this is reached by a redrive of a failed or
+        # cancelled ticket.
         edit = await fetch_settings_edit_since_ticket(pool, work_ticket_idx) if progress else None
         if edit is not None:
             raise _submission_bad_input(

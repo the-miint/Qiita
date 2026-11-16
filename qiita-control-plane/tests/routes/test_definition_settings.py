@@ -16,9 +16,11 @@ from qiita_common.api_paths import (
 )
 from qiita_common.hashing import canonical_params_hash
 from qiita_common.models import (
+    ComputeTarget,
     DefinitionKind,
     DefinitionPairRefusal,
     DefinitionPairVerdict,
+    DefinitionSettingsEditKind,
     DefinitionSettingsRefusal,
     FailureType,
     ScopeTargetKind,
@@ -203,7 +205,7 @@ async def test_the_admin_edit_changes_the_settings_and_records_them(
     assert (audit["definition_kind"], audit["definition_ref"], audit["edit_kind"]) == (
         kind.value,
         idx,
-        "admin_edit",
+        DefinitionSettingsEditKind.ADMIN_EDIT,
     )
     with pytest.raises(asyncpg.RaiseError):
         await postgres_pool.execute(
@@ -392,7 +394,10 @@ async def test_the_adapter_hash_rekey_passes_and_is_recorded(postgres_pool, defs
         " WHERE definition_kind = 'mask' AND definition_ref = $1",
         idx,
     )
-    assert (row["edit_kind"], row["actor_principal_idx"]) == ("adapter_hash_rekey", None)
+    assert (row["edit_kind"], row["actor_principal_idx"]) == (
+        DefinitionSettingsEditKind.ADAPTER_HASH_REKEY,
+        None,
+    )
 
 
 _TICKET_ACTION = "settings-edit-live-work-probe"
@@ -704,12 +709,18 @@ async def test_the_mint_and_hold_needs_a_transaction(postgres_pool):
             )
 
 
-async def test_a_resume_after_its_processing_was_edited_fails_the_ticket(postgres_pool, clients):
+@pytest.mark.parametrize("kept_step", [False, True], ids=["no-step-row", "kept-step-row"])
+async def test_a_resume_after_its_processing_was_edited_fails_the_ticket(
+    postgres_pool, clients, kept_step
+):
     """A failed ticket resumes under the processing it recorded while its settings are
-    unchanged. Once they are edited, its params resolve to another row, and its
-    completed steps and gate are keyed on the first: the mint fails it as bad input
-    and leaves its record."""
+    unchanged. Once they are edited through the admin route, its params resolve to
+    another row: the mint fails it as bad input and leaves its record, with no step
+    row as well as with one (unlike a mask or alignment, whose no-step-row dispatch
+    runs). The message names kept step rows only when there are some."""
     from qiita_common.backend_failure import BackendFailure
+
+    from qiita_control_plane import step_progress
 
     mint = _mint_for(postgres_pool, {"mask_idx": secrets.randbelow(10**9) + 10**9})
     ticket, block_idx, created = await _processing_ticket(postgres_pool, WorkTicketState.FAILED)
@@ -718,6 +729,16 @@ async def test_a_resume_after_its_processing_was_edited_fails_the_ticket(postgre
         first = await mint(work_ticket_idx=ticket)
         minted.append(first)
         assert await mint(work_ticket_idx=ticket) == first
+        if kept_step:
+            await step_progress.record_submitting(
+                postgres_pool,
+                work_ticket_idx=ticket,
+                step_index=0,
+                attempt=0,
+                step_name="assemble",
+                compute_target=ComputeTarget.SLURM,
+                job_name=f"qiita-wt{ticket}-assemble-a0",
+            )
         params = await _params(postgres_pool, DefinitionKind.PROCESSING, first)
         resp = await clients["admin"].patch(
             _url(DefinitionKind.PROCESSING, first),
@@ -725,8 +746,9 @@ async def test_a_resume_after_its_processing_was_edited_fails_the_ticket(postgre
         )
         assert resp.status_code == 200, resp.text
 
-        with pytest.raises(BackendFailure, match="submit a new ticket"):
+        with pytest.raises(BackendFailure, match="submit a new ticket") as exc:
             await mint(work_ticket_idx=ticket)
+        assert ("kept step rows" in str(exc.value)) is kept_step
         assert (
             await postgres_pool.fetchval(
                 "SELECT processing_idx FROM qiita.work_ticket WHERE work_ticket_idx = $1", ticket

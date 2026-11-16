@@ -190,6 +190,17 @@ class DefinitionPairListResponse(BaseModel):
     next_after_definition_pair_idx: Annotated[int | None, Field(default=None, gt=0)] = None
 
 
+class DefinitionSettingsEditKind(StrEnum):
+    """`qiita.definition_settings_edit.edit_kind` (TEXT + CHECK, migration
+    `20261116000004_definition_settings_lock.sql`; out of scope for the enum-parity
+    test)."""
+
+    # Written by `qiita.edit_definition_settings`, the system_admin's audited edit.
+    ADMIN_EDIT = "admin_edit"
+    # Written by the lock trigger for a mask adapter-hash re-key, with no actor.
+    ADAPTER_HASH_REKEY = "adapter_hash_rekey"
+
+
 class DefinitionSettingsRefusal(StrEnum):
     """The `reason` code of a 409 refusing an edit of a definition's settings that is
     not a pair rule's (those carry a `DefinitionPairRefusal`). Raised in

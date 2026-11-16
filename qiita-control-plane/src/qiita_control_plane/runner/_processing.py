@@ -151,14 +151,15 @@ async def _mint_processing_idx(
     the edit and this mint-and-record cannot both commit unseen by the other, and the
     ticket is never recorded under settings it did not hash.
 
-    A redrive resumes a ticket keeping its completed steps' outputs and its assembly
-    gate row, both keyed on the processing it recorded on its first attempt. When the
-    mint now resolves to another row, the ticket is failed as bad submission input
-    rather than re-recorded, so no run mixes outputs of two processings. Two causes
+    A redrive keeps the ticket's step rows and its assembly gate row, both keyed on
+    the processing it recorded on its first attempt. When the mint now resolves to
+    another row, the ticket is failed as bad submission input rather than re-recorded,
+    whether or not it kept step rows, so no ticket names two processings. Two causes
     reach it: the recorded processing's settings were edited (which `run_workflow`
-    refuses first when earlier step rows would be reused), or the ticket's params now
-    build differently, e.g. a changed `assembler_default` filling an omitted
-    assembler. A new ticket is recorded under the processing
+    refuses first when earlier step rows would be reused; without them, this is where
+    an edited processing is refused, unlike a mask or alignment), or the ticket's
+    params now build differently, e.g. a changed `assembler_default` filling an
+    omitted assembler. A new ticket is recorded under the processing
     minted for its own params; the edited row keeps the edited settings. The recorded
     idx is read without a row lock: the dispatch state guard keeps one ticket from
     running twice at once (`dispatch.py`)."""
@@ -176,12 +177,21 @@ async def _mint_processing_idx(
                     work_ticket_idx,
                 )
                 if recorded is not None and recorded != row["processing_idx"]:
+                    kept = await conn.fetchval(
+                        "SELECT EXISTS (SELECT 1 FROM qiita.work_ticket_step"
+                        "                WHERE work_ticket_idx = $1)",
+                        work_ticket_idx,
+                    )
+                    held = (
+                        "Its kept step rows are keyed on the first"
+                        if kept
+                        else "It records the first and is not re-recorded under another"
+                    )
                     raise _submission_bad_input(
                         f"work ticket {work_ticket_idx} first ran under processing"
                         f" {recorded}; its params now resolve to processing"
                         f" {row['processing_idx']} (the first's settings were edited, or"
-                        " the params now build differently). Its completed"
-                        " steps and assembly gate are keyed on the first, so it cannot"
+                        f" the params now build differently). {held}, so it cannot"
                         " resume; submit a new ticket, which is recorded under the"
                         " processing minted for its own params"
                     )

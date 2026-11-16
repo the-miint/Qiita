@@ -62,6 +62,9 @@ COMMENT ON TABLE qiita.definition_settings_edit IS
 COMMENT ON COLUMN qiita.definition_settings_edit.definition_kind IS
     '''mask'' | ''alignment'' | ''processing'' (TEXT + CHECK). Python twin: '
     'qiita_common.models.DefinitionKind.';
+COMMENT ON COLUMN qiita.definition_settings_edit.edit_kind IS
+    '''admin_edit'' | ''adapter_hash_rekey'' (TEXT + CHECK). Python twin: '
+    'qiita_common.models.DefinitionSettingsEditKind.';
 
 CREATE FUNCTION qiita.tg_definition_settings_edit_immutable() RETURNS trigger
 LANGUAGE plpgsql AS $$
