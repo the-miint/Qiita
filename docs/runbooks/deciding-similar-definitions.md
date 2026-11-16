@@ -93,6 +93,11 @@ for that prep_sample. Its state is one of:
   definition or an upstream is deprecated or withdrawn. An older member's run is not
   used instead.
 
+A deprecated mask named by the masked-read export or the SynDNA count export is
+refused unless `--include-deprecated` is passed; with it, each prep_sample is read
+from that mask alone (its own runs, never another member's; a withdrawn run stays
+unreadable), and the output is marked deprecated.
+
 The exports list incomplete and not-processed prep_samples and leave them out, and
 so does `qiita feature-table build` over its default cohort (it also records them in
 the manifest under `table.left_out`); a build over prep_samples named with

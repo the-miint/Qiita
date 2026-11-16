@@ -137,9 +137,12 @@ def _get_syndna_read_count(
     study_idx: int | None,
     sequenced_pool_idx: int | None,
     prep_sample_idx: Sequence[int] | None,
+    include_deprecated: bool = False,
 ) -> SyndnaReadCountResponse:
     """GET /api/v1/mask-definition/{mask_idx}/syndna-read-count."""
     params: dict = _common.filter_params(study_idx=study_idx, sequenced_pool_idx=sequenced_pool_idx)
+    if include_deprecated:
+        params["include_deprecated"] = "true"
     if prep_sample_idx:
         params["prep_sample_idx"] = [str(i) for i in prep_sample_idx]
     body = _common.call(
@@ -301,6 +304,7 @@ def _handle_mask_syndna_read_count(
             study_idx=args.study_idx,
             sequenced_pool_idx=args.sequenced_pool_idx,
             prep_sample_idx=args.prep_sample_idx,
+            include_deprecated=args.include_deprecated,
         )
         samples = syndna_sample_names(response, prefix_pool=args.prefix_pool)
         with contextlib.closing(connect_with_miint()) as con:
@@ -343,6 +347,8 @@ def _handle_mask_syndna_read_count(
         f"wrote {len(samples)} sample(s) x {len(features)} insert(s) to {args.output}"
         f" ({args.format})"
     )
+    if response.deprecated:
+        _common.print_deprecated_read("mask", response.mask_idx, response.deprecation_reason)
     print_left_out(response)
     return 0
 
@@ -351,9 +357,10 @@ def print_left_out(response: SyndnaReadCountResponse) -> None:
     """List on stderr each selected prep_sample the table leaves out, and why."""
     if not response.left_out:
         return
+    scope = "" if response.deprecated else "'s group"
     print(
         f"left out {len(response.left_out)} prep_sample(s) not processed in mask"
-        f" {response.mask_idx}'s group:",
+        f" {response.mask_idx}{scope}:",
         file=sys.stderr,
     )
     for r in response.left_out:

@@ -39,7 +39,7 @@ from ..repositories.exported_identifier import (
     mint_exported_mask_identifiers,
 )
 from ..repositories.mask_definition import MaskDefinitionDeprecated, MaskDefinitionNotFound
-from ._helpers import authorize_completed_alignment_cohort, first_few
+from ._helpers import authorize_completed_alignment_cohort, first_few, refuse_deprecated_mask_read
 
 router = APIRouter(prefix=PATH_EXPORTED_IDENTIFIER_PREFIX, tags=["exported-identifier"])
 
@@ -135,8 +135,9 @@ async def mint_exported_mask_identifier_map(
     by prep_sample_idx, so a masked-read export can name its files without carrying
     `prep_sample_idx`.
 
-    **Idempotent.** 404 for an unknown mask; 409 for a deprecated mask, and for a
-    cohort with any member not masked-complete under it (the gate that the export
+    **Idempotent.** 404 for an unknown mask; 409 for a deprecated mask unless
+    `include_deprecated` (`deprecated_read`), and for a cohort with any member not
+    masked-complete under it (the gate that the export
     ticket route applies), in which case nothing is minted.
     """
     try:
@@ -145,11 +146,12 @@ async def mint_exported_mask_identifier_map(
             mask_idx=body.mask_idx,
             prep_sample_idxs=body.prep_sample_idx,
             created_by_idx=caller.principal_idx,
+            include_deprecated=body.include_deprecated,
         )
     except MaskDefinitionNotFound as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except MaskDefinitionDeprecated as exc:
-        raise HTTPException(status_code=409, detail=exc.detail) from exc
+    except MaskDefinitionDeprecated:
+        await refuse_deprecated_mask_read(pool, body.mask_idx)
     except MaskSampleNotCompleteError as exc:
         raise HTTPException(
             status_code=409,

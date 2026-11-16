@@ -889,3 +889,13 @@ def do_login(*, base_url: str, token_file: Path, cli_command: str) -> int:
     print(f"Logged in. Token saved to {token_file} (mode 0600).", file=sys.stderr)
     print(json.dumps(me, indent=2))
     return 0
+
+
+def print_deprecated_read(kind: str, idx: int, reason: str | None) -> None:
+    """The stderr line for a read of a deprecated definition's own results, made under
+    --include-deprecated."""
+    print(
+        f"warning: {kind} {idx} is deprecated ({reason}); its own results were read"
+        " under --include-deprecated",
+        file=sys.stderr,
+    )

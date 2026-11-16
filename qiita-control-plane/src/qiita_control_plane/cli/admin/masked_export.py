@@ -335,7 +335,8 @@ def _count_masked(flight_client, ticket_bytes: bytes) -> int:
 
 # The output directory's record of which prep_sample and which mask each exported file
 # holds, by public handle: `{"files": {<file name>: {"export_id": "QM…",
-# "biosample_accession": …, "export_processing_id": "QP…"}}}`. Each prep_sample's entries
+# "biosample_accession": …, "export_processing_id": "QP…"}}}`, plus `"deprecated": true`
+# on a file exported from a deprecated mask under --include-deprecated. Each prep_sample's entries
 # are merged in after its files are committed, or after its parquet is found up to date,
 # under a lock (`_record_in_export_manifest`). The overwrite check reads it: a file it names under
 # another mask's handle is never overwritten.
@@ -412,20 +413,35 @@ def _candidate_names(stem: str, fmt: str) -> list[str]:
     return [name for paired in (False, True) for name in _fastq_names(stem, paired=paired)]
 
 
-def _mint_mask_handles(base_url: str, token: str, mask_idxs: list[int]) -> dict[int, str]:
+def _deprecated_field(include_deprecated: bool) -> dict[str, bool]:
+    """The `include_deprecated` body field, sent only when set."""
+    return {"include_deprecated": True} if include_deprecated else {}
+
+
+def _mint_mask_handles(
+    base_url: str, token: str, mask_idxs: list[int], *, include_deprecated: bool = False
+) -> dict[int, str]:
     """Mint (or recover) each mask's public handle (POST /exported-processing/mask).
     Returns `{mask_idx: export_processing_id}`."""
     path = f"{PATH_EXPORTED_PROCESSING_PREFIX}{PATH_EXPORTED_PROCESSING_MASK}"
     return {
-        mask_idx: _common.call("POST", base_url, token, path, json={"mask_idx": mask_idx})[
-            "export_processing_id"
-        ]
+        mask_idx: _common.call(
+            "POST",
+            base_url,
+            token,
+            path,
+            json={"mask_idx": mask_idx, **_deprecated_field(include_deprecated)},
+        )["export_processing_id"]
         for mask_idx in sorted(mask_idxs)
     }
 
 
 def _mint_sample_handles(
-    base_url: str, token: str, samples_by_mask: dict[int, list[int]]
+    base_url: str,
+    token: str,
+    samples_by_mask: dict[int, list[int]],
+    *,
+    include_deprecated: bool = False,
 ) -> dict[int, str]:
     """Mint (or recover) each prep_sample's public handle under its mask
     (POST /exported-identifier/mask). Returns `{prep_sample_idx: export_id}`."""
@@ -435,7 +451,15 @@ def _mint_sample_handles(
         for start in range(0, len(preps), MAX_COHORT_PREP_SAMPLE_IDX):
             chunk = preps[start : start + MAX_COHORT_PREP_SAMPLE_IDX]
             body = _common.call(
-                "POST", base_url, token, path, json={"mask_idx": mask_idx, "prep_sample_idx": chunk}
+                "POST",
+                base_url,
+                token,
+                path,
+                json={
+                    "mask_idx": mask_idx,
+                    "prep_sample_idx": chunk,
+                    **_deprecated_field(include_deprecated),
+                },
             )
             handles.update({i["prep_sample_idx"]: i["export_id"] for i in body["identifiers"]})
     return handles
@@ -477,7 +501,9 @@ def _handle_masked_read_export(args: argparse.Namespace, parser: argparse.Argume
     (`_export_stem`). system_admin only (admin:masked_read_export).
 
     GETs the roster manifest, which resolves each prep_sample across the group (409 when
-    `--mask-idx` is deprecated). A prep_sample that is `incomplete` or `not_processed`
+    `--mask-idx` is deprecated, unless `--include-deprecated`: then each prep_sample is
+    resolved to that mask alone, a stderr line says so, and each manifest entry
+    records `"deprecated": true`). A prep_sample that is `incomplete` or `not_processed`
     is not exported, and neither is one whose export ticket is refused (409) partway
     through the run because its resolution changed since the roster was read; the run
     lists them, with the reason, on stderr after the summary. For each processed
@@ -553,7 +579,14 @@ def _handle_masked_read_export(args: argparse.Namespace, parser: argparse.Argume
     ticket_path = f"{PATH_ADMIN_PREFIX}{PATH_ADMIN_MASKED_READ_EXPORT_TICKET}"
     try:
         roster = _common.call(
-            "GET", args.base_url, token, manifest_path, params={"mask_idx": args.mask_idx}
+            "GET",
+            args.base_url,
+            token,
+            manifest_path,
+            params={
+                "mask_idx": args.mask_idx,
+                **({"include_deprecated": "true"} if args.include_deprecated else {}),
+            },
         )
     except httpx.HTTPStatusError as exc:
         _common.print_http_status_error(exc.response)
@@ -569,6 +602,9 @@ def _handle_masked_read_export(args: argparse.Namespace, parser: argparse.Argume
         return 1
     run_idx = roster["sequencing_run_idx"]
     pool_idx = roster["sequenced_pool_idx"]
+    deprecated = bool(roster.get("deprecated"))
+    if deprecated:
+        _common.print_deprecated_read("mask", args.mask_idx, roster.get("deprecation_reason"))
     if not samples:
         print(
             f"error: no prep_samples on sequenced_pool {pool_idx} for mask_idx"
@@ -584,9 +620,10 @@ def _handle_masked_read_export(args: argparse.Namespace, parser: argparse.Argume
     def print_left_out() -> None:
         if not left_out_lines:
             return
+        scope = "" if deprecated else "'s group"
         print(
             f"not exported: {len(left_out_lines)} prep_sample(s) on sequenced_pool {pool_idx}"
-            f" are not processed in mask_idx {args.mask_idx}'s group, or were refused:",
+            f" are not processed in mask_idx {args.mask_idx}{scope}, or were refused:",
             file=sys.stderr,
         )
         for line in left_out_lines:
@@ -638,8 +675,12 @@ def _handle_masked_read_export(args: argparse.Namespace, parser: argparse.Argume
     # Every refusal that does not need a file name is behind us. The names carry each
     # prep_sample's handle, so the handles are minted before the checks that read names.
     try:
-        mask_handles = _mint_mask_handles(args.base_url, token, list(samples_by_mask))
-        sample_handles = _mint_sample_handles(args.base_url, token, samples_by_mask)
+        mask_handles = _mint_mask_handles(
+            args.base_url, token, list(samples_by_mask), include_deprecated=deprecated
+        )
+        sample_handles = _mint_sample_handles(
+            args.base_url, token, samples_by_mask, include_deprecated=deprecated
+        )
     except httpx.HTTPStatusError as exc:
         _common.print_http_status_error(exc.response)
         return 1
@@ -765,7 +806,11 @@ def _handle_masked_read_export(args: argparse.Namespace, parser: argparse.Argume
                     args.base_url,
                     token,
                     ticket_path,
-                    json={"prep_sample_idx": prep, "mask_idx": mask_idx},
+                    json={
+                        "prep_sample_idx": prep,
+                        "mask_idx": mask_idx,
+                        **_deprecated_field(deprecated),
+                    },
                 )
                 ticket_bytes = base64.b64decode(ticket_resp["ticket"])
                 # Idempotent parquet re-export: only probe the data plane's count
@@ -799,6 +844,7 @@ def _handle_masked_read_export(args: argparse.Namespace, parser: argparse.Argume
                 "export_id": sample_handles[prep],
                 "biosample_accession": s.biosample_accession,
                 "export_processing_id": mask_handles[mask_idx],
+                **({"deprecated": True} if deprecated else {}),
             }
             _record_in_export_manifest(
                 output_dir, {name: entry for name in names}, drop=legacy[prep]

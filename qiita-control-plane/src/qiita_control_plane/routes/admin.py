@@ -64,11 +64,13 @@ from ..auth.scopes import (
 from ..auth.tickets import sign_ticket
 from ..auth.token import mint_api_token
 from ..block_read import READ_MASKED_TABLE
-from ..definition_resolver import cohort_refusal, resolve_group
+from ..definition_resolver import cohort_refusal, resolve_exact, resolve_group
 from ..definition_similarity import load_groups
 from ..deps import TxConnFactory, get_db_pool, get_flight_signing_key, get_tx_conn_factory
 from ..repositories.block import MASK_SAMPLE_COMPLETED
+from ..repositories.mask_definition import fetch_mask_definition_by_idx
 from ..repositories.study_access import fetch_grantee_by_email
+from ._helpers import deprecated_read
 
 router = APIRouter(prefix=PATH_ADMIN_PREFIX, tags=["admin"])
 
@@ -680,17 +682,6 @@ _MASKED_EXPORT_ROSTER_SQL = (
 )
 
 
-def _refuse_deprecated_mask(mask_idx: int) -> HTTPException:
-    """The 409 for a masked-read export that names a deprecated mask."""
-    return HTTPException(
-        status_code=409,
-        detail=(
-            f"mask_definition {mask_idx} is deprecated; a masked-read export may not name it."
-            " Name an active mask of its group instead"
-        ),
-    )
-
-
 @router.get(PATH_ADMIN_SEQUENCED_POOL_MASKED_READ_EXPORT)
 async def export_masked_read_manifest(
     sequenced_pool_idx: int,
@@ -698,6 +689,9 @@ async def export_masked_read_manifest(
     _role: HumanUser = Depends(require_human_with_role(SystemRole.SYSTEM_ADMIN)),
     _scope: Principal = Depends(require_scope(Scope.ADMIN_MASKED_READ_EXPORT)),
     mask_idx: int = Query(gt=0),
+    include_deprecated: bool = Query(
+        default=False, description="Read a deprecated mask's own runs (refused without it)."
+    ),
 ) -> MaskedReadExportManifest:
     """Roster manifest for a per-pool masked-read export: one row per
     non-retired, non-ENA-flagged sample on the pool, each with the filename
@@ -711,7 +705,9 @@ async def export_masked_read_manifest(
     masked-read pull. `mask_idx` is mandatory (the data plane keys read_masked
     on (prep_sample_idx, mask_idx)). 404 if the pool or mask does not exist — an
     empty roster for a real pool is a valid answer, but a typo'd idx fails loudly
-    rather than masquerading as "no prep_samples". 409 if the mask is deprecated.
+    rather than masquerading as "no prep_samples". A deprecated mask is 409 unless
+    `include_deprecated`, which resolves each prep_sample to that mask alone
+    (`deprecated_read`) and marks the manifest `deprecated`.
     Entity-level prep_sample retirement is excluded (ps.retired = false);
     biosample_accession is surfaced even when NULL so the CLI fails loudly on an
     unsubmitted prep_sample rather than the route silently dropping it.
@@ -734,10 +730,16 @@ async def export_masked_read_manifest(
             raise HTTPException(
                 status_code=404, detail=f"no mask_definition with mask_idx={mask_idx}"
             )
-        if mask.deprecated:
-            raise _refuse_deprecated_mask(mask_idx)
+        row = await fetch_mask_definition_by_idx(conn, mask_idx)
+        exact = deprecated_read(
+            kind=DefinitionKind.MASK,
+            idx=mask_idx,
+            deprecated=mask.deprecated,
+            deprecation_reason=row["deprecation_reason"],
+            include_deprecated=include_deprecated,
+        )
         db_rows = await conn.fetch(_MASKED_EXPORT_ROSTER_SQL, sequenced_pool_idx, mask_idx)
-        resolution = await resolve_group(
+        resolution = await (resolve_exact if exact else resolve_group)(
             conn,
             kind=DefinitionKind.MASK,
             definition_idx=mask_idx,
@@ -755,6 +757,8 @@ async def export_masked_read_manifest(
         mask_idx=mask_idx,
         group=list(resolution.group),
         samples=samples,
+        deprecated=exact,
+        deprecation_reason=row["deprecation_reason"] if exact else None,
     )
 
 
@@ -778,8 +782,8 @@ async def create_masked_read_export_ticket(
     the 3600 s max (the data plane's ceiling; expiry is checked only at DoGet
     initiation, so it never bounds the download).
 
-    409 when the mask is deprecated: its config is void, so its reads are not
-    exported by naming it directly.
+    A deprecated mask is 409 unless `include_deprecated` (`deprecated_read`); with
+    it, the prep_sample must resolve to the mask exactly.
 
     Completion gate (contract: see `fetch_mask_sample_state`): the sample must be
     'completed' under this `mask_idx`, else 409 — a 'pending' row (a covering block
@@ -801,7 +805,7 @@ async def create_masked_read_export_ticket(
         )
 
     row = await pool.fetchrow(
-        "SELECT md.status, msamp.state AS mask_state"
+        "SELECT md.status, md.deprecation_reason, msamp.state AS mask_state"
         "  FROM qiita.mask_definition md"
         "  LEFT JOIN qiita.mask_sample msamp"
         "    ON msamp.mask_idx = md.mask_idx AND msamp.prep_sample_idx = $2"
@@ -809,8 +813,13 @@ async def create_masked_read_export_ticket(
         body.mask_idx,
         body.prep_sample_idx,
     )
-    if row is not None and row["status"] == MaskDefinitionStatus.DEPRECATED.value:
-        raise _refuse_deprecated_mask(body.mask_idx)
+    exact = row is not None and deprecated_read(
+        kind=DefinitionKind.MASK,
+        idx=body.mask_idx,
+        deprecated=row["status"] == MaskDefinitionStatus.DEPRECATED.value,
+        deprecation_reason=row["deprecation_reason"],
+        include_deprecated=body.include_deprecated,
+    )
     mask_state = None if row is None else row["mask_state"]
     if mask_state != MASK_SAMPLE_COMPLETED:
         raise HTTPException(
@@ -832,7 +841,7 @@ async def create_masked_read_export_ticket(
         )
 
     async with pool.acquire() as conn, conn.transaction(isolation="repeatable_read", readonly=True):
-        resolution = await resolve_group(
+        resolution = await (resolve_exact if exact else resolve_group)(
             conn,
             kind=DefinitionKind.MASK,
             definition_idx=body.mask_idx,

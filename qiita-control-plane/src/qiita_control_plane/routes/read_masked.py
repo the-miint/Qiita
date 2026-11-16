@@ -97,7 +97,7 @@ from ..auth.guards import (
 from ..auth.principal import HumanUser, Principal, ServiceAccount
 from ..auth.tickets import sign_ticket
 from ..block_read import READ_MASKED_TABLE
-from ..definition_resolver import resolve_group
+from ..definition_resolver import resolve_exact, resolve_group
 from ..definition_similarity import (
     PairRefused,
     load_groups,
@@ -132,6 +132,7 @@ from ._helpers import (
     GATE_ROSTER_HARD_CAP,
     authorize_prep_sample_cohort,
     cap_rows,
+    deprecated_read,
     first_few,
     gate_roster_narrowing_idx,
     live_work_http,
@@ -381,6 +382,9 @@ async def get_syndna_read_count_route(
     prep_sample_idx: list[int] | None = Query(
         default=None, description="These prep_samples (repeatable)."
     ),
+    include_deprecated: bool = Query(
+        default=False, description="Read a deprecated mask's own counts (refused without it)."
+    ),
 ) -> SyndnaReadCountResponse | JSONResponse:
     """The per-insert SynDNA read counts of the selected prep_samples across one
     mask's group — what `qiita mask syndna-read-count` writes as BIOM or Parquet.
@@ -390,8 +394,10 @@ async def get_syndna_read_count_route(
     that matches them. Each is resolved across the group (`definition_resolver`):
     a `processed` prep_sample's counts are read under the member that it resolved
     to; an `incomplete` or `not_processed` one is left out of the table and listed
-    in `left_out` with the reason. A deprecated named mask is not refused: it names
-    its group, and a prep_sample that resolves to it is left out as `deprecated`.
+    in `left_out` with the reason. A deprecated named mask is 409 unless
+    `include_deprecated` (`deprecated_read`); with it, each prep_sample is resolved
+    to that mask alone (`resolve_exact`), its counts are the mask's own, and the
+    response is marked `deprecated`.
 
     **Authorization is all-or-nothing, never narrowed**, because the response is a
     table: the caller needs ``Tier.VIEWER`` on every study each selected prep_sample
@@ -427,7 +433,15 @@ async def get_syndna_read_count_route(
         groups = await load_groups(conn)
         if (DefinitionKind.MASK, mask_idx) not in groups.definitions:
             raise HTTPException(status_code=404, detail=_MSG_MASK_NOT_FOUND)
-        group = sorted(groups.group_of(DefinitionKind.MASK, mask_idx))
+        mask = await fetch_mask_definition_by_idx(conn, mask_idx)
+        exact = deprecated_read(
+            kind=DefinitionKind.MASK,
+            idx=mask_idx,
+            deprecated=groups.definitions[(DefinitionKind.MASK, mask_idx)].deprecated,
+            deprecation_reason=mask["deprecation_reason"],
+            include_deprecated=include_deprecated,
+        )
+        group = [mask_idx] if exact else sorted(groups.group_of(DefinitionKind.MASK, mask_idx))
         references = await fetch_mask_syndna_references(conn, group)
         rows = await fetch_syndna_export_roster(
             conn,
@@ -472,7 +486,7 @@ async def get_syndna_read_count_route(
         await authorize_prep_sample_cohort(
             conn, caller=caller, prep_sample_idx=selected, min_tier=COHORT_MIN_TIER
         )
-        resolution = await resolve_group(
+        resolution = await (resolve_exact if exact else resolve_group)(
             conn,
             kind=DefinitionKind.MASK,
             definition_idx=mask_idx,
@@ -542,6 +556,8 @@ async def get_syndna_read_count_route(
             if r["prep_sample_idx"] in mask_by_sample
         ],
         left_out=left_out,
+        deprecated=exact,
+        deprecation_reason=mask["deprecation_reason"] if exact else None,
     )
     if sees_resolution_tickets(caller):
         return response

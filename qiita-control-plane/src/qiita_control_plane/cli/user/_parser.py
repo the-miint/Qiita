@@ -1096,6 +1096,14 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_mask_syndna.add_argument(
+        "--include-deprecated",
+        action="store_true",
+        help=(
+            "Read a deprecated --mask-idx's own counts, without its group (refused"
+            " without this flag); a mask that is not deprecated reads its group either way"
+        ),
+    )
+    p_mask_syndna.add_argument(
         "--prefix-pool",
         action="store_true",
         help=(

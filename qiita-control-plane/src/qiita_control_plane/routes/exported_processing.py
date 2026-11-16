@@ -41,7 +41,7 @@ from ..repositories.exported_processing import (
     mint_exported_processing,
 )
 from ..repositories.mask_definition import MaskDefinitionDeprecated, MaskDefinitionNotFound
-from ._helpers import authorize_completed_alignment_cohort
+from ._helpers import authorize_completed_alignment_cohort, refuse_deprecated_mask_read
 
 router = APIRouter(prefix=PATH_EXPORTED_PROCESSING_PREFIX, tags=["exported-processing"])
 
@@ -115,15 +115,19 @@ async def mint_exported_mask_processing_handle(
     produced each file without naming our `mask_idx`.
 
     **Idempotent.** Re-requesting a mask returns the handle it already has. 404 for
-    an unknown mask; 409 for a deprecated one, whose config is void.
+    an unknown mask; 409 for a deprecated one unless `include_deprecated`
+    (`deprecated_read`).
     """
     try:
         row = await mint_exported_mask_processing(
-            pool, mask_idx=body.mask_idx, created_by_idx=caller.principal_idx
+            pool,
+            mask_idx=body.mask_idx,
+            created_by_idx=caller.principal_idx,
+            include_deprecated=body.include_deprecated,
         )
     except MaskDefinitionNotFound as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except MaskDefinitionDeprecated as exc:
-        raise HTTPException(status_code=409, detail=exc.detail) from exc
+    except MaskDefinitionDeprecated:
+        await refuse_deprecated_mask_read(pool, body.mask_idx)
 
     return ExportedMaskProcessingResponse.model_validate(dict(row))

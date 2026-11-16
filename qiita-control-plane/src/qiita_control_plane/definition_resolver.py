@@ -49,10 +49,18 @@ nothing to align. No member → `not_processed` / `no_run`.
      produced no contigs, `not_processed` / `no_data`: there is nothing to read.
 A not-processed member is not replaced by an older one.
 
+**Exact mode** (`resolve_exact`) reads one definition's own runs, for a caller that
+names a deprecated definition on purpose. The member is the named definition only,
+never another of its group; rules 1, 2, 5 and 6 apply as above; rules 3 and 4 (the
+definition or an upstream deprecated) are not checked; and each upstream is
+resolved in exact mode too (its own definition, no group), so rule 5's
+`upstream_moved` cannot arise.
+
 **Public API**:
   - `async resolve_group(conn, *, kind, definition_idx, prep_sample_idxs, groups=None)
     -> GroupResolution`, in the caller's transaction, which must be REPEATABLE READ;
     loads the groups when not given them. Raises `DefinitionNotFound`.
+    `resolve_exact`, with the same signature, resolves in exact mode.
   - `GroupResolution.samples[prep_sample_idx] -> SampleResolution` (the
     qiita-common wire model) and `GroupResolution.not_resolved_to(idx)`.
   - `require_observable(groups, kind, definition_idx)`: raises
@@ -123,6 +131,7 @@ __all__ = [
     "cohort_refusal",
     "needed_definitions",
     "require_observable",
+    "resolve_exact",
     "resolve_group",
     "resolve_sample",
     "upstreams",
@@ -293,18 +302,25 @@ def upstreams(groups: Groups, kind: DefinitionKind, idx: int) -> list[tuple[Defi
     ]
 
 
+def _members(groups: Groups, kind: DefinitionKind, idx: int, *, exact: bool) -> set[int]:
+    """The definitions a resolution of `kind` `idx` chooses among: its group, or in
+    exact mode `idx` alone."""
+    return {idx} if exact else set(groups.group_of(kind, idx))
+
+
 def needed_definitions(
-    groups: Groups, kind: DefinitionKind, definition_idx: int
+    groups: Groups, kind: DefinitionKind, definition_idx: int, *, exact: bool = False
 ) -> dict[DefinitionKind, set[int]]:
     """Every definition that resolving `kind` `definition_idx`'s group reads runs of:
-    the group's members and, recursively, the groups of their upstreams."""
+    the group's members and, recursively, the groups of their upstreams (in exact
+    mode, the definition and its upstreams only)."""
     out: dict[DefinitionKind, set[int]] = {}
     stack = [(kind, definition_idx)]
     while stack:
         k, idx = stack.pop()
         if idx in out.get(k, ()):
             continue
-        members = groups.group_of(k, idx)
+        members = _members(groups, k, idx, exact=exact)
         out.setdefault(k, set()).update(members)
         for member in members:
             stack.extend(upstreams(groups, k, member))
@@ -367,16 +383,18 @@ def resolve_sample(
     definition_idx: int,
     prep_sample_idx: int,
     observations: Observations,
+    *,
+    exact: bool = False,
 ) -> SampleResolution:
     """`prep_sample_idx`'s resolution in `kind` `definition_idx`'s group, by the
-    rules in the module docstring. `observations` must cover
-    `needed_definitions(groups, kind, definition_idx)`; a missing entry reads as
-    no gate row and no ticket."""
+    rules in the module docstring (in exact mode with `exact`). `observations` must
+    cover `needed_definitions(groups, kind, definition_idx, exact=exact)`; a missing
+    entry reads as no gate row and no ticket."""
     kind_obs = observations.get(kind, {})
     empty = RunObservation()
     with_run: list[int] = []
     nothing_to_align: list[int] = []
-    for m in groups.group_of(kind, definition_idx):
+    for m in sorted(_members(groups, kind, definition_idx, exact=exact)):
         if _has_run(kind, kind_obs.get((m, prep_sample_idx), empty)):
             with_run.append(m)
         elif _assembled_nothing(groups, kind, m, prep_sample_idx, observations):
@@ -406,7 +424,7 @@ def resolve_sample(
             reason=SampleResolutionReason.WITHDRAWN,
         )
     definition = groups.definitions.get((kind, member))
-    if definition is not None and definition.deprecated:
+    if not exact and definition is not None and definition.deprecated:
         return result(
             SampleResolutionState.NOT_PROCESSED,
             definition_idx=member,
@@ -415,7 +433,7 @@ def resolve_sample(
     ups = upstreams(groups, kind, member)
     for up_kind, up_idx in ups:
         up_definition = groups.definitions.get((up_kind, up_idx))
-        if up_definition is not None and up_definition.deprecated:
+        if not exact and up_definition is not None and up_definition.deprecated:
             return result(
                 SampleResolutionState.NOT_PROCESSED,
                 definition_idx=member,
@@ -423,7 +441,7 @@ def resolve_sample(
                 upstream=(up_kind, up_idx),
             )
     for up_kind, up_idx in ups:
-        up = resolve_sample(groups, up_kind, up_idx, prep_sample_idx, observations)
+        up = resolve_sample(groups, up_kind, up_idx, prep_sample_idx, observations, exact=exact)
         if up.state is SampleResolutionState.PROCESSED:
             if up.definition_idx == up_idx:
                 continue
@@ -491,11 +509,13 @@ class DefinitionNotObservable(Exception):
         self.workflow = workflow
 
 
-def require_observable(groups: Groups, kind: DefinitionKind, definition_idx: int) -> None:
+def require_observable(
+    groups: Groups, kind: DefinitionKind, definition_idx: int, *, exact: bool = False
+) -> None:
     """Raise DefinitionNotObservable when resolving `kind` `definition_idx` would read a
     processing (a member, or an upstream of one) of a workflow outside
     `PROCESSING_RUN_WORKFLOWS`."""
-    needed = needed_definitions(groups, kind, definition_idx)
+    needed = needed_definitions(groups, kind, definition_idx, exact=exact)
     for processing_idx in sorted(needed.get(DefinitionKind.PROCESSING, ())):
         workflow = groups.definitions[(DefinitionKind.PROCESSING, processing_idx)].workflow
         if workflow not in PROCESSING_RUN_WORKFLOWS:
@@ -505,12 +525,14 @@ def require_observable(groups: Groups, kind: DefinitionKind, definition_idx: int
 @dataclass(frozen=True)
 class GroupResolution:
     """The resolution of `prep_sample_idxs` in one group. `group` is the members,
-    ascending; `samples` is keyed by prep_sample_idx, ascending."""
+    ascending (the named definition alone when `exact`); `samples` is keyed by
+    prep_sample_idx, ascending."""
 
     kind: DefinitionKind
     definition_idx: int
     group: tuple[int, ...]
     samples: Mapping[int, SampleResolution]
+    exact: bool = False
 
     def not_resolved_to(self, definition_idx: int) -> list[SampleResolution]:
         """The prep_samples not `processed` under exactly `definition_idx`, ascending."""
@@ -543,6 +565,45 @@ async def resolve_group(
     passing its own must have loaded it in this transaction. Raises
     DefinitionNotFound when `definition_idx` is not a `kind` definition, and
     DefinitionNotObservable (`require_observable`)."""
+    return await _resolve(
+        conn,
+        kind=kind,
+        definition_idx=definition_idx,
+        prep_sample_idxs=prep_sample_idxs,
+        groups=groups,
+        exact=False,
+    )
+
+
+async def resolve_exact(
+    conn: asyncpg.Connection,
+    *,
+    kind: DefinitionKind,
+    definition_idx: int,
+    prep_sample_idxs: Iterable[int],
+    groups: Groups | None = None,
+) -> GroupResolution:
+    """`resolve_group` in exact mode (module docstring): `definition_idx`'s own runs,
+    its deprecation and its upstreams' not checked."""
+    return await _resolve(
+        conn,
+        kind=kind,
+        definition_idx=definition_idx,
+        prep_sample_idxs=prep_sample_idxs,
+        groups=groups,
+        exact=True,
+    )
+
+
+async def _resolve(
+    conn: asyncpg.Connection,
+    *,
+    kind: DefinitionKind,
+    definition_idx: int,
+    prep_sample_idxs: Iterable[int],
+    groups: Groups | None,
+    exact: bool,
+) -> GroupResolution:
     require_transaction(conn)
     # The gates, tickets and groups are read in several statements; below REPEATABLE
     # READ each takes its own snapshot, and a gate read `pending` before its ticket
@@ -556,13 +617,17 @@ async def resolve_group(
         groups = await load_groups(conn)
     if (kind, definition_idx) not in groups.definitions:
         raise DefinitionNotFound(kind, definition_idx)
-    require_observable(groups, kind, definition_idx)
+    require_observable(groups, kind, definition_idx, exact=exact)
     samples = sorted(set(prep_sample_idxs))
-    needed = needed_definitions(groups, kind, definition_idx)
+    needed = needed_definitions(groups, kind, definition_idx, exact=exact)
     observations = await _load_observations(conn, needed, samples)
     return GroupResolution(
         kind=kind,
         definition_idx=definition_idx,
-        group=tuple(sorted(groups.group_of(kind, definition_idx))),
-        samples={s: resolve_sample(groups, kind, definition_idx, s, observations) for s in samples},
+        group=tuple(sorted(_members(groups, kind, definition_idx, exact=exact))),
+        samples={
+            s: resolve_sample(groups, kind, definition_idx, s, observations, exact=exact)
+            for s in samples
+        },
+        exact=exact,
     )

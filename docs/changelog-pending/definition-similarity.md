@@ -36,11 +36,21 @@
   mask of the named mask's group that it resolves to (#874).** Each roster row gains
   `resolution` and the roster gains `group`; the export skips incomplete and
   not-processed prep_samples, lists them on stderr and exits 0. The export ticket
-  route refuses (409) a prep_sample that does not resolve to the mask it names, and,
-  with the roster, a deprecated mask. The SynDNA response gains `samples[].mask_idx`
-  and `left_out`, and returns the processed prep_samples instead of refusing the
-  request when some are not; masks of the group with another SynDNA reference are
-  refused.
+  route refuses (409) a prep_sample that does not resolve to the mask it names. The
+  SynDNA response gains `samples[].mask_idx` and `left_out`, and returns the
+  processed prep_samples instead of refusing the request when some are not; masks
+  of the group with another SynDNA reference are refused.
+- **A deprecated mask named by the masked-read export, the SynDNA count export or
+  the two mask-handle mints is refused (409, `reason` `deprecated`) unless the caller
+  passes `--include-deprecated` (API `include_deprecated`) (#874).** With it, each
+  prep_sample is read from that mask alone, never another of its group: its own
+  completed runs (a withdrawn run stays unreadable), and the SynDNA counts are the
+  mask's own stored ones. The roster and the SynDNA response are marked `deprecated`
+  with the `deprecation_reason`, the CLIs say so on stderr, and each masked-read
+  export manifest entry records `"deprecated": true`. For a mask that is not
+  deprecated the flag changes nothing. Before this change the SynDNA export did not
+  refuse a deprecated mask: it read its group, leaving out each prep_sample that
+  resolved to the deprecated mask.
 - **`qiita feature-table build` takes repeated `--sequencing-run-idx` /
   `--sequenced-pool-idx` pairs and builds one table across the alignment's group
   (#874).** It reads each prep_sample from the alignment that it resolves to. Over the

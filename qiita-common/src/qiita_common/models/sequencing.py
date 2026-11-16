@@ -1196,6 +1196,10 @@ class SyndnaReadCountResponse(BaseModel):
     prep_samples that are `incomplete` or `not_processed`, with the reason, ascending
     by prep_sample_idx. The counts are reads with a mapped primary alignment to each
     insert, ungated (see qiita.syndna_read_count).
+
+    `deprecated` is true for a read of a deprecated mask under `include_deprecated`:
+    each prep_sample was then resolved to that mask alone (`definition_resolver`,
+    exact mode), and `deprecation_reason` is the mask's.
     """
 
     mask_idx: Annotated[int, Field(gt=0)]
@@ -1203,6 +1207,8 @@ class SyndnaReadCountResponse(BaseModel):
     inserts: list[SyndnaInsert]
     samples: list[SyndnaReadCountSample]
     left_out: list[SampleResolution] = []
+    deprecated: bool = False
+    deprecation_reason: str | None = None
 
     @model_validator(mode="after")
     def _counts_follow_inserts(self) -> SyndnaReadCountResponse:
@@ -1742,6 +1748,8 @@ class ExportedMaskProcessingRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     mask_idx: Annotated[int, Field(gt=0)]
+    # Admits a deprecated mask (refused without it), as on the masked-read export.
+    include_deprecated: bool = False
 
 
 class ExportedMaskProcessingResponse(BaseModel):
@@ -1767,6 +1775,8 @@ class ExportedMaskIdentifierRequest(BaseModel):
 
     mask_idx: Annotated[int, Field(gt=0)]
     prep_sample_idx: PrepSampleCohort
+    # Admits a deprecated mask (refused without it), as on the masked-read export.
+    include_deprecated: bool = False
 
 
 class ExportedMaskIdentifierResponse(BaseModel):
@@ -1789,6 +1799,10 @@ class MaskedReadExportManifest(BaseModel):
     (POST /admin/masked-read-export/ticket) under each processed prep_sample's
     `resolution.definition_idx` and streams its read_masked rows from the data plane,
     writing parquet/fastq locally. system_admin + admin:masked_read_export only.
+
+    `deprecated` is true for a deprecated mask read under `include_deprecated`:
+    `group` is then the mask alone and each prep_sample is resolved to it exactly
+    (`definition_resolver`, exact mode); `deprecation_reason` is the mask's.
     """
 
     sequenced_pool_idx: Annotated[int, Field(gt=0)]
@@ -1796,6 +1810,8 @@ class MaskedReadExportManifest(BaseModel):
     mask_idx: Annotated[int, Field(gt=0)]
     group: list[Annotated[int, Field(gt=0)]]
     samples: list[MaskedReadExportSample]
+    deprecated: bool = False
+    deprecation_reason: str | None = None
 
 
 class MaskedReadExportTicketRequest(BaseModel):
@@ -1813,3 +1829,6 @@ class MaskedReadExportTicketRequest(BaseModel):
 
     prep_sample_idx: Annotated[int, Field(gt=0)]
     mask_idx: Annotated[int, Field(gt=0)]
+    # A deprecated mask is refused unless set; then the prep_sample must resolve to
+    # it exactly (`definition_resolver`, exact mode).
+    include_deprecated: bool = False

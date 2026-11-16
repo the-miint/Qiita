@@ -655,6 +655,16 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_export.add_argument(
+        "--include-deprecated",
+        action="store_true",
+        dest="include_deprecated",
+        help=(
+            "Export a deprecated --mask-idx's own reads, without its group (refused"
+            " without this flag); each prep_sample must be processed under that mask"
+            " itself. A mask that is not deprecated exports its group either way"
+        ),
+    )
+    p_export.add_argument(
         "--allow-partial",
         action="store_true",
         dest="allow_partial",

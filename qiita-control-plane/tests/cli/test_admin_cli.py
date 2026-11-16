@@ -1673,6 +1673,55 @@ def _ticket_masks(monkeypatch, served):
     return tickets, recording
 
 
+def test_masked_read_export_of_a_deprecated_mask_passes_the_flag_and_marks_the_read(
+    monkeypatch, tmp_path, capsys
+):
+    """--include-deprecated reaches the roster GET; a roster marked deprecated sends
+    the flag on every mint and ticket, says so on stderr, and records it per file."""
+    import json as _json
+
+    from qiita_common.api_paths import PATH_ADMIN_MASKED_READ_EXPORT_TICKET
+
+    from qiita_control_plane.cli import _common
+    from qiita_control_plane.cli import admin as cli
+    from qiita_control_plane.cli.admin.masked_export import MANIFEST_NAME
+
+    monkeypatch.setenv("QIITA_TOKEN", "qk_admin")
+    roster = {
+        "sequenced_pool_idx": 7,
+        "sequencing_run_idx": 5,
+        "mask_idx": 3,
+        "deprecated": True,
+        "deprecation_reason": "kept host reads",
+        "samples": [{"prep_sample_idx": 42, "biosample_accession": "SAMN_A"}],
+    }
+    mints: list = []
+    served = _fake_masked_export_http(roster, mints)
+    seen: dict[str, list] = {"params": [], "tickets": []}
+
+    def recording(method, url, **kw):
+        if method == "GET":
+            seen["params"].append(kw.get("params"))
+        if method == "POST" and url.endswith(PATH_ADMIN_MASKED_READ_EXPORT_TICKET):
+            seen["tickets"].append(kw["json"])
+        return served(method, url, **kw)
+
+    monkeypatch.setattr(_common.httpx, "request", recording)
+    monkeypatch.setattr("pyarrow.flight.FlightClient", _fake_flight_client_class(_group_tables()))
+
+    out_dir = tmp_path / "exp"
+    assert cli.main(_export_argv(out_dir, "parquet", "--include-deprecated")) == 0
+
+    assert seen["params"] == [{"mask_idx": 3, "include_deprecated": "true"}]
+    assert seen["tickets"] == [{"prep_sample_idx": 42, "mask_idx": 3, "include_deprecated": True}]
+    assert all(body["include_deprecated"] is True for _, body in mints)
+    entry = _json.loads((out_dir / MANIFEST_NAME).read_text())["files"]["SAMN_A.QM542.parquet"]
+    assert entry["deprecated"] is True
+    err = capsys.readouterr().err
+    assert "mask 3 is deprecated (kept host reads)" in err
+    assert "--include-deprecated" in err
+
+
 def test_masked_read_export_exports_each_processed_sample_from_its_mask(
     monkeypatch, tmp_path, capsys
 ):

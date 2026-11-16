@@ -355,6 +355,13 @@ that pair would split a group that other `similar` pairs may rely on. The proced
   does not resolve to the definition they name. `resolve_group` runs only in a
   REPEATABLE READ transaction, and says why. Its module docstring holds the rules,
   among them which failed tickets it ignores as stale.
+- **A deprecated definition read on purpose.** Deprecation stops new processing; it
+  does not forbid reading existing results. A route that names a deprecated mask
+  refuses (409) unless the caller sets `include_deprecated`
+  (`routes/_helpers.deprecated_read`); with it, the resolver's exact mode
+  (`resolve_exact`) reads that definition's own runs, without its group, and the
+  output is marked deprecated. The masked-read export routes, the mask-handle mints
+  and the SynDNA count export take the flag.
 - **The group lock** is one Postgres advisory lock over every kind's groups
   (`repositories/definition_pair.py`). A decide or revoke takes it exclusive, by
   try-lock with a bounded retry and a 503 when it stays busy; the three deprecation

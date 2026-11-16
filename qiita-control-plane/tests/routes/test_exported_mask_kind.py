@@ -217,14 +217,50 @@ async def test_an_unknown_mask_is_refused(role_keyed_clients, seeded, url, body)
 
 
 @pytest.mark.parametrize(("url", "body"), _ROUTES)
-async def test_a_deprecated_mask_is_refused(role_keyed_clients, seeded, url, body):
+async def test_a_deprecated_mask_is_refused_without_the_flag(role_keyed_clients, seeded, url, body):
     await _deprecate(seeded["pool"], seeded["mask_idx"], seeded["owner"])
     resp = await role_keyed_clients["admin"].post(url, json=body(seeded))
     assert resp.status_code == 409, resp.text
-    assert "deprecated" in resp.json()["detail"]
+    detail = resp.json()["detail"]
+    assert (detail["reason"], detail["deprecation_reason"]) == ("deprecated", "probe: config void")
+    assert "--include-deprecated" in detail["detail"]
     minted = await seeded["pool"].fetchval(
         "SELECT (SELECT count(*) FROM qiita.exported_processing WHERE mask_idx = $1)"
         "     + (SELECT count(*) FROM qiita.exported_identifier WHERE mask_idx = $1)",
         seeded["mask_idx"],
     )
     assert minted == 0
+
+
+@pytest.mark.parametrize(("url", "body"), _ROUTES)
+async def test_a_deprecated_mask_is_minted_under_the_flag(role_keyed_clients, seeded, url, body):
+    await _deprecate(seeded["pool"], seeded["mask_idx"], seeded["owner"])
+    resp = await role_keyed_clients["admin"].post(
+        url, json=body(seeded) | {"include_deprecated": True}
+    )
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["mask_idx"] == seeded["mask_idx"]
+
+
+async def test_the_flag_keeps_the_completion_rule(role_keyed_clients, seeded):
+    await _deprecate(seeded["pool"], seeded["mask_idx"], seeded["owner"])
+    resp = await role_keyed_clients["admin"].post(
+        URL_EXPORTED_IDENTIFIER_MASK,
+        json={
+            "mask_idx": seeded["mask_idx"],
+            "prep_sample_idx": [seeded["ps_done"], seeded["ps_pending"]],
+            "include_deprecated": True,
+        },
+    )
+    assert resp.status_code == 409, resp.text
+    assert str(seeded["ps_pending"]) in resp.json()["detail"]
+
+
+@pytest.mark.parametrize(("url", "body"), _ROUTES)
+async def test_an_active_mask_with_the_flag_mints_as_without(role_keyed_clients, seeded, url, body):
+    plain = await role_keyed_clients["admin"].post(url, json=body(seeded))
+    flagged = await role_keyed_clients["admin"].post(
+        url, json=body(seeded) | {"include_deprecated": True}
+    )
+    assert (plain.status_code, flagged.status_code) == (201, 201)
+    assert plain.json() == flagged.json()

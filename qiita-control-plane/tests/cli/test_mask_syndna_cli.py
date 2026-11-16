@@ -252,3 +252,26 @@ def test_species_without_a_data_plane_url_and_no_selector_are_usage_errors(monke
         _run(monkeypatch, tmp_path, "--study-idx", "1", "--output", out)
     with pytest.raises(SystemExit):
         _run(monkeypatch, tmp_path, "--output", out, *_DP)
+
+
+def test_include_deprecated_reaches_the_route_and_the_read_is_marked(monkeypatch, tmp_path, capsys):
+    """--include-deprecated is sent as `include_deprecated=true`; a response marked
+    deprecated is said so on stderr."""
+    seen: list[dict] = []
+    body = _TWO.model_dump(mode="json") | {"deprecated": True, "deprecation_reason": "bad host"}
+
+    def fake_call(method, base_url, token, path, **kw):
+        seen.append(kw.get("params"))
+        return body
+
+    monkeypatch.setenv("QIITA_TOKEN", "t")
+    monkeypatch.setattr(mx._common, "call", fake_call)
+    out = tmp_path / "syndna.parquet"
+    argv = ["--base-url", "https://cp", "mask", "syndna-read-count", "--mask-idx", "3"]
+    argv += ["--study-idx", "1", "--output", str(out), "--format", "parquet"]
+    argv += ["--feature-names", "accession", "--include-deprecated"]
+    assert cli.main(argv) == 0
+    assert seen == [{"study_idx": "1", "include_deprecated": "true"}]
+    err = capsys.readouterr().err
+    assert "mask 3 is deprecated (bad host)" in err
+    assert "--include-deprecated" in err

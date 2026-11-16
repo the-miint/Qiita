@@ -351,6 +351,65 @@ def test_an_alignment_with_no_upstream_mask_run_is_upstream_no_run():
 
 
 # ---------------------------------------------------------------------------
+# Exact mode
+# ---------------------------------------------------------------------------
+
+
+def resolve_exact_sample(definitions, pairs, kind, idx, observations):
+    groups = compute_groups(definitions, pairs)
+    return resolve_sample(groups, kind, idx, S, observations, exact=True)
+
+
+def test_exact_mode_reads_a_deprecated_definition():
+    defs = [mask(5, deprecated=True)]
+    r = resolve_exact_sample(defs, [], MASK, 5, {MASK: {(5, S): done()}})
+    assert (r.state, r.definition_idx, r.reason) == (PROCESSED, 5, None)
+
+
+def test_exact_mode_keeps_a_withdrawn_run_unreadable():
+    defs = [mask(5, deprecated=True)]
+    obs = {MASK: {(5, S): gate(MASK_SAMPLE_INVALIDATED)}}
+    r = resolve_exact_sample(defs, [], MASK, 5, obs)
+    assert (r.state, r.reason) == (NOT_PROCESSED, R.WITHDRAWN)
+
+
+def test_exact_mode_ignores_a_newer_group_member():
+    obs = {MASK: {(5, S): done(), (12, S): done()}}
+    r = resolve_exact_sample(DEFS, PAIRS, MASK, 5, obs)
+    assert (r.state, r.definition_idx) == (PROCESSED, 5)
+    assert resolve(DEFS, PAIRS, MASK, 5, obs).definition_idx == 12
+    r = resolve_exact_sample(DEFS, PAIRS, MASK, 5, {MASK: {(12, S): done()}})
+    assert (r.state, r.reason) == (NOT_PROCESSED, R.NO_RUN)
+
+
+def test_exact_mode_refuses_a_withdrawn_upstream_run_and_reads_a_deprecated_one():
+    defs = [mask(5, deprecated=True), block(50, 5, deprecated=True)]
+    withdrawn = {MASK: {(5, S): gate(MASK_SAMPLE_INVALIDATED)}, ALIGNMENT: {(50, S): done()}}
+    r = resolve_exact_sample(defs, [], ALIGNMENT, 50, withdrawn)
+    assert (r.state, r.reason, r.upstream_definition_idx) == (
+        NOT_PROCESSED,
+        R.UPSTREAM_WITHDRAWN,
+        5,
+    )
+    obs = {MASK: {(5, S): done()}, ALIGNMENT: {(50, S): done()}}
+    r = resolve_exact_sample(defs, [], ALIGNMENT, 50, obs)
+    assert (r.state, r.definition_idx, r.mask_idx) == (PROCESSED, 50, 5)
+
+
+def test_exact_mode_does_not_move_with_the_upstream_group():
+    """Aligned on 50 over mask 5, masked under 5 and 12: the group resolution says
+    upstream_moved; the exact read of 50 reads it."""
+    obs = {MASK: {(5, S): done(), (12, S): done()}, ALIGNMENT: {(50, S): done()}}
+    r = resolve_exact_sample(DEFS, PAIRS, ALIGNMENT, 50, obs)
+    assert (r.state, r.definition_idx) == (PROCESSED, 50)
+
+
+def test_exact_needed_definitions_are_the_definition_and_its_upstreams():
+    groups = compute_groups(DEFS, PAIRS)
+    assert needed_definitions(groups, ALIGNMENT, 50, exact=True) == {ALIGNMENT: {50}, MASK: {5}}
+
+
+# ---------------------------------------------------------------------------
 # Downstream counts only on the resolved upstream
 # ---------------------------------------------------------------------------
 

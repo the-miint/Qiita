@@ -378,3 +378,99 @@ async def test_a_selector_is_required(ctx):
     mask_idx = await _seed_syndna_mask(ctx)
     resp = await ctx["wet"].get(_url(mask_idx))
     assert resp.status_code == 422, resp.text
+
+
+# ---------------------------------------------------------------------------
+# A deprecated mask, read on purpose
+# ---------------------------------------------------------------------------
+
+
+async def _deprecate_mask(ctx, mask_idx: int) -> None:
+    await ctx["pool"].execute(
+        "UPDATE qiita.mask_definition SET status = 'deprecated', deprecated_at = now(),"
+        " deprecated_by_idx = $2, deprecation_reason = 'kept host reads'"
+        " WHERE mask_idx = $1",
+        mask_idx,
+        ctx["admin_session"]["principal_idx"],
+    )
+
+
+async def test_a_deprecated_mask_is_refused_without_the_flag(ctx):
+    mask_idx = await _seed_syndna_mask(ctx)
+    study_idx = await _viewer_study(ctx)
+    await _counted_sample(ctx, mask_idx=mask_idx, study_idx=study_idx)
+    await _deprecate_mask(ctx, mask_idx)
+
+    resp = await ctx["user"].get(_url(mask_idx), params={"study_idx": study_idx})
+
+    assert resp.status_code == 409, resp.text
+    detail = resp.json()["detail"]
+    assert (detail["reason"], detail["deprecation_reason"]) == ("deprecated", "kept host reads")
+    assert "--include-deprecated" in detail["detail"]
+
+
+async def test_a_deprecated_mask_read_under_the_flag_returns_its_own_counts(ctx):
+    """The counts are the mask's stored ones, as an exact-mask read returns them (a
+    completed gate, the counts in insert order); a withdrawn run and a sample with no
+    run are left out; the response is marked deprecated."""
+    mask_idx = await _seed_syndna_mask(ctx)
+    study_idx = await _viewer_study(ctx)
+    ps1, _ = await _counted_sample(ctx, mask_idx=mask_idx, study_idx=study_idx, counts=(5, 0))
+    ps2, _ = await _counted_sample(ctx, mask_idx=mask_idx, study_idx=study_idx, counts=(1, 9))
+    withdrawn, _ = await _counted_sample(
+        ctx, mask_idx=mask_idx, study_idx=study_idx, counts=(3, 3), state="pending"
+    )
+    await ctx["pool"].execute(
+        "UPDATE qiita.mask_sample SET state = 'invalidated', invalidated_at = now(),"
+        " invalidated_by_idx = $3, invalidation_reason = 'withdrawn by a test'"
+        " WHERE mask_idx = $1 AND prep_sample_idx = $2",
+        mask_idx,
+        withdrawn,
+        ctx["admin_session"]["principal_idx"],
+    )
+    await _deprecate_mask(ctx, mask_idx)
+
+    resp = await ctx["user"].get(
+        _url(mask_idx), params={"study_idx": study_idx, "include_deprecated": "true"}
+    )
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert (body["deprecated"], body["deprecation_reason"]) == (True, "kept host reads")
+    stored = await ctx["pool"].fetch(
+        "SELECT prep_sample_idx, array_agg(read_count ORDER BY array_position($3::bigint[],"
+        " feature_idx)) AS counts"
+        "  FROM qiita.syndna_read_count rc"
+        "  JOIN qiita.mask_sample ms USING (mask_idx, prep_sample_idx)"
+        " WHERE rc.mask_idx = $1 AND rc.prep_sample_idx = ANY($2::bigint[])"
+        "   AND ms.state = 'completed'"
+        " GROUP BY prep_sample_idx ORDER BY prep_sample_idx",
+        mask_idx,
+        [ps1, ps2, withdrawn],
+        ctx["inserts"],
+    )
+    assert [(s["prep_sample_idx"], s["mask_idx"], s["read_counts"]) for s in body["samples"]] == [
+        (r["prep_sample_idx"], mask_idx, list(r["counts"])) for r in stored
+    ]
+    assert [(s["prep_sample_idx"], s["read_counts"]) for s in body["samples"]] == [
+        (ps1, [5, 0]),
+        (ps2, [1, 9]),
+    ]
+    assert [(r["prep_sample_idx"], r["reason"]) for r in body["left_out"]] == [
+        (withdrawn, "withdrawn")
+    ]
+
+
+async def test_an_active_mask_with_the_flag_reads_as_without(ctx):
+    mask_idx = await _seed_syndna_mask(ctx)
+    study_idx = await _viewer_study(ctx)
+    await _counted_sample(ctx, mask_idx=mask_idx, study_idx=study_idx)
+
+    plain = await ctx["user"].get(_url(mask_idx), params={"study_idx": study_idx})
+    flagged = await ctx["user"].get(
+        _url(mask_idx), params={"study_idx": study_idx, "include_deprecated": "true"}
+    )
+
+    assert (plain.status_code, flagged.status_code) == (200, 200)
+    assert plain.json() == flagged.json()
+    assert flagged.json()["deprecated"] is False

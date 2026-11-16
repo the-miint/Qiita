@@ -7,7 +7,7 @@ from collections.abc import Sequence
 import asyncpg
 
 from .block import MASK_SAMPLE_COMPLETED
-from .mask_definition import lock_active_mask
+from .mask_definition import lock_active_mask, lock_mask
 
 # Every caller-visible column, plus the accessions that ride along for
 # information. Both accessions are LEFT-joined and nullable: an unaccessioned
@@ -158,6 +158,7 @@ async def mint_exported_mask_identifiers(
     mask_idx: int,
     prep_sample_idxs: list[int],
     created_by_idx: int,
+    include_deprecated: bool = False,
 ) -> list[asyncpg.Record]:
     """Ensure a live `export_id` exists for every `(mask_idx, prep_sample)` pair,
     and return them ascending by prep_sample_idx.
@@ -166,7 +167,8 @@ async def mint_exported_mask_identifiers(
     index over live `(mask_idx, prep_sample_idx)` rows. In one transaction:
 
     * `lock_active_mask` holds the mask row `FOR SHARE`, raising
-      `MaskDefinitionNotFound` or `MaskDefinitionDeprecated`;
+      `MaskDefinitionNotFound` or `MaskDefinitionDeprecated` (`lock_mask`, which
+      admits a deprecated mask, with `include_deprecated`);
     * every cohort member must have `mask_sample.state = 'completed'` under the mask,
       else `MaskSampleNotCompleteError` and nothing is minted;
     * the INSERT and SELECT, then the same all-or-nothing check as the alignment
@@ -174,7 +176,7 @@ async def mint_exported_mask_identifiers(
     """
     cohort = sorted(set(prep_sample_idxs))
     async with pool.acquire() as conn, conn.transaction():
-        await lock_active_mask(conn, mask_idx)
+        await (lock_mask if include_deprecated else lock_active_mask)(conn, mask_idx)
         completed = await conn.fetch(
             "SELECT prep_sample_idx FROM qiita.mask_sample"
             " WHERE mask_idx = $1 AND prep_sample_idx = ANY($2::bigint[]) AND state = $3",

@@ -198,25 +198,118 @@ async def _deprecated_mask(ctx) -> int:
     return mask_idx
 
 
-async def test_roster_refuses_a_deprecated_mask(ctx, group):
-    mask_idx = await _deprecated_mask(ctx)
-    resp = await ctx["admin"].get(_roster_url(group["pool_idx"]), params={"mask_idx": mask_idx})
+def _refused_as_deprecated(resp) -> None:
     assert resp.status_code == 409, resp.text
-    assert "deprecated" in resp.json()["detail"]
+    detail = resp.json()["detail"]
+    assert (detail["reason"], detail["deprecation_reason"]) == (
+        "deprecated",
+        "filter found to keep host reads",
+    )
+    assert "--include-deprecated" in detail["detail"]
 
 
-async def test_ticket_refuses_a_deprecated_mask_even_when_completed(ctx, group):
-    """A completed gate does not make a deprecated mask exportable by name."""
+async def _withdrawn_gate(ctx, *, mask_idx: int, prep_sample_idx: int) -> None:
+    await ctx["pool"].execute(
+        "INSERT INTO qiita.mask_sample (mask_idx, prep_sample_idx, state, invalidated_at,"
+        " invalidated_by_idx, invalidation_reason)"
+        " VALUES ($1, $2, 'invalidated', now(), $3, 'withdrawn by a test')",
+        mask_idx,
+        prep_sample_idx,
+        ctx["admin_session"]["principal_idx"],
+    )
+
+
+async def test_roster_refuses_a_deprecated_mask_without_the_flag(ctx, group):
+    mask_idx = await _deprecated_mask(ctx)
+    _refused_as_deprecated(
+        await ctx["admin"].get(_roster_url(group["pool_idx"]), params={"mask_idx": mask_idx})
+    )
+
+
+async def test_roster_reads_a_deprecated_mask_exactly_under_the_flag(ctx, group):
+    """Each prep_sample is resolved to the deprecated mask alone: completed there is
+    processed, withdrawn there stays not processed, no run is no_run."""
+    mask_idx = await _deprecated_mask(ctx)
+    await _seed_gate_row(
+        ctx, mask_idx=mask_idx, prep_sample_idx=group["on_low"], state=MASK_SAMPLE_COMPLETED
+    )
+    await _withdrawn_gate(ctx, mask_idx=mask_idx, prep_sample_idx=group["on_both"])
+    resp = await ctx["admin"].get(
+        _roster_url(group["pool_idx"]),
+        params={"mask_idx": mask_idx, "include_deprecated": "true"},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert (body["deprecated"], body["deprecation_reason"], body["group"]) == (
+        True,
+        "filter found to keep host reads",
+        [mask_idx],
+    )
+    by_sample = {s["prep_sample_idx"]: s["resolution"] for s in body["samples"]}
+    assert (by_sample[group["on_low"]]["state"], by_sample[group["on_low"]]["definition_idx"]) == (
+        "processed",
+        mask_idx,
+    )
+    assert by_sample[group["on_both"]]["reason"] == "withdrawn"
+    assert by_sample[group["none"]]["reason"] == "no_run"
+
+
+async def test_roster_of_an_active_mask_with_the_flag_is_as_without(ctx, group):
+    url = _roster_url(group["pool_idx"])
+    plain = await ctx["admin"].get(url, params={"mask_idx": group["low"]})
+    flagged = await ctx["admin"].get(
+        url, params={"mask_idx": group["low"], "include_deprecated": "true"}
+    )
+    assert (plain.status_code, flagged.status_code) == (200, 200)
+    assert plain.json() == flagged.json()
+    assert flagged.json()["deprecated"] is False
+
+
+async def test_ticket_refuses_a_deprecated_mask_without_the_flag(ctx, group):
+    """A completed gate does not make a deprecated mask exportable without the flag."""
     mask_idx = await _deprecated_mask(ctx)
     ps = group["on_low"]
     await _seed_gate_row(ctx, mask_idx=mask_idx, prep_sample_idx=ps, state=MASK_SAMPLE_COMPLETED)
-
-    resp = await ctx["admin"].post(
-        URL_ADMIN_MASKED_READ_EXPORT_TICKET, json={"prep_sample_idx": ps, "mask_idx": mask_idx}
+    _refused_as_deprecated(
+        await ctx["admin"].post(
+            URL_ADMIN_MASKED_READ_EXPORT_TICKET, json={"prep_sample_idx": ps, "mask_idx": mask_idx}
+        )
     )
 
-    assert resp.status_code == 409, resp.text
-    assert "deprecated" in resp.json()["detail"]
+
+async def test_ticket_reads_a_deprecated_mask_exactly_under_the_flag(ctx, group):
+    mask_idx = await _deprecated_mask(ctx)
+    ps = group["on_low"]
+    await _seed_gate_row(ctx, mask_idx=mask_idx, prep_sample_idx=ps, state=MASK_SAMPLE_COMPLETED)
+    await _withdrawn_gate(ctx, mask_idx=mask_idx, prep_sample_idx=group["on_both"])
+    ok = await ctx["admin"].post(
+        URL_ADMIN_MASKED_READ_EXPORT_TICKET,
+        json={"prep_sample_idx": ps, "mask_idx": mask_idx, "include_deprecated": True},
+    )
+    assert ok.status_code == 201, ok.text
+    withdrawn = await ctx["admin"].post(
+        URL_ADMIN_MASKED_READ_EXPORT_TICKET,
+        json={
+            "prep_sample_idx": group["on_both"],
+            "mask_idx": mask_idx,
+            "include_deprecated": True,
+        },
+    )
+    assert withdrawn.status_code == 409, withdrawn.text
+
+
+async def test_ticket_of_an_active_mask_with_the_flag_is_as_without(ctx, group):
+    """`on_low` resolves to `low` and `on_both` to `high`: the flag changes neither."""
+    for ps, mask, expected in (
+        (group["on_low"], group["low"], 201),
+        (group["on_both"], group["low"], 409),
+    ):
+        for flag in (False, True):
+            resp = await ctx["admin"].post(
+                URL_ADMIN_MASKED_READ_EXPORT_TICKET,
+                json={"prep_sample_idx": ps, "mask_idx": mask, "include_deprecated": flag},
+            )
+            assert resp.status_code == expected, (ps, flag, resp.text)
 
 
 async def test_ticket_under_each_resolved_member(ctx, group):

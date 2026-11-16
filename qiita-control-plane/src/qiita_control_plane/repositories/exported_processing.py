@@ -10,7 +10,7 @@ entirely minted.
 
 import asyncpg
 
-from .mask_definition import lock_active_mask
+from .mask_definition import lock_active_mask, lock_mask
 
 # The kind columns, each with its own partial unique index on live rows.
 # Interpolated into SQL, so the set is closed.
@@ -83,7 +83,7 @@ async def mint_exported_processing(
 
 
 async def mint_exported_mask_processing(
-    pool: asyncpg.Pool, *, mask_idx: int, created_by_idx: int
+    pool: asyncpg.Pool, *, mask_idx: int, created_by_idx: int, include_deprecated: bool = False
 ) -> asyncpg.Record:
     """Ensure a live `export_processing_id` exists for this mask, and return it as
     `(mask_idx, export_processing_id)`.
@@ -94,10 +94,11 @@ async def mint_exported_mask_processing(
     The mask row is held `FOR SHARE` for the transaction (`lock_active_mask`), so a
     deprecation or a delete cannot commit between the check and the INSERT. Raises
     `MaskDefinitionNotFound` for an unknown mask and `MaskDefinitionDeprecated` for a
-    deprecated one: a deprecated config is void, and a new export must not cite it.
+    deprecated one unless `include_deprecated` (an explicit read of the deprecated
+    mask's own results).
     """
     async with pool.acquire() as conn, conn.transaction():
-        await lock_active_mask(conn, mask_idx)
+        await (lock_mask if include_deprecated else lock_active_mask)(conn, mask_idx)
         return await _mint_live(
             conn, column="mask_idx", idx=mask_idx, created_by_idx=created_by_idx
         )

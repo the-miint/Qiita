@@ -16,6 +16,7 @@ from qiita_common.models import (
     NOT_SETTABLE_ON_LINKED_FIELD,
     STUDY_FIELD_IDX_ATTR,
     AlignmentDefinitionStatus,
+    DefinitionKind,
     DeprecationRefusal,
     IdxsListResponse,
     MetadataEntry,
@@ -88,7 +89,7 @@ from ..repositories.alignment_definition import (
     fetch_alignment_definition_by_idx,
 )
 from ..repositories.block import list_incomplete_alignment_samples
-from ..repositories.mask_definition import MaskHasLiveWork
+from ..repositories.mask_definition import MaskHasLiveWork, fetch_mask_definition_by_idx
 from ..repositories.study_access import CallerMetadataTiers
 
 REFERENCE_NOT_FOUND_DETAIL = "Reference not found"
@@ -173,6 +174,58 @@ def refuse_deprecated_alignment(alignment: asyncpg.Record) -> None:
                 f" {alignment['deprecation_reason']}"
             ),
         )
+
+
+# The CLI spelling of the flag every explicit read of a deprecated definition takes;
+# the API field and query parameter are `include_deprecated`.
+INCLUDE_DEPRECATED_FLAG = "--include-deprecated"
+
+
+def deprecated_read(
+    *,
+    kind: DefinitionKind,
+    idx: int,
+    deprecated: bool,
+    deprecation_reason: str | None,
+    include_deprecated: bool,
+) -> bool:
+    """Whether a read naming `kind` `idx` reads that definition's own results in exact
+    mode (`definition_resolver.resolve_exact`): only when it is deprecated and the
+    caller set `include_deprecated`. Deprecation stops new processing; it does not
+    forbid reading existing results on purpose, so a deprecated definition named
+    without the flag is a 409 that names the flag. A definition that is not
+    deprecated reads its group whatever the flag."""
+    if not deprecated:
+        return False
+    if include_deprecated:
+        return True
+    raise HTTPException(
+        status_code=409,
+        detail={
+            "detail": (
+                f"{kind.value} {idx} is deprecated: {deprecation_reason}. To read its own"
+                f" results, pass {INCLUDE_DEPRECATED_FLAG} (API: include_deprecated=true)"
+            ),
+            "reason": "deprecated",
+            "deprecation_reason": deprecation_reason,
+        },
+    )
+
+
+async def refuse_deprecated_mask_read(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection, mask_idx: int
+) -> NoReturn:
+    """`deprecated_read`'s 409 for a mask that a mint found deprecated without
+    `include_deprecated` (`MaskDefinitionDeprecated`)."""
+    row = await fetch_mask_definition_by_idx(pool_or_conn, mask_idx)
+    deprecated_read(
+        kind=DefinitionKind.MASK,
+        idx=mask_idx,
+        deprecated=True,
+        deprecation_reason=None if row is None else row["deprecation_reason"],
+        include_deprecated=False,
+    )
+    raise AssertionError("deprecated_read returned for a deprecated mask without the flag")
 
 
 async def authorize_completed_alignment_cohort(
