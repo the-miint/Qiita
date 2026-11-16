@@ -129,7 +129,9 @@ qiita feature-table build ... --as-of-event sha256:<hex>
 
 Only the pair decisions are taken from then: runs, gates, tickets and deprecation are
 read as they are now, so a run withdrawn since is still left out. A token that names no
-decision set is refused (422). `decision_set.py` states what the token hashes.
+decision set is refused (422). `decision_set.py` states what the token hashes, and
+which pairs `decisions.pairs_used` counts (the `similar` pairs that shaped the groups
+read).
 
 ## 5. Revoke, or deprecate a decided definition
 

@@ -127,8 +127,8 @@ class DecisionProvenance(BaseModel):
     `as_of_event` rebuilds the groups from those decisions. `newest_event_at` is when the
     newest decision event in that state was recorded (None before any). `as_of` is true
     when the caller asked for an earlier decision set. `pairs_used` / `pairs_used_set`
-    count and hash, in the same canonical form, the decided pairs that name a definition
-    the resolution read (none when it read one definition exactly, without a group)."""
+    count and hash, in the same canonical form, the `similar` pairs that shaped the
+    groups the resolution read (`qiita_control_plane.decision_set`, "Pairs used")."""
 
     model_config = ConfigDict(extra="forbid")
 

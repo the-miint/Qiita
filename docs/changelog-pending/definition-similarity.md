@@ -34,8 +34,9 @@
   earlier ones (#874).** The resolve route, the masked-read export roster and ticket,
   the SynDNA count export and the alignment cohort DoGet return `decisions`: a
   `sha256:` token of every decided pair's verdict (`decision_set`), when its newest
-  decision was recorded, and the count and token of the decided pairs naming a
-  definition the resolution read. The feature-table manifest, each masked-read export
+  decision was recorded, and the count and token of the `similar` pairs that shaped
+  the groups it read (`pairs_used`, `pairs_used_set`; `not_similar` pairs are not
+  counted). The feature-table manifest, each masked-read export
   manifest entry and the SynDNA sidecar record it. Passing the token back as
   `as_of_event` (`--as-of-event` on `qiita feature-table build`, `qiita-admin
   masked-read-export` and `qiita mask syndna-read-count`) groups the definitions as

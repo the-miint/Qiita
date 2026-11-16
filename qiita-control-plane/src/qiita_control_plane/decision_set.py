@@ -23,9 +23,11 @@ state is accepted: it is the state before any decision. Only verdicts are taken 
 the history: whether a pair is detached, and every definition's params and status,
 are read as they are now.
 
-**Pairs used.** The decided pairs at least one of whose sides is a definition the
-resolution read (`definition_resolver.needed_definitions`), in the same canonical
-form; empty for an exact read, which forms no group.
+**Pairs used.** The pairs that shaped the groups the resolution read: `similar` in
+the decision set, not detached now, and naming a definition the resolution read
+(`definition_resolver.needed_definitions`; both sides of such a pair are in one group
+read). `not_similar` and `pending` pairs join nothing and are not counted. Hashed in
+the same canonical form; empty for an exact read, which forms no group.
 """
 
 import hashlib
@@ -61,6 +63,7 @@ class _Pair:
     kind: DefinitionKind
     low: int
     high: int
+    detached: bool
 
 
 def decision_set_token(decided: Iterable[tuple[str, int, int, str]]) -> str:
@@ -94,12 +97,13 @@ class DecisionSet:
         self, read: Mapping[DefinitionKind, Collection[int]] | None
     ) -> DecisionProvenance:
         """The wire record. `read` is the definitions the resolution read by kind, or
-        None for an exact read."""
+        None for an exact read; the pairs used are as the module docstring says."""
         used = [
             (pair.kind.value, pair.low, pair.high, self.verdict_of(idx).value)
             for idx, pair in self._pairs.items()
             if read is not None
-            and self.verdict_of(idx) is not DefinitionPairVerdict.PENDING
+            and self.verdict_of(idx) is DefinitionPairVerdict.SIMILAR
+            and not pair.detached
             and (pair.low in read.get(pair.kind, ()) or pair.high in read.get(pair.kind, ()))
         ]
         return DecisionProvenance(
@@ -117,7 +121,8 @@ async def load_decision_set(conn: asyncpg.Connection, as_of_event: str | None) -
     state hashes to."""
     rows = await conn.fetch(
         "SELECT e.definition_pair_idx, e.verdict, e.occurred_at,"
-        "       p.definition_kind, p.low_definition_ref, p.high_definition_ref"
+        "       p.definition_kind, p.low_definition_ref, p.high_definition_ref,"
+        "       p.detached_at IS NOT NULL AS detached"
         "  FROM qiita.definition_pair_event e"
         "  JOIN qiita.definition_pair p USING (definition_pair_idx)"
         " ORDER BY e.definition_pair_event_idx"
@@ -130,6 +135,7 @@ async def load_decision_set(conn: asyncpg.Connection, as_of_event: str | None) -
                 DefinitionKind(r["definition_kind"]),
                 r["low_definition_ref"],
                 r["high_definition_ref"],
+                r["detached"],
             ),
         )
 

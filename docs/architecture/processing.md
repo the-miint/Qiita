@@ -387,4 +387,5 @@ detaches its pairs, and is refused while a `similar` pair names it (the trigger
   `qiita.definition_pair_event` in the resolution's snapshot, so no pair or event idx
   leaves the system. Passed back as `as_of_event`, it makes `load_groups` read the
   pairs' verdicts at that point and everything else as it is now; the guards never use
-  it.
+  it. `pairs_used` counts the `similar` pairs that shaped the groups read
+  (`decision_set.py`, "Pairs used").
