@@ -26,6 +26,7 @@ from qiita_common.actions import (
 from qiita_common.api_paths import LibraryPrimitive
 from qiita_common.hashing import canonical_params_hash
 
+from ..repositories import require_transaction
 from ..repositories.assembly import (
     create_assembly_sample_pending,
     upsert_assembly_sample_no_data,
@@ -148,7 +149,13 @@ async def _mint_processing_idx(
     mint through that write (`_mint_and_hold`). A settings edit holds the row
     `FOR UPDATE` while it checks for unfinished tickets (`definition_settings`), so
     the edit and this mint-and-record cannot both commit unseen by the other, and the
-    ticket is never recorded under settings it did not hash."""
+    ticket is never recorded under settings it did not hash.
+
+    A redrive resumes a ticket keeping its completed steps' outputs and its assembly
+    gate row, both keyed on the processing it recorded on its first attempt. When that
+    processing's settings were edited since, the mint resolves to another row; the
+    ticket is then failed as bad submission input rather than re-recorded, so no run
+    mixes outputs of two processings. A new ticket runs under the edited settings."""
     params = _build_processing_params(
         action_id, action_version, bound, assembler_default=assembler_default
     )
@@ -158,6 +165,19 @@ async def _mint_processing_idx(
                 conn, workflow=action_id, version=action_version, params=params
             )
             if work_ticket_idx is not None:
+                recorded = await conn.fetchval(
+                    "SELECT processing_idx FROM qiita.work_ticket"
+                    " WHERE work_ticket_idx = $1 FOR UPDATE",
+                    work_ticket_idx,
+                )
+                if recorded is not None and recorded != row["processing_idx"]:
+                    raise _submission_bad_input(
+                        f"work ticket {work_ticket_idx} first ran under processing"
+                        f" {recorded}, whose settings were edited since; its params now"
+                        f" resolve to processing {row['processing_idx']}. Its completed"
+                        " steps and assembly gate are keyed on the first, so it cannot"
+                        " resume; submit a new ticket"
+                    )
                 await conn.execute(
                     "UPDATE qiita.work_ticket SET processing_idx = $1 WHERE work_ticket_idx = $2",
                     row["processing_idx"],
@@ -178,7 +198,8 @@ async def _mint_processing_idx(
 
 # A settings edit that commits between a mint and its hold re-keys the row the mint
 # resolved; the next mint then resolves (or inserts) the row for these params. One
-# retry covers one such edit; a second in the same window is refused loudly.
+# retry covers one such edit; a second in the same window raises RuntimeError, which
+# fails the ticket.
 _MINT_HOLD_ATTEMPTS = 2
 
 
@@ -187,7 +208,9 @@ async def _mint_and_hold(
 ) -> asyncpg.Record:
     """`mint_processing`, then hold the minted row `FOR SHARE` for the caller's
     transaction, re-minting when the held row's `params_hash` is no longer the hash
-    of `params`: a settings edit committed between the mint and the hold."""
+    of `params`: a settings edit committed between the mint and the hold. Requires an
+    open transaction: outside one the `FOR SHARE` ends with its statement."""
+    require_transaction(conn)
     params_hash = canonical_params_hash(params)
     for _ in range(_MINT_HOLD_ATTEMPTS):
         row = await mint_processing(conn, workflow=workflow, version=version, params=params)

@@ -620,8 +620,9 @@ async def run_workflow(
         # membership + load steps), mint the run's processing_idx before the loop —
         # the canonical-params hash of {workflow, version, result-affecting knobs
         # like the assembler}. Same inside-try placement so a mint failure lands in
-        # the FAILED handler. Idempotent: a re-mint on resume re-resolves the same
-        # id via the params-hash upsert.
+        # the FAILED handler. A re-mint on resume re-resolves the same id via the
+        # params-hash upsert, unless the processing's settings were edited since the
+        # first attempt, which fails the ticket (`_mint_processing_idx`).
         if _workflow_needs_processing(action.steps):
             # Single-source the assembler default from the action's context_schema
             # (the one result-affecting knob today) — the same default the hash and

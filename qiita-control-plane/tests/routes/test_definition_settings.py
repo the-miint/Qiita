@@ -623,6 +623,168 @@ async def test_an_edit_between_a_processing_mint_and_its_hold_re_mints(
         )
 
 
+async def _processing_ticket(postgres_pool, state):
+    """An action and a block-scoped ticket in `state` to record a processing on; returns
+    (ticket, block_idx, created) for `_drop_processing_ticket`."""
+    from qiita_common.models import ScopeTargetKind
+
+    from qiita_control_plane.repositories.block import create_block
+    from qiita_control_plane.testing.db_seeds import seed_action_if_absent
+
+    created = await seed_action_if_absent(
+        postgres_pool,
+        action_id=_TICKET_ACTION,
+        version=_TICKET_VERSION,
+        target_kind=ScopeTargetKind.BLOCK.value,
+    )
+    async with postgres_pool.acquire() as conn, conn.transaction():
+        block_idx = await create_block(conn)
+    failure = (
+        ("permanent", "step_run", "assemble", "failed in a test")
+        if state == "failed"
+        else (None, None, None, None)
+    )
+    ticket = await postgres_pool.fetchval(
+        "INSERT INTO qiita.work_ticket (action_id, action_version,"
+        "  originator_principal_idx, scope_target_kind, block_idx, state,"
+        "  failure_type, failure_stage, failure_step_name, failure_reason)"
+        " VALUES ($1, $2, (SELECT MIN(idx) FROM qiita.principal), 'block', $3,"
+        "         $4::qiita.work_ticket_state, $5::qiita.failure_type,"
+        "         $6::qiita.work_ticket_failure_stage, $7, $8)"
+        " RETURNING work_ticket_idx",
+        _TICKET_ACTION,
+        _TICKET_VERSION,
+        block_idx,
+        state,
+        *failure,
+    )
+    return ticket, block_idx, created
+
+
+async def _drop_processing_ticket(postgres_pool, ticket, block_idx, created, minted):
+    from qiita_control_plane.testing.db_seeds import delete_action_if_created
+
+    await postgres_pool.execute("DELETE FROM qiita.work_ticket WHERE work_ticket_idx = $1", ticket)
+    await postgres_pool.execute("DELETE FROM qiita.block WHERE block_idx = $1", block_idx)
+    await postgres_pool.execute(
+        "DELETE FROM qiita.processing WHERE processing_idx = ANY($1::bigint[])", minted
+    )
+    await delete_action_if_created(
+        postgres_pool, action_id=_TICKET_ACTION, version=_TICKET_VERSION, created=created
+    )
+
+
+def _mint_for(postgres_pool, bound):
+    from qiita_control_plane.runner import _processing
+
+    async def mint(work_ticket_idx=None):
+        return (
+            await _processing._mint_processing_idx(
+                postgres_pool,
+                action_id="long-read-assembly",
+                action_version="1.0.0",
+                bound=bound,
+                assembler_default="hifiasm_meta",
+                work_ticket_idx=work_ticket_idx,
+            )
+        )["processing_idx"]
+
+    return mint
+
+
+async def test_an_edit_waits_for_the_runners_hold_and_then_refuses_live_work(
+    postgres_pool, clients, monkeypatch
+):
+    """The runner holds the processing row `FOR SHARE` from its mint through the ticket
+    write. An edit started inside that window waits for the runner's commit, then sees
+    the ticket and refuses (`live_work`). Without the hold the edit would commit before
+    the ticket names the processing."""
+    import asyncio
+
+    from qiita_common.models import WorkTicketState
+
+    from qiita_control_plane.runner import _processing
+
+    mint = _mint_for(postgres_pool, {"mask_idx": secrets.randbelow(10**9) + 10**9})
+    processing_idx = await mint()
+    ticket, block_idx, created = await _processing_ticket(
+        postgres_pool, WorkTicketState.PENDING.value
+    )
+    params = await _params(postgres_pool, DefinitionKind.PROCESSING, processing_idx)
+    real = _processing._mint_and_hold
+    edits = []
+
+    async def hold_then_start_edit(conn, **kw):
+        row = await real(conn, **kw)
+        edits.append(
+            asyncio.create_task(
+                clients["admin"].patch(
+                    _url(DefinitionKind.PROCESSING, processing_idx),
+                    json={"params": {**params, "assembler": "edited"}, "reason": _REASON},
+                )
+            )
+        )
+        await asyncio.sleep(0.5)
+        assert not edits[0].done(), "the edit did not wait for the runner's hold"
+        return row
+
+    monkeypatch.setattr(_processing, "_mint_and_hold", hold_then_start_edit)
+    try:
+        assert await mint(work_ticket_idx=ticket) == processing_idx
+        resp = await edits[0]
+        assert resp.status_code == 409, resp.text
+        assert resp.json()["detail"]["reason"] == DefinitionSettingsRefusal.LIVE_WORK
+        assert (await _params(postgres_pool, DefinitionKind.PROCESSING, processing_idx)) == params
+    finally:
+        await _drop_processing_ticket(postgres_pool, ticket, block_idx, created, [processing_idx])
+
+
+async def test_the_mint_and_hold_needs_a_transaction(postgres_pool):
+    from qiita_control_plane.runner import _processing
+
+    async with postgres_pool.acquire() as conn:
+        with pytest.raises(RuntimeError, match="outside a transaction"):
+            await _processing._mint_and_hold(
+                conn, workflow="long-read-assembly", version="1.0.0", params={}
+            )
+
+
+async def test_a_resume_after_its_processing_was_edited_fails_the_ticket(postgres_pool, clients):
+    """A failed ticket recorded under a processing whose settings were edited since
+    cannot resume: its params now resolve to another row, and its completed steps and
+    gate are keyed on the first. The mint fails it as bad input and leaves its record."""
+    from qiita_common.backend_failure import BackendFailure
+    from qiita_common.models import WorkTicketState
+
+    mint = _mint_for(postgres_pool, {"mask_idx": secrets.randbelow(10**9) + 10**9})
+    ticket, block_idx, created = await _processing_ticket(
+        postgres_pool, WorkTicketState.FAILED.value
+    )
+    minted = []
+    try:
+        first = await mint(work_ticket_idx=ticket)
+        minted.append(first)
+        params = await _params(postgres_pool, DefinitionKind.PROCESSING, first)
+        resp = await clients["admin"].patch(
+            _url(DefinitionKind.PROCESSING, first),
+            json={"params": {**params, "assembler": "edited"}, "reason": _REASON},
+        )
+        assert resp.status_code == 200, resp.text
+
+        with pytest.raises(BackendFailure, match="submit a new ticket"):
+            await mint(work_ticket_idx=ticket)
+        # The resume's mint ran in the transaction the refusal rolled back, so it left
+        # no row for the original params.
+        assert (
+            await postgres_pool.fetchval(
+                "SELECT processing_idx FROM qiita.work_ticket WHERE work_ticket_idx = $1", ticket
+            )
+            == first
+        )
+    finally:
+        await _drop_processing_ticket(postgres_pool, ticket, block_idx, created, minted)
+
+
 @pytest.mark.parametrize("kind", [DefinitionKind.MASK, DefinitionKind.ALIGNMENT])
 async def test_an_edit_is_refused_while_a_public_handle_cites_the_definition(
     postgres_pool, clients, defs, kind
