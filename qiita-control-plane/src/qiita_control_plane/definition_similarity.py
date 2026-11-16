@@ -511,9 +511,16 @@ def _refuse_transition(current: Groups, proposed: Groups, *, pair: PairState, ac
 
 
 def _syndna_reference(params: Mapping[str, Any]) -> int | None:
-    """A mask's SynDNA reference_idx, or None when it ran without SynDNA."""
+    """A mask's SynDNA reference_idx, or None when it ran without SynDNA. Raises on a
+    stored value of another shape."""
     resolved = params.get(RESOLVED_SYNDNA_KEY)
-    return resolved.get(SYNDNA_REFERENCE_IDX_KEY) if isinstance(resolved, dict) else None
+    if resolved is None:
+        return None
+    if not isinstance(resolved, dict) or not is_definition_ref(
+        resolved.get(SYNDNA_REFERENCE_IDX_KEY)
+    ):
+        raise ValueError(f"mask params carry a malformed {RESOLVED_SYNDNA_KEY}: {resolved!r}")
+    return resolved[SYNDNA_REFERENCE_IDX_KEY]
 
 
 def _refuse_similar(groups: Groups, pair: PairState) -> None:

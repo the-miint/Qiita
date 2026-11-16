@@ -2194,7 +2194,7 @@ def test_a_sample_not_processed_in_the_group_stops_the_build(
     monkeypatch, tmp_path, capsys, entry, expected
 ):
     """A cohort named with --prep-sample-idx is refused rather than narrowed, saying
-    which samples and why, before anything streams or is minted."""
+    which prep_samples and why, before anything streams or is minted."""
     rec = _patched_two_pools(
         monkeypatch,
         resolve={**_TWO_POOL_RESOLVE, "unprocessed": {("alignment", 3): {2: entry}}},

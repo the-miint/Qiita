@@ -1079,9 +1079,9 @@ async def cancel_work_tickets(
     Selection is the explicit `work_ticket_idxs` (reaped regardless of state — a
     defensive orphan-reap; a failed one is flipped too) UNION the `action_id`
     (+ optional run/pool) filter matches (non-terminal only, so the filter never
-    cancels a failed ticket). Idempotent per ticket: a `completed`, `no_data` or
-    `cancelled` ticket is not flipped (`cancelled=False`) but its jobs are still
-    reaped. A missing explicit idx comes back `not_found`; a reap that fails after
+    cancels a failed ticket). Idempotent per ticket: a ticket whose state is not in
+    `CANCELLABLE_WORK_TICKET_STATES` is not flipped (`cancelled=False`) but its jobs
+    are still reaped. A missing explicit idx comes back `not_found`; a reap that fails after
     the flip lands comes back with `reap_error` (the flip stands — re-run cancel to
     retry)."""
     backend_client = request.app.state.compute_backend_client

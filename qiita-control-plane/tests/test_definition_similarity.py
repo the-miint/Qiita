@@ -378,6 +378,14 @@ def test_masks_differing_in_syndna_reference_are_never_similar(low_syndna, high_
     check_decision(groups, p, NOT_SIMILAR)
 
 
+@pytest.mark.parametrize("stored", [7, {"reference_idx": "7"}, {}])
+def test_a_malformed_syndna_param_is_refused(stored):
+    defs = [mask(1, resolved_syndna=stored), mask(2, resolved_syndna={"reference_idx": 7})]
+    p = pair(defs, MASK, 1, 2)
+    with pytest.raises(ValueError, match="malformed resolved_syndna"):
+        check_decision(compute_groups(defs, [p]), p, SIMILAR)
+
+
 def test_masks_with_one_syndna_reference_may_be_similar():
     defs = [
         mask(1, resolved_syndna={"reference_idx": 7}),

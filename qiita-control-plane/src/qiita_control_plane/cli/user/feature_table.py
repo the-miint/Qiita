@@ -1488,7 +1488,8 @@ def _left_out_identifiers(
     identifier mint admits."""
     if not left_out:
         return []
-    assert cohort.listed_under is not None  # a named cohort leaves nothing out
+    if cohort.listed_under is None:
+        raise RuntimeError("a cohort named with --prep-sample-idx leaves nothing out")
     by_alignment: dict[int, list[SampleResolution]] = {}
     for entry in left_out:
         by_alignment.setdefault(max(cohort.listed_under[entry.prep_sample_idx]), []).append(entry)

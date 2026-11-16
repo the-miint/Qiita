@@ -546,7 +546,8 @@ def syndna_reference_of_resolved(
     """The one SynDNA reference of the masks that the prep_samples resolved to. 409 when
     they ran without SynDNA, or counted against different references. Masks that differ
     in SynDNA reference cannot be decided similar (`definition_similarity`), so the
-    second 409 is a guard that a group of one reference never reaches."""
+    masks of one group share a reference and the different-references 409 is not
+    reached; it keeps a table from mixing two references should a group hold two."""
     by_reference: dict[int | None, list[int]] = {}
     for m in sorted(set(mask_by_sample.values())):
         by_reference.setdefault(references[m], []).append(m)

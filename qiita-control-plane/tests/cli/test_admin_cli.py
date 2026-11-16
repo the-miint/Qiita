@@ -2095,6 +2095,36 @@ def test_masked_read_export_adopt_replaces_a_file_of_the_earlier_naming(
     assert not {"5", "7", "42", "3"} & set(new.split("."))
 
 
+def test_masked_read_export_adopted_file_of_a_refused_sample_is_listed(
+    monkeypatch, tmp_path, capsys
+):
+    """Under --adopt-unrecorded, an unrecorded file of a prep_sample whose ticket is then
+    refused (409) stays unrecorded and is listed as left in place."""
+    from qiita_common.api_paths import PATH_ADMIN_MASKED_READ_EXPORT_TICKET
+
+    from qiita_control_plane.cli import _common
+    from qiita_control_plane.cli import admin as cli
+
+    _patch_one_sample(monkeypatch)
+    served = _fake_masked_export_http(_ONE_SAMPLE_ROSTER)
+
+    def refusing(method, url, **kw):
+        if method == "POST" and url.endswith(PATH_ADMIN_MASKED_READ_EXPORT_TICKET):
+            body = {"detail": {"reason": "x", "mask_idx": 3, "mask_state": "invalidated"}}
+            return httpx.Response(409, json=body, request=httpx.Request(method, url))
+        return served(method, url, **kw)
+
+    monkeypatch.setattr(_common.httpx, "request", refusing)
+    out_dir = tmp_path / "exp"
+    out_dir.mkdir()
+    (out_dir / "SAMN_A.QM542.parquet").write_bytes(b"old")
+
+    assert cli.main(_export_argv(out_dir, "parquet", "--adopt-unrecorded")) == 1
+    err = capsys.readouterr().err
+    assert "left 1 unrecorded export file(s) in place" in err and "SAMN_A.QM542.parquet" in err
+    assert "mask_sample.state='invalidated'" in err
+
+
 def test_masked_read_export_an_empty_or_new_directory_needs_no_flag(monkeypatch, tmp_path):
     from qiita_control_plane.cli import admin as cli
 

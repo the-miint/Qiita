@@ -22,14 +22,14 @@ The reap covers ALL attempts by the deterministic `qiita-wt{idx}-` job-name pref
 retriable failure bumps `attempt` and launches a fresh job under a new name.
 
 A `failed` ticket is cancellable too (`CANCELLABLE_WORK_TICKET_STATES`). A failed
-ticket can still have a live job (a step that OOM-escalated to attempt N+1 before the
-ticket failed), and the reap below scancels it like any other. The reap names jobs
+ticket can still have a live job (`ticket_redrive.drop_dead_step_rows` says how), and
+the reap below scancels it like any other. The reap names jobs
 by ticket idx only and reads no workspace, so a ticket whose scratch workspace was
 reclaimed or removed reaps the same way.
 
 This primitive is shared with the orphan-reaping direction (a ticket that went
-terminal while its job kept running): the flip is a no-op on a ticket that is
-already `completed`, `no_data` or `cancelled`, but the scancel still runs — reaping
+terminal while its job kept running): the flip is a no-op on a ticket whose state is
+not in `CANCELLABLE_WORK_TICKET_STATES`, but the scancel still runs — reaping
 any stray job — which is why cancel is idempotent AND defensively reaps.
 """
 
@@ -43,11 +43,10 @@ from qiita_common.models import NON_TERMINAL_WORK_TICKET_STATES, WorkTicketState
 
 _log = logging.getLogger(__name__)
 
-# The states `cancel_work_ticket` flips to `cancelled`. A ticket in any other state
-# (`completed`, `no_data`, `cancelled`) is left as it is and only reaped. `failed` is
-# included so an operator can withdraw a failed ticket from what reads ticket outcomes;
-# the definition-group resolver, for one, ignores cancelled tickets
-# (`definition_resolver._TICKET_ROLE`).
+# The states `cancel_work_ticket` flips to `cancelled`: the non-terminal ones, and
+# `failed`, so that an operator can withdraw a failed ticket, which then reads as a
+# deliberate stop rather than a failure. A ticket in any other state is left as it is
+# and only reaped.
 CANCELLABLE_WORK_TICKET_STATES: tuple[str, ...] = (
     *NON_TERMINAL_WORK_TICKET_STATES,
     WorkTicketState.FAILED.value,
@@ -74,8 +73,8 @@ async def cancel_work_ticket(
       * `work_ticket_idx`
       * `previous_state`   — the state before the flip
       * `state`            — `cancelled` if flipped, else `previous_state` (unchanged)
-      * `cancelled`        — True iff this call flipped it (False = it was already
-                             `completed`, `no_data` or `cancelled`)
+      * `cancelled`        — True iff this call flipped it (False = its state is not
+                             in `CANCELLABLE_WORK_TICKET_STATES`)
       * `cancelled_job_ids`— the SLURM job ids the reap scancelled (may be [])
       * `reap_error`       — a message iff the scancel failed AFTER the flip (the flip
                              stands; the operator can re-run cancel to retry the reap)

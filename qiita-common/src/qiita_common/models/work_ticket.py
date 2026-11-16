@@ -735,8 +735,8 @@ class WorkTicketCancelRequest(BaseModel):
 
 class WorkTicketCancelResult(BaseModel):
     """The outcome for ONE ticket in a cancel request. `cancelled` is True iff this
-    call flipped it to `cancelled` (False = it was already `completed`, `no_data` or
-    `cancelled`, a no-op); the scancel reap runs either way. `not_found` marks an
+    call flipped it to `cancelled` (False = a no-op on a ticket the control plane does
+    not cancel from its state); the scancel reap runs either way. `not_found` marks an
     explicit idx that does not exist. `reap_error` is set when the terminal flip
     landed but the scancel failed (the flip stands — re-run cancel to retry the
     reap)."""

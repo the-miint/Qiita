@@ -789,6 +789,7 @@ def _handle_masked_read_export(args: argparse.Namespace, parser: argparse.Argume
                     raise
                 left_out_lines.append(_refusal_line(prep, exc.response))
                 left_in_place.extend(legacy[prep])
+                left_in_place.extend(name for name in targets[prep] if name in adopted)
                 continue
             if written:
                 exported += 1

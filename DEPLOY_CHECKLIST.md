@@ -69,7 +69,7 @@ _None yet._
   their gates' restore, so the resolver already ignores them and they are not listed. For each listed
   ticket, read its failure (`qiita ticket status`) and decide whether the completed run is
   the one to use; if so, cancel it, as a system_admin with a PAT carrying `work_ticket:cancel`, with
-  `qiita-admin ticket cancel <work_ticket_idx>`. Read-only query; it does not burn the rollback path. (#874)
+  `qiita-admin ticket cancel <work_ticket_idx>`. Cancelling a prep_sample's newest per-sample ticket can expose an older failed one, so run the query again after cancelling, until it lists nothing you mean to cancel. Read-only query; it does not burn the rollback path. (#874)
   ```bash
   # [operator] DATABASE_URL set as in docs/runbooks/redeploy.md (migrate step)
   psql "$DATABASE_URL" -v ON_ERROR_STOP=1 <<'SQL'
