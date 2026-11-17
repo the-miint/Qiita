@@ -108,7 +108,7 @@ async def test_boot_line_carries_the_configured_logger_name(monkeypatch, caplog,
 
 
 async def test_shutdown_cancels_the_reconcile_resume_task_before_the_drain(monkeypatch, tmp_path):
-    """The waiting resume must be cancelled first, or it can register dispatches behind the drain."""
+    """Cancelled first, the waiting resume cannot register dispatches behind the drain."""
     from qiita_control_plane import main as cp_main
 
     _minimal_boot_env(monkeypatch, tmp_path)
