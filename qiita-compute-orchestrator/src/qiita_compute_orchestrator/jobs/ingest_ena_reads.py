@@ -207,8 +207,7 @@ def _classify_ena_fetch_error(
         )
     # miint raises the same error for a truncated transfer and for bytes that
     # genuinely disagree with ENA's digest
-    # (https://the-miint.github.io/duckdb-miint/insdc_ena/): retry, bounded per ticket. A digest
-    # really wrong at ENA lands `retriable` beside a stored run, re-ticketed on each re-import.
+    # (https://the-miint.github.io/duckdb-miint/insdc_ena/): retry, bounded per ticket.
     if "md5" in text:
         return BackendFailure(
             kind=FailureKind.EXTERNAL_FETCH_TRANSIENT,

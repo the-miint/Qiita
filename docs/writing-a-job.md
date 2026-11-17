@@ -82,8 +82,8 @@ Three kinds of field arrive in `Inputs`:
    Use `params:` for scalars precisely *because* they can't ride `inputs:`
    (which is path-typed and, for container steps, bind-mounted). A native step
    can also list the runner-provided `final_attempt` (`final_attempt: <field>`):
-   `"True"` on the ticket's last attempt and `"False"` before it, set per attempt
-   and overriding any value a submitter put in `action_context`.
+   `"True"` on the ticket's last attempt and `"False"` before it (see
+   `runner/_workflow.py`).
 3. **Framework-injected scope scalars** — the work ticket's `scope_target`
    idx scalars, merged in by `flatten_native_inputs` per the ticket's scope
    kind, plus the always-present `work_ticket_idx`:

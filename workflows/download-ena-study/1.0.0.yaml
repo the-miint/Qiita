@@ -87,7 +87,6 @@ steps:
     # scalar, not a path) — optional; the job defaults to 'http' when
     # a submitter omits it.
     inputs: [ena_run_map, reads_staging_root]
-    # `final_attempt` is False until the ticket's last attempt.
     params:
       download_method: download_method
       run_concurrency: run_concurrency
