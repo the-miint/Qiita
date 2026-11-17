@@ -28,15 +28,17 @@ def lake_table_ddl() -> Callable[[str], list[tuple[str, str]]]:
         start = src.find(marker)
         assert start != -1, f"the {table} DDL moved; this test reads it out of ducklake.rs"
         body = src[start + len(marker) :]
-        body = body[: body.index(")")]
+        # The statement ends at the `);` that closes it; a type such as
+        # `MAP(VARCHAR, VARCHAR)` holds a `)` of its own.
+        body = body[: body.index(");")]
 
         columns = []
         for line in body.splitlines():
             line = line.strip()
             if not line or line.startswith("--"):
                 continue
-            parts = re.split(r"\s+", line.rstrip(","))
-            columns.append((parts[0], parts[1]))
+            name, rest = re.split(r"\s+", line.rstrip(","), maxsplit=1)
+            columns.append((name, re.sub(r"\s+NOT NULL$", "", rest)))
         return columns
 
     return _parse

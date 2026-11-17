@@ -33,7 +33,7 @@ You are the coordinator.
 8. **Summary:** which rules fired, which did not, and anything no rule covers ("outside the rule set").
 9. **Verification handoff:** close with the handoff block. If nothing needs verification, say so in one line.
 
-Every reviewer, inline or fanned out, follows the same semantics. Each rule or bullet is **[strong]** (apply confidently) or **[soft]** (ask it as a question). Group findings by rule, not by file: a rule firing in five places is one heading listing all five, with the rationale once. Each finding is `path:line` plus a one-line note.
+Every reviewer, inline or fanned out, follows the same semantics. Each rule or bullet is **[strong]** (apply confidently) or **[soft]** (ask it as a question). Group findings by the bullet that fired, not by file: a bullet firing in five places is one heading listing all five, with the rationale once, and two bullets of one rule are two headings. The heading names the bullet by its strength, rule id and short name — `[strong] R9 copy-pasted parallel handler`. The short name is the bullet's bold lead-in without a leading article, or its opening words when it has none; the strength is the bullet's own tag when it has one, else its rule's (a rule "asked as questions" is still `[strong]`). The `qiita-review` loop copies this into its ledger and the PR's `Declined:` entries. Each finding is `path:line` plus a one-line note.
 
 ### Rule families
 
@@ -48,7 +48,7 @@ Every rule has one home. Spawn a family only if one of its rules fired in step 2
 
 ### Subagent prompt template
 
-> You are running the qiita-reviewer rule set, scoped to one family. This is a read-only, non-executing review: do not run tests, builds, migrations or probes, and do not edit files. Read `.claude/agents/qiita-reviewer.md` in full. Get the diff with `git diff <base>...HEAD`, or the range the caller's prompt scopes the round to. Apply only rules **<R…, R…>**; another reviewer owns the rest. Your caller's prompt follows verbatim; apply its scope, standing ledger, `[outside-subject]` commits and ask to your rules only, and treat the ledger as the caller's disposition, not a finding of yours: **<the caller's prompt>**. Follow the file's Trigger map, Scope discipline, Verify your premises, Standing policies and Tone. Do not run the PR-level checks and do not write a summary or a handoff section. Return findings grouped by rule, each as `path:line` + a one-line note, tagged `[verified]` / `[inferred]` / `[needs-probe]`, plus `[outside-subject]` on an offered fix: cite the command or `path:line` behind a `[verified]`; for a `[needs-probe]` state the question and the result that would refute the finding. If none of your rules fire, return "no findings".
+> You are running the qiita-reviewer rule set, scoped to one family. This is a read-only, non-executing review: do not run tests, builds, migrations or probes, and do not edit files. Read `.claude/agents/qiita-reviewer.md` in full. Get the diff with `git diff <base>...HEAD`, or the range the caller's prompt scopes the round to. Apply only rules **<R…, R…>**; another reviewer owns the rest. Your caller's prompt follows verbatim; apply its scope, standing ledger, `[outside-subject]` commits and ask to your rules only, and treat the ledger as the caller's disposition, not a finding of yours: **<the caller's prompt>**. Follow the file's Trigger map, Scope discipline, Verify your premises, Standing policies and Tone. Do not run the PR-level checks and do not write a summary or a handoff section. Return findings grouped by rule, under a heading naming the bullet as the file's How to run section says (strength, rule id, short name), each as `path:line` + a one-line note, tagged `[verified]` / `[inferred]` / `[needs-probe]`, plus `[outside-subject]` on an offered fix: cite the command or `path:line` behind a `[verified]`; for a `[needs-probe]` state the question and the result that would refute the finding. If none of your rules fire, return "no findings".
 
 ## Scope discipline
 
@@ -116,6 +116,8 @@ Only rules whose trigger appears in the diff can fire.
 | A path that either creates an object or reuses an existing one (get-or-create, resolve-or-create, `INSERT … ON CONFLICT` followed by a read) | R4 |
 | A read that hides rows or values by the caller's permission; a timestamp, count, ETag or error detail returned beside them | R4 |
 | A Pydantic `Field(...)` constraint or a validation regex | R5 |
+| A table or staging file naming an entity by text columns (a type, a label, a name) where the system mints an id | R8 |
+| A column named `parent_*`, or otherwise unlike its siblings' name for the same id | R5 |
 | Several values stored in one column with a non-empty separator; a hash, UUID or id cast to text | R5 |
 | A filename, digest, or identity input built from an absolute path or another host-specific value | R5 |
 | A new table storing sequence or per-entity result data | R5, R8, R9 |
@@ -128,6 +130,7 @@ Only rules whose trigger appears in the diff can fire.
 | Inline SQL against another component's tables | R7 |
 | An `_idx` composed into anything that leaves the system (an external alias, an exported filename or column, a submission payload) | R7 |
 | A `CAST` in a JOIN predicate or a projection, a producer `ORDER BY`, a new `DISTINCT`, an alias that renames nothing, `any_value`, a literal `IN (…)` list on a lake table, a repeated function call | R8 |
+| `IN (SELECT …)` / `NOT IN (SELECT …)`; a DELETE trimming a table the previous statement built; a temp table read once; a join predicate built by concatenation, a split or a parse | R8 |
 | A row → Pydantic-model shaper; a wire column order derived from tool output (`a.* EXCLUDE …`) | R8 |
 | A new native job in `jobs/**`; `workflows/**`; a container def or workflow shell script | R9, R6, R1, R10 |
 | Two structurally similar code paths; an endpoint reading from two or more sources; a multi-statement mutation | R9 |
@@ -138,6 +141,7 @@ Only rules whose trigger appears in the diff can fire.
 | A CLI command's error handling or exit path | R9 |
 | A delete of a row in a table the sweep owns, under `tests/**` or `src/**/testing/**` | R9 |
 | Any new or changed doc, runbook, docstring or comment | R2 |
+| A new boolean column, variable or flag | R11 |
 | Prose about a domain object whose name is also a programming term (`*_field_exception`, a work ticket) | R11 |
 | A user-facing string: a runbook, a workflow `description:`, argparse `help=`, an HTTPException `detail`, a failure reason, or a test assertion on one; a `generated_by` value | R11, R2 |
 | A new file, moved code, a helper in a feature-specific module, feature- or platform-specific naming, a one-shot script | R10 |
@@ -248,7 +252,7 @@ Safety must not rest on convention or a comment; and a guard must be real, so do
 - **Referential integrity is enforced by the database where cheap.** A table keyed on another's ids has a foreign key.
 - Free-text vocabulary versus an enum: name the trade-off.
 - Default-empty collections: what does the empty case mean?
-- Column names that need a comment to tell apart need work. The same name must not mean different things in different tables.
+- Column names that need a comment to tell apart need work. The same name must not mean different things in different tables, and the same thing takes the same name: a column holding the row's own id is named as its sibling tables name it, not as a parent.
 - Row granularity is stated in `COMMENT ON TABLE`.
 - Nullable columns: are they all nullable? A nullable set with no co-population check?
 - **What does persisting this buy?** A column nothing reads, or one that repeats a value held elsewhere, is a question. Conversely, when a table stores data selected by a filter, persist the filter.
@@ -281,12 +285,14 @@ Safety must not rest on convention or a comment; and a guard must be real, so do
 - **A cast in a projection** [soft]: ask which side is not already that type. A bare literal and a bare `NULL` are the cases where the engine picks the type.
 - **Sort keys match the consumer's lookup key, or the sort is dropped.** Ask what the ordering is for. [soft]
 - **What does this clause change?** [soft] Ask it of a `DISTINCT` on a one-to-one join, a predicate an upstream table already implies, an alias that renames nothing, a secondary sort key. Ask; such a clause is sometimes a distinct gate that needs a comment instead.
+- **Filter by a join, and chain by a CTE** (`CLAUDE.md`, "Writing DuckDB SQL"). [soft] Ask whether a `SEMI` / `ANTI JOIN` in the building query replaces an `IN (SELECT …)` / `NOT IN (SELECT …)`, or a DELETE trimming a table the previous statement built. Ask whether a temp table only the next statement reads is a CTE.
+- **A join key is a column, not an expression.** [soft] A predicate rebuilding a key from parts (concatenation, a split, a parse) on a table the code itself creates: ask whether that table can carry the key from creation.
 - **Compute an expression once** (a CTE) when the same call appears in two projected columns. [soft]
 - **`any_value()`**: what makes the column constant within the group, and does the code say so? [soft]
 - **A literal `IN (…)` list against a lake table**: ask for the plan. [soft]
 - **Winnow early**, within a query and across pipeline stages: filter before the expensive step. [soft]
 - **A wire column order derived from tool output needs a test pinning the column list.** [soft]
-- **A result table carries a join key to its sibling**: the minted idx, not a local id. [strong]
+- **A result table carries a join key to its sibling**: the minted idx, not a local id. [strong] This holds for the entity a row is about, too: when the system mints an id for an entity, a row that names it by the text columns its id was minted from (a type and a name) is the finding, even when the producer cannot know the id; its staging output carries the text, and the load resolves it.
 - **Build models from rows with `Model.model_validate(dict(row))`**, naming a column only when it needs a transform. [strong]
 
 ### R9 — Sibling convergence, storage patterns and job hygiene [strong]
@@ -327,6 +333,7 @@ When two similar code paths solve the same problem differently, factor out the s
 - **Never a bare "sample" where it reaches a human**: docs, `--help`, error bodies, failure reasons, test assertions, comments. `biosample` and `prep_sample` are different objects. Carve-out: control-plane code that handles both identically may say "sample". When this fires, sweep every prose surface the PR touches; cited sites are examples.
 - **Established field terms keep their field meaning.** A new behaviour gets its own name instead of borrowing one that means something else.
 - **A verb that collides with a programming term in the same sentence.** When a domain noun is also a programming word (a `*_field_exception` row, a work ticket), do not pair it with that word's programming verb: an exception that "raises" a tier reads as error handling, so say it "increases" the tier.
+- **A boolean is named for the condition it records.** A name stating an outcome that holds only in some cases (a name saying something was done to the data, when the value only records that two forms of it differ) is the finding; name the condition, and say in one line what it is true under.
 - **Insider nouns in user-facing prose** are replaced with what the reader would call the thing.
 - **A provenance string in an exported artifact** (`generated_by`) names the product `qiita-miint`. [soft]
 

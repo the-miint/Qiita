@@ -403,15 +403,24 @@ async def test_a_restart_drops_overrides_asymmetrically(
         # --- the restart ---
         fanout_dispatch._OVERRIDES.clear()
         monkeypatch.setattr(dispatch_mod, "schedule_dispatch", lambda *_a, **_kw: None)
+
+        async def _dp_ready(*_a, **_kw):
+            return None
+
+        monkeypatch.setattr(dispatch_mod, "wait_for_data_plane", _dp_ready)
         app = SimpleNamespace(
             state=SimpleNamespace(
                 pool=postgres_pool,
                 compute_backend_client=object(),
-                settings=SimpleNamespace(fanout_max_inflight=default),
+                settings=SimpleNamespace(
+                    fanout_max_inflight=default, data_plane_url="grpc://unused"
+                ),
                 running_dispatches=set(),
+                reconcile_resume_task=None,
             )
         )
         await dispatch_mod.reconcile_inflight_tickets(app)
+        await app.state.reconcile_resume_task
 
         assert await _running_count(postgres_pool, ref) == after_restart
     finally:

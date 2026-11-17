@@ -168,10 +168,7 @@ def _local_id(path: Path) -> str:
 
 
 def _fasta_files(base: Path) -> list[Path]:
-    """Every FASTA file directly under `base` (sorted, deduped). Returns [] if the
-    directory is absent (a legitimately empty upstream step)."""
-    if not base.is_dir():
-        return []
+    """Every FASTA file directly under `base` (sorted, deduped)."""
     found: list[Path] = []
     for pattern in _FASTA_GLOBS:
         found.extend(base.glob(pattern))
@@ -195,7 +192,13 @@ def _file_meta(genomes_dir: Path, refined_bins_dir: Path) -> list[tuple[str, str
       synthetic read_id needs `(kind, bin_id)` to name one file (module docstring).
 
     Empty files are dropped (`read_fastx` raises on a 0-record input, and one empty
-    path aborts the whole `VARCHAR[]` scan)."""
+    path aborts the whole `VARCHAR[]` scan).
+
+    An absent `refined_bins_dir` is refused, as `residue_split.py` refuses it:
+    bin_refine creates it even when it refines no bin, and read as no bins it would
+    count every binned noLCG contig as UNBINNED."""
+    if not refined_bins_dir.is_dir():
+        raise FileNotFoundError(f"refined_bins_dir {refined_bins_dir} is not a directory")
     meta: list[tuple[str, str, str | None]] = []
     for name, kind in ((LCG_FILE, KIND_LCG), (NOLCG_FILE, KIND_UNBINNED)):
         path = genomes_dir / name

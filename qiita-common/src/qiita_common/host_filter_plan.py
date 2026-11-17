@@ -21,13 +21,13 @@ The pool rule, over the NON-control samples' hosts:
                           answer, and filtering it against a union is a feature
                           that does not exist yet.
 
-Anything UNRESOLVED refuses as well. That is the fail-closed contract the whole
-arc rests on: we would rather abort a submission than silently pass an
-un-depleted human sample through.
+Anything UNRESOLVED refuses as well. Fail closed on anything ambiguous: an absent
+host_taxon_id means no host, unless the biosample's own taxon implies one.
 """
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from enum import StrEnum
 
@@ -35,6 +35,8 @@ from qiita_common.models.host_filter_profile import (
     HostFilterOutcome,
     HostFilterResolution,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class PoolPlanRefusal(StrEnum):
@@ -93,6 +95,15 @@ def plan_pool_host_filter(
             decisions={},
             refusal=PoolPlanRefusal.UNRESOLVED_SAMPLES,
             offending=tuple(unresolved),
+        )
+
+    host_absent = sorted(key for key, r in resolutions.items() if r.host_absent)
+    if host_absent and any(r.outcome is HostFilterOutcome.FILTER for r in resolutions.values()):
+        logger.warning(
+            "pool mixes host-filtered samples with %d that have no host_taxon_id and so pass"
+            " through undepleted: %s",
+            len(host_absent),
+            host_absent,
         )
 
     # The pool's host set, over the samples that HAVE a host of their own. Blanks

@@ -42,6 +42,7 @@ from qiita_common.models import (
     UploadStatus,
     WorkTicketFailureStage,
 )
+from qiita_common.models.step import PURGED_RAW_STATE
 from qiita_common.testing.containers import REFERENCE_HASH_CONTAINER, REFERENCE_LOAD_CONTAINER
 
 from qiita_control_plane import step_progress
@@ -4910,9 +4911,9 @@ async def test_local_step_records_compute_target_local(
 # rebuilt from the shared workspace, not re-run), and the first incomplete
 # entry resumes — re-attaching to a live SLURM job by its persisted id,
 # finalizing one that succeeded while the CP was down, or deciding a purged job
-# from its on-disk manifest. A CO outage during reconcile never fails the
-# ticket. These drive run_workflow(resume=True) directly (reconcile's selection
-# is covered in tests/routes/test_work_ticket.py).
+# from its on-disk manifest, or from its stderr when there is none. A CO outage
+# during reconcile never fails the ticket. These drive run_workflow(resume=True)
+# directly (reconcile's selection is covered in tests/routes/test_work_ticket.py).
 
 
 async def _mark_processing(pool, work_ticket_idx):
@@ -4988,14 +4989,14 @@ async def test_resume_finalizes_job_that_succeeded_during_outage(
 
 
 async def test_resume_purged_job_with_valid_output_completes(postgres_pool, slurm_ticket, tmp_path):
-    """The job aged out of slurmrestd (status read raises UNKNOWN_PERMANENT),
-    but its output manifest is on disk — the filesystem tiebreaker decides
-    COMPLETED via result_step."""
+    """The job aged out of slurmrestd (status read raises JOB_PURGED), but its
+    output manifest is on disk — the filesystem tiebreaker decides COMPLETED
+    via result_step."""
     await _mark_processing(postgres_pool, slurm_ticket)
     await _seed_submitted_step(postgres_pool, slurm_ticket, step_name="compute", slurm_job_id=902)
 
     purged = BackendFailure(
-        kind=FailureKind.UNKNOWN_PERMANENT,
+        kind=FailureKind.JOB_PURGED,
         stage=WorkTicketFailureStage.STEP_RUN,
         step_name="compute",
         reason="slurmrestd 404 (job purged)",
@@ -5011,16 +5012,18 @@ async def test_resume_purged_job_with_valid_output_completes(postgres_pool, slur
     )
     assert state == "completed"
     assert backend.result_calls == 1  # tiebreaker consulted the filesystem
+    assert backend.result_statuses[0].raw_state == PURGED_RAW_STATE
 
 
 async def test_resume_purged_job_without_output_fails(postgres_pool, slurm_ticket, tmp_path):
-    """The job aged out AND its output is gone/invalid — result_step's verify
-    raises CONTRACT_VIOLATION (permanent), so the resumed ticket fails."""
+    """A permanent BackendFailure from result_step after a purged status read
+    fails the resumed ticket permanently. The fake backend is scripted to raise
+    CONTRACT_VIOLATION; stderr classification is covered in the orchestrator."""
     await _mark_processing(postgres_pool, slurm_ticket)
     await _seed_submitted_step(postgres_pool, slurm_ticket, step_name="compute", slurm_job_id=903)
 
     purged = BackendFailure(
-        kind=FailureKind.UNKNOWN_PERMANENT,
+        kind=FailureKind.JOB_PURGED,
         stage=WorkTicketFailureStage.STEP_RUN,
         step_name="compute",
         reason="slurmrestd 404 (job purged)",
@@ -5041,6 +5044,28 @@ async def test_resume_purged_job_without_output_fails(postgres_pool, slurm_ticke
     )
     assert row["state"] == "failed"
     assert row["failure_type"] == "permanent"
+
+
+async def test_resume_unreadable_status_other_than_not_found_is_not_marked_purged(
+    postgres_pool, slurm_ticket, tmp_path
+):
+    """A permanent status-read failure that is not a not-found (e.g. a 403) is
+    not marked PURGED, so result_step never reads stderr to retry a live job."""
+    await _mark_processing(postgres_pool, slurm_ticket)
+    await _seed_submitted_step(postgres_pool, slurm_ticket, step_name="compute", slurm_job_id=904)
+
+    unreadable = BackendFailure(
+        kind=FailureKind.UNKNOWN_PERMANENT,
+        stage=WorkTicketFailureStage.STEP_RUN,
+        step_name="compute",
+        reason="slurmrestd 403",
+    )
+    backend = FakeSlurmBackendClient(
+        status_script=[unreadable], result_script=[{"result": "result.parquet"}]
+    )
+    await _run(slurm_ticket, postgres_pool, backend, tmp_path / "ws", resume=True)
+
+    assert backend.result_statuses[0].raw_state is None
 
 
 async def _seed_failed_then_escalated_step(
@@ -6534,7 +6559,7 @@ async def test_assembly_gate_write_that_raises_leaves_a_recoverable_ticket(
     with NULL failure_*, which reconcile still selects and a resume re-drive
     finishes. Reversed, the ticket would already be terminal — reconcile skips
     those — leaving the 'pending' row with nothing to move it."""
-    from qiita_control_plane.dispatch import _inflight_ticket_idxs
+    from qiita_control_plane.dispatch import _inflight_ticket_versions
     from qiita_control_plane.runner import _workflow
 
     work_ticket_idx, prep_sample_idx, teardown = await _seed_assembly_gate_ticket(postgres_pool)
@@ -6581,7 +6606,7 @@ async def test_assembly_gate_write_that_raises_leaves_a_recoverable_ticket(
             == "pending"
         )
         # Non-terminal is what keeps the ticket in reconcile's selection.
-        assert work_ticket_idx in await _inflight_ticket_idxs(postgres_pool)
+        assert work_ticket_idx in await _inflight_ticket_versions(postgres_pool)
 
         async def _no_jobs(_job_name):
             return []

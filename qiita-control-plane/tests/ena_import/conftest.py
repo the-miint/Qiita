@@ -4,9 +4,11 @@ import pytest
 from qiita_control_plane.ena_import import miint_resolver
 
 
-def _http_error(status: int) -> duckdb.HTTPException:
+def _http_error(status: int, body: str | None = None) -> duckdb.HTTPException:
     error = duckdb.HTTPException(f"HTTP {status} from ENA")
     error.status_code = status
+    if body is not None:
+        error.body = body
     return error
 
 

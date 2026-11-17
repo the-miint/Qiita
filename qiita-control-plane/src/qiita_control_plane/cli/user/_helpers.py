@@ -269,16 +269,21 @@ def _handle_study_scoped_call(args: argparse.Namespace, parser: argparse.Argumen
     request model the flags map to or None for a route that takes no body,
     and the names of any repeatable KEY=VALUE flags. Both the fold and the
     body construction precede the token read, so invalid flags exit 2
-    without a request going out.
+    without a request going out. A study named by its export id is resolved
+    to its idx before the path is filled.
     """
     _fold_flag_values(args, parser, args.study_call_kv_flags, _common.parse_kv_pairs)
     model = args.study_call_model
     body = None if model is None else _build_body(model, args, parser)
-    path = args.study_call_path.format(**vars(args))
     method = args.study_call_method
-    return _common.run_http_subcommand(
-        lambda t: _common.call(method, args.base_url, t, path, json=body)
-    )
+
+    def _run(token: str) -> dict | list:
+        _common.resolve_study_idx(args, parser, args.base_url, token)
+        path = args.study_call_path.format(**vars(args))
+        response = _common.call(method, args.base_url, token, path, json=body)
+        return response
+
+    return _common.run_http_subcommand(_run)
 
 
 def _handle_patch(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:

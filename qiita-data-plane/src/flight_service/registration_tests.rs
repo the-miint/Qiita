@@ -418,6 +418,47 @@ fn myloasm_tables_are_replaced_per_run_on_the_run_tables_keys() {
     }
 }
 
+/// Both gene-call tables are replaced per assembly run, and both read their delete
+/// keys from `assembly_membership` (why: `qiita_common.gene_call_constants.GENE_CALL_RUN_KEY`).
+#[test]
+fn gene_call_tables_are_replaced_per_run_on_assembly_membership_keys() {
+    for table in crate::ducklake::GENE_CALL_TABLES {
+        let entry = REPLACE_KEY_TABLES
+            .iter()
+            .find(|entry| entry.table == *table)
+            .unwrap_or_else(|| panic!("{table} is not replace-keyed"));
+        assert_eq!(entry.key, &["prep_sample_idx", "processing_idx"], "{table}");
+        assert_eq!(entry.key_source, "assembly_membership", "{table}");
+    }
+}
+
+/// A table that borrows its replace keys is refused without its `key_source`
+/// (an empty one would delete nothing), and passes with it; a table that is its
+/// own source, or one not replace-keyed, needs nothing else.
+#[test]
+fn a_borrowing_table_is_refused_without_its_key_source() {
+    for entry in REPLACE_KEY_TABLES {
+        if entry.key_source == entry.table {
+            assert!(refuse_borrow_without_key_source([entry.table].into_iter()).is_ok());
+            continue;
+        }
+        let err =
+            refuse_borrow_without_key_source([entry.table].into_iter()).expect_err(entry.table);
+        assert_eq!(err.code(), tonic::Code::InvalidArgument, "{}", entry.table);
+        assert!(
+            err.message().contains(entry.key_source),
+            "{}",
+            err.message()
+        );
+        assert!(
+            refuse_borrow_without_key_source([entry.table, entry.key_source].into_iter()).is_ok(),
+            "{}",
+            entry.table
+        );
+    }
+    assert!(refuse_borrow_without_key_source(["read", "alignment"].into_iter()).is_ok());
+}
+
 /// Every `key_source` is itself a registered table carrying the same key.
 /// The borrowing delete SELECTs this entry's key columns out of the source's
 /// Parquet, so a source keyed on anything else would name a column that file
@@ -2328,18 +2369,18 @@ fn register_files_replaces_run_scoped_tables_on_the_whole_key() {
 
     // One run's rows, byte-identical across both of its registrations —
     // exactly what a re-run under the same processing_idx re-derives.
-    // Nine columns: `ducklake_add_data_files` refuses a Parquet missing a column
+    // The full column list: `ducklake_add_data_files` refuses a Parquet missing a column
     // the target table has, just as it refuses an extra one, so these fixtures
-    // carry the assembler attribute columns `ensure_assembly_tables` adds.
+    // carry every column `ensure_assembly_tables` adds, genome_idx included.
     let membership_values = |prep_sample: i64, run: i64| {
         format!(
             "SELECT * FROM (VALUES \
                  ({prep_sample}::BIGINT, {run}::BIGINT, 'LCG', 'circular_1', {feature_a}::BIGINT, \
-                  'circular_1'::VARCHAR, 'yes'::VARCHAR, 30.5::DOUBLE, 1.02::DOUBLE), \
+                  'circular_1'::VARCHAR, 'yes'::VARCHAR, 30.5::DOUBLE, 1.02::DOUBLE, 9001::BIGINT), \
                  ({prep_sample}::BIGINT, {run}::BIGINT, 'MAG', 'bin.1', {feature_b}::BIGINT, \
-                  NULL::VARCHAR, NULL::VARCHAR, NULL::DOUBLE, NULL::DOUBLE)) \
+                  NULL::VARCHAR, NULL::VARCHAR, NULL::DOUBLE, NULL::DOUBLE, 9002::BIGINT)) \
                  t(prep_sample_idx, processing_idx, kind, bin_id, feature_idx, \
-                   raw_name, circularity, depth, mult)"
+                   raw_name, circularity, depth, mult, genome_idx)"
         )
     };
     let quality_values = |prep_sample: i64, run: i64| {
@@ -2347,10 +2388,10 @@ fn register_files_replaces_run_scoped_tables_on_the_whole_key() {
             "SELECT * FROM (VALUES \
                  ({prep_sample}::BIGINT, {run}::BIGINT, 'MAG', 'bin.1', \
                   'k__Bacteria'::VARCHAR, 91.5::DOUBLE, 1.25::DOUBLE, 0.0::DOUBLE, \
-                  4200000::BIGINT, 42::BIGINT, 0.87::DOUBLE, 'metabat2'::VARCHAR)) \
+                  4200000::BIGINT, 42::BIGINT, 0.87::DOUBLE, 'metabat2'::VARCHAR, 9002::BIGINT)) \
                  t(prep_sample_idx, processing_idx, kind, bin_id, marker_lineage, \
                    completeness, contamination, strain_heterogeneity, genome_size, \
-                   n_contigs, das_tool_score, source_binner)"
+                   n_contigs, das_tool_score, source_binner, genome_idx)"
         )
     };
     let control_values = format!(
@@ -2393,35 +2434,37 @@ fn register_files_replaces_run_scoped_tables_on_the_whole_key() {
     // A fresh ticket per registration: the lake gets a distinct file
     // carrying the same keys, which is what makes the second load a real
     // re-registration rather than a no-op.
+    // A run's two tables are registered together, as assembly_load stages them:
+    // bin_quality borrows assembly_membership's keys and is refused without it.
     let mut ticket = base_ticket;
-    let mut register = |table: &str, values: &str| {
+    let mut register_run = |prep_sample: i64, run: i64| {
         ticket += 1;
-        register_one_parquet(&connstr, &data_path, table, values, ticket)
+        register_parquets(
+            &connstr,
+            &data_path,
+            &[
+                ("assembly_membership", &membership_values(prep_sample, run)),
+                ("bin_quality", &quality_values(prep_sample, run)),
+            ],
+            ticket,
+        )
     };
 
-    let m1 = register(
-        "assembly_membership",
-        &membership_values(prep_sample_a, run_p),
+    let r1 = register_run(prep_sample_a, run_p);
+    let c1 = register_one_parquet(
+        &connstr,
+        &data_path,
+        "reference_sequences",
+        &control_values,
+        base_ticket + 100,
     );
-    let q1 = register("bin_quality", &quality_values(prep_sample_a, run_p));
-    let c1 = register("reference_sequences", &control_values);
-    register(
-        "assembly_membership",
-        &membership_values(prep_sample_b, run_p),
-    );
-    register("bin_quality", &quality_values(prep_sample_b, run_p));
-    register(
-        "assembly_membership",
-        &membership_values(prep_sample_a, run_q),
-    );
-    register("bin_quality", &quality_values(prep_sample_a, run_q));
+    register_run(prep_sample_b, run_p);
+    register_run(prep_sample_a, run_q);
 
     assert!(
-        m1.replaced.is_empty() && q1.replaced.is_empty() && c1.replaced.is_empty(),
-        "a key the lake does not hold replaces nothing: membership={:?} \
-         bin_quality={:?} control={:?}",
-        m1.replaced,
-        q1.replaced,
+        r1.replaced.is_empty() && c1.replaced.is_empty(),
+        "a key the lake does not hold replaces nothing: run={:?} control={:?}",
+        r1.replaced,
         c1.replaced,
     );
     assert_run_rows(&a_p, 2, 1, "after the first load");
@@ -2433,20 +2476,22 @@ fn register_files_replaces_run_scoped_tables_on_the_whole_key() {
         "control loaded once"
     );
 
-    let m2 = register(
-        "assembly_membership",
-        &membership_values(prep_sample_a, run_p),
+    let r2 = register_run(prep_sample_a, run_p);
+    let c2 = register_one_parquet(
+        &connstr,
+        &data_path,
+        "reference_sequences",
+        &control_values,
+        base_ticket + 101,
     );
-    let q2 = register("bin_quality", &quality_values(prep_sample_a, run_p));
-    let c2 = register("reference_sequences", &control_values);
 
     assert_eq!(
-        m2.replaced.get("assembly_membership").copied(),
+        r2.replaced.get("assembly_membership").copied(),
         Some(2),
         "the re-run supersedes A/P's two membership rows, and only those",
     );
     assert_eq!(
-        q2.replaced.get("bin_quality").copied(),
+        r2.replaced.get("bin_quality").copied(),
         Some(1),
         "the re-run supersedes A/P's one bin_quality row, and only that",
     );
@@ -2517,9 +2562,9 @@ fn an_empty_bin_quality_still_supersedes_the_runs_rows() {
         format!(
             "SELECT * FROM (VALUES \
                  ({prep_sample}::BIGINT, {run}::BIGINT, '{kind}', '{bin_id}', {feature}::BIGINT, \
-                  NULL::VARCHAR, NULL::VARCHAR, NULL::DOUBLE, NULL::DOUBLE)) \
+                  NULL::VARCHAR, NULL::VARCHAR, NULL::DOUBLE, NULL::DOUBLE, 9002::BIGINT)) \
                  t(prep_sample_idx, processing_idx, kind, bin_id, feature_idx, \
-                   raw_name, circularity, depth, mult)"
+                   raw_name, circularity, depth, mult, genome_idx)"
         )
     };
     let quality_values = |suffix: &str| {
@@ -2527,10 +2572,10 @@ fn an_empty_bin_quality_still_supersedes_the_runs_rows() {
             "SELECT * FROM (VALUES \
                  ({prep_sample}::BIGINT, {run}::BIGINT, 'MAG', 'bin.1', \
                   'k__Bacteria'::VARCHAR, 91.5::DOUBLE, 1.25::DOUBLE, 0.0::DOUBLE, \
-                  4200000::BIGINT, 42::BIGINT, 0.87::DOUBLE, 'metabat2'::VARCHAR)) \
+                  4200000::BIGINT, 42::BIGINT, 0.87::DOUBLE, 'metabat2'::VARCHAR, 9002::BIGINT)) \
                  t(prep_sample_idx, processing_idx, kind, bin_id, marker_lineage, \
                    completeness, contamination, strain_heterogeneity, genome_size, \
-                   n_contigs, das_tool_score, source_binner){suffix}"
+                   n_contigs, das_tool_score, source_binner, genome_idx){suffix}"
         )
     };
 
@@ -2594,6 +2639,128 @@ fn an_empty_bin_quality_still_supersedes_the_runs_rows() {
         "DELETE FROM qiita_lake.assembly_membership WHERE {where_clause};
          DELETE FROM qiita_lake.bin_quality WHERE {where_clause};"
     ));
+}
+
+/// A re-run with no subject to call clears the previous run's gene-call rows:
+/// both tables arrive empty, and their delete reads the keys the same
+/// registration's `assembly_membership` names
+/// (`qiita_common.gene_call_constants.GENE_CALL_RUN_KEY`).
+///
+/// The control is the second registration's membership row, superseded in the
+/// same call.
+#[test]
+#[serial_test::serial]
+#[cfg(feature = "integration")]
+fn empty_gene_call_tables_still_supersede_the_runs_rows() {
+    let connstr = crate::test_catalog::connstr();
+    let data_path = crate::test_catalog::data_path();
+
+    let prep_sample: i64 = 976_010;
+    let run: i64 = 976_020;
+    let contig: i64 = 976_030;
+    let gene: i64 = 976_040;
+    let genome: i64 = 976_050;
+    let base_ticket: i64 = 976_000_000 + std::process::id() as i64;
+    let where_clause = format!("prep_sample_idx = {prep_sample} AND processing_idx = {run}");
+    let cleanup = format!(
+        "DELETE FROM qiita_lake.assembly_membership WHERE {where_clause};
+         DELETE FROM qiita_lake.gene_call_contig WHERE {where_clause};
+         DELETE FROM qiita_lake.gene_call WHERE {where_clause};"
+    );
+
+    {
+        let conn = Connection::open_in_memory().unwrap();
+        ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
+        ducklake::ensure_assembly_tables(&conn).unwrap();
+        ducklake::ensure_gene_call_tables(&conn).unwrap();
+        ducklake::ensure_registered_file_table(&conn).unwrap();
+        conn.execute_batch(&cleanup).unwrap();
+    }
+
+    let membership_values = |kind: &str, bin_id: &str| {
+        format!(
+            "SELECT * FROM (VALUES \
+                 ({prep_sample}::BIGINT, {run}::BIGINT, '{kind}', '{bin_id}', {contig}::BIGINT, \
+                  NULL::VARCHAR, NULL::VARCHAR, NULL::DOUBLE, NULL::DOUBLE, 9002::BIGINT)) \
+                 t(prep_sample_idx, processing_idx, kind, bin_id, feature_idx, \
+                   raw_name, circularity, depth, mult, genome_idx)"
+        )
+    };
+    let contig_values = |suffix: &str| {
+        format!(
+            "SELECT * FROM (VALUES \
+                 ({prep_sample}::BIGINT, {run}::BIGINT, {genome}::BIGINT, 'prodigal_checkm', \
+                  {contig}::BIGINT, 1::INTEGER, FALSE, FALSE, TRUE, 'ok', 11::INTEGER, \
+                  TRUE, NULL::INTEGER, NULL::VARCHAR, NULL::DOUBLE)) \
+                 t(prep_sample_idx, processing_idx, genome_idx, call_set, \
+                   feature_idx, contig_order, meta_mode, closed_ends, mask_regions, \
+                   status, translation_table, uses_sd, meta_bin, model_desc, \
+                   model_gc_content){suffix}"
+        )
+    };
+    let gene_values = |suffix: &str| {
+        format!(
+            "SELECT * FROM (VALUES \
+                 ({prep_sample}::BIGINT, {run}::BIGINT, {genome}::BIGINT, 'prodigal_checkm', \
+                  {contig}::BIGINT, {gene}::BIGINT, 1::BIGINT, 301::BIGINT, '+', 10.5::DOUBLE, \
+                  FALSE, FALSE, 'ATG', 99.9::DOUBLE, MAP {{'rbs_motif': 'None'}}, 'M*')) \
+                 t(prep_sample_idx, processing_idx, genome_idx, call_set, \
+                   parent_feature_idx, feature_idx, position, stop_position, strand, score, \
+                   partial_left, partial_right, start_type, confidence, attributes, \
+                   protein){suffix}"
+        )
+    };
+
+    let reader = Connection::open_in_memory().unwrap();
+    ducklake::connect_ducklake(&reader, &connstr, &data_path).unwrap();
+    let count = |table: &str| {
+        lake_count(
+            &reader,
+            &format!("SELECT count(*) FROM qiita_lake.{table} WHERE {where_clause}"),
+        )
+    };
+
+    // The first run: one refined MAG with one gene.
+    register_parquets(
+        &connstr,
+        &data_path,
+        &[
+            ("assembly_membership", &membership_values("MAG", "bin.1")),
+            ("gene_call_contig", &contig_values("")),
+            ("gene_call", &gene_values("")),
+        ],
+        base_ticket,
+    );
+    assert_eq!(count("gene_call_contig"), 1, "first run loaded");
+    assert_eq!(count("gene_call"), 1, "first run loaded");
+
+    // The re-run: contigs, but none called, so both gene-call files are empty.
+    let replaced = register_parquets(
+        &connstr,
+        &data_path,
+        &[
+            (
+                "assembly_membership",
+                &membership_values("UNBINNED", "contig_1"),
+            ),
+            ("gene_call_contig", &contig_values(" WHERE FALSE")),
+            ("gene_call", &gene_values(" WHERE FALSE")),
+        ],
+        base_ticket + 1,
+    )
+    .replaced;
+
+    assert_eq!(
+        replaced.get("assembly_membership").copied(),
+        Some(1),
+        "control: the re-run supersedes the first run's membership row",
+    );
+    assert_eq!(replaced.get("gene_call_contig").copied(), Some(1));
+    assert_eq!(replaced.get("gene_call").copied(), Some(1));
+    assert_eq!(count("gene_call_contig"), 0, "no contig row left behind");
+    assert_eq!(count("gene_call"), 0, "no gene row left behind");
+
+    let _ = reader.execute_batch(&cleanup);
 }
 
 /// A re-registered myloasm run supersedes every one of its tables, including one

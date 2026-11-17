@@ -88,7 +88,7 @@ cd qiita-control-plane && uv sync --reinstall-package qiita-common
 
 ## miint is a core dependency
 
-The duckdb-miint extension is the **foundation** of the compute/data system, not optional — every bioinformatics primitive (read_fastx, hashing/chunking, minimap2/bowtie2, host-filter, phylogeny, feature tables) runs through it. On the cluster it is **fail-loud, never fail-soft**: `config._resolve_slurm_settings()` keeps the CO **down** at boot, and `miint_job_env()` **raises** (never a silent empty dict), unless BOTH required job vars are set — `MIINT_EXTENSION_DIRECTORY` (the staged extension) and `MIINT_GPL_BOUNDARY_PATH` (the GPL-boundary binary for bowtie2/FastTree — the only two tools miint runs out-of-process; vsearch/MAFFT/SortMeRNA are statically linked in-process, see [`docs/duckdb-miint.md`](docs/duckdb-miint.md) "GPL boundary"). The boundary can't ride `$HOME` — native jobs get an ephemeral per-ticket HOME — so it must be **forwarded into the job** (the slurmrestd env is an allowlist), and the compute-readiness `miint-gpl-boundary` probe fails the *deploy* if it's unreachable. Carve-out: the client `qiita reference load` CLI runs with these unset (installs into its own cache) via `miint_connect_config()`.
+The duckdb-miint extension is the **foundation** of the compute/data system, not optional — every bioinformatics primitive (read_fastx, hashing/chunking, minimap2/bowtie2, host-filter, phylogeny, feature tables) runs through it. On the cluster it is **fail-loud, never fail-soft**: `config._resolve_slurm_settings()` keeps the CO **down** at boot, and `miint_job_env()` **raises** (never a silent empty dict), unless BOTH required job vars are set — `MIINT_EXTENSION_DIRECTORY` (the staged extension) and `MIINT_GPL_BOUNDARY_PATH` (the GPL-boundary binary for bowtie2, FastTree and Prodigal — the tools miint runs out-of-process; vsearch/MAFFT/SortMeRNA are statically linked in-process, see [`docs/duckdb-miint.md`](docs/duckdb-miint.md) "GPL boundary"). The boundary can't ride `$HOME` — native jobs get an ephemeral per-ticket HOME — so it must be **forwarded into the job** (the slurmrestd env is an allowlist), and the compute-readiness `miint-gpl-boundary` probe fails the *deploy* if it's unreachable. Carve-out: the client `qiita reference load` CLI runs with these unset (installs into its own cache) via `miint_connect_config()`.
 
 **A miint surprise gets an issue, in the PR that lands the workaround.** When miint's behaviour doesn't match what we expected — an undocumented or outright false contract, a missing capability we have to route around, a bug — file it upstream at [the-miint/duckdb-miint](https://github.com/the-miint/duckdb-miint/issues) **in the same PR**, not "later". Then name it by qualified number at every site that carries the workaround: the code comment, the [`docs/duckdb-miint.md`](docs/duckdb-miint.md) entry, and the changelog entry (`duckdb-miint#173` — an external tracker, so the "No issue/PR numbers in code" rule above permits it). If the workaround is code we intend to delete once upstream fixes it, also open a Qiita issue for the removal with its **exit criteria**, and add a row to [Open upstream gaps](docs/duckdb-miint.md#open-upstream-gaps) — that table is the standing list of what we carry for miint's sake, and the row is what makes the cleanup scheduled rather than remembered. A workaround with no issue behind it is the defect: it quietly becomes permanent, and the next reader can't tell whether it is still needed. The reverse holds too — a claim about miint that a probe disproves is worth an issue even when we don't need a fix, because the next person will otherwise re-derive it from the same wrong docs.
 
@@ -102,6 +102,20 @@ data plane. Ad-hoc inspection by hand — a one-off script or analysis included 
 `READ_ONLY` attach of the catalog, `make lake-shell`, which is admin-only and not a
 data-access path (see the header of [`scripts/lake-shell.sh`](scripts/lake-shell.sh)). If
 the catalog is not reachable where the work runs, stop rather than fall back to the files.
+
+## Writing DuckDB SQL
+
+DuckDB's join types go beyond the standard ones; before writing a join or a filter
+against another table, read its [FROM and JOIN clauses](https://duckdb.org/docs/stable/sql/query_syntax/from)
+page, which lists them (semi and anti, as-of, positional, lateral).
+
+- **Filter by whether a key exists elsewhere with `SEMI JOIN` / `ANTI JOIN`**, in the
+  query that builds the table, not with `IN (SELECT …)`, `NOT IN (SELECT …)` or a DELETE
+  afterwards. `NOT IN` also returns no rows at all when the subquery yields a NULL;
+  `ANTI JOIN` returns the rows with no match.
+- **An intermediate that only the next statement reads is a CTE**, not a temp table.
+- **A join key on a table the code creates is a column from creation**, not rebuilt in
+  the join predicate by concatenation, a split or a parse.
 
 ## Workflow runtimes
 
@@ -185,7 +199,8 @@ diff, and the next pass reads what the fixes wrote.
 
 The loop ends by printing a `## Reviewer loop` block for the PR description: the commit
 it reviewed, each fix it made outside the PR's subject, and each finding it declined
-(with the reason), deferred (with its issue number), or left unprobed.
+(with the rule it sets aside and the reason), deferred (with its issue number), or left
+unprobed.
 `.github/pull_request_template.md` carries the heading. The `review-loop-check` CI job
 fails a PR whose description lacks the block, whose "Reviewed at" is not one of the
 PR's own commits, or whose "Reviewed at" line does not name, by sha, every commit the

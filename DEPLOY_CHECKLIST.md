@@ -15,57 +15,104 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
 
 ### 1. Env vars — set BEFORE the deploy (most are `from_env()` fail-fast; a missing one keeps the unit down)
 
-_None yet._
+- `[operator]` Confirm `DATA_PLANE_URL` in `/etc/qiita/control-plane.env` starts with `grpc://`
+  (`grep '^DATA_PLANE_URL=' /etc/qiita/control-plane.env`). The control plane now refuses to boot
+  with any other scheme, so a bad value keeps the unit down. (#899)
 
 ### 2. One-time host setup
 
-- `[operator]` **After pulling and before the restart, confirm every stored run pre-flight
-  still opens under the new kl-run-preflight.** Its schema patch refuses a blank or padded
-  identity value (`sample_name`, `external_project_id`, an accession, an export ID,
-  `matrix_tube_id`), and a stored pre-flight that fails to open can no longer be read by the
-  pool roster, the runner or a re-submit. Expect `unopenable: 0` and exit 0; if any are
-  listed, stop before deploying and raise them. On the `redeploy.sh` fast path, pull first
-  and run this before it. (#840)
+- `[operator]` **Before the restart, run the host-taxon backfill.** From the restart a biosample
+  with no `host_taxon_id` passes through host filtering undepleted, so skipping `--execute` lets
+  residue biosamples (taxa the curated table does not cover) pass through undepleted. `--execute`
+  writes them `not provided`, which stays refused until patched, and leaves hostless taxa absent; it
+  is safe on the old build. This is the backfill's only run: after the restart an absent value is
+  deliberate, so never run it again. (#864)
+  1. Dry-run and read the report. Expect no `WARNING:` lines and `no taxon_id at all (not
+     backfillable)` to read 0, because a blank that the backfill cannot recognize as a control, or a
+     biosample with no `taxon_id`, is no longer refused; if not, stop and raise the report.
+  2. Only then run it with `--execute`.
+  3. Dry-run again. Expect `Pass --execute to write 0 row(s)`; if not, stop and raise the report.
   ```bash
-  # [operator] in the pulled checkout; DATABASE_URL as in redeploy.md §4
-  set -a; . /etc/qiita/control-plane.env; set +a
-  cd ~/qiita-miint/qiita-control-plane && /usr/local/bin/uv run --reinstall-package qiita-common qiita-admin check-stored-preflights
+  # [operator] in the pulled checkout; DATABASE_URL as above
+  cd ~/qiita-miint/qiita-control-plane
+  /usr/local/bin/uv run --reinstall-package qiita-common qiita-admin backfill host-taxon-id --show-unresolved 50            # 1 and 3: dry run
+  /usr/local/bin/uv run --reinstall-package qiita-common qiita-admin backfill host-taxon-id --show-unresolved 0 --execute  # 2: writes
   ```
+- `[admin]` **gpl-boundary must report 0.5.0 or later**, or compute-readiness's
+  `miint-gpl-boundary` probe fails the deploy. If it is older, replace the binary at that path by
+  hand (the deploy does not upgrade it: #859). (#888)
+  ```bash
+  sudo -u qiita-orch "$(sudo grep -oP '^MIINT_GPL_BOUNDARY_PATH=\K.*' /etc/qiita/compute-orchestrator.env)" --version | grep gpl_boundary
+  ```
+- `[operator]` **Before the restart, no long-read-assembly ticket may be in flight.**
+  long-read-assembly 1.0.2 gains steps in place (a `gene_call` step after `bin_refine`,
+  two actions before `assembly_load`), so a ticket past `bin_refine` when the sync lands
+  is refused on resume and has to be submitted again. Expect 0; otherwise wait for them
+  to finish. (#888)
+  ```bash
+  psql "$DATABASE_URL" -tAc "SELECT count(*) FROM qiita.work_ticket WHERE action_id = 'long-read-assembly' AND state IN ('pending','queued','processing')"
+  ```
+- `[operator]` **Do not run `qiita-admin scratch reclaim --execute` until this deploy is in.**
+  The bucket-6 gene-call backfill reads the finished long-read-assembly tickets'
+  workspaces, and the build deployed now does not know to keep them. From this deploy,
+  reclaim skips every ticket that backfill can still recover or is recovering. (#888)
 
 ### 3. Migrations
 
-- `[operator]` (#855) `make migrate` applies `20261110000000_block_rearmed_at.sql` (nullable `rearmed_at` on `qiita.block`, which `rerun-block` sets and abandon-plan reads; no row changes).
+- `20261112000000_host_taxon_id_not_required` makes `host_taxon_id` optional, and from the
+  restart an absent value means no host. `dbmate` applies it; run the bucket-2 backfill
+  first. (#864)
 - `[operator]` (#872) `make migrate` applies `20261112000000_field_exception_excludes_unique_in_study.sql` (triggers that keep a field exception off `unique_in_study` fields, and a nullable `updated_by_idx` on both `*_field_exception` tables; no row changes). It refuses to apply, naming the rule, if an existing exception row already keys on a `unique_in_study` field; nothing has written one, so none should. If it does refuse, stop and follow its HINT.
 
 ### 4. Deploy
 
-- `[operator]` (#851) Deploy every data-plane instance, peers on other hosts included, from this build in the same window. An instance from an earlier build takes no lake lock, so its registrations into the replace-keyed tables overlap the new instances' again and can lose their commits to them.
+_None yet._
 
 ### 5. Verify
 
-- `[operator]` (#851) `make verify-deploy`'s `catalog-connections` row now counts each data-plane instance as its pool size plus 2 lake lock sessions (`pool=<n>` in the catalog session name). If it fails on the budget, lower `DUCKLAKE_POOL_SIZE` in `/etc/qiita/data-plane.env` or raise `max_connections` on the catalog server, as its message says.
-- `[operator]` **Run `qiita-admin check-stored-preflights` again, as in bucket 2.** The old
-  build kept accepting submissions and lane edits until the restart, and the bucket-2 run
-  did not see those. Expect `unopenable: 0`; if any are listed, raise them with an admin,
-  who corrects the stored pre-flight by hand. (#840)
+_None yet._
 
 ### 6. After the deploy verifies green
 
-- `[operator]` (#849) Disable the retired `myloasm-provenance-recover` action. The deploy removes its directory and job module, and `actions sync` does not disable an action whose directory is gone, so the row stays enabled. `action_disabled_consistent` needs `disabled_at` and `disabled_by_idx`; use your own principal's idx, from the first query. Load `DATABASE_URL` as [`redeploy.md`](docs/runbooks/redeploy.md) §4 does (`set -a; . /etc/qiita/control-plane.env; set +a`):
+- `[admin]` **Add gene calls to the long-read-assembly runs finished before this deploy**
+  (1.0.0, 1.0.1 and 1.0.2; the dry run counts them). Each run gets one
+  `assembly-gene-call-recover` ticket, which reads the `assemble`, `bin_refine`, `checkm`,
+  `assembly_hash` and `mint-features` outputs left in that run's ticket workspace and
+  registers its gene calls and its `assembly_membership` and `bin_quality` again, with
+  `genome_idx`. Run it soon
+  after the deploy: those files last only as long as the scratch workspace does. (#888)
   ```bash
-  psql "$DATABASE_URL" -c "SELECT idx, display_name FROM qiita.principal WHERE system_role = 'system_admin' AND idx <> 1 AND NOT retired;"   # idx 1 is the seeded system principal
-  psql "$DATABASE_URL" -c "UPDATE qiita.action SET enabled = false, disabled_at = now(), disabled_by_idx = <your principal idx>, disabled_reason = 'one-off retired' WHERE action_id = 'myloasm-provenance-recover';"
-  psql "$DATABASE_URL" -c "SELECT version, enabled FROM qiita.action WHERE action_id = 'myloasm-provenance-recover';"   # expect 1.0.0 | f
+  # DATABASE_URL and PATH_SCRATCH exported, as for any `qiita-admin backfill`;
+  # QIITA_TOKEN is a system_admin's PAT (only --execute reads it).
+  qiita-admin backfill assembly-gene-call                       # dry run: counts per status, and each run it cannot recover (residue), with the reason
+  qiita-admin backfill assembly-gene-call --execute --limit 5
   ```
+  Once those five tickets complete, check each run in `make lake-shell`, with `PS`/`RUN`
+  from the lines the `--limit 5` run printed. Expect no NULL `genome_idx` and a non-zero
+  gene count:
+  `SELECT (SELECT count(*) FROM qiita_lake.gene_call WHERE prep_sample_idx = PS AND processing_idx = RUN), (SELECT count(*) FILTER (WHERE genome_idx IS NULL) FROM qiita_lake.assembly_membership WHERE prep_sample_idx = PS AND processing_idx = RUN), (SELECT count(*) FILTER (WHERE genome_idx IS NULL) FROM qiita_lake.bin_quality WHERE prep_sample_idx = PS AND processing_idx = RUN);`
+  Measure each step's peak memory and elapsed time against its unmeasured baseline
+  (gene_call 16 GB / 2 h; assembly_load 32 GB / 2 h), for every attempt:
+  `sacct -j <job> -o MaxRSS,Elapsed`, with each `<job>` from
+  `SELECT step_name, attempt, state, slurm_job_id FROM qiita.work_ticket_step WHERE work_ticket_idx = <T> AND slurm_job_id IS NOT NULL ORDER BY step_index, attempt`.
+  Then submit the rest, paced:
+  `qiita-admin backfill assembly-gene-call --execute --rate 10`.
+
+  Each pass submits one ticket per prep_sample, so rerun it once the pass's tickets finish.
+  You are done when the dry run counts no writable and no in-flight runs and every
+  residue line has an explanation. `--retry-failed` resubmits runs whose recovery
+  ticket ended without completing. If the dry run stops with a permission error, run it
+  as an account that can read the ticket workspaces.
 
 ### Notes (no host action)
 
-- (#851) The data plane no longer updates or creates `qiita_lake.registration_lock`; the existing table stays in the catalog, unused.
+- (#896) `POST /study/lookup-by-accession`, `POST /biosample/lookup-by-accession` and `POST /biosample/lookup-by-matrix-tube-id` are deprecated but still served; a downstream client should move to `POST /study/lookup` and `POST /biosample/lookup`. A client generated from the OpenAPI spec sees those routes' and `POST /sequencing-run/lookup-by-instrument-run-id`'s response type renamed to `NaturalKeyLookupResponse`; the JSON is unchanged.
+- (#863) `download-ena-study` 1.0.0 gains an optional `ena_run_accessions` through the normal `qiita-admin actions sync`, and the `held_not_downloaded` run status is no longer reported.
+- `.env.compute-orchestrator.example`'s `MIINT_GPL_BOUNDARY_PATH` comment now names the tools behind the boundary (bowtie2, FastTree, Prodigal) and the 0.5.0 minimum; no live env change. (#888)
+- New DuckLake tables `gene_call` / `gene_call_contig`, and a `genome_idx` column on `assembly_membership` and `bin_quality`, created by the data plane at start. long-read-assembly 1.0.2 (edited in place) and the new `assembly-gene-call-recover` 1.0.0 arrive through the deploy's usual `qiita-admin actions sync`; no new image. (#888)
+- The staged miint must have `prodigal_proteins` (duckdb-miint `2b215901` or later); the miint stage step restages when the mirror's build changes, and compute-readiness's `miint-gpl-boundary` probe fails on a build without it. (#888)
+- `POST /work-ticket/{idx}/run` now applies the submit checks to the stored ticket: a caller who is neither the originator nor wet_lab_admin+ gets 404; otherwise, for a ticket in a redrivable state, the refusal a submit of that work would get (403/422). The ticket is checked against its action's current definition, so a ticket stored under a version since edited in place (a tighter `context_schema`, a lower `mem_ceiling_gb`) is refused with 422 and the work must be submitted again. Scripts that re-run other users' tickets need an admin token. (#902)
 - (#872) New study-admin routes `GET`/`PUT`/`DELETE /study/{S}/biosample/{B}/field-exception/{F}` and `.../sequenced-sample/{SS}/field-exception/{F}` (CLI `qiita biosample|sequenced-sample get-/set-/clear-field-exception`). Soft contract change: a field `PATCH` declaring `unique_in_study` now answers 409 when field exceptions are set on the field.
-- (#849) `qiita-admin backfill myloasm-provenance` is removed, with the `myloasm-provenance-recover` workflow and job: every myloasm run of long-read-assembly 1.0.0/1.0.1 is recovered.
-- (#840) `POST /biosample/resolve-roster` takes a new, incompatible row shape (nested `biosample` / `primary_project` / `secondary_projects` refs); a `qiita` CLI installed before this deploy gets a 422 from `submit-bcl-convert`, `submit-pacbio-ingest` and `submit-golay-demux` until it is upgraded.
-- (#840) Deploy this before kl-metapool moves to the kl-run-preflight release that adds export IDs: Qiita refuses a pre-flight written against a newer schema than the one it ships, so a pre-flight from the new kl-metapool fails every submit until this is live.
-- (#840) Soft output change: in the `submit-bcl-convert` and `submit-golay-demux` JSON, each pre-flight row's `biosample_accession` is replaced by `biosample`, an object holding the identifiers the pre-flight gave for it.
 
 ## Deployed history
 

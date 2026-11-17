@@ -14,7 +14,15 @@ test_landing.py).
 
 from pathlib import Path
 
+import pytest
 from httpx import ASGITransport, AsyncClient
+from qiita_common.api_paths import (
+    URL_BIOSAMPLE_LOOKUP,
+    URL_BIOSAMPLE_LOOKUP_BY_ACCESSION,
+    URL_BIOSAMPLE_LOOKUP_BY_MATRIX_TUBE_ID,
+    URL_STUDY_LOOKUP,
+    URL_STUDY_LOOKUP_BY_ACCESSION,
+)
 
 # Substrings that betray a leak back to an external CDN / font host. The
 # whole point of vendoring is that none of these appear in the rendered
@@ -51,6 +59,26 @@ async def test_openapi_schema_served():
     assert body["info"]["title"] == "qiita-control-plane"
     # Generated from the router tree, so it carries the real surface.
     assert len(body["paths"]) > 0
+
+
+@pytest.mark.parametrize(
+    ("url", "deprecated"),
+    [
+        (URL_STUDY_LOOKUP_BY_ACCESSION, True),
+        (URL_BIOSAMPLE_LOOKUP_BY_ACCESSION, True),
+        (URL_BIOSAMPLE_LOOKUP_BY_MATRIX_TUBE_ID, True),
+        (URL_STUDY_LOOKUP, False),
+        (URL_BIOSAMPLE_LOOKUP, False),
+    ],
+)
+async def test_openapi_schema_served_marks_lookups_deprecated(url, deprecated):
+    """Tests the case where a lookup route is superseded: the spec marks its
+    POST operation deprecated, and leaves its replacement unmarked."""
+    async with _client() as ac:
+        r = await ac.get("/openapi.json")
+    assert r.status_code == 200
+    operation = r.json()["paths"][url]["post"]
+    assert operation.get("deprecated", False) is deprecated
 
 
 async def test_swagger_ui_served_from_local_assets():

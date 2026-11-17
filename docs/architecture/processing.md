@@ -141,7 +141,7 @@ Work ticket fields (per `qiita.work_ticket` migration `20260504000001_work_ticke
 
 The schema does not carry per-step provenance fields (slurm_job_id, log paths, current_step / total_steps, provenance JSONB, completed_at). The runner is synchronous and waits inline for each step; SLURM-side log retrieval is on the orchestrator and not surfaced on the work_ticket row.
 
-Failure classification is finer-grained at the backend layer: `BackendFailure.kind` is one of the values in `qiita_common.backend_failure.FailureKind` (NODE_FAIL, OOM_KILLED, PREEMPTED, TIMEOUT_BEFORE_START, TRANSIENT_FS_ERROR, SLURMRESTD_UNREACHABLE, ORCHESTRATOR_UNREACHABLE, CONTROL_PLANE_UNREACHABLE, PROCESS_RESTARTED, DATA_PLANE_TRANSIENT, EXTERNAL_FETCH_TRANSIENT, SEGFAULT for retriable; BAD_INPUT, EXIT_NONZERO, CONTRACT_VIOLATION, UNKNOWN_PERMANENT, and the runner-raised RESOURCE_CEILING_EXHAUSTED and RETRIES_EXHAUSTED for permanent). The runner collapses these to the two-valued `failure_type` for storage; `work_ticket` has no kind column (the per-attempt kind is stored in `work_ticket_step.failure_kind`), so a `RETRIES_EXHAUSTED` failure is identified by the `retries_exhausted` prefix of its `failure_reason` (`retries_exhausted (3/3); last failure [node_fail]: ...`); other reasons carry per-failure detail for triage.
+Failure classification is finer-grained at the backend layer: `BackendFailure.kind` is one of the values in `qiita_common.backend_failure.FailureKind` (NODE_FAIL, OOM_KILLED, PREEMPTED, TIMEOUT_BEFORE_START, TRANSIENT_FS_ERROR, SLURMRESTD_UNREACHABLE, ORCHESTRATOR_UNREACHABLE, CONTROL_PLANE_UNREACHABLE, PROCESS_RESTARTED, DATA_PLANE_TRANSIENT, EXTERNAL_FETCH_TRANSIENT, SEGFAULT, JOB_PURGED for retriable; BAD_INPUT, EXIT_NONZERO, CONTRACT_VIOLATION, UNKNOWN_PERMANENT, and the runner-raised RESOURCE_CEILING_EXHAUSTED and RETRIES_EXHAUSTED for permanent). The runner collapses these to the two-valued `failure_type` for storage; `work_ticket` has no kind column (the per-attempt kind is stored in `work_ticket_step.failure_kind`), so a `RETRIES_EXHAUSTED` failure is identified by the `retries_exhausted` prefix of its `failure_reason` (`retries_exhausted (3/3); last failure [node_fail]: ...`); other reasons carry per-failure detail for triage.
 
 Retry semantics (implemented in `qiita_control_plane.runner._run_entry_with_retry`):
 - On `BackendFailure(transient=True)` and `retry_count < max_retries`: bump `retry_count`, atomically transition `PROCESSING → QUEUED → PROCESSING`, retry the same entry. Earlier successful entries are not re-run — `bound` outputs carry forward.
@@ -150,6 +150,7 @@ Retry semantics (implemented in `qiita_control_plane.runner._run_entry_with_retr
 - On any other unwrapped `Exception` (LIBRARY primitive raising plain Python, programming bug): treat as `permanent`, `failure_type=permanent`, `failure_reason="<ExceptionType>: <message>"` truncated to 2000 chars.
 
 Manual restart (`POST /api/v1/work-ticket/{idx}/run` on a `FAILED` ticket):
+- The caller must be the ticket's originator or wet_lab_admin+ (404 otherwise) and the stored ticket must pass `_gate_submission` against the action's current definition (the follow-on gate, the in-flight dedupe and `force` do not apply); a ticket that no longer does is refused with 422 and the work is submitted again.
 - Atomic UPDATE: state ← PENDING, `retry_count = 0`, all `failure_*` columns ← NULL (the DB CHECK requires `failure_*` all-NULL when state ≠ failed; the route clears them in one statement).
 - Triggers a fresh in-process dispatch via `schedule_dispatch`, which queues behind the process-wide dispatch cap below when all slots are held. The original FAILED-row state is not preserved on the row itself; ops dashboards that want post-mortem retention should snapshot the `failure_*` fields before triggering /run.
 - Entries with a `completed` step row are fast-forwarded, not re-run. A step row is read for the entry at its `step_index` only while that entry still has the row's `step_name` and kind (`step:` or `action:`), because workflow YAMLs are edited in place and re-synced (`step_progress.check_step_progress`). A ticket with a row that no longer matches — a step was inserted, removed, renamed or reordered ahead of it — is refused by `/run` with a 409 naming those rows, and fails permanently at `submission` when startup recovery resumes it; a new ticket is submitted in its place (a terminal ticket does not block one), or, for `read-mask-block`, its prep_samples are re-masked under a new mask version. `/run` also refuses a ticket whose `mask_idx` names a deprecated mask.
@@ -162,13 +163,15 @@ Manual restart (`POST /api/v1/work-ticket/{idx}/run` on a `FAILED` ticket):
 asyncio loop of the process that submitted them; a CP restart loses
 those tasks. To recover, the lifespan startup hook calls
 `reconcile_inflight_tickets`, which **re-attaches** rather than fails:
-for every non-terminal (PENDING / QUEUED / PROCESSING) ticket it schedules
-`run_workflow(resume=True)`, which fast-forwards entries a prior run already
+in a background task, once the data plane reports SERVING (so a CP that starts first
+doesn't fail every ticket at submission), it schedules `run_workflow(resume=True)`
+for every non-terminal (PENDING / QUEUED / PROCESSING) ticket not changed in the
+meantime (a `/run` that dispatched one is not doubled). The resume fast-forwards entries a prior run already
 completed (rebuilding their `bound` outputs from the shared workspace),
 re-attaches a still-running SLURM job by its persisted `slurm_job_id` (or
 adopts an orphan by its deterministic name via `find-by-name`), finalizes a
 job that succeeded during the outage, and decides a purged job from its
-on-disk output manifest. The startup hook then calls `reconcile_follow_ons`,
+on-disk output manifest, or from its stderr when there is none (only a slurmrestd not-found answer (Slurm's invalid-job-id error) on the status read marks a job purged; any other 4xx or 404 keeps the manifest-only verdict). The startup hook then calls `reconcile_follow_ons`,
 which submits the follow-on of every completed ticket that records no outcome
 (one that completed while no process ran its completion hook, or whose
 submission failed with anything but a refusal). The same reconcile then runs on
@@ -196,7 +199,8 @@ accessions and returns immediately with a batch handle, while a background task
 an ENA sample accession across studies), and submits one `download-ena-study`
 work ticket per `sequenced_pool` holding the study's runs, or a run-list item's
 listed runs (a re-import's new runs
-get a new pool once an earlier pool's download is under way). That ticket then
+get a new pool once an earlier pool's download is under way; runs that a completed
+download did not read get a new, forced ticket on that pool). That ticket then
 runs like any other workflow: a native `ingest_ena_reads` step (`read_ena_sequences`
 + the same mint-then-sort-and-assign pipeline `ingest_reads` uses), the standard
 `register-files` action into DuckLake, and `persist-ena-run-outcomes`, which records

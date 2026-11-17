@@ -121,6 +121,12 @@ const REPLACE_KEY_TABLES: &[ReplaceKey] = &[
     ReplaceKey::borrows("myloasm_mapping", "myloasm_run"),
     ReplaceKey::borrows("myloasm_link", "myloasm_run"),
     ReplaceKey::borrows("myloasm_split", "myloasm_run"),
+    // The gene-call tables (`ducklake::ensure_gene_call_tables`), keyed like
+    // assembly_membership and for the same reason. Both borrow its keys, as
+    // bin_quality does: a run with no subject to call writes both empty
+    // (`qiita_common.gene_call_constants.GENE_CALL_RUN_KEY`).
+    ReplaceKey::borrows("gene_call_contig", "assembly_membership"),
+    ReplaceKey::borrows("gene_call", "assembly_membership"),
     // amplicon's twin of assembly_membership: same key, same argument. amplicon_load
     // derives the whole run's rows from its own workspace and never reads the lake
     // back, and a re-run resolves to the same processing_idx, so a --force resubmit
@@ -142,7 +148,8 @@ struct ReplaceKey {
     /// Columns compared together as one key.
     key: &'static [&'static str],
     /// Table in the same registration whose incoming files name the key set to
-    /// delete on, unioned with this table's own files.
+    /// delete on, unioned with this table's own files. A registration carrying this
+    /// table without that one is refused (`refuse_borrow_without_key_source`).
     ///
     /// `bin_quality` borrows `assembly_membership`'s, because it can be EMPTY
     /// where the load still runs: CheckM scores MAG, LCG and the unbinned residue
@@ -154,8 +161,9 @@ struct ReplaceKey {
     /// was replaced out from under them. `assembly_membership` carries the run's
     /// key on every row and is never empty where the load runs at all
     /// (`assembly_hash` raises `StepNoData` at zero contigs of any kind). The
-    /// myloasm tables borrow `myloasm_run`'s for the same reason; the argument is
-    /// at their entries. Every other entry is its own source.
+    /// gene-call tables borrow `assembly_membership`'s too, and the myloasm tables
+    /// borrow `myloasm_run`'s, for the same reason; the argument is at their
+    /// entries. Every other entry is its own source.
     key_source: &'static str,
 }
 
@@ -178,6 +186,30 @@ impl ReplaceKey {
             key_source,
         }
     }
+}
+
+/// Refuse a registration that carries a table whose `REPLACE_KEY_TABLES` entry
+/// borrows its delete keys, without the `key_source` table it borrows from. Without
+/// the source, the delete reads only the table's own files, so an empty file deletes
+/// nothing and the run's previous rows stay beside the new ones. Checked before any
+/// file is moved.
+fn refuse_borrow_without_key_source<'a>(
+    tables: impl Iterator<Item = &'a str>,
+) -> Result<(), Status> {
+    let tables: std::collections::BTreeSet<&str> = tables.collect();
+    for entry in REPLACE_KEY_TABLES {
+        if entry.key_source != entry.table
+            && tables.contains(entry.table)
+            && !tables.contains(entry.key_source)
+        {
+            return Err(Status::invalid_argument(format!(
+                "{} takes its replace keys from {}, which this registration does not carry; \
+                 register them together",
+                entry.table, entry.key_source
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// The replace-by-key DELETE for one `REPLACE_KEY_TABLES` entry: drop every lake
@@ -472,6 +504,8 @@ fn register_files<W: std::borrow::Borrow<LakeWriter>>(
             )));
         }
     }
+
+    refuse_borrow_without_key_source(payload.files.values().map(String::as_str))?;
 
     // One scope key for the whole registration; it does not vary per file.
     let scope = staging_scope(&payload.staging_dir, scratch_root);

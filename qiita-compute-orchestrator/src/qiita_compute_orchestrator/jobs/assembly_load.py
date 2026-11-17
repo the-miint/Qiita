@@ -1,16 +1,25 @@
 """Native job: re-key assembly_hash's hash-keyed outputs to feature_idx and write
-the four DuckLake-shape staging Parquets register-files hands to the data plane.
+the DuckLake-shape staging Parquets register-files hands to the data plane.
 
 Tail of the long-read-assembly workflow, the assembly analogue of reference_load.
 It REUSES the shared `_feature_load` re-key writers verbatim — the shared
 `qiita.feature` space means an assembled contig and a reference sequence with the
 same bytes carry the same feature_idx, so the sequence + chunk writers are
-identical. The four staging outputs (basename == DuckLake table name):
+identical. The staging outputs (basename == DuckLake table name):
 
   - `assembled_sequence.parquet`        (feature_idx, sequence_hash, sequence_length_bp)
   - `assembled_sequence_chunks/part_*.parquet` (feature_idx, chunk_index, chunk_data)
-  - `assembly_membership.parquet`       (prep_sample_idx, processing_idx, kind, bin_id, feature_idx)
+  - `assembly_membership.parquet`       (prep_sample_idx, processing_idx, kind, bin_id,
+                                         feature_idx, the contig attributes, genome_idx)
   - `bin_quality.parquet`               per-genome CheckM (+ DAS_Tool provenance)
+  - `gene_call.parquet`, `gene_call_contig.parquet`  the gene_call step's rows, keyed
+
+Each subject's `genome_idx` comes from `subject_genome_map`, which
+export-subject-genome-map wrote from the genomes write-assembly-membership minted. The
+gene-call rows name contigs and genes by sequence hash and subjects by `kind` and
+`bin_id` (`gene_call_constants.GENE_CALL_STEP_IDENTIFIERS`); here they get their
+`feature_idx` (contigs from `feature_map`, genes from mint-gene-features'
+`gene_feature_map`) and `genome_idx`. A row any of these leaves unresolved fails the step.
 
 The first two come straight from the shared `_feature_load.write_feature_sequences` /
 `write_feature_sequence_chunks` (fed by `build_feature_id_map`). The membership
@@ -25,7 +34,7 @@ csv parser, never a shell transform on the tool tables).
 
 Empty/partial semantics: a prep_sample with contigs but nothing CheckM scored — no
 refined bin, nothing circular, and no residue contig clearing the length cut — is a
-SUCCESS; `bin_quality` is written empty (register-files still finds all four tables
+SUCCESS; `bin_quality` is written empty (register-files still finds every table
 with the right schema). Zero contigs never reaches here (assembly_hash raised
 StepNoData upstream).
 
@@ -65,8 +74,18 @@ from qiita_common.assembly_constants import (
     contig_attribute_projection,
     register_contig_attribute_table,
 )
+from qiita_common.gene_call_constants import (
+    GENE_CALL_COLUMNS,
+    GENE_CALL_CONTIG_COLUMNS,
+    GENE_CALL_CONTIG_TABLE,
+    GENE_CALL_RUN_KEY,
+    GENE_CALL_STEP_IDENTIFIERS,
+    GENE_CALL_TABLE,
+    GENE_CALL_TABLES,
+)
 from qiita_common.myloasm_constants import MYLOASM_RAW_DIR
 from qiita_common.parquet import validate_parquet_path
+from qiita_common.sql import cast_projection
 
 from ..miint import (
     PARQUET_OPTS_AT_REST,
@@ -87,6 +106,8 @@ from ._myloasm_provenance import (
     staging_paths,
     write_myloasm_staging,
 )
+from .gene_call import CONTIG_FILE as GENE_CALL_CONTIG_FILE
+from .gene_call import GENE_FILE as GENE_CALL_GENE_FILE
 
 YAML_STEP_NAME = "assembly_load"
 
@@ -131,6 +152,8 @@ class Inputs(BaseModel):
     DAS_Tool's raw `das_tool_summary.tsv`. `genomes_dir` is the assemble step's
     output, read here only for the per-contig attribute sidecar the entrypoint
     wrote beside the two FASTAs and, for a myloasm run, its provenance dump.
+    `gene_calls` is the gene_call step's output directory, `gene_feature_map`
+    mint-gene-features' map and `subject_genome_map` export-subject-genome-map's.
     `processing_idx` is
     threaded via the step's `params:` (so the runner mints the run identity before
     the loop); `prep_sample_idx` / `work_ticket_idx` are framework-injected scope
@@ -144,6 +167,9 @@ class Inputs(BaseModel):
     genomes_dir: Path
     checkm_dir: Path
     refined_bins_dir: Path
+    gene_calls: Path
+    gene_feature_map: Path
+    subject_genome_map: Path
     processing_idx: int
     prep_sample_idx: int
     work_ticket_idx: int
@@ -155,6 +181,10 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
         ("feature_map", inputs.feature_map),
         ("assembly_chunks", inputs.assembly_chunks),
         ("bin_map", inputs.bin_map),
+        ("gene_feature_map", inputs.gene_feature_map),
+        ("subject_genome_map", inputs.subject_genome_map),
+        ("gene_calls gene file", inputs.gene_calls / GENE_CALL_GENE_FILE),
+        ("gene_calls contig file", inputs.gene_calls / GENE_CALL_CONTIG_FILE),
     ]:
         if not path.exists():
             raise FileNotFoundError(f"{label} not found: {path}")
@@ -173,6 +203,8 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     chunks_dir = staging / "assembled_sequence_chunks"
     membership_path = staging / "assembly_membership.parquet"
     bin_quality_path = staging / "bin_quality.parquet"
+    gene_path = staging / f"{GENE_CALL_TABLE}.parquet"
+    gene_contig_path = staging / f"{GENE_CALL_CONTIG_TABLE}.parquet"
 
     sequences_out = validate_parquet_path(sequences_path)
     membership_out = validate_parquet_path(membership_path)
@@ -198,6 +230,11 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             build_feature_id_map(conn, inputs.manifest)
 
             register_contig_attribute_table(conn, inputs.genomes_dir / CONTIG_ATTRIBUTES_FILE)
+            conn.execute(
+                f"CREATE TEMP TABLE {_SUBJECT_GENOME} AS"
+                " SELECT kind, bin_id, genome_idx FROM read_parquet(?)",
+                [str(inputs.subject_genome_map)],
+            )
 
             # Reused verbatim from _feature_load — the shared feature space means
             # the sequence + chunk writers are identical to the reference path.
@@ -220,6 +257,18 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 processing_idx=inputs.processing_idx,
                 out=bin_quality_out,
             )
+            for out in (membership_out, bin_quality_out):
+                _require_genome(conn, out)
+
+            write_gene_call_staging(
+                conn,
+                gene_calls=inputs.gene_calls,
+                gene_feature_map=inputs.gene_feature_map,
+                prep_sample_idx=inputs.prep_sample_idx,
+                processing_idx=inputs.processing_idx,
+                gene_out=gene_path,
+                contig_out=gene_contig_path,
+            )
 
             myloasm_dump = inputs.genomes_dir / MYLOASM_RAW_DIR
             if myloasm_dump.is_dir():
@@ -233,6 +282,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 )
 
             conn.execute("DROP TABLE contig_attribute")
+            conn.execute(f"DROP TABLE {_SUBJECT_GENOME}")
             conn.execute("DROP TABLE id_map")
             conn.execute("DROP TABLE feature_map")
         success = True
@@ -242,6 +292,8 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 sequences_path,
                 membership_path,
                 bin_quality_path,
+                gene_path,
+                gene_contig_path,
                 *staging_paths(staging).values(),
             ):
                 partial.unlink(missing_ok=True)
@@ -301,8 +353,11 @@ def _write_assembly_membership(
         "    GROUP BY bm.kind, bm.bin_id, im.feature_idx"
         "  )"
         "  SELECT m.prep_sample_idx, m.processing_idx, m.kind, m.bin_id, m.feature_idx,"
-        f"    {contig_attribute_projection('a')}"
-        "  FROM member m" + contig_attribute_join("m") + "  ORDER BY m.feature_idx"
+        f"    {contig_attribute_projection('a')}, sg.genome_idx"
+        "  FROM member m"
+        + contig_attribute_join("m")
+        + f"  LEFT JOIN {_SUBJECT_GENOME} sg ON sg.kind = m.kind AND sg.bin_id = m.bin_id"
+        "  ORDER BY m.feature_idx"
         f") TO '{out}' ({PARQUET_OPTS_AT_REST})",
         [str(bin_map_path)],
     )
@@ -404,9 +459,14 @@ def _write_bin_quality(
                 "n_contigs": 'qa."# contigs"',
                 "das_tool_score": 'das."bin_score"' if with_das else "NULL",
                 "source_binner": 'das."bin_set"' if with_das else "NULL",
+                "genome_idx": "sg.genome_idx",
             }
         )
-        source = f'  FROM {_READ_TSV} lin  JOIN {_READ_TSV} qa ON lin."Bin Id" = qa."Bin Id"'
+        source = (
+            f'  FROM {_READ_TSV} lin  JOIN {_READ_TSV} qa ON lin."Bin Id" = qa."Bin Id"'
+            f"  LEFT JOIN {_SUBJECT_GENOME} sg"
+            f"    ON sg.kind = '{kind}' AND sg.bin_id = CAST(lin.\"Bin Id\" AS VARCHAR)"
+        )
         # `?` binds positionally across the whole statement, so each arm's paths are
         # appended in the order its own read_csv calls appear.
         params.extend([str(lineage_tsv), str(qa_tsv)])
@@ -425,3 +485,92 @@ def _write_bin_quality(
     # UNION ALL, not UNION: the arms are disjoint by `kind` and a dedupe here
     # would only cost a sort over every column.
     conn.execute(f"COPY ({' UNION ALL '.join(arms)}) TO '{out}' ({PARQUET_OPTS_AT_REST})", params)
+
+
+# The TEMP TABLE holding `subject_genome_map`: (kind, bin_id) -> genome_idx.
+_SUBJECT_GENOME = "subject_genome"
+
+
+def _require_genome(conn: duckdb.DuckDBPyConnection, out: str) -> None:
+    """Every subject this run wrote has a genome in `subject_genome_map`, which
+    export-subject-genome-map built from the same run's Postgres membership; a row
+    without one means the two disagree about the run's subjects."""
+    missing = conn.execute(
+        "SELECT count(*) FROM read_parquet(?) WHERE genome_idx IS NULL", [out]
+    ).fetchone()[0]
+    if missing:
+        raise RuntimeError(f"{out}: {missing} row(s) whose subject has no genome_idx")
+
+
+def write_gene_call_staging(
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    gene_calls: Path,
+    gene_feature_map: Path,
+    prep_sample_idx: int,
+    processing_idx: int,
+    gene_out: Path,
+    contig_out: Path,
+) -> None:
+    """The gene_call step's rows as `gene_call` / `gene_call_contig` staging: the run
+    key added, each subject's `genome_idx` from the `subject_genome` table, each
+    contig's `feature_idx` from `feature_map`, and each gene's from
+    `gene_feature_map`. Inner joins, then a count against the input: a row that does
+    not resolve fails the step rather than being dropped. Needs the `feature_map` and
+    `subject_genome` TEMP TABLEs."""
+    run = dict(zip(GENE_CALL_RUN_KEY, (str(prep_sample_idx), str(processing_idx)), strict=True))
+
+    def sources(table: str, resolved: dict[str, str]) -> dict[str, str]:
+        # The step's own columns as read; each one it names by identifiers instead
+        # (`GENE_CALL_STEP_IDENTIFIERS`) from `resolved`.
+        step = GENE_CALL_STEP_IDENTIFIERS[table]
+        if set(resolved) != set(step):
+            raise KeyError(f"{table}: resolved {sorted(resolved)}, step names {sorted(step)}")
+        own = (n for n, _ in GENE_CALL_TABLES[table] if n not in run and n not in step)
+        return run | {n: f"r.{n}" for n in own} | resolved
+
+    gene_sources = sources(
+        GENE_CALL_TABLE,
+        {
+            "genome_idx": "sg.genome_idx",
+            "parent_feature_idx": "cf.feature_idx",
+            "feature_idx": "gf.feature_idx",
+        },
+    )
+    contig_sources = sources(
+        GENE_CALL_CONTIG_TABLE, {"genome_idx": "sg.genome_idx", "feature_idx": "cf.feature_idx"}
+    )
+    subject_join = f"JOIN {_SUBJECT_GENOME} sg ON sg.kind = r.kind AND sg.bin_id = r.bin_id"
+    for src, out, projection, joins, join_params in (
+        (
+            gene_calls / GENE_CALL_GENE_FILE,
+            gene_out,
+            cast_projection(GENE_CALL_TABLE, GENE_CALL_COLUMNS, gene_sources),
+            f"{subject_join}"
+            " JOIN feature_map cf ON cf.sequence_hash = r.parent_sequence_hash"
+            " JOIN read_parquet(?) gf ON gf.sequence_hash = r.sequence_hash",
+            [str(gene_feature_map)],
+        ),
+        (
+            gene_calls / GENE_CALL_CONTIG_FILE,
+            contig_out,
+            cast_projection(GENE_CALL_CONTIG_TABLE, GENE_CALL_CONTIG_COLUMNS, contig_sources),
+            f"{subject_join} JOIN feature_map cf ON cf.sequence_hash = r.sequence_hash",
+            [],
+        ),
+    ):
+        params = [str(src), *join_params]
+        target = validate_parquet_path(out)
+        conn.execute(
+            f"COPY (SELECT {projection} FROM read_parquet(?) r {joins})"
+            f" TO '{target}' ({PARQUET_OPTS_AT_REST})",
+            params,
+        )
+        read, written = conn.execute(
+            "SELECT (SELECT count(*) FROM read_parquet(?)), (SELECT count(*) FROM read_parquet(?))",
+            [str(src), target],
+        ).fetchone()
+        if read != written:
+            raise RuntimeError(
+                f"{src.name}: {read} row(s) read, {written} resolved to a genome and features"
+            )

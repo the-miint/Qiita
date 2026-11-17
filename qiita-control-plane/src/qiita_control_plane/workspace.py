@@ -13,6 +13,7 @@ from pathlib import Path
 
 from qiita_common.actions import STEP_LOGS_SUBDIR, STEP_MANIFEST_FILENAME
 from qiita_common.workspace import (
+    ATTEMPT_DIR_PREFIX,
     WORK_TICKET_SUBDIR,
     step_attempt_dir,
     step_output_dir,
@@ -20,6 +21,7 @@ from qiita_common.workspace import (
 )
 
 __all__ = [
+    "ATTEMPT_DIR_PREFIX",
     "STEP_MANIFEST_FILENAME",
     "WORK_TICKET_SUBDIR",
     "action_payload_record",

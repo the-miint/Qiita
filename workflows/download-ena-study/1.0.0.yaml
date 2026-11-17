@@ -11,7 +11,8 @@ description: >
   in Qiita, so while the user-facing request is per-study, the download
   work-ticket is `sequenced_pool`-scoped: `ena_import.registration.
   register_ena_study` puts runs into pools on one sequencing_run per
-  (study, platform), and this ticket downloads exactly one such pool's runs.
+  (study, platform), and this ticket downloads one such pool's runs, or only
+  those in the optional `ena_run_accessions`.
   A multi-platform study therefore yields multiple download tickets, fanned
   out by the batch driver.
 
@@ -63,6 +64,12 @@ context_schema:
       type: integer
       minimum: 1
       maximum: 8
+    # Download only these runs of the pool; omitted -> every active run.
+    ena_run_accessions:
+      type: array
+      items: { type: string, minLength: 1 }
+      minItems: 1
+      uniqueItems: true
 
 steps:
   # Store the pool's reads once. For each run in `ena_run_map`, fetch its

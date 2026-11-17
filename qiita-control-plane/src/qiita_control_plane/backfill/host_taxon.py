@@ -2,9 +2,8 @@
 
 `host_taxon_id` (the host organism a sample was taken FROM) was added as a
 biosample global field after the biosamples we hold had been ingested, so those
-carry no value (ENA imports write it). Until it is populated,
-`host_filter_resolver` reports such a sample as UNRESOLVED and the submit path
-has nothing to resolve against. This module fills it in.
+carry no value (ENA imports write it). A biosample with a host must have it named
+here before it is submitted.
 
 The organism is not derivable from the taxonomy tree. `qiita.terminology_term`
 stores only `(term_id, label)` — no parent, no lineage — and NCBI's metagenome
@@ -25,15 +24,19 @@ Two facts drive each biosample, in this order:
      came from. `human gut metagenome` implies a human host; `seawater
      metagenome` implies none.
 
-Anything the two facts do not settle is REPORTED, never guessed. A sample whose
+Anything the two facts do not settle is REPORTED, never guessed. A biosample whose
 taxon is not in the table (e.g. the bare `metagenome` root, which names no
-environment and so implies no host) is left unwritten, and stays UNRESOLVED at
-submit — which aborts rather than silently passing an un-depleted sample
-through. The residue is the curation worklist, not a rounding error.
+environment and so implies no host) is written 'not provided', and stays
+UNRESOLVED at submit — which aborts rather than silently passing an un-depleted
+sample through. The residue is the curation worklist, not a rounding error. A
+hostless taxon is left absent.
 
-Idempotent: a biosample that already carries `host_taxon_id` is skipped, so the
-backfill can be re-run as curation lands. Adding a taxon to the curated table
-(`host_by_sample_taxon`) is a code change plus a deploy.
+Run ONCE, in the deploy that made an absent `host_taxon_id` mean "no host" (DEPLOY_CHECKLIST
+bucket 2, before the restart), and never after: from the restart an absent value is deliberate,
+and a later run would write over it. A biosample that already carries `host_taxon_id` is
+skipped. Adding a taxon to the curated table
+(`host_by_sample_taxon`) is a code change plus a deploy; a residue row already
+written 'not provided' is then fixed with `qiita biosample patch-metadata-by-unique-field`.
 """
 
 from __future__ import annotations
@@ -48,7 +51,7 @@ from qiita_common.models import (
     BIOSAMPLE_FIELD_HOST_TAXON_ID,
     BIOSAMPLE_FIELD_TAXON_ID,
     MISSING_REASON_CONTROL_SAMPLE,
-    MISSING_REASON_NOT_APPLICABLE,
+    MISSING_REASON_NOT_PROVIDED,
     MISSING_REASON_VALUE_COLUMN,
     NCBI_TAXONOMY_NAME,
     TERMINOLOGY_TERM_VALUE_COLUMN,
@@ -66,7 +69,7 @@ class ControlScan:
     """What the pre-flight sweep found — the controls, and what it could not read.
 
     The two failure counts are surfaced rather than dropped because a missed blank
-    resolves UNRESOLVED and aborts its whole pool. "The pre-flight said blank but
+    is handled as an ordinary biosample. "The pre-flight said blank but
     we could not match it" is a different problem from "this sample's metadata
     needs curating", and an operator has to be able to tell them apart.
     """
@@ -83,8 +86,8 @@ class HostTaxonSource(StrEnum):
 
     CONTROL = "control"  # the pre-flight or the metadata says it is a blank
     TAXON = "taxon"  # its own taxon implies a host
-    NO_HOST = "no_host"  # its own taxon implies NO host ('not applicable')
-    UNRESOLVED = "unresolved"  # nothing settles it — left unwritten, reported
+    NO_HOST = "no_host"  # its own taxon implies NO host — left absent
+    UNRESOLVED = "unresolved"  # nothing settles it — written 'not provided', reported
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,7 +97,7 @@ class BiosampleAssignment:
     biosample_idx: int
     study_idx: int
     source: HostTaxonSource
-    # Exactly one of these is set, and only when source is not UNRESOLVED.
+    # Exactly one is set, unless source is NO_HOST (then neither).
     host_term_id: str | None = None
     missing_reason: str | None = None
     # Carried for the report so an UNRESOLVED row says WHY.
@@ -117,7 +120,7 @@ class BackfillPlan:
     control_scan: ControlScan = field(default_factory=ControlScan)
 
     def writable(self) -> list[BiosampleAssignment]:
-        return [a for a in self.assignments if a.source is not HostTaxonSource.UNRESOLVED]
+        return [a for a in self.assignments if a.source is not HostTaxonSource.NO_HOST]
 
     def unresolved(self) -> list[BiosampleAssignment]:
         return [a for a in self.assignments if a.source is HostTaxonSource.UNRESOLVED]
@@ -157,6 +160,7 @@ def classify(
             biosample_idx=biosample_idx,
             study_idx=study_idx,
             source=HostTaxonSource.UNRESOLVED,
+            missing_reason=MISSING_REASON_NOT_PROVIDED,
             sample_taxon_term_id=sample_taxon_term_id,
             sample_taxon_label=sample_taxon_label,
         )
@@ -167,7 +171,6 @@ def classify(
             biosample_idx=biosample_idx,
             study_idx=study_idx,
             source=HostTaxonSource.NO_HOST,
-            missing_reason=MISSING_REASON_NOT_APPLICABLE,
             sample_taxon_term_id=sample_taxon_term_id,
             sample_taxon_label=sample_taxon_label,
         )
@@ -187,8 +190,8 @@ async def fetch_control_accessions(pool: asyncpg.Pool) -> ControlScan:
     Per-pool guarded. A single unreadable blob must NOT take down a 3300-row
     backfill, and it must not be anonymous either: the pool idx is selected so an
     unreadable one can be NAMED in the report. The pools that did parse still
-    contribute their controls, and every blank in an unreadable pool simply falls
-    to UNRESOLVED — which aborts that pool at submit rather than mis-depleting it.
+    contribute their controls, and every blank in an unreadable pool is treated as
+    an ordinary biosample.
 
     (Test databases hold deliberately-corrupt placeholder blobs, so this is not a
     hypothetical: without the guard, one unrelated test's `b"X"` blob would fail
@@ -368,7 +371,7 @@ async def apply_backfill(
         field_idx_by_study: dict[int, int] = {}
 
         for a in assignments:
-            if a.source is HostTaxonSource.UNRESOLVED:
+            if a.source is HostTaxonSource.NO_HOST:
                 continue
             async with conn.transaction():
                 field_idx = field_idx_by_study.get(a.study_idx)
@@ -425,7 +428,7 @@ async def _fetch_ncbi_term_idxs(conn: asyncpg.Connection) -> dict[str, int]:
 
 async def _fetch_missing_reason_idxs(conn: asyncpg.Connection) -> dict[str, int]:
     """Same, for the two missing-reasons the backfill assigns."""
-    wanted = [MISSING_REASON_NOT_APPLICABLE, MISSING_REASON_CONTROL_SAMPLE]
+    wanted = [MISSING_REASON_NOT_PROVIDED, MISSING_REASON_CONTROL_SAMPLE]
     rows = await conn.fetch(
         "SELECT name, idx FROM qiita.missing_value_reason WHERE name = ANY($1::text[])",
         wanted,

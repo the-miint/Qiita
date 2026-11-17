@@ -784,8 +784,7 @@ def _resolved_decisions(
             " whose host we cannot determine would be masked against the wrong thing,"
             " or against nothing.\n"
             + "\n".join(f"  {k}: {v}" for k, v in reasons.items())
-            + "\n\nFix the samples' host_taxon_id metadata (`qiita-admin backfill"
-            " host-taxon-id` fills a biosample with none; `qiita biosample"
+            + "\n\nFix the samples' host_taxon_id metadata (`qiita biosample"
             " patch-metadata-by-unique-field` replaces a stored value, such as an ENA"
             " import's 'not provided'), or pass --force with an explicit"
             " --host-rype-reference-idx to override resolution pool-wide."

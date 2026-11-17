@@ -118,6 +118,53 @@ def staging_inputs(tmp_path):
     }
 
 
+# The genome each subject in a bin_map gets from export-subject-genome-map: 9000 plus
+# its position in sorted (kind, bin_id) order.
+def _subject_genomes(bin_map: Path) -> dict[tuple[str, str], int]:
+    with duckdb.connect(":memory:") as con:
+        subjects = con.execute(
+            f"SELECT DISTINCT kind, bin_id FROM read_parquet('{bin_map}') ORDER BY ALL"
+        ).fetchall()
+    return {s: 9000 + i for i, s in enumerate(subjects)}
+
+
+def _gene_file_schema() -> tuple[str, str]:
+    """The gene_call step's gene and contig files' columns, as DDL."""
+    from qiita_common.gene_call_constants import (
+        GENE_CALL_CONTIG_TABLE,
+        GENE_CALL_TABLE,
+        gene_call_step_columns,
+    )
+
+    def cols(table):
+        return ", ".join(f"{name} {sqltype}" for name, sqltype in gene_call_step_columns(table))
+
+    return cols(GENE_CALL_TABLE), cols(GENE_CALL_CONTIG_TABLE)
+
+
+def _gene_inputs(tmp_path: Path, bin_map: Path, *, genes=(), contigs=(), gene_features=()):
+    """The three gene-call inputs: the gene_call step's directory (empty unless rows
+    are given), mint-gene-features' map, and export-subject-genome-map's map over
+    `bin_map`'s subjects."""
+    gene_schema, contig_schema = _gene_file_schema()
+    gene_calls = tmp_path / "gene_calls"
+    _write(gene_calls / "gene.parquet", gene_schema, list(genes))
+    _write(gene_calls / "contig.parquet", contig_schema, list(contigs))
+    gene_feature_map = tmp_path / "gene_feature_map.parquet"
+    _write(gene_feature_map, "sequence_hash UUID, feature_idx BIGINT", list(gene_features))
+    subject_genome_map = tmp_path / "subject_genome_map.parquet"
+    _write(
+        subject_genome_map,
+        "kind VARCHAR, bin_id VARCHAR, genome_idx BIGINT",
+        [(k, b, g) for (k, b), g in _subject_genomes(bin_map).items()],
+    )
+    return {
+        "gene_calls": gene_calls,
+        "gene_feature_map": gene_feature_map,
+        "subject_genome_map": subject_genome_map,
+    }
+
+
 def _tsv(path: Path, header: list[str], rows: list[tuple]) -> None:
     """Write a RAW tab-delimited tool table (the shape the containers now emit
     verbatim) — assembly_load parses it with DuckDB read_csv, never Python csv."""
@@ -192,6 +239,11 @@ def _inputs(
             ["bin", "bin_score", "bin_set"],
             list(das_rows),
         )
+    gene_inputs = (
+        {}
+        if "subject_genome_map" in staging_inputs
+        else _gene_inputs(tmp_path, staging_inputs["bin_map"])
+    )
     return Inputs(
         genomes_dir=genomes_dir,
         checkm_dir=checkm_dir,
@@ -200,6 +252,7 @@ def _inputs(
         prep_sample_idx=42,
         work_ticket_idx=7,
         **staging_inputs,
+        **gene_inputs,
     )
 
 
@@ -283,6 +336,7 @@ def test_assembly_membership_parquet_lifts_bins_to_feature_idx(tmp_path, staging
         "circularity": "VARCHAR",
         "depth": "DOUBLE",
         "mult": "DOUBLE",
+        "genome_idx": "BIGINT",
     }
     # This case passes no sidecar, so every attribute is NULL — and the row count
     # below is unchanged by that. The columns exist whether or not the assemble
@@ -456,6 +510,7 @@ def test_bin_quality_joins_checkm_and_das(tmp_path, staging_inputs):
         "n_contigs": "BIGINT",
         "das_tool_score": "DOUBLE",
         "source_binner": "VARCHAR",
+        "genome_idx": "BIGINT",
     }
     rows = _rows(
         pq,
@@ -565,7 +620,7 @@ def test_the_unbinned_pair_becomes_unbinned_quality_rows(tmp_path, staging_input
         staging_inputs,
         checkm_rows=[("bin.1", "k__Bacteria", 95.5, 1.2, 0.0, 10000, 2)],
         lcg_rows=[("circ1", "k__Bacteria", 99.1, 0.4, 0.0, 1800000, 1)],
-        unbinned_rows=[("ctg7", "k__Bacteria", 42.0, 0.9, 0.0, 410000, 1)],
+        unbinned_rows=[("ctgU", "k__Bacteria", 42.0, 0.9, 0.0, 410000, 1)],
     )
     out = _run(inputs, tmp_path / "ws")
     staging = out["staging_dir"]
@@ -573,7 +628,7 @@ def test_the_unbinned_pair_becomes_unbinned_quality_rows(tmp_path, staging_input
     assert _rows(staging / "bin_quality.parquet", "kind, bin_id, completeness", "bin_id") == [
         ("MAG", "bin.1", 95.5),
         ("LCG", "circ1", 99.1),
-        ("UNBINNED", "ctg7", 42.0),
+        ("UNBINNED", "ctgU", 42.0),
     ]
     # MAG-only provenance: DAS_Tool never sees a residue contig, so the columns are
     # NULL by construction rather than by a missing join.
@@ -583,7 +638,7 @@ def test_the_unbinned_pair_becomes_unbinned_quality_rows(tmp_path, staging_input
         "bin_id",
         where="kind = 'UNBINNED'",
     )
-    assert unbinned == [("ctg7", None, None)], unbinned
+    assert unbinned == [("ctgU", None, None)], unbinned
 
 
 def test_a_run_with_no_unbinned_pair_still_stores_unbinned_memberships(tmp_path, staging_inputs):
@@ -670,6 +725,7 @@ def myloasm_inputs(tmp_path):
         processing_idx=77,
         prep_sample_idx=42,
         work_ticket_idx=7,
+        **_gene_inputs(tmp_path, tmp_path / "bin_map.parquet"),
     )
 
 
@@ -714,3 +770,117 @@ def test_a_dump_that_does_not_match_the_run_fails_and_leaves_no_partial_staging(
     with pytest.raises(ValueError, match="u912ctg"):
         _run(myloasm_inputs, workspace)
     assert [p.name for p in (workspace / "assembly_staging").iterdir()] == []
+
+
+# --- genome_idx and the gene calls -------------------------------------------------
+
+
+def test_membership_and_quality_name_each_subject_by_its_genome(tmp_path, staging_inputs):
+    """Every membership and quality row carries its subject's genome from
+    `subject_genome_map`."""
+    inputs = _inputs(
+        tmp_path,
+        staging_inputs,
+        checkm_rows=[("bin.1", "k__Bacteria", 95.5, 1.2, 0.0, 10000, 2)],
+        lcg_rows=[("circ1", "k__Bacteria", 99.1, 0.4, 0.0, 1800000, 1)],
+    )
+    genomes = _subject_genomes(staging_inputs["bin_map"])
+    staging = _run(inputs, tmp_path / "ws")["staging_dir"]
+    for table in ("assembly_membership", "bin_quality"):
+        rows = _rows(staging / f"{table}.parquet", "DISTINCT kind, bin_id, genome_idx", "ALL")
+        assert rows and all(genomes[(k, b)] == g for k, b, g in rows), table
+
+
+def test_a_subject_without_a_genome_fails_the_load(tmp_path, staging_inputs):
+    """A subject the run's genome map does not name means the map and the run
+    disagree; the load fails rather than writing a row without its genome."""
+    gene_inputs = _gene_inputs(tmp_path, staging_inputs["bin_map"])
+    _write(
+        gene_inputs["subject_genome_map"],
+        "kind VARCHAR, bin_id VARCHAR, genome_idx BIGINT",
+        [
+            (k, b, g)
+            for (k, b), g in _subject_genomes(staging_inputs["bin_map"]).items()
+            if b != "ctgU"
+        ],
+    )
+    inputs = _inputs(tmp_path, {**staging_inputs, **gene_inputs})
+    with pytest.raises(RuntimeError, match="no genome_idx"):
+        _run(inputs, tmp_path / "ws")
+
+
+def _write_gene_rows(gene_calls: Path, genes: list[tuple], contigs: list[tuple]) -> None:
+    """One gene file row per `(kind, bin_id, call_set, contig hash, gene hash)` and one
+    contig file row per `(kind, bin_id, call_set, contig hash)`, the other columns
+    fixed."""
+    gene_schema, contig_schema = _gene_file_schema()
+    gene_calls.mkdir(parents=True, exist_ok=True)
+    with duckdb.connect(":memory:") as con:
+        con.execute(f"CREATE TABLE g ({gene_schema})")
+        for kind, bin_id, call_set, contig, gene in genes:
+            con.execute(
+                "INSERT INTO g VALUES (?, ?, ?, ?, ?, 1, 301, '+', 50.0, false, false,"
+                " 'ATG', 99.9, MAP {'gc_cont': '0.500'}, 'MKV')",
+                [kind, bin_id, call_set, str(contig), str(gene)],
+            )
+        con.execute(f"COPY g TO '{gene_calls / 'gene.parquet'}' (FORMAT PARQUET)")
+        con.execute(f"CREATE TABLE c ({contig_schema})")
+        for kind, bin_id, call_set, contig in contigs:
+            con.execute(
+                "INSERT INTO c VALUES (?, ?, ?, ?, 1, true, false, true, 'ok', 11, true,"
+                " 3, 'model', 0.5)",
+                [kind, bin_id, call_set, str(contig)],
+            )
+        con.execute(f"COPY c TO '{gene_calls / 'contig.parquet'}' (FORMAT PARQUET)")
+
+
+def test_gene_calls_are_staged_with_their_genome_and_features(tmp_path, staging_inputs):
+    """The gene_call step's rows reach `gene_call` / `gene_call_contig` staging in
+    the lake's columns, with the run key, the subject's genome, the contig's
+    feature_idx from `feature_map` and the gene's from `gene_feature_map`."""
+    from qiita_common.gene_call_constants import GENE_CALL_COLUMNS, GENE_CALL_CONTIG_COLUMNS
+
+    contig = _hash("TTTTGGGGCCCCAAAA")  # MAG bin.1's second contig, feature_idx 300
+    gene = _hash("ATGAAAGTGTAA")
+    gene_inputs = _gene_inputs(
+        tmp_path, staging_inputs["bin_map"], gene_features=[(str(gene), 8800)]
+    )
+    _write_gene_rows(
+        gene_inputs["gene_calls"],
+        genes=[("MAG", "bin.1", "prodigal_checkm", contig, gene)],
+        contigs=[("MAG", "bin.1", "prodigal_checkm", contig)],
+    )
+    inputs = _inputs(tmp_path, {**staging_inputs, **gene_inputs})
+    staging = _run(inputs, tmp_path / "ws")["staging_dir"]
+    genome = _subject_genomes(staging_inputs["bin_map"])[("MAG", "bin.1")]
+
+    gene_pq = staging / "gene_call.parquet"
+    assert list(_schema(gene_pq)) == [name for name, _ in GENE_CALL_COLUMNS]
+    assert _rows(
+        gene_pq,
+        "prep_sample_idx, processing_idx, genome_idx, call_set, parent_feature_idx,"
+        " feature_idx, position, attributes['gc_cont']",
+        "1",
+    ) == [(42, 77, genome, "prodigal_checkm", 300, 8800, 1, "0.500")]
+    contig_pq = staging / "gene_call_contig.parquet"
+    assert list(_schema(contig_pq)) == [name for name, _ in GENE_CALL_CONTIG_COLUMNS]
+    assert _rows(
+        contig_pq, "prep_sample_idx, processing_idx, genome_idx, feature_idx, status", "1"
+    ) == [(42, 77, genome, 300, "ok")]
+
+
+def test_a_gene_whose_feature_was_not_minted_fails_the_load(tmp_path, staging_inputs):
+    """A gene hash `gene_feature_map` does not carry would drop the gene on the inner
+    join; the count check fails the load instead."""
+    contig = _hash("TTTTGGGGCCCCAAAA")
+    gene_inputs = _gene_inputs(tmp_path, staging_inputs["bin_map"])
+    _write_gene_rows(
+        gene_inputs["gene_calls"],
+        genes=[("MAG", "bin.1", "prodigal_checkm", contig, _hash("ATGAAAGTGTAA"))],
+        contigs=[("MAG", "bin.1", "prodigal_checkm", contig)],
+    )
+    inputs = _inputs(tmp_path, {**staging_inputs, **gene_inputs})
+    workspace = tmp_path / "ws"
+    with pytest.raises(RuntimeError, match="gene.parquet: 1 row"):
+        _run(inputs, workspace)
+    assert not (workspace / "assembly_staging" / "gene_call.parquet").exists()

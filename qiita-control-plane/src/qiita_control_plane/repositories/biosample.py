@@ -11,15 +11,13 @@ stand alone.
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Literal, get_args
 
 import asyncpg
-from qiita_common.models import BiosampleAccessionField, FieldDataType, Tier
+from qiita_common.models import BiosampleLookupKey, FieldDataType, Tier
 
 from . import RowLock, require_transaction, row_lock_clause, update_row
 from ._sample_helpers import (
     ResolvedFieldValue,
-    assert_required_global_fields_supplied,
     fetch_missing_value_reason_idxs_by_names,
     fetch_study_idxs_by_entity_idx,
     link_entity_to_studies,
@@ -294,14 +292,6 @@ async def fetch_biosample_idxs_for_study(
     return [r["biosample_idx"] for r in rows]
 
 
-# The natural keys a biosample lookup may key on: the two wire-facing accession
-# columns, matrix_tube_id, and export_entity_id. Deriving from
-# BiosampleAccessionField keeps the accession set defined once, in
-# qiita_common.models.
-BiosampleLookupKey = Literal[
-    *get_args(BiosampleAccessionField), "matrix_tube_id", "export_entity_id"
-]
-
 # Each lookup key's (column expression, join) over `qiita.biosample`. Only text from
 # this closed mapping reaches the SQL, since identifiers cannot be bound.
 _BIOSAMPLE_LOOKUP_SQL: dict[BiosampleLookupKey, tuple[str, str]] = {
@@ -519,17 +509,6 @@ async def import_biosample_from_owner_biosample_id(
         raise BiosampleOwnerIdMissingValueError(
             owner_biosample_id_value, known_missing_reasons[stripped_owner_id]
         )
-
-    # Pre-flight: every REQUIRED global field must be supplied. Declining to give
-    # a value (a missing-value marker) counts as supplied; silence does not. This is
-    # what stops a sample arriving with no `host_taxon_id`, which would resolve
-    # UNRESOLVED and abort its pool at submit.
-    await assert_required_global_fields_supplied(
-        conn,
-        spec=BIOSAMPLE_METADATA_SPEC,
-        metadata=metadata,
-        global_internal_names=global_internal_names,
-    )
 
     bs_idx = await insert_biosample(
         conn,
