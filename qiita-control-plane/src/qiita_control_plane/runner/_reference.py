@@ -15,6 +15,7 @@ from qiita_common.models import (
     INDEX_TYPE_BOWTIE2,
     INDEX_TYPE_MINIMAP2,
     INDEX_TYPE_RYPE_ROUTER,
+    MarkerClass,
     ReferenceStatus,
 )
 
@@ -679,6 +680,7 @@ async def _resolve_qc_adapters(
 SORTMERNA_REF_BINDING = "sortmerna_ref"
 # action_context key: the reference_idx to materialize.
 SORTMERNA_REFERENCE_IDX_KEY = "sortmerna_reference_idx"
+MARKER_REF_BINDINGS = {cls: f"{cls}_ref" for cls in MarkerClass}
 
 
 def _write_reference_fasta(
@@ -720,6 +722,61 @@ def _write_reference_fasta(
     return count
 
 
+def _workflow_declares_marker_refs(steps: list[Any]) -> bool:
+    return any(_workflow_declares_input(steps, b) for b in MARKER_REF_BINDINGS.values())
+
+
+async def _fetch_sortmerna_reference_chunks(
+    pool: asyncpg.Pool | asyncpg.Connection,
+    reference_idx: int,
+    *,
+    label: str,
+    data_plane_url: str,
+    signing_key: bytes,
+) -> list[tuple[int, int, str]]:
+    """Check `reference_idx` is an ACTIVE `sequence_reference` and DoGet its chunks;
+    every failure is a SUBMISSION BAD_INPUT naming `label`."""
+    row = await pool.fetchrow(
+        "SELECT kind, status FROM qiita.reference WHERE reference_idx = $1", reference_idx
+    )
+    if row is None:
+        raise _submission_bad_input(f"{label} {reference_idx} does not exist")
+    if row["kind"] != "sequence_reference":
+        raise _submission_bad_input(f"{label} {reference_idx} is not a sequence_reference")
+    if row["status"] != ReferenceStatus.ACTIVE.value:
+        raise _submission_bad_input(f"{label} {reference_idx} is not active")
+
+    ticket = sign_ticket(
+        table=_REFERENCE_CHUNKS_TABLE,
+        filter={"reference_idx": [reference_idx]},
+        secret=signing_key,
+    )
+    try:
+        return await asyncio.get_event_loop().run_in_executor(
+            None, _runner_pkg._do_get_reference_sequence_chunks, data_plane_url, ticket
+        )
+    except Exception as exc:
+        raise _submission_dp_fetch_failure(
+            f"could not fetch {label} {reference_idx} sequences from the data plane: "
+            f"{type(exc).__name__}: {exc}",
+            exc,
+        ) from exc
+
+
+def _write_sortmerna_fasta(
+    rows: list[tuple[int, int, str]],
+    dest: Path,
+    con: duckdb.DuckDBPyConnection,
+    *,
+    label: str,
+    reference_idx: int,
+) -> None:
+    try:
+        _write_reference_fasta(rows, dest, con)
+    except ValueError as exc:
+        raise _submission_bad_input(f"{label} {reference_idx}: {exc}") from exc
+
+
 async def _resolve_sortmerna_ref(
     pool: asyncpg.Pool | asyncpg.Connection,
     action_context: dict[str, Any],
@@ -728,45 +785,66 @@ async def _resolve_sortmerna_ref(
     signing_key: bytes,
     workspace: Path,
 ) -> dict[str, Path]:
-    """materialize the SortMeRNA `sequence_reference` to a FASTA for denoise.
-
-    run before the step loop when a step declares `sortmerna_ref`. reads
-    `sortmerna_reference_idx`, checks it's an ACTIVE `sequence_reference`, DoGets
-    its chunks, and writes `<workspace>/sortmerna_ref.fasta`. re-run safe. every
-    failure is a SUBMISSION BAD_INPUT, like `_resolve_qc_adapters`."""
+    """Materialize the SortMeRNA `sequence_reference` named by `sortmerna_reference_idx`
+    to `<workspace>/sortmerna_ref.fasta` for denoise. Every failure is a SUBMISSION BAD_INPUT."""
     reference_idx = action_context.get(SORTMERNA_REFERENCE_IDX_KEY)
     if reference_idx is None:
         raise _submission_bad_input("amplicon requires sortmerna_reference_idx")
-    row = await pool.fetchrow(
-        "SELECT kind, status FROM qiita.reference WHERE reference_idx = $1", reference_idx
+    label = "SortMeRNA reference"
+    rows = await _fetch_sortmerna_reference_chunks(
+        pool,
+        reference_idx,
+        label=label,
+        data_plane_url=data_plane_url,
+        signing_key=signing_key,
     )
-    if row is None:
-        raise _submission_bad_input(f"SortMeRNA reference {reference_idx} does not exist")
-    if row["kind"] != "sequence_reference":
-        raise _submission_bad_input(f"reference {reference_idx} is not a sequence_reference")
-    if row["status"] != ReferenceStatus.ACTIVE.value:
-        raise _submission_bad_input(f"SortMeRNA reference {reference_idx} is not active")
-
-    ticket = sign_ticket(
-        table=_REFERENCE_CHUNKS_TABLE,
-        filter={"reference_idx": [reference_idx]},
-        secret=signing_key,
-    )
-    try:
-        rows = await asyncio.get_event_loop().run_in_executor(
-            None, _runner_pkg._do_get_reference_sequence_chunks, data_plane_url, ticket
-        )
-    except Exception as exc:
-        raise _submission_dp_fetch_failure(
-            f"could not fetch SortMeRNA reference {reference_idx} sequences from the "
-            f"data plane: {type(exc).__name__}: {exc}",
-            exc,
-        ) from exc
     workspace.mkdir(parents=True, exist_ok=True)
     fasta = workspace / "sortmerna_ref.fasta"
-    try:
-        with connect_with_miint_staged() as con:
-            _write_reference_fasta(rows, fasta, con)
-    except ValueError as exc:
-        raise _submission_bad_input(f"SortMeRNA reference {reference_idx}: {exc}") from exc
+    with connect_with_miint_staged() as con:
+        _write_sortmerna_fasta(rows, fasta, con, label=label, reference_idx=reference_idx)
     return {SORTMERNA_REF_BINDING: fasta}
+
+
+async def _resolve_marker_refs(
+    pool: asyncpg.Pool | asyncpg.Connection,
+    action_context: dict[str, Any],
+    *,
+    data_plane_url: str,
+    signing_key: bytes,
+    workspace: Path,
+) -> dict[str, Path]:
+    """Materialize one SortMeRNA FASTA per marker class from the four
+    `marker_*_reference_idx` keys, bound as `marker_*_ref`. Every failure is a
+    SUBMISSION BAD_INPUT naming the class."""
+    idxs: dict[MarkerClass, int] = {}
+    for cls in MarkerClass:
+        key = f"{cls}_reference_idx"
+        reference_idx = action_context.get(key)
+        if reference_idx is None:
+            raise _submission_bad_input(f"the {cls} marker reference requires {key}")
+        if reference_idx in idxs.values():
+            twin = next(c for c, i in idxs.items() if i == reference_idx)
+            raise _submission_bad_input(
+                f"reference {reference_idx} is named for both {twin} and {cls}"
+            )
+        idxs[cls] = reference_idx
+    chunks = {
+        cls: await _fetch_sortmerna_reference_chunks(
+            pool,
+            idx,
+            label=f"{cls} reference",
+            data_plane_url=data_plane_url,
+            signing_key=signing_key,
+        )
+        for cls, idx in idxs.items()
+    }
+    workspace.mkdir(parents=True, exist_ok=True)
+    bound = {}
+    with connect_with_miint_staged() as con:
+        for cls, rows in chunks.items():
+            dest = workspace / f"{cls}_ref.fasta"
+            _write_sortmerna_fasta(
+                rows, dest, con, label=f"{cls} reference", reference_idx=idxs[cls]
+            )
+            bound[f"{cls}_ref"] = dest
+    return bound

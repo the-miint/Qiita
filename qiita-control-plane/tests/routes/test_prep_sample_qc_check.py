@@ -222,9 +222,7 @@ async def test_metrics_is_an_object_on_one_row_and_null_on_another(ctx):
     await _as_viewer(ctx, study_idx)
     pool = ctx["pool"]
     metrics = {"n_sampled": 5, "nested": {"a": 1}}
-    await _add_check(
-        pool, ticket_idx, ps_idx, QcCheck.DATA_TYPE, QcSeverity.INFO, metrics=metrics
-    )
+    await _add_check(pool, ticket_idx, ps_idx, QcCheck.DATA_TYPE, QcSeverity.INFO, metrics=metrics)
     await _add_check(pool, ticket_idx, ps_idx, QcCheck.COMPOSITION, QcSeverity.INFO)
 
     body = (await ctx["user"].get(_url(ps_idx))).json()
