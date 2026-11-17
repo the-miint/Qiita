@@ -51,8 +51,12 @@ ORDER BY hash(sequence_idx), sequence_idx
 LIMIT {limit}
 """
 
-# Subject ids carry the class; a read tied across classes goes to the first in table order.
-_SUBJECT_SQL = "SELECT '{cls}:' || read_id AS read_id, sequence1 FROM read_fastx('{ref}')"
+# Subject ids carry the class; a read tied across classes goes to the first class in `refs`,
+# so the table is ordered explicitly (UNION ALL branches run in parallel).
+_SUBJECT_SQL = (
+    "SELECT {ordinal} AS ordinal, '{cls}:' || read_id AS read_id, sequence1 "
+    "FROM read_fastx('{ref}')"
+)
 
 _CLASS_COUNTS_SQL = """
 SELECT split_part(ref_name, ':', 1) AS cls, count(*)
@@ -116,13 +120,14 @@ def _graded(failed: bool, measured: float, threshold: float) -> Verdict:
 
 def _class_counts(conn, refs: dict[MarkerClass, Path]) -> dict[MarkerClass, int]:
     """Reads per class, each read assigned to its best-scoring class; a read whose best hit
-    covers under 50% counts as unclassified."""
+    covers under `_MIN_COVERAGE`% counts as unclassified."""
     conn.execute(
-        "CREATE OR REPLACE TABLE marker_subject AS "
+        "CREATE OR REPLACE TABLE marker_subject AS SELECT read_id, sequence1 FROM ("
         + " UNION ALL ".join(
-            _SUBJECT_SQL.format(cls=cls.value, ref=validate_parquet_path(ref))
-            for cls, ref in refs.items()
+            _SUBJECT_SQL.format(ordinal=i, cls=cls.value, ref=validate_parquet_path(ref))
+            for i, (cls, ref) in enumerate(refs.items())
         )
+        + ") ORDER BY ordinal"
     )
     counts = dict.fromkeys(refs, 0)
     for cls, n in conn.execute(_CLASS_COUNTS_SQL.format(coverage=_MIN_COVERAGE)).fetchall():
