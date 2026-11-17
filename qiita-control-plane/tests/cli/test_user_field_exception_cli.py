@@ -14,6 +14,7 @@ from qiita_common.api_paths import (
     URL_BIOSAMPLE_FIELD_EXCEPTION,
     URL_SEQUENCED_SAMPLE_FIELD_EXCEPTION,
 )
+from qiita_common.http_headers import ETAG_HEADER, IF_MATCH_HEADER
 
 from qiita_control_plane.cli import _common
 from qiita_control_plane.cli.user import main
@@ -82,13 +83,13 @@ def _serve(monkeypatch, *, existing: bool) -> list[dict]:
             if not existing:
                 return httpx.Response(404, json={"detail": "no exception"}, request=req)
             return httpx.Response(
-                200, json=_EXCEPTION_BODY, headers={"ETag": '"etag-v1"'}, request=req
+                200, json=_EXCEPTION_BODY, headers={ETAG_HEADER: '"etag-v1"'}, request=req
             )
         if method == "PUT":
             return httpx.Response(
                 200 if existing else 201,
                 json=_EXCEPTION_BODY,
-                headers={"ETag": '"etag-v2"'},
+                headers={ETAG_HEADER: '"etag-v2"'},
                 request=req,
             )
         return httpx.Response(204, request=req)
@@ -118,7 +119,7 @@ def test_set_field_exception_creates_without_if_match_when_none_exists(monkeypat
     put = requests[1]
     assert put["url"] == _url(surface)
     assert put["json"] == {"tier_override": "admin", "reason": "PII"}
-    assert "If-Match" not in put["headers"]
+    assert IF_MATCH_HEADER not in put["headers"]
 
 
 @pytest.mark.parametrize("surface", _SURFACES, ids=_IDS)
@@ -139,7 +140,7 @@ def test_set_field_exception_replaces_under_the_read_etag(monkeypatch, surface):
 
     assert rc == 0
     assert [r["method"] for r in requests] == ["GET", "PUT"]
-    assert requests[1]["headers"]["If-Match"] == '"etag-v1"'
+    assert requests[1]["headers"][IF_MATCH_HEADER] == '"etag-v1"'
     assert requests[1]["json"] == {"tier_override": "member", "reason": "PII"}
 
 
@@ -177,7 +178,7 @@ def test_set_field_exception_with_replace_creates_when_none_exists(monkeypatch, 
 
     assert rc == 0
     assert [r["method"] for r in requests] == ["GET", "PUT"]
-    assert "If-Match" not in requests[1]["headers"]
+    assert IF_MATCH_HEADER not in requests[1]["headers"]
 
 
 @pytest.mark.parametrize("surface", _SURFACES, ids=_IDS)
@@ -191,7 +192,7 @@ def test_clear_field_exception_deletes_under_the_read_etag(monkeypatch, capsys, 
         ("GET", _url(surface)),
         ("DELETE", _url(surface)),
     ]
-    assert requests[1]["headers"]["If-Match"] == '"etag-v1"'
+    assert requests[1]["headers"][IF_MATCH_HEADER] == '"etag-v1"'
     out = capsys.readouterr().out
     assert _EXCEPTION_BODY["reason"] in out
 

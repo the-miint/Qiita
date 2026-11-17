@@ -24,6 +24,7 @@ from qiita_common.api_paths import (
     URL_SEQUENCED_SAMPLE_FIELD_EXCEPTION,
 )
 from qiita_common.auth_constants import MAX_REASON_LENGTH, Scope
+from qiita_common.http_headers import ETAG_HEADER, IF_MATCH_HEADER
 from qiita_common.models import FieldDataType, Tier
 
 from qiita_control_plane.repositories._sample_helpers import EntityMetadataSpec
@@ -325,7 +326,7 @@ def _body(tier: Tier, reason: str = "accidental PII") -> dict:
 
 
 async def _put(client, url: str, tier: Tier, *, if_match: str | None = None, reason=None):
-    headers = {} if if_match is None else {"If-Match": if_match}
+    headers = {} if if_match is None else {IF_MATCH_HEADER: if_match}
     body = _body(tier) if reason is None else _body(tier, reason)
     return await client.put(url, json=body, headers=headers)
 
@@ -333,7 +334,7 @@ async def _put(client, url: str, tier: Tier, *, if_match: str | None = None, rea
 async def _etag(client, url: str) -> str:
     resp = await client.get(url)
     assert resp.status_code == 200, resp.text
-    return resp.headers["ETag"]
+    return resp.headers[ETAG_HEADER]
 
 
 async def _visible_keys(client, url: str) -> set[str]:
@@ -376,7 +377,7 @@ async def test_put_exception_hides_the_value_below_its_tier(ctx, surface):
     assert body["reason"] == "accidental PII"
     assert body["created_by_idx"] == _wet_idx(ctx)
     assert body["updated_by_idx"] == _wet_idx(ctx)
-    assert resp.headers["ETag"]
+    assert resp.headers[ETAG_HEADER]
     assert value.internal_name not in await _visible_keys(ctx["user"], read_url)
     assert value.internal_name in await _visible_keys(ctx["wet"], read_url)
 
@@ -391,7 +392,7 @@ async def test_delete_exception_restores_visibility(ctx, surface):
     put = await _put(ctx["wet"], url, Tier.ADMIN)
     assert put.status_code == 201, put.text
 
-    resp = await ctx["wet"].delete(url, headers={"If-Match": put.headers["ETag"]})
+    resp = await ctx["wet"].delete(url, headers={IF_MATCH_HEADER: put.headers[ETAG_HEADER]})
 
     assert resp.status_code == 204, resp.text
     assert await _exception_rows(ctx, s.spec, entity) == []
@@ -500,13 +501,17 @@ async def test_put_replaces_an_exception_under_its_if_match(ctx, surface):
     assert first.status_code == 201, first.text
 
     resp = await _put(
-        ctx["wet"], url, Tier.ADMIN, if_match=first.headers["ETag"], reason="named a participant"
+        ctx["wet"],
+        url,
+        Tier.ADMIN,
+        if_match=first.headers[ETAG_HEADER],
+        reason="named a participant",
     )
 
     assert resp.status_code == 200, resp.text
     assert resp.json()["tier_override"] == Tier.ADMIN
     assert resp.json()["reason"] == "named a participant"
-    assert resp.headers["ETag"] != first.headers["ETag"]
+    assert resp.headers[ETAG_HEADER] != first.headers[ETAG_HEADER]
     (row,) = await _exception_rows(ctx, s.spec, entity)
     assert (row["tier_override"], row["reason"]) == ("admin", "named a participant")
 
@@ -585,14 +590,14 @@ async def test_stale_if_match_is_412(ctx, surface, verb):
     value = await _seed_global_value(ctx, s.spec, study_idx=study_idx, entity=entity)
     url = s.exception_url(study_idx, entity, value.study_field_idx)
     first = await _put(ctx["wet"], url, Tier.MEMBER)
-    stale = first.headers["ETag"]
+    stale = first.headers[ETAG_HEADER]
     second = await _put(ctx["wet"], url, Tier.ADMIN, if_match=stale)
     assert second.status_code == 200, second.text
 
     if verb == "put":
         resp = await _put(ctx["wet"], url, Tier.VIEWER, if_match=stale)
     else:
-        resp = await ctx["wet"].delete(url, headers={"If-Match": stale})
+        resp = await ctx["wet"].delete(url, headers={IF_MATCH_HEADER: stale})
 
     assert resp.status_code == 412, resp.text
     (row,) = await _exception_rows(ctx, s.spec, entity)
@@ -693,7 +698,7 @@ async def test_value_another_study_wrote_needs_admin_there(ctx, surface):
             await ctx["user"].get(url),
             await _put(ctx["user"], url, Tier.ADMIN),
             await _put(ctx["user"], url, Tier.ADMIN, if_match=etag),
-            await ctx["user"].delete(url, headers={"If-Match": etag}),
+            await ctx["user"].delete(url, headers={IF_MATCH_HEADER: etag}),
         ]
 
     unset = await _every_verb('"2026-01-01T00:00:00+00:00"')
@@ -757,7 +762,7 @@ async def test_delete_missing_exception_is_404(ctx, surface):
 
     resp = await ctx["wet"].delete(
         s.exception_url(study_idx, entity, value.study_field_idx),
-        headers={"If-Match": '"2026-01-01T00:00:00+00:00"'},
+        headers={IF_MATCH_HEADER: '"2026-01-01T00:00:00+00:00"'},
     )
 
     assert resp.status_code == 404, resp.text
@@ -863,7 +868,7 @@ async def test_declaring_unique_in_study_over_an_exception_is_409(ctx, surface):
         client=ctx["wet"],
         study_idx=study_idx,
         study_field_idx=field_idx,
-        if_match=field.headers["ETag"],
+        if_match=field.headers[ETAG_HEADER],
         unique_in_study=True,
     )
 
@@ -901,7 +906,7 @@ async def test_an_exception_on_another_field_does_not_block_unique_in_study(ctx,
         client=ctx["wet"],
         study_idx=study_idx,
         study_field_idx=field_idx,
-        if_match=field.headers["ETag"],
+        if_match=field.headers[ETAG_HEADER],
         unique_in_study=True,
     )
 
@@ -984,7 +989,7 @@ async def test_unique_declaration_racing_an_exception_is_409(ctx, surface):
                     client=ctx["wet"],
                     study_idx=study_idx,
                     study_field_idx=field_idx,
-                    if_match=field.headers["ETag"],
+                    if_match=field.headers[ETAG_HEADER],
                     unique_in_study=True,
                 )
             )
@@ -1067,7 +1072,7 @@ async def test_field_exception_write_authz(
         if verb == "put":
             return await _put(client, url(study_idx, sample_idx), Tier.ADMIN)
         return await client.delete(
-            url(study_idx, sample_idx), headers={"If-Match": await current_etag()}
+            url(study_idx, sample_idx), headers={IF_MATCH_HEADER: await current_etag()}
         )
 
     await assert_study_scoped_sample_admin_authz(
