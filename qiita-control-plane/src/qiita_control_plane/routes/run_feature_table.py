@@ -4,8 +4,8 @@
 (`FeatureTableRequest`: runs, and a study or a sample list) and answer:
 
   * samples — the table's columns as JSON: each processed sample's column name,
-    its QM, its biosample's public name (to join to metadata), and its run; with
-    the runs' method and what their values are (`count`);
+    its QM, and its biosample's public name (to join to metadata); with the runs'
+    method and what their values are (`count`);
   * values — sparse COO `(sample, feature, value)` as an Arrow IPC stream;
   * features — `(feature, sequence, length)` for every feature the values name
     (an ASV's md5, its sequence and length), as an Arrow IPC stream.
