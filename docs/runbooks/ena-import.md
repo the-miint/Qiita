@@ -138,10 +138,11 @@ warning, listed runs flagged or retired since; it fails only if none remain). `/
 a 409 on an older ticket (the error names the newer one and its state), and on a failed
 ticket that still has a live download job from before the failure, which holds the old
 roster: cancel it by idx (`work_ticket_idxs`) to reap the job, then re-import the study. The ticket stays FAILED and keeps refusing `/run`.
-A re-import does not retry the failed runs of a `completed_partial` pool: its ticket is
-COMPLETED and is reused, and the runs keep reporting `download_failed`. It does ticket the
-runs a completed download never read (no reads, no recorded failure): a new ticket for the
-same pool, restricted to them. A run counts as downloaded once its minting ticket completed, so
+A re-import does not retry the permanently failed runs of a `completed_partial` pool: they
+keep reporting `download_failed`. It tickets the runs a completed download never read, and
+those that failed `retriable` (the retries ran out): a new ticket for the same pool,
+restricted to them. A run that fails every time but is classed retriable (a gzip that ends
+early because ENA serves no file) is downloaded again on each re-import. A run counts as downloaded once its minting ticket completed, so
 a failed ticket that had already reserved a run's read numbering does not hide it from a
 re-import; the new ticket stops at that run, naming the failed ticket, which `/run` re-drives.
 If another import's restricted ticket is still live on a pool
@@ -288,7 +289,7 @@ did.
   `failed`, with `study_idx` and the download ticket idx(s) once resolved, and a
   `failure_reason` on any `failed` or `completed_partial` item. An item whose download
   ticket failed or was cancelled reports `failed`. An item whose ticket completed but
-  has a run that failed permanently and stored no reads reports `completed_partial`;
+  has a run that failed and stored no reads reports `completed_partial`;
   its `failure_reason` lists the failed runs, and each shows in `ena_runs` as
   `download_failed` with its `failure_reason` and `failure_type`. Also admin-only.
 
@@ -534,17 +535,19 @@ qiita ticket run <work_ticket_idx>
 A run that fails in a way a retry cannot clear (a format error, a run with no sequence
 data, a 404, zero reads) does not fail its pool when another run
 was stored: the other runs load, the ticket completes, and the failed run is recorded with
-its reason and `permanent` failure type (the item reads `completed_partial`). The ticket
+its reason and `permanent` failure type (the item reads `completed_partial`). A run that
+keeps failing in a way a retry could clear is recorded the same way, as `retriable`, on the
+ticket's last attempt, and a re-import retries it. The ticket
 is COMPLETED, so the submitter gets the work-ticket digest unless they opted out of
 processing emails; the digest row reads `partial: N runs failed` with a pointer to the
 batch status, which lists the failed runs, and the ticket carries no `failure_reason`. If
-a run failed in a way a retry could clear, the step still fails and retries first, and a
-run that failed permanently is fetched again on each retry, so a large one is downloaded
-again. Any other error fails the step as a whole: out of memory retries with more memory,
+a run failed in a way a retry could clear, the step fails and retries until the last
+attempt, and a run that failed permanently is fetched again on each retry, so a large one
+is downloaded again. Any other error fails the step as a whole: out of memory retries with more memory,
 a segfault retries on the same resources, and anything else (a local disk fault) leaves the
 ticket FAILED and redrivable.
 
-When the retries run out, or at once when no run was stored and none of the failures is one
+When no run was stored and the retries run out, or at once when none of the failures is one
 a retry could clear (a 404), the ticket is FAILED `permanent` and
 emailed with its reason.
 Read the reason first. A dropped transfer or an ENA outage: redrive the ticket

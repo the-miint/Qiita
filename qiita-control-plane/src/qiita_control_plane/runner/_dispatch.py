@@ -558,6 +558,11 @@ def _assert_within_ceiling(
         )
 
 
+# The binding a step names in `params:` to learn that a transient failure of this attempt would
+# exhaust the ticket's retries. The runner always sets it, so an action_context value is ignored.
+FINAL_ATTEMPT_BINDING = "final_attempt"
+
+
 def _bind_step_inputs(entry: WorkflowStep, bound: dict[str, Any]) -> dict[str, Any]:
     """Build a step's name -> value input map from the binding map `bound`.
 

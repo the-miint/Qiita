@@ -11,8 +11,9 @@ Two-write-target and idempotent/re-runnable semantics are identical too.
 A run whose fetch fails permanently (a 404, a format error, no sequence data, zero
 reads) does not fail the pool when another run was stored: it is listed in the
 `run_outcomes` JSON for `persist-ena-run-outcomes` and the rest land. Any
-transient failure, any unrecognised error (OOM, local staging), or no run stored
-fails the step.
+transient failure fails the step so the ticket retries, until `final_attempt`, when the
+stored runs land and the transient failures are listed too. Any unrecognised error (OOM,
+local staging), or no run stored, fails the step.
 
 Gotchas specific to the ENA source:
 - md5 verification is miint's, not this job's: `read_ena_sequences`'s
@@ -114,7 +115,8 @@ class Inputs(BaseModel):
     is the scratch root durable per-prep_sample `read.parquet` copies hang under (via
     `compute_reads_staging_path`). `download_method` defaults to 'http', the only
     transport this environment supports. `sequenced_pool_idx` / `sequencing_run_idx`
-    / `work_ticket_idx` are framework-injected scope scalars."""
+    / `work_ticket_idx` are framework-injected scope scalars. `final_attempt` is set by the
+    runner when a transient failure would not be retried."""
 
     ena_run_map: Path
     reads_staging_root: Path
@@ -123,6 +125,7 @@ class Inputs(BaseModel):
     sequenced_pool_idx: int
     sequencing_run_idx: int
     work_ticket_idx: int
+    final_attempt: bool = False
 
 
 class _RunFetchFailure(Exception):
@@ -406,7 +409,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
         _combine_failures([(acc, f) for _, acc, f in fetch_failures]) if fetch_failures else None
     )
     # Runs that already completed only wrote their own durable copy, which is harmless.
-    if combined is not None and combined.transient:
+    if combined is not None and combined.transient and not inputs.final_attempt:
         raise combined
     for outcome in outcomes:
         if isinstance(outcome, BaseException) and not isinstance(outcome, _RunFetchFailure):
@@ -422,7 +425,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                     prep_sample_idx=psi,
                     ena_run_accession=acc,
                     failure_reason=f.reason,
-                    failure_type=FailureType.PERMANENT,
+                    failure_type=(FailureType.RETRIABLE if f.transient else FailureType.PERMANENT),
                 ).model_dump(mode="json")
                 for psi, acc, f in fetch_failures
             ]

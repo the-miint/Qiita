@@ -65,6 +65,7 @@ from ._db import (
     _transition_to_processing_for_resume,
 )
 from ._dispatch import (
+    FINAL_ATTEMPT_BINDING,
     _advance_completed_step_status,
     _build_scope_target,
     _ceiling_exhausted_failure,
@@ -1192,12 +1193,16 @@ async def _run_entry_with_retry(
                     entry, retry_count=current_retry, max_retries=ctx.max_retries
                 )
         attempt_workspace.mkdir(parents=True, exist_ok=True)
+        attempt_bound = bound
+        if isinstance(entry, WorkflowStep) and FINAL_ATTEMPT_BINDING in entry.params:
+            spent = await _retry_count(ctx.pool, ctx.work_ticket_idx)
+            attempt_bound = {**bound, FINAL_ATTEMPT_BINDING: spent >= ctx.max_retries}
         try:
             if isinstance(entry, WorkflowStep):
                 return await _dispatch_step(
                     ctx,
                     entry,
-                    bound,
+                    attempt_bound,
                     attempt_workspace,
                     step_index=index,
                     attempt=attempt,
