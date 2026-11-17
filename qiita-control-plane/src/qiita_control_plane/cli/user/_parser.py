@@ -334,6 +334,10 @@ def _add_field_exception_subcommands(
     under /study, its placeholders filled from the parsed args.
     """
     hyphenated = entity_noun.replace("_", "-")
+    access = (
+        "(needs admin on the study, and on whichever study wrote a linked field's value;"
+        " wet_lab_admin+ needs neither)"
+    )
 
     def _add_target_args(subparser: argparse.ArgumentParser) -> None:
         subparser.add_argument("--study-idx", type=int, required=True)
@@ -347,10 +351,7 @@ def _add_field_exception_subcommands(
 
     p_get = entity_sub.add_parser(
         "get-field-exception",
-        help=(
-            f"Read the field exception on a {hyphenated}'s value of one study field"
-            " (needs admin on the study)"
-        ),
+        help=f"Read the field exception on a {hyphenated}'s value of one study field {access}",
     )
     _add_target_args(p_get)
     p_get.set_defaults(
@@ -365,7 +366,7 @@ def _add_field_exception_subcommands(
         "set-field-exception",
         help=(
             f"Restrict a {hyphenated}'s value of one study field to a tier above the"
-            " field's own (needs admin on the study)"
+            f" field's own {access}"
         ),
     )
     _add_target_args(p_set)
@@ -385,10 +386,7 @@ def _add_field_exception_subcommands(
 
     p_clear = entity_sub.add_parser(
         "clear-field-exception",
-        help=(
-            f"Remove the field exception on a {hyphenated}'s value of one study field"
-            " (needs admin on the study)"
-        ),
+        help=f"Remove the field exception on a {hyphenated}'s value of one study field {access}",
     )
     _add_target_args(p_clear)
     p_clear.set_defaults(handler=_handle_field_exception_clear, field_exception_path=path)
