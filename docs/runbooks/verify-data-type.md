@@ -74,7 +74,8 @@ qiita --base-url https://<host> ticket submit \
 The runner reads the protocol from the prep_sample; a protocol with no threshold fails the
 ticket. Read the result from `GET /qc-check/{prep_sample_idx}`: the `data_type` row's
 `metrics.marker_reference_idx` records which references were used. A re-run replaces the
-row. A prep_sample with no reads ends `no_data` and writes nothing, but only when an ingest
-found it empty or it is an expected-empty control; otherwise submission fails with BAD_INPUT.
+row. A prep_sample whose stored reads are all empty ends `no_data` and writes nothing. One
+with no stored reads ends `no_data` only when an ingest found it empty or it is an
+expected-empty control; otherwise submission fails with BAD_INPUT.
 
 The job exports the prep_sample's raw reads, so submitting needs an admin role.

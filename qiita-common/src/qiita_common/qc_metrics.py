@@ -1,4 +1,5 @@
-"""Per-check metric models for `prep_sample_qc_check.metrics`, keyed by `QcCheck`."""
+"""Per-check metric models for `prep_sample_qc_check.metrics`, keyed by `QcCheck`, and the
+marker classes' binding and action_context key names."""
 
 import math
 from enum import StrEnum
