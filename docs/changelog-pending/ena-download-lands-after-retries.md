@@ -1,6 +1,6 @@
 ### Changed
 
-- **A pool's stored ENA runs land once transient retries run out (#NNN).** `ingest_ena_reads`
+- **A pool's stored ENA runs land once transient retries run out (#907).** `ingest_ena_reads`
   used to fail the whole ticket when a run kept failing transiently, so the pool's good runs
   were not loaded. On the ticket's last attempt it now lands the stored runs and records the
   failed ones as `retriable`, where a permanent failure is recorded `permanent`, and the item
