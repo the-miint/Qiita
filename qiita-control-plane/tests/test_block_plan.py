@@ -978,9 +978,37 @@ async def test_plan_holds_each_partition_mask_in_its_ticket_transaction(
 
     async def _spy(conn, idx):
         locked.append((idx, conn.is_in_transaction()))
-        await real(conn, idx)
+        return await real(conn, idx)
 
     monkeypatch.setattr(block_planner, "lock_active_mask", _spy)
     await pooled["add_sample"](reads=150)
     summary, _dispatched = await _plan(pooled, planapp)
     assert locked == [(summary["partitions"][0]["mask_idx"], True)]
+
+
+async def test_a_plan_whose_minted_mask_was_edited_before_its_hold_is_refused(
+    pooled, planapp, monkeypatch
+):
+    """The plan mints its masks before the transaction that writes the tickets. When a
+    minted mask's held row no longer carries the hash the plan minted for (a settings
+    edit committed in between), the plan rolls back with no ticket written."""
+    real = block_planner.lock_active_mask
+
+    async def _edited(conn, idx):
+        row = await real(conn, idx)
+        return {**dict(row), "params_hash": b"\x00" * 32}
+
+    monkeypatch.setattr(block_planner, "lock_active_mask", _edited)
+    await pooled["add_sample"](reads=150)
+    with pytest.raises(block_planner.BlockPlanMaskEdited, match="plan the pool again"):
+        await _plan(pooled, planapp)
+    assert (
+        await pooled["pool"].fetchval(
+            "SELECT count(*) FROM qiita.work_ticket wt"
+            "  JOIN qiita.block_member bm ON bm.block_idx = wt.block_idx"
+            "  JOIN qiita.sequenced_sample ss ON ss.prep_sample_idx = bm.prep_sample_idx"
+            " WHERE ss.sequenced_pool_idx = $1",
+            pooled["pool_idx"],
+        )
+        == 0
+    )

@@ -38,6 +38,7 @@ from qiita_common.api_paths import (
     URL_ALIGNMENT_DEFINITION_ABANDON_PLAN,
     URL_ALIGNMENT_DEFINITION_STATUS,
 )
+from qiita_common.hashing import canonical_params_hash
 
 from .actions.reference import ReferenceNotFound
 from .block_planner import (
@@ -69,6 +70,7 @@ from .runner import (
     ReferenceIndexNotBuilt,
     _resolve_sharded_align_indexes,
 )
+from .runner._record import mint_and_hold
 
 if TYPE_CHECKING:
     from fastapi import FastAPI
@@ -451,19 +453,29 @@ async def plan_and_submit_alignments(
     if to_consider:
         async with pool.acquire() as conn, conn.transaction():
             await _lock_align_mask(conn, mask_idx)
+            params = {
+                "reference_idx": reference_idx,
+                "aligner": aligner,
+                "mask_idx": mask_idx,
+                "shard_ids": shard_ids,
+            }
+
+            async def held_params_hash(row: asyncpg.Record) -> bytes:
+                return (await lock_active_alignment(conn, row["alignment_idx"]))["params_hash"]
+
             try:
-                row = await mint_alignment_definition(
+                # Held from the mint through the ticket inserts below
+                # (`runner._record.mint_and_hold`).
+                row = await mint_and_hold(
                     conn,
-                    params={
-                        "reference_idx": reference_idx,
-                        "aligner": aligner,
-                        "mask_idx": mask_idx,
-                        "shard_ids": shard_ids,
-                    },
-                    principal_idx=originator_principal_idx,
+                    mint=lambda: mint_alignment_definition(
+                        conn, params=params, principal_idx=originator_principal_idx
+                    ),
+                    held_params_hash=held_params_hash,
+                    params_hash=canonical_params_hash(params),
+                    what=f"alignment of mask {mask_idx} against reference {reference_idx}",
                 )
                 alignment_idx = row["alignment_idx"]
-                await lock_active_alignment(conn, alignment_idx)
             except AlignmentDefinitionDeprecated as exc:
                 raise AlignDefinitionDeprecated(exc.detail) from exc
 

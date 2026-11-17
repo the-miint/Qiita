@@ -347,12 +347,12 @@ async def test_mint_read_mask_rekeys_a_mask_minted_on_the_byte_hash(seeded, tmp_
 
 
 @pytest.mark.db
-async def test_persist_mask_idx_writes_minted_mask_onto_ticket(seeded):
-    """The runner persists the minted mask_idx onto the ticket row. Mint a real
-    mask via `_mint_read_mask`, then persist it via the same `_persist_mask_idx`
-    the pre-loop block calls; the prep_sample-scoped work_ticket's `mask_idx`
-    column equals the minted value. Re-running is idempotent (a resume re-mints
-    to the same mask_idx and re-writes the same value)."""
+async def test_the_mint_records_the_mask_on_the_ticket(seeded):
+    """`_mint_read_mask` with the ticket records the minted mask_idx on it in the
+    mint's transaction (`runner._record`). A resume re-mints to the same mask_idx and
+    re-records it; a ticket that records another mask (its recorded mask's settings
+    were edited, so its params now resolve elsewhere) fails as bad input and keeps
+    its record."""
     pool = seeded["pool"]
     principal_idx = seeded["principal_idx"]
     prep_sample_idx = seeded["prep_sample_idx"]
@@ -387,51 +387,55 @@ async def test_persist_mask_idx_writes_minted_mask_onto_ticket(seeded):
         principal_idx,
         prep_sample_idx,
     )
+    common = dict(
+        action_id=action_id,
+        action_version=version,
+        prep_sample_idx=prep_sample_idx,
+        originator_principal_idx=principal_idx,
+        adapter_parquet=None,
+        default_adapter_reference_idx=None,
+        host_rype_reference_idx=None,
+        host_minimap2_reference_idx=None,
+        resolved_lima=None,
+        resolved_syndna=None,
+    )
+    from qiita_common.backend_failure import BackendFailure
+
+    masks: list[int] = []
     try:
         minted = await runner._mint_read_mask(
-            pool,
-            action_id=action_id,
-            action_version=version,
-            prep_sample_idx=prep_sample_idx,
-            originator_principal_idx=principal_idx,
-            instrument_model="NextSeq 550",
-            adapter_parquet=None,
-            default_adapter_reference_idx=None,
-            host_rype_reference_idx=None,
-            host_minimap2_reference_idx=None,
-            resolved_lima=None,
-            resolved_syndna=None,
+            pool, instrument_model="NextSeq 550", work_ticket_idx=work_ticket_idx, **common
         )
         mask_idx = minted[runner.MASK_IDX_BINDING]
+        masks.append(mask_idx)
 
-        # Before persist: column is NULL.
-        assert (
-            await pool.fetchval(
+        async def recorded():
+            return await pool.fetchval(
                 "SELECT mask_idx FROM qiita.work_ticket WHERE work_ticket_idx = $1",
                 work_ticket_idx,
             )
-            is None
-        )
 
-        await runner._persist_mask_idx(pool, work_ticket_idx, mask_idx)
-        assert (
-            await pool.fetchval(
-                "SELECT mask_idx FROM qiita.work_ticket WHERE work_ticket_idx = $1",
-                work_ticket_idx,
-            )
-            == mask_idx
+        assert await recorded() == mask_idx
+        again = await runner._mint_read_mask(
+            pool, instrument_model="NextSeq 550", work_ticket_idx=work_ticket_idx, **common
         )
+        assert again[runner.MASK_IDX_BINDING] == mask_idx
+        assert await recorded() == mask_idx
 
-        # Idempotent: a re-mint (same config -> same mask_idx) re-writes the same
-        # value, no error.
-        await runner._persist_mask_idx(pool, work_ticket_idx, mask_idx)
-        assert (
-            await pool.fetchval(
-                "SELECT mask_idx FROM qiita.work_ticket WHERE work_ticket_idx = $1",
-                work_ticket_idx,
-            )
-            == mask_idx
+        other = (await runner._mint_read_mask(pool, instrument_model="Illumina MiSeq", **common))[
+            runner.MASK_IDX_BINDING
+        ]
+        masks.append(other)
+        await pool.execute(
+            "UPDATE qiita.work_ticket SET mask_idx = $1 WHERE work_ticket_idx = $2",
+            other,
+            work_ticket_idx,
         )
+        with pytest.raises(BackendFailure, match="submit a new ticket"):
+            await runner._mint_read_mask(
+                pool, instrument_model="NextSeq 550", work_ticket_idx=work_ticket_idx, **common
+            )
+        assert await recorded() == other
     finally:
         # work_ticket.mask_idx FK is ON DELETE SET NULL, but the work_ticket row
         # still references the mask_definition; drop the ticket first.
@@ -443,7 +447,9 @@ async def test_persist_mask_idx_writes_minted_mask_onto_ticket(seeded):
             action_id,
             version,
         )
-        await pool.execute("DELETE FROM qiita.mask_definition WHERE mask_idx = $1", mask_idx)
+        await pool.execute(
+            "DELETE FROM qiita.mask_definition WHERE mask_idx = ANY($1::bigint[])", masks
+        )
 
 
 @pytest.mark.db

@@ -424,14 +424,15 @@ async def refuse_deprecating_with_live_work(conn: asyncpg.Connection, alignment_
         raise AlignmentHasLiveWork(alignment_idx, live)
 
 
-async def lock_active_alignment(conn: asyncpg.Connection, alignment_idx: int) -> None:
-    """Hold the definition row `FOR SHARE` for the caller's transaction and raise
-    AlignmentDefinitionDeprecated if it is deprecated. Called by every transaction
+async def lock_active_alignment(conn: asyncpg.Connection, alignment_idx: int) -> asyncpg.Record:
+    """Hold the definition row `FOR SHARE` for the caller's transaction, raise
+    AlignmentDefinitionDeprecated if it is deprecated, and return the held row's
+    `status`, `deprecation_reason` and `params_hash`. Called by every transaction
     that writes `work_ticket.alignment_idx`, so a deprecation cannot commit between
     the mint and the ticket recording it (`refuse_deprecating_with_live_work`)."""
     require_transaction(conn)
     row = await conn.fetchrow(
-        "SELECT status, deprecation_reason FROM qiita.alignment_definition"
+        "SELECT status, deprecation_reason, params_hash FROM qiita.alignment_definition"
         " WHERE alignment_idx = $1 FOR SHARE",
         alignment_idx,
     )
@@ -441,3 +442,4 @@ async def lock_active_alignment(conn: asyncpg.Connection, alignment_idx: int) ->
         raise AlignmentDefinitionDeprecated(
             f"alignment_definition {alignment_idx} is deprecated: {row['deprecation_reason']}"
         )
+    return row

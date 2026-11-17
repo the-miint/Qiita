@@ -659,12 +659,12 @@ async def test_align_plan_holds_both_definitions_in_its_ticket_transaction(
     async def _alignment(conn, idx):
         assert conn.is_in_transaction()
         locked.append(("alignment", idx))
-        await real_alignment(conn, idx)
+        return await real_alignment(conn, idx)
 
     async def _mask(conn, idx):
         assert conn.is_in_transaction()
         locked.append(("mask", idx))
-        await real_mask(conn, idx)
+        return await real_mask(conn, idx)
 
     monkeypatch.setattr(align_planner, "lock_active_alignment", _alignment)
     monkeypatch.setattr(align_planner, "lock_active_mask", _mask)

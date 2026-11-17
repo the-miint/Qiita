@@ -577,11 +577,11 @@ async def refuse_deprecating_mask_with_live_work(conn: asyncpg.Connection, mask_
 
 async def lock_mask(conn: asyncpg.Connection, mask_idx: int) -> asyncpg.Record:
     """Hold the mask_definition row `FOR SHARE` for the caller's transaction and
-    return its `status` and `deprecation_reason`, whatever the status. Raises
-    MaskDefinitionNotFound."""
+    return its `status`, `deprecation_reason` and `params_hash`, whatever the status.
+    Raises MaskDefinitionNotFound."""
     require_transaction(conn)
     row = await conn.fetchrow(
-        "SELECT status, deprecation_reason FROM qiita.mask_definition"
+        "SELECT status, deprecation_reason, params_hash FROM qiita.mask_definition"
         " WHERE mask_idx = $1 FOR SHARE",
         mask_idx,
     )
@@ -590,12 +590,14 @@ async def lock_mask(conn: asyncpg.Connection, mask_idx: int) -> asyncpg.Record:
     return row
 
 
-async def lock_active_mask(conn: asyncpg.Connection, mask_idx: int) -> None:
-    """`lock_mask`, raising MaskDefinitionDeprecated if the mask is deprecated.
-    Called in the transactions that write `work_ticket.mask_idx`, so a deprecation
-    cannot commit between resolving the mask and recording the work under it."""
+async def lock_active_mask(conn: asyncpg.Connection, mask_idx: int) -> asyncpg.Record:
+    """`lock_mask`, raising MaskDefinitionDeprecated if the mask is deprecated, and
+    returning the held row. Called in the transactions that write
+    `work_ticket.mask_idx`, so a deprecation cannot commit between resolving the mask
+    and recording the work under it."""
     row = await lock_mask(conn, mask_idx)
     if row["status"] == MaskDefinitionStatus.DEPRECATED.value:
         raise MaskDefinitionDeprecated(
             f"mask_definition {mask_idx} is deprecated: {row['deprecation_reason']}"
         )
+    return row

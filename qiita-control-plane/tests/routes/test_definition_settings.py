@@ -716,8 +716,8 @@ async def test_a_resume_after_its_processing_was_edited_fails_the_ticket(
     """A failed ticket resumes under the processing it recorded while its settings are
     unchanged. Once they are edited through the admin route, its params resolve to
     another row: the mint fails it as bad input and leaves its record, with no step
-    row as well as with one (unlike a mask or alignment, whose no-step-row dispatch
-    runs). The message names kept step rows only when there are some."""
+    row as well as with one. The message names kept step rows only when there are
+    some."""
     from qiita_common.backend_failure import BackendFailure
 
     from qiita_control_plane import step_progress
@@ -799,3 +799,169 @@ async def test_an_edit_is_refused_while_a_public_handle_cites_the_definition(
         assert resp.status_code == 200, resp.text
     finally:
         await postgres_pool.execute("DELETE FROM qiita.exported_processing WHERE idx = $1", handle)
+
+
+# ---------------------------------------------------------------------------
+# Mint-and-record for masks and alignments (`runner._record`), with the holds the
+# runner and planners take: `lock_active_mask` / `lock_active_alignment`.
+# ---------------------------------------------------------------------------
+
+
+def _mask_or_alignment_mint(conn, kind, params, owner):
+    if kind is DefinitionKind.MASK:
+        return mint_mask_definition(
+            conn,
+            filter_workflow="read-mask",
+            filter_version="1.0.0",
+            params=params,
+            principal_idx=owner,
+        )
+    return mint_alignment_definition(conn, params=params, principal_idx=owner)
+
+
+async def _held_hash(conn, kind, row):
+    from qiita_control_plane.repositories.alignment_definition import lock_active_alignment
+    from qiita_control_plane.repositories.mask_definition import lock_active_mask
+
+    if kind is DefinitionKind.MASK:
+        return (await lock_active_mask(conn, row["mask_idx"]))["params_hash"]
+    return (await lock_active_alignment(conn, row["alignment_idx"]))["params_hash"]
+
+
+_MINTED_COLUMN = {DefinitionKind.MASK: "mask_idx", DefinitionKind.ALIGNMENT: "alignment_idx"}
+
+
+@pytest.mark.parametrize("kind", [DefinitionKind.MASK, DefinitionKind.ALIGNMENT])
+async def test_an_edit_between_a_mask_or_alignment_mint_and_its_hold_re_mints(
+    postgres_pool, clients, defs, kind
+):
+    """An edit that commits between the mint and the hold re-keys the row the mint
+    resolved; `mint_and_hold` re-mints, so the row recorded has the settings hashed and
+    the edited row keeps the edit."""
+    from qiita_control_plane.runner._record import mint_and_hold, record_minted
+
+    column = _MINTED_COLUMN[kind]
+    edited = await defs["make"](kind, threshold=3)
+    params = await _params(postgres_pool, kind, edited)
+    ticket, block_idx, created = await _processing_ticket(postgres_pool, WorkTicketState.COMPLETED)
+    edits = []
+    recorded = None
+    try:
+        async with postgres_pool.acquire() as conn, conn.transaction():
+
+            async def mint_then_edit():
+                row = await _mask_or_alignment_mint(conn, kind, params, defs["owner"])
+                if not edits:
+                    edits.append(
+                        await clients["admin"].patch(
+                            _url(kind, edited),
+                            json={"params": {**params, "threshold": 2}, "reason": _REASON},
+                        )
+                    )
+                return row
+
+            row = await mint_and_hold(
+                conn,
+                mint=mint_then_edit,
+                held_params_hash=lambda r: _held_hash(conn, kind, r),
+                params_hash=canonical_params_hash(params),
+                what=kind.value,
+            )
+            recorded = row[column]
+            await record_minted(
+                conn, work_ticket_idx=ticket, column=column, definition_idx=recorded
+            )
+        assert edits[0].status_code == 200, edits[0].text
+        assert recorded != edited
+        assert (
+            await postgres_pool.fetchval(
+                f"SELECT {column} FROM qiita.work_ticket WHERE work_ticket_idx = $1", ticket
+            )
+            == recorded
+        )
+        assert await _params(postgres_pool, kind, recorded) == params
+        assert (await _params(postgres_pool, kind, edited))["threshold"] == 2
+    finally:
+        await _drop_processing_ticket(postgres_pool, ticket, block_idx, created, [])
+        if recorded is not None:
+            table, col = _TABLE[kind]
+            await postgres_pool.execute(f"DELETE FROM {table} WHERE {col} = $1", recorded)
+
+
+@pytest.mark.parametrize("kind", [DefinitionKind.MASK, DefinitionKind.ALIGNMENT])
+async def test_an_edit_waits_for_a_mask_or_alignment_hold_and_then_refuses_live_work(
+    postgres_pool, clients, defs, kind
+):
+    """The minted row is held `FOR SHARE` from the mint through the ticket write. An
+    edit started inside that window waits for the commit, then sees the ticket and
+    refuses (`live_work`)."""
+    import asyncio
+
+    from qiita_control_plane.runner._record import mint_and_hold, record_minted
+
+    column = _MINTED_COLUMN[kind]
+    idx = await defs["make"](kind, threshold=3)
+    params = await _params(postgres_pool, kind, idx)
+    ticket, block_idx, created = await _processing_ticket(postgres_pool, WorkTicketState.PENDING)
+    try:
+        async with postgres_pool.acquire() as conn, conn.transaction():
+            row = await mint_and_hold(
+                conn,
+                mint=lambda: _mask_or_alignment_mint(conn, kind, params, defs["owner"]),
+                held_params_hash=lambda r: _held_hash(conn, kind, r),
+                params_hash=canonical_params_hash(params),
+                what=kind.value,
+            )
+            edit = asyncio.create_task(
+                clients["admin"].patch(
+                    _url(kind, idx),
+                    json={"params": {**params, "threshold": 2}, "reason": _REASON},
+                )
+            )
+            await asyncio.sleep(0.5)
+            assert not edit.done(), "the edit did not wait for the hold"
+            await record_minted(
+                conn, work_ticket_idx=ticket, column=column, definition_idx=row[column]
+            )
+        resp = await edit
+        assert resp.status_code == 409, resp.text
+        assert resp.json()["detail"]["reason"] == DefinitionSettingsRefusal.LIVE_WORK
+        assert await _params(postgres_pool, kind, idx) == params
+    finally:
+        await _drop_processing_ticket(postgres_pool, ticket, block_idx, created, [])
+
+
+@pytest.mark.parametrize("kind", [DefinitionKind.MASK, DefinitionKind.ALIGNMENT])
+async def test_a_ticket_recording_another_mask_or_alignment_is_refused_at_the_mint(
+    postgres_pool, defs, kind
+):
+    """A resume re-records the same definition; one whose params now resolve to another
+    row (its recorded definition was edited) fails as bad input and keeps its record."""
+    from qiita_common.backend_failure import BackendFailure
+
+    from qiita_control_plane.runner._record import record_minted
+
+    column = _MINTED_COLUMN[kind]
+    first = await defs["make"](kind, threshold=3)
+    other = await defs["make"](kind, threshold=2)
+    ticket, block_idx, created = await _processing_ticket(postgres_pool, WorkTicketState.FAILED)
+    try:
+        for definition_idx in (first, first):
+            async with postgres_pool.acquire() as conn, conn.transaction():
+                await record_minted(
+                    conn, work_ticket_idx=ticket, column=column, definition_idx=definition_idx
+                )
+        with pytest.raises(BackendFailure, match="submit a new ticket") as exc:
+            async with postgres_pool.acquire() as conn, conn.transaction():
+                await record_minted(
+                    conn, work_ticket_idx=ticket, column=column, definition_idx=other
+                )
+        assert "kept step rows" not in str(exc.value)
+        assert (
+            await postgres_pool.fetchval(
+                f"SELECT {column} FROM qiita.work_ticket WHERE work_ticket_idx = $1", ticket
+            )
+            == first
+        )
+    finally:
+        await _drop_processing_ticket(postgres_pool, ticket, block_idx, created, [])

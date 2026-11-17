@@ -403,3 +403,44 @@ async def test_a_deprecated_alignment_is_refused_on_mint_and_on_resume(sample):
         await _resolve(sample, work_ticket_idx=ticket)
     with pytest.raises(Exception, match="bad preset"):
         await _resolve(sample)
+
+
+async def test_the_mint_records_the_alignment_on_the_ticket(sample):
+    """The mint records the alignment on the ticket in its own transaction
+    (`runner._record`), before any separate persist."""
+    ticket = await _seed_ticket(sample)
+    minted = await _resolve(sample, work_ticket_idx=ticket)
+    assert (
+        await sample["pool"].fetchval(
+            "SELECT alignment_idx FROM qiita.work_ticket WHERE work_ticket_idx = $1", ticket
+        )
+        == minted["alignment_idx"]
+    )
+
+
+async def test_a_re_attach_after_an_admin_edit_of_the_recorded_alignment_fails(
+    sample, human_admin_session
+):
+    """A resume re-attaches to the recorded alignment while its settings are unchanged;
+    once an admin edited them after the ticket was created, the stored params are not
+    the ones the ticket resolved, and the ticket fails as bad input."""
+    from qiita_common.backend_failure import BackendFailure
+    from qiita_common.models import DefinitionKind, DefinitionSettingsEditKind
+
+    pool = sample["pool"]
+    ticket = await _seed_ticket(sample)
+    first = await _resolve(sample, work_ticket_idx=ticket)
+    assert await _resolve(sample, work_ticket_idx=ticket) == first
+    # Append-only, with no FK to the definition, so the row is left as the other
+    # settings-edit tests leave theirs.
+    await pool.execute(
+        "INSERT INTO qiita.definition_settings_edit (definition_kind, definition_ref,"
+        "  edit_kind, actor_principal_idx, old_settings, new_settings, reason)"
+        " VALUES ($1, $2, $3, $4, '{\"params\": 1}', '{\"params\": 2}', 'corrected in a test')",
+        DefinitionKind.ALIGNMENT.value,
+        first["alignment_idx"],
+        DefinitionSettingsEditKind.ADMIN_EDIT.value,
+        human_admin_session["principal_idx"],
+    )
+    with pytest.raises(BackendFailure, match="submit a new ticket"):
+        await _resolve(sample, work_ticket_idx=ticket)

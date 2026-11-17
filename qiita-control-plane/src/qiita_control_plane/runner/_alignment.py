@@ -17,6 +17,7 @@ declares the third.
 from __future__ import annotations
 
 import json
+from functools import partial
 from typing import Any
 
 import asyncpg
@@ -31,7 +32,8 @@ from qiita_common.api_paths import (
     LibraryPrimitive,
 )
 from qiita_common.backend_failure import StepNoData
-from qiita_common.models import AlignmentDefinitionStatus
+from qiita_common.hashing import canonical_params_hash
+from qiita_common.models import AlignmentDefinitionStatus, DefinitionKind
 
 from ..feature_table import SUBJECT_ASSEMBLY
 from ..repositories.alignment_definition import (
@@ -52,8 +54,10 @@ from ..repositories.block import (
     create_alignment_sample_pending,
     fetch_mask_sample_state,
 )
+from ..repositories.definition_settings_edit import fetch_settings_edit_since_ticket
 from ..repositories.params_storage import ParamsDoNotSurviveStorageError
 from ._base import _workflow_declares_action
+from ._record import mint_and_hold, record_minted
 from ._upload import _submission_bad_input
 
 # action_context keys the de novo resolver reads. Prefixed like `align/1.0.0.yaml`'s
@@ -360,6 +364,12 @@ async def _resolve_denovo_alignment_idx(
     deprecated alignment: the mint by `AlignmentDefinitionDeprecated`, the re-attach by
     reading the stored status, since it never calls the mint.
 
+    The re-attach also refuses a recorded alignment whose settings an admin edited
+    after the ticket was created: the stored params are then not the ones the ticket
+    resolved, as a re-mint would find (`runner._record`). The mint records the
+    alignment on the ticket in its own transaction, holding the row `FOR SHARE` from
+    the mint through that write (`runner._record`).
+
     Like the other pre-loop resolvers, any failure raises a SUBMISSION-attributed
     BAD_INPUT the outer handler turns into a FAILED ticket.
     """
@@ -368,6 +378,18 @@ async def _resolve_denovo_alignment_idx(
         work_ticket_idx,
     )
     if existing is not None:
+        edit = await fetch_settings_edit_since_ticket(pool, work_ticket_idx)
+        if edit is not None and (edit["definition_kind"], edit["definition_ref"]) == (
+            DefinitionKind.ALIGNMENT.value,
+            existing,
+        ):
+            raise _submission_bad_input(
+                f"work ticket {work_ticket_idx} first ran under alignment definition"
+                f" {existing}, whose settings were edited at"
+                f" {edit['occurred_at'].isoformat()}, after the ticket was created, so it"
+                " cannot resume; submit a new ticket, which is recorded under the"
+                " alignment definition minted for its own params"
+            )
         row = await fetch_alignment_definition_by_idx(pool, existing)
         if row["status"] == AlignmentDefinitionStatus.DEPRECATED.value:
             raise _submission_bad_input(
@@ -391,10 +413,26 @@ async def _resolve_denovo_alignment_idx(
     params = _build_denovo_alignment_params(
         action_id, action_version, bound, defaults=_knob_defaults(context_schema)
     )
+
+    async def held_params_hash(conn: asyncpg.Connection, row: asyncpg.Record) -> bytes:
+        return (await lock_active_alignment(conn, row["alignment_idx"]))["params_hash"]
+
     try:
-        async with pool.acquire() as conn:
-            row = await mint_alignment_definition(
-                conn, params=params, principal_idx=originator_principal_idx
+        async with pool.acquire() as conn, conn.transaction():
+            row = await mint_and_hold(
+                conn,
+                mint=lambda: mint_alignment_definition(
+                    conn, params=params, principal_idx=originator_principal_idx
+                ),
+                held_params_hash=partial(held_params_hash, conn),
+                params_hash=canonical_params_hash(params),
+                what=f"de novo alignment for {action_id} {action_version}",
+            )
+            await record_minted(
+                conn,
+                work_ticket_idx=work_ticket_idx,
+                column="alignment_idx",
+                definition_idx=row["alignment_idx"],
             )
     except ParamsDoNotSurviveStorageError as exc:
         raise _submission_bad_input(str(exc)) from exc

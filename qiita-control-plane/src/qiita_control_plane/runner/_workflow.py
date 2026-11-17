@@ -292,12 +292,12 @@ async def run_workflow(
         # re-attached to its live job. When a definition the ticket records had its
         # settings edited after the ticket was created, that work was done under the
         # earlier settings and the remaining steps would run under the edited ones, so
-        # the ticket is failed instead. A mask or alignment ticket dispatched with no
-        # step row (a first run, or a rerun-block re-arm, which deletes every step
-        # row) runs wholly under the current settings and is not refused here. A
-        # processing ticket that records an edited processing is refused at
-        # `_mint_processing_idx` either way: its params resolve to another row. A
-        # settings edit is refused while the ticket is unfinished
+        # the ticket is failed instead. A ticket dispatched with no step row (a first
+        # run, or a rerun-block re-arm, which deletes every step row) is not refused
+        # here: a definition it consumes or carries from its plan runs wholly under
+        # the current settings, and one it mints is refused at its mint when it
+        # already records another (`runner._record`). A settings edit is refused
+        # while the ticket is unfinished
         # (`definition_settings`), so this is reached by a redrive of a failed or
         # cancelled ticket.
         edit = await fetch_settings_edit_since_ticket(pool, work_ticket_idx) if progress else None
@@ -491,13 +491,11 @@ async def run_workflow(
                         # the hash of a run that did not use the feature.
                         resolved_lima=_resolved_lima(bound),
                         resolved_syndna=_resolved_syndna(bound),
+                        # Recorded on the ticket in the mint's transaction (durable
+                        # traceability and a cheap shared-mask guard).
+                        work_ticket_idx=work_ticket_idx,
                     )
                 )
-                # Persist the minted mask_idx onto the ticket for durable
-                # traceability (and a cheap shared-mask guard). Idempotent: a
-                # re-mint on resume re-resolves to the same mask_idx via the
-                # config-hash upsert and re-writes the same value here.
-                await _persist_mask_idx(pool, work_ticket_idx, bound[MASK_IDX_BINDING])
                 minted_mask_idx = bound[MASK_IDX_BINDING]
             elif scope_target["kind"] == ScopeTargetKind.BLOCK.value:
                 block_mask_idx = work_ticket["mask_idx"]

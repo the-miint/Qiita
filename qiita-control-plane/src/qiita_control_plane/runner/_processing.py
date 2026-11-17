@@ -26,7 +26,6 @@ from qiita_common.actions import (
 from qiita_common.api_paths import LibraryPrimitive
 from qiita_common.hashing import canonical_params_hash
 
-from ..repositories import require_transaction
 from ..repositories.assembly import (
     create_assembly_sample_pending,
     upsert_assembly_sample_no_data,
@@ -34,6 +33,7 @@ from ..repositories.assembly import (
 from ..repositories.processing import ProcessingDeprecated, mint_processing
 from ._base import _log, _workflow_declares_action
 from ._mask import MASK_IDX_BINDING
+from ._record import mint_and_hold, record_minted
 from ._upload import _submission_bad_input
 
 # action_context key naming the step-1 assembler. Its default is single-sourced
@@ -146,21 +146,8 @@ async def _mint_processing_idx(
 
     With `work_ticket_idx`, the same transaction records the processing on the ticket
     (`work_ticket.processing_idx`), holding the processing row `FOR SHARE` from the
-    mint through that write (`_mint_and_hold`). A settings edit holds the row
-    `FOR UPDATE` while it checks for unfinished tickets (`definition_settings`), so
-    the edit and this mint-and-record cannot both commit unseen by the other, and the
-    ticket is never recorded under settings it did not hash.
-
-    A redrive keeps the ticket's step rows and its assembly gate row, both keyed on
-    the processing it recorded on its first attempt. When the mint now resolves to
-    another row, the ticket is failed as bad submission input rather than re-recorded,
-    whether or not it kept step rows, so no ticket names two processings. Two causes
-    reach it: the recorded processing's settings were edited, or the ticket's
-    params now build differently, e.g. a changed `assembler_default` filling an
-    omitted assembler. A new ticket is recorded under the processing
-    minted for its own params; the edited row keeps the edited settings. The recorded
-    idx is read without a row lock: the dispatch state guard keeps one ticket from
-    running twice at once (`dispatch.py`)."""
+    mint through that write, and refuses a ticket that already records another
+    processing (`runner._record` says why both)."""
     params = _build_processing_params(
         action_id, action_version, bound, assembler_default=assembler_default
     )
@@ -170,33 +157,11 @@ async def _mint_processing_idx(
                 conn, workflow=action_id, version=action_version, params=params
             )
             if work_ticket_idx is not None:
-                recorded = await conn.fetchval(
-                    "SELECT processing_idx FROM qiita.work_ticket WHERE work_ticket_idx = $1",
-                    work_ticket_idx,
-                )
-                if recorded is not None and recorded != row["processing_idx"]:
-                    kept = await conn.fetchval(
-                        "SELECT EXISTS (SELECT 1 FROM qiita.work_ticket_step"
-                        "                WHERE work_ticket_idx = $1)",
-                        work_ticket_idx,
-                    )
-                    held = (
-                        "Its kept step rows are keyed on the first"
-                        if kept
-                        else "It records the first and is not re-recorded under another"
-                    )
-                    raise _submission_bad_input(
-                        f"work ticket {work_ticket_idx} first ran under processing"
-                        f" {recorded}; its params now resolve to processing"
-                        f" {row['processing_idx']} (the first's settings were edited, or"
-                        f" the params now build differently). {held}, so it cannot"
-                        " resume; submit a new ticket, which is recorded under the"
-                        " processing minted for its own params"
-                    )
-                await conn.execute(
-                    "UPDATE qiita.work_ticket SET processing_idx = $1 WHERE work_ticket_idx = $2",
-                    row["processing_idx"],
-                    work_ticket_idx,
+                await record_minted(
+                    conn,
+                    work_ticket_idx=work_ticket_idx,
+                    column="processing_idx",
+                    definition_idx=row["processing_idx"],
                 )
     except ProcessingDeprecated as exc:
         # The ticket named a run config that cannot be minted against, which is bad
@@ -211,33 +176,24 @@ async def _mint_processing_idx(
     return bindings
 
 
-# A settings edit that commits between a mint and its hold re-keys the row the mint
-# resolved; the next mint then resolves (or inserts) the row for these params. One
-# retry covers one such edit; a second in the same window raises RuntimeError, which
-# fails the ticket.
-_MINT_HOLD_ATTEMPTS = 2
-
-
 async def _mint_and_hold(
     conn: asyncpg.Connection, *, workflow: str, version: str, params: dict[str, Any]
 ) -> asyncpg.Record:
-    """`mint_processing`, then hold the minted row `FOR SHARE` for the caller's
-    transaction, re-minting when the held row's `params_hash` is no longer the hash
-    of `params`: a settings edit committed between the mint and the hold. Requires an
-    open transaction: outside one the `FOR SHARE` ends with its statement."""
-    require_transaction(conn)
-    params_hash = canonical_params_hash(params)
-    for _ in range(_MINT_HOLD_ATTEMPTS):
-        row = await mint_processing(conn, workflow=workflow, version=version, params=params)
-        held = await conn.fetchval(
+    """`mint_processing` under `runner._record.mint_and_hold`: the minted row is held
+    `FOR SHARE` for the caller's transaction, re-minted when an edit moved it."""
+
+    async def held_params_hash(row: asyncpg.Record) -> bytes:
+        return await conn.fetchval(
             "SELECT params_hash FROM qiita.processing WHERE processing_idx = $1 FOR SHARE",
             row["processing_idx"],
         )
-        if held == params_hash:
-            return row
-    raise RuntimeError(
-        f"processing for {workflow} {version}: the minted row's settings were edited"
-        f" between the mint and its hold on each of {_MINT_HOLD_ATTEMPTS} attempts"
+
+    return await mint_and_hold(
+        conn,
+        mint=lambda: mint_processing(conn, workflow=workflow, version=version, params=params),
+        held_params_hash=held_params_hash,
+        params_hash=canonical_params_hash(params),
+        what=f"processing for {workflow} {version}",
     )
 
 
