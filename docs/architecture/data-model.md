@@ -141,7 +141,7 @@ reaches **the value's required tier**.
   - Replacing or clearing one needs the If-Match that its read returned.
   - An exception cannot sit on a `unique_in_study` field, and `unique_in_study`
     cannot be declared over a field that exceptions key on; the database refuses
-    both (migration `20261112000000_field_exception_excludes_unique_in_study.sql`
+    both (migration `20261117000000_field_exception_excludes_unique_in_study.sql`
     says why).
 - **Owner-biosample-id floor** — an owner-biosample-id value requires at least
   `member` (`repositories.biosample.OWNER_BIOSAMPLE_ID_TIER_OVERRIDE`), whatever
