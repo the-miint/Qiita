@@ -15,7 +15,9 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
 
 ### 1. Env vars — set BEFORE the deploy (most are `from_env()` fail-fast; a missing one keeps the unit down)
 
-_None yet._
+- `[operator]` Confirm `DATA_PLANE_URL` in `/etc/qiita/control-plane.env` starts with `grpc://`
+  (`grep '^DATA_PLANE_URL=' /etc/qiita/control-plane.env`). The control plane now refuses to boot
+  with any other scheme, so a bad value keeps the unit down. (#899)
 
 ### 2. One-time host setup
 
@@ -36,6 +38,24 @@ _None yet._
   /usr/local/bin/uv run --reinstall-package qiita-common qiita-admin backfill host-taxon-id --show-unresolved 50            # 1 and 3: dry run
   /usr/local/bin/uv run --reinstall-package qiita-common qiita-admin backfill host-taxon-id --show-unresolved 0 --execute  # 2: writes
   ```
+- `[admin]` **gpl-boundary must report 0.5.0 or later**, or compute-readiness's
+  `miint-gpl-boundary` probe fails the deploy. If it is older, replace the binary at that path by
+  hand (the deploy does not upgrade it: #859). (#888)
+  ```bash
+  sudo -u qiita-orch "$(sudo grep -oP '^MIINT_GPL_BOUNDARY_PATH=\K.*' /etc/qiita/compute-orchestrator.env)" --version | grep gpl_boundary
+  ```
+- `[operator]` **Before the restart, no long-read-assembly ticket may be in flight.**
+  long-read-assembly 1.0.2 gains steps in place (a `gene_call` step after `bin_refine`,
+  two actions before `assembly_load`), so a ticket past `bin_refine` when the sync lands
+  is refused on resume and has to be submitted again. Expect 0; otherwise wait for them
+  to finish. (#888)
+  ```bash
+  psql "$DATABASE_URL" -tAc "SELECT count(*) FROM qiita.work_ticket WHERE action_id = 'long-read-assembly' AND state IN ('pending','queued','processing')"
+  ```
+- `[operator]` **Do not run `qiita-admin scratch reclaim --execute` until this deploy is in.**
+  The bucket-6 gene-call backfill reads the finished long-read-assembly tickets'
+  workspaces, and the build deployed now does not know to keep them. From this deploy,
+  reclaim skips every ticket that backfill can still recover or is recovering. (#888)
 
 ### 3. Migrations
 
@@ -124,9 +144,39 @@ _None yet._
   ROLLBACK;
   SQL
   ```
+- `[admin]` **Add gene calls to the long-read-assembly runs finished before this deploy**
+  (1.0.0, 1.0.1 and 1.0.2; the dry run counts them). Each run gets one
+  `assembly-gene-call-recover` ticket, which reads the `assemble`, `bin_refine`, `checkm`,
+  `assembly_hash` and `mint-features` outputs left in that run's ticket workspace and
+  registers its gene calls and its `assembly_membership` and `bin_quality` again, with
+  `genome_idx`. Run it soon
+  after the deploy: those files last only as long as the scratch workspace does. (#888)
+  ```bash
+  # DATABASE_URL and PATH_SCRATCH exported, as for any `qiita-admin backfill`;
+  # QIITA_TOKEN is a system_admin's PAT (only --execute reads it).
+  qiita-admin backfill assembly-gene-call                       # dry run: counts per status, and each run it cannot recover (residue), with the reason
+  qiita-admin backfill assembly-gene-call --execute --limit 5
+  ```
+  Once those five tickets complete, check each run in `make lake-shell`, with `PS`/`RUN`
+  from the lines the `--limit 5` run printed. Expect no NULL `genome_idx` and a non-zero
+  gene count:
+  `SELECT (SELECT count(*) FROM qiita_lake.gene_call WHERE prep_sample_idx = PS AND processing_idx = RUN), (SELECT count(*) FILTER (WHERE genome_idx IS NULL) FROM qiita_lake.assembly_membership WHERE prep_sample_idx = PS AND processing_idx = RUN), (SELECT count(*) FILTER (WHERE genome_idx IS NULL) FROM qiita_lake.bin_quality WHERE prep_sample_idx = PS AND processing_idx = RUN);`
+  Measure each step's peak memory and elapsed time against its unmeasured baseline
+  (gene_call 16 GB / 2 h; assembly_load 32 GB / 2 h), for every attempt:
+  `sacct -j <job> -o MaxRSS,Elapsed`, with each `<job>` from
+  `SELECT step_name, attempt, state, slurm_job_id FROM qiita.work_ticket_step WHERE work_ticket_idx = <T> AND slurm_job_id IS NOT NULL ORDER BY step_index, attempt`.
+  Then submit the rest, paced:
+  `qiita-admin backfill assembly-gene-call --execute --rate 10`.
+
+  Each pass submits one ticket per prep_sample, so rerun it once the pass's tickets finish.
+  You are done when the dry run counts no writable and no in-flight runs and every
+  residue line has an explanation. `--retry-failed` resubmits runs whose recovery
+  ticket ended without completing. If the dry run stops with a permission error, run it
+  as an account that can read the ticket workspaces.
 
 ### Notes (no host action)
 
+- (#896) `POST /study/lookup-by-accession`, `POST /biosample/lookup-by-accession` and `POST /biosample/lookup-by-matrix-tube-id` are deprecated but still served; a downstream client should move to `POST /study/lookup` and `POST /biosample/lookup`. A client generated from the OpenAPI spec sees those routes' and `POST /sequencing-run/lookup-by-instrument-run-id`'s response type renamed to `NaturalKeyLookupResponse`; the JSON is unchanged.
 - (#863) `download-ena-study` 1.0.0 gains an optional `ena_run_accessions` through the normal `qiita-admin actions sync`, and the `held_not_downloaded` run status is no longer reported.
 - (#874) New: `/api/v1/admin/output-equivalence` routes and `qiita-admin output-equivalence list|show|open|decide|revoke` (verdicts `same`, `similar`, `different`, `not_benchmarked`; each output equivalence gated on its kind's lifecycle scope; procedure in `docs/runbooks/deciding-output-equivalence.md`); `PATCH /api/v1/admin/definition-settings/{kind}/{idx}` and `qiita-admin definition edit-settings` (system_admin, the kind's lifecycle scope), now the only way to change a mask's, alignment's or processing's params, params_hash, workflow or version; a block-mask plan (`POST .../block-mask-plan`) whose minted mask was edited before its plan transaction held it is refused (409, "plan the pool again"), and an align plan (`POST .../align-plan`) whose minted alignment was edited before each of its holds is refused (409); a hand `UPDATE` of them is refused (SQLSTATE 55000); `POST /api/v1/definition-group/resolve` (`prep_sample:read`); `POST /api/v1/exported-processing/mask` and `POST /api/v1/exported-identifier/mask` (system_admin, `admin:masked_read_export`).
 - (#874) `GET /admin/sequenced-pool/{idx}/masked-read-export` gains `group` and a per-row `resolution`; it, `POST /admin/masked-read-export/ticket`, `GET /mask-definition/{idx}/syndna-read-count` and the two mask-handle mints (`POST /exported-processing/mask`, `POST /exported-identifier/mask`) return 409 (`reason` `deprecated`) for a deprecated mask unless `include_deprecated` is set, which reads that mask's own runs and marks the roster and the SynDNA response `deprecated` (`qiita-admin masked-read-export` / `qiita mask syndna-read-count --include-deprecated`), and the ticket route returns 409 for a prep_sample that does not resolve to the mask it names. `qiita-admin masked-read-export` skips incomplete and not-processed prep_samples, and ones whose ticket is refused partway (listed on stderr), and writes `masked-read-export.manifest.json` into the output directory. Its exit code changes: 1 when any prep_sample is left out unless `--allow-partial`, and 1 when nothing is exported (an empty roster included). Files are named `<biosample_accession>.<export_id>` instead of `<biosample_accession>.<run>.<pool>.<prep_sample>`; re-exporting into a directory written before this deploy is refused until it is run once with `--adopt-unrecorded`, which rewrites this run's files under the new names, records them and removes the old-named ones it replaced. For a deprecated alignment, `POST /alignment/{idx}/ticket/doget`, `GET .../sequenced-pool/{pool}/alignment/{idx}/cohort`, `POST /exported-identifier` and `POST /exported-processing` keep their 409 but its `detail` becomes an object (`detail`, `reason` `deprecated`, `deprecation_reason`) naming `include_deprecated`, which each now accepts to read that alignment's own rows (`qiita feature-table build --include-deprecated`); with it, the cohort listing also leaves out the prep_samples that read does not resolve processed (any reason but `no_run` / `no_data`) and lists them in a new `left_out`, with each biosample's accession and `QB<n>` handle. An active alignment whose mask, or (de novo) whose assembly run, is deprecated used to read every prep_sample `upstream_deprecated` (a 409 naming the prep_samples); the same four routes now refuse it up front (409, `reason` `deprecated_upstream`, `deprecated_upstreams`) unless `include_deprecated_upstream` is set, which `POST /definition-group/resolve` also accepts, and the cohort DoGet response gains `deprecated_upstreams`, which also names the deprecated upstreams an exact `include_deprecated` read reads; under `include_deprecated_upstream` the pool cohort listing leaves out and returns in `left_out` the prep_samples whose mask run is withdrawn (`qiita feature-table build --include-deprecated-upstream`; `--include-deprecated` also admits a deprecated assembly run of a de novo arm).
@@ -136,6 +186,9 @@ _None yet._
 - (#874) `qiita feature-table build` manifest: `processing.parts` / `processing.sample_part` (and the same under `table.denovo`) replace `processing.export_processing_id` / `params_hash` / `aligner` and `denovo.requested_alignment_idx` / `processing_idx`, and the manifest gains `schema_version` (2) and `table.left_out`; a script reading the old keys must be updated. Without `--prep-sample-idx` the build now leaves out incomplete and not-processed prep_samples (listed on stderr, recorded in `table.left_out`) instead of refusing, and fails only when none is processed.
 - (#874) `POST /definition-group/resolve`, `GET /admin/sequenced-pool/{idx}/masked-read-export`, `POST /admin/masked-read-export/ticket`, `GET /mask-definition/{idx}/syndna-read-count` and `POST /alignment/{idx}/ticket/doget` take an optional `as_of_event` (a `sha256:` decision-set token; 422 when it names no decision set) and return `decisions` (the decision set they resolved under, without output-equivalence or event idxs). The feature-table manifest gains top-level `decisions`, each masked-read export manifest entry and the SynDNA `<output>.metadata.json` gain `decisions`; `qiita feature-table build`, `qiita-admin masked-read-export` and `qiita mask syndna-read-count` gain `--as-of-event`.
 - (#874) `POST /work-ticket/cancel` marks the ticket (`reap_pending_since`, `reap_note`) before it scancels the ticket's SLURM jobs; a reap without error clears the mark, a failed reap keeps it with the error, and a cancel interrupted mid-reap leaves it until the next cancel's reap clears it. While marked, `POST /work-ticket/{idx}/run` and `POST /alignment-definition/{idx}/rerun-block` refuse the ticket (409, `reason` `reap_pending`). The ticket GETs gain `reap_pending_since` and `reap_note` (`reap_note` is None unless the caller is a system_admin).
+- `.env.compute-orchestrator.example`'s `MIINT_GPL_BOUNDARY_PATH` comment now names the tools behind the boundary (bowtie2, FastTree, Prodigal) and the 0.5.0 minimum; no live env change. (#888)
+- New DuckLake tables `gene_call` / `gene_call_contig`, and a `genome_idx` column on `assembly_membership` and `bin_quality`, created by the data plane at start. long-read-assembly 1.0.2 (edited in place) and the new `assembly-gene-call-recover` 1.0.0 arrive through the deploy's usual `qiita-admin actions sync`; no new image. (#888)
+- The staged miint must have `prodigal_proteins` (duckdb-miint `2b215901` or later); the miint stage step restages when the mirror's build changes, and compute-readiness's `miint-gpl-boundary` probe fails on a build without it. (#888)
 
 ## Deployed history
 

@@ -8,16 +8,16 @@ from typing import get_args
 
 import pytest
 from qiita_common.models import (
+    BiosampleLookupKey,
     BiosampleRef,
     RosterProblem,
     RosterResolvedRow,
     RosterResolveRow,
     SequencedSampleCreateRequest,
+    StudyLookupKey,
     StudyRef,
 )
 
-from qiita_control_plane.repositories.biosample import BiosampleLookupKey
-from qiita_control_plane.repositories.study import StudyLookupKey
 from qiita_control_plane.roster_resolution import (
     _BIOSAMPLE_SPEC,
     _STUDY_SPEC,

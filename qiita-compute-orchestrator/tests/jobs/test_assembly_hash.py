@@ -200,6 +200,21 @@ def test_identical_contigs_dedup_to_one_chunk_set(tmp_path):
     assert distinct_hashes == 1
 
 
+def test_an_absent_bins_directory_is_refused(tmp_path):
+    """bin_refine creates the directory even with no bin; read as no bins, an absent
+    one would count every binned noLCG contig as UNBINNED."""
+    genomes, refined = _layout(tmp_path)
+    refined.rmdir()
+    _fasta(genomes / "noLCG.fa", {"u1": "AAAACCCCGGGGTTTT"})
+    with pytest.raises(FileNotFoundError, match="refined_bins_dir"):
+        _run(
+            Inputs(
+                genomes_dir=genomes, refined_bins_dir=refined, prep_sample_idx=5, work_ticket_idx=9
+            ),
+            tmp_path / "ws",
+        )
+
+
 def test_lcg_only_no_mag(tmp_path):
     """LCG-only: a circular genome but NO refined MAGs (empty refined_bins_dir)
     stores successfully — the single-file circular.fa LCG path + COALESCE bin_id

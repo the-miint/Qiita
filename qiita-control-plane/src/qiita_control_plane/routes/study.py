@@ -11,6 +11,7 @@ DELETE is deferred.
 """
 
 import json
+from functools import partial
 from typing import Annotated
 
 import asyncpg
@@ -18,15 +19,17 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query, Response
 from pydantic import Field
 from qiita_common.api_paths import (
     PATH_STUDY_BY_IDX,
+    PATH_STUDY_LOOKUP,
     PATH_STUDY_LOOKUP_BY_ACCESSION,
     PATH_STUDY_PREFIX,
     PATH_STUDY_ROOT,
 )
 from qiita_common.auth_constants import Scope, SystemRole
 from qiita_common.models import (
+    NaturalKeyLookupResponse,
     StudyCreate,
     StudyLookupByAccessionRequest,
-    StudyLookupByAccessionResponse,
+    StudyLookupRequest,
     StudyPatchRequest,
     StudyRecordSummary,
     StudyRecordView,
@@ -467,33 +470,44 @@ async def patch_study(
     return _study_response_from_row(updated_row)
 
 
-@router.post(PATH_STUDY_LOOKUP_BY_ACCESSION)
+@router.post(PATH_STUDY_LOOKUP)
+async def lookup_study(
+    body: StudyLookupRequest,
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    user: HumanUser = Depends(require_human),
+    _scope: Principal = Depends(require_scope(Scope.STUDY_READ)),
+) -> NaturalKeyLookupResponse:
+    """Resolve a list of values of the natural key named by `body.key` to
+    study_idx.
+
+    Auth: HumanUser with Scope.STUDY_READ. The response is only the
+    (value, idx) mapping — no study columns — so resolution does not itself
+    disclose row contents; reading a row still requires the per-row access
+    policy on GET /study/{idx}.
+    """
+    # `user` is resolved only to require a human caller; no per-caller filter
+    # runs here (see auth docstring).
+    _ = user
+    lookup_response = await resolve_idxs_by_natural_key(
+        values=body.values,
+        fetcher=partial(fetch_study_idxs_by_natural_key, pool, key=body.key),
+    )
+    return lookup_response
+
+
+@router.post(PATH_STUDY_LOOKUP_BY_ACCESSION, deprecated=True)
 async def lookup_study_by_accession(
     body: StudyLookupByAccessionRequest,
     pool: asyncpg.Pool = Depends(get_db_pool),
     user: HumanUser = Depends(require_human),
     _scope: Principal = Depends(require_scope(Scope.STUDY_READ)),
-) -> StudyLookupByAccessionResponse:
-    """Resolve a list of study accession values to study_idx, keyed on the
-    column named by `body.accession_field` (default bioproject_accession).
-
-    POST (not GET) so a long accession list rides in the body rather
-    than tripping nginx's default URL-line cap.
-
-    Auth: HumanUser with Scope.STUDY_READ. The response is only the
-    (accession, idx) mapping — no study columns — so resolution does
-    not itself disclose row contents; reading a row still requires the
-    per-row access policy on GET /study/{idx}.
-
-    `missing` lists input-order-deduped accessions that did not resolve.
-    """
-    # _user is read only to keep the dependency chain explicit — no
-    # per-caller filter runs here (see auth docstring).
+) -> NaturalKeyLookupResponse:
+    """Deprecated in favor of POST /study/lookup: the same resolution, keyed
+    on the accession column named by `body.accession_field` (default
+    bioproject_accession)."""
     _ = user
-    resolved, missing = await resolve_idxs_by_natural_key(
+    lookup_response = await resolve_idxs_by_natural_key(
         values=body.accessions,
-        fetcher=lambda values: fetch_study_idxs_by_natural_key(
-            pool, values=values, key=body.accession_field
-        ),
+        fetcher=partial(fetch_study_idxs_by_natural_key, pool, key=body.accession_field),
     )
-    return StudyLookupByAccessionResponse(resolved=resolved, missing=missing)
+    return lookup_response

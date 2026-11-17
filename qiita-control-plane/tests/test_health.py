@@ -9,6 +9,7 @@ network stack (those tiers live in `test-integration`).
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock
@@ -246,16 +247,6 @@ async def test_probe_dp_strips_grpc_scheme(monkeypatch):
     assert captured_targets == ["data-plane.invalid:50051"]
 
 
-@pytest.mark.asyncio
-async def test_probe_dp_rejects_grpcs_scheme():
-    """`grpcs://` would silently downgrade to a plaintext dial under
-    `insecure_channel` — refuse explicitly. TLS is terminated at
-    nginx in the production deploy; a direct TLS dial isn't a
-    supported path here."""
-    with pytest.raises(ValueError, match="grpcs://"):
-        await health_module._probe_dp("grpcs://data-plane.invalid:50051")
-
-
 # ---------------------------------------------------------------------------
 # _aggregate
 # ---------------------------------------------------------------------------
@@ -440,3 +431,55 @@ async def test_aggregate_health_concurrent_callers_share_one_probe_round(monkeyp
     )
     assert all(r.status == HealthStatus.OK.value for r in results)
     assert pool.calls == ["SELECT 1"]
+
+
+def _scripted_probe(monkeypatch, statuses):
+    """Patch `_probe_dp` to return `statuses` in order, then repeat the last."""
+    calls: list[dict] = []
+    remaining = list(statuses)
+
+    async def probe(url, *, log_failures=True):
+        calls.append({"url": url, "log_failures": log_failures})
+        return remaining.pop(0) if len(remaining) > 1 else remaining[0]
+
+    monkeypatch.setattr(health_module, "_probe_dp", probe)
+    return calls
+
+
+async def test_wait_for_data_plane_returns_only_once_the_probe_is_ok(monkeypatch, caplog):
+    calls = _scripted_probe(
+        monkeypatch,
+        [HealthStatus.UNREACHABLE, HealthStatus.DEGRADED, HealthStatus.OK],
+    )
+    monkeypatch.setattr(health_module, "_DP_WAIT_INTERVAL_SECONDS", 0)
+    with caplog.at_level(logging.INFO, logger=health_module.__name__):
+        await health_module.wait_for_data_plane("grpc://dp.invalid:1")
+    assert len(calls) == 3
+    assert all(c["log_failures"] is False for c in calls)
+    assert "ready" in caplog.text
+
+
+async def test_wait_for_data_plane_warns_with_url_and_status_while_waiting(monkeypatch, caplog):
+    _scripted_probe(monkeypatch, [HealthStatus.UNREACHABLE, HealthStatus.OK])
+    monkeypatch.setattr(health_module, "_DP_WAIT_INTERVAL_SECONDS", 0)
+    monkeypatch.setattr(health_module, "_DP_WAIT_LOG_EVERY_SECONDS", 0)
+    with caplog.at_level(logging.WARNING, logger=health_module.__name__):
+        await health_module.wait_for_data_plane("grpc://dp.invalid:1")
+    assert "grpc://dp.invalid:1" in caplog.text
+    assert HealthStatus.UNREACHABLE.value in caplog.text
+
+
+async def test_probe_dp_log_failures_false_suppresses_the_warning(monkeypatch, caplog):
+    _patch_grpc_channel(monkeypatch, check_raises=ConnectionError("down"))
+    with caplog.at_level(logging.WARNING, logger=health_module.__name__):
+        status = await health_module._probe_dp("grpc://dp.invalid:1", log_failures=False)
+    assert status == HealthStatus.UNREACHABLE
+    assert caplog.text == ""
+
+
+async def test_probe_dp_logs_the_failure_by_default(monkeypatch, caplog):
+    _patch_grpc_channel(monkeypatch, check_raises=ConnectionError("down"))
+    with caplog.at_level(logging.WARNING, logger=health_module.__name__):
+        status = await health_module._probe_dp("grpc://dp.invalid:1")
+    assert status == HealthStatus.UNREACHABLE
+    assert "CP /health probe (dp) failed" in caplog.text

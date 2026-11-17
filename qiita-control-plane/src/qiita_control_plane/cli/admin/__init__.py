@@ -71,6 +71,7 @@ from ._helpers import (
 from .actions_sync import _handle_actions_sync, _sync_actions
 from .alignment import add_alignment_parser
 from .auth import _handle_login, _handle_token_revoke_all, _handle_whoami, _token_revoke_all
+from .backfill_assembly_gene_call import add_assembly_gene_call_parser
 from .check_stored_preflights import add_check_stored_preflights_parser
 from .compute_readiness import _DEFAULT_ORCHESTRATOR_VENV, _handle_compute_readiness
 from .definition import add_definition_parser
@@ -511,6 +512,8 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Write the counts (default: dry-run, report only, no writes).",
     )
     p_backfill_syndna.set_defaults(handler=_handle_backfill_syndna_read_count)
+
+    add_assembly_gene_call_parser(p_backfill_sub)
 
     p_scratch = sub.add_parser("scratch", help="Scratch workspace housekeeping")
     p_scratch_sub = p_scratch.add_subparsers(dest="scratch_cmd", required=True)
@@ -1188,8 +1191,8 @@ def _handle_scratch_reclaim(
     for t in plan.tickets:
         if t.error:
             print(f"  ticket {t.work_ticket_idx}: {t.error}")
-    print(f"skipped (SynDNA backfill still needs them): {len(plan.syndna_skipped)}")
-    for idx in plan.syndna_skipped:
+    print(f"skipped (a backfill still needs them): {len(plan.backfill_skipped)}")
+    for idx in plan.backfill_skipped:
         print(f"  ticket {idx}")
     print(f"orphan workspaces: {len(plan.orphans)}")
     for o in plan.orphans:

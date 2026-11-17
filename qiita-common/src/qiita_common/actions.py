@@ -68,6 +68,12 @@ STEP_MANIFEST_FILENAME = "manifest.json"
 STEP_OUTPUT_SUBDIR = "output"
 STEP_LOGS_SUBDIR = "logs"
 
+# The file the `mint-features` action writes its feature map under, in its attempt's
+# directory. The control plane's primitive writes it, and its resume path rebuilds
+# the path without re-running the primitive; a job reading another ticket's map
+# finds it by the same name.
+MINT_FEATURES_OUTPUT_BASENAME = "feature_map.parquet"
+
 # The runner binding name the minted processing_idx travels under. A step names it
 # as the value side of a `params:` pair (`processing_idx: processing_idx` ->
 # <job>.Inputs.processing_idx), which both signals the runner to mint the run

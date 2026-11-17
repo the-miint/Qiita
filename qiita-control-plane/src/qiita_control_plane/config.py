@@ -385,11 +385,17 @@ class Settings:
         if not _CONTACT_EMAIL_RE.match(smtp_from):
             raise RuntimeError(f"SMTP_FROM must be a local@domain.tld address, got {smtp_from!r}")
 
+        data_plane_url = os.environ.get("DATA_PLANE_URL", "grpc://localhost:50051")
+        if not data_plane_url.startswith("grpc://"):
+            raise RuntimeError(
+                f"DATA_PLANE_URL must be a grpc://host:port address, got {data_plane_url!r}"
+            )
+
         return cls(
             database_url=require_env("DATABASE_URL"),
             flight_signing_key=signing_seed,
             login_cookie_secret_key=login_cookie_secret_key,
-            data_plane_url=os.environ.get("DATA_PLANE_URL", "grpc://localhost:50051"),
+            data_plane_url=data_plane_url,
             compute_orchestrator_url=compute_orchestrator_url,
             cp_to_co_token_path=cp_to_co_token_path,
             authrocket_issuer=issuer,

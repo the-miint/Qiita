@@ -36,6 +36,7 @@ from qiita_common.api_paths import (
     PATH_STUDY_PREFIX,
 )
 from qiita_common.models import (
+    BIOSAMPLE_ATTRIBUTE_FIELDS,
     HOST_FILTER_INDEX_TYPE_MINIMAP2,
     HOST_FILTER_INDEX_TYPE_RYPE,
     INCLUDE_DEPRECATED_FLAG,
@@ -83,7 +84,13 @@ from .alignment import _handle_alignment_cohort, _handle_alignment_list
 from .amplicon import _handle_submit_golay_demux
 from .assembly import DEFAULT_EXPORT_KINDS, EXPORT_KINDS, _handle_assembly_export
 from .auth import _handle_login, _handle_profile_set, _handle_whoami
-from .biosample import _handle_biosample_create
+from .biosample import (
+    _BULK_CREATE_OUTPUT_FIELDS,
+    _OWNER_BIOSAMPLE_ID_FIELD_NAME_FLAG,
+    _TSV_FILE_FLAG,
+    _handle_biosample_bulk_create,
+    _handle_biosample_create,
+)
 from .ena_import import (
     _handle_ena_import_list,
     _handle_ena_import_status,
@@ -149,18 +156,31 @@ from .ticket import (
 )
 
 
-def _add_global_internal_names_arg(subparser: argparse.ArgumentParser) -> None:
-    """Declare the opt-in that reinterprets --metadata KEYs for global fields."""
+def _add_global_internal_names_arg(
+    subparser: argparse.ArgumentParser, *, keys: str = "--metadata KEYs"
+) -> None:
+    """Declare the opt-in that reinterprets metadata keys for global fields;
+    `keys` names where the subcommand takes those keys from, for the help."""
     subparser.add_argument(
         "--global-internal-names",
         action="store_const",
         const=True,
         default=None,
         help=(
-            "Interpret --metadata KEYs for global fields as their internal_name"
+            f"Interpret {keys} for global fields as their internal_name"
             " rather than display_name (local fields stay display-name-keyed)"
         ),
     )
+
+
+def _add_study_arg(subparser: argparse.ArgumentParser) -> None:
+    """Declare the required choice of how the subcommand names its study."""
+    study_group = subparser.add_mutually_exclusive_group(required=True)
+    study_group.add_argument(
+        _common.STUDY_EXPORT_ID_FLAG,
+        help="the study's export_entity_id (preferred); resolved to its study_idx",
+    )
+    study_group.add_argument("--study-idx", type=int)
 
 
 def _add_follow_on_args(subparser: argparse.ArgumentParser) -> None:
@@ -537,7 +557,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help="principal_idx of the biosample's owner; defaults to the caller (resolved via whoami)",
     )
     p_biosample_create.add_argument(
-        "--owner-biosample-id-field-name",
+        _OWNER_BIOSAMPLE_ID_FIELD_NAME_FLAG,
         required=True,
         help="display_name of the study's local field that carries the owner-biosample-id",
     )
@@ -575,6 +595,44 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_global_internal_names_arg(p_biosample_create)
     p_biosample_create.set_defaults(handler=_handle_biosample_create)
 
+    p_biosample_bulk_create = p_biosample_sub.add_parser(
+        "bulk-create",
+        help=(
+            "Create one biosample per row of a TSV file on a study, in one all-or-nothing"
+            " request (POST /study/{S}/biosample/bulk)"
+        ),
+    )
+    _add_study_arg(p_biosample_bulk_create)
+    p_biosample_bulk_create.add_argument(
+        _TSV_FILE_FLAG,
+        type=Path,
+        required=True,
+        help=(
+            "tab-separated file with a header row, one biosample per row; columns named"
+            f" {', '.join(BIOSAMPLE_ATTRIBUTE_FIELDS)} set those attributes, the"
+            f" column that {_OWNER_BIOSAMPLE_ID_FIELD_NAME_FLAG} names sets the owner_biosample_id,"
+            " and every other column is metadata keyed on its header"
+        ),
+    )
+    p_biosample_bulk_create.add_argument(
+        _OWNER_BIOSAMPLE_ID_FIELD_NAME_FLAG,
+        required=True,
+        help=(
+            "display_name of the study's local field that carries the owner_biosample_id;"
+            " the file's column with this header holds each row's value. Ignoring case, it"
+            f" cannot be {', '.join(_BULK_CREATE_OUTPUT_FIELDS)} (the output columns) or"
+            f" {', '.join(BIOSAMPLE_ATTRIBUTE_FIELDS)} (the attribute columns);"
+            " `qiita biosample create` accepts those names"
+        ),
+    )
+    p_biosample_bulk_create.add_argument(
+        "--owner-idx",
+        type=int,
+        help="principal_idx of the biosamples' owner; defaults to the caller (resolved via whoami)",
+    )
+    _add_global_internal_names_arg(p_biosample_bulk_create, keys="the TSV file's column headers")
+    p_biosample_bulk_create.set_defaults(handler=_handle_biosample_bulk_create)
+
     biosample_study_field_path = f"{PATH_STUDY_PREFIX}{PATH_BIOSAMPLE_STUDY_FIELD_BY_STUDY}"
 
     p_biosample_create_field = p_biosample_sub.add_parser(
@@ -603,7 +661,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "link",
         help="Link an existing biosample into a study (POST /study/{S}/biosample/{B}/link)",
     )
-    p_biosample_link.add_argument("--study-idx", type=int, required=True)
+    _add_study_arg(p_biosample_link)
     p_biosample_link.add_argument("--biosample-idx", type=int, required=True)
     p_biosample_link.set_defaults(
         handler=_handle_study_scoped_call,

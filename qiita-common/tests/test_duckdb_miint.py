@@ -20,6 +20,7 @@ from qiita_common.duckdb_miint import (
     MIINT_EXTENSION_DIRECTORY_VAR,
     MIINT_MIRROR_URL,
     MIINT_REQUIRED_JOB_VARS,
+    gpl_boundary_is_outdated,
     is_empty_sequence_file,
     miint_connect_config,
     miint_install_sql,
@@ -269,3 +270,14 @@ def test_is_empty_sequence_file(tmp_path, name, payload, empty):
         assert path.stat().st_size > 0, "an empty gzip member is still bytes on disk"
 
     assert is_empty_sequence_file(path) is empty
+
+
+@pytest.mark.parametrize(
+    ("version", "outdated"),
+    [("0.4.2", True), ("0.4.10", True), ("0.5.0", False), ("0.10.0", False), ("1.0.0", False)],
+)
+def test_gpl_boundary_is_outdated_compares_numerically(version, outdated):
+    """The report is the binary's `--version` JSON, as `install_gpl_boundary()` gives
+    it; components compare as integers, so 0.10.0 is newer than 0.5.0."""
+    report = '{\n  "gpl_boundary": "' + version + '",\n  "tools": []\n}'
+    assert gpl_boundary_is_outdated(report) is outdated

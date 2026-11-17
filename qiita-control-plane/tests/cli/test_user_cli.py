@@ -40,6 +40,7 @@ from qiita_common.api_paths import (
     URL_SEQUENCING_RUN_PREFIX,
     URL_SEQUENCING_RUN_SEQUENCED_POOL,
     URL_STUDY_BY_IDX,
+    URL_STUDY_LOOKUP,
     URL_STUDY_PREFIX,
     URL_USER_ME,
     URL_WORK_TICKET_BY_IDX,
@@ -59,6 +60,8 @@ from run_preflight.db import (
 
 from qiita_control_plane.cli.user import _read_preflight_rows, main
 from qiita_control_plane.preflight import SampleRefs
+
+from .conftest import _stub_post
 
 _BASE = "https://q.example.test"
 _ILLUMINA_CSV = Path(__file__).resolve().parent / "data" / "good_standard_metagv100.csv"
@@ -703,69 +706,6 @@ def test_profile_set_pydantic_validation_error_exits_2(capsys):
     assert "orcid" in err
 
 
-# ---------------------------------------------------------------------------
-# Shared request-stub helper (used by every HTTP subcommand test below)
-# ---------------------------------------------------------------------------
-
-
-def _stub_post(
-    monkeypatch,
-    captured: dict,
-    *,
-    response_json: dict,
-    status: int = 201,
-    whoami_idx: int | None = None,
-    response_headers: dict | None = None,
-):
-    """Patch `_common.httpx.request` to capture every call and return canned
-    responses. Each call appends to `captured['requests']` (full list); the
-    last call's fields also land flat on `captured` (method/url/json/auth)
-    so single-call tests can assert on `captured['url']` etc. without
-    indexing.
-
-    When `whoami_idx` is supplied, a GET to `/auth/whoami` returns
-    `{"kind": "human", "principal_idx": whoami_idx}` (used by handlers
-    that auto-default --owner-idx). Every other request returns
-    `response_json` with HTTP `status`.
-    """
-    import httpx as _httpx
-
-    from qiita_control_plane.cli import _common
-
-    captured.setdefault("requests", [])
-
-    def fake_request(method, url, headers=None, json=None, params=None, timeout=None):
-        record = {
-            "method": method,
-            "url": url,
-            "auth": headers["Authorization"],
-            "json": json,
-            "params": params,
-        }
-        captured["requests"].append(record)
-        # Flat-shape mirror — last-wins so single-POST tests read the POST,
-        # whoami-then-POST tests still see the POST as the "current" record.
-        captured.update(record)
-        if url.endswith("/auth/whoami"):
-            assert whoami_idx is not None, (
-                "test triggered whoami without supplying whoami_idx in the stub"
-            )
-            return _httpx.Response(
-                200,
-                json={"kind": "human", "principal_idx": whoami_idx},
-                request=_httpx.Request(method, url),
-            )
-        return _httpx.Response(
-            status,
-            json=response_json,
-            headers=response_headers,
-            request=_httpx.Request(method, url),
-        )
-
-    monkeypatch.setattr(_common.httpx, "request", fake_request)
-    monkeypatch.setenv("QIITA_TOKEN", "qk_test")
-
-
 def _run(monkeypatch, argv, *, response_json, status=200) -> dict:
     """Drive `qiita <argv>` against a stubbed transport; return the captured
     request. Asserts a clean exit so a wiring break surfaces here."""
@@ -1063,6 +1003,50 @@ def test_biosample_link_posts_without_body(monkeypatch, capsys):
     )
     assert (rc, sent) == (0, [("POST", expected_url, None, None)])
     assert json.loads(capsys.readouterr().out) == link_response
+
+
+def test_biosample_link_by_study_export_id(monkeypatch, capsys):
+    """Tests the case where `biosample link` names its study by --study-export-id:
+    the id is resolved through the study lookup, and the link is posted to that
+    study."""
+    link_response = {
+        "biosample_idx": 9,
+        "study_idx": 7,
+        "created_by_idx": 42,
+        "created_at": "2026-11-10T12:00:00Z",
+    }
+    captured: dict = {}
+    _stub_post(
+        monkeypatch,
+        captured,
+        response_json=link_response,
+        responses_by_url={URL_STUDY_LOOKUP: {"resolved": {"QS7": 7}, "missing": []}},
+    )
+
+    rc = main(
+        [
+            "--base-url",
+            "https://q.example.test",
+            "biosample",
+            "link",
+            "--study-export-id",
+            "QS7",
+            "--biosample-idx",
+            "9",
+        ]
+    )
+
+    sent = [(r["method"], r["url"], r["json"]) for r in captured["requests"]]
+    link_url = URL_BIOSAMPLE_STUDY_LINK.format(study_idx=7, biosample_idx=9)
+    expected_sent = [
+        (
+            "POST",
+            f"https://q.example.test{URL_STUDY_LOOKUP}",
+            {"key": "export_entity_id", "values": ["QS7"]},
+        ),
+        ("POST", f"https://q.example.test{link_url}", None),
+    ]
+    assert (rc, sent, json.loads(capsys.readouterr().out)) == (0, expected_sent, link_response)
 
 
 # ---------------------------------------------------------------------------

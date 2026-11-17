@@ -33,6 +33,9 @@ Aggregation rule (kept strict for v1):
     overall = OK iff every configured service is OK,
               else DEGRADED.
 Anything else lives in `services` for richer consumers.
+
+`wait_for_data_plane` reuses the dp probe as a startup readiness gate: it polls
+until the data plane reports SERVING, for callers that must not dial it earlier.
 """
 
 from __future__ import annotations
@@ -67,6 +70,9 @@ _CACHE_TTL_SECONDS = 5.0
 _KEY_CP = "cp"
 _KEY_CO = "co"
 _KEY_DP = "dp"
+
+_DP_WAIT_INTERVAL_SECONDS = 2.0
+_DP_WAIT_LOG_EVERY_SECONDS = 30.0
 
 
 _logger = logging.getLogger(__name__)
@@ -247,7 +253,7 @@ async def _probe_co(url: str | None) -> HealthStatus:
     return HealthStatus.DEGRADED
 
 
-async def _probe_dp(url: str) -> HealthStatus:
+async def _probe_dp(url: str, *, log_failures: bool = True) -> HealthStatus:
     """gRPC `grpc.health.v1.Health/Check` against the data plane.
 
     `data_plane_url` is non-Optional in `Settings` with a default of
@@ -258,16 +264,8 @@ async def _probe_dp(url: str) -> HealthStatus:
     empty string — the convention for "overall server health" rather
     than a per-service check.
 
-    Rejects `grpcs://` explicitly rather than silently downgrading
-    to plaintext. TLS for the DP is terminated at nginx in the
-    production deploy; a direct TLS dial isn't a supported path here.
+    `log_failures=False` silences the per-probe warning for polling callers.
     """
-    if url.startswith("grpcs://"):
-        raise ValueError(
-            "data plane probe does not support grpcs:// — nginx terminates TLS in "
-            "the production deploy; configure DATA_PLANE_URL with grpc:// for the "
-            "127.0.0.1 dial path."
-        )
     target = url.removeprefix("grpc://")
     try:
         async with grpc.aio.insecure_channel(target) as channel:
@@ -277,8 +275,24 @@ async def _probe_dp(url: str) -> HealthStatus:
                 timeout=_PROBE_TIMEOUT_SECONDS,
             )
     except Exception:
-        _logger.warning("CP /health probe (dp) failed", exc_info=True)
+        if log_failures:
+            _logger.warning("CP /health probe (dp) failed", exc_info=True)
         return HealthStatus.UNREACHABLE
     if response.status == health_pb2.HealthCheckResponse.SERVING:
         return HealthStatus.OK
     return HealthStatus.DEGRADED
+
+
+async def wait_for_data_plane(url: str) -> None:
+    """Poll the data plane until it reports SERVING; DEGRADED counts as not ready.
+
+    No deadline: the caller cancels it. Logs one warning per
+    `_DP_WAIT_LOG_EVERY_SECONDS` while waiting.
+    """
+    last_logged = time.monotonic()
+    while (status := await _probe_dp(url, log_failures=False)) != HealthStatus.OK:
+        if time.monotonic() - last_logged >= _DP_WAIT_LOG_EVERY_SECONDS:
+            _logger.warning("waiting for the data plane at %s (last status: %s)", url, status.value)
+            last_logged = time.monotonic()
+        await asyncio.sleep(_DP_WAIT_INTERVAL_SECONDS)
+    _logger.info("data plane at %s is ready", url)

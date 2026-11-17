@@ -22,6 +22,7 @@ from qiita_control_plane.dispatch import (
     build_compute_backend_client,
     build_dispatch_semaphore,
     drain_running_dispatches,
+    reconcile_inflight_tickets,
     schedule_dispatch,
 )
 from qiita_control_plane.ena_import.batch import _STUDY_CONCURRENCY
@@ -46,6 +47,7 @@ def _fake_app(*, compute_backend_client=object(), pool=object()) -> SimpleNamesp
     state = SimpleNamespace(
         compute_backend_client=compute_backend_client,
         running_dispatches=set(),
+        reconcile_resume_task=None,
         dispatch_semaphore=build_dispatch_semaphore(),
         pool=pool,
         settings=SimpleNamespace(
@@ -316,3 +318,178 @@ async def test_pump_ticket_cohort_is_a_no_op_for_a_non_fanout_ticket(monkeypatch
 
     monkeypatch.setattr(dispatch_mod, "top_up_dispatch", must_not_run, raising=True)
     await dispatch_mod._pump_ticket_cohort(app, 42)
+
+
+@pytest.fixture
+def reconcile_events(monkeypatch):
+    """Record the order of wait / schedule / top-up calls made by a reconcile."""
+    from qiita_control_plane import dispatch as dispatch_mod
+
+    events: list[str] = []
+    release = asyncio.Event()
+
+    async def wait(url):
+        events.append("wait")
+        await release.wait()
+        events.append("ready")
+
+    async def top_up(*_args, **_kwargs):
+        events.append("top_up")
+
+    monkeypatch.setattr(dispatch_mod, "wait_for_data_plane", wait)
+    monkeypatch.setattr(dispatch_mod, "top_up_dispatch", top_up)
+    monkeypatch.setattr(
+        dispatch_mod, "schedule_dispatch", lambda _app, idx, **_kw: events.append(f"schedule {idx}")
+    )
+    return SimpleNamespace(events=events, release=release)
+
+
+def _stub_work(monkeypatch, *, idxs, cohorts):
+    from qiita_control_plane import dispatch as dispatch_mod
+
+    monkeypatch.setattr(
+        dispatch_mod, "_inflight_ticket_versions", _async_return({i: 0 for i in idxs})
+    )
+    monkeypatch.setattr(dispatch_mod, "held_cohorts", _async_return(list(cohorts)))
+
+
+async def _settle(app):
+    await app.state.reconcile_resume_task
+
+
+async def test_reconcile_schedules_nothing_before_the_data_plane_answers(
+    monkeypatch, reconcile_events
+):
+    app = _fake_app()
+    _stub_work(monkeypatch, idxs=[1, 2], cohorts=[])
+
+    count = await reconcile_inflight_tickets(app)
+    await asyncio.sleep(0.01)
+    assert reconcile_events.events == ["wait"]
+
+    reconcile_events.release.set()
+    await _settle(app)
+    assert reconcile_events.events == ["wait", "ready", "schedule 1", "schedule 2"]
+    assert count == 2
+
+
+async def test_reconcile_returns_while_the_wait_is_still_pending(monkeypatch, reconcile_events):
+    app = _fake_app()
+    _stub_work(monkeypatch, idxs=[1], cohorts=[])
+
+    await asyncio.wait_for(reconcile_inflight_tickets(app), timeout=1)
+    assert not app.state.reconcile_resume_task.done()
+    assert not app.state.running_dispatches
+
+    reconcile_events.release.set()
+    await _settle(app)
+
+
+async def test_reconcile_schedules_nothing_while_the_data_plane_stays_down(monkeypatch):
+    from qiita_control_plane import dispatch as dispatch_mod
+    from qiita_control_plane import health as health_module
+
+    async def never_ok(_url, *, log_failures=True):
+        return health_module.HealthStatus.UNREACHABLE
+
+    scheduled: list[int] = []
+    monkeypatch.setattr(health_module, "_probe_dp", never_ok)
+    monkeypatch.setattr(health_module, "_DP_WAIT_INTERVAL_SECONDS", 0.001)
+    monkeypatch.setattr(
+        dispatch_mod, "schedule_dispatch", lambda _a, idx, **_k: scheduled.append(idx)
+    )
+    _stub_work(monkeypatch, idxs=[1], cohorts=[])
+
+    app = _fake_app()
+    await reconcile_inflight_tickets(app)
+    await asyncio.sleep(0.05)
+    task = app.state.reconcile_resume_task
+    assert not task.done()
+    assert scheduled == []
+
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+    assert scheduled == []
+
+
+async def test_reconcile_never_waits_without_in_flight_work(monkeypatch, reconcile_events):
+    app = _fake_app()
+    _stub_work(monkeypatch, idxs=[], cohorts=[])
+
+    assert await reconcile_inflight_tickets(app) == 0
+    assert reconcile_events.events == []
+    assert app.state.reconcile_resume_task is None
+
+
+async def test_reconcile_waits_before_pumping_held_cohorts_with_no_tickets(
+    monkeypatch, reconcile_events
+):
+    app = _fake_app()
+    _stub_work(monkeypatch, idxs=[], cohorts=[shard_cohort(7)])
+
+    await reconcile_inflight_tickets(app)
+    await asyncio.sleep(0.01)
+    assert reconcile_events.events == ["wait"]
+
+    reconcile_events.release.set()
+    await _settle(app)
+    assert reconcile_events.events == ["wait", "ready", "top_up"]
+
+
+async def test_reconcile_retries_a_failed_re_read_until_it_schedules_every_ticket(
+    monkeypatch, reconcile_events, caplog
+):
+    from qiita_control_plane import dispatch as dispatch_mod
+
+    reads = 0
+
+    async def flaky_versions(_pool):
+        nonlocal reads
+        reads += 1
+        if reads == 2:
+            raise OSError("connection reset")
+        return {1: 0, 2: 0}
+
+    monkeypatch.setattr(dispatch_mod, "_inflight_ticket_versions", flaky_versions)
+    monkeypatch.setattr(dispatch_mod, "held_cohorts", _async_return([]))
+    monkeypatch.setattr(dispatch_mod, "_RESUME_RETRY_BASE_SECONDS", 0)
+    reconcile_events.release.set()
+    app = _fake_app()
+
+    with caplog.at_level(logging.ERROR):
+        await reconcile_inflight_tickets(app)
+        await asyncio.wait_for(_settle(app), timeout=1)
+
+    assert "connection reset" in caplog.text
+    assert reads == 3
+    assert [e for e in reconcile_events.events if e.startswith("schedule")] == [
+        "schedule 1",
+        "schedule 2",
+    ]
+
+
+async def test_reconcile_does_not_reschedule_a_ticket_when_the_retry_follows_a_partial_run(
+    monkeypatch,
+):
+    from qiita_control_plane import dispatch as dispatch_mod
+
+    scheduled: list[int] = []
+    failed_once = False
+
+    def flaky_schedule(_app, idx, **_kw):
+        nonlocal failed_once
+        if idx == 2 and not failed_once:
+            failed_once = True
+            raise RuntimeError("boom")
+        scheduled.append(idx)
+
+    monkeypatch.setattr(dispatch_mod, "schedule_dispatch", flaky_schedule)
+    monkeypatch.setattr(dispatch_mod, "wait_for_data_plane", _async_return(None))
+    monkeypatch.setattr(dispatch_mod, "_RESUME_RETRY_BASE_SECONDS", 0)
+    app = _fake_app()
+    _stub_work(monkeypatch, idxs=[1, 2], cohorts=[])
+
+    await reconcile_inflight_tickets(app)
+    await asyncio.wait_for(_settle(app), timeout=1)
+
+    assert scheduled == [1, 2]

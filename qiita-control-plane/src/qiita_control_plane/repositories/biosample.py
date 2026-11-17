@@ -11,10 +11,9 @@ stand alone.
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Literal, get_args
 
 import asyncpg
-from qiita_common.models import BiosampleAccessionField, FieldDataType, Tier
+from qiita_common.models import BiosampleLookupKey, FieldDataType, Tier
 
 from . import RowLock, require_transaction, row_lock_clause, update_row
 from ._sample_helpers import (
@@ -292,14 +291,6 @@ async def fetch_biosample_idxs_for_study(
     )
     return [r["biosample_idx"] for r in rows]
 
-
-# The natural keys a biosample lookup may key on: the two wire-facing accession
-# columns, matrix_tube_id, and export_entity_id. Deriving from
-# BiosampleAccessionField keeps the accession set defined once, in
-# qiita_common.models.
-BiosampleLookupKey = Literal[
-    *get_args(BiosampleAccessionField), "matrix_tube_id", "export_entity_id"
-]
 
 # Each lookup key's (column expression, join) over `qiita.biosample`. Only text from
 # this closed mapping reaches the SQL, since identifiers cannot be bound.

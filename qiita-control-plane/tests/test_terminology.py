@@ -20,6 +20,7 @@ from qiita_common.models import (
     TerminologyTermObsoletionKind,
 )
 
+from qiita_control_plane.delimited_text import write_tsv
 from qiita_control_plane.repositories.terminology import (
     MAX_REPORTED_OFFENDERS,
     ParsedTerm,
@@ -45,7 +46,6 @@ from qiita_control_plane.terminology import (
     write_closure_tsv_stub,
     write_manifest,
     write_terms_tsv,
-    write_tsv,
 )
 from qiita_control_plane.testing.terminology import parsed_term
 
@@ -263,15 +263,41 @@ def test_write_tsv_no_rows(tmp_path):
     assert path.read_text() == "first\tsecond\n"
 
 
-@pytest.mark.parametrize("row", [("only", "two"), ("one", "two", "three", "four")])
-def test_write_tsv_row_of_wrong_width(tmp_path, row):
-    """Tests the case where a row does not carry one cell per column: the write
-    refuses it, since cells are positional and the surplus or shortfall would
-    otherwise land under the wrong column or drop one."""
+@pytest.mark.parametrize(
+    "rows",
+    [
+        [("only", "two")],
+        [("one", "two", "three", "four")],
+        [("a", "b", "c"), ("one", "two", "three", "four")],
+    ],
+    ids=["short-row", "long-row", "long-row-after-full-row"],
+)
+def test_write_tsv_row_of_wrong_width(tmp_path, rows):
+    """Tests the case where a row does not carry one cell per column, alone or
+    after a row that does: the write refuses it, since cells are positional and
+    the surplus or shortfall would otherwise land under the wrong column or drop
+    one."""
     path = tmp_path / "table.tsv"
 
     with pytest.raises(ValueError):
-        write_tsv(path, ("first", "second", "third"), [row])
+        write_tsv(path, ("first", "second", "third"), rows)
+
+    assert not path.exists()
+
+
+@pytest.mark.parametrize(
+    "columns",
+    [("biosample_idx", "biosample_idx"), ("Biosample_idx", "biosample_idx")],
+    ids=["exact-repeat", "repeat-differing-in-case"],
+)
+def test_write_tsv_repeated_column_name(tmp_path, columns):
+    """Tests the case where a column name repeats, exactly or differing only in
+    case: the write refuses it, since the later column would otherwise replace
+    the earlier one's cells or be renamed."""
+    path = tmp_path / "table.tsv"
+
+    with pytest.raises(ValueError, match="biosample_idx"):
+        write_tsv(path, columns, [("SMK-001", "1041")])
 
     assert not path.exists()
 

@@ -33,6 +33,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from qiita_common.sql import cast_projection
+
 # The directory, inside the assemble step's `genomes_dir`, that holds one raw
 # Parquet per reader, verbatim (`<table>.parquet`). Raw means miint's own columns:
 # read and contig names are still myloasm's text, and the run key is absent.
@@ -188,25 +190,6 @@ MYLOASM_TABLES: dict[str, MyloasmTable] = {
 
 
 def myloasm_projection(table: str, sources: dict[str, str]) -> str:
-    """The SELECT list for `table`'s staging Parquet: every lake column, in order, as
-    `CAST(<sources[column]> AS <type>) AS <column>`.
-
-    `sources` maps each column to the SQL that fills it and must name exactly the
-    table's columns: a missing one would write a narrower Parquet than the lake table
-    and a stray one would be dropped in silence, and both would surface only as a
-    register-files rejection at the end of an assembly. Every column is CAST so an
-    empty table's Parquet still carries the lake types.
-
-    Each source is SQL pasted in as is, so it must be built from constants and
-    integers, never from text a caller or a file supplied.
-    """
-    spec = MYLOASM_TABLES[table]
-    if set(sources) != set(spec.column_names):
-        raise KeyError(
-            f"{table} needs exactly {sorted(spec.column_names)}; "
-            f"missing {sorted(set(spec.column_names) - set(sources))}, "
-            f"unexpected {sorted(set(sources) - set(spec.column_names))}"
-        )
-    return ", ".join(
-        f"CAST({sources[name]} AS {sqltype}) AS {name}" for name, sqltype in spec.columns
-    )
+    """The SELECT list for `table`'s staging Parquet; see
+    `qiita_common.sql.cast_projection`."""
+    return cast_projection(table, MYLOASM_TABLES[table].columns, sources)

@@ -39,6 +39,7 @@ from qiita_common.models._base import (
     BlockScopeTarget,
     ComputeTarget,
     MetadataRequestModel,
+    NaturalKeyLookupResponse,
     NonBlankName,
     NonBlankText,
     PatchRequestModel,
@@ -53,6 +54,7 @@ from qiita_common.models._base import (
     check_derived_inputs,
     check_exactly_one_runtime,
     check_withdrawal_reason,
+    names_colliding_on_strip,
 )
 from qiita_common.models.auth import (
     ApiTokenMintRequest,
@@ -75,6 +77,7 @@ from qiita_common.models.auth import (
     WhoAmIServiceResponse,
 )
 from qiita_common.models.biosample import (
+    BIOSAMPLE_ATTRIBUTE_FIELDS,
     BIOSAMPLE_DISPLAY_COLLECTION_DATE,
     BIOSAMPLE_DISPLAY_DEPTH,
     BIOSAMPLE_DISPLAY_GEOGRAPHIC_LOCATION_COUNTRY_OR_SEA,
@@ -108,6 +111,8 @@ from qiita_common.models.biosample import (
     BiosampleLookupByAccessionResponse,
     BiosampleLookupByMatrixTubeIdRequest,
     BiosampleLookupByMatrixTubeIdResponse,
+    BiosampleLookupKey,
+    BiosampleLookupRequest,
     BiosampleMetadataWriteByUniqueFieldResponse,
     BiosamplePatchRequest,
     BiosampleRef,
@@ -142,6 +147,8 @@ from qiita_common.models.biosample import (
     StudyListResponse,
     StudyLookupByAccessionRequest,
     StudyLookupByAccessionResponse,
+    StudyLookupKey,
+    StudyLookupRequest,
     StudyRef,
     StudyScopedBiosampleResponse,
     TerminologyTermRef,
@@ -507,6 +514,7 @@ __all__ = [
     "SERVICE_TOKEN_MAX_TTL_DAYS",
     "SystemRole",
     # Module-level constants.
+    "BIOSAMPLE_ATTRIBUTE_FIELDS",
     "BIOSAMPLE_DISPLAY_COLLECTION_DATE",
     "BIOSAMPLE_DISPLAY_DEPTH",
     "BIOSAMPLE_DISPLAY_GEOGRAPHIC_LOCATION_COUNTRY_OR_SEA",
@@ -553,6 +561,7 @@ __all__ = [
     "NonBlankText",
     "PatchRequestModel",
     "PrepSampleScopeTarget",
+    "NaturalKeyLookupResponse",
     "ReadCounts",
     "ReferenceScopeTarget",
     "ScopeTarget",
@@ -563,6 +572,7 @@ __all__ = [
     "check_derived_inputs",
     "check_exactly_one_runtime",
     "check_withdrawal_reason",
+    "names_colliding_on_strip",
     # Health.
     "HealthResponse",
     "HealthStatus",
@@ -698,6 +708,8 @@ __all__ = [
     "BiosampleImportRequest",
     "BiosampleImportResponse",
     "BiosampleLookupByAccessionRequest",
+    "BiosampleLookupKey",
+    "BiosampleLookupRequest",
     "BiosampleLookupByAccessionResponse",
     "BiosampleLookupByMatrixTubeIdRequest",
     "BiosampleLookupByMatrixTubeIdResponse",
@@ -745,6 +757,8 @@ __all__ = [
     "StudyListResponse",
     "StudyLookupByAccessionRequest",
     "StudyLookupByAccessionResponse",
+    "StudyLookupKey",
+    "StudyLookupRequest",
     "StudyScopedBiosampleResponse",
     "TerminologyTermRef",
     # INSDC study metadata.

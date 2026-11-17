@@ -1,21 +1,7 @@
-"""Package-private CLI helpers.
-
-Surface:
-- argparse helpers (`add_base_url_arg`, `add_token_file_arg`) and the
-  defaults / env-var names that back them. `validate_base_url(args,
-  parser)` is the post-parse companion that refuses plain http:// to
-  a non-localhost host unless --insecure was passed.
-- PAT file I/O (`read_token`, `write_token`), and `commit_partials`, the
-  all-or-nothing multi-file commit both CLIs' exports write through.
-- The authenticated HTTP call helper (`call`) plus `whoami` as a thin
-  wrapper, and the generic token-read + invoke + JSON-print runner
-  (`run_http_subcommand`).
-- `fetch_binary`, the bulk-binary read for routes that answer with a file
-  rather than JSON, and `SlowResponseError`, which it raises when a
-  transfer averages under the rate floor.
-- LoginRocket Web loopback flow (`do_login`, plus the `LoopbackResult`
-  / `bind_loopback` / `loopback_handler_factory` building blocks the
-  flow composes from).
+"""Package-private CLI helpers: argument declaration and validation, PAT
+file I/O, authenticated HTTP calls and the runner that wraps a subcommand
+around them, resolution of user-supplied names to the idx values that routes take,
+and the browser login flow.
 
 Subcommand-dispatch contract (followed by both qiita-admin and qiita;
 a future third CLI should follow the same shape so the dispatch stays
@@ -55,11 +41,13 @@ from collections.abc import Callable
 from pathlib import Path
 
 import httpx
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 from qiita_common.api_paths import (
     LOOPBACK_HOST,
     PATH_ADMIN_PREFIX,
     PATH_ADMIN_PRINCIPAL_LOOKUP_BY_EMAIL,
+    PATH_STUDY_LOOKUP,
+    PATH_STUDY_PREFIX,
 )
 from qiita_common.auth_constants import (
     API_PREFIX,
@@ -69,8 +57,10 @@ from qiita_common.auth_constants import (
 from qiita_common.models import (
     INCLUDE_DEPRECATED_FLAG,
     DefinitionKind,
+    NaturalKeyLookupResponse,
     PrincipalLookupRequest,
     PrincipalLookupResponse,
+    StudyLookupRequest,
     flags_admitting_deprecated_upstream,
 )
 
@@ -120,6 +110,8 @@ BULK_READ_FLOOR_BYTES_PER_SECOND = 100_000
 # Grace period before the rate floor above is applied at all. A small body can
 # arrive entirely within one slow round trip, whose average rate says nothing.
 BULK_READ_TRANSFER_SLACK_SECONDS = 10
+
+STUDY_EXPORT_ID_FLAG = "--study-export-id"
 
 # HTML rendered to the browser at the loopback after the handoff redirect
 # delivers the ot_code. Friendly "you can close this tab now" message. The
@@ -556,6 +548,42 @@ def resolve_owner_idx(
     """
     if getattr(args, attr) is None:
         setattr(args, attr, whoami(base_url, token)["principal_idx"])
+
+
+def lookup_natural_keys(
+    base_url: str, token: str, lookup_path: str, lookup_request: BaseModel
+) -> NaturalKeyLookupResponse:
+    """POST `lookup_request` to the natural-key lookup route at `lookup_path` and
+    return its answer: each value that resolved, and the values that did not."""
+    found = call("POST", base_url, token, lookup_path, json=lookup_request.model_dump(mode="json"))
+    lookup = NaturalKeyLookupResponse.model_validate(found)
+    return lookup
+
+
+def resolve_study_idx(
+    args: argparse.Namespace,
+    parser: argparse.ArgumentParser,
+    base_url: str,
+    token: str,
+) -> None:
+    """If `args.study_export_id` is set, fill `args.study_idx` with the study that
+    it names, resolved through POST /study/lookup. A namespace without that
+    attribute is left as it is. A blank export id, or one that names no study,
+    exits through `parser.error`.
+    """
+    if getattr(args, "study_export_id", None) is None:
+        return
+    if not args.study_export_id.strip():
+        parser.error(f"{STUDY_EXPORT_ID_FLAG}: must not be blank")
+    # The request strips the id, so the response is keyed on the stripped form.
+    lookup_request = StudyLookupRequest(key="export_entity_id", values=[args.study_export_id])
+    export_id = lookup_request.values[0]
+    lookup = lookup_natural_keys(
+        base_url, token, f"{PATH_STUDY_PREFIX}{PATH_STUDY_LOOKUP}", lookup_request
+    )
+    if export_id not in lookup.resolved:
+        parser.error(f"{STUDY_EXPORT_ID_FLAG} {export_id}: no study has this export id")
+    args.study_idx = lookup.resolved[export_id]
 
 
 def parse_json_arg(

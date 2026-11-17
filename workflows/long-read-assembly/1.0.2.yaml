@@ -10,7 +10,7 @@ description: >
   Per-prep_sample metagenome assembly → MAG recovery for masked, ready-for-consumption
   PacBio HiFi long reads. 1.0.0's description carries the step-by-step detail and
   1.0.1's the unbinned-residue CheckM pass; the step chain, its resources and its
-  inputs are unchanged from 1.0.1.
+  inputs are 1.0.1's, plus the gene calls below.
 
   WHAT IS DIFFERENT FROM 1.0.1: a myloasm run keeps its read-level provenance. The
   assemble step dumps miint's six `read_myloasm_*` tables out of the assembler's
@@ -22,6 +22,14 @@ description: >
   runner's, not this file's, so it reaches every version; an assembler's contigs do
   not depend on read names (`_read_ingest._copy_masked_to_fastq` says how that was
   checked).
+
+  Gene calls: a `gene_call` step runs Prodigal on every subject CheckM scores, once
+  per call set (`qiita_common.gene_call_constants`); mint-gene-features mints each
+  gene's feature_idx, export-subject-genome-map names each subject's genome, and
+  assembly_load stages the `gene_call` and `gene_call_contig` lake tables and writes
+  `genome_idx` on `assembly_membership` and `bin_quality`. Added to this version in
+  place; runs that completed before (of this version or an earlier one) get them from
+  `assembly-gene-call-recover`.
 
   A sync leaves only the highest version of an action_id enabled
   (`actions/sync.py`), so once this file is synced 1.0.1 stops accepting
@@ -336,6 +344,22 @@ steps:
       mem_gb: 12
       walltime: PT2H30M
 
+  # Prodigal gene calls on every subject CheckM scores, once per call set
+  # (`qiita_common.gene_call_constants`), through miint's predict_genes. `gene_calls`
+  # holds the gene and contig rows assembly_load keys and stages, and CheckM-layout
+  # genes.faa / genes.gff that nothing reads yet; `gene_manifest` is the gene rows,
+  # for mint-gene-features. Here, after bin_refine, because it reads only what
+  # assembly_hash reads. Resources are assembly_hash's, not measured for this step.
+  - step: gene_call
+    step_type: singleton
+    module: qiita_compute_orchestrator.jobs.gene_call
+    inputs: [genomes_dir, refined_bins_dir]
+    outputs: [gene_calls, gene_manifest]
+    baseline_resources:
+      cpu: 4
+      mem_gb: 16
+      walltime: PT2H
+
   # CheckM lineage_wf + qa -o 2, run THREE times — over the refined MAGs, over the
   # circular contigs, and over the unbinned residue above the length cut → raw
   # lineage.tsv + qa.tsv, lcg_lineage.tsv + lcg_qa.tsv, unbinned_lineage.tsv +
@@ -456,6 +480,18 @@ steps:
     inputs: [bin_map, manifest, feature_map, genomes_dir]
     outputs: []
 
+  # Mint feature_idx for every called gene's hash, as mint-features does for the
+  # contigs (`library.mint_gene_features`).
+  - action: mint-gene-features
+    inputs: [gene_manifest]
+    outputs: [gene_feature_map]
+
+  # This run's (kind, bin_id) -> genome_idx, from the genomes write-assembly-membership
+  # minted, for assembly_load to name each subject by its genome.
+  - action: export-subject-genome-map
+    inputs: []
+    outputs: [subject_genome_map]
+
   # Re-key the contigs to feature_idx (REUSED reference_load writers) and read the
   # CheckM/DAS_Tool metrics → the DuckLake-shape staging Parquets, and, when the
   # assemble step dumped myloasm's provenance, re-key it into six more. Threads
@@ -469,7 +505,7 @@ steps:
   - step: assembly_load
     step_type: singleton
     module: qiita_compute_orchestrator.jobs.assembly_load
-    inputs: [manifest, feature_map, assembly_chunks, bin_map, genomes_dir, checkm_dir, refined_bins_dir]
+    inputs: [manifest, feature_map, assembly_chunks, bin_map, genomes_dir, checkm_dir, refined_bins_dir, gene_calls, gene_feature_map, subject_genome_map]
     params: {processing_idx: processing_idx}
     outputs: [staging_dir]
     # mem_gb measured on the same cohort: 3 of 15 first attempts at 16 failed with a

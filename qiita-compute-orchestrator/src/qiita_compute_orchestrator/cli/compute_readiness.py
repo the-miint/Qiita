@@ -449,17 +449,16 @@ else
 fi
 rm -f "$MIINT_INFERTRIM_PROBE"
 
-# GPL boundary. miint is a CORE dependency, and the GPL-boundary host (a runtime
-# binary behind which bowtie2/vsearch/MAFFT/SortMeRNA run) is the ONE miint
-# surface no prior probe exercised — which is exactly why a whole WOL3 sharded
-# build got to the compute nodes with the boundary unreachable and every
-# `build_bowtie2_index` step died `gpl-boundary not installed`, silently, through
-# a green deploy. Registration alone proves nothing (the boundary is out-of-process),
-# so INVOKE it: build a tiny bowtie2 index via `save_bowtie2_index`, which shells to
-# the boundary. This runs IN THE JOB ENV — so it also verifies the fix that made
-# it fail before: native jobs get an ephemeral HOME, so the boundary is reachable
-# ONLY when MIINT_GPL_BOUNDARY_PATH is forwarded into the job (miint_job_env);
-# unset/wrong → this fails here, at deploy, not at the first real shard build.
+# GPL boundary. bowtie2, FastTree and Prodigal run in the gpl-boundary binary, a
+# separate process miint starts, so checking that the functions are registered says
+# nothing about whether the binary runs. The probe runs two of them:
+# `save_bowtie2_index` builds a tiny index, and `predict_genes` predicts genes on a
+# short sequence; it refuses a gpl-boundary older than it needs and names the
+# version it found. The probe then runs `prodigal_proteins` on that output; the
+# gene_call job writes CheckM's protein FASTA with it. The probe runs in the job
+# env: native jobs get an ephemeral HOME, so the boundary is reachable only through
+# MIINT_GPL_BOUNDARY_PATH as miint_job_env forwards it, and an unset or wrong path
+# fails here, at deploy.
 MIINT_BOUNDARY_PROBE="$(mktemp)"
 cat > "$MIINT_BOUNDARY_PROBE" <<'PYEOF'
 import sys
@@ -479,6 +478,19 @@ try:
         ).fetchone()
         if row is None or not row[0]:
             raise RuntimeError("save_bowtie2_index did not report success")
+    conn.execute(
+        "CREATE TABLE pg_subject AS SELECT 'g' AS genome_id, 'c' AS read_id, "
+        "0::BIGINT AS sequence_index, "
+        "'ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT' AS sequence1"
+    )
+    conn.execute(
+        "CREATE TABLE pg_genes AS SELECT * FROM predict_genes('pg_subject', "
+        "genome_id := 'genome_id', meta_mode := true)"
+    )
+    rows = conn.execute("SELECT count(*) FROM pg_genes").fetchone()
+    if rows is None or not rows[0]:
+        raise RuntimeError("predict_genes returned no rows")
+    conn.execute("SELECT count(*) FROM prodigal_proteins('pg_genes')").fetchall()
 except Exception as exc:
     msg = (type(exc).__name__ + ": " + str(exc)).replace(chr(10), " ").replace(chr(13), " ")
     print(msg[:{MAX_DETAIL}])
@@ -494,7 +506,7 @@ rm -f "$MIINT_BOUNDARY_PROBE"
 # The amplicon deblur pipeline (align_sortmerna_rrna → detect_chimera_uchime_denovo
 # → align_mafft → deblur, plus the sequence_dna_as_regexp orient step) is the newest
 # set of miint functions the deploy depends on. These are all statically linked
-# in-process (NOT behind the GPL boundary, unlike bowtie2/FastTree), so a registration
+# in-process (NOT behind the GPL boundary, unlike bowtie2/FastTree/Prodigal), so a registration
 # check is the right level: assert every amplicon FUNCTION is REGISTERED in the staged
 # build, so a stale build missing one fails at deploy, not at the first amplicon
 # submit. Existence-only: invoking deblur needs real 16S input. Lists ([]), not set

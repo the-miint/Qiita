@@ -54,6 +54,7 @@ the sibling sequenced_sample route module.
 import base64
 import json
 from collections.abc import Mapping
+from functools import partial
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -1550,8 +1551,8 @@ async def lookup_run_by_instrument_run_id(
     # user is read only to keep the dependency chain explicit — no
     # per-caller filter runs here (see auth docstring).
     _ = user
-    resolved, missing = await resolve_idxs_by_natural_key(
+    lookup_response = await resolve_idxs_by_natural_key(
         values=body.instrument_run_ids,
-        fetcher=lambda values: fetch_sequencing_run_idxs_by_instrument_run_id(pool, values=values),
+        fetcher=partial(fetch_sequencing_run_idxs_by_instrument_run_id, pool),
     )
-    return SequencingRunLookupByInstrumentRunIdResponse(resolved=resolved, missing=missing)
+    return lookup_response
