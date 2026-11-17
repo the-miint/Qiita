@@ -15,6 +15,8 @@ guard, not a DB CHECK. Adding a kind here needs no migration.
 from pathlib import Path
 from typing import Any
 
+from qiita_common.sql import cast_projection
+
 KIND_LCG = "LCG"  # a circular genome (large circular genome)
 KIND_MAG = "MAG"  # a refined metagenome-assembled bin
 KIND_UNBINNED = "UNBINNED"  # a noLCG contig that no refined bin claimed
@@ -85,34 +87,15 @@ BIN_QUALITY_COLUMNS: tuple[tuple[str, str], ...] = (
 )
 
 
-# The same list as names alone, for a caller that fills every column the same way and
-# for the exactness check in `bin_quality_projection`.
+# The same list as names alone, for a caller that fills every column the same way.
 BIN_QUALITY_COLUMN_NAMES: tuple[str, ...] = tuple(name for name, _ in BIN_QUALITY_COLUMNS)
 
 
 def bin_quality_projection(sources: dict[str, str]) -> str:
-    """The `bin_quality` SELECT list: every column of `BIN_QUALITY_COLUMNS`, in order,
-    as `CAST(<sources[column]> AS <type>) AS <column>`.
-
-    `sources` maps each column to the SQL expression that fills it — a tool-output
-    reference like `lin."Completeness"`, a run scalar, or the literal `NULL`. It must
-    name exactly these columns: a missing one would emit a narrow Parquet and a
-    stray one would be dropped in silence, so both raise here rather than surfacing
-    as a register-files column-count rejection at the end of an assembly.
-
-    **Every column is CAST**, which is what lets one projection serve the populated
-    and the empty write alike: a bare `NULL` would otherwise take an ambiguous type
-    in the empty Parquet and land a column the lake DDL cannot accept.
-    """
-    if set(sources) != set(BIN_QUALITY_COLUMN_NAMES):
-        raise KeyError(
-            f"bin_quality_projection needs exactly {sorted(BIN_QUALITY_COLUMN_NAMES)}; "
-            f"missing {sorted(set(BIN_QUALITY_COLUMN_NAMES) - set(sources))}, "
-            f"unexpected {sorted(set(sources) - set(BIN_QUALITY_COLUMN_NAMES))}"
-        )
-    return ", ".join(
-        f"CAST({sources[name]} AS {sqltype}) AS {name}" for name, sqltype in BIN_QUALITY_COLUMNS
-    )
+    """The `bin_quality` SELECT list, from `sources` (a tool-output reference like
+    `lin."Completeness"`, a run scalar, or the literal `NULL` per column); see
+    `qiita_common.sql.cast_projection`."""
+    return cast_projection("bin_quality", BIN_QUALITY_COLUMNS, sources)
 
 
 # Per-contig attributes the assembler reported, one row per contig across BOTH
