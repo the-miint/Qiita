@@ -253,7 +253,7 @@ def _workflow_declares_input(steps: list[Any], name: str) -> bool:
 
 
 def _workflow_declares_param(steps: list[Any], key: str) -> bool:
-    """True iff some entry declares a param named `key`."""
+    """True iff some entry threads `key` through `params:` (an action_context key)."""
     return any(key in (getattr(entry, "params", None) or {}) for entry in steps)
 
 
