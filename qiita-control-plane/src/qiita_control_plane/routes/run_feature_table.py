@@ -40,6 +40,7 @@ from qiita_common.api_paths import (
     PATH_FEATURE_TABLE_VALUE,
 )
 from qiita_common.auth_constants import Scope
+from qiita_common.models.reference import ReferenceStatus
 from qiita_common.models.run_feature_table import (
     FeatureTableRequest,
     FeatureTableSamples,
@@ -68,6 +69,11 @@ from ..run_feature_table import (
 from ._helpers import authorize_prep_sample_cohort
 
 router = APIRouter(prefix=PATH_FEATURE_TABLE_PREFIX, tags=["feature-table"])
+
+# The reference statuses whose taxonomy is servable — the same gate the reference
+# DoGet route applies (`routes/reference.py`): `active` (loaded) or `indexing`
+# (mid-reindex). Any other status may hold partial or stale rows.
+_STREAMABLE_REFERENCE_STATUSES = (ReferenceStatus.ACTIVE, ReferenceStatus.INDEXING)
 
 
 async def _authorized_cohort(
@@ -181,19 +187,29 @@ async def feature_table_taxonomy(
     `(name, version)` handle. A feature the reference does not place keeps its row with
     all-NULL ranks — a lookup, not a filter.
 
-    Refuses 404 when no reference carries that `(name, version)`, and 409 when the
-    reference exists but carries no taxonomy at all — a sequence reference, or one still
-    loading — told apart from "loaded but places nothing" by the readiness probe in
-    `fetch_taxonomy`."""
+    Refuses 404 when no reference carries that `(name, version)`; 409 when the reference
+    exists but is not servable — a status other than `active`/`indexing` (`loading` or
+    `failed`, which may carry stray taxonomy rows), or one that carries no taxonomy at
+    all (a sequence reference, told apart from "loaded but places nothing" by the
+    readiness probe in `fetch_taxonomy`)."""
     cohort = await _authorized_cohort(pool, caller, request)
-    reference_idx = await resolve_reference_idx(
+    resolved = await resolve_reference_idx(
         pool, name=request.reference_name, version=request.reference_version
     )
-    if reference_idx is None:
+    if resolved is None:
         raise HTTPException(
             status_code=404,
             detail=(
                 f"no reference named ({request.reference_name!r}, {request.reference_version!r})"
+            ),
+        )
+    reference_idx, status = resolved
+    if status not in _STREAMABLE_REFERENCE_STATUSES:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"reference ({request.reference_name!r}, {request.reference_version!r}) is"
+                f" {status!r}, not servable — must be active or indexing"
             ),
         )
     _, sequences = await _read(cohort, data_plane_url, signing_key, values=False)

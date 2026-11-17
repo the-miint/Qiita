@@ -421,8 +421,8 @@ async def taxonomy_reference(role_keyed_clients, pool_alignment_seed):
     db, seed = role_keyed_clients["pool"], pool_alignment_seed
     name, version = f"greengenes2-{uuid.uuid4().hex[:8]}", "2024.09"
     reference_idx = await db.fetchval(
-        "INSERT INTO qiita.reference (name, version, kind, created_by_idx)"
-        " VALUES ($1, $2, 'taxonomy_authority', $3) RETURNING reference_idx",
+        "INSERT INTO qiita.reference (name, version, kind, status, created_by_idx)"
+        " VALUES ($1, $2, 'taxonomy_authority', 'active', $3) RETURNING reference_idx",
         name,
         version,
         seed["owner_idx"],
@@ -461,6 +461,30 @@ async def test_taxonomy_404s_for_an_unknown_reference(role_keyed_clients, amplic
         ),
     )
     assert resp.status_code == 404, resp.text
+
+
+async def test_taxonomy_409s_for_a_reference_that_is_not_servable(
+    role_keyed_clients, amplicon_run, taxonomy_reference
+):
+    """A reference that exists but is not `active`/`indexing` — here `loading`, which can
+    carry stray taxonomy rows — is refused 409, not served and not mistaken for a 404.
+    The gate is before the data-plane read, so nothing is fetched."""
+    db = role_keyed_clients["pool"]
+    await db.execute(
+        "UPDATE qiita.reference SET status = 'loading' WHERE reference_idx = $1",
+        taxonomy_reference["reference_idx"],
+    )
+    resp = await role_keyed_clients["wet"].post(
+        URL_FEATURE_TABLE_TAXONOMY,
+        json=_body(
+            [amplicon_run["processing_idx"]],
+            prep_sample_idx=[amplicon_run["ps_a"]],
+            reference_name=taxonomy_reference["name"],
+            reference_version=taxonomy_reference["version"],
+        ),
+    )
+    assert resp.status_code == 409, resp.text
+    assert amplicon_run["fetched"] == []
 
 
 async def test_taxonomy_answers_each_asvs_lineage(

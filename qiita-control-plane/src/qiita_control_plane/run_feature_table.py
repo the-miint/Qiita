@@ -286,18 +286,23 @@ async def resolve_cohort(pool: asyncpg.Pool, request: FeatureTableRequest) -> Co
     return cohort
 
 
-async def resolve_reference_idx(pool: asyncpg.Pool, *, name: str, version: str) -> int | None:
-    """The internal `reference_idx` of the reference the request names by its public
-    `(name, version)` handle, or None when no such reference exists.
+async def resolve_reference_idx(
+    pool: asyncpg.Pool, *, name: str, version: str
+) -> tuple[int, str] | None:
+    """The internal `reference_idx` and `status` of the reference the request names by
+    its public `(name, version)` handle, or None when no such reference exists.
 
-    `(name, version)` is UNIQUE, so at most one row matches. The idx stays server-side —
-    it is resolved here and signed into the data-plane ticket, never returned to the
-    caller — so the opaque identifier does not cross the boundary."""
-    return await pool.fetchval(
-        "SELECT reference_idx FROM qiita.reference WHERE name = $1 AND version = $2",
+    The status comes back so the caller can gate on it: only an `active` or `indexing`
+    reference is servable; a `loading`/`failed`/`pending` one may carry stray taxonomy
+    rows a status-blind lookup would serve. `(name, version)` is UNIQUE, so at most one
+    row matches. The idx stays server-side — it is signed into the data-plane ticket,
+    never returned to the caller — so the opaque identifier does not cross the boundary."""
+    row = await pool.fetchrow(
+        "SELECT reference_idx, status FROM qiita.reference WHERE name = $1 AND version = $2",
         name,
         version,
     )
+    return (row["reference_idx"], row["status"]) if row is not None else None
 
 
 def cohort_scope(cohort: Cohort) -> dict[str, list[int]]:

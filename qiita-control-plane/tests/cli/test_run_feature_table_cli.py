@@ -4,6 +4,8 @@ answers — an amplicon table's values, columns, each feature's sequence and md5
 
 import hashlib
 
+import json
+
 import duckdb
 import pyarrow as pa
 from qiita_common.api_paths import (
@@ -156,3 +158,6 @@ def test_taxonomy_flag_writes_each_asvs_lineage_beside_the_bundle(monkeypatch, t
         ).fetchall()
     # Only the feature the table names (md5a); the unused md5b is not written.
     assert lineage == [("md5a", "d__Bacteria", "p__Bacillota")]
+    # The manifest records which reference classified the lineage, by public handle.
+    manifest = json.loads(out.with_name("table.manifest.json").read_text())
+    assert manifest["taxonomy_reference"] == {"name": "greengenes2", "version": "2024.09"}

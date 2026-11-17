@@ -17,5 +17,7 @@
   never crosses the boundary, and there is no server-wide default, so one request can
   classify a run's features against one reference release and another against a newer
   release without a redeploy. The route refuses 404 for an unknown handle, and 409 when
-  the reference exists but has no taxonomy loaded yet, told apart from "places nothing" by
-  a readiness probe.
+  the reference exists but is not servable — a status other than `active`/`indexing`
+  (which may carry partial rows), or one with no taxonomy loaded yet, told apart from
+  "places nothing" by a readiness probe. The bundle's manifest records the classifying
+  reference's `(name, version)`, so the taxonomy companion is reproducible.

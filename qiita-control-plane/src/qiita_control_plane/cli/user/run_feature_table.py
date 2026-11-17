@@ -161,6 +161,20 @@ def _build(args: argparse.Namespace, token: str, con) -> tuple[list[Path], dict[
             # carries only handles a reader can resolve. The identifier map beside the
             # table is the one artifact that carries prep_sample_idx, and it says so.
             "cohort": sorted(s["export_id"] for s in columns["samples"]),
+            # The reference that classified the lineage companion, by its public
+            # (name, version) handle — the table carries the same md5s whichever
+            # reference named them, so the record is what makes the taxonomy
+            # reproducible. Absent when no taxonomy was requested.
+            **(
+                {
+                    "taxonomy_reference": {
+                        "name": args.taxonomy_reference_name,
+                        "version": args.taxonomy_reference_version,
+                    }
+                }
+                if args.taxonomy
+                else {}
+            ),
             **sizes,
             "files": [p.name for p in targets],
             "versions": _tool_versions(con),
