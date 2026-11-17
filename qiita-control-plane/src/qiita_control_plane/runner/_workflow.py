@@ -417,6 +417,9 @@ async def run_workflow(
                 )
             )
 
+        if _workflow_declares_param(action.steps, PREP_PROTOCOL_BINDING):
+            bound.update(await _resolve_prep_protocol(pool, scope_target))
+
         if _workflow_declares_marker_refs(action.steps):
             bound.update(
                 await _resolve_marker_refs(
@@ -427,9 +430,6 @@ async def run_workflow(
                     workspace=workspace,
                 )
             )
-
-        if _workflow_declares_param(action.steps, PREP_PROTOCOL_BINDING):
-            bound.update(await _resolve_prep_protocol(pool, scope_target))
 
         # ENA run-roster binding (download-ena-study workflow's
         # `ingest_ena_reads` step): see _stage_ena_run_roster_binding for the

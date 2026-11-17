@@ -253,7 +253,7 @@ def _workflow_declares_input(steps: list[Any], name: str) -> bool:
 
 
 def _workflow_declares_param(steps: list[Any], key: str) -> bool:
-    """True iff some entry threads action_context key `key` through its `params`."""
+    """True iff some entry declares a param named `key`."""
     return any(key in (getattr(entry, "params", None) or {}) for entry in steps)
 
 
@@ -699,22 +699,20 @@ async def _prep_sample_is_expected_empty_control(pool: asyncpg.Pool, prep_sample
 async def _resolve_prep_protocol(
     pool: asyncpg.Pool, scope_target: dict[str, Any]
 ) -> dict[str, str]:
-    """Bind `prep_protocol` to the prep_sample's protocol name. Resolved here, never
-    taken from the client, so a submitted value cannot steer a protocol-keyed verdict."""
+    """Bind `prep_protocol` to the prep_sample's protocol name. Never taken from the client,
+    so a submitted value cannot steer a protocol-keyed verdict. The ticket's RESTRICT FK and
+    `prep_sample.prep_protocol_idx NOT NULL` guarantee the name exists."""
     if scope_target["kind"] != ScopeTargetKind.PREP_SAMPLE.value:
         raise _submission_bad_input(
             f"a workflow that binds prep_protocol must be prep_sample-scoped; "
             f"got {scope_target['kind']!r}"
         )
-    prep_sample_idx = scope_target["prep_sample_idx"]
     name = await pool.fetchval(
         "SELECT pp.name FROM qiita.prep_sample ps"
         "  JOIN qiita.prep_protocol pp ON pp.idx = ps.prep_protocol_idx"
         " WHERE ps.idx = $1",
-        prep_sample_idx,
+        scope_target["prep_sample_idx"],
     )
-    if name is None:
-        raise _submission_bad_input(f"prep_sample {prep_sample_idx} has no prep_protocol")
     return {PREP_PROTOCOL_BINDING: name}
 
 
