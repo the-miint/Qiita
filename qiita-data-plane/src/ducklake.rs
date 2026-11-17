@@ -843,12 +843,14 @@ pub fn ensure_assembly_tables(conn: &Connection) -> Result<(), Box<dyn std::erro
         -- qiita_common.assembly_constants. The DuckLake copy of
         -- qiita.assembly_membership for bulk joins with the sequences.
         --
-        -- The four trailing columns are the assembler's own per-contig report,
-        -- nullable and NULL for every row written before they existed. Their
+        -- raw_name, circularity, depth and mult are the assembler's own per-contig
+        -- report, nullable and NULL for every row written before they existed. Their
         -- meaning is stated once, as COMMENT ON COLUMN on the Postgres twin
         -- qiita.assembly_membership; do not restate it here. The assembler
         -- itself is NOT among them -- it is captured in qiita.processing via
         -- processing_idx, as bin_quality's comment below says of the same field.
+        -- genome_idx is the subject's qiita.genome, as on the Postgres twin; NULL on
+        -- rows registered before it was written.
         CREATE TABLE IF NOT EXISTS qiita_lake.assembly_membership (
             prep_sample_idx BIGINT NOT NULL,
             processing_idx BIGINT NOT NULL,
@@ -858,7 +860,8 @@ pub fn ensure_assembly_tables(conn: &Connection) -> Result<(), Box<dyn std::erro
             raw_name VARCHAR,
             circularity VARCHAR,
             depth DOUBLE,
-            mult DOUBLE
+            mult DOUBLE,
+            genome_idx BIGINT
         );
 
         -- Per-subject CheckM quality: one row per refined bin (kind MAG), per
@@ -872,6 +875,8 @@ pub fn ensure_assembly_tables(conn: &Connection) -> Result<(), Box<dyn std::erro
         -- lineage_wf --tab_table`; genome_size / n_contigs from `checkm qa -o 2`;
         -- das_tool_score / source_binner are DAS_Tool provenance. The assembler is
         -- captured in qiita.processing (processing_idx), not repeated here.
+        -- genome_idx is the subject's qiita.genome (NULL on rows registered before
+        -- it was written), the key the gene-call tables name the subject by.
         CREATE TABLE IF NOT EXISTS qiita_lake.bin_quality (
             prep_sample_idx BIGINT NOT NULL,
             processing_idx BIGINT NOT NULL,
@@ -884,7 +889,8 @@ pub fn ensure_assembly_tables(conn: &Connection) -> Result<(), Box<dyn std::erro
             genome_size BIGINT,
             n_contigs BIGINT,
             das_tool_score DOUBLE,
-            source_binner VARCHAR
+            source_binner VARCHAR,
+            genome_idx BIGINT
         );",
     )?;
     // `CREATE TABLE IF NOT EXISTS` leaves a lake that already holds
@@ -897,13 +903,15 @@ pub fn ensure_assembly_tables(conn: &Connection) -> Result<(), Box<dyn std::erro
     // inside this function -- once in the CREATE for a fresh lake, once here for
     // an existing one -- and a column added to only one of them leaves a deployed
     // lake narrow, which surfaces at the next registration rather than at boot.
-    // ensure_assembly_tables_is_idempotent asserts the full nine-column shape, so
-    // it fails on the CREATE half; the widening test covers the ALTER half.
+    // ensure_assembly_tables_is_idempotent asserts assembly_membership's full shape,
+    // so it fails on the CREATE half; the widening tests cover the ALTER half.
     conn.execute_batch(
         "ALTER TABLE qiita_lake.assembly_membership ADD COLUMN IF NOT EXISTS raw_name VARCHAR;
          ALTER TABLE qiita_lake.assembly_membership ADD COLUMN IF NOT EXISTS circularity VARCHAR;
          ALTER TABLE qiita_lake.assembly_membership ADD COLUMN IF NOT EXISTS depth DOUBLE;
-         ALTER TABLE qiita_lake.assembly_membership ADD COLUMN IF NOT EXISTS mult DOUBLE;",
+         ALTER TABLE qiita_lake.assembly_membership ADD COLUMN IF NOT EXISTS mult DOUBLE;
+         ALTER TABLE qiita_lake.assembly_membership ADD COLUMN IF NOT EXISTS genome_idx BIGINT;
+         ALTER TABLE qiita_lake.bin_quality ADD COLUMN IF NOT EXISTS genome_idx BIGINT;",
     )?;
     // Pin DuckLake's own rewrites of the chunk table (see CHUNK_ROW_GROUP_SIZE).
     conn.execute_batch(&format!(
@@ -2249,6 +2257,7 @@ mod tests {
             ("circularity", "VARCHAR", "YES"),
             ("depth", "DOUBLE", "YES"),
             ("mult", "DOUBLE", "YES"),
+            ("genome_idx", "BIGINT", "YES"),
         ];
         let got: Vec<(&str, &str, &str)> = cols
             .iter()
@@ -2298,8 +2307,47 @@ mod tests {
                 "circularity",
                 "depth",
                 "mult",
+                "genome_idx",
             ],
-            "the four attribute columns must be appended to an existing table"
+            "the attribute columns and genome_idx must be appended to an existing table"
+        );
+    }
+
+    /// A lake whose bin_quality predates `genome_idx` gains it on the next boot, as
+    /// assembly_membership does above.
+    #[test]
+    #[serial]
+    #[cfg(feature = "integration")]
+    fn ensure_assembly_tables_widens_a_preexisting_bin_quality_table() {
+        let conn = setup_conn();
+        conn.execute_batch("DROP TABLE IF EXISTS qiita_lake.bin_quality;")
+            .unwrap();
+        conn.execute_batch(
+            "CREATE TABLE qiita_lake.bin_quality (
+                prep_sample_idx BIGINT NOT NULL,
+                processing_idx BIGINT NOT NULL,
+                kind VARCHAR NOT NULL,
+                bin_id VARCHAR NOT NULL,
+                marker_lineage VARCHAR,
+                completeness DOUBLE,
+                contamination DOUBLE,
+                strain_heterogeneity DOUBLE,
+                genome_size BIGINT,
+                n_contigs BIGINT,
+                das_tool_score DOUBLE,
+                source_binner VARCHAR
+            );",
+        )
+        .unwrap();
+
+        ensure_assembly_tables(&conn).expect("ensure_assembly_tables over a narrow bin_quality");
+
+        let cols = table_schema(&conn, "bin_quality");
+        assert_eq!(cols.len(), 13);
+        assert_eq!(
+            cols.last()
+                .map(|(n, t, null)| (n.as_str(), t.as_str(), null.as_str())),
+            Some(("genome_idx", "BIGINT", "YES"))
         );
     }
 

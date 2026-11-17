@@ -72,6 +72,14 @@ _AT_REST_HELPERS: dict[str, frozenset[str]] = {
 }
 _HELPER_FUNCTIONS = frozenset().union(*_AT_REST_HELPERS.values())
 
+# Jobs whose registered output is written by another job's `execute`, which they call;
+# the job they call is the one checked for at-rest options.
+_DELEGATES: dict[str, str] = {
+    "qiita_compute_orchestrator.jobs.assembly_load_recover": (
+        "qiita_compute_orchestrator.jobs.assembly_load"
+    ),
+}
+
 # Where the sets are defined (re-exported from qiita_common.parquet), not a writer.
 _DEFINING_MODULE = "qiita_compute_orchestrator.miint"
 
@@ -147,6 +155,12 @@ def test_registering_modules_are_found():
 @pytest.mark.parametrize("module", sorted(_REGISTERING))
 def test_registered_output_is_written_at_rest(module: str):
     names = _names(_module_path(module))
+    target = _DELEGATES.get(module)
+    if target is not None:
+        assert {target.rsplit(".", 1)[1], "execute"} <= names, (
+            f"{module} is listed as delegating to {target}.execute but does not call it"
+        )
+        names = _names(_module_path(target))
     assert names & (_AT_REST_SETS | _HELPER_FUNCTIONS), (
         f"{module} writes files that {sorted(_REGISTERING[module])} register into DuckLake, "
         f"but names no at-rest option set or helper ({sorted(_AT_REST_SETS)})"

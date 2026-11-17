@@ -2369,18 +2369,18 @@ fn register_files_replaces_run_scoped_tables_on_the_whole_key() {
 
     // One run's rows, byte-identical across both of its registrations —
     // exactly what a re-run under the same processing_idx re-derives.
-    // Nine columns: `ducklake_add_data_files` refuses a Parquet missing a column
+    // The full column list: `ducklake_add_data_files` refuses a Parquet missing a column
     // the target table has, just as it refuses an extra one, so these fixtures
-    // carry the assembler attribute columns `ensure_assembly_tables` adds.
+    // carry every column `ensure_assembly_tables` adds, genome_idx included.
     let membership_values = |prep_sample: i64, run: i64| {
         format!(
             "SELECT * FROM (VALUES \
                  ({prep_sample}::BIGINT, {run}::BIGINT, 'LCG', 'circular_1', {feature_a}::BIGINT, \
-                  'circular_1'::VARCHAR, 'yes'::VARCHAR, 30.5::DOUBLE, 1.02::DOUBLE), \
+                  'circular_1'::VARCHAR, 'yes'::VARCHAR, 30.5::DOUBLE, 1.02::DOUBLE, 9001::BIGINT), \
                  ({prep_sample}::BIGINT, {run}::BIGINT, 'MAG', 'bin.1', {feature_b}::BIGINT, \
-                  NULL::VARCHAR, NULL::VARCHAR, NULL::DOUBLE, NULL::DOUBLE)) \
+                  NULL::VARCHAR, NULL::VARCHAR, NULL::DOUBLE, NULL::DOUBLE, 9002::BIGINT)) \
                  t(prep_sample_idx, processing_idx, kind, bin_id, feature_idx, \
-                   raw_name, circularity, depth, mult)"
+                   raw_name, circularity, depth, mult, genome_idx)"
         )
     };
     let quality_values = |prep_sample: i64, run: i64| {
@@ -2388,10 +2388,10 @@ fn register_files_replaces_run_scoped_tables_on_the_whole_key() {
             "SELECT * FROM (VALUES \
                  ({prep_sample}::BIGINT, {run}::BIGINT, 'MAG', 'bin.1', \
                   'k__Bacteria'::VARCHAR, 91.5::DOUBLE, 1.25::DOUBLE, 0.0::DOUBLE, \
-                  4200000::BIGINT, 42::BIGINT, 0.87::DOUBLE, 'metabat2'::VARCHAR)) \
+                  4200000::BIGINT, 42::BIGINT, 0.87::DOUBLE, 'metabat2'::VARCHAR, 9002::BIGINT)) \
                  t(prep_sample_idx, processing_idx, kind, bin_id, marker_lineage, \
                    completeness, contamination, strain_heterogeneity, genome_size, \
-                   n_contigs, das_tool_score, source_binner)"
+                   n_contigs, das_tool_score, source_binner, genome_idx)"
         )
     };
     let control_values = format!(
@@ -2562,9 +2562,9 @@ fn an_empty_bin_quality_still_supersedes_the_runs_rows() {
         format!(
             "SELECT * FROM (VALUES \
                  ({prep_sample}::BIGINT, {run}::BIGINT, '{kind}', '{bin_id}', {feature}::BIGINT, \
-                  NULL::VARCHAR, NULL::VARCHAR, NULL::DOUBLE, NULL::DOUBLE)) \
+                  NULL::VARCHAR, NULL::VARCHAR, NULL::DOUBLE, NULL::DOUBLE, 9002::BIGINT)) \
                  t(prep_sample_idx, processing_idx, kind, bin_id, feature_idx, \
-                   raw_name, circularity, depth, mult)"
+                   raw_name, circularity, depth, mult, genome_idx)"
         )
     };
     let quality_values = |suffix: &str| {
@@ -2572,10 +2572,10 @@ fn an_empty_bin_quality_still_supersedes_the_runs_rows() {
             "SELECT * FROM (VALUES \
                  ({prep_sample}::BIGINT, {run}::BIGINT, 'MAG', 'bin.1', \
                   'k__Bacteria'::VARCHAR, 91.5::DOUBLE, 1.25::DOUBLE, 0.0::DOUBLE, \
-                  4200000::BIGINT, 42::BIGINT, 0.87::DOUBLE, 'metabat2'::VARCHAR)) \
+                  4200000::BIGINT, 42::BIGINT, 0.87::DOUBLE, 'metabat2'::VARCHAR, 9002::BIGINT)) \
                  t(prep_sample_idx, processing_idx, kind, bin_id, marker_lineage, \
                    completeness, contamination, strain_heterogeneity, genome_size, \
-                   n_contigs, das_tool_score, source_binner){suffix}"
+                   n_contigs, das_tool_score, source_binner, genome_idx){suffix}"
         )
     };
 
@@ -2681,9 +2681,9 @@ fn empty_gene_call_tables_still_supersede_the_runs_rows() {
         format!(
             "SELECT * FROM (VALUES \
                  ({prep_sample}::BIGINT, {run}::BIGINT, '{kind}', '{bin_id}', {contig}::BIGINT, \
-                  NULL::VARCHAR, NULL::VARCHAR, NULL::DOUBLE, NULL::DOUBLE)) \
+                  NULL::VARCHAR, NULL::VARCHAR, NULL::DOUBLE, NULL::DOUBLE, 9002::BIGINT)) \
                  t(prep_sample_idx, processing_idx, kind, bin_id, feature_idx, \
-                   raw_name, circularity, depth, mult)"
+                   raw_name, circularity, depth, mult, genome_idx)"
         )
     };
     let contig_values = |suffix: &str| {

@@ -60,8 +60,7 @@ GENE_CALL_RUN_KEY = ("prep_sample_idx", "processing_idx")
 # The subject a row belongs to, by its `qiita.genome` (one per assembled subject,
 # minted from the run, kind and bin_id by
 # `qiita_control_plane.repositories.assembly.assembly_genome_source_id`), then the
-# call set. The gene-calling step does not know the genome; its staging Parquet
-# carries `kind` and `bin_id` in place of `genome_idx`, for the load to resolve.
+# call set. The gene-calling step does not know the genome (`GENE_CALL_STEP_IDENTIFIERS`).
 GENE_CALL_SUBJECT_KEY = ("prep_sample_idx", "processing_idx", "genome_idx", "call_set")
 
 _SUBJECT_COLUMNS: tuple[tuple[str, str], ...] = (
@@ -130,3 +129,34 @@ GENE_CALL_TABLES: dict[str, tuple[tuple[str, str], ...]] = {
     GENE_CALL_TABLE: GENE_CALL_COLUMNS,
     GENE_CALL_CONTIG_TABLE: GENE_CALL_CONTIG_COLUMNS,
 }
+
+# The gene-calling step's files, `gene.parquet` and `contig.parquet`, keyed by the lake
+# table each one loads into: every lake column but the run key, in order, except that
+# a column the step cannot know is replaced by the identifiers the load resolves it
+# from: the subject by `kind` and `bin_id` (for `genome_idx`), a row's own contig or
+# gene by its canonical `sequence_hash` (for `feature_idx`), and a gene's contig by
+# `parent_sequence_hash` (for `parent_feature_idx`).
+_SUBJECT_IDENTIFIERS: tuple[tuple[str, str], ...] = (("kind", "VARCHAR"), ("bin_id", "VARCHAR"))
+GENE_CALL_STEP_IDENTIFIERS: dict[str, dict[str, tuple[tuple[str, str], ...]]] = {
+    GENE_CALL_TABLE: {
+        "genome_idx": _SUBJECT_IDENTIFIERS,
+        "parent_feature_idx": (("parent_sequence_hash", "UUID"),),
+        "feature_idx": (("sequence_hash", "UUID"),),
+    },
+    GENE_CALL_CONTIG_TABLE: {
+        "genome_idx": _SUBJECT_IDENTIFIERS,
+        "feature_idx": (("sequence_hash", "UUID"),),
+    },
+}
+
+
+def gene_call_step_columns(table: str) -> tuple[tuple[str, str], ...]:
+    """The columns of the gene-calling step's file for `table`, as
+    `GENE_CALL_STEP_IDENTIFIERS` describes them."""
+    identifiers = GENE_CALL_STEP_IDENTIFIERS[table]
+    return tuple(
+        column
+        for name, sqltype in GENE_CALL_TABLES[table]
+        if name not in GENE_CALL_RUN_KEY
+        for column in identifiers.get(name, ((name, sqltype),))
+    )

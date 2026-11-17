@@ -84,6 +84,7 @@ BIN_QUALITY_COLUMNS: tuple[tuple[str, str], ...] = (
     ("n_contigs", "BIGINT"),
     ("das_tool_score", "DOUBLE"),
     ("source_binner", "VARCHAR"),
+    ("genome_idx", "BIGINT"),
 )
 
 

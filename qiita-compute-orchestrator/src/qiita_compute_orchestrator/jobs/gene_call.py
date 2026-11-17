@@ -9,14 +9,9 @@ canonical strand are `qiita_common.gene_call_constants`.
 
 Outputs, in `gene_calls/`:
 
-  - `gene.parquet`: one row per gene, the `gene_call` columns without the run key,
-    with the identifiers the load resolves in their place: the subject named by
-    `kind` and `bin_id` (for `genome_idx`), the contig by `parent_sequence_hash`, and
-    the gene by its own canonical `sequence_hash` and `sequence_length_bp`, for
-    minting.
-  - `contig.parquet`: one row per contig of each called subject, the
-    `gene_call_contig` columns without the run key, the subject named by `kind` and
-    `bin_id` and the contig by `sequence_hash`.
+  - `gene.parquet`: one row per gene, and `contig.parquet`: one row per contig of each
+    called subject, with the columns `gene_call_constants.gene_call_step_columns`
+    gives for `gene_call` and `gene_call_contig`.
   - `checkm/<kind>/<bin_id>/genes.faa` and `genes.gff`: the `prodigal_checkm` genes of
     each subject that has any, as Prodigal's CLI writes them for that subject's FASTA
     (contig names and strand as read, not canonical), laid out as CheckM's
@@ -305,7 +300,6 @@ def _gene_rows_sql(calls: str, call_set: str) -> str:
         SELECT c.kind, c.bin_id, '{call_set}' AS call_set,
                c.sequence_hash AS parent_sequence_hash,
                {canonical_sequence_hash_expr(gene_bases)} AS sequence_hash,
-               (g.stop_position - g.position)::BIGINT AS sequence_length_bp,
                (CASE WHEN c.reverse_complemented THEN {length} - g.stop_position + 2
                      ELSE g.position END)::BIGINT AS position,
                (CASE WHEN c.reverse_complemented THEN {length} - g.position + 2
@@ -433,7 +427,9 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
         f"prep_sample_idx={inputs.prep_sample_idx}",
         flush=True,
     )
-    return {"gene_calls": out}
+    # `gene_manifest` is the gene file again, under the name mint-gene-features takes:
+    # its `sequence_hash` column is what that action mints.
+    return {"gene_calls": out, "gene_manifest": out / GENE_FILE}
 
 
 def _call_and_write(inputs: Inputs, workspace: Path, out: Path) -> tuple[int, int]:

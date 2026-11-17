@@ -304,11 +304,51 @@ async def test_a_ticket_the_syndna_backfill_would_still_write_is_skipped_and_rep
     plan = await _plan(world)
     result = await apply_reclaim(pool, plan)
 
-    assert plan.syndna_skipped == [needed]
+    assert plan.backfill_skipped == [needed]
     assert _idxs(plan) == {free}
     assert kept(world["root"], needed)
     assert not kept(world["root"], free)
     assert [t.work_ticket_idx for t in result.reclaimed] == [free]
+
+
+@pytest.mark.parametrize(
+    "status,skipped",
+    [("writable", True), ("in_flight", True), ("done", False), ("residue", False)],
+)
+async def test_a_ticket_the_gene_call_recovery_still_reads_is_skipped(
+    world, monkeypatch, status, skipped
+):
+    """A run the gene-call recovery can still recover, or is recovering, keeps its
+    source ticket's workspace; a done or residue run's does not."""
+    from qiita_control_plane.backfill import assembly_gene_call as gene_call_backfill
+
+    pool = world["pool"]
+    source = await world["ticket"]("completed")
+    run_status = gene_call_backfill.RunStatus(status)
+
+    async def fake_plan(_pool, *, ticket_root):
+        return gene_call_backfill.BackfillPlan(
+            runs=[
+                gene_call_backfill.Run(
+                    1,
+                    1,
+                    run_status,
+                    residue_kind=(
+                        gene_call_backfill.ResidueKind.NO_MANIFEST
+                        if run_status is gene_call_backfill.RunStatus.RESIDUE
+                        else None
+                    ),
+                    source_work_ticket_idx=source,
+                )
+            ]
+        )
+
+    monkeypatch.setattr(scratch_reclaim, "plan_gene_call_backfill", fake_plan)
+    plan = await _plan(world)
+    await apply_reclaim(pool, plan)
+
+    assert (plan.backfill_skipped == [source]) is skipped
+    assert kept(world["root"], source) is skipped
 
 
 def _deny_chmod_on_locked(m):

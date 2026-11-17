@@ -34,6 +34,7 @@ import pyarrow as pa
 import pyarrow.flight as _flight
 import pyarrow.parquet as pq
 from pydantic import TypeAdapter
+from qiita_common.actions import MINT_FEATURES_OUTPUT_BASENAME
 from qiita_common.api_paths import URL_ALIGNMENT_DEFINITION_ABANDON_PLAN, LibraryPrimitive
 from qiita_common.assembly_constants import (
     CONTIG_ATTRIBUTE_REPRESENTATIVE_SQL,
@@ -137,19 +138,21 @@ _MAX_REPORTED = 20
 # Unmatched genome-map read_ids named in `_check_genome_map`'s error and warning.
 _GENOME_MAP_UNMATCHED_EXAMPLES = 5
 
-# Files library actions write into their attempt's directory. runner._reconstruct
-# rebuilds each bound one on resume without re-running the action. Each action has a
-# directory of its own (`qiita_common.workspace.step_attempt_dir`, by step name), so a
-# name needs to be distinct only from the other files of its action.
+# Files library actions write into their attempt's directory; MINT_FEATURES' is
+# `qiita_common.actions.MINT_FEATURES_OUTPUT_BASENAME`. runner._reconstruct rebuilds
+# each bound one on resume without re-running the action. Each action has a directory
+# of its own (`qiita_common.workspace.step_attempt_dir`, by step name), so a name
+# needs to be distinct only from the other files of its action.
 #
 # mint-annotation-features writes two: the sequence_hash → feature_idx map it mints
 # through (an intermediate, never bound), and the minted annotation_idx for each
 # interval keyed by the annotation's NATURAL key (parent + window + type + strand).
 # reference_load joins the second to put annotation_idx on every lake row, which is
 # what lets a lake row point back at its Postgres claim.
-MINT_FEATURES_OUTPUT_BASENAME = "feature_map.parquet"
 MINT_ANNOTATION_FEATURES_OUTPUT_BASENAME = "annotation_feature_map.parquet"
 MINT_ANNOTATION_MAP_OUTPUT_BASENAME = "annotation_map.parquet"
+MINT_GENE_FEATURES_OUTPUT_BASENAME = "gene_feature_map.parquet"
+SUBJECT_GENOME_MAP_OUTPUT_BASENAME = "subject_genome_map.parquet"
 
 # GFF3 attributes carrying cross-references into an annotation authority, in the two
 # spellings the common annotators use (`Dbxref` is GFF3-spec and what NCBI emits;
@@ -1897,6 +1900,67 @@ async def write_assembly_membership(
     return total_written
 
 
+async def mint_gene_features(
+    pool: asyncpg.Pool, gene_manifest_path: Path, output_dir: Path
+) -> tuple[Path, int, int]:
+    """Mint a feature_idx for each called gene from the canonical hash of its bytes,
+    as `mint_annotation_features` does for an annotated interval: identical genes
+    share one feature_idx lake-wide, and the bytes are not stored (a reader cuts them
+    from the contig). `gene_manifest_path` is a Parquet with a `sequence_hash`
+    column, the gene-calling step's gene rows. Writes the sequence_hash ->
+    feature_idx map under `MINT_GENE_FEATURES_OUTPUT_BASENAME`."""
+    return await mint_features(
+        pool,
+        gene_manifest_path,
+        output_dir,
+        output_basename=MINT_GENE_FEATURES_OUTPUT_BASENAME,
+        scope=LibraryPrimitive.MINT_GENE_FEATURES,
+    )
+
+
+async def export_subject_genome_map(
+    pool: asyncpg.Pool, prep_sample_idx: int, processing_idx: int, output_dir: Path
+) -> Path:
+    """One assembly run's subjects and their genomes, `(kind, bin_id, genome_idx)`,
+    from qiita.assembly_membership, as a Parquet under
+    `SUBJECT_GENOME_MAP_OUTPUT_BASENAME`: how a job, which has no database access,
+    names a subject by its genome. `write_assembly_membership` mints the genomes;
+    Postgres holds one genome per subject of a run.
+
+    Raises when the run has no membership rows, or when any row has no genome (a
+    row written before genomes were minted, which `backfill/assembly_genome.py`
+    fills): a subject left out of the map would leave its rows unnamed downstream.
+    """
+    async with pool.acquire() as conn:
+        missing, total = await conn.fetchrow(
+            "SELECT count(*) FILTER (WHERE genome_idx IS NULL), count(*)"
+            " FROM qiita.assembly_membership"
+            " WHERE prep_sample_idx = $1 AND processing_idx = $2",
+            prep_sample_idx,
+            processing_idx,
+        )
+    if total == 0 or missing:
+        raise RuntimeError(
+            f"export-subject-genome-map: assembly run (prep_sample {prep_sample_idx},"
+            f" processing {processing_idx}) has {total} membership row(s), {missing}"
+            " without a genome_idx"
+        )
+    out = output_dir / SUBJECT_GENOME_MAP_OUTPUT_BASENAME
+    await _export_query_to_parquet(
+        pool,
+        sql=(
+            "SELECT DISTINCT kind, bin_id, genome_idx FROM qiita.assembly_membership"
+            " WHERE prep_sample_idx = $1 AND processing_idx = $2"
+        ),
+        params=(prep_sample_idx, processing_idx),
+        schema=pa.schema(
+            [("kind", pa.string()), ("bin_id", pa.string()), ("genome_idx", pa.int64())]
+        ),
+        sink=out,
+    )
+    return out
+
+
 async def register_index(
     pool: asyncpg.Pool,
     reference_idx: int,
@@ -3487,6 +3551,8 @@ LIBRARY: dict[str, Callable[..., Awaitable[Any]]] = {
     LibraryPrimitive.MINT_ANNOTATION_FEATURES: mint_annotation_features,
     LibraryPrimitive.WRITE_MEMBERSHIP: write_membership,
     LibraryPrimitive.WRITE_ASSEMBLY_MEMBERSHIP: write_assembly_membership,
+    LibraryPrimitive.MINT_GENE_FEATURES: mint_gene_features,
+    LibraryPrimitive.EXPORT_SUBJECT_GENOME_MAP: export_subject_genome_map,
     LibraryPrimitive.REGISTER_FILES: register_files,
     LibraryPrimitive.REGISTER_INDEX: register_index,
     LibraryPrimitive.PLAN_SHARDS: plan_shards,

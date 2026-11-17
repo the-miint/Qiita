@@ -20,9 +20,9 @@ from qiita_common.gene_call_constants import (
     CALL_SET_CHECKM,
     CALL_SET_META_CLOSED,
     GENE_CALL_ATTRIBUTE_KEYS,
-    GENE_CALL_COLUMNS,
-    GENE_CALL_CONTIG_COLUMNS,
-    GENE_CALL_RUN_KEY,
+    GENE_CALL_CONTIG_TABLE,
+    GENE_CALL_TABLE,
+    gene_call_step_columns,
 )
 
 from qiita_compute_orchestrator.jobs import gene_call
@@ -228,32 +228,17 @@ def test_checkm_files_are_written_per_subject_with_contig_names_as_read(called):
     assert len(headers) == n_genes
 
 
-def test_outputs_are_the_lake_columns_with_hashes_for_the_identifiers(called):
-    """What the load needs: every lake column but the run key, with the subject's
-    `kind` and `bin_id` in place of its `genome_idx` and each `feature_idx` still a
-    canonical hash, to be resolved or minted."""
+def test_outputs_are_the_step_columns(called):
+    """Each file has the columns `gene_call_step_columns` names, in order, and the
+    types it gives them."""
     out, _ = called
-    subject = {"genome_idx": ["kind", "bin_id"]}
-    gene_swap = subject | {
-        "parent_feature_idx": ["parent_sequence_hash"],
-        "feature_idx": ["sequence_hash", "sequence_length_bp"],
-    }
-    contig_swap = subject | {"feature_idx": ["sequence_hash"]}
-
-    def expected(columns, swap):
-        names = []
-        for name, _ in columns:
-            if name not in GENE_CALL_RUN_KEY:
-                names.extend(swap.get(name, [name]))
-        return names
-
     conn = duckdb.connect()
-    for file, columns, swap in (
-        (gene_call.GENE_FILE, GENE_CALL_COLUMNS, gene_swap),
-        (gene_call.CONTIG_FILE, GENE_CALL_CONTIG_COLUMNS, contig_swap),
+    for file, table in (
+        (gene_call.GENE_FILE, GENE_CALL_TABLE),
+        (gene_call.CONTIG_FILE, GENE_CALL_CONTIG_TABLE),
     ):
-        got = [r[0] for r in conn.execute(f"DESCRIBE FROM '{out / file}'").fetchall()]
-        assert got == expected(columns, swap), file
+        got = [r[:2] for r in conn.execute(f"DESCRIBE FROM '{out / file}'").fetchall()]
+        assert got == list(gene_call_step_columns(table)), file
 
 
 def test_attribute_keys_are_the_contracts():

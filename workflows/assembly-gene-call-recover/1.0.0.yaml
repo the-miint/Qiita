@@ -1,0 +1,118 @@
+# One-off. Adds gene calls, and genome_idx on assembly_membership and bin_quality, to
+# long-read-assembly runs that completed before 1.0.2 gained its gene_call step. The
+# `qiita-admin backfill assembly-gene-call` command submits one ticket per run. Once every
+# such run has its gene calls or an explained residue line, these are removed: this
+# workflow; the jobs gene_call_recover, assembly_load_recover and _recover_source; the
+# backfill (backfill/assembly_gene_call.py, cli/admin/backfill_assembly_gene_call.py and
+# its registration in cli/admin/__init__.py); their tests; and the
+# `ASSEMBLY_PROCESSING_IDX_BINDING` branch of runner._reconstruct._assembly_processing_idx.
+action_id: assembly-gene-call-recover
+version: 1.0.0
+target_kind: prep_sample
+
+description: >
+  Add gene calls to one long-read-assembly run (1.0.0, 1.0.1, or a 1.0.2 run that
+  completed before 1.0.2 gained its gene_call step), under the run's existing
+  processing_idx. The run's own step outputs, still in its ticket's workspace, are
+  the source; the context names them by ticket and attempt number. `gene_call` runs
+  long-read-assembly's gene_call job over the run's assemble and bin_refine outputs;
+  mint-gene-features and export-subject-genome-map run as they do in 1.0.2; and
+  `assembly_load` runs long-read-assembly's assembly_load job over the run's
+  assemble, bin_refine, checkm, assembly_hash and mint-features outputs plus the gene
+  outputs, keeping only assembly_membership, bin_quality and the two gene-call tables,
+  which register-files replaces for the run.
+
+scopes:
+  - prep_sample:write
+
+audience:
+  service: false
+  human_roles: [system_admin]
+
+context_schema:
+  type: object
+  required:
+    - assembly_processing_idx
+    - source_work_ticket_idx
+    - assemble_attempt
+    - bin_refine_attempt
+    - checkm_attempt
+    - assembly_hash_attempt
+    - mint_features_attempt
+  properties:
+    # The completed run that the gene calls are added to.
+    assembly_processing_idx:
+      type: integer
+      minimum: 1
+    # The run's completed long-read-assembly ticket, whose workspace holds the
+    # outputs, and the completed attempt of each entry read from it.
+    source_work_ticket_idx:
+      type: integer
+      minimum: 1
+    assemble_attempt:
+      type: integer
+      minimum: 0
+    bin_refine_attempt:
+      type: integer
+      minimum: 0
+    checkm_attempt:
+      type: integer
+      minimum: 0
+    assembly_hash_attempt:
+      type: integer
+      minimum: 0
+    mint_features_attempt:
+      type: integer
+      minimum: 0
+
+steps:
+  # Resources are long-read-assembly 1.0.2's gene_call step's.
+  - step: gene_call
+    step_type: singleton
+    module: qiita_compute_orchestrator.jobs.gene_call_recover
+    params:
+      source_work_ticket_idx: source_work_ticket_idx
+      assemble_attempt: assemble_attempt
+      bin_refine_attempt: bin_refine_attempt
+    outputs: [gene_calls, gene_manifest]
+    baseline_resources:
+      cpu: 4
+      mem_gb: 16
+      walltime: PT2H
+
+  - action: mint-gene-features
+    inputs: [gene_manifest]
+    outputs: [gene_feature_map]
+
+  # Reads the run from action_context's `assembly_processing_idx`.
+  - action: export-subject-genome-map
+    inputs: []
+    outputs: [subject_genome_map]
+
+  # Resources are long-read-assembly 1.0.2's assembly_load step's.
+  - step: assembly_load
+    step_type: singleton
+    module: qiita_compute_orchestrator.jobs.assembly_load_recover
+    inputs: [gene_calls, gene_feature_map, subject_genome_map]
+    params:
+      assembly_processing_idx: assembly_processing_idx
+      source_work_ticket_idx: source_work_ticket_idx
+      assemble_attempt: assemble_attempt
+      bin_refine_attempt: bin_refine_attempt
+      checkm_attempt: checkm_attempt
+      assembly_hash_attempt: assembly_hash_attempt
+      mint_features_attempt: mint_features_attempt
+    outputs: [staging_dir]
+    baseline_resources:
+      cpu: 4
+      mem_gb: 32
+      walltime: PT2H
+
+  - action: register-files
+    inputs: [staging_dir]
+    outputs: []
+
+action_ceiling:
+  cpu: 4
+  mem_gb: 64
+  walltime: PT8H
