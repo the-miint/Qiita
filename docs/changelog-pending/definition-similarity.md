@@ -107,7 +107,13 @@
   flags too, the
   cohort DoGet response names the deprecated upstreams read (`deprecated_upstreams`),
   and `qiita feature-table build` says so on stderr and records each on the manifest
-  part by `params_hash` and reason.
+  part by `params_hash` and reason. A deprecated alignment read alone under
+  `--include-deprecated` reports a deprecated mask or assembly run under it the same
+  way, without needing the upstream flag. Under `--include-deprecated-upstream` the
+  pool cohort listing leaves out the prep_samples whose mask run is withdrawn and lists
+  them in `left_out`; the build records them in `table.left_out` by biosample
+  accession and `QB<n>` handle instead of failing a default-cohort build on them, and
+  a prep_sample named with `--prep-sample-idx` is still refused.
 - **`qiita feature-table build` takes repeated `--sequencing-run-idx` /
   `--sequenced-pool-idx` pairs and builds one table across the alignment's group
   (#874).** It reads each prep_sample from the alignment that it resolves to. Over the

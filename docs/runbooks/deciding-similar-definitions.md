@@ -111,7 +111,10 @@ is running, and the manifest records each by biosample accession. The flag also 
 a de novo arm whose assembly run is deprecated. An active alignment whose mask (or
 assembly run) is deprecated is refused unless `--include-deprecated-upstream` is
 passed; with it the alignment's group is read as usual, and the manifest names each
-deprecated upstream by `params_hash` and reason.
+deprecated upstream by `params_hash` and reason. Over the build's default cohort a
+prep_sample whose mask run is withdrawn is then left out and recorded, as under
+`--include-deprecated`; a named one is refused. A deprecated alignment read alone
+under `--include-deprecated` names its deprecated upstreams in the manifest too.
 
 The exports list incomplete and not-processed prep_samples and leave them out, and
 so does `qiita feature-table build` over its default cohort (it also records them in

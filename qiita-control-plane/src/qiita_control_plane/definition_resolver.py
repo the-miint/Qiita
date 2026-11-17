@@ -146,6 +146,7 @@ __all__ = [
     "require_observable",
     "NO_RUN_TO_READ",
     "exact_read_left_out",
+    "upstream_read_left_out",
     "resolve_exact",
     "resolve_group",
     "resolve_sample",
@@ -618,9 +619,14 @@ async def resolve_group(
     )
 
 
-# The exact read's left-out rule: every prep_sample it does not resolve `processed` is
-# left out and reported, except one with nothing to read there: no run under the
-# definition, or (de novo) an assembly that produced no contigs.
+# The left-out rules of a listing that reads past deprecation, each applied by the
+# function below it:
+#   - an exact read (`resolve_exact`) leaves out and reports every prep_sample it does
+#     not resolve `processed`, except one with nothing to read there: no run under the
+#     definition, or (de novo) an assembly that produced no contigs;
+#   - a read past deprecated upstreams (`admitted_upstream_kinds`) leaves out and
+#     reports a prep_sample whose upstream run is withdrawn (`upstream_withdrawn`);
+#     every other state is the group resolution's, as without the flag.
 NO_RUN_TO_READ = frozenset({SampleResolutionReason.NO_RUN, SampleResolutionReason.NO_DATA})
 
 
@@ -632,6 +638,15 @@ def exact_read_left_out(samples: Iterable[SampleResolution]) -> list[SampleResol
             for r in samples
             if r.state is not SampleResolutionState.PROCESSED and r.reason not in NO_RUN_TO_READ
         ),
+        key=lambda r: r.prep_sample_idx,
+    )
+
+
+def upstream_read_left_out(samples: Iterable[SampleResolution]) -> list[SampleResolution]:
+    """The prep_samples a read past deprecated upstreams leaves out (the rules above
+    `NO_RUN_TO_READ`), ascending."""
+    return sorted(
+        (r for r in samples if r.reason is SampleResolutionReason.UPSTREAM_WITHDRAWN),
         key=lambda r: r.prep_sample_idx,
     )
 

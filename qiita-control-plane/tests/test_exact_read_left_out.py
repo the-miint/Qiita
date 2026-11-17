@@ -1,6 +1,7 @@
-"""Which prep_samples the exact read of a deprecated alignment leaves out of the pool
-cohort listing (`definition_resolver.NO_RUN_TO_READ`), over every resolution the
-exact resolver can return."""
+"""Which prep_samples a pool cohort listing that reads past deprecation leaves out
+(the rules at `definition_resolver.NO_RUN_TO_READ`): the exact read of a deprecated
+alignment, over every resolution the exact resolver can return, and the read of an
+active alignment past a deprecated upstream."""
 
 import pytest
 from qiita_common.models import (
@@ -10,7 +11,7 @@ from qiita_common.models import (
     SampleResolutionState,
 )
 
-from qiita_control_plane.definition_resolver import exact_read_left_out
+from qiita_control_plane.definition_resolver import exact_read_left_out, upstream_read_left_out
 
 R = SampleResolutionReason
 INCOMPLETE = SampleResolutionState.INCOMPLETE
@@ -54,3 +55,22 @@ def test_a_processed_prep_sample_is_not_left_out():
         definition_idx=3,
     )
     assert exact_read_left_out([processed]) == []
+
+
+@pytest.mark.parametrize(
+    ("state", "reason", "left_out"),
+    [
+        (NOT_PROCESSED, R.UPSTREAM_WITHDRAWN, True),
+        (INCOMPLETE, R.IN_PROGRESS, False),
+        (INCOMPLETE, R.FAILED, False),
+        (INCOMPLETE, R.UPSTREAM_INCOMPLETE, False),
+        (INCOMPLETE, R.UPSTREAM_MOVED, False),
+        (NOT_PROCESSED, R.WITHDRAWN, False),
+        (NOT_PROCESSED, R.DEPRECATED, False),
+        (NOT_PROCESSED, R.UPSTREAM_DEPRECATED, False),
+        (NOT_PROCESSED, R.UPSTREAM_NO_RUN, False),
+        (NOT_PROCESSED, R.NO_RUN, False),
+    ],
+)
+def test_an_upstream_read_leaves_out_only_a_withdrawn_upstream_run(state, reason, left_out):
+    assert bool(upstream_read_left_out([_resolution(state, reason)])) is left_out

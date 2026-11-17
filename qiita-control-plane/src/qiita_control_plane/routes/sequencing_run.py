@@ -98,6 +98,7 @@ from qiita_common.models import (
     PoolReadMetrics,
     PoolWorkTicketSummary,
     SampleQCReport,
+    SampleResolution,
     SampleResolutionState,
     SequencedPoolCreateRequest,
     SequencedPoolCreateResponse,
@@ -143,7 +144,12 @@ from ..auth.guards import (
     require_service_with_scope,
 )
 from ..auth.principal import HumanUser, Principal, ServiceAccount
-from ..definition_resolver import exact_read_left_out, resolve_exact
+from ..definition_resolver import (
+    exact_read_left_out,
+    resolve_exact,
+    resolve_group,
+    upstream_read_left_out,
+)
 from ..definition_similarity import deprecated_upstreams
 from ..deps import (
     TxConnFactory,
@@ -845,7 +851,10 @@ async def get_sequenced_pool_alignment_cohort(
     prep_samples that its exact read (`resolve_exact`) resolves `processed`, and
     `left_out` lists the readable prep_samples the exact read leaves out
     (`definition_resolver.NO_RUN_TO_READ` states the rule), with their biosample
-    handles. A build reading that alignment leaves them out and records them.
+    handles. For an active alignment read past a deprecated upstream under
+    `include_deprecated_upstream`, the cohort's prep_samples whose upstream run is
+    withdrawn are left out and listed the same way (the rule is stated at the same
+    site). A build reading that alignment leaves them out and records them.
     """
     prep_sample_idxs = await _readable_pool_prep_samples(
         pool, sequenced_pool_idx=sequenced_pool_idx, caller=caller
@@ -855,8 +864,9 @@ async def get_sequenced_pool_alignment_cohort(
     alignment = await fetch_alignment_definition_by_idx(pool, alignment_idx)
     if alignment is not None and (cohort or include_deprecated):
         exact = alignment_exact_read(alignment, include_deprecated=include_deprecated)
+        admitted: frozenset[DefinitionKind] = frozenset()
         if cohort and not exact:
-            deprecated_upstream_read(
+            admitted = deprecated_upstream_read(
                 kind=DefinitionKind.ALIGNMENT,
                 idx=alignment_idx,
                 upstreams=await deprecated_upstreams(pool, alignment),
@@ -865,6 +875,8 @@ async def get_sequenced_pool_alignment_cohort(
             )
         if exact and prep_sample_idxs:
             cohort, left_out = await _exact_cohort(pool, alignment_idx, prep_sample_idxs)
+        elif admitted:
+            cohort, left_out = await _upstream_read_cohort(pool, alignment_idx, cohort, admitted)
     return PoolAlignmentCohort(
         sequencing_run_idx=sequencing_run_idx,
         sequenced_pool_idx=sequenced_pool_idx,
@@ -872,6 +884,47 @@ async def get_sequenced_pool_alignment_cohort(
         prep_sample_idx=cohort,
         left_out=left_out,
     )
+
+
+async def _upstream_read_cohort(
+    pool: asyncpg.Pool,
+    alignment_idx: int,
+    cohort: list[int],
+    admitted: frozenset[DefinitionKind],
+) -> tuple[list[int], list[PoolAlignmentCohortLeftOut]]:
+    """`cohort` resolved in `alignment_idx`'s group past the `admitted` deprecated
+    upstream kinds: the prep_samples it keeps, and those it leaves out
+    (`definition_resolver.upstream_read_left_out`) with their biosample handles; both
+    ascending."""
+    async with pool.acquire() as conn, conn.transaction(isolation="repeatable_read", readonly=True):
+        resolution = await resolve_group(
+            conn,
+            kind=DefinitionKind.ALIGNMENT,
+            definition_idx=alignment_idx,
+            prep_sample_idxs=cohort,
+            admitted_upstream_kinds=admitted,
+        )
+        left = upstream_read_left_out(resolution.samples.values())
+        return await _with_handles(conn, cohort, left)
+
+
+async def _with_handles(
+    conn: asyncpg.Connection, cohort: list[int], left: list[SampleResolution]
+) -> tuple[list[int], list[PoolAlignmentCohortLeftOut]]:
+    """`cohort` less `left`, and `left` as listing entries with their biosample's
+    accession and `QB<n>` handle."""
+    handles = await fetch_biosample_handles(conn, [r.prep_sample_idx for r in left])
+    gone = {r.prep_sample_idx for r in left}
+    return sorted(ps for ps in cohort if ps not in gone), [
+        PoolAlignmentCohortLeftOut(
+            prep_sample_idx=r.prep_sample_idx,
+            biosample_accession=handles[r.prep_sample_idx][0],
+            biosample_export_entity_id=handles[r.prep_sample_idx][1],
+            state=r.state,
+            reason=r.reason,
+        )
+        for r in left
+    ]
 
 
 async def _exact_cohort(
@@ -891,17 +944,8 @@ async def _exact_cohort(
             ps for ps, r in resolution.samples.items() if r.state is SampleResolutionState.PROCESSED
         ]
         left = exact_read_left_out(resolution.samples.values())
-        handles = await fetch_biosample_handles(conn, [r.prep_sample_idx for r in left])
-    return sorted(processed), [
-        PoolAlignmentCohortLeftOut(
-            prep_sample_idx=r.prep_sample_idx,
-            biosample_accession=handles[r.prep_sample_idx][0],
-            biosample_export_entity_id=handles[r.prep_sample_idx][1],
-            state=r.state,
-            reason=r.reason,
-        )
-        for r in left
-    ]
+        _, entries = await _with_handles(conn, processed, left)
+    return sorted(processed), entries
 
 
 @router.get(PATH_SEQUENCED_POOL_COMPLETION)

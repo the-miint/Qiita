@@ -1578,12 +1578,14 @@ class PoolAlignmentList(BaseModel):
 
 
 class PoolAlignmentCohortLeftOut(BaseModel):
-    """A readable prep_sample that the exact read of a deprecated alignment
-    (`definition_resolver.resolve_exact`) leaves out: every prep_sample that read does
-    not resolve `processed`, except one with no run under the alignment or (de novo)
-    whose assembly produced no contigs (`definition_resolver.NO_RUN_TO_READ`).
-    `biosample_export_entity_id` is the biosample's `QB<n>`, which names it when it
-    has no accession."""
+    """A readable prep_sample that a listing reading past deprecation leaves out. An
+    exact read of a deprecated alignment (`include_deprecated`) leaves out every
+    prep_sample it does not resolve `processed`, except one with no run under the
+    alignment or (de novo) whose assembly produced no contigs; a read of an active
+    alignment past a deprecated upstream (`include_deprecated_upstream`) leaves out a
+    prep_sample whose upstream run is withdrawn. Both rules are stated at
+    `definition_resolver.NO_RUN_TO_READ`. `biosample_export_entity_id` is the
+    biosample's `QB<n>`, which names it when it has no accession."""
 
     prep_sample_idx: Annotated[int, Field(gt=0)]
     biosample_accession: str | None = None
@@ -1610,8 +1612,9 @@ class PoolAlignmentCohort(BaseModel):
     sequenced_pool_idx: Annotated[int, Field(gt=0)]
     alignment_idx: Annotated[int, Field(gt=0)]
     prep_sample_idx: list[Annotated[int, Field(gt=0)]]
-    # For a deprecated alignment listed under `include_deprecated` only: the readable
-    # prep_samples with a run under it that its exact read leaves out of the cohort.
+    # Under `include_deprecated` (a deprecated alignment) or `include_deprecated_upstream`
+    # (an active alignment past a deprecated upstream) only: the readable prep_samples
+    # the read leaves out of the cohort (`PoolAlignmentCohortLeftOut`).
     left_out: list[PoolAlignmentCohortLeftOut] = []
 
 

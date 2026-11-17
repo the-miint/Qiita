@@ -463,6 +463,7 @@ def _patched(
         include_deprecated_upstream=False,
         as_of_event=None,
         upstreams_read=None,
+        exact=False,
     ):
         rec.setdefault("flags", []).append(("doget", alignment_idx, include_deprecated))
         rec.setdefault("doget_as_of", []).append(as_of_event)
@@ -1668,6 +1669,7 @@ def _patched_combined(monkeypatch, *, denovo_map=None, denovo_alignment=None, re
         include_deprecated_upstream=False,
         as_of_event=None,
         upstreams_read=None,
+        exact=False,
     ):
         rec["arm_tickets"].append(alignment_idx)
         rec["columns"] = list(columns)
@@ -2019,6 +2021,7 @@ def _patched_two_pools(
         include_deprecated_upstream=False,
         as_of_event=None,
         upstreams_read=None,
+        exact=False,
     ):
         rec["tickets"][alignment_idx] = list(prep_sample_idx)
         rec["events"].append(("minted", alignment_idx))
@@ -2954,3 +2957,72 @@ def test_a_deprecated_denovo_alignment_records_its_failed_and_running_runs(
     ]
     assert "SAMEA2: failed (failed)" in capsys.readouterr().err
     assert "idx" not in json.dumps(denovo["left_out"])
+
+
+def test_an_upstream_read_default_cohort_records_what_the_listing_left_out(
+    monkeypatch, tmp_path, capsys
+):
+    """Under --include-deprecated-upstream the cohort route leaves out a prep_sample
+    whose mask run is withdrawn; the build succeeds over the rest and records it in
+    `table.left_out` by its biosample handles, with no `_idx`."""
+    _patched(monkeypatch)
+    monkeypatch.setattr(
+        ftc,
+        "_fetch_alignment_cohort",
+        lambda *a, **k: {
+            "prep_sample_idx": [1, 2],
+            "left_out": [
+                {
+                    "prep_sample_idx": 5,
+                    "biosample_accession": "SAMEA5",
+                    "biosample_export_entity_id": "QB5",
+                    "state": "not_processed",
+                    "reason": "upstream_withdrawn",
+                }
+            ],
+        },
+    )
+    args = _namespace(tmp_path, include_deprecated_upstream=True)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    table = _manifest(tmp_path)["table"]
+    assert table["left_out"] == [
+        {
+            "export_id": None,
+            "biosample_accession": "SAMEA5",
+            "biosample_export_entity_id": "QB5",
+            "state": "not_processed",
+            "reason": "upstream_withdrawn",
+        }
+    ]
+    assert "idx" not in json.dumps(table["left_out"])
+    assert "SAMEA5: not_processed (upstream_withdrawn)" in capsys.readouterr().err
+
+
+def test_an_exact_read_names_its_deprecated_upstream_as_read_under_include_deprecated(
+    monkeypatch, capsys
+):
+    """A deprecated alignment read alone reports the deprecated mask under it in the
+    same shape, and the stderr line names --include-deprecated, the flag it was read
+    under."""
+
+    def _call(method, base_url, token, path, json=None, **kwargs):
+        return {"ticket": "dGlja2V0", "deprecated_upstreams": [_UPSTREAM]}
+
+    monkeypatch.setattr(ftc._common, "call", _call)
+    seen: dict[int, list] = {}
+    ftc._create_alignment_doget_ticket(
+        "http://cp",
+        "tok",
+        alignment_idx=3,
+        prep_sample_idx=[1],
+        columns=("prep_sample_idx",),
+        include_deprecated=True,
+        upstreams_read=seen,
+        exact=True,
+    )
+    assert seen == {3: [_UPSTREAM]}
+    err = capsys.readouterr().err
+    assert "alignment 3 reads mask 6, which is deprecated" in err
+    assert err.rstrip().endswith(f"read under {INCLUDE_DEPRECATED_FLAG}")
+    assert INCLUDE_DEPRECATED_UPSTREAM_FLAG not in err

@@ -904,12 +904,19 @@ def print_deprecated_read(kind: str, idx: int, reason: str | None) -> None:
     )
 
 
-def print_deprecated_upstream_read(kind: str, idx: int, upstream: dict) -> None:
-    """The stderr line for a read of an active definition past a deprecated upstream
-    (a `DeprecatedUpstream` body), naming the flags that admit its kind
-    (`flags_admitting_deprecated_upstream`)."""
-    flags = " or ".join(
-        flags_admitting_deprecated_upstream(DefinitionKind(upstream["definition_kind"]))
+def print_deprecated_upstream_read(
+    kind: str, idx: int, upstream: dict, *, exact: bool = False
+) -> None:
+    """The stderr line for a read past a deprecated upstream (a `DeprecatedUpstream`
+    body): of an active definition, naming the flags that admit its kind
+    (`flags_admitting_deprecated_upstream`); or, `exact`, of a deprecated definition
+    read alone under `INCLUDE_DEPRECATED_FLAG`, which reads its upstreams as they are."""
+    flags = (
+        INCLUDE_DEPRECATED_FLAG
+        if exact
+        else " or ".join(
+            flags_admitting_deprecated_upstream(DefinitionKind(upstream["definition_kind"]))
+        )
     )
     print(
         f"warning: {kind} {idx} reads {upstream['definition_kind']}"

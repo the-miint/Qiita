@@ -802,3 +802,96 @@ async def test_a_deprecated_alignments_listing_leaves_out_a_withdrawn_mask_run(
         json={"prep_sample_idx": [seed["ps_a"]], "columns": _COLUMNS, "include_deprecated": True},
     )
     assert named.status_code == 409, named.text
+
+
+async def test_an_exact_read_reports_the_deprecated_mask_it_reads(ctx, pool_alignment_seed):
+    """A deprecated alignment read alone under include_deprecated, on a deprecated
+    mask: admitted without include_deprecated_upstream, and the ticket names the mask
+    in `deprecated_upstreams`, as a read past it does."""
+    seed = pool_alignment_seed
+    await _deprecate_mask(ctx, seed)
+    await _deprecate_alignment(ctx, seed["align_1"])
+    resp = await ctx["user"].post(
+        _mint_url(seed["align_1"]),
+        json={"prep_sample_idx": [seed["ps_a"]], "columns": _COLUMNS, "include_deprecated": True},
+    )
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["deprecated_upstreams"] == [
+        (await _deprecated_mask(ctx, seed["mask_idx"])).model_dump(mode="json")
+    ]
+
+
+async def test_an_upstream_read_listing_leaves_out_a_withdrawn_mask_run(ctx, pool_alignment_seed):
+    """Under include_deprecated_upstream the listing reads the active alignment past its
+    deprecated mask: a prep_sample whose mask run is withdrawn is not in the cohort and
+    is listed in `left_out`; the DoGet naming it is still refused."""
+    seed = pool_alignment_seed
+    url = URL_SEQUENCED_POOL_ALIGNMENT_COHORT.format(
+        sequencing_run_idx=seed["run_idx"],
+        sequenced_pool_idx=seed["pool_idx"],
+        alignment_idx=seed["align_1"],
+    )
+    await _deprecate_mask(ctx, seed)
+    await ctx["pool"].execute(
+        "UPDATE qiita.mask_sample SET state = 'invalidated', invalidated_at = now(),"
+        " invalidated_by_idx = $3, invalidation_reason = 'withdrawn by a test'"
+        " WHERE mask_idx = $1 AND prep_sample_idx = $2",
+        seed["mask_idx"],
+        seed["ps_a"],
+        seed["owner_idx"],
+    )
+    accession, entity = await ctx["pool"].fetchrow(
+        "SELECT bs.biosample_accession, ee.export_entity_id FROM qiita.prep_sample ps"
+        "  JOIN qiita.biosample bs ON bs.idx = ps.biosample_idx"
+        "  JOIN qiita.exported_entity ee ON ee.biosample_idx = bs.idx WHERE ps.idx = $1",
+        seed["ps_a"],
+    )
+    resp = await ctx["user"].get(url, params={"include_deprecated_upstream": True})
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert seed["ps_a"] not in body["prep_sample_idx"]
+    assert body["left_out"] == [
+        {
+            "prep_sample_idx": seed["ps_a"],
+            "biosample_accession": accession,
+            "biosample_export_entity_id": entity,
+            "state": "not_processed",
+            "reason": "upstream_withdrawn",
+        }
+    ]
+    named = await ctx["user"].post(
+        _mint_url(seed["align_1"]),
+        json={
+            "prep_sample_idx": [seed["ps_a"]],
+            "columns": _COLUMNS,
+            "include_deprecated_upstream": True,
+        },
+    )
+    assert named.status_code == 409, named.text
+
+
+async def test_the_upstream_flag_leaves_nothing_out_without_a_deprecated_upstream(
+    ctx, pool_alignment_seed
+):
+    """With no deprecated upstream the flag reads the group as without it: a withdrawn
+    mask run stays in the listing (the build's resolution decides it) and nothing is
+    listed in `left_out`."""
+    seed = pool_alignment_seed
+    url = URL_SEQUENCED_POOL_ALIGNMENT_COHORT.format(
+        sequencing_run_idx=seed["run_idx"],
+        sequenced_pool_idx=seed["pool_idx"],
+        alignment_idx=seed["align_1"],
+    )
+    await ctx["pool"].execute(
+        "UPDATE qiita.mask_sample SET state = 'invalidated', invalidated_at = now(),"
+        " invalidated_by_idx = $3, invalidation_reason = 'withdrawn by a test'"
+        " WHERE mask_idx = $1 AND prep_sample_idx = $2",
+        seed["mask_idx"],
+        seed["ps_a"],
+        seed["owner_idx"],
+    )
+    plain = await ctx["user"].get(url)
+    flagged = await ctx["user"].get(url, params={"include_deprecated_upstream": True})
+    assert (plain.status_code, flagged.status_code) == (200, 200)
+    assert flagged.json() == plain.json()
+    assert flagged.json()["left_out"] == []

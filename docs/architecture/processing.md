@@ -369,7 +369,11 @@ detaches its pairs, and is refused while a `similar` pair names it (the trigger
   to each. An active alignment whose upstream (its mask, or a de novo alignment's
   assembly run) is deprecated is read only under `include_deprecated_upstream`
   (`deprecated_upstream_read`, at the same step): the group is resolved without the
-  upstream deprecation checks (the resolver's "Deprecated upstreams" paragraph).
+  upstream deprecation checks (the resolver's "Deprecated upstreams" paragraph). The
+  cohort DoGet names the deprecated upstreams read, an exact read's included. Under
+  either flag the pool alignment cohort listing leaves out and reports the
+  prep_samples the read cannot use; the rules are stated at
+  `definition_resolver.NO_RUN_TO_READ`.
 - **The group lock** is one Postgres advisory lock over every kind's groups
   (`repositories/definition_pair.py`). A decide or revoke takes it exclusive, by
   try-lock with a bounded retry and a 503 when it stays busy; the three deprecation

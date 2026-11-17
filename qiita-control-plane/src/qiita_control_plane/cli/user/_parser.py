@@ -1374,7 +1374,9 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "Read an active alignment (reference or de novo) whose mask, or whose"
             " assembly run, is deprecated (refused without this flag). The manifest names"
-            " each deprecated upstream read, by params_hash and reason."
+            " each deprecated upstream read, by params_hash and reason. Over the default"
+            " cohort, a prep_sample whose mask run is withdrawn is left out and recorded in"
+            " the manifest by biosample accession and QB handle; a named one is refused."
         ),
     )
     p_ft_build.add_argument(
