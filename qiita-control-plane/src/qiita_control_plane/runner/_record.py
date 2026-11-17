@@ -1,11 +1,21 @@
 """Minting a definition and recording it on its ticket, in one transaction.
 
-A runner that mints a mask, an alignment or a processing for a ticket holds the
-minted row `FOR SHARE` from the mint through the write of the ticket's column
-(`work_ticket.mask_idx`, `alignment_idx`, `processing_idx`). A settings edit holds
-the row `FOR UPDATE` while it checks for unfinished tickets (`definition_settings`),
-so the edit and the mint-and-record cannot both commit unseen by the other, and a
-ticket is never recorded under settings it did not hash.
+The rule, stated here once: a mask, an alignment or a processing minted for a ticket
+is held `FOR SHARE` from the mint through the write that records it on the ticket
+(`work_ticket.mask_idx`, `alignment_idx`, `processing_idx`), re-minted when a
+settings edit moved it before the hold (`repositories.definition_hold.mint_and_hold`).
+A settings edit holds the row `FOR UPDATE` while it checks for unfinished tickets
+(`definition_settings`), so the edit and the mint-and-record cannot both commit
+unseen by the other, and a ticket is never recorded under settings it did not hash.
+The per-sample read-mask, de novo alignment and processing mints record here
+(`record_minted`); the align-block plan mints and inserts its tickets in one
+transaction the same way (`align_planner`). The block-mask plan is the exception: it
+mints before its plan transaction and, under the hold, refuses the plan when a
+minted mask's settings moved (`block_planner.BlockPlanMaskEdited`) rather than
+re-minting, since a re-mint would re-partition the plan mid-transaction. A mint whose
+row is edited before every hold fails the ticket as bad submission input
+(`fail_exhausted_hold`), as the other pre-loop refusals do; the align planner
+refuses with a 409 instead.
 
 A redrive keeps the ticket's step rows and gate row, keyed on the definition it
 recorded on its first attempt. When the mint now resolves to another row, the
@@ -19,18 +29,11 @@ keeps the edited settings. The recorded value is read without a row lock: the
 dispatch state guard keeps one ticket from running twice at once (`dispatch.py`).
 """
 
-from collections.abc import Awaitable, Callable
-
 import asyncpg
 
 from ..repositories import require_transaction
+from ..repositories.definition_hold import MintHoldExhausted
 from ._upload import _submission_bad_input
-
-# A settings edit that commits between a mint and its hold re-keys the row the mint
-# resolved; the next mint then resolves (or inserts) the row for these params. One
-# retry covers one such edit; a second in the same window raises RuntimeError, which
-# fails the ticket.
-MINT_HOLD_ATTEMPTS = 2
 
 # The ticket columns a runner records a minted definition in, with the noun a
 # refusal names it by. Interpolated into SQL, so the set is closed.
@@ -39,30 +42,6 @@ _RECORDED_COLUMNS = {
     "alignment_idx": "alignment definition",
     "processing_idx": "processing",
 }
-
-
-async def mint_and_hold(
-    conn: asyncpg.Connection,
-    *,
-    mint: Callable[[], Awaitable[asyncpg.Record]],
-    held_params_hash: Callable[[asyncpg.Record], Awaitable[bytes]],
-    params_hash: bytes,
-    what: str,
-) -> asyncpg.Record:
-    """`mint()`, then `held_params_hash(row)`, which holds the minted row `FOR SHARE`
-    for the caller's transaction and returns its `params_hash`; re-mint when that is
-    no longer `params_hash`: a settings edit committed between the mint and the hold.
-    Requires an open transaction: outside one the `FOR SHARE` ends with its
-    statement. `what` names the definition in the error."""
-    require_transaction(conn)
-    for _ in range(MINT_HOLD_ATTEMPTS):
-        row = await mint()
-        if await held_params_hash(row) == params_hash:
-            return row
-    raise RuntimeError(
-        f"{what}: the minted row's settings were edited between the mint and its hold"
-        f" on each of {MINT_HOLD_ATTEMPTS} attempts"
-    )
 
 
 async def record_minted(
@@ -100,3 +79,9 @@ async def record_minted(
         definition_idx,
         work_ticket_idx,
     )
+
+
+def fail_exhausted_hold(exc: MintHoldExhausted) -> Exception:
+    """The ticket failure for a mint whose row was edited before every hold: bad
+    submission input, as every pre-loop refusal is; a redrive mints again."""
+    return _submission_bad_input(str(exc))

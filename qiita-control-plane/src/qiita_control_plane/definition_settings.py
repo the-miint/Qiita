@@ -13,16 +13,12 @@ groups are computed from):
      recorded under settings it did not run with. The definition row is held
      `FOR UPDATE`; a ticket's write of the definition column waits on it (the
      column's FK takes a key-share lock on the row, and the writers also hold it
-     `FOR SHARE`), and the edit then sees the ticket. Every runner and planner that
-     mints a definition for a ticket records it in the mint's transaction, holding
-     the row from the mint on and re-minting when an edit moved it
-     (`runner._record`); the block-mask planner, which mints before its plan
-     transaction, refuses the plan when a minted mask's held hash moved
-     (`BlockPlanMaskEdited`). A later dispatch of a ticket recording a definition
-     edited after the ticket was created fails it when it keeps step rows from an
-     earlier attempt (`runner._workflow`), and a minted definition's resume fails
-     at its mint (`runner._record`), so no run mixes work done under two settings.
-     The
+     `FOR SHARE`), and the edit then sees the ticket. How a mint holds its row
+     through the ticket write, and the block-mask plan's exception, are stated in
+     `runner._record`. A later dispatch of a ticket recording a definition edited
+     after the ticket was created fails it when it keeps step rows from an earlier
+     attempt (`runner._workflow`), and a minted definition's resume fails at its mint
+     (`runner._record`), so no run mixes work done under two settings. The
      deprecation lookups (`refuse_deprecating_*_with_live_work`) are not reused:
      they skip a deprecated definition, and a deprecated one's settings are locked too;
   2b. no public handle that is not retired cites it (`published`): an

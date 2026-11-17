@@ -659,7 +659,7 @@ async def fetch_sequenced_pool_completion(
     The uncovered-completed arm requires `mask_idx IS NOT NULL` (`qiita_common
     .actions` says why a maskless masking ticket is not a masking result). It is
     not applied to the other arms, where it would hide a queued re-mask that
-    in_flight should report — `_persist_mask_idx` writes the column only at the
+    in_flight should report — the runner's pre-loop writes the column only at the
     PENDING/QUEUED → PROCESSING transition. That asymmetry only has an effect in
     the UNSCOPED form: when `reference_idx` is set, the ref_mask test drops every
     NULL-mask ticket from every arm, so the scoped form does hide a queued

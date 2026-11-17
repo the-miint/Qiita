@@ -367,7 +367,10 @@ def _patched(
     monkeypatch.setattr(
         ftc,
         "_fetch_alignment_cohort",
-        lambda *a, **k: {"prep_sample_idx": [1, 2] if cohort is None else cohort},
+        lambda *a, **k: (
+            rec.setdefault("listing_as_of", []).append(k.get("as_of_event"))
+            or {"prep_sample_idx": [1, 2] if cohort is None else cohort}
+        ),
     )
     monkeypatch.setattr(
         ftc,
@@ -1999,6 +2002,7 @@ def _patched_two_pools(
         alignment_idx,
         include_deprecated=False,
         include_deprecated_upstream=False,
+        as_of_event=None,
     ):
         pool = (sequencing_run_idx, sequenced_pool_idx)
         rec["cohort_reads"].append((pool, alignment_idx))
@@ -2254,6 +2258,7 @@ def test_as_of_event_reaches_every_resolve_and_doget_and_the_manifest(monkeypatc
     args.as_of_event = token
     assert ftc._handle_feature_table_build(args, parser=None) == 0
     assert set(rec["resolve_as_of"]) == {token}
+    assert set(rec["listing_as_of"]) == {token}
     assert set(rec["doget_as_of"]) == {DECISIONS["decision_set"]}
     assert _manifest(tmp_path)["decisions"] == {**DECISIONS, "as_of": True}
 
@@ -2741,6 +2746,7 @@ def test_a_deprecated_denovo_alignment_is_read_alone_with_the_flag(monkeypatch, 
         alignment_idx,
         include_deprecated=False,
         include_deprecated_upstream=False,
+        as_of_event=None,
     ):
         flags.append((alignment_idx, include_deprecated))
         return {

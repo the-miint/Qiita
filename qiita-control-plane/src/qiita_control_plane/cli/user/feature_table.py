@@ -1582,6 +1582,7 @@ def _resolve_cohort(
             alignment_idx=alignment_idx,
             include_deprecated=args.include_deprecated,
             include_deprecated_upstream=args.include_deprecated_upstream,
+            as_of_event=args.as_of_event,
         )
         left_out.extend(body.get("left_out") or [])
         return body["prep_sample_idx"]

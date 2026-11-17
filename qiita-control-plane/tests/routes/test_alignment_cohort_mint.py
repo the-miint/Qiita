@@ -28,6 +28,7 @@ import struct
 import pytest
 from qiita_common.api_paths import (
     URL_ALIGNMENT_COHORT_DOGET,
+    URL_DEFINITION_GROUP_RESOLVE,
     URL_EXPORTED_IDENTIFIER,
     URL_EXPORTED_PROCESSING,
     URL_SEQUENCED_POOL_ALIGNMENT_COHORT,
@@ -859,6 +860,28 @@ async def test_an_upstream_read_listing_leaves_out_a_withdrawn_mask_run(ctx, poo
             "reason": "upstream_withdrawn",
         }
     ]
+    # The read resolves each upstream in its group, so it takes the decision set: the
+    # current one gives the same listing, and an unknown one is 422.
+    current = await ctx["user"].post(
+        URL_DEFINITION_GROUP_RESOLVE,
+        json={
+            "definition_kind": "alignment",
+            "definition_idx": seed["align_1"],
+            "prep_sample_idx": [seed["ps_a"]],
+            "include_deprecated_upstream": True,
+        },
+    )
+    assert current.status_code == 200, current.text
+    token = current.json()["decisions"]["decision_set"]
+    pinned = await ctx["user"].get(
+        url, params={"include_deprecated_upstream": True, "as_of_event": token}
+    )
+    assert pinned.status_code == 200, pinned.text
+    assert pinned.json() == body
+    unknown = await ctx["user"].get(
+        url, params={"include_deprecated_upstream": True, "as_of_event": "sha256:" + "0" * 64}
+    )
+    assert unknown.status_code == 422, unknown.text
     named = await ctx["user"].post(
         _mint_url(seed["align_1"]),
         json={

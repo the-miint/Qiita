@@ -458,7 +458,7 @@ async def _ticket_alignment_idx(
     scope on the same thing: the delete clears an identity's rows, the register writes
     under the identity a step's `params:` stamped, and the gate records that the two
     agree. NULL means neither writer ran — the runner's de novo resolver
-    (`_alignment._persist_alignment_idx`) or `align_planner` — or the
+    (`_alignment._resolve_denovo_alignment_idx`) or `align_planner` — or the
     alignment_definition row was removed mid-flight (ON DELETE SET NULL).
     """
     _require_scope(entry, scope_target, ScopeTargetKind.PREP_SAMPLE)
@@ -924,8 +924,8 @@ async def _run_action_primitive(
         # double-count this primitive exists to prevent.
         #
         # The prep_sample writer is the runner's de novo resolver
-        # (`_alignment._persist_alignment_idx`), which writes the column before the
-        # step loop; `align_planner.plan_and_submit_alignments` is the block-scoped
+        # (`_alignment._resolve_denovo_alignment_idx`), which writes the column before
+        # the step loop; `align_planner.plan_and_submit_alignments` is the block-scoped
         # one. So a NULL here means neither ran for this ticket.
         alignment_idx = await _ticket_alignment_idx(
             ctx.pool,

@@ -42,7 +42,9 @@
   masked-read-export` and `qiita mask syndna-read-count`) groups the definitions as
   those decisions did; runs, gates, tickets and deprecation are read as they are now.
   A token that names no decision set is refused (422). A feature-table build sends
-  the decision set its anchor resolved under with every later resolve and DoGet.
+  the decision set its anchor resolved under with every later resolve and DoGet, and
+  `--as-of-event` to the pool cohort listing, whose read past a deprecated upstream
+  resolves each upstream in its group.
 
 ### Changed
 
@@ -164,8 +166,10 @@
   processing, the align-block plan) records the definition in the mint's
   transaction, holding the row from the mint on, so an edit cannot commit between
   them; the block-mask plan, which mints first, is refused (409) when a minted mask
-  was edited before the plan held it. A mask adapter-hash re-key does not count as
-  an edit here.
+  was edited before the plan held it, and an align plan whose alignment was edited
+  before each of its holds is refused (409). A runner mint whose row was edited
+  before each hold fails the ticket as bad submission input. A mask adapter-hash
+  re-key does not count as an edit here.
 - **A hand `DELETE` of a mask, alignment or processing is refused (SQLSTATE 55006)
   while a `similar` pair names it (#874);** revoke the pair first. A `pending` or
   `not_similar` pair is detached by the delete. No route deletes these

@@ -90,7 +90,7 @@ class MaskDefinitionDeprecated(Exception):
 # why it is an anti-join against the gate rather than a replacement for it: gate
 # row wins wherever one exists.
 #
-# A ticket the runner has not picked up yet is NOT covered: `_persist_mask_idx`
+# A ticket the runner has not picked up yet is NOT covered: the runner's pre-loop
 # writes work_ticket.mask_idx inside the run, after the PENDING/QUEUED →
 # PROCESSING transition, so a queued ticket carries a NULL mask and cannot be
 # attributed to any mask here.

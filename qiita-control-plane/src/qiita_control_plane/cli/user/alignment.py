@@ -47,12 +47,14 @@ def _fetch_alignment_cohort(
     alignment_idx: int,
     include_deprecated: bool = False,
     include_deprecated_upstream: bool = False,
+    as_of_event: str | None = None,
 ) -> dict:
     """GET the pool's prep_samples that are BOTH readable by the caller and completed
     for this alignment, sorted so the same pool always produces the same request
     bytes. A deprecated alignment's cohort is listed only with `include_deprecated`,
     and an active alignment's on a deprecated upstream only with
-    `include_deprecated_upstream`.
+    `include_deprecated_upstream`; `as_of_event` is the decision set its read past a
+    deprecated upstream groups under.
 
     The whole body, not just its sample list: printed on its own a bare list says
     nothing about which alignment it belongs to.
@@ -66,6 +68,7 @@ def _fetch_alignment_cohort(
         _common.optional_query_params(
             include_deprecated=include_deprecated,
             include_deprecated_upstream=include_deprecated_upstream,
+            as_of_event=as_of_event,
         )
         or None
     )

@@ -60,6 +60,7 @@ from .repositories.block import (
     create_block,
     set_block_work_ticket,
 )
+from .repositories.definition_hold import MintHoldExhausted, mint_and_hold
 from .repositories.mask_definition import (
     MaskDefinitionDeprecated,
     MaskDefinitionNotFound,
@@ -70,7 +71,6 @@ from .runner import (
     ReferenceIndexNotBuilt,
     _resolve_sharded_align_indexes,
 )
-from .runner._record import mint_and_hold
 
 if TYPE_CHECKING:
     from fastapi import FastAPI
@@ -270,6 +270,13 @@ class AlignDefinitionDeprecated(RuntimeError):
         )
 
 
+class AlignPlanDefinitionEdited(RuntimeError):
+    """The alignment this plan minted had its settings edited before the plan's
+    transaction held it, on every attempt (`repositories.definition_hold`). The plan
+    rolls back; planning again mints the alignment for its own params. The route maps
+    this to 409."""
+
+
 class AlignNoMasksFound(RuntimeError):
     """NOT ONE of the pool's samples is masked under the caller-named `mask_idx`
     (no `mask_sample` gate row at all for any of them), so there is nothing this
@@ -464,8 +471,8 @@ async def plan_and_submit_alignments(
                 return (await lock_active_alignment(conn, row["alignment_idx"]))["params_hash"]
 
             try:
-                # Held from the mint through the ticket inserts below
-                # (`runner._record.mint_and_hold`).
+                # Held from the mint through the ticket inserts below (the rule is
+                # stated in `runner._record`).
                 row = await mint_and_hold(
                     conn,
                     mint=lambda: mint_alignment_definition(
@@ -478,6 +485,8 @@ async def plan_and_submit_alignments(
                 alignment_idx = row["alignment_idx"]
             except AlignmentDefinitionDeprecated as exc:
                 raise AlignDefinitionDeprecated(exc.detail) from exc
+            except MintHoldExhausted as exc:
+                raise AlignPlanDefinitionEdited(str(exc)) from exc
 
             gated = {
                 r["prep_sample_idx"]

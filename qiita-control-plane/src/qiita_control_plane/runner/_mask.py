@@ -15,6 +15,7 @@ from qiita_common.hashing import canonical_params_hash
 
 from ..actions.library import complete_empty_mask_sample
 from ..repositories.block import MaskSampleInvalidated
+from ..repositories.definition_hold import MintHoldExhausted, mint_and_hold
 from ..repositories.mask_definition import (
     ADAPTER_HASH_SCHEME_SEQUENCE_HASH,
     ADAPTER_SET_HASH_KEY,
@@ -27,7 +28,7 @@ from ..repositories.mask_definition import (
 )
 from ..repositories.reference_membership import reference_sequence_set_hash
 from ._base import _log, _workflow_declares_action
-from ._record import mint_and_hold, record_minted
+from ._record import fail_exhausted_hold, record_minted
 from ._reference import QC_ADAPTER_BINDING, _resolve_qc_adapters
 from ._upload import _submission_bad_input
 
@@ -506,6 +507,8 @@ async def _mint_read_mask(
                     column="mask_idx",
                     definition_idx=mask_row["mask_idx"],
                 )
+    except MintHoldExhausted as exc:
+        raise fail_exhausted_hold(exc) from exc
     except MaskDefinitionDeprecated as exc:
         # Same class as the FK case below: the ticket named a config that cannot be
         # minted against, which is bad input rather than a fault to retry. Left

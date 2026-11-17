@@ -86,6 +86,7 @@ from qiita_common.models import (
     AlignPlanResponse,
     BlockMaskPlanRequest,
     BlockMaskPlanResponse,
+    DecisionSetToken,
     DefinitionKind,
     PoolAlignmentCohort,
     PoolAlignmentCohortLeftOut,
@@ -191,6 +192,7 @@ from ._helpers import (
     alignment_exact_read,
     cap_rows,
     deprecated_upstream_read,
+    load_groups_as_of,
     resolve_idxs_by_natural_key,
 )
 
@@ -823,6 +825,13 @@ async def get_sequenced_pool_alignment_cohort(
         default=False,
         description="List the cohort of an active alignment whose upstream is deprecated.",
     ),
+    as_of_event: DecisionSetToken | None = Query(
+        default=None,
+        description=(
+            "Group under this earlier decision set (a `decisions.decision_set`) when"
+            " reading past a deprecated upstream; pair decisions only."
+        ),
+    ),
 ) -> PoolAlignmentCohort:
     """Resolve the cohort to mint an alignment DoGet ticket for: this pool's
     prep_samples that are both readable by the caller and `'completed'` for this
@@ -854,7 +863,9 @@ async def get_sequenced_pool_alignment_cohort(
     handles. For an active alignment read past a deprecated upstream under
     `include_deprecated_upstream`, the cohort's prep_samples whose upstream run is
     withdrawn are left out and listed the same way (the rule is stated at the same
-    site). A build reading that alignment leaves them out and records them.
+    site). A build reading that alignment leaves them out and records them. That
+    read resolves each upstream in its group, so it groups under `as_of_event`'s
+    decision set when given (422 for an unknown one); the exact read forms no group.
     """
     prep_sample_idxs = await _readable_pool_prep_samples(
         pool, sequenced_pool_idx=sequenced_pool_idx, caller=caller
@@ -876,7 +887,9 @@ async def get_sequenced_pool_alignment_cohort(
         if exact and prep_sample_idxs:
             cohort, left_out = await _exact_cohort(pool, alignment_idx, prep_sample_idxs)
         elif admitted:
-            cohort, left_out = await _upstream_read_cohort(pool, alignment_idx, cohort, admitted)
+            cohort, left_out = await _upstream_read_cohort(
+                pool, alignment_idx, cohort, admitted, as_of_event
+            )
     return PoolAlignmentCohort(
         sequencing_run_idx=sequencing_run_idx,
         sequenced_pool_idx=sequenced_pool_idx,
@@ -891,11 +904,12 @@ async def _upstream_read_cohort(
     alignment_idx: int,
     cohort: list[int],
     admitted: frozenset[DefinitionKind],
+    as_of_event: str | None,
 ) -> tuple[list[int], list[PoolAlignmentCohortLeftOut]]:
     """`cohort` resolved in `alignment_idx`'s group past the `admitted` deprecated
-    upstream kinds: the prep_samples it keeps, and those it leaves out
-    (`definition_resolver.upstream_read_left_out`) with their biosample handles; both
-    ascending."""
+    upstream kinds, under `as_of_event`'s decision set when given: the prep_samples it
+    keeps, and those it leaves out (`definition_resolver.upstream_read_left_out`) with
+    their biosample handles; both ascending."""
     async with pool.acquire() as conn, conn.transaction(isolation="repeatable_read", readonly=True):
         resolution = await resolve_group(
             conn,
@@ -903,6 +917,7 @@ async def _upstream_read_cohort(
             definition_idx=alignment_idx,
             prep_sample_idxs=cohort,
             admitted_upstream_kinds=admitted,
+            groups=await load_groups_as_of(conn, as_of_event),
         )
         left = upstream_read_left_out(resolution.samples.values())
         return await _with_handles(conn, cohort, left)
@@ -1366,7 +1381,10 @@ async def submit_align_plan(
         # Reference exists but is not ACTIVE + sharded — the operator must build /
         # shard it (or wait for it to go active) before aligning against it.
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
-    except align_planner.AlignDefinitionDeprecated as exc:
+    except (
+        align_planner.AlignDefinitionDeprecated,
+        align_planner.AlignPlanDefinitionEdited,
+    ) as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     except align_planner.AlignResubmitError as exc:
         # The exception's message carries the way out for each gate state.

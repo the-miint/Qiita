@@ -30,10 +30,11 @@ from ..repositories.assembly import (
     create_assembly_sample_pending,
     upsert_assembly_sample_no_data,
 )
+from ..repositories.definition_hold import MintHoldExhausted, mint_and_hold
 from ..repositories.processing import ProcessingDeprecated, mint_processing
 from ._base import _log, _workflow_declares_action
 from ._mask import MASK_IDX_BINDING
-from ._record import mint_and_hold, record_minted
+from ._record import fail_exhausted_hold, record_minted
 from ._upload import _submission_bad_input
 
 # action_context key naming the step-1 assembler. Its default is single-sourced
@@ -163,6 +164,8 @@ async def _mint_processing_idx(
                     column="processing_idx",
                     definition_idx=row["processing_idx"],
                 )
+    except MintHoldExhausted as exc:
+        raise fail_exhausted_hold(exc) from exc
     except ProcessingDeprecated as exc:
         # The ticket named a run config that cannot be minted against, which is bad
         # input rather than a fault to retry. Left unhandled it reaches
@@ -179,7 +182,7 @@ async def _mint_processing_idx(
 async def _mint_and_hold(
     conn: asyncpg.Connection, *, workflow: str, version: str, params: dict[str, Any]
 ) -> asyncpg.Record:
-    """`mint_processing` under `runner._record.mint_and_hold`: the minted row is held
+    """`mint_processing` under `repositories.definition_hold.mint_and_hold`: the minted row is held
     `FOR SHARE` for the caller's transaction, re-minted when an edit moved it."""
 
     async def held_params_hash(row: asyncpg.Record) -> bytes:

@@ -36,7 +36,6 @@ from ._alignment import (
     ALIGN_MASK_IDX_BINDING,
     ASSEMBLY_PROCESSING_IDX_BINDING,
     _create_alignment_gate_pending,
-    _persist_alignment_idx,
     _require_assembly_subject,
     _require_masked_query,
     _resolve_denovo_alignment_idx,
@@ -756,10 +755,8 @@ async def run_workflow(
                     work_ticket_idx=work_ticket_idx,
                 )
             )
-            # The ticket column, not just the binding: `delete-alignment-sample` and
-            # `finalize-alignment-sample` both read it and refuse on NULL, and a resume
-            # re-attaches to it rather than re-deriving the identity.
-            await _persist_alignment_idx(pool, work_ticket_idx, bound[ALIGNMENT_IDX_BINDING])
+            # `_resolve_denovo_alignment_idx` has recorded the alignment on the
+            # ticket: a mint in its own transaction, a re-attach by re-writing it.
             await _create_alignment_gate_pending(
                 pool,
                 alignment_idx=bound[ALIGNMENT_IDX_BINDING],

@@ -838,7 +838,8 @@ async def test_an_edit_between_a_mask_or_alignment_mint_and_its_hold_re_mints(
     """An edit that commits between the mint and the hold re-keys the row the mint
     resolved; `mint_and_hold` re-mints, so the row recorded has the settings hashed and
     the edited row keeps the edit."""
-    from qiita_control_plane.runner._record import mint_and_hold, record_minted
+    from qiita_control_plane.repositories.definition_hold import mint_and_hold
+    from qiita_control_plane.runner._record import record_minted
 
     column = _MINTED_COLUMN[kind]
     edited = await defs["make"](kind, threshold=3)
@@ -897,7 +898,8 @@ async def test_an_edit_waits_for_a_mask_or_alignment_hold_and_then_refuses_live_
     refuses (`live_work`)."""
     import asyncio
 
-    from qiita_control_plane.runner._record import mint_and_hold, record_minted
+    from qiita_control_plane.repositories.definition_hold import mint_and_hold
+    from qiita_control_plane.runner._record import record_minted
 
     column = _MINTED_COLUMN[kind]
     idx = await defs["make"](kind, threshold=3)

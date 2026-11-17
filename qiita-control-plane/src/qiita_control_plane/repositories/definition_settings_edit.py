@@ -32,3 +32,30 @@ async def fetch_settings_edit_since_ticket(
         DefinitionKind.ALIGNMENT.value,
         DefinitionKind.PROCESSING.value,
     )
+
+
+async def fetch_definition_edit_since_ticket(
+    conn: asyncpg.Pool | asyncpg.Connection,
+    work_ticket_idx: int,
+    *,
+    kind: DefinitionKind,
+    definition_idx: int,
+) -> asyncpg.Record | None:
+    """The earliest admin edit of `kind` `definition_idx` made after the ticket was
+    created, as (definition_kind, definition_ref, occurred_at), or None. Unlike
+    `fetch_settings_edit_since_ticket`, an edit of another definition the ticket
+    records does not mask it."""
+    return await conn.fetchrow(
+        "SELECT e.definition_kind, e.definition_ref, e.occurred_at"
+        "  FROM qiita.work_ticket wt"
+        "  JOIN qiita.definition_settings_edit e"
+        "    ON e.edit_kind = $2 AND e.occurred_at > wt.created_at"
+        "   AND e.definition_kind = $3 AND e.definition_ref = $4"
+        " WHERE wt.work_ticket_idx = $1"
+        " ORDER BY e.occurred_at, e.definition_settings_edit_idx"
+        " LIMIT 1",
+        work_ticket_idx,
+        DefinitionSettingsEditKind.ADMIN_EDIT.value,
+        kind.value,
+        definition_idx,
+    )
