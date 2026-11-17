@@ -103,6 +103,20 @@ data plane. Ad-hoc inspection by hand — a one-off script or analysis included 
 data-access path (see the header of [`scripts/lake-shell.sh`](scripts/lake-shell.sh)). If
 the catalog is not reachable where the work runs, stop rather than fall back to the files.
 
+## Writing DuckDB SQL
+
+DuckDB's join types go beyond the standard ones; before writing a join or a filter
+against another table, read its [FROM and JOIN clauses](https://duckdb.org/docs/stable/sql/query_syntax/from)
+page, which lists them (semi and anti, as-of, positional, lateral).
+
+- **Filter by whether a key exists elsewhere with `SEMI JOIN` / `ANTI JOIN`**, in the
+  query that builds the table, not with `IN (SELECT …)`, `NOT IN (SELECT …)` or a DELETE
+  afterwards. `NOT IN` also returns no rows at all when the subquery yields a NULL;
+  `ANTI JOIN` returns the rows with no match.
+- **An intermediate that only the next statement reads is a CTE**, not a temp table.
+- **A join key on a table the code creates is a column from creation**, not rebuilt in
+  the join predicate by concatenation, a split or a parse.
+
 ## Workflow runtimes
 
 A step in a workflow YAML must declare **exactly one** of `container:` or `module:`. The `module:` form (a native step) runs in the orchestrator's Python environment under SLURM and may only use dependencies that already ship in `qiita-compute-orchestrator`'s `pyproject.toml`; anything heavier (bioinformatics deps, system packages) belongs in a container.

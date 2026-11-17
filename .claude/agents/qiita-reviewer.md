@@ -285,7 +285,7 @@ Safety must not rest on convention or a comment; and a guard must be real, so do
 - **A cast in a projection** [soft]: ask which side is not already that type. A bare literal and a bare `NULL` are the cases where the engine picks the type.
 - **Sort keys match the consumer's lookup key, or the sort is dropped.** Ask what the ordering is for. [soft]
 - **What does this clause change?** [soft] Ask it of a `DISTINCT` on a one-to-one join, a predicate an upstream table already implies, an alias that renames nothing, a secondary sort key. Ask; such a clause is sometimes a distinct gate that needs a comment instead.
-- **Filter by a join, and chain by a CTE.** [soft] Ask whether a `SEMI` / `ANTI JOIN` in the building query replaces an `IN (SELECT …)` / `NOT IN (SELECT …)`, or a DELETE trimming a table the previous statement built. Ask whether a temp table only the next statement reads is a CTE.
+- **Filter by a join, and chain by a CTE** (`CLAUDE.md`, "Writing DuckDB SQL"). [soft] Ask whether a `SEMI` / `ANTI JOIN` in the building query replaces an `IN (SELECT …)` / `NOT IN (SELECT …)`, or a DELETE trimming a table the previous statement built. Ask whether a temp table only the next statement reads is a CTE.
 - **A join key is a column, not an expression.** [soft] A predicate rebuilding a key from parts (concatenation, a split, a parse) on a table the code itself creates: ask whether that table can carry the key from creation.
 - **Compute an expression once** (a CTE) when the same call appears in two projected columns. [soft]
 - **`any_value()`**: what makes the column constant within the group, and does the code say so? [soft]

@@ -44,3 +44,6 @@
 - **`docs/duckdb-miint.md` lists Prodigal among the GPL-boundary tools
   (#888).** It said miint did not route to the boundary's Prodigal; since
   `predict_genes` it does.
+- **`CLAUDE.md` has a "Writing DuckDB SQL" section (#888).** It points at DuckDB's
+  join types, and asks for `SEMI` / `ANTI JOIN` over `IN` / `NOT IN` subqueries, a CTE
+  over a temp table read once, and join keys stored as columns.
