@@ -100,15 +100,21 @@ are optional.
 ## 2. Create the study
 
 ```bash
-STUDY_IDX=$(qiita study create \
+STUDY=$(qiita study create \
     --title "My first study" \
-    --bioproject-accession PRJNA123456 | jq -r .study_idx)
+    --bioproject-accession PRJNA123456)
+STUDY_IDX=$(jq -r .study_idx <<<"$STUDY")
+STUDY_EXPORT_ID=$(jq -r .export_entity_id <<<"$STUDY")
 ```
+
+`qiita study create` prints the new study as JSON. The example keeps its `study_idx`
+and its `export_entity_id`, a value such as `QS12` that Qiita assigns; later commands
+name the study by one or the other.
 
 `--bioproject-accession` is one way a pre-flight can name this study; step 4
 lists them all. No two studies may share an accession.
 
-BioProject accessions can come ONLY from registering with NCBI BioProject. Do not invent
+BioProject accessions can come *only* from registering with NCBI BioProject. Do not invent
 one: an accession is a handle someone reading your published data will try to resolve,
 and a made-up value resolves to nothing. The *identical* string then goes into the
 pre-flight file.
@@ -150,12 +156,12 @@ it, so keep any personally identifying information out of it.
 #### Identifiers and checklist
 
 `biosample_accession`, `ena_sample_accession`, `matrix_tube_id` and
-`metadata_checklist_name` are reserved names. `biosample_accession`,
-`ena_sample_accession` and `matrix_tube_id` are identifiers that a pre-flight row can
-name a biosample by (step 4 lists them), and `metadata_checklist_name` names the ENA
-checklist the biosample follows. They need no field set up first. `biosample_accession`
-comes from registering with NCBI BioSample, so follow the same rule as above for
-`bioproject_accession`: do not invent one.
+`metadata_checklist_name` are reserved names. `biosample_accession` and `matrix_tube_id`
+are identifiers that a pre-flight row can name a biosample by (step 4 lists all of
+those), `ena_sample_accession` holds the biosample's ENA sample accession, and
+`metadata_checklist_name` names the ENA checklist the biosample follows. They need no
+field set up first. `biosample_accession` comes from registering with NCBI BioSample, so
+follow the same rule as above for `bioproject_accession`: do not invent one.
 
 #### Metadata
 
@@ -192,17 +198,20 @@ the display name you give is the name you then use for the field's values.
 Provide a tab-separated file with a header row and one biosample per row:
 
 ```text
-sample_id	biosample_accession	host taxon id	collection depth m
-SAMPLE-1	SAMN0000001	9606	1.5
-SAMPLE-2	SAMN0000002	9606
+sample_id	biosample_accession	collection depth m	host taxon id
+SAMPLE-1	SAMN0000001	1.5	9606
+SAMPLE-2	SAMN0000002		9606
 ```
 
 - One column, under any header you choose (for example `sample_id`), holds the
   owner's name for each biosample. Every row needs one.
-- A column headed with one of the reserved names sets that value.
+- A column headed with one of the reserved names sets that value. If the study has a
+  study field with the same name as a reserved name, that field cannot be set with
+  this command.
 - Every other column is metadata: its header is the field's display name, and each
-  cell is that biosample's value. With `--global-internal-names`, a header may name
-  a global Qiita field by its internal name instead.
+  cell is that biosample's value. With `--global-internal-names`, a header that names
+  a global Qiita field must use that field's internal name; a study field is still
+  named by its display name.
 - A blank cell leaves that value unset for that biosample, as `SAMPLE-2` does with
   its depth; the cell's tab is still there, so every row has one cell per column.
   Spaces around a header or a cell are ignored.
@@ -211,7 +220,7 @@ To import the contents of this file, run
 
 ```bash
 qiita biosample bulk-create \
-    --study-idx "$STUDY_IDX" \
+    --study-export-id "$STUDY_EXPORT_ID" \
     --tsv-file biosamples.tsv \
     --owner-biosample-id-field-name sample_id > created.tsv
 ```
@@ -219,9 +228,9 @@ qiita biosample bulk-create \
 `--owner-biosample-id-field-name` specifies the name of the column holding the
 owner's biosample name.
 
-The example names the study by the `STUDY_IDX` kept in step 2. You can name it by
-its `export_entity_id` instead, which `qiita study create` also prints (a value such
-as `QS12`), by passing `--study-export-id` in place of `--study-idx`.
+The example names the study by the `STUDY_EXPORT_ID` kept in step 2. You can name it
+by the `STUDY_IDX` kept there instead, by passing `--study-idx` in place of
+`--study-export-id`.
 
 The command prints a TSV of the biosamples it created, in the file's row order,
 which `> created.tsv` saves:
@@ -281,8 +290,11 @@ biosample starts out linked only to the study it was created in, so a control th
 names several projects needs a link to each of the others first:
 
 ```bash
-qiita biosample link --study-idx "$OTHER_STUDY_IDX" --biosample-idx "$BIOSAMPLE_IDX"
+qiita biosample link --study-export-id "$OTHER_STUDY_EXPORT_ID" --biosample-idx "$BIOSAMPLE_IDX"
 ```
+
+`OTHER_STUDY_EXPORT_ID` is the other study's `export_entity_id`, kept from its
+`qiita study create` output as in step 2; `--study-idx` takes its `study_idx` instead.
 
 Linking needs `admin` access on that study and ownership of the biosample; a
 `wet_lab_admin` needs neither.

@@ -2,10 +2,10 @@
 
 - **`POST /study/lookup` and `POST /biosample/lookup` resolve by any natural key, including
   `export_entity_id` (#N).** The body names the key (required) and up to 10,000 values; the
-  response is the `resolved` / `missing` shape the older lookups return. Study keys:
+  response is the `resolved` / `missing` shape that the older lookups return. Study keys:
   `export_entity_id`, `bioproject_accession`, `ena_study_accession`. Biosample keys:
   `export_entity_id`, `biosample_accession`, `ena_sample_accession`, `matrix_tube_id` (a
-  malformed tube id is a 422, and a retired biosample is reported `missing`).
+  malformed tube id is a 422). A retired biosample is reported `missing` under every key.
 - **`qiita biosample bulk-create` creates one biosample per row of a TSV file on a study,
   in one all-or-nothing request (#N).** `--tsv-file` names a tab-separated file with a header
   row: the column named by `--owner-biosample-id-field-name` holds each row's owner's

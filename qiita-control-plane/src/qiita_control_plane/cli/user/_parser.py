@@ -82,7 +82,12 @@ from .alignment import _handle_alignment_cohort, _handle_alignment_list
 from .amplicon import _handle_submit_golay_demux
 from .assembly import DEFAULT_EXPORT_KINDS, EXPORT_KINDS, _handle_assembly_export
 from .auth import _handle_login, _handle_profile_set, _handle_whoami
-from .biosample import _handle_biosample_bulk_create, _handle_biosample_create
+from .biosample import (
+    _OWNER_FIELD_NAME_FLAG,
+    _TSV_FILE_FLAG,
+    _handle_biosample_bulk_create,
+    _handle_biosample_create,
+)
 from .ena_import import (
     _handle_ena_import_list,
     _handle_ena_import_status,
@@ -169,7 +174,7 @@ def _add_study_arg(subparser: argparse.ArgumentParser) -> None:
     """Declare the required choice of how the subcommand names its study."""
     study_group = subparser.add_mutually_exclusive_group(required=True)
     study_group.add_argument(
-        "--study-export-id",
+        _common.STUDY_EXPORT_ID_FLAG,
         help="the study's export_entity_id (preferred); resolved to its study_idx",
     )
     study_group.add_argument("--study-idx", type=int)
@@ -549,7 +554,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help="principal_idx of the biosample's owner; defaults to the caller (resolved via whoami)",
     )
     p_biosample_create.add_argument(
-        "--owner-biosample-id-field-name",
+        _OWNER_FIELD_NAME_FLAG,
         required=True,
         help="display_name of the study's local field that carries the owner-biosample-id",
     )
@@ -596,18 +601,18 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     _add_study_arg(p_biosample_bulk_create)
     p_biosample_bulk_create.add_argument(
-        "--tsv-file",
+        _TSV_FILE_FLAG,
         type=Path,
         required=True,
         help=(
             "tab-separated file with a header row, one biosample per row; columns named"
             f" {', '.join(BIOSAMPLE_ATTRIBUTE_FIELDS)} set those attributes, the"
-            " column that --owner-biosample-id-field-name names sets the owner_biosample_id,"
+            f" column that {_OWNER_FIELD_NAME_FLAG} names sets the owner_biosample_id,"
             " and every other column is metadata keyed on its header"
         ),
     )
     p_biosample_bulk_create.add_argument(
-        "--owner-biosample-id-field-name",
+        _OWNER_FIELD_NAME_FLAG,
         required=True,
         help=(
             "display_name of the study's local field that carries the owner_biosample_id;"

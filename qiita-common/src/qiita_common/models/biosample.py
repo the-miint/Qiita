@@ -53,8 +53,8 @@ MATRIX_TUBE_ID_PATTERN = (
 MatrixTubeIdText = Annotated[str, Field(pattern=MATRIX_TUBE_ID_PATTERN)]
 _MATRIX_TUBE_ID_LIST_ADAPTER = TypeAdapter(list[MatrixTubeIdText])
 
-# The qiita.biosample columns a caller may set directly, named as
-# BiosampleImportRequest names them; every other sample value is metadata.
+# The request fields that set a biosample attribute directly, named as
+# BiosampleImportRequest names them; every other biosample value is metadata.
 BIOSAMPLE_ATTRIBUTE_FIELDS = (
     "biosample_accession",
     "ena_sample_accession",

@@ -263,15 +263,24 @@ def test_write_tsv_no_rows(tmp_path):
     assert path.read_text() == "first\tsecond\n"
 
 
-@pytest.mark.parametrize("row", [("only", "two"), ("one", "two", "three", "four")])
-def test_write_tsv_row_of_wrong_width(tmp_path, row):
-    """Tests the case where a row does not carry one cell per column: the write
-    refuses it, since cells are positional and the surplus or shortfall would
-    otherwise land under the wrong column or drop one."""
+@pytest.mark.parametrize(
+    "rows",
+    [
+        [("only", "two")],
+        [("one", "two", "three", "four")],
+        [("a", "b", "c"), ("one", "two", "three", "four")],
+    ],
+    ids=["short-row", "long-row", "long-row-after-full-row"],
+)
+def test_write_tsv_row_of_wrong_width(tmp_path, rows):
+    """Tests the case where a row does not carry one cell per column, alone or
+    after a row that does: the write refuses it, since cells are positional and
+    the surplus or shortfall would otherwise land under the wrong column or drop
+    one."""
     path = tmp_path / "table.tsv"
 
     with pytest.raises(ValueError):
-        write_tsv(path, ("first", "second", "third"), [row])
+        write_tsv(path, ("first", "second", "third"), rows)
 
     assert not path.exists()
 

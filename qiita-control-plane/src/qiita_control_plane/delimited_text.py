@@ -71,6 +71,7 @@ def read_tsv(
     """
     _require_file(path, source_name=source_name)
 
+    # `columns` may come from a user's header line; _columns_spec escapes them.
     spec = _columns_spec(columns)
     header_sql = _READ_TSV_SQL.format(header="false", columns=spec) + _READ_HEADER_SUFFIX
     read_sql = _READ_TSV_SQL.format(header="true", columns=spec)
@@ -121,9 +122,10 @@ def _check_header(
 def read_headed_tsv(path: Path, *, source_name: str) -> list[dict[str, str]]:
     """Read the tab-separated table at `path`, whose first line names its
     columns, into one dict per row keyed on those names stripped of outer
-    whitespace. Raises ValueError when the file is empty or not UTF-8 text, or
-    when a name is blank or repeats another once stripped; OSError when the file
-    cannot be opened; otherwise raises as `read_tsv`.
+    whitespace. Raises ValueError when the file is empty, when its header line is
+    not UTF-8 text, or when a name is blank or repeats another once stripped;
+    OSError when the file cannot be opened; otherwise raises as `read_tsv`, whose
+    duckdb.Error covers a later byte that is not UTF-8.
     """
     _require_file(path, source_name=source_name)
 
@@ -173,6 +175,11 @@ def write_tsv(
     Raises ValueError when a row does not carry one cell per column, and
     duckdb.Error when DuckDB cannot write the file.
     """
+    # Refuse a row of the wrong width, which zip would otherwise truncate.
+    for row in rows:
+        if len(row) != len(columns):
+            raise ValueError(f"row {list(row)} holds {len(row)} cells for {len(columns)} columns")
+
     # Arrow rather than an INSERT per row, which crosses into DuckDB once per row.
     cells_by_column = list(zip(*rows)) if rows else [()] * len(columns)
     arrays = {

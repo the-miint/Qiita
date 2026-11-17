@@ -1,4 +1,4 @@
-"""qiita user CLI — the handlers of the biosample subcommands."""
+"""qiita user CLI — biosample subcommand handlers with biosample-specific logic."""
 
 import argparse
 import sys
@@ -23,6 +23,7 @@ from ._helpers import _build_body
 
 # The flag the TSV file arrives under, which every error about the file names.
 _TSV_FILE_FLAG = "--tsv-file"
+_OWNER_FIELD_NAME_FLAG = "--owner-biosample-id-field-name"
 # Where DuckDB's read error turns to advice for whoever wrote the reading code.
 _DUCKDB_ADVICE_MARKER = "Possible fixes"
 # The fields of each created biosample that the output TSV carries, after the
@@ -83,7 +84,7 @@ def _read_biosample_tsv(
     if owner_column not in tsv_rows[0]:
         parser.error(
             f"{_TSV_FILE_FLAG} {tsv_file} has no {owner_column!r} column, which"
-            " --owner-biosample-id-field-name names"
+            f" {_OWNER_FIELD_NAME_FLAG} names"
         )
     return tsv_rows
 
@@ -108,6 +109,8 @@ def _bulk_create_rows(
         for name, cell in filled_cells.items():
             if name == owner_column:
                 request_row["owner_biosample_id_value"] = cell
+            # A reserved name sets the attribute, so a study field of the same
+            # name can never be filled from a TSV file.
             elif name in BIOSAMPLE_ATTRIBUTE_FIELDS:
                 request_row[name] = cell
             else:
@@ -154,7 +157,7 @@ def _handle_biosample_bulk_create(args: argparse.Namespace, parser: argparse.Arg
         return output_rows
 
     def _render(output_rows: list[tuple[str, ...]]) -> None:
-        # DuckDB writes to the stream underneath Python's, so Python's must go out first.
+        # DuckDB opens /dev/stdout itself, bypassing Python's buffer, so flush sys.stdout first.
         sys.stdout.flush()
         write_tsv(_STANDARD_OUTPUT, (owner_column, *_BULK_CREATE_OUTPUT_FIELDS), output_rows)
 

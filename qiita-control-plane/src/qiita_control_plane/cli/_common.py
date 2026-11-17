@@ -1,6 +1,6 @@
 """Package-private CLI helpers: argument declaration and validation, PAT
 file I/O, authenticated HTTP calls and the runner that wraps a subcommand
-around them, resolution of user-supplied names to the idx values routes take,
+around them, resolution of user-supplied names to the idx values that routes take,
 and the browser login flow.
 
 Subcommand-dispatch contract (followed by both qiita-admin and qiita;
@@ -107,6 +107,8 @@ BULK_READ_FLOOR_BYTES_PER_SECOND = 100_000
 # Grace period before the rate floor above is applied at all. A small body can
 # arrive entirely within one slow round trip, whose average rate says nothing.
 BULK_READ_TRANSFER_SLACK_SECONDS = 10
+
+STUDY_EXPORT_ID_FLAG = "--study-export-id"
 
 # HTML rendered to the browser at the loopback after the handoff redirect
 # delivers the ot_code. Friendly "you can close this tab now" message. The
@@ -561,15 +563,15 @@ def resolve_study_idx(
     base_url: str,
     token: str,
 ) -> None:
-    """If `args.study_export_id` is set, fill `args.study_idx` with the study it
-    names, resolved through POST /study/lookup. A namespace without that
+    """If `args.study_export_id` is set, fill `args.study_idx` with the study that
+    it names, resolved through POST /study/lookup. A namespace without that
     attribute is left as it is. A blank export id, or one that names no study,
     exits through `parser.error`.
     """
     if getattr(args, "study_export_id", None) is None:
         return
     if not args.study_export_id.strip():
-        parser.error("--study-export-id: must not be blank")
+        parser.error(f"{STUDY_EXPORT_ID_FLAG}: must not be blank")
     # The request strips the id, so the response is keyed on the stripped form.
     lookup_request = StudyLookupRequest(key="export_entity_id", values=[args.study_export_id])
     export_id = lookup_request.values[0]
@@ -577,7 +579,7 @@ def resolve_study_idx(
         base_url, token, f"{PATH_STUDY_PREFIX}{PATH_STUDY_LOOKUP}", lookup_request
     )
     if export_id not in lookup.resolved:
-        parser.error(f"--study-export-id {export_id}: no study has this export id")
+        parser.error(f"{STUDY_EXPORT_ID_FLAG} {export_id}: no study has this export id")
     args.study_idx = lookup.resolved[export_id]
 
 

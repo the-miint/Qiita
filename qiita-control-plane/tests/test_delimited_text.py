@@ -7,6 +7,7 @@ import duckdb
 import pytest
 
 from qiita_control_plane.delimited_text import read_headed_tsv
+from qiita_control_plane.miint import duckdb_connect
 
 _SOURCE_NAME = "probe table"
 
@@ -120,9 +121,44 @@ def test_read_headed_tsv_raises_permission_error_for_unreadable_parent(tmp_path)
     ids=["bad-byte-in-header", "bad-byte-in-row"],
 )
 def test_read_headed_tsv_refuses_text_that_is_not_utf8(tmp_path, raw):
-    """Tests the case where the file holds a byte that is not UTF-8, in the
-    header or in a row: the read is refused naming the source."""
+    """Tests the case where the file holds a byte that is not UTF-8 within the
+    first block Python decodes: the read is refused naming the source."""
     path = tmp_path / "table.tsv"
     path.write_bytes(raw)
     with pytest.raises(ValueError, match=f"{_SOURCE_NAME} at .* is not UTF-8 text"):
         read_headed_tsv(path, source_name=_SOURCE_NAME)
+
+
+def test_read_headed_tsv_refuses_bad_byte_past_header_block(tmp_path):
+    """Tests the case where the only byte that is not UTF-8 lies beyond the block
+    Python decodes for the header: DuckDB's read refuses it."""
+    path = tmp_path / "table.tsv"
+    path.write_bytes(b"a\tb\n" + b"x\ty\n" * 5000 + b"z\t\xff\n")
+    with pytest.raises(duckdb.Error, match="not utf-8 encoded"):
+        read_headed_tsv(path, source_name=_SOURCE_NAME)
+
+
+def test_duckdb_read_csv_takes_wider_later_row_as_header(tmp_path):
+    """Tests the case where a later row is wider than the header line and DuckDB
+    detects the header itself: it names the columns from that later row without
+    an error, which is why the header line is read in Python."""
+    path = _write(tmp_path, "a\tb\n1\t2\n3\t4\t5\n")
+    conn = duckdb_connect()
+    try:
+        cursor = conn.execute("SELECT * FROM read_csv(?, delim='\t', header=true)", [str(path)])
+        column_names = [column[0] for column in cursor.description]
+    finally:
+        conn.close()
+    assert column_names == ["3", "4", "5"]
+
+
+def test_duckdb_read_csv_reports_no_file_for_directory(tmp_path):
+    """Tests the case where DuckDB is handed a directory holding a table: it
+    reports only that no file matches, which is why the path is checked first."""
+    (tmp_path / "table.tsv").write_text("a\n1\n", encoding="utf-8")
+    conn = duckdb_connect()
+    try:
+        with pytest.raises(duckdb.IOException, match="No files found that match the pattern"):
+            conn.execute("SELECT * FROM read_csv(?, delim='\t')", [str(tmp_path)])
+    finally:
+        conn.close()
