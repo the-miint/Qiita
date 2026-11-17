@@ -12,7 +12,7 @@ description: >
 scopes:
   - prep_sample:write
 
-# Exports the sample's raw, human-containing reads, so admin-only like read-mask.
+# Exports the prep_sample's raw, human-containing reads, so admin-only like read-mask.
 audience:
   service: false
   human_roles: [wet_lab_admin, system_admin]

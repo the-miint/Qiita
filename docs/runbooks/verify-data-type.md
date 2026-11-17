@@ -1,10 +1,20 @@
 # Verifying a prep_sample's data type
 
-How to load the four rRNA marker references and submit `verify-data-type`, which
+For admins and operators. How to load the four rRNA marker references and submit `verify-data-type`, which
 samples up to 10,000 of a prep_sample's raw reads, classifies them with SortMeRNA and
 writes one `data_type` QC check. The check's `metrics` carry the share of reads per
-class, and its verdict comes from the prep_sample's protocol (thresholds in
+class, and its verdict comes from the prep_sample's protocol (thresholds below, in
 `qiita_compute_orchestrator.jobs.verify_data_type`).
+
+| Protocol | Verdict |
+|---|---|
+| any thresholded protocol, under 1,000 sampled reads | `info`, `insufficient_reads` |
+| `short_read_amplicon`, `long_read_amplicon` | under 0.5 of sampled reads classified: `info`, `no_rrna_marker`; otherwise `fail`, `data_type_mismatch` when the top class holds under 0.90 of the classified reads |
+| `short_read_metagenomics`, `long_read_metagenomics` | `fail`, `data_type_mismatch` at 0.05 or more of sampled reads classified |
+| `short_read_transcriptomics` | `info` |
+
+`no_rrna_marker` is the expected result for amplicons that are not rRNA, such as ITS. A
+read is classified when it aligns to a class's reference with at least 50% query coverage.
 
 ## Reference databases
 
@@ -26,8 +36,8 @@ the per-class files they were built from. The same files are in `v4.3.6`.
 
 The `-idNN` suffix is the clustering identity: the files hold cluster centers only, which
 keeps the data-plane fetch at run time small. The SILVA files derive from SILVA release
-119 (SSURef NR99 and LSURef); the SortMeRNA README does not say which Rfam release the
-5S and 5.8S files come from (TODO-confirm).
+119 (SSURef NR99 and LSURef). The 5S and 5.8S files are pinned by the SortMeRNA commit
+above; its README does not name an Rfam release.
 
 Fetch each file from
 `https://raw.githubusercontent.com/sortmerna/sortmerna/v4.3.7/data/rRNA_databases/<file>`
@@ -60,10 +70,10 @@ qiita --base-url https://<host> ticket submit \
     "marker_23s_28s_reference_idx": <c>, "marker_5s_5_8s_reference_idx": <d>}'
 ```
 
-The runner reads the protocol from the prep_sample; a protocol with no threshold fails
-the ticket. Read the result from `GET /qc-check/{prep_sample_idx}`: the `data_type` row's
+The runner reads the protocol from the prep_sample; a prep_sample with no reads ends
+`no_data` first, and otherwise a protocol with no threshold fails the ticket. Read the result from `GET /qc-check/{prep_sample_idx}`: the `data_type` row's
 `metrics.marker_reference_idx` records which references were used. A re-run replaces the
-row. A sample with fewer than 1,000 reads gets `insufficient_reads`; one with no reads
+row. A prep_sample with fewer than 1,000 reads gets `insufficient_reads`; one with no reads
 ends `no_data` and writes nothing.
 
-The job exports the sample's raw reads, so submitting needs an admin role.
+The job exports the prep_sample's raw reads, so submitting needs an admin role.

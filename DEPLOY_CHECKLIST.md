@@ -72,7 +72,11 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
 
 ### 5. Verify
 
-- `make verify-deploy` lists `verify-data-type` in `qiita.action`. (#N)
+- `verify-data-type` is registered and enabled (expect one row, `1.0.0`, `t`):
+  ```bash
+  psql "$DATABASE_URL" -tAc "SELECT version, enabled FROM qiita.action WHERE action_id = 'verify-data-type'"
+  ```
+  (#N)
 
 ### 6. After the deploy verifies green
 
