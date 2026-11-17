@@ -6,19 +6,17 @@ from __future__ import annotations
 import hashlib
 import json
 from collections import Counter
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Mapping
 from dataclasses import replace
 from pathlib import Path
 
 import asyncpg
-import pyarrow as pa
 from qiita_common.models import (
     TerminologyManifest,
     TerminologyTermObsoletionKind,
 )
 
-from .delimited_text import read_tsv
-from .miint import duckdb_connect
+from .delimited_text import read_tsv, write_tsv
 from .repositories.terminology import (
     ParsedTerm,
     TerminologyImportAnomaly,
@@ -66,15 +64,6 @@ _CLOSURE_SOURCE_NAME = "closure table"
 # a separate contract that merely happens to coincide.
 _TSV_TRUE = "true"
 _TSV_FALSE = "false"
-
-# How a table is written: the name the rows register under, and the statement
-# that copies them out. Pinning the terminator to LF here spares each table
-# remembering it, and binding the destination spares escaping a path that
-# holds a quote.
-_WRITE_RELATION_NAME = "release_table"
-_COPY_TSV_SQL = (
-    f"COPY {_WRITE_RELATION_NAME} TO ? (FORMAT CSV, DELIMITER '\t', HEADER true, NEW_LINE '\n')"
-)
 
 # Mirrors qiita.terminology_term: term_id and replaced_by_term_id
 # VARCHAR(255), label and alternate_label VARCHAR(500).
@@ -331,39 +320,6 @@ def _parse_terms_tsv(path: Path) -> list[ParsedTerm]:
         key_name="term_id",
     )
     return rows
-
-
-def write_tsv(
-    path: Path,
-    columns: tuple[str, ...],
-    rows: Sequence[Sequence[str | None]] = (),
-) -> None:
-    """Write `rows` as the tab-separated table at `path`, headed by `columns`.
-
-    Cells are positional, so every row holds one per column in `columns` order,
-    and a None cell reaches the file empty. Passing no rows writes the header
-    alone.
-
-    Raises ValueError when a row does not carry one cell per column, and
-    duckdb.Error when DuckDB cannot write the file.
-    """
-    # Arrow rather than an INSERT per row, which crosses into DuckDB once per
-    # row and is prohibitively slow at a few million terms.
-    cells_by_column = list(zip(*rows)) if rows else [()] * len(columns)
-    arrays = {
-        column: pa.array(cells, type=pa.string())
-        for column, cells in zip(columns, cells_by_column, strict=True)
-    }
-    relation = pa.table(arrays)
-
-    # None reaches the file empty only while it stays NULL: DuckDB quotes an
-    # empty string, which would read back as a cell holding "".
-    conn = duckdb_connect()
-    try:
-        conn.register(_WRITE_RELATION_NAME, relation)
-        conn.execute(_COPY_TSV_SQL, [str(path)])
-    finally:
-        conn.close()
 
 
 def write_terms_tsv(path: Path, terms: list[ParsedTerm]) -> None:

@@ -40,6 +40,7 @@ from qiita_common.api_paths import (
     URL_SEQUENCING_RUN_PREFIX,
     URL_SEQUENCING_RUN_SEQUENCED_POOL,
     URL_STUDY_BY_IDX,
+    URL_STUDY_LOOKUP,
     URL_STUDY_PREFIX,
     URL_USER_ME,
     URL_WORK_TICKET_BY_IDX,
@@ -1002,6 +1003,50 @@ def test_biosample_link_posts_without_body(monkeypatch, capsys):
     )
     assert (rc, sent) == (0, [("POST", expected_url, None, None)])
     assert json.loads(capsys.readouterr().out) == link_response
+
+
+def test_biosample_link_by_study_export_id(monkeypatch, capsys):
+    """Tests the case where `biosample link` names its study by --study-export-id:
+    the id is resolved through the study lookup, and the link is posted to that
+    study."""
+    link_response = {
+        "biosample_idx": 9,
+        "study_idx": 7,
+        "created_by_idx": 42,
+        "created_at": "2026-11-10T12:00:00Z",
+    }
+    captured: dict = {}
+    _stub_post(
+        monkeypatch,
+        captured,
+        response_json=link_response,
+        responses_by_url={URL_STUDY_LOOKUP: {"resolved": {"QS7": 7}, "missing": []}},
+    )
+
+    rc = main(
+        [
+            "--base-url",
+            "https://q.example.test",
+            "biosample",
+            "link",
+            "--study-export-id",
+            "QS7",
+            "--biosample-idx",
+            "9",
+        ]
+    )
+
+    sent = [(r["method"], r["url"], r["json"]) for r in captured["requests"]]
+    link_url = URL_BIOSAMPLE_STUDY_LINK.format(study_idx=7, biosample_idx=9)
+    expected_sent = [
+        (
+            "POST",
+            f"https://q.example.test{URL_STUDY_LOOKUP}",
+            {"key": "export_entity_id", "values": ["QS7"]},
+        ),
+        ("POST", f"https://q.example.test{link_url}", None),
+    ]
+    assert (rc, sent, json.loads(capsys.readouterr().out)) == (0, expected_sent, link_response)
 
 
 # ---------------------------------------------------------------------------

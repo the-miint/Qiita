@@ -6,6 +6,16 @@
   `export_entity_id`, `bioproject_accession`, `ena_study_accession`. Biosample keys:
   `export_entity_id`, `biosample_accession`, `ena_sample_accession`, `matrix_tube_id` (a
   malformed tube id is a 422, and a retired biosample is reported `missing`).
+- **`qiita biosample bulk-create` creates one biosample per row of a TSV file on a study,
+  in one all-or-nothing request (#N).** `--tsv-file` names a tab-separated file with a header
+  row: the column named by `--owner-biosample-id-field-name` holds each row's owner's
+  biosample name, columns named `biosample_accession`, `ena_sample_accession`,
+  `matrix_tube_id` or `metadata_checklist_name` set those attributes, and every other column
+  is metadata keyed on its header; a blank cell is left unset. The study is named by
+  `--study-export-id` (preferred) or `--study-idx`. It prints a TSV giving, for each created
+  biosample in the file's row order, the owner's biosample name, `biosample_idx` and
+  `export_entity_id`.
+- **`qiita biosample link` accepts `--study-export-id` in place of `--study-idx` (#N).**
 
 ### Changed
 

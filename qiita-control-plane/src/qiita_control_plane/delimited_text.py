@@ -1,10 +1,12 @@
-"""Reading tab-separated tables: every cell as text, the header checked, and a
-row with the wrong number of cells refused."""
+"""Reading and writing tab-separated tables, every cell as text. A read checks
+the header and refuses a row with the wrong number of cells."""
 
 import csv
 import stat
+from collections.abc import Sequence
 from pathlib import Path
 
+import pyarrow as pa
 from qiita_common.models import names_colliding_on_strip
 
 from .miint import duckdb_connect
@@ -17,6 +19,15 @@ _READ_TSV_SQL = (
     " auto_detect=false, quote='\"', escape='\"')"
 )
 _READ_HEADER_SUFFIX = " LIMIT 1"
+
+# write_tsv hands the rows to DuckDB as a table of this name, then writes that
+# table to the file with this COPY. NEW_LINE fixes the line ending to LF, and the
+# file path is passed as a bound parameter so a path holding a quote needs no
+# escaping.
+_WRITE_RELATION_NAME = "written_rows"
+_COPY_TSV_SQL = (
+    f"COPY {_WRITE_RELATION_NAME} TO ? (FORMAT CSV, DELIMITER '\t', HEADER true, NEW_LINE '\n')"
+)
 
 
 def _require_file(path: Path, *, source_name: str) -> None:
@@ -146,3 +157,35 @@ def read_headed_tsv(path: Path, *, source_name: str) -> list[dict[str, str]]:
     read_rows = read_tsv(path, names, source_name=source_name)
     stripped_rows = [{name.strip(): cell for name, cell in row.items()} for row in read_rows]
     return stripped_rows
+
+
+def write_tsv(
+    path: Path,
+    columns: tuple[str, ...],
+    rows: Sequence[Sequence[str | None]] = (),
+) -> None:
+    """Write `rows` as the tab-separated table at `path`, headed by `columns`.
+
+    Cells are positional, so every row holds one per column in `columns` order,
+    and a None cell reaches the file empty. Passing no rows writes the header
+    alone.
+
+    Raises ValueError when a row does not carry one cell per column, and
+    duckdb.Error when DuckDB cannot write the file.
+    """
+    # Arrow rather than an INSERT per row, which crosses into DuckDB once per row.
+    cells_by_column = list(zip(*rows)) if rows else [()] * len(columns)
+    arrays = {
+        column: pa.array(cells, type=pa.string())
+        for column, cells in zip(columns, cells_by_column, strict=True)
+    }
+    relation = pa.table(arrays)
+
+    # None reaches the file empty only while it stays NULL: DuckDB quotes an
+    # empty string, which would read back as a cell holding "".
+    conn = duckdb_connect()
+    try:
+        conn.register(_WRITE_RELATION_NAME, relation)
+        conn.execute(_COPY_TSV_SQL, [str(path)])
+    finally:
+        conn.close()

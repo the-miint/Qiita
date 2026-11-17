@@ -20,6 +20,7 @@ from qiita_common.models import (
     TerminologyTermObsoletionKind,
 )
 
+from qiita_control_plane.delimited_text import write_tsv
 from qiita_control_plane.repositories.terminology import (
     MAX_REPORTED_OFFENDERS,
     ParsedTerm,
@@ -45,7 +46,6 @@ from qiita_control_plane.terminology import (
     write_closure_tsv_stub,
     write_manifest,
     write_terms_tsv,
-    write_tsv,
 )
 from qiita_control_plane.testing.terminology import parsed_term
 

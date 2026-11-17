@@ -10,8 +10,8 @@ from pathlib import Path
 import pytest_asyncio
 from qiita_common.models import TerminologyTermObsoletionKind
 
+from qiita_control_plane.delimited_text import write_tsv
 from qiita_control_plane.repositories.terminology import ParsedTerm
-from qiita_control_plane.terminology import write_tsv
 from qiita_control_plane.terminology_owl import ExportedClass
 from qiita_control_plane.testing.db_seeds import delete_terminology_cascade
 

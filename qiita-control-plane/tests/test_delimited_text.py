@@ -8,11 +8,11 @@ import pytest
 
 from qiita_control_plane.delimited_text import read_headed_tsv
 
-_SOURCE_NAME = "probe sheet"
+_SOURCE_NAME = "probe table"
 
 
 def _write(tmp_path: Path, text: str) -> Path:
-    path = tmp_path / "sheet.tsv"
+    path = tmp_path / "table.tsv"
     path.write_bytes(text.encode("utf-8"))
     return path
 
@@ -100,8 +100,8 @@ def test_read_headed_tsv_unquotes_quoted_names(tmp_path):
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root reads through any permission bit")
 def test_read_headed_tsv_raises_permission_error_for_unreadable_parent(tmp_path):
-    """Tests the case where the sheet's parent directory cannot be traversed:
-    the read raises the permission error rather than calling the sheet
+    """Tests the case where the file's parent directory cannot be traversed:
+    the read raises the permission error rather than calling the file
     missing."""
     locked_dir = tmp_path / "locked"
     locked_dir.mkdir()
@@ -122,7 +122,7 @@ def test_read_headed_tsv_raises_permission_error_for_unreadable_parent(tmp_path)
 def test_read_headed_tsv_refuses_text_that_is_not_utf8(tmp_path, raw):
     """Tests the case where the file holds a byte that is not UTF-8, in the
     header or in a row: the read is refused naming the source."""
-    path = tmp_path / "sheet.tsv"
+    path = tmp_path / "table.tsv"
     path.write_bytes(raw)
     with pytest.raises(ValueError, match=f"{_SOURCE_NAME} at .* is not UTF-8 text"):
         read_headed_tsv(path, source_name=_SOURCE_NAME)
