@@ -6,7 +6,7 @@ on two definitions of one kind:
 
 | Verdict | Meaning | Joins the group |
 |---|---|---|
-| `pending` | No decision yet; wait. Set on open and on revoke. | no |
+| `pending` | No decision yet: wait for one before reading the two as one. Set on open and on revoke. | no |
 | `same` | The outputs are the same. | yes |
 | `similar` | The outputs are similar. | yes |
 | `different` | The outputs are not equivalent. | no |

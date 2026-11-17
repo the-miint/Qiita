@@ -53,8 +53,7 @@ class OutputEquivalenceVerdict(StrEnum):
 
 # The decided verdicts that put the two definitions in one group. Every rule that joins,
 # and every guard that protects a join, reads this set. Its SQL twin is the function
-# `qiita.output_equivalence_verdict_joins` (migration 20261113000000_output_equivalence),
-# and `tests/routes/test_output_equivalence.py` pins the two to each other.
+# `qiita.output_equivalence_verdict_joins`, true for exactly these verdicts.
 JOINING_VERDICTS: frozenset[OutputEquivalenceVerdict] = frozenset(
     {OutputEquivalenceVerdict.SAME, OutputEquivalenceVerdict.SIMILAR}
 )

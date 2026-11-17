@@ -289,14 +289,14 @@ async def test_nothing_processed_is_refused_with_the_reasons(ctx):
 
 
 @pytest.fixture
-async def similar(ctx):
-    """`similar(a, b)` decides two masks similar (or `verdict`); the output equivalences
+async def decided(ctx):
+    """`decided(a, b)` decides two masks similar (or `verdict`); the output equivalences
     are deleted afterwards."""
     pool = ctx["pool"]
     owner = ctx["admin_session"]["principal_idx"]
     equivalences: list[int] = []
 
-    async def _similar(
+    async def _decided(
         a: int, b: int, verdict: OutputEquivalenceVerdict = OutputEquivalenceVerdict.SIMILAR
     ) -> None:
         async with pool.acquire() as conn, conn.transaction():
@@ -312,17 +312,17 @@ async def similar(ctx):
             )
         equivalences.append(equivalence["output_equivalence_idx"])
 
-    yield _similar
+    yield _decided
     await delete_output_equivalences(pool, equivalences)
 
 
-async def test_each_sample_is_counted_under_the_mask_it_resolves_to(ctx, similar):
+async def test_each_sample_is_counted_under_the_mask_it_resolves_to(ctx, decided):
     """Across a group, a sample masked under both members is read under the newer
     one, whose counts differ from the older one's; a sample masked only under the
     older one is read there. Either member names the group."""
     low = await _seed_syndna_mask(ctx)
     high = await _seed_syndna_mask(ctx)
-    await similar(low, high)
+    await decided(low, high)
     study_idx = await _viewer_study(ctx)
     only_low, _ = await _counted_sample(ctx, mask_idx=low, study_idx=study_idx, counts=(5, 0))
     both, _ = await _counted_sample(ctx, mask_idx=low, study_idx=study_idx, counts=(1, 1))
@@ -362,7 +362,7 @@ async def test_each_sample_is_counted_under_the_mask_it_resolves_to(ctx, similar
 
 @pytest.mark.parametrize("other", ["no_syndna", "other_reference"])
 async def test_masks_with_a_different_syndna_reference_cannot_be_decided_joining(
-    ctx, similar, other
+    ctx, decided, other
 ):
     """Through the repository's decide, against the masks' stored params: neither joining
     verdict is allowed, and both non-joining ones are. The export's own reference guard is
@@ -377,10 +377,10 @@ async def test_masks_with_a_different_syndna_reference_cannot_be_decided_joining
         low = await _seed_syndna_mask(ctx)
         for verdict in sorted(JOINING_VERDICTS):
             with pytest.raises(EquivalenceRefused) as ei:
-                await similar(low, high, verdict)
+                await decided(low, high, verdict)
             assert ei.value.reason is OutputEquivalenceRefusal.SYNDNA_REFERENCE_CHANGE
         for verdict in sorted(NON_JOINING_VERDICTS):
-            await similar(low, high, verdict)
+            await decided(low, high, verdict)
     finally:
         if other_reference is not None:
             await cleanup_reference_graph(

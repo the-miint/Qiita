@@ -31,7 +31,7 @@
 -- migrate:up
 
 -- The verdicts that join the group: the SQL twin of
--- qiita_common.models.JOINING_VERDICTS, pinned to it by test_output_equivalence.py.
+-- qiita_common.models.JOINING_VERDICTS: true for exactly the verdicts in that set.
 -- Every SQL rule that reads a join calls this.
 CREATE FUNCTION qiita.output_equivalence_verdict_joins(p_verdict TEXT) RETURNS BOOLEAN
 LANGUAGE sql IMMUTABLE AS $$
@@ -232,7 +232,7 @@ COMMENT ON FUNCTION qiita.joining_output_equivalences_naming(TEXT, BIGINT) IS
 -- (object_in_use), the message names their idxs. One that does not join (pending, or
 -- decided different or not_benchmarked) still detaches.
 -- joining_output_equivalences_naming is the lookup, shared with the settings lock
--- (20261116000004_definition_settings_lock).
+-- (qiita.lock_definition_settings).
 --
 -- TG_ARGV[0] is the definition kind, TG_ARGV[1] the deleted row's id column.
 CREATE FUNCTION qiita.refuse_definition_delete_under_joining_equivalence()
@@ -301,7 +301,7 @@ CREATE INDEX output_equivalence_event_equivalence
     ON qiita.output_equivalence_event (output_equivalence_idx, output_equivalence_event_idx);
 
 COMMENT ON TABLE qiita.output_equivalence_event IS
-    'History of a output_equivalence: opened, each decision and each revoke, with the '
+    'History of an output equivalence: opened, each decision and each revoke, with the '
     'actor and reason. Append-only: UPDATE and DELETE are refused by triggers, and '
     'the FK to the output equivalence is ON DELETE RESTRICT, so it cannot be deleted '
     'either. A revoke nulls its decision columns; these rows are what keeps who '

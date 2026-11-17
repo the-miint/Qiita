@@ -16,13 +16,14 @@ from qiita_common.api_paths import (
 )
 from qiita_common.hashing import canonical_params_hash
 from qiita_common.models import (
+    JOINING_VERDICTS,
+    NON_JOINING_VERDICTS,
     ComputeTarget,
     DefinitionKind,
     DefinitionSettingsEditKind,
     DefinitionSettingsRefusal,
     FailureType,
     OutputEquivalenceRefusal,
-    OutputEquivalenceVerdict,
     ScopeTargetKind,
     WorkTicketFailureStage,
     WorkTicketState,
@@ -332,10 +333,7 @@ async def test_an_edit_that_changes_nothing_is_refused(clients, defs, postgres_p
 
 @pytest.mark.parametrize(
     "joining, non_joining",
-    [
-        (OutputEquivalenceVerdict.SIMILAR, OutputEquivalenceVerdict.DIFFERENT),
-        (OutputEquivalenceVerdict.SAME, OutputEquivalenceVerdict.NOT_BENCHMARKED),
-    ],
+    list(zip(sorted(JOINING_VERDICTS), sorted(NON_JOINING_VERDICTS), strict=True)),
     ids=str,
 )
 async def test_an_edit_is_refused_while_a_joining_equivalence_names_it_and_recomputes_others(

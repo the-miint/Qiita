@@ -7,6 +7,7 @@ from itertools import count
 
 import pytest
 from qiita_common.models import (
+    NON_JOINING_VERDICTS,
     DefinitionGroupRefusal,
     DefinitionKind,
     OutputEquivalenceVerdict,
@@ -117,7 +118,7 @@ def denovo(idx, mask_idx, processing_idx):
     )
 
 
-def similar(definitions, kind, a, b, verdict=OutputEquivalenceVerdict.SIMILAR):
+def decided(definitions, kind, a, b, verdict=OutputEquivalenceVerdict.SIMILAR):
     """A decided output equivalence of `a` and `b`; `verdict` is `similar` unless given."""
     by_key = {(d.kind, d.idx): d for d in definitions}
     low, high = sorted((a, b))
@@ -150,7 +151,7 @@ def resolve(definitions, equivalences, kind, idx, observations):
 # Masks 5 and 12 decided similar; alignments 50 (on 5) and 120 (on 12) are then one
 # group by derivation.
 DEFS = [mask(5), mask(12), block(50, 5), block(120, 12)]
-EQUIVALENCES = [similar(DEFS, MASK, 5, 12)]
+EQUIVALENCES = [decided(DEFS, MASK, 5, 12)]
 
 
 # ---------------------------------------------------------------------------
@@ -195,7 +196,7 @@ def test_a_definition_outside_any_group_resolves_alone():
 def test_a_same_decision_resolves_exactly_as_a_similar_one(kind, idx, obs):
     """Masks 5 and 12 decided `same` give every resolution, the derived alignment group
     included, that a `similar` decision gives."""
-    same = [similar(DEFS, MASK, 5, 12, OutputEquivalenceVerdict.SAME)]
+    same = [decided(DEFS, MASK, 5, 12, OutputEquivalenceVerdict.SAME)]
     assert resolve(DEFS, same, kind, idx, obs) == resolve(DEFS, EQUIVALENCES, kind, idx, obs)
     assert compute_groups(DEFS, same).group_of(kind, idx) == compute_groups(
         DEFS, EQUIVALENCES
@@ -203,13 +204,9 @@ def test_a_same_decision_resolves_exactly_as_a_similar_one(kind, idx, obs):
     assert len(compute_groups(DEFS, same).group_of(kind, idx)) == 2
 
 
-@pytest.mark.parametrize(
-    "verdict",
-    [OutputEquivalenceVerdict.DIFFERENT, OutputEquivalenceVerdict.NOT_BENCHMARKED],
-    ids=str,
-)
+@pytest.mark.parametrize("verdict", sorted(NON_JOINING_VERDICTS), ids=str)
 def test_a_non_joining_decision_resolves_each_definition_alone(verdict):
-    apart = [similar(DEFS, MASK, 5, 12, verdict)]
+    apart = [decided(DEFS, MASK, 5, 12, verdict)]
     obs = {MASK: {(12, S): done()}}
     assert resolve(DEFS, apart, MASK, 5, obs).reason is R.NO_RUN
     assert compute_groups(DEFS, apart).group_of(ALIGNMENT, 50) == frozenset({50})
@@ -593,7 +590,7 @@ def _remasked_world(p2_gate):
     (31, gate `p2_gate`); 61 has no run for it."""
     defs = [mask(5), mask(12), assembly(30, 5), assembly(31, 12), denovo(60, 5, 30)]
     defs.append(denovo(61, 12, 31))
-    equivalences = [similar(defs, MASK, 5, 12)]
+    equivalences = [decided(defs, MASK, 5, 12)]
     obs = {
         MASK: {(5, S): done(), (12, S): done()},
         PROCESSING: {(30, S): done(), (31, S): gate(p2_gate)},
