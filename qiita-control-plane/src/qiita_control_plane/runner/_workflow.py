@@ -65,7 +65,6 @@ from ._db import (
     _transition_to_processing_for_resume,
 )
 from ._dispatch import (
-    FINAL_ATTEMPT_BINDING,
     _advance_completed_step_status,
     _build_scope_target,
     _ceiling_exhausted_failure,
@@ -1033,6 +1032,19 @@ async def run_workflow(
         raise
 
 
+# A step names this in `params:` to learn that a transient failure of its attempt would exhaust
+# the ticket's retries. The runner sets it on every attempt, so a submitted value is overwritten.
+FINAL_ATTEMPT_BINDING = "final_attempt"
+
+
+def _retries_spent(ctx: RunContext, retry_count: int) -> bool:
+    return retry_count >= ctx.max_retries
+
+
+def _declares_final_attempt(entry: WorkflowStep | WorkflowAction) -> bool:
+    return isinstance(entry, WorkflowStep) and FINAL_ATTEMPT_BINDING in entry.params
+
+
 async def _run_entry_with_retry(
     ctx: RunContext,
     *,
@@ -1122,8 +1134,15 @@ async def _run_entry_with_retry(
     # baseline, so a retry overrides the hint (see _resolve_baseline_for_step).
     plan_hint: StepPlanResponse | None = None
     if isinstance(entry, WorkflowStep):
+        plan_bound = (
+            {**bound, FINAL_ATTEMPT_BINDING: False} if _declares_final_attempt(entry) else bound
+        )
         plan_hint = await _fetch_plan_hint(
-            ctx.backend_client, entry, bound, ctx.scope_target, work_ticket_idx=ctx.work_ticket_idx
+            ctx.backend_client,
+            entry,
+            plan_bound,
+            ctx.scope_target,
+            work_ticket_idx=ctx.work_ticket_idx,
         )
     while True:
         attempt_workspace = step_attempt_dir(ctx.workspace, entry.name, attempt)
@@ -1179,7 +1198,7 @@ async def _run_entry_with_retry(
         # still-PROCESSING ticket and would buy a free submit on every restart.
         if skipped_terminal_attempts:
             current_retry = await _retry_count(ctx.pool, ctx.work_ticket_idx)
-            if current_retry >= ctx.max_retries:
+            if _retries_spent(ctx, current_retry):
                 _log.warning(
                     "work_ticket %d entry %r: %d prior attempt(s) already terminal and "
                     "retry budget spent (%d/%d); not submitting a fresh attempt",
@@ -1194,9 +1213,9 @@ async def _run_entry_with_retry(
                 )
         attempt_workspace.mkdir(parents=True, exist_ok=True)
         attempt_bound = bound
-        if isinstance(entry, WorkflowStep) and FINAL_ATTEMPT_BINDING in entry.params:
-            spent = await _retry_count(ctx.pool, ctx.work_ticket_idx)
-            attempt_bound = {**bound, FINAL_ATTEMPT_BINDING: spent >= ctx.max_retries}
+        if _declares_final_attempt(entry):
+            spent = _retries_spent(ctx, await _retry_count(ctx.pool, ctx.work_ticket_idx))
+            attempt_bound = {**bound, FINAL_ATTEMPT_BINDING: spent}
         try:
             if isinstance(entry, WorkflowStep):
                 return await _dispatch_step(
@@ -1221,7 +1240,7 @@ async def _run_entry_with_retry(
             if not exc.transient:
                 raise
             current_retry = await _retry_count(ctx.pool, ctx.work_ticket_idx)
-            if current_retry >= ctx.max_retries:
+            if _retries_spent(ctx, current_retry):
                 _log.warning(
                     "work_ticket %d step %r exhausted retries (%d/%d); failing",
                     ctx.work_ticket_idx,

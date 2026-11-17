@@ -141,8 +141,10 @@ roster: cancel it by idx (`work_ticket_idxs`) to reap the job, then re-import th
 A re-import does not retry the permanently failed runs of a `completed_partial` pool: they
 keep reporting `download_failed`. It tickets the runs a completed download never read, and
 those that failed `retriable` (the retries ran out): a new ticket for the same pool,
-restricted to them. A run that fails every time but is classed retriable (a gzip that ends
-early because ENA serves no file) is downloaded again on each re-import. A run counts as downloaded once its minting ticket completed, so
+restricted to them; if every run of that ticket fails again it ends FAILED, not
+`completed_partial`. A run that fails every time but is classed retriable (a gzip that ends
+early because ENA serves no file, or a digest that is really wrong at ENA; compare it with the
+run's `fastq_md5` on the ENA Portal) is downloaded again on each re-import. A run counts as downloaded once its minting ticket completed, so
 a failed ticket that had already reserved a run's read numbering does not hide it from a
 re-import; the new ticket stops at that run, naming the failed ticket, which `/run` re-drives.
 If another import's restricted ticket is still live on a pool
@@ -492,8 +494,9 @@ file against ENA's published `fastq_md5` by default (`verify_md5`, duckdb-miint#
 see miint's [`insdc_ena` docs](https://the-miint.github.io/duckdb-miint/insdc_ena/)),
 and a mismatch fails the step. miint cannot tell a transfer truncated on a gzip member
 boundary from bytes that really disagree with the digest, so the step is retried up to
-the ticket's retry limit; when the retries run out the ticket ends FAILED with
-failure_type `permanent` and both digests in the reason. A run that broke mid-download
+the ticket's retry limit. When the retries run out and no run was stored, the ticket ends
+FAILED with failure_type `permanent` and both digests in the reason; with another run
+stored, the run lands as `retriable` and the item reads `completed_partial`. A run that broke mid-download
 (including a corrupt body that surfaces mid-stream) and an HTTP 5xx, 408 or 429 from ENA
 or its file server, a failed connection to the server and an HTTP status 0 (no usable
 status) are retried the same way, as are ENA's "Not all results may have been
@@ -536,8 +539,8 @@ A run that fails in a way a retry cannot clear (a format error, a run with no se
 data, a 404, zero reads) does not fail its pool when another run
 was stored: the other runs load, the ticket completes, and the failed run is recorded with
 its reason and `permanent` failure type (the item reads `completed_partial`). A run that
-keeps failing in a way a retry could clear is recorded the same way, as `retriable`, on the
-ticket's last attempt, and a re-import retries it. The ticket
+failed in a way a retry could clear on every attempt is recorded the same way, as
+`retriable`, after the last one, and a re-import retries it. The ticket
 is COMPLETED, so the submitter gets the work-ticket digest unless they opted out of
 processing emails; the digest row reads `partial: N runs failed` with a pointer to the
 batch status, which lists the failed runs, and the ticket carries no `failure_reason`. If
@@ -551,8 +554,8 @@ When no run was stored and the retries run out, or at once when none of the fail
 a retry could clear (a 404), the ticket is FAILED `permanent` and
 emailed with its reason.
 Read the reason first. A dropped transfer or an ENA outage: redrive the ticket
-(`POST /work-ticket/{idx}/run`) once ENA is healthy; runs already stored are skipped, and
-a redrive resets `retry_count`, so it buys the full budget again. A bad digest or a 404:
+(`POST /work-ticket/{idx}/run`) once ENA is healthy; a redrive resets `retry_count`, so it buys
+the full budget again. A bad digest or a 404:
 compare against the ENA Portal before redriving, since the same bytes fail the same way;
 if the run is gone or its digest is wrong at ENA, re-import once ENA is corrected. A gzip that
 ended early: check whether the run's ENA URL redirects or returns an empty or non-gzip body

@@ -941,7 +941,7 @@ def _hash_and_load_outputs(workspace: Path) -> dict[str, Path]:
 async def _declare_final_attempt(pool, action, *, module: str | None = None) -> None:
     """Point the `hash` step's `params:` at the runner's final-attempt binding, and
     optionally make it a native step so the runner asks the backend for a plan."""
-    from qiita_control_plane.runner._dispatch import FINAL_ATTEMPT_BINDING
+    from qiita_control_plane.runner._workflow import FINAL_ATTEMPT_BINDING
 
     action_id, version = action
     steps = json.loads(
@@ -1048,16 +1048,25 @@ async def test_a_submitted_final_attempt_is_overwritten_by_the_runner(
     assert [i["final_attempt"] for i in backend.inputs["hash"]] == ["False", "False"]
 
 
-async def test_the_plan_request_carries_no_final_attempt(
+async def test_the_plan_request_is_never_final_whatever_the_ticket_submits(
     postgres_pool, pending_work_ticket, library_spy, tmp_path
 ):
-    """The plan is fetched once, before any attempt, so the job's default applies to it."""
+    """The plan is fetched once, before any attempt, so it never sees a submitted value."""
     from qiita_common.backend_failure import FailureKind
 
     work_ticket_idx = pending_work_ticket["work_ticket_idx"]
     workspace = tmp_path / "ws" / str(work_ticket_idx)
     await _declare_final_attempt(
         postgres_pool, pending_work_ticket["action"], module="qiita_compute_orchestrator.jobs.hash"
+    )
+    await _set_ticket(
+        postgres_pool,
+        work_ticket_idx,
+        max_retries=3,
+        action_context={
+            "fasta_path": str(pending_work_ticket["fasta_path"]),
+            "final_attempt": True,
+        },
     )
     planned: list[dict] = []
 
@@ -1075,8 +1084,36 @@ async def test_the_plan_request_carries_no_final_attempt(
 
     await _run(work_ticket_idx, postgres_pool, backend, tmp_path / "ws")
 
-    assert planned and all("final_attempt" not in p for p in planned)
+    assert [p["final_attempt"] for p in planned] == ["False"]
     assert [i["final_attempt"] for i in backend.inputs["hash"]] == ["False", "False"]
+
+
+async def test_a_final_attempt_that_fails_transiently_ends_the_ticket_retries_exhausted(
+    postgres_pool, pending_work_ticket, library_spy, tmp_path
+):
+    """The flag and the retry loop decide on the same count: the attempt bound True is the
+    last one, and its transient failure is not retried."""
+    from qiita_common.backend_failure import BackendFailure, FailureKind
+
+    work_ticket_idx = pending_work_ticket["work_ticket_idx"]
+    await _declare_final_attempt(postgres_pool, pending_work_ticket["action"])
+    backend = _RetryingBackendClient(fail_step="hash", fail_n_times=999, kind=FailureKind.NODE_FAIL)
+
+    with pytest.raises(BackendFailure):
+        await _run(work_ticket_idx, postgres_pool, backend, tmp_path / "ws")
+
+    assert [i["final_attempt"] for i in backend.inputs["hash"]] == [
+        "False",
+        "False",
+        "False",
+        "True",
+    ]
+    row = await postgres_pool.fetchrow(
+        "SELECT state, failure_reason FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+        work_ticket_idx,
+    )
+    assert row["state"] == "failed"
+    assert row["failure_reason"].startswith(f"{FailureKind.RETRIES_EXHAUSTED.value} (3/3)")
 
 
 async def test_retry_uses_isolated_per_attempt_workspace(

@@ -11,9 +11,9 @@ Two-write-target and idempotent/re-runnable semantics are identical too.
 A run whose fetch fails permanently (a 404, a format error, no sequence data, zero
 reads) does not fail the pool when another run was stored: it is listed in the
 `run_outcomes` JSON for `persist-ena-run-outcomes` and the rest land. Any
-transient failure fails the step so the ticket retries, until `final_attempt`, when the
-stored runs land and the transient failures are listed too. Any unrecognised error (OOM,
-local staging), or no run stored, fails the step.
+transient failure fails the step so the ticket retries; on its last attempt
+(`final_attempt`) the stored runs land and the transient failures are listed too. Any
+unrecognised error (OOM, local staging), or no run stored, fails the step.
 
 Gotchas specific to the ENA source:
 - md5 verification is miint's, not this job's: `read_ena_sequences`'s
@@ -21,7 +21,7 @@ Gotchas specific to the ENA source:
   (https://the-miint.github.io/duckdb-miint/insdc_ena/) and a single-run scan
   raises `duckdb.IOException` naming the md5 mismatch, which
   `_classify_ena_fetch_error` classifies retriable (a truncated transfer and a
-  bad digest are indistinguishable; `max_retries` bounds it).
+  bad digest are indistinguishable; `max_retries` bounds it per ticket).
 - One DuckDB connection per run, each its own in-memory database, so
   `apply_duckdb_settings` gives every concurrent run its own per-slot memory limit
   and threads, and each run gets its own DuckDB HTTP retry quota (see
@@ -115,8 +115,8 @@ class Inputs(BaseModel):
     is the scratch root durable per-prep_sample `read.parquet` copies hang under (via
     `compute_reads_staging_path`). `download_method` defaults to 'http', the only
     transport this environment supports. `sequenced_pool_idx` / `sequencing_run_idx`
-    / `work_ticket_idx` are framework-injected scope scalars. `final_attempt` is set by the
-    runner when a transient failure would not be retried."""
+    / `work_ticket_idx` are framework-injected scope scalars. `final_attempt` is True only on
+    the ticket's last attempt."""
 
     ena_run_map: Path
     reads_staging_root: Path
@@ -207,7 +207,8 @@ def _classify_ena_fetch_error(
         )
     # miint raises the same error for a truncated transfer and for bytes that
     # genuinely disagree with ENA's digest
-    # (https://the-miint.github.io/duckdb-miint/insdc_ena/): retry, bounded.
+    # (https://the-miint.github.io/duckdb-miint/insdc_ena/): retry, bounded per ticket. A digest
+    # really wrong at ENA lands `retriable` beside a stored run, re-ticketed on each re-import.
     if "md5" in text:
         return BackendFailure(
             kind=FailureKind.EXTERNAL_FETCH_TRANSIENT,

@@ -6,5 +6,7 @@
   failed ones as `retriable`, where a permanent failure is recorded `permanent`, and the item
   reads `completed_partial`. A pool where no run was stored still fails `retries_exhausted`. A
   re-import tickets the `retriable` runs again, restricted to them; `permanent` ones are still
-  left. A run that fails every time but is classed retriable (a gzip that ends early because ENA
-  serves no file) is downloaded again on each re-import.
+  left. A retry ticket whose runs all fail again ends FAILED (`retries_exhausted`), not
+  `completed_partial`. A run that fails every time but is classed retriable (a gzip that ends
+  early because ENA serves no file, or a digest that is really wrong at ENA; compare it with the
+  run's `fastq_md5` on the ENA Portal) is downloaded again on each re-import.
