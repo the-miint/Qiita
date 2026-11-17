@@ -142,3 +142,24 @@ async def test_persist_fails_fast_without_sequenced_sample(chain):
         await persist_qc_report(
             chain["pool"], chain["prep_sample_idx"], _RAW_REPORT, _FILTERED_REPORT
         )
+
+
+async def test_raw_only_persist_leaves_filtered_report_untouched(chain):
+    """A workflow with no post-filter QC report binds only the raw one; a filtered
+    report already on the row must survive."""
+    ss_idx = await chain["seed_subtype"]()
+    await persist_qc_report(chain["pool"], chain["prep_sample_idx"], _RAW_REPORT, _FILTERED_REPORT)
+    newer_raw = {**_RAW_REPORT, "read_pairs": 7}
+    returned = await persist_qc_report(chain["pool"], chain["prep_sample_idx"], newer_raw)
+    assert returned == ss_idx
+    raw, filtered = await _reports(chain["pool"], ss_idx)
+    assert raw == newer_raw
+    assert filtered == _FILTERED_REPORT
+
+
+async def test_raw_only_persist_on_fresh_row_leaves_filtered_null(chain):
+    ss_idx = await chain["seed_subtype"]()
+    await persist_qc_report(chain["pool"], chain["prep_sample_idx"], _RAW_REPORT)
+    raw, filtered = await _reports(chain["pool"], ss_idx)
+    assert raw == _RAW_REPORT
+    assert filtered is None

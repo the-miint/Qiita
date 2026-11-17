@@ -2442,6 +2442,73 @@ async def test_run_action_primitive_refuses_a_wrongly_scoped_ticket(
     assert str(exc.value) == f"{name} requires a {required}-scoped ticket; got {wrong!r}"
 
 
+@pytest.mark.parametrize(
+    ("inputs", "expect_filtered"),
+    [(["raw_qc_report"], False), (["raw_qc_report", "filtered_qc_report"], True)],
+)
+async def test_run_action_primitive_persist_qc_report_binds_what_the_step_declares(
+    monkeypatch, tmp_path, inputs, expect_filtered
+):
+    """A step declaring only `raw_qc_report` persists the raw report alone, so the
+    filtered column is left as it was; a 1.2.0-shaped step still passes both."""
+    import json as _json
+
+    from qiita_common.actions import WorkflowAction
+    from qiita_common.api_paths import LibraryPrimitive
+
+    from qiita_control_plane.actions import library
+    from qiita_control_plane.runner import _run_action_primitive
+
+    recorded: dict = {}
+
+    async def fake_persist(pool, prep_sample_idx, raw, filtered=None):
+        recorded.update(prep_sample_idx=prep_sample_idx, raw=raw, filtered=filtered)
+        return 1
+
+    monkeypatch.setitem(library.LIBRARY, LibraryPrimitive.PERSIST_QC_REPORT, fake_persist)
+    bound = {}
+    for name in inputs:
+        path = tmp_path / f"{name}.json"
+        path.write_text(_json.dumps({"point": name}))
+        bound[name] = str(path)
+
+    entry = WorkflowAction(kind="action", name="persist-qc-report", inputs=inputs, outputs=[])
+    await _run_action_primitive(
+        run_context(
+            pool=None,
+            scope_target={"kind": "prep_sample", "prep_sample_idx": 5},
+            work_ticket_idx=9,
+        ),
+        entry,
+        bound,
+        tmp_path,
+    )
+    assert recorded["prep_sample_idx"] == 5
+    assert recorded["raw"] == {"point": "raw_qc_report"}
+    assert recorded["filtered"] == ({"point": "filtered_qc_report"} if expect_filtered else None)
+
+
+async def test_run_action_primitive_persist_qc_report_rejects_filtered_alone(tmp_path):
+    from qiita_common.actions import WorkflowAction
+
+    from qiita_control_plane.runner import _run_action_primitive
+
+    entry = WorkflowAction(
+        kind="action", name="persist-qc-report", inputs=["filtered_qc_report"], outputs=[]
+    )
+    with pytest.raises(RuntimeError, match="expects inputs"):
+        await _run_action_primitive(
+            run_context(
+                pool=None,
+                scope_target={"kind": "prep_sample", "prep_sample_idx": 5},
+                work_ticket_idx=9,
+            ),
+            entry,
+            {"filtered_qc_report": str(tmp_path / "f.json")},
+            tmp_path,
+        )
+
+
 async def test_run_action_primitive_persist_qc_checks_dispatches(monkeypatch, tmp_path):
     """The persist-qc-checks arm passes the ticket idx, the scope target's prep_sample_idx
     and the `qc_checks` binding's path."""

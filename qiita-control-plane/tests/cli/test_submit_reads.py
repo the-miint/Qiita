@@ -77,6 +77,7 @@ async def test_single_end_fastq_submits_fastq_to_parquet(cp_transport, fastq_r1)
 
     assert result["action_id"] == "fastq-to-parquet"
     body = _ticket_body(calls)
+    assert body["action_version"] == "1.4.0"
     assert body["action_context"] == {"fastq_upload_idx": 100}
     assert body["scope_target"] == {"kind": "prep_sample", "prep_sample_idx": 7}
 

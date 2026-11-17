@@ -1,0 +1,266 @@
+action_id: fastq-to-parquet
+version: 1.4.0
+target_kind: prep_sample
+# Sequenced-only by definition: FASTQ files are sequencing artifacts.
+target_processing_kinds: [sequenced]
+
+description: >
+  Successor to fastq-to-parquet/1.3.0, identical except that it persists the raw QC
+  report (1.3.0 computed it and never stored it). Mask-model successor to
+  fastq-to-parquet/1.2.0: instead of physically dropping
+  reads at qc/host_filter, it stores the FULL reads once in the DuckLake `read`
+  table and records downstream filtering as a `read_mask` (one row per read:
+  survive/trim/why). A sync is directory-wide and leaves only the HIGHEST version of
+  an action_id enabled: a sync auto-deprecates every other version of an action_id
+  (`actions/sync.py`) and the loader yields them newest-last
+  (`actions/loader.py::_version_sort_key`) — the versions here do not coexist,
+  whichever one you are reading. Nothing already stored changes.
+
+  The `fastq` step parses, counts, mints a contiguous sequence_idx range, and
+  writes read.parquet (with prep_sample_idx) — then a register-files step loads
+  those full reads into the DuckLake `read` table. The reads are stored ONCE per
+  sample, independent of any mask; a new host reference is a new mask over the
+  same `read` rows, never a re-run of fastq.
+
+  QC (`qc`) is the same fastp-equivalent transform (adapter trim → optional polyG
+  → length/quality filter, fastp `-l 100`), but it DROPS NOTHING: it emits a
+  partial mask (per read: reason + per-end trims) keyed by sequence_idx. It is
+  ALWAYS ON. Listing `adapter_parquet` in its inputs signals the runner to
+  materialize the canonical adapter set before the step loop.
+
+  Host filtering (`host_filter`) merges its rype/minimap2 host hits into the QC
+  mask under a privacy precedence (host wins over pass; a QC-failed read keeps its
+  qc_* reason) and emits the final read_mask, which a register-files step loads
+  into the DuckLake `read_mask` table tagged with the CP-minted `mask_idx`. The
+  mask_idx is the filtering-config identity the runner mints before the loop (the
+  host references the host_filter step actually applies, from action_context, plus
+  the resolved QC config), so the same config resolves to one mask_idx fleet-wide
+  and multiple masks coexist over the same reads. host_filter classifies only the
+  QC-pass subset (trimmed as the masked view would serve them); when host
+  filtering is disabled the mask is the QC mask unchanged.
+
+  There is only ONE QC report (qc_report_raw, on the full raw reads), by design.
+  Nothing is physically filtered now — qc/host_filter emit masks over the full
+  `read` rows — so a separate "filtered reads" QC report would describe a file
+  that does not exist. The raw report is the QC report for this workflow, and
+  persist-qc-report stores it alone, leaving filtered_qc_report unset.
+
+  host_filter's host indexes are GATED. When action_context sets
+  `host_filter_enabled: true`, `host_rype_reference_idx` names an ACTIVE reference
+  whose rype (.ryxdi) index is bound (required) and the optional
+  `host_minimap2_reference_idx` names a second ACTIVE reference whose minimap2
+  (.mmi) index is bound — two INDEPENDENT references, one per tool (the runner's
+  _resolve_host_filter_indexes resolves them and 400s otherwise). When disabled
+  (or omitted) host_filter's index inputs stay unbound and it masks no read as
+  host.
+
+  Per-sample scope (target_kind: prep_sample); the route's submit-time check
+  rejects tickets pointing at non-sequenced preps. The orchestrator authenticates
+  sequence-range mint with the compute service-account PAT, so the submitter does
+  not need sequence_range:mint on their own token.
+
+# persist-read-metrics writes the per-stage read counts onto the sample's
+# sequenced_sample (prep_sample subtype) row, so submitters must hold
+# prep_sample:write (in the USER ceiling, so the audience below is unaffected).
+scopes:
+  - prep_sample:write
+
+audience:
+  service: false
+  human_roles: [user, wet_lab_admin, system_admin]
+
+context_schema:
+  type: object
+  properties:
+    # The reads arrive by one of two routes, and the `fastq` step reads both
+    # through the same `fastq_path` binding.
+    #
+    #   *_path       — an absolute host path under PATH_INGEST_ROOTS. Naming
+    #                  one is wet_lab_admin+ — rule and reason in
+    #                  routes/work_ticket.py's _check_ingest_paths.
+    #   *_upload_idx — a DoPut handle. The runner rewrites it to the matching
+    #                  `*_path` binding pointing at the staged upload
+    #                  (runner._resolve_upload_handles), and the step stitches
+    #                  the chunked BLOB back into a FASTQ
+    #                  (jobs._blob_input.resolve_reads_blob_input). This is the
+    #                  route a `user` takes — their reads are on their own
+    #                  machine, which the cluster cannot see.
+    fastq_path:
+      type: string
+      minLength: 1
+      pattern: "^/"
+    reverse_fastq_path:
+      type: string
+      minLength: 1
+      pattern: "^/"
+    fastq_upload_idx: {type: integer, minimum: 1}
+    reverse_fastq_upload_idx: {type: integer, minimum: 1}
+    # Sequencing instrument model (e.g. "NextSeq 550"), forwarded per sample from
+    # qiita.sequencing_run. The qc step gates polyG trimming on a 2-color model
+    # (NextSeq/NovaSeq/MiniSeq); absent/unknown → polyG OFF. Passed to the qc job
+    # via the step's `params:` (instrument_model -> qc.Inputs.instrument_model),
+    # and folded into the mask identity (different polyG behaviour → different mask).
+    instrument_model:
+      type: string
+      minLength: 1
+    # Host-filter gate. `host_filter_enabled` defaults off; when true,
+    # `host_rype_reference_idx` (REQUIRED) names an ACTIVE reference carrying a
+    # rype index, and `host_minimap2_reference_idx` (OPTIONAL) names an ACTIVE
+    # reference carrying a minimap2 index — each from its OWN reference.
+    # NOTE: these are plain reference idxs, NOT `*_upload_idx` — the upload-handle
+    # walker only touches `_upload_idx` keys, so it leaves these alone.
+    host_filter_enabled:
+      type: boolean
+    host_rype_reference_idx:
+      type: integer
+      minimum: 1
+    host_minimap2_reference_idx:
+      type: integer
+      minimum: 1
+  # Exactly one route, and BOTH mates take it. Each branch requires its own
+  # forward key and excludes the other family outright, so neither-present,
+  # both-present, and a crossed pair (`fastq_upload_idx` with
+  # `reverse_fastq_path`, or the mirror) all leave zero branches matching and
+  # `oneOf` fails. A crossed pair would otherwise run: the runner rewrites the
+  # handle and leaves the path alone, and both halves are gated. It is refused
+  # because R1 and R2 of one sample coming from two provenances is a submit
+  # slip, and a mis-paired mate is silent in the output.
+  oneOf:
+    - required: [fastq_path]
+      not:
+        anyOf:
+          - required: [fastq_upload_idx]
+          - required: [reverse_fastq_upload_idx]
+    - required: [fastq_upload_idx]
+      not:
+        anyOf:
+          - required: [fastq_path]
+          - required: [reverse_fastq_path]
+
+steps:
+  - step: fastq
+    step_type: singleton
+    module: qiita_compute_orchestrator.jobs.fastq_to_parquet
+    inputs: [fastq_path]
+    # `reverse_fastq_path` flows through only when the action_context carries it.
+    optional_inputs: [reverse_fastq_path]
+    # `reads` is the read.parquet path qc/host_filter consume; `read_staging_dir`
+    # is the workspace the register-read step loads into the DuckLake `read`
+    # table. `raw_read_count` is retained for back-compat (counts now come from
+    # the mask via persist-read-metrics).
+    outputs: [reads, read_staging_dir, raw_read_count]
+    baseline_resources:
+      cpu: 8
+      mem_gb: 13
+      walltime: PT30M
+
+  # Load the FULL reads into the DuckLake `read` table. read_staging_dir holds
+  # read.parquet, which register-files maps to the `read` table.
+  - action: register-files
+    inputs: [read_staging_dir]
+    outputs: []
+
+  # fastqc-equivalent QC summary on the RAW reads (fastq's output). Reports on the
+  # `reads` binding; the qc step below does NOT re-emit `reads`, so order is not
+  # load-bearing here, but keep it before qc for symmetry with prior versions.
+  # This is the ONLY QC report: nothing is physically filtered (qc/host_filter
+  # emit masks, not new read files), so there is no filtered-reads file to report
+  # on. The absence of a post-filter QC report is intentional, not a regression.
+  - step: qc_report_raw
+    step_type: singleton
+    module: qiita_compute_orchestrator.jobs.qc_report
+    inputs: [reads]
+    outputs: [raw_qc_report]
+    baseline_resources:
+      cpu: 2
+      mem_gb: 8
+      walltime: PT1H
+
+  # Always-on QC on the full reads. Emits a PARTIAL read mask (qc_mask: per read,
+  # reason + per-end trims) — it drops nothing. `adapter_parquet` is materialized
+  # by the runner before the loop (this step lists it). `instrument_model` rides
+  # through `params:` to gate polyG.
+  - step: qc
+    step_type: singleton
+    module: qiita_compute_orchestrator.jobs.qc
+    inputs: [reads, adapter_parquet]
+    params: {instrument_model: instrument_model}
+    outputs: [qc_mask]
+    baseline_resources:
+      cpu: 4
+      mem_gb: 12
+      # First-attempt walltime; a TIMEOUT retry escalates it ×2 toward the
+      # action_ceiling walltime below (the runner's walltime floor escalation).
+      walltime: PT4H
+
+  # Merge host hits into the qc_mask and emit the final read_mask. Consumes the
+  # full `reads` (host classify runs on the trimmed QC-pass subset) and `qc_mask`.
+  # `host_rype_path` / `host_minimap2_path` are bound by the runner ONLY when
+  # host_filter_enabled (optional_inputs). `mask_idx` is threaded via `params:`
+  # — its presence signals the runner to mint the mask before the loop and binds
+  # the value into the step.
+  - step: host_filter
+    step_type: singleton
+    module: qiita_compute_orchestrator.jobs.host_filter
+    inputs: [reads, qc_mask]
+    optional_inputs: [host_rype_path, host_minimap2_path]
+    params: {mask_idx: mask_idx}
+    # `read_mask` is the final mask path; `read_mask_staging_dir` is the workspace
+    # the register-mask step loads into the DuckLake `read_mask` table.
+    outputs: [read_mask, read_mask_staging_dir]
+    baseline_resources:
+      cpu: 4
+      mem_gb: 32
+      walltime: PT4H
+
+  # Persist the three per-stage read counts onto this prep_sample's 1:1
+  # sequenced_sample row, DERIVED from the read_mask (raw / biological /
+  # quality-filtered, both-mates r1r2). In-process control-plane action (direct
+  # DB write, no backend hop) — it reads the read_mask Parquet and counts by
+  # reason. Writing a prep_sample subtype row is why the workflow declares
+  # prep_sample:write in `scopes` above. MUST run before register-files:
+  # register-files MOVES read_mask.parquet out of the staging dir into permanent
+  # DuckLake storage, so this read of the staging path must happen first.
+  - action: persist-read-metrics
+    inputs: [read_mask]
+    outputs: []
+
+  # Store the qc_report_raw sidecar on this prep_sample's sequenced_sample. Binds the
+  # raw report only: the pool QC report route reads it from there.
+  - action: persist-qc-report
+    inputs: [raw_qc_report]
+    outputs: []
+
+  # Load the final mask into the DuckLake `read_mask` table. read_mask_staging_dir
+  # holds read_mask.parquet, which register-files maps to the `read_mask` table.
+  # Moves the parquet out of staging — must run after persist-read-metrics (which
+  # reads the staging path) and before finalize-mask-sample (the completion gate
+  # must not flip until the reads are durable in DuckLake).
+  - action: register-files
+    inputs: [read_mask_staging_dir]
+    outputs: []
+
+  # Terminal: record this sample's masking as completed in the qiita.mask_sample
+  # gate (state='completed' for this ticket's mask_idx + prep_sample). Identical to
+  # read-mask/1.0.0's terminal step — this mask-model ingest path mints a mask_idx
+  # and writes read_mask exactly like read-mask, so it owes the same first-class
+  # completion gate its consumers (masked-read export, long-read-assembly,
+  # alignment) require. No file inputs: mask_idx from the ticket, prep_sample_idx
+  # from the scope target. MUST run last — after register-files makes the reads
+  # durable — so 'completed' never advertises reads that aren't in DuckLake.
+  - action: finalize-mask-sample
+    inputs: []
+    outputs: []
+
+# Ceiling must stay strictly ABOVE every step baseline on the escalating axes
+# (mem_gb, walltime). Why, and what enforces it for every shipped workflow, are
+# stated at test_actions_loader.py's
+# `test_every_shipped_step_can_escalate_on_both_retry_axes`. cpu/gpu never escalate.
+#
+# Sized on host_filter's measured peak against its 32 GB baseline, which
+# jobs/host_filter.py states along with why it is real demand; the margin over it
+# is what the ladder has to absorb. Measured on read-mask/1.0.0, same module.
+action_ceiling:
+  cpu: 8
+  mem_gb: 64
+  walltime: PT8H

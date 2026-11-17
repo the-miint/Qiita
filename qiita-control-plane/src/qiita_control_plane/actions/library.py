@@ -2374,15 +2374,16 @@ async def persist_qc_report(
     pool: asyncpg.Pool,
     prep_sample_idx: int,
     raw_qc_report: dict[str, Any],
-    filtered_qc_report: dict[str, Any],
+    filtered_qc_report: dict[str, Any] | None = None,
 ) -> int:
-    """Persist the two fastqc-equivalent QC reports onto the 1:1 sequenced_sample
+    """Persist the fastqc-equivalent QC reports onto the 1:1 sequenced_sample
     row for `prep_sample_idx` and return its idx.
 
     The reports are the qc_report.json documents the runner read from the
     qc_report_raw / qc_report_filtered step sidecars; they are stored verbatim as
-    JSONB (raw -> raw_qc_report, filtered -> filtered_qc_report). The pool-level
-    merged report aggregates them on read.
+    JSONB (raw -> raw_qc_report, filtered -> filtered_qc_report). A workflow that
+    has no filtered report passes none, and the stored one is left as it was. The
+    pool-level merged report aggregates them on read.
 
     Fail-fast (loud) when no sequenced_sample row exists for the prep_sample —
     same ordering invariant as persist_read_metrics: a sequenced prep_sample
@@ -2393,12 +2394,12 @@ async def persist_qc_report(
     ss_idx = await pool.fetchval(
         "UPDATE qiita.sequenced_sample"
         " SET raw_qc_report = $2::jsonb,"
-        "     filtered_qc_report = $3::jsonb"
+        "     filtered_qc_report = COALESCE($3::jsonb, filtered_qc_report)"
         " WHERE prep_sample_idx = $1"
         " RETURNING idx",
         prep_sample_idx,
         json.dumps(raw_qc_report),
-        json.dumps(filtered_qc_report),
+        None if filtered_qc_report is None else json.dumps(filtered_qc_report),
     )
     if ss_idx is None:
         raise RuntimeError(

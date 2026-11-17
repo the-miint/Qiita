@@ -48,7 +48,7 @@ from . import _common
 # loads reads, and an operator who needs a different one has `qiita ticket
 # submit`. Bumping a workflow's version means bumping it here.
 _FASTQ_ACTION_ID = FASTQ_TO_PARQUET_ACTION_ID
-_FASTQ_ACTION_VERSION = "1.3.0"
+_FASTQ_ACTION_VERSION = "1.4.0"
 _BAM_ACTION_ID = BAM_TO_PARQUET_ACTION_ID
 _BAM_ACTION_VERSION = "1.0.0"
 

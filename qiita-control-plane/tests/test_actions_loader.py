@@ -1581,6 +1581,26 @@ def test_load_actions_fastq_to_parquet_v130_finalizes_gate_last():
     assert names[-2] == "register-files"  # register-files immediately precedes the gate flip
 
 
+def test_load_actions_fastq_to_parquet_v140_persists_raw_qc_report():
+    """1.3.0 computed `raw_qc_report` and never stored it; 1.4.0 persists it, binding
+    only the raw report because the mask model has no filtered one."""
+    from pathlib import Path
+
+    from qiita_control_plane.actions import load_actions
+
+    repo_root = Path(__file__).resolve().parents[2]
+    by_key = {(a.action_id, a.version): a for a in load_actions(repo_root / "workflows")}
+    names = [s.name for s in by_key[("fastq-to-parquet", "1.4.0")].steps]
+    assert names.index("persist-qc-report") > names.index("qc_report_raw")
+    assert names[-2:] == ["register-files", "finalize-mask-sample"]
+    persist = next(
+        s for s in by_key[("fastq-to-parquet", "1.4.0")].steps if s.name == "persist-qc-report"
+    )
+    assert persist.inputs == ["raw_qc_report"]
+    assert persist.outputs == []
+    assert "persist-qc-report" not in [s.name for s in by_key[("fastq-to-parquet", "1.3.0")].steps]
+
+
 def test_load_actions_long_read_assembly_finalizes_gate_after_register_files():
     """`finalize-assembly-sample` (the assembly_sample completion writer) must be the
     LAST entry and run strictly AFTER `register-files`: the gate must not read
