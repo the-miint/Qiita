@@ -50,9 +50,9 @@ async def upsert_qc_checks(
         "INSERT INTO qiita.prep_sample_qc_check"
         ' (prep_sample_idx, "check", severity, reason, measured_value, threshold,'
         "  metrics, mask_idx, alignment_idx, work_ticket_idx)"
-        " SELECT p, c, s, r, m, t, j::jsonb, $8, $9, $10"
+        " SELECT p, c, s, r, m, t, j, $8, $9, $10"
         "   FROM unnest($1::bigint[], $2::text[], $3::text[], $4::text[],"
-        "               $5::float8[], $6::float8[], $7::text[]) AS u(p, c, s, r, m, t, j)"
+        "               $5::float8[], $6::float8[], $7::jsonb[]) AS u(p, c, s, r, m, t, j)"
         ' ON CONFLICT (prep_sample_idx, "check", mask_idx, alignment_idx) DO UPDATE SET'
         "  severity = EXCLUDED.severity, reason = EXCLUDED.reason,"
         "  measured_value = EXCLUDED.measured_value, threshold = EXCLUDED.threshold,"
