@@ -235,10 +235,10 @@ def _handle_ticket_logs(args: argparse.Namespace, parser: argparse.ArgumentParse
 
 # `/run` answers these when it refuses this one ticket (gone or not visible to
 # the caller; not in a redrivable state, or a refusal of its own such as a
-# download ticket's). The run records the refusal and goes on to the next ticket.
-# Any other answer stops the run, so an outage is not met with one call per
-# remaining ticket.
-_PER_TICKET_REFUSALS = (404, 409)
+# download ticket's; the caller or the stored ticket fails the submit gates).
+# The run records the refusal and goes on to the next ticket. Any other answer
+# stops the run, so an outage is not met with one call per remaining ticket.
+_PER_TICKET_REFUSALS = (403, 404, 409, 422)
 
 
 def _redrive(args: argparse.Namespace, token: str) -> tuple[dict, bool]:

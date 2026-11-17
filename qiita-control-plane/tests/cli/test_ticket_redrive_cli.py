@@ -124,6 +124,20 @@ def test_redrive_records_a_refused_ticket_and_goes_on(monkeypatch, capsys):
     assert [r["idx"] for r in report["redriven"]] == [12]
 
 
+@pytest.mark.parametrize("status", [403, 422])
+def test_redrive_goes_on_after_a_gate_refusal_of_one_ticket(monkeypatch, capsys, status):
+    log = _stub(monkeypatch, tickets=[_ticket(11), _ticket(12)], run_status={11: status})
+
+    rc = main(["--base-url", _BASE, "ticket", "redrive", "--execute"])
+
+    assert rc == 1
+    assert len(_posts(log)) == 2
+    report = json.loads(capsys.readouterr().err)
+    assert [r["work_ticket_idx"] for r in report["refused"]] == [11]
+    assert [r["idx"] for r in report["redriven"]] == [12]
+    assert "stopped" not in report
+
+
 def test_redrive_stops_on_an_answer_that_is_not_about_the_ticket(monkeypatch, capsys):
     log = _stub(monkeypatch, tickets=[_ticket(11), _ticket(12), _ticket(13)], run_status={12: 503})
 

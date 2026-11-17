@@ -359,8 +359,8 @@ class ResourceOverride(BaseModel):
     INVARIANT — enforcement is NOT on this model: any route that accepts a
     `resource_override` MUST itself gate it to wet_lab_admin+ (else a regular
     caller could inflate their job's footprint) and clamp it to the action
-    ceiling. Today only `POST /work-ticket` accepts one — see the gate in
-    `routes/work_ticket.py::submit_work_ticket`. A new route accepting it
+    ceiling. Today only `POST /work-ticket` accepts one; the submit and redrive
+    gate lives in `work_ticket_submit`. A new route accepting it
     without that gate is a privilege-escalation bug."""
 
     mem_gb: Annotated[int | None, Field(default=None, gt=0)] = None
