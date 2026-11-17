@@ -107,7 +107,7 @@ _None yet._
 - `.env.compute-orchestrator.example`'s `MIINT_GPL_BOUNDARY_PATH` comment now names the tools behind the boundary (bowtie2, FastTree, Prodigal) and the 0.5.0 minimum; no live env change. (#888)
 - New DuckLake tables `gene_call` / `gene_call_contig`, and a `genome_idx` column on `assembly_membership` and `bin_quality`, created by the data plane at start. long-read-assembly 1.0.2 (edited in place) and the new `assembly-gene-call-recover` 1.0.0 arrive through the deploy's usual `qiita-admin actions sync`; no new image. (#888)
 - The staged miint must have `prodigal_proteins` (duckdb-miint `2b215901` or later); the miint stage step restages when the mirror's build changes, and compute-readiness's `miint-gpl-boundary` probe fails on a build without it. (#888)
-- `POST /work-ticket/{idx}/run` now applies the submit checks to the stored ticket: a caller gets the refusal a submit of that work would get (403/404/422), ahead of the state 409s. Scripts that re-run other users' tickets need an admin token. (#NNN)
+- `POST /work-ticket/{idx}/run` now applies the submit checks to the stored ticket: a caller who is neither the originator nor wet_lab_admin+ gets 404; otherwise the refusal a submit of that work would get (403/422), ahead of the state 409s. Scripts that re-run other users' tickets need an admin token. (#NNN)
 
 ## Deployed history
 

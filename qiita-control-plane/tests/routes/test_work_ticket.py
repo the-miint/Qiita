@@ -4009,7 +4009,7 @@ async def test_list_work_ticket_limit_caps_results(
 
 # The tagged-union idx column each scope kind fills in (mirrors the DB CHECK on
 # qiita.work_ticket). Keyed on the enum, so the column name interpolated into
-# the INSERT is always one of these three literals.
+# the INSERT is always one of these literals.
 _SCOPE_IDX_COLUMN = {
     ScopeTargetKind.REFERENCE: "reference_idx",
     ScopeTargetKind.PREP_SAMPLE: "prep_sample_idx",
@@ -4033,8 +4033,8 @@ async def _seed_scoped_ticket(
     """Insert one work_ticket of `kind` pointing at `idx` (the tagged-union
     column that kind uses), register it for wt_client teardown, and return its
     work_ticket_idx. A FAILED ticket carries the failure columns its CHECK
-    requires. Only the column NAME is interpolated — both closed-set labels bind
-    through their enum twin."""
+    requires. Only the column NAME is interpolated — each closed-set label binds
+    through its enum twin."""
     action_id, version = action
     column = _SCOPE_IDX_COLUMN[kind]
     failed = state is WorkTicketState.FAILED
