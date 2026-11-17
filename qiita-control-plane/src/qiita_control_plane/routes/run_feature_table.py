@@ -1,7 +1,8 @@
 """The run feature table over REST: one cohort request, four answers.
 
-`POST /feature-table/{sample,value,feature,taxonomy}` all take the same body
-(`FeatureTableRequest`: runs, and a study or a sample list) and answer:
+`POST /feature-table/{sample,value,feature}` take one cohort body
+(`FeatureTableRequest`: runs, and a study or a sample list); `/taxonomy` extends it
+(`FeatureTableTaxonomyRequest`) to also name the reference. They answer:
 
   * samples — the table's columns as JSON: each processed sample's column name,
     its QM, and its biosample's public name (to join to metadata); with the runs'
@@ -189,9 +190,9 @@ async def feature_table_taxonomy(
 
     Refuses 404 when no reference carries that `(name, version)`; 409 when the reference
     exists but is not servable — a status other than `active`/`indexing` (`loading` or
-    `failed`, which may carry stray taxonomy rows), or one that carries no taxonomy at
-    all (a sequence reference, told apart from "loaded but places nothing" by the
-    readiness probe in `fetch_taxonomy`)."""
+    `failed`, which may carry stray taxonomy rows), or one with no taxonomy loaded at all
+    (which a reference may lack whatever its kind), told apart from "loaded but places
+    nothing" by the readiness probe in `fetch_taxonomy`."""
     cohort = await _authorized_cohort(pool, caller, request)
     resolved = await resolve_reference_idx(
         pool, name=request.reference_name, version=request.reference_version
