@@ -1,7 +1,7 @@
 ### Changed
 
 - **CheckM scores the genes that the gene_call step called, instead of calling Prodigal
-  again (#TBD).** In long-read-assembly 1.0.2 (edited in place), the `checkm` step takes
+  again (#898).** In long-read-assembly 1.0.2 (edited in place), the `checkm` step takes
   `gene_calls` and copies each subject's `prodigal_checkm` `genes.faa` / `genes.gff` to
   where CheckM looks for a bin's genes, so the CheckM scores and the `gene_call` lake rows
   come from the same genes, and CheckM no longer calls Prodigal on a subject that
