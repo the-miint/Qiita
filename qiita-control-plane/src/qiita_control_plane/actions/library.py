@@ -62,6 +62,7 @@ from qiita_common.parquet import (
     ROW_GROUP_SIZE_BYTES,
     validate_parquet_path,
 )
+from qiita_common.qc_metrics import validate_qc_metrics
 from qiita_common.qc_reasons import load_qc_reasons
 from qiita_common.taxonomy import TAXONOMY_SOURCE_TABLE, genome_lineage_select_sql
 
@@ -2434,7 +2435,14 @@ async def persist_qc_checks(
     allowed = load_qc_reasons()
     problems = [] if checks else ["qc_checks is empty"]
     seen: set[str] = set()
-    for c in checks:
+    for i, c in enumerate(checks):
+        if c.metrics is not None:
+            try:
+                checks[i] = c.model_copy(
+                    update={"metrics": validate_qc_metrics(c.check, c.metrics)}
+                )
+            except ValueError as exc:
+                problems.append(str(exc))
         if c.prep_sample_idx != prep_sample_idx:
             problems.append(
                 f"{c.check}: prep_sample_idx {c.prep_sample_idx}, expected {prep_sample_idx}"

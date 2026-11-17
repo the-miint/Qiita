@@ -184,6 +184,10 @@ from qiita_common.models.prep_sample import (
     PrepSampleStudyFieldResponse,
 )
 from qiita_common.models.prep_sample_qc_check import (
+    DataTypeMetrics,
+    MarkerClass,
+    MarkerFractions,
+    MarkerReferenceIdx,
     PrepSampleQcCheck,
     PrepSampleQcCheckResponse,
     QcCheck,
@@ -771,6 +775,10 @@ __all__ = [
     "PrepSampleGlobalFieldResponse",
     "PrepSampleStudyFieldCreateRequest",
     "PrepSampleStudyFieldResponse",
+    "DataTypeMetrics",
+    "MarkerClass",
+    "MarkerFractions",
+    "MarkerReferenceIdx",
     "PrepSampleQcCheck",
     "PrepSampleQcCheckResponse",
     "QcCheck",

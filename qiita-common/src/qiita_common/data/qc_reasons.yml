@@ -1,6 +1,7 @@
 # Allowed QC reason codes, by check. Keys must be QcCheck members.
 data_type:
   - data_type_mismatch
+  - insufficient_reads
 composition:
   - high_unknown
   - low_panel_coverage

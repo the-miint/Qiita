@@ -34,3 +34,7 @@ def test_loader_is_cached_and_frozen():
     reasons = load_qc_reasons()
     assert load_qc_reasons() is reasons
     assert all(isinstance(codes, frozenset) for codes in reasons.values())
+
+
+def test_data_type_lists_insufficient_reads():
+    assert "insufficient_reads" in load_qc_reasons()[QcCheck.DATA_TYPE]

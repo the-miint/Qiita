@@ -1,5 +1,8 @@
 """Repository reads and writes for qiita.prep_sample_qc_check and the qiita.qc_verdict view."""
 
+import json
+from typing import Any
+
 import asyncpg
 from qiita_common.models import QcCheckResult
 
@@ -8,17 +11,19 @@ from . import require_transaction
 
 async def fetch_qc_checks_by_prep_sample_idx(
     pool_or_conn: asyncpg.Pool | asyncpg.Connection, prep_sample_idx: int
-) -> list[asyncpg.Record]:
+) -> list[dict[str, Any]]:
     """Return every check row for the prep_sample, invalidated ones included."""
     rows = await pool_or_conn.fetch(
         'SELECT "check", severity, reason, mask_idx, alignment_idx,'
-        "       measured_value, threshold, work_ticket_idx, created_at,"
+        "       measured_value, threshold, metrics, work_ticket_idx, created_at,"
         "       state, invalidated_at, invalidation_reason"
         "  FROM qiita.prep_sample_qc_check"
         ' WHERE prep_sample_idx = $1 ORDER BY "check", idx',
         prep_sample_idx,
     )
-    return list(rows)
+    return [
+        {**r, "metrics": None if r["metrics"] is None else json.loads(r["metrics"])} for r in rows
+    ]
 
 
 async def fetch_qc_verdict_by_prep_sample_idx(
@@ -44,13 +49,14 @@ async def upsert_qc_checks(
     await conn.execute(
         "INSERT INTO qiita.prep_sample_qc_check"
         ' (prep_sample_idx, "check", severity, reason, measured_value, threshold,'
-        "  mask_idx, alignment_idx, work_ticket_idx)"
-        " SELECT p, c, s, r, m, t, $7, $8, $9"
+        "  metrics, mask_idx, alignment_idx, work_ticket_idx)"
+        " SELECT p, c, s, r, m, t, j::jsonb, $8, $9, $10"
         "   FROM unnest($1::bigint[], $2::text[], $3::text[], $4::text[],"
-        "               $5::float8[], $6::float8[]) AS u(p, c, s, r, m, t)"
+        "               $5::float8[], $6::float8[], $7::text[]) AS u(p, c, s, r, m, t, j)"
         ' ON CONFLICT (prep_sample_idx, "check", mask_idx, alignment_idx) DO UPDATE SET'
         "  severity = EXCLUDED.severity, reason = EXCLUDED.reason,"
         "  measured_value = EXCLUDED.measured_value, threshold = EXCLUDED.threshold,"
+        "  metrics = EXCLUDED.metrics,"
         "  work_ticket_idx = EXCLUDED.work_ticket_idx, created_at = now(),"
         "  state = DEFAULT, invalidated_at = NULL, invalidated_by_idx = NULL,"
         "  invalidation_reason = NULL",
@@ -60,6 +66,7 @@ async def upsert_qc_checks(
         [c.reason for c in checks],
         [c.measured_value for c in checks],
         [c.threshold for c in checks],
+        [None if c.metrics is None else json.dumps(c.metrics) for c in checks],
         mask_idx,
         alignment_idx,
         work_ticket_idx,
