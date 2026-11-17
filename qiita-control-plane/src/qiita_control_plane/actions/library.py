@@ -137,20 +137,18 @@ _MAX_REPORTED = 20
 # Unmatched genome-map read_ids named in `_check_genome_map`'s error and warning.
 _GENOME_MAP_UNMATCHED_EXAMPLES = 5
 
-# Deterministic basename `mint_features` writes its feature-map Parquet under.
-# Single-sourced because the runner's restart path (`_reconstruct_action_outputs`)
-# rebuilds this path WITHOUT re-running the primitive, so the two must not drift.
+# Files library actions write into their attempt's directory. runner._reconstruct
+# rebuilds each bound one on resume without re-running the action. Each action has a
+# directory of its own (`qiita_common.workspace.step_attempt_dir`, by step name), so a
+# name needs to be distinct only from the other files of its action.
+#
+# mint-annotation-features writes two: the sequence_hash → feature_idx map it mints
+# through (an intermediate, never bound), and the minted annotation_idx for each
+# interval keyed by the annotation's NATURAL key (parent + window + type + strand).
+# reference_load joins the second to put annotation_idx on every lake row, which is
+# what lets a lake row point back at its Postgres claim.
 MINT_FEATURES_OUTPUT_BASENAME = "feature_map.parquet"
-# The annotation twin's basename. Distinct from MINT_FEATURES_OUTPUT_BASENAME
-# because both primitives can run in the SAME workflow (a GFF-bearing reference
-# mints sequence features and then annotated-interval features), and the resume
-# path in runner._reconstruct rebuilds each output by basename — one shared name
-# would have the two collide and silently resume onto the wrong map.
 MINT_ANNOTATION_FEATURES_OUTPUT_BASENAME = "annotation_feature_map.parquet"
-# The second output of mint-annotation-features: the minted annotation_idx for each
-# interval, keyed by the annotation's NATURAL key (parent + window + type + strand).
-# reference_load joins it to put annotation_idx on every lake row, which is what lets
-# a lake row point back at its Postgres claim. Same no-drift reason as the two above.
 MINT_ANNOTATION_MAP_OUTPUT_BASENAME = "annotation_map.parquet"
 
 # GFF3 attributes carrying cross-references into an annotation authority, in the two
