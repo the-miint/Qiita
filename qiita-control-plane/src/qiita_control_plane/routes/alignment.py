@@ -72,8 +72,8 @@ from ..auth.tickets import sign_ticket
 from ..definition_resolver import cohort_refusal, resolve_exact, resolve_group
 from ..definition_similarity import (
     DefinitionNotFound,
-    PairRefused,
-    refuse_deprecating_with_similar_pairs,
+    EquivalenceRefused,
+    refuse_deprecating_with_joining_equivalences,
 )
 from ..deps import (
     TxConnFactory,
@@ -110,10 +110,10 @@ from ..work_ticket_submit import (
 from ._helpers import (
     ALIGNMENT_NOT_FOUND_DETAIL,
     authorize_completed_alignment_cohort,
+    equivalence_refused_http,
     first_few,
     live_work_http,
     load_groups_as_of,
-    pair_refused_http,
     resolution_body,
     sees_resolution_tickets,
 )
@@ -159,15 +159,15 @@ async def update_alignment_definition_status_route(
 
     Deprecating is refused (409, listing them) while any work ticket under the
     alignment is unfinished, held ones included: they would still write rows under
-    a void config. It is refused too while the alignment is a side of a `similar`
-    pair decision (`definition_similarity`).
+    a void config. It is refused too while the alignment is a side of a joining
+    output equivalence, `same` or `similar` (`definition_similarity`).
 
     system_admin only (`alignment_definition:lifecycle`).
     """
     try:
         async with tx() as conn:
             if body.status is AlignmentDefinitionStatus.DEPRECATED:
-                await refuse_deprecating_with_similar_pairs(
+                await refuse_deprecating_with_joining_equivalences(
                     conn, DefinitionKind.ALIGNMENT, alignment_idx
                 )
                 await refuse_deprecating_with_live_work(conn, alignment_idx)
@@ -183,8 +183,8 @@ async def update_alignment_definition_status_route(
         raise HTTPException(status_code=404, detail=ALIGNMENT_NOT_FOUND_DETAIL)
     except AlignmentHasLiveWork as exc:
         raise live_work_http(exc) from exc
-    except PairRefused as exc:
-        raise pair_refused_http(exc) from exc
+    except EquivalenceRefused as exc:
+        raise equivalence_refused_http(exc) from exc
     except asyncpg.ForeignKeyViolationError as exc:
         raise HTTPException(
             status_code=422,

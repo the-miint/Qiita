@@ -17,7 +17,7 @@ _EDIT = {
     "new_settings": {},
     "reason": "typo",
     "occurred_at": "2026-11-16T00:00:00Z",
-    "repaired_pair_idx": [4],
+    "repaired_output_equivalence_idx": [4],
 }
 
 
@@ -56,7 +56,7 @@ def test_edit_settings_sends_the_params_file_and_only_the_columns_given(
         "reason": "typo",
         "version": "1.1.0",
     }
-    assert "pairs recomputed: [4]" in capsys.readouterr().err
+    assert "output equivalences recomputed: [4]" in capsys.readouterr().err
 
 
 def test_a_refused_edit_exits_1(monkeypatch, tmp_path):

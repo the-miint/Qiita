@@ -60,7 +60,10 @@ from qiita_control_plane.testing.db_seeds import (
     seed_prep_sample_to_study_link,
     seed_sequenced_sample_subtype,
 )
-from qiita_control_plane.testing.db_teardown import delete_definition_pairs, teardown_entity_graph
+from qiita_control_plane.testing.db_teardown import (
+    delete_output_equivalences,
+    teardown_entity_graph,
+)
 
 from conftest import ducklake_connect
 
@@ -637,8 +640,8 @@ async def test_a_user_builds_a_publishable_feature_table(
 
 @pytest.fixture
 async def cross_pool_cohort(postgres_pool, human_admin_session, regular_user_session, data_plane):
-    from qiita_common.models import DefinitionKind, DefinitionPairVerdict
-    from qiita_control_plane.definition_similarity import decide_pair, open_pair
+    from qiita_common.models import DefinitionKind, OutputEquivalenceVerdict
+    from qiita_control_plane.definition_similarity import decide_equivalence, open_equivalence
 
     db = postgres_pool
     owner = human_admin_session["principal_idx"]
@@ -719,13 +722,13 @@ async def cross_pool_cohort(postgres_pool, human_admin_session, regular_user_ses
     mask_1 = await _masked(db, owner=owner, tag=f"{tag}-1", prep_sample_idxs=[ps0, ps2])
     mask_2 = await _masked(db, owner=owner, tag=f"{tag}-2", prep_sample_idxs=[ps1])
     async with db.acquire() as conn, conn.transaction():
-        pair, _ = await open_pair(
+        equivalence, _ = await open_equivalence(
             conn, kind=DefinitionKind.MASK, definition_idxs=[mask_1, mask_2], principal_idx=owner
         )
-        await decide_pair(
+        await decide_equivalence(
             conn,
-            definition_pair_idx=pair["definition_pair_idx"],
-            verdict=DefinitionPairVerdict.SIMILAR,
+            output_equivalence_idx=equivalence["output_equivalence_idx"],
+            verdict=OutputEquivalenceVerdict.SIMILAR,
             reason="same filter, seeded by the cross-pool feature-table test",
             principal_idx=owner,
         )
@@ -786,7 +789,7 @@ async def cross_pool_cohort(postgres_pool, human_admin_session, regular_user_ses
         biosample_idxs=[bs for bs, _ in samples],
         prep_sample_idxs=[ps for _, ps in samples],
     )
-    await delete_definition_pairs(db, [pair["definition_pair_idx"]])
+    await delete_output_equivalences(db, [equivalence["output_equivalence_idx"]])
     await db.execute(
         "DELETE FROM qiita.alignment_definition WHERE alignment_idx = ANY($1::bigint[])",
         list(alignments.values()),
@@ -869,8 +872,12 @@ async def test_a_cohort_across_pools_builds_one_table_in_parts(
     part_a, part_b = (part["export_processing_id"] for part in parts)
     assert part_a != part_b and all(h.startswith("QP") for h in (part_a, part_b))
     assert manifest["processing"]["sample_part"] == {handles[ps0]: part_a, handles[ps1]: part_b}
-    # The mask pair the two alignments are grouped through is the decision recorded.
-    assert (manifest["decisions"]["as_of"], manifest["decisions"]["pairs_used"]) == (False, 1)
+    # The mask output equivalence the two alignments are grouped through is the decision
+    # recorded.
+    assert (manifest["decisions"]["as_of"], manifest["decisions"]["equivalences_used"]) == (
+        False,
+        1,
+    )
     assert "idx" not in json.dumps(manifest)
 
     # --- A cohort with a sample not processed in the group is refused, not narrowed. ---

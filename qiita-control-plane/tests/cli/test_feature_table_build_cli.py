@@ -274,8 +274,8 @@ DECISIONS = {
     "newest_event_at": None,
     "as_of": False,
     "as_of_scope": AS_OF_SCOPE,
-    "pairs_used": 0,
-    "pairs_used_set": "sha256:" + "7" * 64,
+    "equivalences_used": 0,
+    "equivalences_used_set": "sha256:" + "7" * 64,
 }
 
 
@@ -283,10 +283,11 @@ def _fake_resolve(rec, *, members=None, groups=None, unprocessed=None):
     """Stands in for POST /definition-group/resolve, keyed `(kind, definition_idx)`.
 
     By default every requested sample is processed under the definition named and the
-    group is that definition alone — the state of a deploy with no pair decisions, which
-    is what every single-part test here runs under. `members` moves a sample to another
-    member, `unprocessed` gives it another state (a partial `SampleResolution`), and
-    `groups` sets the `group` answered. Every call is recorded in `resolve_calls`."""
+    group is that definition alone — the state of a deploy with no output-equivalence
+    verdicts, which is what every single-part test here runs under. `members` moves a
+    sample to another member, `unprocessed` gives it another state (a partial
+    `SampleResolution`), and `groups` sets the `group` answered. Every call is recorded
+    in `resolve_calls`."""
     members, groups, unprocessed = members or {}, groups or {}, unprocessed or {}
     rec["resolve_calls"] = []
 
@@ -2167,7 +2168,7 @@ def test_an_omitted_cohort_spans_every_alignment_of_the_group_in_every_pool(monk
 
 
 def test_a_single_pool_build_is_one_part(monkeypatch, tmp_path):
-    """No pair decisions: the group is the alignment alone, so the build is the one it
+    """No output-equivalence verdicts: the group is the alignment alone, so the build is the one it
     was before parts existed — one cohort read, one ticket, one processing handle."""
     rec = _patched(monkeypatch)
     args = _namespace(tmp_path)

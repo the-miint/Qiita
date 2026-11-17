@@ -102,8 +102,8 @@ from ..auth.tickets import sign_ticket
 from ..block_read import READ_MASKED_TABLE
 from ..definition_resolver import resolve_exact, resolve_group
 from ..definition_similarity import (
-    PairRefused,
-    refuse_deprecating_with_similar_pairs,
+    EquivalenceRefused,
+    refuse_deprecating_with_joining_equivalences,
 )
 from ..deps import (
     TxConnFactory,
@@ -135,12 +135,12 @@ from ._helpers import (
     GATE_ROSTER_HARD_CAP,
     authorize_prep_sample_cohort,
     cap_rows,
+    equivalence_refused_http,
     first_few,
     gate_roster_narrowing_idx,
     live_work_http,
     load_groups_as_of,
     mask_exact_read,
-    pair_refused_http,
     resolution_body,
     sees_resolution_tickets,
 )
@@ -425,7 +425,7 @@ async def get_syndna_read_count_route(
     prep_sample is processed, when the masks that they resolved to ran without SynDNA
     or against different references (`syndna_reference_of_resolved`), or when no
     processed prep_sample has counts; 413 above the roster cap. Every
-    read is one read-only snapshot, so neither a re-mask nor a pair decision landing
+    read is one read-only snapshot, so neither a re-mask nor an output-equivalence verdict landing
     mid-request can mix two states into one table.
 
     After every refusal, each mask the counts came from gets its public handle
@@ -631,7 +631,7 @@ def syndna_reference_of_resolved(
 ) -> int:
     """The one SynDNA reference of the masks that the prep_samples resolved to. 409 when
     they ran without SynDNA, or counted against different references. Masks that differ
-    in SynDNA reference cannot be decided similar (`definition_similarity`), so the
+    in SynDNA reference cannot be decided same or similar (`definition_similarity`), so the
     masks of one group share a reference and the different-references 409 is not
     reached; it keeps a table from mixing two references should a group hold two."""
     by_reference: dict[int | None, list[int]] = {}
@@ -693,14 +693,16 @@ async def update_mask_definition_status_route(
 
     Deprecating is refused (409, listing them) while any work ticket carrying the
     mask is unfinished, held ones included, and while the mask is a side of a
-    `similar` pair decision (`definition_similarity`).
+    joining output equivalence, `same` or `similar` (`definition_similarity`).
 
     system_admin only (`mask_definition:lifecycle`).
     """
     try:
         async with tx() as conn:
             if body.status is MaskDefinitionStatus.DEPRECATED:
-                await refuse_deprecating_with_similar_pairs(conn, DefinitionKind.MASK, mask_idx)
+                await refuse_deprecating_with_joining_equivalences(
+                    conn, DefinitionKind.MASK, mask_idx
+                )
                 await refuse_deprecating_mask_with_live_work(conn, mask_idx)
             row = await transition_mask_definition_status(
                 conn,
@@ -714,8 +716,8 @@ async def update_mask_definition_status_route(
         raise HTTPException(status_code=404, detail=_MSG_MASK_NOT_FOUND)
     except MaskHasLiveWork as exc:
         raise live_work_http(exc) from exc
-    except PairRefused as exc:
-        raise pair_refused_http(exc) from exc
+    except EquivalenceRefused as exc:
+        raise equivalence_refused_http(exc) from exc
     except asyncpg.ForeignKeyViolationError as exc:
         raise HTTPException(
             status_code=422,

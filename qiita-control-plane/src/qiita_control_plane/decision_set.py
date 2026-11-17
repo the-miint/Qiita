@@ -1,33 +1,36 @@
-"""The decision set: every decided pair's verdict at one point of the pair history,
-named by a content hash so that a published manifest can record which decisions it
-was built under without carrying a pair or event idx, and a caller can rebuild under
-the same decisions later (`as_of_event`).
+"""The decision set: every decided output equivalence's verdict at one point of the
+output-equivalence history, named by a content hash so that a published manifest can
+record which decisions it was built under without carrying an output-equivalence or
+event idx, and a caller can rebuild under the same decisions later (`as_of_event`).
 
-**Canonical form.** The pairs whose verdict is not `pending`, each as the JSON array
-`[definition_kind, low_definition_ref, high_definition_ref, verdict]`, sorted, then
-serialized as compact JSON (`separators=(",", ":")`, no whitespace) and hashed with
-SHA-256; the token is `sha256:` and the lowercase hex digest. No decision at all hashes
-`[]`. This is the one copy of the form; every other site points here.
+**Canonical form.** The output equivalences whose verdict is not `pending`, each as the
+JSON array `[definition_kind, low_definition_ref, high_definition_ref, verdict]`,
+sorted, then serialized as compact JSON (`separators=(",", ":")`, no whitespace) and
+hashed with SHA-256; the token is `sha256:` and the lowercase hex digest. No decision at
+all hashes `[]`. The verdict is its stored value, so a `same` and a `similar` decision
+on the same two definitions give different tokens, though both join. This is the one
+copy of the form; every other site points here.
 
-**History.** `qiita.definition_pair_event` is append-only and each row carries the
-pair's verdict after it, so the state after event E is, per pair, the verdict of its
-newest event at or before E. Every pair is replayed, detached ones included, so the
-token of a state does not change when a definition is deleted later. The current
-state is the state after the newest event.
+**History.** `qiita.output_equivalence_event` is append-only and each row carries the
+output equivalence's verdict after it, so the state after event E is, per output
+equivalence, the verdict of its newest event at or before E. Every output equivalence is
+replayed, detached ones included, so the token of a state does not change when a
+definition is deleted later. The current state is the state after the newest event.
 
 **As of a token.** The newest event whose state hashes to the token. States repeat (a
 decide then a revoke returns to the earlier state), and any event with that state
 gives the same verdicts, so the newest is as good as any. A token no state hashes to
 is refused (`DecisionSetUnknown`); a state not yet reached is one of them. The `[]`
 state is accepted: it is the state before any decision. Only verdicts are taken from
-the history: whether a pair is detached, and every definition's params and status,
-are read as they are now.
+the history: whether an output equivalence is detached, and every definition's params
+and status, are read as they are now.
 
-**Pairs used.** The pairs that shaped the groups the resolution read: `similar` in
-the decision set, not detached now, and naming a definition the resolution read
-(`definition_resolver.needed_definitions`; both sides of such a pair are in one group
-read). `not_similar` and `pending` pairs join nothing and are not counted. Hashed in
-the same canonical form; empty for an exact read, which forms no group.
+**Equivalences used.** The output equivalences that shaped the groups the resolution
+read: a joining verdict (`JOINING_VERDICTS`) in the decision set, not detached now, and
+naming a definition the resolution read (`definition_resolver.needed_definitions`; both
+sides of such an output equivalence are in one group read). Non-joining and `pending`
+ones join nothing and are not counted. Hashed in the same canonical form; empty for an
+exact read, which forms no group.
 """
 
 import hashlib
@@ -37,7 +40,12 @@ from dataclasses import dataclass
 from datetime import datetime
 
 import asyncpg
-from qiita_common.models import DecisionProvenance, DefinitionKind, DefinitionPairVerdict
+from qiita_common.models import (
+    JOINING_VERDICTS,
+    DecisionProvenance,
+    DefinitionKind,
+    OutputEquivalenceVerdict,
+)
 
 __all__ = [
     "DecisionSet",
@@ -48,18 +56,18 @@ __all__ = [
 
 
 class DecisionSetUnknown(Exception):
-    """No state of the pair history hashes to the token."""
+    """No state of the output-equivalence history hashes to the token."""
 
     def __init__(self, token: str) -> None:
         super().__init__(
-            f"as_of_event {token} names no decision set of the pair history: it was not"
-            " recorded by this server, or names a state not reached"
+            f"as_of_event {token} names no decision set of the output-equivalence history: it"
+            " was not recorded by this server, or names a state not reached"
         )
         self.token = token
 
 
 @dataclass(frozen=True)
-class _Pair:
+class _Equivalence:
     kind: DefinitionKind
     low: int
     high: int
@@ -72,7 +80,7 @@ def decision_set_token(decided: Iterable[tuple[str, int, int, str]]) -> str:
     entries = sorted(
         [kind, low, high, verdict]
         for kind, low, high, verdict in decided
-        if verdict != DefinitionPairVerdict.PENDING.value
+        if verdict != OutputEquivalenceVerdict.PENDING.value
     )
     body = json.dumps(entries, separators=(",", ":"))
     return "sha256:" + hashlib.sha256(body.encode()).hexdigest()
@@ -80,58 +88,61 @@ def decision_set_token(decided: Iterable[tuple[str, int, int, str]]) -> str:
 
 @dataclass(frozen=True)
 class DecisionSet:
-    """The verdicts a resolution is computed under. `verdicts` maps every pair the
-    history names to its verdict at that point; a pair opened later is absent and
+    """The verdicts a resolution is computed under. `verdicts` maps every equivalence the
+    history names to its verdict at that point; an equivalence opened later is absent and
     reads as `pending`."""
 
     token: str
     newest_event_at: datetime | None
     as_of: bool
-    verdicts: Mapping[int, DefinitionPairVerdict]
-    _pairs: Mapping[int, _Pair]
+    verdicts: Mapping[int, OutputEquivalenceVerdict]
+    _equivalences: Mapping[int, _Equivalence]
 
-    def verdict_of(self, pair_idx: int) -> DefinitionPairVerdict:
-        return self.verdicts.get(pair_idx, DefinitionPairVerdict.PENDING)
+    def verdict_of(self, equivalence_idx: int) -> OutputEquivalenceVerdict:
+        return self.verdicts.get(equivalence_idx, OutputEquivalenceVerdict.PENDING)
 
     def provenance(
         self, read: Mapping[DefinitionKind, Collection[int]] | None
     ) -> DecisionProvenance:
         """The wire record. `read` is the definitions the resolution read by kind, or
-        None for an exact read; the pairs used are as the module docstring says."""
+        None for an exact read; the equivalences used are as the module docstring says."""
         used = [
-            (pair.kind.value, pair.low, pair.high, self.verdict_of(idx).value)
-            for idx, pair in self._pairs.items()
+            (equivalence.kind.value, equivalence.low, equivalence.high, self.verdict_of(idx).value)
+            for idx, equivalence in self._equivalences.items()
             if read is not None
-            and self.verdict_of(idx) is DefinitionPairVerdict.SIMILAR
-            and not pair.detached
-            and (pair.low in read.get(pair.kind, ()) or pair.high in read.get(pair.kind, ()))
+            and self.verdict_of(idx) in JOINING_VERDICTS
+            and not equivalence.detached
+            and (
+                equivalence.low in read.get(equivalence.kind, ())
+                or equivalence.high in read.get(equivalence.kind, ())
+            )
         ]
         return DecisionProvenance(
             decision_set=self.token,
             newest_event_at=self.newest_event_at,
             as_of=self.as_of,
-            pairs_used=len(used),
-            pairs_used_set=decision_set_token(used),
+            equivalences_used=len(used),
+            equivalences_used_set=decision_set_token(used),
         )
 
 
 async def load_decision_set(conn: asyncpg.Connection, as_of_event: str | None) -> DecisionSet:
-    """The current decision set, or the one `as_of_event` names, replayed from the pair
+    """The current decision set, or the one `as_of_event` names, replayed from the equivalence
     history in the caller's transaction. Raises DecisionSetUnknown for a token no
     state hashes to."""
     rows = await conn.fetch(
-        "SELECT e.definition_pair_idx, e.verdict, e.occurred_at,"
-        "       p.definition_kind, p.low_definition_ref, p.high_definition_ref,"
-        "       p.detached_at IS NOT NULL AS detached"
-        "  FROM qiita.definition_pair_event e"
-        "  JOIN qiita.definition_pair p USING (definition_pair_idx)"
-        " ORDER BY e.definition_pair_event_idx"
+        "SELECT e.output_equivalence_idx, e.verdict, e.occurred_at,"
+        "       o.definition_kind, o.low_definition_ref, o.high_definition_ref,"
+        "       o.detached_at IS NOT NULL AS detached"
+        "  FROM qiita.output_equivalence_event e"
+        "  JOIN qiita.output_equivalence o USING (output_equivalence_idx)"
+        " ORDER BY e.output_equivalence_event_idx"
     )
-    pairs: dict[int, _Pair] = {}
+    equivalences: dict[int, _Equivalence] = {}
     for r in rows:
-        pairs.setdefault(
-            r["definition_pair_idx"],
-            _Pair(
+        equivalences.setdefault(
+            r["output_equivalence_idx"],
+            _Equivalence(
                 DefinitionKind(r["definition_kind"]),
                 r["low_definition_ref"],
                 r["high_definition_ref"],
@@ -139,15 +150,17 @@ async def load_decision_set(conn: asyncpg.Connection, as_of_event: str | None) -
             ),
         )
 
-    def replay(through: int) -> dict[int, DefinitionPairVerdict]:
+    def replay(through: int) -> dict[int, OutputEquivalenceVerdict]:
         """The verdicts after the first `through` events."""
         return {
-            r["definition_pair_idx"]: DefinitionPairVerdict(r["verdict"]) for r in rows[:through]
+            r["output_equivalence_idx"]: OutputEquivalenceVerdict(r["verdict"])
+            for r in rows[:through]
         }
 
-    def token_of(verdicts: Mapping[int, DefinitionPairVerdict]) -> str:
+    def token_of(verdicts: Mapping[int, OutputEquivalenceVerdict]) -> str:
         return decision_set_token(
-            (pairs[i].kind.value, pairs[i].low, pairs[i].high, v.value) for i, v in verdicts.items()
+            (equivalences[i].kind.value, equivalences[i].low, equivalences[i].high, v.value)
+            for i, v in verdicts.items()
         )
 
     def at(through: int) -> datetime | None:
@@ -155,13 +168,13 @@ async def load_decision_set(conn: asyncpg.Connection, as_of_event: str | None) -
 
     if as_of_event is None:
         verdicts = replay(len(rows))
-        return DecisionSet(token_of(verdicts), at(len(rows)), False, verdicts, pairs)
-    verdicts: dict[int, DefinitionPairVerdict] = {}
+        return DecisionSet(token_of(verdicts), at(len(rows)), False, verdicts, equivalences)
+    verdicts: dict[int, OutputEquivalenceVerdict] = {}
     tokens = [token_of(verdicts)]
     for r in rows:
-        verdicts[r["definition_pair_idx"]] = DefinitionPairVerdict(r["verdict"])
+        verdicts[r["output_equivalence_idx"]] = OutputEquivalenceVerdict(r["verdict"])
         tokens.append(token_of(verdicts))
     for through in range(len(rows), -1, -1):
         if tokens[through] == as_of_event:
-            return DecisionSet(as_of_event, at(through), True, replay(through), pairs)
+            return DecisionSet(as_of_event, at(through), True, replay(through), equivalences)
     raise DecisionSetUnknown(as_of_event)

@@ -1,17 +1,20 @@
 ### Added
 
-- **A system_admin can decide that two masks, two alignments or two processings are
-  similar, and the prep_samples split across them are then read together (#874).**
-  `qiita-admin pair list|show|open|decide|revoke` calls the new
-  `/api/v1/admin/definition-pair` routes, gated on the kind's lifecycle scope. A
-  `similar` decision puts the two in one group; alignments and processings whose
-  params differ only in grouped masks (or, for de novo alignments, grouped
-  processings) are grouped without a decision. Every decision and revoke is kept in
-  the pair's history. `docs/runbooks/deciding-similar-definitions.md` is the
+- **A system_admin can record whether two masks, two alignments or two processings give
+  equivalent outputs, and the prep_samples split across two joined ones are then read
+  together (#874).** `qiita-admin output-equivalence list|show|open|decide|revoke`
+  calls the new `/api/v1/admin/output-equivalence` routes, gated on the kind's
+  lifecycle scope. An output equivalence is `pending` until decided `same` or
+  `similar`, which put the two in one group and behave identically, or `different` or
+  `not_benchmarked`, which keep them apart and behave identically (`not_benchmarked`:
+  not benchmarked because reprocessing is easier, the older one outdated; it
+  deprecates nothing). Alignments and processings whose params differ only in grouped
+  masks (or, for de novo alignments, grouped processings) are grouped without a
+  decision. Every decision and revoke is kept in its history. `docs/runbooks/deciding-output-equivalence.md` is the
   procedure.
 - **Two masks that count SynDNA against different references, or of which only one
-  counts it, cannot be decided `similar` (#874)** (409, `syndna_reference_change`);
-  `not_similar` is allowed. The SynDNA count export's 409 for masks of different
+  counts it, cannot be decided `same` or `similar` (#874)** (409,
+  `syndna_reference_change`); `different` and `not_benchmarked` are allowed. The SynDNA count export's 409 for masks of different
   references now compares the masks that the prep_samples resolved to, whichever
   member was named, and its 409 for a mask without SynDNA comes after the
   resolution.
@@ -30,12 +33,13 @@
   mask's public handles, and refuses to overwrite a file that the manifest records
   under another mask. Two exports into one directory merge their entries under a lock.
 
-- **Outputs record the pair decisions they were built under, and can be rebuilt under
-  earlier ones (#874).** The resolve route, the masked-read export roster and ticket,
+- **Outputs record the output-equivalence verdicts they were built under, and can be
+  rebuilt under earlier ones (#874).** The resolve route, the masked-read export roster and ticket,
   the SynDNA count export and the alignment cohort DoGet return `decisions`: a
-  `sha256:` token of every decided pair's verdict (`decision_set`), when its newest
-  decision was recorded, and the count and token of the `similar` pairs that shaped
-  the groups it read (`pairs_used`, `pairs_used_set`; `not_similar` pairs are not
+  `sha256:` token of every decided output equivalence's verdict (`decision_set`; a
+  `same` and a `similar` decision give different tokens), when its newest decision was
+  recorded, and the count and token of the joining output equivalences that shaped the
+  groups it read (`equivalences_used`, `equivalences_used_set`; non-joining ones are not
   counted). The feature-table manifest, each masked-read export
   manifest entry and the SynDNA sidecar record it. Passing the token back as
   `as_of_event` (`--as-of-event` on `qiita feature-table build`, `qiita-admin
@@ -132,16 +136,16 @@
 - **The alignment cohort DoGet refuses a prep_sample that does not resolve to the
   alignment it names (#874)** (409, `reason` `resolved_elsewhere`, `incomplete` or
   `not_processed`), including one whose mask run is withdrawn or deprecated. Two of
-  these refusals apply with no pair decided: `incomplete` for a prep_sample whose
+  these refusals apply with no output equivalence decided: `incomplete` for a prep_sample whose
   gate is completed but whose newest ticket under the alignment, or a block ticket
   covering it, failed or is waiting or running; and `incomplete` / `upstream_moved`
   for one whose mask now resolves to another mask of its group, which a newer
-  member's run causes once masks are decided similar.
-- **Deprecating a mask, alignment or processing is refused (409, `similar_pairs`)
-  while it is a side of a `similar` pair (#874).** The mask and alignment
-  deprecation 409 for unfinished work tickets now has the same shape: `reason` is the
-  code `live_work` (it was the message), the message moved to `detail`, and
-  `work_ticket_idx` is unchanged.
+  member's run causes once masks are joined.
+- **Deprecating a mask, alignment or processing is refused (409, `joining_equivalences`)
+  while it is a side of a `same` or `similar` output equivalence (#874).** The mask and
+  alignment deprecation 409 for unfinished work tickets now has the same shape:
+  `reason` is the code `live_work` (it was the message), the message moved to
+  `detail`, and `work_ticket_idx` is unchanged.
 - **A mask's, alignment's or processing's settings are locked after its mint
   (#874).** A hand `UPDATE` of its params, params_hash or (for a mask or a processing)
   workflow and version columns is refused (SQLSTATE 55000); status and deprecation stay
@@ -149,11 +153,13 @@
   /api/v1/admin/definition-settings/{kind}/{idx}`, system_admin with the kind's
   lifecycle scope) is the one way to change them: it records who, when, the old and new
   values and a required reason in the append-only `qiita.definition_settings_edit`, is
-  refused (409) while a `similar` pair names the definition (`similar_pairs`), while
+  refused (409) while a `same` or `similar` output equivalence names the definition
+  (`joining_equivalences`), while
   unfinished work tickets run under it (`live_work`), and while a public handle that is
   not retired cites it (`published`: a `QP<n>` naming it or a `QM<n>` minted under
   it), and recomputes the `change` of
-  its pending and not_similar pairs. The mask adapter-hash re-key (the mint's legacy
+  the output equivalences naming it that do not join (pending, `different`,
+  `not_benchmarked`). The mask adapter-hash re-key (the mint's legacy
   path and `qiita-admin backfill mask-adapter-hash`) passes and is recorded with no
   actor. A failed or cancelled ticket that records a definition edited after the
   ticket was created, and whose redrive keeps step rows from an earlier attempt,
@@ -171,9 +177,8 @@
   before each hold fails the ticket as bad submission input. A mask adapter-hash
   re-key does not count as an edit here.
 - **A hand `DELETE` of a mask, alignment or processing is refused (SQLSTATE 55006)
-  while a `similar` pair names it (#874);** revoke the pair first. A `pending` or
-  `not_similar` pair is detached by the delete. No route deletes these
-  rows.
+  while a `same` or `similar` output equivalence names it (#874);** revoke it first.
+  One that does not join is detached by the delete. No route deletes these rows.
 - **Deleting a sequenced pool whose prep_samples have public `QM<n>` handles
   (`exported_identifier`, either kind) succeeds and retires those handles (#874)**
   instead of failing with a 500 on their foreign key. A retired handle keeps its

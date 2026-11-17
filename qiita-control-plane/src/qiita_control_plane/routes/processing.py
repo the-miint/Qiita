@@ -58,7 +58,7 @@ from qiita_common.models import (
 
 from ..auth.guards import require_human, require_scope
 from ..auth.principal import HumanUser, Principal
-from ..definition_similarity import PairRefused, refuse_deprecating_with_similar_pairs
+from ..definition_similarity import EquivalenceRefused, refuse_deprecating_with_joining_equivalences
 from ..deps import TxConnFactory, get_db_pool, get_tx_conn_factory
 from ..repositories.processing import (
     ProcessingNotFound,
@@ -71,8 +71,8 @@ from ..repositories.processing import (
 from ._helpers import (
     GATE_ROSTER_HARD_CAP,
     cap_rows,
+    equivalence_refused_http,
     gate_roster_narrowing_idx,
-    pair_refused_http,
 )
 
 _MSG_PROCESSING_NOT_FOUND = "Processing run not found"
@@ -271,15 +271,15 @@ async def update_processing_status_route(
     whole block, `superseded_by` included, so correcting a reason without
     re-supplying the replacement clears it.
 
-    Deprecating is refused (409) while the run is a side of a `similar` pair
-    decision (`definition_similarity`).
+    Deprecating is refused (409) while the run is a side of a joining output
+    equivalence, `same` or `similar` (`definition_similarity`).
 
     system_admin only (`processing:lifecycle`).
     """
     try:
         async with tx() as conn:
             if body.status is ProcessingStatus.DEPRECATED:
-                await refuse_deprecating_with_similar_pairs(
+                await refuse_deprecating_with_joining_equivalences(
                     conn, DefinitionKind.PROCESSING, processing_idx
                 )
             row = await transition_processing_status(
@@ -292,8 +292,8 @@ async def update_processing_status_route(
             )
     except ProcessingNotFound:
         raise HTTPException(status_code=404, detail=_MSG_PROCESSING_NOT_FOUND)
-    except PairRefused as exc:
-        raise pair_refused_http(exc) from exc
+    except EquivalenceRefused as exc:
+        raise equivalence_refused_http(exc) from exc
     except asyncpg.ForeignKeyViolationError as exc:
         raise HTTPException(
             status_code=422,

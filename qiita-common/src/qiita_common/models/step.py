@@ -275,7 +275,7 @@ class DoGetTicketRequest(BaseModel):
 
 class DoGetTicketResponse(BaseModel):
     ticket: str  # base64-encoded signed ticket bytes
-    # The pair decisions a route that resolves a group before signing resolved under
+    # The output-equivalence verdicts a route that resolves a group before signing resolved under
     # (the alignment cohort DoGet, the masked-read export ticket); None elsewhere.
     decisions: DecisionProvenance | None = None
     # The deprecated upstreams the alignment cohort DoGet read under
@@ -363,7 +363,7 @@ class AlignmentCohortDoGetTicketRequest(BaseModel):
     # Reads an active alignment whose upstream is deprecated (refused without it).
     include_deprecated_upstream: bool = False
     # Resolve the cohort's groups under this earlier decision set
-    # (`DecisionProvenance.decision_set`); only the pair decisions are as of it.
+    # (`DecisionProvenance.decision_set`); only the output-equivalence verdicts are as of it.
     as_of_event: DecisionSetToken | None = None
 
 

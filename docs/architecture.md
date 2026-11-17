@@ -67,7 +67,7 @@ Auth and data-access flow, upload and processing, work ticket lifecycle, the orc
 - [Compute Orchestrator](architecture/processing.md#compute-orchestrator)
 - [Health Checks](architecture/processing.md#health-checks)
 - [Work Ticket Queue](architecture/processing.md#work-ticket-queue)
-- [Similar definitions](architecture/processing.md#similar-definitions)
+- [Output equivalence](architecture/processing.md#output-equivalence)
 
 ### [Storage and Topology](architecture/storage.md)
 

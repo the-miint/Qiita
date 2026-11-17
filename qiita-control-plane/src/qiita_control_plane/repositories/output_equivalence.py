@@ -1,4 +1,4 @@
-"""SQL for `qiita.definition_pair` / `qiita.definition_pair_event`, the reads of
+"""SQL for `qiita.output_equivalence` / `qiita.output_equivalence_event`, the reads of
 masks, alignments and processings that the group rules take as input, and the group
 lock.
 
@@ -15,9 +15,9 @@ import asyncpg
 from qiita_common.models import (
     AlignmentDefinitionStatus,
     DefinitionKind,
-    DefinitionPairEventType,
-    DefinitionPairVerdict,
     MaskDefinitionStatus,
+    OutputEquivalenceEventType,
+    OutputEquivalenceVerdict,
     ProcessingStatus,
 )
 
@@ -43,16 +43,17 @@ class GroupLockBusy(Exception):
 
     def __init__(self) -> None:
         super().__init__(
-            "another pair decision, revoke or deprecation is in progress; retry shortly"
+            "another output-equivalence decision, revoke or deprecation is in progress;"
+            " retry shortly"
         )
 
 
 async def lock_groups_shared(conn: asyncpg.Connection) -> None:
     """Take the group lock SHARED until the transaction ends.
 
-    A deprecation takes this before reading the `similar` pairs that name its
-    definition and before any definition row lock: no decision commits while it is
-    held, so a `similar` decision and the deprecation of one of its sides cannot
+    A deprecation takes this before reading the joining output equivalences that name
+    its definition and before any definition row lock: no decision commits while it is
+    held, so a joining decision and the deprecation of one of its sides cannot
     both commit. It waits for a decision in progress. The caller's transaction must
     be READ COMMITTED, so that the statement after the wait sees that decision; at
     REPEATABLE READ the waiting statement takes a snapshot from before that decision
@@ -216,11 +217,11 @@ async def fetch_definition(
 
 
 # ---------------------------------------------------------------------------
-# Pairs
+# Equivalences
 # ---------------------------------------------------------------------------
 
-_PAIR_COLUMNS = (
-    "definition_pair_idx, definition_kind,"
+_EQUIVALENCE_COLUMNS = (
+    "output_equivalence_idx, definition_kind,"
     " low_definition_ref AS low_definition_idx, high_definition_ref AS high_definition_idx,"
     " detached_at, change, derived_only, verdict, decided_by_idx, decided_at,"
     " decision_reason, opened_by_idx, opened_at"
@@ -233,12 +234,12 @@ _TYPED_COLUMNS: dict[DefinitionKind, tuple[str, str]] = {
 }
 
 
-def pair_record_fields(row: asyncpg.Record) -> dict[str, Any]:
-    """A pair row as the `DefinitionPair` wire model's fields."""
+def equivalence_record_fields(row: asyncpg.Record) -> dict[str, Any]:
+    """An equivalence row as the `OutputEquivalence` wire model's fields."""
     return {**dict(row), "change": decode_jsonb(row["change"])}
 
 
-async def insert_pair(
+async def insert_equivalence(
     conn: asyncpg.Connection,
     *,
     kind: DefinitionKind,
@@ -248,17 +249,17 @@ async def insert_pair(
     derived_only: bool,
     opened_by_idx: int,
 ) -> tuple[asyncpg.Record, bool]:
-    """Open a pending pair and its `opened` event, or return the pair already
+    """Open a pending equivalence and its `opened` event, or return the equivalence already
     recorded for these two definitions. Returns `(row, created)`."""
     require_transaction(conn)
     low_col, high_col = _TYPED_COLUMNS[kind]
     row = await conn.fetchrow(
-        "INSERT INTO qiita.definition_pair ("
+        "INSERT INTO qiita.output_equivalence ("
         f"  definition_kind, {low_col}, {high_col}, low_definition_ref, high_definition_ref,"
         "  change, derived_only, opened_by_idx"
         ") VALUES ($1, $2, $3, $2, $3, $4::jsonb, $5, $6)"
         " ON CONFLICT DO NOTHING"
-        f" RETURNING {_PAIR_COLUMNS}",
+        f" RETURNING {_EQUIVALENCE_COLUMNS}",
         kind.value,
         low_idx,
         high_idx,
@@ -268,7 +269,7 @@ async def insert_pair(
     )
     if row is None:
         existing = await conn.fetchrow(
-            f"SELECT {_PAIR_COLUMNS} FROM qiita.definition_pair"
+            f"SELECT {_EQUIVALENCE_COLUMNS} FROM qiita.output_equivalence"
             " WHERE definition_kind = $1 AND low_definition_ref = $2 AND high_definition_ref = $3",
             kind.value,
             low_idx,
@@ -277,92 +278,96 @@ async def insert_pair(
         return existing, False
     await _insert_event(
         conn,
-        definition_pair_idx=row["definition_pair_idx"],
-        event=DefinitionPairEventType.OPENED,
-        verdict=DefinitionPairVerdict.PENDING,
+        output_equivalence_idx=row["output_equivalence_idx"],
+        event=OutputEquivalenceEventType.OPENED,
+        verdict=OutputEquivalenceVerdict.PENDING,
         actor_principal_idx=opened_by_idx,
         reason=None,
     )
     return row, True
 
 
-async def fetch_pair(
-    conn: asyncpg.Pool | asyncpg.Connection, definition_pair_idx: int, *, for_update: bool = False
+async def fetch_equivalence(
+    conn: asyncpg.Pool | asyncpg.Connection,
+    output_equivalence_idx: int,
+    *,
+    for_update: bool = False,
 ) -> asyncpg.Record | None:
-    """One pair, optionally locked FOR UPDATE (inside a transaction)."""
+    """One equivalence, optionally locked FOR UPDATE (inside a transaction)."""
     if for_update:
         if isinstance(conn, asyncpg.Pool):
             raise RuntimeError("a row lock needs a connection inside a transaction")
         require_transaction(conn)
     return await conn.fetchrow(
-        f"SELECT {_PAIR_COLUMNS} FROM qiita.definition_pair WHERE definition_pair_idx = $1"
-        + (" FOR UPDATE" if for_update else ""),
-        definition_pair_idx,
+        f"SELECT {_EQUIVALENCE_COLUMNS} FROM qiita.output_equivalence"
+        " WHERE output_equivalence_idx = $1" + (" FOR UPDATE" if for_update else ""),
+        output_equivalence_idx,
     )
 
 
-async def list_pairs(
+async def list_equivalences(
     conn: asyncpg.Pool | asyncpg.Connection,
     *,
     kinds: list[DefinitionKind],
-    verdict: DefinitionPairVerdict | None,
-    before_definition_pair_idx: int | None,
+    verdict: OutputEquivalenceVerdict | None,
+    before_output_equivalence_idx: int | None,
     limit: int,
 ) -> list[asyncpg.Record]:
-    """Up to `limit` pairs of the given kinds, optionally of one verdict, newest
-    first, with an id below `before_definition_pair_idx` when it is given."""
+    """Up to `limit` equivalences of the given kinds, optionally of one verdict, newest
+    first, with an id below `before_output_equivalence_idx` when it is given."""
     return list(
         await conn.fetch(
-            f"SELECT {_PAIR_COLUMNS} FROM qiita.definition_pair"
+            f"SELECT {_EQUIVALENCE_COLUMNS} FROM qiita.output_equivalence"
             " WHERE definition_kind = ANY($1::text[])"
             "   AND ($2::text IS NULL OR verdict = $2)"
-            "   AND ($3::bigint IS NULL OR definition_pair_idx < $3)"
-            " ORDER BY definition_pair_idx DESC LIMIT $4",
+            "   AND ($3::bigint IS NULL OR output_equivalence_idx < $3)"
+            " ORDER BY output_equivalence_idx DESC LIMIT $4",
             [k.value for k in kinds],
             None if verdict is None else verdict.value,
-            before_definition_pair_idx,
+            before_output_equivalence_idx,
             limit,
         )
     )
 
 
-async def fetch_live_pairs(conn: asyncpg.Connection) -> list[asyncpg.Record]:
-    """Every pair that is not detached, of every kind and verdict."""
+async def fetch_live_equivalences(conn: asyncpg.Connection) -> list[asyncpg.Record]:
+    """Every equivalence that is not detached, of every kind and verdict."""
     return list(
         await conn.fetch(
-            f"SELECT {_PAIR_COLUMNS} FROM qiita.definition_pair WHERE detached_at IS NULL"
+            f"SELECT {_EQUIVALENCE_COLUMNS} FROM qiita.output_equivalence WHERE detached_at IS NULL"
         )
     )
 
 
-async def fetch_pair_events(
-    conn: asyncpg.Pool | asyncpg.Connection, definition_pair_idx: int
+async def fetch_equivalence_events(
+    conn: asyncpg.Pool | asyncpg.Connection, output_equivalence_idx: int
 ) -> list[asyncpg.Record]:
-    """A pair's history, oldest first."""
+    """An equivalence's history, oldest first."""
     return list(
         await conn.fetch(
-            "SELECT definition_pair_event_idx, event, verdict, actor_principal_idx, reason,"
-            " occurred_at FROM qiita.definition_pair_event"
-            " WHERE definition_pair_idx = $1 ORDER BY definition_pair_event_idx",
-            definition_pair_idx,
+            "SELECT output_equivalence_event_idx, event, verdict, actor_principal_idx, reason,"
+            " occurred_at FROM qiita.output_equivalence_event"
+            " WHERE output_equivalence_idx = $1 ORDER BY output_equivalence_event_idx",
+            output_equivalence_idx,
         )
     )
 
 
-async def fetch_similar_pairs_naming(
+async def fetch_joining_equivalences_naming(
     conn: asyncpg.Connection, kind: DefinitionKind, idx: int
 ) -> list[int]:
-    """The live `similar` pairs of `kind` with `idx` on either side."""
+    """The live joining output equivalences of `kind` with `idx` on either side, by
+    the SQL twin of `JOINING_VERDICTS`."""
     return [
-        r["definition_pair_idx"]
+        r["output_equivalence_idx"]
         for r in await conn.fetch(
-            "SELECT definition_pair_idx FROM qiita.definition_pair"
-            " WHERE definition_kind = $1 AND verdict = $3 AND detached_at IS NULL"
+            "SELECT output_equivalence_idx FROM qiita.output_equivalence"
+            " WHERE definition_kind = $1 AND qiita.output_equivalence_verdict_joins(verdict)"
+            "   AND detached_at IS NULL"
             "   AND $2 IN (low_definition_ref, high_definition_ref)"
-            " ORDER BY definition_pair_idx",
+            " ORDER BY output_equivalence_idx",
             kind.value,
             idx,
-            DefinitionPairVerdict.SIMILAR.value,
         )
     ]
 
@@ -370,27 +375,27 @@ async def fetch_similar_pairs_naming(
 async def record_decision(
     conn: asyncpg.Connection,
     *,
-    definition_pair_idx: int,
-    verdict: DefinitionPairVerdict,
+    output_equivalence_idx: int,
+    verdict: OutputEquivalenceVerdict,
     reason: str,
     principal_idx: int,
 ) -> asyncpg.Record:
-    """Write a decision onto the pair and its `decided` event; return the pair."""
+    """Write a decision onto the equivalence and its `decided` event; return the equivalence."""
     require_transaction(conn)
     row = await conn.fetchrow(
-        "UPDATE qiita.definition_pair"
+        "UPDATE qiita.output_equivalence"
         "   SET verdict = $2, decided_by_idx = $3, decided_at = now(), decision_reason = $4"
-        " WHERE definition_pair_idx = $1"
-        f" RETURNING {_PAIR_COLUMNS}",
-        definition_pair_idx,
+        " WHERE output_equivalence_idx = $1"
+        f" RETURNING {_EQUIVALENCE_COLUMNS}",
+        output_equivalence_idx,
         verdict.value,
         principal_idx,
         reason,
     )
     await _insert_event(
         conn,
-        definition_pair_idx=definition_pair_idx,
-        event=DefinitionPairEventType.DECIDED,
+        output_equivalence_idx=output_equivalence_idx,
+        event=OutputEquivalenceEventType.DECIDED,
         verdict=verdict,
         actor_principal_idx=principal_idx,
         reason=reason,
@@ -399,25 +404,25 @@ async def record_decision(
 
 
 async def record_revoke(
-    conn: asyncpg.Connection, *, definition_pair_idx: int, reason: str, principal_idx: int
+    conn: asyncpg.Connection, *, output_equivalence_idx: int, reason: str, principal_idx: int
 ) -> asyncpg.Record:
-    """Return the pair to pending, clearing its decision, and write the `revoked`
-    event; return the pair."""
+    """Return the equivalence to pending, clearing its decision, and write the `revoked`
+    event; return the equivalence."""
     require_transaction(conn)
     row = await conn.fetchrow(
-        "UPDATE qiita.definition_pair"
+        "UPDATE qiita.output_equivalence"
         "   SET verdict = $2, decided_by_idx = NULL, decided_at = NULL,"
         "       decision_reason = NULL"
-        " WHERE definition_pair_idx = $1"
-        f" RETURNING {_PAIR_COLUMNS}",
-        definition_pair_idx,
-        DefinitionPairVerdict.PENDING.value,
+        " WHERE output_equivalence_idx = $1"
+        f" RETURNING {_EQUIVALENCE_COLUMNS}",
+        output_equivalence_idx,
+        OutputEquivalenceVerdict.PENDING.value,
     )
     await _insert_event(
         conn,
-        definition_pair_idx=definition_pair_idx,
-        event=DefinitionPairEventType.REVOKED,
-        verdict=DefinitionPairVerdict.PENDING,
+        output_equivalence_idx=output_equivalence_idx,
+        event=OutputEquivalenceEventType.REVOKED,
+        verdict=OutputEquivalenceVerdict.PENDING,
         actor_principal_idx=principal_idx,
         reason=reason,
     )
@@ -427,17 +432,17 @@ async def record_revoke(
 async def _insert_event(
     conn: asyncpg.Connection,
     *,
-    definition_pair_idx: int,
-    event: DefinitionPairEventType,
-    verdict: DefinitionPairVerdict,
+    output_equivalence_idx: int,
+    event: OutputEquivalenceEventType,
+    verdict: OutputEquivalenceVerdict,
     actor_principal_idx: int,
     reason: str | None,
 ) -> None:
     await conn.execute(
-        "INSERT INTO qiita.definition_pair_event"
-        " (definition_pair_idx, event, verdict, actor_principal_idx, reason)"
+        "INSERT INTO qiita.output_equivalence_event"
+        " (output_equivalence_idx, event, verdict, actor_principal_idx, reason)"
         " VALUES ($1, $2, $3, $4, $5)",
-        definition_pair_idx,
+        output_equivalence_idx,
         event.value,
         verdict.value,
         actor_principal_idx,

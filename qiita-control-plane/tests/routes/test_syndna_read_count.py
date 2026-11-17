@@ -13,16 +13,27 @@ import uuid
 
 import pytest
 from qiita_common.api_paths import URL_MASK_DEFINITION_SYNDNA_READ_COUNT
-from qiita_common.models import DefinitionKind, DefinitionPairRefusal, DefinitionPairVerdict, Tier
+from qiita_common.models import (
+    JOINING_VERDICTS,
+    NON_JOINING_VERDICTS,
+    DefinitionKind,
+    OutputEquivalenceRefusal,
+    OutputEquivalenceVerdict,
+    Tier,
+)
 
-from qiita_control_plane.definition_similarity import PairRefused, decide_pair, open_pair
+from qiita_control_plane.definition_similarity import (
+    EquivalenceRefused,
+    decide_equivalence,
+    open_equivalence,
+)
 from qiita_control_plane.testing.db_seeds import (
     cleanup_reference_graph,
     seed_bare_feature,
     seed_bare_reference,
     seed_reference_membership,
 )
-from qiita_control_plane.testing.db_teardown import delete_definition_pairs
+from qiita_control_plane.testing.db_teardown import delete_output_equivalences
 
 from . import test_mask_definition_read as mask_read
 from .conftest import (  # noqa: F401
@@ -279,30 +290,30 @@ async def test_nothing_processed_is_refused_with_the_reasons(ctx):
 
 @pytest.fixture
 async def similar(ctx):
-    """`similar(a, b)` decides two masks similar (or `verdict`); the pairs are deleted
-    afterwards."""
+    """`similar(a, b)` decides two masks similar (or `verdict`); the output equivalences
+    are deleted afterwards."""
     pool = ctx["pool"]
     owner = ctx["admin_session"]["principal_idx"]
-    pairs: list[int] = []
+    equivalences: list[int] = []
 
     async def _similar(
-        a: int, b: int, verdict: DefinitionPairVerdict = DefinitionPairVerdict.SIMILAR
+        a: int, b: int, verdict: OutputEquivalenceVerdict = OutputEquivalenceVerdict.SIMILAR
     ) -> None:
         async with pool.acquire() as conn, conn.transaction():
-            pair, _ = await open_pair(
+            equivalence, _ = await open_equivalence(
                 conn, kind=DefinitionKind.MASK, definition_idxs=[a, b], principal_idx=owner
             )
-            await decide_pair(
+            await decide_equivalence(
                 conn,
-                definition_pair_idx=pair["definition_pair_idx"],
+                output_equivalence_idx=equivalence["output_equivalence_idx"],
                 verdict=verdict,
                 reason="same filter, checked against a mock community",
                 principal_idx=owner,
             )
-        pairs.append(pair["definition_pair_idx"])
+        equivalences.append(equivalence["output_equivalence_idx"])
 
     yield _similar
-    await delete_definition_pairs(pool, pairs)
+    await delete_output_equivalences(pool, equivalences)
 
 
 async def test_each_sample_is_counted_under_the_mask_it_resolves_to(ctx, similar):
@@ -325,7 +336,7 @@ async def test_each_sample_is_counted_under_the_mask_it_resolves_to(ctx, similar
         body = resp.json()
         assert body["mask_idx"] == anchor
         assert body["left_out"] == []
-        assert (body["decisions"]["as_of"], body["decisions"]["pairs_used"]) == (False, 1)
+        assert (body["decisions"]["as_of"], body["decisions"]["equivalences_used"]) == (False, 1)
         assert [
             (s["prep_sample_idx"], s["mask_idx"], s["read_counts"]) for s in body["samples"]
         ] == [
@@ -350,11 +361,12 @@ async def test_each_sample_is_counted_under_the_mask_it_resolves_to(ctx, similar
 
 
 @pytest.mark.parametrize("other", ["no_syndna", "other_reference"])
-async def test_masks_with_a_different_syndna_reference_cannot_be_decided_similar(
+async def test_masks_with_a_different_syndna_reference_cannot_be_decided_joining(
     ctx, similar, other
 ):
-    """Through the repository's decide, against the masks' stored params; not_similar
-    is still allowed. The export's own reference guard is unit-tested beside the route."""
+    """Through the repository's decide, against the masks' stored params: neither joining
+    verdict is allowed, and both non-joining ones are. The export's own reference guard is
+    unit-tested beside the route."""
     if other == "no_syndna":
         other_reference = None
         high = await _seed_syndna_mask(ctx, syndna=False)
@@ -363,10 +375,12 @@ async def test_masks_with_a_different_syndna_reference_cannot_be_decided_similar
         high = await _seed_syndna_mask(ctx, reference_idx=other_reference)
     try:
         low = await _seed_syndna_mask(ctx)
-        with pytest.raises(PairRefused) as ei:
-            await similar(low, high)
-        assert ei.value.reason is DefinitionPairRefusal.SYNDNA_REFERENCE_CHANGE
-        await similar(low, high, DefinitionPairVerdict.NOT_SIMILAR)
+        for verdict in sorted(JOINING_VERDICTS):
+            with pytest.raises(EquivalenceRefused) as ei:
+                await similar(low, high, verdict)
+            assert ei.value.reason is OutputEquivalenceRefusal.SYNDNA_REFERENCE_CHANGE
+        for verdict in sorted(NON_JOINING_VERDICTS):
+            await similar(low, high, verdict)
     finally:
         if other_reference is not None:
             await cleanup_reference_graph(

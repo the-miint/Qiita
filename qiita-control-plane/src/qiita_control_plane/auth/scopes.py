@@ -214,7 +214,8 @@ def validate_scopes_against_ceiling(
     return None
 
 
-# The lifecycle scope that governs each definition kind's pairs and settings edits.
+# The lifecycle scope that governs each definition kind's output equivalences and settings
+# edits.
 KIND_LIFECYCLE_SCOPE: Mapping[DefinitionKind, Scope] = {
     DefinitionKind.MASK: Scope.MASK_DEFINITION_LIFECYCLE,
     DefinitionKind.ALIGNMENT: Scope.ALIGNMENT_DEFINITION_LIFECYCLE,

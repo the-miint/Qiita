@@ -51,8 +51,8 @@ from ..auth.guards import (
 from ..auth.principal import HumanUser, Principal
 from ..decision_set import DecisionSetUnknown, load_decision_set
 from ..definition_similarity import (
+    EquivalenceRefused,
     Groups,
-    PairRefused,
     deprecated_upstreams,
     load_groups,
 )
@@ -1902,22 +1902,22 @@ def raise_transient_retry(detail: str) -> None:
     )
 
 
-def pair_refused_http(exc: PairRefused) -> HTTPException:
+def equivalence_refused_http(exc: EquivalenceRefused) -> HTTPException:
     """409 for a refusal by the definition-similarity rules: the message, the
-    `DefinitionPairRefusal` code, and the pairs the refusal names."""
+    `OutputEquivalenceRefusal` code, and the output equivalences the refusal names."""
     return HTTPException(
         status_code=409,
         detail={
             "detail": str(exc),
             "reason": exc.reason.value,
-            "definition_pair_idx": exc.definition_pair_idx,
+            "output_equivalence_idx": exc.output_equivalence_idx,
         },
     )
 
 
 def live_work_http(exc: AlignmentHasLiveWork | MaskHasLiveWork) -> HTTPException:
     """409 for a deprecation refused while work tickets under the definition are
-    unfinished, shaped as `pair_refused_http`'s is: the message, the
+    unfinished, shaped as `equivalence_refused_http`'s is: the message, the
     `DeprecationRefusal` code, and the tickets."""
     return HTTPException(
         status_code=409,

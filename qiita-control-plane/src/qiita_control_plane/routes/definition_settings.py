@@ -3,8 +3,8 @@ edit of a mask's, alignment's or processing's locked settings
 (`definition_settings` holds the steps and refusals).
 
 system_admin only, human callers only, with the kind's lifecycle scope, the scope the
-pair routes and a deprecation take. A refusal is a 409 whose detail carries a
-`reason` code (`DefinitionPairRefusal` or `DefinitionSettingsRefusal`); an edit that
+equivalence routes and a deprecation take. A refusal is a 409 whose detail carries a
+`reason` code (`OutputEquivalenceRefusal` or `DefinitionSettingsRefusal`); an edit that
 cannot take the group lock within its bounded retry is a 503 with Retry-After.
 """
 
@@ -28,11 +28,11 @@ from ..definition_settings import (
     SettingsEditRefused,
     edit_definition_settings,
 )
-from ..definition_similarity import DefinitionNotFound, GroupLockBusy, PairRefused
+from ..definition_similarity import DefinitionNotFound, EquivalenceRefused, GroupLockBusy
 from ..deps import TxConnFactory, get_tx_conn_factory
-from ..repositories.definition_pair import decode_jsonb
+from ..repositories.output_equivalence import decode_jsonb
 from ..repositories.params_storage import ParamsDoNotSurviveStorageError
-from ._helpers import pair_refused_http, raise_transient_retry
+from ._helpers import equivalence_refused_http, raise_transient_retry
 
 router = APIRouter(prefix=PATH_ADMIN_PREFIX, tags=["definition-settings"])
 
@@ -67,8 +67,8 @@ async def edit_definition_settings_route(
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except (SettingsEditInvalid, ParamsDoNotSurviveStorageError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    except PairRefused as exc:
-        raise pair_refused_http(exc) from exc
+    except EquivalenceRefused as exc:
+        raise equivalence_refused_http(exc) from exc
     except SettingsEditRefused as exc:
         raise HTTPException(
             status_code=409, detail={"detail": str(exc), "reason": exc.reason.value}
@@ -82,6 +82,6 @@ async def edit_definition_settings_route(
             "definition_idx": edit["definition_ref"],
             "old_settings": decode_jsonb(edit["old_settings"]),
             "new_settings": decode_jsonb(edit["new_settings"]),
-            "repaired_pair_idx": result.repaired_pair_idx,
+            "repaired_output_equivalence_idx": result.repaired_output_equivalence_idx,
         }
     )

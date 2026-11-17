@@ -54,7 +54,10 @@ from qiita_common.models import (
     SampleResolutionState,
 )
 from qiita_control_plane.repositories.block import MASK_SAMPLE_COMPLETED
-from qiita_control_plane.testing.db_teardown import delete_definition_pairs, teardown_entity_graph
+from qiita_control_plane.testing.db_teardown import (
+    delete_output_equivalences,
+    teardown_entity_graph,
+)
 
 from conftest import ducklake_connect
 
@@ -484,8 +487,8 @@ async def group_seeded(seeded, postgres_pool):
     """`seeded` plus a second mask decided similar to its mask (`mask_2`, the newer
     one), and two more samples on the same pool: `ps_2`, completed under both masks,
     and `ps_3`, with no run under either."""
-    from qiita_common.models import DefinitionKind, DefinitionPairVerdict
-    from qiita_control_plane.definition_similarity import decide_pair, open_pair
+    from qiita_common.models import DefinitionKind, OutputEquivalenceVerdict
+    from qiita_control_plane.definition_similarity import decide_equivalence, open_equivalence
     from qiita_control_plane.repositories.mask_definition import mint_mask_definition
     from qiita_control_plane.testing.db_seeds import (
         seed_biosample,
@@ -505,16 +508,16 @@ async def group_seeded(seeded, postgres_pool):
         )["mask_idx"]
     assert mask_2 > seeded["mask_idx"]
     async with postgres_pool.acquire() as conn, conn.transaction():
-        pair, _ = await open_pair(
+        equivalence, _ = await open_equivalence(
             conn,
             kind=DefinitionKind.MASK,
             definition_idxs=[seeded["mask_idx"], mask_2],
             principal_idx=owner,
         )
-        await decide_pair(
+        await decide_equivalence(
             conn,
-            definition_pair_idx=pair["definition_pair_idx"],
-            verdict=DefinitionPairVerdict.SIMILAR,
+            output_equivalence_idx=equivalence["output_equivalence_idx"],
+            verdict=OutputEquivalenceVerdict.SIMILAR,
             reason="same filter, checked against a mock community",
             principal_idx=owner,
         )
@@ -553,7 +556,7 @@ async def group_seeded(seeded, postgres_pool):
         "ps_3": ps_3,
     }
 
-    await delete_definition_pairs(postgres_pool, [pair["definition_pair_idx"]])
+    await delete_output_equivalences(postgres_pool, [equivalence["output_equivalence_idx"]])
     await teardown_entity_graph(
         postgres_pool, study_idxs=[], biosample_idxs=biosamples, prep_sample_idxs=preps
     )
@@ -682,7 +685,7 @@ async def test_masked_read_export_e2e_across_a_mask_group(
     assert files[name_2]["export_processing_id"] == handles[mask_2]
     # Both files were exported under the one decision set that grouped the masks.
     assert files[name_1]["decisions"] == files[name_2]["decisions"]
-    assert files[name_1]["decisions"]["pairs_used"] == 1
+    assert files[name_1]["decisions"]["equivalences_used"] == 1
     assert handles[mask_1] != handles[mask_2]
     for name, (ps, mask) in {name_1: (ps_1, mask_1), name_2: (ps_2, mask_2)}.items():
         assert files[name]["export_id"] == await postgres_pool.fetchval(

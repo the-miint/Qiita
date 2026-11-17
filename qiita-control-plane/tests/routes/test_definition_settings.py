@@ -9,20 +9,20 @@ import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 from qiita_common.api_paths import (
-    URL_ADMIN_DEFINITION_PAIR,
-    URL_ADMIN_DEFINITION_PAIR_DECISION,
-    URL_ADMIN_DEFINITION_PAIR_REVOKE,
     URL_ADMIN_DEFINITION_SETTINGS,
+    URL_ADMIN_OUTPUT_EQUIVALENCE,
+    URL_ADMIN_OUTPUT_EQUIVALENCE_DECISION,
+    URL_ADMIN_OUTPUT_EQUIVALENCE_REVOKE,
 )
 from qiita_common.hashing import canonical_params_hash
 from qiita_common.models import (
     ComputeTarget,
     DefinitionKind,
-    DefinitionPairRefusal,
-    DefinitionPairVerdict,
     DefinitionSettingsEditKind,
     DefinitionSettingsRefusal,
     FailureType,
+    OutputEquivalenceRefusal,
+    OutputEquivalenceVerdict,
     ScopeTargetKind,
     WorkTicketFailureStage,
     WorkTicketState,
@@ -31,7 +31,7 @@ from qiita_common.models import (
 from qiita_control_plane.repositories.alignment_definition import mint_alignment_definition
 from qiita_control_plane.repositories.mask_definition import mint_mask_definition
 from qiita_control_plane.repositories.processing import mint_processing
-from qiita_control_plane.testing.db_teardown import delete_definition_pairs
+from qiita_control_plane.testing.db_teardown import delete_output_equivalences
 
 pytestmark = pytest.mark.db
 
@@ -73,7 +73,7 @@ async def clients(postgres_pool, human_admin_session, wet_lab_admin_session):
 @pytest_asyncio.fixture
 async def defs(postgres_pool, human_admin_session):
     """`make(kind, **params)` mints a definition with unique params; every definition
-    and every pair naming one is removed afterwards."""
+    and every output equivalence naming one is removed afterwards."""
     owner = human_admin_session["principal_idx"]
     suffix = secrets.token_hex(4)
     made: dict[DefinitionKind, list[int]] = {k: [] for k in DefinitionKind}
@@ -119,10 +119,11 @@ async def defs(postgres_pool, human_admin_session):
     yield {"make": make, "owner": owner}
 
     for kind, idxs in made.items():
-        await delete_definition_pairs(
+        await delete_output_equivalences(
             postgres_pool,
             await postgres_pool.fetchval(
-                "SELECT coalesce(array_agg(definition_pair_idx), '{}') FROM qiita.definition_pair"
+                "SELECT coalesce(array_agg(output_equivalence_idx), '{}')"
+                "  FROM qiita.output_equivalence"
                 " WHERE definition_kind = $1 AND (low_definition_ref = ANY($2::bigint[])"
                 "      OR high_definition_ref = ANY($2::bigint[]))",
                 kind.value,
@@ -329,18 +330,28 @@ async def test_an_edit_that_changes_nothing_is_refused(clients, defs, postgres_p
     assert resp.json()["detail"]["reason"] == DefinitionSettingsRefusal.NO_CHANGE
 
 
-async def test_an_edit_is_refused_while_a_similar_pair_names_it_and_recomputes_others(
-    postgres_pool, clients, defs
+@pytest.mark.parametrize(
+    "joining, non_joining",
+    [
+        (OutputEquivalenceVerdict.SIMILAR, OutputEquivalenceVerdict.DIFFERENT),
+        (OutputEquivalenceVerdict.SAME, OutputEquivalenceVerdict.NOT_BENCHMARKED),
+    ],
+    ids=str,
+)
+async def test_an_edit_is_refused_while_a_joining_equivalence_names_it_and_recomputes_others(
+    postgres_pool, clients, defs, joining, non_joining
 ):
+    """Refused under either joining verdict; once re-decided with a non-joining one, the
+    edit goes through and recomputes that output equivalence's change."""
     a = await defs["make"](DefinitionKind.MASK, threshold=1)
     b = await defs["make"](DefinitionKind.MASK, threshold=2)
     opened = await clients["admin"].post(
-        URL_ADMIN_DEFINITION_PAIR, json={"definition_kind": "mask", "definition_idx": [a, b]}
+        URL_ADMIN_OUTPUT_EQUIVALENCE, json={"definition_kind": "mask", "definition_idx": [a, b]}
     )
-    pair_idx = opened.json()["definition_pair_idx"]
+    equivalence_idx = opened.json()["output_equivalence_idx"]
     decided = await clients["admin"].post(
-        URL_ADMIN_DEFINITION_PAIR_DECISION.format(definition_pair_idx=pair_idx),
-        json={"verdict": DefinitionPairVerdict.SIMILAR, "reason": _REASON},
+        URL_ADMIN_OUTPUT_EQUIVALENCE_DECISION.format(output_equivalence_idx=equivalence_idx),
+        json={"verdict": joining, "reason": _REASON},
     )
     assert decided.status_code == 200, decided.text
     new_params = {**await _params(postgres_pool, DefinitionKind.MASK, a), "threshold": 3}
@@ -349,8 +360,8 @@ async def test_an_edit_is_refused_while_a_similar_pair_names_it_and_recomputes_o
         _url(DefinitionKind.MASK, a), json={"params": new_params, "reason": _REASON}
     )
     assert resp.status_code == 409, resp.text
-    assert resp.json()["detail"]["reason"] == DefinitionPairRefusal.SIMILAR_PAIRS
-    assert resp.json()["detail"]["definition_pair_idx"] == [pair_idx]
+    assert resp.json()["detail"]["reason"] == OutputEquivalenceRefusal.JOINING_EQUIVALENCES
+    assert resp.json()["detail"]["output_equivalence_idx"] == [equivalence_idx]
     # The database refuses it too, even with a matching record.
     with pytest.raises(asyncpg.ObjectInUseError):
         await postgres_pool.execute(
@@ -362,17 +373,23 @@ async def test_an_edit_is_refused_while_a_similar_pair_names_it_and_recomputes_o
         )
 
     revoked = await clients["admin"].post(
-        URL_ADMIN_DEFINITION_PAIR_REVOKE.format(definition_pair_idx=pair_idx),
+        URL_ADMIN_OUTPUT_EQUIVALENCE_REVOKE.format(output_equivalence_idx=equivalence_idx),
         json={"reason": _REASON},
     )
     assert revoked.status_code == 200, revoked.text
+    redecided = await clients["admin"].post(
+        URL_ADMIN_OUTPUT_EQUIVALENCE_DECISION.format(output_equivalence_idx=equivalence_idx),
+        json={"verdict": non_joining, "reason": _REASON},
+    )
+    assert redecided.status_code == 200, redecided.text
     resp = await clients["admin"].patch(
         _url(DefinitionKind.MASK, a), json={"params": new_params, "reason": _REASON}
     )
     assert resp.status_code == 200, resp.text
-    assert resp.json()["repaired_pair_idx"] == [pair_idx]
+    assert resp.json()["repaired_output_equivalence_idx"] == [equivalence_idx]
     change = await postgres_pool.fetchval(
-        "SELECT change FROM qiita.definition_pair WHERE definition_pair_idx = $1", pair_idx
+        "SELECT change FROM qiita.output_equivalence WHERE output_equivalence_idx = $1",
+        equivalence_idx,
     )
     assert json.loads(change) == {"/threshold": [3, 2]}
 

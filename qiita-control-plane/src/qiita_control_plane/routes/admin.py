@@ -720,7 +720,7 @@ async def export_masked_read_manifest(
     unsubmitted prep_sample rather than the route silently dropping it.
 
     One read-only snapshot, so the roster and its resolution see one state of the
-    gates, tickets and pair decisions.
+    gates, tickets and output-equivalence verdicts.
     """
     async with pool.acquire() as conn, conn.transaction(isolation="repeatable_read", readonly=True):
         run_idx = await conn.fetchval(

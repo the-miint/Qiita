@@ -970,7 +970,7 @@ def add_as_of_event_argument(parser: argparse.ArgumentParser) -> None:
         help=(
             "Group the definitions under an earlier decision set: the"
             " `decisions.decision_set` an earlier output recorded (sha256:...). Only the"
-            " pair decisions are as of it; runs, gates, tickets and deprecation are read"
-            " as they are now"
+            " output-equivalence verdicts are as of it; runs, gates, tickets and deprecation"
+            " are read as they are now"
         ),
     )

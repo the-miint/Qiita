@@ -37,7 +37,7 @@ from qiita_common.models import (
 )
 
 from qiita_control_plane.definition_resolver import resolve_group
-from qiita_control_plane.definition_similarity import revoke_pair
+from qiita_control_plane.definition_similarity import revoke_equivalence
 from qiita_control_plane.repositories.alignment_definition import (
     ALIGNMENT_SAMPLE_COMPLETED,
     ALIGNMENT_SAMPLE_PENDING,
@@ -287,7 +287,7 @@ async def test_resolve_a_mask_group(ctx, alignment_group_world, other_pool_sampl
 async def test_as_of_a_decision_set_rebuilds_the_group_after_a_revoke(
     ctx, alignment_group_world, other_pool_sample
 ):
-    """The response records the decision set; after the pair is revoked, the current
+    """The response records the decision set; after the equivalence is revoked, the current
     resolution has no group, and the recorded decision set rebuilds the grouped one.
     A token that names no decision set is a 422."""
     w = alignment_group_world
@@ -296,20 +296,20 @@ async def test_as_of_a_decision_set_rebuilds_the_group_after_a_revoke(
     assert grouped.status_code == 200, grouped.text
     decisions = grouped.json()["decisions"]
     assert decisions["as_of"] is False
-    assert decisions["pairs_used"] == 1
+    assert decisions["equivalences_used"] == 1
     assert decisions["newest_event_at"] is not None
     assert decisions["as_of_scope"] == AS_OF_SCOPE
     token = decisions["decision_set"]
 
-    pair_idx = await ctx["pool"].fetchval(
-        "SELECT definition_pair_idx FROM qiita.definition_pair"
+    equivalence_idx = await ctx["pool"].fetchval(
+        "SELECT output_equivalence_idx FROM qiita.output_equivalence"
         " WHERE definition_kind = 'mask' AND low_definition_ref = $1 AND high_definition_ref = $2",
         *sorted([w["mask_idx"], w["mask_2"]]),
     )
     async with ctx["pool"].acquire() as conn, conn.transaction():
-        await revoke_pair(
+        await revoke_equivalence(
             conn,
-            definition_pair_idx=pair_idx,
+            output_equivalence_idx=equivalence_idx,
             reason="re-checked against the mock community",
             principal_idx=ctx["admin_session"]["principal_idx"],
         )
@@ -318,7 +318,7 @@ async def test_as_of_a_decision_set_rebuilds_the_group_after_a_revoke(
     assert current.status_code == 200, current.text
     assert current.json()["group"] == [w["mask_idx"]]
     assert current.json()["decisions"]["decision_set"] != token
-    assert current.json()["decisions"]["pairs_used"] == 0
+    assert current.json()["decisions"]["equivalences_used"] == 0
     assert _by_sample(current)[other_pool_sample]["state"] == NOT_PROCESSED
 
     as_of = await ctx["user"].post(

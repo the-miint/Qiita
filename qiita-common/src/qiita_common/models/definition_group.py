@@ -1,7 +1,7 @@
 """Per-sample resolution across a definition group, and its wire models.
 
-A group is the masks, alignments or processings that pair decisions (and, for
-alignments and processings, derivation) join; each prep_sample is resolved to one
+A group is the masks, alignments or processings that output-equivalence verdicts (and,
+for alignments and processings, derivation) join; each prep_sample is resolved to one
 member of it, or to none. The rules are in
 `qiita_control_plane.definition_resolver`.
 """
@@ -15,7 +15,7 @@ from typing import Annotated, Literal
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
 from qiita_common.models._base import PrepSampleCohort
-from qiita_common.models.definition_pair import DefinitionKind
+from qiita_common.models.output_equivalence import DefinitionKind
 
 
 class SampleResolutionState(StrEnum):
@@ -146,19 +146,21 @@ def deprecated_upstream_read_refusal(
 DecisionSetToken = Annotated[str, StringConstraints(pattern=r"^sha256:[0-9a-f]{64}$")]
 
 # What `as_of_event` rewinds, stated on every response and manifest that carries it.
-AS_OF_SCOPE = "pair decisions only; runs, gates, tickets and deprecation are current"
+AS_OF_SCOPE = "output-equivalence verdicts only; runs, gates, tickets and deprecation are current"
 
 
 class DecisionProvenance(BaseModel):
-    """The pair decisions a resolution was computed under, without internal ids.
+    """The output-equivalence verdicts a resolution was computed under, without internal ids.
 
-    `decision_set` is the token of every decided pair's verdict as of the resolution
+    `decision_set` is the token of every decided output equivalence's verdict as of the
+    resolution
     (`qiita_control_plane.decision_set` states the canonical form); passing it back as
     `as_of_event` rebuilds the groups from those decisions. `newest_event_at` is when the
     newest decision event in that state was recorded (None before any). `as_of` is true
-    when the caller asked for an earlier decision set. `pairs_used` / `pairs_used_set`
-    count and hash, in the same canonical form, the `similar` pairs that shaped the
-    groups the resolution read (`qiita_control_plane.decision_set`, "Pairs used")."""
+    when the caller asked for an earlier decision set. `equivalences_used` /
+    `equivalences_used_set` count and hash, in the same canonical form, the joining
+    output equivalences (`same` or `similar`) that shaped the groups the resolution read
+    (`qiita_control_plane.decision_set`, "Equivalences used")."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -166,8 +168,8 @@ class DecisionProvenance(BaseModel):
     newest_event_at: datetime | None
     as_of: bool
     as_of_scope: Literal[AS_OF_SCOPE] = AS_OF_SCOPE  # type: ignore[valid-type]
-    pairs_used: Annotated[int, Field(ge=0)]
-    pairs_used_set: DecisionSetToken
+    equivalences_used: Annotated[int, Field(ge=0)]
+    equivalences_used_set: DecisionSetToken
 
 
 class DefinitionGroupResolveRequest(BaseModel):

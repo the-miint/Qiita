@@ -97,13 +97,13 @@ from .masked_export import (
     _retry_seconds_arg,
     _write_masked_sample,
 )
+from .output_equivalence import add_output_equivalence_parser
 from .owner_id import (
     _OWNER_ID_BASE_COLUMNS,
     _OWNER_ID_POOL_COLUMNS,
     _handle_owner_biosample_id,
     _write_owner_biosample_id_tsv,
 )
-from .pair import add_pair_parser
 from .role import (
     _VALID_ROLE_VALUES,
     _handle_principal_set_role,
@@ -255,7 +255,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     add_fanout_parser(sub)
     add_alignment_parser(sub)
-    add_pair_parser(sub)
+    add_output_equivalence_parser(sub)
     add_definition_parser(sub)
 
     p_terminology = sub.add_parser("terminology", help="Terminology release operations")

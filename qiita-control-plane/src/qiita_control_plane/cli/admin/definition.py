@@ -24,8 +24,8 @@ def _render(body: dict | list) -> None:
             f"{body.get('definition_kind')} {body.get('definition_idx')}: settings edited"
             f" (edit {body.get('definition_settings_edit_idx')})"
         )
-        if body.get("repaired_pair_idx"):
-            line += f"; pairs recomputed: {body['repaired_pair_idx']}"
+        if body.get("repaired_output_equivalence_idx"):
+            line += f"; output equivalences recomputed: {body['repaired_output_equivalence_idx']}"
         print(line, file=sys.stderr)
 
 

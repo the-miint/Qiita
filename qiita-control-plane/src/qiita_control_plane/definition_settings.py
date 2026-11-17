@@ -6,9 +6,9 @@ READ COMMITTED transaction, holding the group lock exclusive (an edit changes wh
 groups are computed from):
 
   1. the definition exists (`DefinitionNotFound`);
-  2. no live `similar` pair names it (`PairRefused`, `similar_pairs`): the groups that
-     pair joins were decided over the old settings, so it is revoked first, as for a
-     deprecation or a delete;
+  2. no live joining output equivalence names it (`EquivalenceRefused`,
+     `joining_equivalences`): the groups it joins were decided over the old settings, so
+     it is revoked first, as for a deprecation or a delete;
   2a. no unfinished work ticket runs under it (`live_work`): its output would be
      recorded under settings it did not run with. The definition row is held
      `FOR UPDATE`; a ticket's write of the definition column waits on it (the
@@ -29,17 +29,18 @@ groups are computed from):
      params (`SettingsEditRefused`, `no_change` / `params_taken`; a concurrent mint
      of the same params that the check misses hits the `params_hash` UNIQUE
      constraint, which is refused the same way);
-  4. each live pending or not_similar pair naming it gets its `change` and
-     `derived_only` recomputed from the new params, by the rule a pair is opened
-     with (`check_open`), which refuses an edit that would leave such a pair across
-     comparison scopes or with no difference. Their verdicts stay: a not_similar
-     decision joins nothing, so a stale one cannot merge groups;
+  4. each live output equivalence naming it that does not join (pending, or a
+     `NON_JOINING_VERDICTS` verdict) gets its `change` and `derived_only` recomputed from
+     the new params, by the rule an output equivalence is opened with (`check_open`),
+     which refuses an edit that would leave one across comparison scopes or with no
+     difference. Their verdicts stay: a non-joining decision joins nothing, so a stale
+     one cannot merge groups;
   5. `qiita.edit_definition_settings` records the edit (actor, old and new values,
      reason) and makes it.
 
 The database itself enforces only that a locked change is audited and that no live
-`similar` pair names the row (the lock trigger); steps 2a, 2b, 3 and 4 are checks of
-this path, as deprecation's live-work check is of its route.
+joining output equivalence names the row (the lock trigger); steps 2a, 2b, 3 and 4 are
+checks of this path, as deprecation's live-work check is of its route.
 
 Before any of these, the request itself is checked (`SettingsEditInvalid`): an
 alignment has no workflow or version column, and a mask's or processing's workflow and
@@ -58,24 +59,23 @@ from qiita_common.hashing import canonical_params_hash
 from qiita_common.models import (
     NON_TERMINAL_WORK_TICKET_STATES,
     DefinitionKind,
-    DefinitionPairRefusal,
-    DefinitionPairVerdict,
     DefinitionSettingsRefusal,
+    OutputEquivalenceRefusal,
 )
 
 from .definition_similarity import (
     DefinitionNotFound,
-    PairRefused,
+    EquivalenceRefused,
     check_open,
     is_derived_only,
 )
 from .repositories import require_transaction
-from .repositories.definition_pair import (
+from .repositories.output_equivalence import (
     DEFINITION_TABLES,
     DefinitionRow,
     DefinitionTable,
     fetch_definition,
-    fetch_similar_pairs_naming,
+    fetch_joining_equivalences_naming,
     lock_groups_exclusive,
 )
 from .repositories.params_storage import assert_params_survive_storage
@@ -94,7 +94,7 @@ class SettingsEditInvalid(Exception):
 
 
 class SettingsEditRefused(Exception):
-    """An edit refused by a rule of this module, not a pair rule."""
+    """An edit refused by a rule of this module, not an equivalence rule."""
 
     def __init__(self, reason: DefinitionSettingsRefusal, message: str) -> None:
         super().__init__(message)
@@ -104,7 +104,7 @@ class SettingsEditRefused(Exception):
 @dataclass(frozen=True)
 class SettingsEditResult:
     edit: asyncpg.Record
-    repaired_pair_idx: list[int]
+    repaired_output_equivalence_idx: list[int]
 
 
 async def edit_definition_settings(
@@ -119,7 +119,7 @@ async def edit_definition_settings(
     principal_idx: int,
 ) -> SettingsEditResult:
     """Edit `kind` `idx`'s settings by the steps in the module docstring. Raises
-    DefinitionNotFound, SettingsEditInvalid, PairRefused, SettingsEditRefused,
+    DefinitionNotFound, SettingsEditInvalid, EquivalenceRefused, SettingsEditRefused,
     GroupLockBusy or ParamsDoNotSurviveStorageError."""
     require_transaction(conn)
     t = DEFINITION_TABLES[kind]
@@ -147,12 +147,13 @@ async def edit_definition_settings(
             + ". The column and the params key are written together at the mint; give"
             " both the same value"
         )
-    similar = await fetch_similar_pairs_naming(conn, kind, idx)
-    if similar:
-        raise PairRefused(
-            DefinitionPairRefusal.SIMILAR_PAIRS,
-            f"{kind.value} {idx} is a side of similar pair(s) {similar}; revoke them first",
-            definition_pair_idx=similar,
+    joined = await fetch_joining_equivalences_naming(conn, kind, idx)
+    if joined:
+        raise EquivalenceRefused(
+            OutputEquivalenceRefusal.JOINING_EQUIVALENCES,
+            f"{kind.value} {idx} is a side of joining output equivalence(s) {joined};"
+            " revoke them first",
+            output_equivalence_idx=joined,
         )
     await _refuse_live_work(conn, t, kind, idx)
     await _refuse_published(conn, t, kind, idx)
@@ -175,7 +176,7 @@ async def edit_definition_settings(
         deprecated=current.deprecated,
         workflow=workflow if workflow is not None else current.workflow,
     )
-    repaired = await _recompute_pairs(conn, edited)
+    repaired = await _recompute_equivalences(conn, edited)
 
     try:
         edit_idx = await conn.fetchval(
@@ -201,7 +202,7 @@ async def edit_definition_settings(
         "SELECT * FROM qiita.definition_settings_edit WHERE definition_settings_edit_idx = $1",
         edit_idx,
     )
-    return SettingsEditResult(edit=edit, repaired_pair_idx=repaired)
+    return SettingsEditResult(edit=edit, repaired_output_equivalence_idx=repaired)
 
 
 # The tables whose live rows cite a definition by the kind's id column.
@@ -297,18 +298,18 @@ def _params_taken(kind: DefinitionKind, idx: int, holder: str) -> SettingsEditRe
     )
 
 
-async def _recompute_pairs(conn: asyncpg.Connection, edited: DefinitionRow) -> list[int]:
-    """Recompute `change` and `derived_only` of every live pending or not_similar pair
-    naming `edited`, from its new params. Returns the pairs, ascending."""
+async def _recompute_equivalences(conn: asyncpg.Connection, edited: DefinitionRow) -> list[int]:
+    """Recompute `change` and `derived_only` of every live output equivalence naming
+    `edited` that does not join, from its new params. Returns their idxs, ascending."""
     rows = await conn.fetch(
-        "SELECT definition_pair_idx, low_definition_ref, high_definition_ref"
-        "  FROM qiita.definition_pair"
-        " WHERE definition_kind = $1 AND detached_at IS NULL AND verdict <> $3"
+        "SELECT output_equivalence_idx, low_definition_ref, high_definition_ref"
+        "  FROM qiita.output_equivalence"
+        " WHERE definition_kind = $1 AND detached_at IS NULL"
+        "   AND NOT qiita.output_equivalence_verdict_joins(verdict)"
         "   AND $2 IN (low_definition_ref, high_definition_ref)"
-        " ORDER BY definition_pair_idx",
+        " ORDER BY output_equivalence_idx",
         edited.kind.value,
         edited.idx,
-        DefinitionPairVerdict.SIMILAR.value,
     )
     repaired = []
     for row in rows:
@@ -320,24 +321,25 @@ async def _recompute_pairs(conn: asyncpg.Connection, edited: DefinitionRow) -> l
         other = await fetch_definition(conn, edited.kind, other_idx)
         if other is None:
             raise RuntimeError(
-                f"definition_pair {row['definition_pair_idx']} is live but"
+                f"output_equivalence {row['output_equivalence_idx']} is live but"
                 f" {edited.kind.value} {other_idx} is gone"
             )
         low, high = (edited, other) if edited.idx < other_idx else (other, edited)
         try:
             change = check_open(low, high)
-        except PairRefused as exc:
-            raise PairRefused(
+        except EquivalenceRefused as exc:
+            raise EquivalenceRefused(
                 exc.reason,
-                f"the edit would leave definition_pair {row['definition_pair_idx']} invalid: {exc}",
-                definition_pair_idx=[row["definition_pair_idx"]],
+                f"the edit would leave output_equivalence {row['output_equivalence_idx']}"
+                f" invalid: {exc}",
+                output_equivalence_idx=[row["output_equivalence_idx"]],
             ) from exc
         await conn.execute(
-            "UPDATE qiita.definition_pair SET change = $2::jsonb, derived_only = $3"
-            " WHERE definition_pair_idx = $1",
-            row["definition_pair_idx"],
+            "UPDATE qiita.output_equivalence SET change = $2::jsonb, derived_only = $3"
+            " WHERE output_equivalence_idx = $1",
+            row["output_equivalence_idx"],
             json.dumps(change),
             is_derived_only(edited.kind, low.params, high.params, change),
         )
-        repaired.append(row["definition_pair_idx"])
+        repaired.append(row["output_equivalence_idx"])
     return repaired

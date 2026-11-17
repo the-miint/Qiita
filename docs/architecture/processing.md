@@ -330,22 +330,27 @@ Each service exposes a health check endpoint for monitoring and deployment verif
 
 Postgres-based (`SELECT ... FOR UPDATE SKIP LOCKED`). Work tickets created by qiita-control-plane. Work ticket state transitions driven by callbacks from data plane and compute orchestrator.
 
-## Similar definitions
+## Output equivalence
 
 A mask, an alignment or a processing is a definition minted from its params, so a
 changed setting mints a new one and the prep_samples run under each are split across
-the two. A system_admin records whether two definitions of one kind are `similar`
-(`qiita.definition_pair`, with its history in `qiita.definition_pair_event`, which
-refuses UPDATE and DELETE and keeps its pair from being deleted;
-migration `20261113000000_definition_pair.sql`). A hand DELETE of a definition
-detaches its pairs, and is refused while a `similar` pair names it (the trigger
-`refuse_definition_delete_under_similar_pair` in that migration says why). The procedure is
-[`runbooks/deciding-similar-definitions.md`](../runbooks/deciding-similar-definitions.md).
+the two. A system_admin records an output equivalence: one verdict on whether two
+definitions of one kind give equivalent outputs (`qiita.output_equivalence`, with its
+history in `qiita.output_equivalence_event`, which refuses UPDATE and DELETE and keeps
+its output equivalence from being deleted; migration
+`20261113000000_output_equivalence.sql`). `same` and `similar` join the group,
+`different` and `not_benchmarked` keep the two apart, and `pending` is undecided
+(`qiita_common.models.JOINING_VERDICTS` and its SQL twin
+`qiita.output_equivalence_verdict_joins`). A hand DELETE of a definition detaches the
+output equivalences naming it, and is refused while a joining one names it (the trigger
+`refuse_definition_delete_under_joining_equivalence` in that migration says why). The
+procedure is
+[`runbooks/deciding-output-equivalence.md`](../runbooks/deciding-output-equivalence.md).
 
 - **Groups are computed on read.** Nothing stores a group: `definition_similarity`
-  derives them from the definitions' params and the live pairs on each call. Its
-  module docstring holds the rules and every refusal, among them that two masks
-  differing in SynDNA reference are never `similar`, so every mask of a group counts
+  derives them from the definitions' params and the live output equivalences on each
+  call. Its module docstring holds the rules and every refusal, among them that two
+  masks differing in SynDNA reference are never joined, so every mask of a group counts
   SynDNA against one reference.
 - **The resolver** (`definition_resolver`) answers, for each prep_sample, which member
   of a group its results are read from: `processed` under that member, `incomplete`,
@@ -375,10 +380,10 @@ detaches its pairs, and is refused while a `similar` pair names it (the trigger
   prep_samples the read cannot use; the rules are stated at
   `definition_resolver.NO_RUN_TO_READ`.
 - **The group lock** is one Postgres advisory lock over every kind's groups
-  (`repositories/definition_pair.py`). A decide or revoke takes it exclusive, by
+  (`repositories/output_equivalence.py`). A decide or revoke takes it exclusive, by
   try-lock with a bounded retry and a 503 when it stays busy; the three deprecation
-  routes take it shared before reading the pairs that name the definition, so a
-  `similar` decision and the deprecation of one of its sides cannot both commit.
+  routes take it shared before reading the output equivalences that name the
+  definition, so a joining decision and the deprecation of one of its sides cannot both commit.
   Readers of the groups take no lock: they read one REPEATABLE READ snapshot.
 - **Settings are locked after the mint.** A definition's params, params_hash and
   workflow / version columns change only through the audited edit
@@ -388,9 +393,10 @@ detaches its pairs, and is refused while a `similar` pair names it (the trigger
   params, and is refused under live work or a published handle (`definition_settings`
   states the refusals).
 - **Decision provenance.** Every resolution records the decision set it was computed
-  under (`decision_set`): a content hash of every decided pair's verdict, replayed from
-  `qiita.definition_pair_event` in the resolution's snapshot, so no pair or event idx
-  leaves the system. Passed back as `as_of_event`, it makes `load_groups` read the
-  pairs' verdicts at that point and everything else as it is now; the guards never use
-  it. `pairs_used` counts the `similar` pairs that shaped the groups read
-  (`decision_set.py`, "Pairs used").
+  under (`decision_set`): a content hash of every decided output equivalence's verdict,
+  replayed from `qiita.output_equivalence_event` in the resolution's snapshot, so no
+  output-equivalence or event idx leaves the system. Passed back as `as_of_event`, it
+  makes `load_groups` read the output equivalences' verdicts at that point and
+  everything else as it is now; the guards never use it. `equivalences_used` counts the
+  joining output equivalences that shaped the groups read (`decision_set.py`,
+  "Equivalences used").

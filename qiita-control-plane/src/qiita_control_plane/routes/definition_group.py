@@ -51,7 +51,7 @@ async def resolve_definition_group_route(
     cohort is said; 403 when the caller may not read every prep_sample. Each
     prep_sample's `work_ticket_idx` is omitted unless the caller is a system_admin.
 
-    `decisions` records the pair decisions the group was computed under; passing its
+    `decisions` records the equivalence decisions the group was computed under; passing its
     `decision_set` back as `as_of_event` computes the group from those decisions again,
     with runs, gates, tickets and deprecation read as they are now (422 for a token
     that names no decision set). `include_deprecated` and `include_deprecated_upstream`

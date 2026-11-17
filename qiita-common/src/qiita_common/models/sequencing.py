@@ -47,7 +47,7 @@ from qiita_common.models.definition_group import (
     SampleResolutionReason,
     SampleResolutionState,
 )
-from qiita_common.models.definition_pair import DefinitionKind
+from qiita_common.models.output_equivalence import DefinitionKind
 from qiita_common.models.reference import Platform
 from qiita_common.models.step import ProjectionColumns
 from qiita_common.models.work_ticket import WorkTicketState
@@ -1222,7 +1222,7 @@ class SyndnaReadCountResponse(BaseModel):
     left_out_biosample_accession: dict[int, str | None] = {}
     deprecated: bool = False
     deprecation_reason: str | None = None
-    # The pair decisions the selection was resolved under (`DecisionProvenance`).
+    # The output-equivalence verdicts the selection was resolved under (`DecisionProvenance`).
     decisions: DecisionProvenance | None = None
 
     @model_validator(mode="after")
@@ -1861,7 +1861,7 @@ class MaskedReadExportManifest(BaseModel):
     samples: list[MaskedReadExportSample]
     deprecated: bool = False
     deprecation_reason: str | None = None
-    # The pair decisions the roster was resolved under.
+    # The output-equivalence verdicts the roster was resolved under.
     decisions: DecisionProvenance | None = None
 
 
@@ -1884,5 +1884,5 @@ class MaskedReadExportTicketRequest(BaseModel):
     # it exactly (`definition_resolver`, exact mode).
     include_deprecated: bool = False
     # Resolve the mask's group under this earlier decision set
-    # (`DecisionProvenance.decision_set`); only the pair decisions are as of it.
+    # (`DecisionProvenance.decision_set`); only the output-equivalence verdicts are as of it.
     as_of_event: DecisionSetToken | None = None

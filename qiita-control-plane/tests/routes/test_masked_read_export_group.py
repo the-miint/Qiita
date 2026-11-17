@@ -20,21 +20,21 @@ from qiita_common.api_paths import (
     URL_ADMIN_SEQUENCED_POOL_MASKED_READ_EXPORT,
 )
 from qiita_common.models import (
+    JOINING_VERDICTS,
     DefinitionGroupRefusal,
     DefinitionKind,
-    DefinitionPairVerdict,
     MaskDefinitionStatus,
     SampleResolutionReason,
     SampleResolutionState,
     WorkTicketState,
 )
 
-from qiita_control_plane.definition_similarity import decide_pair, open_pair
+from qiita_control_plane.definition_similarity import decide_equivalence, open_equivalence
 from qiita_control_plane.main import app
 from qiita_control_plane.repositories.block import MASK_SAMPLE_COMPLETED
 from qiita_control_plane.repositories.mask_definition import transition_mask_definition_status
 from qiita_control_plane.testing.db_seeds import seed_biosample_with_sequenced_prep_sample
-from qiita_control_plane.testing.db_teardown import delete_definition_pairs
+from qiita_control_plane.testing.db_teardown import delete_output_equivalences
 
 from . import test_mask_definition_read as mask_read
 from .conftest import role_keyed_clients  # noqa: F401
@@ -91,9 +91,11 @@ async def _add_to_pool(ctx, *, pool_idx: int) -> int:
     return prep_sample_idx
 
 
-@pytest_asyncio.fixture
-async def group(ctx):
-    """Masks `low` < `high`, decided similar, and one pool of four samples:
+@pytest_asyncio.fixture(params=sorted(JOINING_VERDICTS), ids=str)
+async def group(ctx, request):
+    """Masks `low` < `high`, decided with a joining verdict (each test runs once per
+    verdict in `JOINING_VERDICTS`, which behave identically), and one pool of four
+    samples:
 
     - `on_low`: completed under `low` only → processed under `low`;
     - `on_both`: completed under both → processed under `high` (the newest);
@@ -107,13 +109,13 @@ async def group(ctx):
     high = await _seed_mask(ctx, params=json.dumps({"t": f"high-{secrets.token_hex(4)}"}))
     assert low < high
     async with pool.acquire() as conn, conn.transaction():
-        pair, _ = await open_pair(
+        equivalence, _ = await open_equivalence(
             conn, kind=DefinitionKind.MASK, definition_idxs=[low, high], principal_idx=owner
         )
-        await decide_pair(
+        await decide_equivalence(
             conn,
-            definition_pair_idx=pair["definition_pair_idx"],
-            verdict=DefinitionPairVerdict.SIMILAR,
+            output_equivalence_idx=equivalence["output_equivalence_idx"],
+            verdict=request.param,
             reason="same filter, checked against a mock community",
             principal_idx=owner,
         )
@@ -146,7 +148,7 @@ async def group(ctx):
         "ticket": ticket,
     }
 
-    await delete_definition_pairs(pool, [pair["definition_pair_idx"]])
+    await delete_output_equivalences(pool, [equivalence["output_equivalence_idx"]])
 
 
 @pytest.mark.parametrize("anchor", ["low", "high"])
@@ -193,7 +195,7 @@ async def test_roster_and_ticket_record_and_take_the_decision_set(ctx, group):
     )
     assert roster.status_code == 200, roster.text
     decisions = roster.json()["decisions"]
-    assert (decisions["as_of"], decisions["pairs_used"]) == (False, 1)
+    assert (decisions["as_of"], decisions["equivalences_used"]) == (False, 1)
 
     ticket = await ctx["admin"].post(
         URL_ADMIN_MASKED_READ_EXPORT_TICKET,

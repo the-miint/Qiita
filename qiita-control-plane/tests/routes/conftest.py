@@ -64,7 +64,10 @@ from qiita_control_plane.testing.db_seeds import (
     seed_study,
     seed_user_principal,
 )
-from qiita_control_plane.testing.db_teardown import delete_definition_pairs, teardown_entity_graph
+from qiita_control_plane.testing.db_teardown import (
+    delete_output_equivalences,
+    teardown_entity_graph,
+)
 from qiita_control_plane.testing.unique_names import unique_field_name
 
 # Bounds every wait on a request task, so a request that never returns fails
@@ -1618,25 +1621,25 @@ async def alignment_group_world(pool_alignment_seed, role_keyed_clients):
 
     `gate(table, definition_idx, prep_sample_idx, state)` upserts a gate row, with
     the invalidation provenance an 'invalidated' row requires."""
-    from qiita_common.models import DefinitionKind, DefinitionPairVerdict
+    from qiita_common.models import DefinitionKind, OutputEquivalenceVerdict
 
-    from qiita_control_plane.definition_similarity import decide_pair, open_pair
+    from qiita_control_plane.definition_similarity import decide_equivalence, open_equivalence
 
     seed = pool_alignment_seed
     pool = role_keyed_clients["pool"]
     owner = seed["owner_idx"]
     mask_2 = await _mint_mask(pool, owner_idx=owner, tag=f"mask-2-{uuid.uuid4()}")
     async with pool.acquire() as conn, conn.transaction():
-        pair, _ = await open_pair(
+        equivalence, _ = await open_equivalence(
             conn,
             kind=DefinitionKind.MASK,
             definition_idxs=[seed["mask_idx"], mask_2],
             principal_idx=owner,
         )
-        await decide_pair(
+        await decide_equivalence(
             conn,
-            definition_pair_idx=pair["definition_pair_idx"],
-            verdict=DefinitionPairVerdict.SIMILAR,
+            output_equivalence_idx=equivalence["output_equivalence_idx"],
+            verdict=OutputEquivalenceVerdict.SIMILAR,
             reason="same filter, reviewed against the mock community",
             principal_idx=owner,
         )
@@ -1671,7 +1674,7 @@ async def alignment_group_world(pool_alignment_seed, role_keyed_clients):
 
     yield {**seed, "mask_2": mask_2, "align_3": align_3, "gate": gate}
 
-    await delete_definition_pairs(pool, [pair["definition_pair_idx"]])
+    await delete_output_equivalences(pool, [equivalence["output_equivalence_idx"]])
     # These two are this fixture's own parents; deleting them clears their swept
     # alignment_sample / mask_sample rows (ON DELETE CASCADE) ahead of the seed's sweep.
     await pool.execute("DELETE FROM qiita.alignment_definition WHERE alignment_idx = $1", align_3)

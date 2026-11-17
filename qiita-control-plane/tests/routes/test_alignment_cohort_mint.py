@@ -407,7 +407,7 @@ async def test_human_mint_rejects_a_service_account(
 async def test_human_mint_refuses_a_sample_resolved_to_another_alignment_409(
     ctx, alignment_group_world
 ):
-    """ps_a is masked under both similar masks and aligned under both group members,
+    """ps_a is masked under both grouped masks and aligned under both group members,
     so it resolves to the newer alignment, align_3. Naming align_1 is refused, naming
     the alignment it resolves to; naming align_3 is signed."""
     w = alignment_group_world
@@ -433,9 +433,10 @@ async def test_human_mint_refuses_a_sample_resolved_to_another_alignment_409(
         _mint_url(w["align_3"]), json={"prep_sample_idx": [w["ps_a"]], "columns": _COLUMNS}
     )
     assert resp.status_code == 201, resp.text
-    # The mask pair the alignment group derives from is the decision it was signed under.
+    # The mask output equivalence the alignment group derives from is the decision it was
+    # signed under.
     decisions = resp.json()["decisions"]
-    assert (decisions["as_of"], decisions["pairs_used"]) == (False, 1)
+    assert (decisions["as_of"], decisions["equivalences_used"]) == (False, 1)
     unknown = await ctx["user"].post(
         _mint_url(w["align_3"]),
         json={

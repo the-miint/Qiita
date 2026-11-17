@@ -128,7 +128,7 @@ reference are refused. `--format parquet` writes the same values with the zero c
 kept. Beside the table the CLI writes `<output>.metadata.json` (each sample's mask
 handle, the left-out prep_samples, and the decision set read), and a deprecated `M` is
 read only with `--include-deprecated`; both are described in
-[deciding-similar-definitions.md](deciding-similar-definitions.md). Each prep_sample's `sample_id` is its biosample accession; `--prefix-pool` makes it
+[deciding-output-equivalence.md](deciding-output-equivalence.md). Each prep_sample's `sample_id` is its biosample accession; `--prefix-pool` makes it
 `<sequenced_pool_idx>_<accession>` when one biosample was sequenced on two pools.
 Inserts are named by the taxonomy's `species` rank, read from the data plane (hence
 `--data-plane-url`); load the insert reference with each insert's FASTA header as its

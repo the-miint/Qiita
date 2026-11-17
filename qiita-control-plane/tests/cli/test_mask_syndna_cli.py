@@ -19,8 +19,8 @@ _DECISIONS = {
     "newest_event_at": "2026-11-16T10:00:00Z",
     "as_of": True,
     "as_of_scope": AS_OF_SCOPE,
-    "pairs_used": 1,
-    "pairs_used_set": "sha256:" + "2" * 64,
+    "equivalences_used": 1,
+    "equivalences_used_set": "sha256:" + "2" * 64,
 }
 
 

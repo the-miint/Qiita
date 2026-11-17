@@ -1,5 +1,5 @@
 """Unit tests for the per-sample group resolver: which member a sample resolves to,
-and each incomplete / not-processed reason. No database: definitions, pairs and run
+and each incomplete / not-processed reason. No database: definitions, equivalences and run
 observations are built in memory and handed to the pure core."""
 
 from datetime import UTC, datetime, timedelta
@@ -9,7 +9,7 @@ import pytest
 from qiita_common.models import (
     DefinitionGroupRefusal,
     DefinitionKind,
-    DefinitionPairVerdict,
+    OutputEquivalenceVerdict,
     SampleResolutionReason,
     SampleResolutionState,
     WorkTicketState,
@@ -25,7 +25,7 @@ from qiita_control_plane.definition_resolver import (
     resolve_sample,
 )
 from qiita_control_plane.definition_similarity import (
-    PairState,
+    EquivalenceState,
     compute_groups,
     is_derived_only,
     param_diff,
@@ -44,13 +44,13 @@ from qiita_control_plane.repositories.block import (
     MASK_SAMPLE_INVALIDATED,
     MASK_SAMPLE_PENDING,
 )
-from qiita_control_plane.repositories.definition_pair import DefinitionRow
 from qiita_control_plane.repositories.definition_run import (
     SOURCE_BLOCK_TICKET,
     SOURCE_GATE,
     SOURCE_SAMPLE_TICKET,
     RunRow,
 )
+from qiita_control_plane.repositories.output_equivalence import DefinitionRow
 
 MASK = DefinitionKind.MASK
 ALIGNMENT = DefinitionKind.ALIGNMENT
@@ -62,7 +62,7 @@ R = SampleResolutionReason
 S = 900  # the prep_sample every test resolves
 T0 = datetime(2026, 1, 1, tzinfo=UTC)  # a row's `at` where the order of changes is moot
 
-_pair_ids = count(1000)
+_equivalence_ids = count(1000)
 
 
 def mask(idx, *, deprecated=False):
@@ -117,17 +117,18 @@ def denovo(idx, mask_idx, processing_idx):
     )
 
 
-def similar(definitions, kind, a, b):
+def similar(definitions, kind, a, b, verdict=OutputEquivalenceVerdict.SIMILAR):
+    """A decided output equivalence of `a` and `b`; `verdict` is `similar` unless given."""
     by_key = {(d.kind, d.idx): d for d in definitions}
     low, high = sorted((a, b))
     lo, hi = by_key[(kind, low)], by_key[(kind, high)]
     change = param_diff(lo.params, hi.params)
-    return PairState(
-        idx=next(_pair_ids),
+    return EquivalenceState(
+        idx=next(_equivalence_ids),
         kind=kind,
         low=low,
         high=high,
-        verdict=DefinitionPairVerdict.SIMILAR,
+        verdict=verdict,
         change=change,
         derived_only=is_derived_only(kind, lo.params, hi.params, change),
     )
@@ -141,15 +142,15 @@ def gate(state, *tickets):
     return RunObservation(gate=state, unfinished=tuple(tickets))
 
 
-def resolve(definitions, pairs, kind, idx, observations):
-    groups = compute_groups(definitions, pairs)
+def resolve(definitions, equivalences, kind, idx, observations):
+    groups = compute_groups(definitions, equivalences)
     return resolve_sample(groups, kind, idx, S, observations)
 
 
 # Masks 5 and 12 decided similar; alignments 50 (on 5) and 120 (on 12) are then one
 # group by derivation.
 DEFS = [mask(5), mask(12), block(50, 5), block(120, 12)]
-PAIRS = [similar(DEFS, MASK, 5, 12)]
+EQUIVALENCES = [similar(DEFS, MASK, 5, 12)]
 
 
 # ---------------------------------------------------------------------------
@@ -159,18 +160,18 @@ PAIRS = [similar(DEFS, MASK, 5, 12)]
 
 def test_highest_id_member_with_a_run_is_used():
     obs = {MASK: {(5, S): done(), (12, S): done()}}
-    r = resolve(DEFS, PAIRS, MASK, 5, obs)
+    r = resolve(DEFS, EQUIVALENCES, MASK, 5, obs)
     assert (r.state, r.definition_idx, r.reason) == (PROCESSED, 12, None)
 
 
 def test_a_sample_with_a_run_only_under_the_older_member_resolves_to_it():
     obs = {MASK: {(5, S): done()}}
-    r = resolve(DEFS, PAIRS, MASK, 12, obs)
+    r = resolve(DEFS, EQUIVALENCES, MASK, 12, obs)
     assert (r.state, r.definition_idx) == (PROCESSED, 5)
 
 
 def test_no_member_with_a_run_is_no_run():
-    r = resolve(DEFS, PAIRS, MASK, 5, {})
+    r = resolve(DEFS, EQUIVALENCES, MASK, 5, {})
     assert (r.state, r.definition_idx, r.reason) == (NOT_PROCESSED, None, R.NO_RUN)
 
 
@@ -178,6 +179,40 @@ def test_a_definition_outside_any_group_resolves_alone():
     defs = [mask(5), mask(12)]
     obs = {MASK: {(12, S): done()}}
     assert resolve(defs, [], MASK, 5, obs).reason is R.NO_RUN
+
+
+@pytest.mark.parametrize(
+    "kind, idx, obs",
+    [
+        (MASK, 5, {MASK: {(5, S): done(), (12, S): done()}}),
+        (MASK, 12, {MASK: {(5, S): done()}}),
+        (MASK, 5, {}),
+        (ALIGNMENT, 50, {ALIGNMENT: {(50, S): done(), (120, S): done()}}),
+        (ALIGNMENT, 120, {ALIGNMENT: {(50, S): done()}}),
+    ],
+    ids=["mask-newest", "mask-older-only", "mask-no-run", "derived-newest", "derived-older"],
+)
+def test_a_same_decision_resolves_exactly_as_a_similar_one(kind, idx, obs):
+    """Masks 5 and 12 decided `same` give every resolution, the derived alignment group
+    included, that a `similar` decision gives."""
+    same = [similar(DEFS, MASK, 5, 12, OutputEquivalenceVerdict.SAME)]
+    assert resolve(DEFS, same, kind, idx, obs) == resolve(DEFS, EQUIVALENCES, kind, idx, obs)
+    assert compute_groups(DEFS, same).group_of(kind, idx) == compute_groups(
+        DEFS, EQUIVALENCES
+    ).group_of(kind, idx)
+    assert len(compute_groups(DEFS, same).group_of(kind, idx)) == 2
+
+
+@pytest.mark.parametrize(
+    "verdict",
+    [OutputEquivalenceVerdict.DIFFERENT, OutputEquivalenceVerdict.NOT_BENCHMARKED],
+    ids=str,
+)
+def test_a_non_joining_decision_resolves_each_definition_alone(verdict):
+    apart = [similar(DEFS, MASK, 5, 12, verdict)]
+    obs = {MASK: {(12, S): done()}}
+    assert resolve(DEFS, apart, MASK, 5, obs).reason is R.NO_RUN
+    assert compute_groups(DEFS, apart).group_of(ALIGNMENT, 50) == frozenset({50})
 
 
 # ---------------------------------------------------------------------------
@@ -190,7 +225,7 @@ def test_a_definition_outside_any_group_resolves_alone():
 )
 def test_a_waiting_or_running_ticket_under_the_newest_member_is_in_progress(ticket_state):
     obs = {MASK: {(5, S): done(), (12, S): gate(MASK_SAMPLE_PENDING, (77, ticket_state))}}
-    r = resolve(DEFS, PAIRS, MASK, 5, obs)
+    r = resolve(DEFS, EQUIVALENCES, MASK, 5, obs)
     assert (r.state, r.definition_idx, r.reason, r.work_ticket_idx) == (
         INCOMPLETE,
         12,
@@ -201,7 +236,7 @@ def test_a_waiting_or_running_ticket_under_the_newest_member_is_in_progress(tick
 
 def test_a_failed_ticket_is_incomplete_failed_and_does_not_fall_back():
     obs = {MASK: {(5, S): done(), (12, S): gate(None, (78, WorkTicketState.FAILED))}}
-    r = resolve(DEFS, PAIRS, MASK, 5, obs)
+    r = resolve(DEFS, EQUIVALENCES, MASK, 5, obs)
     assert (r.state, r.definition_idx, r.reason, r.work_ticket_idx) == (
         INCOMPLETE,
         12,
@@ -253,13 +288,13 @@ def test_a_block_ticket_in_each_state_over_a_pending_gate(ticket_state):
             at=T0,
         ),
     ]
-    r = resolve(DEFS, PAIRS, MASK, 5, {MASK: build_observations(MASK, rows)})
+    r = resolve(DEFS, EQUIVALENCES, MASK, 5, {MASK: build_observations(MASK, rows)})
     assert (r.state, r.definition_idx, r.reason) == _EXPECTED_BY_TICKET_STATE[ticket_state]
 
 
 def test_an_unknown_gate_state_is_refused():
     with pytest.raises(ValueError, match="unknown mask gate state"):
-        resolve(DEFS, PAIRS, MASK, 5, {MASK: {(12, S): gate("archived")}})
+        resolve(DEFS, EQUIVALENCES, MASK, 5, {MASK: {(12, S): gate("archived")}})
 
 
 def test_running_wins_over_failed_when_naming_the_ticket():
@@ -270,7 +305,7 @@ def test_running_wins_over_failed_when_naming_the_ticket():
             )
         }
     }
-    r = resolve(DEFS, PAIRS, MASK, 12, obs)
+    r = resolve(DEFS, EQUIVALENCES, MASK, 12, obs)
     assert (r.reason, r.work_ticket_idx) == (R.IN_PROGRESS, 70)
 
 
@@ -279,7 +314,7 @@ def test_a_same_version_rerun_over_a_completed_gate_is_incomplete():
         ALIGNMENT: {(120, S): gate(ALIGNMENT_SAMPLE_COMPLETED, (80, WorkTicketState.PROCESSING))}
     }
     obs[MASK] = {(12, S): done()}
-    r = resolve(DEFS, PAIRS, ALIGNMENT, 50, obs)
+    r = resolve(DEFS, EQUIVALENCES, ALIGNMENT, 50, obs)
     assert (r.state, r.definition_idx, r.reason) == (INCOMPLETE, 120, R.IN_PROGRESS)
 
 
@@ -291,7 +326,7 @@ def test_a_rearmed_block_reads_as_incomplete():
         RunRow(SOURCE_BLOCK_TICKET, 120, S, WorkTicketState.PENDING.value, 81, T0),
     ]
     obs = {ALIGNMENT: build_observations(ALIGNMENT, rows), MASK: {(12, S): done()}}
-    r = resolve(DEFS, PAIRS, ALIGNMENT, 120, obs)
+    r = resolve(DEFS, EQUIVALENCES, ALIGNMENT, 120, obs)
     assert (r.state, r.reason, r.work_ticket_idx) == (INCOMPLETE, R.IN_PROGRESS, 81)
 
 
@@ -304,7 +339,7 @@ def test_a_pending_gate_whose_tickets_were_cancelled_is_not_a_run():
             **build_observations(MASK, [RunRow(SOURCE_GATE, 12, S, MASK_SAMPLE_PENDING, None, T0)]),
         }
     }
-    r = resolve(DEFS, PAIRS, MASK, 12, obs)
+    r = resolve(DEFS, EQUIVALENCES, MASK, 12, obs)
     assert (r.state, r.definition_idx) == (PROCESSED, 5)
 
 
@@ -315,7 +350,7 @@ def test_a_pending_gate_whose_tickets_were_cancelled_is_not_a_run():
 
 def test_a_withdrawn_run_is_not_processed_with_no_fallback():
     obs = {MASK: {(5, S): done(), (12, S): gate(MASK_SAMPLE_INVALIDATED)}}
-    r = resolve(DEFS, PAIRS, MASK, 5, obs)
+    r = resolve(DEFS, EQUIVALENCES, MASK, 5, obs)
     assert (r.state, r.definition_idx, r.reason) == (NOT_PROCESSED, 12, R.WITHDRAWN)
 
 
@@ -355,13 +390,13 @@ def test_an_alignment_with_no_upstream_mask_run_is_upstream_no_run():
 # ---------------------------------------------------------------------------
 
 
-def resolve_exact_sample(definitions, pairs, kind, idx, observations):
-    groups = compute_groups(definitions, pairs)
+def resolve_exact_sample(definitions, equivalences, kind, idx, observations):
+    groups = compute_groups(definitions, equivalences)
     return resolve_sample(groups, kind, idx, S, observations, exact=True)
 
 
-def resolve_past_upstream(definitions, pairs, kind, idx, observations, admitted=None):
-    groups = compute_groups(definitions, pairs)
+def resolve_past_upstream(definitions, equivalences, kind, idx, observations, admitted=None):
+    groups = compute_groups(definitions, equivalences)
     return resolve_sample(
         groups,
         kind,
@@ -433,10 +468,10 @@ def test_exact_mode_keeps_a_withdrawn_run_unreadable():
 
 def test_exact_mode_ignores_a_newer_group_member():
     obs = {MASK: {(5, S): done(), (12, S): done()}}
-    r = resolve_exact_sample(DEFS, PAIRS, MASK, 5, obs)
+    r = resolve_exact_sample(DEFS, EQUIVALENCES, MASK, 5, obs)
     assert (r.state, r.definition_idx) == (PROCESSED, 5)
-    assert resolve(DEFS, PAIRS, MASK, 5, obs).definition_idx == 12
-    r = resolve_exact_sample(DEFS, PAIRS, MASK, 5, {MASK: {(12, S): done()}})
+    assert resolve(DEFS, EQUIVALENCES, MASK, 5, obs).definition_idx == 12
+    r = resolve_exact_sample(DEFS, EQUIVALENCES, MASK, 5, {MASK: {(12, S): done()}})
     assert (r.state, r.reason) == (NOT_PROCESSED, R.NO_RUN)
 
 
@@ -458,12 +493,12 @@ def test_exact_mode_does_not_move_with_the_upstream_group():
     """Aligned on 50 over mask 5, masked under 5 and 12: the group resolution says
     upstream_moved; the exact read of 50 reads it."""
     obs = {MASK: {(5, S): done(), (12, S): done()}, ALIGNMENT: {(50, S): done()}}
-    r = resolve_exact_sample(DEFS, PAIRS, ALIGNMENT, 50, obs)
+    r = resolve_exact_sample(DEFS, EQUIVALENCES, ALIGNMENT, 50, obs)
     assert (r.state, r.definition_idx) == (PROCESSED, 50)
 
 
 def test_exact_needed_definitions_are_the_definition_and_its_upstreams():
-    groups = compute_groups(DEFS, PAIRS)
+    groups = compute_groups(DEFS, EQUIVALENCES)
     assert needed_definitions(groups, ALIGNMENT, 50, exact=True) == {ALIGNMENT: {50}, MASK: {5}}
 
 
@@ -476,7 +511,7 @@ def test_an_alignment_on_a_mask_the_sample_moved_off_is_upstream_moved():
     """The sample is masked under 5 and 12 (so its mask resolves to 12) but aligned
     only on 5: it needs aligning on 12."""
     obs = {MASK: {(5, S): done(), (12, S): done()}, ALIGNMENT: {(50, S): done()}}
-    r = resolve(DEFS, PAIRS, ALIGNMENT, 120, obs)
+    r = resolve(DEFS, EQUIVALENCES, ALIGNMENT, 120, obs)
     assert (r.state, r.definition_idx, r.reason, r.mask_idx) == (
         INCOMPLETE,
         50,
@@ -488,7 +523,7 @@ def test_an_alignment_on_a_mask_the_sample_moved_off_is_upstream_moved():
 
 def test_an_alignment_on_the_resolved_mask_is_processed_and_names_its_mask():
     obs = {MASK: {(5, S): done(), (12, S): done()}, ALIGNMENT: {(50, S): done(), (120, S): done()}}
-    r = resolve(DEFS, PAIRS, ALIGNMENT, 50, obs)
+    r = resolve(DEFS, EQUIVALENCES, ALIGNMENT, 50, obs)
     assert (r.state, r.definition_idx, r.mask_idx) == (PROCESSED, 120, 12)
 
 
@@ -497,7 +532,7 @@ def test_an_incomplete_upstream_makes_the_alignment_incomplete():
         MASK: {(5, S): done(), (12, S): gate(MASK_SAMPLE_PENDING, (60, WorkTicketState.QUEUED))},
         ALIGNMENT: {(50, S): done()},
     }
-    r = resolve(DEFS, PAIRS, ALIGNMENT, 50, obs)
+    r = resolve(DEFS, EQUIVALENCES, ALIGNMENT, 50, obs)
     assert (r.state, r.reason, r.work_ticket_idx, r.upstream_definition_idx) == (
         INCOMPLETE,
         R.UPSTREAM_INCOMPLETE,
@@ -558,22 +593,22 @@ def _remasked_world(p2_gate):
     (31, gate `p2_gate`); 61 has no run for it."""
     defs = [mask(5), mask(12), assembly(30, 5), assembly(31, 12), denovo(60, 5, 30)]
     defs.append(denovo(61, 12, 31))
-    pairs = [similar(defs, MASK, 5, 12)]
+    equivalences = [similar(defs, MASK, 5, 12)]
     obs = {
         MASK: {(5, S): done(), (12, S): done()},
         PROCESSING: {(30, S): done(), (31, S): gate(p2_gate)},
         ALIGNMENT: {(60, S): done()},
     }
-    return defs, pairs, obs
+    return defs, equivalences, obs
 
 
 def test_a_denovo_alignment_whose_assembly_produced_no_contigs_has_nothing_to_read():
     """Align-denovo ends NO_DATA without a gate row when its assembly is empty, so 61
     has no run; it is still the member that the prep_sample resolves to, with nothing
     to read, rather than 60 with its mask moved."""
-    defs, pairs, obs = _remasked_world(ASSEMBLY_SAMPLE_NO_DATA)
+    defs, equivalences, obs = _remasked_world(ASSEMBLY_SAMPLE_NO_DATA)
     for anchor in (60, 61):
-        r = resolve(defs, pairs, ALIGNMENT, anchor, obs)
+        r = resolve(defs, equivalences, ALIGNMENT, anchor, obs)
         assert (r.state, r.reason, r.definition_idx, r.mask_idx) == (
             NOT_PROCESSED,
             R.NO_DATA,
@@ -586,8 +621,8 @@ def test_a_denovo_alignment_whose_assembly_produced_no_contigs_has_nothing_to_re
 def test_a_denovo_alignment_whose_assembly_has_contigs_and_no_run_still_needs_one():
     """The same world with contigs under 31: 61 has yet to be aligned, so the prep_sample
     reads as 60 with its mask moved, as before."""
-    defs, pairs, obs = _remasked_world(ASSEMBLY_SAMPLE_COMPLETED)
-    r = resolve(defs, pairs, ALIGNMENT, 60, obs)
+    defs, equivalences, obs = _remasked_world(ASSEMBLY_SAMPLE_COMPLETED)
+    r = resolve(defs, equivalences, ALIGNMENT, 60, obs)
     assert (r.state, r.reason, r.definition_idx, r.upstream_definition_idx) == (
         INCOMPLETE,
         R.UPSTREAM_MOVED,
@@ -597,9 +632,9 @@ def test_a_denovo_alignment_whose_assembly_has_contigs_and_no_run_still_needs_on
 
 
 def test_an_empty_assembly_that_is_rerunning_is_not_nothing_to_read():
-    defs, pairs, obs = _remasked_world(ASSEMBLY_SAMPLE_NO_DATA)
+    defs, equivalences, obs = _remasked_world(ASSEMBLY_SAMPLE_NO_DATA)
     obs[PROCESSING][(31, S)] = gate(ASSEMBLY_SAMPLE_NO_DATA, (44, WorkTicketState.PROCESSING))
-    r = resolve(defs, pairs, ALIGNMENT, 60, obs)
+    r = resolve(defs, equivalences, ALIGNMENT, 60, obs)
     assert (r.state, r.reason, r.definition_idx) == (INCOMPLETE, R.UPSTREAM_MOVED, 60)
 
 
@@ -622,7 +657,7 @@ def test_a_group_reading_a_processing_of_another_workflow_is_refused():
 
 def test_needed_definitions_follows_upstream_groups():
     defs = [*DEFS, assembly(30, 5), denovo(60, 5, 30)]
-    groups = compute_groups(defs, PAIRS)
+    groups = compute_groups(defs, EQUIVALENCES)
     assert needed_definitions(groups, ALIGNMENT, 50) == {ALIGNMENT: {50, 120}, MASK: {5, 12}}
     assert needed_definitions(groups, ALIGNMENT, 60) == {
         ALIGNMENT: {60},
@@ -687,7 +722,7 @@ def _rows(gate_state, gate_at, *tickets):
 
 def _resolve_rows(rows):
     obs = {MASK: {(5, S): done(), **build_observations(MASK, rows)}}
-    r = resolve(DEFS, PAIRS, MASK, 12, obs)
+    r = resolve(DEFS, EQUIVALENCES, MASK, 12, obs)
     return r.state, r.definition_idx, r.reason, r.work_ticket_idx
 
 
@@ -741,7 +776,7 @@ def test_a_failed_ticket_with_no_gate_row_counts():
             ),
         }
     }
-    r = resolve(DEFS, PAIRS, MASK, 12, obs)
+    r = resolve(DEFS, EQUIVALENCES, MASK, 12, obs)
     assert (r.state, r.reason, r.work_ticket_idx) == (INCOMPLETE, R.FAILED, 11)
 
 
@@ -759,14 +794,14 @@ def test_a_ticket_row_without_a_ticket_id_is_refused():
 
 def test_cohort_refusal_codes():
     obs = {MASK: {(5, S): done(), (12, S): done()}}
-    processed_12 = resolve(DEFS, PAIRS, MASK, 5, obs)
+    processed_12 = resolve(DEFS, EQUIVALENCES, MASK, 5, obs)
     assert cohort_refusal(processed_12, 12) is None
     assert cohort_refusal(processed_12, 5) is DefinitionGroupRefusal.RESOLVED_ELSEWHERE
-    no_run = resolve(DEFS, PAIRS, MASK, 5, {})
+    no_run = resolve(DEFS, EQUIVALENCES, MASK, 5, {})
     assert cohort_refusal(no_run, 5) is DefinitionGroupRefusal.NOT_PROCESSED
     running = resolve(
         DEFS,
-        PAIRS,
+        EQUIVALENCES,
         MASK,
         5,
         {MASK: {(5, S): gate(MASK_SAMPLE_PENDING, (1, WorkTicketState.QUEUED))}},
@@ -781,7 +816,7 @@ def test_denovo_arms_on_masks_of_one_group_are_accepted_when_the_group_is_given(
         denovo_alignment_processing_idx(
             denovo_alignment_idx=60, denovo_params=denovo_params, reference_params=reference_params
         )
-    groups = compute_groups(DEFS, PAIRS)
+    groups = compute_groups(DEFS, EQUIVALENCES)
     assert (
         denovo_alignment_processing_idx(
             denovo_alignment_idx=60,

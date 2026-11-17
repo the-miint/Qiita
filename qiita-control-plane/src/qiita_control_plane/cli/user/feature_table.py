@@ -220,7 +220,7 @@ def _resolve_definition_group(
     DoGet and handle mints carry the part's whole cohort, so a part over the cap is
     refused by those routes. Each prep_sample
     resolves on its own, so the chunks' samples are joined; a group that differs
-    between chunks (a pair decision committed between two requests) is refused rather
+    between chunks (an output-equivalence verdict committed between two requests) is refused rather
     than joined. Each body goes through the route's request model and each answer
     through its response model."""
     samples = sorted(set(prep_sample_idx))
@@ -250,7 +250,8 @@ def _resolve_definition_group(
         raise RuntimeError(
             f"the group of {kind.value} {definition_idx} changed while its"
             f" {len(samples)} prep_samples were resolved in {len(answers)} requests"
-            f" ({sorted(groups)}); a pair decision landed meanwhile. Run the build again."
+            f" ({sorted(groups)}); an output-equivalence verdict landed meanwhile. Run the"
+            " build again."
         )
     return answers[0].model_copy(
         update={"samples": [entry for answer in answers for entry in answer.samples]}
@@ -1144,7 +1145,7 @@ def _manifest_payload(
     which rows were kept has to be the gate that kept them, and "two derivations that
     happen to agree" is the shape that has already produced defects on this branch.
 
-    `decisions` is the reference arm's `DecisionProvenance`, the pair decisions its
+    `decisions` is the reference arm's `DecisionProvenance`, the output-equivalence verdicts its
     group was resolved under (the de novo arm is resolved under the same decision set);
     None when the reference arm was read exactly, without a group.
     """

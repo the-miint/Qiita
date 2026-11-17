@@ -1,9 +1,9 @@
 -- migrate:up
 
--- A mask, alignment or processing is minted from its settings, and a pair decision,
--- the derivation grouping and every published params_hash read those settings. After
--- the mint they are locked: a BEFORE UPDATE trigger on each table refuses a change
--- to them unless the same transaction recorded it in
+-- A mask, alignment or processing is minted from its settings, and an output
+-- equivalence verdict, the derivation grouping and every published params_hash read
+-- those settings. After the mint they are locked: a BEFORE UPDATE trigger on each
+-- table refuses a change to them unless the same transaction recorded it in
 -- `qiita.definition_settings_edit`, which only `qiita.edit_definition_settings`
 -- writes for a system_admin, with old and new values and a reason.
 --
@@ -21,10 +21,10 @@
 -- adapter set is hashed, not what the mask does. The trigger records it in the
 -- audit table with no actor.
 --
--- Any other change to the locked settings of a definition that a live `similar`
--- pair names is refused (SQLSTATE 55006), as its delete is
--- (`refuse_definition_delete_under_similar_pair`): the groups that pair joins were
--- decided over the old settings. Revoke it first.
+-- Any other change to the locked settings of a definition that a live joining output
+-- equivalence names (`qiita.joining_output_equivalences_naming`) is refused (SQLSTATE
+-- 55006), as its delete is (`refuse_definition_delete_under_joining_equivalence`): the
+-- groups it joins were decided over the old settings. Revoke it first.
 --
 -- Residual: the database role the services use can INSERT an audit row itself and
 -- then UPDATE. The row must name a system_admin and carry the exact old and new
@@ -192,7 +192,7 @@ DECLARE
     ref   BIGINT := (to_jsonb(OLD) ->> TG_ARGV[1])::bigint;
     old_s JSONB  := qiita.definition_settings_of(TG_ARGV[0], to_jsonb(OLD));
     new_s JSONB  := qiita.definition_settings_of(TG_ARGV[0], to_jsonb(NEW));
-    pairs TEXT;
+    joined TEXT;
 BEGIN
     IF old_s = new_s THEN
         RETURN NEW;
@@ -208,17 +208,11 @@ BEGIN
                 'adapter_set_hash re-keyed onto sequence_hash_v1');
         RETURN NEW;
     END IF;
-    SELECT string_agg(definition_pair_idx::text, ', ' ORDER BY definition_pair_idx)
-      INTO pairs
-      FROM qiita.definition_pair
-     WHERE definition_kind = kind
-       AND verdict = 'similar'
-       AND detached_at IS NULL
-       AND ref IN (low_definition_ref, high_definition_ref);
-    IF pairs IS NOT NULL THEN
+    joined := qiita.joining_output_equivalences_naming(kind, ref);
+    IF joined IS NOT NULL THEN
         RAISE EXCEPTION
-            '% % is named by similar definition pair(s) %; revoke first',
-            TG_TABLE_NAME, ref, pairs
+            '% % is named by joining output equivalence(s) %; revoke first',
+            TG_TABLE_NAME, ref, joined
             USING ERRCODE = '55006';
     END IF;
     IF NOT EXISTS (
@@ -241,9 +235,9 @@ COMMENT ON FUNCTION qiita.lock_definition_settings() IS
     'BEFORE UPDATE on mask_definition, alignment_definition and processing: refuses a '
     'change to the locked settings (qiita.definition_settings_columns) unless this '
     'transaction recorded the same change in qiita.definition_settings_edit '
-    '(SQLSTATE 55000), and refuses such a change while a live similar pair names the '
-    'row (55006). Passes the mask adapter-hash re-key, recording it, before either '
-    'check.';
+    '(SQLSTATE 55000), and refuses such a change while a live joining output '
+    'equivalence names the row (55006). Passes the mask adapter-hash re-key, '
+    'recording it, before either check.';
 
 CREATE TRIGGER mask_definition_lock_settings
     BEFORE UPDATE ON qiita.mask_definition

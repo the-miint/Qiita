@@ -336,7 +336,7 @@ def _count_masked(flight_client, ticket_bytes: bytes) -> int:
 # The output directory's record of which prep_sample and which mask each exported file
 # holds, by public handle: `{"files": {<file name>: {"export_id": "QM…",
 # "biosample_accession": …, "export_processing_id": "QP…", "decisions": {…}}}}`, where
-# `decisions` is the roster's `DecisionProvenance` (the pair decisions the run grouped
+# `decisions` is the roster's `DecisionProvenance` (the output-equivalence verdicts the run grouped
 # the masks under), plus `"deprecated": true`
 # on a file exported from a deprecated mask under --include-deprecated. Each prep_sample's entries
 # are merged in after its files are committed, or after its parquet is found up to date,

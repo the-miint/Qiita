@@ -1617,8 +1617,8 @@ ROSTER_DECISIONS = {
     "newest_event_at": None,
     "as_of": False,
     "as_of_scope": AS_OF_SCOPE,
-    "pairs_used": 0,
-    "pairs_used_set": "sha256:" + "4" * 64,
+    "equivalences_used": 0,
+    "equivalences_used_set": "sha256:" + "4" * 64,
 }
 
 
