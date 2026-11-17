@@ -20,6 +20,7 @@ from qiita_common.models import (
     MetadataEntry,
     MetadataFieldWriteResult,
     MissingReasonRef,
+    NaturalKeyLookupResponse,
     SampleGlobalFieldResponse,
     SampleMetadataWriteResponse,
     SampleStudyFieldCreateRequest,
@@ -1783,10 +1784,10 @@ def raise_for_transient_write_race(exc: TransientWriteRaceError) -> None:
 async def resolve_idxs_by_natural_key(
     *,
     values: list[str],
-    fetcher: Callable[[list[str]], Awaitable[dict[str, int]]],
-) -> tuple[dict[str, int], list[str]]:
-    """Dedup `values` in input order, resolve survivors via `fetcher`, and
-    return `(resolved, missing)`.
+    fetcher: Callable[..., Awaitable[dict[str, int]]],
+) -> NaturalKeyLookupResponse:
+    """Dedup `values` in input order and resolve survivors via
+    `fetcher(values=...)`.
 
     The caller supplies `fetcher` already bound to its pool and any per-key
     SQL details so this helper stays table-agnostic. `missing` is the
@@ -1801,9 +1802,10 @@ async def resolve_idxs_by_natural_key(
         seen.add(v)
         dedup_ordered.append(v)
 
-    resolved = await fetcher(dedup_ordered)
+    resolved = await fetcher(values=dedup_ordered)
     missing = [v for v in dedup_ordered if v not in resolved]
-    return resolved, missing
+    lookup_response = NaturalKeyLookupResponse(resolved=resolved, missing=missing)
+    return lookup_response
 
 
 def gate_roster_narrowing_idx(caller: HumanUser) -> int | None:

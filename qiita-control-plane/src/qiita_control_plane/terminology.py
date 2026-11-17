@@ -6,18 +6,17 @@ from __future__ import annotations
 import hashlib
 import json
 from collections import Counter
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Mapping
 from dataclasses import replace
 from pathlib import Path
 
 import asyncpg
-import pyarrow as pa
 from qiita_common.models import (
     TerminologyManifest,
     TerminologyTermObsoletionKind,
 )
 
-from .miint import duckdb_connect
+from .delimited_text import read_tsv, write_tsv
 from .repositories.terminology import (
     ParsedTerm,
     TerminologyImportAnomaly,
@@ -65,24 +64,6 @@ _CLOSURE_SOURCE_NAME = "closure table"
 # a separate contract that merely happens to coincide.
 _TSV_TRUE = "true"
 _TSV_FALSE = "false"
-
-# How a table is written: the name the rows register under, and the statement
-# that copies them out. Pinning the terminator to LF here spares each table
-# remembering it, and binding the destination spares escaping a path that
-# holds a quote.
-_WRITE_RELATION_NAME = "release_table"
-_COPY_TSV_SQL = (
-    f"COPY {_WRITE_RELATION_NAME} TO ? (FORMAT CSV, DELIMITER '\t', HEADER true, NEW_LINE '\n')"
-)
-
-# How a table is read. Every column is VARCHAR so the parser, not a guessed
-# type, interprets each cell; a first pass reads the header as data, which is
-# the only way to see it.
-_READ_TSV_SQL = (
-    "SELECT * FROM read_csv(?, delim='\t', header={header}, columns={columns},"
-    " auto_detect=false, quote='\"', escape='\"')"
-)
-_READ_HEADER_SUFFIX = " LIMIT 1"
 
 # Mirrors qiita.terminology_term: term_id and replaced_by_term_id
 # VARCHAR(255), label and alternate_label VARCHAR(500).
@@ -241,82 +222,6 @@ def _check_no_duplicate_keys(
         )
 
 
-def _columns_spec(columns: tuple[str, ...]) -> str:
-    """Render `columns` as the column set a read binds."""
-    declared = []
-    for column in columns:
-        escaped = column.replace("'", "''")
-        declared.append(f"'{escaped}': 'VARCHAR'")
-    return "{" + ", ".join(declared) + "}"
-
-
-def read_tsv(
-    path: Path,
-    columns: tuple[str, ...],
-    *,
-    source_name: str,
-) -> list[dict[str, str]]:
-    """Read the tab-separated table at `path` into one `columns`-keyed dict per
-    row. An empty cell becomes the empty string; `source_name` identifies the
-    table in header errors.
-
-    Raises duckdb.Error when DuckDB cannot read the file, or when a row holds
-    the wrong number of cells — the error names the row and both counts.
-    Raises ValueError when `path` is not a file, or when the header is missing
-    or lists `columns` in another order.
-    """
-    # DuckDB reads a directory as a glob of the tables under it, never the
-    # named table; refusing it names the source instead.
-    if not path.is_file():
-        raise ValueError(f"{source_name} at {path} is not a file")
-
-    spec = _columns_spec(columns)
-    header_sql = _READ_TSV_SQL.format(header="false", columns=spec) + _READ_HEADER_SUFFIX
-    read_sql = _READ_TSV_SQL.format(header="true", columns=spec)
-
-    conn = duckdb_connect()
-    try:
-        header_cursor = conn.execute(header_sql, [str(path)])
-        header_rows = header_cursor.fetchall()
-        _check_header(header_rows, columns, source_name=source_name, path=path)
-        row_cursor = conn.execute(read_sql, [str(path)])
-        read_rows = row_cursor.fetchall()
-    finally:
-        conn.close()
-
-    # A NULL cell is an empty one: every row holds every declared column,
-    # because the read itself refuses a short row.
-    rows = [
-        dict(zip(columns, [cell if cell is not None else "" for cell in read_row], strict=True))
-        for read_row in read_rows
-    ]
-    return rows
-
-
-def _check_header(
-    header_rows: list[tuple[str | None, ...]],
-    columns: tuple[str, ...],
-    *,
-    source_name: str,
-    path: Path,
-) -> None:
-    """Reject a table whose first row does not hold `columns` in order.
-
-    `header_rows` holds the first row read as data, empty when the table has no
-    rows at all. Order matters, not just membership: the declared column set
-    maps positionally, so a header listing the same columns in another order
-    would load every cell under the wrong one and still read as valid.
-    """
-    if not header_rows:
-        raise ValueError(f"{source_name} at {path} carries no header; expected {list(columns)}")
-    present_columns = tuple(cell if cell is not None else "" for cell in header_rows[0])
-    if present_columns != columns:
-        raise ValueError(
-            f"{source_name} at {path} is headed by {list(present_columns)};"
-            f" expected {list(columns)} in that order"
-        )
-
-
 def _parse_terms_tsv(path: Path) -> list[ParsedTerm]:
     """Parse a tab-separated terms table at `path` into a list of ParsedTerm,
     which settles what an empty cell means per column. is_obsolete must be
@@ -415,39 +320,6 @@ def _parse_terms_tsv(path: Path) -> list[ParsedTerm]:
         key_name="term_id",
     )
     return rows
-
-
-def write_tsv(
-    path: Path,
-    columns: tuple[str, ...],
-    rows: Sequence[Sequence[str | None]] = (),
-) -> None:
-    """Write `rows` as the tab-separated table at `path`, headed by `columns`.
-
-    Cells are positional, so every row holds one per column in `columns` order,
-    and a None cell reaches the file empty. Passing no rows writes the header
-    alone.
-
-    Raises ValueError when a row does not carry one cell per column, and
-    duckdb.Error when DuckDB cannot write the file.
-    """
-    # Arrow rather than an INSERT per row, which crosses into DuckDB once per
-    # row and is prohibitively slow at a few million terms.
-    cells_by_column = list(zip(*rows)) if rows else [()] * len(columns)
-    arrays = {
-        column: pa.array(cells, type=pa.string())
-        for column, cells in zip(columns, cells_by_column, strict=True)
-    }
-    relation = pa.table(arrays)
-
-    # None reaches the file empty only while it stays NULL: DuckDB quotes an
-    # empty string, which would read back as a cell holding "".
-    conn = duckdb_connect()
-    try:
-        conn.register(_WRITE_RELATION_NAME, relation)
-        conn.execute(_COPY_TSV_SQL, [str(path)])
-    finally:
-        conn.close()
 
 
 def write_terms_tsv(path: Path, terms: list[ParsedTerm]) -> None:

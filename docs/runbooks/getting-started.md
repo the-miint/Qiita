@@ -100,18 +100,24 @@ are optional.
 ## 2. Create the study
 
 ```bash
-STUDY_IDX=$(qiita study create \
+STUDY=$(qiita study create \
     --title "My first study" \
-    --bioproject-accession PRJNA123456 | jq -r .study_idx)
+    --bioproject-accession PRJNA123456)
+STUDY_IDX=$(jq -r .study_idx <<<"$STUDY")
+STUDY_EXPORT_ID=$(jq -r .export_entity_id <<<"$STUDY")
 ```
+
+`qiita study create` prints the new study as JSON. The example keeps its `study_idx`
+and its `export_entity_id`, a value such as `QS12` that Qiita assigns; later commands
+name the study by one or the other.
 
 `--bioproject-accession` is one way a pre-flight can name this study; step 4
 lists them all. No two studies may share an accession.
 
-Register the study with NCBI BioProject first and use the accession it issues
-(up to 50 characters). Do not invent one: an accession is a handle someone
-reading your published data will try to resolve, and a made-up value resolves to
-nothing. The *identical* string then goes into the pre-flight file.
+BioProject accessions can come *only* from registering with NCBI BioProject. Do not invent
+one: an accession is a handle someone reading your published data will try to resolve,
+and a made-up value resolves to nothing. The *identical* string then goes into the
+pre-flight file.
 
 The study is yours: you can do everything below on it without anyone granting you
 access. To let someone else in, they log in to Qiita once, then:
@@ -128,47 +134,54 @@ the `--principal-idx` that `list` shows. Who can change which rows is in
 
 ## 3. Create the biosamples
 
-A biosample is the physical sample itself, independent of any sequencing. The
-CLI creates one per command, so for a plate this is a loop over the biosamples on
-it. The API also takes a whole sheet in one all-or-nothing request,
-`POST /api/v1/study/{idx}/biosample/bulk`, which has no CLI command yet.
+A biosample record represents the physical sample itself, independent of any sequencing.
+`qiita biosample bulk-create` creates one per row of a TSV file, all in one
+all-or-nothing request, and `qiita biosample create` creates one per command. The
+elements below are relevant to both.
 
-```bash
-BIOSAMPLE_IDX=$(qiita biosample create \
-    --study-idx "$STUDY_IDX" \
-    --owner-biosample-id-field-name sample_name \
-    --owner-biosample-id-value SAMPLE-1 \
-    --biosample-accession SAMN0000001 \
-    --metadata "host taxon id=9606" | jq -r .biosample_idx)
-```
+Putting biosamples into a study you do not own needs `admin` access on it, granted with
+`qiita study access grant` by one of the study's admins or by a `wet_lab_admin`.
 
-`--biosample-accession` is one way a pre-flight row can name this biosample;
-step 4 lists them all. Register the biosample with NCBI BioSample and use the
-accession it issues — same rule as above, do not invent one.
+### What each biosample carries
 
-`--metadata "host taxon id=…"` names the host, and is left out when the biosample has none. It takes an NCBI taxonomy id — the
-number, not the name — matched against the NCBI Taxonomy your site has loaded. How
-much that covers is a per-site choice: a deploy starts with a small seeded set
-(`9606` human, `10090` mouse, a few metagenome taxa), and an operator can load a
-full NCBI release, after which the whole taxonomy is accepted. An id your site does
-not have is refused, and there is no self-service way to list or add one — ask your
-operator. For an environmental biosample with no host of its own, leave the field out.
-A blank or other control is marked by a `control_*` `qiita sample type` term
-(`--metadata "qiita sample type=…"`), which makes it a control whatever its `host taxon id`.
+#### Owner's biosample name
 
-`--owner-biosample-id-value` is your own name for the biosample, stored under the
-field named by `--owner-biosample-id-field-name` (the field is created the first
-time you use it, so there is nothing to set up). This is the name to match your
-sheet, since the identifiers are what the machines match on and rarely what you
-say out loud. It does not travel with the biosample: someone reading the
-biosample on its own sees only the shared metadata, but anyone with `member`
-access or above on *this study* sees it, so keep any personally identifying
-information out of it.
+Each biosample carries an owner's biosample name — your own name for it, such as
+`SAMPLE-1` — stored under a study-specific field that you name (for example `sample_id`)
+and that is created for you automatically. This is the name to match your own records.
+It does not travel with the biosample: someone reading the biosample on its own sees
+only the shared metadata, but anyone with `member` access or above on *this study* sees
+it, so keep any personally identifying information out of it.
 
-You can add more `--metadata KEY=VALUE` pairs, but only for fields that already
-exist: a standard Qiita field, or one you created for this study. A key that
-matches nothing is an error, not a new field. To add a field of your own to the
-study first:
+#### Identifiers and checklist
+
+`biosample_accession`, `ena_sample_accession`, `matrix_tube_id` and
+`metadata_checklist_name` are reserved names. `biosample_accession` and `matrix_tube_id`
+are identifiers that a pre-flight row can name a biosample by (step 4 lists all of
+those), `ena_sample_accession` holds the biosample's ENA sample accession, and
+`metadata_checklist_name` names the ENA checklist the biosample follows. They need no
+field set up first. `biosample_accession` comes from registering with NCBI BioSample, so
+follow the same rule as above for `bioproject_accession`: do not invent one.
+
+#### Metadata
+
+Every other value is metadata, stored under a field that must already exist: a
+global Qiita field, or one you created for this study. A name that matches no field
+is an error, not a new field, and the value is parsed into the field's data type.
+
+The global fields `host taxon id` and `qiita sample type` need care. `host taxon id`
+names the host, and is left out when the biosample has no host (such as for an
+environmental biosample). It takes an NCBI taxonomy id — the number, not the name —
+matched against the NCBI Taxonomy your site has loaded. How much that covers is a
+per-site choice: a deploy starts with a small seeded set (`9606` human, `10090` mouse, a
+few metagenome taxa), and an operator can load a full NCBI release, after which the
+whole taxonomy is accepted. An id your site does not have is refused, and there is no
+self-service way to list or add one — ask your operator. A blank or other control is
+marked by a `control_*` term in the global `qiita sample type` field, which makes it a
+control whatever its `host taxon id`.
+
+To record a value no global field covers, add a field of your own to the study
+before you create the biosamples that use it:
 
 ```bash
 qiita biosample create-field \
@@ -178,11 +191,83 @@ qiita biosample create-field \
 ```
 
 `--data-type` is one of `text`, `numeric`, `boolean`, `date` or `terminology`, and
-the display name you give is the `KEY` you then pass to `--metadata`.
+the display name you give is the name you then use for the field's values.
 
-Putting a biosample into a study you do not own needs `admin` access on it,
-granted with `qiita study access grant` by one of the study's admins or by a
-`wet_lab_admin`.
+### Add many biosamples at once (usual approach)
+
+Provide a tab-separated file with a header row and one biosample per row:
+
+```text
+sample_id	biosample_accession	collection depth m	host taxon id
+SAMPLE-1	SAMN0000001	1.5	9606
+SAMPLE-2	SAMN0000002		9606
+```
+
+- One column, under any header you choose (for example `sample_id`), holds the
+  owner's name for each biosample. Every row needs one.
+- A column headed with one of the reserved names sets that value. If the study has a
+  study field with the same name as a reserved name, that field cannot be set with
+  this command.
+- Every other column is metadata: its header is the field's display name, and each
+  cell is that biosample's value. With `--global-internal-names`, a header that names
+  a global Qiita field must use that field's internal name; a study field is still
+  named by its display name.
+- A blank cell leaves that value unset for that biosample, as `SAMPLE-2` does with
+  its depth; the cell's tab is still there, so every row has one cell per column.
+  Spaces around a header or a cell are ignored.
+
+To import the contents of this file, run
+
+```bash
+qiita biosample bulk-create \
+    --study-export-id "$STUDY_EXPORT_ID" \
+    --tsv-file biosamples.tsv \
+    --owner-biosample-id-field-name sample_id > created.tsv
+```
+
+`--owner-biosample-id-field-name` specifies the name of the column holding the
+owner's biosample name. In any letter case, that name cannot be one of the command's
+output column names (`biosample_idx`, `export_entity_id`) or one of the reserved
+names. To use one of these names for the study field that holds the owner's biosample
+name, create the biosamples one at a time with `qiita biosample create`, described below.
+
+The example names the study by the `STUDY_EXPORT_ID` kept in step 2. You can name it
+by the `STUDY_IDX` kept there instead, by passing `--study-idx` in place of
+`--study-export-id`.
+
+The command prints a TSV of the biosamples it created, in the file's row order,
+which `> created.tsv` saves:
+
+```text
+sample_id	biosample_idx	export_entity_id
+SAMPLE-1	1041	QB517
+SAMPLE-2	1042	QB518
+```
+
+The request is all-or-nothing: if any row is refused, nothing is created, and the
+error names the row, counting the first row after the header as 0. A file is
+limited to 2,000 rows and 25,000 metadata values; split a larger one into several
+files and run the command once for each.
+
+### Add one biosample at a time (alternate approach)
+
+`qiita biosample create` takes the owner's biosample name as
+`--owner-biosample-id-value`, each reserved value as its own flag
+(`--biosample-accession` and so on), and each metadata value as
+`--metadata "NAME=VALUE"`, repeated as needed. It prints the created biosample as JSON:
+its `biosample_idx` and `export_entity_id`, and the study field that holds its owner's
+biosample name (`owner_id_biosample_study_field_idx`, with
+`owner_id_biosample_study_field_created` saying whether this call created that field).
+The example keeps the `biosample_idx`:
+
+```bash
+BIOSAMPLE_IDX=$(qiita biosample create \
+    --study-idx "$STUDY_IDX" \
+    --owner-biosample-id-field-name sample_id \
+    --owner-biosample-id-value SAMPLE-1 \
+    --biosample-accession SAMN0000001 \
+    --metadata "host taxon id=9606" | jq -r .biosample_idx)
+```
 
 ## 4. Build the pre-flight file
 
@@ -201,11 +286,21 @@ snippets below are short Python.
 | any extra projects on the plate (controls only) | further studies that row's biosample is already linked to |
 
 The export IDs are assigned by Qiita: `export_entity_id` in the output of
-`qiita study create` and `qiita biosample create`.
+`qiita study create`, `qiita biosample bulk-create` and `qiita biosample create`.
 
 Every project a row names must already be among its biosample's studies. A
-biosample is linked only to the study it was created in, and Qiita has no command
-to link it to another, so a control that names several projects is refused.
+biosample starts out linked only to the study it was created in, so a control that
+names several projects needs a link to each of the others first:
+
+```bash
+qiita biosample link --study-export-id "$OTHER_STUDY_EXPORT_ID" --biosample-idx "$BIOSAMPLE_IDX"
+```
+
+`OTHER_STUDY_EXPORT_ID` is the other study's `export_entity_id`, kept from its
+`qiita study create` output as in step 2; `--study-idx` takes its `study_idx` instead.
+
+Linking needs `admin` access on that study and ownership of the biosample; a
+`wet_lab_admin` needs neither.
 
 Each biosample and project needs at least one of its identifiers. Every one that
 is set must name something in Qiita, and they must all name the same biosample or

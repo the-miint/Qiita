@@ -18,6 +18,7 @@ from qiita_common.api_paths import (
     URL_BIOSAMPLE_BY_STUDY_AND_IDX,
     URL_BIOSAMPLE_BY_STUDY_UNIQUE_FIELD,
     URL_BIOSAMPLE_LIST_BY_STUDY,
+    URL_BIOSAMPLE_LOOKUP,
     URL_BIOSAMPLE_LOOKUP_BY_ACCESSION,
     URL_BIOSAMPLE_LOOKUP_BY_MATRIX_TUBE_ID,
     URL_BIOSAMPLE_METADATA_BY_STUDY,
@@ -3046,6 +3047,89 @@ async def test_lookup_by_matrix_tube_id_rejects_bad_format_422(ctx):
         json={"matrix_tube_ids": [unique_matrix_tube_id(), "abc"]},
     )
     assert resp.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# POST /biosample/lookup — bulk natural-key → idx resolver
+# ---------------------------------------------------------------------------
+
+
+# same-pattern-ok: per-entity twin of the POST /study/lookup tests; the overlap with the
+# deprecated lookup routes' tests ends when those routes are removed
+async def test_lookup_biosample_resolves_by_export_entity_id(ctx):
+    """Tests the case where the body keys on export_entity_id: a biosample's
+    minted id resolves to its idx and an unknown id lands in `missing`."""
+    owner_idx = ctx["wet_session"]["principal_idx"]
+    biosample_idx = await _seed_biosample_with_accession(
+        ctx, accession=unique_accession("LOOKUP-EXP"), owner_idx=owner_idx
+    )
+    export_id = await fetch_export_entity_id(
+        ctx["pool"], kind="biosample", entity_idx=biosample_idx
+    )
+    unknown_id = unique_accession("EXPORT-LOOKUP-MISS")
+
+    resp = await ctx["wet"].post(
+        URL_BIOSAMPLE_LOOKUP,
+        json={"key": "export_entity_id", "values": [export_id, unknown_id]},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"resolved": {export_id: biosample_idx}, "missing": [unknown_id]}
+
+
+async def test_lookup_biosample_resolves_by_matrix_tube_id_excluding_retired(ctx):
+    """Tests the case where the body keys on matrix_tube_id: a live biosample's
+    tube resolves, and a retired biosample's tube lands in `missing`."""
+    owner_idx = ctx["wet_session"]["principal_idx"]
+    live_tube = unique_matrix_tube_id()
+    retired_tube = unique_matrix_tube_id()
+    live_idx = await _seed_biosample_with_matrix_tube_id(
+        ctx, matrix_tube_id=live_tube, owner_idx=owner_idx
+    )
+    retired_idx = await _seed_biosample_with_matrix_tube_id(
+        ctx, matrix_tube_id=retired_tube, owner_idx=owner_idx
+    )
+    await retire_biosample(ctx["pool"], biosample_idx=retired_idx, retired_by_idx=owner_idx)
+
+    resp = await ctx["wet"].post(
+        URL_BIOSAMPLE_LOOKUP,
+        json={"key": "matrix_tube_id", "values": [live_tube, retired_tube]},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"resolved": {live_tube: live_idx}, "missing": [retired_tube]}
+
+
+# same-pattern-ok: per-entity twin of the POST /study/lookup tests; the overlap with the
+# deprecated lookup routes' tests ends when those routes are removed
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"values": ["SAMN00000001"]},
+        {"key": "owner_idx", "values": ["SAMN00000001"]},
+        {"key": "biosample_accession", "values": []},
+        {"key": "matrix_tube_id", "values": ["abc"]},
+    ],
+    ids=["key-absent", "key-invalid", "values-empty", "tube-malformed"],
+)
+async def test_lookup_biosample_rejects_bad_body_422(ctx, body):
+    """Tests the case where the body omits `key`, names a key outside
+    BiosampleLookupKey, carries no values, or carries a malformed tube id under
+    matrix_tube_id: the request model rejects it with 422 before any DB work
+    runs."""
+    resp = await ctx["wet"].post(URL_BIOSAMPLE_LOOKUP, json=body)
+    assert resp.status_code == 422
+
+
+# same-pattern-ok: per-entity twin of the POST /study/lookup tests; the overlap with the
+# deprecated lookup routes' tests ends when those routes are removed
+async def test_lookup_biosample_missing_scope_403(ctx, no_biosample_read_client):
+    """Tests the case where the caller's PAT scope set excludes
+    Scope.BIOSAMPLE_READ: require_scope raises 403 before any DB work."""
+    resp = await no_biosample_read_client.post(
+        URL_BIOSAMPLE_LOOKUP,
+        json={"key": "export_entity_id", "values": ["anything"]},
+    )
+    assert resp.status_code == 403
+    assert "biosample:read" in resp.json()["detail"]
 
 
 # ---------------------------------------------------------------------------
