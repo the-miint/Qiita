@@ -1,0 +1,5 @@
+Marker reference fixtures for test_verify_data_type.py: the first records of suitable length
+from SortMeRNA v4.3.7 data/rRNA_databases (silva-bac-16s-id90, silva-euk-18s-id95,
+silva-bac-23s-id98, rfam-5s-database-id98), upper-cased with U written as T and headers cut to
+the first token. The sequences originate from SILVA release 119 (SSU/LSU Ref) and Rfam and
+remain under their upstream licenses.
