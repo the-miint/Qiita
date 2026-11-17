@@ -287,7 +287,7 @@ async def rerun_alignment_block_route(
     nothing.
 
     system_admin only (`alignment_definition:lifecycle`), plus the align action's own
-    audience and scopes, as `/run` checks them.
+    audience and scopes (`authorize_redrive_action`).
     """
     deadline = pre_txn_deadline()
     ticket = await pool.fetchrow(

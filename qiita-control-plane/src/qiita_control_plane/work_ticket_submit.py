@@ -614,17 +614,17 @@ async def authorize_redrive_action(
 
 
 async def authorize_redrive(
-    pool: asyncpg.Pool, settings: Settings, principal: Principal, ticket: WorkTicket
+    pool: asyncpg.Pool,
+    settings: Settings,
+    principal: Principal,
+    ticket: WorkTicket,
+    resource_override: str | None,
 ) -> bool:
     """Run `_gate_submission` over `ticket`'s stored request, so a redrive needs what a
-    fresh submit of the same work needs. False when the action is missing or disabled.
-    `force` is not stored, so it is not replayed."""
-    if not await authorize_redrive_action(pool, principal, ticket.action_id, ticket.action_version):
+    fresh submit of the same work needs. False when the action is missing or disabled."""
+    action = await _fetch_action_for_submission(pool, ticket.action_id, ticket.action_version)
+    if action is None or not action["enabled"]:
         return False
-    override = await pool.fetchval(
-        "SELECT resource_override FROM qiita.work_ticket WHERE work_ticket_idx = $1",
-        ticket.work_ticket_idx,
-    )
     await _gate_submission(
         pool=pool,
         settings=settings,
@@ -635,9 +635,12 @@ async def authorize_redrive(
             scope_target=ticket.scope_target,
             action_context=ticket.action_context,
             resource_override=(
-                None if override is None else ResourceOverride.model_validate_json(override)
+                None
+                if resource_override is None
+                else ResourceOverride.model_validate_json(resource_override)
             ),
         ),
+        action=action,
     )
     return True
 
@@ -648,6 +651,7 @@ async def _gate_submission(
     settings: Settings,
     principal: Principal,
     body: WorkTicketCreateRequest,
+    action: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Every submission gate that reads only the request and stored state, not
     the scope's in-flight tickets: action, audience, scopes, privileged knobs,
@@ -659,7 +663,8 @@ async def _gate_submission(
     the wrong question.
     """
 
-    action = await _fetch_action_for_submission(pool, body.action_id, body.action_version)
+    if action is None:
+        action = await _fetch_action_for_submission(pool, body.action_id, body.action_version)
     if action is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
