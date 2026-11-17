@@ -147,8 +147,8 @@ async def _mint_processing_idx(
 
     With `work_ticket_idx`, the same transaction records the processing on the ticket
     (`work_ticket.processing_idx`), holding the processing row `FOR SHARE` from the
-    mint through that write, and refuses a ticket that already records another
-    processing (`repositories.definition_hold` and `runner._record` say why)."""
+    mint through that write (the hold: `repositories.definition_hold`), and refuses a
+    ticket that already records another processing (the refusal: `runner._record`)."""
     params = _build_processing_params(
         action_id, action_version, bound, assembler_default=assembler_default
     )

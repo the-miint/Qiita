@@ -402,7 +402,7 @@ async def test_a_deprecated_alignment_is_refused_on_mint_and_on_resume(sample):
 
 async def test_the_mint_records_the_alignment_on_the_ticket(sample):
     """The mint records the alignment on the ticket in its own transaction
-    (`runner._record`), before any separate persist."""
+    (`runner._record`)."""
     ticket = await _seed_ticket(sample)
     minted = await _resolve(sample, work_ticket_idx=ticket)
     assert (

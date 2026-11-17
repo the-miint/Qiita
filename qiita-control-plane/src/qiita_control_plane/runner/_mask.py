@@ -425,8 +425,8 @@ async def _mint_read_mask(
 
     With `work_ticket_idx`, the same transaction records the mask on the ticket
     (`work_ticket.mask_idx`), holding the mask row `FOR SHARE` from the mint through
-    that write, and refuses a ticket that already records another mask
-    (`repositories.definition_hold` and `runner._record` say why).
+    that write (the hold: `repositories.definition_hold`), and refuses a ticket that
+    already records another mask (the refusal: `runner._record`).
 
     Like the other pre-loop resolvers, any failure raises a SUBMISSION-attributed
     BAD_INPUT the outer handler turns into a FAILED ticket: no sequenced_sample

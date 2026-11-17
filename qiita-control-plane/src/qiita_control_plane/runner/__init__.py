@@ -88,7 +88,6 @@ from ._alignment import (
     PRESET_BINDING,
     _build_denovo_alignment_params,
     _create_alignment_gate_pending,
-    _refuse_deprecated_alignment,
     _require_assembly_subject,
     _resolve_denovo_alignment_idx,
     _workflow_writes_alignment_gate,
@@ -243,6 +242,7 @@ from ._reference import (
 )
 from ._upload import (
     _consume_upload_handles,
+    _refuse_deprecated_alignment,
     _resolve_upload_handles,
     _submission_bad_input,
 )

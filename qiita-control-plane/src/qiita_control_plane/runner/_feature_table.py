@@ -46,7 +46,6 @@ from qiita_common.assembly_constants import (
     BIN_QUALITY_SUBJECT_KEY,
     BIN_QUALITY_TABLE,
 )
-from qiita_common.models import AlignmentDefinitionStatus
 from qiita_common.parquet import PARQUET_OPTS_INTERMEDIATE, validate_parquet_path
 
 from ..actions.library import export_assembly_member_genome, export_member_genome
@@ -66,7 +65,11 @@ from ..repositories.assembly import (
 )
 from ..repositories.block import list_incomplete_alignment_samples
 from ..repositories.processing import fetch_processing_by_idx
-from ._upload import _submission_bad_input, _submission_dp_fetch_failure
+from ._upload import (
+    _refuse_deprecated_alignment,
+    _submission_bad_input,
+    _submission_dp_fetch_failure,
+)
 
 # The genome-map Parquet the compute job consumes as an input (feature_idx ->
 # genome_idx for the whole reference), staged by _resolve_feature_table_bindings.
@@ -150,15 +153,6 @@ async def _validate_denovo_arm(
         prep_sample_idx=prep_sample_idx,
     )
     return processing_idx
-
-
-def _refuse_deprecated_alignment(row: asyncpg.Record) -> None:
-    """Refuse a deprecated alignment as either arm. An invalidated prep_sample needs no
-    check of its own: it is not 'completed', so the cohort gate refuses it."""
-    if row["status"] == AlignmentDefinitionStatus.DEPRECATED.value:
-        raise _submission_bad_input(
-            f"alignment {row['alignment_idx']} is deprecated: {row['deprecation_reason']}"
-        )
 
 
 async def _refuse_deprecated_assembly(pool: asyncpg.Pool, *, processing_idx: int) -> None:

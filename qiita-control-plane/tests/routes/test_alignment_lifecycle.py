@@ -313,48 +313,27 @@ async def test_deprecation_waits_for_unfinished_tickets(client, lc):
 
 async def test_a_re_attach_to_a_deprecated_alignment_is_refused(lc):
     """A de novo resume re-attaches to the alignment its ticket records without a mint,
-    so the re-attach refuses a deprecation that landed since (the resolver path is in
-    `test_align_denovo_resolver`)."""
-    from qiita_common.actions import ALIGN_DENOVO_ACTION_ID
+    so it refuses, from the alignment's row, a deprecation that landed since."""
     from qiita_common.backend_failure import BackendFailure, FailureKind
 
-    from qiita_control_plane.runner._alignment import _refuse_deprecated_alignment
+    from qiita_control_plane.repositories.alignment_definition import (
+        fetch_alignment_definition_by_idx,
+    )
+    from qiita_control_plane.runner._upload import _refuse_deprecated_alignment
 
     pool = lc["pool"]
-    a, _b, _c = lc["samples"]
-    version = f"lifecycle-{secrets.token_hex(4)}"
-    created = await seed_action_if_absent(
-        pool, action_id=ALIGN_DENOVO_ACTION_ID, version=version, target_kind="prep_sample"
-    )
-    # A resumed de novo ticket: it already records the alignment.
-    wt = await pool.fetchval(
-        "INSERT INTO qiita.work_ticket (action_id, action_version, originator_principal_idx,"
-        "  scope_target_kind, prep_sample_idx, state, alignment_idx)"
-        " VALUES ($1, $2, $3, 'prep_sample', $4, $5, $6) RETURNING work_ticket_idx",
-        ALIGN_DENOVO_ACTION_ID,
-        version,
-        lc["owner"],
-        a,
-        WorkTicketState.PROCESSING.value,
+    await pool.execute(
+        "UPDATE qiita.alignment_definition SET status = $3, deprecated_at = now(),"
+        "       deprecated_by_idx = $2, deprecation_reason = 'late'"
+        " WHERE alignment_idx = $1",
         lc["alignment_idx"],
+        lc["owner"],
+        AlignmentDefinitionStatus.DEPRECATED.value,
     )
-    try:
-        await pool.execute(
-            "UPDATE qiita.alignment_definition SET status = $3, deprecated_at = now(),"
-            "       deprecated_by_idx = $2, deprecation_reason = 'late'"
-            " WHERE alignment_idx = $1",
-            lc["alignment_idx"],
-            lc["owner"],
-            AlignmentDefinitionStatus.DEPRECATED.value,
-        )
-        with pytest.raises(BackendFailure, match="late") as ei:
-            await _refuse_deprecated_alignment(pool, lc["alignment_idx"])
-        assert ei.value.kind == FailureKind.BAD_INPUT
-    finally:
-        await pool.execute("DELETE FROM qiita.work_ticket WHERE work_ticket_idx = $1", wt)
-        await delete_action_if_created(
-            pool, action_id=ALIGN_DENOVO_ACTION_ID, version=version, created=created
-        )
+    row = await fetch_alignment_definition_by_idx(pool, lc["alignment_idx"])
+    with pytest.raises(BackendFailure, match="late") as ei:
+        _refuse_deprecated_alignment(row)
+    assert ei.value.kind == FailureKind.BAD_INPUT
 
 
 async def test_deprecate_without_reason_is_422(client, lc):
