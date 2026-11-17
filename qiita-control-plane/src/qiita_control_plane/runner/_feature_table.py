@@ -46,6 +46,7 @@ from qiita_common.assembly_constants import (
     BIN_QUALITY_SUBJECT_KEY,
     BIN_QUALITY_TABLE,
 )
+from qiita_common.models import AlignmentDefinitionStatus
 from qiita_common.parquet import PARQUET_OPTS_INTERMEDIATE, validate_parquet_path
 
 from ..actions.library import export_assembly_member_genome, export_member_genome
@@ -66,10 +67,21 @@ from ..repositories.assembly import (
 from ..repositories.block import list_incomplete_alignment_samples
 from ..repositories.processing import fetch_processing_by_idx
 from ._upload import (
-    _refuse_deprecated_alignment,
     _submission_bad_input,
     _submission_dp_fetch_failure,
 )
+
+
+def _refuse_deprecated_alignment(row: asyncpg.Record) -> None:
+    """Refuse (bad submission input) a deprecated alignment, from its
+    `alignment_definition` row. A plain status read: the caller acts on the row after
+    the check, under no lock, so a `FOR SHARE` held only for the check would buy
+    nothing."""
+    if row["status"] == AlignmentDefinitionStatus.DEPRECATED.value:
+        raise _submission_bad_input(
+            f"alignment {row['alignment_idx']} is deprecated: {row['deprecation_reason']}"
+        )
+
 
 # The genome-map Parquet the compute job consumes as an input (feature_idx ->
 # genome_idx for the whole reference), staged by _resolve_feature_table_bindings.

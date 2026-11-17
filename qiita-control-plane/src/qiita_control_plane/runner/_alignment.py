@@ -59,7 +59,7 @@ from ..repositories.definition_settings_edit import fetch_settings_edit_since_ti
 from ..repositories.params_storage import ParamsDoNotSurviveStorageError
 from ._base import _workflow_declares_action
 from ._record import fail_exhausted_hold, record_minted
-from ._upload import _refuse_deprecated_alignment, _submission_bad_input
+from ._upload import _submission_bad_input
 
 # action_context keys the de novo resolver reads. Prefixed like `align/1.0.0.yaml`'s
 # own keys where the bare name is already a binding the runner acts on: `mask_idx` in a
@@ -336,9 +336,10 @@ async def _resolve_denovo_alignment_idx(
     prevent.
 
     So the knobs are read back from the STORED params rather than re-resolved, and the
-    job runs the configuration the identity actually names. Both branches refuse a
-    deprecated alignment: the mint by `AlignmentDefinitionDeprecated`, the re-attach,
-    which does not call the mint, by `_refuse_deprecated_alignment` on the row.
+    job runs the configuration the identity actually names. The mint refuses a
+    deprecated alignment (`AlignmentDefinitionDeprecated`); on the re-attach, which does
+    not call the mint, `_create_alignment_gate_pending`, which the runner calls next on
+    both branches, refuses it under `FOR SHARE`.
 
     The re-attach also refuses a recorded alignment whose settings an admin edited
     after the ticket was created: the stored params are then not the ones the ticket
@@ -365,12 +366,9 @@ async def _resolve_denovo_alignment_idx(
                 " cannot resume; submit a new ticket, which is recorded under the"
                 " alignment definition minted for its own params"
             )
-        # The re-attach branch does not call the mint, so it refuses a deprecated
-        # alignment itself.
         row = await fetch_alignment_definition_by_idx(pool, existing)
         if row is None:
             raise _submission_bad_input(f"alignment {existing} not found")
-        _refuse_deprecated_alignment(row)
         stored = json.loads(row["params"])
         absent = sorted(key for key in _KNOB_BINDINGS if key not in stored)
         if absent:

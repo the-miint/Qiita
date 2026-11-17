@@ -756,7 +756,8 @@ async def run_workflow(
                 )
             )
             # `_resolve_denovo_alignment_idx` has recorded the alignment on the
-            # ticket: a mint in its own transaction, a re-attach by re-writing it.
+            # ticket: a mint records it in its own transaction; a re-attach finds it
+            # already recorded and writes nothing.
             await _create_alignment_gate_pending(
                 pool,
                 alignment_idx=bound[ALIGNMENT_IDX_BINDING],

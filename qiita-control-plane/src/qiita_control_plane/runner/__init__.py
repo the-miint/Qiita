@@ -242,7 +242,6 @@ from ._reference import (
 )
 from ._upload import (
     _consume_upload_handles,
-    _refuse_deprecated_alignment,
     _resolve_upload_handles,
     _submission_bad_input,
 )
@@ -406,7 +405,6 @@ __all__: list[str] = [
     "_build_denovo_alignment_params",
     "_create_alignment_gate_pending",
     "_resolve_denovo_alignment_idx",
-    "_refuse_deprecated_alignment",
     "_require_assembly_subject",
     "_workflow_writes_alignment_gate",
     "ROUTER_INDEX_PATH_BINDING",

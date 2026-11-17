@@ -12,7 +12,6 @@ from qiita_common.api_paths import (
 from qiita_common.backend_failure import BackendFailure, FailureKind
 from qiita_common.data_plane_errors import is_data_plane_transient
 from qiita_common.models import (
-    AlignmentDefinitionStatus,
     UploadStatus,
     WorkTicketFailureStage,
 )
@@ -43,17 +42,6 @@ def _submission_bad_input(reason: str) -> BackendFailure:
         step_name=None,
         reason=reason,
     )
-
-
-def _refuse_deprecated_alignment(row: asyncpg.Record) -> None:
-    """Refuse (bad submission input) a deprecated alignment, from its
-    `alignment_definition` row. A plain status read: the callers act on the row after
-    the check, under no lock, so a `FOR SHARE` held only for the check would buy
-    nothing."""
-    if row["status"] == AlignmentDefinitionStatus.DEPRECATED.value:
-        raise _submission_bad_input(
-            f"alignment {row['alignment_idx']} is deprecated: {row['deprecation_reason']}"
-        )
 
 
 def _is_retriable_dp_error(exc: BaseException) -> bool:
