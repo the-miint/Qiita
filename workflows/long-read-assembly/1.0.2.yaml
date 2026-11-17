@@ -27,15 +27,18 @@ description: >
   per call set (`qiita_common.gene_call_constants`); mint-gene-features mints each
   gene's feature_idx, export-subject-genome-map names each subject's genome, and
   assembly_load stages the `gene_call` and `gene_call_contig` lake tables and writes
-  `genome_idx` on `assembly_membership` and `bin_quality`. Added to this version in
-  place; runs that completed before (of this version or an earlier one) get them from
-  `assembly-gene-call-recover`.
+  `genome_idx` on `assembly_membership` and `bin_quality`. The checkm step scores the
+  `prodigal_checkm` genes gene_call wrote rather than calling Prodigal again. Added to
+  this version in place; runs that completed before (of this version or an earlier
+  one) get the gene calls from `assembly-gene-call-recover`, and keep the CheckM
+  scores they were given.
 
   A sync leaves only the highest version of an action_id enabled
   (`actions/sync.py`), so once this file is synced 1.0.1 stops accepting
   submissions. The assemble image moves to `long-read-assembly-assemble-1.0.2.sif`
-  rather than rebuilding in place; why, and what that costs 1.0.0 and 1.0.1, is on
-  `sif-build.d/assemble.env` beside the filename.
+  rather than rebuilding in place, and the checkm image to
+  `long-read-assembly-checkm-1.0.2.sif`; why, and what that costs 1.0.0 and 1.0.1, is
+  on `sif-build.d/assemble.env` and `sif-build.d/checkm.env` beside each filename.
 
 scopes: []
 
@@ -347,7 +350,7 @@ steps:
   # Prodigal gene calls on every subject CheckM scores, once per call set
   # (`qiita_common.gene_call_constants`), through miint's predict_genes. `gene_calls`
   # holds the gene and contig rows assembly_load keys and stages, and CheckM-layout
-  # genes.faa / genes.gff that nothing reads yet; `gene_manifest` is the gene rows,
+  # genes.faa / genes.gff that the checkm step hands CheckM; `gene_manifest` is the gene rows,
   # for mint-gene-features. Here, after bin_refine, because it reads only what
   # assembly_hash reads. Resources are assembly_hash's, not measured for this step.
   - step: gene_call
@@ -370,7 +373,7 @@ steps:
   # description says what it is for.
   - step: checkm
     step_type: singleton
-    container: long-read-assembly-checkm-1.0.1.sif
+    container: long-read-assembly-checkm-1.0.2.sif
     entrypoint: /opt/qiita/checkm.sh
     # `genomes_dir` is read for circular.fa and noLCG.fa; the refined bins arrive as
     # their own input (and the residue split subtracts them from noLCG.fa). It is an
@@ -378,7 +381,9 @@ steps:
     # assembly_load below states: a declared output is re-bound on resume from a
     # manifest an earlier attempt wrote, while an input resolves from a binding
     # already produced, so adding one here strands nothing.
-    inputs: [refined_bins_dir, genomes_dir]
+    # `gene_calls` carries the gene_call step's genes in CheckM's layout, which checkm.sh
+    # hands CheckM so it does not call Prodigal again (checkm.sh says how).
+    inputs: [refined_bins_dir, genomes_dir, gene_calls]
     # CheckM's reference DB is operator-provisioned under PATH_DERIVED,
     # deliberately NOT baked into the SIF. Bind it in and point checkm.sh at it:
     # the entrypoint reads QIITA_CHECKM_DB (falling back to an /opt/checkm_data

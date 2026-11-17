@@ -41,10 +41,18 @@
 # checkm.sh FAILS LOUD rather than silently emitting an empty checkm_dir (see the
 # DB check below). The genuinely-nothing-to-score case above is a separate benign
 # success.
+#
+# CheckM calls Prodigal on a bin unless `<out>/bins/<bin_id>/genes.faa` is there and
+# not empty, and reads `genes.gff` beside it. The gene_call step has already called
+# each subject's genes by CheckM's rules (`jobs/gene_call.py` says which), and writes
+# them in that layout under `gene_calls/checkm/<kind>/`; seed_genes copies them in
+# before each run, so CheckM scores the genes the lake stores. A subject gene_call
+# found no genes for has no files there, and CheckM calls Prodigal on it.
 source /opt/qiita/_lib.sh
 
 REFINED_DIR="$(qiita_input refined_bins_dir)"
 GENOMES_DIR="$(qiita_input genomes_dir)"
+GENE_CALLS_DIR="$(qiita_input gene_calls)/checkm"
 CIRCULAR="${GENOMES_DIR}/circular.fa"
 NOLCG="${GENOMES_DIR}/noLCG.fa"
 OUT="${QIITA_OUTPUT_PATH}/checkm"
@@ -109,8 +117,30 @@ export TMPDIR="${CK_TMP_LINK}"
 # Emit CheckM's RAW --tab_table output straight into checkm_dir. lineage_wf carries
 # marker lineage + completeness/contamination/strain heterogeneity; qa -o 2 adds
 # genome size / # contigs. assembly_load joins each pair by "Bin Id" in DuckDB.
+#
+# seed_genes <kind> <genomes dir> <CheckM output dir>: each subject of <kind> with
+# gene_call files gets them as `<out>/bins/<bin_id>/genes.{faa,gff}`. A directory
+# naming no genome in <genomes dir> fails the step: it would mean gene_call and
+# CheckM disagree on the bin ids, and CheckM would call Prodigal on every subject.
+seed_genes() {
+    local src="${GENE_CALLS_DIR}/$1" genomes="$2" bins="$3/bins"
+    [[ -d "${src}" ]] || return 0
+    local dir id
+    for dir in "${src}"/*/; do
+        [[ -d "${dir}" ]] || continue
+        id="$(basename "${dir}")"
+        if [[ ! -f "${genomes}/${id}.fa" ]]; then
+            echo "ERROR: gene_call wrote $1 genes for ${id}, which is not a genome in ${genomes}" >&2
+            exit 1
+        fi
+        mkdir -p "${bins}/${id}"
+        cp "${dir}genes.faa" "${dir}genes.gff" "${bins}/${id}/"
+    done
+}
+
 run_checkm() {
-    local genomes="$1" ck="${WORK}/$2" lineage_out="$3" qa_out="$4"
+    local kind="$1" genomes="$2" ck="${WORK}/$3" lineage_out="$4" qa_out="$5"
+    seed_genes "${kind}" "${genomes}" "${ck}"
     micromamba run -n checkm checkm lineage_wf "${genomes}" "${ck}" \
         -x fa -t "${THREADS}" --tab_table -f "${lineage_out}" --pplacer_threads 2
     micromamba run -n checkm checkm qa "${ck}/lineage.ms" "${ck}" \
@@ -118,7 +148,7 @@ run_checkm() {
 }
 
 if [[ "${HAVE_MAG}" -eq 1 ]]; then
-    run_checkm "${REFINED_DIR}" mag_out "${OUT}/lineage.tsv" "${OUT}/qa.tsv"
+    run_checkm MAG "${REFINED_DIR}" mag_out "${OUT}/lineage.tsv" "${OUT}/qa.tsv"
 fi
 
 if [[ "${HAVE_LCG}" -eq 1 ]]; then
@@ -126,7 +156,7 @@ if [[ "${HAVE_LCG}" -eq 1 ]]; then
     # scores a directory of files and would otherwise read the whole multi-FASTA as
     # one genome. lcg_split.py states why the stem is the id verbatim.
     python3 /opt/qiita/lcg_split.py "${CIRCULAR}" "${WORK}/lcg"
-    run_checkm "${WORK}/lcg" lcg_out "${OUT}/lcg_lineage.tsv" "${OUT}/lcg_qa.tsv"
+    run_checkm LCG "${WORK}/lcg" lcg_out "${OUT}/lcg_lineage.tsv" "${OUT}/lcg_qa.tsv"
 fi
 
 if [[ "${HAVE_RESIDUE}" -eq 1 ]]; then
@@ -146,7 +176,7 @@ if [[ "${HAVE_RESIDUE}" -eq 1 ]]; then
         # One line, like the two calls above: test_lcg_split reads the run_checkm
         # INVOCATIONS to check every basename assembly_load opens is written, and a
         # continuation would hide this one from it.
-        run_checkm "${WORK}/residue" residue_out "${OUT}/unbinned_lineage.tsv" "${OUT}/unbinned_qa.tsv"
+        run_checkm UNBINNED "${WORK}/residue" residue_out "${OUT}/unbinned_lineage.tsv" "${OUT}/unbinned_qa.tsv"
     fi
 fi
 

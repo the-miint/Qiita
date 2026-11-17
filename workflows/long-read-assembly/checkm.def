@@ -18,7 +18,7 @@ From: mambaorg/micromamba:1.5.8
     tool checkm
     # Tracks the version in sif-build.d/checkm.env's SIF_FILENAME; the two are the
     # same image's version and disagreed once already.
-    version 1.0.1
+    version 1.0.2
 
 %files
     # Workflow-agnostic output-dir → manifest.json walker, copied from _shared
