@@ -14,7 +14,8 @@ class, and its verdict comes from the prep_sample's protocol (thresholds below, 
 | `short_read_transcriptomics` | `info` |
 
 `no_rrna_marker` is the expected result for amplicons that are not rRNA, such as ITS. A
-read is classified when it aligns to a class's reference with at least 50% query coverage.
+read is classified when its best-scoring alignment across all four references covers at least
+50% of the read.
 
 ## Reference databases
 
@@ -70,10 +71,10 @@ qiita --base-url https://<host> ticket submit \
     "marker_23s_28s_reference_idx": <c>, "marker_5s_5_8s_reference_idx": <d>}'
 ```
 
-The runner reads the protocol from the prep_sample; a prep_sample with no reads ends
-`no_data` first, and otherwise a protocol with no threshold fails the ticket. Read the result from `GET /qc-check/{prep_sample_idx}`: the `data_type` row's
+The runner reads the protocol from the prep_sample; a protocol with no threshold fails the
+ticket. Read the result from `GET /qc-check/{prep_sample_idx}`: the `data_type` row's
 `metrics.marker_reference_idx` records which references were used. A re-run replaces the
-row. A prep_sample with fewer than 1,000 reads gets `insufficient_reads`; one with no reads
-ends `no_data` and writes nothing.
+row. A prep_sample with no reads ends `no_data` and writes nothing, but only when an ingest
+found it empty or it is an expected-empty control; otherwise submission fails with BAD_INPUT.
 
 The job exports the prep_sample's raw reads, so submitting needs an admin role.
