@@ -1318,6 +1318,15 @@ def test_resolve_sortmerna_ref_keeps_its_binding_and_missing_key_message(tmp_pat
         asyncio.run(_resolve_sortmerna_ref(_active_pool(3), {}, **_staged_kwargs(tmp_path)))
 
 
+def test_resolve_sortmerna_ref_wrong_kind_message_is_unchanged(tmp_path):
+    pool = _ReferencePool({3: ("rype_index", "active")})
+    with pytest.raises(BackendFailure) as exc:
+        asyncio.run(
+            _resolve_sortmerna_ref(pool, {"sortmerna_reference_idx": 3}, **_staged_kwargs(tmp_path))
+        )
+    assert exc.value.reason == "reference 3 is not a sequence_reference"
+
+
 def test_workflow_declares_marker_refs_gate():
     assert _workflow_declares_marker_refs([_step(inputs=["reads", "marker_5s_5_8s_ref"])])
     assert not _workflow_declares_marker_refs([_step(inputs=["reads", "sortmerna_ref"])])

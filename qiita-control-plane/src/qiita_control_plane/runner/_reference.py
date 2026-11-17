@@ -731,18 +731,21 @@ async def _fetch_sortmerna_reference_chunks(
     reference_idx: int,
     *,
     label: str,
+    kind_label: str | None = None,
     data_plane_url: str,
     signing_key: bytes,
 ) -> list[tuple[int, int, str]]:
     """Check `reference_idx` is an ACTIVE `sequence_reference` and DoGet its chunks;
-    every failure is a SUBMISSION BAD_INPUT naming `label`."""
+    every failure is a SUBMISSION BAD_INPUT naming `label` (`kind_label` for a wrong kind)."""
     row = await pool.fetchrow(
         "SELECT kind, status FROM qiita.reference WHERE reference_idx = $1", reference_idx
     )
     if row is None:
         raise _submission_bad_input(f"{label} {reference_idx} does not exist")
     if row["kind"] != "sequence_reference":
-        raise _submission_bad_input(f"{label} {reference_idx} is not a sequence_reference")
+        raise _submission_bad_input(
+            f"{kind_label or label} {reference_idx} is not a sequence_reference"
+        )
     if row["status"] != ReferenceStatus.ACTIVE.value:
         raise _submission_bad_input(f"{label} {reference_idx} is not active")
 
@@ -795,6 +798,7 @@ async def _resolve_sortmerna_ref(
         pool,
         reference_idx,
         label=label,
+        kind_label="reference",
         data_plane_url=data_plane_url,
         signing_key=signing_key,
     )

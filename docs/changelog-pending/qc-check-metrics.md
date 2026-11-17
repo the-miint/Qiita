@@ -17,9 +17,3 @@
   `marker_5s_5_8s_ref` gets one FASTA per class from the matching `marker_*_reference_idx`
   context key; a step whose `params:` names `prep_protocol` gets the prep_sample's protocol
   name, which a submitted value cannot override.
-
-### Changed
-
-- **A SortMeRNA reference failure names the reference's role (#N).** The amplicon
-  workflow's "reference N is not a sequence_reference" now reads "SortMeRNA reference N is
-  not a sequence_reference".
