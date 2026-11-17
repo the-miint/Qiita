@@ -17,7 +17,7 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
 
 - `[operator]` Confirm `DATA_PLANE_URL` in `/etc/qiita/control-plane.env` starts with `grpc://`
   (`grep '^DATA_PLANE_URL=' /etc/qiita/control-plane.env`). The control plane now refuses to boot
-  with any other scheme, so a bad value keeps the unit down. (#NNN)
+  with any other scheme, so a bad value keeps the unit down. (#899)
 
 ### 2. One-time host setup
 
