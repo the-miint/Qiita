@@ -82,6 +82,7 @@ from qiita_common.api_paths import (
 from qiita_common.auth_constants import Scope, SystemRole
 from qiita_common.host_filter_plan import PoolPlanRefusal
 from qiita_common.models import (
+    AS_OF_SCOPE,
     AlignPlanRequest,
     AlignPlanResponse,
     BlockMaskPlanRequest,
@@ -193,6 +194,7 @@ from ._helpers import (
     cap_rows,
     deprecated_upstream_read,
     load_groups_as_of,
+    require_known_decision_set,
     resolve_idxs_by_natural_key,
 )
 
@@ -829,7 +831,7 @@ async def get_sequenced_pool_alignment_cohort(
         default=None,
         description=(
             "Group under this earlier decision set (a `decisions.decision_set`) when"
-            " reading past a deprecated upstream; pair decisions only."
+            f" reading past a deprecated upstream; {AS_OF_SCOPE}."
         ),
     ),
 ) -> PoolAlignmentCohort:
@@ -865,8 +867,10 @@ async def get_sequenced_pool_alignment_cohort(
     withdrawn are left out and listed the same way (the rule is stated at the same
     site). A build reading that alignment leaves them out and records them. That
     read resolves each upstream in its group, so it groups under `as_of_event`'s
-    decision set when given (422 for an unknown one); the exact read forms no group.
+    decision set when given; the exact read forms no group. An unknown `as_of_event`
+    is 422 whichever read runs.
     """
+    await require_known_decision_set(pool, as_of_event)
     prep_sample_idxs = await _readable_pool_prep_samples(
         pool, sequenced_pool_idx=sequenced_pool_idx, caller=caller
     )

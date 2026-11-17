@@ -271,10 +271,8 @@ class AlignDefinitionDeprecated(RuntimeError):
 
 
 class AlignPlanDefinitionEdited(RuntimeError):
-    """The alignment this plan minted had its settings edited before the plan's
-    transaction held it, on every attempt (`repositories.definition_hold`). The plan
-    rolls back; planning again mints the alignment for its own params. The route maps
-    this to 409."""
+    """An exhausted hold on the alignment this plan minted
+    (`repositories.definition_hold`); the plan rolls back."""
 
 
 class AlignNoMasksFound(RuntimeError):
@@ -471,8 +469,8 @@ async def plan_and_submit_alignments(
                 return (await lock_active_alignment(conn, row["alignment_idx"]))["params_hash"]
 
             try:
-                # Held from the mint through the ticket inserts below (the rule is
-                # stated in `runner._record`).
+                # Held from the mint through the ticket inserts below
+                # (`repositories.definition_hold`).
                 row = await mint_and_hold(
                     conn,
                     mint=lambda: mint_alignment_definition(

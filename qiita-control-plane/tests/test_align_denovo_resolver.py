@@ -33,7 +33,6 @@ from qiita_control_plane.runner._alignment import (
     MIN_QUERY_COVERAGE_BINDING,
     PRESET_BINDING,
     _create_alignment_gate_pending,
-    _persist_alignment_idx,
     _require_assembly_subject,
     _require_masked_query,
     _resolve_denovo_alignment_idx,
@@ -238,11 +237,9 @@ async def test_the_ticket_column_and_the_gate_row_are_both_written(sample):
     resolver that bound the identity without writing these two would produce a ticket
     that dies at its second entry."""
     pool = sample["pool"]
-    minted = await _resolve(sample)
-    alignment_idx = minted["alignment_idx"]
     work_ticket_idx = await _seed_ticket(sample)
+    alignment_idx = (await _resolve(sample, work_ticket_idx=work_ticket_idx))["alignment_idx"]
 
-    await _persist_alignment_idx(pool, work_ticket_idx, alignment_idx)
     await _create_alignment_gate_pending(
         pool, alignment_idx=alignment_idx, prep_sample_idx=sample["prep_sample_idx"]
     )
@@ -294,7 +291,6 @@ async def test_a_resume_re_attaches_to_the_ticket_column_instead_of_re_deriving(
     come back with the SAME idx and the STORED knobs, not the new default's."""
     ticket = await _seed_ticket(sample)
     first = await _resolve(sample, work_ticket_idx=ticket)
-    await _persist_alignment_idx(sample["pool"], ticket, first["alignment_idx"])
 
     resumed = await _resolve(
         sample,
@@ -391,7 +387,6 @@ async def test_an_invalidated_run_is_not_re_run_under_the_same_identity(sample):
 async def test_a_deprecated_alignment_is_refused_on_mint_and_on_resume(sample):
     ticket = await _seed_ticket(sample)
     first = await _resolve(sample, work_ticket_idx=ticket)
-    await _persist_alignment_idx(sample["pool"], ticket, first["alignment_idx"])
     await sample["pool"].execute(
         "UPDATE qiita.alignment_definition SET status = 'deprecated', deprecated_at = now(),"
         "       deprecated_by_idx = $2, deprecation_reason = 'bad preset'"
@@ -449,9 +444,10 @@ async def test_a_re_attach_after_an_admin_edit_of_the_recorded_alignment_fails(
 async def test_an_earlier_edit_of_the_tickets_mask_does_not_hide_an_alignment_edit(
     sample, human_admin_session
 ):
-    """The ticket also records a mask, edited before the alignment was: the re-attach
-    still finds the alignment's edit and fails, rather than reading only the
-    ticket's earliest edit."""
+    """The ticket also records a mask. An edit of the mask alone does not stop the
+    re-attach; once the alignment is edited too, after the mask, the re-attach finds
+    the alignment's edit and fails, rather than reading only the ticket's earliest
+    edit."""
     from qiita_common.backend_failure import BackendFailure
     from qiita_common.models import DefinitionKind, DefinitionSettingsEditKind
 
@@ -476,12 +472,10 @@ async def test_an_earlier_edit_of_the_tickets_mask_does_not_hide_an_alignment_ed
             ticket,
             mask_idx,
         )
+
         # Append-only, with no FK to the definition, so the rows are left as the
         # other settings-edit tests leave theirs. The mask's edit is the earlier.
-        for kind, ref, minutes in (
-            (DefinitionKind.MASK, mask_idx, 1),
-            (DefinitionKind.ALIGNMENT, first["alignment_idx"], 2),
-        ):
+        async def edit(kind, ref, minutes):
             await pool.execute(
                 "INSERT INTO qiita.definition_settings_edit (definition_kind, definition_ref,"
                 "  edit_kind, actor_principal_idx, old_settings, new_settings, reason,"
@@ -494,6 +488,10 @@ async def test_an_earlier_edit_of_the_tickets_mask_does_not_hide_an_alignment_ed
                 human_admin_session["principal_idx"],
                 minutes,
             )
+
+        await edit(DefinitionKind.MASK, mask_idx, 1)
+        assert await _resolve(sample, work_ticket_idx=ticket) == first
+        await edit(DefinitionKind.ALIGNMENT, first["alignment_idx"], 2)
         with pytest.raises(BackendFailure, match="submit a new ticket"):
             await _resolve(sample, work_ticket_idx=ticket)
     finally:

@@ -15,7 +15,7 @@ groups are computed from):
      column's FK takes a key-share lock on the row, and the writers also hold it
      `FOR SHARE`), and the edit then sees the ticket. How a mint holds its row
      through the ticket write, and the block-mask plan's exception, are stated in
-     `runner._record`. A later dispatch of a ticket recording a definition edited
+     `repositories.definition_hold`. A later dispatch of a ticket recording a definition edited
      after the ticket was created fails it when it keeps step rows from an earlier
      attempt (`runner._workflow`), and a minted definition's resume fails at its mint
      (`runner._record`), so no run mixes work done under two settings. The

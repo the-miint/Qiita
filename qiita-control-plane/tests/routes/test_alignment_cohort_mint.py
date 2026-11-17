@@ -918,3 +918,23 @@ async def test_the_upstream_flag_leaves_nothing_out_without_a_deprecated_upstrea
     assert (plain.status_code, flagged.status_code) == (200, 200)
     assert flagged.json() == plain.json()
     assert flagged.json()["left_out"] == []
+
+
+async def test_the_listing_refuses_an_unknown_decision_set_whichever_read_runs(
+    ctx, pool_alignment_seed
+):
+    """An unknown `as_of_event` is 422 on a plain listing and on the exact read of a
+    deprecated alignment, which form no group, as on the upstream read."""
+    seed = pool_alignment_seed
+    url = URL_SEQUENCED_POOL_ALIGNMENT_COHORT.format(
+        sequencing_run_idx=seed["run_idx"],
+        sequenced_pool_idx=seed["pool_idx"],
+        alignment_idx=seed["align_1"],
+    )
+    unknown = "sha256:" + "0" * 64
+    assert (await ctx["user"].get(url)).status_code == 200
+    plain = await ctx["user"].get(url, params={"as_of_event": unknown})
+    assert plain.status_code == 422, plain.text
+    await _deprecate_alignment(ctx, seed["align_1"])
+    exact = await ctx["user"].get(url, params={"include_deprecated": True, "as_of_event": unknown})
+    assert exact.status_code == 422, exact.text

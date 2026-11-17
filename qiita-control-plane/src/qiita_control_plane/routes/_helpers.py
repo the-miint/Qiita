@@ -49,7 +49,7 @@ from ..auth.guards import (
     tier_at_least,
 )
 from ..auth.principal import HumanUser, Principal
-from ..decision_set import DecisionSetUnknown
+from ..decision_set import DecisionSetUnknown, load_decision_set
 from ..definition_similarity import (
     Groups,
     PairRefused,
@@ -2058,3 +2058,15 @@ async def load_groups_as_of(conn: asyncpg.Connection, as_of_event: str | None) -
         return await load_groups(conn, as_of_event=as_of_event)
     except DecisionSetUnknown as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+async def require_known_decision_set(pool: asyncpg.Pool, as_of_event: str | None) -> None:
+    """422 when `as_of_event` names no decision set, for a route whose read may form
+    no group, so an unknown token is refused whichever read runs."""
+    if as_of_event is None:
+        return
+    async with pool.acquire() as conn, conn.transaction(isolation="repeatable_read", readonly=True):
+        try:
+            await load_decision_set(conn, as_of_event)
+        except DecisionSetUnknown as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc

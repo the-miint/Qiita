@@ -311,14 +311,14 @@ async def test_deprecation_waits_for_unfinished_tickets(client, lc):
     assert (await _deprecate(client, lc["alignment_idx"])).status_code == 200
 
 
-async def test_a_deprecated_alignment_cannot_be_recorded_on_a_ticket(lc):
-    """The de novo writer of work_ticket.alignment_idx re-checks the status under a
-    share lock, so a deprecation landing after the mint still stops the run before it
-    records the alignment."""
+async def test_a_re_attach_to_a_deprecated_alignment_is_refused(lc):
+    """A de novo resume re-attaches to the alignment its ticket records without a mint,
+    so the re-attach refuses a deprecation that landed since (the resolver path is in
+    `test_align_denovo_resolver`)."""
     from qiita_common.actions import ALIGN_DENOVO_ACTION_ID
     from qiita_common.backend_failure import BackendFailure, FailureKind
 
-    from qiita_control_plane.runner._alignment import _persist_alignment_idx
+    from qiita_control_plane.runner._alignment import _refuse_deprecated_alignment
 
     pool = lc["pool"]
     a, _b, _c = lc["samples"]
@@ -326,17 +326,17 @@ async def test_a_deprecated_alignment_cannot_be_recorded_on_a_ticket(lc):
     created = await seed_action_if_absent(
         pool, action_id=ALIGN_DENOVO_ACTION_ID, version=version, target_kind="prep_sample"
     )
-    # The shape the de novo runner stamps: a processing prep_sample ticket that does
-    # not carry the alignment yet.
+    # A resumed de novo ticket: it already records the alignment.
     wt = await pool.fetchval(
         "INSERT INTO qiita.work_ticket (action_id, action_version, originator_principal_idx,"
-        "  scope_target_kind, prep_sample_idx, state)"
-        " VALUES ($1, $2, $3, 'prep_sample', $4, $5) RETURNING work_ticket_idx",
+        "  scope_target_kind, prep_sample_idx, state, alignment_idx)"
+        " VALUES ($1, $2, $3, 'prep_sample', $4, $5, $6) RETURNING work_ticket_idx",
         ALIGN_DENOVO_ACTION_ID,
         version,
         lc["owner"],
         a,
         WorkTicketState.PROCESSING.value,
+        lc["alignment_idx"],
     )
     try:
         await pool.execute(
@@ -348,12 +348,8 @@ async def test_a_deprecated_alignment_cannot_be_recorded_on_a_ticket(lc):
             AlignmentDefinitionStatus.DEPRECATED.value,
         )
         with pytest.raises(BackendFailure, match="late") as ei:
-            await _persist_alignment_idx(pool, wt, lc["alignment_idx"])
+            await _refuse_deprecated_alignment(pool, lc["alignment_idx"])
         assert ei.value.kind == FailureKind.BAD_INPUT
-        recorded = await pool.fetchval(
-            "SELECT alignment_idx FROM qiita.work_ticket WHERE work_ticket_idx = $1", wt
-        )
-        assert recorded is None
     finally:
         await pool.execute("DELETE FROM qiita.work_ticket WHERE work_ticket_idx = $1", wt)
         await delete_action_if_created(

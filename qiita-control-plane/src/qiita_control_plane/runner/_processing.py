@@ -148,7 +148,7 @@ async def _mint_processing_idx(
     With `work_ticket_idx`, the same transaction records the processing on the ticket
     (`work_ticket.processing_idx`), holding the processing row `FOR SHARE` from the
     mint through that write, and refuses a ticket that already records another
-    processing (`runner._record` says why both)."""
+    processing (`repositories.definition_hold` and `runner._record` say why)."""
     params = _build_processing_params(
         action_id, action_version, bound, assembler_default=assembler_default
     )
@@ -182,8 +182,9 @@ async def _mint_processing_idx(
 async def _mint_and_hold(
     conn: asyncpg.Connection, *, workflow: str, version: str, params: dict[str, Any]
 ) -> asyncpg.Record:
-    """`mint_processing` under `repositories.definition_hold.mint_and_hold`: the minted row is held
-    `FOR SHARE` for the caller's transaction, re-minted when an edit moved it."""
+    """`mint_processing` under `repositories.definition_hold.mint_and_hold`: the
+    minted row is held `FOR SHARE` for the caller's transaction, re-minted when an
+    edit moved it."""
 
     async def held_params_hash(row: asyncpg.Record) -> bytes:
         return await conn.fetchval(

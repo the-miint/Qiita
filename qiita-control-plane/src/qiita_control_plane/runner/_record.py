@@ -1,21 +1,5 @@
-"""Minting a definition and recording it on its ticket, in one transaction.
-
-The rule, stated here once: a mask, an alignment or a processing minted for a ticket
-is held `FOR SHARE` from the mint through the write that records it on the ticket
-(`work_ticket.mask_idx`, `alignment_idx`, `processing_idx`), re-minted when a
-settings edit moved it before the hold (`repositories.definition_hold.mint_and_hold`).
-A settings edit holds the row `FOR UPDATE` while it checks for unfinished tickets
-(`definition_settings`), so the edit and the mint-and-record cannot both commit
-unseen by the other, and a ticket is never recorded under settings it did not hash.
-The per-sample read-mask, de novo alignment and processing mints record here
-(`record_minted`); the align-block plan mints and inserts its tickets in one
-transaction the same way (`align_planner`). The block-mask plan is the exception: it
-mints before its plan transaction and, under the hold, refuses the plan when a
-minted mask's settings moved (`block_planner.BlockPlanMaskEdited`) rather than
-re-minting, since a re-mint would re-partition the plan mid-transaction. A mint whose
-row is edited before every hold fails the ticket as bad submission input
-(`fail_exhausted_hold`), as the other pre-loop refusals do; the align planner
-refuses with a 409 instead.
+"""Recording a minted definition on its ticket, in the transaction that holds it
+(the hold, and what an exhausted hold does, are in `repositories.definition_hold`).
 
 A redrive keeps the ticket's step rows and gate row, keyed on the definition it
 recorded on its first attempt. When the mint now resolves to another row, the
@@ -82,6 +66,5 @@ async def record_minted(
 
 
 def fail_exhausted_hold(exc: MintHoldExhausted) -> Exception:
-    """The ticket failure for a mint whose row was edited before every hold: bad
-    submission input, as every pre-loop refusal is; a redrive mints again."""
+    """The ticket failure for an exhausted hold (`repositories.definition_hold`)."""
     return _submission_bad_input(str(exc))

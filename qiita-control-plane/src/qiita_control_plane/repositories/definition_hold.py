@@ -1,7 +1,22 @@
 """Minting a definition and holding the minted row for the caller's transaction.
 
-`runner._record` states when a ticket's definition is held from its mint through the
-write that records it, and why; `align_planner` holds its alignment the same way."""
+The rule, stated here once: a mask, an alignment or a processing minted for a ticket
+is held `FOR SHARE` from the mint through the write that records it on the ticket
+(`work_ticket.mask_idx`, `alignment_idx`, `processing_idx`), re-minted when a
+settings edit moved it before the hold (`mint_and_hold`). A settings edit holds the
+row `FOR UPDATE` while it checks for unfinished tickets (`definition_settings`), so
+the edit and the mint-and-record cannot both commit unseen by the other, and a
+ticket is never recorded under settings it did not hash. The per-sample read-mask,
+de novo alignment and processing mints record on the ticket in the hold's
+transaction (`runner._record.record_minted`); the align-block plan mints and inserts
+its tickets in one transaction. The block-mask plan is the exception: it mints
+before its plan transaction and, under the hold, refuses the plan when a minted
+mask's settings moved (`block_planner.BlockPlanMaskEdited`) rather than re-minting,
+since a re-mint would re-partition the plan mid-transaction.
+
+When the row is edited before every hold (`MintHoldExhausted`), a runner fails the
+ticket as bad submission input, as its other pre-loop refusals do, and the align
+planner refuses the plan with a 409; a redrive or a new plan mints again."""
 
 from collections.abc import Awaitable, Callable
 
@@ -17,8 +32,7 @@ MINT_HOLD_ATTEMPTS = 2
 
 class MintHoldExhausted(Exception):
     """The minted row's settings were edited between the mint and its hold on every
-    attempt. A runner fails the ticket as bad submission input (`runner._record`); the
-    align planner refuses the plan with a 409 (`AlignPlanDefinitionEdited`)."""
+    attempt (the module docstring says what each caller does with it)."""
 
     def __init__(self, what: str):
         self.what = what
