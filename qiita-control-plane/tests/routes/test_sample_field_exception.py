@@ -840,9 +840,9 @@ async def _seed_unique_local_value(ctx, s: _Surface, *, study_idx: int, entity: 
 )
 async def test_exception_on_a_unique_in_study_field_is_409(ctx, surface, tier):
     """A field exception cannot be set on a unique_in_study field. The route
-    refuses it before it compares tiers, so a tier that also restricts nothing
-    gets the 409, not the 422; the database refuses only at the insert, which
-    that 422 would never reach."""
+    refuses it before comparing tiers, so a tier at or below the field's gets
+    the 409, not the 422. The database refuses only at the insert, which a PUT
+    refused with 422 would never reach."""
     s = _SURFACES[surface]
     study_idx = await _member_study(ctx)
     entity = await s.seed_entity(ctx, study_idx)
