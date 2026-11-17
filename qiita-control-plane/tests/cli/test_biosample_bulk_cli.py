@@ -289,8 +289,8 @@ def test_resolve_study_idx_refuses_blank_export_id(monkeypatch, tmp_path, capsys
     assert (exc_info.value.code, captured["requests"], names_flag) == (2, [], True)
 
 
-@pytest.mark.parametrize("owner_column", ["biosample_idx", "export_entity_id"])
-def test__read_biosample_tsv_refuses_owner_column_named_like_output(
+@pytest.mark.parametrize("owner_column", ["biosample_idx", "export_entity_id", "Biosample_IDX"])
+def test__handle_biosample_bulk_create_refuses_owner_column_named_like_output(
     monkeypatch, tmp_path, capsys, owner_column
 ):
     """Tests the case where the owner column shares its name with a column that

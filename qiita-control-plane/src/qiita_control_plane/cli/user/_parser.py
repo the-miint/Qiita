@@ -83,6 +83,7 @@ from .amplicon import _handle_submit_golay_demux
 from .assembly import DEFAULT_EXPORT_KINDS, EXPORT_KINDS, _handle_assembly_export
 from .auth import _handle_login, _handle_profile_set, _handle_whoami
 from .biosample import (
+    _BULK_CREATE_OUTPUT_FIELDS,
     _OWNER_FIELD_NAME_FLAG,
     _TSV_FILE_FLAG,
     _handle_biosample_bulk_create,
@@ -616,7 +617,8 @@ def _build_parser() -> argparse.ArgumentParser:
         required=True,
         help=(
             "display_name of the study's local field that carries the owner_biosample_id;"
-            " the file's column with this header holds each row's value"
+            " the file's column with this header holds each row's value. It cannot be"
+            f" {' or '.join(_BULK_CREATE_OUTPUT_FIELDS)}, the names of the output columns"
         ),
     )
     p_biosample_bulk_create.add_argument(

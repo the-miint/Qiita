@@ -226,8 +226,8 @@ qiita biosample bulk-create \
 ```
 
 `--owner-biosample-id-field-name` specifies the name of the column holding the
-owner's biosample name. That name cannot be `biosample_idx` or `export_entity_id`,
-which are reserved.
+owner's biosample name. That name cannot be `biosample_idx` or `export_entity_id`, the
+names of the command's own output columns.
 
 The example names the study by the `STUDY_EXPORT_ID` kept in step 2. You can name it
 by the `STUDY_IDX` kept there instead, by passing `--study-idx` in place of

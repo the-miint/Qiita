@@ -285,13 +285,19 @@ def test_write_tsv_row_of_wrong_width(tmp_path, rows):
     assert not path.exists()
 
 
-def test_write_tsv_repeated_column_name(tmp_path):
-    """Tests the case where a column name repeats: the write refuses it, since
-    the later column would otherwise replace the earlier one's cells."""
+@pytest.mark.parametrize(
+    "columns",
+    [("biosample_idx", "biosample_idx"), ("Biosample_idx", "biosample_idx")],
+    ids=["exact-repeat", "repeat-differing-in-case"],
+)
+def test_write_tsv_repeated_column_name(tmp_path, columns):
+    """Tests the case where a column name repeats, exactly or differing only in
+    case: the write refuses it, since the later column would otherwise replace
+    the earlier one's cells or be renamed."""
     path = tmp_path / "table.tsv"
 
     with pytest.raises(ValueError, match="biosample_idx"):
-        write_tsv(path, ("biosample_idx", "biosample_idx"), [("SMK-001", "1041")])
+        write_tsv(path, columns, [("SMK-001", "1041")])
 
     assert not path.exists()
 

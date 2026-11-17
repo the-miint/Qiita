@@ -68,13 +68,7 @@ def _read_biosample_tsv(
     """Read the TSV file at `tsv_file` into one dict per row, keyed on its
     stripped column headers. A file that cannot be read, that lacks the
     `owner_column` column, or that holds no rows exits through `parser.error`,
-    naming the file and the fault, as does an `owner_column` that the printed
-    results already use as a column name."""
-    if owner_column in _BULK_CREATE_OUTPUT_FIELDS:
-        parser.error(
-            f"{_OWNER_FIELD_NAME_FLAG} {owner_column!r} cannot be used:"
-            " this column name is reserved."
-        )
+    naming the file and the fault."""
     try:
         tsv_rows = read_headed_tsv(tsv_file, source_name=_TSV_FILE_FLAG)
     except duckdb.Error as exc:
@@ -131,8 +125,16 @@ def _bulk_create_rows(
 def _handle_biosample_bulk_create(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
     """Create one biosample per row of a TSV file on a study, in one
     all-or-nothing request, then print each created biosample's identifiers as a TSV."""
-    # Read the file first, so an unreadable file exits before any request.
+    # Refuse an owner column named, in any case, like an output column.
     owner_column = args.owner_biosample_id_field_name.strip()
+    output_field_names = {field.casefold() for field in _BULK_CREATE_OUTPUT_FIELDS}
+    if owner_column.casefold() in output_field_names:
+        parser.error(
+            f"{_OWNER_FIELD_NAME_FLAG} {owner_column!r} cannot be used:"
+            " this column name is reserved."
+        )
+
+    # Read the file first, so an unreadable file exits before any request.
     tsv_rows = _read_biosample_tsv(args.tsv_file, owner_column, parser)
 
     def _run(token: str) -> list[tuple[str, ...]]:

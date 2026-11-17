@@ -172,11 +172,16 @@ def write_tsv(
     and a None cell reaches the file empty. Passing no rows writes the header
     alone.
 
-    Raises ValueError when a column name repeats or a row does not carry one
-    cell per column, and duckdb.Error when DuckDB cannot write the file.
+    Raises ValueError when a column name repeats, ignoring case, or a row does
+    not carry one cell per column, and duckdb.Error when DuckDB cannot write the
+    file.
     """
-    # Refuse any repeated column name, because its later column would replace the earlier.
-    repeated_columns = sorted({column for column in columns if columns.count(column) > 1})
+    # Refuse any repeated column name, ignoring case: an exact repeat would replace
+    # the earlier column, and DuckDB renames a repeat that differs only in case.
+    folded_columns = [column.casefold() for column in columns]
+    repeated_columns = sorted(
+        {column for column in columns if folded_columns.count(column.casefold()) > 1}
+    )
     if repeated_columns:
         raise ValueError(f"column name(s) {repeated_columns} repeat")
 
