@@ -12,6 +12,7 @@ is work-triggered, so an idle service would narrate nothing and a journal with n
 lines could not be distinguished from a service still carrying the bug.
 """
 
+import asyncio
 import base64
 import logging
 import secrets
@@ -104,3 +105,47 @@ async def test_boot_line_carries_the_configured_logger_name(monkeypatch, caplog,
 
     boot = [r for r in caplog.records if "control-plane up" in r.getMessage()]
     assert boot and boot[0].name == "qiita_control_plane.main"
+
+
+async def test_shutdown_cancels_the_reconcile_resume_task_before_the_drain(monkeypatch, tmp_path):
+    """Cancelled first, the waiting resume cannot register dispatches behind the drain."""
+    from qiita_control_plane import main as cp_main
+
+    _minimal_boot_env(monkeypatch, tmp_path)
+    monkeypatch.setattr(cp_main, "configure_logging", lambda *a, **k: "INFO")
+    monkeypatch.setattr(cp_main, "install_authorization_scrub", lambda *a, **k: None)
+
+    class _Pool:
+        async def close(self):
+            pass
+
+    async def _get_pool(*a, **k):
+        return _Pool()
+
+    async def _forever(*a, **k):
+        await asyncio.Event().wait()
+
+    async def _noop(*a, **k):
+        return None
+
+    async def _reconcile(app):
+        app.state.reconcile_resume_task = asyncio.create_task(_forever())
+
+    resume_task_state_at_drain: list[bool] = []
+
+    async def _drain(*a, **k):
+        resume_task_state_at_drain.append(app.state.reconcile_resume_task.cancelled())
+
+    for name in ("run_sweeper", "run_cli_login_code_sweeper", "run_follow_on_sweeper"):
+        monkeypatch.setattr(cp_main, name, _forever)
+    monkeypatch.setattr(cp_main, "get_pool", _get_pool)
+    monkeypatch.setattr(cp_main, "reconcile_inflight_tickets", _reconcile)
+    monkeypatch.setattr(cp_main, "reconcile_follow_ons", _noop)
+    monkeypatch.setattr(cp_main, "reconcile_inflight_batches", _noop)
+    monkeypatch.setattr(cp_main, "drain_running_dispatches", _drain)
+
+    app = FastAPI()
+    async with cp_main.lifespan(app):
+        assert not app.state.reconcile_resume_task.done()
+
+    assert resume_task_state_at_drain == [True, True]

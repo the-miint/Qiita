@@ -162,8 +162,10 @@ Manual restart (`POST /api/v1/work-ticket/{idx}/run` on a `FAILED` ticket):
 asyncio loop of the process that submitted them; a CP restart loses
 those tasks. To recover, the lifespan startup hook calls
 `reconcile_inflight_tickets`, which **re-attaches** rather than fails:
-for every non-terminal (PENDING / QUEUED / PROCESSING) ticket it schedules
-`run_workflow(resume=True)`, which fast-forwards entries a prior run already
+in a background task, once the data plane reports SERVING (so a CP that starts first
+doesn't fail every ticket at submission), it schedules `run_workflow(resume=True)`
+for every non-terminal (PENDING / QUEUED / PROCESSING) ticket not changed in the
+meantime (a `/run` that dispatched one is not doubled). The resume fast-forwards entries a prior run already
 completed (rebuilding their `bound` outputs from the shared workspace),
 re-attaches a still-running SLURM job by its persisted `slurm_job_id` (or
 adopts an orphan by its deterministic name via `find-by-name`), finalizes a

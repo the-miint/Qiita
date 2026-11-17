@@ -6534,7 +6534,7 @@ async def test_assembly_gate_write_that_raises_leaves_a_recoverable_ticket(
     with NULL failure_*, which reconcile still selects and a resume re-drive
     finishes. Reversed, the ticket would already be terminal — reconcile skips
     those — leaving the 'pending' row with nothing to move it."""
-    from qiita_control_plane.dispatch import _inflight_ticket_idxs
+    from qiita_control_plane.dispatch import _inflight_ticket_versions
     from qiita_control_plane.runner import _workflow
 
     work_ticket_idx, prep_sample_idx, teardown = await _seed_assembly_gate_ticket(postgres_pool)
@@ -6581,7 +6581,7 @@ async def test_assembly_gate_write_that_raises_leaves_a_recoverable_ticket(
             == "pending"
         )
         # Non-terminal is what keeps the ticket in reconcile's selection.
-        assert work_ticket_idx in await _inflight_ticket_idxs(postgres_pool)
+        assert work_ticket_idx in await _inflight_ticket_versions(postgres_pool)
 
         async def _no_jobs(_job_name):
             return []

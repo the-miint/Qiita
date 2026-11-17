@@ -9,6 +9,7 @@ without actually executing a workflow.
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import json
 import logging
@@ -3173,10 +3174,22 @@ async def test_reconcile_schedules_resume_for_non_terminal_only(
             "schedule_dispatch",
             lambda app, idx, **kw: scheduled.append((idx, kw)),
         )
+
+        async def _dp_ready(*_a, **_kw):
+            return None
+
+        monkeypatch.setattr(dispatch, "wait_for_data_plane", _dp_ready)
         app = SimpleNamespace(
-            state=SimpleNamespace(pool=postgres_pool, compute_backend_client=object())
+            state=SimpleNamespace(
+                pool=postgres_pool,
+                compute_backend_client=object(),
+                settings=SimpleNamespace(data_plane_url="grpc://unused"),
+                running_dispatches=set(),
+                reconcile_resume_task=None,
+            )
         )
         count = await dispatch.reconcile_inflight_tickets(app)
+        await app.state.reconcile_resume_task
 
         scheduled_idxs = {idx for idx, _ in scheduled}
         # Every non-terminal ticket scheduled for resume.
@@ -3200,6 +3213,64 @@ async def test_reconcile_schedules_resume_for_non_terminal_only(
                 "DELETE FROM qiita.reference WHERE reference_idx = ANY($1::bigint[])",
                 created_refs,
             )
+
+
+async def test_reconcile_skips_a_ticket_run_while_it_waited_for_the_data_plane(
+    wt_client, postgres_pool, admin_token, reference_action, ticket_seeder, monkeypatch
+):
+    """A ticket `/run` dispatches during the data-plane wait must not be resumed on top of it.
+
+    `/run` on a non-held PENDING ticket changes no column value; the resume's
+    `updated_at` comparison sees it only because the row is written at all.
+    """
+    from types import SimpleNamespace
+
+    from qiita_control_plane import dispatch
+    from qiita_control_plane.routes import work_ticket as work_ticket_routes
+
+    token, admin_idx = admin_token
+    run_by_route = await ticket_seeder.ticket(
+        action=reference_action, originator_idx=admin_idx, state=WorkTicketState.PENDING.value
+    )
+    untouched = await ticket_seeder.ticket(
+        action=reference_action, originator_idx=admin_idx, state=WorkTicketState.PENDING.value
+    )
+
+    release = asyncio.Event()
+
+    async def _wait(_url):
+        await release.wait()
+
+    resumed: list[int] = []
+    dispatched_by_route: list[int] = []
+    monkeypatch.setattr(dispatch, "wait_for_data_plane", _wait)
+    monkeypatch.setattr(dispatch, "schedule_dispatch", lambda _app, idx, **_kw: resumed.append(idx))
+    monkeypatch.setattr(
+        work_ticket_routes,
+        "schedule_dispatch",
+        lambda _app, idx, **_kw: dispatched_by_route.append(idx),
+    )
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            pool=postgres_pool,
+            compute_backend_client=object(),
+            settings=SimpleNamespace(data_plane_url="grpc://unused"),
+            running_dispatches=set(),
+            reconcile_resume_task=None,
+        )
+    )
+    await dispatch.reconcile_inflight_tickets(app)
+    resp = await wt_client.post(
+        URL_WORK_TICKET_RUN.format(work_ticket_idx=run_by_route),
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 202, resp.text
+    assert dispatched_by_route == [run_by_route]
+    release.set()
+    await app.state.reconcile_resume_task
+
+    assert untouched in resumed
+    assert run_by_route not in resumed
 
 
 # ---------------------------------------------------------------------------
