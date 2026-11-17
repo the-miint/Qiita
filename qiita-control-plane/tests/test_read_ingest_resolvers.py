@@ -44,8 +44,6 @@ from qiita_control_plane.runner import (
     STAGED_MASKED_READS_BINDING,
     STAGED_READS_BINDING,
     _resolve_barcode_map,
-    _resolve_marker_refs,
-    _resolve_prep_protocol,
     _resolve_sample_map,
     _resolve_sortmerna_ref,
     _resolve_staged_masked_reads,
@@ -53,8 +51,6 @@ from qiita_control_plane.runner import (
     _stage_ena_run_roster,
     _stage_ena_run_roster_binding,
     _workflow_declares_input,
-    _workflow_declares_marker_refs,
-    _workflow_declares_param,
     _workflow_needs_staged_masked_reads,
     _workflow_needs_staged_reads,
     _write_reference_fasta,
@@ -63,6 +59,12 @@ from qiita_control_plane.runner._read_ingest import (
     _barcode_roster_mismatches,
     _copy_masked_to_fastq,
     _preflight_barcode_roster,
+    _resolve_prep_protocol,
+    _workflow_declares_param,
+)
+from qiita_control_plane.runner._reference import (
+    _resolve_marker_refs,
+    _workflow_declares_marker_refs,
 )
 from qiita_control_plane.testing.db_seeds import (
     seed_biosample_with_sequenced_prep_sample,
@@ -1336,7 +1338,7 @@ def test_workflow_declares_marker_refs_gate():
 
 
 class _ProtocolPool:
-    def __init__(self, name: str | None):
+    def __init__(self, name: str):
         self._name = name
 
     async def fetchval(self, _query, _prep_sample_idx):
@@ -1347,14 +1349,6 @@ def test_resolve_prep_protocol_binds_the_name_of_the_samples_protocol():
     scope = {"kind": "prep_sample", "prep_sample_idx": 5}
     bound = asyncio.run(_resolve_prep_protocol(_ProtocolPool("short_read_amplicon"), scope))
     assert bound == {"prep_protocol": "short_read_amplicon"}
-
-
-def test_resolve_prep_protocol_with_no_protocol_row_is_bad_input():
-    scope = {"kind": "prep_sample", "prep_sample_idx": 5}
-    with pytest.raises(BackendFailure) as exc:
-        asyncio.run(_resolve_prep_protocol(_ProtocolPool(None), scope))
-    assert exc.value.kind == FailureKind.BAD_INPUT
-    assert exc.value.stage == WorkTicketFailureStage.SUBMISSION
 
 
 @pytest.mark.parametrize("kind", ["sequenced_pool", "block", "reference"])

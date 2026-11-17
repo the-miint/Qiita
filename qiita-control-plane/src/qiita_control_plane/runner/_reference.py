@@ -15,9 +15,9 @@ from qiita_common.models import (
     INDEX_TYPE_BOWTIE2,
     INDEX_TYPE_MINIMAP2,
     INDEX_TYPE_RYPE_ROUTER,
-    MarkerClass,
     ReferenceStatus,
 )
+from qiita_common.qc_metrics import MarkerClass
 
 import qiita_control_plane.runner as _runner_pkg
 
@@ -670,17 +670,19 @@ async def _resolve_qc_adapters(
 
 
 # =============================================================================
-# SortMeRNA reference resolution (amplicon denoise)
+# SortMeRNA reference resolution (amplicon denoise, verify-data-type)
 # =============================================================================
 #
-# amplicon's denoise step 16S-filters with SortMeRNA, which needs a FASTA. the
-# workflow names a loaded `sequence_reference` by reference_idx; the runner
-# materializes its sequences to a FASTA and binds `sortmerna_ref`.
+# SortMeRNA needs a FASTA. a workflow names a loaded `sequence_reference` by
+# reference_idx; the runner materializes its sequences to a FASTA and binds
+# `sortmerna_ref` (amplicon denoise) or one `marker_*_ref` per rRNA class
+# (verify-data-type).
 
 SORTMERNA_REF_BINDING = "sortmerna_ref"
 # action_context key: the reference_idx to materialize.
 SORTMERNA_REFERENCE_IDX_KEY = "sortmerna_reference_idx"
 MARKER_REF_BINDINGS = {cls: f"{cls}_ref" for cls in MarkerClass}
+MARKER_REFERENCE_IDX_KEYS = {cls: f"{cls}_reference_idx" for cls in MarkerClass}
 
 
 def _write_reference_fasta(
@@ -822,7 +824,7 @@ async def _resolve_marker_refs(
     SUBMISSION BAD_INPUT naming the class."""
     idxs: dict[MarkerClass, int] = {}
     for cls in MarkerClass:
-        key = f"{cls}_reference_idx"
+        key = MARKER_REFERENCE_IDX_KEYS[cls]
         reference_idx = action_context.get(key)
         if reference_idx is None:
             raise _submission_bad_input(f"the {cls} marker reference requires {key}")
@@ -846,9 +848,9 @@ async def _resolve_marker_refs(
     bound = {}
     with connect_with_miint_staged() as con:
         for cls, rows in chunks.items():
-            dest = workspace / f"{cls}_ref.fasta"
+            dest = workspace / f"{MARKER_REF_BINDINGS[cls]}.fasta"
             _write_sortmerna_fasta(
                 rows, dest, con, label=f"{cls} reference", reference_idx=idxs[cls]
             )
-            bound[f"{cls}_ref"] = dest
+            bound[MARKER_REF_BINDINGS[cls]] = dest
     return bound

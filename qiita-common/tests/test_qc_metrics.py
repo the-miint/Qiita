@@ -6,8 +6,15 @@ import pytest
 from pydantic import ValidationError
 
 from qiita_common.models import QcCheck
-from qiita_common.models.prep_sample_qc_check import DataTypeMetrics
-from qiita_common.qc_metrics import METRIC_MODELS, validate_qc_metrics
+from qiita_common.qc_metrics import (
+    _FRACTION_SUM_TOLERANCE,
+    METRIC_MODELS,
+    DataTypeMetrics,
+    MarkerClass,
+    MarkerFractions,
+    MarkerReferenceIdx,
+    validate_qc_metrics,
+)
 
 _GOOD = {
     "n_sampled": 10000,
@@ -99,3 +106,22 @@ def test_helper_rejects_a_check_without_a_model():
 def test_helper_names_the_check_of_a_failing_payload():
     with pytest.raises(ValueError, match="data_type"):
         validate_qc_metrics(QcCheck.DATA_TYPE, _with(["n_sampled"], 0))
+
+
+def test_marker_models_carry_one_field_per_marker_class():
+    classes = {c.value for c in MarkerClass}
+    assert set(MarkerFractions.model_fields) - {"unclassified"} == classes
+    assert set(MarkerReferenceIdx.model_fields) == classes
+
+
+@pytest.mark.parametrize(
+    ("scale", "accepted"), [(0.9, True), (-0.9, True), (1.1, False), (-1.1, False)]
+)
+def test_fraction_sum_tolerance_boundary(scale, accepted):
+    unclassified = 0.125 + scale * _FRACTION_SUM_TOLERANCE
+    payload = _with(["fractions", "unclassified"], unclassified)
+    if accepted:
+        DataTypeMetrics.model_validate(payload)
+    else:
+        with pytest.raises(ValidationError, match="sum to"):
+            DataTypeMetrics.model_validate(payload)
