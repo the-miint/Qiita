@@ -50,6 +50,10 @@ _None yet._
   ```bash
   psql "$DATABASE_URL" -tAc "SELECT count(*) FROM qiita.work_ticket WHERE action_id = 'long-read-assembly' AND state IN ('pending','queued','processing')"
   ```
+- `[operator]` **Do not run `qiita-admin scratch reclaim --execute` until this deploy is in.**
+  The bucket-6 gene-call backfill reads the finished long-read-assembly tickets'
+  workspaces, and the build deployed now does not know to keep them. From this deploy,
+  reclaim skips every ticket that backfill can still recover or is recovering. (#888)
 
 ### 3. Migrations
 
