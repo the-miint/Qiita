@@ -2,8 +2,8 @@
 
 CheckM calls Prodigal on a bin unless `<out>/bins/<bin_id>/genes.faa` exists and is
 not empty; `seed_genes` puts gene_call's `genes.faa` / `genes.gff` there before each
-run. These tests run that function under bash, and check that the names it reads are
-the ones gene_call writes and the workflow binds.
+run. These tests run that function under bash, and check that the names that it reads
+are the ones that gene_call writes and the workflow binds.
 """
 
 from __future__ import annotations
@@ -52,8 +52,8 @@ def _subject(gene_calls: Path, kind: str, bin_id: str) -> None:
 
 
 def test_each_subjects_genes_land_where_checkm_looks(tmp_path) -> None:
-    """Files go to `<out>/bins/<bin_id>/`, byte for byte; a genome gene_call found no
-    genes for gets no directory, so CheckM calls Prodigal on it."""
+    """Files go to `<out>/bins/<bin_id>/`, byte for byte; a genome that gene_call found
+    no genes for gets no directory, so CheckM calls Prodigal on it."""
     gene_calls, genomes, out = tmp_path / "gc", tmp_path / "genomes", tmp_path / "ck"
     genomes.mkdir()
     for stem in ("bin.1", "s0.ctg000001c", "bin.2"):
@@ -84,7 +84,7 @@ def test_only_the_named_kind_is_seeded(tmp_path) -> None:
 
 
 def test_genes_for_a_genome_checkm_does_not_score_stop_the_step(tmp_path) -> None:
-    """A bin id gene_call wrote that names no genome means the two disagree on bin ids,
+    """A bin id that gene_call wrote and that names no genome means the two disagree on bin ids,
     and CheckM would call Prodigal on every subject."""
     gene_calls, genomes, out = tmp_path / "gc", tmp_path / "genomes", tmp_path / "ck"
     genomes.mkdir()
@@ -98,7 +98,7 @@ def test_genes_for_a_genome_checkm_does_not_score_stop_the_step(tmp_path) -> Non
 
 
 def test_every_checkm_run_is_seeded_with_its_own_kind() -> None:
-    """Each run_checkm call names one of the kinds gene_call writes under, once each,
+    """Each run_checkm call names one of the kinds that gene_call writes under, once each,
     and run_checkm seeds before lineage_wf calls Prodigal."""
     calls = [
         ln.split()[1]
@@ -111,8 +111,8 @@ def test_every_checkm_run_is_seeded_with_its_own_kind() -> None:
 
 
 def test_checkm_reads_the_directory_gene_call_writes() -> None:
-    """checkm.sh reads `<input>/<dir>`: the input is a gene_call output the 1.0.2 checkm
-    step declares, and the directory is the one gene_call writes CheckM's files to."""
+    """checkm.sh reads `<input>/<dir>`: the input is a gene_call output that the 1.0.2 checkm
+    step declares, and the directory is the one that gene_call writes CheckM's files to."""
     m = re.search(r'^GENE_CALLS_DIR="\$\(qiita_input (\w+)\)/(\w+)"$', _CHECKM_SH.read_text(), re.M)
     assert m, "checkm.sh no longer sets GENE_CALLS_DIR from a step input"
     binding, subdir = m.groups()

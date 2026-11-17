@@ -46,8 +46,9 @@
 # not empty, and reads `genes.gff` beside it. The gene_call step has already called
 # each subject's genes by CheckM's rules (`jobs/gene_call.py` says which), and writes
 # them in that layout under `gene_calls/checkm/<kind>/`; seed_genes copies them in
-# before each run, so CheckM scores the genes the lake stores. A subject gene_call
-# found no genes for has no files there, and CheckM calls Prodigal on it.
+# before each run, so CheckM scores the same `prodigal_checkm` genes that the lake
+# stores. A subject that gene_call found no genes for has no files there, and CheckM
+# calls Prodigal on it.
 source /opt/qiita/_lib.sh
 
 REFINED_DIR="$(qiita_input refined_bins_dir)"

@@ -28,10 +28,10 @@ description: >
   gene's feature_idx, export-subject-genome-map names each subject's genome, and
   assembly_load stages the `gene_call` and `gene_call_contig` lake tables and writes
   `genome_idx` on `assembly_membership` and `bin_quality`. The checkm step scores the
-  `prodigal_checkm` genes gene_call wrote rather than calling Prodigal again. Added to
+  `prodigal_checkm` genes that gene_call wrote, rather than calling Prodigal again. Added to
   this version in place; runs that completed before (of this version or an earlier
   one) get the gene calls from `assembly-gene-call-recover`, and keep the CheckM
-  scores they were given.
+  scores that they were given.
 
   A sync leaves only the highest version of an action_id enabled
   (`actions/sync.py`), so once this file is synced 1.0.1 stops accepting
