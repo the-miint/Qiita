@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 
 import duckdb
+import pyarrow as pa
 import pytest
 
 from qiita_control_plane.delimited_text import read_headed_tsv
@@ -162,3 +163,18 @@ def test_duckdb_read_csv_reports_no_file_for_directory(tmp_path):
             conn.execute("SELECT * FROM read_csv(?, delim='\t')", [str(tmp_path)])
     finally:
         conn.close()
+
+
+def test_duckdb_renames_column_differing_only_in_case():
+    """Tests the case where a registered table holds two column names that differ
+    only in ASCII case: DuckDB renames the later one, which is why the writer
+    refuses such names."""
+    table = pa.table({"Biosample_idx": ["a"], "biosample_idx": ["1"]})
+    conn = duckdb_connect()
+    try:
+        conn.register("case_repeat", table)
+        cursor = conn.execute("SELECT * FROM case_repeat")
+        column_names = [column[0] for column in cursor.description]
+    finally:
+        conn.close()
+    assert column_names == ["Biosample_idx", "biosample_idx_1"]

@@ -125,7 +125,7 @@ def _bulk_create_rows(
 def _handle_biosample_bulk_create(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
     """Create one biosample per row of a TSV file on a study, in one
     all-or-nothing request, then print each created biosample's identifiers as a TSV."""
-    # Refuse an owner column named, in any case, like an output column.
+    # Refuse an owner column whose name matches an output column's, ignoring case.
     owner_column = args.owner_biosample_id_field_name.strip()
     output_field_names = {field.casefold() for field in _BULK_CREATE_OUTPUT_FIELDS}
     if owner_column.casefold() in output_field_names:

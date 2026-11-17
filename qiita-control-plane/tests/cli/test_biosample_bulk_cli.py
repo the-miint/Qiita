@@ -295,10 +295,10 @@ def test__handle_biosample_bulk_create_refuses_owner_column_named_like_output(
 ):
     """Tests the case where the owner column shares its name with a column that
     the command's printed results already carry: the command exits 2 naming the
-    flag, before any request."""
+    flag, before reading the file (which does not exist) or sending any request."""
     captured: dict = {}
     _stub_post(monkeypatch, captured, response_json=_BULK_RESPONSE, whoami_idx=42)
-    tsv_file = _write_tsv_file(tmp_path, f"{owner_column}\tnote\nSMK-001\tx\n")
+    tsv_file = tmp_path / "absent.tsv"
 
     with pytest.raises(SystemExit) as exc_info:
         main(_bulk_create_argv(tsv_file, owner_column=owner_column))
