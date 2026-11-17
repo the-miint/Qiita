@@ -46,8 +46,7 @@ END
 $$;
 
 -- Who set an exception's current tier and reason; created_by_idx keeps who
--- first set it. A row already stored was written by hand, since no route
--- wrote one before this migration, and nothing records who last edited it, so
+-- first set it. A row already stored has no record of who last edited it, so
 -- it takes its creator.
 ALTER TABLE qiita.biosample_field_exception
     ADD COLUMN updated_by_idx BIGINT REFERENCES qiita.principal(idx) ON DELETE RESTRICT;

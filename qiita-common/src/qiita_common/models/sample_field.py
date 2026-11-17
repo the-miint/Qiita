@@ -247,7 +247,7 @@ class SampleFieldExceptionResponse(BaseModel):
 
     keyed_on says what it follows: "global" for a field linked to a global
     field, where it restricts the value in every study that links that field,
-    and "local" for a purely-local field. The table admits a NULL reason, on a
+    and "local" for a purely-local field. The table admits a NULL reason on a
     row that something other than the route wrote.
     created_by_idx names who first set the exception, and updated_by_idx who set
     its current tier and reason.

@@ -335,8 +335,8 @@ def _add_field_exception_subcommands(
     """
     hyphenated = entity_noun.replace("_", "-")
     access = (
-        "(needs admin on the study, and on whichever study wrote a linked field's value;"
-        " wet_lab_admin+ needs neither)"
+        "(needs admin on the study, and, on a field linked to a global field, admin on"
+        " whichever study wrote the value; wet_lab_admin+ needs neither)"
     )
 
     def _add_target_args(subparser: argparse.ArgumentParser) -> None:
