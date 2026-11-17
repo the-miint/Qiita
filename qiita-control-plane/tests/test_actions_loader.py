@@ -224,16 +224,21 @@ def test_load_actions_loads_on_disk_long_read_assembly_yaml(version):
     assert assembly.version == version
     assert assembly.context_schema["required"] == ["mask_idx"]
 
+    # 1.0.2 adds the gene calls: the gene_call step, the gene mint, and the subject
+    # genome map assembly_load names each subject's genome by.
+    gene_call = version == "1.0.2"
     assert [s.name for s in assembly.steps] == [
         "assembly_run_config",
         "assemble",
         "assembly_coverage",
         "binning",
         "bin_refine",
+        *(["gene_call"] if gene_call else []),
         "checkm",
         "assembly_hash",
         "mint-features",
         "write-assembly-membership",
+        *(["mint-gene-features", "export-subject-genome-map"] if gene_call else []),
         "assembly_load",
         "register-files",
         "finalize-assembly-sample",

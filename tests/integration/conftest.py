@@ -82,6 +82,7 @@ def _stage_miint_extension():
 
     import duckdb
     from qiita_common.duckdb_miint import (
+        gpl_boundary_is_outdated,
         miint_connect_config,
         miint_install_sql,
         miint_load_sql,
@@ -91,6 +92,10 @@ def _stage_miint_extension():
         conn.execute(miint_install_sql())
         conn.execute(miint_load_sql())
         row = conn.execute("SELECT install_gpl_boundary()").fetchone()
+        # install_gpl_boundary() keeps a cached binary of any version; replace one
+        # older than the miint functions under test accept.
+        if row and row[0] and gpl_boundary_is_outdated(row[0]["version"]):
+            row = conn.execute("SELECT install_gpl_boundary(true)").fetchone()
 
     # miint is a CORE dependency: miint_job_env() now REQUIRES MIINT_GPL_BOUNDARY_PATH
     # (native jobs get an ephemeral HOME, so the boundary must be pointed at

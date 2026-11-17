@@ -18,6 +18,8 @@ import asyncpg
 from qiita_common.actions import STEP_LOGS_SUBDIR
 from qiita_common.models import TERMINAL_STEP_PROGRESS_STATES, WorkTicketState
 
+from .backfill.assembly_gene_call import RunStatus as GeneCallRunStatus
+from .backfill.assembly_gene_call import plan_backfill as plan_gene_call_backfill
 from .backfill.syndna_read_count import plan_backfill as plan_syndna_backfill
 from .ena_import import DOWNLOAD_ENA_STUDY_ACTION_ID
 from .ena_import.registration import fetch_pool_download_ticket
@@ -84,7 +86,7 @@ class ReclaimPlan:
     action_id: str | None
     tickets: list[TicketPlan] = field(default_factory=list)
     orphans: list[TicketPlan] = field(default_factory=list)
-    syndna_skipped: list[int] = field(default_factory=list)
+    backfill_skipped: list[int] = field(default_factory=list)
 
 
 @dataclass(frozen=True, slots=True)
@@ -277,10 +279,19 @@ async def _orphan_idxs(pool: asyncpg.Pool, ticket_root: Path) -> list[int]:
 async def plan_reclaim(
     pool: asyncpg.Pool, *, ticket_root: Path, cutoff: datetime, action_id: str | None = None
 ) -> ReclaimPlan:
-    """Read-only: the eligible workspaces, the SynDNA-backfill skips, and the orphans."""
+    """Read-only: the eligible workspaces, the backfill skips, and the orphans. A
+    workspace a backfill still reads (the SynDNA backfill's, or the gene-call
+    recovery's for a run it can still recover) is skipped."""
     root = ticket_root.resolve()
     backfill = await plan_syndna_backfill(pool, ticket_root=root)
     needed = {p.work_ticket_idx for p in backfill.writable()}
+    gene_calls = await plan_gene_call_backfill(pool, ticket_root=root)
+    needed |= {
+        r.source_work_ticket_idx
+        for r in gene_calls.runs
+        if r.status in (GeneCallRunStatus.WRITABLE, GeneCallRunStatus.IN_FLIGHT)
+        and r.source_work_ticket_idx is not None
+    }
     tickets, skipped = [], []
     for row in await _eligible(pool, cutoff=cutoff, action_id=action_id):
         idx = row["work_ticket_idx"]

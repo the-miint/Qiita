@@ -766,3 +766,49 @@ async def test_one_genome_per_subject_is_enforced_by_the_database(postgres_pool,
         )
     finally:
         await _teardown(postgres_pool, prep_sample_idx=prep, reference_idx=ref, feature_idxs=feats)
+
+
+async def test_subject_genome_map_names_each_subject_by_its_minted_genome(postgres_pool, tmp_path):
+    """export-subject-genome-map writes one `(kind, bin_id, genome_idx)` row per subject
+    the run's membership holds, with the genome write_assembly_membership stamped."""
+    principal_idx, prep, proc, ref, feats, paths = await _setup(
+        postgres_pool, tmp_path, label="agm-export"
+    )
+    try:
+        await lib.write_assembly_membership(postgres_pool, prep, proc, *paths)
+        out_dir = tmp_path / "export"
+        out_dir.mkdir()
+        out = await lib.export_subject_genome_map(postgres_pool, prep, proc, out_dir)
+
+        assert out == out_dir / lib.SUBJECT_GENOME_MAP_OUTPUT_BASENAME
+        with duckdb.connect(":memory:") as con:
+            rows = con.execute(
+                f"SELECT kind, bin_id, genome_idx FROM read_parquet('{out}') ORDER BY ALL"
+            ).fetchall()
+        expected = {k: g for k, (g, _n) in (await _subjects(postgres_pool, prep)).items()}
+        assert {(k, b): g for k, b, g in rows} == expected
+        assert len(rows) == len(expected), "one row per subject"
+    finally:
+        await _teardown(postgres_pool, prep_sample_idx=prep, reference_idx=ref, feature_idxs=feats)
+
+
+async def test_subject_genome_map_refuses_a_run_with_an_unminted_subject(postgres_pool, tmp_path):
+    """A membership row without a genome (one written before genomes were minted)
+    fails the export rather than leaving its subject out of the map."""
+    principal_idx, prep, proc, ref, feats, paths = await _setup(
+        postgres_pool, tmp_path, label="agm-export-null"
+    )
+    try:
+        await lib.write_assembly_membership(postgres_pool, prep, proc, *paths)
+        await postgres_pool.execute(
+            "UPDATE qiita.assembly_membership SET genome_idx = NULL"
+            " WHERE prep_sample_idx = $1 AND kind = $2",
+            prep,
+            KIND_LCG,
+        )
+        with pytest.raises(RuntimeError, match="1 without a genome_idx"):
+            await lib.export_subject_genome_map(postgres_pool, prep, proc, tmp_path)
+        with pytest.raises(RuntimeError, match="0 membership row"):
+            await lib.export_subject_genome_map(postgres_pool, prep, proc + 10_000_000, tmp_path)
+    finally:
+        await _teardown(postgres_pool, prep_sample_idx=prep, reference_idx=ref, feature_idxs=feats)

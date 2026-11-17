@@ -155,6 +155,14 @@ class LibraryPrimitive(StrEnum):
     # to qiita.assembly_membership, tagged by (kind, bin_id). See
     # qiita_control_plane.actions.library.write_assembly_membership.
     WRITE_ASSEMBLY_MEMBERSHIP = "write-assembly-membership"
+    # Mint a feature_idx for each called gene's bytes, as mint-annotation-features
+    # does for an annotated interval. See
+    # qiita_control_plane.actions.library.mint_gene_features.
+    MINT_GENE_FEATURES = "mint-gene-features"
+    # One assembly run's (kind, bin_id) -> genome_idx, from qiita.assembly_membership,
+    # for a job that has no database access. See
+    # qiita_control_plane.actions.library.export_subject_genome_map.
+    EXPORT_SUBJECT_GENOME_MAP = "export-subject-genome-map"
     REGISTER_FILES = "register-files"
     REGISTER_INDEX = "register-index"
     # Reference sharding: assign a reference's genome-bearing features to N

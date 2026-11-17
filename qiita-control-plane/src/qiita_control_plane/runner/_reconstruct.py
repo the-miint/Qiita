@@ -38,6 +38,8 @@ from ..actions.library import (
     LIBRARY,
     MINT_ANNOTATION_MAP_OUTPUT_BASENAME,
     MINT_FEATURES_OUTPUT_BASENAME,
+    MINT_GENE_FEATURES_OUTPUT_BASENAME,
+    SUBJECT_GENOME_MAP_OUTPUT_BASENAME,
     QcProducer,
 )
 from ..repositories.assembly import AssemblySampleInvalidated
@@ -55,7 +57,7 @@ from ..workspace import (
     step_logs_dir,
     step_output_dir,
 )
-from ._alignment import _workflow_writes_alignment_gate
+from ._alignment import ASSEMBLY_PROCESSING_IDX_BINDING, _workflow_writes_alignment_gate
 from ._context import RunContext
 from ._dispatch import _best_effort_record_failed, _result_with_infra_retry
 from ._mask import MASK_IDX_BINDING, _workflow_writes_mask_gate
@@ -209,15 +211,14 @@ async def _reconstruct_completed_outputs(
 
 def _reconstruct_action_outputs(entry: WorkflowAction, attempt_workspace: Path) -> dict[str, Any]:
     """Deterministic output paths an `action:` primitive wrote, for resume.
-    Only the two minting primitives contribute a binding (the feature-map Parquet
-    each wrote into its workspace); the other primitives produce no bound output.
+    The minting primitives contribute a binding (the feature-map Parquet each wrote
+    into its workspace), as does export-subject-genome-map; the other primitives
+    produce no bound output.
     (`plan-shards` is handled separately in `_reconstruct_completed_outputs` —
     its bindings come from the DB, not a scratch path.)
-    Each basename is single-sourced from the primitive itself
-    (`MINT_FEATURES_OUTPUT_BASENAME` / `MINT_ANNOTATION_MAP_OUTPUT_BASENAME`) so this
-    resume path can't drift from where the primitive actually writes the file. The two
-    basenames differ precisely because both primitives can run in one workflow, and a
-    shared name would resume the second onto the first's map.
+    Each basename is a constant the primitive itself writes under (the
+    `*_OUTPUT_BASENAME` imports above) so this resume path can't drift from where the
+    primitive actually writes the file.
 
     Note `mint-annotation-features` writes TWO Parquets and binds only one: the map
     keyed by the annotation's natural key is the OUTPUT, while the sequence_hash →
@@ -229,7 +230,25 @@ def _reconstruct_action_outputs(entry: WorkflowAction, attempt_workspace: Path) 
         return {entry.outputs[0]: attempt_workspace / MINT_FEATURES_OUTPUT_BASENAME}
     if entry.name == LibraryPrimitive.MINT_ANNOTATION_FEATURES:
         return {entry.outputs[0]: attempt_workspace / MINT_ANNOTATION_MAP_OUTPUT_BASENAME}
+    if entry.name == LibraryPrimitive.MINT_GENE_FEATURES:
+        return {entry.outputs[0]: attempt_workspace / MINT_GENE_FEATURES_OUTPUT_BASENAME}
+    if entry.name == LibraryPrimitive.EXPORT_SUBJECT_GENOME_MAP:
+        return {entry.outputs[0]: attempt_workspace / SUBJECT_GENOME_MAP_OUTPUT_BASENAME}
     return {}
+
+
+def _assembly_processing_idx(bound: dict[str, Any]) -> int:
+    """The assembly run an action reads: the run this ticket minted (long-read-assembly)
+    or, for a ticket that fills in an existing run, the one its context names under
+    `ASSEMBLY_PROCESSING_IDX_BINDING` (`_alignment.py` says why not `processing_idx`).
+    Exactly one must be bound."""
+    present = [k for k in (PROCESSING_IDX_BINDING, ASSEMBLY_PROCESSING_IDX_BINDING) if k in bound]
+    if len(present) != 1:
+        raise RuntimeError(
+            f"expected exactly one of {PROCESSING_IDX_BINDING!r} and "
+            f"{ASSEMBLY_PROCESSING_IDX_BINDING!r} bound; got {present!r}"
+        )
+    return int(bound[present[0]])
 
 
 async def _reconstruct_plan_shards_outputs(
@@ -569,6 +588,25 @@ async def _run_action_primitive(
             Path(bound["genomes_dir"]),
         )
         return {}
+
+    if entry.name == LibraryPrimitive.MINT_GENE_FEATURES:
+        if set(entry.inputs) != {"gene_manifest"}:
+            raise RuntimeError(f"{entry.name} expects inputs [gene_manifest]; got {entry.inputs!r}")
+        gene_feature_map_path, _, _ = await LIBRARY[LibraryPrimitive.MINT_GENE_FEATURES](
+            ctx.pool, Path(bound["gene_manifest"]), workspace
+        )
+        return {entry.outputs[0]: gene_feature_map_path}
+
+    if entry.name == LibraryPrimitive.EXPORT_SUBJECT_GENOME_MAP:
+        if entry.inputs:
+            raise RuntimeError(f"{entry.name} takes no inputs; got {entry.inputs!r}")
+        subject_genome_map_path = await LIBRARY[LibraryPrimitive.EXPORT_SUBJECT_GENOME_MAP](
+            ctx.pool,
+            ctx.scope_target["prep_sample_idx"],
+            _assembly_processing_idx(bound),
+            workspace,
+        )
+        return {entry.outputs[0]: subject_genome_map_path}
 
     if entry.name == LibraryPrimitive.REGISTER_FILES:
         staging_dir = Path(bound[entry.inputs[0]])
