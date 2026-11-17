@@ -178,14 +178,24 @@ def test_fractions_and_dominant_class_over_marker_and_random_reads(tmp_path, wri
     assert (entry.severity, entry.reason) == (QcSeverity.INFO, "insufficient_reads")
 
 
-def test_a_read_hitting_two_classes_with_equal_scores_goes_to_the_first(tmp_path, write_reads):
-    sequences = _marker_reads(MarkerClass.MARKER_18S, 20)
-    reads = _write_reads(write_reads, tmp_path / "reads.parquet", sequences)
+@pytest.mark.parametrize(("reverse", "winner"), [(False, "marker_16s"), (True, "marker_18s")])
+def test_a_read_hitting_two_classes_with_equal_scores_goes_to_the_first(
+    tmp_path, write_reads, monkeypatch, reverse, winner
+):
+    reads = _write_reads(
+        write_reads, tmp_path / "reads.parquet", _marker_reads(MarkerClass.MARKER_18S, 20)
+    )
+    if reverse:
+        class_counts = verify_data_type._class_counts
+
+        def reversed_counts(conn, refs):
+            return class_counts(conn, dict(reversed(refs.items())))
+
+        monkeypatch.setattr(verify_data_type, "_class_counts", reversed_counts)
     twin = _MARKERS / "marker_18s.fasta"
     metrics = _entry(_run(reads, tmp_path, marker_16s_ref=twin)).metrics
-    assert metrics["dominant_class"] == "marker_16s"
-    assert metrics["fractions"]["marker_16s"] == 1.0
-    assert metrics["fractions"]["marker_18s"] == 0.0
+    assert metrics["dominant_class"] == winner
+    assert metrics["fractions"][winner] == 1.0
 
 
 def test_random_reads_hit_no_class(tmp_path, write_reads):
