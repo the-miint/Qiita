@@ -74,7 +74,7 @@ from ._upload import (
 
 def _refuse_deprecated_alignment(row: asyncpg.Record) -> None:
     """Refuse (bad submission input) a deprecated alignment, from its
-    `alignment_definition` row. A plain status read: the caller acts on the row after
+    `alignment_definition` row. A plain status read: the callers act on the row after
     the check, under no lock, so a `FOR SHARE` held only for the check would buy
     nothing."""
     if row["status"] == AlignmentDefinitionStatus.DEPRECATED.value:

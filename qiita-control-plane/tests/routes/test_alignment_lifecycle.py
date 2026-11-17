@@ -311,9 +311,9 @@ async def test_deprecation_waits_for_unfinished_tickets(client, lc):
     assert (await _deprecate(client, lc["alignment_idx"])).status_code == 200
 
 
-async def test_the_feature_table_runner_refuses_a_deprecated_alignment(lc):
-    """The feature-table runner refuses, from the alignment's row, a deprecation that
-    landed since the ticket was submitted."""
+async def test_refuse_deprecated_alignment_refuses_from_the_row(lc):
+    """`_refuse_deprecated_alignment` refuses, from the alignment's row, a deprecation
+    that landed since the ticket was submitted."""
     from qiita_common.backend_failure import BackendFailure, FailureKind
 
     from qiita_control_plane.repositories.alignment_definition import (

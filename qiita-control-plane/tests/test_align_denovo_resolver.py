@@ -385,8 +385,8 @@ async def test_an_invalidated_run_is_not_re_run_under_the_same_identity(sample):
 
 
 async def test_a_deprecated_alignment_is_refused_on_mint_and_on_resume(sample):
-    """The mint refuses a deprecated alignment; the re-attach, which does not call the
-    mint, is refused by the gate step the runner calls next."""
+    """The mint refuses a deprecated alignment; a re-attach is refused by
+    `_create_alignment_gate_pending`."""
     ticket = await _seed_ticket(sample)
     first = await _resolve(sample, work_ticket_idx=ticket)
     await sample["pool"].execute(

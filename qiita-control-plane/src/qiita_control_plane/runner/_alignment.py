@@ -191,14 +191,18 @@ async def _create_alignment_gate_pending(
 ) -> None:
     """Materialize this run's alignment_sample gate row at 'pending'.
 
-    Run immediately after the mint, which is the earliest point the row's key exists.
-    Idempotent, and it never resurrects a row an earlier run flipped to 'completed'
+    Run right after the alignment is resolved, by a mint or by a re-attach to the one
+    the ticket records, which is the earliest point the row's key exists. Idempotent,
+    and it never resurrects a row an earlier run flipped to 'completed'
     (`create_alignment_sample_pending`'s ON CONFLICT DO NOTHING).
 
     Refuses a row an earlier run's withdrawal set 'invalidated', before any step
     runs: the workflow's first tail step deletes this prep_sample's alignment rows, which
     would destroy the output the withdrawal was a judgment about, and its terminal
     step could not complete the row anyway (`AlignmentSampleInvalidated`).
+
+    Refuses a deprecated alignment, under `FOR SHARE` (`lock_active_alignment`). For a
+    re-attach, which does not call the mint, this is the only deprecation refusal.
     """
     async with pool.acquire() as conn, conn.transaction():
         try:
@@ -337,9 +341,8 @@ async def _resolve_denovo_alignment_idx(
 
     So the knobs are read back from the STORED params rather than re-resolved, and the
     job runs the configuration the identity actually names. The mint refuses a
-    deprecated alignment (`AlignmentDefinitionDeprecated`); on the re-attach, which does
-    not call the mint, `_create_alignment_gate_pending`, which the runner calls next on
-    both branches, refuses it under `FOR SHARE`.
+    deprecated alignment (`AlignmentDefinitionDeprecated`); a re-attach's refusal is
+    `_create_alignment_gate_pending`'s.
 
     The re-attach also refuses a recorded alignment whose settings an admin edited
     after the ticket was created: the stored params are then not the ones the ticket
