@@ -1144,6 +1144,18 @@ pub fn ensure_amplicon_tables(conn: &Connection) -> Result<(), Box<dyn std::erro
             sequence VARCHAR NOT NULL
         );",
     )?;
+    // `CREATE TABLE IF NOT EXISTS` leaves a lake that already holds the earlier
+    // three-column `amplicon_sequence` (its bytes lived in the now-removed
+    // `amplicon_sequence_chunks`) untouched, and `ducklake_add_data_files` refuses a
+    // Parquet carrying a column the target lacks ("Column ... exists in file ... but
+    // was not found in table"), so without this every amplicon registration into an
+    // existing lake fails once the loader writes the inline `sequence`. Added nullable
+    // -- the CREATE states NOT NULL for a fresh lake, but a widen cannot retro-fill
+    // existing rows -- and the loader always provides it. Same evolve-at-boot pattern,
+    // and reasons, as ensure_assembly_tables.
+    conn.execute_batch(
+        "ALTER TABLE qiita_lake.amplicon_sequence ADD COLUMN IF NOT EXISTS sequence VARCHAR;",
+    )?;
     Ok(())
 }
 
@@ -2020,6 +2032,44 @@ mod tests {
             .unwrap();
         let n: i64 = stmt.query_row([], |row| row.get(0)).unwrap();
         assert_eq!(n, 1, "amplicon_membership table should exist exactly once");
+    }
+
+    #[test]
+    #[serial]
+    #[cfg(feature = "integration")]
+    fn ensure_amplicon_tables_widens_a_preexisting_sequence_table() {
+        let conn = setup_conn();
+        conn.execute_batch("DROP TABLE IF EXISTS qiita_lake.amplicon_sequence;")
+            .unwrap();
+        // The pre-inline shape, as a lake deployed before ASV bytes moved inline holds
+        // it (the bytes were in amplicon_sequence_chunks, since removed).
+        conn.execute_batch(
+            "CREATE TABLE qiita_lake.amplicon_sequence (
+                feature_idx BIGINT NOT NULL,
+                sequence_hash UUID NOT NULL,
+                sequence_length_bp BIGINT NOT NULL
+            );",
+        )
+        .unwrap();
+        assert_eq!(table_schema(&conn, "amplicon_sequence").len(), 3);
+
+        ensure_amplicon_tables(&conn).expect("ensure_amplicon_tables over a narrow table");
+
+        let names: Vec<String> = table_schema(&conn, "amplicon_sequence")
+            .into_iter()
+            .map(|(n, _, _)| n)
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "feature_idx",
+                "sequence_hash",
+                "sequence_length_bp",
+                "sequence",
+            ],
+            "the inline sequence column must be appended to an existing table so \
+             register-files does not fail on a widened Parquet"
+        );
     }
 
     /// The live rows of `qiita_lake.{table}` held inline in the catalog's Postgres,

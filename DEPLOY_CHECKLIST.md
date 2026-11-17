@@ -69,6 +69,7 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
 ### 4. Deploy
 
 - `[operator]` The amplicon workflow gains version 1.1.0 (drops the primer-orient knobs; adds a per-sample completion gate and public sample identifiers). `actions sync` loads it on deploy and supersedes 1.0.0 for new runs; runs already recorded against 1.0.0 keep binding it.
+- `[operator]` 1.1.0 stores ASV sequences inline in the lake's `amplicon_sequence` table. The data plane widens that table on restart (`ALTER TABLE … ADD COLUMN IF NOT EXISTS sequence`), so a redeployed data plane is a precondition for any amplicon `register-files` under 1.1.0 — the standard deploy restart covers it, no manual step. The now-unused `amplicon_sequence_chunks` table is left in the lake with no reader (it holds only 1.0.0 ASV bytes); it can be dropped by hand once no 1.0.0 amplicon run needs reprocessing.
 
 ### 5. Verify
 

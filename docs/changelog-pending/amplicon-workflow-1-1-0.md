@@ -12,3 +12,9 @@
 
 - The amplicon denoise step refuses `orient_primer: true`; 1.0.0 keeps loading and binds
   the step unchanged, but orienting is no longer performed.
+- ASV sequences are stored inline in the lake's `amplicon_sequence` table rather than a
+  separate chunk table — an ASV is short (one 64 KB chunk at most), so chunking is pure
+  overhead. The data plane widens an existing lake's three-column table on restart
+  (`ALTER TABLE … ADD COLUMN IF NOT EXISTS sequence`), so an amplicon `register-files`
+  does not fail on the now-four-column Parquet; the superseded `amplicon_sequence_chunks`
+  table is left in the lake unread. See `DEPLOY_CHECKLIST.md`.
