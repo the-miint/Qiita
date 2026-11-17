@@ -168,7 +168,7 @@ completed (rebuilding their `bound` outputs from the shared workspace),
 re-attaches a still-running SLURM job by its persisted `slurm_job_id` (or
 adopts an orphan by its deterministic name via `find-by-name`), finalizes a
 job that succeeded during the outage, and decides a purged job from its
-on-disk output manifest, or from its stderr when there is none (only a slurmrestd 404 on the status read marks a job purged; any other 4xx keeps the manifest-only verdict). The startup hook then calls `reconcile_follow_ons`,
+on-disk output manifest, or from its stderr when there is none (only a slurmrestd not-found answer (Slurm's invalid-job-id error) on the status read marks a job purged; any other 4xx or 404 keeps the manifest-only verdict). The startup hook then calls `reconcile_follow_ons`,
 which submits the follow-on of every completed ticket that records no outcome
 (one that completed while no process ran its completion hook, or whose
 submission failed with anything but a refusal). The same reconcile then runs on

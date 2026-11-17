@@ -117,6 +117,24 @@ _KILL_LINE_RE = re.compile(
 )
 
 
+# Slurm's ESLURM_INVALID_JOB_ID, the `error_number` slurmrestd returns with a 404 for a job
+# it no longer has. A wrong API version also 404s, with a plain-text body, so the status
+# alone is not enough. Probed 2026-11-17 on slurmrestd v0.0.40:
+# `curl GET /slurm/v0.0.40/job/<purged id>` -> 404, errors[].error_number == 2017.
+_SLURM_INVALID_JOB_ID = 2017
+_BODY_EXCERPT_CHARS = 200
+
+
+def _is_invalid_job_id_body(body: str | None) -> bool:
+    try:
+        errors = json.loads(body or "").get("errors")
+    except ValueError, AttributeError:
+        return False
+    return isinstance(errors, list) and any(
+        isinstance(e, dict) and e.get("error_number") == _SLURM_INVALID_JOB_ID for e in errors
+    )
+
+
 def _scan_slurm_kill_state(stderr_path: Path) -> TerminalSlurmState | None:
     """The state a slurmstepd job-kill line anywhere in `stderr_path` names, else None."""
     try:
@@ -604,7 +622,7 @@ class SlurmBackend(ComputeBackend):
         slurmrestd errors are classified into a typed BackendFailure so the
         caller sees the same surface as submit/result: transport / 5xx / 401
         => retriable SLURMRESTD_UNREACHABLE (the runner keeps polling);
-        404 => JOB_PURGED (recovery uses the output manifest, else the stderr);
+        404 invalid-job-id => JOB_PURGED (recovery uses the output manifest, else the stderr);
         other 4xx => UNKNOWN_PERMANENT (status unknowable)."""
         self._require_slurm_handle(handle)
         try:
@@ -870,8 +888,9 @@ class SlurmBackend(ComputeBackend):
 
     def _classify_status_error(self, exc: SlurmrestdError, step_name: str) -> BackendFailure:
         """Map a slurmrestd get_job / job-list error to a BackendFailure. A
-        404 means slurmrestd has purged the job (JOB_PURGED; the runner then
-        decides from the on-disk manifest, else the stderr); any other 4xx
+        404 carrying Slurm's invalid-job-id error means slurmrestd has purged
+        the job (JOB_PURGED; the runner then decides from the on-disk manifest,
+        else the stderr); any other 4xx, including another 404,
         except 401 is unknowable (permanent); 5xx / transport / 401 are
         transiently unreachable (the runner retries). 401 is retriable, consistent with
         `_classify_submit_error`: a 401 surviving the client's JWT-refresh
@@ -882,7 +901,7 @@ class SlurmBackend(ComputeBackend):
         `find_jobs_by_name`) always means "could not read status" (transport /
         infra), never "the step failed" — retry on a transient kind rather
         than recording a terminal step failure."""
-        if exc.status_code == 404:
+        if exc.status_code == 404 and _is_invalid_job_id_body(exc.body):
             kind = FailureKind.JOB_PURGED
         elif (
             exc.status_code is not None and 400 <= exc.status_code < 500 and exc.status_code != 401
@@ -894,5 +913,10 @@ class SlurmBackend(ComputeBackend):
             kind=kind,
             stage=WorkTicketFailureStage.STEP_RUN,
             step_name=step_name,
-            reason=f"slurmrestd get_job failed: {exc!s}",
+            reason=f"slurmrestd get_job failed: {exc!s}"
+            + (
+                f"; body: {exc.body[:_BODY_EXCERPT_CHARS]!r}"
+                if kind is FailureKind.UNKNOWN_PERMANENT and exc.body
+                else ""
+            ),
         )

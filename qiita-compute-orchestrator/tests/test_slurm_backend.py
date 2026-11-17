@@ -1040,7 +1040,6 @@ async def test_status_step_classifies_live_state(
 @pytest.mark.parametrize(
     ("status_code", "raises_transport", "expected_kind", "expected_transient"),
     [
-        (404, False, FailureKind.JOB_PURGED, True),  # not found: purged
         (403, False, FailureKind.UNKNOWN_PERMANENT, False),
         (422, False, FailureKind.UNKNOWN_PERMANENT, False),
         (400, False, FailureKind.UNKNOWN_PERMANENT, False),
@@ -1066,6 +1065,38 @@ async def test_status_step_classifies_slurmrestd_errors(
         await backend.status_step(_slurm_handle(tmp_path, job_id=7))
     assert ei.value.kind == expected_kind
     assert ei.value.transient is expected_transient
+
+
+_NOT_FOUND_BODY = (
+    '{"jobs": [], "errors": [{"description": "Unable to query JobId=2318089", '
+    '"error_number": 2017, "error": "Invalid job id specified", '
+    '"source": "_handle_job_get"}], "warnings": []}'
+)
+_ROUTE_404_BODY = "Unable find requested URL. Please view /openapi/v3 for API reference."
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("body", "expected_kind"),
+    [
+        (_NOT_FOUND_BODY, FailureKind.JOB_PURGED),
+        (_ROUTE_404_BODY, FailureKind.UNKNOWN_PERMANENT),
+        ('{"errors": [{"error_number": 9999}]}', FailureKind.UNKNOWN_PERMANENT),
+    ],
+    ids=["invalid-job-id", "wrong-route", "other-error"],
+)
+async def test_status_step_404_is_purged_only_for_invalid_job_id(
+    jwt_path, tmp_path, body, expected_kind
+):
+    backend = _make_backend(
+        httpx.MockTransport(lambda r: httpx.Response(404, content=body)), jwt_path
+    )
+    with pytest.raises(BackendFailure) as ei:
+        await backend.status_step(_slurm_handle(tmp_path, job_id=7))
+    assert ei.value.kind is expected_kind
+    if expected_kind is FailureKind.UNKNOWN_PERMANENT:
+        assert "404" in ei.value.reason
+        assert body[:30] in ei.value.reason
 
 
 @pytest.mark.asyncio
