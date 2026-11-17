@@ -36,6 +36,7 @@ from qiita_common.amplicon_constants import (
     AMPLICON_MEMBERSHIP_VISIBLE_TABLE,
     AMPLICON_SEQUENCE_TABLE,
 )
+from qiita_common.models import MAX_COHORT_PREP_SAMPLE_IDX
 from qiita_common.models.run_feature_table import (
     FeatureTableRequest,
     FeatureTableSample,
@@ -247,7 +248,21 @@ async def resolve_cohort(pool: asyncpg.Pool, request: FeatureTableRequest) -> Co
         )
         for r in processed
     ]
-    return Cohort(source=source, runs=runs, samples=samples)
+    cohort = Cohort(source=source, runs=runs, samples=samples)
+    # A named prep_sample request is already bounded (`PrepSampleCohort` caps it at
+    # MAX_COHORT_PREP_SAMPLE_IDX); a study cohort has no such bound, and the routes
+    # read the whole Flight stream into one response, so refuse one too large to sign
+    # as a single ticket rather than buffer an unbounded table. Narrowing is the
+    # caller's to do (by prep_sample or a smaller study), since the table's meaning is
+    # the whole cohort.
+    if len(cohort.prep_sample_idxs) > MAX_COHORT_PREP_SAMPLE_IDX:
+        raise CohortError(
+            413,
+            f"this cohort spans {len(cohort.prep_sample_idxs)} prep_samples, over the"
+            f" {MAX_COHORT_PREP_SAMPLE_IDX} a single request serves; narrow it by"
+            " prep_sample or a smaller study.",
+        )
+    return cohort
 
 
 def cohort_scope(cohort: Cohort) -> dict[str, list[int]]:

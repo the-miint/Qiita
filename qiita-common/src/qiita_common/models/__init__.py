@@ -37,6 +37,7 @@ from qiita_common.auth_constants import (
 from qiita_common.models._base import (
     EXPORT_ENTITY_ID,
     IDX_KEY,
+    MAX_COHORT_PREP_SAMPLE_IDX,
     AccessionText,
     AllOrNothingFailure,
     BlockScopeTarget,
@@ -525,6 +526,7 @@ __all__ = [
     "date",
     "field_validator",
     "model_validator",
+    "MAX_COHORT_PREP_SAMPLE_IDX",
     "MAX_NAME_LENGTH",
     "MAX_TABLE_NAME_LENGTH",
     "MAX_VERSION_LENGTH",

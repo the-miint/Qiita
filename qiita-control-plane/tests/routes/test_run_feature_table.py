@@ -297,6 +297,35 @@ async def test_study_idx_with_none_of_the_runs_404s(role_keyed_clients, amplicon
     assert resp.status_code == 404, resp.text
 
 
+async def test_an_unreadable_named_sample_403s_before_the_uncounted_404(
+    role_keyed_clients, amplicon_run
+):
+    """The named cohort is authorized before it is resolved, so a caller who may not
+    read a named prep_sample is refused 403 — never handed the 404 that enumerates
+    which named prep_samples a run did not count. ps_b is study_2 (unreadable to
+    user); ps_e is uncounted, which the old resolve-first ordering 404'd on."""
+    run = amplicon_run
+    resp = await role_keyed_clients["user"].post(
+        URL_FEATURE_TABLE_VALUE,
+        json=_body([run["processing_idx"]], prep_sample_idx=[run["ps_b"], run["ps_e"]]),
+    )
+    assert resp.status_code == 403, resp.text
+    assert run["fetched"] == []
+
+
+async def test_a_study_cohort_over_the_cap_413s(role_keyed_clients, amplicon_run, monkeypatch):
+    """A study cohort has no request-model bound, so it is capped at resolve: wider than
+    MAX_COHORT_PREP_SAMPLE_IDX is refused (413) rather than buffered into one response."""
+    monkeypatch.setattr("qiita_control_plane.run_feature_table.MAX_COHORT_PREP_SAMPLE_IDX", 1)
+    run = amplicon_run
+    resp = await role_keyed_clients["user"].post(
+        URL_FEATURE_TABLE_VALUE,
+        json=_body([run["processing_idx"]], study_idx=run["study_1"]),
+    )
+    assert resp.status_code == 413, resp.text
+    assert run["fetched"] == []
+
+
 @pytest.mark.parametrize(
     "body",
     [
