@@ -667,7 +667,7 @@ async def test_golay_demux_then_verify_data_type(
     assert await _ticket_state(postgres_pool, first) == "completed"
     (row,) = await data_type_rows()
     metrics = json.loads(row["metrics"])
-    assert row["severity"] == "info"
+    assert (row["severity"], row["reason"]) == ("info", "insufficient_reads")
     assert row["work_ticket_idx"] == first
     assert metrics["n_sampled"] == _READS_PER_SAMPLE
     assert metrics["dominant_class"] == "marker_16s"
