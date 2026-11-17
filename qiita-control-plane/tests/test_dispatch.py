@@ -436,21 +436,60 @@ async def test_reconcile_waits_before_pumping_held_cohorts_with_no_tickets(
     assert reconcile_events.events == ["wait", "ready", "top_up"]
 
 
-async def test_reconcile_logs_and_schedules_nothing_when_the_wait_raises(
+async def test_reconcile_retries_a_failed_re_read_until_it_schedules_every_ticket(
     monkeypatch, reconcile_events, caplog
 ):
     from qiita_control_plane import dispatch as dispatch_mod
 
-    async def broken_wait(*_args, **_kwargs):
-        raise ValueError("grpcs:// not supported")
+    reads = 0
 
-    monkeypatch.setattr(dispatch_mod, "wait_for_data_plane", broken_wait)
+    async def flaky_versions(_pool):
+        nonlocal reads
+        reads += 1
+        if reads == 2:
+            raise OSError("connection reset")
+        return {1: 0, 2: 0}
+
+    monkeypatch.setattr(dispatch_mod, "_inflight_ticket_versions", flaky_versions)
+    monkeypatch.setattr(dispatch_mod, "held_cohorts", _async_return([]))
+    monkeypatch.setattr(dispatch_mod, "_RESUME_RETRY_BASE_SECONDS", 0)
+    reconcile_events.release.set()
     app = _fake_app()
-    _stub_work(monkeypatch, idxs=[1], cohorts=[])
 
     with caplog.at_level(logging.ERROR):
         await reconcile_inflight_tickets(app)
-        await _settle(app)
+        await asyncio.wait_for(_settle(app), timeout=1)
 
-    assert "grpcs:// not supported" in caplog.text
-    assert reconcile_events.events == []
+    assert "connection reset" in caplog.text
+    assert reads == 3
+    assert [e for e in reconcile_events.events if e.startswith("schedule")] == [
+        "schedule 1",
+        "schedule 2",
+    ]
+
+
+async def test_reconcile_does_not_reschedule_a_ticket_when_the_retry_follows_a_partial_run(
+    monkeypatch,
+):
+    from qiita_control_plane import dispatch as dispatch_mod
+
+    scheduled: list[int] = []
+    failed_once = False
+
+    def flaky_schedule(_app, idx, **_kw):
+        nonlocal failed_once
+        if idx == 2 and not failed_once:
+            failed_once = True
+            raise RuntimeError("boom")
+        scheduled.append(idx)
+
+    monkeypatch.setattr(dispatch_mod, "schedule_dispatch", flaky_schedule)
+    monkeypatch.setattr(dispatch_mod, "wait_for_data_plane", _async_return(None))
+    monkeypatch.setattr(dispatch_mod, "_RESUME_RETRY_BASE_SECONDS", 0)
+    app = _fake_app()
+    _stub_work(monkeypatch, idxs=[1, 2], cohorts=[])
+
+    await reconcile_inflight_tickets(app)
+    await asyncio.wait_for(_settle(app), timeout=1)
+
+    assert scheduled == [1, 2]
