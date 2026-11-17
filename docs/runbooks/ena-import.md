@@ -495,8 +495,9 @@ the ticket's retry limit; when the retries run out the ticket ends FAILED with
 failure_type `permanent` and both digests in the reason. A run that broke mid-download
 (including a corrupt body that surfaces mid-stream) and an HTTP 5xx, 408 or 429 from ENA
 or its file server, a failed connection to the server and an HTTP status 0 (no usable
-status) are retried the same way, as is ENA's "Not all results may have been
-written" answer. A run whose file returns a 404 fails at once.
+status) are retried the same way, as are ENA's "Not all results may have been
+written" answer and a gzip that ends before its end marker. A run whose file returns a
+404 fails at once.
 
 Where verification does not apply (an SFF run, a file that is not gzip-compressed, no
 `fastq_md5` from ENA) the run still registers. A run that comes back empty fails
@@ -550,7 +551,9 @@ Read the reason first. A dropped transfer or an ENA outage: redrive the ticket
 (`POST /work-ticket/{idx}/run`) once ENA is healthy; runs already stored are skipped, and
 a redrive resets `retry_count`, so it buys the full budget again. A bad digest or a 404:
 compare against the ENA Portal before redriving, since the same bytes fail the same way;
-if the run is gone or its digest is wrong at ENA, re-import once ENA is corrected. Each
+if the run is gone or its digest is wrong at ENA, re-import once ENA is corrected. A gzip that
+ended early: check whether the run's ENA URL redirects or returns an empty or non-gzip body
+(miint reports that as a truncated gzip too); a cut transfer clears on a redrive. Each
 retry resubmits the whole `ingest_ena_reads` step (resources: `baseline_resources` in
 `workflows/download-ena-study/1.0.0.yaml`), the requeue follows the failure with no
 delay or backoff, and `max_retries` is the ticket's one budget, shared with the OOM and
