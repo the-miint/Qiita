@@ -28,6 +28,9 @@ access to).
 | FAILED        | Reset → PENDING and dispatch (manual restart)     |
 | CANCELLED     | Reset → PENDING and dispatch (redrive after fix)  |
 
+The caller must be the originator or wet_lab_admin+ (else 404), and must pass the submit
+gates for the stored ticket.
+
 A download-ena-study redrive re-runs every step against the live roster. It is
 refused (409) when a newer download ticket exists for the pool, and when a FAILED
 ticket still has a live job holding the old roster.
@@ -118,7 +121,7 @@ from ..ticket_redrive import drop_dead_step_rows, reset_ticket_to_pending
 from ..work_ticket_cancel import WorkTicketNotFound, cancel_work_ticket
 from ..work_ticket_submit import (
     _reset_failed_reference_scope_for_dispatch,
-    authorize_redrive_action,
+    authorize_redrive,
     require_compute_backend_client_dependency,
     submit_work_ticket_core,
 )
@@ -543,6 +546,27 @@ async def pump_fanout_cohort(
     return await _pump_and_report(request, await _resolve_cohort(request, kind, key))
 
 
+async def _fetch_visible_work_ticket(
+    pool: asyncpg.Pool, principal: Principal, work_ticket_idx: int
+) -> WorkTicket:
+    """The ticket for its originator or a wet_lab_admin+; 404 for anyone else, as for a
+    missing idx."""
+    if isinstance(principal, Anonymous):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="authentication required"
+        )
+    ticket = await fetch_work_ticket(pool, work_ticket_idx)
+    if ticket is None or not (
+        ticket.originator_principal_idx == principal.principal_idx
+        or principal.has_role_at_least(SystemRole.WET_LAB_ADMIN)
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"work_ticket {work_ticket_idx} not found",
+        )
+    return ticket
+
+
 @router.get(
     PATH_WORK_TICKET_BY_IDX,
     response_model=WorkTicket,
@@ -564,22 +588,7 @@ async def get_work_ticket(
     caller cannot probe work_ticket_idx values to learn which tickets
     exist. Mirrors the enumeration-safe 404 the auth-token routes use
     (see docs/auth.md)."""
-    if isinstance(principal, Anonymous):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED, detail="authentication required"
-        )
-    not_found = HTTPException(
-        status_code=status.HTTP_404_NOT_FOUND,
-        detail=f"work_ticket {work_ticket_idx} not found",
-    )
-    ticket = await fetch_work_ticket(pool, work_ticket_idx)
-    if ticket is None:
-        raise not_found
-    is_originator = ticket.originator_principal_idx == principal.principal_idx
-    is_bypass = principal.has_role_at_least(SystemRole.WET_LAB_ADMIN)
-    if not (is_originator or is_bypass):
-        raise not_found
-    return ticket
+    return await _fetch_visible_work_ticket(pool, principal, work_ticket_idx)
 
 
 @router.get(
@@ -887,6 +896,15 @@ async def run_work_ticket(
     """Operator override — restart a FAILED ticket or resume a PENDING
     one whose original create-time dispatch was lost. State-aware (see
     table at module top)."""
+    ticket = await _fetch_visible_work_ticket(pool, principal, work_ticket_idx)
+    # Submission tells a missing action (404) from a disabled one (410); a
+    # redrive answers both with 409.
+    disabled = (
+        f"action {ticket.action_id!r}/{ticket.action_version!r} no longer enabled — cannot redrive"
+    )
+    if not await authorize_redrive(pool, request.app.state.settings, principal, ticket):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=disabled)
+
     row = await pool.fetchrow(
         "SELECT action_id, action_version, state, scope_target_kind, reference_idx,"
         "       sequenced_pool_idx"
@@ -898,14 +916,6 @@ async def run_work_ticket(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"work_ticket {work_ticket_idx} not found",
         )
-
-    # Submission tells a missing action (404) from a disabled one (410); a
-    # redrive answers both with 409.
-    disabled = (
-        f"action {row['action_id']!r}/{row['action_version']!r} no longer enabled — cannot redrive"
-    )
-    if not await authorize_redrive_action(pool, principal, row["action_id"], row["action_version"]):
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=disabled)
 
     current_state = row["state"]
     if current_state in _RUN_NOT_APPLICABLE_STATES:

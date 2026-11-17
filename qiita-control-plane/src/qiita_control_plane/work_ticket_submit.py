@@ -26,7 +26,9 @@ from qiita_common.auth_constants import SystemRole
 from qiita_common.models import (
     NON_TERMINAL_WORK_TICKET_STATES,
     ReferenceStatus,
+    ResourceOverride,
     ScopeTargetKind,
+    WorkTicket,
     WorkTicketCreateRequest,
     WorkTicketFollowOn,
     WorkTicketResponse,
@@ -608,6 +610,35 @@ async def authorize_redrive_action(
         return False
     _check_audience(principal, action["audience"])
     _check_scopes(principal, action["scopes"])
+    return True
+
+
+async def authorize_redrive(
+    pool: asyncpg.Pool, settings: Settings, principal: Principal, ticket: WorkTicket
+) -> bool:
+    """Run `_gate_submission` over `ticket`'s stored request, so a redrive needs what a
+    fresh submit of the same work needs. False when the action is missing or disabled.
+    `force` is not stored, so it is not replayed."""
+    if not await authorize_redrive_action(pool, principal, ticket.action_id, ticket.action_version):
+        return False
+    override = await pool.fetchval(
+        "SELECT resource_override FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+        ticket.work_ticket_idx,
+    )
+    await _gate_submission(
+        pool=pool,
+        settings=settings,
+        principal=principal,
+        body=WorkTicketCreateRequest(
+            action_id=ticket.action_id,
+            action_version=ticket.action_version,
+            scope_target=ticket.scope_target,
+            action_context=ticket.action_context,
+            resource_override=(
+                None if override is None else ResourceOverride.model_validate_json(override)
+            ),
+        ),
+    )
     return True
 
 
