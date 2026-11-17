@@ -2,6 +2,7 @@
 data_type:
   - data_type_mismatch
   - insufficient_reads
+  - no_rrna_marker
 composition:
   - high_unknown
   - low_panel_coverage

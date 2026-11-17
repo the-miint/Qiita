@@ -36,5 +36,5 @@ def test_loader_is_cached_and_frozen():
     assert all(isinstance(codes, frozenset) for codes in reasons.values())
 
 
-def test_data_type_lists_insufficient_reads():
-    assert "insufficient_reads" in load_qc_reasons()[QcCheck.DATA_TYPE]
+def test_data_type_lists_its_verdict_reasons():
+    assert {"insufficient_reads", "no_rrna_marker"} <= load_qc_reasons()[QcCheck.DATA_TYPE]

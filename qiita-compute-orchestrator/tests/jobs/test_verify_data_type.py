@@ -9,15 +9,18 @@ from pathlib import Path
 
 import duckdb
 import pytest
+import yaml
 from pydantic import TypeAdapter
 from qiita_common.backend_failure import StepNoData
-from qiita_common.models import MarkerClass, QcCheck, QcCheckResult, QcSeverity
-from qiita_common.qc_metrics import validate_qc_metrics
+from qiita_common.models import QcCheck, QcCheckResult, QcSeverity
+from qiita_common.qc_metrics import MarkerClass, validate_qc_metrics
 
 from qiita_compute_orchestrator.jobs import verify_data_type
 from qiita_compute_orchestrator.jobs.verify_data_type import _verdict
+from qiita_compute_orchestrator.miint import open_miint_conn
 
 _MARKERS = Path(__file__).parent / "data" / "markers"
+_WORKFLOW = Path(__file__).resolve().parents[3] / "workflows" / "verify-data-type" / "1.0.0.yaml"
 _REF_IDX = {cls: 100 + i for i, cls in enumerate(MarkerClass)}
 _READ_LEN = 100
 _RANDOM_READ_SEED = 7
@@ -29,17 +32,42 @@ def _fractions(**by_class: float) -> dict[MarkerClass, float]:
 
 @pytest.mark.parametrize("protocol", ["short_read_amplicon", "long_read_amplicon"])
 @pytest.mark.parametrize(
-    ("top", "severity", "reason"),
+    ("by_class", "severity", "reason", "measured", "threshold"),
     [
-        (0.90, QcSeverity.INFO, None),
-        (0.8999, QcSeverity.FAIL, "data_type_mismatch"),
-        (0.0, QcSeverity.FAIL, "data_type_mismatch"),
+        ({"marker_16s": 1.0}, QcSeverity.INFO, None, 1.0, 0.90),
+        ({"marker_16s": 0.9}, QcSeverity.INFO, None, 1.0, 0.90),
+        ({"marker_16s": 0.45, "marker_18s": 0.05}, QcSeverity.INFO, None, 0.9, 0.90),
+        (
+            {"marker_16s": 0.44, "marker_18s": 0.06},
+            QcSeverity.FAIL,
+            "data_type_mismatch",
+            0.88,
+            0.90,
+        ),
+        (
+            {"marker_16s": 0.25, "marker_18s": 0.25},
+            QcSeverity.FAIL,
+            "data_type_mismatch",
+            0.5,
+            0.90,
+        ),
+        (
+            {c.value: 0.2 for c in MarkerClass},
+            QcSeverity.FAIL,
+            "data_type_mismatch",
+            0.25,
+            0.90,
+        ),
+        ({"marker_16s": 0.5}, QcSeverity.INFO, None, 1.0, 0.90),
+        ({"marker_16s": 0.4999}, QcSeverity.INFO, "no_rrna_marker", 0.4999, 0.5),
+        ({"marker_16s": 0.1}, QcSeverity.INFO, "no_rrna_marker", 0.1, 0.5),
+        ({}, QcSeverity.INFO, "no_rrna_marker", 0.0, 0.5),
     ],
 )
-def test_amplicon_fails_below_ninety_percent_in_the_top_class(protocol, top, severity, reason):
-    verdict = _verdict(protocol, 5000, _fractions(marker_16s=top))
+def test_amplicon_verdict_table(protocol, by_class, severity, reason, measured, threshold):
+    verdict = _verdict(protocol, 5000, _fractions(**by_class))
     assert (verdict.severity, verdict.reason) == (severity, reason)
-    assert (verdict.measured_value, verdict.threshold) == (top, 0.90)
+    assert (verdict.measured_value, verdict.threshold) == (pytest.approx(measured), threshold)
 
 
 @pytest.mark.parametrize("protocol", ["short_read_metagenomics", "long_read_metagenomics"])
@@ -68,7 +96,7 @@ def test_transcriptomics_is_informational_whatever_the_fractions():
 def test_fewer_than_a_thousand_reads_is_insufficient_not_a_fail(protocol):
     verdict = _verdict(protocol, 999, _fractions(marker_16s=1.0))
     assert (verdict.severity, verdict.reason) == (QcSeverity.INFO, "insufficient_reads")
-    assert (verdict.measured_value, verdict.threshold) == (999, 1000)
+    assert (verdict.measured_value, verdict.threshold) == (None, None)
     assert _verdict(protocol, 1000, _fractions(marker_16s=1.0)).reason != "insufficient_reads"
 
 
@@ -78,8 +106,11 @@ def test_an_unregistered_protocol_raises_even_with_few_reads():
 
 
 def _marker_sequences(cls: MarkerClass) -> list[str]:
-    lines = (_MARKERS / f"{cls.value}.fasta").read_text().splitlines()
-    return [line for line in lines if not line.startswith(">")]
+    with open_miint_conn() as conn:
+        rows = conn.execute(
+            "SELECT sequence1 FROM read_fastx(?)", [str(_MARKERS / f"{cls.value}.fasta")]
+        ).fetchall()
+    return [sequence for (sequence,) in rows]
 
 
 def _marker_reads(cls: MarkerClass, n: int) -> list[str]:
@@ -205,12 +236,56 @@ def test_a_sample_with_no_reads_ends_as_no_data(tmp_path):
     assert not (tmp_path / "qc_checks.json").exists()
 
 
-def test_an_unregistered_protocol_fails_the_job(tmp_path, write_reads):
-    reads = _write_reads(write_reads, tmp_path / "reads.parquet", _random_reads(5))
+def test_an_unregistered_protocol_fails_before_any_input_is_read(tmp_path):
     with pytest.raises(ValueError, match="made_up_protocol"):
-        _run(reads, tmp_path, protocol="made_up_protocol")
+        _run(tmp_path / "absent.parquet", tmp_path, protocol="made_up_protocol")
 
 
 def test_the_output_is_a_single_json_list(tmp_path, write_reads):
     reads = _write_reads(write_reads, tmp_path / "reads.parquet", _random_reads(5))
     assert len(json.loads(_run(reads, tmp_path).read_text())) == 1
+
+
+def test_inputs_marker_fields_match_the_marker_classes_and_the_workflow():
+    fields = set(verify_data_type.Inputs.model_fields)
+    refs = {f"{c.value}_ref" for c in MarkerClass}
+    idxs = {f"{c.value}_reference_idx" for c in MarkerClass}
+    assert {f for f in fields if f.startswith("marker_") and f.endswith("_ref")} == refs
+    assert {f for f in fields if f.endswith("_reference_idx")} == idxs
+
+    workflow = yaml.safe_load(_WORKFLOW.read_text())
+    step = workflow["steps"][0]
+    assert set(step["inputs"]) == {"reads"} | refs
+    assert set(workflow["context_schema"]["required"]) == idxs
+    assert set(workflow["context_schema"]["properties"]) == idxs
+    assert set(step["params"].values()) >= idxs
+
+
+def test_amplicon_with_mostly_unclassified_reads_is_info_no_rrna_marker(
+    tmp_path, write_reads, monkeypatch
+):
+    monkeypatch.setattr(verify_data_type, "MIN_SAMPLED_READS", 10)
+    sequences = _marker_reads(MarkerClass.MARKER_16S, 8) + _random_reads(32)
+    reads = _write_reads(write_reads, tmp_path / "reads.parquet", sequences)
+    entry = _entry(_run(reads, tmp_path))
+    assert (entry.severity, entry.reason) == (QcSeverity.INFO, "no_rrna_marker")
+    assert (entry.measured_value, entry.threshold) == (pytest.approx(0.2), 0.5)
+
+
+def test_amplicon_split_across_classes_fails(tmp_path, write_reads, monkeypatch):
+    monkeypatch.setattr(verify_data_type, "MIN_SAMPLED_READS", 10)
+    sequences = _marker_reads(MarkerClass.MARKER_16S, 20) + _marker_reads(
+        MarkerClass.MARKER_18S, 20
+    )
+    reads = _write_reads(write_reads, tmp_path / "reads.parquet", sequences)
+    entry = _entry(_run(reads, tmp_path))
+    assert (entry.severity, entry.reason) == (QcSeverity.FAIL, "data_type_mismatch")
+
+
+def test_a_read_covering_under_half_a_marker_is_not_a_hit(tmp_path, write_reads):
+    marker = _marker_reads(MarkerClass.MARKER_16S, 20)
+    partial = [s[:30] + r[30:] for s, r in zip(marker[:10], _random_reads(10), strict=True)]
+    reads = _write_reads(write_reads, tmp_path / "reads.parquet", marker + partial)
+    metrics = _entry(_run(reads, tmp_path)).metrics
+    assert metrics["fractions"]["marker_16s"] == pytest.approx(20 / 30)
+    assert metrics["fractions"]["unclassified"] == pytest.approx(10 / 30)
