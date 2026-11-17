@@ -846,8 +846,8 @@ async def seed_field_exception(
     return await executor.fetchval(
         f"INSERT INTO {spec.field_exception_table} ("
         f"    {spec.entity_key_column}, {spec.study_field_idx_column}, global_field_idx,"
-        f"    tier_override, reason, created_by_idx"
-        f") VALUES ($1, $2, $3, $4::qiita.tier, $5, $6) RETURNING idx",
+        f"    tier_override, reason, created_by_idx, updated_by_idx"
+        f") VALUES ($1, $2, $3, $4::qiita.tier, $5, $6, $6) RETURNING idx",
         entity_idx,
         study_field_idx,
         global_field_idx,

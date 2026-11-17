@@ -62,7 +62,7 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
 - `20261112000000_host_taxon_id_not_required` makes `host_taxon_id` optional, and from the
   restart an absent value means no host. `dbmate` applies it; run the bucket-2 backfill
   first. (#864)
-- `[operator]` (#872) `make migrate` applies `20261117000000_field_exception_excludes_unique_in_study.sql` (triggers that keep a field exception off `unique_in_study` fields, and a nullable `updated_by_idx` on both `*_field_exception` tables; no row changes). It refuses to apply, naming the rule, if an existing exception row already keys on a `unique_in_study` field. No route wrote exception rows before this deploy, so only a row written by hand can trip it. If it does refuse, stop and follow its HINT.
+- `[operator]` (#872) `make migrate` applies `20261117000000_field_exception_excludes_unique_in_study.sql` (triggers that keep a field exception off `unique_in_study` fields, and a NOT NULL `updated_by_idx` on both `*_field_exception` tables, filled from `created_by_idx` on any row already there). It refuses to apply, naming the rule, if an existing exception row already keys on a `unique_in_study` field. No route wrote exception rows before this deploy, so only a row written by hand can trip it. If it does refuse, stop and follow its HINT.
 
 ### 4. Deploy
 

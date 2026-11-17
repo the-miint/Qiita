@@ -46,17 +46,23 @@ END
 $$;
 
 -- Who set an exception's current tier and reason; created_by_idx keeps who
--- first set it.
+-- first set it. A row already stored was written by hand, since no route
+-- wrote one before this migration, and nothing records who last edited it, so
+-- it takes its creator.
 ALTER TABLE qiita.biosample_field_exception
     ADD COLUMN updated_by_idx BIGINT REFERENCES qiita.principal(idx) ON DELETE RESTRICT;
 ALTER TABLE qiita.prep_sample_field_exception
     ADD COLUMN updated_by_idx BIGINT REFERENCES qiita.principal(idx) ON DELETE RESTRICT;
+UPDATE qiita.biosample_field_exception SET updated_by_idx = created_by_idx;
+UPDATE qiita.prep_sample_field_exception SET updated_by_idx = created_by_idx;
+ALTER TABLE qiita.biosample_field_exception ALTER COLUMN updated_by_idx SET NOT NULL;
+ALTER TABLE qiita.prep_sample_field_exception ALTER COLUMN updated_by_idx SET NOT NULL;
 COMMENT ON COLUMN qiita.biosample_field_exception.updated_by_idx IS
     'The principal who set the current tier_override and reason: the creator until '
-    'a replace. NULL on a row written other than through the exception route.';
+    'a replace.';
 COMMENT ON COLUMN qiita.prep_sample_field_exception.updated_by_idx IS
     'The principal who set the current tier_override and reason: the creator until '
-    'a replace. NULL on a row written other than through the exception route.';
+    'a replace.';
 
 CREATE FUNCTION qiita.tg_field_exception_not_on_unique_field() RETURNS trigger AS $$
 DECLARE

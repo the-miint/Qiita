@@ -247,8 +247,8 @@ class SampleFieldExceptionResponse(BaseModel):
 
     keyed_on says what it follows: "global" for a field linked to a global
     field, where it restricts the value in every study that links that field,
-    and "local" for a purely-local field. The table admits a NULL reason, and
-    updated_by_idx is NULL, on a row that something other than the route wrote.
+    and "local" for a purely-local field. The table admits a NULL reason, on a
+    row that something other than the route wrote.
     created_by_idx names who first set the exception, and updated_by_idx who set
     its current tier and reason.
     """
@@ -257,6 +257,6 @@ class SampleFieldExceptionResponse(BaseModel):
     reason: str | None
     keyed_on: MetadataFieldScope
     created_by_idx: Annotated[int, Field(gt=0)]
-    updated_by_idx: Annotated[int, Field(gt=0)] | None
+    updated_by_idx: Annotated[int, Field(gt=0)]
     created_at: AwareDatetime
     updated_at: AwareDatetime
