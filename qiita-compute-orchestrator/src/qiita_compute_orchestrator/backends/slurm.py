@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import signal
 from datetime import timedelta
 from pathlib import Path
@@ -37,6 +38,7 @@ from qiita_common.models import (
     WorkTicketFailureStage,
     check_derived_inputs,
 )
+from qiita_common.models.step import PURGED_RAW_STATE
 
 from ..backend import (
     ComputeBackend,
@@ -58,11 +60,11 @@ from ..slurm import (
     parse_outputs_map,
     verify_container_output,
 )
-from ..slurm.contract import JOB_PARAMS_FILENAME, JobParams
+from ..slurm.contract import JOB_PARAMS_FILENAME, MANIFEST_FILENAME, JobParams
 
 _log = logging.getLogger(__name__)
 
-# SLURM's job_state strings => FailureKind.
+# SLURM's job_state strings (plus the runner's PURGED marker) => FailureKind.
 #
 # SLURM has more terminal states than retry classes (e.g. BOOT_FAIL and
 # NODE_FAIL both reduce to "infra failed, retry"). The mapping here is
@@ -74,7 +76,7 @@ _log = logging.getLogger(__name__)
 # exceeds walltime, which usually indicates a too-tight allocation —
 # a retry on a less-loaded node may finish in time, and operators can
 # raise the action's walltime ceiling if the pattern persists.
-_STATE_TO_FAILURE_KIND: dict[TerminalSlurmState, FailureKind] = {
+_STATE_TO_FAILURE_KIND: dict[str, FailureKind] = {
     TerminalSlurmState.FAILED: FailureKind.EXIT_NONZERO,
     TerminalSlurmState.CANCELLED: FailureKind.EXIT_NONZERO,
     TerminalSlurmState.DEADLINE: FailureKind.EXIT_NONZERO,
@@ -84,6 +86,7 @@ _STATE_TO_FAILURE_KIND: dict[TerminalSlurmState, FailureKind] = {
     TerminalSlurmState.OUT_OF_MEMORY: FailureKind.OOM_KILLED,
     TerminalSlurmState.PREEMPTED: FailureKind.PREEMPTED,
     TerminalSlurmState.TIMEOUT: FailureKind.TIMEOUT_BEFORE_START,
+    PURGED_RAW_STATE: FailureKind.JOB_PURGED,
 }
 
 # Generic failure kinds an OOM stderr signature is allowed to upgrade to
@@ -93,7 +96,7 @@ _STATE_TO_FAILURE_KIND: dict[TerminalSlurmState, FailureKind] = {
 # kind (NODE_FAIL / TIMEOUT / PREEMPTED) — those are already correct from the
 # SLURM state and must not be downgraded.
 _OOM_UPGRADABLE_KINDS: frozenset[FailureKind] = frozenset(
-    {FailureKind.EXIT_NONZERO, FailureKind.UNKNOWN_PERMANENT}
+    {FailureKind.EXIT_NONZERO, FailureKind.UNKNOWN_PERMANENT, FailureKind.JOB_PURGED}
 )
 
 # The job's exit status when its child process is killed by SIGSEGV.
@@ -105,6 +108,63 @@ _SEGFAULT_EXIT_CODE = 128 + signal.SIGSEGV
 # `qiita ticket status`; the fuller tail is available via `qiita ticket logs`.
 _FAILURE_REASON_TAIL_LINES = 15
 _FAILURE_REASON_TAIL_BYTES = 2048
+
+
+_KILL_LINE_RE = re.compile(
+    r"^\[[^\]]+\] error: \*\*\* JOB \d+ ON \S+ CANCELLED AT \S+ "
+    r"DUE (?P<cause>TO TIME LIMIT|to SIGNAL \w+) \*\*\*\s*$",
+    re.MULTILINE,
+)
+
+
+# Slurm's ESLURM_INVALID_JOB_ID, the `error_number` slurmrestd returns with a 404 for a job
+# it no longer has. A wrong API version also 404s, with a plain-text body, so the status
+# alone is not enough. Probed 2026-11-17 on slurmrestd v0.0.40:
+# `curl GET /slurm/v0.0.40/job/<purged id>` -> 404, errors[].error_number == 2017.
+_SLURM_INVALID_JOB_ID = 2017
+_BODY_EXCERPT_CHARS = 200
+
+
+def _is_invalid_job_id_body(body: str | None) -> bool:
+    try:
+        errors = json.loads(body or "").get("errors")
+    except ValueError, AttributeError:
+        return False
+    return isinstance(errors, list) and any(
+        isinstance(e, dict) and e.get("error_number") == _SLURM_INVALID_JOB_ID for e in errors
+    )
+
+
+def _scan_slurm_kill_state(stderr_path: Path) -> TerminalSlurmState | None:
+    """The state a slurmstepd job-kill line anywhere in `stderr_path` names, else None."""
+    try:
+        text = stderr_path.read_text(errors="replace")
+    except OSError:
+        return None
+    match = _KILL_LINE_RE.search(text)
+    if match is None:
+        return None
+    if match["cause"] == "TO TIME LIMIT":
+        return TerminalSlurmState.TIMEOUT
+    return TerminalSlurmState.CANCELLED
+
+
+def _read_stderr_tail(logs_path: Path) -> str:
+    text, _ = read_text_tail(
+        logs_path / "stderr",
+        max_lines=_FAILURE_REASON_TAIL_LINES,
+        max_bytes=_FAILURE_REASON_TAIL_BYTES,
+    )
+    return text
+
+
+def _is_absent(path: Path) -> bool:
+    """True only when `path` does not exist; any other stat error propagates."""
+    try:
+        path.stat()
+    except FileNotFoundError:
+        return True
+    return False
 
 
 class SlurmBackend(ComputeBackend):
@@ -561,9 +621,9 @@ class SlurmBackend(ComputeBackend):
 
         slurmrestd errors are classified into a typed BackendFailure so the
         caller sees the same surface as submit/result: transport / 5xx / 401
-        => retriable SLURMRESTD_UNREACHABLE (the runner keeps polling); other
-        4xx (e.g. 404 purged) => UNKNOWN_PERMANENT (status unknowable; recovery
-        uses the filesystem tiebreaker)."""
+        => retriable SLURMRESTD_UNREACHABLE (the runner keeps polling);
+        404 invalid-job-id => JOB_PURGED (recovery uses the output manifest, else the stderr);
+        other 4xx => UNKNOWN_PERMANENT (status unknowable)."""
         self._require_slurm_handle(handle)
         try:
             info = await self._client.get_job(handle.slurm_job_id)
@@ -577,6 +637,26 @@ class SlurmBackend(ComputeBackend):
         single home for the post-poll terminal logic, called by the runner
         once `status_step` reports the job terminal."""
         self._require_slurm_handle(handle)
+        if status.status == StepStatus.COMPLETED and status.raw_state == PURGED_RAW_STATE:
+            try:
+                manifest_absent = _is_absent(handle.output_path / MANIFEST_FILENAME)
+            except OSError as exc:
+                raise BackendFailure(
+                    kind=FailureKind.CONTRACT_VIOLATION,
+                    stage=WorkTicketFailureStage.STEP_RUN,
+                    step_name=handle.step_name,
+                    reason=f"cannot stat {exc.filename or handle.output_path}: "
+                    f"[Errno {exc.errno}] {exc.strerror}",
+                ) from exc
+            if manifest_absent:
+                kill_state = _scan_slurm_kill_state(handle.logs_path / "stderr")
+                status = StepStatusInfo(
+                    status=StepStatus.FAILED,
+                    raw_state=kill_state.value if kill_state else PURGED_RAW_STATE,
+                    reason=f"state inferred from the stderr kill line; {status.reason}"
+                    if kill_state
+                    else status.reason,
+                )
         if status.status == StepStatus.COMPLETED:
             failures = verify_container_output(handle.output_path, recovered=status.recovered)
             if failures:
@@ -663,11 +743,7 @@ class SlurmBackend(ComputeBackend):
         # stderr text is the one in-band signal that it was a memory kill.
         # Fold the tail into failure_reason either way so `qiita ticket status`
         # carries the real error without a host shell.
-        stderr_tail, _ = read_text_tail(
-            handle.logs_path / "stderr",
-            max_lines=_FAILURE_REASON_TAIL_LINES,
-            max_bytes=_FAILURE_REASON_TAIL_BYTES,
-        )
+        stderr_tail = _read_stderr_tail(handle.logs_path)
         if (
             status.raw_state == TerminalSlurmState.FAILED
             and status.exit_code == _SEGFAULT_EXIT_CODE
@@ -812,10 +888,11 @@ class SlurmBackend(ComputeBackend):
 
     def _classify_status_error(self, exc: SlurmrestdError, step_name: str) -> BackendFailure:
         """Map a slurmrestd get_job / job-list error to a BackendFailure. A
-        4xx other than 401 means the job state is unknowable (permanent —
-        purged job; the runner's filesystem tiebreaker then decides from the
-        on-disk manifest); 5xx / transport / 401 are transiently unreachable
-        (the runner retries). 401 is retriable, consistent with
+        404 carrying Slurm's invalid-job-id error means slurmrestd has purged
+        the job (JOB_PURGED; the runner then decides from the on-disk manifest,
+        else the stderr); any other 4xx, including another 404,
+        except 401 is unknowable (permanent); 5xx / transport / 401 are
+        transiently unreachable (the runner retries). 401 is retriable, consistent with
         `_classify_submit_error`: a 401 surviving the client's JWT-refresh
         retry is a broken rotation pipeline (operator-fixable), not a terminal
         step outcome.
@@ -824,7 +901,11 @@ class SlurmBackend(ComputeBackend):
         `find_jobs_by_name`) always means "could not read status" (transport /
         infra), never "the step failed" — retry on a transient kind rather
         than recording a terminal step failure."""
-        if exc.status_code is not None and 400 <= exc.status_code < 500 and exc.status_code != 401:
+        if exc.status_code == 404 and _is_invalid_job_id_body(exc.body):
+            kind = FailureKind.JOB_PURGED
+        elif (
+            exc.status_code is not None and 400 <= exc.status_code < 500 and exc.status_code != 401
+        ):
             kind = FailureKind.UNKNOWN_PERMANENT
         else:
             kind = FailureKind.SLURMRESTD_UNREACHABLE
@@ -832,5 +913,10 @@ class SlurmBackend(ComputeBackend):
             kind=kind,
             stage=WorkTicketFailureStage.STEP_RUN,
             step_name=step_name,
-            reason=f"slurmrestd get_job failed: {exc!s}",
+            reason=f"slurmrestd get_job failed: {exc!s}"
+            + (
+                f"; body: {exc.body[:_BODY_EXCERPT_CHARS]!r}"
+                if kind is FailureKind.UNKNOWN_PERMANENT and exc.body
+                else ""
+            ),
         )

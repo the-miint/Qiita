@@ -160,6 +160,10 @@ class StepHandleWire(BaseModel):
     terminal_outputs: dict[str, str] | None = None
 
 
+PURGED_RAW_STATE = "PURGED"
+"""`StepStatusWire.raw_state` of a job slurmrestd no longer has."""
+
+
 class StepStatusWire(BaseModel):
     """Serialized `StepStatusInfo` — returned by POST /step/status and fed
     back into POST /step/result so the orchestrator (stateless) can finalize
