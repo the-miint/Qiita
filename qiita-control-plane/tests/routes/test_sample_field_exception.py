@@ -835,32 +835,20 @@ async def _seed_unique_local_value(ctx, s: _Surface, *, study_idx: int, entity: 
 
 
 @pytest.mark.parametrize("surface", _SURFACE_IDS)
-async def test_exception_on_a_unique_in_study_field_is_409(ctx, surface):
-    """A field exception cannot be set on a unique_in_study field."""
+@pytest.mark.parametrize(
+    "tier", [Tier.ADMIN, Tier.PUBLIC], ids=["above_field_tier", "at_or_below_field_tier"]
+)
+async def test_exception_on_a_unique_in_study_field_is_409(ctx, surface, tier):
+    """A field exception cannot be set on a unique_in_study field. The route
+    refuses it before it compares tiers, so a tier that also restricts nothing
+    gets the 409, not the 422; the database refuses only at the insert, which
+    that 422 would never reach."""
     s = _SURFACES[surface]
     study_idx = await _member_study(ctx)
     entity = await s.seed_entity(ctx, study_idx)
     field_idx = await _seed_unique_local_value(ctx, s, study_idx=study_idx, entity=entity)
 
-    resp = await _put(ctx["wet"], s.exception_url(study_idx, entity, field_idx), Tier.ADMIN)
-
-    assert resp.status_code == 409, resp.text
-    assert "unique_in_study" in resp.json()["detail"]
-    assert await _exception_rows(ctx, s.spec, entity) == []
-
-
-@pytest.mark.parametrize("surface", _SURFACE_IDS)
-async def test_unique_in_study_is_checked_before_the_tier(ctx, surface):
-    """The route refuses a unique_in_study field before it compares tiers, so
-    a PUT whose tier also restricts nothing is the 409, not the 422. The
-    database refuses the same exception only at the insert, which that 422
-    would never reach."""
-    s = _SURFACES[surface]
-    study_idx = await _member_study(ctx)
-    entity = await s.seed_entity(ctx, study_idx)
-    field_idx = await _seed_unique_local_value(ctx, s, study_idx=study_idx, entity=entity)
-
-    resp = await _put(ctx["wet"], s.exception_url(study_idx, entity, field_idx), Tier.PUBLIC)
+    resp = await _put(ctx["wet"], s.exception_url(study_idx, entity, field_idx), tier)
 
     assert resp.status_code == 409, resp.text
     assert "unique_in_study" in resp.json()["detail"]
