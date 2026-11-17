@@ -57,13 +57,23 @@ router = APIRouter(prefix=PATH_FEATURE_TABLE_PREFIX, tags=["feature-table"])
 async def _authorized_cohort(
     pool: asyncpg.Pool, caller: HumanUser, request: FeatureTableRequest
 ) -> Cohort:
+    # When the caller names the prep_samples, authorize that named set BEFORE
+    # resolving: resolve_cohort's 404 enumerates which named prep_samples a run did
+    # not process, so a caller who may not read them must be refused first (403,
+    # anti-enumeration) rather than handed that list. A study cohort names no
+    # prep_samples — its set is known only after resolving, and is authorized then.
+    if request.prep_sample_idx is not None:
+        await authorize_prep_sample_cohort(
+            pool, caller=caller, prep_sample_idx=request.prep_sample_idx, min_tier=COHORT_MIN_TIER
+        )
     try:
         cohort = await resolve_cohort(pool, request)
     except CohortError as exc:
         raise HTTPException(status_code=exc.status, detail=exc.detail) from exc
-    await authorize_prep_sample_cohort(
-        pool, caller=caller, prep_sample_idx=cohort.prep_sample_idxs, min_tier=COHORT_MIN_TIER
-    )
+    if request.prep_sample_idx is None:
+        await authorize_prep_sample_cohort(
+            pool, caller=caller, prep_sample_idx=cohort.prep_sample_idxs, min_tier=COHORT_MIN_TIER
+        )
     return cohort
 
 
