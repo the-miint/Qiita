@@ -1040,7 +1040,9 @@ async def test_status_step_classifies_live_state(
 @pytest.mark.parametrize(
     ("status_code", "raises_transport", "expected_kind", "expected_transient"),
     [
-        (404, False, FailureKind.UNKNOWN_PERMANENT, False),  # purged: status unknowable
+        (404, False, FailureKind.JOB_PURGED, True),  # not found: purged
+        (403, False, FailureKind.UNKNOWN_PERMANENT, False),
+        (422, False, FailureKind.UNKNOWN_PERMANENT, False),
         (400, False, FailureKind.UNKNOWN_PERMANENT, False),
         (401, False, FailureKind.SLURMRESTD_UNREACHABLE, True),  # broken rotation, retriable
         (503, False, FailureKind.SLURMRESTD_UNREACHABLE, True),
@@ -1164,7 +1166,11 @@ async def _purged_result(jwt_path, tmp_path, stderr, *, manifest=None):
     with pytest.raises((BackendFailure, StepNoData)) as ei:
         await backend.result_step(
             _slurm_handle(tmp_path),
-            StepStatusInfo(status=StepStatus.COMPLETED, raw_state=PURGED_RAW_STATE),
+            StepStatusInfo(
+                status=StepStatus.COMPLETED,
+                raw_state=PURGED_RAW_STATE,
+                reason="slurmrestd no longer has the job",
+            ),
         )
     return ei.value
 
@@ -1217,24 +1223,47 @@ async def test_result_step_purged_classifies_slurmstepd_kill_line(jwt_path, tmp_
 
 
 @pytest.mark.asyncio
-async def test_result_step_purged_manifest_stat_error_is_not_absent(
+async def test_result_step_purged_manifest_stat_error_is_permanent_failure(
     jwt_path, tmp_path, monkeypatch
 ):
     real_stat = Path.stat
 
     def stat(self, *args, **kwargs):
         if self.name == "manifest.json":
-            raise PermissionError(13, "denied")
+            raise PermissionError(13, "Permission denied", str(self))
         return real_stat(self, *args, **kwargs)
 
     monkeypatch.setattr(Path, "stat", stat)
     backend = _make_backend(httpx.MockTransport(lambda r: httpx.Response(500)), jwt_path)
     (tmp_path / "output").mkdir(parents=True)
-    with pytest.raises(PermissionError):
+    with pytest.raises(BackendFailure) as ei:
         await backend.result_step(
             _slurm_handle(tmp_path),
             StepStatusInfo(status=StepStatus.COMPLETED, raw_state=PURGED_RAW_STATE),
         )
+    assert ei.value.kind is FailureKind.CONTRACT_VIOLATION
+    assert ei.value.transient is False
+    assert "Errno 13" in ei.value.reason
+    assert str(tmp_path / "output" / "manifest.json") in ei.value.reason
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "trailer",
+    ["more output\n" * 15, "more output\n" * 15 + "Killed\n"],
+    ids=["trailing-output", "trailing-killed"],
+)
+async def test_result_step_purged_finds_kill_line_beyond_the_tail(jwt_path, tmp_path, trailer):
+    exc = await _purged_result(jwt_path, tmp_path, _TIME_LIMIT_LINE + trailer)
+    assert exc.kind is FailureKind.TIMEOUT_BEFORE_START
+
+
+@pytest.mark.asyncio
+async def test_result_step_purged_reason_states_the_inferred_state(jwt_path, tmp_path):
+    exc = await _purged_result(jwt_path, tmp_path, _TIME_LIMIT_LINE)
+    assert "ended in state 'TIMEOUT'" in exc.reason
+    assert "inferred from the stderr kill line" in exc.reason
+    assert "TerminalSlurmState" not in exc.reason
 
 
 @pytest.mark.asyncio

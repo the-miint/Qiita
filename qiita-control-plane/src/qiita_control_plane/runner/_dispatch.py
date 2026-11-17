@@ -1006,9 +1006,10 @@ async def _poll_until_terminal(
     COMPLETED status: the caller's `result_step` runs verify + parse against
     the output manifest, which decides it — a valid manifest yields the
     outputs (completed), a broken one raises CONTRACT_VIOLATION (failed), and
-    a missing one is classified from the job's stderr. This is the filesystem
-    tiebreaker. Records the running transition once, the first time the job is
-    observed on a node."""
+    a missing one is classified from the job's stderr, but only when the read
+    was a not-found (JOB_PURGED); any other unreadable status keeps the
+    manifest-only verdict. This is the filesystem tiebreaker. Records the
+    running transition once, the first time the job is observed on a node."""
     recorded_running = False
     n = 0
     while True:
@@ -1035,7 +1036,7 @@ async def _poll_until_terminal(
             )
             return StepStatusWire(
                 status=StepStatus.COMPLETED,
-                raw_state=PURGED_RAW_STATE,
+                raw_state=PURGED_RAW_STATE if exc.kind is FailureKind.JOB_PURGED else None,
                 reason=f"slurmrestd no longer has the job ({exc.kind.value}); "
                 "deciding from filesystem",
             )

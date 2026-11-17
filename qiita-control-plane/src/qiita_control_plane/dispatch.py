@@ -299,9 +299,10 @@ async def reconcile_inflight_tickets(app: FastAPI) -> int:
     (rebuilding their outputs from the shared workspace) and resumes the first
     incomplete one — re-attaching to a live SLURM job by its persisted id,
     finalizing one that succeeded while the CP was down, or deciding a purged
-    job from its on-disk manifest. A CO outage during reconcile leaves the
-    ticket PROCESSING and keeps retrying (the runner's poll loop never fails on
-    an unreachable orchestrator), so a deploy that stops both services is safe.
+    job from its on-disk manifest, or from its stderr when there is none. A CO
+    outage during reconcile leaves the ticket PROCESSING and keeps retrying (the
+    runner's poll loop never fails on an unreachable orchestrator), so a deploy
+    that stops both services is safe.
 
     Resume policy (vs. the old fail-all sweep): deploys stop/start the CP
     undrained, so a restart with in-flight tickets is routine, not a crash —
