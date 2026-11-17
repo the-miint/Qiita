@@ -285,6 +285,17 @@ def test_write_tsv_row_of_wrong_width(tmp_path, rows):
     assert not path.exists()
 
 
+def test_write_tsv_repeated_column_name(tmp_path):
+    """Tests the case where a column name repeats: the write refuses it, since
+    the later column would otherwise replace the earlier one's cells."""
+    path = tmp_path / "table.tsv"
+
+    with pytest.raises(ValueError, match="biosample_idx"):
+        write_tsv(path, ("biosample_idx", "biosample_idx"), [("SMK-001", "1041")])
+
+    assert not path.exists()
+
+
 def test_write_tsv_unwritable_destination(tmp_path):
     """Tests the case where the destination cannot be written: the writer
     reports it rather than leaving the caller a partial file."""

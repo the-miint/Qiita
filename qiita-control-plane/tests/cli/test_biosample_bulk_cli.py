@@ -66,7 +66,12 @@ def _expected_rows(owner_idx: int, **extra) -> list[dict]:
     ]
 
 
-def _bulk_create_argv(tsv_file: Path, *study_args: str, extra: tuple[str, ...] = ()) -> list[str]:
+def _bulk_create_argv(
+    tsv_file: Path,
+    *study_args: str,
+    extra: tuple[str, ...] = (),
+    owner_column: str = _OWNER_COLUMN,
+) -> list[str]:
     study = study_args or ("--study-idx", str(_STUDY_IDX))
     return [
         "--base-url",
@@ -77,7 +82,7 @@ def _bulk_create_argv(tsv_file: Path, *study_args: str, extra: tuple[str, ...] =
         "--tsv-file",
         str(tsv_file),
         "--owner-biosample-id-field-name",
-        _OWNER_COLUMN,
+        owner_column,
         *extra,
     ]
 
@@ -281,4 +286,23 @@ def test_resolve_study_idx_refuses_blank_export_id(monkeypatch, tmp_path, capsys
 
     stderr = capsys.readouterr().err
     names_flag = "--study-export-id: must not be blank" in stderr
+    assert (exc_info.value.code, captured["requests"], names_flag) == (2, [], True)
+
+
+@pytest.mark.parametrize("owner_column", ["biosample_idx", "export_entity_id"])
+def test__read_biosample_tsv_refuses_owner_column_named_like_output(
+    monkeypatch, tmp_path, capsys, owner_column
+):
+    """Tests the case where the owner column shares its name with a column that
+    the command's printed results already carry: the command exits 2 naming the
+    flag, before any request."""
+    captured: dict = {}
+    _stub_post(monkeypatch, captured, response_json=_BULK_RESPONSE, whoami_idx=42)
+    tsv_file = _write_tsv_file(tmp_path, f"{owner_column}\tnote\nSMK-001\tx\n")
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(_bulk_create_argv(tsv_file, owner_column=owner_column))
+
+    stderr = capsys.readouterr().err
+    names_flag = f"--owner-biosample-id-field-name {owner_column!r}" in stderr
     assert (exc_info.value.code, captured["requests"], names_flag) == (2, [], True)
