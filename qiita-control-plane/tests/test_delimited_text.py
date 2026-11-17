@@ -1,6 +1,8 @@
 """Tests for reading a tab-separated table whose first line names its columns."""
 
 import os
+import subprocess
+import sys
 from pathlib import Path
 
 import duckdb
@@ -11,6 +13,11 @@ from qiita_control_plane.delimited_text import read_headed_tsv
 from qiita_control_plane.miint import duckdb_connect
 
 _SOURCE_NAME = "probe table"
+_COPY_TO_STDOUT_SCRIPT = (
+    "import duckdb; duckdb.connect().execute("
+    "\"COPY (SELECT 'a' AS name) TO '/dev/stdout' (FORMAT CSV, HEADER true)\")"
+)
+_WRITE_TO_STDOUT_SCRIPT = "import sys; sys.stdout.write('name\\na\\n')"
 
 
 def _write(tmp_path: Path, text: str) -> Path:
@@ -178,3 +185,23 @@ def test_duckdb_renames_column_differing_only_in_case():
     finally:
         conn.close()
     assert column_names == ["Biosample_idx", "biosample_idx_1"]
+
+
+def test_duckdb_copy_to_stdout_truncates_file_open_for_append(tmp_path):
+    """Tests the case where DuckDB copies a table to /dev/stdout while stdout is a
+    file open for appending: the file's earlier content is lost, where the same
+    text written through Python's stdout follows it."""
+    file_texts = []
+    for script_name, script in (
+        ("python", _WRITE_TO_STDOUT_SCRIPT),
+        ("duckdb", _COPY_TO_STDOUT_SCRIPT),
+    ):
+        path = tmp_path / f"{script_name}.tsv"
+        path.write_text("SENTINEL\n", encoding="utf-8")
+
+        # A child process, so that its stdout, not the test runner's, is the file.
+        with path.open("a", encoding="utf-8") as appended_stdout:
+            subprocess.run([sys.executable, "-c", script], stdout=appended_stdout, check=True)
+        file_texts.append(path.read_text(encoding="utf-8"))
+
+    assert file_texts == ["SENTINEL\nname\na\n", "name\na\n"]

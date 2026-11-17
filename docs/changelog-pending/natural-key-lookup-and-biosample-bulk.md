@@ -14,8 +14,10 @@
   is metadata keyed on its header; a blank cell is left unset. The study is named by
   `--study-export-id` (preferred) or `--study-idx`. It prints a TSV giving, for each created
   biosample in the file's row order, the owner's biosample name, `biosample_idx` and
-  `export_entity_id`; the owner column therefore cannot be named `biosample_idx` or
-  `export_entity_id`.
+  `export_entity_id`. Ignoring case, the column named by `--owner-biosample-id-field-name`
+  cannot be `biosample_idx`, `export_entity_id` or one of the attribute names; `qiita
+  biosample create` accepts them. If the TSV cannot be written after the biosamples are
+  created, the command exits 1 and prints their identifiers as JSON on stderr.
 - **`qiita biosample link` accepts `--study-export-id` in place of `--study-idx` (#896).**
 
 ### Changed

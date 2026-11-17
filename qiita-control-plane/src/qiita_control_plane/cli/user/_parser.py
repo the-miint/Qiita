@@ -84,7 +84,7 @@ from .assembly import DEFAULT_EXPORT_KINDS, EXPORT_KINDS, _handle_assembly_expor
 from .auth import _handle_login, _handle_profile_set, _handle_whoami
 from .biosample import (
     _BULK_CREATE_OUTPUT_FIELDS,
-    _OWNER_FIELD_NAME_FLAG,
+    _OWNER_BIOSAMPLE_ID_FIELD_NAME_FLAG,
     _TSV_FILE_FLAG,
     _handle_biosample_bulk_create,
     _handle_biosample_create,
@@ -555,7 +555,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help="principal_idx of the biosample's owner; defaults to the caller (resolved via whoami)",
     )
     p_biosample_create.add_argument(
-        _OWNER_FIELD_NAME_FLAG,
+        _OWNER_BIOSAMPLE_ID_FIELD_NAME_FLAG,
         required=True,
         help="display_name of the study's local field that carries the owner-biosample-id",
     )
@@ -608,17 +608,19 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "tab-separated file with a header row, one biosample per row; columns named"
             f" {', '.join(BIOSAMPLE_ATTRIBUTE_FIELDS)} set those attributes, the"
-            f" column that {_OWNER_FIELD_NAME_FLAG} names sets the owner_biosample_id,"
+            f" column that {_OWNER_BIOSAMPLE_ID_FIELD_NAME_FLAG} names sets the owner_biosample_id,"
             " and every other column is metadata keyed on its header"
         ),
     )
     p_biosample_bulk_create.add_argument(
-        _OWNER_FIELD_NAME_FLAG,
+        _OWNER_BIOSAMPLE_ID_FIELD_NAME_FLAG,
         required=True,
         help=(
             "display_name of the study's local field that carries the owner_biosample_id;"
-            " the file's column with this header holds each row's value. It cannot be"
-            f" {' or '.join(_BULK_CREATE_OUTPUT_FIELDS)}, the names of the output columns"
+            " the file's column with this header holds each row's value. Ignoring case, it"
+            f" cannot be {', '.join(_BULK_CREATE_OUTPUT_FIELDS)} (the output columns) or"
+            f" {', '.join(BIOSAMPLE_ATTRIBUTE_FIELDS)} (the attribute columns);"
+            " `qiita biosample create` accepts those names"
         ),
     )
     p_biosample_bulk_create.add_argument(

@@ -1,6 +1,8 @@
 """`qiita biosample bulk-create`: the TSV file it reads, the request it sends, how it
 names the study, and the TSV it prints."""
 
+import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -16,7 +18,7 @@ from qiita_control_plane.cli.user import main
 from .conftest import _stub_post
 
 _BASE = "https://q.example.test"
-_OWNER_COLUMN = "sample_name"
+_OWNER_BIOSAMPLE_ID_COLUMN = "sample_name"
 _STUDY_IDX = 7
 _BULK_URL = URL_BIOSAMPLE_BULK_BY_STUDY.format(study_idx=_STUDY_IDX)
 _TSV_TEXT = (
@@ -51,9 +53,17 @@ def _write_tsv_file(tmp_path: Path, text: str = _TSV_TEXT) -> Path:
     return path
 
 
-def _expected_rows(owner_idx: int, **extra) -> list[dict]:
-    """The request rows `_TSV_TEXT` becomes for `owner_idx`, each carrying `extra`."""
-    common = {"owner_idx": owner_idx, "owner_biosample_id_field_name": _OWNER_COLUMN, **extra}
+def _expected_rows(
+    owner_idx: int, owner_biosample_id_column: str = _OWNER_BIOSAMPLE_ID_COLUMN, **extra
+) -> list[dict]:
+    """The request rows `_TSV_TEXT` becomes for the owner principal `owner_idx`,
+    with the owner_biosample_id column headed `owner_biosample_id_column`, each
+    carrying `extra`."""
+    common = {
+        "owner_idx": owner_idx,
+        "owner_biosample_id_field_name": owner_biosample_id_column,
+        **extra,
+    }
     return [
         {
             **common,
@@ -70,7 +80,7 @@ def _bulk_create_argv(
     tsv_file: Path,
     *study_args: str,
     extra: tuple[str, ...] = (),
-    owner_column: str = _OWNER_COLUMN,
+    owner_biosample_id_column: str = _OWNER_BIOSAMPLE_ID_COLUMN,
 ) -> list[str]:
     study = study_args or ("--study-idx", str(_STUDY_IDX))
     return [
@@ -82,7 +92,7 @@ def _bulk_create_argv(
         "--tsv-file",
         str(tsv_file),
         "--owner-biosample-id-field-name",
-        owner_column,
+        owner_biosample_id_column,
         *extra,
     ]
 
@@ -127,6 +137,81 @@ def test__handle_biosample_bulk_create_explicit_owner_and_internal_names(
     expected_rows = _expected_rows(11, global_internal_names=True)
     expected_calls = [("POST", _BASE + _BULK_URL, {"rows": expected_rows})]
     assert (rc, calls, capfd.readouterr().out) == (0, expected_calls, _EXPECTED_OUTPUT)
+
+
+@pytest.mark.parametrize("owner_biosample_id_column", ["biosample_idx_x", "my_export_entity_id"])
+def test__handle_biosample_bulk_create_accepts_owner_biosample_id_column_containing_refused_name(
+    monkeypatch, tmp_path, capfd, owner_biosample_id_column
+):
+    """Tests the case where the owner_biosample_id column's name contains a
+    refused name without equaling it: the command creates the biosamples and
+    prints them under that column name."""
+    captured: dict = {}
+    _stub_post(monkeypatch, captured, response_json=_BULK_RESPONSE, whoami_idx=42)
+    tsv_text = _TSV_TEXT.replace(_OWNER_BIOSAMPLE_ID_COLUMN, owner_biosample_id_column, 1)
+
+    tsv_file = _write_tsv_file(tmp_path, tsv_text)
+    rc = main(_bulk_create_argv(tsv_file, owner_biosample_id_column=owner_biosample_id_column))
+
+    calls = [(r["method"], r["url"], r["json"]) for r in captured["requests"]]
+    expected_calls = [
+        ("GET", _BASE + URL_AUTH_WHOAMI, None),
+        ("POST", _BASE + _BULK_URL, {"rows": _expected_rows(42, owner_biosample_id_column)}),
+    ]
+    expected_output = _EXPECTED_OUTPUT.replace(
+        _OWNER_BIOSAMPLE_ID_COLUMN, owner_biosample_id_column, 1
+    )
+    assert (rc, calls, capfd.readouterr().out) == (0, expected_calls, expected_output)
+
+
+def test__handle_biosample_bulk_create_appends_to_stdout(monkeypatch, tmp_path):
+    """Tests the case where stdout is a file opened for appending that already
+    holds content: the printed TSV follows that content rather than replacing it."""
+    captured: dict = {}
+    _stub_post(monkeypatch, captured, response_json=_BULK_RESPONSE, whoami_idx=42)
+    output_file = tmp_path / "created.tsv"
+    output_file.write_text("SENTINEL\n", encoding="utf-8")
+
+    with output_file.open("a", encoding="utf-8") as appended_stdout:
+        monkeypatch.setattr(sys, "stdout", appended_stdout)
+        rc = main(_bulk_create_argv(_write_tsv_file(tmp_path)))
+
+    output = output_file.read_text(encoding="utf-8")
+    assert (rc, output) == (0, "SENTINEL\n" + _EXPECTED_OUTPUT)
+
+
+def test__handle_biosample_bulk_create_reports_created_rows_when_output_fails(
+    monkeypatch, tmp_path, capsys
+):
+    """Tests the case where the biosamples are created but stdout cannot be
+    written: the command exits 1 and gives the created rows as JSON on stderr."""
+    captured: dict = {}
+    _stub_post(monkeypatch, captured, response_json=_BULK_RESPONSE, whoami_idx=42)
+    output_file = tmp_path / "read_only.txt"
+    output_file.write_text("", encoding="utf-8")
+
+    with output_file.open("r", encoding="utf-8") as unwritable_stdout:
+        monkeypatch.setattr(sys, "stdout", unwritable_stdout)
+        with pytest.raises(SystemExit) as exc_info:
+            main(_bulk_create_argv(_write_tsv_file(tmp_path)))
+
+    # The first stderr line names the write error, whose text belongs to the OS.
+    stderr_lines = capsys.readouterr().err.split("\n", 2)
+    expected_rows = [
+        {
+            _OWNER_BIOSAMPLE_ID_COLUMN: "SMK-001",
+            "biosample_idx": "1041",
+            "export_entity_id": "QB1041",
+        },
+        {
+            _OWNER_BIOSAMPLE_ID_COLUMN: "SMK-002",
+            "biosample_idx": "1042",
+            "export_entity_id": "QB1042",
+        },
+    ]
+    outcome = (exc_info.value.code, stderr_lines[1], json.loads(stderr_lines[2]))
+    expected = (1, "The biosamples were created; their identifiers are:", expected_rows)
+    assert outcome == expected
 
 
 def test__handle_biosample_bulk_create_by_study_export_id(monkeypatch, tmp_path, capfd):
@@ -192,7 +277,7 @@ def test__handle_biosample_bulk_create_requires_one_study_flag(tmp_path, study_a
         "--tsv-file",
         str(_write_tsv_file(tmp_path)),
         "--owner-biosample-id-field-name",
-        _OWNER_COLUMN,
+        _OWNER_BIOSAMPLE_ID_COLUMN,
     ]
     with pytest.raises(SystemExit) as exc_info:
         main(argv)
@@ -207,7 +292,7 @@ def test__handle_biosample_bulk_create_requires_one_study_flag(tmp_path, study_a
         ("sample_name\tnote\nSMK-001\n", "Expected Number of Columns: 2 Found: 1"),
         ("sample_name\tnote\n", "holds no rows"),
     ],
-    ids=["no-owner-column", "empty-file", "ragged-row", "header-only"],
+    ids=["no-owner-biosample-id-column", "empty-file", "ragged-row", "header-only"],
 )
 def test__read_biosample_tsv_refuses_bad_file(monkeypatch, tmp_path, capsys, text, message):
     """Tests the case where the file lacks the owner_biosample_id column, is
@@ -271,8 +356,9 @@ def test__handle_biosample_bulk_create_refuses_result_count_mismatch(monkeypatch
     with pytest.raises(SystemExit) as exc_info:
         main(_bulk_create_argv(_write_tsv_file(tmp_path)))
 
-    expected_message = "error: the control plane returned 1 result(s) for 2 row(s)"
-    assert (exc_info.value.code, capfd.readouterr().out) == (expected_message, "")
+    output = capfd.readouterr()
+    expected_message = "error: the control plane returned 1 result(s) for 2 row(s)\n"
+    assert (exc_info.value.code, output.out, output.err) == (1, "", expected_message)
 
 
 def test_resolve_study_idx_refuses_blank_export_id(monkeypatch, tmp_path, capsys):
@@ -289,20 +375,24 @@ def test_resolve_study_idx_refuses_blank_export_id(monkeypatch, tmp_path, capsys
     assert (exc_info.value.code, captured["requests"], names_flag) == (2, [], True)
 
 
-@pytest.mark.parametrize("owner_column", ["biosample_idx", "export_entity_id", "Biosample_IDX"])
-def test__handle_biosample_bulk_create_refuses_owner_column_named_like_output(
-    monkeypatch, tmp_path, capsys, owner_column
+@pytest.mark.parametrize(
+    "owner_biosample_id_column",
+    ["biosample_idx", "export_entity_id", "Biosample_IDX", "matrix_tube_id", "Biosample_Accession"],
+)
+def test__handle_biosample_bulk_create_refuses_owner_biosample_id_column_name(
+    monkeypatch, tmp_path, capsys, owner_biosample_id_column
 ):
-    """Tests the case where the owner column shares its name with a column that
-    the command's printed results already carry: the command exits 2 naming the
-    flag, before reading the file (which does not exist) or sending any request."""
+    """Tests the case where the owner_biosample_id column's name, ignoring case, is a column
+    that the command's printed results carry or one that sets an attribute: the
+    command exits 2 naming the flag, before reading the file (which does not
+    exist) or sending any request."""
     captured: dict = {}
     _stub_post(monkeypatch, captured, response_json=_BULK_RESPONSE, whoami_idx=42)
     tsv_file = tmp_path / "absent.tsv"
 
     with pytest.raises(SystemExit) as exc_info:
-        main(_bulk_create_argv(tsv_file, owner_column=owner_column))
+        main(_bulk_create_argv(tsv_file, owner_biosample_id_column=owner_biosample_id_column))
 
     stderr = capsys.readouterr().err
-    names_flag = f"--owner-biosample-id-field-name {owner_column!r}" in stderr
+    names_flag = f"--owner-biosample-id-field-name {owner_biosample_id_column!r}" in stderr
     assert (exc_info.value.code, captured["requests"], names_flag) == (2, [], True)
