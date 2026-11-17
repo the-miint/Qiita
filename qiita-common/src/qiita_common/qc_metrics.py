@@ -18,6 +18,9 @@ class MarkerClass(StrEnum):
     MARKER_5S_5_8S = "marker_5s_5_8s"
 
 
+MARKER_REF_BINDINGS = {cls: f"{cls}_ref" for cls in MarkerClass}
+MARKER_REFERENCE_IDX_KEYS = {cls: f"{cls}_reference_idx" for cls in MarkerClass}
+
 _Fraction = Annotated[float, Field(ge=0, le=1, strict=True, allow_inf_nan=False)]
 _PositiveInt = Annotated[int, Field(gt=0, strict=True)]
 _FRACTION_SUM_TOLERANCE = 1e-6

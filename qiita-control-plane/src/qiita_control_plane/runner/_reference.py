@@ -17,7 +17,7 @@ from qiita_common.models import (
     INDEX_TYPE_RYPE_ROUTER,
     ReferenceStatus,
 )
-from qiita_common.qc_metrics import MarkerClass
+from qiita_common.qc_metrics import MARKER_REF_BINDINGS, MARKER_REFERENCE_IDX_KEYS, MarkerClass
 
 import qiita_control_plane.runner as _runner_pkg
 
@@ -681,8 +681,6 @@ async def _resolve_qc_adapters(
 SORTMERNA_REF_BINDING = "sortmerna_ref"
 # action_context key: the reference_idx to materialize.
 SORTMERNA_REFERENCE_IDX_KEY = "sortmerna_reference_idx"
-MARKER_REF_BINDINGS = {cls: f"{cls}_ref" for cls in MarkerClass}
-MARKER_REFERENCE_IDX_KEYS = {cls: f"{cls}_reference_idx" for cls in MarkerClass}
 
 
 def _write_reference_fasta(

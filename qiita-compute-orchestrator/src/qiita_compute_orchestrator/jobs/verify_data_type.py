@@ -10,7 +10,12 @@ from pydantic import BaseModel, TypeAdapter
 from qiita_common.backend_failure import StepNoData
 from qiita_common.models import QcCheck, QcCheckResult, QcSeverity
 from qiita_common.parquet import validate_parquet_path
-from qiita_common.qc_metrics import DataTypeMetrics, MarkerClass
+from qiita_common.qc_metrics import (
+    MARKER_REF_BINDINGS,
+    MARKER_REFERENCE_IDX_KEYS,
+    DataTypeMetrics,
+    MarkerClass,
+)
 
 from ..miint import apply_duckdb_settings, duckdb_tmp_dir, open_miint_conn, resolve_duckdb_memory_gb
 from ..read_source import bind_step_reads
@@ -26,8 +31,7 @@ AMPLICON_MIN_CLASSIFIED_FRACTION = 0.5
 AMPLICON_MIN_TOP_FRACTION = 0.90
 METAGENOMIC_MAX_RRNA_FRACTION = 0.05
 
-# Keep in step with amplicon_deblur's `coverage >= 50`; no e-value cut, as the library's
-# differ from the CLI's.
+# Keep in step with amplicon_deblur's `coverage >= 50`.
 _MIN_COVERAGE = 50
 
 _DUCKDB_FALLBACK_MEMORY_GB = 6
@@ -37,7 +41,7 @@ _AMPLICON = frozenset({"short_read_amplicon", "long_read_amplicon"})
 _METAGENOMIC = frozenset({"short_read_metagenomics", "long_read_metagenomics"})
 _TRANSCRIPTOMIC = frozenset({"short_read_transcriptomics"})
 
-# hash() spreads the sample across the read set; sequence_idx breaks ties so it is reproducible.
+# hash() spreads the subsample across the read set; sequence_idx breaks ties so it is reproducible.
 _SAMPLE_SQL = """
 CREATE OR REPLACE TABLE sample AS
 SELECT sequence_idx AS read_id, sequence1
@@ -59,7 +63,7 @@ GROUP BY cls
 
 
 class Inputs(BaseModel):
-    reads: Path | None = None
+    reads: Path
     marker_16s_ref: Path
     marker_18s_ref: Path
     marker_23s_28s_ref: Path
@@ -111,7 +115,8 @@ def _graded(failed: bool, measured: float, threshold: float) -> Verdict:
 
 
 def _class_counts(conn, refs: dict[MarkerClass, Path]) -> dict[MarkerClass, int]:
-    """Reads per class, each read assigned to its best-scoring class."""
+    """Reads per class, each read assigned to its best-scoring class; a read whose best hit
+    covers under 50% counts as unclassified."""
     conn.execute(
         "CREATE OR REPLACE TABLE marker_subject AS "
         + " UNION ALL ".join(
@@ -126,10 +131,10 @@ def _class_counts(conn, refs: dict[MarkerClass, Path]) -> dict[MarkerClass, int]
 
 
 async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
-    """Classify a sample of the reads and write the `data_type` QC check. StepNoData
+    """Classify a subsample of the reads and write the `data_type` QC check. StepNoData
     when the prep_sample has no reads."""
     _require_thresholded(inputs.prep_protocol)
-    refs = {cls: getattr(inputs, f"{cls}_ref") for cls in MarkerClass}
+    refs = {cls: getattr(inputs, MARKER_REF_BINDINGS[cls]) for cls in MarkerClass}
     for ref in refs.values():
         if not ref.exists():
             raise FileNotFoundError(f"marker reference not found: {ref}")
@@ -164,7 +169,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             },
             "dominant_class": dominant,
             "marker_reference_idx": {
-                cls.value: getattr(inputs, f"{cls}_reference_idx") for cls in MarkerClass
+                cls.value: getattr(inputs, MARKER_REFERENCE_IDX_KEYS[cls]) for cls in MarkerClass
             },
         }
     )
