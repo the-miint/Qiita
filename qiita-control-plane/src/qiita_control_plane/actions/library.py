@@ -2381,9 +2381,9 @@ async def persist_qc_report(
 
     The reports are the qc_report.json documents the runner read from the
     qc_report_raw / qc_report_filtered step sidecars; they are stored verbatim as
-    JSONB (raw -> raw_qc_report, filtered -> filtered_qc_report). A workflow that
-    has no filtered report passes none, and the stored one is left as it was. The
-    pool-level merged report aggregates them on read.
+    JSONB (raw -> raw_qc_report, filtered -> filtered_qc_report). A workflow with
+    no filtered report passes none, which stores SQL NULL so the row always
+    describes the latest run. The pool-level merged report aggregates them on read.
 
     Fail-fast (loud) when no sequenced_sample row exists for the prep_sample —
     same ordering invariant as persist_read_metrics: a sequenced prep_sample
@@ -2394,7 +2394,7 @@ async def persist_qc_report(
     ss_idx = await pool.fetchval(
         "UPDATE qiita.sequenced_sample"
         " SET raw_qc_report = $2::jsonb,"
-        "     filtered_qc_report = COALESCE($3::jsonb, filtered_qc_report)"
+        "     filtered_qc_report = $3::jsonb"
         " WHERE prep_sample_idx = $1"
         " RETURNING idx",
         prep_sample_idx,

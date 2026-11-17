@@ -6,7 +6,7 @@ target_processing_kinds: [sequenced]
 
 description: >
   Successor to fastq-to-parquet/1.3.0, identical except that it persists the raw QC
-  report (1.3.0 computed it and never stored it). Mask-model successor to
+  report. Mask-model successor to
   fastq-to-parquet/1.2.0: instead of physically dropping
   reads at qc/host_filter, it stores the FULL reads once in the DuckLake `read`
   table and records downstream filtering as a `read_mask` (one row per read:
@@ -43,7 +43,7 @@ description: >
   Nothing is physically filtered now — qc/host_filter emit masks over the full
   `read` rows — so a separate "filtered reads" QC report would describe a file
   that does not exist. The raw report is the QC report for this workflow, and
-  persist-qc-report stores it alone, leaving filtered_qc_report unset.
+  persist-qc-report stores it alone, so filtered_qc_report is NULL.
 
   host_filter's host indexes are GATED. When action_context sets
   `host_filter_enabled: true`, `host_rype_reference_idx` names an ACTIVE reference

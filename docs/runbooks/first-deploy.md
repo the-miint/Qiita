@@ -1141,7 +1141,7 @@ PREP_SAMPLE_IDX=$(qiita sequenced-sample create \
     --pool-item-id smoke \
     --primary-study-idx "$STUDY_IDX" | jq -r .prep_sample_idx)
 WORK_TICKET_IDX=$(qiita ticket submit \
-    --action-id fastq-to-parquet --action-version 1.3.0 \
+    --action-id fastq-to-parquet --action-version 1.4.0 \
     --prep-sample-idx "$PREP_SAMPLE_IDX" \
     --context-json '{"fastq_path": "<ingest-root>/smoke/smoke_R1.fastq"}' \
     | jq -r .work_ticket_idx)

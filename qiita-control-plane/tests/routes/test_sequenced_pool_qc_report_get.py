@@ -150,7 +150,7 @@ async def test_get_qc_report_merges_samples(ctx, seeded_pool):
 
 
 async def test_get_qc_report_returns_raw_only_sample(ctx, seeded_pool):
-    """A sample persisted by a workflow with no filtered report still returns its raw one."""
+    """A prep_sample persisted by a workflow with no filtered report still returns its raw one."""
     db = ctx["pool"]
     owner = ctx["wet_session"]["principal_idx"]
     bs_idx, ps_idx = await seed_biosample_with_sequenced_prep_sample(db, owner_idx=owner)
