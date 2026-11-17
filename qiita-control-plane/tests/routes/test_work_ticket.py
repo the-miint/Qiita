@@ -3216,30 +3216,39 @@ async def test_reconcile_schedules_resume_for_non_terminal_only(
 
 
 async def test_reconcile_skips_a_ticket_run_while_it_waited_for_the_data_plane(
-    postgres_pool, admin_token, reference_action, ticket_seeder, monkeypatch
+    wt_client, postgres_pool, admin_token, reference_action, ticket_seeder, monkeypatch
 ):
     """A ticket `/run` dispatches during the data-plane wait must not be resumed on top of it.
 
-    The touch is `/run`'s own PENDING-path UPDATE; the resume compares each ticket's
-    `updated_at` against the startup snapshot, so only the touched one is dropped.
+    `/run` on a non-held PENDING ticket changes no column value; the resume's
+    `updated_at` comparison sees it only because the row is written at all.
     """
     from types import SimpleNamespace
 
     from qiita_control_plane import dispatch
+    from qiita_control_plane.routes import work_ticket as work_ticket_routes
 
-    _, admin_idx = admin_token
-    run_by_route = await ticket_seeder.ticket(action=reference_action, originator_idx=admin_idx)
-    untouched = await ticket_seeder.ticket(action=reference_action, originator_idx=admin_idx)
+    token, admin_idx = admin_token
+    run_by_route = await ticket_seeder.ticket(
+        action=reference_action, originator_idx=admin_idx, state=WorkTicketState.PENDING.value
+    )
+    untouched = await ticket_seeder.ticket(
+        action=reference_action, originator_idx=admin_idx, state=WorkTicketState.PENDING.value
+    )
 
     release = asyncio.Event()
 
     async def _wait(_url):
         await release.wait()
 
-    scheduled: list[int] = []
+    resumed: list[int] = []
+    dispatched_by_route: list[int] = []
     monkeypatch.setattr(dispatch, "wait_for_data_plane", _wait)
+    monkeypatch.setattr(dispatch, "schedule_dispatch", lambda _app, idx, **_kw: resumed.append(idx))
     monkeypatch.setattr(
-        dispatch, "schedule_dispatch", lambda _app, idx, **_kw: scheduled.append(idx)
+        work_ticket_routes,
+        "schedule_dispatch",
+        lambda _app, idx, **_kw: dispatched_by_route.append(idx),
     )
     app = SimpleNamespace(
         state=SimpleNamespace(
@@ -3251,16 +3260,17 @@ async def test_reconcile_skips_a_ticket_run_while_it_waited_for_the_data_plane(
         )
     )
     await dispatch.reconcile_inflight_tickets(app)
-    await postgres_pool.execute(
-        "UPDATE qiita.work_ticket SET dispatch_held = false"
-        " WHERE work_ticket_idx = $1 AND state = 'pending'::qiita.work_ticket_state",
-        run_by_route,
+    resp = await wt_client.post(
+        URL_WORK_TICKET_RUN.format(work_ticket_idx=run_by_route),
+        headers={"Authorization": f"Bearer {token}"},
     )
+    assert resp.status_code == 202, resp.text
+    assert dispatched_by_route == [run_by_route]
     release.set()
     await app.state.reconcile_resume_task
 
-    assert untouched in scheduled
-    assert run_by_route not in scheduled
+    assert untouched in resumed
+    assert run_by_route not in resumed
 
 
 # ---------------------------------------------------------------------------
