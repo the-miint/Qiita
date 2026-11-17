@@ -308,10 +308,10 @@ class SampleQCReport(BaseModel):
     documents the native `qc_report` job emitted at each point (the
     `{point, layout, read_pairs, mates: {r1, r2}}` shape), or None when none was
     produced (fastq-to-parquet/1.3.0 never stored a raw one; 1.4.0 produces no
-    filtered one). `sequenced_pool_item_id` is the
-    sample's per-pool item id (lane+barcode); `prep_sample_idx` identifies the
-    sample. The blobs are surfaced as-is — the pool report does not re-derive
-    them, only merges copies into `merged`."""
+    filtered one). `sequenced_pool_item_id` is the sample's per-pool item id
+    (lane+barcode); `prep_sample_idx` identifies the sample. The blobs are
+    surfaced as-is — the pool report does not re-derive them, only merges copies
+    into `merged`."""
 
     prep_sample_idx: Annotated[int, Field(gt=0)]
     sequenced_pool_item_id: str | None

@@ -2449,8 +2449,8 @@ async def test_run_action_primitive_refuses_a_wrongly_scoped_ticket(
 async def test_run_action_primitive_persist_qc_report_binds_what_the_step_declares(
     monkeypatch, tmp_path, inputs, expect_filtered
 ):
-    """A step declaring only `raw_qc_report` persists the raw report alone, so the
-    filtered column is left as it was; a 1.2.0-shaped step still passes both."""
+    """A step declaring only `raw_qc_report` persists the raw report alone (filtered
+    stored as NULL); a 1.2.0-shaped step still passes both."""
     import json as _json
 
     from qiita_common.actions import WorkflowAction
