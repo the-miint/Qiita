@@ -902,16 +902,6 @@ async def run_work_ticket(
     one whose original create-time dispatch was lost. State-aware (see
     table at module top)."""
     ticket, row = await _fetch_visible_work_ticket(pool, principal, work_ticket_idx)
-    # Submission tells a missing action (404) from a disabled one (410); a
-    # redrive answers both with 409.
-    disabled = (
-        f"action {ticket.action_id!r}/{ticket.action_version!r} no longer enabled — cannot redrive"
-    )
-    if not await authorize_redrive(
-        pool, request.app.state.settings, principal, ticket, row["resource_override"]
-    ):
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=disabled)
-
     current_state = row["state"]
     if current_state in _RUN_NOT_APPLICABLE_STATES:
         raise HTTPException(
@@ -921,6 +911,16 @@ async def run_work_ticket(
                 "current_state": current_state,
             },
         )
+
+    # Submission tells a missing action (404) from a disabled one (410); a
+    # redrive answers both with 409.
+    disabled = (
+        f"action {ticket.action_id!r}/{ticket.action_version!r} no longer enabled — cannot redrive"
+    )
+    if not await authorize_redrive(
+        pool, request.app.state.settings, principal, ticket, row["resource_override"]
+    ):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=disabled)
 
     if current_state in REDRIVABLE_WORK_TICKET_STATES:
         # Manual restart: FAILED / CANCELLED → PENDING. Per arch.md spec, resets

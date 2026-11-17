@@ -3151,6 +3151,65 @@ async def test_run_by_non_originator_is_404_and_dispatches_nothing(
     assert await _state(postgres_pool, idx) == WorkTicketState.FAILED.value
 
 
+async def _tighten_context_schema(postgres_pool, action) -> None:
+    await postgres_pool.execute(
+        "UPDATE qiita.action SET context_schema = $3::jsonb WHERE action_id = $1 AND version = $2",
+        *action,
+        json.dumps({"type": "object", "required": ["x"]}),
+    )
+
+
+async def test_run_of_a_ticket_the_current_definition_refuses_is_422_and_says_so(
+    wt_client,
+    postgres_pool,
+    regular_token,
+    reference_action_open,
+    reference_idx,
+    dispatched,
+):
+    token, user_idx = regular_token
+    idx = await _seed_scoped_ticket(
+        wt_client,
+        postgres_pool,
+        action=reference_action_open,
+        originator_idx=user_idx,
+        kind=ScopeTargetKind.REFERENCE,
+        idx=reference_idx,
+        state=WorkTicketState.FAILED,
+    )
+    await _tighten_context_schema(postgres_pool, reference_action_open)
+    resp = await _run(wt_client, token, idx)
+    assert resp.status_code == 422, resp.text
+    detail = resp.json()["detail"]
+    assert "submit the work again" in detail["reason"]
+    assert detail["refused"]["reason"] == "action_context does not match action.context_schema"
+    assert dispatched == []
+
+
+async def test_run_answers_a_state_409_before_the_gates(
+    wt_client,
+    postgres_pool,
+    regular_token,
+    reference_action_open,
+    reference_idx,
+    dispatched,
+):
+    token, user_idx = regular_token
+    idx = await _seed_scoped_ticket(
+        wt_client,
+        postgres_pool,
+        action=reference_action_open,
+        originator_idx=user_idx,
+        kind=ScopeTargetKind.REFERENCE,
+        idx=reference_idx,
+        state=WorkTicketState.COMPLETED,
+    )
+    await _tighten_context_schema(postgres_pool, reference_action_open)
+    resp = await _run(wt_client, token, idx)
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["detail"]["current_state"] == WorkTicketState.COMPLETED.value
+
+
 async def test_run_by_originator_redrives(
     wt_client,
     postgres_pool,

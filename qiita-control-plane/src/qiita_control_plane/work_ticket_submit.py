@@ -620,28 +620,43 @@ async def authorize_redrive(
     ticket: WorkTicket,
     resource_override: str | None,
 ) -> bool:
-    """Run `_gate_submission` over `ticket`'s stored request, so a redrive needs what a
-    fresh submit of the same work needs. False when the action is missing or disabled."""
+    """Run `_gate_submission` on `ticket`'s stored request, against the action's current
+    definition. The follow-on gate, the in-flight dedupe and `force` do not run. False
+    when the action is missing or disabled."""
     action = await _fetch_action_for_submission(pool, ticket.action_id, ticket.action_version)
     if action is None or not action["enabled"]:
         return False
-    await _gate_submission(
-        pool=pool,
-        settings=settings,
-        principal=principal,
-        body=WorkTicketCreateRequest(
-            action_id=ticket.action_id,
-            action_version=ticket.action_version,
-            scope_target=ticket.scope_target,
-            action_context=ticket.action_context,
-            resource_override=(
-                None
-                if resource_override is None
-                else ResourceOverride.model_validate_json(resource_override)
+    try:
+        await _gate_submission(
+            pool=pool,
+            settings=settings,
+            principal=principal,
+            body=WorkTicketCreateRequest(
+                action_id=ticket.action_id,
+                action_version=ticket.action_version,
+                scope_target=ticket.scope_target,
+                action_context=ticket.action_context,
+                resource_override=(
+                    None
+                    if resource_override is None
+                    else ResourceOverride.model_validate_json(resource_override)
+                ),
             ),
-        ),
-        action=action,
-    )
+            action=action,
+        )
+    except HTTPException as exc:
+        if exc.status_code != status.HTTP_422_UNPROCESSABLE_CONTENT:
+            raise
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail={
+                "reason": (
+                    "the stored ticket no longer satisfies the action's current definition;"
+                    " submit the work again"
+                ),
+                "refused": exc.detail,
+            },
+        ) from exc
     return True
 
 
