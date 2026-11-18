@@ -41,9 +41,8 @@ description: >
   Nothing is physically filtered now — qc/host_filter emit masks over the full
   `read` rows — so a separate "filtered reads" QC report would describe a file
   that does not exist. The raw report is the QC report for this workflow, and
-  persist-qc-report stores it alone, so filtered_qc_report is NULL. Added to this
-  version in place, as its last step; a prep_sample processed before that has no
-  stored report.
+  persist-qc-report stores it alone, so filtered_qc_report is NULL. A prep_sample
+  processed without this step has no stored report.
 
   host_filter's host indexes are GATED. When action_context sets
   `host_filter_enabled: true`, `host_rype_reference_idx` names an ACTIVE reference

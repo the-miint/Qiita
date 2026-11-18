@@ -307,8 +307,8 @@ class SampleQCReport(BaseModel):
     `raw_qc_report` / `filtered_qc_report` are the verbatim qc_report.json
     documents the native `qc_report` job emitted at each point (the
     `{point, layout, read_pairs, mates: {r1, r2}}` shape), or None when none was
-    stored (the mask-model fastq-to-parquet stores no filtered one, and a sample
-    it processed before it stored the raw one has neither). `sequenced_pool_item_id`
+    stored (the mask-model fastq-to-parquet stores no filtered one, and a prep_sample
+    processed before its raw report was persisted has neither). `sequenced_pool_item_id`
     is the sample's per-pool item id (lane+barcode); `prep_sample_idx` identifies
     the sample. The blobs are surfaced as-is — the pool report does not re-derive
     them, only merges copies into `merged`."""
