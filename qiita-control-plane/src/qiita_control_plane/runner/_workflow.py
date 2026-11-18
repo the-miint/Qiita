@@ -98,6 +98,7 @@ from ._processing import (
     _create_amplicon_gate_pending,
     _create_assembly_gate_pending,
     _mint_processing_idx,
+    _record_amplicon_gate_no_data,
     _record_assembly_gate_no_data,
     _workflow_needs_processing,
     _workflow_writes_amplicon_gate,
@@ -1002,6 +1003,20 @@ async def run_workflow(
                 mask_idx=minted_mask_idx,
                 prep_sample_idx=scope_target["prep_sample_idx"],
                 work_ticket_idx=work_ticket_idx,
+            )
+        # The pool's amplicon_sample gate when denoise produced no ASV for any sample,
+        # before the transition for the same reason; a re-drive re-raises StepNoData
+        # from the same empty pool. Pool-scoped (amplicon is sequenced_pool-scoped),
+        # so every 'pending' row for the run goes 'no_data', not one sample's.
+        if (
+            action is not None
+            and _workflow_writes_amplicon_gate(action.steps)
+            and minted_processing_idx is not None
+        ):
+            await _record_amplicon_gate_no_data(
+                pool,
+                processing_idx=minted_processing_idx,
+                sequenced_pool_idx=scope_target["sequenced_pool_idx"],
             )
         await _transition_to_no_data(pool, work_ticket_idx)
         return

@@ -364,6 +364,18 @@ async def test_delete_pool_clears_completion_gate_rows(
         processing_idx,
         prep,
     )
+    amplicon_processing_idx = await postgres_pool.fetchval(
+        "INSERT INTO qiita.processing (params_hash, workflow, version, params)"
+        " VALUES ($1, 'amplicon', '1.1.0', '{}'::jsonb)"
+        " RETURNING processing_idx",
+        uuid.uuid4().bytes + uuid.uuid4().bytes,  # 32-byte params_hash
+    )
+    await postgres_pool.execute(
+        "INSERT INTO qiita.amplicon_sample (processing_idx, prep_sample_idx, state)"
+        " VALUES ($1, $2, 'completed')",
+        amplicon_processing_idx,
+        prep,
+    )
     try:
         resp = await admin_client.delete(_url(ids))
         assert resp.status_code == 200, resp.text
@@ -388,6 +400,12 @@ async def test_delete_pool_clears_completion_gate_rows(
         assert (
             await postgres_pool.fetchval(
                 "SELECT 1 FROM qiita.assembly_sample WHERE prep_sample_idx = $1", prep
+            )
+            is None
+        )
+        assert (
+            await postgres_pool.fetchval(
+                "SELECT 1 FROM qiita.amplicon_sample WHERE prep_sample_idx = $1", prep
             )
             is None
         )
@@ -420,6 +438,12 @@ async def test_delete_pool_clears_completion_gate_rows(
         )
         await postgres_pool.execute(
             "DELETE FROM qiita.assembly_sample WHERE prep_sample_idx = $1", prep
+        )
+        await postgres_pool.execute(
+            "DELETE FROM qiita.amplicon_sample WHERE prep_sample_idx = $1", prep
+        )
+        await postgres_pool.execute(
+            "DELETE FROM qiita.processing WHERE processing_idx = $1", amplicon_processing_idx
         )
         await postgres_pool.execute(
             "DELETE FROM qiita.mask_definition WHERE mask_idx = $1", mask_idx

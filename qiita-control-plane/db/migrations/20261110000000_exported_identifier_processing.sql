@@ -68,6 +68,11 @@ END;
 $$;
 
 DROP INDEX IF EXISTS qiita.exported_identifier_live_processing_sample;
+-- The processing-kind identifier (alignment_idx NULL, processing_idx set) the up
+-- added is exactly the shape the restored alignment-only CHECK below rejects, so a
+-- rollback that kept those rows would abort on the ADD CONSTRAINT. Rolling back
+-- removes the amplicon-identifier capability, so its identifiers go with it.
+DELETE FROM qiita.exported_identifier WHERE processing_idx IS NOT NULL;
 ALTER TABLE qiita.exported_identifier
     DROP CONSTRAINT exported_identifier_one_processing,
     ADD CONSTRAINT exported_identifier_one_processing
