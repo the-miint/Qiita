@@ -21,6 +21,7 @@ from pathlib import Path
 import asyncpg
 import pytest
 import pytest_asyncio
+from qiita_common.models.reference import GenomeSource
 
 from qiita_control_plane.backfill import wol_genome_repair
 from qiita_control_plane.backfill.wol_genome_repair import (
@@ -38,7 +39,7 @@ from qiita_control_plane.testing.db_seeds import (
     seed_user_principal,
 )
 from qiita_control_plane.testing.db_teardown import delete_principal, teardown_entity_graph
-from qiita_control_plane.testing.postgres import until_blocked_by
+from qiita_control_plane.testing.postgres import cancel_unfinished, until_blocked_by
 
 pytestmark = pytest.mark.db
 
@@ -749,11 +750,14 @@ async def test_the_accession_rules_match_the_derivation_check(world):
         "GCA_0000058250.1",
         "GCX_000005825.1",
         "gca_000005825.1",
+        "GCA_000005825.2x",
+        "xGCA_000005825.2",
+        "GCA_00000582512",
     ]
     async with w.pool.acquire() as conn, conn.transaction():
         for accession in candidates:
             read = re.fullmatch(wol_genome_repair._ACCESSION, accession) is not None
-            for source in ("genbank", "refseq"):
+            for source in GenomeSource:
                 expected = read and wol_genome_repair._PARENT_SOURCE[accession[:3]] == source
                 try:
                     async with conn.transaction():
@@ -776,7 +780,7 @@ async def test_the_accession_rules_match_the_derivation_check(world):
 
 
 class _Accepted(Exception):
-    """Rolls back the savepoint around an insert the CHECK accepted."""
+    """Rolls back the savepoint around an insert that the CHECK accepted."""
 
 
 async def test_refuses_metadata_without_the_columns_it_reads(world):
@@ -884,11 +888,12 @@ async def test_a_table_held_by_another_session_refuses_after_the_lock_timeout(wo
 
 async def test_the_repair_takes_the_reference_row_before_any_table(world, monkeypatch):
     """The reference delete holds the row and then deletes from the locked tables; the
-    repair must wait on the row holding no table, or the two deadlock."""
+    repair must wait on the row while it holds no table, or the two deadlock."""
     w = world
     await w.rc4_genome("A")
     plan = await _plan(w)
     monkeypatch.setattr(wol_genome_repair, "_LOCK_TIMEOUT", "10s")
+    repair = None
     async with w.pool.acquire() as delete:
         held = delete.transaction()
         await held.start()
@@ -902,7 +907,11 @@ async def test_the_repair_takes_the_reference_row_before_any_table(world, monkey
             )
             await asyncio.wait_for(until_blocked_by(w.pool, delete, repair), 10)
             assert not repair.done()
-            await delete.execute("LOCK TABLE qiita.feature_genome IN ROW EXCLUSIVE MODE NOWAIT")
+            tables = ", ".join(wol_genome_repair._LOCKED_TABLES)
+            await delete.execute(f"LOCK TABLE {tables} IN ROW EXCLUSIVE MODE NOWAIT")
+        except BaseException:
+            await cancel_unfinished(repair)
+            raise
         finally:
             await held.rollback()
     await repair
@@ -910,17 +919,25 @@ async def test_the_repair_takes_the_reference_row_before_any_table(world, monkey
 
 
 async def test_a_deadlock_while_locking_refuses_and_writes_nothing(world, monkeypatch):
-    """A session that holds one locked table and then asks for another the repair holds
-    deadlocks with it. Postgres aborts the repair, which says so and writes nothing."""
+    """A session that holds exported_feature, which the repair locks last, and then asks
+    for genome, which the repair has already locked, deadlocks with it. The repair says
+    so and writes nothing.
+
+    Postgres checks for a deadlock once per wait, after deadlock_timeout, and aborts the
+    session that finds the cycle. The other session's timeout is long, so the repair's
+    check finds it, provided the other session starts waiting within the repair's
+    deadlock_timeout (1 s by default); here it starts within milliseconds."""
     w = world
     await w.rc4_genome("A")
     plan = await _plan(w)
     before = await w.snapshot()
     monkeypatch.setattr(wol_genome_repair, "_LOCK_TIMEOUT", "10s")
+    repair = crossing = None
     async with w.pool.acquire() as other:
         held = other.transaction()
         await held.start()
         try:
+            await other.execute("SET LOCAL deadlock_timeout = '60s'")
             await other.execute("LOCK TABLE qiita.exported_feature IN ROW EXCLUSIVE MODE")
             repair = asyncio.create_task(
                 apply_repair(w.pool, plan, manifest_path=w.tmp_path / "manifest.csv")
@@ -933,14 +950,15 @@ async def test_a_deadlock_while_locking_refuses_and_writes_nothing(world, monkey
                 await asyncio.wait_for(repair, 10)
             await asyncio.wait_for(crossing, 10)
         finally:
+            await cancel_unfinished(repair, crossing)
             await held.rollback()
     assert await w.snapshot() == before
     assert list(w.tmp_path.glob("*manifest*")) == []
 
 
 async def test_the_repair_leaves_the_reference_row_open_to_other_updates(world, monkeypatch):
-    """The repair holds the reference row only against its delete, so a status change
-    to the reference does not wait for the whole run."""
+    """The repair holds the reference row only against a delete of the reference, so a
+    status change to the reference does not wait for the whole run."""
     w = world
     await w.rc4_genome("A")
     plan = await _plan(w)

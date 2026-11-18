@@ -119,7 +119,8 @@ _None yet._
      higher only if reference-18 tables were built since. Any other count, or `refused:`, means
      stop and raise the report.
   3. Execute, writing the manifest somewhere kept. It lists every row deleted and label retired,
-     and the run refuses to overwrite one.
+     and the run refuses to overwrite one. A `refused:` that names a lock timeout or a deadlock
+     wrote nothing: run it again.
   4. Dry-run again. Expect `0 GCA_G genome(s) to fold` and 196062 derivations present.
   5. Ask the builder of the reference-18 feature tables (principal 2, alignment 3; the reporter
      of #893) to rebuild them.

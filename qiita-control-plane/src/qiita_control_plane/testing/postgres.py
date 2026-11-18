@@ -3,15 +3,17 @@
 Exposes the connection-string resolver (with QIITA_TEST_POSTGRES_URL override),
 the session-scoped fixtures `postgres_url`, `_run_db_migrations`, and
 `postgres_pool`; `until_advisory_lock_awaited`, which waits for a session to
-block on an advisory lock; and `until_blocked_by`, which waits for one to block on
-a lock that a given connection holds. Migrations are run once per session via dbmate against the
-directory provided by the consumer's `migrations_dir` fixture — the consumer
-is responsible for declaring that fixture (each conftest.py walks the
-filesystem from its own location, which works regardless of how this package
-is installed).
+block on an advisory lock; `until_blocked_by`, which waits for one to block on
+a lock that a given connection holds; and `cancel_unfinished`, which reaps the
+tasks a failed concurrency test left running. Migrations are run once per
+session via dbmate against the directory provided by the consumer's
+`migrations_dir` fixture — the consumer is responsible for declaring that
+fixture (each conftest.py walks the filesystem from its own location, which
+works regardless of how this package is installed).
 """
 
 import asyncio
+import contextlib
 import os
 import shutil
 import subprocess
@@ -199,17 +201,16 @@ async def until_advisory_lock_awaited(
 
     `pg_locks` lists the whole server, and each xdist worker has its own database
     there with idx values that repeat, hence the database filter."""
-    while not task.done():
-        if await pool.fetchval(
-            "SELECT EXISTS (SELECT 1 FROM pg_locks"
-            " WHERE locktype = 'advisory' AND NOT granted"
-            "   AND database = (SELECT oid FROM pg_database WHERE datname = current_database())"
-            "   AND classid = $1 AND objid = $2 AND objsubid = 2)",
-            lock_class,
-            key,
-        ):
-            return
-        await asyncio.sleep(0.01)
+    await _until(
+        pool,
+        task,
+        "SELECT EXISTS (SELECT 1 FROM pg_locks"
+        " WHERE locktype = 'advisory' AND NOT granted"
+        "   AND database = (SELECT oid FROM pg_database WHERE datname = current_database())"
+        "   AND classid = $1 AND objid = $2 AND objsubid = 2)",
+        lock_class,
+        key,
+    )
 
 
 async def until_blocked_by(
@@ -219,11 +220,30 @@ async def until_blocked_by(
     table, any kind), or once `task` has ended without that happening; the caller then
     asserts on what the task did. Wrap it in `asyncio.wait_for`: a task that neither
     waits nor ends hangs here."""
-    blocker_pid = blocker.get_server_pid()
+    await _until(
+        pool,
+        task,
+        "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid)))",
+        blocker.get_server_pid(),
+    )
+
+
+async def _until(pool: asyncpg.Pool, task: asyncio.Task, query: str, *args) -> None:
+    """Poll `query` until it returns true or `task` ends."""
     while not task.done():
-        if await pool.fetchval(
-            "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid)))",
-            blocker_pid,
-        ):
+        if await pool.fetchval(query, *args):
             return
         await asyncio.sleep(0.01)
+
+
+async def cancel_unfinished(*tasks: asyncio.Task | None) -> None:
+    """Cancel and reap each task that a failed test left running, so it cannot write
+    during teardown and hide the failure. A task that already ended is only reaped;
+    None is skipped."""
+    for task in tasks:
+        if task is None:
+            continue
+        if not task.done():
+            task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await task

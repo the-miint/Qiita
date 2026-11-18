@@ -18,9 +18,9 @@
 - **A reference that asserts a genome derivation cannot be deleted, with or without
   `force` (#fix/wol3-genome-fold).** `DELETE /reference/{reference_idx}` answers `409` naming the count,
   before any step that writes. Its last check, just before the Postgres teardown, now
-  holds the reference row, so a derivation or a new work ticket written while the
-  delete runs makes it wait, keep its Postgres rows and answer 409, rather than fail on
-  the foreign key or lose the derivation.
+  holds the reference row: a derivation or a new work ticket still uncommitted at that
+  point makes the delete wait for it and then answer 409, leaving the reference's
+  Postgres rows in place, rather than fail on the foreign key or lose the derivation.
 - **Deleting genomes no longer scans `exported_feature` once per genome (#fix/wol3-genome-fold).** A
   plain index on `exported_feature.genome_idx` serves the foreign key's `SET NULL`
   lookup, which the partial live-genome index could not: deleting 196,062 genomes went

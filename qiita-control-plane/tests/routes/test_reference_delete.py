@@ -17,7 +17,7 @@ from qiita_common.api_paths import URL_REFERENCE_BY_IDX, URL_REFERENCE_PREFIX
 from qiita_control_plane.actions.reference import assert_reference_deletable
 from qiita_control_plane.backfill.wol_genome_repair import DERIVATION_METHOD
 from qiita_control_plane.testing.db_teardown import teardown_entity_graph
-from qiita_control_plane.testing.postgres import until_blocked_by
+from qiita_control_plane.testing.postgres import cancel_unfinished, until_blocked_by
 
 pytestmark = pytest.mark.db
 
@@ -618,16 +618,22 @@ async def test_delete_reference_waits_for_an_uncommitted_derivation_and_refuses(
     and then refuse, not tear down a reference the derivation's foreign key holds."""
     ref_idx = await _create_ref(client, f"del-racing-derivation-{uuid.uuid4()}")
     genome_idx = await _derivation_genome(postgres_pool)
+    delete = None
     try:
         async with postgres_pool.acquire() as writer:
             pending = writer.transaction()
             await pending.start()
-            await writer.execute(_INSERT_DERIVATION, genome_idx, ref_idx, DERIVATION_METHOD)
-            delete = asyncio.create_task(
-                client.delete(URL_REFERENCE_BY_IDX.format(reference_idx=ref_idx))
-            )
-            await asyncio.wait_for(until_blocked_by(postgres_pool, writer, delete), 10)
-            assert not delete.done(), "the delete must wait for the uncommitted derivation"
+            try:
+                await writer.execute(_INSERT_DERIVATION, genome_idx, ref_idx, DERIVATION_METHOD)
+                delete = asyncio.create_task(
+                    client.delete(URL_REFERENCE_BY_IDX.format(reference_idx=ref_idx))
+                )
+                await asyncio.wait_for(until_blocked_by(postgres_pool, writer, delete), 10)
+                assert not delete.done(), "the delete must wait for the uncommitted derivation"
+            except BaseException:
+                await cancel_unfinished(delete)
+                await pending.rollback()
+                raise
             await pending.commit()
             resp = await delete
         assert resp.status_code == 409, resp.text

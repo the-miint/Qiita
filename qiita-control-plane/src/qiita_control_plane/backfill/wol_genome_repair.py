@@ -34,8 +34,8 @@ rows, because a partial fold would leave tables that still split reads.
 
 **Retirement.** Delete this module, its CLI and their tests once every deployment has
 run it, which its dry run shows by finding no `GCA_G` genome and every derivation
-present. `DERIVATION_METHOD` and the tests that import it (the `genome_derivation` schema
-and reference-delete tests) move to whatever then writes derivations.
+present. `DERIVATION_METHOD`, and the tests outside this module's own that import it,
+move to whatever then writes derivations.
 """
 
 from __future__ import annotations
@@ -63,8 +63,7 @@ _WOL_SOURCE = GenomeSource.GENBANK
 _WOL_ID = "G[0-9]{9}"
 _GCA_G_ID = "GCA_G[0-9]{9}"
 # The accession shapes and the prefix -> archive pairing that the migration's
-# genome_derivation_parent_check also holds; test_the_accession_rules_match_the_derivation_check
-# pins the two together.
+# genome_derivation_parent_check also holds; a test fails if the two disagree.
 _ACCESSION = r"GC[AF]_[0-9]{9}\.[0-9]+"
 _PARENT_SOURCE = {"GCA": GenomeSource.GENBANK, "GCF": GenomeSource.REFSEQ}
 _METADATA_COLUMNS = ("genome_id", "assembly_accession")
@@ -671,16 +670,17 @@ async def _lock(conn: asyncpg.Connection, reference_idx: int) -> None:
     most `_LOCK_TIMEOUT` for either.
 
     The row comes first because the reference delete takes it first
-    (`assert_reference_deletable`) and then the tables, so the two wait on each other
-    rather than deadlock. A key-share lock is enough to make the delete wait, and it
-    leaves the row's other updates (a status change) free."""
+    (`assert_reference_deletable`) and then the tables, so whichever of the two comes
+    second waits for the first rather than deadlocking with it. A key-share lock is
+    enough to make the delete wait, and it leaves the row's other updates (a status
+    change) free."""
     await conn.execute(f"SET LOCAL lock_timeout = '{_LOCK_TIMEOUT}'")
     try:
         await _require_reference(conn, reference_idx, "key_share")
         await conn.execute(f"LOCK TABLE {', '.join(_LOCKED_TABLES)} IN SHARE ROW EXCLUSIVE MODE")
     except (asyncpg.LockNotAvailableError, asyncpg.DeadlockDetectedError) as exc:
         raise RepairRefused(
-            f"reference {reference_idx} or a table the repair locks is held by another"
+            f"reference {reference_idx} or a table that the repair locks is held by another"
             f" session ({exc}; the lock timeout is {_LOCK_TIMEOUT}). Nothing was written;"
             " run it again once that session has finished"
         ) from exc
