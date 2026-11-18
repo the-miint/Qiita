@@ -100,6 +100,26 @@ async def mint_sequence_range(
     )
 
 
+async def release_sequence_range_minted_by(
+    conn: asyncpg.Connection, *, prep_sample_idx: int, work_ticket_idx: int
+) -> bool:
+    """Delete `prep_sample_idx`'s range if `work_ticket_idx` minted it; True when one went.
+
+    For a range minted ahead of reads that were never stored. The allocation is not recycled.
+    """
+    require_transaction(conn)
+    await lock_prep_sample_range(conn, prep_sample_idx=prep_sample_idx)
+    return (
+        await conn.fetchval(
+            "DELETE FROM qiita.sequence_range"
+            " WHERE prep_sample_idx = $1 AND minted_by_work_ticket_idx = $2 RETURNING true",
+            prep_sample_idx,
+            work_ticket_idx,
+        )
+        is True
+    )
+
+
 async def fetch_sequence_range_by_prep_sample_idx(
     pool_or_conn: asyncpg.Pool | asyncpg.Connection,
     prep_sample_idx: int,

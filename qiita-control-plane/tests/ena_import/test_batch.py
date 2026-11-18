@@ -27,6 +27,7 @@ from qiita_common.models import (
 from qiita_common.models.ena_import import MAX_ENA_DOWNLOAD_RUN_CONCURRENCY, BatchItemState
 from qiita_common.work_ticket_constants import ENA_RUN_ACCESSIONS_KEY
 
+from qiita_control_plane.actions.library import persist_ena_run_outcomes
 from qiita_control_plane.auth.principal import HumanUser
 from qiita_control_plane.dispatch import build_dispatch_semaphore
 from qiita_control_plane.ena_import import (
@@ -3736,6 +3737,67 @@ async def test_completed_download_with_a_recorded_failure_reads_completed_partia
     assert by_run[bad_run].failure_type == failure_type
     assert by_run[ok_run].status == EnaRunRegistrationStatus.REGISTERED.value
     assert by_run[ok_run].failure_type is None
+
+    await _cleanup_study(postgres_pool, study)
+
+
+async def test_a_failed_run_whose_range_the_completed_ticket_minted_is_downloaded_again(
+    batch_app,
+    postgres_pool,
+    admin_principal,
+    download_ena_study_action,
+    batch_cleanup,
+    monkeypatch,
+    tmp_path,
+):
+    """An earlier attempt minted both ranges; the final attempt's fetch of one failed
+    retriably, and persisting that outcome releases its range."""
+    study = unique_ena_accession("PRJEB")
+    ok_run, bad_run = _runs(2)
+    _EnaWorld(monkeypatch, {study: [ok_run, bad_run]})
+    batch_idx, items = await _drive_accessions(
+        batch_app, postgres_pool, admin_principal, batch_cleanup, [study]
+    )
+    (ticket,) = await _item_ticket_idxs(postgres_pool, items[0].idx)
+    await _store_reads(postgres_pool, admin_principal, ok_run, work_ticket_idx=ticket)
+    await _store_reads(postgres_pool, admin_principal, bad_run, work_ticket_idx=ticket)
+    await _complete_download_tickets(postgres_pool, batch_idx)
+    bad_psi, pool_idx = await postgres_pool.fetchrow(
+        "SELECT prep_sample_idx, sequenced_pool_idx FROM qiita.sequenced_sample"
+        " WHERE ena_run_accession = $1",
+        bad_run,
+    )
+    outcomes = tmp_path / "run_outcomes.json"
+    outcomes.write_text(
+        json.dumps(
+            [
+                {
+                    "prep_sample_idx": bad_psi,
+                    "ena_run_accession": bad_run,
+                    "failure_reason": _NO_DATA_REASON,
+                    "failure_type": FailureType.RETRIABLE.value,
+                }
+            ]
+        )
+    )
+
+    await persist_ena_run_outcomes(postgres_pool, pool_idx, outcomes, work_ticket_idx=ticket)
+
+    (item,) = (await fetch_batch_status(postgres_pool, batch_idx=batch_idx)).items
+    assert item.state == BatchItemState.COMPLETED_PARTIAL
+    by_run = {r.run_accession: r.status for r in item.ena_runs}
+    assert by_run == {
+        ok_run: EnaRunRegistrationStatus.REGISTERED.value,
+        bad_run: EnaRunRegistrationStatus.DOWNLOAD_FAILED.value,
+    }
+    sample_idxs = await postgres_pool.fetch(
+        "SELECT idx FROM qiita.sequenced_sample WHERE ena_run_accession = ANY($1::text[])",
+        [ok_run, bad_run],
+    )
+    needing = await fetch_runs_needing_download(
+        postgres_pool, sequenced_sample_idxs=[r["idx"] for r in sample_idxs]
+    )
+    assert needing == {pool_idx: [bad_run]}
 
     await _cleanup_study(postgres_pool, study)
 

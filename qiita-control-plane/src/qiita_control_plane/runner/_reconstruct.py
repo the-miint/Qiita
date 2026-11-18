@@ -754,6 +754,7 @@ async def _run_action_primitive(
             ctx.pool,
             ctx.scope_target["sequenced_pool_idx"],
             Path(bound["run_outcomes"]),
+            work_ticket_idx=ctx.work_ticket_idx,
         )
         return {}
 
