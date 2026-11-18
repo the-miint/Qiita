@@ -82,8 +82,9 @@ and the other client sessions open now, against `max_connections` less the reser
 slots. It passes with the numbers and one `<host>:<port> pool=<n>` line per instance, marked
 `(no session open)` for a local instance the catalog server shows no session of, and fails
 when the total does not fit; what it counts, and why, is in
-`qiita_catalog_connection_budget` (`deploy/_common.sh`). An instance still running a build
-without the name counts only as the sessions it has open.
+`qiita_catalog_connection_budget` (`deploy/_common.sh`). Another host's instance still
+running a build without the name counts only as the sessions it has open; a local one
+counts at its configured pool as well.
 
 The row queries as the data plane's catalog role, the `user=` in
 `DUCKLAKE_CATALOG_CONNSTR`, which needs `pg_read_all_stats` to see other roles'

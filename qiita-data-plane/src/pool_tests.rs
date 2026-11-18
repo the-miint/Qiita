@@ -496,33 +496,89 @@ fn open_attaches_one_connection_and_the_rest_on_demand() {
     assert_eq!(one, 1);
 }
 
-/// A member's catalog attach is set never to close its backend for idleness —
-/// `KEEP_CATALOG_BACKEND`, read back from the attached catalog's own pool, where
-/// a setting applied too late (after the ATTACH) does not reach.
-/// `__ducklake_metadata_<alias>` is the name DuckLake gives the catalog database it
-/// attaches.
+/// A pool member's catalog backend stays open while the member sits idle
+/// (`KEEP_CATALOG_BACKEND`). Two halves, because a short wait cannot tell the
+/// setting from the 60 s default: the member's catalog pool reports no idle limit
+/// (which fails if the setting is not applied, or applied after the ATTACH), and
+/// over a 4 s wait its backend stays open while a control ATTACH with a 1 s limit
+/// is closed (which fails if `0` stops meaning no limit).
+/// `__ducklake_metadata_<alias>` is the name DuckLake gives the catalog database
+/// it attaches.
 #[test]
 #[cfg(feature = "integration")]
 #[serial_test::serial]
-fn a_members_catalog_backend_is_never_closed_for_idleness() {
+fn a_members_catalog_backend_outlives_an_idle_timeout() {
+    use crate::ducklake::{catalog_application_name, connect_ducklake, tag_catalog_connstr};
+    // A port derived from the process id, so concurrent test processes against one
+    // catalog are unlikely to share a session name.
+    let port = 1 + (std::process::id() % 60000) as u16;
+    let base = crate::test_catalog::connstr();
+    let data_path = crate::test_catalog::data_path();
+
+    let observer = Connection::open_in_memory().unwrap();
+    observer
+        .execute_batch(&format!(
+            "LOAD postgres; ATTACH '{base}' AS observer (TYPE postgres);"
+        ))
+        .unwrap();
+    let sessions = |pool_size: usize| -> i64 {
+        let name = catalog_application_name(port, pool_size);
+        observer
+            .query_row(
+                &format!(
+                    "SELECT n FROM postgres_query('observer', \
+                     'SELECT count(*) AS n FROM pg_stat_activity \
+                      WHERE application_name = ''{name}''')"
+                ),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+
     let tmp = tempfile::tempdir().unwrap();
     let pool = LakePool::open(
-        crate::test_catalog::connstr(),
-        crate::test_catalog::data_path(),
+        tag_catalog_connstr(&base, port, 1).unwrap(),
+        data_path.clone(),
         PoolSettings::for_tests(1, tmp.path().to_path_buf()),
     )
     .expect("open a pool against the test catalog");
-    let member = pool.checkout().expect("the attached connection");
-    let (idle_timeout, reaper): (u64, bool) = member
-        .query_row(
-            "SELECT idle_timeout_millis, reaper_thread_running \
-             FROM postgres_configure_pool(catalog_name='__ducklake_metadata_qiita_lake')",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .expect("read the catalog attach's pool settings");
-    assert_eq!(idle_timeout, 0, "no idle limit on the catalog backend");
-    assert!(!reaper, "no reaper thread to close it");
+    {
+        let member = pool.checkout().expect("the attached connection");
+        let idle_timeout: u64 = member
+            .query_row(
+                "SELECT idle_timeout_millis \
+                 FROM postgres_configure_pool(catalog_name='__ducklake_metadata_qiita_lake')",
+                [],
+                |r| r.get(0),
+            )
+            .expect("read the catalog attach's pool settings");
+        assert_eq!(
+            idle_timeout, 0,
+            "no idle limit on the member's catalog backend"
+        );
+    }
+
+    let control = Connection::open_in_memory().unwrap();
+    control
+        .execute_batch("LOAD postgres; SET pg_pool_idle_timeout_millis=1000;")
+        .unwrap();
+    connect_ducklake(
+        &control,
+        &tag_catalog_connstr(&base, port, 2).unwrap(),
+        &data_path,
+    )
+    .unwrap();
+    assert!(sessions(1) >= 1, "the member's backend, before the wait");
+    assert!(sessions(2) >= 1, "the control's backend, before the wait");
+
+    std::thread::sleep(std::time::Duration::from_secs(4));
+    assert_eq!(
+        sessions(2),
+        0,
+        "the control's backend was closed for idleness"
+    );
+    assert!(sessions(1) >= 1, "the member's backend is still open");
 }
 
 #[test]

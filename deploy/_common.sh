@@ -1307,16 +1307,18 @@ wait_for_data_plane_idle() {
 #   Σ those sums + the other client backends connected now
 #     > max_connections − superuser_reserved_connections − reserved_connections,
 # the slots a role without those privileges can take. Other backends — lake-gc,
-# lake-shell, a data plane still on a build without the name — count as they are
-# now, not at their peak.
+# lake-shell, another host's data plane still on a build without the name — count
+# as they are now, not at their peak.
 #
 # This host's instances count whether or not a session of theirs is open now:
 # one per QIITA_DATA_PLANE_PORTS entry, at DUCKLAKE_POOL_SIZE plus the lock
 # sessions, the sum the data plane writes into its name. A session of one of them
-# is recognised by its port and by the client address Postgres shows for the
+# is recognized by its port and by the client address Postgres shows for the
 # check's own session, which connects from this host with the same connection
 # string; an instance seen at another address counts once more, as a peer would.
-# An instance on another host counts only while one of its sessions is open.
+# An instance on another host counts only while one of its sessions is open. A
+# local instance still on a build without the name counts twice, at its
+# configured pool and as the sessions it has open, which errs toward failing.
 #
 # The query connects with the data plane's own role, the user= in
 # DUCKLAKE_CATALOG_CONNSTR. Postgres shows a role the client_addr and

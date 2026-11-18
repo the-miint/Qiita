@@ -571,13 +571,10 @@ impl Drop for PooledConnection {
 /// stays open for as long as the member does. DuckDB's postgres extension pools
 /// its connections per attached database and closes one left idle for
 /// `pg_pool_idle_timeout_millis` (default 60 s); `0` turns that limit and the
-/// reaper thread off. The setting is read at ATTACH only. Measured on DuckDB 2.0.0
-/// against Postgres 16: set before the ATTACH, `postgres_configure_pool` reports
-/// `idle_timeout_millis` 0 and no reaper, and the backend's pid was unchanged
-/// after 150 s idle and after the next query; set after it, the pool kept 60000
-/// and the backend was gone by 90 s. `qiita_catalog_connection_budget` in
-/// `deploy/_common.sh` counts each member as one backend for its whole life.
-/// `LOAD postgres` first, because the setting is the extension's.
+/// reaper thread off. The setting is read at ATTACH only: measured on DuckDB 2.0.0
+/// against Postgres 16, set after the ATTACH, the pool kept 60000 and the backend
+/// was gone by 90 s. `a_members_catalog_backend_outlives_an_idle_timeout` pins the
+/// retention. `LOAD postgres` first, because the setting is the extension's.
 const KEEP_CATALOG_BACKEND: &str = "LOAD postgres; SET pg_pool_idle_timeout_millis=0;";
 
 /// What a lake write runs at, for the length of its borrow; the reset on return

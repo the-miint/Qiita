@@ -147,7 +147,7 @@ pub fn connect_ducklake(
 /// The libpq `application_name` an instance gives every connection it opens to the
 /// catalog, read back by `qiita_catalog_connection_budget` in `deploy/_common.sh`.
 /// Unquoted with no spaces: a quoted value closes the ATTACH string literal.
-fn catalog_application_name(port: u16, pool_size: usize) -> String {
+pub(crate) fn catalog_application_name(port: u16, pool_size: usize) -> String {
     format!("qiita-data-plane:{port}:pool={pool_size}")
 }
 
