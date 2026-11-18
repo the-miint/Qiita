@@ -11,3 +11,8 @@
   session of it now, and no longer fails when no instance has a session open. An
   instance with no session is listed as `(no session open)`. Instances on other hosts
   still count only while one of their sessions is open.
+- **`verify-deploy`'s `health/data-plane-lb` row passes against the shipped nginx config
+  (#TBD).** nginx's loopback listener now routes gRPC server reflection
+  (`grpc.reflection.v1` and `v1alpha`) to the data plane, which `grpcurl` calls before a
+  `Health/Check` when it has no proto file. Any on-host client of the listener can now
+  list the data plane's services through it; the 443 edge does not route reflection.

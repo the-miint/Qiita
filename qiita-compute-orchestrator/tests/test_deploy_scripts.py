@@ -600,6 +600,21 @@ def test_render_fills_every_placeholder(tmp_path: Path) -> None:
     assert f"listen 127.0.0.1:{_lb_port()};" in text
 
 
+def test_render_routes_reflection_on_the_loopback_listener_only(tmp_path: Path) -> None:
+    """verify.sh's health/data-plane-lb row runs grpcurl without a proto, which calls
+    reflection first; the loopback listener routes it to the upstream, the 443 edge
+    does not."""
+    result, dest = _render(tmp_path)
+    assert result.returncode == 0, result.stderr
+    text = dest.read_text()
+    loopback_at = text.index(f"listen 127.0.0.1:{_lb_port()};")
+    edge, loopback = text[:loopback_at], text[loopback_at:]
+    for version in ("v1", "v1alpha"):
+        location = f"location /grpc.reflection.{version}.ServerReflection/ {{\n"
+        assert location + "        grpc_pass grpc://qiita_data_plane;" in loopback, version
+        assert location not in edge, version
+
+
 def test_render_places_local_members_at_the_bind_host_then_peers(tmp_path: Path) -> None:
     """Local instances at the bind host, then peers verbatim, read back through the
     same parser verify.sh uses."""
