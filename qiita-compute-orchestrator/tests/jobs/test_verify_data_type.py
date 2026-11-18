@@ -75,7 +75,7 @@ def test_amplicon_verdict_table(protocol, by_class, severity, reason, measured, 
 
 
 def test_amplicon_top_class_at_exactly_ninety_percent_is_not_a_fail():
-    """477/530 is exactly 0.9 but 477/1000 / (530/1000) is 0.8999999999999999 in floats."""
+    """477/530 is exactly 0.9 and grades info; 476/530 is below it and fails."""
     counts = _counts(marker_16s=477, marker_18s=53)
     verdict = _verdict("long_read_amplicon", 1000, counts)
     assert (verdict.severity, verdict.reason) == (QcSeverity.INFO, None)
@@ -132,7 +132,6 @@ def test_an_unregistered_protocol_raises_even_with_few_reads():
 
 
 def test_sample_order_is_md5_of_the_sequence_idx():
-    """md5 is fixed across DuckDB versions; hash() is not."""
     with duckdb.connect(":memory:") as conn:
         conn.execute(
             "CREATE TABLE r AS SELECT i::BIGINT AS sequence_idx, 'A' AS sequence1"
