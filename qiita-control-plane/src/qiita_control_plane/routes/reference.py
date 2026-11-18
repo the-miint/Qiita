@@ -859,7 +859,7 @@ async def delete_reference(
     # in-flight, a derivation committed) must abort the teardown (and 409 loudly)
     # rather than be silently deleted by the cascade. force=True here because
     # terminal tickets are still the cascade's to delete; every other blocker
-    # aborts. `hold` keeps a writer from adding one between the gate and the cascade.
+    # aborts. `hold`: `assert_reference_deletable` says which writers it holds out.
     async with tx() as conn:
         try:
             await assert_reference_deletable(conn, reference_idx, force=True, hold=True)

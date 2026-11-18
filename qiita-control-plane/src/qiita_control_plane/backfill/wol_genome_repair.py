@@ -34,7 +34,8 @@ rows, because a partial fold would leave tables that still split reads.
 
 **Retirement.** Delete this module, its CLI and their tests once every deployment has
 run it, which its dry run shows by finding no `GCA_G` genome and every derivation
-present.
+present. `DERIVATION_METHOD` and the tests that import it (the `genome_derivation` schema
+and reference-delete tests) move to whatever then writes derivations.
 """
 
 from __future__ import annotations
@@ -52,6 +53,7 @@ from qiita_common.models.reference import GenomeSource
 
 from ..actions.library import upsert_genomes
 from ..delimited_text import read_headed_tsv
+from ..repositories import RowLock, row_lock_clause
 
 DERIVATION_METHOD = "wol_concatenated"
 
@@ -61,8 +63,8 @@ _WOL_SOURCE = GenomeSource.GENBANK
 _WOL_ID = "G[0-9]{9}"
 _GCA_G_ID = "GCA_G[0-9]{9}"
 # The accession shapes and the prefix -> archive pairing that the migration's
-# genome_derivation_parent_check also holds; recording a derivation of each archive
-# (the tests do) fails if the two drift apart.
+# genome_derivation_parent_check also holds; test_the_accession_rules_match_the_derivation_check
+# pins the two together.
 _ACCESSION = r"GC[AF]_[0-9]{9}\.[0-9]+"
 _PARENT_SOURCE = {"GCA": GenomeSource.GENBANK, "GCF": GenomeSource.REFSEQ}
 _METADATA_COLUMNS = ("genome_id", "assembly_accession")
@@ -244,10 +246,12 @@ def read_parents(metadata_path: Path) -> tuple[Parent, ...]:
 # --- the survey: what the fold touches, and every precondition -------------------------
 
 
-async def _require_reference(conn: asyncpg.Connection, reference_idx: int, *, hold: bool) -> None:
-    lock = " FOR SHARE" if hold else ""
+async def _require_reference(
+    conn: asyncpg.Connection, reference_idx: int, lock: RowLock | None
+) -> None:
     found = await conn.fetchval(
-        f"SELECT 1 FROM qiita.reference WHERE reference_idx = $1{lock}", reference_idx
+        f"SELECT 1 FROM qiita.reference WHERE reference_idx = $1{row_lock_clause(conn, lock)}",
+        reference_idx,
     )
     if found is None:
         raise RepairRefused(f"reference {reference_idx} does not exist")
@@ -490,7 +494,7 @@ async def plan_repair(pool: asyncpg.Pool, *, reference_idx: int, metadata_path: 
     """Check every precondition and count what an apply would do. Writes nothing."""
     parents = read_parents(metadata_path)
     async with pool.acquire() as conn, conn.transaction(isolation="repeatable_read", readonly=True):
-        await _require_reference(conn, reference_idx, hold=False)
+        await _require_reference(conn, reference_idx, None)
         survey = await _survey(conn, reference_idx, parents)
     if survey.problems:
         raise RepairRefused(_refusal(reference_idx, survey.problems))
@@ -668,16 +672,17 @@ async def _lock(conn: asyncpg.Connection, reference_idx: int) -> None:
 
     The row comes first because the reference delete takes it first
     (`assert_reference_deletable`) and then the tables, so the two wait on each other
-    rather than deadlock."""
+    rather than deadlock. A key-share lock is enough to make the delete wait, and it
+    leaves the row's other updates (a status change) free."""
     await conn.execute(f"SET LOCAL lock_timeout = '{_LOCK_TIMEOUT}'")
     try:
-        await _require_reference(conn, reference_idx, hold=True)
+        await _require_reference(conn, reference_idx, "key_share")
         await conn.execute(f"LOCK TABLE {', '.join(_LOCKED_TABLES)} IN SHARE ROW EXCLUSIVE MODE")
-    except asyncpg.LockNotAvailableError as exc:
+    except (asyncpg.LockNotAvailableError, asyncpg.DeadlockDetectedError) as exc:
         raise RepairRefused(
-            f"reference {reference_idx} or a table the repair locks was still held by another"
-            f" session after the {_LOCK_TIMEOUT} lock timeout; run it again once that"
-            " session has finished"
+            f"reference {reference_idx} or a table the repair locks is held by another"
+            f" session ({exc}; the lock timeout is {_LOCK_TIMEOUT}). Nothing was written;"
+            " run it again once that session has finished"
         ) from exc
 
 

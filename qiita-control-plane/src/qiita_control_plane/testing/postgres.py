@@ -2,8 +2,9 @@
 
 Exposes the connection-string resolver (with QIITA_TEST_POSTGRES_URL override),
 the session-scoped fixtures `postgres_url`, `_run_db_migrations`, and
-`postgres_pool`, and `until_advisory_lock_awaited`, which waits for a session to
-block on an advisory lock. Migrations are run once per session via dbmate against the
+`postgres_pool`; `until_advisory_lock_awaited`, which waits for a session to
+block on an advisory lock; and `until_blocked_by`, which waits for one to block on
+a lock that a given connection holds. Migrations are run once per session via dbmate against the
 directory provided by the consumer's `migrations_dir` fixture — the consumer
 is responsible for declaring that fixture (each conftest.py walks the
 filesystem from its own location, which works regardless of how this package
@@ -206,6 +207,23 @@ async def until_advisory_lock_awaited(
             "   AND classid = $1 AND objid = $2 AND objsubid = 2)",
             lock_class,
             key,
+        ):
+            return
+        await asyncio.sleep(0.01)
+
+
+async def until_blocked_by(
+    pool: asyncpg.Pool, blocker: asyncpg.Connection, task: asyncio.Task
+) -> None:
+    """Return once some session is waiting on a lock that `blocker` holds (a row, a
+    table, any kind), or once `task` has ended without that happening; the caller then
+    asserts on what the task did. Wrap it in `asyncio.wait_for`: a task that neither
+    waits nor ends hangs here."""
+    blocker_pid = blocker.get_server_pid()
+    while not task.done():
+        if await pool.fetchval(
+            "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid)))",
+            blocker_pid,
         ):
             return
         await asyncio.sleep(0.01)

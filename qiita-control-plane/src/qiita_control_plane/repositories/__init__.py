@@ -21,11 +21,12 @@ UpdatableTable = Literal[
     "qiita.study",
 ]
 
-RowLock = Literal["update", "share"]
+RowLock = Literal["update", "share", "key_share"]
 
 _ROW_LOCK_CLAUSES: dict[RowLock, str] = {
     "update": " FOR UPDATE",
     "share": " FOR SHARE",
+    "key_share": " FOR KEY SHARE",
 }
 
 ExistsEntity = Literal["study", "sequencing_run", "prep_sample", "biosample"]

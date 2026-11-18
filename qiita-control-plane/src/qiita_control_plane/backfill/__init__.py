@@ -27,6 +27,6 @@ Every backfill in here must be:
 
 **Retirement.** A backfill is done when its residue is empty and no new rows can
 arrive without the field, or, for one that refuses rather than leave residue, when it
-has run on every deployment. Delete it then; it is not load-bearing and nothing
-imports it but its CLI entry point.
+has run on every deployment. Delete it then: nothing in the service imports it, only
+its CLI entry point and tests.
 """

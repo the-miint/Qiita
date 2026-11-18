@@ -14,8 +14,10 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 from qiita_common.api_paths import URL_REFERENCE_BY_IDX, URL_REFERENCE_PREFIX
 
+from qiita_control_plane.actions.reference import assert_reference_deletable
 from qiita_control_plane.backfill.wol_genome_repair import DERIVATION_METHOD
 from qiita_control_plane.testing.db_teardown import teardown_entity_graph
+from qiita_control_plane.testing.postgres import until_blocked_by
 
 pytestmark = pytest.mark.db
 
@@ -624,7 +626,7 @@ async def test_delete_reference_waits_for_an_uncommitted_derivation_and_refuses(
             delete = asyncio.create_task(
                 client.delete(URL_REFERENCE_BY_IDX.format(reference_idx=ref_idx))
             )
-            await asyncio.sleep(0.5)
+            await asyncio.wait_for(until_blocked_by(postgres_pool, writer, delete), 10)
             assert not delete.done(), "the delete must wait for the uncommitted derivation"
             await pending.commit()
             resp = await delete
@@ -639,6 +641,17 @@ async def test_delete_reference_waits_for_an_uncommitted_derivation_and_refuses(
         )
     finally:
         await postgres_pool.execute("DELETE FROM qiita.genome WHERE genome_idx = $1", genome_idx)
+
+
+async def test_holding_the_reference_needs_a_transaction(client, postgres_pool):
+    """A row lock taken on a pool, or outside a transaction, ends with its statement, so
+    the hold would hold nothing."""
+    ref_idx = await _create_ref(client, f"del-hold-{uuid.uuid4()}")
+    with pytest.raises(RuntimeError, match="transaction"):
+        await assert_reference_deletable(postgres_pool, ref_idx, force=False, hold=True)
+    async with postgres_pool.acquire() as conn:
+        with pytest.raises(RuntimeError, match="transaction"):
+            await assert_reference_deletable(conn, ref_idx, force=False, hold=True)
 
 
 async def test_delete_reference_blocked_by_inflight_ticket(client, postgres_pool):

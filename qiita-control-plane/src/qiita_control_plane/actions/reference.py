@@ -17,6 +17,8 @@ from qiita_common.models import (
     ReferenceStatus,
 )
 
+from ..repositories import row_lock_clause
+
 # Column projection backing every ReferenceResponse. Imported by
 # routes/reference.py too, so the two callers can't drift (they previously
 # kept hand-synced copies).
@@ -124,12 +126,14 @@ async def assert_reference_deletable(
     (both always, even with force). Run this
     *before* any destructive step so a blocked delete touches nothing.
 
-    `hold=True`, inside the caller's transaction, locks the reference row until that
-    transaction ends. A writer that adds a blocker through a foreign key to the row (a
-    work ticket, a genome derivation) takes a key-share lock on it: one that has not
+    `hold=True` locks the reference row until the caller's transaction ends, which must
+    be a READ COMMITTED one (under REPEATABLE READ the counts after the wait would not
+    see what the wait was for). An INSERT of a row whose foreign key names the reference
+    (a work ticket, a genome derivation) takes a key-share lock on it: one that has not
     committed yet makes this wait and then count its row, and one that starts later
-    waits for the delete."""
-    lock = " FOR UPDATE" if hold else ""
+    waits for the delete. A write that leaves no such lock is not held out: a change to
+    an existing ticket's state, or an alignment definition, whose reference is JSON."""
+    lock = row_lock_clause(conn, "update" if hold else None)
     status = await conn.fetchval(
         f"SELECT status FROM qiita.reference WHERE reference_idx = $1{lock}", reference_idx
     )

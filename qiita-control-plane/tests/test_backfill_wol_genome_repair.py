@@ -11,7 +11,9 @@ The repair acts on every `GCA_G` genome in the database, so each test starts fro
 none and its fixture removes everything it seeded, and everything the repair minted.
 """
 
+import asyncio
 import csv
+import re
 import secrets
 import uuid
 from pathlib import Path
@@ -36,6 +38,7 @@ from qiita_control_plane.testing.db_seeds import (
     seed_user_principal,
 )
 from qiita_control_plane.testing.db_teardown import delete_principal, teardown_entity_graph
+from qiita_control_plane.testing.postgres import until_blocked_by
 
 pytestmark = pytest.mark.db
 
@@ -576,8 +579,9 @@ async def test_a_commit_that_does_not_complete_keeps_the_partial_manifest(world,
 
 async def test_a_manifest_that_appears_during_the_run_is_not_overwritten(world, monkeypatch):
     """The manifest path is checked before the run, but another run given the same path
-    can create it while this one waits on the lock. The rename must not replace it: the
-    repair still commits, and its own manifest stays at the partial name."""
+    can create it while this one waits on the lock. Moving this run's manifest into place
+    must not replace it: the repair still commits, and its own manifest stays at the
+    partial name."""
     w = world
     await w.rc4_genome("A")
     plan = await _plan(w)
@@ -731,6 +735,50 @@ async def test_refuses_malformed_metadata(world, mutate, offender):
     await _assert_refused(w, offender(rows), w.metadata(mutate(rows), name="bad.txt"))
 
 
+async def test_the_accession_rules_match_the_derivation_check(world):
+    """The repair's accession pattern and prefix -> archive pairing accept exactly the
+    (archive, accession) pairs that genome_derivation_parent_check accepts."""
+    w = world
+    genome_idx = await w.genome(w.wol_id())
+    candidates = [
+        "GCA_000005825.2",
+        "GCF_000005825.2",
+        "GCA_000005825.12",
+        "GCA_000005825",
+        "GCF_00000582.1",
+        "GCA_0000058250.1",
+        "GCX_000005825.1",
+        "gca_000005825.1",
+    ]
+    async with w.pool.acquire() as conn, conn.transaction():
+        for accession in candidates:
+            read = re.fullmatch(wol_genome_repair._ACCESSION, accession) is not None
+            for source in ("genbank", "refseq"):
+                expected = read and wol_genome_repair._PARENT_SOURCE[accession[:3]] == source
+                try:
+                    async with conn.transaction():
+                        await conn.execute(
+                            "INSERT INTO qiita.genome_derivation (genome_idx, parent_source,"
+                            " parent_source_id, method, asserted_by_reference_idx)"
+                            " VALUES ($1, $2, $3, $4, $5)",
+                            genome_idx,
+                            source,
+                            accession,
+                            DERIVATION_METHOD,
+                            w.reference_idx,
+                        )
+                        raise _Accepted
+                except _Accepted:
+                    checked = True
+                except asyncpg.CheckViolationError:
+                    checked = False
+                assert checked == expected, (source, accession)
+
+
+class _Accepted(Exception):
+    """Rolls back the savepoint around an insert the CHECK accepted."""
+
+
 async def test_refuses_metadata_without_the_columns_it_reads(world):
     w = world
     await w.rc4_genome("A")
@@ -832,6 +880,93 @@ async def test_a_table_held_by_another_session_refuses_after_the_lock_timeout(wo
         a["g"],
         w.owner_idx,
     )
+
+
+async def test_the_repair_takes_the_reference_row_before_any_table(world, monkeypatch):
+    """The reference delete holds the row and then deletes from the locked tables; the
+    repair must wait on the row holding no table, or the two deadlock."""
+    w = world
+    await w.rc4_genome("A")
+    plan = await _plan(w)
+    monkeypatch.setattr(wol_genome_repair, "_LOCK_TIMEOUT", "10s")
+    async with w.pool.acquire() as delete:
+        held = delete.transaction()
+        await held.start()
+        try:
+            await delete.execute(
+                "SELECT 1 FROM qiita.reference WHERE reference_idx = $1 FOR UPDATE",
+                w.reference_idx,
+            )
+            repair = asyncio.create_task(
+                apply_repair(w.pool, plan, manifest_path=w.tmp_path / "manifest.csv")
+            )
+            await asyncio.wait_for(until_blocked_by(w.pool, delete, repair), 10)
+            assert not repair.done()
+            await delete.execute("LOCK TABLE qiita.feature_genome IN ROW EXCLUSIVE MODE NOWAIT")
+        finally:
+            await held.rollback()
+    await repair
+    assert await w.pool.fetchval(_GCA_G_ROWS) == 0
+
+
+async def test_a_deadlock_while_locking_refuses_and_writes_nothing(world, monkeypatch):
+    """A session that holds one locked table and then asks for another the repair holds
+    deadlocks with it. Postgres aborts the repair, which says so and writes nothing."""
+    w = world
+    await w.rc4_genome("A")
+    plan = await _plan(w)
+    before = await w.snapshot()
+    monkeypatch.setattr(wol_genome_repair, "_LOCK_TIMEOUT", "10s")
+    async with w.pool.acquire() as other:
+        held = other.transaction()
+        await held.start()
+        try:
+            await other.execute("LOCK TABLE qiita.exported_feature IN ROW EXCLUSIVE MODE")
+            repair = asyncio.create_task(
+                apply_repair(w.pool, plan, manifest_path=w.tmp_path / "manifest.csv")
+            )
+            await asyncio.wait_for(until_blocked_by(w.pool, other, repair), 10)
+            crossing = asyncio.create_task(
+                other.execute("LOCK TABLE qiita.genome IN ROW EXCLUSIVE MODE")
+            )
+            with pytest.raises(RepairRefused, match="deadlock"):
+                await asyncio.wait_for(repair, 10)
+            await asyncio.wait_for(crossing, 10)
+        finally:
+            await held.rollback()
+    assert await w.snapshot() == before
+    assert list(w.tmp_path.glob("*manifest*")) == []
+
+
+async def test_the_repair_leaves_the_reference_row_open_to_other_updates(world, monkeypatch):
+    """The repair holds the reference row only against its delete, so a status change
+    to the reference does not wait for the whole run."""
+    w = world
+    await w.rc4_genome("A")
+    plan = await _plan(w)
+    paused, release = asyncio.Event(), asyncio.Event()
+    real = wol_genome_repair._postcondition_problems
+
+    async def _pause(conn, reference_idx, parents):
+        paused.set()
+        await release.wait()
+        return await real(conn, reference_idx, parents)
+
+    monkeypatch.setattr(wol_genome_repair, "_postcondition_problems", _pause)
+    repair = asyncio.create_task(
+        apply_repair(w.pool, plan, manifest_path=w.tmp_path / "manifest.csv")
+    )
+    try:
+        await asyncio.wait_for(paused.wait(), 10)
+        async with w.pool.acquire() as other, other.transaction():
+            await other.execute("SET LOCAL lock_timeout = '500ms'")
+            await other.execute(
+                "UPDATE qiita.reference SET status = status WHERE reference_idx = $1",
+                w.reference_idx,
+            )
+    finally:
+        release.set()
+        await repair
 
 
 async def test_a_reference_held_by_a_delete_refuses_after_the_lock_timeout(world, monkeypatch):
