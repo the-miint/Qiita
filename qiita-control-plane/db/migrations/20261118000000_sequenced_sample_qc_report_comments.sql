@@ -1,11 +1,10 @@
 -- migrate:up
 
--- Comment-only: the columns' writers changed since they were described. Raw is
--- written by every run that persists it; filtered by none.
+-- Comment-only.
 COMMENT ON COLUMN qiita.sequenced_sample.raw_qc_report IS
   'fastqc-equivalent qc_report.json for the RAW reads (the fastq output, before '
   'qc trims/filters). Written by the persist-qc-report primitive from the '
-  'qc_report_raw step sidecar. NULL for a prep_sample no run has persisted it for.';
+  'qc_report_raw step sidecar. NULL until a run persists the raw report for this sequenced_sample.';
 COMMENT ON COLUMN qiita.sequenced_sample.filtered_qc_report IS
   'fastqc-equivalent qc_report.json for the host-filtered reads, from a '
   'qc_report_filtered step sidecar. NULL when the workflow that last wrote the row '
