@@ -111,13 +111,13 @@ async def assert_reference_deletable(
     *,
     force: bool,
 ) -> str:
-    """Existence + work-ticket gating precheck for a reference delete.
+    """Existence + gating precheck for a reference delete.
 
-    Returns the reference's current status on success. Raises
-    ReferenceNotFound if it doesn't exist, or ReferenceDeleteBlocked if work
-    tickets reference it (in-flight always; terminal unless force) or if any
-    alignment definition aligns against it (always, even with force). Run this
-    *before* any destructive step so a blocked delete touches nothing."""
+    Returns the reference's current status on success. Raises ReferenceNotFound if it
+    doesn't exist, or ReferenceDeleteBlocked if work tickets reference it (by `reference_idx`
+    or an `action_context` marker key: in-flight always, terminal unless force), if a
+    data_type QC check names it (unless force), or if any alignment definition aligns against
+    it (always). Run this *before* any destructive step so a blocked delete touches nothing."""
     status = await conn.fetchval(
         "SELECT status FROM qiita.reference WHERE reference_idx = $1", reference_idx
     )

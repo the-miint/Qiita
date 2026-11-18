@@ -71,8 +71,8 @@ qiita --base-url https://<host> ticket submit \
     "marker_23s_28s_reference_idx": <c>, "marker_5s_5_8s_reference_idx": <d>}'
 ```
 
-The runner reads the protocol from the prep_sample; a protocol with no threshold fails the
-ticket. Read the result from `GET /qc-check/{prep_sample_idx}`: the `data_type` row's
+The runner reads the protocol from the prep_sample; submission refuses a protocol with no
+threshold (BAD_INPUT). Read the result from `GET /qc-check/{prep_sample_idx}`: the `data_type` row's
 `metrics.marker_reference_idx` records which references were used. A re-run replaces the
 row. A prep_sample whose stored reads are all empty ends `no_data` and writes nothing. One
 with no stored reads ends `no_data` only when an ingest found it empty or it is an
