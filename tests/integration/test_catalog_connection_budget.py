@@ -1,8 +1,8 @@
 """The catalog-connections queries in `deploy/_common.sh`, run against the test
 Postgres as a role with and without `pg_read_all_stats`.
 
-`qiita_catalog_connection_budget` reads the settings row's grant flag and the
-backends rows, and `wait_for_data_plane_idle` the idle count; these pin what
+`qiita_catalog_connection_budget` reads the settings row's grant flag and own
+client address and the backends rows, and `wait_for_data_plane_idle` the idle count; these pin what
 Postgres returns to each query on either side of the grant. The roles are created
 once for the module, under a random suffix, and dropped after the probe.
 """
@@ -123,6 +123,9 @@ def test_catalog_queries_see_other_roles_sessions_only_with_pg_read_all_stats(
     assert host not in ("", "local"), rows[0]
     assert count == 1
     assert appname == "budget-other"
+    # The check's own address, which it takes for this host's, is the one another
+    # session from the same host is shown at.
+    assert settings[5] == host
 
 
 def test_idle_wait_does_not_count_another_roles_open_transaction(

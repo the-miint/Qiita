@@ -496,6 +496,35 @@ fn open_attaches_one_connection_and_the_rest_on_demand() {
     assert_eq!(one, 1);
 }
 
+/// A member's catalog attach is set never to close its backend for idleness —
+/// `KEEP_CATALOG_BACKEND`, read back from the attached catalog's own pool, where
+/// a setting applied too late (after the ATTACH) does not reach.
+/// `__ducklake_metadata_<alias>` is the name DuckLake gives the catalog database it
+/// attaches.
+#[test]
+#[cfg(feature = "integration")]
+#[serial_test::serial]
+fn a_members_catalog_backend_is_never_closed_for_idleness() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pool = LakePool::open(
+        crate::test_catalog::connstr(),
+        crate::test_catalog::data_path(),
+        PoolSettings::for_tests(1, tmp.path().to_path_buf()),
+    )
+    .expect("open a pool against the test catalog");
+    let member = pool.checkout().expect("the attached connection");
+    let (idle_timeout, reaper): (u64, bool) = member
+        .query_row(
+            "SELECT idle_timeout_millis, reaper_thread_running \
+             FROM postgres_configure_pool(catalog_name='__ducklake_metadata_qiita_lake')",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("read the catalog attach's pool settings");
+    assert_eq!(idle_timeout, 0, "no idle limit on the catalog backend");
+    assert!(!reaper, "no reaper thread to close it");
+}
+
 #[test]
 fn a_lake_write_runs_ordered_on_one_thread_and_the_baseline_comes_back() {
     let tmp = tempfile::tempdir().unwrap();

@@ -18,8 +18,9 @@
 //! `docs/architecture/flight.md` ("Concurrency bound") is where that lives.
 //!
 //! Connections are built as they are first needed rather than all at boot, because
-//! each one costs a lake-Postgres backend for as long as it lives — the budget
-//! `config::DEFAULT_POOL_SIZE` is chosen against. One is built at `open` so a bad
+//! each one holds a lake-Postgres backend for as long as it lives (see
+//! `KEEP_CATALOG_BACKEND`) — the budget `config::DEFAULT_POOL_SIZE` is chosen
+//! against. One is built at `open` so a bad
 //! setting or an unwritable spill root fails the unit at boot rather than on first
 //! request.
 
@@ -254,6 +255,7 @@ impl LakePool {
     fn build_connection(&self) -> Result<Member, Box<dyn std::error::Error>> {
         let spill = self.new_spill_directory()?;
         let conn = Connection::open_in_memory()?;
+        conn.execute_batch(KEEP_CATALOG_BACKEND)?;
         ducklake::connect_ducklake(&conn, &self.catalog_connstr, &self.data_path)?;
         let member = Member { conn, spill };
         self.settle(&member)?;
@@ -564,6 +566,19 @@ impl Drop for PooledConnection {
         }
     }
 }
+
+/// Run on a member's database before its ATTACH, so the catalog backend it opens
+/// stays open for as long as the member does. DuckDB's postgres extension pools
+/// its connections per attached database and closes one left idle for
+/// `pg_pool_idle_timeout_millis` (default 60 s); `0` turns that limit and the
+/// reaper thread off. The setting is read at ATTACH only. Measured on DuckDB 2.0.0
+/// against Postgres 16: set before the ATTACH, `postgres_configure_pool` reports
+/// `idle_timeout_millis` 0 and no reaper, and the backend's pid was unchanged
+/// after 150 s idle and after the next query; set after it, the pool kept 60000
+/// and the backend was gone by 90 s. `qiita_catalog_connection_budget` in
+/// `deploy/_common.sh` counts each member as one backend for its whole life.
+/// `LOAD postgres` first, because the setting is the extension's.
+const KEEP_CATALOG_BACKEND: &str = "LOAD postgres; SET pg_pool_idle_timeout_millis=0;";
 
 /// What a lake write runs at, for the length of its borrow; the reset on return
 /// puts back the pool's baseline.

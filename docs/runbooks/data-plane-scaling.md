@@ -75,12 +75,15 @@ Each pooled connection also holds a backend on the catalog's Postgres; see
 Every instance, on every host, names its catalog sessions
 `qiita-data-plane:<port>:pool=<n>`, where `<n>` is the pool size plus the instance's lake
 lock sessions (`LOCK_SESSIONS` in `qiita-data-plane/src/lake_locks.rs`), and `verify-deploy`'s
-`catalog-connections` row reads those names back from the catalog server: the pools of
-every connected instance plus the other client sessions open now, against
-`max_connections` less the reserved slots. It passes with the numbers and one
-`<host>:<port> pool=<n>` line per instance, and fails when the total does not fit; what it
-counts, and why, is in `qiita_catalog_connection_budget` (`deploy/_common.sh`). An
-instance still running a build without the name counts only as the sessions it has open.
+`catalog-connections` row adds up the pools of this host's instances (each
+`QIITA_DATA_PLANE_PORTS` entry, at `DUCKLAKE_POOL_SIZE` plus the lock sessions, whether or
+not it has a session open), the pools other hosts' instances name in their open sessions,
+and the other client sessions open now, against `max_connections` less the reserved
+slots. It passes with the numbers and one `<host>:<port> pool=<n>` line per instance, marked
+`(no session open)` for a local instance the catalog server shows no session of, and fails
+when the total does not fit; what it counts, and why, is in
+`qiita_catalog_connection_budget` (`deploy/_common.sh`). An instance still running a build
+without the name counts only as the sessions it has open.
 
 The row queries as the data plane's catalog role, the `user=` in
 `DUCKLAKE_CATALOG_CONNSTR`, which needs `pg_read_all_stats` to see other roles'
