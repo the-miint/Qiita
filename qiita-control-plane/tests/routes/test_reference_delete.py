@@ -554,6 +554,41 @@ async def test_delete_reference_blocked_by_alignment_definition_even_with_force(
         )
 
 
+async def test_delete_reference_blocked_by_genome_derivation_even_with_force(client, postgres_pool):
+    """A reference that asserts a genome's derivation cannot be deleted, with or
+    without force: the delete would withdraw provenance nothing else records. The
+    gate refuses before any destructive step, with a 409 that names the reason,
+    rather than failing on the foreign key at the end."""
+    ref_idx = await _create_ref(client, f"del-derivation-{uuid.uuid4()}")
+    genome_idx = await postgres_pool.fetchval(
+        "INSERT INTO qiita.genome (source, source_id) VALUES ('genbank', $1) RETURNING genome_idx",
+        f"G{uuid.uuid4().int % 10**9:09d}",
+    )
+    await postgres_pool.execute(
+        "INSERT INTO qiita.genome_derivation"
+        " (genome_idx, parent_source, parent_source_id, method, asserted_by_reference_idx)"
+        " VALUES ($1, 'refseq', 'GCF_000005825.2', 'wol_concatenated', $2)",
+        genome_idx,
+        ref_idx,
+    )
+    try:
+        for params in ({}, {"force": "true"}):
+            resp = await client.delete(
+                URL_REFERENCE_BY_IDX.format(reference_idx=ref_idx), params=params
+            )
+            assert resp.status_code == 409, resp.text
+            assert "1 genome derivation(s)" in resp.json()["detail"]
+        assert (
+            await postgres_pool.fetchval(
+                "SELECT count(*) FROM qiita.genome_derivation WHERE asserted_by_reference_idx = $1",
+                ref_idx,
+            )
+            == 1
+        )
+    finally:
+        await postgres_pool.execute("DELETE FROM qiita.genome WHERE genome_idx = $1", genome_idx)
+
+
 async def test_delete_reference_blocked_by_inflight_ticket(client, postgres_pool):
     """An in-flight work ticket blocks the delete even with force=true."""
     ref_idx = await _create_ref(client, f"del-inflight-{uuid.uuid4()}")

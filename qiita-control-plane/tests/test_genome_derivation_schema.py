@@ -5,6 +5,7 @@ Talks to Postgres directly (no routes). Every test runs inside a transaction tha
 rolled back, so the seeded reference and genomes never outlive the test.
 """
 
+import re
 import uuid
 from contextlib import asynccontextmanager
 
@@ -175,3 +176,19 @@ async def test_genome_derivation_rejects_unknown_method(postgres_pool):
             await _insert(
                 conn, genome_idx, "genbank", "GCA_000005825.2", reference_idx, method="linearized"
             )
+
+
+async def test_method_check_matches_the_repair_constant(postgres_pool):
+    """The only writer's constant and the CHECK are the same one-value set."""
+    from qiita_control_plane.backfill.wol_genome_repair import DERIVATION_METHOD
+
+    check_def = await postgres_pool.fetchval(
+        "SELECT pg_get_constraintdef(c.oid)"
+        "  FROM pg_constraint c"
+        "  JOIN pg_class ct ON ct.oid = c.conrelid"
+        "  JOIN pg_namespace cn ON cn.oid = ct.relnamespace"
+        " WHERE cn.nspname = 'qiita' AND ct.relname = 'genome_derivation'"
+        "   AND c.conname = 'genome_derivation_method_check'"
+    )
+    assert check_def is not None
+    assert set(re.findall(r"'([a-z_]+)'", check_def)) == {DERIVATION_METHOD}

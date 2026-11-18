@@ -42,9 +42,10 @@ _WORK_TICKET_TERMINAL_STATES = TERMINAL_WORK_TICKET_STATES
 
 
 class ReferenceDeleteBlocked(Exception):
-    """Raised when a reference cannot be deleted. `alignment_definitions` blocks
-    UNCONDITIONALLY (even with force); `in_flight` work tickets always block;
-    `terminal` work tickets block only when the caller did not pass force=True."""
+    """Raised when a reference cannot be deleted. `alignment_definitions` and
+    `genome_derivations` block UNCONDITIONALLY (even with force); `in_flight` work
+    tickets always block; `terminal` work tickets block only when the caller did not
+    pass force=True."""
 
     def __init__(
         self,
@@ -53,11 +54,13 @@ class ReferenceDeleteBlocked(Exception):
         in_flight: int,
         terminal: int,
         alignment_definitions: int = 0,
+        genome_derivations: int = 0,
     ) -> None:
         self.reference_idx = reference_idx
         self.in_flight = in_flight
         self.terminal = terminal
         self.alignment_definitions = alignment_definitions
+        self.genome_derivations = genome_derivations
         # Alignment definitions are the force-proof reason and the one the operator
         # most needs to act on, so it is reported first when present. The DuckLake
         # `alignment` rows are keyed on `feature_idx`, which this delete would
@@ -71,6 +74,13 @@ class ReferenceDeleteBlocked(Exception):
                 "that has been aligned against cannot be deleted, with or without "
                 "force. Deprecating the alignment "
                 f"(PATCH {URL_ALIGNMENT_DEFINITION_STATUS}) does not change that"
+            )
+        elif genome_derivations:
+            # Why a derivation holds its reference is on the FK it rides,
+            # qiita.genome_derivation.asserted_by_reference_idx.
+            reason = (
+                f"it asserts {genome_derivations} genome derivation(s) "
+                "(qiita.genome_derivation), so it cannot be deleted, with or without force"
             )
         elif in_flight:
             reason = (
@@ -107,8 +117,9 @@ async def assert_reference_deletable(
 
     Returns the reference's current status on success. Raises
     ReferenceNotFound if it doesn't exist, or ReferenceDeleteBlocked if work
-    tickets reference it (in-flight always; terminal unless force) or if any
-    alignment definition aligns against it (always, even with force). Run this
+    tickets reference it (in-flight always; terminal unless force), if any
+    alignment definition aligns against it, or if it asserts any genome derivation
+    (both always, even with force). Run this
     *before* any destructive step so a blocked delete touches nothing."""
     status = await conn.fetchval(
         "SELECT status FROM qiita.reference WHERE reference_idx = $1", reference_idx
@@ -134,12 +145,17 @@ async def assert_reference_deletable(
         " WHERE (params->>'reference_idx')::bigint = $1",
         reference_idx,
     )
-    if alignment_definitions or in_flight or (terminal and not force):
+    genome_derivations = await conn.fetchval(
+        "SELECT count(*) FROM qiita.genome_derivation WHERE asserted_by_reference_idx = $1",
+        reference_idx,
+    )
+    if alignment_definitions or genome_derivations or in_flight or (terminal and not force):
         raise ReferenceDeleteBlocked(
             reference_idx=reference_idx,
             in_flight=in_flight,
             terminal=terminal,
             alignment_definitions=alignment_definitions,
+            genome_derivations=genome_derivations,
         )
     return status
 
