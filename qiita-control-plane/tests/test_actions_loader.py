@@ -320,8 +320,8 @@ def test_load_actions_loads_on_disk_amplicon_yaml():
     assert "pool_reads" not in denoise.inputs and "reads" not in denoise.inputs
     assert denoise.inputs == ["sortmerna_ref"]
     assert denoise.params == {"primer": "primer", "trim": "trim", "orient_primer": "orient_primer"}
-    # asv_chunks carries the ASV bytes so amplicon_load can store the sequences.
-    assert denoise.outputs == ["asv_counts", "manifest", "asv_chunks"]
+    # asv_sequences carries the ASV bytes inline so amplicon_load can store the sequences.
+    assert denoise.outputs == ["asv_counts", "manifest", "asv_sequences"]
 
     # mint-features binds the manifest by the literal name the dispatcher pins.
     mint = next(s for s in amplicon.steps if s.name == "mint-features")
@@ -329,8 +329,8 @@ def test_load_actions_loads_on_disk_amplicon_yaml():
 
     load_step = next(s for s in amplicon.steps if s.name == "amplicon_load")
     assert load_step.module == "qiita_compute_orchestrator.jobs.amplicon_load"
-    # manifest + asv_chunks feed the ASV sequence tables alongside the counts.
-    assert load_step.inputs == ["asv_counts", "feature_map", "manifest", "asv_chunks"]
+    # manifest + asv_sequences feed the ASV sequence tables alongside the counts.
+    assert load_step.inputs == ["asv_counts", "feature_map", "manifest", "asv_sequences"]
     # processing_idx via params -> runner mints the run identity before the loop.
     assert load_step.params == {"processing_idx": "processing_idx"}
     # Pure native + library primitives; no container steps.
